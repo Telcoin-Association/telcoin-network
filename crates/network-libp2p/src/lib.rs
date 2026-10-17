@@ -66,3 +66,7 @@ mod fixture_tests;
 #[cfg(test)]
 #[path = "tests/quic_retry.rs"]
 mod quic_retry;
+
+#[cfg(test)]
+#[path = "tests/ops_artifacts_tests.rs"]
+mod ops_artifacts_tests;

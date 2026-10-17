@@ -2,7 +2,7 @@
   "annotations": {
     "list": []
   },
-  "description": "Telcoin Network node metrics: consensus, execution, networking, batches, and security signals. Scraped from the node's --metrics endpoint; node/chain labels are attached externally by the collector (Alloy).",
+  "description": "Telcoin node metrics. The Prometheus of the observability compose profile scrapes every validator (job telcoin-node) and node_exporter (job node). Every query is scoped by the job and instance variables; host panels use node_job and node_instance.",
   "editable": true,
   "graphTooltip": 1,
   "links": [],
@@ -39,9 +39,9 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "tn_engine_canonical_height",
+          "expr": "tn_engine_canonical_height{job=~\"$job\",instance=~\"$instance\"}",
           "refId": "A",
-          "legendFormat": "height"
+          "legendFormat": "{{instance}} height"
         }
       ],
       "fieldConfig": {
@@ -73,9 +73,9 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "tn_node_mode == 1",
+          "expr": "tn_node_mode{job=~\"$job\",instance=~\"$instance\"} == 1",
           "refId": "A",
-          "legendFormat": "{{mode}}"
+          "legendFormat": "{{instance}} {{mode}}"
         }
       ],
       "fieldConfig": {
@@ -107,9 +107,9 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "tn_node_consensus_sync_distance",
+          "expr": "tn_node_consensus_sync_distance{job=~\"$job\",instance=~\"$instance\"}",
           "refId": "A",
-          "legendFormat": "behind by"
+          "legendFormat": "{{instance}} behind by"
         }
       ],
       "fieldConfig": {
@@ -141,9 +141,9 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "tn_engine_queued_outputs",
+          "expr": "tn_engine_queued_outputs{job=~\"$job\",instance=~\"$instance\"}",
           "refId": "A",
-          "legendFormat": "queued"
+          "legendFormat": "{{instance}} queued"
         }
       ],
       "fieldConfig": {
@@ -175,9 +175,9 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "tn_epoch_current",
+          "expr": "tn_epoch_current{job=~\"$job\",instance=~\"$instance\"}",
           "refId": "A",
-          "legendFormat": "epoch"
+          "legendFormat": "{{instance}} epoch"
         }
       ],
       "fieldConfig": {
@@ -192,7 +192,8 @@
             "lastNotNull"
           ]
         }
-      }
+      },
+      "description": "Epoch number the node is in now."
     },
     {
       "id": 7,
@@ -214,9 +215,9 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "tn_epoch_boundary_timestamp_seconds - time()",
+          "expr": "tn_epoch_boundary_timestamp_seconds{job=~\"$job\",instance=~\"$instance\"} - time()",
           "refId": "A",
-          "legendFormat": "remaining"
+          "legendFormat": "{{instance}} remaining"
         }
       ],
       "fieldConfig": {
@@ -232,7 +233,8 @@
             "lastNotNull"
           ]
         }
-      }
+      },
+      "description": "Seconds until the current epoch ends. Negative when the boundary timestamp is in the past."
     },
     {
       "id": 8,
@@ -254,9 +256,9 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "increase(tn_epoch_runs_total[1h])",
+          "expr": "increase(tn_epoch_runs_total{job=~\"$job\",instance=~\"$instance\"}[1h])",
           "refId": "A",
-          "legendFormat": "{{mode}}"
+          "legendFormat": "{{instance}} {{mode}}"
         }
       ],
       "fieldConfig": {
@@ -300,27 +302,27 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "tn_primary_round",
+          "expr": "tn_primary_round{job=~\"$job\",instance=~\"$instance\"}",
           "refId": "A",
-          "legendFormat": "round"
+          "legendFormat": "{{instance}} round"
         },
         {
           "datasource": {
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "tn_primary_committed_round",
+          "expr": "tn_primary_committed_round{job=~\"$job\",instance=~\"$instance\"}",
           "refId": "B",
-          "legendFormat": "committed"
+          "legendFormat": "{{instance}} committed"
         },
         {
           "datasource": {
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "tn_primary_round - tn_primary_committed_round",
+          "expr": "tn_primary_round{job=~\"$job\",instance=~\"$instance\"} - tn_primary_committed_round{job=~\"$job\",instance=~\"$instance\"}",
           "refId": "C",
-          "legendFormat": "lag"
+          "legendFormat": "{{instance}} lag"
         }
       ],
       "fieldConfig": {
@@ -329,7 +331,8 @@
         },
         "overrides": []
       },
-      "options": {}
+      "options": {},
+      "description": "Current primary round and the last committed round. A growing gap means consensus proposes but does not commit."
     },
     {
       "id": 11,
@@ -351,9 +354,9 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "rate(tn_primary_headers_proposed_total[5m])",
+          "expr": "rate(tn_primary_headers_proposed_total{job=~\"$job\",instance=~\"$instance\"}[5m])",
           "refId": "A",
-          "legendFormat": "proposed/s"
+          "legendFormat": "{{instance}} proposed/s"
         }
       ],
       "fieldConfig": {
@@ -362,7 +365,8 @@
         },
         "overrides": []
       },
-      "options": {}
+      "options": {},
+      "description": "Rate of headers the primary proposed."
     },
     {
       "id": 12,
@@ -384,18 +388,18 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "rate(tn_primary_certificates_formed_total[5m])",
+          "expr": "rate(tn_primary_certificates_formed_total{job=~\"$job\",instance=~\"$instance\"}[5m])",
           "refId": "A",
-          "legendFormat": "formed (own)"
+          "legendFormat": "{{instance}} formed (own)"
         },
         {
           "datasource": {
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "rate(tn_primary_certificates_received_total[5m])",
+          "expr": "rate(tn_primary_certificates_received_total{job=~\"$job\",instance=~\"$instance\"}[5m])",
           "refId": "B",
-          "legendFormat": "received (peers)"
+          "legendFormat": "{{instance}} received (peers)"
         }
       ],
       "fieldConfig": {
@@ -404,7 +408,8 @@
         },
         "overrides": []
       },
-      "options": {}
+      "options": {},
+      "description": "Rate of certificates the primary formed from votes."
     },
     {
       "id": 13,
@@ -426,9 +431,9 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "histogram_quantile(0.95, sum by (le) (rate(tn_primary_commit_latency_seconds_bucket[5m])))",
+          "expr": "histogram_quantile(0.95, sum by (instance, le) (rate(tn_primary_commit_latency_seconds_bucket{job=~\"$job\",instance=~\"$instance\"}[5m])))",
           "refId": "A",
-          "legendFormat": "p95"
+          "legendFormat": "{{instance}} p95"
         }
       ],
       "fieldConfig": {
@@ -461,9 +466,9 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "rate(tn_primary_subdags_committed_total[5m])",
+          "expr": "rate(tn_primary_subdags_committed_total{job=~\"$job\",instance=~\"$instance\"}[5m])",
           "refId": "A",
-          "legendFormat": "commits/s"
+          "legendFormat": "{{instance}} commits/s"
         }
       ],
       "fieldConfig": {
@@ -472,7 +477,8 @@
         },
         "overrides": []
       },
-      "options": {}
+      "options": {},
+      "description": "Rate of subdag commits in the primary."
     },
     {
       "id": 15,
@@ -494,27 +500,27 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "tn_primary_certificates_pending",
+          "expr": "tn_primary_certificates_pending{job=~\"$job\",instance=~\"$instance\"}",
           "refId": "A",
-          "legendFormat": "pending (missing parents)"
+          "legendFormat": "{{instance}} pending (missing parents)"
         },
         {
           "datasource": {
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "rate(tn_primary_certificates_fetched_total[5m])",
+          "expr": "rate(tn_primary_certificates_fetched_total{job=~\"$job\",instance=~\"$instance\"}[5m])",
           "refId": "B",
-          "legendFormat": "fetched/s"
+          "legendFormat": "{{instance}} fetched/s"
         },
         {
           "datasource": {
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "histogram_quantile(0.95, sum by (le) (rate(tn_primary_certificate_fetch_duration_seconds_bucket[5m])))",
+          "expr": "histogram_quantile(0.95, sum by (instance, le) (rate(tn_primary_certificate_fetch_duration_seconds_bucket{job=~\"$job\",instance=~\"$instance\"}[5m])))",
           "refId": "C",
-          "legendFormat": "fetch p95 (s)"
+          "legendFormat": "{{instance}} fetch p95 (s)"
         }
       ],
       "fieldConfig": {
@@ -523,7 +529,8 @@
         },
         "overrides": []
       },
-      "options": {}
+      "options": {},
+      "description": "Certificates that wait for their parents, and certificates fetched from peers."
     },
     {
       "id": 16,
@@ -557,9 +564,9 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "rate(tn_engine_blocks_executed_total[5m])",
+          "expr": "rate(tn_engine_blocks_executed_total{job=~\"$job\",instance=~\"$instance\"}[5m])",
           "refId": "A",
-          "legendFormat": "blocks/s"
+          "legendFormat": "{{instance}} blocks/s"
         }
       ],
       "fieldConfig": {
@@ -568,7 +575,8 @@
         },
         "overrides": []
       },
-      "options": {}
+      "options": {},
+      "description": "Rate of blocks the engine executed."
     },
     {
       "id": 18,
@@ -590,27 +598,27 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "histogram_quantile(0.50, sum by (le) (rate(tn_engine_execution_duration_seconds_bucket[5m])))",
+          "expr": "histogram_quantile(0.50, sum by (instance, le) (rate(tn_engine_execution_duration_seconds_bucket{job=~\"$job\",instance=~\"$instance\"}[5m])))",
           "refId": "A",
-          "legendFormat": "p50"
+          "legendFormat": "{{instance}} p50"
         },
         {
           "datasource": {
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "histogram_quantile(0.95, sum by (le) (rate(tn_engine_execution_duration_seconds_bucket[5m])))",
+          "expr": "histogram_quantile(0.95, sum by (instance, le) (rate(tn_engine_execution_duration_seconds_bucket{job=~\"$job\",instance=~\"$instance\"}[5m])))",
           "refId": "B",
-          "legendFormat": "p95"
+          "legendFormat": "{{instance}} p95"
         },
         {
           "datasource": {
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "histogram_quantile(0.99, sum by (le) (rate(tn_engine_execution_duration_seconds_bucket[5m])))",
+          "expr": "histogram_quantile(0.99, sum by (instance, le) (rate(tn_engine_execution_duration_seconds_bucket{job=~\"$job\",instance=~\"$instance\"}[5m])))",
           "refId": "C",
-          "legendFormat": "p99"
+          "legendFormat": "{{instance}} p99"
         }
       ],
       "fieldConfig": {
@@ -620,7 +628,8 @@
         },
         "overrides": []
       },
-      "options": {}
+      "options": {},
+      "description": "Block execution duration quantiles from the engine histogram."
     },
     {
       "id": 19,
@@ -642,9 +651,9 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "sum by (le) (rate(tn_engine_block_gas_used_bucket[5m]))",
+          "expr": "sum by (instance, le) (rate(tn_engine_block_gas_used_bucket{job=~\"$job\",instance=~\"$instance\"}[5m]))",
           "refId": "A",
-          "legendFormat": "{{le}}"
+          "legendFormat": "{{instance}} {{le}}"
         }
       ],
       "fieldConfig": {
@@ -655,7 +664,8 @@
       },
       "options": {
         "calculate": false
-      }
+      },
+      "description": "Distribution of gas used per block."
     },
     {
       "id": 20,
@@ -677,9 +687,9 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "sum(rate(tn_executor_output_transactions_sum[5m]))",
+          "expr": "sum by (instance) (rate(tn_executor_output_transactions_sum{job=~\"$job\",instance=~\"$instance\"}[5m]))",
           "refId": "A",
-          "legendFormat": "tps"
+          "legendFormat": "{{instance}} tps"
         }
       ],
       "fieldConfig": {
@@ -688,7 +698,8 @@
         },
         "overrides": []
       },
-      "options": {}
+      "options": {},
+      "description": "Rate of transactions the executor output."
     },
     {
       "id": 21,
@@ -710,27 +721,27 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "rate(tn_executor_outputs_ready_total[5m])",
+          "expr": "rate(tn_executor_outputs_ready_total{job=~\"$job\",instance=~\"$instance\"}[5m])",
           "refId": "A",
-          "legendFormat": "ready (executor)"
+          "legendFormat": "{{instance}} ready (executor)"
         },
         {
           "datasource": {
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "rate(tn_engine_outputs_executed_total[5m])",
+          "expr": "rate(tn_engine_outputs_executed_total{job=~\"$job\",instance=~\"$instance\"}[5m])",
           "refId": "B",
-          "legendFormat": "executed (engine)"
+          "legendFormat": "{{instance}} executed (engine)"
         },
         {
           "datasource": {
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "rate(tn_engine_empty_outputs_skipped_total[5m])",
+          "expr": "rate(tn_engine_empty_outputs_skipped_total{job=~\"$job\",instance=~\"$instance\"}[5m])",
           "refId": "C",
-          "legendFormat": "skipped (empty)"
+          "legendFormat": "{{instance}} skipped (empty)"
         }
       ],
       "fieldConfig": {
@@ -739,7 +750,8 @@
         },
         "overrides": []
       },
-      "options": {}
+      "options": {},
+      "description": "Rate of consensus outputs that became ready versus outputs the executor finished."
     },
     {
       "id": 22,
@@ -761,18 +773,18 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "rate(tn_executor_batch_fetch_failures_total[5m])",
+          "expr": "rate(tn_executor_batch_fetch_failures_total{job=~\"$job\",instance=~\"$instance\"}[5m])",
           "refId": "A",
-          "legendFormat": "fetch failures/s"
+          "legendFormat": "{{instance}} fetch failures/s"
         },
         {
           "datasource": {
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "histogram_quantile(0.95, sum by (le) (rate(tn_worker_batch_fetch_duration_seconds_bucket[5m])))",
+          "expr": "histogram_quantile(0.95, sum by (instance, le) (rate(tn_worker_batch_fetch_duration_seconds_bucket{job=~\"$job\",instance=~\"$instance\"}[5m])))",
           "refId": "B",
-          "legendFormat": "worker fetch p95 (s)"
+          "legendFormat": "{{instance}} worker fetch p95 (s)"
         }
       ],
       "fieldConfig": {
@@ -781,7 +793,8 @@
         },
         "overrides": []
       },
-      "options": {}
+      "options": {},
+      "description": "Rate of batch fetch failures during execution."
     },
     {
       "id": 23,
@@ -815,27 +828,27 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "tn_network_connected_peers{network=~\"$network\"}",
+          "expr": "tn_network_connected_peers{job=~\"$job\",instance=~\"$instance\",network=~\"$network\"}",
           "refId": "A",
-          "legendFormat": "{{network}} connected"
+          "legendFormat": "{{instance}} {{network}} connected"
         },
         {
           "datasource": {
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "tn_network_known_peers{network=~\"$network\"}",
+          "expr": "tn_network_known_peers{job=~\"$job\",instance=~\"$instance\",network=~\"$network\"}",
           "refId": "B",
-          "legendFormat": "{{network}} known"
+          "legendFormat": "{{instance}} {{network}} known"
         },
         {
           "datasource": {
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "tn_network_discovery_peers{network=~\"$network\"}",
+          "expr": "tn_network_discovery_peers{job=~\"$job\",instance=~\"$instance\",network=~\"$network\"}",
           "refId": "C",
-          "legendFormat": "{{network}} discovery"
+          "legendFormat": "{{instance}} {{network}} discovery"
         }
       ],
       "fieldConfig": {
@@ -844,7 +857,8 @@
         },
         "overrides": []
       },
-      "options": {}
+      "options": {},
+      "description": "Peers with an open connection, per network (primary or worker)."
     },
     {
       "id": 25,
@@ -866,27 +880,27 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "rate(tn_network_connections_established_total{network=~\"$network\"}[5m])",
+          "expr": "rate(tn_network_connections_established_total{job=~\"$job\",instance=~\"$instance\",network=~\"$network\"}[5m])",
           "refId": "A",
-          "legendFormat": "{{network}} {{direction}}"
+          "legendFormat": "{{instance}} {{network}} {{direction}}"
         },
         {
           "datasource": {
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "rate(tn_network_connections_closed_total{network=~\"$network\"}[5m])",
+          "expr": "rate(tn_network_connections_closed_total{job=~\"$job\",instance=~\"$instance\",network=~\"$network\"}[5m])",
           "refId": "B",
-          "legendFormat": "{{network}} closed"
+          "legendFormat": "{{instance}} {{network}} closed"
         },
         {
           "datasource": {
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "rate(tn_network_dial_failures_total{network=~\"$network\"}[5m])",
+          "expr": "rate(tn_network_dial_failures_total{job=~\"$job\",instance=~\"$instance\",network=~\"$network\"}[5m])",
           "refId": "C",
-          "legendFormat": "{{network}} dial failures"
+          "legendFormat": "{{instance}} {{network}} dial failures"
         }
       ],
       "fieldConfig": {
@@ -895,7 +909,8 @@
         },
         "overrides": []
       },
-      "options": {}
+      "options": {},
+      "description": "Rate of connections established and closed, per network."
     },
     {
       "id": 26,
@@ -917,18 +932,18 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "rate(tn_network_gossip_received_total{network=~\"$network\"}[5m])",
+          "expr": "rate(tn_network_gossip_received_total{job=~\"$job\",instance=~\"$instance\",network=~\"$network\"}[5m])",
           "refId": "A",
-          "legendFormat": "{{network}} in"
+          "legendFormat": "{{instance}} {{network}} in"
         },
         {
           "datasource": {
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "rate(tn_network_gossip_published_total{network=~\"$network\"}[5m])",
+          "expr": "rate(tn_network_gossip_published_total{job=~\"$job\",instance=~\"$instance\",network=~\"$network\"}[5m])",
           "refId": "B",
-          "legendFormat": "{{network}} out"
+          "legendFormat": "{{instance}} {{network}} out"
         }
       ],
       "fieldConfig": {
@@ -937,7 +952,8 @@
         },
         "overrides": []
       },
-      "options": {}
+      "options": {},
+      "description": "Rate of gossip messages received, per network."
     },
     {
       "id": 27,
@@ -959,9 +975,9 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "rate(tn_network_outbound_request_failures_total{network=~\"$network\"}[5m])",
+          "expr": "rate(tn_network_outbound_request_failures_total{job=~\"$job\",instance=~\"$instance\",network=~\"$network\"}[5m])",
           "refId": "A",
-          "legendFormat": "{{network}} {{kind}}"
+          "legendFormat": "{{instance}} {{network}} {{kind}}"
         }
       ],
       "fieldConfig": {
@@ -976,7 +992,8 @@
         },
         "overrides": []
       },
-      "options": {}
+      "options": {},
+      "description": "Rate of outbound requests that failed, per network."
     },
     {
       "id": 28,
@@ -998,18 +1015,18 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "tn_network_outbound_requests_pending{network=~\"$network\"}",
+          "expr": "tn_network_outbound_requests_pending{job=~\"$job\",instance=~\"$instance\",network=~\"$network\"}",
           "refId": "A",
-          "legendFormat": "{{network}} outbound"
+          "legendFormat": "{{instance}} {{network}} outbound"
         },
         {
           "datasource": {
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "tn_network_px_disconnects_pending{network=~\"$network\"}",
+          "expr": "tn_network_px_disconnects_pending{job=~\"$job\",instance=~\"$instance\",network=~\"$network\"}",
           "refId": "B",
-          "legendFormat": "{{network}} px disconnects"
+          "legendFormat": "{{instance}} {{network}} px disconnects"
         }
       ],
       "fieldConfig": {
@@ -1018,7 +1035,8 @@
         },
         "overrides": []
       },
-      "options": {}
+      "options": {},
+      "description": "Outbound requests that wait for a response, per network."
     },
     {
       "id": 29,
@@ -1040,18 +1058,18 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "tn_network_kad_records{network=~\"$network\"}",
+          "expr": "tn_network_kad_records{job=~\"$job\",instance=~\"$instance\",network=~\"$network\"}",
           "refId": "A",
-          "legendFormat": "{{network}} kad records"
+          "legendFormat": "{{instance}} {{network}} kad records"
         },
         {
           "datasource": {
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "tn_network_external_addr_confirmed{network=~\"$network\"}",
+          "expr": "tn_network_external_addr_confirmed{job=~\"$job\",instance=~\"$instance\",network=~\"$network\"}",
           "refId": "B",
-          "legendFormat": "{{network}} ext addr confirmed"
+          "legendFormat": "{{instance}} {{network}} ext addr confirmed"
         }
       ],
       "fieldConfig": {
@@ -1060,7 +1078,8 @@
         },
         "overrides": []
       },
-      "options": {}
+      "options": {},
+      "description": "Kademlia records the node holds and the count of confirmed external addresses, per network."
     },
     {
       "id": 30,
@@ -1094,9 +1113,9 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "tn_batch_builder_pending_pool_transactions",
+          "expr": "tn_batch_builder_pending_pool_transactions{job=~\"$job\",instance=~\"$instance\"}",
           "refId": "A",
-          "legendFormat": "worker {{worker}}"
+          "legendFormat": "{{instance}} worker {{worker}}"
         }
       ],
       "fieldConfig": {
@@ -1105,7 +1124,8 @@
         },
         "overrides": []
       },
-      "options": {}
+      "options": {},
+      "description": "Transactions that wait in the batch builder pool."
     },
     {
       "id": 32,
@@ -1127,9 +1147,9 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "tn_batch_builder_base_fee",
+          "expr": "tn_batch_builder_base_fee{job=~\"$job\",instance=~\"$instance\"}",
           "refId": "A",
-          "legendFormat": "worker {{worker}}"
+          "legendFormat": "{{instance}} worker {{worker}}"
         }
       ],
       "fieldConfig": {
@@ -1139,7 +1159,8 @@
         },
         "overrides": []
       },
-      "options": {}
+      "options": {},
+      "description": "Base fee the batch builder uses for the next batch."
     },
     {
       "id": 33,
@@ -1161,18 +1182,18 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "rate(tn_worker_batches_sealed_total[5m])",
+          "expr": "rate(tn_worker_batches_sealed_total{job=~\"$job\",instance=~\"$instance\"}[5m])",
           "refId": "A",
-          "legendFormat": "worker {{worker}} sealed/s"
+          "legendFormat": "{{instance}} worker {{worker}} sealed/s"
         },
         {
           "datasource": {
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "rate(tn_batch_builder_seal_failures_total[5m])",
+          "expr": "rate(tn_batch_builder_seal_failures_total{job=~\"$job\",instance=~\"$instance\"}[5m])",
           "refId": "B",
-          "legendFormat": "{{reason}} failures/s"
+          "legendFormat": "{{instance}} {{reason}} failures/s"
         }
       ],
       "fieldConfig": {
@@ -1181,7 +1202,8 @@
         },
         "overrides": []
       },
-      "options": {}
+      "options": {},
+      "description": "Rate of batches the worker sealed."
     },
     {
       "id": 34,
@@ -1203,18 +1225,18 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "histogram_quantile(0.95, sum by (le) (rate(tn_worker_batch_size_bytes_bucket[5m])))",
+          "expr": "histogram_quantile(0.95, sum by (instance, le) (rate(tn_worker_batch_size_bytes_bucket{job=~\"$job\",instance=~\"$instance\"}[5m])))",
           "refId": "A",
-          "legendFormat": "size p95 (bytes)"
+          "legendFormat": "{{instance}} size p95 (bytes)"
         },
         {
           "datasource": {
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "histogram_quantile(0.95, sum by (le) (rate(tn_worker_batch_transactions_bucket[5m])))",
+          "expr": "histogram_quantile(0.95, sum by (instance, le) (rate(tn_worker_batch_transactions_bucket{job=~\"$job\",instance=~\"$instance\"}[5m])))",
           "refId": "B",
-          "legendFormat": "txs p95"
+          "legendFormat": "{{instance}} txs p95"
         }
       ],
       "fieldConfig": {
@@ -1223,7 +1245,8 @@
         },
         "overrides": []
       },
-      "options": {}
+      "options": {},
+      "description": "95th percentile of batch size in bytes and of transactions per batch."
     },
     {
       "id": 35,
@@ -1245,9 +1268,9 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "histogram_quantile(0.95, sum by (le) (rate(tn_worker_quorum_wait_seconds_bucket[5m])))",
+          "expr": "histogram_quantile(0.95, sum by (instance, le) (rate(tn_worker_quorum_wait_seconds_bucket{job=~\"$job\",instance=~\"$instance\"}[5m])))",
           "refId": "A",
-          "legendFormat": "p95"
+          "legendFormat": "{{instance}} p95"
         }
       ],
       "fieldConfig": {
@@ -1257,7 +1280,8 @@
         },
         "overrides": []
       },
-      "options": {}
+      "options": {},
+      "description": "95th percentile of the time a worker waits for a batch quorum."
     },
     {
       "id": 36,
@@ -1279,9 +1303,9 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "sum(rate(tn_worker_batches_fetched_total{source=\"local\"}[5m])) / sum(rate(tn_worker_batches_fetched_total[5m]))",
+          "expr": "sum by (instance) (rate(tn_worker_batches_fetched_total{job=~\"$job\",instance=~\"$instance\",source=\"local\"}[5m])) / sum by (instance) (rate(tn_worker_batches_fetched_total{job=~\"$job\",instance=~\"$instance\"}[5m]))",
           "refId": "A",
-          "legendFormat": "local ratio"
+          "legendFormat": "{{instance}} local ratio"
         }
       ],
       "fieldConfig": {
@@ -1291,7 +1315,8 @@
         },
         "overrides": []
       },
-      "options": {}
+      "options": {},
+      "description": "Share of batches fetched from the local store instead of from a peer (the bounded source label)."
     },
     {
       "id": 37,
@@ -1325,9 +1350,9 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "rate(tn_worker_quorum_failures_total[5m])",
+          "expr": "rate(tn_worker_quorum_failures_total{job=~\"$job\",instance=~\"$instance\"}[5m])",
           "refId": "A",
-          "legendFormat": "{{reason}}"
+          "legendFormat": "{{instance}} {{reason}}"
         }
       ],
       "fieldConfig": {
@@ -1365,18 +1390,18 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "rate(tn_primary_invalid_votes_total[5m])",
+          "expr": "rate(tn_primary_invalid_votes_total{job=~\"$job\",instance=~\"$instance\"}[5m])",
           "refId": "A",
-          "legendFormat": "invalid votes"
+          "legendFormat": "{{instance}} invalid votes"
         },
         {
           "datasource": {
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "rate(tn_primary_vote_request_failures_total[5m])",
+          "expr": "rate(tn_primary_vote_request_failures_total{job=~\"$job\",instance=~\"$instance\"}[5m])",
           "refId": "B",
-          "legendFormat": "vote request failures"
+          "legendFormat": "{{instance}} vote request failures"
         }
       ],
       "fieldConfig": {
@@ -1385,7 +1410,8 @@
         },
         "overrides": []
       },
-      "options": {}
+      "options": {},
+      "description": "Rate of invalid votes and vote failures seen by the primary."
     },
     {
       "id": 40,
@@ -1407,27 +1433,27 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "rate(tn_worker_batch_validation_failures_total[5m])",
+          "expr": "rate(tn_worker_batch_validation_failures_total{job=~\"$job\",instance=~\"$instance\"}[5m])",
           "refId": "A",
-          "legendFormat": "batch validation failures"
+          "legendFormat": "{{instance}} batch validation failures"
         },
         {
           "datasource": {
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "rate(tn_executor_protocol_violations_total[5m])",
+          "expr": "rate(tn_executor_protocol_violations_total{job=~\"$job\",instance=~\"$instance\"}[5m])",
           "refId": "B",
-          "legendFormat": "protocol violations"
+          "legendFormat": "{{instance}} protocol violations"
         },
         {
           "datasource": {
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "rate(tn_reth_unrecoverable_txs_dropped_total[5m])",
+          "expr": "rate(tn_reth_unrecoverable_txs_dropped_total{job=~\"$job\",instance=~\"$instance\"}[5m])",
           "refId": "C",
-          "legendFormat": "unrecoverable txs dropped"
+          "legendFormat": "{{instance}} unrecoverable txs dropped"
         }
       ],
       "fieldConfig": {
@@ -1436,7 +1462,8 @@
         },
         "overrides": []
       },
-      "options": {}
+      "options": {},
+      "description": "Rate of batch validation failures and protocol violations."
     },
     {
       "id": 41,
@@ -1458,9 +1485,9 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "rate(tn_network_gossip_rejected_total{network=~\"$network\"}[5m])",
+          "expr": "rate(tn_network_gossip_rejected_total{job=~\"$job\",instance=~\"$instance\",network=~\"$network\"}[5m])",
           "refId": "A",
-          "legendFormat": "{{network}} rejected"
+          "legendFormat": "{{instance}} {{network}} rejected"
         }
       ],
       "fieldConfig": {
@@ -1492,9 +1519,9 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "rate(tn_network_peer_penalties_total{network=~\"$network\"}[5m])",
+          "expr": "rate(tn_network_peer_penalties_total{job=~\"$job\",instance=~\"$instance\",network=~\"$network\"}[5m])",
           "refId": "A",
-          "legendFormat": "{{network}} {{severity}} {{class}} {{outcome}}"
+          "legendFormat": "{{instance}} {{network}} {{severity}} {{class}} {{outcome}}"
         }
       ],
       "fieldConfig": {
@@ -1509,7 +1536,8 @@
         },
         "overrides": []
       },
-      "options": {}
+      "options": {},
+      "description": "Rate of peer penalties, by severity and network."
     },
     {
       "id": 43,
@@ -1531,18 +1559,18 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "tn_network_banned_peers{network=~\"$network\"}",
+          "expr": "tn_network_banned_peers{job=~\"$job\",instance=~\"$instance\",network=~\"$network\"}",
           "refId": "A",
-          "legendFormat": "{{network}} banned (stock)"
+          "legendFormat": "{{instance}} {{network}} banned (stock)"
         },
         {
           "datasource": {
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "rate(tn_network_peers_banned_total{network=~\"$network\"}[5m])",
+          "expr": "rate(tn_network_peers_banned_total{job=~\"$job\",instance=~\"$instance\",network=~\"$network\"}[5m])",
           "refId": "B",
-          "legendFormat": "{{network}} bans/s (flow)"
+          "legendFormat": "{{instance}} {{network}} bans/s (flow)"
         }
       ],
       "fieldConfig": {
@@ -1551,7 +1579,8 @@
         },
         "overrides": []
       },
-      "options": {}
+      "options": {},
+      "description": "Peers the node banned, per network."
     },
     {
       "id": 44,
@@ -1573,9 +1602,9 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "rate(tn_network_add_provider_rate_limited_total{network=~\"$network\"}[5m])",
+          "expr": "rate(tn_network_add_provider_rate_limited_total{job=~\"$job\",instance=~\"$instance\",network=~\"$network\"}[5m])",
           "refId": "A",
-          "legendFormat": "{{network}} dropped"
+          "legendFormat": "{{instance}} {{network}} dropped"
         }
       ],
       "fieldConfig": {
@@ -1607,9 +1636,9 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "rate(tn_network_kad_provider_write_failures_total{network=~\"$network\"}[5m])",
+          "expr": "rate(tn_network_kad_provider_write_failures_total{job=~\"$job\",instance=~\"$instance\",network=~\"$network\"}[5m])",
           "refId": "A",
-          "legendFormat": "{{network}} write failures"
+          "legendFormat": "{{instance}} {{network}} write failures"
         }
       ],
       "fieldConfig": {
@@ -1620,6 +1649,980 @@
       },
       "options": {},
       "description": "Provider database insert failures, such as MDBX capacity or I/O errors. Expected provider-table capacity and input-size rejections are excluded. Original database causes are logged at error level."
+    },
+    {
+      "id": 46,
+      "type": "row",
+      "title": "Host Network Pressure",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 110
+      },
+      "panels": []
+    },
+    {
+      "id": 47,
+      "type": "timeseries",
+      "title": "Firewall drops by rule (packets/s)",
+      "description": "Packets per second that hit a firewall rule whose nft counter name starts with drop_. The textfile collector reads the named counters every 15 seconds. A counter reset shows as a short gap, not as a negative rate.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 111
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {},
+          "unit": "pps"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum by (instance, rule) (rate(tn_host_firewall_rule_packets_total{job=~\"$node_job\",instance=~\"$node_instance\",rule=~\"drop_.*\"}[5m]))",
+          "legendFormat": "{{instance}} {{rule}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 48,
+      "type": "timeseries",
+      "title": "Firewall accepts by rule (packets/s)",
+      "description": "Packets per second that hit a firewall rule whose nft counter name starts with accept_. Compare with the drop panel to see the share of rejected traffic.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 111
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {},
+          "unit": "pps"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum by (instance, rule) (rate(tn_host_firewall_rule_packets_total{job=~\"$node_job\",instance=~\"$node_instance\",rule=~\"accept_.*\"}[5m]))",
+          "legendFormat": "{{instance}} {{rule}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 49,
+      "type": "timeseries",
+      "title": "UDP receive buffer errors (per second)",
+      "description": "Rate of UDP datagrams the kernel dropped because the socket receive buffer was full (Udp and Udp6 RcvbufErrors from the node_exporter netstat collector). A non-zero rate means the node reads slower than the network delivers.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 119
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {}
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "rate(node_netstat_Udp_RcvbufErrors{job=~\"$node_job\",instance=~\"$node_instance\"}[5m])",
+          "legendFormat": "{{instance}} udp4",
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "rate(node_netstat_Udp6_RcvbufErrors{job=~\"$node_job\",instance=~\"$node_instance\"}[5m])",
+          "legendFormat": "{{instance}} udp6",
+          "refId": "B"
+        }
+      ]
+    },
+    {
+      "id": 50,
+      "type": "stat",
+      "title": "UDP rmem_max",
+      "description": "net.core.rmem_max of the host, as read by the textfile collector. A QUIC socket cannot get a receive buffer above this value.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 4,
+        "x": 8,
+        "y": 119
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {},
+          "unit": "bytes"
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "orientation": "auto",
+        "textMode": "auto",
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "tn_host_udp_rmem_max_bytes{job=~\"$node_job\",instance=~\"$node_instance\"}",
+          "legendFormat": "{{instance}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 51,
+      "type": "timeseries",
+      "title": "Conntrack occupancy (%)",
+      "description": "Conntrack table occupancy in percent of nf_conntrack_max. The red line marks the 80 percent alert threshold. The value is meaningful only when the conntrack state is tracked.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 119
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "thresholdsStyle": {
+              "mode": "line"
+            }
+          },
+          "unit": "percent",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 80
+              }
+            ]
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "100 * node_nf_conntrack_entries{job=~\"$node_job\",instance=~\"$node_instance\"} / node_nf_conntrack_entries_limit{job=~\"$node_job\",instance=~\"$node_instance\"}",
+          "legendFormat": "{{instance}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 52,
+      "type": "state-timeline",
+      "title": "Collector and conntrack state",
+      "description": "Explicit states of the host collectors. Collector: exporter-down, collector-absent (no textfile mtime series), collector-stale (file older than 120 seconds), ok. Conntrack: tracked, notrack (a notrack rule is present), unsupported (no conntrack sysctl), collector-failed (the node_exporter conntrack collector returned an error). Absent means Prometheus has no series for that instance.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 127
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "fillOpacity": 70,
+            "lineWidth": 0
+          },
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "1": {
+                  "text": "exporter-down",
+                  "color": "red",
+                  "index": 0
+                },
+                "2": {
+                  "text": "collector-absent",
+                  "color": "orange",
+                  "index": 1
+                },
+                "3": {
+                  "text": "collector-stale",
+                  "color": "yellow",
+                  "index": 2
+                },
+                "4": {
+                  "text": "ok",
+                  "color": "green",
+                  "index": 3
+                },
+                "5": {
+                  "text": "tracked",
+                  "color": "green",
+                  "index": 4
+                },
+                "6": {
+                  "text": "notrack",
+                  "color": "blue",
+                  "index": 5
+                },
+                "7": {
+                  "text": "unsupported",
+                  "color": "orange",
+                  "index": 6
+                },
+                "8": {
+                  "text": "collector-failed",
+                  "color": "red",
+                  "index": 7
+                }
+              }
+            }
+          ],
+          "noValue": "absent"
+        },
+        "overrides": []
+      },
+      "options": {
+        "mergeValues": true,
+        "showValue": "auto",
+        "alignValue": "left",
+        "rowHeight": 0.9,
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum by (instance) ((up{job=~\"$node_job\",instance=~\"$node_instance\"} == 0) + 1) or sum by (instance) ((up{job=~\"$node_job\",instance=~\"$node_instance\"} == 1 unless on (instance) node_textfile_mtime_seconds{job=~\"$node_job\",instance=~\"$node_instance\",file=\"tn_host_network.prom\"}) + 1) or sum by (instance) (3 * clamp_max(time() - node_textfile_mtime_seconds{job=~\"$node_job\",instance=~\"$node_instance\",file=\"tn_host_network.prom\"} > 120, 1)) or sum by (instance) (4 * (up{job=~\"$node_job\",instance=~\"$node_instance\"} == 1))",
+          "legendFormat": "{{instance}} collector",
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum by (instance) (8 * (node_scrape_collector_success{job=~\"$node_job\",instance=~\"$node_instance\",collector=\"conntrack\"} == 0)) or sum by (instance) (7 * (tn_host_conntrack_mode{job=~\"$node_job\",instance=~\"$node_instance\",mode=\"unsupported\"} == 1)) or sum by (instance) (6 * (tn_host_conntrack_mode{job=~\"$node_job\",instance=~\"$node_instance\",mode=\"notrack\"} == 1)) or sum by (instance) (5 * (tn_host_conntrack_mode{job=~\"$node_job\",instance=~\"$node_instance\",mode=\"tracked\"} == 1))",
+          "legendFormat": "{{instance}} conntrack",
+          "refId": "B"
+        }
+      ]
+    },
+    {
+      "id": 53,
+      "type": "timeseries",
+      "title": "Interface drops and errors (per second)",
+      "description": "Receive and transmit drops and errors per second for the selected interfaces. Interface counters are per network namespace: the exporter runs in the host namespace and does not see drops inside containers.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 127
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {}
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum by (instance, device) (rate(node_network_receive_drop_total{job=~\"$node_job\",instance=~\"$node_instance\",device=~\"$device\"}[5m]))",
+          "legendFormat": "{{instance}} {{device}} rx drop",
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum by (instance, device) (rate(node_network_transmit_drop_total{job=~\"$node_job\",instance=~\"$node_instance\",device=~\"$device\"}[5m]))",
+          "legendFormat": "{{instance}} {{device}} tx drop",
+          "refId": "B"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum by (instance, device) (rate(node_network_receive_errs_total{job=~\"$node_job\",instance=~\"$node_instance\",device=~\"$device\"}[5m]))",
+          "legendFormat": "{{instance}} {{device}} rx errs",
+          "refId": "C"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum by (instance, device) (rate(node_network_transmit_errs_total{job=~\"$node_job\",instance=~\"$node_instance\",device=~\"$device\"}[5m]))",
+          "legendFormat": "{{instance}} {{device}} tx errs",
+          "refId": "D"
+        }
+      ]
+    },
+    {
+      "id": 54,
+      "type": "row",
+      "title": "Committee Connectivity",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 135
+      },
+      "panels": []
+    },
+    {
+      "id": 55,
+      "type": "timeseries",
+      "title": "Committee peers expected vs connected",
+      "description": "Committee peers the node expects to reach versus the committee peers that have an open connection, per network (primary or worker). The local node is not counted in either value.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 136
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {}
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "tn_network_committee_peers_expected{job=~\"$job\",instance=~\"$instance\",network=~\"$network\"}",
+          "legendFormat": "{{instance}} {{network}} expected",
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "tn_network_committee_peers_connected{job=~\"$job\",instance=~\"$instance\",network=~\"$network\"}",
+          "legendFormat": "{{instance}} {{network}} connected",
+          "refId": "B"
+        }
+      ]
+    },
+    {
+      "id": 56,
+      "type": "timeseries",
+      "title": "Committee coverage (%)",
+      "description": "Connected committee peers as a percentage of expected committee peers. The red line marks two thirds; below it the node cannot see a quorum of the committee. Empty when no committee is loaded.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 136
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "thresholdsStyle": {
+              "mode": "line"
+            }
+          },
+          "unit": "percent",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 66.7
+              }
+            ]
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "(100 * tn_network_committee_peers_connected{job=~\"$job\",instance=~\"$instance\",network=~\"$network\"} / tn_network_committee_peers_expected{job=~\"$job\",instance=~\"$instance\",network=~\"$network\"}) and tn_network_committee_peers_expected{job=~\"$job\",instance=~\"$instance\",network=~\"$network\"} > 0",
+          "legendFormat": "{{instance}} {{network}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 57,
+      "type": "stat",
+      "title": "Committee peers missing",
+      "description": "Expected committee peers minus connected committee peers. Zero is the healthy value.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 4,
+        "x": 16,
+        "y": 136
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {}
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "orientation": "auto",
+        "textMode": "auto",
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "tn_network_committee_peers_expected{job=~\"$job\",instance=~\"$instance\",network=~\"$network\"} - tn_network_committee_peers_connected{job=~\"$job\",instance=~\"$instance\",network=~\"$network\"}",
+          "legendFormat": "{{instance}} {{network}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 59,
+      "type": "stat",
+      "title": "Committee size",
+      "description": "Number of members in the current committee, including the local node.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 4,
+        "x": 20,
+        "y": 136
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {}
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "orientation": "auto",
+        "textMode": "auto",
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "tn_network_committee_size{job=~\"$job\",instance=~\"$instance\",network=~\"$network\"}",
+          "legendFormat": "{{instance}} {{network}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 58,
+      "type": "timeseries",
+      "title": "Connected peers vs committee peers connected",
+      "description": "All connected peers compared with connected committee peers. A high total with a low committee count means the node has peers, but not the ones consensus needs.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 144
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {}
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "tn_network_connected_peers{job=~\"$job\",instance=~\"$instance\",network=~\"$network\"}",
+          "legendFormat": "{{instance}} {{network}} all peers",
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "tn_network_committee_peers_connected{job=~\"$job\",instance=~\"$instance\",network=~\"$network\"}",
+          "legendFormat": "{{instance}} {{network}} committee",
+          "refId": "B"
+        }
+      ]
+    },
+    {
+      "id": 60,
+      "type": "row",
+      "title": "Correlation",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 152
+      },
+      "panels": []
+    },
+    {
+      "id": 61,
+      "type": "timeseries",
+      "title": "Host drops, UDP errors and QUIC incoming outcomes",
+      "description": "Host firewall drops and UDP receive buffer errors (recording rules) next to QUIC incoming connection outcomes per network. The QUIC series stays empty until PR #1691 merges.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 153
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {}
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "tn_host:firewall_drop_packets:rate5m{job=~\"$node_job\",instance=~\"$node_instance\"}",
+          "legendFormat": "{{instance}} firewall drops",
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "tn_host:udp_rcvbuf_errors:rate5m{job=~\"$node_job\",instance=~\"$node_instance\"}",
+          "legendFormat": "{{instance}} udp rcvbuf errors",
+          "refId": "B"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum by (instance, network, outcome) (rate(tn_network_quic_incoming_outcomes_total{job=~\"$job\",instance=~\"$instance\",network=~\"$network\"}[5m]))",
+          "legendFormat": "{{instance}} {{network}} quic {{outcome}}",
+          "refId": "C"
+        }
+      ]
+    },
+    {
+      "id": 62,
+      "type": "timeseries",
+      "title": "Inbound requests pending and shed",
+      "description": "Inbound requests that wait for a permit, by class, and the rate of requests shed, by class and reason. Growth here together with host drops in the panel on the left points at host pressure, not at the peer.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 153
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {}
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum by (instance, network, class) (tn_network_inbound_requests_pending{job=~\"$job\",instance=~\"$instance\",network=~\"$network\"})",
+          "legendFormat": "{{instance}} {{network}} {{class}} pending",
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum by (instance, network, class, reason) (rate(tn_network_inbound_requests_shed_total{job=~\"$job\",instance=~\"$instance\",network=~\"$network\"}[5m]))",
+          "legendFormat": "{{instance}} {{network}} {{class}} shed {{reason}}",
+          "refId": "B"
+        }
+      ]
+    },
+    {
+      "id": 63,
+      "type": "timeseries",
+      "title": "Primary round lag, quorum shortfalls and commit age",
+      "description": "Distance between the current primary round and the last committed round, the rate of rounds that missed quorum, and the age of the last commit in seconds. The last two series stay empty until PR #1693 merges.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 161
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {}
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "tn_primary_round{job=~\"$job\",instance=~\"$instance\"} - tn_primary_committed_round{job=~\"$job\",instance=~\"$instance\"}",
+          "legendFormat": "{{instance}} round lag",
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "rate(tn_primary_round_quorum_shortfalls_total{job=~\"$job\",instance=~\"$instance\"}[5m])",
+          "legendFormat": "{{instance}} quorum shortfalls",
+          "refId": "B"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "time() - tn_primary_last_commit_timestamp_seconds{job=~\"$job\",instance=~\"$instance\"}",
+          "legendFormat": "{{instance}} commit age s",
+          "refId": "C"
+        }
+      ]
+    },
+    {
+      "id": 64,
+      "type": "timeseries",
+      "title": "Committee membership resolution",
+      "description": "Committee members the node could not resolve to a peer, the required member count, and the age of the last committee observation in seconds. These series stay empty until PR #1694 merges.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 161
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {}
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum by (instance, network) (tn_network_committee_unresolved_members{job=~\"$job\",instance=~\"$instance\",network=~\"$network\"})",
+          "legendFormat": "{{instance}} {{network}} unresolved",
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum by (instance, network) (tn_network_committee_required_members{job=~\"$job\",instance=~\"$instance\",network=~\"$network\"})",
+          "legendFormat": "{{instance}} {{network}} required",
+          "refId": "B"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "time() - tn_network_committee_observed_timestamp_seconds{job=~\"$job\",instance=~\"$instance\",network=~\"$network\"}",
+          "legendFormat": "{{instance}} {{network}} observed age s",
+          "refId": "C"
+        }
+      ]
     }
   ],
   "refresh": "30s",
@@ -1631,16 +2634,6 @@
   "templating": {
     "list": [
       {
-        "name": "network",
-        "label": "Network",
-        "type": "query",
-        "datasource": {
-          "type": "prometheus",
-          "uid": "prometheus"
-        },
-        "query": "label_values(tn_network_connected_peers, network)",
-        "includeAll": true,
-        "multi": true,
         "current": {
           "selected": true,
           "text": [
@@ -1650,7 +2643,175 @@
             "$__all"
           ]
         },
-        "refresh": 2
+        "datasource": {
+          "type": "prometheus",
+          "uid": "prometheus"
+        },
+        "definition": "label_values(tn_network_connected_peers, job)",
+        "hide": 0,
+        "includeAll": true,
+        "label": "job",
+        "multi": true,
+        "name": "job",
+        "options": [],
+        "query": {
+          "query": "label_values(tn_network_connected_peers, job)",
+          "refId": "PrometheusVariableQueryEditor-VariableQuery"
+        },
+        "refresh": 2,
+        "regex": "",
+        "sort": 1,
+        "type": "query"
+      },
+      {
+        "current": {
+          "selected": true,
+          "text": [
+            "All"
+          ],
+          "value": [
+            "$__all"
+          ]
+        },
+        "datasource": {
+          "type": "prometheus",
+          "uid": "prometheus"
+        },
+        "definition": "label_values(tn_network_connected_peers{job=~\"$job\"}, instance)",
+        "hide": 0,
+        "includeAll": true,
+        "label": "instance",
+        "multi": true,
+        "name": "instance",
+        "options": [],
+        "query": {
+          "query": "label_values(tn_network_connected_peers{job=~\"$job\"}, instance)",
+          "refId": "PrometheusVariableQueryEditor-VariableQuery"
+        },
+        "refresh": 2,
+        "regex": "",
+        "sort": 1,
+        "type": "query"
+      },
+      {
+        "current": {
+          "selected": true,
+          "text": [
+            "All"
+          ],
+          "value": [
+            "$__all"
+          ]
+        },
+        "datasource": {
+          "type": "prometheus",
+          "uid": "prometheus"
+        },
+        "definition": "label_values(tn_network_connected_peers{job=~\"$job\",instance=~\"$instance\"}, network)",
+        "hide": 0,
+        "includeAll": true,
+        "label": "network",
+        "multi": true,
+        "name": "network",
+        "options": [],
+        "query": {
+          "query": "label_values(tn_network_connected_peers{job=~\"$job\",instance=~\"$instance\"}, network)",
+          "refId": "PrometheusVariableQueryEditor-VariableQuery"
+        },
+        "refresh": 2,
+        "regex": "",
+        "sort": 1,
+        "type": "query"
+      },
+      {
+        "current": {
+          "selected": true,
+          "text": [
+            "All"
+          ],
+          "value": [
+            "$__all"
+          ]
+        },
+        "datasource": {
+          "type": "prometheus",
+          "uid": "prometheus"
+        },
+        "definition": "label_values(node_exporter_build_info, job)",
+        "hide": 0,
+        "includeAll": true,
+        "label": "node_job",
+        "multi": true,
+        "name": "node_job",
+        "options": [],
+        "query": {
+          "query": "label_values(node_exporter_build_info, job)",
+          "refId": "PrometheusVariableQueryEditor-VariableQuery"
+        },
+        "refresh": 2,
+        "regex": "",
+        "sort": 1,
+        "type": "query"
+      },
+      {
+        "current": {
+          "selected": true,
+          "text": [
+            "All"
+          ],
+          "value": [
+            "$__all"
+          ]
+        },
+        "datasource": {
+          "type": "prometheus",
+          "uid": "prometheus"
+        },
+        "definition": "label_values(node_exporter_build_info{job=~\"$node_job\"}, instance)",
+        "hide": 0,
+        "includeAll": true,
+        "label": "node_instance",
+        "multi": true,
+        "name": "node_instance",
+        "options": [],
+        "query": {
+          "query": "label_values(node_exporter_build_info{job=~\"$node_job\"}, instance)",
+          "refId": "PrometheusVariableQueryEditor-VariableQuery"
+        },
+        "refresh": 2,
+        "regex": "",
+        "sort": 1,
+        "type": "query"
+      },
+      {
+        "current": {
+          "selected": true,
+          "text": [
+            "All"
+          ],
+          "value": [
+            "$__all"
+          ]
+        },
+        "datasource": {
+          "type": "prometheus",
+          "uid": "prometheus"
+        },
+        "definition": "label_values(node_network_receive_drop_total{job=~\"$node_job\",instance=~\"$node_instance\"}, device)",
+        "hide": 0,
+        "includeAll": true,
+        "label": "device",
+        "multi": true,
+        "name": "device",
+        "options": [],
+        "query": {
+          "query": "label_values(node_network_receive_drop_total{job=~\"$node_job\",instance=~\"$node_instance\"}, device)",
+          "refId": "PrometheusVariableQueryEditor-VariableQuery"
+        },
+        "refresh": 2,
+        "regex": "",
+        "sort": 1,
+        "type": "query"
       }
     ]
   },

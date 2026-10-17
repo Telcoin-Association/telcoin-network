@@ -1210,6 +1210,27 @@ impl AllPeers {
         &self.current_committee
     }
 
+    /// Count the current committee and its members that hold an established connection.
+    ///
+    /// Returns `(size, connected)`. `size` is the member count of the current slot. `connected`
+    /// counts members whose `Confirmed` record is connected; the store keys each confirmed peer
+    /// once by its BLS key, so a member counts once however many connections it holds. Members
+    /// of only the previous or next slot are not counted, and a connected peer whose BLS key is
+    /// not yet learned (`Unidentified`) is not counted. Both values are zero until
+    /// [`Self::update_committees`] sets a committee.
+    pub(super) fn current_committee_connectivity(&self) -> (usize, usize) {
+        let connected = self
+            .current_committee
+            .iter()
+            .filter(|bls_key| {
+                self.peers
+                    .get(&PeerIdentity::Confirmed(**bls_key))
+                    .is_some_and(|peer| peer.connection_status().is_connected())
+            })
+            .count();
+        (self.current_committee.len(), connected)
+    }
+
     /// Whether `bls_key` sits in any tracked committee slot (previous, current, or next).
     ///
     /// Committee membership is set every epoch from authoritative consensus state, so this is the
