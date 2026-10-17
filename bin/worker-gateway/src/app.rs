@@ -184,7 +184,7 @@ pub(crate) async fn run(settings: Settings) -> eyre::Result<()> {
         // --max-connections-per-ip
         rate_limit_v4_prefix = rate_limit_prefix.v4_bits(),
         rate_limit_v6_prefix = rate_limit_prefix.v6_bits(),
-        max_request_bytes,
+        max_request_bytes = max_request_bytes.get(),
         ?max_batch_len,
         max_inflight_submissions,
         max_inflight_queries,
@@ -354,7 +354,7 @@ pub(crate) async fn run(settings: Settings) -> eyre::Result<()> {
         client_prefix: rate_limit_prefix,
         tcp_user_timeout,
         max_connection_duration,
-        max_request_bytes,
+        max_request_bytes: max_request_bytes.get(),
         // `into_settings` rejects `--proxy-protocol` with no peer to read from
         proxy_protocol: proxy_protocol.map(Arc::new),
         max_inflight_request_bytes,
@@ -512,16 +512,14 @@ fn native_root_count() -> usize {
 /// Each such request reserves up to `--max-request-bytes` from its head (the
 /// whole cap when chunked) and keeps it until the request deadline, so this
 /// many idle connections refuse every other request body. Returns `None` when
-/// the connection cap binds first, the budget is unlimited, or the cap is `0`
-/// (nothing can then be reserved).
+/// the connection cap binds first or the budget is unlimited.
 fn idle_heads_exhausting_budget(
     max_inflight_request_bytes: Option<NonZeroU32>,
-    max_request_bytes: usize,
+    max_request_bytes: NonZeroUsize,
     max_connections: NonZeroUsize,
 ) -> Option<usize> {
     let budget = usize::try_from(max_inflight_request_bytes?.get()).unwrap_or(usize::MAX);
-    let cap = NonZeroUsize::new(max_request_bytes)?;
-    let idle_heads = budget.div_ceil(cap.get());
+    let idle_heads = budget.div_ceil(max_request_bytes.get());
     (idle_heads < max_connections.get()).then_some(idle_heads)
 }
 
@@ -782,7 +780,7 @@ mod tests {
     fn idle_heads(budget_mib: u32, cap: usize, connections: usize) -> Option<usize> {
         idle_heads_exhausting_budget(
             NonZeroU32::new(budget_mib * 1024 * 1024),
-            cap,
+            NonZeroUsize::new(cap).expect("nonzero"),
             NonZeroUsize::new(connections).expect("nonzero"),
         )
     }
@@ -812,9 +810,8 @@ mod tests {
         assert_eq!(idle_heads(256, MIB, 256), None);
         // more connections than the default budget covers
         assert_eq!(idle_heads(512, MIB, 2000), Some(512));
-        // an unlimited budget or a zero cap cannot be exhausted from heads
+        // an unlimited budget cannot be exhausted from heads
         assert_eq!(idle_heads(0, MIB, 500), None);
-        assert_eq!(idle_heads(512, 0, 500), None);
     }
 
     /// The header the query upstream requires, and the secret value it holds.

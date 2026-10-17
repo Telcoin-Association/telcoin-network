@@ -779,7 +779,7 @@ pub(crate) struct Settings {
     /// when uncapped.
     pub(crate) max_connection_duration: Option<Duration>,
     /// Maximum accepted request body size, in bytes.
-    pub(crate) max_request_bytes: usize,
+    pub(crate) max_request_bytes: NonZeroUsize,
     /// Maximum calls in one JSON-RPC batch, or `None` when unlimited.
     pub(crate) max_batch_len: Option<NonZeroUsize>,
     /// Budget of request-body bytes held across all in-flight requests, or
@@ -1183,7 +1183,7 @@ impl Cli {
             max_worker_pool_reads: worker_pool_read_cap(self.max_upstream_inflight),
             tcp_user_timeout: resolve_optional_duration(self.tcp_user_timeout),
             max_connection_duration,
-            max_request_bytes: self.max_request_bytes.get(),
+            max_request_bytes: self.max_request_bytes,
             max_batch_len,
             max_inflight_request_bytes,
             http1_max_buf_size: self.http1_max_buf_size,
@@ -2755,7 +2755,7 @@ mod tests {
     #[test]
     fn edge_protection_defaults() -> eyre::Result<()> {
         let settings = cli_with_flags(&[]).into_settings()?;
-        assert_eq!(settings.max_request_bytes, 1_048_576);
+        assert_eq!(settings.max_request_bytes.get(), 1_048_576);
         assert_eq!(settings.max_batch_len, NonZeroUsize::new(50));
         let per_ip = settings.rate_limit_per_ip.expect("per-ip limit on by default");
         assert_eq!(per_ip.rate().get(), 100);
@@ -3278,7 +3278,7 @@ mod tests {
     #[test]
     fn max_request_bytes_is_configurable() -> eyre::Result<()> {
         let settings = cli_with_flags(&["--max-request-bytes=1024"]).into_settings()?;
-        assert_eq!(settings.max_request_bytes, 1_024);
+        assert_eq!(settings.max_request_bytes.get(), 1_024);
         Ok(())
     }
 
@@ -3330,7 +3330,7 @@ mod tests {
     fn max_request_bytes_below_the_submission_floor_warns() -> eyre::Result<()> {
         const WARNING: &str = "--max-request-bytes is below one hex-encoded 128 KiB transaction";
         let (settings, logs) = into_settings_logged(cli_with_flags(&["--max-request-bytes=1024"]));
-        assert_eq!(settings?.max_request_bytes, 1_024);
+        assert_eq!(settings?.max_request_bytes.get(), 1_024);
         assert!(logs.contains(WARNING), "{logs}");
         assert!(logs.contains("max_request_bytes=1024"), "{logs}");
         assert!(logs.contains("floor=263168"), "{logs}");
