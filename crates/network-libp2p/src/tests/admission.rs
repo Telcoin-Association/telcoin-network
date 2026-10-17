@@ -566,8 +566,8 @@ async fn admission_revocation_on_banned_ip_creates_no_ban() {
 
 /// A window update queries a key again when its cached record is older than the record age
 /// limit, so a Closed swarm can learn a rotated network key. Fresh records are not queried.
-#[test]
-fn admission_renewal_requeries_outdated_window_record() {
+#[tokio::test]
+async fn admission_renewal_requeries_outdated_window_record() {
     let mut fixture = AdmissionFixture::new(NetworkType::Primary, AdmissionMode::Closed);
     let retired = AdmissionPeer::new();
     fixture.previous = AdmissionPeer {
