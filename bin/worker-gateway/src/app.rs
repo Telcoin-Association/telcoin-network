@@ -371,7 +371,7 @@ pub(crate) async fn run(settings: Settings) -> eyre::Result<()> {
         );
     }
 
-    // Summarize a burst of throttled per-request warnings once it stops, so
+    // Summarize a burst of throttled warnings once it stops, so
     // its count does not wait for the call site's next event.
     spawner.spawn_critical_task(
         "warning-summaries",
