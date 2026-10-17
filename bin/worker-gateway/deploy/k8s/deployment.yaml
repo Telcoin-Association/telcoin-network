@@ -187,6 +187,11 @@ spec:
               path: /ready/any
               port: probe
             periodSeconds: 5
+            # /ready/any answers from memory, so a slow answer means only a
+            # starved runtime, which every replica shares under a flood; a
+            # real outage still removes the pod at once through a fast 503.
+            timeoutSeconds: 5
+            failureThreshold: 3
           resources:
             requests:
               cpu: 100m
