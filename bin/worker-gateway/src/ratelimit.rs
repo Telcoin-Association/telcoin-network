@@ -166,7 +166,8 @@ impl RateLimit {
 }
 
 /// A refilling token bucket. It starts full and refills at `rate` tokens per
-/// second up to `capacity`; each admitted request spends one token.
+/// second up to `capacity`; each admitted request spends one token;
+/// [`Bucket::spend`] can take it below zero.
 #[derive(Debug)]
 struct Bucket {
     tokens: f64,
@@ -199,6 +200,16 @@ impl Bucket {
         } else {
             false
         }
+    }
+
+    /// Refill for the elapsed time, then spend `cost` tokens whether or not
+    /// that many are left: a spend already admitted elsewhere, recorded as
+    /// debt down to `-capacity`, so the bucket refills past it before it
+    /// admits again. [`Self::replenished`], [`Self::is_idle`] and
+    /// [`Self::refund`] handle a negative balance.
+    fn spend(&mut self, now: Instant, rate: f64, capacity: f64, cost: f64) {
+        self.tokens = (self.replenished(now, rate, capacity) - cost).max(-capacity);
+        self.last_refill = self.last_refill.max(now);
     }
 
     /// Spend `cost` tokens as [`Bucket::try_admit`] does, then ask `next`
@@ -580,7 +591,14 @@ impl PerIpLimiter {
     ///
     /// If the prefix has a bucket by now, a concurrent first request from it
     /// was inserted first, and this request's `cost` is spent from that bucket
-    /// instead; its verdict is ignored, since the request is already admitted.
+    /// instead, even past its tokens: the spend is recorded as debt, down to
+    /// minus one burst ([`Bucket::spend`]), so concurrent first requests cost
+    /// the prefix its sustained per-IP rate. Its first burst can still reach
+    /// the number of requests it has in flight before the first insertion,
+    /// which `--max-connections-per-ip` bounds for a direct client; keep that
+    /// at or below the per-IP burst (32 and 200 at the defaults). A client
+    /// named by a trusted `X-Forwarded-For` front is not under that cap.
+    ///
     /// If the table is full by now and [`Self::make_room`] frees no slot,
     /// nothing is inserted and the prefix stays untracked until its next
     /// request.
@@ -590,8 +608,9 @@ impl PerIpLimiter {
         let mut buckets = lock(&self.buckets);
         let now = clock.now();
         if let Some(bucket) = buckets.get_mut(&key) {
-            // the request is admitted already: this only records what it spent
-            bucket.try_admit(now, rate, capacity, cost);
+            // the request is already past the edge: record what it spent, as
+            // debt if the bucket is short
+            bucket.spend(now, rate, capacity, cost);
         } else if self.make_room(&mut buckets, now) {
             // the bucket the edge charged, refilling from when it was charged
             buckets.insert(key, Bucket { tokens: capacity - cost, last_refill: at });
@@ -1764,6 +1783,51 @@ mod tests {
         assert!(second.charge(true).is_ok());
         assert_eq!(limiters.per_ip_len(), 1);
         assert_eq!(limiters.per_ip_tokens(ip6(1, 3)), Some(2.0));
+    }
+
+    /// More concurrent first requests from one new prefix than its burst all
+    /// pass the edge on fresh buckets; what they spend past the burst is
+    /// recorded against the entry as debt, down to minus one burst, so the
+    /// prefix is refused until the bucket has refilled past it.
+    #[test]
+    fn first_requests_beyond_the_burst_are_recorded_as_debt() {
+        let clock = ManualClock::new();
+        let limiters = limiters_with_submissions(
+            clock.clone(),
+            Some(limit(1, 2)),
+            Some(limit(1, 10)),
+            limit(1, 10),
+        );
+        // five first requests from one /64, all admitted before any is tracked
+        let budgets: Vec<_> = (1..=5)
+            .map(|host| limiters.check_edge(Some(ip6(1, host))).expect("edge").expect("a budget"))
+            .collect();
+        assert_eq!(limiters.per_ip_len(), 0);
+        for budget in &budgets[..4] {
+            assert!(budget.charge(false).is_ok());
+        }
+        // the first inserts the bucket with one token left, the next three
+        // take it to -2
+        assert_eq!(
+            limiters.per_ip_tokens(ip6(1, 9)),
+            Some(-2.0),
+            "the spends past the burst were not recorded"
+        );
+        assert!(budgets[4].charge(false).is_ok());
+        assert_eq!(
+            limiters.per_ip_tokens(ip6(1, 9)),
+            Some(-2.0),
+            "the debt went past minus one burst"
+        );
+        assert!(matches!(limiters.check_edge(Some(ip6(1, 9))), Err(GatewayError::RateLimited)));
+        // two seconds bring the bucket back to zero, not to one token
+        clock.advance(Duration::from_secs(2));
+        assert!(
+            matches!(limiters.check_edge(Some(ip6(1, 9))), Err(GatewayError::RateLimited)),
+            "the debt was forgiven"
+        );
+        clock.advance(Duration::from_secs(1));
+        assert!(limiters.check_edge(Some(ip6(1, 9))).is_ok());
     }
 
     #[test]
