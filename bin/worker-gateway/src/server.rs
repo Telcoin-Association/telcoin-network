@@ -3318,7 +3318,9 @@ mod tests {
     /// stays bounded by `--upstream-request-timeout` from send even while each
     /// piece arrives inside the read timeout: a worker that trickles an
     /// accepting answer past the deadline loses it, and the hash is not
-    /// remembered.
+    /// remembered. The `504` comes no earlier than the deadline (a timer never
+    /// fires early, and the clock starts before the request is sent) and well
+    /// before the trickle would end.
     #[tokio::test]
     async fn buffered_submission_answer_keeps_its_deadline() {
         // the accepting answer in 26 pieces 100 ms apart, about 2.6 s in all,
@@ -3331,7 +3333,8 @@ mod tests {
         )
         .expect("client");
         let mut state = redirect_state_with_client(worker, None, client);
-        state.upstream_request_timeout = Duration::from_millis(400);
+        let deadline = Duration::from_millis(400);
+        state.upstream_request_timeout = deadline;
         state.readiness.set_ready(0, true);
         let recent = state.recent_submissions.clone().expect("hash routing on");
         let (gateway, _shutdown) = spawn(test_router(state)).await;
@@ -3342,6 +3345,10 @@ mod tests {
         assert_eq!(status, StatusCode::GATEWAY_TIMEOUT);
         assert_eq!(error_code_and_id(&text), (-32002, serde_json::json!(7)));
         assert!(elapsed < Duration::from_secs(2), "the answer was given up after {elapsed:?}");
+        assert!(
+            elapsed >= deadline,
+            "the answer was given up after {elapsed:?}, before --upstream-request-timeout"
+        );
         assert!(!recent.contains(&submitted_hash()));
     }
 
