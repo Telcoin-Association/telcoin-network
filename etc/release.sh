@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Release pipeline for telcoin-network. CI, the build host (xerxes) and the maintainer laptop
+# Release pipeline for telcoin-network. CI, the build server and the maintainer laptop
 # all run this one file, so the tag grammar, the maintainer allowlist, the signature counter
 # and the registry lookup exist exactly once. Maintainer guide:
 # docs/src/maintainers/releasing.md.
@@ -8,16 +8,16 @@
 # Usage: etc/release.sh <subcommand> <TAG> [options]   (or: make release-<subcommand> TAG=...)
 #
 # Flow:
-#   1. prep TAG        xerxes  set [workspace.package].version to X.Y.Z, cargo update, splice
+#   1. prep TAG        server  set [workspace.package].version to X.Y.Z, cargo update, splice
 #                              the git-cliff section into CHANGELOG.md; open the PR
 #                              "release: TAG", merge it alone through the queue, `make attest`
 #   2. tag TAG         laptop  sign TAG on the release commit with an allowlisted key, push it
 #   3. check-tag TAG   CI      validate the pushed tag; `notes` renders the release body and
 #                              `draft` creates the draft release
-#   4. build TAG       xerxes  build image and tarball from the tag, push the image, upload
+#   4. build TAG       server  build image and tarball from the tag, push the image, upload
 #                              IMAGE_DIGEST, SHA256SUMS and the tarball to the draft
 #   5. sign TAG        laptop  append a detached signature over SHA256SUMS to SHA256SUMS.asc
-#   6. verify TAG      xerxes  re-check tag, assets, signatures, image and binary, then
+#   6. verify TAG      server  re-check tag, assets, signatures, image and binary, then
 #      publish TAG             publish the draft and move the channel alias
 #   7. verify TAG      CI      re-check the published release (detective only)
 #
@@ -738,7 +738,7 @@ check_attestation() {
     case "$rc" in
         0) ;;
         2) die 3 "the attestation registry did not answer for $commit" ;;
-        *) die 1 "$commit is not attested on chain; on xerxes run: git switch --detach $commit && ALLOW_STALE_BASE=1 make attest" ;;
+        *) die 1 "$commit is not attested on chain; on the build server run: git switch --detach $commit && ALLOW_STALE_BASE=1 make attest" ;;
     esac
 }
 
@@ -1459,7 +1459,7 @@ cmd_draft() {
     info "draft release $TAG is ready"
 }
 
-# xerxes: on a clean checkout of main's tip, bump the version and splice the CHANGELOG
+# build server: on a clean checkout of main's tip, bump the version and splice the CHANGELOG
 # section. The marker records main's tip so check-tag can prove nothing landed in between.
 cmd_prep() {
     local main_sha remote anchors changed name tag_re
@@ -1587,7 +1587,7 @@ cmd_tag() {
     info "pushed $TAG; CI now validates it and creates the draft release"
 }
 
-# xerxes: build image and tarball from the tag, push the image, attach the artifacts.
+# build server: build image and tarball from the tag, push the image, attach the artifacts.
 cmd_build() {
     local driver existing rd stage dir mtime want got repo_digests sums_hex
     if [ "$(uname -s)" != Linux ] || [ "$(uname -m)" != x86_64 ]; then
@@ -1742,7 +1742,7 @@ cmd_sign() {
     printf 'signed %s as @%s: %s/%s signatures\n' "$TAG" "$SIGN_HANDLE" "$n_after" "$THRESHOLD"
 }
 
-# xerxes, CI, operators: re-check everything about a release. $1 = 1 allows a missing
+# build server, CI, operators: re-check everything about a release. $1 = 1 allows a missing
 # SHA256SUMS.asc (build's own self-check before anyone has signed).
 cmd_verify() {
     local allow_unsigned=$1 dir handles n=0 tar_bin_hex image_bin_hex
@@ -1796,7 +1796,7 @@ published_versions() {
     channel_finals "$tags"
 }
 
-# xerxes: verify, publish the draft, move the channel alias. Safe to re-run.
+# build server: verify, publish the draft, move the channel alias. Safe to re-run.
 cmd_publish() {
     local published highest latest=--latest=false move_alias=0 current
     need docker
@@ -1862,15 +1862,15 @@ usage() {
 usage: etc/release.sh <subcommand> <TAG> [options]
 
   parse TAG                          print TAG's channel, features, alias and file names
-  check-tag TAG                      validate a pushed release tag (CI, xerxes, laptop)
-  notes TAG [--image-digest D]       render the release body (CI, xerxes)
+  check-tag TAG                      validate a pushed release tag (CI, build server, laptop)
+  notes TAG [--image-digest D]       render the release body (CI, build server)
   draft TAG                          create or refresh the draft release (CI only)
-  prep TAG                           bump the version and write the CHANGELOG section (xerxes)
+  prep TAG                           bump the version and write the CHANGELOG section (build server)
   tag TAG                            sign and push the release tag (laptop)
-  build TAG                          build, push and attach the artifacts (xerxes)
+  build TAG                          build, push and attach the artifacts (build server)
   sign TAG                           add a maintainer signature to SHA256SUMS.asc (laptop)
-  verify TAG [--allow-unsigned]      check a release end to end (xerxes, CI, operators)
-  publish TAG                        verify, publish the draft, move the alias (xerxes)
+  verify TAG [--allow-unsigned]      check a release end to end (build server, CI, operators)
+  publish TAG                        verify, publish the draft, move the alias (build server)
 
 TAG is vX.Y.Z, vX.Y.Z-rcN, vX.Y.Z-adiri or vX.Y.Z-adiri-rcN.
 See the header of this file for the environment variables and exit codes.

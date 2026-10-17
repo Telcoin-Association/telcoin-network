@@ -7,7 +7,7 @@ When you finish it you have:
 - that key on the release allowlist;
 - GitHub showing your signed tags as Verified;
 - a laptop ready for `make release-tag` and `make release-sign`;
-- registry access on xerxes for `make release-build` and `make release-publish`.
+- registry access on the build server, the Ubuntu or Debian Linux x86_64 host that runs `make release-build` and `make release-publish`.
 
 ## What you need
 
@@ -254,21 +254,21 @@ gpg --verify t.asc t
   The key still signs while the PIN works, but a blocked PIN could then never be unblocked, so replace the key as [Lost or broken YubiKey](#lost-or-broken-yubikey) describes.
 - If both PINs are blocked, the key can no longer sign; follow [Lost or broken YubiKey](#lost-or-broken-yubikey), and run `ykman openpgp reset` before you create a new key on that YubiKey.
 
-## Registry access on xerxes
+## Registry access on the build server
 
 `make release-build` and `make release-publish` push to `ghcr.io/telcoin-association/telcoin-network`, which needs a classic personal access token with only the `write:packages` scope.
-Create one at `https://github.com/settings/tokens/new?scopes=write:packages&description=tn-release-xerxes` with a 90-day expiry.
+Create one at `https://github.com/settings/tokens/new?scopes=write:packages&description=tn-release-build-server` with a 90-day expiry.
 That link selects `write:packages` alone; ticking the scope by hand on the token page also selects `repo`, which this token must not have.
-Then, on xerxes:
+Then, on the build server:
 
 ```sh
 make docker-login
 ```
 
 `make docker-login` runs `docker login ghcr.io` with your GitHub login as the user name, and Docker prompts for the password: paste the token there.
-Keep `write:packages` off every `gh` login, on xerxes and on the laptop, so the only credential that can push images is the one Docker holds.
-Unless xerxes has a Docker credential helper, `docker login` stores the token in `~/.docker/config.json`, so log out after each release, as step 6 of [Releasing](releasing.md#6-verify-and-publish-xerxes) does.
-The YubiKey never goes to xerxes, and the packages token never goes on the laptop.
+Keep `write:packages` off every `gh` login, on the build server and on the laptop, so the only credential that can push images is the one Docker holds.
+Unless the build server has a Docker credential helper, `docker login` stores the token in `~/.docker/config.json`, so log out after each release, as step 6 of [Releasing](releasing.md#6-verify-and-publish-build-server) does.
+The YubiKey never goes to the build server, and the packages token never goes on the laptop.
 
 ## Spare YubiKey
 

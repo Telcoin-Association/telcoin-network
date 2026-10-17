@@ -2,7 +2,7 @@
 
 A release goes from a release PR to a published GitHub release in seven steps.
 CI validates the signed tag and creates a draft release; it never builds anything.
-The maintainer builds on xerxes, signs on the laptop, and publishes from xerxes once every check passes.
+The maintainer builds on the build server, signs on the laptop, and publishes from the build server once every check passes.
 Each step is a `make` target that calls [`etc/release.sh`](https://github.com/Telcoin-Association/telcoin-network/blob/main/etc/release.sh).
 `release-tag`, `release-sign` and `release-publish` show what they are about to do and wait for you to type `yes`.
 The examples use `v0.17.0-adiri`.
@@ -11,12 +11,12 @@ The examples use `v0.17.0-adiri`.
 
 | Step | Where | Command | Result |
 | --- | --- | --- | --- |
-| 1. Release PR | xerxes | `make release-prep TAG=v0.17.0-adiri`, a PR merged alone, then `ALLOW_STALE_BASE=1 make attest` on the release commit | The attested `release: v0.17.0-adiri` commit on `main` |
+| 1. Release PR | build server | `make release-prep TAG=v0.17.0-adiri`, a PR merged alone, then `ALLOW_STALE_BASE=1 make attest` on the release commit | The attested `release: v0.17.0-adiri` commit on `main` |
 | 2. Tag | laptop | `make release-tag TAG=v0.17.0-adiri` | A signed tag on GitHub |
 | 3. Validate and draft | CI | runs when the tag is pushed | A draft release with generated notes |
-| 4. Build | xerxes | `make release-build TAG=v0.17.0-adiri` | The image pushed as `:v0.17.0-adiri`; the tarball, `IMAGE_DIGEST` and `SHA256SUMS` on the draft |
+| 4. Build | build server | `make release-build TAG=v0.17.0-adiri` | The image pushed as `:v0.17.0-adiri`; the tarball, `IMAGE_DIGEST` and `SHA256SUMS` on the draft |
 | 5. Sign | laptop | `make release-sign TAG=v0.17.0-adiri` | `SHA256SUMS.asc` on the draft |
-| 6. Verify and publish | xerxes | `make release-verify TAG=v0.17.0-adiri`, then `make release-publish TAG=v0.17.0-adiri` | The published release, and the channel alias moved if it is the newest release |
+| 6. Verify and publish | build server | `make release-verify TAG=v0.17.0-adiri`, then `make release-publish TAG=v0.17.0-adiri` | The published release, and the channel alias moved if it is the newest release |
 | 7. Post-publish check | CI | runs when the release is published | The same verification, repeated on a GitHub runner |
 
 ## Release channels
@@ -53,18 +53,20 @@ The tag checks also enforce these version rules:
 - The repository is cloned and on an up-to-date `main`.
 - Foundry's `cast` is optional: with it, `release-tag` and `release-sign` also check the on-chain attestation, and without it they print a notice and leave that check to CI.
 
-### xerxes (Linux x86_64)
+### Build server (Ubuntu or Debian, Linux x86_64)
+
+Any Ubuntu or Debian server on Linux x86_64 can be the build server; `release-build` refuses any other platform.
 
 - `docker buildx version` works, and `docker buildx inspect default` reports the `docker` driver; `RELEASE_BUILDER` selects another builder with that driver.
 - `gh auth status` shows a login with the `repo` scope, to upload to the draft and edit it.
-- Docker is logged in to `ghcr.io` through `make docker-login`; [Registry access on xerxes](yubikey-setup.md#registry-access-on-xerxes) covers the first login.
+- Docker is logged in to `ghcr.io` through `make docker-login`; [Registry access on the build server](yubikey-setup.md#registry-access-on-the-build-server) covers the first login.
 - `cast --version` works, and `.env` holds `GITHUB_ATTESTATION_PRIVATE_KEY` for an address with the MAINTAINER role (see the [CI environment notes](https://github.com/Telcoin-Association/telcoin-network/blob/main/.github/ACTIONS.md#environment)).
 - `make init-submodules` has been run.
 - The checkout is on an up-to-date `main` with a clean tracked tree.
   `release-prep` requires `HEAD` to be `origin/main`.
   `release-build` and `release-publish` refuse to run when `etc/release.sh` or `.github/scripts/verify_commit_hash.sh` differ from `origin/main`.
 
-The YubiKey never goes to xerxes, and the registry token never goes on the laptop.
+The YubiKey never goes to the build server, and the registry token never goes on the laptop.
 
 ### One-time setup
 
@@ -78,7 +80,7 @@ The YubiKey never goes to xerxes, and the registry token never goes on the lapto
 
 ## Cut a release
 
-### 1. Prepare and merge the release PR (xerxes)
+### 1. Prepare and merge the release PR (build server)
 
 ```sh
 git switch main && git pull --ff-only
@@ -166,7 +168,7 @@ gh run watch
 gh release view v0.17.0-adiri
 ```
 
-### 4. Build (xerxes)
+### 4. Build (build server)
 
 ```sh
 git switch main && git pull --ff-only
@@ -204,7 +206,7 @@ It signs `SHA256SUMS` with the key `release-tag` would use, adds the signature t
 Sign one at a time: two maintainers uploading at once replace each other's file, and `release-sign` stops with an error for the one whose signature was lost.
 Expect one touch; [PIN and touch during signing](yubikey-setup.md#pin-and-touch-during-signing) covers the prompts and retries.
 
-### 6. Verify and publish (xerxes)
+### 6. Verify and publish (build server)
 
 ```sh
 make release-verify TAG=v0.17.0-adiri
@@ -230,7 +232,7 @@ After you type `yes`, it checks that the draft's files are still the ones it ver
 It checks the files once more after publishing, before it moves the alias.
 If the release is the highest published final version in its channel, it points the channel alias at the image digest and confirms that the registry agrees.
 It skips work that is already done, so it is safe to run again.
-`docker logout ghcr.io` removes the registry credential from xerxes until the next release.
+`docker logout ghcr.io` removes the registry credential from the build server until the next release.
 
 ### 7. CI verifies the published release
 
@@ -291,9 +293,9 @@ If `release-sign` had already uploaded the signature, the second run stops becau
 | 1 | `release-prep` finds the version's section lower down in `CHANGELOG.md` | That version was already released; choose the next one. |
 | 2, 3 | The `CHANGELOG.md` check fails on `release-base` | If you are tagging a later commit, set `RELEASE_COMMIT` to the release commit. If the release commit did not land alone, repeat step 1 on the new `main`. |
 | 2, 3 | The signing key is not on the allowlist | Check `git config --get user.signingkey` and `RELEASE_GPG_KEY`, and that your file on `main` holds your current signing key (`gpg --show-keys .github/maintainer-gpg-keys/<handle>.asc`). |
-| 2, 3 | The commit is not attested | On xerxes, run `git switch --detach <commit> && ALLOW_STALE_BASE=1 make attest`, then `git switch main`. If CI failed on it, also run `gh run rerun <run-id>`. |
+| 2, 3 | The commit is not attested | On the build server, run `git switch --detach <commit> && ALLOW_STALE_BASE=1 make attest`, then `git switch main`. If CI failed on it, also run `gh run rerun <run-id>`. |
 | 3 | The tag is wrong and has to go | If CI created no draft and nothing was built, delete it with `git push --delete origin <TAG>` and `git tag -d <TAG>`, then tag again. Otherwise follow [Before publish](#before-publish). |
-| 4, 6 | `run make docker-login` | Run `make docker-login` on xerxes. |
+| 4, 6 | `run make docker-login` | Run `make docker-login` on the build server. |
 | 4 | `package is not public` | Do the [one-time setup](#one-time-setup). |
 | 4 | The image `:<TAG>` is already in the registry | An earlier build pushed it. Rebuild with `RELEASE_REBUILD=1 make release-build TAG=<TAG>`; the new image has a different digest, because builds are not reproducible. |
 | 4 | The release scripts differ from `origin/main` | Run `git switch main && git pull --ff-only`, then the build again. |
@@ -311,7 +313,7 @@ If `release-sign` had already uploaded the signature, the second run stops becau
 ### Before publish
 
 Until the release is published, the public parts are the tag, the `:<TAG>` image, and the release commit on `main`, whose `CHANGELOG.md` section is already on the docs site's [Release notes](../getting-started/release-notes.md) page.
-Delete the draft, the image version and the tag, running the `gh` commands on xerxes, where the package scopes belong:
+Delete the draft, the image version and the tag, running the `gh` commands on the build server, where the package scopes belong:
 
 ```sh
 gh release delete v0.17.0-adiri --yes
@@ -336,7 +338,7 @@ Instead:
 
 1. Put a warning at the top of the release notes with `gh release edit <TAG> --notes-file notes.md`.
 2. Mark the release as a pre-release with `gh release edit <TAG> --prerelease`.
-3. If the channel alias points at it, move the alias back to the previous good release from xerxes, after `make docker-login`:
+3. If the channel alias points at it, move the alias back to the previous good release from the build server, after `make docker-login`:
 
    ```sh
    PREV=vX.Y.Z-adiri

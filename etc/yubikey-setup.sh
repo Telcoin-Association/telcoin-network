@@ -1411,7 +1411,7 @@ stage_github() {
         login=$(gh_login) || die 2 "gh cannot read your GitHub login; is the Mac online?"
         [ "$login" = "$HANDLE" ] || die 1 "gh is logged in as $login, not $HANDLE"
         scopes=$(gh_scopes <<<"$status")
-        case " $scopes " in *" write:packages "*) warn "this gh login has write:packages; keep that scope off every gh login (see 'Registry access on xerxes' in $DOC)" ;; esac
+        case " $scopes " in *" write:packages "*) warn "this gh login has write:packages; keep that scope off every gh login (see 'Registry access on the build server' in $DOC)" ;; esac
         case " $scopes " in
             *" write:gpg_key "*) ;;
             *)
@@ -1533,7 +1533,7 @@ summary() {
         printf '  - keep the revocation certificate from the Mac that generated the key in your password manager or on paper (Store the revocation certificate)\n'
     fi
     printf '  - a lost or broken YubiKey, or a blocked Admin PIN, means a new key, a new allowlist PR and a new GitHub key (Lost or broken YubiKey); a spare YubiKey with a key of its own limits that (Spare YubiKey)\n'
-    printf '  - on xerxes, set up registry access (Registry access on xerxes)\n'
+    printf '  - on the build server, set up registry access (Registry access on the build server)\n'
 }
 
 # ---------------------------------------------------------------------------------------------
