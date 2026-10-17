@@ -2,6 +2,7 @@
 
 mod bullshark;
 mod leader_schedule;
+mod liveness;
 mod state;
 mod utils;
 pub use crate::consensus::{
