@@ -801,8 +801,18 @@ async fn relay_submission_answer(
 /// The client's read timeout fails the read when the body sends nothing for
 /// that long, so an upstream that stalls mid-answer cannot hold it; the caller
 /// bounds the whole read (see [`relay_submission_answer`]).
+///
+/// The buffer is sized from a declared `Content-Length`, an answer that
+/// declares more than `cap` is refused before its body is read, and an answer
+/// without one is shrunk to its length once read, so a held answer costs its
+/// length (see [`HeldAnswer`]).
 async fn read_answer(mut upstream: reqwest::Response, cap: usize) -> Result<Bytes, AnswerLost> {
-    let mut answer = Vec::new();
+    let declared = upstream.content_length();
+    if declared.is_some_and(|len| len > u64::try_from(cap).unwrap_or(u64::MAX)) {
+        return Err(AnswerLost::TooLong);
+    }
+    let mut answer =
+        Vec::with_capacity(declared.and_then(|len| usize::try_from(len).ok()).unwrap_or(0));
     while let Some(chunk) =
         upstream.chunk().await.map_err(|err| AnswerLost::Failed(err.without_url()))?
     {
@@ -812,7 +822,9 @@ async fn read_answer(mut upstream: reqwest::Response, cap: usize) -> Result<Byte
         }
         answer.extend_from_slice(&chunk);
     }
-    Ok(answer.into())
+    // a buffer grown chunk by chunk can hold up to twice its length, and
+    // `Bytes` keeps a vec's whole capacity, so it is shrunk to its length
+    Ok(Bytes::from(answer.into_boxed_slice()))
 }
 
 /// Why [`read_answer`] could not read an answer whole, after the worker had
@@ -4710,6 +4722,100 @@ mod tests {
 
         assert!(matches!(AnswerLost::TooLong.error(), GatewayError::UpstreamAnswerLost));
         assert!(matches!(AnswerLost::TimedOut.error(), GatewayError::UpstreamTimeout));
+        server.abort();
+    }
+
+    /// A submission's answer is read into a buffer of exactly its length, with
+    /// a declared `Content-Length` and without one, so a held answer costs its
+    /// length: a buffer grown chunk by chunk would keep up to twice the answer
+    /// for as long as the client leaves it unread.
+    #[tokio::test]
+    async fn submission_answer_is_held_at_its_length() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let answer = [vec![b'a'; 1000], vec![b'b'; 500]].concat();
+        // each connection gets a 1,500-byte answer in two writes 50 ms apart,
+        // so the read sees two chunks: the first answer is chunked, the second
+        // declares its length; the pause only keeps the chunks apart
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let server = tokio::spawn(async move {
+            for chunked in [true, false] {
+                let (mut stream, _) = listener.accept().await.expect("accept");
+                let mut request = [0u8; 4096];
+                let _ = stream.read(&mut request).await;
+                let head = "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+                            connection: close\r\n";
+                let (first, second) = if chunked {
+                    (
+                        format!(
+                            "{head}transfer-encoding: chunked\r\n\r\n3e8\r\n{}\r\n",
+                            "a".repeat(1000)
+                        ),
+                        format!("1f4\r\n{}\r\n0\r\n\r\n", "b".repeat(500)),
+                    )
+                } else {
+                    (
+                        format!("{head}content-length: 1500\r\n\r\n{}", "a".repeat(1000)),
+                        "b".repeat(500),
+                    )
+                };
+                stream.write_all(first.as_bytes()).await.expect("write");
+                stream.flush().await.expect("flush");
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                stream.write_all(second.as_bytes()).await.expect("write");
+                stream.flush().await.expect("flush");
+            }
+        });
+        let client = proxy_client(
+            UpstreamClientBuilder::for_test(Duration::from_secs(2)),
+            Duration::from_secs(2),
+        )
+        .expect("client");
+
+        for case in ["chunked", "content-length"] {
+            let upstream =
+                client.post(format!("http://{addr}/")).body("{}").send().await.expect(case);
+            let held = match read_answer(upstream, 4096).await {
+                Ok(held) => held,
+                Err(lost) => panic!("{case}: the answer is lost: {lost}"),
+            };
+            assert_eq!(held, answer, "{case}");
+            // bytes hands a unique buffer's allocation to the vec unchanged
+            assert_eq!(Vec::<u8>::from(held).capacity(), 1500, "{case}");
+        }
+        server.abort();
+    }
+
+    /// An answer that declares a length past the cap is lost at its head,
+    /// before its body is read, rather than after a read that waits on it.
+    #[tokio::test]
+    async fn declared_overlong_submission_answer_is_lost_at_its_head() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        // the head promises 5,000 bytes and one byte follows; the connection
+        // then stalls, so a read of the body would wait out the read timeout
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept");
+            let mut request = [0u8; 4096];
+            let _ = stream.read(&mut request).await;
+            let head = "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+                        content-length: 5000\r\n\r\n{";
+            stream.write_all(head.as_bytes()).await.expect("write");
+            tokio::time::sleep(Duration::from_secs(60)).await;
+        });
+        let client = proxy_client(
+            UpstreamClientBuilder::for_test(Duration::from_secs(2)),
+            Duration::from_secs(2),
+        )
+        .expect("client");
+
+        let upstream =
+            client.post(format!("http://{addr}/")).body("{}").send().await.expect("head");
+        let lost = read_answer(upstream, 1024).await.expect_err("an overlong answer is lost");
+        assert!(matches!(lost, AnswerLost::TooLong), "{lost}");
         server.abort();
     }
 }
