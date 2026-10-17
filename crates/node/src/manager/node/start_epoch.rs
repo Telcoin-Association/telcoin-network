@@ -38,6 +38,7 @@ use std::{
     collections::{HashMap, HashSet},
     num::NonZeroUsize,
     sync::Arc,
+    time::Duration,
 };
 use tn_config::{
     Config, ConfigFmt, ConfigTrait as _, ConsensusConfig, NetworkConfig, PriorEpoch, TelcoinDirs,
@@ -550,7 +551,8 @@ where
     ///
     /// Refresh each active handle and initialize pools and RPC servers in id order to preserve the
     /// engine's contiguous worker indexing, then bring up the epoch networks concurrently.
-    /// Extra configured swarms stay idle until a future epoch activates their ids.
+    /// Extra configured swarms keep listening, so they get this epoch's admission window and its
+    /// renewal, but no worker node, until a future epoch activates their ids.
     /// Workers removed from the committee close transaction admission before the new epoch's
     /// workers start.
     #[allow(clippy::too_many_arguments)]
@@ -578,6 +580,12 @@ where
             });
 
         engine.deactivate_workers_above(consensus_config.committee().number_of_workers()).await;
+        self.publish_inactive_worker_windows(
+            consensus_config,
+            &epoch_task_spawner,
+            previous_committee_keys.clone(),
+        )
+        .await?;
 
         // Follow mode changes while workers initialize.
         let engine_for_sync_status = engine.clone();
@@ -613,6 +621,47 @@ where
             )
         }))
         .await
+    }
+
+    /// Publish this epoch's admission window to every configured worker swarm outside the
+    /// on-chain worker range.
+    ///
+    /// These swarms keep their process-lifetime listeners. Without a versioned window their
+    /// admission falls back to Missing (startup) or Stale (after a shrink), and both map to Open
+    /// under Closed. Each gets the same window as the active workers and its renewal on this
+    /// epoch's spawner. No worker node, gossip subscription or dial starts for these ids.
+    async fn publish_inactive_worker_windows(
+        &self,
+        consensus_config: &ConsensusConfig<DB>,
+        epoch_task_spawner: &TaskSpawner,
+        previous_committee_keys: HashSet<BlsPublicKey>,
+    ) -> eyre::Result<()> {
+        let committee_keys: HashSet<BlsPublicKey> = consensus_config
+            .committee()
+            .authorities()
+            .into_iter()
+            .map(|a| *a.protocol_key())
+            .collect();
+        let next_committee_keys: HashSet<BlsPublicKey> =
+            consensus_config.next_committee_keys().iter().copied().collect();
+        futures::future::try_join_all(
+            self.worker_network_handles
+                .iter()
+                .skip(consensus_config.committee().number_of_workers())
+                .map(|handle| {
+                    Self::init_network_for_epoch(
+                        handle.inner_handle(),
+                        u64::from(consensus_config.committee().epoch()),
+                        previous_committee_keys.clone(),
+                        committee_keys.clone(),
+                        next_committee_keys.clone(),
+                        epoch_task_spawner,
+                        consensus_config.network_config().admission().refresh_interval(),
+                    )
+                }),
+        )
+        .await
+        .map(drop)
     }
 
     /// Initialize one worker's persistent components in ascending worker-id order.
@@ -861,9 +910,12 @@ where
             .collect();
         Self::init_network_for_epoch(
             network_handle.inner_handle(),
+            u64::from(consensus_config.committee().epoch()),
             previous_committee_keys,
             committee_keys.clone(),
             next_committee_keys,
+            &epoch_task_spawner,
+            consensus_config.network_config().admission().refresh_interval(),
         )
         .await?;
 
@@ -1035,9 +1087,12 @@ where
             consensus_config.next_committee_keys().iter().copied().collect();
         Self::init_network_for_epoch(
             network_handle.inner_handle(),
+            u64::from(consensus_config.committee().epoch()),
             previous_committee_keys,
             committee_keys.clone(),
             next_committee_keys,
+            &epoch_task_spawner,
+            consensus_config.network_config().admission().refresh_interval(),
         )
         .await?;
 
@@ -1101,10 +1156,10 @@ where
     /// An existing `CvvInactive` state is sticky: a node syncing to rejoin
     /// the committee stays inactive until that resolves elsewhere. Otherwise the node is an
     /// `Observer` if it is not in this committee or a newer epoch record excludes it from the
-    /// committee. A locally eligible node otherwise starts as
-    /// `CvvActive`. `CvvActive` is optimistic: the node assumes it is caught up and is
-    /// demoted to inactive later if that turns out to be false. The chosen mode is written to the
-    /// [`ConsensusBus`] before returning.
+    /// committee. A locally eligible node starts as `CvvInactive` when a newer epoch record proves
+    /// it must catch up, and otherwise starts as `CvvActive`. `CvvActive` is optimistic: the node
+    /// assumes it is caught up and is demoted to inactive later if that turns out to be false.
+    /// The chosen mode is written to the [`ConsensusBus`] before returning.
     async fn identify_node_mode(
         &self,
         consensus_config: &ConsensusConfig<DB>,
@@ -1156,20 +1211,47 @@ where
 
     /// Point a network handle at a new epoch's committee membership.
     ///
-    /// Every epoch sets the previous/current/next committee slots directly from authoritative
-    /// state via `update_committees`.
+    /// Every epoch publishes its immutable authoritative committee window and renews its
+    /// admission lease on the epoch-scoped spawner. Shutdown cancels renewal; delayed commands
+    /// from an older epoch cannot overwrite a newer window. Every swarm uses the same contract.
     ///
     /// Process startup has already registered bootstrap peers, so `known_peers` is populated
     /// before the peer manager resolves these committee slots.
     async fn init_network_for_epoch<Req: TNMessage, Res: TNMessage>(
         handle: &NetworkHandle<Req, Res>,
+        epoch: u64,
         previous_committee_keys: HashSet<BlsPublicKey>,
         committee_keys: HashSet<BlsPublicKey>,
         next_committee_keys: HashSet<BlsPublicKey>,
+        epoch_task_spawner: &TaskSpawner,
+        refresh_interval: Duration,
     ) -> eyre::Result<()> {
         handle
-            .update_committees(previous_committee_keys, committee_keys, next_committee_keys)
+            .update_committees_at(
+                epoch,
+                previous_committee_keys.clone(),
+                committee_keys.clone(),
+                next_committee_keys.clone(),
+            )
             .await?;
+        let handle = handle.clone();
+        epoch_task_spawner.spawn_task("Renew admission committee snapshot", async move {
+            let interval = tokio::time::interval(refresh_interval);
+            futures::stream::unfold(interval, |mut interval| async move {
+                interval.tick().await;
+                Some(((), interval))
+            }).for_each(move |()| {
+                let handle = handle.clone();
+                let previous = previous_committee_keys.clone();
+                let current = committee_keys.clone();
+                let next = next_committee_keys.clone();
+                async move {
+                    let _ = handle.renew_committees_at(epoch, previous, current, next).await
+                        .inspect_err(|error| warn!(target: "epoch-manager", ?error, epoch, "admission snapshot renewal failed"));
+                }
+            }).await;
+            Ok(())
+        });
         Ok(())
     }
 
@@ -1327,7 +1409,7 @@ mod tests {
         use rand::{rngs::StdRng, SeedableRng as _};
         use std::time::Duration;
         use tn_config::KeyConfig;
-        use tn_network_libp2p::types::NetworkCommand;
+        use tn_network_libp2p::{types::NetworkCommand, CommitteeUpdate};
         use tn_reth::{recover_raw_transaction, test_utils::TransactionFactory, RethEnv};
         use tn_storage::mem_db::MemDatabase;
         use tn_test_utils::{wait_until, CommitteeFixture};
@@ -1445,6 +1527,7 @@ mod tests {
 
         // Identify the role before worker startup, as create_consensus does in production.
         let consensus_bus = ConsensusBus::new_with_app(manager.consensus_bus.clone());
+        let (window_sender, mut window_changes) = mpsc::unbounded_channel();
         if mode.is_cvv_inactive() {
             manager.consensus_bus.node_mode().send_replace(NodeMode::CvvInactive);
         }
@@ -1464,12 +1547,14 @@ mod tests {
             .map(|worker_id| {
                 let (sender, receiver) = mpsc::channel(128);
                 let topic_sender = topic_sender.clone();
+                let window_sender = window_sender.clone();
                 let first_probes = first_probes.clone();
                 network_tasks.spawn_task("test worker commands", async move {
                     let probed = std::sync::atomic::AtomicBool::new(false);
                     tokio_stream::wrappers::ReceiverStream::new(receiver)
                         .for_each(|command| {
                             let topic_sender = topic_sender.clone();
+                            let window_sender = window_sender.clone();
                             let first_probes = &first_probes;
                             let probed = &probed;
                             async move {
@@ -1493,6 +1578,13 @@ mod tests {
                                     let _ = topic_sender
                                         .send(BatchTopicChange::Unsubscribe(worker_id, topic));
                                     let _ = reply.send(false);
+                                } else if let NetworkCommand::UpdateAdmissionCommittees {
+                                    update,
+                                    epoch,
+                                    ..
+                                } = command
+                                {
+                                    let _ = window_sender.send((worker_id, update, epoch));
                                 } else if let NetworkCommand::ConnectedPeerIds { reply } = command {
                                     let _ = reply.send(Default::default());
                                 }
@@ -1700,6 +1792,21 @@ mod tests {
             futures::stream::iter(&shrunk).then(|worker| worker.id()).collect::<Vec<_>>().await;
         assert_eq!(ids, vec![0]);
         assert_topics(1)?;
+        // The retired worker keeps its listener, so it gets the same epoch-start window as
+        // worker 0. The reply to this command proves the mock handled the earlier window command.
+        manager
+            .worker_network_handles
+            .get(1)
+            .ok_or_else(|| eyre!("retired worker handle"))?
+            .inner_handle()
+            .connected_peer_count()
+            .await?;
+        let mut windows = std::iter::from_fn(|| window_changes.try_recv().ok())
+            .filter(|(_, update, epoch)| *update == CommitteeUpdate::EpochStart && *epoch == 2)
+            .map(|(worker_id, ..)| worker_id)
+            .collect::<Vec<_>>();
+        windows.sort_unstable();
+        assert_eq!(windows, vec![0, 1]);
         assert_eq!(engine.worker_http_local_address(&0).await?, rpc_zero);
         assert_eq!(
             engine.worker_readiness(tn_types::NodeMode::CvvActive).await,

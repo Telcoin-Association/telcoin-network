@@ -10,6 +10,7 @@ exclude.workspace = true
 description = "Read-only kademlia client that fetches BLS-signed Telcoin Network node records without running a node."
 
 [dependencies]
+tn-network-libp2p = { workspace = true }
 tn-node-record = { workspace = true }
 libp2p = { workspace = true, features = ["kad", "gossipsub", "quic", "tokio", "macros"] }
 tokio = { workspace = true, features = ["rt", "sync", "macros", "time"] }
@@ -18,7 +19,6 @@ tracing = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]
-tn-network-libp2p = { workspace = true }
 tn-config = { workspace = true, features = ["test-utils"] }
 tn-storage = { workspace = true, features = ["test-utils"] }
 tn-test-utils = { workspace = true }

@@ -5,6 +5,7 @@
 use crate::{
     codec::{PeerExchangeCodec, TNCodec, TNMessage},
     error::NetworkError,
+    gossip_config::gossipsub_config,
     kad::{node_record_key, KadStore},
     metrics::{
         ConnectionLimitReason, InboundDenial, InboundFailureOutcome, PeerManagerMetrics,
@@ -609,22 +610,9 @@ where
         // (GHSA-cc64-wfq5-56ph).
         let record_domain = RecordDomain::new(chain_id, network_type);
 
-        let gossipsub_config = gossipsub::ConfigBuilder::default()
-            // explicitly set default
-            .heartbeat_interval(Duration::from_secs(1))
-            // explicitly set default
-            .validation_mode(gossipsub::ValidationMode::Strict)
-            // TN specific: filter against authorized_publishers for certain topics
-            .validate_messages()
-            // Gossipsub negotiates its own `/meshsub` protocol, independent of the
-            // req-res/kad/stream names below, so without this it is the one wire
-            // protocol two chains still share: namespacing the topics keeps their
-            // messages apart but still lets cross-chain peers negotiate a gossip
-            // substream. Folding the chain id into the protocol id closes that gap.
-            // The builder appends `/1.1.0` and `/1.0.0`, yielding
-            // `/tn-meshsub-{chain_id}/1.1.0` and `/tn-meshsub-{chain_id}/1.0.0`.
-            .protocol_id_prefix(crate::types::gossip_protocol_id_prefix(chain_id))
-            .build()?;
+        // Explicit frame limits and the order the library applies them: see
+        // `gossipsub_config` (issue #1655).
+        let gossipsub_config = gossipsub_config(chain_id)?;
         let gossipsub = gossipsub::Behaviour::new(
             gossipsub::MessageAuthenticity::Signed(keypair.clone()),
             gossipsub_config,
@@ -746,6 +734,12 @@ where
         // rotation. Our own record is skipped: both primary and worker key their record by
         // the primary BLS key, and there is no point caching ourselves as a known peer.
         let own_key = key_config.primary_public_key();
+        behavior.peer_manager.configure_admission(network_config.admission().clone(), own_key);
+        // A live owner re-signs its record every publication interval. A cached window record
+        // older than two intervals is queried again, so a rotated network key heals under Closed.
+        behavior
+            .peer_manager
+            .configure_record_max_age(network_config.libp2p_config().kad_publication_interval * 2);
         let mut restored: usize = 0;
         for (key, info) in known {
             if key == own_key {
@@ -1469,6 +1463,7 @@ where
                 send_or_log_error!(reply, peers, "PeersForExchange");
             }
             NetworkCommand::UpdateCommittees { previous, current, next } => {
+                self.swarm.behaviour_mut().peer_manager.invalidate_admission();
                 // The network mirrors three of the on-chain registry's committees: previous,
                 // current, and next. Peers in any of the three count as validators so the
                 // just-completed committee is not pruned while late gossip may still arrive and
@@ -1492,6 +1487,41 @@ where
                 self.refresh_explicit_peers();
                 self.query_missing_required_records();
                 retention?;
+            }
+            NetworkCommand::UpdateAdmissionCommittees {
+                update,
+                epoch,
+                previous,
+                current,
+                next,
+            } => {
+                // Mirror the `UpdateCommittees` arm for authoritative epoch updates. Only an
+                // applied update moves retention: every accepted epoch-start send, and a renewal
+                // that changes membership. An old or contradictory revision cannot prune the
+                // records of the accepted committees.
+                let window: Vec<_> =
+                    previous.iter().chain(&current).chain(&next).copied().collect();
+                let applied = self
+                    .swarm
+                    .behaviour_mut()
+                    .peer_manager
+                    .update_committees_at(update, epoch, previous, current, next);
+                if applied {
+                    let retention = self
+                        .swarm
+                        .behaviour_mut()
+                        .kademlia
+                        .store_mut()
+                        .retain_committees(window)
+                        .map_err(|error| NetworkError::StoreKademliaRecord(error.to_string()));
+                    self.refresh_explicit_peers();
+                    self.query_missing_required_records();
+                    retention?;
+                }
+            }
+            NetworkCommand::AdmissionStatus { reply } => {
+                let status = self.swarm.behaviour().peer_manager.admission_status();
+                send_or_log_error!(reply, status, "AdmissionStatus");
             }
             NetworkCommand::PrepareCommitteeDial { committee } => {
                 // Deadlock-breaker pre-dial: forgive bans so the committee can be dialed without
