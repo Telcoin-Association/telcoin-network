@@ -97,14 +97,19 @@ const EOPNOTSUPP: i32 = 95;
 /// Linux `EHOSTDOWN`: the peer's host is down.
 const EHOSTDOWN: i32 = 112;
 
-/// Liveness probe path. Exempt from rate limiting (see [`crate::ratelimit`]).
+/// Liveness probe path. Its `GET` and `HEAD` are exempt from rate limiting (see
+/// [`crate::ratelimit`]); any other method is limited and then refused with a
+/// `405`.
 pub(crate) const HEALTH_PATH: &str = "/health";
 
-/// Readiness probe path. Exempt from rate limiting (see [`crate::ratelimit`]).
+/// Readiness probe path. Its `GET` and `HEAD` are exempt from rate limiting
+/// (see [`crate::ratelimit`]); any other method is limited and then refused
+/// with a `405`.
 pub(crate) const READY_PATH: &str = "/ready";
 
-/// Read-availability probe path. Never rate limited: [`router`] adds it after
-/// every layer but the `nosniff` one.
+/// Read-availability probe path. Its `GET` and `HEAD` are never rate limited:
+/// [`router`] adds it after every layer but the `nosniff` one. Any other method
+/// passes the identity and rate-limit layers before its `405`.
 pub(crate) const READY_ANY_PATH: &str = "/ready/any";
 
 /// Default budget of request-body bytes held across all in-flight requests
@@ -728,8 +733,8 @@ impl Drop for ClientSlot {
 /// The probe paths answer `GET` and `HEAD`; any other method on them, `POST`
 /// included, gets the same `405` envelope as a non-`POST` request anywhere
 /// else, with axum's `Allow: GET,HEAD` in place of the proxy's `Allow: POST`.
-/// A `POST` to a probe path is not proxied because the rate limiter exempts
-/// those paths, so proxying it would let JSON-RPC skip the limits.
+/// A `POST` to a probe path is not proxied: the path belongs to the probe, and
+/// its answer must not depend on the upstream.
 ///
 /// `layers` carries the optional layers (see [`RouterLayers`]). When it holds
 /// rate limiters, the rate-limit layer is installed inside up to four layers
@@ -748,7 +753,7 @@ impl Drop for ClientSlot {
 /// so a request answered there is logged like a proxied one: a `429`, a
 /// byte-budget `413` or `503`, a `405`, the deadline's `408` or `504` and, with
 /// CORS on, a preflight.
-/// `/health` and `/ready` are exempt by path, as from the rate limiter.
+/// `/health` and `/ready` are not logged, whatever their method.
 ///
 /// The CORS layer answers every `OPTIONS` itself as a preflight, so a
 /// preflight is never forwarded, never refused by the proxy's `POST`-only
@@ -858,8 +863,10 @@ async fn set_nosniff(mut response: Response) -> Response {
 /// client disconnect, the connection-lifetime cap or shutdown. Every answer
 /// records its own outcome where it is built, so only this drop needs a
 /// guard, and the guard is disarmed once any response comes back. The probes
-/// `/health` and `/ready` are skipped, as they are by every request metric;
-/// `/ready/any` is added after this layer and never reaches it.
+/// `/health` and `/ready` are skipped (their `GET` and `HEAD` record no request
+/// metric; another method's `405` or `429` records its own `rejected` outcome
+/// where it is built); `/ready/any` is added after this layer and never
+/// reaches it.
 async fn count_cancelled(request: Request, next: Next) -> Response {
     let path = request.uri().path();
     if path == HEALTH_PATH || path == READY_PATH {
@@ -1023,10 +1030,12 @@ async fn enforce_request_deadline(
 /// the proxy has the upstream's response head, or, for a single submission,
 /// its whole answer; the buffered body is dropped by then. It cannot ride in
 /// the request extensions instead: the proxy drops the request's parts before
-/// it reads the body. Probes are exempt, as they are from rate limiting, and so
-/// is a request that is not a `POST`: it is refused with the `405` before its
-/// body is read (see [`crate::proxy::PostOnly`]), so it holds no bytes, and
-/// its `405` is not masked by a `413` or a `503`.
+/// it reads the body. Requests to `/health` and `/ready` are exempt whatever
+/// their method (their `GET`/`HEAD` hold no body, and any other method is
+/// refused with a `405` without reading one), and so is a request that is not
+/// a `POST`: it is refused with the `405` before its body is read (see
+/// [`crate::proxy::PostOnly`]), so it holds no bytes, and its `405` is not
+/// masked by a `413` or a `503`.
 async fn reserve_request_bytes(
     State(budget): State<Arc<RequestByteBudget>>,
     request: Request,
@@ -8687,8 +8696,8 @@ mod tests {
         .await;
 
         let client = Client::new();
-        // a POST to a probe path is refused too: the rate limiter exempts
-        // those paths, so it must not reach the proxy
+        // a POST to a probe path is refused too: the probe routes refuse it
+        // before the proxy
         const NON_POST: &str = "only POST is accepted";
         const NON_GET: &str = "only GET and HEAD are accepted on this path";
         for (method, path, allow, message) in [
