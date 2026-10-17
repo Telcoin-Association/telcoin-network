@@ -868,6 +868,29 @@ pub(crate) struct PeerManagerMetrics {
 }
 
 impl PeerManagerMetrics {
+    /// Timestamp the swarm's latest authoritative resolution observation.
+    pub(crate) fn mark_committee_observed(&self) {
+        let observed = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0.0, |time| time.as_secs_f64());
+        metrics::gauge!("tn_network.committee_observed_timestamp_seconds", "network" => self.network.clone())
+            .set(observed);
+    }
+
+    /// Publish one of the three fixed committee slots, scoped to this configured swarm.
+    pub(crate) fn set_committee_resolution(
+        &self,
+        slot: &'static str,
+        expected: usize,
+        unresolved: usize,
+    ) {
+        let count = |value| u32::try_from(value).map_or(f64::from(u32::MAX), f64::from);
+        metrics::gauge!("tn_network.committee_required_members", "network" => self.network.clone(), "slot" => slot)
+            .set(count(expected));
+        metrics::gauge!("tn_network.committee_unresolved_members", "network" => self.network.clone(), "slot" => slot)
+            .set(count(unresolved));
+    }
+
     /// Publish admission inputs independently of connections and node consensus readiness.
     pub(crate) fn set_admission(&self, status: &crate::AdmissionStatus) {
         let mode = match status.effective() {

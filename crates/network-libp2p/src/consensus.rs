@@ -1033,6 +1033,10 @@ where
         // add peer record if address confirmed
         self.swarm.behaviour_mut().kademlia.set_mode(Some(Mode::Server));
         self.provide_our_data();
+        self.swarm
+            .behaviour()
+            .peer_manager
+            .observe_committee_resolution(self.key_config.primary_public_key());
 
         // Startup already published our record. Refresh only after the first full interval,
         // and skip missed ticks to avoid a burst of signing and publication after a stall.
@@ -1080,6 +1084,10 @@ where
             let (pending, deferred) = self.record_exchange.counts();
             self.metrics.set_record_exchange_pending(pending, deferred);
             self.metrics.record_quic_incoming(&self.quic_incoming);
+            self.swarm
+                .behaviour()
+                .peer_manager
+                .observe_committee_resolution(self.key_config.primary_public_key());
         }
     }
 
@@ -1568,6 +1576,11 @@ where
                 let rpcs = self.swarm.behaviour_mut().peer_manager.current_committee_rpcs();
                 send_or_log_error!(reply, rpcs, "GetAllValidatorRpcs");
             }
+            NetworkCommand::GetCommitteeRpcSnapshot { reply } => {
+                let snapshot = self.committee_rpc_snapshot();
+                self.query_missing_required_records();
+                send_or_log_error!(reply, snapshot, "GetCommitteeRpcSnapshot");
+            }
             NetworkCommand::OpenStream { peer, reply } => {
                 // Look up the peer's PeerId from their BLS key
                 let (peer_id, addrs) = match self.swarm.behaviour().peer_manager.auth_to_peer(peer)
@@ -1631,6 +1644,38 @@ where
         } else {
             self.swarm.behaviour_mut().gossipsub.remove_explicit_peer(peer);
         }
+    }
+
+    /// Read submit advertisements only while their matching signed store record is live.
+    /// The resolution cache deliberately outlives DHT expiry for consensus liveness; that
+    /// cached identity alone cannot prove fresh submit coverage.
+    fn committee_rpc_snapshot(&mut self) -> crate::types::CommitteeRpcSnapshot {
+        let behaviour = self.swarm.behaviour_mut();
+        let snapshot = behaviour.peer_manager.committee_rpc_snapshot();
+        let rpcs: Vec<_> = snapshot
+            .rpcs()
+            .iter()
+            .filter(|(key, rpc)| {
+                behaviour
+                    .kademlia
+                    .store_mut()
+                    .get(&node_record_key(key))
+                    .and_then(|record| NodeRecord::try_decode_compat(&record.value))
+                    .is_some_and(|record| {
+                        record.info.rpc.as_ref() == Some(rpc)
+                            && behaviour
+                                .peer_manager
+                                .record_timestamp(key, record.info.timestamp)
+                                .is_some()
+                    })
+            })
+            .cloned()
+            .collect();
+        crate::types::CommitteeRpcSnapshot::new(
+            snapshot.members().clone(),
+            rpcs,
+            snapshot.advertisements().to_vec(),
+        )
     }
 
     /// Refill required rows after ownership updates, even if the restored peer cache already
