@@ -762,27 +762,27 @@ An `id` that is an array, an object, a boolean or a string over 256 bytes is ech
 The exceptions are a request whose head hyper, the HTTP library underneath, cannot parse (below), a connection that does not finish its request head within `--header-read-timeout` (closed without a response), a connection over `--max-connections-per-ip`, which is closed before any request is read, and an exchange still running when the connection-lifetime grace or `--graceful-shutdown-timeout` ends (see [Connection handling](#connection-handling) and [Graceful shutdown](#graceful-shutdown)).
 Hyper answers an unparseable request head itself, before the request reaches the gateway's service, with a bare `400` (malformed request line or headers), `414` (request target longer than 65,534 bytes) or `431` (request head too large, or too many headers), without a JSON-RPC body or `X-Content-Type-Options: nosniff`; the gateway cannot intercept these.
 
-| Condition | HTTP | JSON-RPC error code |
-| --- | --- | --- |
-| No upstream ready | `503` | `-32000` |
-| Upstream unreachable | `502` | `-32001` |
-| Upstream request timed out | `504` | `-32002` |
-| Upstream answered a submission, but its answer was lost (the transaction may have been accepted; reason `upstream_answer_lost`) | `502` | `-32013` |
-| Request body too large | `413` | `-32003` |
-| Batch longer than `--max-batch-len` | `413` | `-32003` |
-| Proxy loop detected (the request carries `X-TN-Gateway`; reason `loop_detected`) | `508` | `-32004` |
-| Redirect loop detected (the request carries `X-TN-Gateway-Redirect` and this gateway has `--redirect-queries`; reason `redirect_loop_detected`) | `508` | `-32004` |
-| Request deadline exceeded before the request was sent upstream | `408` | `-32005` |
-| Request deadline exceeded after the request was sent upstream | `504` | `-32005` |
-| Rate limit exceeded | `429` | `-32006` |
-| Raw transaction undecodable | `400` | `-32007` |
-| Unsupported transaction type: an EIP-4844 blob, an EIP-7702 set-code or an unknown typed envelope (`0x05`..=`0x7f`), refused from its type byte, so a malformed type-3 or type-4 payload gets this code rather than `-32007` (the message names the type) | `400` | `-32008` |
-| Request body unreadable (client aborted), or a batch the gateway cannot read to its end | `400` | `-32600` |
-| Method other than `POST` (other than `GET` or `HEAD` on `/health`, `/ready` and `/ready/any`) | `405` | `-32600` |
-| In-flight cap reached (overloaded) | `503` | `-32009` |
-| In-flight request byte budget exhausted | `503` | `-32010` |
-| Method refused by the [method policy](#method-policy) (no `--redirect-queries`) | `403` | `-32011` |
-| Upstream answered an error status without a JSON body, a `2xx` from the query URL without one, or a status that cannot carry a body | the upstream's, or `502` for a `1xx`, `204`, `205` or `304` | `-32012` |
+| Condition | HTTP | JSON-RPC error code | `reason` |
+| --- | --- | --- | --- |
+| No upstream ready | `503` | `-32000` | `no_upstream_ready` |
+| Upstream unreachable | `502` | `-32001` | `upstream_unreachable` |
+| Upstream request timed out | `504` | `-32002` | `upstream_timeout` |
+| Upstream answered a submission, but its answer was lost (the transaction may have been accepted) | `502` | `-32013` | `upstream_answer_lost` |
+| Request body too large | `413` | `-32003` | `request_too_large` |
+| Batch longer than `--max-batch-len` | `413` | `-32003` | `batch_too_long` |
+| Proxy loop detected (the request carries `X-TN-Gateway`) | `508` | `-32004` | `loop_detected` |
+| Redirect loop detected (the request carries `X-TN-Gateway-Redirect` and this gateway has `--redirect-queries`) | `508` | `-32004` | `redirect_loop_detected` |
+| Request deadline exceeded before the request was sent upstream | `408` | `-32005` | `request_timeout` |
+| Request deadline exceeded after the request was sent upstream | `504` | `-32005` | `request_timeout` |
+| Rate limit exceeded | `429` | `-32006` | `rate_limited` |
+| Raw transaction undecodable | `400` | `-32007` | `invalid_transaction` |
+| Unsupported transaction type: an EIP-4844 blob, an EIP-7702 set-code or an unknown typed envelope (`0x05`..=`0x7f`), refused from its type byte, so a malformed type-3 or type-4 payload gets this code rather than `-32007` (the message names the type) | `400` | `-32008` | `unsupported_transaction_type` |
+| Request body unreadable (client aborted), or a batch the gateway cannot read to its end | `400` | `-32600` | `unreadable_body` |
+| Method other than `POST` (other than `GET` or `HEAD` on `/health`, `/ready` and `/ready/any`) | `405` | `-32600` | `method_not_post` |
+| In-flight cap reached (overloaded) | `503` | `-32009` | `overloaded` |
+| In-flight request byte budget exhausted | `503` | `-32010` | `inflight_bytes_exhausted` |
+| Method refused by the [method policy](#method-policy) (no `--redirect-queries`) | `403` | `-32011` | `method_not_allowed` |
+| Upstream answered an error status without a JSON body, a `2xx` from the query URL without one, or a status that cannot carry a body | the upstream's, or `502` for a `1xx`, `204`, `205` or `304` | `-32012` | `upstream_error` |
 
 The two capacity `503`s, `-32009` and `-32010`, carry `Retry-After: 1`: a slot or a byte reservation frees as soon as a request in flight finishes, so a client or proxy that honours the header waits a second instead of retrying at once.
 
@@ -857,7 +857,7 @@ the same Prometheus stay out of it.
 | --- | --- | --- | --- |
 | `tn_worker_gateway_inflight_requests` | gauge | | Proxied requests from their buffered body until the relayed response's body has finished streaming (or the gateway's own error); the request body read and requests refused before the proxy handler (by the rate limiter or the byte budget) are not counted. The intended autoscaling signal. |
 | `tn_worker_gateway_requests_total` | counter | `outcome` (`forwarded` / `rejected` / `upstream_error` / `cancelled`) | Proxied requests by terminal outcome; `upstream_error` is a request whose upstream's answer the gateway replaced with the `-32012` error (an error status without a JSON body, an answer from the query URL without one, or a `1xx`, `204`, `205` or `304`), a submission whose answer was lost after the worker's `2xx` counts as `rejected` under the reason of the error it gets (`upstream_answer_lost` or `upstream_timeout`), and `cancelled` is a request whose connection closed before the gateway answered (client disconnect, `--max-connection-duration`, shutdown). |
-| `tn_worker_gateway_rejections_total` | counter | `reason` | Rejected and `upstream_error` proxied requests, broken down by reason (the conditions in the failure table above). |
+| `tn_worker_gateway_rejections_total` | counter | `reason` | Rejected and `upstream_error` proxied requests, broken down by reason; the `reason` column of [Behaviour on failure](#behaviour-on-failure) names each label. |
 | `tn_worker_gateway_request_duration_seconds` | histogram | | Time from a proxied request's buffered body to the end of its response body (or the gateway's own error); not end-to-end, as it leaves out the request body read and requests refused before the proxy handler (by the rate limiter or the byte budget). |
 | `tn_worker_gateway_upstream_ready` | gauge | `worker_id`, `upstream` (the RPC URL's origin, `scheme://host:port`) | Per-worker published readiness, after the poll thresholds and passive health (`1` ready, `0` not-ready); nodes whose workers share an id keep separate series. |
 | `tn_worker_gateway_routed_requests_total` | counter | `route` (`worker` / `query`), `result` (`forwarded` / `upstream_error` / `unreachable` / `timeout` / `body_failed`) | Forward attempts by route, with their result; `body_failed` counts a forwarded response whose body then failed, in addition to its `forwarded`: a streamed body that failed mid-stream, or a worker's answer to a submission that was lost while the gateway read it whole (see [Reads kept on the worker](#reads-kept-on-the-worker)); the reads kept on the worker count under `worker`. A forward cut short by the whole-request deadline has no result here; it shows as `tn_worker_gateway_rejections_total{reason="request_timeout"}`. |
