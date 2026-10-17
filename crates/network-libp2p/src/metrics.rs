@@ -42,6 +42,8 @@ struct SwarmMetricHandles {
     receive_credit_per_connection_bytes: Gauge,
     /// Gossip messages published by this node.
     gossip_published_total: Counter,
+    /// Gossip publishes refused because the send queue of every recipient peer was full.
+    gossip_publish_queue_full_total: Counter,
     /// Gossip messages received from peers.
     gossip_received_total: Counter,
     /// Gossip messages rejected (failed verification against authorized publishers).
@@ -701,6 +703,14 @@ impl SwarmMetrics {
         self.handles.gossip_published_total.increment(1);
     }
 
+    /// Record a gossip publish refused because every recipient peer's send queue was full.
+    ///
+    /// The swarm task does not retry the publish. The caller receives
+    /// `PublishError::AllQueuesFull` and decides what to do.
+    pub(crate) fn record_gossip_publish_queue_full(&self) {
+        self.handles.gossip_publish_queue_full_total.increment(1);
+    }
+
     /// Record a gossip message received from a peer.
     pub(crate) fn record_gossip_received(&self) {
         self.handles.gossip_received_total.increment(1);
@@ -1110,6 +1120,7 @@ mod tests {
         metrics::with_local_recorder(&recorder, || {
             let swarm = SwarmMetrics::new_for(&NetworkType::Primary);
             swarm.record_gossip_published();
+            swarm.record_gossip_publish_queue_full();
             swarm.record_gossip_received();
             swarm.record_gossip_rejected();
             swarm.set_pending(1, 2);
@@ -1138,6 +1149,10 @@ mod tests {
         };
 
         let (key, _, _, value) = find("tn_network.gossip_published_total");
+        assert!(matches!(value, DebugValue::Counter(1)));
+        assert!(key.key().labels().any(|l| l.key() == "network" && l.value() == "primary"));
+
+        let (key, _, _, value) = find("tn_network.gossip_publish_queue_full_total");
         assert!(matches!(value, DebugValue::Counter(1)));
         assert!(key.key().labels().any(|l| l.key() == "network" && l.value() == "primary"));
 
