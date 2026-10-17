@@ -417,8 +417,9 @@ pub(crate) async fn proxy(
     // with `--rate-limit-submissions` the edge charged only the per-IP bucket,
     // since it could not tell the classes apart: the first call is charged
     // here, a submission to its own budget and anything else to the global
-    // bucket, and a refusal gives the per-IP token back, so a refused
-    // submission spends no read budget and a refused read no submission budget
+    // bucket; a refusal spends no other shared bucket, so a refused submission
+    // spends no read budget and a refused read no submission budget, and the
+    // per-IP token stays spent, since it paid for reading this body
     if let Some(Extension(budget)) = &submission_budget {
         if let Err(err) = budget.charge(class == Class::Submission) {
             return error_response(&err, body.as_ref());
