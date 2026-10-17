@@ -507,6 +507,13 @@ impl FromStr for Cidr {
 /// address, a bracketed IPv6 address (`[2001:db8::7]`), or an address with a
 /// port (`203.0.113.7:4711`, `[2001:db8::7]:4711`), which some proxies append;
 /// the port is dropped.
+///
+/// An IPv6 address with a port must be bracketed: an unbracketed
+/// `2001:db8::7:4711` is itself a valid IPv6 address and is read as that
+/// address, the port in its low bits, so a front that appends a port to an
+/// IPv6 client address must bracket it; otherwise the groups shift one place
+/// left and the client could choose its rate-limit prefix through its
+/// interface identifier.
 fn parse_forwarded_entry(entry: &str) -> Option<IpAddr> {
     let entry = entry.trim();
     let ip = match entry.strip_prefix('[').and_then(|rest| rest.strip_suffix(']')) {
