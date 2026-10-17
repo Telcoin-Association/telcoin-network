@@ -7744,8 +7744,11 @@ mod tests {
         assert_eq!((status, text.as_str()), (StatusCode::OK, "worker"));
         let (status, text) = post_rpc(gateway, None, nonce_read("pending", 2)).await;
         assert_eq!((status, text.as_str()), (StatusCode::OK, "worker"));
+        // the tag matches in any ASCII case, as the worker reads it
+        let (status, text) = post_rpc(gateway, None, nonce_read("Pending", 3)).await;
+        assert_eq!((status, text.as_str()), (StatusCode::OK, "worker"));
 
-        assert_eq!((worker_seen.hits(), worker_seen.hop_marker()), (2, 2));
+        assert_eq!((worker_seen.hits(), worker_seen.hop_marker()), (3, 3));
         assert_eq!(query_seen.hits(), 0);
     }
 
@@ -7764,8 +7767,6 @@ mod tests {
             nonce_read("0x10", 3),
             // the block parameter defaults to latest
             call_with("eth_getTransactionCount", &format!(r#"["{ADDRESS}"]"#), 4),
-            // the tag matches case-sensitively, like the method names
-            nonce_read("Pending", 5),
         ];
         for body in &reads {
             let (status, text) = post_rpc(gateway, None, body.clone()).await;

@@ -2278,7 +2278,8 @@ impl<'de> Call<'de> {
 /// read at `pending` (`eth_call`, `eth_getBalance`, `eth_estimateGas`) stays
 /// on the query upstream. So does a batch: [`scan`] reads a pool read from a
 /// single call only, so a batch keeps the route its calls give it. Method
-/// names and the tag match exactly and case-sensitively.
+/// names match exactly and case-sensitively; the tag matches in any ASCII
+/// case, as the worker reads it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PoolRead {
     /// [`GET_TRANSACTION_COUNT`] whose block parameter is the string
@@ -2558,8 +2559,9 @@ impl<'de> Deserialize<'de> for MaybeByte {
     }
 }
 
-/// Whether a value is the string [`PENDING_TAG`], compared where it lies and
-/// never copied; any other shape is consumed and discarded.
+/// Whether a value is the string [`PENDING_TAG`] in any ASCII case, as the
+/// worker's `BlockNumberOrTag` reads the tag, compared where it lies and never
+/// copied; any other shape is consumed and discarded.
 struct PendingTag(bool);
 
 impl Lenient<'_> for PendingTag {
@@ -2568,7 +2570,7 @@ impl Lenient<'_> for PendingTag {
     }
 
     fn string(value: &str) -> Self {
-        Self(value == PENDING_TAG)
+        Self(value.eq_ignore_ascii_case(PENDING_TAG))
     }
 }
 
@@ -4226,7 +4228,9 @@ mod tests {
             (format!(r#"["{ADDRESS}","pending"]"#), true),
             (format!(r#"["{ADDRESS}","pending","extra"]"#), true),
             (format!(r#"["{ADDRESS}","latest"]"#), false),
-            (format!(r#"["{ADDRESS}","Pending"]"#), false),
+            (format!(r#"["{ADDRESS}","Pending"]"#), true),
+            (format!(r#"["{ADDRESS}","PENDING"]"#), true),
+            (format!(r#"["{ADDRESS}","\u0050ending"]"#), true),
             (format!(r#"["{ADDRESS}","0x10"]"#), false),
             (format!(r#"["{ADDRESS}"]"#), false),
             (format!(r#"["{ADDRESS}",{{"blockNumber":"pending"}}]"#), false),

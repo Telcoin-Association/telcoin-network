@@ -676,7 +676,7 @@ The rule is exact:
 
 - Only a single call counts.
   A batch keeps the classification above: it goes to the worker only when every element is a submission, so a batch holding one of these reads goes, whole, to the query URL.
-- Method names and the `"pending"` tag match exactly and case-sensitively, after unicode escapes are decoded, as the worker reads them.
+- Method names match exactly and case-sensitively, after unicode escapes are decoded, as the worker reads them; the `"pending"` tag matches in any ASCII case, such as `"PENDING"`, as the worker reads it.
   A block parameter given any other way, such as `{"blockNumber": "pending"}`, or left out (which means `latest`) sends the nonce read to the query URL.
 - Every other read at `pending`, such as `eth_call`, `eth_getBalance` and `eth_estimateGas`, still goes to the query URL and can lag the worker's pool.
 - A hash is remembered only for a single `eth_sendRawTransaction` that passed the [transaction screen](#transaction-screening) and that the worker accepted: a `2xx` answer carrying a JSON-RPC `result`.
