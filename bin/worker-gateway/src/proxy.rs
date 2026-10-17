@@ -4543,12 +4543,34 @@ mod tests {
     /// [`HeldAnswer::MAX_FRAME`] bytes that add up to the answer, its exact
     /// size hint shrinking to zero as they are taken, and it keeps its class
     /// slot until the body itself is dropped.
+    ///
+    /// The frames are copies so that the answer's allocation leaves with the
+    /// body: frames hyper still queues after it has dropped the body, and with
+    /// it the guards, cannot keep that allocation alive. The answer is built
+    /// on an owner that records when it is freed, and every frame is kept
+    /// until the body has yielded the last one.
     #[tokio::test]
     async fn held_answer_yields_bounded_frames() {
+        use std::sync::atomic::AtomicBool;
+
+        /// The answer's allocation, which records when it is freed.
+        struct Owner(Vec<u8>, Arc<AtomicBool>);
+        impl AsRef<[u8]> for Owner {
+            fn as_ref(&self) -> &[u8] {
+                &self.0
+            }
+        }
+        impl Drop for Owner {
+            fn drop(&mut self) {
+                self.1.store(true, Ordering::SeqCst);
+            }
+        }
+
         let answer: Vec<u8> = (0..40 * 1024).map(|i| (i % 251) as u8).collect();
+        let freed = Arc::new(AtomicBool::new(false));
         let slots = inflight_slots(1);
         let mut held = HeldAnswer {
-            answer: Bytes::from(answer.clone()),
+            answer: Bytes::from_owner(Owner(answer.clone(), Arc::clone(&freed))),
             _in_flight: telemetry::RequestInFlight::enter(),
             _class_slot: telemetry::InFlightSlot::route(&slots, "submission").expect("free slot"),
         };
@@ -4556,19 +4578,20 @@ mod tests {
         assert!(!hyper::body::Body::is_end_stream(&held));
 
         let mut taken = Vec::new();
-        let mut frames = 0;
+        let mut frames: Vec<Bytes> = Vec::new();
         while let Some(frame) =
             std::future::poll_fn(|cx| hyper::body::Body::poll_frame(Pin::new(&mut held), cx)).await
         {
             let data = frame.expect("infallible").into_data().expect("a data frame");
             assert!(!data.is_empty() && data.len() <= HeldAnswer::MAX_FRAME, "{}", data.len());
             taken.extend_from_slice(&data);
-            frames += 1;
+            frames.push(data);
             let remaining = u64::try_from(answer.len() - taken.len()).expect("fits");
             assert_eq!(hyper::body::Body::size_hint(&held).exact(), Some(remaining));
         }
         assert_eq!(taken, answer);
-        assert_eq!(frames, 3, "16 KiB + 16 KiB + 8 KiB");
+        assert_eq!(frames.len(), 3, "16 KiB + 16 KiB + 8 KiB");
+        assert!(freed.load(Ordering::SeqCst), "the answer's allocation must not outlive the body");
         assert!(hyper::body::Body::is_end_stream(&held));
         assert_eq!(slots.available_permits(), 0, "the slot is held until the body drops");
         drop(held);
