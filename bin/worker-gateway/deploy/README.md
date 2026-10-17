@@ -136,7 +136,9 @@ pod, submission load), between 2 and 10 replicas; the HPA scales to the larger
 result. The worker-slot target sits below
 `WORKER_GATEWAY_MAX_UPSTREAM_INFLIGHT` (45): a worker-bound request over that
 cap is refused at once, not queued, so under submission load alone the first
-gauge stays near 45 and never reaches 50. Kubernetes does **not** know these
+gauge stays near 45; only held submission answers that clients have not read
+yet (they stay in flight after their worker slot is freed, under
+`--redirect-queries`) can lift it further. Kubernetes does **not** know these
 metrics natively: you need
 [prometheus-adapter](https://github.com/kubernetes-sigs/prometheus-adapter) (or
 an equivalent `custom.metrics.k8s.io` provider) to read the gauges from

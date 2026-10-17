@@ -7,7 +7,7 @@ With `--redirect-queries` it sends transaction submissions, and the few reads on
 
 Because every instance is mostly stateless and identical, the gateway can be scaled horizontally: any replica can serve any request.
 Each replica keeps its own bounded set of recent submission hashes, which only steers where a lookup goes (see [Reads kept on the worker](#reads-kept-on-the-worker)).
-Besides the proxy and its edge protections, the crate ships a Prometheus `/metrics` endpoint, a container image, and reference Kubernetes manifests, including an autoscaler keyed on the in-flight-request gauge.
+Besides the proxy and its edge protections, the crate ships a Prometheus `/metrics` endpoint, a container image, and reference Kubernetes manifests, including an autoscaler keyed on the in-flight-request and worker-slot gauges.
 
 ## Scope (v1)
 
