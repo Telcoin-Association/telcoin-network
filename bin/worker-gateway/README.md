@@ -710,7 +710,8 @@ For a secret, use `--redirect-queries-header-file <path>` instead: the file hold
 Either flag requires `--redirect-queries`, and setting both is a startup error.
 A line that is not one valid `Name: value` header also stops startup, with an error that names the problem but never the value.
 So does a name the gateway sets on the query hop itself or a hop-by-hop name, in any letter case: `Content-Length`, `Transfer-Encoding`, `Host`, `Connection`, `TE`, `Trailer`, `Upgrade`, `Keep-Alive`, `Proxy-Connection`, `Content-Type`, `X-Forwarded-For`, `X-Forwarded-Proto`, `X-TN-Gateway` and `X-TN-Gateway-Redirect` are refused, since the header is added next to the gateway's own and would send them twice or mis-frame the body.
-On a command line, quote the whole line: unquoted, the shell splits it at the space after the colon, and the argument parser rejects the value as a stray argument and prints it in that error, before the gateway's own checks run.
+On a command line, quote the whole line: unquoted, the shell splits it at the space after the colon, and startup stops with an argument error that names the flag but does not repeat the stray token.
+The value is still in the process arguments and the shell history, so prefer `--redirect-queries-header-file`.
 
 The value is never logged: the startup line records only whether a header is configured, debug output of the gateway's settings and state prints `<redacted>` in its place, and `--help` hides the environment variable's value.
 Use an `https` query URL with a header; over plain `http` the header crosses the network in clear.
