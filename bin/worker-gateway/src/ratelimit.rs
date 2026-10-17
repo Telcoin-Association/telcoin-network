@@ -1595,7 +1595,7 @@ mod tests {
             Some(2.0),
             "a refund lifted the bucket past its burst"
         );
-        assert_eq!(limiters.per_ip_tokens(ip(1)), Some(9.0), "the edge token came back");
+        assert_eq!(limiters.per_ip_tokens(ip(1)), Some(9.0), "the edge token stays spent");
         assert_eq!(limiters.global_tokens(), Some(0.0));
     }
 
@@ -1616,7 +1616,7 @@ mod tests {
         assert!(matches!(limiters.charge_batch(Some(ip(1)), 2), Err(GatewayError::RateLimited)));
         batch.refund(false);
         assert_eq!(limiters.global_tokens(), Some(4.0), "the refused batch kept its global token");
-        assert_eq!(limiters.per_ip_tokens(ip(1)), Some(1.0), "the edge token came back");
+        assert_eq!(limiters.per_ip_tokens(ip(1)), Some(1.0), "the edge token stays spent");
         assert_eq!(limiters.submission_tokens(), Some(1.0));
     }
 
