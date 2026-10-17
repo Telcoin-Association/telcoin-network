@@ -105,6 +105,7 @@ The gateway buffers each request body whole before it forwards it, and `--max-in
 A body with a declared length is read into one buffer of exactly that size, so a held body costs about its reservation.
 Each open connection also keeps a read buffer of up to `--http1-max-buf-size` (default 64 KiB).
 Size the container's memory limit as `--max-inflight-request-bytes` + `--max-connections` × `--http1-max-buf-size` + 64 MiB for the process baseline and response streaming.
+With `--redirect-queries`, add up to N × (`--max-request-bytes` + 4 KiB) for submission answers clients have not read yet, N being `--max-inflight-submissions` (256 by default), or `--max-connections` if that is lower or the cap is `0`; a connection holds a body or such an answer, never both, so at the defaults the total stays within the figure below.
 At the defaults that is 512 MiB + 500 × 64 KiB + 64 MiB, about 608 MiB, and the Deployment's 1Gi limit leaves about 416 MiB over that.
 Set the memory request to cover the same bound (the Deployment requests 768Mi): below it the pod is scheduled as if it needed less than clients can make it hold, and under node memory pressure the kubelet evicts the gateways first.
 In a test process that also ran the client and the upstream, 128 parallel 1 MiB bodies against a 64 MiB budget peaked 81 to 83 MiB above the idle process, about 1.3 times the budget, the read buffers of all three sides' connections included.

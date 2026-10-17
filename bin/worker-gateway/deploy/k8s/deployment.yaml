@@ -209,9 +209,13 @@ spec:
               # bounded by --max-inflight-request-bytes (512 MiB), plus a read
               # buffer of up to --http1-max-buf-size per connection:
               # 512 MiB + 500 x 64 KiB + 64 MiB for the process is about
-              # 608 MiB. The request and the limit both follow this formula;
-              # recompute both if you change those flags (see
-              # deploy/README.md, "Memory limit").
+              # 608 MiB. With WORKER_GATEWAY_REDIRECT_QUERIES set, up to 256
+              # unread submission answers (--max-inflight-submissions) of up
+              # to --max-request-bytes + 4 KiB each come on top, but a
+              # connection holds a body or an answer, never both, so at these
+              # defaults the total stays within that figure. The request and
+              # the limit both follow this formula; recompute both if you
+              # change those flags (see deploy/README.md, "Memory limit").
               memory: 1Gi
           securityContext:
             runAsNonRoot: true
