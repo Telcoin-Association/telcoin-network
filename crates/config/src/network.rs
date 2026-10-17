@@ -811,7 +811,8 @@ pub struct PeerConfig {
     pub heartbeat_interval: u64,
     /// The target number of connected peers.
     pub target_num_peers: usize,
-    /// The timeout for dialing a peer.
+    /// The requested timeout for dialing a peer.
+    /// The network raises this to cover all signed endpoints plus transport and delivery slack.
     pub dial_timeout: Duration,
     /// A fraction of `Self::target_num_peers` that is allowed to connect to this node in excess of
     /// `PeerManager::target_num_peers`.
