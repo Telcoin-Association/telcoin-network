@@ -11,7 +11,7 @@ deploy/
     deployment.yaml      # apps/v1 Deployment (hardened pod securityContext, replicas spread over nodes and zones)
     service.yaml         # v1 ClusterIP Services: worker-gateway (rpc 8545), worker-gateway-metrics (metrics 9100)
     servicemonitor.yaml  # monitoring.coreos.com/v1 ServiceMonitor (Prometheus Operator)
-    hpa.yaml             # autoscaling/v2 HPA driven by in-flight requests (2 to 10 replicas)
+    hpa.yaml             # autoscaling/v2 HPA driven by in-flight requests and worker slots in use (2 to 10 replicas)
     pdb.yaml             # policy/v1 PodDisruptionBudget (keeps at most one Ready gateway disrupted at a time; pods already terminating are not counted, so evicted pods can still be draining)
 ```
 
@@ -129,18 +129,24 @@ Alloy, ...), delete this file and point your scraper at that Service's
 
 ## Autoscaling (HPA + prometheus-adapter)
 
-`hpa.yaml` scales on a `Pods` custom metric,
-`tn_worker_gateway_inflight_requests` (target average 50 in-flight per pod,
-between 2 and 10 replicas). Kubernetes does **not** know this metric natively:
-you need [prometheus-adapter](https://github.com/kubernetes-sigs/prometheus-adapter)
-(or an equivalent `custom.metrics.k8s.io` provider) to read the gauge from
-Prometheus and surface it on the custom metrics API as a per-pod metric.
+`hpa.yaml` scales on two `Pods` custom metrics:
+`tn_worker_gateway_inflight_requests` (target average 50 in flight per pod,
+read load) and `tn_worker_gateway_upstream_inflight` (target average 30 per
+pod, submission load), between 2 and 10 replicas; the HPA scales to the larger
+result. The worker-slot target sits below
+`WORKER_GATEWAY_MAX_UPSTREAM_INFLIGHT` (45): a worker-bound request over that
+cap is refused at once, not queued, so under submission load alone the first
+gauge stays near 45 and never reaches 50. Kubernetes does **not** know these
+metrics natively: you need
+[prometheus-adapter](https://github.com/kubernetes-sigs/prometheus-adapter) (or
+an equivalent `custom.metrics.k8s.io` provider) to read the gauges from
+Prometheus and surface them on the custom metrics API as per-pod metrics.
 
-A minimal prometheus-adapter rule that exposes the gauge per pod:
+A minimal prometheus-adapter rule that exposes both gauges per pod:
 
 ```yaml
 rules:
-  - seriesQuery: 'tn_worker_gateway_inflight_requests{namespace!="",pod!=""}'
+  - seriesQuery: '{__name__=~"tn_worker_gateway_(inflight_requests|upstream_inflight)",namespace!="",pod!=""}'
     resources:
       overrides:
         namespace:
@@ -155,13 +161,17 @@ rules:
 ```
 
 Notes:
-- The gauge itself carries no per-pod label; prometheus-adapter attaches the
+- Each gauge itself carries no per-pod label; prometheus-adapter attaches the
   `pod`/`namespace` association from the target Prometheus scrape labels, which
   is why the `ServiceMonitor` (or your scrape config) must land pods with those
-  labels. The `metricsQuery` averages the series per pod so the HPA's
-  `AverageValue` target compares like with like.
-- Verify the metric is live before trusting the HPA:
-  `kubectl get --raw "/apis/custom.metrics.k8s.io/v1beta1/namespaces/<ns>/pods/*/tn_worker_gateway_inflight_requests"`.
+  labels. The `metricsQuery` averages each series per pod so the HPA's
+  `AverageValue` targets compare like with like.
+- Verify both metrics are live before trusting the HPA:
+  `kubectl get --raw "/apis/custom.metrics.k8s.io/v1beta1/namespaces/<ns>/pods/*/tn_worker_gateway_inflight_requests"`
+  and
+  `kubectl get --raw "/apis/custom.metrics.k8s.io/v1beta1/namespaces/<ns>/pods/*/tn_worker_gateway_upstream_inflight"`.
+  If the adapter serves only one of them, the HPA still scales up on the other
+  but never scales down.
 
 `behavior` sets a 300s scale-down stabilization window (conservative, avoids
 flapping when traffic dips) and a 30s scale-up window (react quickly to load).
