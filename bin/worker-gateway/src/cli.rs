@@ -108,7 +108,10 @@ pub(crate) struct Cli {
     /// `--recent-submission-ttl`); everything else, including a batch that
     /// mixes submissions with other calls, goes here, with no readiness gate
     /// and no fallback to the worker. Must not point at the gateway itself or
-    /// at a worker's RPC or readiness host and port.
+    /// at a worker's RPC or readiness host and port, where `localhost` counts
+    /// as both `127.0.0.1` and `[::1]`, and an unspecified host as any loopback
+    /// address; another loopback address at a worker's port is accepted with a
+    /// warning.
     #[arg(long, env = "WORKER_GATEWAY_REDIRECT_QUERIES", hide_env_values = true)]
     pub(crate) redirect_queries: Option<String>,
 
@@ -1727,15 +1730,16 @@ pub(crate) fn redacted_parse_error(err: &clap::Error) -> Option<String> {
 /// worker's node land on the validator, which is the load the redirect exists
 /// to remove. It compares host and port whatever the scheme, so an `https` URL
 /// on a worker's `http` socket is caught too, an IPv4-mapped IPv6 literal
-/// matches the IPv4 address it names, and any loopback or unspecified host
-/// (`localhost`, `127.0.0.2`, `[::1]`, `0.0.0.0`) matches any other, since each
-/// names this machine (see [`same_host`]). A URL on a worker's host but another
-/// port is accepted with a warning, since that port may serve a separate node
-/// on the validator's machine. Plain `http` to a host that is not an address
-/// literal unroutable from the internet (see [`plaintext_to_public_host`]) is
-/// accepted with a warning: the reads and their answers then cross the network
-/// unencrypted. Messages name the URL by origin only, since a hosted RPC URL
-/// can carry an API key in its path.
+/// matches the IPv4 address it names, `localhost` matches `127.0.0.1` and
+/// `[::1]`, and an unspecified host (`0.0.0.0`, `[::]`) matches any loopback or
+/// unspecified one (see [`same_host`]). A URL elsewhere on a worker's machine
+/// (see [`same_machine`]), at another port or on another loopback address at
+/// the worker's port, is accepted with a warning, since that endpoint may serve
+/// a separate node on the validator's machine. Plain `http` to a host that is
+/// not an address literal unroutable from the internet (see
+/// [`plaintext_to_public_host`]) is accepted with a warning: the reads and
+/// their answers then cross the network unencrypted. Messages name the URL by
+/// origin only, since a hosted RPC URL can carry an API key in its path.
 fn ensure_query_upstream(
     listen_addr: SocketAddr,
     url: &Url,
@@ -1769,14 +1773,15 @@ fn ensure_query_upstream(
             })
     })?;
     if let Some(worker) = upstreams.iter().find(|upstream| {
-        same_host(url, &upstream.rpc_url) || same_host(url, &upstream.readiness_url)
+        same_machine(url, &upstream.rpc_url) || same_machine(url, &upstream.readiness_url)
     }) {
         warn!(
             target: "gateway",
             upstream = %UpstreamOrigin(url),
             worker_id = worker.worker_id,
-            "--redirect-queries is on a worker's host at another port; unless that port serves \
-             a separate node, reads still reach the validator's machine"
+            "--redirect-queries is on a worker's host at another port, or on another loopback \
+             address at its port; unless that endpoint serves a separate node, reads still reach \
+             the validator's machine"
         );
     }
     if plaintext_to_public_host(url) {
@@ -1816,20 +1821,36 @@ fn same_host_and_port(a: &Url, b: &Url) -> bool {
 /// Whether two URLs name the same host. Hosts that name addresses (see
 /// [`url_host_ips`]) match when they share one, so an IPv4-mapped IPv6 literal
 /// (`[::ffff:10.0.0.7]`) matches the IPv4 address it names and `localhost`
-/// matches either loopback address; other domain names match only as written.
-/// Any loopback or unspecified address also matches any other, in either
-/// family: each names this machine (an unspecified address connects to it),
-/// and a node bound to an unspecified address serves every loopback spelling,
-/// so `[::1]`, `127.0.0.2` and `0.0.0.0` all reach a worker on `127.0.0.1`.
+/// matches `127.0.0.1` and `[::1]`; other domain names match only as written.
+/// An unspecified address (`0.0.0.0`, `[::]`) also matches any loopback or
+/// unspecified address, in either family: a node bound to one answers on the
+/// loopback addresses, and a URL naming one connects to this machine. Two
+/// explicit loopback addresses match only when they are equal, since `[::1]`
+/// or `127.0.0.2` beside `127.0.0.1` can be another node's socket at the same
+/// port; [`same_machine`] is the wider test that matches them.
 fn same_host(a: &Url, b: &Url) -> bool {
     let this_machine = |ip: &IpAddr| ip.is_loopback() || ip.is_unspecified();
     url_host_ips(a).zip(url_host_ips(b)).map_or_else(
         || a.host() == b.host(),
         |(a, b)| {
             a.iter().any(|ip| b.contains(ip))
-                || (a.iter().any(this_machine) && b.iter().any(this_machine))
+                || (a.iter().any(IpAddr::is_unspecified) && b.iter().any(this_machine))
+                || (b.iter().any(IpAddr::is_unspecified) && a.iter().any(this_machine))
         },
     )
+}
+
+/// Whether two URLs name hosts on this same machine: the same host (see
+/// [`same_host`]), or two loopback or unspecified addresses in either family,
+/// each of which names this machine. Only the redirect's warning uses this
+/// wider test, since two different explicit loopback addresses can be two
+/// sockets.
+fn same_machine(a: &Url, b: &Url) -> bool {
+    let this_machine = |url: &Url| {
+        url_host_ips(url)
+            .is_some_and(|ips| ips.iter().any(|ip| ip.is_loopback() || ip.is_unspecified()))
+    };
+    same_host(a, b) || (this_machine(a) && this_machine(b))
 }
 
 /// Whether `url` is plain `http` to anything but an address literal that is
@@ -2577,8 +2598,10 @@ mod tests {
         Ok(())
     }
 
-    /// `localhost` names both loopbacks, so a redirect to it is a worker on
-    /// either one, and the other way round.
+    /// `localhost` names both `127.0.0.1` and `[::1]`, so a redirect to it is
+    /// a worker on either one, and the other way round. Another explicit
+    /// loopback address is not refused (see
+    /// `distinct_loopback_redirect_at_a_workers_port_starts_with_a_warning`).
     #[test]
     fn localhost_redirect_matches_a_worker_on_either_loopback() -> eyre::Result<()> {
         let flags = |rpc: &str, redirect: &str| {
@@ -2597,8 +2620,6 @@ mod tests {
             ("http://127.0.0.1:9545/", "http://localhost:9545/"),
             ("http://localhost:9545/", "http://[::1]:9545/"),
             ("http://localhost:9545/", "http://[::ffff:127.0.0.1]:9545/"),
-            // any other loopback address is this machine too
-            ("http://[::1]:9545/", "http://127.0.0.2:9545/"),
         ] {
             let message = match flags(rpc, redirect) {
                 Ok(_) => panic!("{redirect} is the worker at {rpc}"),
@@ -2609,6 +2630,73 @@ mod tests {
         // an address off this machine is another host to the check
         flags("http://[::1]:9545/", "http://10.0.0.9:9545/")?;
         Ok(())
+    }
+
+    /// Two explicit loopback addresses can be two sockets at one port, so a
+    /// redirect to `[::1]` or `127.0.0.2` beside a worker on `127.0.0.1`, or the
+    /// other way round, is not refused; it is still this machine, so startup
+    /// warns.
+    #[test]
+    fn distinct_loopback_redirect_at_a_workers_port_starts_with_a_warning() -> eyre::Result<()> {
+        const WARNING: &str = "--redirect-queries is on a worker's host at another port, or on \
+                               another loopback address at its port";
+        for (worker, redirect) in [
+            ("127.0.0.1", "http://[::1]:8545/"),
+            ("127.0.0.1", "http://127.0.0.2:8545/"),
+            ("[::1]", "http://127.0.0.1:8545/"),
+        ] {
+            let cli = try_parse_test_argv([
+                "worker-gateway".to_string(),
+                "--listen-addr=10.0.0.5:8545".to_string(),
+                format!("--upstream-rpc-url=http://{worker}:8545/"),
+                format!("--upstream-readiness-url=http://{worker}:8551/health/workers"),
+                format!("--redirect-queries={redirect}"),
+            ])
+            .expect("argv parses");
+            let (settings, logs) = into_settings_logged(cli);
+            let settings = settings.unwrap_or_else(|err| {
+                panic!("{redirect} beside a worker on {worker}:8545 must start: {err:?}")
+            });
+            assert_eq!(settings.query_upstream, Some(Url::parse(redirect)?), "{redirect}");
+            assert!(logs.contains(WARNING), "{redirect} beside {worker} must warn: {logs}");
+            assert!(logs.contains("worker_id=0"), "{logs}");
+        }
+        Ok(())
+    }
+
+    /// Every spelling of a worker's own address stays refused: an IPv4-mapped
+    /// literal, `localhost`, and an unspecified address, since a node bound to
+    /// one answers on the loopback addresses.
+    #[test]
+    fn loopback_spellings_of_a_workers_address_stay_refused() {
+        // the gateway listens on another port, so its own-address check, which
+        // takes `0.0.0.0` beside an IPv4 listener, is not what trips
+        let flags = |worker: &str, redirect: &str| {
+            try_parse_test_argv([
+                "worker-gateway".to_string(),
+                "--listen-addr=10.0.0.5:9000".to_string(),
+                format!("--upstream-rpc-url=http://{worker}:8545/"),
+                format!("--upstream-readiness-url=http://{worker}:8551/health/workers"),
+                format!("--redirect-queries={redirect}"),
+            ])
+            .expect("argv parses")
+            .into_settings()
+        };
+        for (worker, redirect) in [
+            ("127.0.0.1", "http://[::ffff:127.0.0.1]:8545/"),
+            ("127.0.0.1", "http://0.0.0.0:8545/"),
+            ("127.0.0.1", "http://[::]:8545/"),
+            ("127.0.0.1", "http://localhost:8545/"),
+            ("[::1]", "http://[::]:8545/"),
+            ("[::1]", "http://0.0.0.0:8545/"),
+            ("[::1]", "http://localhost:8545/"),
+        ] {
+            let message = match flags(worker, redirect) {
+                Ok(_) => panic!("{redirect} is the worker on {worker}:8545"),
+                Err(err) => format!("{err:?}"),
+            };
+            assert!(message.contains("worker 0's RPC host and port"), "{redirect}: {message}");
+        }
     }
 
     /// An inline-upstream CLI on another host (so the self-pointing guard does
@@ -3949,19 +4037,23 @@ mod tests {
             ])
             .expect("argv parses")
         };
-        for redirect in ["http://[::1]:8544", "http://127.0.0.2:8544", "http://0.0.0.0:8544"] {
+        for redirect in ["http://0.0.0.0:8544", "http://[::]:8544"] {
             let message = match worker(redirect).into_settings() {
                 Ok(_) => panic!("{redirect} reaches the worker on 127.0.0.1:8544"),
                 Err(err) => format!("{err:?}"),
             };
             assert!(message.contains("is worker 0's RPC host and port"), "{redirect}: {message}");
         }
-        let (settings, logs) = into_settings_logged(worker("http://[::1]:9545"));
-        settings?;
-        assert!(
-            logs.contains("--redirect-queries is on a worker's host at another port"),
-            "{logs}"
-        );
+        // another loopback address at the worker's port can be another node's
+        // socket, as can another port, so these only warn
+        for redirect in ["http://[::1]:8544", "http://127.0.0.2:8544", "http://[::1]:9545"] {
+            let (settings, logs) = into_settings_logged(worker(redirect));
+            settings?;
+            assert!(
+                logs.contains("--redirect-queries is on a worker's host at another port"),
+                "{redirect}: {logs}"
+            );
+        }
         Ok(())
     }
 
