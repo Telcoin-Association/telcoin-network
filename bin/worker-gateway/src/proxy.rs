@@ -2713,8 +2713,8 @@ impl<'de, T: Lenient<'de>> Visitor<'de> for LenientVisitor<T> {
 /// `params`. So a submission the worker would refuse for another reason (a
 /// missing or wrong `jsonrpc`, a repeated `params`) gets the gateway's own
 /// code for its transaction where the worker would answer an invalid request,
-/// and a notification (no `id`), which the worker would run without answering,
-/// gets an answer.
+/// and a notification (no `id`), which the worker reads but does not run
+/// (jsonrpsee 0.26 acknowledges it with an empty body), gets an answer.
 fn screen_transaction(raw: &RawTransaction<'_>) -> Result<PooledTransaction, GatewayError> {
     let raw = raw.bytes().ok_or(GatewayError::InvalidTransaction)?;
     // a typed envelope starts with its type byte, 0x01..=0x7f; a legacy
@@ -3945,8 +3945,10 @@ mod tests {
     }
 
     /// What jsonrpsee 0.26, the worker's JSON-RPC server, makes of a body:
-    /// refused whole, or the calls it reads, each with the method it would
-    /// run (`None` for a call it refuses and runs nothing for).
+    /// refused whole, or the calls it reads, each with the method it names.
+    /// A `Notification` is counted as though it ran, an over-approximation:
+    /// jsonrpsee 0.26's `RpcService::notification` never calls the method.
+    /// `None` marks an element it refuses.
     #[derive(Debug, PartialEq)]
     enum WorkerReads {
         /// Not a request at all: the server answers a parse error.
