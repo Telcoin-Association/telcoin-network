@@ -5147,6 +5147,35 @@ mod tests {
         assert_eq!(worker_seen.hits(), 2);
     }
 
+    /// A submission batch whose extra call the empty global bucket refuses
+    /// gets its submission token back in the handler, so the submission
+    /// budget is whole for the next submissions.
+    #[tokio::test]
+    async fn refused_submission_batch_returns_its_submission_token() {
+        let (gateway, worker_seen, _servers) =
+            one_token_gateway(Some(RateLimit::new(nz(1), nz(2)))).await;
+
+        // a read spends the global bucket's only token
+        let (status, text) = post_rpc(gateway, None, call("eth_chainId", 1)).await;
+        assert_eq!((status, text.as_str()), (StatusCode::OK, "worker"));
+
+        // a two-call submission batch: the first call takes a submission
+        // token, the second needs a global token and is refused
+        let (status, _) = post_rpc(gateway, None, batch("eth_sendRawTransaction", 2)).await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+
+        // both of the budget's tokens are there for single submissions
+        for id in [3, 4] {
+            let (status, text) = post_rpc(gateway, None, call("eth_sendRawTransaction", id)).await;
+            assert_eq!(
+                (status, text.as_str()),
+                (StatusCode::OK, "worker"),
+                "the refused batch kept a submission token"
+            );
+        }
+        assert_eq!(worker_seen.hits(), 3);
+    }
+
     #[tokio::test]
     async fn without_a_submission_budget_the_edge_check_is_unchanged() {
         let (gateway, worker_seen, _servers) = one_token_gateway(None).await;
