@@ -55,9 +55,10 @@ mod code {
     pub(super) const RATE_LIMITED: i32 = -32006;
     /// An `eth_sendRawTransaction` payload could not be decoded as a transaction.
     pub(super) const INVALID_TRANSACTION: i32 = -32007;
-    /// An `eth_sendRawTransaction` payload decoded to a transaction type the
-    /// network does not accept (an EIP-4844 blob or EIP-7702 set-code
-    /// transaction).
+    /// An `eth_sendRawTransaction` payload of a transaction type the network
+    /// does not accept: an EIP-4844 blob or EIP-7702 set-code transaction, or
+    /// a typed envelope of an unknown type, refused from its type byte before
+    /// it is decoded.
     pub(super) const UNSUPPORTED_TRANSACTION_TYPE: i32 = -32008;
     /// Every in-flight slot the request could use is taken (its route's cap,
     /// or the cap on concurrent requests to the worker).
@@ -132,9 +133,10 @@ pub(crate) enum GatewayError {
     /// An `eth_sendRawTransaction` payload could not be decoded as a
     /// transaction (malformed hex or RLP).
     InvalidTransaction,
-    /// An `eth_sendRawTransaction` payload decoded to a transaction type the
-    /// network does not accept (an EIP-4844 blob or EIP-7702 set-code
-    /// transaction). Carries the EIP-2718 type byte, which the message names.
+    /// An `eth_sendRawTransaction` payload of a transaction type the network
+    /// does not accept: an EIP-4844 blob or EIP-7702 set-code transaction, or
+    /// a typed envelope of an unknown type, refused from its type byte before
+    /// it is decoded. Carries the EIP-2718 type byte, which the message names.
     UnsupportedTransactionType(u8),
     /// The request's body bytes did not fit in what is left of the in-flight
     /// request-byte budget, so it was refused before its body was read.
@@ -237,9 +239,9 @@ impl GatewayError {
     }
 
     /// A human-readable message paired with this error. Every message is
-    /// static except the one for a transaction type without a name here,
-    /// which the screen cannot produce today (it refuses only types 3 and 4),
-    /// and the upstream error's, which names the upstream's status.
+    /// static except the one for a transaction type without a name here (an
+    /// unknown typed envelope, `0x05..=0x7f`, which the screen refuses from its
+    /// type byte), and the upstream error's, which names the upstream's status.
     fn message(&self) -> Cow<'static, str> {
         let message = match self {
             Self::NoUpstreamReady => "no upstream worker is ready",
