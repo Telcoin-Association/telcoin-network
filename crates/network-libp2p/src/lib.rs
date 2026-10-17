@@ -28,6 +28,7 @@ mod peers;
 mod quic_incoming;
 mod record_exchange;
 mod retention;
+mod serve_permits;
 mod service_class;
 pub mod source_admission;
 pub mod stream;
@@ -42,6 +43,7 @@ pub use metrics::AdmissionShed;
 pub use peers::{
     AdmissionFallback, AdmissionStatus, CommitteeUpdate, LoadPenalty, PeerExchangeMap, Penalty,
 };
+pub use serve_permits::{ServePermit, ServePermits};
 pub use service_class::ServiceClass;
 pub use stream::StreamError;
 pub use sync::{

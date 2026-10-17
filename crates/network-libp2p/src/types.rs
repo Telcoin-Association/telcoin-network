@@ -1,8 +1,8 @@
 //! Constants and trait implementations for network compatibility.
 
 use crate::{
-    codec::TNMessage, error::NetworkError, peers::Penalty, AdmissionStatus, CommitteeUpdate,
-    GossipMessage, PeerExchangeMap,
+    codec::TNMessage, error::NetworkError, peers::Penalty, serve_permits::ServePermits,
+    AdmissionStatus, CommitteeUpdate, GossipMessage, PeerExchangeMap,
 };
 pub use libp2p::gossipsub::MessageId;
 use libp2p::{
@@ -552,6 +552,11 @@ where
 {
     /// Sending channel to the network to process commands.
     sender: mpsc::Sender<NetworkCommand<Req, Res>>,
+    /// The application's per-class serve permits for this swarm's inbound requests.
+    ///
+    /// A handle that the swarm built shares the swarm's pools. Any other handle carries
+    /// unmetered pools, so it admits every request and registers no series.
+    serve_permits: ServePermits,
 }
 
 impl<Req, Res> NetworkHandle<Req, Res>
@@ -559,15 +564,26 @@ where
     Req: TNMessage,
     Res: TNMessage,
 {
-    /// Create a new instance of Self.
+    /// Create a new instance of Self with unmetered serve permits.
     pub fn new(sender: mpsc::Sender<NetworkCommand<Req, Res>>) -> Self {
-        Self { sender }
+        Self { sender, serve_permits: ServePermits::unmetered() }
     }
 
     /// Create a handle to no where for test setup.
     pub fn new_for_test() -> Self {
         let (sender, _) = mpsc::channel(100);
-        Self { sender }
+        Self::new(sender)
+    }
+
+    /// Return this handle with the swarm's serve permits in place of the unmetered pools.
+    #[must_use]
+    pub fn with_serve_permits(self, serve_permits: ServePermits) -> Self {
+        Self { serve_permits, ..self }
+    }
+
+    /// The per-class serve permits that request handlers offer inbound requests to.
+    pub fn serve_permits(&self) -> &ServePermits {
+        &self.serve_permits
     }
 
     /// Start swarm listening on the given address. Returns an error if the address is not

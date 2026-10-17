@@ -258,7 +258,7 @@ impl InboundFailureOutcome {
 
 /// One pre-resolved metric handle per [`ServiceClass`].
 #[derive(Clone)]
-struct PerClass<T> {
+pub(crate) struct PerClass<T> {
     /// The handle for [`ServiceClass::Vote`].
     vote: T,
     /// The handle for [`ServiceClass::EpochRecord`].
@@ -275,7 +275,7 @@ struct PerClass<T> {
 
 impl<T> PerClass<T> {
     /// Resolve one handle per class with `resolve`.
-    fn new(resolve: impl Fn(ServiceClass) -> T) -> Self {
+    pub(crate) fn new(resolve: impl Fn(ServiceClass) -> T) -> Self {
         Self {
             vote: resolve(ServiceClass::Vote),
             epoch_record: resolve(ServiceClass::EpochRecord),
@@ -287,7 +287,7 @@ impl<T> PerClass<T> {
     }
 
     /// The handle for `class`.
-    fn get(&self, class: ServiceClass) -> &T {
+    pub(crate) fn get(&self, class: ServiceClass) -> &T {
         match class {
             ServiceClass::Vote => &self.vote,
             ServiceClass::EpochRecord => &self.epoch_record,
@@ -308,6 +308,8 @@ struct PerShedReason<T> {
     unsubscribed: T,
     /// The handle for [`ShedReason::Admission`].
     admission: T,
+    /// The handle for [`ShedReason::ServeBudget`].
+    serve_budget: T,
 }
 
 impl<T> PerShedReason<T> {
@@ -317,6 +319,7 @@ impl<T> PerShedReason<T> {
             queue_full: resolve(ShedReason::QueueFull),
             unsubscribed: resolve(ShedReason::Unsubscribed),
             admission: resolve(ShedReason::Admission),
+            serve_budget: resolve(ShedReason::ServeBudget),
         }
     }
 
@@ -326,6 +329,7 @@ impl<T> PerShedReason<T> {
             ShedReason::QueueFull => &self.queue_full,
             ShedReason::Unsubscribed => &self.unsubscribed,
             ShedReason::Admission => &self.admission,
+            ShedReason::ServeBudget => &self.serve_budget,
         }
     }
 }
@@ -599,7 +603,7 @@ impl LabeledHandles {
 }
 
 /// Resolve the `inbound_requests_shed_total` series for one network label, class and reason.
-fn shed_counter(network: &str, class: ServiceClass, reason: ShedReason) -> Counter {
+pub(crate) fn shed_counter(network: &str, class: ServiceClass, reason: ShedReason) -> Counter {
     metrics::counter!(
         "tn_network.inbound_requests_shed_total",
         "network" => network.to_owned(),
