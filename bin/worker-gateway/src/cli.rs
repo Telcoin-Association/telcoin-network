@@ -612,9 +612,11 @@ pub(crate) struct Cli {
 
     /// How long to drain in-flight requests on SIGTERM before forcing close.
     /// Default: the request deadline, `--upstream-request-timeout` +
-    /// `--header-read-timeout` (45s at the defaults), so a request accepted just
-    /// before shutdown can finish; an explicit value is kept as given, and one
-    /// below the deadline logs a startup warning.
+    /// `--header-read-timeout` (45s at the defaults), so a request whose head
+    /// has arrived when the drain starts can run to its deadline. A connection
+    /// still sending its head can be cut up to `--header-read-timeout` (twice
+    /// that with `--proxy-protocol`) before its own deadline. An explicit value
+    /// is kept as given, and one below the deadline logs a startup warning.
     #[arg(
         long,
         env = "WORKER_GATEWAY_GRACEFUL_SHUTDOWN_TIMEOUT",
@@ -1151,9 +1153,11 @@ impl Cli {
             humantime::format_duration(self.shutdown_delay),
             humantime::format_duration(MAX_SHUTDOWN_DELAY),
         );
-        // the drain defaults to the request deadline so a request accepted just
-        // before shutdown can finish; a shorter explicit value is the
-        // operator's choice, so it is kept, with a warning
+        // the drain defaults to the request deadline, so a request whose head
+        // has arrived when the drain starts can run to its deadline (one still
+        // sending its head can be cut up to --header-read-timeout early); a
+        // shorter explicit value is the operator's choice, so it is kept, with
+        // a warning
         let graceful_shutdown_timeout = self.graceful_shutdown_timeout.unwrap_or(deadline);
         if graceful_shutdown_timeout < deadline {
             warn!(
@@ -1367,8 +1371,8 @@ fn resolve_optional_duration(value: Duration) -> Option<Duration> {
 /// `upstream_request_timeout` plus a `header_read_timeout`-sized budget for
 /// reading the body, so a trickled body cannot hold a request slot without
 /// bound. It is also the default drain on shutdown
-/// (`--graceful-shutdown-timeout`), so a request accepted just before it can
-/// finish.
+/// (`--graceful-shutdown-timeout`), so a request whose head has arrived when
+/// the drain starts can run to its deadline.
 pub(crate) fn request_deadline(
     upstream_request_timeout: Duration,
     header_read_timeout: Duration,
