@@ -13,6 +13,7 @@ use super::{
     PeerExchangeMap, Penalty,
 };
 use crate::{
+    diagnostics::{bounded_error, bounded_reply_error as error, bounded_warn},
     error::NetworkError,
     peers::{score::Reputation, status::NewConnectionStatus, types::PeerAction},
     send_or_log_error,
@@ -29,7 +30,7 @@ use std::{
 use tn_config::ScoreConfig;
 use tn_types::{BlsPublicKey, NetworkPublicKey};
 use tokio::sync::oneshot;
-use tracing::{debug, error, warn};
+use tracing::debug;
 #[cfg(test)]
 #[path = "../tests/peers.rs"]
 mod peers;
@@ -316,7 +317,7 @@ impl AllPeers {
             (prior_reputation, new_reputation, peer.connection_status().is_connected_or_dialing())
         });
         update.map_or_else(|| {
-            warn!(target: "peer-manager", ?peer_id, "application layer reported an unknown peer");
+            bounded_warn!(PeerState, target: "peer-manager", ?peer_id, "application layer reported an unknown peer");
             PeerAction::NoAction
         }, |(prior_reputation, new_reputation, connected_or_dialing)| {
             debug!(target: "peer-manager", ?peer_id, ?prior_reputation, ?new_reputation);
@@ -339,13 +340,13 @@ impl AllPeers {
                             NewConnectionStatus::Disconnecting { banned: true },
                         )
                     } else {
-                        warn!(target: "peer-manager", ?peer_id, ?prior_reputation, "process_penalty for disconnected peer");
+                        bounded_warn!(PeerState, target: "peer-manager", ?peer_id, ?prior_reputation, "process_penalty for disconnected peer");
                         self.update_connection_status(peer_id, NewConnectionStatus::Disconnected)
                     }
                 }
                 Reputation::Trusted => {
                     // this should never happen
-                    error!(target: "peer-manager", ?peer_id, "process_penalty resulted in peer becoming trusted");
+                    bounded_error!(PeerState, target: "peer-manager", ?peer_id, "process_penalty resulted in peer becoming trusted");
                     PeerAction::NoAction
                 }
             }
@@ -372,7 +373,7 @@ impl AllPeers {
         let id = if matches!(resolved, PeerIdentity::Confirmed(_))
             && !self.peers.contains_key(&resolved)
         {
-            error!(target: "peer-manager", ?peer_id, "bls_by_peer_id entry found without a confirmed record - repairing index");
+            bounded_error!(PeerRecord, target: "peer-manager", ?peer_id, "bls_by_peer_id entry found without a confirmed record - repairing index");
             self.bls_by_peer_id.remove(peer_id);
             PeerIdentity::Unidentified(*peer_id)
         } else {
@@ -381,7 +382,7 @@ impl AllPeers {
         if !self.peers.contains_key(&id) {
             // initialize unknown peer and log warning if status update is invalid for unknown peers
             if !new_status.valid_initial_state() {
-                warn!(target: "peer-manager",
+                bounded_warn!(PeerRecord, target: "peer-manager",
                     "Attempt to update {:?} for unknown peer {:?}. Current peers:\n{:?}",
                     new_status,
                     peer_id,
@@ -399,7 +400,7 @@ impl AllPeers {
                 peer.ensure_banned(peer_id);
             } else {
                 // unreachable
-                error!(target: "peer-manager", ?peer_id, "impossible - peer was just created if it didn't already exist");
+                bounded_error!(PeerRecord, target: "peer-manager", ?peer_id, "impossible - peer was just created if it didn't already exist");
             }
         }
 
@@ -488,7 +489,7 @@ impl AllPeers {
                 },
                 // filter other results and log error
                 ReputationUpdate::Banned | ReputationUpdate::Disconnect => {
-                    error!(
+                    bounded_error!(PeerState,
                         target: "peer-manager",
                         ?update,
                         ?id,
@@ -623,11 +624,11 @@ impl AllPeers {
                     self.disconnected_peers = self.disconnected_peers.saturating_sub(1);
                 }
                 ConnectionStatus::Banned { .. } => {
-                    error!(target: "peer-manager", ?peer_id, "accepted a connection from a banned peer");
+                    bounded_error!(PeerAdmission, target: "peer-manager", ?peer_id, "accepted a connection from a banned peer");
                     self.banned_peers.remove_banned_peer(peer.known_ip_addresses());
                 }
                 ConnectionStatus::Disconnecting { .. } => {
-                    warn!(target: "peer-manager", ?peer_id, "connected to a disconnecting peer")
+                    bounded_warn!(PeerAdmission, target: "peer-manager", ?peer_id, "connected to a disconnecting peer")
                 }
                 ConnectionStatus::Unknown
                 | ConnectionStatus::Connected { .. }
@@ -654,26 +655,26 @@ impl AllPeers {
         if let Some(peer) = self.peers.get_mut(&id) {
             match current_status {
                 ConnectionStatus::Banned { .. } => {
-                    warn!(target: "peer-manager", ?peer_id, "dialing a banned peer");
+                    bounded_warn!(PeerState, target: "peer-manager", ?peer_id, "dialing a banned peer");
                     self.banned_peers.remove_banned_peer(peer.known_ip_addresses());
                 }
                 ConnectionStatus::Disconnected { .. } => {
                     self.disconnected_peers = self.disconnected_peers.saturating_sub(1);
                 }
                 ConnectionStatus::Connected { .. } => {
-                    warn!(target: "peer-manager", ?peer_id, "dialing an already connected peer")
+                    bounded_warn!(PeerState, target: "peer-manager", ?peer_id, "dialing an already connected peer")
                 }
                 ConnectionStatus::Dialing { .. } => {
-                    warn!(target: "peer-manager", ?peer_id, "dialing an already dialing peer")
+                    bounded_warn!(PeerState, target: "peer-manager", ?peer_id, "dialing an already dialing peer")
                 }
                 ConnectionStatus::Disconnecting { .. } => {
-                    warn!(target: "peer-manager", ?peer_id, "dialing a disconnecting peer")
+                    bounded_warn!(PeerState, target: "peer-manager", ?peer_id, "dialing a disconnecting peer")
                 }
                 ConnectionStatus::Unknown => {} // default status
             }
 
             if let Err(e) = peer.register_dialing() {
-                error!(target: "peer-manager", e, ?peer_id, "error updating peer to dialing");
+                bounded_error!(PeerState, target: "peer-manager", e, ?peer_id, "error updating peer to dialing");
             }
         }
 
@@ -736,7 +737,7 @@ impl AllPeers {
             PeerAction::Ban(banned_ips)
         } else {
             // NOTE: this should never happen
-            warn!(target: "peer-manager", ?peer_id, "failed to retrieve peer data for handling disconnect and ban");
+            bounded_warn!(PeerState, target: "peer-manager", ?peer_id, "failed to retrieve peer data for handling disconnect and ban");
             PeerAction::Ban(Vec::new())
         }
     }
@@ -773,7 +774,7 @@ impl AllPeers {
             }
             ConnectionStatus::Banned { .. } => {
                 // banned peers should already be disconnected
-                error!(target: "peer-manager", ?peer_id, "disconnecting from a banned peer - banned peer should already be disconnected");
+                bounded_error!(PeerState, target: "peer-manager", ?peer_id, "disconnecting from a banned peer - banned peer should already be disconnected");
             }
             ConnectionStatus::Connected { .. } | ConnectionStatus::Dialing { .. } => {
                 // support discovery with peer exchange if the target number of peers is reached
@@ -817,7 +818,7 @@ impl AllPeers {
                     PeerAction::NoAction
                 }
                 ConnectionStatus::Banned { .. } => {
-                    error!(target: "peer-manager", ?peer_id, "banning already banned peer");
+                    bounded_error!(PeerState, target: "peer-manager", ?peer_id, "banning already banned peer");
                     let already_banned_ips = self.banned_peers.banned_ips();
                     PeerAction::Ban(peer.filter_new_ips_to_ban(&already_banned_ips))
                 }
@@ -826,7 +827,7 @@ impl AllPeers {
                     PeerAction::Disconnect
                 }
                 ConnectionStatus::Unknown => {
-                    warn!(target: "peer-manager", ?peer_id, "banning an unknown peer");
+                    bounded_warn!(PeerState, target: "peer-manager", ?peer_id, "banning an unknown peer");
                     self.banned_peers.add_banned_peer(peer);
                     peer.set_connection_status(ConnectionStatus::Banned {
                         instant: Instant::now(),
@@ -836,7 +837,7 @@ impl AllPeers {
                 }
             }
         } else {
-            warn!(target: "peer-manager", ?peer_id, "failed to retrieve peer data for handling banned transition");
+            bounded_warn!(PeerState, target: "peer-manager", ?peer_id, "failed to retrieve peer data for handling banned transition");
             PeerAction::NoAction
         }
     }
@@ -850,7 +851,7 @@ impl AllPeers {
         let id = self.identity_for(peer_id);
         if let Some(peer) = self.peers.get_mut(&id) {
             if matches!(peer.reputation(), Reputation::Banned) {
-                error!(target: "peer-manager", ?peer_id, "unbanning a banned peer");
+                bounded_error!(PeerState, target: "peer-manager", ?peer_id, "unbanning a banned peer");
             }
 
             // expected status is "banned", but there are possible edge cases
@@ -883,7 +884,7 @@ impl AllPeers {
                 }
                 ConnectionStatus::Unknown | ConnectionStatus::Connected { .. } => {
                     // technically an error, but not fatal
-                    error!(target: "peer-manager", ?peer_id, "unbanning a connected peer");
+                    bounded_error!(PeerState, target: "peer-manager", ?peer_id, "unbanning a connected peer");
                 }
             }
         }
@@ -1299,7 +1300,7 @@ impl AllPeers {
             let action = match status {
                 ConnectionStatus::Banned { .. }
                 | ConnectionStatus::Disconnecting { banned: true } => {
-                    warn!(target: "peer-manager", ?peer_id, "unbanning banned committee member");
+                    bounded_warn!(PeerState, target: "peer-manager", ?peer_id, "unbanning banned committee member");
                     Some(self.update_connection_status(&peer_id, NewConnectionStatus::Unbanned))
                 }
                 ConnectionStatus::Disconnecting { banned: false }

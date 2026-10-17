@@ -1,0 +1,11 @@
+[package]
+name = "tn-network-diagnostics-tests"
+version = "0.0.0"
+edition = "2021"
+publish = false
+license = "MIT OR Apache-2.0"
+
+[dev-dependencies]
+tracing = { version = "=0.1.44", default-features = false, features = ["std"] }
+
+[workspace]
