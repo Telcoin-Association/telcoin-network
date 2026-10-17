@@ -2899,8 +2899,14 @@ mod tests {
     }
 
     /// The extraction this fix replaced, verbatim, kept as the reference the new
-    /// member-by-member reader is checked against. Only the extraction differs;
-    /// the decode and verdict below it are the same code in both paths.
+    /// member-by-member reader is checked against. Only the extraction and one
+    /// step differ: the screen refuses a typed envelope of a type the network
+    /// does not accept from its type byte, before decoding (see
+    /// [`screen_transaction`]), where the reference decodes first, so a payload
+    /// that starts with a refused type byte and does not decode, such as
+    /// `0x03c0`, gets `UnsupportedTransactionType` from the screen and
+    /// `InvalidTransaction` from the reference. The rest of the decode and the
+    /// verdict are the same code in both paths.
     fn reference_screen(body: &[u8]) -> Option<(GatewayError, RequestId)> {
         if !mentions_send_raw_transaction(body) {
             return None;
@@ -2934,10 +2940,15 @@ mod tests {
     /// `id` outside the echo bound on a rejected request, which echoes `null`
     /// where the old parse echoed it whole (an array or object id is pinned by
     /// [`structured_id_on_a_rejection_echoes_null`], a long string or boolean
-    /// id by the bound tests in `error.rs`); and the shapes the screen reads
+    /// id by the bound tests in `error.rs`); the shapes the screen reads
     /// since WG-32, which the old one forwarded unread although the worker
     /// refuses them too: `eth_sendRawTransactionSync`, an escaped method name,
-    /// a byte-array param and a batch, each pinned by its own test.
+    /// a byte-array param and a batch, each pinned by its own test; and a
+    /// payload that starts with a refused type byte and does not decode, which
+    /// the screen refuses from its type byte where the old parse failed the
+    /// decode, pinned by [`refused_type_is_refused_from_its_type_byte`] and
+    /// [`blob_typed_payload_is_not_forwarded`]. No body below starts with such
+    /// a byte (`0xdeadbeef` starts with `0xde`).
     #[test]
     fn extraction_matches_the_previous_value_parse() {
         let valid = format!("[\"{EIP155_LEGACY_TX}\"]");
