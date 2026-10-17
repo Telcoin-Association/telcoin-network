@@ -1936,8 +1936,9 @@ struct Scan {
 /// or anywhere in a batch, names a method that starts with one of the
 /// prefixes, matched case-sensitively from the first character as jsonrpsee
 /// matches names, after unicode escapes are decoded. A batch element that is
-/// an array names the method jsonrpsee would run from it, its third member
-/// when that is a string (see [`Element::Positional`]); a `method` that is not
+/// an array names the methods jsonrpsee reads from it: its third member when
+/// that is a string, and its second when the array has exactly three members
+/// (see [`Element::Positional`]); a `method` that is not
 /// a string, and a batch element that is neither an object nor an array, name
 /// nothing. With a list in force the pass reads every call: neither the
 /// single-call fast path nor the skip of a mixed batch's remaining elements is
@@ -2086,7 +2087,7 @@ impl ScanState<'_> {
     }
 
     /// Record one batch element; one that is not an object counts as another
-    /// call, and an array is checked against the method policy by the name
+    /// call, and an array is checked against the method policy by the names
     /// jsonrpsee would read from it (see [`Element::Positional`]). A
     /// submission is screened while the batch can still be all submissions,
     /// up to the first one the screen refuses.
@@ -2098,9 +2099,9 @@ impl ScanState<'_> {
                     self.rejection = call.screen().err().map(|err| (err, Some(self.len)));
                 }
             }
-            Element::Positional(name) => {
+            Element::Positional { third, notified } => {
                 self.other = true;
-                self.denied |= self.denies(name.as_deref());
+                self.denied |= self.denies(third.as_deref()) || self.denies(notified.as_deref());
             }
             Element::Other => self.other = true,
         }
@@ -2374,12 +2375,21 @@ impl<'de> Deserialize<'de> for Member {
 enum Element<'de> {
     /// A call object.
     Call(Call<'de>),
-    /// An array. jsonrpsee's derived `Request` reads one positionally,
-    /// `[jsonrpc, id, method, params]`, and runs it when it has exactly four
-    /// elements, so its `method` (when a string, escapes decoded) is kept
-    /// for the method policy. It still routes as another call and is not
-    /// screened.
-    Positional(Option<Cow<'de, str>>),
+    /// An array. jsonrpsee reads a batch element as a `Request` and, failing
+    /// that, as a `Notification`; both names (when strings, escapes decoded)
+    /// are kept for the method policy, and either denies the batch, as the
+    /// object form of a notification is denied. It still routes as another
+    /// call and is not screened.
+    Positional {
+        /// The third member, kept from an array of any length: the `method`
+        /// of jsonrpsee's four-member `Request` shape,
+        /// `[jsonrpc, id, method, params]`, which it runs.
+        third: Option<Cow<'de, str>>,
+        /// The second member of a three-member array: the `method` of
+        /// jsonrpsee's `Notification` shape, `[jsonrpc, method, params]`,
+        /// which jsonrpsee 0.26 reads but never runs.
+        notified: Option<Cow<'de, str>>,
+    },
     /// Any other element; the upstream answers it as an invalid request.
     Other,
 }
@@ -2390,22 +2400,29 @@ impl<'de> Lenient<'de> for Element<'de> {
     }
 
     fn array<A: SeqAccess<'de>>(mut elements: A) -> Result<Self, A::Error> {
-        // the third member is the `method` jsonrpsee reads; a name read from
-        // a shape it refuses (another length, a bad `jsonrpc`) still denies
-        // the batch, although the worker would answer that element as an
-        // invalid request: the check errs toward refusing
-        let mut name = None;
-        for index in 0usize.. {
-            let more = if index == 2 {
-                elements.next_element::<MaybeStr<'de>>()?.map(|method| name = method.0).is_some()
-            } else {
-                elements.next_element::<IgnoredAny>()?.is_some()
+        // the third member is the `method` of jsonrpsee's four-member
+        // `Request` shape, `[jsonrpc, id, method, params]`, and the second is
+        // the `method` of its three-member `Notification` shape,
+        // `[jsonrpc, method, params]`; in the four-member shape the second
+        // member is the id and must not deny, so it counts only when the
+        // array ends at three. a name read from a shape jsonrpsee refuses
+        // (another length, a bad `jsonrpc`) still denies the batch, although
+        // the worker would answer that element as an invalid request: the
+        // check errs toward refusing
+        let (mut second, mut third) = (None, None);
+        let mut len = 0usize;
+        loop {
+            let more = match len {
+                1 => elements.next_element::<MaybeStr<'de>>()?.map(|m| second = m.0).is_some(),
+                2 => elements.next_element::<MaybeStr<'de>>()?.map(|m| third = m.0).is_some(),
+                _ => elements.next_element::<IgnoredAny>()?.is_some(),
             };
             if !more {
                 break;
             }
+            len += 1;
         }
-        Ok(Self::Positional(name))
+        Ok(Self::Positional { third, notified: second.filter(|_| len == 3) })
     }
 
     fn object<A: MapAccess<'de>>(members: A) -> Result<Self, A::Error> {
@@ -4110,10 +4127,12 @@ mod tests {
             r#"{"jsonrpc":"2.0","method":"eth_sendRawTransaction","params":["\udc00"],"id":1}"#
                 .to_string(),
             r#"{"jsonrpc":"2.0","method":"eth_chainId","params":[[1e400]],"id":1}"#.to_string(),
-            // a positional element's method slot is read too, so a value the
-            // typed readers refuse there ends the scan
+            // a positional element's second and third members are read too, so
+            // a value the typed readers refuse in either ends the scan
             r#"["2.0",1,1e400,[]]"#.to_string(),
             r#"["2.0",1,"\ud800",[]]"#.to_string(),
+            r#"["2.0",1e400,"eth_call",[]]"#.to_string(),
+            r#"["2.0","\ud800",[]]"#.to_string(),
         ];
         for trigger in &triggers {
             for body in [
@@ -4303,12 +4322,18 @@ mod tests {
         let denied = call("tn_getStuff");
         let deep = format!("{}{}", "[".repeat(512), "]".repeat(512));
         // jsonrpsee's derived `Request` reads a four-element array
-        // positionally, `[jsonrpc, id, method, params]`, and runs it
+        // positionally, `[jsonrpc, id, method, params]`, and runs it; a
+        // three-element array it reads as a `Notification`,
+        // `[jsonrpc, method, params]`, which jsonrpsee 0.26 never runs, and the
+        // policy denies it like the object form. the model below counts it as
+        // run (see `WorkerReads`)
         let positional = [
             r#"[["2.0",1,"tn_info",[]]]"#.to_string(),
             r#"[["2.0",1,"debug_traceBlockByNumber",["latest",{}]]]"#.to_string(),
             r#"[["2.0",null,"tn_info",null]]"#.to_string(),
             format!(r#"[{},["2.0",1,"tn_info",[]]]"#, call("eth_call")),
+            r#"[["2.0","tn_info",[]]]"#.to_string(),
+            r#"[["2.0","tn_info",null]]"#.to_string(),
         ];
         let mut denied_bodies = vec![
             r#"{"jsonrpc":"2.0","method":"\u0074n_getStuff","params":[],"id":1}"#.to_string(),
@@ -4365,7 +4390,10 @@ mod tests {
                 .any(|method| prefixes.iter().any(|prefix| method.starts_with(prefix.as_str())))
         };
         for body in &positional {
-            assert!(runs_a_denied_call(body.as_bytes()), "jsonrpsee runs a denied call: {body}");
+            assert!(
+                runs_a_denied_call(body.as_bytes()),
+                "the worker model runs a denied call: {body}"
+            );
         }
         for body in denied_bodies.iter().chain(&allowed_bodies) {
             assert!(
