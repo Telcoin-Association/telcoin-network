@@ -91,12 +91,12 @@ lane_clippy() {
     echo "clippy for workspace: default and all features passed"
 }
 
-# Rebuild the gateway image's build context from HEAD and resolve the workspace in it.
-# bin/worker-gateway/Dockerfile copies only the paths it names (etc/Dockerfile copies
-# everything), and cargo cannot load the workspace when an explicit member or a
-# [patch.crates-io] path source is missing, even for `-p`. The metadata call resolves
-# dependencies on purpose: `--no-deps` would hide a missing patch source. Takes an optional
-# Dockerfile path so the check can be pointed at another copy of the file.
+# Rebuild the gateway image's build context from HEAD, resolve the workspace in it and check
+# the gateway in it. bin/worker-gateway/Dockerfile copies only the paths it names
+# (etc/Dockerfile copies everything), and cargo cannot load the workspace when an explicit
+# member or a [patch.crates-io] path source is missing, even for `-p`. The metadata call
+# resolves dependencies on purpose: `--no-deps` would hide a missing patch source. Takes an
+# optional Dockerfile path so the check can be pointed at another copy of the file.
 check_gateway_image_context() {
     local dockerfile=${1:-bin/worker-gateway/Dockerfile}
     local line word tmp
@@ -120,13 +120,24 @@ check_gateway_image_context() {
         trap 'rm -rf -- "$tmp"' EXIT
         # The sources go to git quoted, so git, not the shell, expands a glob such as
         # `Cargo*`. The tn-contracts submodule archives as an empty directory, which is all
-        # cargo metadata needs.
+        # cargo metadata needs; the gateway's own dependencies (tn-types, tn-metrics) read
+        # nothing from it.
         git archive HEAD -- "${paths[@]}" | tar -x -C "$tmp"
         # --offline needs every locked crate source in CARGO_HOME.
         run cargo fetch --locked
         run cargo metadata --locked --offline --format-version 1 --manifest-path "$tmp/Cargo.toml" >/dev/null
+        # Resolving the workspace is not enough: a compile-time input of the gateway's
+        # dependencies, such as the chain-configs/ files tn-types reads with
+        # include_str!, can be missing from the COPY list and still resolve, so check
+        # the gateway in the copy too. This does not replace the standalone build in
+        # lane_test_default: that build links the production binary with the
+        # gateway's own feature set, and this check proves compile-time inputs such
+        # as chain-configs/ are in the image's COPY set. The shared target dir reuses
+        # the registry crates; only the path crates recompile under the copy's path.
+        CARGO_TARGET_DIR="$PWD/target" run cargo check --locked --offline \
+            -p tn-worker-gateway --bin worker-gateway --manifest-path "$tmp/Cargo.toml"
     )
-    echo "gateway image context resolves: ${paths[*]}"
+    echo "gateway image context resolves and compiles: ${paths[*]}"
 }
 
 lane_test_default() {
