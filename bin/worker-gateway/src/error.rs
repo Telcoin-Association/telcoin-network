@@ -140,14 +140,15 @@ pub(crate) enum GatewayError {
     /// answers at once instead of queueing, so one saturated route cannot
     /// hold the connection slots the other route needs.
     Overloaded,
-    /// The upstream answered with a non-2xx `status`, or, from the query
-    /// upstream, a `2xx`, and a body that is not JSON, so it carries no
-    /// JSON-RPC answer to relay. The client gets the
-    /// upstream's status with a JSON-RPC error in place of the body, or `502`
-    /// for a `1xx` or `304`, which can carry no body.
+    /// The upstream's answer carries no JSON-RPC answer to relay: a non-2xx
+    /// `status`, or, from the query upstream, a `2xx`, with a body that is not
+    /// JSON, or a `1xx`, `204`, `205` or `304` from either upstream, which can
+    /// carry no body. The client gets the upstream's status with a JSON-RPC
+    /// error in place of the body, or `502` for a `1xx`, `204`, `205` or
+    /// `304`.
     UpstreamError {
         /// The HTTP status the client gets: the upstream's, or `502` in place
-        /// of a `1xx` or `304`.
+        /// of a `1xx`, `204`, `205` or `304`.
         status: StatusCode,
     },
     /// The request's HTTP method was not `POST`. JSON-RPC over HTTP is
@@ -336,8 +337,9 @@ pub(crate) fn error_response_with_id(err: &GatewayError, id: RequestId) -> Respo
 }
 
 /// Replace an upstream answer that carries no JSON-RPC body to pass on with a
-/// JSON-RPC error under `status` (the upstream's, or `502` in place of a `1xx`
-/// or `304`), echoing the request `id` recovered from `request_body`.
+/// JSON-RPC error under `status` (the upstream's, or `502` in place of a `1xx`,
+/// `204`, `205` or `304`), echoing the request `id` recovered from
+/// `request_body`.
 ///
 /// The gateway did forward this request, so it is counted under its own
 /// `upstream_error` outcome rather than as a rejection (see

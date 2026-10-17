@@ -18,8 +18,8 @@
 //! - [`record_upstream_error`] bumps `tn_worker_gateway_requests_total{outcome="upstream_error"}`
 //!   plus `tn_worker_gateway_rejections_total{reason="upstream_error"}` for a request whose
 //!   upstream's answer carried no JSON-RPC body to pass on (an error status without a JSON body, an
-//!   answer from the `--redirect-queries` endpoint without one, or a `1xx` or `304`), which the
-//!   gateway replaced with a JSON-RPC error;
+//!   answer from the `--redirect-queries` endpoint without one, or a `1xx`, `204`, `205` or `304`),
+//!   which the gateway replaced with a JSON-RPC error;
 //! - [`record_cancelled`] bumps `tn_worker_gateway_requests_total{outcome="cancelled"}` for a
 //!   request whose connection closed before the gateway answered it (a client disconnect, the
 //!   connection-lifetime cap or shutdown dropped it mid-flight).
@@ -285,7 +285,7 @@ pub(crate) fn record_rejection(reason: &'static str) {
 
 /// Record a request whose upstream's answer carried no JSON-RPC body to pass
 /// on (an error status without a JSON body, an answer from the query upstream
-/// without one, or a `1xx` or `304`), which the gateway replaced with a
+/// without one, or a `1xx`, `204`, `205` or `304`), which the gateway replaced with a
 /// JSON-RPC error. It is kept apart from [`record_rejection`]'s `rejected`
 /// outcome because the gateway did forward it and the upstream answered.
 pub(crate) fn record_upstream_error(reason: &'static str) {

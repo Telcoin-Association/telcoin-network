@@ -22,8 +22,8 @@
 //! a well-formed JSON-RPC error instead (see [`crate::error`]). So does a
 //! client whose upstream answers an error status without a JSON body (a
 //! worker's `429` text/plain, say): it keeps the upstream's status, with a
-//! JSON-RPC error in place of the body. A `1xx` or `304`, which can carry no
-//! body, gets the same error with a `502`.
+//! JSON-RPC error in place of the body. A `1xx`, `204`, `205` or `304`, which
+//! can carry no body, gets the same error with a `502`.
 //!
 //! With `--redirect-queries` set, transaction submissions go to the worker,
 //! and so do the few single reads only its pool can answer: a nonce at the
@@ -578,11 +578,15 @@ pub(crate) async fn proxy(
             // text/plain, say), or any query answer without one, carries no
             // json-rpc answer: replace it with the gateway's envelope, keeping
             // the status and echoing the request's id. hyper's server sends a
-            // 1xx or 304 without a body (and closes the connection after a
-            // 101), so such an answer could carry no json-rpc response
-            // whatever its content type: it gets the envelope with a 502
+            // 1xx, 204 or 304 without a body (and closes the connection after
+            // a 101), and a 205 must carry none, so such an answer could carry
+            // no json-rpc response whatever its content type: it gets the
+            // envelope with a 502
             let unservable = upstream.status().is_informational()
-                || upstream.status() == StatusCode::NOT_MODIFIED;
+                || matches!(
+                    upstream.status(),
+                    StatusCode::NO_CONTENT | StatusCode::RESET_CONTENT | StatusCode::NOT_MODIFIED
+                );
             if unservable || is_non_json_answer(&upstream, route) {
                 let status = if unservable { StatusCode::BAD_GATEWAY } else { upstream.status() };
                 telemetry::record_routed(route.label(), "upstream_error");
@@ -1037,8 +1041,9 @@ async fn forward(
 /// Every non-2xx status counts, `3xx` included (redirects are never followed;
 /// see [`proxy_client`]). A JSON body, `application/json` or any `+json`
 /// subtype with any parameters, is relayed unchanged whatever the status: it
-/// is the upstream's own JSON-RPC error. A `1xx` or `304`, which can carry no
-/// body, never reaches this check: [`proxy`] answers it with a `502` first.
+/// is the upstream's own JSON-RPC error. A `1xx`, `204`, `205` or `304`, which
+/// can carry no body, never reaches this check: [`proxy`] answers it with a
+/// `502` first.
 fn is_non_json_error(upstream: &reqwest::Response) -> bool {
     !upstream.status().is_success()
         && !is_json_content_type(upstream.headers().get(header::CONTENT_TYPE))
@@ -4817,5 +4822,101 @@ mod tests {
         let lost = read_answer(upstream, 1024).await.expect_err("an overlong answer is lost");
         assert!(matches!(lost, AnswerLost::TooLong), "{lost}");
         server.abort();
+    }
+
+    /// The [`AppState`] of a gateway whose one worker serves `worker_url`,
+    /// with `query_url` as its `--redirect-queries` upstream when given.
+    fn upstream_state(worker_url: Url, query_url: Option<Url>) -> AppState {
+        let worker = UpstreamWorker {
+            worker_id: 0,
+            rpc_url: worker_url,
+            readiness_url: Url::parse("http://127.0.0.1:1/health/workers").expect("url"),
+        };
+        let nz = |n| NonZeroU32::new(n).expect("nonzero");
+        let thresholds = ReadinessThresholds { failure: nz(3), success: nz(2), rpc_failure: None };
+        AppState {
+            readiness: Arc::new(GatewayReadiness::new(&[worker], thresholds)),
+            http: proxy_client(
+                UpstreamClientBuilder::for_test(Duration::from_secs(2)),
+                Duration::from_secs(5),
+            )
+            .expect("client"),
+            query_upstream: query_url,
+            query_header: None,
+            recent_submissions: None,
+            denied_method_prefixes: Arc::from([]),
+            max_batch_len: NonZeroUsize::new(DEFAULT_MAX_BATCH_LEN),
+            query_http: None,
+            upstream_request_timeout: Duration::from_secs(5),
+            submission_slots: inflight_slots(0),
+            query_slots: inflight_slots(0),
+            upstream_slots: inflight_slots(0),
+            pool_read_slots: inflight_slots(0),
+            draining: Arc::default(),
+        }
+    }
+
+    /// A `204` or `205` gets the `502` / `-32012` error with the request's
+    /// id, as a `304` does: hyper's server sends a `204` without a body and a
+    /// `205` must carry none, so passing either on would leave the client with
+    /// no JSON-RPC answer, from either upstream and whatever its content type.
+    #[tokio::test]
+    async fn no_content_answers_become_a_bad_gateway_error() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let body = r#"{"jsonrpc":"2.0","method":"eth_chainId","params":[],"id":7}"#;
+        let rows = [
+            ("query 204", "HTTP/1.1 204 No Content\r\n\r\n", true),
+            ("query 205", "HTTP/1.1 205 Reset Content\r\ncontent-length: 0\r\n\r\n", true),
+            (
+                "worker 204",
+                "HTTP/1.1 204 No Content\r\ncontent-type: application/json\r\n\r\n",
+                false,
+            ),
+        ];
+        for (case, head, query) in rows {
+            // the upstream answers every connection with `head` and keeps it
+            // open, so the answer is never cut by a reset
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+            let upstream_url =
+                Url::parse(&format!("http://{}/", listener.local_addr().expect("addr")))
+                    .expect("url");
+            let server = tokio::spawn(async move {
+                let mut open = Vec::new();
+                loop {
+                    let (mut stream, _) = listener.accept().await.expect("accept");
+                    let mut request = [0u8; 4096];
+                    let _ = stream.read(&mut request).await;
+                    stream.write_all(head.as_bytes()).await.expect("write");
+                    open.push(stream);
+                }
+            });
+            let unreachable = Url::parse("http://127.0.0.1:1/").expect("url");
+            let state = if query {
+                upstream_state(unreachable, Some(upstream_url))
+            } else {
+                upstream_state(upstream_url, None)
+            };
+            state.readiness.set_ready(0, true);
+            let forwarding = TrustedProxies::default()
+                .resolve("127.0.0.1".parse().expect("peer"), &HeaderMap::new());
+
+            let response = proxy(
+                State(state),
+                Extension(forwarding),
+                PostOnly,
+                None,
+                None,
+                None,
+                Request::new(Body::from(body)),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::BAD_GATEWAY, "{case}");
+            let answer = axum::body::to_bytes(response.into_body(), usize::MAX).await.expect(case);
+            let answer: Value = serde_json::from_slice(&answer).expect(case);
+            assert_eq!(answer["error"]["code"], -32012, "{case}: {answer}");
+            assert_eq!(answer["id"], 7, "{case}: {answer}");
+            server.abort();
+        }
     }
 }
