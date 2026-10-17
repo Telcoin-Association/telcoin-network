@@ -91,7 +91,7 @@ Without a query redirect, `/ready/any` is exactly `/ready`.
 
 Every replica polls the same worker, so when the worker is down every replica's `/ready` fails at once.
 A `readinessProbe` on `/ready` would then take every replica out of the Service, and reads would stop too, although the query upstream could still serve them; removing the replicas gains submissions nothing, since every replica would answer them with the same `503` / `-32000`.
-The Deployment's `readinessProbe` therefore uses `/ready/any`: the replicas stay in the Service while reads can be served, submissions get `503` / `-32000` until the worker is back, and a replica leaves only when neither the worker nor the query upstream answers.
+The Deployment's `readinessProbe` therefore uses `/ready/any`: the replicas stay in the Service while reads can be served, submissions get `503` / `-32000` until the worker is back, and a replica leaves only when neither the worker nor the query upstream answers; the probe allows 5 s per answer and three misses, since `/ready/any` answers from memory and a slow answer means only a runtime starved by a flood that every replica shares.
 
 The same choice applies to an external load balancer or DNS health check, which has to check the client port (`8545`), since the probe port is not exposed.
 Check `/ready/any` to keep a gateway published while it can serve reads; that suits a validator's gateways, which all share one worker.
