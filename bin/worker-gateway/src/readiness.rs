@@ -1097,6 +1097,65 @@ mod tests {
         assert_eq!(warnings, 2, "{lines:#?}");
     }
 
+    /// The version warning is kept per upstream: two upstreams that both
+    /// answer a mismatching version each warn once, on a line naming their own
+    /// worker and readiness origin, and then each log at debug.
+    #[tokio::test]
+    async fn version_mismatch_warns_once_for_each_upstream() {
+        const LINE: &str = "unexpected readiness envelope version";
+        let captured = Captured::default();
+        let writer = captured.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || writer.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::DEBUG)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        // a node answering a mismatching version for its one worker
+        let mismatching = |worker_id: u16| {
+            let body = format!(
+                r#"{{"version":2,"workers":[{{"worker_id":{worker_id},"accepting_transactions":true}}]}}"#
+            );
+            Router::new().route(
+                "/health/workers",
+                get(move || {
+                    let body = body.clone();
+                    async move { body }
+                }),
+            )
+        };
+        let a = serve_mock(mismatching(0)).await;
+        let b = serve_mock(mismatching(1)).await;
+        let readiness =
+            GatewayReadiness::new(&[upstream_at(0, a), upstream_at(1, b)], thresholds(3, 1));
+        let client = Client::new();
+
+        // two mismatching polls of each upstream: each warns once, then logs
+        // its second poll at debug
+        poll_cycle(&readiness, &client, STEP_TIMEOUT).await;
+        poll_cycle(&readiness, &client, STEP_TIMEOUT).await;
+        let lines: Vec<String> =
+            captured.lines().into_iter().filter(|line| line.contains(LINE)).collect();
+        assert_eq!(lines.len(), 4, "{lines:#?}");
+        // the trailing spaces keep one port from matching a longer one
+        let count = |level: &str, worker_id: u16, addr: SocketAddr| {
+            lines
+                .iter()
+                .filter(|line| {
+                    line.contains(level)
+                        && line.contains(&format!("worker_id={worker_id} "))
+                        && line.contains(&format!("readiness=http://{addr} "))
+                })
+                .count()
+        };
+        for (worker_id, addr) in [(0, a), (1, b)] {
+            assert_eq!(count(" WARN ", worker_id, addr), 1, "worker {worker_id}: {lines:#?}");
+            assert_eq!(count(" DEBUG ", worker_id, addr), 1, "worker {worker_id}: {lines:#?}");
+        }
+        assert!(lines.iter().all(|line| !line.contains("/health/workers")), "url leaked");
+    }
+
     #[tokio::test]
     async fn rpc_path_mark_lasts_until_m_successful_polls() {
         let mode = Arc::new(AtomicU8::new(READY));

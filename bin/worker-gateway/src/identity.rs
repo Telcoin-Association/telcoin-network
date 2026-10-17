@@ -343,10 +343,10 @@ pub(crate) async fn identify(
 /// (a front sending one is misconfigured, and serving the connection as the
 /// front's own would merge its clients into the front's rate-limit key). That
 /// includes a `PROXY` header with family `UNSPEC`, which the PROXY v2
-/// specification has a receiver accept and serve under the real connection's
-/// endpoints; the gateway closes such a connection instead, on purpose, so a
-/// relayed client is never served under the front's key. The caller bounds the
-/// read with the header read timeout.
+/// specification lets a receiver either serve under the real connection's
+/// endpoints or reject; the gateway rejects it, so a relayed client is never
+/// served under the front's key. The caller bounds the read with the header
+/// read timeout.
 pub(crate) async fn read_proxy_header<R>(stream: &mut R) -> io::Result<ProxyHeader>
 where
     R: AsyncRead + Unpin,
@@ -507,6 +507,13 @@ impl FromStr for Cidr {
 /// address, a bracketed IPv6 address (`[2001:db8::7]`), or an address with a
 /// port (`203.0.113.7:4711`, `[2001:db8::7]:4711`), which some proxies append;
 /// the port is dropped.
+///
+/// An IPv6 address with a port must be bracketed: an unbracketed
+/// `2001:db8::7:4711` is itself a valid IPv6 address and is read as that
+/// address, the port in its low bits, so a front that appends a port to an
+/// IPv6 client address must bracket it; otherwise the groups shift one place
+/// left and the client could choose its rate-limit prefix through its
+/// interface identifier.
 fn parse_forwarded_entry(entry: &str) -> Option<IpAddr> {
     let entry = entry.trim();
     let ip = match entry.strip_prefix('[').and_then(|rest| rest.strip_suffix(']')) {

@@ -108,7 +108,10 @@ pub(crate) struct Cli {
     /// `--recent-submission-ttl`); everything else, including a batch that
     /// mixes submissions with other calls, goes here, with no readiness gate
     /// and no fallback to the worker. Must not point at the gateway itself or
-    /// at a worker's RPC or readiness host and port.
+    /// at a worker's RPC or readiness host and port, where `localhost` counts
+    /// as both `127.0.0.1` and `[::1]`, and an unspecified host as any loopback
+    /// or unspecified address; another loopback address at a worker's port is
+    /// accepted with a warning.
     #[arg(long, env = "WORKER_GATEWAY_REDIRECT_QUERIES", hide_env_values = true)]
     pub(crate) redirect_queries: Option<String>,
 
@@ -327,6 +330,11 @@ pub(crate) struct Cli {
     /// it would put every client behind that front under one cap. A connection
     /// over the cap is closed at once, without a response, so one client
     /// cannot hold every `--max-connections` slot.
+    /// Keep it at or below the per-IP burst (`--rate-limit-per-ip-burst`, 200
+    /// by default; the default 32 is within it): with
+    /// `--rate-limit-submissions`, a first-seen client's concurrent first
+    /// requests all pass the edge before its entry exists, and are recorded
+    /// against it as debt afterwards.
     #[arg(
         long,
         env = "WORKER_GATEWAY_MAX_CONNECTIONS_PER_IP",
@@ -359,14 +367,17 @@ pub(crate) struct Cli {
     /// (default 100; `0` means unlimited). A request for the worker over the
     /// cap is answered at once with a `503` overload error instead of waiting.
     /// Every gateway in front of a worker shares its `--rpc.max-connections`
-    /// (500 by default), so keep the number of gateways times this cap below
-    /// it. Without `--redirect-queries`, reads may hold at most this cap less a
-    /// fifth of it (at least one slot), so the rest stays free for submissions
-    /// (see `--max-inflight-queries`). With it, the reads kept on the worker
-    /// (pending nonce reads and recent submission lookups) may hold at most a
-    /// fifth of it (at least one slot), and one over that share is answered at
-    /// once with the same `503`. At `1` no slot stays free for submissions, and
-    /// startup warns.
+    /// (500 by default), which counts in-flight HTTP requests, not TCP
+    /// connections, so keep N times this cap below it, where N counts every
+    /// gateway that can hold worker requests at once: the replica ceiling plus
+    /// any pod a rollout adds or is draining (see the README's Sizing for N
+    /// gateways). Without `--redirect-queries`, reads may hold at most this cap
+    /// less a fifth of it (at least one slot), so the rest stays free for
+    /// submissions (see `--max-inflight-queries`). With it, the reads kept on
+    /// the worker (pending nonce reads and recent submission lookups) may hold
+    /// at most a fifth of it (at least one slot), and one over that share is
+    /// answered at once with the same `503`. At `1` no slot stays free for
+    /// submissions, and startup warns.
     #[arg(long, env = "WORKER_GATEWAY_MAX_UPSTREAM_INFLIGHT", default_value_t = 100)]
     pub(crate) max_upstream_inflight: usize,
 
@@ -398,7 +409,9 @@ pub(crate) struct Cli {
     /// single-request bound (`--header-read-timeout`, twice with `--proxy-protocol`, plus the
     /// whole-request deadline `--upstream-request-timeout` +
     /// `--header-read-timeout`) so the first request on a connection can never
-    /// be cut off. `0` disables.
+    /// be cut off. `0` disables, and then a streamed answer that keeps
+    /// arriving, or a client that keeps reading it slowly, holds its class
+    /// slot without a time bound.
     #[arg(
         long,
         env = "WORKER_GATEWAY_MAX_CONNECTION_DURATION",
@@ -534,9 +547,13 @@ pub(crate) struct Cli {
     pub(crate) rate_limit_submissions: u32,
 
     /// Most client prefixes the per-IP rate limiter tracks at once (default
-    /// 100,000); a first-seen client beyond it shares one overflow bucket with
-    /// every other untracked client (see the README's Rate limiting section).
-    /// Ignored when the per-IP rate limit is disabled.
+    /// 100,000); a first-seen client beyond it, once no tracked entry is idle,
+    /// shares one overflow bucket with every other untracked client (see the
+    /// README's Rate limiting section).
+    /// Memory (about 100 bytes an entry) and the once-a-second idle sweep,
+    /// which walks the whole table under the lock every per-IP admission takes
+    /// (about 1 ms per 100,000 entries), grow with this value; startup warns
+    /// above 1,000,000. Ignored when the per-IP rate limit is disabled.
     #[arg(
         long,
         env = "WORKER_GATEWAY_RATE_LIMIT_PER_IP_MAX_ENTRIES",
@@ -603,9 +620,11 @@ pub(crate) struct Cli {
 
     /// How long to drain in-flight requests on SIGTERM before forcing close.
     /// Default: the request deadline, `--upstream-request-timeout` +
-    /// `--header-read-timeout` (45s at the defaults), so a request accepted just
-    /// before shutdown can finish; an explicit value is kept as given, and one
-    /// below the deadline logs a startup warning.
+    /// `--header-read-timeout` (45s at the defaults), so a request whose head
+    /// has arrived when the drain starts can run to its deadline. A connection
+    /// still sending its head can be cut up to `--header-read-timeout` (twice
+    /// that with `--proxy-protocol`) before its own deadline. An explicit value
+    /// is kept as given, and one below the deadline logs a startup warning.
     #[arg(
         long,
         env = "WORKER_GATEWAY_GRACEFUL_SHUTDOWN_TIMEOUT",
@@ -643,7 +662,9 @@ pub(crate) struct Cli {
     /// `--access-log-sample`: a sampled request over it writes no line and is
     /// counted in `tn_worker_gateway_access_log_suppressed_total`. The window
     /// is a fixed second, so a burst across one window edge can write about
-    /// twice the ceiling within a second at most. Defaults to `1000`; `0`
+    /// twice the ceiling within a second at most. The ceiling is shared by
+    /// every client, so one client's flood, its `429`s included, can suppress
+    /// every other client's lines in the same second. Defaults to `1000`; `0`
     /// means unlimited.
     #[arg(long, env = "WORKER_GATEWAY_ACCESS_LOG_MAX_LINES_PER_SECOND", default_value_t = 1000)]
     pub(crate) access_log_max_lines_per_second: u32,
@@ -692,8 +713,8 @@ impl fmt::Debug for Cli {
     }
 }
 
-/// Fully-resolved runtime settings, derived from [`Cli`].
-#[derive(Debug)]
+/// Fully-resolved runtime settings, derived from [`Cli`]. Its `Debug` is
+/// redacted (see below).
 pub(crate) struct Settings {
     /// Address the gateway listens on.
     pub(crate) listen_addr: SocketAddr,
@@ -768,7 +789,7 @@ pub(crate) struct Settings {
     /// when uncapped.
     pub(crate) max_connection_duration: Option<Duration>,
     /// Maximum accepted request body size, in bytes.
-    pub(crate) max_request_bytes: usize,
+    pub(crate) max_request_bytes: NonZeroUsize,
     /// Maximum calls in one JSON-RPC batch, or `None` when unlimited.
     pub(crate) max_batch_len: Option<NonZeroUsize>,
     /// Budget of request-body bytes held across all in-flight requests, or
@@ -812,6 +833,26 @@ pub(crate) struct Settings {
     /// Most access-log lines written per second after sampling, or `None`
     /// when unlimited.
     pub(crate) access_log_max_lines_per_second: Option<NonZeroU32>,
+}
+
+/// Prints only the fields that identify a deployment, as [`Cli`]'s `Debug`
+/// does: the upstreams and `--redirect-queries` by origin (see
+/// [`UpstreamOrigin`]) and the query header as `<redacted>`. Every other
+/// field, one added later included, is left out rather than printed.
+impl fmt::Debug for Settings {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Settings")
+            .field("listen_addr", &self.listen_addr)
+            .field("probe_addr", &self.probe_addr)
+            .field("upstreams", &self.upstreams)
+            .field(
+                "query_upstream",
+                &self.query_upstream.as_ref().map(|url| UpstreamOrigin(url).to_string()),
+            )
+            .field("query_header", &self.query_header.as_ref().map(|_| "<redacted>"))
+            .field("metrics_addr", &self.metrics_addr)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Cli {
@@ -929,6 +970,14 @@ impl Cli {
             );
             Ok(())
         })?;
+        if max_connection_duration.is_none() {
+            warn!(
+                target: "gateway",
+                "--max-connection-duration is 0: a streamed answer that keeps arriving, or a \
+                 client that keeps reading it slowly, holds its class slot and connection \
+                 without a time bound"
+            );
+        }
         let requested_queries = self.max_inflight_queries.unwrap_or(DEFAULT_MAX_INFLIGHT_QUERIES);
         let max_inflight_queries = effective_query_cap(
             requested_queries,
@@ -1033,6 +1082,17 @@ impl Cli {
             resolve_rate_limit(self.rate_limit_per_ip, self.rate_limit_per_ip_burst);
         let rate_limit_global =
             resolve_rate_limit(self.rate_limit_global, self.rate_limit_global_burst);
+        if rate_limit_per_ip.is_some()
+            && self.rate_limit_per_ip_max_entries.get() > crate::ratelimit::MAX_QUIET_PER_IP_ENTRIES
+        {
+            warn!(
+                target: "gateway",
+                max_entries = self.rate_limit_per_ip_max_entries.get(),
+                "--rate-limit-per-ip-max-entries is above 1,000,000: each idle-bucket sweep \
+                 walks the whole table under the lock every per-IP admission takes (about 1 ms \
+                 per 100,000 entries)"
+            );
+        }
         // a batch of k calls needs k tokens at once and no bucket ever holds
         // more than its burst, so a batch longer than the smallest per-ip or
         // global burst could only ever get a 429 that no retry satisfies; cap
@@ -1101,9 +1161,11 @@ impl Cli {
             humantime::format_duration(self.shutdown_delay),
             humantime::format_duration(MAX_SHUTDOWN_DELAY),
         );
-        // the drain defaults to the request deadline so a request accepted just
-        // before shutdown can finish; a shorter explicit value is the
-        // operator's choice, so it is kept, with a warning
+        // the drain defaults to the request deadline, so a request whose head
+        // has arrived when the drain starts can run to its deadline (one still
+        // sending its head can be cut up to --header-read-timeout early); a
+        // shorter explicit value is the operator's choice, so it is kept, with
+        // a warning
         let graceful_shutdown_timeout = self.graceful_shutdown_timeout.unwrap_or(deadline);
         if graceful_shutdown_timeout < deadline {
             warn!(
@@ -1153,7 +1215,7 @@ impl Cli {
             max_worker_pool_reads: worker_pool_read_cap(self.max_upstream_inflight),
             tcp_user_timeout: resolve_optional_duration(self.tcp_user_timeout),
             max_connection_duration,
-            max_request_bytes: self.max_request_bytes.get(),
+            max_request_bytes: self.max_request_bytes,
             max_batch_len,
             max_inflight_request_bytes,
             http1_max_buf_size: self.http1_max_buf_size,
@@ -1317,8 +1379,8 @@ fn resolve_optional_duration(value: Duration) -> Option<Duration> {
 /// `upstream_request_timeout` plus a `header_read_timeout`-sized budget for
 /// reading the body, so a trickled body cannot hold a request slot without
 /// bound. It is also the default drain on shutdown
-/// (`--graceful-shutdown-timeout`), so a request accepted just before it can
-/// finish.
+/// (`--graceful-shutdown-timeout`), so a request whose head has arrived when
+/// the drain starts can run to its deadline.
 pub(crate) fn request_deadline(
     upstream_request_timeout: Duration,
     header_read_timeout: Duration,
@@ -1675,11 +1737,12 @@ fn parse_url_flag(flag: &str, value: &str) -> eyre::Result<Url> {
 /// `--redirect-queries-header X-Api-Key: <key>` leaves the key behind as such
 /// a stray argument, so those kinds get a message that names the flag, or a
 /// similar flag clap suggests, and never the token. A value error keeps the
-/// parser's own reason: the flags that can carry a secret are taken as strings
-/// and parsed after clap, so the typed parsers only ever see durations,
-/// numbers, addresses and the like. Help, version and the kinds that carry
-/// only flag names (a missing or conflicting argument, for example) return
-/// `None`, and the caller lets clap print and exit as usual.
+/// parser's own reason, which can quote part of the value (humantime names an
+/// unknown unit, for example): the flags that can carry a secret are taken as
+/// strings and parsed after clap, so the typed parsers only ever see
+/// durations, numbers, addresses and the like. Help, version and the kinds
+/// that carry only flag names (a missing or conflicting argument, for example)
+/// return `None`, and the caller lets clap print and exit as usual.
 pub(crate) fn redacted_parse_error(err: &clap::Error) -> Option<String> {
     use clap::error::{ContextKind, ContextValue, ErrorKind};
 
@@ -1704,6 +1767,13 @@ pub(crate) fn redacted_parse_error(err: &clap::Error) -> Option<String> {
             let reason = std::error::Error::source(err)
                 .map(|source| format!(": {source}"))
                 .unwrap_or_default();
+            // the parser's reason can quote part of the value (humantime names
+            // an unknown unit), so the message does not claim otherwise
+            let not_repeated = if reason.is_empty() {
+                "the value is not repeated here"
+            } else {
+                "the value is not repeated here, beyond what the parser's reason quotes"
+            };
             let possible = match err.get(ContextKind::ValidValue) {
                 Some(ContextValue::Strings(values)) if !values.is_empty() => {
                     format!("; possible values: {}", values.join(", "))
@@ -1711,8 +1781,7 @@ pub(crate) fn redacted_parse_error(err: &clap::Error) -> Option<String> {
                 _ => String::new(),
             };
             Some(format!(
-                "invalid value for '{arg}'{reason} (the value is not repeated here){possible}; \
-                 see --help"
+                "invalid value for '{arg}'{reason} ({not_repeated}){possible}; see --help"
             ))
         }
         _ => None,
@@ -1727,15 +1796,16 @@ pub(crate) fn redacted_parse_error(err: &clap::Error) -> Option<String> {
 /// worker's node land on the validator, which is the load the redirect exists
 /// to remove. It compares host and port whatever the scheme, so an `https` URL
 /// on a worker's `http` socket is caught too, an IPv4-mapped IPv6 literal
-/// matches the IPv4 address it names, and any loopback or unspecified host
-/// (`localhost`, `127.0.0.2`, `[::1]`, `0.0.0.0`) matches any other, since each
-/// names this machine (see [`same_host`]). A URL on a worker's host but another
-/// port is accepted with a warning, since that port may serve a separate node
-/// on the validator's machine. Plain `http` to a host that is not an address
-/// literal unroutable from the internet (see [`plaintext_to_public_host`]) is
-/// accepted with a warning: the reads and their answers then cross the network
-/// unencrypted. Messages name the URL by origin only, since a hosted RPC URL
-/// can carry an API key in its path.
+/// matches the IPv4 address it names, `localhost` matches `127.0.0.1` and
+/// `[::1]`, and an unspecified host (`0.0.0.0`, `[::]`) matches any loopback or
+/// unspecified one (see [`same_host`]). A URL elsewhere on a worker's machine
+/// (see [`same_machine`]), at another port or on another loopback address at
+/// the worker's port, is accepted with a warning, since that endpoint may serve
+/// a separate node on the validator's machine. Plain `http` to a host that is
+/// not an address literal unroutable from the internet (see
+/// [`plaintext_to_public_host`]) is accepted with a warning: the reads and
+/// their answers then cross the network unencrypted. Messages name the URL by
+/// origin only, since a hosted RPC URL can carry an API key in its path.
 fn ensure_query_upstream(
     listen_addr: SocketAddr,
     url: &Url,
@@ -1769,14 +1839,15 @@ fn ensure_query_upstream(
             })
     })?;
     if let Some(worker) = upstreams.iter().find(|upstream| {
-        same_host(url, &upstream.rpc_url) || same_host(url, &upstream.readiness_url)
+        same_machine(url, &upstream.rpc_url) || same_machine(url, &upstream.readiness_url)
     }) {
         warn!(
             target: "gateway",
             upstream = %UpstreamOrigin(url),
             worker_id = worker.worker_id,
-            "--redirect-queries is on a worker's host at another port; unless that port serves \
-             a separate node, reads still reach the validator's machine"
+            "--redirect-queries is on a worker's host at another port, or on another loopback \
+             address at its port; unless that endpoint serves a separate node, reads still reach \
+             the validator's machine"
         );
     }
     if plaintext_to_public_host(url) {
@@ -1816,20 +1887,36 @@ fn same_host_and_port(a: &Url, b: &Url) -> bool {
 /// Whether two URLs name the same host. Hosts that name addresses (see
 /// [`url_host_ips`]) match when they share one, so an IPv4-mapped IPv6 literal
 /// (`[::ffff:10.0.0.7]`) matches the IPv4 address it names and `localhost`
-/// matches either loopback address; other domain names match only as written.
-/// Any loopback or unspecified address also matches any other, in either
-/// family: each names this machine (an unspecified address connects to it),
-/// and a node bound to an unspecified address serves every loopback spelling,
-/// so `[::1]`, `127.0.0.2` and `0.0.0.0` all reach a worker on `127.0.0.1`.
+/// matches `127.0.0.1` and `[::1]`; other domain names match only as written.
+/// An unspecified address (`0.0.0.0`, `[::]`) also matches any loopback or
+/// unspecified address, in either family: a node bound to one answers on the
+/// loopback addresses, and a URL naming one connects to this machine. Two
+/// explicit loopback addresses match only when they are equal, since `[::1]`
+/// or `127.0.0.2` beside `127.0.0.1` can be another node's socket at the same
+/// port; [`same_machine`] is the wider test that matches them.
 fn same_host(a: &Url, b: &Url) -> bool {
     let this_machine = |ip: &IpAddr| ip.is_loopback() || ip.is_unspecified();
     url_host_ips(a).zip(url_host_ips(b)).map_or_else(
         || a.host() == b.host(),
         |(a, b)| {
             a.iter().any(|ip| b.contains(ip))
-                || (a.iter().any(this_machine) && b.iter().any(this_machine))
+                || (a.iter().any(IpAddr::is_unspecified) && b.iter().any(this_machine))
+                || (b.iter().any(IpAddr::is_unspecified) && a.iter().any(this_machine))
         },
     )
+}
+
+/// Whether two URLs name hosts on this same machine: the same host (see
+/// [`same_host`]), or two loopback or unspecified addresses in either family,
+/// each of which names this machine. Only the redirect's warning uses this
+/// wider test, since two different explicit loopback addresses can be two
+/// sockets.
+fn same_machine(a: &Url, b: &Url) -> bool {
+    let this_machine = |url: &Url| {
+        url_host_ips(url)
+            .is_some_and(|ips| ips.iter().any(|ip| ip.is_loopback() || ip.is_unspecified()))
+    };
+    same_host(a, b) || (this_machine(a) && this_machine(b))
 }
 
 /// Whether `url` is plain `http` to anything but an address literal that is
@@ -2016,6 +2103,20 @@ mod tests {
         .into_settings()?;
         assert_eq!(settings.tcp_user_timeout, Some(Duration::from_secs(30)));
         assert_eq!(settings.max_connection_duration, Some(Duration::from_secs(600)));
+        Ok(())
+    }
+
+    #[test]
+    fn zero_connection_duration_warns() -> eyre::Result<()> {
+        const WARNING: &str = "--max-connection-duration is 0";
+        let (settings, logs) =
+            into_settings_logged(cli_with_flags(&["--max-connection-duration=0"]));
+        assert_eq!(settings?.max_connection_duration, None);
+        assert!(logs.contains(WARNING), "{logs}");
+        // the default cap (10 minutes) bounds every connection, so no warning
+        let (settings, logs) = into_settings_logged(cli_with_flags(&[]));
+        assert_eq!(settings?.max_connection_duration, Some(Duration::from_secs(600)));
+        assert!(!logs.contains(WARNING), "{logs}");
         Ok(())
     }
 
@@ -2577,8 +2678,10 @@ mod tests {
         Ok(())
     }
 
-    /// `localhost` names both loopbacks, so a redirect to it is a worker on
-    /// either one, and the other way round.
+    /// `localhost` names both `127.0.0.1` and `[::1]`, so a redirect to it is
+    /// a worker on either one, and the other way round. Another explicit
+    /// loopback address is not refused (see
+    /// `distinct_loopback_redirect_at_a_workers_port_starts_with_a_warning`).
     #[test]
     fn localhost_redirect_matches_a_worker_on_either_loopback() -> eyre::Result<()> {
         let flags = |rpc: &str, redirect: &str| {
@@ -2597,8 +2700,6 @@ mod tests {
             ("http://127.0.0.1:9545/", "http://localhost:9545/"),
             ("http://localhost:9545/", "http://[::1]:9545/"),
             ("http://localhost:9545/", "http://[::ffff:127.0.0.1]:9545/"),
-            // any other loopback address is this machine too
-            ("http://[::1]:9545/", "http://127.0.0.2:9545/"),
         ] {
             let message = match flags(rpc, redirect) {
                 Ok(_) => panic!("{redirect} is the worker at {rpc}"),
@@ -2609,6 +2710,73 @@ mod tests {
         // an address off this machine is another host to the check
         flags("http://[::1]:9545/", "http://10.0.0.9:9545/")?;
         Ok(())
+    }
+
+    /// Two explicit loopback addresses can be two sockets at one port, so a
+    /// redirect to `[::1]` or `127.0.0.2` beside a worker on `127.0.0.1`, or the
+    /// other way round, is not refused; it is still this machine, so startup
+    /// warns.
+    #[test]
+    fn distinct_loopback_redirect_at_a_workers_port_starts_with_a_warning() -> eyre::Result<()> {
+        const WARNING: &str = "--redirect-queries is on a worker's host at another port, or on \
+                               another loopback address at its port";
+        for (worker, redirect) in [
+            ("127.0.0.1", "http://[::1]:8545/"),
+            ("127.0.0.1", "http://127.0.0.2:8545/"),
+            ("[::1]", "http://127.0.0.1:8545/"),
+        ] {
+            let cli = try_parse_test_argv([
+                "worker-gateway".to_string(),
+                "--listen-addr=10.0.0.5:8545".to_string(),
+                format!("--upstream-rpc-url=http://{worker}:8545/"),
+                format!("--upstream-readiness-url=http://{worker}:8551/health/workers"),
+                format!("--redirect-queries={redirect}"),
+            ])
+            .expect("argv parses");
+            let (settings, logs) = into_settings_logged(cli);
+            let settings = settings.unwrap_or_else(|err| {
+                panic!("{redirect} beside a worker on {worker}:8545 must start: {err:?}")
+            });
+            assert_eq!(settings.query_upstream, Some(Url::parse(redirect)?), "{redirect}");
+            assert!(logs.contains(WARNING), "{redirect} beside {worker} must warn: {logs}");
+            assert!(logs.contains("worker_id=0"), "{logs}");
+        }
+        Ok(())
+    }
+
+    /// Every spelling of a worker's own address stays refused: an IPv4-mapped
+    /// literal, `localhost`, and an unspecified address, since a node bound to
+    /// one answers on the loopback addresses.
+    #[test]
+    fn loopback_spellings_of_a_workers_address_stay_refused() {
+        // the gateway listens on another port, so its own-address check, which
+        // takes `0.0.0.0` beside an IPv4 listener, is not what trips
+        let flags = |worker: &str, redirect: &str| {
+            try_parse_test_argv([
+                "worker-gateway".to_string(),
+                "--listen-addr=10.0.0.5:9000".to_string(),
+                format!("--upstream-rpc-url=http://{worker}:8545/"),
+                format!("--upstream-readiness-url=http://{worker}:8551/health/workers"),
+                format!("--redirect-queries={redirect}"),
+            ])
+            .expect("argv parses")
+            .into_settings()
+        };
+        for (worker, redirect) in [
+            ("127.0.0.1", "http://[::ffff:127.0.0.1]:8545/"),
+            ("127.0.0.1", "http://0.0.0.0:8545/"),
+            ("127.0.0.1", "http://[::]:8545/"),
+            ("127.0.0.1", "http://localhost:8545/"),
+            ("[::1]", "http://[::]:8545/"),
+            ("[::1]", "http://0.0.0.0:8545/"),
+            ("[::1]", "http://localhost:8545/"),
+        ] {
+            let message = match flags(worker, redirect) {
+                Ok(_) => panic!("{redirect} is the worker on {worker}:8545"),
+                Err(err) => format!("{err:?}"),
+            };
+            assert!(message.contains("worker 0's RPC host and port"), "{redirect}: {message}");
+        }
     }
 
     /// An inline-upstream CLI on another host (so the self-pointing guard does
@@ -2626,7 +2794,7 @@ mod tests {
     #[test]
     fn edge_protection_defaults() -> eyre::Result<()> {
         let settings = cli_with_flags(&[]).into_settings()?;
-        assert_eq!(settings.max_request_bytes, 1_048_576);
+        assert_eq!(settings.max_request_bytes.get(), 1_048_576);
         assert_eq!(settings.max_batch_len, NonZeroUsize::new(50));
         let per_ip = settings.rate_limit_per_ip.expect("per-ip limit on by default");
         assert_eq!(per_ip.rate().get(), 100);
@@ -2713,6 +2881,30 @@ mod tests {
         assert_eq!(err.kind(), clap::error::ErrorKind::ValueValidation);
     }
 
+    /// A per-IP table cap above 1,000,000 entries starts with a warning, since
+    /// both idle sweeps walk the whole table under the lock every per-IP
+    /// admission takes; the ceiling itself is quiet, and so is a cap the
+    /// disabled per-IP limit ignores.
+    #[test]
+    fn per_ip_max_entries_above_a_million_warns() -> eyre::Result<()> {
+        const WARNING: &str = "--rate-limit-per-ip-max-entries is above 1,000,000";
+        let (settings, logs) =
+            into_settings_logged(cli_with_flags(&["--rate-limit-per-ip-max-entries=1000001"]));
+        settings?;
+        assert!(logs.contains(WARNING), "a cap above the ceiling did not warn: {logs}");
+        let (settings, logs) =
+            into_settings_logged(cli_with_flags(&["--rate-limit-per-ip-max-entries=1000000"]));
+        settings?;
+        assert!(!logs.contains(WARNING), "the ceiling itself is quiet: {logs}");
+        let (settings, logs) = into_settings_logged(cli_with_flags(&[
+            "--rate-limit-per-ip-max-entries=1000001",
+            "--rate-limit-per-ip=0",
+        ]));
+        settings?;
+        assert!(!logs.contains(WARNING), "ignored with the per-IP limit off: {logs}");
+        Ok(())
+    }
+
     #[test]
     fn explicit_burst_is_honored() -> eyre::Result<()> {
         let settings = cli_with_flags(&["--rate-limit-per-ip=40", "--rate-limit-per-ip-burst=50"])
@@ -2768,9 +2960,12 @@ mod tests {
 
     #[test]
     fn short_per_ip_prefix_warns() -> eyre::Result<()> {
-        for (flag, short, floor) in
-            [("--rate-limit-per-ip-v4-prefix", 8, 16), ("--rate-limit-per-ip-v6-prefix", 16, 32)]
+        for (flag, floor) in
+            [("--rate-limit-per-ip-v4-prefix", 16), ("--rate-limit-per-ip-v6-prefix", 32)]
         {
+            // one bit below the floor warns and the floor is quiet, so a floor
+            // moved by one bit either way fails
+            let short = floor - 1;
             let warning = format!("{flag} is /{short}: every client inside one /{short} shares");
             let arg = format!("{flag}={short}");
             let (settings, logs) = into_settings_logged(cli_with_flags(&[arg.as_str()]));
@@ -3125,7 +3320,7 @@ mod tests {
     #[test]
     fn max_request_bytes_is_configurable() -> eyre::Result<()> {
         let settings = cli_with_flags(&["--max-request-bytes=1024"]).into_settings()?;
-        assert_eq!(settings.max_request_bytes, 1_024);
+        assert_eq!(settings.max_request_bytes.get(), 1_024);
         Ok(())
     }
 
@@ -3177,7 +3372,7 @@ mod tests {
     fn max_request_bytes_below_the_submission_floor_warns() -> eyre::Result<()> {
         const WARNING: &str = "--max-request-bytes is below one hex-encoded 128 KiB transaction";
         let (settings, logs) = into_settings_logged(cli_with_flags(&["--max-request-bytes=1024"]));
-        assert_eq!(settings?.max_request_bytes, 1_024);
+        assert_eq!(settings?.max_request_bytes.get(), 1_024);
         assert!(logs.contains(WARNING), "{logs}");
         assert!(logs.contains("max_request_bytes=1024"), "{logs}");
         assert!(logs.contains("floor=263168"), "{logs}");
@@ -3949,19 +4144,23 @@ mod tests {
             ])
             .expect("argv parses")
         };
-        for redirect in ["http://[::1]:8544", "http://127.0.0.2:8544", "http://0.0.0.0:8544"] {
+        for redirect in ["http://0.0.0.0:8544", "http://[::]:8544"] {
             let message = match worker(redirect).into_settings() {
                 Ok(_) => panic!("{redirect} reaches the worker on 127.0.0.1:8544"),
                 Err(err) => format!("{err:?}"),
             };
             assert!(message.contains("is worker 0's RPC host and port"), "{redirect}: {message}");
         }
-        let (settings, logs) = into_settings_logged(worker("http://[::1]:9545"));
-        settings?;
-        assert!(
-            logs.contains("--redirect-queries is on a worker's host at another port"),
-            "{logs}"
-        );
+        // another loopback address at the worker's port can be another node's
+        // socket, as can another port, so these only warn
+        for redirect in ["http://[::1]:8544", "http://127.0.0.2:8544", "http://[::1]:9545"] {
+            let (settings, logs) = into_settings_logged(worker(redirect));
+            settings?;
+            assert!(
+                logs.contains("--redirect-queries is on a worker's host at another port"),
+                "{redirect}: {logs}"
+            );
+        }
         Ok(())
     }
 
@@ -4024,6 +4223,52 @@ mod tests {
         let debug = format!("{cli:?}");
         assert!(debug.contains("<invalid url>"), "{debug}");
         assert!(!debug.contains("s3cret"), "{debug}");
+
+        // a scheme-less credential parses with its user name as the scheme,
+        // which is not printed as an origin
+        let cli =
+            try_parse_test_argv(["worker-gateway", "--upstream-rpc-url=apikey:secret@host:8545"])?;
+        let debug = format!("{cli:?}");
+        assert!(debug.contains("<url without http(s) scheme>"), "{debug}");
+        for secret in ["apikey", "secret"] {
+            assert!(!debug.contains(secret), "`{secret}` leaked into: {debug}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn settings_debug_redacts_urls_and_header() -> eyre::Result<()> {
+        let settings = try_parse_test_argv([
+            "worker-gateway",
+            "--upstream-rpc-url=http://gw:s3cret@10.0.0.7:8545/rpc-path?key=qsecret1",
+            "--upstream-readiness-url=http://gw:s3cret@10.0.0.7:8551/ready-path?key=qsecret2",
+            "--redirect-queries=https://user:pw0rd@rpc.example.com/v2/apikey123?key=qsecret3",
+            "--redirect-queries-header=X-Api-Key: hdrsecret",
+        ])?
+        .into_settings()?;
+        let debug = format!("{settings:?}");
+        for shown in [
+            "http://10.0.0.7:8545",
+            "http://10.0.0.7:8551",
+            "https://rpc.example.com:443",
+            "<redacted>",
+        ] {
+            assert!(debug.contains(shown), "`{shown}` missing from: {debug}");
+        }
+        for secret in [
+            "s3cret",
+            "pw0rd",
+            "rpc-path",
+            "ready-path",
+            "apikey123",
+            "qsecret",
+            "hdrsecret",
+            "X-Api-Key",
+        ] {
+            assert!(!debug.contains(secret), "`{secret}` leaked into: {debug}");
+        }
+        // a field the impl does not name is left out, never printed
+        assert!(!debug.contains("max_batch_len"), "{debug}");
         Ok(())
     }
 
@@ -4110,6 +4355,19 @@ mod tests {
             assert!(message.contains(flag), "{message}");
             assert!(!message.contains("s3cret"), "the value leaked into: {message}");
         }
+
+        // a duration parser's reason quotes the unknown unit, which is part of
+        // the value, and the message says so
+        let err = try_parse_test_argv(["worker-gateway", "--upstream-request-timeout=30sekret"])
+            .expect_err("an unknown unit must fail");
+        assert_eq!(err.kind(), ErrorKind::ValueValidation);
+        // control: clap's own message quotes the value
+        assert!(err.to_string().contains("30sekret"), "{err}");
+        let message = redacted_parse_error(&err).expect("a value error is redacted");
+        assert!(message.contains("--upstream-request-timeout"), "{message}");
+        assert!(message.contains("unknown time unit"), "{message}");
+        assert!(message.contains("beyond what the parser's reason quotes"), "{message}");
+        assert!(!message.contains("30sekret"), "the value leaked into: {message}");
     }
 
     #[test]

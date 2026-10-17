@@ -11,8 +11,8 @@ deploy/
     deployment.yaml      # apps/v1 Deployment (hardened pod securityContext, replicas spread over nodes and zones)
     service.yaml         # v1 ClusterIP Services: worker-gateway (rpc 8545), worker-gateway-metrics (metrics 9100)
     servicemonitor.yaml  # monitoring.coreos.com/v1 ServiceMonitor (Prometheus Operator)
-    hpa.yaml             # autoscaling/v2 HPA driven by in-flight requests (2 to 10 replicas)
-    pdb.yaml             # policy/v1 PodDisruptionBudget (at most one pod evicted at a time)
+    hpa.yaml             # autoscaling/v2 HPA driven by in-flight requests and worker slots in use (2 to 10 replicas)
+    pdb.yaml             # policy/v1 PodDisruptionBudget (keeps at most one Ready gateway disrupted at a time; pods already terminating are not counted, so evicted pods can still be draining; not-ready pods are always evictable (AlwaysAllow))
 ```
 
 The Deployment sets no `spec.replicas`, because the HPA owns the count; set `spec.replicas` if you do not install the HPA.
@@ -79,9 +79,9 @@ After SIGTERM the gateway keeps accepting and serving for those 5s while `/ready
 The 5s covers the endpoint controller dropping the terminating pod from the Service, which happens when the pod is deleted whatever the readiness probe says, and that change reaching kube-proxy and any load balancer fed from the endpoints.
 An external load balancer or DNS health check that probes `/ready` or `/ready/any` stops routing here within those 5s only if its interval times its unhealthy threshold (plus the record TTL for DNS) fits in them; for a slower front, raise the delay and the grace period below with it.
 The container has no `preStop` sleep: a sleep only postpones SIGTERM, and fronts outside Kubernetes never learn from it that the pod is going away.
-The Deployment also sets `WORKER_GATEWAY_GRACEFUL_SHUTDOWN_TIMEOUT` (equivalently `--graceful-shutdown-timeout`, default: the whole-request deadline, 45s at the defaults) to `45s`, the gateway's whole-request deadline at the defaults (`--upstream-request-timeout` 35s plus `--header-read-timeout` 10s), so a request accepted just before the listener closes, such as an `eth_sendRawTransactionSync` waiting for its receipt, can still finish; the drain ends as soon as the last request does.
-The `terminationGracePeriodSeconds: 55` in the Deployment covers the 5s delay plus the 45s drain and the gateway's 1s join margin, 51s in total, so the process has room to drain in-flight proxied requests before the kubelet escalates to SIGKILL.
-If you raise the delay, the drain timeout or `--upstream-request-timeout`, raise this too.
+The Deployment also sets `WORKER_GATEWAY_GRACEFUL_SHUTDOWN_TIMEOUT` (equivalently `--graceful-shutdown-timeout`, default: the whole-request deadline, 45s at the defaults) to `45s`, the gateway's whole-request deadline at the defaults (`--upstream-request-timeout` 35s plus `--header-read-timeout` 10s), so a request whose headers have arrived before the listener closes, such as an `eth_sendRawTransactionSync` waiting for its receipt, can still finish (a connection still sending its headers then can be cut up to `--header-read-timeout` before its own deadline, twice that with `--proxy-protocol`); the drain ends as soon as the last request does.
+The `terminationGracePeriodSeconds: 55` in the Deployment covers the 5s delay plus the 45s drain, the gateway's 1s join margin and its 1s runtime shutdown, 52s in total, so the process has room to drain in-flight proxied requests before the kubelet escalates to SIGKILL.
+If you raise the delay, the drain timeout or `--upstream-request-timeout`, raise this and `minReadySeconds` with it: a rollout deletes the next old pod once its replacement has been Ready for `minReadySeconds`, so it must exceed the delay plus the drain plus 2s, or two old pods drain at once and more than `maxReplicas` + 1 gateways hold worker requests, beyond the 11 × 45 sizing of `WORKER_GATEWAY_MAX_UPSTREAM_INFLIGHT` (see the README's "Sizing for N gateways").
 
 ## Readiness and reads
 
@@ -91,7 +91,7 @@ Without a query redirect, `/ready/any` is exactly `/ready`.
 
 Every replica polls the same worker, so when the worker is down every replica's `/ready` fails at once.
 A `readinessProbe` on `/ready` would then take every replica out of the Service, and reads would stop too, although the query upstream could still serve them; removing the replicas gains submissions nothing, since every replica would answer them with the same `503` / `-32000`.
-The Deployment's `readinessProbe` therefore uses `/ready/any`: the replicas stay in the Service while reads can be served, submissions get `503` / `-32000` until the worker is back, and a replica leaves only when neither the worker nor the query upstream answers.
+The Deployment's `readinessProbe` therefore uses `/ready/any`: the replicas stay in the Service while reads can be served, submissions get `503` / `-32000` until the worker is back, and a replica leaves only when neither the worker nor the query upstream answers; the probe allows 5 s per answer and three misses, since `/ready/any` answers from memory and a slow answer means only a runtime starved by a flood that every replica shares.
 
 The same choice applies to an external load balancer or DNS health check, which has to check the client port (`8545`), since the probe port is not exposed.
 Check `/ready/any` to keep a gateway published while it can serve reads; that suits a validator's gateways, which all share one worker.
@@ -105,6 +105,7 @@ The gateway buffers each request body whole before it forwards it, and `--max-in
 A body with a declared length is read into one buffer of exactly that size, so a held body costs about its reservation.
 Each open connection also keeps a read buffer of up to `--http1-max-buf-size` (default 64 KiB).
 Size the container's memory limit as `--max-inflight-request-bytes` + `--max-connections` × `--http1-max-buf-size` + 64 MiB for the process baseline and response streaming.
+With `--redirect-queries`, add up to N × (`--max-request-bytes` + 4 KiB) for submission answers clients have not read yet, N being `--max-inflight-submissions` (256 by default), or `--max-connections` if that is lower or the cap is `0`; a connection holds a body or such an answer, never both, so at the defaults the total stays within the figure below.
 At the defaults that is 512 MiB + 500 × 64 KiB + 64 MiB, about 608 MiB, and the Deployment's 1Gi limit leaves about 416 MiB over that.
 Set the memory request to cover the same bound (the Deployment requests 768Mi): below it the pod is scheduled as if it needed less than clients can make it hold, and under node memory pressure the kubelet evicts the gateways first.
 In a test process that also ran the client and the upstream, 128 parallel 1 MiB bodies against a 64 MiB budget peaked 81 to 83 MiB above the idle process, about 1.3 times the budget, the read buffers of all three sides' connections included.
@@ -128,18 +129,26 @@ Alloy, ...), delete this file and point your scraper at that Service's
 
 ## Autoscaling (HPA + prometheus-adapter)
 
-`hpa.yaml` scales on a `Pods` custom metric,
-`tn_worker_gateway_inflight_requests` (target average 50 in-flight per pod,
-between 2 and 10 replicas). Kubernetes does **not** know this metric natively:
-you need [prometheus-adapter](https://github.com/kubernetes-sigs/prometheus-adapter)
-(or an equivalent `custom.metrics.k8s.io` provider) to read the gauge from
-Prometheus and surface it on the custom metrics API as a per-pod metric.
+`hpa.yaml` scales on two `Pods` custom metrics:
+`tn_worker_gateway_inflight_requests` (target average 50 in flight per pod,
+read load) and `tn_worker_gateway_upstream_inflight` (target average 30 per
+pod, submission load), between 2 and 10 replicas; the HPA scales to the larger
+result. The worker-slot target sits below
+`WORKER_GATEWAY_MAX_UPSTREAM_INFLIGHT` (45): a worker-bound request over that
+cap is refused at once, not queued, so under submission load alone the first
+gauge stays near 45; only held submission answers that clients have not read
+yet (they stay in flight after their worker slot is freed, under
+`--redirect-queries`) can lift it further. Kubernetes does **not** know these
+metrics natively: you need
+[prometheus-adapter](https://github.com/kubernetes-sigs/prometheus-adapter) (or
+an equivalent `custom.metrics.k8s.io` provider) to read the gauges from
+Prometheus and surface them on the custom metrics API as per-pod metrics.
 
-A minimal prometheus-adapter rule that exposes the gauge per pod:
+A minimal prometheus-adapter rule that exposes both gauges per pod:
 
 ```yaml
 rules:
-  - seriesQuery: 'tn_worker_gateway_inflight_requests{namespace!="",pod!=""}'
+  - seriesQuery: '{__name__=~"tn_worker_gateway_(inflight_requests|upstream_inflight)",namespace!="",pod!=""}'
     resources:
       overrides:
         namespace:
@@ -154,13 +163,17 @@ rules:
 ```
 
 Notes:
-- The gauge itself carries no per-pod label; prometheus-adapter attaches the
+- Each gauge itself carries no per-pod label; prometheus-adapter attaches the
   `pod`/`namespace` association from the target Prometheus scrape labels, which
   is why the `ServiceMonitor` (or your scrape config) must land pods with those
-  labels. The `metricsQuery` averages the series per pod so the HPA's
-  `AverageValue` target compares like with like.
-- Verify the metric is live before trusting the HPA:
-  `kubectl get --raw "/apis/custom.metrics.k8s.io/v1beta1/namespaces/<ns>/pods/*/tn_worker_gateway_inflight_requests"`.
+  labels. The `metricsQuery` averages each series per pod so the HPA's
+  `AverageValue` targets compare like with like.
+- Verify both metrics are live before trusting the HPA:
+  `kubectl get --raw "/apis/custom.metrics.k8s.io/v1beta1/namespaces/<ns>/pods/*/tn_worker_gateway_inflight_requests"`
+  and
+  `kubectl get --raw "/apis/custom.metrics.k8s.io/v1beta1/namespaces/<ns>/pods/*/tn_worker_gateway_upstream_inflight"`.
+  If the adapter serves only one of them, the HPA still scales up on the other
+  but never scales down.
 
 `behavior` sets a 300s scale-down stabilization window (conservative, avoids
 flapping when traffic dips) and a 30s scale-up window (react quickly to load).

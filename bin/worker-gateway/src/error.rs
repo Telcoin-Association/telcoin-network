@@ -41,7 +41,8 @@ mod code {
     pub(super) const NO_UPSTREAM_READY: i32 = -32000;
     /// The upstream (a worker, or the query upstream) could not be reached.
     pub(super) const UPSTREAM_UNREACHABLE: i32 = -32001;
-    /// The upstream did not answer within the request deadline.
+    /// An upstream timeout (connect, read, or a submission answer's read
+    /// budget), not the gateway's request deadline (`-32005`).
     pub(super) const UPSTREAM_TIMEOUT: i32 = -32002;
     /// The request body exceeded the gateway's size limit, or a batch its
     /// length limit.
@@ -54,9 +55,10 @@ mod code {
     pub(super) const RATE_LIMITED: i32 = -32006;
     /// An `eth_sendRawTransaction` payload could not be decoded as a transaction.
     pub(super) const INVALID_TRANSACTION: i32 = -32007;
-    /// An `eth_sendRawTransaction` payload decoded to a transaction type the
-    /// network does not accept (an EIP-4844 blob or EIP-7702 set-code
-    /// transaction).
+    /// An `eth_sendRawTransaction` payload of a transaction type the network
+    /// does not accept: an EIP-4844 blob or EIP-7702 set-code transaction, or
+    /// a typed envelope of an unknown type, refused from its type byte before
+    /// it is decoded.
     pub(super) const UNSUPPORTED_TRANSACTION_TYPE: i32 = -32008;
     /// Every in-flight slot the request could use is taken (its route's cap,
     /// or the cap on concurrent requests to the worker).
@@ -67,13 +69,17 @@ mod code {
     /// The request calls a method the gateway refuses to forward
     /// (`--denied-method-prefixes`, applied when `--redirect-queries` is unset).
     pub(super) const METHOD_NOT_ALLOWED: i32 = -32011;
-    /// The upstream answered with an error status and a body that is not
-    /// JSON (a worker's `429` text/plain, for example).
+    /// The upstream's answer carried no JSON-RPC body to relay: an error
+    /// status whose body is not JSON (a worker's `429` text/plain, for
+    /// example), an answer without a JSON body from the query upstream, a
+    /// `2xx` included, or a `1xx`, `204`, `205` or `304`, which can carry no
+    /// body.
     pub(super) const UPSTREAM_ERROR: i32 = -32012;
     /// The worker answered a remembered submission `2xx`, but its answer
     /// could not be read whole; the transaction may have been accepted.
     pub(super) const UPSTREAM_ANSWER_LOST: i32 = -32013;
-    /// The request body could not be read, or the request was not a `POST`.
+    /// The request body could not be read, the request was not a `POST`, or
+    /// a probe path got a method other than `GET` or `HEAD`.
     /// This is the spec-defined "Invalid Request" code, not a gateway-range
     /// code.
     pub(super) const INVALID_REQUEST: i32 = -32600;
@@ -93,7 +99,12 @@ pub(crate) enum GatewayError {
     /// The upstream (a worker, or the query upstream) could not be reached
     /// (connection failure).
     UpstreamUnreachable,
-    /// The upstream did not answer within the request deadline.
+    /// The upstream did not answer in time: the connection could not be set
+    /// up within `--upstream-connect-timeout`, the route's read timeout passed
+    /// with no response head or with a gap in a remembered submission's
+    /// answer, or that answer was not read whole within
+    /// `--upstream-request-timeout` of being sent. The gateway's own request
+    /// deadline is [`RequestTimeout`](Self::RequestTimeout) / `-32005`.
     UpstreamTimeout,
     /// The worker answered `2xx` but its answer to a remembered submission
     /// could not be read whole; the transaction may have been accepted.
@@ -122,9 +133,10 @@ pub(crate) enum GatewayError {
     /// An `eth_sendRawTransaction` payload could not be decoded as a
     /// transaction (malformed hex or RLP).
     InvalidTransaction,
-    /// An `eth_sendRawTransaction` payload decoded to a transaction type the
-    /// network does not accept (an EIP-4844 blob or EIP-7702 set-code
-    /// transaction). Carries the EIP-2718 type byte, which the message names.
+    /// An `eth_sendRawTransaction` payload of a transaction type the network
+    /// does not accept: an EIP-4844 blob or EIP-7702 set-code transaction, or
+    /// a typed envelope of an unknown type, refused from its type byte before
+    /// it is decoded. Carries the EIP-2718 type byte, which the message names.
     UnsupportedTransactionType(u8),
     /// The request's body bytes did not fit in what is left of the in-flight
     /// request-byte budget, so it was refused before its body was read.
@@ -140,14 +152,15 @@ pub(crate) enum GatewayError {
     /// answers at once instead of queueing, so one saturated route cannot
     /// hold the connection slots the other route needs.
     Overloaded,
-    /// The upstream answered with a non-2xx `status`, or, from the query
-    /// upstream, a `2xx`, and a body that is not JSON, so it carries no
-    /// JSON-RPC answer to relay. The client gets the
-    /// upstream's status with a JSON-RPC error in place of the body, or `502`
-    /// for a `1xx` or `304`, which can carry no body.
+    /// The upstream's answer carries no JSON-RPC answer to relay: a non-2xx
+    /// `status`, or, from the query upstream, a `2xx`, with a body that is not
+    /// JSON, or a `1xx`, `204`, `205` or `304` from either upstream, which can
+    /// carry no body. The client gets the upstream's status with a JSON-RPC
+    /// error in place of the body, or `502` for a `1xx`, `204`, `205` or
+    /// `304`.
     UpstreamError {
         /// The HTTP status the client gets: the upstream's, or `502` in place
-        /// of a `1xx` or `304`.
+        /// of a `1xx`, `204`, `205` or `304`.
         status: StatusCode,
     },
     /// The request's HTTP method was not `POST`. JSON-RPC over HTTP is
@@ -226,9 +239,9 @@ impl GatewayError {
     }
 
     /// A human-readable message paired with this error. Every message is
-    /// static except the one for a transaction type without a name here,
-    /// which the screen cannot produce today (it refuses only types 3 and 4),
-    /// and the upstream error's, which names the upstream's status.
+    /// static except the one for a transaction type without a name here (an
+    /// unknown typed envelope, `0x05..=0x7f`, which the screen refuses from its
+    /// type byte), and the upstream error's, which names the upstream's status.
     fn message(&self) -> Cow<'static, str> {
         let message = match self {
             Self::NoUpstreamReady => "no upstream worker is ready",
@@ -336,8 +349,9 @@ pub(crate) fn error_response_with_id(err: &GatewayError, id: RequestId) -> Respo
 }
 
 /// Replace an upstream answer that carries no JSON-RPC body to pass on with a
-/// JSON-RPC error under `status` (the upstream's, or `502` in place of a `1xx`
-/// or `304`), echoing the request `id` recovered from `request_body`.
+/// JSON-RPC error under `status` (the upstream's, or `502` in place of a `1xx`,
+/// `204`, `205` or `304`), echoing the request `id` recovered from
+/// `request_body`.
 ///
 /// The gateway did forward this request, so it is counted under its own
 /// `upstream_error` outcome rather than as a rejection (see

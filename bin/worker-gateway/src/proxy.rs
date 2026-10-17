@@ -22,8 +22,8 @@
 //! a well-formed JSON-RPC error instead (see [`crate::error`]). So does a
 //! client whose upstream answers an error status without a JSON body (a
 //! worker's `429` text/plain, say): it keeps the upstream's status, with a
-//! JSON-RPC error in place of the body. A `1xx` or `304`, which can carry no
-//! body, gets the same error with a `502`.
+//! JSON-RPC error in place of the body. A `1xx`, `204`, `205` or `304`, which
+//! can carry no body, gets the same error with a `502`.
 //!
 //! With `--redirect-queries` set, transaction submissions go to the worker,
 //! and so do the few single reads only its pool can answer: a nonce at the
@@ -131,7 +131,7 @@ const SEND_RAW_TRANSACTION_SYNC: &str = "eth_sendRawTransactionSync";
 const SUBMISSION_METHODS: [&str; 2] = [SEND_RAW_TRANSACTION, SEND_RAW_TRANSACTION_SYNC];
 
 /// The nonce read a gateway with `--redirect-queries` keeps on the worker when
-/// its block parameter is [`PENDING_TAG`] (see [`PoolRead`]).
+/// its block parameter is [`PENDING_TAG`] in any ASCII case (see [`PoolRead`]).
 const GET_TRANSACTION_COUNT: &str = "eth_getTransactionCount";
 
 /// The lookups by hash a gateway with `--redirect-queries` keeps on the worker
@@ -214,8 +214,7 @@ static FORWARD_FAILURE_WARNINGS: PerRoute =
 static UPSTREAM_ERROR_WARNINGS: PerRoute =
     PerRoute::new("upstream_error_worker", "upstream_error_query");
 
-/// Every per-request (or, for a PROXY header, per-connection) warning
-/// throttle, summarized by [`telemetry::run_throttle_summaries`].
+/// Every throttled warning, summarized by [`telemetry::run_throttle_summaries`].
 pub(crate) static WARNING_THROTTLES: [&Throttle; 15] = [
     &HOP_LOOP_WARNINGS,
     &REDIRECT_LOOP_WARNINGS,
@@ -418,8 +417,9 @@ pub(crate) async fn proxy(
     // with `--rate-limit-submissions` the edge charged only the per-IP bucket,
     // since it could not tell the classes apart: the first call is charged
     // here, a submission to its own budget and anything else to the global
-    // bucket, and a refusal gives the per-IP token back, so a refused
-    // submission spends no read budget and a refused read no submission budget
+    // bucket; a refusal spends no other shared bucket, so a refused submission
+    // spends no read budget and a refused read no submission budget, and the
+    // per-IP token stays spent, since it paid for reading this body
     if let Some(Extension(budget)) = &submission_budget {
         if let Err(err) = budget.charge(class == Class::Submission) {
             return error_response(&err, body.as_ref());
@@ -433,7 +433,9 @@ pub(crate) async fn proxy(
     // has already decoded its submissions), to the same client the layer
     // charged (the resolved `ClientAddr`, not the TCP peer), from the per-IP
     // and global buckets whatever its class. Like the layer's own refusal,
-    // this one cannot name an id.
+    // this one cannot name an id. A refused batch gets back only the class
+    // charge's token (below): without a submission budget the layer's global
+    // token stays spent, like the per-IP token in both modes.
     let charged = limiters.as_ref().map_or(Ok(()), |Extension(limiters)| {
         limiters.charge_batch(Some(forwarding.client_addr().0), scan.len.saturating_sub(1))
     });
@@ -578,11 +580,15 @@ pub(crate) async fn proxy(
             // text/plain, say), or any query answer without one, carries no
             // json-rpc answer: replace it with the gateway's envelope, keeping
             // the status and echoing the request's id. hyper's server sends a
-            // 1xx or 304 without a body (and closes the connection after a
-            // 101), so such an answer could carry no json-rpc response
-            // whatever its content type: it gets the envelope with a 502
+            // 1xx, 204 or 304 without a body (and closes the connection after
+            // a 101), and a 205 must carry none, so such an answer could carry
+            // no json-rpc response whatever its content type: it gets the
+            // envelope with a 502
             let unservable = upstream.status().is_informational()
-                || upstream.status() == StatusCode::NOT_MODIFIED;
+                || matches!(
+                    upstream.status(),
+                    StatusCode::NO_CONTENT | StatusCode::RESET_CONTENT | StatusCode::NOT_MODIFIED
+                );
             if unservable || is_non_json_answer(&upstream, route) {
                 let status = if unservable { StatusCode::BAD_GATEWAY } else { upstream.status() };
                 telemetry::record_routed(route.label(), "upstream_error");
@@ -593,7 +599,7 @@ pub(crate) async fn proxy(
                         upstream = %UpstreamOrigin(&upstream_url),
                         status = upstream.status().as_u16(),
                         suppressed,
-                        "upstream answered an error status without a JSON-RPC body"
+                        "upstream sent an answer without a JSON-RPC body"
                     );
                 }
                 return upstream_error_response(status, body.as_ref());
@@ -623,10 +629,12 @@ pub(crate) async fn proxy(
             // this path. it is read here, while the in-flight guard, the class
             // slot and the byte reservation are still held (the worker slot no
             // longer is). the in-flight guard and the class slot then travel
-            // with the answer until the client has taken it (see
+            // with the answer until hyper has taken the last frame (see
             // [`HeldAnswer`]); the byte reservation does not, and drops when
-            // this returns, which keeps it within the request deadline (45 s
-            // by default) whether or not the client reads
+            // this returns, so a client that reads slowly or not at all cannot
+            // hold it. it is held for the read, which ends within
+            // `--upstream-request-timeout` of the request being sent, so up to
+            // that long past the request deadline
             let remember = recent
                 .zip(scan.submitted)
                 .filter(|_| route == Route::Worker && upstream.status().is_success());
@@ -751,8 +759,9 @@ fn submission_accepted(answer: &[u8]) -> bool {
 /// only for an answer passed on, and a lost one as the error it gets.
 ///
 /// An answer that was read goes out as a [`HeldAnswer`], which keeps
-/// `in_flight` and `class_slot` until the client has taken it, as a streamed
-/// answer keeps them (see [`relay`]); a lost answer drops them on return.
+/// `in_flight` and `class_slot` until hyper has taken the last frame, as a
+/// streamed answer keeps them (see [`relay`]); a lost answer drops them on
+/// return.
 async fn relay_submission_answer(
     upstream: reqwest::Response,
     upstream_url: &Url,
@@ -801,8 +810,18 @@ async fn relay_submission_answer(
 /// The client's read timeout fails the read when the body sends nothing for
 /// that long, so an upstream that stalls mid-answer cannot hold it; the caller
 /// bounds the whole read (see [`relay_submission_answer`]).
+///
+/// The buffer is sized from a declared `Content-Length`, an answer that
+/// declares more than `cap` is refused before its body is read, and an answer
+/// without one is shrunk to its length once read, so a held answer costs its
+/// length (see [`HeldAnswer`]).
 async fn read_answer(mut upstream: reqwest::Response, cap: usize) -> Result<Bytes, AnswerLost> {
-    let mut answer = Vec::new();
+    let declared = upstream.content_length();
+    if declared.is_some_and(|len| len > u64::try_from(cap).unwrap_or(u64::MAX)) {
+        return Err(AnswerLost::TooLong);
+    }
+    let mut answer =
+        Vec::with_capacity(declared.and_then(|len| usize::try_from(len).ok()).unwrap_or(0));
     while let Some(chunk) =
         upstream.chunk().await.map_err(|err| AnswerLost::Failed(err.without_url()))?
     {
@@ -812,7 +831,9 @@ async fn read_answer(mut upstream: reqwest::Response, cap: usize) -> Result<Byte
         }
         answer.extend_from_slice(&chunk);
     }
-    Ok(answer.into())
+    // a buffer grown chunk by chunk can hold up to twice its length, and
+    // `Bytes` keeps a vec's whole capacity, so it is shrunk to its length
+    Ok(Bytes::from(answer.into_boxed_slice()))
 }
 
 /// Why [`read_answer`] could not read an answer whole, after the worker had
@@ -855,16 +876,19 @@ impl fmt::Display for AnswerLost {
 
 /// A submission's answer, read whole by [`relay_submission_answer`], on its way
 /// to the client, holding the request's in-flight guard and class slot until
-/// the client has taken it.
+/// hyper has taken the last frame.
 ///
 /// [`proxy`] returns as soon as the answer has been read, but the answer then
 /// waits in hyper for a client that may read it slowly, or not at all, until
 /// the connection-layer guards close the connection. Holding the guards keeps
 /// that request in the in-flight gauge (the autoscaling signal) and its
 /// duration, and on `--max-inflight-submissions`, as [`UpstreamBody`] does for
-/// a streamed answer. The byte reservation is not held: it drops when
-/// [`proxy`] returns, so the request-byte budget stays bounded by the request
-/// deadline.
+/// a streamed answer. The guards drop once hyper has taken the last frame, so
+/// up to `--http1-max-buf-size` plus the socket's send buffer of the answer
+/// may still be unread by the client then, as on the streamed path. The byte
+/// reservation is not held: it drops when [`proxy`] returns, once the answer
+/// has been read (within `--upstream-request-timeout` of the request being
+/// sent), whatever the client does next.
 ///
 /// The answer goes out in copies of at most [`HeldAnswer::MAX_FRAME`] bytes,
 /// with an exact size hint, so hyper still sends its `Content-Length`. A
@@ -875,8 +899,8 @@ struct HeldAnswer {
     /// The part of the answer not yet handed to hyper.
     answer: Bytes,
     /// Holds the request in the in-flight gauge and its duration timer until
-    /// the answer has been taken, or is dropped because the client went away
-    /// or the connection closed.
+    /// hyper has taken the last frame, or is dropped because the client went
+    /// away or the connection closed.
     _in_flight: telemetry::RequestInFlight,
     /// The request's slot on `--max-inflight-submissions`.
     _class_slot: telemetry::InFlightSlot,
@@ -1025,8 +1049,9 @@ async fn forward(
 /// Every non-2xx status counts, `3xx` included (redirects are never followed;
 /// see [`proxy_client`]). A JSON body, `application/json` or any `+json`
 /// subtype with any parameters, is relayed unchanged whatever the status: it
-/// is the upstream's own JSON-RPC error. A `1xx` or `304`, which can carry no
-/// body, never reaches this check: [`proxy`] answers it with a `502` first.
+/// is the upstream's own JSON-RPC error. A `1xx`, `204`, `205` or `304`, which
+/// can carry no body, never reaches this check: [`proxy`] answers it with a
+/// `502` first.
 fn is_non_json_error(upstream: &reqwest::Response) -> bool {
     !upstream.status().is_success()
         && !is_json_content_type(upstream.headers().get(header::CONTENT_TYPE))
@@ -1540,10 +1565,11 @@ impl<S: Send + Sync> FromRequestParts<S> for PostOnly {
 /// deadline fires: a request that never started forwarding cannot have reached
 /// an upstream, one that did may have, and the client is told which. Once the
 /// upstream has answered, the deadline no longer cuts the request: all that is
-/// left is passing that answer on (the worker's answer to a submission is read
-/// whole first, under the proxy client's request timeout), and cutting it then
-/// would turn an answer the upstream already gave, a transaction it accepted
-/// included, into a timeout.
+/// left is passing that answer on (a single submission the gateway remembers is
+/// first read whole, within what is left of `--upstream-request-timeout` since
+/// it was sent, the client's read timeout bounding each gap; see
+/// [`relay_submission_answer`]), and cutting it then would turn an answer the
+/// upstream already gave, a transaction it accepted included, into a timeout.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct ForwardingStarted(Arc<AtomicU8>);
 
@@ -1581,11 +1607,18 @@ impl ForwardingStarted {
 /// hosted RPC provider's API key, for example), so log lines name an upstream
 /// by origin alone. The port is always written, falling back to the scheme's
 /// default, so two upstreams on one host stay distinguishable.
+///
+/// A URL without a special scheme (`http`, `https` and the like), such as a
+/// scheme-less `user:secret@host:port` that `Url` reads as scheme `user`,
+/// prints as `<url without http(s) scheme>`, so no part of it is echoed.
 pub(crate) struct UpstreamOrigin<'a>(pub(crate) &'a Url);
 
 impl fmt::Display for UpstreamOrigin<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let url = self.0;
+        if !url.is_special() {
+            return f.write_str("<url without http(s) scheme>");
+        }
         write!(f, "{}://{}", url.scheme(), url.host_str().unwrap_or_default())?;
         if let Some(port) = url.port_or_known_default() {
             write!(f, ":{port}")?;
@@ -1615,14 +1648,17 @@ impl QueryHeader {
     /// name and the value.
     ///
     /// A framing or hop-by-hop name, or one the gateway sets on the query hop
-    /// itself, is refused: reqwest appends the header rather than replacing
-    /// one already set, so it would go out twice or mis-frame the body.
+    /// itself, is refused: reqwest appends such a header rather than replacing
+    /// the one already set, so it would go out twice or mis-frame the body;
+    /// `User-Agent`, which reqwest would replace instead, is refused because a
+    /// query upstream's operator identifies the gateway by it (see
+    /// [`USER_AGENT`]).
     ///
     /// Errors name the problem but never echo the value or a malformed line,
     /// either of which can hold a credential; a refused name is named, in its
     /// lowercase form, since it is one of a fixed list.
     pub(crate) fn parse(line: &str) -> eyre::Result<Self> {
-        const RESERVED: [HeaderName; 14] = [
+        const RESERVED: [HeaderName; 15] = [
             header::CONTENT_LENGTH,
             header::TRANSFER_ENCODING,
             header::HOST,
@@ -1631,6 +1667,7 @@ impl QueryHeader {
             header::TRAILER,
             header::UPGRADE,
             header::CONTENT_TYPE,
+            header::USER_AGENT,
             X_FORWARDED_FOR,
             X_FORWARDED_PROTO,
             HOP_HEADER,
@@ -1936,8 +1973,9 @@ struct Scan {
 /// or anywhere in a batch, names a method that starts with one of the
 /// prefixes, matched case-sensitively from the first character as jsonrpsee
 /// matches names, after unicode escapes are decoded. A batch element that is
-/// an array names the method jsonrpsee would run from it, its third member
-/// when that is a string (see [`Element::Positional`]); a `method` that is not
+/// an array names the methods jsonrpsee reads from it: its third member when
+/// that is a string, and its second when the array has exactly three members
+/// (see [`Element::Positional`]); a `method` that is not
 /// a string, and a batch element that is neither an object nor an array, name
 /// nothing. With a list in force the pass reads every call: neither the
 /// single-call fast path nor the skip of a mixed batch's remaining elements is
@@ -2086,7 +2124,7 @@ impl ScanState<'_> {
     }
 
     /// Record one batch element; one that is not an object counts as another
-    /// call, and an array is checked against the method policy by the name
+    /// call, and an array is checked against the method policy by the names
     /// jsonrpsee would read from it (see [`Element::Positional`]). A
     /// submission is screened while the batch can still be all submissions,
     /// up to the first one the screen refuses.
@@ -2098,9 +2136,9 @@ impl ScanState<'_> {
                     self.rejection = call.screen().err().map(|err| (err, Some(self.len)));
                 }
             }
-            Element::Positional(name) => {
+            Element::Positional { third, notified } => {
                 self.other = true;
-                self.denied |= self.denies(name.as_deref());
+                self.denied |= self.denies(third.as_deref()) || self.denies(notified.as_deref());
             }
             Element::Other => self.other = true,
         }
@@ -2198,7 +2236,8 @@ struct Call<'de> {
     /// bytes: the raw transaction, if the call is a submission, or the hash,
     /// if it is a lookup by hash.
     raw_transaction: Option<RawTransaction<'de>>,
-    /// The second element of `params` is the string [`PENDING_TAG`].
+    /// The second element of `params` is the string [`PENDING_TAG`] in any
+    /// ASCII case.
     pending: bool,
 }
 
@@ -2277,11 +2316,12 @@ impl<'de> Call<'de> {
 /// read at `pending` (`eth_call`, `eth_getBalance`, `eth_estimateGas`) stays
 /// on the query upstream. So does a batch: [`scan`] reads a pool read from a
 /// single call only, so a batch keeps the route its calls give it. Method
-/// names and the tag match exactly and case-sensitively.
+/// names match exactly and case-sensitively; the tag matches in any ASCII
+/// case, as the worker reads it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PoolRead {
     /// [`GET_TRANSACTION_COUNT`] whose block parameter is the string
-    /// [`PENDING_TAG`].
+    /// [`PENDING_TAG`] in any ASCII case.
     PendingNonce,
     /// One of [`LOOKUPS_BY_HASH`] for this hash.
     Lookup(B256),
@@ -2374,12 +2414,29 @@ impl<'de> Deserialize<'de> for Member {
 enum Element<'de> {
     /// A call object.
     Call(Call<'de>),
-    /// An array. jsonrpsee's derived `Request` reads one positionally,
-    /// `[jsonrpc, id, method, params]`, and runs it when it has exactly four
-    /// elements, so its `method` (when a string, escapes decoded) is kept
-    /// for the method policy. It still routes as another call and is not
-    /// screened.
-    Positional(Option<Cow<'de, str>>),
+    /// An array. jsonrpsee reads a batch element as a `Request` and, failing
+    /// that, as a `Notification`; both names (when strings, escapes decoded)
+    /// are kept for the method policy, and either denies the batch, as the
+    /// object form of a notification is denied. It still routes as another
+    /// call and is not screened.
+    ///
+    /// The second and third members are read as strings whatever the array's
+    /// length, so a value serde's typed readers refuse there (a number out of
+    /// `f64` range, an unpaired surrogate escape) ends the scan and makes the
+    /// batch unreadable, which the gateway refuses whole, under
+    /// `--redirect-queries` too, where no method policy is in force. An
+    /// object element whose `method` holds such a value is handled the same
+    /// way.
+    Positional {
+        /// The third member, kept from an array of any length: the `method`
+        /// of jsonrpsee's four-member `Request` shape,
+        /// `[jsonrpc, id, method, params]`, which it runs.
+        third: Option<Cow<'de, str>>,
+        /// The second member of a three-member array: the `method` of
+        /// jsonrpsee's `Notification` shape, `[jsonrpc, method, params]`,
+        /// which jsonrpsee 0.26 reads but never runs.
+        notified: Option<Cow<'de, str>>,
+    },
     /// Any other element; the upstream answers it as an invalid request.
     Other,
 }
@@ -2390,22 +2447,29 @@ impl<'de> Lenient<'de> for Element<'de> {
     }
 
     fn array<A: SeqAccess<'de>>(mut elements: A) -> Result<Self, A::Error> {
-        // the third member is the `method` jsonrpsee reads; a name read from
-        // a shape it refuses (another length, a bad `jsonrpc`) still denies
-        // the batch, although the worker would answer that element as an
-        // invalid request: the check errs toward refusing
-        let mut name = None;
-        for index in 0usize.. {
-            let more = if index == 2 {
-                elements.next_element::<MaybeStr<'de>>()?.map(|method| name = method.0).is_some()
-            } else {
-                elements.next_element::<IgnoredAny>()?.is_some()
+        // the third member is the `method` of jsonrpsee's four-member
+        // `Request` shape, `[jsonrpc, id, method, params]`, and the second is
+        // the `method` of its three-member `Notification` shape,
+        // `[jsonrpc, method, params]`; in the four-member shape the second
+        // member is the id and must not deny, so it counts only when the
+        // array ends at three. a name read from a shape jsonrpsee refuses
+        // (another length, a bad `jsonrpc`) still denies the batch, although
+        // the worker would answer that element as an invalid request: the
+        // check errs toward refusing
+        let (mut second, mut third) = (None, None);
+        let mut len = 0usize;
+        loop {
+            let more = match len {
+                1 => elements.next_element::<MaybeStr<'de>>()?.map(|m| second = m.0).is_some(),
+                2 => elements.next_element::<MaybeStr<'de>>()?.map(|m| third = m.0).is_some(),
+                _ => elements.next_element::<IgnoredAny>()?.is_some(),
             };
             if !more {
                 break;
             }
+            len += 1;
         }
-        Ok(Self::Positional(name))
+        Ok(Self::Positional { third, notified: second.filter(|_| len == 3) })
     }
 
     fn object<A: MapAccess<'de>>(members: A) -> Result<Self, A::Error> {
@@ -2421,7 +2485,7 @@ impl<'de> Deserialize<'de> for Element<'de> {
 
 /// A `params` member reduced to its first element when that element holds a
 /// raw transaction (or a hash, for a lookup by hash), and whether its second
-/// element is the string [`PENDING_TAG`] (for a nonce read).
+/// element is the string [`PENDING_TAG`] in any ASCII case (for a nonce read).
 ///
 /// The remaining elements are drained through the ignored-value sink, so a
 /// `params` array of any length costs a scan rather than an allocation per
@@ -2430,7 +2494,7 @@ impl<'de> Deserialize<'de> for Element<'de> {
 struct LeadingParams<'de> {
     /// The first element, when it holds a raw transaction.
     first: Option<RawTransaction<'de>>,
-    /// The second element is [`PENDING_TAG`].
+    /// The second element is [`PENDING_TAG`] in any ASCII case.
     pending: bool,
 }
 
@@ -2533,8 +2597,9 @@ impl<'de> Deserialize<'de> for MaybeByte {
     }
 }
 
-/// Whether a value is the string [`PENDING_TAG`], compared where it lies and
-/// never copied; any other shape is consumed and discarded.
+/// Whether a value is the string [`PENDING_TAG`] in any ASCII case, as the
+/// worker's `BlockNumberOrTag` reads the tag, compared where it lies and never
+/// copied; any other shape is consumed and discarded.
 struct PendingTag(bool);
 
 impl Lenient<'_> for PendingTag {
@@ -2543,7 +2608,7 @@ impl Lenient<'_> for PendingTag {
     }
 
     fn string(value: &str) -> Self {
-        Self(value == PENDING_TAG)
+        Self(value.eq_ignore_ascii_case(PENDING_TAG))
     }
 }
 
@@ -2696,8 +2761,8 @@ impl<'de, T: Lenient<'de>> Visitor<'de> for LenientVisitor<T> {
 /// `params`. So a submission the worker would refuse for another reason (a
 /// missing or wrong `jsonrpc`, a repeated `params`) gets the gateway's own
 /// code for its transaction where the worker would answer an invalid request,
-/// and a notification (no `id`), which the worker would run without answering,
-/// gets an answer.
+/// and a notification (no `id`), which the worker reads but does not run
+/// (jsonrpsee 0.26 acknowledges it with an empty body), gets an answer.
 fn screen_transaction(raw: &RawTransaction<'_>) -> Result<PooledTransaction, GatewayError> {
     let raw = raw.bytes().ok_or(GatewayError::InvalidTransaction)?;
     // a typed envelope starts with its type byte, 0x01..=0x7f; a legacy
@@ -2874,8 +2939,14 @@ mod tests {
     }
 
     /// The extraction this fix replaced, verbatim, kept as the reference the new
-    /// member-by-member reader is checked against. Only the extraction differs;
-    /// the decode and verdict below it are the same code in both paths.
+    /// member-by-member reader is checked against. Only the extraction and one
+    /// step differ: the screen refuses a typed envelope of a type the network
+    /// does not accept from its type byte, before decoding (see
+    /// [`screen_transaction`]), where the reference decodes first, so a payload
+    /// that starts with a refused type byte and does not decode, such as
+    /// `0x03c0`, gets `UnsupportedTransactionType` from the screen and
+    /// `InvalidTransaction` from the reference. The rest of the decode and the
+    /// verdict are the same code in both paths.
     fn reference_screen(body: &[u8]) -> Option<(GatewayError, RequestId)> {
         if !mentions_send_raw_transaction(body) {
             return None;
@@ -2909,10 +2980,15 @@ mod tests {
     /// `id` outside the echo bound on a rejected request, which echoes `null`
     /// where the old parse echoed it whole (an array or object id is pinned by
     /// [`structured_id_on_a_rejection_echoes_null`], a long string or boolean
-    /// id by the bound tests in `error.rs`); and the shapes the screen reads
+    /// id by the bound tests in `error.rs`); the shapes the screen reads
     /// since WG-32, which the old one forwarded unread although the worker
     /// refuses them too: `eth_sendRawTransactionSync`, an escaped method name,
-    /// a byte-array param and a batch, each pinned by its own test.
+    /// a byte-array param and a batch, each pinned by its own test; and a
+    /// payload that starts with a refused type byte and does not decode, which
+    /// the screen refuses from its type byte where the old parse failed the
+    /// decode, pinned by [`refused_type_is_refused_from_its_type_byte`] and
+    /// [`blob_typed_payload_is_not_forwarded`]. No body below starts with such
+    /// a byte (`0xdeadbeef` starts with `0xde`).
     #[test]
     fn extraction_matches_the_previous_value_parse() {
         let valid = format!("[\"{EIP155_LEGACY_TX}\"]");
@@ -3928,8 +4004,10 @@ mod tests {
     }
 
     /// What jsonrpsee 0.26, the worker's JSON-RPC server, makes of a body:
-    /// refused whole, or the calls it reads, each with the method it would
-    /// run (`None` for a call it refuses and runs nothing for).
+    /// refused whole, or the calls it reads, each with the method it names.
+    /// A `Notification` is counted as though it ran, an over-approximation:
+    /// jsonrpsee 0.26's `RpcService::notification` never calls the method.
+    /// `None` marks an element it refuses.
     #[derive(Debug, PartialEq)]
     enum WorkerReads {
         /// Not a request at all: the server answers a parse error.
@@ -4110,10 +4188,12 @@ mod tests {
             r#"{"jsonrpc":"2.0","method":"eth_sendRawTransaction","params":["\udc00"],"id":1}"#
                 .to_string(),
             r#"{"jsonrpc":"2.0","method":"eth_chainId","params":[[1e400]],"id":1}"#.to_string(),
-            // a positional element's method slot is read too, so a value the
-            // typed readers refuse there ends the scan
+            // a positional element's second and third members are read too, so
+            // a value the typed readers refuse in either ends the scan
             r#"["2.0",1,1e400,[]]"#.to_string(),
             r#"["2.0",1,"\ud800",[]]"#.to_string(),
+            r#"["2.0",1e400,"eth_call",[]]"#.to_string(),
+            r#"["2.0","\ud800",[]]"#.to_string(),
         ];
         for trigger in &triggers {
             for body in [
@@ -4186,7 +4266,9 @@ mod tests {
             (format!(r#"["{ADDRESS}","pending"]"#), true),
             (format!(r#"["{ADDRESS}","pending","extra"]"#), true),
             (format!(r#"["{ADDRESS}","latest"]"#), false),
-            (format!(r#"["{ADDRESS}","Pending"]"#), false),
+            (format!(r#"["{ADDRESS}","Pending"]"#), true),
+            (format!(r#"["{ADDRESS}","PENDING"]"#), true),
+            (format!(r#"["{ADDRESS}","\u0050ending"]"#), true),
             (format!(r#"["{ADDRESS}","0x10"]"#), false),
             (format!(r#"["{ADDRESS}"]"#), false),
             (format!(r#"["{ADDRESS}",{{"blockNumber":"pending"}}]"#), false),
@@ -4303,12 +4385,21 @@ mod tests {
         let denied = call("tn_getStuff");
         let deep = format!("{}{}", "[".repeat(512), "]".repeat(512));
         // jsonrpsee's derived `Request` reads a four-element array
-        // positionally, `[jsonrpc, id, method, params]`, and runs it
+        // positionally, `[jsonrpc, id, method, params]`, and runs it; a
+        // three-element array it reads as a `Notification`,
+        // `[jsonrpc, method, params]`, which jsonrpsee 0.26 never runs, and the
+        // policy denies it like the object form. the model below counts it as
+        // run (see `WorkerReads`)
         let positional = [
             r#"[["2.0",1,"tn_info",[]]]"#.to_string(),
             r#"[["2.0",1,"debug_traceBlockByNumber",["latest",{}]]]"#.to_string(),
             r#"[["2.0",null,"tn_info",null]]"#.to_string(),
             format!(r#"[{},["2.0",1,"tn_info",[]]]"#, call("eth_call")),
+            r#"[["2.0","tn_info",[]]]"#.to_string(),
+            r#"[["2.0","tn_info",null]]"#.to_string(),
+            // an escaped name in either slot is decoded, as jsonrpsee decodes it
+            r#"[["2.0",1,"\u0074n_info",[]]]"#.to_string(),
+            r#"[["2.0","\u0074n_info",[]]]"#.to_string(),
         ];
         let mut denied_bodies = vec![
             r#"{"jsonrpc":"2.0","method":"\u0074n_getStuff","params":[],"id":1}"#.to_string(),
@@ -4365,7 +4456,10 @@ mod tests {
                 .any(|method| prefixes.iter().any(|prefix| method.starts_with(prefix.as_str())))
         };
         for body in &positional {
-            assert!(runs_a_denied_call(body.as_bytes()), "jsonrpsee runs a denied call: {body}");
+            assert!(
+                runs_a_denied_call(body.as_bytes()),
+                "the worker model runs a denied call: {body}"
+            );
         }
         for body in denied_bodies.iter().chain(&allowed_bodies) {
             assert!(
@@ -4462,12 +4556,34 @@ mod tests {
     /// [`HeldAnswer::MAX_FRAME`] bytes that add up to the answer, its exact
     /// size hint shrinking to zero as they are taken, and it keeps its class
     /// slot until the body itself is dropped.
+    ///
+    /// The frames are copies so that the answer's allocation leaves with the
+    /// body: frames hyper still queues after it has dropped the body, and with
+    /// it the guards, cannot keep that allocation alive. The answer is built
+    /// on an owner that records when it is freed, and every frame is kept
+    /// until the body has yielded the last one.
     #[tokio::test]
     async fn held_answer_yields_bounded_frames() {
+        use std::sync::atomic::AtomicBool;
+
+        /// The answer's allocation, which records when it is freed.
+        struct Owner(Vec<u8>, Arc<AtomicBool>);
+        impl AsRef<[u8]> for Owner {
+            fn as_ref(&self) -> &[u8] {
+                &self.0
+            }
+        }
+        impl Drop for Owner {
+            fn drop(&mut self) {
+                self.1.store(true, Ordering::SeqCst);
+            }
+        }
+
         let answer: Vec<u8> = (0..40 * 1024).map(|i| (i % 251) as u8).collect();
+        let freed = Arc::new(AtomicBool::new(false));
         let slots = inflight_slots(1);
         let mut held = HeldAnswer {
-            answer: Bytes::from(answer.clone()),
+            answer: Bytes::from_owner(Owner(answer.clone(), Arc::clone(&freed))),
             _in_flight: telemetry::RequestInFlight::enter(),
             _class_slot: telemetry::InFlightSlot::route(&slots, "submission").expect("free slot"),
         };
@@ -4475,19 +4591,20 @@ mod tests {
         assert!(!hyper::body::Body::is_end_stream(&held));
 
         let mut taken = Vec::new();
-        let mut frames = 0;
+        let mut frames: Vec<Bytes> = Vec::new();
         while let Some(frame) =
             std::future::poll_fn(|cx| hyper::body::Body::poll_frame(Pin::new(&mut held), cx)).await
         {
             let data = frame.expect("infallible").into_data().expect("a data frame");
             assert!(!data.is_empty() && data.len() <= HeldAnswer::MAX_FRAME, "{}", data.len());
             taken.extend_from_slice(&data);
-            frames += 1;
+            frames.push(data);
             let remaining = u64::try_from(answer.len() - taken.len()).expect("fits");
             assert_eq!(hyper::body::Body::size_hint(&held).exact(), Some(remaining));
         }
         assert_eq!(taken, answer);
-        assert_eq!(frames, 3, "16 KiB + 16 KiB + 8 KiB");
+        assert_eq!(frames.len(), 3, "16 KiB + 16 KiB + 8 KiB");
+        assert!(freed.load(Ordering::SeqCst), "the answer's allocation must not outlive the body");
         assert!(hyper::body::Body::is_end_stream(&held));
         assert_eq!(slots.available_permits(), 0, "the slot is held until the body drops");
         drop(held);
@@ -4584,6 +4701,7 @@ mod tests {
             "Trailer",
             "UpGrade",
             "Content-type",
+            "user-AGENT",
             "X-Forwarded-For",
             "x-FORWARDED-proto",
             "X-TN-Gateway",
@@ -4635,9 +4753,13 @@ mod tests {
                 });
             }
         });
+        // the read timeout also bounds connecting and the wait for the head,
+        // so it leaves a loaded runner room: on loopback the head and the
+        // close arrive at once, and only the stalled body waits it out, well
+        // inside the mock's 10 s stall
         let client = proxy_client(
             UpstreamClientBuilder::for_test(Duration::from_secs(2)),
-            Duration::from_millis(200),
+            Duration::from_secs(2),
         )
         .expect("client");
         let send = || client.post(format!("http://{addr}/")).body("{}").send();
@@ -4654,5 +4776,234 @@ mod tests {
         assert!(matches!(AnswerLost::TooLong.error(), GatewayError::UpstreamAnswerLost));
         assert!(matches!(AnswerLost::TimedOut.error(), GatewayError::UpstreamTimeout));
         server.abort();
+    }
+
+    /// A submission's answer is read into a buffer of exactly its length, with
+    /// a declared `Content-Length` and without one, so a held answer costs its
+    /// length: a buffer grown chunk by chunk would keep up to twice the answer
+    /// for as long as the client leaves it unread.
+    #[tokio::test]
+    async fn submission_answer_is_held_at_its_length() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let answer = [vec![b'a'; 1000], vec![b'b'; 500]].concat();
+        // each connection gets a 1,500-byte answer in two writes 50 ms apart,
+        // so the read sees two chunks: the first answer is chunked, the second
+        // declares its length; the pause only keeps the chunks apart
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let server = tokio::spawn(async move {
+            for chunked in [true, false] {
+                let (mut stream, _) = listener.accept().await.expect("accept");
+                let mut request = [0u8; 4096];
+                let _ = stream.read(&mut request).await;
+                let head = "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+                            connection: close\r\n";
+                let (first, second) = if chunked {
+                    (
+                        format!(
+                            "{head}transfer-encoding: chunked\r\n\r\n3e8\r\n{}\r\n",
+                            "a".repeat(1000)
+                        ),
+                        format!("1f4\r\n{}\r\n0\r\n\r\n", "b".repeat(500)),
+                    )
+                } else {
+                    (
+                        format!("{head}content-length: 1500\r\n\r\n{}", "a".repeat(1000)),
+                        "b".repeat(500),
+                    )
+                };
+                stream.write_all(first.as_bytes()).await.expect("write");
+                stream.flush().await.expect("flush");
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                stream.write_all(second.as_bytes()).await.expect("write");
+                stream.flush().await.expect("flush");
+            }
+        });
+        let client = proxy_client(
+            UpstreamClientBuilder::for_test(Duration::from_secs(2)),
+            Duration::from_secs(2),
+        )
+        .expect("client");
+
+        for case in ["chunked", "content-length"] {
+            let upstream =
+                client.post(format!("http://{addr}/")).body("{}").send().await.expect(case);
+            let held = match read_answer(upstream, 4096).await {
+                Ok(held) => held,
+                Err(lost) => panic!("{case}: the answer is lost: {lost}"),
+            };
+            assert_eq!(held, answer, "{case}");
+            // bytes hands a unique buffer's allocation to the vec unchanged
+            assert_eq!(Vec::<u8>::from(held).capacity(), 1500, "{case}");
+        }
+        server.abort();
+    }
+
+    /// An answer that declares a length past the cap is lost at its head,
+    /// before its body is read, rather than after a read that waits on it.
+    #[tokio::test]
+    async fn declared_overlong_submission_answer_is_lost_at_its_head() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        // the head promises 5,000 bytes and one byte follows; the connection
+        // then stalls, so a read of the body would wait out the read timeout
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept");
+            let mut request = [0u8; 4096];
+            let _ = stream.read(&mut request).await;
+            let head = "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+                        content-length: 5000\r\n\r\n{";
+            stream.write_all(head.as_bytes()).await.expect("write");
+            tokio::time::sleep(Duration::from_secs(60)).await;
+        });
+        let client = proxy_client(
+            UpstreamClientBuilder::for_test(Duration::from_secs(2)),
+            Duration::from_secs(2),
+        )
+        .expect("client");
+
+        let upstream =
+            client.post(format!("http://{addr}/")).body("{}").send().await.expect("head");
+        let lost = read_answer(upstream, 1024).await.expect_err("an overlong answer is lost");
+        assert!(matches!(lost, AnswerLost::TooLong), "{lost}");
+        server.abort();
+    }
+
+    /// The [`AppState`] of a gateway whose one worker serves `worker_url`,
+    /// with `query_url` as its `--redirect-queries` upstream when given.
+    fn upstream_state(worker_url: Url, query_url: Option<Url>) -> AppState {
+        let worker = UpstreamWorker {
+            worker_id: 0,
+            rpc_url: worker_url,
+            readiness_url: Url::parse("http://127.0.0.1:1/health/workers").expect("url"),
+        };
+        let nz = |n| NonZeroU32::new(n).expect("nonzero");
+        let thresholds = ReadinessThresholds { failure: nz(3), success: nz(2), rpc_failure: None };
+        AppState {
+            readiness: Arc::new(GatewayReadiness::new(&[worker], thresholds)),
+            http: proxy_client(
+                UpstreamClientBuilder::for_test(Duration::from_secs(2)),
+                Duration::from_secs(5),
+            )
+            .expect("client"),
+            query_upstream: query_url,
+            query_header: None,
+            recent_submissions: None,
+            denied_method_prefixes: Arc::from([]),
+            max_batch_len: NonZeroUsize::new(DEFAULT_MAX_BATCH_LEN),
+            query_http: None,
+            upstream_request_timeout: Duration::from_secs(5),
+            submission_slots: inflight_slots(0),
+            query_slots: inflight_slots(0),
+            upstream_slots: inflight_slots(0),
+            pool_read_slots: inflight_slots(0),
+            draining: Arc::default(),
+        }
+    }
+
+    /// A `204` or `205` gets the `502` / `-32012` error with the request's
+    /// id, as a `304` does: hyper's server sends a `204` without a body and a
+    /// `205` must carry none, so passing either on would leave the client with
+    /// no JSON-RPC answer, from either upstream and whatever its content type.
+    #[tokio::test]
+    async fn no_content_answers_become_a_bad_gateway_error() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let body = r#"{"jsonrpc":"2.0","method":"eth_chainId","params":[],"id":7}"#;
+        let rows = [
+            ("query 204", "HTTP/1.1 204 No Content\r\n\r\n", true),
+            ("query 205", "HTTP/1.1 205 Reset Content\r\ncontent-length: 0\r\n\r\n", true),
+            (
+                "worker 204",
+                "HTTP/1.1 204 No Content\r\ncontent-type: application/json\r\n\r\n",
+                false,
+            ),
+        ];
+        for (case, head, query) in rows {
+            // the upstream answers every connection with `head` and keeps it
+            // open, so the answer is never cut by a reset
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+            let upstream_url =
+                Url::parse(&format!("http://{}/", listener.local_addr().expect("addr")))
+                    .expect("url");
+            let server = tokio::spawn(async move {
+                let mut open = Vec::new();
+                loop {
+                    let (mut stream, _) = listener.accept().await.expect("accept");
+                    let mut request = [0u8; 4096];
+                    let _ = stream.read(&mut request).await;
+                    stream.write_all(head.as_bytes()).await.expect("write");
+                    open.push(stream);
+                }
+            });
+            let unreachable = Url::parse("http://127.0.0.1:1/").expect("url");
+            let state = if query {
+                upstream_state(unreachable, Some(upstream_url))
+            } else {
+                upstream_state(upstream_url, None)
+            };
+            state.readiness.set_ready(0, true);
+            let forwarding = TrustedProxies::default()
+                .resolve("127.0.0.1".parse().expect("peer"), &HeaderMap::new());
+
+            let response = proxy(
+                State(state),
+                Extension(forwarding),
+                PostOnly,
+                None,
+                None,
+                None,
+                Request::new(Body::from(body)),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::BAD_GATEWAY, "{case}");
+            let answer = axum::body::to_bytes(response.into_body(), usize::MAX).await.expect(case);
+            let answer: Value = serde_json::from_slice(&answer).expect(case);
+            assert_eq!(answer["error"]["code"], -32012, "{case}: {answer}");
+            assert_eq!(answer["id"], 7, "{case}: {answer}");
+            server.abort();
+        }
+    }
+
+    /// [`relay`] labels a query upstream's answer `application/json` unless
+    /// the upstream labelled it JSON, keeping its body, while a worker's
+    /// content type passes through as is. [`proxy`] answers a non-JSON query
+    /// answer with the `-32012` error before it gets here, so only a direct
+    /// call reaches this second line of defence.
+    #[tokio::test]
+    async fn relay_relabels_a_non_json_query_answer() {
+        const BODY: &str = "<html><script>alert(1)</script></html>";
+        let slots = inflight_slots(3);
+        let url = Url::parse("http://127.0.0.1:1/").expect("url");
+        for (route, class, content_type, expected) in [
+            (Route::Query, "query", Some("text/html"), "application/json"),
+            (Route::Query, "query", None, "application/json"),
+            (Route::Worker, "submission", Some("text/html"), "text/html"),
+        ] {
+            let case = format!("{} {content_type:?}", route.label());
+            let mut answer = axum::http::Response::builder().status(StatusCode::OK);
+            if let Some(content_type) = content_type {
+                answer = answer.header(header::CONTENT_TYPE, content_type);
+            }
+            let upstream = reqwest::Response::from(answer.body(BODY).expect("response"));
+            let relayed = relay(
+                upstream,
+                route,
+                url.clone(),
+                telemetry::RequestInFlight::enter(),
+                telemetry::InFlightSlot::route(&slots, class).expect("free slot"),
+            );
+            assert_eq!(relayed.status(), StatusCode::OK, "{case}");
+            assert_eq!(
+                relayed.headers().get(header::CONTENT_TYPE).and_then(|value| value.to_str().ok()),
+                Some(expected),
+                "{case}"
+            );
+            let body = axum::body::to_bytes(relayed.into_body(), usize::MAX).await.expect("body");
+            assert_eq!(body, BODY.as_bytes(), "{case}");
+        }
     }
 }
