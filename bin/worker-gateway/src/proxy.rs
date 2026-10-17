@@ -2380,6 +2380,14 @@ enum Element<'de> {
     /// are kept for the method policy, and either denies the batch, as the
     /// object form of a notification is denied. It still routes as another
     /// call and is not screened.
+    ///
+    /// The second and third members are read as strings whatever the array's
+    /// length, so a value serde's typed readers refuse there (a number out of
+    /// `f64` range, an unpaired surrogate escape) ends the scan and makes the
+    /// batch unreadable, which the gateway refuses whole, under
+    /// `--redirect-queries` too, where no method policy is in force. An
+    /// object element whose `method` holds such a value is handled the same
+    /// way.
     Positional {
         /// The third member, kept from an array of any length: the `method`
         /// of jsonrpsee's four-member `Request` shape,
