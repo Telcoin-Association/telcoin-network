@@ -1810,6 +1810,76 @@ mod tests {
         assert_eq!(limiters.per_ip_tokens(ip6(1, 3)), Some(2.0));
     }
 
+    /// Limiters with a one-entry per-IP table (burst 4) under a submission
+    /// budget, for the deferred-insertion tests.
+    fn one_entry_limiters(clock: ManualClock) -> Arc<RateLimiters<ManualClock>> {
+        let limiters = RateLimiters::with_clock(
+            clock,
+            Some(limit(1, 4)),
+            Some(limit(1, 10)),
+            Some(limit(1, 10)),
+            1,
+            PrefixPolicy::default(),
+        );
+        Arc::new(limiters.expect("limiters"))
+    }
+
+    /// Two first-seen clients pass the edge against an empty one-entry table.
+    /// The first one charged takes the slot; the second, charged while the
+    /// table is full and less than an interval after the last inline sweep,
+    /// is admitted untracked rather than growing the table past its cap.
+    #[test]
+    fn deferred_insertion_never_grows_a_full_table() {
+        let limiters = one_entry_limiters(ManualClock::new());
+        let first = limiters.check_edge(Some(ip(1))).expect("edge").expect("a budget");
+        let second = limiters.check_edge(Some(ip(2))).expect("edge").expect("a budget");
+        assert!(first.charge(false).is_ok());
+        assert!(second.charge(false).is_ok());
+        assert_eq!(limiters.per_ip_len(), 1, "insert_fresh grew the table past its cap");
+        assert_eq!(limiters.per_ip_tokens(ip(2)), None);
+    }
+
+    /// A deferred first-seen client that meets a full table once an inline
+    /// sweep is due takes the slot an idle entry frees, on the bucket the
+    /// edge charged.
+    #[test]
+    fn deferred_insertion_takes_a_slot_an_idle_entry_frees() {
+        let clock = ManualClock::new();
+        let limiters = one_entry_limiters(clock.clone());
+        let first = limiters.check_edge(Some(ip(1))).expect("edge").expect("a budget");
+        let second = limiters.check_edge(Some(ip(2))).expect("edge").expect("a budget");
+        assert!(first.charge(false).is_ok());
+        // ip(1) refills to its burst of 4 and is idle
+        clock.advance(INLINE_SWEEP_INTERVAL);
+        assert!(second.charge(false).is_ok());
+        assert_eq!(limiters.per_ip_tokens(ip(2)), Some(3.0));
+        assert_eq!(limiters.per_ip_len(), 1);
+    }
+
+    /// A deferred first-seen client that meets a full table whose only entry
+    /// is still busy at the inline sweep is admitted untracked, and the busy
+    /// entry keeps its slot.
+    #[test]
+    fn deferred_insertion_never_evicts_a_busy_entry() {
+        let clock = ManualClock::new();
+        let limiters = one_entry_limiters(clock.clone());
+        let first = limiters.check_edge(Some(ip(1))).expect("edge").expect("a budget");
+        let second = limiters.check_edge(Some(ip(2))).expect("edge").expect("a budget");
+        assert!(first.charge(false).is_ok());
+        // three more requests take ip(1) from 3 tokens to 0
+        for _ in 0..3 {
+            let budget = limiters.check_edge(Some(ip(1))).expect("edge").expect("a budget");
+            assert!(budget.charge(false).is_ok());
+        }
+        assert_eq!(limiters.per_ip_tokens(ip(1)), Some(0.0));
+        // ip(1) refills to 1 of 4: busy at the sweep
+        clock.advance(INLINE_SWEEP_INTERVAL);
+        assert!(second.charge(false).is_ok());
+        assert_eq!(limiters.per_ip_tokens(ip(2)), None);
+        assert!(limiters.per_ip_tokens(ip(1)).is_some(), "a busy entry was evicted");
+        assert_eq!(limiters.per_ip_len(), 1);
+    }
+
     /// More concurrent first requests from one new prefix than its burst all
     /// pass the edge on fresh buckets; what they spend past the burst is
     /// recorded against the entry as debt, down to minus one burst, so the
