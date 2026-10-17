@@ -32,8 +32,9 @@
 //! though: its `405` is a `method_not_post` rejection, and on the client
 //! listener a `429` before it a `rate_limited` one.
 //!
-//! [`Throttle`] rate-limits a per-request log call site, so request volume
-//! cannot drive log volume; the counters above still count every request.
+//! [`Throttle`] rate-limits a log call site (one hit per request, or per
+//! connection for the accept loops), so request volume cannot drive log volume;
+//! the counters above still count every request.
 //!
 //! [`record_routed`] counts every forward attempt that resolves, by route and
 //! result (an attempt the request deadline or a client disconnect drops before
@@ -366,7 +367,7 @@ pub(crate) fn set_upstream_ready(worker_id: u16, rpc_url: &Url, ready: bool) {
     .set(if ready { 1.0 } else { 0.0 });
 }
 
-/// Rate limit for one per-request log call site.
+/// Rate limit for one log call site (hit per request or per connection).
 ///
 /// A rejection a client can trigger at will (a loop marker, a junk
 /// transaction) or a failing upstream would otherwise write one warning per
