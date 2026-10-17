@@ -24,7 +24,7 @@ A release needs signatures from at least `MIN_SIGNATURES` distinct maintainers (
 
 | File | Maintainer | Status |
 |------|------------|--------|
-| `grantkee.asc` | @grantkee | Placeholder until provisioned; every check fails closed on it and names the file. |
+| `grantkee.asc` | @grantkee | Active since 2026-10-17. |
 
 ## Rules
 

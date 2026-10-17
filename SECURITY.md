@@ -79,7 +79,7 @@ Each key is generated on a YubiKey and never leaves it. The fingerprint is the p
 
 | Handle | Primary key fingerprint | YubiKey serial | Added | Status |
 |--------|-------------------------|----------------|-------|--------|
-| @grantkee | pending provisioning | pending | pending | pending provisioning |
+| @grantkee | 4E36D35A4AB61B589861D01AC7173F2377CA7573 | 37853185 | 2026-10-17 | active |
 
 Signatures required: 1 (MIN_SIGNATURES in etc/release.sh).
 
