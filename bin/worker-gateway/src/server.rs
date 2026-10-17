@@ -4262,9 +4262,9 @@ mod tests {
     #[tokio::test]
     async fn bad_proxy_headers_are_counted_and_warned_once_per_window() {
         const WARNING: &str = "missing, malformed or late PROXY protocol header";
-        if !process_per_test() {
-            eprintln!("skipped: {THROTTLED_WARNING_SKIP}");
-            return;
+        let per_test = process_per_test();
+        if !per_test {
+            eprintln!("not checking the throttled PROXY header warning: {THROTTLED_WARNING_SKIP}");
         }
         let mut metrics = CapturedMetrics::install();
         let logs = CapturedLogs::default();
@@ -4299,15 +4299,17 @@ mod tests {
             .expect("closed at the header read timeout");
         assert_eq!(read.expect("read"), 0, "expected EOF");
         assert_eq!(refused(), 3.0);
-        // the throttle lets one warning through per window, naming the peer
-        // and why
-        let text = logs.contents();
-        assert_eq!(text.matches(WARNING).count(), 1, "{text}");
-        let line = text.lines().find(|line| line.contains(WARNING)).expect("the warning");
-        assert!(line.contains("WARN"), "{line}");
-        assert!(line.contains("peer_addr=127.0.0.1:"), "{line}");
-        assert!(line.contains("missing the PROXY protocol v2 signature"), "{line}");
-        assert!(line.contains("suppressed=0"), "{line}");
+        if per_test {
+            // the throttle lets one warning through per window, naming the peer
+            // and why
+            let text = logs.contents();
+            assert_eq!(text.matches(WARNING).count(), 1, "{text}");
+            let line = text.lines().find(|line| line.contains(WARNING)).expect("the warning");
+            assert!(line.contains("WARN"), "{line}");
+            assert!(line.contains("peer_addr=127.0.0.1:"), "{line}");
+            assert!(line.contains("missing the PROXY protocol v2 signature"), "{line}");
+            assert!(line.contains("suppressed=0"), "{line}");
+        }
 
         // a peer that connects and closes without a byte (a tcp connect check)
         // is neither counted nor warned about
@@ -4317,7 +4319,9 @@ mod tests {
         assert!(response.starts_with("HTTP/1.1 200"), "{response}");
         assert_eq!(refused(), 3.0);
         let text = logs.contents();
-        assert_eq!(text.matches(WARNING).count(), 1, "{text}");
+        if per_test {
+            assert_eq!(text.matches(WARNING).count(), 1, "{text}");
+        }
         assert!(text.contains("connection closed before its PROXY protocol header"), "{text}");
     }
 
@@ -7241,10 +7245,6 @@ mod tests {
     /// names the connect stage.
     #[tokio::test]
     async fn stalled_connection_setup_counts_against_the_worker() {
-        if !process_per_test() {
-            eprintln!("skipped: {THROTTLED_WARNING_SKIP}");
-            return;
-        }
         let logs = CapturedLogs::default();
         let subscriber = tracing_subscriber::fmt()
             .with_writer(logs.clone())
@@ -7296,6 +7296,10 @@ mod tests {
         assert_eq!(worker_seen.hits(), 0);
         assert_eq!(lookups.load(Ordering::SeqCst), 1, "each forward waited on the one lookup");
 
+        if !process_per_test() {
+            eprintln!("not checking the throttled forwarding warning: {THROTTLED_WARNING_SKIP}");
+            return;
+        }
         // the first failure is logged with its whole cause chain and the
         // upstream's origin, no path
         let text = logs.contents();
@@ -9119,9 +9123,10 @@ mod tests {
         assert_eq!((worker_seen.hop_marker(), worker_seen.redirect_marker()), (3, 0));
     }
 
-    /// Why a test that asserts a throttled warning skips outside nextest: the
-    /// throttles are process-wide statics, so under `cargo test` another test
-    /// may already have used up the window and the warning never appears.
+    /// Why a test skips its assertions on a throttled warning outside nextest
+    /// (or, for one that asserts nothing else, the whole test): the throttles
+    /// are process-wide statics, so under `cargo test` another test may
+    /// already have used up the window and the warning never appears.
     const THROTTLED_WARNING_SKIP: &str = "reads a warning a process-wide throttle admits once per \
                                           10s, so it needs nextest's process-per-test model";
 
@@ -9162,9 +9167,9 @@ mod tests {
     /// through the same thread-local subscriber.
     #[tokio::test]
     async fn header_value_never_appears_in_logs() {
-        if !process_per_test() {
-            eprintln!("skipped: {THROTTLED_WARNING_SKIP}");
-            return;
+        let per_test = process_per_test();
+        if !per_test {
+            eprintln!("not checking the throttled forwarding warning: {THROTTLED_WARNING_SKIP}");
         }
         let logs = CapturedLogs::default();
         let subscriber = tracing_subscriber::fmt()
@@ -9229,13 +9234,16 @@ mod tests {
 
         let captured = logs.contents();
         // the capture saw the gateway's own lines, and the header was in play
-        for line in [
+        let mut expected = vec![
             "plain http",
             "resolved settings",
             "could not compare the chain ids",
             "gateway state",
-            "forwarding to upstream failed",
-        ] {
+        ];
+        if per_test {
+            expected.push("forwarding to upstream failed");
+        }
+        for line in expected {
             assert!(captured.contains(line), "missing {line:?} in: {captured}");
         }
         assert!(captured.contains("<redacted>"), "the header should print redacted: {captured}");
