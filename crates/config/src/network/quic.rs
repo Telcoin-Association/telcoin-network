@@ -9,6 +9,7 @@ use std::time::Duration;
 pub struct QuicConfig {
     /// Timeout for the initial handshake when establishing a connection.
     /// The actual timeout is the minimum of this and the [`Self::max_idle_timeout`].
+    /// Each signed endpoint gets this window when dialing addresses in order.
     pub handshake_timeout: Duration,
     /// Maximum duration of inactivity in ms to accept before timing out the connection.
     pub max_idle_timeout: u32,
@@ -37,7 +38,7 @@ pub struct QuicConfig {
 impl Default for QuicConfig {
     fn default() -> Self {
         Self {
-            handshake_timeout: Duration::from_secs(65),
+            handshake_timeout: Duration::from_secs(10),
             max_idle_timeout: 30 * 1_000, // 30s
             keep_alive_interval: Duration::from_secs(5),
             max_concurrent_stream_limit: 10_000,
