@@ -1,7 +1,7 @@
 //! Current-epoch readiness for worker RPC listeners and persistent transaction pools.
 
 use crate::health::WorkerReadiness;
-use tn_types::{Noticer, WorkerId};
+use tn_types::{NodeMode, Noticer, WorkerId};
 
 /// The worker range and shutdown signal belonging to one active epoch.
 #[derive(Debug)]
@@ -25,22 +25,29 @@ impl WorkerReadinessState {
         self.epoch = Some(WorkerEpoch { worker_count, shutdown });
     }
 
-    /// Report every initialized worker, accepting only with a running RPC and active epoch.
+    /// Report every initialized worker, accepting only with a running RPC, an active epoch,
+    /// and a node mode that admits submissions.
+    ///
+    /// `mode` is the same live [`NodeMode`] that RPC admission reads, so `/health/workers`
+    /// stops reporting a demoted validator as accepting while its handlers refuse every
+    /// submission (issue #1514).
     pub(super) fn snapshot(
         &self,
         running_workers: impl IntoIterator<Item = bool>,
+        mode: NodeMode,
     ) -> Vec<WorkerReadiness> {
         let active_workers = self
             .epoch
             .as_ref()
             .filter(|epoch| !epoch.shutdown.noticed())
             .map_or(0, |epoch| epoch.worker_count);
+        let node_accepts = tn_reth::node_mode_accepts_submissions(mode);
         (0..=WorkerId::MAX)
             .zip(running_workers)
             .map(|(worker_id, rpc_running)| {
                 WorkerReadiness::new(
                     worker_id,
-                    rpc_running && usize::from(worker_id) < active_workers,
+                    node_accepts && rpc_running && usize::from(worker_id) < active_workers,
                 )
             })
             .collect()
@@ -51,34 +58,40 @@ impl WorkerReadinessState {
 mod tests {
     use super::WorkerReadinessState;
     use crate::health::WorkerReadiness;
-    use tn_types::ShutdownNotifier;
+    use tn_types::{NodeMode, ShutdownNotifier};
 
     /// Initialization, membership changes and shutdown constrain readiness independently.
     #[test]
     fn readiness_follows_initialization_and_epoch_membership() {
         let mut state = WorkerReadinessState::default();
-        assert!(state.snapshot([]).is_empty());
-        assert_eq!(state.snapshot([true]), vec![WorkerReadiness::new(0, false)]);
+        assert!(state.snapshot([], NodeMode::CvvActive).is_empty());
+        assert_eq!(
+            state.snapshot([true], NodeMode::CvvActive),
+            vec![WorkerReadiness::new(0, false)]
+        );
 
         let first_epoch = ShutdownNotifier::new();
         state.start_epoch(2, first_epoch.subscribe());
-        assert!(state.snapshot([]).is_empty());
-        assert_eq!(state.snapshot([true]), vec![WorkerReadiness::new(0, true)]);
+        assert!(state.snapshot([], NodeMode::CvvActive).is_empty());
         assert_eq!(
-            state.snapshot([true, true]),
+            state.snapshot([true], NodeMode::CvvActive),
+            vec![WorkerReadiness::new(0, true)]
+        );
+        assert_eq!(
+            state.snapshot([true, true], NodeMode::CvvActive),
             vec![WorkerReadiness::new(0, true), WorkerReadiness::new(1, true)]
         );
 
         first_epoch.notify();
         assert_eq!(
-            state.snapshot([true, true]),
+            state.snapshot([true, true], NodeMode::CvvActive),
             vec![WorkerReadiness::new(0, false), WorkerReadiness::new(1, false)]
         );
 
         let smaller_epoch = ShutdownNotifier::new();
         state.start_epoch(1, smaller_epoch.subscribe());
         assert_eq!(
-            state.snapshot([true, true]),
+            state.snapshot([true, true], NodeMode::CvvActive),
             vec![WorkerReadiness::new(0, true), WorkerReadiness::new(1, false)]
         );
 
@@ -86,7 +99,7 @@ mod tests {
         state.start_epoch(2, larger_epoch.subscribe());
         smaller_epoch.notify();
         assert_eq!(
-            state.snapshot([true, true]),
+            state.snapshot([true, true], NodeMode::CvvActive),
             vec![WorkerReadiness::new(0, true), WorkerReadiness::new(1, true)]
         );
     }
@@ -98,12 +111,38 @@ mod tests {
         let epoch = ShutdownNotifier::new();
         state.start_epoch(2, epoch.subscribe());
         assert_eq!(
-            state.snapshot([true, false]),
+            state.snapshot([true, false], NodeMode::CvvActive),
             vec![WorkerReadiness::new(0, true), WorkerReadiness::new(1, false)]
         );
         assert_eq!(
-            state.snapshot([true, true]),
+            state.snapshot([true, true], NodeMode::CvvActive),
             vec![WorkerReadiness::new(0, true), WorkerReadiness::new(1, true)]
+        );
+    }
+
+    /// Node mode gates readiness exactly as it gates RPC admission (issue #1514).
+    #[test]
+    fn readiness_follows_node_mode() {
+        let mut state = WorkerReadinessState::default();
+        let epoch = ShutdownNotifier::new();
+        state.start_epoch(2, epoch.subscribe());
+        assert_eq!(
+            state.snapshot([true, true], NodeMode::CvvInactive),
+            vec![WorkerReadiness::new(0, false), WorkerReadiness::new(1, false)]
+        );
+        assert_eq!(
+            state.snapshot([true, true], NodeMode::Observer),
+            vec![WorkerReadiness::new(0, true), WorkerReadiness::new(1, true)]
+        );
+        assert_eq!(
+            state.snapshot([true, true], NodeMode::CvvActive),
+            vec![WorkerReadiness::new(0, true), WorkerReadiness::new(1, true)]
+        );
+
+        epoch.notify();
+        assert_eq!(
+            state.snapshot([true, true], NodeMode::CvvInactive),
+            vec![WorkerReadiness::new(0, false), WorkerReadiness::new(1, false)]
         );
     }
 }
