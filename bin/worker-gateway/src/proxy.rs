@@ -131,7 +131,7 @@ const SEND_RAW_TRANSACTION_SYNC: &str = "eth_sendRawTransactionSync";
 const SUBMISSION_METHODS: [&str; 2] = [SEND_RAW_TRANSACTION, SEND_RAW_TRANSACTION_SYNC];
 
 /// The nonce read a gateway with `--redirect-queries` keeps on the worker when
-/// its block parameter is [`PENDING_TAG`] (see [`PoolRead`]).
+/// its block parameter is [`PENDING_TAG`] in any ASCII case (see [`PoolRead`]).
 const GET_TRANSACTION_COUNT: &str = "eth_getTransactionCount";
 
 /// The lookups by hash a gateway with `--redirect-queries` keeps on the worker
@@ -2199,7 +2199,8 @@ struct Call<'de> {
     /// bytes: the raw transaction, if the call is a submission, or the hash,
     /// if it is a lookup by hash.
     raw_transaction: Option<RawTransaction<'de>>,
-    /// The second element of `params` is the string [`PENDING_TAG`].
+    /// The second element of `params` is the string [`PENDING_TAG`] in any
+    /// ASCII case.
     pending: bool,
 }
 
@@ -2283,7 +2284,7 @@ impl<'de> Call<'de> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PoolRead {
     /// [`GET_TRANSACTION_COUNT`] whose block parameter is the string
-    /// [`PENDING_TAG`].
+    /// [`PENDING_TAG`] in any ASCII case.
     PendingNonce,
     /// One of [`LOOKUPS_BY_HASH`] for this hash.
     Lookup(B256),
@@ -2447,7 +2448,7 @@ impl<'de> Deserialize<'de> for Element<'de> {
 
 /// A `params` member reduced to its first element when that element holds a
 /// raw transaction (or a hash, for a lookup by hash), and whether its second
-/// element is the string [`PENDING_TAG`] (for a nonce read).
+/// element is the string [`PENDING_TAG`] in any ASCII case (for a nonce read).
 ///
 /// The remaining elements are drained through the ignored-value sink, so a
 /// `params` array of any length costs a scan rather than an allocation per
@@ -2456,7 +2457,7 @@ impl<'de> Deserialize<'de> for Element<'de> {
 struct LeadingParams<'de> {
     /// The first element, when it holds a raw transaction.
     first: Option<RawTransaction<'de>>,
-    /// The second element is [`PENDING_TAG`].
+    /// The second element is [`PENDING_TAG`] in any ASCII case.
     pending: bool,
 }
 
