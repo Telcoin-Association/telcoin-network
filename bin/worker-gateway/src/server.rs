@@ -2467,7 +2467,7 @@ mod tests {
     async fn slow_reader_is_closed_at_connection_lifetime_cap() {
         // The issue #958 scenario: response streaming to a client that stops
         // reading. The whole-request deadline no longer covers the response
-        // body, and the upstream client's total timeout is only observed when
+        // body, and the upstream client's read timeout is only observed when
         // the body is polled (which the stall prevents), so only the lifetime
         // cap bounds this connection.
         let mock = Router::new().route("/", post(|| async { vec![0_u8; STALL_BODY_BYTES] }));
