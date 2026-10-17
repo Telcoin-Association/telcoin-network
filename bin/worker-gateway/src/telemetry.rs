@@ -54,6 +54,9 @@
 //! closed without serving, by `reason`. They never carry a request to the
 //! proxy, so they appear in neither request counter.
 //!
+//! [`record_accept_error`] counts failed `accept()` calls on either listener,
+//! by `listener` and `kind`; its warnings are throttled, the counter is not.
+//!
 //! [`ConnectionSlot`] pairs an accepted client connection's
 //! `--max-connections` permit with `tn_worker_gateway_open_connections`, so the
 //! gauge always equals the slots held; at the cap, new connections wait in the
@@ -143,6 +146,13 @@ const OPEN_CONNECTIONS: &str = "tn_worker_gateway_open_connections";
 /// Sampled access-log lines the line ceiling
 /// (`--access-log-max-lines-per-second`) dropped.
 const ACCESS_LOG_SUPPRESSED_TOTAL: &str = "tn_worker_gateway_access_log_suppressed_total";
+
+/// Failed `accept()` calls, by `listener` (`client`: `--listen-addr`;
+/// `probe`: `--probe-addr`) and `kind` (`connection`: an error about the one
+/// connection being accepted, retried at once; `resource`: one about the
+/// process, such as fd exhaustion, which the accept loop backs off from). A
+/// failed accept holds no connection, so no connection series counts it.
+const ACCEPT_ERRORS_TOTAL: &str = "tn_worker_gateway_accept_errors_total";
 
 /// How long a [`Throttle`] stays quiet after it lets a line through.
 const THROTTLE_WINDOW: Duration = Duration::from_secs(10);
@@ -323,6 +333,12 @@ pub(crate) fn record_connection_refused(reason: &'static str) {
 /// was already reached.
 pub(crate) fn record_access_log_suppressed() {
     counter!(ACCESS_LOG_SUPPRESSED_TOTAL).increment(1);
+}
+
+/// Record a failed `accept()` on `listener` (`client` or `probe`), of
+/// `kind` `connection` or `resource`.
+pub(crate) fn record_accept_error(listener: &'static str, kind: &'static str) {
+    counter!(ACCEPT_ERRORS_TOTAL, "listener" => listener, "kind" => kind).increment(1);
 }
 
 /// Record one name resolution with its `result` (`hit`, `miss`, `error` or
@@ -691,5 +707,28 @@ mod tests {
         // a quiet call site has nothing to summarize and logs its next event at once
         assert_eq!(throttle.flush_at(start + THROTTLE_WINDOW * 4), None);
         assert_eq!(throttle.admit_at(start + THROTTLE_WINDOW * 10), Some(0));
+    }
+
+    /// The accept-error counter's name and labels are part of the metrics
+    /// contract; pin them.
+    #[test]
+    fn record_accept_error_writes_listener_and_kind() {
+        let mut metrics = test_utils::CapturedMetrics::install();
+        record_accept_error("probe", "resource");
+        record_accept_error("client", "connection");
+        record_accept_error("client", "connection");
+        assert_eq!(
+            metrics.value(ACCEPT_ERRORS_TOTAL, &[("listener", "probe"), ("kind", "resource")]),
+            1.0
+        );
+        assert_eq!(
+            metrics.value(ACCEPT_ERRORS_TOTAL, &[("listener", "client"), ("kind", "connection")]),
+            2.0
+        );
+        assert_eq!(
+            metrics.value(ACCEPT_ERRORS_TOTAL, &[("listener", "client"), ("kind", "resource")]),
+            0.0
+        );
+        assert_eq!(ACCEPT_ERRORS_TOTAL, "tn_worker_gateway_accept_errors_total");
     }
 }

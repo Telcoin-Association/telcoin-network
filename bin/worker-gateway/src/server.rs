@@ -144,6 +144,22 @@ const REFUSED_PER_IP_CAP: &str = "per_ip_cap";
 /// was missing, malformed or late.
 const REFUSED_PROXY_HEADER: &str = "proxy_header";
 
+/// `listener` label on `tn_worker_gateway_accept_errors_total` for the
+/// client listener (`--listen-addr`).
+const ACCEPT_LISTENER_CLIENT: &str = "client";
+
+/// `listener` label on `tn_worker_gateway_accept_errors_total` for the
+/// `--probe-addr` listener.
+const ACCEPT_LISTENER_PROBE: &str = "probe";
+
+/// `kind` label on `tn_worker_gateway_accept_errors_total` for an error
+/// about the one connection being accepted (see [`is_connection_error`]).
+const ACCEPT_ERROR_CONNECTION: &str = "connection";
+
+/// `kind` label on `tn_worker_gateway_accept_errors_total` for an error
+/// about the process, such as fd exhaustion, which takes the back-off.
+const ACCEPT_ERROR_RESOURCE: &str = "resource";
+
 /// Throttle for the warning on a connection closed for its PROXY header. A
 /// misconfigured front has every connection closed this way, so the warning
 /// shows at the default log level, once per window.
@@ -152,11 +168,13 @@ pub(crate) static PROXY_HEADER_WARNINGS: Throttle = Throttle::new("proxy_header"
 /// Throttle for the warning on a failed `accept()` on the client listener. A
 /// persistent failure such as fd exhaustion repeats every
 /// [`ACCEPT_RETRY_DELAY`], so the warning shows once per window, carrying the
-/// count it skipped.
+/// count it skipped; `tn_worker_gateway_accept_errors_total` counts every
+/// failure.
 pub(crate) static ACCEPT_ERROR_WARNINGS: Throttle = Throttle::new("accept");
 
 /// Throttle for the warning on a failed `accept()` on the `--probe-addr`
-/// listener, kept apart from the client listener's so each shows.
+/// listener, kept apart from the client listener's so each shows; the same
+/// counter counts its failures under `listener="probe"`.
 pub(crate) static PROBE_ACCEPT_ERROR_WARNINGS: Throttle = Throttle::new("probe_accept");
 
 /// How long a browser may cache the gateway's answer to a CORS preflight
@@ -1242,10 +1260,12 @@ async fn accept_loop(
             // the next connection is unaffected, so accept it at once; the
             // permit is released and taken again
             Err(err) if is_connection_error(&err) => {
+                telemetry::record_accept_error(ACCEPT_LISTENER_CLIENT, ACCEPT_ERROR_CONNECTION);
                 debug!(target: "gateway::server", %err, "accept: connection error, retrying");
                 continue;
             }
             Err(err) => {
+                telemetry::record_accept_error(ACCEPT_LISTENER_CLIENT, ACCEPT_ERROR_RESOURCE);
                 if let Some(suppressed) = ACCEPT_ERROR_WARNINGS.admit() {
                     warn!(target: "gateway::server", %err, suppressed, "failed to accept connection");
                 }
@@ -1588,10 +1608,12 @@ async fn probe_accept_loop(
         let stream = match accepted {
             Ok((stream, _)) => stream,
             Err(err) if is_connection_error(&err) => {
+                telemetry::record_accept_error(ACCEPT_LISTENER_PROBE, ACCEPT_ERROR_CONNECTION);
                 debug!(target: "gateway::server", %err, "probe accept: connection error, retrying");
                 continue;
             }
             Err(err) => {
+                telemetry::record_accept_error(ACCEPT_LISTENER_PROBE, ACCEPT_ERROR_RESOURCE);
                 if let Some(suppressed) = PROBE_ACCEPT_ERROR_WARNINGS.admit() {
                     warn!(
                         target: "gateway::server",
