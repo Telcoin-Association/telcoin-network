@@ -8821,11 +8821,13 @@ mod tests {
         assert_eq!(worker_seen.hits(), 0, "a probe-path request must never reach the upstream");
     }
 
-    /// An accept error about the one connection (its peer aborted it, or a
-    /// network error already pending on it) is retried at once; one about the
-    /// process (fd exhaustion, out of memory) takes the back-off.
+    /// [`is_connection_error`] classifies an accept error about the one
+    /// connection (its peer aborted it, or a network error already pending on
+    /// it) as a connection error, which the accept loops retry at once, and one
+    /// about the process (fd exhaustion, out of memory) as not, which takes the
+    /// back-off; the loops' use of the verdict is not driven here.
     #[test]
-    fn accept_connection_errors_are_retried_at_once() {
+    fn accept_errors_are_classified_per_connection_or_process() {
         use std::io::{Error, ErrorKind};
         assert!(is_connection_error(&Error::from(ErrorKind::ConnectionAborted)));
         assert!(is_connection_error(&Error::from(ErrorKind::ConnectionReset)));
