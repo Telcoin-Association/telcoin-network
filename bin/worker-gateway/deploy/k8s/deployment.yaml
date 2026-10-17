@@ -13,7 +13,10 @@ spec:
   # No replicas: the HPA (hpa.yaml) owns the count; set it if you do not install the HPA.
   # A rollout replaces one pod at a time and waits out the old pod's 51s
   # shutdown (minReadySeconds > 5s delay + 45s drain + 1s) before the next,
-  # so at most maxReplicas + 1 gateways hold worker slots at once.
+  # so a rollout adds at most one gateway to the maxReplicas holding worker
+  # slots. A node drain is not bounded this way: the PDB counts only Ready
+  # pods that are not terminating, so pods it evicted can still be draining
+  # (see WORKER_GATEWAY_MAX_UPSTREAM_INFLIGHT below).
   strategy:
     type: RollingUpdate
     rollingUpdate:
@@ -137,11 +140,17 @@ spec:
             # --rpc.max-connections (500 by default), which counts in-flight
             # HTTP requests, not TCP connections. N counts every gateway that
             # can hold worker requests at once: the HPA's ceiling of 10
-            # replicas plus the one pod a rollout is replacing (see strategy
-            # above), so 11 x 45 = 495 worker requests at most, below the
-            # worker's limit. Raise it when the worker's limit is raised; lower
-            # it for a higher replica ceiling (see README.md, "Sizing for N
-            # gateways").
+            # replicas, plus the one pod a rollout is replacing while it
+            # drains (see strategy above), plus every pod a node drain evicted
+            # that is still draining: the PDB counts only Ready pods that are
+            # not terminating, so it allows the next eviction as soon as the
+            # replacement is Ready. 11 x 45 = 495 worker requests, below the
+            # worker's limit, holds when nodes are drained one at a time, with
+            # at most one gateway per node and never during a rollout;
+            # otherwise add one to N for each eviction that can overlap. Raise
+            # it when the worker's limit is raised; lower it for a higher
+            # replica ceiling or more overlapping evictions (see README.md,
+            # "Sizing for N gateways").
             - name: WORKER_GATEWAY_MAX_UPSTREAM_INFLIGHT
               value: "45"
           ports:
