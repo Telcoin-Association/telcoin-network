@@ -1560,10 +1560,11 @@ impl<S: Send + Sync> FromRequestParts<S> for PostOnly {
 /// deadline fires: a request that never started forwarding cannot have reached
 /// an upstream, one that did may have, and the client is told which. Once the
 /// upstream has answered, the deadline no longer cuts the request: all that is
-/// left is passing that answer on (the worker's answer to a submission is read
-/// whole first, under the proxy client's request timeout), and cutting it then
-/// would turn an answer the upstream already gave, a transaction it accepted
-/// included, into a timeout.
+/// left is passing that answer on (a single submission the gateway remembers is
+/// first read whole, within what is left of `--upstream-request-timeout` since
+/// it was sent, the client's read timeout bounding each gap; see
+/// [`relay_submission_answer`]), and cutting it then would turn an answer the
+/// upstream already gave, a transaction it accepted included, into a timeout.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct ForwardingStarted(Arc<AtomicU8>);
 

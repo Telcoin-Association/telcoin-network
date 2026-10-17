@@ -985,11 +985,14 @@ async fn log_access(
 /// [`ForwardingStarted`] marker the proxy sets just before it forwards.
 ///
 /// A request whose upstream has already answered when the deadline passes is
-/// not cut: the proxy is only passing that answer on (it reads the worker's
-/// answer to a submission whole, under the proxy client's request timeout),
-/// and cutting it would report an answer the upstream already gave, a
-/// transaction it accepted included, as a timeout. It finishes and the proxy
-/// counts it, once.
+/// not cut: the proxy is only passing that answer on, and cutting it would
+/// report an answer the upstream already gave, a transaction it accepted
+/// included, as a timeout. A streamed answer leaves this layer once its head
+/// is in. The one answer still read here, a single submission the gateway
+/// remembers (see `relay_submission_answer`), must be read within
+/// `--upstream-request-timeout` of the request being sent, so the handler can
+/// run up to that long past this deadline. It finishes and the proxy counts
+/// it, once.
 async fn enforce_request_deadline(
     State(deadline): State<Duration>,
     mut request: Request,
