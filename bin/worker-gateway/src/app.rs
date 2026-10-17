@@ -708,8 +708,12 @@ mod tests {
         Json, Router,
     };
     use std::{
+        io,
         net::SocketAddr,
-        sync::atomic::{AtomicBool, Ordering},
+        sync::{
+            atomic::{AtomicBool, Ordering},
+            Mutex, PoisonError,
+        },
         time::{Duration, Instant},
     };
     use tokio::{
@@ -750,6 +754,28 @@ mod tests {
         Ok(())
     }
 
+    /// In-memory log sink for a scoped fmt subscriber.
+    #[derive(Clone, Default)]
+    struct Captured(Arc<Mutex<Vec<u8>>>);
+
+    impl Captured {
+        fn text(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().unwrap_or_else(PoisonError::into_inner))
+                .into_owned()
+        }
+    }
+
+    impl io::Write for Captured {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap_or_else(PoisonError::into_inner).extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
     #[test]
     fn custom_ca_with_an_empty_store_starts() -> eyre::Result<()> {
         let ca_file = tempfile::NamedTempFile::new()?;
@@ -763,15 +789,37 @@ mod tests {
             ca_flag.as_str(),
         ]);
 
+        const WARNING: &str = "must chain to --upstream-ca-cert";
+        let run = |native: usize| {
+            let captured = Captured::default();
+            let writer = captured.clone();
+            let subscriber = tracing_subscriber::fmt()
+                .with_ansi(false)
+                .with_writer(move || writer.clone())
+                .finish();
+            let loaded = std::cell::Cell::new(false);
+            let result = tracing::subscriber::with_default(subscriber, || {
+                ensure_root_store(&with_ca, || {
+                    loaded.set(true);
+                    native
+                })
+            });
+            (result, loaded.get(), captured.text())
+        };
         // the store is still loaded, so an empty one can be reported, but the
-        // private CA alone lets the workers verify, so startup goes on
-        let loaded = std::cell::Cell::new(false);
-        let result = ensure_root_store(&with_ca, || {
-            loaded.set(true);
-            0
-        });
+        // private CA alone lets the workers verify, so startup goes on, with a
+        // warning
+        let (result, loaded, logs) = run(0);
         assert!(result.is_ok(), "{result:?}");
-        assert!(loaded.get(), "the store must be loaded when an https url is configured");
+        assert!(loaded, "the store must be loaded when an https url is configured");
+        let line = logs
+            .lines()
+            .find(|l| l.contains(WARNING))
+            .unwrap_or_else(|| panic!("no warning: {logs}"));
+        assert!(line.contains(" WARN "), "{line}");
+        // a populated store with a custom CA starts without the warning
+        let (result, _, logs) = run(1);
+        assert!(result.is_ok() && !logs.contains(WARNING), "{logs}");
         Ok(())
     }
 
