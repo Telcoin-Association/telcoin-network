@@ -703,8 +703,8 @@ impl fmt::Debug for Cli {
     }
 }
 
-/// Fully-resolved runtime settings, derived from [`Cli`].
-#[derive(Debug)]
+/// Fully-resolved runtime settings, derived from [`Cli`]. Its `Debug` is
+/// redacted (see below).
 pub(crate) struct Settings {
     /// Address the gateway listens on.
     pub(crate) listen_addr: SocketAddr,
@@ -823,6 +823,26 @@ pub(crate) struct Settings {
     /// Most access-log lines written per second after sampling, or `None`
     /// when unlimited.
     pub(crate) access_log_max_lines_per_second: Option<NonZeroU32>,
+}
+
+/// Prints only the fields that identify a deployment, as [`Cli`]'s `Debug`
+/// does: the upstreams and `--redirect-queries` by origin (see
+/// [`UpstreamOrigin`]) and the query header as `<redacted>`. Every other
+/// field, one added later included, is left out rather than printed.
+impl fmt::Debug for Settings {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Settings")
+            .field("listen_addr", &self.listen_addr)
+            .field("probe_addr", &self.probe_addr)
+            .field("upstreams", &self.upstreams)
+            .field(
+                "query_upstream",
+                &self.query_upstream.as_ref().map(|url| UpstreamOrigin(url).to_string()),
+            )
+            .field("query_header", &self.query_header.as_ref().map(|_| "<redacted>"))
+            .field("metrics_addr", &self.metrics_addr)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Cli {
@@ -4191,6 +4211,42 @@ mod tests {
         for secret in ["apikey", "secret"] {
             assert!(!debug.contains(secret), "`{secret}` leaked into: {debug}");
         }
+        Ok(())
+    }
+
+    #[test]
+    fn settings_debug_redacts_urls_and_header() -> eyre::Result<()> {
+        let settings = try_parse_test_argv([
+            "worker-gateway",
+            "--upstream-rpc-url=http://gw:s3cret@10.0.0.7:8545/rpc-path?key=qsecret1",
+            "--upstream-readiness-url=http://gw:s3cret@10.0.0.7:8551/ready-path?key=qsecret2",
+            "--redirect-queries=https://user:pw0rd@rpc.example.com/v2/apikey123?key=qsecret3",
+            "--redirect-queries-header=X-Api-Key: hdrsecret",
+        ])?
+        .into_settings()?;
+        let debug = format!("{settings:?}");
+        for shown in [
+            "http://10.0.0.7:8545",
+            "http://10.0.0.7:8551",
+            "https://rpc.example.com:443",
+            "<redacted>",
+        ] {
+            assert!(debug.contains(shown), "`{shown}` missing from: {debug}");
+        }
+        for secret in [
+            "s3cret",
+            "pw0rd",
+            "rpc-path",
+            "ready-path",
+            "apikey123",
+            "qsecret",
+            "hdrsecret",
+            "X-Api-Key",
+        ] {
+            assert!(!debug.contains(secret), "`{secret}` leaked into: {debug}");
+        }
+        // a field the impl does not name is left out, never printed
+        assert!(!debug.contains("max_batch_len"), "{debug}");
         Ok(())
     }
 
