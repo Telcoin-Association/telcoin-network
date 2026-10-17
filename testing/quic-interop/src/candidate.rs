@@ -50,7 +50,7 @@ pub struct Observer {
     /// The exact counters installed in the candidate transport.
     stats: Arc<IncomingStats>,
     /// Last emitted aggregate counters, to avoid redundant records.
-    previous: (u64, u64, u64, u64, u64),
+    previous: Value,
     /// Effective incoming settings recorded before the endpoint starts.
     configuration: Value,
 }
@@ -69,7 +69,7 @@ impl Observer {
         );
         Self {
             stats,
-            previous: (0, 0, 0, 0, 0),
+            previous: Value::Null,
             configuration: json!({"applied": true, "requested_retry": retry,
                 "retry_unvalidated_incoming": config.retry_unvalidated_incoming,
                 "priority_peers": peers, "connections_per_peer": connections,
@@ -87,20 +87,23 @@ impl Observer {
 
     /// Emit only a changed aggregate observation, with no address or token labels.
     pub fn record(&mut self) -> Option<Value> {
-        let current = (
-            self.stats.retried(),
-            self.stats.accepted(),
-            self.stats.refused(),
-            self.stats.ignored(),
-            self.stats.budget_yields(),
-        );
+        let outcomes: Vec<_> = libp2p_quic::IncomingOutcome::ALL
+            .into_iter()
+            .map(|outcome| {
+                json!({"stage": outcome.stage(), "decision": outcome.decision(),
+                "reason": outcome.reason(), "count": self.stats.count(outcome)})
+            })
+            .collect();
+        let endpoint = self.stats.endpoint();
+        let current = json!({"event": "outcomes", "retried": self.stats.retried(),
+            "accepted": self.stats.accepted(), "refused": self.stats.refused(),
+            "ignored": self.stats.ignored(), "budget_yields": self.stats.budget_yields(),
+            "queued": endpoint.queued(), "effective_max_incoming": endpoint.limit(),
+            "endpoints": endpoint.endpoints(), "handshakes": self.stats.handshakes(),
+            "decisions": outcomes});
         let changed = current != self.previous;
-        self.previous = current;
-        changed.then(|| {
-            json!({"event": "outcomes", "retried": current.0,
-            "accepted": current.1, "refused": current.2, "ignored": current.3,
-            "budget_yields": current.4})
-        })
+        self.previous = current.clone();
+        changed.then_some(current)
     }
 }
 
@@ -437,6 +440,8 @@ mod tests {
         let connection = connect(&first, server.address).await?;
         server.accepted(2).await?;
         assert_eq!(server.stats.retried(), before, "valid validation token skips Retry");
+        assert_eq!(server.stats.count(libp2p_quic::IncomingOutcome::AddressValidated), 1);
+        assert_eq!(server.stats.count(libp2p_quic::IncomingOutcome::RetryValidated), 1);
         let (replay, _tokens) = client(Ipv4Addr::LOCALHOST, Some(token))?;
         let replayed = connect(&replay, server.address).await?;
         server.accepted(3).await?;
@@ -444,6 +449,8 @@ mod tests {
             server.stats.retried() > before,
             "resolved Bloom log rejects replay and rechallenges"
         );
+        assert!(server.stats.count(libp2p_quic::IncomingOutcome::InvalidAddressToken) > 0);
+        assert_eq!(server.stats.count(libp2p_quic::IncomingOutcome::RetryValidated), 2);
         connection.close(0u32.into(), b"done");
         replayed.close(0u32.into(), b"done");
         Ok(())
@@ -459,11 +466,13 @@ mod tests {
         let malformed = connect(&bad, server.address).await?;
         server.accepted(2).await?;
         assert!(server.stats.retried() > before, "opaque malformed token is treated as absent");
+        assert!(server.stats.count(libp2p_quic::IncomingOutcome::UndecodableToken) > 0);
         let before = server.stats.retried();
         let (bound, _tokens) = client(Ipv4Addr::new(127, 0, 0, 2), Some(token))?;
         let wrong_ip = connect(&bound, server.address).await?;
         server.accepted(3).await?;
         assert!(server.stats.retried() > before, "NEW_TOKEN binds the IP, not the UDP port");
+        assert!(server.stats.count(libp2p_quic::IncomingOutcome::InvalidAddressToken) > 0);
         malformed.close(0u32.into(), b"done");
         wrong_ip.close(0u32.into(), b"done");
         Ok(())
@@ -493,6 +502,8 @@ mod tests {
         assert!(connect(&endpoint, server.address).await.is_err());
         assert!(server.stats.retried() > 0);
         assert_eq!(server.stats.accepted(), 0);
+        assert!(server.stats.count(libp2p_quic::IncomingOutcome::InvalidRetryToken) > 0);
+        assert_eq!(server.stats.endpoint().queued(), 0);
         Ok(())
     }
 
@@ -660,7 +671,21 @@ mod tests {
         let first = incoming(&server).await?;
         assert!(!first.remote_address_validated() && first.may_retry());
         first.retry().map_err(|error| Error::Setup(format!("{error}")))?;
-        let validated = incoming(&server).await?;
+        // A split ClientHello can leave another original Initial ahead of the token return.
+        let validated = stream::repeat(())
+            .then(|()| incoming(&server))
+            .try_filter_map(|attempt| async move {
+                Ok(if attempt.remote_address_validated() {
+                    Some(attempt)
+                } else {
+                    attempt.ignore();
+                    None
+                })
+            })
+            .boxed()
+            .try_next()
+            .await?
+            .ok_or_else(|| Error::Setup("endpoint stopped before validated Initial".into()))?;
         assert!(validated.remote_address_validated());
         assert!(!validated.may_retry());
         validated

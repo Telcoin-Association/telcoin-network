@@ -191,7 +191,7 @@ impl From<Config> for QuinnConfig {
             incoming_buffer_size,
             incoming_buffer_size_total,
             max_incoming_outcomes_per_poll: _,
-            incoming_stats: _,
+            incoming_stats,
         } = config;
         let mut transport = quinn::TransportConfig::default();
         // Disable uni-directional streams.
@@ -237,6 +237,7 @@ impl From<Config> for QuinnConfig {
             })
             .unwrap_or_default();
 
+        endpoint_config.incoming_stats(Arc::clone(incoming_stats.endpoint()));
         if !support_draft_29 {
             endpoint_config.supported_versions(vec![1]);
         }
