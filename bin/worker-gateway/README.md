@@ -314,7 +314,8 @@ Two token-bucket limiters shed load before a request is buffered or forwarded:
   caps aggregate throughput to roughly what the upstream workers can absorb.
 
 The per-client bucket is checked first, and only a request it admits takes a global token, so a source over its own limit cannot drain the shared budget the other clients depend on (WG-08 in the [production-readiness review](docs/production-readiness.md)).
-If the global bucket then refuses the request, its per-client token is refunded, so a global refusal costs the client nothing either.
+Without `--rate-limit-submissions`, if the global bucket then refuses the request, its per-client token is refunded, so a global refusal costs the client nothing either.
+With it, the per-client token pays for reading the request: it stays spent when the request's class bucket refuses it, and when the global bucket refuses a request answered before its class was charged (a `405`, an unreadable or over-length body, a denied method).
 
 Either limiter is disabled by setting its rate to `0`; a `0` burst derives twice
 the sustained rate. An over-limit request receives a JSON-RPC `429` (see below),
