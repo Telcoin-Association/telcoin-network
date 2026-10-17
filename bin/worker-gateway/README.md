@@ -869,7 +869,7 @@ the same Prometheus stay out of it.
 
 | Metric | Type | Labels | Meaning |
 | --- | --- | --- | --- |
-| `tn_worker_gateway_inflight_requests` | gauge | | Proxied requests from their buffered body until the relayed response's body has finished streaming (or the gateway's own error); the request body read and requests refused before the proxy handler (by the rate limiter or the byte budget) are not counted. The intended autoscaling signal. |
+| `tn_worker_gateway_inflight_requests` | gauge | | Proxied requests from their buffered body until the relayed response's body has finished streaming (or the gateway's own error); the request body read and requests refused before the proxy handler (by the rate limiter or the byte budget) are not counted. One of the reference HPA's two signals, with `tn_worker_gateway_upstream_inflight`. |
 | `tn_worker_gateway_requests_total` | counter | `outcome` (`forwarded` / `rejected` / `upstream_error` / `cancelled`) | Proxied requests by terminal outcome; `upstream_error` is a request whose upstream's answer the gateway replaced with the `-32012` error (an error status without a JSON body, an answer from the query URL without one, or a `1xx`, `204`, `205` or `304`), a submission whose answer was lost after the worker's `2xx` counts as `rejected` under the reason of the error it gets (`upstream_answer_lost` or `upstream_timeout`), and `cancelled` is a request whose connection closed before the gateway answered (client disconnect, `--max-connection-duration`, shutdown). |
 | `tn_worker_gateway_rejections_total` | counter | `reason` | Rejected and `upstream_error` proxied requests, broken down by reason; the `reason` column of [Behaviour on failure](#behaviour-on-failure) names each label. |
 | `tn_worker_gateway_request_duration_seconds` | histogram | | Time from a proxied request's buffered body to the end of its response body (or the gateway's own error); not end-to-end, as it leaves out the request body read and requests refused before the proxy handler (by the rate limiter or the byte budget). |
@@ -1034,9 +1034,10 @@ Reference Kubernetes manifests live under `deploy/k8s/` (a Deployment, a
 client Service carrying only the `rpc` port, a cluster-internal
 `worker-gateway-metrics` Service for `/metrics`, a ServiceMonitor, a
 HorizontalPodAutoscaler keyed on the `tn_worker_gateway_inflight_requests`
-gauge, and a PodDisruptionBudget). They are a starting point, not a
-turnkey install: see `deploy/README.md` for the placeholders to replace and the
-prometheus-adapter rule the autoscaler needs.
+and `tn_worker_gateway_upstream_inflight` gauges, and a PodDisruptionBudget).
+They are a starting point, not a turnkey install: see `deploy/README.md` for
+the placeholders to replace and the prometheus-adapter rule the autoscaler
+needs.
 
 The reference client Service is a `ClusterIP`, so clients reach the gateways
 through a front, and the gateways see that front as every client's address
