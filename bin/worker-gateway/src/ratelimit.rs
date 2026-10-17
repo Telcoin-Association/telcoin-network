@@ -15,7 +15,10 @@
 //! for a request the per-client bucket admits, and a global refusal refunds
 //! the per-client tokens, so neither limit spends the other's budget on a
 //! request it refused. One helper, `RateLimiters::try_admit_then`, holds that
-//! rule for the edge check and the batch charge alike.
+//! rule for the edge check and the batch charge alike. The exceptions are the
+//! submission budget's charges, made after the body is read (see below): a
+//! refusal by the class charge, and a global refusal of a request answered
+//! before it was classified, keep the edge's per-IP token spent.
 //!
 //! The per-client key is the client address masked to a configurable prefix
 //! ([`PrefixPolicy`]), not the bare address. Keyed on the bare address, a client
@@ -67,7 +70,10 @@
 //! per-IP limit. A first-seen client whose every request is answered
 //! unclassified while the global bucket refuses it is never inserted, so the
 //! per-IP limit does not slow those requests; the connection caps and
-//! `--max-request-bytes` bound that work.
+//! `--max-request-bytes` bound that work. With the global limit off
+//! (`--rate-limit-global 0`), the global charges here and in
+//! [`RateLimiters::check`] always admit, so a first-seen client's entry then
+//! costs only its per-IP token in either mode.
 
 use std::{
     collections::HashMap,
@@ -536,13 +542,14 @@ impl PerIpLimiter {
     /// The fresh bucket is inserted only when `then` admits the request too: a
     /// refused first request leaves no entry, exactly as if its refunded (full)
     /// bucket had been swept, so a flood the global limit refuses cannot fill the
-    /// table. With `defer` (the edge check under a submission budget, whose
-    /// `then` admits everything) it is not inserted here at all: the receipt is
-    /// [`PerIpReceipt::Fresh`], and the bucket is inserted at the request's
-    /// class charge, whatever its verdict, or, for a request answered
-    /// unclassified, once the global bucket admits it as a query (see
-    /// [`RateLimiters::charge_class`]); there a refused request can add an
-    /// entry, paid for by its per-IP token.
+    /// table when a global limit is set (with it off, every first request the
+    /// per-IP bucket admits is inserted, up to the cap). With `defer` (the edge
+    /// check under a submission budget, whose `then` admits everything) it is
+    /// not inserted here at all: the receipt is [`PerIpReceipt::Fresh`], and
+    /// the bucket is inserted at the request's class charge, whatever its
+    /// verdict, or, for a request answered unclassified, once the global bucket
+    /// admits it as a query (see [`RateLimiters::charge_class`]); there a
+    /// refused request can add an entry, paid for by its per-IP token.
     ///
     /// A new IP that meets a full table first sweeps the table's idle entries
     /// (see [`Self::make_room`]), at most once per [`INLINE_SWEEP_INTERVAL`],
@@ -873,8 +880,10 @@ impl<C: Clock> RateLimiters<C> {
     /// Settle a request the edge admitted under a submission budget but that
     /// was answered without a class charge (a `405`, an unreadable or
     /// over-length body, a denied method, a loop): charge its first call to
-    /// the global bucket as a query, as [`Self::check`] would have, and insert
-    /// a first-seen client's bucket only if that bucket admits it. The request
+    /// the global bucket as a query (nothing when the global limit is off), as
+    /// [`Self::check`] would have, except that a global refusal keeps the
+    /// per-IP token the edge spent, which `check` would refund, and insert a
+    /// first-seen client's bucket only if that bucket admits it. The request
     /// was already answered, so the verdict decides only the insertion; the
     /// per-IP token the edge spent stays spent either way.
     fn settle_unclassified(&self, edge: PerIpReceipt) {
@@ -914,8 +923,11 @@ impl<C: Clock> RateLimiters<C> {
 /// When the last clone of its budget is dropped, it is charged to the global
 /// bucket as a query, and a first-seen client's per-IP bucket is inserted only
 /// if that bucket admits it, so such a request costs a global token and
-/// leaves no entry unless it paid one, as under [`RateLimiters::check`].
-/// Dropping a budget that was charged costs nothing more.
+/// leaves no entry unless it paid one. Unlike [`RateLimiters::check`], a
+/// global refusal here does not refund the edge's per-IP token: the request
+/// has been answered already, and that token paid for reading it. With the
+/// global limit off the drop charge always admits. Dropping a budget that was
+/// charged costs nothing more.
 #[derive(Clone)]
 pub(crate) struct SubmissionBudget<C: Clock = SystemClock> {
     /// Shared by every clone (the request extension and the handler's copy),
