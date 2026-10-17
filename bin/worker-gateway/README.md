@@ -848,8 +848,8 @@ The probe listener (`--probe-addr`) follows the same phases: it keeps answering 
 With the delay at `0` the first phase is skipped: the listeners close as soon as the signal arrives, and a front that has not noticed yet sees refused connections.
 Set the delay to at least the time your fronts outside Kubernetes take to act on a failing `/ready` or `/ready/any` (health-check interval times unhealthy threshold, plus the record TTL for DNS).
 A request whose head has arrived when the listener closes can run for the whole request deadline, `--upstream-request-timeout` plus `--header-read-timeout` (45s at the defaults), and the drain defaults to that deadline so such a request can finish (one whose head is still arriving can be cut up to `--header-read-timeout` early, twice that with `--proxy-protocol`); an explicit `--graceful-shutdown-timeout` below it is kept, with a startup warning.
-Keep the delay plus the drain timeout plus about 1s inside the orchestrator's termination grace period.
-Kubernetes' default `terminationGracePeriodSeconds` is 30s, shorter than the 45s default drain, so set the pod's grace period explicitly (the shutdown delay plus the drain plus about 1s); a pod spec that omits it is killed 30s into the drain.
+Keep the delay plus the drain timeout plus about 2s (the join margin and the runtime shutdown) inside the orchestrator's termination grace period.
+Kubernetes' default `terminationGracePeriodSeconds` is 30s, shorter than the 45s default drain, so set the pod's grace period explicitly (the shutdown delay plus the drain plus about 2s); a pod spec that omits it is killed 30s into the drain.
 The reference manifest uses a 5s delay, a 45s drain and a 55s grace period; the 5s covers Kubernetes endpoint removal only (see `deploy/README.md`).
 
 ## Observability
