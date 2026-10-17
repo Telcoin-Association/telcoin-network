@@ -67,13 +67,17 @@ mod code {
     /// The request calls a method the gateway refuses to forward
     /// (`--denied-method-prefixes`, applied when `--redirect-queries` is unset).
     pub(super) const METHOD_NOT_ALLOWED: i32 = -32011;
-    /// The upstream answered with an error status and a body that is not
-    /// JSON (a worker's `429` text/plain, for example).
+    /// The upstream's answer carried no JSON-RPC body to relay: an error
+    /// status whose body is not JSON (a worker's `429` text/plain, for
+    /// example), an answer without a JSON body from the query upstream, a
+    /// `2xx` included, or a `1xx`, `204`, `205` or `304`, which can carry no
+    /// body.
     pub(super) const UPSTREAM_ERROR: i32 = -32012;
     /// The worker answered a remembered submission `2xx`, but its answer
     /// could not be read whole; the transaction may have been accepted.
     pub(super) const UPSTREAM_ANSWER_LOST: i32 = -32013;
-    /// The request body could not be read, or the request was not a `POST`.
+    /// The request body could not be read, the request was not a `POST`, or
+    /// a probe path got a method other than `GET` or `HEAD`.
     /// This is the spec-defined "Invalid Request" code, not a gateway-range
     /// code.
     pub(super) const INVALID_REQUEST: i32 = -32600;

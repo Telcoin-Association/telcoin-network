@@ -596,7 +596,7 @@ pub(crate) async fn proxy(
                         upstream = %UpstreamOrigin(&upstream_url),
                         status = upstream.status().as_u16(),
                         suppressed,
-                        "upstream answered an error status without a JSON-RPC body"
+                        "upstream sent an answer without a JSON-RPC body"
                     );
                 }
                 return upstream_error_response(status, body.as_ref());
