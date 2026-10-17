@@ -1633,8 +1633,13 @@ mod tests {
             let submission = round % 2 == 0;
             let extra = round % 3;
             let budget = limiters.check_edge(None).expect("edge").expect("a budget");
-            if budget.charge(submission).is_ok() && limiters.charge_batch(None, extra).is_ok() {
-                admitted += 1 + extra;
+            if budget.charge(submission).is_ok() {
+                if limiters.charge_batch(None, extra).is_ok() {
+                    admitted += 1 + extra;
+                } else {
+                    // as the handler does (proxy.rs, the batch-charge refusal arm)
+                    budget.refund(submission);
+                }
             }
         }
         assert!(admitted <= 4 + 3, "{admitted} calls admitted over two bursts of 4 and 3");
