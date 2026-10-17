@@ -26,8 +26,10 @@ const EMFILE: i32 = 24;
 const ENFILE: i32 = 23;
 
 /// Raise the soft `RLIMIT_NOFILE` to the hard limit, as the node does, and
-/// return the limit now in force, or `None` when it is unknown (the platform is
-/// unsupported or the call failed, which is logged).
+/// return the limit now in force: the raised one, or, when the raise fails
+/// (logged), the soft limit [`current_limit`] reads, so [`warn_on_budget`]
+/// still compares the caps with it; `None` only when the platform is
+/// unsupported or the limit cannot be read.
 pub(crate) fn raise_limit() -> Option<u64> {
     match fdlimit::raise_fd_limit() {
         Ok(fdlimit::Outcome::LimitRaised { from, to }) => {
@@ -36,10 +38,36 @@ pub(crate) fn raise_limit() -> Option<u64> {
         }
         Ok(fdlimit::Outcome::Unsupported) => None,
         Err(err) => {
-            warn!(target: "gateway", %err, "could not raise the file descriptor limit");
-            None
+            let current = current_limit();
+            warn!(
+                target: "gateway",
+                %err,
+                soft_limit = ?current,
+                "could not raise the file descriptor limit; checking the caps against the current \
+                 soft limit"
+            );
+            current
         }
     }
+}
+
+/// The soft `RLIMIT_NOFILE` in force, read with `getrlimit` (an unlimited
+/// one as `u64::MAX`, as fdlimit reports it), or `None` when the call fails.
+#[cfg(unix)]
+fn current_limit() -> Option<u64> {
+    let mut limit = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+    // SAFETY: `getrlimit` writes only the one `rlimit` it is given, through
+    // a pointer to this live, exclusively borrowed local.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } != 0 {
+        return None;
+    }
+    Some(if limit.rlim_cur == libc::RLIM_INFINITY { u64::MAX } else { limit.rlim_cur })
+}
+
+/// No `getrlimit` outside Unix.
+#[cfg(not(unix))]
+fn current_limit() -> Option<u64> {
+    None
 }
 
 /// Warn when the caps in `settings` could need more descriptors than
@@ -184,5 +212,15 @@ mod tests {
         // so does a connect failure with no io cause
         assert!(!is_exhausted(&chain(None)));
         assert!(!is_exhausted(&chain(Some(io::Error::other("tls handshake failed")))));
+    }
+
+    /// The raise sets the soft limit to what it reports, and when it fails (a
+    /// sandbox refusing `setrlimit`) it returns what [`current_limit`] reads.
+    #[cfg(unix)]
+    #[test]
+    fn current_limit_reads_the_soft_limit_in_force() {
+        let raised = raise_limit();
+        assert!(raised.is_some());
+        assert_eq!(current_limit(), raised);
     }
 }

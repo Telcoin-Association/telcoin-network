@@ -12566,6 +12566,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "jsonrpsee-types",
+ "libc",
  "metrics",
  "metrics-util",
  "rcgen",

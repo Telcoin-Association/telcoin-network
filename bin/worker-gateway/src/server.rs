@@ -79,23 +79,25 @@ use crate::{
 /// so a persistent accept error (e.g. fd exhaustion) cannot spin the loop hot.
 const ACCEPT_RETRY_DELAY: Duration = Duration::from_millis(100);
 
-/// Linux `ENONET`: the peer's machine is not on the network. With the four
-/// below, one of the errors `accept(2)` documents as already pending on the
-/// new socket, so it is about that connection alone; `std::io::ErrorKind` has
-/// no kind for these and `libc` is not a dependency, hence the raw values.
-const ENONET: i32 = 64;
+/// Whether `errno` is one of the errors `accept(2)` documents as already
+/// pending on the new socket (`ENONET`, `EPROTO`, `ENOPROTOOPT`,
+/// `EOPNOTSUPP`, `EHOSTDOWN`), so about that connection alone;
+/// `std::io::ErrorKind` has no kind for these. Linux-family only, with the
+/// values `libc` gives for the target: mips, sparc, alpha and parisc number
+/// them differently.
+#[cfg(any(target_os = "android", target_os = "linux"))]
+fn is_pending_socket_error(errno: Option<i32>) -> bool {
+    matches!(
+        errno,
+        Some(libc::ENONET | libc::EPROTO | libc::ENOPROTOOPT | libc::EOPNOTSUPP | libc::EHOSTDOWN)
+    )
+}
 
-/// Linux `EPROTO`: protocol error on the connection being accepted.
-const EPROTO: i32 = 71;
-
-/// Linux `ENOPROTOOPT`: protocol option not available on the new socket.
-const ENOPROTOOPT: i32 = 92;
-
-/// Linux `EOPNOTSUPP`: operation not supported on the new socket.
-const EOPNOTSUPP: i32 = 95;
-
-/// Linux `EHOSTDOWN`: the peer's host is down.
-const EHOSTDOWN: i32 = 112;
+/// No such errors are consulted outside the Linux family.
+#[cfg(not(any(target_os = "android", target_os = "linux")))]
+fn is_pending_socket_error(_errno: Option<i32>) -> bool {
+    false
+}
 
 /// Liveness probe path. Its `GET` and `HEAD` are exempt from rate limiting (see
 /// [`crate::ratelimit`]); any other method is limited and then refused with a
@@ -1675,11 +1677,7 @@ fn is_connection_error(err: &std::io::Error) -> bool {
             | ErrorKind::NetworkDown
             | ErrorKind::NetworkUnreachable
             | ErrorKind::HostUnreachable
-    ) || (cfg!(any(target_os = "android", target_os = "linux"))
-        && matches!(
-            err.raw_os_error(),
-            Some(ENONET | EPROTO | ENOPROTOOPT | EOPNOTSUPP | EHOSTDOWN)
-        ))
+    ) || is_pending_socket_error(err.raw_os_error())
 }
 
 /// Arm `TCP_USER_TIMEOUT` on an accepted connection: the kernel forcibly
