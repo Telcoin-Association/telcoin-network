@@ -81,7 +81,7 @@ An external load balancer or DNS health check that probes `/ready` or `/ready/an
 The container has no `preStop` sleep: a sleep only postpones SIGTERM, and fronts outside Kubernetes never learn from it that the pod is going away.
 The Deployment also sets `WORKER_GATEWAY_GRACEFUL_SHUTDOWN_TIMEOUT` (equivalently `--graceful-shutdown-timeout`, default: the whole-request deadline, 45s at the defaults) to `45s`, the gateway's whole-request deadline at the defaults (`--upstream-request-timeout` 35s plus `--header-read-timeout` 10s), so a request accepted just before the listener closes, such as an `eth_sendRawTransactionSync` waiting for its receipt, can still finish; the drain ends as soon as the last request does.
 The `terminationGracePeriodSeconds: 55` in the Deployment covers the 5s delay plus the 45s drain and the gateway's 1s join margin, 51s in total, so the process has room to drain in-flight proxied requests before the kubelet escalates to SIGKILL.
-If you raise the delay, the drain timeout or `--upstream-request-timeout`, raise this too.
+If you raise the delay, the drain timeout or `--upstream-request-timeout`, raise this and `minReadySeconds` with it: a rollout deletes the next old pod once its replacement has been Ready for `minReadySeconds`, so it must exceed the delay plus the drain plus 2s, or two old pods drain at once and more than `maxReplicas` + 1 gateways hold worker requests, beyond the 11 × 45 sizing of `WORKER_GATEWAY_MAX_UPSTREAM_INFLIGHT` (see the README's "Sizing for N gateways").
 
 ## Readiness and reads
 
