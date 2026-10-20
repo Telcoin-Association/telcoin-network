@@ -14,10 +14,10 @@
 //! ## Commits
 //!
 //! A commit (see `RwTxn::commit`) stamps the CRC of every page the transaction wrote, makes
-//! them durable (`msync` over coalesced ranges, or one `fdatasync` of the file when the pages are
-//! scattered, then an `fdatasync` if the file grew and it is still needed), and only
-//! then writes the new meta over the slot holding the lower txn and syncs that one page. A crash
-//! before the meta's sync recovers the previous state; after it, the new one. In
+//! them durable (one `msync` when they form one range, else one `fdatasync` of the file; see
+//! [`data_sync`]), then the file's size if it grew and that sync did not already cover it, and
+//! only then writes the new meta over the slot holding the lower txn and syncs that one page. A
+//! crash before the meta's sync recovers the previous state; after it, the new one. In
 //! [`SyncMode::NoSync`] a commit only stamps and publishes in memory; [`Env::sync`] (or the
 //! environment's drop) runs the durable steps for the newest state.
 //!
@@ -69,19 +69,21 @@ use crate::{
     txn::{RoTxn, RwTxn},
 };
 
-/// Runs of dirty pages separated by at most this many clean pages are synced by one `msync` (the
-/// clean pages between cost the kernel a page-table walk, not a write).
+/// Runs of dirty pages separated by at most this many clean pages merge into one range, which one
+/// `msync` can sync (the clean pages between cost the kernel a page-table walk, not a write).
 const MERGE_GAP: u32 = 64;
 
 /// A commit whose dirty pages form more runs of adjacent pages than this makes them durable with
-/// one `fdatasync` of the file instead of one `msync` per range ([`data_sync`]).
-const MAX_RANGES: usize = 16;
+/// one `fdatasync` of the file even when the runs merge into one range ([`data_sync`]).
+const MAX_RUNS: usize = 16;
 
 /// How step 4 makes a commit's dirty pages durable ([`data_sync`]).
 #[derive(Debug, PartialEq, Eq)]
 enum DataSync {
-    /// One `msync(MS_SYNC)` per byte range.
-    Ranges(Vec<Range<u64>>),
+    /// No page to sync.
+    Nothing,
+    /// One `msync(MS_SYNC)` of this byte range.
+    Range(Range<u64>),
     /// One `fdatasync` of the whole file.
     File,
 }
@@ -291,10 +293,6 @@ pub(crate) struct Writer {
     /// [`Self::crash_point`]).
     #[cfg(test)]
     pub(crate) crash_at: Option<CrashAt>,
-    /// Test-only: the data syncs (msynced ranges, or the one `fdatasync`) of the latest durable
-    /// steps.
-    #[cfg(test)]
-    pub(crate) data_msyncs: usize,
     /// Test-only: the latest durable steps synced the data with one `fdatasync` of the file.
     #[cfg(test)]
     pub(crate) data_by_file: bool,
@@ -302,6 +300,12 @@ pub(crate) struct Writer {
     /// `fdatasync` of the whole file for every commit, not only those [`data_sync`] picks it for.
     #[cfg(test)]
     pub(crate) data_by_fdatasync: bool,
+    /// Test-only: step 4 makes the data pages durable with one `msync` of the range from the
+    /// first dirty page to the last, whatever [`data_sync`] picks, so the crash matrix runs the
+    /// `msync` path (and the size sync after it) on a commit whose pages form several ranges.
+    /// [`Self::data_by_fdatasync`] wins over it.
+    #[cfg(test)]
+    pub(crate) data_by_msync: bool,
     /// Test-only: table puts take the descent every time: each put empties its table's
     /// write-path cache (`write::PathCache`) first, so none is used.
     #[cfg(test)]
@@ -320,10 +324,9 @@ pub(crate) enum CrashAt {
     AfterSave,
     /// After step 3 (the pages' CRCs stamped): the last point of a `SyncMode::NoSync` commit.
     AfterStamp,
-    /// After the msync of the `k`-th data range (from 1) of step 4, or (`k` = 1) after the one
-    /// `fdatasync` that replaces them.
-    DataMsync(usize),
-    /// After step 5 (the size sync, whether or not the file grew).
+    /// After step 4 (the data sync: the one `msync`, the one `fdatasync`, or nothing).
+    AfterDataSync,
+    /// After step 5 (the size sync, whether or not the file grew or step 4 already synced it).
     AfterSizeSync,
     /// After the meta's copy into its slot, before its msync (inside step 6).
     AfterMetaCopy,
@@ -350,39 +353,32 @@ impl Writer {
         }
     }
 
-    /// The durable steps of a commit (4–6): sync `pages` (ascending), the file's size if it
-    /// grew, then write `meta` over the slot holding the lower txn and sync that page.
+    /// The durable steps of a commit (4–6): sync `pages` (ascending) by the one `msync` or the
+    /// one `fdatasync` [`data_sync`] picks, then the file's size if it grew (a no-op after the
+    /// `fdatasync`, which syncs the size too), then write `meta` over the slot holding the lower
+    /// txn and sync that page.
     pub(crate) fn make_durable(&mut self, pages: &[u32], meta: &Meta) -> Result<()> {
         let size = self.geometry.page_size();
-        #[cfg(test)]
-        {
-            self.data_msyncs = 0;
-            self.data_by_file = false;
-        }
         let plan = data_sync(pages, size as u64);
         #[cfg(test)]
-        let plan = if self.data_by_fdatasync { DataSync::File } else { plan };
-        match plan {
-            DataSync::Ranges(ranges) => {
-                for range in ranges {
-                    self.file.msync_ranges(std::slice::from_ref(&range))?;
-                    #[cfg(test)]
-                    {
-                        self.data_msyncs += 1;
-                        self.crash_point(CrashAt::DataMsync(self.data_msyncs))?;
-                    }
-                }
+        let plan = match (pages.first(), pages.last()) {
+            _ if self.data_by_fdatasync => DataSync::File,
+            (Some(&first), Some(&last)) if self.data_by_msync => {
+                DataSync::Range(u64::from(first) * size as u64..(u64::from(last) + 1) * size as u64)
             }
-            DataSync::File => {
-                self.file.fdatasync_all()?;
-                #[cfg(test)]
-                {
-                    self.data_by_file = true;
-                    self.data_msyncs = 1;
-                    self.crash_point(CrashAt::DataMsync(1))?;
-                }
-            }
+            _ => plan,
+        };
+        #[cfg(test)]
+        {
+            self.data_by_file = plan == DataSync::File;
         }
+        match plan {
+            DataSync::Nothing => {}
+            DataSync::Range(range) => self.file.msync_range(range)?,
+            DataSync::File => self.file.fdatasync_all()?,
+        }
+        #[cfg(test)]
+        self.crash_point(CrashAt::AfterDataSync)?;
         self.file.sync_size_if_grown()?;
         #[cfg(test)]
         self.crash_point(CrashAt::AfterSizeSync)?;
@@ -592,32 +588,37 @@ fn not_private(pgno: u32) -> Error {
     Error::Failed(format!("page {pgno} is not private: copy it first"))
 }
 
-/// How step 4 syncs dirty `pages` (ascending). Pages forming at most [`MAX_RANGES`] runs of
-/// adjacent pages get one `msync` per range, runs separated by at most [`MERGE_GAP`] clean pages
-/// merged. More runs (a commit whose copies took pages freed all over the file) get one
-/// `fdatasync` of the file: an msync writes its range's dirty pages one cluster at a time on
-/// macOS, about three times the cost of fdatasync's single pass for a commit of a thousand
-/// scattered pages, and on Linux every msync runs the file system's fsync path, device flush
-/// included, so one fdatasync is one flush instead of many. Either way the data is durable before
-/// the meta is written. `fdatasync` also writes any other dirty page of the file, which at a
-/// commit can only be a page of an aborted transaction: a free page, so writing it is harmless.
+/// How step 4 syncs dirty `pages` (ascending). Runs of adjacent pages separated by at most
+/// [`MERGE_GAP`] clean pages merge into one range. Pages that form exactly one range, in at most
+/// [`MAX_RUNS`] runs, get one `msync` of it; any other set gets one `fdatasync` of the file.
+///
+/// - **Two or more ranges:** on Linux every `msync(MS_SYNC)` runs the file system's fsync path,
+///   drive-cache flush included, so k ranges cost k flushes where one `fdatasync` costs one (small
+///   commits on macOS sync faster by one `fdatasync` too).
+/// - **One range:** one `msync` is one flush on Linux too, and on macOS it beats an `fdatasync` of
+///   the file for a large commit (a bulk load's one range), which `fdatasync` writes slower.
+/// - **More than [`MAX_RUNS`] runs** (a commit whose copies took pages freed all over the file) get
+///   the `fdatasync` even when they merge into one range: an `msync` writes its range's dirty pages
+///   one cluster at a time on macOS, about three times the cost of `fdatasync`'s single pass for a
+///   commit of a thousand scattered pages.
+///
+/// Either way the data is durable before the meta is written. `fdatasync` also writes any other
+/// dirty page of the file, which at a commit can only be a page of an aborted transaction: a free
+/// page, so writing it is harmless.
 fn data_sync(pages: &[u32], page_size: u64) -> DataSync {
-    let adjacent_runs = 1 + pages.windows(2).filter(|w| w[1] != w[0] + 1).count();
-    if adjacent_runs > MAX_RANGES {
+    let (Some(&first), Some(&last)) = (pages.first(), pages.last()) else {
+        return DataSync::Nothing;
+    };
+    let (mut runs, mut ranges) = (1, 1);
+    for w in pages.windows(2) {
+        let clean = w[1] - w[0] - 1;
+        runs += usize::from(clean > 0);
+        ranges += usize::from(clean > MERGE_GAP);
+    }
+    if runs > MAX_RUNS || ranges > 1 {
         return DataSync::File;
     }
-    let mut runs: Vec<Range<u32>> = Vec::new();
-    for &p in pages {
-        match runs.last_mut() {
-            Some(run) if p - run.end <= MERGE_GAP => run.end = p + 1,
-            _ => runs.push(p..p + 1),
-        }
-    }
-    DataSync::Ranges(
-        runs.into_iter()
-            .map(|run| u64::from(run.start) * page_size..u64::from(run.end) * page_size)
-            .collect(),
-    )
+    DataSync::Range(u64::from(first) * page_size..(u64::from(last) + 1) * page_size)
 }
 
 impl Env {
@@ -669,11 +670,11 @@ impl Env {
             #[cfg(test)]
             crash_at: None,
             #[cfg(test)]
-            data_msyncs: 0,
-            #[cfg(test)]
             data_by_file: false,
             #[cfg(test)]
             data_by_fdatasync: false,
+            #[cfg(test)]
+            data_by_msync: false,
             #[cfg(test)]
             no_path_cache: false,
         };

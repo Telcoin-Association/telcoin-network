@@ -181,7 +181,7 @@ impl Run {
             CrashAt::BeforeSave,
             CrashAt::AfterSave,
             CrashAt::AfterStamp,
-            CrashAt::DataMsync(1),
+            CrashAt::AfterDataSync,
             CrashAt::AfterSizeSync,
             CrashAt::AfterMetaCopy,
             CrashAt::AfterMetaMsync,

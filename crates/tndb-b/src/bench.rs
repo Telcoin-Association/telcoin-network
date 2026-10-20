@@ -45,24 +45,28 @@
 //!   pages (`PageSize::Set(4096)`): the like-for-like one for `t4d`, and what a Linux x86_64 node
 //!   runs, though on Apple Silicon each 4 KiB page sits in a 16 KiB OS page. On x86_64 the two MDBX
 //!   columns are the same configuration. The geometry is generous (no remap mid-run).
-//! - tndb-b `Durable` and MDBX `Durable` make a commit durable the same way: `msync(MS_SYNC)` of
-//!   the data (tndb-b: each dirty range; MDBX: the whole used span), then of the meta page, plus an
-//!   `fsync` when the file grew. On macOS `msync` and `fsync` do not flush the drive's cache, so
-//!   there the durable rows cost far less than on Linux, where `msync(MS_SYNC)` takes the file
-//!   system's fsync path. Linux numbers are the ones that decide production questions.
-//! - tndb-b `NoSync` and MDBX `SafeNoSync` commits are not durable: their "small commits" rows and
-//!   the bulk "commit" rows measure the commit path without a sync.
+//! - tndb-b `Durable` syncs the data by one `msync(MS_SYNC)` of the dirty pages when they form one
+//!   range, else by one `fdatasync` of the file, then the size if the file grew and the data sync
+//!   did not cover it, then `msync` of the meta page. MDBX `Durable` syncs the data by `msync` of
+//!   the whole used span, then the meta page, plus an `fsync` when the file grew. On macOS `msync`
+//!   and `fsync` do not flush the drive's cache, so there the durable rows cost far less than on
+//!   Linux, where every `msync(MS_SYNC)` takes the file system's fsync path. Linux numbers are the
+//!   ones that decide production questions.
+//! - tndb-b `NoSync` and MDBX `SafeNoSync` commits are not durable. tndb-b's "small commits" rows
+//!   and bulk "commit" rows measure the commit path without a sync; MDBX's `SafeNoSync` small
+//!   commits still took milliseconds each on Linux (the cause is not investigated).
 //! - A bulk row's "put loop" runs from `begin` to just before `commit` (`begin` and the table's
 //!   creation cost next to nothing); its "commit" is the rest. The two add up to the total.
 //! - The API rows (append put, cursor put) time the put loop only; their commits match the
 //!   sequential insert's. MDBX runs them with `WriteFlags::APPEND` on `Transaction::put` and with
 //!   `Cursor::put`, with and without `WriteFlags::APPEND`; tndb-b with `RwTxn::append`,
 //!   `RwCursor::put` and `RwCursor::append`.
-//! - The "fdatasync" small-commit rows run the same workload with step 4 of tndb-b's commit
-//!   replaced by one `fdatasync` of the whole file (a test-only switch, see
-//!   `Writer::data_by_fdatasync`), to compare it with the per-range `msync`. The two modes
-//!   alternate in blocks of 100 transactions (A B B A order) on the same table, so neither gains
-//!   from running second.
+//! - The "fdatasync" small-commit rows run the same workload with step 4 of tndb-b's commit forced
+//!   to one `fdatasync` of the whole file for every commit (a test-only switch, see
+//!   `Writer::data_by_fdatasync`). Step 4 picks the `fdatasync` itself for pages that form two or
+//!   more ranges, so the two modes differ only on the commits whose pages form one range, which
+//!   step 4 syncs by one `msync`. The two modes alternate in blocks of 100 transactions (A B B A
+//!   order) on the same table, so neither gains from running second.
 //! - With `TNDB_B_BENCH_REPEAT` above 1, a read row reports the median of its runs, not a single
 //!   cold-ish run: later runs find the tree in the CPU caches a first run had to fill.
 
@@ -1062,8 +1066,11 @@ fn tndb_b_vs_mdbx() {
     print_table(&columns, n);
     println!(
         "\nNotes: NoSync/SafeNoSync commits are not durable. On macOS msync/fsync do not flush the \
-         drive cache, so durable rows cost far less than on Linux. The fdatasync rows replace \
-         tndb-b's per-range msync (commit step 4) with one fdatasync of the whole file. The API \
+         drive cache, so durable rows cost far less than on Linux. tndb-b Durable syncs the data \
+         by one msync when the dirty pages form one range, else by one fdatasync of the file, then \
+         the meta page by msync; MDBX Durable msyncs the whole used span, then the meta page. The \
+         fdatasync rows force the fdatasync for every commit, so they differ from step 4's own \
+         choice only on commits whose pages form one range. The API \
          rows (append put, cursor put) time the put loop into a fresh environment. MDBX opens with \
          the OS page size; md4 opens it with 4 KiB pages, the like-for-like column for t4d (on \
          x86_64 the OS page is 4 KiB, so md and md4 are the same configuration there)."

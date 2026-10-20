@@ -126,17 +126,16 @@ fn crash_changes(txn: &mut RwTxn, state: &mut State) {
     }
 }
 
-/// The crash points a commit in `sync` mode stops at, with `ranges` data ranges to msync.
-fn points(ranges: usize, every_range: bool) -> Vec<CrashAt> {
-    let mut points = vec![CrashAt::BeforeSave, CrashAt::AfterSave, CrashAt::AfterStamp];
-    if every_range {
-        points.extend((1..=ranges).map(CrashAt::DataMsync));
-    } else {
-        points.extend([CrashAt::DataMsync(1), CrashAt::DataMsync(ranges)]);
-    }
-    points.extend([CrashAt::AfterSizeSync, CrashAt::AfterMetaCopy, CrashAt::AfterMetaMsync]);
-    points
-}
+/// The crash points of a commit, in protocol order.
+const POINTS: [CrashAt; 7] = [
+    CrashAt::BeforeSave,
+    CrashAt::AfterSave,
+    CrashAt::AfterStamp,
+    CrashAt::AfterDataSync,
+    CrashAt::AfterSizeSync,
+    CrashAt::AfterMetaCopy,
+    CrashAt::AfterMetaMsync,
+];
 
 /// True if `at` stops a commit in `sync` mode (else it stops the following sync).
 fn stops_the_commit(sync: SyncMode, at: CrashAt) -> bool {
@@ -146,13 +145,15 @@ fn stops_the_commit(sync: SyncMode, at: CrashAt) -> bool {
 
 /// Copy the base to a tracked case file, open it in `sync` mode, make the commits (unsynced
 /// ones first in `SyncMode::NoSync`) and stop at `at` (`None`: run to the end, with a sync).
-/// Returns the case's path, the state `M` its last commit made, the slot `M`'s meta goes to,
-/// and the data ranges the durable steps msynced. The environment is crashed.
-fn run_case(base: &Base, sync: SyncMode, at: Option<CrashAt>) -> Case {
+/// With `by_msync`, step 4 syncs the data by one `msync` (`Writer::data_by_msync`), else by the
+/// sync `data_sync` picks. Returns the case's path, the state `M` its last commit made, the slot
+/// `M`'s meta goes to, and how the durable steps synced the data. The environment is crashed.
+fn run_case(base: &Base, sync: SyncMode, by_msync: bool, at: Option<CrashAt>) -> Case {
     let path = base.dir.path().join("case");
     fs::copy(&base.path, &path).expect("copy");
     disk_model::track(&path);
     let env = open(&path, sync);
+    env.with_writer(|w| w.data_by_msync = by_msync);
     let mut latest = base.state.clone();
     if sync == SyncMode::NoSync {
         for round in 0..2 {
@@ -183,9 +184,9 @@ fn run_case(base: &Base, sync: SyncMode, at: Option<CrashAt>) -> Case {
         (None, None) => {}
         (at, e) => panic!("{at:?}: {e:?}"),
     }
-    let (ranges, reused) = env.with_writer(|w| (w.data_msyncs, w.alloc.load_log.len()));
+    let (by_file, reused) = env.with_writer(|w| (w.data_by_file, w.alloc.load_log.len()));
     env.crash();
-    Case { path, latest, slot, ranges, reused }
+    Case { path, latest, slot, by_file, reused }
 }
 
 /// What [`run_case`] left.
@@ -196,17 +197,17 @@ struct Case {
     latest: State,
     /// The meta slot `M`'s record goes to.
     slot: usize,
-    /// The data ranges the last durable steps msynced.
-    ranges: usize,
+    /// The last durable steps synced the data by one `fdatasync` of the file.
+    by_file: bool,
     /// The pages the writer took from the free list.
     reused: usize,
 }
 
 /// One cell of the matrix: stop at `at`, go down by `loss`, and reopen (twice, with a crash and
 /// a strict power loss right after the first reopen) to exactly the state allowed.
-fn crash_case(base: &Base, sync: SyncMode, at: CrashAt, loss: Loss) {
-    let case = format!("{sync:?} {at:?} {loss:?}");
-    let Case { path, latest, slot, .. } = run_case(base, sync, Some(at));
+fn crash_case(base: &Base, sync: SyncMode, by_msync: bool, at: CrashAt, loss: Loss) {
+    let case = format!("{sync:?} by_msync={by_msync} {at:?} {loss:?}");
+    let Case { path, latest, slot, .. } = run_case(base, sync, by_msync, Some(at));
     match loss {
         Loss::Process => {}
         Loss::Strict => disk_model::power_loss(&path),
@@ -239,12 +240,13 @@ fn crash_case(base: &Base, sync: SyncMode, at: CrashAt, loss: Loss) {
     fs::remove_file(&path).expect("remove");
 }
 
-/// The number of data ranges the durable steps of the crash commit (or of the sync after it)
-/// msync in `sync` mode, checked to exercise what the matrix needs: at least two ranges, pages
-/// reused from the free list, and a growth of the file.
-fn dry_run(base: &Base, sync: SyncMode) -> usize {
-    let Case { path, latest, ranges, reused, .. } = run_case(base, sync, None);
-    assert!(ranges >= 2, "{sync:?}: {ranges} data ranges");
+/// Run the crash commit (or the sync after it) to the end, checked to exercise what the matrix
+/// needs: the data synced by the `fdatasync` `data_sync` picks for pages that form several
+/// ranges (or, `by_msync`, by one `msync`), pages reused from the free list, and a growth of the
+/// file.
+fn dry_run(base: &Base, sync: SyncMode, by_msync: bool) {
+    let Case { path, latest, by_file, reused, .. } = run_case(base, sync, by_msync, None);
+    assert_eq!(by_file, !by_msync, "{sync:?}: by_msync={by_msync}: synced by fdatasync");
     assert!(reused > 0, "{sync:?}: pages were reused");
     let base_len = fs::metadata(&base.path).expect("metadata").len();
     assert!(fs::metadata(&path).expect("metadata").len() > base_len, "{sync:?}: the file grew");
@@ -253,59 +255,59 @@ fn dry_run(base: &Base, sync: SyncMode) -> usize {
     drop(env);
     disk_model::untrack(&path);
     fs::remove_file(&path).expect("remove");
-    ranges
 }
 
-/// The matrix: every crash point x {process crash, strict power loss, random power loss with
-/// three seeds} x {`Durable`, `NoSync`} reopens to exactly the allowed state, which checks and
-/// survives a crash right after the reopen.
-#[test]
-fn every_crash_point_recovers_the_state_the_protocol_allows() {
-    let base = base(4096);
+/// Every crash point of `base`'s crash commit x {process crash, strict power loss, `seeds`
+/// random power losses} x {`Durable`, `NoSync`} x {the `fdatasync` step 4 picks, one `msync`}.
+fn matrix(base: &Base, seeds: u64) {
     for sync in [SyncMode::Durable, SyncMode::NoSync] {
-        let ranges = dry_run(&base, sync);
-        for (n, at) in points(ranges, false).into_iter().enumerate() {
-            for loss in [Loss::Process, Loss::Strict] {
-                crash_case(&base, sync, at, loss);
-            }
-            for seed in 0..3 {
-                crash_case(&base, sync, at, Loss::Random(seed * 64 + n as u64));
+        for by_msync in [false, true] {
+            dry_run(base, sync, by_msync);
+            for (n, at) in POINTS.into_iter().enumerate() {
+                for loss in [Loss::Process, Loss::Strict] {
+                    crash_case(base, sync, by_msync, at, loss);
+                }
+                for seed in 0..seeds {
+                    crash_case(base, sync, by_msync, at, Loss::Random(seed * 64 + n as u64));
+                }
             }
         }
     }
 }
 
-/// The matrix at two page sizes, after every data range, with many random power losses.
+/// The matrix: every crash point x {process crash, strict power loss, random power loss with
+/// three seeds} x {`Durable`, `NoSync`} x {data synced by `fdatasync`, by one `msync`} reopens
+/// to exactly the allowed state, which checks and survives a crash right after the reopen.
+#[test]
+fn every_crash_point_recovers_the_state_the_protocol_allows() {
+    matrix(&base(4096), 3);
+}
+
+/// The matrix at two page sizes, with many random power losses.
 #[test]
 #[ignore = "heavy: run with --release"]
 fn every_crash_point_recovers_the_state_the_protocol_allows_heavy() {
     for page_size in [4096, 16384] {
-        let base = base(page_size);
-        for sync in [SyncMode::Durable, SyncMode::NoSync] {
-            let ranges = dry_run(&base, sync);
-            for (n, at) in points(ranges, true).into_iter().enumerate() {
-                for loss in [Loss::Process, Loss::Strict] {
-                    crash_case(&base, sync, at, loss);
-                }
-                for seed in 0..40 {
-                    crash_case(&base, sync, at, Loss::Random(seed * 64 + n as u64));
-                }
-            }
-        }
+        matrix(&base(page_size), 40);
     }
 }
 
-/// A commit that grew the file survives a power loss once it returned: the size sync made the
-/// new length durable before the meta naming it.
+/// A commit that grew the file survives a power loss once it returned, by either data sync: the
+/// `fdatasync` makes the new length durable with the data, and after one `msync` the size sync
+/// does, before the meta naming it.
 #[test]
 fn a_commit_that_grew_the_file_survives_a_power_loss() {
     let base = base(4096);
-    let Case { path, latest, .. } = run_case(&base, SyncMode::Durable, None);
-    disk_model::power_loss(&path);
-    disk_model::untrack(&path);
-    let env = open(&path, SyncMode::Durable);
-    assert_eq!(env.stat().txn_id, base.txn + 1);
-    assert_eq!(newest_state(&env), latest);
+    for by_msync in [false, true] {
+        let Case { path, latest, .. } = run_case(&base, SyncMode::Durable, by_msync, None);
+        disk_model::power_loss(&path);
+        disk_model::untrack(&path);
+        let env = open(&path, SyncMode::Durable);
+        assert_eq!(env.stat().txn_id, base.txn + 1, "by_msync={by_msync}");
+        assert_eq!(newest_state(&env), latest, "by_msync={by_msync}");
+        drop(env);
+        fs::remove_file(&path).expect("remove");
+    }
 }
 
 /// The older durable state stays recoverable until a commit overwrites its meta: a commit
@@ -316,7 +318,7 @@ fn a_commit_that_grew_the_file_survives_a_power_loss() {
 fn the_older_state_stays_recoverable_until_its_meta_is_overwritten() {
     let base = base(4096);
     let Case { path, slot, reused, .. } =
-        run_case(&base, SyncMode::Durable, Some(CrashAt::AfterSizeSync));
+        run_case(&base, SyncMode::Durable, false, Some(CrashAt::AfterSizeSync));
     assert!(reused > 0, "the commit reused pages");
     disk_model::power_loss(&path);
     disk_model::untrack(&path);

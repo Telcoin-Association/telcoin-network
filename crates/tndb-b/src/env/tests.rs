@@ -513,7 +513,8 @@ fn commits_survive_a_power_loss_once_durable() {
 }
 
 /// A commit whose pages are scattered over the file (copies taking pages that earlier commits
-/// freed all over it) syncs its data with one `fdatasync` of the file, and survives a power loss.
+/// freed all over it), so they form more than one range, syncs its data with one `fdatasync` of
+/// the file, and survives a power loss.
 #[test]
 fn a_scattered_commit_is_durable_through_one_fdatasync() {
     let (_dir, path) = temp();
@@ -548,6 +549,49 @@ fn a_scattered_commit_is_durable_through_one_fdatasync() {
     }
     drop(ro);
     env.check().expect("check");
+}
+
+/// A commit of a few pages that form two ranges (pages reused from the free list, and new ones
+/// further on) in a file that did not grow syncs them all by its one `fdatasync`, and survives a
+/// power loss: an `msync` of one of the ranges would lose the other, and no size sync covers it.
+/// Every commit up to the first such one is followed by a power loss and a reopen, so the check
+/// does not depend on which sync step 4 took.
+#[test]
+fn a_commit_of_two_ranges_survives_a_power_loss() {
+    let (_dir, path) = temp();
+    let mut env = Env::open(&path, options(4096, SyncMode::Durable)).expect("open");
+    disk_model::track(&path);
+    let key = |i: u32| i.to_be_bytes();
+    let rows: Vec<([u8; 4], Vec<u8>)> = (0..3000).map(|i| (key(i), vec![1; 150])).collect();
+    let rows: Vec<(&[u8], &[u8])> = rows.iter().map(|(k, v)| (&k[..], &v[..])).collect();
+    put_all(&env, "a", &rows);
+    // One put copies a leaf, the root, the catalog and the free list's records: too few pages
+    // for more than 16 runs, so a commit synced by `fdatasync` is one whose pages form two or
+    // more ranges.
+    let changed = |round: u8| key(u32::from(round) * 37 % 3000);
+    let mut round = 1;
+    loop {
+        round += 1;
+        assert!(round < 50, "no commit's pages formed two ranges in a file that did not grow");
+        let len = env.with_writer(|w| w.file.file_len());
+        put_all(&env, "a", &[(&changed(round), &[round; 150])]);
+        let two_ranges = env.with_writer(|w| w.data_by_file && w.file.file_len() == len);
+        env.crash();
+        disk_model::power_loss(&path);
+        env = open(&path);
+        let ro = env.begin_ro().expect("ro");
+        let a = table(&ro, "a");
+        for r in 2..=round {
+            assert_eq!(val(&ro, &a, &changed(r)), Some(vec![r; 150]), "round {round}: key of {r}");
+        }
+        drop(ro);
+        env.check().expect("check");
+        if two_ranges {
+            break;
+        }
+    }
+    env.crash();
+    disk_model::untrack(&path);
 }
 
 /// Open makes the meta it reads durable: a meta that reached the page cache but not the disk
@@ -764,26 +808,24 @@ fn handles_are_send_and_sync() {
     send_sync::<Table>();
 }
 
-/// Dirty pages merge across gaps of up to 64 clean pages; past 16 runs of adjacent pages, one
-/// `fdatasync` of the file replaces the msyncs.
+/// Dirty pages merge across gaps of up to 64 clean pages: one merged range of at most 16 runs of
+/// adjacent pages is synced by one `msync`, and anything else by one `fdatasync` of the file.
 #[test]
-fn dirty_pages_coalesce_into_few_ranges() {
+fn dirty_pages_form_one_range_or_take_one_fdatasync() {
     let p = 4096;
-    let one = |range: Range<u64>| DataSync::Ranges(vec![range]);
-    assert_eq!(data_sync(&[], p), DataSync::Ranges(Vec::new()));
-    assert_eq!(data_sync(&[2, 3, 4], p), one(2 * p..5 * p));
-    assert_eq!(data_sync(&[2, 67], p), one(2 * p..68 * p), "a gap of 64 merges");
-    let apart = DataSync::Ranges(vec![2 * p..3 * p, 68 * p..69 * p]);
-    assert_eq!(data_sync(&[2, 68], p), apart, "65 does not");
-    let sparse: Vec<u32> = (0..16).map(|i| 2 + i * 100).collect();
-    assert!(matches!(data_sync(&sparse, p), DataSync::Ranges(r) if r.len() == 16));
-    let sparser: Vec<u32> = (0..17).map(|i| 2 + i * 100).collect();
-    assert_eq!(data_sync(&sparser, p), DataSync::File, "17 runs");
-    // Runs that would merge into one range still count one by one.
+    assert_eq!(data_sync(&[], p), DataSync::Nothing);
+    assert_eq!(data_sync(&[7], p), DataSync::Range(7 * p..8 * p));
+    assert_eq!(data_sync(&[2, 3, 4], p), DataSync::Range(2 * p..5 * p));
+    assert_eq!(data_sync(&[2, 67], p), DataSync::Range(2 * p..68 * p), "a gap of 64 merges");
+    assert_eq!(data_sync(&[2, 68], p), DataSync::File, "65 does not: two ranges");
+    let apart: Vec<u32> = (0..3).map(|i| 2 + i * 100).collect();
+    assert_eq!(data_sync(&apart, p), DataSync::File, "three ranges");
+    // Runs that merge into one range still count one by one.
+    let combed: Vec<u32> = (0..16).flat_map(|i| [2 + i * 3, 3 + i * 3]).collect();
+    let one = DataSync::Range(2 * p..49 * p);
+    assert_eq!(data_sync(&combed, p), one, "16 runs one page apart");
     let combed: Vec<u32> = (0..17).map(|i| 2 + i * 2).collect();
     assert_eq!(data_sync(&combed, p), DataSync::File, "17 runs one page apart");
-    let combed: Vec<u32> = (0..16).flat_map(|i| [2 + i * 3, 3 + i * 3]).collect();
-    assert_eq!(data_sync(&combed, p), one(2 * p..49 * p), "16 runs one page apart");
 }
 
 /// A table record a transaction remembers serves only the handle it was resolved for: not a

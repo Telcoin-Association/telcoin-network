@@ -201,8 +201,8 @@ Table ids are unique over the file's life, so a dropped and re-created table get
 | 1 | Write each changed table's root into the catalog (in name order), then save the free list (see below). |
 | 2 | Build meta M in memory: txn L+1, both roots, the page count. |
 | 3 | Stamp the CRC of every page the transaction created (they become "stamped by this writer"). |
-| 4 | `msync(MS_SYNC)` the dirty pages. Runs separated by at most 64 clean pages (`MERGE_GAP`) are coalesced, and each range is one msync call. If the pages form more than 16 runs of adjacent pages (`MAX_RANGES`), one `fdatasync` of the file replaces the msyncs (`data_sync`). |
-| 5 | If the file grew since the last sync, run `fdatasync_file` so its size is durable. |
+| 4 | Sync the dirty pages (`data_sync`). Runs separated by at most 64 clean pages (`MERGE_GAP`) merge into one range. If the pages form exactly one range, in at most 16 runs of adjacent pages (`MAX_RUNS`), one `msync(MS_SYNC)` of that range; otherwise one `fdatasync` of the file (do-not-flag item 10 says why). |
+| 5 | If the file grew since the last sync, run `fdatasync_file` so its size is durable. After step 4's `fdatasync` this has nothing left to do: that call made the size durable too. |
 | 6 | Copy meta M into the slot holding the lower txn (an invalid slot first; on a tie, slot 1), msync that one page, then record M's txn as the slot's. |
 | 7 | Publish: swap in the new snapshot, push `(M, Weak<Snapshot>)` on the reader queue. |
 
@@ -501,8 +501,8 @@ A write transaction's read cursor sees its own uncommitted changes.
   Only `F_FULLFSYNC` does, at 10–20 ms each, and the crate deliberately never issues it. Never
   call `File::sync_all`; use `sys::fsync_file` and `fdatasync_file`. A process or kernel crash
   loses nothing committed durably, but a power loss can, exactly as with MDBX's `Durable` mode on
-  macOS. Production durability is a Linux property, where `msync(MS_SYNC)` takes the file
-  system's fsync path.
+  macOS. Production durability is a Linux property, where `msync(MS_SYNC)` and `fdatasync` each
+  take the file system's fsync path, drive-cache flush included.
 - **A page size below the OS page puts both metas in one OS page** (4 KiB pages on Apple
   Silicon's 16 KiB OS pages, or on a 64 KiB-page arm64 or ppc64 Linux kernel). A mapped write
   dirties the whole OS page and an msync rounds down to it, so every meta msync also writes back
@@ -578,11 +578,26 @@ M1 is the crash-safe core. These limits are known; the first four are M2 items:
    it while holding an `RwTxn` deadlocks. This is documented, not guarded.
 9. **No leaf merging in M1** (see above). Pages are reused through the free list, so there is no
    compaction pass.
-10. **Each dirty range is its own msync**, so a crash test can stop the commit between ranges.
-    Past 16 runs of adjacent pages, one `fdatasync` of the file replaces them. That bounds the
-    syscalls, and it is much cheaper for a commit scattered over the file (see the benchmark).
+10. **Step 4 is one sync: an `msync` of one range, or one `fdatasync` of the file.** Dirty pages
+    that merge into one range (gaps of at most 64 clean pages, at most 16 runs) take one `msync`
+    of it; any other set takes one `fdatasync`. Why:
+    - On Linux every `msync(MS_SYNC)` runs the file system's fsync path, drive-cache flush
+      included, so a commit of k ranges synced range by range pays k flushes, and one `fdatasync`
+      pays one. In an A B B A comparison of 3-put commits on one table (i7-1360P, NVMe, ext4,
+      three runs), one `fdatasync` beat the per-range msyncs in all 18 cells: median 904–920 µs
+      → 515–516 µs at 4 KiB, 703–931 µs → 532–568 µs at 16 KiB, with lower p99s and totals.
+    - On macOS one `fdatasync` was also cheaper per small commit (75–84 µs vs 114–130 µs median).
+      But for a one-range bulk commit (a 1M-entry load) it cost 15–26% more than one `msync` of
+      the range plus the growth sync: sequential commit 34.9 → 43.9 ms, random 87.9 → 106.1 ms at
+      4 KiB, confirmed by a repeat. One range keeps the `msync`, which is one flush on Linux too.
+    - Past 16 runs, even runs that merge into one range take the `fdatasync`: on macOS an msync
+      of a scattered range is about three times slower (see the benchmark).
+
     `fdatasync` also writes any other dirty page of the file. At a commit, that can only be a page
-    of an aborted transaction, which is a free page, so writing it is harmless.
+    of an aborted transaction, which is a free page, so writing it is harmless. A crash test can no
+    longer stop a commit between data ranges, because there is one sync; partial writeback of the
+    dirty pages is still modelled by `power_loss_random`, and the crash matrix runs every point
+    on both paths (`Writer::data_by_msync`).
 11. **The writer trusts its own pages by provenance** (`write::descend_write`):
     `trusted(child) = trusted(parent) && is_private(child)`, and the root is trusted only when its
     holder's flag says this txn's writer wrote it. Trusted pages skip the per-fetch checks,
@@ -630,9 +645,9 @@ The default tests are small and fast, because CI runs nextest in debug. The heav
 | `tree/write.rs`, `tree/read.rs` | copy-on-write put and delete against a `BTreeMap` model over random batches (with a coverage gate on split and delete shapes); a failed allocation leaves the tree identical; split reservation for long separators; append fill; collapse and unlink; `clear` and the free walk refuse damaged or stale pointers; fetch checks, stale copies, redirected children and misrouted pointers are `Corrupt`; provenance trust: a trusted path skips the range checks, a private page named by a page this writer did not write (a stamped forged cell, an untrusted root handle, a collapse) is refused, as is a copied cell naming a page this txn allocates later, while a child whose txn wrapped stays live |
 | `tree/cursor/tests.rs` | random moves against a sorted model on the detached cursor and the public `Cursor`, over many tree shapes and page sizes, committed and uncommitted; the ends of empty and single-entry trees; leaf crossings; seeks; damage under a cursor latches; `RwCursor` writes against a model |
 | `meta.rs`, `catalog.rs`, `latch.rs`, `alloc.rs`, `file.rs`, `sys.rs`, `crc.rs`, `page_set.rs`, `disk_model.rs` | codecs, slot choice, the latch's first-cause rule, allocator abort, growth and remap, sync wrappers, the power-loss model |
-| `env/tests.rs` | open steps (create at every page size, leftovers, the lock, a damaged newest meta, damaged roots, short and foreign files, the open fsync), commit and NoSync durability under power loss, a commit of no change, abort, the writer hand-off, readers across commits, range coalescing, the latch (failed msync, damage, oversized entries do not latch), table handles |
+| `env/tests.rs` | open steps (create at every page size, leftovers, the lock, a damaged newest meta, damaged roots, short and foreign files, the open fsync), commit and NoSync durability under power loss, a commit of no change, abort, the writer hand-off, readers across commits, step 4's sync choice (`data_sync`: one range or one `fdatasync`), a scattered commit and a two-range commit under power loss, the latch (failed msync, damage, oversized entries do not latch), table handles |
 | `freelist/tests.rs` | the record codec; reuse after two durable commits or two NoSync syncs, held back by a live reader; damaged records never handed out; abort returns the records taken; dropped and cleared tables' pages reused; steady churn keeps the file bounded; the save settles within three rounds, including a record count that shrinks mid-save; `check` reports damage, leaks and double uses; exact accounting in a random workload |
-| `tests/crash.rs` | every crash point (`CrashAt`) × {process crash, strict power loss, random power loss with three seeds} × {`Durable`, `NoSync`}: the reopen recovers exactly the allowed state, which passes `check` and survives a crash right after the reopen; a commit that grew the file survives a power loss; the older state stays recoverable until its meta is overwritten |
+| `tests/crash.rs` | every crash point (`CrashAt`) × {process crash, strict power loss, random power loss with three seeds} × {`Durable`, `NoSync`} × {step 4 by `fdatasync`, by one `msync`}: the reopen recovers exactly the allowed state, which passes `check` and survives a crash right after the reopen; a commit that grew the file survives a power loss by either data sync; the older state stays recoverable until its meta is overwritten |
 | `tests/damage.rs` | each kind of damage at rest fails the open closed (the file unchanged) or, once opened, is met by reads, copy-on-write, free-list loads and `check` as `Corrupt`, which latches; nothing panics |
 | `tests/multi_model.rs` | a random multi-table workload with crashes against a model |
 | `tests/path_cache.rs` | random multi-table workloads (puts, deletes, clears, drops, commits, aborts, readers held) on a cached and an uncached environment: the same outcomes and byte-identical files after every commit; a cached leaf reused by another table in the same txn is not written; an aborted transaction's cache never reaches the next |
@@ -654,6 +669,18 @@ cargo test --release -p tndb-b tndb_b_vs_mdbx -- --ignored --nocapture --test-th
 cargo test --release -p tndb-b tndb_b_vs_mdbx -- --ignored --nocapture --test-threads 1
 ```
 
+**Run tip (Linux):** pin the run to performance cores, and put the temp dir on a real disk (never
+a tmpfs), scoped to the one command. On a CPU with P and E cores (`lscpu -e` shows which CPUs are
+which), for example:
+
+```text
+TMPDIR=/path/on/disk taskset -c 0-7 cargo test --release -p tndb-b tndb_b_vs_mdbx -- --ignored --nocapture --test-threads 1
+```
+
+In the Linux runs below, MDBX's forward scan took either about 32 ms or about 42.7 ms per run,
+while tndb-b's never split. The cause is unconfirmed; the core type the run landed on is one
+guess.
+
 Environment variables select what runs (the `bench.rs` module docs have the details):
 
 - `TNDB_B_BENCH_N`: entries per bulk table (default 1,000,000).
@@ -673,24 +700,36 @@ The columns:
   configuration there.
 
 **Like-for-like pairs:** `t4d` with `md4` everywhere, and `t16d` with `md` on Apple Silicon,
-where the OS page is 16 KiB. `t4n` has no MDBX twin: on macOS `SafeNoSync` still msyncs every
-commit (see below).
+where the OS page is 16 KiB. On x86_64 `t16d` has no MDBX twin. `t4n` has none either: a
+`SafeNoSync` commit costs far more than a tndb-b NoSync commit on both platforms (see
+[NoSync against SafeNoSync](#nosync-against-safenosync)).
 
 A bulk row's "put loop" runs from `begin` to just before `commit`, and its "commit" is the rest.
 The API rows time the put loop into a fresh environment: tndb-b's `RwTxn::append`,
 `RwCursor::put` and `RwCursor::append` against MDBX's `put` with `WriteFlags::APPEND`,
 `Cursor::put`, and `Cursor::put` with `WriteFlags::APPEND`.
 
-The "fdatasync" rows rerun the small-commit workload with commit step 4 done by one `fdatasync`
-of the whole file instead of one msync per range. A test-only switch (`Writer::data_by_fdatasync`)
-selects this for every commit. Production takes the fdatasync path only past 16 runs of adjacent
-dirty pages, which a 3-put commit never reaches. The two modes alternate in blocks of 100
-transactions (A B B A order) on the same table, so neither gains from running second.
+The "fdatasync" rows rerun the small-commit workload with commit step 4 forced to one
+`fdatasync` of the whole file for every commit (a test-only switch, `Writer::data_by_fdatasync`).
+Step 4 picks the `fdatasync` itself whenever the dirty pages form two or more ranges or more
+than 16 runs, so the two modes differ only on one-range commits, which step 4 syncs by one
+`msync`. The two modes alternate in blocks of 100 transactions (A B B A order) on the same
+table, so neither gains from running second. Both runs below were taken before step 4 became one
+sync, when it synced each dirty range by its own `msync` (and took one `fdatasync` past 16 runs);
+there the "fdatasync" rows replaced those msyncs on every commit.
+
+#### macOS run
 
 **Run:** Apple M1 Max, 64 GiB RAM, internal SSD (APFS), macOS (Darwin 24.6), 2026-10-20. Each
 cell is the median of three full runs (each about 45 s). The Mac had background load, and the
 MDBX cells moved by up to 20% between runs (`md` random insert: 779–894 ms), so a difference
-under about 10% is noise. Linux numbers are still to come.
+under about 10% is noise. How step 4 syncs matters mainly to the small-commit rows: a bulk
+commit is one range, synced by one `msync` before and after, and nearly every mixed-row commit
+already took the `fdatasync` past 16 runs. Since step 4 became one sync (do-not-flag item 10),
+the Mac's small-commit median is 73 us at 4K and 89–90 us at 16K (medians of three targeted
+runs, against 114 and 130 us here; the "fdatasync" rows read 72 and 81 us in the same runs), and
+the bulk commits, the mixed row and `clear_table` stayed level (sequential commit 34.5 vs
+34.9 ms, random 85.5 vs 87.9 ms at 4K).
 
 | | `t4d` | `t16d` | `t4n` | `md` | `md4` | `mn` |
 |---|--:|--:|--:|--:|--:|--:|
@@ -742,12 +781,73 @@ put loop from about 367 to 47 ms), the random insert from 1097 to 830 ms, the fo
 38.8 to 27.1 ms, and a seek from 1.3 to 1.1 us. Small commits, the mixed workload and
 `clear_table` stayed level in back-to-back comparisons.
 
-**Where tndb-b loses, and why:**
+#### Linux run
+
+**Run:** Linux x86_64 laptop (i7-1360P, NVMe, ext4), 2026-10-20, three full runs, with the
+per-range msync step 4 that preceded the one-range rule. Each run took 132–163 s.
+
+**CPU-bound rows.** Each cell is the median of the three runs. tndb-b's cells repeated within a
+few percent, and the median drops a few one-run outliers in `mn`. The NoSync bulk totals are
+shown for `t4n` and `mn` only; the durable totals follow the drive (below).
+
+| | `t4d` | `t16d` | `t4n` | `md` | `md4` | `mn` |
+|---|--:|--:|--:|--:|--:|--:|
+| seq: put loop | 53.5 ms | 46.0 ms | 53.6 ms | 115.7 ms | 115.8 ms | 115.8 ms |
+| random: put loop | 512.9 ms | 557.8 ms | 517.4 ms | 544.2 ms | 546.8 ms | 563.3 ms |
+| seq insert 1M, 1 txn (NoSync) | - | - | 60.3 ms | - | - | 116.1 ms |
+| random insert 1M, 1 txn (NoSync) | - | - | 531.3 ms | - | - | 563.8 ms |
+| file size (st_size) | 516.0 MiB | 528.0 MiB | 516.0 MiB | 512.0 MiB | 512.0 MiB | 512.0 MiB |
+| file used (pages × P) | 318.1 MiB | 311.0 MiB | 318.1 MiB | 324.6 MiB | 324.6 MiB | 324.6 MiB |
+| get hit (per op) | 497 ns | 545 ns | 494 ns | 587 ns | 602 ns | 603 ns |
+| get miss (per op) | 505 ns | 569 ns | 504 ns | 619 ns | 626 ns | 632 ns |
+| scan forward 1M | 31.9 ms | 20.8 ms | 31.9 ms | 42.7 ms | 42.5 ms | 35.2 ms |
+| scan reverse 1M | 32.6 ms | 21.2 ms | 32.6 ms | 30.2 ms | 30.3 ms | 30.4 ms |
+| seek + 10 entries (per seek) | 1.1 us | 855 ns | 1.1 us | 1.0 us | 1.0 us | 1.1 us |
+| append put 1M (put loop) | 52.2 ms | 46.0 ms | 52.8 ms | 56.2 ms | 56.2 ms | 55.6 ms |
+| cursor put 1M (put loop) | 55.4 ms | 48.6 ms | 55.7 ms | 48.3 ms | 47.5 ms | 47.2 ms |
+| cursor put APPEND 1M (put loop) | 54.4 ms | 48.2 ms | 54.8 ms | 52.6 ms | 52.9 ms | 52.1 ms |
+
+The MDBX forward-scan medians hide a split: each MDBX column had runs of about 32 ms and runs of
+about 42.7 ms (see the run tip). tndb-b's scans moved by at most 0.2 ms.
+
+**Durable rows.** Each cell is the range (min–max) of the three runs.
+
+| | `t4d` | `t16d` | `md` | `md4` |
+|---|--:|--:|--:|--:|
+| seq: commit | 32.7–119.3 ms | 28.6–127.2 ms | 33.0–143.4 ms | 104.0–170.9 ms |
+| random: commit | 51.9–214.6 ms | 63.0–223.8 ms | 50.2–406.3 ms | 191.7–280.6 ms |
+| small txn (3 puts) median | 904.3–920.2 us | 703.2–931.3 us | 543.6 us–3.5 ms | 3.4 ms (all three) |
+| small txn p99 | 4.9–16.9 ms | 5.6–7.1 ms | 848.6 us–7.0 ms | 3.9–7.3 ms |
+| small txns total (2000) | 2.15–5.45 s | 1.85–4.29 s | 1.13–8.19 s | 5.72–6.48 s |
+| fdatasync: median | 514.5–515.9 us | 531.8–568.1 us | - | - |
+| fdatasync: p99 | 3.4–7.2 ms | 3.5–3.9 ms | - | - |
+| fdatasync: total | 1.21–3.17 s | 1.54–3.38 s | - | - |
+| mixed 100k upd/del (1000/txn) | 7.90–57.80 s | 3.11–10.62 s | 33.33–43.74 s | 3.47–27.54 s |
+| clear_table 1M + commit | 4.3–9.1 ms | 900.8 us–4.0 ms | 1.6–11.6 ms | 1.6–7.2 ms |
+
+**These rows measure the drive's state, not the engine.** On x86_64 `md` and `md4` are the same
+configuration, yet within one run they differed by up to 12.6× (mixed 43.7 s vs 3.5 s;
+sequential commit 33 vs 171 ms). By estimate, each column writes 1–3 GB (two bulk loads, the
+mixed commits and three fresh 1M-entry files), so a later column meets a busier drive. The
+fastest runs are level:
+sequential commit 32.7 ms (`t4d`) vs 33.0 ms (`md`), random commit 51.9 vs 50.2 ms.
+
+**The small-commit A/B rows do not drift with the drive,** because the two modes alternate on one
+table. One `fdatasync` beat the per-range msyncs in all 18 cells (median, p99 and total, at both
+page sizes, in three runs): median 904–920 → 515–516 us at 4K, 703–931 → 532–568 us at 16K. This
+is why step 4 changed. Under the one-range rule, about 3 in 4 small commits have two or more
+ranges and take the `fdatasync` path, so the next Linux run should show a small-commit median
+near the "fdatasync" rows. That is not yet measured.
+
+#### Where tndb-b wins and loses
+
+**On Apple Silicon, where tndb-b loses, and why** (the macOS table):
 
 - **The commit of a bulk load costs more:** 91 ms against MDBX's 61–66 ms after the random
   insert, and 35–37 ms against 30–32 ms after the sequential one. A tndb-b commit stamps a CRC on
-  every page it wrote, msyncs each dirty range, and fsyncs the file's growth; in a profile of the
-  sequential commit, msync took about 77%, CRCs 15% and the growth fsync 8%.
+  every page it wrote, msyncs the dirty pages (one range for a bulk load), and fsyncs the file's
+  growth; in a profile of the sequential commit, msync took about 77%, CRCs 15% and the growth
+  fsync 8%.
 - **Random inserts at 4K:** the put loop takes 801 ms against `md4`'s 683 ms (+17%). Random keys
   rarely land in the cached leaf, so each put descends. MDBX's put loop gets faster at 4K than at
   16K while tndb-b's gets slower, which points at tndb-b's per-page costs: each level of the
@@ -760,48 +860,84 @@ put loop from about 367 to 47 ms), the random insert from 1097 to 830 ms, the fo
   number and txn checks, and a miss checks the leaf against its separators. At 16K reads are level
   with MDBX.
 
-**Where tndb-b wins:**
+**On Apple Silicon, where tndb-b wins:**
 
 - **Sequential loads:** the put loop is 2.3× faster than MDBX's at 16K (47 vs 111 ms) and 1.9×
   at 4K (60 vs 115 ms), because almost every put lands in the cached leaf. A plain put even beats
   MDBX's `APPEND` put (65–69 ms). `RwTxn::append` takes 48–54 ms, and `RwCursor::append` is a
   little faster than MDBX's cursor `APPEND` (51.5 vs 57.9 ms at 16K, 57.8 vs 61.6 ms at 4K).
-- **Small durable commits are about 10× cheaper** (130 us vs 1.3 ms median at 16K, 114 us vs 1.3
-  ms at 4K). tndb-b msyncs only the dirty ranges plus one meta page. MDBX msyncs the whole used
-  span of the map on every commit (about 312 MB here), and on macOS that walk is the cost.
-- Under `SafeNoSync`, MDBX on macOS still issues an `MS_ASYNC` msync of the whole span every commit
-  (`MDBX_MMAP_NEEDS_JOLT` is set off Linux). That makes it slower than its own Durable mode here.
+- **Small durable commits are about 10× cheaper** in the table (130 us vs 1.3 ms median at 16K,
+  114 us vs 1.3 ms at 4K), and more since step 4 became one sync (90 and 73 us; see
+  [Step 4](#step-4-one-msync-or-one-fdatasync)). tndb-b syncs only the pages the commit dirtied,
+  by one `msync` or one `fdatasync`, plus one meta page. MDBX msyncs the whole used span of the
+  map on every commit (about 312 MB here), and on macOS that walk is the cost.
 - **Scans** are 10–17% faster than MDBX's at 16K (27.1 vs 30.2 ms forward, 24.9 vs 30.0 ms
   reverse). At 4K the forward scan beats `md4` (46.6 vs 55.8 ms), and the reverse one is level.
 - **`clear_table`** frees a 1M-entry tree 2–4× faster (569 us vs 2.2 ms at 16K).
 - **The durable mixed workload** matches MDBX or beats it (2.63 vs 3.27 s at 16K, 3.34 vs 4.26 s
   at 4K). MDBX's own cell moved most between runs here (2.72–3.33 s at 16K), so read this row as
   parity.
-- **The mixed workload without syncs** is about 6× faster than MDBX SafeNoSync, on macOS only,
-  and mostly for the reason above: MDBX msyncs the whole span asynchronously on every commit,
-  while a tndb-b NoSync commit does no I/O and its deferred `Env::sync` is not timed. On Linux
-  SafeNoSync does not msync per commit, so this is not an engine win.
 - **File sizes match:** the used pages within 2%, the file lengths within 3%.
 
-**msync per range vs one fdatasync.** On macOS one fdatasync of the whole file is about 35%
-cheaper per small commit than the per-range msyncs (75–84 us vs 114–130 us median). Neither is a
-drive-cache flush on macOS, so this measures only the kernel paths.
+**On Linux x86_64** (the Linux tables; "MDBX" is the median of the six `md` and `md4` runs, the
+same configuration there):
 
-For a large scattered commit the gap is far wider. On macOS an msync writes its range's dirty
-pages one cluster at a time, so its cost follows the dirty pages, not the span. In the mixed row
-at 200k entries, a 1000-update commit dirtied about 835 pages at 16K, in about 620 runs of
-adjacent pages. The 64-page merge gap folded them into 2 ranges spanning the whole file. Their
-msyncs took about 14.6 ms, and one fdatasync took 5.3 ms. Syncing the runs one by one, or with a
-smaller merge gap, cost the same as the merged span. At 4K it was 16.5 ms against 3.7 ms. This is
-why step 4 switches to one `fdatasync` past 16 runs of adjacent pages.
+- **At 4K, tndb-b wins** the sequential put loop by 2.2× (53.5 vs 115.7 ms), the random put loop
+  by 6% (512.9 vs 545.5 ms), `RwTxn::append` by 7% (52.2 vs 56.2 ms), and gets by 16–19% (497 vs
+  589 ns hit, 505 vs 622 ns miss). Small durable commits took 0.90–0.92 ms with per-range
+  msyncs, against 3.4–3.5 ms in 5 of the 6 MDBX runs; the sixth, an `md` run, took 0.54 ms.
+- **At 4K, level:** the forward scan against MDBX's fast runs (31.8–31.9 ms both; its slow runs
+  took about 42.7 ms), and the bulk commits at the fastest runs (above).
+- **At 4K, tndb-b loses** on a plain cursor put (+15%: 55.4 vs 48.2 ms), the reverse scan (+8%:
+  32.6 vs 30.3 ms) and the cursor `APPEND` (+3%: 54.4 vs 52.6 ms). A seek is about level (1.0–1.1
+  vs 1.0 us, at the table's 0.1 us resolution).
+- **At 16K, tndb-b beats MDBX on every CPU row but two:** the random put loop (557.8 vs 545.5 ms,
+  +2%) and the plain cursor put, which is level (48.6 vs 48.2 ms).
+- **4K against 16K:** 16K wins the scans by 35%, a seek by about 20% and the sequential puts by
+  11–14%. 4K wins gets by 9–11% and random puts by 8%.
+- **The Mac's 4K losses do not occur here.** The random put loop (+17% on the Mac) and point
+  reads (+5%) both beat MDBX at 4K, and tndb-b's random put loop is faster at 4K than at 16K, so
+  the per-page explanation above is an Apple Silicon finding.
 
-On Linux the difference should matter more. Each `msync(MS_SYNC)` range runs the file system's
-fsync path, which includes a device cache flush, so a commit with k dirty ranges pays up to k+1
-flushes (the ranges plus the meta). An `fdatasync` of the file plus the meta msync pays two.
-MDBX also pays about two (one whole-span msync plus the meta). A scattered commit already takes
-the fdatasync path.
+#### NoSync against SafeNoSync
 
-**Linux numbers are still to be taken.** They decide whether the 16-run threshold should drop
-(every commit of more than one range syncing by `fdatasync`), or whether step 4 should use
-`sync_file_range` plus one `fdatasync`. Run the same command on the target hardware, with a
-non-tmpfs `TMPDIR` scoped to that command.
+**On macOS**, MDBX under `SafeNoSync` still issues an `MS_ASYNC` msync of the whole span every
+commit (`MDBX_MMAP_NEEDS_JOLT` is set off Linux). That makes its small commits slower than its
+own Durable mode (2.3 vs 1.3 ms median), and it is most of why tndb-b's NoSync mixed workload is
+about 6× faster (256.5 ms vs 1.62 s).
+
+**On Linux**, `mn` took a median of 0.58–3.5 ms per small commit (`t4n` 3.8 us) and 4.3–5.4 s on
+the mixed row (`t4n` 0.25 s). The cause was not investigated.
+
+On both platforms, a tndb-b NoSync commit does no I/O, and its deferred `Env::sync` is not timed.
+
+#### Step 4: one msync or one fdatasync
+
+Step 4 syncs a commit's dirty pages with one call: one `msync` when they merge into one range of
+at most 16 runs, and one `fdatasync` of the file otherwise (do-not-flag item 10). The numbers
+behind the rule:
+
+- **Linux, small commits.** Each `msync(MS_SYNC)` runs the file system's fsync path, drive-cache
+  flush included, so syncing range by range paid one flush per range. In the A/B rows of three
+  runs, one `fdatasync` beat the per-range msyncs in all 18 cells: median 904–920 → 515–516 us
+  at 4K, 703–931 → 532–568 us at 16K, with lower p99s and totals.
+- **macOS, small commits.** One `fdatasync` was about 35% cheaper than the per-range msyncs
+  (75–84 us vs 114–130 us median). Neither is a drive-cache flush on macOS, so this measures only
+  the kernel paths.
+- **macOS, bulk commits.** A 1M-entry load dirties one range. One `fdatasync` of it cost 15–26%
+  more than one `msync` of the range plus the growth sync: sequential commit 34.9 → 43.9 ms,
+  random 87.9 → 106.1 ms at 4K, confirmed by a repeat. So one range keeps the `msync`, which is
+  also a single flush on Linux.
+- **macOS, scattered commits.** An msync writes its range's dirty pages one cluster at a time, so
+  its cost follows the dirty pages, not the span. In the mixed row at 200k entries, a 1000-update
+  commit dirtied about 835 pages at 16K, in about 620 runs, which the 64-page merge gap folded
+  into 2 ranges spanning the file. Their msyncs took about 14.6 ms, and one `fdatasync` 5.3 ms
+  (16.5 vs 3.7 ms at 4K). Syncing the runs one by one, or a smaller merge gap, cost the same as
+  the merged span. So past 16 runs even one range takes the `fdatasync`.
+
+**After the change**, on the Mac, the small-commit median is 73.2 us at 4K and 90.2 us at 16K (it
+was 114 and 130 us), and the bulk commits, the mixed row and `clear_table` are level. On Linux the
+small commits are not yet measured under the new rule (see the Linux run).
+
+**Open:** at 16K on the Mac, a one-range small commit synced by `msync` is still slower than by
+`fdatasync` (median 89–90 vs 81–82 us, p99 158–165 vs 96–97 us). At 4K the two match.

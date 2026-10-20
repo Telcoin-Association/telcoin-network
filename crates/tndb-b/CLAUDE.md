@@ -20,7 +20,7 @@ more than half tests. Grep for the symbol and read with an offset.
 
 | file | role |
 |---|---|
-| `env.rs` | `Env`: open and recovery (steps 1–9), the writer hand-off (`Mutex` + `Condvar`), snapshots, the reader queue and `reuse_gate`, `make_durable` (commit steps 4–6; `data_sync` picks per-range msync or one fdatasync), `sync`, the test-only `CrashAt` hook |
+| `env.rs` | `Env`: open and recovery (steps 1–9), the writer hand-off (`Mutex` + `Condvar`), snapshots, the reader queue and `reuse_gate`, `make_durable` (commit steps 4–6; `data_sync` picks one msync when the dirty pages form one range, else one fdatasync), `sync`, the test-only `CrashAt` hook |
 | `txn.rs` | `RoTxn`, `RwTxn` (`Work::commit` = steps 1–3 and 7), `ReadTxn`, `Table` resolution (`StaleTable`), `RwCursor`; each `Working` table record holds its `write::PathCache`, used by `RwTxn::put` and `RwTxn::append` (`put_entry`), which also places an `RwCursor` from the cached path after a put that did not split or did an append split (which refills the cache by a second, trusted descent of the new path; any other split re-seeks) |
 | `meta.rs` | meta record codec, `choose_meta`, `slot_to_write` |
 | `page.rs` | slotted page codec, `Geometry` (limits), `validate`, splits through the writer's reused `SplitBuf` (plan from a copy of the page, then `write_right` into the zeroed new page and `write_left` over the old one, each half laid out by `place_cells`; one page borrowed at a time; a leaf's append split leaves the left page untouched; `init_leaf_zeroed`, `init_root` and `write_right` skip the zero-fill of a page `alloc` returned zeroed, yet write every header, trailer, cell and slot byte themselves, so only the free gap relies on the zeros), the one-pass searches (`cmp_keys`, `leaf_find`, `branch_route`; each probe prefetches the two cells the next probe may read, `prefetch_next_probes`, through `prefetch`'s `asm!` hint: one of the crate's five `unsafe` places, listed in the README's do-not-flag item 2), the parsed views (`View`, `LeafView`, `BranchView`: one header check, many cell reads), `LeafMut` (a leaf put's read and change behind one header parse); the hot accessors (`hdr`, `hdr_of`, the cell reads) are `#[inline]`, with their errors built out of line by the `#[cold]` constructors `hdr_error`, `kind_error`, `cell_error`, `leaf_cell_error`, `branch_cell_error` and `reserve_error` (`hdr_error` re-runs the header checks in their original order, so every message is unchanged) |
@@ -32,7 +32,7 @@ more than half tests. Grep for the symbol and read with an offset.
 | `catalog.rs` | `TableRecord` and catalog ops |
 | `check.rs` | `Env::check`: structure plus exact page accounting |
 | `latch.rs` | `Latch` (first cause wins, `fail` vs `fail_damaged`), `UnwindLatch` |
-| `file.rs` | `PageFile` (reserved mapping, growth, msync, poison), `MapView` |
+| `file.rs` | `PageFile` (reserved mapping, growth, `msync_range`/`msync_page`, `fdatasync_all`, the size sync, poison), `MapView` |
 | `sys.rs` | `fsync_file`, `fdatasync_file`, `fsync_directory`, `allocate_range`, `flock_exclusive` |
 | `crc.rs` | a copy of `crates/storage/src/archive/crc.rs`; keep it a copy |
 | `page_set.rs` | a copy of `crates/storage/src/archive/page_set.rs` plus a touched-word list, so `clear` and `drain` cost the words an insert touched, not the file; keep the rest a copy |
@@ -46,9 +46,9 @@ more than half tests. Grep for the symbol and read with an offset.
   `sys::fsync_file` and `sys::fdatasync_file`, which are a plain fsync on macOS.
 - **Grow the file with `sys::allocate_range`** (real blocks), so a full disk is an `io::Error`,
   not a `SIGBUS`.
-- **Every sync wrapper reports to `disk_model` in tests.** `msync` calls `flushed_range`, and
-  `fsync`/`fdatasync` call `flushed_all`. A new sync path that skips the model makes the crash
-  tests lie.
+- **Every sync wrapper reports to `disk_model` in tests.** `msync` (behind `msync_range` and
+  `msync_page`) calls `flushed_range`, and `fsync`/`fdatasync` (behind `fdatasync_all` and the
+  size sync) call `flushed_all`. A new sync path that skips the model makes the crash tests lie.
 - **Never panic on bytes from disk.** Page accessors bounds-check and return `Corrupt`. A page
   read from the file must pass `page::validate` before its first change, which copy-on-write
   does.
@@ -68,10 +68,11 @@ more than half tests. Grep for the symbol and read with an offset.
   numbers. Never cite review ids, agent or task ids, or "the plan".
 - **Every public item has docs and every public type is `Debug`** (`missing_docs` is on). A
   dev-dependency the lib does not use needs `#[cfg(test)] use x as _;` in `lib.rs`.
-- **Test-only knobs** (`CrashAt`, `data_by_fdatasync`, `max_save_rounds`, `fail_next_msync`,
-  `no_path_cache`) are `#[cfg(test)]` fields and functions. Production behaviour never depends
-  on them. The test-only counters (`COW_VERIFIES`, `CACHED_PUTS`, `RANGE_CHECKS` in
-  `tree/write.rs`) exist only in debug test builds, `#[cfg(all(test, debug_assertions))]`: the
+- **Test-only knobs** (`CrashAt`, `data_by_fdatasync`, `data_by_msync`, `max_save_rounds`,
+  `fail_next_msync`, `no_path_cache`) are `#[cfg(test)]` fields and functions. Production
+  behaviour never depends on them. The test-only counters (`COW_VERIFIES`, `CACHED_PUTS`,
+  `RANGE_CHECKS` in `tree/write.rs`) exist only in debug test builds,
+  `#[cfg(all(test, debug_assertions))]`: the
   release benchmark is compiled with the test configuration, so a counter on a timed path would
   show in its numbers. A test that reads one is gated the same way or accepts zero in release.
   A knob on a timed path costs at most a branch on a field.
@@ -113,8 +114,10 @@ point it at a tmpfs.
    - before `Env::sync`, `env.with_writer(|w| w.crash_at = Some(at))`.
 
    `CrashAt` names a point of the commit protocol: `BeforeSave`, `AfterSave`, `AfterStamp`,
-   `DataMsync(k)`, `AfterSizeSync`, `AfterMetaCopy`, `AfterMetaMsync`. The commit stops there with
-   an error, as a process death would: no further I/O, and the environment latches.
+   `AfterDataSync`, `AfterSizeSync`, `AfterMetaCopy`, `AfterMetaMsync`. The commit stops there with
+   an error, as a process death would: no further I/O, and the environment latches. Step 4 takes
+   one `msync` or one `fdatasync` (`data_sync`); to run a crash point on the path a commit would
+   not take, set `data_by_msync` or `data_by_fdatasync` on the writer, as `tests/crash.rs` does.
 3. **Drop the environment as a crash would.** Call `env.crash()`, which skips the NoSync final
    sync (hold no other handle or transaction).
 4. **Choose the loss:**

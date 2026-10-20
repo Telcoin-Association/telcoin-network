@@ -22,9 +22,11 @@
 //!
 //! ## Durability
 //!
-//! [`PageFile::msync_ranges`] / [`PageFile::msync_page`] are `msync(MS_SYNC)`; `msync` does not
+//! [`PageFile::msync_range`] / [`PageFile::msync_page`] are `msync(MS_SYNC)`; `msync` does not
 //! persist a size extension, so a growth marks the size unsynced and
-//! [`PageFile::sync_size_if_grown`] fdatasyncs it once. Any failed sync or growth poisons the file:
+//! [`PageFile::sync_size_if_grown`] fdatasyncs it once. [`PageFile::fdatasync_all`] writes every
+//! dirty page of the mapping and the size in one call, so after it the size sync has nothing left
+//! to do. Any failed sync or growth poisons the file:
 //! every later write or sync returns [`Error::Failed`] and is never retried (a retried `msync`
 //! after a writeback error can spuriously succeed on Linux errseq, laundering lost data). Reads
 //! continue.
@@ -296,14 +298,11 @@ impl PageFile {
         }
     }
 
-    /// `msync(MS_SYNC)` each byte range (its start rounded down to an OS page). A failure poisons
-    /// the file, and no range is retried.
-    pub(crate) fn msync_ranges(&self, ranges: &[Range<u64>]) -> Result<()> {
+    /// `msync(MS_SYNC)` the byte range `range` (its start rounded down to an OS page). A failure
+    /// poisons the file, and the range is never retried.
+    pub(crate) fn msync_range(&self, range: Range<u64>) -> Result<()> {
         self.check_poison()?;
-        for range in ranges {
-            self.msync(range.start, range.end).inspect_err(|_| self.poison())?;
-        }
-        Ok(())
+        self.msync(range.start, range.end).inspect_err(|_| self.poison())
     }
 
     /// `msync(MS_SYNC)` page `pgno` of `page_size` bytes (a meta page). A failure poisons the file.
@@ -484,10 +483,10 @@ mod tests {
         assert_eq!(view.slice(0, 1), None, "a dropped file's view maps nothing");
     }
 
-    /// `msync_ranges` flushes exactly the OS pages its ranges cover: after a power loss those
+    /// `msync_range` flushes exactly the OS pages its range covers: after a power loss those
     /// pages hold the new bytes and the others the old ones.
     #[test]
-    fn msync_ranges_flushes_only_the_synced_pages() {
+    fn msync_range_flushes_only_the_synced_pages() {
         let tmp = TempDir::with_prefix("tndb_b_file_msync").expect("temp dir");
         let path = tmp.path().join("db");
         let page = os_page();
@@ -500,7 +499,8 @@ mod tests {
         }
         let p = page as u64;
         // Page 1 whole, and a few bytes inside page 3 (which flush its whole OS page).
-        pf.msync_ranges(&[p..2 * p, 3 * p + 10..3 * p + 20]).expect("msync");
+        pf.msync_range(p..2 * p).expect("msync");
+        pf.msync_range(3 * p + 10..3 * p + 20).expect("msync");
         disk_model::power_loss(&path);
         let bytes = std::fs::read(&path).expect("read");
         disk_model::untrack(&path);
@@ -522,10 +522,10 @@ mod tests {
         pf.ensure_len(8192).expect("grow");
         pf.page_mut(0, 4096).expect("page").fill(1);
         pf.fail_next_msync();
-        let ranges = [0..4096, 4096..8192];
-        assert!(matches!(pf.msync_ranges(&ranges), Err(Error::Io(_))));
+        assert!(matches!(pf.msync_range(0..8192), Err(Error::Io(_))));
         assert!(pf.is_poisoned());
-        assert!(matches!(pf.msync_ranges(&ranges), Err(Error::Failed(_))), "never retried");
+        assert!(matches!(pf.msync_range(0..8192), Err(Error::Failed(_))), "never retried");
+        assert!(matches!(pf.fdatasync_all(), Err(Error::Failed(_))));
         assert!(matches!(pf.msync_page(0, 4096), Err(Error::Failed(_))));
         assert!(matches!(pf.sync_size_if_grown(), Err(Error::Failed(_))));
         assert!(matches!(pf.ensure_len(16 << 20), Err(Error::Failed(_))));

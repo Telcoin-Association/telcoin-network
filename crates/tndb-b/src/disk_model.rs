@@ -247,8 +247,7 @@ mod tests {
             file.ensure_len((u64::from(p) + 1) * page as u64).expect("grow");
             file.page_mut(p, page).expect("page").fill(fill);
             let start = u64::from(p) * page as u64;
-            let range = start..start + page as u64;
-            file.msync_ranges(std::slice::from_ref(&range)).expect("msync");
+            file.msync_range(start..start + page as u64).expect("msync");
             if sync {
                 file.sync_size_if_grown().expect("size sync");
             }
