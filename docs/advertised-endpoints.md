@@ -160,20 +160,26 @@ tn_network_committee_unresolved_members
 For a conservative rollout gate, use the following query for **each expected worker network**.
 Replace `worker-0` with the configured network being checked and `telcoin-observers` with the scrape
 job selecting the observer fleet. Every expected observer must be present in that job's `up` series.
-The result is one only for full current coverage with matching denominators and observations no more
-than three sampling intervals old; missing observations return zero. Require one for every expected
-observer/worker pair. Do not sum worker numerators or infer the expected worker inventory from the
-series that happen to exist. Include tenant/cluster labels in joins if they are part of target identity.
+The result is one only for full current coverage with matching denominators and an observation no
+more than three monitor intervals (15 s) old at the time of its scrape; missing observations return
+zero. The freshness term measures the age at scrape time, `timestamp()` of the sample minus the
+observed timestamp, so the Prometheus scrape interval does not enter the window and the query
+assumes no scrape interval. Clock offset between the node and Prometheus shifts the measured age by
+the offset. Keep both clocks under NTP: an offset above 15 s reads zero on every evaluation, and a
+stalled monitor on a node whose clock runs ahead by `d` seconds reads one for up to 15 + `d` seconds.
+Require one for every expected observer/worker pair. Do not sum worker numerators or infer the
+expected worker inventory from the series that happen to exist. Include tenant/cluster labels in
+joins if they are part of target identity.
 
 ```promql
 (
   (tn_worker_submit_usable_members{job="telcoin-observers",network="worker-0"}
     == bool tn_worker_submit_expected_members{job="telcoin-observers",network="worker-0"})
   * (tn_worker_submit_expected_members{job="telcoin-observers",network="worker-0"} > bool 0)
-  * (tn_worker_submit_observed_timestamp_seconds{job="telcoin-observers",network="worker-0"}
-      > bool (time() - 15))
-  * (tn_worker_submit_observed_timestamp_seconds{job="telcoin-observers",network="worker-0"}
-      <= bool time())
+  * (abs(timestamp(
+        tn_worker_submit_observed_timestamp_seconds{job="telcoin-observers",network="worker-0"})
+      - tn_worker_submit_observed_timestamp_seconds{job="telcoin-observers",network="worker-0"})
+      <= bool 15)
   * on(job,instance,network)
     (tn_worker_submit_expected_members{job="telcoin-observers",network="worker-0"}
       == bool on(job,instance,network)
