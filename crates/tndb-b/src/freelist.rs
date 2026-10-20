@@ -176,8 +176,10 @@ pub(crate) fn encode_pages(pages: &[u32]) -> Vec<u8> {
 /// them. Loading stays stopped until the next transaction begins.
 pub(crate) fn save(writer: &mut Writer, free: &mut TreeRoot) -> Result<u32> {
     writer.alloc.stop_loading();
+    // The free root's provenance ([`write::put_sized`]): the committed root is published.
+    let mut trusted = false;
     for key in writer.alloc.take_consumed() {
-        if !write::delete(writer, free, &key.encode())? {
+        if !write::delete(writer, free, &mut trusted, &key.encode())? {
             return Err(Error::Failed(format!("free list: the record {key:?} taken has vanished")));
         }
     }
@@ -202,7 +204,7 @@ pub(crate) fn save(writer: &mut Writer, free: &mut TreeRoot) -> Result<u32> {
                 continue;
             }
             let key = RecordKey { txn, seq: seq as u32 };
-            let replaced = write::put(writer, free, &key.encode(), value)?;
+            let replaced = write::put(writer, free, &mut trusted, &key.encode(), value)?;
             if replaced != (seq < written.len()) {
                 return Err(Error::Corrupt(format!(
                     "free list: a record {key:?} of the committing transaction already exists"

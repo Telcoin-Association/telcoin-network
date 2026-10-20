@@ -16,7 +16,9 @@ use crate::{
     meta::Meta,
     tree::{
         cursor::{Cursor, TreeCursor},
-        read, write, TreeRoot,
+        read,
+        write::{self, PutKind},
+        TreeRoot,
     },
 };
 
@@ -38,6 +40,13 @@ impl Table {
     /// The table's name.
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    /// `self == other`, with the shortcut of a clone: handles that share the name's allocation
+    /// skip the name compare.
+    #[inline]
+    fn is(&self, other: &Self) -> bool {
+        self.id == other.id && (Arc::ptr_eq(&self.name, &other.name) || self.name == other.name)
     }
 
     /// Test-only: the table's id.
@@ -216,6 +225,9 @@ struct Work {
     base: Meta,
     /// The working catalog.
     catalog: TreeRoot,
+    /// The working catalog root's provenance ([`write::put_sized`]): true only while it names a
+    /// page this transaction's writer wrote for it.
+    catalog_trusted: bool,
     /// The id the next table created gets.
     next_table_id: u32,
     /// The tables resolved by a write, with their working records (those whose tree changed
@@ -231,8 +243,19 @@ struct Working {
     table: Table,
     /// Its working record.
     record: TableRecord,
+    /// Its root's provenance ([`write::put_sized`]): true only while the record's root names a
+    /// page this transaction's writer wrote for this table.
+    trusted: bool,
+    /// Its write-path cache ([`write::put_cached`]).
+    cache: write::PathCache,
     /// True once its tree changed: the catalog gets the record at commit.
     changed: bool,
+}
+
+impl Working {
+    fn new(table: Table, record: TableRecord) -> Self {
+        Self { table, record, trusted: false, cache: write::PathCache::default(), changed: false }
+    }
 }
 
 impl Work {
@@ -244,10 +267,10 @@ impl Work {
         self.writer.as_deref_mut().expect("a live write transaction holds the writer")
     }
 
-    /// The writer and the working catalog, borrowed together.
-    fn catalog_mut(&mut self) -> (&mut Writer, &mut TreeRoot) {
+    /// The writer and the working catalog with its provenance, borrowed together.
+    fn catalog_mut(&mut self) -> (&mut Writer, &mut TreeRoot, &mut bool) {
         let writer = self.writer.as_deref_mut().expect("a live write transaction holds the writer");
-        (writer, &mut self.catalog)
+        (writer, &mut self.catalog, &mut self.catalog_trusted)
     }
 
     /// Table `name`'s working record, if it exists.
@@ -267,20 +290,36 @@ impl Work {
     }
 
     /// The index in [`Self::tables`] of `table`'s working record (see [`resolve`]), added if
-    /// it is not there yet.
+    /// it is not there yet. Every table write starts here, so the scan is inline and the add is
+    /// out of line.
+    #[inline]
     fn working(&mut self, table: &Table) -> Result<usize> {
-        if let Some(i) = self.tables.iter().position(|w| w.table == *table) {
-            return Ok(i);
+        match self.tables.iter().position(|w| w.table.is(table)) {
+            Some(i) => Ok(i),
+            None => self.add_working(table),
         }
+    }
+
+    /// [`Self::working`] for a table without a working record yet.
+    #[inline(never)]
+    fn add_working(&mut self, table: &Table) -> Result<usize> {
         let record = self.record(table)?;
-        self.tables.push(Working { table: table.clone(), record, changed: false });
+        self.tables.push(Working::new(table.clone(), record));
         Ok(self.tables.len() - 1)
     }
 
-    /// Record the changed tree of the table at `i` in [`Self::tables`].
-    fn set_record(&mut self, i: usize, record: TableRecord) {
+    /// The writer and the table at `i` in [`Self::tables`], borrowed together.
+    fn writer_and_table(&mut self, i: usize) -> (&mut Writer, &mut Working) {
+        let writer = self.writer.as_deref_mut().expect("a live write transaction holds the writer");
+        (writer, &mut self.tables[i])
+    }
+
+    /// Record the changed tree of the table at `i` in [`Self::tables`], with its root's
+    /// provenance.
+    fn set_record(&mut self, i: usize, record: TableRecord, trusted: bool) {
         let w = &mut self.tables[i];
         w.record = record;
+        w.trusted = trusted;
         w.changed = true;
         self.changed = true;
     }
@@ -294,13 +333,13 @@ impl Work {
             .filter_map(|w| w.changed.then_some((w.table.name, w.record)))
             .collect();
         dirty.sort_unstable_by(|a, b| a.0.cmp(&b.0));
-        let Self { writer, txn, base, catalog, next_table_id, .. } = self;
+        let Self { writer, txn, base, catalog, catalog_trusted, next_table_id, .. } = self;
         let (txn, base, next_table_id) = (*txn, *base, *next_table_id);
         let writer = writer.as_deref_mut().expect("a live write transaction holds the writer");
         #[cfg(test)]
         writer.crash_point(CrashAt::BeforeSave)?;
         for (name, record) in &dirty {
-            catalog::put(writer, catalog, name, record)?;
+            catalog::put(writer, catalog, catalog_trusted, name, record)?;
         }
         let mut free = base.free;
         let _rounds = freelist::save(writer, &mut free)?;
@@ -341,6 +380,7 @@ impl RwTxn {
                 txn: base.txn + 1,
                 base,
                 catalog: base.catalog,
+                catalog_trusted: false,
                 next_table_id: base.next_table_id,
                 tables: Vec::new(),
                 changed: false,
@@ -380,11 +420,11 @@ impl RwTxn {
                 .checked_add(1)
                 .ok_or_else(|| Error::Failed("every table id has been used".to_string()))?;
             let record = TableRecord::new(id, work.txn);
-            let (writer, catalog) = work.catalog_mut();
-            catalog::put(writer, catalog, name, &record)?;
+            let (writer, catalog, trusted) = work.catalog_mut();
+            catalog::put(writer, catalog, trusted, name, &record)?;
             work.changed = true;
             let table = Table::new(id, name);
-            work.tables.push(Working { table: table.clone(), record, changed: false });
+            work.tables.push(Working::new(table.clone(), record));
             Ok(table)
         })
     }
@@ -395,8 +435,8 @@ impl RwTxn {
         self.write(|work| {
             let record = work.record(&table)?;
             write::free_subtree(work.writer_mut(), &record.root)?;
-            let (writer, catalog) = work.catalog_mut();
-            if !catalog::delete(writer, catalog, table.name())? {
+            let (writer, catalog, trusted) = work.catalog_mut();
+            if !catalog::delete(writer, catalog, trusted, table.name())? {
                 return Err(Error::Failed(format!(
                     "table {:?} vanished from the catalog",
                     table.name()
@@ -417,7 +457,7 @@ impl RwTxn {
                 return Ok(());
             }
             write::clear(work.writer_mut(), &mut record.root)?;
-            work.set_record(i, record);
+            work.set_record(i, record, false);
             Ok(())
         })
     }
@@ -426,13 +466,56 @@ impl RwTxn {
     /// size's limits is refused first ([`Error::KeyTooLarge`], [`Error::ValueTooLarge`]; see
     /// `Env::max_key_len` and `Env::max_value_len`), changing nothing.
     pub fn put(&mut self, table: &Table, key: &[u8], value: &[u8]) -> Result<()> {
+        self.put_entry(table, key, value, PutKind::Upsert, None).map(drop)
+    }
+
+    /// Store `value` under `key` in `table` as its new last entry: `key` must sort strictly after
+    /// the table's last key (an empty table takes any key), else [`Error::AppendOutOfOrder`]. Like
+    /// MDBX's `MDBX_APPEND`, it is the fast way to load keys in ascending order: an append into
+    /// the table's cached rightmost leaf neither descends nor searches. The table's path cache
+    /// holds the leaf of its last put or append in this transaction (after an append split, the
+    /// new right leaf) until a page is allocated or freed; any other append descends. A refused
+    /// append ([`Error::AppendOutOfOrder`], [`Error::KeyTooLarge`], [`Error::ValueTooLarge`])
+    /// changes nothing and does not fail the environment.
+    pub fn append(&mut self, table: &Table, key: &[u8], value: &[u8]) -> Result<()> {
+        self.put_entry(table, key, value, PutKind::Append, None).map(drop)
+    }
+
+    /// [`Self::put`] or [`Self::append`] (`kind`). With a `cursor` (an [`RwCursor`]'s path and
+    /// root), the root becomes the table's new one, and when the put leaves the table's path
+    /// cache naming the entry's leaf ([`write::Placed::slot`]), the path is placed at the entry.
+    /// Returns whether it was placed.
+    fn put_entry(
+        &mut self,
+        table: &Table,
+        key: &[u8],
+        value: &[u8],
+        kind: PutKind,
+        cursor: Option<(&mut TreeCursor, &mut TreeRoot)>,
+    ) -> Result<bool> {
         self.inner.geometry.check_entry(key.len(), value.len())?;
         self.write(|work| {
             let i = work.working(table)?;
-            let mut record = work.tables[i].record;
-            write::put(work.writer_mut(), &mut record.root, key, value)?;
-            work.set_record(i, record);
-            Ok(())
+            let (writer, w) = work.writer_and_table(i);
+            let (mut record, mut trusted) = (w.record, w.trusted);
+            // Test-only: an emptied cache per put, so every put descends.
+            #[cfg(test)]
+            if writer.no_path_cache {
+                w.cache.forget();
+            }
+            let cache = &mut w.cache;
+            let placed =
+                write::put_cached(writer, &mut record.root, &mut trusted, cache, key, value, kind)?;
+            let mut at = false;
+            if let Some((tree, root)) = cursor {
+                *root = record.root;
+                if let Some(slot) = placed.slot {
+                    tree.place(cache.branches(), cache.leaf(), slot);
+                    at = true;
+                }
+            }
+            work.set_record(i, record, trusted);
+            Ok(at)
         })
     }
 
@@ -440,18 +523,18 @@ impl RwTxn {
     pub fn delete(&mut self, table: &Table, key: &[u8]) -> Result<bool> {
         self.write(|work| {
             let i = work.working(table)?;
-            let mut record = work.tables[i].record;
-            let found = write::delete(work.writer_mut(), &mut record.root, key)?;
+            let (mut record, mut trusted) = (work.tables[i].record, work.tables[i].trusted);
+            let found = write::delete(work.writer_mut(), &mut record.root, &mut trusted, key)?;
             if found {
-                work.set_record(i, record);
+                work.set_record(i, record, trusted);
             }
             Ok(found)
         })
     }
 
     /// A new, unset cursor over `table` that can also write: the moves of a [`Cursor`] over this
-    /// transaction's working state, plus [`RwCursor::put`] and [`RwCursor::delete_current`]. It
-    /// holds the transaction until it is dropped.
+    /// transaction's working state, plus [`RwCursor::put`], [`RwCursor::append`] and
+    /// [`RwCursor::delete_current`]. It holds the transaction until it is dropped.
     pub fn cursor_mut(&mut self, table: &Table) -> Result<RwCursor<'_>> {
         let root = self.read(|work| Ok(work.record(table)?.root))?;
         Ok(RwCursor {
@@ -531,11 +614,13 @@ impl ReadTxn for RwTxn {
 /// [`RwTxn::cursor_mut`]). Its moves are a [`Cursor`]'s, over the transaction's working state;
 /// the entries it returns are borrowed until its next call.
 ///
-/// [`Self::put`] writes through the transaction and leaves the cursor at the entry written.
-/// [`Self::delete_current`] removes the entry the cursor is at and leaves it between that entry's
-/// neighbours: [`Self::next`] then returns the entry that followed the deleted one, [`Self::prev`]
-/// the entry before it, and [`Self::current`] nothing. Both find their place again by key after
-/// changing the tree. Errors are the transaction's (a failure latches the environment).
+/// [`Self::put`] and [`Self::append`] write through the transaction and leave the cursor at the
+/// entry written. [`Self::delete_current`] removes the entry the cursor is at and leaves it
+/// between that entry's neighbours: [`Self::next`] then returns the entry that followed the
+/// deleted one, [`Self::prev`] the entry before it, and [`Self::current`] nothing. A put that did
+/// not split its leaf, or did an append split, places the cursor from the path the table's path
+/// cache then holds for the entry; any other split, and a delete, find the place again by key.
+/// Errors are the transaction's (a failure latches the environment).
 pub struct RwCursor<'t> {
     txn: &'t mut RwTxn,
     table: Table,
@@ -631,7 +716,24 @@ impl RwCursor<'_> {
     /// entry ([`Error::KeyTooLarge`], [`Error::ValueTooLarge`]) changes nothing, the cursor
     /// included.
     pub fn put(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
-        self.txn.put(&self.table, key, value)?;
+        self.put_entry(key, value, PutKind::Upsert)
+    }
+
+    /// Store `value` under `key` as the table's new last entry (as [`RwTxn::append`] does) and
+    /// move to that entry. A refused append ([`Error::AppendOutOfOrder`], [`Error::KeyTooLarge`],
+    /// [`Error::ValueTooLarge`]) changes nothing, the cursor included.
+    pub fn append(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
+        self.put_entry(key, value, PutKind::Append)
+    }
+
+    /// [`Self::put`] or [`Self::append`] (`kind`): placed from the path the put left in the
+    /// table's path cache, else found again by key.
+    fn put_entry(&mut self, key: &[u8], value: &[u8], kind: PutKind) -> Result<()> {
+        let Self { txn, table, root, tree, deleted } = self;
+        if txn.put_entry(table, key, value, kind, Some((tree, root)))? {
+            *deleted = false;
+            return Ok(());
+        }
         self.reseek(key, true)
     }
 

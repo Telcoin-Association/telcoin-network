@@ -33,6 +33,10 @@ pub enum Error {
         /// The largest value this page size allows with the given key.
         max: usize,
     },
+    /// An append ([`crate::RwTxn::append`], [`crate::RwCursor::append`]) of a key that does not
+    /// sort strictly after the table's last key. It is refused before anything changes.
+    #[error("tndb-b: append of a key that does not sort after the table's last key")]
+    AppendOutOfOrder,
     /// No table with this name exists.
     #[error("tndb-b: table {0:?} not found")]
     TableNotFound(String),

@@ -61,7 +61,11 @@ use crate::{
     page::{self, Geometry, Kind},
     page_set::PageSet,
     sys,
-    tree::{read::checked_page, PageRead, PageWrite, TreeRoot},
+    tree::{
+        read::{checked_child, checked_page},
+        write::Scratch,
+        PageRead, PageWrite, TreeRoot,
+    },
     txn::{RoTxn, RwTxn},
 };
 
@@ -164,6 +168,13 @@ impl PageRead for Snapshot {
     fn page(&self, pgno: u32) -> Result<&[u8]> {
         let size = self.geometry.page_size();
         checked_page(pgno, self.meta.page_count, self.meta.txn, false, |p| {
+            self.view.slice(u64::from(p) * size as u64, size)
+        })
+    }
+
+    fn child(&self, pgno: u32, want_txn: u32) -> Result<&[u8]> {
+        let size = self.geometry.page_size();
+        checked_child(pgno, want_txn, self.meta.page_count, self.meta.txn, false, |p| {
             self.view.slice(u64::from(p) * size as u64, size)
         })
     }
@@ -271,6 +282,8 @@ pub(crate) struct Writer {
     readers: VecDeque<(u64, Weak<Snapshot>)>,
     /// The queue's length after its last full pass (see [`Self::prune_readers`]).
     readers_kept: usize,
+    /// The tree writes' reused buffers ([`PageWrite::take_scratch`]).
+    scratch: Scratch,
     /// Test-only: the most rounds a commit's free-list save took.
     #[cfg(test)]
     pub(crate) max_save_rounds: u32,
@@ -289,6 +302,10 @@ pub(crate) struct Writer {
     /// `fdatasync` of the whole file for every commit, not only those [`data_sync`] picks it for.
     #[cfg(test)]
     pub(crate) data_by_fdatasync: bool,
+    /// Test-only: table puts take the descent every time: each put empties its table's
+    /// write-path cache (`write::PathCache`) first, so none is used.
+    #[cfg(test)]
+    pub(crate) no_path_cache: bool,
 }
 
 /// Test-only: a point of the commit protocol (see the env module docs) at which
@@ -499,6 +516,18 @@ impl PageRead for Writer {
             |p| self.file.page(p, size),
         )
     }
+
+    fn child(&self, pgno: u32, want_txn: u32) -> Result<&[u8]> {
+        let size = self.geometry.page_size();
+        checked_child(
+            pgno,
+            want_txn,
+            self.alloc.page_count(),
+            self.alloc.txn(),
+            self.alloc.is_private(pgno),
+            |p| self.file.page(p, size),
+        )
+    }
 }
 
 impl PageWrite for Writer {
@@ -514,6 +543,16 @@ impl PageWrite for Writer {
         self.alloc.is_stamped(pgno)
     }
 
+    fn private_page(&self, pgno: u32) -> Result<&[u8]> {
+        self.file
+            .page(pgno, self.geometry.page_size())
+            .ok_or_else(|| Error::Corrupt(format!("private page {pgno} is not mapped")))
+    }
+
+    fn epoch(&self) -> u64 {
+        self.alloc.epoch()
+    }
+
     fn alloc(&mut self) -> Result<u32> {
         if self.alloc.wants_refill() {
             self.refill()?;
@@ -525,9 +564,10 @@ impl PageWrite for Writer {
         Ok(p)
     }
 
+    #[inline]
     fn page_mut(&mut self, pgno: u32) -> Result<&mut [u8]> {
         if !self.alloc.is_private(pgno) {
-            return Err(Error::Failed(format!("page {pgno} is not private: copy it first")));
+            return Err(not_private(pgno));
         }
         self.file.page_mut(pgno, self.geometry.page_size())
     }
@@ -535,6 +575,21 @@ impl PageWrite for Writer {
     fn free(&mut self, pgno: u32) {
         self.alloc.free(pgno);
     }
+
+    fn take_scratch(&mut self) -> Scratch {
+        std::mem::take(&mut self.scratch)
+    }
+
+    fn put_scratch(&mut self, scratch: Scratch) {
+        self.scratch = scratch;
+    }
+}
+
+/// [`Writer::page_mut`]'s error for a page that is not private.
+#[cold]
+#[inline(never)]
+fn not_private(pgno: u32) -> Error {
+    Error::Failed(format!("page {pgno} is not private: copy it first"))
 }
 
 /// How step 4 syncs dirty `pages` (ascending). Pages forming at most [`MAX_RANGES`] runs of
@@ -608,6 +663,7 @@ impl Env {
             unsynced: PageSet::default(),
             readers: VecDeque::from([(meta.txn, Arc::downgrade(&snapshot))]),
             readers_kept: 1,
+            scratch: Scratch::default(),
             #[cfg(test)]
             max_save_rounds: 0,
             #[cfg(test)]
@@ -618,6 +674,8 @@ impl Env {
             data_by_file: false,
             #[cfg(test)]
             data_by_fdatasync: false,
+            #[cfg(test)]
+            no_path_cache: false,
         };
         Ok(Env {
             inner: Arc::new(EnvInner {

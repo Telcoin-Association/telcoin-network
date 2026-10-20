@@ -275,6 +275,17 @@ fn damage_at_rest_fails_closed_or_latches() {
             Box::new(|p| flip(p, u64::from(at.catalog_leaf) * P + P - 16)),
         ),
         ("zeroed leaf", Stage::Get, Box::new(|p| write_page(p, at.t_leaf, &vec![0; P as usize]))),
+        // A torn write that left a leaf's header intact and its last sector zero (trailer
+        // included): only the zero-CRC check of a page fetch tells, since a zeroed cell parses.
+        (
+            "zeroed tail sector",
+            Stage::Get,
+            Box::new(|p| {
+                let mut page = read_page(p, at.t_leaf);
+                page[P as usize - 512..].fill(0);
+                write_page(p, at.t_leaf, &page);
+            }),
+        ),
         // A branch pointing at the next leaf (written by the same txn: only the range check can
         // tell), and at an older copy of its own leaf (same range: only the txn check can tell);
         // both pass their CRCs and name themselves in their headers.
@@ -383,6 +394,44 @@ fn damage_at_rest_fails_closed_or_latches() {
             true
         });
         fs::remove_file(&path).expect("remove");
+    }
+}
+
+/// A restamped branch whose cell names a real leaf of another part of `t` (under the next
+/// level-two branch), written by the txn the cell names, so the identity check passes: a cursor
+/// over a snapshot meets it only by crossing into it, forward and backward, and must find the
+/// leaf's keys outside the range its ancestors' separators give it. The crossing is `Corrupt` and
+/// latches, never a scan that returns another part's entries out of order.
+#[test]
+fn a_crossing_into_a_redirected_leaf_is_corrupt() {
+    let fx = fixture();
+    let (branch, cell, target) = {
+        let env = open(&fx.path, SyncMode::Durable);
+        let level2 = children(&env, tree(&env, "t").root);
+        let (first, next) = (children(&env, level2[0].0), children(&env, level2[1].0));
+        let (cell, target) = (1..first.len())
+            .find_map(|k| next[1..].iter().find(|c| c.1 == first[k].1).map(|c| (k, c.0)))
+            .expect("a leaf of the next branch written by the txn of a later cell");
+        (level2[0].0, cell, target)
+    };
+    restamped(&fx.path, branch, |b| set_child(b, cell, target));
+    for forward in [true, false] {
+        let env = open(&fx.path, SyncMode::Durable);
+        let ro = env.begin_ro().expect("ro");
+        let table = ro.open_table("t").expect("open").expect("t");
+        let mut cursor = ro.cursor(&table).expect("cursor");
+        let mut seen = 0;
+        let err = loop {
+            match if forward { cursor.next() } else { cursor.prev() } {
+                Ok(Some(_)) => seen += 1,
+                Ok(None) => panic!("forward {forward}: the scan ended after {seen} entries"),
+                Err(e) => break e,
+            }
+        };
+        assert!(matches!(err, Error::Corrupt(_)), "forward {forward}: {err}");
+        assert!(seen > 0, "forward {forward}: met at a crossing, not the first descent");
+        drop(ro);
+        assert!(env.failure().is_some(), "forward {forward}: the damage latched");
     }
 }
 

@@ -26,6 +26,34 @@ pub(crate) fn checked_page<'a>(
     private: bool,
     slice: impl FnOnce(u32) -> Option<&'a [u8]>,
 ) -> Result<&'a [u8]> {
+    checked(pgno, None, page_count, snapshot_txn, private, slice)
+}
+
+/// [`checked_page`] for a page reached through a pointer that names it as `(pgno, want_txn)` (a
+/// branch cell's `child` and `child_txn`, or a root's): after those checks, the low 32 bits of
+/// the header's txn must equal `want_txn`, so a pointer to a stale copy or redirected to another
+/// page is [`Error::Corrupt`]. The header's page number and txn are read once for every check.
+pub(crate) fn checked_child<'a>(
+    pgno: u32,
+    want_txn: u32,
+    page_count: u32,
+    snapshot_txn: u64,
+    private: bool,
+    slice: impl FnOnce(u32) -> Option<&'a [u8]>,
+) -> Result<&'a [u8]> {
+    checked(pgno, Some(want_txn), page_count, snapshot_txn, private, slice)
+}
+
+/// The checks of [`checked_page`] and, with `want_txn`, [`checked_child`], in that order.
+#[inline(always)]
+fn checked<'a>(
+    pgno: u32,
+    want_txn: Option<u32>,
+    page_count: u32,
+    snapshot_txn: u64,
+    private: bool,
+    slice: impl FnOnce(u32) -> Option<&'a [u8]>,
+) -> Result<&'a [u8]> {
     if pgno < 2 || pgno >= page_count {
         return Err(Error::Corrupt(format!(
             "page {pgno} is not a tree page of a file of {page_count} pages"
@@ -36,17 +64,32 @@ pub(crate) fn checked_page<'a>(
     if !private && crc::crc_is_zero(page) {
         return Err(Error::Corrupt(format!("published page {pgno} was never stamped (zero CRC)")));
     }
-    let header = page::pgno(page);
+    let (header, txn) = (page::pgno(page), page::txn(page));
     if header != pgno {
         return Err(Error::Corrupt(format!("page {pgno} holds page {header}")));
     }
-    let txn = page::txn(page);
     if txn > snapshot_txn {
         return Err(Error::Corrupt(format!(
             "page {pgno} was written by txn {txn}, after the reading snapshot's txn {snapshot_txn}"
         )));
     }
+    if let Some(want_txn) = want_txn {
+        check_identity(pgno, txn, want_txn)?;
+    }
     Ok(page)
+}
+
+/// The identity check of a page reached through a pointer naming `(pgno, want_txn)` whose header
+/// holds `pgno` and `txn`: the low 32 bits of `txn` must be `want_txn`.
+#[inline]
+pub(crate) fn check_identity(pgno: u32, txn: u64, want_txn: u32) -> Result<()> {
+    if txn as u32 != want_txn {
+        return Err(Error::Corrupt(format!(
+            "page {pgno} (txn {txn}) is not the copy its parent names (txn {want_txn}): a \
+             redirected or stale pointer"
+        )));
+    }
+    Ok(())
 }
 
 /// The leaf a [`descend`] reached, with the key range `[lo, hi)` its ancestors' separators give
@@ -89,14 +132,7 @@ pub(crate) fn descend<'s, S: PageRead + ?Sized>(
     let (mut pgno, mut want_txn) = (root.root, root.root_txn);
     let (mut lo, mut hi): (Option<&'s [u8]>, Option<&'s [u8]>) = (None, None);
     for depth in 1..=root.height {
-        let page = store.page(pgno)?;
-        let txn = page::txn(page);
-        if page::pgno(page) != pgno || txn as u32 != want_txn {
-            return Err(Error::Corrupt(format!(
-                "page {pgno} (txn {txn}) is not the copy its parent names (txn {want_txn}): a \
-                 redirected or stale pointer"
-            )));
-        }
+        let page = store.child(pgno, want_txn)?;
         let at_leaf_level = depth == root.height;
         let kind = page::kind(page)?;
         if (kind == Kind::Leaf) != at_leaf_level {
@@ -183,7 +219,7 @@ mod tests {
     use super::*;
     use crate::tree::{
         test_harness::{walk_tree, MemStore},
-        write::put,
+        write::plain::put,
         PageWrite,
     };
 

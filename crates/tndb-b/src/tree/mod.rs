@@ -114,6 +114,15 @@ pub(crate) trait PageRead {
     /// `pgno`, and the header's txn no later than the reading snapshot. Damage is
     /// [`Error::Corrupt`].
     fn page(&self, pgno: u32) -> Result<&[u8]>;
+
+    /// Page `pgno` reached through a pointer that names it with `want_txn` (a branch cell's
+    /// `child_txn`, or a root's `root_txn`): the checks of [`Self::page`], then the identity check
+    /// of [`read::checked_child`]. A store that can read the header once for both overrides it.
+    fn child(&self, pgno: u32, want_txn: u32) -> Result<&[u8]> {
+        let page = self.page(pgno)?;
+        read::check_identity(pgno, crate::page::txn(page), want_txn)?;
+        Ok(page)
+    }
 }
 
 /// The writer's page store: pages private to the writing transaction (created by it, reachable
@@ -129,6 +138,17 @@ pub(crate) trait PageWrite: PageRead {
     /// were built (and checked) here: copy-on-write does not re-verify it.
     fn is_stamped(&self, pgno: u32) -> bool;
 
+    /// Private page `pgno`'s bytes for a trusted descent (see [`write`]): the caller checked
+    /// [`Self::is_private`], so the page is one this transaction allocated, inside the file; only
+    /// the mapping is checked ([`Error::Corrupt`] if it fails), none of [`read::checked_page`]'s
+    /// checks.
+    fn private_page(&self, pgno: u32) -> Result<&[u8]>;
+
+    /// The allocator's epoch (`Allocator::epoch`): unchanged exactly while no page was
+    /// allocated or freed, no transaction began or aborted and no commit stamped the private
+    /// pages, so while every tree keeps its shape and separators.
+    fn epoch(&self) -> u64;
+
     /// A new private page, all zeros. A failure (e.g. the file cannot grow) changes nothing.
     fn alloc(&mut self) -> Result<u32>;
 
@@ -139,6 +159,13 @@ pub(crate) trait PageWrite: PageRead {
     /// Page `pgno` left the tree: a published page is freed once no reader or durable meta can
     /// reach it; a private one is reusable at once.
     fn free(&mut self, pgno: u32);
+
+    /// The writer's reused buffers ([`write::Scratch`]), taken for one write that copies or splits
+    /// pages and handed back with [`Self::put_scratch`].
+    fn take_scratch(&mut self) -> write::Scratch;
+
+    /// Hand back the buffers [`Self::take_scratch`] took.
+    fn put_scratch(&mut self, scratch: write::Scratch);
 }
 
 #[cfg(test)]

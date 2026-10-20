@@ -46,6 +46,8 @@ pub(crate) struct Allocator {
     /// True while an empty pool may be refilled from the free list: until no record passes the
     /// reuse gate, or the commit saves the list.
     loading: bool,
+    /// The writer-wide epoch a table's write-path cache is valid in (see [`Self::epoch`]).
+    epoch: u64,
     /// Test-only: fail the allocation after this many more succeed.
     #[cfg(test)]
     pub(crate) fail_allocs_after: Option<u64>,
@@ -72,6 +74,7 @@ impl Allocator {
             consumed: Vec::new(),
             loaded: PageSet::default(),
             loading: true,
+            epoch: 1,
             #[cfg(test)]
             fail_allocs_after: None,
             #[cfg(test)]
@@ -89,6 +92,20 @@ impl Allocator {
     /// The transaction's page count: pages `0..page_count` are allocated.
     pub(crate) fn page_count(&self) -> u32 {
         self.next_pgno
+    }
+
+    /// The writer-wide epoch: it changes at every allocation and free, whenever the private set
+    /// empties (commit, abort) and when a transaction begins, and never otherwise; it is never 0.
+    /// Every change to a tree's shape or separators allocates or frees a page, so a write-path
+    /// cache filled in this epoch still names the tree's pages and bounds while the epoch is
+    /// unchanged (`write::PathCache`).
+    pub(crate) fn epoch(&self) -> u64 {
+        self.epoch
+    }
+
+    /// A new epoch (see [`Self::epoch`]).
+    fn bump_epoch(&mut self) {
+        self.epoch += 1;
     }
 
     /// True if the transaction created page `p` and still holds it.
@@ -176,6 +193,7 @@ impl Allocator {
     /// `grow(new_page_count)` must first make room. The caller zero-fills the page. A failure
     /// changes nothing.
     pub(crate) fn allocate(&mut self, grow: impl FnOnce(u32) -> Result<()>) -> Result<u32> {
+        self.bump_epoch();
         #[cfg(test)]
         if let Some(left) = self.fail_allocs_after.as_mut() {
             if *left == 0 {
@@ -202,6 +220,7 @@ impl Allocator {
     /// Page `p` left the transaction's trees: a private page goes back to `pool` at once (no one
     /// else ever saw it), a published one to `freed`.
     pub(crate) fn free(&mut self, p: u32) {
+        self.bump_epoch();
         if self.private.contains(p) {
             self.private.remove(p);
             self.pool.push(p);
@@ -213,6 +232,7 @@ impl Allocator {
     /// At commit: every private page, ascending, now recorded as stamped (the caller stamps their
     /// CRCs); the private set is left empty.
     pub(crate) fn stamp_private(&mut self) -> Vec<u32> {
+        self.bump_epoch();
         let pages: Vec<u32> = self.private.drain().map(|p| p as u32).collect();
         for &p in &pages {
             self.stamped.insert(p);
@@ -230,6 +250,7 @@ impl Allocator {
     /// set; the free list's save emptied the pool and the freed pages).
     pub(crate) fn begin_txn(&mut self, txn: u64) {
         debug_assert!(self.freed.is_empty(), "freed pages left unsaved");
+        self.bump_epoch();
         self.txn = txn;
         self.base = (self.pool.clone(), self.next_pgno);
         self.reset_loading();
@@ -249,6 +270,7 @@ impl Allocator {
     /// the pool was unstamped then and is free again). The free records it took stay in the free
     /// tree, which it did not change.
     pub(crate) fn abort(&mut self) {
+        self.bump_epoch();
         self.private.clear();
         self.freed.clear();
         self.pool.clone_from(&self.base.0);
@@ -266,6 +288,38 @@ impl Allocator {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The epoch moves at every allocation and free, at the commit's stamp, and when a transaction
+    /// begins or aborts, and at nothing else: a write-path cache (`write::PathCache`) filled in
+    /// one transaction never matches in the next.
+    #[test]
+    fn the_epoch_moves_at_every_page_and_transaction_change() {
+        let mut a = Allocator::new(5, 2);
+        let mut seen = vec![a.epoch()];
+        let mut step = |a: &Allocator, what: &str| {
+            assert!(!seen.contains(&a.epoch()), "{what}: the epoch did not move");
+            seen.push(a.epoch());
+        };
+        let p = a.allocate(|_| Ok(())).expect("alloc");
+        step(&a, "allocate");
+        a.free(p);
+        step(&a, "free");
+        a.allocate(|_| Ok(())).expect("alloc");
+        step(&a, "allocate from the pool");
+        a.abort();
+        step(&a, "abort");
+        a.allocate(|_| Ok(())).expect("alloc");
+        step(&a, "allocate");
+        let _ = a.stamp_private();
+        step(&a, "stamp_private");
+        a.saved();
+        let e = a.epoch();
+        let _ = (a.reusable(), a.is_private(p), a.wants_refill(), a.page_count());
+        assert_eq!(a.epoch(), e, "reading the allocator keeps the epoch");
+        a.begin_txn(6);
+        step(&a, "begin_txn");
+        assert_ne!(a.epoch(), 0, "0 is never an epoch: an empty cache never matches");
+    }
 
     /// The end of the file grows one page per allocation, private pages come back through the
     /// pool, published ones go to `freed`, and a reused page stops counting as stamped.

@@ -17,10 +17,12 @@ use crate::{
     CheckReport, ReadTxn, RwTxn, Table,
 };
 
+mod append;
 mod concurrency;
 mod crash;
 mod damage;
 mod multi_model;
+mod path_cache;
 
 /// Every table's rows by name: one committed state of a file.
 type State = BTreeMap<String, Rows>;

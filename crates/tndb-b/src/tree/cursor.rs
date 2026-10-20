@@ -108,6 +108,18 @@ impl TreeCursor {
         })
     }
 
+    /// Place the cursor at entry `slot` of `leaf`, below `branches` (root first, as `(pgno, child
+    /// index taken)`), without reading a page: the caller is the writer that just put that entry
+    /// there, on that path of its own pages, so a descent for the entry's key would take exactly
+    /// this path.
+    pub(crate) fn place(&mut self, branches: &[(u32, usize)], leaf: u32, slot: usize) {
+        let depth = branches.len() + 1;
+        self.path[..branches.len()].copy_from_slice(branches);
+        self.path[branches.len()] = (leaf, slot);
+        self.depth = depth;
+        self.state = State::At;
+    }
+
     /// Move to the first entry (after the end of an empty tree).
     pub(crate) fn first<'s, S: PageRead + ?Sized>(
         &mut self,
@@ -359,14 +371,7 @@ impl TreeCursor {
                     root.height
                 )));
             }
-            let page = store.page(pgno)?;
-            let txn = page::txn(page);
-            if page::pgno(page) != pgno || txn as u32 != want_txn {
-                return Err(Error::Corrupt(format!(
-                    "page {pgno} (txn {txn}) is not the copy its parent names (txn {want_txn}): a \
-                     redirected or stale pointer"
-                )));
-            }
+            let page = store.child(pgno, want_txn)?;
             let at_leaf_level = depth as u32 == root.height;
             let kind = page::kind(page)?;
             if (kind == Kind::Leaf) != at_leaf_level {

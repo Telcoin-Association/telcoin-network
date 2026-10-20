@@ -43,14 +43,15 @@ impl Latch {
 
     /// Latch the failure `error` stands for, if it is one: damage ([`Error::Corrupt`]) through
     /// [`Self::fail_damaged`]; an I/O error or a broken invariant ([`Error::Io`],
-    /// [`Error::Failed`]) through [`Self::fail`]. Validation errors (an entry over the limits, a
-    /// table error) change nothing and do not latch.
+    /// [`Error::Failed`]) through [`Self::fail`]. Validation errors (an entry over the limits, an
+    /// append out of order, a table error) change nothing and do not latch.
     pub(crate) fn latch_error(&self, error: &Error) {
         match error {
             Error::Corrupt(cause) => self.fail_damaged(cause.clone()),
             Error::Io(_) | Error::Failed(_) => self.fail(error.to_string()),
             Error::KeyTooLarge { .. }
             | Error::ValueTooLarge { .. }
+            | Error::AppendOutOfOrder
             | Error::TableNotFound(_)
             | Error::StaleTable(_)
             | Error::InvalidTableName
@@ -62,16 +63,26 @@ impl Latch {
     }
 
     /// True once anything has failed.
+    #[inline]
     pub(crate) fn is_failed(&self) -> bool {
         self.failed.load(Ordering::Acquire)
     }
 
-    /// `Err(Failed(first cause))` once anything has failed.
+    /// `Err(Failed(first cause))` once anything has failed. Every write checks it first, so the
+    /// error is built out of line.
+    #[inline]
     pub(crate) fn check(&self) -> Result<()> {
         if !self.is_failed() {
             return Ok(());
         }
-        Err(Error::Failed(self.failure().unwrap_or_default()))
+        Err(self.failed_error())
+    }
+
+    /// [`Self::check`]'s error.
+    #[cold]
+    #[inline(never)]
+    fn failed_error(&self) -> Error {
+        Error::Failed(self.failure().unwrap_or_default())
     }
 
     /// The first failure's cause, if anything has failed.
@@ -103,6 +114,7 @@ mod tests {
         assert!(!latch.is_failed() && latch.check().is_ok() && latch.failure().is_none());
         latch.latch_error(&Error::KeyTooLarge { len: 2, max: 1 });
         latch.latch_error(&Error::StaleTable("t".to_string()));
+        latch.latch_error(&Error::AppendOutOfOrder);
         assert!(!latch.is_failed(), "validation errors change nothing");
 
         latch.latch_error(&Error::Corrupt("page 7 holds page 9".to_string()));

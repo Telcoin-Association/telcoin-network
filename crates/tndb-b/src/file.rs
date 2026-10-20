@@ -272,15 +272,28 @@ impl PageFile {
     /// The tree layer upholds the rule that makes this sound: the writer mutates only its private
     /// pages (pages it allocated in this transaction, which no reader's snapshot reaches), so no
     /// reader ever reads bytes being written.
+    #[inline]
     pub(crate) fn page_mut(&mut self, pgno: u32, page_size: usize) -> Result<&mut [u8]> {
-        self.check_poison()?;
-        let start = self.page_offset(pgno, page_size).ok_or_else(|| {
-            Error::Failed(format!("page file: page {pgno} lies past the end of the file"))
-        })?;
+        let start = match self.page_offset(pgno, page_size) {
+            Some(start) if !self.is_poisoned() => start,
+            _ => return Err(self.page_mut_error(pgno)),
+        };
         // SAFETY: the page lies within the file and so within the live mapping, `&mut self` makes
         // this the only writer and the only borrow through `self`, and no reader reaches the page
         // (see above).
         Ok(unsafe { std::slice::from_raw_parts_mut(self.map.as_mut_ptr().add(start), page_size) })
+    }
+
+    /// [`Self::page_mut`]'s error: the poison first, else the page past the end.
+    #[cold]
+    #[inline(never)]
+    fn page_mut_error(&self, pgno: u32) -> Error {
+        match self.check_poison() {
+            Err(e) => e,
+            Ok(()) => {
+                Error::Failed(format!("page file: page {pgno} lies past the end of the file"))
+            }
+        }
     }
 
     /// `msync(MS_SYNC)` each byte range (its start rounded down to an OS page). A failure poisons

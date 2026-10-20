@@ -3,7 +3,11 @@
 
 use std::collections::HashSet;
 
-use super::{read::checked_page, PageRead, PageWrite, TreeRoot};
+use super::{
+    read::{checked_child, checked_page},
+    write::Scratch,
+    PageRead, PageWrite, TreeRoot,
+};
 use crate::{
     alloc::Allocator,
     crc::{self, CrcState},
@@ -64,6 +68,8 @@ pub(crate) struct MemStore {
     /// The pool and page count at the start of the writing transaction, which
     /// [`Self::abort_like`] returns to.
     base: (Vec<u32>, u32),
+    /// The writer's reused buffers ([`PageWrite::take_scratch`]).
+    scratch: Scratch,
 }
 
 impl MemStore {
@@ -76,6 +82,7 @@ impl MemStore {
             alloc: Allocator::new(1, 2),
             retired: Vec::new(),
             base: (Vec::new(), 2),
+            scratch: Scratch::default(),
         }
     }
 
@@ -213,6 +220,17 @@ impl PageRead for MemStore {
             |p| self.pages.get(p as usize).map(Vec::as_slice),
         )
     }
+
+    fn child(&self, pgno: u32, want_txn: u32) -> Result<&[u8]> {
+        checked_child(
+            pgno,
+            want_txn,
+            self.alloc.page_count(),
+            self.alloc.txn(),
+            self.alloc.is_private(pgno),
+            |p| self.pages.get(p as usize).map(Vec::as_slice),
+        )
+    }
 }
 
 impl PageWrite for MemStore {
@@ -226,6 +244,17 @@ impl PageWrite for MemStore {
 
     fn is_stamped(&self, pgno: u32) -> bool {
         self.alloc.is_stamped(pgno)
+    }
+
+    fn private_page(&self, pgno: u32) -> Result<&[u8]> {
+        self.pages
+            .get(pgno as usize)
+            .map(Vec::as_slice)
+            .ok_or_else(|| Error::Corrupt(format!("private page {pgno} is not stored")))
+    }
+
+    fn epoch(&self) -> u64 {
+        self.alloc.epoch()
     }
 
     fn alloc(&mut self) -> Result<u32> {
@@ -250,6 +279,14 @@ impl PageWrite for MemStore {
     fn free(&mut self, pgno: u32) {
         self.alloc.free(pgno);
     }
+
+    fn take_scratch(&mut self) -> Scratch {
+        std::mem::take(&mut self.scratch)
+    }
+
+    fn put_scratch(&mut self, scratch: Scratch) {
+        self.scratch = scratch;
+    }
 }
 
 /// A reader's snapshot of a [`MemStore`] (see [`MemStore::reader`]).
@@ -270,6 +307,12 @@ impl PageRead for ReadView<'_> {
 
     fn page(&self, pgno: u32) -> Result<&[u8]> {
         checked_page(pgno, self.store.alloc.page_count(), self.txn, false, |p| {
+            self.store.pages.get(p as usize).map(Vec::as_slice)
+        })
+    }
+
+    fn child(&self, pgno: u32, want_txn: u32) -> Result<&[u8]> {
+        checked_child(pgno, want_txn, self.store.alloc.page_count(), self.txn, false, |p| {
             self.store.pages.get(p as usize).map(Vec::as_slice)
         })
     }

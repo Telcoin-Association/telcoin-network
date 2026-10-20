@@ -88,26 +88,30 @@ pub(crate) fn get<S: PageRead + ?Sized>(
     read::get(store, catalog, name.as_bytes())?.map(TableRecord::decode).transpose()
 }
 
-/// Insert or replace table `name`'s record.
+/// Insert or replace table `name`'s record. `trusted` is the catalog root's provenance
+/// ([`write::put_sized`]).
 pub(crate) fn put<S: PageWrite + ?Sized>(
     store: &mut S,
     catalog: &mut TreeRoot,
+    trusted: &mut bool,
     name: &str,
     record: &TableRecord,
 ) -> Result<()> {
     check_name(name)?;
-    write::put(store, catalog, name.as_bytes(), &record.encode())?;
+    write::put(store, catalog, trusted, name.as_bytes(), &record.encode())?;
     Ok(())
 }
 
-/// Remove table `name`'s record, returning whether there was one.
+/// Remove table `name`'s record, returning whether there was one. `trusted` is the catalog
+/// root's provenance ([`write::put_sized`]).
 pub(crate) fn delete<S: PageWrite + ?Sized>(
     store: &mut S,
     catalog: &mut TreeRoot,
+    trusted: &mut bool,
     name: &str,
 ) -> Result<bool> {
     check_name(name)?;
-    write::delete(store, catalog, name.as_bytes())
+    write::delete(store, catalog, trusted, name.as_bytes())
 }
 
 #[cfg(test)]
@@ -142,30 +146,37 @@ mod tests {
     fn catalog_ops_and_names() {
         let mut store = MemStore::new(4096);
         let mut catalog = TreeRoot::EMPTY;
+        let mut trusted = false;
         let longest = "n".repeat(MAX_NAME_LEN);
         let a = TableRecord::new(1, 1);
         let b = TableRecord::new(2, 1);
-        put(&mut store, &mut catalog, "a", &a).expect("put a");
-        put(&mut store, &mut catalog, &longest, &b).expect("put longest");
+        put(&mut store, &mut catalog, &mut trusted, "a", &a).expect("put a");
+        put(&mut store, &mut catalog, &mut trusted, &longest, &b).expect("put longest");
         assert_eq!(get(&store, &catalog, "a").expect("get"), Some(a));
         assert_eq!(get(&store, &catalog, &longest).expect("get"), Some(b));
         assert_eq!(get(&store, &catalog, "b").expect("get"), None);
 
         let changed =
             TableRecord { root: TreeRoot { root: 2, root_txn: 1, height: 1, entries: 1 }, ..a };
-        put(&mut store, &mut catalog, "a", &changed).expect("replace");
+        put(&mut store, &mut catalog, &mut trusted, "a", &changed).expect("replace");
         assert_eq!(get(&store, &catalog, "a").expect("get"), Some(changed));
         assert_eq!(catalog.entries, 2);
-        assert!(delete(&mut store, &mut catalog, "a").expect("delete"));
-        assert!(!delete(&mut store, &mut catalog, "a").expect("delete again"));
+        assert!(delete(&mut store, &mut catalog, &mut trusted, "a").expect("delete"));
+        assert!(!delete(&mut store, &mut catalog, &mut trusted, "a").expect("delete again"));
         assert_eq!(get(&store, &catalog, "a").expect("get"), None);
 
         let too_long = "n".repeat(MAX_NAME_LEN + 1);
         let before = catalog;
         for bad in ["", too_long.as_str()] {
             assert!(matches!(get(&store, &catalog, bad), Err(Error::InvalidTableName)));
-            assert!(matches!(put(&mut store, &mut catalog, bad, &a), Err(Error::InvalidTableName)));
-            assert!(matches!(delete(&mut store, &mut catalog, bad), Err(Error::InvalidTableName)));
+            assert!(matches!(
+                put(&mut store, &mut catalog, &mut trusted, bad, &a),
+                Err(Error::InvalidTableName)
+            ));
+            assert!(matches!(
+                delete(&mut store, &mut catalog, &mut trusted, bad),
+                Err(Error::InvalidTableName)
+            ));
         }
         assert_eq!(catalog, before);
     }

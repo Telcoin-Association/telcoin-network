@@ -11,7 +11,7 @@ use crate::{
     catalog,
     tree::{
         test_harness::{walk_tree, MemStore, ReportSeed, Rng},
-        write::{delete, put},
+        write::plain::{delete, put},
     },
     Env, EnvOptions, ReadTxn, Table,
 };
