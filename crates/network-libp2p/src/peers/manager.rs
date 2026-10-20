@@ -343,11 +343,11 @@ impl PeerManager {
 
     /// Apply one predicate to every connection direction, including unknown pending identities.
     /// Closed rejects an unknown pending identity; authenticated establishment always rechecks.
-    /// Each Closed denial is counted by `direction` ({`in`, `out`}).
+    /// Each Closed denial is counted by `direction`.
     pub(super) fn check_admission(
         &self,
         peer: Option<&PeerId>,
-        direction: &'static str,
+        direction: crate::metrics::ConnectionDirection,
     ) -> Result<(), libp2p::swarm::ConnectionDenied> {
         let (status, authorized) = self.evaluate_admission();
         if status.effective() != AdmissionMode::Closed
@@ -475,17 +475,17 @@ impl PeerManager {
         connection: ConnectionId,
         peer: PeerId,
         address: &Multiaddr,
-        direction: &'static str,
+        direction: crate::metrics::ConnectionDirection,
     ) -> Result<(), libp2p::swarm::ConnectionDenied> {
         let important = self.peer_is_important(&peer);
         self.source_connections.reserve(connection, peer, address).map_err(|error| {
-            self.metrics.record_source_admission_denied(direction, error.label());
+            self.metrics.record_source_admission_denied(direction, error);
             if matches!(error, AdmissionError::Poisoned) {
                 bounded_error!(PeerAdmission, target: "peer-manager", %error, "source admission accounting poisoned");
             } else if important {
-                bounded_warn!(PeerAdmission, target: "peer-manager", ?peer, direction, %error, "source budget refused important peer");
+                bounded_warn!(PeerAdmission, target: "peer-manager", ?peer, direction = direction.label(), %error, "source budget refused important peer");
             } else {
-                debug!(target: "peer-manager", ?peer, direction, %error, "source budget refused connection");
+                debug!(target: "peer-manager", ?peer, direction = direction.label(), %error, "source budget refused connection");
             }
             libp2p::swarm::ConnectionDenied::new(error)
         })

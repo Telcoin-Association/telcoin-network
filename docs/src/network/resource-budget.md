@@ -84,7 +84,17 @@ rejection and denial counters also have a `reason` label:
 | `tn_network_inbound_streams_per_connection_limit` | Effective incoming stream capacity per connection |
 | `tn_network_receive_credit_per_connection_bytes` | Effective advertised credit per connection |
 | `tn_network_connection_limit_rejections_total` | Connections refused by a connection limit. `reason`: `pending_incoming`, `pending_outgoing`, `established_incoming`, `established_outgoing`, `established_per_peer`, `established_total` or `unknown` |
-| `tn_network_inbound_connections_denied_total` | Inbound connections denied by a limit. `reason`: `pending_incoming_limit`, `established_per_peer_limit`, `established_total_limit` or `other_limit` |
+| `tn_network_inbound_connections_denied_total` | Inbound connections the swarm refused, counted once per refusal. `stage`: `transport_cap` (a connection limit), `pre_auth` (before the peer is authenticated), `authenticated_policy` (a peer manager or source admission policy after authentication) or `unknown`. `reason`: `pending_incoming_limit`, `established_per_peer_limit`, `established_total_limit` or `other_limit` for a limit; `peer_manager_local_peer`, `peer_manager_banned_peer`, `peer_manager_invalid_ip` or `peer_manager_closed_admission` for the peer manager; the snake-case `AdmissionError` variant (for example `peer_full`) for source admission; `unknown` for any other cause |
+| `tn_network_listener_errors_total` | Non-fatal listener errors by I/O error kind. `reason`: `address_in_use`, `address_not_available`, `permission_denied`, `connection`, `timed_out`, `invalid_data`, `other` or `unknown` |
+| `tn_network_listeners_closed_total` | Listeners that closed. `outcome`: `ok` or `error` |
+
+`tn_network_inbound_connections_denied_total` is the terminal count of inbound refusals.
+`tn_network_connection_limit_rejections_total` counts limit refusals in both directions. The
+peer manager stage counters `tn_network_listen_failures_total`,
+`tn_network_source_admission_denied_total` and `tn_network_closed_admission_denied_total`
+count the same refusals where the peer manager makes the decision, so they overlap the terminal
+count on purpose. The peer manager registers every series of these three families at zero when
+it starts, so a rate query reads `0` and not a missing series.
 
 Connection occupancy updates after swarm event processing. Scrapes can miss short peaks, so record
 the sampling interval and use transport tracing when measuring peak streams or retained buffers.

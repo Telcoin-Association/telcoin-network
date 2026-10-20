@@ -472,6 +472,110 @@ async fn admission_closed_denial_is_typed_and_counted() {
     );
 }
 
+/// Every counter in the recorder as `(key, value)` pairs.
+fn admission_counters(recorder: &DebuggingRecorder) -> Vec<(metrics::Key, u64)> {
+    recorder
+        .snapshotter()
+        .snapshot()
+        .into_vec()
+        .into_iter()
+        .filter_map(|(key, _, _, value)| match value {
+            DebugValue::Counter(count) => Some((key.key().clone(), count)),
+            DebugValue::Gauge(_) | DebugValue::Histogram(_) => None,
+        })
+        .collect()
+}
+
+/// Every `(key, value)` pair named `name` whose labels include `label`.
+fn admission_series<'a>(
+    counters: &'a [(metrics::Key, u64)],
+    name: &'a str,
+    label: (&'a str, &'a str),
+) -> impl Iterator<Item = u64> + 'a {
+    counters
+        .iter()
+        .filter(move |(key, _)| {
+            key.name() == name && key.labels().any(|l| l.key() == label.0 && l.value() == label.1)
+        })
+        .map(|(_, count)| *count)
+}
+
+/// An allowed inbound connection moves no denial series. One Closed refusal of an inbound
+/// peer moves only `closed_admission_denied_total{direction="in"}`.
+#[tokio::test]
+async fn admission_closed_counts_only_refused_inbound_connections() {
+    let recorder = DebuggingRecorder::new();
+    metrics::with_local_recorder(&recorder, || {
+        let mut fixture = AdmissionFixture::new(NetworkType::Primary, AdmissionMode::Closed);
+        let addr = create_multiaddr(None);
+        assert!(fixture
+            .manager
+            .handle_established_inbound_connection(
+                ConnectionId::new_unchecked(1),
+                fixture.current.id(),
+                &addr,
+                &addr,
+            )
+            .is_ok());
+
+        let before = admission_counters(&recorder);
+        let closed = "tn_network.closed_admission_denied_total";
+        ["in", "out"].into_iter().for_each(|direction| {
+            assert_eq!(
+                admission_series(&before, closed, ("direction", direction)).collect::<Vec<_>>(),
+                vec![0],
+                "{closed}{{direction={direction}}} must be registered at zero"
+            );
+        });
+        let source: Vec<_> = before
+            .iter()
+            .filter(|(key, _)| key.name() == "tn_network.source_admission_denied_total")
+            .map(|(_, count)| *count)
+            .collect();
+        assert!(!source.is_empty(), "source admission series must be registered at zero");
+        assert!(source.iter().all(|count| *count == 0), "an allowed peer is not a source denial");
+        let peer_manager: Vec<_> = before
+            .iter()
+            .filter(|(key, _)| {
+                key.name() == "tn_network.listen_failures_total"
+                    && key
+                        .labels()
+                        .any(|l| l.key() == "reason" && l.value().starts_with("peer_manager_"))
+            })
+            .map(|(_, count)| *count)
+            .collect();
+        assert!(!peer_manager.is_empty(), "peer manager reasons must be registered at zero");
+        assert!(peer_manager.iter().all(|count| *count == 0), "an allowed peer is not a failure");
+
+        assert!(fixture
+            .manager
+            .handle_established_inbound_connection(
+                ConnectionId::new_unchecked(2),
+                fixture.ordinary.id(),
+                &addr,
+                &addr,
+            )
+            .err()
+            .is_some_and(|denial| denial
+                .downcast_ref::<PeerAdmissionDenied>()
+                .is_some_and(|cause| matches!(cause, PeerAdmissionDenied::ClosedAdmission))));
+
+        let after = admission_counters(&recorder);
+        let moved: Vec<_> = after
+            .iter()
+            .filter(|(key, count)| {
+                before.iter().find(|(old, _)| old == key).map_or(0, |(_, old)| *old) != *count
+            })
+            .cloned()
+            .collect();
+        assert_eq!(moved.len(), 1, "only the inbound Closed series may move: {moved:?}");
+        assert_eq!(
+            admission_series(&moved, closed, ("direction", "in")).collect::<Vec<_>>(),
+            vec![1]
+        );
+    });
+}
+
 /// A real Closed dial failure adds no table entry for an untracked peer, a Dialing peer still
 /// moves to Disconnected, and discovery skips unauthorized candidates.
 #[tokio::test]

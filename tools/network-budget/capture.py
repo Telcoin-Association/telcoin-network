@@ -45,7 +45,14 @@ SHED_REASONS = frozenset({"queue_full", "unsubscribed", "admission"})
 FAILURE_OUTCOMES = frozenset({"timeout", "omitted", "closed", "io", "unsupported"})
 REJECTION_REASONS = frozenset({"pending_incoming", "pending_outgoing", "established_incoming", "established_outgoing",
                                "established_per_peer", "established_total", "unknown"})
-DENIAL_REASONS = frozenset({"pending_incoming_limit", "established_per_peer_limit", "established_total_limit", "other_limit"})
+# Inbound denials carry the limit reasons, the peer manager reasons, the snake-case source admission
+# errors, and unknown for any other cause.
+DENIAL_REASONS = frozenset({"pending_incoming_limit", "established_per_peer_limit", "established_total_limit", "other_limit",
+                            "peer_manager_local_peer", "peer_manager_banned_peer", "peer_manager_invalid_ip",
+                            "peer_manager_closed_admission", "invalid_limits", "process_full", "peer_full",
+                            "address_full", "prefix_full", "sources_full", "unsupported_address",
+                            "duplicate_connection", "poisoned", "unknown"})
+DENIAL_STAGES = frozenset({"pre_auth", "authenticated_policy", "transport_cap", "unknown"})
 SAMPLE = re.compile(r'^([a-zA-Z_:][a-zA-Z0-9_:]*)(?:\{([^}]*)\})?\s+(\S+)(?:\s+\S+)?$')
 LABEL = re.compile(r'([a-zA-Z_][a-zA-Z0-9_]*)="([^"\\]*)"(?:,|$)')
 FAILURE_KINDS = frozenset({"dial", "timeout", "connection", "unsupported", "io"})
@@ -65,7 +72,7 @@ LABEL_SETS = {
     **{name: frozenset({"network"}) for name in NETWORK_METRICS},
     "tn_network_outbound_request_failures_total": frozenset({"network", "kind"}),
     REJECTIONS: frozenset({"network", "reason"}),
-    DENIALS: frozenset({"network", "reason"}),
+    DENIALS: frozenset({"network", "reason", "stage"}),
     **CLASS_METRICS,
     **{name: frozenset() for name in PROCESS_METRICS},
 }
@@ -75,6 +82,7 @@ LABEL_VALUES = {
     "outcome": FAILURE_OUTCOMES.__contains__,
     "quantile": lambda text: bounded(text, 1),
     "le": lambda text: bounded(text, math.inf),
+    "stage": DENIAL_STAGES.__contains__,
 }
 # The reason label is a different closed set on each metric that carries it.
 REASON_VALUES = {SHED: SHED_REASONS, REJECTIONS: REJECTION_REASONS, DENIALS: DENIAL_REASONS}

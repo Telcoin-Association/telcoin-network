@@ -84,7 +84,10 @@ handshakes, stream buffers, RPC work, and the execution engine need their own fi
 
 Every denial increments `tn_network.source_admission_denied_total` with `network`,
 `direction` (`in` or `out`), and `reason` labels. The reason is the snake-case
-`AdmissionError` variant, for example `peer_full` or `process_full`. A denial logs at
+`AdmissionError` variant, for example `peer_full` or `process_full`. Every `direction`
+and `reason` pair is registered at zero when the peer manager starts. An inbound denial also
+counts once in `tn_network.inbound_connections_denied_total` with
+`stage="authenticated_policy"` and the same `reason`. A denial logs at
 `warn` when the peer manager treats the peer as important (for example a committee
 member), at `error` when the accounting lock is poisoned, and at `debug` otherwise.
 
