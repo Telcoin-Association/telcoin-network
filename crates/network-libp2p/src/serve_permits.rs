@@ -20,6 +20,15 @@
 //! at the epoch boundary is not overload, and the swarm answers peer-exchange requests itself, so
 //! they never reach a handler.
 //!
+//! An enforcing class also bounds each peer: one peer holds at most [`MAX_PERMITS_PER_PEER`]
+//! permits of the class. An offer from a peer at its share is shed under `serve_budget` even when
+//! the pool has free permits, so one peer cannot hold a whole class. The per-peer counts keep only
+//! peers that hold a permit. An unbounded class keeps no per-peer counts.
+//!
+//! A permit is held for the whole task. For `vote` that includes a wait on the author's vote lock
+//! in the primary's request handler, behind an earlier vote request of the same peer. The per-peer
+//! share bounds that wait to one task per peer.
+//!
 //! Every series carries the `network` and `class` labels only, so the cardinality is the six
 //! classes per swarm. The pools register all six classes at construction, so `gossip` and
 //! `certificate_sync` export zero series rather than missing ones.
@@ -31,18 +40,28 @@ use crate::{
 };
 use reth_metrics::metrics::{Counter, Gauge};
 use std::{
+    collections::HashMap,
     fmt,
     sync::{
         atomic::{AtomicU32, Ordering},
-        Arc,
+        Arc, Mutex, PoisonError,
     },
 };
 use tn_config::ServeBudget;
+use tn_types::BlsPublicKey;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 #[cfg(test)]
 #[path = "tests/serve_permits_tests.rs"]
 mod serve_permits_tests;
+
+/// The most permits of one enforcing class that one peer can hold at once.
+///
+/// It matches the primary's per-peer epoch record admission cap. Without it, one peer could hold
+/// every permit of a class, and the node would shed the requests of every other peer in that
+/// class. Committee peers are exempt from penalties, so peer scoring does not stop a committee
+/// peer that does this. An unbounded class has no per-peer share.
+pub const MAX_PERMITS_PER_PEER: u32 = 2;
 
 /// The permit capacity of `class` under `budget`. Zero is unbounded.
 ///
@@ -76,6 +95,9 @@ struct ClassPermits {
     semaphore: Arc<Semaphore>,
     /// The permits held right now.
     held: AtomicU32,
+    /// The permits each peer holds right now. Only an enforcing class uses it, and a peer leaves
+    /// the map with its last permit, so it holds at most `capacity` peers.
+    peers: Mutex<HashMap<BlsPublicKey, u32>>,
     /// `serve_permits_held` for this class.
     held_gauge: Gauge,
     /// `serve_requests_offered_total` for this class.
@@ -100,6 +122,7 @@ impl ClassPermits {
             capacity,
             semaphore: Arc::new(Semaphore::new(pool_size(capacity))),
             held: AtomicU32::new(0),
+            peers: Mutex::new(HashMap::new()),
             held_gauge: metrics::gauge!(
                 "tn_network.serve_permits_held",
                 "network" => network.to_owned(),
@@ -134,6 +157,7 @@ impl ClassPermits {
             capacity: 0,
             semaphore: Arc::new(Semaphore::new(Semaphore::MAX_PERMITS)),
             held: AtomicU32::new(0),
+            peers: Mutex::new(HashMap::new()),
             held_gauge: Gauge::noop(),
             offered: Counter::noop(),
             admitted: Counter::noop(),
@@ -141,14 +165,26 @@ impl ClassPermits {
         }
     }
 
-    /// Offer one request to the pool: admit it with a permit, or shed it.
+    /// Offer one request from `peer` to the pool: admit it with a permit, or shed it.
     ///
-    /// The decision is one counter and one semaphore try, before any work for the request. A
-    /// shed counts exactly once under `serve_budget` and changes nothing else.
-    fn try_acquire(self: &Arc<Self>) -> Option<ServePermit> {
+    /// The decision is one counter and one semaphore try, before any work for the request. An
+    /// enforcing class first checks the share of `peer` and counts the new permit under the same
+    /// lock, so two offers of one peer cannot both pass the check. A shed counts exactly once
+    /// under `serve_budget` and changes nothing else.
+    fn try_acquire(self: &Arc<Self>, peer: BlsPublicKey) -> Option<ServePermit> {
         self.offered.increment(1);
-        self.semaphore.clone().try_acquire_owned().map_or_else(
-            |_no_permit| {
+        let permit = if self.capacity > 0 {
+            let mut peers = self.peers.lock().unwrap_or_else(PoisonError::into_inner);
+            let held_by_peer = peers.get(&peer).copied().unwrap_or(0);
+            (held_by_peer < MAX_PERMITS_PER_PEER)
+                .then(|| self.semaphore.clone().try_acquire_owned().ok())
+                .flatten()
+                .inspect(|_| *peers.entry(peer).or_insert(0) += 1)
+        } else {
+            self.semaphore.clone().try_acquire_owned().ok()
+        };
+        permit.map_or_else(
+            || {
                 self.shed.increment(1);
                 None
             },
@@ -156,9 +192,20 @@ impl ClassPermits {
                 self.admitted.increment(1);
                 self.held.fetch_add(1, Ordering::Relaxed);
                 self.held_gauge.increment(1.0);
-                Some(ServePermit { _permit: permit, pool: Arc::clone(self) })
+                Some(ServePermit { _permit: permit, pool: Arc::clone(self), peer })
             },
         )
+    }
+
+    /// Return one permit of the share of `peer`. The peer leaves the map with its last permit.
+    fn release_peer(&self, peer: &BlsPublicKey) {
+        let mut peers = self.peers.lock().unwrap_or_else(PoisonError::into_inner);
+        let remaining = peers.get(peer).map_or(0, |held| held.saturating_sub(1));
+        if remaining == 0 {
+            peers.remove(peer);
+        } else {
+            peers.insert(*peer, remaining);
+        }
     }
 }
 
@@ -202,12 +249,14 @@ impl ServePermits {
         Self { pools: PerClass::new(|class| Arc::new(ClassPermits::unmetered(class))) }
     }
 
-    /// Offer one request of `class`: a permit to hold while serving it, or `None` to shed it.
+    /// Offer one request of `class` from `peer`: a permit to hold while serving it, or `None` to
+    /// shed it.
     ///
-    /// On `None` the caller drops the response channel and does no work for the request. The
-    /// shed is already counted.
-    pub fn try_acquire(&self, class: ServiceClass) -> Option<ServePermit> {
-        self.pools.get(class).try_acquire()
+    /// An enforcing class sheds the offer when `peer` already holds [`MAX_PERMITS_PER_PEER`]
+    /// permits of it, even when the pool has free permits. On `None` the caller drops the response
+    /// channel and does no work for the request. The shed is already counted.
+    pub fn try_acquire(&self, class: ServiceClass, peer: BlsPublicKey) -> Option<ServePermit> {
+        self.pools.get(class).try_acquire(peer)
     }
 
     /// The permits of `class` held right now.
@@ -227,6 +276,8 @@ pub struct ServePermit {
     _permit: OwnedSemaphorePermit,
     /// The pool to release on drop.
     pool: Arc<ClassPermits>,
+    /// The peer whose share this permit counts against in an enforcing pool.
+    peer: BlsPublicKey,
 }
 
 impl fmt::Debug for ServePermit {
@@ -237,12 +288,16 @@ impl fmt::Debug for ServePermit {
 }
 
 impl Drop for ServePermit {
-    /// Release the held count and gauge. The semaphore permit releases itself.
+    /// Release the held count, the gauge and the peer's share. The semaphore permit releases
+    /// itself.
     fn drop(&mut self) {
         // the update closure returns `Some` for every input, so it never fails
         let _ = self.pool.held.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |held| {
             Some(held.saturating_sub(1))
         });
         self.pool.held_gauge.decrement(1.0);
+        if self.pool.capacity > 0 {
+            self.pool.release_peer(&self.peer);
+        }
     }
 }

@@ -1555,9 +1555,11 @@ where
         // Dropping the response channel and the cancel receiver sends no reply, so the swarm
         // also counts the request as an `omitted` failure, exactly as an admission shed does.
         // The default budget is unbounded, so this only observes until an operator sets
-        // `serve_budget.vote`.
+        // `serve_budget.vote`. An enforcing vote class also caps each peer at
+        // `MAX_PERMITS_PER_PEER`, so one committee peer cannot hold the whole pool while its
+        // requests wait on its author lock in `RequestHandler::vote`.
         if let Some(serve_permit) =
-            self.network_handle.handle.serve_permits().try_acquire(ServiceClass::Vote)
+            self.network_handle.handle.serve_permits().try_acquire(ServiceClass::Vote, peer)
         {
             // clone for spawned tasks
             let request_handler = self.request_handler.clone();
@@ -1629,7 +1631,7 @@ where
         // under `serve_budget`, and the admission permit releases on return. The default budget
         // is unbounded, so this only observes until an operator sets `serve_budget.epoch_record`.
         if let Some(serve_permit) =
-            self.network_handle.handle.serve_permits().try_acquire(ServiceClass::EpochRecord)
+            self.network_handle.handle.serve_permits().try_acquire(ServiceClass::EpochRecord, peer)
         {
             // clone for spawned tasks
             let request_handler = self.request_handler.clone();

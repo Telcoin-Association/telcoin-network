@@ -78,8 +78,9 @@ shed votes.
 
 A serve permit covers the application side of one forwarded request. The request handler asks for
 it after it dequeues the request and before it does any work for it, and the ask does not block.
-The permit ends when the handler drops it: after it sends the response, when it fails, or when its
-task is dropped at an epoch boundary. The permit window is distinct from
+The permit ends when the handler drops it: after it sends the response, when it fails, when the
+swarm cancels the request after the request-response timeout (10 s) or a closed connection, or
+when its task is dropped at an epoch boundary. The permit window is distinct from
 `tn_network_inbound_requests_pending`, which the swarm measures from the forward to the response and
 which also spans the event-queue wait. It is also distinct from the event queue, which holds
 requests that no handler has dequeued yet. Gossip has no response and takes no permit.
@@ -110,9 +111,21 @@ The dropped channel also counts an `omitted` failure, as an `admission` shed doe
 epoch record admission cap runs first, so an epoch record request takes a permit only after it
 passes that cap.
 
+A positive value also bounds each peer. One peer can hold at most 2 permits of an enforcing
+class (`MAX_PERMITS_PER_PEER`). An offer from a peer that already holds 2 is shed under
+`serve_budget`, even when the class has free permits. Without this share, one peer could hold every
+permit of a class, and the node would shed the requests of every other peer in that class. Committee
+peers are exempt from penalties, so peer scoring does not stop a committee peer that does this.
+
+A permit is held for the whole task. A vote task can wait on the vote lock of its author, behind an
+earlier vote request of the same peer, so `tn_network_serve_permits_held{class="vote"}` counts that
+wait as well as the evaluation of a header. The per-peer share limits the wait to one task per peer.
+A batch permit is usually held for milliseconds.
+
 To size a budget, run with zero and watch the peaks of `tn_network_serve_permits_held` per class
-over honest steady state, catch-up and reconnect overlap. Votes are bounded by the committee size
-per round. Epoch records are bounded by the admission cap of 5 concurrent requests. Batch reports
+over honest steady state, catch-up and reconnect overlap. For votes, a capacity of at least two
+times the committee size gives every committee member its full share, whatever the other peers do.
+A smaller vote capacity can shed honest proposers while faulty peers hold their shares. Epoch records are bounded by the admission cap of 5 concurrent requests. Batch reports
 scale with the number of committee workers and their batch rate. Set each class above its honest
 peak with headroom. A budget below the honest peak sheds honest requests. The swarm does not
 schedule by priority, so a budget bounds the application's work for a class but does not reserve

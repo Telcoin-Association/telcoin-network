@@ -43,7 +43,7 @@ pub use metrics::AdmissionShed;
 pub use peers::{
     AdmissionFallback, AdmissionStatus, CommitteeUpdate, LoadPenalty, PeerExchangeMap, Penalty,
 };
-pub use serve_permits::{ServePermit, ServePermits};
+pub use serve_permits::{ServePermit, ServePermits, MAX_PERMITS_PER_PEER};
 pub use service_class::ServiceClass;
 pub use stream::StreamError;
 pub use sync::{

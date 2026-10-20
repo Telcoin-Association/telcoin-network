@@ -352,8 +352,11 @@ where
         // Dropping the response channel and the cancel receiver sends no reply, so the swarm
         // also counts the request as an `omitted` failure. The default budget is unbounded, so
         // this only observes until an operator sets `serve_budget.batch`.
-        if let Some(serve_permit) =
-            self.network_handle.inner_handle().serve_permits().try_acquire(ServiceClass::Batch)
+        if let Some(serve_permit) = self
+            .network_handle
+            .inner_handle()
+            .serve_permits()
+            .try_acquire(ServiceClass::Batch, peer)
         {
             // clone for spawned tasks
             let request_handler = self.request_handler.clone();
