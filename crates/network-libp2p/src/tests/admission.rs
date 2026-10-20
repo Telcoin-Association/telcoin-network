@@ -486,8 +486,7 @@ async fn admission_closed_dial_failure_and_discovery_scope() {
                 &[],
                 Endpoint::Dialer,
             )
-            .err()
-            .expect("Closed refuses an ordinary dial");
+            .expect_err("Closed refuses an ordinary dial");
         manager.on_swarm_event(FromSwarm::DialFailure(DialFailure {
             peer_id: Some(ordinary),
             error: &DialError::Denied { cause },
