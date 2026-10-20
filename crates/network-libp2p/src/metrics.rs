@@ -1933,18 +1933,24 @@ mod tests {
             [
                 (
                     "tn_network.inbound_connections_denied_total",
-                    ("reason", "peer_manager_banned_peer"),
+                    [("reason", "peer_manager_banned_peer")].as_slice(),
                 ),
-                ("tn_network.listener_errors_total", ("reason", "address_in_use")),
-                ("tn_network.listeners_closed_total", ("outcome", "ok")),
-                ("tn_network.listen_failures_total", ("reason", "aborted")),
-                ("tn_network.source_admission_denied_total", ("reason", "peer_full")),
-                ("tn_network.closed_admission_denied_total", ("direction", "in")),
+                ("tn_network.listener_errors_total", [("reason", "address_in_use")].as_slice()),
+                ("tn_network.listeners_closed_total", [("outcome", "ok")].as_slice()),
+                ("tn_network.listen_failures_total", [("reason", "aborted")].as_slice()),
+                // each direction has its own series, so the filter names the recorded one
+                (
+                    "tn_network.source_admission_denied_total",
+                    [("direction", "out"), ("reason", "peer_full")].as_slice(),
+                ),
+                ("tn_network.closed_admission_denied_total", [("direction", "in")].as_slice()),
             ]
             .into_iter()
-            .for_each(|(name, label)| {
+            .for_each(|(name, labels)| {
+                let filter: Vec<_> =
+                    std::iter::once(("network", *network)).chain(labels.iter().copied()).collect();
                 assert_eq!(
-                    count(&after, name, &[("network", network), label]),
+                    count(&after, name, &filter),
                     Some(*times),
                     "{name} must count {network}'s events separately"
                 );
