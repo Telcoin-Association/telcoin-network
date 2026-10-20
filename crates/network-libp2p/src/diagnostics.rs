@@ -1,22 +1,25 @@
-//! Process-wide warning/error budgets for fixed network event classes.
+//! Per-call-site warning/error budgets for network diagnostics.
 //!
-//! Each class admits four detailed events per minute across all swarms. Suppressed fields are
-//! never evaluated. Summaries carry only a fixed class name and counts, and an event-loop timer
+//! Each `bounded_warn!` or `bounded_error!` call site owns one window that admits four detailed
+//! events per minute across all swarms. One call site cannot use the budget of another, so a
+//! remotely driven site cannot suppress an unrelated local failure. Suppressed fields are never
+//! evaluated. Summaries carry a fixed class name and the call site, and an event-loop timer
 //! drains quiet tails. See `docs/network-diagnostics.md` for the site and label audit.
 
 #[path = "diagnostics/window.rs"]
 mod window;
 
-use std::{sync::Mutex, time::Instant};
+use std::{
+    sync::{Mutex, Once, PoisonError},
+    time::Instant,
+};
 use window::{Summary, Window};
 
 pub(crate) use window::INTERVAL;
 
-/// Fixed event classes. No remote data can create another class or another limiter entry.
+/// Fixed event classes. A class names the kind of failure; the budget belongs to the call site.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Class {
-    /// Recoverable transport listener errors.
-    Listener,
     /// Outer swarm event failures and external address reports.
     Swarm,
     /// Local command processing failures, including remotely induced application replies.
@@ -44,77 +47,74 @@ pub(crate) enum Class {
 }
 
 impl Class {
-    /// Every class, in the same order as its storage slot.
-    const ALL: [Self; 13] = [
-        Self::Listener,
-        Self::Swarm,
-        Self::Command,
-        Self::Gossip,
-        Self::Request,
-        Self::Stream,
-        Self::Kademlia,
-        Self::Record,
-        Self::Store,
-        Self::PeerAdmission,
-        Self::PeerState,
-        Self::PeerRecord,
-        Self::Reply,
-    ];
-
-    /// Resolve a compile-time class to its fixed storage slot.
-    const fn index(self) -> usize {
+    /// The fixed metric label for this class.
+    const fn label(self) -> &'static str {
         match self {
-            Self::Listener => 0,
-            Self::Swarm => 1,
-            Self::Command => 2,
-            Self::Gossip => 3,
-            Self::Request => 4,
-            Self::Stream => 5,
-            Self::Kademlia => 6,
-            Self::Record => 7,
-            Self::Store => 8,
-            Self::PeerAdmission => 9,
-            Self::PeerState => 10,
-            Self::PeerRecord => 11,
-            Self::Reply => 12,
+            Self::Swarm => "swarm",
+            Self::Command => "command",
+            Self::Gossip => "gossip",
+            Self::Request => "request",
+            Self::Stream => "stream",
+            Self::Kademlia => "kademlia",
+            Self::Record => "record",
+            Self::Store => "store",
+            Self::PeerAdmission => "peer_admission",
+            Self::PeerState => "peer_state",
+            Self::PeerRecord => "peer_record",
+            Self::Reply => "reply",
         }
     }
 }
 
-/// Fixed storage shared across primary and worker swarms and their peer/record helpers.
+/// The budget of one call site. Every `bounded_*!` expansion owns exactly one static `Site`.
 #[derive(Debug)]
-struct Diagnostics {
-    /// One window per class, never per peer, address, message, or error string.
-    windows: [Window; Class::ALL.len()],
+pub(crate) struct Site {
+    /// The class reported in summaries and metrics.
+    class: Class,
+    /// The call site as `file:line`, fixed at compile time.
+    location: &'static str,
+    /// The burst window of this call site only.
+    window: Mutex<Window>,
+    /// Adds the site to the flush registry once, on its first event.
+    registered: Once,
 }
 
-impl Diagnostics {
-    /// Construct every window without allocation.
-    const fn new() -> Self {
-        Self { windows: [const { Window::new() }; Class::ALL.len()] }
+impl Site {
+    /// Construct a call-site budget without allocation.
+    pub(crate) const fn new(class: Class, location: &'static str) -> Self {
+        Self { class, location, window: Mutex::new(Window::new()), registered: Once::new() }
     }
 
     /// Record an occurrence without inspecting its diagnostic payload.
-    fn observe(&mut self, class: Class, now: Instant) -> (bool, Option<Summary>) {
-        self.windows.get_mut(class.index()).map_or((false, None), |window| window.observe(now))
+    fn observe(&self, now: Instant) -> (bool, Option<Summary>) {
+        self.window.lock().unwrap_or_else(PoisonError::into_inner).observe(now)
     }
 
-    /// Drain elapsed suppression windows into fixed-size storage before calling a tracing sink.
-    fn flush(&mut self, now: Instant) -> [Option<Summary>; Class::ALL.len()] {
-        std::array::from_fn(|index| {
-            self.windows.get_mut(index).and_then(|window| window.flush(now))
-        })
+    /// Drain an elapsed suppression window.
+    fn flush(&self, now: Instant) -> Option<Summary> {
+        self.window.lock().unwrap_or_else(PoisonError::into_inner).flush(now)
     }
 }
 
-/// Process-wide budget; a short lock protects counters only, never formatting or a tracing sink.
-static DIAGNOSTICS: Mutex<Diagnostics> = Mutex::new(Diagnostics::new());
+/// Sites that emitted at least once. Only compile-time call sites can register, so the length is
+/// bounded by the number of `bounded_*!` calls in this crate. No remote data adds an entry.
+type Registry = Mutex<Vec<&'static Site>>;
 
-/// Emit one summary with a bounded class vocabulary and the actual observation window.
-fn report(class: Class, summary: Summary) {
+/// Process-wide registry; short locks protect counters only, never formatting or a tracing sink.
+static SITES: Registry = Mutex::new(Vec::new());
+
+/// Emit one summary and count the suppressed events with fixed class and site labels.
+fn report(site: &Site, summary: Summary) {
+    metrics::counter!(
+        "tn_network.diagnostics_suppressed_total",
+        "class" => site.class.label(),
+        "site" => site.location,
+    )
+    .increment(summary.suppressed());
     tracing::warn!(
         target: "network::diagnostics",
-        event_class = ?class,
+        event_class = ?site.class,
+        site = %site.location,
         emitted = summary.emitted(),
         suppressed = summary.suppressed(),
         window_seconds = summary.elapsed().as_secs_f64(),
@@ -122,47 +122,60 @@ fn report(class: Class, summary: Summary) {
     );
 }
 
-/// Emit a diagnostic using a supplied clock and fixed storage, with sinks outside the lock.
-fn emit_at(state: &Mutex<Diagnostics>, class: Class, now: Instant, event: impl FnOnce()) {
-    let (emit, summary) =
-        state.lock().unwrap_or_else(std::sync::PoisonError::into_inner).observe(class, now);
-    summary.into_iter().for_each(|summary| report(class, summary));
+/// Emit a diagnostic using a supplied clock and registry, with sinks outside every lock.
+fn emit_at(registry: &Registry, site: &'static Site, now: Instant, event: impl FnOnce()) {
+    site.registered.call_once(|| {
+        registry.lock().unwrap_or_else(PoisonError::into_inner).push(site);
+    });
+    let (emit, summary) = site.observe(now);
+    summary.into_iter().for_each(|summary| report(site, summary));
     if emit {
         event();
     }
 }
 
 /// Admit a detailed diagnostic before any field or error formatting is evaluated.
-pub(crate) fn emit(class: Class, event: impl FnOnce()) {
-    emit_at(&DIAGNOSTICS, class, Instant::now(), event);
+pub(crate) fn emit(site: &'static Site, event: impl FnOnce()) {
+    emit_at(&SITES, site, Instant::now(), event);
 }
 
 /// Drain summaries using a supplied clock, including quiet tails.
-fn flush_at(state: &Mutex<Diagnostics>, now: Instant) {
-    let summaries = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner).flush(now);
-    Class::ALL.into_iter().zip(summaries).for_each(|(class, summary)| {
-        summary.into_iter().for_each(|summary| report(class, summary));
-    });
+fn flush_at(registry: &Registry, now: Instant) {
+    let summaries: Vec<(&'static Site, Summary)> = registry
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .iter()
+        .filter_map(|site| site.flush(now).map(|summary| (*site, summary)))
+        .collect();
+    summaries.into_iter().for_each(|(site, summary)| report(site, summary));
 }
 
 /// Report suppressed tails even when the offending input has stopped arriving.
 pub(crate) fn flush() {
-    flush_at(&DIAGNOSTICS, Instant::now());
+    flush_at(&SITES, Instant::now());
 }
 
 /// Gate all tracing arguments so a suppressed event cannot format its payload.
 macro_rules! bounded_warn {
     ($class:ident, $($fields:tt)*) => {{
-        $crate::diagnostics::emit($crate::diagnostics::Class::$class, || {
+        static SITE: $crate::diagnostics::Site = $crate::diagnostics::Site::new(
+            $crate::diagnostics::Class::$class,
+            concat!(file!(), ":", line!()),
+        );
+        $crate::diagnostics::emit(&SITE, || {
             tracing::warn!($($fields)*);
         });
     }};
 }
 
-/// Preserve error severity while sharing the same fixed per-class budget as warnings.
+/// Preserve error severity with the same per-call-site budget as warnings.
 macro_rules! bounded_error {
     ($class:ident, $($fields:tt)*) => {{
-        $crate::diagnostics::emit($crate::diagnostics::Class::$class, || {
+        static SITE: $crate::diagnostics::Site = $crate::diagnostics::Site::new(
+            $crate::diagnostics::Class::$class,
+            concat!(file!(), ":", line!()),
+        );
+        $crate::diagnostics::emit(&SITE, || {
             tracing::error!($($fields)*);
         });
     }};
@@ -186,27 +199,25 @@ pub(crate) mod emission_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
-    /// Every fixed class has an independent burst, and churn cannot change storage size.
+    /// A saturated call site cannot suppress another call site in the same class.
     #[test]
-    fn classes_have_fixed_independent_windows() {
+    fn call_sites_have_independent_windows() {
+        static REMOTE: Site = Site::new(Class::Store, "remote:1");
+        static LOCAL: Site = Site::new(Class::Store, "local:2");
+        let registry = Registry::new(Vec::new());
         let start = Instant::now();
-        let mut diagnostics = Diagnostics::new();
-        let bytes = std::mem::size_of_val(&diagnostics);
-        Class::ALL.into_iter().enumerate().for_each(|(index, class)| {
-            assert_eq!(class.index(), index);
-            (0..window::BURST)
-                .for_each(|_| assert_eq!(diagnostics.observe(class, start), (true, None)));
-            (0..10_000).for_each(|_| assert_eq!(diagnostics.observe(class, start), (false, None)));
+        let admitted = AtomicUsize::new(0);
+        (0..10_000).for_each(|_| emit_at(&registry, &REMOTE, start, || {}));
+        emit_at(&registry, &LOCAL, start, || {
+            admitted.fetch_add(1, Ordering::Relaxed);
         });
-        assert_eq!(std::mem::size_of_val(&diagnostics), bytes);
-        assert!(diagnostics.flush(start + INTERVAL).into_iter().all(|summary| {
-            summary.map(|summary| (summary.emitted(), summary.suppressed(), summary.elapsed()))
-                == Some((window::BURST, 10_000, INTERVAL))
+        assert_eq!(admitted.load(Ordering::Relaxed), 1, "the local site keeps its first detail");
+        assert_eq!(registry.lock().unwrap_or_else(PoisonError::into_inner).len(), 2);
+        assert!(REMOTE.flush(start + INTERVAL).is_some_and(|summary| {
+            (summary.emitted(), summary.suppressed()) == (window::BURST, 10_000 - window::BURST)
         }));
-        assert!(diagnostics.flush(start + INTERVAL).into_iter().all(|summary| summary.is_none()));
-        Class::ALL.into_iter().for_each(|class| {
-            assert_eq!(diagnostics.observe(class, start + INTERVAL), (true, None));
-        });
+        assert!(LOCAL.flush(start + INTERVAL).is_none());
     }
 }

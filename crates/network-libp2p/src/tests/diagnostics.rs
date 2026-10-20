@@ -84,31 +84,36 @@ impl fmt::Debug for RemoteError<'_> {
 #[test]
 fn emission_is_bounded_and_suppressed_payloads_are_lazy() {
     let start = Instant::now();
-    let state = Mutex::new(Diagnostics::new());
+    static SITE: Site = Site::new(Class::Swarm, "tests/diagnostics.rs:1");
+    let registry = Registry::new(Vec::new());
     let capture = Capture::default();
     let formatted = AtomicUsize::new(0);
     tracing::subscriber::with_default(capture.clone(), || {
         (0..10_004).for_each(|identity| {
-            emit_at(&state, Class::Listener, start, || {
-                assert!(state.try_lock().is_ok(), "diagnostic sinks run outside the lock");
+            emit_at(&registry, &SITE, start, || {
+                assert!(SITE.window.try_lock().is_ok(), "diagnostic sinks run outside the lock");
                 tracing::error!(error = ?RemoteError { formatted: &formatted, identity }, "listener error");
             });
         });
         assert_eq!(formatted.load(Ordering::Relaxed), 4);
-        flush_at(&state, start + INTERVAL);
-        flush_at(&state, start + INTERVAL);
+        flush_at(&registry, start + INTERVAL);
+        flush_at(&registry, start + INTERVAL);
         let events = capture.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         assert_eq!(events.len(), 5, "four details and exactly one idle summary");
         assert!(events
             .first()
             .and_then(|fields| fields.value("error"))
             .is_some_and(|error| error.contains("identity 0")));
-        assert_eq!(events.last().and_then(|fields| fields.value("event_class")), Some("Listener"));
+        assert_eq!(events.last().and_then(|fields| fields.value("event_class")), Some("Swarm"));
+        assert_eq!(
+            events.last().and_then(|fields| fields.value("site")),
+            Some("tests/diagnostics.rs:1")
+        );
         assert_eq!(events.last().and_then(|fields| fields.value("emitted")), Some("4"));
         assert_eq!(events.last().and_then(|fields| fields.value("suppressed")), Some("10000"));
         assert_eq!(events.last().and_then(|fields| fields.value("window_seconds")), Some("60.0"));
         drop(events);
-        emit_at(&state, Class::Listener, start + INTERVAL, || {
+        emit_at(&registry, &SITE, start + INTERVAL, || {
             tracing::error!(error = ?RemoteError { formatted: &formatted, identity: 10_004 }, "listener error");
         });
         assert_eq!(
