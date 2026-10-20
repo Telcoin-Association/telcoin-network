@@ -3882,3 +3882,44 @@ async fn test_source_admission_denial_metric_records_reason() {
         });
     assert_eq!(denied, Some(1));
 }
+
+/// Membership is recomputed from the local BLS key on every committee update: a member expects
+/// every other member, a non-member expects 0, and the committee size stays exported either way.
+#[tokio::test]
+async fn test_committee_expected_follows_local_membership() {
+    use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
+    let key = |seed: u8| *BlsKeypair::generate(&mut StdRng::from_seed([seed; 32])).public();
+    let local = key(0);
+    let with_local: HashSet<BlsPublicKey> = (0..4).map(key).collect();
+    let without_local: HashSet<BlsPublicKey> = (4..8).map(key).collect();
+
+    let recorder = DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    let gauge = |name: &str| {
+        snapshotter.snapshot().into_vec().into_iter().find_map(|(composite, _, _, value)| {
+            match value {
+                DebugValue::Gauge(gauge) if composite.key().name() == name => Some(gauge.0),
+                DebugValue::Gauge(_) | DebugValue::Counter(_) | DebugValue::Histogram(_) => None,
+            }
+        })
+    };
+
+    let observed = metrics::with_local_recorder(&recorder, || {
+        let mut peer_manager = create_test_peer_manager(None);
+        peer_manager.local_bls_key = Some(local);
+        [with_local.clone(), without_local.clone(), with_local.clone()]
+            .into_iter()
+            .map(|current| {
+                peer_manager.update_committees(HashSet::new(), current, HashSet::new());
+                (gauge("tn_network.committee_size"), gauge("tn_network.committee_peers_expected"))
+            })
+            .collect::<Vec<_>>()
+    });
+
+    // member, rotated out, rotated back in: the size stays 4 and expected follows membership
+    assert_eq!(
+        observed,
+        vec![(Some(4.0), Some(3.0)), (Some(4.0), Some(0.0)), (Some(4.0), Some(3.0))]
+    );
+}

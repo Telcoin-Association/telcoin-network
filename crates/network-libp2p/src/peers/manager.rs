@@ -289,8 +289,8 @@ pub(crate) struct PeerManager {
     discovery_peers: HashMap<PeerId, Vec<Multiaddr>>,
     /// Whether this node's own BLS key sits in the current committee slot.
     ///
-    /// The manager knows only the local [PeerId], so the swarm loop sets this on every committee
-    /// update; it lowers the expected committee peer count by one for a member.
+    /// Recomputed from the local BLS key on every committee update. A member expects every other
+    /// member; a non-member exports an expected committee peer count of 0.
     local_in_current_committee: bool,
     /// Per-source inbound kad `PutRecord` rate windows.
     ///
@@ -1369,6 +1369,12 @@ impl PeerManager {
         // neither pinned nor a current committee member so rotated-out members and stale discovered
         // records cannot accumulate across epochs (issue #827).
         self.prune_known_peers();
+        // membership comes from the local BLS key, so rotating into or out of the committee updates
+        // the expected peer count on the same update that installs the new slots
+        self.local_in_current_committee = self
+            .local_bls_key
+            .as_ref()
+            .is_some_and(|key| self.peers.current_committee().contains(key));
         self.record_committee_connectivity();
     }
 
@@ -1383,21 +1389,14 @@ impl PeerManager {
         self.apply_unban_actions(unban_actions);
     }
 
-    /// Record whether this node is a member of the current committee.
-    ///
-    /// Called by the swarm loop before [`Self::update_committees`], because the manager has no
-    /// BLS key of its own.
-    pub(crate) fn set_local_committee_member(&mut self, member: bool) {
-        self.local_in_current_committee = member;
-    }
-
     /// Write the committee connectivity gauges from the current committee slot.
     ///
-    /// Expected peers exclude this node when it is a member; all three gauges stay zero until a
-    /// committee is known.
+    /// A member expects every other member (`size - 1`); a non-member expects 0, so the committee
+    /// alerts, which require expected above 0, skip it. Size and connected are written for every
+    /// node, and all three gauges stay zero until a committee is known.
     fn record_committee_connectivity(&self) {
         let (size, connected) = self.peers.current_committee_connectivity();
-        let expected = size.saturating_sub(usize::from(self.local_in_current_committee));
+        let expected = if self.local_in_current_committee { size.saturating_sub(1) } else { 0 };
         self.metrics.set_committee_connectivity(size, expected, connected);
     }
 

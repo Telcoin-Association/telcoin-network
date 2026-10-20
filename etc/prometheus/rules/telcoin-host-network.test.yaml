@@ -16,16 +16,18 @@ tests:
   # Five hosts observed by one Prometheus; nothing merges across instances.
   #   hostA: exporter up, collector fresh until 10m then frozen, a drop counter
   #          that RESETS at 10m, conntrack tracked at 90%, UDP errors from 5m.
-  #   hostB: exporter up but no collector series at all; conntrack at 95% with
-  #          no mode series, so ConntrackHigh must stay quiet.
+  #   hostB: exporter up but no collector series at all; conntrack at 95% from
+  #          node_exporter, so ConntrackHigh fires without a mode series.
   #   hostC: exporter down.
-  #   hostD: collector fresh, conntrack at 95% but mode notrack (suppressed).
+  #   hostD: collector fresh, conntrack at 95% and mode notrack; notrack exempts
+  #          only matching flows, so ConntrackHigh still fires.
   #   hostE: collector fresh, conntrack mode unsupported.
+  # The file label is the full textfile path, as node_exporter reports it.
   - interval: 15s
     input_series:
       - series: 'up{job="node",instance="hostA"}'
         values: '1x120'
-      - series: 'node_textfile_mtime_seconds{job="node",instance="hostA",file="tn_host_network.prom"}'
+      - series: 'node_textfile_mtime_seconds{job="node",instance="hostA",file="/textfile/tn_host_network.prom"}'
         values: '0+15x40 600x80'
       - series: 'tn_host_firewall_rule_packets_total{job="node",instance="hostA",rule="drop_udp_probe"}'
         values: '0+1x40 0+1x80'
@@ -55,7 +57,7 @@ tests:
         values: '0x120'
       - series: 'up{job="node",instance="hostD"}'
         values: '1x120'
-      - series: 'node_textfile_mtime_seconds{job="node",instance="hostD",file="tn_host_network.prom"}'
+      - series: 'node_textfile_mtime_seconds{job="node",instance="hostD",file="/var/lib/node_exporter/textfile/tn_host_network.prom"}'
         values: '0+15x120'
       - series: 'node_nf_conntrack_entries{job="node",instance="hostD"}'
         values: '950x120'
@@ -69,7 +71,7 @@ tests:
         values: '0x120'
       - series: 'up{job="node",instance="hostE"}'
         values: '1x120'
-      - series: 'node_textfile_mtime_seconds{job="node",instance="hostE",file="tn_host_network.prom"}'
+      - series: 'node_textfile_mtime_seconds{job="node",instance="hostE",file="/textfile/tn_host_network.prom"}'
         values: '0+15x120'
       - series: 'tn_host_conntrack_mode{job="node",instance="hostE",mode="unsupported"}'
         values: '1x120'
@@ -95,7 +97,7 @@ tests:
               severity: warning
             exp_annotations:
               summary: "host network collector absent on hostB"
-              description: "node_exporter on hostB answers but has no tn_host_network.prom textfile. Firewall, conntrack and UDP buffer series are absent; the dashboard shows collector-absent, not zero."
+              description: "node_exporter on hostB answers but has no tn_host_network.prom textfile. The textfile series (firewall counters, conntrack mode and rmem_max) are absent; node_nf_conntrack_* and the UDP error counters come from node_exporter itself and stay present. The dashboard shows collector-absent, not zero."
               action: "Install etc/host-metrics/tn-host-network.sh, enable tn-host-network.timer and check that node_exporter runs with --collector.textfile.directory pointing at the same directory."
               runbook_url: https://github.com/Telcoin-Association/telcoin-network/blob/main/docs/src/getting-started/host-network-observability.md#exporter-and-collector-state
       # The reset at 10m must not look like 100 drops.
@@ -115,8 +117,26 @@ tests:
               severity: warning
             exp_annotations:
               summary: "conntrack table above 80% on hostA"
-              description: "nf_conntrack_entries on hostA is above 80% of nf_conntrack_max for 5 minutes while the host tracks connections. At 100% the kernel drops new flows, including consensus traffic."
-              action: "Raise net.netfilter.nf_conntrack_max, add a notrack rule for the primary and worker UDP ports, or block the source of the flow churn at the edge."
+              description: "nf_conntrack_entries on hostA is above 80% of nf_conntrack_max for 5 minutes. At 100% the kernel drops new flows, including consensus traffic. The alert ignores the conntrack mode: a notrack rule exempts only the flows it matches."
+              action: "Raise net.netfilter.nf_conntrack_max, block the source of the flow churn at the edge, or exempt the primary and worker UDP ports with notrack rules in a prerouting chain (and an output chain for local traffic) at priority raw (-300), before conntrack at -200. The alert stays active after that because every other flow is still tracked."
+              runbook_url: https://github.com/Telcoin-Association/telcoin-network/blob/main/docs/src/getting-started/host-network-observability.md#conntrack-occupancy
+          - exp_labels:
+              job: node
+              instance: hostB
+              severity: warning
+            exp_annotations:
+              summary: "conntrack table above 80% on hostB"
+              description: "nf_conntrack_entries on hostB is above 80% of nf_conntrack_max for 5 minutes. At 100% the kernel drops new flows, including consensus traffic. The alert ignores the conntrack mode: a notrack rule exempts only the flows it matches."
+              action: "Raise net.netfilter.nf_conntrack_max, block the source of the flow churn at the edge, or exempt the primary and worker UDP ports with notrack rules in a prerouting chain (and an output chain for local traffic) at priority raw (-300), before conntrack at -200. The alert stays active after that because every other flow is still tracked."
+              runbook_url: https://github.com/Telcoin-Association/telcoin-network/blob/main/docs/src/getting-started/host-network-observability.md#conntrack-occupancy
+          - exp_labels:
+              job: node
+              instance: hostD
+              severity: warning
+            exp_annotations:
+              summary: "conntrack table above 80% on hostD"
+              description: "nf_conntrack_entries on hostD is above 80% of nf_conntrack_max for 5 minutes. At 100% the kernel drops new flows, including consensus traffic. The alert ignores the conntrack mode: a notrack rule exempts only the flows it matches."
+              action: "Raise net.netfilter.nf_conntrack_max, block the source of the flow churn at the edge, or exempt the primary and worker UDP ports with notrack rules in a prerouting chain (and an output chain for local traffic) at priority raw (-300), before conntrack at -200. The alert stays active after that because every other flow is still tracked."
               runbook_url: https://github.com/Telcoin-Association/telcoin-network/blob/main/docs/src/getting-started/host-network-observability.md#conntrack-occupancy
       - eval_time: 20m
         alertname: TnHostCollectorStale
@@ -124,7 +144,7 @@ tests:
           - exp_labels:
               job: node
               instance: hostA
-              file: tn_host_network.prom
+              file: /textfile/tn_host_network.prom
               severity: warning
             exp_annotations:
               summary: "host network collector stale on hostA"
@@ -234,5 +254,102 @@ tests:
         alertname: TnCommitteeConnectivityDegraded
         exp_alerts: []
       - eval_time: 20m
+        alertname: TnCommitteeConnectivityLost
+        exp_alerts: []
+
+  # Firewall collector state: hostF cannot list nft counters, hostG has more than
+  # 32 tn_ counters, hostH is healthy and stays silent.
+  - interval: 15s
+    input_series:
+      - series: 'tn_host_firewall_collector_available{job="node",instance="hostF"}'
+        values: '0x80'
+      - series: 'tn_host_firewall_collector_available{job="node",instance="hostG"}'
+        values: '1x80'
+      - series: 'tn_host_firewall_rules_truncated{job="node",instance="hostG"}'
+        values: '1x80'
+      - series: 'tn_host_firewall_collector_available{job="node",instance="hostH"}'
+        values: '1x80'
+      - series: 'tn_host_firewall_rules_truncated{job="node",instance="hostH"}'
+        values: '0x80'
+    alert_rule_test:
+      # Pending, not firing, before the 10 minute hold.
+      - eval_time: 9m
+        alertname: TnHostFirewallCollectorUnavailable
+        exp_alerts: []
+      - eval_time: 12m
+        alertname: TnHostFirewallCollectorUnavailable
+        exp_alerts:
+          - exp_labels:
+              job: node
+              instance: hostF
+              severity: warning
+            exp_annotations:
+              summary: "firewall counters unavailable on hostF"
+              description: "The host network collector on hostF cannot list nft counters for 10 minutes: nft or jq is missing, or nft -j list counters fails. The firewall drop series are absent; the dashboard shows firewall-unavailable, not zero drops."
+              action: "Install nftables and jq, run nft -j list counters as root on the host to see the error, and confirm that the collector runs as root."
+              runbook_url: https://github.com/Telcoin-Association/telcoin-network/blob/main/docs/src/getting-started/host-network-observability.md#firewall-drops
+      - eval_time: 12m
+        alertname: TnHostFirewallRulesTruncated
+        exp_alerts:
+          - exp_labels:
+              job: node
+              instance: hostG
+              severity: warning
+            exp_annotations:
+              summary: "firewall counter list truncated on hostG"
+              description: "hostG has more than 32 named nft counters with the tn_ prefix for 10 minutes. The collector exports only the first 32 in name order, so drops on the other counters are not observed."
+              action: "Remove or merge tn_ counters until at most 32 remain, then confirm that the firewall drop panel lists every counter you rely on."
+              runbook_url: https://github.com/Telcoin-Association/telcoin-network/blob/main/docs/src/getting-started/host-network-observability.md#firewall-drops
+
+  # Node scrape state: validator5 stops answering at 5m, validator6 answers but
+  # exports no committee gauges, and validator7 is outside the committee
+  # (expected 0, members only) and fires nothing.
+  - interval: 15s
+    input_series:
+      - series: 'up{job="telcoin-node",instance="validator5"}'
+        values: '1x20 0x100'
+      - series: 'up{job="telcoin-node",instance="validator6"}'
+        values: '1x120'
+      - series: 'up{job="telcoin-node",instance="validator7"}'
+        values: '1x120'
+      - series: 'tn_network_committee_size{job="telcoin-node",instance="validator7",network="primary"}'
+        values: '4x120'
+      - series: 'tn_network_committee_peers_expected{job="telcoin-node",instance="validator7",network="primary"}'
+        values: '0x120'
+      - series: 'tn_network_committee_peers_connected{job="telcoin-node",instance="validator7",network="primary"}'
+        values: '0x120'
+    alert_rule_test:
+      # Down from 5m15s: pending at 6m, firing after the 2 minute hold.
+      - eval_time: 6m
+        alertname: TnNodeDown
+        exp_alerts: []
+      - eval_time: 8m
+        alertname: TnNodeDown
+        exp_alerts:
+          - exp_labels:
+              job: telcoin-node
+              instance: validator5
+              severity: critical
+            exp_annotations:
+              summary: "telcoin node validator5 is down"
+              description: "Prometheus has not scraped the node metrics endpoint of validator5 for 2 minutes. Every node series of this instance is absent, so the committee alerts cannot fire for it; treat the node as unobserved, not as healthy."
+              action: "Check the node process or container and its logs, confirm the metrics port and the Prometheus scrape target, then watch the committee connectivity panels."
+              runbook_url: https://github.com/Telcoin-Association/telcoin-network/blob/main/docs/src/getting-started/host-network-observability.md#node-state
+      - eval_time: 16m
+        alertname: TnNodeCommitteeSeriesAbsent
+        exp_alerts:
+          - exp_labels:
+              job: telcoin-node
+              instance: validator6
+              severity: warning
+            exp_annotations:
+              summary: "committee gauges absent on validator6"
+              description: "The node on validator6 answers scrapes but exports no tn_network_committee_peers_expected series for 15 minutes. The committee connectivity alerts cannot fire for this instance."
+              action: "Confirm that the node runs a release that exports the committee gauges and that the scrape target is the node metrics endpoint, not another service on that port."
+              runbook_url: https://github.com/Telcoin-Association/telcoin-network/blob/main/docs/src/getting-started/host-network-observability.md#node-state
+      - eval_time: 16m
+        alertname: TnCommitteeConnectivityDegraded
+        exp_alerts: []
+      - eval_time: 16m
         alertname: TnCommitteeConnectivityLost
         exp_alerts: []

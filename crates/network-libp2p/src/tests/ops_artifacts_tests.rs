@@ -78,14 +78,17 @@ fn matcher_block(expr: &str, end: usize) -> Option<&str> {
 }
 
 /// Metric references in `expr` that start with `prefix` and lack a `job=~` or `instance=~`
-/// matcher. A `prefix` occurrence inside a label value (after `"`), inside a template variable
-/// (after `$`) or inside a longer name is not a reference. With `exact`, only a name equal to
-/// `prefix` counts.
+/// matcher. A `prefix` occurrence inside a quoted label value (an odd number of `"` before it),
+/// directly after `"`, inside a template variable (after `$`) or inside a longer name is not a
+/// reference. With `exact`, only a name equal to `prefix` counts.
 fn unscoped_references(expr: &str, prefix: &str, exact: bool) -> Vec<String> {
     expr.match_indices(prefix)
         .filter_map(|(start, _)| {
             let preceded_by = expr.get(..start).and_then(|head| head.chars().next_back());
-            let starts_name = preceded_by.is_none_or(|c| !is_name_char(c) && c != '"' && c != '$');
+            let in_label_value =
+                expr.get(..start).is_some_and(|head| head.matches('"').count() % 2 == 1);
+            let starts_name = !in_label_value
+                && preceded_by.is_none_or(|c| !is_name_char(c) && c != '"' && c != '$');
             let end = expr.get(start..).map_or(start, |tail| {
                 start + tail.find(|c: char| !is_name_char(c)).unwrap_or(tail.len())
             });

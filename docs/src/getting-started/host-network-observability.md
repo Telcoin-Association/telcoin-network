@@ -72,18 +72,19 @@ Rules load from `etc/prometheus/rules/*.rules.yaml`. The scrape and evaluation i
 | --- | --- | --- | --- |
 | `tn_host_firewall_rule_packets_total{rule}` | nft named counter | host, per rule | resets on reboot or `nft reset counters`; use `rate` or `increase` |
 | `tn_host_firewall_rule_bytes_total{rule}` | nft named counter | host, per rule | same as packets |
-| `tn_host_firewall_rules_truncated` | collector | host | gauge; 1 when more than 32 `tn_` counters exist |
-| `tn_host_firewall_collector_available` | collector | host | gauge; 0 when nft or jq is missing |
+| `tn_host_firewall_rules_truncated` | collector | host | gauge; 1 when more than 32 `tn_` counters exist and the collector keeps only the first 32 in name order |
+| `tn_host_firewall_collector_available` | collector | host | gauge; 0 when nft or jq is missing or `nft -j list counters` fails |
 | `tn_host_conntrack_mode{mode}` | collector | host | one-hot gauge: `tracked`, `notrack` or `unsupported` |
 | `tn_host_udp_rmem_max_bytes` | `/proc/sys/net/core/rmem_max` | host | gauge |
 | `tn_host_network_collector_info{version}` | collector | host | gauge; collector version |
 | `node_netstat_Udp_RcvbufErrors`, `node_netstat_Udp6_RcvbufErrors` | kernel SNMP | host | resets on reboot; use `rate` |
 | `node_nf_conntrack_entries`, `node_nf_conntrack_entries_limit` | node_exporter conntrack collector | host | gauges; absent when the module is not loaded |
 | `node_network_receive_drop_total{device}`, `node_network_receive_errs_total{device}` | node_exporter netdev collector | host, per interface | resets on reboot; use `rate` |
-| `node_textfile_mtime_seconds{file}` | node_exporter textfile collector | host | gauge; collector freshness |
+| `node_textfile_mtime_seconds{file}` | node_exporter textfile collector | host | gauge; collector freshness. `file` is the path node_exporter reads, for example `/textfile/tn_host_network.prom`, so the rules match `file=~"(.*/)?tn_host_network[.]prom"` |
 | `up{job="node"}` | Prometheus | host | 0 when the exporter does not answer |
+| `up{job="telcoin-node"}` | Prometheus | node | 0 when the node metrics endpoint does not answer |
 | `tn_network_committee_size{network}` | node | node, per network | gauge; 0 until the first committee is known |
-| `tn_network_committee_peers_expected{network}` | node | node, per network | gauge; 0 until the first committee is known |
+| `tn_network_committee_peers_expected{network}` | node | node, per network | gauge; 0 until the first committee is known, and 0 on a node outside the current committee |
 | `tn_network_committee_peers_connected{network}` | node | node, per network | gauge; 0 until the first committee is known |
 
 Recording rules keep the baselines operators use for threshold selection:
@@ -92,7 +93,7 @@ Recording rules keep the baselines operators use for threshold selection:
 | --- | --- |
 | `tn_host:firewall_drop_packets:rate5m` | packets per second across all `drop_*` counters, per host |
 | `tn_host:udp_rcvbuf_errors:rate5m` | UDP receive buffer errors per second, IPv4 and IPv6, per host |
-| `tn_host:conntrack_occupancy:ratio` | entries divided by the limit, only while the host tracks connections |
+| `tn_host:conntrack_occupancy:ratio` | entries divided by the limit, per host, in every conntrack mode |
 | `tn_network:committee_coverage:ratio` | connected divided by expected committee peers, only while a committee is known |
 
 ## Scope caveats
@@ -115,21 +116,36 @@ One exporter observes one host. Several validators on one host share the same ho
 
 ### Explicit states
 
-A missing signal is never a healthy zero. The state panel of the dashboard shows one of `exporter-down`, `collector-absent`, `stale` or `ok` for the collector, and one of `tracked`, `notrack`, `unsupported` or `collector-failed` for conntrack. An empty drop panel next to a `collector-absent` state means no data, not no drops.
+A missing signal is never a healthy zero. The state panel of the dashboard shows one of `exporter-down`, `collector-absent`, `stale`, `firewall-unavailable` or `ok` for the collector, and one of `unsupported`, `collector-failed`, `notrack` or `tracked` for conntrack. A host without the conntrack module shows `unsupported` while the textfile is present and `collector-failed` without it, because the node_exporter conntrack collector also fails there. An empty drop panel next to a `collector-absent` state means no data, not no drops.
 
-- `notrack`: the ruleset contains a `notrack` statement. Flows that match it do not enter the conntrack table, so occupancy does not describe them. `TnHostConntrackHigh` is suppressed while the mode is `notrack`.
+- `notrack`: at least one nft rule has a `notrack` statement. Flows that match it do not enter the conntrack table; every other flow is still tracked. `TnHostConntrackHigh` stays active in this mode, because the tracked flows can still fill the table.
 - `unsupported`: `/proc/sys/net/netfilter/nf_conntrack_max` is absent. The module is not loaded or the kernel has no conntrack. `TnHostConntrackUnsupported` fires after 15 minutes so the state is reviewed, not ignored.
-- The collector cannot detect `notrack` without `nft`. A host that uses iptables `NOTRACK` targets shows `tracked`. Document the exception for such hosts.
+- The collector reads the ruleset with `nft -j list ruleset` and `jq` and counts only a `notrack` statement inside a rule. A counter, chain or comment that is only named `notrack` does not count. Without `nft` or `jq` the mode is `tracked`. A host that uses iptables `NOTRACK` targets shows `tracked`. Document the exception for such hosts.
+
+A `notrack` rule works only before conntrack sees the packet. Put it in a chain on the `prerouting` hook, and on the `output` hook for traffic the host sends, at priority `raw` (-300). Conntrack runs at priority -200, so a `notrack` rule in an `input` chain at priority 0 is too late and exempts nothing. Example for the primary and worker UDP ports:
+
+```text
+table inet raw {
+    chain prerouting {
+        type filter hook prerouting priority raw;
+        udp dport { <primary>, <worker> } notrack
+    }
+    chain output {
+        type filter hook output priority raw;
+        udp sport { <primary>, <worker> } notrack
+    }
+}
+```
 
 ## Committee connectivity semantics
 
 The node sets three gauges per network (`primary` and `worker-{id}`):
 
 - `tn_network_committee_size`: the number of members of the current committee.
-- `tn_network_committee_peers_expected`: `size - 1` when this node is a current member, else `size`. Every network is a full mesh between committee members, so a member expects every other member and an observer expects all of them.
+- `tn_network_committee_peers_expected`: `size - 1` when this node is a current member, else `0`. Every network is a full mesh between committee members, so a member expects every other member. A node outside the current committee (an observer, or a validator outside the committee of this epoch) exports 0, so both committee alerts skip it; `tn_network_committee_size` and `tn_network_committee_peers_connected` stay exported for the dashboard. The node recomputes membership from its own BLS key on every committee update.
 - `tn_network_committee_peers_connected`: the number of unique current-committee members with at least one established connection on this network.
 
-All three are 0 until the node learns its first committee. The rules use `expected > 0` as the restart guard, so a node that boots fires nothing until the committee is known. At an epoch change the previous committee is not counted: a member that leaves the committee drops out of `connected` without lowering coverage.
+All three are 0 until the node learns its first committee. The rules use `expected > 0` as the restart guard, so a node that boots fires nothing until the committee is known. At an epoch change the previous committee is not counted: a member that leaves the committee drops out of `connected` without lowering coverage. A node outside the current committee also exports `expected` 0, so the guard skips it too.
 
 The generic `tn_network_connected_peers` and `tn_network_known_peers` gauges count every peer. The dashboard overlays `connected_peers` on the committee panel only to show that committee coverage moves on its own. The unit test has `connected_peers` rising while committee coverage falls, and the alerts still fire.
 
@@ -147,11 +163,22 @@ The thresholds below are launch defaults. To re-derive one, record the matching 
 | `TnHostCollectorAbsent` | exporter up without `tn_host_network.prom` for 10 minutes | warning | Install the collector script and enable the timer. Check the textfile directory flag. |
 | `TnHostCollectorStale` | file older than 120 seconds for 5 minutes | warning | Read `journalctl -u tn-host-network.service`. Fix nft, jq or permissions. |
 
+### Node state
+
+| Alert | Condition | Severity | Action |
+| --- | --- | --- | --- |
+| `TnNodeDown` | `up{job="telcoin-node"} == 0` for 2 minutes | critical | Check the node process and its logs. Check the metrics port and the scrape target. |
+| `TnNodeCommitteeSeriesAbsent` | node up without `tn_network_committee_peers_expected` for 15 minutes | warning | Confirm that the node release exports the committee gauges and that the scrape target is the node metrics endpoint. |
+
+The committee alerts read the node gauges, so they cannot fire for a node that is down or does not export them. These two alerts cover that gap.
+
 ### Firewall drops
 
 | Alert | Condition | Severity | Action |
 | --- | --- | --- | --- |
 | `TnHostFirewallDropsRising` | `increase` of a `drop_*` counter over 5 minutes above 100, for 5 minutes | warning | Compare with the QUIC Retry and inbound request panels. A rise that matches committee loss means a blocked peer. A rise with stable committee coverage is a scan or flood the firewall absorbs. |
+| `TnHostFirewallCollectorUnavailable` | `tn_host_firewall_collector_available` is 0 for 10 minutes | warning | Install nftables and jq. Run `nft -j list counters` as root to see the error. The drop panel is empty, not zero, while this fires. |
+| `TnHostFirewallRulesTruncated` | more than 32 `tn_` counters for 10 minutes | warning | Remove or merge `tn_` counters until at most 32 remain. The collector exports only the first 32 in name order. |
 
 Launch default: 100 packets per 5 minutes. Re-derive it from `tn_host:firewall_drop_packets:rate5m` multiplied by 300.
 
@@ -167,10 +194,10 @@ Launch default: any sustained error. A host that shows a constant low rate at la
 
 | Alert | Condition | Severity | Action |
 | --- | --- | --- | --- |
-| `TnHostConntrackHigh` | entries divided by limit above 0.8 for 5 minutes while the mode is `tracked` | warning | Raise `net.netfilter.nf_conntrack_max`, add a `notrack` rule for the consensus UDP ports, or block the flow churn at the edge. |
+| `TnHostConntrackHigh` | entries divided by limit above 0.8 for 5 minutes, in every conntrack mode | warning | Raise `net.netfilter.nf_conntrack_max`, block the flow churn at the edge, or add `notrack` rules for the consensus UDP ports at priority `raw` (see [Explicit states](#explicit-states)). The alert stays active with `notrack`, because other flows are still tracked. |
 | `TnHostConntrackUnsupported` | mode `unsupported`, or the exporter's conntrack collector fails, for 15 minutes | info | Load `nf_conntrack` or enable the collector. If the host runs without conntrack on purpose, document it and silence the alert for that instance. |
 
-Launch default: 0.8. Re-derive it from `tn_host:conntrack_occupancy:ratio`.
+Launch default: 0.8. Re-derive it from `tn_host:conntrack_occupancy:ratio`. The ratio and the alert ignore the conntrack mode, because `notrack` exempts only the flows it matches.
 
 ### Committee connectivity
 
@@ -183,14 +210,14 @@ Launch default: two thirds. Re-derive it from `tn_network:committee_coverage:rat
 
 ## Controlled scenarios
 
-Run these on a staging host to confirm the signals before launch. The `host-scenarios` job of `.github/workflows/host-network-observability.yaml` runs the first four on every pull request that touches the artifacts, then checks the collector output with `promtool check metrics`.
+Run these on a staging host to confirm the signals before launch. The `host-scenarios` job of `.github/workflows/host-network-observability.yaml` runs the first four on every pull request that touches the artifacts, checks that node_exporter labels the textfile with its full path, then checks the collector output with `promtool check metrics`.
 
 | Scenario | Procedure | Expected observation | CI |
 | --- | --- | --- | --- |
 | Firewall drops | Add a `tn_drop_*` counter and a drop rule for a probe port. Send 50 datagrams to it. Run the collector. | `tn_host_firewall_rule_packets_total{rule="drop_<name>"}` is at least 50. `TnHostFirewallDropsRising` fires above the threshold. | yes |
-| notrack | Insert a `notrack` rule before the drop rule. Run the collector. | `tn_host_conntrack_mode{mode="notrack"}` is 1. `TnHostConntrackHigh` is suppressed. | yes |
+| notrack | Add a `notrack` rule for the probe port in a `prerouting` chain at priority `raw`. Run the collector. | `tn_host_conntrack_mode{mode="notrack"}` is 1. A chain or a comment that is only named `notrack` leaves the mode `tracked`. `TnHostConntrackHigh` still fires if the tracked flows fill the table. | yes |
 | UDP receive buffer pressure | Set `net.core.rmem_max` and `net.core.rmem_default` to 2304. Start a UDP listener that does not read. Send 300 datagrams of 1000 bytes. | The `RcvbufErrors` column of `/proc/net/snmp` increases. `TnHostUdpRcvbufErrors` fires after 10 minutes. | yes |
-| Conntrack pressure | Set `net.netfilter.nf_conntrack_max` to 64. Open more than 64 UDP flows. When the table is full, the kernel drops each new flow and the sender gets `EPERM`. This is the expected result, not an error. | `nf_conntrack_count` reaches 80 percent of the limit. `TnHostConntrackHigh` fires while the mode is `tracked`. | yes |
+| Conntrack pressure | Set `net.netfilter.nf_conntrack_max` to 64. Open more than 64 UDP flows. When the table is full, the kernel drops each new flow and the sender gets `EPERM`. This is the expected result, not an error. | `nf_conntrack_count` reaches 80 percent of the limit. `TnHostConntrackHigh` fires after 5 minutes above the threshold. | yes |
 | Committee loss and recovery | Block one committee member's address on the primary port. Wait. Unblock it. | `tn_network_committee_peers_connected` falls by one while `tn_network_connected_peers` is unchanged or rising. `TnCommitteeConnectivityDegraded` fires after 5 minutes and clears after the unblock. | no (needs a committee) |
 
 The unit test file `etc/prometheus/rules/telcoin-host-network.test.yaml` covers the rule side of every scenario: a counter reset, an absent exporter, several instances without merging, a `notrack` host, an `unsupported` host, a restart with zero gauges, and committee loss with recovery.

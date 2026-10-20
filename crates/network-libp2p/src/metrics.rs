@@ -1183,8 +1183,8 @@ struct PeerManagerMetricHandles {
     banned_peers: Gauge,
     /// Members of the current committee; zero until a committee is known.
     committee_size: Gauge,
-    /// Current committee members this node should connect to: `committee_size` minus one
-    /// when this node is a member, else `committee_size`.
+    /// Committee peers this node expects to reach: `committee_size` minus one when this node is a
+    /// current member, else 0 (the committee alerts skip non-members).
     committee_peers_expected: Gauge,
     /// Unique current committee members (by BLS key) with at least one established
     /// connection on this network; members of only the previous committee are not counted.

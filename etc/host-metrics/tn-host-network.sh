@@ -15,6 +15,9 @@ MAX_RULES=32
 NFT_PREFIX='tn_'
 CONNTRACK_MAX_FILE=/proc/sys/net/netfilter/nf_conntrack_max
 RMEM_MAX_FILE=/proc/sys/net/core/rmem_max
+# A rule with a notrack statement ({"notrack": null} in its expr list). A counter, chain
+# or comment that is only named notrack does not match.
+NOTRACK_FILTER='[ .nftables[] | .rule? // empty | .expr[]? | select(type == "object" and has("notrack")) ] | length > 0'
 
 emit_header() {
     printf '# HELP %s %s\n# TYPE %s %s\n' "$1" "$3" "$1" "$2"
@@ -60,8 +63,8 @@ collect_conntrack() {
     local mode=tracked tracked=0 notrack=0 unsupported=0
     if [ ! -r "$CONNTRACK_MAX_FILE" ]; then
         mode=unsupported
-    elif command -v nft >/dev/null 2>&1 \
-        && nft list ruleset 2>/dev/null | awk '/notrack/ { found = 1 } END { exit found ? 0 : 1 }'; then
+    elif command -v nft >/dev/null 2>&1 && command -v jq >/dev/null 2>&1 \
+        && nft -j list ruleset 2>/dev/null | jq -e "$NOTRACK_FILTER" >/dev/null 2>&1; then
         mode=notrack
     fi
     case "$mode" in
@@ -70,7 +73,7 @@ collect_conntrack() {
         unsupported) unsupported=1 ;;
     esac
     emit_header tn_host_conntrack_mode gauge \
-        'One-hot conntrack mode: tracked, notrack (the ruleset has a notrack statement) or unsupported (no nf_conntrack_max).'
+        'One-hot conntrack mode: tracked (conntrack present and no notrack rule found, or nft or jq missing), notrack (the nft ruleset has at least one rule with a notrack statement, read with nft -j and jq) or unsupported (no nf_conntrack_max).'
     printf 'tn_host_conntrack_mode{mode="%s"} %s\n' \
         tracked "$tracked" notrack "$notrack" unsupported "$unsupported"
 }

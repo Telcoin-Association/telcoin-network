@@ -1921,7 +1921,7 @@
       "id": 52,
       "type": "state-timeline",
       "title": "Collector and conntrack state",
-      "description": "Explicit states of the host collectors. Collector: exporter-down, collector-absent (no textfile mtime series), collector-stale (file older than 120 seconds), ok. Conntrack: tracked, notrack (a notrack rule is present), unsupported (no conntrack sysctl), collector-failed (the node_exporter conntrack collector returned an error). Absent means Prometheus has no series for that instance.",
+      "description": "Explicit states of the host collectors. Collector: exporter-down, collector-absent (no textfile mtime series), collector-stale (file older than 120 seconds), firewall-unavailable (the collector cannot list nft counters: nft or jq missing, or nft failed), ok. Conntrack: unsupported (no conntrack sysctl), collector-failed (the node_exporter conntrack collector returned an error and no textfile reports unsupported), notrack (at least one nft rule has a notrack statement; other flows are still tracked), tracked. A host without the conntrack module shows unsupported while the textfile is present and collector-failed without it. Absent means Prometheus has no series for that instance.",
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
@@ -1981,6 +1981,11 @@
                   "text": "collector-failed",
                   "color": "red",
                   "index": 7
+                },
+                "9": {
+                  "text": "firewall-unavailable",
+                  "color": "orange",
+                  "index": 8
                 }
               }
             }
@@ -2010,7 +2015,7 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "sum by (instance) ((up{job=~\"$node_job\",instance=~\"$node_instance\"} == 0) + 1) or sum by (instance) ((up{job=~\"$node_job\",instance=~\"$node_instance\"} == 1 unless on (instance) node_textfile_mtime_seconds{job=~\"$node_job\",instance=~\"$node_instance\",file=\"tn_host_network.prom\"}) + 1) or sum by (instance) (3 * clamp_max(time() - node_textfile_mtime_seconds{job=~\"$node_job\",instance=~\"$node_instance\",file=\"tn_host_network.prom\"} > 120, 1)) or sum by (instance) (4 * (up{job=~\"$node_job\",instance=~\"$node_instance\"} == 1))",
+          "expr": "sum by (instance) ((up{job=~\"$node_job\",instance=~\"$node_instance\"} == 0) + 1) or sum by (instance) ((up{job=~\"$node_job\",instance=~\"$node_instance\"} == 1 unless on (instance) node_textfile_mtime_seconds{job=~\"$node_job\",instance=~\"$node_instance\",file=~\"(.*/)?tn_host_network[.]prom\"}) + 1) or sum by (instance) (3 * clamp_max(time() - node_textfile_mtime_seconds{job=~\"$node_job\",instance=~\"$node_instance\",file=~\"(.*/)?tn_host_network[.]prom\"} > 120, 1)) or sum by (instance) ((tn_host_firewall_collector_available{job=~\"$node_job\",instance=~\"$node_instance\"} == 0) + 9) or sum by (instance) (4 * (up{job=~\"$node_job\",instance=~\"$node_instance\"} == 1))",
           "legendFormat": "{{instance}} collector",
           "refId": "A"
         },
@@ -2019,7 +2024,7 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "sum by (instance) (8 * (node_scrape_collector_success{job=~\"$node_job\",instance=~\"$node_instance\",collector=\"conntrack\"} == 0)) or sum by (instance) (7 * (tn_host_conntrack_mode{job=~\"$node_job\",instance=~\"$node_instance\",mode=\"unsupported\"} == 1)) or sum by (instance) (6 * (tn_host_conntrack_mode{job=~\"$node_job\",instance=~\"$node_instance\",mode=\"notrack\"} == 1)) or sum by (instance) (5 * (tn_host_conntrack_mode{job=~\"$node_job\",instance=~\"$node_instance\",mode=\"tracked\"} == 1))",
+          "expr": "sum by (instance) (7 * (tn_host_conntrack_mode{job=~\"$node_job\",instance=~\"$node_instance\",mode=\"unsupported\"} == 1)) or sum by (instance) ((node_scrape_collector_success{job=~\"$node_job\",instance=~\"$node_instance\",collector=\"conntrack\"} == 0) + 8) or sum by (instance) (6 * (tn_host_conntrack_mode{job=~\"$node_job\",instance=~\"$node_instance\",mode=\"notrack\"} == 1)) or sum by (instance) (5 * (tn_host_conntrack_mode{job=~\"$node_job\",instance=~\"$node_instance\",mode=\"tracked\"} == 1))",
           "legendFormat": "{{instance}} conntrack",
           "refId": "B"
         }
@@ -2113,7 +2118,7 @@
       "id": 55,
       "type": "timeseries",
       "title": "Committee peers expected vs connected",
-      "description": "Committee peers the node expects to reach versus the committee peers that have an open connection, per network (primary or worker). The local node is not counted in either value.",
+      "description": "Committee peers the node expects to reach versus the committee peers that have an open connection, per network (primary or worker). The local node is not counted in either value. A node outside the current committee shows expected 0; the committee alerts apply to members only.",
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
@@ -2166,7 +2171,7 @@
       "id": 56,
       "type": "timeseries",
       "title": "Committee coverage (%)",
-      "description": "Connected committee peers as a percentage of expected committee peers. The red line marks two thirds; below it the node cannot see a quorum of the committee. Empty when no committee is loaded.",
+      "description": "Connected committee peers as a percentage of expected committee peers. The red line marks two thirds; below it the node cannot see a quorum of the committee. Empty when no committee is loaded or when the node is outside the current committee (expected 0).",
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
