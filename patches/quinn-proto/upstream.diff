@@ -432,10 +432,10 @@ index 5982b69033db7e1d366e05074fdf32098509976a..f00f4bc9190b6caec0656db872e20bd0
      #[cfg(feature = "arbitrary")]
 diff --git patched/src/tests/incoming_observations.rs patched/src/tests/incoming_observations.rs
 new file mode 100644
-index 0000000000000000000000000000000000000000..63cccf5d8f1381824a2404a1f83bbe2180af5f71
+index 0000000000000000000000000000000000000000..718c14b88f1a9cebd62ae380426f796f60c5e945
 --- /dev/null
 +++ patched/src/tests/incoming_observations.rs
-@@ -0,0 +1,211 @@
+@@ -0,0 +1,214 @@
 +//! Deterministic observations at real endpoint decision sites.
 +
 +use super::{token::FakeTimeSource, *};
@@ -511,14 +511,17 @@ index 0000000000000000000000000000000000000000..63cccf5d8f1381824a2404a1f83bbe21
 +                ));
 +            }
 +            Disposition::Refuse => {
-+                pair.server.refuse(incoming, &mut Vec::new());
++                let refusal = pair.server.refuse(incoming, &mut Vec::new());
++                assert!(refusal.size > 0);
 +            }
 +            Disposition::Ignore => pair.server.ignore(incoming),
 +            Disposition::Retry => {
-+                pair.server
++                let retry = pair
++                    .server
 +                    .endpoint
 +                    .retry(incoming, &mut Vec::new())
 +                    .map_err(|_| "retry failed")?;
++                assert!(retry.size > 0);
 +            }
 +        }
 +        assert_eq!(

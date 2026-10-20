@@ -2694,7 +2694,7 @@
   "quinn_provenance": {
     "registry_archive_sha256": "a9746dbde176634f4f2f1faf2404e30a31b2bc1e9cafb5329c95d8177a18c9fc",
     "upstream_base_revision": "eaec0db4bcb698f76df736d89938743c88a2ad5f",
-    "upstream_diff_sha256": "219d1f7a04a2e2433815ba393110c16e40afa2016a7d02d27af68ec0d268a369",
+    "upstream_diff_sha256": "b3bddf015b9991132fa7a73506bcbed227ed03eea30442f851dc90651a47c163",
     "vendored_files": {
       "Cargo.toml": "739f19627faef023b9c24932441d4e23b82b5786c8c57e37a1419d93189ef5c5",
       "Cargo.toml.orig": "b51200a74958e34fa6581ea6a7a349354eb3d68506e42d135baf251cc62eda3a",
@@ -2746,7 +2746,7 @@
       "src/range_set/mod.rs": "34180938d54029c07d2bee70501e3c6e865581d1be1411c4e5319bf82e98a657",
       "src/range_set/tests.rs": "195a6ced04ff4fb5d85f7d1aee3404de66ac4325e228cdb0d5fb3c82bb3b657d",
       "src/shared.rs": "126c72d2c933a8e27cb9264d6d973239fbde78620af7a91b9967a4481ec49599",
-      "src/tests/incoming_observations.rs": "ab5ca99b0967efe0ff48e45ec57f957e8522b3bcb4ddc2f05cd67f2f2658ded4",
+      "src/tests/incoming_observations.rs": "9e400407885cbbc760450e726440deae58673316bf141d576e5b875b9973ed32",
       "src/tests/mod.rs": "b83de7d1431bd83f8b09ea0da490da4293ec7aab5c5caf61ba4e4c5501fd01a4",
       "src/tests/token.rs": "f648dd0c171d1f2c498e0363b68c6211d5e9ec2f2b305db4a262d3ec47ebbc79",
       "src/tests/util.rs": "147b3c45aa083fc13fb72818eb098f1ec14548830612040e7a1c521c41f12a3d",
@@ -2756,6 +2756,6 @@
       "src/transport_parameters.rs": "e6b70199d2322ddf2b2b6516c39bc4554b17364cf3fc60ba669d718fdc58a266",
       "src/varint.rs": "6f07845002d5fe7b0a1388fc18eecba0f1d3870110494052d1eeaf963eb1d132"
     },
-    "vendored_tree_sha256": "f171721216180561d13a478d675b85504190ac29cde9031bc38c8c444b3274e2"
+    "vendored_tree_sha256": "a64afd46d7b4d7da8d240f6a30b978a68cb6772fc33099bf5f34012c83849904"
   }
 }

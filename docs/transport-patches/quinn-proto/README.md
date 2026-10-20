@@ -18,8 +18,8 @@ before Initial-key derivation. Label vocabularies are fixed and independent of r
 | Maintained mirror | [Tracked source tree](../../../patches/quinn-proto) |
 | Exact observation revision | [`372fa302bbb85758c9341b2c6b2247db3e9601ca`](https://github.com/Telcoin-Association/telcoin-network/commit/372fa302bbb85758c9341b2c6b2247db3e9601ca) |
 | Cargo source | Root `[patch.crates-io]`, `quinn-proto = { path = "patches/quinn-proto" }`, excluded from workspace membership |
-| Complete diff | [upstream.diff](../../../patches/quinn-proto/upstream.diff), SHA-256 `219d1f7a04a2e2433815ba393110c16e40afa2016a7d02d27af68ec0d268a369` |
-| Source tree fingerprint | `f171721216180561d13a478d675b85504190ac29cde9031bc38c8c444b3274e2` |
+| Complete diff | [upstream.diff](../../../patches/quinn-proto/upstream.diff), SHA-256 `b3bddf015b9991132fa7a73506bcbed227ed03eea30442f851dc90651a47c163` |
+| Source tree fingerprint | `a64afd46d7b4d7da8d240f6a30b978a68cb6772fc33099bf5f34012c83849904` |
 | Resolution evidence | [source.json](evidence/source.json), default and Adiri Linux graphs, package IDs, dependency edges, enabled features and per-file source hashes |
 
 The normalized registry manifest, dependencies, features, crypto providers and both licenses
