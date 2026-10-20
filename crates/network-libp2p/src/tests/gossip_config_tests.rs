@@ -1,4 +1,5 @@
-//! Tests for the explicit gossipsub frame limits (issue #1655).
+//! Tests for the explicit gossipsub frame limits (issue #1655) and for the rejection of the
+//! unsigned `key` field (issue #1699).
 
 use super::*;
 use eyre::eyre;
@@ -364,11 +365,12 @@ async fn test_gossip_frame_limits_on_the_wire() -> eyre::Result<()> {
     ))
     .map_err(|e| eyre!("gossip protocol: {e:?}"))?;
 
-    // receiver: the node's gossipsub configuration, subscribed to the test topic
+    // receiver: the node's gossipsub configuration and transform, subscribed to the test topic
     let receiver_key = Keypair::generate_ed25519();
-    let mut gossip: gossipsub::Behaviour = gossipsub::Behaviour::new(
+    let mut gossip: GossipBehaviour = GossipBehaviour::new_with_transform(
         gossipsub::MessageAuthenticity::Signed(receiver_key.clone()),
         gossipsub_config(TEST_CHAIN_ID)?,
+        RejectGossipKey,
     )
     .map_err(|e| eyre!("gossipsub behaviour: {e}"))?;
     gossip
@@ -474,5 +476,242 @@ async fn test_gossip_frame_limits_on_the_wire() -> eyre::Result<()> {
         expected.iter().map(Vec::len).collect::<Vec<_>>()
     );
     assert!(delivered == expected, "the delivered payloads differ from the honest payloads");
+    Ok(())
+}
+
+/// [`RejectGossipKey`] rejects a message that carries `key`, gives a message without `key` to the
+/// node unchanged, and does not change outbound data.
+#[test]
+fn test_reject_gossip_key_transform() -> eyre::Result<()> {
+    let author = Keypair::generate_ed25519();
+    let source = author.public().to_peer_id();
+    let topic = gossipsub::IdentTopic::new(longest_topic()).hash();
+    let raw = |key: Option<Vec<u8>>| gossipsub::RawMessage {
+        source: Some(source),
+        data: b"payload".to_vec(),
+        sequence_number: Some(7),
+        topic: topic.clone(),
+        signature: Some(vec![0u8; 64]),
+        key,
+        validated: false,
+    };
+    let inbound = |key: Option<Vec<u8>>| {
+        gossipsub::DataTransform::inbound_transform(&RejectGossipKey, raw(key))
+    };
+
+    // padding in `key` is rejected
+    let padded = inbound(Some(vec![0xff; MAX_GOSSIP_MESSAGE_SIZE]));
+    assert_eq!(padded.err().map(|e| e.kind()), Some(io::ErrorKind::InvalidData));
+    // the check is strict: the author's own encoded key is rejected too
+    let own_key = inbound(Some(author.public().encode_protobuf()));
+    assert_eq!(own_key.err().map(|e| e.kind()), Some(io::ErrorKind::InvalidData));
+    // an empty `key` is still a `key`
+    let empty = inbound(Some(Vec::new()));
+    assert_eq!(empty.err().map(|e| e.kind()), Some(io::ErrorKind::InvalidData));
+
+    // without `key`, every field the node reads is unchanged
+    let clean = inbound(None)?;
+    assert_eq!(
+        clean,
+        gossipsub::Message {
+            source: Some(source),
+            data: b"payload".to_vec(),
+            sequence_number: Some(7),
+            topic: topic.clone(),
+        }
+    );
+
+    // outbound data is unchanged
+    let outbound =
+        gossipsub::DataTransform::outbound_transform(&RejectGossipKey, &topic, b"out".to_vec())?;
+    assert_eq!(outbound, b"out".to_vec());
+    Ok(())
+}
+
+/// Test transform for the observer in the key wire test.
+///
+/// It records the payload and the `key` length of each message the observer receives, before any
+/// other check, then applies the identity transform.
+struct RecordRawMessages(mpsc::UnboundedSender<(Vec<u8>, Option<usize>)>);
+
+impl gossipsub::DataTransform for RecordRawMessages {
+    fn inbound_transform(
+        &self,
+        raw_message: gossipsub::RawMessage,
+    ) -> Result<gossipsub::Message, io::Error> {
+        // the test drops its receiver only after it has failed
+        let _ = self.0.send((raw_message.data.clone(), raw_message.key.as_ref().map(Vec::len)));
+        gossipsub::DataTransform::inbound_transform(&gossipsub::IdentityTransform, raw_message)
+    }
+
+    fn outbound_transform(
+        &self,
+        topic: &gossipsub::TopicHash,
+        data: Vec<u8>,
+    ) -> Result<Vec<u8>, io::Error> {
+        gossipsub::DataTransform::outbound_transform(&gossipsub::IdentityTransform, topic, data)
+    }
+}
+
+/// On the wire, a receiver that runs the node's gossipsub drops a valid message that carries
+/// the unsigned `key` field, does not forward it, and accepts a later clean copy of the same
+/// message (issue #1699).
+///
+/// A raw sender writes three frames on one substream: a signed message with 12,000 bytes of
+/// padding in `key`, a sentinel, and the same signed message without `key`. The receiver accepts
+/// each message it delivers, as `verify_gossip` does, so it forwards the message to an explicit
+/// peer (the observer). Without [`RejectGossipKey`], the receiver delivers the padded copy first,
+/// forwards it with the padding, and drops the clean copy as a duplicate.
+#[tokio::test]
+async fn test_gossip_key_field_rejected_on_the_wire() -> eyre::Result<()> {
+    let topic = longest_topic();
+    let gossip_topic = gossipsub::IdentTopic::new(topic.clone());
+    let protocol = StreamProtocol::try_from_owned(format!(
+        "{}/1.1.0",
+        gossip_protocol_id_prefix(TEST_CHAIN_ID)
+    ))
+    .map_err(|e| eyre!("gossip protocol: {e:?}"))?;
+
+    // observer: records each message the receiver forwards to it
+    let observer_key = Keypair::generate_ed25519();
+    let observer_id = observer_key.public().to_peer_id();
+    let (recorded_tx, mut recorded_rx) = mpsc::unbounded_channel();
+    let mut observer_gossip = gossipsub::Behaviour::new_with_transform(
+        gossipsub::MessageAuthenticity::Signed(observer_key.clone()),
+        gossipsub_config(TEST_CHAIN_ID)?,
+        RecordRawMessages(recorded_tx),
+    )
+    .map_err(|e| eyre!("observer gossipsub behaviour: {e}"))?;
+    observer_gossip.subscribe(&gossip_topic).map_err(|e| eyre!("observer subscribe: {e:?}"))?;
+
+    // receiver: the node's gossipsub configuration and transform, with the observer as an
+    // explicit peer, so the receiver forwards every accepted message to it
+    let receiver_key = Keypair::generate_ed25519();
+    let mut gossip: GossipBehaviour = GossipBehaviour::new_with_transform(
+        gossipsub::MessageAuthenticity::Signed(receiver_key.clone()),
+        gossipsub_config(TEST_CHAIN_ID)?,
+        RejectGossipKey,
+    )
+    .map_err(|e| eyre!("gossipsub behaviour: {e}"))?;
+    gossip.subscribe(&gossip_topic).map_err(|e| eyre!("subscribe: {e:?}"))?;
+    gossip.add_explicit_peer(&observer_id);
+    let mut receiver = SwarmBuilder::with_existing_identity(receiver_key)
+        .with_tokio()
+        .with_quic()
+        .with_behaviour(|_| gossip)
+        .map_err(|e| eyre!("receiver behaviour: {e:?}"))?
+        .with_swarm_config(|c| c.with_idle_connection_timeout(WIRE_TIMEOUT))
+        .build();
+    receiver.listen_on("/ip4/127.0.0.1/udp/0/quic-v1".parse()?)?;
+    let address = (&mut receiver)
+        .filter_map(listen_address)
+        .next()
+        .await
+        .ok_or_else(|| eyre!("the receiver stopped before it listened"))?;
+
+    // accept and report every delivered payload, in delivery order, and report each peer that
+    // subscribes to the test topic
+    let (delivered_tx, mut delivered_rx) = mpsc::unbounded_channel();
+    let (subscribed_tx, mut subscribed_rx) = mpsc::unbounded_channel();
+    tokio::spawn(
+        futures::stream::unfold(receiver, move |mut receiver| {
+            let delivered_tx = delivered_tx.clone();
+            let subscribed_tx = subscribed_tx.clone();
+            async move {
+                let event = receiver.next().await?;
+                if let SwarmEvent::Behaviour(gossipsub::Event::Message {
+                    propagation_source,
+                    message_id,
+                    message,
+                    ..
+                }) = event
+                {
+                    // the message is in the message cache, so the result is always true
+                    let _ = receiver.behaviour_mut().report_message_validation_result(
+                        &message_id,
+                        &propagation_source,
+                        gossipsub::MessageAcceptance::Accept,
+                    );
+                    let _ = delivered_tx.send(message.data);
+                } else if let SwarmEvent::Behaviour(gossipsub::Event::Subscribed {
+                    peer_id, ..
+                }) = event
+                {
+                    let _ = subscribed_tx.send(peer_id);
+                }
+                Some(((), receiver))
+            }
+        })
+        .for_each(|()| future::ready(())),
+    );
+
+    let mut observer = SwarmBuilder::with_existing_identity(observer_key)
+        .with_tokio()
+        .with_quic()
+        .with_behaviour(|_| observer_gossip)
+        .map_err(|e| eyre!("observer behaviour: {e:?}"))?
+        .with_swarm_config(|c| c.with_idle_connection_timeout(WIRE_TIMEOUT))
+        .build();
+    observer.dial(address.clone())?;
+    tokio::spawn(observer.for_each(|_| future::ready(())));
+
+    // the receiver forwards to the observer only after it has the observer's subscription
+    tokio::time::timeout(
+        WIRE_TIMEOUT,
+        futures::stream::poll_fn(|cx| subscribed_rx.poll_recv(cx))
+            .filter(|peer_id| future::ready(*peer_id == observer_id))
+            .next(),
+    )
+    .await
+    .map_err(|_| eyre!("the observer did not subscribe in time"))?
+    .ok_or_else(|| eyre!("the receiver stopped before the observer subscribed"))?;
+
+    // sender: raw substreams on the same gossipsub protocol
+    let sender_key = Keypair::generate_ed25519();
+    let (opener, requests) = mpsc::unbounded_channel();
+    let raw_sender = RawGossipSender { protocol, requests: Some(requests) };
+    let mut sender = SwarmBuilder::with_existing_identity(sender_key.clone())
+        .with_tokio()
+        .with_quic()
+        .with_behaviour(|_| raw_sender)
+        .map_err(|e| eyre!("sender behaviour: {e:?}"))?
+        .with_swarm_config(|c| c.with_idle_connection_timeout(WIRE_TIMEOUT))
+        .build();
+    sender.dial(address)?;
+    tokio::spawn(sender.for_each(|_| future::ready(())));
+
+    // the padded copy has a valid signature: `key` is not signed, and padding that does not
+    // decode as a key makes the codec take the key from the peer id
+    let payload = b"payload of a message padded in key".to_vec();
+    let clean = signed_message(&sender_key, 1, &topic, &payload);
+    let padded = [clean.clone(), field(6, &vec![0xffu8; MAX_GOSSIP_MESSAGE_SIZE])].concat();
+    let sentinel = signed_message(&sender_key, 2, &topic, b"sentinel");
+    // the padded frame is inside the frame limits, so only the transform can stop it
+    assert!(publish_frame(&[padded.clone()]).len() <= GOSSIP_FRAME_BOUND);
+
+    let mut substream = open_substream(&opener).await?;
+    substream.write_all(&publish_frame(&[padded])).await?;
+    substream.write_all(&publish_frame(&[sentinel])).await?;
+    substream.write_all(&publish_frame(&[clean])).await?;
+    substream.flush().await?;
+
+    // the sentinel is the first delivery, so the padded copy was dropped, and the clean copy
+    // follows it, so the padded copy did not reach the duplicate cache
+    let delivered: Vec<Vec<u8>> = tokio::time::timeout(
+        WIRE_TIMEOUT,
+        futures::stream::poll_fn(|cx| delivered_rx.poll_recv(cx)).take(2).collect::<Vec<_>>(),
+    )
+    .await
+    .map_err(|_| eyre!("the receiver did not deliver the sentinel and the clean copy"))?;
+    assert_eq!(delivered, vec![b"sentinel".to_vec(), payload.clone()]);
+
+    // the observer got the two accepted messages, and neither carries `key`
+    let recorded: Vec<(Vec<u8>, Option<usize>)> = tokio::time::timeout(
+        WIRE_TIMEOUT,
+        futures::stream::poll_fn(|cx| recorded_rx.poll_recv(cx)).take(2).collect::<Vec<_>>(),
+    )
+    .await
+    .map_err(|_| eyre!("the receiver did not forward the accepted messages to the observer"))?;
+    assert_eq!(recorded, vec![(b"sentinel".to_vec(), None), (payload, None)]);
     Ok(())
 }

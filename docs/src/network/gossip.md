@@ -119,10 +119,17 @@ A frame that breaks a limit closes the stream, and none of its messages are deli
 - **Frame size: 24,579 bytes.** One honest frame is at most 16,387 bytes: one 12,000-byte payload plus a 512-byte bound on its envelope, or one 16 KiB control field plus its length prefix.
   The codec reads in 8 KiB chunks and checks the size of its whole read buffer, not of one frame, so the limit adds one read chunk.
   Without that slack, two maximum frames sent back to back can close an honest stream.
+  The 16,387-byte bound covers the frames an author sends and the frames a node forwards, because the node rejects the one unsigned field that a forwarder could grow (see the `key` item below).
 - **Publish entries per frame: 8.** An honest peer sends one message per frame.
   The library default of 500 would let one frame force 500 signature checks.
   This is a per-frame bound, not a rate bound.
 - **Control bytes per frame: 16 KiB.** This equals the library default, set explicitly so that an upgrade cannot change it.
+- **Unsigned `key` field: rejected.** The author signs `from`, `data`, `seqno` and `topic`, but not `key`.
+  A node forwards a message as it received it, so without this check a peer could add bytes in `key` to a valid message, and every honest node would forward the larger copy.
+  An ed25519 author never sends `key`, because its public key is inlined in its peer id, so the node drops every message that carries `key` (issue #1699).
+  This check drops the message only, and the stream stays open.
+  It runs before the duplicate cache, so a later clean copy of the same message is accepted.
+  The node does not penalize the peer, because a node on an older release forwards such a message without fault.
 
 No topic has its own size limit, because `MAX_GOSSIP_MESSAGE_SIZE` applies to every topic.
 The limits and the order in which the library applies them are recorded at `gossipsub_config`, with the resolved library versions.
@@ -178,7 +185,7 @@ See [Network architecture](../architecture/network.md) for the node roles this g
 |----------|------|
 | Topic names | `crates/config/src/network.rs` (`LibP2pConfig` topic constructors) |
 | Message size limit | `crates/config/src/network.rs` (`MAX_GOSSIP_MESSAGE_SIZE`) |
-| Gossipsub configuration and frame limits | `crates/network-libp2p/src/gossip_config.rs` (`gossipsub_config`), called from `ConsensusNetwork::new` |
+| Gossipsub configuration, frame limits and `key` rejection | `crates/network-libp2p/src/gossip_config.rs` (`gossipsub_config`, `RejectGossipKey`), called from `ConsensusNetwork::new` |
 | Allowlist check and subscribe/unsubscribe | `crates/network-libp2p/src/consensus.rs` (`verify_gossip`, `NetworkCommand::Subscribe`) |
 | Penalty attribution | `crates/network-libp2p/src/consensus.rs` (`RejectReason::penalty`) |
 | Per-epoch subscription and allowlists | `crates/node/src/manager/node/start_epoch.rs` (`spawn_primary_network_for_epoch`, `spawn_worker_network_for_epoch`) |
