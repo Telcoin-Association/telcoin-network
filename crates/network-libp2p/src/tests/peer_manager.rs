@@ -3909,10 +3909,20 @@ async fn test_source_admission_denial_metric_records_reason() {
             .expect("valid source budget");
         peer_manager.set_source_budget(Some(budget));
         assert!(peer_manager
-            .reserve_source(ConnectionId::new_unchecked(1), peer, &endpoint, "in")
+            .reserve_source(
+                ConnectionId::new_unchecked(1),
+                peer,
+                &endpoint,
+                crate::metrics::ConnectionDirection::Inbound
+            )
             .is_ok());
         assert!(peer_manager
-            .reserve_source(ConnectionId::new_unchecked(2), peer, &endpoint, "in")
+            .reserve_source(
+                ConnectionId::new_unchecked(2),
+                peer,
+                &endpoint,
+                crate::metrics::ConnectionDirection::Inbound
+            )
             .is_err());
     });
 
