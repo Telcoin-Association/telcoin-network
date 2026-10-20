@@ -6,6 +6,7 @@ publish = false
 license = "MIT OR Apache-2.0"
 
 [dev-dependencies]
+metrics = { version = "=0.24.3", default-features = false }
 tracing = { version = "=0.1.44", default-features = false, features = ["std"] }
 
 [workspace]
