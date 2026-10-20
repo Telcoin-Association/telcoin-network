@@ -1,0 +1,1936 @@
+//! Slotted page layout and byte-level codec for the B+tree pages.
+//!
+//! Every tree page is one page of the file ([`Geometry::page_size`] bytes, a power of two in
+//! 4 KiB..=64 KiB) holding variable-size cells addressed through a slot array kept in key order:
+//!
+//! ```text
+//! header (24):  pgno u32 | kind u8 (1 = branch, 2 = leaf) | flags u8 | nkeys u16 | txn u64 | upper u16 | reserved [6]
+//! slots:        nkeys × u16 cell offsets from byte 24; slot i addresses cell i (key order)
+//! free space:   from the end of the slot array up to `upper`
+//! cells:        packed from `upper` up to P − 4, in no particular order
+//! trailer (4):  CRC32, stamped at commit (all zeros = dirty); this codec never touches it
+//!
+//! leaf cell:    vlen u32 | klen u16 | flags u16 | key | value
+//! branch cell:  child u32 | child_txn u32 | klen u16 | key
+//! ```
+//!
+//! **Packing.** The cells tile `upper..P − 4` exactly. A new cell goes just below `upper`;
+//! deleting or shrinking a cell closes its gap at once (the cells below it move up and their slots
+//! follow), so a page never fragments and its free space is the single gap
+//! `upper − (24 + 2·nkeys)`. With `used` = the bytes of every cell plus its slot,
+//! `free + used == U` always holds, where `U = P − 28` (header and trailer).
+//!
+//! **Branches** hold one cell per child (LMDB-style uniform cells): cell i's key is the lower
+//! bound of child i's key range, and cell 0's key is empty and stands for −∞, so the child for a
+//! key is the last cell whose key is `<=` it.
+//!
+//! **Limits.** An entry (cell plus slot) is at most `MAX_ENTRY = U / 4` bytes:
+//! `max_key = MAX_ENTRY − 12` (so any key fits a branch cell as a separator) and
+//! `max_value(klen) = MAX_ENTRY − 10 − klen` (0 for a key over `max_key`, which [`validate`]
+//! refuses in a leaf too). A page that overflows holds at most `U + MAX_ENTRY`
+//! bytes counting the pending entry, so cutting it at the first entry where the left part reaches
+//! half leaves a left part under `half + MAX_ENTRY ≤ 5U/8 + U/4` and a right part of at most half:
+//! one split always suffices ([`split_leaf`], [`split_branch`]).
+//!
+//! **Checking.** Pages read from the file may hold any bytes. [`validate`] checks a whole page
+//! (header, every cell in bounds, cells tiling the cell area, keys strictly ascending, entry
+//! limits). Without it, every accessor still bounds-checks what it touches (the header in O(1),
+//! then the cells it reads) and returns [`Error::Corrupt`] instead of indexing out of the page, so
+//! readers can use pages lazily. The mutators stay in bounds on any page but keep a page valid only
+//! if it was valid, so a page read from the file must pass [`validate`] before its first change.
+
+use std::{cmp::Ordering, fmt::Display};
+
+use crate::error::{Error, Result};
+
+/// Smallest supported page size.
+pub(crate) const MIN_PAGE_SIZE: usize = 4096;
+/// Largest supported page size (the largest whose cell offsets fit a `u16` slot).
+pub(crate) const MAX_PAGE_SIZE: usize = 65536;
+/// Size of the page header.
+pub(crate) const HEADER: usize = 24;
+/// Size of the CRC trailer at the end of every page.
+pub(crate) const TRAILER: usize = 4;
+/// Size of one slot (a `u16` cell offset).
+pub(crate) const SLOT: usize = 2;
+/// Fixed part of a leaf cell: `vlen u32 | klen u16 | flags u16`.
+pub(crate) const LEAF_CELL_HEADER: usize = 8;
+/// Fixed part of a branch cell: `child u32 | child_txn u32 | klen u16`.
+pub(crate) const BRANCH_CELL_HEADER: usize = 10;
+
+// Header field offsets.
+const PGNO_OFF: usize = 0;
+const KIND_OFF: usize = 4;
+const FLAGS_OFF: usize = 5;
+const NKEYS_OFF: usize = 6;
+const TXN_OFF: usize = 8;
+const UPPER_OFF: usize = 16;
+const RESERVED_OFF: usize = 18;
+
+const KIND_BRANCH: u8 = 1;
+const KIND_LEAF: u8 = 2;
+
+/// The two kinds of tree page.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Kind {
+    /// An interior page: one `(child, child_txn, lower-bound key)` cell per child.
+    Branch,
+    /// A leaf page: one `(key, value)` cell per entry.
+    Leaf,
+}
+
+impl Kind {
+    /// The header tag byte.
+    fn tag(self) -> u8 {
+        match self {
+            Self::Branch => KIND_BRANCH,
+            Self::Leaf => KIND_LEAF,
+        }
+    }
+
+    /// The fixed part of a cell of this kind (its smallest possible size).
+    fn cell_header(self) -> usize {
+        match self {
+            Self::Branch => BRANCH_CELL_HEADER,
+            Self::Leaf => LEAF_CELL_HEADER,
+        }
+    }
+}
+
+/// Outcome of a leaf binary search.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Search {
+    /// The key is at this cell index.
+    Found(usize),
+    /// The key is absent; this is the cell index it would be inserted at.
+    NotFound(usize),
+}
+
+/// Outcome of [`leaf_find`]: a [`Search`] with what the search already read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Find<'a> {
+    /// The key is at cell `index`, whose value is `value`.
+    Found {
+        /// The cell index.
+        index: usize,
+        /// The entry's value.
+        value: &'a [u8],
+    },
+    /// The key is absent and would be inserted at cell `index`, between `before` (the key of cell
+    /// `index − 1`; `None` when `index` is 0) and `after` (the key of cell `index`; `None` past
+    /// the last cell).
+    NotFound {
+        /// The insertion index.
+        index: usize,
+        /// The key below the insertion point.
+        before: Option<&'a [u8]>,
+        /// The key above the insertion point.
+        after: Option<&'a [u8]>,
+    },
+}
+
+/// The way down a branch to one child ([`branch_route`], [`branch_route_at`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Route<'a> {
+    /// The child's cell index.
+    pub(crate) index: usize,
+    /// The child's lower bound in this branch, the key of cell `index` (`None` for cell 0: −∞).
+    pub(crate) lo: Option<&'a [u8]>,
+    /// The child's upper bound in this branch, the key of cell `index + 1` (`None` for the last
+    /// child).
+    pub(crate) hi: Option<&'a [u8]>,
+    /// The child's page number.
+    pub(crate) child: u32,
+    /// The low 32 bits of the child's header txn (see [`branch_child`]).
+    pub(crate) child_txn: u32,
+}
+
+/// Outcome of an operation that adds bytes to a page.
+#[must_use]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Fit {
+    /// The page was changed.
+    Done,
+    /// The bytes do not fit the page's free space; the page is unchanged (byte for byte).
+    Full,
+}
+
+/// Page size and the limits derived from it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Geometry {
+    page_size: usize,
+    usable: usize,
+    max_entry: usize,
+}
+
+impl Geometry {
+    /// The geometry of `page_size`-byte pages: a power of two in 4096..=65536, else
+    /// [`Error::InvalidPageSize`].
+    pub(crate) fn new(page_size: u32) -> Result<Self> {
+        let p = page_size as usize;
+        if !p.is_power_of_two() || !(MIN_PAGE_SIZE..=MAX_PAGE_SIZE).contains(&p) {
+            return Err(Error::InvalidPageSize(page_size));
+        }
+        let usable = p - HEADER - TRAILER;
+        Ok(Self { page_size: p, usable, max_entry: usable / 4 })
+    }
+
+    /// The page size P in bytes.
+    pub(crate) fn page_size(&self) -> usize {
+        self.page_size
+    }
+
+    /// `U = P − 28`: the bytes a page has for cells and slots.
+    #[cfg(test)]
+    pub(crate) fn usable(&self) -> usize {
+        self.usable
+    }
+
+    /// `U / 4`: the largest entry (cell plus slot) a page accepts.
+    #[cfg(test)]
+    pub(crate) fn max_entry(&self) -> usize {
+        self.max_entry
+    }
+
+    /// The longest key: one whose branch cell (as a separator) is a maximal entry.
+    pub(crate) fn max_key(&self) -> usize {
+        self.max_entry - BRANCH_CELL_HEADER - SLOT
+    }
+
+    /// The longest value stored with a `klen`-byte key, or 0 for a key over [`max_key`], which
+    /// is refused with any value. A key within the limit always takes at least 2 bytes, so 0 is
+    /// never a limit for an accepted key.
+    ///
+    /// [`max_key`]: Self::max_key
+    pub(crate) fn max_value(&self, klen: usize) -> usize {
+        if klen > self.max_key() {
+            return 0;
+        }
+        self.max_entry - LEAF_CELL_HEADER - SLOT - klen
+    }
+
+    /// Check an entry's sizes against the limits: [`Error::KeyTooLarge`] or
+    /// [`Error::ValueTooLarge`], before anything is changed.
+    pub(crate) fn check_entry(&self, klen: usize, vlen: usize) -> Result<()> {
+        let max = self.max_key();
+        if klen > max {
+            return Err(Error::KeyTooLarge { len: klen, max });
+        }
+        let max = self.max_value(klen);
+        if vlen > max {
+            return Err(Error::ValueTooLarge { len: vlen, max });
+        }
+        Ok(())
+    }
+}
+
+// ---- little-endian scalar helpers ----
+//
+// The `get_*` readers are for header fields of a buffer of any length; the `read_*` readers and
+// the writers index directly and are only used at offsets the page checks have proven in bounds.
+
+fn get_u16(buf: &[u8], off: usize) -> Option<u16> {
+    Some(u16::from_le_bytes(buf.get(off..off + 2)?.try_into().ok()?))
+}
+
+fn get_u32(buf: &[u8], off: usize) -> Option<u32> {
+    Some(u32::from_le_bytes(buf.get(off..off + 4)?.try_into().ok()?))
+}
+
+fn get_u64(buf: &[u8], off: usize) -> Option<u64> {
+    Some(u64::from_le_bytes(buf.get(off..off + 8)?.try_into().ok()?))
+}
+
+fn read_u16(buf: &[u8], off: usize) -> usize {
+    u16::from_le_bytes([buf[off], buf[off + 1]]) as usize
+}
+
+fn read_u32(buf: &[u8], off: usize) -> u32 {
+    u32::from_le_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]])
+}
+
+fn put_u16(buf: &mut [u8], off: usize, v: usize) {
+    debug_assert!(v <= u16::MAX as usize);
+    buf[off..off + 2].copy_from_slice(&(v as u16).to_le_bytes());
+}
+
+fn put_u32(buf: &mut [u8], off: usize, v: u32) {
+    buf[off..off + 4].copy_from_slice(&v.to_le_bytes());
+}
+
+fn put_u64(buf: &mut [u8], off: usize, v: u64) {
+    buf[off..off + 8].copy_from_slice(&v.to_le_bytes());
+}
+
+/// A [`Error::Corrupt`] naming the page.
+#[cold]
+fn corrupt(page: &[u8], what: impl Display) -> Error {
+    Error::Corrupt(format!("page {}: {what}", pgno(page)))
+}
+
+// ---- header ----
+//
+// The raw header accessors read a buffer of any length (a buffer too short for a header reads as
+// zeros); they do not check the page.
+
+/// The page number recorded in the header.
+pub(crate) fn pgno(page: &[u8]) -> u32 {
+    get_u32(page, PGNO_OFF).unwrap_or(0)
+}
+
+/// The page kind, or [`Error::Corrupt`] for an unknown tag.
+pub(crate) fn kind(page: &[u8]) -> Result<Kind> {
+    match page.get(KIND_OFF) {
+        Some(&KIND_BRANCH) => Ok(Kind::Branch),
+        Some(&KIND_LEAF) => Ok(Kind::Leaf),
+        tag => Err(corrupt(page, format_args!("unknown page kind {tag:?}"))),
+    }
+}
+
+/// The header flags (zero in this format version).
+pub(crate) fn flags(page: &[u8]) -> u8 {
+    page.get(FLAGS_OFF).copied().unwrap_or(0)
+}
+
+/// The number of cells (entries of a leaf, children of a branch).
+pub(crate) fn nkeys(page: &[u8]) -> usize {
+    get_u16(page, NKEYS_OFF).map_or(0, usize::from)
+}
+
+/// The id of the transaction that wrote the page.
+pub(crate) fn txn(page: &[u8]) -> u64 {
+    get_u64(page, TXN_OFF).unwrap_or(0)
+}
+
+/// The offset of the lowest cell (the page size minus the trailer when the page is empty).
+pub(crate) fn upper(page: &[u8]) -> usize {
+    get_u16(page, UPPER_OFF).map_or(0, usize::from)
+}
+
+fn init(page: &mut [u8], kind: Kind, pgno: u32, txn: u64) {
+    debug_assert!(valid_len(page.len()), "page buffer of {} bytes", page.len());
+    page.fill(0);
+    put_u32(page, PGNO_OFF, pgno);
+    page[KIND_OFF] = kind.tag();
+    put_u64(page, TXN_OFF, txn);
+    put_u16(page, UPPER_OFF, page.len() - TRAILER);
+}
+
+/// Initialise `page` (all of it, trailer zeroed = dirty) as an empty leaf.
+pub(crate) fn init_leaf(page: &mut [u8], pgno: u32, txn: u64) {
+    init(page, Kind::Leaf, pgno, txn);
+}
+
+/// Initialise `page` (all of it, trailer zeroed = dirty) as a branch with no children yet: add
+/// child 0 with an empty key ([`branch_insert`]), or use [`init_root`].
+pub(crate) fn init_branch(page: &mut [u8], pgno: u32, txn: u64) {
+    init(page, Kind::Branch, pgno, txn);
+}
+
+/// Re-stamp a page's identity: a copy-on-write copy takes its new page number and the writing
+/// transaction's id.
+pub(crate) fn set_pgno_txn(page: &mut [u8], pgno: u32, txn: u64) {
+    put_u32(page, PGNO_OFF, pgno);
+    put_u64(page, TXN_OFF, txn);
+}
+
+fn valid_len(len: usize) -> bool {
+    len.is_power_of_two() && (MIN_PAGE_SIZE..=MAX_PAGE_SIZE).contains(&len)
+}
+
+/// A page header that passed the O(1) checks of [`hdr`].
+#[derive(Clone, Copy, Debug)]
+struct Hdr {
+    kind: Kind,
+    nkeys: usize,
+    upper: usize,
+    /// `P − TRAILER`: the end of the cell area.
+    end: usize,
+}
+
+impl Hdr {
+    /// The end of the slot array.
+    fn slots_end(&self) -> usize {
+        HEADER + SLOT * self.nkeys
+    }
+
+    /// The free gap between the slot array and the cells.
+    fn free(&self) -> usize {
+        self.upper - self.slots_end()
+    }
+}
+
+/// The cheap per-access check: a supported buffer length, a known kind, flags zero and the slot
+/// array ending at or below `upper`, which is at or below the trailer. Every slot read is then in
+/// bounds.
+fn hdr(page: &[u8]) -> Result<Hdr> {
+    let len = page.len();
+    if !valid_len(len) {
+        return Err(corrupt(page, format_args!("page buffer of {len} bytes")));
+    }
+    let kind = kind(page)?;
+    if flags(page) != 0 {
+        return Err(corrupt(page, format_args!("page flags {:#x}", flags(page))));
+    }
+    let (nkeys, upper, end) = (nkeys(page), upper(page), len - TRAILER);
+    if upper > end || HEADER + SLOT * nkeys > upper {
+        return Err(corrupt(page, format_args!("{nkeys} slots and upper {upper} do not fit")));
+    }
+    Ok(Hdr { kind, nkeys, upper, end })
+}
+
+/// [`hdr`] for a page that must be of kind `want`.
+fn hdr_of(page: &[u8], want: Kind) -> Result<Hdr> {
+    let h = hdr(page)?;
+    if h.kind != want {
+        return Err(corrupt(page, format_args!("expected a {want:?} page, found a {:?}", h.kind)));
+    }
+    Ok(h)
+}
+
+// ---- key order ----
+
+/// The byte-wise lexicographic order of keys, a shorter key first when it is a prefix of the
+/// longer: the order of `<[u8]>::cmp`, compared inline eight bytes at a time as big-endian words.
+/// Every key comparison of a search goes through it.
+#[inline]
+pub(crate) fn cmp_keys(a: &[u8], b: &[u8]) -> Ordering {
+    let n = a.len().min(b.len());
+    let (a_words, a_tail) = a[..n].as_chunks::<8>();
+    let (b_words, b_tail) = b[..n].as_chunks::<8>();
+    for (x, y) in a_words.iter().zip(b_words) {
+        if x != y {
+            return u64::from_be_bytes(*x).cmp(&u64::from_be_bytes(*y));
+        }
+    }
+    for (x, y) in a_tail.iter().zip(b_tail) {
+        if x != y {
+            return x.cmp(y);
+        }
+    }
+    a.len().cmp(&b.len())
+}
+
+// ---- cells ----
+
+/// Slot `i` (in bounds for `i < nkeys` once [`hdr`] passed).
+fn slot(page: &[u8], i: usize) -> usize {
+    read_u16(page, HEADER + SLOT * i)
+}
+
+/// The offset of cell `i`, checked to lie in the cell area with room for its fixed part.
+fn cell_off(page: &[u8], h: &Hdr, i: usize) -> Result<usize> {
+    if i >= h.nkeys {
+        return Err(corrupt(page, format_args!("cell {i} of {}", h.nkeys)));
+    }
+    let off = slot(page, i);
+    if off < h.upper || off > h.end - h.kind.cell_header() {
+        return Err(corrupt(
+            page,
+            format_args!("cell {i} at {off} outside the cell area {}..{}", h.upper, h.end),
+        ));
+    }
+    Ok(off)
+}
+
+/// Leaf cell `i` as `(offset, klen, vlen)`, checked to end inside the cell area and to carry no
+/// cell flags (reserved for overflow values and duplicate keys).
+fn leaf_cell(page: &[u8], h: &Hdr, i: usize) -> Result<(usize, usize, usize)> {
+    let off = cell_off(page, h, i)?;
+    let vlen = read_u32(page, off) as usize;
+    let klen = read_u16(page, off + 4);
+    let cell_flags = read_u16(page, off + 6);
+    if cell_flags != 0 {
+        return Err(corrupt(page, format_args!("cell {i} has flags {cell_flags:#x}")));
+    }
+    let room = h.end - off - LEAF_CELL_HEADER;
+    if vlen > room || klen > room - vlen {
+        return Err(corrupt(
+            page,
+            format_args!("cell {i} at {off} ({klen}+{vlen} bytes) overruns"),
+        ));
+    }
+    Ok((off, klen, vlen))
+}
+
+/// Branch cell `i` as `(offset, klen)`, checked to end inside the cell area.
+fn branch_cell(page: &[u8], h: &Hdr, i: usize) -> Result<(usize, usize)> {
+    let off = cell_off(page, h, i)?;
+    let klen = read_u16(page, off + 8);
+    if klen > h.end - off - BRANCH_CELL_HEADER {
+        return Err(corrupt(page, format_args!("cell {i} at {off} ({klen} key bytes) overruns")));
+    }
+    Ok((off, klen))
+}
+
+/// Cell `i` of either kind as `(offset, size)`.
+fn cell_extent(page: &[u8], h: &Hdr, i: usize) -> Result<(usize, usize)> {
+    match h.kind {
+        Kind::Leaf => {
+            let (off, klen, vlen) = leaf_cell(page, h, i)?;
+            Ok((off, LEAF_CELL_HEADER + klen + vlen))
+        }
+        Kind::Branch => {
+            let (off, klen) = branch_cell(page, h, i)?;
+            Ok((off, BRANCH_CELL_HEADER + klen))
+        }
+    }
+}
+
+/// The key of cell `i` of either kind (empty for a branch's cell 0).
+fn key_at<'a>(page: &'a [u8], h: &Hdr, i: usize) -> Result<&'a [u8]> {
+    let (k, klen) = match h.kind {
+        Kind::Leaf => {
+            let (off, klen, _) = leaf_cell(page, h, i)?;
+            (off + LEAF_CELL_HEADER, klen)
+        }
+        Kind::Branch => {
+            let (off, klen) = branch_cell(page, h, i)?;
+            (off + BRANCH_CELL_HEADER, klen)
+        }
+    };
+    Ok(&page[k..k + klen])
+}
+
+/// Make room for a `size`-byte cell at index `i`: the slots from `i` move up one, slot `i` takes
+/// the new cell's offset (returned; its bytes are for the caller to write). `None`, with the page
+/// untouched, if the cell and its slot do not fit the free space.
+fn reserve(page: &mut [u8], h: &Hdr, i: usize, size: usize) -> Result<Option<usize>> {
+    if i > h.nkeys {
+        return Err(corrupt(page, format_args!("insert at {i} of {}", h.nkeys)));
+    }
+    if size.saturating_add(SLOT) > h.free() {
+        return Ok(None);
+    }
+    let off = h.upper - size;
+    let at = HEADER + SLOT * i;
+    page.copy_within(at..h.slots_end(), at + SLOT);
+    put_u16(page, at, off);
+    put_u16(page, NKEYS_OFF, h.nkeys + 1);
+    put_u16(page, UPPER_OFF, off);
+    Ok(Some(off))
+}
+
+/// Remove cell `i` and compact: the cells below it move up over its bytes, their slots follow,
+/// and slot `i` leaves the array.
+fn remove_cell(page: &mut [u8], h: &Hdr, i: usize) -> Result<()> {
+    let (off, size) = cell_extent(page, h, i)?;
+    page.copy_within(h.upper..off, h.upper + size);
+    for j in 0..h.nkeys {
+        let o = slot(page, j);
+        if h.upper <= o && o < off {
+            put_u16(page, HEADER + SLOT * j, o + size);
+        }
+    }
+    let at = HEADER + SLOT * i;
+    page.copy_within(at + SLOT..h.slots_end(), at);
+    put_u16(page, NKEYS_OFF, h.nkeys - 1);
+    put_u16(page, UPPER_OFF, h.upper + size);
+    Ok(())
+}
+
+/// Resize the cell at `off` by moving the cells below it, together with its own first `keep`
+/// bytes, so that the cell area starts at `new_upper`: the cell grows (`new_upper < upper`) or
+/// shrinks at byte `keep` while its tail stays in place, and every slot addressing a cell at or
+/// below `off` follows. The caller has checked the free space for growth, and that a shrink is no
+/// larger than the cell's bytes past `keep`.
+fn shift_front(page: &mut [u8], h: &Hdr, off: usize, keep: usize, new_upper: usize) {
+    page.copy_within(h.upper..off + keep, new_upper);
+    for j in 0..h.nkeys {
+        let o = slot(page, j);
+        if h.upper <= o && o <= off {
+            put_u16(page, HEADER + SLOT * j, new_upper + (o - h.upper));
+        }
+    }
+    put_u16(page, UPPER_OFF, new_upper);
+}
+
+/// Bytes a leaf cell takes (without its slot).
+pub(crate) const fn cell_size_leaf(klen: usize, vlen: usize) -> usize {
+    LEAF_CELL_HEADER.saturating_add(klen).saturating_add(vlen)
+}
+
+/// Bytes a branch cell takes (without its slot).
+pub(crate) const fn cell_size_branch(klen: usize) -> usize {
+    BRANCH_CELL_HEADER.saturating_add(klen)
+}
+
+/// The free gap of a page: `upper − (24 + 2·nkeys)`.
+pub(crate) fn free_space(page: &[u8]) -> Result<usize> {
+    Ok(hdr(page)?.free())
+}
+
+/// Whether a `cell_size`-byte cell and its slot fit the page's free space.
+pub(crate) fn fits(page: &[u8], cell_size: usize) -> Result<bool> {
+    Ok(cell_size.saturating_add(SLOT) <= hdr(page)?.free())
+}
+
+// ---- whole-page check ----
+
+/// Check every structural rule of a page, never panicking on any bytes: a buffer of the
+/// geometry's page size; a known kind, flags and reserved header bytes zero, the slot array below
+/// `upper` and `upper` below the trailer; every slot addressing a cell that lies in the cell area
+/// with lengths inside the page and no cell flags; the cells tiling `upper..P − 4` exactly (no
+/// overlap, no gap); every entry within the geometry's maximal entry (`U / 4`) and every key
+/// within its `max_key` (for a branch cell the entry limit is that, for a leaf cell it is not);
+/// keys strictly ascending; and for a branch at least one child, with cell 0's key empty. The page
+/// number, transaction id and CRC are the caller's to check.
+pub(crate) fn validate(page: &[u8], geometry: &Geometry) -> Result<()> {
+    if page.len() != geometry.page_size {
+        return Err(corrupt(
+            page,
+            format_args!("{} bytes, expected {}", page.len(), geometry.page_size),
+        ));
+    }
+    let h = hdr(page)?;
+    if page[RESERVED_OFF..HEADER].iter().any(|&b| b != 0) {
+        return Err(corrupt(page, "reserved header bytes are not zero"));
+    }
+    if h.nkeys * (h.kind.cell_header() + SLOT) > geometry.usable {
+        return Err(corrupt(page, format_args!("{} cells cannot fit", h.nkeys)));
+    }
+    if h.kind == Kind::Branch && h.nkeys == 0 {
+        return Err(corrupt(page, "branch page without children"));
+    }
+    let mut extents = Vec::with_capacity(h.nkeys);
+    let mut prev: Option<&[u8]> = None;
+    for i in 0..h.nkeys {
+        let (off, size) = cell_extent(page, &h, i)?;
+        if size + SLOT > geometry.max_entry {
+            return Err(corrupt(page, format_args!("cell {i} of {size} bytes exceeds the limit")));
+        }
+        let key = key_at(page, &h, i)?;
+        if key.len() > geometry.max_key() {
+            return Err(corrupt(
+                page,
+                format_args!("cell {i} has a key of {} bytes over the limit", key.len()),
+            ));
+        }
+        if h.kind == Kind::Branch && i == 0 && !key.is_empty() {
+            return Err(corrupt(page, "branch cell 0 has a key"));
+        }
+        if prev.is_some_and(|p| p >= key) {
+            return Err(corrupt(page, format_args!("cell {i} is out of key order")));
+        }
+        prev = Some(key);
+        extents.push((off, size));
+    }
+    extents.sort_unstable();
+    let mut at = h.upper;
+    for (off, size) in extents {
+        if off != at {
+            return Err(corrupt(page, format_args!("cell at {off} where {at} was expected")));
+        }
+        at = off + size;
+    }
+    if at != h.end {
+        return Err(corrupt(page, format_args!("cells end at {at}, not {}", h.end)));
+    }
+    Ok(())
+}
+
+/// Whether every key of the page lies in `[lo, hi)`, the range the separators on the way down
+/// give it (`None`: unbounded). Keys are sorted, so the first and the last decide it; a branch's
+/// cell 0 (key −∞) is skipped, its lower bound being `lo` itself.
+pub(crate) fn keys_in_range(page: &[u8], lo: Option<&[u8]>, hi: Option<&[u8]>) -> Result<bool> {
+    let h = hdr(page)?;
+    let first = usize::from(h.kind == Kind::Branch);
+    if h.nkeys <= first {
+        return Ok(true);
+    }
+    let lo_ok = match lo {
+        Some(lo) => cmp_keys(key_at(page, &h, first)?, lo).is_ge(),
+        None => true,
+    };
+    let hi_ok = match hi {
+        Some(hi) => cmp_keys(key_at(page, &h, h.nkeys - 1)?, hi).is_lt(),
+        None => true,
+    };
+    Ok(lo_ok && hi_ok)
+}
+
+// ---- leaf ----
+
+fn write_leaf_cell(cell: &mut [u8], key: &[u8], value: &[u8]) {
+    put_u32(cell, 0, value.len() as u32);
+    put_u16(cell, 4, key.len());
+    put_u16(cell, 6, 0);
+    let k = LEAF_CELL_HEADER + key.len();
+    cell[LEAF_CELL_HEADER..k].copy_from_slice(key);
+    cell[k..k + value.len()].copy_from_slice(value);
+}
+
+/// The key of leaf entry `i`.
+pub(crate) fn leaf_key(page: &[u8], i: usize) -> Result<&[u8]> {
+    key_at(page, &hdr_of(page, Kind::Leaf)?, i)
+}
+
+/// Leaf entry `i` as `(key, value)`.
+pub(crate) fn leaf_entry(page: &[u8], i: usize) -> Result<(&[u8], &[u8])> {
+    let h = hdr_of(page, Kind::Leaf)?;
+    let (off, klen, vlen) = leaf_cell(page, &h, i)?;
+    let k = off + LEAF_CELL_HEADER;
+    Ok((&page[k..k + klen], &page[k + klen..k + klen + vlen]))
+}
+
+/// Binary-search a leaf for `key`.
+pub(crate) fn leaf_search(page: &[u8], key: &[u8]) -> Result<Search> {
+    let h = hdr_of(page, Kind::Leaf)?;
+    let (mut lo, mut hi) = (0, h.nkeys);
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        match cmp_keys(key_at(page, &h, mid)?, key) {
+            Ordering::Less => lo = mid + 1,
+            Ordering::Greater => hi = mid,
+            Ordering::Equal => return Ok(Search::Found(mid)),
+        }
+    }
+    Ok(Search::NotFound(lo))
+}
+
+/// [`leaf_search`] that also returns what the search read: the value of the entry found, or the
+/// keys either side of the insertion point. One header check; every cell it reads gets the checks
+/// of [`leaf_entry`].
+pub(crate) fn leaf_find<'a>(page: &'a [u8], key: &[u8]) -> Result<Find<'a>> {
+    let h = hdr_of(page, Kind::Leaf)?;
+    let (mut lo, mut hi) = (0, h.nkeys);
+    // The keys of the last probes either way: cell `lo − 1` once `lo` moved, cell `hi` once `hi`
+    // moved (the final `lo` and `hi` are the last values assigned).
+    let (mut before, mut after) = (None, None);
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        let (off, klen, vlen) = leaf_cell(page, &h, mid)?;
+        let k = off + LEAF_CELL_HEADER;
+        let probe = &page[k..k + klen];
+        match cmp_keys(probe, key) {
+            Ordering::Less => (lo, before) = (mid + 1, Some(probe)),
+            Ordering::Greater => (hi, after) = (mid, Some(probe)),
+            Ordering::Equal => {
+                return Ok(Find::Found { index: mid, value: &page[k + klen..k + klen + vlen] })
+            }
+        }
+    }
+    Ok(Find::NotFound { index: lo, before, after })
+}
+
+/// Insert `(key, value)` as entry `i` (the sorted position: [`Search::NotFound`]). The caller has
+/// checked the sizes with [`Geometry::check_entry`]. [`Fit::Full`] leaves the page unchanged.
+pub(crate) fn leaf_insert(page: &mut [u8], i: usize, key: &[u8], value: &[u8]) -> Result<Fit> {
+    let h = hdr_of(page, Kind::Leaf)?;
+    let size = cell_size_leaf(key.len(), value.len());
+    let Some(off) = reserve(page, &h, i, size)? else {
+        return Ok(Fit::Full);
+    };
+    write_leaf_cell(&mut page[off..off + size], key, value);
+    Ok(Fit::Done)
+}
+
+/// Replace the value of leaf entry `i`: in place when the size is unchanged, otherwise by
+/// resizing the cell in place (the cells below it shift by the difference). [`Fit::Full`] (a
+/// larger value than the free space allows) leaves the page unchanged.
+pub(crate) fn leaf_replace_value(page: &mut [u8], i: usize, value: &[u8]) -> Result<Fit> {
+    let h = hdr_of(page, Kind::Leaf)?;
+    let (off, klen, vlen) = leaf_cell(page, &h, i)?;
+    let keep = LEAF_CELL_HEADER + klen;
+    let off = match value.len().cmp(&vlen) {
+        Ordering::Equal => off,
+        Ordering::Greater => {
+            let grow = value.len() - vlen;
+            if grow > h.free() {
+                return Ok(Fit::Full);
+            }
+            shift_front(page, &h, off, keep, h.upper - grow);
+            off - grow
+        }
+        Ordering::Less => {
+            let shrink = vlen - value.len();
+            shift_front(page, &h, off, keep, h.upper + shrink);
+            off + shrink
+        }
+    };
+    put_u32(page, off, value.len() as u32);
+    page[off + keep..off + keep + value.len()].copy_from_slice(value);
+    Ok(Fit::Done)
+}
+
+/// Delete leaf entry `i`, compacting the cell area.
+pub(crate) fn leaf_delete(page: &mut [u8], i: usize) -> Result<()> {
+    let h = hdr_of(page, Kind::Leaf)?;
+    remove_cell(page, &h, i)
+}
+
+// ---- branch ----
+
+fn write_branch_cell(cell: &mut [u8], key: &[u8], child: u32, child_txn: u32) {
+    put_u32(cell, 0, child);
+    put_u32(cell, 4, child_txn);
+    put_u16(cell, 8, key.len());
+    cell[BRANCH_CELL_HEADER..BRANCH_CELL_HEADER + key.len()].copy_from_slice(key);
+}
+
+/// Child `i` of a branch as `(child_pgno, child_txn)`; `child_txn` is the low 32 bits of the
+/// child's header txn, checked on every descent.
+pub(crate) fn branch_child(page: &[u8], i: usize) -> Result<(u32, u32)> {
+    let h = hdr_of(page, Kind::Branch)?;
+    let (off, _) = branch_cell(page, &h, i)?;
+    Ok((read_u32(page, off), read_u32(page, off + 4)))
+}
+
+/// The key of branch cell `i`: the lower bound of child `i`'s range (empty for cell 0: −∞).
+pub(crate) fn branch_key(page: &[u8], i: usize) -> Result<&[u8]> {
+    key_at(page, &hdr_of(page, Kind::Branch)?, i)
+}
+
+/// The child index to descend into for `key`: the largest `i` with `key_i <= key`, where
+/// `key_0 = −∞`. An empty branch is [`Error::Corrupt`]. The tree routes with [`branch_route`];
+/// this is its model in the tests.
+#[cfg(test)]
+pub(crate) fn branch_search(page: &[u8], key: &[u8]) -> Result<usize> {
+    let h = hdr_of(page, Kind::Branch)?;
+    if h.nkeys == 0 {
+        return Err(corrupt(page, "branch page without children"));
+    }
+    // Invariant: key_(lo−1) <= key, and key_hi > key when hi < nkeys.
+    let (mut lo, mut hi) = (1, h.nkeys);
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        if cmp_keys(key_at(page, &h, mid)?, key).is_le() {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    Ok(lo - 1)
+}
+
+/// The child to descend into for `key` (the largest `i` with `key_i <= key`, where `key_0 = −∞`)
+/// with its bounds and pointer ([`Route`]: what [`branch_key`] and [`branch_child`] give), from
+/// one header check and the cells the binary search read; every cell it reads gets the checks of
+/// [`branch_child`]. An empty branch is [`Error::Corrupt`].
+pub(crate) fn branch_route<'a>(page: &'a [u8], key: &[u8]) -> Result<Route<'a>> {
+    let h = hdr_of(page, Kind::Branch)?;
+    if h.nkeys == 0 {
+        return Err(corrupt(page, "branch page without children"));
+    }
+    let (mut lo, mut hi) = (1, h.nkeys);
+    // The cells of the last probes either way: cell `lo − 1` (offset and key) once `lo` moved,
+    // the key of cell `hi` once `hi` moved (the final `lo` and `hi` are the last values assigned).
+    let (mut below, mut above) = (None, None);
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        let (off, klen) = branch_cell(page, &h, mid)?;
+        let k = off + BRANCH_CELL_HEADER;
+        let probe = &page[k..k + klen];
+        if cmp_keys(probe, key).is_le() {
+            (lo, below) = (mid + 1, Some((off, probe)));
+        } else {
+            (hi, above) = (mid, Some(probe));
+        }
+    }
+    let off = match below {
+        Some((off, _)) => off,
+        None => branch_cell(page, &h, 0)?.0,
+    };
+    Ok(Route {
+        index: lo - 1,
+        lo: below.map(|(_, k)| k),
+        hi: above,
+        child: read_u32(page, off),
+        child_txn: read_u32(page, off + 4),
+    })
+}
+
+/// The [`Route`] to child `i` of a branch, from one header check.
+pub(crate) fn branch_route_at(page: &[u8], i: usize) -> Result<Route<'_>> {
+    let h = hdr_of(page, Kind::Branch)?;
+    let (off, klen) = branch_cell(page, &h, i)?;
+    let k = off + BRANCH_CELL_HEADER;
+    let hi = if i + 1 < h.nkeys { Some(key_at(page, &h, i + 1)?) } else { None };
+    Ok(Route {
+        index: i,
+        lo: (i > 0).then(|| &page[k..k + klen]),
+        hi,
+        child: read_u32(page, off),
+        child_txn: read_u32(page, off + 4),
+    })
+}
+
+/// Insert a child as cell `i` with lower-bound `key`: `i >= 1` with a non-empty key above
+/// `key_(i−1)` and below `key_i`, or `i == 0` with an empty key into an empty branch.
+/// [`Fit::Full`] leaves the page unchanged.
+pub(crate) fn branch_insert(
+    page: &mut [u8],
+    i: usize,
+    key: &[u8],
+    child: u32,
+    child_txn: u32,
+) -> Result<Fit> {
+    let h = hdr_of(page, Kind::Branch)?;
+    debug_assert!(
+        if i == 0 { key.is_empty() && h.nkeys == 0 } else { !key.is_empty() },
+        "branch cell {i} with a {}-byte key in a branch of {}",
+        key.len(),
+        h.nkeys
+    );
+    let size = cell_size_branch(key.len());
+    let Some(off) = reserve(page, &h, i, size)? else {
+        return Ok(Fit::Full);
+    };
+    write_branch_cell(&mut page[off..off + size], key, child, child_txn);
+    Ok(Fit::Done)
+}
+
+/// Point branch cell `i` at another child (a copy-on-write copy of it), in place.
+pub(crate) fn branch_set_child(
+    page: &mut [u8],
+    i: usize,
+    child: u32,
+    child_txn: u32,
+) -> Result<()> {
+    let h = hdr_of(page, Kind::Branch)?;
+    let (off, _) = branch_cell(page, &h, i)?;
+    put_u32(page, off, child);
+    put_u32(page, off + 4, child_txn);
+    Ok(())
+}
+
+/// Remove child `i` of a branch, compacting the cell area; its left neighbour takes over its key
+/// range. Removing child 0 makes child 1 the new cell 0, whose key is dropped (it now covers the
+/// range from −∞).
+pub(crate) fn branch_delete(page: &mut [u8], i: usize) -> Result<()> {
+    let h = hdr_of(page, Kind::Branch)?;
+    remove_cell(page, &h, i)?;
+    if i == 0 && h.nkeys > 1 {
+        let h = hdr_of(page, Kind::Branch)?;
+        let (off, klen) = branch_cell(page, &h, 0)?;
+        shift_front(page, &h, off, BRANCH_CELL_HEADER, h.upper + klen);
+        put_u16(page, off + klen + 8, 0);
+    }
+    Ok(())
+}
+
+/// Initialise `page` as a new root over two children: `left` (cell 0, from −∞) and `right` (from
+/// `sep`), each `(child_pgno, child_txn)`.
+pub(crate) fn init_root(
+    page: &mut [u8],
+    pgno: u32,
+    txn: u64,
+    left: (u32, u32),
+    sep: &[u8],
+    right: (u32, u32),
+) -> Result<()> {
+    init_branch(page, pgno, txn);
+    if branch_insert(page, 0, &[], left.0, left.1)? == Fit::Full
+        || branch_insert(page, 1, sep, right.0, right.1)? == Fit::Full
+    {
+        return Err(corrupt(page, format_args!("a {}-byte separator overflows a root", sep.len())));
+    }
+    Ok(())
+}
+
+// ---- splits ----
+
+/// Split the leaf `src` (rewritten in place, keeping its page number and txn) into `src` and
+/// `dst`, inserting `(key, value)` at sorted position `at` on whichever side it lands. `dst` must
+/// be a freshly initialised empty leaf ([`init_leaf`]) of the same size. Returns the separator:
+/// the first key of `dst`; every key left in `src` is below it.
+///
+/// The cut is by bytes, not entries: `src` keeps the entries before the first one at which its
+/// share (cells plus slots) reaches half of the total, so both halves end within `U` and neither
+/// is empty. With `append` and `at == nkeys` (the key goes past the end of the tree's rightmost
+/// leaf), `src` keeps every old entry and `dst` gets only the new one, so ascending inserts fill
+/// leaves instead of leaving each half empty behind them; otherwise `append` is ignored.
+pub(crate) fn split_leaf(
+    src: &mut [u8],
+    dst: &mut [u8],
+    at: usize,
+    key: &[u8],
+    value: &[u8],
+    append: bool,
+) -> Result<Vec<u8>> {
+    let size = cell_size_leaf(key.len(), value.len());
+    check_split_entry(src, size)?;
+    let mut cell = vec![0; size];
+    write_leaf_cell(&mut cell, key, value);
+    split(src, dst, Kind::Leaf, at, &cell, append)
+}
+
+/// Split the branch `src` (rewritten in place, keeping its page number and txn) into `src` and
+/// `dst`, inserting the child `(key, child, child_txn)` as cell `at` (`at >= 1`). `dst` must be a
+/// freshly initialised empty branch ([`init_branch`]) of the same size. Returns the separator,
+/// which moves up to the parent: `src` keeps the cells below it, and `dst`'s cell 0 is the
+/// separator's own child with an empty key.
+///
+/// The cut is by bytes as in [`split_leaf`]; both halves end within `U` with at least one child
+/// each. With `append` and `at == nkeys` (the child goes last, on the tree's rightmost path),
+/// `src` keeps all but its last old child, which `dst` takes with the new one; otherwise
+/// `append` is ignored.
+pub(crate) fn split_branch(
+    src: &mut [u8],
+    dst: &mut [u8],
+    at: usize,
+    key: &[u8],
+    child: u32,
+    child_txn: u32,
+    append: bool,
+) -> Result<Vec<u8>> {
+    let size = cell_size_branch(key.len());
+    check_split_entry(src, size)?;
+    let mut cell = vec![0; size];
+    write_branch_cell(&mut cell, key, child, child_txn);
+    split(src, dst, Kind::Branch, at, &cell, append)
+}
+
+/// The pending entry of a split must respect the entry limit (the split guarantee rests on it).
+fn check_split_entry(src: &[u8], cell_size: usize) -> Result<()> {
+    let max_entry = src.len().saturating_sub(HEADER + TRAILER) / 4;
+    if cell_size.saturating_add(SLOT) > max_entry {
+        return Err(corrupt(src, format_args!("split entry of {cell_size} bytes over the limit")));
+    }
+    Ok(())
+}
+
+/// The split shared by both kinds; `new_cell` is the encoded pending cell. Checks everything
+/// before it changes either page, so an error leaves both unchanged.
+fn split(
+    src: &mut [u8],
+    dst: &mut [u8],
+    kind: Kind,
+    at: usize,
+    new_cell: &[u8],
+    append: bool,
+) -> Result<Vec<u8>> {
+    let h = hdr_of(src, kind)?;
+    if dst.len() != src.len() || hdr_of(dst, kind)?.nkeys != 0 {
+        return Err(corrupt(dst, "split target is not an empty page of the source's size"));
+    }
+    let n = h.nkeys;
+    let first = usize::from(kind == Kind::Branch);
+    if n == 0 || at < first || at > n {
+        return Err(corrupt(src, format_args!("split inserting cell {at} into {n}")));
+    }
+
+    // The old cells with the new one spliced in at `at`, borrowed from a copy of `src`.
+    let old = src.to_vec();
+    let mut cells: Vec<&[u8]> = Vec::with_capacity(n + 1);
+    for i in 0..n {
+        if i == at {
+            cells.push(new_cell);
+        }
+        let (off, size) = cell_extent(&old, &h, i)?;
+        cells.push(&old[off..off + size]);
+    }
+    if at == n {
+        cells.push(new_cell);
+    }
+    let bytes = |cells: &[&[u8]]| cells.iter().map(|c| c.len() + SLOT).sum::<usize>();
+    let total = bytes(&cells);
+
+    // `m` = the number of cells `src` keeps (1..=n); cell `m` is the first of `dst`.
+    let m = if append && at == n {
+        match kind {
+            Kind::Leaf => n,
+            Kind::Branch => n - 1,
+        }
+    } else {
+        let mut cum = 0;
+        cells
+            .iter()
+            .position(|c| {
+                let reached = 2 * cum >= total;
+                cum += c.len() + SLOT;
+                reached
+            })
+            .unwrap_or(n)
+    }
+    .clamp(1, n);
+
+    let (key_off, klen) = match kind {
+        Kind::Leaf => (LEAF_CELL_HEADER, read_u16(cells[m], 4)),
+        Kind::Branch => (BRANCH_CELL_HEADER, read_u16(cells[m], 8)),
+    };
+    let left = bytes(&cells[..m]);
+    // A branch's separator moves up: its cell stays in `dst` without the key.
+    let right = total - left - if kind == Kind::Branch { klen } else { 0 };
+    let usable = src.len() - HEADER - TRAILER;
+    if left > usable || right > usable {
+        return Err(corrupt(
+            src,
+            format_args!("split halves of {left} and {right} bytes exceed {usable}"),
+        ));
+    }
+    let sep = cells[m][key_off..key_off + klen].to_vec();
+
+    init(src, kind, pgno(&old), txn(&old));
+    for (j, cell) in cells.iter().enumerate() {
+        if j < m {
+            append_cell(src, cell)?;
+        } else if j == m && kind == Kind::Branch {
+            let mut first = [0; BRANCH_CELL_HEADER];
+            first[..8].copy_from_slice(&cell[..8]);
+            append_cell(dst, &first)?;
+        } else {
+            append_cell(dst, cell)?;
+        }
+    }
+    Ok(sep)
+}
+
+/// Append an encoded cell after the page's last cell (both halves were sized by [`split`] first).
+fn append_cell(page: &mut [u8], cell: &[u8]) -> Result<()> {
+    let h = hdr(page)?;
+    let Some(off) = reserve(page, &h, h.nkeys, cell.len())? else {
+        return Err(corrupt(page, "split half overflowed"));
+    };
+    page[off..off + cell.len()].copy_from_slice(cell);
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use proptest::{collection::vec, prelude::*, sample::select};
+
+    const SIZES: [u32; 5] = [4096, 8192, 16384, 32768, 65536];
+
+    type Entry = (Vec<u8>, Vec<u8>);
+    type Cell = (Vec<u8>, u32, u32);
+
+    fn geometry(size: u32) -> Geometry {
+        Geometry::new(size).unwrap()
+    }
+
+    fn fresh(g: &Geometry, kind: Kind) -> Vec<u8> {
+        let mut page = vec![0; g.page_size()];
+        init(&mut page, kind, 7, 3);
+        page
+    }
+
+    fn entries(page: &[u8]) -> Vec<Entry> {
+        (0..nkeys(page))
+            .map(|i| {
+                let (k, v) = leaf_entry(page, i).unwrap();
+                (k.to_vec(), v.to_vec())
+            })
+            .collect()
+    }
+
+    fn cells(page: &[u8]) -> Vec<Cell> {
+        (0..nkeys(page))
+            .map(|i| {
+                let (child, txn) = branch_child(page, i).unwrap();
+                (branch_key(page, i).unwrap().to_vec(), child, txn)
+            })
+            .collect()
+    }
+
+    fn leaf_used(model: &[Entry]) -> usize {
+        model.iter().map(|(k, v)| cell_size_leaf(k.len(), v.len()) + SLOT).sum()
+    }
+
+    fn branch_used(model: &[Cell]) -> usize {
+        model.iter().map(|(k, ..)| cell_size_branch(k.len()) + SLOT).sum()
+    }
+
+    /// A key that sorts by `rank` (a big-endian prefix), padded to `klen` (at least 4) bytes.
+    fn ranked_key(rank: u32, klen: usize) -> Vec<u8> {
+        let mut key = rank.to_be_bytes().to_vec();
+        key.resize(klen.max(4), 0xab);
+        key
+    }
+
+    /// Random entry sizes scaled to the page: a quarter at the limit, a quarter anywhere up to
+    /// it, half small.
+    #[derive(Clone, Copy, Debug)]
+    struct Spec {
+        ksel: u8,
+        klen: u16,
+        kseed: u8,
+        vsel: u8,
+        vlen: u16,
+        vfill: u8,
+    }
+
+    fn spec() -> impl Strategy<Value = Spec> {
+        any::<(u8, u16, u8, u8, u16, u8)>().prop_map(|(ksel, klen, kseed, vsel, vlen, vfill)| {
+            Spec { ksel, klen, kseed, vsel, vlen, vfill }
+        })
+    }
+
+    impl Spec {
+        fn klen(&self, g: &Geometry) -> usize {
+            match self.ksel % 4 {
+                0 => g.max_key(),
+                1 => usize::from(self.klen) % (g.max_key() + 1),
+                _ => usize::from(self.klen) % 3,
+            }
+        }
+
+        /// Short keys come from a tiny alphabet so they repeat; long ones are spread out.
+        fn key(&self, g: &Geometry) -> Vec<u8> {
+            let klen = self.klen(g);
+            let base = if klen < 3 { self.kseed % 3 } else { self.kseed };
+            (0..klen).map(|k| base.wrapping_add((k as u8).wrapping_mul(7))).collect()
+        }
+
+        fn value(&self, g: &Geometry, klen: usize) -> Vec<u8> {
+            let max = g.max_value(klen);
+            let vlen = match self.vsel % 4 {
+                0 => max,
+                1 => usize::from(self.vlen) % (max + 1),
+                _ => usize::from(self.vlen) % 17.min(max + 1),
+            };
+            vec![self.vfill; vlen]
+        }
+    }
+
+    #[derive(Clone, Debug)]
+    enum LeafOp {
+        Put(Spec),
+        Delete(usize),
+    }
+
+    fn leaf_op() -> impl Strategy<Value = LeafOp> {
+        prop_oneof![
+            3 => spec().prop_map(LeafOp::Put),
+            1 => any::<usize>().prop_map(LeafOp::Delete),
+        ]
+    }
+
+    #[derive(Clone, Debug)]
+    enum BranchOp {
+        Insert(Spec, u32, u32),
+        Delete(usize),
+        SetChild(usize, u32, u32),
+        Search(Spec),
+        SearchExisting(usize),
+    }
+
+    fn branch_op() -> impl Strategy<Value = BranchOp> {
+        prop_oneof![
+            4 => (spec(), any::<u32>(), any::<u32>()).prop_map(|(s, c, t)| BranchOp::Insert(s, c, t)),
+            2 => any::<usize>().prop_map(BranchOp::Delete),
+            1 => (any::<usize>(), any::<u32>(), any::<u32>())
+                .prop_map(|(i, c, t)| BranchOp::SetChild(i, c, t)),
+            1 => spec().prop_map(BranchOp::Search),
+            1 => any::<usize>().prop_map(BranchOp::SearchExisting),
+        ]
+    }
+
+    /// Fill a leaf in ascending order (ranks 1, 3, 5, ...) from `specs`, cycling, until an entry
+    /// does not fit. Returns the entries and the size of the one that did not fit.
+    fn fill_leaf(g: &Geometry, page: &mut [u8], specs: &[Spec]) -> (Vec<Entry>, usize, Vec<u8>) {
+        let mut model = Vec::new();
+        for s in specs.iter().cycle() {
+            let klen = s.klen(g).max(4);
+            let value = s.value(g, klen);
+            let key = ranked_key(2 * model.len() as u32 + 1, klen);
+            match leaf_insert(page, model.len(), &key, &value).unwrap() {
+                Fit::Done => model.push((key, value)),
+                Fit::Full => return (model, klen, value),
+            }
+        }
+        unreachable!("specs is never empty")
+    }
+
+    /// Fill a branch (cell 0, then ranks 3, 5, ...) from `specs`, cycling, until a cell does not
+    /// fit. Returns the cells and the key length of the one that did not fit.
+    fn fill_branch(g: &Geometry, page: &mut [u8], specs: &[Spec]) -> (Vec<Cell>, usize) {
+        assert_eq!(branch_insert(page, 0, &[], 0, 0).unwrap(), Fit::Done);
+        let mut model = vec![(Vec::new(), 0, 0)];
+        for s in specs.iter().cycle() {
+            let n = model.len();
+            let key = ranked_key(2 * n as u32 + 1, s.klen(g));
+            match branch_insert(page, n, &key, n as u32, 3 * n as u32).unwrap() {
+                Fit::Done => model.push((key, n as u32, 3 * n as u32)),
+                Fit::Full => return (model, key.len()),
+            }
+        }
+        unreachable!("specs is never empty")
+    }
+
+    #[test]
+    fn entry_limits_are_exact() {
+        for size in SIZES {
+            let g = geometry(size);
+            let u = size as usize - HEADER - TRAILER;
+            assert_eq!((g.page_size(), g.usable(), g.max_entry()), (size as usize, u, u / 4));
+            let mk = g.max_key();
+            assert!(g.check_entry(mk, 0).is_ok());
+            assert!(matches!(
+                g.check_entry(mk + 1, 0),
+                Err(Error::KeyTooLarge { len, max }) if len == mk + 1 && max == mk
+            ));
+            // A maximal key is a maximal separator entry.
+            assert_eq!(cell_size_branch(mk) + SLOT, g.max_entry());
+            for klen in [0, 1, 32, mk] {
+                let mv = g.max_value(klen);
+                assert!(g.check_entry(klen, mv).is_ok());
+                assert!(matches!(
+                    g.check_entry(klen, mv + 1),
+                    Err(Error::ValueTooLarge { len, max }) if len == mv + 1 && max == mv
+                ));
+                assert_eq!(cell_size_leaf(klen, mv) + SLOT, g.max_entry());
+            }
+            // Four maximal entries fill a leaf without overflowing it.
+            let mut page = fresh(&g, Kind::Leaf);
+            for i in 0..4_u8 {
+                let value = vec![i; g.max_value(32)];
+                let fit = leaf_insert(&mut page, i.into(), &[i; 32], &value).unwrap();
+                assert_eq!(fit, Fit::Done);
+            }
+            assert!(free_space(&page).unwrap() < g.max_entry());
+            validate(&page, &g).unwrap();
+        }
+        let g = geometry(4096);
+        assert_eq!((g.max_key(), g.max_value(32)), (1005, 975));
+        // A refused key has no value limit, not the 1 or 0 bytes its entry would leave.
+        assert_eq!((g.max_value(1005), g.max_value(1006), g.max_value(1007)), (2, 0, 0));
+        assert_eq!(g.max_value(usize::MAX), 0);
+        for bad in [0, 2048, 4095, 4097, 6144, 131_072, u32::MAX] {
+            assert!(matches!(Geometry::new(bad), Err(Error::InvalidPageSize(b)) if b == bad));
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(64))]
+
+        #[test]
+        fn leaf_ops_match_a_sorted_vec_model(
+            size in select(&SIZES[..]),
+            ops in vec(leaf_op(), 1..120),
+        ) {
+            let g = geometry(size);
+            let mut page = fresh(&g, Kind::Leaf);
+            let mut model: Vec<Entry> = Vec::new();
+            for op in ops {
+                let before = page.clone();
+                match op {
+                    LeafOp::Put(s) => {
+                        let key = s.key(&g);
+                        let value = s.value(&g, key.len());
+                        prop_assert!(g.check_entry(key.len(), value.len()).is_ok());
+                        let (fit, need) = match leaf_search(&page, &key).unwrap() {
+                            Search::Found(i) => {
+                                prop_assert_eq!(&model[i].0, &key);
+                                let fit = leaf_replace_value(&mut page, i, &value).unwrap();
+                                let need = value.len().saturating_sub(model[i].1.len());
+                                if fit == Fit::Done {
+                                    model[i].1 = value;
+                                }
+                                (fit, need)
+                            }
+                            Search::NotFound(i) => {
+                                prop_assert_eq!(i, model.partition_point(|(k, _)| *k < key));
+                                let need = cell_size_leaf(key.len(), value.len()) + SLOT;
+                                let fit = leaf_insert(&mut page, i, &key, &value).unwrap();
+                                if fit == Fit::Done {
+                                    model.insert(i, (key, value));
+                                }
+                                (fit, need)
+                            }
+                        };
+                        if fit == Fit::Full {
+                            prop_assert!(free_space(&before).unwrap() < need);
+                            prop_assert_eq!(&page, &before);
+                        }
+                    }
+                    LeafOp::Delete(sel) => {
+                        if !model.is_empty() {
+                            let i = sel % model.len();
+                            leaf_delete(&mut page, i).unwrap();
+                            model.remove(i);
+                        }
+                    }
+                }
+                prop_assert!(validate(&page, &g).is_ok(), "{:?}", validate(&page, &g));
+                prop_assert_eq!(entries(&page), model.clone());
+                prop_assert_eq!(free_space(&page).unwrap() + leaf_used(&model), g.usable());
+            }
+        }
+
+        #[test]
+        fn branch_ops_match_a_sorted_vec_model(
+            size in select(&SIZES[..]),
+            ops in vec(branch_op(), 1..120),
+        ) {
+            let g = geometry(size);
+            let mut page = fresh(&g, Kind::Branch);
+            prop_assert_eq!(branch_insert(&mut page, 0, &[], 100, 200).unwrap(), Fit::Done);
+            let mut model: Vec<Cell> = vec![(Vec::new(), 100, 200)];
+            for op in ops {
+                let before = page.clone();
+                match op {
+                    BranchOp::Insert(s, child, txn) => {
+                        let key = s.key(&g);
+                        let i = model.partition_point(|(k, ..)| *k < key);
+                        if !key.is_empty() && model.get(i).is_none_or(|(k, ..)| *k != key) {
+                            match branch_insert(&mut page, i, &key, child, txn).unwrap() {
+                                Fit::Done => model.insert(i, (key, child, txn)),
+                                Fit::Full => {
+                                    let need = cell_size_branch(key.len()) + SLOT;
+                                    prop_assert!(free_space(&before).unwrap() < need);
+                                    prop_assert_eq!(&page, &before);
+                                }
+                            }
+                        }
+                    }
+                    BranchOp::Delete(sel) => {
+                        if model.len() > 1 {
+                            let i = sel % model.len();
+                            branch_delete(&mut page, i).unwrap();
+                            model.remove(i);
+                            model[0].0.clear();
+                        }
+                    }
+                    BranchOp::SetChild(sel, child, txn) => {
+                        let i = sel % model.len();
+                        branch_set_child(&mut page, i, child, txn).unwrap();
+                        (model[i].1, model[i].2) = (child, txn);
+                    }
+                    BranchOp::Search(s) => {
+                        let key = s.key(&g);
+                        let want = model.iter().rposition(|(k, ..)| *k <= key).unwrap();
+                        prop_assert_eq!(branch_search(&page, &key).unwrap(), want);
+                    }
+                    BranchOp::SearchExisting(sel) => {
+                        let i = sel % model.len();
+                        prop_assert_eq!(branch_search(&page, &model[i].0.clone()).unwrap(), i);
+                    }
+                }
+                prop_assert!(validate(&page, &g).is_ok(), "{:?}", validate(&page, &g));
+                prop_assert_eq!(cells(&page), model.clone());
+                prop_assert_eq!(free_space(&page).unwrap() + branch_used(&model), g.usable());
+            }
+        }
+
+        #[test]
+        fn leaf_splits_fit_and_keep_every_entry(
+            specs in vec(spec(), 1..40),
+            at_sel in any::<usize>(),
+            append in any::<bool>(),
+        ) {
+            for size in SIZES {
+                let g = geometry(size);
+                let mut src = fresh(&g, Kind::Leaf);
+                let (mut model, klen, value) = fill_leaf(&g, &mut src, &specs);
+                let n = model.len();
+                let at = at_sel % (n + 1);
+                let key = ranked_key(2 * at as u32, klen);
+                model.insert(at, (key.clone(), value.clone()));
+                let mut dst = fresh(&g, Kind::Leaf);
+                let sep = split_leaf(&mut src, &mut dst, at, &key, &value, append);
+                prop_assert!(sep.is_ok(), "{size}: {sep:?}");
+                prop_assert!(validate(&src, &g).is_ok(), "{:?}", validate(&src, &g));
+                prop_assert!(validate(&dst, &g).is_ok(), "{:?}", validate(&dst, &g));
+                let (left, right) = (entries(&src), entries(&dst));
+                prop_assert!(!left.is_empty() && !right.is_empty());
+                prop_assert_eq!(sep.unwrap(), right[0].0.clone());
+                prop_assert_eq!(&[left.clone(), right].concat(), &model);
+                prop_assert_eq!((pgno(&src), txn(&src)), (7, 3));
+                let left_used = g.usable() - free_space(&src).unwrap();
+                let right_used = g.usable() - free_space(&dst).unwrap();
+                let total = leaf_used(&model);
+                prop_assert_eq!(left_used + right_used, total);
+                if append && at == n {
+                    prop_assert_eq!(left.len(), n);
+                } else {
+                    // Cut by bytes: the left reaches half, overshooting by less than one entry.
+                    prop_assert!(2 * right_used <= total, "{left_used} | {right_used}");
+                    prop_assert!(2 * left_used < total + 2 * g.max_entry());
+                }
+            }
+        }
+
+        #[test]
+        fn branch_splits_fit_and_keep_every_child(
+            specs in vec(spec(), 1..40),
+            at_sel in any::<usize>(),
+            append in any::<bool>(),
+        ) {
+            for size in SIZES {
+                let g = geometry(size);
+                let mut src = fresh(&g, Kind::Branch);
+                let (mut model, klen) = fill_branch(&g, &mut src, &specs);
+                let n = model.len();
+                let at = 1 + at_sel % n;
+                let key = ranked_key(2 * at as u32, klen);
+                model.insert(at, (key.clone(), 1000, 77));
+                let mut dst = fresh(&g, Kind::Branch);
+                let sep = split_branch(&mut src, &mut dst, at, &key, 1000, 77, append);
+                prop_assert!(sep.is_ok(), "{size}: {sep:?}");
+                prop_assert!(validate(&src, &g).is_ok(), "{:?}", validate(&src, &g));
+                prop_assert!(validate(&dst, &g).is_ok(), "{:?}", validate(&dst, &g));
+                let (left, mut right) = (cells(&src), cells(&dst));
+                // The separator moved up: it is the lower bound of dst's cell 0.
+                right[0].0 = sep.unwrap();
+                prop_assert_eq!([left.clone(), right].concat(), model);
+                if append && at == n && n >= 2 {
+                    prop_assert_eq!(left.len(), n - 1);
+                }
+            }
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(64))]
+
+        #[test]
+        fn cmp_keys_is_the_slice_order(
+            prefix in vec(any::<u8>(), 0..40),
+            a in vec(select(&[0_u8, 1, 0x7f, 0x80, 0xfe, 0xff][..]), 0..20),
+            b in vec(select(&[0_u8, 1, 0x7f, 0x80, 0xfe, 0xff][..]), 0..20),
+            cut in any::<usize>(),
+        ) {
+            let a = [&prefix[..], &a].concat();
+            let b = [&prefix[..], &b].concat();
+            let cut = &a[..cut % (a.len() + 1)];
+            for (x, y) in [(&a[..], &b[..]), (&a, &a), (cut, &a), (&[][..], &b), (&[][..], &[][..])] {
+                prop_assert_eq!(cmp_keys(x, y), x.cmp(y), "{:?} vs {:?}", x, y);
+                prop_assert_eq!(cmp_keys(y, x), y.cmp(x), "{:?} vs {:?}", y, x);
+            }
+        }
+
+        #[test]
+        fn one_pass_searches_match_the_slow_accessors(
+            size in select(&SIZES[..]),
+            specs in vec(spec(), 1..8),
+            leaf in any::<bool>(),
+        ) {
+            let g = geometry(size);
+            let mut page = fresh(&g, if leaf { Kind::Leaf } else { Kind::Branch });
+            let keys: Vec<Vec<u8>> = if leaf {
+                fill_leaf(&g, &mut page, &specs).0.into_iter().map(|(k, _)| k).collect()
+            } else {
+                fill_branch(&g, &mut page, &specs).0.into_iter().map(|(k, _, _)| k).collect()
+            };
+            // Each key, a prefix and an extension of it, and a rank between it and the one below.
+            let mut probes = vec![Vec::new(), vec![0xff; 6]];
+            for (r, k) in keys.iter().enumerate().step_by(keys.len().div_ceil(48)) {
+                probes.push(k.clone());
+                probes.push(k[..k.len().saturating_sub(1)].to_vec());
+                probes.push([&k[..], &[0]].concat());
+                probes.push(ranked_key(2 * r as u32, 4));
+            }
+            let (mut found, mut missed) = (0, 0);
+            for (i, key) in probes.iter().enumerate() {
+                assert_one_pass_matches(&page, key, i % (keys.len() + 1));
+                if leaf {
+                    match leaf_find(&page, key).unwrap() {
+                        Find::Found { .. } => found += 1,
+                        Find::NotFound { .. } => missed += 1,
+                    }
+                } else {
+                    prop_assert!(branch_route(&page, key).is_ok());
+                }
+            }
+            prop_assert!(!leaf || (found > 0 && missed > 0), "{found} hits, {missed} misses");
+        }
+    }
+
+    #[test]
+    fn append_splits_fill_the_left_leaf() {
+        for size in SIZES {
+            let g = geometry(size);
+            let mut page = fresh(&g, Kind::Leaf);
+            let (mut rank, mut splits) = (0_u32, 0);
+            while splits < 3 {
+                let (key, value) = (ranked_key(rank, 16), [rank as u8; 40]);
+                rank += 1;
+                let n = nkeys(&page);
+                if leaf_insert(&mut page, n, &key, &value).unwrap() == Fit::Full {
+                    let mut dst = fresh(&g, Kind::Leaf);
+                    assert_eq!(
+                        split_leaf(&mut page, &mut dst, n, &key, &value, true).unwrap(),
+                        key
+                    );
+                    let used = g.usable() - free_space(&page).unwrap();
+                    assert!(
+                        used * 100 > g.usable() * 95,
+                        "{size}: left leaf {used}/{}",
+                        g.usable()
+                    );
+                    assert_eq!(nkeys(&dst), 1);
+                    page = dst;
+                    splits += 1;
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_full_page_is_left_byte_identical() {
+        let g = geometry(4096);
+        let mut leaf = fresh(&g, Kind::Leaf);
+        let mut n = 0;
+        while leaf_insert(&mut leaf, n, &ranked_key(n as u32, 8), &[1; 100]).unwrap() == Fit::Done {
+            n += 1;
+        }
+        let free = free_space(&leaf).unwrap();
+        let before = leaf.clone();
+        for at in [0, n / 2, n] {
+            let fit = leaf_insert(&mut leaf, at, &ranked_key(u32::MAX, 8), &[2; 100]).unwrap();
+            assert_eq!(fit, Fit::Full);
+            assert_eq!(leaf, before);
+        }
+        let fit = leaf_replace_value(&mut leaf, n / 2, &vec![3; 100 + free + 1]).unwrap();
+        assert_eq!(fit, Fit::Full);
+        assert_eq!(leaf, before);
+        // Growing by exactly the free space fits and uses the page to the last byte.
+        let fit = leaf_replace_value(&mut leaf, n / 2, &vec![3; 100 + free]).unwrap();
+        assert_eq!(fit, Fit::Done);
+        assert_eq!(free_space(&leaf).unwrap(), 0);
+        validate(&leaf, &g).unwrap();
+        // So does an insert of exactly the free space.
+        let mut leaf = before;
+        let value = vec![4; free - SLOT - cell_size_leaf(8, 0)];
+        assert_eq!(leaf_insert(&mut leaf, n, &ranked_key(u32::MAX, 8), &value).unwrap(), Fit::Done);
+        assert_eq!(free_space(&leaf).unwrap(), 0);
+        validate(&leaf, &g).unwrap();
+
+        let mut branch = fresh(&g, Kind::Branch);
+        assert_eq!(branch_insert(&mut branch, 0, &[], 1, 1).unwrap(), Fit::Done);
+        let mut n = 1;
+        while branch_insert(&mut branch, n, &ranked_key(n as u32, 40), 1, 1).unwrap() == Fit::Done {
+            n += 1;
+        }
+        let before = branch.clone();
+        for (at, rank) in [(1, 0), (n, u32::MAX)] {
+            let fit = branch_insert(&mut branch, at, &ranked_key(rank, 40), 2, 2).unwrap();
+            assert_eq!(fit, Fit::Full);
+            assert_eq!(branch, before);
+        }
+    }
+
+    /// A small valid leaf for the damage cases: five 8-byte keys with 20-byte values.
+    fn damage_base(g: &Geometry) -> Vec<u8> {
+        let mut page = fresh(g, Kind::Leaf);
+        for i in 0..5 {
+            assert_eq!(
+                leaf_insert(&mut page, i, &ranked_key(i as u32, 8), &[9; 20]).unwrap(),
+                Fit::Done
+            );
+        }
+        validate(&page, g).unwrap();
+        page
+    }
+
+    #[test]
+    fn validate_rejects_a_leaf_key_over_max_key() {
+        for size in SIZES {
+            let g = geometry(size);
+            let mk = g.max_key();
+            // `leaf_insert` does not enforce the limits. Both entries are exactly `max_entry`, so
+            // only the key limit refuses them: a branch separator must hold any leaf key.
+            for (klen, value) in [(mk + 1, &b"v"[..]), (mk + 2, &b""[..])] {
+                assert_eq!(cell_size_leaf(klen, value.len()) + SLOT, g.max_entry());
+                let mut page = fresh(&g, Kind::Leaf);
+                assert_eq!(leaf_insert(&mut page, 0, &vec![7; klen], value).unwrap(), Fit::Done);
+                let err = validate(&page, &g).unwrap_err();
+                assert!(err.to_string().contains("over the limit"), "{size}/{klen}: {err}");
+            }
+            // The longest accepted key passes.
+            let mut page = fresh(&g, Kind::Leaf);
+            let value = vec![1; g.max_value(mk)];
+            assert_eq!(leaf_insert(&mut page, 0, &vec![7; mk], &value).unwrap(), Fit::Done);
+            validate(&page, &g).unwrap();
+        }
+    }
+
+    /// A named way to damage a valid page.
+    type Damage = (&'static str, fn(&mut Vec<u8>));
+
+    #[test]
+    fn validate_rejects_each_kind_of_damage() {
+        let g = geometry(4096);
+        let end = g.page_size() - TRAILER;
+        let damages: [Damage; 13] = [
+            ("unknown kind", |p| p[KIND_OFF] = 3),
+            ("page flags", |p| p[FLAGS_OFF] = 1),
+            ("reserved header byte", |p| p[RESERVED_OFF + 5] = 1),
+            ("one slot too many", |p| put_u16(p, NKEYS_OFF, 6)),
+            ("upper past the trailer", |p| put_u16(p, UPPER_OFF, 4096 - TRAILER + 1)),
+            ("keys out of order", |p| {
+                let (a, b) = (slot(p, 1), slot(p, 2));
+                put_u16(p, HEADER + SLOT, b);
+                put_u16(p, HEADER + 2 * SLOT, a);
+            }),
+            ("gap before the first cell", |p| {
+                let u = upper(p);
+                put_u16(p, UPPER_OFF, u - 1);
+            }),
+            ("cell overlapping its neighbour", |p| {
+                let off = upper(p);
+                put_u32(p, off, 21);
+            }),
+            ("cells ending before the trailer", |p| {
+                let off = slot(p, 0);
+                put_u32(p, off, 19);
+            }),
+            ("cell flags", |p| {
+                let off = slot(p, 0);
+                put_u16(p, off + 6, 1);
+            }),
+            ("cell overrunning the page", |p| {
+                let off = slot(p, 0);
+                put_u32(p, off, u32::MAX);
+            }),
+            ("wrong kind for the cells", |p| p[KIND_OFF] = KIND_BRANCH),
+            ("short buffer", |p| p.truncate(2048)),
+        ];
+        for (what, damage) in damages {
+            let mut page = damage_base(&g);
+            damage(&mut page);
+            assert!(validate(&page, &g).is_err(), "{what} passed validate");
+        }
+        assert_eq!(slot(&damage_base(&g), 0), end - cell_size_leaf(8, 20));
+
+        // An entry over the limit (the codec itself does not check limits).
+        let mut page = fresh(&g, Kind::Leaf);
+        let fit = leaf_insert(&mut page, 0, &[1; 8], &vec![0; g.max_value(8) + 1]).unwrap();
+        assert_eq!(fit, Fit::Done);
+        assert!(validate(&page, &g).is_err());
+
+        // A branch needs a child, and its cell 0 has no key.
+        let page = fresh(&g, Kind::Branch);
+        assert!(validate(&page, &g).is_err());
+        let mut page = fresh(&g, Kind::Branch);
+        for (i, key) in [&b"a"[..], b"b"].into_iter().enumerate() {
+            let h = hdr(&page).unwrap();
+            let off = reserve(&mut page, &h, i, cell_size_branch(1)).unwrap().unwrap();
+            write_branch_cell(&mut page[off..off + cell_size_branch(1)], key, 1, 1);
+        }
+        assert!(validate(&page, &g).is_err());
+        branch_delete(&mut page, 0).unwrap();
+        validate(&page, &g).unwrap();
+        assert_eq!(cells(&page), vec![(Vec::new(), 1, 1)]);
+    }
+
+    #[test]
+    fn root_and_range_helpers() {
+        let g = geometry(4096);
+        let mut root = vec![0; g.page_size()];
+        init_root(&mut root, 5, 9, (10, 1), b"m", (11, 2)).unwrap();
+        validate(&root, &g).unwrap();
+        assert_eq!((pgno(&root), txn(&root), kind(&root).unwrap()), (5, 9, Kind::Branch));
+        assert_eq!(cells(&root), vec![(Vec::new(), 10, 1), (b"m".to_vec(), 11, 2)]);
+        assert_eq!(branch_search(&root, b"a").unwrap(), 0);
+        assert_eq!(branch_search(&root, b"m").unwrap(), 1);
+        assert!(keys_in_range(&root, Some(b"m"), Some(b"n")).unwrap());
+        assert!(!keys_in_range(&root, Some(b"n"), None).unwrap());
+        assert!(!keys_in_range(&root, None, Some(b"m")).unwrap());
+        set_pgno_txn(&mut root, 6, 10);
+        assert_eq!((pgno(&root), txn(&root)), (6, 10));
+
+        let leaf = damage_base(&g);
+        let (first, last) = (ranked_key(0, 8), ranked_key(4, 8));
+        assert!(keys_in_range(&leaf, Some(&first), Some(&ranked_key(5, 8))).unwrap());
+        assert!(!keys_in_range(&leaf, Some(&ranked_key(1, 8)), None).unwrap());
+        assert!(!keys_in_range(&leaf, None, Some(&last)).unwrap());
+        assert!(keys_in_range(&fresh(&g, Kind::Leaf), Some(b"z"), Some(b"a")).unwrap());
+        assert_eq!(leaf_search(&leaf, &last).unwrap(), Search::Found(4));
+        assert_eq!(leaf_search(&leaf, b"").unwrap(), Search::NotFound(0));
+        assert!(fits(&leaf, free_space(&leaf).unwrap() - SLOT).unwrap());
+        assert!(!fits(&leaf, free_space(&leaf).unwrap() - SLOT + 1).unwrap());
+        assert!(leaf_search(&root, b"a").is_err());
+        assert!(branch_search(&leaf, b"a").is_err());
+    }
+
+    /// SplitMix64, for cheap reproducible page bytes.
+    fn splitmix(state: &mut u64) -> u64 {
+        *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = *state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+
+    /// Page bytes from a seed: plain noise, or noise shaped to pass the header and per-cell
+    /// checks (a known kind, flags zero, slots into the cell area, small cell lengths) so the
+    /// deeper code runs on overlapping, out-of-order cells.
+    fn noise_page(seed: u64, size: usize, shaped: bool) -> Vec<u8> {
+        let mut s = seed;
+        let mut page = vec![0_u8; size];
+        for chunk in page.chunks_mut(8) {
+            chunk.copy_from_slice(&splitmix(&mut s).to_le_bytes()[..chunk.len()]);
+        }
+        if shaped {
+            let r = splitmix(&mut s);
+            let end = size - TRAILER;
+            page[KIND_OFF] = if r & 1 == 0 { KIND_BRANCH } else { KIND_LEAF };
+            page[FLAGS_OFF] = 0;
+            let nkeys = (r >> 8) as usize % 200;
+            let slots_end = HEADER + SLOT * nkeys;
+            let upper = slots_end + (r >> 32) as usize % (end - slots_end + 1);
+            put_u16(&mut page, NKEYS_OFF, nkeys);
+            put_u16(&mut page, UPPER_OFF, upper);
+            for i in 0..nkeys {
+                let r = splitmix(&mut s);
+                let off = upper + r as usize % (end - upper).max(1);
+                put_u16(&mut page, HEADER + SLOT * i, off);
+                if off + BRANCH_CELL_HEADER <= end {
+                    put_u32(&mut page, off, (r >> 16) as u32 % 64);
+                    put_u16(&mut page, off + 4, (r >> 24) as usize % 32);
+                    put_u16(&mut page, off + 6, 0);
+                    put_u16(&mut page, off + 8, (r >> 32) as usize % 32);
+                }
+            }
+        }
+        page
+    }
+
+    /// A valid leaf or branch of random content with a few random bytes overwritten, mostly in
+    /// the header and slot array.
+    fn damaged_page(seed: u64, size: u32, flips: usize) -> Vec<u8> {
+        let mut s = seed;
+        let g = geometry(size);
+        let leaf = splitmix(&mut s) & 1 == 0;
+        let mut page = fresh(&g, if leaf { Kind::Leaf } else { Kind::Branch });
+        if !leaf {
+            assert_eq!(branch_insert(&mut page, 0, &[], 1, 1).unwrap(), Fit::Done);
+        }
+        for i in 1.. {
+            let r = splitmix(&mut s);
+            let key = ranked_key(i, (r % 40) as usize);
+            let fit = if leaf {
+                leaf_insert(&mut page, i as usize - 1, &key, &vec![7; (r >> 8) as usize % 200])
+            } else {
+                branch_insert(&mut page, i as usize, &key, i, i)
+            };
+            if fit.unwrap() == Fit::Full || r >> 60 == 0 {
+                break;
+            }
+        }
+        let hot = HEADER + SLOT * nkeys(&page) + 16;
+        for _ in 0..flips {
+            let r = splitmix(&mut s);
+            let pos =
+                if r & 1 == 0 { (r >> 8) as usize % hot } else { (r >> 8) as usize % page.len() };
+            page[pos] = (r >> 40) as u8;
+        }
+        page
+    }
+
+    /// What [`branch_route`] and [`branch_route_at`] give, from the slow accessors.
+    fn route_model(page: &[u8], ci: Result<usize>) -> Option<Route<'_>> {
+        let ci = ci.ok()?;
+        let (child, child_txn) = branch_child(page, ci).ok()?;
+        let lo = if ci > 0 { Some(branch_key(page, ci).ok()?) } else { None };
+        let hi = if ci + 1 < nkeys(page) { Some(branch_key(page, ci + 1).ok()?) } else { None };
+        Some(Route { index: ci, lo, hi, child, child_txn })
+    }
+
+    /// What [`leaf_find`] gives, from the slow accessors.
+    fn find_model<'a>(page: &'a [u8], key: &[u8]) -> Option<Find<'a>> {
+        Some(match leaf_search(page, key).ok()? {
+            Search::Found(index) => Find::Found { index, value: leaf_entry(page, index).ok()?.1 },
+            Search::NotFound(index) => Find::NotFound {
+                index,
+                before: if index > 0 { Some(leaf_key(page, index - 1).ok()?) } else { None },
+                after: if index < nkeys(page) { Some(leaf_key(page, index).ok()?) } else { None },
+            },
+        })
+    }
+
+    /// The one-pass searches agree with the slow accessors on any page, damaged or not: the same
+    /// result, and an error exactly when one of those accessors errs (they check the same cells).
+    fn assert_one_pass_matches(page: &[u8], key: &[u8], i: usize) {
+        assert_eq!(leaf_find(page, key).ok(), find_model(page, key), "leaf_find {key:?}");
+        let route = route_model(page, branch_search(page, key));
+        assert_eq!(branch_route(page, key).ok(), route, "branch_route {key:?}");
+        assert_eq!(branch_route_at(page, i).ok(), route_model(page, Ok(i)), "branch_route_at {i}");
+    }
+
+    /// Call every reader and mutator on `page` (mutators on copies); none may panic. The one-pass
+    /// searches must match the slow accessors ([`assert_one_pass_matches`]).
+    fn exercise(page: &[u8], key: &[u8], sel: usize) {
+        let g = geometry(page.len() as u32);
+        let _ = validate(page, &g);
+        let _ = (pgno(page), kind(page), flags(page), nkeys(page), txn(page), upper(page));
+        let _ = (free_space(page), fits(page, 100));
+        let _ = (leaf_search(page, key), branch_search(page, key));
+        let _ = keys_in_range(page, Some(key), Some(&[0xff; 4]));
+        let n = nkeys(page);
+        for i in 0..=n.min(300) {
+            let _ = (
+                leaf_entry(page, i),
+                leaf_key(page, i),
+                branch_child(page, i),
+                branch_key(page, i),
+            );
+            assert_eq!(branch_route_at(page, i).ok(), route_model(page, Ok(i)), "route_at {i}");
+        }
+        let i = sel % (n + 2);
+        assert_one_pass_matches(page, key, i);
+        assert_one_pass_matches(page, &[], i);
+        let sep = [&[1][..], key].concat();
+        let empty = |kind| {
+            let mut page = vec![0; g.page_size()];
+            init(&mut page, kind, 1, 1);
+            page
+        };
+        let _ = leaf_insert(&mut page.to_vec(), i, key, b"value");
+        let _ = leaf_replace_value(&mut page.to_vec(), i, &[7; 300]);
+        let _ = leaf_replace_value(&mut page.to_vec(), i, &[]);
+        let _ = leaf_delete(&mut page.to_vec(), i);
+        let _ = branch_insert(&mut page.to_vec(), i.max(1), &sep, 1, 2);
+        let _ = branch_set_child(&mut page.to_vec(), i, 1, 2);
+        let _ = branch_delete(&mut page.to_vec(), i);
+        let _ = branch_delete(&mut page.to_vec(), 0);
+        let append = sel.is_multiple_of(3);
+        let _ = split_leaf(&mut page.to_vec(), &mut empty(Kind::Leaf), i, key, b"v", append);
+        let _ = split_branch(
+            &mut page.to_vec(),
+            &mut empty(Kind::Branch),
+            i.max(1),
+            &sep,
+            1,
+            2,
+            append,
+        );
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(256))]
+
+        #[test]
+        fn arbitrary_bytes_never_panic(
+            seed in any::<u64>(),
+            size in select(&SIZES[..]),
+            shaped in any::<bool>(),
+            key in vec(any::<u8>(), 0..24),
+            sel in any::<usize>(),
+        ) {
+            exercise(&noise_page(seed, size as usize, shaped), &key, sel);
+        }
+
+        #[test]
+        fn damaged_valid_pages_never_panic(
+            seed in any::<u64>(),
+            size in select(&SIZES[..]),
+            flips in 1_usize..6,
+            key in vec(any::<u8>(), 0..24),
+            sel in any::<usize>(),
+        ) {
+            exercise(&damaged_page(seed, size, flips), &key, sel);
+        }
+    }
+
+    #[test]
+    fn short_buffers_are_rejected_not_indexed() {
+        let g = geometry(4096);
+        for len in [0, 3, 23, 24, 100, 4095, 4097, 8000] {
+            // An empty leaf's header, cut to `len` bytes where it is shorter.
+            let mut page = vec![0; len.max(HEADER)];
+            page[KIND_OFF] = KIND_LEAF;
+            put_u16(&mut page, UPPER_OFF, len.saturating_sub(TRAILER).min(u16::MAX.into()));
+            page.truncate(len);
+            let _ = (pgno(&page), flags(&page), nkeys(&page), txn(&page), upper(&page));
+            assert!(free_space(&page).is_err());
+            assert!(leaf_search(&page, b"k").is_err());
+            assert!(leaf_entry(&page, 0).is_err());
+            assert!(branch_search(&page, b"k").is_err());
+            assert!(validate(&page, &g).is_err());
+        }
+    }
+}

@@ -1,0 +1,43 @@
+// SPDX-License-Identifier: MIT or Apache-2.0
+//! tndb-b: an embedded key-value engine in the LMDB/MDBX mould.
+//!
+//! One page file holds every table as a copy-on-write B+tree with the values in its pages. A
+//! single writer builds the next version of the trees in pages no reader can reach, while any
+//! number of readers see consistent snapshots. A commit makes the new version durable by writing
+//! one of two fixed meta pages (atomic commit, O(1) recovery: open picks the valid meta with the
+//! highest transaction id), and pages freed by a commit are reused only once no durable meta and no
+//! live reader can reach them, through a free list persisted in the file itself. There is no log:
+//! the meta pages and the gated page reuse carry all crash safety.
+
+// The page file is mmap-backed, synced with `msync`/`fsync`, preallocated with
+// `fallocate`/`F_PREALLOCATE` and locked with `flock`: this crate builds for unix targets only.
+#[cfg(not(unix))]
+compile_error!("tndb-b requires a unix target (mmap-backed page file, msync, flock)");
+
+mod alloc;
+#[cfg(test)]
+mod bench;
+mod catalog;
+mod check;
+mod crc;
+#[cfg(test)]
+mod disk_model;
+mod env;
+mod error;
+mod file;
+mod freelist;
+mod latch;
+mod meta;
+mod page;
+mod page_set;
+mod sys;
+#[cfg(test)]
+mod tests;
+mod tree;
+mod txn;
+
+pub use check::{CheckReport, TableCheck};
+pub use env::{Env, EnvOptions, EnvStat, SyncMode};
+pub use error::{Error, Result};
+pub use tree::cursor::Cursor;
+pub use txn::{ReadTxn, RoTxn, RwCursor, RwTxn, Table, TableStat};

@@ -12584,6 +12584,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "tndb-b"
+version = "0.1.0"
+dependencies = [
+ "crc32fast",
+ "libc",
+ "memmap2",
+ "parking_lot",
+ "proptest",
+ "reth-libmdbx",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tracing",
+]
+
+[[package]]
 name = "tokio"
 version = "1.53.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

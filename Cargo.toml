@@ -19,6 +19,7 @@ members = [
     "crates/kad-client",
     "crates/state-sync",
     "crates/tn-metrics",
+    "crates/tndb-b",
     "crates/tn-reth",
     "crates/e2e-tests",
     "crates/telcoin-network-cli",

@@ -1,0 +1,13 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc bb7a3a3d47d0231218fe7e9db7b8bb311f258eaf2540afd8cbf9c82bb9ef6287 # shrinks to size = 4096, ops = [Put(Spec { ksel: 0, klen: 0, kseed: 0, vsel: 0, vlen: 0, vfill: 0 }), Put(Spec { ksel: 0, klen: 0, kseed: 1, vsel: 0, vlen: 0, vfill: 0 }), Delete(0)]
+cc 375209cba77b5f4815eed6bf9c254ba3e3a70b63ada240226cf99a4608bf36fa # shrinks to specs = [Spec { ksel: 166, klen: 0, kseed: 0, vsel: 0, vlen: 0, vfill: 0 }, Spec { ksel: 1, klen: 49098, kseed: 0, vsel: 0, vlen: 0, vfill: 0 }, Spec { ksel: 17, klen: 49098, kseed: 0, vsel: 0, vlen: 0, vfill: 0 }, Spec { ksel: 58, klen: 0, kseed: 0, vsel: 30, vlen: 10268, vfill: 131 }, Spec { ksel: 122, klen: 62212, kseed: 192, vsel: 110, vlen: 10553, vfill: 43 }, Spec { ksel: 93, klen: 40634, kseed: 228, vsel: 114, vlen: 54742, vfill: 218 }, Spec { ksel: 166, klen: 41199, kseed: 222, vsel: 31, vlen: 27638, vfill: 147 }, Spec { ksel: 30, klen: 3347, kseed: 74, vsel: 49, vlen: 10994, vfill: 151 }, Spec { ksel: 102, klen: 39072, kseed: 19, vsel: 212, vlen: 13945, vfill: 133 }, Spec { ksel: 241, klen: 13667, kseed: 141, vsel: 165, vlen: 51288, vfill: 179 }, Spec { ksel: 37, klen: 29400, kseed: 84, vsel: 201, vlen: 52908, vfill: 43 }, Spec { ksel: 254, klen: 7362, kseed: 87, vsel: 86, vlen: 24292, vfill: 3 }, Spec { ksel: 17, klen: 38739, kseed: 214, vsel: 108, vlen: 37471, vfill: 85 }, Spec { ksel: 8, klen: 9982, kseed: 138, vsel: 93, vlen: 42460, vfill: 216 }, Spec { ksel: 192, klen: 26209, kseed: 197, vsel: 128, vlen: 50280, vfill: 163 }], at_sel = 1135070509320372818, append = false
+cc bd35a5aaf1f69471cffddf254f9c8c3773a6d805f205e46c9676eceb59b0bee6 # shrinks to seed = 16133489606739242319, size = 32768, shaped = true, key = [], sel = 0
+cc fae50372f057a8d3fb36043bab9da887496a51b0150f88a286f089700b8db50d # shrinks to seed = 9738563295061300150, size = 4096, flips = 4, key = [], sel = 0
+cc c8d3642cc911ad42934d20db7e2f7a0b7a4d6a37c2e3e2e3ef0bddbd073637ea # shrinks to seed = 3363940241176974634, size = 4096, flips = 4, key = [1], sel = 0
+cc 0d0fe0f7feff5f91740ebb8c48ea494789ba29315f5463f74d0185d284665158 # shrinks to seed = 5891950408352145929, size = 4096, shaped = true, key = [], sel = 0
+cc 5cf521be25866c2541e259664ea86ebe399a37f96c1535c61abb878f5610e5e1 # shrinks to seed = 5187083200078007627, size = 4096, flips = 3, key = [], sel = 0
