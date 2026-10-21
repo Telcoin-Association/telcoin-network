@@ -358,11 +358,12 @@ The release signatures and the on-chain attestation answer different questions: 
 
 | Job | Event | Runs | Token | Timeout |
 |---|---|---|---|---|
-| `validate-tag` | a pushed `v*` tag; a dispatch with `mode: validate` | `Install Foundry`, `etc/release.sh check-tag`, then `etc/release.sh notes` into the step summary | `contents: read` | 15 min |
+| `validate-tag` | a pushed `v*` tag; a dispatch with `mode: validate` | `Install Foundry`, `etc/release.sh check-tag`, then `etc/release.sh notes` into the step summary | `contents: read`, `actions: read` | 15 min |
 | `draft-release` | a pushed `v*` tag, once `validate-tag` has passed | `etc/release.sh draft` | `contents: write` | 5 min |
 | `verify-release` | a published release (`release: published`); a dispatch with `mode: verify` | `Install Foundry`, `etc/release.sh verify` | `contents: read` | 20 min |
 
 `validate-tag` checks that the tag is an annotated tag signed by a key in the allowlist (`.github/maintainer-gpg-keys/` on `main`), that it points at a commit on `main` whose Cargo version and `CHANGELOG.md` section match it, and that the commit was attested on-chain, which is what `cast` is installed for.
+A tag is validated against every release tag that exists when it is pushed: on the push, the first run of `validate-tag` compares it with every `v*` tag in its checkout, and a re-run with the tags created before GitHub created the run, which `actions: read` lets it look up; the date in the tag plays no part there.
 The tag filter is broader than the tag grammar on purpose: a malformed `v` tag fails visibly there instead of being ignored, and `etc/release.sh` decides what a release tag is.
 `draft-release` creates the draft with the same notes, or refreshes the notes of a draft it created before; the draft carries no assets until the maintainer's `make release-build` uploads them.
 `published` is the event type that fires when a draft is published as a prerelease, which every adiri and rc release is; `prereleased` does not fire for those.

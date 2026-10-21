@@ -65,8 +65,9 @@ on:
         options: [validate, verify]
         default: validate
 
-# Everything here reads the repository; draft-release alone adds the write it needs to
-# create the draft (least privilege, CodeQL actions/missing-workflow-permissions).
+# Everything here reads the repository; validate-tag also reads its own workflow run, and
+# draft-release alone adds the write it needs to create the draft (least privilege, CodeQL
+# actions/missing-workflow-permissions).
 permissions:
   contents: read
 
@@ -96,6 +97,13 @@ jobs:
     if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.mode == 'validate')
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    # actions: read lets the check read when GitHub created this run. On the push of a tag
+    # the first run compares the tag with every release tag in the checkout; a re-run
+    # compares it with the tags created before that time, the time of the push, whatever
+    # date the tag itself carries.
+    permissions:
+      contents: read
+      actions: read
     steps:
       # The scripts and the allowlist come from main, never from the tag; the header
       # says why. `refs/heads/main` is fully qualified so that a tag named `main` cannot
@@ -152,6 +160,8 @@ jobs:
           "${RUNNER_TEMP}/foundry/cast" --version
 
       - name: Check the tag
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: ./etc/release.sh check-tag "$RELEASE_TAG"
 
       - name: Release notes

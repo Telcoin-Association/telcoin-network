@@ -542,7 +542,8 @@ require_origin() {
 }
 
 # Retried because a fetch is the first network call on every host. git fetch exits 1 when it
-# refuses a ref update (here only the unforced tag: it moved on origin), 128 on other errors.
+# refuses a ref update (here only the unforced tags: a local one differs from origin's), 128 on
+# other errors.
 git_fetch() {
     local attempt=1 rc
     require_origin
@@ -550,7 +551,7 @@ git_fetch() {
         git fetch --quiet --no-tags origin "$@" && rc=0 || rc=$?
         case "$rc" in
             0) return 0 ;;
-            1) die 1 "git fetch refused to update a local ref from origin ($*); did the tag move on origin?" ;;
+            1) die 1 "git fetch refused to update a local ref from origin ($*); a local tag differs from the one on origin: find out why before you delete it" ;;
         esac
         [ "$attempt" -lt 3 ] || die 3 "git fetch from origin failed after 3 attempts"
         attempt=$((attempt + 1))
@@ -570,8 +571,9 @@ ls_remote_tag() {
     printf '%s\n' "$out" | awk -v r="refs/tags/$1" '$2 == r { print $1 }'
 }
 
-# check-tag step (1), outside CI and dry run: fetch main and exactly this tag, unforced, so a
-# local tag that differs from origin is an error rather than silently replaced.
+# check-tag step (1), outside CI and dry run: fetch main, this tag and every other v* tag,
+# unforced, so a local tag that differs from origin is an error rather than silently replaced,
+# and the version rules see the tags origin has.
 fetch_tag() {
     local remote local_obj
     if [ "$FETCHED" = 1 ] || [ "$DRY_RUN" = 1 ] || [ "${GITHUB_ACTIONS:-}" = true ]; then return 0; fi
@@ -580,7 +582,7 @@ fetch_tag() {
     if local_obj=$(git rev-parse --verify --quiet "refs/tags/$TAG"); then
         [ "$local_obj" = "$remote" ] || die 1 "local tag $TAG ($local_obj) differs from origin ($remote)"
     fi
-    git_fetch +refs/heads/main:refs/remotes/origin/main "refs/tags/$TAG:refs/tags/$TAG"
+    git_fetch +refs/heads/main:refs/remotes/origin/main "refs/tags/$TAG:refs/tags/$TAG" 'refs/tags/v*:refs/tags/v*'
     FETCHED=1
 }
 
@@ -643,8 +645,10 @@ remote_tags() {
 }
 
 # Names of the v* tags that count for the version rules. Without a cutoff (TAG does not exist
-# yet), every v* tag on origin, or every local one in a dry run. With a cutoff (epoch seconds),
-# every local annotated tag whose tagger date is strictly earlier, whatever commit it names.
+# yet, or CI checks the push of TAG), every v* tag on origin, read with ls-remote, or every
+# local one in a dry run and in CI, whose checkout holds origin's tags. With a cutoff (epoch
+# seconds), every local annotated tag whose tagger date is strictly earlier, whatever commit
+# it names.
 # Its output is captured, and bash 3.2 runs $(...) without -e, so a failure dies explicitly
 # and the caller passes the status on with `|| exit`.
 tags_before() {
@@ -653,7 +657,7 @@ tags_before() {
         out=$(git for-each-ref --format='%(refname:strip=2) %(taggerdate:raw)' 'refs/tags/v*') ||
             die 2 "cannot list the v* tags"
         printf '%s\n' "$out" | awk -v c="$1" '$2 != "" && $2 + 0 < c + 0 { print $1 }'
-    elif [ "$DRY_RUN" = 1 ]; then
+    elif [ "$DRY_RUN" = 1 ] || [ "${GITHUB_ACTIONS:-}" = true ]; then
         git tag -l 'v*' || die 2 "cannot list the v* tags"
     else
         remote_tags
@@ -677,6 +681,41 @@ check_version_order() {
         die 1 "$TAG is not newer than the $CHANNEL release v$highest; $CHANNEL versions only go up"
 }
 
+# Epoch seconds at which GitHub created this workflow run: the push of the tag created it, and
+# a re-run keeps it. Its output is captured, so a failure dies explicitly.
+ci_run_created() {
+    local t
+    [[ "${GITHUB_RUN_ID:-}" =~ ^[0-9]+$ ]] || die 2 "GITHUB_RUN_ID is not set"
+    t=$(gh_run api "repos/$REPO/actions/runs/$GITHUB_RUN_ID" --jq '.created_at | fromdateiso8601') || exit
+    [[ "$t" =~ ^[0-9]+$ ]] || die 3 "GitHub returned no creation time for workflow run $GITHUB_RUN_ID"
+    printf '%s\n' "$t"
+}
+
+# The cutoff for the version rules once TAG exists, empty for none. A tag is validated against
+# every release tag that exists when it is pushed:
+# - CI, on the push of TAG: the first run compares with every tag; a re-run with the tags
+#   created before GitHub created the run, the time of the push.
+# - Everywhere else (a dispatch, build, sign, verify, publish): the tags dated before TAG's
+#   tagger date, which must lie between its commit's committer date and five minutes from now.
+#   The check of the push in CI is what creates the draft that these steps need.
+# Its output is captured, so a failure dies explicitly.
+tag_cutoff() {
+    local commit=$1 tagged committed now
+    if [ "${GITHUB_ACTIONS:-}" = true ] && [ "${GITHUB_EVENT_NAME:-}" = push ]; then
+        if [ "${GITHUB_RUN_ATTEMPT:-1}" != 1 ]; then ci_run_created || exit; fi
+        return 0
+    fi
+    tagged=$(tagger_time "$TAG") || exit
+    [ -n "$tagged" ] || die 1 "tag $TAG has no tagger date"
+    committed=$(git log -1 --format=%ct "$commit") || die 1 "cannot read the committer date of $commit"
+    [ "$tagged" -ge "$committed" ] ||
+        die 1 "tag $TAG is dated $tagged (epoch seconds), before its commit $commit was made ($committed); a release tag is made after its commit"
+    now=$(date +%s) || die 2 "cannot read the clock"
+    [ "$tagged" -le $((now + 300)) ] ||
+        die 1 "tag $TAG is dated $tagged (epoch seconds), more than five minutes after this host's clock ($now)"
+    printf '%s\n' "$tagged"
+}
+
 # check-tag step (5): the Cargo version is X.Y.Z, the extradata string fits 32 bytes, and the
 # release is monotonic in its channel, with no release candidate after its final.
 check_version_at() {
@@ -690,15 +729,14 @@ check_version_at() {
     [ "${#extradata}" -le 32 ] || die 1 "'$extradata' is longer than the 32-byte extradata limit"
 
     # Before TAG exists (`tag` is about to create it) the rules compare with every tag on origin.
-    # Once it exists they compare only with the annotated tags dated before it, on any commit:
-    # an older release stays verifiable after newer ones exist, while a lower version tagged
-    # after a higher one, or a release candidate tagged after its final, fails. Only TAG's date
-    # is signed; the other tags are not verified (the tags before this process are unsigned),
-    # so the v* tag ruleset keeps bogus tags out. Tags are immutable under that ruleset: a wrong
-    # tag stays, and the next version supersedes it.
+    # Once it exists they compare with the tags tag_cutoff selects, on any commit: an older
+    # release stays verifiable after newer ones exist, while a lower version tagged after a
+    # higher one, or a release candidate tagged after its final, fails. The other tags are not
+    # verified (the tags before this process are unsigned), so the v* tag ruleset keeps bogus
+    # tags out. Tags are immutable under that ruleset: a wrong tag stays, and the next version
+    # supersedes it.
     if git rev-parse --verify --quiet "refs/tags/$TAG" >/dev/null; then
-        cutoff=$(tagger_time "$TAG")
-        [ -n "$cutoff" ] || die 1 "tag $TAG has no tagger date"
+        cutoff=$(tag_cutoff "$commit") || exit
     fi
     check_version_order "$cutoff"
 }
