@@ -11,9 +11,12 @@ metadata:
     app.kubernetes.io/part-of: telcoin-network
 spec:
   # No replicas: the HPA (hpa.yaml) owns the count; set it if you do not install the HPA.
-  # A rollout replaces one pod at a time and waits out the old pod's 51s
-  # shutdown (minReadySeconds > 5s delay + 45s drain + 1s) before the next,
-  # so at most maxReplicas + 1 gateways hold worker slots at once.
+  # A rollout replaces one pod at a time and waits out the old pod's 52s
+  # shutdown (minReadySeconds > 5s delay + 45s drain + 1s join margin + 1s
+  # runtime shutdown) before the next, so a rollout adds at most one gateway to
+  # the maxReplicas holding worker slots. A node drain is not bounded this way:
+  # the PDB counts only Ready pods that are not terminating, so pods it evicted
+  # can still be draining (see WORKER_GATEWAY_MAX_UPSTREAM_INFLIGHT below).
   strategy:
     type: RollingUpdate
     rollingUpdate:
@@ -49,10 +52,11 @@ spec:
             matchLabels:
               app: worker-gateway
       # Longer than the gateway's --shutdown-delay (5s, set below) plus its
-      # --graceful-shutdown-timeout (45s, set below) plus its 1s join margin:
-      # 5s + 45s + 1s = 51s, so the process can finish draining in-flight
-      # proxied requests before the kubelet sends SIGKILL. Recompute it if
-      # you change either value.
+      # --graceful-shutdown-timeout (45s, set below) plus its 1s join margin
+      # and its 1s runtime shutdown: 5s + 45s + 1s + 1s = 52s, so the
+      # process can finish draining in-flight proxied requests before the
+      # kubelet sends SIGKILL. Recompute it, and minReadySeconds above, if you
+      # change either value.
       terminationGracePeriodSeconds: 55
       containers:
         - name: worker-gateway
@@ -119,29 +123,38 @@ spec:
             # the pod's removal from the Service endpoints to reach kube-proxy
             # and load balancers, as the old preStop sleep was. A front outside
             # Kubernetes that probes /ready or /ready/any needs its interval x
-            # unhealthy threshold to fit in it; for a slower front raise this
-            # and terminationGracePeriodSeconds. The drain starts after it. No
-            # preStop sleep is needed.
+            # unhealthy threshold to fit in it; for a slower front raise this,
+            # terminationGracePeriodSeconds and minReadySeconds. The drain
+            # starts after it. No preStop sleep is needed.
             - name: WORKER_GATEWAY_SHUTDOWN_DELAY
               value: "5s"
             # Drain in-flight requests for up to the gateway's whole-request
             # deadline (--upstream-request-timeout 35s + --header-read-timeout
-            # 10s), so a request accepted just before the listener closes,
-            # such as an eth_sendRawTransactionSync waiting for its receipt,
-            # still finishes. The drain ends as soon as the last request does.
-            # 45s equals the default at these timeouts; it is set explicitly so
-            # the arithmetic for terminationGracePeriodSeconds stays visible.
+            # 10s), so a request whose headers have arrived before the listener
+            # closes, such as an eth_sendRawTransactionSync waiting for its
+            # receipt, still finishes; a connection still sending its headers
+            # then can be cut up to --header-read-timeout (10s) before its own
+            # deadline. The drain ends as soon as the last request does.
+            # 45s equals the default at these timeouts; it is set explicitly
+            # so the arithmetic for terminationGracePeriodSeconds and
+            # minReadySeconds stays visible.
             - name: WORKER_GATEWAY_GRACEFUL_SHUTDOWN_TIMEOUT
               value: "45s"
             # Keep N x --max-upstream-inflight below the worker's
             # --rpc.max-connections (500 by default), which counts in-flight
             # HTTP requests, not TCP connections. N counts every gateway that
             # can hold worker requests at once: the HPA's ceiling of 10
-            # replicas plus the one pod a rollout is replacing (see strategy
-            # above), so 11 x 45 = 495 worker requests at most, below the
-            # worker's limit. Raise it when the worker's limit is raised; lower
-            # it for a higher replica ceiling (see README.md, "Sizing for N
-            # gateways").
+            # replicas, plus the one pod a rollout is replacing while it
+            # drains (see strategy above), plus every pod a node drain evicted
+            # that is still draining: the PDB counts only Ready pods that are
+            # not terminating, so it allows the next eviction as soon as the
+            # replacement is Ready. 11 x 45 = 495 worker requests, below the
+            # worker's limit, holds when nodes are drained one at a time, with
+            # at most one gateway per node and never during a rollout;
+            # otherwise add one to N for each eviction that can overlap. Raise
+            # it when the worker's limit is raised; lower it for a higher
+            # replica ceiling or more overlapping evictions (see README.md,
+            # "Sizing for N gateways").
             - name: WORKER_GATEWAY_MAX_UPSTREAM_INFLIGHT
               value: "45"
           ports:
@@ -178,6 +191,13 @@ spec:
               path: /ready/any
               port: probe
             periodSeconds: 5
+            # /ready/any answers from memory, so a slow answer means only a
+            # starved runtime, which every replica shares under a flood; a
+            # fast 503 counts as one miss like a timeout, so a real outage
+            # removes the pod after three misses, about 10 to 15 s with
+            # periodSeconds: 5 and failureThreshold: 3.
+            timeoutSeconds: 5
+            failureThreshold: 3
           resources:
             requests:
               cpu: 100m
@@ -191,9 +211,13 @@ spec:
               # bounded by --max-inflight-request-bytes (512 MiB), plus a read
               # buffer of up to --http1-max-buf-size per connection:
               # 512 MiB + 500 x 64 KiB + 64 MiB for the process is about
-              # 608 MiB. The request and the limit both follow this formula;
-              # recompute both if you change those flags (see
-              # deploy/README.md, "Memory limit").
+              # 608 MiB. With WORKER_GATEWAY_REDIRECT_QUERIES set, up to 256
+              # unread submission answers (--max-inflight-submissions) of up
+              # to --max-request-bytes + 4 KiB each come on top, but a
+              # connection holds a body or an answer, never both, so at these
+              # defaults the total stays within that figure. The request and
+              # the limit both follow this formula; recompute both if you
+              # change those flags (see deploy/README.md, "Memory limit").
               memory: 1Gi
           securityContext:
             runAsNonRoot: true

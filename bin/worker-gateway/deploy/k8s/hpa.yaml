@@ -1,8 +1,16 @@
-# HorizontalPodAutoscaler driven by the gateway's in-flight request gauge.
+# HorizontalPodAutoscaler driven by two of the gateway's gauges: requests in
+# flight (tn_worker_gateway_inflight_requests, read load) and requests held
+# on the worker cap (tn_worker_gateway_upstream_inflight, submission load).
+# The HPA scales to the larger of the two results. A worker-bound request
+# over WORKER_GATEWAY_MAX_UPSTREAM_INFLIGHT (45 in deployment.yaml) is
+# refused at once, not queued, so under submission load alone the worker-slot
+# gauge stays at or below 45 and the in-flight gauge rises past it only through
+# held submission answers clients have not read yet; the worker-slot target (30)
+# sits below that cap.
 #
-# The Pods custom metric below requires prometheus-adapter (or an equivalent
-# custom.metrics.k8s.io provider) to surface tn_worker_gateway_inflight_requests
-# on the custom metrics API as a per-pod metric. See ../README.md for a sample
+# The Pods custom metrics below require prometheus-adapter (or an equivalent
+# custom.metrics.k8s.io provider) to surface both gauges on the custom
+# metrics API as per-pod metrics. See ../README.md for a sample
 # prometheus-adapter rules snippet.
 apiVersion: autoscaling/v2
 kind: HorizontalPodAutoscaler
@@ -27,6 +35,13 @@ spec:
         target:
           type: AverageValue
           averageValue: "50"
+    - type: Pods
+      pods:
+        metric:
+          name: tn_worker_gateway_upstream_inflight
+        target:
+          type: AverageValue
+          averageValue: "30"
   behavior:
     scaleDown:
       stabilizationWindowSeconds: 300

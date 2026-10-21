@@ -121,6 +121,8 @@ pub(crate) async fn run(settings: Settings) -> eyre::Result<()> {
             .map_or_else(|| String::from("off"), |url| UpstreamOrigin(url).to_string()),
         redirect_queries_header = query_header.is_some(),
         ?recent_submission_ttl,
+        ?shutdown_delay,
+        ?graceful_shutdown_timeout,
         cors = match &cors_allowed_origins {
             None => "off",
             Some(CorsOrigins::Any) => "any origin",
@@ -175,12 +177,14 @@ pub(crate) async fn run(settings: Settings) -> eyre::Result<()> {
         trusted_proxies = trusted_proxies.len(),
         proxy_protocol = proxy_protocol.is_some(),
         submission_budget,
+        rate_limit_per_ip_max_entries = ?rate_limit_per_ip
+            .map(|_| rate_limit_per_ip_max_entries.get()),
         ?max_connections_per_ip,
         // the per-ip key's prefix widths (`v4`, `v6`), which also key
         // --max-connections-per-ip
         rate_limit_v4_prefix = rate_limit_prefix.v4_bits(),
         rate_limit_v6_prefix = rate_limit_prefix.v6_bits(),
-        max_request_bytes,
+        max_request_bytes = max_request_bytes.get(),
         ?max_batch_len,
         max_inflight_submissions,
         max_inflight_queries,
@@ -198,6 +202,8 @@ pub(crate) async fn run(settings: Settings) -> eyre::Result<()> {
         access_log = %access_log
             .as_ref()
             .map_or_else(|| String::from("off"), |_| format!("sampling {access_log_sample}")),
+        access_log_max_lines_per_second = access_log_max_lines_per_second
+            .map_or(0, NonZeroU32::get),
         "edge protections configured"
     );
     if let Some(idle_heads) =
@@ -348,7 +354,7 @@ pub(crate) async fn run(settings: Settings) -> eyre::Result<()> {
         client_prefix: rate_limit_prefix,
         tcp_user_timeout,
         max_connection_duration,
-        max_request_bytes,
+        max_request_bytes: max_request_bytes.get(),
         // `into_settings` rejects `--proxy-protocol` with no peer to read from
         proxy_protocol: proxy_protocol.map(Arc::new),
         max_inflight_request_bytes,
@@ -365,7 +371,7 @@ pub(crate) async fn run(settings: Settings) -> eyre::Result<()> {
         );
     }
 
-    // Summarize a burst of throttled per-request warnings once it stops, so
+    // Summarize a burst of throttled warnings once it stops, so
     // its count does not wait for the call site's next event.
     spawner.spawn_critical_task(
         "warning-summaries",
@@ -506,16 +512,14 @@ fn native_root_count() -> usize {
 /// Each such request reserves up to `--max-request-bytes` from its head (the
 /// whole cap when chunked) and keeps it until the request deadline, so this
 /// many idle connections refuse every other request body. Returns `None` when
-/// the connection cap binds first, the budget is unlimited, or the cap is `0`
-/// (nothing can then be reserved).
+/// the connection cap binds first or the budget is unlimited.
 fn idle_heads_exhausting_budget(
     max_inflight_request_bytes: Option<NonZeroU32>,
-    max_request_bytes: usize,
+    max_request_bytes: NonZeroUsize,
     max_connections: NonZeroUsize,
 ) -> Option<usize> {
     let budget = usize::try_from(max_inflight_request_bytes?.get()).unwrap_or(usize::MAX);
-    let cap = NonZeroUsize::new(max_request_bytes)?;
-    let idle_heads = budget.div_ceil(cap.get());
+    let idle_heads = budget.div_ceil(max_request_bytes.get());
     (idle_heads < max_connections.get()).then_some(idle_heads)
 }
 
@@ -536,7 +540,8 @@ fn one_prefix_holds_budget(
 /// every task it tracks before the process exits, so on a SIGTERM, or when a
 /// critical task such as the server ends (a failed bind), a check still
 /// waiting on a slow upstream stops at once and logs nothing instead of
-/// holding the exit for up to `--upstream-request-timeout`.
+/// holding the exit while a slow upstream answers: each client's read timeout
+/// bounds only the head and each gap in the body, not the whole call.
 fn chain_id_check_task(
     state: &AppState,
     upstreams: &[UpstreamWorker],
@@ -544,13 +549,21 @@ fn chain_id_check_task(
 ) -> Option<impl Future<Output = Result<(), TaskError>> + Send + 'static> {
     let worker = upstreams.first()?.rpc_url.clone();
     let query = state.query_upstream.clone()?;
-    let client = state.http.clone();
+    // the clients forwarded calls use (see `proxy::forward`)
+    let worker_client = state.http.clone();
+    let query_client = state.query_http.clone().unwrap_or_else(|| state.http.clone());
     let query_header = state.query_header.clone();
     let shutdown = shutdown.subscribe();
     Some(async move {
         tokio::select! {
             () = shutdown => {}
-            check = check_chain_ids(&client, &worker, &query, query_header.as_ref()) => {
+            check = check_chain_ids(
+                &worker_client,
+                &query_client,
+                &worker,
+                &query,
+                query_header.as_ref(),
+            ) => {
                 log_chain_id_check(&check, &worker, &query);
             }
         }
@@ -585,19 +598,22 @@ pub(crate) enum ChainIdCheck {
 /// Ask the first worker and the query upstream for their chain ids, both at
 /// once, and decide what to log.
 ///
-/// Each call goes through `client`, the proxy client, so
-/// `--upstream-request-timeout` bounds it, and only the query call carries
-/// `query_header` (see [`fetch_chain_id`]). A failed call is a decision like
-/// any other; it never fails startup.
+/// The worker call goes through `worker_client` and the query call through
+/// `query_client`, the clients forwarded calls use, so
+/// `--upstream-request-timeout` and `--query-request-timeout` bound the head
+/// and each gap of the answer, not the whole call, and only the query call
+/// carries `query_header` (see [`fetch_chain_id`]). A failed call is a
+/// decision like any other; it never fails startup.
 pub(crate) async fn check_chain_ids(
-    client: &Client,
+    worker_client: &Client,
+    query_client: &Client,
     worker: &Url,
     query: &Url,
     query_header: Option<&QueryHeader>,
 ) -> ChainIdCheck {
     let (worker, query) = tokio::join!(
-        fetch_chain_id(client, Route::Worker, worker, query_header),
-        fetch_chain_id(client, Route::Query, query, query_header),
+        fetch_chain_id(worker_client, Route::Worker, worker, query_header),
+        fetch_chain_id(query_client, Route::Query, query, query_header),
     );
     match (worker, query) {
         (Ok(worker), Ok(query)) if worker == query => ChainIdCheck::Match(worker),
@@ -692,8 +708,12 @@ mod tests {
         Json, Router,
     };
     use std::{
+        io,
         net::SocketAddr,
-        sync::atomic::{AtomicBool, Ordering},
+        sync::{
+            atomic::{AtomicBool, Ordering},
+            Mutex, PoisonError,
+        },
         time::{Duration, Instant},
     };
     use tokio::{
@@ -734,6 +754,28 @@ mod tests {
         Ok(())
     }
 
+    /// In-memory log sink for a scoped fmt subscriber.
+    #[derive(Clone, Default)]
+    struct Captured(Arc<Mutex<Vec<u8>>>);
+
+    impl Captured {
+        fn text(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().unwrap_or_else(PoisonError::into_inner))
+                .into_owned()
+        }
+    }
+
+    impl io::Write for Captured {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap_or_else(PoisonError::into_inner).extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
     #[test]
     fn custom_ca_with_an_empty_store_starts() -> eyre::Result<()> {
         let ca_file = tempfile::NamedTempFile::new()?;
@@ -747,15 +789,37 @@ mod tests {
             ca_flag.as_str(),
         ]);
 
+        const WARNING: &str = "must chain to --upstream-ca-cert";
+        let run = |native: usize| {
+            let captured = Captured::default();
+            let writer = captured.clone();
+            let subscriber = tracing_subscriber::fmt()
+                .with_ansi(false)
+                .with_writer(move || writer.clone())
+                .finish();
+            let loaded = std::cell::Cell::new(false);
+            let result = tracing::subscriber::with_default(subscriber, || {
+                ensure_root_store(&with_ca, || {
+                    loaded.set(true);
+                    native
+                })
+            });
+            (result, loaded.get(), captured.text())
+        };
         // the store is still loaded, so an empty one can be reported, but the
-        // private CA alone lets the workers verify, so startup goes on
-        let loaded = std::cell::Cell::new(false);
-        let result = ensure_root_store(&with_ca, || {
-            loaded.set(true);
-            0
-        });
+        // private CA alone lets the workers verify, so startup goes on, with a
+        // warning
+        let (result, loaded, logs) = run(0);
         assert!(result.is_ok(), "{result:?}");
-        assert!(loaded.get(), "the store must be loaded when an https url is configured");
+        assert!(loaded, "the store must be loaded when an https url is configured");
+        let line = logs
+            .lines()
+            .find(|l| l.contains(WARNING))
+            .unwrap_or_else(|| panic!("no warning: {logs}"));
+        assert!(line.contains(" WARN "), "{line}");
+        // a populated store with a custom CA starts without the warning
+        let (result, _, logs) = run(1);
+        assert!(result.is_ok() && !logs.contains(WARNING), "{logs}");
         Ok(())
     }
 
@@ -764,7 +828,7 @@ mod tests {
     fn idle_heads(budget_mib: u32, cap: usize, connections: usize) -> Option<usize> {
         idle_heads_exhausting_budget(
             NonZeroU32::new(budget_mib * 1024 * 1024),
-            cap,
+            NonZeroUsize::new(cap).expect("nonzero"),
             NonZeroUsize::new(connections).expect("nonzero"),
         )
     }
@@ -794,9 +858,8 @@ mod tests {
         assert_eq!(idle_heads(256, MIB, 256), None);
         // more connections than the default budget covers
         assert_eq!(idle_heads(512, MIB, 2000), Some(512));
-        // an unlimited budget or a zero cap cannot be exhausted from heads
+        // an unlimited budget cannot be exhausted from heads
         assert_eq!(idle_heads(0, MIB, 500), None);
-        assert_eq!(idle_heads(512, 0, 500), None);
     }
 
     /// The header the query upstream requires, and the secret value it holds.
@@ -855,22 +918,23 @@ mod tests {
     #[tokio::test]
     async fn startup_warns_when_chain_ids_differ() {
         let header = api_key_header();
+        let client = client();
         let worker = url(chain_id_mock(CHAIN_2017, false).await);
 
         // the query upstream serves another chain: a warning with both ids
         let other_chain = url(chain_id_mock(CHAIN_1, true).await);
-        let check = check_chain_ids(&client(), &worker, &other_chain, Some(&header)).await;
+        let check = check_chain_ids(&client, &client, &worker, &other_chain, Some(&header)).await;
         assert_eq!(check, ChainIdCheck::Mismatch { worker: 2017, query: 1 });
 
         // the same chain: no warning
         let same_chain = url(chain_id_mock(CHAIN_2017, true).await);
-        let check = check_chain_ids(&client(), &worker, &same_chain, Some(&header)).await;
+        let check = check_chain_ids(&client, &client, &worker, &same_chain, Some(&header)).await;
         assert_eq!(check, ChainIdCheck::Match(2017));
 
         // the mocks only answer when the key reaches the query upstream and
         // not the worker, so the two outcomes above also prove its routing;
         // without the key the query upstream refuses
-        let check = check_chain_ids(&client(), &worker, &same_chain, None).await;
+        let check = check_chain_ids(&client, &client, &worker, &same_chain, None).await;
         assert_eq!(
             check,
             ChainIdCheck::Unchecked {
@@ -888,6 +952,7 @@ mod tests {
         // nothing listens on port 1
         let down = Url::parse("http://user:pass@127.0.0.1:1/k3y?token=t0k3n").expect("url");
         let junk = url(serve_mock(Router::new().route("/", post(|| async { "not json" }))).await);
+        let client = client();
 
         for (worker, query, worker_fails, query_fails) in [
             (&worker, &down, false, true),
@@ -895,7 +960,7 @@ mod tests {
             (&down, &down, true, true),
             (&worker, &junk, false, true),
         ] {
-            let check = check_chain_ids(&client(), worker, query, Some(&header)).await;
+            let check = check_chain_ids(&client, &client, worker, query, Some(&header)).await;
             let ChainIdCheck::Unchecked { worker: worker_reason, query: query_reason } = check
             else {
                 panic!("a failed call must leave the chains unchecked, got {check:?}");
@@ -912,7 +977,7 @@ mod tests {
         }
 
         // an upstream that accepts the call and never answers is cut off by the
-        // proxy client's request timeout (`--upstream-request-timeout`)
+        // query client's read timeout
         let hung = url(serve_mock(Router::new().route(
             "/",
             post(|| async {
@@ -927,7 +992,7 @@ mod tests {
         )
         .expect("client");
         let started = Instant::now();
-        let check = check_chain_ids(&client, &worker, &hung, Some(&header)).await;
+        let check = check_chain_ids(&client, &client, &worker, &hung, Some(&header)).await;
         assert!(started.elapsed() < Duration::from_secs(5), "took {:?}", started.elapsed());
         assert!(
             matches!(check, ChainIdCheck::Unchecked { worker: None, query: Some(_) }),
@@ -1035,6 +1100,39 @@ mod tests {
             .await
             .expect("the check ends once shutdown fires")
             .expect("the task does not panic")
+            .expect("the task succeeds");
+    }
+
+    #[tokio::test]
+    async fn chain_id_check_task_sends_the_query_call_through_the_query_client() {
+        let worker = url(chain_id_mock(CHAIN_2017, false).await);
+        // a query upstream that accepts the call and never answers
+        let hung = url(serve_mock(
+            Router::new()
+                .route("/", post(|| async { std::future::pending::<&'static str>().await })),
+        )
+        .await);
+        // the worker client waits far past the bound below, the query client
+        // gives up after 200 ms, so the check ends in time only when the
+        // query call goes through the query client
+        let slow = proxy_client(
+            UpstreamClientBuilder::for_test(Duration::from_secs(2)),
+            Duration::from_secs(600),
+        )
+        .expect("client");
+        let quick = proxy_client(
+            UpstreamClientBuilder::for_test(Duration::from_secs(2)),
+            Duration::from_millis(200),
+        )
+        .expect("client");
+        let workers = [worker_at(&worker)];
+        let shutdown = ShutdownNotifier::new();
+        let mut app_state = state(&workers, Some(hung), slow);
+        app_state.query_http = Some(quick);
+        let task = chain_id_check_task(&app_state, &workers, &shutdown).expect("a check task");
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("the query call used the worker client")
             .expect("the task succeeds");
     }
 
