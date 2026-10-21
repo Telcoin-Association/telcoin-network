@@ -587,6 +587,8 @@ struct PerShedReason<T> {
     queue_full: T,
     /// The handle for [`ShedReason::Unsubscribed`].
     unsubscribed: T,
+    /// The handle for [`ShedReason::QueueBudget`].
+    queue_budget: T,
     /// The handle for [`ShedReason::Admission`].
     admission: T,
     /// The handle for [`ShedReason::ServeBudget`].
@@ -599,6 +601,7 @@ impl<T> PerShedReason<T> {
         Self {
             queue_full: resolve(ShedReason::QueueFull),
             unsubscribed: resolve(ShedReason::Unsubscribed),
+            queue_budget: resolve(ShedReason::QueueBudget),
             admission: resolve(ShedReason::Admission),
             serve_budget: resolve(ShedReason::ServeBudget),
         }
@@ -609,6 +612,7 @@ impl<T> PerShedReason<T> {
         match reason {
             ShedReason::QueueFull => &self.queue_full,
             ShedReason::Unsubscribed => &self.unsubscribed,
+            ShedReason::QueueBudget => &self.queue_budget,
             ShedReason::Admission => &self.admission,
             ShedReason::ServeBudget => &self.serve_budget,
         }
@@ -1136,7 +1140,9 @@ impl SwarmMetrics {
     /// Count a forward to the application that did not queue its work as shed.
     ///
     /// A full queue counts as [`ShedReason::QueueFull`]. A queue with no subscriber drops the
-    /// work instead of queuing it, so it counts as [`ShedReason::Unsubscribed`]. A closed queue
+    /// work instead of queuing it, so it counts as [`ShedReason::Unsubscribed`]. A queue that
+    /// already holds its budget for the class drops the work too, so it counts as
+    /// [`ShedReason::QueueBudget`]. A closed queue
     /// occurs at the epoch boundary, not under load, so it is not counted. A broadcast failure
     /// is not a full queue, so it is not counted either.
     pub(crate) fn record_forward<T>(
@@ -1154,6 +1160,7 @@ impl SwarmMetrics {
                 |outcome| match outcome {
                     TrySendOutcome::Queued => None,
                     TrySendOutcome::Unsubscribed => Some(ShedReason::Unsubscribed),
+                    TrySendOutcome::OverBudget => Some(ShedReason::QueueBudget),
                 },
             )
             .into_iter()

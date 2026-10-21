@@ -64,15 +64,48 @@ stream protocol, and the swarm cannot see their class before it forwards them, s
 Thus `other` is not a low-priority class.
 
 The classes label the swarm metrics below and select the application's
-[serve budget](#serve-permits). They do not change swarm admission, queue space or scheduling.
-A message is shed, whatever its class, for one of four reasons. `queue_full`: the queue is full.
+[serve budget](#serve-permits). They do not change swarm admission or scheduling. They set queue
+space only on the primary network event queue, see
+[Primary event queue bounds](#primary-event-queue-bounds).
+A message is shed, whatever its class, for one of five reasons. `queue_full`: the queue is full.
 `unsubscribed`: no application task receives from a regular queue. The primary network event queue
-does not use this reason. `admission`: the application drops the request at its admission check.
+does not use this reason. `queue_budget`: the primary network event queue already holds the item
+cap or the byte cap of the class. `admission`: the application drops the request at its admission
+check.
 `serve_budget`: the application's serve budget for the class had no free permit. A
 shed request gets no response: the swarm drops the response channel, libp2p closes the stream, and
 the requester gets a stream error at once. It does not wait for its request timeout. The swarm does
-not schedule by priority, so unanswered requests of any class can fill the queue and make the swarm
-shed votes.
+not schedule by priority, so on a regular queue unanswered requests of any class can fill the queue
+and make the swarm shed votes. The primary network event queue gives each class its own caps, so
+other classes cannot take the room of votes there.
+
+### Primary event queue bounds
+
+The primary network event queue holds the requests and gossip that the swarm forwards to the
+primary. It keeps events while no event loop receives them, for example between two epochs. Each
+service class has its own item cap and byte cap. The swarm sheds a message whose class is at a cap
+as `queue_budget`. A class at its caps does not stop another class, so gossip and other traffic
+cannot take the room of votes and epoch-record requests.
+
+| Class | Item cap | Byte cap |
+| --- | --- | --- |
+| `vote` | 1,000 | 64 MiB |
+| `epoch_record` | 1,000 | 1 MiB |
+| `certificate_sync` | 500 | 4 MiB |
+| `batch` | 500 | 4 MiB |
+| `gossip` | 4,000 | 32 MiB |
+| `other` | 1,000 | 8 MiB |
+
+The item caps sum to 8,000, less than the queue capacity of 10,000, so this queue does not shed as
+`queue_full`. The byte weight of a request is an estimate from its variable-length parts (header
+payload and parents, parent certificates) plus fixed overheads. The byte weight of gossip is the
+length of its data. At most once every 10 seconds, the primary writes one warning with the number
+of messages shed per class since the last warning.
+
+When the event loop of a new epoch subscribes, the queue discards the events that are stale in the
+new epoch: requests that the swarm already ended and vote requests for headers from earlier epochs.
+It keeps gossip (including the epoch votes that arrive between the two event loops), epoch-record
+requests, inbound streams and error events.
 
 ## Serve permits
 
@@ -162,7 +195,8 @@ connections, not bytes currently retained. Sum that product over every swarm on 
 Never interpret missing samples as zero. The connection gauges do not give active-stream occupancy.
 
 The service class metrics also have a `class` label with the six values above. The shed counter also
-has a `reason` label (`queue_full`, `unsubscribed`, `admission` or `serve_budget`). The failure
+has a `reason` label (`queue_full`, `unsubscribed`, `queue_budget`, `admission` or
+`serve_budget`). The failure
 counter also has an `outcome` label (`timeout`, `omitted`, `closed`, `io` or `unsupported`). The
 node registers every class, reason and outcome series at zero when the swarm starts, so a missing
 series means that the metric is not exported, not zero.

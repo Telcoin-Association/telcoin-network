@@ -154,6 +154,9 @@ pub enum TrySendOutcome {
     Queued,
     /// The channel had no subscribed receiver, so it dropped the value instead of queuing it.
     Unsubscribed,
+    /// The channel already held as many values or bytes of the value's class as its budget
+    /// allows, so it dropped the value instead of queuing it.
+    OverBudget,
 }
 
 pub trait TnReceiver<T>: Send + Unpin {
@@ -179,7 +182,8 @@ pub trait TnSender<T>: Unpin + Clone {
     fn try_send(&self, value: T) -> Result<(), TrySendError<T>>;
 
     /// Attempts to immediately send a message like [`Self::try_send`], and reports whether the
-    /// channel queued it or dropped it because no receiver was subscribed.
+    /// channel queued it or dropped it because no receiver was subscribed or its class was over
+    /// budget.
     ///
     /// The default reports [`TrySendOutcome::Queued`] for every value that `try_send` accepts.
     /// A sender that drops values while it has no subscriber overrides it, so that the caller

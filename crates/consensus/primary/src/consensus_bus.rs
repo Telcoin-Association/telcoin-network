@@ -8,15 +8,16 @@ use crate::{
 };
 use parking_lot::Mutex;
 use std::{
-    collections::HashSet,
+    collections::{BTreeMap, HashMap, HashSet},
     error::Error,
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
     },
+    time::{Duration, Instant},
 };
 use tn_config::Parameters;
-use tn_network_libp2p::types::NetworkEvent;
+use tn_network_libp2p::{types::NetworkEvent, ServiceClass, TNMessage};
 use tn_storage::consensus::{ConsensusChain, ConsensusChainError};
 use tn_types::{
     deconstruct_nonce, BlockNumHash, CanonicalExecutionReader, Certificate, CommittedSubDag,
@@ -74,6 +75,285 @@ const EXEX_CONSENSUS_OUTPUT_CHANNEL_CAPACITY: usize = 100;
 /// that drain the queue must never wait on it: a worker that waits for room in its own queue stops
 /// the consumption that would make room (see [`ConsensusBusApp::try_requeue_epoch_pack_file`]).
 pub const EPOCH_REQUEST_QUEUE_CAPACITY: usize = 1024;
+/// Byte weight of the fixed fields of a header (author, round, epoch, timestamp, latest
+/// execution block) and its encoding overhead. Payload entries and parents are charged on top,
+/// because they are the only parts of a header that a peer can grow.
+const HEADER_FIXED_BYTES: usize = 256;
+/// Byte weight of one header payload entry: a 32-byte batch digest and its worker id.
+const HEADER_PAYLOAD_ENTRY_BYTES: usize = 40;
+/// Byte weight of one header parent: a 32-byte header digest.
+const HEADER_PARENT_BYTES: usize = 32;
+/// Byte weight of a certificate on top of its header: the aggregate BLS signature, the signer
+/// bitmap and the encoding overhead.
+const CERTIFICATE_FIXED_BYTES: usize = 256;
+/// Byte weight of an epoch-record request: an optional number and an optional hash.
+const EPOCH_RECORD_REQUEST_BYTES: usize = 64;
+/// Byte weight of an event with no variable-length part, such as an inbound stream.
+const FIXED_EVENT_BYTES: usize = 64;
+/// One mebibyte, for the byte caps in [`primary_event_limit`].
+const MIB: usize = 1024 * 1024;
+/// How often a budgeted [`QueChannel`] writes a summary log of the messages that it shed over
+/// budget. The swarm counts every shed message in `tn_network_inbound_requests_shed_total` with
+/// `reason="queue_budget"`; the log only tells an operator to look there.
+const QUEUE_BUDGET_REPORT_INTERVAL: Duration = Duration::from_secs(10);
+
+/// The item and byte caps of the primary network event queue for `class`.
+///
+/// Every class has its own caps, so gossip or other traffic at its caps cannot take the room that
+/// the committee classes (votes and epoch-record requests) need. Each cap is near the honest
+/// burst that the queue must hold between two epochs' event loops:
+///
+/// - `Vote`: a committee member receives about one vote request per peer per round, so 1,000 holds
+///   about ten rounds of a 100-member committee. A vote request with its parent certificates weighs
+///   a few KiB to tens of KiB, so 64 MiB holds the item cap at 64 KiB each.
+/// - `EpochRecord`: requests from peers that catch up on epoch records. Each weighs
+///   [`EPOCH_RECORD_REQUEST_BYTES`], so 1,000 of them fit in 1 MiB.
+/// - `Gossip`: certificates, consensus results and epoch votes from the committee, a few KiB each.
+///   4,000 holds about 40 rounds of certificates from a 100-member committee, and 32 MiB holds the
+///   item cap at 8 KiB each.
+/// - `Other`: inbound streams and error events, 1,000 items and 8 MiB.
+/// - `CertificateSync` and `Batch`: the primary queue does not carry these classes today, so they
+///   get small caps.
+///
+/// The item caps sum to 8,000, below [`CHANNEL_CAPACITY`], so the underlying queue never fills
+/// and a budgeted send never reports [`tn_types::TrySendError::Full`].
+fn primary_event_limit(class: ServiceClass) -> QueueLimit {
+    match class {
+        ServiceClass::Vote => QueueLimit::new(1_000, 64 * MIB),
+        ServiceClass::EpochRecord => QueueLimit::new(1_000, MIB),
+        ServiceClass::CertificateSync => QueueLimit::new(500, 4 * MIB),
+        ServiceClass::Batch => QueueLimit::new(500, 4 * MIB),
+        ServiceClass::Gossip => QueueLimit::new(4_000, 32 * MIB),
+        ServiceClass::Other => QueueLimit::new(1_000, 8 * MIB),
+    }
+}
+
+/// The budget charge of one primary network event.
+///
+/// The swarm decodes a request before it forwards it and does not pass the encoded length, so
+/// the byte weight is a deterministic estimate: the variable-length parts of the event (header
+/// payload and parents, parent certificates, gossip data, error text) plus fixed overheads. A
+/// peer can grow only the variable-length parts, so the estimate follows what a peer can make the
+/// queue hold.
+fn primary_event_charge(
+    event: &NetworkEvent<crate::network::Req, crate::network::Res>,
+) -> QueueCharge {
+    match event {
+        NetworkEvent::Request { request, .. } => {
+            QueueCharge::new(request.service_class(), primary_request_bytes(request))
+        }
+        NetworkEvent::Gossip(gossip) => {
+            QueueCharge::new(ServiceClass::Gossip, gossip.message.data.len())
+        }
+        NetworkEvent::Error(message, _) => {
+            QueueCharge::new(ServiceClass::Other, FIXED_EVENT_BYTES.saturating_add(message.len()))
+        }
+        NetworkEvent::InboundStream { .. } => {
+            QueueCharge::new(ServiceClass::Other, FIXED_EVENT_BYTES)
+        }
+    }
+}
+
+/// The estimated byte weight of a primary request.
+fn primary_request_bytes(request: &crate::network::Req) -> usize {
+    match request {
+        crate::network::Req::Vote { header, parents } => {
+            parents.iter().map(certificate_bytes).fold(header_bytes(header), usize::saturating_add)
+        }
+        crate::network::Req::EpochRecord { .. } => EPOCH_RECORD_REQUEST_BYTES,
+        // The swarm answers a peer exchange itself and does not forward it to this queue.
+        crate::network::Req::PeerExchange { .. } => FIXED_EVENT_BYTES,
+    }
+}
+
+/// The estimated byte weight of a header.
+fn header_bytes(header: &Header) -> usize {
+    HEADER_FIXED_BYTES
+        .saturating_add(header.payload().len().saturating_mul(HEADER_PAYLOAD_ENTRY_BYTES))
+        .saturating_add(header.parents().len().saturating_mul(HEADER_PARENT_BYTES))
+}
+
+/// The estimated byte weight of a certificate.
+fn certificate_bytes(certificate: &Certificate) -> usize {
+    CERTIFICATE_FIXED_BYTES.saturating_add(header_bytes(certificate.header()))
+}
+
+/// Whether a primary network event that a previous epoch's event loop left queued is still worth
+/// handling in `epoch`.
+///
+/// A request that the swarm already ended (its cancel notice fired or its sender is gone) and a
+/// vote request for a header from an earlier epoch are stale. Everything else is kept: gossip,
+/// including the epoch votes that arrive between two epochs' event loops (epoch-record voting
+/// depends on them), epoch-record requests, error events and inbound streams.
+fn primary_event_is_current(
+    event: &mut NetworkEvent<crate::network::Req, crate::network::Res>,
+    epoch: Epoch,
+) -> bool {
+    match event {
+        NetworkEvent::Request { request, cancel, .. } => {
+            matches!(cancel.try_recv(), Err(tokio::sync::oneshot::error::TryRecvError::Empty))
+                && primary_request_is_current(request, epoch)
+        }
+        NetworkEvent::Gossip(_) | NetworkEvent::Error(..) | NetworkEvent::InboundStream { .. } => {
+            true
+        }
+    }
+}
+
+/// Whether a primary request is still worth handling in `epoch`.
+fn primary_request_is_current(request: &crate::network::Req, epoch: Epoch) -> bool {
+    match request {
+        crate::network::Req::Vote { header, .. } => header.epoch() >= epoch,
+        crate::network::Req::EpochRecord { .. } | crate::network::Req::PeerExchange { .. } => true,
+    }
+}
+
+/// The class and byte weight that a budgeted [`QueChannel`] charges one message.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct QueueCharge {
+    /// The class whose caps the message counts against.
+    class: ServiceClass,
+    /// The byte weight of the message.
+    bytes: usize,
+}
+
+impl QueueCharge {
+    /// Charge a message of `class` that weighs `bytes`.
+    fn new(class: ServiceClass, bytes: usize) -> Self {
+        Self { class, bytes }
+    }
+}
+
+/// The item cap and the byte cap of one class on a budgeted [`QueChannel`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct QueueLimit {
+    /// The most messages of the class that the channel holds at once.
+    items: usize,
+    /// The most bytes of the class that the channel holds at once.
+    bytes: usize,
+}
+
+impl QueueLimit {
+    /// Hold at most `items` messages and `bytes` bytes of one class.
+    fn new(items: usize, bytes: usize) -> Self {
+        Self { items, bytes }
+    }
+}
+
+/// The messages of one class that a budgeted [`QueChannel`] holds.
+#[derive(Clone, Copy, Debug, Default)]
+struct ClassUsage {
+    /// Messages held.
+    items: usize,
+    /// Bytes held.
+    bytes: usize,
+}
+
+/// The occupancy and the shed counts of a [`QueueBudget`].
+#[derive(Debug, Default)]
+struct BudgetState {
+    /// The messages held, per class.
+    queued: HashMap<ServiceClass, ClassUsage>,
+    /// The messages shed over budget since the last summary log, per class label.
+    shed: BTreeMap<&'static str, u64>,
+    /// When the last summary log was written.
+    last_report: Option<Instant>,
+}
+
+impl BudgetState {
+    /// Count one message of `class` shed over budget. When no summary log was written in the
+    /// last [`QUEUE_BUDGET_REPORT_INTERVAL`], return the counts to log and restart them.
+    fn record_shed(&mut self, class: ServiceClass) -> Option<BTreeMap<&'static str, u64>> {
+        let count = self.shed.entry(class.label()).or_default();
+        *count = count.saturating_add(1);
+        let now = Instant::now();
+        let due = self
+            .last_report
+            .is_none_or(|last| now.saturating_duration_since(last) >= QUEUE_BUDGET_REPORT_INTERVAL);
+        due.then(|| {
+            self.last_report = Some(now);
+            std::mem::take(&mut self.shed)
+        })
+    }
+}
+
+/// The per-class item and byte budget of a [`QueChannel`], shared by its clones and its receiver.
+///
+/// A sender charges a message before it queues it, and the receiver releases the charge when it
+/// receives the message, so the budget counts the messages in the queue.
+struct QueueBudget<T> {
+    /// The channel name for the summary log.
+    name: &'static str,
+    /// The class and byte weight of a message. It must be deterministic, because the receiver
+    /// computes it again to release the charge.
+    charge: fn(&T) -> QueueCharge,
+    /// The caps of a class.
+    limit: fn(ServiceClass) -> QueueLimit,
+    /// The occupancy and the shed counts.
+    state: Mutex<BudgetState>,
+}
+
+impl<T> std::fmt::Debug for QueueBudget<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("QueueBudget")
+            .field("name", &self.name)
+            .field("state", &self.state)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<T> QueueBudget<T> {
+    /// Charge `value` against the caps of its class. Return `None`, and count the message as
+    /// shed, when the class already holds its item cap or `value` would pass its byte cap.
+    fn try_charge(&self, value: &T) -> Option<QueueCharge> {
+        let charge = (self.charge)(value);
+        let limit = (self.limit)(charge.class);
+        let mut state = self.state.lock();
+        let usage = state.queued.entry(charge.class).or_default();
+        let bytes = usage.bytes.saturating_add(charge.bytes);
+        if usage.items < limit.items && bytes <= limit.bytes {
+            *usage = ClassUsage { items: usage.items.saturating_add(1), bytes };
+            return Some(charge);
+        }
+        let report = state.record_shed(charge.class);
+        drop(state);
+        report.into_iter().for_each(|shed| {
+            warn!(target: "primary", queue = self.name, ?shed, "queue shed messages over their class budget");
+        });
+        None
+    }
+
+    /// Release the charge that `value` held while queued.
+    fn release(&self, value: &T) {
+        self.release_charge((self.charge)(value));
+    }
+
+    /// Release `charge`, saturating at zero.
+    fn release_charge(&self, charge: QueueCharge) {
+        let mut state = self.state.lock();
+        let usage = state.queued.entry(charge.class).or_default();
+        *usage = ClassUsage {
+            items: usage.items.saturating_sub(1),
+            bytes: usage.bytes.saturating_sub(charge.bytes),
+        };
+    }
+}
+
+/// Release the charge that a queued `value` held in `budget`, when the channel has a budget.
+fn release_queued<T>(budget: Option<&QueueBudget<T>>, value: &T) {
+    budget.into_iter().for_each(|budget| budget.release(value));
+}
+
+/// What the budget of a [`QueChannel`] decided for one message.
+#[derive(Clone, Copy, Debug)]
+enum BudgetCheck {
+    /// The channel has no budget.
+    Unbudgeted,
+    /// The message fits the caps of its class and holds this charge until it is received.
+    Charged(QueueCharge),
+    /// The class of the message is at its item or byte cap, so the message is dropped.
+    OverBudget,
+}
 
 /// Wrapper around a receiver and a subs count to make sure only one of these exists at a time.
 /// Note this does NOT implement Clone on purpose, do not implement it else managing subscriptions
@@ -86,6 +366,8 @@ struct QueChanReceiver<T> {
     subscribed: Arc<AtomicBool>,
     /// If true then never set subscribed to false.
     always_subscribed: bool,
+    /// The budget of the channel, if any. Receiving a message releases its charge.
+    budget: Option<Arc<QueueBudget<T>>>,
 }
 
 /// Use the Drop to decrement subs and signal unsubscribed.
@@ -112,17 +394,37 @@ pub struct QueChannel<T> {
     /// If true then set subscribed to false which will que messages even when no subscribers
     /// active.
     always_subscribed: bool,
+    /// The per-class item and byte budget, if any. A message over budget is dropped.
+    budget: Option<Arc<QueueBudget<T>>>,
 }
 
 impl<T> QueChannel<T> {
     /// Create a new QueChannel.
     pub fn new() -> Self {
-        Self::build(CHANNEL_CAPACITY, false)
+        Self::build(CHANNEL_CAPACITY, false, None)
     }
 
     /// Create a new QueChannel that will que messages even when no subscribers.
     pub fn new_always_subscribed() -> Self {
-        Self::build(CHANNEL_CAPACITY, true)
+        Self::build(CHANNEL_CAPACITY, true, None)
+    }
+
+    /// Create a QueChannel like [`Self::new_always_subscribed`] that caps the messages that it
+    /// holds per service class.
+    ///
+    /// `charge` gives the class and byte weight of a message. It must be deterministic, because
+    /// the receiver computes it again to release the charge. `limit` gives the item cap and byte
+    /// cap of a class. A message whose class is at either cap is dropped, and
+    /// `try_send_outcome` reports [`tn_types::TrySendOutcome::OverBudget`]. Each class has its own
+    /// caps, so a flood of one class cannot take the room of another. When the item caps sum to
+    /// at most [`CHANNEL_CAPACITY`], the underlying queue never fills.
+    fn new_always_subscribed_budgeted(
+        name: &'static str,
+        charge: fn(&T) -> QueueCharge,
+        limit: fn(ServiceClass) -> QueueLimit,
+    ) -> Self {
+        let budget = QueueBudget { name, charge, limit, state: Mutex::new(BudgetState::default()) };
+        Self::build(CHANNEL_CAPACITY, true, Some(Arc::new(budget)))
     }
 
     /// Create a new QueChannel that queues at most `capacity` messages.
@@ -135,15 +437,20 @@ impl<T> QueChannel<T> {
     ///
     /// Panics if `capacity` is 0, like [`tokio::sync::mpsc::channel`].
     pub fn with_capacity(capacity: usize) -> Self {
-        Self::build(capacity, false)
+        Self::build(capacity, false, None)
     }
 
     /// Build the channel. With `always_subscribed` it queues messages even with no subscriber.
-    fn build(capacity: usize, always_subscribed: bool) -> Self {
+    /// With a `budget` it caps the messages that it holds per service class.
+    fn build(
+        capacity: usize,
+        always_subscribed: bool,
+        budget: Option<Arc<QueueBudget<T>>>,
+    ) -> Self {
         let (tx, rx) = mpsc::channel(capacity);
         let receiver = Arc::new(Mutex::new(Some(rx)));
         let subscribed = Arc::new(AtomicBool::new(always_subscribed));
-        Self { channel: tx, receiver, subscribed, always_subscribed }
+        Self { channel: tx, receiver, subscribed, always_subscribed, budget }
     }
 
     /// Subscribe to receive messages on this channel.
@@ -164,6 +471,7 @@ impl<T> QueChannel<T> {
             container: self.receiver.clone(),
             subscribed: self.subscribed.clone(),
             always_subscribed: self.always_subscribed,
+            budget: self.budget.clone(),
         }
     }
 
@@ -186,7 +494,9 @@ impl<T> QueChannel<T> {
     {
         let mut receiver = self.receiver.lock().take();
         let Some(rx) = receiver.as_mut() else { panic!("Another subscription is already in use!") };
-        let discarded = std::iter::from_fn(|| rx.try_recv().ok()).count();
+        let discarded = std::iter::from_fn(|| rx.try_recv().ok())
+            .inspect(|value| release_queued(self.budget.as_deref(), value))
+            .count();
         if discarded > 0 {
             warn!(target: "primary", discarded, "discarded messages a previous subscriber left queued");
         }
@@ -196,6 +506,78 @@ impl<T> QueChannel<T> {
             container: self.receiver.clone(),
             subscribed: self.subscribed.clone(),
             always_subscribed: self.always_subscribed,
+            budget: self.budget.clone(),
+        }
+    }
+
+    /// Subscribe like [`Self::subscribe`], first discarding the queued messages that `keep`
+    /// rejects.
+    ///
+    /// For an always-subscribed channel whose messages must survive the gap between two
+    /// subscribers, where some of what the previous subscriber left queued is stale for the next
+    /// one. `keep` sees each queued message once, oldest first. Kept messages go back into the
+    /// queue in order and keep their budget charge; a message sent while this runs can land
+    /// ahead of them. Discarded messages release their charge. As for [`Self::subscribe_fresh`],
+    /// callers subscribe before they spawn the next consumer.
+    ///
+    /// # Panics
+    ///
+    /// Panics if another subscription is in use, like [`Self::subscribe`].
+    pub fn subscribe_retain(
+        &self,
+        mut keep: impl FnMut(&mut T) -> bool,
+    ) -> impl TnReceiver<T> + 'static
+    where
+        T: Send + 'static,
+    {
+        let mut receiver = self.receiver.lock().take();
+        let Some(rx) = receiver.as_mut() else { panic!("Another subscription is already in use!") };
+        let queued: Vec<T> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        let (kept, discarded, lost) = queued.into_iter().fold(
+            (0_usize, 0_usize, 0_usize),
+            |(kept, discarded, lost), mut value| {
+                if !keep(&mut value) {
+                    release_queued(self.budget.as_deref(), &value);
+                    return (kept, discarded.saturating_add(1), lost);
+                }
+                // A kept message still holds its charge, so the queue has room for it when the
+                // item caps sum to at most its capacity. Release the charge if the queue refuses.
+                self.channel.try_send(value).map_or_else(
+                    |error| {
+                        release_queued(self.budget.as_deref(), &error.into_inner());
+                        (kept, discarded, lost.saturating_add(1))
+                    },
+                    |()| (kept.saturating_add(1), discarded, lost),
+                )
+            },
+        );
+        if discarded > 0 || lost > 0 {
+            warn!(target: "primary", kept, discarded, lost, "discarded stale messages a previous subscriber left queued");
+        }
+        self.subscribed.store(true, Ordering::Release);
+        QueChanReceiver {
+            receiver,
+            container: self.receiver.clone(),
+            subscribed: self.subscribed.clone(),
+            always_subscribed: self.always_subscribed,
+            budget: self.budget.clone(),
+        }
+    }
+
+    /// Charge `value` to the budget of the channel, if it has one.
+    fn check_budget(&self, value: &T) -> BudgetCheck {
+        self.budget.as_deref().map_or(BudgetCheck::Unbudgeted, |budget| {
+            budget.try_charge(value).map_or(BudgetCheck::OverBudget, BudgetCheck::Charged)
+        })
+    }
+
+    /// Release the charge of a message that the underlying queue did not take.
+    fn refund(&self, check: BudgetCheck) {
+        match check {
+            BudgetCheck::Charged(charge) => {
+                self.budget.iter().for_each(|budget| budget.release_charge(charge))
+            }
+            BudgetCheck::Unbudgeted | BudgetCheck::OverBudget => {}
         }
     }
 }
@@ -213,6 +595,7 @@ impl<T> Clone for QueChannel<T> {
             receiver: self.receiver.clone(),
             subscribed: self.subscribed.clone(),
             always_subscribed: self.always_subscribed,
+            budget: self.budget.clone(),
         }
     }
 }
@@ -222,16 +605,25 @@ impl<T: Send + 'static> TnSender<T> for QueChannel<T> {
         if !self.subscribed.load(Ordering::Acquire) {
             return Ok(());
         }
-        Ok(self.channel.send(value).await?)
+        let check = self.check_budget(&value);
+        match check {
+            // Drop a message over budget, as for a channel with no subscriber.
+            BudgetCheck::OverBudget => Ok(()),
+            BudgetCheck::Unbudgeted | BudgetCheck::Charged(_) => {
+                Ok(self.channel.send(value).await.inspect_err(|_| self.refund(check))?)
+            }
+        }
     }
 
-    /// Queue `value` without waiting, or drop it while no receiver is subscribed.
+    /// Queue `value` without waiting, or drop it while no receiver is subscribed or while its
+    /// class is over budget.
     fn try_send(&self, value: T) -> Result<(), tn_types::TrySendError<T>> {
         self.try_send_outcome(value).map(|_outcome| ())
     }
 
     /// Queue `value` like [`TnSender::try_send`], and report
-    /// [`tn_types::TrySendOutcome::Unsubscribed`] when no receiver is subscribed, so the network
+    /// [`tn_types::TrySendOutcome::Unsubscribed`] when no receiver is subscribed and
+    /// [`tn_types::TrySendOutcome::OverBudget`] when its class is over budget, so the network
     /// layer counts the drop as shed instead of as forwarded.
     fn try_send_outcome(
         &self,
@@ -240,21 +632,39 @@ impl<T: Send + 'static> TnSender<T> for QueChannel<T> {
         if !self.subscribed.load(Ordering::Acquire) {
             return Ok(tn_types::TrySendOutcome::Unsubscribed);
         }
-        Ok(self.channel.try_send(value).map(|()| tn_types::TrySendOutcome::Queued)?)
+        let check = self.check_budget(&value);
+        match check {
+            BudgetCheck::OverBudget => Ok(tn_types::TrySendOutcome::OverBudget),
+            BudgetCheck::Unbudgeted | BudgetCheck::Charged(_) => Ok(self
+                .channel
+                .try_send(value)
+                .map(|()| tn_types::TrySendOutcome::Queued)
+                .inspect_err(|_| self.refund(check))?),
+        }
     }
 }
 
 impl<T: Send + 'static> TnReceiver<T> for QueChanReceiver<T> {
     async fn recv(&mut self) -> Option<T> {
-        self.receiver.as_mut().expect("receiver").recv().await
+        let value = self.receiver.as_mut().expect("receiver").recv().await;
+        value.inspect(|value| release_queued(self.budget.as_deref(), value))
     }
 
     fn try_recv(&mut self) -> Result<T, tn_types::TryRecvError> {
-        Ok(self.receiver.as_mut().expect("receiver").try_recv()?)
+        Ok(self
+            .receiver
+            .as_mut()
+            .expect("receiver")
+            .try_recv()
+            .inspect(|value| release_queued(self.budget.as_deref(), value))?)
     }
 
     fn poll_recv(&mut self, cx: &mut std::task::Context<'_>) -> std::task::Poll<Option<T>> {
-        self.receiver.as_mut().expect("receiver").poll_recv(cx)
+        self.receiver
+            .as_mut()
+            .expect("receiver")
+            .poll_recv(cx)
+            .map(|value| value.inspect(|value| release_queued(self.budget.as_deref(), value)))
     }
 }
 
@@ -589,7 +999,11 @@ impl ConsensusBusApp {
                 tx_sync_status,
                 new_epoch_votes: QueChannel::new(),
                 tx_epoch_record,
-                primary_network_events: QueChannel::new_always_subscribed(),
+                primary_network_events: QueChannel::new_always_subscribed_budgeted(
+                    "primary_network_events",
+                    primary_event_charge,
+                    primary_event_limit,
+                ),
                 epoch_request_queue_tx,
                 epoch_request_queue_rx,
                 epoch_pack_claims: EpochPackClaims::default(),
@@ -836,6 +1250,21 @@ impl ConsensusBusApp {
         &self,
     ) -> impl TnReceiver<NetworkEvent<crate::network::Req, crate::network::Res>> {
         self.inner.primary_network_events.subscribe()
+    }
+
+    /// Provide a subscriber (Receiver) for primary network events in `epoch`, first discarding
+    /// the events that a previous epoch's event loop left queued and that are stale in `epoch`.
+    ///
+    /// A request that the swarm already ended and a vote request for a header from an earlier
+    /// epoch are discarded. Gossip (including the epoch votes that arrive between two epochs'
+    /// event loops), epoch-record requests, error events and inbound streams are kept.
+    pub fn subscribe_primary_network_events_for_epoch(
+        &self,
+        epoch: Epoch,
+    ) -> impl TnReceiver<NetworkEvent<crate::network::Req, crate::network::Res>> {
+        self.inner
+            .primary_network_events
+            .subscribe_retain(|event| primary_event_is_current(event, epoch))
     }
 
     /// Provide a subscription (Receiver) for consensus output.
@@ -1449,14 +1878,17 @@ mod exex_receiver_count_tests {
 #[cfg(test)]
 mod tests {
     use super::{
-        ConsensusBusApp, EpochPackRequest, QueChannel, CONSENSUS_OUTPUT_CHANNEL_CAPACITY,
-        EPOCH_REQUEST_QUEUE_CAPACITY, SYNC_OUTPUT_CHANNEL_CAPACITY,
+        primary_event_limit, ConsensusBusApp, EpochPackRequest, QueChannel, QueueCharge,
+        QueueLimit, CONSENSUS_OUTPUT_CHANNEL_CAPACITY, EPOCH_REQUEST_QUEUE_CAPACITY,
+        SYNC_OUTPUT_CHANNEL_CAPACITY,
     };
     use metrics_util::debugging::{DebugValue, DebuggingRecorder};
     use std::{collections::VecDeque, task::Poll, time::Duration};
+    use tn_network_libp2p::ServiceClass;
     use tn_types::{
         CommittedSubDag, ConsensusHeaderDigest, ConsensusNumHash, ConsensusOutput, Epoch,
-        EpochRecord, TnReceiver as _, TnSender as _, TryRecvError, TrySendError,
+        EpochRecord, TnReceiver as _, TnSender as _, TryRecvError, TrySendError, TrySendOutcome,
+        CHANNEL_CAPACITY,
     };
 
     /// The smallest output that can sit in `sync_output` or `consensus_output`; only its number
@@ -1855,5 +2287,111 @@ mod tests {
         assert_eq!(rx.try_recv(), Ok(1));
         assert_eq!(rx.try_recv(), Ok(2));
         assert_eq!(rx.try_recv(), Err(TryRecvError::Empty));
+    }
+
+    /// A budgeted test message: its class, its byte weight and its epoch.
+    type Budgeted = (ServiceClass, usize, Epoch);
+
+    /// Charge a test message its class and byte weight.
+    fn budgeted_charge(message: &Budgeted) -> QueueCharge {
+        QueueCharge::new(message.0, message.1)
+    }
+
+    /// Two messages and 100 bytes for every class.
+    fn budgeted_limit(_class: ServiceClass) -> QueueLimit {
+        QueueLimit::new(2, 100)
+    }
+
+    /// An always-subscribed channel with the test budget.
+    fn budgeted_channel() -> QueChannel<Budgeted> {
+        QueChannel::new_always_subscribed_budgeted("test", budgeted_charge, budgeted_limit)
+    }
+
+    /// What `try_send_outcome` reported for `message`, or `None` for an error.
+    fn outcome(channel: &QueChannel<Budgeted>, message: Budgeted) -> Option<TrySendOutcome> {
+        channel.try_send_outcome(message).ok()
+    }
+
+    /// With no subscriber, each class queues up to its item cap and its byte cap and sheds the
+    /// rest as over budget. A class at its caps does not stop another class, so votes and
+    /// epoch-record requests still queue while gossip and other traffic are at their caps. A
+    /// received message releases its charge.
+    #[test]
+    fn budget_caps_each_class_by_items_and_bytes() {
+        let channel = budgeted_channel();
+        let queued = Some(TrySendOutcome::Queued);
+        let over = Some(TrySendOutcome::OverBudget);
+
+        // Gossip reaches its item cap.
+        assert_eq!(outcome(&channel, (ServiceClass::Gossip, 10, 0)), queued);
+        assert_eq!(outcome(&channel, (ServiceClass::Gossip, 10, 0)), queued);
+        assert_eq!(outcome(&channel, (ServiceClass::Gossip, 10, 0)), over);
+
+        // Other reaches its byte cap first: 60 + 60 passes 100, 60 + 40 does not.
+        assert_eq!(outcome(&channel, (ServiceClass::Other, 60, 0)), queued);
+        assert_eq!(outcome(&channel, (ServiceClass::Other, 60, 0)), over);
+        assert_eq!(outcome(&channel, (ServiceClass::Other, 40, 0)), queued);
+        assert_eq!(outcome(&channel, (ServiceClass::Other, 0, 0)), over);
+
+        // The committee classes keep their own share.
+        assert_eq!(outcome(&channel, (ServiceClass::Vote, 100, 0)), queued);
+        assert_eq!(outcome(&channel, (ServiceClass::EpochRecord, 10, 0)), queued);
+
+        // Receiving the first gossip releases its charge, so one more gossip fits.
+        let mut rx = channel.subscribe();
+        assert_eq!(rx.try_recv(), Ok((ServiceClass::Gossip, 10, 0)));
+        assert_eq!(outcome(&channel, (ServiceClass::Gossip, 10, 0)), queued);
+        assert_eq!(outcome(&channel, (ServiceClass::Gossip, 10, 0)), over);
+
+        // Only the messages reported as queued were queued.
+        let classes: Vec<_> =
+            std::iter::from_fn(|| rx.try_recv().ok()).map(|message| message.0).collect();
+        assert_eq!(
+            classes,
+            [
+                ServiceClass::Gossip,
+                ServiceClass::Other,
+                ServiceClass::Other,
+                ServiceClass::Vote,
+                ServiceClass::EpochRecord,
+                ServiceClass::Gossip,
+            ]
+        );
+    }
+
+    /// `subscribe_retain` drops the leftovers that `keep` rejects and releases their charge, and
+    /// hands the rest to the next subscriber in order: a vote from the previous epoch is
+    /// discarded, while gossip sent between the two subscribers survives.
+    #[test]
+    fn subscribe_retain_discards_rejected_leftovers_and_keeps_the_rest() {
+        let channel = budgeted_channel();
+        let rx = channel.subscribe();
+        assert!(channel.try_send((ServiceClass::Vote, 10, 0)).is_ok());
+        assert!(channel.try_send((ServiceClass::Gossip, 10, 1)).is_ok());
+        assert!(channel.try_send((ServiceClass::Vote, 10, 1)).is_ok());
+        drop(rx);
+
+        let mut rx =
+            channel.subscribe_retain(|message| message.0 != ServiceClass::Vote || message.2 >= 1);
+        assert_eq!(rx.try_recv(), Ok((ServiceClass::Gossip, 10, 1)));
+        assert_eq!(rx.try_recv(), Ok((ServiceClass::Vote, 10, 1)));
+        assert_eq!(rx.try_recv(), Err(TryRecvError::Empty));
+
+        // The discarded vote released its charge, so the vote class takes two more.
+        assert_eq!(outcome(&channel, (ServiceClass::Vote, 10, 1)), Some(TrySendOutcome::Queued));
+        assert_eq!(outcome(&channel, (ServiceClass::Vote, 10, 1)), Some(TrySendOutcome::Queued));
+        assert_eq!(
+            outcome(&channel, (ServiceClass::Vote, 10, 1)),
+            Some(TrySendOutcome::OverBudget)
+        );
+    }
+
+    /// The item caps of the primary network event queue sum to at most the channel capacity, so
+    /// a budgeted send never finds the underlying queue full.
+    #[test]
+    fn primary_event_item_caps_fit_the_channel() {
+        let items: usize =
+            ServiceClass::ALL.iter().map(|class| primary_event_limit(*class).items).sum();
+        assert!(items <= CHANNEL_CAPACITY, "{items}");
     }
 }
