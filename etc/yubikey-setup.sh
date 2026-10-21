@@ -63,7 +63,8 @@
 #     generation (the user ID and the card are then committed), replacing a git or gpg-agent
 #     setting, the optional scratch-repository test.
 #   - The OpenPGP reset is never offered for a card whose key is in the allowlist on
-#     origin/main or on the GitHub account, nor when origin/main's allowlist cannot be read.
+#     origin/main or on the GitHub account, nor when main cannot be fetched from origin, its
+#     allowlist cannot be read, or the key list of a known GitHub login cannot be downloaded.
 #   - The script never commits, pushes or opens a pull request.
 #
 # State: none. Everything is read from the card, ~/.gnupg, the checkout and GitHub.
@@ -689,14 +690,19 @@ has_any_fpr() {
 
 # card_key_published FPR...: where a key holding one of FPR... (as its primary key or a subkey)
 # is published, one place per line: an allowlist file on origin/main, which release.sh treats
-# as the source of truth (fetched first when origin answers), and https://github.com/<login>.gpg
-# when the GitHub login is known without asking. Returns 2 when origin/main's allowlist cannot
-# be read at all. Run mode only: the fetch writes refs/remotes/origin/main.
+# as the source of truth, and https://github.com/<login>.gpg when the GitHub login is known
+# without asking. main is fetched from origin first, and the fetch must succeed: returns 2 when
+# it fails or the allowlist cannot be read (a match in the local origin/main is still listed),
+# and 3 when the login is known but its GitHub key list cannot be downloaded. Run mode only:
+# the fetch writes refs/remotes/origin/main.
 card_key_published() {
-    local ref=refs/remotes/origin/main names name fprs login rc=0
-    if git remote get-url origin >/dev/null 2>&1; then
-        git fetch --quiet --no-tags origin +refs/heads/main:$ref 2>/dev/null ||
-            warn "cannot fetch main from origin; checking the allowlist in the local origin/main, which may be out of date"
+    local ref=refs/remotes/origin/main names name fprs login keys rc=0
+    if ! git remote get-url origin >/dev/null 2>&1; then
+        warn "this checkout has no git remote named origin"
+        rc=2
+    elif ! git fetch --quiet --no-tags origin "+refs/heads/main:$ref" 2>/dev/null; then
+        warn "cannot fetch main from origin"
+        rc=2
     fi
     if names=$(git ls-tree --name-only "$ref:$ALLOWLIST_PATH" 2>/dev/null) && [ -n "$names" ]; then
         while IFS= read -r name; do
@@ -711,15 +717,21 @@ EOF
     fi
     login=$(gh_login || git config --global --get github.user 2>/dev/null || true)
     if matches "$login" "$HANDLE_RE"; then
-        fprs=$(curl -fsS --max-time 30 "https://github.com/$login.gpg" 2>/dev/null | "$GPG" --show-keys --with-colons 2>/dev/null | all_fprs || true)
-        if has_any_fpr "$fprs" "$@"; then printf 'https://github.com/%s.gpg\n' "$login"; fi
+        if keys=$(curl -fsS --max-time 30 "https://github.com/$login.gpg" 2>/dev/null); then
+            fprs=$(printf '%s\n' "$keys" | "$GPG" --show-keys --with-colons 2>/dev/null | all_fprs || true)
+            if has_any_fpr "$fprs" "$@"; then printf 'https://github.com/%s.gpg\n' "$login"; fi
+        else
+            warn "cannot download https://github.com/$login.gpg"
+            if [ "$rc" = 0 ]; then rc=3; fi
+        fi
     fi
     return "$rc"
 }
 
 # run: a card holding a key that matches nothing here is either the maintainer's own key from
 # another Mac, or something to wipe. A key published on main's allowlist or on GitHub is never
-# wiped here, and neither is a key when main's allowlist cannot be read.
+# wiped here, and neither is a key when main cannot be fetched from origin, its allowlist cannot
+# be read, or the key list of a known GitHub login cannot be downloaded.
 stage_card_state() {
     local found rc=0
     [ "$PHASE" = foreign ] || return 0
@@ -728,9 +740,11 @@ stage_card_state() {
     if [ -n "$found" ]; then
         die 1 "the key on YubiKey $SERIAL is published at $(printf '%s' "$found" | tr '\n' ' '), so it may be an allowlisted release key; not offering ykman openpgp reset. Put its public key in ~/<handle>.asc, for example with git show origin/main:$ALLOWLIST_PATH/<handle>.asc > ~/<handle>.asc, and run again."
     fi
-    if [ "$rc" != 0 ]; then
-        die 1 "cannot read $ALLOWLIST_PATH on origin/main, so the key on YubiKey $SERIAL may be an allowlisted release key; not offering ykman openpgp reset. Run git fetch origin main and run again."
-    fi
+    case "$rc" in
+        0) ;;
+        3) die 2 "could not read your GitHub key list, so the key on YubiKey $SERIAL may be a published release key; not offering ykman openpgp reset. Check the network and run again." ;;
+        *) die 2 "could not read the allowlist on origin/main, so the key on YubiKey $SERIAL may be an allowlisted release key; not offering ykman openpgp reset. Check that git fetch origin main works and run again." ;;
+    esac
     info "If it is your own key from another Mac, decline below, put its public key in ~/<handle>.asc (copy the file from that Mac, or curl -fsS https://github.com/<handle>.gpg -o ~/<handle>.asc when GitHub holds only that key) and run again."
     info "Otherwise the card can be wiped: every key on it is lost and the PINs return to the defaults."
     confirm "Wipe the OpenPGP application of YubiKey $SERIAL (ykman openpgp reset)."
