@@ -193,7 +193,9 @@ spec:
             periodSeconds: 5
             # /ready/any answers from memory, so a slow answer means only a
             # starved runtime, which every replica shares under a flood; a
-            # real outage still removes the pod at once through a fast 503.
+            # fast 503 counts as one miss like a timeout, so a real outage
+            # removes the pod after three misses, about 10 to 15 s with
+            # periodSeconds: 5 and failureThreshold: 3.
             timeoutSeconds: 5
             failureThreshold: 3
           resources:
