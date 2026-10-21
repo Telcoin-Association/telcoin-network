@@ -16,6 +16,7 @@ use clap::Args;
 use tn_config::{Config, ConfigFmt, ConfigTrait as _, KeyConfig, NodeInfo, TelcoinDirs};
 use tn_types::Address;
 use tracing::{info, warn};
+use zeroize::Zeroizing;
 
 /// Re-sign the proof of possession for a new execution address.
 ///
@@ -46,7 +47,7 @@ impl PopArgs {
     pub fn execute<TND: TelcoinDirs>(
         &self,
         dir: &TND,
-        passphrase: Option<String>,
+        passphrase: Option<Zeroizing<String>>,
     ) -> eyre::Result<()> {
         // existing keys - never generated here; error with an accurate hint
         // (distinguish "no keys yet" from "keys present but unreadable").

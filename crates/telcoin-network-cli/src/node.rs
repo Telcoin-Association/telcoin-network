@@ -24,6 +24,14 @@ fn parse_bootstrap_peers(
     serde_yaml::from_str(raw)
 }
 
+/// Read a bootstrap dial hints file and parse it with [`parse_bootstrap_peers`].
+fn parse_bootstrap_peers_file(
+    path: &str,
+) -> Result<BTreeMap<BlsPublicKey, BootstrapServer>, String> {
+    let raw = std::fs::read_to_string(path).map_err(|err| format!("cannot read file: {err}"))?;
+    parse_bootstrap_peers(&raw).map_err(|err| err.to_string())
+}
+
 /// Avaliable "named" chains.
 /// These will have embedded config files and can be joined after gereating keys.
 #[derive(Debug, Copy, Clone, clap::ValueEnum)]
@@ -50,6 +58,19 @@ pub struct NodeCommand<Ext: clap::Args + fmt::Debug = NoArgs> {
     /// primary and workers (a list). Committee membership still comes from chain state.
     #[arg(long, value_name = "MAP", value_parser = parse_bootstrap_peers, allow_hyphen_values = true)]
     bootstrap_peers: Option<BTreeMap<BlsPublicKey, BootstrapServer>>,
+
+    /// Read the bootstrap dial hints map from a file instead of the command line.
+    ///
+    /// The file holds the same YAML or JSON map as --bootstrap-peers, with the same meaning.
+    /// It is read and checked while arguments are parsed, so a missing or invalid file stops
+    /// the node before startup.
+    #[arg(
+        long,
+        value_name = "PATH",
+        value_parser = parse_bootstrap_peers_file,
+        conflicts_with = "bootstrap_peers"
+    )]
+    bootstrap_peers_file: Option<BTreeMap<BlsPublicKey, BootstrapServer>>,
 
     /// Enable Prometheus consensus metrics.
     ///
@@ -257,6 +278,7 @@ impl<Ext: clap::Args + fmt::Debug> NodeCommand<Ext> {
         let Self {
             chain: _, // Used above
             bootstrap_peers,
+            bootstrap_peers_file,
             metrics,
             enable_state_export,
             state_export_keep,
@@ -286,7 +308,8 @@ impl<Ext: clap::Args + fmt::Debug> NodeCommand<Ext> {
         let reth_db = tn_reth::RethEnv::new_database(&node_config, tn_datadir.reth_db_path())?;
         let mut builder = TnBuilder::new(node_config, tn_config, reth_db)
             .with_state_export_keep(state_export_keep)
-            .with_bootstrap_peers(bootstrap_peers)
+            // the two flags conflict, so at most one of them is set
+            .with_bootstrap_peers(bootstrap_peers.or(bootstrap_peers_file))
             .with_pid_lock(pid_lock);
         builder.metrics = metrics;
         builder.healthcheck = healthcheck;
@@ -406,6 +429,73 @@ mod tests {
                 assert_eq!(result, Err(ErrorKind::ValueValidation));
             },
         );
+        Ok(())
+    }
+
+    /// A map read from `--bootstrap-peers-file` equals the same content passed inline.
+    #[test]
+    fn bootstrap_peers_file_matches_inline_map() -> eyre::Result<()> {
+        let committee: tn_types::Committee = serde_yaml::from_str(tn_types::MAINNET_COMMITTEE)?;
+        let peers = committee.bootstrap_servers();
+        assert!(!peers.is_empty());
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("bootstrap-peers.yaml");
+        [serde_yaml::to_string(&peers)?, serde_json::to_string(&peers)?, "{}".to_owned()]
+            .into_iter()
+            .try_for_each(|raw| -> eyre::Result<()> {
+                std::fs::write(&path, &raw)?;
+                let from_file = NodeCommand::<NoArgs>::try_parse_from([
+                    "node".as_ref(),
+                    "--bootstrap-peers-file".as_ref(),
+                    path.as_os_str(),
+                ])?;
+                let inline =
+                    NodeCommand::<NoArgs>::try_parse_from(["node", "--bootstrap-peers", &raw])?;
+                assert!(from_file.bootstrap_peers_file.is_some());
+                assert_eq!(from_file.bootstrap_peers_file, inline.bootstrap_peers);
+                assert_eq!(from_file.bootstrap_peers, None);
+                Ok(())
+            })?;
+        Ok(())
+    }
+
+    /// The inline map and the file form are mutually exclusive.
+    #[test]
+    fn bootstrap_peers_file_conflicts_with_inline_map() -> eyre::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("bootstrap-peers.yaml");
+        std::fs::write(&path, "{}")?;
+        let result = NodeCommand::<NoArgs>::try_parse_from([
+            "node".as_ref(),
+            "--bootstrap-peers".as_ref(),
+            "{}".as_ref(),
+            "--bootstrap-peers-file".as_ref(),
+            path.as_os_str(),
+        ])
+        .map(|_| ())
+        .map_err(|error| error.kind());
+        assert_eq!(result, Err(ErrorKind::ArgumentConflict));
+        Ok(())
+    }
+
+    /// A missing or unparsable file fails at argument parsing, before node startup.
+    #[test]
+    fn bootstrap_peers_file_rejects_missing_and_invalid_files() -> eyre::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let invalid = dir.path().join("invalid.yaml");
+        std::fs::write(&invalid, "{invalid-key: {}}")?;
+        [dir.path().join("absent.yaml"), invalid].iter().for_each(|path| {
+            let result = NodeCommand::<NoArgs>::try_parse_from([
+                "node".as_ref(),
+                "--bootstrap-peers-file".as_ref(),
+                path.as_os_str(),
+            ])
+            .map(|_| ())
+            .map_err(|error| (error.kind(), error.to_string()));
+            let (kind, message) = result.expect_err("bad file must not parse");
+            assert_eq!(kind, ErrorKind::ValueValidation, "{path:?}");
+            assert!(message.contains(path.to_str().expect("utf-8 temp path")), "{message}");
+        });
         Ok(())
     }
 

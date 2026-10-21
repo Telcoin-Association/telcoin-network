@@ -2,6 +2,7 @@
 use crate::{
     db, genesis, keytool, node,
     open_telemetry::init_opentracing_subscriber,
+    passphrase::DEFAULT_BLS_PASSPHRASE_CREDENTIAL,
     version::{LONG_VERSION, SHORT_VERSION},
     NoArgs,
 };
@@ -12,6 +13,7 @@ use tn_node::engine::TnBuilder;
 use tn_reth::{dirs::DEFAULT_ROOT_DIR, init_reth_defaults, LogArgs};
 use tokio::{runtime::Builder, task::JoinHandle};
 use tracing::info_span;
+use zeroize::Zeroizing;
 
 /// How do we want to get the BLS key passphrase?
 #[derive(Debug, Copy, Clone, clap::ValueEnum)]
@@ -25,6 +27,9 @@ pub enum PassSource {
     /// Do not use a passphrase- save the BLS key in the clear.
     /// Only do this for testing, one offs, etc.
     NoPassphrase,
+    /// Read the passphrase from the systemd credential named by --bls-passphrase-credential
+    /// (LoadCredential= or LoadCredentialEncrypted=). Removes one final \n or \r\n only.
+    Credential,
 }
 
 impl PassSource {
@@ -56,6 +61,21 @@ pub struct Cli<Ext: clap::Args + fmt::Debug = NoArgs> {
         global = true
     )]
     pub bls_passphrase_source: PassSource,
+
+    /// Name of the systemd credential holding the BLS key passphrase.
+    ///
+    /// Used with `--bls-passphrase-source credential`, which reads the file of this name in
+    /// $CREDENTIALS_DIRECTORY (set by systemd for LoadCredential= and LoadCredentialEncrypted=).
+    /// An empty value selects the default. The name is checked only when the credential source
+    /// is selected, so other sources and subcommands ignore it.
+    #[arg(
+        long,
+        value_name = "NAME",
+        default_value = DEFAULT_BLS_PASSPHRASE_CREDENTIAL,
+        env = "TN_BLS_PASSPHRASE_CREDENTIAL",
+        global = true
+    )]
+    pub bls_passphrase_credential: OsString,
 
     /// The path to the data dir for all telcoin-network files and subdirectories.
     ///
@@ -132,7 +152,7 @@ impl<Ext: clap::Args + fmt::Debug> Cli<Ext> {
     /// })?;
     /// # Ok::<(), eyre::Report>(())
     /// ```
-    pub fn run<L>(mut self, passphrase: Option<String>, launcher: L) -> eyre::Result<()>
+    pub fn run<L>(mut self, passphrase: Option<Zeroizing<String>>, launcher: L) -> eyre::Result<()>
     where
         L: FnOnce(TnBuilder, Ext, PathBuf, KeyConfig, &'static str) -> JoinHandle<eyre::Result<()>>,
     {
