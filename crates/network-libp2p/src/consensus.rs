@@ -104,6 +104,8 @@ enum LoopEvent<E, C> {
     Refresh,
     /// Retry connected peers whose record retrieval was deferred by a budget.
     RecordRetry,
+    /// Sample transport work that can finish without producing a swarm event.
+    MetricsTick,
     /// Report elapsed diagnostic windows, including suppressed tails with no new input.
     DiagnosticReport,
     /// The swarm produced an event.
@@ -1084,6 +1086,8 @@ where
         record_refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut record_retry = tokio::time::interval(self.record_retry_interval);
         record_retry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut metrics_tick = tokio::time::interval(Duration::from_secs(1));
+        metrics_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut diagnostic_reports = tokio::time::interval(crate::diagnostics::INTERVAL);
         diagnostic_reports.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -1091,11 +1095,13 @@ where
             let event = tokio::select! {
                 event = next_loop_event(&mut record_refresh, &mut self.swarm, &mut self.commands) => event,
                 _ = record_retry.tick() => LoopEvent::RecordRetry,
+                _ = metrics_tick.tick() => LoopEvent::MetricsTick,
                 _ = diagnostic_reports.tick() => LoopEvent::DiagnosticReport,
             };
             match event {
                 LoopEvent::Refresh => self.refresh_own_record(),
                 LoopEvent::RecordRetry => self.retry_record_requests(),
+                LoopEvent::MetricsTick => {}
                 LoopEvent::DiagnosticReport => crate::diagnostics::flush(),
                 LoopEvent::Swarm(event) => {
                     if let Err(e) = self.process_event(event).await {
@@ -1125,6 +1131,9 @@ where
             let (pending, deferred) = self.record_exchange.counts();
             self.metrics.set_record_exchange_pending(pending, deferred);
             self.metrics.record_quic_incoming(&self.quic_incoming);
+            self.metrics.set_pending_incoming_connections(
+                self.swarm.network_info().connection_counters().num_pending_incoming(),
+            );
         }
     }
 
