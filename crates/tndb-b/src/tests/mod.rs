@@ -1,6 +1,6 @@
 //! Whole-engine tests through the public API and the disk model: the crash matrix of the commit
-//! protocol, damaged files, a randomized multi-table model with crashes and power losses, and
-//! concurrent readers under a churning writer.
+//! protocol, damaged files, a randomized multi-table model with crashes and power losses,
+//! concurrent readers under a churning writer, and the read-only open.
 
 use std::{
     collections::BTreeMap,
@@ -20,9 +20,16 @@ use crate::{
 mod append;
 mod concurrency;
 mod crash;
+mod crash_runs;
 mod damage;
+mod damage_merge;
+mod damage_runs;
+mod key_tail;
+mod merge;
 mod multi_model;
 mod path_cache;
+mod read_only;
+mod txn_cursor;
 
 /// Every table's rows by name: one committed state of a file.
 type State = BTreeMap<String, Rows>;

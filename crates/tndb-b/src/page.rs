@@ -14,6 +14,10 @@
 //! branch cell:  child u32 | child_txn u32 | klen u16 | key
 //! ```
 //!
+//! A leaf cell's flags are 0 for a value held in the cell, or 1 for an overflow cell, whose
+//! 12-byte value names the overflow run holding the value ([`Val`], [`crate::overflow`]); any
+//! other flag is [`Error::Corrupt`].
+//!
 //! **Packing.** The cells tile `upper..P − 4` exactly. A new cell goes just below `upper`;
 //! deleting or shrinking a cell closes its gap at once (the cells below it move up and their slots
 //! follow), so a page never fragments and its free space is the single gap
@@ -27,10 +31,15 @@
 //! **Limits.** An entry (cell plus slot) is at most `MAX_ENTRY = U / 4` bytes:
 //! `max_key = MAX_ENTRY − 12` (so any key fits a branch cell as a separator) and
 //! `max_value(klen) = MAX_ENTRY − 10 − klen` (0 for a key over `max_key`, which [`validate`]
-//! refuses in a leaf too). A page that overflows holds at most `U + MAX_ENTRY`
-//! bytes counting the pending entry, so cutting it at the first entry where the left part reaches
-//! half leaves a left part under `half + MAX_ENTRY ≤ 5U/8 + U/4` and a right part of at most half:
-//! one split always suffices ([`split_leaf`], [`split_branch`]).
+//! refuses in a leaf too), the inline limit. A table's larger value goes to an overflow run
+//! ([`Geometry::place`]), up to 16 MiB for a key that leaves room for the 12-byte overflow cell
+//! ([`Geometry::max_table_value`]); the cell itself is an ordinary entry within the limits. A page
+//! that overflows holds at most `U + MAX_ENTRY` bytes counting the pending entry, so cutting it
+//! at the first entry where the left part reaches half leaves a left part under
+//! `half + MAX_ENTRY ≤ 5U/8 + U/4` and a right part of at most half: one split always suffices
+//! ([`split_leaf`], [`split_branch`]). A delete's merge of two siblings ([`SplitBuf::merge`]) is
+//! sized to fit before it is planned: the two pages' cells and slots ([`View::used`]), plus for
+//! branches the parent's key coming down as the right page's cell-0 key, within `U`.
 //!
 //! **Checking.** Pages read from the file may hold any bytes. [`validate`] checks a whole page
 //! (header, every cell in bounds, cells tiling the cell area, keys strictly ascending, entry
@@ -46,7 +55,10 @@
 
 use std::{cmp::Ordering, fmt::Display};
 
-use crate::error::{Error, Result};
+use crate::{
+    error::{Error, Result},
+    overflow::{self, Ovf, MAX_VALUE, OVF_CELL},
+};
 
 /// Smallest supported page size.
 pub(crate) const MIN_PAGE_SIZE: usize = 4096;
@@ -74,6 +86,9 @@ const RESERVED_OFF: usize = 18;
 
 const KIND_BRANCH: u8 = 1;
 const KIND_LEAF: u8 = 2;
+
+/// A leaf cell's flag: the value is an overflow reference ([`Ovf`], [`OVF_CELL`] bytes).
+const CELL_OVERFLOW: usize = 0x0001;
 
 /// The two kinds of tree page.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -111,6 +126,102 @@ pub(crate) enum Search {
     NotFound(usize),
 }
 
+/// A leaf entry's value as its cell holds it: the bytes themselves, or a reference to the
+/// overflow run holding them. A put passes the same form to the leaf mutators.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Val<'a> {
+    /// The value, in the cell.
+    Inline(&'a [u8]),
+    /// The value's overflow run ([`crate::overflow`]).
+    Overflow(Ovf),
+}
+
+impl<'a> Val<'a> {
+    /// The bytes of the value in the cell: the value, or [`OVF_CELL`] for a reference.
+    #[inline]
+    pub(crate) fn cell_len(&self) -> usize {
+        match self {
+            Self::Inline(v) => v.len(),
+            Self::Overflow(_) => OVF_CELL,
+        }
+    }
+
+    /// The value of a tree that holds only inline values (the catalog, the free list): an
+    /// overflow reference there is [`Error::Corrupt`].
+    #[inline]
+    pub(crate) fn inline(self) -> Result<&'a [u8]> {
+        match self {
+            Self::Inline(v) => Ok(v),
+            Self::Overflow(ovf) => Err(inline_error(ovf)),
+        }
+    }
+}
+
+/// A value as the leaf mutators ([`LeafMut::insert`], [`LeafMut::replace_value`]) write it into
+/// a cell: inline bytes (`&[u8]`), or either form ([`Val`]). The mutators are generic over it so
+/// that a put of inline bytes, the hot path, compiles to code that never sees the overflow form:
+/// a [`Val`] passed to them through memory and matched there slowed every inline put by a few
+/// percent.
+pub(crate) trait CellVal: Copy {
+    /// The bytes of the value in the cell ([`Val::cell_len`]).
+    fn cell_len(&self) -> usize;
+
+    /// Write the cell's value length, flags and value, the value at `v` (past the key).
+    fn write(self, cell: &mut [u8], v: usize);
+}
+
+impl CellVal for &[u8] {
+    #[inline(always)]
+    fn cell_len(&self) -> usize {
+        self.len()
+    }
+
+    #[inline(always)]
+    fn write(self, cell: &mut [u8], v: usize) {
+        put_u32(cell, 0, self.len() as u32);
+        put_u16(cell, 6, 0);
+        cell[v..v + self.len()].copy_from_slice(self);
+    }
+}
+
+impl CellVal for Val<'_> {
+    #[inline]
+    fn cell_len(&self) -> usize {
+        Val::cell_len(self)
+    }
+
+    #[inline]
+    fn write(self, cell: &mut [u8], v: usize) {
+        match self {
+            Val::Inline(bytes) => bytes.write(cell, v),
+            Val::Overflow(ovf) => {
+                put_u32(cell, 0, OVF_CELL as u32);
+                put_u16(cell, 6, CELL_OVERFLOW);
+                cell[v..v + OVF_CELL].copy_from_slice(&ovf.encode());
+            }
+        }
+    }
+}
+
+/// [`Val::inline`]'s error.
+#[cold]
+#[inline(never)]
+fn inline_error(ovf: Ovf) -> Error {
+    Error::Corrupt(format!("an overflow value ({ovf:?}) in a tree of inline values"))
+}
+
+/// Where a put stores a value ([`Geometry::place`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Place {
+    /// In its leaf cell.
+    Inline,
+    /// In an overflow run of `npages` pages, named by a 12-byte cell.
+    Overflow {
+        /// The run's pages ([`overflow::run_pages`]).
+        npages: usize,
+    },
+}
+
 /// Outcome of [`leaf_find`]: a [`Search`] with what the search already read.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Find<'a> {
@@ -119,7 +230,7 @@ pub(crate) enum Find<'a> {
         /// The cell index.
         index: usize,
         /// The entry's value.
-        value: &'a [u8],
+        value: Val<'a>,
     },
     /// The key is absent and would be inserted at cell `index`, between `before` (the key of cell
     /// `index − 1`; `None` when `index` is 0) and `after` (the key of cell `index`; `None` past
@@ -186,7 +297,6 @@ impl Geometry {
     }
 
     /// `U = P − 28`: the bytes a page has for cells and slots.
-    #[cfg(test)]
     pub(crate) fn usable(&self) -> usize {
         self.usable
     }
@@ -214,8 +324,45 @@ impl Geometry {
         self.max_entry - LEAF_CELL_HEADER - SLOT - klen
     }
 
-    /// Check an entry's sizes against the limits: [`Error::KeyTooLarge`] or
-    /// [`Error::ValueTooLarge`], before anything is changed.
+    /// The longest value a table stores with a `klen`-byte key: [`MAX_VALUE`] when the key leaves
+    /// room for an overflow cell (`klen <= max_key − 10`), else [`Self::max_value`] (0 for a key
+    /// over [`Self::max_key`]).
+    pub(crate) fn max_table_value(&self, klen: usize) -> usize {
+        if self.overflow_fits(klen) {
+            MAX_VALUE
+        } else {
+            self.max_value(klen)
+        }
+    }
+
+    /// True if a `klen`-byte key leaves room for an overflow cell's 12 bytes in a maximal entry.
+    fn overflow_fits(&self, klen: usize) -> bool {
+        klen <= self.max_key() && OVF_CELL <= self.max_value(klen)
+    }
+
+    /// Where a table stores a `vlen`-byte value under a `klen`-byte key: inline when it fits
+    /// [`Self::max_value`] (so every inline layout is unchanged by overflow support), else in an
+    /// overflow run when the key leaves room for the 12-byte cell and `vlen <=` [`MAX_VALUE`]; else
+    /// [`Error::KeyTooLarge`] or [`Error::ValueTooLarge`], before anything is changed.
+    #[inline]
+    pub(crate) fn place(&self, klen: usize, vlen: usize) -> Result<Place> {
+        let max = self.max_key();
+        if klen > max {
+            return Err(Error::KeyTooLarge { len: klen, max });
+        }
+        if vlen <= self.max_value(klen) {
+            return Ok(Place::Inline);
+        }
+        let max = self.max_table_value(klen);
+        if vlen > max {
+            return Err(Error::ValueTooLarge { len: vlen, max });
+        }
+        Ok(Place::Overflow { npages: overflow::run_pages(vlen, self.page_size) })
+    }
+
+    /// Check an entry's sizes against the inline limits: [`Error::KeyTooLarge`] or
+    /// [`Error::ValueTooLarge`], before anything is changed. The catalog and the free list, which
+    /// hold only inline values, write through it; a table's put asks [`Self::place`].
     pub(crate) fn check_entry(&self, klen: usize, vlen: usize) -> Result<()> {
         let max = self.max_key();
         if klen > max {
@@ -389,6 +536,11 @@ impl Hdr {
     fn fits(&self, cell_size: usize) -> bool {
         cell_size.saturating_add(SLOT) <= self.free()
     }
+
+    /// The bytes of every cell plus its slot: `U − free`.
+    fn used(&self) -> usize {
+        self.end - self.upper + SLOT * self.nkeys
+    }
 }
 
 // The hot accessors below keep their error messages out of line, in `#[cold]` functions that
@@ -551,8 +703,9 @@ fn cell_error(page: &[u8], h: &Hdr, i: usize) -> Error {
     corrupt(page, format_args!("cell {i} at {off} outside the cell area {}..{}", h.upper, h.end))
 }
 
-/// Leaf cell `i` as `(offset, klen, vlen)`, checked to end inside the cell area and to carry no
-/// cell flags (reserved for overflow values and duplicate keys).
+/// Leaf cell `i` as `(offset, klen, vlen)`, checked to end inside the cell area and to carry
+/// flags 0 (an inline value) or [`CELL_OVERFLOW`] with a 12-byte value (an overflow reference,
+/// [`leaf_val`]); every other flag is refused.
 #[inline]
 fn leaf_cell(page: &[u8], h: &Hdr, i: usize) -> Result<(usize, usize, usize)> {
     let off = cell_off(page, h, i)?;
@@ -560,10 +713,25 @@ fn leaf_cell(page: &[u8], h: &Hdr, i: usize) -> Result<(usize, usize, usize)> {
     let klen = read_u16(page, off + 4);
     let cell_flags = read_u16(page, off + 6);
     let room = h.end - off - LEAF_CELL_HEADER;
-    if cell_flags != 0 || vlen > room || klen > room - vlen {
+    if (cell_flags != 0 && (cell_flags != CELL_OVERFLOW || vlen != OVF_CELL))
+        || vlen > room
+        || klen > room - vlen
+    {
         return Err(leaf_cell_error(page, i, off, (klen, vlen, cell_flags)));
     }
     Ok((off, klen, vlen))
+}
+
+/// The value of the leaf cell at `off` with a `klen`-byte key and a `vlen`-byte value, as
+/// [`leaf_cell`] checked it: the bytes, or the overflow reference its 12 bytes hold.
+#[inline]
+fn leaf_val(page: &[u8], off: usize, klen: usize, vlen: usize) -> Val<'_> {
+    let v = off + LEAF_CELL_HEADER + klen;
+    if read_u16(page, off + 6) == CELL_OVERFLOW {
+        Val::Overflow(Ovf::decode(page[v..v + OVF_CELL].try_into().expect("12 bytes")))
+    } else {
+        Val::Inline(&page[v..v + vlen])
+    }
 }
 
 /// [`leaf_cell`]'s [`Error::Corrupt`] for cell `i` at `off`, read as `(klen, vlen, flags)`.
@@ -575,8 +743,11 @@ fn leaf_cell_error(
     off: usize,
     (klen, vlen, flags): (usize, usize, usize),
 ) -> Error {
-    if flags != 0 {
+    if flags > CELL_OVERFLOW {
         return corrupt(page, format_args!("cell {i} has flags {flags:#x}"));
+    }
+    if flags == CELL_OVERFLOW && vlen != OVF_CELL {
+        return corrupt(page, format_args!("overflow cell {i} has a {vlen}-byte value"));
     }
     corrupt(page, format_args!("cell {i} at {off} ({klen}+{vlen} bytes) overruns"))
 }
@@ -764,6 +935,16 @@ impl<'a> View<'a> {
         }
     }
 
+    /// The bytes of every cell plus its slot (`U − free`): what a merge lays out
+    /// ([`SplitBuf::merge`]).
+    #[inline]
+    pub(crate) fn used(&self) -> usize {
+        match self {
+            Self::Leaf(v) => v.h.used(),
+            Self::Branch(v) => v.h.used(),
+        }
+    }
+
     /// Whether every key lies in `[lo, hi)` ([`LeafView::keys_in_range`],
     /// [`BranchView::keys_in_range`]).
     #[inline]
@@ -803,6 +984,12 @@ impl<'a> LeafView<'a> {
         self.h.free()
     }
 
+    /// The bytes of every cell plus its slot ([`View::used`]).
+    #[inline]
+    pub(crate) fn used(&self) -> usize {
+        self.h.used()
+    }
+
     /// Whether a `cell_size`-byte cell and its slot fit the free gap.
     #[inline]
     pub(crate) fn fits(&self, cell_size: usize) -> bool {
@@ -826,11 +1013,29 @@ impl<'a> LeafView<'a> {
 
     /// Entry `i` as `(key, value)`.
     #[inline]
-    pub(crate) fn entry(&self, i: usize) -> Result<(&'a [u8], &'a [u8])> {
+    pub(crate) fn entry(&self, i: usize) -> Result<(&'a [u8], Val<'a>)> {
         let page = self.page;
         let (off, klen, vlen) = leaf_cell(page, &self.h, i)?;
         let k = off + LEAF_CELL_HEADER;
-        Ok((&page[k..k + klen], &page[k + klen..k + klen + vlen]))
+        Ok((&page[k..k + klen], leaf_val(page, off, klen, vlen)))
+    }
+
+    /// Entry `i` as its key and, for an inline value, the key's last `t` bytes followed by the
+    /// value: `key[klen − t..] ‖ value`, one slice of the cell, since a cell holds its value right
+    /// after its key. An overflow value is its reference, as [`Self::entry`] gives it. A `t` past
+    /// the key's length is the key's length (the slice is then `key ‖ value`): the slice never
+    /// reaches into the cell's fixed part.
+    #[inline]
+    pub(crate) fn entry_with_key_tail(&self, i: usize, t: usize) -> Result<(&'a [u8], Val<'a>)> {
+        let page = self.page;
+        let (off, klen, vlen) = leaf_cell(page, &self.h, i)?;
+        let k = off + LEAF_CELL_HEADER;
+        let v = k + klen;
+        let val = match leaf_val(page, off, klen, vlen) {
+            Val::Inline(_) => Val::Inline(&page[v - t.min(klen)..v + vlen]),
+            ovf => ovf,
+        };
+        Ok((&page[k..v], val))
     }
 
     /// Binary-search for `key`.
@@ -869,7 +1074,7 @@ impl<'a> LeafView<'a> {
                 Ordering::Less => (lo, before) = (mid + 1, Some(probe)),
                 Ordering::Greater => (hi, after) = (mid, Some(probe)),
                 Ordering::Equal => {
-                    return Ok(Find::Found { index: mid, value: &page[k + klen..k + klen + vlen] })
+                    return Ok(Find::Found { index: mid, value: leaf_val(page, off, klen, vlen) })
                 }
             }
         }
@@ -902,6 +1107,12 @@ impl<'a> BranchView<'a> {
     #[cfg(test)]
     pub(crate) fn free_space(&self) -> usize {
         self.h.free()
+    }
+
+    /// The bytes of every cell plus its slot ([`View::used`]).
+    #[inline]
+    pub(crate) fn used(&self) -> usize {
+        self.h.used()
     }
 
     /// Whether a `cell_size`-byte cell and its slot fit the free gap.
@@ -994,7 +1205,9 @@ impl<'a> BranchView<'a> {
 /// Check every structural rule of a page, never panicking on any bytes: a buffer of the
 /// geometry's page size; a known kind, flags and reserved header bytes zero, the slot array below
 /// `upper` and `upper` below the trailer; every slot addressing a cell that lies in the cell area
-/// with lengths inside the page and no cell flags; the cells tiling `upper..P − 4` exactly (no
+/// with lengths inside the page; a leaf cell's flags 0, or 1 for an overflow cell, whose value is
+/// 12 bytes naming a length past the inline limit ([`Geometry::max_value`]) and within
+/// [`MAX_VALUE`]; the cells tiling `upper..P − 4` exactly (no
 /// overlap, no gap); every entry within the geometry's maximal entry (`U / 4`) and every key
 /// within its `max_key` (for a branch cell the entry limit is that, for a leaf cell it is not);
 /// keys strictly ascending; and for a branch at least one child, with cell 0's key empty. The page
@@ -1032,6 +1245,18 @@ pub(crate) fn validate(page: &[u8], geometry: &Geometry) -> Result<()> {
         }
         if h.kind == Kind::Branch && i == 0 && !key.is_empty() {
             return Err(corrupt(page, "branch cell 0 has a key"));
+        }
+        if h.kind == Kind::Leaf {
+            let (off, klen, vlen) = leaf_cell(page, &h, i)?;
+            if let Val::Overflow(ovf) = leaf_val(page, off, klen, vlen) {
+                let len = ovf.len as usize;
+                if len <= geometry.max_value(klen) || len > MAX_VALUE {
+                    return Err(corrupt(
+                        page,
+                        format_args!("overflow cell {i} holds a value of {len} bytes"),
+                    ));
+                }
+            }
         }
         if prev.is_some_and(|p| p >= key) {
             return Err(corrupt(page, format_args!("cell {i} is out of key order")));
@@ -1080,24 +1305,40 @@ fn keys_within(page: &[u8], h: &Hdr, lo: Option<&[u8]>, hi: Option<&[u8]>) -> Re
 // ---- leaf ----
 
 #[inline]
-fn write_leaf_cell(cell: &mut [u8], key: &[u8], value: &[u8]) {
-    put_u32(cell, 0, value.len() as u32);
+fn write_leaf_cell(cell: &mut [u8], key: &[u8], value: impl CellVal) {
     put_u16(cell, 4, key.len());
-    put_u16(cell, 6, 0);
     let k = LEAF_CELL_HEADER + key.len();
     cell[LEAF_CELL_HEADER..k].copy_from_slice(key);
-    cell[k..k + value.len()].copy_from_slice(value);
+    value.write(cell, k);
 }
 
 /// The key of leaf entry `i` ([`LeafView::key`]).
-#[cfg(test)]
 pub(crate) fn leaf_key(page: &[u8], i: usize) -> Result<&[u8]> {
     LeafView { page, h: hdr_of(page, Kind::Leaf)? }.key(i)
 }
 
+/// Test-only: leaf entry `i` of a tree of inline values (the catalog, the free list): an
+/// overflow reference is [`Error::Corrupt`] ([`Val::inline`]).
+#[cfg(test)]
+pub(crate) fn leaf_inline_entry(page: &[u8], i: usize) -> Result<(&[u8], &[u8])> {
+    let (k, v) = leaf_entry(page, i)?;
+    Ok((k, v.inline()?))
+}
+
 /// Leaf entry `i` as `(key, value)` ([`LeafView::entry`]).
-pub(crate) fn leaf_entry(page: &[u8], i: usize) -> Result<(&[u8], &[u8])> {
+pub(crate) fn leaf_entry(page: &[u8], i: usize) -> Result<(&[u8], Val<'_>)> {
     LeafView { page, h: hdr_of(page, Kind::Leaf)? }.entry(i)
+}
+
+/// Leaf entry `i` as its key and its value joined to the key's last `t` bytes
+/// ([`LeafView::entry_with_key_tail`]).
+#[inline]
+pub(crate) fn leaf_entry_with_key_tail(
+    page: &[u8],
+    i: usize,
+    t: usize,
+) -> Result<(&[u8], Val<'_>)> {
+    LeafView { page, h: hdr_of(page, Kind::Leaf)? }.entry_with_key_tail(i, t)
 }
 
 /// Binary-search a leaf for `key` ([`LeafView::search`]).
@@ -1114,13 +1355,17 @@ pub(crate) fn leaf_find<'a>(page: &'a [u8], key: &[u8]) -> Result<Find<'a>> {
 
 /// Insert `(key, value)` as entry `i` (the sorted position: [`Search::NotFound`]). The caller has
 /// checked the sizes with [`Geometry::check_entry`]. [`Fit::Full`] leaves the page unchanged.
+/// Test-only: the engine changes a leaf through [`LeafMut`].
+#[cfg(test)]
 pub(crate) fn leaf_insert(page: &mut [u8], i: usize, key: &[u8], value: &[u8]) -> Result<Fit> {
     LeafMut::new(page)?.insert(i, key, value)
 }
 
 /// Replace the value of leaf entry `i`: in place when the size is unchanged, otherwise by
 /// resizing the cell in place (the cells below it shift by the difference). [`Fit::Full`] (a
-/// larger value than the free space allows) leaves the page unchanged.
+/// larger value than the free space allows) leaves the page unchanged. Test-only, like
+/// [`leaf_insert`].
+#[cfg(test)]
 pub(crate) fn leaf_replace_value(page: &mut [u8], i: usize, value: &[u8]) -> Result<Fit> {
     LeafMut::new(page)?.replace_value(i, value)
 }
@@ -1149,11 +1394,11 @@ impl<'a> LeafMut<'a> {
         LeafView { page: self.page, h: self.h }
     }
 
-    /// [`leaf_insert`].
+    /// [`leaf_insert`] of an inline value or an overflow reference ([`CellVal`]).
     #[inline]
-    pub(crate) fn insert(self, i: usize, key: &[u8], value: &[u8]) -> Result<Fit> {
+    pub(crate) fn insert(self, i: usize, key: &[u8], value: impl CellVal) -> Result<Fit> {
         let Self { page, h } = self;
-        let size = cell_size_leaf(key.len(), value.len());
+        let size = cell_size_leaf(key.len(), value.cell_len());
         let Some(off) = reserve(page, &h, i, size)? else {
             return Ok(Fit::Full);
         };
@@ -1161,16 +1406,18 @@ impl<'a> LeafMut<'a> {
         Ok(Fit::Done)
     }
 
-    /// [`leaf_replace_value`].
+    /// [`leaf_replace_value`] with an inline value or an overflow reference (either may replace
+    /// either, [`CellVal`]).
     #[inline]
-    pub(crate) fn replace_value(self, i: usize, value: &[u8]) -> Result<Fit> {
+    pub(crate) fn replace_value(self, i: usize, value: impl CellVal) -> Result<Fit> {
         let Self { page, h } = self;
         let (off, klen, vlen) = leaf_cell(page, &h, i)?;
         let keep = LEAF_CELL_HEADER + klen;
-        let off = match value.len().cmp(&vlen) {
+        let new_len = value.cell_len();
+        let off = match new_len.cmp(&vlen) {
             Ordering::Equal => off,
             Ordering::Greater => {
-                let grow = value.len() - vlen;
+                let grow = new_len - vlen;
                 if grow > h.free() {
                     return Ok(Fit::Full);
                 }
@@ -1178,13 +1425,12 @@ impl<'a> LeafMut<'a> {
                 off - grow
             }
             Ordering::Less => {
-                let shrink = vlen - value.len();
+                let shrink = vlen - new_len;
                 shift_front(page, &h, off, keep, h.upper + shrink);
                 off + shrink
             }
         };
-        put_u32(page, off, value.len() as u32);
-        page[off + keep..off + keep + value.len()].copy_from_slice(value);
+        value.write(&mut page[off..off + keep + new_len], keep);
         Ok(Fit::Done)
     }
 }
@@ -1339,6 +1585,9 @@ pub(crate) fn init_root(
 /// [`Self::sep`] is then the separator, which goes up to the parent. Each half's bytes are those
 /// of an empty page ([`init`]) given its cells in order by [`reserve`]: the first cell at the top
 /// of the cell area, each next one below it.
+///
+/// A delete's merge of two siblings reuses the buffers: [`Self::merge`] plans it from both pages,
+/// [`Self::write_merged`] lays the cells out the same way over the survivor.
 #[derive(Debug, Default)]
 pub(crate) struct SplitBuf {
     /// The size of the page that splits.
@@ -1379,10 +1628,10 @@ impl SplitBuf {
         src: &[u8],
         at: usize,
         key: &[u8],
-        value: &[u8],
+        value: Val<'_>,
         append: bool,
     ) -> Result<()> {
-        let size = cell_size_leaf(key.len(), value.len());
+        let size = cell_size_leaf(key.len(), value.cell_len());
         check_split_entry(src, size)?;
         let h = hdr_of(src, Kind::Leaf)?;
         check_split_at(src, &h, at)?;
@@ -1524,6 +1773,64 @@ impl SplitBuf {
         place_cells(src, &self.copy, &self.cells[..self.left], false);
         Ok(())
     }
+
+    /// Plan the merge of two adjacent pages under one parent, `left` then `right`, into one:
+    /// `left`'s cells followed by `right`'s. For branches `sep` is the parent's key for `right`,
+    /// which comes down as the key of `right`'s cell 0 (empty until then), so the merged page's
+    /// size is `used(left) + used(right) + sep.len()` ([`View::used`]); for leaves it is ignored.
+    /// It changes no page: [`Self::write_merged`] writes the result over the survivor. Pages of
+    /// different kinds or sizes, or a result over `U`, are [`Error::Corrupt`] (the caller sized the
+    /// merge to fit, from the same bytes [`place_cells`] lays out). The caller also checked the key
+    /// order across the seam (`left`'s keys below `sep`, `sep` below `right`'s key 1).
+    pub(crate) fn merge(&mut self, left: &[u8], right: &[u8], sep: &[u8]) -> Result<()> {
+        let (hl, hr) = (hdr(left)?, hdr(right)?);
+        if hl.kind != hr.kind || left.len() != right.len() {
+            return Err(corrupt(right, "merging pages of different kinds or sizes"));
+        }
+        let branch = hl.kind == Kind::Branch;
+        self.copy.clear();
+        self.copy.extend_from_slice(left);
+        self.copy.extend_from_slice(right);
+        self.cells.clear();
+        for i in 0..hl.nkeys {
+            self.cells.push(cell_extent(left, &hl, i)?);
+        }
+        let base = left.len();
+        for i in 0..hr.nkeys {
+            let (off, size) = cell_extent(right, &hr, i)?;
+            if i == 0 && branch {
+                // Right's cell 0 with the separator for its key.
+                let at = self.copy.len();
+                let size = cell_size_branch(sep.len());
+                self.copy.resize(at + size, 0);
+                let (child, child_txn) = (read_u32(right, off), read_u32(right, off + 4));
+                write_branch_cell(&mut self.copy[at..], sep, child, child_txn);
+                self.cells.push((at, size));
+            } else {
+                self.cells.push((base + off, size));
+            }
+        }
+        let total = self.cells.iter().map(|c| c.1 + SLOT).sum::<usize>();
+        let usable = left.len() - HEADER - TRAILER;
+        if total > usable {
+            return Err(corrupt(right, format_args!("a merge of {total} bytes exceeds {usable}")));
+        }
+        (self.page_size, self.left, self.rewrite, self.kind) =
+            (left.len(), self.cells.len(), true, Some(hl.kind));
+        Ok(())
+    }
+
+    /// Write the planned merge over `dst`, the survivor (one of the two pages merged, private to
+    /// the writer), keeping its page number and txn. The other page is the caller's to free.
+    pub(crate) fn write_merged(&self, dst: &mut [u8]) -> Result<()> {
+        let Some(kind) = self.kind.filter(|_| dst.len() == self.page_size) else {
+            return Err(corrupt(dst, "merge target is not a page of the planned size"));
+        };
+        let (p, t) = (pgno(dst), txn(dst));
+        init(dst, kind, p, t);
+        place_cells(dst, &self.copy, &self.cells[..self.left], false);
+        Ok(())
+    }
 }
 
 /// The pending entry of a split must respect the entry limit (the split guarantee rests on it).
@@ -1579,7 +1886,7 @@ pub(crate) fn split_leaf(
     append: bool,
 ) -> Result<Vec<u8>> {
     let mut buf = SplitBuf::default();
-    buf.split_leaf(src, at, key, value, append)?;
+    buf.split_leaf(src, at, key, Val::Inline(value), append)?;
     split_into(&buf, src, dst, Kind::Leaf)
 }
 
@@ -1636,7 +1943,7 @@ mod tests {
             let size = cell_size_leaf(key.len(), value.len());
             check_split_entry(src, size)?;
             let mut cell = vec![0; size];
-            write_leaf_cell(&mut cell, key, value);
+            write_leaf_cell(&mut cell, key, Val::Inline(value));
             split(src, dst, Kind::Leaf, at, &cell, append)
         }
 
@@ -1788,7 +2095,7 @@ mod tests {
         (0..nkeys(page))
             .map(|i| {
                 let (k, v) = leaf_entry(page, i).unwrap();
-                (k.to_vec(), v.to_vec())
+                (k.to_vec(), v.inline().unwrap().to_vec())
             })
             .collect()
     }
@@ -2499,7 +2806,12 @@ mod tests {
         for i in 1.. {
             let r = splitmix(&mut s);
             let key = ranked_key(i, (r % 40) as usize);
-            let fit = if leaf {
+            let fit = if leaf && (r >> 56) & 3 == 0 {
+                // An overflow cell: a 12-byte reference with flags 1.
+                let ovf = Ovf { pgno: i, txn: (r >> 16) as u32, len: (r >> 32) as u32 };
+                LeafMut::new(&mut page)
+                    .and_then(|m| m.insert(i as usize - 1, &key, Val::Overflow(ovf)))
+            } else if leaf {
                 leaf_insert(&mut page, i as usize - 1, &key, &vec![7; (r >> 8) as usize % 200])
             } else {
                 branch_insert(&mut page, i as usize, &key, i, i)
@@ -2550,6 +2862,29 @@ mod tests {
 
     /// Call every reader and mutator on `page` (mutators on copies); none may panic. The one-pass
     /// searches must match the slow accessors ([`assert_one_pass_matches`]).
+    /// [`leaf_entry_with_key_tail`] against [`leaf_entry`] on any page: both refuse, or both give
+    /// the key, and for an inline value the key's last `t` bytes (all of them for a `t` past its
+    /// length) and the value as one slice of the page, starting inside the key; an overflow
+    /// reference is the same reference.
+    fn assert_key_tail_matches(page: &[u8], i: usize, t: usize) {
+        let (got, want) = (leaf_entry_with_key_tail(page, i, t), leaf_entry(page, i));
+        let ((key, tail), (want_key, want_val)) = match (got, want) {
+            (Ok(got), Ok(want)) => (got, want),
+            (Err(_), Err(_)) => return,
+            (got, want) => panic!("cell {i}, t {t}: {got:?} where leaf_entry gives {want:?}"),
+        };
+        assert_eq!(key, want_key, "cell {i}, t {t}: key");
+        match (tail, want_val) {
+            (Val::Inline(joined), Val::Inline(value)) => {
+                let start = key.len() - t.min(key.len());
+                assert_eq!(joined, [&key[start..], value].concat(), "cell {i}, t {t}");
+                // One slice of the page, from inside the key: no copy.
+                assert_eq!(joined.as_ptr(), key[start..].as_ptr(), "cell {i}, t {t}");
+            }
+            (tail, value) => assert_eq!(tail, value, "cell {i}, t {t}: an overflow reference"),
+        }
+    }
+
     fn exercise(page: &[u8], key: &[u8], sel: usize) {
         let g = geometry(page.len() as u32);
         let _ = validate(page, &g);
@@ -2566,6 +2901,7 @@ mod tests {
                 branch_key(page, i),
             );
             assert_eq!(branch_route_at(page, i).ok(), route_model(page, Ok(i)), "route_at {i}");
+            assert_key_tail_matches(page, i, sel % 70);
         }
         let i = sel % (n + 2);
         assert_one_pass_matches(page, key, i);
@@ -2687,7 +3023,8 @@ mod tests {
             let page = self.page;
             if self.leaf {
                 let (vlen, klen) = (self.u32_at(off) as usize, self.u16_at(off + 4));
-                if self.u16_at(off + 6) != 0 || off + 8 + klen + vlen > self.end {
+                let flags = self.u16_at(off + 6);
+                if (flags != 0 && (flags != 1 || vlen != 12)) || off + 8 + klen + vlen > self.end {
                     return None;
                 }
                 let k = off + 8;
@@ -2701,6 +3038,18 @@ mod tests {
             }
         }
 
+        /// Leaf cell `i` as `(key, value)`: flags 1 makes its 12 value bytes an overflow
+        /// reference.
+        fn entry(&self, i: usize) -> Option<(&'a [u8], Val<'a>)> {
+            let (k, v) = self.cell(i)?;
+            let off = self.u16_at(24 + 2 * i);
+            Some(if self.u16_at(off + 6) == 1 {
+                (k, Val::Overflow(Ovf::decode(v.try_into().unwrap())))
+            } else {
+                (k, Val::Inline(v))
+            })
+        }
+
         fn child(&self, i: usize) -> Option<(u32, u32)> {
             let (_, ptr) = self.cell(i)?;
             let word = |at: usize| u32::from_le_bytes(ptr[at..at + 4].try_into().unwrap());
@@ -2711,7 +3060,7 @@ mod tests {
             let (mut lo, mut hi, mut before, mut after) = (0, self.n, None, None);
             while lo < hi {
                 let mid = lo + (hi - lo) / 2;
-                let (k, v) = self.cell(mid)?;
+                let (k, v) = self.entry(mid)?;
                 match k.cmp(key) {
                     Ordering::Less => (lo, before) = (mid + 1, Some(k)),
                     Ordering::Greater => (hi, after) = (mid, Some(k)),
@@ -2810,7 +3159,7 @@ mod tests {
             assert_eq!(branch_route(page, p).ok(), want, "branch_route {p:?}");
         }
         for i in (0..n.min(64)).chain([n.saturating_sub(1), n, n + 1, sel % (n + 2)]) {
-            let want = leaf.and_then(|m| m.cell(i));
+            let want = leaf.and_then(|m| m.entry(i));
             assert_eq!(lv.and_then(|v| v.entry(i).ok()), want, "LeafView::entry {i}");
             assert_eq!(leaf_entry(page, i).ok(), want, "leaf_entry {i}");
             assert_eq!(lv.and_then(|v| v.key(i).ok()), want.map(|c| c.0), "LeafView::key {i}");
@@ -2965,7 +3314,7 @@ mod tests {
                     let (mut got_src, mut got_dst) = (src.clone(), vec![0; g.page_size()]);
                     let want = match kind {
                         Kind::Leaf => {
-                            buf.split_leaf(&got_src, at, &key, &value, append).unwrap();
+                            buf.split_leaf(&got_src, at, &key, Val::Inline(&value), append).unwrap();
                             reference::split_leaf(
                                 &mut want_src, &mut want_dst, at, &key, &value, append,
                             )
@@ -2986,6 +3335,180 @@ mod tests {
                     prop_assert!(got_dst == want_dst, "{size} {kind:?} at {at}: right halves differ");
                     validate(&got_src, &g).unwrap();
                     validate(&got_dst, &g).unwrap();
+                }
+            }
+        }
+    }
+
+    /// [`Geometry::place`]: a value up to [`Geometry::max_value`] stays inline (M1's rule, so
+    /// every inline layout is unchanged); a larger one goes to a run of `ceil((28 + len) / P)`
+    /// pages when its key leaves room for the 12-byte cell and it is at most [`MAX_VALUE`];
+    /// anything else is refused with the error and limit `Env::max_value_len` reports.
+    #[test]
+    fn place_keeps_m1_values_inline_and_sends_larger_ones_to_runs() {
+        for size in SIZES {
+            let g = geometry(size);
+            let (p, mk) = (g.page_size(), g.max_key());
+            // `Error` has no `PartialEq`: compare the debug forms.
+            let want = |r: Result<Place>| format!("{r:?}");
+            let place = |klen: usize, vlen: usize| want(g.place(klen, vlen));
+            let runs = |len: usize| want(Ok(Place::Overflow { npages: (28 + len).div_ceil(p) }));
+            for klen in [0, 1, 24, mk - OVF_CELL + 2, mk - OVF_CELL + 3] {
+                let max = g.max_value(klen);
+                assert_eq!(place(klen, 0), want(Ok(Place::Inline)), "{size}: klen {klen}");
+                assert_eq!(place(klen, max), want(Ok(Place::Inline)), "{size}: klen {klen}");
+                if klen + OVF_CELL <= mk + 2 {
+                    assert_eq!(g.max_table_value(klen), MAX_VALUE);
+                    assert_eq!(place(klen, max + 1), runs(max + 1), "{size}: klen {klen}");
+                    assert_eq!(place(klen, p - 28), runs(p - 28), "one full page");
+                    assert_eq!(place(klen, p - 27), runs(p - 27), "two pages");
+                    assert_eq!(place(klen, MAX_VALUE), runs(MAX_VALUE), "the largest value");
+                    assert_eq!(
+                        place(klen, MAX_VALUE + 1),
+                        want(Err(Error::ValueTooLarge { len: MAX_VALUE + 1, max: MAX_VALUE }))
+                    );
+                } else {
+                    // The 12-byte cell would not fit a maximal entry: inline values only.
+                    assert_eq!(g.max_table_value(klen), max);
+                    assert_eq!(
+                        place(klen, max + 1),
+                        want(Err(Error::ValueTooLarge { len: max + 1, max })),
+                        "{size}: klen {klen}"
+                    );
+                }
+            }
+            assert_eq!(place(mk + 1, 0), want(Err(Error::KeyTooLarge { len: mk + 1, max: mk })));
+            // The longest key with a run: its overflow cell is exactly a maximal entry.
+            let klen = mk - OVF_CELL + 2;
+            assert_eq!(cell_size_leaf(klen, OVF_CELL) + SLOT, g.max_entry());
+        }
+    }
+
+    /// An overflow cell (flags 1, 12 value bytes) reads back as [`Val::Overflow`] through every
+    /// reader, replaces and is replaced by inline values in place, and is canonical: [`validate`]
+    /// refuses flags other than 0 and 1, an overflow cell whose value is not 12 bytes, and a run
+    /// length that would fit inline or exceeds [`MAX_VALUE`]. The catalog's and the free list's
+    /// readers ([`Val::inline`]) refuse it.
+    #[test]
+    fn overflow_cells_are_canonical_references() {
+        for size in SIZES {
+            let g = geometry(size);
+            let key = b"key".as_slice();
+            let ovf = Ovf { pgno: 9, txn: 0xDEAD_BEEF, len: (g.max_value(key.len()) + 1) as u32 };
+            let mut page = fresh(&g, Kind::Leaf);
+            assert_eq!(leaf_insert(&mut page, 0, b"a", b"inline").unwrap(), Fit::Done);
+            let fit = LeafMut::new(&mut page).unwrap().insert(1, key, Val::Overflow(ovf)).unwrap();
+            assert_eq!(fit, Fit::Done);
+            validate(&page, &g).expect("a canonical overflow cell");
+            assert_eq!(leaf_entry(&page, 1).unwrap(), (key, Val::Overflow(ovf)));
+            assert_eq!(leaf_entry(&page, 0).unwrap(), (b"a".as_slice(), Val::Inline(b"inline")));
+            assert_eq!(
+                leaf_find(&page, key).unwrap(),
+                Find::Found { index: 1, value: Val::Overflow(ovf) }
+            );
+            assert!(matches!(Val::Overflow(ovf).inline(), Err(Error::Corrupt(_))));
+            assert!(matches!(leaf_inline_entry(&page, 1), Err(Error::Corrupt(_))));
+            assert_eq!(
+                free_space(&page).unwrap() + 2 * (SLOT + 8) + 1 + 6 + 3 + OVF_CELL,
+                g.usable()
+            );
+
+            // Replace in place: overflow -> inline -> overflow, the free space following.
+            let free = free_space(&page).unwrap();
+            let fit = LeafMut::new(&mut page).unwrap().replace_value(1, Val::Inline(&[5; 40]));
+            assert_eq!(fit.unwrap(), Fit::Done);
+            assert_eq!(leaf_entry(&page, 1).unwrap(), (key, Val::Inline(&[5; 40])));
+            assert_eq!(free_space(&page).unwrap(), free - 28);
+            validate(&page, &g).expect("inline again");
+            let other = Ovf { len: MAX_VALUE as u32, ..ovf };
+            let fit = LeafMut::new(&mut page).unwrap().replace_value(1, Val::Overflow(other));
+            assert_eq!(fit.unwrap(), Fit::Done);
+            assert_eq!(leaf_entry(&page, 1).unwrap(), (key, Val::Overflow(other)));
+            assert_eq!(free_space(&page).unwrap(), free);
+            validate(&page, &g).expect("the largest value");
+
+            let off = slot(&page, 1);
+            let damaged = |change: &dyn Fn(&mut [u8])| {
+                let mut p = page.clone();
+                change(&mut p);
+                p
+            };
+            for (what, bad) in [
+                ("flags 2", damaged(&|p| put_u16(p, off + 6, 2))),
+                ("flags 3", damaged(&|p| put_u16(p, off + 6, 3))),
+                ("flags 0x100", damaged(&|p| put_u16(p, off + 6, 0x100))),
+            ] {
+                assert!(matches!(validate(&bad, &g), Err(Error::Corrupt(_))), "{size}: {what}");
+                assert!(leaf_entry(&bad, 1).is_err(), "{size}: {what}");
+                assert!(leaf_find(&bad, key).is_err(), "{size}: {what}");
+            }
+            // Flags 1 on an inline cell whose value is not 12 bytes.
+            let bad = damaged(&|p| put_u16(p, slot(p, 0) + 6, 1));
+            assert!(matches!(validate(&bad, &g), Err(Error::Corrupt(_))), "{size}: flags 1");
+            assert!(leaf_entry(&bad, 0).is_err(), "{size}: flags 1 on a 6-byte value");
+            // Run lengths that are not canonical: one that fits inline, one past the limit.
+            let v = off + LEAF_CELL_HEADER + key.len();
+            for len in [0, g.max_value(key.len()), MAX_VALUE + 1, u32::MAX as usize] {
+                let bad = damaged(&|p| put_u32(p, v + 8, len as u32));
+                assert!(matches!(validate(&bad, &g), Err(Error::Corrupt(_))), "{size}: len {len}");
+            }
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(64))]
+
+        /// `leaf_entry_with_key_tail` on random valid leaves (an empty first key now and then,
+        /// keys up to `max_key`, values up to the inline limit, overflow cells among them): the
+        /// key, and for an inline value `key[klen − t..] ‖ value` for `t` of 0, the key's length,
+        /// past it (clamped: `key ‖ value`) and in between; an overflow cell's reference.
+        #[test]
+        fn key_tail_joins_the_keys_last_bytes_to_an_inline_value(
+            size in select(&SIZES[..]),
+            empty_first in any::<bool>(),
+            specs in vec((spec(), any::<u8>()), 1..80),
+            tsel in any::<usize>(),
+        ) {
+            let g = geometry(size);
+            let mut page = fresh(&g, Kind::Leaf);
+            let mut model: Vec<(Vec<u8>, Val<'static>, Vec<u8>)> = Vec::new();
+            for (n, (s, ovf_sel)) in specs.iter().enumerate() {
+                let key = if n == 0 && empty_first {
+                    Vec::new()
+                } else {
+                    ranked_key(2 * n as u32 + 1, s.klen(&g))
+                };
+                let value = s.value(&g, key.len());
+                let ovf = (ovf_sel % 4 == 0 && g.overflow_fits(key.len())).then(|| Ovf {
+                    pgno: n as u32 + 9,
+                    txn: 0xC0FF_EE00 | n as u32,
+                    len: (g.max_value(key.len()) + 1) as u32,
+                });
+                let leaf = LeafMut::new(&mut page).unwrap();
+                let fit = match ovf {
+                    Some(ovf) => leaf.insert(model.len(), &key, Val::Overflow(ovf)),
+                    None => leaf.insert(model.len(), &key, value.as_slice()),
+                };
+                if fit.unwrap() == Fit::Full {
+                    break;
+                }
+                let val = ovf.map_or(Val::Inline(&[]), Val::Overflow);
+                model.push((key, val, value));
+            }
+            validate(&page, &g).unwrap();
+            for (i, (key, val, value)) in model.iter().enumerate() {
+                let klen = key.len();
+                for t in [0, klen, klen + 1 + tsel % 50, tsel % (klen + 1)] {
+                    let (got_key, tail) = leaf_entry_with_key_tail(&page, i, t).unwrap();
+                    prop_assert_eq!(got_key, key.as_slice());
+                    match (tail, val) {
+                        (Val::Inline(joined), Val::Inline(_)) => {
+                            let want = [&key[klen - t.min(klen)..], value.as_slice()].concat();
+                            prop_assert_eq!(joined, want.as_slice(), "cell {}, t {}", i, t);
+                        }
+                        (tail, val) => prop_assert_eq!(tail, *val, "cell {}, t {}", i, t),
+                    }
+                    assert_key_tail_matches(&page, i, t);
                 }
             }
         }

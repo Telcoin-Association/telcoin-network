@@ -11,6 +11,11 @@
 //! file: a file that is shorter than the chosen meta's page count, not a tndb-b file, or whose
 //! catalog or free-tree root fails its checks fails closed, unchanged.
 //!
+//! [`Env::open_read_only`] opens an existing file no writer holds (`O_RDONLY`, a shared
+//! `flock`), chooses the meta and checks the roots exactly as [`Env::open`] does, and maps the
+//! file read-only. It never creates, writes or syncs anything; it has no writer, so its snapshot
+//! is the one it opened at.
+//!
 //! ## Commits
 //!
 //! A commit (see `RwTxn::commit`) stamps the CRC of every page the transaction wrote, makes
@@ -50,14 +55,15 @@ use std::{
 use parking_lot::{Condvar, Mutex, RwLock};
 
 use crate::{
-    alloc::Allocator,
+    alloc::{Allocator, RUN_LOAD_RECORDS},
     check::{self, CheckReport},
     crc::{self, CrcState},
     error::{Error, Result},
-    file::{MapView, PageFile, DEFAULT_RESERVE},
+    file::{MapView, PageFile, ReadOnlyFile, DEFAULT_RESERVE},
     freelist,
     latch::{Latch, UnwindLatch},
-    meta::{choose_meta, slot_to_write, Meta, META_LEN},
+    meta::{choose_meta, slot_to_write, Chosen, Meta, META_LEN},
+    overflow::{checked_run, Ovf, RunCrc},
     page::{self, Geometry, Kind},
     page_set::PageSet,
     sys,
@@ -100,7 +106,8 @@ pub enum SyncMode {
     NoSync,
 }
 
-/// How [`Env::open`] opens (or creates) a file.
+/// How [`Env::open`] opens (or creates) a file. [`Env::open_read_only`] validates `page_size` as
+/// [`Env::open`] does and uses no other field: it maps the file at its length and commits nothing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct EnvOptions {
     /// The page size of a new file: a power of two in 4 KiB..=64 KiB (default 4096). An
@@ -158,6 +165,16 @@ pub(crate) struct Snapshot {
     pub(crate) view: Arc<MapView>,
 }
 
+impl Snapshot {
+    /// Page `pgno` again, without the per-fetch checks, for a cursor that fetched it with them
+    /// before: the snapshot's pages do not change while it lives. `None` if it is not mapped.
+    #[inline]
+    pub(crate) fn page_again(&self, pgno: u32) -> Option<&[u8]> {
+        let size = self.geometry.page_size();
+        self.view.slice(u64::from(pgno) * size as u64, size)
+    }
+}
+
 impl PageRead for Snapshot {
     fn geometry(&self) -> Geometry {
         self.geometry
@@ -180,6 +197,13 @@ impl PageRead for Snapshot {
             self.view.slice(u64::from(p) * size as u64, size)
         })
     }
+
+    fn run(&self, ovf: Ovf, verify: RunCrc) -> Result<&[u8]> {
+        let size = self.geometry.page_size();
+        checked_run(ovf, size, self.meta.page_count, self.meta.txn, false, verify, |p, len| {
+            self.view.slice(u64::from(p) * size as u64, len)
+        })
+    }
 }
 
 /// What every handle and transaction of one environment shares.
@@ -193,19 +217,54 @@ pub(crate) struct EnvInner {
     pub(crate) latch: Latch,
     /// The newest committed state, which a new reader starts from.
     current: RwLock<Arc<Snapshot>>,
-    /// The writer's state while no write transaction holds it.
+    /// The writer's state while no write transaction holds it (always empty in a read-only
+    /// environment, which [`Self::writable`] refuses first).
     writer: Mutex<Option<Box<Writer>>>,
     /// Signalled whenever the writer's state comes back.
     writer_back: Condvar,
+    /// A read-only environment's mapping ([`Env::open_read_only`]); `None` in one with a writer,
+    /// whose page file the writer's state holds.
+    read_only: Option<ReadOnlyFile>,
     /// Test-only: drop as a crash would, without the final sync.
     #[cfg(test)]
     pub(crate) crash_on_drop: std::sync::atomic::AtomicBool,
 }
 
 impl EnvInner {
+    /// A new environment's shared state: `snapshot` is its current state, and `writer` its
+    /// writer's state, or `None` with `read_only` set.
+    fn new(
+        geometry: Geometry,
+        sync_mode: SyncMode,
+        snapshot: Arc<Snapshot>,
+        writer: Option<Box<Writer>>,
+        read_only: Option<ReadOnlyFile>,
+    ) -> Self {
+        Self {
+            geometry,
+            sync_mode,
+            latch: Latch::default(),
+            current: RwLock::new(snapshot),
+            writer: Mutex::new(writer),
+            writer_back: Condvar::new(),
+            read_only,
+            #[cfg(test)]
+            crash_on_drop: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
     /// The newest committed state.
     pub(crate) fn current(&self) -> Arc<Snapshot> {
         Arc::clone(&self.current.read())
+    }
+
+    /// `Err(ReadOnly)` in a read-only environment: it has no writer, so whatever needs one
+    /// checks this before waiting for it.
+    fn writable(&self) -> Result<()> {
+        if self.read_only.is_some() {
+            return Err(Error::ReadOnly);
+        }
+        Ok(())
     }
 
     /// Take the writer's state, waiting while a write transaction holds it (with `wait`), else
@@ -254,7 +313,8 @@ impl Drop for EnvInner {
         if self.sync_mode != SyncMode::NoSync || self.latch.is_failed() {
             return;
         }
-        // Every transaction holds a reference to this, so the writer's state is home.
+        // Every transaction holds a reference to this, so the writer's state is home (a
+        // read-only environment has none, and is never `NoSync`).
         if let Some(writer) = self.writer.get_mut().as_mut() {
             if let Err(e) = writer.sync(&self.latch) {
                 tracing::error!(target: "tndb_b", "the final sync failed: {e}");
@@ -310,6 +370,16 @@ pub(crate) struct Writer {
     /// write-path cache (`write::PathCache`) first, so none is used.
     #[cfg(test)]
     pub(crate) no_path_cache: bool,
+    /// Test-only: deletes do not merge under-full pages (`PageWrite::no_merge`).
+    #[cfg(test)]
+    pub(crate) no_merge: bool,
+    /// Test-only: the deletes whose merges absorbed a sibling (`PageWrite::merges_applied`).
+    #[cfg(test)]
+    pub(crate) merging_deletes: u64,
+    /// Test-only: the most pages one free record lists, in place of
+    /// [`freelist::record_capacity`], so a commit writes many small records.
+    #[cfg(test)]
+    pub(crate) record_pages: Option<usize>,
 }
 
 /// Test-only: a point of the commit protocol (see the env module docs) at which
@@ -335,15 +405,16 @@ pub(crate) enum CrashAt {
 }
 
 impl Writer {
-    /// Stamp the CRC of every page the transaction wrote (commit step 3) and return them,
-    /// ascending; they then count as stamped by this writer.
+    /// Stamp the CRCs of what the transaction wrote (commit step 3): each tree page's, and one
+    /// over each overflow run ([`crate::alloc::PrivatePages::units`]). Returns every page written,
+    /// ascending, for the data sync; the tree pages then count as stamped by this writer.
     pub(crate) fn stamp_private(&mut self) -> Result<Vec<u32>> {
         let size = self.geometry.page_size();
-        let pages = self.alloc.stamp_private();
-        for &p in &pages {
-            crc::add_crc32_nonzero(self.file.page_mut(p, size)?);
+        let private = self.alloc.stamp_private();
+        for (p, n) in private.units() {
+            crc::add_crc32_nonzero(self.file.pages_mut(p, size, n as usize * size)?);
         }
-        Ok(pages)
+        Ok(private.pages)
     }
 
     /// Record pages stamped by a [`SyncMode::NoSync`] commit, for the next sync.
@@ -465,19 +536,36 @@ impl Writer {
         durable.min(self.oldest_reader_txn())
     }
 
-    /// Refill the empty pool from the free list of the transaction's base state: records are
-    /// taken smallest first while their txn passes [`Self::reuse_gate`], until one lists a page
-    /// (records may be empty). The first record past the gate, or the end of the list, stops
-    /// loading for the rest of the transaction. A damaged record is [`Error::Corrupt`] and none
-    /// of its pages is taken.
+    /// Refill the empty pool from the free list of the transaction's base state ([`Self::load`]),
+    /// until a record lists a page (records may be empty). Out of line: the allocations call it
+    /// only when the pool is empty.
+    #[cold]
+    #[inline(never)]
     fn refill(&mut self) -> Result<()> {
+        self.load(|alloc, _| !alloc.wants_refill())
+    }
+
+    /// Run allocation's step 2 (see the `alloc` module docs): load more free records until the
+    /// pool holds `n` consecutive pages or [`RUN_LOAD_RECORDS`] records are loaded.
+    fn load_for_run(&mut self, n: u32) -> Result<()> {
+        self.load(|alloc, records| records >= RUN_LOAD_RECORDS || alloc.pool_fits(n))
+    }
+
+    /// Load records of the free list of the transaction's base state into the pool, smallest
+    /// first while their txn passes [`Self::reuse_gate`], until `enough(allocator, records
+    /// loaded)`. The first record past the gate, or the end of the list, stops loading for the
+    /// rest of the transaction. A damaged record is [`Error::Corrupt`] and none of its pages is
+    /// taken.
+    fn load(&mut self, mut enough: impl FnMut(&mut Allocator, u32) -> bool) -> Result<()> {
         let gate = self.reuse_gate();
         let (free, page_count) = (self.last.free, self.last.page_count);
-        while self.alloc.wants_refill() {
+        let mut records = 0;
+        while self.alloc.loading() && !enough(&mut self.alloc, records) {
             let after = self.alloc.last_consumed();
             match freelist::next_record(&*self, &free, after)? {
                 Some((key, value)) if key.txn <= gate => {
                     let pages = freelist::decode_pages(value, page_count)?;
+                    records += 1;
                     self.alloc.load_record(key, pages)?;
                 }
                 _ => self.alloc.stop_loading(),
@@ -522,6 +610,19 @@ impl PageRead for Writer {
             self.alloc.txn(),
             self.alloc.is_private(pgno),
             |p| self.file.page(p, size),
+        )
+    }
+
+    fn run(&self, ovf: Ovf, verify: RunCrc) -> Result<&[u8]> {
+        let size = self.geometry.page_size();
+        checked_run(
+            ovf,
+            size,
+            self.alloc.page_count(),
+            self.alloc.txn(),
+            self.alloc.is_private_run(ovf.pgno),
+            verify,
+            |p, len| self.file.pages(p, size, len),
         )
     }
 }
@@ -572,12 +673,69 @@ impl PageWrite for Writer {
         self.alloc.free(pgno);
     }
 
+    fn run_privacy(&self, pgno: u32, npages: u32) -> Option<bool> {
+        self.alloc.run_privacy(pgno, npages)
+    }
+
+    /// The run allocation policy (see the `alloc` module docs): step 2 here, the others in
+    /// [`Allocator::allocate_run`]. Records loaded stay loaded if the allocation then fails, as a
+    /// refill's do; the failure latches, and the abort returns them.
+    fn alloc_run(&mut self, npages: u32) -> Result<u32> {
+        if self.alloc.wants_refill() {
+            self.refill()?;
+        }
+        let loads = self.alloc.loading() && !self.alloc.pool_fits(npages);
+        if loads {
+            self.load_for_run(npages)?;
+        }
+        let size = self.geometry.page_size();
+        let file = &mut self.file;
+        #[cfg(test)]
+        let end = self.alloc.page_count();
+        let p = self
+            .alloc
+            .allocate_run(npages, |count| file.ensure_len(u64::from(count) * size as u64))?;
+        #[cfg(test)]
+        {
+            let step = match (p.saturating_add(npages) <= end, p < end) {
+                (true, _) => usize::from(loads),
+                (false, true) => 2,
+                (false, false) => 3,
+            };
+            self.alloc.run_stats.steps[step] += 1;
+        }
+        Ok(p)
+    }
+
+    fn run_mut(&mut self, pgno: u32, npages: u32) -> Result<&mut [u8]> {
+        if self.alloc.run_privacy(pgno, npages) != Some(true) {
+            return Err(not_private(pgno));
+        }
+        let size = self.geometry.page_size();
+        self.file.pages_mut(pgno, size, npages as usize * size)
+    }
+
+    fn free_run(&mut self, pgno: u32, npages: u32) {
+        self.alloc.free_run(pgno, npages);
+    }
+
     fn take_scratch(&mut self) -> Scratch {
         std::mem::take(&mut self.scratch)
     }
 
     fn put_scratch(&mut self, scratch: Scratch) {
         self.scratch = scratch;
+    }
+
+    #[cfg(test)]
+    fn no_merge(&self) -> bool {
+        self.no_merge
+    }
+
+    #[cfg(test)]
+    fn merges_applied(&mut self, report: crate::tree::write::MergeReport) {
+        let crate::tree::write::MergeReport { leaf_left, leaf_right, branches, .. } = report;
+        self.merging_deletes += u64::from(leaf_left + leaf_right + branches > 0);
     }
 }
 
@@ -631,30 +789,13 @@ impl Env {
         let path = path.as_ref();
         Geometry::new(options.page_size)?;
         let file = open_locked(path, options.page_size)?;
-        let chosen = choose_meta(|offset| read_record(&file, offset))?;
+        let (chosen, geometry) = choose_state(&file)?;
         let meta = chosen.meta;
-        let geometry = Geometry::new(meta.page_size)?;
-        if meta.txn == u64::MAX {
-            return Err(Error::Corrupt("open: the meta's txn id leaves no next txn".to_string()));
-        }
-        let needed = u64::from(meta.page_count) * u64::from(meta.page_size);
-        let len = file.metadata()?.len();
-        if len < needed {
-            return Err(Error::Corrupt(format!(
-                "open: the file is {len} bytes, shorter than the {} pages of its newest meta (txn \
-                 {})",
-                meta.page_count, meta.txn
-            )));
-        }
         // A crash may have left a meta in the page cache whose msync never finished: make what
         // this open reads durable before anything is built on it.
         sys::fsync_file(&file)?;
         let file = PageFile::from_file(file, options.map_reserve)?;
-        let view = file.view();
-        view.publish_len(needed);
-        let snapshot = Arc::new(Snapshot { meta, geometry, view });
-        check_root(&snapshot, &meta.catalog, "catalog")?;
-        check_root(&snapshot, &meta.free, "free tree")?;
+        let snapshot = checked_snapshot(meta, geometry, file.view())?;
         let writer = Writer {
             file,
             geometry,
@@ -677,19 +818,38 @@ impl Env {
             data_by_msync: false,
             #[cfg(test)]
             no_path_cache: false,
+            #[cfg(test)]
+            no_merge: false,
+            #[cfg(test)]
+            merging_deletes: 0,
+            #[cfg(test)]
+            record_pages: None,
         };
-        Ok(Env {
-            inner: Arc::new(EnvInner {
-                geometry,
-                sync_mode: options.sync,
-                latch: Latch::default(),
-                current: RwLock::new(snapshot),
-                writer: Mutex::new(Some(Box::new(writer))),
-                writer_back: Condvar::new(),
-                #[cfg(test)]
-                crash_on_drop: std::sync::atomic::AtomicBool::new(false),
-            }),
-        })
+        let inner = EnvInner::new(geometry, options.sync, snapshot, Some(Box::new(writer)), None);
+        Ok(Env { inner: Arc::new(inner) })
+    }
+
+    /// Open the existing database file at `path` read-only, for a process that reads it while no
+    /// writer has it open (a tool run while the node is stopped). It takes a shared lock, so
+    /// read-only opens coexist and exclude [`Self::open`]; chooses the meta and checks the roots
+    /// as [`Self::open`] does; and maps the file read-only. It never creates, writes or syncs
+    /// anything, and has no writer: [`Self::begin_rw`] and [`Self::try_begin_rw`] return
+    /// [`Error::ReadOnly`], [`Self::sync`] does nothing, and every reader sees the state opened
+    /// at. Reads, [`Self::check`] and [`Self::stat`] work as in any environment, and damage a
+    /// read finds latches it (see the module docs).
+    ///
+    /// Errors: as [`Self::open`]'s, except that a missing file is [`Error::Io`] (`NotFound`) and
+    /// an empty one [`Error::NotTndbB`]; [`Error::Locked`] if a handle with a writer holds it.
+    /// `options.page_size` is validated as [`Self::open`] validates it; no other field applies.
+    pub fn open_read_only(path: impl AsRef<Path>, options: EnvOptions) -> Result<Env> {
+        Geometry::new(options.page_size)?;
+        let file = open_shared(path.as_ref())?;
+        let (chosen, geometry) = choose_state(&file)?;
+        // No sync, unlike `open`: nothing is built on what this open reads.
+        let file = ReadOnlyFile::from_file(file)?;
+        let snapshot = checked_snapshot(chosen.meta, geometry, file.view())?;
+        let inner = EnvInner::new(geometry, SyncMode::Durable, snapshot, None, Some(file));
+        Ok(Env { inner: Arc::new(inner) })
     }
 
     /// Begin a read-only transaction on the newest committed state. It sees that state of every
@@ -699,26 +859,33 @@ impl Env {
     }
 
     /// Begin the write transaction, waiting while another one is open (from any thread: a
-    /// thread that holds one and calls this waits forever). [`Error::Failed`] once the
-    /// environment has latched a failure.
+    /// thread that holds one and calls this waits forever). [`Error::ReadOnly`] in an
+    /// environment opened read-only, latched or not; [`Error::Failed`] once the environment has
+    /// latched a failure.
     pub fn begin_rw(&self) -> Result<RwTxn> {
+        self.inner.writable()?;
         self.inner.latch.check()?;
         let writer = self.inner.take_writer(true).expect("a waiting take returns the writer");
         Ok(RwTxn::new(Arc::clone(&self.inner), writer))
     }
 
-    /// Begin the write transaction if no other one is open, else `None`. [`Error::Failed`] once
-    /// the environment has latched a failure.
+    /// Begin the write transaction if no other one is open, else `None`. [`Error::ReadOnly`] in
+    /// an environment opened read-only, latched or not; [`Error::Failed`] once the environment
+    /// has latched a failure.
     pub fn try_begin_rw(&self) -> Result<Option<RwTxn>> {
+        self.inner.writable()?;
         self.inner.latch.check()?;
         Ok(self.inner.take_writer(false).map(|w| RwTxn::new(Arc::clone(&self.inner), w)))
     }
 
     /// Make every commit durable: in [`SyncMode::NoSync`], sync the pages committed since the
     /// last sync and write the newest state's meta (a no-op when nothing is pending, and always
-    /// in [`SyncMode::Durable`]). Waits while a write transaction is open, as
-    /// [`Self::begin_rw`] does. A failure latches the environment.
+    /// in [`SyncMode::Durable`] and in an environment opened read-only). Waits while a write
+    /// transaction is open, as [`Self::begin_rw`] does. A failure latches the environment.
     pub fn sync(&self) -> Result<()> {
+        if self.inner.writable().is_err() {
+            return Ok(());
+        }
         let latch = &self.inner.latch;
         self.inner.with_writer(|writer| {
             latch.check()?;
@@ -728,11 +895,13 @@ impl Env {
 
     /// Check the newest committed state in full: every page of every tree passes its CRC and
     /// structure checks, is the copy its parent names, lies at the depth its kind says, and holds
-    /// keys inside its ancestors' separators; every tree holds the entries its root counts; every
-    /// free record is well formed; and the pages reachable from the trees and those the free list
-    /// lists are disjoint and cover `2..page_count` exactly. Any failure is [`Error::Corrupt`]
-    /// naming the damage, or the pages leaked (used by nothing) and used twice, and latches the
-    /// environment. It reads through a snapshot, alongside readers and the writer.
+    /// keys inside its ancestors' separators; every overflow run a leaf names passes its header,
+    /// identity and full CRC checks with a zero pad; every tree holds the entries and the pages of
+    /// each kind its root counts; every free record is well formed; and the pages reachable from
+    /// the trees (their runs' included) and those the free list lists are disjoint and cover
+    /// `2..page_count` exactly. Any failure is [`Error::Corrupt`] naming the damage, or the pages
+    /// leaked (used by nothing) and used twice, and latches the environment. It reads through a
+    /// snapshot, alongside readers and the writer.
     pub fn check(&self) -> Result<CheckReport> {
         let inner = &self.inner;
         check::check_snapshot(&inner.current()).inspect_err(|e| inner.latch.latch_error(e))
@@ -749,8 +918,34 @@ impl Env {
         }
     }
 
+    /// The pages the free list of the newest committed state holds: pages a later write may
+    /// reuse, once no reader needs them (MDBX's `freelist`). It reads every free record, with the
+    /// checks the allocator's reads make; damage is [`Error::Corrupt`] and latches the
+    /// environment.
+    pub fn free_pages(&self) -> Result<u64> {
+        let inner = &self.inner;
+        let snapshot = inner.current();
+        let mut pages = 0;
+        let mut after = None;
+        let counted = loop {
+            match freelist::next_record(&*snapshot, &snapshot.meta.free, after) {
+                Ok(Some((key, value))) => {
+                    match freelist::decode_pages(value, snapshot.meta.page_count) {
+                        Ok(listed) => pages += listed.len() as u64,
+                        Err(e) => break Err(e),
+                    }
+                    after = Some(key);
+                }
+                Ok(None) => break Ok(pages),
+                Err(e) => break Err(e),
+            }
+        };
+        counted.inspect_err(|e| inner.latch.latch_error(e))
+    }
+
     /// The first failure the environment latched, if any: from then on writes and commits
-    /// return [`Error::Failed`] (reads continue) until the file is reopened.
+    /// return [`Error::Failed`] (reads continue) until the file is reopened. A read-only
+    /// environment latches damage its reads find too, though it has no writer to stop.
     pub fn failure(&self) -> Option<String> {
         self.inner.latch.failure()
     }
@@ -760,11 +955,14 @@ impl Env {
         self.inner.geometry.max_key()
     }
 
-    /// The longest value this page size accepts with a `klen`-byte key, or 0 when `klen` is over
-    /// [`max_key_len`](Self::max_key_len): such a key is refused with any value. Every accepted
-    /// key leaves room for at least 2 bytes, so 0 always means the key is refused.
+    /// The longest value a table accepts with a `klen`-byte key: 16 MiB (stored in an overflow
+    /// run) when the key leaves room for the run's 12-byte reference in its leaf, which every key
+    /// up to 10 bytes short of [`max_key_len`](Self::max_key_len) does; else the longest value its
+    /// leaf holds; 0 when `klen` is over [`max_key_len`](Self::max_key_len): such a key is refused
+    /// with any value. Every accepted key leaves room for at least 2 bytes, so 0 always means the
+    /// key is refused.
     pub fn max_value_len(&self, klen: usize) -> usize {
-        self.inner.geometry.max_value(klen)
+        self.inner.geometry.max_table_value(klen)
     }
 
     /// Test-only: the environment's shared state.
@@ -776,6 +974,7 @@ impl Env {
     /// Test-only: run `f` on the writer's state (waiting for an open write transaction).
     #[cfg(test)]
     pub(crate) fn with_writer<T>(&self, f: impl FnOnce(&mut Writer) -> T) -> T {
+        assert!(self.inner.read_only.is_none(), "a read-only environment has no writer");
         self.inner.with_writer(f)
     }
 
@@ -811,6 +1010,31 @@ fn open_locked(path: &Path, page_size: u32) -> Result<File> {
                 if locked.len() > 0 {
                     return Ok(file);
                 }
+            }
+            Ok(_) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Err(Error::Locked)
+}
+
+/// Open and lock the existing database file at `path` read-only (a read-only open's steps 2–3):
+/// `O_RDONLY`, then a shared lock, else [`Error::Locked`] (a handle with a writer holds the file).
+/// As in [`open_locked`], the lock must end up on the file the path names: a creator may rename a
+/// new file over a missing or empty path between this open and its lock, so the open is retried
+/// (a few times; then [`Error::Locked`]). A missing file is [`Error::Io`] (`NotFound`), and an
+/// empty one is left to [`choose_meta`], which finds no meta in it: [`Error::NotTndbB`].
+fn open_shared(path: &Path) -> Result<File> {
+    for _ in 0..3 {
+        let file = OpenOptions::new().read(true).open(path)?;
+        if !sys::flock_shared(&file)? {
+            return Err(Error::Locked);
+        }
+        let locked = file.metadata()?;
+        match fs::metadata(path) {
+            Ok(named) if named.ino() == locked.ino() && named.dev() == locked.dev() => {
+                return Ok(file);
             }
             Ok(_) => {}
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
@@ -871,6 +1095,37 @@ fn remove_unused(tmp: &Path, file: &File) {
     if named.ino() == held.ino() && named.dev() == held.dev() && held.len() == 0 {
         let _ = fs::remove_file(tmp);
     }
+}
+
+/// Choose the state an open recovers from `file`, locked (open steps 4–6): the newest valid meta
+/// ([`choose_meta`]) and its geometry, refusing a txn id with no next one and a file shorter than
+/// the meta's pages. Reads only.
+fn choose_state(file: &File) -> Result<(Chosen, Geometry)> {
+    let chosen = choose_meta(|offset| read_record(file, offset))?;
+    let meta = chosen.meta;
+    let geometry = Geometry::new(meta.page_size)?;
+    if meta.txn == u64::MAX {
+        return Err(Error::Corrupt("open: the meta's txn id leaves no next txn".to_string()));
+    }
+    let needed = u64::from(meta.page_count) * u64::from(meta.page_size);
+    let len = file.metadata()?.len();
+    if len < needed {
+        return Err(Error::Corrupt(format!(
+            "open: the file is {len} bytes, shorter than the {} pages of its newest meta (txn {})",
+            meta.page_count, meta.txn
+        )));
+    }
+    Ok((chosen, geometry))
+}
+
+/// The snapshot of the state `meta` names, read through `view` (the file mapped by open step 8),
+/// once both its tree roots pass [`check_root`] (open step 9).
+fn checked_snapshot(meta: Meta, geometry: Geometry, view: Arc<MapView>) -> Result<Arc<Snapshot>> {
+    view.publish_len(u64::from(meta.page_count) * u64::from(meta.page_size));
+    let snapshot = Arc::new(Snapshot { meta, geometry, view });
+    check_root(&snapshot, &meta.catalog, "catalog")?;
+    check_root(&snapshot, &meta.free, "free tree")?;
+    Ok(snapshot)
 }
 
 /// The meta record at `offset` of `file`, or `None` if the file ends before it.

@@ -1,5 +1,6 @@
 //! Thin wrappers over the system calls the page file needs: file and directory syncs, block
-//! preallocation, the OS page size and the exclusive open lock.
+//! preallocation, the OS page size and the open locks (exclusive for a writer, shared for a
+//! read-only open).
 //!
 //! **macOS.** Neither `msync` nor `fsync` is a full power-loss barrier there (that needs
 //! `F_FULLFSYNC`, a flush of the whole drive's write cache). Commits are `msync`, so every other
@@ -160,10 +161,22 @@ pub(crate) fn os_page_size() -> u64 {
 
 /// Take an exclusive, non-blocking `flock` on `file`, held until every descriptor of its open file
 /// description is closed (a crash releases it with the process). `Ok(false)` when another open of
-/// the file (from this process or another) already holds it.
+/// the file (from this process or another) already holds it, exclusive or shared.
 pub(crate) fn flock_exclusive(file: &File) -> io::Result<bool> {
+    flock(file, libc::LOCK_EX)
+}
+
+/// Take a shared, non-blocking `flock` on `file` (a read-only open's), held as
+/// [`flock_exclusive`]'s is. Any number of opens hold it together. `Ok(false)` when another open
+/// of the file (from this process or another) holds it exclusive.
+pub(crate) fn flock_shared(file: &File) -> io::Result<bool> {
+    flock(file, libc::LOCK_SH)
+}
+
+/// `flock(file, op | LOCK_NB)`: `Ok(false)` when it would block.
+fn flock(file: &File, op: libc::c_int) -> io::Result<bool> {
     // SAFETY: `flock` on a valid, open file descriptor borrowed for the call.
-    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+    if unsafe { libc::flock(file.as_raw_fd(), op | libc::LOCK_NB) } == 0 {
         return Ok(true);
     }
     let e = io::Error::last_os_error();
@@ -190,6 +203,24 @@ mod tests {
         assert!(!flock_exclusive(&second).expect("try lock"), "a second open must not get it");
         drop(first);
         assert!(flock_exclusive(&second).expect("lock"), "free once the first open closes");
+    }
+
+    /// Shared locks coexist; an exclusive one excludes them and they exclude it.
+    #[test]
+    fn flock_shared_coexists_and_excludes_an_exclusive_lock() {
+        let tmp = tempfile::TempDir::with_prefix("tndb_b_flock_sh").expect("temp dir");
+        let path = tmp.path().join("db");
+        let writer = File::create(&path).expect("create");
+        let (a, b) = (File::open(&path).expect("open"), File::open(&path).expect("open"));
+        assert!(flock_exclusive(&writer).expect("lock"));
+        assert!(!flock_shared(&a).expect("try lock"), "an exclusive lock excludes a shared one");
+        drop(writer);
+        assert!(flock_shared(&a).expect("lock"), "free once the exclusive holder closes");
+        assert!(flock_shared(&b).expect("lock"), "shared locks coexist");
+        let writer = File::open(&path).expect("open");
+        assert!(!flock_exclusive(&writer).expect("try lock"), "a shared lock excludes a writer");
+        drop((a, b));
+        assert!(flock_exclusive(&writer).expect("lock"), "free once every reader closes");
     }
 
     /// `allocate_range` reserves real blocks for the whole range, not a sparse hole.

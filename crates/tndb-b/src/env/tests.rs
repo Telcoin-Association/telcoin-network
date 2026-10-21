@@ -73,10 +73,11 @@ fn create_and_reopen_at_every_page_size() {
         let (_dir, path) = temp();
         let env = Env::open(&path, options(p, SyncMode::Durable)).expect("create");
         let geometry = Geometry::new(p).expect("geometry");
-        assert_eq!(
-            (env.max_key_len(), env.max_value_len(8)),
-            (geometry.max_key(), geometry.max_value(8))
-        );
+        // A short key takes a value up to 16 MiB (in an overflow run); a key too long for an
+        // overflow cell takes its leaf's limit.
+        assert_eq!((env.max_key_len(), env.max_value_len(8)), (geometry.max_key(), 16 << 20));
+        let longest = env.max_key_len();
+        assert_eq!(env.max_value_len(longest), geometry.max_value(longest));
         // A key over the limit has no value limit: it is refused even with an empty value.
         assert_eq!(env.max_value_len(env.max_key_len() + 1), 0);
         assert!(env.max_value_len(env.max_key_len()) > 0);
@@ -233,7 +234,7 @@ fn readers_keep_their_snapshot_of_every_table() {
 
     let new = env.begin_ro().expect("ro");
     assert_eq!(val(&new, &tables[0], &7_u32.to_be_bytes()).as_deref(), Some(&b"new"[..]));
-    assert_eq!(new.table_stat(&tables[1]).expect("stat"), TableStat { entries: 0, height: 0 });
+    assert_eq!(new.table_stat(&tables[1]).expect("stat"), TableStat::default());
     assert!(matches!(new.get(&tables[2], b"k"), Err(Error::StaleTable(_))));
     assert_eq!(val(&new, &d, b"k").as_deref(), Some(&b"v"[..]));
     assert_eq!(env.failure(), None);
@@ -351,11 +352,15 @@ fn damaged_metas_and_roots_fail_closed() {
     assert_fails_closed(&path, |e| matches!(e, Error::Corrupt(m) if m.contains("catalog root")));
     file.write_all_at(&original, u64::from(catalog_root.root) * 4096).expect("restore");
     drop(open(&path));
-    // The newest meta says the catalog has two levels, but its root is a leaf.
+    // The newest meta says the catalog has two levels, but its root is a leaf. The counters
+    // (one branch and two leaves at 56 and 60) keep the root's shape possible, so the meta
+    // decodes and open's root check is what refuses it.
     let mut record = [0; META_LEN];
     file.read_exact_at(&mut record, 0).expect("read");
     let original = record;
     record[40] = 2;
+    record[56] = 1;
+    record[60] = 2;
     let crc = crc::crc32(&record[..124]);
     record[124..].copy_from_slice(&crc.to_le_bytes());
     file.write_all_at(&record, 0).expect("write");
@@ -667,6 +672,87 @@ fn begin_rw_waits_for_the_open_writer() {
     assert!(env.try_begin_rw().expect("try").is_some());
 }
 
+/// The first page of each overflow run of a `len`-byte value in the file at `path` (a page whose
+/// header names itself, kind 3 and that length), for a test to damage.
+fn runs_of_len(path: &Path, page_size: usize, len: usize) -> Vec<usize> {
+    let bytes = fs::read(path).expect("read");
+    let u32_at = |off: usize| u32::from_le_bytes(bytes[off..off + 4].try_into().expect("4 bytes"));
+    (2..bytes.len() / page_size)
+        .filter(|&p| {
+            let at = p * page_size;
+            bytes[at + 4] == crate::overflow::KIND_RUN
+                && u32_at(at) as usize == p
+                && u32_at(at + 16) as usize == len
+        })
+        .collect()
+}
+
+/// A value of several pages put through a write transaction reads back byte for byte: from the
+/// writer's own private run, from a snapshot of the commit, after a reopen, and from the next
+/// writer (a published run); a replace by another multi-page value too. `Env::check` counts the
+/// runs. A flipped byte in a run's middle page is then `Corrupt` to a reader, to the writer and
+/// to `Env::check`.
+#[test]
+fn a_multi_page_value_reads_back_after_commit_and_reopen() {
+    for p in PAGE_SIZES {
+        let (_dir, path) = temp();
+        let env = Env::open(&path, options(p, SyncMode::Durable)).expect("create");
+        let value = |len: usize, salt: usize| -> Vec<u8> {
+            (0..len).map(|i| ((i * 31 + salt) % 251) as u8).collect()
+        };
+        let (big, bigger) = (value(3 * p as usize + 123, 1), value(5 * p as usize - 28, 2));
+        let mut txn = env.begin_rw().expect("begin");
+        let t = txn.create_table("t").expect("table");
+        txn.put(&t, b"big", &big).expect("put");
+        txn.put(&t, b"small", b"s").expect("put");
+        assert_eq!(val(&txn, &t, b"big").as_ref(), Some(&big), "{p}: the private run");
+        txn.commit().expect("commit");
+        let ro = env.begin_ro().expect("ro");
+        assert_eq!(val(&ro, &table(&ro, "t"), b"big").as_ref(), Some(&big), "{p}: a snapshot");
+        drop(ro);
+        drop(env);
+
+        let env = open(&path);
+        let ro = env.begin_ro().expect("ro");
+        let t = table(&ro, "t");
+        assert_eq!(val(&ro, &t, b"big").as_ref(), Some(&big), "{p}: after a reopen");
+        assert_eq!(ro.table_stat(&t).expect("stat").overflow_pages, 4, "{p}: a 4-page run");
+        drop(ro);
+        let mut txn = env.begin_rw().expect("begin");
+        assert_eq!(val(&txn, &t, b"big").as_ref(), Some(&big), "{p}: the writer, published");
+        txn.put(&t, b"big", &bigger).expect("replace");
+        txn.commit().expect("commit");
+        env.check().expect("check");
+        drop(env);
+
+        let env = open(&path);
+        let ro = env.begin_ro().expect("ro");
+        let t = table(&ro, "t");
+        assert_eq!(val(&ro, &t, b"big").as_ref(), Some(&bigger), "{p}: the replacement");
+        assert_eq!(ro.table_stat(&t).expect("stat").overflow_pages, 5, "{p}: a 5-page run");
+        drop(ro);
+        drop(env);
+
+        let [run] = runs_of_len(&path, p as usize, bigger.len())[..] else {
+            panic!("{p}: one run of the replacement")
+        };
+        flip(&path, ((run + 2) * p as usize + 10) as u64);
+        // Each probe on a fresh open: the damage it finds latches the environment.
+        let env = open(&path);
+        let ro = env.begin_ro().expect("ro");
+        let got = ro.get(&table(&ro, "t"), b"big").map(drop);
+        assert!(matches!(got, Err(Error::Corrupt(_))), "{p}: a reader: {got:?}");
+        drop((ro, env));
+        let env = open(&path);
+        assert!(matches!(env.check(), Err(Error::Corrupt(_))), "{p}: check");
+        drop(env);
+        let env = open(&path);
+        let txn = env.begin_rw().expect("begin");
+        let got = txn.get(&table(&txn, "t"), b"big").map(drop);
+        assert!(matches!(got, Err(Error::Corrupt(_))), "{p}: the writer: {got:?}");
+    }
+}
+
 /// Entries over the limits are refused without latching; entries at the limits fit.
 #[test]
 fn oversized_entries_do_not_latch() {
@@ -861,4 +947,25 @@ fn remembered_records_serve_only_their_own_handle() {
     assert!(matches!(txn.put(&z, b"k", b"v"), Err(Error::StaleTable(_))));
     assert!(matches!(txn.put(&old, b"k", b"v"), Err(Error::StaleTable(_))));
     assert_eq!(env.failure(), None);
+}
+
+#[test]
+fn free_pages_counts_the_pages_the_free_list_holds() {
+    let (_dir, path) = temp();
+    let env = open(&path);
+    assert_eq!(env.free_pages().unwrap(), env.check().unwrap().free_pages);
+    let entries: Vec<(Vec<u8>, Vec<u8>)> =
+        (0u32..3000).map(|i| (i.to_be_bytes().to_vec(), vec![7u8; 100])).collect();
+    let refs: Vec<(&[u8], &[u8])> =
+        entries.iter().map(|(k, v)| (k.as_slice(), v.as_slice())).collect();
+    put_all(&env, "t", &refs);
+    let mut txn = env.begin_rw().unwrap();
+    let t = table(&txn, "t");
+    for (k, _) in &entries {
+        assert!(txn.delete(&t, k).unwrap());
+    }
+    txn.commit().unwrap();
+    let report = env.check().unwrap();
+    assert!(report.free_pages > report.free_records, "{report:?}");
+    assert_eq!(env.free_pages().unwrap(), report.free_pages);
 }

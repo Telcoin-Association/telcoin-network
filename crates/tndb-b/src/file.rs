@@ -1,5 +1,6 @@
 //! The page file: one file mapped read-write (shared) into a reserved range of address space, the
-//! single writer's page accessors, its durability barriers, and the lock-free readers' view.
+//! single writer's page accessors, its durability barriers, and the lock-free readers' view; and
+//! [`ReadOnlyFile`], a read-only environment's mapping.
 //!
 //! ## Mapping
 //!
@@ -30,6 +31,11 @@
 //! every later write or sync returns [`Error::Failed`] and is never retried (a retried `msync`
 //! after a writeback error can spuriously succeed on Linux errseq, laundering lost data). Reads
 //! continue.
+//!
+//! ## Read-only
+//!
+//! [`ReadOnlyFile`] maps a file opened `O_RDONLY` once, `PROT_READ`, at its length: no
+//! reservation, no growth, no sync. Readers reach it through the same [`MapView`].
 
 use std::{
     fs::File,
@@ -41,7 +47,7 @@ use std::{
     },
 };
 
-use memmap2::{MmapMut, MmapOptions};
+use memmap2::{Mmap, MmapMut, MmapOptions};
 
 use crate::{
     error::{Error, Result},
@@ -252,20 +258,27 @@ impl PageFile {
         Ok(())
     }
 
-    /// The byte offset of page `pgno` of `page_size` bytes, if the whole page lies within the file.
-    fn page_offset(&self, pgno: u32, page_size: usize) -> Option<usize> {
+    /// The byte offset of the `len` bytes from page `pgno` of `page_size` bytes, if they lie
+    /// within the file.
+    fn page_offset(&self, pgno: u32, page_size: usize, len: usize) -> Option<usize> {
         let start = u64::from(pgno) * page_size as u64;
-        (start + page_size as u64 <= self.len).then_some(start as usize)
+        (start + len as u64 <= self.len).then_some(start as usize)
     }
 
     /// Borrow page `pgno` (of `page_size` bytes), or `None` if it lies past the end of the file.
     /// Only that page is borrowed, never the whole mapping.
     pub(crate) fn page(&self, pgno: u32, page_size: usize) -> Option<&[u8]> {
-        let start = self.page_offset(pgno, page_size)?;
-        // SAFETY: the page lies within the file and so within the live mapping (`len <=
-        // map.len()`). Nothing writes it while this shared borrow lives: the only writer is this
-        // file's owner, through `page_mut`, which needs `&mut self`.
-        Some(unsafe { std::slice::from_raw_parts(self.map.as_ptr().add(start), page_size) })
+        self.pages(pgno, page_size, page_size)
+    }
+
+    /// Borrow the `len` bytes from page `pgno` (of `page_size` bytes): an overflow run of
+    /// `len / page_size` pages. `None` if they reach past the end of the file.
+    pub(crate) fn pages(&self, pgno: u32, page_size: usize, len: usize) -> Option<&[u8]> {
+        let start = self.page_offset(pgno, page_size, len)?;
+        // SAFETY: the pages lie within the file and so within the live mapping (`len <=
+        // map.len()`). Nothing writes them while this shared borrow lives: the only writer is
+        // this file's owner, through `pages_mut`, which needs `&mut self`.
+        Some(unsafe { std::slice::from_raw_parts(self.map.as_ptr().add(start), len) })
     }
 
     /// Borrow page `pgno` (of `page_size` bytes) mutably, through the mapping's raw pointer so only
@@ -276,14 +289,26 @@ impl PageFile {
     /// reader ever reads bytes being written.
     #[inline]
     pub(crate) fn page_mut(&mut self, pgno: u32, page_size: usize) -> Result<&mut [u8]> {
-        let start = match self.page_offset(pgno, page_size) {
+        self.pages_mut(pgno, page_size, page_size)
+    }
+
+    /// Borrow the `len` bytes from page `pgno` (of `page_size` bytes) mutably, as
+    /// [`Self::page_mut`] borrows one page: an overflow run the writer is writing.
+    #[inline]
+    pub(crate) fn pages_mut(
+        &mut self,
+        pgno: u32,
+        page_size: usize,
+        len: usize,
+    ) -> Result<&mut [u8]> {
+        let start = match self.page_offset(pgno, page_size, len) {
             Some(start) if !self.is_poisoned() => start,
             _ => return Err(self.page_mut_error(pgno)),
         };
-        // SAFETY: the page lies within the file and so within the live mapping, `&mut self` makes
-        // this the only writer and the only borrow through `self`, and no reader reaches the page
+        // SAFETY: the pages lie within the file and so within the live mapping, `&mut self` makes
+        // this the only writer and the only borrow through `self`, and no reader reaches the pages
         // (see above).
-        Ok(unsafe { std::slice::from_raw_parts_mut(self.map.as_mut_ptr().add(start), page_size) })
+        Ok(unsafe { std::slice::from_raw_parts_mut(self.map.as_mut_ptr().add(start), len) })
     }
 
     /// [`Self::page_mut`]'s error: the poison first, else the page past the end.
@@ -377,6 +402,46 @@ impl Drop for PageFile {
     fn drop(&mut self) {
         // A reader still holding the view finds nothing mapped from now on, rather than a mapping
         // about to go. The mappings (current and retired) unmap as the fields drop.
+        self.view.set_mapping(std::ptr::null(), 0);
+    }
+}
+
+/// A read-only environment's page file (see the module docs): the file, opened read-only and
+/// holding its shared lock, mapped once at its length. Nothing changes the file while it is held,
+/// so readers borrow the mapping through [`MapView`] as they borrow a writer's.
+#[derive(Debug)]
+pub(crate) struct ReadOnlyFile {
+    /// The file, kept open so its shared lock lasts as long as the mapping.
+    _file: File,
+    /// The mapping: shared, read-only, over `[0, file length)`.
+    _map: Mmap,
+    /// The lock-free reader view of the mapping.
+    view: Arc<MapView>,
+}
+
+impl ReadOnlyFile {
+    /// Map all of `file`, opened read-only (the caller has locked it shared and checked that it
+    /// is not empty).
+    pub(crate) fn from_file(file: File) -> Result<Self> {
+        let len = usize::try_from(file.metadata()?.len()).map_err(io::Error::other)?;
+        // SAFETY: the shared lock keeps every tndb-b writer out, so nothing changes the file while
+        // it is mapped (a foreign process truncating it is outside the crate's contract, as for a
+        // writer's mapping), and readers read only the published bytes, inside the file.
+        let map = unsafe { MmapOptions::new().len(len).map(&file) }?;
+        let view = Arc::new(MapView::new());
+        view.set_mapping(map.as_ptr(), map.len() as u64);
+        Ok(Self { _file: file, _map: map, view })
+    }
+
+    /// The lock-free reader view of the mapping (see [`MapView`]).
+    pub(crate) fn view(&self) -> Arc<MapView> {
+        Arc::clone(&self.view)
+    }
+}
+
+impl Drop for ReadOnlyFile {
+    fn drop(&mut self) {
+        // As for `PageFile`: a reader still holding the view finds nothing mapped from now on.
         self.view.set_mapping(std::ptr::null(), 0);
     }
 }
@@ -531,6 +596,32 @@ mod tests {
         assert!(matches!(pf.ensure_len(16 << 20), Err(Error::Failed(_))));
         assert!(matches!(pf.page_mut(0, 4096), Err(Error::Failed(_))));
         assert!(pf.page(0, 4096).expect("reads continue").iter().all(|&b| b == 1));
+    }
+
+    /// A read-only mapping of a file opened read-only (mode 0444 here) reads its bytes up to the
+    /// published length, and maps nothing once dropped.
+    #[test]
+    fn a_read_only_file_maps_its_bytes_until_dropped() {
+        let tmp = TempDir::with_prefix("tndb_b_file_ro").expect("temp dir");
+        let path = tmp.path().join("db");
+        let bytes: Vec<u8> = (0..3 * 4096_u32).map(|i| (i / 4096 + 1) as u8).collect();
+        std::fs::write(&path, &bytes).expect("write");
+        std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o444))
+            .expect("chmod");
+        let file = File::open(&path).expect("open read-only");
+        let ro = ReadOnlyFile::from_file(file).expect("map");
+        let view = ro.view();
+        assert_eq!(view.slice(0, 1), None, "nothing published yet");
+        view.publish_len(2 * 4096);
+        assert!(view.slice(4096, 4096).expect("page 1").iter().all(|&b| b == 2));
+        assert_eq!(view.slice(4096, 4097), None, "past the published length");
+        view.publish_len(3 * 4096);
+        assert!(view.slice(2 * 4096, 4096).expect("page 2").iter().all(|&b| b == 3));
+        view.publish_len(4 * 4096);
+        assert_eq!(view.slice(3 * 4096, 1), None, "past the mapping");
+        drop(ro);
+        assert_eq!(view.slice(0, 1), None, "a dropped file's view maps nothing");
+        assert!(std::fs::read(&path).expect("read") == bytes);
     }
 
     /// A growth that cannot be satisfied fails with an error (never a panic or a wrapped length)

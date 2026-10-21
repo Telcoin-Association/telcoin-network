@@ -10,14 +10,14 @@
 //! | off | size | field |
 //! |---|---|---|
 //! | 0 | 8 | magic `b"tndb-b\0\0"` |
-//! | 8 | 4 | format version (1) |
+//! | 8 | 4 | format version (2) |
 //! | 12 | 4 | page size |
 //! | 16 | 8 | txn id |
 //! | 24 | 4 | page count (pages `0..page_count` are allocated) |
 //! | 28 | 4 | next table id |
-//! | 32 | 24 | catalog [`TreeRoot`] |
-//! | 56 | 24 | free-tree [`TreeRoot`] |
-//! | 80 | 44 | reserved (zero) |
+//! | 32 | 32 | catalog [`TreeRoot`] |
+//! | 64 | 32 | free-tree [`TreeRoot`] |
+//! | 96 | 28 | reserved (zero) |
 //! | 124 | 4 | CRC32 over bytes 0..124 |
 
 use std::io;
@@ -33,7 +33,7 @@ use crate::{
 pub(crate) const MAGIC: [u8; 8] = *b"tndb-b\0\0";
 
 /// The on-disk format version this build reads and writes.
-pub(crate) const FORMAT_VERSION: u32 = 1;
+pub(crate) const FORMAT_VERSION: u32 = 2;
 
 /// The size of a meta record (at offset 0 of its page).
 pub(crate) const META_LEN: usize = 128;
@@ -41,8 +41,14 @@ pub(crate) const META_LEN: usize = 128;
 /// Where the record's CRC32 (over the bytes before it) lies.
 const CRC_AT: usize = 124;
 
-/// The bytes the format reserves (zero in version 1).
-const RESERVED: std::ops::Range<usize> = 80..CRC_AT;
+/// Where the catalog's [`TreeRoot`] lies.
+const CATALOG: std::ops::Range<usize> = 32..32 + TreeRoot::ENCODED_LEN;
+
+/// Where the free tree's [`TreeRoot`] lies.
+const FREE: std::ops::Range<usize> = CATALOG.end..CATALOG.end + TreeRoot::ENCODED_LEN;
+
+/// The bytes the format reserves (zero in version 2).
+const RESERVED: std::ops::Range<usize> = FREE.end..CRC_AT;
 
 /// Every page size a file can have, smallest first: where meta 1 may lie when meta 0 cannot be
 /// read.
@@ -91,8 +97,8 @@ impl Meta {
         out[16..24].copy_from_slice(&self.txn.to_le_bytes());
         out[24..28].copy_from_slice(&self.page_count.to_le_bytes());
         out[28..32].copy_from_slice(&self.next_table_id.to_le_bytes());
-        out[32..56].copy_from_slice(&self.catalog.encode());
-        out[56..80].copy_from_slice(&self.free.encode());
+        out[CATALOG].copy_from_slice(&self.catalog.encode());
+        out[FREE].copy_from_slice(&self.free.encode());
         let crc = crc::crc32(&out[..CRC_AT]);
         out[CRC_AT..].copy_from_slice(&crc.to_le_bytes());
         out
@@ -129,8 +135,8 @@ impl Meta {
             txn: u64::from_le_bytes(rec[16..24].try_into().expect("8 bytes")),
             page_count: u32_at(24),
             next_table_id: u32_at(28),
-            catalog: TreeRoot::decode(rec[32..56].try_into().expect("24 bytes"))?,
-            free: TreeRoot::decode(rec[56..80].try_into().expect("24 bytes"))?,
+            catalog: TreeRoot::decode(rec[CATALOG].try_into().expect("a tree root"))?,
+            free: TreeRoot::decode(rec[FREE].try_into().expect("a tree root"))?,
         };
         if meta.page_count < 2 {
             return corrupt(format!("page count {} leaves no room for the metas", meta.page_count));
@@ -248,7 +254,15 @@ mod tests {
             txn,
             page_count: 9,
             next_table_id: 3,
-            catalog: TreeRoot { root: 5, root_txn: txn as u32, height: 2, entries: 4 },
+            catalog: TreeRoot {
+                root: 5,
+                root_txn: txn as u32,
+                height: 2,
+                entries: 4,
+                branch_pages: 1,
+                leaf_pages: 2,
+                ..TreeRoot::EMPTY
+            },
             ..Meta::initial(page_size)
         }
     }
@@ -282,12 +296,21 @@ mod tests {
     /// The record round-trips, and each kind of damage is refused with its own error.
     #[test]
     fn meta_encoding_round_trips_and_refuses_damage() {
-        let m = Meta {
-            free: TreeRoot { root: 7, root_txn: 1, height: 1, entries: 2 },
-            ..meta(8192, 42)
+        let free = TreeRoot {
+            root: 7,
+            root_txn: 1,
+            height: 1,
+            entries: 2,
+            leaf_pages: 1,
+            overflow_pages: 3,
+            ..TreeRoot::EMPTY
         };
+        let m = Meta { free, ..meta(8192, 42) };
         let rec = m.encode();
         assert_eq!(Meta::decode(&rec).expect("decode"), m);
+        assert_eq!((CATALOG, FREE, RESERVED), (32..64, 64..96, 96..124), "the layout");
+        assert_eq!(rec[CATALOG], m.catalog.encode());
+        assert_eq!(rec[FREE], free.encode());
         assert!(rec[RESERVED].iter().all(|&b| b == 0));
 
         let damaged = |f: &dyn Fn(&mut [u8; META_LEN]), stamp: bool| {
@@ -299,10 +322,20 @@ mod tests {
             Meta::decode(&bad)
         };
         assert!(matches!(damaged(&|r| r[3] ^= 1, true), Err(Error::NotTndbB)));
-        assert!(matches!(damaged(&|r| r[8] = 2, false), Err(Error::UnsupportedVersion(2))));
+        let other = FORMAT_VERSION + 1;
+        assert!(matches!(
+            damaged(&|r| r[8..12].copy_from_slice(&other.to_le_bytes()), false),
+            Err(Error::UnsupportedVersion(v)) if v == other
+        ));
+        assert!(matches!(
+            damaged(&|r| r[8..12].copy_from_slice(&1_u32.to_le_bytes()), true),
+            Err(Error::UnsupportedVersion(1))
+        ));
         assert!(matches!(damaged(&|r| r[20] ^= 1, false), Err(Error::Corrupt(_))), "crc");
         assert!(matches!(damaged(&|r| r[CRC_AT] ^= 1, false), Err(Error::Corrupt(_))), "crc");
-        assert!(matches!(damaged(&|r| r[100] = 1, true), Err(Error::Corrupt(_))), "reserved");
+        for at in [RESERVED.start, 100, RESERVED.end - 1] {
+            assert!(matches!(damaged(&|r| r[at] = 1, true), Err(Error::Corrupt(_))), "reserved");
+        }
         let set_u32 = |off: usize, v: u32| {
             move |r: &mut [u8; META_LEN]| r[off..off + 4].copy_from_slice(&v.to_le_bytes())
         };
@@ -312,7 +345,8 @@ mod tests {
             ("page count", set_u32(24, 1)),
             ("table id", set_u32(28, 0)),
             ("catalog shape", set_u32(40, 0)),
-            ("free reserved word", set_u32(68, 1)),
+            ("catalog branch count", set_u32(56, 0)),
+            ("free leaf count", set_u32(92, 2)),
         ] {
             assert!(matches!(damaged(&f, true), Err(Error::Corrupt(_))), "{what}");
         }
@@ -414,19 +448,16 @@ mod tests {
     /// valid one.
     #[test]
     fn another_format_version_is_refused() {
-        let mut v2 = meta(4096, 6).encode();
-        v2[8] = 2;
-        restamp(&mut v2);
+        let other = FORMAT_VERSION + 1;
+        let mut newer = meta(4096, 6).encode();
+        newer[8..12].copy_from_slice(&other.to_le_bytes());
+        restamp(&mut newer);
         let ok = meta(4096, 5).encode();
-        assert!(matches!(
-            choose(&image(4096, Some(v2), Some(ok))),
-            Err(Error::UnsupportedVersion(2))
-        ));
-        assert!(matches!(
-            choose(&image(4096, Some(ok), Some(v2))),
-            Err(Error::UnsupportedVersion(2))
-        ));
-        assert!(matches!(choose(&image(4096, None, Some(v2))), Err(Error::UnsupportedVersion(2))));
+        let refused =
+            |r: Result<Chosen>| matches!(r, Err(Error::UnsupportedVersion(v)) if v == other);
+        assert!(refused(choose(&image(4096, Some(newer), Some(ok)))));
+        assert!(refused(choose(&image(4096, Some(ok), Some(newer)))));
+        assert!(refused(choose(&image(4096, None, Some(newer)))));
     }
 
     /// The commit writes over the lower txn, an invalid slot first, slot 1 on a tie.

@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 //! tndb-b: an embedded key-value engine in the LMDB/MDBX mould.
 //!
-//! One page file holds every table as a copy-on-write B+tree with the values in its pages. A
+//! One page file holds every table as a copy-on-write B+tree with the values in its leaves, or,
+//! for a value too large for its leaf, in an overflow run of contiguous pages (up to 16 MiB). A
 //! single writer builds the next version of the trees in pages no reader can reach, while any
 //! number of readers see consistent snapshots. A commit makes the new version durable by writing
 //! one of two fixed meta pages (atomic commit, O(1) recovery: open picks the valid meta with the
@@ -28,6 +29,7 @@ mod file;
 mod freelist;
 mod latch;
 mod meta;
+mod overflow;
 mod page;
 mod page_set;
 mod sys;
@@ -39,5 +41,5 @@ mod txn;
 pub use check::{CheckReport, TableCheck};
 pub use env::{Env, EnvOptions, EnvStat, SyncMode};
 pub use error::{Error, Result};
-pub use tree::cursor::Cursor;
-pub use txn::{ReadTxn, RoTxn, RwCursor, RwTxn, Table, TableStat};
+pub use tree::cursor::{Cursor, KeyTail};
+pub use txn::{ReadTxn, RoCursor, RoTxn, RwCursor, RwTxn, Table, TableStat, TxnCursor};

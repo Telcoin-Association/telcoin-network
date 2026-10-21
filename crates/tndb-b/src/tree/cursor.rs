@@ -18,21 +18,63 @@ use super::{read::tighten, PageRead, TreeRoot, MAX_HEIGHT};
 use crate::{
     error::{Error, Result},
     latch::Latch,
-    page::{self, Kind, Search},
+    page::{self, Kind, Search, Val},
 };
 
 /// A `(key, value)` entry borrowed from a page store.
-type Entry<'s> = (&'s [u8], &'s [u8]);
+pub(crate) type Entry<'s> = (&'s [u8], &'s [u8]);
+
+/// Entry `i` of `leaf` with its value as a reader sees it: an overflow value read from its run
+/// ([`PageRead::value`]).
+#[inline]
+fn leaf_entry<'s, S: PageRead + ?Sized>(
+    store: &'s S,
+    leaf: &'s [u8],
+    i: usize,
+) -> Result<Entry<'s>> {
+    let (k, v) = page::leaf_entry(leaf, i)?;
+    Ok((k, store.value(v)?))
+}
+
+/// A cursor entry's value with the last bytes of its key before it, as a `current_with_key_tail`
+/// returns it ([`Cursor::current_with_key_tail`], [`crate::RoCursor::current_with_key_tail`],
+/// [`crate::TxnCursor::current_with_key_tail`]). A leaf cell holds its value right after its key,
+/// so for an inline value the key's tail and the value are one slice of the page, read without a
+/// copy; a value in an overflow run is not next to its key.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KeyTail<'a> {
+    /// An inline value: the key's last `t` bytes followed by the value, one slice.
+    Joined(&'a [u8]),
+    /// A value in an overflow run: the value alone, for the caller to join to the key's tail.
+    Apart(&'a [u8]),
+}
+
+/// Entry `i` of `leaf` as its key and its value joined to the key's last `t` bytes
+/// ([`KeyTail`]; `t` past the key's length is the key's length).
+#[inline]
+fn leaf_entry_with_key_tail<'s, S: PageRead + ?Sized>(
+    store: &'s S,
+    leaf: &'s [u8],
+    i: usize,
+    t: usize,
+) -> Result<(&'s [u8], KeyTail<'s>)> {
+    let (key, val) = page::leaf_entry_with_key_tail(leaf, i, t)?;
+    let tail = match val {
+        Val::Inline(joined) => KeyTail::Joined(joined),
+        Val::Overflow(ovf) => KeyTail::Apart(store.overflow(ovf)?),
+    };
+    Ok((key, tail))
+}
 
 /// A key range `[lo, hi)` borrowed from a page store (`None`: unbounded).
 type Bounds<'s> = (Option<&'s [u8]>, Option<&'s [u8]>);
 
 /// Where a move landed: the entry the cursor is now at, with the page of the leaf holding it
 /// (`None`: not at an entry).
-type Landing<'s> = Option<(Entry<'s>, &'s [u8])>;
+pub(crate) type Landing<'s> = Option<(Entry<'s>, &'s [u8])>;
 
 /// The entry of a [`Landing`].
-fn entry(landing: Landing<'_>) -> Option<Entry<'_>> {
+pub(crate) fn entry(landing: Landing<'_>) -> Option<Entry<'_>> {
     landing.map(|(entry, _)| entry)
 }
 
@@ -66,7 +108,10 @@ enum Edge<'k> {
 #[derive(Clone, Debug)]
 pub(crate) struct TreeCursor {
     /// The path from the root: `(branch, child taken)` entries, then `(leaf, current entry)`.
-    path: [(u32, usize); MAX_HEIGHT as usize],
+    /// Each slot is held as a `u32` (a page holds far fewer entries), so a step has no padding:
+    /// every new cursor zeroes this array and its creation moves it, so its size is a cursor's
+    /// cost (`tree_cursor_stays_small`).
+    path: [(u32, u32); MAX_HEIGHT as usize],
     /// Entries of `path` in use (the tree's height while [`State::At`]).
     depth: usize,
     state: State,
@@ -78,24 +123,46 @@ impl Default for TreeCursor {
     }
 }
 
+/// A slot as the path holds it (see [`TreeCursor`]'s `path`).
+#[inline]
+fn narrow(slot: usize) -> u32 {
+    debug_assert!(u32::try_from(slot).is_ok(), "slot {slot}");
+    slot as u32
+}
+
 impl TreeCursor {
     /// Where the cursor is.
     pub(crate) fn state(&self) -> State {
         self.state
     }
 
+    /// The last step of the path: the leaf and the entry while the cursor is at one.
+    #[inline]
+    fn top(&self) -> (u32, usize) {
+        let (pgno, slot) = self.path[self.depth - 1];
+        (pgno, slot as usize)
+    }
+
+    /// Set the slot of the path's last step.
+    #[inline]
+    fn set_top_slot(&mut self, slot: usize) {
+        self.path[self.depth - 1].1 = narrow(slot);
+    }
+
     /// Move one entry forward or backward inside `leaf`, the page of the leaf the cursor is at
     /// (fetched and checked when the cursor entered it). `None`, the cursor unmoved, when the
     /// move would leave the leaf or the cursor is not at an entry.
-    pub(crate) fn step_in_leaf<'s>(
+    #[inline]
+    pub(crate) fn step_in_leaf<'s, S: PageRead + ?Sized>(
         &mut self,
+        store: &'s S,
         leaf: &'s [u8],
         forward: bool,
     ) -> Result<Option<Entry<'s>>> {
         if self.state != State::At {
             return Ok(None);
         }
-        let slot = self.path[self.depth - 1].1;
+        let slot = self.top().1;
         let to = if forward {
             (slot + 1 < page::nkeys(leaf)).then_some(slot + 1)
         } else {
@@ -103,8 +170,8 @@ impl TreeCursor {
         };
         let Some(to) = to else { return Ok(None) };
         self.guarded(|c| {
-            c.path[c.depth - 1].1 = to;
-            Ok(Some(page::leaf_entry(leaf, to)?))
+            c.set_top_slot(to);
+            Ok(Some(leaf_entry(store, leaf, to)?))
         })
     }
 
@@ -114,8 +181,10 @@ impl TreeCursor {
     /// this path.
     pub(crate) fn place(&mut self, branches: &[(u32, usize)], leaf: u32, slot: usize) {
         let depth = branches.len() + 1;
-        self.path[..branches.len()].copy_from_slice(branches);
-        self.path[branches.len()] = (leaf, slot);
+        for (step, &(pgno, ci)) in self.path.iter_mut().zip(branches) {
+            *step = (pgno, narrow(ci));
+        }
+        self.path[branches.len()] = (leaf, narrow(slot));
         self.depth = depth;
         self.state = State::At;
     }
@@ -166,8 +235,29 @@ impl TreeCursor {
         if self.state != State::At {
             return Ok(None);
         }
-        let (pgno, slot) = self.path[self.depth - 1];
-        Ok(Some(page::leaf_entry(store.page(pgno)?, slot)?))
+        let (pgno, slot) = self.top();
+        Ok(Some(leaf_entry(store, store.page(pgno)?, slot)?))
+    }
+
+    /// The entry the cursor is at, if it is at one, as its key and its value joined to the key's
+    /// last `t` bytes ([`KeyTail`]). `leaf` is the page of the leaf the cursor is at, when the
+    /// caller holds it (else it is fetched, as [`Self::current`] fetches it).
+    #[inline]
+    pub(crate) fn current_with_key_tail<'s, S: PageRead + ?Sized>(
+        &self,
+        store: &'s S,
+        leaf: Option<&'s [u8]>,
+        t: usize,
+    ) -> Result<Option<(&'s [u8], KeyTail<'s>)>> {
+        if self.state != State::At {
+            return Ok(None);
+        }
+        let (pgno, slot) = self.top();
+        let leaf = match leaf {
+            Some(leaf) => leaf,
+            None => store.page(pgno)?,
+        };
+        Ok(Some(leaf_entry_with_key_tail(store, leaf, slot, t)?))
     }
 
     /// Move to the first entry `>= key`; after the end if there is none.
@@ -188,6 +278,103 @@ impl TreeCursor {
         key: &[u8],
     ) -> Result<Option<&'s [u8]>> {
         Ok(self.guarded(|c| c.find(store, root, key))?.map(|((_, value), _)| value))
+    }
+
+    /// Move one entry forward (`forward`) or backward only if the entry there shares the first
+    /// `n` bytes of the current entry's key, returning it with its leaf's page; else `None`, the
+    /// cursor unmoved (see [`Cursor::next_in_prefix`] for the edge rules). `leaf` is the page of
+    /// the leaf the cursor is at, when the caller holds it (else it is fetched). Inside the leaf
+    /// the follower's key is compared before its value is read; at the leaf's end a copy of the
+    /// cursor crosses, and the cursor takes its place only if the entry it lands on shares the
+    /// prefix.
+    pub(crate) fn step_in_prefix<'s, S: PageRead + ?Sized>(
+        &mut self,
+        store: &'s S,
+        root: &TreeRoot,
+        leaf: Option<&'s [u8]>,
+        n: usize,
+        forward: bool,
+    ) -> Result<Landing<'s>> {
+        if self.state != State::At {
+            return Ok(None);
+        }
+        self.guarded(|c| {
+            let (pgno, slot) = c.top();
+            let leaf = match leaf {
+                Some(leaf) => leaf,
+                None => store.page(pgno)?,
+            };
+            let Some(prefix) = page::leaf_key(leaf, slot)?.get(..n) else {
+                return Ok(None);
+            };
+            let to = if forward {
+                (slot + 1 < page::nkeys(leaf)).then_some(slot + 1)
+            } else {
+                slot.checked_sub(1)
+            };
+            match to {
+                Some(to) => {
+                    let (k, v) = page::leaf_entry(leaf, to)?;
+                    if !k.starts_with(prefix) {
+                        return Ok(None);
+                    }
+                    let value = store.value(v)?;
+                    c.set_top_slot(to);
+                    Ok(Some(((k, value), leaf)))
+                }
+                None => c.move_if(prefix, |peek| peek.cross(store, root, forward)),
+            }
+        })
+    }
+
+    /// Move to the next (`forward`) or previous entry, as [`Self::next`] and [`Self::prev`] do,
+    /// only if its key starts with `prefix`; else `None`, the cursor unmoved. An error leaves the
+    /// cursor unset.
+    pub(crate) fn step_if<'s, S: PageRead + ?Sized>(
+        &mut self,
+        store: &'s S,
+        root: &TreeRoot,
+        prefix: &[u8],
+        forward: bool,
+    ) -> Result<Landing<'s>> {
+        self.guarded(|c| c.move_if(prefix, |peek| peek.advance(store, root, forward)))
+    }
+
+    /// Make the move `op` on a copy of the cursor, and take the copy's place only if it landed
+    /// on an entry whose key starts with `prefix`.
+    fn move_if<'s>(
+        &mut self,
+        prefix: &[u8],
+        op: impl FnOnce(&mut Self) -> Result<Landing<'s>>,
+    ) -> Result<Landing<'s>> {
+        let mut peek = self.clone();
+        match op(&mut peek)? {
+            Some(landing) if landing.0 .0.starts_with(prefix) => {
+                *self = peek;
+                Ok(Some(landing))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// The page number of the leaf the cursor is at, if it is at an entry.
+    pub(crate) fn leaf_pgno(&self) -> Option<u32> {
+        (self.state == State::At).then(|| self.path[self.depth - 1].0)
+    }
+
+    /// [`Self::next`] (`forward`) or [`Self::prev`] for a cursor at an entry, from `leaf`: the page
+    /// of the leaf it is at, as the cursor fetched it with every check when it entered it.
+    pub(crate) fn step_from<'s, S: PageRead + ?Sized>(
+        &mut self,
+        store: &'s S,
+        root: &TreeRoot,
+        leaf: &'s [u8],
+        forward: bool,
+    ) -> Result<Option<Entry<'s>>> {
+        if let Some(entry) = self.step_in_leaf(store, leaf, forward)? {
+            return Ok(Some(entry));
+        }
+        self.guarded(|c| c.cross(store, root, forward)).map(entry)
     }
 
     /// Run a move; an error leaves the cursor unset.
@@ -218,12 +405,12 @@ impl TreeCursor {
             return Ok(None);
         }
         let leaf = self.descend(store, root, root.root, root.root_txn, Edge::Key(key))?;
-        let slot = self.path[self.depth - 1].1;
+        let slot = self.top().1;
         if slot < page::nkeys(leaf) {
             let (k, v) = page::leaf_entry(leaf, slot)?;
             if k == key {
                 self.state = State::At;
-                return Ok(Some(((k, v), leaf)));
+                return Ok(Some(((k, store.value(v)?), leaf)));
             }
         }
         self.reset(State::Unset);
@@ -273,7 +460,7 @@ impl TreeCursor {
         forward: bool,
     ) -> Result<Landing<'s>> {
         let leaf = store.page(self.path[self.depth - 1].0)?;
-        if let Some(entry) = self.step_in_leaf(leaf, forward)? {
+        if let Some(entry) = self.step_in_leaf(store, leaf, forward)? {
             return Ok(Some((entry, leaf)));
         }
         self.cross(store, root, forward)
@@ -307,10 +494,10 @@ impl TreeCursor {
         forward: bool,
     ) -> Result<Landing<'s>> {
         loop {
-            let slot = self.path[self.depth - 1].1;
+            let slot = self.top().1;
             if slot < page::nkeys(leaf) {
                 self.state = State::At;
-                return Ok(Some((page::leaf_entry(leaf, slot)?, leaf)));
+                return Ok(Some((leaf_entry(store, leaf, slot)?, leaf)));
             }
             match self.adjacent_leaf(store, root, forward)? {
                 Some(next) => leaf = next,
@@ -332,7 +519,7 @@ impl TreeCursor {
     ) -> Result<Option<&'s [u8]>> {
         self.depth -= 1;
         while self.depth > 0 {
-            let (pgno, ci) = self.path[self.depth - 1];
+            let (pgno, ci) = self.top();
             let branch = store.page(pgno)?;
             let to = if forward {
                 (ci + 1 < page::nkeys(branch)).then_some(ci + 1)
@@ -340,7 +527,7 @@ impl TreeCursor {
                 ci.checked_sub(1)
             };
             if let Some(ci) = to {
-                self.path[self.depth - 1].1 = ci;
+                self.set_top_slot(ci);
                 let (child, child_txn) = page::branch_child(branch, ci)?;
                 let edge = if forward { Edge::First } else { Edge::Last };
                 return self.descend(store, root, child, child_txn, edge).map(Some);
@@ -421,14 +608,14 @@ impl TreeCursor {
     fn bounds<'s, S: PageRead + ?Sized>(&self, store: &'s S) -> Result<Bounds<'s>> {
         let (mut lo, mut hi): Bounds<'s> = (None, None);
         for &(pgno, ci) in &self.path[..self.depth] {
-            tighten(&page::branch_route_at(store.page(pgno)?, ci)?, &mut lo, &mut hi);
+            tighten(&page::branch_route_at(store.page(pgno)?, ci as usize)?, &mut lo, &mut hi);
         }
         Ok((lo, hi))
     }
 
     /// Append `(pgno, slot)` to the path (the caller checked the depth).
     fn push(&mut self, pgno: u32, slot: usize) {
-        self.path[self.depth] = (pgno, slot);
+        self.path[self.depth] = (pgno, narrow(slot));
         self.depth += 1;
     }
 }
@@ -501,7 +688,7 @@ impl<'t> Cursor<'t> {
     fn step(&mut self, forward: bool) -> Result<Option<(&'t [u8], &'t [u8])>> {
         let (store, root) = (self.store, &self.root);
         let moved = match self.leaf {
-            Some(leaf) => match self.tree.step_in_leaf(leaf, forward) {
+            Some(leaf) => match self.tree.step_in_leaf(store, leaf, forward) {
                 Ok(Some(entry)) => return Ok(Some(entry)),
                 Ok(None) => self.tree.guarded(|c| c.cross(store, root, forward)),
                 Err(e) => Err(e),
@@ -544,6 +731,15 @@ impl<'t> Cursor<'t> {
         self.latched(self.tree.current(self.store))
     }
 
+    /// The entry the cursor is at, if it is at one, as its key and its value with the key's last
+    /// `t` bytes before it: for an inline value one slice of the page, `key[key.len() − t..] ‖
+    /// value` ([`KeyTail::Joined`]), for a value in an overflow run the value alone
+    /// ([`KeyTail::Apart`]). A `t` past the key's length is the key's length (the slice is then
+    /// `key ‖ value`). The cursor does not move.
+    pub fn current_with_key_tail(&self, t: usize) -> Result<Option<(&'t [u8], KeyTail<'t>)>> {
+        self.latched(self.tree.current_with_key_tail(self.store, self.leaf, t))
+    }
+
     /// Move to the first entry whose key is `>= key` and return it; `None` (the cursor after the
     /// end) if there is none.
     pub fn seek(&mut self, key: &[u8]) -> Result<Option<(&'t [u8], &'t [u8])>> {
@@ -557,6 +753,42 @@ impl<'t> Cursor<'t> {
         let (store, root) = (self.store, &self.root);
         let moved = self.tree.guarded(|c| c.find(store, root, key));
         Ok(self.track(moved)?.map(|(_, value)| value))
+    }
+
+    /// Move to the next entry only if its key shares the first `n` bytes of the current entry's
+    /// key, and return it; else return `None` and stay at the current entry. For keys built as
+    /// `key ‖ subkey`, `next_in_prefix(key.len())` steps through one key's subkeys.
+    ///
+    /// - Not at an entry (unset, after the end, before the start): `None`, the cursor unmoved.
+    /// - `n` longer than the current entry's key: that prefix has no other entry, so `None`.
+    /// - `n == 0`: every key shares the empty prefix, so this is [`Self::next`], except that at the
+    ///   last entry it returns `None` and stays there.
+    ///
+    /// At the end of a leaf the move peeks into the next leaf without losing the position.
+    pub fn next_in_prefix(&mut self, n: usize) -> Result<Option<(&'t [u8], &'t [u8])>> {
+        self.step_in_prefix(n, true)
+    }
+
+    /// Move to the previous entry only if its key shares the first `n` bytes of the current
+    /// entry's key, and return it; else return `None` and stay at the current entry. The edge
+    /// rules are [`Self::next_in_prefix`]'s, backward: with `n == 0` this is [`Self::prev`],
+    /// except that at the first entry it returns `None` and stays there.
+    pub fn prev_in_prefix(&mut self, n: usize) -> Result<Option<(&'t [u8], &'t [u8])>> {
+        self.step_in_prefix(n, false)
+    }
+
+    /// [`Self::next_in_prefix`] (`forward`) or [`Self::prev_in_prefix`], from the remembered
+    /// leaf. A `None` leaves the cursor, so its leaf, where it was.
+    fn step_in_prefix(&mut self, n: usize, forward: bool) -> Result<Option<Entry<'t>>> {
+        let (store, root) = (self.store, &self.root);
+        match self.tree.step_in_prefix(store, root, self.leaf, n, forward) {
+            Ok(Some((entry, leaf))) => {
+                self.leaf = Some(leaf);
+                Ok(Some(entry))
+            }
+            Ok(None) => Ok(None),
+            moved @ Err(_) => self.track(moved),
+        }
     }
 }
 

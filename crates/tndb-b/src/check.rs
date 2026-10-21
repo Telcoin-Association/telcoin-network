@@ -1,7 +1,9 @@
 //! `Env::check`: a full structural check of the newest committed state — the catalog, every
 //! table and the free tree, page by page — and its exact page accounting: every page of
 //! `2..page_count` is either reachable from exactly one tree, once, or listed exactly once by the
-//! free list.
+//! free list. Each tree's root must count the entries and the pages of each kind the walk finds.
+//! Every overflow run a leaf names is checked as a read checks it, plus the full CRC of every run
+//! (a 1-page one too) and its zero pad, and its pages count as its table's.
 
 use std::collections::BTreeMap;
 
@@ -11,7 +13,8 @@ use crate::{
     env::Snapshot,
     error::{Error, Result},
     freelist::{decode_pages, RecordKey},
-    page::{self, Kind},
+    overflow::{self, Ovf, RunCrc},
+    page::{self, Kind, Val},
     tree::{PageRead, TreeRoot},
 };
 
@@ -24,7 +27,7 @@ pub struct CheckReport {
     pub page_count: u32,
     /// The pages of the catalog's tree.
     pub catalog_pages: u64,
-    /// The pages of every table's tree.
+    /// The pages of every table's tree, its overflow runs' included.
     pub table_pages: u64,
     /// The pages of the free tree.
     pub free_tree_pages: u64,
@@ -41,7 +44,7 @@ pub struct CheckReport {
 pub struct TableCheck {
     /// The number of entries.
     pub entries: u64,
-    /// The pages of its tree.
+    /// The pages of its tree, its overflow runs' included.
     pub pages: u64,
     /// The height of its tree (0: empty).
     pub height: u32,
@@ -79,12 +82,13 @@ impl Checker<'_> {
 
     /// Walk the tree `root` names for `owner`, checking every page and passing each leaf entry
     /// to `entry`. Returns the tree's page count. A page claimed already is noted and not
-    /// descended into.
+    /// descended into. A root whose entry count or page counters differ from what the walk found
+    /// is [`Error::Corrupt`] (unless a page was claimed twice: the accounting reports that).
     fn walk(
         &mut self,
         root: &TreeRoot,
         owner: Owner,
-        mut entry: impl FnMut(&mut Self, &[u8], &[u8]) -> Result<()>,
+        mut entry: impl FnMut(&mut Self, &[u8], Val<'_>) -> Result<()>,
     ) -> Result<u64> {
         root.check()?;
         if root.is_empty() {
@@ -95,7 +99,7 @@ impl Checker<'_> {
         let name = self.owners[owner as usize].clone();
         let corrupt =
             |p: u32, what: String| Error::Corrupt(format!("check: {name}: page {p} {what}"));
-        let (mut pages, mut entries) = (0, 0);
+        let (mut branches, mut leaves, mut overflows, mut entries) = (0_u64, 0_u64, 0_u64, 0);
         let mut stack = vec![(root.root, root.root_txn, 1, None::<Vec<u8>>, None::<Vec<u8>>)];
         while let Some((p, want_txn, depth, lo, hi)) = stack.pop() {
             if p < 2 || p >= snapshot.meta.page_count {
@@ -104,7 +108,6 @@ impl Checker<'_> {
             if !self.claim(p, owner) {
                 continue;
             }
-            pages += 1;
             let page = snapshot.page(p).map_err(|e| corrupt(p, e.to_string()))?;
             if crc::crc_state(page) != CrcState::Valid {
                 return Err(corrupt(p, "fails its CRC".to_string()));
@@ -123,6 +126,7 @@ impl Checker<'_> {
             }
             let n = page::nkeys(page);
             if leaf {
+                leaves += 1;
                 if depth > 1 && n == 0 {
                     return Err(corrupt(p, "is an empty non-root leaf".to_string()));
                 }
@@ -130,8 +134,18 @@ impl Checker<'_> {
                 for i in 0..n {
                     let (k, v) = page::leaf_entry(page, i)?;
                     entry(self, k, v).map_err(|e| corrupt(p, e.to_string()))?;
+                    if let Val::Overflow(ovf) = v {
+                        overflows +=
+                            self.claim_run(ovf, owner).map_err(|e| corrupt(p, e.to_string()))?;
+                    }
                 }
                 continue;
+            }
+            branches += 1;
+            // A root branch the writer leaves with one child gives way to it (a collapse, or a
+            // merge's `merged_root`), so a root branch keeps two children or more.
+            if depth == 1 && n < 2 {
+                return Err(corrupt(p, "is a root branch with one child".to_string()));
             }
             for i in 0..n {
                 let (child, child_txn) = page::branch_child(page, i)?;
@@ -145,13 +159,43 @@ impl Checker<'_> {
                 stack.push((child, child_txn, depth + 1, child_lo, child_hi));
             }
         }
-        if entries != root.entries && self.twice.is_empty() {
+        if !self.twice.is_empty() {
+            return Ok(branches + leaves + overflows);
+        }
+        if entries != root.entries {
             return Err(Error::Corrupt(format!(
                 "check: {name}: {entries} entries, not the {} its root counts",
                 root.entries
             )));
         }
-        Ok(pages)
+        let counted = [
+            ("branch", branches, root.branch_pages),
+            ("leaf", leaves, root.leaf_pages),
+            ("overflow", overflows, root.overflow_pages),
+        ];
+        for (kind, found, counts) in counted {
+            if found != u64::from(counts) {
+                return Err(Error::Corrupt(format!(
+                    "check: {name}: {found} {kind} pages, not the {counts} its root counts"
+                )));
+            }
+        }
+        Ok(branches + leaves + overflows)
+    }
+
+    /// Check the overflow run `ovf` names as a read does, plus its full CRC even for a 1-page run
+    /// ([`RunCrc::Always`]) and its zero pad, then claim each of its pages for `owner`. Returns
+    /// its page count.
+    fn claim_run(&mut self, ovf: Ovf, owner: Owner) -> Result<u64> {
+        let run = self.snapshot.run(ovf, RunCrc::Always)?;
+        if !overflow::pad_is_zero(run, ovf) {
+            return Err(Error::Corrupt(format!("overflow run {} has a non-zero pad", ovf.pgno)));
+        }
+        let n = (run.len() / self.snapshot.geometry.page_size()) as u32;
+        for p in ovf.pgno..ovf.pgno + n {
+            self.claim(p, owner);
+        }
+        Ok(u64::from(n))
     }
 }
 
@@ -173,7 +217,7 @@ pub(crate) fn check_snapshot(snapshot: &Snapshot) -> Result<CheckReport> {
             .map_err(|_| Error::Corrupt("a table name is not UTF-8".to_string()))?;
         catalog::check_name(name)
             .map_err(|_| Error::Corrupt(format!("bad table name {name:?}")))?;
-        let record = TableRecord::decode(v)?;
+        let record = TableRecord::decode(v.inline()?)?;
         if record.id >= meta.next_table_id || record.created_txn > meta.txn {
             return Err(Error::Corrupt(format!(
                 "table {name:?} has an impossible record {record:?}"
@@ -206,7 +250,7 @@ pub(crate) fn check_snapshot(snapshot: &Snapshot) -> Result<CheckReport> {
             return Err(Error::Corrupt(format!("record {key:?} is later than the state")));
         }
         free_records += 1;
-        for p in decode_pages(v, meta.page_count)? {
+        for p in decode_pages(v.inline()?, meta.page_count)? {
             free_pages += 1;
             checker.claim(p, FREE_LIST);
         }

@@ -1,7 +1,7 @@
 //! The catalog: a B+tree keyed by table name (UTF-8, 1..=255 bytes) whose values are
 //! [`TableRecord`]s, each naming one table's tree. The meta page names the catalog's root.
 //!
-//! Record layout (48 bytes, little-endian): `id u32 | flags u32 | root TreeRoot (24) |
+//! Record layout (56 bytes, little-endian): `id u32 | flags u32 | root TreeRoot (32) |
 //! created_txn u64 | reserved 8`.
 
 use crate::{
@@ -13,7 +13,13 @@ use crate::{
 pub(crate) const MAX_NAME_LEN: usize = 255;
 
 /// The size of an encoded [`TableRecord`].
-pub(crate) const RECORD_LEN: usize = 48;
+pub(crate) const RECORD_LEN: usize = 56;
+
+/// Where the record's [`TreeRoot`] lies.
+const ROOT: std::ops::Range<usize> = 8..8 + TreeRoot::ENCODED_LEN;
+
+/// Where the creating transaction's id lies.
+const CREATED: std::ops::Range<usize> = ROOT.end..ROOT.end + 8;
 
 /// One table: its id, its tree, and the transaction that created it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -35,18 +41,18 @@ impl TableRecord {
         Self { id, flags: 0, root: TreeRoot::EMPTY, created_txn: txn }
     }
 
-    /// The 48-byte encoding.
+    /// The 56-byte encoding.
     pub(crate) fn encode(&self) -> [u8; RECORD_LEN] {
         let mut out = [0; RECORD_LEN];
         out[0..4].copy_from_slice(&self.id.to_le_bytes());
         out[4..8].copy_from_slice(&self.flags.to_le_bytes());
-        out[8..32].copy_from_slice(&self.root.encode());
-        out[32..40].copy_from_slice(&self.created_txn.to_le_bytes());
+        out[ROOT].copy_from_slice(&self.root.encode());
+        out[CREATED].copy_from_slice(&self.created_txn.to_le_bytes());
         out
     }
 
-    /// Decode [`Self::encode`]'s bytes: exactly 48 of them, no flags, a zero reserved tail and a
-    /// sound tree root; else [`Error::Corrupt`].
+    /// Decode [`Self::encode`]'s bytes: exactly [`RECORD_LEN`] of them, no flags, a zero reserved
+    /// tail and a sound tree root; else [`Error::Corrupt`].
     pub(crate) fn decode(bytes: &[u8]) -> Result<Self> {
         let corrupt = |what: &str| Err(Error::Corrupt(format!("catalog record: {what}")));
         let Ok(bytes) = <&[u8; RECORD_LEN]>::try_from(bytes) else {
@@ -56,13 +62,13 @@ impl TableRecord {
         let record = Self {
             id: u32_at(0),
             flags: u32_at(4),
-            root: TreeRoot::decode(bytes[8..32].try_into().expect("24 bytes"))?,
-            created_txn: u64::from_le_bytes(bytes[32..40].try_into().expect("8 bytes")),
+            root: TreeRoot::decode(bytes[ROOT].try_into().expect("a tree root"))?,
+            created_txn: u64::from_le_bytes(bytes[CREATED].try_into().expect("8 bytes")),
         };
         if record.flags != 0 {
             return corrupt(&format!("unknown flags {:#x}", record.flags));
         }
-        if bytes[40..].iter().any(|&b| b != 0) {
+        if bytes[CREATED.end..].iter().any(|&b| b != 0) {
             return corrupt("reserved bytes are not zero");
         }
         Ok(record)
@@ -85,7 +91,9 @@ pub(crate) fn get<S: PageRead + ?Sized>(
     name: &str,
 ) -> Result<Option<TableRecord>> {
     check_name(name)?;
-    read::get(store, catalog, name.as_bytes())?.map(TableRecord::decode).transpose()
+    read::find(store, catalog, name.as_bytes())?
+        .map(|v| v.inline().and_then(TableRecord::decode))
+        .transpose()
 }
 
 /// Insert or replace table `name`'s record. `trusted` is the catalog root's provenance
@@ -125,20 +133,33 @@ mod tests {
         let record = TableRecord {
             id: 9,
             flags: 0,
-            root: TreeRoot { root: 12, root_txn: 7, height: 2, entries: 300 },
+            root: TreeRoot {
+                root: 12,
+                root_txn: 7,
+                height: 2,
+                entries: 300,
+                branch_pages: 1,
+                leaf_pages: 20,
+                overflow_pages: 5,
+            },
             created_txn: 1 << 33,
         };
         let bytes = record.encode();
         assert_eq!(TableRecord::decode(&bytes).expect("decode"), record);
         assert_eq!(TableRecord::new(3, 4).root, TreeRoot::EMPTY);
+        assert_eq!((ROOT, CREATED, RECORD_LEN), (8..40, 40..48, 56), "the layout");
+        assert_eq!(bytes[ROOT], record.root.encode());
+        assert_eq!(bytes[CREATED], (1_u64 << 33).to_le_bytes());
 
-        for (what, at) in [("flags", 4), ("root reserved word", 20), ("reserved", 47)] {
+        for (what, at) in
+            [("flags", 4), ("root branch count", 32), ("reserved", 48), ("reserved", 55)]
+        {
             let mut bad = bytes;
             bad[at] ^= 1;
             assert!(matches!(TableRecord::decode(&bad), Err(Error::Corrupt(_))), "{what}");
         }
-        assert!(matches!(TableRecord::decode(&bytes[..47]), Err(Error::Corrupt(_))));
-        assert!(matches!(TableRecord::decode(&[0; 49]), Err(Error::Corrupt(_))));
+        assert!(matches!(TableRecord::decode(&bytes[..55]), Err(Error::Corrupt(_))));
+        assert!(matches!(TableRecord::decode(&[0; 57]), Err(Error::Corrupt(_))));
     }
 
     /// Names of 1..=255 bytes are tables' keys; others are refused before the tree is touched.
@@ -156,8 +177,15 @@ mod tests {
         assert_eq!(get(&store, &catalog, &longest).expect("get"), Some(b));
         assert_eq!(get(&store, &catalog, "b").expect("get"), None);
 
-        let changed =
-            TableRecord { root: TreeRoot { root: 2, root_txn: 1, height: 1, entries: 1 }, ..a };
+        let root = TreeRoot {
+            root: 2,
+            root_txn: 1,
+            height: 1,
+            entries: 1,
+            leaf_pages: 1,
+            ..TreeRoot::EMPTY
+        };
+        let changed = TableRecord { root, ..a };
         put(&mut store, &mut catalog, &mut trusted, "a", &changed).expect("replace");
         assert_eq!(get(&store, &catalog, "a").expect("get"), Some(changed));
         assert_eq!(catalog.entries, 2);

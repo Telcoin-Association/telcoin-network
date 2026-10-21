@@ -5,14 +5,15 @@ use std::collections::HashSet;
 
 use super::{
     read::{checked_child, checked_page},
-    write::Scratch,
+    write::{MergeReport, Scratch},
     PageRead, PageWrite, TreeRoot,
 };
 use crate::{
     alloc::Allocator,
     crc::{self, CrcState},
     error::{Error, Result},
-    page::{self, Geometry, Kind},
+    overflow::{checked_run, run_pages, Ovf, RunCrc},
+    page::{self, Geometry, Kind, Val},
 };
 
 /// xorshift64: a seeded, reproducible stream for the randomized tests.
@@ -51,14 +52,15 @@ impl Drop for ReportSeed {
     }
 }
 
-/// An in-memory page store: page `p` is `pages[p]` (pages 0 and 1 stand for the metas and are
-/// never tree pages). It is the writer's store ([`PageWrite`]) for transaction `alloc.txn()`;
-/// [`Self::commit_like`] stamps the private pages' CRCs as a commit would, so the tree code meets
-/// published pages (which must carry a CRC) and copies them.
+/// An in-memory page store: page `p` is bytes `p·P..(p + 1)·P` of `data`, one buffer so an
+/// overflow run is one slice (pages 0 and 1 stand for the metas and are never tree pages). It is
+/// the writer's store ([`PageWrite`]) for transaction `alloc.txn()`; [`Self::commit_like`] stamps
+/// the private pages' CRCs as a commit would, so the tree code meets published pages (which must
+/// carry a CRC) and copies them.
 #[derive(Debug)]
 pub(crate) struct MemStore {
     geometry: Geometry,
-    pages: Vec<Vec<u8>>,
+    data: Vec<u8>,
     /// The writer's allocator (its failure injection is `alloc.fail_allocs_after`).
     pub(crate) alloc: Allocator,
     /// Published pages freed by committed transactions, each with the id of the transaction that
@@ -70,6 +72,12 @@ pub(crate) struct MemStore {
     base: (Vec<u32>, u32),
     /// The writer's reused buffers ([`PageWrite::take_scratch`]).
     scratch: Scratch,
+    /// Deletes do not merge under-full pages ([`PageWrite::no_merge`]).
+    pub(crate) no_merge: bool,
+    /// What the last delete that merged, or read a sibling that did not fit, reported
+    /// ([`PageWrite::merges_applied`]); any other delete leaves it as it was, so a test reading
+    /// it for one delete resets it first.
+    pub(crate) merge_report: MergeReport,
 }
 
 impl MemStore {
@@ -78,19 +86,22 @@ impl MemStore {
         let geometry = Geometry::new(page_size).expect("page size");
         Self {
             geometry,
-            pages: vec![vec![0; geometry.page_size()]; 2],
+            data: vec![0; 2 * geometry.page_size()],
             alloc: Allocator::new(1, 2),
             retired: Vec::new(),
             base: (Vec::new(), 2),
             scratch: Scratch::default(),
+            no_merge: false,
+            merge_report: MergeReport::default(),
         }
     }
 
-    /// Commit as the environment will: stamp every private page's CRC, set the freed pages
-    /// aside (intact, not reused), and start the next transaction.
+    /// Commit as the environment will: stamp every private page's CRC and one over each private
+    /// run, set the freed pages aside (intact, not reused), and start the next transaction.
     pub(crate) fn commit_like(&mut self) {
-        for p in self.alloc.stamp_private() {
-            crc::add_crc32_nonzero(&mut self.pages[p as usize]);
+        let size = self.geometry.page_size();
+        for (p, n) in self.alloc.stamp_private().units() {
+            crc::add_crc32_nonzero(self.raw_span_mut(p, n as usize * size));
         }
         let txn = self.alloc.txn();
         self.retired.extend(self.alloc.take_freed().into_iter().map(|p| (txn, p)));
@@ -151,28 +162,54 @@ impl MemStore {
 
     /// Page `p`'s bytes, unchecked.
     pub(crate) fn raw(&self, p: u32) -> &[u8] {
-        &self.pages[p as usize]
+        self.span(p, self.geometry.page_size()).expect("a stored page")
+    }
+
+    /// The `len` bytes from page `p`, if stored.
+    fn span(&self, p: u32, len: usize) -> Option<&[u8]> {
+        let start = p as usize * self.geometry.page_size();
+        self.data.get(start..start.checked_add(len)?)
     }
 
     /// Page `p`'s bytes, unchecked and writable (to inject damage). Past the page count it is
     /// file slack (created on demand), which no fetch may return.
     pub(crate) fn raw_mut(&mut self, p: u32) -> &mut [u8] {
-        if p as usize >= self.pages.len() {
-            self.pages.resize(p as usize + 1, vec![0; self.geometry.page_size()]);
+        let size = self.geometry.page_size();
+        self.raw_span_mut(p, size)
+    }
+
+    /// The `len` bytes from page `p`, unchecked and writable; storage past the end is created on
+    /// demand (file slack).
+    pub(crate) fn raw_span_mut(&mut self, p: u32, len: usize) -> &mut [u8] {
+        let start = p as usize * self.geometry.page_size();
+        if self.data.len() < start + len {
+            self.data.resize(start + len, 0);
         }
-        &mut self.pages[p as usize]
+        &mut self.data[start..start + len]
     }
 
     /// Re-stamp page `p`'s CRC (to make injected damage CRC-valid).
     pub(crate) fn restamp(&mut self, p: u32) {
-        crc::add_crc32_nonzero(&mut self.pages[p as usize]);
+        crc::add_crc32_nonzero(self.raw_mut(p));
     }
 
     /// Check the page accounting after a commit (no private or freed pages pending): the pages
-    /// reachable from `roots`, the retired pages and the pool are disjoint and together are every
-    /// tree page `2..page_count`.
+    /// reachable from `roots` (tree pages and the pages of the overflow runs their leaves name),
+    /// the retired pages and the pool are disjoint and together are every tree page
+    /// `2..page_count`; and each root counts its reachable pages by kind.
     pub(crate) fn assert_accounting(&self, roots: &[TreeRoot]) {
-        let mut all: Vec<u32> = roots.iter().flat_map(|r| self.reachable_pgnos(r)).collect();
+        for root in roots {
+            let counted = self.counted(*root);
+            assert_eq!(
+                (root.branch_pages, root.leaf_pages, root.overflow_pages as usize),
+                (counted.branch_pages, counted.leaf_pages, self.run_pgnos(root).len()),
+                "{root:?}: the page counters (branch, leaf, overflow) against the pages reached"
+            );
+        }
+        let mut all: Vec<u32> = roots
+            .iter()
+            .flat_map(|r| self.reachable_pgnos(r).into_iter().chain(self.run_pgnos(r)))
+            .collect();
         all.extend(self.retired.iter().map(|&(_, p)| p));
         all.extend_from_slice(self.alloc.pool());
         all.sort_unstable();
@@ -180,9 +217,37 @@ impl MemStore {
         assert_eq!(all, expect, "reachable + retired + pool must be every page, once");
     }
 
+    /// `root` with its branch and leaf counters set to the pages reachable from it: the handle of
+    /// a tree a test built page by page.
+    pub(crate) fn counted(&self, root: TreeRoot) -> TreeRoot {
+        let pages = self.reachable_pgnos(&root);
+        let leaves =
+            pages.iter().filter(|&&p| page::kind(self.raw(p)).ok() == Some(Kind::Leaf)).count();
+        let count = |n: usize| u32::try_from(n).expect("a page count");
+        TreeRoot { leaf_pages: count(leaves), branch_pages: count(pages.len() - leaves), ..root }
+    }
+
     /// Every page reachable from `root` with its bytes, in walk order.
     pub(crate) fn reachable(&self, root: &TreeRoot) -> Vec<(u32, Vec<u8>)> {
         self.reachable_pgnos(root).into_iter().map(|p| (p, self.raw(p).to_vec())).collect()
+    }
+
+    /// Every page of the overflow runs the leaves of `root` name, unchecked.
+    pub(crate) fn run_pgnos(&self, root: &TreeRoot) -> Vec<u32> {
+        let mut pages = Vec::new();
+        for p in self.reachable_pgnos(root) {
+            let buf = self.raw(p);
+            if page::kind(buf).ok() != Some(Kind::Leaf) {
+                continue;
+            }
+            for i in 0..page::nkeys(buf) {
+                if let (_, Val::Overflow(ovf)) = page::leaf_entry(buf, i).expect("entry") {
+                    let n = run_pages(ovf.len as usize, self.geometry.page_size()) as u32;
+                    pages.extend(ovf.pgno..ovf.pgno + n);
+                }
+            }
+        }
+        pages
     }
 
     /// Every page reachable from `root`, in walk order.
@@ -217,7 +282,7 @@ impl PageRead for MemStore {
             self.alloc.page_count(),
             self.alloc.txn(),
             self.alloc.is_private(pgno),
-            |p| self.pages.get(p as usize).map(Vec::as_slice),
+            |p| self.span(p, self.geometry.page_size()),
         )
     }
 
@@ -228,7 +293,19 @@ impl PageRead for MemStore {
             self.alloc.page_count(),
             self.alloc.txn(),
             self.alloc.is_private(pgno),
-            |p| self.pages.get(p as usize).map(Vec::as_slice),
+            |p| self.span(p, self.geometry.page_size()),
+        )
+    }
+
+    fn run(&self, ovf: Ovf, verify: RunCrc) -> Result<&[u8]> {
+        checked_run(
+            ovf,
+            self.geometry.page_size(),
+            self.alloc.page_count(),
+            self.alloc.txn(),
+            self.alloc.is_private_run(ovf.pgno),
+            verify,
+            |p, len| self.span(p, len),
         )
     }
 }
@@ -247,9 +324,7 @@ impl PageWrite for MemStore {
     }
 
     fn private_page(&self, pgno: u32) -> Result<&[u8]> {
-        self.pages
-            .get(pgno as usize)
-            .map(Vec::as_slice)
+        self.span(pgno, self.geometry.page_size())
             .ok_or_else(|| Error::Corrupt(format!("private page {pgno} is not stored")))
     }
 
@@ -258,14 +333,14 @@ impl PageWrite for MemStore {
     }
 
     fn alloc(&mut self) -> Result<u32> {
-        let (pages, size) = (&mut self.pages, self.geometry.page_size());
+        let (data, size) = (&mut self.data, self.geometry.page_size());
         let p = self.alloc.allocate(|count| {
-            if pages.len() < count as usize {
-                pages.resize(count as usize, vec![0; size]);
+            if data.len() < count as usize * size {
+                data.resize(count as usize * size, 0);
             }
             Ok(())
         })?;
-        self.pages[p as usize].fill(0);
+        self.raw_mut(p).fill(0);
         Ok(p)
     }
 
@@ -273,11 +348,36 @@ impl PageWrite for MemStore {
         if !self.alloc.is_private(pgno) {
             return Err(Error::Failed(format!("page {pgno} is not private: copy it first")));
         }
-        Ok(&mut self.pages[pgno as usize])
+        Ok(self.raw_mut(pgno))
     }
 
     fn free(&mut self, pgno: u32) {
         self.alloc.free(pgno);
+    }
+
+    fn run_privacy(&self, pgno: u32, npages: u32) -> Option<bool> {
+        self.alloc.run_privacy(pgno, npages)
+    }
+
+    fn alloc_run(&mut self, npages: u32) -> Result<u32> {
+        let (data, size) = (&mut self.data, self.geometry.page_size());
+        self.alloc.allocate_run(npages, |count| {
+            if data.len() < count as usize * size {
+                data.resize(count as usize * size, 0);
+            }
+            Ok(())
+        })
+    }
+
+    fn run_mut(&mut self, pgno: u32, npages: u32) -> Result<&mut [u8]> {
+        if self.alloc.run_privacy(pgno, npages) != Some(true) {
+            return Err(Error::Failed(format!("run {pgno} is not private: it is immutable")));
+        }
+        Ok(self.raw_span_mut(pgno, npages as usize * self.geometry.page_size()))
+    }
+
+    fn free_run(&mut self, pgno: u32, npages: u32) {
+        self.alloc.free_run(pgno, npages);
     }
 
     fn take_scratch(&mut self) -> Scratch {
@@ -286,6 +386,14 @@ impl PageWrite for MemStore {
 
     fn put_scratch(&mut self, scratch: Scratch) {
         self.scratch = scratch;
+    }
+
+    fn no_merge(&self) -> bool {
+        self.no_merge
+    }
+
+    fn merges_applied(&mut self, report: MergeReport) {
+        self.merge_report = report;
     }
 }
 
@@ -307,13 +415,20 @@ impl PageRead for ReadView<'_> {
 
     fn page(&self, pgno: u32) -> Result<&[u8]> {
         checked_page(pgno, self.store.alloc.page_count(), self.txn, false, |p| {
-            self.store.pages.get(p as usize).map(Vec::as_slice)
+            self.store.span(p, self.store.geometry.page_size())
         })
     }
 
     fn child(&self, pgno: u32, want_txn: u32) -> Result<&[u8]> {
         checked_child(pgno, want_txn, self.store.alloc.page_count(), self.txn, false, |p| {
-            self.store.pages.get(p as usize).map(Vec::as_slice)
+            self.store.span(p, self.store.geometry.page_size())
+        })
+    }
+
+    fn run(&self, ovf: Ovf, verify: RunCrc) -> Result<&[u8]> {
+        let size = self.store.geometry.page_size();
+        checked_run(ovf, size, self.store.alloc.page_count(), self.txn, false, verify, |p, len| {
+            self.store.span(p, len)
         })
     }
 }
@@ -327,6 +442,8 @@ pub(crate) struct Walk {
     pub(crate) pages: Vec<u32>,
     /// The leaves, left to right.
     pub(crate) leaves: Vec<u32>,
+    /// The pages of the overflow runs the leaves name.
+    pub(crate) overflow_pages: usize,
 }
 
 /// A walk of one tree, checking its structure (see [`walk_tree`]).
@@ -367,6 +484,14 @@ impl<'s, S: PageRead + ?Sized> Walker<'s, S> {
                 if let Some((last, _)) = self.walk.entries.last() {
                     assert!(last.as_slice() < k, "leaf {p}: key {i} is not above the last key");
                 }
+                if let Val::Overflow(ovf) = v {
+                    let n = run_pages(ovf.len as usize, self.geometry.page_size()) as u32;
+                    for q in ovf.pgno..ovf.pgno + n {
+                        assert!(self.seen.insert(q), "leaf {p}: run page {q} is reached twice");
+                    }
+                    self.walk.overflow_pages += n as usize;
+                }
+                let v = self.store.value(v).unwrap_or_else(|e| panic!("leaf {p}, key {i}: {e}"));
                 self.walk.entries.push((k.to_vec(), v.to_vec()));
             }
             self.walk.leaves.push(p);
@@ -392,7 +517,9 @@ impl<'s, S: PageRead + ?Sized> Walker<'s, S> {
 /// parent's cell (or the root handle) names, has a valid or dirty (never a wrong) CRC, and is
 /// reached once; every leaf is at depth `height` and every branch above it; only a root leaf is
 /// empty and a root branch has two children or more; every key lies in the range its ancestors'
-/// separators give it and keys ascend strictly across the tree; and the entry count matches.
+/// separators give it and keys ascend strictly across the tree; every overflow value reads back
+/// through the store's checked run read, and no run page is reached twice; and the entry count
+/// and the page counters (branch, leaf, overflow) match.
 pub(crate) fn walk_tree<S: PageRead + ?Sized>(store: &S, root: &TreeRoot) -> Walk {
     root.check().expect("root shape");
     let mut walker = Walker {
@@ -405,8 +532,15 @@ pub(crate) fn walk_tree<S: PageRead + ?Sized>(store: &S, root: &TreeRoot) -> Wal
     if !root.is_empty() {
         walker.visit(root.root, root.root_txn, 1, None, None);
     }
-    assert_eq!(walker.walk.entries.len() as u64, root.entries, "the root's entry count");
-    walker.walk
+    let walk = walker.walk;
+    assert_eq!(walk.entries.len() as u64, root.entries, "the root's entry count");
+    let (leaves, branches) = (walk.leaves.len(), walk.pages.len() - walk.leaves.len());
+    assert_eq!(
+        (root.branch_pages as usize, root.leaf_pages as usize, root.overflow_pages as usize),
+        (branches, leaves, walk.overflow_pages),
+        "the root's page counters (branch, leaf, overflow) against the pages walked"
+    );
+    walk
 }
 
 /// The fraction of the leaves' usable bytes their entries fill.
@@ -417,4 +551,114 @@ pub(crate) fn leaf_fill<S: PageRead + ?Sized>(store: &S, leaves: &[u32]) -> f64 
         .map(|&p| usable - page::free_space(store.page(p).expect("leaf")).expect("free"))
         .sum();
     used as f64 / (leaves.len() * usable) as f64
+}
+
+/// A hash of a page's kind, cell count and outer keys (the first and last keys of a leaf; key
+/// 1 and the last of a branch, whose cell 0 has no key). A page only copied keeps it; a page that
+/// lost a cell or absorbed a sibling does not, nor does it match another page of its level (keys
+/// and separators are unique within a level), save single-child branches, which all look alike.
+fn key_list_hash(buf: &[u8]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    let n = page::nkeys(buf);
+    let key = |i: usize| match page::kind(buf).expect("kind") {
+        Kind::Leaf => page::leaf_entry(buf, i).expect("entry").0,
+        Kind::Branch => page::branch_key(buf, i).expect("key"),
+    };
+    (page::kind(buf).ok() == Some(Kind::Leaf), n).hash(&mut h);
+    if n > 0 {
+        (key(1.min(n - 1)), key(n - 1)).hash(&mut h);
+    }
+    h.finish()
+}
+
+/// The pages of `root`'s levels, the root first.
+fn levels<S: PageRead + ?Sized>(store: &S, root: &TreeRoot) -> Vec<Vec<u32>> {
+    let mut levels = Vec::new();
+    let mut level = if root.is_empty() { vec![] } else { vec![root.root] };
+    for depth in 1..=root.height {
+        let mut next = Vec::new();
+        if depth < root.height {
+            for &p in &level {
+                let buf = store.page(p).expect("branch");
+                next.extend(
+                    (0..page::nkeys(buf)).map(|i| page::branch_child(buf, i).expect("c").0),
+                );
+            }
+        }
+        levels.push(std::mem::replace(&mut level, next));
+    }
+    levels
+}
+
+/// The key lists of `root`'s pages ([`key_list_hash`]), level by level from the leaves up
+/// (index 0: the leaves), for [`merge_open_pages`].
+pub(crate) fn level_keys<S: PageRead + ?Sized>(store: &S, root: &TreeRoot) -> Vec<HashSet<u64>> {
+    let mut levels = levels(store, root);
+    levels.reverse();
+    levels
+        .iter()
+        .map(|level| level.iter().map(|&p| key_list_hash(store.page(p).expect("page"))).collect())
+        .collect()
+}
+
+/// The non-root pages of `root` that hold under a quarter of `U` beside a same-parent sibling
+/// they would fit into: the merged page's cells and slots, `used + used(sibling)`, plus for
+/// branches the parent's key for the right page of the pair (it comes down as that page's cell-0
+/// key), within `U`. With `before` ([`level_keys`] of the tree before a delete), only the pages
+/// the delete changed count (a key list new at its level); with an empty `before`, every page.
+/// After a delete with merging on, the changed pages are merge-closed: this is empty.
+pub(crate) fn merge_open_pages<S: PageRead + ?Sized>(
+    store: &S,
+    root: &TreeRoot,
+    before: &[HashSet<u64>],
+) -> Vec<u32> {
+    let usable = store.geometry().usable();
+    let used = |p: u32| usable - page::free_space(store.page(p).expect("page")).expect("free");
+    let mut open = Vec::new();
+    let levels = levels(store, root);
+    for (depth, level) in levels.iter().enumerate().take(levels.len().saturating_sub(1)) {
+        // The level index of the children, counted from the leaves.
+        let below = levels.len() - depth - 2;
+        for &p in level {
+            let buf = store.page(p).expect("branch");
+            let n = page::nkeys(buf);
+            let kids: Vec<u32> = (0..n).map(|i| page::branch_child(buf, i).expect("c").0).collect();
+            for (i, &c) in kids.iter().enumerate() {
+                let cb = store.page(c).expect("child");
+                let changed = before.get(below).is_none_or(|set| !set.contains(&key_list_hash(cb)));
+                if !changed || 4 * used(c) >= usable {
+                    continue;
+                }
+                let leaf = page::kind(cb).ok() == Some(Kind::Leaf);
+                let fits = |j: usize, right: usize| {
+                    let sep =
+                        if leaf { 0 } else { page::branch_key(buf, right).expect("key").len() };
+                    used(c) + used(kids[j]) + sep <= usable
+                };
+                if (i > 0 && fits(i - 1, i)) || (i + 1 < n && fits(i + 1, i + 1)) {
+                    open.push(c);
+                }
+            }
+        }
+    }
+    open
+}
+
+/// The fraction of the usable bytes of the tree's pages (all of them, or only its leaves) their
+/// cells and slots fill.
+pub(crate) fn page_fill<S: PageRead + ?Sized>(
+    store: &S,
+    root: &TreeRoot,
+    leaves_only: bool,
+) -> f64 {
+    let levels = levels(store, root);
+    let pages: Vec<u32> =
+        if leaves_only { levels.last().cloned().unwrap_or_default() } else { levels.concat() };
+    let usable = store.geometry().usable();
+    let used: usize = pages
+        .iter()
+        .map(|&p| usable - page::free_space(store.page(p).expect("page")).expect("free"))
+        .sum();
+    used as f64 / (pages.len().max(1) * usable) as f64
 }

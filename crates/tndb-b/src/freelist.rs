@@ -1,29 +1,35 @@
 //! The free list: a B+tree (the free tree, named by the meta) of the pages committed transactions
 //! freed, LMDB style.
 //!
-//! A record's key is `txn u64 BE | seq u32 BE` (the committing transaction and a sequence number,
-//! so records sort by txn) and its value the page numbers, strictly ascending, as `u32` LE (at
-//! most [`record_capacity`] of them; an empty value is allowed).
+//! A record's key is `txn u64 BE | seq u32 BE` (a transaction and a sequence number, so records
+//! sort by txn) and its value the page numbers, strictly ascending, as `u32` LE (at most
+//! [`record_capacity`] of them; an empty value is allowed).
 //!
 //! **Loading.** A write transaction reuses a page only once no durable meta and no live reader
-//! can reach it. Every page a record of txn `M` lists is unreachable from the states `M`
-//! onwards, so the writer takes records in key order ([`next_record`]), smallest first, while
-//! their txn is no later than the reuse gate: the lower txn of the two meta slots and the oldest
-//! snapshot a reader may hold (`Writer::reuse_gate`). In `SyncMode::Durable` a page freed by txn
-//! `N` is thus reusable from txn `N + 2`; in `SyncMode::NoSync` the slots move only at a sync,
-//! so it comes back once two syncs have made states from `N` on durable in both slots. A record's
-//! pages are checked before any is handed out ([`decode_pages`]): the leaf holding it passes its
-//! CRC and structure checks, and each page is a tree page of the state (`2 <= p < page_count`),
-//! strictly ascending, and not already taken from the list by this transaction. The free tree
-//! itself is not changed while the transaction runs.
+//! can reach it. A record's txn is the reuse gate its pages wait for: once the gate reaches it,
+//! no state a durable meta or a reader still holds reaches them. So the writer takes records in
+//! key order ([`next_record`]), smallest first, while their txn is no later than the reuse gate:
+//! the lower txn of the two meta slots and the oldest snapshot a reader may hold
+//! (`Writer::reuse_gate`). The pages a transaction `N` freed are listed under `N`: in
+//! `SyncMode::Durable` they are reusable from txn `N + 2`; in `SyncMode::NoSync` the slots move
+//! only at a sync, so they come back once two syncs have made states from `N` on durable in both
+//! slots. A record's pages are checked before any is handed out ([`decode_pages`]): the leaf
+//! holding it passes its CRC and structure checks, and each page is a tree page of the state
+//! (`2 <= p < page_count`), strictly ascending, and not already taken from the list by this
+//! transaction. The free tree itself is not changed while the transaction runs.
 //!
 //! **Saving** at commit ([`save`]), with loading stopped (pages come from the pool or the end of
-//! the file): the records taken are deleted, then the pages to list — those the transaction
-//! freed and those left in its pool — are written as records `(M, 0..k)` of the committing txn
-//! `M`. Writing them can take pages from the pool and free pages of the free tree, which changes
-//! the list, so it is written again until it lists exactly what it should: a fixed point,
-//! reached in at most three rounds. Keys are never deleted inside the loop (a record no longer
-//! needed is left empty), so a round never frees a page a later round must list.
+//! the file): the records taken are deleted, then the pages to list are written. Those left in the
+//! pool (taken from records, or added to the file by this transaction, and in no tree now) are
+//! free in every state a durable meta or a reader holds, so they go back under the keys of the
+//! records taken, which the gate has passed, and the next transaction may take them at once, as
+//! LMDB and MDBX do. Those the transaction freed, and pool pages past what the keys taken hold,
+//! are written as records `(M, 0..k)` of the committing txn `M`. Two records never list one page:
+//! the records taken are gone, and the keys taken are free for the save to write. Writing can take
+//! pages from the pool and free pages of the free tree, which changes the lists, so they are
+//! written again until they list exactly what they should: a fixed point, reached in at most three
+//! rounds. Keys are never deleted inside the loop (a record no longer needed is left empty), so a
+//! round never frees a page a later round must list.
 
 use crate::{
     crc::{self, CrcState},
@@ -42,7 +48,9 @@ const MAX_ROUNDS: u32 = 8;
 /// A free record's key: the transaction that wrote it and a sequence number.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct RecordKey {
-    /// The committing transaction: every page listed is unreachable from its state on.
+    /// The reuse gate the pages listed wait for: the committing transaction for the pages it
+    /// freed, the txn of a record taken (which the gate had passed) for the pages a commit took
+    /// from the list and left unused.
     pub(crate) txn: u64,
     /// The record's place among its transaction's records.
     pub(crate) seq: u32,
@@ -124,7 +132,7 @@ pub(crate) fn next_record<'s, S: PageRead + ?Sized>(
         let (Search::Found(i) | Search::NotFound(i)) = page::leaf_search(leaf.page, &probe)?;
         if i < page::nkeys(leaf.page) {
             let (key, value) = page::leaf_entry(leaf.page, i)?;
-            return Ok(Some((RecordKey::decode(key)?, value)));
+            return Ok(Some((RecordKey::decode(key)?, value.inline()?)));
         }
         match leaf.hi {
             None => return Ok(None),
@@ -169,29 +177,38 @@ pub(crate) fn encode_pages(pages: &[u32]) -> Vec<u8> {
     pages.iter().flat_map(|p| p.to_le_bytes()).collect()
 }
 
-/// Save the free list at commit (see the module docs) into the working free tree `free`, as
-/// records of the committing transaction: delete the records the transaction took, then write
-/// the pages it freed and those left in its pool until the records list exactly them. Returns the
-/// number of write rounds. Afterwards the pool and the freed pages are empty: the tree lists
-/// them. Loading stays stopped until the next transaction begins.
+/// Save the free list at commit (see the module docs) into the working free tree `free`: delete
+/// the records the transaction took, then write the pages left in its pool under the keys of the
+/// records taken (the pages that do not fit there, and those it freed, as records of the
+/// committing transaction) until the records list exactly them. Returns the number of write
+/// rounds. Afterwards the pool and the freed pages are empty: the tree lists them. Loading stays
+/// stopped until the next transaction begins.
 pub(crate) fn save(writer: &mut Writer, free: &mut TreeRoot) -> Result<u32> {
     writer.alloc.stop_loading();
     // The free root's provenance ([`write::put_sized`]): the committed root is published.
     let mut trusted = false;
-    for key in writer.alloc.take_consumed() {
+    let taken = writer.alloc.take_consumed();
+    for key in &taken {
         if !write::delete(writer, free, &mut trusted, &key.encode())? {
             return Err(Error::Failed(format!("free list: the record {key:?} taken has vanished")));
         }
     }
     let txn = writer.alloc.txn();
     let capacity = record_capacity(&writer.geometry);
-    let mut written: Vec<Vec<u8>> = Vec::new();
+    #[cfg(test)]
+    let capacity = writer.record_pages.unwrap_or(capacity);
+    // The records as last written: under the keys taken, and under the committing txn.
+    let mut written: [Vec<Vec<u8>>; 2] = Default::default();
     for round in 0..=MAX_ROUNDS {
-        let mut want: Vec<Vec<u8>> =
-            writer.alloc.reusable()?.chunks(capacity).map(encode_pages).collect();
-        if want.len() < written.len() {
-            want.resize(written.len(), Vec::new());
+        let (mut pool, mut freed) = writer.alloc.reusable()?;
+        // Pool pages past what the keys taken hold (the highest: pages this transaction added to
+        // the file and freed again) wait under the committing txn.
+        let room = taken.len() * capacity;
+        if pool.len() > room {
+            freed.extend(pool.drain(room..));
+            freed.sort_unstable();
         }
+        let want = [records(&pool, capacity, &written[0]), records(&freed, capacity, &written[1])];
         if want == written {
             writer.alloc.saved();
             return Ok(round);
@@ -199,21 +216,37 @@ pub(crate) fn save(writer: &mut Writer, free: &mut TreeRoot) -> Result<u32> {
         if round == MAX_ROUNDS {
             break;
         }
-        for (seq, value) in want.iter().enumerate() {
-            if written.get(seq) == Some(value) {
-                continue;
-            }
-            let key = RecordKey { txn, seq: seq as u32 };
-            let replaced = write::put(writer, free, &mut trusted, &key.encode(), value)?;
-            if replaced != (seq < written.len()) {
-                return Err(Error::Corrupt(format!(
-                    "free list: a record {key:?} of the committing transaction already exists"
-                )));
+        for (list, (want, written)) in want.iter().zip(&written).enumerate() {
+            for (seq, value) in want.iter().enumerate() {
+                if written.get(seq) == Some(value) {
+                    continue;
+                }
+                let key = match list {
+                    0 => taken[seq],
+                    _ => RecordKey { txn, seq: seq as u32 },
+                };
+                let replaced = write::put(writer, free, &mut trusted, &key.encode(), value)?;
+                if replaced != (seq < written.len()) {
+                    return Err(Error::Corrupt(format!(
+                        "free list: a record {key:?} the save writes already exists"
+                    )));
+                }
             }
         }
         written = want;
     }
     Err(Error::Failed(format!("free list: the save did not settle in {MAX_ROUNDS} rounds")))
+}
+
+/// `pages` as record values of at most `capacity` pages each, padded with empty values to as
+/// many records as `written` holds: a record written in an earlier round and no longer needed is
+/// left empty, never deleted inside the loop.
+fn records(pages: &[u32], capacity: usize, written: &[Vec<u8>]) -> Vec<Vec<u8>> {
+    let mut values: Vec<Vec<u8>> = pages.chunks(capacity).map(encode_pages).collect();
+    if values.len() < written.len() {
+        values.resize(written.len(), Vec::new());
+    }
+    values
 }
 
 #[cfg(test)]

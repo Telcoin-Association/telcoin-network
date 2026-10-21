@@ -1,6 +1,7 @@
 //! Free-list tests: the record codec, gated reuse (held readers, durability, `SyncMode::NoSync`),
-//! bounded growth, reuse of dropped and cleared tables, the save's fixed point, exact page
-//! accounting (`Env::check`) in a randomized workload, damaged records, and power loss.
+//! bounded growth, reuse of dropped and cleared tables (overflow runs included), the save's fixed
+//! point, exact page accounting (`Env::check`) in a randomized workload, damaged records, damaged
+//! runs refused by clear, drop and `Env::check`, and power loss.
 
 use std::{
     collections::{BTreeMap, HashMap},
@@ -16,8 +17,11 @@ use crate::{
     catalog, disk_model,
     env::{Env, EnvOptions, SyncMode},
     meta::{Meta, PAGE_SIZES},
-    tree::test_harness::{ReportSeed, Rng},
-    CheckReport, ReadTxn, RoTxn, Table,
+    tree::{
+        test_harness::{ReportSeed, Rng},
+        PageWrite,
+    },
+    CheckReport, Error, ReadTxn, RoTxn, RwTxn, Table, TableStat,
 };
 
 fn temp() -> (TempDir, PathBuf) {
@@ -183,6 +187,68 @@ fn durable_reuse_waits_two_commits() {
     assert_eq!(reuses.iter().map(|&(t, n, _)| t - n).min(), Some(2), "and as soon as that");
 }
 
+/// The free records of the newest state, in key order, with the pages each lists.
+fn free_records(env: &Env) -> Vec<(RecordKey, Vec<u32>)> {
+    let snapshot = env.inner().current();
+    let mut records = Vec::new();
+    let mut after = None;
+    while let Some((key, value)) =
+        next_record(&*snapshot, &snapshot.meta.free, after).expect("record")
+    {
+        records.push((key, decode_pages(value, snapshot.meta.page_count).expect("pages")));
+        after = Some(key);
+    }
+    records
+}
+
+/// A transaction that takes a free record and uses only some of its pages lists the rest again
+/// under the keys of the records it took, which the gate has passed: the next transaction reuses
+/// them at once, not two commits on as the pages the transaction freed itself.
+#[test]
+fn leftover_pages_are_listed_under_the_keys_taken_and_reused_at_once() {
+    let (_dir, path) = temp();
+    let env = open(&path, SyncMode::Durable);
+    let mut txn = env.begin_rw().expect("begin");
+    let a = txn.create_table("a").expect("a");
+    for i in 0..300 {
+        txn.put(&a, &key(i), &value(i, 0, 700)).expect("put");
+    }
+    txn.commit().expect("commit");
+    let mut txn = env.begin_rw().expect("begin");
+    txn.drop_table(a).expect("drop");
+    let dropped = txn.commit().expect("commit");
+    churn(&env, "s", 1, 0, 8);
+    let loads = |env: &Env, txn: u64| -> Vec<u32> {
+        logs(env).0.iter().filter(|&&(t, _)| t == txn).map(|&(_, p)| p).collect()
+    };
+
+    // The drop's record passes the gate: the next commit takes it and needs a few of its pages.
+    let taker = churn(&env, "s", 1, 1, 8);
+    let taken = loads(&env, taker);
+    assert!(taken.len() > 50, "the drop's record: {taken:?}");
+    let records = free_records(&env);
+    let leftover: Vec<u32> = records
+        .iter()
+        .filter(|(k, _)| k.txn <= dropped)
+        .flat_map(|(_, pages)| pages.iter().copied())
+        .collect();
+    assert!(!leftover.is_empty() && leftover.len() < taken.len(), "{taken:?} then {records:?}");
+    assert!(leftover.iter().all(|p| taken.contains(p)), "only leftovers keep old keys");
+    for (key, pages) in &records {
+        assert!(
+            key.txn <= dropped || pages.iter().all(|p| !taken.contains(p)),
+            "a leftover listed under {key:?}, past the gate: {records:?}"
+        );
+    }
+
+    // The next commit takes them, though no commit has passed since.
+    let next = churn(&env, "s", 1, 2, 8);
+    let reused = loads(&env, next);
+    assert!(!reused.is_empty(), "the leftovers are reused at once");
+    assert!(reused.iter().all(|p| leftover.contains(p)), "{reused:?} not from {leftover:?}");
+    check(&env);
+}
+
 /// In `SyncMode::NoSync` the meta slots move only at a sync: a freed page comes back once both
 /// slots hold states from its freeing on, so after two syncs.
 #[test]
@@ -255,8 +321,7 @@ fn dropped_and_cleared_tables_pages_are_reused() {
     txn.commit().expect("commit");
     let dropped = check(&env);
     assert!(dropped.free_pages >= full.tables["a"].pages, "{dropped:?}");
-    // The drop's pages pass the gate two commits on (a commit taking a record re-lists what it
-    // leaves under its own txn, so the fill comes right then).
+    // The drop's pages pass the gate two commits on.
     small(0);
     let b = fill("b");
     let refilled = check(&env);
@@ -348,12 +413,16 @@ fn a_record_count_that_shrinks_mid_save_leaves_an_empty_record() {
     // eight full records and one page more.
     let writer = txn.writer_mut();
     let want = 8 * capacity + 1;
-    let have = writer.alloc.reusable().expect("reusable").len();
+    let listed = |writer: &crate::env::Writer| {
+        let (pool, freed) = writer.alloc.reusable().expect("reusable");
+        pool.len() + freed.len()
+    };
+    let have = listed(writer);
     let pages: Vec<u32> = (have..want).map(|_| writer.alloc().expect("alloc")).collect();
     for p in pages {
         writer.free(p);
     }
-    assert_eq!(writer.alloc.reusable().expect("reusable").len(), want);
+    assert_eq!(listed(writer), want);
     writer.max_save_rounds = 0;
     let txn_id = txn.commit().expect("commit");
     assert!((2..=3).contains(&env.with_writer(|w| w.max_save_rounds)));
@@ -388,7 +457,8 @@ fn random_workload(seed: u64, page_size: u32, sync: SyncMode, rounds: u32) {
     let (_dir, path) = temp();
     let options = EnvOptions { page_size, sync, ..EnvOptions::default() };
     let mut env = Env::open(&path, options).expect("open");
-    let max_value = env.max_value_len(4);
+    // The inline limit: the workload's values stay in their leaves.
+    let max_value = crate::page::Geometry::new(page_size).expect("geometry").max_value(4);
     type Model = BTreeMap<String, BTreeMap<u32, Vec<u8>>>;
     let mut model: Model = BTreeMap::new();
     let mut readers: Vec<(RoTxn, Model)> = Vec::new();
@@ -546,7 +616,7 @@ fn file_with_records(path: &Path) -> Records {
     let leaf_page = snapshot.page(leaf).expect("leaf");
     let base = leaf_page.as_ptr() as u64;
     let record = |i: usize| {
-        let (k, v) = page::leaf_entry(leaf_page, i).expect("entry");
+        let (k, v) = page::leaf_inline_entry(leaf_page, i).expect("entry");
         assert_eq!(RecordKey::decode(k).expect("key"), RecordKey { txn: 2, seq: i as u32 });
         let offset = u64::from(leaf) * 4096 + (v.as_ptr() as u64 - base);
         (offset, decode_pages(v, snapshot.meta.page_count).expect("pages"))
@@ -693,12 +763,12 @@ fn check_reports_damage_leaks_and_double_uses() {
     let (free, meta) = (snapshot.meta.free, snapshot.meta);
     assert_eq!(free.height, 1, "{free:?}");
     let leaf = snapshot.page(free.root).expect("free leaf");
-    let (_, v) = page::leaf_entry(leaf, 0).expect("record");
+    let (_, v) = page::leaf_inline_entry(leaf, 0).expect("record");
     let listed = decode_pages(v, meta.page_count).expect("pages");
     let value_at = u64::from(free.root) * 4096 + (v.as_ptr() as u64 - leaf.as_ptr() as u64);
     let record = catalog::get(&*snapshot, &meta.catalog, "t").expect("get").expect("t");
     let catalog_leaf = snapshot.page(meta.catalog.root).expect("catalog");
-    let (_, rec) = page::leaf_entry(catalog_leaf, 0).expect("t's record");
+    let (_, rec) = page::leaf_inline_entry(catalog_leaf, 0).expect("t's record");
     let entries_at = u64::from(meta.catalog.root) * 4096
         + (rec.as_ptr() as u64 - catalog_leaf.as_ptr() as u64)
         + 24;
@@ -768,6 +838,78 @@ fn check_reports_damage_leaks_and_double_uses() {
     assert!(leak.contains(&format!("leaked [{}]; used twice []", meta.page_count)), "{leak}");
 }
 
+/// `Env::check` refuses a root branch with one child (its other cells deleted, its CRC stamped
+/// again): the writer never leaves one, since such a root gives way to its child.
+#[test]
+fn check_refuses_a_root_branch_with_one_child() {
+    let (dir, base) = temp();
+    let env = open(&base, SyncMode::Durable);
+    churn(&env, "t", 300, 0, 100);
+    let root = check(&env).tables["t"];
+    assert_eq!(root.height, 2, "{root:?}");
+    let r = {
+        let snapshot = env.inner().current();
+        catalog::get(&*snapshot, &snapshot.meta.catalog, "t").expect("get").expect("t").root.root
+    };
+    drop(env);
+    let path = dir.path().join("single");
+    fs::copy(&base, &path).expect("copy");
+    let file = fs::OpenOptions::new().read(true).write(true).open(&path).expect("open");
+    let mut page = vec![0; 4096];
+    file.read_exact_at(&mut page, u64::from(r) * 4096).expect("read");
+    for i in (1..page::nkeys(&page)).rev() {
+        page::branch_delete(&mut page, i).expect("delete");
+    }
+    crc::add_crc32_nonzero(&mut page);
+    file.write_all_at(&page, u64::from(r) * 4096).expect("write");
+    let env = open(&path, SyncMode::Durable);
+    let err = env.check().expect_err("one child").to_string();
+    assert!(err.contains(&format!("page {r} is a root branch with one child")), "{err}");
+}
+
+/// `Env::check` compares each root's page counters with the pages its walk finds, by kind, and
+/// `table_stat` reports them: a table record counting one leaf, one branch or one overflow page
+/// too many (its shape still possible, its leaf's CRC re-stamped) is `Corrupt`, naming the kind.
+#[test]
+fn check_compares_the_page_counters() {
+    let (dir, base) = temp();
+    let env = open(&base, SyncMode::Durable);
+    churn(&env, "t", 300, 0, 100);
+    let report = check(&env);
+    let ro = env.begin_ro().expect("ro");
+    let stat = ro.table_stat(&ro.open_table("t").expect("open").expect("t")).expect("stat");
+    assert_eq!((stat.height, stat.branch_pages, stat.overflow_pages), (2, 1, 0), "{stat:?}");
+    assert_eq!(u64::from(stat.branch_pages + stat.leaf_pages), report.tables["t"].pages);
+    drop(ro);
+    let snapshot = env.inner().current();
+    let catalog = snapshot.meta.catalog;
+    assert_eq!(catalog.height, 1, "the catalog is one leaf");
+    let leaf = snapshot.page(catalog.root).expect("catalog");
+    let (_, record) = page::leaf_inline_entry(leaf, 0).expect("t's record");
+    let root_at =
+        u64::from(catalog.root) * 4096 + (record.as_ptr() as u64 - leaf.as_ptr() as u64) + 8;
+    drop(snapshot);
+    drop(env);
+
+    let case = |name: &str, offset: u64, count: u32| -> String {
+        let path = dir.path().join(name);
+        fs::copy(&base, &path).expect("copy");
+        patch(&path, offset, count);
+        let env = open(&path, SyncMode::Durable);
+        let err = env.check().expect_err(name).to_string();
+        assert!(env.failure().is_some(), "{name}: a failed check latches");
+        err
+    };
+    let leaves = stat.leaf_pages;
+    let err = case("leaf", root_at + 28, leaves + 1);
+    let want = format!("table \"t\": {leaves} leaf pages, not the {} its root counts", leaves + 1);
+    assert!(err.contains(&want), "{err}");
+    let err = case("branch", root_at + 24, 2);
+    assert!(err.contains("table \"t\": 1 branch pages, not the 2 its root counts"), "{err}");
+    let err = case("overflow", root_at + 12, 1);
+    assert!(err.contains("table \"t\": 0 overflow pages, not the 1 its root counts"), "{err}");
+}
+
 /// The pages of table `t` (two levels) and of the catalog (one) in the newest state.
 fn tree_pages(env: &Env) -> Vec<u32> {
     let snapshot = env.inner().current();
@@ -778,4 +920,665 @@ fn tree_pages(env: &Env) -> Vec<u32> {
         pages.push(page::branch_child(root, i).expect("child").0);
     }
     pages
+}
+
+/// The length of key `i`'s value in [`fill_with_runs`]: an overflow run of 1 to 6 pages for every
+/// 25th key, 100 inline bytes for the rest.
+fn run_value_len(i: u32) -> usize {
+    if i.is_multiple_of(25) {
+        (i / 25 % 6) as usize * 4096 + 2000
+    } else {
+        100
+    }
+}
+
+/// Put keys `0..300` into `t`: 288 inline values and 12 in runs of 1 to 6 pages (42 pages) spread
+/// over the leaves of a two-level tree, or, without `runs`, every value inline.
+fn fill_with_runs(txn: &mut RwTxn, t: &Table, generation: u32, runs: bool) {
+    for i in 0..300 {
+        let len = if runs { run_value_len(i) } else { 100 };
+        txn.put(t, &key(i), &value(i, generation, len)).expect("put");
+    }
+}
+
+fn stat_of(env: &Env, name: &str) -> TableStat {
+    let ro = env.begin_ro().expect("ro");
+    ro.table_stat(&ro.open_table(name).expect("open").expect("the table")).expect("stat")
+}
+
+/// Test-only: the published pages copy-on-write and tree walks have verified on this thread
+/// (debug builds only; 0 in release, where the counter does not exist).
+fn verifies() -> u64 {
+    #[cfg(debug_assertions)]
+    return crate::tree::write::COW_VERIFIES.with(std::cell::Cell::get);
+    #[cfg(not(debug_assertions))]
+    0
+}
+
+/// Clear (or drop) table `name` in one commit. Returns the published pages the free verified
+/// before following them.
+fn free_table(env: &Env, name: &str, drop: bool) -> u64 {
+    let mut txn = env.begin_rw().expect("begin");
+    let t = txn.open_table(name).expect("open").expect("the table");
+    let before = verifies();
+    if drop { txn.drop_table(t) } else { txn.clear_table(&t) }.expect("free");
+    let verified = verifies() - before;
+    txn.commit().expect("commit");
+    verified
+}
+
+/// A cleared table holding overflow runs, and a dropped one, gives every run page to the free list
+/// (`Env::check` accounts for each, as single pages), and the next fill of the same values reuses
+/// them once the gate passes. Freeing a table with runs reads and verifies every leaf (each run
+/// it names leaves with it); a table with none keeps the fast path, verifying its branches and no
+/// leaf (debug builds count the verifies of a writer that stamped none of the pages).
+#[test]
+fn cleared_and_dropped_runs_are_freed_and_reused() {
+    let (_dir, path) = temp();
+    let fill = |env: &Env, name: &str, runs: bool| {
+        let mut txn = env.begin_rw().expect("begin");
+        let t = txn.create_table(name).expect("table");
+        fill_with_runs(&mut txn, &t, 0, runs);
+        txn.commit().expect("commit");
+    };
+    let mut generation = 0;
+    for drop in [false, true] {
+        for runs in [true, false] {
+            let name = if runs { "runs" } else { "inline" };
+            let env = open(&path, SyncMode::Durable);
+            fill(&env, name, runs);
+            let full = check(&env);
+            let stat = stat_of(&env, name);
+            let want_overflow = if runs { 42 } else { 0 };
+            assert_eq!((stat.height, stat.overflow_pages), (2, want_overflow), "{stat:?}");
+            let pages = stat.branch_pages + stat.leaf_pages + stat.overflow_pages;
+            assert_eq!(full.tables[name].pages, u64::from(pages), "{full:?}");
+            // A fresh writer: the pages it frees are published and unstamped.
+            std::mem::drop(env);
+            let env = open(&path, SyncMode::Durable);
+
+            let verified = free_table(&env, name, drop);
+            if cfg!(debug_assertions) {
+                let leaves = if runs { stat.leaf_pages } else { 0 };
+                // A drop also copies the catalog's one leaf to delete the table's record.
+                let want = u64::from(stat.branch_pages + leaves + u32::from(drop));
+                assert_eq!(verified, want, "{name} (drop {drop}): pages verified, {stat:?}");
+            }
+            let freed = check(&env);
+            assert!(freed.free_pages >= u64::from(pages), "{name}: {full:?} then {freed:?}");
+            assert_eq!(freed.tables.contains_key(name), !drop, "{freed:?}");
+            // The free passes the gate two commits on, as in
+            // `dropped_and_cleared_tables_pages_are_reused`.
+            churn(&env, "small", 1, generation, 8);
+            generation += 1;
+            fill(&env, name, runs);
+            let again = check(&env);
+            assert_eq!(again.tables[name].pages, u64::from(pages), "{again:?}");
+            assert!(again.page_count <= freed.page_count + 4, "{freed:?} then {again:?}");
+            free_table(&env, name, true);
+            churn(&env, "small", 1, generation, 8);
+            generation += 1;
+        }
+    }
+}
+
+/// A file whose table `t` holds 300 entries ([`fill_with_runs`], 12 runs) and whose free list holds
+/// the pages a second commit (rewriting the first inline values) freed.
+struct RunsFile {
+    /// Each run of `t` in key order, as `(first page, pages, value length)`.
+    runs: Vec<(u32, u32, u32)>,
+    /// `t`'s counters.
+    stat: TableStat,
+    /// The file offset of `t`'s root in its catalog record (the overflow counter is at +12).
+    root_at: u64,
+    /// The free tree's one leaf.
+    free_leaf: u32,
+}
+
+fn file_with_runs(path: &Path) -> RunsFile {
+    let env = open(path, SyncMode::Durable);
+    let mut txn = env.begin_rw().expect("begin");
+    let t = txn.create_table("t").expect("table");
+    fill_with_runs(&mut txn, &t, 0, true);
+    txn.commit().expect("commit");
+    let mut txn = env.begin_rw().expect("begin");
+    for i in 1..20 {
+        txn.put(&t, &key(i), &value(i, 1, 100)).expect("put");
+    }
+    txn.commit().expect("commit");
+    check(&env);
+    let stat = stat_of(&env, "t");
+    let snapshot = env.inner().current();
+    let meta = snapshot.meta;
+    assert_eq!((meta.catalog.height, meta.free.height), (1, 1), "{meta:?}");
+    let record = catalog::get(&*snapshot, &meta.catalog, "t").expect("get").expect("t");
+    let catalog_leaf = snapshot.page(meta.catalog.root).expect("catalog");
+    let (_, rec) = page::leaf_inline_entry(catalog_leaf, 0).expect("t's record");
+    let root_at = u64::from(meta.catalog.root) * 4096
+        + (rec.as_ptr() as u64 - catalog_leaf.as_ptr() as u64)
+        + 8;
+    let root = snapshot.page(record.root.root).expect("root");
+    let mut runs = Vec::new();
+    for c in 0..page::nkeys(root) {
+        let leaf = snapshot.page(page::branch_child(root, c).expect("child").0).expect("leaf");
+        for i in 0..page::nkeys(leaf) {
+            if let (_, page::Val::Overflow(ovf)) = page::leaf_entry(leaf, i).expect("entry") {
+                let n = crate::overflow::run_pages(ovf.len as usize, 4096) as u32;
+                runs.push((ovf.pgno, n, ovf.len));
+            }
+        }
+    }
+    assert_eq!(runs.len(), 12);
+    assert!(runs.iter().map(|r| r.1).eq([1, 2, 3, 4, 5, 6, 1, 2, 3, 4, 5, 6]), "{runs:?}");
+    RunsFile { runs, stat, root_at, free_leaf: meta.free.root }
+}
+
+/// Write `bytes` at `offset` into the run starting at page `first` of `n` pages, then re-stamp the
+/// run's one CRC (unless `stamp` is false), so only the check under test can find the damage.
+fn patch_run(path: &Path, first: u32, n: u32, offset: usize, bytes: &[u8], stamp: bool) {
+    let file = fs::OpenOptions::new().read(true).write(true).open(path).expect("open");
+    let start = u64::from(first) * 4096;
+    let mut run = vec![0; n as usize * 4096];
+    file.read_exact_at(&mut run, start).expect("read");
+    run[offset..offset + bytes.len()].copy_from_slice(bytes);
+    if stamp {
+        crc::add_crc32_nonzero(&mut run);
+    }
+    file.write_all_at(&run, start).expect("write");
+}
+
+/// Clearing or dropping a table whose run is damaged (its header), whose leaf is damaged (one a
+/// table without runs would not read), or whose overflow counter is not what its leaves name is
+/// `Corrupt` before anything is freed: the allocator is untouched, the environment latches, and
+/// the file is byte for byte the damaged one, so a reopen finds the accounting as it was.
+#[test]
+fn a_damaged_run_or_counter_refuses_clear_and_drop() {
+    let (dir, base) = temp();
+    let f = file_with_runs(&base);
+    let (first, n, _) = f.runs[5];
+    assert_eq!(n, 6);
+    let last_leaf = {
+        let env = open(&base, SyncMode::Durable);
+        let snapshot = env.inner().current();
+        let record =
+            catalog::get(&*snapshot, &snapshot.meta.catalog, "t").expect("get").expect("t");
+        let root = snapshot.page(record.root.root).expect("root");
+        page::branch_child(root, page::nkeys(root) - 1).expect("child").0
+    };
+    type Damage<'a> = &'a dyn Fn(&Path);
+    let header: Damage<'_> = &|p| patch_run(p, first, n, 0, &(first + 1).to_le_bytes(), true);
+    let leaf: Damage<'_> = &|p| {
+        let file = fs::OpenOptions::new().read(true).write(true).open(p).expect("open");
+        let at = u64::from(last_leaf) * 4096 + 2000;
+        let mut b = [0];
+        file.read_exact_at(&mut b, at).expect("read");
+        file.write_all_at(&[b[0] ^ 1], at).expect("write");
+    };
+    let counter: Damage<'_> = &|p| patch(p, f.root_at + 12, f.stat.overflow_pages + 1);
+    let cases = [
+        ("header", header, format!("overflow run {first} ")),
+        ("leaf", leaf, format!("page {last_leaf} fails its CRC")),
+        ("counter", counter, "the leaves name 42 overflow pages, the handle counts 43".to_string()),
+    ];
+    for (name, damage, want) in cases {
+        for drop in [false, true] {
+            let path = dir.path().join(format!("{name}-{drop}"));
+            fs::copy(&base, &path).expect("copy");
+            damage(&path);
+            let before = fs::read(&path).expect("read");
+            let env = open(&path, SyncMode::Durable);
+            let mut txn = env.begin_rw().expect("begin");
+            let t = txn.open_table("t").expect("open").expect("t");
+            let state = |txn: &mut RwTxn| {
+                let a = &txn.writer_mut().alloc;
+                (a.freed().len(), a.pool().len(), a.epoch())
+            };
+            let untouched = state(&mut txn);
+            let stat = txn.table_stat(&t).expect("stat");
+            let got = if drop { txn.drop_table(t) } else { txn.clear_table(&t) };
+            match got {
+                Err(Error::Corrupt(e)) => assert!(e.contains(&want), "{name} (drop {drop}): {e}"),
+                other => panic!("{name} (drop {drop}): {other:?}"),
+            }
+            assert_eq!(state(&mut txn), untouched, "{name} (drop {drop}): nothing freed");
+            assert!(env.failure().is_some(), "{name} (drop {drop}): the damage latches");
+            std::mem::drop((txn, env));
+            assert!(fs::read(&path).expect("read") == before, "{name} (drop {drop}): unchanged");
+            assert_eq!(stat_of(&open(&path, SyncMode::Durable), "t"), stat, "{name}: reopened");
+        }
+    }
+}
+
+/// `Env::check` reads every run as a read does, and claims each of its pages: a run failing its
+/// CRC (a flipped byte in a middle page), a run whose header is not its own (CRC re-stamped), a
+/// run with a non-zero pad (CRC re-stamped), an overflow counter that is not the runs' total, and
+/// a run page the free list lists too are each reported.
+#[test]
+fn check_reports_damaged_runs_and_double_claims() {
+    let (dir, base) = temp();
+    let f = file_with_runs(&base);
+    let (first, n, len) = f.runs[4];
+    assert_eq!(n, 5);
+    let case = |name: &str, damage: &dyn Fn(&Path)| -> String {
+        let path = dir.path().join(name);
+        fs::copy(&base, &path).expect("copy");
+        damage(&path);
+        let env = open(&path, SyncMode::Durable);
+        let err = env.check().expect_err(name).to_string();
+        assert!(env.failure().is_some(), "{name}: a failed check latches");
+        err
+    };
+    let crc = case("crc", &|p| patch_run(p, first, n, 2 * 4096 + 7, &[0xA5], false));
+    assert!(crc.contains(&format!("overflow run {first} ")), "{crc}");
+    assert!(crc.contains("fails its CRC"), "{crc}");
+
+    let header = case("header", &|p| patch_run(p, first, n, 5, &[1], true));
+    assert!(header.contains(&format!("overflow run {first} ")), "{header}");
+    assert!(header.contains("the header is not this run's"), "{header}");
+
+    let pad_at = crate::overflow::RUN_HEADER + len as usize + 3;
+    assert!(pad_at < n as usize * 4096 - 4, "the run has a pad");
+    let pad = case("pad", &|p| patch_run(p, first, n, pad_at, &[1], true));
+    assert!(pad.contains(&format!("overflow run {first} has a non-zero pad")), "{pad}");
+
+    let counts = f.stat.overflow_pages;
+    let counter = case("counter", &|p| patch(p, f.root_at + 12, counts - 1));
+    let want =
+        format!("table \"t\": {counts} overflow pages, not the {} its root counts", counts - 1);
+    assert!(counter.contains(&want), "{counter}");
+
+    let middle = first + 2;
+    let twice = case("twice", &|p: &Path| {
+        let file = fs::OpenOptions::new().read(true).write(true).open(p).expect("open");
+        let start = u64::from(f.free_leaf) * 4096;
+        let mut page = vec![0; 4096];
+        file.read_exact_at(&mut page, start).expect("read");
+        let (_, v) = page::leaf_inline_entry(&page, 0).expect("record");
+        let mut listed = decode_pages(v, u32::MAX).expect("pages");
+        listed.push(middle);
+        listed.sort_unstable();
+        let fit = page::leaf_replace_value(&mut page, 0, &encode_pages(&listed)).expect("fits");
+        assert!(fit == page::Fit::Done);
+        crc::add_crc32_nonzero(&mut page);
+        file.write_all_at(&page, start).expect("write");
+    });
+    let want = format!("leaked []; used twice [{middle} (table \"t\" and free list)]");
+    assert!(twice.contains(&want), "{twice}");
+}
+
+/// Key `25 * k`'s value read from the file at `path` in a fresh environment, which is returned too
+/// (to see whether the read latched).
+fn get_run_key(path: &Path, k: u32) -> (Env, Result<Vec<u8>>) {
+    let env = open(path, SyncMode::Durable);
+    let ro = env.begin_ro().expect("ro");
+    let t = ro.open_table("t").expect("open").expect("t");
+    let got = ro.get(&t, &key(25 * k)).map(|v| v.expect("a hit").to_vec());
+    drop(ro);
+    (env, got)
+}
+
+/// A read skips the CRC of a 1-page run, as it skips a leaf's: a flipped byte inside the value is
+/// returned as stored, and `Env::check`, which verifies every run's CRC, reports it, as it reports
+/// a flipped byte inside a leaf.
+#[test]
+fn check_finds_a_flip_inside_a_one_page_run() {
+    let (_dir, path) = temp();
+    let f = file_with_runs(&path);
+    let (first, n, len) = f.runs[0];
+    assert_eq!(n, 1);
+    patch_run(&path, first, n, crate::overflow::RUN_HEADER + 100, &[0xA5], false);
+    let (env, got) = get_run_key(&path, 0);
+    let got = got.expect("a 1-page run's read checks its header, not its CRC");
+    assert_eq!(got.len(), len as usize);
+    assert_ne!(got, value(0, 0, len as usize), "the flipped byte");
+    let err = env.check().expect_err("check verifies the run's CRC").to_string();
+    assert!(err.contains(&format!("overflow run {first} ")), "{err}");
+    assert!(err.contains("fails its CRC"), "{err}");
+}
+
+/// A read of a 1-page run whose page now holds another page is `Corrupt`, by its header alone (the
+/// CRC is valid): another 1-page run of the same commit and length (only the page number in its
+/// header differs), and a leaf. The read latches.
+#[test]
+fn a_get_refuses_a_one_page_run_reused_as_another_page() {
+    let (dir, base) = temp();
+    let f = file_with_runs(&base);
+    let ((first, n, len), (other, other_n, other_len)) = (f.runs[0], f.runs[6]);
+    assert_eq!((n, other_n, len), (1, 1, other_len), "two 1-page runs of the same length");
+    let leaf = f.free_leaf;
+    for (name, from, want) in [
+        ("another run", other, "the header is not this run's"),
+        ("a leaf", leaf, "the header is not this run's"),
+    ] {
+        let path = dir.path().join(name);
+        fs::copy(&base, &path).expect("copy");
+        let file = fs::OpenOptions::new().read(true).write(true).open(&path).expect("open");
+        let mut page = vec![0; 4096];
+        file.read_exact_at(&mut page, u64::from(from) * 4096).expect("read");
+        file.write_all_at(&page, u64::from(first) * 4096).expect("write");
+        let (env, got) = get_run_key(&path, 0);
+        match got {
+            Err(Error::Corrupt(e)) => {
+                assert!(e.contains(&format!("overflow run {first} ")) && e.contains(want), "{e}")
+            }
+            other => panic!("{name}: {other:?}"),
+        }
+        assert!(env.failure().is_some(), "{name}: the damage latches");
+    }
+}
+
+/// A read of a run of more than one page verifies its CRC: a flipped byte in a middle page, which
+/// has no header of its own, is `Corrupt` at get, and latches.
+#[test]
+fn a_get_refuses_a_flip_in_a_middle_page_of_a_run() {
+    let (_dir, path) = temp();
+    let f = file_with_runs(&path);
+    let (first, n, _) = f.runs[4];
+    assert_eq!(n, 5);
+    patch_run(&path, first, n, 2 * 4096 + 7, &[0xA5], false);
+    let (env, got) = get_run_key(&path, 4);
+    match got {
+        Err(Error::Corrupt(e)) => {
+            assert!(e.contains(&format!("overflow run {first} ")) && e.contains("fails its CRC"))
+        }
+        other => panic!("{other:?}"),
+    }
+    assert!(env.failure().is_some(), "the damage latches");
+}
+
+/// A file for run allocation's step 2 (`Writer::alloc_run`): table `t` holds keys `0..100`, each
+/// in a one-page run, written in order (the runs are consecutive pages); one commit deleted every
+/// odd key below 90 (single run pages), the next deleted keys 96, 97 and 98 (three consecutive run
+/// pages). A reader held across both kept their records in the free list until a later commit,
+/// after which the gate passes both. `record_pages` caps the pages one record lists
+/// (`Writer::record_pages`) for every commit.
+struct ScatteredRecords {
+    env: Env,
+    /// Each key's run, by key.
+    runs: Vec<u32>,
+}
+
+fn scattered_records(path: &Path, record_pages: Option<usize>) -> ScatteredRecords {
+    let env = open(path, SyncMode::Durable);
+    env.with_writer(|w| w.record_pages = record_pages);
+    let mut txn = env.begin_rw().expect("begin");
+    let t = txn.create_table("t").expect("t");
+    for i in 0..100 {
+        txn.put(&t, &key(i), &value(i, 0, 3000)).expect("put");
+    }
+    txn.commit().expect("commit");
+    let snapshot = env.inner().current();
+    let record = catalog::get(&*snapshot, &snapshot.meta.catalog, "t").expect("get").expect("t");
+    let runs: Vec<u32> = (0..100)
+        .map(|i| match crate::tree::read::find(&*snapshot, &record.root, &key(i)) {
+            Ok(Some(page::Val::Overflow(ovf))) => ovf.pgno,
+            other => panic!("key {i}: {other:?}"),
+        })
+        .collect();
+    drop(snapshot);
+    assert!(runs.windows(2).all(|w| w[1] == w[0] + 1), "{runs:?}");
+    let held = env.begin_ro().expect("ro");
+    for keys in [(1..90).step_by(2).collect::<Vec<u32>>(), vec![96, 97, 98]] {
+        let mut txn = env.begin_rw().expect("begin");
+        let t = txn.open_table("t").expect("open").expect("t");
+        for i in keys {
+            assert!(txn.delete(&t, &key(i)).expect("delete"));
+        }
+        txn.commit().expect("commit");
+    }
+    churn(&env, "s", 1, 0, 8);
+    drop(held);
+    check(&env);
+    ScatteredRecords { env, runs }
+}
+
+/// The records a writer loaded, by any allocation.
+fn records_loaded(w: &crate::env::Writer) -> u64 {
+    w.alloc.run_stats.records
+}
+
+/// A run with no fit in the pool loads more records that pass the gate before it grows the file:
+/// the first record (the odd keys' single pages) holds no three consecutive pages, the next one
+/// does, and the run takes them.
+#[test]
+fn a_run_takes_a_fit_from_records_loaded_for_it() {
+    let (_dir, path) = temp();
+    let f = scattered_records(&path, None);
+    let mut txn = f.env.begin_rw().expect("begin");
+    let w = txn.writer_mut();
+    let (count, stats) = (w.alloc.page_count(), w.alloc.run_stats);
+    let p = PageWrite::alloc_run(w, 3).expect("run");
+    assert_eq!(p, f.runs[96], "the three pages the second record lists");
+    assert_eq!(w.alloc.page_count(), count, "the file did not grow");
+    assert_eq!(w.alloc.run_stats.steps[1], stats.steps[1] + 1, "{:?}", w.alloc.run_stats);
+    assert_eq!(records_loaded(w), stats.records + 2, "the refill's record, then one more");
+    txn.abort();
+}
+
+/// Run allocation's step 2 loads at most [`RUN_LOAD_RECORDS`] records, however many pages they
+/// list, then the run comes from the end of the file.
+///
+/// [`RUN_LOAD_RECORDS`]: crate::alloc::RUN_LOAD_RECORDS
+#[test]
+fn a_run_loads_at_most_its_budget_of_records() {
+    let budget = u64::from(crate::alloc::RUN_LOAD_RECORDS);
+    for per in [1, 4] {
+        let (_dir, path) = temp();
+        let f = scattered_records(&path, Some(per));
+        let mut txn = f.env.begin_rw().expect("begin");
+        let w = txn.writer_mut();
+        // The refill's record first, so the run's own loading is counted alone.
+        let q = PageWrite::alloc(w).expect("page");
+        PageWrite::free(w, q);
+        let (count, before) = (w.alloc.page_count(), records_loaded(w));
+        let p = PageWrite::alloc_run(w, 3).expect("run");
+        assert_eq!(records_loaded(w) - before, budget, "{per} pages per record");
+        assert!(w.alloc.loading(), "the gate did not stop the loading: the budget did");
+        assert_eq!((p, w.alloc.page_count()), (count, count + 3), "from the end");
+        txn.abort();
+    }
+}
+
+/// An abort after a run allocation that loaded records leaves them in the free tree: the next
+/// transaction loads the same records and takes the same run, and its commit accounts for every
+/// page.
+#[test]
+fn an_abort_returns_the_records_a_run_loaded() {
+    let (_dir, path) = temp();
+    let f = scattered_records(&path, None);
+    let free_root = f.env.inner().current().meta.free;
+    let take = |commit: bool| -> (u32, Vec<u32>) {
+        let before = logs(&f.env).0.len();
+        let mut txn = f.env.begin_rw().expect("begin");
+        let w = txn.writer_mut();
+        let records = records_loaded(w);
+        let p = PageWrite::alloc_run(w, 3).expect("run");
+        assert_eq!(records_loaded(w), records + 2, "the refill's record, then one more");
+        if commit {
+            PageWrite::free_run(w, p, 3);
+            txn.commit().expect("commit");
+        } else {
+            txn.abort();
+        }
+        (p, logs(&f.env).0[before..].iter().map(|&(_, p)| p).collect())
+    };
+    let aborted = take(false);
+    assert_eq!(aborted.0, f.runs[96]);
+    assert_eq!(f.env.inner().current().meta.free, free_root);
+    assert_eq!(f.env.with_writer(|w| w.alloc.last_consumed()), None);
+    assert_eq!(take(true), aborted, "the next transaction loads the same records");
+    check(&f.env);
+}
+
+/// The bytes [`run_churn`] values are cut from: one random buffer, so a value costs a copy.
+fn churn_bytes() -> Vec<u8> {
+    let mut rng = Rng(0x0C4E_17B5);
+    (0..64 * 1024).map(|_| rng.next() as u8).collect()
+}
+
+/// Key `i`'s value of generation `generation` and `len` bytes in [`run_churn`].
+fn churn_value(bytes: &[u8], i: u32, generation: u32, len: usize) -> &[u8] {
+    let at = (i as usize * 7919 + generation as usize * 104_729) % (bytes.len() - len);
+    &bytes[at..at + len]
+}
+
+/// Run allocation under churn, the shape of history shards rewritten at each change: table `t`
+/// holds `keys` values of 4 to 20 KB (overflow runs of 2 to 6 pages at 4 KiB), and each of
+/// `commits` commits rewrites `rewrites` random keys with new random lengths. With `readers`, every
+/// 40th commit a reader is taken and held across four commits, so it holds reuse back for two (a
+/// page freed by txn `N` waits for txn `N + 2` anyway). The file must grow less than 5% over the
+/// second half and never pass `max_ratio` times its live pages (the trees' pages, the free tree's
+/// included) at a report; the save must settle within three rounds, and `Env::check` must pass.
+/// Prints, every twentieth of the run, the page count, the live and free pages, the records loaded
+/// per commit, the share of runs the pool served and the share of each allocation step.
+fn run_churn(keys: u32, rewrites: u32, commits: u32, readers: bool, max_ratio: f64, seed: u64) {
+    let (_dir, path) = temp();
+    let env = open(&path, SyncMode::Durable);
+    let bytes = churn_bytes();
+    let mut rng = Rng(seed);
+    let mut model: Vec<(u32, usize)> = Vec::with_capacity(keys as usize);
+    let mut txn = env.begin_rw().expect("begin");
+    let t = txn.create_table("t").expect("t");
+    for i in 0..keys {
+        let len = 4096 + rng.len_upto(16 * 1024);
+        txn.put(&t, &key(i), churn_value(&bytes, i, 0, len)).expect("put");
+        model.push((0, len));
+    }
+    txn.commit().expect("commit");
+    let every = (commits / 20).max(1);
+    let (mut held, mut mid) = (None::<(u32, RoTxn)>, None);
+    let mut window = env.with_writer(|w| w.alloc.run_stats);
+    eprintln!("commit pages live free ratio records/commit pool-hit steps(pool,loaded,tail,grow)");
+    for c in 1..=commits {
+        if held.as_ref().is_some_and(|&(at, _)| c >= at + 4) {
+            held = None;
+        }
+        if readers && c % 40 == 0 {
+            held = Some((c, env.begin_ro().expect("ro")));
+        }
+        let mut txn = env.begin_rw().expect("begin");
+        let t = txn.open_table("t").expect("open").expect("t");
+        for _ in 0..rewrites {
+            let i = rng.below(u64::from(keys)) as u32;
+            let len = 4096 + rng.len_upto(16 * 1024);
+            txn.put(&t, &key(i), churn_value(&bytes, i, c, len)).expect("put");
+            model[i as usize] = (c, len);
+        }
+        txn.commit().expect("commit");
+        env.with_writer(|w| {
+            w.alloc.load_log.clear();
+            w.alloc.free_log.clear();
+        });
+        if c % every == 0 || c == commits {
+            let r = check(&env);
+            let live = r.catalog_pages + r.table_pages + r.free_tree_pages;
+            let stats = env.with_writer(|w| w.alloc.run_stats);
+            let steps: Vec<u64> = (0..4).map(|s| stats.steps[s] - window.steps[s]).collect();
+            let runs = steps.iter().sum::<u64>().max(1) as f64;
+            let records = (stats.records - window.records) as f64 / f64::from(every);
+            let share: Vec<String> =
+                steps.iter().map(|&s| format!("{:.1}%", s as f64 * 100.0 / runs)).collect();
+            eprintln!(
+                "{c} {} {live} {} {:.2} {records:.1} {:.1}% [{}]",
+                r.page_count,
+                r.free_pages,
+                f64::from(r.page_count) / live as f64,
+                (steps[0] + steps[1]) as f64 * 100.0 / runs,
+                share.join(" "),
+            );
+            window = stats;
+            assert!(
+                f64::from(r.page_count) <= max_ratio * live as f64,
+                "commit {c}: {} pages, {live} live",
+                r.page_count
+            );
+            if c == commits / 2 / every * every {
+                mid = Some(r.page_count);
+            }
+            if c == commits {
+                let mid = mid.expect("a report at the half");
+                let grown = f64::from(r.page_count - mid.min(r.page_count)) / f64::from(mid);
+                assert!(grown < 0.05, "the file grew {:.1}% over the second half", grown * 100.0);
+            }
+        }
+    }
+    drop(held);
+    let rounds = env.with_writer(|w| w.max_save_rounds);
+    assert!(rounds <= 3, "the save took {rounds} rounds");
+    let ro = env.begin_ro().expect("ro");
+    let t = ro.open_table("t").expect("open").expect("t");
+    for (i, &(generation, len)) in model.iter().enumerate() {
+        let got = ro.get(&t, &key(i as u32)).expect("get").expect("a hit");
+        assert!(got == churn_value(&bytes, i as u32, generation, len), "key {i}");
+    }
+}
+
+/// 400 keys, 20 rewrites per commit, 400 commits, no reader
+/// ([`run_churn_with_readers_keeps_the_file_bounded`] holds them).
+#[test]
+fn run_churn_keeps_the_file_bounded() {
+    run_churn(400, 20, 400, false, 2.0, 0xC4E5_0001);
+}
+
+/// 300 keys, 30 rewrites per commit (about a tenth of the pages), 400 commits, with readers held,
+/// at most 1.75 times the live pages (it stays near 1.5). A commit lists the pages it took from
+/// records and left unused under those records' keys, so the next transaction reuses them. Listed
+/// under the committing txn instead, they waited two commits more (longer under a held reader),
+/// later commits took more records and left more over, and the file reached 1.9 times its live
+/// pages here and 2.5 times over 20K commits.
+#[test]
+fn run_churn_with_readers_keeps_the_file_bounded() {
+    run_churn(300, 30, 400, true, 1.75, 0xC4E5_0003);
+}
+
+/// [`run_churn_with_readers_keeps_the_file_bounded`] for 20K commits.
+#[test]
+#[ignore = "heavy: run with --release"]
+fn run_churn_with_readers_keeps_the_file_bounded_heavy() {
+    run_churn(300, 30, 20_000, true, 1.75, 0xC4E5_0004);
+}
+
+/// 2K keys, 100 rewrites per commit, 50K commits, at most 1.5 times the live pages (it stays near
+/// 1.3; with the leftovers listed under the committing txn it passed 1.5). The length matters: a
+/// step 2 that stopped after one record per allocation grew the file slowly enough to pass at 20K
+/// commits, and without bound past that.
+#[test]
+#[ignore = "heavy: run with --release"]
+fn run_churn_keeps_the_file_bounded_heavy() {
+    run_churn(2000, 100, 50_000, true, 1.5, 0xC4E5_0002);
+}
+
+/// A merge frees the sibling it absorbs, which the commit's save must list like any freed page:
+/// commits that delete most of a table's keys in scattered order merge its pages, with one-page
+/// free records (`Writer::record_pages`) so each save writes and takes back many records. Every
+/// save settles in at most three rounds, and `Env::check` passes after every commit. (The free
+/// tree's own deletes run before the save's loop, which only puts, so they cannot feed it.)
+#[test]
+fn merges_feed_the_save_which_still_settles() {
+    let (_dir, path) = temp();
+    let env = open(&path, SyncMode::Durable);
+    env.with_writer(|w| w.record_pages = Some(1));
+    let n = 3_000_u32;
+    let mut txn = env.begin_rw().expect("begin");
+    let t = txn.create_table("t").expect("t");
+    for i in 0..n {
+        txn.put(&t, &key(i * 7919 % n), &value(i, 0, 200)).expect("put");
+    }
+    txn.commit().expect("commit");
+    env.with_writer(|w| (w.max_save_rounds, w.merging_deletes) = (0, 0));
+    let mut rounds = 0;
+    for chunk in 0..9 {
+        let mut txn = env.begin_rw().expect("begin");
+        let t = txn.open_table("t").expect("open").expect("t");
+        for i in (chunk * n / 10..(chunk + 1) * n / 10).map(|i| i * 4801 % n) {
+            assert!(txn.delete(&t, &key(i)).expect("delete"), "key {i}");
+        }
+        txn.writer_mut().max_save_rounds = 0;
+        txn.commit().expect("commit");
+        rounds = rounds.max(env.with_writer(|w| w.max_save_rounds));
+        check(&env);
+    }
+    let merges = env.with_writer(|w| w.merging_deletes);
+    assert!(merges > 50, "{merges} deletes merged");
+    assert!((1..=3).contains(&rounds), "a save took {rounds} rounds");
 }

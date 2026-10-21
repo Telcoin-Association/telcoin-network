@@ -1,11 +1,14 @@
-//! `RwTxn::append`, `RwCursor::put` and `RwCursor::append` against `RwTxn::put`: the same entries
-//! give the same rows and byte-identical files, an append out of order changes nothing and does
-//! not latch, and a cursor put leaves the cursor at its entry.
+//! `RwTxn::append`, `RwCursor::put`, `RwCursor::append` and both inserts against `RwTxn::put`:
+//! the same entries give the same rows and byte-identical files, an append out of order and an
+//! insert of a present key change nothing and do not latch, and a cursor put or insert leaves the
+//! cursor at its entry.
 
 use std::{collections::BTreeMap, fs};
 
 use super::{newest_state, open, temp};
-use crate::{env::SyncMode, tree::test_harness::Rng, Error, Result, RwCursor, RwTxn, Table};
+use crate::{
+    env::SyncMode, tree::test_harness::Rng, Env, Error, ReadTxn, Result, RwCursor, RwTxn, Table,
+};
 
 /// One table's rows.
 type Model = BTreeMap<Vec<u8>, Vec<u8>>;
@@ -212,5 +215,94 @@ fn a_cursor_put_lands_on_its_entry() {
         same_files(&pa, &pb, &format!("round {round}"));
     }
     assert_eq!(newest_state(&ea).get("t"), Some(&model));
+    assert_eq!(newest_state(&ea), newest_state(&eb));
+}
+
+fn exists(result: Result<()>) {
+    assert!(matches!(result, Err(Error::KeyExists)), "expected KeyExists: {result:?}");
+}
+
+/// An insert of `k`, present in `model`, through the transaction or (`cursor`) a cursor first
+/// placed at the table's first entry: `KeyExists`, with the table (its stat and `k`'s value), the
+/// allocator's epoch and the cursor unchanged, and nothing latched.
+fn refused_insert(env: &Env, txn: &mut RwTxn, t: &Table, model: &Model, k: &[u8], cursor: bool) {
+    let owned = |e: Option<(&[u8], &[u8])>| e.map(|(k, v)| (k.to_vec(), v.to_vec()));
+    let epoch = txn.writer_mut().alloc.epoch();
+    let stat = txn.table_stat(t).expect("stat");
+    if cursor {
+        let mut c = txn.cursor_mut(t).expect("cursor");
+        let at = owned(c.first().expect("first"));
+        exists(c.insert(k, b"refused"));
+        assert_eq!(owned(c.current().expect("current")), at, "a refused insert moved the cursor");
+    } else {
+        exists(txn.insert(t, k, &vec![0xEE; 7000]));
+    }
+    assert_eq!(txn.writer_mut().alloc.epoch(), epoch, "a refused insert moved the epoch");
+    assert_eq!(txn.table_stat(t).expect("stat"), stat);
+    assert_eq!(txn.get(t, k).expect("get"), model.get(k).map(Vec::as_slice));
+    assert!(env.failure().is_none(), "a refused insert latched: {:?}", env.failure());
+}
+
+/// `RwTxn::insert` and `RwCursor::insert` of new keys (some values in overflow runs) write the
+/// same file as `RwTxn::put` of the same entries, and a cursor insert leaves the cursor at its
+/// entry. An insert of a present key is `KeyExists` wherever it is found: in the table's cached
+/// leaf right after a write there, on the descent (at the start of a transaction, when nothing is
+/// cached, and for a value too large for a leaf, which never takes the cache), and over a present
+/// value in an overflow run. It changes nothing (see `refused_insert`), and a transaction of
+/// refused inserts only commits nothing.
+#[test]
+fn inserts_match_puts_and_a_present_key_changes_nothing() {
+    let ((_da, pa), (_db, pb)) = (temp("insert-a"), temp("insert-b"));
+    let (ea, eb) = (open(&pa, SyncMode::NoSync), open(&pb, SyncMode::NoSync));
+    let mut rng = Rng(23);
+    let mut model = Model::new();
+    for round in 0..4u64 {
+        let (mut ta, mut tb) = (ea.begin_rw().expect("begin"), eb.begin_rw().expect("begin"));
+        let (t_a, t_b) = (ta.create_table("t").expect("t"), tb.create_table("t").expect("t"));
+        if let Some(k) = model.keys().nth(rng.below(model.len().max(1) as u64) as usize) {
+            refused_insert(&ea, &mut ta, &t_a, &model, &k.clone(), false);
+        }
+        for op in 0..200u64 {
+            let k = key(rng.below(3000));
+            if model.contains_key(&k) {
+                refused_insert(&ea, &mut ta, &t_a, &model, &k, rng.below(2) == 0);
+                continue;
+            }
+            let v = if rng.below(15) == 0 {
+                vec![op as u8; 5000 + rng.below(9000) as usize]
+            } else {
+                val(&mut rng, op)
+            };
+            if rng.below(2) == 0 {
+                ta.insert(&t_a, &k, &v).expect("insert");
+                model.insert(k.clone(), v.clone());
+            } else {
+                let mut cursor = ta.cursor_mut(&t_a).expect("cursor");
+                cursor.insert(&k, &v).expect("cursor insert");
+                model.insert(k.clone(), v.clone());
+                assert_at(&mut cursor, &model, &k, &format!("round {round} op {op}"));
+            }
+            tb.put(&t_b, &k, &v).expect("put");
+            if op % 3 == 0 {
+                // The table's path cache holds the entry's leaf now (unless it split).
+                exists(ta.insert(&t_a, &k, b"again"));
+            }
+        }
+        assert!(ea.failure().is_none(), "a refused insert latched: {:?}", ea.failure());
+        ta.commit().expect("commit");
+        tb.commit().expect("commit");
+        same_files(&pa, &pb, &format!("round {round}"));
+        assert_eq!(newest_state(&ea).get("t"), Some(&model), "round {round}");
+    }
+
+    let before = fs::read(&pa).expect("read");
+    let mut ta = ea.begin_rw().expect("begin");
+    let t = ta.create_table("t").expect("t");
+    let base = ta.txn_id() - 1;
+    for k in model.keys().step_by(7) {
+        exists(ta.insert(&t, k, b"x"));
+    }
+    assert_eq!(ta.commit().expect("commit"), base, "nothing to commit");
+    assert!(fs::read(&pa).expect("read") == before, "the file changed");
     assert_eq!(newest_state(&ea), newest_state(&eb));
 }

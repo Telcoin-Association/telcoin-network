@@ -2,7 +2,7 @@
 //! and single-entry trees, leaf crossings both ways, seeks, damage under a cursor, and the cursors
 //! of the environment's transactions.
 
-use std::{collections::BTreeMap, os::unix::fs::FileExt as _};
+use std::{collections::BTreeMap, os::unix::fs::FileExt as _, sync::Arc};
 
 use tempfile::TempDir;
 
@@ -13,7 +13,7 @@ use crate::{
         test_harness::{walk_tree, MemStore, ReportSeed, Rng},
         write::plain::{delete, put},
     },
-    Env, EnvOptions, ReadTxn, Table,
+    Env, EnvOptions, ReadTxn, RoCursor, Table,
 };
 
 type Kv = (Vec<u8>, Vec<u8>);
@@ -108,6 +108,86 @@ impl Model {
         let i = self.entries.binary_search_by(|(k, _)| k.as_slice().cmp(key)).ok();
         self.go(i, Pos::Unset).map(|(_, v)| v)
     }
+
+    /// `next_in_prefix(n)` (`forward`) or `prev_in_prefix(n)`: to the adjacent entry only if it
+    /// shares the first `n` bytes of the current key; else `None`, the position kept.
+    fn step_in_prefix(&mut self, n: usize, forward: bool) -> Option<Kv> {
+        let Pos::At(i) = self.pos else { return None };
+        let prefix = self.entries[i].0.get(..n)?.to_vec();
+        self.step_to_prefix(if forward { Some(i + 1) } else { i.checked_sub(1) }, &prefix)
+    }
+
+    /// Move to entry `j` if there is one and its key starts with `prefix`; else `None`, the
+    /// position kept.
+    fn step_to_prefix(&mut self, j: Option<usize>, prefix: &[u8]) -> Option<Kv> {
+        let entry = self.entries.get(j?).filter(|(k, _)| k.starts_with(prefix))?.clone();
+        self.pos = Pos::At(j?);
+        Some(entry)
+    }
+
+    /// Apply `op`, returning what the cursor should (a `seek_exact` hit as `(key, value)`).
+    fn apply(&mut self, op: &Op) -> Option<Kv> {
+        match op {
+            Op::First => self.first(),
+            Op::Last => self.last(),
+            Op::Next => self.next(),
+            Op::Prev => self.prev(),
+            Op::Current => self.current(),
+            Op::Seek(key) => self.seek(key),
+            Op::SeekExact(key) => self.seek_exact(key).map(|v| (key.clone(), v)),
+            Op::NextInPrefix(n) => self.step_in_prefix(*n, true),
+            Op::PrevInPrefix(n) => self.step_in_prefix(*n, false),
+        }
+    }
+}
+
+/// One cursor call of the model tests.
+#[derive(Clone, Debug)]
+enum Op {
+    First,
+    Last,
+    Next,
+    Prev,
+    Current,
+    Seek(Vec<u8>),
+    SeekExact(Vec<u8>),
+    NextInPrefix(usize),
+    PrevInPrefix(usize),
+}
+
+impl Op {
+    /// A random call for a cursor whose model is `model`: a seek's key from [`probe`], a prefix
+    /// step's length 0, the current key's length, one past it, 4 (the group of a grouped key) or
+    /// anything up to one past the key.
+    fn pick(rng: &mut Rng, model: &Model) -> Self {
+        match rng.below(10) {
+            0 => Self::First,
+            1 => Self::Last,
+            2 | 3 => Self::Next,
+            4 => Self::Prev,
+            5 => Self::Current,
+            6 => Self::Seek(probe(rng, &model.entries)),
+            7 => Self::SeekExact(probe(rng, &model.entries)),
+            op => {
+                let klen = match model.pos {
+                    Pos::At(i) => model.entries[i].0.len(),
+                    _ => 8,
+                };
+                let n = match rng.below(6) {
+                    0 => 0,
+                    1 => klen,
+                    2 => klen + 1,
+                    3 => 4,
+                    _ => rng.below(klen as u64 + 2) as usize,
+                };
+                if op == 8 {
+                    Self::NextInPrefix(n)
+                } else {
+                    Self::PrevInPrefix(n)
+                }
+            }
+        }
+    }
 }
 
 /// A key to seek: one of the tree's, just after or just before one, the empty key (before every
@@ -161,7 +241,26 @@ trait Moves<'s> {
     fn current(&self) -> Result<Option<Entry<'s>>>;
     fn seek(&mut self, key: &[u8]) -> Result<Option<Entry<'s>>>;
     fn seek_exact(&mut self, key: &[u8]) -> Result<Option<&'s [u8]>>;
+    fn next_in_prefix(&mut self, n: usize) -> Result<Option<Entry<'s>>>;
+    fn prev_in_prefix(&mut self, n: usize) -> Result<Option<Entry<'s>>>;
     fn state(&self) -> State;
+
+    /// Make the call `op` (a `seek_exact` hit returned as `(key, value)`).
+    fn apply(&mut self, op: &Op) -> Option<Kv> {
+        match op {
+            Op::First => owned(self.first().expect("first")),
+            Op::Last => owned(self.last().expect("last")),
+            Op::Next => owned(self.next().expect("next")),
+            Op::Prev => owned(self.prev().expect("prev")),
+            Op::Current => owned(self.current().expect("current")),
+            Op::Seek(key) => owned(self.seek(key).expect("seek")),
+            Op::SeekExact(key) => {
+                self.seek_exact(key).expect("seek_exact").map(|v| (key.clone(), v.to_vec()))
+            }
+            Op::NextInPrefix(n) => owned(self.next_in_prefix(*n).expect("next_in_prefix")),
+            Op::PrevInPrefix(n) => owned(self.prev_in_prefix(*n).expect("prev_in_prefix")),
+        }
+    }
 }
 
 /// A [`TreeCursor`] bound to its store and root.
@@ -193,6 +292,12 @@ impl<'s, S: PageRead + ?Sized> Moves<'s> for Detached<'s, S> {
     fn seek_exact(&mut self, key: &[u8]) -> Result<Option<&'s [u8]>> {
         self.cursor.seek_exact(self.store, &self.root, key)
     }
+    fn next_in_prefix(&mut self, n: usize) -> Result<Option<Entry<'s>>> {
+        self.cursor.step_in_prefix(self.store, &self.root, None, n, true).map(entry)
+    }
+    fn prev_in_prefix(&mut self, n: usize) -> Result<Option<Entry<'s>>> {
+        self.cursor.step_in_prefix(self.store, &self.root, None, n, false).map(entry)
+    }
     fn state(&self) -> State {
         self.cursor.state()
     }
@@ -220,6 +325,12 @@ impl<'s> Moves<'s> for Cursor<'s> {
     fn seek_exact(&mut self, key: &[u8]) -> Result<Option<&'s [u8]>> {
         Cursor::seek_exact(self, key)
     }
+    fn next_in_prefix(&mut self, n: usize) -> Result<Option<Entry<'s>>> {
+        Cursor::next_in_prefix(self, n)
+    }
+    fn prev_in_prefix(&mut self, n: usize) -> Result<Option<Entry<'s>>> {
+        Cursor::prev_in_prefix(self, n)
+    }
     fn state(&self) -> State {
         Cursor::state(self)
     }
@@ -246,31 +357,21 @@ fn run_moves<S: PageRead + Sync>(
 fn run_moves_on<'s>(cursor: &mut impl Moves<'s>, model: &mut Model, rng: &mut Rng, ops: usize) {
     model.pos = Pos::Unset;
     for step in 0..ops {
-        let op = rng.below(8);
-        let (got, want) = match op {
-            0 => (owned(cursor.first().expect("first")), model.first()),
-            1 => (owned(cursor.last().expect("last")), model.last()),
-            2 | 3 => (owned(cursor.next().expect("next")), model.next()),
-            4 => (owned(cursor.prev().expect("prev")), model.prev()),
-            5 => (owned(cursor.current().expect("current")), model.current()),
-            6 => {
-                let key = probe(rng, &model.entries);
-                (owned(cursor.seek(&key).expect("seek")), model.seek(&key))
-            }
-            _ => {
-                let key = probe(rng, &model.entries);
-                let got = cursor.seek_exact(&key).expect("seek_exact");
-                let want = model.seek_exact(&key);
-                (got.map(|v| (key.clone(), v.to_vec())), want.map(|v| (key, v)))
-            }
-        };
-        assert_eq!(got, want, "step {step} op {op} from {:?}", model.pos);
-        assert_eq!(cursor.state(), model.state(), "step {step} op {op}: {:?}", model.pos);
+        let op = Op::pick(rng, model);
+        let from = model.pos;
+        let got = cursor.apply(&op);
+        assert_eq!(got, model.apply(&op), "step {step} {op:?} from {from:?}");
+        assert_eq!(cursor.state(), model.state(), "step {step} {op:?} from {from:?}");
+        if matches!(op, Op::NextInPrefix(_) | Op::PrevInPrefix(_)) {
+            // A prefix step that returns nothing keeps the position.
+            assert_eq!(owned(cursor.current().expect("current")), model.current(), "step {step}");
+        }
     }
 }
 
 /// A tree shape: page size, entries inserted, key lengths, value lengths, and the share of
-/// entries deleted again (leaving sparse leaves: deletes never merge pages).
+/// entries deleted again (leaving part-full leaves: deletes merge only the pages they leave
+/// under a quarter full).
 #[derive(Clone, Copy, Debug)]
 struct Shape {
     page_size: u32,
@@ -278,6 +379,20 @@ struct Shape {
     keys: (usize, usize),
     vmax: usize,
     delete_pct: u64,
+    /// With `g > 0`, every key is one of `g` 4-byte groups followed by the random key (which may
+    /// be empty), so prefix steps of 4 bytes walk a group.
+    groups: u64,
+}
+
+/// A key of `shape`: random, or a random group then a random suffix.
+fn shape_key(rng: &mut Rng, shape: &Shape) -> Vec<u8> {
+    let suffix = random_key(rng, shape.keys.0, shape.keys.1);
+    if shape.groups == 0 {
+        return suffix;
+    }
+    let mut key = (rng.below(shape.groups) as u32).to_be_bytes().to_vec();
+    key.extend_from_slice(&suffix);
+    key
 }
 
 /// Build `shape` (committed) and its model.
@@ -286,7 +401,7 @@ fn build(shape: Shape, rng: &mut Rng) -> (MemStore, TreeRoot, BTreeMap<Vec<u8>, 
     let mut root = TreeRoot::EMPTY;
     let mut model = BTreeMap::new();
     for _ in 0..shape.n {
-        let key = random_key(rng, shape.keys.0, shape.keys.1);
+        let key = shape_key(rng, &shape);
         let value = vec![rng.next() as u8; rng.len_upto(shape.vmax)];
         put(&mut store, &mut root, &key, &value).expect("put");
         model.insert(key, value);
@@ -309,13 +424,17 @@ fn build(shape: Shape, rng: &mut Rng) -> (MemStore, TreeRoot, BTreeMap<Vec<u8>, 
 #[test]
 fn random_moves_match_a_sorted_model() {
     let shapes = [
-        Shape { page_size: 4096, n: 0, keys: (1, 8), vmax: 8, delete_pct: 0 },
-        Shape { page_size: 4096, n: 1, keys: (1, 8), vmax: 8, delete_pct: 0 },
-        Shape { page_size: 4096, n: 40, keys: (1, 24), vmax: 40, delete_pct: 0 },
-        Shape { page_size: 4096, n: 1500, keys: (100, 250), vmax: 100, delete_pct: 0 },
-        Shape { page_size: 4096, n: 2000, keys: (150, 250), vmax: 60, delete_pct: 85 },
-        Shape { page_size: 8192, n: 800, keys: (200, 400), vmax: 200, delete_pct: 30 },
-        Shape { page_size: 65536, n: 3000, keys: (4, 32), vmax: 300, delete_pct: 0 },
+        Shape { page_size: 4096, n: 0, keys: (1, 8), vmax: 8, delete_pct: 0, groups: 0 },
+        Shape { page_size: 4096, n: 1, keys: (1, 8), vmax: 8, delete_pct: 0, groups: 0 },
+        Shape { page_size: 4096, n: 40, keys: (1, 24), vmax: 40, delete_pct: 0, groups: 0 },
+        Shape { page_size: 4096, n: 1500, keys: (100, 250), vmax: 100, delete_pct: 0, groups: 0 },
+        Shape { page_size: 4096, n: 2000, keys: (150, 250), vmax: 60, delete_pct: 85, groups: 0 },
+        Shape { page_size: 8192, n: 800, keys: (200, 400), vmax: 200, delete_pct: 30, groups: 0 },
+        Shape { page_size: 65536, n: 3000, keys: (4, 32), vmax: 300, delete_pct: 0, groups: 0 },
+        // Groups spanning several leaves, and groups of a few short keys (a key may be the bare
+        // group, so a prefix step's length can equal the key's or pass it).
+        Shape { page_size: 4096, n: 1500, keys: (40, 120), vmax: 60, delete_pct: 20, groups: 9 },
+        Shape { page_size: 4096, n: 900, keys: (0, 2), vmax: 300, delete_pct: 10, groups: 300 },
     ];
     let mut max_height = 0;
     for (i, shape) in shapes.into_iter().enumerate() {
@@ -476,6 +595,10 @@ impl<S: PageRead + ?Sized> PageRead for LeafLog<'_, S> {
             self.leaves.lock().expect("log").push(pgno);
         }
         Ok(page)
+    }
+
+    fn run(&self, ovf: crate::overflow::Ovf, verify: crate::overflow::RunCrc) -> Result<&[u8]> {
+        self.store.run(ovf, verify)
     }
 }
 
@@ -754,14 +877,20 @@ fn damage_under_a_write_cursor_latches() {
 fn cursors_are_send_and_sync() {
     fn send_sync<T: Send + Sync>() {}
     send_sync::<Cursor<'static>>();
+    send_sync::<RoCursor>();
 }
 
 /// The model of an [`crate::RwCursor`]: a [`Model`] whose position can also be "after a deleted
-/// entry", given as the index of its follower in the remaining entries (`len`: none).
+/// entry", given as the index of its follower in the remaining entries (`len`: none). As in
+/// MDBX, the cursor is then on the follower: `next` and `current` return it and leave the
+/// deleted state (so `next` after `current` steps past it), `prev` steps back from it, and
+/// `delete_current` deletes it.
 #[derive(Debug)]
 struct RwModel {
     read: Model,
     deleted: Option<usize>,
+    /// The deleted entry's key while `deleted` is set.
+    deleted_key: Vec<u8>,
 }
 
 impl RwModel {
@@ -795,12 +924,9 @@ impl RwModel {
         self.read.prev()
     }
 
-    fn current(&self) -> Option<Kv> {
-        if self.deleted.is_some() {
-            None
-        } else {
-            self.read.current()
-        }
+    fn current(&mut self) -> Option<Kv> {
+        self.take_deleted();
+        self.read.current()
     }
 
     fn put(&mut self, key: &[u8], value: &[u8]) {
@@ -819,15 +945,33 @@ impl RwModel {
         self.read.pos = Pos::At(i);
     }
 
+    /// Delete the entry the cursor is on: after a delete, the follower (the deleted state is
+    /// kept, and the next follower has the same index); with none, nothing changes.
     fn delete_current(&mut self) -> bool {
-        match (self.deleted, self.read.pos) {
-            (None, Pos::At(i)) => {
-                self.read.entries.remove(i);
-                self.deleted = Some(i);
-                true
-            }
-            _ => false,
+        let i = match (self.deleted, self.read.pos) {
+            (Some(i), _) if i < self.read.entries.len() => i,
+            (None, Pos::At(i)) => i,
+            _ => return false,
+        };
+        self.deleted_key = self.read.entries.remove(i).0;
+        self.deleted = Some(i);
+        true
+    }
+
+    /// `next_in_prefix(n)` (`forward`) or `prev_in_prefix(n)`. After a delete the prefix is the
+    /// deleted key's, the candidates are its follower and the entry before it, and a refusal
+    /// keeps the cursor between them.
+    fn step_in_prefix(&mut self, n: usize, forward: bool) -> Option<Kv> {
+        let Some(i) = self.deleted else {
+            return self.read.step_in_prefix(n, forward);
+        };
+        let prefix = self.deleted_key.get(..n)?.to_vec();
+        let entry =
+            self.read.step_to_prefix(if forward { Some(i) } else { i.checked_sub(1) }, &prefix);
+        if entry.is_some() {
+            self.deleted = None;
         }
+        entry
     }
 }
 
@@ -853,12 +997,25 @@ fn rw_cursor_moves_and_writes_match_a_model() {
         let env = Env::open(dir.path().join("db"), options).expect("open");
         let mut rw = env.begin_rw().expect("begin");
         let table = rw.create_table("t").expect("table");
-        let mut model =
-            RwModel { read: Model { entries: Vec::new(), pos: Pos::Unset }, deleted: None };
+        let mut model = RwModel {
+            read: Model { entries: Vec::new(), pos: Pos::Unset },
+            deleted: None,
+            deleted_key: Vec::new(),
+        };
         let mut cursor = rw.cursor_mut(&table).expect("cursor");
-        let mut max_len = 0;
-        for step in 0..10_000 {
-            let op = rng.below(if step % 5000 < 3500 { 10 } else { 12 });
+        let (mut max_len, mut prefix_hits) = (0, 0);
+        // Calls made in the deleted state: a `current` that returned the follower, a delete
+        // that removed it.
+        let (mut current_hits, mut redeletes) = (0, 0);
+        for step in 0..12_000 {
+            // While the table grows, op 12 is one more share of puts (deletes land often: one
+            // in the deleted state removes the follower); after that, deletes take three shares.
+            let growing = step % 6000 < 4200;
+            let op = match rng.below(if growing { 13 } else { 14 }) {
+                12 if growing => 7,
+                op => op,
+            };
+            let after_delete = model.deleted.is_some();
             let (got, want) = match op {
                 0 => {
                     model.deleted = None;
@@ -870,7 +1027,11 @@ fn rw_cursor_moves_and_writes_match_a_model() {
                 }
                 2 => (owned(cursor.next().expect("next")), model.next()),
                 3 => (owned(cursor.prev().expect("prev")), model.prev()),
-                4 => (owned(cursor.current().expect("current")), model.current()),
+                4 => {
+                    let got = owned(cursor.current().expect("current"));
+                    current_hits += usize::from(after_delete && got.is_some());
+                    (got, model.current())
+                }
                 5 => {
                     let key = rw_key(rng.below(keys));
                     model.deleted = None;
@@ -892,9 +1053,21 @@ fn rw_cursor_moves_and_writes_match_a_model() {
                     model.put(&key, &value);
                     (owned(cursor.current().expect("current")), model.current())
                 }
+                9 | 10 => {
+                    // The keys share 60 bytes after `i`: 7 bytes group 256 keys, 8 name one.
+                    let n = [0, 6, 7, 7, 8, 68, 69][rng.below(7) as usize];
+                    let n = if rng.below(4) == 0 { rng.below(70) as usize } else { n };
+                    let got =
+                        if op == 9 { cursor.next_in_prefix(n) } else { cursor.prev_in_prefix(n) };
+                    let got = owned(got.expect("prefix step"));
+                    prefix_hits += usize::from(got.is_some());
+                    let want = model.step_in_prefix(n, op == 9);
+                    (got, want)
+                }
                 _ => {
                     let deleted = cursor.delete_current().expect("delete_current");
                     assert_eq!(deleted, model.delete_current(), "step {step}: delete_current");
+                    redeletes += usize::from(after_delete && deleted);
                     (None, None)
                 }
             };
@@ -913,13 +1086,18 @@ fn rw_cursor_moves_and_writes_match_a_model() {
         assert_eq!(scanned, model.read.entries, "seed {seed}: the committed table");
         env.check().expect("check");
         assert!(max_len > 400 || keys < 100, "seed {seed}: the table grew ({max_len})");
+        assert!(prefix_hits > 100, "seed {seed}: prefix steps moved ({prefix_hits})");
+        assert!(current_hits > 20, "seed {seed}: current after a delete ({current_hits})");
+        assert!(redeletes > 20, "seed {seed}: a delete after a delete ({redeletes})");
     }
 }
 
-/// `delete_current` leaves the cursor between the deleted entry's neighbours: `next` returns the
-/// follower (so first + delete/next removes everything in order), `prev` the entry before, and
-/// `current` nothing; with no entry under the cursor it changes nothing. Over a multi-level tree,
-/// so deletes empty and unlink leaves under the cursor.
+/// `delete_current` leaves the cursor on the deleted entry's follower, as MDBX does: `next`
+/// returns the follower (so first + delete/next removes everything in order), `current` returns
+/// it too and leaves the cursor at it (`next` then steps past it), `prev` returns the entry before
+/// the deleted one, and a second delete removes the follower; with no entry under the cursor, or
+/// no follower, it changes nothing. Over a multi-level tree, so deletes empty and unlink leaves
+/// under the cursor.
 #[test]
 fn delete_current_then_next_returns_the_follower() {
     let (_dir, env) = temp_env();
@@ -936,14 +1114,18 @@ fn delete_current_then_next_returns_the_follower() {
 
     assert!(c.seek_exact(&rw_key(10)).expect("seek").is_some());
     assert!(c.delete_current().expect("delete"));
-    assert_eq!(c.current().expect("current"), None, "nothing under the cursor");
-    assert!(!c.delete_current().expect("delete"), "the deleted entry is gone");
-    assert_eq!(key(c.next().expect("next")), rw_key(11), "next: the follower");
+    assert_eq!(c.state(), (State::At, true));
+    assert!(c.delete_current().expect("delete"), "a second delete removes the follower");
+    assert_eq!(key(c.current().expect("current")), rw_key(12), "current: the follower");
+    assert_eq!(c.state(), (State::At, false), "current leaves the deleted state");
+    assert_eq!(key(c.next().expect("next")), rw_key(13), "next steps past the follower");
     assert!(c.delete_current().expect("delete"));
-    assert_eq!(key(c.prev().expect("prev")), rw_key(9), "prev: the entry before");
+    assert_eq!(key(c.next().expect("next")), rw_key(14), "next: the follower");
+    assert!(c.delete_current().expect("delete"));
+    assert_eq!(key(c.prev().expect("prev")), rw_key(12), "prev: the entry before");
 
     // Delete the rest in order: every next returns the follower of the entry just deleted.
-    let mut deleted = 2;
+    let mut deleted = 4;
     let mut at = key(c.first().expect("first"));
     loop {
         assert!(c.delete_current().expect("delete"));
@@ -971,6 +1153,12 @@ fn delete_current_then_next_returns_the_follower() {
     assert_eq!(key(c.last().expect("last")), rw_key(2));
     assert!(c.delete_current().expect("delete"));
     assert_eq!(c.state(), (State::AfterEnd, true));
+    assert!(!c.delete_current().expect("delete"), "no follower: nothing to delete");
+    assert_eq!(c.state(), (State::AfterEnd, true), "a refused delete changes nothing");
+    // After the end `current` is nothing, after a delete as after a seek past the end (MDBX's
+    // cursor stays on the new last entry there).
+    assert_eq!(c.current().expect("current"), None);
+    assert_eq!(c.state(), (State::AfterEnd, false));
     assert_eq!(key(c.prev().expect("prev")), rw_key(1));
     // A refused put changes nothing, the cursor included.
     let big = vec![0; env.max_key_len() + 1];
@@ -979,4 +1167,325 @@ fn delete_current_then_next_returns_the_follower() {
     drop(c);
     rw.commit().expect("commit");
     env.check().expect("check");
+}
+
+/// A 200-byte key: group `g` and entry `j` (2 bytes each) in front of 196 filler bytes.
+fn grouped_key(g: u16, j: u16) -> Vec<u8> {
+    let mut k = vec![0x5A; 200];
+    k[..2].copy_from_slice(&g.to_be_bytes());
+    k[2..4].copy_from_slice(&j.to_be_bytes());
+    k
+}
+
+/// From every entry of a three-level tree of groups that span leaves, and for prefix lengths 0
+/// (anything), 1 and 3 (a byte that every key shares, or that only the group's do), 2 (the
+/// group), 4 (the whole entry id), the key's length and one past it, `next_in_prefix` and
+/// `prev_in_prefix` match the model on the detached and the public cursor: the entry returned,
+/// and the position after, kept on a refusal. Steps that cross a leaf boundary and refusals at
+/// one happen in both directions; a cursor that is not at an entry returns nothing and stays.
+#[test]
+fn prefix_steps_from_every_entry_match_a_model() {
+    let mut store = MemStore::new(4096);
+    let mut root = TreeRoot::EMPTY;
+    let mut map = BTreeMap::new();
+    for g in 0..30_u16 {
+        for j in 0..(g * 7 % 40) + 1 {
+            let k = grouped_key(g, j);
+            put(&mut store, &mut root, &k, &j.to_le_bytes()).expect("put");
+            map.insert(k, j.to_le_bytes().to_vec());
+        }
+    }
+    store.commit_like();
+    let reader = store.reader();
+    assert!(root.height >= 3, "a tree of three levels: {}", root.height);
+    let mut model = Model::new(&map);
+    let keys: Vec<Vec<u8>> = map.keys().cloned().collect();
+    // The leaf of every entry.
+    let mut probe = TreeCursor::default();
+    let leaf_of: Vec<u32> = keys
+        .iter()
+        .map(|k| {
+            probe.seek_exact(&reader, &root, k).expect("seek").expect("a hit");
+            probe.leaf_pgno().expect("at an entry")
+        })
+        .collect();
+    let latch = Latch::default();
+    let mut detached = Detached { cursor: TreeCursor::default(), store: &reader, root };
+    let mut public = Cursor::new(&reader, root, &latch);
+    // [direction][crossed with a match, refused at a boundary]
+    let mut seen = [[0; 2]; 2];
+    for (i, key) in keys.iter().enumerate() {
+        for n in [0, 1, 2, 3, 4, 200, 201] {
+            for forward in [true, false] {
+                let op = if forward { Op::NextInPrefix(n) } else { Op::PrevInPrefix(n) };
+                model.pos = Pos::At(i);
+                let want = model.apply(&op);
+                for cursor in [&mut detached as &mut dyn Moves<'_>, &mut public] {
+                    assert!(cursor.seek_exact(key).expect("seek").is_some());
+                    assert_eq!(cursor.apply(&op), want, "entry {i} {op:?}");
+                    let here = owned(cursor.current().expect("current"));
+                    assert_eq!(here, model.current(), "entry {i} {op:?}: the position after");
+                }
+                let j = if forward { Some(i + 1) } else { i.checked_sub(1) };
+                if j.is_some_and(|j| j < keys.len() && leaf_of[j] != leaf_of[i]) {
+                    seen[usize::from(forward)][usize::from(want.is_none())] += 1;
+                }
+            }
+        }
+    }
+    assert!(seen.iter().flatten().all(|&c| c > 0), "boundary coverage {seen:?}");
+    assert_eq!(latch.failure(), None);
+
+    // Not at an entry: unset, after the end, before the start.
+    let mut c = TreeCursor::default();
+    for setup in 0..3 {
+        match setup {
+            0 => {}
+            1 => assert_eq!(c.seek(&reader, &root, &[0xFF; 4]).expect("seek"), None),
+            _ => {
+                c.first(&reader, &root).expect("first");
+                assert_eq!(c.prev(&reader, &root).expect("prev"), None);
+            }
+        }
+        let state = c.state();
+        assert_ne!(state, State::At);
+        for forward in [true, false] {
+            let got = c.step_in_prefix(&reader, &root, None, 0, forward).expect("step");
+            assert!(got.is_none() && c.state() == state, "{state:?}");
+        }
+    }
+}
+
+/// Make the call `op` on an owned cursor (a `seek_exact` hit returned as `(key, value)`).
+fn apply_owned(cursor: &mut RoCursor, op: &Op) -> Option<Kv> {
+    match op {
+        Op::First => owned(cursor.first().expect("first")),
+        Op::Last => owned(cursor.last().expect("last")),
+        Op::Next => owned(cursor.next().expect("next")),
+        Op::Prev => owned(cursor.prev().expect("prev")),
+        Op::Current => owned(cursor.current().expect("current")),
+        Op::Seek(key) => owned(cursor.seek(key).expect("seek")),
+        Op::SeekExact(key) => {
+            cursor.seek_exact(key).expect("seek_exact").map(|v| (key.clone(), v.to_vec()))
+        }
+        Op::NextInPrefix(n) => owned(cursor.next_in_prefix(*n).expect("next_in_prefix")),
+        Op::PrevInPrefix(n) => owned(cursor.prev_in_prefix(*n).expect("prev_in_prefix")),
+    }
+}
+
+/// Random moves and prefix steps of an owned cursor match a sorted model, and the borrowed
+/// cursor of the same snapshot driven alongside, in every result and state: over grouped keys,
+/// with values in overflow runs (a few of 1.5–21 KB) and leaves thinned by deletes, at 4 and
+/// 16 KiB pages. An empty table's ends hold too.
+#[test]
+fn owned_cursor_moves_match_a_model_and_the_borrowed_cursor() {
+    for (seed, page_size) in [(1_u64, 4096_u32), (2, 16384)] {
+        let _report = ReportSeed(seed);
+        let mut rng = Rng(seed * 0x0051_7CC1);
+        let dir = TempDir::with_prefix("tndb_b_owned").expect("temp dir");
+        let options = EnvOptions { page_size, ..EnvOptions::default() };
+        let env = Env::open(dir.path().join("db"), options).expect("open");
+        let shape =
+            Shape { page_size, n: 1500, keys: (0, 60), vmax: 80, delete_pct: 15, groups: 12 };
+        let mut map = BTreeMap::new();
+        let mut rw = env.begin_rw().expect("begin");
+        let (t, empty) = (rw.create_table("t").expect("t"), rw.create_table("e").expect("e"));
+        for i in 0..shape.n {
+            let key = shape_key(&mut rng, &shape);
+            let len = if rng.below(25) == 0 {
+                1500 + rng.len_upto(20_000)
+            } else {
+                rng.len_upto(shape.vmax)
+            };
+            let value: Vec<u8> = (0..len).map(|j| (i + j) as u8).collect();
+            rw.put(&t, &key, &value).expect("put");
+            map.insert(key, value);
+        }
+        let keys: Vec<Vec<u8>> = map.keys().cloned().collect();
+        for key in keys {
+            if rng.below(100) < shape.delete_pct {
+                assert!(rw.delete(&t, &key).expect("delete"));
+                map.remove(&key);
+            }
+        }
+        rw.commit().expect("commit");
+        let ro = Arc::new(env.begin_ro().expect("ro"));
+        let stat = ro.table_stat(&t).expect("stat");
+        assert!(stat.overflow_pages > 0 && stat.height >= 2, "{stat:?}");
+        let mut owned_cursor = ro.cursor_owned(&t).expect("cursor");
+        let mut borrowed = ro.cursor(&t).expect("cursor");
+        let mut model = Model::new(&map);
+        for step in 0..4000 {
+            let op = Op::pick(&mut rng, &model);
+            let from = model.pos;
+            let want = model.apply(&op);
+            assert_eq!(apply_owned(&mut owned_cursor, &op), want, "step {step} {op:?} {from:?}");
+            assert_eq!(borrowed.apply(&op), want, "step {step} {op:?} from {from:?}");
+            assert_eq!(owned_cursor.state(), model.state(), "step {step} {op:?} {from:?}");
+            assert_eq!(Moves::state(&borrowed), model.state(), "step {step}");
+        }
+        let mut e = ro.cursor_owned(&empty).expect("cursor");
+        assert_eq!(e.first().expect("first"), None);
+        assert_eq!(e.state(), State::AfterEnd);
+        assert_eq!(e.last().expect("last"), None);
+        assert_eq!(e.state(), State::BeforeStart);
+        assert_eq!(e.next_in_prefix(0).expect("step"), None);
+        assert!(env.failure().is_none(), "{:?}", env.failure());
+    }
+}
+
+/// An owned cursor whose transaction handle has dropped keeps the snapshot: while later commits
+/// rewrite, clear and refill its table (freeing every page the cursor's tree used, and reusing
+/// the pages they may), it reads the old values, overflow runs included, from another thread.
+#[test]
+fn an_owned_cursor_outlives_its_transaction_handle() {
+    let (_dir, env) = temp_env();
+    let value =
+        |i: u32, round: u8| vec![round ^ i as u8; if i.is_multiple_of(10) { 9000 } else { 50 }];
+    let mut rw = env.begin_rw().expect("begin");
+    let t = rw.create_table("t").expect("table");
+    for i in 0..400_u32 {
+        rw.put(&t, &i.to_be_bytes(), &value(i, 1)).expect("put");
+    }
+    rw.commit().expect("commit");
+    let want: Vec<Kv> = (0..400_u32).map(|i| (i.to_be_bytes().to_vec(), value(i, 1))).collect();
+    let ro = Arc::new(env.begin_ro().expect("ro"));
+    let mut cursor = ro.cursor_owned(&t).expect("cursor");
+    assert_eq!(owned(cursor.seek(&200_u32.to_be_bytes()).expect("seek")), Some(want[200].clone()));
+    drop(ro);
+    for round in 2..9_u8 {
+        let mut rw = env.begin_rw().expect("begin");
+        if round % 2 == 1 {
+            rw.clear_table(&t).expect("clear");
+        }
+        for i in 0..400_u32 {
+            rw.put(&t, &(i + u32::from(round % 2)).to_be_bytes(), &value(i, round)).expect("put");
+        }
+        rw.commit().expect("commit");
+    }
+    let cursor = std::thread::spawn(move || {
+        assert_eq!(owned(cursor.current().expect("current")), Some(want[200].clone()));
+        let mut got = Vec::new();
+        let mut entry = owned(cursor.first().expect("first"));
+        while let Some(kv) = entry {
+            got.push(kv);
+            entry = owned(cursor.next().expect("next"));
+        }
+        assert!(got == want, "the snapshot's entries");
+        assert_eq!(owned(cursor.prev().expect("prev")), want.last().cloned());
+        cursor
+    })
+    .join()
+    .expect("the reader thread");
+    drop(cursor);
+    assert!(env.failure().is_none(), "{:?}", env.failure());
+    env.check().expect("check");
+}
+
+/// Damage an owned cursor's move finds, by a plain move or by a prefix step peeking past a leaf's
+/// end, is `Corrupt`, leaves the cursor unset and latches the environment; other reads continue.
+#[test]
+fn damage_under_an_owned_cursor_latches() {
+    let (_dir, env, a, b) = env_with_a_damaged_leaf();
+    let ro = Arc::new(env.begin_ro().expect("ro"));
+    let mut cursor = ro.cursor_owned(&a).expect("cursor");
+    assert!(cursor.first().expect("first").is_some(), "the first leaf is intact");
+    assert!(env.failure().is_none());
+    assert!(matches!(cursor.last(), Err(Error::Corrupt(_))));
+    assert_eq!(cursor.state(), State::Unset);
+    assert!(env.failure().is_some_and(|c| c.contains("zero CRC")), "{:?}", env.failure());
+    let mut other = ro.cursor_owned(&b).expect("cursor");
+    let mut count = usize::from(other.first().expect("first").is_some());
+    while other.next().expect("next").is_some() {
+        count += 1;
+    }
+    assert_eq!(count, 200, "other reads continue");
+
+    let (_dir, env, a, _b) = env_with_a_damaged_leaf();
+    let ro = Arc::new(env.begin_ro().expect("ro"));
+    let mut cursor = ro.cursor_owned(&a).expect("cursor");
+    assert!(cursor.first().expect("first").is_some());
+    let error = loop {
+        match cursor.next_in_prefix(0) {
+            Ok(Some(_)) => {}
+            Ok(None) => panic!("the scan passed the damaged leaf"),
+            Err(e) => break e,
+        }
+    };
+    assert!(matches!(error, Error::Corrupt(_)), "{error:?}");
+    assert_eq!(cursor.state(), State::Unset);
+    assert!(env.failure().is_some_and(|c| c.contains("zero CRC")), "{:?}", env.failure());
+}
+
+/// After `delete_current` the prefix steps compare with the deleted key (as an MDBX cursor keeps
+/// its key): the follower (forward) or the entry before the deleted one (backward) is returned,
+/// and the cursor moves to it, when it shares the prefix; otherwise nothing, and the cursor stays
+/// on the follower in the deleted state (with `n` past the deleted key too). `n = 0` takes the
+/// follower; the ends of the table hold.
+#[test]
+fn prefix_steps_after_delete_current_use_the_deleted_key() {
+    let (_dir, env) = temp_env();
+    let mut rw = env.begin_rw().expect("begin");
+    let t = rw.create_table("t").expect("table");
+    for g in 1..=3_u8 {
+        for j in 0..3_u8 {
+            rw.put(&t, &[g, j], &[g, j, 0]).expect("put");
+        }
+    }
+    let mut c = rw.cursor_mut(&t).expect("cursor");
+    let key = |e: Option<(&[u8], &[u8])>| e.map(|(k, _)| k.to_vec());
+    let deleted = (State::At, true);
+
+    assert!(c.seek_exact(&[2, 1]).expect("seek").is_some());
+    assert!(c.delete_current().expect("delete"));
+    assert_eq!(key(c.next_in_prefix(1).expect("step")), Some(vec![2, 2]), "the follower");
+    assert_eq!(c.state(), (State::At, false));
+    assert!(c.delete_current().expect("delete"));
+    assert_eq!(c.next_in_prefix(1).expect("step"), None, "[3, 0] is another group");
+    assert_eq!(c.state(), deleted, "the cursor stays on the follower, in the deleted state");
+    assert_eq!(key(c.prev_in_prefix(1).expect("step")), Some(vec![2, 0]), "the entry before");
+    assert_eq!(c.state(), (State::At, false));
+
+    assert!(c.delete_current().expect("delete"));
+    assert_eq!(c.next_in_prefix(3).expect("step"), None, "n past the deleted key");
+    assert_eq!(c.state(), deleted);
+    assert_eq!(c.prev_in_prefix(1).expect("step"), None, "[1, 2] is another group");
+    assert_eq!(c.state(), deleted);
+    assert_eq!(key(c.next_in_prefix(0).expect("step")), Some(vec![3, 0]), "n = 0");
+
+    assert!(c.seek_exact(&[3, 2]).expect("seek").is_some());
+    assert!(c.delete_current().expect("delete"));
+    assert_eq!(c.next_in_prefix(0).expect("step"), None, "after the end");
+    assert_eq!(c.state(), (State::AfterEnd, true));
+    assert_eq!(key(c.prev_in_prefix(2).expect("step")), None, "[3, 1] differs in byte 2");
+    assert_eq!(key(c.prev_in_prefix(1).expect("step")), Some(vec![3, 1]));
+
+    assert!(c.first().expect("first").is_some());
+    assert!(c.delete_current().expect("delete"));
+    assert_eq!(c.prev_in_prefix(0).expect("step"), None, "nothing before the first entry");
+    assert_eq!(c.state(), deleted);
+    assert_eq!(key(c.next().expect("next")), Some(vec![1, 1]), "next still takes the follower");
+
+    // A second delete removes the follower, whose key the prefix steps then compare with:
+    // [1, 2, 0] shares the first two bytes of [1, 2], not of [1, 1].
+    c.put(&[1, 2, 0], b"v").expect("put");
+    assert!(c.seek_exact(&[1, 1]).expect("seek").is_some());
+    assert!(c.delete_current().expect("delete"));
+    assert!(c.delete_current().expect("delete"), "the follower, [1, 2]");
+    assert_eq!(key(c.next_in_prefix(2).expect("step")), Some(vec![1, 2, 0]));
+    drop(c);
+    rw.commit().expect("commit");
+    env.check().expect("check");
+}
+
+/// Every new cursor zeroes its path and its creation moves the whole cursor (an `RoCursor` per
+/// reth cursor), so the path's steps stay 8 bytes, a page number and a slot with no padding.
+#[test]
+fn tree_cursor_stays_small() {
+    let path = 8 * MAX_HEIGHT as usize;
+    assert!(
+        size_of::<TreeCursor>() <= path + 16,
+        "TreeCursor is {} bytes for a path of {path}",
+        size_of::<TreeCursor>()
+    );
 }

@@ -20,6 +20,7 @@ members = [
     "crates/state-sync",
     "crates/tn-metrics",
     "crates/tndb-b",
+    "crates/tndb-b-reth",
     "crates/tn-reth",
     "crates/e2e-tests",
     "crates/telcoin-network-cli",
@@ -128,6 +129,7 @@ reth-chainspec = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" 
 reth-chain-state = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
 reth-config = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
 reth-db = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
+reth-db-api = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
 reth-db-common = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
 reth-engine-primitives = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
 reth-ethereum-engine-primitives = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
@@ -163,6 +165,7 @@ reth-discv4 = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
 reth-eth-wire = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
 reth-cli-util = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
 reth-errors = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
+reth-storage-errors = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
 reth-libmdbx = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
 reth-metrics = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
 

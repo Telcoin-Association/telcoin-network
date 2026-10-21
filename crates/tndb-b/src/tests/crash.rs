@@ -8,7 +8,7 @@
 use std::{fs, os::unix::fs::FileExt as _};
 
 use super::*;
-use crate::{disk_model, env::CrashAt, meta::slot_to_write};
+use crate::{alloc::RunStats, disk_model, env::CrashAt, meta::slot_to_write};
 
 /// How the machine went down once the process stopped.
 #[derive(Clone, Copy, Debug)]
@@ -27,18 +27,25 @@ fn key(i: u32) -> [u8; 4] {
 }
 
 /// A cleanly closed file to crash commits on: its last commit's state and txn, the state before
-/// it, and its page size.
-struct Base {
-    dir: TempDir,
-    path: PathBuf,
-    state: State,
-    prev: State,
-    txn: u64,
-    page_size: u32,
+/// it, its page size, and the workload a case runs on it: the changes of the two commits
+/// `SyncMode::NoSync` cases leave unsynced (by round), the crashing commit's, whether that commit
+/// grows the file, and a check of the layout the matrix relies on, run on the state the crashing
+/// commit made (`dry_run`).
+pub(super) struct Base {
+    pub(super) dir: TempDir,
+    pub(super) path: PathBuf,
+    pub(super) state: State,
+    pub(super) prev: State,
+    pub(super) txn: u64,
+    pub(super) page_size: u32,
+    pub(super) unsynced: fn(&mut RwTxn, &mut State, u32),
+    pub(super) crash: fn(&mut RwTxn, &mut State),
+    pub(super) grows: bool,
+    pub(super) layout: fn(&Env),
 }
 
 /// The pages the file holds past the newest state's page count (growth slack).
-fn slack(env: &Env) -> u64 {
+pub(super) fn slack(env: &Env) -> u64 {
     env.with_writer(|w| {
         w.file.file_len() / w.geometry.page_size() as u64 - u64::from(w.last.page_count)
     })
@@ -48,7 +55,7 @@ fn slack(env: &Env) -> u64 {
 /// second-to-last commit, so its pages are free records a reopened writer may reuse; and a filler
 /// table `f`, sized to leave the file only a few pages of slack, dropped by the last commit, so
 /// its pages are free but not yet reusable: a modest commit must grow the file.
-fn base(page_size: u32) -> Base {
+pub(super) fn base(page_size: u32) -> Base {
     let (dir, path) = temp("tndb_b_crash");
     let env = Env::open(&path, EnvOptions { page_size, ..EnvOptions::default() }).expect("open");
     let mut state = State::new();
@@ -98,7 +105,18 @@ fn base(page_size: u32) -> Base {
     assert!((1..=24).contains(&left), "{left} pages of slack");
     check(&env);
     drop(env);
-    Base { dir, path, state, prev, txn, page_size }
+    Base {
+        dir,
+        path,
+        state,
+        prev,
+        txn,
+        page_size,
+        unsynced: unsynced_changes,
+        crash: crash_changes,
+        grows: true,
+        layout: |_| {},
+    }
 }
 
 /// Two small commits that `SyncMode::NoSync` cases leave unsynced before the crash commit.
@@ -147,8 +165,9 @@ fn stops_the_commit(sync: SyncMode, at: CrashAt) -> bool {
 /// ones first in `SyncMode::NoSync`) and stop at `at` (`None`: run to the end, with a sync).
 /// With `by_msync`, step 4 syncs the data by one `msync` (`Writer::data_by_msync`), else by the
 /// sync `data_sync` picks. Returns the case's path, the state `M` its last commit made, the slot
-/// `M`'s meta goes to, and how the durable steps synced the data. The environment is crashed.
-fn run_case(base: &Base, sync: SyncMode, by_msync: bool, at: Option<CrashAt>) -> Case {
+/// `M`'s meta goes to, how the durable steps synced the data, and what the writer reused and
+/// how it placed its runs. The environment is crashed.
+pub(super) fn run_case(base: &Base, sync: SyncMode, by_msync: bool, at: Option<CrashAt>) -> Case {
     let path = base.dir.path().join("case");
     fs::copy(&base.path, &path).expect("copy");
     disk_model::track(&path);
@@ -158,13 +177,13 @@ fn run_case(base: &Base, sync: SyncMode, by_msync: bool, at: Option<CrashAt>) ->
     if sync == SyncMode::NoSync {
         for round in 0..2 {
             let mut txn = env.begin_rw().expect("begin");
-            unsynced_changes(&mut txn, &mut latest, round);
+            (base.unsynced)(&mut txn, &mut latest, round);
             txn.commit().expect("an unsynced commit");
         }
     }
     let slot = env.with_writer(|w| slot_to_write(&w.slots()));
     let mut txn = env.begin_rw().expect("begin");
-    crash_changes(&mut txn, &mut latest);
+    (base.crash)(&mut txn, &mut latest);
     let stopped = match at {
         Some(at) if stops_the_commit(sync, at) => {
             txn.writer_mut().crash_at = Some(at);
@@ -184,23 +203,39 @@ fn run_case(base: &Base, sync: SyncMode, by_msync: bool, at: Option<CrashAt>) ->
         (None, None) => {}
         (at, e) => panic!("{at:?}: {e:?}"),
     }
-    let (by_file, reused) = env.with_writer(|w| (w.data_by_file, w.alloc.load_log.len()));
+    let (by_file, reused, runs) =
+        env.with_writer(|w| (w.data_by_file, w.alloc.load_log.len(), w.alloc.run_stats));
     env.crash();
-    Case { path, latest, slot, by_file, reused }
+    Case { path, latest, slot, by_file, reused, runs }
 }
 
 /// What [`run_case`] left.
-struct Case {
+pub(super) struct Case {
     /// The case's file.
-    path: PathBuf,
+    pub(super) path: PathBuf,
     /// The state the last commit made (`M`).
-    latest: State,
+    pub(super) latest: State,
     /// The meta slot `M`'s record goes to.
-    slot: usize,
+    pub(super) slot: usize,
     /// The last durable steps synced the data by one `fdatasync` of the file.
-    by_file: bool,
+    pub(super) by_file: bool,
     /// The pages the writer took from the free list.
-    reused: usize,
+    pub(super) reused: usize,
+    /// How the writer placed the overflow runs of the case's commits.
+    pub(super) runs: RunStats,
+}
+
+/// Every key of `want` reads back through a get (a point read, not the cursor `newest_state`
+/// scans with), byte for byte.
+pub(super) fn assert_gets(env: &Env, want: &State, case: &str) {
+    let ro = env.begin_ro().expect("ro");
+    for (name, rows) in want {
+        let table = ro.open_table(name).expect("open").expect("the table exists");
+        for (k, v) in rows {
+            let got = ro.get(&table, k).expect("get");
+            assert!(got == Some(&v[..]), "{case}: table {name} key {k:?}: the get differs");
+        }
+    }
 }
 
 /// One cell of the matrix: stop at `at`, go down by `loss`, and reopen (twice, with a crash and
@@ -233,6 +268,7 @@ fn crash_case(base: &Base, sync: SyncMode, by_msync: bool, at: CrashAt, loss: Lo
         let env = open(&path, sync);
         assert_eq!(env.stat().txn_id, want_txn, "{case}: reopen {reopen}");
         assert!(newest_state(&env) == *want, "{case}: reopen {reopen}: the state differs");
+        assert_gets(&env, want, &format!("{case}: reopen {reopen}"));
         env.crash();
         disk_model::power_loss(&path);
     }
@@ -242,16 +278,20 @@ fn crash_case(base: &Base, sync: SyncMode, by_msync: bool, at: CrashAt, loss: Lo
 
 /// Run the crash commit (or the sync after it) to the end, checked to exercise what the matrix
 /// needs: the data synced by the `fdatasync` `data_sync` picks for pages that form several
-/// ranges (or, `by_msync`, by one `msync`), pages reused from the free list, and a growth of the
-/// file.
+/// ranges (or, `by_msync`, by one `msync`), pages reused from the free list, a growth of the
+/// file exactly when the base says so (a growth's size sync is an `fsync`, which writes every
+/// page: only a commit that does not grow shows what one `msync` alone covers), and the base's
+/// `layout`.
 fn dry_run(base: &Base, sync: SyncMode, by_msync: bool) {
     let Case { path, latest, by_file, reused, .. } = run_case(base, sync, by_msync, None);
     assert_eq!(by_file, !by_msync, "{sync:?}: by_msync={by_msync}: synced by fdatasync");
     assert!(reused > 0, "{sync:?}: pages were reused");
     let base_len = fs::metadata(&base.path).expect("metadata").len();
-    assert!(fs::metadata(&path).expect("metadata").len() > base_len, "{sync:?}: the file grew");
+    let grew = fs::metadata(&path).expect("metadata").len() > base_len;
+    assert_eq!(grew, base.grows, "{sync:?}: the file grew");
     let env = open(&path, sync);
     assert_eq!(newest_state(&env), latest);
+    (base.layout)(&env);
     drop(env);
     disk_model::untrack(&path);
     fs::remove_file(&path).expect("remove");
@@ -259,7 +299,7 @@ fn dry_run(base: &Base, sync: SyncMode, by_msync: bool) {
 
 /// Every crash point of `base`'s crash commit x {process crash, strict power loss, `seeds`
 /// random power losses} x {`Durable`, `NoSync`} x {the `fdatasync` step 4 picks, one `msync`}.
-fn matrix(base: &Base, seeds: u64) {
+pub(super) fn matrix(base: &Base, seeds: u64) {
     for sync in [SyncMode::Durable, SyncMode::NoSync] {
         for by_msync in [false, true] {
             dry_run(base, sync, by_msync);

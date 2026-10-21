@@ -5,7 +5,7 @@ use super::{PageRead, TreeRoot};
 use crate::{
     crc,
     error::{Error, Result},
-    page::{self, Find, Kind, Route},
+    page::{self, Find, Kind, Route, Val},
 };
 
 /// The checks every page fetch makes, shared by every [`PageRead`] store. `slice` maps a page
@@ -183,6 +183,16 @@ pub(crate) fn get<'s, S: PageRead + ?Sized>(
     root: &TreeRoot,
     key: &[u8],
 ) -> Result<Option<&'s [u8]>> {
+    find(store, root, key)?.map(|v| store.value(v)).transpose()
+}
+
+/// [`get`] of the value as its leaf cell holds it: the bytes, or the reference to its overflow
+/// run, unread. The catalog and the free list take only inline values ([`Val::inline`]).
+pub(crate) fn find<'s, S: PageRead + ?Sized>(
+    store: &'s S,
+    root: &TreeRoot,
+    key: &[u8],
+) -> Result<Option<Val<'s>>> {
     let Some(leaf) = descend(store, root, key, |_, _, _, _| Ok(()), None)? else {
         return Ok(None);
     };
@@ -190,27 +200,39 @@ pub(crate) fn get<'s, S: PageRead + ?Sized>(
         // The descent keeps `key` inside the separators, so only a leaf whose range overlaps them
         // can hold it: a hit needs no check.
         Find::Found { value, .. } => Ok(Some(value)),
-        // A miss must come from the leaf whose range holds `key`: the keys either side of where it
-        // would go must lie inside the separators. Any other leaf holds a disjoint range, so one
-        // of them is outside.
         Find::NotFound { before, after, .. } => {
-            let below = match (before, leaf.lo) {
-                (Some(k), Some(lo)) => page::cmp_keys(k, lo).is_ge(),
-                _ => true,
-            };
-            let above = match (after, leaf.hi) {
-                (Some(k), Some(hi)) => page::cmp_keys(k, hi).is_lt(),
-                _ => true,
-            };
-            if below && above {
-                Ok(None)
-            } else {
-                Err(Error::Corrupt(format!(
-                    "leaf {} is not where its parents say (keys outside their separators)",
-                    leaf.pgno
-                )))
-            }
+            check_miss(leaf.pgno, before, after, leaf.lo, leaf.hi)?;
+            Ok(None)
         }
+    }
+}
+
+/// The check of a miss in leaf `leaf`, whose search put the key between `before` and `after`
+/// ([`Find::NotFound`]), against the range `[lo, hi)` its ancestors' separators give it (`None`:
+/// unbounded). A miss must come from the leaf whose range holds the key: the keys either side of
+/// where it would go must lie inside the separators. Any other leaf holds a disjoint range, so one
+/// of them is outside, and the miss is [`Error::Corrupt`], not a wrong `None`.
+pub(crate) fn check_miss(
+    leaf: u32,
+    before: Option<&[u8]>,
+    after: Option<&[u8]>,
+    lo: Option<&[u8]>,
+    hi: Option<&[u8]>,
+) -> Result<()> {
+    let below = match (before, lo) {
+        (Some(k), Some(lo)) => page::cmp_keys(k, lo).is_ge(),
+        _ => true,
+    };
+    let above = match (after, hi) {
+        (Some(k), Some(hi)) => page::cmp_keys(k, hi).is_lt(),
+        _ => true,
+    };
+    if below && above {
+        Ok(())
+    } else {
+        Err(Error::Corrupt(format!(
+            "leaf {leaf} is not where its parents say (keys outside their separators)"
+        )))
     }
 }
 

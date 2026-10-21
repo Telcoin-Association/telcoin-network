@@ -1,7 +1,9 @@
 //! The environment's failure latch: the first failure of a write, a sync, a commit or a growth,
 //! or damage found by a read, stops every later write and commit, which return
 //! [`Error::Failed`] with the first cause. Reads continue. The latch is never cleared: only a
-//! reopen, which recovers from the meta pages, clears it.
+//! reopen, which recovers from the meta pages, clears it. A read-only environment has no writer:
+//! its `begin_rw` returns [`Error::ReadOnly`] whether it latched or not, and the latch only
+//! records the first damage its reads found.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -44,7 +46,8 @@ impl Latch {
     /// Latch the failure `error` stands for, if it is one: damage ([`Error::Corrupt`]) through
     /// [`Self::fail_damaged`]; an I/O error or a broken invariant ([`Error::Io`],
     /// [`Error::Failed`]) through [`Self::fail`]. Validation errors (an entry over the limits, an
-    /// append out of order, a table error) change nothing and do not latch.
+    /// append out of order, an insert of a present key, a table error, a write asked of a
+    /// read-only environment) change nothing and do not latch.
     pub(crate) fn latch_error(&self, error: &Error) {
         match error {
             Error::Corrupt(cause) => self.fail_damaged(cause.clone()),
@@ -52,13 +55,16 @@ impl Latch {
             Error::KeyTooLarge { .. }
             | Error::ValueTooLarge { .. }
             | Error::AppendOutOfOrder
+            | Error::KeyExists
             | Error::TableNotFound(_)
             | Error::StaleTable(_)
             | Error::InvalidTableName
             | Error::NotTndbB
             | Error::UnsupportedVersion(_)
             | Error::InvalidPageSize(_)
-            | Error::Locked => {}
+            | Error::Locked
+            | Error::ReadOnly
+            | Error::WrongTxn => {}
         }
     }
 
@@ -115,6 +121,9 @@ mod tests {
         latch.latch_error(&Error::KeyTooLarge { len: 2, max: 1 });
         latch.latch_error(&Error::StaleTable("t".to_string()));
         latch.latch_error(&Error::AppendOutOfOrder);
+        latch.latch_error(&Error::KeyExists);
+        latch.latch_error(&Error::ReadOnly);
+        latch.latch_error(&Error::WrongTxn);
         assert!(!latch.is_failed(), "validation errors change nothing");
 
         latch.latch_error(&Error::Corrupt("page 7 holds page 9".to_string()));

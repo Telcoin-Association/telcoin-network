@@ -25,18 +25,26 @@ pub enum Error {
         /// The largest key this page size allows.
         max: usize,
     },
-    /// A value longer than the page size allows for its key.
+    /// A value longer than a table accepts with its key: 16 MiB (in an overflow run) for a key
+    /// that leaves room for the run's reference in its leaf, else what the leaf holds
+    /// ([`crate::Env::max_value_len`]).
     #[error("tndb-b: value of {len} bytes exceeds the maximum of {max} for its key")]
     ValueTooLarge {
         /// The value's length.
         len: usize,
-        /// The largest value this page size allows with the given key.
+        /// The largest value accepted with the given key at this page size.
         max: usize,
     },
-    /// An append ([`crate::RwTxn::append`], [`crate::RwCursor::append`]) of a key that does not
-    /// sort strictly after the table's last key. It is refused before anything changes.
+    /// An append ([`crate::RwTxn::append`], [`crate::RwCursor::append`],
+    /// [`crate::TxnCursor::append`]) of a key that does not sort strictly after the table's last
+    /// key. It is refused before anything changes.
     #[error("tndb-b: append of a key that does not sort after the table's last key")]
     AppendOutOfOrder,
+    /// An insert ([`crate::RwTxn::insert`], [`crate::RwCursor::insert`],
+    /// [`crate::TxnCursor::insert`]) of a key the table already holds. It is refused before
+    /// anything changes and does not latch.
+    #[error("tndb-b: insert of a key the table already holds")]
+    KeyExists,
     /// No table with this name exists.
     #[error("tndb-b: table {0:?} not found")]
     TableNotFound(String),
@@ -56,9 +64,20 @@ pub enum Error {
     /// A page size that is not a power of two in 4 KiB..=64 KiB.
     #[error("tndb-b: invalid page size {0}")]
     InvalidPageSize(u32),
-    /// Another handle (in this process or another) holds the database open.
+    /// Another handle (in this process or another) holds the database open: any handle, for
+    /// [`crate::Env::open`]; one with a writer, for [`crate::Env::open_read_only`].
     #[error("tndb-b: database is locked by another handle")]
     Locked,
+    /// A write transaction asked of an environment opened read-only
+    /// ([`crate::Env::open_read_only`]), which has no writer. It changes nothing and does not
+    /// latch.
+    #[error("tndb-b: the environment is open read-only")]
+    ReadOnly,
+    /// A detached cursor ([`crate::TxnCursor`]) used with a write transaction other than the one
+    /// that made it (a later one, even one that reuses the transaction id of an aborted one). It
+    /// changes nothing and does not latch.
+    #[error("tndb-b: a cursor used with a write transaction other than its own")]
+    WrongTxn,
 }
 
 /// A `Result` with [`Error`].

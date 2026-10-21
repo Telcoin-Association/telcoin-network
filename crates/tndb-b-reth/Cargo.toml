@@ -1,0 +1,33 @@
+[package]
+name = "tndb-b-reth"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "reth's database API (reth-db-api) on the tndb-b copy-on-write B+tree engine."
+publish = false
+
+[dependencies]
+libc = "0.2"
+metrics = { workspace = true }
+parking_lot = { workspace = true }
+reth-db-api = { workspace = true }
+reth-storage-errors = { workspace = true }
+tndb-b = { path = "../tndb-b" }
+tracing = { workspace = true }
+
+[dev-dependencies]
+alloy = { workspace = true }
+proptest = { workspace = true }
+reth-db = { workspace = true }
+reth-libmdbx = { workspace = true }
+reth-primitives-traits = { workspace = true }
+# `StorageTrieEntry` and its parts, for the dup-sort layout tests (the version reth-db-api uses).
+reth-trie-common = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
+tempfile = { workspace = true }
+
+[lints]
+workspace = true
