@@ -62,18 +62,14 @@
 //! With the flag, a first-seen client's per-IP bucket is inserted at its
 //! request's class charge, whatever the class bucket's verdict, or, for a
 //! request answered before it is classified (a `405`, an unreadable or
-//! over-length body, a denied method, a loop), once the global bucket admits it as a
-//! query when its [`SubmissionBudget`] is dropped. So a table entry costs the
+//! over-length body, a denied method, a loop), when its [`SubmissionBudget`]
+//! is dropped, whatever the global bucket's verdict. So a table entry costs the
 //! per-IP token that paid for reading the request, and a flood the shared
 //! buckets refuse can add entries, up to `--rate-limit-per-ip-max-entries` and
 //! subject to the idle eviction, each of which then holds its client to the
-//! per-IP limit. A first-seen client whose every request is answered
-//! unclassified while the global bucket refuses it is never inserted, so the
-//! per-IP limit does not slow those requests; the connection caps and
-//! `--max-request-bytes` bound that work. With the global limit off
-//! (`--rate-limit-global 0`), the global charges here and in
-//! [`RateLimiters::check`] always admit, so a first-seen client's entry then
-//! costs only its per-IP token in either mode.
+//! per-IP limit. With the global limit off (`--rate-limit-global 0`), the
+//! global charges here and in [`RateLimiters::check`] always admit, so a
+//! first-seen client's entry then costs only its per-IP token in either mode.
 
 use std::{
     collections::HashMap,
@@ -478,7 +474,8 @@ enum PerIpReceipt {
     /// A first-seen prefix admitted on a fresh bucket that is not in the table
     /// yet: the edge check under a submission budget defers the insertion to
     /// the request's class charge, or, for a request answered unclassified, to
-    /// a global admission (see [`PerIpLimiter::insert_fresh`]). `at` is when
+    /// its settlement when its budget is dropped, and either inserts it
+    /// whatever the verdict (see [`PerIpLimiter::insert_fresh`]). `at` is when
     /// the edge charged it, so the bucket rebuilt at insertion refills from
     /// then.
     Fresh { key: IpAddr, at: Instant },
@@ -508,9 +505,8 @@ impl PerIpLimiter {
     /// With `defer`, a first-seen prefix the table has room for is charged on
     /// a fresh bucket that is not inserted: the receipt is
     /// [`PerIpReceipt::Fresh`], and the caller inserts the bucket with
-    /// [`Self::insert_fresh`] at the request's class charge, whatever its
-    /// verdict, or once the global bucket admits a request answered
-    /// unclassified.
+    /// [`Self::insert_fresh`] at the request's class charge, or at the
+    /// settlement of a request answered unclassified, whatever the verdict.
     ///
     /// The clock is read under the map lock, so admissions refill in lock
     /// order; the overflow bucket is touched only with the map lock held, so
@@ -546,10 +542,10 @@ impl PerIpLimiter {
     /// per-IP bucket admits is inserted, up to the cap). With `defer` (the edge
     /// check under a submission budget, whose `then` admits everything) it is
     /// not inserted here at all: the receipt is [`PerIpReceipt::Fresh`], and
-    /// the bucket is inserted at the request's class charge, whatever its
-    /// verdict, or, for a request answered unclassified, once the global bucket
-    /// admits it as a query (see [`RateLimiters::charge_class`]); there a
-    /// refused request can add an entry, paid for by its per-IP token.
+    /// the bucket is inserted at the request's class charge, or, for a request
+    /// answered unclassified, at its settlement, whatever the verdict (see
+    /// [`RateLimiters::charge_class`]); there a refused request can add an
+    /// entry, paid for by its per-IP token.
     ///
     /// A new IP that meets a full table first sweeps the table's idle entries
     /// (see [`Self::make_room`]), at most once per [`INLINE_SWEEP_INTERVAL`],
@@ -600,8 +596,8 @@ impl PerIpLimiter {
 
     /// Track the first-seen prefix `key` that the edge admitted at `at` on a
     /// fresh bucket charged `cost` tokens (a [`PerIpReceipt::Fresh`]), at its
-    /// request's class charge, whatever the verdict, or once the global bucket
-    /// has admitted a request answered unclassified.
+    /// request's class charge or at the settlement of a request answered
+    /// unclassified, whatever the verdict.
     ///
     /// If the prefix has a bucket by now, a concurrent first request from it
     /// was inserted first, and this request's `cost` is spent from that bucket
@@ -739,9 +735,9 @@ impl<C: Clock> RateLimiters<C> {
     }
 
     /// Insert the per-IP bucket a [`PerIpReceipt::Fresh`] names, at its
-    /// request's class charge, or once the global bucket admits a request
-    /// answered unclassified; every other receipt names a bucket that is
-    /// tracked already, or none (see [`PerIpLimiter::insert_fresh`]).
+    /// request's class charge or at the settlement of a request answered
+    /// unclassified, whatever the verdict; every other receipt names a bucket
+    /// that is tracked already, or none (see [`PerIpLimiter::insert_fresh`]).
     fn track_fresh(&self, receipt: PerIpReceipt) {
         if let (Some(per_ip), PerIpReceipt::Fresh { key, at }) = (&self.per_ip, receipt) {
             per_ip.insert_fresh(&self.clock, key, at, 1.0);
@@ -857,9 +853,9 @@ impl<C: Clock> RateLimiters<C> {
     ///
     /// A first-seen client is charged on a fresh bucket that is not inserted
     /// yet ([`PerIpReceipt::Fresh`]): the class charge inserts it whatever its
-    /// verdict, and a budget dropped uncharged inserts it only if
-    /// the global bucket admits the request as a query (see
-    /// [`SubmissionBudget`]), so the edge alone never adds a table entry.
+    /// verdict, and so does a budget dropped uncharged, whatever the global
+    /// bucket says of the request as a query (see [`SubmissionBudget`]), so
+    /// the edge alone never adds a table entry.
     fn check_edge(
         self: &Arc<Self>,
         client: Option<IpAddr>,
@@ -881,15 +877,17 @@ impl<C: Clock> RateLimiters<C> {
     /// was answered without a class charge (a `405`, an unreadable or
     /// over-length body, a denied method, a loop): charge its first call to
     /// the global bucket as a query (nothing when the global limit is off), as
-    /// [`Self::check`] would have, except that a global refusal keeps the
-    /// per-IP token the edge spent, which `check` would refund, and insert a
-    /// first-seen client's bucket only if that bucket admits it. The request
-    /// was already answered, so the verdict decides only the insertion; the
-    /// per-IP token the edge spent stays spent either way.
+    /// [`Self::check`] would have, and insert a first-seen client's bucket
+    /// whatever that bucket's verdict, as [`Self::charge_class`] does. Unlike
+    /// `check`, a global refusal keeps the per-IP token the edge spent: that
+    /// token paid for reading the request, so a client whose requests are all
+    /// answered unclassified meets its per-IP limit at the edge however the
+    /// global bucket answers them.
     fn settle_unclassified(&self, edge: PerIpReceipt) {
-        if self.admit_global(1.0) {
-            self.track_fresh(edge);
-        }
+        // the request was already answered, so the global verdict decides
+        // nothing: the per-IP token the edge spent stays spent either way
+        self.admit_global(1.0);
+        self.track_fresh(edge);
     }
 
     /// Drop idle (fully-refilled) per-IP buckets to bound memory. Called
@@ -921,13 +919,14 @@ impl<C: Clock> RateLimiters<C> {
 /// A request answered before it is classified (a `405`, an unreadable or
 /// over-length body, a denied method, a loop) never reaches [`Self::charge`].
 /// When the last clone of its budget is dropped, it is charged to the global
-/// bucket as a query, and a first-seen client's per-IP bucket is inserted only
-/// if that bucket admits it, so such a request costs a global token and
-/// leaves no entry unless it paid one. Unlike [`RateLimiters::check`], a
-/// global refusal here does not refund the edge's per-IP token: the request
-/// has been answered already, and that token paid for reading it. With the
-/// global limit off the drop charge always admits. Dropping a budget that was
-/// charged costs nothing more.
+/// bucket as a query, and a first-seen client's per-IP bucket is inserted
+/// whatever that bucket's verdict, as the class charge inserts it. Unlike
+/// [`RateLimiters::check`], a global refusal here does not refund the edge's
+/// per-IP token: the request has been answered already, and that token paid
+/// for reading it, so a client whose requests are all answered unclassified
+/// still meets its per-IP limit at the edge while the global bucket is empty.
+/// With the global limit off the drop charge always admits. Dropping a budget
+/// that was charged costs nothing more.
 #[derive(Clone)]
 pub(crate) struct SubmissionBudget<C: Clock = SystemClock> {
     /// Shared by every clone (the request extension and the handler's copy),
@@ -959,8 +958,7 @@ struct BudgetInner<C: Clock> {
     /// The limiters holding the global and submission buckets.
     limiters: Arc<RateLimiters<C>>,
     /// The per-IP bucket the edge charged; a first-seen client's is inserted
-    /// by the class charge, or by the drop charge when the global bucket
-    /// admits it.
+    /// by the class charge, or by the drop charge, whatever the verdict.
     edge: PerIpReceipt,
     /// Whether [`SubmissionBudget::charge`] has run, whatever its verdict.
     charged: AtomicBool,
@@ -1704,24 +1702,34 @@ mod tests {
         assert_eq!(limiters.per_ip_tokens(ip(1)), Some(1.0));
     }
 
-    /// The same with the global bucket empty: the unclassified request leaves
-    /// no entry, so a flood of requests answered unclassified that the global
-    /// limit refuses cannot fill the table (a classified request it refuses is
-    /// tracked at its class charge instead).
+    /// The same with the global bucket empty: the unclassified request is
+    /// refused as a query, and the client is tracked anyway with its edge token
+    /// spent, as a class refusal leaves it, so a source whose requests are all
+    /// answered unclassified meets its per-IP limit at the edge while the
+    /// global limit refuses them.
     #[test]
-    fn edge_admission_without_a_class_charge_leaves_no_entry_when_global_refuses() {
+    fn edge_admission_without_a_class_charge_tracks_the_client_when_global_refuses() {
         let limiters = limiters_with_submissions(
             ManualClock::new(),
-            Some(limit(1, 2)),
+            Some(limit(1, 1)),
             Some(limit(1, 1)),
             limit(1, 1),
         );
         let read = limiters.check_edge(None).expect("edge").expect("a budget");
         assert!(read.charge(false).is_ok(), "the global bucket's only token");
-        for client in [ip(1), ip(2), ip(1)] {
-            drop(limiters.check_edge(Some(client)).expect("edge").expect("a budget"));
-        }
-        assert_eq!(limiters.per_ip_len(), 0, "a globally refused new client was tracked");
+        drop(limiters.check_edge(Some(ip(1))).expect("edge").expect("a budget"));
+        assert_eq!(limiters.global_tokens(), Some(0.0));
+        assert_eq!(limiters.per_ip_len(), 1, "a globally refused new client was not tracked");
+        assert_eq!(
+            limiters.per_ip_tokens(ip(1)),
+            Some(0.0),
+            "the unclassified request's per-IP token was not kept"
+        );
+        assert!(
+            matches!(limiters.check_edge(Some(ip(1))), Err(GatewayError::RateLimited)),
+            "a client whose requests are all answered unclassified was not limited per IP"
+        );
+        assert!(limiters.check_edge(Some(ip(2))).is_ok(), "another client was refused at the edge");
     }
 
     /// A budget is settled once: a charged one costs nothing more when it is

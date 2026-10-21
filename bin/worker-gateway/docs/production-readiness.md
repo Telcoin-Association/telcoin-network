@@ -588,6 +588,7 @@ New with `--redirect-queries`.
 - **Effort:** S.
 - **Status:** #1612 (P25): fixed by #1643 (merged into this branch): a full table no longer admits new clients untracked; they share one overflow bucket with the per-IP rate and burst.
   The branch review of 2026-10-13 found that a client holding about 100,000 prefixes could fill the table and starve every untracked client in that overflow bucket; issue #1661, fixed in the follow-up PR: a first-seen client's entry is inserted only once a shared bucket has admitted its request (`fix(worker-gateway): insert a first-seen client's bucket only once its class is charged`), the table's size is `--rate-limit-per-ip-max-entries` (`feat(worker-gateway): add --rate-limit-per-ip-max-entries`), and a full table evicts an idle entry for a new client (`fix(worker-gateway): evict an idle per-IP entry when the table is full`).
+  The review of this branch then had that entry inserted whatever the shared bucket's verdict, at the class charge (`cleanup - keep the per-IP token spent on a class refusal`) or at the settlement of a request answered before it is classified (`cleanup - track a first-seen client at its unclassified settlement too`), so the per-IP token that paid for reading the request pays for the entry.
 
 ### WG-30 The 408 rewrite misreports — Low
 
