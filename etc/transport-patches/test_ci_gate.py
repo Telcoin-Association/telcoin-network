@@ -16,13 +16,15 @@ def gate_script():
     return textwrap.dedent(source.split("  ci-success:\n", 1)[1].split("        run: |\n", 1)[1])
 
 
-def execute(event, run_lanes, transport, script=None, connection_limits="success", pins="success"):
+def execute(event, run_lanes, transport, script=None, connection_limits="success", pins="success",
+            quinn_proto="success"):
     lanes = ("adiri-test", "archive-mode-gate", "clippy", "fmt", "test")
     results = {name: {"result": "success" if run_lanes else "skipped"} for name in lanes}
     results.update({"ci-scope": {"result": "success", "outputs": {"run_lanes": str(run_lanes).lower()}},
                     "attest": {"result": "success" if event == "pull_request" else "skipped"},
                     "transport-evidence": {"result": transport},
                     "connection-limits-patch": {"result": connection_limits},
+                    "quinn-proto-patch": {"result": quinn_proto},
                     "quic-profile-pins": {"result": pins}})
     return subprocess.run(["bash", "-c", gate_script() if script is None else script],
                           env={"PATH": os.environ["PATH"], "EVENT_NAME": event, "RESULTS": json.dumps(results)},
@@ -53,6 +55,15 @@ class ConnectionLimitsGate(unittest.TestCase):
         for outcome in ("skipped", "cancelled", "failure"):
             with self.subTest(outcome=outcome):
                 self.assertNotEqual(execute("merge_group", True, "success", connection_limits=outcome).returncode, 0)
+
+
+class QuinnProtoGate(unittest.TestCase):
+    def test_every_author_and_event_requires_success(self):
+        for event, run_lanes in (("pull_request", False), ("pull_request", True), ("merge_group", True)):
+            self.assertEqual(execute(event, run_lanes, "success").returncode, 0)
+            for outcome in ("skipped", "cancelled", "failure"):
+                with self.subTest(event=event, run_lanes=run_lanes, outcome=outcome):
+                    self.assertNotEqual(execute(event, run_lanes, "success", quinn_proto=outcome).returncode, 0)
 
 
 class QuicProfilePinsGate(unittest.TestCase):
