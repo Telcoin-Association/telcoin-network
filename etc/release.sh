@@ -1263,20 +1263,21 @@ EOF
     sed -e "s|@TAG@|$TAG|g" -e "s|@REPO@|$REPO|g" <<'EOF'
 ## Verify
 
-Check the signed checksums before you extract or run anything. These commands take the maintainer keys from `main`, never from the tag, fetch the tag by its full name, extract the chain-config files from it, download the release files, check the signature over `SHA256SUMS`, and check the hashes:
+Check the signed checksums before you extract or run anything. In a new, empty directory, run these commands in one shell; the first one stops on a directory that is not empty, so no file from an earlier download is checked in place of this release's. They take the maintainer keys from `main`, never from the tag, fetch the tag by its full name, extract the chain-config files from it, download the release files, stopping at the first download that fails, check the signature over `SHA256SUMS`, and check the hashes:
 
 ```sh
 TAG=@TAG@
 REPO=@REPO@
 BASE="https://github.com/$REPO/releases/download/$TAG"
+if [ -n "$(ls -A)" ]; then echo "Run these commands in a new, empty directory" >&2; false; fi &&
 git clone --quiet --depth 1 --branch main "https://github.com/$REPO.git" tn-main &&
 git -C tn-main fetch --quiet --depth 1 origin "refs/tags/$TAG:refs/tags/$TAG" &&
 git -C tn-main archive "refs/tags/$TAG" chain-configs | tar -xf - &&
 for k in tn-main/.github/maintainer-gpg-keys/*.asc; do gpg --dearmor < "$k"; done > tn-release-keys.gpg &&
 gpg --show-keys --with-fingerprint tn-main/.github/maintainer-gpg-keys/*.asc &&
-curl -fsSL --remote-name-all "$BASE/SHA256SUMS" "$BASE/SHA256SUMS.asc" "$BASE/IMAGE_DIGEST" "$BASE/telcoin-network-$TAG-x86_64-unknown-linux-gnu.tar.gz" &&
+curl -fsSL --fail-early --remote-name-all "$BASE/SHA256SUMS" "$BASE/SHA256SUMS.asc" "$BASE/IMAGE_DIGEST" "$BASE/telcoin-network-$TAG-x86_64-unknown-linux-gnu.tar.gz" &&
 gpgv --status-fd 1 --keyring ./tn-release-keys.gpg SHA256SUMS.asc SHA256SUMS |
-awk '$2 == "BADSIG" { bad = 1 } $2 ~ /^(GOODSIG|EXPKEYSIG|REVKEYSIG|BADSIG|ERRSIG)$/ { s = $2; print $2 } $2 == "VALIDSIG" && s == "GOODSIG" { print "signed by primary key " $NF; n++ } END { exit (n && !bad) ? 0 : 1 }' &&
+awk '$2 ~ /^(BADSIG|ERRSIG|EXPSIG|EXPKEYSIG|REVKEYSIG)$/ { bad = 1 } $2 ~ /^(GOODSIG|BADSIG|ERRSIG|EXPSIG|EXPKEYSIG|REVKEYSIG)$/ { s = $2; print $2 } $2 == "VALIDSIG" && s == "GOODSIG" { print "signed by primary key " $NF; n++ } END { exit (n && !bad) ? 0 : 1 }' &&
 sha256sum --check SHA256SUMS &&
 echo "Signature and hashes verified"
 ```
@@ -1308,20 +1309,21 @@ git -C ../tn-main rev-parse "refs/tags/$TAG^{commit}"
 
 The first `--version` line is `telcoin-network-cli Version: @VERSION@`. `Commit SHA:` must be the commit that `git rev-parse` printed. `Build Features:` must be empty for a mainnet tag; for an `-adiri` tag it lists `adiri`, and may also list `faucet`, which the `adiri` feature implies, and nothing else.
 
-Docker image: it needs only `SHA256SUMS`, `SHA256SUMS.asc`, `IMAGE_DIGEST` and the chain-config files. These commands are the block above without the tarball, and with `--ignore-missing`, which makes `sha256sum` skip the tarball's line:
+Docker image: it needs only `SHA256SUMS`, `SHA256SUMS.asc`, `IMAGE_DIGEST` and the chain-config files. In a new, empty directory, run the block above without the tarball, and with `--ignore-missing`, which makes `sha256sum` skip the tarball's line:
 
 ```sh
 TAG=@TAG@
 REPO=@REPO@
 BASE="https://github.com/$REPO/releases/download/$TAG"
+if [ -n "$(ls -A)" ]; then echo "Run these commands in a new, empty directory" >&2; false; fi &&
 git clone --quiet --depth 1 --branch main "https://github.com/$REPO.git" tn-main &&
 git -C tn-main fetch --quiet --depth 1 origin "refs/tags/$TAG:refs/tags/$TAG" &&
 git -C tn-main archive "refs/tags/$TAG" chain-configs | tar -xf - &&
 for k in tn-main/.github/maintainer-gpg-keys/*.asc; do gpg --dearmor < "$k"; done > tn-release-keys.gpg &&
 gpg --show-keys --with-fingerprint tn-main/.github/maintainer-gpg-keys/*.asc &&
-curl -fsSL --remote-name-all "$BASE/SHA256SUMS" "$BASE/SHA256SUMS.asc" "$BASE/IMAGE_DIGEST" &&
+curl -fsSL --fail-early --remote-name-all "$BASE/SHA256SUMS" "$BASE/SHA256SUMS.asc" "$BASE/IMAGE_DIGEST" &&
 gpgv --status-fd 1 --keyring ./tn-release-keys.gpg SHA256SUMS.asc SHA256SUMS |
-awk '$2 == "BADSIG" { bad = 1 } $2 ~ /^(GOODSIG|EXPKEYSIG|REVKEYSIG|BADSIG|ERRSIG)$/ { s = $2; print $2 } $2 == "VALIDSIG" && s == "GOODSIG" { print "signed by primary key " $NF; n++ } END { exit (n && !bad) ? 0 : 1 }' &&
+awk '$2 ~ /^(BADSIG|ERRSIG|EXPSIG|EXPKEYSIG|REVKEYSIG)$/ { bad = 1 } $2 ~ /^(GOODSIG|BADSIG|ERRSIG|EXPSIG|EXPKEYSIG|REVKEYSIG)$/ { s = $2; print $2 } $2 == "VALIDSIG" && s == "GOODSIG" { print "signed by primary key " $NF; n++ } END { exit (n && !bad) ? 0 : 1 }' &&
 sha256sum --check --ignore-missing SHA256SUMS &&
 echo "Signature and hashes verified"
 ```
@@ -1342,8 +1344,12 @@ When a check fails, do not extract, install or run anything from this release:
 
 - The last line is not `Signature and hashes verified`: a step failed, and the lines above it say which.
 - `BADSIG`: `SHA256SUMS` changed after it was signed. Report it.
+- `Run these commands in a new, empty directory`: the directory holds files already. Start again in a new, empty directory.
+- `curl` reports an error, such as `404`: a release file did not download, and the block stopped there. Check `TAG`; if it is right, report it.
 - `ERRSIG`: the signing key is not in the allowlist on `main`, or `TAG` is wrong. Check `TAG`; if it is right, report it.
 - `EXPKEYSIG` or `REVKEYSIG`: the signing key has expired or was revoked, although gpgv still prints `Good signature`. Report it; a release signed before that can no longer be verified against `main`, which is intended.
+- `EXPSIG`: the signature itself has expired. Report it.
+- Any of `BADSIG`, `ERRSIG`, `EXPSIG`, `EXPKEYSIG` or `REVKEYSIG` stops the block even when another signature in `SHA256SUMS.asc` is good.
 - `sha256sum` prints `FAILED` or `no file was verified`: a file differs from its signed hash, or none of the files is present. Check `TAG` and download once more; if it still fails, report it.
 - `sha256sum` prints `FAILED open or read` for a `chain-configs/` file: `git archive` did not extract it. Check that the tag was fetched; if it was, report it.
 - A fingerprint is missing from `SECURITY.md` or GitHub, differs, or has the Status `revoked`. Report it.
