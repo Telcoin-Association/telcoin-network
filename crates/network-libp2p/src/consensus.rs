@@ -1445,14 +1445,15 @@ where
                 send_or_log_error!(reply, self.connected_peers.len(), "EstablishedPeerCount");
             }
             NetworkCommand::ConnectedPeers { reply } => {
-                let peers = self
-                    .swarm
-                    .behaviour()
-                    .peer_manager
+                let peer_manager = &self.swarm.behaviour().peer_manager;
+                // current-committee members first (stable order), so a caller that tries
+                // peers in order reaches the peers most likely to hold consensus data first
+                let (committee, others): (Vec<_>, Vec<_>) = peer_manager
                     .connected_or_dialing_peers()
                     .iter()
-                    .flat_map(|id| self.swarm.behaviour().peer_manager.peer_to_bls(id))
-                    .collect();
+                    .flat_map(|id| peer_manager.peer_to_bls(id))
+                    .partition(|bls| peer_manager.is_current_committee_member(bls));
+                let peers: Vec<_> = committee.into_iter().chain(others).collect();
                 debug!(target: "network", ?peers, "peer manager connected peers:");
                 send_or_log_error!(reply, peers, "ConnectedPeers");
             }

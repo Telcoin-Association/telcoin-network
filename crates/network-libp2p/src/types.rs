@@ -820,6 +820,10 @@ where
     }
 
     /// Retrieve a collection of connected peers.
+    ///
+    /// Members of the current committee come first. Within each group the order is the peer
+    /// manager's order, so a caller that tries peers in turn reaches committee members before
+    /// other peers.
     pub async fn connected_peers(&self) -> NetworkResult<Vec<BlsPublicKey>> {
         let (reply, peers) = oneshot::channel();
         self.sender.send(NetworkCommand::ConnectedPeers { reply }).await?;
