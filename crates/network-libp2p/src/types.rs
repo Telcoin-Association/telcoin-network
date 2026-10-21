@@ -21,6 +21,47 @@ use tokio::sync::{mpsc, oneshot};
 /// The result for network operations.
 pub type NetworkResult<T> = Result<T, NetworkError>;
 
+/// One atomic view of current membership and its learned submit advertisements.
+///
+/// Membership includes unresolved identities. Coverage candidates exclude configuration
+/// stubs and expired store rows. The complete consumer advertisement set is retained separately
+/// so observing freshness cannot retire an advertised endpoint's transport cooldown.
+#[derive(Clone, Debug)]
+pub struct CommitteeRpcSnapshot {
+    /// Current committee identities from authoritative epoch state.
+    members: HashSet<BlsPublicKey>,
+    /// Learned RPC advertisements belonging to these members.
+    rpcs: Vec<(BlsPublicKey, RpcInfo)>,
+    /// Complete current advertisements used by forwarding, including cached records.
+    advertisements: Vec<(BlsPublicKey, RpcInfo)>,
+}
+
+impl CommitteeRpcSnapshot {
+    /// Construct a snapshot on the swarm loop, without an intervening committee update.
+    pub(crate) fn new(
+        members: HashSet<BlsPublicKey>,
+        rpcs: Vec<(BlsPublicKey, RpcInfo)>,
+        advertisements: Vec<(BlsPublicKey, RpcInfo)>,
+    ) -> Self {
+        Self { members, rpcs, advertisements }
+    }
+
+    /// Current identities, including members without an RPC advertisement.
+    pub fn members(&self) -> &HashSet<BlsPublicKey> {
+        &self.members
+    }
+
+    /// Fresh verified coverage candidates; callers must still apply endpoint admission policy.
+    pub fn rpcs(&self) -> &[(BlsPublicKey, RpcInfo)] {
+        &self.rpcs
+    }
+
+    /// Complete advertisement set, matching the forwarding consumer's cache lifecycle.
+    pub fn advertisements(&self) -> &[(BlsPublicKey, RpcInfo)] {
+        &self.advertisements
+    }
+}
+
 /// Helper trait to cast lib-specific results into RPC messages.
 pub trait IntoResponse<M> {
     /// Convert a [Result] into a [TNMessage] type.
@@ -515,6 +556,11 @@ where
         /// The reply to caller.
         reply: oneshot::Sender<Vec<(BlsPublicKey, RpcInfo)>>,
     },
+    /// Atomically read current membership and learned RPC advertisements.
+    GetCommitteeRpcSnapshot {
+        /// The reply to caller.
+        reply: oneshot::Sender<CommitteeRpcSnapshot>,
+    },
     /// Read a single record from the local kad store by BLS key.
     ///
     /// Test-only observation hook used to assert local-store eviction
@@ -701,7 +747,36 @@ where
         Ok(was_subscribed.await?)
     }
 
+    /// The free and total slots of the command channel.
+    ///
+    /// `test_full_command_channel_publish_waits_then_resolves` reads it to see when the channel
+    /// is full.
+    #[cfg(test)]
+    pub(crate) fn command_channel_slots(&self) -> (usize, usize) {
+        (self.sender.capacity(), self.sender.max_capacity())
+    }
+
     /// Publish a message on a certain topic.
+    ///
+    /// The swarm task never waits for a peer during a publish (see
+    /// `ConsensusNetwork::process_command`). The caller can wait at two points only:
+    ///
+    /// - The send on the command channel waits while the channel holds its 100 commands. This
+    ///   occurs only when the swarm task is behind, and the swarm task drains the channel at its
+    ///   loop rate.
+    /// - The reply comes in the loop iteration that takes the command from the channel. It holds
+    ///   the gossipsub result, for example `PublishError::AllQueuesFull` when the send queue of
+    ///   every recipient peer is full. The swarm task does not retry a failed publish.
+    ///
+    /// The callers that wait here are the certifier (certificates), the executor subscriber
+    /// (consensus output), the epoch-vote manager (epoch votes) and the worker (batch digests).
+    /// None of them runs on the swarm task, so a wait delays that caller and never the swarm
+    /// task. The wait has no timeout, and the send is not `try_send`, by decision (issue #1656):
+    /// both would drop a message during a short burst that the swarm task drains, and neither
+    /// helps when the swarm task stalls, because every other [`NetworkHandle`] call uses the
+    /// same channel. A timeout on the reply also does not cancel a publish that is already in
+    /// the channel. `test_full_command_channel_publish_waits_then_resolves` records what a
+    /// caller sees when the channel is full.
     pub async fn publish(&self, topic: String, msg: Vec<u8>) -> NetworkResult<MessageId> {
         let (reply, published) = oneshot::channel();
         self.sender.send(NetworkCommand::Publish { topic, msg, reply }).await?;
@@ -926,6 +1001,14 @@ where
     pub async fn get_all_validator_rpcs(&self) -> NetworkResult<Vec<(BlsPublicKey, RpcInfo)>> {
         let (reply, rx) = oneshot::channel();
         self.sender.send(NetworkCommand::GetAllValidatorRpcs { reply }).await?;
+        rx.await.map_err(Into::into)
+    }
+
+    /// Read current membership and learned RPC advertisements on the same swarm iteration.
+    /// Polling also retries discovery for unresolved members, including configuration stubs.
+    pub async fn get_committee_rpc_snapshot(&self) -> NetworkResult<CommitteeRpcSnapshot> {
+        let (reply, rx) = oneshot::channel();
+        self.sender.send(NetworkCommand::GetCommitteeRpcSnapshot { reply }).await?;
         rx.await.map_err(Into::into)
     }
 }

@@ -15,7 +15,7 @@ use crate::{
     peers::status::ConnectionStatus,
     send_or_log_error,
     source_admission::{AdmissionError, SourceAdmissionBudget, SourceConnections},
-    types::{NetworkInfo, NetworkResult, RpcInfo},
+    types::{CommitteeRpcSnapshot, NetworkInfo, NetworkResult, RpcInfo},
 };
 use libp2p::{
     core::ConnectedPoint, kad::PeerInfo, multiaddr::Protocol, swarm::ConnectionId, Multiaddr,
@@ -342,11 +342,11 @@ impl PeerManager {
 
     /// Apply one predicate to every connection direction, including unknown pending identities.
     /// Closed rejects an unknown pending identity; authenticated establishment always rechecks.
-    /// Each Closed denial is counted by `direction` ({`in`, `out`}).
+    /// Each Closed denial is counted by `direction`.
     pub(super) fn check_admission(
         &self,
         peer: Option<&PeerId>,
-        direction: &'static str,
+        direction: crate::metrics::ConnectionDirection,
     ) -> Result<(), libp2p::swarm::ConnectionDenied> {
         let (status, authorized) = self.evaluate_admission();
         if status.effective() != AdmissionMode::Closed
@@ -474,17 +474,17 @@ impl PeerManager {
         connection: ConnectionId,
         peer: PeerId,
         address: &Multiaddr,
-        direction: &'static str,
+        direction: crate::metrics::ConnectionDirection,
     ) -> Result<(), libp2p::swarm::ConnectionDenied> {
         let important = self.peer_is_important(&peer);
         self.source_connections.reserve(connection, peer, address).map_err(|error| {
-            self.metrics.record_source_admission_denied(direction, error.label());
+            self.metrics.record_source_admission_denied(direction, error);
             if matches!(error, AdmissionError::Poisoned) {
                 error!(target: "peer-manager", %error, "source admission accounting poisoned");
             } else if important {
-                warn!(target: "peer-manager", ?peer, direction, %error, "source budget refused important peer");
+                warn!(target: "peer-manager", ?peer, direction = direction.label(), %error, "source budget refused important peer");
             } else {
-                debug!(target: "peer-manager", ?peer, direction, %error, "source budget refused connection");
+                debug!(target: "peer-manager", ?peer, direction = direction.label(), %error, "source budget refused connection");
             }
             libp2p::swarm::ConnectionDenied::new(error)
         })
@@ -2077,6 +2077,28 @@ impl PeerManager {
                 self.known_peers.get(bls).and_then(|info| info.rpc.clone()).map(|rpc| (*bls, rpc))
             })
             .collect()
+    }
+
+    /// Snapshot membership and learned advertisements without racing committee rotation.
+    pub(crate) fn committee_rpc_snapshot(&mut self) -> CommitteeRpcSnapshot {
+        let advertisements = self.current_committee_rpcs();
+        let rpcs =
+            advertisements.iter().filter(|(key, _)| !self.record_unlearned(key)).cloned().collect();
+        CommitteeRpcSnapshot::new(self.peers.current_committee().clone(), rpcs, advertisements)
+    }
+
+    /// Observe required remote identities in each slot using the resolution consumer's state.
+    /// Self is excluded from both counts because it never needs remote discovery.
+    pub(crate) fn observe_committee_resolution(&self, local_key: BlsPublicKey) {
+        ["previous", "current", "next"].into_iter().zip(self.peers.committee_slots()).for_each(
+            |(slot, members)| {
+                let required = members.iter().filter(|key| **key != local_key);
+                let expected = required.clone().count();
+                let unresolved = required.filter(|key| self.record_unlearned(key)).count();
+                self.metrics.set_committee_resolution(slot, expected, unresolved);
+            },
+        );
+        self.metrics.mark_committee_observed();
     }
 
     /// Find the peer id for an authority.
