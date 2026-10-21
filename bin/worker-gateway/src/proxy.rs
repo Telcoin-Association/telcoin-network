@@ -4436,6 +4436,10 @@ mod tests {
             r#"[["2.0",1,"eth_call",[]]]"#.to_string(),
             // a denied-looking string outside the method slot names nothing
             r#"[["tn_x",1,"eth_call",[]]]"#.to_string(),
+            // a string id in a four-member array's second slot is an id, not a method
+            r#"[["2.0","tn_x","eth_call",[]]]"#.to_string(),
+            // nor in a five-member one: only a three-member array's second member is a method
+            r#"[["2.0","tn_x","eth_call",[],1]]"#.to_string(),
         ];
         for body in &allowed_bodies {
             assert!(!calls_denied_method(body.as_bytes(), &prefixes), "{body}");
