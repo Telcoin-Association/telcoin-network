@@ -83,8 +83,6 @@ Each key is generated on a YubiKey and never leaves it. The fingerprint is the p
 
 Signatures required: 1 (MIN_SIGNATURES in etc/release.sh).
 
-Until a key is provisioned, its file in `.github/maintainer-gpg-keys/` is a placeholder and every release check fails on it.
-
 ### Changing this table
 
 - To add a maintainer, open one pull request that adds `.github/maintainer-gpg-keys/<handle>.asc` and a row here, and have it reviewed by someone other than the key's owner. [YubiKey signing setup](https://docs.telcoin.network/maintainers/yubikey-setup.html) covers creating and exporting the key.

@@ -870,10 +870,12 @@ key_expiry_date() {
     if matches "$exp" '^[0-9]+$'; then date -r "$exp" +%Y-%m-%d; else printf 'unknown\n'; fi
 }
 
-# other_keys FILE: the primary fingerprints in FILE other than FPR, space separated.
+# other_keys FILE: the primary fingerprints in FILE other than FPR, space separated; nothing
+# for a missing file or one that holds no armored public key (empty, or any other text).
 other_keys() {
     [ -f "$1" ] || return 0
-    "$GPG" --show-keys --with-colons "$1" 2>/dev/null | list_fprs pub | awk -v f="$FPR" '$0 != f' | tr '\n' ' ' | sed 's/ $//'
+    grep -q 'BEGIN PGP PUBLIC KEY BLOCK' "$1" || return 0
+    "$GPG" --show-keys --with-colons "$1" 2>/dev/null | list_fprs pub | awk -v f="$FPR" '$0 != f' | tr '\n' ' ' | sed 's/ $//' || true
 }
 
 # drive_gpg_editor TABLE PREFIX ARG...: runs "$GPG" --no-tty --command-fd 4 --status-fd 5 ARG...

@@ -173,7 +173,7 @@ The file holds only the public key; it goes on the allowlist and on GitHub.
 
 ## Add the key to the allowlist
 
-1. On a branch, copy `~/$HANDLE.asc` to `.github/maintainer-gpg-keys/<handle>.asc`, replacing the placeholder file if your handle has one.
+1. On a branch, copy `~/$HANDLE.asc` to `.github/maintainer-gpg-keys/<handle>.asc`.
 2. Fill in your row of the maintainer release keys table in `SECURITY.md`: handle, primary key fingerprint (`$FPR`), YubiKey serial, date added and status `active`.
 3. Set the Status of your row in the Files table of `.github/maintainer-gpg-keys/README.md` to `Active since YYYY-MM-DD.`, adding the row if your handle has none.
 4. Open a PR; another maintainer reviews it and confirms the fingerprint with you over a separate channel, such as a call.
