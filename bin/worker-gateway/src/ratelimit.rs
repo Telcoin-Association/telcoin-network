@@ -140,6 +140,24 @@ impl Clock for SystemClock {
     }
 }
 
+/// The production clock behind an `Arc`, so a test can hand the server's
+/// limiters a clock it keeps advancing. The default is [`SystemClock`]; each
+/// reading costs one dynamic call.
+#[derive(Clone)]
+pub(crate) struct SharedClock(Arc<dyn Clock>);
+
+impl Default for SharedClock {
+    fn default() -> Self {
+        Self(Arc::new(SystemClock))
+    }
+}
+
+impl Clock for SharedClock {
+    fn now(&self) -> Instant {
+        self.0.now()
+    }
+}
+
 /// A resolved rate limit: a sustained `rate` (requests per second) with a
 /// `burst` ceiling (the token-bucket capacity).
 #[derive(Debug, Clone, Copy)]
@@ -652,7 +670,7 @@ impl PerIpLimiter {
 }
 
 /// The gateway's rate limiters. Any limiter may be disabled (`None`).
-pub(crate) struct RateLimiters<C: Clock = SystemClock> {
+pub(crate) struct RateLimiters<C: Clock = SharedClock> {
     clock: C,
     global: Option<GlobalLimiter>,
     per_ip: Option<PerIpLimiter>,
@@ -661,7 +679,7 @@ pub(crate) struct RateLimiters<C: Clock = SystemClock> {
     submissions: Option<GlobalLimiter>,
 }
 
-impl RateLimiters<SystemClock> {
+impl RateLimiters<SharedClock> {
     /// Build the limiters from resolved settings using the system clock, or
     /// `None` when every limiter is disabled (so no layer need be installed).
     pub(crate) fn new(
@@ -671,8 +689,15 @@ impl RateLimiters<SystemClock> {
         max_per_ip_entries: usize,
         prefix: PrefixPolicy,
     ) -> Option<Arc<Self>> {
-        Self::with_clock(SystemClock, per_ip, global, submissions, max_per_ip_entries, prefix)
-            .map(Arc::new)
+        Self::with_clock(
+            SharedClock::default(),
+            per_ip,
+            global,
+            submissions,
+            max_per_ip_entries,
+            prefix,
+        )
+        .map(Arc::new)
     }
 }
 
@@ -680,7 +705,7 @@ impl<C: Clock> RateLimiters<C> {
     /// Build the limiters over an injected clock. `prefix` decides how a client
     /// address is masked before it keys a per-IP bucket; it is inert when the
     /// per-IP limiter is disabled.
-    fn with_clock(
+    pub(crate) fn with_clock(
         clock: C,
         per_ip: Option<RateLimit>,
         global: Option<RateLimit>,
@@ -930,7 +955,7 @@ impl<C: Clock> RateLimiters<C> {
 /// With the global limit off the drop charge always admits. Dropping a budget
 /// that was charged costs nothing more.
 #[derive(Clone)]
-pub(crate) struct SubmissionBudget<C: Clock = SystemClock> {
+pub(crate) struct SubmissionBudget<C: Clock = SharedClock> {
     /// Shared by every clone (the request extension and the handler's copy),
     /// so the request is settled once, when the last clone is dropped.
     inner: Arc<BudgetInner<C>>,
@@ -1046,31 +1071,42 @@ fn is_exempt(method: &Method, path: &str) -> bool {
     (path == HEALTH_PATH || path == READY_PATH) && matches!(*method, Method::GET | Method::HEAD)
 }
 
+/// A hand-advanced clock so token refills are deterministic without sleeps.
+/// The server's tests hand it to their limiters as a [`SharedClock`].
+#[cfg(test)]
+#[derive(Clone)]
+pub(crate) struct ManualClock {
+    now: Arc<Mutex<Instant>>,
+}
+
+#[cfg(test)]
+impl ManualClock {
+    pub(crate) fn new() -> Self {
+        Self { now: Arc::new(Mutex::new(Instant::now())) }
+    }
+
+    pub(crate) fn advance(&self, by: Duration) {
+        *lock(&self.now) += by;
+    }
+}
+
+#[cfg(test)]
+impl Clock for ManualClock {
+    fn now(&self) -> Instant {
+        *lock(&self.now)
+    }
+}
+
+#[cfg(test)]
+impl From<ManualClock> for SharedClock {
+    fn from(clock: ManualClock) -> Self {
+        Self(Arc::new(clock))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// A hand-advanced clock so token refills are deterministic without sleeps.
-    #[derive(Clone)]
-    struct ManualClock {
-        now: Arc<Mutex<Instant>>,
-    }
-
-    impl ManualClock {
-        fn new() -> Self {
-            Self { now: Arc::new(Mutex::new(Instant::now())) }
-        }
-
-        fn advance(&self, by: Duration) {
-            *lock(&self.now) += by;
-        }
-    }
-
-    impl Clock for ManualClock {
-        fn now(&self) -> Instant {
-            *lock(&self.now)
-        }
-    }
 
     fn nz(n: u32) -> NonZeroU32 {
         NonZeroU32::new(n).expect("nonzero")

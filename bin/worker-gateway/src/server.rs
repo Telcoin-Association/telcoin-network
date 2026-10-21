@@ -1712,7 +1712,7 @@ mod tests {
             client_builder, proxy_client, UpstreamClientBuilder, DEFAULT_MAX_BATCH_LEN,
             MAX_REQUEST_BYTES, SUBMISSION_ANSWER_SLACK,
         },
-        ratelimit::RateLimit,
+        ratelimit::{ManualClock, RateLimit, SharedClock},
         readiness::{run_poller, QueryProbe, ReadinessThresholds},
         telemetry::test_utils::{process_per_test, CapturedMetrics},
     };
@@ -5126,15 +5126,20 @@ mod tests {
     }
 
     /// A gateway with a ready worker answering `worker` and a global limit of
-    /// one request (no refill within the test), plus a submission budget when
-    /// `submissions` is given.
+    /// one request, plus a submission budget when `submissions` is given.
+    ///
+    /// The limiters run on the returned manual clock, not the wall clock: it
+    /// never moves unless the test advances it, so no bucket refills within
+    /// the test, however long its steps take.
     async fn one_token_gateway(
         submissions: Option<RateLimit>,
-    ) -> (SocketAddr, Seen, [Notifier; 2]) {
+    ) -> (SocketAddr, Seen, ManualClock, [Notifier; 2]) {
         let (worker, worker_seen, worker_server) = named_mock("worker").await;
         let state = redirect_state(worker, None);
         state.readiness.set_ready(0, true);
-        let limiters = RateLimiters::new(
+        let clock = ManualClock::new();
+        let limiters = RateLimiters::with_clock(
+            SharedClock::from(clock.clone()),
             None,
             Some(RateLimit::new(nz(1), nz(1))),
             submissions,
@@ -5147,16 +5152,16 @@ mod tests {
             Duration::from_secs(5),
             MAX_REQUEST_BYTES,
             None,
-            RouterLayers { rate_limiters: Some(limiters), ..RouterLayers::default() },
+            RouterLayers { rate_limiters: Some(Arc::new(limiters)), ..RouterLayers::default() },
             Arc::default(),
         ))
         .await;
-        (gateway, worker_seen, [worker_server, gateway_server])
+        (gateway, worker_seen, clock, [worker_server, gateway_server])
     }
 
     #[tokio::test]
     async fn submission_budget_admits_when_global_is_exhausted() {
-        let (gateway, worker_seen, _servers) =
+        let (gateway, worker_seen, _clock, _servers) =
             one_token_gateway(Some(RateLimit::new(nz(1), nz(1)))).await;
 
         // a read spends the global bucket's only token
@@ -5179,7 +5184,7 @@ mod tests {
     /// still gets.
     #[tokio::test]
     async fn submission_flood_spends_no_read_budget() {
-        let (gateway, worker_seen, _servers) =
+        let (gateway, worker_seen, _clock, _servers) =
             one_token_gateway(Some(RateLimit::new(nz(1), nz(1)))).await;
 
         // the first submission spends the submission bucket's only token
@@ -5204,7 +5209,7 @@ mod tests {
     /// budget is whole for the next submissions.
     #[tokio::test]
     async fn refused_submission_batch_returns_its_submission_token() {
-        let (gateway, worker_seen, _servers) =
+        let (gateway, worker_seen, _clock, _servers) =
             one_token_gateway(Some(RateLimit::new(nz(1), nz(2)))).await;
 
         // a read spends the global bucket's only token
@@ -5230,7 +5235,7 @@ mod tests {
 
     #[tokio::test]
     async fn without_a_submission_budget_the_edge_check_is_unchanged() {
-        let (gateway, worker_seen, _servers) = one_token_gateway(None).await;
+        let (gateway, worker_seen, _clock, _servers) = one_token_gateway(None).await;
 
         let (status, text) = post_rpc(gateway, None, call("eth_chainId", 1)).await;
         assert_eq!((status, text.as_str()), (StatusCode::OK, "worker"));
