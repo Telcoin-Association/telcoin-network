@@ -157,7 +157,8 @@ Record the tarball's SHA-256 from `SHA256SUMS` and the `--version` output in you
 ## Path B: Docker image
 
 The image needs only three of the release files, `SHA256SUMS`, `SHA256SUMS.asc` and `IMAGE_DIGEST`, and the chain-config files from the tag.
-In a new, empty directory, run the Path A block without the tarball, and with `--ignore-missing`, which makes `sha256sum` skip the tarball's line in `SHA256SUMS`:
+In a new, empty directory, run the Path A block without the tarball.
+Its last check drops only the tarball's line from `SHA256SUMS` with `grep`, so `sha256sum` checks `IMAGE_DIGEST` and the three chain-config files and fails when one of them is missing:
 
 ```sh
 TAG=v0.17.0-adiri
@@ -172,7 +173,7 @@ gpg --show-keys --with-fingerprint tn-main/.github/maintainer-gpg-keys/*.asc &&
 curl -fsSL --fail-early --remote-name-all "$BASE/SHA256SUMS" "$BASE/SHA256SUMS.asc" "$BASE/IMAGE_DIGEST" &&
 gpgv --status-fd 1 --keyring ./tn-release-keys.gpg SHA256SUMS.asc SHA256SUMS |
 awk '$2 ~ /^(BADSIG|ERRSIG|EXPSIG|EXPKEYSIG|REVKEYSIG)$/ { bad = 1 } $2 ~ /^(GOODSIG|BADSIG|ERRSIG|EXPSIG|EXPKEYSIG|REVKEYSIG)$/ { s = $2; print $2 } $2 == "VALIDSIG" && s == "GOODSIG" { print "signed by primary key " $NF; n++ } END { exit (n && !bad) ? 0 : 1 }' &&
-sha256sum --check --ignore-missing SHA256SUMS &&
+grep -v -F "  telcoin-network-$TAG-x86_64-unknown-linux-gnu.tar.gz" SHA256SUMS | sha256sum --check &&
 echo "Signature and hashes verified"
 ```
 

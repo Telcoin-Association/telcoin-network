@@ -23,15 +23,16 @@ The examples use `v0.17.0-adiri`.
 
 | Tag | Network | Build features | Image tags | GitHub release |
 | --- | --- | --- | --- | --- |
-| `vX.Y.Z` | mainnet | none | `:vX.Y.Z`, `:latest` | Latest, or a normal release if a higher mainnet version is already published |
+| `vX.Y.Z` | mainnet | none | `:vX.Y.Z`, `:latest` | Latest, or a normal release if a higher mainnet version, tagged after it, was published first |
 | `vX.Y.Z-rcN` | mainnet release candidate | none | `:vX.Y.Z-rcN` only | Pre-release |
 | `vX.Y.Z-adiri` | Adiri testnet | `adiri` | `:vX.Y.Z-adiri`, `:adiri` | Pre-release |
 | `vX.Y.Z-adiri-rcN` | Adiri release candidate | `adiri` | `:vX.Y.Z-adiri-rcN` only | Pre-release |
 
 `release-build` pushes the image under the tag name.
-`release-publish` moves `:latest` or `:adiri` only when the release is the highest published final version in its channel, so publishing an older patch later does not move the alias back.
-It marks a release Latest only when it is a mainnet final release with the highest published mainnet version.
-An older mainnet final, such as a patch to an earlier minor version, is published as a normal release that is not Latest, and every release candidate and Adiri release as a pre-release.
+`release-publish` moves `:latest` or `:adiri` only when the release is the highest published final version in its channel, so publishing a lower version after a higher one does not move the alias back.
+It marks a release Latest only when it is a mainnet final release with the highest published mainnet version, and every release candidate and Adiri release a pre-release.
+The version rules below refuse a final version that is not higher than every final version already tagged in its channel, so a patch to an earlier minor version, such as `v1.1.1` once `v1.2.0` exists, cannot be released.
+A mainnet final is published as a normal release that is not Latest only when a higher version, tagged after it, was published first.
 `etc/release.sh` rejects any tag outside this grammar, so neither CI nor the `make` targets accept one; numbers have no leading zeros, and `N` starts at 1.
 
 The tag checks also enforce these version rules:
@@ -114,12 +115,13 @@ When the PR has merged, attest the release commit, which is the commit you will 
 
 ```sh
 git switch main && git pull --ff-only
-RELEASE_SHA="$(git log -1 --format=%H --grep='^release: v0\.17\.0-adiri' origin/main)"
+RELEASE_SHA="$(git log -1 --format=%H --grep='^release: v0\.17\.0-adiri (#' origin/main)"
 git switch --detach "$RELEASE_SHA" && ALLOW_STALE_BASE=1 make attest
 git switch main
 ```
 
-`RELEASE_SHA` is the newest commit on `main` whose subject starts with `release: v0.17.0-adiri`, which is the release commit you just merged; it is the tip of `main` unless another PR has landed since.
+`RELEASE_SHA` is the newest commit on `main` whose subject is `release: v0.17.0-adiri (#<PR>)`, which is the release commit you just merged; it is the tip of `main` unless another PR has landed since.
+The pattern ends at ` (#`, which starts the pull request number of the squash commit, so it matches neither a candidate's commit, `release: v0.17.0-adiri-rc1 (#<PR>)`, nor, for a mainnet tag such as `v0.17.0`, the Adiri commit of the same version, `release: v0.17.0-adiri (#<PR>)`.
 `make attest` normally refuses a commit that is behind `origin/main`, because a PR attested on an old base is not what the merge queue merges.
 The release commit is already on `main` and is the exact commit that gets tagged and built, so `ALLOW_STALE_BASE=1` is safe here.
 If `make attest` reports that the commit is already attested, there is nothing more to do.
@@ -138,10 +140,11 @@ make release-tag TAG=v0.17.0-adiri
 If another PR has landed since the release commit, point it at the release commit instead:
 
 ```sh
-RELEASE_COMMIT="$(git log -1 --format=%H --grep='^release: v0\.17\.0-adiri' origin/main)" make release-tag TAG=v0.17.0-adiri
+RELEASE_COMMIT="$(git log -1 -E --format=%H --grep='^release: v0\.17\.0-adiri(-rc[1-9][0-9]*)? \(#' origin/main)" make release-tag TAG=v0.17.0-adiri
 ```
 
-The pattern also matches a release candidate's commit, such as `release: v0.17.0-adiri-rc1`, and `-1` picks the newest, so it finds the candidate's commit when the final release tags the same commit.
+This pattern also matches a release candidate's commit of the same version and channel, such as `release: v0.17.0-adiri-rc1 (#<PR>)`, and `-1` picks the newest, so it finds the candidate's commit when the final release tags the same commit.
+It ends at ` (#` as well, so for a mainnet tag it never matches the Adiri commit of the same version.
 The release commit must already be attested, as in step 1.
 
 Before signing, it checks the Cargo version and the `CHANGELOG.md` section on that commit, and the attestation too when `cast` is installed.
@@ -188,7 +191,7 @@ It then runs every check from step 6 except the signature count.
 The last line it prints is `SHA256SUMS sha256: <hex>`.
 Write that value down; step 5 asks for it and refuses to sign when the draft's `SHA256SUMS` has another hash.
 
-Because `release-build` rewrites the draft's notes, add the operator notes after it:
+Because `release-build` rewrites the draft's notes, add the operator notes after it, above the generated notes, and leave the generated notes as they are: `release-publish` refuses a body that does not end with them.
 
 ```sh
 gh release view v0.17.0-adiri --json body --jq .body > notes.md
@@ -233,8 +236,9 @@ docker logout ghcr.io
 It ends with a line like `verified v0.17.0-adiri commit=... signatures=1/1 image=...`.
 
 `release-publish` runs the same checks, and also checks the ghcr login when it will move the channel alias, before it asks for `yes`.
-After you type `yes`, it checks that the draft's files are still the ones it verified, by name, asset id and digest, and publishes the draft as Latest, as a normal release or as a pre-release, following the channel table.
-It checks the files once more after publishing, before it moves the alias.
+It checks that the release body ends with the notes generated for the tagged commit and the image digest, line for line, and shows the operator notes above them for you to review.
+After you type `yes`, it checks that the draft's files are still the ones it verified, by name, asset id and digest, and that the body has not changed, and publishes the draft as Latest, as a normal release or as a pre-release, following the channel table.
+It checks the files and the body once more after publishing, before it moves the alias.
 If the release is the highest published final version in its channel, it points the channel alias at the image digest and confirms that the registry agrees.
 It skips work that is already done, so it is safe to run again.
 `docker logout ghcr.io` removes the registry credential from the build server until the next release.
@@ -285,9 +289,10 @@ For maintainers this means:
 
 Every step prints `error:` and the reason when it stops.
 `etc/release.sh` exits with 1 when a check fails, 2 for a usage error or an unmet precondition, and 3 when GitHub, the registry, the RPC endpoint or a `git` or `docker` network call failed; `make` shows the code as `Error N`.
-GitHub API calls, `git fetch`, registry lookups and the attestation check are retried before a step gives up with 3.
+GitHub API calls, `git fetch` and `git ls-remote`, registry lookups, the pull of the git-cliff image and the attestation check are retried before a step gives up with 3.
 A request that GitHub refuses, with an HTTP 4xx other than 429, is not retried and exits with 1 or 2, and so does a tag push that `origin` rejects.
-`git push`, `docker push`, `docker pull`, the submodule fetch and the alias move are tried once.
+`git push`, `docker push`, `docker pull`, `cargo update`, the image build, the submodule fetch and the alias move are tried once, and exit with 3 when they fail.
+A signature that gpg cannot make, usually because the YubiKey is not plugged in, exits with 2.
 After an exit code of 3, run the same command again.
 If `release-build` had already pushed the image, the second run stops because `:<TAG>` is in the registry; rebuild with `RELEASE_REBUILD=1` as the table below says.
 If `release-sign` had already uploaded the signature, the second run stops because your key has already signed, and nothing more is needed.
@@ -295,6 +300,7 @@ If `release-sign` had already uploaded the signature, the second run stops becau
 | Step | Symptom | Fix |
 | --- | --- | --- |
 | 1 | `release-prep` refuses to start | The message names the precondition: a clean tracked tree, `HEAD` at `origin/main`, or a tag that already exists. |
+| 1 | `release-prep` stops after it set the version | It restores `Cargo.toml`, `Cargo.lock` and `CHANGELOG.md` from `HEAD` as it exits, so fix the cause and run it again. |
 | 1 | `release-prep` finds the version's section lower down in `CHANGELOG.md` | That version was already released; choose the next one. |
 | 2, 3 | The `CHANGELOG.md` check fails on `release-base` | If you are tagging a later commit, set `RELEASE_COMMIT` to the release commit. If the release commit did not land alone, repeat step 1 on the new `main`. |
 | 2, 3 | The signing key is not on the allowlist | Check `git config --get user.signingkey` and `RELEASE_GPG_KEY`, and that your file on `main` holds your current signing key (`gpg --show-keys .github/maintainer-gpg-keys/<handle>.asc`). |
@@ -309,7 +315,8 @@ If `release-sign` had already uploaded the signature, the second run stops becau
 | 5 | PIN or touch errors | See [PIN and touch during signing](yubikey-setup.md#pin-and-touch-during-signing). |
 | 5 | Your key has already signed this release | Nothing to do. With a threshold above 1, another maintainer signs next. |
 | 6 | `release-verify` fails | Do not publish; the message names the failed check. To rebuild under the same tag, delete the draft with `gh release delete <TAG> --yes`, recreate it with `gh run rerun <run-id>` on the tag's CI run, run step 4 with `RELEASE_REBUILD=1`, then step 5. |
-| 6 | `release-publish` stops because the release's files changed after they were verified | Someone changed the draft while `release-publish` ran. If the release is still a draft, find out what changed before you run `release-publish` again; if it is public, follow [After publish](#after-publish). |
+| 6 | `release-publish` stops because the release's files or body changed after they were verified | Someone changed the draft while `release-publish` ran. If the release is still a draft, find out what changed before you run `release-publish` again; if it is public, follow [After publish](#after-publish). |
+| 6 | `release-publish` stops because the body does not end with the generated notes | Someone edited the generated part, or the allowlist or the release scripts on `main` changed since the build. Re-run the tag's CI run with `gh run rerun <run-id>`, which writes the generated notes again, add the operator notes above them, and run `release-publish` again. |
 | 6 | `release-publish` stops at the alias step | Run it again; it skips the steps already done. |
 | 7 | CI verification fails after publishing | Follow [After publish](#after-publish). |
 | any | Unsure where things stand | Check `gh release view <TAG>`, `gh run list --workflow release.yaml` and the files in `target/release-artifacts/<TAG>/`. |

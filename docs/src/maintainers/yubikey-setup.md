@@ -30,6 +30,7 @@ It shows where gpg wrote the revocation certificate and waits while you store it
 It checks every step by reading the card, the keyring, the files and GitHub back.
 It fills in the allowlist file, your `SECURITY.md` row and your row in the allowlist README on the current branch and stages them, but it never commits, pushes or opens the allowlist PR for you.
 It skips the optional `kdf-setup` and `url` card settings; do those by hand before its PIN step if you want them.
+It treats a YubiKey as new only when all three key slots, signature, encryption and authentication, are empty.
 When the YubiKey holds a key that matches nothing on the Mac, the script offers to wipe the card only after it has looked for that key in the allowlist on `origin/main`, fetched first, and at `https://github.com/<handle>.gpg` when it knows your login; it refuses the wipe when it finds the key there, and names where, or when it cannot read the allowlist on `origin/main`.
 
 `etc/yubikey-setup.sh check` reports what it finds without writing anything.
@@ -47,6 +48,7 @@ echo "no-allow-external-cache" >> ~/.gnupg/gpg-agent.conf
 gpgconf --kill gpg-agent
 ```
 
+`ykman --version` must print 5.6.0 or later, the first release with `ykman openpgp keys info`; `brew upgrade ykman` updates an older one, and the setup script refuses it.
 `no-allow-external-cache` removes the "Save in Keychain" box from pinentry-mac.
 Never store the PIN in Keychain.
 

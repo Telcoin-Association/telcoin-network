@@ -446,16 +446,16 @@ docker-login:
 # list is crates/types/src/forks.rs; a running node logs its compiled schedule at startup
 # (target "cli", "fork schedule (adiri)").
 docker-adiri:
-	docker buildx build -f ./etc/Dockerfile --build-arg CARGO_FEATURES=adiri --build-arg GIT_SHA=$(GIT_SHA) --platform linux/amd64,linux/arm64 --no-cache -t $(GHCR_IMAGE):dev-adiri-$(TAG) . --push ;
+	docker buildx build -f ./etc/Dockerfile --build-arg CARGO_FEATURES=adiri --build-arg "GIT_SHA=$(GIT_SHA)" --platform linux/amd64,linux/arm64 --no-cache -t "$(GHCR_IMAGE):dev-adiri-$(TAG)" . --push ;
 
 # build and push an ad-hoc devnet image for amd64 and arm64 as dev-devnet-$(TAG)
 # CARGO_FEATURES=faucet compiles in the faucet support only
 docker-devnet:
-	docker buildx build -f ./etc/Dockerfile --build-arg CARGO_FEATURES=faucet --build-arg GIT_SHA=$(GIT_SHA) --platform linux/amd64,linux/arm64 --no-cache -t $(GHCR_IMAGE):dev-devnet-$(TAG) . --push ;
+	docker buildx build -f ./etc/Dockerfile --build-arg CARGO_FEATURES=faucet --build-arg "GIT_SHA=$(GIT_SHA)" --platform linux/amd64,linux/arm64 --no-cache -t "$(GHCR_IMAGE):dev-devnet-$(TAG)" . --push ;
 
 # push the local ad-hoc adiri image to ghcr.io
 docker-push:
-	docker push $(GHCR_IMAGE):dev-adiri-$(TAG) ;
+	docker push "$(GHCR_IMAGE):dev-adiri-$(TAG)" ;
 
 # docker buildx used for multiple processor image building
 docker-builder:

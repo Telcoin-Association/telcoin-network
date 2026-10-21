@@ -82,11 +82,17 @@ sort_commits = "newest"
 # cannot end or start an mdBook anchor and cut the page short.
 # Raw HTML is escaped: `<` before a letter, `/`, `?` or `!` becomes `&lt;`, which
 # also stops a `<!--` from hiding the rest of a release body.
+# Every `[` becomes `\[`, so commit text makes no Markdown link, image, link
+# reference or footnote. A `#` followed by `#`, white space or the end becomes
+# `\#`, so no line of commit text reads as a heading; `(#123)` is untouched,
+# and the postprocessor still links it.
 commit_preprocessors = [
     { pattern = '\{\{', replace = '{\{' },
     { pattern = '\{\{', replace = '{\{' },
     { pattern = 'ANCHOR(_END)?:', replace = 'ANCHOR${1}\:' },
     { pattern = '<([A-Za-z/?!])', replace = '&lt;${1}' },
+    { pattern = '\[', replace = '\[' },
+    { pattern = '#([#\s]|$)', replace = '\#${1}' },
 ]
 # First match wins, so the private-fork merges are claimed before every other
 # `Merge` subject is skipped. The `<!-- NN -->` prefixes fix the order of the

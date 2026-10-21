@@ -10,8 +10,9 @@
 # Usage: etc/yubikey-setup.sh check | run | help   (or: make yubikey-setup)
 #
 # Flow (run):
-#   1. tools      brew gnupg, pinentry-mac and ykman; ~/.gnupg and gpg-agent.conf
+#   1. tools      brew gnupg, pinentry-mac and ykman (>= 5.6.0); ~/.gnupg and gpg-agent.conf
 #   2. yubikey    exactly one YubiKey, firmware >= 5.2.3, OpenPGP enabled; find an existing key
+#                 (the card counts as new only when all three key slots are empty)
 #   3. pins       change the PIN and Admin PIN (ykman prompts for them)
 #   4. identity   GitHub login (gh, else git config github.user, else a prompt), name and
 #                 email for the user ID
@@ -80,6 +81,9 @@ umask 077
 # Constants
 
 MIN_GPG=2.2.0
+# ykman 5.6.0 is the first release with `ykman openpgp keys info`, which set_touch_policy reads;
+# `openpgp access change-pin` and `change-admin-pin` date from 5.0.0.
+MIN_YKMAN=5.6.0
 MIN_FIRMWARE=5.2.3
 KEY_EXPIRY=2y
 # Right after generation the key must expire between these many days from now (2y is 730).
@@ -116,6 +120,8 @@ SERIAL=           # stage_card: the YubiKey's decimal serial
 FIRMWARE=         # stage_card
 CARD_AID=         # read_card_slot: OpenPGP application id (32 hex)
 CARD_SIG_FPR=     # read_card_slot: fingerprint in the card's signature slot, empty when none
+CARD_ENC_FPR=     # read_card_slot: the same for the encryption slot
+CARD_AUT_FPR=     # read_card_slot: the same for the authentication slot
 CARD_COLONS=      # read_card_slot: the gpg --card-status --with-colons output it read
 PINS_DEFAULT=0    # stage_card_state: the card was just reset, so the PINs are the defaults
 PHASE=            # discover_key: fresh, import, ready or foreign
@@ -419,10 +425,15 @@ read_card_slot() {
     [ "$(aid_serial "$CARD_AID")" = "$SERIAL" ] ||
         die 1 "gpg sees the card $CARD_AID (serial $(aid_serial "$CARD_AID")) but ykman reports serial $SERIAL; unplug every other card"
     CARD_SIG_FPR=$(card_field fpr 2 <<<"$CARD_COLONS")
+    CARD_ENC_FPR=$(card_field fpr 3 <<<"$CARD_COLONS")
+    CARD_AUT_FPR=$(card_field fpr 4 <<<"$CARD_COLONS")
     if [ -n "$CARD_SIG_FPR" ]; then
         matches "$CARD_SIG_FPR" "$FPR_RE" || die 1 "unexpected signature fingerprint on the card: $CARD_SIG_FPR"
     fi
 }
+
+# card_empty: none of the card's three key slots holds a key.
+card_empty() { [ -z "$CARD_SIG_FPR$CARD_ENC_FPR$CARD_AUT_FPR" ]; }
 
 # on_card LOCATION: the secret key location field (key_field 15) names this YubiKey.
 on_card() {
@@ -485,7 +496,7 @@ check_old_ramdisk() {
 # 1. tools
 
 stage_tools() {
-    local missing='' entry formula tool ver mode agentconf cur want tmp
+    local missing='' entry formula tool ver ykver mode agentconf cur want tmp
     step "1. tools"
     BREW_BIN=$(brew --prefix)/bin
     for entry in gnupg:gpg gnupg:gpgconf pinentry-mac:pinentry-mac ykman:ykman; do
@@ -514,7 +525,10 @@ stage_tools() {
     ver=$("$GPG" --version | awk 'NR == 1 { print $3 }')
     matches "$ver" "$VERSION_RE" || die 2 "cannot parse the gpg version from '$ver'"
     version_ge "$ver" "$MIN_GPG" || die 2 "gpg $ver is older than $MIN_GPG"
-    ok tools "gpg $ver, ykman, pinentry-mac in $BREW_BIN"
+    ykver=$("$YKMAN" --version 2>/dev/null | awk 'NR == 1 { print $NF }')
+    matches "$ykver" "$VERSION_RE" || die 2 "cannot parse the ykman version from '$ykver'"
+    version_ge "$ykver" "$MIN_YKMAN" || die 2 "ykman $ykver is older than $MIN_YKMAN; run brew upgrade ykman"
+    ok tools "gpg $ver, ykman $ykver, pinentry-mac in $BREW_BIN"
 
     if [ ! -d "$HOME_GNUPG" ]; then
         if todo gnupg-dir "create $HOME_GNUPG"; then mkdir -m 700 "$HOME_GNUPG"; fi
@@ -611,17 +625,23 @@ stage_card() {
 }
 
 # Settles the case from the card and what this Mac holds, before anything touches the card:
-#   fresh    the signature slot is empty
+#   fresh    all three key slots are empty
 #   ready    ~/.gnupg links the key in the signature slot to this YubiKey
 #   import   the key in the slot is in ~/.gnupg but not linked to this card, or its public key
 #            is in ~/*.asc or the allowlist and not yet in ~/.gnupg
-#   foreign  the slot holds a key that matches nothing here
+#   foreign  the signature slot holds a key that matches nothing here, or it is empty while
+#            the encryption or authentication slot holds a key
 # A key whose secret part sits in ~/.gnupg itself has existed outside the card; it is refused.
 discover_key() {
     local secrets f loc keys
     PHASE=fresh
     PHASE_DETAIL=
     secrets=$(gpg_home --list-secret-keys --with-colons 2>/dev/null || true)
+    if [ -z "$CARD_SIG_FPR" ] && ! card_empty; then
+        PHASE=foreign
+        PHASE_DETAIL="YubiKey $SERIAL has no signature key, but its encryption slot holds '${CARD_ENC_FPR:-nothing}' and its authentication slot '${CARD_AUT_FPR:-nothing}'; generating a key would replace them."
+        return 0
+    fi
     if [ -z "$CARD_SIG_FPR" ]; then
         for f in $(list_fprs sec <<<"$secrets"); do
             if on_card "$(key_field "$f" 15 <<<"$secrets")"; then
@@ -704,7 +724,7 @@ stage_card_state() {
     local found rc=0
     [ "$PHASE" = foreign ] || return 0
     info "$PHASE_DETAIL"
-    found=$(card_key_published "$CARD_SIG_FPR") || rc=$?
+    found=$(card_key_published "$CARD_SIG_FPR" "$CARD_ENC_FPR" "$CARD_AUT_FPR") || rc=$?
     if [ -n "$found" ]; then
         die 1 "the key on YubiKey $SERIAL is published at $(printf '%s' "$found" | tr '\n' ' '), so it may be an allowlisted release key; not offering ykman openpgp reset. Put its public key in ~/<handle>.asc, for example with git show origin/main:$ALLOWLIST_PATH/<handle>.asc > ~/<handle>.asc, and run again."
     fi
@@ -716,7 +736,7 @@ stage_card_state() {
     confirm "Wipe the OpenPGP application of YubiKey $SERIAL (ykman openpgp reset)."
     yk openpgp reset -f || die 1 "ykman openpgp reset failed"
     read_card_slot
-    [ -z "$CARD_SIG_FPR" ] || die 1 "the signature slot still holds $CARD_SIG_FPR after the reset"
+    card_empty || die 1 "the card still holds a key after the reset (signature '$CARD_SIG_FPR', encryption '$CARD_ENC_FPR', authentication '$CARD_AUT_FPR')"
     PINS_DEFAULT=1
     PHASE=fresh
     info "OpenPGP application reset; the PINs are the defaults again"
@@ -1056,7 +1076,7 @@ generate_key() {
     assert_first_key
     assert_this_card
     read_card_slot
-    [ -z "$CARD_SIG_FPR" ] || die 1 "the card's signature slot holds $CARD_SIG_FPR; refusing to generate over it"
+    card_empty || die 1 "the card holds a key (signature '$CARD_SIG_FPR', encryption '$CARD_ENC_FPR', authentication '$CARD_AUT_FPR'); refusing to generate over it"
     tries=$(card_field pinretry 4 <<<"$CARD_COLONS")
     case "$tries" in
         0) die 1 "the Admin PIN of YubiKey $SERIAL is blocked, so no key can be generated on it. Only ykman openpgp reset clears it (it wipes the OpenPGP application and restores the default PINs); then run again." ;;
@@ -1135,7 +1155,7 @@ check_revocation_cert() {
             info "revocation certificate: $rev; keep it stored apart from the YubiKey"
         fi
     elif todo revocation-cert "$rev missing; store the one from the Mac that generated the key"; then
-        warn "there is no revocation certificate at $rev. If the key was generated on another Mac, it is there: make sure it is stored. Otherwise make one with the YubiKey plugged in, gpg --output $FPR.rev --gen-revoke $FPR, and store it ('Store the revocation certificate' in $DOC)."
+        warn "there is no revocation certificate at $rev. If the key was generated on another Mac, it is there: make sure it is stored. Otherwise make one at that path with the YubiKey plugged in, mkdir -m 700 -p $HOME_GNUPG/openpgp-revocs.d && gpg --output $rev --gen-revoke $FPR, and store it ('Store the revocation certificate' in $DOC)."
     fi
 }
 
@@ -1534,17 +1554,24 @@ github_sig_test() {
 }
 
 stage_test() {
-    local repo=$WORK/sigtest raw signer
+    local repo=$WORK/sigtest raw signer name email
     step "10. test"
     if [ "$MODE" = check ]; then
         report test todo "run signs a test tag and a file"
         return 0
     fi
+    # The test tag carries the identity make release-tag uses in this checkout: git's own
+    # user.name and user.email here, not the key's user ID.
+    name=$(git config --get user.name || true)
+    email=$(git config --get user.email || true)
+    if [ -z "$name" ] || [ -z "$email" ]; then
+        die 1 "git config user.name and user.email must be set for the test tag, as make release-tag uses them (git config --global user.email $EMAIL)"
+    fi
     mkdir "$repo"
     git -C "$repo" init -q
-    git -C "$repo" -c user.name="$HANDLE" -c user.email="$EMAIL" commit -q --allow-empty -m init
-    info "Signing a test tag: pinentry-mac asks for the YubiKey's PIN unless the card holds it, then the YubiKey blinks until you touch it ('PIN and touch during signing' in $DOC)."
-    git -C "$repo" -c user.name="$HANDLE" -c user.email="$EMAIL" tag -s sigtest -m sigtest || die 1 "git tag -s failed; see Troubleshooting in $DOC"
+    git -C "$repo" -c user.name="$name" -c user.email="$email" commit -q --allow-empty -m init
+    info "Signing a test tag as $name <$email>: pinentry-mac asks for the YubiKey's PIN unless the card holds it, then the YubiKey blinks until you touch it ('PIN and touch during signing' in $DOC)."
+    git -C "$repo" -c user.name="$name" -c user.email="$email" tag -s sigtest -m sigtest || die 1 "git tag -s failed; see Troubleshooting in $DOC"
     raw=$(git -C "$repo" verify-tag --raw sigtest 2>&1) || die 1 "git verify-tag failed: $raw"
     signer=$(awk '$2 == "VALIDSIG" { print $3; exit }' <<<"$raw")
     [ "$signer" = "$FPR" ] || die 1 "the test tag was signed by '$signer', not $FPR"

@@ -6,7 +6,10 @@
 # rust:1.94-slim-bookworm, index digest as of 2026-10-15
 FROM rust:1.94-slim-bookworm@sha256:cf9dd0ec73e75f827fe59123fff9dc65af1a1c8363c3c31ee8d7f8ad0b6a5fb2 AS builder
 
-ENV RUSTUP_TOOLCHAIN=1.94
+# The exact toolchain the image above ships (rustc 1.94.1), so rustup never downloads one at
+# build time; a channel such as 1.94 makes it fetch that channel's manifest. Change it with the
+# base image: docker run --rm <image> rustc --version
+ENV RUSTUP_TOOLCHAIN=1.94.1
 
 # Strip symbols+debuginfo from the release binary. Scoped to this build only, so the
 # workspace's release profile (CI, local) is unchanged.

@@ -20,7 +20,8 @@
 #                              hash with the one build printed, append a detached signature over
 #                              SHA256SUMS to SHA256SUMS.asc
 #   6. verify TAG      server  re-check tag, assets, signatures, image and binary, then
-#      publish TAG             publish the draft and move the channel alias
+#      publish TAG             check the release body, publish the draft and move the
+#                              channel alias
 #   7. verify TAG      CI      re-check the published release (detective only)
 #
 # Subcommands: parse, check-tag, notes [--image-digest sha256:HEX], draft, prep, tag, build,
@@ -116,6 +117,9 @@ FETCHED=0        # fetch_tag ran
 BUILD_WT=        # build: detached worktree of the tag, removed on exit
 CONTAINERS=      # containers from docker create, removed on exit
 CREATED_TAG=     # tag: local tag deleted again on failure (until it is pushed)
+PREP_RESTORE=0   # prep: 1 from the version bump until every check passed; cleanup then
+                 # restores Cargo.toml, Cargo.lock and CHANGELOG.md from HEAD
+BODY_HEX=        # check_release_body: sha256 of the release body that publish checked
 
 # ---------------------------------------------------------------------------------------------
 # Helpers
@@ -898,12 +902,17 @@ EOF
 }
 
 # check_assets_unchanged WHAT: the release still holds exactly the assets, by name, id and
-# digest, that release_state listed for the last verification. WHAT ends the error message.
+# digest, that release_state listed for the last verification, and the body that
+# check_release_body checked, once it has run. WHAT ends the error message.
 check_assets_unchanged() {
     local verified=$REL_ASSET_IDS
     release_state
     [ "$REL_EXISTS" = 1 ] || die 1 "release $TAG is gone; $1"
     [ "$REL_ASSET_IDS" = "$verified" ] || die 1 "the assets of $TAG changed after they were verified; $1"
+    if [ -n "$BODY_HEX" ]; then
+        release_body "$WORK/body.now"
+        [ "$(sha256_hex "$WORK/body.now")" = "$BODY_HEX" ] || die 1 "the body of release $TAG changed after it was checked; $1"
+    fi
     if [ "$REL_DRAFT" = false ] && [ "$REL_PRERELEASE" != "$PRERELEASE" ]; then
         die 1 "release $TAG is published with prerelease=$REL_PRERELEASE; expected $PRERELEASE"
     fi
@@ -916,9 +925,9 @@ check_fetched_digests() {
     while IFS=$'\t' read -r name id digest; do
         [ -n "$name" ] || continue
         hex=$(sha256_hex "$dir/$name")
-        if [ -n "$digest" ] && [ "$digest" != "sha256:$hex" ]; then
-            die 1 "$name on release $TAG (asset $id) changed between listing and download"
-        fi
+        [ -n "$digest" ] ||
+            die 1 "GitHub reported no sha256 digest for $name (asset $id) on release $TAG, so the download cannot be compared with it; update gh if it is old"
+        [ "$digest" = "sha256:$hex" ] || die 1 "$name on release $TAG (asset $id) changed between listing and download"
     done <<EOF
 $REL_ASSET_IDS
 EOF
@@ -962,6 +971,48 @@ release_upload() {
         return 0
     fi
     gh_run release upload "$TAG" --repo "$REPO" --clobber "$@" >&2
+}
+
+# Markdown on stdin without carriage returns and without trailing blank lines, so a body
+# GitHub returns compares equal to the file it was set from.
+normalize_body() {
+    tr -d '\r' | awk '{ line[NR] = $0 } END { n = NR; while (n > 0 && line[n] ~ /^[ \t]*$/) n--; for (i = 1; i <= n; i++) print line[i] }'
+}
+
+# release_body FILE: the release body, normalized, written to FILE; a dry run reads the copy
+# release_set_notes keeps next to the artifacts.
+release_body() {
+    local file
+    if [ "$DRY_RUN" = 1 ]; then
+        file="$(pwd)/$ARTIFACT_ROOT/$TAG.notes.md"
+        [ -f "$file" ] || die 2 "dry run: $file does not exist; run the build first"
+    else
+        file=$WORK/body.raw
+        gh_run release view "$TAG" --repo "$REPO" --json body --jq .body >"$file"
+    fi
+    normalize_body <"$file" >"$1"
+}
+
+# publish: the release body ends with the notes render_notes writes for COMMIT and D, line for
+# line; anything above them is the operator notes a maintainer added after the build, which are
+# shown for review. Sets BODY_HEX, so check_assets_unchanged also catches a later edit.
+check_release_body() {
+    local want=$WORK/body.want have=$WORK/body.have n_want n_have
+    render_notes "$D" >"$WORK/body.rendered"
+    normalize_body <"$WORK/body.rendered" >"$want"
+    release_body "$have"
+    n_want=$(awk 'END { print NR }' "$want")
+    n_have=$(awk 'END { print NR }' "$have")
+    if [ "$n_have" -lt "$n_want" ] || ! tail -n "$n_want" "$have" | cmp -s - "$want"; then
+        die 1 "the body of release $TAG does not end with the notes generated for $COMMIT and $D; re-run the tag's release workflow (gh run rerun <run-id>) to write them again, add the operator notes above them, and publish again"
+    fi
+    if [ "$n_have" -gt "$n_want" ]; then
+        info "operator notes above the generated release notes:"
+        head -n "$((n_have - n_want))" "$have" | sed 's/^/  | /' >&2
+    else
+        info "the release body is the generated release notes, with no operator notes"
+    fi
+    BODY_HEX=$(sha256_hex "$have")
 }
 
 # The release body; a dry run keeps it next to the artifacts instead.
@@ -1309,7 +1360,7 @@ git -C ../tn-main rev-parse "refs/tags/$TAG^{commit}"
 
 The first `--version` line is `telcoin-network-cli Version: @VERSION@`. `Commit SHA:` must be the commit that `git rev-parse` printed. `Build Features:` must be empty for a mainnet tag; for an `-adiri` tag it lists `adiri`, and may also list `faucet`, which the `adiri` feature implies, and nothing else.
 
-Docker image: it needs only `SHA256SUMS`, `SHA256SUMS.asc`, `IMAGE_DIGEST` and the chain-config files. In a new, empty directory, run the block above without the tarball, and with `--ignore-missing`, which makes `sha256sum` skip the tarball's line:
+Docker image: it needs only `SHA256SUMS`, `SHA256SUMS.asc`, `IMAGE_DIGEST` and the chain-config files. In a new, empty directory, run the block above without the tarball; its last check drops the tarball's line from `SHA256SUMS` with `grep`, so `sha256sum` checks every other file and fails when one of them is missing:
 
 ```sh
 TAG=@TAG@
@@ -1324,7 +1375,7 @@ gpg --show-keys --with-fingerprint tn-main/.github/maintainer-gpg-keys/*.asc &&
 curl -fsSL --fail-early --remote-name-all "$BASE/SHA256SUMS" "$BASE/SHA256SUMS.asc" "$BASE/IMAGE_DIGEST" &&
 gpgv --status-fd 1 --keyring ./tn-release-keys.gpg SHA256SUMS.asc SHA256SUMS |
 awk '$2 ~ /^(BADSIG|ERRSIG|EXPSIG|EXPKEYSIG|REVKEYSIG)$/ { bad = 1 } $2 ~ /^(GOODSIG|BADSIG|ERRSIG|EXPSIG|EXPKEYSIG|REVKEYSIG)$/ { s = $2; print $2 } $2 == "VALIDSIG" && s == "GOODSIG" { print "signed by primary key " $NF; n++ } END { exit (n && !bad) ? 0 : 1 }' &&
-sha256sum --check --ignore-missing SHA256SUMS &&
+grep -v -F "  telcoin-network-$TAG-x86_64-unknown-linux-gnu.tar.gz" SHA256SUMS | sha256sum --check &&
 echo "Signature and hashes verified"
 ```
 
@@ -1384,6 +1435,18 @@ set_workspace_version() {
     mv "$tmp" Cargo.toml
 }
 
+# Makes the pinned image $1 available locally, pulling it with retries; exit 3 when the
+# registry stays unavailable.
+pull_image() {
+    local attempt=1
+    if docker image inspect "$1" >/dev/null 2>&1; then return 0; fi
+    until docker pull --quiet "$1" >&2; do
+        [ "$attempt" -lt 3 ] || die 3 "docker pull $1 failed after 3 attempts"
+        attempt=$((attempt + 1))
+        sleep 5
+    done
+}
+
 # Writes the commits since the previous final release as the "## [BASE]" section to $1, with
 # the pinned git-cliff image. The range starts at the nearest final tag of either channel
 # reachable from HEAD (the whole history when there is none), not at --unreleased, which
@@ -1408,6 +1471,7 @@ cliff_section() {
     else
         info "CHANGELOG section for $BASE: no earlier final release tag, so the whole history"
     fi
+    pull_image "$GIT_CLIFF_IMAGE"
     docker run --rm --network none -u "$(id -u):$(id -g)" -e HOME=/tmp "$@" >"$out" ||
         die 1 "git-cliff failed"
 }
@@ -1528,9 +1592,12 @@ cmd_prep() {
     anchors=$(awk -v a="$ANCHOR" '$0 == a { n++ } END { print n + 0 }' CHANGELOG.md)
     [ "$anchors" = 1 ] || die 1 "CHANGELOG.md must contain the line '$ANCHOR' exactly once (found $anchors)"
 
+    # From here until the checks below pass, a failure restores the three files prep writes, so
+    # the next run finds a clean tree.
+    PREP_RESTORE=1
     set_workspace_version "$VERSION"
     info "cargo update --workspace"
-    cargo update --workspace >&2 || die 1 "cargo update --workspace failed"
+    cargo update --workspace >&2 || die 3 "cargo update --workspace failed (see its output above)"
 
     cliff_section "$WORK/section.raw"
     awk -v base="$BASE" -v m="$main_sha" '
@@ -1551,6 +1618,7 @@ cmd_prep() {
     done <<EOF
 $changed
 EOF
+    PREP_RESTORE=0
 
     # The squash commit's subject is "release: TAG (#PR)"; dots escaped, so v1.2.3 cannot
     # match v1x2x3, and " (#" keeps v1.2.3 from matching v1.2.3-rc1.
@@ -1599,7 +1667,7 @@ cmd_tag() {
 
     CREATED_TAG=$TAG
     git -c gpg.format=openpgp tag -s -u "$SIGN_KEY" -m "Release $TAG" "$TAG" "$target" ||
-        die 1 "git tag -s failed"
+        die 2 "git tag -s failed: is the YubiKey that holds $SIGN_FPR plugged in, and does gpg --card-status show it?"
     COMMIT=$(tag_commit "$TAG")
     [ "$COMMIT" = "$target" ] || die 1 "the new tag points at $COMMIT, not $target"
     check_tag_signature
@@ -1674,7 +1742,8 @@ cmd_build() {
         --label "org.opencontainers.image.version=$TAG" \
         --label "org.opencontainers.image.revision=$COMMIT" \
         --provenance=false --sbom=false --pull --no-cache --load \
-        -t "$IMAGE:$TAG" "$BUILD_WT" >&2 || die 1 "docker buildx build failed"
+        -t "$IMAGE:$TAG" "$BUILD_WT" >&2 ||
+        die 3 "docker buildx build failed; a failed download (base image, apt, crates.io) is the usual cause, so run make release-build again, and report it if the output above shows a build error instead"
 
     # One build: the tarball carries the very bytes that are in the image.
     rd="$(pwd)/$(release_dir "$TAG")"
@@ -1768,7 +1837,7 @@ cmd_sign() {
     check_build_sums_hash "$sums_hex"
     confirm "Sign SHA256SUMS for $TAG?"
     gpg --armor --detach-sign --local-user "$SIGN_KEY" --output "$WORK/new.asc" "$rd/SHA256SUMS" ||
-        die 1 "gpg could not sign SHA256SUMS"
+        die 2 "gpg could not sign SHA256SUMS: is the YubiKey that holds $SIGN_FPR plugged in, and does gpg --card-status show it?"
     if [ -f "$rd/SHA256SUMS.asc" ]; then
         cat "$rd/SHA256SUMS.asc" "$WORK/new.asc" >"$WORK/combined.asc"
     else
@@ -1810,6 +1879,9 @@ cmd_verify() {
     check_tag always
     release_state
     [ "$REL_EXISTS" = 1 ] || die 2 "no GitHub release for $TAG"
+    if [ "$allow_unsigned" = 1 ] && [ "$REL_DRAFT" != true ]; then
+        die 2 "release $TAG is published; --allow-unsigned applies only to a draft"
+    fi
     if [ "$REL_DRAFT" = false ] && [ "$REL_PRERELEASE" != "$PRERELEASE" ]; then
         die 1 "release $TAG is published with prerelease=$REL_PRERELEASE; expected $PRERELEASE"
     fi
@@ -1855,6 +1927,7 @@ cmd_publish() {
     fetch_tag
     check_scripts_from_main
     cmd_verify 0
+    check_release_body
     published=$(published_versions) || exit
     highest=$(printf '%s\n%s\n' "$published" "$VERSION" | version_max)
     if [ -z "$RC" ] && [ "$highest" = "$VERSION" ]; then
@@ -1995,6 +2068,13 @@ init_env() {
 
 cleanup() {
     local ctr
+    if [ "$PREP_RESTORE" = 1 ]; then
+        if git checkout HEAD -- Cargo.toml Cargo.lock CHANGELOG.md 2>/dev/null; then
+            info "prep stopped: restored Cargo.toml, Cargo.lock and CHANGELOG.md from HEAD"
+        else
+            warn "prep stopped and could not restore its files: run git checkout HEAD -- Cargo.toml Cargo.lock CHANGELOG.md"
+        fi
+    fi
     if [ -n "$CREATED_TAG" ] && git tag -d "$CREATED_TAG" >/dev/null 2>&1; then
         info "removed the unpushed local tag $CREATED_TAG"
     fi

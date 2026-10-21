@@ -449,5 +449,5 @@ Two channels are pinned in the repo root:
 - **`rust-nightly`** — single-line file containing the nightly date (currently `nightly-2026-03-20`). Used only for `cargo fmt` and `cargo clippy`, which require nightly-only rustfmt/clippy options (`imports_granularity`, `wrap_comments`, etc.). The Makefile, `etc/test-and-attest.sh`, and CI workflows read this file and invoke `cargo +<date>` explicitly.
 
 To bump nightly: edit `rust-nightly`.
-To bump stable: edit `rust-toolchain.toml` (and align with `Cargo.toml`'s `rust-version` and `etc/Dockerfile`'s base image tag).
+To bump stable: edit `rust-toolchain.toml` (and align with `Cargo.toml`'s `rust-version`, `etc/Dockerfile`'s base image tag and digest, and its `RUSTUP_TOOLCHAIN`, which names the exact `rustc` version of that image, such as `1.94.1`, so the release build never downloads a toolchain).
 Either bump rotates the dependency caches; see "Caches" above.
