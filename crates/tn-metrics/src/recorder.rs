@@ -36,9 +36,70 @@ const GAS_BUCKETS: &[f64] = &[
     30_000_000.0,
 ];
 
-/// Buckets for transaction counts per batch/output.
-const TRANSACTIONS_BUCKETS: &[f64] =
+/// Buckets for `tn_worker_batch_transactions`, the transaction count of one own batch.
+///
+/// The top bucket must be at or above `max_batch_gas(epoch) / 21_000`, because a transaction
+/// uses at least 21,000 gas. That is 30,000,000 / 21,000 = 1,428 today. The bounds at 750 and
+/// 1,250 resolve the band between a half full batch and a full batch.
+///
+/// [`tn_types::max_batch_gas`] takes an epoch so that a fork can raise it. A fork that raises it
+/// must also raise the top bucket here. `test_batch_transactions_buckets_cover_full_batch` fails
+/// until it does.
+const BATCH_TRANSACTIONS_BUCKETS: &[f64] =
+    &[1.0, 2.0, 5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 750.0, 1_000.0, 1_250.0, 1_500.0];
+
+/// Buckets for `tn_executor_output_batches`, the batch count of one consensus output.
+///
+/// One output is one committed Bullshark sub-DAG, and a steady-state sub-DAG holds about two
+/// certificates per authority, not one. With `n` authorities, full connectivity and no skipped
+/// leader, each leader commit orders the leader, the `n` certificates of the round below it, and
+/// the `n - 1` non-leader certificates of the previous leader's round, which that leader did not
+/// cover: 1 + n + (n - 1) = 2n certificates. The consensus tests encode this: three leaders with
+/// n = 4 commit 5 + 8 + 8 = 21 certificates.
+///
+/// The layout is sized for a 50-authority committee at full headers: 50 authorities * 2
+/// certificates * [`tn_types::MAX_HEADER_NUM_OF_BATCHES`] (10) = 1,000 batches. These are the
+/// same bounds as before #1511, so this series keeps its `le` label set across the upgrade.
+///
+/// A larger committee, a deeper sub-DAG after a skipped leader, or a higher
+/// `MAX_HEADER_NUM_OF_BATCHES` puts samples in `+Inf` and needs a new layout. The only hard bound
+/// on one output is the GC horizon, `committee.size() * MAX_GC_DEPTH * MAX_HEADER_NUM_OF_BATCHES`
+/// batches, which is too loose to size buckets from. `_sum` and `_count` stay exact.
+/// `test_output_buckets_cover_sizing_committee` fails when `MAX_HEADER_NUM_OF_BATCHES` grows past
+/// this layout.
+const OUTPUT_BATCHES_BUCKETS: &[f64] =
     &[1.0, 2.0, 5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1_000.0];
+
+/// Buckets for `tn_executor_output_transactions`, the transaction count of one consensus output.
+///
+/// An output sums the batches of every certificate in the committed sub-DAG. It can hold every
+/// batch that [`OUTPUT_BATCHES_BUCKETS`] covers, and each batch can hold up to
+/// `max_batch_gas(epoch) / 21_000` transactions. The top bucket is therefore at or above the top
+/// batches bucket times the per-batch maximum: 1,000 * 1,428 = 1,428,000. An output whose batch
+/// count lands in a finite batches bucket also lands in a finite transactions bucket.
+/// `test_output_buckets_cover_sizing_committee` fails when that stops being true.
+const OUTPUT_TRANSACTIONS_BUCKETS: &[f64] = &[
+    1.0,
+    2.0,
+    5.0,
+    10.0,
+    25.0,
+    50.0,
+    100.0,
+    250.0,
+    500.0,
+    1_000.0,
+    2_500.0,
+    5_000.0,
+    10_000.0,
+    25_000.0,
+    50_000.0,
+    100_000.0,
+    250_000.0,
+    500_000.0,
+    1_000_000.0,
+    2_500_000.0,
+];
 
 /// The handle to the global Prometheus registry. Set exactly once by [`install_recorder`].
 static RECORDER_HANDLE: OnceLock<PrometheusHandle> = OnceLock::new();
@@ -83,15 +144,15 @@ fn build_prometheus_recorder() -> eyre::Result<PrometheusRecorder> {
         .set_buckets_for_metric(Matcher::Full("tn_engine_block_gas_used".to_string()), GAS_BUCKETS)?
         .set_buckets_for_metric(
             Matcher::Full("tn_worker_batch_transactions".to_string()),
-            TRANSACTIONS_BUCKETS,
+            BATCH_TRANSACTIONS_BUCKETS,
         )?
         .set_buckets_for_metric(
             Matcher::Full("tn_executor_output_transactions".to_string()),
-            TRANSACTIONS_BUCKETS,
+            OUTPUT_TRANSACTIONS_BUCKETS,
         )?
         .set_buckets_for_metric(
             Matcher::Full("tn_executor_output_batches".to_string()),
-            TRANSACTIONS_BUCKETS,
+            OUTPUT_BATCHES_BUCKETS,
         )?;
 
     Ok(builder.build_recorder())
@@ -172,6 +233,41 @@ impl Recorder for TnPrefixRecorder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tn_types::{max_batch_gas, Epoch, MAX_HEADER_NUM_OF_BATCHES};
+
+    /// Minimum gas of a transaction (the intrinsic cost of a plain transfer).
+    const MIN_TRANSACTION_GAS: u64 = 21_000;
+
+    /// Committee size that the executor output buckets are sized for.
+    const SIZING_COMMITTEE_SIZE: usize = 50;
+
+    /// Certificates that one steady-state consensus output commits per authority. A leader is
+    /// elected every two rounds and its sub-DAG orders the two rounds since the previous leader,
+    /// so about two per authority. The arithmetic is on [`OUTPUT_BATCHES_BUCKETS`].
+    const CERTIFICATES_PER_AUTHORITY_PER_OUTPUT: usize = 2;
+
+    /// Epochs to check the batch gas cap at. A fork that raises the cap shows at the last epoch.
+    const SIZING_EPOCHS: [Epoch; 2] = [0, Epoch::MAX];
+
+    /// The one bucket layout that all three transaction histograms shared before #1511.
+    const PREVIOUS_TRANSACTIONS_BUCKETS: &[f64] =
+        &[1.0, 2.0, 5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1_000.0];
+
+    /// The three bucket layouts that #1511 split out of the previous shared layout.
+    const TRANSACTION_LAYOUTS: [&[f64]; 3] =
+        [BATCH_TRANSACTIONS_BUCKETS, OUTPUT_BATCHES_BUCKETS, OUTPUT_TRANSACTIONS_BUCKETS];
+
+    /// Most transactions that one batch can hold at `epoch`.
+    fn max_transactions_per_batch(epoch: Epoch) -> f64 {
+        u32::try_from(max_batch_gas(epoch) / MIN_TRANSACTION_GAS)
+            .map(f64::from)
+            .expect("per-batch transaction bound fits in u32")
+    }
+
+    /// Top bound of a bucket layout.
+    fn top_bucket(buckets: &[f64]) -> f64 {
+        buckets.last().copied().expect("bucket layout is not empty")
+    }
 
     /// Pure prefix-rewrite test against a local (non-global) recorder.
     #[test]
@@ -211,5 +307,100 @@ mod tests {
         let rendered = handle.render();
         assert!(rendered.contains("tn_test_duration_seconds_bucket"), "{rendered}");
         assert!(rendered.contains("le=\"0.5\""), "{rendered}");
+    }
+
+    /// A full batch of minimum-gas transactions must land in a finite bucket of
+    /// `tn_worker_batch_transactions`, not in `+Inf` (#1511).
+    #[test]
+    fn test_batch_transactions_buckets_cover_full_batch() {
+        let top = top_bucket(BATCH_TRANSACTIONS_BUCKETS);
+        SIZING_EPOCHS.into_iter().for_each(|epoch| {
+            let max_txs = max_transactions_per_batch(epoch);
+            assert!(
+                top >= max_txs,
+                "epoch {epoch}: top bucket {top} is below a full batch {max_txs}"
+            );
+        });
+    }
+
+    /// The executor output layouts must cover the sizing committee: a steady-state sub-DAG of
+    /// full certificates for the batch count, and a full batch for each covered batch for the
+    /// transaction count.
+    #[test]
+    fn test_output_buckets_cover_sizing_committee() {
+        let sizing_batches = u32::try_from(
+            SIZING_COMMITTEE_SIZE
+                .saturating_mul(CERTIFICATES_PER_AUTHORITY_PER_OUTPUT)
+                .saturating_mul(MAX_HEADER_NUM_OF_BATCHES),
+        )
+        .map(f64::from)
+        .expect("sizing batch count fits in u32");
+        let top_batches = top_bucket(OUTPUT_BATCHES_BUCKETS);
+        assert!(
+            top_batches >= sizing_batches,
+            "top batches bucket {top_batches} < {sizing_batches}"
+        );
+
+        let top_txs = top_bucket(OUTPUT_TRANSACTIONS_BUCKETS);
+        SIZING_EPOCHS.into_iter().for_each(|epoch| {
+            let covered = top_batches * max_transactions_per_batch(epoch);
+            assert!(
+                top_txs >= covered,
+                "epoch {epoch}: top transactions bucket {top_txs} < {covered}"
+            );
+        });
+    }
+
+    /// Every new layout keeps the bounds of the previous shared layout, so an external query that
+    /// pins one of them (for example `le="1000"`) still finds its series.
+    #[test]
+    fn test_bucket_layouts_keep_previous_bounds() {
+        TRANSACTION_LAYOUTS.into_iter().for_each(|layout| {
+            let missing: Vec<f64> = PREVIOUS_TRANSACTIONS_BUCKETS
+                .iter()
+                .copied()
+                .filter(|bound| !layout.iter().any(|b| b.to_bits() == bound.to_bits()))
+                .collect();
+            assert!(missing.is_empty(), "layout {layout:?} drops previous bounds {missing:?}");
+        });
+    }
+
+    /// Every bucket layout must be strictly ascending.
+    #[test]
+    fn test_bucket_layouts_strictly_ascending() {
+        TRANSACTION_LAYOUTS.into_iter().for_each(|layout| {
+            assert!(
+                layout.windows(2).all(|pair| pair.first() < pair.last()),
+                "layout {layout:?} is not strictly ascending"
+            );
+        });
+    }
+
+    /// Samples above the previous 1,000 cap must land in finite buckets (#1511): a full batch of
+    /// 1,428 minimum-gas transfers, and an output that commits one such batch from each of four
+    /// authorities (5,712 transactions).
+    #[test]
+    fn test_transaction_histograms_render_past_previous_cap() {
+        let inner = build_prometheus_recorder().expect("recorder builds");
+        let handle = inner.handle();
+        let recorder = TnPrefixRecorder { inner };
+
+        metrics::with_local_recorder(&recorder, || {
+            metrics::histogram!("tn_worker.batch_transactions").record(1_428.0);
+            metrics::histogram!("tn_executor.output_transactions").record(5_712.0);
+            metrics::histogram!("tn_executor.output_batches").record(40.0);
+        });
+
+        let rendered = handle.render();
+        [
+            "tn_worker_batch_transactions_bucket{le=\"1000\"} 0\n",
+            "tn_worker_batch_transactions_bucket{le=\"1500\"} 1\n",
+            "tn_executor_output_transactions_bucket{le=\"5000\"} 0\n",
+            "tn_executor_output_transactions_bucket{le=\"10000\"} 1\n",
+            "tn_executor_output_batches_bucket{le=\"25\"} 0\n",
+            "tn_executor_output_batches_bucket{le=\"50\"} 1\n",
+        ]
+        .into_iter()
+        .for_each(|line| assert!(rendered.contains(line), "missing {line:?} in {rendered}"));
     }
 }

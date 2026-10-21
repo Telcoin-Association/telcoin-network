@@ -1,7 +1,8 @@
 //! Constants and trait implementations for network compatibility.
 
 use crate::{
-    codec::TNMessage, error::NetworkError, peers::Penalty, GossipMessage, PeerExchangeMap,
+    codec::TNMessage, error::NetworkError, peers::Penalty, AdmissionStatus, CommitteeUpdate,
+    GossipMessage, PeerExchangeMap,
 };
 pub use libp2p::gossipsub::MessageId;
 use libp2p::{
@@ -278,6 +279,13 @@ where
         /// Reply for connection outcome.
         reply: oneshot::Sender<NetworkResult<()>>,
     },
+    /// Install process-lifetime trusted hub connections in this swarm.
+    AddTrustedPeers {
+        /// Validated operator-provisioned identities and address hints for this swarm only.
+        peers: BTreeMap<BlsPublicKey, P2pNode>,
+        /// Acknowledge installation independently of remote availability.
+        reply: oneshot::Sender<NetworkResult<()>>,
+    },
     /// Seed fixed launch bindings without granting committee membership.
     SeedCommitteePeers {
         /// This swarm's operator-owned BLS/network/address bindings.
@@ -387,6 +395,14 @@ where
         /// Reply to caller.
         reply: oneshot::Sender<Vec<PeerId>>,
     },
+    /// Inspect a signed identity binding when waiting for authentication in transport tests.
+    #[cfg(test)]
+    VerifiedPeerBls {
+        /// Transport identity whose signed binding is required.
+        peer: PeerId,
+        /// Reply to caller, excluding unverified configuration hints.
+        reply: oneshot::Sender<Option<BlsPublicKey>>,
+    },
     /// Number of established peers available to `SendRequestAny`.
     EstablishedPeerCount {
         /// Reply to caller, excluding pending dials.
@@ -444,6 +460,24 @@ where
         current: HashSet<BlsPublicKey>,
         /// The next epoch committee.
         next: HashSet<BlsPublicKey>,
+    },
+    /// Set or renew a complete authoritative admission window at an epoch revision.
+    UpdateAdmissionCommittees {
+        /// Epoch-start publication or lease renewal.
+        update: CommitteeUpdate,
+        /// Epoch owning the immutable committee window.
+        epoch: u64,
+        /// Previous committee.
+        previous: HashSet<BlsPublicKey>,
+        /// Current committee.
+        current: HashSet<BlsPublicKey>,
+        /// Next committee.
+        next: HashSet<BlsPublicKey>,
+    },
+    /// Observe admission inputs without conflating records, connections, and consensus readiness.
+    AdmissionStatus {
+        /// Admission observations from this handle's swarm.
+        reply: oneshot::Sender<AdmissionStatus>,
     },
     /// Pre-dial recovery: forgive bans for a committee so it can be dialed, without mutating the
     /// committee slots.
@@ -556,7 +590,7 @@ where
 
     /// Add explicit "trusted" peer.
     ///
-    /// These peers are considered "trusted" and do not receive penalties.
+    /// These peers retain operator privileges and ignore load penalties. Protocol penalties apply.
     /// This does not unban ips and should only be called during initialization.
     pub async fn add_trusted_peer_and_dial(
         &self,
@@ -592,6 +626,19 @@ where
     ) -> NetworkResult<()> {
         let (reply, rx) = oneshot::channel();
         self.sender.send(NetworkCommand::AddBootstrapPeers { peers, reply }).await?;
+        rx.await?
+    }
+
+    /// Install hubs and maintain their connections until the network shuts down.
+    ///
+    /// Acknowledges registration immediately, including when a hub is offline. The swarm owns
+    /// one retry timer and one schedule per hub; duplicate installation preserves existing bans.
+    pub async fn add_trusted_peers(
+        &self,
+        peers: BTreeMap<BlsPublicKey, P2pNode>,
+    ) -> NetworkResult<()> {
+        let (reply, rx) = oneshot::channel();
+        self.sender.send(NetworkCommand::AddTrustedPeers { peers, reply }).await?;
         rx.await?
     }
 
@@ -766,6 +813,57 @@ where
         Ok(())
     }
 
+    /// Publish the authoritative admission window at epoch start. An accepted update always
+    /// applies the committee update, also on a same-epoch re-entry. Older or contradictory
+    /// revisions trigger fallback without replacing accepted membership.
+    pub async fn update_committees_at(
+        &self,
+        epoch: u64,
+        previous: HashSet<BlsPublicKey>,
+        current: HashSet<BlsPublicKey>,
+        next: HashSet<BlsPublicKey>,
+    ) -> NetworkResult<()> {
+        self.sender
+            .send(NetworkCommand::UpdateAdmissionCommittees {
+                update: CommitteeUpdate::EpochStart,
+                epoch,
+                previous,
+                current,
+                next,
+            })
+            .await?;
+        Ok(())
+    }
+
+    /// Renew the lease of the accepted admission window. An identical window only renews the
+    /// lease. Older or contradictory revisions trigger fallback without replacing membership.
+    pub async fn renew_committees_at(
+        &self,
+        epoch: u64,
+        previous: HashSet<BlsPublicKey>,
+        current: HashSet<BlsPublicKey>,
+        next: HashSet<BlsPublicKey>,
+    ) -> NetworkResult<()> {
+        self.sender
+            .send(NetworkCommand::UpdateAdmissionCommittees {
+                update: CommitteeUpdate::Renewal,
+                epoch,
+                previous,
+                current,
+                next,
+            })
+            .await?;
+        Ok(())
+    }
+
+    /// Observe this swarm's policy, resolved-record quorum, and connected current peers.
+    /// Consensus readiness remains a separate node-level observation.
+    pub async fn admission_status(&self) -> NetworkResult<AdmissionStatus> {
+        let (reply, res) = oneshot::channel();
+        self.sender.send(NetworkCommand::AdmissionStatus { reply }).await?;
+        res.await.map_err(Into::into)
+    }
+
     /// Forgive bans for a committee so it can be dialed, without mutating the committee slots.
     ///
     /// Used by the deadlock-breaker pre-dial path; the real slot update follows via
@@ -922,6 +1020,16 @@ where
         let (reply, peers) = oneshot::channel();
         self.sender.send(NetworkCommand::ConnectedPeerIds { reply }).await?;
         peers.await.map_err(Into::into)
+    }
+
+    /// Inspect the verified BLS binding without treating a configuration hint as proof.
+    pub(crate) async fn verified_peer_bls(
+        &self,
+        peer: PeerId,
+    ) -> NetworkResult<Option<BlsPublicKey>> {
+        let (reply, binding) = oneshot::channel();
+        self.sender.send(NetworkCommand::VerifiedPeerBls { peer, reply }).await?;
+        binding.await.map_err(Into::into)
     }
 
     /// Send a request to a peer by peer id.

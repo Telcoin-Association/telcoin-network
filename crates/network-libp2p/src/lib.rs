@@ -21,6 +21,7 @@ mod codec;
 mod consensus;
 pub mod error;
 mod freshness;
+mod gossip_config;
 pub mod kad;
 mod metrics;
 mod peers;
@@ -28,6 +29,7 @@ mod quic_incoming;
 mod record_exchange;
 mod retention;
 mod service_class;
+pub mod source_admission;
 pub mod stream;
 mod sync;
 pub mod types;
@@ -35,8 +37,11 @@ pub mod types;
 // export types
 pub use codec::{decode_message, encode_message, TNCodec, TNMessage};
 pub use consensus::ConsensusNetwork;
+pub use gossip_config::gossipsub_config;
 pub use metrics::AdmissionShed;
-pub use peers::{PeerExchangeMap, Penalty};
+pub use peers::{
+    AdmissionFallback, AdmissionStatus, CommitteeUpdate, LoadPenalty, PeerExchangeMap, Penalty,
+};
 pub use service_class::ServiceClass;
 pub use stream::StreamError;
 pub use sync::{

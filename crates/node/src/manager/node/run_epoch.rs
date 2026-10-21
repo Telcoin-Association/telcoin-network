@@ -213,6 +213,9 @@ where
                 .await?
                 .apply(&gas_accumulator);
         }
+        // Deactivate removed workers before recovery, replay, and peer discovery can await.
+        // The submission guard already rejects these ids as soon as the resize above runs.
+        engine.deactivate_workers_above(gas_accumulator.num_workers()).await;
         // The task manager that resets every epoch and manages
         // short-running tasks for the lifetime of the epoch.
         let mut epoch_task_manager = TaskManager::new(EPOCH_TASK_MANAGER);
@@ -223,7 +226,9 @@ where
         // (advancing the on-chain epoch to N) but write_epoch_record(N-1) never persisted the
         // record
         // - re-derive record N-1 locally from the executed closing block before opening the pack.
-        // A no-op unless the previous epoch's record is actually missing.
+        // Re-derives nothing unless the previous epoch's record is actually missing. With the
+        // record present it clears the epoch tables only when they still hold rows of an older
+        // epoch (killed between the record write and the tables clear).
         self.recover_previous_epoch_record(committee.epoch(), engine).await?;
 
         let prior_epoch_record = self.open_epoch_pack(committee.clone()).await?;
@@ -462,8 +467,40 @@ where
                 )
                 .await?;
 
+                // Deactivate removed workers before writing records or exporting execution state.
+                // Admission is already closed by the accumulator resize inside close_epoch.
+                engine.deactivate_workers_above(gas_accumulator.num_workers()).await;
+
+                // e2e fault injection, always false without `tn-types/test-utils`: the closing
+                // block is executed and canonical, the record and the tables clear are not done
+                if tn_types::test_hooks::exit_before_epoch_record(current_epoch) {
+                    warn!(
+                        target: "epoch-manager",
+                        epoch = current_epoch,
+                        "test hook: exiting before the epoch record is written",
+                    );
+                    // stop where a SIGTERM inside this window stops: `run` sees the shutdown and
+                    // drops this future while it is parked, then runs the graceful exit path
+                    self.node_shutdown.notify();
+                    std::future::pending::<()>().await;
+                }
+
                 // Write the epoch record to DB and save in manager for next epoch.
                 self.write_epoch_record(current_epoch, engine).await?;
+
+                // e2e fault injection, always false without `tn-types/test-utils`: the record is
+                // durable, the state export and the epoch tables clear that follow it are not done
+                if tn_types::test_hooks::exit_after_epoch_record(current_epoch) {
+                    warn!(
+                        target: "epoch-manager",
+                        epoch = current_epoch,
+                        "test hook: exiting after the epoch record is written",
+                    );
+                    // same stop as the before-record hook: `run` sees the shutdown and drops this
+                    // future while it is parked
+                    self.node_shutdown.notify();
+                    std::future::pending::<()>().await;
+                }
 
                 // Export the epoch's final execution state (no-op unless --enable-state-export).
                 self.export_epoch_state(&primary, &reth_env).await?;

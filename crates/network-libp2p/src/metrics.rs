@@ -4,7 +4,7 @@
 //! carries a `network` label (`primary` or `worker-{id}`) set at construction.
 
 use crate::{
-    peers::{Penalty, PutRecordRate},
+    peers::{Penalty, PenaltyOutcome, PutRecordRate},
     service_class::{ServiceClass, ShedReason},
     types::NetworkType,
 };
@@ -817,6 +817,18 @@ impl SwarmMetrics {
 #[derive(Metrics, Clone)]
 #[metrics(scope = "tn_network")]
 struct PeerManagerMetricHandles {
+    /// Effective admission mode: Open = 0, Grace = 1, Closed = 2.
+    admission_mode: Gauge,
+    /// Resolved current-committee records, including the local identity.
+    admission_resolved_current: Gauge,
+    /// Minimum authenticated-record quorum for Closed.
+    admission_required_current: Gauge,
+    /// Connected current peers, excluding the local identity.
+    admission_connected_current: Gauge,
+    /// Identities with a contradicted PeerId binding. They do not change the effective mode.
+    admission_contradicted: Gauge,
+    /// Fallback: healthy = 0, missing = 1, stale = 2, contradictory = 3, unresolved = 4.
+    admission_fallback: Gauge,
     /// Currently connected peers.
     connected_peers: Gauge,
     /// Peers known with a resolved network record (BLS key -> address).
@@ -846,6 +858,34 @@ pub(crate) struct PeerManagerMetrics {
 }
 
 impl PeerManagerMetrics {
+    /// Publish admission inputs independently of connections and node consensus readiness.
+    pub(crate) fn set_admission(&self, status: &crate::AdmissionStatus) {
+        let mode = match status.effective() {
+            tn_config::AdmissionMode::Open => 0.0,
+            tn_config::AdmissionMode::Grace => 1.0,
+            tn_config::AdmissionMode::Closed => 2.0,
+        };
+        self.handles.admission_mode.set(mode);
+        self.handles
+            .admission_resolved_current
+            .set(u32::try_from(status.resolved_current()).map_or(f64::MAX, f64::from));
+        self.handles
+            .admission_required_current
+            .set(u32::try_from(status.required_current()).map_or(f64::MAX, f64::from));
+        self.handles
+            .admission_connected_current
+            .set(u32::try_from(status.connected_current()).map_or(f64::MAX, f64::from));
+        self.handles
+            .admission_contradicted
+            .set(u32::try_from(status.contradicted()).map_or(f64::MAX, f64::from));
+        self.handles.admission_fallback.set(status.fallback().map_or(0.0, |reason| match reason {
+            crate::AdmissionFallback::Missing => 1.0,
+            crate::AdmissionFallback::Stale => 2.0,
+            crate::AdmissionFallback::Contradictory => 3.0,
+            crate::AdmissionFallback::Unresolved => 4.0,
+        }));
+    }
+
     /// Record one failed inbound attempt with a fixed reason label, never a peer or address.
     pub(crate) fn record_listen_failure(&self, reason: &'static str) {
         metrics::counter!(
@@ -889,6 +929,31 @@ impl PeerManagerMetrics {
         .increment(1);
     }
 
+    /// Record a source-budget denial by direction ({`in`, `out`}) and reason.
+    pub(crate) fn record_source_admission_denied(
+        &self,
+        direction: &'static str,
+        reason: &'static str,
+    ) {
+        metrics::counter!(
+            "tn_network.source_admission_denied_total",
+            "network" => self.network.clone(),
+            "direction" => direction,
+            "reason" => reason,
+        )
+        .increment(1);
+    }
+
+    /// Record a Closed admission policy denial by direction ({`in`, `out`}).
+    pub(crate) fn record_closed_admission_denied(&self, direction: &'static str) {
+        metrics::counter!(
+            "tn_network.closed_admission_denied_total",
+            "network" => self.network.clone(),
+            "direction" => direction,
+        )
+        .increment(1);
+    }
+
     /// Record a closed connection.
     pub(crate) fn record_connection_closed(&self) {
         self.handles.connections_closed_total.increment(1);
@@ -904,18 +969,25 @@ impl PeerManagerMetrics {
         self.handles.external_addr_confirmed.set(1.0);
     }
 
-    /// Record an application-layer penalty by severity.
-    pub(crate) fn record_penalty(&self, penalty: &Penalty) {
-        let severity = match penalty {
-            Penalty::Mild => "mild",
-            Penalty::Medium => "medium",
-            Penalty::Severe => "severe",
-            Penalty::Fatal => "fatal",
+    /// Record an application-layer penalty by severity, class and scoring outcome.
+    pub(crate) fn record_penalty(&self, penalty: &Penalty, outcome: PenaltyOutcome) {
+        let severity = match penalty.severity() {
+            crate::peers::Severity::Mild => "mild",
+            crate::peers::Severity::Medium => "medium",
+            crate::peers::Severity::Severe => "severe",
+            crate::peers::Severity::Fatal => "fatal",
+        };
+        let class = if penalty.is_load() { "load" } else { "protocol" };
+        let outcome = match outcome {
+            PenaltyOutcome::Applied => "applied",
+            PenaltyOutcome::Exempt => "exempt",
         };
         metrics::counter!(
             "tn_network.peer_penalties_total",
             "network" => self.network.clone(),
             "severity" => severity,
+            "class" => class,
+            "outcome" => outcome,
         )
         .increment(1);
     }
@@ -1052,7 +1124,7 @@ mod tests {
             peers.record_connection_closed();
             peers.record_dial_failure();
             peers.record_external_addr_confirmed();
-            peers.record_penalty(&Penalty::Severe);
+            peers.record_penalty(&Penalty::Severe, PenaltyOutcome::Applied);
             peers.record_peer_banned();
             peers.record_put_record_rate_limited(&PutRecordRate::Shed);
         });
@@ -1139,7 +1211,7 @@ mod tests {
             second.set_peer_counts(7, 7, 7, 7);
             [&first, &second].into_iter().for_each(|peers| {
                 peers.record_connection_established("in");
-                peers.record_penalty(&Penalty::Severe);
+                peers.record_penalty(&Penalty::Severe, PenaltyOutcome::Applied);
             });
         });
 

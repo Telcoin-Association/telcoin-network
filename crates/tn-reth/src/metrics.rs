@@ -27,6 +27,9 @@
 //! and `tn_reth.canon_state_resync_read_failures_total` counts canonical account reads the
 //! post-lag resync absorbed and retried. See [`RethEnvMetrics`] for per-series semantics.
 //! `tn_reth.txpool_expired_txs_total` counts parked transactions removed by the age sweep.
+//! When a worker retires, `tn_reth.retired_pool_txns_moved_total` counts the transactions its
+//! pool hands to an active worker, and `tn_reth.retired_pool_txns_dropped_total` (labeled by
+//! `reason`, see [`HandoffDropReason`]) counts the ones the active worker refused.
 //!
 //! RPC submission forwarding (`--forward-txs`). `tn_reth.rpc_tx_forwarded_total` counts every
 //! raw submission by how it ended (labeled by `outcome`, see [`RpcTxForwardOutcome`]), and
@@ -68,6 +71,7 @@
 use alloy_evm::InvalidTxError;
 use reth_metrics::{metrics::Counter, Metrics};
 use reth_revm::context::result::InvalidTransaction;
+use reth_transaction_pool::error::PoolErrorKind;
 use std::sync::LazyLock;
 use tracing::warn;
 
@@ -86,8 +90,8 @@ use crate::{evm::SYSTEM_CALL_GAS_LIMIT, RethDb};
 /// the noop one.
 pub(crate) static RETH_METRICS: LazyLock<RethEnvMetrics> = LazyLock::new(RethEnvMetrics::default);
 
-/// Register every [`RethEnvMetrics`] counter and every labeled skip series with the global
-/// recorder without recording an event.
+/// Register every [`RethEnvMetrics`] counter, every labeled skip series and every retired-pool
+/// handoff series with the global recorder without recording an event.
 ///
 /// For the derive-based counters, registration happens when the `LazyLock` is first forced.
 /// Register before the expiry task or any drop or lag-recovery path first uses the counters.
@@ -106,6 +110,7 @@ pub(crate) static RETH_METRICS: LazyLock<RethEnvMetrics> = LazyLock::new(RethEnv
 pub(crate) fn init() {
     LazyLock::force(&RETH_METRICS);
     register_invalid_tx_skip_series();
+    register_retired_pool_handoff_series();
 }
 
 /// Metrics for the execution environment: block building from certified batch payloads, plus
@@ -319,6 +324,117 @@ fn register_invalid_tx_skip_series() {
 /// series observable from a unit test.
 pub(crate) fn record_invalid_tx_skipped(reason: InvalidTxSkipReason) {
     metrics::counter!(INVALID_TXS_SKIPPED, "reason" => reason.label()).increment(1);
+}
+
+/// Counter names for the retired-worker pool handoff, kept next to their only emission sites so
+/// the registration in [`register_retired_pool_handoff_series`] and the increments below cannot
+/// drift apart.
+///
+/// When a node runs fewer workers, each retired worker hands its pool to an active worker
+/// (`WorkerTxPool::migrate_transactions_to`). The moved series is the denominator. The dropped
+/// series counts the transactions the active worker refused, one series per
+/// [`HandoffDropReason`]. This node's RPC accepted those transactions, and the handoff discards
+/// them.
+const RETIRED_POOL_TXNS_MOVED: &str = "tn_reth.retired_pool_txns_moved_total";
+const RETIRED_POOL_TXNS_DROPPED: &str = "tn_reth.retired_pool_txns_dropped_total";
+
+/// Why an active worker refused a transaction from a retired worker's pool.
+///
+/// The variants label [`RETIRED_POOL_TXNS_DROPPED`], one series per reason, all registered at
+/// zero by [`register_retired_pool_handoff_series`]. Each variant maps one refusing
+/// [`PoolErrorKind`]. `AlreadyImported` maps to no reason, because the active worker already
+/// holds the transaction and the handoff is complete.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) enum HandoffDropReason {
+    /// Validation refused the transaction (nonce, balance, size, gas limit, fee or type).
+    Invalid,
+    /// The active worker holds a transaction with the same sender and nonce at a higher price.
+    ReplacementUnderpriced,
+    /// The fee cap is below the protocol minimum.
+    FeeCapBelowMinimum,
+    /// The sender already fills its slot capacity in the active worker's pool.
+    SpammerExceededCapacity,
+    /// The active worker's pool was full and discarded the transaction on insert.
+    DestinationFull,
+    /// The sender has a transaction of a conflicting type (blob or normal) in the active worker.
+    ConflictingTransactionType,
+    /// Any other insertion or validation failure, for example an unreachable validation service.
+    Other,
+}
+
+impl HandoffDropReason {
+    /// Every variant, for zero-registration in [`register_retired_pool_handoff_series`].
+    ///
+    /// Hand-maintained like [`ForwardDropReason::ALL`]: extend it in the same edit as a new
+    /// variant, because the register-at-zero test iterates this same list.
+    const ALL: [Self; 7] = [
+        Self::Invalid,
+        Self::ReplacementUnderpriced,
+        Self::FeeCapBelowMinimum,
+        Self::SpammerExceededCapacity,
+        Self::DestinationFull,
+        Self::ConflictingTransactionType,
+        Self::Other,
+    ];
+
+    /// The `reason` label value this variant records under.
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Invalid => "invalid",
+            Self::ReplacementUnderpriced => "replacement_underpriced",
+            Self::FeeCapBelowMinimum => "fee_cap_below_minimum",
+            Self::SpammerExceededCapacity => "spammer_exceeded_capacity",
+            Self::DestinationFull => "destination_full",
+            Self::ConflictingTransactionType => "conflicting_transaction_type",
+            Self::Other => "other",
+        }
+    }
+
+    /// Classify a pool insertion error. Return `None` when the destination already holds the
+    /// transaction, because that is a completed handoff and not a refusal.
+    pub(crate) fn from_kind(kind: &PoolErrorKind) -> Option<Self> {
+        match kind {
+            PoolErrorKind::AlreadyImported => None,
+            PoolErrorKind::InvalidTransaction(_) => Some(Self::Invalid),
+            PoolErrorKind::ReplacementUnderpriced => Some(Self::ReplacementUnderpriced),
+            PoolErrorKind::FeeCapBelowMinimumProtocolFeeCap(_) => Some(Self::FeeCapBelowMinimum),
+            PoolErrorKind::SpammerExceededCapacity(_) => Some(Self::SpammerExceededCapacity),
+            PoolErrorKind::DiscardedOnInsert => Some(Self::DestinationFull),
+            PoolErrorKind::ExistingConflictingTransactionType(..) => {
+                Some(Self::ConflictingTransactionType)
+            }
+            PoolErrorKind::Other(_) => Some(Self::Other),
+        }
+    }
+}
+
+/// Register the retired-pool moved series and one dropped series per [`HandoffDropReason`] at
+/// zero.
+///
+/// A shrink is rare, so without a zero baseline the first refusal burst renders no `rate()`
+/// step, and a reason that never fired cannot be told apart from a mistyped label value.
+fn register_retired_pool_handoff_series() {
+    metrics::counter!(RETIRED_POOL_TXNS_MOVED).increment(0);
+    HandoffDropReason::ALL.iter().for_each(|reason| {
+        metrics::counter!(RETIRED_POOL_TXNS_DROPPED, "reason" => reason.label()).increment(0);
+    });
+}
+
+/// Count transactions an active worker accepted from a retired worker's pool.
+///
+/// The denominator the dropped series reads against. A transaction the active worker already
+/// held is not counted here, because this pass did not move it.
+pub(crate) fn record_retired_pool_txns_moved(count: u64) {
+    metrics::counter!(RETIRED_POOL_TXNS_MOVED).increment(count);
+}
+
+/// Count transactions an active worker refused from a retired worker's pool, labeled by
+/// [`HandoffDropReason`].
+///
+/// The call site pairs this with one summary `warn!` per handoff pass. Each transaction counted
+/// here was accepted by this node's RPC and is discarded.
+pub(crate) fn record_retired_pool_txns_dropped(reason: HandoffDropReason, count: u64) {
+    metrics::counter!(RETIRED_POOL_TXNS_DROPPED, "reason" => reason.label()).increment(count);
 }
 
 /// Counter names for the observer forwarder, kept next to their only emission sites so the
@@ -949,6 +1065,69 @@ mod tests {
                     reason.label()
                 );
             });
+    }
+
+    /// [`init`] must register the retired-pool moved series and one dropped series per
+    /// [`HandoffDropReason`] at zero, and a recorded refusal must move only its own reason's
+    /// series.
+    #[test]
+    fn test_retired_pool_handoff_series_register_at_zero_and_count_separately() {
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+
+        metrics::with_local_recorder(&recorder, register_retired_pool_handoff_series);
+
+        let snapshot = snapshotter.snapshot().into_vec();
+        assert!(matches!(series(&snapshot, RETIRED_POOL_TXNS_MOVED), DebugValue::Counter(0)));
+        HandoffDropReason::ALL.into_iter().for_each(|reason| {
+            assert!(
+                matches!(
+                    reason_series(&snapshot, RETIRED_POOL_TXNS_DROPPED, reason.label()),
+                    DebugValue::Counter(0)
+                ),
+                "reason {} must be registered at zero",
+                reason.label()
+            );
+        });
+
+        metrics::with_local_recorder(&recorder, || {
+            record_retired_pool_txns_moved(5);
+            record_retired_pool_txns_dropped(HandoffDropReason::DestinationFull, 2);
+        });
+
+        let snapshot = snapshotter.snapshot().into_vec();
+        assert!(matches!(series(&snapshot, RETIRED_POOL_TXNS_MOVED), DebugValue::Counter(5)));
+        assert!(matches!(
+            reason_series(&snapshot, RETIRED_POOL_TXNS_DROPPED, "destination_full"),
+            DebugValue::Counter(2)
+        ));
+        HandoffDropReason::ALL
+            .into_iter()
+            .filter(|reason| *reason != HandoffDropReason::DestinationFull)
+            .for_each(|reason| {
+                assert!(
+                    matches!(
+                        reason_series(&snapshot, RETIRED_POOL_TXNS_DROPPED, reason.label()),
+                        DebugValue::Counter(0)
+                    ),
+                    "a destination_full refusal must not move the {} series",
+                    reason.label()
+                );
+            });
+    }
+
+    /// A duplicate is a completed handoff; every other insertion error is a refusal.
+    #[test]
+    fn test_handoff_drop_reason_classifies_pool_errors() {
+        assert_eq!(HandoffDropReason::from_kind(&PoolErrorKind::AlreadyImported), None);
+        assert_eq!(
+            HandoffDropReason::from_kind(&PoolErrorKind::DiscardedOnInsert),
+            Some(HandoffDropReason::DestinationFull)
+        );
+        assert_eq!(
+            HandoffDropReason::from_kind(&PoolErrorKind::ReplacementUnderpriced),
+            Some(HandoffDropReason::ReplacementUnderpriced)
+        );
     }
 
     /// [`register_invalid_tx_skip_series`] must register one skip series per

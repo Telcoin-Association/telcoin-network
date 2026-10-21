@@ -10,7 +10,7 @@ This directory holds a vendored copy of `libp2p-quic` with a small additive chan
 - crates.io checksum (from the base `Cargo.lock`):
   `4f78ca359466657b380e469fe8c04df2f4447d1430838e6c3cef4a1c51ccb2ee`.
 - Resolved stack: libp2p 0.57.0, libp2p-tls 0.7.0, quinn 0.11.9, quinn-proto 0.11.18,
-  rustls 0.23.45, AWS-LC 1.18.1 / 0.45.0 and rustls-webpki 0.103.15.
+  rustls 0.23.46, AWS-LC 1.18.1 / 0.45.0 and rustls-webpki 0.103.15.
 - Dependencies, features and crypto provider are the same as upstream (tokio feature, quinn
   `rustls-aws-lc-rs` and `futures-io`, ring). `Cargo.toml` is the upstream
   `Cargo.toml.orig` with registry versions in place of workspace references, so the crate

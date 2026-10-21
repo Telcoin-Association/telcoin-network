@@ -2,13 +2,20 @@
 
 use super::common::{kill_child, ProcessGuard};
 use crate::common::{
-    address_from_word, advertise_worker_rpc, call_rpc, get_balance, get_balance_above_with_retry,
-    get_block, get_block_number, get_key, get_latest_consensus_header_number, get_node_info,
-    get_node_mode, get_positive_balance_with_retry, network_advancing, scrape_metrics,
-    send_and_confirm, send_tel, start_observer, start_validator, start_validator_with_args,
-    WEI_PER_TEL,
+    address_from_word, advertise_worker_rpc, assert_epoch_records_verify,
+    assert_nodes_agree_on_commit_times, call_rpc, epoch_seconds_remaining, get_balance,
+    get_balance_above_with_retry, get_block, get_block_number, get_key,
+    get_latest_consensus_header_number, get_node_info, get_node_mode,
+    get_positive_balance_with_retry, network_advancing, node_log_path, scrape_metric_value,
+    scrape_metrics, send_and_confirm, send_tel, start_observer, start_validator,
+    start_validator_with_args, start_validator_with_env, strip_ansi, wait_for_epoch_at_least,
+    wait_for_rpc, walk_block_commit_times, EVM_TIMESTAMP_CLAMPED_SERIES, WEI_PER_TEL,
 };
-use e2e_tests::{config_local_testnet, config_local_testnet_with_gc_depth, TestBinary};
+use alloy::{primitives::utils::parse_ether, providers::ProviderBuilder};
+use e2e_tests::{
+    config_local_testnet, config_local_testnet_with_gc_depth,
+    config_local_testnet_with_gc_depth_and_epoch_duration, NodeEndpoints, TestBinary,
+};
 use eyre::{Report, WrapErr as _};
 use jsonrpsee::rpc_params;
 use nix::{
@@ -18,11 +25,15 @@ use nix::{
 use std::{
     cell::RefCell,
     path::Path,
-    process::Child,
+    process::{Child, ExitStatus},
+    sync::{
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        Arc,
+    },
     time::{Duration, Instant},
 };
 use tn_test_utils::wait_until_blocking;
-use tn_types::{get_available_tcp_port, NodeMode};
+use tn_types::{get_available_tcp_port, Address, Epoch, GenesisAccount, NodeMode, U256};
 use tracing::{error, info};
 
 /// Run the first part tests, broken up like this to allow more robust node shutdown.
@@ -569,15 +580,12 @@ fn test_restartstt() -> eyre::Result<()> {
 
 /// Wait for `node` to reach at least `target_block`, polling every second for up to 60 seconds.
 fn wait_for_block(node: &str, target_block: u64) -> eyre::Result<()> {
-    for _ in 0..60 {
-        if let Ok(n) = get_block_number(node) {
-            if n >= target_block {
-                return Ok(());
-            }
-        }
-        std::thread::sleep(Duration::from_secs(1));
-    }
-    Err(eyre::eyre!("Node {node} did not reach block {target_block} within 60 seconds"))
+    wait_until_blocking(
+        Duration::from_secs(60),
+        &format!("node {node} to reach block {target_block}"),
+        || Ok(get_block_number(node).map(|n| n >= target_block).unwrap_or(false)),
+    )?;
+    Ok(())
 }
 
 /// Run some test to make sure an observer is participating in the network.
@@ -675,6 +683,566 @@ fn test_restarts_delayed() -> eyre::Result<()> {
 fn test_restarts_lagged_delayed() -> eyre::Result<()> {
     let _permit = super::common::acquire_test_permit();
     do_restarts(RESTART_TEST_DOWNTIME_SECS, true, "restarts_lagged_delayed")
+}
+
+/// The epoch whose close every validator stops inside in
+/// [`test_restarts_cohort_exits_in_epoch_boundary_window`].
+///
+/// Late enough that all four validators serve RPC long before it closes, which with
+/// [`BOUNDARY_WINDOW_EPOCH_SECS`] epochs comes about 35 s after genesis, and that the records the
+/// rebuilt one chains on are already certified.
+const BOUNDARY_WINDOW_EPOCH: Epoch = 6;
+
+/// Epoch duration (seconds) for [`test_restarts_cohort_exits_in_epoch_boundary_window`], short
+/// enough that the cohort reaches [`BOUNDARY_WINDOW_EPOCH`] and closes two more epochs within the
+/// test budget.
+const BOUNDARY_WINDOW_EPOCH_SECS: u32 = 5;
+
+/// How long a node gets to serve each certified epoch record. Certificates take a fixed
+/// quorum-voting time that does not shrink with 5 s epochs, so this keeps the 60 s floor the
+/// epoch tests use.
+const BOUNDARY_WINDOW_RECORD_SECS: u64 = 60;
+
+/// How long the cohort restarted from the boundary window gets to reach epoch
+/// [`BOUNDARY_WINDOW_EPOCH`] + 2: 24 epochs' worth for two closes.
+const BOUNDARY_WINDOW_RECOVERY_SECS: u64 = 120;
+
+/// The test-utils hook that stops a node at the live close of the named epoch, after the closing
+/// block is executed and before the epoch record is written (`tn_types::test_hooks`).
+const EXIT_BEFORE_EPOCH_RECORD_ENV: &str = "TN_TEST_EXIT_BEFORE_EPOCH_RECORD";
+
+/// The warn line, with field `epoch`, a node logs as [`EXIT_BEFORE_EPOCH_RECORD_ENV`] stops it.
+const EXIT_HOOK_LOG: &str = "test hook: exiting before the epoch record is written";
+
+/// The test-utils hook that stops a node at the live close of the named epoch, after the epoch
+/// record is written and before the state export and the epoch tables clear
+/// (`tn_types::test_hooks`).
+const EXIT_AFTER_EPOCH_RECORD_ENV: &str = "TN_TEST_EXIT_AFTER_EPOCH_RECORD";
+
+/// The warn line, with field `epoch`, a node logs as [`EXIT_AFTER_EPOCH_RECORD_ENV`] stops it.
+const EXIT_AFTER_HOOK_LOG: &str = "test hook: exiting after the epoch record is written";
+
+/// The warn line, with fields `table`, `stale_epoch` and `current_epoch`, a restarted node logs
+/// when the previous epoch's record is present but the epoch tables still hold rows of an older
+/// epoch, before it clears them.
+const STALE_TABLES_CLEAR_LOG: &str =
+    "epoch record present but the consensus db tables still hold rows of an older epoch \
+     (killed between the record write and the tables clear); clearing them";
+
+/// The warn line, with fields `previous_epoch` and `current_epoch`, a restarted node logs when
+/// the previous epoch's record is missing and it rebuilds the record from the closing block.
+const REDERIVE_LOG: &str = "re-deriving it locally";
+
+/// The info line, with the same fields as [`REDERIVE_LOG`], logged once the rebuilt record is
+/// written and before the previous epoch's consensus tables are cleared.
+const RECORD_CLEAR_LOG: &str =
+    "re-derived epoch record written - clearing the previous epoch's consensus db tables";
+
+/// The prefix of the line an epoch's primary logs after it rebuilds its DAG from the certificate
+/// store: `Dag is restored and contains <N> certs for <R> rounds`.
+const DAG_RESTORED_LOG: &str = "Dag is restored and contains";
+
+/// The warn line a proposer logs when it drops parent certificates from another epoch.
+const FOREIGN_PARENTS_LOG: &str = "ignoring parent certificates from another epoch";
+
+/// The error peers answer a vote request with when the header's parents are from another epoch.
+const INVALID_EPOCH_LOG: &str = "Invalid epoch";
+
+/// A window of a live epoch close that [`restarts_cohort_in_epoch_boundary_window`] stops every
+/// validator inside, through the test-utils hook that stops a node there.
+struct BoundaryWindow {
+    /// The hook's environment variable, set to the epoch whose close the node stops in.
+    env: &'static str,
+    /// The warn line, with field `epoch`, a node logs as the hook stops it.
+    hook_log: &'static str,
+    /// The test's name for its temp dir and `test_logs/<name>/`. Short on purpose: node IPC socket
+    /// paths are built under the temp dir.
+    name: &'static str,
+    /// Whether the restart finds the record missing and rebuilds it, rather than finding it
+    /// written and the epoch tables stale.
+    rebuilds_record: bool,
+}
+
+/// After the closing block is executed and before the epoch record is written.
+const BEFORE_EPOCH_RECORD: BoundaryWindow = BoundaryWindow {
+    env: EXIT_BEFORE_EPOCH_RECORD_ENV,
+    hook_log: EXIT_HOOK_LOG,
+    name: "boundary",
+    rebuilds_record: true,
+};
+
+/// After the epoch record is written and before the epoch tables are cleared.
+const AFTER_EPOCH_RECORD: BoundaryWindow = BoundaryWindow {
+    env: EXIT_AFTER_EPOCH_RECORD_ENV,
+    hook_log: EXIT_AFTER_HOOK_LOG,
+    name: "recorded",
+    rebuilds_record: false,
+};
+
+/// Stop the whole cohort inside the epoch-boundary window, restart it on its own datadirs, and
+/// require the network to keep closing epochs.
+///
+/// The window is the part of a live epoch close after the engine has executed the closing block
+/// and made it canonical, and before the epoch's record is durable. The chain has entered the next
+/// epoch, but the record of the closed one is not written, and neither is the clear of that
+/// epoch's consensus tables that always follows the record write. It lasts about 200 ms per
+/// boundary. A node restarted from it finds the record missing and rebuilds it from the closing
+/// block.
+///
+/// Before the fix that rebuild wrote the record but never cleared the tables. The new epoch's
+/// primary reloaded the old epoch's certificates into its DAG (66 certificates over 22 rounds in
+/// the run that found it) and proposed a round-22 header in the new epoch with the old epoch's
+/// round-21 certificates as parents. Every peer refused to vote on it ("Invalid epoch. Peer
+/// proposed epoch 8, but expected 9") and refused the honest round-1 headers as too old. With at
+/// least two of the four validators restarted from inside the window, no certificate of the new
+/// epoch could form and the network halted for good with all four up. When a round-1 header of the
+/// new epoch got certified anyway, its certificate met the reloaded round-1 certificate of the same
+/// author, and a node holding both stopped on "equivocates with earlier certificate": in one run of
+/// this test against the binary without the fix, three of the four exited that way.
+///
+/// A SIGTERM lands in a 200 ms window only by luck, so every validator runs with
+/// [`EXIT_BEFORE_EPOCH_RECORD_ENV`] set to [`BOUNDARY_WINDOW_EPOCH`] (E = 6). The hook stops each
+/// node inside the window of E's close through the same graceful path a SIGTERM takes, which puts
+/// all four there on every run. They restart without the hook. Each must log the rebuild of record
+/// E, which proves it stopped inside the window, then clear epoch E's tables and start epoch E + 1
+/// with an empty DAG, and no proposer may see a parent from another epoch. The cohort must then
+/// reach epoch E + 2, serve verified records for epochs 0 to E + 1, agree on every block and commit
+/// time, return to active consensus without clamping an EVM timestamp, and execute a transfer.
+///
+/// Four validators run [`BOUNDARY_WINDOW_EPOCH_SECS`] s epochs at the delayed restart tests' gc
+/// depth, each serving `--metrics`. Nothing here depends on a fork: the test decodes nothing
+/// in-process and makes no claim about block timestamps, so it runs under the fork epochs the lane
+/// exports.
+#[test]
+#[ignore = "should not run with a default cargo test, run restart tests as seperate step"]
+fn test_restarts_cohort_exits_in_epoch_boundary_window() -> eyre::Result<()> {
+    let _permit = super::common::acquire_test_permit();
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_io()
+        .enable_time()
+        .build()
+        .expect("tokio runtime");
+    runtime.block_on(restarts_cohort_in_epoch_boundary_window(BEFORE_EPOCH_RECORD))
+}
+
+/// Stop the whole cohort after the epoch record is written and before the epoch tables are
+/// cleared, restart it on its own datadirs, and require the network to keep closing epochs.
+///
+/// A live epoch close writes the epoch's record, exports the epoch's state, and only then clears
+/// the epoch's consensus tables, so the window between the record write and the clear holds the
+/// state export and is not small. A node restarted from it finds the record present and the
+/// tables still holding the closed epoch's rows.
+///
+/// Before the fix the restart found the record and took the no-op path, so the tables were never
+/// cleared. The new epoch's primary restored the old epoch's certificates into its DAG and started
+/// the certificate store and the digest indexes from them. The proposer refuses parents from
+/// another epoch, so the round no longer jumps, but nothing else kept the old rows out.
+///
+/// Every validator runs with [`EXIT_AFTER_EPOCH_RECORD_ENV`] set to [`BOUNDARY_WINDOW_EPOCH`]
+/// (E = 6). The hook stops each node in that window of E's close through the same graceful path a
+/// SIGTERM takes, which puts all four there on every run. They restart without the hook. Each must
+/// find epoch E's rows in the tables and clear them without rebuilding the record, then start
+/// epoch E + 1 with an empty DAG, and no proposer may see a parent from another epoch. The cohort
+/// must then reach epoch E + 2, serve verified records for epochs 0 to E + 1, agree on every block
+/// and commit time, return to active consensus without clamping an EVM timestamp, and execute a
+/// transfer.
+///
+/// The cohort, its epochs and the fork setup are those of
+/// [`test_restarts_cohort_exits_in_epoch_boundary_window`].
+#[test]
+#[ignore = "should not run with a default cargo test, run restart tests as seperate step"]
+fn test_restarts_cohort_exits_after_epoch_record() -> eyre::Result<()> {
+    let _permit = super::common::acquire_test_permit();
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_io()
+        .enable_time()
+        .build()
+        .expect("tokio runtime");
+    runtime.block_on(restarts_cohort_in_epoch_boundary_window(AFTER_EPOCH_RECORD))
+}
+
+/// The body of [`test_restarts_cohort_exits_in_epoch_boundary_window`] and
+/// [`test_restarts_cohort_exits_after_epoch_record`], which stop the cohort inside `window`.
+async fn restarts_cohort_in_epoch_boundary_window(window: BoundaryWindow) -> eyre::Result<()> {
+    const E: Epoch = BOUNDARY_WINDOW_EPOCH;
+    const REFERENCE: usize = 0;
+    let test = window.name;
+    let temp_dir = tempfile::TempDir::with_prefix(test)?;
+    let temp_path = temp_dir.path();
+    config_local_testnet_with_gc_depth_and_epoch_duration(
+        temp_path,
+        Some("restart_test".to_string()),
+        None,
+        RESTART_TEST_GC_DEPTH,
+        BOUNDARY_WINDOW_EPOCH_SECS,
+    )?;
+    let bin = e2e_tests::get_telcoin_network_binary();
+    let free_port =
+        || get_available_tcp_port("127.0.0.1").ok_or_else(|| eyre::eyre!("no free local port"));
+    let hook_epoch = E.to_string();
+
+    // run 0: every validator carries the hook, so each stops itself inside E's close
+    let mut guard = ProcessGuard::empty();
+    let mut rpc_ports = [0u16; 4];
+    let mut metrics_addrs: [String; 4] = Default::default();
+    for (instance, (rpc_port, metrics)) in
+        rpc_ports.iter_mut().zip(metrics_addrs.iter_mut()).enumerate()
+    {
+        *rpc_port = free_port()?;
+        *metrics = format!("127.0.0.1:{}", free_port()?);
+        guard.push(start_validator_with_env(
+            instance,
+            bin,
+            temp_path,
+            *rpc_port,
+            test,
+            0,
+            &["--metrics", metrics.as_str()],
+            &[(window.env, hook_epoch.as_str())],
+        ));
+    }
+    let rpc_urls: [String; 4] = rpc_ports.map(|port| format!("http://127.0.0.1:{port}"));
+    let providers = rpc_urls
+        .iter()
+        .map(|url| Ok(ProviderBuilder::new().connect_http(url.parse()?)))
+        .collect::<eyre::Result<Vec<_>>>()?;
+    futures::future::try_join_all(providers.iter().map(wait_for_rpc)).await?;
+    let endpoints: Vec<NodeEndpoints> = rpc_urls
+        .iter()
+        .map(|url| NodeEndpoints {
+            http_url: url.clone(),
+            ws_url: String::new(),
+            ipc_path: String::new(),
+        })
+        .collect();
+    let key = get_key("test-source");
+    let to_account = address_from_word("testing");
+
+    // the nodes stop at E's close, so the wait runs from inside E to two epochs past its close
+    let in_e = wait_for_epoch_at_least(&providers[REFERENCE], E).await?;
+    eyre::ensure!(
+        in_e.epoch_id == E,
+        "validator-1 was already in epoch {} when the test looked, past the epoch {E} close the \
+         hook stops every node at",
+        in_e.epoch_id
+    );
+    let epoch_secs = u64::from(BOUNDARY_WINDOW_EPOCH_SECS);
+    let exit_window =
+        Duration::from_secs(epoch_seconds_remaining(&rpc_urls[REFERENCE], &in_e)? + 2 * epoch_secs);
+    let deadline = Instant::now() + exit_window;
+    let mut exits: [Option<ExitStatus>; 4] = [None; 4];
+    while exits.iter().any(Option::is_none) && Instant::now() < deadline {
+        for (instance, exit) in exits.iter_mut().enumerate().filter(|(_, exit)| exit.is_none()) {
+            if let Some(child) = guard.get_mut(instance) {
+                *exit = child.try_wait()?;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    // every slot leaves the guard here: an exited child is reaped and its pid may be reused, and a
+    // straggler is stopped by hand
+    let hook_fields = [format!("epoch={E}")];
+    let mut hooked = Vec::with_capacity(exits.len());
+    for (instance, exit) in exits.iter().enumerate() {
+        let mut child = guard
+            .take(instance)
+            .ok_or_else(|| eyre::eyre!("validator-{} is not running", instance + 1))?;
+        let Some(status) = exit else {
+            error!(
+                target: "restart-test",
+                instance,
+                "validator-{} did not stop itself in the epoch {E} window within {exit_window:?}; \
+                 stopping it",
+                instance + 1
+            );
+            kill_child(&mut child);
+            continue;
+        };
+        let log = node_log_lines(test, instance, 0)?;
+        eyre::ensure!(
+            log.iter().any(|line| log_line_matches(line, window.hook_log, &hook_fields)),
+            "validator-{} exited ({status}) without the hook's `{}` line for epoch {E}: \
+             test_logs/{test}/node{instance}-run0.stderr.log carries its fatal error",
+            instance + 1,
+            window.hook_log
+        );
+        eyre::ensure!(
+            status.success(),
+            "validator-{} stopped at the epoch {E} hook but exited with {status}, not the graceful \
+             exit a SIGTERM gives",
+            instance + 1
+        );
+        hooked.push(instance);
+    }
+    // the halt the rebuild window caused needed at least two validators restarted from inside it;
+    // the proof wants all four, and one straggler is the most a deterministic hook should leave
+    eyre::ensure!(
+        hooked.len() >= 3,
+        "only validators at indices {hooked:?} stopped themselves inside the epoch {E} window \
+         within {exit_window:?}"
+    );
+    info!(target: "restart-test", ?hooked, "validators stopped inside the epoch boundary window");
+
+    // run 1: the cohort restarts without the hook on the datadirs it left in the window
+    for (instance, (rpc_port, metrics)) in
+        rpc_ports.iter().zip(metrics_addrs.iter_mut()).enumerate()
+    {
+        *metrics = format!("127.0.0.1:{}", free_port()?);
+        guard.replace(
+            instance,
+            start_validator_with_args(
+                instance,
+                bin,
+                temp_path,
+                *rpc_port,
+                test,
+                1,
+                &["--metrics", metrics.as_str()],
+            ),
+        );
+    }
+    futures::future::try_join_all(providers.iter().map(wait_for_rpc)).await?;
+
+    let window_fields = [format!("previous_epoch={E}"), format!("current_epoch={}", E + 1)];
+    let stale_fields = [format!("stale_epoch={E}"), format!("current_epoch={}", E + 1)];
+    if window.rebuilds_record {
+        // the proof the window was hit: record E is missing on restart and rebuilt from the
+        // closing block, which the engine had already executed into epoch E + 1
+        for &instance in &hooked {
+            wait_for_node_log_line(
+                test,
+                instance,
+                1,
+                REDERIVE_LOG,
+                &window_fields,
+                Duration::from_secs(60),
+            )
+            .await?;
+        }
+    } else {
+        // the proof the window was hit: record E is present on restart, but epoch E's tables
+        // were never cleared
+        for &instance in &hooked {
+            wait_for_node_log_line(
+                test,
+                instance,
+                1,
+                STALE_TABLES_CLEAR_LOG,
+                &stale_fields,
+                Duration::from_secs(60),
+            )
+            .await?;
+        }
+        // the record was written before the node stopped, so nothing is rebuilt
+        for &instance in &hooked {
+            let log = node_log_lines(test, instance, 1)?;
+            if let Some(line) = log.iter().find(|line| line.contains(REDERIVE_LOG)) {
+                return Err(eyre::eyre!(
+                    "validator-{} rebuilt a record it wrote before it stopped: {line}",
+                    instance + 1
+                ));
+            }
+        }
+    }
+
+    // before the fixes the cohort never got past here from the rebuild window (every epoch E + 1
+    // header was refused); from the after-record window the restarted primaries start from epoch
+    // E's certificates instead, which the DAG check below catches
+    match tokio::time::timeout(
+        Duration::from_secs(BOUNDARY_WINDOW_RECOVERY_SECS),
+        wait_for_epoch_at_least(&providers[REFERENCE], E + 2),
+    )
+    .await
+    {
+        Ok(Ok(_)) => {}
+        Ok(Err(e)) => {
+            return Err(e.wrap_err(format!(
+                "the cohort restarted from the epoch {E} window did not reach epoch {}: {}",
+                E + 2,
+                restart_halt_evidence(test, 1)
+            )))
+        }
+        Err(_) => {
+            return Err(eyre::eyre!(
+                "the cohort restarted from the epoch {E} window did not reach epoch {} within \
+                 {BOUNDARY_WINDOW_RECOVERY_SECS} s: {}",
+                E + 2,
+                restart_halt_evidence(test, 1)
+            ))
+        }
+    }
+
+    // the rebuild or the stale-tables clear emptied epoch E's tables, so the epoch E + 1 primary
+    // started from an empty DAG
+    for &instance in &hooked {
+        let log = node_log_lines(test, instance, 1)?;
+        let after = if window.rebuilds_record {
+            let rederive = log
+                .iter()
+                .position(|line| log_line_matches(line, REDERIVE_LOG, &window_fields))
+                .ok_or_else(|| {
+                    eyre::eyre!("node{instance}-run1.log lost its `{REDERIVE_LOG}` line")
+                })?;
+            let after = &log[rederive..];
+            eyre::ensure!(
+                after.iter().any(|line| log_line_matches(line, RECORD_CLEAR_LOG, &window_fields)),
+                "validator-{} rebuilt the epoch {E} record without `{RECORD_CLEAR_LOG}`",
+                instance + 1
+            );
+            after
+        } else {
+            let clear = log
+                .iter()
+                .position(|line| log_line_matches(line, STALE_TABLES_CLEAR_LOG, &stale_fields))
+                .ok_or_else(|| {
+                    eyre::eyre!("node{instance}-run1.log lost its `{STALE_TABLES_CLEAR_LOG}` line")
+                })?;
+            &log[clear..]
+        };
+        let dag = after
+            .iter()
+            .find(|line| line.contains(DAG_RESTORED_LOG))
+            .ok_or_else(|| eyre::eyre!("validator-{} logged no DAG restore", instance + 1))?;
+        eyre::ensure!(
+            dag.contains(&format!("{DAG_RESTORED_LOG} 0 certs")),
+            "validator-{}'s epoch {} primary restored epoch {E}'s certificates into its DAG: {dag}",
+            instance + 1,
+            E + 1
+        );
+    }
+    for instance in 0..rpc_urls.len() {
+        let log = node_log_lines(test, instance, 1)?;
+        if let Some(line) = log.iter().find(|line| line.contains(FOREIGN_PARENTS_LOG)) {
+            return Err(eyre::eyre!(
+                "validator-{}'s proposer was handed parents from another epoch: {line}",
+                instance + 1
+            ));
+        }
+    }
+
+    for url in &rpc_urls {
+        wait_for_node_mode(url, NodeMode::CvvActive)?;
+    }
+    assert_epoch_records_verify(&endpoints, 0..=E + 1, BOUNDARY_WINDOW_RECORD_SECS).await?;
+    test_blocks_same(&rpc_urls)?;
+    let mut walks = Vec::with_capacity(rpc_urls.len());
+    for (provider, url) in providers.iter().zip(&rpc_urls) {
+        let head = get_block_number(url)?;
+        walks.push(walk_block_commit_times(provider, url, 0..=head).await?);
+    }
+    assert_nodes_agree_on_commit_times(&walks, &rpc_urls)?;
+    assert_no_evm_timestamp_clamps(&metrics_addrs, &rpc_urls, test)?;
+    send_and_confirm(&rpc_urls[REFERENCE], &rpc_urls[3], &key, to_account, 0)?;
+    info!(
+        target: "restart-test",
+        ?hooked,
+        "cohort restarted from the epoch boundary window kept closing epochs"
+    );
+
+    guard.kill_all();
+    Ok(())
+}
+
+/// Node `instance`'s stdout log of run `run` of `test`, as lines without ANSI escapes.
+///
+/// Read lossily: the node may be mid-write, and a torn multi-byte character must not fail the read.
+fn node_log_lines(test: &str, instance: usize, run: u32) -> eyre::Result<Vec<String>> {
+    plain_log_lines(&node_log_path(test, instance, run, false))
+}
+
+/// The lines of the node log at `path` without ANSI escapes, read lossily (see
+/// [`node_log_lines`]).
+fn plain_log_lines(path: &Path) -> eyre::Result<Vec<String>> {
+    let bytes = std::fs::read(path).wrap_err_with(|| format!("reading {}", path.display()))?;
+    Ok(strip_ansi(&String::from_utf8_lossy(&bytes)).lines().map(str::to_owned).collect())
+}
+
+/// Whether the node log `line` contains `text` and carries every `name=value` in `fields` as a
+/// whole token, so `epoch=6` does not match `epoch=60`.
+fn log_line_matches(line: &str, text: &str, fields: &[String]) -> bool {
+    line.contains(text)
+        && fields.iter().all(|field| line.split_whitespace().any(|token| token == field.as_str()))
+}
+
+/// Poll node `instance`'s run-`run` log of `test` until a line matches `text` and `fields` (see
+/// [`log_line_matches`]), for up to `timeout`.
+async fn wait_for_node_log_line(
+    test: &str,
+    instance: usize,
+    run: u32,
+    text: &str,
+    fields: &[String],
+    timeout: Duration,
+) -> eyre::Result<()> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if node_log_lines(test, instance, run)?
+            .iter()
+            .any(|line| log_line_matches(line, text, fields))
+        {
+            return Ok(());
+        }
+        eyre::ensure!(
+            Instant::now() < deadline,
+            "test_logs/{test}/node{instance}-run{run}.log has no `{text}` line with {fields:?} \
+             after {timeout:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
+/// What each validator's run-`run` logs of `test` show of a restart that stopped making progress:
+/// the first DAG restore after the record rebuild (the new epoch's primary), how many vote requests
+/// peers refused with [`INVALID_EPOCH_LOG`], and the fatal error the process exited with, if any.
+/// A validator that exited surfaces in the epoch wait only as a refused RPC connection.
+fn restart_halt_evidence(test: &str, run: u32) -> String {
+    (0..4)
+        .map(|instance| {
+            let fatal = plain_log_lines(&node_log_path(test, instance, run, true))
+                .ok()
+                .and_then(|stderr| stderr.into_iter().find(|line| line.starts_with("Error:")))
+                .unwrap_or_else(|| "no fatal error on stderr".to_string());
+            match node_log_lines(test, instance, run) {
+                Ok(log) => {
+                    let from =
+                        log.iter().position(|line| line.contains(REDERIVE_LOG)).unwrap_or(0);
+                    let dag = log[from..]
+                        .iter()
+                        .find(|line| line.contains(DAG_RESTORED_LOG))
+                        .map_or("no DAG restore logged", String::as_str);
+                    let refused =
+                        log.iter().filter(|line| line.contains(INVALID_EPOCH_LOG)).count();
+                    format!(
+                        "node{instance}: [{dag}], {refused} `{INVALID_EPOCH_LOG}` refusals, [{fatal}]"
+                    )
+                }
+                Err(e) => format!("node{instance}: {e}, [{fatal}]"),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+/// Require the engine behind each metrics endpoint to report no EVM timestamp clamped up to its
+/// parent's since that process started. `metrics_addrs[i]` belongs to the node at `urls[i]`.
+fn assert_no_evm_timestamp_clamps(
+    metrics_addrs: &[String],
+    urls: &[String],
+    test: &str,
+) -> eyre::Result<()> {
+    for (addr, url) in metrics_addrs.iter().zip(urls) {
+        // blocking socket I/O with sleeps between retries, so it runs off the runtime worker
+        let clamped = tokio::task::block_in_place(|| {
+            scrape_metric_value(addr, EVM_TIMESTAMP_CLAMPED_SERIES)
+        })?;
+        eyre::ensure!(
+            clamped == 0.0,
+            "{url} clamped {clamped} EVM timestamps up to their parent's: consensus let commit \
+             time go backwards (node logs under test_logs/{test}/ carry the \
+             \"evm timestamp clamped to parent\" warnings)"
+        );
+    }
+    Ok(())
 }
 
 fn test_blocks_same(client_urls: &[String; 4]) -> eyre::Result<()> {
@@ -861,6 +1429,7 @@ fn test_epoch_cold_genesis_without_peers() -> eyre::Result<()> {
     let key = get_key("test-source");
     send_and_confirm(alone_url, peer_url, &key, address_from_word("cold-genesis-target"), 0)?;
     wait_for_block(alone_url, get_block_number(peer_url)?)?;
+    guard.finish();
     Ok(())
 }
 
@@ -934,6 +1503,7 @@ fn test_observer_late_join_catchup() -> eyre::Result<()> {
                 .unwrap_or(false))
         },
     )?;
+    guard.finish();
     Ok(())
 }
 
@@ -972,9 +1542,21 @@ fn test_observer_reconnect_after_pause() -> eyre::Result<()> {
     let obs_url = format!("http://127.0.0.1:{obs_rpc_port}");
     guard.push(start_observer(4, bin, &temp_path, obs_rpc_port, "reconnect", 0));
 
-    // Wait for network to advance and observer to be in sync
+    // Wait for the network to advance, then for the observer to reach the consensus height that
+    // validator 0 reported earlier in the same poll. The start value below is then in sync.
     network_advancing(&client_urls)?;
-    std::thread::sleep(Duration::from_secs(5));
+    wait_until_blocking(
+        Duration::from_secs(45),
+        "observer in sync with validator 0 before pause (test_logs/reconnect/)",
+        || {
+            Ok(get_latest_consensus_header_number(&client_urls[0])
+                .and_then(|validator| {
+                    get_latest_consensus_header_number(&obs_url)
+                        .map(|observer| observer > 0 && observer >= validator)
+                })
+                .unwrap_or(false))
+        },
+    )?;
 
     let initial_obs_consensus_height = get_latest_consensus_header_number(&obs_url)?;
     info!(target: "restart-test", ?initial_obs_consensus_height, "observer synced, pausing it");
@@ -1009,5 +1591,154 @@ fn test_observer_reconnect_after_pause() -> eyre::Result<()> {
                 .unwrap_or(false))
         },
     )?;
+    guard.finish();
     Ok(())
+}
+
+/// Word for the funded genesis account that drives load in [`test_restarts_lagged_under_load`].
+///
+/// It is separate from `test-source`, so the load never races the nonces of other transfers.
+const LOAD_SOURCE: &str = "load-source";
+
+/// Time limit for a lagged validator to catch up and rejoin while the load runs.
+///
+/// Longer than the unloaded catch-up wait, because the restarted node executes a non-empty block
+/// for every output it syncs.
+const LOADED_REJOIN_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Pending nonce of `address` on `node`, from `eth_getTransactionCount`.
+fn pending_nonce(node: &str, address: Address) -> eyre::Result<u128> {
+    let count: String = call_rpc(
+        node,
+        "eth_getTransactionCount",
+        rpc_params![address, "pending"],
+        1,
+        "eth_getTransactionCount",
+    )?;
+    u128::from_str_radix(count.trim_start_matches("0x"), 16)
+        .wrap_err("eth_getTransactionCount returned a count that is not hex")
+}
+
+/// Send value transfers from [`LOAD_SOURCE`] through `node` until `stop` is set.
+///
+/// `sent` counts the accepted transfers. A failed send resyncs the nonce from the pool, so a full
+/// per-sender pool slows the load to the rate of block inclusion instead of ending it.
+fn spawn_load(
+    node: String,
+    stop: Arc<AtomicBool>,
+    sent: Arc<AtomicU64>,
+) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        let key = get_key(LOAD_SOURCE);
+        let source = address_from_word(LOAD_SOURCE);
+        let sink = address_from_word("load-sink");
+        std::iter::successors(Some(0u128), |&nonce| {
+            (!stop.load(Ordering::Relaxed)).then(|| {
+                send_tel(&node, &key, sink, 1, 250, 21000, nonce).map_or_else(
+                    |_| {
+                        std::thread::sleep(Duration::from_millis(100));
+                        pending_nonce(&node, source).unwrap_or(nonce)
+                    },
+                    |_| {
+                        sent.fetch_add(1, Ordering::Relaxed);
+                        nonce + 1
+                    },
+                )
+            })
+        })
+        .for_each(|_nonce| {});
+    })
+}
+
+/// A validator restarted far behind while transactions keep flowing must catch up and rejoin
+/// consensus before the load stops (issue #1513).
+///
+/// Before the fix a catching-up node rejoined only when the output it had just handled was the
+/// newest known header. A node that must execute every output does not reach that point while the
+/// committee keeps committing, so it stayed inactive until the load dropped.
+#[test]
+#[ignore = "should not run with a default cargo test, run restart tests as seperate step"]
+fn test_restarts_lagged_under_load() -> eyre::Result<()> {
+    let _permit = super::common::acquire_test_permit();
+    let test = "restarts_lagged_under_load";
+    let tmp_guard = tempfile::TempDir::new()?;
+    let temp_path = tmp_guard.path().to_path_buf();
+    let funded = vec![(
+        address_from_word(LOAD_SOURCE),
+        GenesisAccount::default().with_balance(U256::from(parse_ether("10_000_000")?)),
+    )];
+    config_local_testnet_with_gc_depth(
+        &temp_path,
+        Some("restart_test".to_string()),
+        Some(funded),
+        Some(RESTART_TEST_GC_DEPTH),
+    )?;
+    let bin = e2e_tests::get_telcoin_network_binary();
+    let rpc_ports = (0..4)
+        .map(|_| {
+            get_available_tcp_port("127.0.0.1").ok_or_else(|| eyre::eyre!("no rpc port available"))
+        })
+        .collect::<eyre::Result<Vec<u16>>>()?;
+    let rpc_port2 =
+        rpc_ports.get(2).copied().ok_or_else(|| eyre::eyre!("missing rpc port for node 2"))?;
+    let client_urls = <[String; 4]>::try_from(
+        rpc_ports.iter().map(|port| format!("http://127.0.0.1:{port}")).collect::<Vec<_>>(),
+    )
+    .map_err(|_| eyre::eyre!("expected four rpc urls"))?;
+    let mut guard = ProcessGuard::empty();
+    rpc_ports.iter().enumerate().for_each(|(i, &rpc_port)| {
+        guard.push(start_validator(i, bin, &temp_path, rpc_port, test, 0));
+    });
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let sent = Arc::new(AtomicU64::new(0));
+    let load = spawn_load(client_urls[0].clone(), Arc::clone(&stop), Arc::clone(&sent));
+
+    let mut rejoin = || -> eyre::Result<()> {
+        network_advancing(&client_urls)?;
+        wait_until_blocking(Duration::from_secs(30), "load transfers accepted", || {
+            Ok(sent.load(Ordering::Relaxed) > 0)
+        })?;
+        let mut child2 = guard.take(2).ok_or_else(|| eyre::eyre!("missing child 2"))?;
+        kill_child(&mut child2);
+        wait_for_downtime(&client_urls, RESTART_TEST_DOWNTIME_SECS)?;
+        let metrics_port = get_available_tcp_port("127.0.0.1")
+            .ok_or_else(|| eyre::eyre!("no metrics port available for restarted validator"))?;
+        let metrics_addr = format!("127.0.0.1:{metrics_port}");
+        let sent_at_restart = sent.load(Ordering::Relaxed);
+        guard.replace(
+            2,
+            start_validator_with_args(
+                2,
+                bin,
+                &temp_path,
+                rpc_port2,
+                test,
+                1,
+                &["--metrics", &metrics_addr],
+            ),
+        );
+        wait_until_blocking(
+            LOADED_REJOIN_TIMEOUT,
+            "lagged validator to catch up and rejoin while the load runs",
+            || {
+                Ok(scrape_metrics(&metrics_addr).is_ok_and(|metrics| {
+                    get_node_mode(&client_urls[2])
+                        .is_ok_and(|mode| restart_catch_up_complete(mode, &metrics))
+                }))
+            },
+        )?;
+        eyre::ensure!(
+            !load.is_finished() && sent.load(Ordering::Relaxed) > sent_at_restart,
+            "the load stopped before the lagged validator rejoined"
+        );
+        Ok(())
+    };
+    let rejoined = rejoin();
+    stop.store(true, Ordering::Relaxed);
+    let joined = load.join().map_err(|_| eyre::eyre!("load thread panicked"));
+    guard.kill_all();
+    rejoined
+        .wrap_err(format!("lagged rejoin under load failed, check logs in test_logs/{test}/"))
+        .and(joined)
 }

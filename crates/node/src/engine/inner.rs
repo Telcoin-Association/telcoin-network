@@ -41,7 +41,7 @@ pub(super) struct ExecutionNodeInner {
     /// Reth execution environment.
     pub(super) reth_env: RethEnv,
     /// Initialized execution components indexed by worker id.
-    /// Removed workers retain their pools with stopped RPC listeners until reactivation.
+    /// Removed workers retain their pools and listeners with transaction admission closed.
     pub(super) workers: Vec<WorkerComponents>,
 }
 
@@ -135,13 +135,15 @@ impl ExecutionNodeInner {
 
     /// Initialize the worker's transaction pool and public RPC.
     /// Peer tracking is attached separately when the worker enters an epoch.
-    /// Must call this function in accending worker_id order or will panic,
-    /// for instance call for worker id 0, then 1, etc.
+    /// Worker ids must be consecutive, starting at zero. Reject existing or skipped ids before
+    /// creating a pool or binding RPC listeners.
     ///
     /// The pool receives the shared [`BaseFeeContainer`] so canonical updates always charge
     /// the current epoch's fee (issue #1262). The RPC server keeps the [`WorkerBaseFee`]
     /// handle so `eth_feeHistory` resolves the worker's current fee on every quote, surviving
     /// worker-count changes (issue #1282).
+    /// Raw transaction admission reads the same live node mode as `tn_nodeMode`,
+    /// refusing inactive validators before their pools can retain submissions.
     pub(super) async fn initialize_worker_components<EP>(
         &mut self,
         worker_id: WorkerId,
@@ -152,6 +154,11 @@ impl ExecutionNodeInner {
     where
         EP: EngineToPrimary + Send + Sync + 'static,
     {
+        eyre::ensure!(
+            usize::from(worker_id) == self.workers.len(),
+            "cannot initialize worker {worker_id}: next uninitialized worker is {}",
+            self.workers.len()
+        );
         let transaction_pool = self.reth_env.init_txn_pool(base_fee.clone())?;
 
         let network = WorkerNetwork::new(
@@ -172,6 +179,7 @@ impl ExecutionNodeInner {
             transaction_pool.clone(),
             network.clone(),
             worker_base_fee,
+            tn_ext.node_mode_reader(),
             tn_ext.into_rpc(),
         )?;
 
@@ -181,11 +189,7 @@ impl ExecutionNodeInner {
         let rpc_handle = self.reth_env.start_rpc(&server, worker_id).await?;
 
         // take ownership of worker components
-        let components = WorkerComponents::new(rpc_handle, server, transaction_pool, network);
-        // Must call this function in accending worker_id order or will panic.
-        if worker_id as usize != self.workers.len() {
-            panic!("initialize_worker_components not called with sequencial worker ids!")
-        }
+        let components = WorkerComponents::new(rpc_handle, transaction_pool, network);
         self.workers.push(components);
         Ok(())
     }
@@ -325,7 +329,7 @@ impl ExecutionNodeInner {
         self.reth_env.clone()
     }
 
-    /// Return a running worker's RPC handle, or an error if absent or stopped.
+    /// Return an active worker's RPC handle, or an error if absent or inactive.
     pub(super) fn worker_rpc_handle(&self, worker_id: &WorkerId) -> eyre::Result<&RpcServerHandle> {
         self.workers
             .get(usize::from(*worker_id))

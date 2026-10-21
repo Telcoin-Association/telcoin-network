@@ -47,6 +47,8 @@ fn worker_server(
         pool.clone(),
         WorkerNetwork::new_for_test(reth_env.chainspec()),
         accumulator.worker_base_fee(worker_id),
+        // a forwarding node is an observer, which the mode check admits
+        || NodeMode::Observer,
         RpcModule::new(()),
     )?;
     Ok((server, pool))
