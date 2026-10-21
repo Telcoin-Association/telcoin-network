@@ -622,30 +622,42 @@ tagger_time() {
     printf '%s\n' "${raw%% *}"
 }
 
-# Names of the refs/tags/v* tags that count for the version rules. Without a cutoff, every
-# tag; with a cutoff (epoch seconds) and commit $2, only annotated tags whose tagger date is
-# strictly earlier and whose commit is $2 or one of its ancestors. Returns git's status:
-# bash 3.2 runs $(...) without -e, so the caller checks it.
+# Names of the v* tags on origin. Every fetch here is --no-tags, so the local tags can be
+# stale; ls-remote reads origin's. Retried like ls_remote_tag.
+remote_tags() {
+    local out attempt=1
+    require_origin
+    until out=$(git ls-remote --tags origin 'refs/tags/v*'); do
+        [ "$attempt" -lt 3 ] || die 3 "git ls-remote --tags origin failed after 3 attempts"
+        attempt=$((attempt + 1))
+        sleep 5
+    done
+    printf '%s\n' "$out" | awk '{ n = $2; sub(/^refs\/tags\//, "", n); if (n != "" && n !~ /\^\{\}$/) print n }'
+}
+
+# Names of the v* tags that count for the version rules. Without a cutoff (TAG does not exist
+# yet), every v* tag on origin, or every local one in a dry run. With a cutoff (epoch seconds),
+# every local annotated tag whose tagger date is strictly earlier, whatever commit it names.
+# Its output is captured, and bash 3.2 runs $(...) without -e, so a failure dies explicitly
+# and the caller passes the status on with `|| exit`.
 tags_before() {
-    local name
-    if [ -z "$1" ]; then
-        git tag -l 'v*'
+    local out
+    if [ -n "$1" ]; then
+        out=$(git for-each-ref --format='%(refname:strip=2) %(taggerdate:raw)' 'refs/tags/v*') ||
+            die 2 "cannot list the v* tags"
+        printf '%s\n' "$out" | awk -v c="$1" '$2 != "" && $2 + 0 < c + 0 { print $1 }'
+    elif [ "$DRY_RUN" = 1 ]; then
+        git tag -l 'v*' || die 2 "cannot list the v* tags"
     else
-        git for-each-ref --format='%(refname:strip=2) %(taggerdate:raw)' 'refs/tags/v*' |
-            awk -v c="$1" '$2 != "" && $2 + 0 < c + 0 { print $1 }' |
-            while IFS= read -r name; do
-                if git merge-base --is-ancestor "refs/tags/$name^{commit}" "$2" 2>/dev/null; then
-                    printf '%s\n' "$name"
-                fi
-            done
+        remote_tags
     fi
 }
 
 # The release is monotonic in its channel, with no release candidate after its final, among
-# the tags that tags_before CUTOFF COMMIT names.
+# the tags that tags_before CUTOFF names.
 check_version_order() {
     local earlier others highest
-    earlier=$(tags_before "$1" "$2") || die 2 "cannot list the v* tags"
+    earlier=$(tags_before "$1") || exit
     if [ -n "$RC" ]; then
         case $'\n'"$earlier"$'\n' in
             *$'\n'"$BASE"$'\n'*) die 1 "$BASE already exists; no release candidate may follow its final release" ;;
@@ -670,16 +682,17 @@ check_version_at() {
     extradata="telcoin-network/v$VERSION/linux"
     [ "${#extradata}" -le 32 ] || die 1 "'$extradata' is longer than the 32-byte extradata limit"
 
-    # Before TAG exists (`tag` is about to create it) the rules compare with every existing tag.
-    # Once it exists they compare only with annotated tags dated before it on COMMIT or its
-    # ancestors, so an older release stays verifiable after newer ones exist. Only TAG's date
+    # Before TAG exists (`tag` is about to create it) the rules compare with every tag on origin.
+    # Once it exists they compare only with the annotated tags dated before it, on any commit:
+    # an older release stays verifiable after newer ones exist, while a lower version tagged
+    # after a higher one, or a release candidate tagged after its final, fails. Only TAG's date
     # is signed; the other tags are not verified (the tags before this process are unsigned),
     # so the v* tag ruleset keeps bogus tags out, and a wrong tag has to be deleted.
     if git rev-parse --verify --quiet "refs/tags/$TAG" >/dev/null; then
         cutoff=$(tagger_time "$TAG")
         [ -n "$cutoff" ] || die 1 "tag $TAG has no tagger date"
     fi
-    check_version_order "$cutoff" "$commit"
+    check_version_order "$cutoff"
 }
 
 # Applies the CHANGELOG rules of check-tag step (6) to file $1: exactly one "## [BASE] - date"
@@ -1499,14 +1512,10 @@ cmd_prep() {
         remote=$(ls_remote_tag "$TAG")
         [ -z "$remote" ] || die 1 "tag $TAG already exists on origin"
     fi
-    # The version rules of tag and check-tag, before anything is written: a release candidate
-    # after its final would replace the released section at the top of CHANGELOG.md. prep
-    # fetches no tags, so the final is also looked up on origin.
-    check_version_order '' "$main_sha"
-    if [ -n "$RC" ] && [ "$DRY_RUN" != 1 ]; then
-        remote=$(ls_remote_tag "$BASE")
-        [ -z "$remote" ] || die 1 "$BASE already exists on origin; no release candidate may follow its final release"
-    fi
+    # The version rules of tag and check-tag, against origin's tags, before anything is written:
+    # a release candidate after its final would replace the released section at the top of
+    # CHANGELOG.md.
+    check_version_order ''
     [ -f cliff.toml ] || die 2 "cliff.toml is missing"
     [ -f CHANGELOG.md ] || die 2 "CHANGELOG.md is missing"
     anchors=$(awk -v a="$ANCHOR" '$0 == a { n++ } END { print n + 0 }' CHANGELOG.md)

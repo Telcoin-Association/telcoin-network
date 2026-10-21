@@ -42,6 +42,9 @@ The tag checks also enforce these version rules:
 - mainnet and Adiri may use the same `X.Y.Z`;
 - `telcoin-network/vX.Y.Z/linux` must fit in the 32-byte block extra-data field.
 
+`release-prep` and `release-tag` apply the version rules to the tags on GitHub, read with `git ls-remote`, because the scripts fetch no other tags and a clone's own tags can be out of date.
+Once the tag exists, CI and every later step apply them to the tags created before it, by tagger date and on any commit, so an older release still verifies after newer ones exist, while a lower version tagged after a higher one, or a release candidate tagged after its final release, fails.
+
 ## Machines and prerequisites
 
 ### Laptop (macOS)
