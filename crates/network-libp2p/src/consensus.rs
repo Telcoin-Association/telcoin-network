@@ -5,15 +5,17 @@
 use crate::{
     codec::{PeerExchangeCodec, TNCodec, TNMessage},
     error::NetworkError,
+    gossip_config::gossipsub_config,
     kad::{node_record_key, KadStore},
     metrics::{
-        ConnectionLimitReason, InboundDenial, InboundFailureOutcome, PeerManagerMetrics,
+        ConnectionLimitReason, InboundFailureOutcome, InboundRejection, PeerManagerMetrics,
         SwarmMetrics,
     },
     peers::{self, LoadPenalty, PeerEvent, PeerManager, Penalty, PutRecordRate},
     quic_incoming::QuicIncomingLimits,
     record_exchange::{RecordCodec, RecordExchange, RecordResponse},
     send_or_log_error,
+    serve_permits::ServePermits,
     service_class::{InboundOccupancy, ServiceClass},
     stream::{StreamBehavior, StreamEvent},
     types::{
@@ -172,6 +174,9 @@ enum PutOutcome {
 
 pub(crate) use tn_node_record::MAX_ADVERTISED_MULTIADDRS;
 
+/// Margin between the serial QUIC handshake budget, transport timeout and peer-manager timeout.
+const DIAL_TIMEOUT_SLACK: Duration = Duration::from_secs(5);
+
 /// Freshness of a validated incoming record relative to the locally stored value.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum RecordFreshness {
@@ -252,6 +257,39 @@ impl InboundDenialWarning {
     }
 }
 
+/// Minimum time between two `error` logs about listener errors (see [`ListenerErrorLog`]).
+const LISTENER_ERROR_LOG_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Rate limit for the `error` log about `SwarmEvent::ListenerError`.
+///
+/// Every listener error is counted in the `tn_network.listener_errors_total` metric. The first
+/// error logs at once. Later errors within [`LISTENER_ERROR_LOG_INTERVAL`] of the last log are
+/// suppressed, and the next log carries the number of errors suppressed since the last log.
+#[derive(Debug, Default)]
+struct ListenerErrorLog {
+    /// When the last log fired, or `None` before the first error.
+    last: Option<tokio::time::Instant>,
+    /// The number of errors suppressed since the last log.
+    suppressed: u64,
+}
+
+impl ListenerErrorLog {
+    /// Count one error at `now`. Return the number of errors suppressed since the last log when
+    /// a log is due, and `None` when this error is suppressed.
+    fn record(&mut self, now: tokio::time::Instant) -> Option<u64> {
+        if self
+            .last
+            .is_none_or(|last| now.saturating_duration_since(last) >= LISTENER_ERROR_LOG_INTERVAL)
+        {
+            self.last = Some(now);
+            Some(std::mem::take(&mut self.suppressed))
+        } else {
+            self.suppressed = self.suppressed.saturating_add(1);
+            None
+        }
+    }
+}
+
 /// Build the [`connection_limits::Behaviour`] for one swarm.
 ///
 /// It sets the following bounds:
@@ -276,9 +314,9 @@ impl InboundDenialWarning {
 ///   pending upgrade fails, times out or is aborted. The slots are a set of `ConnectionId`s, so a
 ///   second release of the same id and a release of an id that holds no slot free nothing.
 ///
-/// Hold time: the libp2p `SwarmBuilder` wraps the transport in a `TransportTimeout` with a 10
-/// second default, which is shorter than the configured QUIC `handshake_timeout`. So an unfinished
-/// inbound handshake holds its slot for about 10 seconds at most, not for the QUIC value.
+/// Hold time: QUIC bounds each inbound handshake by the configured `handshake_timeout` (10 seconds
+/// by default). The outer transport timeout covers all signed outbound endpoints and is longer;
+/// it does not extend an inbound handshake's hold time.
 ///
 /// The pending inbound ceiling applies to each swarm separately. Each primary and worker network
 /// builds its own [`TNBehavior`], so the host total is this ceiling times the number of swarms.
@@ -520,9 +558,13 @@ where
     record_retry_interval: Duration,
     /// Prometheus metrics for swarm-level events (gossip, requests).
     metrics: SwarmMetrics,
+    /// The application's per-class serve permits, shared with every handle of this swarm.
+    serve_permits: ServePermits,
     /// Rate limit for the warning about inbound connections that a `connection_limits` bound
     /// refuses.
     inbound_denial_warning: InboundDenialWarning,
+    /// Rate limit for the `error` log about listener errors.
+    listener_error_log: ListenerErrorLog,
     /// Decision counters of this swarm's QUIC listener (Retry, Accept, Refuse, Ignore,
     /// budget yields), mirrored into [`SwarmMetrics`] once per event-loop iteration.
     quic_incoming: std::sync::Arc<libp2p::quic::IncomingStats>,
@@ -599,6 +641,18 @@ where
     ) -> NetworkResult<Self> {
         let budget = network_config.swarm_budget().map_err(std::io::Error::other)?;
         let quic_config = network_config.quic_config().with_budget(budget);
+        // libp2p creates every address's outer timer before serial dialing starts. Leave enough
+        // time for every signed endpoint to consume its own first-poll QUIC handshake window.
+        let connection_timeout =
+            std::iter::repeat_n(quic_config.handshake_timeout, MAX_ADVERTISED_MULTIADDRS)
+                .fold(DIAL_TIMEOUT_SLACK, Duration::saturating_add);
+        let peer_config = PeerConfig {
+            dial_timeout: network_config
+                .peer_config()
+                .dial_timeout
+                .max(connection_timeout.saturating_add(DIAL_TIMEOUT_SLACK)),
+            ..*network_config.peer_config()
+        };
         // Namespace every wire protocol by the genesis chain id so nodes on
         // different chains never negotiate a connection. The id is stamped onto
         // the network config from genesis at node startup; see
@@ -609,22 +663,9 @@ where
         // (GHSA-cc64-wfq5-56ph).
         let record_domain = RecordDomain::new(chain_id, network_type);
 
-        let gossipsub_config = gossipsub::ConfigBuilder::default()
-            // explicitly set default
-            .heartbeat_interval(Duration::from_secs(1))
-            // explicitly set default
-            .validation_mode(gossipsub::ValidationMode::Strict)
-            // TN specific: filter against authorized_publishers for certain topics
-            .validate_messages()
-            // Gossipsub negotiates its own `/meshsub` protocol, independent of the
-            // req-res/kad/stream names below, so without this it is the one wire
-            // protocol two chains still share: namespacing the topics keeps their
-            // messages apart but still lets cross-chain peers negotiate a gossip
-            // substream. Folding the chain id into the protocol id closes that gap.
-            // The builder appends `/1.1.0` and `/1.0.0`, yielding
-            // `/tn-meshsub-{chain_id}/1.1.0` and `/tn-meshsub-{chain_id}/1.0.0`.
-            .protocol_id_prefix(crate::types::gossip_protocol_id_prefix(chain_id))
-            .build()?;
+        // Explicit frame limits and the order the library applies them: see
+        // `gossipsub_config` (issue #1655).
+        let gossipsub_config = gossipsub_config(chain_id)?;
         let gossipsub = gossipsub::Behaviour::new(
             gossipsub::MessageAuthenticity::Signed(keypair.clone()),
             gossipsub_config,
@@ -733,7 +774,7 @@ where
             gossipsub,
             (req_res, peer_exchange, record_exchange),
             kademlia,
-            network_config.peer_config(),
+            &peer_config,
             PeerManagerMetrics::new_for(&network_type),
             stream_protocol,
         );
@@ -746,6 +787,12 @@ where
         // rotation. Our own record is skipped: both primary and worker key their record by
         // the primary BLS key, and there is no point caching ourselves as a known peer.
         let own_key = key_config.primary_public_key();
+        behavior.peer_manager.configure_admission(network_config.admission().clone(), own_key);
+        // A live owner re-signs its record every publication interval. A cached window record
+        // older than two intervals is queried again, so a rotated network key heals under Closed.
+        behavior
+            .peer_manager
+            .configure_record_max_age(network_config.libp2p_config().kad_publication_interval * 2);
         let mut restored: usize = 0;
         for (key, info) in known {
             if key == own_key {
@@ -795,6 +842,7 @@ where
                     network_config.libp2p_config().max_idle_connection_timeout,
                 )
             })
+            .with_connection_timeout(connection_timeout)
             .build();
 
         // set external address
@@ -842,14 +890,19 @@ where
             ),
             record_retry_interval,
             metrics: SwarmMetrics::new_for(&network_type).with_capacity(&quic_config, budget),
+            serve_permits: ServePermits::new(&network_type, network_config.serve_budget()),
             inbound_denial_warning: InboundDenialWarning::default(),
+            listener_error_log: ListenerErrorLog::default(),
             quic_incoming,
         })
     }
 
     /// Return a [NetworkHandle] to send commands to this network.
+    ///
+    /// The handle shares this swarm's serve permits, so every request handler offers inbound
+    /// requests to the same per-class budget.
     pub fn network_handle(&self) -> NetworkHandle<Req, Res> {
-        NetworkHandle::new(self.handle.clone())
+        NetworkHandle::new(self.handle.clone()).with_serve_permits(self.serve_permits.clone())
     }
 
     /// Attach the process-wide source budget before starting the swarm.
@@ -1023,6 +1076,10 @@ where
         // add peer record if address confirmed
         self.swarm.behaviour_mut().kademlia.set_mode(Some(Mode::Server));
         self.provide_our_data();
+        self.swarm
+            .behaviour()
+            .peer_manager
+            .observe_committee_resolution(self.key_config.primary_public_key());
 
         // Startup already published our record. Refresh only after the first full interval,
         // and skip missed ticks to avoid a burst of signing and publication after a stall.
@@ -1070,10 +1127,20 @@ where
             let (pending, deferred) = self.record_exchange.counts();
             self.metrics.set_record_exchange_pending(pending, deferred);
             self.metrics.record_quic_incoming(&self.quic_incoming);
+            self.swarm
+                .behaviour()
+                .peer_manager
+                .observe_committee_resolution(self.key_config.primary_public_key());
         }
     }
 
     /// Process events from the swarm.
+    ///
+    /// Non-blocking invariant (issue #1656): the swarm task never waits for a gossip publish or
+    /// for a slow peer. This function does not publish and does not await. It gives received
+    /// gossip to the application with `try_send_outcome`, which does not wait when the
+    /// application channel is full. [`Self::process_command`] states the publish half of the
+    /// invariant. `test_publish_to_stalled_peer_never_blocks_swarm` protects it.
     #[instrument(level = "trace", target = "network::events", skip(self), fields(topics = ?self.authorized_publishers.keys()))]
     async fn process_event(
         &mut self,
@@ -1123,16 +1190,26 @@ where
                 );
             }
             SwarmEvent::ListenerError { listener_id, error } => {
-                // log listener errors
-                error!(
-                    target: "network",
-                    ?listener_id,
-                    ?error,
-                    "listener error"
+                // count every listener error by class; log the first at once, then at most one
+                // per interval with the number of errors suppressed since the last log
+                let reason = self.metrics.record_listener_error(&error);
+                self.listener_error_log.record(tokio::time::Instant::now()).into_iter().for_each(
+                    |suppressed| {
+                        error!(
+                            target: "network",
+                            ?listener_id,
+                            ?error,
+                            reason = reason.label(),
+                            suppressed,
+                            window = ?LISTENER_ERROR_LOG_INTERVAL,
+                            "listener error"
+                        );
+                    },
                 );
             }
             SwarmEvent::ListenerClosed { addresses, reason, .. } => {
-                // log errors
+                // count every close by outcome, then log errors
+                self.metrics.record_listener_closed(&reason);
                 if let Err(e) = reason {
                     error!(target: "network", ?e, "listener unexpectedly closed");
                 }
@@ -1143,35 +1220,28 @@ where
                     return Err(NetworkError::AllListenersClosed);
                 }
             }
-            // an inbound connection refused by a `connection_limits` bound (the pending inbound
-            // ceiling, the per-peer established ceiling or the total established ceiling); count
-            // it by the bound that the refusal names, and log only the configured limit and the
-            // fixed limit description, never peer-supplied data
+            // an inbound connection that a behaviour refused; count it once by its terminal
+            // reason and stage, never by peer-supplied data. A `connection_limits` refusal (the
+            // pending inbound ceiling, the per-peer established ceiling or the total established
+            // ceiling) also counts by bound and feeds the rate-limited warning
             SwarmEvent::IncomingConnectionError {
                 error: libp2p::swarm::ListenError::Denied { cause },
                 ..
             } => {
-                cause.downcast_ref::<connection_limits::Exceeded>().into_iter().for_each(
-                    |exceeded| {
-                        // classify by the refusal text, not by the peer id: both established
-                        // ceilings refuse after authentication, so a peer id cannot tell them apart
-                        let reason = ConnectionLimitReason::from_exceeded(exceeded);
-                        self.metrics.record_connection_limit_rejection(reason);
-                        let denial = InboundDenial::from_reason(reason);
-                        self.metrics.record_inbound_denied(&denial);
-                        self.inbound_denial_warning
-                            .record(tokio::time::Instant::now())
-                            .into_iter()
-                            .for_each(|denied| {
-                                warn!(
-                                    target: "network",
-                                    denied,
-                                    window = ?INBOUND_DENIAL_WARN_INTERVAL,
-                                    "inbound connections keep being refused by connection limits"
-                                );
-                            });
-                    },
-                );
+                let rejection = self.metrics.record_inbound_rejection(&cause);
+                if matches!(rejection, InboundRejection::Limit(_)) {
+                    self.inbound_denial_warning
+                        .record(tokio::time::Instant::now())
+                        .into_iter()
+                        .for_each(|denied| {
+                            warn!(
+                                target: "network",
+                                denied,
+                                window = ?INBOUND_DENIAL_WARN_INTERVAL,
+                                "inbound connections keep being refused by connection limits"
+                            );
+                        });
+                }
             }
             SwarmEvent::OutgoingConnectionError {
                 error: libp2p::swarm::DialError::Denied { cause },
@@ -1192,6 +1262,16 @@ where
     }
 
     /// Process commands for the network.
+    ///
+    /// Non-blocking invariant (issue #1656): this function is synchronous, so the swarm task
+    /// never awaits a command. `NetworkCommand::Publish` calls `gossipsub.publish`, which puts
+    /// the message in the send queue of each recipient connection or fails at once. When the
+    /// send queue of every recipient is full, the result is `PublishError::AllQueuesFull`. The
+    /// swarm task sends each result, success or failure, to the caller in the same loop
+    /// iteration and does not retry a failed publish. The caller decides whether to publish
+    /// again. `test_publish_to_stalled_peer_never_blocks_swarm` protects this invariant, and
+    /// `test_full_command_channel_publish_waits_then_resolves` records what a caller sees when
+    /// the command channel is full.
     fn process_command(&mut self, command: NetworkCommand<Req, Res>) -> NetworkResult<()> {
         match command {
             NetworkCommand::StartListening { multiaddr, reply } => {
@@ -1328,6 +1408,10 @@ where
                 if res.is_ok() {
                     self.metrics.record_gossip_published();
                 }
+                // No retry here: the failure goes back to the caller with the result.
+                if matches!(res, Err(PublishError::AllQueuesFull(_))) {
+                    self.metrics.record_gossip_publish_queue_full();
+                }
                 send_or_log_error!(reply, res, "Publish");
             }
             NetworkCommand::Subscribe { topic, publishers, reply } => {
@@ -1461,6 +1545,7 @@ where
                 send_or_log_error!(reply, peers, "PeersForExchange");
             }
             NetworkCommand::UpdateCommittees { previous, current, next } => {
+                self.swarm.behaviour_mut().peer_manager.invalidate_admission();
                 // The network mirrors three of the on-chain registry's committees: previous,
                 // current, and next. Peers in any of the three count as validators so the
                 // just-completed committee is not pruned while late gossip may still arrive and
@@ -1485,6 +1570,41 @@ where
                 self.query_missing_required_records();
                 retention?;
             }
+            NetworkCommand::UpdateAdmissionCommittees {
+                update,
+                epoch,
+                previous,
+                current,
+                next,
+            } => {
+                // Mirror the `UpdateCommittees` arm for authoritative epoch updates. Only an
+                // applied update moves retention: every accepted epoch-start send, and a renewal
+                // that changes membership. An old or contradictory revision cannot prune the
+                // records of the accepted committees.
+                let window: Vec<_> =
+                    previous.iter().chain(&current).chain(&next).copied().collect();
+                let applied = self
+                    .swarm
+                    .behaviour_mut()
+                    .peer_manager
+                    .update_committees_at(update, epoch, previous, current, next);
+                if applied {
+                    let retention = self
+                        .swarm
+                        .behaviour_mut()
+                        .kademlia
+                        .store_mut()
+                        .retain_committees(window)
+                        .map_err(|error| NetworkError::StoreKademliaRecord(error.to_string()));
+                    self.refresh_explicit_peers();
+                    self.query_missing_required_records();
+                    retention?;
+                }
+            }
+            NetworkCommand::AdmissionStatus { reply } => {
+                let status = self.swarm.behaviour().peer_manager.admission_status();
+                send_or_log_error!(reply, status, "AdmissionStatus");
+            }
             NetworkCommand::PrepareCommitteeDial { committee } => {
                 // Deadlock-breaker pre-dial: forgive bans so the committee can be dialed without
                 // mutating the committee slots (the real slot update follows shortly after).
@@ -1501,6 +1621,11 @@ where
             NetworkCommand::GetAllValidatorRpcs { reply } => {
                 let rpcs = self.swarm.behaviour_mut().peer_manager.current_committee_rpcs();
                 send_or_log_error!(reply, rpcs, "GetAllValidatorRpcs");
+            }
+            NetworkCommand::GetCommitteeRpcSnapshot { reply } => {
+                let snapshot = self.committee_rpc_snapshot();
+                self.query_missing_required_records();
+                send_or_log_error!(reply, snapshot, "GetCommitteeRpcSnapshot");
             }
             NetworkCommand::OpenStream { peer, reply } => {
                 // Look up the peer's PeerId from their BLS key
@@ -1565,6 +1690,38 @@ where
         } else {
             self.swarm.behaviour_mut().gossipsub.remove_explicit_peer(peer);
         }
+    }
+
+    /// Read submit advertisements only while their matching signed store record is live.
+    /// The resolution cache deliberately outlives DHT expiry for consensus liveness; that
+    /// cached identity alone cannot prove fresh submit coverage.
+    fn committee_rpc_snapshot(&mut self) -> crate::types::CommitteeRpcSnapshot {
+        let behaviour = self.swarm.behaviour_mut();
+        let snapshot = behaviour.peer_manager.committee_rpc_snapshot();
+        let rpcs: Vec<_> = snapshot
+            .rpcs()
+            .iter()
+            .filter(|(key, rpc)| {
+                behaviour
+                    .kademlia
+                    .store_mut()
+                    .get(&node_record_key(key))
+                    .and_then(|record| NodeRecord::try_decode_compat(&record.value))
+                    .is_some_and(|record| {
+                        record.info.rpc.as_ref() == Some(rpc)
+                            && behaviour
+                                .peer_manager
+                                .record_timestamp(key, record.info.timestamp)
+                                .is_some()
+                    })
+            })
+            .cloned()
+            .collect();
+        crate::types::CommitteeRpcSnapshot::new(
+            snapshot.members().clone(),
+            rpcs,
+            snapshot.advertisements().to_vec(),
+        )
     }
 
     /// Refill required rows after ownership updates, even if the restored peer cache already

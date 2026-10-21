@@ -1,8 +1,8 @@
 //! Configuration for network variables.
 
 use crate::{
-    ConfigFmt, ConfigTrait, NetworkBudgetError, NetworkProcessBudget, SourceAdmissionConfig,
-    SwarmNetworkBudget, TelcoinDirs,
+    ConfigFmt, ConfigTrait, NetworkBudgetError, NetworkProcessBudget, ServeBudget,
+    SourceAdmissionConfig, SwarmNetworkBudget, TelcoinDirs,
 };
 use libp2p::{kad::K_VALUE, multiaddr::Protocol, PeerId};
 use serde::{
@@ -35,8 +35,12 @@ pub struct NetworkConfig {
     quic_config: QuicConfig,
     /// Optional process-wide allocation. Omission preserves the existing transport defaults.
     process_budget: Option<NetworkProcessBudget>,
+    /// Opt-in per-class serve permit budget. Omission leaves every class unbounded.
+    serve_budget: ServeBudget,
     /// The configuration for managing peers.
     peer_config: PeerConfig,
+    /// Connection admission policy shared by the primary and every worker swarm.
+    admission: AdmissionConfig,
     /// Optional process-wide accounting of established connections by observed source.
     /// No production limits are assumed when this configuration is absent.
     source_admission: Option<SourceAdmissionConfig>,
@@ -166,6 +170,11 @@ impl fmt::Display for CommitteePeerError {
 impl std::error::Error for CommitteePeerError {}
 
 impl NetworkConfig {
+    /// Return this node's connection admission configuration.
+    pub fn admission(&self) -> &AdmissionConfig {
+        &self.admission
+    }
+
     /// Return explicit deployment limits for source admission, when configured.
     pub fn source_admission(&self) -> Option<&SourceAdmissionConfig> {
         self.source_admission.as_ref()
@@ -278,6 +287,11 @@ impl NetworkConfig {
     /// Derive one swarm's resource allocation, or preserve legacy limits when not configured.
     pub fn swarm_budget(&self) -> Result<Option<SwarmNetworkBudget>, NetworkBudgetError> {
         self.process_budget.as_ref().map(NetworkProcessBudget::allocate).transpose()
+    }
+
+    /// The per-class serve permit budget. Every class is unbounded when not configured.
+    pub fn serve_budget(&self) -> ServeBudget {
+        self.serve_budget
     }
 
     /// Endpoint mappings for the primary and every independently keyed worker.
@@ -447,6 +461,56 @@ impl NetworkConfig {
     pub fn write_config<TND: TelcoinDirs>(&self, tn_datadir: &TND) -> eyre::Result<()> {
         let path = tn_datadir.network_config_path();
         Self::write_to_path(path, self, ConfigFmt::YAML)
+    }
+}
+
+/// Connection admission rollout mode. Authentication and resource limits apply in every mode.
+#[derive(Serialize, Deserialize, Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum AdmissionMode {
+    /// Preserve unrestricted discovery and the existing identity and ban checks.
+    #[default]
+    Open,
+    /// Permit discovery while operators observe and repair the admission inputs.
+    Grace,
+    /// Admit only committee, trusted, and bootstrap identities when inputs are complete.
+    Closed,
+}
+
+/// Settings for renewable, epoch-versioned connection admission snapshots.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(default)]
+pub struct AdmissionConfig {
+    /// Requested rollout mode; an unsafe snapshot always falls back to Open or Grace.
+    mode: AdmissionMode,
+    /// Maximum seconds since the epoch owner last renewed the authoritative snapshot.
+    snapshot_max_age_secs: u64,
+}
+
+impl Default for AdmissionConfig {
+    fn default() -> Self {
+        Self { mode: AdmissionMode::Open, snapshot_max_age_secs: 300 }
+    }
+}
+
+impl AdmissionConfig {
+    /// Construct a policy with an explicit renewal lease. A zero lease prevents Closed.
+    pub fn new(mode: AdmissionMode, snapshot_max_age: Duration) -> Self {
+        Self { mode, snapshot_max_age_secs: snapshot_max_age.as_secs() }
+    }
+
+    /// Return the requested rollout mode.
+    pub fn mode(&self) -> AdmissionMode {
+        self.mode
+    }
+
+    /// Return the snapshot lease, measured with the swarm's monotonic clock.
+    pub fn snapshot_max_age(&self) -> Duration {
+        Duration::from_secs(self.snapshot_max_age_secs)
+    }
+
+    /// Renew at one third of the lease, with a minimum interval of one second.
+    pub fn refresh_interval(&self) -> Duration {
+        Duration::from_secs((self.snapshot_max_age_secs / 3).max(1))
     }
 }
 
@@ -754,7 +818,8 @@ pub struct PeerConfig {
     pub heartbeat_interval: u64,
     /// The target number of connected peers.
     pub target_num_peers: usize,
-    /// The timeout for dialing a peer.
+    /// The requested timeout for dialing a peer.
+    /// The network raises this to cover all signed endpoints plus transport and delivery slack.
     pub dial_timeout: Duration,
     /// A fraction of `Self::target_num_peers` that is allowed to connect to this node in excess of
     /// `PeerManager::target_num_peers`.
@@ -1800,6 +1865,22 @@ hostname: "my-validator"
         // A negative halflife flips exponential decay into unbounded growth.
         let config = ScoreConfig { score_halflife: -1.0, ..Default::default() };
         assert!(config.validate().is_err(), "a negative score_halflife must be rejected");
+    }
+
+    /// A network config without a serve budget leaves every class unbounded, and a partial budget
+    /// sets only the named class.
+    #[test]
+    fn serve_budget_is_optional_and_partial() -> Result<(), serde_json::Error> {
+        let absent: NetworkConfig = serde_json::from_value(serde_json::json!({}))?;
+        assert_eq!(absent.serve_budget(), ServeBudget::default());
+        let partial: NetworkConfig =
+            serde_json::from_value(serde_json::json!({ "serve_budget": { "vote": 8 } }))?;
+        assert_eq!(partial.serve_budget().vote(), 8);
+        assert_eq!(partial.serve_budget().epoch_record(), 0);
+        assert_eq!(partial.serve_budget().certificate_sync(), 0);
+        assert_eq!(partial.serve_budget().batch(), 0);
+        assert_eq!(partial.serve_budget().other(), 0);
+        Ok(())
     }
 
     /// Process allocations cap transport values and preserve lower operator settings.
