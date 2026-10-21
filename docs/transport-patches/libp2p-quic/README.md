@@ -102,7 +102,12 @@ repeated in required CI; an empty scanner report cannot replace them.
 
 The fresh scan also identified [GHSA-2mjx-qc3c-rqvc](https://github.com/advisories/GHSA-2mjx-qc3c-rqvc),
 RUSTSEC-2026-0285, affecting the old rustls 0.23.37 pin. This PR updates rustls
-to the fixed 0.23.45, AWS-LC to 1.18.1 / 0.45.0 and rustls-webpki to 0.103.15.
+to the fixed 0.23.46, AWS-LC to 1.18.1 / 0.45.0 and rustls-webpki to 0.103.15.
+The 2026-10-15 lockfile update from rustls 0.23.45 to 0.23.46 also addresses
+RUSTSEC-2026-0346, RUSTSEC-2026-0347, RUSTSEC-2026-0348 and RUSTSEC-2026-0349,
+which the required advisory gate detected in the carried transport closure.
+The committed evidence snapshots below describe the earlier qualification;
+CI captures fresh source and advisory evidence for the current lockfile.
 The scoped updated transport scan has no findings. The workspace scan exits
 1 with seven findings outside the complete QUIC/TLS dependency closure; this record does not
 claim the entire workspace is advisory-free.
