@@ -75,7 +75,7 @@ The YubiKey never goes to the build server, and the registry token never goes on
 ### One-time setup
 
 - The allowlist on `main` must hold a provisioned key; every check fails on a placeholder file and names it.
-- A repository admin sets up the tag ruleset on `v*`, as [Settings the release workflow requires](https://github.com/Telcoin-Association/telcoin-network/blob/main/.github/ACTIONS.md#settings-the-release-workflow-requires) describes: only the maintainers can create a `v*` tag, and nobody can update or delete one.
+- A repository admin sets up the tag ruleset on `v*`, as [Settings the release workflow requires](https://github.com/Telcoin-Association/telcoin-network/blob/main/.github/ACTIONS.md#settings-the-release-workflow-requires) describes: only maintainers can create a `v*` tag, and it must be signed; nobody, maintainers included, can update or delete one.
   The scripts cannot see the ruleset, and the signatures do not depend on it: every step that reads a tag requires exactly one signature on it, made by a key in the allowlist on `main`, and publishing requires at least `MIN_SIGNATURES` maintainer signatures over `SHA256SUMS`.
   The ruleset covers what signatures cannot: GitHub runs `release.yaml` from the tagged commit, so the ruleset decides who can start the workflow for a release tag, and it keeps a tag from being moved or deleted after it was validated.
 - The ghcr package must be public, because the release scripts and operators read it without credentials.
@@ -102,7 +102,7 @@ git commit -am "release: v0.17.0-adiri"
 gh pr create --title "release: v0.17.0-adiri" --body "Version 0.17.0 and the CHANGELOG section for v0.17.0-adiri."
 ```
 
-Review the section, but do not edit it; `CHANGELOG.md` sections are generated, never written by hand, except to remove a release withdrawn before publishing (see [Before publish](#before-publish)).
+Review the section, but do not edit it; `CHANGELOG.md` sections are generated, never written by hand.
 Notes for operators, such as a required resync, a configuration change or an activation epoch, go in the GitHub release in step 4.
 
 Attest the PR head with `make attest` as for any PR, then merge it through the merge queue on its own.
@@ -299,7 +299,7 @@ If `release-sign` had already uploaded the signature, the second run stops becau
 | 2, 3 | The `CHANGELOG.md` check fails on `release-base` | If you are tagging a later commit, set `RELEASE_COMMIT` to the release commit. If the release commit did not land alone, repeat step 1 on the new `main`. |
 | 2, 3 | The signing key is not on the allowlist | Check `git config --get user.signingkey` and `RELEASE_GPG_KEY`, and that your file on `main` holds your current signing key (`gpg --show-keys .github/maintainer-gpg-keys/<handle>.asc`). |
 | 2, 3 | The commit is not attested | On the build server, run `git switch --detach <commit> && ALLOW_STALE_BASE=1 make attest`, then `git switch main`. If CI failed on it, also run `gh run rerun <run-id>`. |
-| 3 | The tag is wrong and has to go | If CI created no draft and nothing was built, delete it with `git push --delete origin <TAG>` and `git tag -d <TAG>`, then tag again. Otherwise follow [Before publish](#before-publish). |
+| 3 | The tag is wrong | The tag stays: only maintainers can create a `v*` tag, and it must be signed; nobody, maintainers included, can update or delete one. Follow [Before publish](#before-publish) and release the next version. |
 | 4, 6 | `run make docker-login` | Run `make docker-login` on the build server. |
 | 4 | `package is not public` | Do the [one-time setup](#one-time-setup). |
 | 4 | The image `:<TAG>` is already in the registry | An earlier build pushed it. Rebuild with `RELEASE_REBUILD=1 make release-build TAG=<TAG>`; the new image has a different digest, because builds are not reproducible. |
@@ -319,23 +319,23 @@ If `release-sign` had already uploaded the signature, the second run stops becau
 ### Before publish
 
 Until the release is published, the public parts are the tag, the `:<TAG>` image, and the release commit on `main`, whose `CHANGELOG.md` section is already on the docs site's [Release notes](../getting-started/release-notes.md) page.
-Delete the draft, the image version and the tag, running the `gh` commands on the build server, where the package scopes belong:
+The tag stays: only maintainers can create a `v*` tag, and it must be signed; nobody, maintainers included, can update or delete one.
+Delete the draft, if CI created one, and the image version, if `release-build` pushed one, running the `gh` commands on the build server, where the package scopes belong:
 
 ```sh
 gh release delete v0.17.0-adiri --yes
 ID=$(GH_TOKEN="$PACKAGES_PAT" gh api --paginate /orgs/Telcoin-Association/packages/container/telcoin-network/versions \
   --jq '.[] | select(.metadata.container.tags | any(. == "v0.17.0-adiri")) | .id')
 GH_TOKEN="$PACKAGES_PAT" gh api -X DELETE "/orgs/Telcoin-Association/packages/container/telcoin-network/versions/$ID"
-git push --delete origin v0.17.0-adiri
-git tag -d v0.17.0-adiri
 ```
 
 The packages API accepts only a classic personal access token with the `read:packages` and `delete:packages` scopes, so put one in `PACKAGES_PAT` for those two calls and revoke it afterwards; the package's Versions page on GitHub can delete the version instead.
 
-Run `git tag -d` on every machine that has the tag.
-Then open a PR that deletes the release's section from `CHANGELOG.md`, from its `## [v0.17.0-adiri]` heading up to the next `## [` heading, and attest and merge it like any other PR.
-This is the only hand edit `CHANGELOG.md` takes; with the tag deleted, the next release's section lists the same commits again.
-Then cut the next release candidate or patch version; reuse a tag name only if CI never created a draft for it and no image was pushed.
+Then release the next version from step 1, which supersedes the tag: the next release candidate after a withdrawn candidate (`v0.17.0-adiri-rc2` after `v0.17.0-adiri-rc1`, or the final `v0.17.0-adiri`), and the next patch version after a withdrawn final release (`v0.17.1-adiri` after `v0.17.0-adiri`).
+The version rules refuse any version that is not above the withdrawn tag, so its version is never released.
+Leave `CHANGELOG.md` as it is.
+`release-prep` replaces a withdrawn candidate's section while it is the newest one; a withdrawn final keeps its section, and the next section lists the commits after its tag.
+Say in the next release's operator notes that the version was withdrawn.
 
 ### After publish
 

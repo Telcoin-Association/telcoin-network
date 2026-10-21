@@ -687,7 +687,8 @@ check_version_at() {
     # an older release stays verifiable after newer ones exist, while a lower version tagged
     # after a higher one, or a release candidate tagged after its final, fails. Only TAG's date
     # is signed; the other tags are not verified (the tags before this process are unsigned),
-    # so the v* tag ruleset keeps bogus tags out, and a wrong tag has to be deleted.
+    # so the v* tag ruleset keeps bogus tags out. Tags are immutable under that ruleset: a wrong
+    # tag stays, and the next version supersedes it.
     if git rev-parse --verify --quiet "refs/tags/$TAG" >/dev/null; then
         cutoff=$(tagger_time "$TAG")
         [ -n "$cutoff" ] || die 1 "tag $TAG has no tagger date"

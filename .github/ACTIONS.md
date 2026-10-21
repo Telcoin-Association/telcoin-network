@@ -385,7 +385,7 @@ The operator check in [Installing a release](https://docs.telcoin.network/gettin
 
 The job definitions are the exception.
 GitHub reads `release.yaml` itself from the tagged commit (for a dispatch, from the branch it runs on), so a tag on a commit that edits the workflow runs the edited workflow under that tag's name.
-The tag ruleset below keeps anyone but the maintainers from creating, moving or deleting a `v*` tag, so an edited workflow cannot run for a release tag a maintainer did not push.
+The tag ruleset below lets only the maintainers create a `v*` tag and nobody move or delete one, so an edited workflow cannot run for a release tag a maintainer did not push.
 It does not keep a `contents: write` token from anyone with write access: they can push a branch whose workflow asks for one, or create, edit, publish and delete releases with their own credentials.
 What protects a release is the maintainer signatures, which `make release-publish` and `verify-release` check against the allowlist on `main`, not the token.
 
@@ -412,9 +412,12 @@ What keeps a release from changing after it passed is the immutable-releases set
 
 None of these is visible to the workflow, and each closes a gap the workflow leaves open.
 
-1. **A tag ruleset** (Settings -> Rules -> Rulesets) on the `v*` tags that lets only the maintainers create, update or delete one.
+1. **A tag ruleset** (Settings -> Rules -> Rulesets) on the `v*` tags: only maintainers can create a `v*` tag, and it must be signed; nobody, maintainers included, can update or delete one.
+   A ruleset's bypass list applies to every rule in it, so this takes two tag rulesets on `refs/tags/v*`: one with *Restrict creations* and the maintainers on its bypass list, and one with *Restrict updates* and *Restrict deletions* and an empty bypass list.
+   The signature is not a GitHub rule: `validate-tag` and every later step refuse a tag that does not carry exactly one signature by an allowlisted key.
    `validate-tag` proves who signed a tag, not who pushed it, and GitHub runs the workflow definition at the tagged commit.
    Without the rule, anyone with write access could push a `v*` tag on a commit with an edited `release.yaml`, or move or delete a tag after it was validated.
+   A wrong tag therefore stays, and the next version supersedes it; the version rules refuse any version that is not above it.
    The rule limits who can create, move or delete a `v*` tag and nothing else; it does not limit who can create, edit, publish or delete releases, which write access alone allows.
 2. **Immutable releases** (Settings -> General -> Releases).
    Once a release is published its assets and its tag cannot change, so the files `verify-release` checked are the files operators download.
