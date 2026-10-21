@@ -121,8 +121,13 @@ check_gateway_image_context() {
         # The sources go to git quoted, so git, not the shell, expands a glob such as
         # `Cargo*`. The tn-contracts submodule archives as an empty directory, which is all
         # cargo metadata needs; the gateway's own dependencies (tn-types, tn-metrics) read
-        # nothing from it.
-        git archive HEAD -- "${paths[@]}" | tar -x -C "$tmp"
+        # nothing from it. Without `-m`, tar would keep the commit time as every file's
+        # mtime, and cargo, which keys a path crate's fingerprint on its path relative to
+        # the workspace root, would then judge the copied path crates fresh against the
+        # shared target dir whenever the checkout had been checked after the commit, so a
+        # missing input would go unnoticed. `-m` stamps the copy with the extraction time,
+        # so every path crate recompiles under the copy's path.
+        git archive HEAD -- "${paths[@]}" | tar -xm -C "$tmp"
         # --offline needs every locked crate source in CARGO_HOME.
         run cargo fetch --locked
         # `run` traces to stdout, which this redirect would discard with the JSON, so
@@ -136,7 +141,8 @@ check_gateway_image_context() {
         # lane_test_default: that build links the production binary with the
         # gateway's own feature set, and this check proves compile-time inputs such
         # as chain-configs/ are in the image's COPY set. The shared target dir reuses
-        # the registry crates; only the path crates recompile under the copy's path.
+        # the registry crates; the path crates recompile under the copy's path on every
+        # run, because `tar -xm` above makes their sources newer than any output.
         CARGO_TARGET_DIR="$PWD/target" run cargo check --locked --offline \
             -p tn-worker-gateway --bin worker-gateway --manifest-path "$tmp/Cargo.toml"
     )
