@@ -17,6 +17,9 @@ path = "src/main.rs"
 # cli + runtime
 clap = { workspace = true, features = ["derive", "env"] }
 eyre = { workspace = true }
+fdlimit = { workspace = true }
+# errno values and getrlimit (see server::is_connection_error, fd::current_limit); already in the lock through tokio and fdlimit
+libc = { workspace = true }
 futures = { workspace = true }
 tokio = { workspace = true, features = [
     "rt-multi-thread",

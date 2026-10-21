@@ -15,14 +15,14 @@ use tracing::{info, warn};
 use url::Url;
 
 use crate::{
-    cli::{submission_reserve, Settings},
+    cli::{request_deadline, submission_reserve, Settings},
     config::UpstreamWorker,
     dns::{LookupHost, SystemLookup},
     proxy::{
-        client_builder, fetch_chain_id, proxy_client, readiness_client, QueryHeader, Route,
+        client_builder, fetch_chain_id, readiness_client, route_clients, QueryHeader, Route,
         UpstreamOrigin, WARNING_THROTTLES,
     },
-    ratelimit::{run_gc, RateLimiters, DEFAULT_MAX_PER_IP_ENTRIES},
+    ratelimit::{run_gc, RateLimiters},
     readiness::{run_poller, GatewayReadiness, QueryProbe, ReadinessThresholds},
     server::{
         inflight_slots, serve, serve_probes, AccessLog, AppState, CorsOrigins, RecentSubmissions,
@@ -54,13 +54,15 @@ const TLS_SETTINGS_HINT: &str = "cannot build the upstream clients; check --upst
 pub(crate) async fn run(settings: Settings) -> eyre::Result<()> {
     ensure_root_store(&settings, native_root_count)?;
 
-    // Dedicated clients, both started from `client_builder` so they share the
-    // connect timeout, TLS and the no-proxy policy, and neither follows
-    // redirects: the proxy also enforces a per-request deadline (see
-    // `proxy_client`); the poller bounds each probe with its own tokio timeout
-    // (see `readiness_client`). Each resolves upstream names through its own
-    // cache and lookup cap (see `UpstreamClients`).
-    let UpstreamClients { proxy: proxy_client, readiness: readiness_client } =
+    // Dedicated clients, all started from `client_builder`'s settings so they
+    // share the connect timeout, TLS and the no-proxy policy, and none follows
+    // redirects: one forwarding client per route, whose read timeout bounds
+    // the wait for a response head and every gap in its body (see
+    // `route_clients`), and the poller's, which bounds each probe with its own
+    // tokio timeout (see `readiness_client`). The forwarding clients share one
+    // DNS cache and lookup cap, and the poller's has its own (see
+    // `UpstreamClients`).
+    let UpstreamClients { proxy: proxy_client, query: query_client, readiness: readiness_client } =
         UpstreamClients::new(&settings, Arc::new(SystemLookup)).wrap_err(TLS_SETTINGS_HINT)?;
     let Settings {
         listen_addr,
@@ -77,7 +79,7 @@ pub(crate) async fn run(settings: Settings) -> eyre::Result<()> {
         upstream_failure_threshold,
         upstream_connect_timeout: _,
         upstream_request_timeout,
-        query_request_timeout,
+        query_request_timeout: _,
         upstream_ca_certs: _,
         upstream_identity: _,
         dns_cache_ttl,
@@ -101,11 +103,13 @@ pub(crate) async fn run(settings: Settings) -> eyre::Result<()> {
         trusted_proxies,
         proxy_protocol,
         rate_limit_submissions,
+        rate_limit_per_ip_max_entries,
         shutdown_delay,
         graceful_shutdown_timeout,
         metrics_addr,
         cors_allowed_origins,
         access_log_sample,
+        access_log_max_lines_per_second,
     } = settings;
 
     info!(
@@ -117,6 +121,8 @@ pub(crate) async fn run(settings: Settings) -> eyre::Result<()> {
             .map_or_else(|| String::from("off"), |url| UpstreamOrigin(url).to_string()),
         redirect_queries_header = query_header.is_some(),
         ?recent_submission_ttl,
+        ?shutdown_delay,
+        ?graceful_shutdown_timeout,
         cors = match &cors_allowed_origins {
             None => "off",
             Some(CorsOrigins::Any) => "any origin",
@@ -140,7 +146,7 @@ pub(crate) async fn run(settings: Settings) -> eyre::Result<()> {
         rate_limit_per_ip,
         rate_limit_global,
         rate_limit_submissions,
-        DEFAULT_MAX_PER_IP_ENTRIES,
+        rate_limit_per_ip_max_entries.get(),
         rate_limit_prefix,
     );
     let trusted_proxies = Arc::new(trusted_proxies);
@@ -155,7 +161,8 @@ pub(crate) async fn run(settings: Settings) -> eyre::Result<()> {
     };
     // The sampled access log keys clients by the same prefix as the per-IP
     // limiter, or `None` when `--access-log-sample` is `0`.
-    let access_log = AccessLog::new(access_log_sample, rate_limit_prefix);
+    let access_log =
+        AccessLog::new(access_log_sample, access_log_max_lines_per_second, rate_limit_prefix);
     // the worker slots reads can never take, so the operator sees what
     // submissions are guaranteed, not just `--max-inflight-submissions`:
     // without a redirect every read may take one, with one only the reads kept
@@ -170,8 +177,14 @@ pub(crate) async fn run(settings: Settings) -> eyre::Result<()> {
         trusted_proxies = trusted_proxies.len(),
         proxy_protocol = proxy_protocol.is_some(),
         submission_budget,
+        rate_limit_per_ip_max_entries = ?rate_limit_per_ip
+            .map(|_| rate_limit_per_ip_max_entries.get()),
         ?max_connections_per_ip,
-        max_request_bytes,
+        // the per-ip key's prefix widths (`v4`, `v6`), which also key
+        // --max-connections-per-ip
+        rate_limit_v4_prefix = rate_limit_prefix.v4_bits(),
+        rate_limit_v6_prefix = rate_limit_prefix.v6_bits(),
+        max_request_bytes = max_request_bytes.get(),
         ?max_batch_len,
         max_inflight_submissions,
         max_inflight_queries,
@@ -189,20 +202,35 @@ pub(crate) async fn run(settings: Settings) -> eyre::Result<()> {
         access_log = %access_log
             .as_ref()
             .map_or_else(|| String::from("off"), |_| format!("sampling {access_log_sample}")),
+        access_log_max_lines_per_second = access_log_max_lines_per_second
+            .map_or(0, NonZeroU32::get),
         "edge protections configured"
     );
     if let Some(idle_heads) =
         idle_heads_exhausting_budget(max_inflight_request_bytes, max_request_bytes, max_connections)
     {
-        warn!(
-            target: "gateway",
-            idle_heads,
-            max_connections = max_connections.get(),
-            "this many idle requests, fewer than --max-connections, can hold the whole in-flight \
-             byte budget until the request deadline by sending only their headers, and every \
-             other request body is then refused; raise --max-inflight-request-bytes, or lower \
-             --max-request-bytes or --max-connections"
-        );
+        if one_prefix_holds_budget(idle_heads, max_connections_per_ip) {
+            warn!(
+                target: "gateway",
+                idle_heads,
+                max_connections_per_ip = max_connections_per_ip.map_or(0, NonZeroUsize::get),
+                "one client prefix can hold the whole in-flight byte budget with this many idle \
+                 requests, within --max-connections-per-ip, until the request deadline by sending \
+                 only their headers, and every other request body is then refused; raise \
+                 --max-inflight-request-bytes, or lower --max-request-bytes or \
+                 --max-connections-per-ip"
+            );
+        } else {
+            warn!(
+                target: "gateway",
+                idle_heads,
+                max_connections = max_connections.get(),
+                "this many idle requests, fewer than --max-connections, can hold the whole \
+                 in-flight byte budget until the request deadline by sending only their headers, \
+                 and every other request body is then refused; raise \
+                 --max-inflight-request-bytes, or lower --max-request-bytes or --max-connections"
+            );
+        }
     }
     if query_upstream.is_none() && denied_method_prefixes.is_empty() {
         warn!(
@@ -261,14 +289,15 @@ pub(crate) async fn run(settings: Settings) -> eyre::Result<()> {
         None
     };
 
-    // The poller probes the query upstream with the proxy client, so the probe
-    // travels like a redirected read, through the same DNS cache and lookup
-    // cap, and with the same `--redirect-queries-header`.
-    let query_probe = query_upstream.clone().map(|url| QueryProbe {
-        url,
-        client: proxy_client.clone(),
-        query_header: query_header.clone(),
-    });
+    // The poller probes the query upstream with the query route's client, so
+    // the probe travels like a redirected read, with the same read timeout,
+    // through the proxy's DNS cache and lookup cap, and with the same
+    // `--redirect-queries-header`. With a redirect, `route_clients` always
+    // builds that client.
+    let query_probe = query_upstream
+        .clone()
+        .zip(query_client.clone())
+        .map(|(url, client)| QueryProbe { url, client, query_header: query_header.clone() });
     // submissions are remembered only for the redirect's hash routing
     let recent_submissions = recent_submission_ttl
         .filter(|_| query_upstream.is_some())
@@ -281,7 +310,8 @@ pub(crate) async fn run(settings: Settings) -> eyre::Result<()> {
         recent_submissions,
         denied_method_prefixes: denied_method_prefixes.into(),
         max_batch_len,
-        query_request_timeout,
+        query_http: query_client,
+        upstream_request_timeout,
         submission_slots: inflight_slots(max_inflight_submissions),
         query_slots: inflight_slots(max_inflight_queries),
         upstream_slots: inflight_slots(max_upstream_inflight),
@@ -316,7 +346,7 @@ pub(crate) async fn run(settings: Settings) -> eyre::Result<()> {
         // the body read gets a header-scale budget on top, so a trickled body
         // cannot hold a request slot indefinitely. (`into_settings` guarantees
         // any connection-lifetime cap is at least this deadline.)
-        request_deadline: upstream_request_timeout.saturating_add(header_read_timeout),
+        request_deadline: request_deadline(upstream_request_timeout, header_read_timeout),
         max_connections,
         max_connections_per_ip,
         // The per-client cap keys clients by the rate limiter's prefix
@@ -324,7 +354,7 @@ pub(crate) async fn run(settings: Settings) -> eyre::Result<()> {
         client_prefix: rate_limit_prefix,
         tcp_user_timeout,
         max_connection_duration,
-        max_request_bytes,
+        max_request_bytes: max_request_bytes.get(),
         // `into_settings` rejects `--proxy-protocol` with no peer to read from
         proxy_protocol: proxy_protocol.map(Arc::new),
         max_inflight_request_bytes,
@@ -341,7 +371,7 @@ pub(crate) async fn run(settings: Settings) -> eyre::Result<()> {
         );
     }
 
-    // Summarize a burst of throttled per-request warnings once it stops, so
+    // Summarize a burst of throttled warnings once it stops, so
     // its count does not wait for the call site's next event.
     spawner.spawn_critical_task(
         "warning-summaries",
@@ -381,24 +411,28 @@ pub(crate) async fn run(settings: Settings) -> eyre::Result<()> {
     Ok(())
 }
 
-/// The gateway's two upstream HTTP clients, both started from
-/// [`client_builder`], so they share the TLS settings and the no-proxy policy,
-/// and neither follows a redirect.
+/// The gateway's upstream HTTP clients, all started from [`client_builder`]'s
+/// settings, so they share the TLS settings and the no-proxy policy, and none
+/// follows a redirect.
 #[derive(Debug)]
 pub(crate) struct UpstreamClients {
-    /// Forwards client requests to the workers and the query upstream, and
-    /// probes the query upstream for the poller (see [`proxy_client`] and
-    /// [`QueryProbe`]).
+    /// Forwards client requests to the workers, and to the query upstream when
+    /// `query` is `None` (see [`route_clients`]).
     pub(crate) proxy: Client,
+    /// Forwards client requests to the `--redirect-queries` upstream and
+    /// probes it for the poller (see [`QueryProbe`]), or `None` without a
+    /// redirect.
+    pub(crate) query: Option<Client>,
     /// Polls the workers' readiness endpoints (see [`readiness_client`]).
     pub(crate) readiness: Client,
 }
 
 impl UpstreamClients {
-    /// Build both clients from `settings`, each with its own
-    /// [`crate::dns::CachingResolver`] over `lookup` (see [`client_builder`]):
-    /// its own cache, and its own cap of `--max-concurrent-dns-lookups`
-    /// lookups at once.
+    /// Build the clients from `settings`: the forwarding clients over one
+    /// shared [`crate::dns::CachingResolver`] (see [`route_clients`]) and the
+    /// readiness client over its own (see [`client_builder`]), each resolver
+    /// over `lookup` with its own cache and its own cap of
+    /// `--max-concurrent-dns-lookups` lookups at once.
     ///
     /// The readiness client must not share the proxy's resolver. Query traffic
     /// to hosts that resolve slowly can hold every proxy lookup permit, and a
@@ -407,26 +441,29 @@ impl UpstreamClients {
     /// listener closes the connection after each response, so every poll opens
     /// a new connection and goes through the resolver.
     pub(crate) fn new(settings: &Settings, lookup: Arc<dyn LookupHost>) -> reqwest::Result<Self> {
+        let routes = route_clients(settings, Arc::clone(&lookup))?;
         Ok(Self {
-            proxy: proxy_client(
-                client_builder(settings, Arc::clone(&lookup)),
-                settings.upstream_request_timeout,
-            )?,
+            proxy: routes.worker,
+            query: routes.query,
             readiness: readiness_client(client_builder(settings, lookup))?,
         })
     }
 }
 
 /// Fail startup when an `https` upstream would be verified against the native
-/// root store alone and that store is empty.
+/// root store alone and that store is empty, and warn when an empty store
+/// leaves `--upstream-ca-cert` as the only trusted root.
 ///
 /// reqwest builds a client over an empty native root store without complaint,
 /// so on a host without CA certificates every `https` call would fail at
 /// runtime instead, and a worker would just never become ready. The check
 /// applies only when some configured URL (a worker's RPC or readiness URL, or
-/// `--redirect-queries`) is `https` and no `--upstream-ca-cert` is given: the
-/// extra CA is something to verify against on its own. `native_root_count`
-/// loads the store, and is called only when the check applies.
+/// `--redirect-queries`) is `https`. Without `--upstream-ca-cert` an empty
+/// store is an error. With it the gateway starts, because private-CA workers
+/// verify against that CA alone, but warns: the one client trust store serves
+/// every upstream, so an `https` `--redirect-queries` signed by a public CA
+/// would then fail every call. `native_root_count` loads the store, and is
+/// called only when the check applies.
 fn ensure_root_store(
     settings: &Settings,
     native_root_count: impl FnOnce() -> usize,
@@ -437,15 +474,24 @@ fn ensure_root_store(
         .flat_map(|upstream| [&upstream.rpc_url, &upstream.readiness_url])
         .chain(settings.query_upstream.as_ref())
         .any(|url| url.scheme() == "https");
-    if !https || !settings.upstream_ca_certs.is_empty() {
+    if !https {
         return Ok(());
     }
-    eyre::ensure!(
-        native_root_count() > 0,
-        "an https upstream is configured but the system root store holds no CA certificates, \
-         so every https call would fail; install the ca-certificates package, point \
-         SSL_CERT_FILE or SSL_CERT_DIR at a CA bundle, or pass --upstream-ca-cert"
-    );
+    let native = native_root_count();
+    if settings.upstream_ca_certs.is_empty() {
+        eyre::ensure!(
+            native > 0,
+            "an https upstream is configured but the system root store holds no CA certificates, \
+             so every https call would fail; install the ca-certificates package, point \
+             SSL_CERT_FILE or SSL_CERT_DIR at a CA bundle, or pass --upstream-ca-cert"
+        );
+    } else if native == 0 {
+        warn!(
+            target: "gateway",
+            "the system root store holds no CA certificates, so every https upstream, \
+             --redirect-queries included, must chain to --upstream-ca-cert"
+        );
+    }
     Ok(())
 }
 
@@ -466,17 +512,25 @@ fn native_root_count() -> usize {
 /// Each such request reserves up to `--max-request-bytes` from its head (the
 /// whole cap when chunked) and keeps it until the request deadline, so this
 /// many idle connections refuse every other request body. Returns `None` when
-/// the connection cap binds first, the budget is unlimited, or the cap is `0`
-/// (nothing can then be reserved).
+/// the connection cap binds first or the budget is unlimited.
 fn idle_heads_exhausting_budget(
     max_inflight_request_bytes: Option<NonZeroU32>,
-    max_request_bytes: usize,
+    max_request_bytes: NonZeroUsize,
     max_connections: NonZeroUsize,
 ) -> Option<usize> {
     let budget = usize::try_from(max_inflight_request_bytes?.get()).unwrap_or(usize::MAX);
-    let cap = NonZeroUsize::new(max_request_bytes)?;
-    let idle_heads = budget.div_ceil(cap.get());
+    let idle_heads = budget.div_ceil(max_request_bytes.get());
     (idle_heads < max_connections.get()).then_some(idle_heads)
+}
+
+/// Whether one client prefix may open the `idle_heads` connections that hold
+/// the whole in-flight byte budget (see [`idle_heads_exhausting_budget`]): true
+/// when `--max-connections-per-ip` is set and allows at least that many.
+fn one_prefix_holds_budget(
+    idle_heads: usize,
+    max_connections_per_ip: Option<NonZeroUsize>,
+) -> bool {
+    max_connections_per_ip.is_some_and(|per_ip| idle_heads <= per_ip.get())
 }
 
 /// The startup chain-id check (see [`check_chain_ids`]) as a task for [`run`]
@@ -486,7 +540,8 @@ fn idle_heads_exhausting_budget(
 /// every task it tracks before the process exits, so on a SIGTERM, or when a
 /// critical task such as the server ends (a failed bind), a check still
 /// waiting on a slow upstream stops at once and logs nothing instead of
-/// holding the exit for up to `--upstream-request-timeout`.
+/// holding the exit while a slow upstream answers: each client's read timeout
+/// bounds only the head and each gap in the body, not the whole call.
 fn chain_id_check_task(
     state: &AppState,
     upstreams: &[UpstreamWorker],
@@ -494,13 +549,21 @@ fn chain_id_check_task(
 ) -> Option<impl Future<Output = Result<(), TaskError>> + Send + 'static> {
     let worker = upstreams.first()?.rpc_url.clone();
     let query = state.query_upstream.clone()?;
-    let client = state.http.clone();
+    // the clients forwarded calls use (see `proxy::forward`)
+    let worker_client = state.http.clone();
+    let query_client = state.query_http.clone().unwrap_or_else(|| state.http.clone());
     let query_header = state.query_header.clone();
     let shutdown = shutdown.subscribe();
     Some(async move {
         tokio::select! {
             () = shutdown => {}
-            check = check_chain_ids(&client, &worker, &query, query_header.as_ref()) => {
+            check = check_chain_ids(
+                &worker_client,
+                &query_client,
+                &worker,
+                &query,
+                query_header.as_ref(),
+            ) => {
                 log_chain_id_check(&check, &worker, &query);
             }
         }
@@ -535,19 +598,22 @@ pub(crate) enum ChainIdCheck {
 /// Ask the first worker and the query upstream for their chain ids, both at
 /// once, and decide what to log.
 ///
-/// Each call goes through `client`, the proxy client, so
-/// `--upstream-request-timeout` bounds it, and only the query call carries
-/// `query_header` (see [`fetch_chain_id`]). A failed call is a decision like
-/// any other; it never fails startup.
+/// The worker call goes through `worker_client` and the query call through
+/// `query_client`, the clients forwarded calls use, so
+/// `--upstream-request-timeout` and `--query-request-timeout` bound the head
+/// and each gap of the answer, not the whole call, and only the query call
+/// carries `query_header` (see [`fetch_chain_id`]). A failed call is a
+/// decision like any other; it never fails startup.
 pub(crate) async fn check_chain_ids(
-    client: &Client,
+    worker_client: &Client,
+    query_client: &Client,
     worker: &Url,
     query: &Url,
     query_header: Option<&QueryHeader>,
 ) -> ChainIdCheck {
     let (worker, query) = tokio::join!(
-        fetch_chain_id(client, Route::Worker, worker, query_header),
-        fetch_chain_id(client, Route::Query, query, query_header),
+        fetch_chain_id(worker_client, Route::Worker, worker, query_header),
+        fetch_chain_id(query_client, Route::Query, query, query_header),
     );
     match (worker, query) {
         (Ok(worker), Ok(query)) if worker == query => ChainIdCheck::Match(worker),
@@ -632,16 +698,22 @@ async fn run_poller_until_listener_closes(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{cli::Cli, proxy::UpstreamClientBuilder};
+    use crate::{
+        cli::try_parse_test_argv,
+        proxy::{proxy_client, UpstreamClientBuilder},
+    };
     use axum::{
         http::{HeaderMap, StatusCode},
         routing::{get, post},
         Json, Router,
     };
-    use clap::Parser as _;
     use std::{
+        io,
         net::SocketAddr,
-        sync::atomic::{AtomicBool, Ordering},
+        sync::{
+            atomic::{AtomicBool, Ordering},
+            Mutex, PoisonError,
+        },
         time::{Duration, Instant},
     };
     use tokio::{
@@ -652,7 +724,7 @@ mod tests {
 
     fn settings(flags: &[&str]) -> Settings {
         let argv = std::iter::once("worker-gateway").chain(flags.iter().copied());
-        Cli::parse_from(argv).into_settings().expect("settings")
+        try_parse_test_argv(argv).expect("argv parses").into_settings().expect("settings")
     }
 
     #[test]
@@ -676,15 +748,78 @@ mod tests {
             settings(&[HTTP_RPC, HTTP_READY, "--redirect-queries=https://rpc.example.com/"]);
         assert!(ensure_root_store(&https_redirect, || 0).is_err());
 
-        // plain http everywhere, or an extra CA, never loads the store
+        // plain http everywhere never loads the store
         let http_only = settings(&[HTTP_RPC, HTTP_READY]);
         assert!(ensure_root_store(&http_only, || panic!("the store must not be loaded")).is_ok());
+        Ok(())
+    }
+
+    /// In-memory log sink for a scoped fmt subscriber.
+    #[derive(Clone, Default)]
+    struct Captured(Arc<Mutex<Vec<u8>>>);
+
+    impl Captured {
+        fn text(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().unwrap_or_else(PoisonError::into_inner))
+                .into_owned()
+        }
+    }
+
+    impl io::Write for Captured {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap_or_else(PoisonError::into_inner).extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn custom_ca_with_an_empty_store_starts() -> eyre::Result<()> {
         let ca_file = tempfile::NamedTempFile::new()?;
         let ca = rcgen::generate_simple_self_signed(vec!["ca.test".to_string()])?;
         std::fs::write(ca_file.path(), ca.cert.pem())?;
         let ca_flag = format!("--upstream-ca-cert={}", ca_file.path().display());
-        let with_ca = settings(&[HTTPS_RPC, HTTPS_READY, ca_flag.as_str()]);
-        assert!(ensure_root_store(&with_ca, || panic!("the store must not be loaded")).is_ok());
+        let with_ca = settings(&[
+            "--upstream-rpc-url=https://10.0.0.7:8545",
+            "--upstream-readiness-url=https://10.0.0.7:8551/health/workers",
+            "--redirect-queries=https://rpc.example.com/",
+            ca_flag.as_str(),
+        ]);
+
+        const WARNING: &str = "must chain to --upstream-ca-cert";
+        let run = |native: usize| {
+            let captured = Captured::default();
+            let writer = captured.clone();
+            let subscriber = tracing_subscriber::fmt()
+                .with_ansi(false)
+                .with_writer(move || writer.clone())
+                .finish();
+            let loaded = std::cell::Cell::new(false);
+            let result = tracing::subscriber::with_default(subscriber, || {
+                ensure_root_store(&with_ca, || {
+                    loaded.set(true);
+                    native
+                })
+            });
+            (result, loaded.get(), captured.text())
+        };
+        // the store is still loaded, so an empty one can be reported, but the
+        // private CA alone lets the workers verify, so startup goes on, with a
+        // warning
+        let (result, loaded, logs) = run(0);
+        assert!(result.is_ok(), "{result:?}");
+        assert!(loaded, "the store must be loaded when an https url is configured");
+        let line = logs
+            .lines()
+            .find(|l| l.contains(WARNING))
+            .unwrap_or_else(|| panic!("no warning: {logs}"));
+        assert!(line.contains(" WARN "), "{line}");
+        // a populated store with a custom CA starts without the warning
+        let (result, _, logs) = run(1);
+        assert!(result.is_ok() && !logs.contains(WARNING), "{logs}");
         Ok(())
     }
 
@@ -693,9 +828,23 @@ mod tests {
     fn idle_heads(budget_mib: u32, cap: usize, connections: usize) -> Option<usize> {
         idle_heads_exhausting_budget(
             NonZeroU32::new(budget_mib * 1024 * 1024),
-            cap,
+            NonZeroUsize::new(cap).expect("nonzero"),
             NonZeroUsize::new(connections).expect("nonzero"),
         )
+    }
+
+    #[test]
+    fn one_prefix_holding_the_budget_is_reported() {
+        let per_ip = NonZeroUsize::new(32);
+        assert!(one_prefix_holds_budget(32, per_ip), "at the per-ip cap");
+        assert!(one_prefix_holds_budget(1, per_ip));
+        assert!(!one_prefix_holds_budget(33, per_ip), "above the per-ip cap");
+        assert!(!one_prefix_holds_budget(1, None), "no per-ip cap");
+        // a 16 MiB --max-request-bytes against the default 512 MiB budget: 32
+        // idle requests, which one prefix may hold at a per-ip cap of 32
+        let idle_heads = idle_heads(512, 16 * MIB, 500).expect("below the connection cap");
+        assert_eq!(idle_heads, 32);
+        assert!(one_prefix_holds_budget(idle_heads, per_ip));
     }
 
     #[test]
@@ -709,9 +858,8 @@ mod tests {
         assert_eq!(idle_heads(256, MIB, 256), None);
         // more connections than the default budget covers
         assert_eq!(idle_heads(512, MIB, 2000), Some(512));
-        // an unlimited budget or a zero cap cannot be exhausted from heads
+        // an unlimited budget cannot be exhausted from heads
         assert_eq!(idle_heads(0, MIB, 500), None);
-        assert_eq!(idle_heads(512, 0, 500), None);
     }
 
     /// The header the query upstream requires, and the secret value it holds.
@@ -770,22 +918,23 @@ mod tests {
     #[tokio::test]
     async fn startup_warns_when_chain_ids_differ() {
         let header = api_key_header();
+        let client = client();
         let worker = url(chain_id_mock(CHAIN_2017, false).await);
 
         // the query upstream serves another chain: a warning with both ids
         let other_chain = url(chain_id_mock(CHAIN_1, true).await);
-        let check = check_chain_ids(&client(), &worker, &other_chain, Some(&header)).await;
+        let check = check_chain_ids(&client, &client, &worker, &other_chain, Some(&header)).await;
         assert_eq!(check, ChainIdCheck::Mismatch { worker: 2017, query: 1 });
 
         // the same chain: no warning
         let same_chain = url(chain_id_mock(CHAIN_2017, true).await);
-        let check = check_chain_ids(&client(), &worker, &same_chain, Some(&header)).await;
+        let check = check_chain_ids(&client, &client, &worker, &same_chain, Some(&header)).await;
         assert_eq!(check, ChainIdCheck::Match(2017));
 
         // the mocks only answer when the key reaches the query upstream and
         // not the worker, so the two outcomes above also prove its routing;
         // without the key the query upstream refuses
-        let check = check_chain_ids(&client(), &worker, &same_chain, None).await;
+        let check = check_chain_ids(&client, &client, &worker, &same_chain, None).await;
         assert_eq!(
             check,
             ChainIdCheck::Unchecked {
@@ -803,6 +952,7 @@ mod tests {
         // nothing listens on port 1
         let down = Url::parse("http://user:pass@127.0.0.1:1/k3y?token=t0k3n").expect("url");
         let junk = url(serve_mock(Router::new().route("/", post(|| async { "not json" }))).await);
+        let client = client();
 
         for (worker, query, worker_fails, query_fails) in [
             (&worker, &down, false, true),
@@ -810,7 +960,7 @@ mod tests {
             (&down, &down, true, true),
             (&worker, &junk, false, true),
         ] {
-            let check = check_chain_ids(&client(), worker, query, Some(&header)).await;
+            let check = check_chain_ids(&client, &client, worker, query, Some(&header)).await;
             let ChainIdCheck::Unchecked { worker: worker_reason, query: query_reason } = check
             else {
                 panic!("a failed call must leave the chains unchecked, got {check:?}");
@@ -827,7 +977,7 @@ mod tests {
         }
 
         // an upstream that accepts the call and never answers is cut off by the
-        // proxy client's request timeout (`--upstream-request-timeout`)
+        // query client's read timeout
         let hung = url(serve_mock(Router::new().route(
             "/",
             post(|| async {
@@ -842,7 +992,7 @@ mod tests {
         )
         .expect("client");
         let started = Instant::now();
-        let check = check_chain_ids(&client, &worker, &hung, Some(&header)).await;
+        let check = check_chain_ids(&client, &client, &worker, &hung, Some(&header)).await;
         assert!(started.elapsed() < Duration::from_secs(5), "took {:?}", started.elapsed());
         assert!(
             matches!(check, ChainIdCheck::Unchecked { worker: None, query: Some(_) }),
@@ -876,7 +1026,8 @@ mod tests {
             recent_submissions: None,
             denied_method_prefixes: Arc::from([]),
             max_batch_len: None,
-            query_request_timeout: None,
+            query_http: None,
+            upstream_request_timeout: Duration::from_secs(5),
             submission_slots: inflight_slots(0),
             query_slots: inflight_slots(0),
             upstream_slots: inflight_slots(0),
@@ -949,6 +1100,39 @@ mod tests {
             .await
             .expect("the check ends once shutdown fires")
             .expect("the task does not panic")
+            .expect("the task succeeds");
+    }
+
+    #[tokio::test]
+    async fn chain_id_check_task_sends_the_query_call_through_the_query_client() {
+        let worker = url(chain_id_mock(CHAIN_2017, false).await);
+        // a query upstream that accepts the call and never answers
+        let hung = url(serve_mock(
+            Router::new()
+                .route("/", post(|| async { std::future::pending::<&'static str>().await })),
+        )
+        .await);
+        // the worker client waits far past the bound below, the query client
+        // gives up after 200 ms, so the check ends in time only when the
+        // query call goes through the query client
+        let slow = proxy_client(
+            UpstreamClientBuilder::for_test(Duration::from_secs(2)),
+            Duration::from_secs(600),
+        )
+        .expect("client");
+        let quick = proxy_client(
+            UpstreamClientBuilder::for_test(Duration::from_secs(2)),
+            Duration::from_millis(200),
+        )
+        .expect("client");
+        let workers = [worker_at(&worker)];
+        let shutdown = ShutdownNotifier::new();
+        let mut app_state = state(&workers, Some(hung), slow);
+        app_state.query_http = Some(quick);
+        let task = chain_id_check_task(&app_state, &workers, &shutdown).expect("a check task");
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("the query call used the worker client")
             .expect("the task succeeds");
     }
 

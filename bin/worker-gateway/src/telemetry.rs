@@ -7,32 +7,43 @@
 //! is installed and every macro below is a cheap no-op against the global noop
 //! recorder.
 //!
-//! Three recorders partition every proxied request:
+//! Four recorders partition every proxied request:
 //!
 //! - [`record_forwarded`] bumps `tn_worker_gateway_requests_total{outcome="forwarded"}` for a
 //!   request handed to an upstream (a worker, or the `--redirect-queries` endpoint) whose answer is
 //!   relayed;
 //! - [`record_rejection`] bumps `tn_worker_gateway_requests_total{outcome="rejected"}` plus
 //!   `tn_worker_gateway_rejections_total{reason=...}` for a request the gateway answered with a
-//!   JSON-RPC error;
+//!   JSON-RPC error, a submission whose answer was lost after the worker's `2xx` included;
 //! - [`record_upstream_error`] bumps `tn_worker_gateway_requests_total{outcome="upstream_error"}`
 //!   plus `tn_worker_gateway_rejections_total{reason="upstream_error"}` for a request whose
-//!   upstream answered an error status without a JSON body, which the gateway replaced with a
-//!   JSON-RPC error.
+//!   upstream's answer carried no JSON-RPC body to pass on (an error status without a JSON body, an
+//!   answer from the `--redirect-queries` endpoint without one, or a `1xx`, `204`, `205` or `304`),
+//!   which the gateway replaced with a JSON-RPC error;
+//! - [`record_cancelled`] bumps `tn_worker_gateway_requests_total{outcome="cancelled"}` for a
+//!   request whose connection closed before the gateway answered it (a client disconnect, the
+//!   connection-lifetime cap or shutdown dropped it mid-flight).
 //!
-//! Their sum is the total proxied-request count, and `rejections_total` breaks
-//! the non-forwarded side down by reason. The gateway's own `/health` and `/ready`
-//! probes are not proxied and are deliberately not counted, so the in-flight
+//! Their sum is the total proxied-request count, a cancelled request included,
+//! and `rejections_total` breaks the non-forwarded side down by reason. The gateway's own `/health`
+//! and `/ready` probes are not proxied and are deliberately not counted, so the in-flight
 //! gauge and request counters reflect real client load only.
+//! A probe path requested with a method other than `GET` or `HEAD` is counted,
+//! though: its `405` is a `method_not_post` rejection, and on the client
+//! listener a `429` before it a `rate_limited` one.
 //!
-//! [`Throttle`] rate-limits a per-request log call site, so request volume
-//! cannot drive log volume; the counters above still count every request.
+//! [`Throttle`] rate-limits a log call site (one hit per request, or per
+//! connection for the accept loops), so request volume cannot drive log volume;
+//! the counters above still count every request.
 //!
-//! [`record_routed`] counts every forward attempt by route and result, which
-//! splits the load between the worker and the query upstream (a relayed body
-//! that fails mid-stream is counted again, as `body_failed`, and a worker's
-//! answer to a submission that is lost while it is read whole counts as
-//! `body_failed` alone), and
+//! [`record_routed`] counts every forward attempt that resolves, by route and
+//! result (an attempt the request deadline or a client disconnect drops before
+//! its response head records none: it shows as
+//! `rejections_total{reason="request_timeout"}` or as
+//! `requests_total{outcome="cancelled"}`), which splits the load between the
+//! worker and the query upstream (a forwarded answer whose body then fails is
+//! counted again, as `body_failed`: a relayed body that fails mid-stream, or a
+//! worker's answer to a submission that is lost while it is read whole), and
 //! [`record_mixed_batch`] counts the batches sent to the query upstream only
 //! because they mixed submissions with other calls.
 //!
@@ -49,6 +60,18 @@
 //! [`record_connection_refused`] counts inbound connections the accept loop
 //! closed without serving, by `reason`. They never carry a request to the
 //! proxy, so they appear in neither request counter.
+//!
+//! [`record_accept_error`] counts failed `accept()` calls on either listener,
+//! by `listener` and `kind`; its warnings are throttled, the counter is not.
+//!
+//! [`record_rate_limit_overflow`] counts the charges the rate limiter meters on
+//! the one overflow bucket shared by the clients a full per-IP table cannot
+//! track (see [`crate::ratelimit`]).
+//!
+//! [`ConnectionSlot`] pairs an accepted client connection's
+//! `--max-connections` permit with `tn_worker_gateway_open_connections`, so the
+//! gauge always equals the slots held; at the cap, new connections wait in the
+//! kernel's accept backlog.
 
 use std::{
     sync::{Arc, Mutex, PoisonError},
@@ -69,12 +92,13 @@ use crate::proxy::UpstreamOrigin;
 /// gateway's own CPU idle.
 const INFLIGHT_REQUESTS: &str = "tn_worker_gateway_inflight_requests";
 
-/// Proxied requests by terminal `outcome` (`forwarded`, `rejected` or
-/// `upstream_error`).
+/// Proxied requests by terminal `outcome` (`forwarded`, `rejected`,
+/// `upstream_error` or `cancelled`).
 const REQUESTS_TOTAL: &str = "tn_worker_gateway_requests_total";
 
 /// Rejected and upstream-error proxied requests by `reason` (the
-/// `GatewayError` reason label).
+/// `GatewayError` reason label). Of the two alike, `method_not_allowed` is the
+/// `403` method policy and `method_not_post` HTTP's `405`.
 const REJECTIONS_TOTAL: &str = "tn_worker_gateway_rejections_total";
 
 /// End-to-end proxied-request duration, in seconds, until the response body has
@@ -87,10 +111,12 @@ const REQUEST_DURATION_SECONDS: &str = "tn_worker_gateway_request_duration_secon
 /// so two nodes whose workers share an id keep separate series.
 const UPSTREAM_READY: &str = "tn_worker_gateway_upstream_ready";
 
-/// Forward attempts by `route` (`worker` or `query`) and `result`
-/// (`forwarded`, `upstream_error`, `unreachable` or `timeout`), plus
-/// `body_failed` for a forwarded response whose body then failed mid-stream,
-/// or a worker's answer to a submission lost while it was read whole.
+/// Forward attempts that resolved, by `route` (`worker` or `query`) and
+/// `result` (`forwarded`, `upstream_error`, `unreachable` or `timeout`), plus
+/// `body_failed` for a forwarded response whose body then failed mid-stream, or
+/// a worker's answer to a submission lost while it was read whole. An attempt
+/// the request deadline or a client disconnect drops before its head has no
+/// result here.
 const ROUTED_REQUESTS_TOTAL: &str = "tn_worker_gateway_routed_requests_total";
 
 /// Batches sent whole to the query upstream because they mixed submissions
@@ -124,6 +150,29 @@ const DNS_LOOKUPS_TOTAL: &str = "tn_worker_gateway_dns_lookups_total";
 /// connections; `proxy_header`: a `--proxy-protocol` peer's PROXY header was
 /// missing, malformed or late).
 const CONNECTIONS_REFUSED_TOTAL: &str = "tn_worker_gateway_connections_refused_total";
+
+/// Client-listener connections holding a `--max-connections` slot. While it
+/// reads the cap, new connections wait in the kernel's accept backlog. The
+/// `--probe-addr` listener has no cap and is not counted.
+const OPEN_CONNECTIONS: &str = "tn_worker_gateway_open_connections";
+
+/// Sampled access-log lines the line ceiling
+/// (`--access-log-max-lines-per-second`) dropped.
+const ACCESS_LOG_SUPPRESSED_TOTAL: &str = "tn_worker_gateway_access_log_suppressed_total";
+
+/// Failed `accept()` calls, by `listener` (`client`: `--listen-addr`;
+/// `probe`: `--probe-addr`) and `kind` (`connection`: an error about the one
+/// connection being accepted, retried at once; `resource`: one about the
+/// process, such as fd exhaustion, which the accept loop backs off from). A
+/// failed accept holds no connection, so no connection series counts it.
+const ACCEPT_ERRORS_TOTAL: &str = "tn_worker_gateway_accept_errors_total";
+
+/// Charges the rate limiter metered on its per-IP overflow bucket (a request's
+/// first call at the edge, or a batch's calls beyond the first) because the
+/// full per-IP table could not track their client, whether that bucket admitted
+/// them or not. A non-zero rate means those clients are sharing one client's
+/// budget until a sweep frees idle entries.
+const RATE_LIMIT_OVERFLOW_TOTAL: &str = "tn_worker_gateway_rate_limit_overflow_total";
 
 /// How long a [`Throttle`] stays quiet after it lets a line through.
 const THROTTLE_WINDOW: Duration = Duration::from_secs(10);
@@ -200,6 +249,32 @@ impl Drop for InFlightSlot {
     }
 }
 
+/// RAII guard for one accepted client connection's `--max-connections` slot:
+/// the semaphore permit plus the open-connections gauge that counts it.
+///
+/// The accept loop builds it only once a connection is accepted, so a failed
+/// accept never counts, and the connection's task drops it when the
+/// connection ends, lowering the gauge as the permit goes back, so the gauge
+/// cannot drift from the slots actually held.
+pub(crate) struct ConnectionSlot {
+    /// The held permit; dropping it frees the slot.
+    _permit: OwnedSemaphorePermit,
+}
+
+impl ConnectionSlot {
+    /// Count the connection accepted under `permit` as open.
+    pub(crate) fn open(permit: OwnedSemaphorePermit) -> Self {
+        gauge!(OPEN_CONNECTIONS).increment(1.0);
+        Self { _permit: permit }
+    }
+}
+
+impl Drop for ConnectionSlot {
+    fn drop(&mut self) {
+        gauge!(OPEN_CONNECTIONS).decrement(1.0);
+    }
+}
+
 /// RAII guard covering the bytes one request holds against the in-flight byte
 /// budget.
 ///
@@ -238,18 +313,26 @@ pub(crate) fn record_rejection(reason: &'static str) {
     counter!(REJECTIONS_TOTAL, "reason" => reason).increment(1);
 }
 
-/// Record a request whose upstream answered an error status without a JSON
-/// body, which the gateway replaced with a JSON-RPC error. It is kept apart
-/// from [`record_rejection`]'s `rejected` outcome because the gateway did
-/// forward it: the upstream refused it.
+/// Record a request whose upstream's answer carried no JSON-RPC body to pass
+/// on (an error status without a JSON body, an answer from the query upstream
+/// without one, or a `1xx`, `204`, `205` or `304`), which the gateway replaced with a
+/// JSON-RPC error. It is kept apart from [`record_rejection`]'s `rejected`
+/// outcome because the gateway did forward it and the upstream answered.
 pub(crate) fn record_upstream_error(reason: &'static str) {
     counter!(REQUESTS_TOTAL, "outcome" => "upstream_error").increment(1);
     counter!(REJECTIONS_TOTAL, "reason" => reason).increment(1);
 }
 
-/// Record one forward attempt on `route` (`worker` or `query`) with its
-/// `result` (`forwarded`, `upstream_error`, `unreachable` or `timeout`), or a
-/// response whose body then failed (`body_failed`).
+/// Record a request dropped before the gateway answered it: its connection
+/// closed (a client disconnect, the connection-lifetime cap or shutdown)
+/// while the request was in flight, so no other outcome was recorded.
+pub(crate) fn record_cancelled() {
+    counter!(REQUESTS_TOTAL, "outcome" => "cancelled").increment(1);
+}
+
+/// Record one resolved forward attempt on `route` (`worker` or `query`) with
+/// its `result` (`forwarded`, `upstream_error`, `unreachable` or `timeout`),
+/// or, after its `forwarded`, an answer whose body then failed (`body_failed`).
 pub(crate) fn record_routed(route: &'static str, result: &'static str) {
     counter!(ROUTED_REQUESTS_TOTAL, "route" => route, "result" => result).increment(1);
 }
@@ -264,6 +347,24 @@ pub(crate) fn record_mixed_batch() {
 /// by a stable machine-readable `reason`.
 pub(crate) fn record_connection_refused(reason: &'static str) {
     counter!(CONNECTIONS_REFUSED_TOTAL, "reason" => reason).increment(1);
+}
+
+/// Record a sampled access-log line dropped because the second's line ceiling
+/// was already reached.
+pub(crate) fn record_access_log_suppressed() {
+    counter!(ACCESS_LOG_SUPPRESSED_TOTAL).increment(1);
+}
+
+/// Record a failed `accept()` on `listener` (`client` or `probe`), of
+/// `kind` `connection` or `resource`.
+pub(crate) fn record_accept_error(listener: &'static str, kind: &'static str) {
+    counter!(ACCEPT_ERRORS_TOTAL, "listener" => listener, "kind" => kind).increment(1);
+}
+
+/// Record a charge metered on the per-IP overflow bucket, admitted or not,
+/// because the full per-IP table could not track its client.
+pub(crate) fn record_rate_limit_overflow() {
+    counter!(RATE_LIMIT_OVERFLOW_TOTAL).increment(1);
 }
 
 /// Record one name resolution with its `result` (`hit`, `miss`, `error` or
@@ -283,7 +384,7 @@ pub(crate) fn set_upstream_ready(worker_id: u16, rpc_url: &Url, ready: bool) {
     .set(if ready { 1.0 } else { 0.0 });
 }
 
-/// Rate limit for one per-request log call site.
+/// Rate limit for one log call site (hit per request or per connection).
 ///
 /// A rejection a client can trigger at will (a loop marker, a junk
 /// transaction) or a failing upstream would otherwise write one warning per
@@ -352,11 +453,13 @@ impl Throttle {
 }
 
 /// Every [`THROTTLE_WINDOW`] until `shutdown` fires, write one summary line
-/// for each throttle whose suppressed count has waited a whole window.
+/// for each throttle whose suppressed count has waited a whole window, and at
+/// shutdown one last line for every throttle with a pending count.
 ///
 /// Without it, a burst that stops inside its window would go unreported until
 /// the call site's next event, however late that comes. A burst is therefore
-/// summarized at most two windows after its first line.
+/// summarized at most two windows after its first line, or at shutdown if that
+/// comes first.
 pub(crate) async fn run_throttle_summaries(
     throttles: &'static [&'static Throttle],
     shutdown: Noticer,
@@ -365,21 +468,31 @@ pub(crate) async fn run_throttle_summaries(
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     // consume the immediate first tick: nothing can be due at startup
     ticker.tick().await;
+    // set on shutdown: one last pass then writes every pending count, due or
+    // not, so a burst in the last windows is not dropped
+    let mut stopping = false;
     loop {
         tokio::select! {
-            () = &shutdown => break,
+            () = &shutdown, if !stopping => {
+                stopping = true;
+                ticker.reset_immediately();
+            }
             _ = ticker.tick() => {
-                let now = Instant::now();
+                // a whole window ahead at shutdown, so every pending count is due
+                let now = if stopping { Instant::now() + THROTTLE_WINDOW } else { Instant::now() };
                 throttles.iter().for_each(|throttle| {
                     if let Some(suppressed) = throttle.flush_at(now) {
                         tracing::warn!(
                             target: "gateway::proxy",
                             site = throttle.site,
                             suppressed,
-                            "per-request warnings suppressed since the last line"
+                            "warnings suppressed since the last line"
                         );
                     }
                 });
+                if stopping {
+                    break;
+                }
             }
         }
     }
@@ -482,6 +595,19 @@ pub(crate) mod test_utils {
                 .map(|((_, labels), value)| (labels.clone(), *value))
                 .collect()
         }
+    }
+
+    /// Whether this test has a process of its own (nextest's model), so a
+    /// process-wide static it reads (an env var, a warning throttle) is
+    /// touched by no other test.
+    ///
+    /// A test that needs this skips what depends on it when it is false (only
+    /// its assertions on a throttled line, or the whole test when nothing else
+    /// is left), with an `eprintln!` naming the reason: under `cargo test`
+    /// every test shares one process, so a warning another test already
+    /// admitted, or an env var another test reads, would make it fail by order.
+    pub(crate) fn process_per_test() -> bool {
+        std::env::var("NEXTEST_EXECUTION_MODE").as_deref() == Ok("process-per-test")
     }
 }
 
@@ -589,6 +715,27 @@ mod tests {
         });
     }
 
+    /// `outcome="cancelled"` is part of the metrics contract like the
+    /// rejection reasons, but it is no `GatewayError`, so
+    /// `reason_labels_are_stable` cannot pin it; pin it here.
+    #[test]
+    fn record_cancelled_writes_outcome_cancelled() {
+        let mut metrics = test_utils::CapturedMetrics::install();
+        record_cancelled();
+        assert_eq!(metrics.value(REQUESTS_TOTAL, &[("outcome", "cancelled")]), 1.0);
+        assert_eq!(REQUESTS_TOTAL, "tn_worker_gateway_requests_total");
+    }
+
+    /// The overflow counter's name is part of the metrics contract; pin it.
+    #[test]
+    fn record_rate_limit_overflow_writes_the_counter() {
+        let mut metrics = test_utils::CapturedMetrics::install();
+        record_rate_limit_overflow();
+        record_rate_limit_overflow();
+        assert_eq!(metrics.value(RATE_LIMIT_OVERFLOW_TOTAL, &[]), 2.0);
+        assert_eq!(RATE_LIMIT_OVERFLOW_TOTAL, "tn_worker_gateway_rate_limit_overflow_total");
+    }
+
     #[test]
     fn warnings_are_throttled() {
         let throttle = Throttle::new("test");
@@ -609,5 +756,88 @@ mod tests {
         // a quiet call site has nothing to summarize and logs its next event at once
         assert_eq!(throttle.flush_at(start + THROTTLE_WINDOW * 4), None);
         assert_eq!(throttle.admit_at(start + THROTTLE_WINDOW * 10), Some(0));
+    }
+
+    /// The accept-error counter's name and labels are part of the metrics
+    /// contract; pin them.
+    #[test]
+    fn record_accept_error_writes_listener_and_kind() {
+        let mut metrics = test_utils::CapturedMetrics::install();
+        record_accept_error("probe", "resource");
+        record_accept_error("client", "connection");
+        record_accept_error("client", "connection");
+        assert_eq!(
+            metrics.value(ACCEPT_ERRORS_TOTAL, &[("listener", "probe"), ("kind", "resource")]),
+            1.0
+        );
+        assert_eq!(
+            metrics.value(ACCEPT_ERRORS_TOTAL, &[("listener", "client"), ("kind", "connection")]),
+            2.0
+        );
+        assert_eq!(
+            metrics.value(ACCEPT_ERRORS_TOTAL, &[("listener", "client"), ("kind", "resource")]),
+            0.0
+        );
+        assert_eq!(ACCEPT_ERRORS_TOTAL, "tn_worker_gateway_accept_errors_total");
+    }
+
+    /// In-memory log sink for a scoped fmt subscriber.
+    #[derive(Clone, Default)]
+    struct CapturedLogs(Arc<Mutex<Vec<u8>>>);
+
+    impl CapturedLogs {
+        fn text(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().unwrap_or_else(PoisonError::into_inner))
+                .into_owned()
+        }
+    }
+
+    impl std::io::Write for CapturedLogs {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap_or_else(PoisonError::into_inner).extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A count still pending when shutdown fires is written on a last summary
+    /// line, however little of its window has passed, and the task then ends.
+    #[tokio::test]
+    async fn throttle_summaries_flush_pending_counts_on_shutdown() {
+        static THROTTLE: Throttle = Throttle::new("shutdown_flush_test");
+        static THROTTLES: [&Throttle; 1] = [&THROTTLE];
+        // the test runs on a current-thread runtime, so a thread-local default
+        // subscriber sees the summary task's line
+        let captured = CapturedLogs::default();
+        let writer = captured.clone();
+        let subscriber =
+            tracing_subscriber::fmt().with_ansi(false).with_writer(move || writer.clone()).finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        // the first event is logged, the second only counted
+        assert_eq!(THROTTLE.admit(), Some(0));
+        assert_eq!(THROTTLE.admit(), None);
+        let shutdown = tn_types::Notifier::new();
+        let noticer = shutdown.subscribe();
+        shutdown.notify();
+        tokio::time::timeout(Duration::from_secs(1), run_throttle_summaries(&THROTTLES, noticer))
+            .await
+            .expect("ends at once on shutdown")
+            .expect("ok");
+        // the shutdown pass took the pending count, so nothing is left to summarize
+        assert_eq!(THROTTLE.flush_at(Instant::now() + THROTTLE_WINDOW * 2), None);
+        // and wrote it on exactly one summary line naming the site
+        let logs = captured.text();
+        let lines: Vec<&str> =
+            logs.lines().filter(|line| line.contains("shutdown_flush_test")).collect();
+        let [line] = lines.as_slice() else {
+            panic!("exactly one line must name the site:\n{logs}");
+        };
+        assert!(line.contains(" WARN "), "{line}");
+        assert!(line.contains("site=\"shutdown_flush_test\""), "{line}");
+        assert!(line.contains("suppressed=1"), "{line}");
+        assert!(line.contains("warnings suppressed since the last line"), "{line}");
     }
 }

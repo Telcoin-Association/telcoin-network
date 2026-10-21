@@ -14,7 +14,7 @@ use axum::{
     response::Response,
 };
 use serde::{
-    de::{IgnoredAny, MapAccess, SeqAccess, Visitor},
+    de::{DeserializeSeed, IgnoredAny, MapAccess, SeqAccess, Visitor},
     Deserialize, Deserializer,
 };
 use serde_json::{json, Value};
@@ -41,7 +41,8 @@ mod code {
     pub(super) const NO_UPSTREAM_READY: i32 = -32000;
     /// The upstream (a worker, or the query upstream) could not be reached.
     pub(super) const UPSTREAM_UNREACHABLE: i32 = -32001;
-    /// The upstream did not answer within the request deadline.
+    /// An upstream timeout (connect, read, or a submission answer's read
+    /// budget), not the gateway's request deadline (`-32005`).
     pub(super) const UPSTREAM_TIMEOUT: i32 = -32002;
     /// The request body exceeded the gateway's size limit, or a batch its
     /// length limit.
@@ -54,9 +55,10 @@ mod code {
     pub(super) const RATE_LIMITED: i32 = -32006;
     /// An `eth_sendRawTransaction` payload could not be decoded as a transaction.
     pub(super) const INVALID_TRANSACTION: i32 = -32007;
-    /// An `eth_sendRawTransaction` payload decoded to a transaction type the
-    /// network does not accept (an EIP-4844 blob or EIP-7702 set-code
-    /// transaction).
+    /// An `eth_sendRawTransaction` payload of a transaction type the network
+    /// does not accept: an EIP-4844 blob or EIP-7702 set-code transaction, or
+    /// a typed envelope of an unknown type, refused from its type byte before
+    /// it is decoded.
     pub(super) const UNSUPPORTED_TRANSACTION_TYPE: i32 = -32008;
     /// Every in-flight slot the request could use is taken (its route's cap,
     /// or the cap on concurrent requests to the worker).
@@ -67,10 +69,17 @@ mod code {
     /// The request calls a method the gateway refuses to forward
     /// (`--denied-method-prefixes`, applied when `--redirect-queries` is unset).
     pub(super) const METHOD_NOT_ALLOWED: i32 = -32011;
-    /// The upstream answered with an error status and a body that is not
-    /// JSON (a worker's `429` text/plain, for example).
+    /// The upstream's answer carried no JSON-RPC body to relay: an error
+    /// status whose body is not JSON (a worker's `429` text/plain, for
+    /// example), an answer without a JSON body from the query upstream, a
+    /// `2xx` included, or a `1xx`, `204`, `205` or `304`, which can carry no
+    /// body.
     pub(super) const UPSTREAM_ERROR: i32 = -32012;
-    /// The request body could not be read, or the request was not a `POST`.
+    /// The worker answered a remembered submission `2xx`, but its answer
+    /// could not be read whole; the transaction may have been accepted.
+    pub(super) const UPSTREAM_ANSWER_LOST: i32 = -32013;
+    /// The request body could not be read, the request was not a `POST`, or
+    /// a probe path got a method other than `GET` or `HEAD`.
     /// This is the spec-defined "Invalid Request" code, not a gateway-range
     /// code.
     pub(super) const INVALID_REQUEST: i32 = -32600;
@@ -90,8 +99,16 @@ pub(crate) enum GatewayError {
     /// The upstream (a worker, or the query upstream) could not be reached
     /// (connection failure).
     UpstreamUnreachable,
-    /// The upstream did not answer within the request deadline.
+    /// The upstream did not answer in time: the connection could not be set
+    /// up within `--upstream-connect-timeout`, the route's read timeout passed
+    /// with no response head or with a gap in a remembered submission's
+    /// answer, or that answer was not read whole within
+    /// `--upstream-request-timeout` of being sent. The gateway's own request
+    /// deadline is [`RequestTimeout`](Self::RequestTimeout) / `-32005`.
     UpstreamTimeout,
+    /// The worker answered `2xx` but its answer to a remembered submission
+    /// could not be read whole; the transaction may have been accepted.
+    UpstreamAnswerLost,
     /// The request body exceeded the gateway's size limit.
     RequestTooLarge,
     /// A batch carried more calls than `--max-batch-len` allows.
@@ -116,9 +133,10 @@ pub(crate) enum GatewayError {
     /// An `eth_sendRawTransaction` payload could not be decoded as a
     /// transaction (malformed hex or RLP).
     InvalidTransaction,
-    /// An `eth_sendRawTransaction` payload decoded to a transaction type the
-    /// network does not accept (an EIP-4844 blob or EIP-7702 set-code
-    /// transaction). Carries the EIP-2718 type byte, which the message names.
+    /// An `eth_sendRawTransaction` payload of a transaction type the network
+    /// does not accept: an EIP-4844 blob or EIP-7702 set-code transaction, or
+    /// a typed envelope of an unknown type, refused from its type byte before
+    /// it is decoded. Carries the EIP-2718 type byte, which the message names.
     UnsupportedTransactionType(u8),
     /// The request's body bytes did not fit in what is left of the in-flight
     /// request-byte budget, so it was refused before its body was read.
@@ -134,17 +152,26 @@ pub(crate) enum GatewayError {
     /// answers at once instead of queueing, so one saturated route cannot
     /// hold the connection slots the other route needs.
     Overloaded,
-    /// The upstream answered with a non-2xx `status` and a body that is not
-    /// JSON, so it carries no JSON-RPC answer to relay. The client gets the
-    /// upstream's status with a JSON-RPC error in place of the body.
+    /// The upstream's answer carries no JSON-RPC answer to relay: a non-2xx
+    /// `status`, or, from the query upstream, a `2xx`, with a body that is not
+    /// JSON, or a `1xx`, `204`, `205` or `304` from either upstream, which can
+    /// carry no body. The client gets the upstream's status with a JSON-RPC
+    /// error in place of the body, or `502` for a `1xx`, `204`, `205` or
+    /// `304`.
     UpstreamError {
-        /// The upstream's HTTP status, passed through to the client.
+        /// The HTTP status the client gets: the upstream's, or `502` in place
+        /// of a `1xx`, `204`, `205` or `304`.
         status: StatusCode,
     },
     /// The request's HTTP method was not `POST`. JSON-RPC over HTTP is
     /// `POST` only, so the request is answered locally, without reading its
     /// body or forwarding it.
     NonPostMethod,
+    /// A probe path (`/health`, `/ready`, `/ready/any`) was requested with a
+    /// method other than `GET` or `HEAD`. It shares `NonPostMethod`'s status,
+    /// code and reason label, so the metric contract is unchanged; only the
+    /// message differs, to agree with the response's `Allow: GET,HEAD`.
+    ProbeNonGetMethod,
 }
 
 /// The `Retry-After` value, in seconds, on the capacity `503`s
@@ -168,9 +195,13 @@ impl GatewayError {
             Self::NoUpstreamReady => StatusCode::SERVICE_UNAVAILABLE,
             Self::UpstreamUnreachable => StatusCode::BAD_GATEWAY,
             Self::UpstreamTimeout => StatusCode::GATEWAY_TIMEOUT,
+            Self::UpstreamAnswerLost => StatusCode::BAD_GATEWAY,
             Self::RequestTooLarge | Self::BatchTooLong => StatusCode::PAYLOAD_TOO_LARGE,
             Self::LoopDetected | Self::RedirectLoopDetected => StatusCode::LOOP_DETECTED,
-            Self::RequestTimeout { .. } => StatusCode::REQUEST_TIMEOUT,
+            Self::RequestTimeout { forwarding_started: false } => StatusCode::REQUEST_TIMEOUT,
+            // the request reached the upstream: a 408 ("you were too slow to
+            // send") would invite OkHttp and Chromium to resend it on their own
+            Self::RequestTimeout { forwarding_started: true } => StatusCode::GATEWAY_TIMEOUT,
             Self::RateLimited => StatusCode::TOO_MANY_REQUESTS,
             Self::InvalidTransaction | Self::UnsupportedTransactionType(_) => {
                 StatusCode::BAD_REQUEST
@@ -180,7 +211,7 @@ impl GatewayError {
             Self::UnreadableBody => StatusCode::BAD_REQUEST,
             Self::Overloaded => StatusCode::SERVICE_UNAVAILABLE,
             Self::UpstreamError { status } => *status,
-            Self::NonPostMethod => StatusCode::METHOD_NOT_ALLOWED,
+            Self::NonPostMethod | Self::ProbeNonGetMethod => StatusCode::METHOD_NOT_ALLOWED,
         }
     }
 
@@ -190,6 +221,7 @@ impl GatewayError {
             Self::NoUpstreamReady => code::NO_UPSTREAM_READY,
             Self::UpstreamUnreachable => code::UPSTREAM_UNREACHABLE,
             Self::UpstreamTimeout => code::UPSTREAM_TIMEOUT,
+            Self::UpstreamAnswerLost => code::UPSTREAM_ANSWER_LOST,
             Self::RequestTooLarge | Self::BatchTooLong => code::REQUEST_TOO_LARGE,
             Self::LoopDetected | Self::RedirectLoopDetected => code::LOOP_DETECTED,
             Self::RequestTimeout { .. } => code::REQUEST_TIMEOUT,
@@ -198,21 +230,27 @@ impl GatewayError {
             Self::UnsupportedTransactionType(_) => code::UNSUPPORTED_TRANSACTION_TYPE,
             Self::InflightBytesExhausted => code::INFLIGHT_BYTES_EXHAUSTED,
             Self::MethodNotAllowed => code::METHOD_NOT_ALLOWED,
-            Self::UnreadableBody | Self::NonPostMethod => code::INVALID_REQUEST,
+            Self::UnreadableBody | Self::NonPostMethod | Self::ProbeNonGetMethod => {
+                code::INVALID_REQUEST
+            }
             Self::Overloaded => code::OVERLOADED,
             Self::UpstreamError { .. } => code::UPSTREAM_ERROR,
         }
     }
 
     /// A human-readable message paired with this error. Every message is
-    /// static except the one for a transaction type without a name here,
-    /// which the screen cannot produce today (it refuses only types 3 and 4),
-    /// and the upstream error's, which names the upstream's status.
+    /// static except the one for a transaction type without a name here (an
+    /// unknown typed envelope, `0x05..=0x7f`, which the screen refuses from its
+    /// type byte), and the upstream error's, which names the upstream's status.
     fn message(&self) -> Cow<'static, str> {
         let message = match self {
             Self::NoUpstreamReady => "no upstream worker is ready",
             Self::UpstreamUnreachable => "upstream unreachable",
             Self::UpstreamTimeout => "upstream request timed out",
+            Self::UpstreamAnswerLost => {
+                "upstream answered, but its answer was lost; the transaction may have been \
+                 accepted, so look it up by hash before sending it again"
+            }
             Self::RequestTooLarge => "request body too large",
             Self::BatchTooLong => "batch too long",
             Self::LoopDetected => {
@@ -252,6 +290,7 @@ impl GatewayError {
                     .into();
             }
             Self::NonPostMethod => "only POST is accepted",
+            Self::ProbeNonGetMethod => "only GET and HEAD are accepted on this path",
         };
         Cow::Borrowed(message)
     }
@@ -260,11 +299,17 @@ impl GatewayError {
     /// `tn_worker_gateway_rejections_total` metric. It is kept in lockstep with
     /// the variants; a rename is a metrics-contract change, so the labels are
     /// pinned by a test.
+    ///
+    /// Two labels read alike: `method_not_allowed` is the `403` the method
+    /// policy (`--denied-method-prefixes`) answers, and `method_not_post` is
+    /// HTTP's `405 Method Not Allowed`, for a method other than `POST`, or than
+    /// `GET` and `HEAD` on a probe path.
     fn reason(&self) -> &'static str {
         match self {
             Self::NoUpstreamReady => "no_upstream_ready",
             Self::UpstreamUnreachable => "upstream_unreachable",
             Self::UpstreamTimeout => "upstream_timeout",
+            Self::UpstreamAnswerLost => "upstream_answer_lost",
             Self::RequestTooLarge => "request_too_large",
             Self::BatchTooLong => "batch_too_long",
             Self::LoopDetected => "loop_detected",
@@ -278,7 +323,7 @@ impl GatewayError {
             Self::UnreadableBody => "unreadable_body",
             Self::Overloaded => "overloaded",
             Self::UpstreamError { .. } => "upstream_error",
-            Self::NonPostMethod => "method_not_post",
+            Self::NonPostMethod | Self::ProbeNonGetMethod => "method_not_post",
         }
     }
 }
@@ -303,8 +348,9 @@ pub(crate) fn error_response_with_id(err: &GatewayError, id: RequestId) -> Respo
     render(err, id)
 }
 
-/// Replace an upstream's non-JSON error answer with a JSON-RPC error that
-/// keeps the upstream's `status` and echoes the request `id` recovered from
+/// Replace an upstream answer that carries no JSON-RPC body to pass on with a
+/// JSON-RPC error under `status` (the upstream's, or `502` in place of a `1xx`,
+/// `204`, `205` or `304`), echoing the request `id` recovered from
 /// `request_body`.
 ///
 /// The gateway did forward this request, so it is counted under its own
@@ -476,15 +522,49 @@ impl<'de> Visitor<'de> for IdMemberVisitor {
         // A repeated `id` keeps the last occurrence, which is how a full parse
         // into `Value` resolves a duplicated member.
         std::iter::from_fn(|| {
-            members.next_key::<Cow<'_, str>>().transpose().map(|member| {
-                member.and_then(|member| match member.as_ref() {
-                    "id" => members.next_value::<BoundedId>().map(|id| Some(id.0)),
-                    _ => members.next_value::<IgnoredAny>().map(|_| None),
+            members.next_key_seed(IsIdKey).transpose().map(|is_id| {
+                is_id.and_then(|is_id| {
+                    if is_id {
+                        members.next_value::<BoundedId>().map(|id| Some(id.0))
+                    } else {
+                        members.next_value::<IgnoredAny>().map(|_| None)
+                    }
                 })
             })
         })
         .try_fold(Value::Null, |id, member| member.map(|found| found.unwrap_or(id)))
         .map(IdMember)
+    }
+}
+
+/// Key seed behind [`IdMemberVisitor`]: whether a member's name is `id`,
+/// compared where the parser holds it. serde's `Cow<str>` key always copies the
+/// name into a `String`; this reads a name without escapes straight from the
+/// body and one with escapes from the parser's reused scratch buffer, so no
+/// member name gets an allocation of its own.
+struct IsIdKey;
+
+impl<'de> DeserializeSeed<'de> for IsIdKey {
+    type Value = bool;
+
+    fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<Self::Value, D::Error> {
+        deserializer.deserialize_str(IsIdKeyVisitor)
+    }
+}
+
+/// Visitor behind [`IsIdKey`]. serde forwards a borrowed and an owned string
+/// to `visit_str`, so every form of the name is compared here.
+struct IsIdKeyVisitor;
+
+impl<'de> Visitor<'de> for IsIdKeyVisitor {
+    type Value = bool;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a member name")
+    }
+
+    fn visit_str<E>(self, name: &str) -> Result<Self::Value, E> {
+        Ok(name == "id")
     }
 }
 
@@ -527,6 +607,11 @@ impl<'de> Visitor<'de> for BoundedIdVisitor {
         Ok(BoundedId(Value::from(id)))
     }
 
+    /// A fractional id, and also an integer id outside the `i64`/`u64` range
+    /// or one written with an exponent: those echo in float form
+    /// (`18446744073709551616` as `1.8446744073709552e19`, `1e2` as `100.0`),
+    /// so a client comparing ids as text or as big integers will not match
+    /// its call.
     fn visit_f64<E>(self, id: f64) -> Result<Self::Value, E> {
         Ok(BoundedId(Value::from(id)))
     }
@@ -578,6 +663,22 @@ mod tests {
         let body =
             format!(r#"{{"method":"eth_sendRawTransaction","params":["{payload}"],"id":11}}"#);
         assert_eq!(recovered(body.as_bytes()), json!(11));
+    }
+
+    /// A member name written with an escape (`"\u0069d"` is `id`) is decoded
+    /// before it is compared, so its id is still recovered, in a single call
+    /// and in a batch element alike.
+    #[test]
+    fn id_recovery_reads_an_escaped_id_key() {
+        assert_eq!(recovered(br#"{"method":"eth_chainId","\u0069d":5}"#), json!(5));
+        assert_eq!(recovered(br#"{"i\u0064":"abc","method":"eth_chainId"}"#), json!("abc"));
+        assert_eq!(
+            RequestId::recover_element(br#"[{"id":1},{"\u0069d":2}]"#, 1).0,
+            json!(2),
+            "the escaped key of a batch element"
+        );
+        // an escaped name that decodes to something other than `id` is skipped
+        assert_eq!(recovered(br#"{"\u0069dx":5}"#), Value::Null);
     }
 
     #[test]
@@ -839,7 +940,8 @@ mod tests {
             recent_submissions: None,
             denied_method_prefixes: Arc::from([]),
             max_batch_len: None,
-            query_request_timeout: None,
+            query_http: None,
+            upstream_request_timeout: Duration::from_secs(5),
             submission_slots: inflight_slots(0),
             query_slots: inflight_slots(0),
             upstream_slots: inflight_slots(0),
@@ -944,6 +1046,11 @@ mod tests {
             StatusCode::REQUEST_TIMEOUT
         );
         assert_eq!(
+            error_response(&GatewayError::RequestTimeout { forwarding_started: true }, b"{}")
+                .status(),
+            StatusCode::GATEWAY_TIMEOUT
+        );
+        assert_eq!(
             error_response(&GatewayError::UnreadableBody, b"{}").status(),
             StatusCode::BAD_REQUEST
         );
@@ -982,7 +1089,9 @@ mod tests {
         assert_eq!(GatewayError::InflightBytesExhausted.code(), -32010);
         assert_eq!(GatewayError::MethodNotAllowed.code(), -32011);
         assert_eq!(GatewayError::UpstreamError { status: StatusCode::FORBIDDEN }.code(), -32012);
+        assert_eq!(GatewayError::UpstreamAnswerLost.code(), -32013);
         assert_eq!(GatewayError::NonPostMethod.code(), -32600);
+        assert_eq!(GatewayError::ProbeNonGetMethod.code(), -32600);
     }
 
     /// An over-length batch shares the "too large" code and status with an
@@ -1054,6 +1163,7 @@ mod tests {
         assert_eq!(GatewayError::NoUpstreamReady.reason(), "no_upstream_ready");
         assert_eq!(GatewayError::UpstreamUnreachable.reason(), "upstream_unreachable");
         assert_eq!(GatewayError::UpstreamTimeout.reason(), "upstream_timeout");
+        assert_eq!(GatewayError::UpstreamAnswerLost.reason(), "upstream_answer_lost");
         assert_eq!(GatewayError::RequestTooLarge.reason(), "request_too_large");
         assert_eq!(GatewayError::BatchTooLong.reason(), "batch_too_long");
         assert_eq!(GatewayError::LoopDetected.reason(), "loop_detected");
@@ -1081,6 +1191,7 @@ mod tests {
             "upstream_error"
         );
         assert_eq!(GatewayError::NonPostMethod.reason(), "method_not_post");
+        assert_eq!(GatewayError::ProbeNonGetMethod.reason(), "method_not_post");
     }
 
     #[tokio::test]
@@ -1158,6 +1269,17 @@ mod tests {
         assert_eq!(err.status(), StatusCode::METHOD_NOT_ALLOWED);
         assert_eq!(err.code(), -32600);
         assert_eq!(err.message(), "only POST is accepted");
+        assert_eq!(err.reason(), "method_not_post");
+    }
+
+    #[test]
+    fn probe_non_get_code_and_reason_are_stable() {
+        // a probe path's 405 keeps the non-POST status, code and reason label
+        // (the metric contract) but names the methods its `Allow` lists
+        let err = GatewayError::ProbeNonGetMethod;
+        assert_eq!(err.status(), StatusCode::METHOD_NOT_ALLOWED);
+        assert_eq!(err.code(), -32600);
+        assert_eq!(err.message(), "only GET and HEAD are accepted on this path");
         assert_eq!(err.reason(), "method_not_post");
     }
 

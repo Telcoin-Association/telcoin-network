@@ -39,8 +39,9 @@ use std::{
 use axum::{
     body::HttpBody as _,
     extract::{ConnectInfo, DefaultBodyLimit, Request, State},
+    handler::Handler as _,
     http::{header, HeaderValue, Method, StatusCode},
-    middleware::{from_fn_with_state, map_response, Next},
+    middleware::{from_fn, from_fn_with_state, map_response, Next},
     response::{IntoResponse, Response},
     routing::get,
     Extension, Json, Router,
@@ -67,27 +68,50 @@ use crate::{
     identity::{
         identify, read_proxy_header, ClientAddr, LocalConnection, ProxyHeader, TrustedProxies,
     },
-    proxy::{
-        proxy, reject_non_post, AccessRecord, ForwardingStarted, QueryHeader,
-        OVERSIZED_BODY_WARNINGS,
-    },
+    proxy::{proxy, AccessRecord, ForwardingStarted, QueryHeader, OVERSIZED_BODY_WARNINGS},
     ratelimit::{rate_limit, PrefixPolicy, RateLimiters},
     readiness::GatewayReadiness,
     telemetry::{self, Throttle},
 };
 
-/// Pause before re-polling `accept()` after it fails, so a persistent accept
-/// error (e.g. fd exhaustion) cannot spin the loop hot.
+/// Pause before re-polling `accept()` after it fails with an error that is
+/// not about the one connection being accepted (see [`is_connection_error`]),
+/// so a persistent accept error (e.g. fd exhaustion) cannot spin the loop hot.
 const ACCEPT_RETRY_DELAY: Duration = Duration::from_millis(100);
 
-/// Liveness probe path. Exempt from rate limiting (see [`crate::ratelimit`]).
+/// Whether `errno` is one of the errors `accept(2)` documents as already
+/// pending on the new socket (`ENONET`, `EPROTO`, `ENOPROTOOPT`,
+/// `EOPNOTSUPP`, `EHOSTDOWN`), so about that connection alone;
+/// `std::io::ErrorKind` has no kind for these. Linux-family only, with the
+/// values `libc` gives for the target: mips, sparc, alpha and parisc number
+/// them differently.
+#[cfg(any(target_os = "android", target_os = "linux"))]
+fn is_pending_socket_error(errno: Option<i32>) -> bool {
+    matches!(
+        errno,
+        Some(libc::ENONET | libc::EPROTO | libc::ENOPROTOOPT | libc::EOPNOTSUPP | libc::EHOSTDOWN)
+    )
+}
+
+/// No such errors are consulted outside the Linux family.
+#[cfg(not(any(target_os = "android", target_os = "linux")))]
+fn is_pending_socket_error(_errno: Option<i32>) -> bool {
+    false
+}
+
+/// Liveness probe path. Its `GET` and `HEAD` are exempt from rate limiting (see
+/// [`crate::ratelimit`]); any other method is limited and then refused with a
+/// `405`.
 pub(crate) const HEALTH_PATH: &str = "/health";
 
-/// Readiness probe path. Exempt from rate limiting (see [`crate::ratelimit`]).
+/// Readiness probe path. Its `GET` and `HEAD` are exempt from rate limiting
+/// (see [`crate::ratelimit`]); any other method is limited and then refused
+/// with a `405`.
 pub(crate) const READY_PATH: &str = "/ready";
 
-/// Read-availability probe path. Never rate limited: [`router`] adds it after
-/// every layer but the `nosniff` one.
+/// Read-availability probe path. Its `GET` and `HEAD` are never rate limited:
+/// [`router`] adds it after every layer but the `nosniff` one. Any other method
+/// passes the identity and rate-limit layers before its `405`.
 pub(crate) const READY_ANY_PATH: &str = "/ready/any";
 
 /// Default budget of request-body bytes held across all in-flight requests
@@ -122,10 +146,38 @@ const REFUSED_PER_IP_CAP: &str = "per_ip_cap";
 /// was missing, malformed or late.
 const REFUSED_PROXY_HEADER: &str = "proxy_header";
 
+/// `listener` label on `tn_worker_gateway_accept_errors_total` for the
+/// client listener (`--listen-addr`).
+const ACCEPT_LISTENER_CLIENT: &str = "client";
+
+/// `listener` label on `tn_worker_gateway_accept_errors_total` for the
+/// `--probe-addr` listener.
+const ACCEPT_LISTENER_PROBE: &str = "probe";
+
+/// `kind` label on `tn_worker_gateway_accept_errors_total` for an error
+/// about the one connection being accepted (see [`is_connection_error`]).
+const ACCEPT_ERROR_CONNECTION: &str = "connection";
+
+/// `kind` label on `tn_worker_gateway_accept_errors_total` for an error
+/// about the process, such as fd exhaustion, which takes the back-off.
+const ACCEPT_ERROR_RESOURCE: &str = "resource";
+
 /// Throttle for the warning on a connection closed for its PROXY header. A
 /// misconfigured front has every connection closed this way, so the warning
 /// shows at the default log level, once per window.
 pub(crate) static PROXY_HEADER_WARNINGS: Throttle = Throttle::new("proxy_header");
+
+/// Throttle for the warning on a failed `accept()` on the client listener. A
+/// persistent failure such as fd exhaustion repeats every
+/// [`ACCEPT_RETRY_DELAY`], so the warning shows once per window, carrying the
+/// count it skipped; `tn_worker_gateway_accept_errors_total` counts every
+/// failure.
+pub(crate) static ACCEPT_ERROR_WARNINGS: Throttle = Throttle::new("accept");
+
+/// Throttle for the warning on a failed `accept()` on the `--probe-addr`
+/// listener, kept apart from the client listener's so each shows; the same
+/// counter counts its failures under `listener="probe"`.
+pub(crate) static PROBE_ACCEPT_ERROR_WARNINGS: Throttle = Throttle::new("probe_accept");
 
 /// How long a browser may cache the gateway's answer to a CORS preflight
 /// (`Access-Control-Max-Age`).
@@ -141,8 +193,8 @@ const CLIENT_CLOSED_REQUEST: u16 = 499;
 pub(crate) struct AppState {
     /// Live readiness view of the configured upstream workers.
     pub(crate) readiness: Arc<GatewayReadiness>,
-    /// Client used to forward requests on both routes (built by
-    /// [`crate::proxy::proxy_client`] outside tests).
+    /// Client for the worker route, and for the query route when `query_http`
+    /// is `None` (built by [`crate::proxy::route_clients`] outside tests).
     pub(crate) http: Client,
     /// Endpoint serving every call the worker does not (`--redirect-queries`),
     /// or `None` when every call goes to the workers. It is not
@@ -162,9 +214,13 @@ pub(crate) struct AppState {
     /// Maximum calls in one JSON-RPC batch (`--max-batch-len`), or `None` when
     /// unlimited.
     pub(crate) max_batch_len: Option<NonZeroUsize>,
-    /// Per-request deadline on the query route (`--query-request-timeout`), or
-    /// `None` when it follows the client's own (`--upstream-request-timeout`).
-    pub(crate) query_request_timeout: Option<Duration>,
+    /// Client for the query route, with `--query-request-timeout` as its read
+    /// timeout and sharing `http`'s resolver, or `None`, which sends the query
+    /// route through `http` (see [`crate::proxy::route_clients`]).
+    pub(crate) query_http: Option<Client>,
+    /// The deadline, from send, for reading a buffered submission answer whole
+    /// (`--upstream-request-timeout`; see [`crate::proxy`]).
+    pub(crate) upstream_request_timeout: Duration,
     /// In-flight cap for requests made only of submissions
     /// (`--max-inflight-submissions`); see [`inflight_slots`].
     pub(crate) submission_slots: Arc<Semaphore>,
@@ -373,12 +429,31 @@ pub(crate) struct RouterLayers {
 /// `floor((n - 1) * rate)`, so exactly `floor(n * rate)` of the first `n`
 /// requests are logged, evenly spread. A rate of `1` logs every request. The
 /// probes are not counted.
+///
+/// A sampled request is then held to the line ceiling
+/// (`--access-log-max-lines-per-second`): a fixed one-second window counts the
+/// lines written, and a sampled request over the ceiling writes no line and is
+/// counted in `tn_worker_gateway_access_log_suppressed_total` instead. The
+/// window is fixed, not sliding, so a burst across one window edge can write
+/// about twice the ceiling within a second at most. The window is one for
+/// every client, and the access log sits outside the rate limiter, so one
+/// client's flood (its `429`s or preflights) can take every line of a second;
+/// the other clients' sampled lines in that second, proxied ones included, are
+/// then suppressed and counted. A rising
+/// `tn_worker_gateway_access_log_suppressed_total` therefore means lines of
+/// any client were lost, not only the flooding one's.
 #[derive(Debug)]
 pub(crate) struct AccessLog {
     /// Fraction of requests logged, in `(0, 1]`.
     rate: f64,
     /// Requests counted so far.
     requests: AtomicU64,
+    /// Most lines written per second, after sampling; `None` is unlimited.
+    max_lines_per_second: Option<NonZeroU32>,
+    /// When the log was built; the ceiling's windows are whole seconds since.
+    started: Instant,
+    /// The ceiling's current window.
+    window: Mutex<LineWindow>,
     /// Reduces a client address to the rate limiter's key for it (its network
     /// prefix), so a line names the client the way the limiter meters it.
     prefix: PrefixPolicy,
@@ -386,20 +461,79 @@ pub(crate) struct AccessLog {
 
 impl AccessLog {
     /// Build the access log for a sample `rate` already validated to `0..=1`,
-    /// or `None` at `0`, where the log is off and no layer is installed.
-    pub(crate) fn new(rate: f64, prefix: PrefixPolicy) -> Option<Arc<Self>> {
-        (rate > 0.0).then(|| Arc::new(Self { rate, requests: AtomicU64::new(0), prefix }))
+    /// writing at most `max_lines_per_second` lines a second (`None` is
+    /// unlimited), or `None` at a `0` rate, where the log is off and no layer
+    /// is installed.
+    pub(crate) fn new(
+        rate: f64,
+        max_lines_per_second: Option<NonZeroU32>,
+        prefix: PrefixPolicy,
+    ) -> Option<Arc<Self>> {
+        (rate > 0.0).then(|| {
+            Arc::new(Self {
+                rate,
+                requests: AtomicU64::new(0),
+                max_lines_per_second,
+                started: Instant::now(),
+                window: Mutex::default(),
+                prefix,
+            })
+        })
     }
 
     /// Count one request and report whether it is logged.
     fn sample(&self) -> bool {
+        self.sample_at(self.started.elapsed().as_secs())
+    }
+
+    /// [`Self::sample`] for a request arriving in window `second` (whole
+    /// seconds since the log was built).
+    fn sample_at(&self, second: u64) -> bool {
         // the counter only hands each request a distinct position, which
         // `fetch_add` does under any ordering
         let before = self.requests.fetch_add(1, Ordering::Relaxed);
         // exact while the count stays below 2^53, which takes centuries at any
         // rate the gateway can serve
-        (before.saturating_add(1) as f64 * self.rate).floor() > (before as f64 * self.rate).floor()
+        let sampled = (before.saturating_add(1) as f64 * self.rate).floor()
+            > (before as f64 * self.rate).floor();
+        sampled && self.admit_line(second)
     }
+
+    /// Whether a sampled request in window `second` still fits under the line
+    /// ceiling; one that does not is counted as suppressed.
+    fn admit_line(&self, second: u64) -> bool {
+        let Some(max) = self.max_lines_per_second else { return true };
+        let admitted = {
+            // a poisoned lock only means a panic while holding it; the two plain
+            // fields are still consistent enough to cap a log line
+            let mut window = self.window.lock().unwrap_or_else(PoisonError::into_inner);
+            // a request that read the clock just before a newer one took the lock
+            // counts against the newer window rather than reopening its own
+            if second > window.second {
+                *window = LineWindow { second, lines: 0 };
+            }
+            let admitted = window.lines < max.get();
+            if admitted {
+                window.lines += 1;
+            }
+            admitted
+        };
+        // recorded after the lock is released: every sampled request takes it,
+        // and this is the flood path the ceiling exists for
+        if !admitted {
+            telemetry::record_access_log_suppressed();
+        }
+        admitted
+    }
+}
+
+/// One window of the access log's line ceiling.
+#[derive(Debug, Default)]
+struct LineWindow {
+    /// The window's second, counted from when the log was built.
+    second: u64,
+    /// Lines written in the window so far.
+    lines: u32,
 }
 
 /// Request extension marking a request the access log samples. The proxy
@@ -613,12 +747,13 @@ impl Drop for ClientSlot {
 /// Build the gateway router: health/readiness routes plus the proxy fallback.
 ///
 /// `request_deadline` bounds each whole request, and an overrun is answered
-/// with the gateway's own `408` JSON-RPC error envelope (see
-/// [`enforce_request_deadline`]); a `408` from an upstream passes through
-/// untouched. Streamed *response* bodies are written after the handler
-/// returns, outside this deadline; they are bounded by the accept loop's
+/// with the gateway's own JSON-RPC error envelope, a `408` before the request
+/// was forwarded and a `504` after (see [`enforce_request_deadline`]); a `408`
+/// from an upstream passes through this layer unchanged, relayed like any other
+/// upstream error status. Streamed *response* bodies are written after the
+/// handler returns, outside this deadline; they are bounded by the accept loop's
 /// transport-stall deadline and connection-lifetime cap (the upstream
-/// client's total timeout is only checked when the body is polled, which a
+/// client's read timeout is only checked when the body is polled, which a
 /// slow-reading client can prevent; see [`accept_loop`]). `max_request_bytes`
 /// caps the buffered request body.
 ///
@@ -630,16 +765,17 @@ impl Drop for ClientSlot {
 /// The probe paths answer `GET` and `HEAD`; any other method on them, `POST`
 /// included, gets the same `405` envelope as a non-`POST` request anywhere
 /// else, with axum's `Allow: GET,HEAD` in place of the proxy's `Allow: POST`.
-/// A `POST` to a probe path is not proxied because the rate limiter exempts
-/// those paths, so proxying it would let JSON-RPC skip the limits.
+/// A `POST` to a probe path is not proxied: the path belongs to the probe, and
+/// its answer must not depend on the upstream.
 ///
 /// `layers` carries the optional layers (see [`RouterLayers`]). When it holds
-/// rate limiters, the rate-limit layer is installed inside up to four layers
+/// rate limiters, the rate-limit layer is installed inside up to five layers
 /// and outside every other one, so an over-limit request is shed with a
 /// JSON-RPC `429` before its body is buffered or forwarded, and before it
 /// reserves any of the byte budget. Outside it are, innermost first, the CORS
 /// layer when `layers` holds allowed origins, the access log ([`log_access`])
-/// when it holds one, the identity middleware ([`identify`]), which resolves
+/// when it holds one, the cancellation counter ([`count_cancelled`]), the
+/// identity middleware ([`identify`]), which resolves
 /// the client address the rate limiter keys on, the access log names and the
 /// proxy forwards, believing `X-Forwarded-For` only from a peer in
 /// `trusted_proxies`, and, outermost, the `nosniff` layer ([`set_nosniff`]),
@@ -647,8 +783,9 @@ impl Drop for ClientSlot {
 ///
 /// The access log sits outside every layer that can answer a request itself,
 /// so a request answered there is logged like a proxied one: a `429`, a
-/// byte-budget `413` or `503`, a `405`, a `408` and, with CORS on, a preflight.
-/// `/health` and `/ready` are exempt by path, as from the rate limiter.
+/// byte-budget `413` or `503`, a `405`, the deadline's `408` or `504` and, with
+/// CORS on, a preflight.
+/// `/health` and `/ready` are not logged, whatever their method.
 ///
 /// The CORS layer answers every `OPTIONS` itself as a preflight, so a
 /// preflight is never forwarded, never refused by the proxy's `POST`-only
@@ -659,12 +796,16 @@ impl Drop for ClientSlot {
 /// same `405` as any other method but `POST`.
 ///
 /// `/ready/any` is added after every layer but the `nosniff` one, the identity,
-/// access-log and CORS layers included, so it answers from memory with none of
-/// them applied: it is never rate limited, metered, logged, charged against
-/// the byte budget or deadline-bound, like `/health` and `/ready`, and it never
-/// carries a CORS header (an `OPTIONS` to it gets the probes' `405`). `/health` and
-/// `/ready` sit inside the CORS layer, which answers an `OPTIONS` to them and
-/// adds `Access-Control-Allow-Origin` to their answers for an allowed `Origin`.
+/// access-log and CORS layers included, so its `GET` and `HEAD` answer from
+/// memory with none of them applied: they are never rate limited, metered,
+/// logged, charged against the byte budget or deadline-bound, like `/health`
+/// and `/ready`, and never carry a CORS header. Any other method there (an
+/// `OPTIONS` included) passes the identity and rate-limit layers on its own
+/// before it gets the probes' `405`, so, as on the other probe paths, it
+/// spends the client's tokens and is refused with a `429` once they run out.
+/// `/health` and `/ready` sit inside the CORS layer, which answers an
+/// `OPTIONS` to them and adds `Access-Control-Allow-Origin` to their answers
+/// for an allowed `Origin`.
 pub(crate) fn router(
     state: AppState,
     request_deadline: Duration,
@@ -688,8 +829,8 @@ pub(crate) fn router(
         .layer(from_fn_with_state(byte_budget, reserve_request_bytes));
     // Add the rate-limit layer after the body, deadline and byte-budget layers
     // so it runs ahead of the reservation and the body read.
-    let router = match layers.rate_limiters {
-        Some(limiters) => router.layer(from_fn_with_state(limiters, rate_limit)),
+    let router = match &layers.rate_limiters {
+        Some(limiters) => router.layer(from_fn_with_state(Arc::clone(limiters), rate_limit)),
         None => router,
     };
     // Add CORS after the rate limiter so it runs before it: a preflight is
@@ -707,15 +848,30 @@ pub(crate) fn router(
         Some(log) => router.layer(from_fn_with_state(log, log_access)),
         None => router,
     };
+    // Add the cancellation counter after every layer that can answer a
+    // request itself, so a request dropped anywhere inside counts as
+    // cancelled while an answer from any of them (the deadline's included,
+    // counted `rejected`) is not counted twice.
+    let router = router.layer(from_fn(count_cancelled));
     // Add the identity layer after the access-log, CORS and rate-limit layers
     // so it runs before them: they read the client address this layer stores.
-    let router = router.layer(from_fn_with_state(trusted_proxies, identify));
-    // a layer wraps only the routes added before it, so this probe, like
-    // `/health` and `/ready` (exempt in `crate::ratelimit`), is never rate
-    // limited; it stays the last route added, outside every layer but the
-    // `nosniff` one, and refuses other methods like the two probes above
+    let router = router.layer(from_fn_with_state(Arc::clone(&trusted_proxies), identify));
+    // a layer wraps only the routes added before it, so this probe's `GET` and
+    // `HEAD`, like those on `/health` and `/ready` (exempt in
+    // `crate::ratelimit`), are never rate limited; it stays the last route
+    // added, outside every layer but the `nosniff` one, and refuses other
+    // methods like the two probes above, through the same rate limiter, which
+    // needs the identity layer's client address
+    let ready_any_route = match layers.rate_limiters {
+        Some(limiters) => get(ready_any).fallback(
+            probe_method_not_allowed
+                .layer(from_fn_with_state(limiters, rate_limit))
+                .layer(from_fn_with_state(trusted_proxies, identify)),
+        ),
+        None => get(ready_any).fallback(probe_method_not_allowed),
+    };
     router
-        .route(READY_ANY_PATH, get(ready_any).fallback(probe_method_not_allowed))
+        .route(READY_ANY_PATH, ready_any_route)
         // Outermost, so every response the service produces carries it, the
         // identity, CORS and rate-limit layers' included.
         .layer(map_response(set_nosniff))
@@ -732,15 +888,58 @@ async fn set_nosniff(mut response: Response) -> Response {
     response
 }
 
+/// Axum middleware: count a request dropped before it was answered as
+/// `outcome="cancelled"` in `tn_worker_gateway_requests_total`.
+///
+/// A request's future is dropped mid-flight when its connection closes: a
+/// client disconnect, the connection-lifetime cap or shutdown. Every answer
+/// records its own outcome where it is built, so only this drop needs a
+/// guard, and the guard is disarmed once any response comes back. The probes
+/// `/health` and `/ready` are skipped (their `GET` and `HEAD` record no request
+/// metric; another method's `405` or `429` records its own `rejected` outcome
+/// where it is built); `/ready/any` is added after this layer and never
+/// reaches it.
+async fn count_cancelled(request: Request, next: Next) -> Response {
+    let path = request.uri().path();
+    if path == HEALTH_PATH || path == READY_PATH {
+        return next.run(request).await;
+    }
+    let mut guard = OutcomeGuard { answered: false };
+    let response = next.run(request).await;
+    guard.answered = true;
+    response
+}
+
+/// Drop guard behind [`count_cancelled`]: records the `cancelled` outcome
+/// unless the request it covers was answered.
+struct OutcomeGuard {
+    /// Set once the inner service returned a response, whose outcome the
+    /// code that built it recorded.
+    answered: bool,
+}
+
+impl Drop for OutcomeGuard {
+    fn drop(&mut self) {
+        if !self.answered {
+            telemetry::record_cancelled();
+        }
+    }
+}
+
 /// Answer a probe path requested with a method other than `GET` or `HEAD`.
+/// axum adds `Allow: GET,HEAD` to the response, and the message names the
+/// same methods.
 async fn probe_method_not_allowed(method: Method) -> Response {
-    reject_non_post(&method)
+    debug!(target: "gateway::server", %method, "rejecting non-GET request to a probe path");
+    error_response(&GatewayError::ProbeNonGetMethod, b"")
 }
 
 /// Build the CORS layer for `origins`: a JSON-RPC client only ever needs
 /// `POST` with a `Content-Type` header, and a browser may cache the preflight
-/// answer for [`CORS_MAX_AGE`]. Origins are matched exactly, byte for byte,
-/// against the request's `Origin`.
+/// answer for [`CORS_MAX_AGE`]. `Retry-After` is exposed so a page can read
+/// how long a capacity `503` asks it to wait; a browser hides every response
+/// header outside the CORS-safelisted few unless it is exposed. Origins are
+/// matched exactly, byte for byte, against the request's `Origin`.
 fn cors_layer(origins: CorsOrigins) -> CorsLayer {
     let allow_origin = match origins {
         CorsOrigins::Any => AllowOrigin::any(),
@@ -752,6 +951,7 @@ fn cors_layer(origins: CorsOrigins) -> CorsLayer {
         .allow_origin(allow_origin)
         .allow_methods([Method::POST])
         .allow_headers([header::CONTENT_TYPE])
+        .expose_headers([header::RETRY_AFTER])
         .max_age(CORS_MAX_AGE)
 }
 
@@ -767,7 +967,10 @@ fn cors_layer(origins: CorsOrigins) -> CorsLayer {
 ///
 /// The line's fields are `client` (the resolved client's [`ClientAddr`]
 /// masked to its network prefix, as the rate limiter keys it, so behind a
-/// trusted front it names the forwarded client, never the front), `class`
+/// trusted front it names the forwarded client, or the front itself when the
+/// front forwarded no usable client: no, an empty or an unparsable
+/// `X-Forwarded-For`, a chain of only trusted addresses, or a PROXY `LOCAL`
+/// connection), `class`
 /// and `route` (from the [`AccessRecord`] the proxy keeps in the request's
 /// [`AccessSampled`] slot, or `unknown` and `rejected` for a request answered
 /// or dropped before the proxy read its body: a rate-limit `429`, a byte
@@ -807,21 +1010,28 @@ async fn log_access(
 }
 
 /// Bound a whole request by `deadline`, answering an overrun with the
-/// gateway's `408` JSON-RPC error envelope.
+/// gateway's JSON-RPC error envelope: a `408` while the request has not been
+/// forwarded, and a `504` once it has. A `408` says the request never fully
+/// arrived, and client stacks such as OkHttp and Chromium resend one on their
+/// own, so a request that may have reached the upstream is never answered
+/// with it.
 ///
 /// Only an overrun of this deadline produces the envelope; the response of a
 /// request that finishes in time, an upstream's own `408` included, passes
-/// through unchanged. The request `id` is not recovered (the body may never
+/// through this layer unchanged. The request `id` is not recovered (the body may never
 /// have finished arriving), so it echoes as `null`, per spec. The message
 /// says whether the request may have reached an upstream, from the
 /// [`ForwardingStarted`] marker the proxy sets just before it forwards.
 ///
 /// A request whose upstream has already answered when the deadline passes is
-/// not cut: the proxy is only passing that answer on (it reads the worker's
-/// answer to a submission whole, under the proxy client's request timeout),
-/// and cutting it would report an answer the upstream already gave, a
-/// transaction it accepted included, as a timeout. It finishes and the proxy
-/// counts it, once.
+/// not cut: the proxy is only passing that answer on, and cutting it would
+/// report an answer the upstream already gave, a transaction it accepted
+/// included, as a timeout. A streamed answer leaves this layer once its head
+/// is in. The one answer still read here, a single submission the gateway
+/// remembers (see `relay_submission_answer`), must be read within
+/// `--upstream-request-timeout` of the request being sent, so the handler can
+/// run up to that long past this deadline. It finishes and the proxy counts
+/// it, once.
 async fn enforce_request_deadline(
     State(deadline): State<Duration>,
     mut request: Request,
@@ -849,12 +1059,15 @@ async fn enforce_request_deadline(
 /// "in-flight bytes exhausted" error at once instead of waiting. Neither can
 /// recover the request `id`, which sits in the unread body, so it echoes as
 /// `null`. The reservation is held across the inner call, which returns once
-/// the proxy has the upstream's response head; the buffered body is dropped by
-/// then. It cannot ride in the request extensions instead: the proxy drops the
-/// request's parts before it reads the body. Probes are exempt, as they are
-/// from rate limiting, and so is a request that is not a `POST`: it is refused
-/// with the `405` before its body is read (see [`crate::proxy::PostOnly`]), so
-/// it holds no bytes, and its `405` is not masked by a `413` or a `503`.
+/// the proxy has the upstream's response head, or, for a single submission,
+/// its whole answer; the buffered body is dropped by then. It cannot ride in
+/// the request extensions instead: the proxy drops the request's parts before
+/// it reads the body. Requests to `/health` and `/ready` are exempt whatever
+/// their method (their `GET`/`HEAD` hold no body, and any other method is
+/// refused with a `405` without reading one), and so is a request that is not
+/// a `POST`: it is refused with the `405` before its body is read (see
+/// [`crate::proxy::PostOnly`]), so it holds no bytes, and its `405` is not
+/// masked by a `413` or a `503`.
 async fn reserve_request_bytes(
     State(budget): State<Arc<RequestByteBudget>>,
     request: Request,
@@ -970,7 +1183,7 @@ pub(crate) async fn serve(
 ///
 /// The two write-path guards close the response-side slow loris: the
 /// whole-request deadline stops covering a response once its head is produced,
-/// and the upstream client's total timeout is only observed when the streamed
+/// and the upstream client's read timeout is only observed when the streamed
 /// body is polled; under downstream backpressure hyper stops polling the body
 /// (its write loop parks on a full write buffer), so that timeout never fires.
 /// `TCP_USER_TIMEOUT` fires in the kernel when the peer stops acknowledging
@@ -1056,12 +1269,27 @@ async fn accept_loop(
             () = &mut stop_accepting => break,
             accepted = listener.accept() => accepted,
         };
-        let Ok((mut stream, peer_addr)) = accepted.inspect_err(|err| {
-            warn!(target: "gateway::server", %err, "failed to accept connection");
-        }) else {
-            tokio::time::sleep(ACCEPT_RETRY_DELAY).await;
-            continue;
+        let (mut stream, peer_addr) = match accepted {
+            Ok(accepted) => accepted,
+            // the next connection is unaffected, so accept it at once; the
+            // permit is released and taken again
+            Err(err) if is_connection_error(&err) => {
+                telemetry::record_accept_error(ACCEPT_LISTENER_CLIENT, ACCEPT_ERROR_CONNECTION);
+                debug!(target: "gateway::server", %err, "accept: connection error, retrying");
+                continue;
+            }
+            Err(err) => {
+                telemetry::record_accept_error(ACCEPT_LISTENER_CLIENT, ACCEPT_ERROR_RESOURCE);
+                if let Some(suppressed) = ACCEPT_ERROR_WARNINGS.admit() {
+                    warn!(target: "gateway::server", %err, suppressed, "failed to accept connection");
+                }
+                tokio::time::sleep(ACCEPT_RETRY_DELAY).await;
+                continue;
+            }
         };
+        // counted from here, so a failed accept never shows as an open
+        // connection
+        let connection_slot = telemetry::ConnectionSlot::open(permit);
 
         // Nagle + delayed-ACK can add ~40ms to small JSON-RPC responses; the
         // upstream hop (reqwest) already disables it. Best-effort: a failure
@@ -1216,7 +1444,7 @@ async fn accept_loop(
             // the connection future drops its client slot and its drain
             // receiver as it ends, before the global permit goes back
             connection.await;
-            drop(permit);
+            drop(connection_slot);
         });
     }
 
@@ -1314,12 +1542,14 @@ async fn proxy_header(
 /// Build the probe-only router served on `--probe-addr`: the health, readiness
 /// and read-availability routes and nothing else (any other path is a `404`,
 /// another method on a probe path a `405`), with no rate limit, body limit or
-/// request deadline, since the handlers answer from memory.
+/// request deadline, since the handlers answer from memory. Every response
+/// carries `X-Content-Type-Options: nosniff`, as on the client listener.
 fn probe_router(state: AppState) -> Router {
     Router::new()
         .route(HEALTH_PATH, get(liveness))
         .route(READY_PATH, get(readiness))
         .route(READY_ANY_PATH, get(ready_any))
+        .layer(map_response(set_nosniff))
         .with_state(state)
 }
 
@@ -1389,11 +1619,26 @@ async fn probe_accept_loop(
             () = &mut stop_accepting => break,
             accepted = listener.accept() => accepted,
         };
-        let Ok((stream, _)) = accepted.inspect_err(|err| {
-            warn!(target: "gateway::server", %err, "failed to accept probe connection");
-        }) else {
-            tokio::time::sleep(ACCEPT_RETRY_DELAY).await;
-            continue;
+        let stream = match accepted {
+            Ok((stream, _)) => stream,
+            Err(err) if is_connection_error(&err) => {
+                telemetry::record_accept_error(ACCEPT_LISTENER_PROBE, ACCEPT_ERROR_CONNECTION);
+                debug!(target: "gateway::server", %err, "probe accept: connection error, retrying");
+                continue;
+            }
+            Err(err) => {
+                telemetry::record_accept_error(ACCEPT_LISTENER_PROBE, ACCEPT_ERROR_RESOURCE);
+                if let Some(suppressed) = PROBE_ACCEPT_ERROR_WARNINGS.admit() {
+                    warn!(
+                        target: "gateway::server",
+                        %err,
+                        suppressed,
+                        "failed to accept probe connection"
+                    );
+                }
+                tokio::time::sleep(ACCEPT_RETRY_DELAY).await;
+                continue;
+            }
         };
         let connection = graceful.watch(
             connection_builder
@@ -1414,6 +1659,25 @@ async fn probe_accept_loop(
         debug!(target: "gateway::server", "probe connections still open at shutdown");
     }
     Ok(())
+}
+
+/// Whether an `accept()` error is about the one connection being accepted
+/// (its peer refused, aborted or reset it, or the network to the peer failed)
+/// rather than about the listener or the process (fd exhaustion, out of
+/// memory). Such an error says nothing about the next connection, so the
+/// accept loops retry at once instead of backing off. The raw `errno` values
+/// are Linux's and are only consulted there.
+fn is_connection_error(err: &std::io::Error) -> bool {
+    use std::io::ErrorKind;
+    matches!(
+        err.kind(),
+        ErrorKind::ConnectionRefused
+            | ErrorKind::ConnectionAborted
+            | ErrorKind::ConnectionReset
+            | ErrorKind::NetworkDown
+            | ErrorKind::NetworkUnreachable
+            | ErrorKind::HostUnreachable
+    ) || is_pending_socket_error(err.raw_os_error())
 }
 
 /// Arm `TCP_USER_TIMEOUT` on an accepted connection: the kernel forcibly
@@ -1440,7 +1704,7 @@ mod tests {
     use super::*;
     use crate::{
         app::{check_chain_ids, log_chain_id_check, ChainIdCheck, UpstreamClients},
-        cli::{Cli, LogFormat, Settings, DEFAULT_DENIED_METHOD_PREFIXES},
+        cli::{LogFormat, Settings, DEFAULT_DENIED_METHOD_PREFIXES},
         config::UpstreamWorker,
         dns::{self, lookup_fn, SystemLookup},
         identity::proxy_v2_header,
@@ -1448,16 +1712,15 @@ mod tests {
             client_builder, proxy_client, UpstreamClientBuilder, DEFAULT_MAX_BATCH_LEN,
             MAX_REQUEST_BYTES, SUBMISSION_ANSWER_SLACK,
         },
-        ratelimit::RateLimit,
+        ratelimit::{ManualClock, RateLimit, SharedClock},
         readiness::{run_poller, QueryProbe, ReadinessThresholds},
-        telemetry::test_utils::CapturedMetrics,
+        telemetry::test_utils::{process_per_test, CapturedMetrics},
     };
     use axum::{
         body::Bytes,
         http::{header, HeaderMap},
         routing::{any, post},
     };
-    use clap::Parser as _;
     use rcgen::{
         BasicConstraints, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, KeyPair,
         KeyUsagePurpose,
@@ -1534,7 +1797,8 @@ mod tests {
             recent_submissions: None,
             denied_method_prefixes: default_denied(),
             max_batch_len: NonZeroUsize::new(DEFAULT_MAX_BATCH_LEN),
-            query_request_timeout: None,
+            query_http: None,
+            upstream_request_timeout: Duration::from_secs(5),
             submission_slots: inflight_slots(0),
             query_slots: inflight_slots(0),
             upstream_slots: inflight_slots(0),
@@ -1803,9 +2067,14 @@ mod tests {
         );
         let (upstream_addr, _mock) = spawn(mock).await;
 
-        let proxy_client =
-            Client::builder().timeout(Duration::from_millis(200)).build().expect("build client");
-        let state = test_state_with_client(&[upstream(upstream_addr)], proxy_client);
+        // the production client, whose read timeout also bounds the wait for
+        // the response head
+        let client = proxy_client(
+            UpstreamClientBuilder::for_test(Duration::from_secs(2)),
+            Duration::from_millis(200),
+        )
+        .expect("client");
+        let state = test_state_with_client(&[upstream(upstream_addr)], client);
         state.readiness.set_ready(0, true);
         let (gateway_addr, _shutdown) = spawn(test_router(state)).await;
 
@@ -2047,8 +2316,13 @@ mod tests {
         assert_eq!(body["id"], serde_json::Value::Null);
     }
 
+    /// The deadline fired after the request went upstream is a `504`, not a
+    /// `408` a client stack would resend on its own; its code, `-32005`, tells
+    /// it from the upstream timeout's `504` (`-32002`). The deadline before
+    /// forwarding keeps its `408` (see
+    /// `gateway_408_before_forwarding_says_not_delivered`).
     #[tokio::test]
-    async fn gateway_408_after_forwarding_says_delivery_unknown() {
+    async fn deadline_after_forwarding_is_a_504() {
         // A worker slower than the whole-request deadline: the request reaches
         // it, then the deadline fires while the gateway waits for the answer.
         let hits = Arc::new(AtomicUsize::new(0));
@@ -2078,7 +2352,7 @@ mod tests {
         .await;
 
         let (status, text) = post_rpc(gateway, None, call("eth_sendRawTransaction", 3)).await;
-        assert_eq!(status, StatusCode::REQUEST_TIMEOUT);
+        assert_eq!(status, StatusCode::GATEWAY_TIMEOUT);
         let body: serde_json::Value = serde_json::from_str(&text).expect("json error body");
         assert_eq!(body["error"]["code"], -32005);
         assert_eq!(
@@ -2145,6 +2419,41 @@ mod tests {
         }
     }
 
+    /// `tn_worker_gateway_open_connections` counts the client connections
+    /// holding a `--max-connections` slot: it rises as connections are
+    /// accepted and falls as each one closes.
+    #[tokio::test]
+    async fn open_connections_gauge_tracks_held_connections() {
+        const OPEN: &str = "tn_worker_gateway_open_connections";
+        let mut metrics = CapturedMetrics::install();
+        let app = Router::new().route(HEALTH_PATH, get(|| async { "ok" }));
+        // idle connections send nothing, so the header read timeout is what
+        // would close them; keep it far past the test
+        let limits = ServerLimits { header_read_timeout: Duration::from_secs(60), ..test_limits() };
+        let (gateway, _shutdown) = spawn_with_limits(app, limits).await;
+
+        let mut held = Vec::new();
+        for _ in 0..3 {
+            held.push(TcpStream::connect(gateway).await.expect("connect"));
+        }
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while metrics.value(OPEN, &[]) != 3.0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("three accepted connections should read 3");
+
+        drop(held.pop());
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while metrics.value(OPEN, &[]) != 2.0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("a closed connection should give its slot back");
+    }
+
     /// Upstream response body sized well above the sum of every buffer
     /// between the mock upstream and the stalled client (gateway channel,
     /// socket send/receive buffers, even generously tuned `tcp_wmem`/
@@ -2156,7 +2465,7 @@ mod tests {
     async fn slow_reader_is_closed_at_connection_lifetime_cap() {
         // The issue #958 scenario: response streaming to a client that stops
         // reading. The whole-request deadline no longer covers the response
-        // body, and the upstream client's total timeout is only observed when
+        // body, and the upstream client's read timeout is only observed when
         // the body is polled (which the stall prevents), so only the lifetime
         // cap bounds this connection.
         let mock = Router::new().route("/", post(|| async { vec![0_u8; STALL_BODY_BYTES] }));
@@ -2213,14 +2522,14 @@ mod tests {
 
     #[tokio::test]
     async fn lifetime_cap_lets_the_inflight_request_finish() {
-        // A worker that answers 150ms after it is asked, and counts the asks.
+        // A worker that answers 1.5 s after it is asked, and counts the asks.
         let hits = Arc::new(AtomicUsize::new(0));
         let counter = Arc::clone(&hits);
         let mock = Router::new().route(
             "/",
             post(move || async move {
                 counter.fetch_add(1, Ordering::SeqCst);
-                tokio::time::sleep(Duration::from_millis(150)).await;
+                tokio::time::sleep(Duration::from_millis(1500)).await;
                 r#"{"jsonrpc":"2.0","result":"0x1","id":1}"#
             }),
         );
@@ -2228,10 +2537,8 @@ mod tests {
 
         let state = test_state(&[upstream(upstream_addr)]);
         state.readiness.set_ready(0, true);
-        let limits = ServerLimits {
-            max_connection_duration: Some(Duration::from_millis(300)),
-            ..test_limits()
-        };
+        let limits =
+            ServerLimits { max_connection_duration: Some(Duration::from_secs(1)), ..test_limits() };
         let (gateway, _shutdown) = spawn_with_limits(test_router(state), limits).await;
 
         let body = call("eth_chainId", 1);
@@ -2241,10 +2548,12 @@ mod tests {
             body.len()
         );
 
-        // The request starts at 250ms, inside the 300ms cap, and its answer
-        // comes at about 400ms, past it.
+        // The request is written at once and its answer comes about 1.5 s
+        // after it is asked, past the 1 s cap, so the cap fires while the
+        // exchange is in flight unless the connection task first reads the
+        // head more than 1 s after accept (the crate's 1 s margin for a
+        // stalled runner); both deadlines share the runtime clock.
         let mut stream = TcpStream::connect(gateway).await.expect("connect");
-        tokio::time::sleep(Duration::from_millis(250)).await;
         stream.write_all(request.as_bytes()).await.expect("write");
 
         // The exchange in flight finishes, then the connection closes.
@@ -2337,6 +2646,17 @@ mod tests {
         // A connection that never sends a byte must be closed by the lifetime
         // cap (well before the 5s header deadline, hence the 2s bound).
         let mut stream = TcpStream::connect(addr).await.expect("connect");
+
+        // The probe waits in the accept backlog while the only slot is held.
+        // Its request is written now, so its bytes are already buffered when
+        // it is accepted and its own 300ms cap cannot close it before they
+        // are read.
+        let mut probe = TcpStream::connect(addr).await.expect("connect probe");
+        probe
+            .write_all(b"GET /health HTTP/1.1\r\nHost: gateway\r\nConnection: close\r\n\r\n")
+            .await
+            .expect("write probe");
+
         let mut buf = [0_u8; 16];
         let read = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut buf))
             .await
@@ -2344,15 +2664,14 @@ mod tests {
         assert_eq!(read.expect("read"), 0, "expected EOF from the server");
 
         // The capped connection's permit must be released: with a single slot,
-        // this probe only gets accepted (and answered) if it was.
-        let response = tokio::time::timeout(
-            Duration::from_secs(5),
-            Client::new().get(format!("http://{addr}/health")).send(),
-        )
-        .await
-        .expect("permit should be released after the cap fires")
-        .expect("send");
-        assert_eq!(response.status(), StatusCode::OK);
+        // the probe only gets accepted (and answered) if it was.
+        let mut response = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), probe.read_to_end(&mut response))
+            .await
+            .expect("permit should be released after the cap fires")
+            .expect("read probe");
+        let response = String::from_utf8_lossy(&response);
+        assert!(response.starts_with("HTTP/1.1 200"), "expected 200, got: {response}");
     }
 
     /// The transport-stall guard actually arms the socket option (readable
@@ -2465,11 +2784,11 @@ mod tests {
                     let admitted = accept_submissions
                         && serde_json::from_slice::<serde_json::Value>(&body)
                             .is_ok_and(|call| call["method"] == "eth_sendRawTransaction");
-                    if admitted {
-                        ACCEPTED
-                    } else {
-                        name
-                    }
+                    // labelled json, as a real upstream's answer is: a query
+                    // upstream's 2xx without a json content type gets the
+                    // -32012 error in its place
+                    let answer = if admitted { ACCEPTED } else { name };
+                    ([(header::CONTENT_TYPE, "application/json")], answer)
                 }
             }),
         );
@@ -2507,7 +2826,8 @@ mod tests {
             ))),
             denied_method_prefixes: default_denied(),
             max_batch_len: NonZeroUsize::new(DEFAULT_MAX_BATCH_LEN),
-            query_request_timeout: None,
+            query_http: None,
+            upstream_request_timeout: Duration::from_secs(5),
             submission_slots: inflight_slots(0),
             query_slots: inflight_slots(0),
             upstream_slots: inflight_slots(0),
@@ -2878,6 +3198,183 @@ mod tests {
         assert_eq!(status, StatusCode::GATEWAY_TIMEOUT);
         assert_eq!(error_code_and_id(&text), (-32002, serde_json::json!(4)));
         assert_eq!(worker_seen.hits(), 0);
+    }
+
+    /// A mock upstream that answers every request at once with a `200` head
+    /// and then sends `body` in pieces of `piece` bytes, one every `every`,
+    /// and then, when `stall` is set, holds the body open without sending
+    /// anything more.
+    async fn trickling_mock(
+        body: &'static str,
+        piece: usize,
+        every: Duration,
+        stall: bool,
+    ) -> (SocketAddr, Notifier) {
+        let mock = Router::new().route(
+            "/",
+            post(move || async move {
+                let pieces = futures::stream::unfold(body.as_bytes(), move |rest| async move {
+                    if rest.is_empty() {
+                        return None;
+                    }
+                    tokio::time::sleep(every).await;
+                    let (now, later) = rest.split_at(piece.min(rest.len()));
+                    Some((Ok::<_, std::io::Error>(Bytes::from_static(now)), later))
+                });
+                let tail = futures::StreamExt::flatten(futures::stream::iter(
+                    stall.then(futures::stream::pending),
+                ));
+                (
+                    [(header::CONTENT_TYPE, "application/json")],
+                    axum::body::Body::from_stream(futures::StreamExt::chain(pieces, tail)),
+                )
+            }),
+        );
+        spawn(mock).await
+    }
+
+    /// The query route's request timeout bounds each gap in a streamed answer,
+    /// not the whole transfer: an answer that keeps arriving runs well past it
+    /// and reaches the client whole.
+    #[tokio::test]
+    async fn progressing_query_answer_outlives_the_route_deadline() {
+        let mut metrics = CapturedMetrics::install();
+        let answer = "0123456789".repeat(15);
+        let answer: &'static str = answer.leak();
+        // 15 pieces 100 ms apart, about 1.5 s in all
+        let (query, _query) = trickling_mock(answer, 10, Duration::from_millis(100), false).await;
+        let (worker, _worker_seen, _worker) = named_mock("worker").await;
+        let deadline = Duration::from_millis(400);
+        let mut state = redirect_state(worker, Some(query));
+        state.query_http = Some(
+            proxy_client(UpstreamClientBuilder::for_test(Duration::from_secs(2)), deadline)
+                .expect("client"),
+        );
+        state.readiness.set_ready(0, true);
+        let (gateway, _shutdown) = spawn(test_router(state)).await;
+
+        let started = tokio::time::Instant::now();
+        let response = Client::new()
+            .post(format!("http://{gateway}/"))
+            .body(call("eth_getLogs", 1))
+            .send()
+            .await
+            .expect("send");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.bytes().await.expect("the whole body");
+        let elapsed = started.elapsed();
+        assert_eq!(body.as_ref(), answer.as_bytes());
+        assert!(elapsed > 3 * deadline, "the answer took {elapsed:?}, past the deadline");
+
+        let routed = "tn_worker_gateway_routed_requests_total";
+        assert_eq!(metrics.value(routed, &[("route", "query"), ("result", "body_failed")]), 0.0);
+        assert_eq!(metrics.value(routed, &[("route", "query"), ("result", "forwarded")]), 1.0);
+    }
+
+    /// A query answer that stops arriving still fails once its route's request
+    /// timeout passes without data: the client gets the `200` head and then a
+    /// body that cannot be read to the end, and the failure is counted.
+    #[tokio::test]
+    async fn stalled_query_body_fails_after_the_idle_window() {
+        let mut metrics = CapturedMetrics::install();
+        // one piece, then nothing
+        let start = r#"{"jsonrpc":"2.0","#;
+        let (query, _query) =
+            trickling_mock(start, start.len(), Duration::from_millis(10), true).await;
+        let (worker, _worker_seen, _worker) = named_mock("worker").await;
+        let mut state = redirect_state(worker, Some(query));
+        state.query_http = Some(
+            proxy_client(
+                UpstreamClientBuilder::for_test(Duration::from_secs(2)),
+                Duration::from_millis(400),
+            )
+            .expect("client"),
+        );
+        state.readiness.set_ready(0, true);
+        let (gateway, _shutdown) = spawn(test_router(state)).await;
+
+        let started = tokio::time::Instant::now();
+        let response = Client::new()
+            .post(format!("http://{gateway}/"))
+            .body(call("eth_getLogs", 1))
+            .send()
+            .await
+            .expect("send");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = tokio::time::timeout(Duration::from_secs(10), response.bytes())
+            .await
+            .expect("the stalled body must end");
+        let elapsed = started.elapsed();
+        assert!(body.is_err(), "a stalled body must not read as complete");
+        assert!(elapsed < Duration::from_secs(3), "the stalled body ended after {elapsed:?}");
+
+        let routed = "tn_worker_gateway_routed_requests_total";
+        assert_eq!(metrics.value(routed, &[("route", "query"), ("result", "body_failed")]), 1.0);
+    }
+
+    /// The worker's answer to a remembered submission is read whole, so it
+    /// stays bounded by `--upstream-request-timeout` from send even while each
+    /// piece arrives inside the read timeout: a worker that trickles an
+    /// accepting answer past the deadline loses it, and the hash is not
+    /// remembered. The `504` comes no earlier than the deadline (a timer never
+    /// fires early, and the clock starts before the request is sent) and well
+    /// before the trickle would end.
+    #[tokio::test]
+    async fn buffered_submission_answer_keeps_its_deadline() {
+        // the accepting answer in 26 pieces 100 ms apart, about 2.6 s in all,
+        // each gap well inside the 400 ms read timeout
+        let (worker, _worker) =
+            trickling_mock(ACCEPTED, 4, Duration::from_millis(100), false).await;
+        let client = proxy_client(
+            UpstreamClientBuilder::for_test(Duration::from_secs(2)),
+            Duration::from_millis(400),
+        )
+        .expect("client");
+        let mut state = redirect_state_with_client(worker, None, client);
+        let deadline = Duration::from_millis(400);
+        state.upstream_request_timeout = deadline;
+        state.readiness.set_ready(0, true);
+        let recent = state.recent_submissions.clone().expect("hash routing on");
+        let (gateway, _shutdown) = spawn(test_router(state)).await;
+
+        let started = tokio::time::Instant::now();
+        let (status, text) = post_rpc(gateway, None, submission(7)).await;
+        let elapsed = started.elapsed();
+        assert_eq!(status, StatusCode::GATEWAY_TIMEOUT);
+        assert_eq!(error_code_and_id(&text), (-32002, serde_json::json!(7)));
+        assert!(elapsed < Duration::from_secs(2), "the answer was given up after {elapsed:?}");
+        assert!(
+            elapsed >= deadline,
+            "the answer was given up after {elapsed:?}, before --upstream-request-timeout"
+        );
+        assert!(!recent.contains(&submitted_hash()));
+    }
+
+    /// The worker and query clients resolve upstream names through one cache:
+    /// a host the worker client has resolved is not looked up again when the
+    /// query client connects to it.
+    #[tokio::test]
+    async fn query_and_worker_clients_share_one_resolver() {
+        let (upstream, _upstream_seen, _upstream) = named_mock("upstream").await;
+        let lookups = Arc::new(AtomicUsize::new(0));
+        let lookup = {
+            let lookups = Arc::clone(&lookups);
+            lookup_fn(move |_host| {
+                lookups.fetch_add(1, Ordering::SeqCst);
+                async move { Ok(vec![SocketAddr::from(([127, 0, 0, 1], 0))]) }
+            })
+        };
+        let url = named_url("shared.test", upstream, "/");
+        let settings =
+            worker_settings("http", upstream, upstream, &[format!("--redirect-queries={url}")]);
+        let clients = crate::proxy::route_clients(&settings, lookup).expect("clients");
+        let query = clients.query.expect("a redirect builds a query client");
+
+        for client in [&clients.worker, &query] {
+            let response = client.post(url.clone()).send().await.expect("send");
+            assert_eq!(response.text().await.expect("text"), "upstream");
+        }
+        assert_eq!(lookups.load(Ordering::SeqCst), 1, "the query client hits the shared cache");
     }
 
     #[tokio::test]
@@ -3299,6 +3796,10 @@ mod tests {
     /// not go unnoticed.
     #[tokio::test]
     async fn json_redirect_from_an_upstream_is_logged() {
+        if !process_per_test() {
+            eprintln!("skipped: {THROTTLED_WARNING_SKIP}");
+            return;
+        }
         let logs = CapturedLogs::default();
         let subscriber = tracing_subscriber::fmt()
             .with_writer(logs.clone())
@@ -3359,8 +3860,10 @@ mod tests {
         assert!(!logs.contains("elsewhere"), "the Location must not be logged: {logs}");
     }
 
-    /// A per-IP limit of one request with no burst headroom (no refill lands
-    /// inside a test), and no global limit.
+    /// A per-IP limit of one request per second with no burst headroom, and no
+    /// global limit. A test's exchanges see no refill while they take under
+    /// 1s in all, which loopback exchanges do (1 token/s is the slowest rate
+    /// the limit can express).
     fn one_request_per_ip() -> Option<Arc<RateLimiters>> {
         RateLimiters::new(
             Some(RateLimit::new(nz(1), nz(1))),
@@ -3776,6 +4279,10 @@ mod tests {
     #[tokio::test]
     async fn bad_proxy_headers_are_counted_and_warned_once_per_window() {
         const WARNING: &str = "missing, malformed or late PROXY protocol header";
+        let per_test = process_per_test();
+        if !per_test {
+            eprintln!("not checking the throttled PROXY header warning: {THROTTLED_WARNING_SKIP}");
+        }
         let mut metrics = CapturedMetrics::install();
         let logs = CapturedLogs::default();
         let subscriber = tracing_subscriber::fmt()
@@ -3809,15 +4316,17 @@ mod tests {
             .expect("closed at the header read timeout");
         assert_eq!(read.expect("read"), 0, "expected EOF");
         assert_eq!(refused(), 3.0);
-        // the throttle lets one warning through per window, naming the peer
-        // and why
-        let text = logs.contents();
-        assert_eq!(text.matches(WARNING).count(), 1, "{text}");
-        let line = text.lines().find(|line| line.contains(WARNING)).expect("the warning");
-        assert!(line.contains("WARN"), "{line}");
-        assert!(line.contains("peer_addr=127.0.0.1:"), "{line}");
-        assert!(line.contains("missing the PROXY protocol v2 signature"), "{line}");
-        assert!(line.contains("suppressed=0"), "{line}");
+        if per_test {
+            // the throttle lets one warning through per window, naming the peer
+            // and why
+            let text = logs.contents();
+            assert_eq!(text.matches(WARNING).count(), 1, "{text}");
+            let line = text.lines().find(|line| line.contains(WARNING)).expect("the warning");
+            assert!(line.contains("WARN"), "{line}");
+            assert!(line.contains("peer_addr=127.0.0.1:"), "{line}");
+            assert!(line.contains("missing the PROXY protocol v2 signature"), "{line}");
+            assert!(line.contains("suppressed=0"), "{line}");
+        }
 
         // a peer that connects and closes without a byte (a tcp connect check)
         // is neither counted nor warned about
@@ -3827,20 +4336,27 @@ mod tests {
         assert!(response.starts_with("HTTP/1.1 200"), "{response}");
         assert_eq!(refused(), 3.0);
         let text = logs.contents();
-        assert_eq!(text.matches(WARNING).count(), 1, "{text}");
+        if per_test {
+            assert_eq!(text.matches(WARNING).count(), 1, "{text}");
+        }
         assert!(text.contains("connection closed before its PROXY protocol header"), "{text}");
     }
 
     #[tokio::test]
     async fn slow_proxy_header_neither_stalls_accept_nor_outlives_the_header_timeout() {
+        let header_read_timeout = Duration::from_secs(2);
         let (worker, _worker) = forwarding_echo().await;
         let state = redirect_state(worker, None);
         state.readiness.set_ready(0, true);
         let (gateway, _shutdown) =
-            spawn_proxy_protocol(state, None, "127.0.0.1/32", Duration::from_secs(2)).await;
+            spawn_proxy_protocol(state, None, "127.0.0.1/32", header_read_timeout).await;
 
-        // a trusted peer sends half a header and stalls
+        // a trusted peer sends half a header and stalls; the clock starts
+        // just before it connects, because the header read timeout is armed
+        // when the connection's task first runs, which can come before the
+        // write returns
         let header = proxy_v2_header(socket("198.51.100.1:4711"), &[]);
+        let started = tokio::time::Instant::now();
         let mut stalled = TcpStream::connect(gateway).await.expect("connect");
         stalled.write_all(&header[..8]).await.expect("write");
         // the header is read on the stalled connection's own task, so another
@@ -3850,12 +4366,30 @@ mod tests {
                 .await
                 .expect("accept must not wait for the stalled header");
         assert!(response.starts_with("HTTP/1.1 200"), "{response}");
-        // and the stalled connection is closed at the header read timeout
-        let mut buf = [0_u8; 16];
-        let read = tokio::time::timeout(Duration::from_secs(5), stalled.read(&mut buf))
-            .await
-            .expect("connection should be closed by the header read timeout");
-        assert_eq!(read.expect("read"), 0, "expected EOF from the server");
+
+        // and the stalled connection is closed at the header read timeout, not
+        // before it and not at some later bound. Once the test has no other
+        // socket to wait on, the clock is paused (see
+        // [`drain_during_proxy_headers`]) and stepped to just before the
+        // timeout and to a margin past it; the timeout was armed after
+        // `started`, so it fires in between. The socket is checked without
+        // waiting on it: a paused clock skips ahead to the next pending timer
+        // whenever the runtime parks, so a read that waits could be answered
+        // by a later bound. `yield_now` lets the runtime take in the socket's
+        // events without moving the clock.
+        tokio::time::sleep(SETTLE).await;
+        tokio::time::pause();
+        tokio::time::sleep_until(started + header_read_timeout - Duration::from_millis(100)).await;
+        tokio::task::yield_now().await;
+        let before = stalled.try_read(&mut [0_u8; 1]);
+        assert!(
+            matches!(&before, Err(err) if err.kind() == std::io::ErrorKind::WouldBlock),
+            "closed before the header read timeout: {before:?}"
+        );
+        tokio::time::sleep_until(started + header_read_timeout + Duration::from_millis(500)).await;
+        tokio::task::yield_now().await;
+        let after = stalled.try_read(&mut [0_u8; 1]);
+        assert!(matches!(after, Ok(0)), "still open 500ms past the header read timeout: {after:?}");
     }
 
     /// The accept loop for the probe-only `/health` router with PROXY protocol
@@ -4161,7 +4695,11 @@ mod tests {
         let (gateway, _shutdown) = spawn(test_router(state)).await;
 
         let (status, _) = post_rpc(gateway, None, call("eth_chainId", 1)).await;
-        assert_eq!(status, StatusCode::BAD_GATEWAY, "nothing listens on the freed port");
+        assert_eq!(
+            status,
+            StatusCode::BAD_GATEWAY,
+            "nothing should listen on the freed port {addr}; another process may have taken it"
+        );
 
         // the worker answers once on the same port, then goes away again
         let listener = TcpListener::bind(addr).await.unwrap_or_else(|err| {
@@ -4178,7 +4716,12 @@ mod tests {
         // one refused forward after the response: the run restarted, so the
         // count is 1, below the threshold of 2
         let (status, _) = post_rpc(gateway, None, call("eth_chainId", 3)).await;
-        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            status,
+            StatusCode::BAD_GATEWAY,
+            "nothing should listen on the freed port {addr} again; another process may have \
+             taken it"
+        );
         assert_eq!(ready_status(gateway).await, StatusCode::OK, "the response reset the count");
     }
 
@@ -4314,7 +4857,8 @@ mod tests {
             "/",
             post(|| async {
                 let first = futures::stream::iter([Ok::<_, std::convert::Infallible>("partial")]);
-                axum::body::Body::from_stream(first.chain(futures::stream::pending()))
+                let body = axum::body::Body::from_stream(first.chain(futures::stream::pending()));
+                ([(header::CONTENT_TYPE, "application/json")], body)
             }),
         ))
         .await;
@@ -4546,7 +5090,13 @@ mod tests {
         let (worker, _worker) = slow_mock("worker", Duration::from_secs(1)).await;
         let (query, _query) = slow_mock("query", Duration::from_secs(1)).await;
         let mut state = redirect_state(worker, Some(query));
-        state.query_request_timeout = Some(Duration::from_millis(200));
+        state.query_http = Some(
+            proxy_client(
+                UpstreamClientBuilder::for_test(Duration::from_secs(2)),
+                Duration::from_millis(200),
+            )
+            .expect("client"),
+        );
         state.readiness.set_ready(0, true);
         let (gateway, _shutdown) = spawn(test_router(state)).await;
 
@@ -4576,15 +5126,20 @@ mod tests {
     }
 
     /// A gateway with a ready worker answering `worker` and a global limit of
-    /// one request (no refill within the test), plus a submission budget when
-    /// `submissions` is given.
+    /// one request, plus a submission budget when `submissions` is given.
+    ///
+    /// The limiters run on the returned manual clock, not the wall clock: it
+    /// never moves unless the test advances it, so no bucket refills within
+    /// the test, however long its steps take.
     async fn one_token_gateway(
         submissions: Option<RateLimit>,
-    ) -> (SocketAddr, Seen, [Notifier; 2]) {
+    ) -> (SocketAddr, Seen, ManualClock, [Notifier; 2]) {
         let (worker, worker_seen, worker_server) = named_mock("worker").await;
         let state = redirect_state(worker, None);
         state.readiness.set_ready(0, true);
-        let limiters = RateLimiters::new(
+        let clock = ManualClock::new();
+        let limiters = RateLimiters::with_clock(
+            SharedClock::from(clock.clone()),
             None,
             Some(RateLimit::new(nz(1), nz(1))),
             submissions,
@@ -4597,16 +5152,16 @@ mod tests {
             Duration::from_secs(5),
             MAX_REQUEST_BYTES,
             None,
-            RouterLayers { rate_limiters: Some(limiters), ..RouterLayers::default() },
+            RouterLayers { rate_limiters: Some(Arc::new(limiters)), ..RouterLayers::default() },
             Arc::default(),
         ))
         .await;
-        (gateway, worker_seen, [worker_server, gateway_server])
+        (gateway, worker_seen, clock, [worker_server, gateway_server])
     }
 
     #[tokio::test]
     async fn submission_budget_admits_when_global_is_exhausted() {
-        let (gateway, worker_seen, _servers) =
+        let (gateway, worker_seen, _clock, _servers) =
             one_token_gateway(Some(RateLimit::new(nz(1), nz(1)))).await;
 
         // a read spends the global bucket's only token
@@ -4629,7 +5184,7 @@ mod tests {
     /// still gets.
     #[tokio::test]
     async fn submission_flood_spends_no_read_budget() {
-        let (gateway, worker_seen, _servers) =
+        let (gateway, worker_seen, _clock, _servers) =
             one_token_gateway(Some(RateLimit::new(nz(1), nz(1)))).await;
 
         // the first submission spends the submission bucket's only token
@@ -4649,9 +5204,38 @@ mod tests {
         assert_eq!(worker_seen.hits(), 2);
     }
 
+    /// A submission batch whose extra call the empty global bucket refuses
+    /// gets its submission token back in the handler, so the submission
+    /// budget is whole for the next submissions.
+    #[tokio::test]
+    async fn refused_submission_batch_returns_its_submission_token() {
+        let (gateway, worker_seen, _clock, _servers) =
+            one_token_gateway(Some(RateLimit::new(nz(1), nz(2)))).await;
+
+        // a read spends the global bucket's only token
+        let (status, text) = post_rpc(gateway, None, call("eth_chainId", 1)).await;
+        assert_eq!((status, text.as_str()), (StatusCode::OK, "worker"));
+
+        // a two-call submission batch: the first call takes a submission
+        // token, the second needs a global token and is refused
+        let (status, _) = post_rpc(gateway, None, batch("eth_sendRawTransaction", 2)).await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+
+        // both of the budget's tokens are there for single submissions
+        for id in [3, 4] {
+            let (status, text) = post_rpc(gateway, None, call("eth_sendRawTransaction", id)).await;
+            assert_eq!(
+                (status, text.as_str()),
+                (StatusCode::OK, "worker"),
+                "the refused batch kept a submission token"
+            );
+        }
+        assert_eq!(worker_seen.hits(), 3);
+    }
+
     #[tokio::test]
     async fn without_a_submission_budget_the_edge_check_is_unchanged() {
-        let (gateway, worker_seen, _servers) = one_token_gateway(None).await;
+        let (gateway, worker_seen, _clock, _servers) = one_token_gateway(None).await;
 
         let (status, text) = post_rpc(gateway, None, call("eth_chainId", 1)).await;
         assert_eq!((status, text.as_str()), (StatusCode::OK, "worker"));
@@ -4885,6 +5469,122 @@ mod tests {
         let routed = "tn_worker_gateway_routed_requests_total";
         assert_eq!(metrics.value(routed, &[("route", "worker"), ("result", "body_failed")]), 1.0);
         assert_eq!(metrics.value(routed, &[("route", "worker"), ("result", "forwarded")]), 1.0);
+    }
+
+    /// hyper's server sends a `304` without a body, so an upstream's `304`
+    /// could carry no JSON-RPC answer whatever its content type: the client
+    /// gets `502` and the `-32012` error with its id instead.
+    #[tokio::test]
+    async fn upstream_not_modified_becomes_a_bad_gateway_error() {
+        for content_type in ["text/plain", "application/json"] {
+            let (worker, _worker) = answering_mock(
+                StatusCode::NOT_MODIFIED,
+                content_type,
+                r#"{"jsonrpc":"2.0","result":"0x1","id":5}"#,
+            )
+            .await;
+            let state = redirect_state(worker, None);
+            state.readiness.set_ready(0, true);
+            let (gateway, _shutdown) = spawn(test_router(state)).await;
+
+            let (status, text) = post_rpc(gateway, None, call("eth_chainId", 5)).await;
+            assert_eq!(status, StatusCode::BAD_GATEWAY, "{content_type}");
+            assert_eq!(error_code_and_id(&text), (-32012, serde_json::json!(5)), "{content_type}");
+        }
+    }
+
+    /// An upstream's `101` would have hyper's server send the client a bare
+    /// protocol switch and close the connection; the client gets `502` and the
+    /// `-32012` error with its id instead.
+    #[tokio::test]
+    async fn upstream_switching_protocols_becomes_a_bad_gateway_error() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.expect("bind");
+        let worker = listener.local_addr().expect("local addr");
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept");
+            read_request(&mut stream).await;
+            stream
+                .write_all(
+                    b"HTTP/1.1 101 Switching Protocols\r\nConnection: upgrade\r\n\
+                      Upgrade: websocket\r\n\r\n",
+                )
+                .await
+                .expect("write");
+            // hold the connection until the gateway drops it
+            let _ = stream.read(&mut [0_u8; 1]).await;
+        });
+        let state = redirect_state(worker, None);
+        state.readiness.set_ready(0, true);
+        let (gateway, _shutdown) = spawn(test_router(state)).await;
+
+        let (status, text) = post_rpc(gateway, None, call("eth_chainId", 6)).await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert_eq!(error_code_and_id(&text), (-32012, serde_json::json!(6)));
+    }
+
+    /// A streamed answer keeps the upstream's `Content-Length`, so the client
+    /// can tell a complete answer by its length rather than by a final chunk.
+    #[tokio::test]
+    async fn streamed_answer_keeps_the_upstream_content_length() {
+        let answer = "a".repeat(100 * 1024);
+        let sized = answer.clone();
+        let mock = Router::new().route(
+            "/",
+            post(move || async move { ([(header::CONTENT_TYPE, "application/json")], sized) }),
+        );
+        let (worker, _worker) = spawn(mock).await;
+        let state = redirect_state(worker, None);
+        state.readiness.set_ready(0, true);
+        let (gateway, _shutdown) = spawn(test_router(state)).await;
+
+        let response = Client::new()
+            .post(format!("http://{gateway}/"))
+            .body(call("eth_getLogs", 1))
+            .send()
+            .await
+            .expect("send");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.content_length(), Some(102_400));
+        assert_eq!(response.text().await.expect("text"), answer);
+    }
+
+    /// An upstream answer without a `Content-Length` still goes out chunked.
+    #[tokio::test]
+    async fn chunked_upstream_answer_stays_chunked() {
+        let mock = Router::new().route(
+            "/",
+            post(|| async {
+                let pieces = futures::stream::iter(
+                    [r#"{"jsonrpc":"2.0","#, r#""result":"0x1","id":1}"#]
+                        .map(|piece| Ok::<_, std::io::Error>(axum::body::Bytes::from(piece))),
+                );
+                (
+                    [(header::CONTENT_TYPE, "application/json")],
+                    axum::body::Body::from_stream(pieces),
+                )
+            }),
+        );
+        let (worker, _worker) = spawn(mock).await;
+        let state = redirect_state(worker, None);
+        state.readiness.set_ready(0, true);
+        let (gateway, _shutdown) = spawn(test_router(state)).await;
+
+        let response = Client::new()
+            .post(format!("http://{gateway}/"))
+            .body(call("eth_getLogs", 1))
+            .send()
+            .await
+            .expect("send");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.content_length(), None);
+        assert_eq!(
+            response.headers().get(header::TRANSFER_ENCODING).map(HeaderValue::as_bytes),
+            Some(b"chunked".as_slice())
+        );
+        assert_eq!(
+            response.text().await.expect("text"),
+            r#"{"jsonrpc":"2.0","result":"0x1","id":1}"#
+        );
     }
 
     /// A relayed response stays in the in-flight gauge until its body has
@@ -5266,6 +5966,25 @@ mod tests {
         drop(held);
     }
 
+    /// The probe listener marks its responses `nosniff` like the client
+    /// listener, a probe's answer and a `404` alike.
+    #[tokio::test]
+    async fn probe_listener_responses_carry_nosniff() {
+        let state = test_state(&[upstream("127.0.0.1:1".parse().expect("addr"))]);
+        let (probe_addr, _probes) = spawn_probes(state).await;
+
+        for path in [READY_PATH, "/not-a-probe"] {
+            let response =
+                Client::new().get(format!("http://{probe_addr}{path}")).send().await.expect("send");
+            assert_eq!(
+                response.headers().get(header::X_CONTENT_TYPE_OPTIONS),
+                Some(&HeaderValue::from_static("nosniff")),
+                "{path} answered {}",
+                response.status()
+            );
+        }
+    }
+
     #[tokio::test]
     async fn probe_connection_serves_one_request_with_a_small_head() {
         let state = test_state(&[upstream("127.0.0.1:1".parse().expect("addr"))]);
@@ -5590,6 +6309,40 @@ mod tests {
         }
     }
 
+    /// A method other than `GET` or `HEAD` on `/ready/any` is charged against
+    /// the client's bucket like any request before it gets its `405`, and a
+    /// `429` once the bucket is empty; `GET` and `HEAD` are never charged.
+    #[tokio::test]
+    async fn ready_any_charges_other_methods_against_the_rate_limit() {
+        let (worker, worker_seen, _worker) = named_mock("worker").await;
+        let state = redirect_state(worker, None);
+        state.readiness.set_ready(0, true);
+        let app = identity_router(state, one_request_per_ip(), "127.0.0.1/32");
+        let (gateway, _shutdown) = spawn(app).await;
+        let url = format!("http://{gateway}{READY_ANY_PATH}");
+        let client = Client::new();
+        let status = |method: Method| {
+            let request = client.request(method, &url).body(call("eth_chainId", 1));
+            async move { request.send().await.expect("send").status() }
+        };
+
+        // probes spend nothing, so the only token is still there for the POST
+        for _ in 0..3 {
+            assert_eq!(status(Method::GET).await, StatusCode::OK);
+            assert_eq!(status(Method::HEAD).await, StatusCode::OK);
+        }
+        assert_eq!(status(Method::POST).await, StatusCode::METHOD_NOT_ALLOWED);
+        // the POST took the client's only token
+        assert_eq!(status(Method::POST).await, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(status(Method::PUT).await, StatusCode::TOO_MANY_REQUESTS);
+        let (status_rpc, _) = post_rpc(gateway, None, call("eth_chainId", 2)).await;
+        assert_eq!(status_rpc, StatusCode::TOO_MANY_REQUESTS, "the bucket is the client's");
+        // and the probes still answer with the bucket empty
+        assert_eq!(status(Method::GET).await, StatusCode::OK);
+        assert_eq!(status(Method::HEAD).await, StatusCode::OK);
+        assert_eq!(worker_seen.hits(), 0, "a probe path must never reach the upstream");
+    }
+
     /// A throwaway certificate authority for the TLS upstream tests.
     struct TestCa {
         cert: rcgen::Certificate,
@@ -5785,7 +6538,7 @@ mod tests {
             format!("--upstream-readiness-url={scheme}://{readiness}/health/workers"),
         ];
         argv.extend(flags.iter().cloned());
-        Cli::parse_from(argv).into_settings().expect("settings")
+        crate::cli::try_parse_test_argv(argv).expect("parse").into_settings().expect("settings")
     }
 
     /// The gateway state with the production upstream client built from
@@ -5803,14 +6556,16 @@ mod tests {
     /// production clients, as `app::run` wires them. The two `Notifier`s keep
     /// the server and the poller alive.
     async fn spawn_polled_gateway(settings: &Settings) -> (SocketAddr, Notifier, Notifier) {
-        let UpstreamClients { proxy, readiness: readiness_client } =
+        let UpstreamClients { proxy, query, readiness: readiness_client } =
             UpstreamClients::new(settings, Arc::new(SystemLookup)).expect("upstream clients");
-        let state = test_state_with_client(&settings.upstreams, proxy);
-        let query_probe = settings.query_upstream.clone().map(|url| QueryProbe {
-            url,
-            client: state.http.clone(),
-            query_header: settings.query_header.clone(),
-        });
+        let mut state = test_state_with_client(&settings.upstreams, proxy);
+        let query_probe =
+            settings.query_upstream.clone().zip(query.clone()).map(|(url, client)| QueryProbe {
+                url,
+                client,
+                query_header: settings.query_header.clone(),
+            });
+        state.query_http = query;
         let poller = Notifier::new();
         tokio::spawn(run_poller(
             Arc::clone(&state.readiness),
@@ -6563,6 +7318,10 @@ mod tests {
         assert_eq!(worker_seen.hits(), 0);
         assert_eq!(lookups.load(Ordering::SeqCst), 1, "each forward waited on the one lookup");
 
+        if !process_per_test() {
+            eprintln!("not checking the throttled forwarding warning: {THROTTLED_WARNING_SKIP}");
+            return;
+        }
         // the first failure is logged with its whole cause chain and the
         // upstream's origin, no path
         let text = logs.contents();
@@ -6711,7 +7470,10 @@ mod tests {
             timed_raw_exchange(gateway, "POST / HTTP/1.1\r\nContent-Length: 204800", b"").await;
         assert_eq!(status, 503);
         assert_eq!(error_code_and_id(&body), (-32010, serde_json::Value::Null));
-        assert!(elapsed < Duration::from_millis(100), "answered after {elapsed:?}");
+        // a queued reservation, or one that read the body first, would wait
+        // out the 5s request deadline; 1s separates the two with room to spare
+        // on a loaded runner, like the other "must not wait" checks
+        assert!(elapsed < Duration::from_secs(1), "answered after {elapsed:?}");
         assert_eq!(hits.load(Ordering::SeqCst), 1, "the refused request must not be forwarded");
     }
 
@@ -7071,8 +7833,11 @@ mod tests {
         assert_eq!((status, text.as_str()), (StatusCode::OK, "worker"));
         let (status, text) = post_rpc(gateway, None, nonce_read("pending", 2)).await;
         assert_eq!((status, text.as_str()), (StatusCode::OK, "worker"));
+        // the tag matches in any ASCII case, as the worker reads it
+        let (status, text) = post_rpc(gateway, None, nonce_read("Pending", 3)).await;
+        assert_eq!((status, text.as_str()), (StatusCode::OK, "worker"));
 
-        assert_eq!((worker_seen.hits(), worker_seen.hop_marker()), (2, 2));
+        assert_eq!((worker_seen.hits(), worker_seen.hop_marker()), (3, 3));
         assert_eq!(query_seen.hits(), 0);
     }
 
@@ -7091,8 +7856,6 @@ mod tests {
             nonce_read("0x10", 3),
             // the block parameter defaults to latest
             call_with("eth_getTransactionCount", &format!(r#"["{ADDRESS}"]"#), 4),
-            // the tag matches case-sensitively, like the method names
-            nonce_read("Pending", 5),
         ];
         for body in &reads {
             let (status, text) = post_rpc(gateway, None, body.clone()).await;
@@ -7333,7 +8096,8 @@ mod tests {
 
     /// An answer past the request's length plus the slack is not one a healthy
     /// worker sends; the gateway stops reading, so the answer is lost and the
-    /// client gets an unreachable-upstream error rather than a truncated body.
+    /// client gets the lost-answer error, which says the transaction may have
+    /// been accepted, rather than a truncated body.
     #[tokio::test]
     async fn submission_answer_past_the_cap_is_lost() {
         let padding = "p".repeat(64 * 1024);
@@ -7351,15 +8115,18 @@ mod tests {
 
         let (status, text) = post_rpc(gateway, None, submission(7)).await;
         assert_eq!(status, StatusCode::BAD_GATEWAY);
-        assert_eq!(error_code_and_id(&text), (-32001, serde_json::json!(7)));
+        assert_eq!(error_code_and_id(&text), (-32013, serde_json::json!(7)));
+        assert!(text.contains("may have been accepted"), "{text}");
         assert!(!recent.contains(&submitted_hash()));
     }
 
-    /// A submission's answer read whole counts once: as `forwarded` when it
-    /// reaches the client, and as `body_failed` when it is lost, never as
-    /// `unreachable` and never next to a `forwarded`.
+    /// A submission's answer read whole counts like a streamed one: its head
+    /// as `forwarded` on `routed_requests_total`, and a lost answer as
+    /// `body_failed` after it, never as `unreachable`. `requests_total`
+    /// counts the answer passed on as `forwarded` and the lost one, once, as
+    /// `rejected`.
     #[tokio::test]
-    async fn submission_answers_are_counted_once() {
+    async fn submission_answers_count_like_streamed_answers() {
         let mut metrics = CapturedMetrics::install();
         let (worker, _worker_seen, _worker) = accepting_worker_mock().await;
         let state = redirect_state(worker, None);
@@ -7367,6 +8134,16 @@ mod tests {
         let (gateway, _shutdown) = spawn(test_router(state)).await;
         let (status, text) = post_rpc(gateway, None, submission(1)).await;
         assert_eq!((status, text.as_str()), (StatusCode::OK, ACCEPTED));
+        let series = |result: &str| {
+            vec![
+                ("result".to_string(), result.to_string()),
+                ("route".to_string(), "worker".to_string()),
+            ]
+        };
+        let routed = "tn_worker_gateway_routed_requests_total";
+        let requests = "tn_worker_gateway_requests_total";
+        assert_eq!(metrics.series(routed), vec![(series("forwarded"), 1.0)]);
+        assert_eq!(metrics.value(requests, &[("outcome", "forwarded")]), 1.0);
 
         // a worker whose answer breaks off mid-body
         let state = redirect_state(truncating_mock().await, None);
@@ -7375,22 +8152,84 @@ mod tests {
         let (truncating, _truncating) = spawn(test_router(state)).await;
         let (status, text) = post_rpc(truncating, None, submission(7)).await;
         assert_eq!(status, StatusCode::BAD_GATEWAY);
-        assert_eq!(error_code_and_id(&text), (-32001, serde_json::json!(7)));
+        assert_eq!(error_code_and_id(&text), (-32013, serde_json::json!(7)));
         assert!(!recent.contains(&submitted_hash()));
 
-        let series = |result: &str| {
-            vec![
-                ("result".to_string(), result.to_string()),
-                ("route".to_string(), "worker".to_string()),
-            ]
-        };
+        // the lost answer's head counts as forwarded, then its failure; on
+        // requests_total it counts only as rejected
         assert_eq!(
-            metrics.series("tn_worker_gateway_routed_requests_total"),
-            vec![(series("body_failed"), 1.0), (series("forwarded"), 1.0)]
+            metrics.series(routed),
+            vec![(series("body_failed"), 1.0), (series("forwarded"), 2.0)]
         );
-        let requests = "tn_worker_gateway_requests_total";
         assert_eq!(metrics.value(requests, &[("outcome", "forwarded")]), 1.0);
         assert_eq!(metrics.value(requests, &[("outcome", "rejected")]), 1.0);
+        let rejections = "tn_worker_gateway_rejections_total";
+        assert_eq!(metrics.value(rejections, &[("reason", "upstream_answer_lost")]), 1.0);
+    }
+
+    /// The worker's answer to a remembered submission is read whole before
+    /// `proxy()` returns and then waits in the response body for the client:
+    /// until the client has taken it, the request stays in the in-flight gauge
+    /// and keeps its submission slot, as a streamed answer does.
+    #[tokio::test]
+    async fn buffered_submission_answer_holds_its_guards_until_taken() {
+        let mut metrics = CapturedMetrics::install();
+        let (worker, _worker_seen, _worker) = accepting_worker_mock().await;
+        let mut state = redirect_state(worker, None);
+        state.submission_slots = inflight_slots(1);
+        state.readiness.set_ready(0, true);
+        let recent = state.recent_submissions.clone().expect("hash routing on");
+        let slots = Arc::clone(&state.submission_slots);
+        let forwarding = TrustedProxies::default()
+            .resolve("127.0.0.1".parse().expect("peer"), &HeaderMap::new());
+
+        let response = proxy(
+            State(state),
+            Extension(forwarding),
+            crate::proxy::PostOnly,
+            None,
+            None,
+            None,
+            Request::new(axum::body::Body::from(submission(1))),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // the handler has returned, but nothing has taken the answer yet
+        let inflight = "tn_worker_gateway_inflight_requests";
+        let class = [("route", "submission")];
+        assert_eq!(slots.available_permits(), 0, "the submission slot is still held");
+        assert_eq!(metrics.value(inflight, &[]), 1.0);
+        assert_eq!(metrics.value("tn_worker_gateway_route_inflight", &class), 1.0);
+
+        let answer =
+            axum::body::to_bytes(response.into_body(), usize::MAX).await.expect("the answer");
+        assert_eq!(answer.as_ref(), ACCEPTED.as_bytes());
+        assert_eq!(slots.available_permits(), 1, "taking the answer frees the slot");
+        assert_eq!(metrics.value(inflight, &[]), 0.0);
+        assert_eq!(metrics.value("tn_worker_gateway_route_inflight", &class), 0.0);
+        assert!(recent.contains(&submitted_hash()));
+    }
+
+    /// The held answer keeps an exact size, so the client gets it with a
+    /// `Content-Length`, as it did when the answer went out in one piece.
+    #[tokio::test]
+    async fn buffered_submission_answer_keeps_its_content_length() {
+        let (worker, _worker_seen, _worker) = accepting_worker_mock().await;
+        let state = redirect_state(worker, None);
+        state.readiness.set_ready(0, true);
+        let (gateway, _shutdown) = spawn(test_router(state)).await;
+
+        let response = Client::new()
+            .post(format!("http://{gateway}/"))
+            .body(submission(1))
+            .send()
+            .await
+            .expect("send");
+        assert_eq!(response.status(), StatusCode::OK);
+        let length = u64::try_from(ACCEPTED.len()).expect("fits");
+        assert_eq!(response.content_length(), Some(length));
+        assert_eq!(response.bytes().await.expect("bytes").as_ref(), ACCEPTED.as_bytes());
     }
 
     #[tokio::test]
@@ -7905,14 +8744,16 @@ mod tests {
         .await;
 
         let client = Client::new();
-        // a POST to a probe path is refused too: the rate limiter exempts
-        // those paths, so it must not reach the proxy
-        for (method, path, allow) in [
-            (Method::GET, "/", "POST"),
-            (Method::PUT, "/", "POST"),
-            (Method::DELETE, "/x", "POST"),
-            (Method::PUT, "/health", "GET,HEAD"),
-            (Method::POST, "/ready", "GET,HEAD"),
+        // a POST to a probe path is refused too: the probe routes refuse it
+        // before the proxy
+        const NON_POST: &str = "only POST is accepted";
+        const NON_GET: &str = "only GET and HEAD are accepted on this path";
+        for (method, path, allow, message) in [
+            (Method::GET, "/", "POST", NON_POST),
+            (Method::PUT, "/", "POST", NON_POST),
+            (Method::DELETE, "/x", "POST", NON_POST),
+            (Method::PUT, "/health", "GET,HEAD", NON_GET),
+            (Method::POST, "/ready", "GET,HEAD", NON_GET),
         ] {
             let response = client
                 .request(method.clone(), format!("http://{gateway}{path}"))
@@ -7928,7 +8769,7 @@ mod tests {
             );
             let body: serde_json::Value = response.json().await.expect("json error body");
             assert_eq!(body["error"]["code"], -32600, "{method} {path}");
-            assert_eq!(body["error"]["message"], "only POST is accepted", "{method} {path}");
+            assert_eq!(body["error"]["message"], message, "{method} {path}");
             assert_eq!(body["id"], serde_json::Value::Null, "{method} {path}");
         }
         assert_eq!(worker_seen.hits(), 0, "a non-POST request must never reach the upstream");
@@ -7936,6 +8777,71 @@ mod tests {
         // the probes still answer GET
         let response = client.get(format!("http://{gateway}/health")).send().await.expect("send");
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    /// Every probe path refuses a method other than `GET` or `HEAD` with a
+    /// message that agrees with its `Allow: GET,HEAD`, not the proxy's "only
+    /// POST is accepted", and never forwards it.
+    #[tokio::test]
+    async fn probe_paths_refuse_other_methods_with_a_get_head_message() {
+        let (worker, worker_seen, _worker) = named_mock("worker").await;
+        let state = redirect_state(worker, None);
+        state.readiness.set_ready(0, true);
+        let (gateway, _shutdown) = spawn(router(
+            state,
+            Duration::from_secs(5),
+            1024,
+            None,
+            RouterLayers::default(),
+            Arc::default(),
+        ))
+        .await;
+
+        let client = Client::new();
+        for path in [HEALTH_PATH, READY_PATH, READY_ANY_PATH] {
+            for method in [Method::POST, Method::DELETE] {
+                let response = client
+                    .request(method.clone(), format!("http://{gateway}{path}"))
+                    .body(call("eth_chainId", 1))
+                    .send()
+                    .await
+                    .expect("send");
+                assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED, "{method} {path}");
+                assert_eq!(
+                    response.headers().get(header::ALLOW),
+                    Some(&HeaderValue::from_static("GET,HEAD")),
+                    "{method} {path}"
+                );
+                let body: serde_json::Value = response.json().await.expect("json error body");
+                assert_eq!(body["error"]["code"], -32600, "{method} {path}");
+                assert_eq!(
+                    body["error"]["message"], "only GET and HEAD are accepted on this path",
+                    "{method} {path}"
+                );
+                assert_eq!(body["id"], serde_json::Value::Null, "{method} {path}");
+            }
+        }
+        assert_eq!(worker_seen.hits(), 0, "a probe-path request must never reach the upstream");
+    }
+
+    /// [`is_connection_error`] classifies an accept error about the one
+    /// connection (its peer aborted it, or a network error already pending on
+    /// it) as a connection error, which the accept loops retry at once, and one
+    /// about the process (fd exhaustion, out of memory) as not, which takes the
+    /// back-off; the loops' use of the verdict is not driven here.
+    #[test]
+    fn accept_errors_are_classified_per_connection_or_process() {
+        use std::io::{Error, ErrorKind};
+        assert!(is_connection_error(&Error::from(ErrorKind::ConnectionAborted)));
+        assert!(is_connection_error(&Error::from(ErrorKind::ConnectionReset)));
+        // `EPROTO`, a pending network error `accept(2)` returns on Linux
+        assert_eq!(
+            is_connection_error(&Error::from_raw_os_error(71)),
+            cfg!(any(target_os = "android", target_os = "linux"))
+        );
+        // `EMFILE`
+        assert!(!is_connection_error(&Error::from_raw_os_error(24)));
+        assert!(!is_connection_error(&Error::from(ErrorKind::OutOfMemory)));
     }
 
     /// A query upstream that answers every POST with an HTML page labelled
@@ -7973,6 +8879,9 @@ mod tests {
             .expect("send")
     }
 
+    /// A query upstream's `2xx` without a JSON content type (a CDN challenge
+    /// or a captive page, say) carries no JSON-RPC answer: the client gets the
+    /// upstream's status with the `-32012` error, labelled JSON, in its place.
     #[tokio::test]
     async fn query_route_non_json_content_type_is_replaced() {
         for content_type in [
@@ -8000,6 +8909,13 @@ mod tests {
                 Some(&HeaderValue::from_static("nosniff")),
                 "{content_type:?}"
             );
+            let text = response.text().await.expect("text");
+            assert_eq!(
+                error_code_and_id(&text),
+                (-32012, serde_json::json!(1)),
+                "{content_type:?}"
+            );
+            assert!(text.contains("upstream returned 200"), "{content_type:?}: {text}");
         }
     }
 
@@ -8025,11 +8941,13 @@ mod tests {
         let (worker, _worker_seen, _worker) = named_mock("worker").await;
         let state = redirect_state(worker, None);
         state.readiness.set_ready(0, true);
-        // one request a second with no burst headroom, so the second POST is
-        // shed by the rate limiter, the layer just inside the nosniff one
+        // one request a second with a burst of two: the probe-path PUT (no
+        // longer exempt, only GET and HEAD are) and the first POST take the two
+        // tokens, so the second POST is shed by the rate limiter, the layer just
+        // inside the nosniff one; the GET probes are exempt
         let limiters = RateLimiters::new(
             None,
-            Some(RateLimit::new(nz(1), nz(1))),
+            Some(RateLimit::new(nz(1), nz(2))),
             None,
             16,
             PrefixPolicy::default(),
@@ -8048,6 +8966,7 @@ mod tests {
         let client = Client::new();
         let url = |path: &str| format!("http://{gateway}{path}");
         let cases = [
+            ("method refused", client.put(url("/health")), StatusCode::METHOD_NOT_ALLOWED),
             ("proxied", client.post(url("/")).body(call("eth_chainId", 1)), StatusCode::OK),
             (
                 "rate limited",
@@ -8056,7 +8975,6 @@ mod tests {
             ),
             ("liveness", client.get(url("/health")), StatusCode::OK),
             ("readiness", client.get(url("/ready")), StatusCode::OK),
-            ("method refused", client.put(url("/health")), StatusCode::METHOD_NOT_ALLOWED),
         ];
         for (case, request, status) in cases {
             let response = request.send().await.expect("send");
@@ -8229,6 +9147,13 @@ mod tests {
         assert_eq!((worker_seen.hop_marker(), worker_seen.redirect_marker()), (3, 0));
     }
 
+    /// Why a test skips its assertions on a throttled warning outside nextest
+    /// (or, for one that asserts nothing else, the whole test): the throttles
+    /// are process-wide statics, so under `cargo test` another test may
+    /// already have used up the window and the warning never appears.
+    const THROTTLED_WARNING_SKIP: &str = "reads a warning a process-wide throttle admits once per \
+                                          10s, so it needs nextest's process-per-test model";
+
     /// A `MakeWriter` that appends every formatted log line to a shared
     /// buffer.
     #[derive(Clone, Default)]
@@ -8266,6 +9191,10 @@ mod tests {
     /// through the same thread-local subscriber.
     #[tokio::test]
     async fn header_value_never_appears_in_logs() {
+        let per_test = process_per_test();
+        if !per_test {
+            eprintln!("not checking the throttled forwarding warning: {THROTTLED_WARNING_SKIP}");
+        }
         let logs = CapturedLogs::default();
         let subscriber = tracing_subscriber::fmt()
             .with_writer(logs.clone())
@@ -8282,13 +9211,14 @@ mod tests {
         let header = format!("--redirect-queries-header={}", api_key_line());
         let worker_flag = format!("--upstream-rpc-url=http://{worker}/");
         for redirect in [format!("http://{query}/"), "http://203.0.113.5:8545/".to_string()] {
-            let settings = Cli::parse_from([
+            let settings = crate::cli::try_parse_test_argv([
                 "worker-gateway",
                 worker_flag.as_str(),
                 "--upstream-readiness-url=http://127.0.0.1:1/health/workers",
                 format!("--redirect-queries={redirect}").as_str(),
                 header.as_str(),
             ])
+            .expect("parse")
             .into_settings()
             .expect("settings resolve");
             assert!(settings.query_header.is_some());
@@ -8306,7 +9236,8 @@ mod tests {
         let worker_url = Url::parse(&format!("http://{worker}/")).expect("worker url");
         for query_url in [format!("http://{query}/"), "http://127.0.0.1:1/".to_string()] {
             let query_url = Url::parse(&query_url).expect("query url");
-            let check = check_chain_ids(&client, &worker_url, &query_url, Some(&header)).await;
+            let check =
+                check_chain_ids(&client, &client, &worker_url, &query_url, Some(&header)).await;
             log_chain_id_check(&check, &worker_url, &query_url);
         }
 
@@ -8328,13 +9259,16 @@ mod tests {
 
         let captured = logs.contents();
         // the capture saw the gateway's own lines, and the header was in play
-        for line in [
+        let mut expected = vec![
             "plain http",
             "resolved settings",
             "could not compare the chain ids",
             "gateway state",
-            "forwarding to upstream failed",
-        ] {
+        ];
+        if per_test {
+            expected.push("forwarding to upstream failed");
+        }
+        for line in expected {
             assert!(captured.contains(line), "missing {line:?} in: {captured}");
         }
         assert!(captured.contains("<redacted>"), "the header should print redacted: {captured}");
@@ -8510,8 +9444,9 @@ mod tests {
     #[tokio::test]
     async fn ready_reports_503_during_the_shutdown_delay_while_posts_succeed() {
         let (worker, worker_seen, _worker) = named_mock("worker").await;
-        let (gateway, shutdown, _accept) =
-            draining_gateway(worker, Duration::from_millis(500)).await;
+        // the test never waits the delay out, so a long one costs nothing
+        // and leaves the exchanges below no window to miss
+        let (gateway, shutdown, _accept) = draining_gateway(worker, Duration::from_secs(5)).await;
         assert_eq!(get_ready(gateway).await, (StatusCode::OK, serde_json::json!({"ready": true})));
 
         shutdown.notify();
@@ -8562,8 +9497,9 @@ mod tests {
     #[tokio::test]
     async fn ready_any_reports_503_during_the_shutdown_delay_while_posts_succeed() {
         let (worker, worker_seen, _worker) = named_mock("worker").await;
-        let (gateway, shutdown, _accept) =
-            draining_gateway(worker, Duration::from_millis(500)).await;
+        // the test never waits the delay out, so a long one costs nothing
+        // and leaves the exchanges below no window to miss
+        let (gateway, shutdown, _accept) = draining_gateway(worker, Duration::from_secs(5)).await;
         assert_eq!(
             get_probe(gateway, READY_ANY_PATH).await,
             (
@@ -8729,9 +9665,12 @@ mod tests {
     }
 
     /// A disallowed origin is still served, as a non-browser client would be,
-    /// but its `POST` gets no CORS header and its preflight no
+    /// but neither its `POST` nor its preflight gets
     /// `Access-Control-Allow-Origin`, so a browser withholds the response from
-    /// the page. Matching is exact: scheme, host and port must all agree.
+    /// the page. The `POST` carries only the `Access-Control-Expose-Headers`
+    /// the layer adds to every answer but a preflight, which grants nothing
+    /// without the origin. Matching is exact: scheme, host and port must all
+    /// agree.
     #[tokio::test]
     async fn disallowed_origin_gets_no_cors_headers() {
         let (gateway, worker_seen, _guards) =
@@ -8747,7 +9686,7 @@ mod tests {
         for origin in disallowed {
             let response = post_from(gateway, origin).await;
             assert_eq!(response.status(), StatusCode::OK, "{origin}");
-            assert_eq!(cors_headers(&response), Vec::<String>::new(), "{origin}");
+            assert_eq!(cors_headers(&response), ["access-control-expose-headers"], "{origin}");
             assert_eq!(response.text().await.expect("text"), "worker", "{origin}");
 
             // the preflight is still answered locally, without allowing the
@@ -8766,6 +9705,23 @@ mod tests {
             );
         }
         assert_eq!(worker_seen.hits(), disallowed.len(), "only the posts are forwarded");
+    }
+
+    /// An allowed page can read `Retry-After`: the browser hides a response
+    /// header from the page unless the CORS answer exposes it.
+    #[tokio::test]
+    async fn cors_response_exposes_retry_after() {
+        let origin = "https://app.example";
+        let (gateway, _worker_seen, _guards) = cors_gateway(cors_list(&[origin])).await;
+
+        let response = post_from(gateway, origin).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(header_value(&response, header::ACCESS_CONTROL_ALLOW_ORIGIN), origin);
+        let exposed = header_value(&response, header::ACCESS_CONTROL_EXPOSE_HEADERS);
+        assert!(
+            exposed.split(',').any(|name| name.trim().eq_ignore_ascii_case("retry-after")),
+            "exposed: {exposed:?}"
+        );
     }
 
     #[tokio::test]
@@ -9024,7 +9980,7 @@ mod tests {
         layers: RouterLayers,
         trusted: Arc<TrustedProxies>,
     ) -> Router {
-        let access_log = AccessLog::new(rate, PrefixPolicy::default());
+        let access_log = AccessLog::new(rate, None, PrefixPolicy::default());
         router(
             state,
             Duration::from_secs(5),
@@ -9116,11 +10072,34 @@ mod tests {
         );
     }
 
+    /// The line ceiling caps the lines the sampler admits within one second
+    /// and counts the rest; the next second opens a fresh window.
+    #[test]
+    fn access_log_ceiling_suppresses_and_counts_lines_over_the_limit() {
+        let mut metrics = CapturedMetrics::install();
+        let log = AccessLog::new(1.0, NonZeroU32::new(2), PrefixPolicy::default())
+            .expect("a non-zero rate installs the log");
+        let second_zero: Vec<bool> = (0..3).map(|_| log.sample_at(0)).collect();
+        assert_eq!(second_zero, [true, true, false]);
+        assert!(log.sample_at(1), "a new second opens a new window");
+        assert_eq!(metrics.value("tn_worker_gateway_access_log_suppressed_total", &[]), 1.0);
+    }
+
+    /// A `0` ceiling (`None` once resolved) never suppresses a sampled line.
+    #[test]
+    fn access_log_ceiling_zero_is_unlimited() {
+        let mut metrics = CapturedMetrics::install();
+        let log = AccessLog::new(1.0, NonZeroU32::new(0), PrefixPolicy::default())
+            .expect("a non-zero rate installs the log");
+        assert!((0..10_000).all(|_| log.sample_at(0)), "every sampled line is written");
+        assert_eq!(metrics.value("tn_worker_gateway_access_log_suppressed_total", &[]), 0.0);
+    }
+
     #[tokio::test]
     async fn sample_rate_zero_logs_nothing() {
         let (lines, _capture) = AccessLines::capture();
         assert!(
-            AccessLog::new(0.0, PrefixPolicy::default()).is_none(),
+            AccessLog::new(0.0, None, PrefixPolicy::default()).is_none(),
             "a zero rate installs no access log"
         );
         let (worker, _seen, _worker) = named_mock("worker").await;
@@ -9251,7 +10230,7 @@ mod tests {
     async fn oversized_body_is_logged_unknown_rejected() {
         let (lines, _capture) = AccessLines::capture();
         let (worker, _seen, _worker) = named_mock("worker").await;
-        let access_log = AccessLog::new(1.0, PrefixPolicy::default());
+        let access_log = AccessLog::new(1.0, None, PrefixPolicy::default());
         let layers = RouterLayers { access_log, ..RouterLayers::default() };
         let app =
             router(ready_state(worker), Duration::from_secs(5), 64, None, layers, Arc::default());
@@ -9314,6 +10293,80 @@ mod tests {
         );
     }
 
+    /// A request whose client closes the connection while the gateway awaits
+    /// the worker is dropped without an answer; it counts as
+    /// `outcome="cancelled"`, so the outcomes still add up to every request.
+    #[tokio::test]
+    async fn cancelled_request_counts_outcome_cancelled() {
+        const REQUESTS: &str = "tn_worker_gateway_requests_total";
+        let mut metrics = CapturedMetrics::install();
+        let (worker, worker_seen, _worker) = counted_slow_mock(Duration::from_secs(10)).await;
+        let (gateway, _shutdown) = spawn(router(
+            ready_state(worker),
+            Duration::from_secs(30),
+            MAX_REQUEST_BYTES,
+            None,
+            RouterLayers::default(),
+            Arc::default(),
+        ))
+        .await;
+
+        // a complete request, then a close while the gateway awaits the worker
+        let body = call("eth_chainId", 1);
+        let mut stream = TcpStream::connect(gateway).await.expect("connect");
+        let request = format!(
+            "POST / HTTP/1.1\r\nHost: gateway\r\nContent-Type: application/json\r\n\
+             Content-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        stream.write_all(request.as_bytes()).await.expect("write");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while worker_seen.hits() == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the request never reached the worker");
+        drop(stream);
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while metrics.value(REQUESTS, &[("outcome", "cancelled")]) < 1.0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the dropped request should count as cancelled");
+        assert_eq!(metrics.value(REQUESTS, &[("outcome", "cancelled")]), 1.0);
+        assert_eq!(metrics.value(REQUESTS, &[("outcome", "forwarded")]), 0.0);
+        assert_eq!(metrics.value(REQUESTS, &[("outcome", "rejected")]), 0.0);
+    }
+
+    /// The deadline's answer records `rejected` where it is built; the
+    /// cancellation counter sits outside the deadline layer and sees that
+    /// answer, so the request is not counted again as cancelled.
+    #[tokio::test]
+    async fn deadline_is_not_counted_as_cancelled() {
+        const REQUESTS: &str = "tn_worker_gateway_requests_total";
+        let mut metrics = CapturedMetrics::install();
+        let (worker, worker_seen, _worker) = counted_slow_mock(Duration::from_secs(10)).await;
+        let (gateway, _shutdown) = spawn(router(
+            ready_state(worker),
+            Duration::from_millis(300),
+            MAX_REQUEST_BYTES,
+            None,
+            RouterLayers::default(),
+            Arc::default(),
+        ))
+        .await;
+
+        let (status, _) = post_rpc(gateway, None, call("eth_chainId", 1)).await;
+        assert_eq!(status, StatusCode::GATEWAY_TIMEOUT);
+        assert_eq!(worker_seen.hits(), 1, "the request was forwarded");
+        assert_eq!(metrics.value(REQUESTS, &[("outcome", "rejected")]), 1.0);
+        assert_eq!(metrics.value(REQUESTS, &[("outcome", "cancelled")]), 0.0);
+        assert_eq!(metrics.value(REQUESTS, &[("outcome", "forwarded")]), 0.0);
+    }
+
     #[tokio::test]
     async fn request_timeout_after_forward_keeps_class_and_route() {
         let (lines, _capture) = AccessLines::capture();
@@ -9324,7 +10377,7 @@ mod tests {
             Client::builder().timeout(Duration::from_secs(5)).build().expect("build client");
         let state = test_state_with_client(&[upstream(worker)], proxy_client);
         state.readiness.set_ready(0, true);
-        let access_log = AccessLog::new(1.0, PrefixPolicy::default());
+        let access_log = AccessLog::new(1.0, None, PrefixPolicy::default());
         let layers = RouterLayers { access_log, ..RouterLayers::default() };
         let app = router(
             state,
@@ -9337,7 +10390,7 @@ mod tests {
         let (gateway, _shutdown) = spawn(app).await;
 
         let body = call("eth_chainId", 1);
-        assert_eq!(post_rpc(gateway, None, body.clone()).await.0, StatusCode::REQUEST_TIMEOUT);
+        assert_eq!(post_rpc(gateway, None, body.clone()).await.0, StatusCode::GATEWAY_TIMEOUT);
         assert_eq!(worker_seen.hits(), 1, "the request was forwarded");
         let lines = lines.lines();
         assert_eq!(lines.len(), 1, "{lines:?}");
@@ -9345,13 +10398,14 @@ mod tests {
         assert_eq!(
             [&lines[0]["class"], &lines[0]["route"], &lines[0]["status"], &lines[0]["bytes_in"]]
                 .map(String::as_str),
-            ["query", "worker", "408", size.as_str()]
+            ["query", "worker", "504", size.as_str()]
         );
     }
 
     /// Behind a trusted front the line names the client the front forwarded
-    /// for, masked to the rate limiter's prefix, as the limiter keys it; never
-    /// the front's own address.
+    /// for, masked to the rate limiter's prefix, as the limiter keys it, not
+    /// the front's own address (which it names only when the front forwarded
+    /// no usable client).
     #[tokio::test]
     async fn access_log_names_the_forwarded_client_behind_a_trusted_proxy() {
         let (lines, _capture) = AccessLines::capture();
@@ -9570,18 +10624,20 @@ mod tests {
         assert_eq!(target_polls.load(Ordering::SeqCst), 0, "the redirect target was polled");
     }
 
-    /// Both upstream clients ignore proxy variables. Every proxy variable
+    /// Every upstream client ignores proxy variables. Every proxy variable
     /// points at a port nothing listens on, with no `NO_PROXY` exemption, yet
     /// a poll through the production readiness client still marks the worker
-    /// ready and a call through the production proxy client still reaches it.
-    /// Both clients are the ones `app::run` builds (see [`UpstreamClients`]).
+    /// ready, a call through the production proxy client still reaches the
+    /// worker, and a read through the production query client still reaches
+    /// the `--redirect-queries` upstream. The clients are the ones `app::run`
+    /// builds (see [`UpstreamClients`]).
     ///
     /// The variables set here are process-wide, so the body runs only under
     /// nextest's process-per-test model, where they reach no other test; any
     /// other runner skips it.
     #[tokio::test]
     async fn clients_ignore_proxy_environment() {
-        if std::env::var("NEXTEST_EXECUTION_MODE").as_deref() != Ok("process-per-test") {
+        if !process_per_test() {
             eprintln!(
                 "skipped: clients_ignore_proxy_environment needs nextest's process-per-test model"
             );
@@ -9599,11 +10655,17 @@ mod tests {
         }
 
         let (worker, worker_seen, _worker) = named_mock("worker").await;
+        let (query, query_seen, _query) = named_mock("query").await;
         let (node, node_polls, _node) = counted_ready_node().await;
-        let settings = worker_settings("http", worker, node, &[]);
-        let UpstreamClients { proxy, readiness: readiness_client } =
+        // the query upstream listens on its own port: a redirect to the
+        // worker's own address is refused when the settings are resolved
+        let settings =
+            worker_settings("http", worker, node, &[format!("--redirect-queries=http://{query}/")]);
+        let UpstreamClients { proxy, query: query_client, readiness: readiness_client } =
             UpstreamClients::new(&settings, Arc::new(SystemLookup)).expect("clients");
-        let state = test_state_with_client(&settings.upstreams, proxy);
+        let mut state = test_state_with_client(&settings.upstreams, proxy);
+        state.query_upstream = settings.query_upstream.clone();
+        state.query_http = Some(query_client.expect("a redirect builds the query client"));
         let readiness = Arc::clone(&state.readiness);
         let _poller = spawn_readiness_poller(Arc::clone(&readiness), readiness_client);
         assert!(
@@ -9616,14 +10678,27 @@ mod tests {
 
         // the test's own client must not use the proxy either
         let client = Client::builder().no_proxy().build().expect("client");
+        // with a redirect a read goes to the query upstream, so the call that
+        // must reach the worker is a submission
         let response = client
             .post(format!("http://{gateway}/"))
-            .body(call("eth_chainId", 1))
+            .body(submission(1))
             .send()
             .await
             .expect("send");
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(response.text().await.expect("text"), "worker");
+        assert_eq!(worker_seen.hits(), 1);
+
+        let response = client
+            .post(format!("http://{gateway}/"))
+            .body(call("eth_call", 2))
+            .send()
+            .await
+            .expect("send");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.text().await.expect("text"), "query");
+        assert_eq!(query_seen.hits(), 1);
         assert_eq!(worker_seen.hits(), 1);
     }
 }

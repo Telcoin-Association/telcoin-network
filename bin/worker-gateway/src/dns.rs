@@ -32,9 +32,10 @@
 //! The names the resolver sees come from the gateway's own configuration: the
 //! worker RPC and readiness URLs and `--redirect-queries`. reqwest never calls a
 //! resolver for an IP literal, and nothing in a client request becomes part of
-//! an upstream URL. The readiness client follows the node's redirects, so a
-//! readiness endpoint could name another host; the cache is capped at
-//! [`MAX_ENTRIES`] hosts as a backstop.
+//! an upstream URL. No upstream client follows a redirect (see
+//! [`crate::proxy::proxy_client`], which finishes both forwarding clients, and
+//! [`crate::proxy::readiness_client`]), so only the configured hosts reach the
+//! resolver; the cache is still capped at [`MAX_ENTRIES`] hosts as a backstop.
 
 use std::{
     collections::HashMap,
@@ -70,8 +71,9 @@ const MAX_ENTRIES: usize = 256;
 /// A [`Resolve`] implementation that caches each host's addresses and caps
 /// how many lookups run at once (see the module docs).
 ///
-/// Each client gets its own instance, so two clients never share a cache or a
-/// lookup cap.
+/// Each [`crate::proxy::client_builder`] call installs its own instance; the
+/// two forwarding clients share one (see [`crate::proxy::route_clients`]), and
+/// the readiness client keeps its own.
 pub(crate) struct CachingResolver {
     /// State shared with every lookup task, which writes its answer back here.
     cache: Arc<Cache>,

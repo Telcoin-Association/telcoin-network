@@ -55,9 +55,12 @@ use crate::{
     proxy::{chain_id_request, QueryHeader, Route, UpstreamOrigin},
 };
 
-/// Readiness envelope version the gateway targets. Newer versions still parse,
-/// because unknown fields are ignored (see [`NodeReadiness`]); this is only used
-/// to log a heads-up when the shape may have changed.
+/// Readiness envelope version the gateway targets. Other versions still parse,
+/// best-effort, because unknown fields are ignored (see [`NodeReadiness`]);
+/// this is only used to log a heads-up when the shape may have changed: at
+/// warn for the first poll of a run of such answers from one upstream, at
+/// debug for the rest of the run (see
+/// [`UpstreamReadiness::record_envelope_version`]).
 const READINESS_VERSION: u32 = 1;
 
 /// Largest readiness body the poller reads, in bytes. The node's payload is a
@@ -230,6 +233,39 @@ impl UpstreamReadiness {
             "upstream worker became not-ready"
         );
     }
+
+    /// Note the envelope version a parsed poll answered with. A version other
+    /// than [`READINESS_VERSION`] is parsed best-effort, and may mean the node
+    /// changed what the fields mean, so the first poll of a run of such
+    /// answers logs it at warn, where the default filter shows it, and every
+    /// later poll of the run at debug. A poll that answers the expected
+    /// version ends the run.
+    fn record_envelope_version(&self, version: u32) {
+        let mut streak = self.streak();
+        if version == READINESS_VERSION {
+            streak.version_warned = false;
+        } else if streak.version_warned {
+            debug!(
+                target: "gateway::readiness",
+                worker_id = self.worker_id,
+                readiness = %UpstreamOrigin(&self.readiness_url),
+                version,
+                expected = READINESS_VERSION,
+                "unexpected readiness envelope version; parsing best-effort"
+            );
+        } else {
+            streak.version_warned = true;
+            warn!(
+                target: "gateway::readiness",
+                worker_id = self.worker_id,
+                upstream = %UpstreamOrigin(&self.rpc_url),
+                readiness = %UpstreamOrigin(&self.readiness_url),
+                version,
+                expected = READINESS_VERSION,
+                "unexpected readiness envelope version; parsing best-effort"
+            );
+        }
+    }
 }
 
 /// Shared readiness view over all configured upstreams.
@@ -390,9 +426,9 @@ pub(crate) struct ReadinessThresholds {
 pub(crate) struct QueryProbe {
     /// The query upstream's URL.
     pub(crate) url: Url,
-    /// The proxy client (see [`crate::proxy::proxy_client`]), so the probe
-    /// travels like a redirected read: same connection pool, user agent and
-    /// redirect policy.
+    /// The query route's client (see [`crate::proxy::route_clients`]), so the
+    /// probe travels like a redirected read: same connection pool, user agent,
+    /// redirect policy and resolver.
     pub(crate) client: Client,
     /// The `--redirect-queries-header` header, sent with every probe like
     /// with every redirected read, or `None`. Its `Debug` is redacted.
@@ -411,20 +447,22 @@ pub(crate) async fn run_poller(
     shutdown: Noticer,
 ) -> Result<(), TaskError> {
     let mut ticker = interval(poll_interval);
-    // Skip (do not burst) missed ticks: a cycle that overruns `poll_interval`
-    // (a hanging upstream with a `poll_timeout` longer than the interval) must
-    // not then fire back-to-back catch-up cycles, which would pile extra load
-    // onto already-failing upstreams. `Skip` keeps at least `poll_interval`
-    // spacing between cycles regardless of cycle duration.
+    // Skip (do not burst) missed ticks. A cycle lasts at most one
+    // `poll_timeout`, which startup keeps within `poll_interval`, so a cycle
+    // overruns its tick only when the two are equal or the runtime stalls;
+    // then `Skip` fires the overdue tick at once and snaps back to the
+    // `poll_interval` grid instead of firing back-to-back catch-up cycles,
+    // which would pile extra load onto already-failing upstreams. It does not
+    // keep a full `poll_interval` between cycles.
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
     loop {
         tokio::select! {
             () = &shutdown => break,
             _ = ticker.tick() => {
                 // race the cycle against shutdown so teardown never waits on a
-                // slow poll; an abandoned cycle records nothing. The query
-                // upstream is probed alongside the workers, so a cycle still
-                // lasts at most one `poll_timeout`.
+                // slow poll; an abandoned cycle records only the polls that
+                // already finished. The query upstream is probed alongside the
+                // workers, so a cycle still lasts at most one `poll_timeout`.
                 let query = query_probe
                     .as_ref()
                     .map(|probe| poll_query_upstream(probe, &readiness, poll_timeout));
@@ -445,14 +483,19 @@ pub(crate) async fn run_poller(
 /// Run one poll cycle: poll every upstream at once, each bounded by
 /// `poll_timeout`, and apply each result as it lands. A cycle lasts at most one
 /// `poll_timeout`, however many upstreams hang, so one hanging upstream cannot
-/// delay the polls of the others.
+/// delay the polls of the others in its cycle, and startup keeps
+/// `poll_timeout` within `--readiness-poll-interval`, so it cannot stretch the
+/// cadence of later cycles either.
 ///
 /// [`run_poller`] runs one cycle per tick; tests call it directly to step the
 /// readiness state one cycle at a time.
 async fn poll_cycle(readiness: &GatewayReadiness, client: &Client, poll_timeout: Duration) {
     let polls = readiness.upstreams.iter().map(|upstream| async move {
-        let result =
+        let (result, version) =
             poll_one(client, &upstream.readiness_url, upstream.worker_id, poll_timeout).await;
+        if let Some(version) = version {
+            upstream.record_envelope_version(version);
+        }
         upstream.record_poll(result, readiness.thresholds);
     });
     futures::future::join_all(polls).await;
@@ -526,30 +569,32 @@ async fn fetch_query_ready(
 }
 
 /// Poll a single upstream: `Ok` when the worker reports it is accepting
-/// transactions, otherwise the cause of the failed poll.
+/// transactions, otherwise the cause of the failed poll, with the envelope
+/// version when the payload was read and parsed.
 async fn poll_one(
     client: &Client,
     url: &Url,
     worker_id: u16,
     poll_timeout: Duration,
-) -> Result<(), NotReadyCause> {
-    let accepting = timeout(poll_timeout, fetch_readiness(client, url, worker_id))
-        .await
-        .map_err(|_elapsed| NotReadyCause::Timeout)??;
-    if accepting {
-        Ok(())
-    } else {
-        Err(NotReadyCause::NotAccepting)
-    }
+) -> (Result<(), NotReadyCause>, Option<u32>) {
+    let (accepting, version) =
+        match timeout(poll_timeout, fetch_readiness(client, url, worker_id)).await {
+            Ok(Ok(answer)) => answer,
+            Ok(Err(cause)) => return (Err(cause), None),
+            Err(_elapsed) => return (Err(NotReadyCause::Timeout), None),
+        };
+    let result = if accepting { Ok(()) } else { Err(NotReadyCause::NotAccepting) };
+    (result, Some(version))
 }
 
 /// Fetch and parse one upstream's readiness payload, reading at most
-/// [`MAX_READINESS_BODY_BYTES`] of body.
+/// [`MAX_READINESS_BODY_BYTES`] of body: whether the worker is accepting
+/// transactions, and the envelope version.
 async fn fetch_readiness(
     client: &Client,
     url: &Url,
     worker_id: u16,
-) -> Result<bool, NotReadyCause> {
+) -> Result<(bool, u32), NotReadyCause> {
     let mut response = client.get(url.clone()).send().await.map_err(NotReadyCause::connection)?;
     let status = response.status();
     if !status.is_success() {
@@ -567,29 +612,23 @@ async fn fetch_readiness(
         }
         body.extend_from_slice(&chunk);
     }
-    parse_ready(&body, worker_id).ok_or(NotReadyCause::MalformedPayload)
+    parse_readiness(&body, worker_id).ok_or(NotReadyCause::MalformedPayload)
 }
 
-/// Parse a readiness payload, returning `Some(accepting)` for the requested
-/// worker (or `Some(false)` when it is absent), and `None` when the payload is
-/// not valid JSON of the expected shape.
-fn parse_ready(bytes: &[u8], worker_id: u16) -> Option<bool> {
+/// Parse a readiness payload, returning whether the requested worker is
+/// accepting transactions (`false` when it is absent) and the envelope's
+/// version, and `None` when the payload is not valid JSON of the expected
+/// shape. Any version is parsed best-effort; the caller logs a version other
+/// than [`READINESS_VERSION`] per upstream (see
+/// [`UpstreamReadiness::record_envelope_version`]).
+fn parse_readiness(bytes: &[u8], worker_id: u16) -> Option<(bool, u32)> {
     let readiness: NodeReadiness = serde_json::from_slice(bytes).ok()?;
-    if readiness.version != READINESS_VERSION {
-        debug!(
-            target: "gateway::readiness",
-            version = readiness.version,
-            expected = READINESS_VERSION,
-            "unexpected readiness envelope version; parsing best-effort"
-        );
-    }
-    Some(
-        readiness
-            .workers
-            .iter()
-            .find(|worker| worker.worker_id == worker_id)
-            .is_some_and(|worker| worker.accepting_transactions),
-    )
+    let accepting = readiness
+        .workers
+        .iter()
+        .find(|worker| worker.worker_id == worker_id)
+        .is_some_and(|worker| worker.accepting_transactions);
+    Some((accepting, readiness.version))
 }
 
 /// The run of consecutive poll results for one upstream.
@@ -602,6 +641,10 @@ struct PollStreak {
     /// Set once the upstream has been ready, or once its first failed poll
     /// has been logged at info.
     first_failure_logged: bool,
+    /// Set once a poll's unexpected envelope version has been logged at
+    /// warn; cleared by a poll that answers the expected version, so the
+    /// next mismatch warns again.
+    version_warned: bool,
 }
 
 /// Why an upstream is not ready: the cause of a failed poll, or a mark from the
@@ -662,9 +705,15 @@ mod tests {
     use super::*;
     use crate::{proxy::UpstreamClientBuilder, telemetry::test_utils::CapturedMetrics};
     use axum::{body::Body, response::IntoResponse as _, routing::get, Router};
-    use std::{io, net::SocketAddr, sync::atomic::AtomicU8, time::Instant};
+    use std::{io, net::SocketAddr, sync::atomic::AtomicU8};
     use tn_types::Notifier;
     use tokio::net::TcpListener;
+
+    /// The accepting half of [`parse_readiness`], which the payload tests
+    /// below check.
+    fn parse_ready(bytes: &[u8], worker_id: u16) -> Option<bool> {
+        parse_readiness(bytes, worker_id).map(|(accepting, _version)| accepting)
+    }
 
     #[test]
     fn parses_ready_worker() {
@@ -794,6 +843,23 @@ mod tests {
                         }
                         _ => READY_BODY.into_response(),
                     }
+                }
+            }),
+        );
+        serve_mock(app).await
+    }
+
+    /// Serve a mock `GET /health/workers` that answers [`READY_BODY`] only once
+    /// as many requests as `barrier` counts are waiting on it, across every
+    /// mock that shares it.
+    async fn mock_readiness_at_barrier(barrier: Arc<tokio::sync::Barrier>) -> SocketAddr {
+        let app = Router::new().route(
+            "/health/workers",
+            get(move || {
+                let barrier = Arc::clone(&barrier);
+                async move {
+                    barrier.wait().await;
+                    READY_BODY
                 }
             }),
         );
@@ -973,6 +1039,124 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn version_mismatch_warns_once_per_upstream() {
+        const LINE: &str = "unexpected readiness envelope version";
+        let captured = Captured::default();
+        let writer = captured.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || writer.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::DEBUG)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        // a worker whose envelope version the test switches between polls
+        let version = Arc::new(AtomicU32::new(2));
+        let served = Arc::clone(&version);
+        let app = Router::new().route(
+            "/health/workers",
+            get(move || {
+                let version = served.load(Ordering::SeqCst);
+                async move {
+                    format!(
+                        r#"{{"version":{version},"workers":[{{"worker_id":0,"accepting_transactions":true}}]}}"#
+                    )
+                }
+            }),
+        );
+        let addr = serve_mock(app).await;
+        let readiness = GatewayReadiness::new(&[upstream_at(0, addr)], thresholds(3, 1));
+        let client = Client::new();
+        let version_lines = || -> Vec<String> {
+            captured.lines().into_iter().filter(|line| line.contains(LINE)).collect()
+        };
+
+        // two mismatching polls: one warning, then the per-poll debug line;
+        // the payload still parses, so the upstream turns ready
+        poll_cycle(&readiness, &client, STEP_TIMEOUT).await;
+        poll_cycle(&readiness, &client, STEP_TIMEOUT).await;
+        assert!(readiness.any_ready(), "a mismatching version is parsed best-effort");
+        let lines = version_lines();
+        assert_eq!(lines.len(), 2, "{lines:#?}");
+        assert!(lines[0].contains(" WARN "), "{}", lines[0]);
+        assert!(lines[0].contains("version=2") && lines[0].contains("expected=1"), "{}", lines[0]);
+        assert!(lines[0].contains(&format!("readiness=http://{addr}")), "{}", lines[0]);
+        assert!(!lines[0].contains("/health/workers"), "url leaked: {}", lines[0]);
+        assert!(lines[1].contains(" DEBUG "), "{}", lines[1]);
+
+        // a matching poll ends the run, so the next mismatch warns again
+        version.store(1, Ordering::SeqCst);
+        poll_cycle(&readiness, &client, STEP_TIMEOUT).await;
+        assert_eq!(version_lines().len(), 2, "a matching version logs nothing");
+        version.store(2, Ordering::SeqCst);
+        poll_cycle(&readiness, &client, STEP_TIMEOUT).await;
+        let lines = version_lines();
+        assert_eq!(lines.len(), 3, "{lines:#?}");
+        assert!(lines[2].contains(" WARN "), "{}", lines[2]);
+        let warnings = lines.iter().filter(|line| line.contains(" WARN ")).count();
+        assert_eq!(warnings, 2, "{lines:#?}");
+    }
+
+    /// The version warning is kept per upstream: two upstreams that both
+    /// answer a mismatching version each warn once, on a line naming their own
+    /// worker and readiness origin, and then each log at debug.
+    #[tokio::test]
+    async fn version_mismatch_warns_once_for_each_upstream() {
+        const LINE: &str = "unexpected readiness envelope version";
+        let captured = Captured::default();
+        let writer = captured.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || writer.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::DEBUG)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        // a node answering a mismatching version for its one worker
+        let mismatching = |worker_id: u16| {
+            let body = format!(
+                r#"{{"version":2,"workers":[{{"worker_id":{worker_id},"accepting_transactions":true}}]}}"#
+            );
+            Router::new().route(
+                "/health/workers",
+                get(move || {
+                    let body = body.clone();
+                    async move { body }
+                }),
+            )
+        };
+        let a = serve_mock(mismatching(0)).await;
+        let b = serve_mock(mismatching(1)).await;
+        let readiness =
+            GatewayReadiness::new(&[upstream_at(0, a), upstream_at(1, b)], thresholds(3, 1));
+        let client = Client::new();
+
+        // two mismatching polls of each upstream: each warns once, then logs
+        // its second poll at debug
+        poll_cycle(&readiness, &client, STEP_TIMEOUT).await;
+        poll_cycle(&readiness, &client, STEP_TIMEOUT).await;
+        let lines: Vec<String> =
+            captured.lines().into_iter().filter(|line| line.contains(LINE)).collect();
+        assert_eq!(lines.len(), 4, "{lines:#?}");
+        // the trailing spaces keep one port from matching a longer one
+        let count = |level: &str, worker_id: u16, addr: SocketAddr| {
+            lines
+                .iter()
+                .filter(|line| {
+                    line.contains(level)
+                        && line.contains(&format!("worker_id={worker_id} "))
+                        && line.contains(&format!("readiness=http://{addr} "))
+                })
+                .count()
+        };
+        for (worker_id, addr) in [(0, a), (1, b)] {
+            assert_eq!(count(" WARN ", worker_id, addr), 1, "worker {worker_id}: {lines:#?}");
+            assert_eq!(count(" DEBUG ", worker_id, addr), 1, "worker {worker_id}: {lines:#?}");
+        }
+        assert!(lines.iter().all(|line| !line.contains("/health/workers")), "url leaked");
+    }
+
+    #[tokio::test]
     async fn rpc_path_mark_lasts_until_m_successful_polls() {
         let mode = Arc::new(AtomicU8::new(READY));
         let addr = mock_readiness(Arc::clone(&mode)).await;
@@ -1058,21 +1242,22 @@ mod tests {
 
     #[tokio::test]
     async fn readiness_polls_run_concurrently() {
-        // three upstreams, each behind its own mock that takes 300 ms to answer
+        // three upstreams, each behind its own mock, and none answers until all
+        // three polls are waiting: only polls that overlap release each other
+        let barrier = Arc::new(tokio::sync::Barrier::new(3));
         let mut upstreams = Vec::new();
         for worker_id in 0..3u16 {
-            let addr = mock_readiness(Arc::new(AtomicU8::new(SLOW))).await;
+            let addr = mock_readiness_at_barrier(Arc::clone(&barrier)).await;
             upstreams.push(upstream_at(worker_id, addr));
         }
         let readiness = GatewayReadiness::new(&upstreams, thresholds(3, 1));
         let client = Client::new();
 
-        let started = Instant::now();
         poll_cycle(&readiness, &client, Duration::from_secs(2)).await;
-        let elapsed = started.elapsed();
 
-        // polled one after another, the cycle would take at least 900 ms
-        assert!(elapsed < Duration::from_millis(600), "one cycle took {elapsed:?}");
+        // polled one after another (or two at a time), every poll would wait
+        // at the barrier until its 2 s timeout and fail, so no wall-clock
+        // bound is needed
         assert!(readiness.upstreams.iter().all(UpstreamReadiness::is_ready), "a poll failed");
     }
 
@@ -1115,7 +1300,7 @@ mod tests {
         let poll = |path: &'static str| {
             let client = client.clone();
             let url = url(path);
-            async move { poll_one(&client, &url, 0, Duration::from_secs(2)).await }
+            async move { poll_one(&client, &url, 0, Duration::from_secs(2)).await.0 }
         };
 
         assert_eq!(poll("/at-cap").await, Ok(()), "a body at the cap is read whole");
