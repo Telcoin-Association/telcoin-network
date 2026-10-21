@@ -39,7 +39,7 @@ The tag checks also enforce these version rules:
 
 - the release commit sets `[workspace.package].version` in `Cargo.toml` to `X.Y.Z`, with no suffix;
 - a final version must be higher than every other final version in the same channel;
-- no release candidate can be tagged once the final release of the same version exists;
+- a release candidate's version must be higher than every final version in the same channel, so none can be tagged once its own final release exists;
 - mainnet and Adiri may use the same `X.Y.Z`;
 - `telcoin-network/vX.Y.Z/linux` must fit in the 32-byte block extra-data field.
 
@@ -298,6 +298,7 @@ A request that GitHub refuses, with an HTTP 4xx other than 429, is not retried a
 `git push`, `docker push`, `docker pull`, `cargo update`, the image build, the submodule fetch and the alias move are tried once, and exit with 3 when they fail.
 A signature that gpg cannot make, usually because the YubiKey is not plugged in, exits with 2.
 After an exit code of 3, run the same command again.
+If `cargo update` or the image build fails the same way a second time, the cause is not an outage: the output above it shows it, such as a version conflict or a compile error.
 If `release-build` had already pushed the image, the second run stops because `:<TAG>` is in the registry; rebuild with `RELEASE_REBUILD=1` as the table below says.
 If `release-sign` had already uploaded the signature, the second run stops because your key has already signed, and nothing more is needed.
 
@@ -343,7 +344,7 @@ GH_TOKEN="$PACKAGES_PAT" gh api -X DELETE "/orgs/Telcoin-Association/packages/co
 The packages API accepts only a classic personal access token with the `read:packages` and `delete:packages` scopes, so put one in `PACKAGES_PAT` for those two calls and revoke it afterwards; the package's Versions page on GitHub can delete the version instead.
 
 Then release the next version from step 1, which supersedes the tag: the next release candidate after a withdrawn candidate (`v0.17.0-adiri-rc2` after `v0.17.0-adiri-rc1`, or the final `v0.17.0-adiri`), and the next patch version after a withdrawn final release (`v0.17.1-adiri` after `v0.17.0-adiri`).
-The version rules refuse any version that is not above the withdrawn tag, so its version is never released.
+The version rules refuse a final release or a release candidate whose version is not above every final release in its channel, so a withdrawn final's version is never released; a withdrawn candidate's version can still be released, by a later candidate or by its final.
 Leave `CHANGELOG.md` as it is.
 `release-prep` replaces a withdrawn candidate's section while it is the newest one; a withdrawn final keeps its section, and the next section lists the commits after its tag.
 Say in the next release's operator notes that the version was withdrawn.

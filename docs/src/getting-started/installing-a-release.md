@@ -241,8 +241,7 @@ Never extract, install or run anything from a release that failed one of these c
 | `EXPKEYSIG` (gpgv still prints `Good signature`) | The signing key has expired | Stop and report it. An older release signed before the expiry cannot be verified against `main` until a maintainer extends the key there. |
 | `EXPSIG` | The signature itself has expired | Stop and report it. |
 | One of the rows above next to a `GOODSIG` | Another signature in `SHA256SUMS.asc` is bad, unverifiable, expired or revoked, and the block refuses the file as a whole | Stop and report it. |
-| `sha256sum` prints `FAILED` | A file differs from its signed hash | Download it again once; if it still fails, report it. |
-| `sha256sum` prints `no file was verified` | None of the files named in `SHA256SUMS` is present | Check `TAG` and the downloaded file names. |
+| `sha256sum` prints `FAILED` | A file differs from its signed hash | Check `TAG` and run the block again in a new, empty directory; if it fails again, stop and report it. |
 | `sha256sum` prints `FAILED open or read` for a `chain-configs/` file | `git archive` did not extract it from the tag | Check that the tag was fetched; if it was, stop and report it. |
 | A fingerprint is missing from, or differs from, `SECURITY.md` or GitHub, or its `SECURITY.md` Status is `revoked` | The keys on `main` are not the current maintainer keys | Stop and report it. |
 | `IMAGE_DIGEST does not name a telcoin-network image by digest` | The signed `IMAGE_DIGEST` points outside the release repository | Stop and report it. |

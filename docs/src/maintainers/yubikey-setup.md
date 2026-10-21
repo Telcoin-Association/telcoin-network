@@ -64,7 +64,16 @@ gpg --card-status
 - Write down the serial number and firmware version that `ykman info` prints; the serial goes in `SECURITY.md`.
 - If `ykman config usb --list` does not include OpenPGP, enable it with `ykman config usb --enable OPENPGP`.
 - On a YubiKey that was used before, `ykman openpgp reset` wipes its OpenPGP keys and restores the default PINs.
-  Before you run it, check that the fingerprint `gpg --card-status` shows as the signature key is not in `git show origin/main:.github/maintainer-gpg-keys/<handle>.asc | gpg --show-keys` or at `https://github.com/<handle>.gpg`: a release key on the allowlist exists only on its YubiKey.
+  Before you run it, check that none of the three fingerprints `gpg --card-status` shows, for the signature, encryption and authentication keys, appears in any allowlist file on `origin/main` or at `https://github.com/<handle>.gpg`: a release key on the allowlist exists only on its YubiKey.
+  These commands print them; `git fetch` and `curl` must both succeed, and if either fails, do not reset.
+
+  ```sh
+  git fetch origin main &&
+  for f in $(git ls-tree --name-only origin/main:.github/maintainer-gpg-keys | grep '\.asc$'); do
+    git show "origin/main:.github/maintainer-gpg-keys/$f" | gpg --show-keys --with-subkey-fingerprint
+  done
+  curl -fsS https://github.com/<handle>.gpg | gpg --show-keys --with-subkey-fingerprint
+  ```
 - GnuPG holds the YubiKey through `scdaemon`, so run `gpgconf --kill scdaemon` before any `ykman openpgp` command.
 
 ## Set the PINs

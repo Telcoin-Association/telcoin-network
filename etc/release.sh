@@ -229,6 +229,12 @@ require_local_image_in_dry_run() {
     fi
 }
 
+# Before the first docker call of build, sign and verify, so a stopped daemon is a precondition
+# (exit 2) and not read as a registry outage.
+require_docker() {
+    docker info >/dev/null 2>&1 || die 2 "docker does not answer: start Docker (Docker Desktop on a Mac) and run again"
+}
+
 require_main_ref() {
     git rev-parse --verify --quiet "$MAIN_REF^{commit}" >/dev/null ||
         die 2 "$MAIN_REF does not exist; fetch main first"
@@ -631,8 +637,9 @@ tagger_time() {
     printf '%s\n' "${raw%% *}"
 }
 
-# Names of the v* tags on origin. Every fetch here is --no-tags, so the local tags can be
-# stale; ls-remote reads origin's. Retried like ls_remote_tag.
+# Names of the annotated v* tags on origin, the ones ls-remote lists with a peeled ^{} line;
+# a lightweight tag counts for no version rule, as on the cutoff path. Read with ls-remote
+# because the local tags can be stale. Retried like ls_remote_tag.
 remote_tags() {
     local out attempt=1
     require_origin
@@ -641,14 +648,14 @@ remote_tags() {
         attempt=$((attempt + 1))
         sleep 5
     done
-    printf '%s\n' "$out" | awk '{ n = $2; sub(/^refs\/tags\//, "", n); if (n != "" && n !~ /\^\{\}$/) print n }'
+    printf '%s\n' "$out" | awk '$2 ~ /\^\{\}$/ { n = $2; sub(/^refs\/tags\//, "", n); sub(/\^\{\}$/, "", n); if (n != "") print n }'
 }
 
-# Names of the v* tags that count for the version rules. Without a cutoff (TAG does not exist
-# yet, or CI checks the push of TAG), every v* tag on origin, read with ls-remote, or every
-# local one in a dry run and in CI, whose checkout holds origin's tags. With a cutoff (epoch
-# seconds), every local annotated tag whose tagger date is strictly earlier, whatever commit
-# it names.
+# Names of the annotated v* tags that count for the version rules. Without a cutoff (TAG does
+# not exist yet, or CI checks the push of TAG), every one on origin, read with ls-remote, or
+# every local one in a dry run and in CI, whose checkout holds origin's tags. With a cutoff
+# (epoch seconds), every local one whose tagger date is strictly earlier, whatever commit it
+# names.
 # Its output is captured, and bash 3.2 runs $(...) without -e, so a failure dies explicitly
 # and the caller passes the status on with `|| exit`.
 tags_before() {
@@ -658,14 +665,17 @@ tags_before() {
             die 2 "cannot list the v* tags"
         printf '%s\n' "$out" | awk -v c="$1" '$2 != "" && $2 + 0 < c + 0 { print $1 }'
     elif [ "$DRY_RUN" = 1 ] || [ "${GITHUB_ACTIONS:-}" = true ]; then
-        git tag -l 'v*' || die 2 "cannot list the v* tags"
+        out=$(git for-each-ref --format='%(objecttype) %(refname:strip=2)' 'refs/tags/v*') ||
+            die 2 "cannot list the v* tags"
+        printf '%s\n' "$out" | awk '$1 == "tag" { print $2 }'
     else
         remote_tags
     fi
 }
 
-# The release is monotonic in its channel, with no release candidate after its final, among
-# the tags that tags_before CUTOFF names.
+# The release is monotonic in its channel among the tags that tags_before CUTOFF names: a
+# final's version is above every other final's, and a release candidate's version is above
+# every final's, its own final included.
 check_version_order() {
     local earlier others highest
     earlier=$(tags_before "$1") || exit
@@ -673,7 +683,6 @@ check_version_order() {
         case $'\n'"$earlier"$'\n' in
             *$'\n'"$BASE"$'\n'*) die 1 "$BASE already exists; no release candidate may follow its final release" ;;
         esac
-        return 0
     fi
     others=$(channel_finals "$earlier")
     highest=$(printf '%s\n%s\n' "$others" "$VERSION" | version_max)
@@ -967,7 +976,7 @@ check_fetched_digests() {
         [ -n "$name" ] || continue
         hex=$(sha256_hex "$dir/$name")
         [ -n "$digest" ] ||
-            die 1 "GitHub reported no sha256 digest for $name (asset $id) on release $TAG, so the download cannot be compared with it; update gh if it is old"
+            die 2 "GitHub reported no sha256 digest for $name (asset $id) on release $TAG, so the download cannot be compared with it; update gh if it is old"
         [ "$digest" = "sha256:$hex" ] || die 1 "$name on release $TAG (asset $id) changed between listing and download"
     done <<EOF
 $REL_ASSET_IDS
@@ -1452,7 +1461,7 @@ When a check fails, do not extract, install or run anything from this release:
 - `EXPKEYSIG` or `REVKEYSIG`: the signing key has expired or was revoked, although gpgv still prints `Good signature`. Report it; a release signed before that can no longer be verified against `main`, which is intended.
 - `EXPSIG`: the signature itself has expired. Report it.
 - Any of `BADSIG`, `ERRSIG`, `EXPSIG`, `EXPKEYSIG` or `REVKEYSIG` stops the block even when another signature in `SHA256SUMS.asc` is good.
-- `sha256sum` prints `FAILED` or `no file was verified`: a file differs from its signed hash, or none of the files is present. Check `TAG` and download once more; if it still fails, report it.
+- `sha256sum` prints `FAILED`: a file differs from its signed hash. Check `TAG` and run the block again in a new, empty directory; if it fails again, report it.
 - `sha256sum` prints `FAILED open or read` for a `chain-configs/` file: `git archive` did not extract it. Check that the tag was fetched; if it was, report it.
 - A fingerprint is missing from `SECURITY.md` or GitHub, differs, or has the Status `revoked`. Report it.
 - `IMAGE_DIGEST does not name a telcoin-network image by digest`. Report it.
@@ -1648,7 +1657,8 @@ cmd_prep() {
     PREP_RESTORE=1
     set_workspace_version "$VERSION"
     info "cargo update --workspace"
-    cargo update --workspace >&2 || die 3 "cargo update --workspace failed (see its output above)"
+    cargo update --workspace >&2 ||
+        die 3 "cargo update --workspace failed; a failed download from crates.io is the usual cause, so run make release-prep again, and if it fails the same way, the output above shows the cause, such as a version conflict"
 
     cliff_section "$WORK/section.raw"
     awk -v base="$BASE" -v m="$main_sha" '
@@ -1754,6 +1764,7 @@ cmd_build() {
         die 2 "build runs on Linux x86_64 (this host is $(uname -s) $(uname -m))"
     fi
     need docker tar gzip curl
+    require_docker
     require_local_image_in_dry_run
     driver=$(docker buildx inspect "$RELEASE_BUILDER" 2>/dev/null | awk '$1 == "Driver:" && !seen { print $2; seen = 1 }') ||
         die 2 "docker buildx builder '$RELEASE_BUILDER' does not exist"
@@ -1844,7 +1855,8 @@ check_build_sums_hash() {
         printf 'Paste the SHA256SUMS sha256 from the last line of make release-build: ' >&2
         read -r want || true
     fi
-    want=$(lower "${want##* }")
+    # The last word of the last non-blank line, so a trailing blank or CR does not matter.
+    want=$(printf '%s\n' "$want" | tr -d '\r' | awk 'NF { w = $NF } END { print tolower(w) }')
     [[ "$want" =~ $HEX64_RE ]] || die 2 "the SHA256SUMS sha256 from make release-build must be 64 hex characters, got '$want'"
     [ "$want" = "$have" ] ||
         die 1 "SHA256SUMS on the draft has sha256 $have, but make release-build printed $want; do not sign, find out what changed the draft"
@@ -1856,6 +1868,7 @@ check_build_sums_hash() {
 cmd_sign() {
     local rd before after recount n_before n_after n_back sums_hex up_hex back_hex
     need docker tar gzip curl gpg
+    require_docker
     check_tag if-cast
     release_state
     [ "$REL_EXISTS" = 1 ] || die 2 "no draft release for $TAG"
@@ -1927,6 +1940,7 @@ cmd_sign() {
 cmd_verify() {
     local allow_unsigned=$1 dir handles n=0
     need docker tar gzip curl gpg
+    require_docker
     check_tag always
     release_state
     [ "$REL_EXISTS" = 1 ] || die 2 "no GitHub release for $TAG"

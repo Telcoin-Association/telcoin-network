@@ -523,10 +523,11 @@ stage_tools() {
     GPGCONF=$BREW_BIN/gpgconf
     YKMAN=$BREW_BIN/ykman
     PINENTRY=$BREW_BIN/pinentry-mac
-    ver=$("$GPG" --version | awk 'NR == 1 { print $3 }')
+    ver=$("$GPG" --version | awk 'NR == 1 { print $3 }') || die 2 "$GPG --version failed"
     matches "$ver" "$VERSION_RE" || die 2 "cannot parse the gpg version from '$ver'"
     version_ge "$ver" "$MIN_GPG" || die 2 "gpg $ver is older than $MIN_GPG"
-    ykver=$("$YKMAN" --version 2>/dev/null | awk 'NR == 1 { print $NF }')
+    ykver=$("$YKMAN" --version 2>/dev/null | awk 'NR == 1 { print $NF }') ||
+        die 2 "$YKMAN --version failed; run it to see why, or reinstall ykman with brew reinstall ykman"
     matches "$ykver" "$VERSION_RE" || die 2 "cannot parse the ykman version from '$ykver'"
     version_ge "$ykver" "$MIN_YKMAN" || die 2 "ykman $ykver is older than $MIN_YKMAN; run brew upgrade ykman"
     ok tools "gpg $ver, ykman $ykver, pinentry-mac in $BREW_BIN"
@@ -905,10 +906,10 @@ key_expiry_date() {
 }
 
 # other_keys FILE: the primary fingerprints in FILE other than FPR, space separated; nothing
-# for a missing file or one that holds no armored public key (empty, or any other text).
+# for a missing file or one that holds no OpenPGP public key, armored or binary (empty, or any
+# other text).
 other_keys() {
     [ -f "$1" ] || return 0
-    grep -q 'BEGIN PGP PUBLIC KEY BLOCK' "$1" || return 0
     "$GPG" --show-keys --with-colons "$1" 2>/dev/null | list_fprs pub | awk -v f="$FPR" '$0 != f' | tr '\n' ' ' | sed 's/ $//' || true
 }
 
@@ -1579,7 +1580,7 @@ stage_test() {
     name=$(git config --get user.name || true)
     email=$(git config --get user.email || true)
     if [ -z "$name" ] || [ -z "$email" ]; then
-        die 1 "git config user.name and user.email must be set for the test tag, as make release-tag uses them (git config --global user.email $EMAIL)"
+        die 2 "git config user.name and user.email must be set for the test tag, as make release-tag uses them (git config --global user.email $EMAIL)"
     fi
     mkdir "$repo"
     git -C "$repo" init -q

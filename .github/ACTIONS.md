@@ -418,7 +418,7 @@ None of these is visible to the workflow, and each closes a gap the workflow lea
    The signature is not a GitHub rule: `validate-tag` and every later step refuse a tag that does not carry exactly one signature by an allowlisted key.
    `validate-tag` proves who signed a tag, not who pushed it, and GitHub runs the workflow definition at the tagged commit.
    Without the rule, anyone with write access could push a `v*` tag on a commit with an edited `release.yaml`, or move or delete a tag after it was validated.
-   A wrong tag therefore stays, and the next version supersedes it; the version rules refuse any version that is not above it.
+   A wrong tag therefore stays, and the next version supersedes it; the version rules refuse a final release or a release candidate whose version is not above every final release in its channel.
    The rule limits who can create, move or delete a `v*` tag and nothing else; it does not limit who can create, edit, publish or delete releases, which write access alone allows.
 2. **Immutable releases** (Settings -> General -> Releases).
    Once a release is published its assets and its tag cannot change, so the files `verify-release` checked are the files operators download.
