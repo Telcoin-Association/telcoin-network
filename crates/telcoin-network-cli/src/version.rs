@@ -85,4 +85,21 @@ mod tests {
         let extradata = default_extradata();
         assert!(extradata.len() <= 32, "extradata must be less than 32 bytes: {extradata}")
     }
+
+    /// The `--version` "Build Features" line lists `faucet` exactly when this crate was built
+    /// with its `faucet` feature (directly, or through `adiri`, which implies it), and such a
+    /// build compiles the faucet mint into tn-reth.
+    #[test]
+    fn long_version_lists_faucet_feature() {
+        let features = LONG_VERSION
+            .lines()
+            .find_map(|line| line.strip_prefix("Build Features: "))
+            .expect("long version has a Build Features line");
+        let listed = features.split(',').any(|feature| feature.trim() == "faucet");
+        assert_eq!(listed, cfg!(feature = "faucet"), "Build Features: {features}");
+        assert!(
+            !listed || tn_reth::FAUCET_ENABLED,
+            "faucet listed but tn-reth was built without it"
+        );
+    }
 }

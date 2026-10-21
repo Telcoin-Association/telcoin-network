@@ -1211,4 +1211,25 @@ mod tests {
             _ => panic!("expected a keytool command"),
         }
     }
+
+    /// A passphrase against a cleartext-only key dir is refused rather than silently ignored, and
+    /// `generate pop` points the operator at the passphrase source that loads a cleartext key.
+    #[tokio::test]
+    async fn test_generate_pop_cleartext_key_with_passphrase_hint() {
+        let dir = tempfile::TempDir::new().expect("tempdir created");
+        let path = dir.path().to_path_buf();
+        keygen_args(None).execute(&path, None).expect("generate cleartext keys");
+
+        let err = PopArgs { address: new_test_address() }
+            .execute(&path, Some("unused".to_string()))
+            .expect_err("a passphrase must not load the cleartext key");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("refusing to load the cleartext bls.key"), "got: {msg}");
+        assert!(msg.contains("--bls-passphrase-source no-passphrase"), "got: {msg}");
+        assert!(!msg.contains("generate keys first"), "got: {msg}");
+
+        PopArgs { address: new_test_address() }
+            .execute(&path, None)
+            .expect("the cleartext key loads without a passphrase");
+    }
 }

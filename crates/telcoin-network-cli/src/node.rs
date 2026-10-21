@@ -2,18 +2,28 @@
 //!
 //! Starts the client
 use crate::{version::SHORT_VERSION, NoArgs};
-use clap::{value_parser, Parser};
+use clap::{
+    builder::{BoolishValueParser, PossibleValue, TypedValueParser},
+    value_parser, Parser,
+};
 use core::fmt;
 use fdlimit::raise_fd_limit;
 use rayon::ThreadPoolBuilder;
 use std::{
-    collections::BTreeMap, net::SocketAddr, num::NonZeroUsize, path::PathBuf, sync::Arc,
+    collections::BTreeMap,
+    ffi::OsStr,
+    net::SocketAddr,
+    num::NonZeroUsize,
+    path::{Path, PathBuf},
+    sync::Arc,
     thread::available_parallelism,
 };
-use tn_config::{Config, KeyConfig, PidLock, TelcoinDirs as _};
+use tn_config::{Config, KeyConfig, PidLock, TelcoinDirs, BLS_KEYFILE};
 use tn_node::engine::TnBuilder;
 use tn_reth::{parse_socket_address, RethChainSpec, RethCommand, RethConfig, FAUCET_ENABLED};
-use tn_types::{BlsPublicKey, BootstrapServer, Genesis, B256, MAINNET_GENESIS};
+use tn_types::{
+    BlsPublicKey, BootstrapServer, Genesis, ADIRI_CHAIN_ID, B256, MAINNET_CHAIN_ID, MAINNET_GENESIS,
+};
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
 
@@ -34,6 +44,31 @@ pub enum NamedChain {
     TestNet,
     /// MainNet
     MainNet,
+}
+
+impl NamedChain {
+    /// Load this chain's bundled config. Writes nothing to the datadir.
+    pub(crate) fn load_config<P: TelcoinDirs>(
+        self,
+        tn_datadir: &P,
+        version: &'static str,
+    ) -> eyre::Result<Config> {
+        match self {
+            Self::Adiri | Self::TestNet => Config::load_adiri(tn_datadir, version),
+            Self::MainNet => Config::load_mainnet(tn_datadir, version),
+        }
+    }
+
+    /// Write this chain's bundled genesis committee to the datadir unless one is already there.
+    ///
+    /// Callers run this after their startup checks pass, so a refused start leaves the datadir
+    /// as it was.
+    pub(crate) fn write_committee<P: TelcoinDirs>(self, tn_datadir: &P) -> eyre::Result<()> {
+        match self {
+            Self::Adiri | Self::TestNet => Config::write_adiri_committee(tn_datadir),
+            Self::MainNet => Config::write_mainnet_committee(tn_datadir),
+        }
+    }
 }
 
 /// Start the node
@@ -132,6 +167,32 @@ pub struct NodeCommand<Ext: clap::Args + fmt::Debug = NoArgs> {
     #[arg(long, value_name = "URL", global = true, env = "TN_TRACING_URL")]
     pub tracing_url: Option<String>,
 
+    /// Let a faucet build start on chain id 487. Devnet only.
+    ///
+    /// A binary built with the `faucet` feature refuses chain id 487, the mainnet chain id,
+    /// unless this is set. Devnets that reuse chain id 487 set it. A faucet build refuses the
+    /// embedded mainnet genesis even with this set.
+    ///
+    /// The environment variable accepts 1/0, true/false, yes/no, on/off, t/f and y/n in any case;
+    /// an empty value leaves the flag off and any other value is an argument error.
+    #[arg(
+        long,
+        env = "TN_ALLOW_FAUCET_ON_CHAIN_487",
+        value_parser = OptInValueParser::default(),
+        hide_short_help = true
+    )]
+    pub allow_faucet_on_chain_487: bool,
+
+    /// Let the node start on chain id 487 with a cleartext BLS key. Testing only.
+    ///
+    /// On chain id 487, the mainnet chain id, the node refuses a BLS key read from the
+    /// cleartext `node-keys/bls.key` without a passphrase (for example with
+    /// `--bls-passphrase-source no-passphrase`) and requires the passphrase-encrypted `bls.kw`.
+    /// This flag lifts that refusal. It is read from the command line only, never from the
+    /// environment.
+    #[arg(long, hide_short_help = true)]
+    pub allow_cleartext_bls_key: bool,
+
     /// Additional cli arguments
     #[clap(flatten)]
     pub ext: Ext,
@@ -219,20 +280,23 @@ impl<Ext: clap::Args + fmt::Debug> NodeCommand<Ext> {
         }
 
         // overwrite all genesis if `genesis` was passed to CLI
-        let tn_config = self.chain.take().map_or_else(
+        let named_chain = self.chain.take();
+        let tn_config = named_chain.map_or_else(
             || Config::load(&tn_datadir, SHORT_VERSION),
             |chain| {
                 info!(target: "cli", "Overwriting TN config with named chain: {chain:?}");
-                match chain {
-                    NamedChain::Adiri | NamedChain::TestNet => {
-                        Config::load_adiri(&tn_datadir, SHORT_VERSION)
-                    }
-                    NamedChain::MainNet => Config::load_mainnet(&tn_datadir, SHORT_VERSION),
-                }
+                chain.load_config(&tn_datadir, SHORT_VERSION)
             },
         )?;
+        let chain_id = tn_config.genesis().config.chain_id;
+        // built once here and handed to reth below; the genesis hash comes from the same spec the
+        // node boots with
+        let chain_spec = Arc::new(tn_config.chain_spec());
+        // one fixed-format line naming the compiled features and the loaded chain, so operators
+        // and deployment checks can confirm both from the log before any guard below refuses
+        info!(target: "cli", "{}", node_build_line(chain_id, chain_spec.genesis_hash()));
         #[cfg(not(feature = "adiri"))]
-        if tn_config.genesis().config.chain_id == 2017 {
+        if chain_id == ADIRI_CHAIN_ID {
             // If we are trying to start an Adiri node without the adiri feature flag then error
             // out.
             return Err(eyre::eyre!(
@@ -240,16 +304,26 @@ impl<Ext: clap::Args + fmt::Debug> NodeCommand<Ext> {
             ));
         }
         #[cfg(feature = "adiri")]
-        if tn_config.genesis().config.chain_id != 2017 {
+        if chain_id != ADIRI_CHAIN_ID {
             // If we are trying to start an Adiri node without the adiri feature flag then error
             // out.
             return Err(eyre::eyre!(
                 "Must NOT compile with adiri feature flag when connecting to non-adiri (testnet) networks!"
             ));
         }
+        validate_bls_key_protection(
+            chain_id,
+            key_config.bls_key_is_cleartext(),
+            self.allow_cleartext_bls_key,
+        )?;
+        warn_stale_cleartext_bls_key(
+            chain_id,
+            key_config.bls_key_is_cleartext(),
+            &tn_datadir.node_keys_path(),
+        );
         // Runtime value, not a #[cfg], so the check holds no matter which crate in the
         // build graph enabled the faucet feature.
-        validate_faucet_build(FAUCET_ENABLED, tn_config.genesis())?;
+        validate_faucet_build(FAUCET_ENABLED, tn_config.genesis(), self.allow_faucet_on_chain_487)?;
         debug!(target: "cli", validator = ?tn_config.node_info.name, "tn datadir for node command: {tn_datadir:?}");
         info!(target: "cli", validator = ?tn_config.node_info.name, "config loaded");
 
@@ -268,20 +342,21 @@ impl<Ext: clap::Args + fmt::Debug> NodeCommand<Ext> {
             ext,
             node_name: _,
             tracing_url: _,
+            allow_faucet_on_chain_487: _, // Used above
+            allow_cleartext_bls_key: _,   // Used above
         } = self;
 
         // set up reth node config for engine components
-        let node_config = RethConfig::new(
-            reth,
-            instance,
-            &tn_datadir,
-            with_unused_ports,
-            Arc::new(tn_config.chain_spec()),
-        );
+        let node_config =
+            RethConfig::new(reth, instance, &tn_datadir, with_unused_ports, chain_spec);
 
         // Refuse a second node on this datadir before opening the execution database a live node
         // may hold; the node keeps the lock for its lifetime (handed over in the builder).
         let pid_lock = PidLock::acquire(&tn_datadir)?;
+        // the bundled committee is written only once every startup check above has passed
+        if let Some(chain) = named_chain {
+            chain.write_committee(&tn_datadir)?;
+        }
         // create dbs to survive between sync state transitions
         let reth_db = tn_reth::RethEnv::new_database(&node_config, tn_datadir.reth_db_path())?;
         let mut builder = TnBuilder::new(node_config, tn_config, reth_db)
@@ -297,38 +372,161 @@ impl<Ext: clap::Args + fmt::Debug> NodeCommand<Ext> {
     }
 }
 
-/// Refuse to run a faucet-compiled binary against canonical Telcoin mainnet.
+/// Value parser for an opt-in flag that can also be set from an environment variable.
+///
+/// An empty value reads as unset (`false`), so a variable set to the empty string (`VAR=` in an
+/// env file, or a `${VAR:-}` expansion) leaves the opt-in off instead of stopping the command.
+/// Any other value parses like clap's [`BoolishValueParser`]: `1/0`, `true/false`, `yes/no`,
+/// `on/off`, `t/f` and `y/n`, case-insensitive, and anything else is an argument error.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct OptInValueParser(BoolishValueParser);
+
+impl TypedValueParser for OptInValueParser {
+    type Value = bool;
+
+    fn parse_ref(
+        &self,
+        cmd: &clap::Command,
+        arg: Option<&clap::Arg>,
+        value: &OsStr,
+    ) -> Result<Self::Value, clap::Error> {
+        if value.is_empty() {
+            return Ok(false);
+        }
+        self.0.parse_ref(cmd, arg, value)
+    }
+
+    fn possible_values(&self) -> Option<Box<dyn Iterator<Item = PossibleValue> + '_>> {
+        self.0.possible_values()
+    }
+}
+
+/// Refuse to run a faucet-compiled binary on the mainnet chain id or the mainnet genesis.
 ///
 /// The `faucet` cargo feature swaps the TEL precompile's `mint` dispatch table (the
 /// instant, role-gated `mint(address,uint256)` replaces the timelocked, governance-only
 /// `mint(uint256)`), so a faucet build joining mainnet computes different state roots
 /// than the rest of the network for the same block: a consensus split, not a local
-/// misconfiguration. No attacker is required; cargo feature unification can enable the
-/// feature transitively without the operator ever typing it.
+/// misconfiguration. Cargo feature unification can enable the feature transitively without
+/// the operator ever typing it, so the caller passes the runtime `FAUCET_ENABLED` value.
 ///
-/// The check keys on the genesis block hash, the identity peers actually agree on,
-/// rather than either alternative:
+/// A faucet build runs two checks:
 ///
-/// - Chain id: the guard the issue literally proposed (refuse `chain_id != 2017` in faucet builds)
-///   would reject both supported faucet flows, the docker devnet scripts at chain id 487
-///   (`etc/genesis.sh`) and the e2e faucet test at the default 911329; keying on mainnet's own 487
-///   instead would still reject the devnet flow, which shares that id.
-/// - Struct equality on [`Genesis`]: the fork-config fields (`config`) sit outside the genesis
-///   header preimage, so a genesis differing from canonical mainnet only in such a field still
-///   computes mainnet's genesis block hash (and could join mainnet consensus) while comparing
-///   unequal.
+/// - Chain id: chain id [`MAINNET_CHAIN_ID`] is refused unless `allow_on_mainnet_chain_id` is set
+///   (`--allow-faucet-on-chain-487`). Devnets that reuse that chain id (the docker devnet scripts
+///   in `etc/genesis.sh`) opt in explicitly.
+/// - Genesis identity: with the opt-in set, a genesis whose block hash equals the embedded
+///   [`MAINNET_GENESIS`] is still refused. The check compares genesis block hashes rather than
+///   [`Genesis`] structs because the fork-config fields (`config`) sit outside the genesis header
+///   preimage: a genesis differing from mainnet only in such a field still computes mainnet's
+///   genesis block hash, and could join mainnet consensus, while comparing unequal.
 ///
-/// Only the canonical embedded mainnet genesis is refused; adiri/testnet (2017) is
-/// faucet-intended and separately covered by the `adiri` feature guard at the call
-/// site in [`NodeCommand::execute`].
-pub(crate) fn validate_faucet_build(faucet_enabled: bool, genesis: &Genesis) -> eyre::Result<()> {
-    let joins_mainnet = faucet_enabled
-        .then(|| serde_yaml::from_str::<Genesis>(MAINNET_GENESIS))
-        .transpose()?
-        .is_some_and(|mainnet| genesis_block_hash(genesis.clone()) == genesis_block_hash(mainnet));
-    (!joins_mainnet).then_some(()).ok_or_else(|| {
-        eyre::eyre!("Must NOT compile with faucet feature flag when connecting to Telcoin mainnet!")
-    })
+/// Adiri/testnet (2017) is faucet-intended and passes both checks; the `adiri` feature guard at
+/// the call site in [`NodeCommand::execute`] covers it separately.
+pub(crate) fn validate_faucet_build(
+    faucet_enabled: bool,
+    genesis: &Genesis,
+    allow_on_mainnet_chain_id: bool,
+) -> eyre::Result<()> {
+    if !faucet_enabled {
+        return Ok(());
+    }
+    if genesis.config.chain_id == MAINNET_CHAIN_ID && !allow_on_mainnet_chain_id {
+        return Err(eyre::eyre!(
+            "this binary was built with the faucet feature and refuses chain id \
+             {MAINNET_CHAIN_ID}; a devnet that reuses chain id {MAINNET_CHAIN_ID} must pass \
+             --allow-faucet-on-chain-487 (env TN_ALLOW_FAUCET_ON_CHAIN_487=true)"
+        ));
+    }
+    let mainnet: Genesis = serde_yaml::from_str(MAINNET_GENESIS)?;
+    if genesis_block_hash(genesis.clone()) == genesis_block_hash(mainnet) {
+        return Err(eyre::eyre!(
+            "Must NOT compile with faucet feature flag when connecting to Telcoin mainnet!"
+        ));
+    }
+    Ok(())
+}
+
+/// Refuse a cleartext BLS key on chain id [`MAINNET_CHAIN_ID`] unless the operator opted in.
+///
+/// `cleartext_key` is [`KeyConfig::bls_key_is_cleartext`]: the key was read from `bls.key`
+/// without a passphrase. That covers `--bls-passphrase-source no-passphrase`, the only source
+/// that reaches the node without a passphrase, and any caller that loads keys without one.
+/// Other chain ids are unaffected. With `allow_cleartext` set the node starts and logs a warning.
+pub(crate) fn validate_bls_key_protection(
+    chain_id: u64,
+    cleartext_key: bool,
+    allow_cleartext: bool,
+) -> eyre::Result<()> {
+    if chain_id != MAINNET_CHAIN_ID || !cleartext_key {
+        return Ok(());
+    }
+    if allow_cleartext {
+        warn!(
+            target: "cli",
+            "starting on chain id {MAINNET_CHAIN_ID} with a cleartext BLS key (bls.key) because \
+             --allow-cleartext-bls-key is set"
+        );
+        return Ok(());
+    }
+    Err(eyre::eyre!(
+        "refusing to start on chain id {MAINNET_CHAIN_ID} with a cleartext BLS key: the key was \
+         read from node-keys/bls.key without a passphrase (for example with \
+         --bls-passphrase-source no-passphrase). Use a passphrase-encrypted key (bls.kw) and a \
+         passphrase source, or pass --allow-cleartext-bls-key on a test network"
+    ))
+}
+
+/// Warn about a cleartext `bls.key` left beside the encrypted key on chain id
+/// [`MAINNET_CHAIN_ID`].
+///
+/// When the node loaded its key from `bls.kw` (`cleartext_key` false), a `bls.key` in the same
+/// directory is a cleartext copy of a BLS private key that the node never reads. The node still
+/// starts; the warning names the file so the operator can delete it. Other chain ids are not
+/// checked. Returns the stale file's path when it warned.
+pub(crate) fn warn_stale_cleartext_bls_key(
+    chain_id: u64,
+    cleartext_key: bool,
+    keys_dir: &Path,
+) -> Option<PathBuf> {
+    if chain_id != MAINNET_CHAIN_ID || cleartext_key {
+        return None;
+    }
+    let stale = keys_dir.join(BLS_KEYFILE);
+    match std::fs::exists(&stale) {
+        Ok(true) => {
+            warn!(
+                target: "cli",
+                "cleartext BLS key file {} lies beside the encrypted key on chain id \
+                 {MAINNET_CHAIN_ID}; the node loaded bls.kw and does not read it, but it holds a \
+                 BLS private key in cleartext. Delete it",
+                stale.display()
+            );
+            Some(stale)
+        }
+        Ok(false) => None,
+        Err(e) => {
+            warn!(
+                target: "cli",
+                "cannot check for a stale cleartext BLS key file {}: {e}",
+                stale.display()
+            );
+            None
+        }
+    }
+}
+
+/// The startup line naming the compiled build features and the loaded chain:
+/// `node build: faucet=<bool> adiri=<bool> chain_id=<n> genesis_hash=<0x..>`.
+///
+/// `faucet` is the runtime `FAUCET_ENABLED` value, so it reports the faucet mint however the
+/// feature reached tn-reth; `adiri` is this crate's `adiri` feature.
+fn node_build_line(chain_id: u64, genesis_hash: B256) -> String {
+    format!(
+        "node build: faucet={FAUCET_ENABLED} adiri={} chain_id={chain_id} \
+         genesis_hash={genesis_hash}",
+        cfg!(feature = "adiri")
+    )
 }
 
 /// The genesis block hash of `genesis`: the hash of the sealed genesis header, covering
@@ -468,11 +666,14 @@ mod tests {
         Ok(())
     }
 
-    /// A faucet build configured with the canonical mainnet genesis must refuse to start.
+    /// A faucet build configured with the canonical mainnet genesis must refuse to start, with or
+    /// without the chain id opt-in: the genesis-hash check runs behind the chain id check.
     #[test]
     fn faucet_build_rejects_canonical_mainnet_genesis() -> eyre::Result<()> {
         let mainnet: Genesis = serde_yaml::from_str(MAINNET_GENESIS)?;
-        assert!(validate_faucet_build(true, &mainnet).is_err());
+        assert!(validate_faucet_build(true, &mainnet, false).is_err());
+        let err = validate_faucet_build(true, &mainnet, true).expect_err("mainnet genesis");
+        assert!(err.to_string().contains("Telcoin mainnet"), "{err}");
         Ok(())
     }
 
@@ -480,27 +681,52 @@ mod tests {
     #[test]
     fn default_build_accepts_mainnet_genesis() -> eyre::Result<()> {
         let mainnet: Genesis = serde_yaml::from_str(MAINNET_GENESIS)?;
-        assert!(validate_faucet_build(false, &mainnet).is_ok());
+        assert!(validate_faucet_build(false, &mainnet, false).is_ok());
         Ok(())
     }
 
-    /// A faucet build on the adiri/testnet genesis is allowed; that chain is
+    /// A faucet build on the adiri/testnet genesis is allowed without the opt-in; that chain is
     /// faucet-intended and separately covered by the `adiri` feature guard.
     #[test]
     fn faucet_build_accepts_testnet_genesis() -> eyre::Result<()> {
-        assert!(validate_faucet_build(true, &adiri_genesis()).is_ok());
+        let testnet = adiri_genesis();
+        assert_eq!(testnet.config.chain_id, ADIRI_CHAIN_ID);
+        assert!(validate_faucet_build(true, &testnet, false).is_ok());
         Ok(())
     }
 
-    /// A faucet build on a devnet genesis that reuses mainnet's chain id 487 (the
-    /// documented docker-devnet flow) must NOT be rejected: the guard keys on genesis
-    /// identity, not chain id.
-    #[test]
-    fn faucet_build_accepts_devnet_genesis_with_mainnet_chain_id() -> eyre::Result<()> {
+    /// A devnet genesis that reuses mainnet's chain id but is not the mainnet genesis.
+    fn devnet_genesis_on_mainnet_chain_id() -> eyre::Result<Genesis> {
         let base: Genesis = serde_yaml::from_str(MAINNET_GENESIS)?;
         let devnet = Genesis { timestamp: base.timestamp.wrapping_add(1), ..base };
-        assert_eq!(devnet.config.chain_id, 487);
-        assert!(validate_faucet_build(true, &devnet).is_ok());
+        assert_eq!(devnet.config.chain_id, MAINNET_CHAIN_ID);
+        Ok(devnet)
+    }
+
+    /// A faucet build refuses chain id 487 when the operator has not opted in, even on a genesis
+    /// that is not the mainnet genesis, and the error names the opt-in flag.
+    #[test]
+    fn faucet_build_refuses_chain_487_without_opt_in() -> eyre::Result<()> {
+        let devnet = devnet_genesis_on_mainnet_chain_id()?;
+        let err = validate_faucet_build(true, &devnet, false).expect_err("chain 487 refused");
+        assert!(err.to_string().contains("--allow-faucet-on-chain-487"), "{err}");
+        Ok(())
+    }
+
+    /// A faucet build on a devnet genesis that reuses mainnet's chain id 487 (the documented
+    /// docker-devnet flow) starts once the operator opts in with `--allow-faucet-on-chain-487`.
+    #[test]
+    fn faucet_build_accepts_devnet_genesis_with_mainnet_chain_id() -> eyre::Result<()> {
+        let devnet = devnet_genesis_on_mainnet_chain_id()?;
+        assert!(validate_faucet_build(true, &devnet, true).is_ok());
+        Ok(())
+    }
+
+    /// A default (non-faucet) build needs no opt-in to start on a chain id 487 devnet.
+    #[test]
+    fn default_build_needs_no_opt_in_on_chain_487() -> eyre::Result<()> {
+        let devnet = devnet_genesis_on_mainnet_chain_id()?;
+        assert!(validate_faucet_build(false, &devnet, false).is_ok());
         Ok(())
     }
 
@@ -508,7 +734,7 @@ mod tests {
     /// canonical mainnet while header and alloc stay identical: such a genesis computes
     /// mainnet's exact genesis block hash (the positive control below), so it could
     /// still join mainnet consensus. Struct equality would wrongly admit it; hash
-    /// identity refuses it.
+    /// identity refuses it, with the chain id opt-in set.
     #[test]
     fn faucet_build_rejects_config_only_divergence_from_mainnet() -> eyre::Result<()> {
         let mainnet: Genesis = serde_yaml::from_str(MAINNET_GENESIS)?;
@@ -516,18 +742,312 @@ mod tests {
         divergent.config.dao_fork_support = !divergent.config.dao_fork_support;
         assert_ne!(divergent, mainnet);
         assert_eq!(genesis_block_hash(divergent.clone()), genesis_block_hash(mainnet));
-        assert!(validate_faucet_build(true, &divergent).is_err());
+        assert!(validate_faucet_build(true, &divergent, true).is_err());
         Ok(())
     }
 
     /// The compiled feature set gates the canonical mainnet genesis exactly: refused
-    /// when the binary carries the faucet feature and accepted otherwise. This
-    /// exercises the same `FAUCET_ENABLED` value the [`NodeCommand::execute`] call site
-    /// wires in, under whichever feature set the test build resolved.
+    /// when the binary carries the faucet feature and accepted otherwise, whatever the
+    /// opt-in. This exercises the same `FAUCET_ENABLED` value the [`NodeCommand::execute`]
+    /// call site wires in, under whichever feature set the test build resolved.
     #[test]
     fn compiled_feature_set_gates_canonical_mainnet_genesis() -> eyre::Result<()> {
         let mainnet: Genesis = serde_yaml::from_str(MAINNET_GENESIS)?;
-        assert_eq!(validate_faucet_build(FAUCET_ENABLED, &mainnet).is_err(), FAUCET_ENABLED);
+        for allow in [false, true] {
+            assert_eq!(
+                validate_faucet_build(FAUCET_ENABLED, &mainnet, allow).is_err(),
+                FAUCET_ENABLED
+            );
+        }
+        Ok(())
+    }
+
+    /// The startup line has the fixed format deployment checks read, and its genesis hash is the
+    /// genesis block hash the faucet guard compares.
+    #[test]
+    fn node_build_line_reports_features_chain_and_genesis_hash() -> eyre::Result<()> {
+        let mainnet: Genesis = serde_yaml::from_str(MAINNET_GENESIS)?;
+        let hash = Arc::new(RethChainSpec::from(mainnet.clone())).genesis_hash();
+        assert_eq!(hash, genesis_block_hash(mainnet));
+        let line = node_build_line(MAINNET_CHAIN_ID, hash);
+        assert_eq!(
+            line,
+            format!(
+                "node build: faucet={FAUCET_ENABLED} adiri={} chain_id=487 genesis_hash={hash:#x}",
+                cfg!(feature = "adiri")
+            )
+        );
+        let hex = line.rsplit("genesis_hash=0x").next().unwrap_or_default();
+        assert!(hex.len() == 64 && hex.chars().all(|c| c.is_ascii_hexdigit()), "{line}");
+        Ok(())
+    }
+
+    /// The faucet opt-in's argument id, the one node argument read from a `TN_ALLOW_*` variable.
+    const FAUCET_OPT_IN: &str = "allow_faucet_on_chain_487";
+
+    /// Parse `args` as the node command with the faucet opt-in's environment binding removed, so
+    /// a `TN_ALLOW_FAUCET_ON_CHAIN_487` in the developer's shell cannot change the result.
+    fn parse_node_without_env(args: &[&str]) -> Result<NodeCommand<NoArgs>, clap::Error> {
+        use clap::{CommandFactory as _, FromArgMatches as _};
+
+        let command = NodeCommand::<NoArgs>::command()
+            .mut_arg(FAUCET_OPT_IN, |arg| arg.env(None::<&'static str>));
+        NodeCommand::from_arg_matches(&command.try_get_matches_from(args)?)
+    }
+
+    /// `--allow-faucet-on-chain-487` defaults off, parses as a bare flag, reads its documented
+    /// environment variable, and stays out of the short help.
+    #[test]
+    fn allow_faucet_flag_parses_and_is_devnet_only() -> eyre::Result<()> {
+        use clap::CommandFactory as _;
+
+        assert!(!parse_node_without_env(&["node"])?.allow_faucet_on_chain_487);
+        let set = parse_node_without_env(&["node", "--allow-faucet-on-chain-487"])?;
+        assert!(set.allow_faucet_on_chain_487);
+        let mut command = NodeCommand::<NoArgs>::command();
+        let arg = command
+            .get_arguments()
+            .find(|arg| arg.get_id() == FAUCET_OPT_IN)
+            .ok_or_else(|| eyre::eyre!("flag registered"))?;
+        assert_eq!(
+            arg.get_env().and_then(|env| env.to_str()),
+            Some("TN_ALLOW_FAUCET_ON_CHAIN_487")
+        );
+        assert!(!command.render_help().to_string().contains("--allow-faucet-on-chain-487"));
+        assert!(command.render_long_help().to_string().contains("--allow-faucet-on-chain-487"));
+        Ok(())
+    }
+
+    /// An empty value reads as unset; booleans parse as clap's boolish parser does, in any case;
+    /// anything else is an argument error.
+    #[test]
+    fn opt_in_value_parser_reads_empty_as_unset() {
+        let cmd = clap::Command::new("node");
+        let parse = |raw: &str| {
+            OptInValueParser::default()
+                .parse_ref(&cmd, None, OsStr::new(raw))
+                .map_err(|error| error.kind())
+        };
+        assert_eq!(parse(""), Ok(false));
+        for raw in ["1", "true", "TRUE", "yes", "On", "t", "Y"] {
+            assert_eq!(parse(raw), Ok(true), "{raw:?}");
+        }
+        for raw in ["0", "false", "No", "OFF", "f", "n"] {
+            assert_eq!(parse(raw), Ok(false), "{raw:?}");
+        }
+        for raw in ["maybe", " ", "2"] {
+            assert_eq!(parse(raw), Err(ErrorKind::ValueValidation), "{raw:?}");
+        }
+    }
+
+    /// The faucet opt-in's environment value goes through [`OptInValueParser`] on both `node`
+    /// and `db load-state`: an empty value leaves the flag off, a boolean sets it, and anything
+    /// else stops the command at parse.
+    #[test]
+    fn faucet_opt_in_env_value_parses_on_node_and_load_state() {
+        use clap::{Args as _, CommandFactory as _};
+
+        // a variable no other test reads, bound onto the flag in place of the real one so the
+        // test runs clap's env path without depending on the developer's shell
+        const VAR: &str = "TN_TEST_FAUCET_OPT_IN_ENV_VALUE";
+        let cases = [
+            ("", Ok(false)),
+            ("TRUE", Ok(true)),
+            ("0", Ok(false)),
+            ("maybe", Err(ErrorKind::ValueValidation)),
+        ];
+        for (raw, expected) in cases {
+            std::env::set_var(VAR, raw);
+            let node = NodeCommand::<NoArgs>::command()
+                .mut_arg(FAUCET_OPT_IN, |arg| arg.env(VAR))
+                .try_get_matches_from(["node"]);
+            let load_state =
+                crate::db::DbLoadStateArgs::augment_args(clap::Command::new("load-state"))
+                    .mut_arg(FAUCET_OPT_IN, |arg| arg.env(VAR))
+                    .try_get_matches_from(["load-state", "pack"]);
+            for (command, matches) in [("node", node), ("db load-state", load_state)] {
+                let parsed =
+                    matches.map(|m| m.get_flag(FAUCET_OPT_IN)).map_err(|error| error.kind());
+                assert_eq!(parsed, expected, "{command} with {VAR}={raw:?}");
+            }
+        }
+        std::env::remove_var(VAR);
+    }
+
+    /// A cleartext key on chain id 487 is refused without the opt-in and the error names it;
+    /// the opt-in lifts the refusal.
+    #[test]
+    fn cleartext_bls_key_refused_on_chain_487_without_opt_in() {
+        let err = validate_bls_key_protection(MAINNET_CHAIN_ID, true, false)
+            .expect_err("cleartext key on chain 487");
+        let msg = err.to_string();
+        assert!(msg.contains("--allow-cleartext-bls-key"), "{msg}");
+        assert!(msg.contains("no-passphrase"), "{msg}");
+        assert!(validate_bls_key_protection(MAINNET_CHAIN_ID, true, true).is_ok());
+    }
+
+    /// An encrypted key passes on chain id 487, and other chain ids accept a cleartext key with
+    /// no opt-in.
+    #[test]
+    fn bls_key_protection_accepts_encrypted_keys_and_other_chains() {
+        assert!(validate_bls_key_protection(MAINNET_CHAIN_ID, false, false).is_ok());
+        for chain_id in [ADIRI_CHAIN_ID, 911_329] {
+            assert!(validate_bls_key_protection(chain_id, true, false).is_ok());
+        }
+    }
+
+    /// On chain id 487 a `bls.key` beside the `bls.kw` the node loaded is reported; without the
+    /// file, with a cleartext-loaded key (the refusal covers that) or on another chain id nothing
+    /// is reported.
+    #[test]
+    fn stale_cleartext_bls_key_is_reported_on_chain_487() -> eyre::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let keys_dir = dir.path();
+        assert_eq!(warn_stale_cleartext_bls_key(MAINNET_CHAIN_ID, false, keys_dir), None);
+        let stale = keys_dir.join(BLS_KEYFILE);
+        std::fs::write(&stale, "stale")?;
+        assert_eq!(warn_stale_cleartext_bls_key(MAINNET_CHAIN_ID, false, keys_dir), Some(stale));
+        assert_eq!(warn_stale_cleartext_bls_key(MAINNET_CHAIN_ID, true, keys_dir), None);
+        assert_eq!(warn_stale_cleartext_bls_key(ADIRI_CHAIN_ID, false, keys_dir), None);
+        Ok(())
+    }
+
+    /// `--allow-cleartext-bls-key` defaults off, parses as a bare flag, has no environment
+    /// variable, and stays out of the short help.
+    #[test]
+    fn allow_cleartext_flag_parses_and_is_hidden_from_short_help() -> eyre::Result<()> {
+        use clap::CommandFactory as _;
+
+        assert!(!parse_node_without_env(&["node"])?.allow_cleartext_bls_key);
+        let set = parse_node_without_env(&["node", "--allow-cleartext-bls-key"])?;
+        assert!(set.allow_cleartext_bls_key);
+        let mut command = NodeCommand::<NoArgs>::command();
+        let arg = command
+            .get_arguments()
+            .find(|arg| arg.get_id() == "allow_cleartext_bls_key")
+            .ok_or_else(|| eyre::eyre!("flag registered"))?;
+        assert_eq!(arg.get_env(), None, "the cleartext opt-in is command-line only");
+        assert!(!command.render_help().to_string().contains("--allow-cleartext-bls-key"));
+        assert!(command.render_long_help().to_string().contains("--allow-cleartext-bls-key"));
+        Ok(())
+    }
+
+    /// Generate cleartext validator keys in `datadir`, as `keytool generate validator
+    /// --bls-passphrase-source no-passphrase` does.
+    #[cfg(not(feature = "adiri"))]
+    fn generate_cleartext_keys(datadir: &str) -> eyre::Result<()> {
+        use crate::cli::Cli;
+
+        let keygen = Cli::<NoArgs>::try_parse_args_from([
+            "tn",
+            "--bls-passphrase-source",
+            "no-passphrase",
+            "keytool",
+            "generate",
+            "validator",
+            "--workers",
+            "1",
+            "--datadir",
+            datadir,
+            "--address",
+            "0",
+        ])?;
+        let passphrase = keygen.resolve_bls_passphrase(None)?;
+        keygen.run(passphrase, |_, _, _, _, _| tokio::spawn(async { Ok(()) }))
+    }
+
+    /// Run `node --chain main-net` (chain id 487) with `--bls-passphrase-source no-passphrase`
+    /// plus `extra` node arguments on `datadir`, through the same passphrase resolution and
+    /// launcher plumbing as the binary. The faucet opt-in's environment binding is removed, so
+    /// the developer's shell cannot change the outcome.
+    #[cfg(not(feature = "adiri"))]
+    fn run_mainnet_node_with_cleartext_key(datadir: &str, extra: &[&str]) -> eyre::Result<()> {
+        use crate::cli::Cli;
+        use clap::{CommandFactory as _, FromArgMatches as _};
+
+        let args =
+            ["tn", "node", "--bls-passphrase-source", "no-passphrase", "--chain", "main-net"]
+                .into_iter()
+                .chain(["--datadir", datadir])
+                .chain(extra.iter().copied());
+        // seeded before the command is built, as `Cli::try_parse_args_from` does
+        tn_reth::init_reth_defaults();
+        let command = Cli::<NoArgs>::command().mut_subcommand("node", |node| {
+            node.mut_arg(FAUCET_OPT_IN, |arg| arg.env(None::<&'static str>))
+        });
+        let node = Cli::<NoArgs>::from_arg_matches(&command.try_get_matches_from(args)?)?;
+        let passphrase = node.resolve_bls_passphrase(None)?;
+        node.run(passphrase, |_, _, _, _, _| tokio::spawn(async { Ok(()) }))
+    }
+
+    /// Every path under `dir`, sorted, so a test can compare a datadir before and after a run.
+    #[cfg(not(feature = "adiri"))]
+    fn datadir_listing(dir: &std::path::Path) -> eyre::Result<Vec<PathBuf>> {
+        let mut listing = Vec::new();
+        let mut pending = vec![dir.to_path_buf()];
+        while let Some(next) = pending.pop() {
+            for entry in std::fs::read_dir(&next)? {
+                let path = entry?.path();
+                if path.is_dir() {
+                    pending.push(path.clone());
+                }
+                listing.push(path);
+            }
+        }
+        listing.sort();
+        Ok(listing)
+    }
+
+    /// `node --bls-passphrase-source no-passphrase` on chain id 487 loads the cleartext key and
+    /// is refused before it changes the datadir: no database and no `genesis/` committee file.
+    #[cfg(not(feature = "adiri"))]
+    #[test]
+    fn node_refuses_no_passphrase_on_chain_487() -> eyre::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let datadir = dir.path().to_str().ok_or_else(|| eyre::eyre!("utf-8 temp path"))?;
+        generate_cleartext_keys(datadir)?;
+        let before = datadir_listing(dir.path())?;
+        let err = run_mainnet_node_with_cleartext_key(datadir, &[])
+            .expect_err("no-passphrase on chain 487 must be refused");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("refusing to start on chain id 487"), "{msg}");
+        assert!(!dir.path().to_path_buf().reth_db_path().exists());
+        assert!(!dir.path().to_path_buf().genesis_path().exists());
+        assert_eq!(datadir_listing(dir.path())?, before);
+        Ok(())
+    }
+
+    /// With `--allow-cleartext-bls-key` the same node passes the cleartext key check. A default
+    /// build then starts and reaches the launcher. A build that carries the faucet mint is still
+    /// refused on chain id 487: by the chain id check without `--allow-faucet-on-chain-487`, and
+    /// by the mainnet genesis check with it; neither refusal changes the datadir.
+    #[cfg(not(feature = "adiri"))]
+    #[test]
+    fn node_on_chain_487_with_cleartext_opt_in() -> eyre::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let datadir = dir.path().to_str().ok_or_else(|| eyre::eyre!("utf-8 temp path"))?;
+        generate_cleartext_keys(datadir)?;
+        if FAUCET_ENABLED {
+            let before = datadir_listing(dir.path())?;
+            let err = run_mainnet_node_with_cleartext_key(datadir, &["--allow-cleartext-bls-key"])
+                .expect_err("a faucet build is refused on chain id 487");
+            let msg = format!("{err:#}");
+            assert!(msg.contains("--allow-faucet-on-chain-487"), "{msg}");
+            let err = run_mainnet_node_with_cleartext_key(
+                datadir,
+                &["--allow-cleartext-bls-key", "--allow-faucet-on-chain-487"],
+            )
+            .expect_err("a faucet build is refused on the mainnet genesis");
+            let msg = format!("{err:#}");
+            assert!(msg.contains("Telcoin mainnet"), "{msg}");
+            assert_eq!(datadir_listing(dir.path())?, before);
+            return Ok(());
+        }
+        run_mainnet_node_with_cleartext_key(datadir, &["--allow-cleartext-bls-key"])?;
+        // past every startup guard: the bundled committee and the execution database were
+        // written for the launcher
+        assert!(dir.path().to_path_buf().committee_path().exists());
+        assert!(dir.path().to_path_buf().reth_db_path().exists());
         Ok(())
     }
 }

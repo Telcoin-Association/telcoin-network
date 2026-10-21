@@ -50,8 +50,18 @@ impl PopArgs {
     ) -> eyre::Result<()> {
         // existing keys - never generated here; error with an accurate hint
         // (distinguish "no keys yet" from "keys present but unreadable").
+        let passphrase_given = passphrase.is_some();
         let key_config = KeyConfig::read_config(dir, passphrase).map_err(|e| {
-            if KeyConfig::keys_exist(dir) {
+            let wrapped_exists = dir.node_keys_path().join(tn_config::BLS_WRAPPED_KEYFILE).exists();
+            if passphrase_given && KeyConfig::keys_exist(dir) && !wrapped_exists {
+                // a passphrase never unlocks the cleartext bls.key; name the source that does
+                eyre::eyre!(
+                    "could not read existing BLS keys from {}: {e}\n\
+                     hint: the BLS key is stored unencrypted (bls.key) - rerun with \
+                     `--bls-passphrase-source no-passphrase` to use it",
+                    dir.node_keys_path().display()
+                )
+            } else if KeyConfig::keys_exist(dir) {
                 eyre::eyre!(
                     "could not read existing BLS keys from {}: {e}\n\
                      hint: the keys exist but could not be read - verify the BLS passphrase is correct",

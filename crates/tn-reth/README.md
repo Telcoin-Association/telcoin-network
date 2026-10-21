@@ -291,7 +291,9 @@ replay, and read-only/RPC EVMs alike:
 **Feature-flag hazard:** the `faucet` feature replaces the timelocked mint with an instant,
 role-gated `mint(address,uint256)` and **must never ship in mainnet builds**. Note
 `adiri = ["faucet", "tn-types/adiri"]` in `crates/tn-reth/Cargo.toml` — building for adiri
-transitively enables faucet minting.
+transitively enables faucet minting. At startup a faucet build refuses chain id 487 unless the node
+runs with `--allow-faucet-on-chain-487` (devnets that reuse that chain id), and refuses the embedded
+mainnet genesis even then (`validate_faucet_build` in `telcoin-network-cli`).
 
 ## Trust boundaries
 

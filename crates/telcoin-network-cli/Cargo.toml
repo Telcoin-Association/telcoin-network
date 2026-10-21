@@ -80,6 +80,11 @@ workspace = true
 # Purely additive: it must never change how the secure paths behave.
 test-utils = ["tn-config/test-utils"]
 # Adiri testnet: propagate to the node graph + this crate's directly-gated fork logic.
-adiri = ["tn-node/adiri", "tn-reth/adiri", "tn-storage/adiri", "tn-types/adiri"]
+# `tn-reth/adiri` already compiles in the faucet mint, so `faucet` is listed here too and the
+# `--version` "Build Features" line names it.
+adiri = ["faucet", "tn-node/adiri", "tn-reth/adiri", "tn-storage/adiri", "tn-types/adiri"]
+# Faucet build (devnet): the instant, role-gated TEL mint in tn-reth. Declared on this crate
+# because vergen reads this crate's features for the `--version` "Build Features" line.
+faucet = ["tn-node/faucet", "tn-reth/faucet"]
 # Opt back in to reth's RocksDB storage backend: propagate to the node graph.
 rocksdb = ["tn-node/rocksdb", "tn-reth/rocksdb"]

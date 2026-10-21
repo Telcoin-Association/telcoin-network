@@ -412,7 +412,9 @@ pub fn spawn_local_testnet(
             &ipc_path_str,
         ]);
 
-        let key_config = KeyConfig::read_config(&dir, Some("it_test_pass".to_string()))?;
+        // config_local_testnet above generated these keys without a passphrase (cleartext
+        // bls.key), so they are read without one
+        let key_config = KeyConfig::read_config(&dir, None)?;
         let tx = tx.clone();
         let name = v.to_string();
 
