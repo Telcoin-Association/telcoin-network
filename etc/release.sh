@@ -1056,6 +1056,16 @@ check_release_body() {
     BODY_HEX=$(sha256_hex "$have")
 }
 
+# publish on a release that is public already, after a publish that stopped before the alias
+# step: its body may carry a warning added since, and the draft job no longer writes the notes
+# of a published release, so the body is recorded as it is (BODY_HEX, which
+# check_assets_unchanged compares) and not compared with the generated notes.
+record_release_body() {
+    release_body "$WORK/body.have"
+    BODY_HEX=$(sha256_hex "$WORK/body.have")
+    info "release $TAG is public already: its body is kept as it is, not compared with the generated notes"
+}
+
 # The release body; a dry run keeps it next to the artifacts instead.
 release_set_notes() {
     local dest
@@ -1968,7 +1978,7 @@ cmd_publish() {
     fetch_tag
     check_scripts_from_main
     cmd_verify 0
-    check_release_body
+    if [ "$REL_DRAFT" = true ]; then check_release_body; else record_release_body; fi
     published=$(published_versions) || exit
     highest=$(printf '%s\n%s\n' "$published" "$VERSION" | version_max)
     if [ -z "$RC" ] && [ "$highest" = "$VERSION" ]; then

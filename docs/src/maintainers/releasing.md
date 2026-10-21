@@ -240,11 +240,11 @@ docker logout ghcr.io
 It ends with a line like `verified v0.17.0-adiri commit=... signatures=1/1 image=...`.
 
 `release-publish` runs the same checks, and also checks the ghcr login when it will move the channel alias, before it asks for `yes`.
-It checks that the release body ends with the notes generated for the tagged commit and the image digest, line for line, and shows the operator notes above them for you to review.
+While the release is a draft, it checks that the release body ends with the notes generated for the tagged commit and the image digest, line for line, and shows the operator notes above them for you to review.
 After you type `yes`, it checks that the draft's files are still the ones it verified, by name, asset id and digest, and that the body has not changed, and publishes the draft as Latest, as a normal release or as a pre-release, following the channel table.
 It checks the files and the body once more after publishing, before it moves the alias.
 If the release is the highest published final version in its channel, it points the channel alias at the image digest and confirms that the registry agrees.
-It skips work that is already done, so it is safe to run again.
+It skips work that is already done, so it is safe to run again: when a run stopped after publishing, run `make release-publish` again, and on the release that is now public it keeps the body as it is, without comparing it with the generated notes, and moves the alias.
 `docker logout ghcr.io` removes the registry credential from the build server until the next release.
 
 ### 7. CI verifies the published release
@@ -320,8 +320,8 @@ If `release-sign` had already uploaded the signature, the second run stops becau
 | 5 | Your key has already signed this release | Nothing to do. With a threshold above 1, another maintainer signs next. |
 | 6 | `release-verify` fails | Do not publish; the message names the failed check. To rebuild under the same tag, delete the draft with `gh release delete <TAG> --yes`, recreate it with `gh run rerun <run-id>` on the tag's CI run, run step 4 with `RELEASE_REBUILD=1`, then step 5. |
 | 6 | `release-publish` stops because the release's files or body changed after they were verified | Someone changed the draft while `release-publish` ran. If the release is still a draft, find out what changed before you run `release-publish` again; if it is public, follow [After publish](#after-publish). |
-| 6 | `release-publish` stops because the body does not end with the generated notes | Someone edited the generated part, or the allowlist or the release scripts on `main` changed since the build. Re-run the tag's CI run with `gh run rerun <run-id>`, which writes the generated notes again, add the operator notes above them, and run `release-publish` again. |
-| 6 | `release-publish` stops at the alias step | Run it again; it skips the steps already done. |
+| 6 | `release-publish` stops because the body of the draft does not end with the generated notes | Someone edited the generated part, or the allowlist or the release scripts on `main` changed since the build. Re-run the tag's CI run with `gh run rerun <run-id>`, which writes the generated notes again, add the operator notes above them, and run `release-publish` again. |
+| 6 | `release-publish` stops after publishing, at the alias step | Run `make release-publish` again; on the published release it skips publishing and the body comparison and moves the alias. |
 | 7 | CI verification fails after publishing | Follow [After publish](#after-publish). |
 | any | Unsure where things stand | Check `gh release view <TAG>`, `gh run list --workflow release.yaml` and the files in `target/release-artifacts/<TAG>/`. |
 
