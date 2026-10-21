@@ -179,3 +179,104 @@ fn every_cursor_joins_the_key_tail_to_inline_values() {
     assert_eq!(next, keys[101]);
     txn.abort();
 }
+
+/// An entry with its value owned, for comparing two cursors' results across their next calls.
+fn own(entry: Option<(&[u8], &[u8])>) -> Option<(Vec<u8>, Vec<u8>)> {
+    entry.map(|(key, value)| (key.to_vec(), value.to_vec()))
+}
+
+/// The seek keys: each row's key (a hit), the key with a zero byte after it (a miss between it
+/// and the next key), its key part (a miss before the key part's first row), the empty key
+/// (before the first row) and a key past every row.
+fn probes() -> Vec<Vec<u8>> {
+    let mut probes = vec![Vec::new(), vec![0xFF; KEY + SUB + 1]];
+    for i in 0..ROWS {
+        let key = row_key(i);
+        probes.push([&key[..], &[0]].concat());
+        probes.push(key[..KEY].to_vec());
+        probes.push(key);
+    }
+    probes
+}
+
+/// `seek_with_key_tail(key, t)` on an owned cursor and a detached write cursor equals `seek(key)`
+/// followed by `current_with_key_tail(t)` on a twin cursor: hits on inline, empty and overflow
+/// values, misses between keys, before the first and past the last, and an empty table; for each
+/// tail, the same [`KeyTail`] (one slice of the page for an inline value), and the cursor left
+/// where the seek leaves its twin: the same state, and the same `current`, `next` and `prev` after.
+#[test]
+fn seek_with_key_tail_is_a_seek_then_current_with_key_tail() {
+    let (_dir, path) = temp("tndb-b-seek-key-tail");
+    let env = open(&path, SyncMode::Durable);
+    let table = filled(&env);
+    let mut txn = env.begin_rw().expect("rw");
+    let empty = txn.create_table("empty").expect("create");
+    txn.commit().expect("commit");
+    let (mut overflow, mut blank, mut misses, mut ends) = (0, 0, 0, 0);
+
+    let ro = Arc::new(env.begin_ro().expect("ro"));
+    for (table, probes) in [(&table, probes()), (&empty, vec![Vec::new(), row_key(5)])] {
+        let mut fused = ro.cursor_owned(table).expect("cursor_owned");
+        let mut twin = ro.cursor_owned(table).expect("cursor_owned");
+        for probe in &probes {
+            for t in TAILS {
+                let got = fused.seek_with_key_tail(probe, t).expect("seek_with_key_tail");
+                let found = twin.seek(probe).expect("seek").map(|(key, _)| key == &probe[..]);
+                let want = twin.current_with_key_tail(t).expect("tail");
+                assert_eq!(got, want, "probe {probe:?} t {t}");
+                assert_tail(got, twin.current().unwrap(), t);
+                assert_eq!(fused.state(), twin.state(), "probe {probe:?} t {t}");
+                assert_eq!(own(fused.current().unwrap()), own(twin.current().unwrap()));
+                match found {
+                    Some(true) => {
+                        let (_, value) = twin.current().unwrap().expect("a hit");
+                        overflow += usize::from(value.len() > INLINE_MAX);
+                        blank += usize::from(value.is_empty());
+                    }
+                    Some(false) => misses += 1,
+                    None => ends += 1,
+                }
+                // Forward then back past the start, or back then forward, by `t`.
+                let forward = t % 2 == 0;
+                for step in [forward, !forward, !forward] {
+                    let (a, b) = if step {
+                        (own(fused.next().unwrap()), own(twin.next().unwrap()))
+                    } else {
+                        (own(fused.prev().unwrap()), own(twin.prev().unwrap()))
+                    };
+                    assert_eq!(a, b, "probe {probe:?} t {t}: step forward {step}");
+                }
+            }
+        }
+    }
+    assert!(overflow >= 100 && blank >= 100, "{overflow} overflow and {blank} empty values hit");
+    assert!(misses >= 2 * ROWS as usize && ends >= 4, "{misses} misses, {ends} at the end");
+    drop(ro);
+
+    // A detached write cursor, which keeps the key it lands on to find its place again after a
+    // write: the same results, and after the transaction's write it is still where it landed.
+    let mut txn = env.begin_rw().expect("rw");
+    let mut fused = txn.cursor_detached(&table).expect("cursor_detached");
+    let mut twin = txn.cursor_detached(&table).expect("cursor_detached");
+    for (n, probe) in probes().iter().enumerate() {
+        let t = TAILS[n % TAILS.len()];
+        let got = fused.seek_with_key_tail(&txn, probe, t).expect("seek_with_key_tail");
+        twin.seek(&txn, probe).expect("seek");
+        assert_eq!(got, twin.current_with_key_tail(&txn, t).expect("tail"), "probe {probe:?}");
+        assert_eq!(own(fused.current(&txn).unwrap()), own(twin.current(&txn).unwrap()));
+        let step = n % 2 == 0;
+        let (a, b) = if step {
+            (own(fused.next(&txn).unwrap()), own(twin.next(&txn).unwrap()))
+        } else {
+            (own(fused.prev(&txn).unwrap()), own(twin.prev(&txn).unwrap()))
+        };
+        assert_eq!(a, b, "probe {probe:?}: step forward {step}");
+    }
+    assert!(fused.seek(&txn, &row_key(10)).expect("seek").is_some());
+    let landed = fused.seek_with_key_tail(&txn, &row_key(200), SUB).expect("seek").map(|e| e.0);
+    let landed = landed.expect("a hit").to_vec();
+    txn.put(&table, &row_key(201), b"moved").expect("put");
+    let (key, _) = fused.current(&txn).expect("current").expect("at the row");
+    assert_eq!(key, landed, "the key a reseek finds");
+    txn.abort();
+}

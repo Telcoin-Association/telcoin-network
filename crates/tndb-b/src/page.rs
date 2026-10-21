@@ -972,6 +972,12 @@ impl<'a> LeafView<'a> {
         Ok(Self { page, h: hdr_of(page, Kind::Leaf)? })
     }
 
+    /// The page's bytes.
+    #[inline]
+    pub(crate) fn page(&self) -> &'a [u8] {
+        self.page
+    }
+
     /// The number of cells.
     #[inline]
     pub(crate) fn nkeys(&self) -> usize {
@@ -1012,7 +1018,7 @@ impl<'a> LeafView<'a> {
     }
 
     /// Entry `i` as `(key, value)`.
-    #[inline]
+    #[inline(always)]
     pub(crate) fn entry(&self, i: usize) -> Result<(&'a [u8], Val<'a>)> {
         let page = self.page;
         let (off, klen, vlen) = leaf_cell(page, &self.h, i)?;
@@ -1025,7 +1031,7 @@ impl<'a> LeafView<'a> {
     /// after its key. An overflow value is its reference, as [`Self::entry`] gives it. A `t` past
     /// the key's length is the key's length (the slice is then `key ‖ value`): the slice never
     /// reaches into the cell's fixed part.
-    #[inline]
+    #[inline(always)]
     pub(crate) fn entry_with_key_tail(&self, i: usize, t: usize) -> Result<(&'a [u8], Val<'a>)> {
         let page = self.page;
         let (off, klen, vlen) = leaf_cell(page, &self.h, i)?;

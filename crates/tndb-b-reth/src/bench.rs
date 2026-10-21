@@ -71,6 +71,9 @@
 //!   run long enough to profile: for example `TNDB_RETH_BENCH_ENGINES=tndb
 //!   TNDB_RETH_BENCH_ROWS=RandomRead TNDB_RETH_BENCH_REPEAT=200000`.
 //! - `TNDB_RETH_BENCH_ENGINES`: `tndb`, `mdbx` or both (default), to profile one side.
+//! - `TNDB_RETH_BENCH_SYNC`: `durable` (default) or `nosync`. With `nosync` both sides skip every
+//!   commit sync (tndb [`SyncMode::NoSync`](crate::SyncMode::NoSync), MDBX `UtterlyNoSync`), so the
+//!   write rows time the CPU alone, even on a real disk. It is never the gate.
 //! - `TNDB_RETH_BENCH_MDBX_PAGE`: MDBX's page size (default reth's: the OS page size, clamped to 4
 //!   KiB..=64 KiB). On Apple Silicon the OS page is 16 KiB; `4096` there gives the like-for-like
 //!   column, which on Linux x86_64 is the default.
@@ -90,7 +93,7 @@
 // `get.rs`, `put.rs` and `utils.rs` (`RANDOM_INDEXES`), and the vector shapes of
 // `crates/cli/commands/src/test_vectors/tables.rs`; reth is licensed MIT OR Apache-2.0.
 
-use crate::{TndbArgs, TndbEnv, TndbEnvKind};
+use crate::{SyncMode, TndbArgs, TndbEnv, TndbEnvKind};
 use alloy::{
     consensus::{EthereumTxEnvelope, Header, Signed, TxEip1559, TxEip4844, TxLegacy},
     primitives::{Address, Bloom, Bytes, Signature, TxKind, B256, B64, U256},
@@ -327,23 +330,35 @@ fn hash_batches(rng: &mut Rng, size: usize) -> (HashRows, HashRows) {
 /// An environment the bench runs on.
 trait BenchDb: Database + DatabaseMetrics + Sized {
     /// A fresh environment in the empty directory `dir`, with every one of reth's tables.
-    fn create(dir: &Path, mdbx_page: Option<usize>) -> Self;
+    fn create(dir: &Path, open: Open) -> Self;
+}
+
+/// How the bench opens each environment.
+#[derive(Clone, Copy, Debug)]
+struct Open {
+    /// MDBX's page size (`None`: reth's default, the OS page).
+    mdbx_page: Option<usize>,
+    /// `TNDB_RETH_BENCH_SYNC=nosync`: commits skip every sync, on both sides.
+    no_sync: bool,
 }
 
 impl BenchDb for TndbEnv {
-    fn create(dir: &Path, _: Option<usize>) -> Self {
-        let mut db =
-            crate::tests::open_env(dir, TndbEnvKind::RW, TndbArgs::default()).expect("open tndb");
+    fn create(dir: &Path, open: Open) -> Self {
+        let sync = if open.no_sync { SyncMode::NoSync } else { SyncMode::Durable };
+        let args = TndbArgs::default().with_sync_mode(sync);
+        let mut db = crate::tests::open_env(dir, TndbEnvKind::RW, args).expect("open tndb");
         db.create_tables().expect("create tables");
         db
     }
 }
 
 impl BenchDb for DatabaseEnv {
-    fn create(dir: &Path, mdbx_page: Option<usize>) -> Self {
+    fn create(dir: &Path, open: Open) -> Self {
+        let sync = open.no_sync.then_some(reth_db::mdbx::SyncMode::UtterlyNoSync);
         let args = DatabaseArguments::test()
             .with_geometry_max_size(Some(MDBX_MAX_SIZE))
-            .with_geometry_page_size(mdbx_page);
+            .with_geometry_page_size(open.mdbx_page)
+            .with_sync_mode(sync);
         reth_db::init_db(dir, args).expect("open mdbx")
     }
 }
@@ -378,7 +393,7 @@ impl Engine {
 struct Dirs {
     root: PathBuf,
     made: usize,
-    mdbx_page: Option<usize>,
+    open: Open,
 }
 
 impl Dirs {
@@ -387,7 +402,7 @@ impl Dirs {
         self.made += 1;
         let dir = self.root.join(format!("env-{}", self.made));
         std::fs::create_dir(&dir).expect("bench dir");
-        let db = DB::create(&dir, self.mdbx_page);
+        let db = DB::create(&dir, self.open);
         (dir, db)
     }
 
@@ -485,7 +500,12 @@ impl Bench {
         };
         let mdbx_page =
             env_var("TNDB_RETH_BENCH_MDBX_PAGE").map(|v| number("TNDB_RETH_BENCH_MDBX_PAGE", &v));
-        let dirs = Dirs { root: root.to_path_buf(), made: 0, mdbx_page };
+        let no_sync = match env_var("TNDB_RETH_BENCH_SYNC").as_deref().map(str::trim) {
+            None | Some("durable") => false,
+            Some("nosync") => true,
+            Some(v) => panic!("TNDB_RETH_BENCH_SYNC: {v:?} is not durable or nosync"),
+        };
+        let dirs = Dirs { root: root.to_path_buf(), made: 0, open: Open { mdbx_page, no_sync } };
         Self { dirs, hash_sizes, rows_filter, repeat, engines, rows: Vec::new() }
     }
 
@@ -1121,13 +1141,18 @@ fn tndb_reth_vs_mdbx() {
     gets(&mut bench, rng);
     puts(&mut bench);
 
-    let mdbx_page = bench.dirs.mdbx_page.map_or_else(
+    let mdbx_page = bench.dirs.open.mdbx_page.map_or_else(
         || format!("reth's default, the OS page ({} B)", page_size()),
         |p| format!("{p} B"),
     );
+    let (tndb_sync, mdbx_sync) = if bench.dirs.open.no_sync {
+        ("NoSync", "UtterlyNoSync: CPU only, not the gate")
+    } else {
+        ("Durable", "Durable")
+    };
     println!(
-        "\nreth's db benches, tndb (4 KiB pages, Durable) vs MDBX (Durable, page {mdbx_page}); \
-         time per op, the median of at least {} samples and {} ms\n",
+        "\nreth's db benches, tndb (4 KiB pages, {tndb_sync}) vs MDBX ({mdbx_sync}, page \
+         {mdbx_page}); time per op, the median of at least {} samples and {} ms\n",
         bench.repeat,
         MEASURE.as_millis()
     );

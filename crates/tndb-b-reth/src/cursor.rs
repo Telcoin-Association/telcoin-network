@@ -30,7 +30,7 @@
 //! on the next key's first row, where `prev_dup` finds nothing, as MDBX's does.
 
 use crate::{
-    dup::DupLayout,
+    dup::{DupLayout, DUP_LAYOUTS},
     error::{self, Mdbx},
     tx::{compressed, no_data, SharedTxn},
 };
@@ -69,6 +69,8 @@ trait Moves {
     fn next_in_prefix(&mut self, n: usize) -> tndb_b::Result<Option<Entry<'_>>>;
     fn prev_in_prefix(&mut self, n: usize) -> tndb_b::Result<Option<Entry<'_>>>;
     fn current_with_key_tail(&mut self, t: usize) -> tndb_b::Result<Option<Tailed<'_>>>;
+    /// `seek(key)` followed by `current_with_key_tail(t)`, from one leaf access.
+    fn seek_with_key_tail(&mut self, key: &[u8], t: usize) -> tndb_b::Result<Option<Tailed<'_>>>;
 }
 
 impl Moves for RoCursor {
@@ -101,6 +103,9 @@ impl Moves for RoCursor {
     }
     fn current_with_key_tail(&mut self, t: usize) -> tndb_b::Result<Option<Tailed<'_>>> {
         Self::current_with_key_tail(self, t)
+    }
+    fn seek_with_key_tail(&mut self, key: &[u8], t: usize) -> tndb_b::Result<Option<Tailed<'_>>> {
+        Self::seek_with_key_tail(self, key, t)
     }
 }
 
@@ -141,6 +146,9 @@ impl Moves for Locked<'_, '_> {
     fn current_with_key_tail(&mut self, t: usize) -> tndb_b::Result<Option<Tailed<'_>>> {
         self.cursor.current_with_key_tail(self.txn, t)
     }
+    fn seek_with_key_tail(&mut self, key: &[u8], t: usize) -> tndb_b::Result<Option<Tailed<'_>>> {
+        self.cursor.seek_with_key_tail(self.txn, key, t)
+    }
 }
 
 /// Where a cursor is, beyond its engine cursor's state: MDBX tells a fresh cursor from one a
@@ -175,15 +183,28 @@ enum Pos {
 }
 
 /// The part of a cursor that knows its table's rows: their layout, the cursor's [`Pos`], and the
-/// buffers a dup-sort row's value is rebuilt in and a `seek_by_key_subkey` key is built in. Its
-/// moves take the engine cursor as [`Moves`].
+/// buffer a dup-sort row's value is rebuilt in. Its moves take the engine cursor as [`Moves`].
 #[derive(Debug)]
 struct Rows {
     dup: Option<DupLayout>,
     pos: Pos,
     value: Vec<u8>,
-    target: Vec<u8>,
 }
+
+/// The width of the stack buffer a `seek_by_key_subkey` key, `key ‖ subkey`, is built in
+/// ([`Rows::seek_by_key_subkey_row`]). Every layout's `key + subkey` fits (`StoragesTrie`'s 97
+/// bytes is the widest), so a seek with reth's keys allocates nothing.
+const SEEK_KEY_STACK: usize = 128;
+
+// Every layout's `key ‖ subkey` fits the stack buffer, checked at compile time.
+const _: () = {
+    let mut i = 0;
+    while i < DUP_LAYOUTS.len() {
+        let layout = DUP_LAYOUTS[i].1;
+        assert!(layout.key + layout.subkey <= SEEK_KEY_STACK);
+        i += 1;
+    }
+};
 
 /// The row of table `T` that a move of the engine cursor `$m` landed on, `$entry` (its stored
 /// form, which borrows `$m`), decoded: from the entry on a table without duplicates ([`plain`]);
@@ -207,9 +228,25 @@ fn plain<T: Table>(entry: Option<Entry<'_>>) -> PairResult<T> {
     Ok(Some((T::Key::decode(key)?, T::Value::decompress(value)?)))
 }
 
+/// The row of dup-sort table `T` read as its stored key and its full value ([`Rows::dup_row`]),
+/// if any, decoded.
+#[inline(always)]
+fn dup_decoded<T: Table>(dup: DupLayout, row: Option<Entry<'_>>) -> PairResult<T> {
+    let Some((key, value)) = row else { return Ok(None) };
+    let (key_part, _) = dup.split(key).ok_or(DatabaseError::Decode)?;
+    Ok(Some((T::Key::decode(key_part)?, T::Value::decompress(value)?)))
+}
+
+/// The value of the row of dup-sort table `T` read as its stored key and its full value
+/// ([`Rows::dup_row`]), if any, decoded.
+#[inline(always)]
+fn dup_value_of<T: Table>(row: Option<Entry<'_>>) -> ValueOnlyResult<T> {
+    row.map(|(_, value)| T::Value::decompress(value)).transpose()
+}
+
 impl Rows {
     const fn new(dup: Option<DupLayout>) -> Self {
-        Self { dup, pos: Pos::Fresh, value: Vec::new(), target: Vec::new() }
+        Self { dup, pos: Pos::Fresh, value: Vec::new() }
     }
 
     /// Where a write through the cursor that ended with `result` leaves it. A write the engine
@@ -262,9 +299,7 @@ impl Rows {
         dup: DupLayout,
         found: bool,
     ) -> PairResult<T> {
-        let Some((key, value)) = self.dup_row(m, dup, found)? else { return Ok(None) };
-        let (key_part, _) = dup.split(key).ok_or(DatabaseError::Decode)?;
-        Ok(Some((T::Key::decode(key_part)?, T::Value::decompress(value)?)))
+        dup_decoded::<T>(dup, self.dup_row(m, dup, found)?)
     }
 
     /// The value of the row of dup-sort table `T` the engine cursor `m` is at, if a move just
@@ -275,7 +310,7 @@ impl Rows {
         dup: DupLayout,
         found: bool,
     ) -> ValueOnlyResult<T> {
-        self.dup_row(m, dup, found)?.map(|(_, value)| T::Value::decompress(value)).transpose()
+        dup_value_of::<T>(self.dup_row(m, dup, found)?)
     }
 
     fn first<T: Table>(&mut self, m: &mut impl Moves) -> PairResult<T> {
@@ -360,24 +395,37 @@ impl Rows {
     }
 
     /// Move to the first row of `key` whose subkey is at or after `subkey` (MDBX's
-    /// `get_both_range`): a `seek` of `key ‖ subkey`, never past the key's rows. `true` if there
-    /// is one; a miss leaves the cursor unset.
-    fn seek_by_key_subkey_row(
-        &mut self,
-        m: &mut impl Moves,
+    /// `get_both_range`) and return it, as [`Rows::dup_row`] does: a `seek` of `key ‖ subkey`,
+    /// never past the key's rows, that reads the row it lands on from the same leaf access
+    /// ([`Moves::seek_with_key_tail`]). A miss leaves the cursor unset ([`Pos::Missed`]). The seek
+    /// key is built on the stack ([`SEEK_KEY_STACK`] bytes), or when longer (only a raw key or
+    /// subkey can be) in a `Vec` of its own: the same seek either way.
+    fn seek_by_key_subkey_row<'a>(
+        &'a mut self,
+        m: &'a mut impl Moves,
         dup: DupLayout,
         key: &[u8],
         subkey: &[u8],
-    ) -> Result<bool, DatabaseError> {
-        self.target.clear();
-        self.target.extend_from_slice(key);
-        self.target.extend_from_slice(subkey);
-        let found = m
-            .seek(&self.target)
+    ) -> Result<Option<Entry<'a>>, DatabaseError> {
+        let mut stack = [0; SEEK_KEY_STACK];
+        let heap;
+        let target = if let Some(target) = stack.get_mut(..key.len() + subkey.len()) {
+            let (key_part, subkey_part) = target.split_at_mut(key.len());
+            key_part.copy_from_slice(key);
+            subkey_part.copy_from_slice(subkey);
+            &*target
+        } else {
+            heap = [key, subkey].concat();
+            &heap
+        };
+        let row = m
+            .seek_with_key_tail(target, dup.subkey)
             .map_err(error::read)?
-            .is_some_and(|(stored, _)| dup.is_row_of(stored, key));
-        self.pos = if found { Pos::Engine } else { Pos::Missed };
-        Ok(found)
+            .filter(|&(stored, _)| dup.is_row_of(stored, key));
+        self.pos = if row.is_some() { Pos::Engine } else { Pos::Missed };
+        let Some((stored, tail)) = row else { return Ok(None) };
+        let value = dup.joined(stored, tail, &mut self.value).ok_or(DatabaseError::Decode)?;
+        Ok(Some((stored, value)))
     }
 
     /// The next row of the current key.
@@ -650,8 +698,8 @@ macro_rules! dup_reads {
             let (key, subkey) = (key.encode(), subkey.encode());
             self.with(|rows, m| {
                 let dup = rows.layout::<T>()?;
-                let found = rows.seek_by_key_subkey_row(m, dup, key.as_ref(), subkey.as_ref())?;
-                rows.dup_value::<T>(m, dup, found)
+                let row = rows.seek_by_key_subkey_row(m, dup, key.as_ref(), subkey.as_ref())?;
+                dup_value_of::<T>(row)
             })
         }
 
@@ -669,9 +717,8 @@ macro_rules! dup_reads {
                 let (key, subkey) = (key.encode(), subkey.encode());
                 this.with(|rows, m| {
                     let dup = rows.layout::<T>()?;
-                    let found =
-                        rows.seek_by_key_subkey_row(m, dup, key.as_ref(), subkey.as_ref())?;
-                    rows.dup_pair::<T>(m, dup, found)
+                    let row = rows.seek_by_key_subkey_row(m, dup, key.as_ref(), subkey.as_ref())?;
+                    dup_decoded::<T>(dup, row)
                 })
             };
             let start = match (key, subkey) {

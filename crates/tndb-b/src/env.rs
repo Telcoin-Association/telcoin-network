@@ -30,7 +30,9 @@
 //!
 //! Each commit publishes an immutable [`Snapshot`] (its meta and the mapping's reader view);
 //! [`Env::begin_ro`] clones the current one, so a reader sees one consistent state of every
-//! table for as long as it lives. The writer keeps a weak reference to every snapshot it
+//! table for as long as it lives. A snapshot also remembers the tree roots of the tables its
+//! readers resolved ([`TableRoots`]), so each table's catalog lookup runs once per snapshot,
+//! not once per transaction. The writer keeps a weak reference to every snapshot it
 //! published, oldest first, to learn the oldest state a reader may still be reading
 //! ([`Writer::oldest_reader_txn`]): a page freed after that state must not be reused yet.
 //!
@@ -72,7 +74,7 @@ use crate::{
         write::Scratch,
         PageRead, PageWrite, TreeRoot,
     },
-    txn::{RoTxn, RwTxn},
+    txn::{RoTxn, RwTxn, TableRoots},
 };
 
 /// Runs of dirty pages separated by at most this many clean pages merge into one range, which one
@@ -154,7 +156,7 @@ impl std::fmt::Debug for Env {
 }
 
 /// One committed state as readers see it: its meta (txn, catalog and free-tree roots, page
-/// count) and the mapping's reader view.
+/// count), the mapping's reader view, and the tree roots of the tables its readers resolved.
 #[derive(Debug)]
 pub(crate) struct Snapshot {
     /// The state's meta.
@@ -163,9 +165,17 @@ pub(crate) struct Snapshot {
     pub(crate) geometry: Geometry,
     /// The mapping, read without a lock.
     pub(crate) view: Arc<MapView>,
+    /// The tree roots of the tables resolved by the readers of this snapshot (empty when it is
+    /// published; a commit publishes a new snapshot).
+    pub(crate) tables: TableRoots,
 }
 
 impl Snapshot {
+    /// The snapshot of the state `meta` names, read through `view`, with no table resolved.
+    fn new(meta: Meta, geometry: Geometry, view: Arc<MapView>) -> Self {
+        Self { meta, geometry, view, tables: TableRoots::default() }
+    }
+
     /// Page `pgno` again, without the per-fetch checks, for a cursor that fetched it with them
     /// before: the snapshot's pages do not change while it lives. `None` if it is not mapped.
     #[inline]
@@ -494,7 +504,7 @@ impl Writer {
     pub(crate) fn publish(&mut self, inner: &EnvInner, meta: Meta) {
         let view = self.file.view();
         view.publish_len(u64::from(meta.page_count) * self.geometry.page_size() as u64);
-        let snapshot = Arc::new(Snapshot { meta, geometry: self.geometry, view });
+        let snapshot = Arc::new(Snapshot::new(meta, self.geometry, view));
         self.readers.push_back((meta.txn, Arc::downgrade(&snapshot)));
         self.last = meta;
         *inner.current.write() = snapshot;
@@ -1122,7 +1132,7 @@ fn choose_state(file: &File) -> Result<(Chosen, Geometry)> {
 /// once both its tree roots pass [`check_root`] (open step 9).
 fn checked_snapshot(meta: Meta, geometry: Geometry, view: Arc<MapView>) -> Result<Arc<Snapshot>> {
     view.publish_len(u64::from(meta.page_count) * u64::from(meta.page_size));
-    let snapshot = Arc::new(Snapshot { meta, geometry, view });
+    let snapshot = Arc::new(Snapshot::new(meta, geometry, view));
     check_root(&snapshot, &meta.catalog, "catalog")?;
     check_root(&snapshot, &meta.free, "free tree")?;
     Ok(snapshot)

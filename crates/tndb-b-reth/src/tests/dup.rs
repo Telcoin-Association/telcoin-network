@@ -3,7 +3,11 @@
 //! differences from MDBX's cursors.
 
 use super::{adapter::create_mdbx_db, mdbx_port::create_test_db};
-use crate::{dup::dup_layout, tx::compressed, TndbEnvKind};
+use crate::{
+    dup::{dup_layout, DupLayout},
+    tx::compressed,
+    TndbEnvKind,
+};
 use alloy::primitives::{Address, B256, U256};
 use reth_db_api::{
     common::{PairResult, ValueOnlyResult},
@@ -744,6 +748,167 @@ fn every_dup_table_keeps_its_rows_as_mdbx_does() {
     );
 }
 
+/// A key or subkey `width` bytes wide whose every byte counts: `base + i` at byte `i`, the last
+/// byte `n`.
+fn wide(width: usize, base: u8, n: u8) -> Vec<u8> {
+    let mut bytes: Vec<u8> = (0..width).map(|i| base.wrapping_add(i as u8)).collect();
+    bytes[width - 1] = n;
+    bytes
+}
+
+/// Key `n` of `layout`'s width ([`wide`]).
+fn wide_key(layout: DupLayout, n: u8) -> Vec<u8> {
+    wide(layout.key, 0xA0, n)
+}
+
+/// Subkey `n` of `layout`'s width ([`wide`]). Subkeys sort before keys, so a seek key with the
+/// two swapped sorts before every row.
+fn wide_subkey(layout: DupLayout, n: u8) -> Vec<u8> {
+    wide(layout.subkey, 0x30, n)
+}
+
+/// Rows of the raw view of dup-sort table `T` at its layout's widths ([`wide_key`],
+/// [`wide_subkey`]), key 1 at subkeys 3 and 5, key 2 at 2, 4 and 6, key 4 at 1 and 5 (no key of
+/// one row, where MDBX's cursor misbehaves), each value's rest after the subkey three 7s; then
+/// [`seeks_through`] a read cursor and a write one.
+fn subkey_seeks<T: DupSort, D: Database>(db: &D, seeks: &[(Vec<u8>, Vec<u8>)]) -> Vec<String>
+where
+    T::Key: Debug,
+    T::Value: Debug,
+{
+    let layout = dup_layout(T::NAME).unwrap();
+    let tx = db.tx_mut().unwrap();
+    for (k, sk) in [(1, 3), (1, 5), (2, 2), (2, 4), (2, 6), (4, 1), (4, 5)] {
+        let value = [wide_subkey(layout, sk), vec![7; 3]].concat();
+        tx.put::<RawDupSort<T>>(RawKey::from_vec(wide_key(layout, k)), RawValue::from_vec(value))
+            .unwrap();
+    }
+    tx.commit().unwrap();
+    let mut log = Vec::new();
+    let tx = db.tx().unwrap();
+    let mut c = tx.cursor_dup_read::<RawDupSort<T>>().unwrap();
+    seeks_through::<T, _>(&mut c, seeks, &mut log);
+    let tx = db.tx_mut().unwrap();
+    let mut c = tx.cursor_dup_write::<RawDupSort<T>>().unwrap();
+    seeks_through::<T, _>(&mut c, seeks, &mut log);
+    log
+}
+
+/// Each `seek_by_key_subkey` of `seeks` (a key and a subkey) through cursor `c` over the raw view
+/// of table `T`, followed by `current` and `next_dup` and by a `walk_dup` from it, every result
+/// logged to `log`.
+fn seeks_through<T: DupSort, C>(c: &mut C, seeks: &[(Vec<u8>, Vec<u8>)], log: &mut Vec<String>)
+where
+    C: DbCursorRO<RawDupSort<T>> + DbDupCursorRO<RawDupSort<T>>,
+    T::Key: Debug,
+    T::Value: Debug,
+{
+    for (i, (key, subkey)) in seeks.iter().enumerate() {
+        let (key, subkey) = (RawKey::from_vec(key.clone()), RawKey::from_vec(subkey.clone()));
+        log.push(format!("{i} sk: {:?}", c.seek_by_key_subkey(key.clone(), subkey.clone())));
+        log.push(format!("{i} c: {:?}", c.current()));
+        log.push(format!("{i} nd: {:?}", c.next_dup()));
+        let walk = c.walk_dup(Some(key), Some(subkey)).map(|w| w.collect::<Vec<_>>());
+        log.push(format!("{i} walk_dup: {walk:?}"));
+    }
+}
+
+/// `seek_by_key_subkey` (and `walk_dup` from a key and subkey) on every dup-sort table, with
+/// keys and subkeys at its layout's full widths, as on MDBX ([`subkey_seeks`]): hits at a key's
+/// first, middle and last rows, misses inside its rows (on the row after), a miss past them
+/// (another key's rows follow), and keys absent from the table, before another key and past the
+/// last.
+#[test]
+fn seek_by_key_subkey_matches_mdbx_at_every_layouts_widths() {
+    let (_mdbx_dir, mdbx) = create_mdbx_db();
+    let (_dir, db) = create_test_db(TndbEnvKind::RW);
+    macro_rules! same {
+        ($table:ty) => {{
+            let layout = dup_layout(<$table>::NAME).unwrap();
+            let (key, subkey) = (|n| wide_key(layout, n), |n| wide_subkey(layout, n));
+            let seeks = [
+                (key(2), subkey(2)),
+                (key(2), subkey(4)),
+                (key(2), subkey(6)),
+                (key(2), subkey(3)),
+                (key(2), subkey(1)),
+                (key(2), subkey(7)),
+                (key(1), subkey(5)),
+                (key(1), subkey(6)),
+                (key(3), subkey(5)),
+                (key(5), subkey(0)),
+            ];
+            let expected = subkey_seeks::<$table, _>(&mdbx, &seeks);
+            let got = subkey_seeks::<$table, _>(&db, &seeks);
+            for (want, have) in expected.iter().zip(&got) {
+                assert_eq!(have, want, stringify!($table));
+            }
+            assert_eq!(got.len(), expected.len());
+        }};
+    }
+    same!(PlainStorageState);
+    same!(StorageChangeSets);
+    same!(HashedStorages);
+    same!(AccountChangeSets);
+    same!(StoragesTrie);
+}
+
+/// A `seek_by_key_subkey` key longer than the cursor's stack buffer for it (128 bytes) is the
+/// same seek, on `PlainStorageState`'s raw view (key 20 bytes, subkey 32; [`subkey_seeks`]):
+/// subkeys of 108 bytes (a seek key of 128, the longest on the stack), 109 and 200 that go
+/// between two rows of the key, skip a row whose subkey they start with, or go past the key's
+/// rows, and an oversized key, all as on MDBX.
+///
+/// A subkey that starts with a row's subkey and then sorts before that row's rest is not as on
+/// MDBX, at every length: MDBX compares the row's whole value, `subkey ‖ rest`, with it, so it
+/// takes the row, while here the seek key `key ‖ subkey` sorts after the row's stored key
+/// `key ‖ subkey[..32]`, of which it is a longer copy, so it takes the row after. No reth
+/// subkey is wider than its table's layout, so only a raw one meets this.
+#[test]
+fn seek_by_key_subkey_longer_than_the_stack_buffer_matches_mdbx() {
+    let (_mdbx_dir, mdbx) = create_mdbx_db();
+    let (_dir, db) = create_test_db(TndbEnvKind::RW);
+    let layout = dup_layout(PlainStorageState::NAME).unwrap();
+    let (key, subkey) = (|n| wide_key(layout, n), |n| wide_subkey(layout, n));
+    let longer = |n, len, fill| {
+        let mut bytes = subkey(n);
+        bytes.resize(len, fill);
+        bytes
+    };
+    let mut seeks = Vec::new();
+    for len in [108, 109, 200] {
+        seeks.extend([
+            (key(2), longer(3, len, 0x00)),
+            (key(2), longer(4, len, 0xFF)),
+            (key(2), longer(6, len, 0xFF)),
+        ]);
+    }
+    seeks.push(([key(2), vec![0; 120]].concat(), subkey(4)));
+    let expected = subkey_seeks::<PlainStorageState, _>(&mdbx, &seeks);
+    let got = subkey_seeks::<PlainStorageState, _>(&db, &seeks);
+    for (want, have) in expected.iter().zip(&got) {
+        assert_eq!(have, want);
+    }
+    assert_eq!(got.len(), expected.len());
+
+    // The difference, pinned beside MDBX's result: subkey 4, then zeros, which sort before the
+    // row's rest (7s).
+    for len in [108, 200] {
+        let (k, sk) = (key(2), longer(4, len, 0x00));
+        assert_eq!(seek_taken(&mdbx, k.clone(), sk.clone()), Some(4), "{len}");
+        assert_eq!(seek_taken(&db, k, sk), Some(6), "{len}");
+    }
+}
+
+/// The last byte of the subkey of the value `seek_by_key_subkey(key, subkey)` takes on
+/// `PlainStorageState`'s raw view, if any.
+fn seek_taken<D: Database>(db: &D, key: Vec<u8>, subkey: Vec<u8>) -> Option<u8> {
+    let tx = db.tx().unwrap();
+    let mut c = tx.cursor_dup_read::<RawDupSort<PlainStorageState>>().unwrap();
+    let value = c.seek_by_key_subkey(RawKey::from_vec(key), RawKey::from_vec(subkey)).unwrap()?;
+    Some(value.raw_value()[31])
+}
+
 /// Every row of `StorageChangeSets`, by a walk.
 fn all_rows(tx: &impl DbTx) -> Vec<(BlockNumberAddress, StorageEntry)> {
     let mut cursor = tx.cursor_dup_read::<StorageChangeSets>().unwrap();
@@ -937,7 +1102,9 @@ fn a_range_walk_on_a_dup_table_starts_past_every_row_of_an_excluded_key() {
 
 /// Dup rows whose values are too large for a leaf, so the engine keeps them in overflow runs,
 /// where a row's value is not next to its subkey (no reth dup table's values get that large):
-/// every read call returns each full value, `subkey ‖ rest`, as with the inline ones beside them.
+/// every read call returns each full value, `subkey ‖ rest`, as with the inline ones beside them,
+/// and a `seek_by_key_subkey` past a key's rows or of a key with none misses although a row in a
+/// run follows.
 #[test]
 fn dup_values_in_overflow_runs_read_back_whole() {
     type Raw = RawDupSort<PlainStorageState>;
@@ -991,6 +1158,26 @@ fn dup_values_in_overflow_runs_read_back_whole() {
     assert_eq!(c.first().unwrap(), Some(rows[0].clone()));
     assert_eq!(c.next_dup_val().unwrap(), Some(rows[1].1.clone()));
     assert_eq!(c.last().unwrap(), Some(rows[3].clone()));
+
+    // `seek_by_key_subkey` through the read cursor: a hit on a value in a run, and a miss between
+    // two subkeys that lands on one, each leaving the cursor at its row; a subkey past the key's
+    // rows, and a key with no rows, each a miss although the next row (key 2's, in a run) follows.
+    let subkey = |bytes: [u8; 32]| RawKey::new(B256::from(bytes));
+    let mut between = [2; 32];
+    between[31] = 3;
+    assert_eq!(c.seek_by_key_subkey(key(1), subkey([1; 32])).unwrap(), Some(rows[0].1.clone()));
+    assert_eq!(c.current().unwrap(), Some(rows[0].clone()));
+    assert_eq!(c.next_dup().unwrap(), Some(rows[1].clone()));
+    assert_eq!(c.seek_by_key_subkey(key(1), subkey(between)).unwrap(), Some(rows[2].1.clone()));
+    assert_eq!(c.prev_dup().unwrap(), Some(rows[1].clone()));
+    assert_eq!(c.seek_by_key_subkey(key(1), subkey([4; 32])).unwrap(), None);
+    assert_eq!(c.current().unwrap(), None);
+    let mut absent = vec![1; 20];
+    absent[19] = 9;
+    assert_eq!(c.seek_by_key_subkey(RawKey::from_vec(absent), subkey([0; 32])).unwrap(), None);
+    assert_eq!(c.next_dup().unwrap(), None);
+    let from = c.walk_dup(Some(key(1)), Some(subkey(between))).unwrap();
+    assert_eq!(from.collect::<Result<Vec<_>, _>>().unwrap(), rows[2..3]);
 }
 
 /// [`dup_steps`] through a cursor over the raw view of `PlainStorageState` (whose values can be

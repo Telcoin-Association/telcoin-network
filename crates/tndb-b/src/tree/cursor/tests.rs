@@ -22,6 +22,20 @@ fn owned(entry: Option<(&[u8], &[u8])>) -> Option<Kv> {
     entry.map(|(k, v)| (k.to_vec(), v.to_vec()))
 }
 
+/// An entry as a `current_with_key_tail(t)` gives it, in the model's form: the key, and the key's
+/// last `t` bytes followed by the value.
+fn joined(key: &[u8], t: usize, value: &[u8]) -> Kv {
+    (key.to_vec(), [&key[key.len() - t.min(key.len())..], value].concat())
+}
+
+/// A cursor's [`KeyTail`] entry in the model's form ([`joined`]; an overflow value joined here).
+fn owned_tail(entry: Option<(&[u8], KeyTail<'_>)>, t: usize) -> Option<Kv> {
+    entry.map(|(key, tail)| match tail {
+        KeyTail::Joined(slice) => (key.to_vec(), slice.to_vec()),
+        KeyTail::Apart(value) => joined(key, t, value),
+    })
+}
+
 /// The model of a cursor: the sorted entries and a position.
 #[derive(Debug)]
 struct Model {
@@ -135,6 +149,7 @@ impl Model {
             Op::Current => self.current(),
             Op::Seek(key) => self.seek(key),
             Op::SeekExact(key) => self.seek_exact(key).map(|v| (key.clone(), v)),
+            Op::SeekWithKeyTail(key, t) => self.seek(key).map(|(k, v)| joined(&k, *t, &v)),
             Op::NextInPrefix(n) => self.step_in_prefix(*n, true),
             Op::PrevInPrefix(n) => self.step_in_prefix(*n, false),
         }
@@ -151,16 +166,19 @@ enum Op {
     Current,
     Seek(Vec<u8>),
     SeekExact(Vec<u8>),
+    /// A seek returning the entry as `current_with_key_tail(t)` would (in [`joined`] form).
+    SeekWithKeyTail(Vec<u8>, usize),
     NextInPrefix(usize),
     PrevInPrefix(usize),
 }
 
 impl Op {
-    /// A random call for a cursor whose model is `model`: a seek's key from [`probe`], a prefix
-    /// step's length 0, the current key's length, one past it, 4 (the group of a grouped key) or
-    /// anything up to one past the key.
+    /// A random call for a cursor whose model is `model`: a seek's key from [`probe`], a
+    /// `seek_with_key_tail`'s tail none, up to 15 bytes or past every key, a prefix step's length
+    /// 0, the current key's length, one past it, 4 (the group of a grouped key) or anything up to
+    /// one past the key.
     fn pick(rng: &mut Rng, model: &Model) -> Self {
-        match rng.below(10) {
+        match rng.below(11) {
             0 => Self::First,
             1 => Self::Last,
             2 | 3 => Self::Next,
@@ -168,6 +186,14 @@ impl Op {
             5 => Self::Current,
             6 => Self::Seek(probe(rng, &model.entries)),
             7 => Self::SeekExact(probe(rng, &model.entries)),
+            10 => {
+                let t = match rng.below(3) {
+                    0 => 0,
+                    1 => rng.below(16) as usize,
+                    _ => usize::MAX,
+                };
+                Self::SeekWithKeyTail(probe(rng, &model.entries), t)
+            }
             op => {
                 let klen = match model.pos {
                     Pos::At(i) => model.entries[i].0.len(),
@@ -244,6 +270,18 @@ trait Moves<'s> {
     fn next_in_prefix(&mut self, n: usize) -> Result<Option<Entry<'s>>>;
     fn prev_in_prefix(&mut self, n: usize) -> Result<Option<Entry<'s>>>;
     fn state(&self) -> State;
+    fn current_with_key_tail(&self, t: usize) -> Result<Option<(&'s [u8], KeyTail<'s>)>>;
+
+    /// A seek and the entry as `current_with_key_tail(t)` gives it: the cursor's own
+    /// `seek_with_key_tail` where it has one, else a seek followed by `current_with_key_tail`.
+    fn seek_with_key_tail(
+        &mut self,
+        key: &[u8],
+        t: usize,
+    ) -> Result<Option<(&'s [u8], KeyTail<'s>)>> {
+        self.seek(key)?;
+        self.current_with_key_tail(t)
+    }
 
     /// Make the call `op` (a `seek_exact` hit returned as `(key, value)`).
     fn apply(&mut self, op: &Op) -> Option<Kv> {
@@ -256,6 +294,9 @@ trait Moves<'s> {
             Op::Seek(key) => owned(self.seek(key).expect("seek")),
             Op::SeekExact(key) => {
                 self.seek_exact(key).expect("seek_exact").map(|v| (key.clone(), v.to_vec()))
+            }
+            Op::SeekWithKeyTail(key, t) => {
+                owned_tail(self.seek_with_key_tail(key, *t).expect("seek_with_key_tail"), *t)
             }
             Op::NextInPrefix(n) => owned(self.next_in_prefix(*n).expect("next_in_prefix")),
             Op::PrevInPrefix(n) => owned(self.prev_in_prefix(*n).expect("prev_in_prefix")),
@@ -301,6 +342,16 @@ impl<'s, S: PageRead + ?Sized> Moves<'s> for Detached<'s, S> {
     fn state(&self) -> State {
         self.cursor.state()
     }
+    fn current_with_key_tail(&self, t: usize) -> Result<Option<(&'s [u8], KeyTail<'s>)>> {
+        self.cursor.current_with_key_tail(self.store, None, t)
+    }
+    fn seek_with_key_tail(
+        &mut self,
+        key: &[u8],
+        t: usize,
+    ) -> Result<Option<(&'s [u8], KeyTail<'s>)>> {
+        self.cursor.seek_with_key_tail(self.store, &self.root, key, t)
+    }
 }
 
 impl<'s> Moves<'s> for Cursor<'s> {
@@ -333,6 +384,9 @@ impl<'s> Moves<'s> for Cursor<'s> {
     }
     fn state(&self) -> State {
         Cursor::state(self)
+    }
+    fn current_with_key_tail(&self, t: usize) -> Result<Option<(&'s [u8], KeyTail<'s>)>> {
+        Cursor::current_with_key_tail(self, t)
     }
 }
 
@@ -657,6 +711,234 @@ fn seeks_land_between_before_and_after() {
     assert_eq!(c.state(), State::AfterEnd);
     assert_eq!(c.next(s, r).expect("next"), None);
     assert_eq!(c.prev(s, r).expect("prev").expect("last").0, key_of(2 * (n - 1)));
+}
+
+/// The keys a seek of every key and every gap of `entries` probes: each key, the least key above
+/// it (the key with a zero byte appended), a key just below it, the empty key, and a key past
+/// every key.
+fn every_key_and_gap(entries: &[Kv]) -> Vec<Vec<u8>> {
+    let mut probes = vec![Vec::new(), vec![0xFF; 16]];
+    for (key, _) in entries {
+        let mut above = key.clone();
+        above.push(0);
+        let mut below = key.clone();
+        match below.last_mut() {
+            Some(b) if *b > 0 => {
+                *b -= 1;
+                below.push(0xFF);
+            }
+            _ => {
+                below.pop();
+            }
+        }
+        probes.extend([key.clone(), above, below]);
+    }
+    probes
+}
+
+/// The `t` of a key-tail seek: none of the key, part of it, or past its length (the whole key).
+const TAILS: [usize; 4] = [0, 1, 5, usize::MAX];
+
+/// Every probe of `probes` through `seek`, `seek_exact` and `seek_with_key_tail`, each followed
+/// by two random steps, on `cursor`, against `model`: every result and every state.
+fn seek_every_probe<'s>(
+    cursor: &mut impl Moves<'s>,
+    model: &mut Model,
+    probes: &[Vec<u8>],
+    rng: &mut Rng,
+) {
+    for (i, probe) in probes.iter().enumerate() {
+        let t = TAILS[i % TAILS.len()];
+        let seeks = [
+            Op::Seek(probe.clone()),
+            Op::SeekExact(probe.clone()),
+            Op::SeekWithKeyTail(probe.clone(), t),
+        ];
+        for seek in seeks {
+            let steps = [0, 1].map(|_| if rng.below(2) == 0 { Op::Next } else { Op::Prev });
+            for op in std::iter::once(&seek).chain(&steps) {
+                let from = model.pos;
+                assert_eq!(
+                    cursor.apply(op),
+                    model.apply(op),
+                    "{seek:?}, then {op:?} from {from:?}"
+                );
+                assert_eq!(cursor.state(), model.state(), "{seek:?}, then {op:?} from {from:?}");
+            }
+        }
+    }
+}
+
+/// `TreeCursor::seek_with_key_tail` against a `seek` followed by `current_with_key_tail` on
+/// another cursor, for every probe and every `t` of [`TAILS`]: the same result (the same
+/// [`KeyTail`] form, the same bytes, a joined slice at the same place of the page, the same
+/// error), the same state and leaf, and the same entry after a `next`. Returns how many probes
+/// failed (both ways alike).
+fn fused_seek_matches_seek_then_current<S: PageRead + ?Sized>(
+    store: &S,
+    root: &TreeRoot,
+    probes: &[Vec<u8>],
+) -> usize {
+    let mut failed = 0;
+    for probe in probes {
+        for t in TAILS {
+            let (mut fused, mut apart) = (TreeCursor::default(), TreeCursor::default());
+            let got = fused.seek_with_key_tail(store, root, probe, t);
+            let want = apart
+                .seek(store, root, probe)
+                .and_then(|_| apart.current_with_key_tail(store, None, t));
+            match (got, want) {
+                (Ok(got), Ok(want)) => {
+                    assert_eq!(got, want, "{probe:?} t {t}");
+                    if let (Some((_, KeyTail::Joined(a))), Some((_, KeyTail::Joined(b)))) =
+                        (got, want)
+                    {
+                        assert_eq!(
+                            a.as_ptr(),
+                            b.as_ptr(),
+                            "{probe:?} t {t}: one slice of the page"
+                        );
+                    }
+                }
+                (Err(Error::Corrupt(got)), Err(Error::Corrupt(want))) => {
+                    assert_eq!(got, want, "{probe:?} t {t}: the same first damage");
+                    failed += 1;
+                }
+                (got, want) => panic!("{probe:?} t {t}: {got:?} against {want:?}"),
+            }
+            assert_eq!(fused.state(), apart.state(), "{probe:?} t {t}");
+            assert_eq!(fused.leaf_pgno(), apart.leaf_pgno(), "{probe:?} t {t}");
+            if fused.state() == State::At {
+                // Damage may meet the step too, alike.
+                let next = |c: &mut TreeCursor| c.next(store, root).map_err(|e| e.to_string());
+                assert_eq!(next(&mut fused), next(&mut apart), "{probe:?} t {t}");
+            }
+        }
+    }
+    failed
+}
+
+/// The shapes of the seek model test: heights 1 to 4 (the long keys), 4 and 16 KiB pages, empty
+/// values only (16 KiB leaves of more than 255 entries), values in overflow runs, leaves thinned
+/// by deletes.
+const SEEK_SHAPES: [Shape; 8] = [
+    Shape { page_size: 4096, n: 20, keys: (1, 12), vmax: 16, delete_pct: 0, groups: 0 },
+    Shape { page_size: 4096, n: 400, keys: (4, 40), vmax: 40, delete_pct: 10, groups: 0 },
+    Shape { page_size: 4096, n: 1500, keys: (100, 250), vmax: 100, delete_pct: 0, groups: 0 },
+    Shape { page_size: 4096, n: 60, keys: (600, 990), vmax: 30, delete_pct: 20, groups: 0 },
+    Shape { page_size: 16384, n: 3000, keys: (2, 4), vmax: 0, delete_pct: 0, groups: 0 },
+    Shape { page_size: 16384, n: 300, keys: (8, 64), vmax: 9000, delete_pct: 15, groups: 0 },
+    Shape { page_size: 4096, n: 200, keys: (1, 30), vmax: 3000, delete_pct: 0, groups: 0 },
+    Shape { page_size: 16384, n: 800, keys: (600, 1000), vmax: 40, delete_pct: 30, groups: 0 },
+];
+
+/// [`seeks_of_every_key_and_gap_match_a_model`] over `shapes`, `seeds` trees of each.
+fn seek_model(shapes: &[Shape], seeds: u64) {
+    let (mut heights, mut widest, mut overflow) = (Vec::new(), 0, 0);
+    for (i, &shape) in shapes.iter().enumerate() {
+        for seed in 0..seeds {
+            let seed = 0x5EE4_0000 + 100 * i as u64 + seed;
+            let _report = ReportSeed(seed);
+            let mut rng = Rng(seed);
+            let (store, root, map) = build(shape, &mut rng);
+            let reader = store.reader();
+            let walk = walk_tree(&reader, &root);
+            let mut model = Model::new(&map);
+            assert_eq!(walk.entries, model.entries, "{shape:?}: the model is the tree");
+            heights.push(root.height);
+            overflow += walk.overflow_pages;
+            let leaf_entries = walk.leaves.iter().map(|&leaf| page::nkeys(store.raw(leaf)));
+            widest = widest.max(leaf_entries.max().unwrap_or(0));
+
+            let probes = every_key_and_gap(&model.entries);
+            let mut detached = Detached { cursor: TreeCursor::default(), store: &reader, root };
+            seek_every_probe(&mut detached, &mut model, &probes, &mut rng);
+            let latch = Latch::default();
+            let mut public = Cursor::new(&reader, root, &latch);
+            seek_every_probe(&mut public, &mut model, &probes, &mut rng);
+            assert_eq!(latch.failure(), None);
+            assert_eq!(fused_seek_matches_seek_then_current(&reader, &root, &probes), 0);
+        }
+    }
+    for height in 1..=4 {
+        assert!(heights.contains(&height), "a tree of height {height}: {heights:?}");
+    }
+    assert!(widest > 255, "a leaf of more than 255 entries (a slot past a byte): {widest}");
+    assert!(overflow > 0, "values in overflow runs");
+}
+
+/// Every key and every gap of trees of many shapes ([`SEEK_SHAPES`]), through `seek`,
+/// `seek_exact` and `seek_with_key_tail`, each followed by a few steps, match a sorted model in
+/// every result and state, on the detached and on the public cursor; and `seek_with_key_tail`
+/// equals a `seek` followed by `current_with_key_tail`.
+#[test]
+fn seeks_of_every_key_and_gap_match_a_model() {
+    seek_model(&SEEK_SHAPES, 1);
+}
+
+/// [`seeks_of_every_key_and_gap_match_a_model`] over more trees of each shape.
+#[test]
+#[ignore = "heavy: run with --release"]
+fn seeks_of_every_key_and_gap_match_a_model_heavy() {
+    seek_model(&SEEK_SHAPES, 12);
+}
+
+/// Damage met by a seek is met alike by `seek_with_key_tail` and by a `seek` followed by
+/// `current_with_key_tail`: the same `Corrupt`, with the same message (the same first check
+/// failing), at every key and gap. The damage: a root cell and a lower cell misrouted to a
+/// sibling (only the separator range exposes them), an emptied non-root leaf, a tree root of the
+/// wrong height, and a byte of a multi-page overflow run (its CRC).
+#[test]
+fn a_seek_with_key_tail_meets_damage_as_a_seek_does() {
+    let n = 1_000;
+    let (mut store, root) = even_tree(n);
+    assert_eq!(root.height, 3, "the root's children are branches");
+    let entries = walk_tree(&store.reader(), &root).entries;
+    let probes = every_key_and_gap(&entries);
+    let check = |store: &MemStore, root: &TreeRoot, what: &str| {
+        let failed = fused_seek_matches_seek_then_current(&store.reader(), root, &probes);
+        assert!(failed > 0, "{what}: no seek met the damage");
+    };
+    let original = store.raw(root.root).to_vec();
+    let target = page::branch_child(&original, 1).expect("child");
+    page::branch_set_child(store.raw_mut(root.root), 0, target.0, target.1).expect("set");
+    store.restamp(root.root);
+    check(&store, &root, "a misrouted root cell");
+    store.raw_mut(root.root).copy_from_slice(&original);
+
+    let (branch, _) = page::branch_child(&original, 1).expect("child");
+    let saved = store.raw(branch).to_vec();
+    let target = page::branch_child(&saved, 1).expect("child");
+    page::branch_set_child(store.raw_mut(branch), 2, target.0, target.1).expect("set");
+    store.restamp(branch);
+    check(&store, &root, "a misrouted lower cell");
+    store.raw_mut(branch).copy_from_slice(&saved);
+
+    let leaf = walk_tree(&store.reader(), &root).leaves[3];
+    let saved = store.raw(leaf).to_vec();
+    while page::nkeys(store.raw(leaf)) > 0 {
+        page::leaf_delete(store.raw_mut(leaf), 0).expect("delete");
+    }
+    store.restamp(leaf);
+    check(&store, &root, "an emptied leaf");
+    store.raw_mut(leaf).copy_from_slice(&saved);
+
+    for height in [2, 4] {
+        check(&store, &TreeRoot { height, ..root }, "a wrong height");
+    }
+    assert_eq!(fused_seek_matches_seek_then_current(&store.reader(), &root, &probes), 0);
+
+    // A byte of a multi-page overflow run: only the run's CRC exposes it.
+    let mut rng = Rng(0x0F10_0D00);
+    let shape =
+        Shape { page_size: 4096, n: 40, keys: (4, 20), vmax: 9000, delete_pct: 0, groups: 0 };
+    let (mut store, root, map) = build(shape, &mut rng);
+    let probes = every_key_and_gap(&Model::new(&map).entries);
+    assert_eq!(fused_seek_matches_seek_then_current(&store.reader(), &root, &probes), 0);
+    let runs = store.run_pgnos(&root);
+    assert!(runs.len() > 2, "multi-page runs: {runs:?}");
+    store.raw_mut(runs[1])[100] ^= 0x40;
+    check(&store, &root, "a damaged run");
 }
 
 /// Collect a scan in one direction until it ends or fails.
@@ -1268,6 +1550,9 @@ fn apply_owned(cursor: &mut RoCursor, op: &Op) -> Option<Kv> {
         Op::SeekExact(key) => {
             cursor.seek_exact(key).expect("seek_exact").map(|v| (key.clone(), v.to_vec()))
         }
+        Op::SeekWithKeyTail(key, t) => {
+            owned_tail(cursor.seek_with_key_tail(key, *t).expect("seek_with_key_tail"), *t)
+        }
         Op::NextInPrefix(n) => owned(cursor.next_in_prefix(*n).expect("next_in_prefix")),
         Op::PrevInPrefix(n) => owned(cursor.prev_in_prefix(*n).expect("prev_in_prefix")),
     }
@@ -1479,10 +1764,10 @@ fn prefix_steps_after_delete_current_use_the_deleted_key() {
 }
 
 /// Every new cursor zeroes its path and its creation moves the whole cursor (an `RoCursor` per
-/// reth cursor), so the path's steps stay 8 bytes, a page number and a slot with no padding.
+/// reth cursor), so the path's steps stay 6 bytes, a page number and a `u16` slot with no padding.
 #[test]
 fn tree_cursor_stays_small() {
-    let path = 8 * MAX_HEIGHT as usize;
+    let path = 6 * MAX_HEIGHT as usize;
     assert!(
         size_of::<TreeCursor>() <= path + 16,
         "TreeCursor is {} bytes for a path of {path}",

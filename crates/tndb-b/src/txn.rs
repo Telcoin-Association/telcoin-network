@@ -1,7 +1,8 @@
 //! Transactions: read-only ones ([`RoTxn`]) on a published snapshot, and the single write
 //! transaction ([`RwTxn`]), which builds the next state in pages no reader can reach and
 //! publishes it at [`RwTxn::commit`]. Tables are named by [`Table`] handles, checked against
-//! the catalog on every use.
+//! the catalog of the state they are used in; a read-only transaction's handle is checked once
+//! per snapshot, which every transaction on it shares ([`TableRoots`]).
 
 use std::sync::{
     atomic::{AtomicU64, Ordering},
@@ -68,6 +69,10 @@ const _: fn() = || {
     send_sync::<Table>();
 };
 
+// A read-only transaction is two `Arc`s, cheap to begin and to put in the `Arc` that
+// `RoTxn::cursor_owned` takes: the table roots it resolves live in its snapshot (`TableRoots`).
+const _: () = assert!(std::mem::size_of::<RoTxn>() == 2 * std::mem::size_of::<usize>());
+
 /// Figures about one table in a transaction's state, read from its tree's root record: O(1),
 /// with no page read. An empty table has every figure zero.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -133,17 +138,84 @@ fn resolve(found: Option<TableRecord>, table: &Table, next_table_id: u32) -> Res
     }
 }
 
-/// How many tables a [`RoTxn`] remembers the records of.
-const RO_TABLES: usize = 8;
+// Test-only counter, debug builds only: the benchmark is compiled with the test configuration,
+// and a thread-local update on a timed path would show in its release timings.
+#[cfg(all(test, debug_assertions))]
+thread_local! {
+    /// Test-only: how many times a [`RoTxn`] resolved a handle through the catalog.
+    pub(crate) static CATALOG_RESOLVES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// How many tables a snapshot's [`TableRoots`] remembers.
+const SNAPSHOT_TABLES: usize = 32;
+
+/// The tree roots of the tables resolved in one snapshot, shared by every [`RoTxn`] on it
+/// ([`RoTxn::root`]). The snapshot's catalog never changes, so a handle resolved once resolves
+/// the same for the snapshot's life, and each commit publishes a new snapshot with an empty set.
+/// Only a resolved handle is remembered: a refused one is checked again each time. A handle's
+/// slot is the first one from `id % SNAPSHOT_TABLES` on (wrapping) that no other handle holds,
+/// and a slot is never emptied, so a lookup stops at the first empty slot. A hit is
+/// [`Table::is`]: the id, then the name (a handle of another file may carry the same id). Once
+/// every slot holds another handle, a handle resolves through the catalog on each use.
+#[derive(Default)]
+pub(crate) struct TableRoots([OnceLock<(Table, TreeRoot)>; SNAPSHOT_TABLES]);
+
+impl std::fmt::Debug for TableRoots {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let known = self.0.iter().filter(|slot| slot.get().is_some()).count();
+        f.debug_struct("TableRoots").field("known", &known).finish()
+    }
+}
+
+impl TableRoots {
+    /// The slot a lookup of `table` starts from.
+    #[inline]
+    fn home(table: &Table) -> usize {
+        table.id as usize % SNAPSHOT_TABLES
+    }
+
+    /// `table`'s root if its first slot holds it: the hit path of [`RoTxn::root`].
+    #[inline]
+    fn at_home(&self, table: &Table) -> Option<TreeRoot> {
+        match self.0[Self::home(table)].get() {
+            Some((known, root)) if known.is(table) => Some(*root),
+            _ => None,
+        }
+    }
+
+    /// `table`'s root, or else the first empty slot of its probe (`None`: every slot holds
+    /// another handle).
+    fn find(&self, table: &Table) -> std::result::Result<TreeRoot, Option<usize>> {
+        let home = Self::home(table);
+        for i in 0..SNAPSHOT_TABLES {
+            let at = (home + i) % SNAPSHOT_TABLES;
+            match self.0[at].get() {
+                Some((known, root)) if known.is(table) => return Ok(*root),
+                Some(_) => {}
+                None => return Err(Some(at)),
+            }
+        }
+        Err(None)
+    }
+
+    /// Remember `table`'s `root` in the first empty slot from `from` on, the one [`Self::find`]
+    /// gave. A racing reader may take that slot first: for this handle, which ends the search, or
+    /// for another, which moves it to the next.
+    fn remember(&self, from: usize, table: &Table, root: TreeRoot) {
+        for i in 0..SNAPSHOT_TABLES {
+            let slot = &self.0[(from + i) % SNAPSHOT_TABLES];
+            if slot.get_or_init(|| (table.clone(), root)).0.is(table) {
+                return;
+            }
+        }
+    }
+}
 
 /// A read-only transaction: one committed state of every table, unaffected by later commits.
 /// The state's pages stay intact while it lives.
 pub struct RoTxn {
     inner: Arc<EnvInner>,
     snapshot: Arc<Snapshot>,
-    /// The records of the first tables resolved (filled in order; the snapshot never changes,
-    /// so a record resolved once stands for the transaction's life).
-    tables: [OnceLock<(Table, TableRecord)>; RO_TABLES],
 }
 
 impl std::fmt::Debug for RoTxn {
@@ -154,7 +226,7 @@ impl std::fmt::Debug for RoTxn {
 
 impl RoTxn {
     pub(crate) fn new(inner: Arc<EnvInner>, snapshot: Arc<Snapshot>) -> Self {
-        Self { inner, snapshot, tables: Default::default() }
+        Self { inner, snapshot }
     }
 
     /// Run a read, latching damage it finds.
@@ -162,34 +234,43 @@ impl RoTxn {
         op(&self.snapshot).inspect_err(|e| self.inner.latch.latch_error(e))
     }
 
-    /// `table`'s record in the snapshot (see [`resolve`]), remembered once resolved. Only a
-    /// resolved record is remembered: a refused handle is checked again each time.
-    fn record(&self, table: &Table) -> Result<TableRecord> {
-        for slot in &self.tables {
-            match slot.get() {
-                Some((known, record)) if known == table => return Ok(*record),
-                Some(_) => {}
-                // A slot is set only after every one before it, so the rest are empty.
-                None => break,
-            }
+    /// `table`'s tree root in the snapshot (see [`resolve`]): from the snapshot's
+    /// [`TableRoots`] once a reader on it resolved the handle, else from the catalog
+    /// ([`Self::resolve_root`]).
+    #[inline]
+    fn root(&self, table: &Table) -> Result<TreeRoot> {
+        match self.snapshot.tables.at_home(table) {
+            Some(root) => Ok(root),
+            None => self.resolve_root(table),
         }
+    }
+
+    /// [`Self::root`] past the handle's first slot: the rest of its probe, else the catalog,
+    /// whose answer is remembered if it resolved and a slot is free.
+    #[inline(never)]
+    fn resolve_root(&self, table: &Table) -> Result<TreeRoot> {
+        let tables = &self.snapshot.tables;
+        let free = match tables.find(table) {
+            Ok(root) => return Ok(root),
+            Err(free) => free,
+        };
+        #[cfg(all(test, debug_assertions))]
+        CATALOG_RESOLVES.with(|n| n.set(n.get() + 1));
         let meta = &self.snapshot.meta;
         let found = catalog::get(&*self.snapshot, &meta.catalog, table.name())?;
-        let record = resolve(found, table, meta.next_table_id)?;
-        // The first empty slot, unless a racing reader takes it first (then the next one).
-        for slot in &self.tables {
-            if slot.get().is_none() && slot.set((table.clone(), record)).is_ok() {
-                break;
-            }
+        let root = resolve(found, table, meta.next_table_id)?.root;
+        if let Some(from) = free {
+            tables.remember(from, table, root);
         }
-        Ok(record)
+        Ok(root)
     }
 
     /// A new, unset cursor over `table` that owns a share of this transaction (see
     /// [`RoCursor`]): it has no lifetime, and keeps the snapshot readable after every other
     /// handle of the transaction drops.
+    #[inline]
     pub fn cursor_owned(self: &Arc<Self>, table: &Table) -> Result<RoCursor> {
-        let root = self.read(|_| Ok(self.record(table)?.root))?;
+        let root = self.read(|_| self.root(table))?;
         Ok(RoCursor { txn: Arc::clone(self), root, tree: TreeCursor::default() })
     }
 }
@@ -291,11 +372,27 @@ impl RoCursor {
 
     /// Move to the first entry whose key is `>= key` and return it; `None` (the cursor after the
     /// end) if there is none.
+    #[inline]
     pub fn seek(&mut self, key: &[u8]) -> Result<Option<(&[u8], &[u8])>> {
         self.moved(|c, store, root| c.seek(store, root, key))
     }
 
+    /// [`Self::seek`] followed by [`Self::current_with_key_tail`], from one leaf access: move to
+    /// the first entry whose key is `>= key` and return it as its key and its value with the
+    /// key's last `t` bytes before it ([`KeyTail`]); `None` (the cursor after the end) if there
+    /// is none. The entry is read from the leaf the descent fetched and parsed, an overflow value
+    /// once. The cursor is left as [`Self::seek`] leaves it.
+    #[inline]
+    pub fn seek_with_key_tail(
+        &mut self,
+        key: &[u8],
+        t: usize,
+    ) -> Result<Option<(&[u8], KeyTail<'_>)>> {
+        self.moved(|c, store, root| c.seek_with_key_tail(store, root, key, t))
+    }
+
     /// Move to the entry `key` and return its value; `None` (the cursor unset) if there is none.
+    #[inline]
     pub fn seek_exact(&mut self, key: &[u8]) -> Result<Option<&[u8]>> {
         self.moved(|c, store, root| c.seek_exact(store, root, key))
     }
@@ -326,11 +423,11 @@ impl ReadTxn for RoTxn {
     }
 
     fn get<'t>(&'t self, table: &Table, key: &[u8]) -> Result<Option<&'t [u8]>> {
-        self.read(|s| read::get(s, &self.record(table)?.root, key))
+        self.read(|s| read::get(s, &self.root(table)?, key))
     }
 
     fn cursor<'t>(&'t self, table: &Table) -> Result<Cursor<'t>> {
-        let root = self.read(|_| Ok(self.record(table)?.root))?;
+        let root = self.read(|_| self.root(table))?;
         Ok(Cursor::new(&*self.snapshot, root, &self.inner.latch))
     }
 
@@ -339,7 +436,7 @@ impl ReadTxn for RoTxn {
     }
 
     fn table_stat(&self, table: &Table) -> Result<TableStat> {
-        self.read(|_| Ok(TableStat::of(&self.record(table)?.root)))
+        self.read(|_| Ok(TableStat::of(&self.root(table)?)))
     }
 }
 
@@ -1429,6 +1526,28 @@ impl TxnCursor {
     /// end) if there is none.
     pub fn seek<'t>(&mut self, txn: &'t RwTxn, key: &[u8]) -> Result<Option<(&'t [u8], &'t [u8])>> {
         self.moved(txn, |c, store, root| c.seek(store, root, key))
+    }
+
+    /// [`Self::seek`] followed by [`Self::current_with_key_tail`], from one leaf access: move to
+    /// the first entry whose key is `>= key` and return it as its key and its value with the
+    /// key's last `t` bytes before it ([`KeyTail`]); `None` (the cursor after the end) if there
+    /// is none. The cursor is left as [`Self::seek`] leaves it.
+    pub fn seek_with_key_tail<'t>(
+        &mut self,
+        txn: &'t RwTxn,
+        key: &[u8],
+        t: usize,
+    ) -> Result<Option<(&'t [u8], KeyTail<'t>)>> {
+        self.call(txn, |c, store| {
+            c.deleted = false;
+            c.soft_end = false;
+            let found = c.tree.seek_with_key_tail(store, &c.root, key, t);
+            if let Ok(Some((k, _))) = found {
+                c.key.clear();
+                c.key.extend_from_slice(k);
+            }
+            found
+        })
     }
 
     /// Move to the entry `key` and return its value; `None` (the cursor unset) if there is none.

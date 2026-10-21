@@ -969,3 +969,146 @@ fn free_pages_counts_the_pages_the_free_list_holds() {
     assert!(report.free_pages > report.free_records, "{report:?}");
     assert_eq!(env.free_pages().unwrap(), report.free_pages);
 }
+
+/// Test-only: the handles read-only transactions on this thread resolved through the catalog
+/// (debug builds only; 0 in release, where the counter does not exist).
+fn catalog_resolves() -> u64 {
+    #[cfg(debug_assertions)]
+    return crate::txn::CATALOG_RESOLVES.with(std::cell::Cell::get);
+    #[cfg(not(debug_assertions))]
+    0
+}
+
+/// Every read-only transaction on one snapshot shares its resolved table roots: a handle goes
+/// through the catalog once per snapshot, whichever read uses it (get, both cursors, stat), and
+/// again in the snapshot of the next commit.
+#[test]
+fn a_snapshot_resolves_each_handle_once() {
+    let (_dir, path) = temp();
+    let env = open(&path);
+    put_all(&env, "x", &[(b"k", b"one")]);
+    put_all(&env, "y", &[(b"k", b"y")]);
+    let x = table(&env.begin_ro().expect("ro"), "x");
+    let start = catalog_resolves();
+    let resolved = || catalog_resolves() - start;
+
+    let first = env.begin_ro().expect("ro");
+    assert_eq!(val(&first, &x, b"k").as_deref(), Some(&b"one"[..]));
+    assert_eq!(val(&first, &x, b"k").as_deref(), Some(&b"one"[..]));
+    let second = Arc::new(env.begin_ro().expect("ro"));
+    assert_eq!(second.txn_id(), first.txn_id(), "one snapshot");
+    assert_eq!(val(&*second, &x, b"k").as_deref(), Some(&b"one"[..]));
+    assert_eq!(
+        second.cursor(&x).expect("cursor").first().expect("first").map(|e| e.1),
+        Some(&b"one"[..])
+    );
+    let mut owned = second.cursor_owned(&x).expect("owned cursor");
+    assert_eq!(owned.seek_exact(b"k").expect("seek"), Some(&b"one"[..]));
+    assert_eq!(second.table_stat(&x).expect("stat").entries, 1);
+    if cfg!(debug_assertions) {
+        assert_eq!(resolved(), 1, "two transactions on one snapshot resolve the handle once");
+    }
+
+    put_all(&env, "x", &[(b"k", b"two")]);
+    let after = env.begin_ro().expect("ro");
+    assert_ne!(after.txn_id(), first.txn_id());
+    assert_eq!(val(&after, &x, b"k").as_deref(), Some(&b"two"[..]));
+    assert_eq!(val(&first, &x, b"k").as_deref(), Some(&b"one"[..]), "the old snapshot reads on");
+    if cfg!(debug_assertions) {
+        assert_eq!(resolved(), 2, "the commit's snapshot resolves the handle again");
+    }
+}
+
+/// A snapshot's resolved roots live and die with it: after a table is dropped and re-created,
+/// the next snapshot refuses the old handle (`StaleTable`), while transactions on the old
+/// snapshot still read the old table through it, and refuse the new one (`TableNotFound`),
+/// whether they resolved the handle before the commit or only after it.
+#[test]
+fn a_dropped_tables_handle_is_stale_only_in_later_snapshots() {
+    let (_dir, path) = temp();
+    let env = open(&path);
+    put_all(&env, "x", &[(b"k", b"old")]);
+    let before = env.begin_ro().expect("ro");
+    let late = env.begin_ro().expect("ro");
+    let old = table(&before, "x");
+    assert_eq!(val(&before, &old, b"k").as_deref(), Some(&b"old"[..]));
+
+    let mut txn = env.begin_rw().expect("begin");
+    txn.drop_table(old.clone()).expect("drop");
+    let new = txn.create_table("x").expect("re-create");
+    txn.put(&new, b"k", b"new").expect("put");
+    txn.commit().expect("commit");
+
+    let ro = env.begin_ro().expect("ro");
+    assert!(matches!(ro.get(&old, b"k"), Err(Error::StaleTable(_))));
+    assert!(matches!(ro.cursor(&old), Err(Error::StaleTable(_))));
+    assert_eq!(val(&ro, &new, b"k").as_deref(), Some(&b"new"[..]));
+    assert!(matches!(env.begin_ro().expect("ro").get(&old, b"k"), Err(Error::StaleTable(_))));
+
+    for txn in [&before, &late] {
+        assert_eq!(val(txn, &old, b"k").as_deref(), Some(&b"old"[..]));
+        assert!(matches!(txn.get(&new, b"k"), Err(Error::TableNotFound(_))));
+    }
+    assert_eq!(env.failure(), None);
+}
+
+/// A remembered root serves only a handle with its name as well as its id. Ids are unique over
+/// one file's life and a table is never renamed, so the only handle with the same id and another
+/// name comes from another file.
+#[test]
+fn a_remembered_root_needs_the_handles_name_too() {
+    let (_dir, path) = temp();
+    let env = open(&path);
+    put_all(&env, "x", &[(b"k", b"x")]);
+    let (_other_dir, other_path) = temp();
+    let other = open(&other_path);
+    put_all(&other, "z", &[(b"k", b"z")]);
+    let z = table(&other.begin_ro().expect("ro"), "z");
+
+    let ro = env.begin_ro().expect("ro");
+    let x = table(&ro, "x");
+    assert_eq!(z.id(), x.id(), "the same id in two files");
+    assert_eq!(val(&ro, &x, b"k").as_deref(), Some(&b"x"[..]));
+    let start = catalog_resolves();
+    for txn in [&ro, &env.begin_ro().expect("ro")] {
+        assert!(matches!(txn.get(&z, b"k"), Err(Error::StaleTable(_))));
+        assert!(matches!(txn.table_stat(&z), Err(Error::StaleTable(_))));
+    }
+    // A handle opened again (its own name allocation) is the same table, so it hits.
+    let again = table(&env.begin_ro().expect("ro"), "x");
+    assert_eq!(val(&env.begin_ro().expect("ro"), &again, b"k").as_deref(), Some(&b"x"[..]));
+    if cfg!(debug_assertions) {
+        assert_eq!(catalog_resolves() - start, 4, "only the refused handle went to the catalog");
+    }
+    assert_eq!(env.failure(), None);
+}
+
+/// More tables than a snapshot remembers: the first 32 resolved take a slot each (some past
+/// their first, wrapping), and the rest resolve through the catalog on every use, each to its own
+/// table.
+#[test]
+fn more_tables_than_a_snapshot_remembers_still_resolve() {
+    let (_dir, path) = temp();
+    let env = open(&path);
+    let names: Vec<String> = (0..40).map(|i| format!("t{i:02}")).collect();
+    let mut txn = env.begin_rw().expect("begin");
+    for name in &names {
+        let t = txn.create_table(name).expect("table");
+        txn.put(&t, b"k", name.as_bytes()).expect("put");
+    }
+    txn.commit().expect("commit");
+
+    let ro = env.begin_ro().expect("ro");
+    let mut tables: Vec<Table> = names.iter().map(|name| table(&ro, name)).collect();
+    // The last 8 first: their ids take the first slots of the first 8, which then probe on.
+    tables.rotate_left(32);
+    let start = catalog_resolves();
+    for txn in [&ro, &ro, &env.begin_ro().expect("ro")] {
+        for t in &tables {
+            assert_eq!(val(txn, t, b"k").as_deref(), Some(t.name().as_bytes()), "{}", t.name());
+        }
+    }
+    if cfg!(debug_assertions) {
+        assert_eq!(catalog_resolves() - start, 40 + 8 + 8, "32 remembered, 8 resolved each time");
+    }
+}
