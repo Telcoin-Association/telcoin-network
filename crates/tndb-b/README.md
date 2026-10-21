@@ -1142,8 +1142,8 @@ cargo test --release -p tndb-b tndb_b_vs_mdbx -- --ignored --nocapture --test-th
 ```
 
 **Run tip (Linux):** pin the run to performance cores, and put the temp dir on a real disk (never
-a tmpfs), scoped to the one command. On a CPU with P and E cores (`lscpu -e` shows which CPUs are
-which), for example:
+a tmpfs: on Linux the run stops if it is one), scoped to the one command. On a CPU with P and E
+cores (`lscpu -e` shows which CPUs are which), for example:
 
 ```text
 TMPDIR=/path/on/disk taskset -c 0-7 cargo test --release -p tndb-b tndb_b_vs_mdbx -- --ignored --nocapture --test-threads 1

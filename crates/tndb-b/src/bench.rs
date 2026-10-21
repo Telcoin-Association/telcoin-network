@@ -1577,6 +1577,43 @@ fn print_table(columns: &[Column], n: usize) {
     }
 }
 
+/// The type of the file system holding `dir`, from Linux's `/proc/self/mountinfo` (the mount
+/// whose point is the longest prefix of `dir`'s canonical path); `None` where that file does not
+/// exist.
+fn fs_type(dir: &Path) -> Option<String> {
+    let dir = dir.canonicalize().ok()?;
+    let mounts = std::fs::read_to_string("/proc/self/mountinfo").ok()?;
+    mounts
+        .lines()
+        .filter_map(|line| {
+            let (fields, rest) = line.split_once(" - ")?;
+            // The mount point is the fifth field, with a space as `\040`.
+            let point = fields.split(' ').nth(4)?.replace("\\040", " ");
+            let fs = rest.split(' ').next()?;
+            dir.starts_with(&point).then(|| (point.len(), fs.to_owned()))
+        })
+        // Of equal lengths `max_by_key` takes the last: a later mount on a point hides the earlier.
+        .max_by_key(|(len, _)| *len)
+        .map(|(_, fs)| fs)
+}
+
+/// Print the bench's temp dir, and stop the run when it is on a file system held in memory
+/// (tmpfs, ramfs): syncs there cost nothing, so durable commits would time no disk.
+fn announce_temp_dir(dir: &Path) {
+    let fs = fs_type(dir);
+    match &fs {
+        Some(fs) => println!("bench temp dir: {} ({fs})", dir.display()),
+        None => println!("bench temp dir: {}", dir.display()),
+    }
+    assert!(
+        !matches!(fs.as_deref(), Some("tmpfs" | "ramfs")),
+        "the bench temp dir {} is on {}: syncs there cost nothing, so durable commits would time \
+         no disk. Set TMPDIR to a directory on a real disk, for this command only.",
+        dir.display(),
+        fs.unwrap_or_default(),
+    );
+}
+
 /// Compare tndb-b with MDBX across the benchmark rows and print one side-by-side table.
 ///
 /// On-demand perf test (kept out of the default suite). Run with:
@@ -1587,7 +1624,7 @@ fn tndb_b_vs_mdbx() {
     let sel = Selection::from_env();
     let n = sel.n;
     let tmp = tempfile::tempdir().expect("temp dir");
-    println!("bench temp dir: {}", tmp.path().display());
+    announce_temp_dir(tmp.path());
     let data = Data::new(n);
     let columns: Vec<Column> = sel
         .engines

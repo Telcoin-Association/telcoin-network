@@ -116,10 +116,11 @@ of tndb's.
 
 **The Linux gate** decides M2's performance: each bench at most 1.10× MDBX, with at most one
 explained row up to 1.25×. Run it three times at reth's sizes, pinned to performance cores with
-the temp dir on a real disk (as the engine README's run tip says):
+the temp dir on a real disk (as the engine README's run tip says; the run stops if the temp
+dir is on a tmpfs). From the repository root:
 
 ```text
-for i in 1 2 3; do TNDB_RETH_BENCH_N=10000,100000,1000000 cargo test --release -p tndb-b-reth tndb_reth_vs_mdbx -- --ignored --nocapture --test-threads 1 | grep '^|' > reth-bench-$i.txt; done
+mkdir -p tmp; for i in 1 2 3; do TMPDIR=$PWD/tmp TNDB_RETH_BENCH_N=10000,100000,1000000 cargo test --release -p tndb-b-reth tndb_reth_vs_mdbx -- --ignored --nocapture --test-threads 1 | grep '^|' > reth-bench-$i.txt; done
 ```
 
 Report each cell as the median of the three.
