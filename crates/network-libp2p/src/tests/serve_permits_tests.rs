@@ -31,13 +31,13 @@ fn peer(seed: u8) -> BlsPublicKey {
 type Series = (CompositeKey, Option<Unit>, Option<SharedString>, DebugValue);
 
 /// The value of series `name` for `class` under `network`, matching `reason` when given.
-fn series_value(
-    snapshot: &[Series],
+fn series_value<'a>(
+    snapshot: &'a [Series],
     name: &str,
     network: &str,
     class: &str,
     reason: Option<&str>,
-) -> Option<DebugValue> {
+) -> Option<&'a DebugValue> {
     snapshot
         .iter()
         .find(|(key, ..)| {
@@ -48,7 +48,7 @@ fn series_value(
                     key.key().labels().any(|l| l.key() == "reason" && l.value() == reason)
                 })
         })
-        .map(|(_, _, _, value)| value.clone())
+        .map(|(_, _, _, value)| value)
 }
 
 /// Whether the counter series is registered with `expected`.
@@ -62,7 +62,7 @@ fn counter_is(
 ) -> bool {
     matches!(
         series_value(snapshot, name, network, class, reason),
-        Some(DebugValue::Counter(value)) if value == expected
+        Some(DebugValue::Counter(value)) if *value == expected
     )
 }
 
