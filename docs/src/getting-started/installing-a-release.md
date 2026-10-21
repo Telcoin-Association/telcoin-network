@@ -32,7 +32,9 @@ GitHub marks every Adiri release and every release candidate as a pre-release, s
 
 ## What the signature proves
 
-`IMAGE_DIGEST` names the image by its content digest, and `SHA256SUMS` lists the SHA-256 of `IMAGE_DIGEST` and of the tarball, so one signature over `SHA256SUMS` covers both the binary and the image.
+`SHA256SUMS` has five lines: `IMAGE_DIGEST`, which names the image by its content digest, the tarball, and the network's `committee.yaml`, `genesis.yaml` and `parameters.yaml` by their path in the repository, under `chain-configs/testnet/` for an `-adiri` tag and `chain-configs/mainnet/` for any other.
+One signature over `SHA256SUMS` therefore covers the binary, the image and the chain configuration.
+The blocks below extract the chain-config files from the tag, so Path A checks all five lines and Path B checks every line but the tarball's.
 `SHA256SUMS.asc` is made with a maintainer's OpenPGP signing key, held on a YubiKey, which it never leaves.
 The same key signs the git tag.
 The keys allowed to sign are in [`.github/maintainer-gpg-keys/`](https://github.com/Telcoin-Association/telcoin-network/blob/main/.github/maintainer-gpg-keys/README.md) on `main`, and their fingerprints are in the maintainer release keys table in [`SECURITY.md`](https://github.com/Telcoin-Association/telcoin-network/blob/main/SECURITY.md#maintainer-release-keys).
