@@ -278,7 +278,7 @@ The node deployment scripts in [tn-node-deployment](https://github.com/Telcoin-A
 For maintainers this means:
 
 - The release files keep their names and formats: `SHA256SUMS` in `sha256sum` format with the chain-config lines under their repository paths, a detached ASCII-armored `SHA256SUMS.asc`, the tarball and `IMAGE_DIGEST`. A renamed or reformatted file stops every node update.
-- A new maintainer key, or a new signing subkey, reaches the scripts in a signed script release before it signs a node release; until then the scripts refuse that release with `NO_PUBKEY` or `ERRSIG`. An expired or revoked key stops verifying there as it does here.
+- A new key that signs releases, whether a primary key that signs, as every key on the allowlist does today, or a subkey with the sign capability, reaches the scripts in a signed script release before it signs a node release; until then the scripts refuse that release with `NO_PUBKEY` or `ERRSIG`. An expired or revoked key stops verifying there as it does here.
 - The scripts require one valid signature. Raising `MIN_SIGNATURES` here does not raise what they require until they change too.
 
 ## When a step fails

@@ -108,6 +108,11 @@ gpg/card> quit
 ```
 
 `key-attr` asks about the signature, encryption and authentication keys in turn; choose `(2) ECC` and then `(1) Curve 25519` for each.
+Curve 25519 on all three is the recommendation for every new key; RSA with 4096 bits on all three is the fallback for a YubiKey that refuses ECC (see [Troubleshooting](#troubleshooting)).
+
+The first key on the allowlist, `grantkee.asc` with primary fingerprint `4E36D35A4AB61B589861D01AC7173F2377CA7573`, predates this recommendation: its primary key is RSA 2048 and certifies and signs, its encryption subkey is RSA 2048, its authentication subkey is Ed25519, and all three expire on 2028-10-16.
+It is accepted as it is.
+RSA 2048 on the YubiKey signs tags and `SHA256SUMS` like the recommended keys, and what the allowlist checks is the primary key fingerprint in a `VALIDSIG` line, not the algorithm.
 `generate` then asks:
 
 - `Make off-card backup of encryption key? (Y/n)`: answer `n`, so the encryption key is generated on the card like the others.
@@ -362,7 +367,7 @@ Then tell the other maintainers and the operators which releases were signed aft
 | --- | --- |
 | `gpg --card-status` finds no card, or reports a card error | Run `gpgconf --kill scdaemon` and plug the YubiKey in again, because only one `scdaemon` can hold the card. If that does not help, add `disable-ccid` and `pcsc-shared` on separate lines to `~/.gnupg/scdaemon.conf`, then kill `scdaemon` again. |
 | `ykman` cannot connect to the YubiKey | Run `gpgconf --kill scdaemon`, then retry. |
-| `key-attr` refuses ECC or Curve 25519 | The firmware is older than 5.2.3; use a newer YubiKey, or choose `(1) RSA` with 4096 bits for each of the three keys in `key-attr`. |
+| `key-attr` refuses ECC or Curve 25519 | The firmware is older than 5.2.3; use a newer YubiKey, or fall back to `(1) RSA` with 4096 bits for each of the three keys in `key-attr`. |
 | gpg asks you to insert the card with another serial number | The key you sign with is on your other YubiKey; plug that one in, or point `user.signingkey` at the key on the YubiKey that is plugged in. |
 | git prints `gpg failed to sign the data` | Run `echo test \| gpg --clearsign --local-user "${FPR}!"` to see GnuPG's own error. |
 | GitHub shows a tag as Unverified | The user ID's email is not verified on your GitHub account, or GitHub holds an older export of the key, for example from before you extended it; fix the email, or replace the key on GitHub. |
