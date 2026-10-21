@@ -1389,9 +1389,12 @@ impl PeerManagerMetrics {
     /// Record the outcome of the per-source inbound kad `PutRecord` rate limiter.
     ///
     /// `Allowed` records nothing. `Shed` and `Flooding` bump the counter with the outcome
-    /// labels {`shed`, `flood`}: `shed` counts records dropped without a penalty; `flood`
-    /// counts penalty escalations, including repeated penalties above the hard ceiling.
-    /// Operators watch `shed` to see honest shedding before it reaches the penalty threshold.
+    /// labels {`shed`, `flood`}, and [`Self::record_put_record_budget_shed`] adds `budget`:
+    /// `shed` counts records the per-source limiter drops without a penalty; `flood` counts
+    /// penalty escalations, including repeated penalties above the hard ceiling; `budget`
+    /// counts records the cross-source budget drops without a penalty. Operators watch `shed`
+    /// to see honest shedding before it reaches the penalty threshold, and `budget` to see
+    /// the shared budget bind during a restart or a flood from many sources.
     pub(crate) fn record_put_record_rate_limited(&self, rate: &PutRecordRate) {
         let outcome = match rate {
             PutRecordRate::Allowed => None,
@@ -1406,6 +1409,19 @@ impl PeerManagerMetrics {
             )
             .increment(1);
         });
+    }
+
+    /// Record an inbound kad `PutRecord` shed by the budget that untrusted sources share.
+    ///
+    /// Bumps the rate-limit counter with the outcome label `budget`. The source is not
+    /// penalized.
+    pub(crate) fn record_put_record_budget_shed(&self) {
+        metrics::counter!(
+            "tn_network.put_records_rate_limited_total",
+            "network" => self.network.clone(),
+            "outcome" => "budget",
+        )
+        .increment(1);
     }
 }
 
