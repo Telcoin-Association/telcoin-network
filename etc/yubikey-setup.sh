@@ -61,6 +61,8 @@
 #   - Destructive or irreversible actions wait for a typed "yes": OpenPGP reset, key
 #     generation (the user ID and the card are then committed), replacing a git or gpg-agent
 #     setting, the optional scratch-repository test.
+#   - The OpenPGP reset is never offered for a card whose key is in the allowlist on
+#     origin/main or on the GitHub account, nor when origin/main's allowlist cannot be read.
 #   - The script never commits, pushes or opens a pull request.
 #
 # State: none. Everything is read from the card, ~/.gnupg, the checkout and GitHub.
@@ -652,11 +654,63 @@ discover_key() {
     PHASE_DETAIL="YubiKey $SERIAL holds a signature key $CARD_SIG_FPR that matches nothing in $HOME_GNUPG, $HOME/*.asc or $ALLOWLIST_PATH."
 }
 
+# all_fprs (`--show-keys --with-colons`): every primary and subkey fingerprint, one per line.
+all_fprs() { awk -F: '$1 == "pub" || $1 == "sub" { want = 1; next } $1 == "fpr" && want { print $10 } { want = 0 }'; }
+
+# has_any_fpr LIST FPR...: one of FPR... is a line of LIST.
+has_any_fpr() {
+    local list=$1 fpr
+    shift
+    for fpr in "$@"; do
+        if [ -n "$fpr" ] && grep -qx "$fpr" <<<"$list"; then return 0; fi
+    done
+    return 1
+}
+
+# card_key_published FPR...: where a key holding one of FPR... (as its primary key or a subkey)
+# is published, one place per line: an allowlist file on origin/main, which release.sh treats
+# as the source of truth (fetched first when origin answers), and https://github.com/<login>.gpg
+# when the GitHub login is known without asking. Returns 2 when origin/main's allowlist cannot
+# be read at all. Run mode only: the fetch writes refs/remotes/origin/main.
+card_key_published() {
+    local ref=refs/remotes/origin/main names name fprs login rc=0
+    if git remote get-url origin >/dev/null 2>&1; then
+        git fetch --quiet --no-tags origin +refs/heads/main:$ref 2>/dev/null ||
+            warn "cannot fetch main from origin; checking the allowlist in the local origin/main, which may be out of date"
+    fi
+    if names=$(git ls-tree --name-only "$ref:$ALLOWLIST_PATH" 2>/dev/null) && [ -n "$names" ]; then
+        while IFS= read -r name; do
+            case "$name" in *.asc) ;; *) continue ;; esac
+            fprs=$(git show "$ref:$ALLOWLIST_PATH/$name" 2>/dev/null | "$GPG" --show-keys --with-colons 2>/dev/null | all_fprs || true)
+            if has_any_fpr "$fprs" "$@"; then printf 'origin/main:%s/%s\n' "$ALLOWLIST_PATH" "$name"; fi
+        done <<EOF
+$names
+EOF
+    else
+        rc=2
+    fi
+    login=$(gh_login || git config --global --get github.user 2>/dev/null || true)
+    if matches "$login" "$HANDLE_RE"; then
+        fprs=$(curl -fsS --max-time 30 "https://github.com/$login.gpg" 2>/dev/null | "$GPG" --show-keys --with-colons 2>/dev/null | all_fprs || true)
+        if has_any_fpr "$fprs" "$@"; then printf 'https://github.com/%s.gpg\n' "$login"; fi
+    fi
+    return "$rc"
+}
+
 # run: a card holding a key that matches nothing here is either the maintainer's own key from
-# another Mac, or something to wipe.
+# another Mac, or something to wipe. A key published on main's allowlist or on GitHub is never
+# wiped here, and neither is a key when main's allowlist cannot be read.
 stage_card_state() {
+    local found rc=0
     [ "$PHASE" = foreign ] || return 0
     info "$PHASE_DETAIL"
+    found=$(card_key_published "$CARD_SIG_FPR") || rc=$?
+    if [ -n "$found" ]; then
+        die 1 "the key on YubiKey $SERIAL is published at $(printf '%s' "$found" | tr '\n' ' '), so it may be an allowlisted release key; not offering ykman openpgp reset. Put its public key in ~/<handle>.asc, for example with git show origin/main:$ALLOWLIST_PATH/<handle>.asc > ~/<handle>.asc, and run again."
+    fi
+    if [ "$rc" != 0 ]; then
+        die 1 "cannot read $ALLOWLIST_PATH on origin/main, so the key on YubiKey $SERIAL may be an allowlisted release key; not offering ykman openpgp reset. Run git fetch origin main and run again."
+    fi
     info "If it is your own key from another Mac, decline below, put its public key in ~/<handle>.asc (copy the file from that Mac, or curl -fsS https://github.com/<handle>.gpg -o ~/<handle>.asc when GitHub holds only that key) and run again."
     info "Otherwise the card can be wiped: every key on it is lost and the PINs return to the defaults."
     confirm "Wipe the OpenPGP application of YubiKey $SERIAL (ykman openpgp reset)."

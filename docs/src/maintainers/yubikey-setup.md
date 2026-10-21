@@ -30,6 +30,7 @@ It shows where gpg wrote the revocation certificate and waits while you store it
 It checks every step by reading the card, the keyring, the files and GitHub back.
 It fills in the allowlist file, your `SECURITY.md` row and your row in the allowlist README on the current branch and stages them, but it never commits, pushes or opens the allowlist PR for you.
 It skips the optional `kdf-setup` and `url` card settings; do those by hand before its PIN step if you want them.
+When the YubiKey holds a key that matches nothing on the Mac, the script offers to wipe the card only after it has looked for that key in the allowlist on `origin/main`, fetched first, and at `https://github.com/<handle>.gpg` when it knows your login; it refuses the wipe when it finds the key there, and names where, or when it cannot read the allowlist on `origin/main`.
 
 `etc/yubikey-setup.sh check` reports what it finds without writing anything.
 The sections below are the reference for what the script does, and the only path for a [spare YubiKey](#spare-yubikey) and for [expiry, loss and rotation](#expiry-loss-and-rotation).
@@ -60,6 +61,7 @@ gpg --card-status
 - Write down the serial number and firmware version that `ykman info` prints; the serial goes in `SECURITY.md`.
 - If `ykman config usb --list` does not include OpenPGP, enable it with `ykman config usb --enable OPENPGP`.
 - On a YubiKey that was used before, `ykman openpgp reset` wipes its OpenPGP keys and restores the default PINs.
+  Before you run it, check that the fingerprint `gpg --card-status` shows as the signature key is not in `git show origin/main:.github/maintainer-gpg-keys/<handle>.asc | gpg --show-keys` or at `https://github.com/<handle>.gpg`: a release key on the allowlist exists only on its YubiKey.
 - GnuPG holds the YubiKey through `scdaemon`, so run `gpgconf --kill scdaemon` before any `ykman openpgp` command.
 
 ## Set the PINs
