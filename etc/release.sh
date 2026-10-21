@@ -387,21 +387,22 @@ handle_of() {
 # Reads gpg status output (--status-fd) on stdin and judges each signature block, split on
 # NEWSIG. A block is good only with GOODSIG and VALIDSIG, and its signer is the VALIDSIG
 # primary fingerprint (last field) mapped through the allowlist. Prints per block
-# "good<TAB>handle<TAB>fpr", "bad<TAB>keyid" or "skip<TAB>reason", then "blocks<TAB>N".
+# "good<TAB>handle<TAB>fpr", "bad<TAB>keyid" or "skip<TAB>reason", the reason starting with
+# the gpg status, then "blocks<TAB>N".
 sig_blocks() {
     awk -v allow="$WORK/allowlist.tsv" '
         BEGIN {
             while ((getline line < allow) > 0) { split(line, f, "\t"); handle[f[2]] = f[1] }
         }
         function open_block() {
-            if (!inblock) { inblock = 1; n++; good = 0; valid = ""; note = ""; bad = 0 }
+            if (!inblock) { inblock = 1; n++; good = 0; valid = ""; note = ""; bad = 0; nokey = 0 }
         }
         function close_block() {
             if (!inblock) return
             if (good && valid != "") {
                 if (valid in handle) print "good\t" handle[valid] "\t" valid
-                else print "skip\tsignature by key " valid " is not allowlisted"
-            } else if (note != "") print "skip\t" note
+                else print "skip\tGOODSIG by key " valid ", which is not on the allowlist"
+            } else if (note != "") print "skip\t" note (nokey ? " (NO_PUBKEY: the key is not on the allowlist)" : "")
             else if (!bad) print "skip\tsignature without GOODSIG and VALIDSIG"
             inblock = 0
         }
@@ -410,30 +411,32 @@ sig_blocks() {
         $2 == "GOODSIG" { open_block(); good = 1; next }
         $2 == "VALIDSIG" { open_block(); valid = $NF; next }
         $2 == "BADSIG" { open_block(); bad = 1; print "bad\t" $3; next }
-        $2 == "ERRSIG" { open_block(); note = "unverifiable signature by key " $3 " (not allowlisted?)"; next }
-        $2 == "EXPKEYSIG" { open_block(); note = "signature by expired key " $3; next }
-        $2 == "REVKEYSIG" { open_block(); note = "signature by revoked key " $3; next }
-        $2 == "EXPSIG" { open_block(); note = "expired signature by key " $3; next }
+        $2 == "ERRSIG" { open_block(); note = "ERRSIG: cannot check the signature by key " $3; next }
+        $2 == "NO_PUBKEY" { open_block(); nokey = 1; next }
+        $2 == "EXPKEYSIG" { open_block(); note = "EXPKEYSIG: signature by expired key " $3; next }
+        $2 == "REVKEYSIG" { open_block(); note = "REVKEYSIG: signature by revoked key " $3; next }
+        $2 == "EXPSIG" { open_block(); note = "EXPSIG: expired signature by key " $3; next }
         END { close_block(); print "blocks\t" n + 0 }
     '
 }
 
 # count_sigs FILE SIG: prints the distinct allowlisted handles with a good signature over FILE
 # in SIG (concatenated armored detached signatures), one per line; the count is the line
-# count. Any BADSIG is fatal (exit 1); unverifiable, expired or revoked ones are warned about
-# and not counted.
+# count. Every signature in SIG must be a GOODSIG with a VALIDSIG by an allowlisted primary
+# key, the rule of the operator check on the install page: one that is bad, unverifiable,
+# expired, revoked or by a key off the allowlist refuses the whole file (exit 1), even next to
+# good ones. Its output is captured, so callers pass a die on with `|| exit`.
 count_sigs() {
-    local file=$1 sig=$2 status results bad kind detail
+    local file=$1 sig=$2 status results refused
     if [ ! -f "$file" ] || [ ! -f "$sig" ]; then die 2 "count_sigs: $file or $sig does not exist"; fi
     status=$(gpg --homedir "$ALLOW_GNUPGHOME" --batch --status-fd 1 --verify "$sig" "$file" 2>/dev/null || true)
     results=$(printf '%s\n' "$status" | sig_blocks) || die 1 "cannot judge the signatures in ${sig##*/}"
-    bad=$(printf '%s\n' "$results" | awk -F'\t' '$1 == "bad" { printf "%s ", $2 }')
-    [ -z "$bad" ] || die 1 "BADSIG in ${sig##*/} from key ${bad% }: ${file##*/} does not match its signature"
-    while IFS=$'\t' read -r kind detail; do
-        if [ "$kind" = skip ]; then warn "${sig##*/}: $detail; not counted"; fi
-    done <<EOF
-$results
-EOF
+    refused=$(printf '%s\n' "$results" | awk -F'\t' -v f="${file##*/}" '
+        $1 == "bad" { msg = msg sep "BADSIG: signature by key " $2 " does not match " f; sep = "; " }
+        $1 == "skip" { msg = msg sep $2; sep = "; " }
+        END { print msg }')
+    [ -z "$refused" ] ||
+        die 1 "${sig##*/} holds a signature that is not a good one by an allowlisted maintainer key, so the file is refused: $refused"
     printf '%s\n' "$results" | awk -F'\t' '$1 == "good" { print $2 }' | LC_ALL=C sort -u
 }
 
@@ -1820,7 +1823,7 @@ cmd_sign() {
     check_release_files "$rd"
     resolve_signing_key
     before=
-    if [ -f "$rd/SHA256SUMS.asc" ]; then before=$(count_sigs "$rd/SHA256SUMS" "$rd/SHA256SUMS.asc"); fi
+    if [ -f "$rd/SHA256SUMS.asc" ]; then before=$(count_sigs "$rd/SHA256SUMS" "$rd/SHA256SUMS.asc") || exit; fi
     n_before=$(printf '%s\n' "$before" | count_lines)
     case $'\n'"$before"$'\n' in
         *$'\n'"$SIGN_HANDLE"$'\n'*) die 1 "SHA256SUMS for $TAG is already signed by @$SIGN_HANDLE" ;;
@@ -1843,7 +1846,7 @@ cmd_sign() {
     else
         cp "$WORK/new.asc" "$WORK/combined.asc"
     fi
-    after=$(count_sigs "$rd/SHA256SUMS" "$WORK/combined.asc")
+    after=$(count_sigs "$rd/SHA256SUMS" "$WORK/combined.asc") || exit
     n_after=$(printf '%s\n' "$after" | count_lines)
     [ "$n_after" = $((n_before + 1)) ] || die 1 "the new signature did not count (before $n_before, after $n_after)"
     case $'\n'"$after"$'\n' in
@@ -1861,7 +1864,7 @@ cmd_sign() {
     back_hex=$(sha256_hex "$WORK/readback/SHA256SUMS.asc")
     [ "$back_hex" = "$up_hex" ] ||
         die 1 "SHA256SUMS.asc on the release is not the file just uploaded (did another maintainer sign at the same time?); run make release-sign again"
-    recount=$(count_sigs "$WORK/readback/SHA256SUMS" "$WORK/readback/SHA256SUMS.asc")
+    recount=$(count_sigs "$WORK/readback/SHA256SUMS" "$WORK/readback/SHA256SUMS.asc") || exit
     case $'\n'"$recount"$'\n' in
         *$'\n'"$SIGN_HANDLE"$'\n'*) ;;
         *) die 1 "the uploaded SHA256SUMS.asc carries no signature by @$SIGN_HANDLE" ;;
@@ -1899,7 +1902,7 @@ cmd_verify() {
     fi
     check_release_files "$dir"
     if [ -f "$dir/SHA256SUMS.asc" ]; then
-        handles=$(count_sigs "$dir/SHA256SUMS" "$dir/SHA256SUMS.asc")
+        handles=$(count_sigs "$dir/SHA256SUMS" "$dir/SHA256SUMS.asc") || exit
         n=$(printf '%s\n' "$handles" | count_lines)
     fi
     if [ "$allow_unsigned" != 1 ] && [ "$n" -lt "$THRESHOLD" ]; then

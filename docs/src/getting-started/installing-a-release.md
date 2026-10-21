@@ -92,6 +92,7 @@ Expect:
 - `Signature and hashes verified` as the last line.
 
 gpgv prints `Good signature from` and exits 0 even when the signing key is revoked or expired, so the block reads gpgv's status lines instead: it counts only a `GOODSIG`, and it fails when any signature in `SHA256SUMS.asc` is `BADSIG`, `ERRSIG`, `EXPSIG`, `EXPKEYSIG` or `REVKEYSIG`, even if another one is good.
+The release pipeline applies the same rule before a maintainer signs and before a release is published.
 If the last line `Signature and hashes verified` is missing, the files are not verified; stop, do not extract or run anything from this release, and report it.
 The lines above it show which check failed, and [When verification fails](#when-verification-fails) explains each one.
 

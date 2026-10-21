@@ -207,7 +207,7 @@ make release-sign TAG=v0.17.0-adiri
 
 `release-sign` repeats the tag checks and downloads the draft's files into `target/release-artifacts/v0.17.0-adiri/`.
 It then runs the file checks of `release-verify` in step 6 before anything is signed: the downloads are the assets GitHub lists, the hashes in `SHA256SUMS` match, the chain-config ones against the tagged commit, `IMAGE_DIGEST` matches what the registry reports for `:v0.17.0-adiri`, the tarball holds the four expected files, its binary is byte-identical to the one in the image pulled by digest, and that binary's `--version` names the release.
-It checks that your key is allowlisted and has not signed this release yet, and shows the tag, the commit, the image, the content of `SHA256SUMS` and its SHA-256.
+It checks that your key is allowlisted and has not signed this release yet, and that every signature already in `SHA256SUMS.asc` is a good one by an allowlisted key, and shows the tag, the commit, the image, the content of `SHA256SUMS` and its SHA-256.
 It asks for the SHA-256 that `release-build` printed in step 4 (paste the value or the whole line), or reads it from `RELEASE_SUMS_SHA256`, and stops without signing when it differs.
 `RELEASE_YES=1` answers only the `yes` prompt that follows, never this one, so a run without a terminal needs `RELEASE_SUMS_SHA256`.
 It signs `SHA256SUMS` with the key `release-tag` would use, adds the signature to `SHA256SUMS.asc`, uploads it, then downloads it again and checks that it is the file it uploaded and that it carries your signature.
@@ -228,6 +228,7 @@ docker logout ghcr.io
 - the draft holds exactly the tarball, `IMAGE_DIGEST`, `SHA256SUMS` and `SHA256SUMS.asc`;
 - `SHA256SUMS` names exactly `IMAGE_DIGEST`, the tarball and the network's three chain-config files, and every hash matches, the chain-config ones against the tagged commit;
 - enough distinct allowlisted maintainers signed: `RELEASE_SIG_THRESHOLD` if set, otherwise `MIN_SIGNATURES`, which is 1;
+- every signature in `SHA256SUMS.asc` is a `GOODSIG` with a `VALIDSIG` by an allowlisted key: one that is bad, unverifiable, expired or revoked, or by a key that is not on the allowlist, refuses the release even next to good ones, which is the rule of the operator check on the install page;
 - `IMAGE_DIGEST` matches the registry;
 - the tarball holds exactly the four expected files in its directory;
 - the binary in the tarball is byte-identical to the one in the image pulled by digest;
