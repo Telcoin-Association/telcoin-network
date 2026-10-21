@@ -1,8 +1,8 @@
 //! Configuration for network variables.
 
 use crate::{
-    ConfigFmt, ConfigTrait, NetworkBudgetError, NetworkProcessBudget, SourceAdmissionConfig,
-    SwarmNetworkBudget, TelcoinDirs,
+    ConfigFmt, ConfigTrait, NetworkBudgetError, NetworkProcessBudget, ServeBudget,
+    SourceAdmissionConfig, SwarmNetworkBudget, TelcoinDirs,
 };
 use libp2p::{kad::K_VALUE, multiaddr::Protocol, PeerId};
 use serde::{
@@ -35,6 +35,8 @@ pub struct NetworkConfig {
     quic_config: QuicConfig,
     /// Optional process-wide allocation. Omission preserves the existing transport defaults.
     process_budget: Option<NetworkProcessBudget>,
+    /// Opt-in per-class serve permit budget. Omission leaves every class unbounded.
+    serve_budget: ServeBudget,
     /// The configuration for managing peers.
     peer_config: PeerConfig,
     /// Connection admission policy shared by the primary and every worker swarm.
@@ -285,6 +287,11 @@ impl NetworkConfig {
     /// Derive one swarm's resource allocation, or preserve legacy limits when not configured.
     pub fn swarm_budget(&self) -> Result<Option<SwarmNetworkBudget>, NetworkBudgetError> {
         self.process_budget.as_ref().map(NetworkProcessBudget::allocate).transpose()
+    }
+
+    /// The per-class serve permit budget. Every class is unbounded when not configured.
+    pub fn serve_budget(&self) -> ServeBudget {
+        self.serve_budget
     }
 
     /// Endpoint mappings for the primary and every independently keyed worker.
@@ -1858,6 +1865,22 @@ hostname: "my-validator"
         // A negative halflife flips exponential decay into unbounded growth.
         let config = ScoreConfig { score_halflife: -1.0, ..Default::default() };
         assert!(config.validate().is_err(), "a negative score_halflife must be rejected");
+    }
+
+    /// A network config without a serve budget leaves every class unbounded, and a partial budget
+    /// sets only the named class.
+    #[test]
+    fn serve_budget_is_optional_and_partial() -> Result<(), serde_json::Error> {
+        let absent: NetworkConfig = serde_json::from_value(serde_json::json!({}))?;
+        assert_eq!(absent.serve_budget(), ServeBudget::default());
+        let partial: NetworkConfig =
+            serde_json::from_value(serde_json::json!({ "serve_budget": { "vote": 8 } }))?;
+        assert_eq!(partial.serve_budget().vote(), 8);
+        assert_eq!(partial.serve_budget().epoch_record(), 0);
+        assert_eq!(partial.serve_budget().certificate_sync(), 0);
+        assert_eq!(partial.serve_budget().batch(), 0);
+        assert_eq!(partial.serve_budget().other(), 0);
+        Ok(())
     }
 
     /// Process allocations cap transport values and preserve lower operator settings.

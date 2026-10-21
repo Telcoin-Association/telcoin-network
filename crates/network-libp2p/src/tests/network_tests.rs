@@ -4584,6 +4584,53 @@ async fn test_add_provider_rate_limit_counts_drops_before_storage() {
     }));
 }
 
+/// A cached URL is insufficient: coverage needs a live, matching verified record.
+#[tokio::test]
+async fn committee_convergence_excludes_stale_records() -> eyre::Result<()> {
+    let TestTypes { peer1, peer2, .. } =
+        create_test_types::<TestWorkerRequest, TestWorkerResponse>();
+    let mut network = peer1.network;
+    let owner = peer2.config.key_config().primary_public_key();
+    let publisher = *peer2.network.swarm.local_peer_id();
+    let keys = peer2.config.key_config();
+    let rpc = RpcInfo { http: "https://validator.example.com:8545/".parse()?, ws: None };
+    let record = NodeRecord::build(
+        RecordDomain::new(
+            peer2.config.network_config().libp2p_config().chain_id,
+            NetworkType::Primary,
+        ),
+        keys.primary_network_public_key(),
+        peer2.config.primary_address(),
+        Some(rpc),
+        |data| keys.request_signature_direct(data),
+    );
+    network.process_command(NetworkCommand::UpdateCommittees {
+        previous: HashSet::new(),
+        current: HashSet::from([owner]),
+        next: HashSet::new(),
+    })?;
+    network.swarm.behaviour_mut().peer_manager.add_restored_peer(owner, record.info.clone());
+    assert_eq!(network.committee_rpc_snapshot().members(), &HashSet::from([owner]));
+    assert!(network.committee_rpc_snapshot().rpcs().is_empty());
+    let kad_record = kad::Record {
+        key: node_record_key(&owner),
+        value: encode(&record),
+        publisher: Some(publisher),
+        expires: None,
+    };
+    network.process_kad_put_request(publisher, kad_record.clone())?;
+    assert_eq!(network.committee_rpc_snapshot().rpcs().len(), 1);
+    network
+        .swarm
+        .behaviour_mut()
+        .kademlia
+        .store_mut()
+        .put(kad::Record { expires: Some(std::time::Instant::now()), ..kad_record })?;
+    assert!(network.swarm.behaviour().peer_manager.get_rpc(&owner).is_some());
+    assert!(network.committee_rpc_snapshot().rpcs().is_empty());
+    Ok(())
+}
+
 /// A signed record advertising an RPC endpoint with a well-formed URL but the
 /// wrong scheme is accepted (the signature is authentic) and promoted with the
 /// malformed endpoint stripped, without penalizing the sender.
@@ -5821,21 +5868,27 @@ async fn diagnostic_suppression_preserves_network_progress_and_counters() -> eyr
     let (reply, received) = oneshot::channel();
     network.process_command(NetworkCommand::EstablishedPeerCount { reply })?;
     assert_eq!(received.await?, 0, "the next command still makes progress after the event stream");
-    ["listener_errors_total", "gossip_received_total", "gossip_rejected_total"]
-        .into_iter()
-        .for_each(|suffix| {
-            assert!(
-                snapshotter.snapshot().into_vec().iter().any(|(key, _, _, value)| {
-                    key.key().name() == format!("tn_network.{suffix}")
-                        && key
-                            .key()
-                            .labels()
-                            .all(|label| label.key() == "network" && label.value() == "primary")
-                        && matches!(value, DebugValue::Counter(128))
-                }),
-                "every event is counted without remote label values: {suffix}"
-            );
-        });
+    // The listener error count carries a fixed reason class; the error text never becomes a label.
+    [
+        ("listener_errors_total", &[("network", "primary"), ("reason", "other")][..]),
+        ("gossip_received_total", &[("network", "primary")][..]),
+        ("gossip_rejected_total", &[("network", "primary")][..]),
+    ]
+    .into_iter()
+    .for_each(|(suffix, expected)| {
+        assert!(
+            snapshotter.snapshot().into_vec().iter().any(|(key, _, _, value)| {
+                key.key().name() == format!("tn_network.{suffix}")
+                    && key.key().labels().count() == expected.len()
+                    && key
+                        .key()
+                        .labels()
+                        .all(|label| expected.contains(&(label.key(), label.value())))
+                    && matches!(value, DebugValue::Counter(128))
+            }),
+            "every event is counted without remote label values: {suffix}"
+        );
+    });
 
     // The transport has not been polled, so it has no active listener addresses yet.
     assert!(network.swarm.listeners().next().is_none());
