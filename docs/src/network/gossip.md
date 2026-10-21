@@ -110,6 +110,24 @@ If an operator lowered it, that node would ban honest peers forwarding legitimat
 The bound is enforced symmetrically.
 A node refuses to publish a message larger than the limit rather than emitting one its peers must reject, so on the first hop the originator is never the victim of its own ban.
 
+## Frame limits
+
+Every gossip message is signed, and gossipsub verifies one signature for each message in a received frame.
+That work runs before the duplicate cache and before the `MAX_GOSSIP_MESSAGE_SIZE` check, so the node sets explicit frame limits that the codec applies first, on the raw bytes, before it decodes the frame or verifies a signature.
+A frame that breaks a limit closes the stream, and none of its messages are delivered.
+
+- **Frame size: 24,579 bytes.** One honest frame is at most 16,387 bytes: one 12,000-byte payload plus a 512-byte bound on its envelope, or one 16 KiB control field plus its length prefix.
+  The codec reads in 8 KiB chunks and checks the size of its whole read buffer, not of one frame, so the limit adds one read chunk.
+  Without that slack, two maximum frames sent back to back can close an honest stream.
+- **Publish entries per frame: 8.** An honest peer sends one message per frame.
+  The library default of 500 would let one frame force 500 signature checks.
+  This is a per-frame bound, not a rate bound.
+- **Control bytes per frame: 16 KiB.** This equals the library default, set explicitly so that an upgrade cannot change it.
+
+No topic has its own size limit, because `MAX_GOSSIP_MESSAGE_SIZE` applies to every topic.
+The limits and the order in which the library applies them are recorded at `gossipsub_config`, with the resolved library versions.
+A dependency upgrade must re-check both.
+
 ## Penalty attribution
 
 Rejection never propagates the message.
@@ -160,7 +178,7 @@ See [Network architecture](../architecture/network.md) for the node roles this g
 |----------|------|
 | Topic names | `crates/config/src/network.rs` (`LibP2pConfig` topic constructors) |
 | Message size limit | `crates/config/src/network.rs` (`MAX_GOSSIP_MESSAGE_SIZE`) |
-| Gossipsub configuration | `crates/network-libp2p/src/consensus.rs` (`ConsensusNetwork::new`) |
+| Gossipsub configuration and frame limits | `crates/network-libp2p/src/gossip_config.rs` (`gossipsub_config`), called from `ConsensusNetwork::new` |
 | Allowlist check and subscribe/unsubscribe | `crates/network-libp2p/src/consensus.rs` (`verify_gossip`, `NetworkCommand::Subscribe`) |
 | Penalty attribution | `crates/network-libp2p/src/consensus.rs` (`RejectReason::penalty`) |
 | Per-epoch subscription and allowlists | `crates/node/src/manager/node/start_epoch.rs` (`spawn_primary_network_for_epoch`, `spawn_worker_network_for_epoch`) |
