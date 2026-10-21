@@ -16,7 +16,9 @@
 #                              `draft` creates the draft release
 #   4. build TAG       server  build image and tarball from the tag, push the image, upload
 #                              IMAGE_DIGEST, SHA256SUMS and the tarball to the draft
-#   5. sign TAG        laptop  append a detached signature over SHA256SUMS to SHA256SUMS.asc
+#   5. sign TAG        laptop  re-check the draft's files as verify does, compare the SHA256SUMS
+#                              hash with the one build printed, append a detached signature over
+#                              SHA256SUMS to SHA256SUMS.asc
 #   6. verify TAG      server  re-check tag, assets, signatures, image and binary, then
 #      publish TAG             publish the draft and move the channel alias
 #   7. verify TAG      CI      re-check the published release (detective only)
@@ -41,7 +43,10 @@
 #   RELEASE_REBUILD=1              build: rebuild a tag the registry already has
 #   RELEASE_ALLOW_LOCAL_SCRIPTS=1  build, publish: allow this script or verify_commit_hash.sh
 #                                  to differ from main
-#   RELEASE_YES=1                  answer yes to every confirmation prompt
+#   RELEASE_SUMS_SHA256            sign: the SHA256SUMS sha256 that build printed last; asked for
+#                                  at a prompt when unset
+#   RELEASE_YES=1                  answer yes to every confirmation prompt; it never stands in
+#                                  for RELEASE_SUMS_SHA256
 #   GH_TOKEN                       read by gh (CI); locally `gh auth login` is used
 #
 # Dry run, for rehearsals (RELEASE_DRY_RUN=1). The variables below are refused without it.
@@ -73,6 +78,7 @@ ARTIFACT_ROOT=target/release-artifacts
 TAG_RE='^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-adiri)?(-rc[1-9][0-9]*)?$'
 DIGEST_RE='^sha256:[0-9a-f]{64}$'
 HANDLE_FILE_RE='^[A-Za-z0-9-]+\.asc$'
+HEX64_RE='^[0-9a-f]{64}$'
 REPO_RE='^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$'
 LOCAL_HOST_RE='^(localhost|127\.0\.0\.1):[0-9]+$'
 LOCAL_PATH_RE='^[a-z0-9._/-]+$'
@@ -1139,6 +1145,25 @@ EOF
     info "$ref: Version $version, Commit SHA $sha, Build Features ${features:-none}"
 }
 
+# The release files that release_fetch put in DIR, before anyone counts or adds a signature:
+# each is the asset GitHub listed, SHA256SUMS matches them and the chain-config files at COMMIT,
+# IMAGE_DIGEST names what the registry serves for TAG, the tarball holds the four files, its
+# binary is byte for byte /usr/local/bin/telcoin in the image pulled by digest, and that binary
+# reports this release's version, commit and features. sign and verify both run it. Sets D.
+check_release_files() {
+    local dir=$1 tar_bin_hex image_bin_hex
+    check_fetched_digests "$dir"
+    check_sums "$dir"
+    check_image_digest_file "$dir"
+    check_tarball "$dir/$TARBALL" "$dir/x"
+    docker pull --platform linux/amd64 "$IMAGE@$D" >&2 || die 3 "docker pull $IMAGE@$D failed"
+    image_binary "$IMAGE@$D" "$dir/image-telcoin"
+    image_bin_hex=$(sha256_hex "$dir/image-telcoin")
+    tar_bin_hex=$(sha256_hex "$dir/x/telcoin-network-$TAG-$TRIPLE/telcoin-network")
+    [ "$image_bin_hex" = "$tar_bin_hex" ] || die 1 "the tarball's telcoin-network differs from /usr/local/bin/telcoin in $IMAGE@$D"
+    check_version_output "$IMAGE@$D"
+}
+
 # ---------------------------------------------------------------------------------------------
 # Release body
 
@@ -1673,10 +1698,28 @@ cmd_build() {
     printf 'SHA256SUMS sha256: %s\n' "$sums_hex"
 }
 
-# laptop: append this maintainer's detached signature over SHA256SUMS to SHA256SUMS.asc.
+# sign: $1 is the sha256 of the SHA256SUMS about to be signed. It must equal the value build
+# printed last, taken from RELEASE_SUMS_SHA256 or typed at the prompt (the whole printed line
+# is accepted). RELEASE_YES=1 does not answer this prompt, and a mismatch always stops.
+check_build_sums_hash() {
+    local have=$1 want=${RELEASE_SUMS_SHA256:-}
+    if [ -z "$want" ]; then
+        [ -t 0 ] || die 2 "set RELEASE_SUMS_SHA256 to the SHA256SUMS sha256 that make release-build printed (stdin is not a TTY)"
+        printf 'Paste the SHA256SUMS sha256 from the last line of make release-build: ' >&2
+        read -r want || true
+    fi
+    want=$(lower "${want##* }")
+    [[ "$want" =~ $HEX64_RE ]] || die 2 "the SHA256SUMS sha256 from make release-build must be 64 hex characters, got '$want'"
+    [ "$want" = "$have" ] ||
+        die 1 "SHA256SUMS on the draft has sha256 $have, but make release-build printed $want; do not sign, find out what changed the draft"
+    info "SHA256SUMS sha256 matches the value from make release-build"
+}
+
+# laptop: re-check the draft's files as verify does, compare the SHA256SUMS hash with the one
+# build printed, then append this maintainer's detached signature to SHA256SUMS.asc.
 cmd_sign() {
     local rd before after recount n_before n_after n_back sums_hex up_hex back_hex
-    need gpg curl
+    need docker tar gzip curl gpg
     check_tag if-cast
     release_state
     [ "$REL_EXISTS" = 1 ] || die 2 "no draft release for $TAG"
@@ -1689,8 +1732,7 @@ cmd_sign() {
     else
         release_fetch "$rd" IMAGE_DIGEST SHA256SUMS "$TARBALL"
     fi
-    check_sums "$rd"
-    check_image_digest_file "$rd"
+    check_release_files "$rd"
     resolve_signing_key
     before=
     if [ -f "$rd/SHA256SUMS.asc" ]; then before=$(count_sigs "$rd/SHA256SUMS" "$rd/SHA256SUMS.asc"); fi
@@ -1704,8 +1746,10 @@ cmd_sign() {
     info "commit     $COMMIT"
     info "signer     @$SIGN_HANDLE $SIGN_FPR"
     info "signatures $n_before so far, $THRESHOLD required"
-    info "SHA256SUMS sha256: $sums_hex (compare with the last line of make release-build)"
+    info "image      $IMAGE@$D"
+    info "SHA256SUMS sha256: $sums_hex"
     info "$(cat "$rd/SHA256SUMS")"
+    check_build_sums_hash "$sums_hex"
     confirm "Sign SHA256SUMS for $TAG?"
     gpg --armor --detach-sign --local-user "$SIGN_KEY" --output "$WORK/new.asc" "$rd/SHA256SUMS" ||
         die 1 "gpg could not sign SHA256SUMS"
@@ -1745,7 +1789,7 @@ cmd_sign() {
 # build server, CI, operators: re-check everything about a release. $1 = 1 allows a missing
 # SHA256SUMS.asc (build's own self-check before anyone has signed).
 cmd_verify() {
-    local allow_unsigned=$1 dir handles n=0 tar_bin_hex image_bin_hex
+    local allow_unsigned=$1 dir handles n=0
     need docker tar gzip curl gpg
     check_tag always
     release_state
@@ -1765,8 +1809,7 @@ cmd_verify() {
     else
         release_fetch "$dir" IMAGE_DIGEST SHA256SUMS "$TARBALL"
     fi
-    check_fetched_digests "$dir"
-    check_sums "$dir"
+    check_release_files "$dir"
     if [ -f "$dir/SHA256SUMS.asc" ]; then
         handles=$(count_sigs "$dir/SHA256SUMS" "$dir/SHA256SUMS.asc")
         n=$(printf '%s\n' "$handles" | count_lines)
@@ -1774,14 +1817,6 @@ cmd_verify() {
     if [ "$allow_unsigned" != 1 ] && [ "$n" -lt "$THRESHOLD" ]; then
         die 1 "SHA256SUMS carries $n of the $THRESHOLD required maintainer signatures"
     fi
-    check_image_digest_file "$dir"
-    check_tarball "$dir/$TARBALL" "$dir/x"
-    docker pull --platform linux/amd64 "$IMAGE@$D" >&2 || die 3 "docker pull $IMAGE@$D failed"
-    image_binary "$IMAGE@$D" "$dir/image-telcoin"
-    image_bin_hex=$(sha256_hex "$dir/image-telcoin")
-    tar_bin_hex=$(sha256_hex "$dir/x/telcoin-network-$TAG-$TRIPLE/telcoin-network")
-    [ "$image_bin_hex" = "$tar_bin_hex" ] || die 1 "the tarball's telcoin-network differs from /usr/local/bin/telcoin in $IMAGE@$D"
-    check_version_output "$IMAGE@$D"
     printf 'verified %s commit=%s signatures=%s/%s image=%s@%s\n' "$TAG" "$COMMIT" "$n" "$THRESHOLD" "$IMAGE" "$D"
 }
 

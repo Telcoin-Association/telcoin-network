@@ -50,6 +50,7 @@ The tag checks also enforce these version rules:
 - `gpg --card-status` shows the YubiKey.
 - `git config --get user.signingkey` prints your signing key fingerprint followed by `!`; `RELEASE_GPG_KEY` overrides it for one command.
 - `gh auth status` shows a login with the `repo` scope, which `release-sign` needs to read the draft and upload to it.
+- Docker runs `linux/amd64` images, as Docker Desktop does on any Mac: `release-sign` pulls the release image by digest, compares its binary with the tarball's and runs its `--version`.
 - The repository is cloned and on an up-to-date `main`.
 - Foundry's `cast` is optional: with it, `release-tag` and `release-sign` also check the on-chain attestation, and without it they print a notice and leave that check to CI.
 
@@ -182,7 +183,7 @@ It writes `IMAGE_DIGEST` and `SHA256SUMS` next to the tarball in `target/release
 `SHA256SUMS` lists `IMAGE_DIGEST`, the tarball, and the network's `committee.yaml`, `genesis.yaml` and `parameters.yaml` by their repository path (`chain-configs/testnet/` for an Adiri tag, `chain-configs/mainnet/` otherwise), hashed as committed at the tag.
 It then runs every check from step 6 except the signature count.
 The last line it prints is `SHA256SUMS sha256: <hex>`.
-Write that value down; step 5 shows it again before you sign.
+Write that value down; step 5 asks for it and refuses to sign when the draft's `SHA256SUMS` has another hash.
 
 Because `release-build` rewrites the draft's notes, add the operator notes after it:
 
@@ -199,9 +200,10 @@ make release-sign TAG=v0.17.0-adiri
 ```
 
 `release-sign` repeats the tag checks and downloads the draft's files into `target/release-artifacts/v0.17.0-adiri/`.
-It checks the hashes in `SHA256SUMS`, the chain-config ones against the tagged commit, checks that `IMAGE_DIGEST` matches what the registry reports for `:v0.17.0-adiri`, and checks that your key is allowlisted and has not signed this release yet.
-It then shows the tag, the commit, the content of `SHA256SUMS` and its SHA-256, and waits for `yes`.
-Compare that SHA-256 with the value `release-build` printed in step 4 before you type `yes`, and stop if they differ.
+It then runs the file checks of `release-verify` in step 6 before anything is signed: the downloads are the assets GitHub lists, the hashes in `SHA256SUMS` match, the chain-config ones against the tagged commit, `IMAGE_DIGEST` matches what the registry reports for `:v0.17.0-adiri`, the tarball holds the four expected files, its binary is byte-identical to the one in the image pulled by digest, and that binary's `--version` names the release.
+It checks that your key is allowlisted and has not signed this release yet, and shows the tag, the commit, the image, the content of `SHA256SUMS` and its SHA-256.
+It asks for the SHA-256 that `release-build` printed in step 4 (paste the value or the whole line), or reads it from `RELEASE_SUMS_SHA256`, and stops without signing when it differs.
+`RELEASE_YES=1` answers only the `yes` prompt that follows, never this one, so a run without a terminal needs `RELEASE_SUMS_SHA256`.
 It signs `SHA256SUMS` with the key `release-tag` would use, adds the signature to `SHA256SUMS.asc`, uploads it, then downloads it again and checks that it is the file it uploaded and that it carries your signature.
 Sign one at a time: two maintainers uploading at once replace each other's file, and `release-sign` stops with an error for the one whose signature was lost.
 Expect one touch; [PIN and touch during signing](yubikey-setup.md#pin-and-touch-during-signing) covers the prompts and retries.
@@ -299,7 +301,8 @@ If `release-sign` had already uploaded the signature, the second run stops becau
 | 4 | `package is not public` | Do the [one-time setup](#one-time-setup). |
 | 4 | The image `:<TAG>` is already in the registry | An earlier build pushed it. Rebuild with `RELEASE_REBUILD=1 make release-build TAG=<TAG>`; the new image has a different digest, because builds are not reproducible. |
 | 4 | The release scripts differ from `origin/main` | Run `git switch main && git pull --ff-only`, then the build again. |
-| 5 | The SHA-256 differs from what `release-build` printed | Do not sign. Find out what changed the draft's files before going further. |
+| 5 | `release-sign` stops because the SHA-256 differs from what `release-build` printed | Nothing was signed. Find out what changed the draft's files before going further. |
+| 5 | `release-sign` stops on a file check | Nothing was signed; the message names the check, as for `release-verify` in step 6. |
 | 5 | PIN or touch errors | See [PIN and touch during signing](yubikey-setup.md#pin-and-touch-during-signing). |
 | 5 | Your key has already signed this release | Nothing to do. With a threshold above 1, another maintainer signs next. |
 | 6 | `release-verify` fails | Do not publish; the message names the failed check. To rebuild under the same tag, delete the draft with `gh release delete <TAG> --yes`, recreate it with `gh run rerun <run-id>` on the tag's CI run, run step 4 with `RELEASE_REBUILD=1`, then step 5. |
