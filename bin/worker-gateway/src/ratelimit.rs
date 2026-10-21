@@ -564,6 +564,8 @@ impl PerIpLimiter {
     /// meters only the prefixes beyond the cap. Bounded memory is still chosen
     /// over perfect per-IP fairness: an honest client first seen while every
     /// tracked entry is busy shares that budget until a sweep frees a slot.
+    /// Every charge metered there, admitted or not, counts in
+    /// `tn_worker_gateway_rate_limit_overflow_total`.
     fn admit_new_ip(
         &self,
         buckets: &mut HashMap<IpAddr, Bucket>,
@@ -588,9 +590,9 @@ impl PerIpLimiter {
         } else {
             // Table full of busy entries: share the overflow bucket (bounded
             // memory over per-IP fairness).
-            lock(&self.overflow)
-                .try_admit_then(now, rate, capacity, cost, then)
-                .then_some(PerIpReceipt::Overflow)
+            let admitted = lock(&self.overflow).try_admit_then(now, rate, capacity, cost, then);
+            crate::telemetry::record_rate_limit_overflow();
+            admitted.then_some(PerIpReceipt::Overflow)
         }
     }
 
@@ -1963,6 +1965,33 @@ mod tests {
         assert_eq!(limiters.per_ip_len(), 2, "untracked clients must not add entries");
         // A tracked client keeps its own bucket, which still holds a token.
         assert!(limiters.check(Some(ip(1))).is_ok());
+    }
+
+    /// A charge metered on the overflow bucket is counted, so an operator can
+    /// see first-seen clients sharing one client's budget; a tracked client's
+    /// request, charged to its own bucket, is not.
+    #[test]
+    fn overflow_charges_are_counted() {
+        const OVERFLOW: &str = "tn_worker_gateway_rate_limit_overflow_total";
+        let mut metrics = crate::telemetry::test_utils::CapturedMetrics::install();
+        let limiters = one_entry_limiters(ManualClock::new());
+        let tracked = limiters.check_edge(Some(ip(1))).expect("edge").expect("a budget");
+        assert!(tracked.charge(false).is_ok());
+        assert_eq!(limiters.per_ip_len(), 1);
+        assert_eq!(
+            metrics.value(OVERFLOW, &[]),
+            0.0,
+            "a client the table had room for was counted"
+        );
+        // the table is full of a busy entry and was swept less than an interval
+        // ago, so the second client is metered on the overflow bucket
+        let untracked = limiters.check_edge(Some(ip(2))).expect("edge").expect("a budget");
+        assert!(untracked.charge(false).is_ok());
+        assert_eq!(limiters.per_ip_tokens(ip(2)), None, "the full table tracked a second client");
+        assert_eq!(metrics.value(OVERFLOW, &[]), 1.0);
+        let again = limiters.check_edge(Some(ip(1))).expect("edge").expect("a budget");
+        assert!(again.charge(false).is_ok());
+        assert_eq!(metrics.value(OVERFLOW, &[]), 1.0, "a tracked client's own bucket was counted");
     }
 
     #[test]

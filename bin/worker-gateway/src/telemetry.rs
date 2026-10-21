@@ -64,6 +64,10 @@
 //! [`record_accept_error`] counts failed `accept()` calls on either listener,
 //! by `listener` and `kind`; its warnings are throttled, the counter is not.
 //!
+//! [`record_rate_limit_overflow`] counts the charges the rate limiter meters on
+//! the one overflow bucket shared by the clients a full per-IP table cannot
+//! track (see [`crate::ratelimit`]).
+//!
 //! [`ConnectionSlot`] pairs an accepted client connection's
 //! `--max-connections` permit with `tn_worker_gateway_open_connections`, so the
 //! gauge always equals the slots held; at the cap, new connections wait in the
@@ -162,6 +166,13 @@ const ACCESS_LOG_SUPPRESSED_TOTAL: &str = "tn_worker_gateway_access_log_suppress
 /// process, such as fd exhaustion, which the accept loop backs off from). A
 /// failed accept holds no connection, so no connection series counts it.
 const ACCEPT_ERRORS_TOTAL: &str = "tn_worker_gateway_accept_errors_total";
+
+/// Charges the rate limiter metered on its per-IP overflow bucket (a request's
+/// first call at the edge, or a batch's calls beyond the first) because the
+/// full per-IP table could not track their client, whether that bucket admitted
+/// them or not. A non-zero rate means those clients are sharing one client's
+/// budget until a sweep frees idle entries.
+const RATE_LIMIT_OVERFLOW_TOTAL: &str = "tn_worker_gateway_rate_limit_overflow_total";
 
 /// How long a [`Throttle`] stays quiet after it lets a line through.
 const THROTTLE_WINDOW: Duration = Duration::from_secs(10);
@@ -348,6 +359,12 @@ pub(crate) fn record_access_log_suppressed() {
 /// `kind` `connection` or `resource`.
 pub(crate) fn record_accept_error(listener: &'static str, kind: &'static str) {
     counter!(ACCEPT_ERRORS_TOTAL, "listener" => listener, "kind" => kind).increment(1);
+}
+
+/// Record a charge metered on the per-IP overflow bucket, admitted or not,
+/// because the full per-IP table could not track its client.
+pub(crate) fn record_rate_limit_overflow() {
+    counter!(RATE_LIMIT_OVERFLOW_TOTAL).increment(1);
 }
 
 /// Record one name resolution with its `result` (`hit`, `miss`, `error` or
@@ -707,6 +724,16 @@ mod tests {
         record_cancelled();
         assert_eq!(metrics.value(REQUESTS_TOTAL, &[("outcome", "cancelled")]), 1.0);
         assert_eq!(REQUESTS_TOTAL, "tn_worker_gateway_requests_total");
+    }
+
+    /// The overflow counter's name is part of the metrics contract; pin it.
+    #[test]
+    fn record_rate_limit_overflow_writes_the_counter() {
+        let mut metrics = test_utils::CapturedMetrics::install();
+        record_rate_limit_overflow();
+        record_rate_limit_overflow();
+        assert_eq!(metrics.value(RATE_LIMIT_OVERFLOW_TOTAL, &[]), 2.0);
+        assert_eq!(RATE_LIMIT_OVERFLOW_TOTAL, "tn_worker_gateway_rate_limit_overflow_total");
     }
 
     #[test]
