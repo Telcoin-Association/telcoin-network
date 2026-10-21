@@ -754,12 +754,41 @@ mod tests {
         assert_eq!(ACCEPT_ERRORS_TOTAL, "tn_worker_gateway_accept_errors_total");
     }
 
+    /// In-memory log sink for a scoped fmt subscriber.
+    #[derive(Clone, Default)]
+    struct CapturedLogs(Arc<Mutex<Vec<u8>>>);
+
+    impl CapturedLogs {
+        fn text(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().unwrap_or_else(PoisonError::into_inner))
+                .into_owned()
+        }
+    }
+
+    impl std::io::Write for CapturedLogs {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap_or_else(PoisonError::into_inner).extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
     /// A count still pending when shutdown fires is written on a last summary
     /// line, however little of its window has passed, and the task then ends.
     #[tokio::test]
     async fn throttle_summaries_flush_pending_counts_on_shutdown() {
         static THROTTLE: Throttle = Throttle::new("shutdown_flush_test");
         static THROTTLES: [&Throttle; 1] = [&THROTTLE];
+        // the test runs on a current-thread runtime, so a thread-local default
+        // subscriber sees the summary task's line
+        let captured = CapturedLogs::default();
+        let writer = captured.clone();
+        let subscriber =
+            tracing_subscriber::fmt().with_ansi(false).with_writer(move || writer.clone()).finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
         // the first event is logged, the second only counted
         assert_eq!(THROTTLE.admit(), Some(0));
         assert_eq!(THROTTLE.admit(), None);
@@ -772,5 +801,16 @@ mod tests {
             .expect("ok");
         // the shutdown pass took the pending count, so nothing is left to summarize
         assert_eq!(THROTTLE.flush_at(Instant::now() + THROTTLE_WINDOW * 2), None);
+        // and wrote it on exactly one summary line naming the site
+        let logs = captured.text();
+        let lines: Vec<&str> =
+            logs.lines().filter(|line| line.contains("shutdown_flush_test")).collect();
+        let [line] = lines.as_slice() else {
+            panic!("exactly one line must name the site:\n{logs}");
+        };
+        assert!(line.contains(" WARN "), "{line}");
+        assert!(line.contains("site=\"shutdown_flush_test\""), "{line}");
+        assert!(line.contains("suppressed=1"), "{line}");
+        assert!(line.contains("warnings suppressed since the last line"), "{line}");
     }
 }
