@@ -1052,9 +1052,11 @@ fn a_dropped_tables_handle_is_stale_only_in_later_snapshots() {
     assert_eq!(env.failure(), None);
 }
 
-/// A remembered root serves only a handle with its name as well as its id. Ids are unique over
-/// one file's life and a table is never renamed, so the only handle with the same id and another
-/// name comes from another file.
+/// A remembered root serves only a handle with its name as well as its id. A table is never
+/// renamed and a committed table's id is never given again, yet two handles can carry one id
+/// under two names: one of another file, and in one file one of a table an aborted transaction
+/// created, as `RwTxn::new` starts from the committed `next_table_id`, so the next table created
+/// takes that id. Neither reaches the table holding the id, in a read or a write transaction.
 #[test]
 fn a_remembered_root_needs_the_handles_name_too() {
     let (_dir, path) = temp();
@@ -1080,6 +1082,27 @@ fn a_remembered_root_needs_the_handles_name_too() {
     if cfg!(debug_assertions) {
         assert_eq!(catalog_resolves() - start, 4, "only the refused handle went to the catalog");
     }
+
+    // In one file: an aborted create's id goes to the next table created, "b".
+    let mut txn = env.begin_rw().expect("begin");
+    let a = txn.create_table("a").expect("create");
+    txn.abort();
+    put_all(&env, "b", &[(b"k", b"b")]);
+    let ro = env.begin_ro().expect("ro");
+    let b = table(&ro, "b");
+    assert_eq!(a.id(), b.id(), "the same id in one file");
+    assert_eq!(val(&ro, &b, b"k").as_deref(), Some(&b"b"[..]));
+    for txn in [&ro, &env.begin_ro().expect("ro")] {
+        assert!(matches!(txn.get(&a, b"k"), Err(Error::StaleTable(_))));
+        assert!(matches!(txn.table_stat(&a), Err(Error::StaleTable(_))));
+    }
+    // A write transaction holding b's working record refuses the handle too, and b is unchanged.
+    let mut txn = env.begin_rw().expect("begin");
+    txn.put(&b, b"j", b"b").expect("put");
+    assert!(matches!(txn.get(&a, b"k"), Err(Error::StaleTable(_))));
+    assert!(matches!(txn.put(&a, b"k", b"a"), Err(Error::StaleTable(_))));
+    assert_eq!(val(&txn, &b, b"k").as_deref(), Some(&b"b"[..]));
+    txn.abort();
     assert_eq!(env.failure(), None);
 }
 

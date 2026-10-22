@@ -280,3 +280,80 @@ fn seek_with_key_tail_is_a_seek_then_current_with_key_tail() {
     assert_eq!(key, landed, "the key a reseek finds");
     txn.abort();
 }
+
+/// `seek_with_key_tail` takes a detached write cursor out of its end and deleted states, as
+/// `seek` does: after `last`, after `prev` from an unset cursor (each ends the table for `next`
+/// and `next_in_prefix`) and after `delete_current` (the cursor on the follower, which `next`
+/// would return), the steps after it (`next` or `next_in_prefix` first, then `current`, `prev`
+/// and `next`) agree with a twin cursor's after the same state, `seek` and
+/// `current_with_key_tail`.
+#[test]
+fn seek_with_key_tail_clears_a_txn_cursors_end_and_deleted_states() {
+    let (_dir, path) = temp("tndb-b-seek-key-tail-states");
+    let env = open(&path, SyncMode::Durable);
+    let table = filled(&env);
+    let mut txn = env.begin_rw().expect("rw");
+    let mut fused = txn.cursor_detached(&table).expect("cursor_detached");
+    let mut twin = txn.cursor_detached(&table).expect("cursor_detached");
+    // A hit, a miss between keys, a miss before a key part's first row (each with a row after it
+    // in its key part), the last row, and past every row.
+    let probes = [
+        row_key(10),
+        [&row_key(29)[..], &[0]].concat(),
+        row_key(90)[..KEY].to_vec(),
+        row_key(ROWS - 1),
+        vec![0xFF; KEY + SUB + 1],
+    ];
+    let (mut victim, mut stepped) = (150, 0);
+    for (n, probe) in probes.iter().enumerate() {
+        for (s, before) in ["last", "prev from unset", "delete_current"].into_iter().enumerate() {
+            match before {
+                "last" => {
+                    for c in [&mut fused, &mut twin] {
+                        assert!(c.last(&txn).expect("last").is_some());
+                    }
+                }
+                "prev from unset" => {
+                    for c in [&mut fused, &mut twin] {
+                        assert_eq!(c.seek_exact(&txn, b"").expect("a miss unsets"), None);
+                        assert!(c.prev(&txn).expect("prev").is_some());
+                    }
+                }
+                _ => {
+                    // The twin finds the deleted entry gone at its next call: on the follower in
+                    // the deleted state, as the deleting cursor is.
+                    for c in [&mut fused, &mut twin] {
+                        assert!(c.seek(&txn, &row_key(victim)).expect("seek").is_some());
+                    }
+                    assert!(fused.delete_current(&mut txn).expect("delete_current"));
+                    victim += 1;
+                }
+            }
+            if before != "delete_current" {
+                // The end is set: `next` returns nothing and keeps it.
+                assert_eq!(fused.next(&txn).expect("next"), None, "{before}");
+            }
+            let t = TAILS[(n + s) % TAILS.len()];
+            let got = fused.seek_with_key_tail(&txn, probe, t).expect("seek_with_key_tail");
+            twin.seek(&txn, probe).expect("seek");
+            let want = twin.current_with_key_tail(&txn, t).expect("tail");
+            assert_eq!(got, want, "{before}, probe {probe:?}");
+            let first = if (n + s) % 2 == 0 {
+                (own(fused.next(&txn).unwrap()), own(twin.next(&txn).unwrap()))
+            } else {
+                let step = |c: &mut crate::TxnCursor| own(c.next_in_prefix(&txn, KEY).unwrap());
+                (step(&mut fused), step(&mut twin))
+            };
+            assert_eq!(first.0, first.1, "{before}, probe {probe:?}: the first step");
+            stepped += usize::from(first.1.is_some());
+            let current = (own(fused.current(&txn).unwrap()), own(twin.current(&txn).unwrap()));
+            assert_eq!(current.0, current.1, "{before}, probe {probe:?}: current");
+            let back = (own(fused.prev(&txn).unwrap()), own(twin.prev(&txn).unwrap()));
+            assert_eq!(back.0, back.1, "{before}, probe {probe:?}: prev");
+            let on = (own(fused.next(&txn).unwrap()), own(twin.next(&txn).unwrap()));
+            assert_eq!(on.0, on.1, "{before}, probe {probe:?}: next");
+        }
+    }
+    assert!(stepped >= 9, "{stepped} first steps landed on an entry");
+    txn.abort();
+}

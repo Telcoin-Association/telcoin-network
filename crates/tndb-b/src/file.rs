@@ -12,6 +12,10 @@
 //! the base moves) and retires the old mapping, keeping it mapped until the file drops, so a
 //! reader that loaded the old base still reads live memory.
 //!
+//! The writer's mapping is an [`MmapRaw`], which hands out only raw pointers: every page slice,
+//! the writer's and the readers' alike, is formed from the base pointer over exactly its own
+//! bytes, so no reference to the whole mapping ever exists beside a reader's slice.
+//!
 //! ## Growth
 //!
 //! [`PageFile::ensure_len`] grows geometrically: to at least the length asked for, and at least by
@@ -47,7 +51,7 @@ use std::{
     },
 };
 
-use memmap2::{Mmap, MmapMut, MmapOptions};
+use memmap2::{Mmap, MmapOptions, MmapRaw};
 
 use crate::{
     error::{Error, Result},
@@ -64,9 +68,11 @@ pub(crate) const MIN_GROWTH: u64 = 1 << 20;
 pub(crate) const MAX_GROWTH: u64 = 1 << 30;
 
 /// A reader's view of a page file's mapping that needs no lock: the mapping's base address and
-/// length, plus a length the owner has published as readable. Shared (`Arc`) between the file and
-/// its readers; the file updates the mapping fields whenever its mapping moves, and the owner
-/// advances [`Self::publish_len`].
+/// length, plus a length the owner has published as readable. One view, shared (`Arc`) between the
+/// file, its readers' snapshots and, in an environment, the writer, which holds a clone of its own
+/// (`Writer::view`) to borrow a copy-on-write source. The file updates the mapping fields in place
+/// whenever its mapping moves, so every clone, the writer's like the readers', follows it without
+/// a refresh; the owner advances [`Self::publish_len`].
 ///
 /// Validity: a slice from [`Self::slice`] borrows mapped memory. The owner must keep the file open
 /// while any reader can reach the view; a mapping replaced while the view is shared is retired
@@ -128,15 +134,16 @@ impl MapView {
 #[derive(Debug)]
 pub(crate) struct PageFile {
     file: File,
-    /// The current mapping: shared, read-write, over the reservation `[0, map.len())`.
-    map: MmapMut,
+    /// The current mapping: shared, read-write, over the reservation `[0, map.len())`. Only ever
+    /// reached through its raw pointer ([`MmapRaw::as_ptr`], [`MmapRaw::as_mut_ptr`]).
+    map: MmapRaw,
     /// The physical file length (`<= map.len()`): the writer's accessors stop here.
     len: u64,
     /// The lock-free reader view of the current mapping.
     view: Arc<MapView>,
     /// Mappings replaced while [`Self::view`] was shared: kept mapped until this file drops so a
     /// reader still holding an old base stays valid.
-    retired: Vec<MmapMut>,
+    retired: Vec<MmapRaw>,
     /// Set when a growth extended the file since the last size sync (see
     /// [`Self::sync_size_if_grown`]).
     size_unsynced: AtomicBool,
@@ -245,13 +252,16 @@ impl PageFile {
     }
 
     /// Map a new reservation of `max(target, 2 × the current one)` bytes and point the view at it,
-    /// retiring the old mapping if a reader may hold its base (else it unmaps here).
+    /// retiring the old mapping if a clone of the view may hold its base (else it unmaps here).
     fn remap(&mut self, target: u64) -> Result<()> {
         let reserve = target.max((self.map.len() as u64).saturating_mul(2));
         let old = std::mem::replace(&mut self.map, map_reservation(&self.file, reserve)?);
         self.view.set_mapping(self.map.as_ptr(), self.map.len() as u64);
-        // `&mut self` means the writer holds no page borrow, and a reader can only borrow through
-        // its own clone of the view: with no clone, nothing can still point into `old`.
+        // `&mut self` means the writer holds no page borrow through the file, and every other
+        // borrow goes through a clone of the view: a reader's, or the writer's own
+        // (`Writer::view`), which `set_mapping` has just updated in place like the readers'. With
+        // no clone, nothing can still point into `old`. An environment always holds clones (the
+        // writer's and the current snapshot's), so there the old mapping is always retired.
         if Arc::strong_count(&self.view) > 1 {
             self.retired.push(old);
         }
@@ -276,13 +286,16 @@ impl PageFile {
     pub(crate) fn pages(&self, pgno: u32, page_size: usize, len: usize) -> Option<&[u8]> {
         let start = self.page_offset(pgno, page_size, len)?;
         // SAFETY: the pages lie within the file and so within the live mapping (`len <=
-        // map.len()`). Nothing writes them while this shared borrow lives: the only writer is
-        // this file's owner, through `pages_mut`, which needs `&mut self`.
+        // map.len()`), and the slice is formed from the mapping's raw pointer over exactly those
+        // bytes. Nothing writes them while this shared borrow lives: the only writer is this
+        // file's owner, through `pages_mut`, which needs `&mut self`.
         Some(unsafe { std::slice::from_raw_parts(self.map.as_ptr().add(start), len) })
     }
 
-    /// Borrow page `pgno` (of `page_size` bytes) mutably, through the mapping's raw pointer so only
-    /// that page is borrowed: readers may hold slices of other pages meanwhile.
+    /// Borrow page `pgno` (of `page_size` bytes) mutably, through the mapping's raw pointer
+    /// ([`MmapRaw::as_mut_ptr`], which forms no reference to the mapping) so only that page is
+    /// borrowed: readers, and the writer's own copy-on-write source, may hold slices of other
+    /// pages meanwhile.
     ///
     /// The tree layer upholds the rule that makes this sound: the writer mutates only its private
     /// pages (pages it allocated in this transaction, which no reader's snapshot reaches), so no
@@ -305,9 +318,10 @@ impl PageFile {
             Some(start) if !self.is_poisoned() => start,
             _ => return Err(self.page_mut_error(pgno)),
         };
-        // SAFETY: the pages lie within the file and so within the live mapping, `&mut self` makes
-        // this the only writer and the only borrow through `self`, and no reader reaches the pages
-        // (see above).
+        // SAFETY: the pages lie within the file and so within the live mapping, and the slice is
+        // formed from the mapping's raw pointer over exactly those bytes, so it overlaps no slice
+        // of another page. `&mut self` makes this the only writer and the only borrow through
+        // `self`, and no reader reaches the pages (see above).
         Ok(unsafe { std::slice::from_raw_parts_mut(self.map.as_mut_ptr().add(start), len) })
     }
 
@@ -355,7 +369,8 @@ impl PageFile {
         let aligned = start - start % os_page_size();
         let base = self.map.as_ptr();
         // SAFETY: `[aligned, end)` lies within the file and so within the live mapping; `msync`
-        // reads no Rust memory.
+        // reads no Rust memory, and `base` is the mapping's raw pointer, so no reference to the
+        // mapping is formed.
         let rc = unsafe {
             libc::msync(
                 base.add(aligned as usize).cast_mut().cast(),
@@ -446,14 +461,17 @@ impl Drop for ReadOnlyFile {
     }
 }
 
-/// Map `[0, len)` of `file` (at least one OS page) read-write and shared. The range may extend
-/// past the end of file; those pages are never touched.
-fn map_reservation(file: &File, len: u64) -> Result<MmapMut> {
+/// Map `[0, len)` of `file` (at least one OS page) read-write and shared (`PROT_READ |
+/// PROT_WRITE`, `MAP_SHARED`). The range may extend past the end of file; those pages are never
+/// touched.
+fn map_reservation(file: &File, len: u64) -> Result<MmapRaw> {
     let len = usize::try_from(len.max(os_page_size())).map_err(io::Error::other)?;
-    // SAFETY: the file is only modified through this mapping by its single writer (the database
-    // holds an exclusive lock on it), and the pages past the end of file are never touched: the
-    // writer's accessors stop at the file length, readers at the published length.
-    Ok(unsafe { MmapOptions::new().len(len).map_mut(file) }?)
+    // `map_raw` is safe because an `MmapRaw` hands out only raw pointers; the slices this file
+    // forms from them are sound because the file is only modified through this mapping by its
+    // single writer (the database holds an exclusive lock on it), and the pages past the end of
+    // file are never touched: the writer's accessors stop at the file length, readers at the
+    // published length.
+    Ok(MmapOptions::new().len(len).map_raw(file)?)
 }
 
 #[cfg(test)]

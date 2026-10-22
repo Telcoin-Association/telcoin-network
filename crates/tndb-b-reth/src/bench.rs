@@ -73,7 +73,9 @@
 //! - `TNDB_RETH_BENCH_ENGINES`: `tndb`, `mdbx` or both (default), to profile one side.
 //! - `TNDB_RETH_BENCH_SYNC`: `durable` (default) or `nosync`. With `nosync` both sides skip every
 //!   commit sync (tndb [`SyncMode::NoSync`](crate::SyncMode::NoSync), MDBX `UtterlyNoSync`), so the
-//!   write rows time the CPU alone, even on a real disk. It is never the gate.
+//!   write rows time the CPU alone, even on a real disk. It is never the gate: the table's header
+//!   row then reads `bench (nosync: CPU only, not the gate)`, so the gate loop's `grep '^|'` keeps
+//!   the mark, and the notes say the write rows are CPU only.
 //! - `TNDB_RETH_BENCH_MDBX_PAGE`: MDBX's page size (default reth's: the OS page size, clamped to 4
 //!   KiB..=64 KiB). On Apple Silicon the OS page is 16 KiB; `4096` there gives the like-for-like
 //!   column, which on Linux x86_64 is the default.
@@ -83,7 +85,8 @@
 //! - On macOS `msync` and `fsync` do not flush the drive's cache, so commits cost far less than on
 //!   Linux, where every durable commit takes the file system's sync path. The Linux run decides.
 //! - The write rows of `measure_table_db` and `measure_dupsort_db` are one transaction of 10 to
-//!   1000 rows into a fresh environment: their time is mostly the commit.
+//!   1000 rows into a fresh environment: their time is mostly the commit (under `nosync`, which
+//!   syncs no commit, the CPU alone).
 //! - Keys are encoded and values compressed by reth's codecs on both sides; that cost is common to
 //!   both columns.
 //! - The run prints its temp dir (on Linux with its file system) and stops if that is a tmpfs or
@@ -573,8 +576,12 @@ impl Bench {
         self.rows.push(Row { label, ops: 0, cells });
     }
 
+    /// Print the rows as a table. Under `nosync` the first column's header names the mode, so a
+    /// filter that keeps only the table's lines (`grep '^|'`) keeps the mark too.
     fn print(&self) {
-        let header = ["bench", "ops", "tndb", "MDBX", "tndb/MDBX"];
+        let first =
+            if self.dirs.open.no_sync { "bench (nosync: CPU only, not the gate)" } else { "bench" };
+        let header = [first, "ops", "tndb", "MDBX", "tndb/MDBX"];
         let lines: Vec<[String; 5]> = self
             .rows
             .iter()
@@ -1157,12 +1164,17 @@ fn tndb_reth_vs_mdbx() {
         MEASURE.as_millis()
     );
     bench.print();
+    let sync_note = if bench.dirs.open.no_sync {
+        "nosync: neither side syncs a commit, so the write rows time the CPU alone; compare them \
+         with no durable run, and never use them for the gate."
+    } else {
+        "on macOS msync/fsync do not flush the drive cache, so commits cost far less than on \
+         Linux; the Linux run decides. The table write rows (SeqWrite, RandomWrite) are one \
+         transaction into a fresh environment, so their time is mostly the commit."
+    };
     println!(
-        "\nNotes: on macOS msync/fsync do not flush the drive cache, so commits cost far less than \
-         on Linux; the Linux run decides. The table write rows (SeqWrite, RandomWrite) are one \
-         transaction into a fresh environment, so their time is mostly the commit. hash_keys \
-         sorts its input before the timer (reth's bench times the sort too). Sizes are the \
-         table's pages times the page size."
+        "\nNotes: {sync_note} hash_keys sorts its input before the timer (reth's bench times the \
+         sort too). Sizes are the table's pages times the page size."
     );
 }
 

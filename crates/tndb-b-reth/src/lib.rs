@@ -115,8 +115,10 @@
 //!   sorting at or before that row's rest, makes `seek_by_key_subkey` take the row after: the seek
 //!   key `k ‖ s` sorts after the row's stored key `k ‖ s[..W]`, of which it is a longer copy, while
 //!   MDBX compares the row's whole value (subkey, then the rest) with `s` and takes the row. No
-//!   reth subkey type encodes wider than W, so only a raw view (`RawDupSort`) meets this;
-//!   `seek_by_key_subkey_longer_than_the_stack_buffer_matches_mdbx` pins it beside MDBX's result.
+//!   reth subkey type encodes wider than W, so only a raw view (`RawDupSort`) meets this (the
+//!   differential test's typed subkeys never do); `known_dup_cursor_deviations_from_mdbx` pins it
+//!   beside MDBX's result, and `seek_by_key_subkey_longer_than_the_stack_buffer_matches_mdbx` with
+//!   seek keys at and past the cursor's stack buffer.
 //!
 //! The cursor positions. Right after a delete the cursor is on the follower as MDBX's is
 //! (`current` returns it, `delete_current` deletes it, `delete_current_duplicates` deletes its

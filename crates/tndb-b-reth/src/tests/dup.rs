@@ -568,6 +568,12 @@ fn dup_cursor_steps_after_a_delete_or_last_match_mdbx() {
 ///   `next_no_dup` do not see a later key the transaction appends; and a missed
 ///   `seek_by_key_subkey` past such a key's row, from a cursor that has moved, leaves MDBX's cursor
 ///   on that row. tndb-b's steps from the new row, takes the later key, and is unset.
+/// - **A raw subkey wider than the layout's W** (pinned after the table, on `PlainStorageState`'s
+///   raw view, [`put_wide_rows`]): when it starts with a row's subkey and its bytes past W sort at
+///   or before that row's rest, MDBX's `seek_by_key_subkey` takes the row, since it compares the
+///   row's whole value with the subkey. tndb-b's takes the row after, since its seek key is a
+///   longer copy of the row's stored key (`key ‖ subkey` against `key ‖ subkey[..W]`), so sorts
+///   after it. No reth subkey type encodes wider than W.
 ///
 /// Not run on MDBX, where libmdbx fails an assertion and aborts: `last_dup` before the first row
 /// (here: `None`); and, in `tree_rebalance`, `delete_current` after the transaction gives the
@@ -630,6 +636,19 @@ fn known_dup_cursor_deviations_from_mdbx() {
     assert_eq!(row(c.first()), "1/1");
     assert_eq!(row(c.prev()), "none");
     assert_eq!(val(c.last_dup()), "none", "last_dup before the first row");
+    drop(c);
+    drop(tx);
+
+    // A raw subkey wider than the layout's: subkey 4 of key 2, then bytes that sort before the
+    // row's rest (three 7s) or equal it. MDBX takes the row; tndb-b takes the row after (6).
+    put_wide_rows::<PlainStorageState, _>(&mdbx);
+    put_wide_rows::<PlainStorageState, _>(&db);
+    let layout = dup_layout(PlainStorageState::NAME).unwrap();
+    for past in [&[0][..], &[7, 7, 7]] {
+        let (key, subkey) = (wide_key(layout, 2), [wide_subkey(layout, 4), past.to_vec()].concat());
+        assert_eq!(seek_taken(&mdbx, key.clone(), subkey.clone()), Some(4), "MDBX, {past:?}");
+        assert_eq!(seek_taken(&db, key, subkey), Some(6), "tndb-b, {past:?}");
+    }
 }
 
 /// Checks table `T`'s layout against reth's encodings: `key`'s width, the width of `value`'s
@@ -767,15 +786,10 @@ fn wide_subkey(layout: DupLayout, n: u8) -> Vec<u8> {
     wide(layout.subkey, 0x30, n)
 }
 
-/// Rows of the raw view of dup-sort table `T` at its layout's widths ([`wide_key`],
-/// [`wide_subkey`]), key 1 at subkeys 3 and 5, key 2 at 2, 4 and 6, key 4 at 1 and 5 (no key of
-/// one row, where MDBX's cursor misbehaves), each value's rest after the subkey three 7s; then
-/// [`seeks_through`] a read cursor and a write one.
-fn subkey_seeks<T: DupSort, D: Database>(db: &D, seeks: &[(Vec<u8>, Vec<u8>)]) -> Vec<String>
-where
-    T::Key: Debug,
-    T::Value: Debug,
-{
+/// Commits rows of the raw view of dup-sort table `T` at its layout's widths ([`wide_key`],
+/// [`wide_subkey`]): key 1 at subkeys 3 and 5, key 2 at 2, 4 and 6, key 4 at 1 and 5 (no key of
+/// one row, where MDBX's cursor misbehaves), each value's rest after the subkey three 7s.
+fn put_wide_rows<T: DupSort, D: Database>(db: &D) {
     let layout = dup_layout(T::NAME).unwrap();
     let tx = db.tx_mut().unwrap();
     for (k, sk) in [(1, 3), (1, 5), (2, 2), (2, 4), (2, 6), (4, 1), (4, 5)] {
@@ -784,6 +798,16 @@ where
             .unwrap();
     }
     tx.commit().unwrap();
+}
+
+/// The rows of [`put_wide_rows`] in dup-sort table `T`, then [`seeks_through`] a read cursor and
+/// a write one.
+fn subkey_seeks<T: DupSort, D: Database>(db: &D, seeks: &[(Vec<u8>, Vec<u8>)]) -> Vec<String>
+where
+    T::Key: Debug,
+    T::Value: Debug,
+{
+    put_wide_rows::<T, _>(db);
     let mut log = Vec::new();
     let tx = db.tx().unwrap();
     let mut c = tx.cursor_dup_read::<RawDupSort<T>>().unwrap();
@@ -864,6 +888,8 @@ fn seek_by_key_subkey_matches_mdbx_at_every_layouts_widths() {
 /// takes the row, while here the seek key `key ‖ subkey` sorts after the row's stored key
 /// `key ‖ subkey[..32]`, of which it is a longer copy, so it takes the row after. No reth
 /// subkey is wider than its table's layout, so only a raw one meets this.
+/// `known_dup_cursor_deviations_from_mdbx` pins it with short subkeys; this test pins it with
+/// subkeys at and past the stack buffer's limit.
 #[test]
 fn seek_by_key_subkey_longer_than_the_stack_buffer_matches_mdbx() {
     let (_mdbx_dir, mdbx) = create_mdbx_db();

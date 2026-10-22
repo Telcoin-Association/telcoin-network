@@ -495,7 +495,9 @@ impl TreeCursor {
     }
 
     /// Descend from the root along `edge` and settle on an entry: forward from where a
-    /// [`Edge::First`] or [`Edge::Key`] descent lands, backward for [`Edge::Last`].
+    /// [`Edge::First`] or [`Edge::Key`] descent lands, backward for [`Edge::Last`]. An
+    /// [`Edge::Exact`] descent never comes here: [`Self::find`] makes it, as a miss leaves the
+    /// cursor unset rather than settled on the next entry, and a hit takes the search's value.
     fn start<'s, S: PageRead + ?Sized>(
         &mut self,
         store: &'s S,

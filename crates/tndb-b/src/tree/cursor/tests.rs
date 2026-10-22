@@ -1042,6 +1042,71 @@ fn damage_under_a_cursor_is_corrupt() {
     assert_eq!(scan(&store.reader(), &root, false).expect("scan"), n as usize);
 }
 
+/// Two damages on one page meet the descent's checks in their order (the fetch and identity, the
+/// kind for the level, the header, the separator range, the empty page), so the error names the
+/// first check the page fails: a leaf made a branch at the leaf level whose header is broken too
+/// (flags, `nkeys` or `upper`) is refused by the kind check, not by the header parser; a root
+/// cell pointed at the last leaf, a leaf where a branch belongs holding keys past the cell's
+/// range, by the kind check, not by the range check.
+#[test]
+fn the_descent_names_the_first_check_a_page_fails() {
+    /// The header fields broken (`page.rs`): the kind and flags bytes, then `nkeys` and `upper`,
+    /// each a little-endian `u16`.
+    const KIND: usize = 4;
+    const FLAGS: usize = 5;
+    const NKEYS: usize = 6;
+    const UPPER: usize = 16;
+    fn message<T: std::fmt::Debug>(r: Result<T>) -> String {
+        match r {
+            Err(Error::Corrupt(m)) => m,
+            other => panic!("not Corrupt: {other:?}"),
+        }
+    }
+    let (mut store, root) = even_tree(1_000);
+    assert_eq!(root.height, 3, "the root's children are branches");
+    let leaves = walk_tree(&store.reader(), &root).leaves;
+
+    let leaf = leaves[0];
+    let saved = store.raw(leaf).to_vec();
+    let branch_kind = store.raw(root.root)[KIND];
+    let want = format!("page {leaf} is a Branch at depth 3 of a tree of height 3");
+    for what in ["flags", "nkeys", "upper"] {
+        let page = store.raw_mut(leaf);
+        page[KIND] = branch_kind;
+        match what {
+            "flags" => page[FLAGS] = 1,
+            "nkeys" => page[NKEYS..NKEYS + 2].copy_from_slice(&u16::MAX.to_le_bytes()),
+            _ => {
+                let len = u16::try_from(page.len()).expect("a 4 KiB page");
+                page[UPPER..UPPER + 2].copy_from_slice(&len.to_le_bytes());
+            }
+        }
+        store.restamp(leaf);
+        let header = message(View::new(store.raw(leaf)).map(|_| ()));
+        assert!(header.starts_with(&format!("page {leaf}: ")), "{what}: {header}");
+        let s = &store.reader();
+        assert_eq!(message(TreeCursor::default().seek(s, &root, &key_of(0))), want, "{what}");
+        assert_eq!(message(TreeCursor::default().first(s, &root)), want, "{what}: first");
+        store.raw_mut(leaf).copy_from_slice(&saved);
+    }
+
+    // The last leaf's own txn in the cell, so the fetch's identity check passes.
+    let original = store.raw(root.root).to_vec();
+    let last = *leaves.last().expect("leaves");
+    let txn = page::txn(store.raw(last)) as u32;
+    let separator = page::branch_key(&original, 1).expect("separator");
+    let first = page::leaf_key(store.raw(last), 0).expect("key");
+    assert!(first >= separator, "the leaf's keys lie outside cell 0's range");
+    page::branch_set_child(store.raw_mut(root.root), 0, last, txn).expect("set");
+    store.restamp(root.root);
+    let want = format!("page {last} is a Leaf at depth 2 of a tree of height 3");
+    let s = &store.reader();
+    assert_eq!(message(TreeCursor::default().seek(s, &root, &key_of(0))), want, "a misrouted cell");
+    assert_eq!(message(TreeCursor::default().first(s, &root)), want, "a misrouted cell: first");
+    store.raw_mut(root.root).copy_from_slice(&original);
+    assert_eq!(scan(&store.reader(), &root, true).expect("scan"), 1_000);
+}
+
 fn temp_env() -> (TempDir, Env) {
     let dir = TempDir::with_prefix("tndb_b_cursor").expect("temp dir");
     let env = Env::open(dir.path().join("db"), EnvOptions::default()).expect("open");

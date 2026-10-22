@@ -14,20 +14,22 @@
 //! table as after `last`, as MDBX leaves it. A write refused for its size leaves the cursor where
 //! it was, in whatever state, as MDBX's refusal does.
 //!
-//! On a dup-sort table (stored as composite keys, see [`crate::dup`]) each row read is read again
-//! once the move is done, with its value (subkey, then the rest) as one slice of the page, which
-//! the engine's `current_with_key_tail` gives since a leaf cell holds its value right after its
+//! On a dup-sort table (stored as composite keys, see [`crate::dup`]) a row's value (subkey, then
+//! the rest) is read as one slice of the page, since a leaf cell holds its value right after its
 //! key: no copy, unless the value is in an overflow run, whose rest is joined to the subkey in a
-//! buffer of the cursor's. The dup moves are the engine's prefix
-//! steps over the key's width: `next_dup` and `prev_dup` stay within the current key's rows, from
-//! a fresh cursor `next_dup`, `next_no_dup` and `next_dup_val` go to the first row and `prev_dup`
-//! to the last, as MDBX's do. Where MDBX's cursor ends a key's rows, the cursor does too (its
-//! `Pos::DupEnd` state): after `last`, and after a delete of a key's last row that leaves the key
-//! earlier rows, which puts the cursor on the row before the deleted one. There `next_dup` finds
-//! nothing and `next` goes to the next key; right after that delete `current`, `prev` and
-//! `prev_dup` return the row before (now the key's last) and `delete_current` is `MDBX_ENODATA`,
-//! as MDBX's do. Right after a delete that leaves a key no rows (`Pos::KeyDeleted`) the cursor is
-//! on the next key's first row, where `prev_dup` finds nothing, as MDBX's does.
+//! buffer of the cursor's. A move reads its row again once the move is done, through the engine's
+//! `current_with_key_tail`; `seek_by_key_subkey`, and a `walk_dup` started from a subkey, read it
+//! in the seek itself, from the leaf the seek fetched ([`Moves::seek_with_key_tail`]). The dup
+//! moves are the engine's prefix steps over the key's width: `next_dup` and `prev_dup` stay within
+//! the current key's rows, from a fresh cursor `next_dup`, `next_no_dup` and `next_dup_val` go to
+//! the first row and `prev_dup` to the last, as MDBX's do. Where MDBX's cursor ends a key's rows,
+//! the cursor does too (its `Pos::DupEnd` state): after `last`, and after a delete of a key's last
+//! row that leaves the key earlier rows, which puts the cursor on the row before the deleted one.
+//! There `next_dup` finds nothing and `next` goes to the next key; right after that delete
+//! `current`, `prev` and `prev_dup` return the row before (now the key's last) and `delete_current`
+//! is `MDBX_ENODATA`, as MDBX's do. Right after a delete that leaves a key no rows
+//! (`Pos::KeyDeleted`) the cursor is on the next key's first row, where `prev_dup` finds nothing,
+//! as MDBX's does.
 
 use crate::{
     dup::{DupLayout, DUP_LAYOUTS},
@@ -193,7 +195,9 @@ struct Rows {
 
 /// The width of the stack buffer a `seek_by_key_subkey` key, `key ‖ subkey`, is built in
 /// ([`Rows::seek_by_key_subkey_row`]). Every layout's `key + subkey` fits (`StoragesTrie`'s 97
-/// bytes is the widest), so a seek with reth's keys allocates nothing.
+/// bytes is the widest), so building the seek key from reth's encoded keys allocates nothing; only
+/// a longer raw input takes a `Vec`. The encodes themselves may allocate: `StoragesTrie`'s subkey,
+/// `StoredNibblesSubKey`, encodes to a `Vec`.
 const SEEK_KEY_STACK: usize = 128;
 
 // Every layout's `key ‖ subkey` fits the stack buffer, checked at compile time.

@@ -26,10 +26,13 @@ use crate::{
     },
 };
 
-/// A handle on one table: its name and its id. The id is unique over the file's life, so a
-/// handle of a table that was dropped (and perhaps re-created under the same name) is refused
-/// with [`Error::StaleTable`] rather than reaching the new table; a handle used in a transaction
-/// whose state predates the table is refused with [`Error::TableNotFound`].
+/// A handle on one table: its name and its id. A committed table's id is never given to another
+/// table over the file's life, so a handle of a table that was dropped (and perhaps re-created
+/// under the same name) is refused with [`Error::StaleTable`] rather than reaching the new table;
+/// a handle used in a transaction whose state predates the table is refused with
+/// [`Error::TableNotFound`]. The id alone does not name a table: the id of a table created in a
+/// transaction that aborted goes to the next table created, under its own name, and a handle of
+/// another file may carry it too. A handle is the table with its id and its name.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Table {
     id: u32,
@@ -155,8 +158,9 @@ const SNAPSHOT_TABLES: usize = 32;
 /// Only a resolved handle is remembered: a refused one is checked again each time. A handle's
 /// slot is the first one from `id % SNAPSHOT_TABLES` on (wrapping) that no other handle holds,
 /// and a slot is never emptied, so a lookup stops at the first empty slot. A hit is
-/// [`Table::is`]: the id, then the name (a handle of another file may carry the same id). Once
-/// every slot holds another handle, a handle resolves through the catalog on each use.
+/// [`Table::is`]: the id, then the name (a handle of another file, or one of a table an aborted
+/// transaction created, may carry the same id). Once every slot holds another handle, a handle
+/// resolves through the catalog on each use.
 #[derive(Default)]
 pub(crate) struct TableRoots([OnceLock<(Table, TreeRoot)>; SNAPSHOT_TABLES]);
 

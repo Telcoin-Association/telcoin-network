@@ -4684,10 +4684,13 @@ mod tests {
 
     /// The damage cases of [`assert_copy_fails_as_page_fails`] on published page `p`, each
     /// undone after: a zero trailer, a header naming another page, a txn after the writer's;
-    /// and the pages either side of the tree pages. `raw` gives a page's bytes unchecked.
+    /// and the pages either side of the tree pages. Then the two guards: a private source is
+    /// refused, and so is a published destination (`other`, a published page other than `p`),
+    /// whose bytes stay as they were. `raw` gives a page's bytes unchecked.
     fn assert_copies_fail_as_pages_fail<S: PageWrite + ?Sized>(
         store: &mut S,
         p: u32,
+        other: u32,
         raw: fn(&mut S, u32) -> &mut [u8],
     ) {
         let q = store.alloc().expect("alloc");
@@ -4709,6 +4712,13 @@ mod tests {
         }
         let err = store.copy_published(q, q).expect_err("a private source");
         assert!(matches!(&err, Error::Failed(m) if m.contains("is private")), "{err}");
+
+        assert_ne!(other, p, "a destination other than the source");
+        let before = raw(store, other).to_vec();
+        let err = store.copy_published(p, other).map(|_| ()).expect_err("a published destination");
+        let want = format!("page {other} is not private: copy it first");
+        assert!(matches!(&err, Error::Failed(m) if *m == want), "{err}");
+        assert!(raw(store, other) == before.as_slice(), "the destination {other} changed");
     }
 
     /// A [`MemStore`] holding a committed tree of a few levels, and its handle.
@@ -4792,12 +4802,15 @@ mod tests {
 
     /// A copy-on-write fetches its source with exactly [`PageRead::page`]'s checks: a damaged or
     /// out-of-range page fails with the same error, and a page past the published bytes that
-    /// this transaction freed (where the writer's view ends) is copied as `page` reads it.
+    /// this transaction freed (where the writer's view ends) is copied as `page` reads it. A
+    /// private source, and a published destination, are refused, and the destination is left
+    /// as it was.
     #[test]
     fn copy_on_write_fails_as_the_page_fetch_fails() {
         let (mut store, root) = committed_mem_store();
-        let leaf = *store.reachable_pgnos(&root).last().expect("a page");
-        assert_copies_fail_as_pages_fail(&mut store, leaf, MemStore::raw_mut);
+        let pages = store.reachable_pgnos(&root);
+        let (root_page, leaf) = (pages[0], *pages.last().expect("a page"));
+        assert_copies_fail_as_pages_fail(&mut store, leaf, root_page, MemStore::raw_mut);
 
         fn raw(w: &mut crate::env::Writer, p: u32) -> &mut [u8] {
             let size = w.geometry.page_size();
@@ -4807,8 +4820,9 @@ mod tests {
         let mut txn = env.begin_rw().expect("begin");
         let w = txn.writer_mut();
         let size = w.geometry.page_size();
-        let leaf = *published_tree_pages(w).last().expect("a tree page");
-        assert_copies_fail_as_pages_fail(w, leaf, raw);
+        let pages = published_tree_pages(w);
+        let (first, leaf) = (pages[0], *pages.last().expect("a tree page"));
+        assert_copies_fail_as_pages_fail(w, leaf, first, raw);
 
         // A freed page past the published bytes, forged to pass the checks, then not.
         let src = w.page(leaf).expect("leaf").to_vec();

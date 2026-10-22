@@ -65,7 +65,9 @@ stack. A row this layout cannot hold is `MDBX_BAD_VALSIZE`.
   table the file lacks.
 - **Data:** a dup-sort subkey holds one value (a second write with the same subkey replaces the
   first; reth deletes before it writes); dup values may be up to 16 MiB; a range walk may start
-  past an excluded key.
+  past an excluded key; a raw subkey wider than the table's subkey, which starts with a row's
+  subkey, can make `seek_by_key_subkey` take the row after the one MDBX takes (no reth subkey type
+  encodes that wide).
 - **Cursor positions:** past either end the cursor is past the end where MDBX's stays on the end
   row; after another writer's delete and put the cursor finds its place again lazily, at its next
   call; and a few dup-sort positions differ (`last_dup` after a key's only row is deleted,
@@ -116,9 +118,9 @@ the `hash_keys` batch sizes (default `10000,100000`; reth's add `1000000`), `TND
 picks rows by group (`table`, `dupsort`, `hash`, `get`, `put`) or by part of a label,
 `TNDB_RETH_BENCH_REPEAT` the minimum samples per cell, `TNDB_RETH_BENCH_ENGINES` one side for
 profiling, and `TNDB_RETH_BENCH_SYNC=nosync` skips every commit sync on both sides (tndb `NoSync`,
-MDBX `UtterlyNoSync`), so the write rows time the CPU alone: the table's header then says "CPU only,
-not the gate". The module docs give each workload, the data, the timing and where they differ from
-reth's.
+MDBX `UtterlyNoSync`), so the write rows time the CPU alone: the table's own header row then reads
+`bench (nosync: CPU only, not the gate)`, so the mark survives the gate loop's `grep '^|'`. The
+module docs give each workload, the data, the timing and where they differ from reth's.
 
 **The Linux gate** decides: each bench at most 1.10× MDBX, with at most one explained row up to
 1.25×. Run it three times at reth's sizes, on performance cores with the temp dir on a real disk
