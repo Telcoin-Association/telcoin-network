@@ -520,8 +520,7 @@ impl<P: Provider> Listener<P> {
             Poll::Ready(Some(incoming)) => {
                 let endpoint = self.endpoint.clone();
                 self.accept = async move { endpoint.accept().await }.boxed();
-                if self.incoming_policy.retry_unvalidated && !incoming.remote_address_validated()
-                {
+                if self.incoming_policy.retry_unvalidated && !incoming.remote_address_validated() {
                     self.incoming_policy.decide_unvalidated(incoming);
                     std::ops::ControlFlow::Continue(())
                 } else {
@@ -638,7 +637,7 @@ impl<P: Provider> Stream for Listener<P> {
                     let connecting = match incoming.accept() {
                         Ok(connecting) => connecting,
                         Err(error) => {
-                            self.incoming_policy.stats.inc_refused();
+                            self.incoming_policy.stats.inc_accept_failed();
                             return Poll::Ready(Some(TransportEvent::ListenerError {
                                 listener_id: self.listener_id,
                                 error: Error::Connection(crate::ConnectionError(error)),
@@ -653,7 +652,8 @@ impl<P: Provider> Stream for Listener<P> {
                     let send_back_addr = socketaddr_to_multiaddr(&remote_addr, self.version);
 
                     let event = TransportEvent::Incoming {
-                        upgrade: Connecting::new(connecting, self.handshake_timeout),
+                        upgrade: Connecting::new(connecting, self.handshake_timeout)
+                            .observe_incoming(&self.incoming_policy.stats),
                         local_addr,
                         send_back_addr,
                         listener_id: self.listener_id,

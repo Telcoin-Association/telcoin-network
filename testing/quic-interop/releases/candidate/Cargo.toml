@@ -36,4 +36,5 @@ serde_json = "1"
 tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "time", "net", "sync"] }
 
 [patch.crates-io]
+quinn-proto = { path = "../../../../patches/quinn-proto" }
 libp2p-quic = { path = "../../../../patches/libp2p-quic" }

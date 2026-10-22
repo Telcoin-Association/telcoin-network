@@ -2,7 +2,7 @@ name: QUIC release interoperability
 
 on:
   pull_request:
-    branches: [main]
+    branches: [main, 'staging/**']
   merge_group:
     types: [checks_requested]
   workflow_dispatch:
