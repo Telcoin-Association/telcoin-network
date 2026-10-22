@@ -3956,13 +3956,16 @@ async fn test_committee_expected_follows_local_membership() {
 
     let recorder = DebuggingRecorder::new();
     let snapshotter = recorder.snapshotter();
-    let gauge = |name: &str| {
-        snapshotter.snapshot().into_vec().into_iter().find_map(|(composite, _, _, value)| {
-            match value {
+    // a snapshot clears the recorded values, so read both gauges from one snapshot per update
+    let committee_gauges = || {
+        let snapshot = snapshotter.snapshot().into_vec();
+        let gauge = |name: &str| {
+            snapshot.iter().find_map(|(composite, _, _, value)| match value {
                 DebugValue::Gauge(gauge) if composite.key().name() == name => Some(gauge.0),
                 DebugValue::Gauge(_) | DebugValue::Counter(_) | DebugValue::Histogram(_) => None,
-            }
-        })
+            })
+        };
+        (gauge("tn_network.committee_size"), gauge("tn_network.committee_peers_expected"))
     };
 
     let observed = metrics::with_local_recorder(&recorder, || {
@@ -3972,7 +3975,7 @@ async fn test_committee_expected_follows_local_membership() {
             .into_iter()
             .map(|current| {
                 peer_manager.update_committees(HashSet::new(), current, HashSet::new());
-                (gauge("tn_network.committee_size"), gauge("tn_network.committee_peers_expected"))
+                committee_gauges()
             })
             .collect::<Vec<_>>()
     });
