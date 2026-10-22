@@ -5868,6 +5868,8 @@ async fn diagnostic_suppression_preserves_network_progress_and_counters() -> eyr
     let (reply, received) = oneshot::channel();
     network.process_command(NetworkCommand::EstablishedPeerCount { reply })?;
     assert_eq!(received.await?, 0, "the next command still makes progress after the event stream");
+    // Read the recorder once: every snapshot resets its counters to zero.
+    let snapshot = snapshotter.snapshot().into_vec();
     // The listener error count carries a fixed reason class; the error text never becomes a label.
     [
         ("listener_errors_total", &[("network", "primary"), ("reason", "other")][..]),
@@ -5877,7 +5879,7 @@ async fn diagnostic_suppression_preserves_network_progress_and_counters() -> eyr
     .into_iter()
     .for_each(|(suffix, expected)| {
         assert!(
-            snapshotter.snapshot().into_vec().iter().any(|(key, _, _, value)| {
+            snapshot.iter().any(|(key, _, _, value)| {
                 key.key().name() == format!("tn_network.{suffix}")
                     && key.key().labels().count() == expected.len()
                     && key
