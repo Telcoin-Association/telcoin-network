@@ -1,0 +1,118 @@
+name: Committee convergence regressions
+
+on:
+  pull_request:
+    paths:
+      - "crates/network-libp2p/**"
+      - "crates/tn-reth/src/forward.rs"
+      - "crates/node/src/manager/node/start_epoch.rs"
+      - ".github/workflows/committee-convergence.yaml"
+
+permissions:
+  contents: read
+
+jobs:
+  workspace:
+    if: startsWith(github.base_ref, 'staging/')
+    name: Staging workspace (${{ matrix.lane }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        lane: [fmt, clippy, test-default, test-adiri]
+    env:
+      CARGO_INCREMENTAL: "0"
+      RUSTFLAGS: "-D warnings -D unused_extern_crates"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          submodules: true
+      - name: Install pinned Rust toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+      - name: Install pinned nightly tools
+        if: matrix.lane == 'fmt' || matrix.lane == 'clippy'
+        run: rustup toolchain install "$(cat rust-nightly)" -c rustfmt,clippy,rust-src --profile minimal
+      - uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0
+        if: startsWith(matrix.lane, 'test-')
+        with:
+          tool: cargo-nextest
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+        if: matrix.lane != 'fmt'
+        with:
+          prefix-key: v1-rust
+          shared-key: ${{ matrix.lane == 'clippy' && 'clippy-cache' || 'test-cache' }}
+          save-if: "false"
+      - name: Run existing workspace CI lane
+        run: ./etc/ci-lanes.sh ${{ matrix.lane }}
+      - name: Include all targets required by the scope plan
+        if: matrix.lane == 'clippy'
+        run: cargo "+$(cat rust-nightly)" clippy --locked --workspace --all-targets --no-deps -- -D warnings
+
+  regressions:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      CARGO_INCREMENTAL: "0"
+      RUSTFLAGS: "-D warnings -D unused_extern_crates"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          submodules: true
+      - name: Install pinned Rust toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0
+        with:
+          tool: cargo-nextest
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+        with:
+          prefix-key: v1-rust
+          shared-key: test-cache
+          save-if: "false"
+      - name: Run regressions and confirm each rejects its guard mutation
+        shell: python3 -P {0}
+        run: |
+          from pathlib import Path
+          import subprocess
+
+          base = ["cargo", "+1.94", "nextest", "run", "--locked", "--no-tests=fail"]
+          subprocess.run(base + ["-p", "tn-network-libp2p", "-p", "tn-reth",
+                                 "-E", "test(committee_convergence)"], check=True)
+          mutants = [
+              ("crates/network-libp2p/src/peers/manager.rs", "tn-network-libp2p",
+               "committee_convergence_tracks_resolution_and_rotation",
+               ".filter(|(key, _)| !self.record_unlearned(key))",
+               ".filter(|(key, _)| self.known_peers.contains_key(key))"),
+              ("crates/network-libp2p/src/consensus.rs", "tn-network-libp2p",
+               "committee_convergence_excludes_stale_records",
+               ".and_then(|record| NodeRecord::try_decode_compat(&record.value))\n                    .is_some_and(|record| {",
+               ".and_then(|record| NodeRecord::try_decode_compat(&record.value))\n                    .is_none_or(|record| {"),
+              ("crates/tn-reth/src/forward.rs", "tn-reth",
+               "committee_convergence_submit_coverage",
+               "!self.unreachable.contains_key(endpoint)",
+               "self.providers.contains_key(endpoint)"),
+              ("crates/tn-reth/src/forward.rs", "tn-reth",
+               "committee_convergence_submit_coverage",
+               "self.cached_providers(&current_advertisements)",
+               "self.cached_providers(if current_rpcs.is_empty() { &current_rpcs } else { &current_advertisements })"),
+          ]
+          for filename, package, test, original, mutation in mutants:
+              path = Path(filename)
+              source = path.read_text()
+              if source.count(original) != 1:
+                  raise RuntimeError(f"Expected one mutation site: {filename}: {original}")
+              try:
+                  path.write_text(source.replace(original, mutation))
+                  command = base + ["-p", package, "-E", f"test({test})"]
+                  # A compiler error is not evidence that the regression caught the mutation.
+                  subprocess.run(command + ["--no-run"], check=True)
+                  result = subprocess.run(command)
+                  if result.returncode != 100:
+                      raise RuntimeError(f"Mutation must fail a running test: {test}: {result.returncode}")
+                  print(f"Confirmed regression rejects mutation: {test}", flush=True)
+              finally:
+                  path.write_text(source)
