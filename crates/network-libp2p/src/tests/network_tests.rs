@@ -5829,6 +5829,87 @@ async fn connection_limit_swarm_frees_slot_of_timed_out_pending_connection() {
     );
 }
 
+/// Repeated listener errors and malformed input preserve exact counters and command progress.
+#[tokio::test]
+async fn diagnostic_suppression_preserves_network_progress_and_counters() -> eyre::Result<()> {
+    use crate::diagnostics::emission_tests::Capture;
+    use futures::TryStreamExt as _;
+    use libp2p::core::transport::ListenerId;
+    use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
+    let recorder = DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    let _recorder = metrics::set_default_local_recorder(&recorder);
+    let TestTypes { peer1, _task_manager, .. } =
+        create_test_types::<TestWorkerRequest, TestWorkerResponse>();
+    let capture = Capture::default();
+    let _subscriber = tracing::subscriber::set_default(capture.clone());
+    let mut network = futures::stream::iter((0_u64..128).map(Ok::<_, NetworkError>))
+        .try_fold(peer1.network, |mut network, identity| async move {
+            network
+                .process_event(SwarmEvent::ListenerError {
+                    listener_id: ListenerId::next(),
+                    error: std::io::Error::other(format!("changing listener error {identity}")),
+                })
+                .await?;
+            let source = PeerId::random();
+            network.process_gossip_event(GossipEvent::Message {
+                propagation_source: source,
+                message_id: gossipsub::MessageId::from(identity.to_le_bytes().to_vec()),
+                message: test_gossip_message(),
+            })?;
+            let mut malformed = kad::Record::new(identity.to_le_bytes().to_vec(), vec![0xff]);
+            malformed.publisher = Some(source);
+            network.process_kad_put_request(source, malformed)?;
+            Ok(network)
+        })
+        .await?;
+
+    let (reply, received) = oneshot::channel();
+    network.process_command(NetworkCommand::EstablishedPeerCount { reply })?;
+    assert_eq!(received.await?, 0, "the next command still makes progress after the event stream");
+    // Read the recorder once: every snapshot resets its counters to zero.
+    let snapshot = snapshotter.snapshot().into_vec();
+    // The listener error count carries a fixed reason class; the error text never becomes a label.
+    [
+        ("listener_errors_total", &[("network", "primary"), ("reason", "other")][..]),
+        ("gossip_received_total", &[("network", "primary")][..]),
+        ("gossip_rejected_total", &[("network", "primary")][..]),
+    ]
+    .into_iter()
+    .for_each(|(suffix, expected)| {
+        assert!(
+            snapshot.iter().any(|(key, _, _, value)| {
+                key.key().name() == format!("tn_network.{suffix}")
+                    && key.key().labels().count() == expected.len()
+                    && key
+                        .key()
+                        .labels()
+                        .all(|label| expected.contains(&(label.key(), label.value())))
+                    && matches!(value, DebugValue::Counter(128))
+            }),
+            "every event is counted without remote label values: {suffix}"
+        );
+    });
+
+    // The transport has not been polled, so it has no active listener addresses yet.
+    assert!(network.swarm.listeners().next().is_none());
+    let result = network
+        .process_event(SwarmEvent::ListenerClosed {
+            listener_id: ListenerId::next(),
+            addresses: Vec::new(),
+            reason: Err(std::io::Error::other("terminal listener loss")),
+        })
+        .await;
+    assert!(matches!(result, Err(NetworkError::AllListenersClosed)));
+    assert_eq!(
+        capture.message_count("no listeners for swarm"),
+        1,
+        "terminal loss bypasses suppression"
+    );
+    Ok(())
+}
+
 /// The inbound denial warning stays silent for a short burst of refusals and fires once per window
 /// when refusals persist.
 #[test]

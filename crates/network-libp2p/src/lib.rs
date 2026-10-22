@@ -19,6 +19,7 @@
 pub mod admission;
 mod codec;
 mod consensus;
+mod diagnostics;
 pub mod error;
 mod freshness;
 mod gossip_config;
