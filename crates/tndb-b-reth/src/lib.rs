@@ -172,9 +172,11 @@
 //!   key (the table's last) a second row, MDBX's cursor is on the new row but `prev` skips the
 //!   key's first, `prev_dup` finds nothing, and `next`, `next_dup` and `next_no_dup` find nothing
 //!   even after another writer adds rows. Ending such a key (after `last`, a fresh `prev` or
-//!   `prev_dup`, or a refused `append`), its `next` does not see a later key another writer adds,
-//!   as on a table without duplicates. A missed `seek_by_key_subkey` past such a key's row leaves
-//!   its cursor on that row once it has moved, where this one is unset.
+//!   `prev_dup`, a refused `append`, or an `append` of its row unchanged, which MDBX's `append`
+//!   takes as `last`: it finds the last key's last value and returns), its `next` does not see a
+//!   later key another writer adds, as on a table without duplicates. A missed `seek_by_key_subkey`
+//!   past such a key's row leaves its cursor on that row once it has moved, where this one is
+//!   unset.
 //!
 //! `known_dup_cursor_deviations_from_mdbx` pins the cases that do not abort. Here a cursor finds
 //! its place again by key at its next call, as after any other writer's change; the engine's

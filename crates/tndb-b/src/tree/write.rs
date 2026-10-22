@@ -74,7 +74,7 @@ pub(crate) struct Placed {
     pub(crate) replaced: bool,
     /// The entry's slot in the leaf the table's [`PathCache`] then names; `None` after a split
     /// that left the cache empty (every split but an append split through a cache, which fills
-    /// it from a second descent of the new path).
+    /// it with the new path: see [`put_from_root`]).
     pub(crate) slot: Option<usize>,
 }
 
@@ -121,12 +121,12 @@ pub(crate) fn put_sized<S: PageWrite + ?Sized>(
 /// ([`PathCache`]): a put whose key lands in the cached leaf and fits there changes that leaf in
 /// place with no descent, exactly as the descent's put would (the same leaf, change, entry count
 /// and bytes). Any other put descends ([`put_sized`]) and refills the cache if it did not split,
-/// or did an append split (by descending the new path again for the entry). An append takes the
-/// cached leaf only if it is the tree's rightmost; elsewhere, its descent refuses a key that does
-/// not sort after the tree's last key. An insert of a present key is refused where it is found:
-/// in the cached leaf (the cache kept), else by the descent's plan (the cache left empty). A value
-/// stored in an overflow run, and a replace of one, always descend: the run is allocated, or the
-/// old one freed, with the tree's other pages.
+/// or did an append split (with the new path to the entry: see [`put_from_root`]). An append takes
+/// the cached leaf only if it is the tree's rightmost; elsewhere, its descent refuses a key that
+/// does not sort after the tree's last key. An insert of a present key is refused where it is
+/// found: in the cached leaf (the cache kept), else by the descent's plan (the cache left empty). A
+/// value stored in an overflow run, and a replace of one, always descend: the run is allocated, or
+/// the old one freed, with the tree's other pages.
 pub(crate) fn put_cached<S: PageWrite + ?Sized>(
     store: &mut S,
     root: &mut TreeRoot,
@@ -149,8 +149,10 @@ pub(crate) fn put_cached<S: PageWrite + ?Sized>(
 
 /// [`put_sized`], or an append or an insert (`kind`): descend from the root, plan, reserve,
 /// apply; then fill `cache`, if given, with the entry's path (private and trusted once the put
-/// is done) when the put did not split, or did an append split (the path then found by a second
-/// descent).
+/// is done) when the put did not split, or did an append split. After an append split whose
+/// separator the leaf's parent took, the most common one, the new path is the descent's with the
+/// parent's step moved to its new last cell and the new right leaf, which holds only the entry;
+/// after one that split a branch or grew a new root, a second, trusted descent finds it.
 fn put_from_root<S: PageWrite + ?Sized>(
     store: &mut S,
     root: &mut TreeRoot,
@@ -237,8 +239,8 @@ fn put_from_root<S: PageWrite + ?Sized>(
         }
     };
     let result = make_path_writable(store, root, path, leaf, &mut scratch).and_then(|leaf| {
-        let replaced = apply(store, root, path, leaf, key, val, change, &mut scratch)?;
-        Ok((leaf, replaced))
+        let applied = apply(store, root, path, leaf, key, val, change, &mut scratch)?;
+        Ok((leaf, applied))
     });
     // The split's worst case may not have happened: the pages it did not use are reusable.
     for p in scratch.reserved.drain(..) {
@@ -247,7 +249,7 @@ fn put_from_root<S: PageWrite + ?Sized>(
     if needed != 0 {
         store.put_scratch(scratch);
     }
-    let (leaf, replaced) = result?;
+    let (leaf, Applied { replaced, right_leaf }) = result?;
     // The leaf no longer names the old run: it leaves the tree.
     if let Some((p, n)) = old_run {
         store.free_run(p, n);
@@ -257,25 +259,63 @@ fn put_from_root<S: PageWrite + ?Sized>(
     let (leaf, slot) = match (change, tail.as_mut()) {
         (LeafChange::Replace(i) | LeafChange::Insert(i), _) => (leaf, Some(i)),
         // An append split changed the path, and the next put of an ascending run goes to the new
-        // right leaf. With a cache, find the entry again on the new path (every page on it is
-        // private now, so the trusted descent checks only identity, kind and non-emptiness) and
-        // cache it, so neither that put nor a cursor placed at the entry descends again. Any other
-        // split leaves the cache empty: a second descent there would rarely be used.
-        (LeafChange::Split { append: true, .. }, Some(tail)) => {
-            path.len = 0;
-            let (found, _) = descend_write(&*store, root, true, key, Verify::Now, path)?;
-            let Find::Found { index, .. } = found.view.find(key)? else {
-                return Err(bug("a split lost the entry it put"));
-            };
-            tail.set_range(found.range);
-            (found.pgno, Some(index))
-        }
+        // right leaf. With a cache, cache the entry's new path, so neither that put nor a cursor
+        // placed at the entry descends again. Any other split leaves the cache empty: a second
+        // descent there would rarely be used.
+        (LeafChange::Split { append: true, .. }, Some(tail)) => match right_leaf {
+            // The leaf's parent took the separator, so `path` leads to the new right leaf
+            // ([`Applied::right_leaf`]): the parent's last child, on the rightmost path, holding
+            // only the entry. Its range starts at the separator, which an append split takes from
+            // the key itself ([`page::SplitBuf::split_leaf`]), and has no upper bound: what a
+            // descent of the new path finds, without the descent.
+            Some(right) => {
+                #[cfg(debug_assertions)]
+                assert_found_again(&*store, root, key, path, right);
+                tail.set_range((Some(key), None));
+                (right, Some(0))
+            }
+            // A branch split or a new root: find the entry again on the new path (every page on
+            // it is private now, so the trusted descent checks only identity, kind and
+            // non-emptiness).
+            None => {
+                path.len = 0;
+                let (found, _) = descend_write(&*store, root, true, key, Verify::Now, path)?;
+                let Find::Found { index, .. } = found.view.find(key)? else {
+                    return Err(bug("a split lost the entry it put"));
+                };
+                tail.set_range(found.range);
+                (found.pgno, Some(index))
+            }
+        },
         (LeafChange::Split { .. }, _) => (leaf, None),
     };
     if let (Some(tail), Some(_)) = (tail, slot) {
         tail.fill(store, leaf, path)?;
     }
     Ok(Placed { replaced, slot })
+}
+
+/// Debug builds: the path [`put_from_root`] caches after an append split without a descent is
+/// what a trusted descent of the new path finds: the branches `path`, the leaf `right` with `key`
+/// at slot 0, and the range from `key` up.
+#[cfg(debug_assertions)]
+fn assert_found_again<S: PageWrite + ?Sized>(
+    store: &S,
+    root: &TreeRoot,
+    key: &[u8],
+    path: &[(u32, usize)],
+    right: u32,
+) {
+    let mut again = Path::new();
+    let found = descend_write(store, root, true, key, Verify::Now, &mut again)
+        .and_then(|(found, _)| Ok((found.pgno, found.range, found.view.find(key)?)));
+    let same = match found {
+        Ok((pgno, (Some(lo), None), Find::Found { index: 0, .. })) => {
+            pgno == right && lo == key && *again == *path
+        }
+        _ => false,
+    };
+    assert!(same, "an append split cached another path than a descent finds: {found:?}");
 }
 
 /// A [`PathCache`]'s fields other than its path, borrowed beside the path buffer a put's descent
@@ -322,11 +362,12 @@ impl CacheTail<'_> {
 /// ([`put_cached`]). The bounds are owned copies in buffers the cache reuses.
 ///
 /// It is filled after a put that ended on a trusted path (every page private, built here: see
-/// [`descend_write`]) without a split, or after an append split from a second descent of the new
-/// path, and holds only while the allocator's epoch ([`PageWrite::epoch`]) is the one it was
-/// filled in. Every change to a tree's shape or separators allocates or frees a page (a copy, a
-/// split, a new root, an unlink or a collapse; a cleared or dropped tree frees its pages), and a
-/// commit or abort ends the transaction's private pages, each with a new epoch. An in-place
+/// [`descend_write`]) without a split, or after an append split with the new path (from the split
+/// itself when the leaf's parent took the separator, else from a second descent: see
+/// [`put_from_root`]), and holds only while the allocator's epoch ([`PageWrite::epoch`]) is the one
+/// it was filled in. Every change to a tree's shape or separators allocates or frees a page (a
+/// copy, a split, a new root, an unlink or a collapse; a cleared or dropped tree frees its pages),
+/// and a commit or abort ends the transaction's private pages, each with a new epoch. An in-place
 /// insert, replace or delete changes only its leaf and no separator. So within the epoch the root
 /// still names the cached path, every page on it is still private, and exactly the keys in
 /// `[lo, hi)` route to the leaf. The catalog and the free list write through [`put`] and
@@ -887,7 +928,15 @@ fn plan<'s, S: PageWrite + ?Sized>(
             if view.fits(page::cell_size_leaf(key.len(), vlen)) {
                 LeafChange::Insert(at)
             } else {
-                let append = at == view.nkeys() && is_rightmost(store, path)?;
+                // An append's leaf is the rightmost, with no need to read the path again: it was
+                // refused above unless its range has no upper bound, which the descent leaves
+                // exactly when every branch routed to its last child ([`page::BranchView::route`]).
+                debug_assert!(
+                    kind != PutKind::Append || matches!(is_rightmost(store, path), Ok(true)),
+                    "an append's unbounded leaf is not on the rightmost path"
+                );
+                let append =
+                    at == view.nkeys() && (kind == PutKind::Append || is_rightmost(store, path)?);
                 LeafChange::Split { at, replace: false, append }
             }
         }
@@ -1127,9 +1176,19 @@ fn make_path_writable<S: PageWrite + ?Sized>(
     Ok(current)
 }
 
+/// What [`apply`] did.
+struct Applied {
+    /// It replaced a present key's value.
+    replaced: bool,
+    /// After a split whose separator the leaf's parent took (no branch split, no new root): the
+    /// new right leaf, which `path` then leads to (the parent's step moved to the leaf's new cell,
+    /// the steps above it unchanged). `None` after any other change.
+    right_leaf: Option<u32>,
+}
+
 /// Apply the planned change to the writable `leaf` with the cell value `value` (the value, or the
 /// reference to its run), splitting up the writable `path` with pages from `scratch.reserved`,
-/// and count each split's new page and a new root in `root`. Returns true for a replaced value.
+/// and count each split's new page and a new root in `root`.
 #[allow(clippy::too_many_arguments)]
 fn apply<S: PageWrite + ?Sized>(
     store: &mut S,
@@ -1140,7 +1199,7 @@ fn apply<S: PageWrite + ?Sized>(
     value: Val<'_>,
     change: LeafChange,
     scratch: &mut Scratch,
-) -> Result<bool> {
+) -> Result<Applied> {
     let fit = |fit: Fit, what: &str| match fit {
         Fit::Done => Ok(()),
         Fit::Full => Err(bug(format!("{what} did not fit as planned"))),
@@ -1148,12 +1207,12 @@ fn apply<S: PageWrite + ?Sized>(
     let (at, replace, append) = match change {
         LeafChange::Replace(i) => {
             fit(page::LeafMut::new(store.page_mut(leaf)?)?.replace_value(i, value)?, "a value")?;
-            return Ok(true);
+            return Ok(Applied { replaced: true, right_leaf: None });
         }
         LeafChange::Insert(i) => {
             fit(page::LeafMut::new(store.page_mut(leaf)?)?.insert(i, key, value)?, "an entry")?;
             root.entries += 1;
-            return Ok(false);
+            return Ok(Applied { replaced: false, right_leaf: None });
         }
         LeafChange::Split { at, replace, append } => (at, replace, append),
     };
@@ -1173,12 +1232,14 @@ fn apply<S: PageWrite + ?Sized>(
     split.write_left(store.page_mut(leaf)?)?;
     root.add_page(Kind::Leaf)?;
 
-    // Insert the separator up the path, splitting each branch it does not fit.
-    let mut placed = false;
+    // Insert the separator up the path, splitting each branch it does not fit; `placed` is the
+    // step of the branch that took it, at the new cell.
+    let new_leaf = right;
+    let mut placed = None;
     while let Some((p, ci)) = path.pop() {
         if page::branch_insert(store.page_mut(p)?, ci + 1, split.sep(), right, txn32)? == Fit::Done
         {
-            placed = true;
+            placed = Some((p, ci + 1));
             break;
         }
         let q = take()?;
@@ -1188,19 +1249,29 @@ fn apply<S: PageWrite + ?Sized>(
         root.add_page(Kind::Branch)?;
         right = q;
     }
-    // The root split: grow a new root one level up.
-    if !placed {
-        let q = take()?;
-        let sep = split.sep();
-        page::init_root(store.page_mut(q)?, q, txn, (root.root, txn32), sep, (right, txn32))?;
-        (root.root, root.root_txn) = (q, txn32);
-        root.height += 1;
-        root.add_page(Kind::Branch)?;
-    }
+    let right_leaf = match placed {
+        // The leaf's parent took it (no branch split moved `right` on): the path above it is
+        // unchanged, and the parent's step at the new cell leads to the new leaf.
+        Some(step) if right == new_leaf => {
+            path.push(step)?;
+            Some(new_leaf)
+        }
+        Some(_) => None,
+        // The root split: grow a new root one level up.
+        None => {
+            let q = take()?;
+            let sep = split.sep();
+            page::init_root(store.page_mut(q)?, q, txn, (root.root, txn32), sep, (right, txn32))?;
+            (root.root, root.root_txn) = (q, txn32);
+            root.height += 1;
+            root.add_page(Kind::Branch)?;
+            None
+        }
+    };
     if !replace {
         root.entries += 1;
     }
-    Ok(replace)
+    Ok(Applied { replaced: replace, right_leaf })
 }
 
 /// What a delete does to the tree once the entry is gone from its leaf.
@@ -2866,6 +2937,106 @@ mod tests {
         walk_tree(&store, &root);
         #[cfg(debug_assertions)]
         assert_eq!(cached() - before, 1, "only the inline put took the cached leaf");
+        store.commit_like();
+        store.assert_accounting(&[root]);
+    }
+
+    /// After a put through `cache` that returned `slot`: with a slot, the cache holds in this
+    /// epoch and names what a fresh trusted descent for `key` finds (the branches, the leaf, its
+    /// range, and `key` at the slot), which is where a cursor's put places the cursor; without
+    /// one, the cache is empty.
+    fn assert_cache_found(
+        store: &MemStore,
+        root: &TreeRoot,
+        cache: &PathCache,
+        key: &[u8],
+        slot: Option<usize>,
+        what: &str,
+    ) {
+        let Some(slot) = slot else {
+            assert_eq!(cache.epoch, 0, "{what}: a put that placed no entry left a cache");
+            return;
+        };
+        let mut path = Path::new();
+        let (found, _) =
+            descend_write(store, root, true, key, Verify::Now, &mut path).expect("descent");
+        assert_eq!(cache.epoch, store.epoch(), "{what}: the cache holds");
+        assert_eq!(cache.branches(), &*path, "{what}: the branches");
+        assert_eq!(cache.leaf(), found.pgno, "{what}: the leaf");
+        assert_eq!((cache.lo.get(), cache.hi.get()), found.range, "{what}: the range");
+        let at = found.view.find(key).expect("find");
+        assert!(matches!(at, Find::Found { index, .. } if index == slot), "{what}: slot {slot}");
+    }
+
+    /// Ascending puts through a table's path cache (appends, and upserts and inserts past the last
+    /// key, which split in append mode too) across leaf, branch and root splits, with replaces of
+    /// present keys (growing some until they split), inserts and upserts of new keys between
+    /// present keys (some past the last key of a full leaf, which split it as any other) and
+    /// commits (the next put copies its path) between them: after every put, the cache names
+    /// what a fresh descent finds ([`assert_cache_found`]), and the tree holds the model. Every
+    /// shape of split happens: past the last key, the leaf's parent takes the separator (the
+    /// cache filled from the split, on a private path and on one the put copied), a branch
+    /// below the root splits, or a new root grows (both filled by a descent); elsewhere, the
+    /// cache is left empty.
+    #[test]
+    fn an_append_split_caches_the_path_a_descent_finds() {
+        let mut store = MemStore::new(4096);
+        let mut rng = Rng(0x5DEE_CE66_D1CE_4E5B);
+        let (mut root, mut trusted, mut cache) = (TreeRoot::EMPTY, false, PathCache::default());
+        let mut model = BTreeMap::new();
+        // Leaf splits by shape: past the last key, the separator taken by the leaf's parent (0),
+        // by a branch below the root that split (1), or by a new root (2); elsewhere (3); and
+        // shape 0 again where the put copied its path from published pages (4).
+        let mut splits = [0u32; 5];
+        // 200-byte keys: about 19 children a branch, so the tree reaches height 3 and splits
+        // branches below its root within a few hundred leaves.
+        let key = |id: u64| id_key(id, 200);
+        let mut next = 0u64;
+        for op in 0..2_500u64 {
+            let (k, kind) = match rng.below(10) {
+                0 => (key(2 * next), PutKind::Upsert),
+                1 => (key(2 * next), PutKind::Insert),
+                2 if next > 0 => (key(2 * rng.below(next)), PutKind::Upsert),
+                3 if next > 0 => match key(2 * rng.below(next) + 1) {
+                    k if model.contains_key(&k) || rng.below(2) == 0 => (k, PutKind::Upsert),
+                    k => (k, PutKind::Insert),
+                },
+                _ => (key(2 * next), PutKind::Append),
+            };
+            let past_last = model.last_key_value().is_none_or(|(last, _)| k > *last);
+            if past_last {
+                next += 1;
+            }
+            let v = vec![op as u8; 40 + rng.below(160) as usize];
+            let (before, copied) = (root, !trusted);
+            let placed = put_cached(&mut store, &mut root, &mut trusted, &mut cache, &k, &v, kind)
+                .expect("put");
+            assert_eq!(placed.replaced, model.insert(k.clone(), v).is_some(), "op {op}");
+            // A put into the empty tree adds the first leaf: no split.
+            if before.height > 0 && root.leaf_pages > before.leaf_pages {
+                let shape = if !past_last {
+                    3
+                } else if root.height > before.height {
+                    2
+                } else if root.branch_pages > before.branch_pages {
+                    1
+                } else {
+                    0
+                };
+                splits[shape] += 1;
+                if shape == 0 && copied {
+                    splits[4] += 1;
+                }
+            }
+            assert_cache_found(&store, &root, &cache, &k, placed.slot, &format!("op {op}"));
+            if op % 23 == 22 {
+                store.commit_like();
+                trusted = false;
+            }
+        }
+        assert!(splits.iter().all(|&n| n > 0), "splits by shape {splits:?}");
+        assert!(root.height >= 3, "height {}", root.height);
+        assert_holds(&store, &root, &model);
         store.commit_like();
         store.assert_accounting(&[root]);
     }

@@ -180,7 +180,7 @@ impl CellVal for &[u8] {
     fn write(self, cell: &mut [u8], v: usize) {
         put_u32(cell, 0, self.len() as u32);
         put_u16(cell, 6, 0);
-        cell[v..v + self.len()].copy_from_slice(self);
+        copy_short(&mut cell[v..v + self.len()], self);
     }
 }
 
@@ -412,6 +412,45 @@ fn put_u32(buf: &mut [u8], off: usize, v: u32) {
 
 fn put_u64(buf: &mut [u8], off: usize, v: u64) {
     buf[off..off + 8].copy_from_slice(&v.to_le_bytes());
+}
+
+/// `dst.copy_from_slice(src)`, panicking as it does when the lengths differ, for the short
+/// copies a put makes on every row (a key, an inline value, a cursor's saved key). Up to 64 bytes
+/// it copies the slice's first and last bytes in two fixed-size chunks that overlap
+/// ([`copy_ends`]), so the compiler emits plain loads and stores where `copy_from_slice` of a
+/// length it cannot see calls `memcpy`. Longer slices go to `copy_from_slice`.
+///
+/// `#[inline(always)]`: the reth adapter instantiates the generic write path ([`LeafMut::insert`])
+/// in its own crate, where a call to this helper would cost more than the `memcpy` it replaces.
+#[inline(always)]
+pub(crate) fn copy_short(dst: &mut [u8], src: &[u8]) {
+    let n = src.len();
+    if dst.len() != n || n > 64 {
+        // `copy_from_slice` panics on the length mismatch.
+        dst.copy_from_slice(src);
+    } else if n > 32 {
+        copy_ends::<32>(dst, src);
+    } else if n > 16 {
+        copy_ends::<16>(dst, src);
+    } else if n >= 8 {
+        copy_ends::<8>(dst, src);
+    } else if n >= 4 {
+        copy_ends::<4>(dst, src);
+    } else if n > 0 {
+        // 1..=3 bytes: the first, the middle and the last cover them all.
+        dst[0] = src[0];
+        dst[n / 2] = src[n / 2];
+        dst[n - 1] = src[n - 1];
+    }
+}
+
+/// [`copy_short`] of `K..=2K` bytes between slices of equal length: the first `K` bytes and the
+/// last `K`, which overlap unless the length is `2K`.
+#[inline(always)]
+fn copy_ends<const K: usize>(dst: &mut [u8], src: &[u8]) {
+    let tail = src.len() - K;
+    dst[..K].copy_from_slice(&src[..K]);
+    dst[tail..tail + K].copy_from_slice(&src[tail..tail + K]);
 }
 
 /// A [`Error::Corrupt`] naming the page.
@@ -817,7 +856,10 @@ fn reserve(page: &mut [u8], h: &Hdr, i: usize, size: usize) -> Result<Option<usi
     }
     let off = h.upper - size;
     let at = HEADER + SLOT * i;
-    page.copy_within(at..h.slots_end(), at + SLOT);
+    // A cell at the end (an append) moves no slot: skip the empty move's `memmove` call.
+    if i < h.nkeys {
+        page.copy_within(at..h.slots_end(), at + SLOT);
+    }
     put_u16(page, at, off);
     put_u16(page, NKEYS_OFF, h.nkeys + 1);
     put_u16(page, UPPER_OFF, off);
@@ -1319,7 +1361,7 @@ fn keys_within(page: &[u8], h: &Hdr, lo: Option<&[u8]>, hi: Option<&[u8]>) -> Re
 fn write_leaf_cell(cell: &mut [u8], key: &[u8], value: impl CellVal) {
     put_u16(cell, 4, key.len());
     let k = LEAF_CELL_HEADER + key.len();
-    cell[LEAF_CELL_HEADER..k].copy_from_slice(key);
+    copy_short(&mut cell[LEAF_CELL_HEADER..k], key);
     value.write(cell, k);
 }
 
@@ -1458,7 +1500,7 @@ fn write_branch_cell(cell: &mut [u8], key: &[u8], child: u32, child_txn: u32) {
     put_u32(cell, 0, child);
     put_u32(cell, 4, child_txn);
     put_u16(cell, 8, key.len());
-    cell[BRANCH_CELL_HEADER..BRANCH_CELL_HEADER + key.len()].copy_from_slice(key);
+    copy_short(&mut cell[BRANCH_CELL_HEADER..BRANCH_CELL_HEADER + key.len()], key);
 }
 
 /// Child `i` of a branch as `(child_pgno, child_txn)`; `child_txn` is the low 32 bits of the
@@ -2521,6 +2563,77 @@ mod tests {
                 }
             }
             prop_assert!(!leaf || (found > 0 && missed > 0), "{found} hits, {missed} misses");
+        }
+    }
+
+    /// [`copy_short`] is `copy_from_slice` for every length through its fallback past 64 bytes:
+    /// random bytes into a slice of a larger buffer, whose bytes either side stay as they were.
+    #[test]
+    fn copy_short_is_copy_from_slice() {
+        let mut s = 0x5eed_u64;
+        for n in 0..=80 {
+            for at in 0..4 {
+                for _ in 0..8 {
+                    let src: Vec<u8> = (0..n).map(|_| splitmix(&mut s) as u8).collect();
+                    let mut buf: Vec<u8> = (0..n + 8).map(|_| splitmix(&mut s) as u8).collect();
+                    let mut want = buf.clone();
+                    want[at..at + n].copy_from_slice(&src);
+                    copy_short(&mut buf[at..at + n], &src);
+                    assert_eq!(buf, want, "{n} bytes at {at}");
+                }
+            }
+        }
+    }
+
+    /// [`copy_short`] panics where `copy_from_slice` does, with its message.
+    #[test]
+    fn copy_short_panics_as_copy_from_slice_on_a_length_mismatch() {
+        fn panic_message(copy: fn(&mut [u8], &[u8]), dst: usize, src: usize) -> String {
+            let (mut d, s) = (vec![0_u8; dst], vec![1_u8; src]);
+            let caught =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| copy(&mut d, &s)));
+            let payload = caught.expect_err("a length mismatch must panic");
+            match payload.downcast::<String>() {
+                Ok(message) => *message,
+                Err(payload) => payload.downcast::<&str>().map(|m| m.to_string()).unwrap(),
+            }
+        }
+        for (dst, src) in [(0, 1), (1, 0), (2, 3), (4, 3), (8, 7), (7, 8), (17, 16), (64, 65)] {
+            assert_eq!(
+                panic_message(copy_short, dst, src),
+                panic_message(|d, s| d.copy_from_slice(s), dst, src),
+                "dst {dst}, src {src}"
+            );
+        }
+    }
+
+    /// An insert at every index of leaves of 0..=10 entries, the end (`i == nkeys`, which moves
+    /// no slot in [`reserve`]) included, against a sorted model. Key lengths vary so the key
+    /// copies take every [`copy_short`] size class.
+    #[test]
+    fn inserts_at_every_index_match_a_model() {
+        let g = geometry(4096);
+        let klen = |rank: u32| 4 + (rank as usize * 7) % 67;
+        for n in 0..=10_u32 {
+            for i in 0..=n {
+                let mut page = fresh(&g, Kind::Leaf);
+                let mut model: Vec<Entry> = Vec::new();
+                for j in 0..n {
+                    let rank = 2 * (j + 1);
+                    let (key, value) = (ranked_key(rank, klen(rank)), vec![j as u8; j as usize]);
+                    assert_eq!(
+                        leaf_insert(&mut page, j as usize, &key, &value).unwrap(),
+                        Fit::Done
+                    );
+                    model.push((key, value));
+                }
+                let rank = 2 * i + 1;
+                let (key, value) = (ranked_key(rank, klen(rank)), vec![0xee; 8]);
+                assert_eq!(leaf_insert(&mut page, i as usize, &key, &value).unwrap(), Fit::Done);
+                model.insert(i as usize, (key, value));
+                validate(&page, &g).unwrap();
+                assert_eq!(entries(&page), model, "{n} entries, insert at {i}");
+            }
         }
     }
 

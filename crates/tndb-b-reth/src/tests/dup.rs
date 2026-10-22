@@ -414,7 +414,8 @@ fn dup_steps<D: Database>(db: &D, steps: &str) -> String {
 /// key's last row, `next` the next key's first, a delete is `MDBX_ENODATA` until `next_dup`).
 /// After `last` it ends the last key's rows the same way, softly: `next_dup` and `next` skip rows
 /// put after it in its key, but `next` and `next_no_dup` take a later key (put or appended, and
-/// after a refused `append` too). A refused `append_dup` leaves it on the key's last row, or on
+/// after a refused `append` too, or an `append` of the last key's last value unchanged, which
+/// leaves the cursor on that row). A refused `append_dup` leaves it on the key's last row, or on
 /// its first when the value is exactly the first's. After an `append` gives a key with one row a
 /// second, the calls that match MDBX's are those that do not step (`current`, `delete_current`,
 /// `last_dup`, `delete_current_duplicates`), `next_dup`, and any call after a third `append`.
@@ -517,6 +518,9 @@ const DUP_MATCHED: &[&str] = &[
     "l tap:5/1 nnd",
     "a:1/1 c",
     "a:1/1 tap:5/1 n",
+    "a:4/2 tap:5/1 n",
+    "tap:5/1 a:5/1 c",
+    "tap:5/1 a:5/1 tap:6/1 p",
     "ad:1/1 c",
     "ad:1/1 n",
     "ad:1/3 c",
@@ -564,8 +568,9 @@ fn dup_cursor_steps_after_a_delete_or_last_match_mdbx() {
 /// - **A key of one row**, which MDBX holds apart from its dup values: after an `append` gives such
 ///   a key (the table's last) a second, MDBX's cursor is on the new row, but `prev` steps to the
 ///   key before, `prev_dup` finds nothing, and `next`, `next_dup` and `next_no_dup` find nothing
-///   even after another writer adds a row after it; after `last` on such a key, `next` and
-///   `next_no_dup` do not see a later key the transaction appends; and a missed
+///   even after another writer adds a row after it; after `last` on such a key, or an `append` of
+///   its row unchanged (MDBX's `append` takes `last` first and, finding the same value, returns),
+///   `next` and `next_no_dup` do not see a later key the transaction puts or appends; and a missed
 ///   `seek_by_key_subkey` past such a key's row, from a cursor that has moved, leaves MDBX's cursor
 ///   on that row. tndb-b's steps from the new row, takes the later key, and is unset.
 /// - **A raw subkey wider than the layout's W** (pinned after the table, on `PlainStorageState`'s
@@ -605,6 +610,16 @@ const DUP_DEVIATIONS: &[(&str, &str, &str)] = &[
         "tap:5/1 l tap:6/1 n",
         "tap:5/1=ok l=5/1 tap:6/1=ok n=none",
         "tap:5/1=ok l=5/1 tap:6/1=ok n=6/1",
+    ),
+    (
+        "tap:5/1 a:5/1 tap:6/1 n",
+        "tap:5/1=ok a:5/1=ok tap:6/1=ok n=none",
+        "tap:5/1=ok a:5/1=ok tap:6/1=ok n=6/1",
+    ),
+    (
+        "tap:5/1 a:5/1 put:6/1 nnd",
+        "tap:5/1=ok a:5/1=ok put:6/1=ok nnd=none",
+        "tap:5/1=ok a:5/1=ok put:6/1=ok nnd=6/1",
     ),
     ("f sk:2/3 c", "f=1/1 sk:2/3=none c=2/2", "f=1/1 sk:2/3=none c=none"),
     ("se:2 p put:1/6 n", "se:2=2/2 p=1/5 put:1/6=ok n=2/2", "se:2=2/2 p=1/5 put:1/6=ok n=1/6"),

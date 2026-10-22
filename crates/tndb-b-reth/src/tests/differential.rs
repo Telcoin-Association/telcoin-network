@@ -49,8 +49,9 @@
 //! 8. **a dup key of one row** (MDBX keeps a key's only value apart from its dup values): a
 //!    cursor's `append` that gives its key (the table's last, with one row) a second taints it, as
 //!    does a later key's put while the cursor ends a key of one row (after `last`, a fresh `prev`
-//!    or `prev_dup`, or a refused `append`), and a missed `seek_by_key_subkey` (or `walk_dup`
-//!    start) past a key's one row from a cursor that has moved.
+//!    or `prev_dup`, a refused `append`, or an `append` of the key's row unchanged, which MDBX
+//!    takes as `last`), and a missed `seek_by_key_subkey` (or `walk_dup` start) past a key's one
+//!    row from a cursor that has moved.
 //!
 //! An error other than the expected ones (`MDBX_KEYEXIST`, `MDBX_EKEYMISMATCH`, `MDBX_ENODATA`)
 //! also taints the cursor, counted apart. On a difference proptest shrinks the script, then
@@ -483,8 +484,9 @@ struct CurModel {
     /// The row the cursor is on: after its own delete, the row after the deleted one (on a dup
     /// table, the key's row before when the key's last row went and earlier ones stay).
     row: Option<Row>,
-    /// On the row `last` (or a fresh `prev`, or a refused append) placed it on: `next` finds
-    /// nothing and the cursor stays.
+    /// On the row `last` (or a fresh `prev`, a refused append, or an append of the table's last
+    /// key, or on the dup table of its last row) placed it on: `next` finds nothing and the cursor
+    /// stays.
     soft_end: bool,
     /// Another writer deleted the cursor's row (this one) since its last call.
     pending: Option<Row>,
@@ -1164,11 +1166,15 @@ impl<DB: Database> Runner<'_, DB> {
                 // An `append` that gives a dup key with one row a second (class 8).
                 let append = matches!(call, Call::Append(..));
                 let second = append && self.only_other_row(tb, row).is_some();
-                // One that replaces the last key's value ends the table, as `last` does.
+                // One that replaces the last key's value ends the table, as `last` does; on the
+                // dup table one of the table's last row (which holds that value, one value per
+                // subkey) does too: MDBX's `append` takes `last` first and, finding the same value,
+                // returns. A later key's put then taints the cursor if its key has one row (class
+                // 8, in `others_on_put`).
                 let last = self.rows(tb).last_key_value().is_some_and(|(&r, _)| r == row);
                 self.written(Some(slot), tb, row, v);
                 let m = self.models[slot].as_mut().expect("open");
-                m.place(row, append && last && !tb.dup());
+                m.place(row, append && last);
                 if second {
                     m.taint(ONE_ROW_KEY, false);
                 }

@@ -18,6 +18,7 @@ use crate::{
     freelist,
     latch::UnwindLatch,
     meta::Meta,
+    page,
     tree::{
         cursor::{self, Cursor, Entry, KeyTail, State, TreeCursor},
         read,
@@ -1199,6 +1200,19 @@ fn find_again(
     Ok(())
 }
 
+/// Keep a copy of `key` in `saved`, a [`TxnCursor`]'s key buffer. A table's keys often share one
+/// length, so a key as long as the one saved overwrites it in place with [`page::copy_short`],
+/// which makes no `memcpy` call; any other length goes through `clear` and `extend_from_slice`.
+#[inline(always)]
+fn save_key(saved: &mut Vec<u8>, key: &[u8]) {
+    if saved.len() == key.len() {
+        page::copy_short(saved, key);
+    } else {
+        saved.clear();
+        saved.extend_from_slice(key);
+    }
+}
+
 /// A cursor over one table of a write transaction that holds no borrow of it (created by
 /// [`RwTxn::cursor_detached`]): each call takes the transaction, `&RwTxn` for a move (the entry
 /// returned borrows the transaction) and `&mut RwTxn` for a write. So several cursors, over one
@@ -1437,8 +1451,7 @@ impl TxnCursor {
     #[inline]
     fn landed<'s>(&mut self, moved: Result<Option<Entry<'s>>>) -> Result<Option<Entry<'s>>> {
         if let Ok(Some((k, _))) = moved {
-            self.key.clear();
-            self.key.extend_from_slice(k);
+            save_key(&mut self.key, k);
         }
         moved
     }
@@ -1547,8 +1560,7 @@ impl TxnCursor {
             c.soft_end = false;
             let found = c.tree.seek_with_key_tail(store, &c.root, key, t);
             if let Ok(Some((k, _))) = found {
-                c.key.clear();
-                c.key.extend_from_slice(k);
+                save_key(&mut c.key, k);
             }
             found
         })
@@ -1561,8 +1573,7 @@ impl TxnCursor {
             c.soft_end = false;
             let found = c.tree.seek_exact(store, &c.root, key);
             if let Ok(Some(_)) = found {
-                c.key.clear();
-                c.key.extend_from_slice(key);
+                save_key(&mut c.key, key);
             }
             found
         })
@@ -1655,8 +1666,7 @@ impl TxnCursor {
         let placed = txn.put_entry(table, key, value, kind, Some((tree, root)))?;
         self.deleted = false;
         self.soft_end = false;
-        self.key.clear();
-        self.key.extend_from_slice(key);
+        save_key(&mut self.key, key);
         self.writes = self.table_writes(&txn.work);
         if placed {
             return Ok(());
@@ -1698,8 +1708,7 @@ impl TxnCursor {
         let found = find_again(&txn.work, table, root, tree, key, false).and_then(|()| {
             // The follower's key, which a reseek finds the cursor again by.
             if let Some((k, _)) = tree.current(txn.work.writer())? {
-                self.key.clear();
-                self.key.extend_from_slice(k);
+                save_key(&mut self.key, k);
             }
             Ok(())
         });
