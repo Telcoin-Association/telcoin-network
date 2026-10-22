@@ -1,0 +1,847 @@
+diff --git patched/rustfmt.toml patched/rustfmt.toml
+new file mode 100644
+index 0000000000000000000000000000000000000000..3501136812cb639f6f93412fc9ef5bb7ce177a64
+--- /dev/null
++++ patched/rustfmt.toml
+@@ -0,0 +1 @@
++style_edition = "2024"
+diff --git upstream/src/config/mod.rs patched/src/config/mod.rs
+index 0a299d03a71d31a28cc8b9899a76a8cbfc46ff4d..609dff633662a2378116c1a4335ea1b82deff127 100644
+--- upstream/src/config/mod.rs
++++ patched/src/config/mod.rs
+@@ -35,6 +35,8 @@ pub use transport::{AckFrequencyConfig, IdleTimeout, MtuDiscoveryConfig, Transpo
+ /// Default values should be suitable for most internet applications.
+ #[derive(Clone)]
+ pub struct EndpointConfig {
++    /// Optional observations shared by endpoints made from this configuration.
++    pub(crate) incoming_stats: Option<Arc<crate::IncomingStats>>,
+     pub(crate) reset_key: Arc<dyn HmacKey>,
+     pub(crate) max_udp_payload_size: VarInt,
+     /// CID generator factory
+@@ -56,6 +58,7 @@ impl EndpointConfig {
+         let cid_factory =
+             || -> Box<dyn ConnectionIdGenerator> { Box::<HashedConnectionIdGenerator>::default() };
+         Self {
++            incoming_stats: None,
+             reset_key,
+             max_udp_payload_size: (1500u32 - 28).into(), // Ethernet MTU minus IP + UDP headers
+             connection_id_generator_factory: Arc::new(cid_factory),
+@@ -66,6 +69,17 @@ impl EndpointConfig {
+         }
+     }
+ 
++    /// Observe endpoint decisions and live incoming occupancy without an external recorder.
++    pub fn incoming_stats(&mut self, stats: Arc<crate::IncomingStats>) -> &mut Self {
++        self.incoming_stats = Some(stats);
++        self
++    }
++
++    /// Borrow the configured observation sink without exposing its ownership field.
++    pub(crate) fn incoming_observer(&self) -> Option<&crate::IncomingStats> {
++        self.incoming_stats.as_deref()
++    }
++
+     /// Supply a custom connection ID generator factory
+     ///
+     /// Called once by each `Endpoint` constructed from this configuration to obtain the CID
+@@ -214,8 +228,8 @@ pub struct ServerConfig {
+ 
+     /// Whether to allow clients to migrate to new addresses
+     ///
+-    /// Improves behavior for clients that move between different internet connections or suffer NAT
+-    /// rebinding. Enabled by default.
++    /// Improves behavior for clients that move between different internet connections or suffer
++    /// NAT rebinding. Enabled by default.
+     pub(crate) migration: bool,
+ 
+     pub(crate) preferred_address_v4: Option<SocketAddrV4>,
+diff --git upstream/src/endpoint.rs patched/src/endpoint.rs
+index f46bc8bbdcd1275dbc43a9e0bc940c0209d0142c..39c656b102afa840ff42f99202c13e64888db773 100644
+--- upstream/src/endpoint.rs
++++ patched/src/endpoint.rs
+@@ -58,6 +58,18 @@ pub struct Endpoint {
+     all_incoming_buffers_total_bytes: u64,
+ }
+ 
++impl Drop for Endpoint {
++    /// Release this endpoint's contribution even when incomings were never handed to the app.
++    fn drop(&mut self) {
++        self.config.incoming_observer().iter().for_each(|stats| {
++            stats.dequeue(self.incoming_buffers.len());
++            self.server_config
++                .iter()
++                .for_each(|server| stats.remove_server(server.max_incoming));
++        });
++    }
++}
++
+ impl Endpoint {
+     /// Create a new endpoint
+     ///
+@@ -75,6 +87,11 @@ impl Endpoint {
+         allow_mtud: bool,
+         rng_seed: Option<[u8; 32]>,
+     ) -> Self {
++        config.incoming_observer().iter().for_each(|stats| {
++            server_config
++                .iter()
++                .for_each(|server| stats.add_server(server.max_incoming));
++        });
+         Self {
+             rng: match rng_seed.or(config.rng_seed) {
+                 Some(seed) => StdRng::from_seed(seed),
+@@ -97,6 +114,14 @@ impl Endpoint {
+     ///
+     /// Pending incoming connections retain the configuration active when they first arrived.
+     pub fn set_server_config(&mut self, server_config: Option<Arc<ServerConfig>>) {
++        self.config.incoming_observer().iter().for_each(|stats| {
++            self.server_config
++                .iter()
++                .for_each(|server| stats.remove_server(server.max_incoming));
++            server_config
++                .iter()
++                .for_each(|server| stats.add_server(server.max_incoming));
++        });
+         self.server_config = server_config;
+     }
+ 
+@@ -237,6 +262,8 @@ impl Endpoint {
+                         incoming_buffer.datagrams.push(event);
+                         incoming_buffer.total_bytes += datagram_len as u64;
+                         self.all_incoming_buffers_total_bytes += datagram_len as u64;
++                    } else {
++                        self.observe_incoming(crate::IncomingEvent::BufferFull);
+                     }
+ 
+                     None
+@@ -453,6 +480,12 @@ impl Endpoint {
+         // Saturation only happens under heavy load, where deriving initial keys per Initial just to
+         // reply with CONNECTION_REFUSED would starve packet processing for existing connections.
+         if self.cids_exhausted() || self.incoming_buffers.len() >= server_config.max_incoming {
++            let reason = if self.incoming_buffers.len() >= server_config.max_incoming {
++                crate::IncomingEvent::QueueFull
++            } else {
++                crate::IncomingEvent::ConnectionIdsExhausted
++            };
++            self.observe_incoming(reason);
+             debug!(
+                 "ignoring initial for connection {} due to saturation",
+                 dst_cid
+@@ -503,9 +536,15 @@ impl Endpoint {
+ 
+         let server_config = self.server_config.as_ref().unwrap().clone();
+ 
+-        let token = match IncomingToken::from_header(&header, &server_config, addresses.remote) {
++        let token = match IncomingToken::from_header(
++            &header,
++            &server_config,
++            addresses.remote,
++            self.config.incoming_observer(),
++        ) {
+             Ok(token) => token,
+             Err(InvalidRetryTokenError) => {
++                self.observe_incoming(crate::IncomingEvent::InvalidRetryToken);
+                 debug!("rejecting invalid retry token");
+                 return Some(DatagramEvent::Response(self.initial_close(
+                     header.version,
+@@ -518,6 +557,11 @@ impl Endpoint {
+             }
+         };
+ 
++        if token.retry_src_cid.is_some() {
++            self.observe_incoming(crate::IncomingEvent::RetryValidated);
++        } else if token.validated {
++            self.observe_incoming(crate::IncomingEvent::AddressValidated);
++        }
+         let incoming_idx = self.incoming_buffers.insert(IncomingBuffer {
+             server_config,
+             datagrams: Vec::new(),
+@@ -525,6 +569,10 @@ impl Endpoint {
+         });
+         self.index
+             .insert_initial_incoming(header.dst_cid, incoming_idx);
++        self.config
++            .incoming_observer()
++            .iter()
++            .for_each(|stats| stats.enqueue());
+ 
+         Some(DatagramEvent::NewConnection(Incoming {
+             received_at: event.now,
+@@ -556,6 +604,10 @@ impl Endpoint {
+         let remote_address_validated = incoming.remote_address_validated();
+         incoming.improper_drop_warner.dismiss();
+         let incoming_buffer = self.incoming_buffers.remove(incoming.incoming_idx);
++        self.config
++            .incoming_observer()
++            .iter()
++            .for_each(|stats| stats.dequeue(1));
+         self.all_incoming_buffers_total_bytes -= incoming_buffer.total_bytes;
+ 
+         let packet_number = incoming.packet.header.number.expand(0);
+@@ -576,6 +628,7 @@ impl Endpoint {
+         {
+             debug!("abandoning accept of stale initial");
+             self.index.remove_initial(dst_cid);
++            self.observe_incoming(crate::IncomingEvent::AcceptFailed);
+             return Err(AcceptError {
+                 cause: ConnectionError::TimedOut,
+                 response: None,
+@@ -585,6 +638,7 @@ impl Endpoint {
+         if self.cids_exhausted() {
+             debug!("refusing connection");
+             self.index.remove_initial(dst_cid);
++            self.observe_incoming(crate::IncomingEvent::AcceptFailed);
+             return Err(AcceptError {
+                 cause: ConnectionError::CidsExhausted,
+                 response: Some(self.initial_close(
+@@ -611,6 +665,7 @@ impl Endpoint {
+         {
+             debug!(packet_number, "failed to authenticate initial packet");
+             self.index.remove_initial(dst_cid);
++            self.observe_incoming(crate::IncomingEvent::AcceptFailed);
+             return Err(AcceptError {
+                 cause: TransportError::PROTOCOL_VIOLATION("authentication failed").into(),
+                 response: None,
+@@ -681,6 +736,7 @@ impl Endpoint {
+             }
+             Err(e) => {
+                 debug!("handshake failed: {}", e);
++                self.observe_incoming(crate::IncomingEvent::AcceptFailed);
+                 self.handle_event(ch, EndpointEvent(EndpointEventInner::Drained));
+                 let response = match e {
+                     ConnectionError::TransportError(ref e) => Some(self.initial_close(
+@@ -725,6 +781,7 @@ impl Endpoint {
+ 
+     /// Reject this incoming connection attempt
+     pub fn refuse(&mut self, incoming: Incoming, buf: &mut Vec<u8>) -> Transmit {
++        self.observe_incoming(crate::IncomingEvent::Refused);
+         self.clean_up_incoming(&incoming);
+         incoming.improper_drop_warner.dismiss();
+ 
+@@ -796,6 +853,7 @@ impl Endpoint {
+     /// Doing this actively, rather than merely dropping the [`Incoming`], is necessary to prevent
+     /// memory leaks due to state within [`Endpoint`] tracking the incoming connection.
+     pub fn ignore(&mut self, incoming: Incoming) {
++        self.observe_incoming(crate::IncomingEvent::Ignored);
+         self.clean_up_incoming(&incoming);
+         incoming.improper_drop_warner.dismiss();
+     }
+@@ -804,9 +862,21 @@ impl Endpoint {
+     fn clean_up_incoming(&mut self, incoming: &Incoming) {
+         self.index.remove_initial(incoming.packet.header.dst_cid);
+         let incoming_buffer = self.incoming_buffers.remove(incoming.incoming_idx);
++        self.config
++            .incoming_observer()
++            .iter()
++            .for_each(|stats| stats.dequeue(1));
+         self.all_incoming_buffers_total_bytes -= incoming_buffer.total_bytes;
+     }
+ 
++    /// Observe a fixed outcome without exposing packet or address data.
++    fn observe_incoming(&self, event: crate::IncomingEvent) {
++        self.config
++            .incoming_observer()
++            .iter()
++            .for_each(|stats| stats.record(event));
++    }
++
+     fn add_connection(
+         &mut self,
+         ch: ConnectionHandle,
+@@ -1261,7 +1331,8 @@ impl Drop for IncomingImproperDropWarner {
+ pub enum ConnectError {
+     /// The endpoint can no longer create new connections
+     ///
+-    /// Indicates that a necessary component of the endpoint has been dropped or otherwise disabled.
++    /// Indicates that a necessary component of the endpoint has been dropped or otherwise
++    /// disabled.
+     #[error("endpoint stopping")]
+     EndpointStopping,
+     /// The connection could not be created because not enough of the CID space is available
+diff --git patched/src/incoming_stats.rs patched/src/incoming_stats.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..81d69666ea2a8faae8bf722719227db885c3e7f2
+--- /dev/null
++++ patched/src/incoming_stats.rs
+@@ -0,0 +1,133 @@
++//! Bounded observations at the endpoint boundary, before an application sees an incoming.
++
++use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
++
++/// Fixed protocol outcomes. These carry no remote addresses, identities, or error strings.
++#[derive(Clone, Copy, Debug, Eq, PartialEq)]
++pub enum IncomingEvent {
++    /// A new Initial carries a valid Retry token.
++    RetryValidated,
++    /// A new Initial carries a valid address-validation token from NEW_TOKEN.
++    AddressValidated,
++    /// A decoded Retry token fails validation, including expiry or address mismatch.
++    InvalidRetryToken,
++    /// A nonempty token cannot be authenticated or decoded and is treated as absent.
++    UndecodableToken,
++    /// A NEW_TOKEN token fails address, lifetime, or replay validation.
++    InvalidAddressToken,
++    /// A new Initial is dropped at the effective incoming queue ceiling.
++    QueueFull,
++    /// A new Initial is dropped because connection IDs are exhausted.
++    ConnectionIdsExhausted,
++    /// A datagram for a queued incoming is dropped at a per-attempt or total buffer cap.
++    BufferFull,
++    /// An application explicitly refused an incoming attempt.
++    Refused,
++    /// An application explicitly ignored an incoming attempt.
++    Ignored,
++    /// An accept call failed, with or without a close response.
++    AcceptFailed,
++}
++
++/// Shared, optional endpoint observations. Counters grow for this object's lifetime.
++///
++/// Live gauges sum all endpoints sharing this object. Queue occupancy includes both the
++/// receive queue and incomings held by the application, until accept, retry, refuse, or ignore.
++/// Dropping an endpoint removes its outstanding occupancy and configured ceiling.
++#[derive(Debug, Default)]
++pub struct IncomingStats {
++    /// Initials returning valid Retry tokens.
++    retry_validated: AtomicU64,
++    /// Initials with valid NEW_TOKEN tokens.
++    address_validated: AtomicU64,
++    /// Rejected Retry tokens.
++    invalid_retry_token: AtomicU64,
++    /// Nonempty tokens treated as absent because they cannot be decoded.
++    undecodable_token: AtomicU64,
++    /// Address-validation tokens treated as absent after validation fails.
++    invalid_address_token: AtomicU64,
++    /// Initials dropped at max_incoming.
++    queue_full: AtomicU64,
++    /// Initials dropped at the connection ID limit.
++    connection_ids_exhausted: AtomicU64,
++    /// Buffered datagrams dropped at a byte cap.
++    buffer_full: AtomicU64,
++    /// Explicit API refusals.
++    refused: AtomicU64,
++    /// Explicit API ignores.
++    ignored: AtomicU64,
++    /// Accept errors, including stale queued Initials.
++    accept_failed: AtomicU64,
++    /// Live queued incomings.
++    queued: AtomicUsize,
++    /// Sum of effective max_incoming values of live listening endpoints.
++    limit: AtomicUsize,
++    /// Live endpoints with a server configuration.
++    endpoints: AtomicUsize,
++}
++
++impl IncomingStats {
++    /// Read one cumulative protocol outcome.
++    pub fn count(&self, event: IncomingEvent) -> u64 {
++        self.counter(event).load(Ordering::Relaxed)
++    }
++
++    /// Current incoming attempts retained before an application decision, in attempts.
++    pub fn queued(&self) -> usize {
++        self.queued.load(Ordering::Relaxed)
++    }
++
++    /// Sum of effective incoming ceilings of live listening endpoints, in attempts.
++    pub fn limit(&self) -> usize {
++        self.limit.load(Ordering::Relaxed)
++    }
++
++    /// Number of live endpoints with a server configuration.
++    pub fn endpoints(&self) -> usize {
++        self.endpoints.load(Ordering::Relaxed)
++    }
++
++    /// Resolve a fixed outcome to its atomic counter.
++    fn counter(&self, event: IncomingEvent) -> &AtomicU64 {
++        match event {
++            IncomingEvent::RetryValidated => &self.retry_validated,
++            IncomingEvent::AddressValidated => &self.address_validated,
++            IncomingEvent::InvalidRetryToken => &self.invalid_retry_token,
++            IncomingEvent::UndecodableToken => &self.undecodable_token,
++            IncomingEvent::InvalidAddressToken => &self.invalid_address_token,
++            IncomingEvent::QueueFull => &self.queue_full,
++            IncomingEvent::ConnectionIdsExhausted => &self.connection_ids_exhausted,
++            IncomingEvent::BufferFull => &self.buffer_full,
++            IncomingEvent::Refused => &self.refused,
++            IncomingEvent::Ignored => &self.ignored,
++            IncomingEvent::AcceptFailed => &self.accept_failed,
++        }
++    }
++
++    /// Record a protocol outcome at its decision site.
++    pub(crate) fn record(&self, event: IncomingEvent) {
++        self.counter(event).fetch_add(1, Ordering::Relaxed);
++    }
++
++    /// Account for one incoming inserted into an endpoint's slab.
++    pub(crate) fn enqueue(&self) {
++        self.queued.fetch_add(1, Ordering::Relaxed);
++    }
++
++    /// Release incomings removed from a slab, including endpoint destruction.
++    pub(crate) fn dequeue(&self, count: usize) {
++        self.queued.fetch_sub(count, Ordering::Relaxed);
++    }
++
++    /// Add an endpoint's current effective server configuration.
++    pub(crate) fn add_server(&self, limit: usize) {
++        self.limit.fetch_add(limit, Ordering::Relaxed);
++        self.endpoints.fetch_add(1, Ordering::Relaxed);
++    }
++
++    /// Remove an endpoint's previous effective server configuration.
++    pub(crate) fn remove_server(&self, limit: usize) {
++        self.limit.fetch_sub(limit, Ordering::Relaxed);
++        self.endpoints.fetch_sub(1, Ordering::Relaxed);
++    }
++}
+diff --git upstream/src/lib.rs patched/src/lib.rs
+index 5982b69033db7e1d366e05074fdf32098509976a..f00f4bc9190b6caec0656db872e20bd017c4969a 100644
+--- upstream/src/lib.rs
++++ patched/src/lib.rs
+@@ -70,9 +70,11 @@ use crate::frame::Frame;
+ pub use crate::frame::{ApplicationClose, ConnectionClose, Datagram, FrameType};
+ 
+ mod endpoint;
++mod incoming_stats;
+ pub use crate::endpoint::{
+     AcceptError, ConnectError, ConnectionHandle, DatagramEvent, Endpoint, Incoming, RetryError,
+ };
++pub use incoming_stats::{IncomingEvent, IncomingStats};
+ 
+ mod packet;
+ pub use packet::{
+@@ -111,10 +113,12 @@ pub(crate) use web_time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+ 
+ #[cfg(fuzzing)]
+ pub mod fuzzing {
+-    pub use crate::connection::{Retransmits, State as ConnectionState, StreamsState};
+-    pub use crate::frame::ResetStream;
+-    pub use crate::packet::PartialDecode;
+-    pub use crate::transport_parameters::TransportParameters;
++    pub use crate::{
++        connection::{Retransmits, State as ConnectionState, StreamsState},
++        frame::ResetStream,
++        packet::PartialDecode,
++        transport_parameters::TransportParameters,
++    };
+     pub use bytes::{BufMut, BytesMut};
+ 
+     #[cfg(feature = "arbitrary")]
+diff --git patched/src/tests/incoming_observations.rs patched/src/tests/incoming_observations.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..718c14b88f1a9cebd62ae380426f796f60c5e945
+--- /dev/null
++++ patched/src/tests/incoming_observations.rs
+@@ -0,0 +1,214 @@
++//! Deterministic observations at real endpoint decision sites.
++
++use super::{token::FakeTimeSource, *};
++use crate::token::{IncomingToken, Token, TokenPayload};
++use rand::{SeedableRng, rngs::StdRng};
++
++/// Construct an observed endpoint using the existing packet-driven protocol harness.
++fn observed_pair(limit: usize) -> (Pair, Arc<IncomingStats>) {
++    let stats = Arc::new(IncomingStats::default());
++    let mut endpoint = EndpointConfig::default();
++    endpoint.incoming_stats(Arc::clone(&stats));
++    let mut server = server_config();
++    server.max_incoming(limit);
++    let mut pair = Pair::new(Arc::new(endpoint), server);
++    pair.server.handle_incoming = Box::new(|_| IncomingConnectionBehavior::Wait);
++    (pair, stats)
++}
++
++/// Deliver a new client's Initial while holding the application decision open.
++fn queued_initial(pair: &mut Pair) -> Result<Incoming, &'static str> {
++    pair.begin_connect(client_config());
++    pair.drive_client();
++    pair.server.drive_incoming(pair.time, pair.client.addr);
++    pair.server
++        .waiting_incoming
++        .pop()
++        .ok_or("Initial did not reach incoming queue")
++}
++
++/// Every terminal disposition must release the actual endpoint slab entry.
++#[derive(Clone, Copy)]
++enum Disposition {
++    /// Successful accept.
++    Accept,
++    /// Accept after the queued Initial's idle deadline.
++    Timeout,
++    /// Explicit connection refusal.
++    Refuse,
++    /// Explicit silent discard.
++    Ignore,
++    /// Stateless Retry response.
++    Retry,
++}
++
++/// Occupancy is measured at insertion and removal, including failed accept.
++#[test]
++fn incoming_observations_release_every_disposition() -> Result<(), &'static str> {
++    [
++        Disposition::Accept,
++        Disposition::Timeout,
++        Disposition::Refuse,
++        Disposition::Ignore,
++        Disposition::Retry,
++    ]
++    .into_iter()
++    .try_for_each(|disposition| {
++        let (mut pair, stats) = observed_pair(7);
++        let incoming = queued_initial(&mut pair)?;
++        assert_eq!(stats.limit(), 7);
++        assert_eq!(stats.endpoints(), 1);
++        assert_eq!(stats.queued(), 1);
++        match disposition {
++            Disposition::Accept => {
++                pair.server
++                    .try_accept(incoming, pair.time)
++                    .map_err(|_| "accept failed")?;
++            }
++            Disposition::Timeout => {
++                assert!(matches!(
++                    pair.server
++                        .try_accept(incoming, pair.time + Duration::from_secs(3600)),
++                    Err(ConnectionError::TimedOut)
++                ));
++            }
++            Disposition::Refuse => {
++                let refusal = pair.server.refuse(incoming, &mut Vec::new());
++                assert!(refusal.size > 0);
++            }
++            Disposition::Ignore => pair.server.ignore(incoming),
++            Disposition::Retry => {
++                let retry = pair
++                    .server
++                    .endpoint
++                    .retry(incoming, &mut Vec::new())
++                    .map_err(|_| "retry failed")?;
++                assert!(retry.size > 0);
++            }
++        }
++        assert_eq!(
++            stats.count(IncomingEvent::Refused),
++            u64::from(matches!(disposition, Disposition::Refuse))
++        );
++        assert_eq!(
++            stats.count(IncomingEvent::Ignored),
++            u64::from(matches!(disposition, Disposition::Ignore))
++        );
++        assert_eq!(
++            stats.count(IncomingEvent::AcceptFailed),
++            u64::from(matches!(disposition, Disposition::Timeout))
++        );
++        assert_eq!(stats.queued(), 0);
++        drop(pair);
++        assert_eq!(stats.limit(), 0);
++        assert_eq!(stats.endpoints(), 0);
++        Ok(())
++    })
++}
++
++/// Saturation is observed before the app hook and remains bounded across many source addresses.
++#[test]
++fn incoming_observations_cap_and_shutdown() -> Result<(), &'static str> {
++    let (mut pair, stats) = observed_pair(1);
++    let incoming = queued_initial(&mut pair)?;
++    (1..=1000).for_each(|port| {
++        pair.client.addr.set_port(port);
++        pair.client
++            .addr
++            .set_ip(Ipv6Addr::from(u128::from(port)).into());
++        pair.begin_connect(client_config());
++        pair.drive_client();
++        pair.server.drive_incoming(pair.time, pair.client.addr);
++    });
++    assert_eq!(stats.queued(), 1);
++    assert!(stats.count(IncomingEvent::QueueFull) >= 1000);
++    assert_eq!(stats.count(IncomingEvent::InvalidRetryToken), 0);
++    // An undecided incoming is owned by the endpoint; shutdown releases its slab entry.
++    pair.server.waiting_incoming.push(incoming);
++    drop(pair);
++    assert_eq!(stats.queued(), 0);
++    assert_eq!(stats.limit(), 0);
++    assert_eq!(stats.endpoints(), 0);
++    Ok(())
++}
++
++/// The effective default and replacement ceilings come from ServerConfig itself.
++#[test]
++fn incoming_observations_effective_configuration() {
++    let (mut pair, stats) = observed_pair(3);
++    let default = server_config();
++    let expected = default.max_incoming;
++    pair.server.set_server_config(Some(Arc::new(default)));
++    assert_eq!(stats.limit(), expected);
++    assert_eq!(stats.endpoints(), 1);
++    pair.server.set_server_config(None);
++    assert_eq!(stats.limit(), 0);
++    assert_eq!(stats.endpoints(), 0);
++}
++
++/// Opaque and decoded-but-invalid address tokens are observable even when treated as absent.
++#[test]
++fn incoming_observations_fallback_tokens() -> Result<(), &'static str> {
++    let (mut pair, stats) = observed_pair(7);
++    let incoming = queued_initial(&mut pair)?;
++    let mut header = crate::packet::InitialHeader {
++        dst_cid: ConnectionId::new(&[0; 8]),
++        src_cid: ConnectionId::new(&[1; 8]),
++        token: Bytes::new(),
++        number: crate::packet::PacketNumber::U8(0),
++        version: 1,
++    };
++    let server = server_config();
++    header.token = Bytes::from_static(b"not a token");
++    let opaque = IncomingToken::from_header(&header, &server, pair.client.addr, Some(&stats))
++        .map_err(|_| "opaque token should fall back")?;
++    assert!(!opaque.validated);
++    assert_eq!(stats.count(IncomingEvent::UndecodableToken), 1);
++    let token = Token::new(
++        TokenPayload::Validation {
++            ip: Ipv4Addr::new(192, 0, 2, 1).into(),
++            issued: SystemTime::now(),
++        },
++        &mut StdRng::seed_from_u64(7),
++    );
++    header.token = token.encode(&*server.token_key).into();
++    let wrong_ip = IncomingToken::from_header(&header, &server, pair.client.addr, Some(&stats))
++        .map_err(|_| "address token should fall back")?;
++    assert!(!wrong_ip.validated);
++    assert_eq!(stats.count(IncomingEvent::InvalidAddressToken), 1);
++    pair.server.ignore(incoming);
++    Ok(())
++}
++
++/// Real Retry returns and expired tokens are counted before application admission.
++#[test]
++fn incoming_observations_retry_return_and_invalid_token() {
++    [false, true].into_iter().for_each(|expired| {
++        let (mut pair, stats) = observed_pair(7);
++        let time = Arc::new(FakeTimeSource::new());
++        let mut server = server_config();
++        server
++            .time_source(time.clone())
++            .retry_token_lifetime(Duration::from_secs(1));
++        pair.server.set_server_config(Some(Arc::new(server)));
++        pair.server.handle_incoming = Box::new(validate_incoming);
++        pair.begin_connect(client_config());
++        pair.drive_client();
++        pair.drive_server();
++        pair.drive_client();
++        if expired {
++            time.advance(Duration::from_secs(2));
++        }
++        pair.drive();
++        assert_eq!(
++            stats.count(IncomingEvent::RetryValidated),
++            u64::from(!expired)
++        );
++        assert_eq!(
++            stats.count(IncomingEvent::InvalidRetryToken),
++            u64::from(expired)
++        );
++        assert_eq!(stats.count(IncomingEvent::AddressValidated), 0);
++        assert_eq!(stats.queued(), 0);
++    });
++}
+diff --git upstream/src/tests/mod.rs patched/src/tests/mod.rs
+index 1c24d34a4e3ba8aef4002450577f2b6f8612aa0c..a28fd57f2cf7cc087055035d106040bdda49976a 100644
+--- upstream/src/tests/mod.rs
++++ patched/src/tests/mod.rs
+@@ -35,14 +35,15 @@ use crate::{
+ mod util;
+ use util::*;
+ 
++mod incoming_observations;
+ mod token;
+ 
+ #[cfg(all(target_family = "wasm", target_os = "unknown"))]
+ use wasm_bindgen_test::wasm_bindgen_test as test;
+ 
+ // Enable this if you want to run these tests in the browser.
+-// Unfortunately it's either-or: Enable this and you can run in the browser, disable to run in nodejs.
+-// #[cfg(all(target_family = "wasm", target_os = "unknown"))]
++// Unfortunately it's either-or: Enable this and you can run in the browser, disable to run in
++// nodejs. #[cfg(all(target_family = "wasm", target_os = "unknown"))]
+ // wasm_bindgen_test::wasm_bindgen_test_configure!(run_in_browser);
+ 
+ #[test]
+@@ -187,7 +188,7 @@ fn version_negotiate_client() {
+     assert_matches!(
+         client_ch.poll(),
+         Some(Event::ConnectionLost {
+-            reason: ConnectionError::VersionMismatch,
++            reason: ConnectionError::VersionMismatch
+         })
+     );
+ }
+@@ -1599,13 +1600,13 @@ fn idle_timeout() {
+     assert_matches!(
+         pair.client_conn_mut(client_ch).poll(),
+         Some(Event::ConnectionLost {
+-            reason: ConnectionError::TimedOut,
++            reason: ConnectionError::TimedOut
+         })
+     );
+     assert_matches!(
+         pair.server_conn_mut(server_ch).poll(),
+         Some(Event::ConnectionLost {
+-            reason: ConnectionError::TimedOut,
++            reason: ConnectionError::TimedOut
+         })
+     );
+ }
+@@ -1962,8 +1963,7 @@ fn cid_rotation() {
+     let mut stop = pair.time;
+     let end = pair.time + 5 * CID_TIMEOUT;
+ 
+-    use crate::LOC_CID_COUNT;
+-    use crate::cid_queue::CidQueue;
++    use crate::{LOC_CID_COUNT, cid_queue::CidQueue};
+     let mut active_cid_num = CidQueue::LEN as u64 + 1;
+     active_cid_num = active_cid_num.min(LOC_CID_COUNT);
+     let mut left_bound = 0;
+@@ -2010,8 +2010,7 @@ fn cid_retirement() {
+     assert!(!pair.server_conn_mut(server_ch).is_closed());
+     assert_matches!(pair.client_conn_mut(client_ch).active_rem_cid_seq(), 1);
+ 
+-    use crate::LOC_CID_COUNT;
+-    use crate::cid_queue::CidQueue;
++    use crate::{LOC_CID_COUNT, cid_queue::CidQueue};
+     let mut active_cid_num = CidQueue::LEN as u64;
+     active_cid_num = active_cid_num.min(LOC_CID_COUNT);
+ 
+@@ -3533,7 +3532,8 @@ fn ack_frequency_ack_sent_after_reordered_packets_above_threshold() {
+         pair.drive_client();
+     }
+ 
+-    // Restore the default MTU and send another ping, which will arrive earlier than the dropped ones
++    // Restore the default MTU and send another ping, which will arrive earlier than the dropped
++    // ones
+     pair.mtu = DEFAULT_MTU;
+     pair.client_conn_mut(client_ch).ping();
+     pair.drive_client();
+@@ -3667,7 +3667,7 @@ fn silently_drop_rejected_initials() {
+     assert_matches!(
+         pair.client_conn_mut(client_ch).poll(),
+         Some(Event::ConnectionLost {
+-            reason: ConnectionError::TimedOut,
++            reason: ConnectionError::TimedOut
+         })
+     );
+ }
+@@ -3790,7 +3790,8 @@ fn datagram_gso() {
+     let final_ios = pair.client_conn_mut(client_ch).stats().udp_tx.ios;
+     let final_bytes = pair.client_conn_mut(client_ch).stats().udp_tx.bytes;
+     assert_eq!(final_ios - initial_ios, 1);
+-    // Expected overhead: flags + CID + PN + tag + frame type + frame length = 1 + 8 + 1 + 16 + 1 + 2 = 29
++    // Expected overhead: flags + CID + PN + tag + frame type + frame length = 1 + 8 + 1 + 16 + 1 +
++    // 2 = 29
+     assert_eq!(
+         final_bytes - initial_bytes,
+         ((29 + DATAGRAM_LEN) * DATAGRAMS) as u64
+@@ -3852,7 +3853,8 @@ fn pad_to_mtu() {
+     pair.server.capture_inbound_packets = true;
+ 
+     info!("sending");
+-    // Send two datagrams significantly smaller than MTU, but large enough to require two UDP datagrams.
++    // Send two datagrams significantly smaller than MTU, but large enough to require two UDP
++    // datagrams.
+     const LEN_1: usize = 800;
+     const LEN_2: usize = 600;
+     pair.client_datagrams(client_ch)
+@@ -4140,7 +4142,8 @@ fn ack_bundled_with_datagrams() {
+ 
+     pair.drive();
+ 
+-    // No more acks should be sent from server since ACK to the first packet has been sent with the datagram
++    // No more acks should be sent from server since ACK to the first packet has been sent with the
++    // datagram
+     assert_eq!(
+         server_tx_acks_after_datagram,
+         pair.server_conn_mut(server_ch).stats().frame_tx.acks,
+diff --git upstream/src/token.rs patched/src/token.rs
+index d071321fdc181d67ce8bbdfd3018f5910bca686b..752972dd7dd5c9ffc194adcfff5d409ba755a16d 100644
+--- upstream/src/token.rs
++++ patched/src/token.rs
+@@ -38,8 +38,8 @@ pub trait TokenLog: Send + Sync {
+     /// Parameters:
+     /// - `nonce`: A server-generated random unique value for the token.
+     /// - `issued`: The time the server issued the token.
+-    /// - `lifetime`: The expiration time of address validation tokens sent via NEW_TOKEN frames,
+-    ///   as configured by [`ServerValidationTokenConfig::lifetime`][1].
++    /// - `lifetime`: The expiration time of address validation tokens sent via NEW_TOKEN frames, as
++    ///   configured by [`ServerValidationTokenConfig::lifetime`][1].
+     ///
+     /// [1]: crate::ValidationTokenConfig::lifetime
+     ///
+@@ -117,6 +117,7 @@ impl IncomingToken {
+         header: &InitialHeader,
+         server_config: &ServerConfig,
+         remote_address: SocketAddr,
++        stats: Option<&crate::IncomingStats>,
+     ) -> Result<Self, InvalidRetryTokenError> {
+         let unvalidated = Self {
+             retry_src_cid: None,
+@@ -138,7 +139,12 @@ impl IncomingToken {
+         //
+         // > If the token is invalid, then the server SHOULD proceed as if the client did not have
+         // > a validated address, including potentially sending a Retry packet.
+-        let Some(retry) = Token::decode(&*server_config.token_key, &header.token) else {
++        let Some(retry) = Token::decode(&*server_config.token_key, &header.token).or_else(|| {
++            stats
++                .iter()
++                .for_each(|stats| stats.record(crate::IncomingEvent::UndecodableToken));
++            None
++        }) else {
+             return Ok(unvalidated);
+         };
+ 
+@@ -164,11 +170,17 @@ impl IncomingToken {
+             }
+             TokenPayload::Validation { ip, issued } => {
+                 if ip != remote_address.ip() {
++                    stats
++                        .iter()
++                        .for_each(|stats| stats.record(crate::IncomingEvent::InvalidAddressToken));
+                     return Ok(unvalidated);
+                 }
+                 if issued + server_config.validation_token.lifetime
+                     < server_config.time_source.now()
+                 {
++                    stats
++                        .iter()
++                        .for_each(|stats| stats.record(crate::IncomingEvent::InvalidAddressToken));
+                     return Ok(unvalidated);
+                 }
+                 if server_config
+@@ -177,6 +189,9 @@ impl IncomingToken {
+                     .check_and_insert(retry.nonce, issued, server_config.validation_token.lifetime)
+                     .is_err()
+                 {
++                    stats
++                        .iter()
++                        .for_each(|stats| stats.record(crate::IncomingEvent::InvalidAddressToken));
+                     return Ok(unvalidated);
+                 }
+ 
+@@ -429,9 +444,10 @@ mod test {
+ 
+     #[test]
+     fn retry_token_sanity() {
+-        use crate::MAX_CID_SIZE;
+-        use crate::cid_generator::{ConnectionIdGenerator, RandomConnectionIdGenerator};
+-        use crate::{Duration, UNIX_EPOCH};
++        use crate::{
++            Duration, MAX_CID_SIZE, UNIX_EPOCH,
++            cid_generator::{ConnectionIdGenerator, RandomConnectionIdGenerator},
++        };
+ 
+         use std::net::Ipv6Addr;
+ 
