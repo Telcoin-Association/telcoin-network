@@ -15,7 +15,7 @@ use std::{
 use tn_config::ConsensusConfig;
 use tn_network_libp2p::{
     read_frame, types::NetworkEvent, write_frame, DenyReason, GossipMessage, ResponseChannel,
-    Stream, SyncFrame, SyncFrameError, WorkerSyncRequest,
+    ServiceClass, Stream, SyncFrame, SyncFrameError, WorkerSyncRequest,
 };
 use tn_storage::consensus::ConsensusChain;
 use tn_types::{
@@ -347,33 +347,47 @@ where
         channel: ResponseChannel<WorkerResponse>,
         cancel: oneshot::Receiver<()>,
     ) {
-        // clone for spawned tasks
-        let request_handler = self.request_handler.clone();
-        let network_handle = self.network_handle.clone();
-        let task_name = format!("process-report-batch-{}", sealed_batch.digest());
-        self.network_handle.get_task_spawner().spawn_task(task_name, async move {
-            tokio::select! {
-                res = request_handler.process_report_batch(&peer, sealed_batch) => {
-                    let response = match res {
-                        Ok(()) => WorkerResponse::ReportBatch,
-                        Err(err) => {
-                            // classify transient responder-side conditions as
-                            // recoverable so the requester retries instead of
-                            // treating this as a permanent rejection
-                            let response = WorkerResponse::into_error_ref(&err);
-                            if let Some(penalty) = err.into() {
-                                network_handle.report_penalty(peer, penalty).await;
+        // Serve budget: offer the request to the batch class before any work for it. `None`
+        // means the class has no free permit; the shed is already counted under `serve_budget`.
+        // Dropping the response channel and the cancel receiver sends no reply, so the swarm
+        // also counts the request as an `omitted` failure. The default budget is unbounded, so
+        // this only observes until an operator sets `serve_budget.batch`.
+        if let Some(serve_permit) = self
+            .network_handle
+            .inner_handle()
+            .serve_permits()
+            .try_acquire(ServiceClass::Batch, peer)
+        {
+            // clone for spawned tasks
+            let request_handler = self.request_handler.clone();
+            let network_handle = self.network_handle.clone();
+            let task_name = format!("process-report-batch-{}", sealed_batch.digest());
+            self.network_handle.get_task_spawner().spawn_task(task_name, async move {
+                // hold the serve permit for the task's lifetime, so every exit releases it
+                let _serve_permit = serve_permit;
+                tokio::select! {
+                    res = request_handler.process_report_batch(&peer, sealed_batch) => {
+                        let response = match res {
+                            Ok(()) => WorkerResponse::ReportBatch,
+                            Err(err) => {
+                                // classify transient responder-side conditions as
+                                // recoverable so the requester retries instead of
+                                // treating this as a permanent rejection
+                                let response = WorkerResponse::into_error_ref(&err);
+                                if let Some(penalty) = err.into() {
+                                    network_handle.report_penalty(peer, penalty).await;
+                                }
+                                response
                             }
-                            response
-                        }
-                    };
-                    let _ = network_handle.inner_handle().send_response(response, channel).await;
-                },
-                // cancel notification from network layer
-                _ = cancel => (),
-            }
-            Ok(())
-        });
+                        };
+                        let _ = network_handle.inner_handle().send_response(response, channel).await;
+                    },
+                    // cancel notification from network layer
+                    _ = cancel => (),
+                }
+                Ok(())
+            });
+        }
     }
 
     /// Process gossip from a worker.

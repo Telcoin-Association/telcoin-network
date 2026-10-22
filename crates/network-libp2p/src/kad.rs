@@ -2,6 +2,7 @@
 
 use crate::{
     consensus::MAX_ADVERTISED_MULTIADDRS,
+    diagnostics::{bounded_error, bounded_warn},
     freshness::RecordTimestamp,
     retention::{RecordRetention, RetentionBudget},
     types::NetworkType,
@@ -26,7 +27,6 @@ use tn_storage::tables::{
     KadProviderRecords, KadRecords, KadWorkerProviderRecords, KadWorkerRecords,
 };
 use tn_types::{encode, now, try_decode, BlockHash, BlsPublicKey, Database, DefaultHashFunction};
-use tracing::{error, warn};
 
 /// A record stored in the DHT.
 /// This is a "shadow" struct for a kad Record so we can serialize/deserialize
@@ -211,7 +211,7 @@ fn instant_to_system(expires: &Option<Instant>) -> Option<SystemTime> {
 fn decode_providers(key: &BlockHash, raw: &[u8]) -> Option<Vec<KadProviderRecord>> {
     try_decode::<Vec<KadProviderRecord>>(raw)
         .inspect_err(|error| {
-            warn!(target: "network-kad", ?error, ?key, "skipping undecodable provider record");
+            bounded_warn!(Store, target: "network-kad", ?error, ?key, "skipping undecodable provider record");
         })
         .ok()
 }
@@ -474,11 +474,11 @@ impl<DB: Database> KadStore<DB> {
                 NetworkType::Worker(_) => self.db.contains_key::<KadWorkerRecords>(&hash),
             }
             .map_err(|error| {
-                error!(target: "network-kad", ?error, ?key, kad_type = ?self.kad_type, "failed to verify Kademlia record deletion");
+                bounded_error!(Store, target: "network-kad", ?error, ?key, kad_type = ?self.kad_type, "failed to verify Kademlia record deletion");
                 Error::MaxRecords
             })?;
             if remains {
-                error!(target: "network-kad", ?key, kad_type = ?self.kad_type, "failed to delete unretained Kademlia record; row stays counted");
+                bounded_error!(Store, target: "network-kad", ?key, kad_type = ?self.kad_type, "failed to delete unretained Kademlia record; row stays counted");
                 Err(Error::MaxRecords)
             } else {
                 Ok(())
@@ -551,7 +551,7 @@ impl<DB: Database> KadStore<DB> {
             NetworkType::Worker(_) => self.db.get::<KadWorkerRecords>(&hash),
         }
         .inspect_err(|error| {
-            error!(target: "network-kad", ?error, "failed to read record freshness metadata");
+            bounded_error!(Store, target: "network-kad", ?error, "failed to read record freshness metadata");
         })
         .ok()
         .flatten()
@@ -578,7 +578,7 @@ impl<DB: Database> KadStore<DB> {
             NetworkType::Worker(_) => self.db.get::<KadWorkerRecords>(&key),
         }
         .map_err(|error| {
-            error!(target: "network-kad", ?error, kad_type = ?self.kad_type, "failed to read Kademlia record before insert");
+            bounded_error!(Store, target: "network-kad", ?error, kad_type = ?self.kad_type, "failed to read Kademlia record before insert");
             Error::ValueTooLarge
         })?;
         // Startup excludes unreadable records, so repairing one is an insertion for capacity
@@ -611,7 +611,7 @@ impl<DB: Database> KadStore<DB> {
             NetworkType::Worker(_) => self.db.insert::<KadWorkerRecords>(&key, &encoded),
         }
         .map_err(|error| {
-            error!(target: "network-kad", ?error, kad_type = ?self.kad_type, "failed to insert Kademlia record");
+            bounded_error!(Store, target: "network-kad", ?error, kad_type = ?self.kad_type, "failed to insert Kademlia record");
             Error::ValueTooLarge
         })?;
         if new_record {
@@ -783,7 +783,7 @@ impl<DB: Database> RecordStore for KadStore<DB> {
             NetworkType::Worker(_) => self.db.get::<KadWorkerRecords>(&key),
         }
         .inspect_err(|error| {
-            error!(target: "network-kad", ?error, kad_type = ?self.kad_type, "failed to read Kademlia record");
+            bounded_error!(Store, target: "network-kad", ?error, kad_type = ?self.kad_type, "failed to read Kademlia record");
         })
         .ok()?;
         let raw = record?;
@@ -808,7 +808,7 @@ impl<DB: Database> RecordStore for KadStore<DB> {
             NetworkType::Worker(_) => self.db.get::<KadWorkerRecords>(&key),
         }
         .inspect_err(|error| {
-            error!(target: "network-kad", ?error, key = ?k, kad_type = ?self.kad_type, "failed to read Kademlia record before removal");
+            bounded_error!(Store, target: "network-kad", ?error, key = ?k, kad_type = ?self.kad_type, "failed to read Kademlia record before removal");
         })
         .ok()
         .flatten()
@@ -819,7 +819,7 @@ impl<DB: Database> RecordStore for KadStore<DB> {
             NetworkType::Worker(_) => self.db.remove::<KadWorkerRecords>(&key),
         }
         .inspect_err(|error| {
-            error!(target: "network-kad", ?error, key = ?k, kad_type = ?self.kad_type, "failed to remove Kademlia record");
+            bounded_error!(Store, target: "network-kad", ?error, key = ?k, kad_type = ?self.kad_type, "failed to remove Kademlia record");
         })
         .is_ok()
             && row_counted
@@ -846,7 +846,7 @@ impl<DB: Database> RecordStore for KadStore<DB> {
         // sibling caps here (`max_providers_per_key`, `max_provided_keys`) bound different
         // axes and do not limit the address list inside one record.
         (record.addresses.len() <= MAX_ADVERTISED_MULTIADDRS).then_some(()).ok_or_else(|| {
-            warn!(
+            bounded_warn!(Store,
                 target: "network-kad",
                 count = record.addresses.len(),
                 max = MAX_ADVERTISED_MULTIADDRS,
@@ -863,7 +863,7 @@ impl<DB: Database> RecordStore for KadStore<DB> {
             NetworkType::Worker(_) => self.db.get::<KadWorkerProviderRecords>(&key),
         }
         .map_err(|error| {
-            error!(target: "network-kad", ?error, kad_type = ?self.kad_type, "failed to read Kademlia provider records before insert");
+            bounded_error!(Store, target: "network-kad", ?error, kad_type = ?self.kad_type, "failed to read Kademlia provider records before insert");
             Error::ValueTooLarge
         })?;
 
@@ -910,7 +910,7 @@ impl<DB: Database> RecordStore for KadStore<DB> {
             NetworkType::Worker(_) => self.db.insert::<KadWorkerProviderRecords>(&key, &encoded),
         }
         .map_err(|error| {
-            error!(target: "network-kad", ?error, kad_type = ?self.kad_type, "failed to insert Kademlia provider records");
+            bounded_error!(Store, target: "network-kad", ?error, kad_type = ?self.kad_type, "failed to insert Kademlia provider records");
             self.record_provider_write_failure();
             Error::ValueTooLarge
         })?;
@@ -933,7 +933,7 @@ impl<DB: Database> RecordStore for KadStore<DB> {
         // panicking. The startup scrub and the mutating paths do the actual purge.
         stored
             .inspect_err(|error| {
-                error!(target: "network-kad", ?error, kad_type = ?self.kad_type, "failed to read Kademlia provider records");
+                bounded_error!(Store, target: "network-kad", ?error, kad_type = ?self.kad_type, "failed to read Kademlia provider records");
             })
             .ok()
             .flatten()
@@ -970,7 +970,7 @@ impl<DB: Database> RecordStore for KadStore<DB> {
             NetworkType::Worker(_) => self.db.get::<KadWorkerProviderRecords>(&hash),
         }
         .inspect_err(|error| {
-            error!(target: "network-kad", ?error, kad_type = ?self.kad_type, "failed to read Kademlia provider records before removal");
+            bounded_error!(Store, target: "network-kad", ?error, kad_type = ?self.kad_type, "failed to read Kademlia provider records before removal");
         })
         .ok()
         .flatten();
@@ -1004,7 +1004,7 @@ impl<DB: Database> RecordStore for KadStore<DB> {
                     }
                 }
                 .inspect_err(|error| {
-                    error!(target: "network-kad", ?error, kad_type = ?self.kad_type, "failed to update Kademlia provider records after removal");
+                    bounded_error!(Store, target: "network-kad", ?error, kad_type = ?self.kad_type, "failed to update Kademlia provider records after removal");
                     self.record_provider_write_failure();
                 });
             }
