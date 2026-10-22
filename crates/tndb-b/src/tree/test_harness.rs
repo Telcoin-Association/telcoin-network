@@ -351,6 +351,19 @@ impl PageWrite for MemStore {
         Ok(self.raw_mut(pgno))
     }
 
+    /// One `copy_within` of the page's range: the buffer has no readers to alias.
+    fn copy_published(&mut self, from: u32, to: u32) -> Result<&mut [u8]> {
+        if self.alloc.is_private(from) {
+            return Err(Error::Failed(format!("page {from} is private: it needs no copy")));
+        }
+        self.page(from)?;
+        self.page_mut(to)?;
+        let size = self.geometry.page_size();
+        let start = from as usize * size;
+        self.data.copy_within(start..start + size, to as usize * size);
+        Ok(self.raw_mut(to))
+    }
+
     fn free(&mut self, pgno: u32) {
         self.alloc.free(pgno);
     }

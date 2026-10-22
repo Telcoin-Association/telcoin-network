@@ -53,7 +53,9 @@ sort by key, then by subkey, as MDBX sorts a key's values.
 | `StoragesTrie` | `B256` (32) | `StoredNibblesSubKey` (65) |
 
 A read returns the value (subkey, then the rest) as one slice of the page, through the engine's
-`current_with_key_tail`, with no copy. A row this layout cannot hold is `MDBX_BAD_VALSIZE`.
+`current_with_key_tail`, with no copy. `seek_by_key_subkey` reads its row in the seek itself, from
+the leaf the seek fetched (the engine's `seek_with_key_tail`), with `key ‖ subkey` built on the
+stack. A row this layout cannot hold is `MDBX_BAD_VALSIZE`.
 
 ## Differences from MDBX, in brief
 
@@ -112,8 +114,10 @@ On Apple Silicon add `TNDB_RETH_BENCH_MDBX_PAGE=4096` for MDBX pages the size of
 default is the OS page, 16 KiB there; on Linux x86_64 it is 4 KiB already). `TNDB_RETH_BENCH_N` sets
 the `hash_keys` batch sizes (default `10000,100000`; reth's add `1000000`), `TNDB_RETH_BENCH_ROWS`
 picks rows by group (`table`, `dupsort`, `hash`, `get`, `put`) or by part of a label,
-`TNDB_RETH_BENCH_REPEAT` the minimum samples per cell, and `TNDB_RETH_BENCH_ENGINES` one side for
-profiling. The module docs give each workload, the data, the timing and where they differ from
+`TNDB_RETH_BENCH_REPEAT` the minimum samples per cell, `TNDB_RETH_BENCH_ENGINES` one side for
+profiling, and `TNDB_RETH_BENCH_SYNC=nosync` skips every commit sync on both sides (tndb `NoSync`,
+MDBX `UtterlyNoSync`), so the write rows time the CPU alone: the table's header then says "CPU only,
+not the gate". The module docs give each workload, the data, the timing and where they differ from
 reth's.
 
 **The Linux gate** decides: each bench at most 1.10× MDBX, with at most one explained row up to
@@ -216,11 +220,11 @@ to about 2 KB in the leaf. TN blocks carry no ommers.
 
 **The tuning:** two changes, from samply profiles of the `RandomRead` rows (a read transaction, then
 10 times a new cursor and its `seek_exact`). A new engine cursor zeroed and moved a 784-byte path
-(`[(u32, usize); 48]`, 96 stores) on every creation; its steps are now `(u32, u32)`
-(`tree_cursor_stays_small`), which took about 45 ns off each `RandomRead` operation. The table map
-hashed each table name with SipHash on every call; it now hashes with `NameHasher` (FxHash's step),
-which halved `Get.get` (an empty table, so the lookup path alone) and took 17 ns off each `Put` row
-operation.
+(`[(u32, usize); 48]`, 96 stores) on every creation; its steps became `(u32, u32)`, which took about
+45 ns off each `RandomRead` operation (the path is now 288 bytes, `u32` pages and `u16` slots:
+`tree_cursor_stays_small`). The table map hashed each table name with SipHash on every call; it now
+hashes with `NameHasher` (FxHash's step), which halved `Get.get` (an empty table, so the lookup path
+alone) and took 17 ns off each `Put` row operation.
 
 **Zero-copy dup reads:** a dup-sort row's value used to be rebuilt, subkey then rest, in the
 cursor's buffer. The cursors now read the row again once a move is done through the engine's

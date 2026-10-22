@@ -71,7 +71,7 @@ use crate::{
     sys,
     tree::{
         read::{checked_child, checked_page},
-        write::Scratch,
+        write::{copy_page, Scratch},
         PageRead, PageWrite, TreeRoot,
     },
     txn::{RoTxn, RwTxn, TableRoots},
@@ -340,6 +340,11 @@ impl Drop for EnvInner {
 pub(crate) struct Writer {
     /// The page file (only the writer changes it).
     pub(crate) file: PageFile,
+    /// The readers' view of [`Self::file`]'s mapping ([`PageFile::view`]): the one [`MapView`]
+    /// the file updates in place whenever its mapping moves, so it never needs refreshing. A
+    /// field apart from `file`, so [`PageWrite::copy_published`] borrows a published page through
+    /// it while it writes a private page through `file`.
+    pub(crate) view: Arc<MapView>,
     /// The page geometry.
     pub(crate) geometry: Geometry,
     /// The page allocator of the writing transaction.
@@ -679,6 +684,31 @@ impl PageWrite for Writer {
         self.file.page_mut(pgno, self.geometry.page_size())
     }
 
+    /// The source is borrowed through [`Self::view`], as a reader borrows a page, and the
+    /// destination through `file`'s [`PageFile::page_mut`]: each slice covers exactly its own
+    /// page, and they are disjoint because `from` is not private and `to` is. A page past the
+    /// published bytes, where the view ends, is no page of a committed tree, only one this
+    /// transaction freed: [`copy_unpublished`] copies it as the two-step copy did, so its checks
+    /// stay exactly [`PageRead::page`]'s.
+    #[inline]
+    fn copy_published(&mut self, from: u32, to: u32) -> Result<&mut [u8]> {
+        if self.alloc.is_private(from) {
+            return Err(private_source(from));
+        }
+        let size = self.geometry.page_size();
+        let Some(src) = self.view.slice(u64::from(from) * size as u64, size) else {
+            return copy_unpublished(self, from, to);
+        };
+        let src =
+            checked_page(from, self.alloc.page_count(), self.alloc.txn(), false, |_| Some(src))?;
+        if !self.alloc.is_private(to) {
+            return Err(not_private(to));
+        }
+        let dst = self.file.page_mut(to, size)?;
+        copy_page(src, to, dst)?;
+        Ok(dst)
+    }
+
     fn free(&mut self, pgno: u32) {
         self.alloc.free(pgno);
     }
@@ -756,6 +786,25 @@ fn not_private(pgno: u32) -> Error {
     Error::Failed(format!("page {pgno} is not private: copy it first"))
 }
 
+/// [`Writer::copy_published`]'s error for a source page that is private.
+#[cold]
+#[inline(never)]
+fn private_source(pgno: u32) -> Error {
+    Error::Failed(format!("page {pgno} is private: it needs no copy"))
+}
+
+/// [`Writer::copy_published`] for a page past the published bytes (see there): fetched through
+/// the file with [`PageRead::page`]'s checks and copied through a buffer of its own. No sound
+/// tree reaches it.
+#[cold]
+#[inline(never)]
+fn copy_unpublished(writer: &mut Writer, from: u32, to: u32) -> Result<&mut [u8]> {
+    let src = writer.page(from)?.to_vec();
+    let dst = writer.page_mut(to)?;
+    copy_page(&src, to, dst)?;
+    Ok(dst)
+}
+
 /// How step 4 syncs dirty `pages` (ascending). Runs of adjacent pages separated by at most
 /// [`MERGE_GAP`] clean pages merge into one range. Pages that form exactly one range, in at most
 /// [`MAX_RUNS`] runs, get one `msync` of it; any other set gets one `fdatasync` of the file.
@@ -807,6 +856,7 @@ impl Env {
         let file = PageFile::from_file(file, options.map_reserve)?;
         let snapshot = checked_snapshot(meta, geometry, file.view())?;
         let writer = Writer {
+            view: file.view(),
             file,
             geometry,
             alloc: Allocator::new(meta.txn + 1, meta.page_count),

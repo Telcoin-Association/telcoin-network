@@ -1006,8 +1006,6 @@ fn split_pages<S: PageRead + ?Sized>(
 pub(crate) struct Scratch {
     /// The pages [`reserve`] took for the write; empty between writes.
     reserved: Vec<u32>,
-    /// [`writable`]'s copy of a published page.
-    copy: Vec<u8>,
     /// The splits' buffers.
     split: page::SplitBuf,
 }
@@ -1072,27 +1070,31 @@ fn write_run<S: PageWrite + ?Sized>(store: &mut S, npages: u32, value: &[u8]) ->
     Ok(Ovf { pgno: p, txn: txn as u32, len })
 }
 
-/// The writable version of page `p`: `p` itself if private, else a copy in a reserved page,
-/// re-stamped with its new page number and this transaction's id and its trailer zeroed (dirty);
-/// the original is freed. (The planning descent verified it.)
+/// The writable version of page `p`: `p` itself if private, else a copy in a reserved page
+/// ([`PageWrite::copy_published`], one copy), re-stamped with its new page number and this
+/// transaction's id and its trailer zeroed (dirty); the original is freed. (The planning descent
+/// verified it.)
 fn writable<S: PageWrite + ?Sized>(store: &mut S, p: u32, scratch: &mut Scratch) -> Result<u32> {
     if store.is_private(p) {
         return Ok(p);
     }
     let q = scratch.reserved.pop().ok_or_else(|| bug("copy-on-write ran out of reserved pages"))?;
     let txn = store.txn();
-    let buf = &mut scratch.copy;
-    buf.clear();
-    buf.extend_from_slice(store.page(p)?);
-    let copy = store.page_mut(q)?;
-    if copy.len() != buf.len() {
-        return Err(bug(format!("page {q} of {} bytes, not {}", copy.len(), buf.len())));
-    }
-    copy.copy_from_slice(buf);
+    let copy = store.copy_published(p, q)?;
     page::set_pgno_txn(copy, q, txn);
     crc::zero_crc(copy);
     store.free(p);
     Ok(q)
+}
+
+/// Copy page `src` into private page `to`'s bytes `dst` ([`PageWrite::copy_published`]): both
+/// are one page, else a broken invariant ([`Error::Failed`]), never a panic.
+pub(crate) fn copy_page(src: &[u8], to: u32, dst: &mut [u8]) -> Result<()> {
+    if dst.len() != src.len() {
+        return Err(bug(format!("page {to} of {} bytes, not {}", dst.len(), src.len())));
+    }
+    dst.copy_from_slice(src);
+    Ok(())
 }
 
 /// Make the planned root-to-leaf path writable, top-down: a copied child is re-pointed in its
@@ -4652,5 +4654,180 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Copy-on-write of published page `p` through [`writable`], against the two-step copy it
+    /// replaced (the page into a buffer, the buffer into the reserved page, then the stamp): the
+    /// same bytes, the new page number and this txn in the header, the trailer zeroed.
+    fn assert_one_copy_is_the_two_step_copy<S: PageWrite + ?Sized>(store: &mut S, p: u32) {
+        let txn = store.txn();
+        let q = store.alloc().expect("alloc");
+        let mut want = store.page(p).expect("a published page").to_vec();
+        page::set_pgno_txn(&mut want, q, txn);
+        crc::zero_crc(&mut want);
+        let mut scratch = Scratch::default();
+        scratch.reserved.push(q);
+        assert_eq!(writable(store, p, &mut scratch).expect("copy"), q);
+        let got = store.private_page(q).expect("the copy");
+        assert!(got == want.as_slice(), "page {p} copied to {q}: not the two-step copy");
+        assert_eq!((page::pgno(got), page::txn(got)), (q, txn), "page {p}: the stamp");
+        assert!(crc::crc_is_zero(got), "page {p}: the trailer");
+    }
+
+    /// [`PageWrite::copy_published`] of page `p` into private page `q` returns what
+    /// [`PageRead::page`] of `p` returns: its bytes, or its error, message and all.
+    fn assert_copy_fails_as_page_fails<S: PageWrite + ?Sized>(store: &mut S, p: u32, q: u32) {
+        let want = store.page(p).map(<[u8]>::to_vec).map_err(|e| e.to_string());
+        let got = store.copy_published(p, q).map(|c| c.to_vec()).map_err(|e| e.to_string());
+        assert_eq!(got, want, "copy of page {p}");
+    }
+
+    /// The damage cases of [`assert_copy_fails_as_page_fails`] on published page `p`, each
+    /// undone after: a zero trailer, a header naming another page, a txn after the writer's;
+    /// and the pages either side of the tree pages. `raw` gives a page's bytes unchecked.
+    fn assert_copies_fail_as_pages_fail<S: PageWrite + ?Sized>(
+        store: &mut S,
+        p: u32,
+        raw: fn(&mut S, u32) -> &mut [u8],
+    ) {
+        let q = store.alloc().expect("alloc");
+        let (txn, saved) = (store.txn(), raw(store, p).to_vec());
+        let page_txn = page::txn(&saved);
+        type Damage<'d> = &'d dyn Fn(&mut [u8]);
+        let damages: [Damage<'_>; 4] =
+            [&|_| {}, &|b| crc::zero_crc(b), &|b| page::set_pgno_txn(b, p + 1, page_txn), &|b| {
+                page::set_pgno_txn(b, p, txn + 1)
+            }];
+        for damage in damages {
+            damage(raw(store, p));
+            assert_copy_fails_as_page_fails(store, p, q);
+            raw(store, p).copy_from_slice(&saved);
+        }
+        let count = store.page_count();
+        for outside in [0, 1, count, count + 1] {
+            assert_copy_fails_as_page_fails(store, outside, q);
+        }
+        let err = store.copy_published(q, q).expect_err("a private source");
+        assert!(matches!(&err, Error::Failed(m) if m.contains("is private")), "{err}");
+    }
+
+    /// A [`MemStore`] holding a committed tree of a few levels, and its handle.
+    fn committed_mem_store() -> (MemStore, TreeRoot) {
+        let mut store = MemStore::new(4096);
+        let mut root = TreeRoot::EMPTY;
+        for i in 0..600u32 {
+            put(&mut store, &mut root, &i.to_be_bytes(), &[i as u8; 40]).expect("put");
+        }
+        store.commit_like();
+        assert!(root.height >= 2, "a tree with branches");
+        (store, root)
+    }
+
+    /// An environment (4 KiB pages, a 16 KiB reservation, so its mapping has moved) holding a
+    /// committed table of a few levels.
+    fn committed_env() -> (tempfile::TempDir, crate::Env) {
+        let dir = tempfile::TempDir::with_prefix("tndb_b_cow").expect("temp dir");
+        let options = crate::EnvOptions { map_reserve: 16 << 10, ..Default::default() };
+        let env = crate::Env::open(dir.path().join("db"), options).expect("open");
+        let mut txn = env.begin_rw().expect("begin");
+        let table = txn.create_table("t").expect("table");
+        for i in 0..600u32 {
+            txn.put(&table, &i.to_be_bytes(), &[i as u8; 40]).expect("put");
+        }
+        txn.commit().expect("commit");
+        (dir, env)
+    }
+
+    /// The pages of the writer's newest committed state that its trees reach: the catalog's, the
+    /// free list's and every table's.
+    fn published_tree_pages(w: &crate::env::Writer) -> Vec<u32> {
+        let (catalog, free) = (w.last.catalog, w.last.free);
+        let tables = walk_tree(w, &catalog).entries.into_iter().map(|(_, record)| {
+            crate::catalog::TableRecord::decode(&record).expect("a table record").root
+        });
+        [catalog, free].into_iter().chain(tables).flat_map(|r| walk_tree(w, &r).pages).collect()
+    }
+
+    /// Copy-on-write takes one copy, through [`PageWrite::copy_published`], and gives the bytes
+    /// the two-step copy gave, on a [`MemStore`] (`copy_within`) and on the environment's writer
+    /// (a published page through the readers' view into a private page).
+    #[test]
+    fn copy_on_write_is_the_two_step_copy() {
+        let (mut store, root) = committed_mem_store();
+        for p in store.reachable_pgnos(&root) {
+            assert_one_copy_is_the_two_step_copy(&mut store, p);
+        }
+
+        let (_dir, env) = committed_env();
+        let mut txn = env.begin_rw().expect("begin");
+        let w = txn.writer_mut();
+        let pages = published_tree_pages(w);
+        assert!(pages.len() > 5, "{} tree pages", pages.len());
+        for p in pages {
+            assert_one_copy_is_the_two_step_copy(w, p);
+        }
+    }
+
+    /// A page published before the file grew past the writer's mapping, in the same transaction,
+    /// is copied from the new mapping with the right bytes: the writer's view is the file's own
+    /// [`crate::file::MapView`], which the remap moved.
+    #[test]
+    fn copy_on_write_reads_a_page_published_before_a_remap() {
+        let (_dir, env) = committed_env();
+        let mut txn = env.begin_rw().expect("begin");
+        let w = txn.writer_mut();
+        let size = w.geometry.page_size();
+        let p = *published_tree_pages(w).last().expect("a tree page");
+        let before = w.file.page(p, size).expect("mapped").as_ptr();
+        let mut grown = 0;
+        while w.file.page(p, size).expect("mapped").as_ptr() == before {
+            w.alloc().expect("alloc");
+            grown += 1;
+            assert!(grown < 4096, "the mapping never moved");
+        }
+        let view = w.view.slice(u64::from(p) * size as u64, size).expect("in the view");
+        assert_eq!(view.as_ptr(), w.file.page(p, size).expect("mapped").as_ptr(), "the view moved");
+        assert_one_copy_is_the_two_step_copy(w, p);
+    }
+
+    /// A copy-on-write fetches its source with exactly [`PageRead::page`]'s checks: a damaged or
+    /// out-of-range page fails with the same error, and a page past the published bytes that
+    /// this transaction freed (where the writer's view ends) is copied as `page` reads it.
+    #[test]
+    fn copy_on_write_fails_as_the_page_fetch_fails() {
+        let (mut store, root) = committed_mem_store();
+        let leaf = *store.reachable_pgnos(&root).last().expect("a page");
+        assert_copies_fail_as_pages_fail(&mut store, leaf, MemStore::raw_mut);
+
+        fn raw(w: &mut crate::env::Writer, p: u32) -> &mut [u8] {
+            let size = w.geometry.page_size();
+            w.file.page_mut(p, size).expect("in the file")
+        }
+        let (_dir, env) = committed_env();
+        let mut txn = env.begin_rw().expect("begin");
+        let w = txn.writer_mut();
+        let size = w.geometry.page_size();
+        let leaf = *published_tree_pages(w).last().expect("a tree page");
+        assert_copies_fail_as_pages_fail(w, leaf, raw);
+
+        // A freed page past the published bytes, forged to pass the checks, then not.
+        let src = w.page(leaf).expect("leaf").to_vec();
+        let freed = loop {
+            let p = w.alloc().expect("alloc");
+            if p >= w.last.page_count {
+                break p;
+            }
+        };
+        let (txn_id, page) = (w.txn(), raw(w, freed));
+        page.copy_from_slice(&src);
+        page::set_pgno_txn(page, freed, txn_id);
+        crc::add_crc32_nonzero(page);
+        let q = w.alloc().expect("alloc");
+        w.free(freed);
+        assert!(w.view.slice(u64::from(freed) * size as u64, size).is_none(), "past the view");
+        assert!(w.page(freed).is_ok(), "page reads it");
+        assert_copy_fails_as_page_fails(w, freed, q);
+        crc::zero_crc(raw(w, freed));
+        assert_copy_fails_as_page_fails(w, freed, q);
     }
 }

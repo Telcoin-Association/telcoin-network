@@ -273,6 +273,13 @@ pub(crate) trait PageWrite: PageRead {
     /// refused: it must be copied first.
     fn page_mut(&mut self, pgno: u32) -> Result<&mut [u8]>;
 
+    /// Copy page `from`, fetched with exactly [`PageRead::page`]'s checks (whose
+    /// [`Error::Corrupt`] it returns as is), into private page `to`, and return `to`'s bytes:
+    /// copy-on-write in one copy, the store lending the source and the destination at once. A
+    /// private `from` is refused ([`Error::Failed`]), so the two never overlap; so is a `to` that
+    /// is not private, as [`Self::page_mut`] refuses it.
+    fn copy_published(&mut self, from: u32, to: u32) -> Result<&mut [u8]>;
+
     /// Page `pgno` left the tree: a published page is freed once no reader or durable meta can
     /// reach it; a private one is reusable at once.
     fn free(&mut self, pgno: u32);

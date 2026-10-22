@@ -445,6 +445,7 @@ pub(crate) fn flags(page: &[u8]) -> u8 {
 }
 
 /// The number of cells (entries of a leaf, children of a branch).
+#[inline]
 pub(crate) fn nkeys(page: &[u8]) -> usize {
     get_u16(page, NKEYS_OFF).map_or(0, usize::from)
 }
@@ -455,6 +456,7 @@ pub(crate) fn txn(page: &[u8]) -> u64 {
 }
 
 /// The offset of the lowest cell (the page size minus the trailer when the page is empty).
+#[inline]
 pub(crate) fn upper(page: &[u8]) -> usize {
     get_u16(page, UPPER_OFF).map_or(0, usize::from)
 }
@@ -507,6 +509,7 @@ pub(crate) fn set_pgno_txn(page: &mut [u8], pgno: u32, txn: u64) {
     put_u64(page, TXN_OFF, txn);
 }
 
+#[inline]
 fn valid_len(len: usize) -> bool {
     len.is_power_of_two() && (MIN_PAGE_SIZE..=MAX_PAGE_SIZE).contains(&len)
 }
@@ -705,8 +708,10 @@ fn cell_error(page: &[u8], h: &Hdr, i: usize) -> Error {
 
 /// Leaf cell `i` as `(offset, klen, vlen)`, checked to end inside the cell area and to carry
 /// flags 0 (an inline value) or [`CELL_OVERFLOW`] with a 12-byte value (an overflow reference,
-/// [`leaf_val`]); every other flag is refused.
-#[inline]
+/// [`leaf_val`]); every other flag is refused. Always inlined: every leaf read runs it, and with
+/// this many callers a plain `#[inline]` left it a call in hot paths such as
+/// [`crate::RoCursor::current_with_key_tail`] as the adapter crate compiles it.
+#[inline(always)]
 fn leaf_cell(page: &[u8], h: &Hdr, i: usize) -> Result<(usize, usize, usize)> {
     let off = cell_off(page, h, i)?;
     let vlen = read_u32(page, off) as usize;
