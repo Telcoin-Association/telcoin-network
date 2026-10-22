@@ -1972,6 +1972,12 @@ impl PeerManager {
         self.peers.get_peer(peer_id).map(|peer| peer.multiaddr_count())
     }
 
+    /// Refill the shared inbound `PutRecord` budget to its burst.
+    #[cfg(test)]
+    pub(crate) fn refill_put_record_budget(&mut self) {
+        self.put_record_budget = PutRecordBudget::new(Instant::now());
+    }
+
     /// Check whether a kad-sourced record fails the shared local freshness policy.
     ///
     /// Mirrors the store-side freshness check so kad-sourced ordinary records never regress

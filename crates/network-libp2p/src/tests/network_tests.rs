@@ -3665,11 +3665,14 @@ async fn test_kad_self_advertisement_confirms_when_store_is_full() -> eyre::Resu
 
     // Two valid records per relay stay below both the per-source message limit and the
     // tracked-source cap. Fill the real store through the inbound handler without confirming
-    // any of the non-committee identities advertised by these relays.
+    // any of the non-committee identities advertised by these relays. Refill the shared budget
+    // before each record: this test pins store saturation, and the shared budget has its own
+    // tests.
     std::iter::repeat_with(PeerId::random)
         .flat_map(|source| std::iter::repeat_n(source, 2))
         .take(max_records)
         .try_for_each(|source| -> eyre::Result<()> {
+            network.swarm.behaviour_mut().peer_manager.refill_put_record_budget();
             let bls = BlsKeypair::generate(&mut rng);
             let netkey = NetworkKeypair::generate_ed25519();
             let record = NodeRecord::build(
