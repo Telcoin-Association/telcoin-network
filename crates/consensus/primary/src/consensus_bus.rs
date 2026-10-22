@@ -1264,7 +1264,7 @@ impl ConsensusBusApp {
     ) -> impl TnReceiver<NetworkEvent<crate::network::Req, crate::network::Res>> {
         self.inner
             .primary_network_events
-            .subscribe_retain(|event| primary_event_is_current(event, epoch))
+            .subscribe_retain(move |event| primary_event_is_current(event, epoch))
     }
 
     /// Provide a subscription (Receiver) for consensus output.
