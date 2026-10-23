@@ -130,6 +130,53 @@ impl SwarmNetworkBudget {
     }
 }
 
+/// Opt-in per-class ceilings on inbound requests that the application serves at once, in permits.
+///
+/// Zero, the default for every class, means unbounded: the node admits every request of that
+/// class and only observes the occupancy. The classes are the swarm's inbound service classes.
+/// The network crate maps each class to its field, so this type stays free of network types.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ServeBudget {
+    /// Permits for primary vote requests.
+    vote: u32,
+    /// Permits for primary epoch record requests.
+    epoch_record: u32,
+    /// Permits for certificate catch-up requests. No current request takes this class.
+    certificate_sync: u32,
+    /// Permits for worker batch reports.
+    batch: u32,
+    /// Permits for every other request class.
+    other: u32,
+}
+
+impl ServeBudget {
+    /// Permits for primary vote requests. Zero is unbounded.
+    pub fn vote(&self) -> u32 {
+        self.vote
+    }
+
+    /// Permits for primary epoch record requests. Zero is unbounded.
+    pub fn epoch_record(&self) -> u32 {
+        self.epoch_record
+    }
+
+    /// Permits for certificate catch-up requests. Zero is unbounded.
+    pub fn certificate_sync(&self) -> u32 {
+        self.certificate_sync
+    }
+
+    /// Permits for worker batch reports. Zero is unbounded.
+    pub fn batch(&self) -> u32 {
+        self.batch
+    }
+
+    /// Permits for every other request class. Zero is unbounded.
+    pub fn other(&self) -> u32 {
+        self.other
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -208,6 +255,33 @@ mod tests {
             )),
             Ok((1, 1, u32::MAX, u32::MAX))
         );
+        Ok(())
+    }
+
+    /// An absent serve budget leaves every class unbounded, a partial one sets only the named
+    /// classes, and an unknown class is rejected.
+    #[test]
+    fn serve_budget_defaults_to_unbounded_and_sets_named_classes_only(
+    ) -> Result<(), serde_json::Error> {
+        let absent: ServeBudget = serde_json::from_value(serde_json::json!({}))?;
+        assert_eq!(absent, ServeBudget::default());
+        assert_eq!(
+            (
+                absent.vote(),
+                absent.epoch_record(),
+                absent.certificate_sync(),
+                absent.batch(),
+                absent.other()
+            ),
+            (0, 0, 0, 0, 0)
+        );
+        let partial: ServeBudget = serde_json::from_value(serde_json::json!({ "vote": 8 }))?;
+        assert_eq!(partial.vote(), 8);
+        assert_eq!(
+            (partial.epoch_record(), partial.certificate_sync(), partial.batch(), partial.other()),
+            (0, 0, 0, 0)
+        );
+        assert!(serde_json::from_value::<ServeBudget>(serde_json::json!({ "gossip": 1 })).is_err());
         Ok(())
     }
 }

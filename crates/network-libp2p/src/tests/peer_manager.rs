@@ -2264,6 +2264,66 @@ async fn test_learned_pinned_record_not_regressed_by_older_query_result() {
     assert_eq!(cached.rpc, Some(rpc), "older query result must not drop the advertised rpc");
 }
 
+/// Resolution observations follow learned records, exclude self, and replace all three slots.
+#[tokio::test]
+async fn committee_convergence_tracks_resolution_and_rotation() {
+    use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+    let recorder = DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    let mut manager = create_test_peer_manager(None);
+    let [local, learned, stub, missing, incoming] = [101, 102, 103, 104, 105]
+        .map(|seed| *BlsKeypair::generate(&mut StdRng::from_seed([seed; 32])).public());
+    let (info, _) = random_network_info_with_rpc();
+    manager.add_restored_peer(learned, info);
+    let (stub_info, _) = random_network_info_with_rpc();
+    manager.add_known_peer(stub, stub_info.clone());
+    manager.update_committees(
+        HashSet::from([local, learned]),
+        HashSet::from([learned, stub, missing]),
+        HashSet::from([stub, incoming]),
+    );
+    metrics::with_local_recorder(&recorder, || manager.observe_committee_resolution(local));
+    // The debugging recorder drains every gauge when taking a snapshot.
+    let observations = std::cell::RefCell::new(snapshotter.snapshot().into_vec());
+    let refresh = || *observations.borrow_mut() = snapshotter.snapshot().into_vec();
+    let gauge = |name: &str, slot: &str| {
+        observations.borrow().iter().find_map(|(key, _, _, value)| {
+            (key.key().name() == name
+                && key.key().labels().count() == 2
+                && key.key().labels().any(|label| label.key() == "slot" && label.value() == slot))
+            .then_some(value)
+            .and_then(|value| match value {
+                DebugValue::Gauge(value) => Some(value.0),
+                DebugValue::Counter(_) | DebugValue::Histogram(_) => None,
+            })
+        })
+    };
+    assert_eq!(gauge("tn_network.committee_required_members", "previous"), Some(1.0));
+    assert_eq!(gauge("tn_network.committee_unresolved_members", "previous"), Some(0.0));
+    assert_eq!(gauge("tn_network.committee_required_members", "current"), Some(3.0));
+    assert_eq!(gauge("tn_network.committee_unresolved_members", "current"), Some(2.0));
+    assert_eq!(gauge("tn_network.committee_unresolved_members", "next"), Some(2.0));
+    let snapshot = manager.committee_rpc_snapshot();
+    assert_eq!(snapshot.members().len(), 3);
+    assert_eq!(
+        snapshot.rpcs().iter().map(|(key, _)| *key).collect::<HashSet<_>>(),
+        HashSet::from([learned])
+    );
+    // Accepting verified metadata upgrades a stub without requiring a restart.
+    manager.add_restored_peer(stub, stub_info);
+    metrics::with_local_recorder(&recorder, || manager.observe_committee_resolution(local));
+    refresh();
+    assert_eq!(gauge("tn_network.committee_unresolved_members", "current"), Some(1.0));
+    assert_eq!(manager.committee_rpc_snapshot().rpcs().len(), 2);
+    manager.update_committees(HashSet::from([learned]), HashSet::from([incoming]), HashSet::new());
+    metrics::with_local_recorder(&recorder, || manager.observe_committee_resolution(local));
+    refresh();
+    assert_eq!(gauge("tn_network.committee_required_members", "current"), Some(1.0));
+    assert_eq!(gauge("tn_network.committee_unresolved_members", "current"), Some(1.0));
+    assert_eq!(gauge("tn_network.committee_required_members", "next"), Some(0.0));
+    assert!(manager.committee_rpc_snapshot().rpcs().is_empty());
+}
+
 /// Build a [`NetworkInfo`] like [`random_network_info`], but advertising a valid [`RpcInfo`].
 fn random_network_info_with_rpc() -> (NetworkInfo, RpcInfo) {
     let rpc = RpcInfo {
@@ -3881,4 +3941,48 @@ async fn test_source_admission_denial_metric_records_reason() {
             }
         });
     assert_eq!(denied, Some(1));
+}
+
+/// Membership is recomputed from the local BLS key on every committee update: a member expects
+/// every other member, a non-member expects 0, and the committee size stays exported either way.
+#[tokio::test]
+async fn test_committee_expected_follows_local_membership() {
+    use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
+    let key = |seed: u8| *BlsKeypair::generate(&mut StdRng::from_seed([seed; 32])).public();
+    let local = key(0);
+    let with_local: HashSet<BlsPublicKey> = (0..4).map(key).collect();
+    let without_local: HashSet<BlsPublicKey> = (4..8).map(key).collect();
+
+    let recorder = DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    // a snapshot clears the recorded values, so read both gauges from one snapshot per update
+    let committee_gauges = || {
+        let snapshot = snapshotter.snapshot().into_vec();
+        let gauge = |name: &str| {
+            snapshot.iter().find_map(|(composite, _, _, value)| match value {
+                DebugValue::Gauge(gauge) if composite.key().name() == name => Some(gauge.0),
+                DebugValue::Gauge(_) | DebugValue::Counter(_) | DebugValue::Histogram(_) => None,
+            })
+        };
+        (gauge("tn_network.committee_size"), gauge("tn_network.committee_peers_expected"))
+    };
+
+    let observed = metrics::with_local_recorder(&recorder, || {
+        let mut peer_manager = create_test_peer_manager(None);
+        peer_manager.local_bls_key = Some(local);
+        [with_local.clone(), without_local.clone(), with_local.clone()]
+            .into_iter()
+            .map(|current| {
+                peer_manager.update_committees(HashSet::new(), current, HashSet::new());
+                committee_gauges()
+            })
+            .collect::<Vec<_>>()
+    });
+
+    // member, rotated out, rotated back in: the size stays 4 and expected follows membership
+    assert_eq!(
+        observed,
+        vec![(Some(4.0), Some(3.0)), (Some(4.0), Some(0.0)), (Some(4.0), Some(3.0))]
+    );
 }
