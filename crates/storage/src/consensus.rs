@@ -15,7 +15,7 @@
 //!   and `ImportPath`, then `mod test`.
 
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{BTreeSet, HashMap, VecDeque},
     error::Error,
     fmt::Display,
     fs::{File, OpenOptions},
@@ -473,6 +473,12 @@ pub struct ConsensusChain {
     /// certificate), one is answered here instead of decompressing and decoding its whole sub-dag
     /// again. Each is exactly what the pack returned.
     recent_headers: Arc<Mutex<VecDeque<RecentHeader>>>,
+    /// The epoch whose in-place install replaced the live epoch's files but whose swap of
+    /// `current_pack` failed (its `open_static`): `current_pack` still holds the replaced files
+    /// until the next [`Self::stream_import`] swaps them, first thing, under `pack_install`.
+    /// Stream serving refuses the replaced handle meanwhile (its data log is not the one at the
+    /// path).
+    pending_swap: Arc<Mutex<Option<Epoch>>>,
 }
 
 /// A header [`ConsensusChain`] remembers, with the epoch and digest it is looked up by, computed
@@ -552,6 +558,7 @@ impl ConsensusChain {
             heal_failures: Arc::new(Mutex::new(HashMap::new())),
             staging_import: Arc::new(tokio::sync::Mutex::new(())),
             recent_headers: Arc::new(Mutex::new(VecDeque::new())),
+            pending_swap: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -720,17 +727,20 @@ impl ConsensusChain {
     /// drops. The seal runs on the blocking pool and is awaited asynchronously, so this never
     /// blocks a tokio worker.
     ///
-    /// Fails unless the epoch's data log under `base_path` reads back sealed afterwards. The seal
-    /// itself cannot report a failure (it is the pack state's drop, which only logs one), so the
-    /// data log is read back: one left unsealed (a failed truncate or sentinel write, a full disk
-    /// while sealing, or a pack a failed write took out of service) fails every later read of the
-    /// epoch as `CorruptPack` until `db repair`. It is logged here at `error!`, where it happens,
-    /// and returned as a [`PackError::PersistError`] naming `db repair`. The read goes through the
-    /// page cache, so it cannot see a failed final fsync, which the pack's `Drop` only logs: the
-    /// sentinel it reads may then be only in memory. An open failure the environment caused
-    /// (descriptor or memory exhaustion, [`PackError::is_environmental`]), or a check that did not
-    /// finish, proves nothing either way: it is logged as an unverified seal and returned without
-    /// the `db repair` remedy. Either error makes `new_epoch` fail, which stops the node.
+    /// Fails unless the seal succeeded ([`ConsensusPack::close_checked_if_open`]: every step of
+    /// the data log's and the indexes' seal, a failed final fsync included) and the epoch's data
+    /// log under `base_path` then reads back sealed (a second check). A pack something closed
+    /// before the handoff (a straggling handle's `seal_now`) has no seal to report here, so the
+    /// read-back alone decides. A seal that failed or was refused (a
+    /// failed msync, truncate, sentinel write or fsync, a full disk while sealing, or a pack a
+    /// failed write took out of service) can leave the epoch failing every later read as
+    /// `CorruptPack` until `db repair`, now or after a power loss. It is logged here at `error!`,
+    /// where it happens, and returned as a [`PackError::PersistError`] naming `db repair`, as is a
+    /// data log that reads back unsealed. A read-back that fails to open for a reason the
+    /// environment caused (descriptor or memory exhaustion, [`PackError::is_environmental`]), or
+    /// that did not finish, proves nothing either way: it is logged as an unverified seal and
+    /// returned without the `db repair` remedy. Either error makes `new_epoch` fail, which stops
+    /// the node.
     ///
     /// A read-only (imported) pack, or one of the epoch the handoff just opened (`new_epoch`), is
     /// not checked and reports `Ok`: a read-only pack writes nothing and was sealed when it was
@@ -755,11 +765,33 @@ impl ConsensusChain {
                  straggling request on it will fail)"
             );
         }
-        old_pack.seal_now().await;
-        drop(old_pack);
         if !check_on_disk {
+            old_pack.seal_now().await;
             return Ok(());
         }
+        match old_pack.close_checked_if_open().await {
+            Ok(true) => {}
+            // Closed before this call (a straggler's or a shutdown's `seal_now`, or a failed save):
+            // nothing to report here, so the read-back below decides.
+            Ok(false) => warn!(
+                target: "consensus::store",
+                epoch,
+                "previous-epoch pack was already closed at the handoff; checking its seal on disk"
+            ),
+            Err(e) => {
+                error!(
+                    target: "consensus::store",
+                    epoch,
+                    "previous-epoch pack failed to seal at the handoff ({e}); its reads will fail as \
+                     CorruptPack until `db repair`"
+                );
+                return Err(PackError::PersistError(format!(
+                "epoch {epoch}'s pack failed to seal at the epoch handoff ({e}); its reads fail \
+                 until `db repair`"
+            )));
+            }
+        }
+        // A second check: read the data log back sealed.
         let data = base_path.join(format!("epoch-{epoch}")).join(DATA_NAME);
         #[cfg(test)]
         let environmental =
@@ -838,6 +870,10 @@ impl ConsensusChain {
     /// This will resolve once the stream has been written.
     /// Note, if called on an epoch while streaming that epoch will just return Ok(()).
     ///
+    /// The download goes into an `import-{epoch}` directory of its own, created empty: a leftover
+    /// one that cannot be removed fails the import with [`ConsensusChainError::IO`] (this node's
+    /// fault, never the peer's) instead of being reused.
+    ///
     /// The stream must end with `epoch_record`'s final output; the import fails the moment it
     /// reads a final that is not that one. The live (writable) epoch is replaced only with the
     /// chain of its own stored record: any other record for it, such as a prefix's partial final,
@@ -852,6 +888,9 @@ impl ConsensusChain {
     ) -> Result<(), ConsensusChainError> {
         let epoch = epoch_record.epoch;
         let epoch_final_hash = epoch_record.final_consensus.hash;
+        // Before the idempotency check below, which would find the installed epoch and return
+        // without ever swapping the live handle.
+        self.complete_pending_swap().await?;
         if let Ok(pack) = self.get_static(epoch).await {
             // Idempotency / anti-truncation guard: if we already contain the requested final
             // consensus header, there is nothing to import. Checking *by number* (rather than only
@@ -909,18 +948,22 @@ impl ConsensusChain {
         // while it runs. `close()` returns only after the files are closed (FDs released),
         // without stalling a tokio worker.
         #[cfg(test)]
-        if FAIL_NEXT_IMPORT_SEAL.with(|fail| fail.replace(false)) {
-            pack.poison_data_for_test();
+        match FAIL_NEXT_IMPORT_SEAL.with(|fail| fail.replace(None)) {
+            Some(crate::consensus_pack::SealFault::Unsealed) => pack.poison_data_for_test(),
+            Some(crate::consensus_pack::SealFault::Sync) => pack.fail_next_seal_sync_for_test(),
+            None => {}
         }
-        pack.close().await;
-        // The seal is the import's only data sync after its meta commit, and `close()` cannot
-        // report a failure (the pack's `Drop` only logs it). Read the files back sealed, as
-        // `open_static` will, before installing them, so a copy whose seal never reached its files
-        // (a failed msync, truncate or sentinel write, or a poisoned log) never replaces
-        // `epoch-{N}`. The read goes through the page cache, so it cannot see a failed final
-        // fsync: such a copy is installed, and after a power loss its next read refuses it (`db
-        // repair`; its data was msynced before the seal). On failure `_import_path` removes the
-        // import directory.
+        // The seal is the import's only data sync after its meta commit: a copy whose seal failed
+        // (its msync, truncate, sentinel write or fsync, or a poisoned log) never replaces
+        // `epoch-{N}`, or after a power loss its next read could refuse the epoch with the older
+        // copy gone. On failure `_import_path` removes the import directory.
+        pack.close_checked().await.map_err(|e| {
+            PackError::PersistError(format!(
+                "epoch {epoch}: the imported pack failed to seal ({e}); nothing was installed"
+            ))
+        })?;
+        // A second check: read the files back sealed, as `open_static` will, before installing
+        // them.
         let staged = path.join(format!("epoch-{epoch}"));
         #[cfg(test)]
         let environmental =
@@ -975,13 +1018,88 @@ impl ConsensusChain {
         // Surface a genuine install failure only AFTER invalidating the cache above.
         install_result?;
         if replace_current {
-            // Do this directly, using get_static() will short circuit on the old pack...
-            // Swap the old pack out under the lock, then async-close it after the guard drops.
-            let new_static = ConsensusPack::open_static(&self.base_path, epoch)?;
-            let old = std::mem::replace(&mut *self.current_pack.lock(), new_static);
-            old.close().await;
+            // Do this directly, using get_static() will short circuit on the old pack. A failed
+            // swap is left pending, for the next import of any epoch to finish.
+            if let Err(e) = self.swap_in_installed(epoch).await {
+                *self.pending_swap.lock() = Some(epoch);
+                return Err(Self::swap_failed(epoch, e).into());
+            }
         }
         Ok(())
+    }
+
+    /// Replace `current_pack`, of `epoch`, whose files an install replaced, with a static handle
+    /// on the installed files, and close the old handle. The caller holds `pack_install`.
+    async fn swap_in_installed(&self, epoch: Epoch) -> Result<(), PackError> {
+        #[cfg(test)]
+        if FAIL_NEXT_SWAP_OPEN.with(|fail| fail.replace(false)) {
+            return Err(PackError::IO(Arc::new(io::Error::other("injected open_static failure"))));
+        }
+        let new_static = ConsensusPack::open_static(&self.base_path, epoch)?;
+        // Swap under the lock, then async-close the old pack after the guard drops.
+        let old = std::mem::replace(&mut *self.current_pack.lock(), new_static);
+        old.close().await;
+        Ok(())
+    }
+
+    /// The error for a swap of the live epoch's handle that failed after its files were
+    /// installed: this node's own failure, never the peer's (a descriptor or memory shortage
+    /// comes back as it came).
+    fn swap_failed(epoch: Epoch, e: PackError) -> PackError {
+        if e.is_environmental() {
+            return e;
+        }
+        PackError::ReadError(format!(
+            "epoch {epoch}: the import was installed, but opening it as the live pack failed \
+             ({e}); the next import finishes the swap"
+        ))
+    }
+
+    /// Finish a swap of `current_pack` that an install of the live epoch left pending (see
+    /// `pending_swap`), under `pack_install`. Once another epoch is current the handoff has closed
+    /// the replaced handle, and nothing is left to do. A swap that fails again stays pending.
+    async fn complete_pending_swap(&self) -> Result<(), ConsensusChainError> {
+        if self.pending_swap.lock().is_none() {
+            return Ok(());
+        }
+        let _install = self.pack_install.lock().await;
+        let Some(epoch) = *self.pending_swap.lock() else { return Ok(()) };
+        if self.current_pack.lock().epoch() == epoch {
+            self.swap_in_installed(epoch).await.map_err(|e| Self::swap_failed(epoch, e))?;
+            self.install_generation.fetch_add(1, Ordering::Release);
+        }
+        *self.pending_swap.lock() = None;
+        Ok(())
+    }
+
+    /// Open the data log of `epoch` by path, for a stream whose length came from a pack handle
+    /// whose data log is `handle_file` ([`ConsensusPack::data_file_id`]).
+    /// [`ConsensusChainError::StreamUnavailable`] (the caller retries) when an install of the
+    /// epoch completed since `generation` was read or is under way, or when the file at the path
+    /// is not the handle's (a live handle whose files an install replaced, see `pending_swap`):
+    /// the handle's length would frame another copy's bytes. `pack_install` is only tried, never
+    /// waited on.
+    fn open_stream_file(
+        &self,
+        epoch: Epoch,
+        generation: u64,
+        handle_file: (u64, u64),
+    ) -> Result<File, ConsensusChainError> {
+        use std::os::unix::fs::MetadataExt as _;
+        let file = {
+            let Ok(_install) = self.pack_install.try_lock() else {
+                return Err(ConsensusChainError::StreamUnavailable);
+            };
+            if self.install_generation.load(Ordering::Acquire) != generation {
+                return Err(ConsensusChainError::StreamUnavailable);
+            }
+            File::open(self.base_path.join(format!("epoch-{epoch}")).join(DATA_NAME))?
+        };
+        let meta = file.metadata()?;
+        if (meta.dev(), meta.ino()) != handle_file {
+            return Err(ConsensusChainError::StreamUnavailable);
+        }
+        Ok(file)
     }
 
     /// Return a stream reader for the data file of `epoch` together with its logical length.
@@ -992,8 +1110,8 @@ impl ConsensusChain {
         epoch: Epoch,
     ) -> Result<(Box<dyn ReadStream>, u64), ConsensusChainError> {
         // `data_len` comes from the pack handle but the file is opened by path: as in
-        // `get_partial_epoch_stream`, open it only if no install of the epoch has completed since
-        // the lookup or is under way (the caller retries).
+        // `get_partial_epoch_stream`, serve it only if no install of the epoch has completed since
+        // the lookup or is under way, and the file is the handle's (the caller retries).
         let generation = self.install_generation.load(Ordering::Acquire);
         if let Ok(pack) = self.get_static(epoch).await {
             if let Some((epoch_record, _)) = self.epochs().get_epoch_by_number(epoch).await {
@@ -1013,18 +1131,9 @@ impl ConsensusChain {
                             // the trailing bytes. It also lets the pack own its length instead of a
                             // network-triggered truncate of the served file.
                             let data_len = pack.data_file_len().await?;
+                            let handle_file = pack.data_file_id().await?;
                             drop(pack);
-                            let file = {
-                                let Ok(_install) = self.pack_install.try_lock() else {
-                                    return Err(ConsensusChainError::StreamUnavailable);
-                                };
-                                if self.install_generation.load(Ordering::Acquire) != generation {
-                                    return Err(ConsensusChainError::StreamUnavailable);
-                                }
-                                File::open(
-                                    self.base_path.join(format!("epoch-{epoch}")).join(DATA_NAME),
-                                )?
-                            };
+                            let file = self.open_stream_file(epoch, generation, handle_file)?;
                             Ok((Box::new(AsyncFile::from_std(file)), data_len))
                         } else {
                             Err(ConsensusChainError::StreamUnavailable)
@@ -1057,8 +1166,9 @@ impl ConsensusChain {
         // `end` comes from the pack handle but the file is opened by path, so an install of the
         // epoch in between would pair one copy's length with another copy's bytes. Snapshot the
         // install generation before the lookup, and open the file only if no install has completed
-        // since or is under way (the caller retries). `pack_install` is only tried, never waited
-        // on, and never held across `get_static`, which takes it on its retry path.
+        // since or is under way, then serve it only if it is the handle's data log (the caller
+        // retries; `open_stream_file`). `pack_install` is only tried, never waited on, and never
+        // held across `get_static`, which takes it on its retry path.
         let generation = self.install_generation.load(Ordering::Acquire);
         let pack =
             self.get_static(epoch).await.map_err(|_| ConsensusChainError::StreamUnavailable)?;
@@ -1067,16 +1177,9 @@ impl ConsensusChain {
         // to the separate AsyncFile handle opened below. Visibility, not durability — avoids the
         // expensive network-triggerable fsync on the live pack.
         pack.flush_data().await?;
+        let handle_file = pack.data_file_id().await?;
         drop(pack);
-        let file = {
-            let Ok(_install) = self.pack_install.try_lock() else {
-                return Err(ConsensusChainError::StreamUnavailable);
-            };
-            if self.install_generation.load(Ordering::Acquire) != generation {
-                return Err(ConsensusChainError::StreamUnavailable);
-            }
-            File::open(self.base_path.join(format!("epoch-{epoch}")).join(DATA_NAME))?
-        };
+        let file = self.open_stream_file(epoch, generation, handle_file)?;
         Ok((Box::new(AsyncFile::from_std(file)), end))
     }
 
@@ -1108,7 +1211,16 @@ impl ConsensusChain {
                     || name.starts_with("import-")
                     || name.ends_with(".migrating")
                 {
-                    let _ = std::fs::remove_dir_all(entry.path());
+                    // One that stays is never reused: the import or staging that next needs the
+                    // name removes it again, or fails with the error.
+                    if let Err(e) = std::fs::remove_dir_all(entry.path()) {
+                        warn!(
+                            target: "consensus::store",
+                            path = %entry.path().display(),
+                            %e,
+                            "failed to remove a leftover import or staging directory"
+                        );
+                    }
                 } else if name.strip_prefix("epoch-").is_some_and(|n| n.parse::<Epoch>().is_ok()) {
                     ConsensusPack::remove_stale_heal_dirs(&entry.path());
                 }
@@ -2600,43 +2712,53 @@ impl From<EpochDbError> for ConsensusChainError {
     }
 }
 
-/// Lock to prevent races when creating ImportPath's.
-static IMPORT_PATH_LOCK: Mutex<()> = Mutex::new(());
+/// The imports under way in this process, by epochs directory and epoch: while an epoch is here,
+/// no other import of it starts ([`ImportPath::new`]). Kept in memory, never on disk, so a
+/// directory that could not be removed never makes later imports of its epoch look under way, and
+/// a restart begins with none.
+static IMPORTS_UNDER_WAY: Mutex<BTreeSet<(PathBuf, Epoch)>> = Mutex::new(BTreeSet::new());
 
-/// Helper to create the stream import dir and remove on Drop.
+/// The directory a [`ConsensusChain::stream_import`] downloads into (`import-{epoch}`), and its
+/// claim on the epoch: while it lives, no other import of the epoch starts in this process.
+/// Dropping it removes the directory, then releases the claim.
 struct ImportPath {
     path: PathBuf,
+    key: (PathBuf, Epoch),
 }
 
 impl ImportPath {
-    /// New ImportPath rooted at base_path.
-    /// Returns None if this process is already importing for this epoch.
+    /// Claim `epoch` under `base_path` and create its import directory, empty. `None` if this
+    /// process is already importing the epoch.
+    ///
+    /// A directory left by an earlier import is removed first, never reused. A removal that fails
+    /// (other than for an absent directory), or a directory that exists anyway, is this node's own
+    /// I/O error and comes back as one, never charged to the peer.
     fn new(base_path: &Path, epoch: Epoch) -> io::Result<Option<Self>> {
-        // Store our files out of the way while we import so we don't use them until ready.
-        let path = base_path.join(format!("import-{epoch}"));
-        let pid = std::process::id();
-        let proc_path = path.join(format!("{pid}.inproc"));
-        // Grab the single lock so we can avoid races on the off chance we try to
-        // import the same epoch twice at the same time.
-        let _guard = IMPORT_PATH_LOCK.lock();
-        if proc_path.exists() {
-            // This process is already streaming this pack file so just return.
+        let key = (base_path.to_path_buf(), epoch);
+        // Held across the directory work, so two imports of one epoch never both start.
+        let mut under_way = IMPORTS_UNDER_WAY.lock();
+        if under_way.contains(&key) {
             return Ok(None);
         }
-        // We need to start with a clean import dir since we do not restart.
-        // Note, this should not exist but just in case...
-        let _ = std::fs::remove_dir_all(&path);
-        // Create a sentinel for this process to avoid double streams.
-        let _ = std::fs::create_dir_all(&path);
-        File::create(proc_path)?;
-        Ok(Some(Self { path }))
+        let path = base_path.join(format!("import-{epoch}"));
+        match std::fs::remove_dir_all(&path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return Err(io::Error::new(
+                    e.kind(),
+                    format!("removing the leftover import directory {}: {e}", path.display()),
+                ))
+            }
+        }
+        std::fs::create_dir(&path)?;
+        under_way.insert(key.clone());
+        Ok(Some(Self { path, key }))
     }
 
-    /// True if this epoch is already being streamed.
+    /// True if this process is importing `epoch` under `base_path`.
     fn is_streaming(base_path: &Path, epoch: Epoch) -> bool {
-        let pid = std::process::id();
-        let path = base_path.join(format!("import-{epoch}")).join(format!("{pid}.inproc"));
-        path.exists()
+        IMPORTS_UNDER_WAY.lock().contains(&(base_path.to_path_buf(), epoch))
     }
 
     /// Return the contained path.
@@ -2647,15 +2769,32 @@ impl ImportPath {
 
 impl Drop for ImportPath {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.path);
+        // The directory goes before the claim, so the next import of the epoch never starts while
+        // this one's files are still being removed. One that cannot be removed stays behind, and
+        // the next import's `ImportPath::new` reports it.
+        if let Err(e) = std::fs::remove_dir_all(&self.path) {
+            if e.kind() != io::ErrorKind::NotFound {
+                warn!(
+                    target: "consensus::store",
+                    path = %self.path.display(),
+                    %e,
+                    "failed to remove an import directory; the next import of its epoch retries"
+                );
+            }
+        }
+        IMPORTS_UNDER_WAY.lock().remove(&self.key);
     }
 }
 
 #[cfg(test)]
 thread_local! {
-    /// Test-only: the next [`ConsensusChain::stream_import`] on this thread leaves the imported
-    /// pack unsealed, as a sync failing in its `Drop` does.
-    static FAIL_NEXT_IMPORT_SEAL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Test-only: the next [`ConsensusChain::stream_import`] on this thread breaks the seal of
+    /// the imported pack's data log (see [`crate::consensus_pack::SealFault`]).
+    static FAIL_NEXT_IMPORT_SEAL: std::cell::Cell<Option<crate::consensus_pack::SealFault>> =
+        const { std::cell::Cell::new(None) };
+    /// Test-only: the next swap of `current_pack` for an installed live epoch on this thread
+    /// fails as its `open_static` would.
+    static FAIL_NEXT_SWAP_OPEN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 #[cfg(test)]
@@ -4272,13 +4411,17 @@ mod test {
             parent_hash: record0.digest(),
             ..Default::default()
         };
-        let handoff = std::time::Instant::now();
-        consensus_chain.new_epoch(record1, committee.advance_epoch_for_test(2)).await.unwrap();
-        let handoff = handoff.elapsed();
-        assert!(
-            handoff < ConsensusChain::HANDOFF_SEAL_GRACE,
-            "the handoff must not wait for a reader of another epoch: took {handoff:?}"
-        );
+        // A handoff that waited out its grace for a handle would warn that it sealed with live
+        // handles. It runs on this thread, so its log lines are captured here.
+        let (handed_off, levels) = crate::consensus_pack::test::warnings_and_errors(|| {
+            let runtime = tokio::runtime::Handle::current();
+            let next = committee.advance_epoch_for_test(2);
+            tokio::task::block_in_place(|| {
+                runtime.block_on(consensus_chain.new_epoch(record1, next))
+            })
+        });
+        handed_off.expect("handoff");
+        assert!(levels.is_empty(), "the handoff waited for a reader of another epoch: {levels:?}");
         decoding.abort();
 
         // A read of an epoch an install has moved aside waits out `pack_install`, holding no clone
@@ -4344,19 +4487,28 @@ mod test {
             parent_hash: record0.digest(),
             ..Default::default()
         };
-        let handoff = std::time::Instant::now();
-        consensus_chain.new_epoch(record1, committee.advance_epoch_for_test(2)).await.unwrap();
-        let handoff = handoff.elapsed();
+        // A handoff that waited out its grace for a handle would warn that it sealed with live
+        // handles. It runs on this thread, so its log lines are captured here.
+        let (handed_off, levels) = crate::consensus_pack::test::warnings_and_errors(|| {
+            let runtime = tokio::runtime::Handle::current();
+            let next = committee.advance_epoch_for_test(2);
+            tokio::task::block_in_place(|| {
+                runtime.block_on(consensus_chain.new_epoch(record1, next))
+            })
+        });
+        handed_off.expect("handoff");
         assert!(
-            handoff < ConsensusChain::HANDOFF_SEAL_GRACE,
-            "the handoff must not wait for a stalled decode of the epoch it seals: took {handoff:?}"
+            levels.is_empty(),
+            "the handoff waited for a stalled decode of the epoch it seals: {levels:?}"
         );
         decoding.abort();
     }
 
     /// The handoff's seal of the previous epoch fails when that epoch's data log did not end up
-    /// sealed, and logs an error: an epoch left unsealed fails its reads as `CorruptPack` until
-    /// `db repair`, so the failure must be visible where it happens. A seal check that meets
+    /// sealed (a failed seal step, a failed final fsync included, or a pack a failed save took
+    /// out of service), and logs an error: an epoch left unsealed fails its reads as
+    /// `CorruptPack` until `db repair`, so the failure must be visible where it happens. A seal
+    /// check that meets
     /// descriptor exhaustion proves nothing about the files: it fails too (the seal is
     /// unverified), with the environmental error and without the `db repair` remedy.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -4402,7 +4554,44 @@ mod test {
             "the pack itself sealed"
         );
 
-        // A save that panics takes the pack out of service unsealed (the next open recovers it).
+        // A failed final fsync in the seal: the data log reads back sealed (the sentinel is in
+        // the page cache), so only the seal's own result shows the failure.
+        let fsync_failed = TempDir::with_prefix("test_seal_fsync_failed").expect("temp dir");
+        let pack =
+            ConsensusPack::open_append(fsync_failed.path(), epoch0.clone(), committee.clone())
+                .expect("open a pack");
+        let output = make_test_output(&committee, 1, chain.clone(), 1, parent);
+        pack.save_consensus_output(output).await.expect("save");
+        pack.fail_next_seal_sync_for_test();
+        let err = ConsensusChain::seal_previous_pack(fsync_failed.path(), pack, 1)
+            .await
+            .expect_err("a failed seal fails the handoff");
+        let msg = format!("{err}");
+        assert!(msg.contains("failed to seal") && msg.contains("fsync"), "{err}");
+        assert!(msg.contains("db repair"), "the `db repair` remedy: {err}");
+        let data = fsync_failed.path().join("epoch-0").join(crate::consensus_pack::DATA_NAME);
+        assert!(
+            matches!(crate::consensus_pack::pack_unsealed_version(&data, 0), Some((_, false))),
+            "the read-back cannot see the failed fsync"
+        );
+
+        // Another handle sealed the pack before the handoff: nothing is left for the handoff to
+        // seal, and the read-back finds it sealed, so the handoff succeeds.
+        let closed_before = TempDir::with_prefix("test_seal_closed_before").expect("temp dir");
+        let pack =
+            ConsensusPack::open_append(closed_before.path(), epoch0.clone(), committee.clone())
+                .expect("open a pack");
+        let output = make_test_output(&committee, 1, chain.clone(), 1, parent);
+        pack.save_consensus_output(output).await.expect("save");
+        let straggler = pack.clone();
+        straggler.seal_now().await;
+        drop(straggler);
+        ConsensusChain::seal_previous_pack(closed_before.path(), pack, 1)
+            .await
+            .expect("a pack sealed before the handoff passes its read-back");
+
+        // A save that panics takes the pack out of service unsealed (the next open recovers it);
+        // the handoff has nothing to seal, and the read-back finds the data log unsealed.
         let broken = TempDir::with_prefix("test_seal_broken").expect("temp dir");
         let pack = ConsensusPack::open_append(broken.path(), epoch0, committee.clone())
             .expect("open a pack");
@@ -4739,12 +4928,14 @@ mod test {
         );
     }
 
-    /// An imported pack whose seal failed is never installed, whether it would replace the live
-    /// epoch (`replace_current`) or a past one: the import returns `Err`, `epoch-{N}` is left as
-    /// it was, the import directory is removed, and a retry installs the epoch. A seal check that
-    /// fails for an environmental reason returns that error unwrapped.
+    /// An imported pack whose seal failed (a poisoned log, or a failed final fsync that the
+    /// read-back cannot see) is never installed, whether it would replace the live epoch
+    /// (`replace_current`) or a past one: the import returns `Err`, `epoch-{N}` is left as it was,
+    /// the import directory is removed, and a retry installs the epoch. A seal check that fails
+    /// for an environmental reason returns that error unwrapped.
     #[tokio::test]
     async fn test_stream_import_refuses_an_unsealed_import() {
+        use crate::consensus_pack::SealFault;
         use tokio::io::AsyncReadExt as _;
 
         let source_dir = TempDir::with_prefix("test_unsealed_import_source").expect("temp dir");
@@ -4787,12 +4978,18 @@ mod test {
         live.epochs().save_record(record0.clone()).await.expect("save record");
         live.persist_current().await.expect("persist the live pack");
         let before = data_log(&live_dir);
-        super::FAIL_NEXT_IMPORT_SEAL.with(|fail| fail.set(true));
-        let err = import(&live).await.expect_err("an unsealed import of the live epoch fails");
-        assert!(format!("{err}").contains("seal check"), "{err}");
-        assert!(!live.current_pack().is_static(), "the live pack is not replaced");
-        assert_eq!(data_log(&live_dir), before, "epoch-0 is untouched");
-        assert!(!live_dir.path().join("import-0").exists(), "the import dir is removed");
+        // A poisoned log the seal refuses, and a failed final fsync that a read-back of the files
+        // cannot see: only the seal's own result shows it.
+        for (fault, why) in [(SealFault::Unsealed, "poisoned"), (SealFault::Sync, "fsync")] {
+            super::FAIL_NEXT_IMPORT_SEAL.with(|fail| fail.set(Some(fault)));
+            let err = import(&live).await.expect_err("an unsealed import of the live epoch fails");
+            let msg = format!("{err}");
+            assert!(msg.contains("failed to seal") && msg.contains(why), "{fault:?}: {err}");
+            assert!(super::FAIL_NEXT_IMPORT_SEAL.with(|fail| fail.get()).is_none(), "fired");
+            assert!(!live.current_pack().is_static(), "the live pack is not replaced");
+            assert_eq!(data_log(&live_dir), before, "epoch-0 is untouched");
+            assert!(!live_dir.path().join("import-0").exists(), "the import dir is removed");
+        }
         // Descriptor exhaustion in the seal check says nothing about the imported files: it comes
         // back as it came, not as a failed seal.
         crate::consensus_pack::ENVIRONMENTAL_NEXT_SEAL_CHECK.with(|fail| fail.set(true));
@@ -4812,14 +5009,463 @@ mod test {
         let past = ConsensusChain::new(past_dir.path().to_owned(), committee.clone()).unwrap();
         past.new_epoch(record0.clone(), committee.advance_epoch_for_test(1)).await.unwrap();
         let before = data_log(&past_dir);
-        super::FAIL_NEXT_IMPORT_SEAL.with(|fail| fail.set(true));
-        import(&past).await.expect_err("an unsealed import of a past epoch fails");
-        assert_eq!(data_log(&past_dir), before, "epoch-0 is untouched");
-        assert!(!past_dir.path().join("import-0").exists(), "the import dir is removed");
+        for fault in [SealFault::Unsealed, SealFault::Sync] {
+            super::FAIL_NEXT_IMPORT_SEAL.with(|fail| fail.set(Some(fault)));
+            import(&past).await.expect_err("an unsealed import of a past epoch fails");
+            assert_eq!(data_log(&past_dir), before, "{fault:?}: epoch-0 is untouched");
+            assert!(!past_dir.path().join("import-0").exists(), "the import dir is removed");
+        }
         import(&past).await.expect("the retry installs the past epoch");
         let epoch0 = past.get_static(0).await.expect("open epoch 0");
         let header = epoch0.consensus_header_by_number(3).await.expect("read");
         assert_eq!(header.digest(), record0.final_consensus.hash);
+    }
+
+    /// The regular files under `dir`, recursively, sorted.
+    fn files_under(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+        let mut files = Vec::new();
+        let mut dirs = vec![dir.to_path_buf()];
+        while let Some(dir) = dirs.pop() {
+            for entry in std::fs::read_dir(&dir).expect("read dir").flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    dirs.push(path);
+                } else {
+                    files.push(path);
+                }
+            }
+        }
+        files.sort();
+        files
+    }
+
+    /// Copy the directory tree `from` to `to`.
+    fn copy_tree(from: &std::path::Path, to: &std::path::Path) {
+        std::fs::create_dir_all(to).expect("create dir");
+        for entry in std::fs::read_dir(from).expect("read dir").flatten() {
+            let target = to.join(entry.file_name());
+            if entry.path().is_dir() {
+                copy_tree(&entry.path(), &target);
+            } else {
+                std::fs::copy(entry.path(), &target).expect("copy file");
+            }
+        }
+    }
+
+    /// An import never reuses files it did not create. A leftover `import-{N}` (here a whole
+    /// sealed copy of the epoch, whose reuse would fail the import's consensus-number check and
+    /// charge an honest peer) is removed before the import starts, and the import installs. One
+    /// that cannot be removed fails the import as this node's own I/O error
+    /// (`ConsensusChainError::IO`, which the network layer never charges to the peer), writes
+    /// nothing into it, and does not leave the epoch looking under way: once it can be removed,
+    /// the next import installs. Below `ConsensusChain`, an import into a directory whose
+    /// `epoch-{N}` already exists refuses it the same way, as `PackError::IO`, and a failed import
+    /// leaves none of its files behind, even when only its last index failed to open.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_stream_import_never_reuses_a_leftover_import_dir() {
+        use std::os::unix::fs::PermissionsExt as _;
+        use tokio::io::AsyncReadExt as _;
+
+        let source_dir = TempDir::with_prefix("test_leftover_import_source").expect("temp dir");
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let committee = fixture.committee();
+        let (source, record0, _) = chain_with_epoch0_outputs(&source_dir, &committee, &chain).await;
+        source.persist_current().await.expect("persist source");
+        source.epochs().save_record(record0.clone()).await.expect("save epoch record");
+        let previous_epoch = EpochRecord {
+            epoch: 0,
+            committee: committee.bls_keys().iter().copied().collect(),
+            next_committee: committee.bls_keys().iter().copied().collect(),
+            ..Default::default()
+        };
+        let stream = || async {
+            let (stream, len) = source.get_epoch_stream(0).await.expect("source epoch stream");
+            stream.take(len)
+        };
+        let import = |target: &ConsensusChain| {
+            let (record0, previous_epoch) = (record0.clone(), previous_epoch.clone());
+            let target = target.clone();
+            async move {
+                target
+                    .stream_import(
+                        stream().await,
+                        &record0,
+                        &previous_epoch,
+                        Duration::from_secs(5),
+                    )
+                    .await
+            }
+        };
+        let past_target = |dir: &TempDir| {
+            let (committee, record0) = (committee.clone(), record0.clone());
+            let path = dir.path().to_owned();
+            async move {
+                let target = ConsensusChain::new(path, committee.clone()).unwrap();
+                target.new_epoch(record0, committee.advance_epoch_for_test(1)).await.unwrap();
+                target
+            }
+        };
+
+        // A sealed copy of the epoch, as an earlier target installed it.
+        let sealed_dir = TempDir::with_prefix("test_leftover_import_sealed").expect("temp dir");
+        let sealed = past_target(&sealed_dir).await;
+        import(&sealed).await.expect("the first target installs the epoch");
+        sealed.close().await;
+
+        // A leftover holding that copy is removed, not reused.
+        let target_dir = TempDir::with_prefix("test_leftover_import_target").expect("temp dir");
+        let target = past_target(&target_dir).await;
+        let import_dir = target_dir.path().join("import-0");
+        copy_tree(&sealed_dir.path().join("epoch-0"), &import_dir.join("epoch-0"));
+        import(&target).await.expect("an import over a removable leftover installs");
+        assert!(target.is_epoch_complete(&record0).await, "the import installed the epoch");
+        assert!(!import_dir.exists(), "the import dir is removed");
+        target.close().await;
+
+        // A leftover that cannot be removed: an entry in a read-only directory.
+        let stuck_dir = TempDir::with_prefix("test_leftover_import_stuck").expect("temp dir");
+        let stuck = past_target(&stuck_dir).await;
+        let leftover = stuck_dir.path().join("import-0").join("epoch-0");
+        std::fs::create_dir_all(&leftover).expect("create leftover");
+        std::fs::write(leftover.join("junk"), b"junk").expect("write junk");
+        std::fs::write(leftover.join("root-probe"), b"probe").expect("write probe");
+        let writable = std::fs::metadata(&leftover).expect("metadata").permissions();
+        std::fs::set_permissions(&leftover, std::fs::Permissions::from_mode(0o555))
+            .expect("make the leftover read-only");
+        if std::fs::remove_file(leftover.join("root-probe")).is_ok() {
+            // Running as root: directory permissions do not apply, so nothing fails to remove.
+            eprintln!(
+                "test_stream_import_never_reuses_a_leftover_import_dir: removal-failure case \
+                 SKIPPED (root bypasses directory permissions)"
+            );
+            std::fs::set_permissions(&leftover, writable).expect("restore permissions");
+        } else {
+            let before = files_under(&leftover);
+            let result = import(&stuck).await;
+            std::fs::set_permissions(&leftover, writable).expect("restore permissions");
+            let err = result.expect_err("a leftover that cannot be removed fails the import");
+            assert!(
+                matches!(&err, ConsensusChainError::IO(e)
+                    if e.kind() == std::io::ErrorKind::PermissionDenied),
+                "the failed removal comes back as this node's I/O error, got {err:?}"
+            );
+            assert_eq!(files_under(&leftover), before, "nothing was written into the leftover");
+            assert!(!stuck.already_streaming_epoch(0), "the epoch is not left under way");
+            import(&stuck).await.expect("once it can be removed, the next import installs");
+            assert!(stuck.is_epoch_complete(&record0).await, "the retry installed the epoch");
+        }
+        stuck.close().await;
+
+        // Below `ConsensusChain`: an existing `epoch-{N}` is refused, never opened.
+        let pack_dir = TempDir::with_prefix("test_leftover_import_pack").expect("temp dir");
+        copy_tree(&sealed_dir.path().join("epoch-0"), &pack_dir.path().join("epoch-0"));
+        let before = files_under(pack_dir.path());
+        let err = crate::consensus_pack::ConsensusPack::stream_import(
+            pack_dir.path(),
+            stream().await,
+            0,
+            &previous_epoch,
+            record0.final_consensus,
+            Duration::from_secs(5),
+        )
+        .await
+        .expect_err("an import into an existing epoch dir fails");
+        assert!(
+            matches!(&err, crate::consensus_pack::PackError::IO(e) if e.kind() == std::io::ErrorKind::AlreadyExists),
+            "an existing epoch dir is this node's I/O error, got {err:?}"
+        );
+        assert_eq!(files_under(pack_dir.path()), before, "the leftover is untouched");
+
+        // A failed import removes every file it opened, the indexes as well as the data log.
+        let failed_dir = TempDir::with_prefix("test_leftover_import_failed").expect("temp dir");
+        crate::consensus_pack::FAIL_NEXT_IMPORT_INDEX_OPEN.with(|fail| fail.set(true));
+        crate::consensus_pack::ConsensusPack::stream_import(
+            failed_dir.path(),
+            stream().await,
+            0,
+            &previous_epoch,
+            record0.final_consensus,
+            Duration::from_secs(5),
+        )
+        .await
+        .expect_err("an import whose batch digest index fails to open fails");
+        assert!(
+            !crate::consensus_pack::FAIL_NEXT_IMPORT_INDEX_OPEN.with(|fail| fail.get()),
+            "the hook fired"
+        );
+        let epoch_dir = failed_dir.path().join("epoch-0");
+        assert_eq!(
+            files_under(&epoch_dir),
+            vec![epoch_dir.join(crate::consensus_pack::BATCH_DIGEST_NAME)],
+            "only the file the hook put in the batch index's place is left"
+        );
+        source.close().await;
+    }
+
+    /// `ImportPath` claims an epoch in memory: a second claim of it while the first lives is
+    /// refused (`None`, the caller's no-op), and dropping the claim releases it even when its
+    /// directory cannot be removed, so the epoch never looks under way after a failed removal.
+    /// The next claim then reports that removal failure as an error instead of reusing the
+    /// directory, and once it can be removed starts in an empty one.
+    #[cfg(unix)]
+    #[test]
+    fn test_import_path_claim_is_in_memory() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let tmp = TempDir::with_prefix("test_import_path_claim").expect("temp dir");
+        let base = tmp.path();
+        let first = super::ImportPath::new(base, 3).expect("claim").expect("the first claim");
+        assert!(super::ImportPath::is_streaming(base, 3), "the claimed epoch is under way");
+        assert!(!super::ImportPath::is_streaming(base, 4), "only the claimed epoch");
+        assert!(
+            super::ImportPath::new(base, 3).expect("claim").is_none(),
+            "a second claim is refused"
+        );
+        let other = TempDir::with_prefix("test_import_path_claim_other").expect("temp dir");
+        assert!(
+            super::ImportPath::new(other.path(), 3).expect("claim").is_some(),
+            "another epochs directory claims its own"
+        );
+
+        // An entry the drop cannot remove: a file in a read-only directory.
+        let stuck = first.path().join("stuck");
+        std::fs::create_dir(&stuck).expect("create dir");
+        std::fs::write(stuck.join("junk"), b"junk").expect("write junk");
+        std::fs::write(stuck.join("root-probe"), b"probe").expect("write probe");
+        std::fs::set_permissions(&stuck, std::fs::Permissions::from_mode(0o555))
+            .expect("make read-only");
+        let restore =
+            || std::fs::set_permissions(&stuck, std::fs::Permissions::from_mode(0o755)).unwrap();
+        if std::fs::remove_file(stuck.join("root-probe")).is_ok() {
+            eprintln!(
+                "test_import_path_claim_is_in_memory: removal-failure case SKIPPED (root \
+                 bypasses directory permissions)"
+            );
+            restore();
+            drop(first);
+            assert!(!super::ImportPath::is_streaming(base, 3), "the drop released the claim");
+            return;
+        }
+        let path = first.path().to_path_buf();
+        drop(first);
+        assert!(path.exists(), "the directory could not be removed");
+        assert!(!super::ImportPath::is_streaming(base, 3), "the drop released the claim anyway");
+        let err = match super::ImportPath::new(base, 3) {
+            Err(e) => e,
+            Ok(claim) => panic!("the leftover must not be reused (claimed: {})", claim.is_some()),
+        };
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied, "the removal's error: {err}");
+        assert!(!super::ImportPath::is_streaming(base, 3), "a failed claim claims nothing");
+        restore();
+        let claim =
+            super::ImportPath::new(base, 3).expect("claim").expect("the leftover is removed");
+        assert!(files_under(claim.path()).is_empty(), "the claim starts in an empty directory");
+        assert_eq!(std::fs::read_dir(claim.path()).unwrap().count(), 0, "no leftover entries");
+    }
+
+    /// Two imports of one epoch never run at once: the second, started while the first is still
+    /// downloading, returns `Ok` without touching the first's import directory, and the first then
+    /// installs the epoch.
+    #[tokio::test]
+    async fn test_concurrent_imports_of_an_epoch_are_deduped() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let source_dir = TempDir::with_prefix("test_dedup_import_source").expect("temp dir");
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let committee = fixture.committee();
+        let (source, record0, _) = chain_with_epoch0_outputs(&source_dir, &committee, &chain).await;
+        source.persist_current().await.expect("persist source");
+        source.epochs().save_record(record0.clone()).await.expect("save epoch record");
+        let previous_epoch = EpochRecord {
+            epoch: 0,
+            committee: committee.bls_keys().iter().copied().collect(),
+            next_committee: committee.bls_keys().iter().copied().collect(),
+            ..Default::default()
+        };
+        let mut bytes = Vec::new();
+        let (stream, len) = source.get_epoch_stream(0).await.expect("source epoch stream");
+        stream.take(len).read_to_end(&mut bytes).await.expect("read the source pack");
+
+        let target_dir = TempDir::with_prefix("test_dedup_import_target").expect("temp dir");
+        let target = ConsensusChain::new(target_dir.path().to_owned(), committee.clone()).unwrap();
+        target.new_epoch(record0.clone(), committee.advance_epoch_for_test(1)).await.unwrap();
+        let (mut writer, reader) = tokio::io::duplex(1 << 20);
+        let first_import = target.clone();
+        let first =
+            first_import.stream_import(reader, &record0, &previous_epoch, Duration::from_secs(30));
+        tokio::pin!(first);
+        // Drive the first import until it has claimed the epoch and waits on the stream.
+        tokio::select! {
+            res = &mut first => panic!("the first import ended before its stream did: {res:?}"),
+            () = async {
+                while !target.already_streaming_epoch(0) {
+                    tokio::task::yield_now().await;
+                }
+            } => {}
+        }
+        let import_dir = target_dir.path().join("import-0");
+        assert!(import_dir.is_dir(), "the first import downloads into its directory");
+        target
+            .stream_import(tokio::io::empty(), &record0, &previous_epoch, Duration::from_secs(5))
+            .await
+            .expect("a second import of the epoch is a no-op");
+        assert!(import_dir.is_dir(), "the second import left the first's directory alone");
+        assert!(target.already_streaming_epoch(0), "the first import still holds the epoch");
+        writer.write_all(&bytes).await.expect("stream the pack");
+        drop(writer);
+        first.await.expect("the first import installs");
+        assert!(target.is_epoch_complete(&record0).await, "the epoch is installed");
+        assert!(!target.already_streaming_epoch(0), "the claim is released");
+        assert!(!import_dir.exists(), "the import dir is removed");
+        source.close().await;
+        target.close().await;
+    }
+
+    /// Stream serving takes the length from a pack handle and opens the data log by path, so it
+    /// serves the file only if it is the handle's: with `epoch-{N}` replaced behind a cached
+    /// handle (no install, so no generation bump), both stream functions refuse with
+    /// `StreamUnavailable` rather than frame one copy's bytes with the other's length.
+    #[tokio::test]
+    async fn test_stream_serving_refuses_a_file_that_is_not_the_handles() {
+        use tokio::io::AsyncReadExt as _;
+
+        let source_dir = TempDir::with_prefix("test_stream_identity_source").expect("temp dir");
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let committee = fixture.committee();
+        let (source, record0, _) = chain_with_epoch0_outputs(&source_dir, &committee, &chain).await;
+        source.persist_current().await.expect("persist source");
+        source.epochs().save_record(record0.clone()).await.expect("save epoch record");
+        let previous_epoch = EpochRecord {
+            epoch: 0,
+            committee: committee.bls_keys().iter().copied().collect(),
+            next_committee: committee.bls_keys().iter().copied().collect(),
+            ..Default::default()
+        };
+        let target_dir = TempDir::with_prefix("test_stream_identity_target").expect("temp dir");
+        let target = ConsensusChain::new(target_dir.path().to_owned(), committee.clone()).unwrap();
+        target.new_epoch(record0.clone(), committee.advance_epoch_for_test(1)).await.unwrap();
+        target.epochs().save_record(record0.clone()).await.expect("save epoch record");
+        let (stream, len) = source.get_epoch_stream(0).await.expect("source epoch stream");
+        target
+            .stream_import(stream.take(len), &record0, &previous_epoch, Duration::from_secs(5))
+            .await
+            .expect("import epoch 0");
+        // Served from the cached handle on its own file.
+        target.get_epoch_stream(0).await.expect("the epoch streams");
+        target.get_partial_epoch_stream(0, 1).await.expect("a prefix streams");
+
+        // Replace `epoch-0` with a copy, outside any install.
+        let epoch_dir = target_dir.path().join("epoch-0");
+        let copy = target_dir.path().join("copy-0");
+        copy_tree(&epoch_dir, &copy);
+        std::fs::rename(&epoch_dir, target_dir.path().join("old-0")).expect("move aside");
+        std::fs::rename(&copy, &epoch_dir).expect("put the copy in place");
+        assert!(
+            matches!(target.get_epoch_stream(0).await, Err(ConsensusChainError::StreamUnavailable)),
+            "a whole-epoch stream refuses a file that is not the handle's"
+        );
+        assert!(
+            matches!(
+                target.get_partial_epoch_stream(0, 1).await,
+                Err(ConsensusChainError::StreamUnavailable)
+            ),
+            "a prefix stream refuses a file that is not the handle's"
+        );
+        source.close().await;
+        target.close().await;
+    }
+
+    /// An in-place import of the live epoch whose swap of `current_pack` fails after the install
+    /// (its `open_static`) leaves the swap pending: the import fails as this node's own error, the
+    /// replaced handle is not served (its data log is not the installed one), and the next import
+    /// finishes the swap before its idempotency check, which returns early once the node's own
+    /// saves completed the epoch in the replaced handle; the installed epoch then streams.
+    #[tokio::test]
+    async fn test_failed_live_swap_completes_on_the_next_import() {
+        use tokio::io::AsyncReadExt as _;
+
+        let source_dir = TempDir::with_prefix("test_pending_swap_source").expect("temp dir");
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let committee = fixture.committee();
+        let (source, record0, _) = chain_with_epoch0_outputs(&source_dir, &committee, &chain).await;
+        source.persist_current().await.expect("persist source");
+        source.epochs().save_record(record0.clone()).await.expect("save epoch record");
+        let previous_epoch = EpochRecord {
+            epoch: 0,
+            committee: committee.bls_keys().iter().copied().collect(),
+            next_committee: committee.bls_keys().iter().copied().collect(),
+            ..Default::default()
+        };
+        let import = |target: &ConsensusChain| {
+            let (record0, previous_epoch) = (record0.clone(), previous_epoch.clone());
+            let (source, target) = (&source, target.clone());
+            async move {
+                let (stream, len) = source.get_epoch_stream(0).await.expect("source epoch stream");
+                target
+                    .stream_import(
+                        stream.take(len),
+                        &record0,
+                        &previous_epoch,
+                        Duration::from_secs(5),
+                    )
+                    .await
+            }
+        };
+
+        // The live target holds the first two outputs of epoch 0, and its stored record.
+        let live_dir = TempDir::with_prefix("test_pending_swap_live").expect("temp dir");
+        let live = ConsensusChain::new(live_dir.path().to_owned(), committee.clone()).unwrap();
+        live.new_epoch(previous_epoch.clone(), committee.clone()).await.unwrap();
+        let source_output = |n: u64| {
+            let source = &source;
+            async move { source.get_consensus_output_current(n).await.expect("source output") }
+        };
+        for n in 1..=2u64 {
+            live.save_consensus_output(source_output(n).await).await.unwrap();
+        }
+        live.persist_current().await.expect("persist the live pack");
+        live.epochs().save_record(record0.clone()).await.expect("save record");
+
+        super::FAIL_NEXT_SWAP_OPEN.with(|fail| fail.set(true));
+        let err = import(&live).await.expect_err("a failed swap fails the import");
+        assert!(!super::FAIL_NEXT_SWAP_OPEN.with(|fail| fail.get()), "the hook fired");
+        assert!(
+            matches!(&err, ConsensusChainError::PackError(crate::consensus_pack::PackError::ReadError(msg))
+                if msg.contains("next import")),
+            "the failed swap is this node's own error, got {err:?}"
+        );
+        assert!(!live.current_pack().is_static(), "the replaced handle is still current");
+        let installed = crate::consensus_pack::ConsensusPack::open_static(live_dir.path(), 0)
+            .expect("installed epoch");
+        let header = installed.consensus_header_by_number(3).await.expect("installed final");
+        assert_eq!(header.digest(), record0.final_consensus.hash, "the epoch was installed");
+        installed.close().await;
+        assert!(
+            matches!(
+                live.get_partial_epoch_stream(0, 1).await,
+                Err(ConsensusChainError::StreamUnavailable)
+            ),
+            "the replaced handle's length is never paired with the installed file"
+        );
+        // The node's own save adds the final to the replaced handle, so the next import's
+        // idempotency check finds the epoch complete and would return without a swap.
+        live.save_consensus_output(source_output(3).await).await.expect("save the final");
+        let stale_final = live.current_pack().consensus_header_by_number(3).await.expect("final");
+        assert_eq!(stale_final.digest(), record0.final_consensus.hash, "the epoch's own final");
+
+        import(&live).await.expect("the next import finishes the swap");
+        assert!(live.current_pack().is_static(), "the installed epoch is now current");
+        assert!(live.pending_swap.lock().is_none(), "nothing is pending");
+        let (_, len) = live.get_epoch_stream(0).await.expect("the installed epoch streams");
+        assert_eq!(len, live.current_pack().data_file_len().await.expect("len"));
+        live.get_partial_epoch_stream(0, 1).await.expect("a prefix streams");
+        source.close().await;
+        live.close().await;
     }
 
     /// `import_partial_to_staging` must produce a readable verified prefix in a side dir WITHOUT
@@ -5564,10 +6210,11 @@ mod test {
         assert!(dest.current_pack().is_static(), "the whole epoch replaced the live pack");
     }
 
-    /// A process killed during an import leaves `import-{epoch}/{pid}.inproc` behind. When the
-    /// next process gets the same pid (pid 1 in a container), that sentinel would make every later
-    /// import of the epoch a silent no-op. Opening the chain must sweep stale import dirs, so the
-    /// epoch is no longer in flight and an import of it installs the pack.
+    /// A process killed during an import leaves its `import-{epoch}` directory behind, with
+    /// whatever it had written (here a file named as the on-disk sentinel imports once used, which
+    /// made every later import of the epoch a silent no-op in a process with the same pid). Opening
+    /// the chain sweeps stale import dirs, the epoch is not under way (that is tracked in memory),
+    /// and an import of it installs the pack.
     #[tokio::test]
     async fn test_new_clears_stale_import_dirs() {
         let source_dir = TempDir::with_prefix("test_stale_import_src").expect("temp dir");
@@ -5599,7 +6246,7 @@ mod test {
         };
         source.epochs().save_record(epoch_record.clone()).await.expect("save record");
 
-        // the sentinel a killed import of epoch 0 leaves when this process had its pid
+        // what a killed import of epoch 0 left, under this process's pid
         let import_dir = target_dir.path().join("import-0");
         std::fs::create_dir_all(&import_dir).expect("create import dir");
         std::fs::File::create(import_dir.join(format!("{}.inproc", std::process::id())))
@@ -5609,7 +6256,7 @@ mod test {
         assert!(!import_dir.exists(), "the open must remove the stale import dir");
         assert!(
             !target.already_streaming_epoch(0),
-            "a stale import sentinel must not survive open"
+            "a stale import dir must not leave the epoch under way"
         );
         target.epochs().save_record(epoch_record.clone()).await.expect("save record");
         assert!(!target.is_epoch_complete(&epoch_record).await);

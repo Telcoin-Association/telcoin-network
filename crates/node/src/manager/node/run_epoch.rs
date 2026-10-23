@@ -446,6 +446,20 @@ where
         // this can also happen due to committee nodes re-syncing and errors
         let consensus_shutdown_clone = consensus_shutdown.clone();
 
+        // e2e fault injection, always false without `tn-types/test-utils`: fail the peer-record
+        // store, which no epoch task writes every round, so only the `store_failed` arm below stops
+        // the node before the boundary
+        if tn_types::test_hooks::fail_store_at_epoch::<KadRecords, _>(
+            &self.consensus_db,
+            current_epoch,
+        ) {
+            warn!(
+                target: "epoch-manager",
+                epoch = current_epoch,
+                "test hook: failed the peer-record store",
+            );
+        }
+
         // Resolves once a consensus DB store latches a failure. Made before the select, which
         // borrows `self` mutably for the boundary arm.
         let store_failed = store_failure(&self.consensus_db);

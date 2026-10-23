@@ -22,6 +22,7 @@ use tracing::{error, info, warn};
 
 use crate::{
     archive::{
+        data_file::create_dir_synced,
         digest_index::HdxIndex,
         error::{fetch::FetchError, open::OpenError},
         fxhasher::FxHasher,
@@ -612,7 +613,7 @@ impl Inner {
     fn open<P: AsRef<Path>>(path: P, read_only: bool) -> Result<Self, PackError> {
         let base_dir = path.as_ref();
         if !read_only {
-            let _ = std::fs::create_dir_all(base_dir);
+            create_dir_synced(base_dir)?;
         }
         // Before touching any pack file: wait out a previous writer of this epoch.
         let epoch_lock = if read_only { None } else { Some(Self::lock_epoch_dir(base_dir)?) };

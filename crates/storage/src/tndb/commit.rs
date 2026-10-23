@@ -85,6 +85,9 @@ pub(super) struct Durability {
     /// Test-only: the commit thread's next sync fails.
     #[cfg(test)]
     pub(super) fail_next_sync: std::sync::atomic::AtomicBool,
+    /// Test-only: the commit thread's next `fsync` of the log's growth fails after the call.
+    #[cfg(test)]
+    pub(super) fail_next_growth_sync: std::sync::atomic::AtomicBool,
     /// Test-only: the syncs of this database's log so far.
     #[cfg(test)]
     pub(super) syncs: AtomicU64,
@@ -118,6 +121,8 @@ impl Durability {
             stopped: AtomicBool::new(false),
             #[cfg(test)]
             fail_next_sync: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            fail_next_growth_sync: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
             syncs: AtomicU64::new(0),
             #[cfg(test)]
@@ -386,7 +391,21 @@ fn sync_round(core: &Core) {
         // every growth below the frontier's end.
         let growths = sync.growths.load(Ordering::Acquire);
         if growths != sync.size_synced.load(Ordering::Relaxed) {
-            fsync_file(&sync.file)?;
+            let grown = fsync_file(&sync.file);
+            #[cfg(test)]
+            let grown = grown.and_then(|()| {
+                match durability.fail_next_growth_sync.swap(false, Ordering::Relaxed) {
+                    true => Err(std::io::Error::other("injected growth sync failure")),
+                    false => Ok(()),
+                }
+            });
+            if let Err(e) = grown {
+                // A barrier on the log run outside it (a duplicate descriptor): latch the log's
+                // poison through its view, as a failed `MapView::msync` does, so its close never
+                // seals it however it is dropped, not only through the writer's `log_unknown`.
+                sync.view.poison();
+                return Err(e);
+            }
             sync.size_synced.store(growths, Ordering::Relaxed);
         }
         Ok(())

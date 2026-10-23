@@ -41,8 +41,13 @@ opened as a new database: the manifest is written only after `gen-0` exists, so 
 atomically (tmp, `fsync`, rename, directory `fsync`) when a table is first opened, or when its first
 row fixes its key size. Both happen before the log holds any record of that table, so a record whose
 table id is missing from the manifest is damage. A table's index is created when its key size is
-fixed. An index directory the manifest doesn't know forces a full replay at open, which fails if
-its table has records left, and is deleted once the replay passes (see Recovery).
+fixed. From then on every point op checks a key against it: a put, a get, a `contains`, a removal
+(bare, or a transaction's at its write and again at its commit) or a transaction's get of a key of
+another size is refused as the caller's error, which latches nothing (`check_read_ksize`), rather
+than answered "absent" or, for a removal, written as nothing (the index never holds such a key). A
+table with no key size yet holds no rows: any key reads as absent. An index directory the manifest
+doesn't know forces a full replay at open, which fails if its table has records left, and is
+deleted once the replay passes (see Recovery).
 
 ## Records (`record.rs`)
 
@@ -289,6 +294,8 @@ an ordinary crash only the padding's zeros and the marker do.
 - group `persist` (durable across a power loss) and its FIFO across tables;
 - concurrent `Sync` writers (each write durable across a power loss);
 - unknown table and kind failing closed;
+- a key of the wrong size refused by every point op (put, get, `contains`, removal, and a
+  transaction's get, write and removal), with nothing latched;
 - a scan outliving every handle;
 - a second open refused;
 - a failed sync latching, and a failed manifest rewrite or index creation for a table's first row
@@ -299,7 +306,8 @@ an ordinary crash only the padding's zeros and the marker do.
 - group syncs on demand (2,000 unpersisted writes made durable within the delay by a few syncs);
 - a `persist` not waiting out the delay;
 - a stale index rebuilding alone, with an orphan index deleted;
-- a randomized crash model over two tables;
+- a randomized crash model over two tables (a crash alone keeps every batch written: the reopen
+  finds the model exactly);
 - `revert_to_published` (randomized, in `btree_index`);
 - the manifest and the record format;
 - group mode's cap on unsynced bytes (the commit thread stopped);
@@ -344,24 +352,40 @@ an ordinary crash only the padding's zeros and the marker do.
   compacted), the switch's `base` matching the written one, and index pages stamped before the
   switch;
 - power loss (`archive::data_file::disk_model`: an image per tracked file of the bytes real
-  flushes put on disk; a power loss keeps only the image, and so does a dropped page cache): rows
-  from before an unclean reopen surviving that open's later writes, a rolled-back batch staying
-  gone, the first acknowledged write after a sealed reopen leaving a durable marker over the log
-  as it opened (damage below it refused), rows acknowledged after a reopen that followed a lost
-  writeback (`set_flushes_lost`) all surviving, and the randomized model with half its crashes
-  losing power;
+  flushes put on disk, and its durable length, which only an fsync or fdatasync moves; a power
+  loss cuts the file back to that length and keeps only the image, and a dropped page cache reads
+  the image at the file's length): rows from before an unclean reopen surviving that open's later
+  writes, a rolled-back batch staying gone, the first acknowledged write after a sealed reopen
+  leaving a durable marker over the log as it opened (damage below it refused), rows acknowledged
+  after a reopen that followed a lost writeback (`set_flushes_lost`) all surviving, rows
+  acknowledged past the log's first 1 MiB surviving (the growth's fsync), every row surviving a
+  compaction (the new log tracked from its creation, `TestHooks::track_new_log`), and the
+  randomized model with half its crashes losing power (a reopen after one finds a state written
+  since the last persist; each compaction's new log tracked from its creation). Directory entries
+  are not modelled: a power loss keeps every create, rename and removal, so no test covers the
+  directory fsyncs (around the compaction's rename, the manifest's and `compacted`'s);
 - concurrency and scale: writers, a scanner, a persister and compactions at once; a
   `SplitDatabase` power loss of all three environments and a transaction whose cache part fails
   (atomic per environment); the log outgrowing its reservation (a test-only 1 MiB one) while a
   reader scans.
 
-**Mutation checks.** Each of these fails a test: applying a batch before its end, skipping the
-revert, advancing the watermark before the sync, ignoring CLEAR in replay, writers never leading a
-round, an eager commit thread, a `persist` that doesn't ask for a round, and a write that never
-wakes an idle commit thread. Accepting writes after a latch is still refused after a failed sync,
-by the poisoned log; after a read's damage, it fails the read-damage tests. A read's damage
-poisoning the log, its close leaving the indexes current, a later sync failure not keeping the
-seal off, and a removal's damage stopping the writer (the log left unsealed) each fail one too.
+**Seeds.** The randomized tests (the crash and power-loss models, compaction keeping rows, and
+the concurrent stress test) run fixed default seeds, so CI is deterministic. The environment
+variable `TNDB_MODEL_SEED` (decimal, or hex with `0x`) overrides every one of them; each test
+prints its seed on stderr and names it in its assertion messages, so a failure reproduces with
+`TNDB_MODEL_SEED=<seed> cargo test --release -p tn-storage --lib -- <test> --exact`, and a soak
+runs many seeds in a loop. (The stress test's interleaving also varies from run to run.)
+
+**Mutation checks.** Each of these fails a test: a crash path that drops the last unsynced batch
+(the randomized crash models: a process crash must keep it, though a power loss may not), a read
+or removal without its key-size check (it answers "absent", or writes nothing), applying a batch
+before its end, skipping the revert, advancing the watermark before the sync, ignoring CLEAR in
+replay, writers never leading a round, an eager commit thread, a `persist` that doesn't ask for a
+round, and a write that never wakes an idle commit thread. Accepting writes after a latch is still
+refused after a failed sync, by the poisoned log; after a read's damage, it fails the read-damage
+tests. A read's damage poisoning the log, its close leaving the indexes current, a later sync
+failure not keeping the seal off, and a removal's damage stopping the writer (the log left
+unsealed) each fail one too.
 For compaction: skipping the last catch-up, copied rows without the batch-end flag, a catch-up
 that ignores CLEAR, installing before the rename, `base` not read at open, no empty indexes,
 caching an unfixed key size, no cap on the switch's tail, a switch without the registry lock,
@@ -371,8 +395,12 @@ failures and power loss: no latch before a panicking rollback, no latch over the
 on a poisoned index, no flush of a rollback's zeros (the power-loss model sees the batch come
 back), no open-time fsync of an unclean log (the model loses rows the reopened log built on), a
 sync round that skips its msync (the randomized power-loss model, and the `Sync`-mode, group
-`persist` and `SplitDatabase` power-loss tests), and tndb's log at the default
-16 MiB record cap. For the seal until the first write: retiring the sentinel at open (the killed,
+`persist` and `SplitDatabase` power-loss tests), a sync round that skips the fsync a growth owes
+(`test_tndb_power_loss_keeps_rows_past_a_log_growth`, and the interleaved-tables, rolled-back
+batch, lost-writeback, sealed-reopen and `SplitDatabase` power-loss tests), a compaction that
+never syncs its new log before the switch (`Builder::sync`'s commit:
+`test_tndb_power_loss_after_a_compaction_keeps_every_row` and the randomized power-loss model),
+and tndb's log at the default 16 MiB record cap. For the seal until the first write: retiring the sentinel at open (the killed,
 panicking and crashed-reopen tests), and no stamp after the first append, or a skipped stamp
 counted as stamped (the sealed-reopen power-loss test). For the cache drop: no drop after the
 unclean open's fsync (the lost-writeback power-loss test: the acknowledged rows after the reopen

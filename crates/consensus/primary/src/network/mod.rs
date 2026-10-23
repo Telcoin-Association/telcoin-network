@@ -1196,8 +1196,8 @@ impl PrimaryNetworkHandle {
                 // honest pack finishes at any sustained rate at/above the floor
                 // while a drip/stalled peer is cut quickly. On such an error the
                 // future resolves `Err`, which unwinds `stream_import` so its
-                // `ImportPath` guard clears the `.inproc` sentinel and the epoch is
-                // retryable against another peer.
+                // `ImportPath` guard removes the import dir, releases the epoch's claim, and the
+                // epoch is retryable against another peer.
                 match import.await {
                     Ok(()) => Ok(()),
                     Err(e) => {

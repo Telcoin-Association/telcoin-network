@@ -1268,11 +1268,35 @@ fn read_failure(name: &str, pos: u64, source: FetchError) -> EpochDbError {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Test-only: the next `Inner::attested_end` on this thread reads its digest index as a disk
+    /// fails the read (`EIO`).
+    static FAIL_NEXT_ATTESTED_END: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// The error for an index of the `name` log whose attestation (see [`AttestedLog`]) the disk failed
+/// to read: what it attests is unknown, and an unknown attestation is no proof that nothing was
+/// acked, so the open refuses before it cuts or discards anything, for a retry once the disk reads
+/// again.
+fn attestation_read_failure(name: &str, index: &Path, source: io::Error) -> EpochDbError {
+    EpochDbError::Unreadable {
+        what: format!(
+            "the {name} log's index {} (a read error, so what it attests is unknown; nothing was \
+             cut)",
+            index.display()
+        ),
+        source: Arc::new(FetchError::IO(source)),
+    }
+}
+
 /// What is on disk about how far one log was acked, read before any index is touched: the digest
-/// index's durably synced data length (the acked end; `0` when that index cannot be opened, which
-/// attests nothing), the position index's recorded record offsets (empty when the log has no
-/// position index or it cannot be opened), and the log's own tail commit marker (see
-/// [`Inner::persist`]; `None` when absent), which needs no index at all.
+/// index's durably synced data length (the acked end; `0` when that index is absent or damaged,
+/// which attests nothing), the position index's recorded record offsets (empty when the log has
+/// no position index, or it is absent or damaged), and the log's own tail commit marker (see
+/// [`Inner::persist`]; `None` when absent), which needs no index at all. An index the disk fails
+/// to read is not "nothing attested": reading the attestation fails
+/// ([`attestation_read_failure`]), since a read error is never a torn tail.
 #[derive(Debug, Default)]
 struct AttestedLog {
     end: u64,
@@ -1730,7 +1754,7 @@ impl Inner {
         V: std::fmt::Debug + serde::Serialize + serde::de::DeserializeOwned,
     {
         let header = DataHeader::new(uid_idx, PackCompression::ZStd, EPOCH_PACK_VERSION);
-        let attested_end = Self::attested_end(&dir.join(digest_name), &header);
+        let attested_end = Self::attested_end(&dir.join(digest_name), &header, name)?;
         let path = dir.join(log_name);
         if !std::fs::exists(&path)? {
             Self::refuse_a_lost_log::<V>(None, attested_end, name)?;
@@ -1751,18 +1775,35 @@ impl Inner {
         }
     }
 
-    /// The data length the digest index in `digest_dir` durably attests for the log whose header
-    /// is `header` (see [`AttestedLog::end`]), read with a read-only open: `0` when the index
-    /// cannot be opened, which attests nothing.
-    fn attested_end(digest_dir: &Path, header: &DataHeader) -> u64 {
-        HdxIndex::<32, BuildHasherDefault<FxHasher>>::open_hdx_file(
+    /// The data length the digest index in `digest_dir` durably attests for the `name` log whose
+    /// header is `header` (see [`AttestedLog::end`]), read with a read-only open: `0` when the
+    /// index is absent or damaged (its contents: a short or invalid header), which attests
+    /// nothing. A read the disk fails is an error ([`attestation_read_failure`]).
+    fn attested_end(
+        digest_dir: &Path,
+        header: &DataHeader,
+        name: &str,
+    ) -> Result<u64, EpochDbError> {
+        let opened = HdxIndex::<32, BuildHasherDefault<FxHasher>>::open_hdx_file(
             digest_dir,
             header,
             BuildHasherDefault::<FxHasher>::default(),
             true,
-        )
-        .map(|index| index.data_file_length())
-        .unwrap_or(0)
+        );
+        #[cfg(test)]
+        let opened = match FAIL_NEXT_ATTESTED_END.with(|fail| fail.replace(false)) {
+            true => Err(LoadHeaderError::IO(io::Error::from_raw_os_error(libc::EIO))),
+            false => opened,
+        };
+        match opened {
+            Ok(index) => Ok(index.data_file_length()),
+            Err(LoadHeaderError::IO(e))
+                if !matches!(e.kind(), io::ErrorKind::NotFound | io::ErrorKind::UnexpectedEof) =>
+            {
+                Err(attestation_read_failure(name, digest_dir, e))
+            }
+            Err(_) => Ok(0),
+        }
     }
 
     /// Refuse (`CorruptLog`) a log that holds no record (`None`: missing, or one the open would
@@ -1824,7 +1865,11 @@ impl Inner {
                 log.file_len()
             )));
         }
-        Self::refuse_dropping_acked(log, &Self::attested_log(log, digest_dir, position_dir), name)?;
+        Self::refuse_dropping_acked(
+            log,
+            &Self::attested_log(log, digest_dir, position_dir, name)?,
+            name,
+        )?;
         heals.push(format!(
             "{name} log was not cleanly closed: {} byte(s) past offset {consistent_end} would be \
              truncated and its indexes rebuilt",
@@ -1833,20 +1878,31 @@ impl Inner {
         Ok(())
     }
 
-    /// What one log's on-disk indexes attest, read with read-only opens before any index is
-    /// opened for writing or discarded (see [`Self::attested_log`]).
-    fn attested_log<V>(log: &Pack<V>, digest_dir: &Path, position_dir: Option<&Path>) -> AttestedLog
+    /// What the on-disk indexes of the `name` log attest ([`AttestedLog`]), read with read-only
+    /// opens before any index is opened for writing or discarded. An index the disk fails to read
+    /// fails this ([`attestation_read_failure`]): an unknown attestation must not pass for none.
+    fn attested_log<V>(
+        log: &Pack<V>,
+        digest_dir: &Path,
+        position_dir: Option<&Path>,
+        name: &str,
+    ) -> Result<AttestedLog, EpochDbError>
     where
         V: std::fmt::Debug + serde::Serialize + serde::de::DeserializeOwned,
     {
-        let end = Self::attested_end(digest_dir, log.header());
+        let end = Self::attested_end(digest_dir, log.header(), name)?;
         // Read straight from the index file: a read-only open refuses an unsealed (crashed)
         // index, and a writable one would heal it, while this must attest the same offsets
         // whether the caller is the writable open or the read-only assessment.
-        let offsets = position_dir
-            .map(|dir| PositionIndex::<u64>::raw_entries(&dir.join("index.pdx"), log.header()))
-            .unwrap_or_default();
-        AttestedLog { end, offsets, committed: log.committed_end() }
+        let offsets = match position_dir {
+            Some(dir) => {
+                let path = dir.join("index.pdx");
+                PositionIndex::<u64>::raw_entries(&path, log.header())
+                    .map_err(|e| attestation_read_failure(name, &path, e))?
+            }
+            None => Vec::new(),
+        };
+        Ok(AttestedLog { end, offsets, committed: log.committed_end() })
     }
 
     /// Does `log` hold an acked record that a rebuild would drop? The rebuild truncates the log at
@@ -1965,7 +2021,7 @@ impl Inner {
 
     fn open_append<P: AsRef<Path>>(path: P, start_epoch: Epoch) -> Result<Self, EpochDbError> {
         let base_dir = path.as_ref();
-        let _ = create_dir_synced(base_dir);
+        create_dir_synced(base_dir)?;
         let have_records = std::fs::exists(base_dir.join(Self::RECORDS_NAME))?;
         let have_certs = std::fs::exists(base_dir.join(Self::CERTS_NAME))?;
 
@@ -1986,14 +2042,17 @@ impl Inner {
 
         // What the indexes attest about the logs, read before any index is opened for writing or
         // discarded: a rebuild below must refuse to drop an acked record, and once an index is
-        // reset its attestation is gone. Read read-only and per index, so one unreadable index
-        // (which the rebuild replaces anyway) never blinds the check for the others.
+        // reset its attestation is gone. Read read-only and per index, so one damaged index
+        // (which the rebuild replaces anyway) never blinds the check for the others. An index
+        // the disk fails to read fails the open here, before anything is cut or discarded.
         let attested_records = Self::attested_log(
             &records,
             &base_dir.join(Self::RECORD_HASH_NAME),
             Some(&base_dir.join(Self::EPOCH_POS_NAME)),
-        );
-        let attested_certs = Self::attested_log(&certs, &base_dir.join(Self::CERT_HASH_NAME), None);
+            "records",
+        )?;
+        let attested_certs =
+            Self::attested_log(&certs, &base_dir.join(Self::CERT_HASH_NAME), None, "certs")?;
         // A log that holds no record beside an index that attests acked ones was lost, not new:
         // refuse before any index is reset or stamped to the fresh length.
         Self::refuse_a_lost_log(Some(&records), attested_records.end, "records")?;
@@ -6172,7 +6231,8 @@ mod test {
         let probed_at = PositionIndex::<u64>::raw_entries(
             &dir.path().join(Inner::EPOCH_POS_NAME).join("index.pdx"),
             &DataHeader::new(Inner::PACK_EPOCH, PackCompression::ZStd, EPOCH_PACK_VERSION),
-        )[3];
+        )
+        .expect("read the position index")[3];
         let path = dir.path().join(RECORDS_NAME);
         let mut bytes = std::fs::read(&path).expect("read records log");
         // Epoch 2's size prefix far past any valid size, so the walk stops dead; the commit
@@ -6192,5 +6252,60 @@ mod test {
             panic!("the damage itself is refused");
         };
         assert!(matches!(err, EpochDbError::CorruptLog(_)), "{err:?}");
+    }
+
+    /// An index the disk fails to read attests something unknown, which is not "nothing
+    /// attested": the open and the read-only assessment refuse with the read error before
+    /// anything is cut, where reading the index as empty would let the rebuild drop the acked
+    /// records past the damage. In each case the failed index is the one attestation that proves
+    /// the damage acked (the commit marker is lost): the position index's recorded offsets behind
+    /// a size prefix that stops the walk dead, and the digest index's acked end behind a record
+    /// whose CRC fails. Once the disk reads again, the damage itself is refused.
+    #[test]
+    fn test_unreadable_attestation_refuses_the_cut() {
+        use super::FAIL_NEXT_ATTESTED_END;
+        use crate::archive::position_index::index::FAIL_NEXT_PDX_READ;
+        use std::{cell::Cell, thread::LocalKey};
+        for case in ["position index", "digest index"] {
+            let (dir, damaged_at) = crashed_db_with_eight_records(2);
+            let path = dir.path().join(RECORDS_NAME);
+            let mut bytes = std::fs::read(&path).expect("read records log");
+            let at = damaged_at as usize;
+            if case == "position index" {
+                bytes[at..at + 4].copy_from_slice(&[0xFF; 4]);
+            } else {
+                bytes[at + 8] ^= 0xFF;
+            }
+            let len = bytes.len();
+            bytes[len - 16..].fill(0);
+            std::fs::write(&path, &bytes).expect("write records log");
+            let hook: &'static LocalKey<Cell<bool>> = if case == "position index" {
+                &FAIL_NEXT_PDX_READ
+            } else {
+                &FAIL_NEXT_ATTESTED_END
+            };
+
+            for what in ["dry run", "open"] {
+                hook.with(|fail| fail.set(true));
+                let failed = if what == "open" {
+                    EpochRecordDb::open(dir.path()).err()
+                } else {
+                    EpochRecordDb::assess(dir.path()).err()
+                };
+                assert!(!hook.with(|fail| fail.replace(false)), "{case}: {what}: the hook fired");
+                let err = failed
+                    .unwrap_or_else(|| panic!("{case}: an unreadable index must fail the {what}"));
+                assert!(
+                    matches!(err, EpochDbError::Unreadable { .. })
+                        && err.to_string().contains("what it attests is unknown"),
+                    "{case}: {what}: {err:?}"
+                );
+                assert_eq!(std::fs::read(&path).expect("read"), bytes, "{case}: {what}: cut");
+            }
+            let Err(err) = EpochRecordDb::open(dir.path()) else {
+                panic!("{case}: the damage itself is refused");
+            };
+            assert!(matches!(err, EpochDbError::CorruptLog(_)), "{case}: {err:?}");
+        }
     }
 }

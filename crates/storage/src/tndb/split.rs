@@ -324,6 +324,13 @@ impl Database for SplitDatabase {
             Poll::Pending
         })
     }
+
+    /// The inherent [`SplitDatabase::fail_durability_for_test`], for code generic over the
+    /// backend.
+    #[cfg(feature = "test-utils")]
+    fn fail_durability_for_test<T: Table>(&self) {
+        SplitDatabase::fail_durability_for_test::<T>(self);
+    }
 }
 
 #[cfg(test)]

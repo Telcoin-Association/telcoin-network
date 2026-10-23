@@ -142,8 +142,16 @@ impl Published {
     /// The value bytes of the put record at `pos`, which the index gave for `key` (checked to
     /// be that row's: see [`record::put_value`]).
     fn value_at(&self, pos: u64, key: &[u8]) -> Result<&[u8], FetchError> {
-        let payload =
-            Pack::<Vec<u8>>::record_bytes_within(&self.view, pos, self.limit, MAX_RECORD)?;
+        // SAFETY: `limit` is the log's length when `Writer::publish` built this snapshot, after
+        // its batch was appended in full; those appends happen before the `ArcSwap` store that
+        // published the snapshot, which this reader loaded. The writer only appends past it: a
+        // failed batch rewinds to its own start (`Writer::revert`), at or past every publish
+        // before it, and the open's recovery cut runs before any reader. Nothing cuts the log
+        // below it while this snapshot lives: a compaction retires the generation's files into
+        // `_alive`, and a clean close truncates only to the log's end.
+        let payload = unsafe {
+            Pack::<Vec<u8>>::record_bytes_within(&self.view, pos, self.limit, MAX_RECORD)?
+        };
         record::put_value(payload, self.table, key)
     }
 
@@ -449,6 +457,13 @@ pub(super) struct NewGen {
 }
 
 impl Writer {
+    /// Test-only: whether the log has failed or its poison latch is set (by the writer, or by a
+    /// barrier through its view).
+    #[cfg(test)]
+    pub(super) fn log_failed(&self) -> bool {
+        self.log.is_failed()
+    }
+
     pub(super) fn check(&self) -> eyre::Result<()> {
         if let Some(cause) = &self.failed {
             bail!("tndb: the writer stopped ({cause}); restart to recover");
@@ -514,6 +529,15 @@ impl Writer {
                     out.push(i);
                 }
                 BatchOp::Remove(_, key) => {
+                    // A table with no key size yet holds no rows: any removal is a no-op.
+                    if table.ksize != 0 && key.len() != table.ksize as usize {
+                        bail!(
+                            "tndb: a {}-byte key in table {} of {}-byte keys",
+                            key.len(),
+                            table.shared.name,
+                            table.ksize
+                        );
+                    }
                     let held = match &table.idx {
                         Some(idx) if !cleared.contains(&id) => {
                             idx.contains(key).wrap_err_with(|| {
@@ -873,7 +897,9 @@ impl Core {
         config: CompactionConfig,
         metrics: TnDbMetrics,
     ) -> eyre::Result<Self> {
-        fs::create_dir_all(root)?;
+        // Every level created here is synced into its parent: the roots' entries must not depend
+        // on a later sync elsewhere to survive a power loss.
+        crate::archive::data_file::create_dir_synced(root)?;
         let lock = lock_dir(root)?;
         Manifest::remove_tmp(root);
         // An unfinished compaction is never a generation.
@@ -1383,6 +1409,18 @@ fn check_ksize(table: &TableShared, fixed: u16, ksize: usize) -> eyre::Result<()
         bail!("tndb: a {ksize}-byte key in table {} of {fixed}-byte keys", table.name);
     }
     Ok(())
+}
+
+/// Refuse a read's (or a transaction's buffered write's) `key` if it is not `table`'s fixed key
+/// size, as a put is refused: the index never holds a key of another size, so a get would answer
+/// "absent" for a key no row could have. A table whose size is not fixed yet holds no rows, so any
+/// key passes it. The caller's error, not damage: nothing latches (the snapshot's own lookup
+/// errors latch as a read's damage, so the size is checked here, before it).
+pub(super) fn check_read_ksize(table: &TableShared, key: &[u8]) -> eyre::Result<()> {
+    match table.ksize() {
+        0 => Ok(()),
+        fixed => check_ksize(table, fixed, key.len()),
+    }
 }
 
 #[cfg(test)]

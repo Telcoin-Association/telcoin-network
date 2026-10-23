@@ -415,7 +415,7 @@ Public (`pub`) unless marked crate-internal.
 | item | description |
 |---|---|
 | `BtreeIndex::open_btx_file(dir, &DataHeader, ksize, read_only)` | open or create `dir/index.btx` |
-| `save(&mut, key, pos)` / `load(&, key)` / `contains(&, key)` / `remove(&mut, key) -> bool` | point ops on `&[u8]` keys of length `ksize()` (another length is a `KeySize` error) |
+| `save(&mut, key, pos)` / `load(&, key)` / `contains(&, key)` / `remove(&mut, key) -> bool` | point ops on `&[u8]` keys of length `ksize()`: another length is a `KeySize` error from `save`, `load` and `remove`, and `false` from `contains` (the index never holds such a key) |
 | `save_digest` / `load_digest` / `remove_digest` | `B256` adapters (32-byte index) |
 | `impl Index<[u8; 32], u64>` | the generic point-index trait (`save`/`load`/`sync`/`contains`) for 32-byte keys |
 | `iter` / `rev_iter` / `range` / `rev_range` / `prefix` | sorted iteration over the writer's tree (`BtreeIter`) |
@@ -430,7 +430,7 @@ Public (`pub`) unless marked crate-internal.
 | `page_crc_scan -> PageCrcReport` | off-path full CRC classification |
 | `verify_tree -> Result<(), FetchError>` (crate) | the clean writable open's walk checks on the current tree (every page's CRC, types, child pointers), for an inspection of a read-only handle |
 | `publish(&mut) -> IndexSnapshot` *(crate)* | publish the working tree for lock-free readers |
-| `IndexSnapshot::{load, len}` + `PageSource` *(crate)* | snapshot reads and cursor source |
+| `IndexSnapshot::{load, len}` + `PageSource` *(crate)* | snapshot reads and cursor source; `load` does not check the key size (a key of another length is `NotFound`), so its caller does: tndb refuses a mis-sized key before it reaches a snapshot, whose errors it latches as damage |
 | `iter::BtreeCursor` *(crate)* | the detached cursor (`new`, `next`) |
 | `BTX_MAP_RESERVE` *(crate)* | the 1 GiB mapping reservation |
 
@@ -465,7 +465,7 @@ Public (`pub`) unless marked crate-internal.
 
 ## Tests and benchmarks
 
-Tests live in `index.rs` (`test_archive_btx_*`) and `iter.rs`:
+Tests live in `index.rs` (`test_archive_btx_*`), `iter.rs` and `model_test.rs`:
 
 - basic operations and reopen, a million keys with splits, custom key sizes;
 - geometry and uid mismatch rejection, implausible headers, short files (lost size extension), and a
@@ -485,8 +485,13 @@ Tests live in `index.rs` (`test_archive_btx_*`) and `iter.rs`:
   with earlier snapshots intact, and it refills;
 - ascending inserts and sorted rebuilds fill leaves above 95%, while random inserts keep the usual
   split; the model test also runs with mostly removals over few keys;
-- a wrong-size key is a `KeySize` error from every point op;
+- a wrong-size key is a `KeySize` error from `save`, `load`, `remove` and a rebuild, and never in
+  the index for `contains`;
 - iteration: sorted forward and reverse order, ranges, prefixes, and an empty tree.
+- `model_test.rs`: random batches of inserts, removes, publishes, reverts, clears and reopens at
+  key sizes 8 to 2032, checked against a model after every operation by a tree walk, forward and
+  reverse cursor scans and point loads (present and absent keys), on the writer and on held
+  snapshots. Its ignored long run adds a fresh random seed each run (`TN_BTX_SEED` replays one).
 
 ```text
 cargo test -p tn-storage btree

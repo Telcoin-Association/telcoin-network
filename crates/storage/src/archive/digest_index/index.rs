@@ -1250,6 +1250,26 @@ impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndex<KSIZE, S> {
     }
 }
 
+impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndex<KSIZE, S> {
+    /// Seal the index now and report the outcome: the ordered sync `Drop` runs (when the index
+    /// has unsynced writes), then the clean-close seal of the hdx and the odx file (see
+    /// [`MmapDataFile::seal`]). Every step runs whatever the earlier ones returned, as in `Drop`;
+    /// the first failure is returned. Dropping the index seals it too, but can only log a failure.
+    pub(crate) fn seal(mut self) -> io::Result<()> {
+        let synced = if self.read_only || self.remove_on_drop || self.synced {
+            Ok(())
+        } else {
+            self.ordered_sync()
+        };
+        // `Drop` must not retry the sync: a retried sync after a failed one can report success
+        // for writes that never reached the disk.
+        self.synced = true;
+        let hdx = self.hdx_file.seal();
+        let odx = self.odx_file.seal();
+        synced.and(hdx).and(odx)
+    }
+}
+
 impl<const KSIZE: usize, S: BuildHasher + Default> Drop for HdxIndex<KSIZE, S> {
     fn drop(&mut self) {
         if !self.read_only && !self.synced && !self.remove_on_drop {

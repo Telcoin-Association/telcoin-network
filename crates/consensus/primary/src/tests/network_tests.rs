@@ -3894,6 +3894,12 @@ fn test_import_fault_is_peer_caused_whitelist() {
     assert!(!peer_caused(cc(PackError::PersistError("disk full".into()))));
     assert!(!peer_caused(cc(PackError::Append("io".into()))));
     assert!(!peer_caused(cc(PackError::ReadOnly)));
+    // Local IO (a leftover import dir we could not remove, a full disk) is never the peer's.
+    let io = || std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+    assert!(!peer_caused(ConsensusChainError::IO(io())));
+    assert!(!peer_caused(cc(PackError::IO(Arc::new(io())))));
+    assert!(PrimaryNetworkHandle::consensus_chain_error_to_penalty(&ConsensusChainError::IO(io()))
+        .is_none());
     // A transport failure or timeout says nothing about the sender's bytes.
     assert!(!peer_caused(cc(PackError::ReadError("timeout".into()))));
     assert!(!peer_caused(ConsensusChainError::EpochMismatch));

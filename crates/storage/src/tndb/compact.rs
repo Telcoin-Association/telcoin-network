@@ -339,6 +339,10 @@ pub(super) struct TestHooks {
     pub(super) fail_next: AtomicBool,
     /// The next compaction's copy skips a row (so its switch finds a row count wrong).
     pub(super) skip_a_row: AtomicBool,
+    /// The next compaction's new log is tracked by the disk model
+    /// (`archive::data_file::disk_model`) from its creation, so its image holds only what the
+    /// compaction itself synced.
+    pub(super) track_new_log: AtomicBool,
     /// The free space the disk guards see.
     pub(super) free_space: Mutex<Option<u64>>,
     /// How many times a disk guard has run.
@@ -748,7 +752,13 @@ enum Net {
 /// Bring `out` up to date with the old log's batches in `[from, to)` (whole batches: both ends
 /// lie between batches): their net effect, in key order: each table they cleared cleared, then
 /// each touched key's last write.
-fn catch_up(
+///
+/// # Safety
+///
+/// [`MapView::tail_within`]'s, for `[from, to)` of the log `view` maps: the writer appended every
+/// byte of it in full before the call (`to` is a frontier it stored after a batch, or its end
+/// read under its lock), and writes and cuts none of it while the call runs.
+unsafe fn catch_up(
     out: &mut Builder,
     view: &MapView,
     from: u64,
@@ -769,7 +779,8 @@ fn catch_up(
             check_stop(core)?;
             next_check = pos + BATCH_BYTES;
         }
-        let payload = Log::record_bytes_within(view, pos, to, MAX_RECORD)?;
+        // SAFETY: `pos < to`, and `[from, to)` meets `tail_within`'s contract (this fn's own).
+        let payload = unsafe { Log::record_bytes_within(view, pos, to, MAX_RECORD)? };
         let record = record::parse(payload, |id| ksizes.get(id)).map_err(|e| {
             DamagedRecord(format!("tndb: compaction: the record at {pos} does not parse: {e:#}"))
         })?;
@@ -794,7 +805,8 @@ fn catch_up(
     for ((id, key), last) in net {
         match last {
             Net::Put(pos) => {
-                let payload = Log::record_bytes_within(view, pos, to, MAX_RECORD)?;
+                // SAFETY: as above: `pos` is a record this call read below `to`.
+                let payload = unsafe { Log::record_bytes_within(view, pos, to, MAX_RECORD)? };
                 let ksize = ksizes.get(id).unwrap_or(0);
                 out.copy_row(id, ksize, &key, payload)?;
                 if let Some((pacer, core)) = pacer.as_mut() {
@@ -844,6 +856,11 @@ fn compact_once(core: &Core, requested: bool, rate: u64) -> eyre::Result<bool> {
     let view = Arc::clone(&snap.view);
     let ksizes = Ksizes::new(core, &snap.tables);
     let mut out = Builder::new(compact_dir(&core.root, snap.gen + 1))?;
+    // Nothing is written to the new log yet but the header its open synced.
+    #[cfg(test)]
+    if shared.test.track_new_log.swap(false, Ordering::Relaxed) {
+        crate::archive::data_file::disk_model::track(&out.dir.join("log"));
+    }
 
     // 1. Every table's rows, in key order; each snapshot dropped once copied.
     let mut pacer = Pacer::new(rate);
@@ -857,8 +874,12 @@ fn compact_once(core: &Core, requested: bool, rate: u64) -> eyre::Result<bool> {
             if std::mem::take(&mut skip_a_row) {
                 continue;
             }
-            let payload =
-                Log::record_bytes_within(&published.view, pos, published.limit, MAX_RECORD)?;
+            // SAFETY: as for a reader (`store::Published::value_at`): `limit` is the old log's
+            // length at the publish this snapshot came from, written in full before it and never
+            // rewritten or cut while `_alive` keeps the generation open.
+            let payload = unsafe {
+                Log::record_bytes_within(&published.view, pos, published.limit, MAX_RECORD)?
+            };
             // A damaged index entry is abandoned on, not copied into the new generation.
             record::put_value(payload, id, key)?;
             out.copy_row(id, ksize, key, payload)?;
@@ -877,7 +898,11 @@ fn compact_once(core: &Core, requested: bool, rate: u64) -> eyre::Result<bool> {
         check_stop(core)?;
         check_room(core)?;
         let to = core.frontier.load().end;
-        catch_up(&mut out, &view, done, to, &ksizes, Some(core))?;
+        // SAFETY: the frontier is stored (`Core::store_frontier`) under the write lock after a
+        // batch was appended in full, so the `ArcSwap` load orders those appends before this read.
+        // Only this thread switches generations, so it is still the old log's. The writer writes
+        // past it only: a failed batch rewinds to its own start, at or past the frontier.
+        unsafe { catch_up(&mut out, &view, done, to, &ksizes, Some(core))? };
         let behind = to - done;
         done = to;
         out.sync()?;
@@ -905,7 +930,11 @@ fn compact_once(core: &Core, requested: bool, rate: u64) -> eyre::Result<bool> {
         check_stop(core)?;
         check_room(core)?;
         let to = core.frontier.load().end;
-        catch_up(&mut out, &view, done, to, &ksizes, Some(core))?;
+        // SAFETY: the frontier is stored (`Core::store_frontier`) under the write lock after a
+        // batch was appended in full, so the `ArcSwap` load orders those appends before this read.
+        // Only this thread switches generations, so it is still the old log's. The writer writes
+        // past it only: a failed batch rewinds to its own start, at or past the frontier.
+        unsafe { catch_up(&mut out, &view, done, to, &ksizes, Some(core))? };
         done = to;
         out.sync()?;
         // Before the final tail below: written under the write lock, it would add a file sync to
@@ -930,7 +959,9 @@ fn compact_once(core: &Core, requested: bool, rate: u64) -> eyre::Result<bool> {
             continue;
         }
         // Under the write lock, and at most a tail's worth (the cap above): no checks.
-        catch_up(&mut out, &view, done, end, &ksizes, None)?;
+        // SAFETY: `end` is the writer's log length read under its lock, held across this call:
+        // every append below it is complete and ordered by the lock, and none can start.
+        unsafe { catch_up(&mut out, &view, done, end, &ksizes, None)? };
         for (id, rows) in writer.table_rows() {
             if out.rows(id) != rows {
                 bail!(
@@ -1363,7 +1394,9 @@ mod test {
         let ksizes = Ksizes::new(core, &[]);
         let catch_up_into = |name: &str, from, to| {
             let mut out = Builder::new(tmp.path().join(name)).expect("builder");
-            let result = catch_up(&mut out, &view, from, to, &ksizes, Some(core));
+            // SAFETY: the test's own appends end at `end`, before this call, and the log is
+            // written no more while the view is read.
+            let result = unsafe { catch_up(&mut out, &view, from, to, &ksizes, Some(core)) };
             (result, out.rows(id))
         };
 

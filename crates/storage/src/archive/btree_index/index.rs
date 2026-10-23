@@ -219,7 +219,9 @@ impl IndexSnapshot {
         self.values as usize
     }
 
-    /// The file position stored for `key`, or [`FetchError::NotFound`].
+    /// The file position stored for `key`, or [`FetchError::NotFound`]. The key size is not
+    /// checked: a key of another length is never found. Its caller (tndb's
+    /// `store::check_read_ksize`) refuses one first, since a snapshot's errors latch as damage.
     pub(crate) fn load(&self, key: &[u8]) -> Result<u64, FetchError> {
         lookup(self, key)
     }
@@ -245,9 +247,14 @@ impl PageSource for IndexSnapshot {
                 self.page_count
             )));
         }
-        let buf = self
-            .view
-            .slice(BtreeIndex::page_offset(p), PAGE_SIZE)
+        // SAFETY: published pages are written before `publish_pages` publishes them and never
+        // again while a snapshot can reach them: copy-on-write writes only private pages, and a
+        // replaced page is reused only after every snapshot that can reach it has dropped (its
+        // `SnapshotPin` dead; `reclaim`'s fence orders this reader's reads before the reuse). A
+        // lookup reaches only pages named by the snapshot's root and the pages it read. The one
+        // case this does not cover is damage at rest: a child pointer damaged on disk can name a
+        // free page the writer is reusing, and the read races that rewrite.
+        let buf = unsafe { self.view.slice(BtreeIndex::page_offset(p), PAGE_SIZE) }
             .ok_or_else(|| self.damaged(format!("page {p} is not published")))?;
         if crc_is_zero(buf) {
             return Err(self

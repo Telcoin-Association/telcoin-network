@@ -859,7 +859,11 @@ fn failed_certificate_pack() -> tn_storage::certificate_pack::CertificatePack {
 
 /// The consensus task ends with the certificate pack's error at the first certificate it cannot
 /// archive, instead of logging it and dropping the pack. The task is critical, so its error ends
-/// the epoch's task manager, and `run_epoch` returns it: the node exits non-zero.
+/// the task manager it runs on: this test pins that the manager ends with the pack's error. What
+/// `run_epoch` does with an error that ends the epoch's task manager is pinned in tn-node
+/// (`epoch_tasks_ended_stops_the_node_unless_it_is_shutting_down`), and a node exiting non-zero on
+/// a store that fails mid-epoch end to end by
+/// `test_restarts_store_failure_stops_the_node_mid_epoch` in the e2e tests.
 #[tokio::test]
 async fn test_failed_certificate_pack_ends_the_consensus_task() {
     let fixture = CommitteeFixture::builder(MemDatabase::default).build();

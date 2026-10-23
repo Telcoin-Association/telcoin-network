@@ -165,6 +165,15 @@ pub trait Database: Send + Sync + Clone + Unpin + 'static {
     fn failed(&self) -> impl Future<Output = String> + Send + 'static {
         std::future::pending()
     }
+
+    /// Test-only, for code generic over the backend (`test-utils`; reached through
+    /// [`crate::test_hooks::fail_store_at_epoch`]): latch a durability failure in the store that
+    /// holds `T`, as a failed sync does, so every later write and `persist` on it fails and
+    /// [`Database::failed`] resolves. The default does nothing: only a backend that can latch a
+    /// failure overrides it (tndb's `SplitDatabase`, with `tn-storage/test-utils`).
+    #[cfg(feature = "test-utils")]
+    fn fail_durability_for_test<T: Table>(&self) {}
+
     /// Synchronous, catch-up-only sibling of [`Database::persist`], for tests that cannot `await`.
     ///
     /// Unlike `persist` this deliberately does **not** provide the durability barrier: it must

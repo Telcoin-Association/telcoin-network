@@ -13,8 +13,12 @@
 //! epoch's record is written, so a restart finds the record missing. [`exit_after_epoch_record`]
 //! stops it after the record is written and before the state export and the epoch tables clear, so
 //! a restart finds the record present and the tables still holding the closed epoch's rows.
+//!
+//! [`fail_store_at_epoch`] fails one store of the node's consensus DB once an epoch's tasks are
+//! running, as a failed sync does, so a test sees whether the failure stops the node then rather
+//! than at the epoch's end.
 
-use crate::Epoch;
+use crate::{Database, Epoch, Table};
 
 /// Whether this node should stop at the live close of `epoch` after the closing block executed
 /// and before the epoch's record is written.
@@ -70,6 +74,39 @@ pub fn exit_after_epoch_record(epoch: Epoch) -> bool {
     }
 }
 
+/// Latch a durability failure in the store of `db` that holds `T` if this node should fail it in
+/// `epoch`, and return whether the hook fired.
+///
+/// Reads `TN_TEST_FAIL_STORE_AT_EPOCH=<epoch>` once per process. It lets an e2e test fail one of a
+/// node's stores in the middle of an epoch the way a failed sync does: the store refuses every
+/// later write and `persist` until the process restarts, and [`Database::failed`] resolves. The
+/// caller consults it once the epoch's tasks are running and before it waits for the epoch
+/// boundary, so the test sees whether the failure stops the node at once or only at the epoch's
+/// end. It fires on every run of `epoch`, a restart into it included, so a test sets it on one run
+/// of one node.
+///
+/// Unset means never. A value that does not parse as an epoch is ignored with a warning. Always
+/// `false`, leaving `db` untouched, without `test-utils`; as with the fork-epoch overrides, a
+/// node-scoped release build lacks the hook and a workspace-root build without `-p` has it. Only a
+/// backend that overrides [`Database::fail_durability_for_test`] latches anything (tndb's, with
+/// `tn-storage/test-utils`).
+#[inline]
+pub fn fail_store_at_epoch<T: Table, DB: Database>(db: &DB, epoch: Epoch) -> bool {
+    #[cfg(feature = "test-utils")]
+    {
+        let fires = FAIL_STORE_AT_EPOCH.fires_for(epoch);
+        if fires {
+            db.fail_durability_for_test::<T>();
+        }
+        fires
+    }
+    #[cfg(not(feature = "test-utils"))]
+    {
+        let _ = (db, epoch);
+        false
+    }
+}
+
 /// The hook behind [`exit_before_epoch_record`].
 #[cfg(feature = "test-utils")]
 static EXIT_BEFORE_EPOCH_RECORD: EpochHook = EpochHook::new("TN_TEST_EXIT_BEFORE_EPOCH_RECORD");
@@ -78,7 +115,11 @@ static EXIT_BEFORE_EPOCH_RECORD: EpochHook = EpochHook::new("TN_TEST_EXIT_BEFORE
 #[cfg(feature = "test-utils")]
 static EXIT_AFTER_EPOCH_RECORD: EpochHook = EpochHook::new("TN_TEST_EXIT_AFTER_EPOCH_RECORD");
 
-/// A hook that stops a node at one epoch, named by the environment variable `var`.
+/// The hook behind [`fail_store_at_epoch`].
+#[cfg(feature = "test-utils")]
+static FAIL_STORE_AT_EPOCH: EpochHook = EpochHook::new("TN_TEST_FAIL_STORE_AT_EPOCH");
+
+/// A hook that fires at one epoch, named by the environment variable `var`.
 #[cfg(feature = "test-utils")]
 struct EpochHook {
     /// The environment variable that names the epoch.
@@ -105,7 +146,7 @@ impl EpochHook {
     }
 }
 
-/// Parses the value of the epoch hook variable `var` into the epoch to stop at.
+/// Parses the value of the epoch hook variable `var` into the epoch the hook fires at.
 ///
 /// `None` (the variable is unset) yields `None`. Surrounding whitespace is trimmed. A value that
 /// does not parse as an [`Epoch`] logs a warning naming `var` and yields `None`, so a typo leaves
@@ -130,9 +171,9 @@ fn parse_epoch_hook(var: &str, raw: Option<&str>) -> Option<Epoch> {
 mod tests {
     use super::*;
 
-    /// Both epoch hook variables, for the parse tests.
-    fn hook_vars() -> [&'static str; 2] {
-        [EXIT_BEFORE_EPOCH_RECORD.var, EXIT_AFTER_EPOCH_RECORD.var]
+    /// Every epoch hook variable, for the parse tests.
+    fn hook_vars() -> [&'static str; 3] {
+        [EXIT_BEFORE_EPOCH_RECORD.var, EXIT_AFTER_EPOCH_RECORD.var, FAIL_STORE_AT_EPOCH.var]
     }
 
     /// The hook fires for the named epoch and no other. This is the only test in the crate that
@@ -157,6 +198,19 @@ mod tests {
         assert!(exit_after_epoch_record(5));
         assert!(!exit_after_epoch_record(4));
         assert!(!exit_after_epoch_record(6));
+    }
+
+    /// The store-failure hook fires for the named epoch and no other. This is the only test in the
+    /// crate that sets the variable, and it names an epoch neither exit test names, so a hook that
+    /// read another variable could not pass under a single-process run either. It asks the hook
+    /// itself: [`fail_store_at_epoch`] needs a backend, and the e2e test that sets the variable
+    /// (`test_restarts_store_failure_stops_the_node_mid_epoch`) covers the latch.
+    #[test]
+    fn fail_store_at_epoch_matches_only_the_named_epoch() {
+        std::env::set_var("TN_TEST_FAIL_STORE_AT_EPOCH", "3");
+        assert!(FAIL_STORE_AT_EPOCH.fires_for(3));
+        assert!(!FAIL_STORE_AT_EPOCH.fires_for(2));
+        assert!(!FAIL_STORE_AT_EPOCH.fires_for(4));
     }
 
     #[test]
