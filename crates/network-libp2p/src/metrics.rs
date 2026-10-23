@@ -52,6 +52,8 @@ struct SwarmMetricHandles {
     gossip_rejected_total: Counter,
     /// Inbound provider announcements dropped by the per-source rate limit.
     add_provider_rate_limited_total: Counter,
+    /// Inbound provider announcements dropped because the provider is not the local peer.
+    add_provider_remote_dropped_total: Counter,
     /// Graceful peer-exchange disconnects awaiting the peer's ack.
     px_disconnects_pending: Gauge,
     /// Outbound requests in flight.
@@ -548,7 +550,7 @@ impl InboundFailureOutcome {
 
 /// One pre-resolved metric handle per [`ServiceClass`].
 #[derive(Clone)]
-struct PerClass<T> {
+pub(crate) struct PerClass<T> {
     /// The handle for [`ServiceClass::Vote`].
     vote: T,
     /// The handle for [`ServiceClass::EpochRecord`].
@@ -565,7 +567,7 @@ struct PerClass<T> {
 
 impl<T> PerClass<T> {
     /// Resolve one handle per class with `resolve`.
-    fn new(resolve: impl Fn(ServiceClass) -> T) -> Self {
+    pub(crate) fn new(resolve: impl Fn(ServiceClass) -> T) -> Self {
         Self {
             vote: resolve(ServiceClass::Vote),
             epoch_record: resolve(ServiceClass::EpochRecord),
@@ -577,7 +579,7 @@ impl<T> PerClass<T> {
     }
 
     /// The handle for `class`.
-    fn get(&self, class: ServiceClass) -> &T {
+    pub(crate) fn get(&self, class: ServiceClass) -> &T {
         match class {
             ServiceClass::Vote => &self.vote,
             ServiceClass::EpochRecord => &self.epoch_record,
@@ -598,6 +600,8 @@ struct PerShedReason<T> {
     unsubscribed: T,
     /// The handle for [`ShedReason::Admission`].
     admission: T,
+    /// The handle for [`ShedReason::ServeBudget`].
+    serve_budget: T,
 }
 
 impl<T> PerShedReason<T> {
@@ -607,6 +611,7 @@ impl<T> PerShedReason<T> {
             queue_full: resolve(ShedReason::QueueFull),
             unsubscribed: resolve(ShedReason::Unsubscribed),
             admission: resolve(ShedReason::Admission),
+            serve_budget: resolve(ShedReason::ServeBudget),
         }
     }
 
@@ -616,6 +621,7 @@ impl<T> PerShedReason<T> {
             ShedReason::QueueFull => &self.queue_full,
             ShedReason::Unsubscribed => &self.unsubscribed,
             ShedReason::Admission => &self.admission,
+            ShedReason::ServeBudget => &self.serve_budget,
         }
     }
 }
@@ -914,7 +920,7 @@ impl LabeledHandles {
 }
 
 /// Resolve the `inbound_requests_shed_total` series for one network label, class and reason.
-fn shed_counter(network: &str, class: ServiceClass, reason: ShedReason) -> Counter {
+pub(crate) fn shed_counter(network: &str, class: ServiceClass, reason: ShedReason) -> Counter {
     metrics::counter!(
         "tn_network.inbound_requests_shed_total",
         "network" => network.to_owned(),
@@ -1114,6 +1120,12 @@ impl SwarmMetrics {
         self.handles.add_provider_rate_limited_total.increment(1);
     }
 
+    /// Record an inbound provider announcement from a remote provider, dropped before a store
+    /// write.
+    pub(crate) fn record_add_provider_remote_dropped(&self) {
+        self.handles.add_provider_remote_dropped_total.increment(1);
+    }
+
     /// Update the in-flight request gauges (called once per event-loop iteration).
     pub(crate) fn set_pending(&self, px_disconnects: usize, outbound_requests: usize) {
         self.handles.px_disconnects_pending.set(px_disconnects as f64);
@@ -1308,6 +1320,29 @@ pub(crate) struct PeerManagerMetrics {
 }
 
 impl PeerManagerMetrics {
+    /// Timestamp the swarm's latest authoritative resolution observation.
+    pub(crate) fn mark_committee_observed(&self) {
+        let observed = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0.0, |time| time.as_secs_f64());
+        metrics::gauge!("tn_network.committee_observed_timestamp_seconds", "network" => self.network.clone())
+            .set(observed);
+    }
+
+    /// Publish one of the three fixed committee slots, scoped to this configured swarm.
+    pub(crate) fn set_committee_resolution(
+        &self,
+        slot: &'static str,
+        expected: usize,
+        unresolved: usize,
+    ) {
+        let count = |value| u32::try_from(value).map_or(f64::from(u32::MAX), f64::from);
+        metrics::gauge!("tn_network.committee_required_members", "network" => self.network.clone(), "slot" => slot)
+            .set(count(expected));
+        metrics::gauge!("tn_network.committee_unresolved_members", "network" => self.network.clone(), "slot" => slot)
+            .set(count(unresolved));
+    }
+
     /// Publish admission inputs independently of connections and node consensus readiness.
     pub(crate) fn set_admission(&self, status: &crate::AdmissionStatus) {
         let mode = match status.effective() {

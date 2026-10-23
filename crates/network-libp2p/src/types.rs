@@ -1,8 +1,8 @@
 //! Constants and trait implementations for network compatibility.
 
 use crate::{
-    codec::TNMessage, error::NetworkError, peers::Penalty, AdmissionStatus, CommitteeUpdate,
-    GossipMessage, PeerExchangeMap,
+    codec::TNMessage, error::NetworkError, peers::Penalty, serve_permits::ServePermits,
+    AdmissionStatus, CommitteeUpdate, GossipMessage, PeerExchangeMap,
 };
 pub use libp2p::gossipsub::MessageId;
 use libp2p::{
@@ -20,6 +20,47 @@ use tokio::sync::{mpsc, oneshot};
 
 /// The result for network operations.
 pub type NetworkResult<T> = Result<T, NetworkError>;
+
+/// One atomic view of current membership and its learned submit advertisements.
+///
+/// Membership includes unresolved identities. Coverage candidates exclude configuration
+/// stubs and expired store rows. The complete consumer advertisement set is retained separately
+/// so observing freshness cannot retire an advertised endpoint's transport cooldown.
+#[derive(Clone, Debug)]
+pub struct CommitteeRpcSnapshot {
+    /// Current committee identities from authoritative epoch state.
+    members: HashSet<BlsPublicKey>,
+    /// Learned RPC advertisements belonging to these members.
+    rpcs: Vec<(BlsPublicKey, RpcInfo)>,
+    /// Complete current advertisements used by forwarding, including cached records.
+    advertisements: Vec<(BlsPublicKey, RpcInfo)>,
+}
+
+impl CommitteeRpcSnapshot {
+    /// Construct a snapshot on the swarm loop, without an intervening committee update.
+    pub(crate) fn new(
+        members: HashSet<BlsPublicKey>,
+        rpcs: Vec<(BlsPublicKey, RpcInfo)>,
+        advertisements: Vec<(BlsPublicKey, RpcInfo)>,
+    ) -> Self {
+        Self { members, rpcs, advertisements }
+    }
+
+    /// Current identities, including members without an RPC advertisement.
+    pub fn members(&self) -> &HashSet<BlsPublicKey> {
+        &self.members
+    }
+
+    /// Fresh verified coverage candidates; callers must still apply endpoint admission policy.
+    pub fn rpcs(&self) -> &[(BlsPublicKey, RpcInfo)] {
+        &self.rpcs
+    }
+
+    /// Complete advertisement set, matching the forwarding consumer's cache lifecycle.
+    pub fn advertisements(&self) -> &[(BlsPublicKey, RpcInfo)] {
+        &self.advertisements
+    }
+}
 
 /// Helper trait to cast lib-specific results into RPC messages.
 pub trait IntoResponse<M> {
@@ -515,6 +556,11 @@ where
         /// The reply to caller.
         reply: oneshot::Sender<Vec<(BlsPublicKey, RpcInfo)>>,
     },
+    /// Atomically read current membership and learned RPC advertisements.
+    GetCommitteeRpcSnapshot {
+        /// The reply to caller.
+        reply: oneshot::Sender<CommitteeRpcSnapshot>,
+    },
     /// Read a single record from the local kad store by BLS key.
     ///
     /// Test-only observation hook used to assert local-store eviction
@@ -552,6 +598,11 @@ where
 {
     /// Sending channel to the network to process commands.
     sender: mpsc::Sender<NetworkCommand<Req, Res>>,
+    /// The application's per-class serve permits for this swarm's inbound requests.
+    ///
+    /// A handle that the swarm built shares the swarm's pools. Any other handle carries
+    /// unmetered pools, so it admits every request and registers no series.
+    serve_permits: ServePermits,
 }
 
 impl<Req, Res> NetworkHandle<Req, Res>
@@ -559,15 +610,26 @@ where
     Req: TNMessage,
     Res: TNMessage,
 {
-    /// Create a new instance of Self.
+    /// Create a new instance of Self with unmetered serve permits.
     pub fn new(sender: mpsc::Sender<NetworkCommand<Req, Res>>) -> Self {
-        Self { sender }
+        Self { sender, serve_permits: ServePermits::unmetered() }
     }
 
     /// Create a handle to no where for test setup.
     pub fn new_for_test() -> Self {
         let (sender, _) = mpsc::channel(100);
-        Self { sender }
+        Self::new(sender)
+    }
+
+    /// Return this handle with the swarm's serve permits in place of the unmetered pools.
+    #[must_use]
+    pub fn with_serve_permits(self, serve_permits: ServePermits) -> Self {
+        Self { serve_permits, ..self }
+    }
+
+    /// The per-class serve permits that request handlers offer inbound requests to.
+    pub fn serve_permits(&self) -> &ServePermits {
+        &self.serve_permits
     }
 
     /// Start swarm listening on the given address. Returns an error if the address is not
@@ -955,6 +1017,14 @@ where
     pub async fn get_all_validator_rpcs(&self) -> NetworkResult<Vec<(BlsPublicKey, RpcInfo)>> {
         let (reply, rx) = oneshot::channel();
         self.sender.send(NetworkCommand::GetAllValidatorRpcs { reply }).await?;
+        rx.await.map_err(Into::into)
+    }
+
+    /// Read current membership and learned RPC advertisements on the same swarm iteration.
+    /// Polling also retries discovery for unresolved members, including configuration stubs.
+    pub async fn get_committee_rpc_snapshot(&self) -> NetworkResult<CommitteeRpcSnapshot> {
+        let (reply, rx) = oneshot::channel();
+        self.sender.send(NetworkCommand::GetCommitteeRpcSnapshot { reply }).await?;
         rx.await.map_err(Into::into)
     }
 }
