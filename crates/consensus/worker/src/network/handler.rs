@@ -376,12 +376,18 @@ where
     /// requester with a [`SyncFrame::Err`] so it stops waiting; it is not a peer
     /// fault, so no penalty is returned. The sync responder reports errors
     /// metrics-only during the item-5 rollout.
+    ///
+    /// `epoch` is the request epoch, which the caller has checked is inside the
+    /// node's serve window; it selects the epoch pack read on a cache miss.
+    /// `max_frame` is the node's own frame limit, taken from the node's epoch, so
+    /// the requester cannot size the responder's buffers (#1718).
     pub(super) async fn process_sync_batches_stream(
         &self,
         peer: BlsPublicKey,
         mut stream: Stream,
         batch_digests: BTreeSet<B256>,
         epoch: Epoch,
+        max_frame: usize,
         consensus_chain: &ConsensusChain,
     ) -> WorkerNetworkResult<()> {
         debug!(
@@ -393,7 +399,6 @@ where
         );
 
         let store = self.consensus_config.node_storage();
-        let max_frame = crate::network::handle::max_sync_frame_size(epoch);
 
         // set timeout to prevent slow-read attack; flatten the timeout's outer
         // `Result` into the send's so a single error path handles both

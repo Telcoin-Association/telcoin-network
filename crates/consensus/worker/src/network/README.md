@@ -74,14 +74,17 @@ Req(Batches{digests, epoch})  ──►
 ```
 
 Instead of `Ack`, a responder that is shedding load writes `Deny(DenyReason::AtCapacity)` and closes
-without reading, so the requester gives up on that peer immediately and tries another. A serve that
-fails partway (storage or encoding error) is terminated with `Err(SyncFrameError::Internal)`, and a
+without reading, so the requester gives up on that peer immediately and tries another. A responder
+serves only its own epoch and the previous one. A `Req` for any other epoch is answered with
+`Deny(DenyReason::Unavailable)` before the `Ack` and before any storage read. A serve that fails
+partway (storage or encoding error) is terminated with `Err(SyncFrameError::Internal)`, and a
 malformed opening frame is answered with `Err(SyncFrameError::Malformed)`.
 
 Each batch is one [`SyncFrame::Data`] frame carrying the BCS-encoded batch. The stream is delimited
-by the terminating `End` frame; there is no on-wire batch count. The responder reads batches from the
-database in chunks of `BATCH_DIGESTS_READ_CHUNK_SIZE` (200) to bound the working set of a single
-serve — this is a database-read batching detail, not a wire-visible framing.
+by the terminating `End` frame; there is no on-wire batch count. The responder reads one batch at a
+time and drops it before the next read, and it flushes every `SYNC_SERVE_FLUSH_INTERVAL` (200)
+batches. A single serve holds at most one batch plus two reusable frame buffers, sized from the
+node's own epoch. This is a read and flush detail, not a wire-visible framing.
 
 ### Frame Wire Format
 
