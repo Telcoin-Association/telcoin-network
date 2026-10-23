@@ -132,7 +132,7 @@ kv knobs "$(env | grep -E '^(TN_BENCH_|INDEX_BENCH_)' | tr '\n' ' ')"
 
 build() { # <label> <source tree> <target dir>: prints the test binary's path
     echo "building the $1 test binary..." >&2
-    (cd "$2" && CARGO_TARGET_DIR="$3" cargo test --release -p tn-storage --lib \
+    (cd "$2" && CARGO_TARGET_DIR="$3" cargo test --locked --release -p tn-storage --lib \
         ${features[@]+"${features[@]}"} --no-run) >"$bench_dir/build-$1.log" 2>&1 || {
         tail -30 "$bench_dir/build-$1.log" >&2
         die "build of $1 failed; see $bench_dir/build-$1.log"

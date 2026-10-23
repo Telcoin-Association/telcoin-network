@@ -567,17 +567,17 @@ impl<DB: Database> Certifier<DB> {
                         //
                         // The lock exists to make the already-certified check at the top of this
                         // method atomic with the insert above, and that pair is now complete: the
-                        // insert updates the in-memory layer synchronously, so any later proposal
-                        // reaching that check already observes this certificate. Nothing below
-                        // needs the exclusion.
+                        // insert is readable as soon as it returns, so any later proposal reaching
+                        // that check already observes this certificate. Nothing below needs the
+                        // exclusion.
                         //
-                        // Holding it across the barrier would be actively harmful, because
-                        // `persist` is a *whole-DB* barrier - the table parameter is unused
-                        // and only selects which of the three DBs to target - so it defers while
-                        // any write txn on the epoch DB is open and drains only at refcount zero,
-                        // with no timeout. Under catch-up or epoch close that is tens to hundreds
-                        // of milliseconds during which every other proposal would queue behind this
-                        // lock. Do not widen this critical section back out.
+                        // Holding it across the barrier would be actively harmful: `persist` waits
+                        // for a sync round of the whole epoch environment's log (the table only
+                        // selects the environment) covering every write made before it, so it
+                        // waits on the disk (an msync, plus an fsync if the log grew), longest on
+                        // a slow volume, under catch-up or at epoch close, and every other proposal
+                        // would queue behind this lock meanwhile. Do not widen this critical
+                        // section back out.
                         drop(_guard);
 
                         // Wait for the `ProposedCertificates` record to be durable before

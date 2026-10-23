@@ -391,7 +391,8 @@ table; assumed at open unless the log is empty). In steady state that is "dead â
 accounting per write; a log that only grows never compacts. A batch that leaves every table
 empty, in a log of at least 1 MiB with a dead row, also asks for one at once (automatic
 compaction on), whatever the threshold. The epoch tables are all cleared at every epoch's end,
-so the epoch log resets there: nothing is live to copy, and the switch takes about 0.1 ms. That
+so the epoch log resets there: nothing is live to copy, and the switch takes about 0.1 ms (on
+a Mac; Linux not measured). That
 request stays pending until a compaction whose snapshot came after the last such batch switches
 (each one moves it on, so a second epoch end during a retried reset is not lost), or one whose new
 generation holds nothing dead. A batch during a compaction's copy is after its snapshot, so that

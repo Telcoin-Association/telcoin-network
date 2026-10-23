@@ -77,7 +77,8 @@ enum DbSubcommand {
 
     /// Report what the node's tndb consensus database holds: per environment, its generation,
     /// log, live and dead bytes, and each table's rows and index state. Read-only (changes no
-    /// file); refuses while a node holds the datadir, as the other at-rest tools do.
+    /// file); refuses while a node holds the datadir, as the other at-rest tools do, and holds the
+    /// datadir while it runs, so a node started meanwhile is refused until the report finishes.
     TndbStat,
 }
 

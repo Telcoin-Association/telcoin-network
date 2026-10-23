@@ -777,9 +777,11 @@ async fn drain_pending_on_shutdown<Fut>(
         })
         .try_fold(consensus_chain, |chain, output| async move {
             if let Err(e) = save_consensus(output.clone(), chain, consensus_bus.metrics()).await {
-                // The epoch end stops the node on a storage failure here: a save the pack failed
-                // either poisoned it or was rolled back, and either way every later persist
-                // fails, `finish_epoch`'s included.
+                // A storage failure here (a write that poisoned the pack, or a save rolled back
+                // after one) makes every later persist fail, `finish_epoch`'s included, so the
+                // epoch end stops the node. A save the pack refuses as invalid latches nothing;
+                // the drain stops there all the same, as at a failed fetch, and nothing at or past
+                // it is saved or sent.
                 error!(target: "subscriber", "error saving consensus during shutdown: {e}");
                 Err(())
             } else {

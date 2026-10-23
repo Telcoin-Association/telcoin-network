@@ -606,14 +606,13 @@ where
 
                 // This fast path recasts a stored vote before taking the per-author lock, so it
                 // must be gated on the same durability barrier as the slow paths.
-                // If any epoch-DB commit has failed, the `Votes` guard for this
-                // author/round may live only in the authoritative mem layer and
-                // never on disk, so recasting here would risk the same
-                // self-inflicted equivocation on restart that the first-vote barrier guards
-                // against. The poison latch fails this barrier after any failed
-                // commit; end the epoch rather than recast a non-durable vote (issue
-                // #975), after which `run_epoch` finds the store unable to make writes
-                // durable and stops the node.
+                // If any epoch-DB write or sync has failed, the `Votes` guard for this
+                // author/round may be readable without ever having reached disk, so recasting
+                // here would risk the same self-inflicted equivocation on restart that the
+                // first-vote barrier guards against. The store's failure latch fails this
+                // barrier after any failed write or sync; end the epoch rather than recast a
+                // non-durable vote (issue #975), after which `run_epoch` finds the store unable
+                // to make writes durable and stops the node.
                 self.consensus_config
                     .node_storage()
                     .persist::<Votes>()
@@ -1108,13 +1107,13 @@ where
                             header,
                             header.round()
                         );
-                        // Recast of a prior matching vote. If any epoch-DB commit has since failed,
-                        // the `Votes` guard for this author/round may live only in the
-                        // authoritative mem layer and not on disk, so
-                        // resending it here would risk the same
-                        // self-inflicted equivocation on restart. The poison latch fails this
-                        // barrier after any failed commit; end the epoch rather than recast a
-                        // non-durable vote (issue #975), and `run_epoch` then stops the node.
+                        // Recast of a prior matching vote. If any epoch-DB write or sync has since
+                        // failed, the `Votes` guard for this author/round may be readable without
+                        // ever having reached disk, so resending it here would risk the same
+                        // self-inflicted equivocation on restart. The store's failure latch fails
+                        // this barrier after any failed write or sync; end the epoch rather than
+                        // recast a non-durable vote (issue #975), and `run_epoch` then stops the
+                        // node.
                         self.consensus_config
                             .node_storage()
                             .persist::<Votes>()

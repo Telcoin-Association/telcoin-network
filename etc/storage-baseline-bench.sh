@@ -91,7 +91,7 @@ try() { "$@" 2>/dev/null || echo "?"; }
 cd "$repo"
 echo "building the tn-storage bench binary (release, all features)..."
 build_log="$(mktemp)"
-if ! cargo test --release -p tn-storage --all-features --lib --no-run >"$build_log" 2>&1; then
+if ! cargo test --locked --release -p tn-storage --all-features --lib --no-run >"$build_log" 2>&1; then
     tail -30 "$build_log" >&2
     exit 1
 fi

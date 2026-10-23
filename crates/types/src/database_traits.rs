@@ -130,13 +130,13 @@ pub trait Database: Send + Sync + Clone + Unpin + 'static {
 
     /// Await until this caller's background writes are durably committed to the physical store.
     ///
-    /// Some backends persist in the background: an `insert` updates an in-memory layer and enqueues
-    /// the disk write, returning before it is durable. This barrier resolves only once every write
-    /// ordered before it is durably committed, including the subtle case where a concurrently-open
-    /// write txn has *absorbed* this caller's bare insert, in which case the ack is deferred until
-    /// that physical txn commits. Synchronously-durable backends (raw MDBX, `MemDatabase`)
-    /// are already durable on return, so the default no-op is correct for them. Uses `Table` as a
-    /// hint so a composite backend only waits on the relevant physical store.
+    /// Some backends make writes durable in the background: tndb (in group mode) returns from an
+    /// `insert` or a transaction's commit once the write is readable, and a sync round makes it
+    /// durable later. This barrier resolves only once every write made before it, by any caller,
+    /// is durable. Writes still buffered in an open, uncommitted write transaction are not made
+    /// yet and are not waited for. Backends with nothing to wait for (`MemDatabase`, raw MDBX) keep
+    /// the default no-op. `Table` selects the store: a backend split by environment
+    /// (`SplitDatabase`) waits only on the environment that holds `T`.
     ///
     /// This is the single durability barrier: await it at externalization points (the proposer's
     /// header broadcast, the vote handler's vote return, and the certifier's proposed-certificate
