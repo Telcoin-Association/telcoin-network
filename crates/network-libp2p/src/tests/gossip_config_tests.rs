@@ -576,12 +576,13 @@ async fn test_gossip_key_field_rejected_on_the_wire() -> eyre::Result<()> {
     let observer_key = Keypair::generate_ed25519();
     let observer_id = observer_key.public().to_peer_id();
     let (recorded_tx, mut recorded_rx) = mpsc::unbounded_channel();
-    let mut observer_gossip = gossipsub::Behaviour::new_with_transform(
-        gossipsub::MessageAuthenticity::Signed(observer_key.clone()),
-        gossipsub_config(TEST_CHAIN_ID)?,
-        RecordRawMessages(recorded_tx),
-    )
-    .map_err(|e| eyre!("observer gossipsub behaviour: {e}"))?;
+    let mut observer_gossip: gossipsub::Behaviour<RecordRawMessages> =
+        gossipsub::Behaviour::new_with_transform(
+            gossipsub::MessageAuthenticity::Signed(observer_key.clone()),
+            gossipsub_config(TEST_CHAIN_ID)?,
+            RecordRawMessages(recorded_tx),
+        )
+        .map_err(|e| eyre!("observer gossipsub behaviour: {e}"))?;
     observer_gossip.subscribe(&gossip_topic).map_err(|e| eyre!("observer subscribe: {e:?}"))?;
 
     // receiver: the node's gossipsub configuration and transform, with the observer as an
