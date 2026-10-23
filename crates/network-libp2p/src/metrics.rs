@@ -64,13 +64,22 @@ struct SwarmMetricHandles {
     quic_incoming_retried_total: Counter,
     /// Incoming QUIC attempts accepted into a handshake.
     quic_incoming_accepted_total: Counter,
-    /// Incoming QUIC attempts refused with a connection close: refused by the listener or
-    /// failed in the quinn accept.
+    /// Legacy aggregate of listener policy refusals and failed accepts, including stale Initials.
     quic_incoming_refused_total: Counter,
     /// Incoming QUIC attempts dropped without a reply.
     quic_incoming_ignored_total: Counter,
     /// Times the QUIC listener yielded after its per-poll outcome cap.
     quic_incoming_budget_yields_total: Counter,
+    /// Endpoint attempts retained before accept, Retry, refuse, or ignore.
+    quic_incoming_queued: Gauge,
+    /// Sum of effective max_incoming values across live listening endpoints.
+    quic_incoming_limit: Gauge,
+    /// Live QUIC endpoints with an incoming server configuration.
+    quic_incoming_endpoints: Gauge,
+    /// Accepted inbound upgrade futures still pending, distinct from endpoint queue occupancy.
+    quic_incoming_handshakes: Gauge,
+    /// Swarm pending inbound connections after transport admission.
+    pending_incoming_connections: Gauge,
 }
 
 /// The `connection_limits` bound named by a [`connection_limits::Exceeded`] refusal.
@@ -961,12 +970,65 @@ impl AdmissionShed {
 /// Swarm-level metrics owned by `ConsensusNetwork`.
 #[derive(Clone, Debug)]
 pub(crate) struct SwarmMetrics {
+    /// Clear live gauges when the last owner of this swarm's metric handles shuts down.
+    _quic_lifetime: std::sync::Arc<QuicGaugeLifetime>,
+    /// Fixed transport outcome series, resolved once for this configured swarm.
+    quic_outcomes: [(libp2p::quic::IncomingOutcome, std::sync::Arc<QuicCounter>);
+        libp2p::quic::IncomingOutcome::ALL.len()],
+    /// Per-lifetime source positions for the legacy transport aggregates.
+    quic_legacy: [std::sync::Arc<QuicCounter>; 5],
     /// The configured swarm label for record-exchange events.
     network: String,
     /// The derive-backed handles.
     handles: SwarmMetricHandles,
     /// The labeled handles, resolved at construction.
     labeled: LabeledHandles,
+}
+
+/// Publish source deltas so a recreated swarm adds to the existing process recorder series.
+#[derive(Debug)]
+struct QuicCounter {
+    /// Counter in the process recorder, retained across source lifetimes.
+    counter: Counter,
+    /// Last source total sampled by the network loop, shared by cloned metric handles.
+    observed: std::sync::atomic::AtomicU64,
+}
+
+impl QuicCounter {
+    /// Start observing one newly constructed transport's monotonic source counter.
+    fn new(counter: Counter) -> Self {
+        counter.increment(0);
+        Self { counter, observed: std::sync::atomic::AtomicU64::new(0) }
+    }
+
+    /// Sample each source lifetime from the owning swarm's single event loop.
+    fn publish(&self, current: u64) {
+        let previous = self.observed.swap(current, std::sync::atomic::Ordering::Relaxed);
+        self.counter.increment(current.saturating_sub(previous));
+    }
+}
+
+/// Live transport gauges outlive individual sampling calls and clear on swarm teardown.
+#[derive(Debug)]
+struct QuicGaugeLifetime(SwarmMetricHandles);
+
+impl Drop for QuicGaugeLifetime {
+    /// A stopped swarm contributes no live queue entries, endpoints, or handshakes.
+    fn drop(&mut self) {
+        self.0.quic_incoming_queued.set(0);
+        self.0.quic_incoming_limit.set(0);
+        self.0.quic_incoming_endpoints.set(0);
+        self.0.quic_incoming_handshakes.set(0);
+        self.0.pending_incoming_connections.set(0);
+    }
+}
+
+/// Convert native counts to correctly rounded gauges without truncating large ceilings.
+fn quic_gauge_value(count: usize) -> f64 {
+    let count = u64::try_from(count).unwrap_or(u64::MAX);
+    let high = u32::try_from(count >> u32::BITS).unwrap_or(u32::MAX);
+    let low = u32::try_from(count & u64::from(u32::MAX)).unwrap_or(u32::MAX);
+    f64::from(high).mul_add(f64::from(u32::MAX) + 1.0, f64::from(low))
 }
 
 impl SwarmMetrics {
@@ -1001,8 +1063,28 @@ impl SwarmMetrics {
     /// Create the swarm metric handles for `network_type`.
     pub(crate) fn new_for(network_type: &NetworkType) -> Self {
         let network = network_label(network_type);
+        let handles = SwarmMetricHandles::new_with_labels(&[("network", network.clone())]);
         Self {
-            handles: SwarmMetricHandles::new_with_labels(&[("network", network.clone())]),
+            _quic_lifetime: std::sync::Arc::new(QuicGaugeLifetime(handles.clone())),
+            quic_outcomes: libp2p::quic::IncomingOutcome::ALL.map(|outcome| {
+                let counter = metrics::counter!(
+                    "tn_network.quic_incoming_outcomes_total",
+                    "network" => network.clone(),
+                    "stage" => outcome.stage(),
+                    "decision" => outcome.decision(),
+                    "reason" => outcome.reason(),
+                );
+                (outcome, std::sync::Arc::new(QuicCounter::new(counter)))
+            }),
+            quic_legacy: [
+                &handles.quic_incoming_retried_total,
+                &handles.quic_incoming_accepted_total,
+                &handles.quic_incoming_refused_total,
+                &handles.quic_incoming_ignored_total,
+                &handles.quic_incoming_budget_yields_total,
+            ]
+            .map(|counter| std::sync::Arc::new(QuicCounter::new(counter.clone()))),
+            handles,
             labeled: LabeledHandles::new(&network),
             network,
         }
@@ -1042,14 +1124,32 @@ impl SwarmMetrics {
         self.handles.outbound_requests_pending.set(outbound_requests as f64);
     }
 
-    /// Mirror the QUIC listener decision counters (absolute values; called once per
-    /// event-loop iteration). No address labels.
+    /// Publish source deltas and live transport gauges from the owning network loop.
+    /// Every series uses only the configured swarm and fixed outcome labels.
     pub(crate) fn record_quic_incoming(&self, stats: &libp2p::quic::IncomingStats) {
-        self.handles.quic_incoming_retried_total.absolute(stats.retried());
-        self.handles.quic_incoming_accepted_total.absolute(stats.accepted());
-        self.handles.quic_incoming_refused_total.absolute(stats.refused());
-        self.handles.quic_incoming_ignored_total.absolute(stats.ignored());
-        self.handles.quic_incoming_budget_yields_total.absolute(stats.budget_yields());
+        self.quic_outcomes
+            .iter()
+            .for_each(|(outcome, counter)| counter.publish(stats.count(*outcome)));
+        let endpoint = stats.endpoint();
+        self.handles.quic_incoming_queued.set(quic_gauge_value(endpoint.queued()));
+        self.handles.quic_incoming_limit.set(quic_gauge_value(endpoint.limit()));
+        self.handles.quic_incoming_endpoints.set(quic_gauge_value(endpoint.endpoints()));
+        self.handles.quic_incoming_handshakes.set(quic_gauge_value(stats.handshakes()));
+        [
+            stats.retried(),
+            stats.accepted(),
+            stats.refused(),
+            stats.ignored(),
+            stats.budget_yields(),
+        ]
+        .into_iter()
+        .zip(&self.quic_legacy)
+        .for_each(|(current, counter)| counter.publish(current));
+    }
+
+    /// Publish the swarm's inbound pending count independently of transport resource gauges.
+    pub(crate) fn set_pending_incoming_connections(&self, pending: u32) {
+        self.handles.pending_incoming_connections.set(f64::from(pending));
     }
 
     /// Record a retrieval event with a fixed, peer-independent outcome label.
@@ -1429,6 +1529,135 @@ impl PeerManagerMetrics {
 mod tests {
     use super::*;
     use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
+    /// Counts beyond u32 retain their magnitude instead of saturating the effective ceiling.
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn quic_metrics_preserve_large_ceilings() -> Result<(), std::num::TryFromIntError> {
+        let count = usize::try_from(u64::from(u32::MAX) + 2)?;
+        assert_eq!(quic_gauge_value(count), 4_294_967_297.0);
+        assert_eq!(quic_gauge_value(usize::MAX), 18_446_744_073_709_551_616.0);
+        Ok(())
+    }
+
+    /// Recreating a transport retains prior process totals and does not lose the new lifetime.
+    #[test]
+    fn quic_metrics_accumulate_across_swarm_restarts() {
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        metrics::with_local_recorder(&recorder, || {
+            let counter =
+                metrics::counter!("tn_network.quic_incoming_retried_total", "network" => "primary");
+            let first = QuicCounter::new(counter.clone());
+            first.publish(8);
+            first.publish(8);
+            let restarted = QuicCounter::new(counter);
+            restarted.publish(3);
+            restarted.publish(5);
+        });
+        assert!(snapshotter.snapshot().into_vec().iter().any(|(key, _, _, value)| key
+            .key()
+            .name()
+            == "tn_network.quic_incoming_retried_total"
+            && matches!(value, DebugValue::Counter(13))));
+    }
+
+    /// The transport family has only fixed stage/reason labels and configured swarm labels.
+    #[test]
+    fn quic_metrics_have_bounded_per_swarm_series() {
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        metrics::with_local_recorder(&recorder, || {
+            [NetworkType::Primary, NetworkType::Worker(0), NetworkType::Worker(1)].iter().for_each(
+                |network| {
+                    let swarm = SwarmMetrics::new_for(network);
+                    let stats = libp2p::quic::IncomingStats::default();
+                    (0..1000).for_each(|_| swarm.record_quic_incoming(&stats));
+                },
+            );
+        });
+        let snapshot = snapshotter.snapshot().into_vec();
+        let outcomes: Vec<_> = snapshot
+            .iter()
+            .filter(|(key, _, _, _)| key.key().name() == "tn_network.quic_incoming_outcomes_total")
+            .collect();
+        assert_eq!(outcomes.len(), 3 * libp2p::quic::IncomingOutcome::ALL.len());
+        outcomes.iter().for_each(|(key, _, _, value)| {
+            assert_eq!(key.key().labels().count(), 4);
+            assert!(key.key().labels().all(|label| match label.key() {
+                "network" => ["primary", "worker-0", "worker-1"].contains(&label.value()),
+                "stage" => ["endpoint", "listener"].contains(&label.value()),
+                "decision" => [
+                    "accept",
+                    "accept_error",
+                    "retry",
+                    "refuse",
+                    "ignore",
+                    "validate",
+                    "revalidate"
+                ]
+                .contains(&label.value()),
+                "reason" => libp2p::quic::IncomingOutcome::ALL
+                    .iter()
+                    .any(|outcome| outcome.reason() == label.value()),
+                _ => false,
+            }));
+            assert!(matches!(value, DebugValue::Counter(0)));
+        });
+    }
+
+    /// Gauge values from a stopped swarm must not retain stale resource occupancy.
+    #[test]
+    fn quic_metrics_clear_live_gauges_at_shutdown() {
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let set_live = |swarm: &SwarmMetrics| {
+            swarm.handles.quic_incoming_queued.set(2);
+            swarm.handles.quic_incoming_limit.set(7);
+            swarm.handles.quic_incoming_endpoints.set(1);
+            swarm.handles.quic_incoming_handshakes.set(3);
+            swarm.set_pending_incoming_connections(4);
+        };
+        let swarm = metrics::with_local_recorder(&recorder, || {
+            let swarm = SwarmMetrics::new_for(&NetworkType::Primary);
+            set_live(&swarm);
+            swarm
+        });
+        let observed = || {
+            snapshotter
+                .snapshot()
+                .into_vec()
+                .into_iter()
+                .filter_map(|(key, _, _, value)| {
+                    [
+                        "tn_network.quic_incoming_queued",
+                        "tn_network.quic_incoming_limit",
+                        "tn_network.quic_incoming_endpoints",
+                        "tn_network.quic_incoming_handshakes",
+                        "tn_network.pending_incoming_connections",
+                    ]
+                    .contains(&key.key().name())
+                    .then_some(value)
+                })
+                .collect::<Vec<_>>()
+        };
+        let before = observed();
+        assert_eq!(before.len(), 5);
+        assert!(
+            before.iter().all(|value| matches!(value, DebugValue::Gauge(value) if value.0 > 0.0)),
+            "live gauges: {before:?}"
+        );
+        // DebuggingRecorder consumes gauge values when snapshotting. Refill them so that
+        // the post-drop assertion verifies cleanup rather than the snapshot's reset.
+        set_live(&swarm);
+        drop(swarm);
+        let after = observed();
+        assert_eq!(after.len(), 5);
+        assert!(
+            after.iter().all(|value| matches!(value, DebugValue::Gauge(value) if value.0 == 0.0)),
+            "stopped gauges: {after:?}"
+        );
+    }
 
     /// Capacity observations have only the configured swarm label and track occupancy and shedding.
     #[test]
@@ -1948,29 +2177,29 @@ mod tests {
             });
         });
 
+        // every direction registers `peer_full` at zero, so that query names the recorded
+        // direction; `count` returns the first match in registration order
+        let families: [(&str, &[(&str, &str)]); 6] = [
+            (
+                "tn_network.inbound_connections_denied_total",
+                &[("reason", "peer_manager_banned_peer")],
+            ),
+            ("tn_network.listener_errors_total", &[("reason", "address_in_use")]),
+            ("tn_network.listeners_closed_total", &[("outcome", "ok")]),
+            ("tn_network.listen_failures_total", &[("reason", "aborted")]),
+            (
+                "tn_network.source_admission_denied_total",
+                &[("direction", "out"), ("reason", "peer_full")],
+            ),
+            ("tn_network.closed_admission_denied_total", &[("direction", "in")]),
+        ];
         let after = counters(&recorder);
         networks.iter().for_each(|(_, network, times)| {
-            [
-                (
-                    "tn_network.inbound_connections_denied_total",
-                    [("reason", "peer_manager_banned_peer")].as_slice(),
-                ),
-                ("tn_network.listener_errors_total", [("reason", "address_in_use")].as_slice()),
-                ("tn_network.listeners_closed_total", [("outcome", "ok")].as_slice()),
-                ("tn_network.listen_failures_total", [("reason", "aborted")].as_slice()),
-                // each direction has its own series, so the filter names the recorded one
-                (
-                    "tn_network.source_admission_denied_total",
-                    [("direction", "out"), ("reason", "peer_full")].as_slice(),
-                ),
-                ("tn_network.closed_admission_denied_total", [("direction", "in")].as_slice()),
-            ]
-            .into_iter()
-            .for_each(|(name, labels)| {
-                let filter: Vec<_> =
+            families.iter().for_each(|(name, labels)| {
+                let labels: Vec<_> =
                     std::iter::once(("network", *network)).chain(labels.iter().copied()).collect();
                 assert_eq!(
-                    count(&after, name, &filter),
+                    count(&after, name, &labels),
                     Some(*times),
                     "{name} must count {network}'s events separately"
                 );
