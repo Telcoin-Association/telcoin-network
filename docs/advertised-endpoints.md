@@ -109,3 +109,87 @@ must preserve the source information required by consensus networking and QUIC a
 and QUIC authentication must terminate at the validator's configured transport identity. An arbitrary
 proxy that substitutes its own identity or obscures the required source is unsupported. Obtain
 provider confirmation for the actual routing setup before production migration.
+## Committee convergence
+
+Known-peer totals and record-exchange counters do not measure committee readiness. The following
+gauges contain only configured `network` values (`primary`, `worker-0`, `worker-1`, etc.) and the
+three fixed `slot` values (`previous`, `current`, `next`). No identity, address, URL, or error is a
+label. Prometheus normalizes the dot in the `tn_network.*` names to an underscore.
+
+| Gauge | Meaning |
+| --- | --- |
+| `tn_network_committee_required_members{network,slot}` | Required remote committee identities, excluding this node's own BLS identity from each slot. |
+| `tn_network_committee_unresolved_members{network,slot}` | Required identities without a learned record. Configuration and bootstrap stubs remain unresolved. |
+| `tn_network_committee_observed_timestamp_seconds{network}` | Unix time of the latest resolution observation on the swarm loop. |
+| `tn_worker_submit_expected_members{network}` | All current committee identities in an observer's atomic membership snapshot. |
+| `tn_worker_submit_usable_members{network}` | Current members with at least one fresh, verified advertisement admitted by the forwarder's actual endpoint policy and demotion state. A member counts once. |
+| `tn_worker_submit_observed_timestamp_seconds{network}` | Unix time of the latest successful observer snapshot, or zero when unavailable. |
+
+Resolution gauges initialize at swarm startup and update after commands and network events, including
+record acceptance/replacement, failed resolution, and committee rotation. Learned identities retain
+their existing committee-window lifetime for routing; this alone does not establish submit coverage.
+Submit observations additionally require a matching, unexpired signed DHT record under the existing
+record-expiry policy. Cached URLs, expired records, and local stubs cannot establish coverage. A newer
+verified refresh can restore coverage without restarting the node. Polling also retries missing
+required records. Expiry follows the existing DHT store policy, including its handling of identical
+republishes; these observations impose no new age threshold on signed timestamps.
+
+Observer monitors run immediately and every five seconds on each active worker's epoch task spawner,
+even with no transactions. Each snapshot reads membership and advertisements on one swarm iteration,
+then applies the same URL policy, provider cache, and transport-demotion checks as forwarding.
+Demotion and successful-delivery recovery update coverage at the consumer mutation. Cooldown expiry,
+record changes, and rotation appear on the next snapshot. Unresolved or missing members remain in
+the denominator; previous/next members and pinned non-members never enter submit coverage. Observers
+are outside the current committee, so their submit denominator needs no self exclusion. These
+observations describe admission eligibility under existing policy, without an additional HTTP probe.
+The complete advertisement set drives cache retention separately from fresh coverage candidates, so
+record expiry cannot erase a still-advertised endpoint's transport cooldown.
+
+A missing reply or stalled command channel clears coverage after a five-second timeout. Monitor
+cancellation clears all three submit gauges; new epochs start unavailable. Zero members, absent
+observations, and stalled monitors must never be interpreted as ready. The timestamp bounds a stalled
+task even if it cannot publish its timeout.
+
+For resolution progress, inspect each network and slot separately:
+
+```promql
+tn_network_committee_unresolved_members
+  / clamp_min(tn_network_committee_required_members, 1)
+```
+
+For a conservative rollout gate, use the following query for **each expected worker network**.
+Replace `worker-0` with the configured network being checked and `telcoin-observers` with the scrape
+job selecting the observer fleet. Every expected observer must be present in that job's `up` series.
+The result is one only for full current coverage with matching denominators and an observation no
+more than three monitor intervals (15 s) old at the time of its scrape; missing observations return
+zero. The freshness term measures the age at scrape time, `timestamp()` of the sample minus the
+observed timestamp, so the Prometheus scrape interval does not enter the window and the query
+assumes no scrape interval. Clock offset between the node and Prometheus shifts the measured age by
+the offset. Keep both clocks under NTP: an offset above 15 s reads zero on every evaluation, and a
+stalled monitor on a node whose clock runs ahead by `d` seconds reads one for up to 15 + `d` seconds.
+Require one for every expected observer/worker pair. Do not sum worker numerators or infer the
+expected worker inventory from the series that happen to exist. Include tenant/cluster labels in
+joins if they are part of target identity.
+
+```promql
+(
+  (tn_worker_submit_usable_members{job="telcoin-observers",network="worker-0"}
+    == bool tn_worker_submit_expected_members{job="telcoin-observers",network="worker-0"})
+  * (tn_worker_submit_expected_members{job="telcoin-observers",network="worker-0"} > bool 0)
+  * (abs(timestamp(
+        tn_worker_submit_observed_timestamp_seconds{job="telcoin-observers",network="worker-0"})
+      - tn_worker_submit_observed_timestamp_seconds{job="telcoin-observers",network="worker-0"})
+      <= bool 15)
+  * on(job,instance,network)
+    (tn_worker_submit_expected_members{job="telcoin-observers",network="worker-0"}
+      == bool on(job,instance,network)
+        max without(slot) (tn_network_committee_required_members{
+          job="telcoin-observers",network="worker-0",slot="current"}))
+  * on(job,instance) (up{job="telcoin-observers"} == bool 1)
+)
+or on(job,instance) (0 * up{job="telcoin-observers"})
+```
+
+During rollout, verify a partial snapshot first, then accept a fresh signed advertisement, demote and
+recover an endpoint, and rotate membership. Coverage must increase on verified refresh/recovery,
+drop on demotion or expiry, and replace departed members at rotation. Check each worker independently.

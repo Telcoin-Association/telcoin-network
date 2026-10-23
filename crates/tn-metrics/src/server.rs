@@ -1,8 +1,10 @@
 //! Minimal HTTP `/metrics` endpoint for Prometheus scrapes.
 //!
 //! Mirrors the raw-TCP pattern of the node healthcheck server: no request parsing, no
-//! connection limits, every connection receives the full rendered registry. Node operators
-//! must protect the endpoint with a firewall.
+//! connection limits, every connection receives the full rendered registry. Bind it to a
+//! loopback or private interface address; the bound endpoint and its reach are reported at
+//! startup through [`crate::report_listener_bound`]. A host firewall is defense in depth, not
+//! the binding contract.
 
 use std::{fmt, net::SocketAddr, sync::Arc, time::Duration};
 
@@ -80,9 +82,11 @@ impl MetricsHooks {
 /// # Security Considerations
 ///
 /// Like the healthcheck endpoint, this accepts connections from any source and responds
-/// unconditionally, without parsing the request. Operators must firewall the port.
-/// Binding to a loopback address (e.g. `127.0.0.1:9001`) with a local scraper relaying
-/// to remote storage is the recommended deployment.
+/// unconditionally, without parsing the request. Reach is the control: bind a loopback address
+/// (e.g. `127.0.0.1:9101`) with a local scraper relaying to remote storage, or one private
+/// interface address that only the collector can route to. The bound endpoint and its reach
+/// are reported at startup through [`crate::report_listener_bound`]; a wildcard bind is
+/// warned. A host firewall is defense in depth, not the binding contract.
 pub async fn start_metrics_server(
     addr: SocketAddr,
     task_spawner: &TaskSpawner,
@@ -91,9 +95,9 @@ pub async fn start_metrics_server(
 ) -> eyre::Result<SocketAddr> {
     let handle = install_recorder()?;
 
-    // IMPORTANT: use firewall to protect this endpoint
     let listener = TcpListener::bind(addr).await?;
     let listen_on = listener.local_addr()?;
+    crate::exposure::report_listener_bound("metrics", listen_on);
 
     // static info series so dashboards can surface the running version
     metrics::gauge!("tn_info", "version" => version).set(1.0);
