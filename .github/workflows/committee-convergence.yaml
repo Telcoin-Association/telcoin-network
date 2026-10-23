@@ -35,7 +35,7 @@ jobs:
       - name: Install pinned nightly tools
         if: matrix.lane == 'fmt' || matrix.lane == 'clippy'
         run: rustup toolchain install "$(cat rust-nightly)" -c rustfmt,clippy,rust-src --profile minimal
-      - uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0
+      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283
         if: startsWith(matrix.lane, 'test-')
         with:
           tool: cargo-nextest
@@ -65,7 +65,7 @@ jobs:
           submodules: true
       - name: Install pinned Rust toolchain
         run: rustup show active-toolchain || rustup toolchain install
-      - uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0
+      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283
         with:
           tool: cargo-nextest
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
