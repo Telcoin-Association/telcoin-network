@@ -259,6 +259,28 @@ jobs:
       - name: Test connection accounting
         run: cargo +1.94 test --locked -p libp2p-connection-limits --lib
 
+  # Same shape for the carried QUIC protocol crate. `patches/quinn-proto` is excluded from
+  # the workspace, so no lane above builds its library tests, and the protocol observation
+  # regressions (src/tests/incoming_observations.rs) are the safety net its maintenance
+  # record relies on. quic-observations.yaml runs them with their mutation witnesses, but
+  # that workflow is not behind `CI Success` and has no merge_group trigger, so a break
+  # could merge the way #1462 did. This lane runs for every author and in the queue, under
+  # this file's RUSTFLAGS, so the carried tests are also held to `-D warnings`.
+  #
+  # No cache step, for the reason given above. The cold dependency build (aws-lc-sys is
+  # the long pole) fits the lane's 20-minute budget with room to spare.
+  quinn-proto-patch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install pinned toolchain
+        run: rustup toolchain install 1.94 --profile minimal
+
+      - name: Test the carried protocol observations
+        run: cargo +1.94 test --locked --manifest-path patches/quinn-proto/Cargo.toml --lib
+
   # Clippy - replaces cargo check, catches more issues.
   #
   # Two passes, default features and then --all-features (see etc/ci-lanes.sh for why one
@@ -434,7 +456,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     if: always()
-    needs: [ci-scope, attest, fmt, clippy, test, adiri-test, archive-mode-gate, connection-limits-patch, transport-evidence, quic-profile-pins]
+    needs: [ci-scope, attest, fmt, clippy, test, adiri-test, archive-mode-gate, connection-limits-patch, quinn-proto-patch, transport-evidence, quic-profile-pins]
     steps:
       - name: Check all jobs passed
         env:
@@ -461,7 +483,7 @@ jobs:
           # The job list is asserted, not discovered: a job renamed or dropped from
           # `needs` would otherwise leave this check silently, or turn up as an unnamed
           # lane whose `skipped` the pull_request branch below accepts.
-          expected="adiri-test archive-mode-gate attest ci-scope clippy connection-limits-patch fmt quic-profile-pins test transport-evidence"
+          expected="adiri-test archive-mode-gate attest ci-scope clippy connection-limits-patch fmt quic-profile-pins quinn-proto-patch test transport-evidence"
           actual=$(jq -r 'keys | join(" ")' <<<"${RESULTS}")
           if [[ "${actual}" != "${expected}" ]]; then
             echo "::error::needs mismatch: expected [${expected}], got [${actual}]. Update 'expected' in this step together with 'needs'."
@@ -492,6 +514,11 @@ jobs:
               *:connection-limits-patch:success) echo "  ok       ${job}" ;;
               *:connection-limits-patch:*)
                 echo "::error::connection-limits-patch: ${result}"
+                failed=1
+                ;;
+              *:quinn-proto-patch:success) echo "  ok       ${job}" ;;
+              *:quinn-proto-patch:*)
+                echo "::error::quinn-proto-patch: ${result}"
                 failed=1
                 ;;
               *:transport-evidence:success) echo "  ok       ${job}" ;;

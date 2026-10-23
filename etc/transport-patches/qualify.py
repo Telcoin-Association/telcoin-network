@@ -83,6 +83,7 @@ rustls-webpki = {{ version = "={stack['rustls-webpki']}", features = ["aws-lc-rs
 '''
     if name == "carried":
         text += '\n[patch.crates-io]\nlibp2p-quic = { path = ' + json.dumps(str(ROOT / "patches/libp2p-quic")) + ' }\n'
+        text += 'quinn-proto = { path = ' + json.dumps(str(ROOT / "patches/quinn-proto")) + ' }\n'
     return text
 
 
