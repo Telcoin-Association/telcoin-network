@@ -15,7 +15,7 @@ use crate::{
     peers::status::ConnectionStatus,
     send_or_log_error,
     source_admission::{AdmissionError, SourceAdmissionBudget, SourceConnections},
-    types::{NetworkInfo, NetworkResult, RpcInfo},
+    types::{CommitteeRpcSnapshot, NetworkInfo, NetworkResult, RpcInfo},
 };
 use libp2p::{
     core::ConnectedPoint, kad::PeerInfo, multiaddr::Protocol, swarm::ConnectionId, Multiaddr,
@@ -125,6 +125,24 @@ pub(crate) const PUT_RECORD_PENALTY_THRESHOLD: usize = 2 * KAD_MAX_STORED_RECORD
 /// through the existing disconnect and ban paths without waiting for another window.
 pub(crate) const PUT_RECORD_DISCONNECT_THRESHOLD: usize = 8 * PUT_RECORD_PENALTY_THRESHOLD;
 
+/// Tokens per second that refill the inbound kad `PutRecord` budget shared by untrusted
+/// sources.
+///
+/// Honest steady fan-in is about 30 target peers times 20 replicated records per hour, less
+/// than 0.2 records per second. Two per second is ten times that, and costs at most about
+/// 2 ms of BLS verify work per second on the network task.
+const PUT_RECORD_BUDGET_REFILL_PER_SEC: u32 = 2;
+
+/// Capacity of the inbound kad `PutRecord` budget shared by untrusted sources.
+///
+/// Covers a restart: each target peer pushes its own record on connect, then record exchange
+/// follows. Without this budget, [`MAX_RATE_WINDOWS`] sources at
+/// [`MAX_PUT_RECORDS_PER_WINDOW`] per [`PUT_RECORD_RATE_WINDOW`] permit 512 verifies per
+/// second, and 61,440 at one aligned window boundary. With it, untrusted sources together
+/// get at most [`PUT_RECORD_BUDGET_REFILL_PER_SEC`] verifies per second and this many at one
+/// instant.
+const PUT_RECORD_BUDGET_BURST: u32 = 120;
+
 /// Per-source inbound kad `PutRecord` rate window.
 struct PutRecordWindow {
     /// Records counted from the source in the current window.
@@ -135,12 +153,50 @@ struct PutRecordWindow {
     penalized: bool,
 }
 
+/// Token bucket for the inbound kad `PutRecord` verifies that all untrusted sources share.
+///
+/// Refills [`PUT_RECORD_BUDGET_REFILL_PER_SEC`] tokens per whole elapsed second, up to
+/// [`PUT_RECORD_BUDGET_BURST`]. Each record that passes its per-source window takes one token.
+struct PutRecordBudget {
+    /// Verifies available now.
+    tokens: u32,
+    /// When tokens were last credited; a partial second carries over to the next refill.
+    last_refill: Instant,
+}
+
+impl PutRecordBudget {
+    /// A full budget as of `now`.
+    fn new(now: Instant) -> Self {
+        Self { tokens: PUT_RECORD_BUDGET_BURST, last_refill: now }
+    }
+
+    /// Credit the tokens earned since the last refill, then take one if any are left.
+    ///
+    /// Returns whether a token was taken.
+    fn try_take(&mut self, now: Instant) -> bool {
+        let secs = now.saturating_duration_since(self.last_refill).as_secs();
+        let refill =
+            u32::try_from(secs.saturating_mul(u64::from(PUT_RECORD_BUDGET_REFILL_PER_SEC)))
+                .unwrap_or(u32::MAX);
+        let tokens = self.tokens.saturating_add(refill).min(PUT_RECORD_BUDGET_BURST);
+        self.last_refill = if tokens == PUT_RECORD_BUDGET_BURST {
+            now
+        } else {
+            self.last_refill.checked_add(Duration::from_secs(secs)).unwrap_or(now)
+        };
+        let taken = tokens > 0;
+        self.tokens = tokens.saturating_sub(u32::from(taken));
+        taken
+    }
+}
+
 /// Outcome of recording an inbound kad `PutRecord` against the per-source window.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PutRecordRate {
     /// Under the shed threshold: process the record.
     Allowed,
-    /// Per-source budget or tracking capacity exhausted: drop without penalizing the source.
+    /// Per-source budget, shared budget, or tracking capacity exhausted: drop without
+    /// penalizing the source.
     Shed,
     /// First crossing of the penalty threshold, or any message past the repeated-penalty
     /// ceiling: drop the record and penalize the source.
@@ -295,6 +351,14 @@ pub(crate) struct PeerManager {
     /// task that also relays consensus gossip (GHSA-f6rq-62rr-4h9g). Entries survive
     /// disconnects, expire on heartbeat, and never exceed [`MAX_RATE_WINDOWS`].
     put_record_windows: HashMap<PeerId, PutRecordWindow>,
+    /// Inbound kad `PutRecord` verify budget that all untrusted sources share.
+    ///
+    /// The per-source windows alone let [`MAX_RATE_WINDOWS`] sources together reach 512
+    /// verifies per second, and 61,440 at one aligned window boundary. This budget limits
+    /// untrusted sources together to [`PUT_RECORD_BUDGET_REFILL_PER_SEC`] per second and
+    /// [`PUT_RECORD_BUDGET_BURST`] at one instant. Validator, operator, and bootstrap sources
+    /// are exempt, so committee record traffic never waits on it.
+    put_record_budget: PutRecordBudget,
     /// Per-provider sliding windows bounding the inbound `AddProvider` write rate.
     ///
     /// `process_kad_add_provider` (consensus.rs) does a row read, BCS decode,
@@ -532,6 +596,7 @@ impl PeerManager {
             temporarily_banned,
             discovery_peers: Default::default(),
             put_record_windows: Default::default(),
+            put_record_budget: PutRecordBudget::new(Instant::now()),
             add_provider_windows: Default::default(),
             metrics,
         }
@@ -1744,7 +1809,7 @@ impl PeerManager {
     }
 
     /// Record an inbound kad `PutRecord` from `source` and classify it against the
-    /// per-source rate.
+    /// per-source rate and the budget that untrusted sources share.
     ///
     /// Counts one message per call in a [`PUT_RECORD_RATE_WINDOW`] tumbling window. A source
     /// past [`MAX_PUT_RECORDS_PER_WINDOW`] has its records shed before the expensive
@@ -1752,9 +1817,17 @@ impl PeerManager {
     /// [`PUT_RECORD_PENALTY_THRESHOLD`] is flagged for a penalty, once per window below
     /// [`PUT_RECORD_DISCONNECT_THRESHOLD`] and on every message above that ceiling.
     /// Untracked sources are shed without a penalty when [`MAX_RATE_WINDOWS`] is full.
+    /// A record under the per-source limit then takes one token from [`PutRecordBudget`];
+    /// when that budget is empty, the record is shed without a penalty. Validator, operator,
+    /// and bootstrap sources are exempt from that budget, but not from the per-source window.
     /// The local node's own id is never limited, and live budgets survive disconnects.
-    /// Shed and flood outcomes each bump the rate-limit metric.
+    /// Shed, flood, and budget outcomes each bump the rate-limit metric.
     pub(crate) fn put_record_rate_limited(&mut self, source: PeerId) -> PutRecordRate {
+        self.put_record_rate_limited_at(source, Instant::now())
+    }
+
+    /// [`Self::put_record_rate_limited`] at an explicit `now`.
+    fn put_record_rate_limited_at(&mut self, source: PeerId, now: Instant) -> PutRecordRate {
         if self.is_local_peer(&source) {
             PutRecordRate::Allowed
         } else if self.put_record_windows.len() >= MAX_RATE_WINDOWS
@@ -1763,7 +1836,6 @@ impl PeerManager {
             self.metrics.record_put_record_rate_limited(&PutRecordRate::Shed);
             PutRecordRate::Shed
         } else {
-            let now = Instant::now();
             let window = self.put_record_windows.entry(source).or_insert(PutRecordWindow {
                 count: 0,
                 started: now,
@@ -1786,8 +1858,28 @@ impl PeerManager {
                 }
                 () => PutRecordRate::Shed,
             };
-            self.metrics.record_put_record_rate_limited(&rate);
-            rate
+            match rate {
+                PutRecordRate::Allowed => self.put_record_budget_rate(&source, now),
+                PutRecordRate::Shed | PutRecordRate::Flooding => {
+                    self.metrics.record_put_record_rate_limited(&rate);
+                    rate
+                }
+            }
+        }
+    }
+
+    /// Take one token from the shared inbound `PutRecord` budget unless `source` is exempt.
+    ///
+    /// An exempt source never spends a token. An empty budget sheds the record without a
+    /// penalty and bumps the `budget` rate-limit metric.
+    fn put_record_budget_rate(&mut self, source: &PeerId, now: Instant) -> PutRecordRate {
+        if self.peer_policy(source).exempts_shared_record_budget()
+            || self.put_record_budget.try_take(now)
+        {
+            PutRecordRate::Allowed
+        } else {
+            self.metrics.record_put_record_budget_shed();
+            PutRecordRate::Shed
         }
     }
 
@@ -1878,6 +1970,12 @@ impl PeerManager {
     #[cfg(test)]
     pub(crate) fn peer_multiaddr_count(&self, peer_id: &PeerId) -> Option<usize> {
         self.peers.get_peer(peer_id).map(|peer| peer.multiaddr_count())
+    }
+
+    /// Refill the shared inbound `PutRecord` budget to its burst.
+    #[cfg(test)]
+    pub(crate) fn refill_put_record_budget(&mut self) {
+        self.put_record_budget = PutRecordBudget::new(Instant::now());
     }
 
     /// Check whether a kad-sourced record fails the shared local freshness policy.
@@ -2077,6 +2175,28 @@ impl PeerManager {
                 self.known_peers.get(bls).and_then(|info| info.rpc.clone()).map(|rpc| (*bls, rpc))
             })
             .collect()
+    }
+
+    /// Snapshot membership and learned advertisements without racing committee rotation.
+    pub(crate) fn committee_rpc_snapshot(&mut self) -> CommitteeRpcSnapshot {
+        let advertisements = self.current_committee_rpcs();
+        let rpcs =
+            advertisements.iter().filter(|(key, _)| !self.record_unlearned(key)).cloned().collect();
+        CommitteeRpcSnapshot::new(self.peers.current_committee().clone(), rpcs, advertisements)
+    }
+
+    /// Observe required remote identities in each slot using the resolution consumer's state.
+    /// Self is excluded from both counts because it never needs remote discovery.
+    pub(crate) fn observe_committee_resolution(&self, local_key: BlsPublicKey) {
+        ["previous", "current", "next"].into_iter().zip(self.peers.committee_slots()).for_each(
+            |(slot, members)| {
+                let required = members.iter().filter(|key| **key != local_key);
+                let expected = required.clone().count();
+                let unresolved = required.filter(|key| self.record_unlearned(key)).count();
+                self.metrics.set_committee_resolution(slot, expected, unresolved);
+            },
+        );
+        self.metrics.mark_committee_observed();
     }
 
     /// Find the peer id for an authority.

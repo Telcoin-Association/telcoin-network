@@ -548,7 +548,7 @@ impl InboundFailureOutcome {
 
 /// One pre-resolved metric handle per [`ServiceClass`].
 #[derive(Clone)]
-struct PerClass<T> {
+pub(crate) struct PerClass<T> {
     /// The handle for [`ServiceClass::Vote`].
     vote: T,
     /// The handle for [`ServiceClass::EpochRecord`].
@@ -565,7 +565,7 @@ struct PerClass<T> {
 
 impl<T> PerClass<T> {
     /// Resolve one handle per class with `resolve`.
-    fn new(resolve: impl Fn(ServiceClass) -> T) -> Self {
+    pub(crate) fn new(resolve: impl Fn(ServiceClass) -> T) -> Self {
         Self {
             vote: resolve(ServiceClass::Vote),
             epoch_record: resolve(ServiceClass::EpochRecord),
@@ -577,7 +577,7 @@ impl<T> PerClass<T> {
     }
 
     /// The handle for `class`.
-    fn get(&self, class: ServiceClass) -> &T {
+    pub(crate) fn get(&self, class: ServiceClass) -> &T {
         match class {
             ServiceClass::Vote => &self.vote,
             ServiceClass::EpochRecord => &self.epoch_record,
@@ -598,6 +598,8 @@ struct PerShedReason<T> {
     unsubscribed: T,
     /// The handle for [`ShedReason::Admission`].
     admission: T,
+    /// The handle for [`ShedReason::ServeBudget`].
+    serve_budget: T,
 }
 
 impl<T> PerShedReason<T> {
@@ -607,6 +609,7 @@ impl<T> PerShedReason<T> {
             queue_full: resolve(ShedReason::QueueFull),
             unsubscribed: resolve(ShedReason::Unsubscribed),
             admission: resolve(ShedReason::Admission),
+            serve_budget: resolve(ShedReason::ServeBudget),
         }
     }
 
@@ -616,6 +619,7 @@ impl<T> PerShedReason<T> {
             ShedReason::QueueFull => &self.queue_full,
             ShedReason::Unsubscribed => &self.unsubscribed,
             ShedReason::Admission => &self.admission,
+            ShedReason::ServeBudget => &self.serve_budget,
         }
     }
 }
@@ -914,7 +918,7 @@ impl LabeledHandles {
 }
 
 /// Resolve the `inbound_requests_shed_total` series for one network label, class and reason.
-fn shed_counter(network: &str, class: ServiceClass, reason: ShedReason) -> Counter {
+pub(crate) fn shed_counter(network: &str, class: ServiceClass, reason: ShedReason) -> Counter {
     metrics::counter!(
         "tn_network.inbound_requests_shed_total",
         "network" => network.to_owned(),
@@ -1308,6 +1312,29 @@ pub(crate) struct PeerManagerMetrics {
 }
 
 impl PeerManagerMetrics {
+    /// Timestamp the swarm's latest authoritative resolution observation.
+    pub(crate) fn mark_committee_observed(&self) {
+        let observed = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0.0, |time| time.as_secs_f64());
+        metrics::gauge!("tn_network.committee_observed_timestamp_seconds", "network" => self.network.clone())
+            .set(observed);
+    }
+
+    /// Publish one of the three fixed committee slots, scoped to this configured swarm.
+    pub(crate) fn set_committee_resolution(
+        &self,
+        slot: &'static str,
+        expected: usize,
+        unresolved: usize,
+    ) {
+        let count = |value| u32::try_from(value).map_or(f64::from(u32::MAX), f64::from);
+        metrics::gauge!("tn_network.committee_required_members", "network" => self.network.clone(), "slot" => slot)
+            .set(count(expected));
+        metrics::gauge!("tn_network.committee_unresolved_members", "network" => self.network.clone(), "slot" => slot)
+            .set(count(unresolved));
+    }
+
     /// Publish admission inputs independently of connections and node consensus readiness.
     pub(crate) fn set_admission(&self, status: &crate::AdmissionStatus) {
         let mode = match status.effective() {
@@ -1462,9 +1489,12 @@ impl PeerManagerMetrics {
     /// Record the outcome of the per-source inbound kad `PutRecord` rate limiter.
     ///
     /// `Allowed` records nothing. `Shed` and `Flooding` bump the counter with the outcome
-    /// labels {`shed`, `flood`}: `shed` counts records dropped without a penalty; `flood`
-    /// counts penalty escalations, including repeated penalties above the hard ceiling.
-    /// Operators watch `shed` to see honest shedding before it reaches the penalty threshold.
+    /// labels {`shed`, `flood`}, and [`Self::record_put_record_budget_shed`] adds `budget`:
+    /// `shed` counts records the per-source limiter drops without a penalty; `flood` counts
+    /// penalty escalations, including repeated penalties above the hard ceiling; `budget`
+    /// counts records the cross-source budget drops without a penalty. Operators watch `shed`
+    /// to see honest shedding before it reaches the penalty threshold, and `budget` to see
+    /// the shared budget bind during a restart or a flood from many sources.
     pub(crate) fn record_put_record_rate_limited(&self, rate: &PutRecordRate) {
         let outcome = match rate {
             PutRecordRate::Allowed => None,
@@ -1479,6 +1509,19 @@ impl PeerManagerMetrics {
             )
             .increment(1);
         });
+    }
+
+    /// Record an inbound kad `PutRecord` shed by the budget that untrusted sources share.
+    ///
+    /// Bumps the rate-limit counter with the outcome label `budget`. The source is not
+    /// penalized.
+    pub(crate) fn record_put_record_budget_shed(&self) {
+        metrics::counter!(
+            "tn_network.put_records_rate_limited_total",
+            "network" => self.network.clone(),
+            "outcome" => "budget",
+        )
+        .increment(1);
     }
 }
 

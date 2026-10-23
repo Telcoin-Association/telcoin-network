@@ -3665,11 +3665,14 @@ async fn test_kad_self_advertisement_confirms_when_store_is_full() -> eyre::Resu
 
     // Two valid records per relay stay below both the per-source message limit and the
     // tracked-source cap. Fill the real store through the inbound handler without confirming
-    // any of the non-committee identities advertised by these relays.
+    // any of the non-committee identities advertised by these relays. Refill the shared budget
+    // before each record: this test pins store saturation, and the shared budget has its own
+    // tests.
     std::iter::repeat_with(PeerId::random)
         .flat_map(|source| std::iter::repeat_n(source, 2))
         .take(max_records)
         .try_for_each(|source| -> eyre::Result<()> {
+            network.swarm.behaviour_mut().peer_manager.refill_put_record_budget();
             let bls = BlsKeypair::generate(&mut rng);
             let netkey = NetworkKeypair::generate_ed25519();
             let record = NodeRecord::build(
@@ -4582,6 +4585,53 @@ async fn test_add_provider_rate_limit_counts_drops_before_storage() {
                 .any(|label| label.key() == "network" && label.value() == "primary")
             && matches!(value, DebugValue::Counter(1))
     }));
+}
+
+/// A cached URL is insufficient: coverage needs a live, matching verified record.
+#[tokio::test]
+async fn committee_convergence_excludes_stale_records() -> eyre::Result<()> {
+    let TestTypes { peer1, peer2, .. } =
+        create_test_types::<TestWorkerRequest, TestWorkerResponse>();
+    let mut network = peer1.network;
+    let owner = peer2.config.key_config().primary_public_key();
+    let publisher = *peer2.network.swarm.local_peer_id();
+    let keys = peer2.config.key_config();
+    let rpc = RpcInfo { http: "https://validator.example.com:8545/".parse()?, ws: None };
+    let record = NodeRecord::build(
+        RecordDomain::new(
+            peer2.config.network_config().libp2p_config().chain_id,
+            NetworkType::Primary,
+        ),
+        keys.primary_network_public_key(),
+        peer2.config.primary_address(),
+        Some(rpc),
+        |data| keys.request_signature_direct(data),
+    );
+    network.process_command(NetworkCommand::UpdateCommittees {
+        previous: HashSet::new(),
+        current: HashSet::from([owner]),
+        next: HashSet::new(),
+    })?;
+    network.swarm.behaviour_mut().peer_manager.add_restored_peer(owner, record.info.clone());
+    assert_eq!(network.committee_rpc_snapshot().members(), &HashSet::from([owner]));
+    assert!(network.committee_rpc_snapshot().rpcs().is_empty());
+    let kad_record = kad::Record {
+        key: node_record_key(&owner),
+        value: encode(&record),
+        publisher: Some(publisher),
+        expires: None,
+    };
+    network.process_kad_put_request(publisher, kad_record.clone())?;
+    assert_eq!(network.committee_rpc_snapshot().rpcs().len(), 1);
+    network
+        .swarm
+        .behaviour_mut()
+        .kademlia
+        .store_mut()
+        .put(kad::Record { expires: Some(std::time::Instant::now()), ..kad_record })?;
+    assert!(network.swarm.behaviour().peer_manager.get_rpc(&owner).is_some());
+    assert!(network.committee_rpc_snapshot().rpcs().is_empty());
+    Ok(())
 }
 
 /// A signed record advertising an RPC endpoint with a well-formed URL but the
