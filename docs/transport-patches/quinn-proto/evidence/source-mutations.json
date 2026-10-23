@@ -1,0 +1,10 @@
+[
+  {
+    "mutation": "version-guard",
+    "assertion_failed": true
+  },
+  {
+    "mutation": "normalization-version",
+    "assertion_failed": true
+  }
+]
