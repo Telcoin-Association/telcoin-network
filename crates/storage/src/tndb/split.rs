@@ -14,6 +14,7 @@
 
 use std::path::Path;
 
+use eyre::{bail, WrapErr as _};
 use tn_types::{DBIter, Database, DbTx, DbTxMut, Table, TableHint};
 
 use super::database::{CompactionConfig, TnDatabase, TnDbOptions, TnDbTxMut};
@@ -52,6 +53,34 @@ const EPOCH: usize = 0;
 const KAD: usize = 1;
 const CACHE: usize = 2;
 
+/// Refuse a `SplitDatabase` at `root` that lost an environment's directory. [`MDBX_MIGRATED`] is
+/// written only after the first open has created all three (`open_db` opens them before
+/// `migrate_from_mdbx` runs), so with it present a missing environment was deleted or not
+/// restored, and opening it would start that environment empty: for `epoch`, with no record of
+/// this node's votes and proposals. Before the marker exists (a first start), the environments
+/// are created as usual. A stat error is an error, never read as absent.
+fn check_environments(root: &Path) -> eyre::Result<()> {
+    let marker = root.join(MDBX_MIGRATED);
+    let stat = |path: &Path| {
+        path.try_exists().wrap_err_with(|| format!("tndb: check for {}", path.display()))
+    };
+    if !stat(&marker)? {
+        return Ok(());
+    }
+    for env in ENVIRONMENTS {
+        let dir = root.join(env);
+        if !stat(&dir)? {
+            bail!(
+                "tndb: environment {} is missing beside {} (its log is lost); refusing to open \
+                 it empty",
+                dir.display(),
+                marker.display()
+            );
+        }
+    }
+    Ok(())
+}
+
 /// The options for environment `env`: `options`, with the cache's automatic threshold raised to
 /// at least [`CACHE_AUTO_MIN_BYTES`] and the epoch's to at least [`EPOCH_AUTO_MIN_BYTES`]
 /// (automatic compaction left off if it is off).
@@ -82,9 +111,11 @@ pub struct SplitDatabase {
 impl SplitDatabase {
     /// Open (creating if absent) the three databases under `root` (`epoch/`, `kad/`, `cache/`),
     /// committing and compacting as `options` say (the cache compacting automatically at no less
-    /// than [`CACHE_AUTO_MIN_BYTES`]).
+    /// than [`CACHE_AUTO_MIN_BYTES`]). Once [`MDBX_MIGRATED`] is in `root`, every environment
+    /// has been created, so a missing one is refused (see `check_environments`).
     pub fn open_with<P: AsRef<Path>>(root: P, options: TnDbOptions) -> eyre::Result<Self> {
         let root = root.as_ref();
+        check_environments(root)?;
         Ok(Self {
             dbs: [
                 TnDatabase::open_named(
@@ -415,12 +446,17 @@ mod test {
         assert!(names("epoch").contains("EpochTable") && !names("epoch").contains("TestTable"));
     }
 
-    /// A crash and reopen of all three environments keeps every persisted row (a persist covers
-    /// its table's environment).
+    /// A power loss (the disk model keeps only what was flushed) and reopen of all three
+    /// environments keeps every persisted row (a persist covers its table's environment).
     #[test]
-    fn test_tndb_split_crash_reopens_every_environment() {
+    fn test_tndb_split_power_loss_reopens_every_environment() {
+        use crate::archive::data_file::disk_model;
         let tmp = TempDir::with_prefix("tndb_split_crash").expect("temp dir");
         let db = open(tmp.path());
+        let logs = ENVIRONMENTS.map(|env| tmp.path().join(env).join("gen-0").join("log"));
+        for log in &logs {
+            disk_model::track(log);
+        }
         for i in 0..50_u64 {
             db.insert::<EpochTable>(&i, &format!("e{i}")).expect("insert");
             db.insert::<KadTable>(&i, &format!("k{i}")).expect("insert");
@@ -430,11 +466,53 @@ mod test {
         block_on(db.persist::<KadTable>()).expect("persist kad");
         block_on(db.persist::<TestTable>()).expect("persist cache");
         crash(db);
+        for log in &logs {
+            disk_model::power_loss(log);
+        }
         let db = open(tmp.path());
         assert_eq!(db.iter::<EpochTable>().count(), 50);
         assert_eq!(db.iter::<KadTable>().count(), 50);
         assert_eq!(db.iter::<TestTable>().count(), 50);
         assert_eq!(db.get::<KadTable>(&7).expect("get"), Some("k7".to_string()));
+        drop(db);
+        for log in &logs {
+            disk_model::untrack(log);
+        }
+    }
+
+    /// Once the MDBX migration's marker is written, every environment exists: a missing one (an
+    /// operator's deletion, a partial restore) is refused by name rather than recreated empty, and
+    /// the refused open creates nothing. Before the marker (a first start), a missing
+    /// environment is created as usual.
+    #[test]
+    fn test_tndb_split_refuses_a_missing_environment_after_the_migration() {
+        for lost in ENVIRONMENTS {
+            let tmp = TempDir::with_prefix("tndb_split_lost_env").expect("temp dir");
+            {
+                let db = open(tmp.path());
+                db.insert::<EpochTable>(&1, &"epoch".to_string()).expect("insert");
+                db.insert::<KadTable>(&1, &"kad".to_string()).expect("insert");
+                db.insert::<TestTable>(&1, &"cache".to_string()).expect("insert");
+            }
+            // No marker yet: a first start (or one before the migration finished) creates it.
+            std::fs::remove_dir_all(tmp.path().join(lost)).expect("lose an environment");
+            drop(open(tmp.path()));
+            assert!(tmp.path().join(lost).is_dir(), "{lost}: created before the marker");
+
+            std::fs::write(tmp.path().join(MDBX_MIGRATED), b"").expect("marker");
+            drop(open(tmp.path()));
+            std::fs::remove_dir_all(tmp.path().join(lost)).expect("lose an environment");
+            let err = SplitDatabase::open_with(tmp.path(), TnDbOptions::default())
+                .err()
+                .unwrap_or_else(|| panic!("{lost}: a missing environment must not open empty"));
+            let err = format!("{err:#}");
+            assert!(
+                err.contains(&format!("environment {}", tmp.path().join(lost).display()))
+                    && err.contains("missing beside"),
+                "{lost}: the refusal names it: {err}"
+            );
+            assert!(!tmp.path().join(lost).exists(), "{lost}: the refused open created nothing");
+        }
     }
 
     /// A transaction over two environments commits each part in its own log: when one part

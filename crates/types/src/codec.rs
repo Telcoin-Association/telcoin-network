@@ -34,6 +34,11 @@ use serde::{Deserialize, Serialize};
 /// (`ULEB128(len)` then the raw bytes, with the same length limit on decode), so switching a field
 /// to this leaves its encoding, and any digest over it, unchanged. Not for fixed `[u8; N]` arrays,
 /// which `bcs` writes without a length prefix.
+///
+/// Decode only from a slice ([`decode`](crate::decode)/[`try_decode`](crate::try_decode),
+/// `bcs::from_bytes`), which bounds the length prefix by the input. Under bcs's reader
+/// deserializer (`bcs::from_reader*`) the prefix is untrusted and `bcs` allocates that many bytes
+/// (up to 2^31 - 1) before reading, so a caller reading from a stream must bound its input first.
 pub mod byte_vec {
     use serde::{de, Deserializer, Serializer};
     use std::fmt;

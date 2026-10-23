@@ -41,7 +41,8 @@ pub struct EnvReport {
     pub file_bytes: u64,
     /// Where the log's last whole batch ends.
     pub data_end: u64,
-    /// The log's length right after the compaction that made this generation (0 if none did).
+    /// The compaction trigger's base: the log's length when the compaction that made this
+    /// generation wrote it, just before its switch's final tail (0 if no compaction did).
     pub base: u64,
     /// The bytes of the live rows' records.
     pub live_bytes: u64,
@@ -72,9 +73,8 @@ pub struct TableReport {
 /// A table index's state, as the next open would find it from the index's header and root.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum IndexState {
-    /// Closed cleanly, covering the whole log, with a sound root: the next open uses it, unless
-    /// its open-time walk of the internal pages (which a writable open runs, and an inspection
-    /// cannot) finds damage below the root, which rebuilds it.
+    /// Closed cleanly, covering the whole log, and every page of its tree sound (each internal
+    /// page's and leaf's CRC, as the writable open's walk checks them): the next open uses it.
     Current,
     /// Closed cleanly but covering a different length of the log: rebuilt at the next open.
     Stale,
@@ -82,7 +82,7 @@ pub enum IndexState {
     Unclean,
     /// Its directory is missing: rebuilt at the next open.
     Missing,
-    /// It could not be read (damage): rebuilt at the next open.
+    /// It could not be read, or a page of its tree is damaged: rebuilt at the next open.
     Unreadable,
     /// The table has no rows yet, so no key size and no index.
     NoKeySize,
@@ -102,8 +102,8 @@ impl IndexState {
     }
 }
 
-/// What a [`super::SplitDatabase`] holds: each environment present, in `epoch`, `kad`, `cache`
-/// order, with its report or why it could not be read.
+/// What a [`super::SplitDatabase`] holds: each environment, in `epoch`, `kad`, `cache` order,
+/// with its report or why it could not be read (a missing one included).
 #[derive(Debug)]
 pub struct SplitReport {
     /// Each environment's name and report.
@@ -178,18 +178,34 @@ pub fn inspect(root: &Path) -> eyre::Result<EnvReport> {
     })
 }
 
-/// Inspect the [`super::SplitDatabase`] at `root`: each environment present (see [`inspect`]).
+/// Inspect the [`super::SplitDatabase`] at `root`: each environment (see [`inspect`]). The
+/// node creates all three at its first open, so a missing one is reported as an error, not
+/// skipped (with the migration marker present, the node refuses to open it).
 pub fn inspect_split(root: &Path) -> SplitReport {
+    let migrated = root.join(MDBX_MIGRATED).exists();
     let envs = ENVIRONMENTS
         .into_iter()
-        .filter(|env| root.join(env).is_dir())
-        .map(|env| (env, inspect(&root.join(env))))
+        .map(|env| {
+            let dir = root.join(env);
+            let report = match dir.try_exists() {
+                Ok(true) => inspect(&dir),
+                Ok(false) if migrated => Err(eyre::eyre!(
+                    "tndb: environment {} is missing beside {MDBX_MIGRATED} (its log is lost); \
+                     the node refuses to open it",
+                    dir.display()
+                )),
+                Ok(false) => Err(eyre::eyre!("tndb: environment {} is missing", dir.display())),
+                Err(e) => Err(eyre::eyre!("tndb: check for {}: {e}", dir.display())),
+            };
+            (env, report)
+        })
         .collect();
-    SplitReport { envs, migrated: root.join(MDBX_MIGRATED).exists() }
+    SplitReport { envs, migrated }
 }
 
 /// The state of `entry`'s index in the generation at `gen_path`, whose log is `log_len` long,
-/// opened read-only (so without the writable open's walk: see [`IndexState::Current`]).
+/// opened read-only. A clean, current index has its tree checked as the writable open checks it
+/// ([`BtreeIndex::verify_tree`]), so damage the next open would rebuild reads as unreadable.
 fn index_state(gen_path: &Path, entry: &Entry, header: &DataHeader, log_len: u64) -> IndexState {
     if entry.ksize == 0 {
         return IndexState::NoKeySize;
@@ -201,6 +217,7 @@ fn index_state(gen_path: &Path, entry: &Entry, header: &DataHeader, log_len: u64
     match BtreeIndex::open_btx_file(&dir, header, entry.ksize, true) {
         Ok(idx) if idx.opened_unclean() => IndexState::Unclean,
         Ok(idx) if idx.data_file_length() != log_len => IndexState::Stale,
+        Ok(idx) if idx.verify_tree().is_err() => IndexState::Unreadable,
         Ok(_) => IndexState::Current,
         Err(_) => IndexState::Unreadable,
     }

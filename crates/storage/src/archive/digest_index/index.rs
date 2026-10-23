@@ -360,12 +360,15 @@ impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndex<KSIZE, S> {
         }
 
         // The digest index does point lookups over fixed-offset hash buckets — random
-        // access with no benefit from readahead — so hint `MADV_RANDOM`. It is derived from the
-        // data log (rebuilt after any unclean open), so its size waits for the seal.
+        // access with no benefit from readahead — so hint `MADV_RANDOM`. Not `derived`, though it
+        // is rebuilt from the data log: the epoch records' and certificate pack's recoveries read
+        // an unsealed hdx's `data_file_length` before any rebuild, as evidence to refuse a cut,
+        // and an hdx shorter than its header (a growth whose size never reached the disk) fails
+        // to open and so attests nothing. The first barrier after a growth fsyncs its size.
         let opts = MmapFileOptions {
             write_mode: WriteMode::Random,
             access: MmapAccess::Random,
-            derived: true,
+            derived: false,
             ..Default::default()
         };
         let mut hdx_file = MmapDataFile::open_with(dir.join("index.hdx"), read_only, opts)?;

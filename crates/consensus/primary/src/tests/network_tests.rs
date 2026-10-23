@@ -3866,8 +3866,6 @@ fn test_import_fault_is_peer_caused_whitelist() {
     assert!(peer_caused(cc(PackError::OutputTooLarge { size: 2, max: 1 })));
     assert!(peer_caused(cc(PackError::TooManyBatches(9))));
     assert!(peer_caused(cc(PackError::MissingBatch)));
-    assert!(peer_caused(ConsensusChainError::EmptyImport));
-    assert!(peer_caused(ConsensusChainError::InvalidImport));
     // A record out of place / not what the header declares, or one that fails its CRC/decode, is
     // the sender's bytes: charged at Medium (an honest peer's at-rest pack damage looks the
     // same).

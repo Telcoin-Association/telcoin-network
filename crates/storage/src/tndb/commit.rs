@@ -63,7 +63,8 @@ pub(super) struct Durability {
     durable_changed: Condvar,
     /// The first failure, if any (never cleared).
     failed: Mutex<Option<String>>,
-    /// Set by every failure but damage a read found ([`Self::fail_damaged`]): a failed sync, a
+    /// Set by every failure but those [`Self::fail_damaged`] latches (damage a read found, a
+    /// failure before anything was appended): a failed sync, a
     /// writer that stopped part way or a panic leaves the log's state on disk unknown, so it must
     /// never be sealed as clean. Kept apart from `failed`, which holds only the first cause, so a
     /// sync failing after a read's damage still blocks the seal.
@@ -196,8 +197,9 @@ impl Durability {
     }
 
     /// Latch damage a read found (see `Core::read_damaged`; a removal's lookup too, see
-    /// `Writer::latch_if_poisoned`): every later write and persist fails, as after any failure,
-    /// but the log itself is as it was, so the close still seals it.
+    /// `Writer::latch_if_poisoned`), or an I/O failure before anything was appended (a table's
+    /// registration or first-row setup, see `Core::fail_setup`): every later write and persist
+    /// fails, as after any failure, but the log itself is as it was, so the close still seals it.
     pub(super) fn fail_damaged(&self, cause: String) {
         self.latch(cause);
     }

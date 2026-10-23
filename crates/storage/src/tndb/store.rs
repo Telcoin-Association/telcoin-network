@@ -201,8 +201,9 @@ impl TableShared {
             .inspect_err(|e| core.read_damaged(&self.name, e))
     }
 
-    /// True if the published state holds `key` (a damaged index is an error, not "absent", and
-    /// latched in `core`).
+    /// True if the published index holds `key`. Damage the index's checks see is an error, not
+    /// "absent", latched in `core`; no log record is read, so an entry whose position was damaged
+    /// still answers true (a get of that key is `CorruptIndex`).
     pub(super) fn contains(&self, core: &Core, key: &[u8]) -> eyre::Result<bool> {
         Ok(self.published.load().contains(key).inspect_err(|e| core.read_damaged(&self.name, e))?)
     }
@@ -375,16 +376,22 @@ pub(super) struct Writer {
     tables: BTreeMap<TableId, TableWriter>,
     /// The last batch's number.
     seq: u64,
-    /// How far the log's commit marker has been stamped.
+    /// How far the log's commit marker has been stamped (by a stamp that landed). 0 at open and
+    /// after a switch, so the first stamp covers everything already in the log.
     stamped: u64,
     /// Set when the writer can no longer write (a batch it could not take back): every later
     /// write fails until a restart.
     failed: Option<String>,
+    /// A compaction found damage (`Core::compaction_damaged`): the close marks every index stale,
+    /// so the next open replays the log whole, rebuilding a damaged index and refusing a damaged
+    /// sealed log. Never cleared.
+    damage_seen: bool,
     durability: Arc<Durability>,
     /// When the log compacts automatically.
     config: CompactionConfig,
-    /// The log's length right after the compaction that made this generation (0 if none did):
-    /// the log compacts once it has doubled since.
+    /// The trigger's base: the log's length before the final tail of the switch that made this
+    /// generation (0 if no compaction did; see `compact::COMPACTED`): the log compacts once it
+    /// has doubled since.
     base: u64,
     /// A row may have been made dead (overwritten, removed or cleared) since the last compaction
     /// (assumed at open, unless the log is empty): a log that only grows does not compact.
@@ -456,13 +463,16 @@ impl Writer {
     }
 
     /// Stamp the log's commit marker up to what the commit thread has synced (best-effort and
-    /// unsynced, as a commit marker always is), lazily, under the write lock.
+    /// unsynced, as a commit marker always is), lazily, under the write lock. A stamp the log
+    /// skipped (no room past its end: a reopened log until it grows; a sealed one whose sentinel
+    /// is still pending) is tried again by the next call.
     fn stamp_synced(&mut self) {
         let synced = self.sync.synced.load(Ordering::Acquire);
         if synced > self.stamped {
             self.log.note_synced(synced);
-            self.log.stamp_commit_marker_at(synced);
-            self.stamped = synced;
+            if self.log.stamp_commit_marker_at(synced) {
+                self.stamped = synced;
+            }
         }
     }
 
@@ -752,7 +762,9 @@ impl Writer {
         self.view = view;
         self.sync = sync;
         self.gen = gen;
-        self.stamped = self.log.file_len();
+        // The compaction stamped the new log's marker, if it had room: the next write stamps it
+        // again either way.
+        self.stamped = 0;
         self.base = base;
         self.has_dead = has_dead;
         // An emptying after the snapshot was copied with the rows it cleared (live when copied,
@@ -777,11 +789,12 @@ impl Drop for Writer {
     /// commit (or follows a failed sync, or a stopped writer) leaves the log unsealed and every
     /// index marked stale instead.
     ///
-    /// After damage a read found (see [`Core::read_damaged`] and [`Self::latch_if_poisoned`]), and
-    /// nothing else, the log is still committed and sealed, but every index is marked stale: the
-    /// next open replays the sealed log, which must read whole. Damage to an index is then rebuilt;
-    /// damage to the log fails the open on every retry, where an unsealed log's replay would take
-    /// the damaged record for a crash's torn tail and cut every acknowledged batch after it.
+    /// After damage a read found (see [`Core::read_damaged`] and [`Self::latch_if_poisoned`]) or a
+    /// compaction found (see [`Core::compaction_damaged`]), and nothing else, the log is still
+    /// committed and sealed, but every index is marked stale: the next open replays the sealed
+    /// log, which must read whole. Damage to an index is then rebuilt; damage to the log fails the
+    /// open on every retry, where an unsealed log's replay would take the damaged record for a
+    /// crash's torn tail and cut every acknowledged batch after it.
     fn drop(&mut self) {
         let committed =
             self.failed.is_none() && !self.durability.log_unknown() && self.log.commit().is_ok();
@@ -790,7 +803,7 @@ impl Drop for Writer {
         } else {
             self.log.poison();
         }
-        let current = committed && !self.durability.is_failed();
+        let current = committed && !self.durability.is_failed() && !self.damage_seen;
         let len = if current { self.log.file_len() } else { u64::MAX };
         for table in self.tables.values_mut() {
             if let Some(idx) = table.idx.as_mut() {
@@ -872,7 +885,7 @@ impl Core {
         // the manifest no longer names) fails the open. A fresh database replays nothing.
         let manifest_lost = manifest.is_none();
         let manifest = manifest.unwrap_or_default();
-        let (gen, mut log, older) = open_current_gen(root)?;
+        let (gen, mut log, older) = open_current_gen(root, !manifest_lost)?;
         let gen_path = gen_dir(root, gen);
         // A table's index is created only after the manifest names the table, so an index the
         // manifest does not name means it was rolled back (an older copy restored): replay the
@@ -935,7 +948,7 @@ impl Core {
         let alive = Arc::new(GenAlive::default());
         let sync = Arc::new(GenSync::new(&log, &view, &alive)?);
         let frontier = Frontier { sync: Arc::clone(&sync), end: log.file_len(), seq: 0 };
-        let stamped = log.file_len();
+        let log_len = log.file_len();
         let base = read_base(&gen_path);
         let mut writer = Writer {
             gen,
@@ -946,13 +959,17 @@ impl Core {
             sync,
             tables: BTreeMap::new(),
             seq: 0,
-            stamped,
+            // Nothing stamped yet: the log as it opened (durable: sealed after a sync, or synced
+            // by an unclean open) gets its first marker from the first write, the one that grows
+            // the log past its end (see `Core::write`).
+            stamped: 0,
             failed: None,
+            damage_seen: false,
             durability: Arc::clone(&durability),
             config,
             base,
             // Unknown for a log with records; a new one holds nothing dead.
-            has_dead: stamped > DATA_HEADER_BYTES as u64,
+            has_dead: log_len > DATA_HEADER_BYTES as u64,
             emptied: false,
             emptied_at: 0,
             snapshot_end: 0,
@@ -1016,6 +1033,15 @@ impl Core {
     /// damaged index, and refuses a damaged log record rather than cut the log there.
     pub(super) fn read_damaged(&self, table: &str, e: &dyn std::fmt::Display) {
         self.durability.fail_damaged(format!("tndb: a read of table {table} found damage: {e}"));
+    }
+
+    /// Note damage a compaction found (an index entry or a log record that does not check out):
+    /// the close marks every index stale, so the next open replays the log whole (see
+    /// `Writer::drop`). Unlike damage a read found ([`Self::read_damaged`]), nothing is latched:
+    /// no caller acted on the compaction's reads, and the rows it read are read again (and latch
+    /// if damaged) by the node's own scans and gets; the database keeps writing until then.
+    pub(super) fn compaction_damaged(&self) {
+        self.writer.lock().damage_seen = true;
     }
 
     /// Bytes of the log not yet synced.
@@ -1094,7 +1120,9 @@ impl Core {
         }
         let mut updated = manifest.clone();
         let id = updated.add(name)?;
-        updated.write(&self.root)?;
+        // A latched database writes nothing more, a table's registration included.
+        self.durability.check()?;
+        self.write_manifest(&updated)?;
         *manifest = updated;
         let shared = {
             let mut writer = self.writer.lock();
@@ -1118,6 +1146,21 @@ impl Core {
         Ok(shared)
     }
 
+    /// Rewrite the manifest as `updated` (a table's registration or first row, under the registry
+    /// lock). A failure latches (see [`Self::fail_setup`]).
+    fn write_manifest(&self, updated: &Manifest) -> eyre::Result<()> {
+        updated.write(&self.root).inspect_err(|e| self.fail_setup("rewrite the manifest", e))
+    }
+
+    /// Latch an I/O failure of a table's registration or first-row setup (the manifest rewrite,
+    /// the index's creation), as any write failure of the node's own storage latches: the write
+    /// that needed it fails, and so does every later write and persist, so the node stops. Nothing
+    /// was appended, so the log's state is known and it is not poisoned: the close still seals
+    /// it, with every index marked stale, as after damage a read found.
+    fn fail_setup(&self, what: &str, e: &eyre::Report) {
+        self.durability.fail_damaged(format!("tndb: {what}: {e:#}"));
+    }
+
     /// Fix `table`'s key size at `ksize` if its first row is being written, or check `ksize`
     /// against it: the manifest records it and the table's index is created (and published, so a
     /// batch can be reverted to it), before the write lock is taken.
@@ -1136,16 +1179,19 @@ impl Core {
         if fixed != 0 {
             return check_ksize(table, fixed, ksize);
         }
+        // A latched database writes nothing more, a table's first-row setup included.
+        self.durability.check()?;
         let mut updated = manifest.clone();
         updated.set_ksize(table.id, ksize16);
-        updated.write(&self.root)?;
+        self.write_manifest(&updated)?;
         *manifest = updated;
         let (dir, header) = {
             let writer = self.writer.lock();
             (idx_dir(&writer.gen_dir, table.id), *writer.log.header())
         };
         let _ = fs::remove_dir_all(&dir);
-        let mut idx = BtreeIndex::open_btx_file(&dir, &header, ksize16, false)?;
+        let mut idx = create_index(&dir, &header, ksize16)
+            .inspect_err(|e| self.fail_setup(&format!("create table {}'s index", table.name), e))?;
         idx.publish();
         let mut writer = self.writer.lock();
         let entry = writer.tables.get_mut(&table.id).expect("a registered table");
@@ -1204,6 +1250,10 @@ impl Core {
         }
         // A panic from here leaves the batch appended but not (wholly) published: latched.
         let latch = UnwindLatch(&self.durability, "a batch's publish panicked");
+        // The append has grown a reopened log past its end, so the stamp the call before it could
+        // not place lands now: from the first batch's acknowledgement (its sync round fsyncs the
+        // growth, and with it the marker's page) a marker covers the log as it opened.
+        writer.stamp_synced();
         // Numbered before it is published: a reader that sees it and then writes takes a later
         // number, so a persist covering the reader's write covers this one.
         writer.seq += 1;
@@ -1377,7 +1427,18 @@ fn log_options() -> MmapFileOptions {
     let reserve = LOG_RESERVE.with(std::cell::Cell::get).unwrap_or(LOG_MAP_RESERVE);
     #[cfg(not(test))]
     let reserve = LOG_MAP_RESERVE;
-    MmapFileOptions { reserve, max_record_size: Some(MAX_RECORD), ..Default::default() }
+    // `defer_seal_retire`: a sealed log stays sealed through the replay at open, and until the
+    // first write, so a failed (or killed) open never leaves a damaged log to be cut as a torn
+    // tail. `drop_cache_on_unclean_open`: an unclean log's replay reads what the disk holds, so it
+    // stops at pages a failed writeback never wrote (a page cache that still holds them would
+    // let new acknowledged batches follow a hole a power loss reveals).
+    MmapFileOptions {
+        reserve,
+        max_record_size: Some(MAX_RECORD),
+        defer_seal_retire: true,
+        drop_cache_on_unclean_open: true,
+        ..Default::default()
+    }
 }
 
 /// Open (creating if absent) a generation's log.
@@ -1394,6 +1455,30 @@ pub(super) fn open_log_read_only(dir: &Path) -> eyre::Result<Log> {
 
 #[cfg(test)]
 thread_local! {
+    /// Test-only: this thread's next index creation for a table's first row fails, as a full disk
+    /// or an I/O error would (see `create_index`).
+    pub(super) static FAIL_NEXT_INDEX_CREATE: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+/// Create a table's index at `dir`, for its first row (see `Core::ensure_ksize`).
+fn create_index(dir: &Path, header: &DataHeader, ksize: u16) -> eyre::Result<BtreeIndex> {
+    #[cfg(test)]
+    if FAIL_NEXT_INDEX_CREATE.with(|fail| fail.replace(false)) {
+        bail!("an index creation failure injected by a test");
+    }
+    Ok(BtreeIndex::open_btx_file(dir, header, ksize, false)?)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only: this thread's next replay panics before it reads a record (an open that dies
+    /// part way through its replay).
+    pub(super) static PANIC_IN_REPLAY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+thread_local! {
     /// Test-only: this thread's next creation of a database fails once its first generation's
     /// directory exists, before its log does (as a crash there would leave it).
     pub(super) static FAIL_GEN0_BUILD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
@@ -1401,10 +1486,19 @@ thread_local! {
 
 /// The current generation of the database at `root`, opened: the newest one (an error if it does
 /// not open), and the older ones, for the caller to delete once the newest has replayed (until
-/// then, the only other copy); a new database gets generation 0, created durably.
-fn open_current_gen(root: &Path) -> eyre::Result<(u64, Log, Vec<u64>)> {
+/// then, the only other copy); a new database gets generation 0, created durably. `has_manifest`:
+/// the database has a table manifest, which is written only after generation 0 exists, so with
+/// it and no generation the log was lost, and the open is refused rather than started empty.
+fn open_current_gen(root: &Path, has_manifest: bool) -> eyre::Result<(u64, Log, Vec<u64>)> {
     let gens = list_gens(root)?;
     let Some(&current) = gens.last() else {
+        if has_manifest {
+            bail!(
+                "tndb: {} has a table manifest but no generation (its log is lost); refusing to \
+                 open it empty",
+                root.display()
+            );
+        }
         // Built aside and renamed into place, so a failure (or a crash) part way leaves no
         // log-less generation 0, which every later open would refuse; a leftover build is
         // deleted by the next open (`remove_unfinished`).
@@ -1582,6 +1676,10 @@ pub(super) fn replay(
     manifest: &Manifest,
     sink: &mut impl ReplaySink,
 ) -> eyre::Result<Replayed> {
+    #[cfg(test)]
+    if PANIC_IN_REPLAY.with(|panic| panic.replace(false)) {
+        panic!("injected panic in a replay");
+    }
     let ksizes: BTreeMap<TableId, u16> = manifest.tables.iter().map(|t| (t.id, t.ksize)).collect();
     let mut pending: Vec<(TableId, Pending)> = Vec::new();
     let mut in_batch = false;

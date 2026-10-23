@@ -331,9 +331,10 @@ where
     }
 
     /// Stamp the tail commit marker at `committed`, an end a sync made outside this pack covered
-    /// (see [`Self::note_synced`] and [`MmapDataFile::stamp_commit_marker_at`]).
-    pub(crate) fn stamp_commit_marker_at(&mut self, committed: u64) {
-        self.inner.data_file.stamp_commit_marker_at(committed);
+    /// (see [`Self::note_synced`] and [`MmapDataFile::stamp_commit_marker_at`]). Returns whether
+    /// the marker was stamped.
+    pub(crate) fn stamp_commit_marker_at(&mut self, committed: u64) -> bool {
+        self.inner.data_file.stamp_commit_marker_at(committed)
     }
 
     /// Stamp the tail commit marker (`committed_end == file_len()`) — a best-effort, no-extra-sync
@@ -1824,21 +1825,27 @@ mod tests {
         .expect("an uncompressed pack reads what it wrote");
     }
 
-    /// A compressed record whose decoded bytes declare a length far past what is there is a decode
-    /// error, not a panic or an abort.
+    /// A record whose decoded bytes declare a length far past what is there is a decode error, not
+    /// a panic or an abort: on a compressed pack, where the value is decoded from the decompressed
+    /// slice, and on an uncompressed one. The record beside it, the same bytes with an honest
+    /// length, decodes, so the failure is the lying length's.
     #[test]
     fn zstd_read_of_a_lying_length_prefix_fails_cleanly() {
-        let tmp_path = TempDir::with_prefix("test_pack_zstd_lying_len").expect("temp dir");
-        let path = tmp_path.path().join("pack");
-        let mut db: Pack<Vec<u8>> =
-            Pack::open(&path, 0, false, PackCompression::ZStd, 0).expect("open pack");
-        // ULEB128 for 2^31 - 2 (bcs's longest sequence), then three bytes.
-        let lying = [0xfe_u8, 0xff, 0xff, 0xff, 0x07, 1, 2, 3];
-        let compressed = zstd::bulk::compress(&lying, 3).expect("compress");
-        let pos = db.append_raw(&compressed).expect("append");
-        db.commit().expect("commit");
-        let err = db.fetch(pos).expect_err("a length past the bytes");
-        assert!(matches!(err, FetchError::DeserializeValue(_)), "got {err:?}");
+        for compression in [PackCompression::ZStd, PackCompression::None] {
+            let tmp_path = TempDir::with_prefix("test_pack_zstd_lying_len").expect("temp dir");
+            let path = tmp_path.path().join("pack");
+            let mut db: Pack<Vec<u8>> =
+                Pack::open(&path, 0, false, compression, 0).expect("open pack");
+            // `append_raw` stores the encoded value as the pack stores any value (compressed once
+            // on a compressed pack). ULEB128 for 3, then three bytes.
+            let honest = db.append_raw(&[3, 1, 2, 3]).expect("append");
+            // ULEB128 for 2^31 - 2 (bcs's longest sequence), then the same three bytes.
+            let lying = db.append_raw(&[0xfe, 0xff, 0xff, 0xff, 0x07, 1, 2, 3]).expect("append");
+            db.commit().expect("commit");
+            assert_eq!(db.fetch(honest).expect("an honest length decodes"), vec![1, 2, 3]);
+            let err = db.fetch(lying).expect_err("a length past the bytes");
+            assert!(matches!(err, FetchError::DeserializeValue(_)), "{compression:?}: got {err:?}");
+        }
     }
 
     fn archive_pack_(compression: PackCompression) {

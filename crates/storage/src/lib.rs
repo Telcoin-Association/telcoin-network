@@ -229,7 +229,11 @@ fn open_mdbx_env(store_path: &std::path::Path, env: MdbxEnv) -> eyre::Result<Mdb
 /// the time of the switch; then a marker file in `tndb_root` records that the migration is done.
 /// Until then every open runs it again: an environment still present is copied again (MDBX is not
 /// written meanwhile, so that only rewrites the same rows) and deleted, and one already deleted was
-/// copied before it. A downgrade to the MDBX build after the switch starts with empty epoch tables.
+/// copied before it. A file whose presence cannot be checked (a stat error other than not-found)
+/// fails the open rather than counting as absent. The switch is one-way: a downgrade to an MDBX
+/// build after it is not supported, because that build would start with empty epoch tables (no
+/// record of this node's votes and proposals) and could sign conflicting messages. Problems after
+/// the switch are fixed forward.
 #[cfg(feature = "reth-libmdbx")]
 pub(crate) fn migrate_from_mdbx(
     store_path: &std::path::Path,
@@ -239,24 +243,34 @@ pub(crate) fn migrate_from_mdbx(
     use eyre::WrapErr as _;
     use std::io::Write as _;
 
+    // Presence is decided by `try_exists`: any error other than not-found (EACCES on a directory,
+    // an unmounted volume behind a symlink) fails the open. `exists` would read it as "absent", and
+    // the marker written below would then make the loss of the epoch tables permanent.
+    let exists = |path: &std::path::Path| {
+        path.try_exists().wrap_err_with(|| format!("Cannot check {}", path.display()))
+    };
     let marker = tndb_root.join(tndb::MDBX_MIGRATED);
-    if marker.exists() {
+    if exists(&marker)? {
         // Done before. An MDBX environment here now was made by an older binary run since (a
-        // downgrade): it is never read, so what that binary recorded (its votes, its last
-        // proposal) is not in tndb. Say so; it is the operator's to resolve.
+        // downgrade, which is not supported: that binary started with empty epoch tables). It is
+        // never read, so what that binary recorded (its votes, its last proposal) is not in tndb.
+        // Say so; it is the operator's to resolve.
         for env in ["epoch", "kad", "cache"] {
             let data = store_path.join(env).join("mdbx.dat");
-            if data.exists() {
+            if exists(&data)? {
                 tracing::error!(target: "tn::storage", "{} was written after this node moved to tndb (by an older binary?) and is not read; anything it holds is not in the consensus DB", data.display());
             }
         }
         return Ok(0);
     }
     // An environment exists only if its data file does: opening an absent one would create it.
-    let present = |dir: &str| store_path.join(dir).join("mdbx.dat").exists();
+    let mut read = Vec::new();
+    for dir in ["epoch", "kad", "cache"] {
+        if exists(&store_path.join(dir).join("mdbx.dat"))? {
+            read.push(dir);
+        }
+    }
     let mut copied = 0;
-    let read: Vec<&str> =
-        ["epoch", "kad", "cache"].into_iter().filter(|dir| present(dir)).collect();
     if read.contains(&"epoch") {
         let src = open_mdbx_env(store_path, MdbxEnv::Epoch)?;
         // Before the copy below, whose typed reads panic on a row this binary cannot decode: it
@@ -595,6 +609,44 @@ mod migrate_test {
         assert!(!root.join(MDBX_MIGRATED).exists(), "and the move is not marked done");
         assert_eq!(migrate_from_mdbx(store, &root, &db).expect("retry"), 10, "a retry copies all");
         assert!(!store.join("epoch").exists(), "then MDBX is deleted");
+    }
+
+    /// An environment that cannot be checked (here a directory the node may not search: EACCES on
+    /// the stat of its `mdbx.dat`) fails the move instead of counting as absent: nothing is copied
+    /// or deleted, and the move is not marked done, so the open retries once the operator fixes
+    /// the permissions.
+    #[cfg(unix)]
+    #[test]
+    fn test_migrate_from_mdbx_fails_when_an_environment_cannot_be_checked() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        /// Gives the directory its permissions back, so the temp dir can be removed.
+        struct Restore<'a>(&'a std::path::Path);
+        impl Drop for Restore<'_> {
+            fn drop(&mut self) {
+                let _ = std::fs::set_permissions(self.0, std::fs::Permissions::from_mode(0o755));
+            }
+        }
+
+        let tmp = TempDir::with_prefix("migrate_mdbx_unreadable").expect("temp dir");
+        let store = tmp.path();
+        let env = store.join("epoch");
+        std::fs::create_dir(&env).expect("epoch dir");
+        std::fs::write(env.join("mdbx.dat"), b"not read").expect("mdbx.dat");
+        let root = store.join(TNDB_DIR);
+        let db = open_split(&root);
+        std::fs::set_permissions(&env, std::fs::Permissions::from_mode(0o000)).expect("chmod");
+        let restore = Restore(&env);
+        if std::fs::read_dir(&env).is_ok() {
+            // Running as root: permissions do not apply, so there is no stat error to test.
+            eprintln!("skipped: directory permissions do not apply to this user");
+            return;
+        }
+        let err = migrate_from_mdbx(store, &root, &db).expect_err("an unchecked env fails");
+        assert!(err.to_string().contains("mdbx.dat"), "the error names the file: {err}");
+        assert!(!root.join(MDBX_MIGRATED).exists(), "the move is not marked done");
+        drop(restore);
+        assert!(env.join("mdbx.dat").exists(), "MDBX is kept");
     }
 
     /// A node with no MDBX data (a fresh node) copies nothing, and records that it is done.

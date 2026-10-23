@@ -53,9 +53,10 @@ pub enum ConsensusError {
     Invariant(#[from] ConsensusInvariant),
 
     /// This epoch's certificate pack failed for good (an open, write or sync failure it latched,
-    /// or its thread is gone). It is this node's own storage failing, never a peer's input:
-    /// certificates are verified before consensus sees them. Fatal on purpose: it ends the
-    /// consensus task, which stops the node.
+    /// or its thread is gone). It is this node's own storage failing, not a peer's input:
+    /// certificates are verified before consensus sees them (short of a peer's batch flood filling
+    /// the shared disk, the known exception in the storage README §8). Fatal on purpose: it ends
+    /// the consensus task, which stops the node.
     #[error("certificate pack failed: {0}")]
     CertificatePack(PackError),
 }

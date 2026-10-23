@@ -48,7 +48,7 @@ use tracing::{error, warn};
 use crate::{
     archive::data_file::{fsync_directory, fsync_file},
     consensus_pack::{
-        install_dir_rename_aside, pack_unsealed_version, ConsensusPack, DeclaredBatches, PackError,
+        install_dir_rename_aside, pack_is_sealed, ConsensusPack, DeclaredBatches, PackError,
         DATA_NAME,
     },
     epoch_records::{EpochDbError, EpochRecordDb},
@@ -213,9 +213,10 @@ impl LatestConsensus {
         // Both slots damaged (a double fault) leaves the hint at (0, 0), so `ConsensusChain::new`
         // opens epoch 0's pack as the current one, whatever epoch the node had reached. Nothing
         // here can tell which epoch that was (the slots are its only record); the pack files are
-        // untouched, and the node's next `new_epoch` opens the epoch it is really in. Logged at
-        // `error!`, since resuming from the wrong epoch is otherwise silent until a save or read
-        // trips over it.
+        // untouched. Mid-epoch, the node's startup `count_leaders` (which runs before its next
+        // `new_epoch`) reopens the executed epoch's pack as the current one; at an epoch boundary
+        // the next `new_epoch` opens the epoch it is really in. Logged at `error!`, since
+        // resuming from the wrong epoch is otherwise silent until a save or read trips over it.
         let slot1_read = Self::read_slot(&mut slot1);
         let slot2_read = Self::read_slot(&mut slot2);
         if let (Err(e1), Err(e2)) = (&slot1_read, &slot2_read) {
@@ -699,16 +700,10 @@ impl ConsensusChain {
         // epoch the moment this handoff returns. The next epoch's subscriber reads it immediately
         // (its parent is that epoch's last output), and `get_static` only accepts a sealed pack:
         // leaving the seal to a straggling clone's `Drop` would make that read fail as
-        // `CorruptPack` and halt the node. A seal that fails is our own storage failing: return
-        // the error so the caller stops the node for `db repair`.
-        let previous = old_pack.epoch();
-        if !Self::seal_previous_pack(&self.base_path, old_pack, epoch).await {
-            return Err(PackError::PersistError(format!(
-                "epoch {previous}'s pack is not sealed after the epoch handoff; its reads fail \
-                 until `db repair`"
-            ))
-            .into());
-        }
+        // `CorruptPack` and halt the node. A seal that fails is our own storage failing, and a
+        // seal that cannot be checked cannot be trusted: return the error so the caller stops the
+        // node (for `db repair` in the first case; a restart re-runs the handoff in the second).
+        Self::seal_previous_pack(&self.base_path, old_pack, epoch).await?;
         Ok(())
     }
 
@@ -725,21 +720,27 @@ impl ConsensusChain {
     /// drops. The seal runs on the blocking pool and is awaited asynchronously, so this never
     /// blocks a tokio worker.
     ///
-    /// Returns whether the epoch's data log under `base_path` is sealed afterwards. The seal itself
-    /// cannot report a failure (it is the pack state's drop), so the data log is checked on disk:
-    /// one left unsealed (an I/O error or a full disk while sealing, or a pack a failed write took
-    /// out of service) fails every later read of the epoch as `CorruptPack` until `db repair`, and
-    /// is logged here at `error!`, where it happens; `new_epoch` then fails, which stops the node.
+    /// Fails unless the epoch's data log under `base_path` reads back sealed afterwards. The seal
+    /// itself cannot report a failure (it is the pack state's drop, which only logs one), so the
+    /// data log is read back: one left unsealed (a failed truncate or sentinel write, a full disk
+    /// while sealing, or a pack a failed write took out of service) fails every later read of the
+    /// epoch as `CorruptPack` until `db repair`. It is logged here at `error!`, where it happens,
+    /// and returned as a [`PackError::PersistError`] naming `db repair`. The read goes through the
+    /// page cache, so it cannot see a failed final fsync, which the pack's `Drop` only logs: the
+    /// sentinel it reads may then be only in memory. An open failure the environment caused
+    /// (descriptor or memory exhaustion, [`PackError::is_environmental`]), or a check that did not
+    /// finish, proves nothing either way: it is logged as an unverified seal and returned without
+    /// the `db repair` remedy. Either error makes `new_epoch` fail, which stops the node.
     ///
     /// A read-only (imported) pack, or one of the epoch the handoff just opened (`new_epoch`), is
-    /// not checked and reports `true`: a read-only pack writes nothing and was sealed when it was
+    /// not checked and reports `Ok`: a read-only pack writes nothing and was sealed when it was
     /// opened, and the same epoch's data log is now the live writer's, whose open retired its
     /// sentinel.
     async fn seal_previous_pack(
         base_path: &Path,
         old_pack: ConsensusPack,
         new_epoch: Epoch,
-    ) -> bool {
+    ) -> Result<(), PackError> {
         let deadline = tokio::time::Instant::now() + Self::HANDOFF_SEAL_GRACE;
         while !old_pack.is_sole_handle() && tokio::time::Instant::now() < deadline {
             tokio::time::sleep(Duration::from_millis(5)).await;
@@ -757,22 +758,53 @@ impl ConsensusChain {
         old_pack.seal_now().await;
         drop(old_pack);
         if !check_on_disk {
-            return true;
+            return Ok(());
         }
         let data = base_path.join(format!("epoch-{epoch}")).join(DATA_NAME);
-        let checked =
-            tokio::task::spawn_blocking(move || pack_unsealed_version(&data, epoch)).await;
-        let sealed = matches!(checked, Ok(Some((_, false))));
-        if !sealed {
-            error!(
-                target: "consensus::store",
-                epoch,
-                ?checked,
-                "previous-epoch pack is not sealed after the handoff; its reads will fail as \
-                 CorruptPack until `db repair`"
-            );
+        #[cfg(test)]
+        let environmental =
+            crate::consensus_pack::ENVIRONMENTAL_NEXT_SEAL_CHECK.with(|fail| fail.replace(false));
+        let checked = tokio::task::spawn_blocking(move || {
+            #[cfg(test)]
+            crate::consensus_pack::ENVIRONMENTAL_NEXT_SEAL_CHECK
+                .with(|fail| fail.set(environmental));
+            pack_is_sealed(&data, epoch)
+        })
+        .await;
+        match checked {
+            Ok(Ok(true)) => Ok(()),
+            // Descriptor or memory exhaustion says nothing about the files: the seal is unverified,
+            // not known bad, so `db repair` is not the remedy.
+            Ok(Err(e)) if e.is_environmental() => {
+                error!(
+                    target: "consensus::store",
+                    epoch,
+                    "could not verify the seal of epoch {epoch}: {e}"
+                );
+                Err(e)
+            }
+            Err(e) => {
+                error!(
+                    target: "consensus::store",
+                    epoch,
+                    "could not verify the seal of epoch {epoch}: the check did not finish: {e}"
+                );
+                Err(PackError::ReceiveFailed)
+            }
+            Ok(unsealed) => {
+                error!(
+                    target: "consensus::store",
+                    epoch,
+                    ?unsealed,
+                    "previous-epoch pack is not sealed after the handoff; its reads will fail as \
+                     CorruptPack until `db repair`"
+                );
+                Err(PackError::PersistError(format!(
+                    "epoch {epoch}'s pack is not sealed after the epoch handoff; its reads fail \
+                     until `db repair`"
+                )))
+            }
         }
-        sealed
     }
 
     /// Remove every `recent_packs` entry for any of `epochs` and return them, so the caller can
@@ -882,9 +914,13 @@ impl ConsensusChain {
         }
         pack.close().await;
         // The seal is the import's only data sync after its meta commit, and `close()` cannot
-        // report a failed one (the pack's `Drop` only logs it). Read the files back sealed, as
-        // `open_static` will, before installing them: an unsealed copy must never replace
-        // `epoch-{N}`. On failure `_import_path` removes the import directory.
+        // report a failure (the pack's `Drop` only logs it). Read the files back sealed, as
+        // `open_static` will, before installing them, so a copy whose seal never reached its files
+        // (a failed msync, truncate or sentinel write, or a poisoned log) never replaces
+        // `epoch-{N}`. The read goes through the page cache, so it cannot see a failed final
+        // fsync: such a copy is installed, and after a power loss its next read refuses it (`db
+        // repair`; its data was msynced before the seal). On failure `_import_path` removes the
+        // import directory.
         let staged = path.join(format!("epoch-{epoch}"));
         #[cfg(test)]
         let environmental =
@@ -1884,23 +1920,74 @@ impl ConsensusChain {
         }
     }
 
-    /// Count the current pack's leaders (in rewards_counter) up to last_executed_round.
+    /// Count the leaders of `expected_epoch` (the epoch execution last ran) up to
+    /// `last_executed_round` into `rewards_counter`.
     ///
-    /// The current pack must be `expected_epoch`'s (the epoch execution last ran), or this errors
-    /// with `InvalidPackEpoch` and counts nothing: the counts become the epoch-close rewards, so
-    /// another epoch's leaders (a resume hint left behind execution) would silently fork this
-    /// node's closing block from its peers'.
+    /// The counts become the epoch-close rewards, so they come from `expected_epoch`'s pack, never
+    /// another epoch's: another epoch's leaders would silently fork this node's closing block from
+    /// its peers'. That pack is normally the current one, but startup opens the current pack from
+    /// the `LatestConsensus` slot hint, which can be behind execution: both slots damaged fall
+    /// back to epoch 0, and a failed slot write is only logged, so a power loss can lose the
+    /// epoch change. The slots are a hint and must not stop the node, so a current pack behind
+    /// `expected_epoch` is replaced, with a warning, by `expected_epoch`'s pack opened for append
+    /// ([`Self::resume_executed_epoch`]). A current pack ahead of it (not reached in practice: the
+    /// node counts only mid-epoch) is kept, and the count reads `expected_epoch`'s static pack. A
+    /// chain with no pack for `expected_epoch` refuses with `InvalidPackEpoch` and counts nothing.
     pub async fn count_leaders(
         &self,
         expected_epoch: Epoch,
         last_executed_round: Round,
         rewards_counter: RewardsCounter,
     ) -> Result<(), ConsensusChainError> {
-        let pack = self.current_pack();
-        if pack.epoch() != expected_epoch {
-            return Err(ConsensusChainError::InvalidPackEpoch(pack.epoch(), expected_epoch));
+        let current_epoch = self.current_pack.lock().epoch();
+        if current_epoch < expected_epoch {
+            self.resume_executed_epoch(expected_epoch).await?;
+        } else if current_epoch > expected_epoch {
+            warn!(
+                target: "consensus::store",
+                current_epoch,
+                expected_epoch,
+                "the current pack is ahead of the executed epoch; counting leaders from the \
+                 executed epoch's static pack"
+            );
         }
+        let pack = self.get_static(expected_epoch).await?;
         Ok(pack.count_leaders(last_executed_round, rewards_counter).await?)
+    }
+
+    /// Make `epoch`'s pack, opened for append, the current one in place of a current pack from an
+    /// earlier epoch, and seal the pack it replaces as the epoch handoff does (a failed seal is an
+    /// error). Startup opens the current pack from the `LatestConsensus` slot hint, so this is the
+    /// open startup would have made with a hint at `epoch` (it recovers a torn tail); see
+    /// [`Self::count_leaders`]. The hint itself is corrected by `epoch`'s next save. Refuses with
+    /// `InvalidPackEpoch` if `epoch` has no pack.
+    async fn resume_executed_epoch(&self, epoch: Epoch) -> Result<(), ConsensusChainError> {
+        // Lock order as in `new_epoch`: `pack_install` before `current_pack`.
+        let _install = self.pack_install.lock().await;
+        let old_pack = self.current_pack();
+        if old_pack.epoch() >= epoch {
+            return Ok(());
+        }
+        if !self.base_path.join(format!("epoch-{epoch}")).join(DATA_NAME).try_exists()? {
+            return Err(ConsensusChainError::InvalidPackEpoch(old_pack.epoch(), epoch));
+        }
+        warn!(
+            target: "consensus::store",
+            hint_epoch = old_pack.epoch(),
+            epoch,
+            "the consensus slot hint is behind the executed epoch; reopening the executed epoch's \
+             pack as the current one"
+        );
+        let pack = ConsensusPack::open_append_exists(&self.base_path, epoch)?;
+        *self.current_pack.lock() = pack;
+        // As in `new_epoch`: invalidate any `get_static` open racing the swap, then evict cached
+        // handles of either epoch.
+        self.install_generation.fetch_add(1, Ordering::Release);
+        for stale in self.take_cached(&[epoch, old_pack.epoch()]) {
+            stale.close().await;
+        }
+        Self::seal_previous_pack(&self.base_path, old_pack, epoch).await?;
+        Ok(())
     }
 
     /// Return a clone of the current pack.
@@ -2431,10 +2518,6 @@ pub enum ConsensusChainError {
     CrcError,
     /// An epoch record database operation failed; wraps the [`EpochDbError`].
     EpochDbError(EpochDbError),
-    /// The imported pack file contained no consensus output.
-    EmptyImport,
-    /// The final consensus output in the imported pack file was invalid.
-    InvalidImport,
     /// The chain lacks the complete data needed to stream a pack file to a peer.
     StreamUnavailable,
     /// [`ConsensusChain::stream_import`] was given, for the live (writable) epoch `.0`, a record
@@ -2478,10 +2561,6 @@ impl Display for ConsensusChainError {
             }
             ConsensusChainError::CrcError => write!(f, "Crc error"),
             ConsensusChainError::EpochDbError(e) => write!(f, "Epoch DB Error: {e}"),
-            ConsensusChainError::EmptyImport => write!(f, "No consensus in imported pack file"),
-            ConsensusChainError::InvalidImport => {
-                write!(f, "Bad final consensus in imported pack file")
-            }
             ConsensusChainError::StreamUnavailable => {
                 write!(f, "Incomplete data to stream a pack file")
             }
@@ -4275,9 +4354,11 @@ mod test {
         decoding.abort();
     }
 
-    /// The handoff's seal of the previous epoch reports whether that epoch's data log ended up
-    /// sealed on disk, and logs an error when it did not: an epoch left unsealed fails its reads as
-    /// `CorruptPack` until `db repair`, so the failure must be visible where it happens.
+    /// The handoff's seal of the previous epoch fails when that epoch's data log did not end up
+    /// sealed, and logs an error: an epoch left unsealed fails its reads as `CorruptPack` until
+    /// `db repair`, so the failure must be visible where it happens. A seal check that meets
+    /// descriptor exhaustion proves nothing about the files: it fails too (the seal is
+    /// unverified), with the environmental error and without the `db repair` remedy.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_seal_previous_pack_reports_an_unsealed_epoch() {
         use crate::consensus_pack::ConsensusPack;
@@ -4298,9 +4379,27 @@ mod test {
             .expect("open a pack");
         let output = make_test_output(&committee, 1, chain.clone(), 1, parent);
         pack.save_consensus_output(output).await.expect("save");
+        ConsensusChain::seal_previous_pack(healthy.path(), pack, 1)
+            .await
+            .expect("a healthy pack seals");
+
+        // Descriptor exhaustion in the seal check: the pack sealed, but the check cannot say so.
+        let unverified = TempDir::with_prefix("test_seal_unverified").expect("temp dir");
+        let pack = ConsensusPack::open_append(unverified.path(), epoch0.clone(), committee.clone())
+            .expect("open a pack");
+        let output = make_test_output(&committee, 1, chain.clone(), 1, parent);
+        pack.save_consensus_output(output).await.expect("save");
+        crate::consensus_pack::ENVIRONMENTAL_NEXT_SEAL_CHECK.with(|fail| fail.set(true));
+        let err = ConsensusChain::seal_previous_pack(unverified.path(), pack, 1)
+            .await
+            .expect_err("an unverified seal fails the handoff");
+        assert!(err.is_environmental(), "expected the environmental error, got {err}");
+        assert!(!format!("{err}").contains("db repair"), "no `db repair` remedy: {err}");
+        assert!(!crate::consensus_pack::ENVIRONMENTAL_NEXT_SEAL_CHECK.with(|fail| fail.get()));
+        let data = unverified.path().join("epoch-0").join(crate::consensus_pack::DATA_NAME);
         assert!(
-            ConsensusChain::seal_previous_pack(healthy.path(), pack, 1).await,
-            "a healthy pack seals"
+            matches!(crate::consensus_pack::pack_unsealed_version(&data, 0), Some((_, false))),
+            "the pack itself sealed"
         );
 
         // A save that panics takes the pack out of service unsealed (the next open recovers it).
@@ -4310,10 +4409,10 @@ mod test {
         pack.panic_next_save();
         let output = make_test_output(&committee, 1, chain.clone(), 1, parent);
         pack.save_consensus_output(output).await.expect_err("the save panics");
-        assert!(
-            !ConsensusChain::seal_previous_pack(broken.path(), pack, 1).await,
-            "an epoch left unsealed must be reported"
-        );
+        let err = ConsensusChain::seal_previous_pack(broken.path(), pack, 1)
+            .await
+            .expect_err("an epoch left unsealed must be reported");
+        assert!(format!("{err}").contains("db repair"), "the `db repair` remedy: {err}");
     }
 
     /// `new_epoch` drops a cached read-only handle for the epoch it opens for writing. After a
@@ -6110,9 +6209,9 @@ mod test {
 
     /// `count_leaders` restores the executed epoch's leader counts at startup, and they become the
     /// epoch-close rewards: counted from another epoch's pack (a resume hint behind execution),
-    /// this node's closing block would silently diverge from its peers. It counts the current pack
-    /// only when that is the expected epoch, and otherwise refuses with `InvalidPackEpoch` without
-    /// counting anything.
+    /// this node's closing block would silently diverge from its peers. It counts only the
+    /// expected epoch's pack; with no pack for that epoch it refuses with `InvalidPackEpoch`
+    /// without counting anything.
     #[tokio::test]
     async fn test_count_leaders_guards_epoch() {
         use tn_types::gas_accumulator::RewardsCounter;
@@ -6146,6 +6245,73 @@ mod test {
         for (index, expected) in [(0, 2), (1, 2), (2, 1), (3, 1)] {
             assert_eq!(counts.get(&address(index)), Some(&expected), "authority {index}");
         }
+    }
+
+    /// Startup opens the current pack from the `LatestConsensus` slot hint, which can be behind
+    /// execution: both slots damaged fall back to epoch 0. The slots are a hint and must not stop
+    /// the node, so `count_leaders` still counts the executed epoch's leaders, from that epoch's
+    /// pack, which it reopens as the current (writable) one; the epoch it replaces is resealed and
+    /// still reads.
+    #[tokio::test]
+    async fn test_count_leaders_reopens_the_executed_epoch_behind_a_stale_hint() {
+        use tn_types::gas_accumulator::RewardsCounter;
+
+        let temp_dir = TempDir::with_prefix("test_count_leaders_stale_hint").expect("temp dir");
+        // Epoch 0: outputs 1..=2, led by authorities 0 and 1.
+        let (consensus_chain, digests) = chain_with_outputs(temp_dir.path(), 2).await;
+        let committee0 = consensus_chain.current_pack().committee().clone();
+        let last0 = *digests.last().expect("outputs");
+        let record0 = EpochRecord {
+            epoch: 0,
+            committee: committee0.bls_keys().iter().copied().collect(),
+            next_committee: committee0.bls_keys().iter().copied().collect(),
+            final_consensus: ConsensusNumHash::new(2, last0),
+            ..Default::default()
+        };
+        let committee = committee0.advance_epoch_for_test(1);
+        consensus_chain.new_epoch(record0, committee.clone()).await.expect("epoch 1");
+        // Epoch 1: outputs 3..=5, all at leader round 1, led by authorities 2, 2 and 3.
+        let chain_spec: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let mut parent = last0;
+        for (number, leader) in [(3, 2), (4, 2), (5, 3)] {
+            let output = make_test_output(&committee, leader, chain_spec.clone(), number, parent);
+            parent = output.digest();
+            consensus_chain.save_consensus_output(output).await.expect("save");
+        }
+        consensus_chain.persist_current().await.expect("persist");
+        // As a crash mid-epoch leaves it: epoch 1's outputs are durable but its pack is unsealed,
+        // so only a writable open (which recovers it) serves it; a read-only open refuses it.
+        consensus_chain.poison_current_pack_for_test();
+        consensus_chain.close().await;
+
+        // Both slot files damaged: the restart opens epoch 0's pack as the current one.
+        for name in ["consensus_slot1", "consensus_slot2"] {
+            std::fs::write(temp_dir.path().join(name), [0xFF; 16]).expect("damage a slot");
+        }
+        let restarted =
+            ConsensusChain::new(temp_dir.path().to_owned(), committee0.clone()).expect("restart");
+        assert_eq!(restarted.current_pack().epoch(), 0, "the hint fell back to epoch 0");
+
+        let rewards = RewardsCounter::default();
+        rewards.set_committee(committee.clone());
+        restarted
+            .count_leaders(1, 1, rewards.clone())
+            .await
+            .expect("count the executed epoch's leaders");
+        let address = |index: usize| committee.authorities()[index].execution_address();
+        let counts = rewards.get_address_counts();
+        assert_eq!(counts.values().sum::<u32>(), 3, "{counts:?}");
+        assert_eq!(counts.get(&address(2)), Some(&2), "{counts:?}");
+        assert_eq!(counts.get(&address(3)), Some(&1), "{counts:?}");
+        let current = restarted.current_pack();
+        assert_eq!(current.epoch(), 1, "epoch 1 is the current pack");
+        assert!(!current.is_static(), "and writable");
+        drop(current);
+        let epoch0 = restarted.get_static(0).await.expect("epoch 0 reads after the swap");
+        let header = epoch0.consensus_header_by_number(2).await.expect("read");
+        assert_eq!(header.digest(), last0);
+        drop(epoch0);
+        restarted.close().await;
     }
 
     /// A same-epoch `new_epoch` re-entry whose committee differs from the pack's persisted

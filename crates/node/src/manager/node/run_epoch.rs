@@ -1179,10 +1179,13 @@ fn epoch_tasks_ended(
 /// [`TNDatabase::failed`], which names the store); never resolve otherwise. `'static`, so it
 /// holds no borrow of `db`.
 ///
-/// Every latch is this node's own storage failing (a failed write or sync, a stopped writer, or
-/// damage a read found on disk), never a peer's input: a peer's bad record is refused before it is
-/// written and latches nothing. Without this, a latched peer-record or batch-cache store would go
-/// unnoticed until the epoch ends (an observer's following stalls meanwhile).
+/// A latch is this node's own storage failing (a failed write or sync, a stopped writer, or damage
+/// a read found on disk): a peer's bad record is refused before it is written and latches nothing.
+/// One known exception predates tndb and is tracked separately: a committee member can flood
+/// distinct valid batches into [`NodeBatchesCache`], which keeps them until they are committed or
+/// the epoch closes, so the flood can fill the disk and latch the cache store. Without this, a
+/// latched peer-record or batch-cache store would go unnoticed until the epoch ends (an observer's
+/// following stalls meanwhile).
 fn store_failure<DB: TNDatabase>(
     db: &DB,
 ) -> impl Future<Output = eyre::Report> + Send + 'static + use<DB> {
@@ -1199,7 +1202,8 @@ fn store_failure<DB: TNDatabase>(
 /// The pack reports a certificate save that failed in the background, and a failed final flush,
 /// only here ([`CertificatePack::shutdown`]). Either is this node's own storage failing, never a
 /// peer's input: certificates are verified before consensus archives them, and nothing a peer
-/// sends can make the pack fail. So the error stops the node.
+/// sends can make the pack fail (short of filling the shared disk, the batch flood described at
+/// [`store_failure`]). So the error stops the node.
 async fn seal_certificate_pack(pack: Arc<CertificatePack>) -> eyre::Result<()> {
     match Arc::try_unwrap(pack) {
         Ok(pack) => pack.shutdown().await,

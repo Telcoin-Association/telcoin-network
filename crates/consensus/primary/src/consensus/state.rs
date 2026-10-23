@@ -337,7 +337,9 @@ pub struct Consensus<DB> {
 /// unarchived and consensus carries on. Any other error means the pack has failed for good, and it
 /// is this node's own storage failing, never a peer's input: certificates are verified before they
 /// reach consensus, and nothing a peer sends can latch the pack (only its own open, write or sync
-/// failing, or its thread being gone, does). So it ends the consensus task, which stops the node.
+/// failing, or its thread being gone, does), short of a peer's batch flood filling the shared disk
+/// (the known exception in the storage README §8). So it ends the consensus task, which stops the
+/// node.
 fn certificate_archived(saved: Result<(), PackError>) -> Result<(), ConsensusError> {
     match saved {
         Err(PackError::SendFull) => {

@@ -87,6 +87,10 @@ const PACE_SLICE: Duration = Duration::from_millis(10);
 /// take): the new log's growth preallocation, at most this much past its data.
 const DISK_HEADROOM: u64 = 128 << 20;
 
+/// Test-only: how long `CompactShared::compact_now` waits for its compaction before it panics.
+#[cfg(test)]
+const COMPACT_NOW_TIMEOUT: Duration = Duration::from_secs(120);
+
 /// After a failed automatic compaction, the automatic trigger waits this long before trying again,
 /// doubling with each further failure up to [`AUTO_BACKOFF_MAX`].
 const AUTO_BACKOFF_MIN: Duration = Duration::from_secs(60);
@@ -135,15 +139,19 @@ const STALL_TAIL_MAX: u64 = 64 << 20;
 /// under the writer's own log growth would stop the database until a restart.
 const MIN_FREE: u64 = 2 * DISK_HEADROOM;
 
-/// A generation's `compacted` file: the log's length when the compaction that made it switched.
+/// A generation's `compacted` file: the trigger's base, the new log's length just before the
+/// switch's final tail (the batches it replays under the write lock), not at the switch itself:
+/// it is written before the write lock is taken, so the switch's stall holds no extra file sync.
+/// The tail is small next to the log (at most [`STALL_TAIL_MAX`]), so the trigger barely moves.
 const COMPACTED: &str = "compacted";
 const COMPACTED_TMP: &str = "compacted.tmp";
 
 /// A record's frame beyond its payload: its length and CRC.
 pub(super) const FRAME: u64 = 8;
 
-/// The log's length right after the compaction that made the generation at `gen_path`, or 0 when
-/// none did (or its `compacted` file is unreadable: it is only the trigger's starting point).
+/// The trigger's base of the generation at `gen_path` (its log's length before the final tail of
+/// the switch that made it; see [`COMPACTED`]), or 0 when no compaction made it (or its
+/// `compacted` file is unreadable: it is only the trigger's starting point).
 pub(super) fn read_base(gen_path: &Path) -> u64 {
     let path = gen_path.join(COMPACTED);
     match fs::read(&path) {
@@ -271,16 +279,26 @@ impl CompactShared {
     }
 
     /// Test-only: compact now, whatever the log's size, and wait for it: whether it switched, or
-    /// why it was abandoned.
+    /// why it was abandoned. Panics if it has not finished within [`COMPACT_NOW_TIMEOUT`], so a
+    /// stuck compaction fails its test rather than hanging it.
     #[cfg(test)]
     pub(super) fn compact_now(&self) -> Result<bool, String> {
+        self.compact_now_within(COMPACT_NOW_TIMEOUT)
+    }
+
+    /// Test-only: [`Self::compact_now`], panicking unless it finishes within `timeout`.
+    #[cfg(test)]
+    pub(super) fn compact_now_within(&self, timeout: Duration) -> Result<bool, String> {
         self.test.force.store(true, Ordering::Relaxed);
+        let deadline = Instant::now() + timeout;
         let mut state = self.state.lock();
         let target = state.done + 1 + u64::from(self.running.load(Ordering::Acquire));
         state.requested = true;
         self.wake.notify_one();
         while state.done < target {
-            self.finished.wait(&mut state);
+            if self.finished.wait_until(&mut state, deadline).timed_out() && state.done < target {
+                panic!("compact_now: compaction {target} did not finish within {timeout:?}");
+            }
         }
         state.outcomes[target as usize - 1].clone()
     }
@@ -890,6 +908,8 @@ fn compact_once(core: &Core, requested: bool, rate: u64) -> eyre::Result<bool> {
         catch_up(&mut out, &view, done, to, &ksizes, Some(core))?;
         done = to;
         out.sync()?;
+        // Before the final tail below: written under the write lock, it would add a file sync to
+        // the switch's stall (see `COMPACTED`).
         let base = out.log_len();
         write_base(&out.dir, base)?;
         #[cfg(test)]
@@ -1083,6 +1103,7 @@ fn run(core: &Core, rate: u64) {
                     let cause = cause(&e);
                     if cause == Cause::Corruption {
                         tracing::error!(target: "tndb", "compaction abandoned: {e:#}");
+                        core.compaction_damaged();
                     } else {
                         tracing::warn!(target: "tndb", "compaction abandoned: {e:#}");
                     }
@@ -1191,6 +1212,30 @@ mod test {
             assert!(Instant::now() < deadline, "the compaction started");
             std::thread::sleep(Duration::from_millis(5));
         }
+    }
+
+    /// A test's `compact_now` waits a bounded time: a compaction that does not finish (here held
+    /// at a gate) fails the test with a panic naming it instead of hanging it.
+    #[test]
+    fn test_tndb_compact_now_panics_past_its_timeout() {
+        let tmp = TempDir::with_prefix("tndb_compact_now_timeout").expect("temp dir");
+        let db = open(tmp.path(), manual());
+        db.insert::<TestTable>(&1, &"a".to_string()).expect("insert");
+        let compact = &db.core().compact;
+        let (arrivals, release) = compact.test.gate_next();
+        std::thread::scope(|s| {
+            let waiter = s.spawn(|| compact.compact_now_within(Duration::from_millis(200)));
+            assert_eq!(
+                arrivals.recv_timeout(Duration::from_secs(20)),
+                Ok(1),
+                "held after the copy"
+            );
+            let panicked = waiter.join().expect_err("the wait times out while the gate holds it");
+            let message = panicked.downcast_ref::<String>().cloned().unwrap_or_default();
+            assert!(message.contains("did not finish within"), "the panic names it: {message}");
+            drop(release);
+        });
+        assert!(compact.wait_done(1).is_some(), "the released compaction finishes");
     }
 
     /// The epoch-end reset (every table emptied) needs no room for a copy: with free space above

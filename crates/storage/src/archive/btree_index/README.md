@@ -198,10 +198,11 @@ reads of a page happen before the writer reuses it. A long-lived snapshot theref
 grow until it is dropped.
 
 **Reopen.** The free list lives in memory. On a clean, writable reopen `unreachable_pages` walks
-the tree from the root (checking each internal page's CRC, child bounds and that no page is reached
-twice) and frees every page it does not reach. A walk failure fails the open
-(`LoadHeaderError::CorruptIndex`), so the owner rebuilds: a page that might be live is never
-reused, and a damaged pointer never misroutes a lookup into the next session.
+the tree from the root (checking every page's full CRC, internal and leaf, each page's type, child
+bounds and that no page is reached twice) and frees every page it does not reach. A walk failure
+fails the open (`LoadHeaderError::CorruptIndex`), so the owner rebuilds: a page that might be live
+is never reused, a damaged pointer never misroutes a lookup into the next session, and a damaged
+leaf never answers one.
 
 ---
 
@@ -242,7 +243,13 @@ The B+tree does not pay a CRC per operation: it is derived and rebuildable, so i
   private.
 - **Publish/sync** stamps exactly the private pages (O(pages written), never a full scan). A page
   zeroed *at rest* is never re-stamped as valid, because it is not in the private set.
-- **Reads do not recompute the full CRC**, but cheap checks turn damage into
+- **A clean writable open verifies every page.** Its walk (see Reopen) checks each internal
+  page's and each leaf's full CRC, so damage at rest anywhere in the tree, including damage that
+  leaves a leaf a whole node (a flipped key or value bit, an entry count lowered or raised within
+  range), fails the open as `CorruptIndex` and the owner rebuilds from the log. It costs one CRC
+  per page of the tree per clean open, nothing on the hot path. A read-only open checks only the
+  root's CRC; `verify_tree()` runs the walk's checks on demand (tndb's inspection uses it).
+- **Reads do not recompute the full CRC**, but cheap checks turn the damage they can see into
   `FetchError::CorruptIndex` instead of a wrong answer or a panic:
   - the page number must be inside the tree (`1 ≤ p < page_count`);
   - an all-zero trailer is only legal on a page this handle wrote since its last publish. On a
@@ -262,8 +269,11 @@ The B+tree does not pay a CRC per operation: it is derived and rebuildable, so i
     a pointer redirected to a stale, still CRC-valid copy of the right subtree (a page that
     copy-on-write replaced and has not reused yet) reads what that copy held.
 
-  Damage these checks don't see (a flipped key or value bit inside a leaf) is found by
-  `page_crc_scan()`, or by a write's copy-on-write check.
+  Damage these checks don't see, arising after the open while the handle is live (a flipped key
+  or value bit inside a leaf, an entry count changed within range), reads as a wrong answer until
+  a write's copy-on-write check, the next clean open's walk or `page_crc_scan()` finds it. A
+  leaf's vacated slots are zeroed (by a delete and by a split, and an internal page's by a removal
+  and a split), so a count raised past the live entries reads zero keys, never a removed entry.
 - **Writes into a damaged page are refused.** A write changes only a private page (`page_mut`),
   so a published page is copied first: copy-on-write (`make_writable`) reads the source through
   the same checks as a read, and also verifies its full CRC before copying a page read from disk
@@ -273,10 +283,11 @@ The B+tree does not pay a CRC per operation: it is derived and rebuildable, so i
   one case: a page this process wrote, evicted by the OS and then re-read from a silently
   damaged sector.
 - **Pages whose child pointers decide what is live** are CRC-checked when read from disk: the
-  open-time walk checks every internal page, and `clear`, which retires the old tree through its
-  child pointers, checks each internal page this handle neither wrote nor stamped (as does
-  `collapse_root` for each root whose only child pointer it follows). A damaged pointer there
-  could otherwise hand a live page to the free list.
+  open-time walk checks every page, and `clear`, which retires the old tree through its child
+  pointers, checks each internal page this handle neither wrote nor stamped (as does
+  `collapse_root` for each root whose only child pointer it follows); `clear` does not read the
+  leaves, whose contents it discards. A damaged pointer there could otherwise hand a live page to
+  the free list.
 - **Damage found is latched.** Every `CorruptIndex` a read or write finds poisons the index file:
   `is_poisoned()` turns true, `sync()` is refused, and the file is never sealed as clean again, so
   the next open finds it unclean and the owner rebuilds it. A snapshot doesn't hold the file, so it
@@ -287,7 +298,7 @@ The B+tree does not pay a CRC per operation: it is derived and rebuildable, so i
   (unsynced writes: rebuild from the log) or corrupt (genuine on-disk corruption), in a
   `PageCrcReport { dirty, corrupt }`.
 - **Open** checks the header CRC, on a cleanly sealed file the root page's full CRC, and on a clean
-  writable open the walk above.
+  writable open the walk above (every page's full CRC).
 
 ---
 
@@ -347,8 +358,9 @@ BtreeIndex::open_btx_file(dir, data_header: &DataHeader, ksize: u16, read_only: 
      stays unclean);
    - on a cleanly sealed file, the root page's CRC must be valid (`CrcFailed`).
 6. Publish the tree as opened to the reader view; on a clean writable reopen, walk the tree and
-   recover the free list. A walk failure (an internal page failing its CRC, a bad or repeated
-   child pointer, a height that does not reach the leaves) fails the open (`CorruptIndex`).
+   recover the free list. A walk failure (an internal page or a leaf failing its CRC, a page of
+   the wrong type, a bad or repeated child pointer, a height that does not reach the leaves)
+   fails the open (`CorruptIndex`).
 
 A pack wrapper treats any rejection (except an `IO` error, which it surfaces) as "rebuild from the
 log".
@@ -416,6 +428,7 @@ Public (`pub`) unless marked crate-internal.
 | `set_owner_value` / `owner_value` | one `u64` the owner keeps with the index, durable at `sync` |
 | `set_remove_on_drop` | delete on drop, skipping the sync |
 | `page_crc_scan -> PageCrcReport` | off-path full CRC classification |
+| `verify_tree -> Result<(), FetchError>` (crate) | the clean writable open's walk checks on the current tree (every page's CRC, types, child pointers), for an inspection of a read-only handle |
 | `publish(&mut) -> IndexSnapshot` *(crate)* | publish the working tree for lock-free readers |
 | `IndexSnapshot::{load, len}` + `PageSource` *(crate)* | snapshot reads and cursor source |
 | `iter::BtreeCursor` *(crate)* | the detached cursor (`new`, `next`) |

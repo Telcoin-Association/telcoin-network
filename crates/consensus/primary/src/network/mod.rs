@@ -1289,9 +1289,6 @@ impl PrimaryNetworkHandle {
             ConsensusChainError::EpochMismatch
             | ConsensusChainError::PrevCommitteeEpochMismatch
             | ConsensusChainError::CrcError => Some(Penalty::Mild),
-            ConsensusChainError::EmptyImport | ConsensusChainError::InvalidImport => {
-                Some(Penalty::Severe)
-            }
             ConsensusChainError::StreamUnavailable
             | ConsensusChainError::NoCurrentEpoch
             | ConsensusChainError::EpochDbError(_)
@@ -1364,8 +1361,6 @@ impl PrimaryNetworkHandle {
                 | PackError::InvalidVersion(_, _)
                 | PackError::ConsensusNumberTooHigh => false,
             },
-            // The imported stream had no / an invalid final output: the peer served a bad pack.
-            ConsensusChainError::EmptyImport | ConsensusChainError::InvalidImport => true,
             // Local chain state, our own storage, or a benign mismatch: never charge the peer.
             ConsensusChainError::EpochMismatch
             | ConsensusChainError::PrevCommitteeEpochMismatch

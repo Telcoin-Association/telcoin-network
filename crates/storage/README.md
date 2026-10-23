@@ -52,7 +52,13 @@ syscalls, no read/write buffers). It exposes `Read`/`Write`/`Seek` plus `slice`,
   padding, so ordinary reads (bounded to `end`) never observe it as data. The documented exceptions
   are the recovery/validation scan on an `opened_unclean` file — where `end` is left at physical EOF
   and the padding is deliberately read (as CRC-failing records) to find the trim point — and
-  `AsyncPackIter` (intentional-design item 12).
+  `AsyncPackIter` (intentional-design item 12). Growth preallocates real blocks for the new range
+  (`allocate_range`: `fallocate` on Linux, `F_PREALLOCATE` on macOS), so a full disk fails the
+  growing write with an `io::Error` instead of a later SIGBUS on a store into an unbacked page. On
+  Linux that needs ext4 or xfs: where `fallocate` is unsupported (`EOPNOTSUPP`/`ENOSYS`: ext2/ext3,
+  NFS, many FUSE filesystems) growth falls back to a sparse `set_len`, and a full disk can SIGBUS;
+  copy-on-write filesystems (btrfs, ZFS) accept `fallocate` without guaranteeing a later write's
+  space. Data already synced is kept either way.
 - **Clean-close sentinel.** On a clean `Drop` the file is truncated to `end` and an 8-byte sentinel
   (`crc32(end)` ‖ `crc32` of those 4 bytes) is appended and fsync'd. On reopen the sentinel is
   validated against the physical size and stripped; a missing/invalid sentinel means the file was
@@ -63,8 +69,11 @@ syscalls, no read/write buffers). It exposes `Read`/`Write`/`Seek` plus `slice`,
   `fsync`'d in the grow path: the next durability barrier fsyncs the size if the file grew since the
   last fsync (`sync_size_if_grown`), so a barrier still promises data `[0, end)` durable within a
   durable size, and one with no growth since stays msync-only. A derived index file
-  (`MmapFileOptions::derived`) skips that fsync and leaves its size to the clean-close seal.
-  `sync_disk` is the full msync+fsync.
+  (`MmapFileOptions::derived`: the position indexes and tndb's B+trees) skips that fsync and leaves
+  its size to the clean-close seal. The digest indexes (`.hdx`/`.odx`) are not derived in this
+  sense: the epoch records' and certificate pack's recoveries read an unsealed hdx's attested
+  length as evidence to refuse a cut, so its size must not lag its header. `sync_disk` is the full
+  msync+fsync.
 - **Read-only handles** (`open(.., read_only=true)`) map a *sealed* file and clamp their read bound
   (`set_read_bound`) to the index-attested length as defense against a writer truncation.
 
@@ -185,7 +194,9 @@ data log opened read-only, then swapped in by rename), imports a full epoch from
 partial-prefix pack instead stages under its own `staging-{N}-{n}/` and is never renamed; either import
 authenticates the record's final output itself and stops with a local `StorageFull` error, not charged
 to the peer, before free space could drop below a floor (each check needs `IMPORT_FREE_HEADROOM` above
-it, for the growth the import's files may preallocate before the next check), since the peer's bytes
+it for every floored import in flight in the process, for the growth their files may preallocate before
+their next checks: the epoch fetchers and an observer's staging import can run several at once onto the
+live stores' filesystem), since the peer's bytes
 are authenticated only at the final header; `db load-state`'s restore of a local bundle has no floor;
 the imported pack is sealed before `pack_install` is taken, and the live (writable) epoch is replaced
 only with its stored record's chain, anything else, such as a prefix's partial final, being refused as
@@ -259,6 +270,13 @@ it remotely. These are refused and logged, never fatal:
 - a certificate that fails verification (checked before consensus sees it);
 - an import that fails verification.
 
+One known exception, which predates tndb and is tracked separately: a committee member can send a
+flood of distinct, valid batches. Each is written to `NodeBatchesCache`, which has no byte budget
+and keeps uncommitted batches until the epoch closes, so the flood can fill the disk. The cache
+environment's write then fails, its `Durability` latches, and the node stops like any other
+storage failure. (The MDBX cache of the release before stopped the node at its fixed 1 GiB
+maximum.)
+
 **How the stores report it.** A failure latches, so every later write fails the same way:
 - **tndb:** `Durability`. A failed write or sync, a stopped writer, or damage a read found;
   `Database::failed()` resolves once any environment latches.
@@ -286,8 +304,16 @@ it remotely. These are refused and logged, never fatal:
   `finish_epoch`'s persist stops the node even for a save that failed in the subscriber's shutdown
   drain.
 - **The epoch handoff (`new_epoch`):** the previous writable pack is sealed before the handoff
-  returns. If its data log is still unsealed on disk afterwards, `new_epoch` returns a
-  `PersistError` naming the epoch and `db repair`, and `open_epoch_pack` stops the node.
+  returns. If its data log then reads back unsealed, `new_epoch` returns a `PersistError` naming
+  the epoch and `db repair`, and `open_epoch_pack` stops the node. A check that cannot open the
+  file for a reason the environment caused (descriptor or memory exhaustion) proves nothing about
+  it: `new_epoch` returns that error, logged as "could not verify the seal of epoch N", which
+  stops the node too but without the `db repair` remedy (a restart re-runs the handoff). The
+  check reads the file back
+  through the page cache, so it sees a seal that was never written but not a final fsync that
+  failed: the seal (`MmapDataFile`'s `Drop`) only logs that. After a power loss such an epoch is
+  refused at its next read (`db repair`); its committed data was msynced before the seal, so
+  nothing is lost.
 - **Epoch records and certificates:** `write_epoch_record` and the startup epoch-0 record save
   return their errors. A local failure is one `EpochDbError::is_local_storage_failure` says is our
   own (an exhaustive match: IO, append, index, open, unreadable, corrupt, a gone actor):
@@ -309,12 +335,16 @@ notified is only logged, which is why `finish_epoch` re-checks the packs and sto
 
 **Two exceptions:**
 - **The `LatestConsensus` slot files.** They are a non-authoritative hint; the packs are ground
-  truth. A failed slot write or fsync is logged, and `persist_current` still returns Ok.
+  truth. A failed slot write or fsync is logged, and `persist_current` still returns Ok. A hint
+  behind execution (both slots damaged fall back to epoch 0, or a lost epoch change) does not stop
+  a restart either: mid-epoch, startup's `count_leaders` reopens the executed epoch's pack as the
+  current one, with a warning; at a boundary, `new_epoch` opens the right epoch.
 - **A pack import from a peer.** An import writes only its own directory, which is removed on any
   failure and never touches installed data. So a failed import is not installed, and the fetcher
   tries another peer, whether the fault was the peer's stream or a local write (an IO error there
-  can be either). An imported pack that fails its seal check is one of these. A disk that fails
-  here fails the node's own stores at their next write, and that stops it.
+  can be either). An imported pack that fails its seal check is one of these (the check has the
+  handoff's limit: it reads through the page cache and cannot see a failed final fsync). A disk
+  that fails here fails the node's own stores at their next write, and that stops it.
 
 ### On-disk layout
 
@@ -345,7 +375,9 @@ notified is only logged, which is why `finish_epoch` re-checks the packs and sto
 issues. `telcoin-network db repair [--epoch N] [--force]` repairs epoch packs **at rest** (node
 stopped): it truncates a torn tail and rebuilds indexes from the WAL for damaged epochs, dry-run by
 default, skipping the current/latest epoch unless named. Meta/mid-log corruption is reported for
-re-sync, never "fixed". A legacy (pre-v2) pack's torn tail is judged by the migration to v2 (which
+re-sync, never "fixed". A read the disk failed, or a failure the environment caused (descriptor or
+memory exhaustion, a permission problem, a full disk), is no verdict on the epoch: it is reported as
+an error to rerun once the cause is fixed, never as unrepairable. A legacy (pre-v2) pack's torn tail is judged by the migration to v2 (which
 drops an unacked tail), so `db validate`, `db repair` and `db migrate` agree on it. Only the newest
 epoch's legacy pack can drop an unacked tail: a past epoch (one with a later `epoch-N` directory) was
 complete when the next epoch began, so a tail its replay cannot reach is refused as damage by the
@@ -487,7 +519,8 @@ guard exists it is named so a reviewer can confirm it, not re-derive it.
     crate; not a "define a proper error type" finding.
 17. **A rolled-back consensus-output save invalidates the digest commit marker (forces a rebuild),
     it does not surgically restore overwritten index entries.** `rollback_output` rewinds the data
-    log + position index, then sets the digest indexes' `data_file_length` to a value that can never
+    log (flushing the zeros it writes over the cut, so a power loss cannot bring the failed save
+    back; a failed flush poisons the log) + position index, then sets the digest indexes' `data_file_length` to a value that can never
     equal the rewound data length, so the next `open_append` fails `files_consistent` and
     `recover_pack` rebuilds every index from the data-log WAL. This deliberately does not try to
     restore an overwritten duplicate-key position (e.g. a batch already committed by an earlier
@@ -549,4 +582,8 @@ guard exists it is named so a reviewer can confirm it, not re-derive it.
     nothing to assess there. (A read-only cert-pack open does not self-heal — but no production path
     takes one.) A writable open takes an exclusive `flock` on `epoch-{N}/cert_lock` and holds it until
     its data and index have sealed, so a same-epoch reopen waits for a previous writer that is still
-    sealing.
+    sealing (with a warning naming the epoch directory when the lock is not free at once). A
+    writable open whose `cert_data` is missing starts a new log and discards a leftover
+    `cert_hash/`, warning when that index attested certificates: the one exception to "an absent
+    file beside an index that attests data counts as corrupt", since nothing reads the pack and a
+    refusal would stop the node over an archive.

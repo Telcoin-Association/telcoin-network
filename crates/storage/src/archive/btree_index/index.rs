@@ -11,17 +11,27 @@
 //! Like the digest index, this index is not the durability source — it is derived from its data
 //! log and rebuilt from it ([`BtreeIndex::rebuild_from`]) — so it does not pay a per-op CRC. A
 //! modified page's 4-byte CRC trailer is `zero_crc`'d as a "dirty" marker and the page recorded as
-//! written by this handle; [`Index::sync`] CRC-stamps exactly those pages. Reads do not verify the
-//! full CRC ([`BtreeIndex::page_crc_scan`] is the off-path check), but cheap checks turn damage
-//! at rest into `CorruptIndex`: a zero trailer on a page this handle did not write, an impossible
-//! page type or entry count, and a leaf that is not at the tree's height or holds keys outside the
-//! range its ancestors' separators give it (the intersection of their ranges), which is where a
-//! damaged child pointer leading to another page of the tree ends. A write into a damaged page is
-//! refused rather than stamped valid at the next sync, and a page whose child pointers decide
-//! which pages are live (the open-time walk, `clear`) has its full CRC checked when it was read
-//! from disk. Damage the checks don't see (a flipped key or value bit inside a leaf, or a child
-//! pointer redirected to a stale, still CRC-valid copy of the right subtree) is found by
-//! [`BtreeIndex::page_crc_scan`] or by a write's copy.
+//! written by this handle; [`Index::sync`] CRC-stamps exactly those pages.
+//!
+//! A clean writable open walks the whole tree and checks every page's full CRC, internal and
+//! leaf, so damage at rest anywhere in it (a flipped bit, an entry count lowered or raised within
+//! range, a changed key) fails the open as `CorruptIndex` and its owner rebuilds the index from
+//! the data log. A read-only open checks only the root's CRC ([`BtreeIndex::verify_tree`] runs
+//! the walk's checks on demand, for an inspection).
+//!
+//! Reads do not verify the full CRC, but cheap checks turn damage into `CorruptIndex`: a zero
+//! trailer on a page this handle did not write, an impossible page type or entry count, and a
+//! leaf that is not at the tree's height or holds keys outside the range its ancestors'
+//! separators give it (the intersection of their ranges), which is where a damaged child pointer
+//! leading to another page of the tree ends. A write's copy of a page read from disk checks its
+//! full CRC, so a write into a damaged page is refused rather than stamped valid at the next sync,
+//! and `clear` checks the CRC of each internal page whose child pointers it follows. What the
+//! cheap checks cannot see is damage that arises after the open, while the handle is live, and
+//! leaves a page a whole node: a flipped key or value bit inside a leaf, an entry count changed
+//! within range (a leaf's vacated slots are zeroed, so a raised count reads zero keys, never a
+//! removed entry), or a child pointer redirected to a stale, still CRC-valid copy of the right
+//! subtree. Such damage reads as a wrong answer until a write's copy of that page, the next
+//! open's walk or [`BtreeIndex::page_crc_scan`] finds it.
 //!
 //! Damage found is latched: the index file is poisoned, so it is never sealed as clean again and
 //! the next open rebuilds it from its data log.
@@ -35,7 +45,7 @@
 //! rebuilds it from the log and calls [`BtreeIndex::mark_consistent`] so the next clean close
 //! seals it. A file shorter than the pages its header names (a lost size extension) is rejected
 //! at open, as is a cleanly-sealed one whose root page fails its CRC or, opened writable, whose
-//! tree walk (every internal page's CRC and child pointers) fails.
+//! tree walk (every page's CRC, the page types and the child pointers) fails.
 //!
 //! ## Copy-on-write and page reuse
 //! A published page is never modified: a write copies the pages it changes, and readers of a
@@ -503,10 +513,12 @@ impl BtreeIndex {
             cow_crc_checks: 0,
         };
         // A cleanly-sealed tree's unreachable pages are free; an unclean one is rebuilt, not
-        // trusted, and a read-only handle never allocates. The walk checks every internal page's
-        // CRC and child pointers: damage there would misroute lookups and could free a live page,
-        // so it fails the open (the handle's file is poisoned, never sealed), and the writable
-        // doors rebuild from the data log.
+        // trusted, and a read-only handle never allocates. The walk checks every page's full CRC
+        // (internal and leaf), the page types and the child pointers: damage to an internal page
+        // would misroute lookups and could free a live page, and damage to a leaf (an entry count
+        // still in range, a key byte) would read as a wrong answer the reads' cheap checks cannot
+        // see. Either fails the open (the handle's file is poisoned, never sealed), and the
+        // writable doors rebuild from the data log.
         if !read_only && !fresh && !index.opened_unclean() {
             index.free = index.unreachable_pages().map_err(|e| {
                 tracing::warn!(target: "btree-index", "index {} fails its open-time walk; it must be rebuilt: {e}", dir.display());
@@ -748,12 +760,12 @@ impl BtreeIndex {
         p as u64 * PAGE_SIZE as u64
     }
 
-    /// Borrow page `p`'s bytes directly from the mapping. Reads do not verify the full CRC (the
-    /// mapping is trusted; [`Self::page_crc_scan`] is the off-path check), but cheap checks turn
-    /// damage into [`FetchError::CorruptIndex`] (latched, see [`Self::damaged`]) instead of a
-    /// wrong answer: `p` must lie inside the tree, a page with an all-zero CRC trailer must be one
-    /// this handle wrote since its last publish (anywhere else the zero marker is at-rest damage,
-    /// e.g. a zeroed page), and any other page must be a whole node.
+    /// Borrow page `p`'s bytes directly from the mapping. Reads do not verify the full CRC (a
+    /// clean writable open's walk verified every page; see the module docs for what that leaves),
+    /// but cheap checks turn the damage they can see into [`FetchError::CorruptIndex`] (latched,
+    /// see [`Self::damaged`]): `p` must lie inside the tree, a page with an all-zero CRC trailer
+    /// must be one this handle wrote since its last publish (anywhere else the zero marker is
+    /// at-rest damage, e.g. a zeroed page), and any other page must be a whole node.
     fn page(&self, p: u32) -> Result<&[u8], FetchError> {
         if p == 0 || p >= self.header.page_count {
             return Err(self.damaged(format!(
@@ -1375,9 +1387,16 @@ impl BtreeIndex {
     /// Every page of the tree at `root` with `height` levels. Internal pages are read (each must be
     /// internal, with a sane entry count and in-bounds children never seen before), and one read
     /// from disk must pass its full CRC ([`Self::verified_page`]): its child pointers decide which
-    /// pages are live. Leaves are taken from their parents' child pointers, and only the first is
-    /// read (it must be a leaf: the tree is balanced, so that checks `height`).
-    fn tree_pages(&self, root: u32, height: u32) -> Result<PageSet, FetchError> {
+    /// pages are live. Leaves are taken from their parents' child pointers. With `verify_leaves`
+    /// every leaf is read the same way (each must be a leaf and, read from disk, pass its full CRC:
+    /// a damaged entry count or key would otherwise read as a valid, wrong answer); without it only
+    /// the first is read (it must be a leaf: the tree is balanced, so that checks `height`).
+    fn tree_pages(
+        &self,
+        root: u32,
+        height: u32,
+        verify_leaves: bool,
+    ) -> Result<PageSet, FetchError> {
         let node = self.node;
         let corrupt = |what: String| self.damaged(format!("btree walk: {what}"));
         let mut seen = PageSet::default();
@@ -1402,16 +1421,32 @@ impl BtreeIndex {
             }
             level = next;
         }
-        if !node.is_leaf(self.page(level[0])?) {
-            return Err(corrupt(format!("height {height} does not reach the leaves")));
+        let leaves = if verify_leaves { &level[..] } else { &level[..1] };
+        for &p in leaves {
+            let buf = if verify_leaves { self.verified_page(p)? } else { self.page(p)? };
+            if !node.is_leaf(buf) {
+                return Err(corrupt(format!(
+                    "height {height} does not reach the leaves (page {p})"
+                )));
+            }
         }
         Ok(seen)
     }
 
+    /// Check every page of the current tree as a writable clean open does: each internal page's
+    /// and each leaf's full CRC (for a page read from disk), the page types and the child
+    /// pointers. For an inspection of a cleanly-sealed index, whose read-only open checks only
+    /// the root's CRC. A failure is damage at rest ([`FetchError::CorruptIndex`], latched).
+    pub(crate) fn verify_tree(&self) -> Result<(), FetchError> {
+        self.tree_pages(self.header.root_page, self.header.height, true).map(|_| ())
+    }
+
     /// The pages a cleanly-sealed tree does not reach (free to reuse), lowest popped first, or the
-    /// walk's failure (damage at rest, latched): a page that might be live is never reused.
+    /// walk's failure (damage at rest, latched): a page that might be live is never reused. The
+    /// walk verifies every leaf too ([`Self::tree_pages`] with `verify_leaves`), so a clean open
+    /// has checked every page of the tree it trusts.
     fn unreachable_pages(&self) -> Result<Vec<u32>, FetchError> {
-        let reachable = self.tree_pages(self.header.root_page, self.header.height)?;
+        let reachable = self.tree_pages(self.header.root_page, self.header.height, true)?;
         Ok((1..self.header.page_count).rev().filter(|&p| !reachable.contains(p)).collect())
     }
 
@@ -1424,9 +1459,11 @@ impl BtreeIndex {
         }
         let node = self.node;
         // The old tree's pages are retired through its child pointers, so each internal page read
-        // from disk is CRC-checked first: a damaged pointer must not retire a live page.
-        let mut old =
-            self.tree_pages(self.header.root_page, self.header.height).map_err(fetch_to_append)?;
+        // from disk is CRC-checked first: a damaged pointer must not retire a live page. The
+        // leaves' contents are discarded, so they are not read.
+        let mut old = self
+            .tree_pages(self.header.root_page, self.header.height, false)
+            .map_err(fetch_to_append)?;
         let leaf = self.allocate_page()?;
         let buf = self.page_mut(leaf).map_err(fetch_to_append)?;
         node.init_leaf(buf, NULL_PAGE, NULL_PAGE);
@@ -1542,7 +1579,6 @@ mod tests {
     use super::*;
     use crate::archive::{data_file::SENTINEL_LEN, pack::PackCompression};
 
-    /// XOR the byte at `offset` of `file` with `mask`, on disk (damage at rest).
     /// Flip `mask` into byte `at` of page `p` in `idx`'s live mapping: damage that arises after
     /// the open (which its walk could not have seen).
     fn flip_in_mapping(idx: &mut BtreeIndex, p: u32, at: usize, mask: u8) {
@@ -1565,6 +1601,7 @@ mod tests {
         Node::new(32).set_internal_child(page_bytes, 0, to);
     }
 
+    /// XOR the byte at `offset` of `file` with `mask`, on disk (damage at rest).
     fn xor_at(file: &Path, offset: u64, mask: u8) {
         use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
         let mut f = std::fs::OpenOptions::new().read(true).write(true).open(file).expect("open");
@@ -1599,7 +1636,7 @@ mod tests {
     /// A page damaged at rest so that its entry count is impossible (one flipped bit in the
     /// count's high byte; the CRC trailer, now wrong, stays non-zero) is reported as
     /// `CorruptIndex` on every path that reaches it, never a panic. A writable open's walk finds
-    /// it (here in the leftmost leaf, which the walk reads, or an internal page), so the owner
+    /// it (here in a leaf or an internal page: the walk reads every page), so the owner
     /// rebuilds; a read-only open does not walk, and its lookups and scans report it. Damage that
     /// arises after a clean open is reported by a lookup through the writer and through a
     /// published snapshot (tndb's read path) and by a save (tndb's write path), and is latched.
@@ -1649,17 +1686,18 @@ mod tests {
     }
 
     /// Copy-on-write refuses to copy a page that fails its CRC: the copy would be stamped valid at
-    /// the next publish, making damage at rest (here one flipped bit in a stored value) CRC-valid
-    /// and invisible to every later check.
+    /// the next publish, making damage (here one flipped bit in a stored value) CRC-valid and
+    /// invisible to every later check. The damage arises after the open, as damage while the node
+    /// runs does: at rest, the open's walk would refuse the index first.
     #[test]
     fn test_archive_btx_copy_on_write_refuses_a_damaged_page() {
         let tmp = TempDir::new().expect("tmp");
         let (dir, dh, [_, _, leaf, _]) = sealed_index(&tmp, 2_000);
         let node = Node::new(32);
-        let first_value = BtreeIndex::page_offset(leaf) + (12 + node.max_leaf_keys() * 32) as u64;
-        xor_at(&dir.join("index.btx"), first_value, 0x01);
-        // A flipped value bit leaves the leaf a whole node: the open's walk accepts it.
+        let first_value = 12 + node.max_leaf_keys() * 32;
         let mut idx = BtreeIndex::open_btx_file(&dir, &dh, 32, false).expect("open");
+        // A flipped value bit leaves the leaf a whole node: only its CRC shows it.
+        flip_in_mapping(&mut idx, leaf, first_value, 0x01);
         assert_eq!(idx.page_crc_scan().corrupt, 1, "the damage is visible");
         let save = idx.save(&[0_u8; 32], 7);
         assert!(matches!(save, Err(AppendError::CorruptIndex(_))), "{save:?}");
@@ -1670,6 +1708,87 @@ mod tests {
         drop(idx);
         let idx = BtreeIndex::open_btx_file(&dir, &dh, 32, false).expect("reopen");
         assert!(idx.opened_unclean(), "the next open finds it unclean, so its owner rebuilds it");
+    }
+
+    /// The second leaf from the left of the sealed index at `dir`, of height 2 (a leaf the open's
+    /// walk once never read): its page number, entry count and keys.
+    fn second_leaf(dir: &Path, dh: &DataHeader) -> (u32, usize, Vec<[u8; 32]>) {
+        let idx = BtreeIndex::open_btx_file(dir, dh, 32, true).expect("open read-only");
+        let node = idx.node;
+        assert_eq!(idx.header.height, 2, "a root over leaves");
+        let leaf = node.internal_child(idx.page(idx.header.root_page).expect("root"), 1);
+        let buf = idx.page(leaf).expect("leaf");
+        assert!(node.is_leaf(buf), "a leaf");
+        let n = node.entry_count(buf);
+        let keys = (0..n).map(|i| node.leaf_key(buf, i).try_into().expect("32 bytes")).collect();
+        (leaf, n, keys)
+    }
+
+    /// Damage at rest that leaves a leaf a whole node the reads' cheap checks accept is found by
+    /// its CRC: [`BtreeIndex::verify_tree`] reports it on a read-only open (as an inspection
+    /// runs it), and a writable open's walk refuses the index, so its owner rebuilds it.
+    fn assert_leaf_damage_refused(dir: &Path, dh: &DataHeader) {
+        let ro = BtreeIndex::open_btx_file(dir, dh, 32, true).expect("open read-only");
+        let verified = ro.verify_tree();
+        assert!(matches!(verified, Err(FetchError::CorruptIndex(_))), "{verified:?}");
+        drop(ro);
+        let open = BtreeIndex::open_btx_file(dir, dh, 32, false);
+        assert!(matches!(open, Err(LoadHeaderError::CorruptIndex(_))), "{:?}", open.err());
+    }
+
+    /// A leaf's entry count lowered by one (its low byte) stays in range, so `tag_ok` accepts it
+    /// and a read would miss the leaf's last key: the writable open refuses the index.
+    #[test]
+    fn test_archive_btx_open_refuses_a_lowered_leaf_count() {
+        let tmp = TempDir::new().expect("tmp");
+        let (dir, dh, _) = sealed_index(&tmp, 2_000);
+        let (leaf, n, _) = second_leaf(&dir, &dh);
+        let mask = (n as u8) ^ (n as u8 - 1);
+        xor_at(&dir.join("index.btx"), BtreeIndex::page_offset(leaf) + 2, mask);
+        assert_leaf_damage_refused(&dir, &dh);
+    }
+
+    /// A key byte changed within the leaf's order and its separators' range would hide the
+    /// original key from every read: the writable open refuses the index.
+    #[test]
+    fn test_archive_btx_open_refuses_a_changed_leaf_key() {
+        let tmp = TempDir::new().expect("tmp");
+        let (dir, dh, _) = sealed_index(&tmp, 2_000);
+        let (leaf, n, keys) = second_leaf(&dir, &dh);
+        let j = n / 2;
+        let mut changed = keys[j];
+        changed[31] ^= 0x01;
+        assert!(keys[j - 1] < changed && changed < keys[j + 1], "the change keeps the order");
+        // Leaf keys start after the tag (4 bytes) and the two unused links (8).
+        let at = BtreeIndex::page_offset(leaf) + (12 + j * 32 + 31) as u64;
+        xor_at(&dir.join("index.btx"), at, 0x01);
+        assert_leaf_damage_refused(&dir, &dh);
+    }
+
+    /// A leaf's entry count raised by one after its last entry was removed would bring the
+    /// vacated slot back as a live entry: the delete zeroes the slot (so it reads as a zero key,
+    /// not the removed one), and the writable open refuses the index.
+    #[test]
+    fn test_archive_btx_open_refuses_a_raised_leaf_count_after_a_delete() {
+        let tmp = TempDir::new().expect("tmp");
+        let (dir, dh, _) = sealed_index(&tmp, 2_000);
+        let (_, n, keys) = second_leaf(&dir, &dh);
+        {
+            let mut idx = BtreeIndex::open_btx_file(&dir, &dh, 32, false).expect("open");
+            assert!(idx.remove(&keys[n - 1]).expect("remove"), "the leaf's last key");
+            idx.sync().expect("sync");
+        }
+        let (leaf, m, _) = second_leaf(&dir, &dh);
+        assert_eq!(m, n - 1, "the copied leaf lost its last entry");
+        {
+            let idx = BtreeIndex::open_btx_file(&dir, &dh, 32, true).expect("open read-only");
+            let buf = idx.page(leaf).expect("leaf");
+            assert!(idx.node.leaf_key(buf, m).iter().all(|&b| b == 0), "the vacated slot is zero");
+            assert_eq!(idx.node.leaf_value(buf, m), 0, "and so is its value");
+        }
+        let mask = (m as u8) ^ (m as u8 + 1);
+        xor_at(&dir.join("index.btx"), BtreeIndex::page_offset(leaf) + 2, mask);
+        assert_leaf_damage_refused(&dir, &dh);
     }
 
     /// Copy-on-write verifies a page read from disk before its first copy, and never one this
@@ -2645,7 +2764,10 @@ mod tests {
 
     /// Pages reachable from the working tree.
     fn live_pages(idx: &BtreeIndex) -> usize {
-        idx.tree_pages(idx.header.root_page, idx.header.height).expect("walk").drain().count()
+        idx.tree_pages(idx.header.root_page, idx.header.height, false)
+            .expect("walk")
+            .drain()
+            .count()
     }
 
     /// Random writes, publishes, syncs and clears while a changing set of snapshots is held and
@@ -2754,7 +2876,8 @@ mod tests {
             k
         };
         let pages_of = |idx: &BtreeIndex, snap: &IndexSnapshot| -> Vec<(u32, Vec<u8>)> {
-            let mut walk = idx.tree_pages(idx.header.root_page, idx.header.height).expect("walk");
+            let mut walk =
+                idx.tree_pages(idx.header.root_page, idx.header.height, false).expect("walk");
             walk.drain().map(|p| (p as u32, snap.page(p as u32).expect("page").to_vec())).collect()
         };
         let unchanged = |snap: &IndexSnapshot, pages: &[(u32, Vec<u8>)]| {
@@ -3064,10 +3187,17 @@ mod tests {
             assert!(rep.corrupt > 0, "corrupted page must be flagged by the scan, got {rep:?}");
         }
 
-        // Rebuilding from the (pack-derived) entries recovers a fully readable, clean index.
+        // A writable open's walk verifies every leaf's CRC, so it refuses the damaged index (and
+        // poisons the handle, so it is never sealed again)...
+        let open = BtreeIndex::open_btx_file(&dir, &data_header, 32, false);
+        assert!(matches!(open, Err(LoadHeaderError::CorruptIndex(_))), "{:?}", open.err());
+
+        // ...and rebuilding from the (pack-derived) entries recovers a fully readable, clean
+        // index: the next open finds it unclean, as its owner does after the refusal.
         {
             let mut idx: BtreeIndex =
                 BtreeIndex::open_btx_file(&dir, &data_header, 32, false).expect("reopen rw");
+            assert!(idx.opened_unclean(), "the refused index is never trusted again");
             idx.rebuild_from(all.iter().copied()).expect("rebuild");
             idx.sync().expect("sync");
             for (k, v) in &all {
@@ -3143,7 +3273,9 @@ mod tests {
     /// Average leaf fill: stored keys over leaf capacity.
     fn leaf_fill(idx: &BtreeIndex) -> f64 {
         let (mut leaves, mut keys) = (0_usize, 0_usize);
-        for p in idx.tree_pages(idx.header.root_page, idx.header.height).expect("walk").drain() {
+        for p in
+            idx.tree_pages(idx.header.root_page, idx.header.height, false).expect("walk").drain()
+        {
             let buf = idx.page(p as u32).expect("page");
             if idx.node.is_leaf(buf) {
                 leaves += 1;

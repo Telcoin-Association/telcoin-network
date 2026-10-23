@@ -28,7 +28,10 @@ use std::{
     ops::Range,
     panic::{catch_unwind, resume_unwind, AssertUnwindSafe},
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
     time::Duration,
 };
 
@@ -944,8 +947,12 @@ impl ConsensusPack {
         // position index, never the possibly-corrupt digest indexes.
         match Inner::check_recoverable(&epoch_dir, &data_file, epoch) {
             Ok(()) => {}
-            // A read the disk failed is no verdict on the pack: report it, not a re-sync.
-            Err(e @ PackError::ReadError(_)) => return Err(e),
+            // A read the disk failed, or a failure the environment caused (descriptor or memory
+            // exhaustion, a permission problem), is no verdict on the pack: report it as an error
+            // to retry, not as data loss to re-sync.
+            Err(e) if matches!(e, PackError::ReadError(_)) || e.is_environmental() => {
+                return Err(e)
+            }
             Err(e) => {
                 return Ok(EpochRepair::Unrepairable(format!(
                     "epoch {epoch}: the data log cannot be recovered without losing committed \
@@ -978,7 +985,10 @@ impl ConsensusPack {
 
         // Apply: the writable open runs recover_pack (truncate torn tail) + open_indexes_for_append
         // (rebuild indexes); persist + drop re-seals. If recover_pack finds mid-log corruption the
-        // best-effort classifier missed, this surfaces as an error -> Unrepairable.
+        // best-effort classifier missed, this surfaces as an error -> Unrepairable. A read error or
+        // an environmental failure (descriptor or memory exhaustion, a full disk while rebuilding)
+        // comes back as the error it is: recovery cut nothing, and only derived indexes may be
+        // gone, so a rerun once the cause is fixed completes the repair.
         match Self::open_append_exists(epochs_dir, epoch) {
             Ok(pack) => {
                 // Async-close (sole handle) so the seal does not block a worker on either the
@@ -989,8 +999,10 @@ impl ConsensusPack {
                 }
                 pack.close().await;
             }
-            // A read the disk failed is no verdict on the pack (recovery cut nothing).
-            Err(e @ PackError::ReadError(_)) => return Err(e),
+            // No verdict on the pack (recovery cut nothing), see above.
+            Err(e) if matches!(e, PackError::ReadError(_)) || e.is_environmental() => {
+                return Err(e)
+            }
             Err(e) => {
                 return Ok(EpochRepair::Unrepairable(format!(
                     "epoch {epoch}: repair aborted, the data is damaged beyond truncation ({e}); \
@@ -1124,6 +1136,7 @@ impl ConsensusPack {
             final_consensus,
             timeout,
             min_free,
+            &IMPORTS_IN_FLIGHT,
             lease,
         )
         .await?;
@@ -1721,15 +1734,40 @@ pub fn wal_consistent_end(data_path: &Path, epoch: Epoch) -> Result<u64, PackErr
 /// (the live current epoch, or a padded-unsealed previous epoch mid-handoff), whatever its epoch
 /// number.
 pub fn pack_unsealed_version(data_path: &Path, epoch: Epoch) -> Option<(u16, bool)> {
-    let data = Pack::<PackRecord>::open(
+    let data = open_data_for_check(data_path, epoch).ok()?;
+    Some((data.version(), data.opened_unclean()))
+}
+
+/// Whether the data log at `data_path` reads back sealed (it carries the clean-close sentinel),
+/// for a writer that has just closed it. Unlike [`pack_unsealed_version`], an open failure comes
+/// back as an error: a failure the environment caused (descriptor or memory exhaustion,
+/// [`PackError::is_environmental`]) says nothing about the file, so the caller must not report it
+/// as an unsealed epoch. Read-only, and like [`check_installed_pack_sealed`] it reads through the
+/// page cache, so it cannot see a failed final fsync.
+pub(crate) fn pack_is_sealed(data_path: &Path, epoch: Epoch) -> Result<bool, PackError> {
+    #[cfg(test)]
+    if ENVIRONMENTAL_NEXT_SEAL_CHECK.with(|fail| fail.replace(false)) {
+        return Err(PackError::IO(Arc::new(io::Error::from_raw_os_error(libc::EMFILE))));
+    }
+    Ok(!open_data_for_check(data_path, epoch)?.opened_unclean())
+}
+
+/// Open the data log at `data_path` read-only for a seal check: an environmental open failure
+/// becomes [`PackError::IO`] (see [`PackError::is_environmental`]), any other comes as it came.
+fn open_data_for_check(data_path: &Path, epoch: Epoch) -> Result<Pack<PackRecord>, PackError> {
+    match Pack::<PackRecord>::open(
         data_path,
         epoch as u64,
         true,
         PackCompression::ZStd,
         PACK_VERSION,
-    )
-    .ok()?;
-    Some((data.version(), data.opened_unclean()))
+    ) {
+        Ok(data) => Ok(data),
+        Err(DataFileOpen(LoadHeaderError::IO(e))) if io_error_is_environmental(&e) => {
+            Err(PackError::IO(Arc::new(e)))
+        }
+        Err(e) => Err(e.into()),
+    }
 }
 
 /// Check that the pack in `dir` (an `epoch-{N}` directory, live or staged) reads back sealed the
@@ -1738,7 +1776,12 @@ pub fn pack_unsealed_version(data_path: &Path, epoch: Epoch) -> Option<(u16, boo
 ///
 /// A pack's `Drop` seals its files but cannot report a failure (a failed truncate, sentinel write
 /// or final fsync is only logged), so a writer that closes a pack and then installs or trusts its
-/// files calls this after the close. `Err` means the files must not be installed:
+/// files calls this after the close. It reads the files back through the page cache, so it sees a
+/// seal that never reached them (a failed truncate or sentinel write, or a file left unsealed
+/// because it was poisoned), but not a failed final fsync: the sentinel it reads may then be only
+/// in memory, and after a power loss the file is unsealed on disk although this check passed (its
+/// committed data was msynced before the seal, so the next read refuses the pack, pointing at `db
+/// repair`, and nothing is lost). `Err` means the files must not be installed:
 /// [`PackError::PersistError`] for files that are not sealed and consistent (an index that will
 /// not open counts), else the data log's open failure as it came. A failure the environment
 /// caused (descriptor or memory exhaustion: [`PackError::IO`] for the data log, an environmental
@@ -1751,19 +1794,7 @@ pub(crate) fn check_installed_pack_sealed(dir: &Path, epoch: Epoch) -> Result<()
             io::Error::from_raw_os_error(libc::EMFILE),
         )))));
     }
-    let data = match Pack::<PackRecord>::open(
-        dir.join(Inner::DATA_NAME),
-        epoch as u64,
-        true,
-        PackCompression::ZStd,
-        PACK_VERSION,
-    ) {
-        Ok(data) => data,
-        Err(DataFileOpen(LoadHeaderError::IO(e))) if io_error_is_environmental(&e) => {
-            return Err(PackError::IO(Arc::new(e)));
-        }
-        Err(e) => return Err(e.into()),
-    };
+    let data = open_data_for_check(&dir.join(Inner::DATA_NAME), epoch)?;
     Inner::check_sealed(&data, dir, dir)
 }
 
@@ -1840,9 +1871,18 @@ thread_local! {
     /// Test-only: the next `Inner::rebuild_indexes_into` on this thread leaves its rebuilt position
     /// index unsealed, as a sync failing in its `Drop` does.
     static FAIL_NEXT_HEAL_SEAL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    /// Test-only: the next [`check_installed_pack_sealed`] on this thread fails as descriptor
-    /// exhaustion does (an environmental index-open error).
+    /// Test-only: the next seal check on this thread fails as descriptor exhaustion does:
+    /// [`check_installed_pack_sealed`] with an environmental index-open error, [`pack_is_sealed`]
+    /// with an environmental data-log open error.
     pub(crate) static ENVIRONMENTAL_NEXT_SEAL_CHECK: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+    /// Test-only: the next `Inner::check_recoverable` on this thread fails as descriptor
+    /// exhaustion opening its data log does.
+    static ENVIRONMENTAL_NEXT_RECOVERY_CHECK: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+    /// Test-only: the next `Inner::open_index_for_append` on this thread fails as descriptor
+    /// exhaustion does (an environmental index-open error).
+    static ENVIRONMENTAL_NEXT_INDEX_OPEN: std::cell::Cell<bool> =
         const { std::cell::Cell::new(false) };
     /// Test-only: the directories [`install_dir_rename_aside`] synced on this thread.
     static INSTALL_DIR_SYNCS: std::cell::RefCell<Vec<PathBuf>> =
@@ -2546,6 +2586,12 @@ impl Inner {
         data_file: &Path,
         epoch: Epoch,
     ) -> Result<(), PackError> {
+        #[cfg(test)]
+        if ENVIRONMENTAL_NEXT_RECOVERY_CHECK.with(|fail| fail.replace(false)) {
+            return Err(PackError::Open(Arc::new(DataFileOpen(LoadHeaderError::IO(
+                io::Error::from_raw_os_error(libc::EMFILE),
+            )))));
+        }
         let mut data = Pack::<PackRecord>::open(
             data_file,
             epoch as u64,
@@ -3573,6 +3619,12 @@ impl Inner {
         discarded: &mut bool,
         open: impl Fn() -> Result<T, PackError>,
     ) -> Result<T, PackError> {
+        #[cfg(test)]
+        if ENVIRONMENTAL_NEXT_INDEX_OPEN.with(|fail| fail.replace(false)) {
+            return Err(PackError::Open(Arc::new(OpenError::IndexFileOpen(LoadHeaderError::IO(
+                io::Error::from_raw_os_error(libc::EMFILE),
+            )))));
+        }
         match open() {
             Ok(index) => Ok(index),
             Err(e) if e.is_environmental_index_error() => Err(e),
@@ -4023,7 +4075,8 @@ impl Inner {
     /// stream that ends before it is the sender's (`NotConsensus`).
     ///
     /// The import stops before the filesystem's free space drops below `min_free` (see
-    /// [`IMPORT_MIN_FREE_BYTES`]).
+    /// [`IMPORT_MIN_FREE_BYTES`]), counted in `in_flight` among the imports whose growth each check
+    /// makes room for ([`DiskFloor`]).
     ///
     /// Only the stream reads run here ([`pump_import_frames`]). Each record's CPU work
     /// (decompress, decode, digest, re-encode) and every file write run on the blocking pool
@@ -4041,6 +4094,7 @@ impl Inner {
         final_consensus: ConsensusNumHash,
         timeout: Duration,
         min_free: u64,
+        in_flight: &'static AtomicU64,
         lease: L,
     ) -> Result<(Self, L), PackError> {
         // `AsyncPackIter::open` rejects a source newer than `PACK_VERSION` (its `max_version`).
@@ -4080,7 +4134,8 @@ impl Inner {
             // A failed import was discarded inside `import_records`, before `lease` drops here. A
             // completed one stays guarded until this future takes it, so one abandoned at the
             // last moment is discarded too (the guard drops before the lease).
-            Self::import_records(&path, epoch, &previous_epoch, final_consensus, min_free, records)
+            let floor = DiskFloor::new(path.join(format!("epoch-{epoch}")), min_free, in_flight);
+            Self::import_records(&path, epoch, &previous_epoch, final_consensus, floor, records)
                 .map(|pack| (pack, lease))
         });
         // Read the stream until the blocking half finishes: it stops taking frames at the final
@@ -4111,12 +4166,11 @@ impl Inner {
         epoch: Epoch,
         previous_epoch: &EpochRecord,
         final_consensus: ConsensusNumHash,
-        min_free: u64,
+        mut floor: DiskFloor,
         mut records: ImportRecords,
     ) -> Result<ImportGuard, PackError> {
         let base_dir = path.join(format!("epoch-{epoch}"));
         create_dir_synced(&base_dir)?;
-        let mut floor = DiskFloor { dir: base_dir.clone(), min_free, checked_at: None };
         floor.check(0)?;
         let epoch_meta = match records.next()? {
             Some(ImportRecord::Meta(meta)) => meta,
@@ -4609,7 +4663,11 @@ impl Inner {
     ///
     /// The data log's logical end is moved back with [`Pack::rewind_to`] (zeroing the abandoned
     /// region, no physical truncate/remap → no read-only-mmap SIGBUS window), so a retry or the
-    /// next output appends exactly at `data_start`. The position index is rolled back to
+    /// next output appends exactly at `data_start`. The zeros are flushed at once: the abandoned
+    /// bytes may already be on disk (the system's writeback), and no later persist covers a region
+    /// behind the log's end, so a power loss could otherwise bring the failed save back as a
+    /// complete output. A failed flush poisons the log, so it refuses later saves and is not
+    /// sealed: the next open recovers it. The position index is rolled back to
     /// `pos_idx_start` (normally a no-op — index saves are atomic and there is no fallible step
     /// after the pos-index save today).
     ///
@@ -4631,7 +4689,12 @@ impl Inner {
     /// record it fetches, so a stale entry is at worst a miss. See the storage README
     /// ("Intentional design decisions").
     fn rollback_output(&mut self, data_start: u64, pos_idx_start: usize) {
-        self.data.rewind_to(data_start);
+        if let Some(cut) = self.data.rewind_to(data_start) {
+            if let Err(e) = self.data.view().msync(cut.start, cut.end) {
+                error!(target: "consensus_pack", %e, "failed to flush a failed save's rollback; the pack refuses saves until reopened");
+                self.data.poison();
+            }
+        }
         self.consensus_pos_idx.rewind_to_len(pos_idx_start);
         // 0 can never equal the real data length (always >= DATA_HEADER_BYTES), so
         // `files_consistent` always fails and the next open runs `recover_pack`, which rebuilds
@@ -4730,7 +4793,18 @@ impl Inner {
             .consensus_pos_idx
             .get(number.saturating_sub(self.epoch_meta.start_consensus_number))?
             .consensus_header;
-        self.data.fetch(pos)?.into_consensus()
+        let header = self.data.fetch(pos)?.into_consensus()?;
+        // A position index entry's CRC covers its offsets, not its slot, so an entry misplaced into
+        // another slot still decodes. Bind the header to the number asked for, as
+        // `consensus_header_by_digest` binds it to its digest.
+        if header.number != number {
+            return Err(PackError::CorruptPack(format!(
+                "position index slot for consensus number {number} resolves to the header of \
+                 consensus number {}",
+                header.number
+            )));
+        }
+        Ok(header)
     }
 
     fn persist(&mut self) -> Result<(), PackError> {
@@ -4757,22 +4831,49 @@ impl Inner {
         Ok(())
     }
 
-    /// Read and return all the bytes for consensus number (all batches and the consensus header).
-    fn bytes_for_consensus(&self, number: u64) -> Result<Vec<u8>, PackError> {
+    /// The position index entry for consensus `number`, range-checked and checked against its
+    /// neighbour: every write path (save, import, the WAL rebuild, the legacy v0 layout) appends
+    /// outputs back to back, so an entry starts where the previous one ends (slot 0 ends where
+    /// slot 1 starts). The entry CRC does not bind an entry to its slot, so this catches an entry
+    /// misplaced into another slot before its offsets are served. The last slot needs no
+    /// neighbour: the open checks that it ends at the data length ([`Self::files_consistent`]).
+    fn checked_entry(&self, number: u64) -> Result<IndexPositions, PackError> {
         // Validate the range like consensus_header_by_number; without this a number below
         // start_consensus_number would saturate to index 0 and silently return the epoch's
         // first output instead of an error.
         if number < self.epoch_meta.start_consensus_number {
             return Err(PackError::ConsensusNumberTooLow);
         }
-        if number >= self.epoch_meta.start_consensus_number + self.consensus_pos_idx.len() as u64 {
+        let len = self.consensus_pos_idx.len() as u64;
+        if number >= self.epoch_meta.start_consensus_number + len {
             return Err(PackError::ConsensusNumberTooHigh);
         }
-        let rec_pos_idx = number.saturating_sub(self.epoch_meta.start_consensus_number);
-        let IndexPositions { consensus_header: _, output_start, output_end } = self
-            .consensus_pos_idx
-            .get(rec_pos_idx)
-            .map_err(|e| PackError::ReadError(e.to_string()))?;
+        let slot = number - self.epoch_meta.start_consensus_number;
+        let get = |slot: u64| {
+            self.consensus_pos_idx.get(slot).map_err(|e| PackError::ReadError(e.to_string()))
+        };
+        let entry = get(slot)?;
+        let contiguous = if slot > 0 {
+            get(slot - 1)?.output_end == entry.output_start
+        } else if slot + 1 < len {
+            entry.output_end == get(slot + 1)?.output_start
+        } else {
+            true
+        };
+        if !contiguous {
+            return Err(PackError::CorruptPack(format!(
+                "position index entry for consensus number {number} (bytes {}..{}) is not \
+                 contiguous with its neighbour",
+                entry.output_start, entry.output_end
+            )));
+        }
+        Ok(entry)
+    }
+
+    /// Read and return all the bytes for consensus number (all batches and the consensus header).
+    fn bytes_for_consensus(&self, number: u64) -> Result<Vec<u8>, PackError> {
+        let IndexPositions { consensus_header: _, output_start, output_end } =
+            self.checked_entry(number)?;
         let bytes = self
             .data
             .read_bytes(output_start, output_end)
@@ -4781,20 +4882,10 @@ impl Inner {
     }
 
     /// Return the byte offset in the data file just past the end of the consensus output for
-    /// `number` (the `output_end` of its index entry). Range-checked like `bytes_for_consensus`.
+    /// `number` (the `output_end` of its index entry). Range- and neighbour-checked like
+    /// `bytes_for_consensus` ([`Self::checked_entry`]).
     fn output_end_for_consensus(&self, number: u64) -> Result<u64, PackError> {
-        if number < self.epoch_meta.start_consensus_number {
-            return Err(PackError::ConsensusNumberTooLow);
-        }
-        if number >= self.epoch_meta.start_consensus_number + self.consensus_pos_idx.len() as u64 {
-            return Err(PackError::ConsensusNumberTooHigh);
-        }
-        let rec_pos_idx = number.saturating_sub(self.epoch_meta.start_consensus_number);
-        let pos = self
-            .consensus_pos_idx
-            .get(rec_pos_idx)
-            .map_err(|e| PackError::ReadError(e.to_string()))?;
-        Ok(pos.output_end)
+        Ok(self.checked_entry(number)?.output_end)
     }
 
     /// Return the latest consensus header by reading directly from the pack index,
@@ -5015,47 +5106,88 @@ pub const IMPORT_MIN_FREE_BYTES: u64 = 256 << 20;
 /// How far an import's data log may grow between free-space checks.
 const IMPORT_FREE_CHECK_EVERY: u64 = 64 << 20;
 
-/// Free space a check needs beyond the floor: what the import's files may still take before the
-/// next check. Mmap growth preallocates real blocks up to one growth step
-/// ([`DEFAULT_MAX_MAP_SIZE`](crate::archive::data_file::DEFAULT_MAX_MAP_SIZE)) ahead of what a file
-/// holds, and the data log and the batch-digest index are the files an import grows by whole
+/// Free space a check needs beyond the floor for each import in flight: what one import's files
+/// may still take before its next check. Mmap growth preallocates real blocks up to one growth
+/// step ([`DEFAULT_MAX_MAP_SIZE`](crate::archive::data_file::DEFAULT_MAX_MAP_SIZE)) ahead of what a
+/// file holds, and the data log and the batch-digest index are the files an import grows by whole
 /// steps; the data log also grows by up to [`IMPORT_FREE_CHECK_EVERY`] between checks.
 const IMPORT_FREE_HEADROOM: u64 =
     IMPORT_FREE_CHECK_EVERY + 2 * crate::archive::data_file::DEFAULT_MAX_MAP_SIZE;
 
+/// The stream imports in this process that keep a free-space floor: several epochs can be fetched
+/// at once, all onto the filesystem of the live stores, and each check makes room for every one of
+/// them ([`DiskFloor`]).
+static IMPORTS_IN_FLIGHT: AtomicU64 = AtomicU64::new(0);
+
+/// One import counted in an imports-in-flight counter for as long as it is held.
+struct ImportSlot(&'static AtomicU64);
+
+impl ImportSlot {
+    fn take(in_flight: &'static AtomicU64) -> Self {
+        in_flight.fetch_add(1, Ordering::SeqCst);
+        Self(in_flight)
+    }
+
+    /// The imports in flight, this one included.
+    fn imports(&self) -> u64 {
+        self.0.load(Ordering::SeqCst).max(1)
+    }
+}
+
+impl Drop for ImportSlot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 /// Stops a stream import before free space on `dir`'s filesystem drops below `min_free`. Falling
 /// short is a local condition, not the sending peer's fault (an honest epoch on a nearly full disk
 /// looks the same), so it is an [`io::ErrorKind::StorageFull`] I/O error that charges no penalty.
+///
+/// The floor holds the import's slot in an imports-in-flight counter (the process-wide
+/// [`IMPORTS_IN_FLIGHT`] in production) from its creation until it drops, when the import's
+/// blocking half returns, whatever its outcome. A floor of `0` takes no slot: it never checks, and
+/// its only user is `db load-state`'s restore, which runs offline in its own process, where no
+/// floored import runs beside it.
 struct DiskFloor {
     dir: PathBuf,
     min_free: u64,
     /// The data length at the last check, `None` before the first.
     checked_at: Option<u64>,
+    /// This import's place among the imports in flight; `None` for a floor of `0`.
+    slot: Option<ImportSlot>,
 }
 
 impl DiskFloor {
+    /// A floor of `min_free` for an import into `dir`, counted in `in_flight` unless `min_free` is
+    /// `0`.
+    fn new(dir: PathBuf, min_free: u64, in_flight: &'static AtomicU64) -> Self {
+        let slot = (min_free != 0).then(|| ImportSlot::take(in_flight));
+        Self { dir, min_free, checked_at: None, slot }
+    }
+
     /// Check the free space once the import's data log has grown by [`IMPORT_FREE_CHECK_EVERY`]
     /// since the last check (and on the first call). A check needs [`IMPORT_FREE_HEADROOM`] above
-    /// the floor, so what the import's files take before the next check cannot carry the
-    /// filesystem below it. A floor of `0` (an operator's own restore) never stops the import, and
-    /// an unknown free space does not either: a real shortage still surfaces as a write error.
+    /// the floor for each import in flight, so what their files take before their next checks
+    /// cannot carry the filesystem below it. A floor of `0` (an operator's own restore) never
+    /// stops the import, and an unknown free space does not either: a real shortage still surfaces
+    /// as a write error.
     fn check(&mut self, data_len: u64) -> Result<(), PackError> {
-        if self.min_free == 0
-            || self
-                .checked_at
-                .is_some_and(|at| data_len < at.saturating_add(IMPORT_FREE_CHECK_EVERY))
-        {
+        let Some(slot) = &self.slot else { return Ok(()) };
+        if self.checked_at.is_some_and(|at| data_len < at.saturating_add(IMPORT_FREE_CHECK_EVERY)) {
             return Ok(());
         }
         self.checked_at = Some(data_len);
+        let imports = slot.imports();
+        let headroom = IMPORT_FREE_HEADROOM.saturating_mul(imports);
         match available_space(&self.dir) {
-            Ok(free) if free < self.min_free.saturating_add(IMPORT_FREE_HEADROOM) => {
+            Ok(free) if free < self.min_free.saturating_add(headroom) => {
                 Err(PackError::IO(Arc::new(io::Error::new(
                     io::ErrorKind::StorageFull,
                     format!(
                         "stream import into {} stopped: {free} bytes free, below the {} bytes an \
-                         import must leave plus the {IMPORT_FREE_HEADROOM} its files may take \
-                         before the next check",
+                         import must leave plus the {headroom} the files of the {imports} \
+                         import(s) in flight may take before their next checks",
                         self.dir.display(),
                         self.min_free
                     ),
@@ -5992,11 +6124,22 @@ impl PackError {
     }
 
     /// True for a failure the environment caused rather than a file's contents: an environmental
-    /// index-open failure ([`Self::is_environmental_index_error`]) or an [`PackError::IO`] (which
-    /// the doors return for an environmental data-log open failure). Says nothing about the
-    /// epoch, so the read-side heal does not back off on it and a seal check passes it through.
+    /// index-open failure ([`Self::is_environmental_index_error`]), an [`PackError::IO`] (which
+    /// the doors return for an environmental data-log open failure), or an environmental data-log
+    /// open failure as it came from a read-only check that opens the log with `?` (such as the
+    /// `db repair` recoverability check). Says nothing about the epoch, so the read-side heal does
+    /// not back off on it, a seal check passes it through, and `db repair` reports it as an error
+    /// to retry rather than as damage.
     pub fn is_environmental(&self) -> bool {
-        self.is_environmental_index_error() || matches!(self, PackError::IO(_))
+        self.is_environmental_index_error()
+            || matches!(self, PackError::IO(_))
+            || matches!(
+                self,
+                PackError::Open(open_error) if matches!(
+                    open_error.as_ref(),
+                    OpenError::DataFileOpen(LoadHeaderError::IO(e)) if io_error_is_environmental(e)
+                )
+            )
     }
 
     /// True iff this is the "unwritten data file" open error: the `data` file has a physical size
@@ -10262,6 +10405,62 @@ pub(crate) mod test {
         assert_pack_reads_back(&temp_dir, 3).await;
     }
 
+    /// A position index entry's CRC covers its offsets, not its slot, so a CRC-valid entry copied
+    /// into another slot still decodes. The by-number read must refuse the header it resolves to
+    /// (wrong number), and the byte reads must refuse an entry that is not contiguous with its
+    /// neighbour, instead of serving another output's header or bytes.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_misplaced_position_entry_is_refused_by_number_reads() {
+        use super::PackError;
+        use crate::archive::position_index::index::PDX_HEADER_SIZE;
+        use std::os::unix::fs::FileExt as _;
+
+        let temp_dir = TempDir::with_prefix("test_misplaced_pos_entry").expect("temp dir");
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let committee = fixture.committee();
+        let previous_epoch = test_previous_epoch(&committee);
+        build_test_pack(&temp_dir, &committee, &chain, &previous_epoch, 3).await;
+
+        // Consensus numbers 1..=3 sit in slots 0..=2. Copy slot 2's entry over slot 1.
+        const ENTRY: usize = 28;
+        let pdx =
+            temp_dir.path().join("epoch-0").join(Inner::CONSENSUS_POS_NAME).join("index_pos.pdx");
+        let file = std::fs::OpenOptions::new().read(true).write(true).open(&pdx).expect("open pdx");
+        let slot = |n: usize| (PDX_HEADER_SIZE + n * ENTRY) as u64;
+        let mut entry = [0u8; ENTRY];
+        file.read_exact_at(&mut entry, slot(2)).expect("read slot 2");
+        file.write_all_at(&entry, slot(1)).expect("overwrite slot 1");
+        drop(file);
+
+        let pack = ConsensusPack::open_static(temp_dir.path(), 0)
+            .expect("only the last entry is checked at open");
+        // Slot 1 now resolves to the header of consensus number 3.
+        assert!(
+            matches!(pack.consensus_header_by_number(2).await, Err(PackError::CorruptPack(_))),
+            "a by-number read must refuse a header whose number differs from the one asked for"
+        );
+        // Slot 1 does not start where slot 0 ends.
+        assert!(
+            matches!(pack.get_consensus_output_bytes(2).await, Err(PackError::CorruptPack(_))),
+            "a misplaced entry's bytes must not be served"
+        );
+        assert!(
+            matches!(pack.consensus_output_end(2).await, Err(PackError::CorruptPack(_))),
+            "a misplaced entry's output end must not be served"
+        );
+        // Slot 0 is checked against the slot after it.
+        assert!(
+            matches!(pack.get_consensus_output_bytes(1).await, Err(PackError::CorruptPack(_))),
+            "slot 0 must be checked against the next entry's start"
+        );
+        // The headers of the undamaged slots still read back by number.
+        assert_eq!(pack.consensus_header_by_number(1).await.expect("slot 0").number, 1);
+        assert_eq!(pack.consensus_header_by_number(3).await.expect("slot 2").number, 3);
+        pack.close().await;
+    }
+
     /// A writable open discards only the index that failed to open. A readable position index
     /// survives a broken digest index, and with it the attested output boundaries recovery uses
     /// to tell a torn tail from damage to acked data.
@@ -10329,6 +10528,15 @@ pub(crate) mod test {
             io::Error::from(io::ErrorKind::PermissionDenied)
         ))))
         .is_environmental_index_error());
+        // A data-log open failure as a `?` open returns it: environmental by its I/O error.
+        let data_io = |e: io::Error| {
+            PackError::Open(Arc::new(OpenError::DataFileOpen(LoadHeaderError::IO(e))))
+        };
+        assert!(data_io(io::Error::from_raw_os_error(libc::EMFILE)).is_environmental());
+        assert!(data_io(io::Error::from(io::ErrorKind::PermissionDenied)).is_environmental());
+        assert!(!data_io(io::Error::from(io::ErrorKind::UnexpectedEof)).is_environmental());
+        assert!(!PackError::Open(Arc::new(OpenError::DataFileOpen(LoadHeaderError::Unwritten)))
+            .is_environmental());
     }
 
     /// Re-saving the output already stored under a number is an idempotent no-op (restart replay),
@@ -10834,6 +11042,47 @@ pub(crate) mod test {
             ConsensusPack::open_static(temp_dir.path(), 0).is_err(),
             "dry run must leave the pack damaged"
         );
+    }
+
+    /// A failure the environment caused (descriptor exhaustion here) is no verdict on the pack:
+    /// `repair_epoch` returns it as an error to retry, from its recoverability check and from the
+    /// apply's writable open, never `Unrepairable` with re-sync advice, and a rerun repairs the
+    /// epoch.
+    #[tokio::test]
+    async fn test_repair_epoch_reports_environmental_failures_as_errors() {
+        use super::{ENVIRONMENTAL_NEXT_INDEX_OPEN, ENVIRONMENTAL_NEXT_RECOVERY_CHECK};
+        let temp_dir = TempDir::with_prefix("test_repair_environmental").expect("temp dir");
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let committee = fixture.committee();
+        let previous_epoch = test_previous_epoch(&committee);
+        build_test_pack(&temp_dir, &committee, &chain, &previous_epoch, 4).await;
+        break_index_file(&temp_dir.path().join("epoch-0").join("idx").join("index_pos.pdx"));
+        let data_path = temp_dir.path().join("epoch-0").join(Inner::DATA_NAME);
+        let before = std::fs::read(&data_path).expect("read data");
+
+        for apply in [false, true] {
+            ENVIRONMENTAL_NEXT_RECOVERY_CHECK.with(|fail| fail.set(true));
+            let err = ConsensusPack::repair_epoch(temp_dir.path(), 0, apply)
+                .await
+                .expect_err("an environmental failure is an error, not a verdict");
+            assert!(!ENVIRONMENTAL_NEXT_RECOVERY_CHECK.with(|fail| fail.get()), "the hook fired");
+            assert!(err.is_environmental(), "apply={apply}: got {err:?}");
+            assert_eq!(std::fs::read(&data_path).expect("read data"), before, "nothing changed");
+        }
+
+        ENVIRONMENTAL_NEXT_INDEX_OPEN.with(|fail| fail.set(true));
+        let err = ConsensusPack::repair_epoch(temp_dir.path(), 0, true)
+            .await
+            .expect_err("an environmental failure in the writable open is an error");
+        assert!(!ENVIRONMENTAL_NEXT_INDEX_OPEN.with(|fail| fail.get()), "the hook fired");
+        assert!(err.is_environmental(), "got {err:?}");
+
+        let applied = ConsensusPack::repair_epoch(temp_dir.path(), 0, true)
+            .await
+            .expect("a rerun once the cause is gone");
+        assert!(matches!(applied, EpochRepair::Repaired(_)), "got {applied:?}");
+        assert_pack_reads_back(&temp_dir, 4).await;
     }
 
     /// A legacy (pre-v2) pack has no clean-close sentinel, so `db validate` judges its torn tail by
@@ -11975,6 +12224,55 @@ pub(crate) mod test {
             .expect("read past the cut");
         disk_model::untrack(&data_path);
         assert!(tail.iter().all(|&b| b == 0), "the cut tail's zeros reached the disk");
+    }
+
+    /// The zeros a failed save's rollback writes over the abandoned bytes reach the disk. Those
+    /// bytes may already be on disk (the system's writeback), and no later persist covers a region
+    /// behind the log's end, so zeros left only in memory would let a power loss bring the failed
+    /// save back as a complete output.
+    #[tokio::test]
+    async fn test_rollback_flushes_the_failed_save_it_cuts() {
+        use crate::archive::data_file::disk_model;
+        let temp_dir = TempDir::with_prefix("test_rollback_flush").expect("temp dir");
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let committee = fixture.committee();
+        let previous_epoch = test_previous_epoch(&committee);
+        let data_path = temp_dir.path().join("epoch-0").join(Inner::DATA_NAME);
+        let mut inner =
+            Inner::open_append(temp_dir.path(), &previous_epoch, committee.clone(), PACK_VERSION)
+                .expect("open_append inner");
+        let mut parent = ConsensusHeader::default().digest();
+        for i in 0..2 {
+            let output = make_test_output(&committee, i, chain.clone(), i as u64 + 1, parent);
+            parent = output.digest();
+            inner.save_consensus_output(&output).expect("save output");
+        }
+        inner.persist().expect("persist");
+
+        disk_model::track(&data_path);
+        // A wide output spanning several pages, written in full and then rolled back, as a save
+        // that fails at its last step is; writeback reached the disk before the rollback.
+        let start = inner.data.file_len();
+        let pos_idx_start = inner.consensus_pos_idx.len();
+        let wide = make_wide_test_output(&committee, chain.clone(), 3, parent, 400);
+        inner.save_consensus_output(&wide).expect("save the output to roll back");
+        let end = inner.data.file_len();
+        assert!(end - start > 4 * 16384, "the output spans pages: {}", end - start);
+        inner.data.view().msync(start, end).expect("writeback before the rollback");
+        inner.rollback_output(start, pos_idx_start);
+        std::mem::forget(inner); // crash: no clean close
+        disk_model::power_loss(&data_path);
+        let mut tail = vec![0_u8; (end - start) as usize];
+        File::open(&data_path)
+            .and_then(|mut f| {
+                use std::io::Read as _;
+                f.seek(SeekFrom::Start(start))?;
+                f.read_exact(&mut tail)
+            })
+            .expect("read the rolled-back region");
+        disk_model::untrack(&data_path);
+        assert!(tail.iter().all(|&b| b == 0), "the rolled-back save stays gone");
     }
 
     /// A pack whose first record (the epoch meta) is corrupt must fail `open_append` with
@@ -13708,6 +14006,8 @@ pub(crate) mod test {
     async fn test_stream_import_stops_at_the_free_space_floor() {
         use std::io;
 
+        use std::sync::atomic::AtomicU64;
+
         use crate::consensus_pack::{DiskFloor, PackError, IMPORT_FREE_CHECK_EVERY};
         let temp_dir = TempDir::with_prefix("test_import_floor").expect("temp dir");
         let fixture = CommitteeFixture::builder(MemDatabase::default).build();
@@ -13732,8 +14032,10 @@ pub(crate) mod test {
         assert!(is_storage_full(&err), "got {err:?}");
         assert_nothing_imported(&target);
 
-        let mut floor =
-            DiskFloor { dir: temp_dir.path().to_owned(), min_free: u64::MAX, checked_at: Some(0) };
+        // A counter of its own, so imports other tests run meanwhile do not change the headroom.
+        static IN_FLIGHT: AtomicU64 = AtomicU64::new(0);
+        let mut floor = DiskFloor::new(temp_dir.path().to_owned(), u64::MAX, &IN_FLIGHT);
+        floor.checked_at = Some(0);
         assert!(floor.check(IMPORT_FREE_CHECK_EVERY - 1).is_ok(), "no check within the interval");
         let err = floor.check(IMPORT_FREE_CHECK_EVERY).expect_err("checked after the interval");
         assert!(is_storage_full(&err), "got {err:?}");
@@ -13747,7 +14049,11 @@ pub(crate) mod test {
     fn test_import_floor_keeps_headroom_for_growth() {
         use std::io;
 
+        use std::sync::atomic::AtomicU64;
+
         use crate::consensus_pack::{available_space, DiskFloor, PackError, IMPORT_FREE_HEADROOM};
+        // A counter of its own: each floor below is the only import in flight.
+        static IN_FLIGHT: AtomicU64 = AtomicU64::new(0);
         let temp_dir = TempDir::with_prefix("test_import_floor_headroom").expect("temp dir");
         let dir = temp_dir.path().to_owned();
         let free = available_space(&dir).expect("free space");
@@ -13756,7 +14062,7 @@ pub(crate) mod test {
             "the test needs {} bytes free",
             4 * IMPORT_FREE_HEADROOM
         );
-        let check = |min_free| DiskFloor { dir: dir.clone(), min_free, checked_at: None }.check(0);
+        let check = |min_free| DiskFloor::new(dir.clone(), min_free, &IN_FLIGHT).check(0);
 
         // Above the floor, but by less than the headroom (a margin either way for other writers).
         let err =
@@ -13767,6 +14073,99 @@ pub(crate) mod test {
         );
         check(free - 2 * IMPORT_FREE_HEADROOM).expect("room for the headroom above the floor");
         check(0).expect("no floor");
+    }
+
+    /// Several imports can run at once onto one filesystem, so a check needs the headroom once
+    /// for each import in flight: a floor that leaves room for one import's growth is short with
+    /// three in flight, and has room again once the other two are gone. A floor of zero takes no
+    /// slot.
+    #[test]
+    fn test_import_floor_headroom_scales_with_imports_in_flight() {
+        use std::{
+            io,
+            sync::atomic::{AtomicU64, Ordering},
+        };
+
+        use crate::consensus_pack::{available_space, DiskFloor, PackError, IMPORT_FREE_HEADROOM};
+        static IN_FLIGHT: AtomicU64 = AtomicU64::new(0);
+        let temp_dir = TempDir::with_prefix("test_import_floor_in_flight").expect("temp dir");
+        let dir = temp_dir.path().to_owned();
+        let free = available_space(&dir).expect("free space");
+        assert!(
+            free > 4 * IMPORT_FREE_HEADROOM,
+            "the test needs {} bytes free",
+            4 * IMPORT_FREE_HEADROOM
+        );
+        // Room for two imports' headroom above the floor (a margin either way for other writers).
+        let min_free = free - 2 * IMPORT_FREE_HEADROOM;
+        let floor = || DiskFloor::new(dir.clone(), min_free, &IN_FLIGHT);
+
+        let mut first = floor();
+        first.check(0).expect("one import in flight has room");
+        let second = floor();
+        let mut third = floor();
+        assert_eq!(IN_FLIGHT.load(Ordering::SeqCst), 3);
+        let err = third.check(0).expect_err("three imports in flight need more room");
+        assert!(
+            matches!(&err, PackError::IO(e) if e.kind() == io::ErrorKind::StorageFull),
+            "got {err:?}"
+        );
+        drop((second, third));
+        assert_eq!(IN_FLIGHT.load(Ordering::SeqCst), 1, "a dropped floor releases its slot");
+        first.checked_at = None;
+        first.check(0).expect("room again with one import in flight");
+        drop(first);
+
+        let restore = DiskFloor::new(dir.clone(), 0, &IN_FLIGHT);
+        assert_eq!(IN_FLIGHT.load(Ordering::SeqCst), 0, "a floor of zero takes no slot");
+        drop(restore);
+    }
+
+    /// An import holds its slot among the imports in flight while it runs and releases it when it
+    /// fails, so a failed import does not keep shrinking the room later imports get.
+    #[tokio::test]
+    async fn test_import_slot_is_released_when_an_import_fails() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        use tokio::io::AsyncWriteExt as _;
+
+        static IN_FLIGHT: AtomicU64 = AtomicU64::new(0);
+        let temp_dir = TempDir::with_prefix("test_import_slot").expect("temp dir");
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let previous_epoch = test_previous_epoch(&fixture.committee());
+        // The stream's header and meta only: the import then waits for the outputs.
+        let bytes = peer_stream_bytes(temp_dir.path(), &fixture.committee(), &previous_epoch, &[]);
+        let (mut peer, stream) = tokio::io::duplex(bytes.len() + 1);
+        peer.write_all(&bytes).await.expect("write the stream's start");
+
+        let target = TempDir::with_prefix("test_import_slot_dst").expect("temp dir");
+        let path = target.path().to_owned();
+        let import = tokio::spawn(async move {
+            Inner::stream_import(
+                path,
+                stream,
+                0,
+                &previous_epoch,
+                ConsensusNumHash::new(1, ConsensusHeaderDigest::default()),
+                Duration::from_secs(30),
+                1,
+                &IN_FLIGHT,
+                (),
+            )
+            .await
+            .map(|_| ())
+        });
+        let started = std::time::Instant::now();
+        while IN_FLIGHT.load(Ordering::SeqCst) == 0 {
+            assert!(started.elapsed() < Duration::from_secs(10), "the import never took its slot");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(IN_FLIGHT.load(Ordering::SeqCst), 1);
+        // The peer goes away before the final output: the import fails.
+        drop(peer);
+        import.await.expect("join").expect_err("a stream that ends before its final must fail");
+        assert_eq!(IN_FLIGHT.load(Ordering::SeqCst), 0, "a failed import must release its slot");
+        assert_nothing_imported(&target);
     }
 
     /// A streamed import builds a fresh pack strictly in order, so a header whose number does not
@@ -13988,10 +14387,27 @@ pub(crate) mod test {
 
     /// A rejected import leaves no pack behind: its data log was discarded, not sealed in place.
     fn assert_nothing_imported(target: &TempDir) {
-        assert!(
-            !target.path().join("epoch-0").join(Inner::DATA_NAME).exists(),
-            "a rejected import must not leave its data log behind"
-        );
+        let left = imported_files(target);
+        assert!(left.is_empty(), "a rejected import must leave no files behind: {left:?}");
+    }
+
+    /// Every file under an import's `epoch-0` directory: its data log and its index files (the
+    /// directories that held them may stay).
+    fn imported_files(target: &TempDir) -> Vec<std::path::PathBuf> {
+        fn walk(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
+            let Ok(entries) = std::fs::read_dir(dir) else { return };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    walk(&path, out);
+                } else {
+                    out.push(path);
+                }
+            }
+        }
+        let mut files = Vec::new();
+        walk(&target.path().join("epoch-0"), &mut files);
+        files
     }
 
     /// The backward walk: only the final header is authenticated (against the certified record),
@@ -14209,7 +14625,7 @@ pub(crate) mod test {
     }
 
     /// An import whose future is dropped part way (a shutdown, or a caller that gives up) is
-    /// discarded: its data log is removed, never sealed in place.
+    /// discarded: its data log and index files are removed, never sealed in place.
     #[tokio::test]
     async fn test_abandoned_stream_import_is_discarded() {
         use tokio::io::AsyncReadExt as _;
@@ -14264,12 +14680,12 @@ pub(crate) mod test {
             res = import => panic!("a stalled import must not finish: {res:?}"),
         }
 
-        // The import's files go once it notices; it must not leave a sealed log behind.
+        // The import's files go once it notices; it must not leave a sealed log or index behind.
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        while data.exists() && std::time::Instant::now() < deadline {
+        while !imported_files(&target).is_empty() && std::time::Instant::now() < deadline {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        assert!(!data.exists(), "an abandoned import must be discarded, not sealed");
+        assert_nothing_imported(&target);
     }
 
     /// `batches` forged one-byte-pattern batches of `max_batch_size` each (distinct only by their
@@ -15596,23 +16012,32 @@ pub(crate) mod test {
             ),
         }
 
-        // the peer-sync door: the first streamed record fails to decode
+        // The peer-sync door: the stream's header reads, and its first record, the legacy-layout
+        // meta, fails to decode. Pinned to that decode failure: the default previous record and
+        // final digest would fail the import later anyway (a meta that decoded fails
+        // `verify_epoch_meta`), so a bare `is_err()` would pass whatever the meta decode did. No
+        // free-space floor, so the result does not depend on the disk the test runs on.
         let source = dir.path().join("peer_stream");
         std::fs::write(&source, golden_legacy_pack_bytes()).expect("write peer stream");
         let stream = tokio::fs::File::open(&source).await.expect("open peer stream");
         let imported = TempDir::with_prefix("golden_legacy_non_adiri_import").expect("temp dir");
-        let import = ConsensusPack::stream_import(
+        let import = ConsensusPack::stream_import_with_floor(
             imported.path(),
             stream,
             LEGACY_PACK_EPOCH,
             &EpochRecord::default(),
             ConsensusNumHash::new(LEGACY_PACK_LAST_CONSENSUS, ConsensusHeaderDigest::default()),
             Duration::from_secs(5),
+            0,
         )
         .await;
         assert!(
-            import.is_err(),
-            "peer sync must reject legacy-layout bytes on a post-fork build, got {:?}",
+            matches!(
+                import,
+                Err(super::PackError::UndecodableRecord(ref m)) if m.starts_with("deserialize value")
+            ),
+            "peer sync must reject the legacy-layout meta as undecodable on a post-fork build, got \
+             {:?}",
             import.map(|pack| pack.epoch())
         );
     }
