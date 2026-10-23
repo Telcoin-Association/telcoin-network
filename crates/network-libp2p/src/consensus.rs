@@ -15,6 +15,7 @@ use crate::{
     quic_incoming::QuicIncomingLimits,
     record_exchange::{RecordCodec, RecordExchange, RecordResponse},
     send_or_log_error,
+    serve_permits::ServePermits,
     service_class::{InboundOccupancy, ServiceClass},
     stream::{StreamBehavior, StreamEvent},
     types::{
@@ -559,6 +560,8 @@ where
     record_retry_interval: Duration,
     /// Prometheus metrics for swarm-level events (gossip, requests).
     metrics: SwarmMetrics,
+    /// The application's per-class serve permits, shared with every handle of this swarm.
+    serve_permits: ServePermits,
     /// Rate limit for the warning about inbound connections that a `connection_limits` bound
     /// refuses.
     inbound_denial_warning: InboundDenialWarning,
@@ -889,6 +892,7 @@ where
             ),
             record_retry_interval,
             metrics: SwarmMetrics::new_for(&network_type).with_capacity(&quic_config, budget),
+            serve_permits: ServePermits::new(&network_type, network_config.serve_budget()),
             inbound_denial_warning: InboundDenialWarning::default(),
             listener_error_log: ListenerErrorLog::default(),
             quic_incoming,
@@ -896,8 +900,11 @@ where
     }
 
     /// Return a [NetworkHandle] to send commands to this network.
+    ///
+    /// The handle shares this swarm's serve permits, so every request handler offers inbound
+    /// requests to the same per-class budget.
     pub fn network_handle(&self) -> NetworkHandle<Req, Res> {
-        NetworkHandle::new(self.handle.clone())
+        NetworkHandle::new(self.handle.clone()).with_serve_permits(self.serve_permits.clone())
     }
 
     /// Attach the process-wide source budget before starting the swarm.
@@ -1071,6 +1078,10 @@ where
         // add peer record if address confirmed
         self.swarm.behaviour_mut().kademlia.set_mode(Some(Mode::Server));
         self.provide_our_data();
+        self.swarm
+            .behaviour()
+            .peer_manager
+            .observe_committee_resolution(self.key_config.primary_public_key());
 
         // Startup already published our record. Refresh only after the first full interval,
         // and skip missed ticks to avoid a burst of signing and publication after a stall.
@@ -1122,6 +1133,10 @@ where
             let (pending, deferred) = self.record_exchange.counts();
             self.metrics.set_record_exchange_pending(pending, deferred);
             self.metrics.record_quic_incoming(&self.quic_incoming);
+            self.swarm
+                .behaviour()
+                .peer_manager
+                .observe_committee_resolution(self.key_config.primary_public_key());
             self.metrics.set_pending_incoming_connections(
                 self.swarm.network_info().connection_counters().num_pending_incoming(),
             );
@@ -1439,14 +1454,15 @@ where
                 send_or_log_error!(reply, self.connected_peers.len(), "EstablishedPeerCount");
             }
             NetworkCommand::ConnectedPeers { reply } => {
-                let peers = self
-                    .swarm
-                    .behaviour()
-                    .peer_manager
+                let peer_manager = &self.swarm.behaviour().peer_manager;
+                // current-committee members first (stable order), so a caller that tries
+                // peers in order reaches the peers most likely to hold consensus data first
+                let (committee, others): (Vec<_>, Vec<_>) = peer_manager
                     .connected_or_dialing_peers()
                     .iter()
-                    .flat_map(|id| self.swarm.behaviour().peer_manager.peer_to_bls(id))
-                    .collect();
+                    .flat_map(|id| peer_manager.peer_to_bls(id))
+                    .partition(|bls| peer_manager.is_current_committee_member(bls));
+                let peers: Vec<_> = committee.into_iter().chain(others).collect();
                 debug!(target: "network", ?peers, "peer manager connected peers:");
                 send_or_log_error!(reply, peers, "ConnectedPeers");
             }
@@ -1616,6 +1632,11 @@ where
                 let rpcs = self.swarm.behaviour_mut().peer_manager.current_committee_rpcs();
                 send_or_log_error!(reply, rpcs, "GetAllValidatorRpcs");
             }
+            NetworkCommand::GetCommitteeRpcSnapshot { reply } => {
+                let snapshot = self.committee_rpc_snapshot();
+                self.query_missing_required_records();
+                send_or_log_error!(reply, snapshot, "GetCommitteeRpcSnapshot");
+            }
             NetworkCommand::OpenStream { peer, reply } => {
                 // Look up the peer's PeerId from their BLS key
                 let (peer_id, addrs) = match self.swarm.behaviour().peer_manager.auth_to_peer(peer)
@@ -1679,6 +1700,38 @@ where
         } else {
             self.swarm.behaviour_mut().gossipsub.remove_explicit_peer(peer);
         }
+    }
+
+    /// Read submit advertisements only while their matching signed store record is live.
+    /// The resolution cache deliberately outlives DHT expiry for consensus liveness; that
+    /// cached identity alone cannot prove fresh submit coverage.
+    fn committee_rpc_snapshot(&mut self) -> crate::types::CommitteeRpcSnapshot {
+        let behaviour = self.swarm.behaviour_mut();
+        let snapshot = behaviour.peer_manager.committee_rpc_snapshot();
+        let rpcs: Vec<_> = snapshot
+            .rpcs()
+            .iter()
+            .filter(|(key, rpc)| {
+                behaviour
+                    .kademlia
+                    .store_mut()
+                    .get(&node_record_key(key))
+                    .and_then(|record| NodeRecord::try_decode_compat(&record.value))
+                    .is_some_and(|record| {
+                        record.info.rpc.as_ref() == Some(rpc)
+                            && behaviour
+                                .peer_manager
+                                .record_timestamp(key, record.info.timestamp)
+                                .is_some()
+                    })
+            })
+            .cloned()
+            .collect();
+        crate::types::CommitteeRpcSnapshot::new(
+            snapshot.members().clone(),
+            rpcs,
+            snapshot.advertisements().to_vec(),
+        )
     }
 
     /// Refill required rows after ownership updates, even if the restored peer cache already

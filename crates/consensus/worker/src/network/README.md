@@ -124,6 +124,10 @@ When a worker needs batches it doesn't have locally, `request_batches()` tries c
 one at a time. If a peer is unavailable (it sheds with `Deny`, or a transient stream error occurs),
 the next peer is tried.
 
+Peer order: `connected_peers()` returns current-committee members first. When the caller names a
+preferred authority (the vote-path `synchronize` passes the header author), that peer is tried
+first, because it is the peer most likely to hold the batches.
+
 If **all** peers fail a single pass, the method retries up to `MAX_BATCH_REQUEST_RETRIES` (3)
 times through the full peer list, with a `BATCH_REQUEST_RETRY_DELAY` (500ms) pause between
 attempts. This gives peer capacity time to free up.
@@ -136,13 +140,23 @@ Attempt 2: peer_a → Ack → batches received → return Ok
 
 Key behaviors:
 - **Re-fetches peers** each attempt to pick up newly connected nodes.
+- **Skips failed peers**: a peer that answers `Deny` stays eligible for later passes. A peer that
+  fails in any other way (open error, unsupported protocol, write or read timeout, protocol error)
+  is not tried again in the same call.
 - **Returns immediately** on any partial success (at least one batch received).
 - **Accumulates batches** across retries — digests fulfilled on earlier attempts are removed.
+- **Bounded in total**: the whole call runs under `BATCH_REQUEST_TOTAL_TIMEOUT` (480s). On expiry
+  it returns the batches fetched so far, or `NetworkError::Timeout` if none were fetched.
 - **Returns `RPCError`** only after all retries are exhausted with zero batches.
 
 A transient post-negotiation failure (a slow but sync-capable peer) is classified as a retryable
 failure rather than an "unsupported" verdict, so a momentarily-slow peer is not cached as unusable
 for the rest of the epoch.
+
+Each exchange is bounded step by step: the request write and flush by `SYNC_REQUEST_WRITE_TIMEOUT`
+(5s), the `Ack`/`Deny` read by `SYNC_ACK_TIMEOUT` (5s), and the data read by
+`BATCH_STREAM_TOTAL_TIMEOUT` (210s). A peer that negotiates the sync protocol and then never reads
+the request cannot hold the requester.
 
 ## Security Measures
 
