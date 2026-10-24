@@ -1402,9 +1402,9 @@ async fn test_epoch_vote_already_certified_epoch_dropped_before_verify() -> eyre
 
 /// The epoch-scoped [`PrimaryNetwork`] event loop is torn down and re-spawned every epoch, but it
 /// consumes from the application-scoped `primary_network_events` channel on the [`ConsensusBus`].
-/// That channel is an always-subscribed `QueChannel` with a gap policy, so gossip that arrives while
-/// no `PrimaryNetwork` is running is queued (not dropped) and delivered to the next epoch's network.
-/// Epoch-record voting depends on this; enforce it going forward.
+/// That channel is an always-subscribed `QueChannel` with a gap policy, so gossip that arrives
+/// while no `PrimaryNetwork` is running is queued (not dropped) and delivered to the next epoch's
+/// network. Epoch-record voting depends on this; enforce it going forward.
 ///
 /// This drives the guarantee end-to-end through the real event loop. `NetworkEvent::Gossip` is the
 /// only variant constructible from this crate (`Request`/`Error` carry a `pub(crate)` libp2p
