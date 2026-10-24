@@ -8,8 +8,8 @@ use crate::{
     gossip_config::gossipsub_config,
     kad::{node_record_key, KadStore},
     metrics::{
-        ConnectionLimitReason, InboundFailureOutcome, InboundRejection, PeerManagerMetrics,
-        SwarmMetrics,
+        ConnectionLimitReason, HandshakeDirection, InboundFailureOutcome, InboundRejection,
+        OutboundRequestOutcome, PeerManagerMetrics, SwarmMetrics,
     },
     peers::{self, LoadPenalty, PeerEvent, PeerManager, Penalty, PutRecordRate},
     quic_incoming::QuicIncomingLimits,
@@ -69,6 +69,15 @@ struct PendingInbound {
     class: ServiceClass,
     /// The time that the swarm forwarded the request, for the service time histogram.
     received: Instant,
+}
+
+/// An outbound request that the swarm sent and that has not yet resolved.
+#[derive(Debug)]
+struct PendingOutbound<Res> {
+    /// The caller's channel for the response or the failure.
+    reply: NetworkResponseSender<Res>,
+    /// The time that the swarm sent the request, for the round-trip histogram.
+    sent: Instant,
 }
 
 #[cfg(test)]
@@ -502,8 +511,9 @@ where
     ///
     /// Callers include a oneshot channel for the network to return response. The caller is
     /// responsible for decoding message bytes and reporting peers who return bad data. Peers that
-    /// send messages that fail to decode must receive an application score penalty.
-    outbound_requests: HashMap<(PeerId, OutboundRequestId), NetworkResponseSender<Res>>,
+    /// send messages that fail to decode must receive an application score penalty. Each entry
+    /// carries its send time for the outbound request duration histogram.
+    outbound_requests: HashMap<(PeerId, OutboundRequestId), PendingOutbound<Res>>,
     /// The collection of pending inbound requests.
     ///
     /// Callers include a oneshot channel for the network to return a cancellation notice. The
@@ -1128,6 +1138,32 @@ where
         }
     }
 
+    /// Track an outbound request until its response or failure arrives, stamping the send time
+    /// for the round-trip histogram.
+    fn track_outbound(
+        &mut self,
+        peer: PeerId,
+        request_id: OutboundRequestId,
+        reply: NetworkResponseSender<Res>,
+    ) {
+        self.outbound_requests
+            .insert((peer, request_id), PendingOutbound { reply, sent: Instant::now() });
+    }
+
+    /// Stop tracking the outbound request `(peer, request_id)`, observe its round trip under
+    /// `outcome`, and return the caller's reply channel when the request was still pending.
+    fn resolve_outbound(
+        &mut self,
+        peer: PeerId,
+        request_id: OutboundRequestId,
+        outcome: OutboundRequestOutcome,
+    ) -> Option<NetworkResponseSender<Res>> {
+        self.outbound_requests.remove(&(peer, request_id)).map(|pending| {
+            self.metrics.record_outbound_request_duration(outcome, pending.sent.elapsed());
+            pending.reply
+        })
+    }
+
     /// Process events from the swarm.
     ///
     /// Non-blocking invariant (issue #1656): the swarm task never waits for a gossip publish or
@@ -1141,6 +1177,14 @@ where
         event: SwarmEvent<TNBehaviorEvent<TNCodec<Req, Res>, DB>>,
     ) -> NetworkResult<()> {
         match event {
+            SwarmEvent::ConnectionEstablished { endpoint, established_in, .. } => {
+                // Handshake time of an honest dial (outbound) or of an accepted peer (inbound):
+                // the issue #1741 measurement companion of `connections_established_total`.
+                self.metrics.record_connection_established(
+                    HandshakeDirection::from_dialer(endpoint.is_dialer()),
+                    established_in,
+                );
+            }
             SwarmEvent::ConnectionClosed { peer_id, num_established: 0, .. } => {
                 // Connection-owned rows are gone at the receiver too. A reconnect needs a fresh
                 // direct advertisement even when the bounded publication cache saw this peer
@@ -1485,7 +1529,7 @@ where
                         .behaviour_mut()
                         .req_res
                         .send_request_with_addresses(&peer, request, addr);
-                    self.outbound_requests.insert((peer, request_id), reply);
+                    self.track_outbound(peer, request_id, reply);
                 } else {
                     // Best effort to return an error to caller.
                     let _ = reply.send(Err(NetworkError::PeerMissing));
@@ -1493,7 +1537,7 @@ where
             }
             NetworkCommand::SendRequestDirect { peer, request, reply } => {
                 let request_id = self.swarm.behaviour_mut().req_res.send_request(&peer, request);
-                self.outbound_requests.insert((peer, request_id), reply);
+                self.track_outbound(peer, request_id, reply);
             }
             NetworkCommand::SendRequestAny { request, reply } => {
                 // Rotating an empty list will panic...
@@ -1502,7 +1546,7 @@ where
                 }
                 if let Some(peer) = self.connected_peers.front() {
                     let request_id = self.swarm.behaviour_mut().req_res.send_request(peer, request);
-                    self.outbound_requests.insert((*peer, request_id), reply);
+                    self.track_outbound(*peer, request_id, reply);
                 } else {
                     // Ignore error since this means other end lost interest and we don't really
                     // care.
@@ -1918,7 +1962,8 @@ where
                         }
 
                         // try to forward response to original caller
-                        let _ = self.outbound_requests.remove(&(peer, request_id)).map(|ack| {
+                        let outcome = OutboundRequestOutcome::Response;
+                        let _ = self.resolve_outbound(peer, request_id, outcome).map(|ack| {
                             // The response payload is genuine (we still hold the
                             // matching outbound request). If the responder's BLS
                             // identity has not resolved yet, report a transient
@@ -1992,7 +2037,8 @@ where
                 }
 
                 // try to forward error to original caller
-                let _ = self.outbound_requests.remove(&(peer, request_id)).map(|ack| {
+                let outcome = OutboundRequestOutcome::Failure;
+                let _ = self.resolve_outbound(peer, request_id, outcome).map(|ack| {
                     let _ = ack.send(Err(NetworkError::Outbound(error.into())));
                 });
             }
@@ -2389,7 +2435,7 @@ where
             let (reply, done) = oneshot::channel();
             let request_id =
                 self.swarm.behaviour_mut().req_res.send_request(&peer_id, peer_exchange.into());
-            self.outbound_requests.insert((peer_id, request_id), reply);
+            self.track_outbound(peer_id, request_id, reply);
 
             let timeout = self.config.px_disconnect_timeout;
             let handle = self.network_handle();
@@ -2485,7 +2531,9 @@ where
 
                 // remove from outbound_requests and send error
                 for k in keys {
-                    let _ = self.outbound_requests.remove(&k).map(|ack| {
+                    let (peer, request_id) = k;
+                    let outcome = OutboundRequestOutcome::Failure;
+                    let _ = self.resolve_outbound(peer, request_id, outcome).map(|ack| {
                         let _ = ack.send(Err(NetworkError::Disconnected));
                     });
                 }

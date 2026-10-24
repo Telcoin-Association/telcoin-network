@@ -17,7 +17,7 @@ use tracing::{info, warn};
 pub use trusted::{TrustedNode, TrustedNodeConfigError};
 
 mod quic;
-pub use quic::QuicConfig;
+pub use quic::{InboundAcceptTask, QuicConfig};
 
 impl ConfigTrait for NetworkConfig {}
 

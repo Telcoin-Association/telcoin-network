@@ -123,6 +123,42 @@ CID errors have no dedicated series in this observer. Use endpoint tracing or pa
 for those gaps. They must not be represented by synthetic zero counters. The incoming-cap
 check precedes token parsing, so a cap-denied Initial has a cap outcome without a token outcome.
 
+## Measurement companions (#1741)
+
+Two histograms give the honest-service figures that the inbound capacity qualification
+(`docs/src/network/inbound-capacity-qualification.md`, read by `etc/quic-qualification/measure.py`)
+takes from the node. Both carry the `network` label (`primary` or `worker-{id}`), observe
+seconds, are scoped per swarm and reset on process restart. Their other label is a fixed enum.
+
+| Series | Label | Observation |
+| --- | --- | --- |
+| `tn_network_connection_established_seconds` | `direction`: `inbound`, `outbound` | The swarm's handshake time from the dial or the accept to the established event. |
+| `tn_network_outbound_request_duration_seconds` | `outcome`: `response`, `failure` | The client-side round trip of an outbound consensus request, from the send to its response or to its failure (an outbound failure or a peer disconnect). |
+
+The outbound direction is the honest dial handshake time. The honest dial success fraction
+combines the existing counters, whose direction label is spelled `out`:
+
+```promql
+sum by (instance, network) (increase(tn_network_connections_established_total{direction="out"}[5m]))
+/
+(
+  sum by (instance, network) (increase(tn_network_connections_established_total{direction="out"}[5m]))
+  + sum by (instance, network) (increase(tn_network_dial_failures_total[5m]))
+)
+```
+
+The p99 handshake time of outbound connections:
+
+```promql
+histogram_quantile(0.99, sum by (le) (rate(tn_network_connection_established_seconds_bucket{direction="outbound"}[1m])))
+```
+
+The process-wide histogram buckets run from 0.005 s to 30 s in 12 steps, so a p99.9 estimate
+is bucket-limited: `histogram_quantile` interpolates inside one bucket and returns the upper
+bound of the last finite bucket when the quantile falls in `+Inf`. The scrape tool records the
+bucket bounds it used beside every quantile. An idle denominator yields no fraction; show it
+as unavailable, never as zero.
+
 ## Dependency and verification
 
 The pinned dependency's public endpoint stats omit invalid-token outcomes, incoming slab
