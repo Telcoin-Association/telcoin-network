@@ -63,14 +63,100 @@ No current primary request uses `certificate_sync`. Certificate catch-up and bat
 stream protocol, and the swarm cannot see their class before it forwards them, so they are `other`.
 Thus `other` is not a low-priority class.
 
-The classes only label the metrics below. They do not change admission, queue space or scheduling.
-A message is shed, whatever its class, for one of three reasons. `queue_full`: the queue is full.
-`unsubscribed`: no application task receives from a regular queue. The primary network event queue
-does not use this reason. `admission`: the application drops the request at its admission check. A
+The classes label the swarm metrics below and select the application's
+[serve budget](#serve-permits). They do not change swarm admission, queue space or scheduling.
+A message is shed, whatever its class, for one of five reasons. `queue_full`: the queue is full.
+`unsubscribed`: no application task receives from the queue. The primary network event queue uses
+this reason only for events other than gossip in a gap, see
+[Primary event queue bounds](#primary-event-queue-bounds). `queue_budget`: the primary network
+event queue already holds its gap cap. `admission`: the application drops the request at its
+admission check.
+`serve_budget`: the application's serve budget for the class had no free permit. A
 shed request gets no response: the swarm drops the response channel, libp2p closes the stream, and
 the requester gets a stream error at once. It does not wait for its request timeout. The swarm does
 not schedule by priority, so unanswered requests of any class can fill the queue and make the swarm
 shed votes.
+
+### Primary event queue bounds
+
+The primary network event queue holds the requests and gossip that the swarm forwards to the
+primary. The queue lives for the full process, but its event loop lives for one epoch. A live event
+loop receives each event when it arrives, so the queue can fill only in a gap with no event loop:
+between two epochs, and at start before the first epoch. While an event loop receives from the
+queue, the queue has no caps other than its capacity.
+
+In a gap, the queue holds only gossip, because the epoch votes arrive as gossip between two epochs
+and epoch-record voting needs them. The byte weight of gossip is the length of its data. In one gap
+the queue holds a maximum of 4,000 gossip messages and 32 MiB. The swarm sheds gossip past one of
+these caps as `queue_budget`. It sheds all other events in a gap as `unsubscribed`. A shed request
+drops its response channel, and the peer sends the request again. The certifier sends a vote
+request again until a new proposal replaces it. Peers send epoch-record and stream requests again.
+
+The item cap is less than the queue capacity of 10,000, so the gossip that the queue holds in a gap
+does not fill the queue. The honest burst is approximately 40 rounds of certificates from a
+100-member committee, plus the epoch votes of the committee.
+
+When the event loop of a new epoch subscribes, the queue discards the events other than gossip that
+the previous event loop left. It keeps the gossip in order and sets the gap counts to zero. If the
+gap dropped or discarded events, the primary writes one warning with the number of events kept,
+dropped, over the caps and discarded.
+
+## Serve permits
+
+A serve permit covers the application side of one forwarded request. The request handler asks for
+it after it dequeues the request and before it does any work for it, and the ask does not block.
+The permit ends when the handler drops it: after it sends the response, when it fails, when the
+swarm cancels the request after the request-response timeout (10 s) or a closed connection, or
+when its task is dropped at an epoch boundary. The permit window is distinct from
+`tn_network_inbound_requests_pending`, which the swarm measures from the forward to the response and
+which also spans the event-queue wait. It is also distinct from the event queue, which holds
+requests that no handler has dequeued yet. Gossip has no response and takes no permit.
+
+The primary vote and epoch record handlers and the worker batch report handler take permits. The
+`certificate_sync` and `other` pools exist and export their series, but no handler takes a permit
+from them yet, so their held gauge stays at zero. The pools register all six classes at zero when
+the swarm's network is built, so a missing series means that the metric is not exported, not zero.
+
+The optional `serve_budget` in the YAML `network-config` file sets the permits per class. Every key
+is optional and zero is the default:
+
+```yaml
+serve_budget:
+  vote: 0
+  epoch_record: 0
+  certificate_sync: 0
+  batch: 0
+  other: 0
+```
+
+Zero means unbounded: the handler admits every request of that class and the series only observe.
+A node without this section serves exactly what it served before. A positive value is the number
+of requests of that class in service at once. When every permit is held, the handler sheds the
+request before any work: it drops the response channel, the requester gets a stream error at once,
+and the request counts once under `tn_network_inbound_requests_shed_total{reason="serve_budget"}`.
+The dropped channel also counts an `omitted` failure, as an `admission` shed does. The primary's
+epoch record admission cap runs first, so an epoch record request takes a permit only after it
+passes that cap.
+
+A positive value also bounds each peer. One peer can hold at most 2 permits of an enforcing
+class (`MAX_PERMITS_PER_PEER`). An offer from a peer that already holds 2 is shed under
+`serve_budget`, even when the class has free permits. Without this share, one peer could hold every
+permit of a class, and the node would shed the requests of every other peer in that class. Committee
+peers are exempt from penalties, so peer scoring does not stop a committee peer that does this.
+
+A permit is held for the whole task. A vote task can wait on the vote lock of its author, behind an
+earlier vote request of the same peer, so `tn_network_serve_permits_held{class="vote"}` counts that
+wait as well as the evaluation of a header. The per-peer share limits the wait to one task per peer.
+A batch permit is usually held for milliseconds.
+
+To size a budget, run with zero and watch the peaks of `tn_network_serve_permits_held` per class
+over honest steady state, catch-up and reconnect overlap. For votes, a capacity of at least two
+times the committee size gives every committee member its full share, whatever the other peers do.
+A smaller vote capacity can shed honest proposers while faulty peers hold their shares. Epoch records are bounded by the admission cap of 5 concurrent requests. Batch reports
+scale with the number of committee workers and their batch rate. Set each class above its honest
+peak with headroom. A budget below the honest peak sheds honest requests. The swarm does not
+schedule by priority, so a budget bounds the application's work for a class but does not reserve
+queue space for it. Budget values are not calibrated; the calibration record below applies.
 
 ## Observations
 
@@ -103,10 +189,11 @@ connections, not bytes currently retained. Sum that product over every swarm on 
 Never interpret missing samples as zero. The connection gauges do not give active-stream occupancy.
 
 The service class metrics also have a `class` label with the six values above. The shed counter also
-has a `reason` label (`queue_full`, `unsubscribed` or `admission`). The failure counter also has an
-`outcome` label (`timeout`, `omitted`, `closed`, `io` or `unsupported`). The node registers every
-class, reason and outcome series at zero when the swarm starts, so a missing series means that the
-metric is not exported, not zero.
+has a `reason` label (`queue_full`, `unsubscribed`, `queue_budget`, `admission` or
+`serve_budget`). The failure
+counter also has an `outcome` label (`timeout`, `omitted`, `closed`, `io` or `unsupported`). The
+node registers every class, reason and outcome series at zero when the swarm starts, so a missing
+series means that the metric is not exported, not zero.
 
 | Metric | Meaning |
 | --- | --- |
@@ -114,10 +201,34 @@ metric is not exported, not zero.
 | `tn_network_inbound_request_service_seconds` | Time from sending a request to the application to sending its response. Answered requests only |
 | `tn_network_inbound_requests_shed_total` | Inbound messages dropped before service, by the swarm or at application admission |
 | `tn_network_inbound_requests_failed_total` | Inbound requests sent to the application that got no response |
+| `tn_network_serve_permit_capacity` | Configured serve permits for the class; zero means unbounded |
+| `tn_network_serve_permits_held` | Forwarded requests that hold a serve permit now |
+| `tn_network_serve_requests_offered_total` | Forwarded requests that asked for a serve permit |
+| `tn_network_serve_requests_admitted_total` | Offered requests that got a serve permit |
 
 The exporter can render the service time as a summary (quantiles with `_sum` and `_count`) or as
 buckets. These metrics give queue occupancy and service time by class, not network round-trip time.
-An `admission` shed also counts as an `omitted` failure, so do not add the shed and failure counters.
+An `admission` or `serve_budget` shed also counts as an `omitted` failure, so do not add the shed
+and failure counters.
+
+The serve permit series carry the `network` and `class` labels. Occupancy and headroom are defined
+for bounded classes only, so restrict them to a positive capacity:
+
+```promql
+# Occupancy ratio, 0 to 1, bounded classes only
+tn_network_serve_permits_held / clamp_min(tn_network_serve_permit_capacity, 1)
+  and tn_network_serve_permit_capacity > 0
+# Headroom in permits, bounded classes only
+(tn_network_serve_permit_capacity - tn_network_serve_permits_held)
+  and tn_network_serve_permit_capacity > 0
+# Offered, admitted and shed rates in requests per second
+rate(tn_network_serve_requests_offered_total[5m])
+rate(tn_network_serve_requests_admitted_total[5m])
+rate(tn_network_inbound_requests_shed_total{reason="serve_budget"}[5m])
+# Shed ratio, 0 to 1, only where the offered rate is positive
+rate(tn_network_inbound_requests_shed_total{reason="serve_budget"}[5m])
+  / ignoring(reason) (rate(tn_network_serve_requests_offered_total[5m]) > 0)
+```
 
 ## Reproducible calibration record
 

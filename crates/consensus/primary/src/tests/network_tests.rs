@@ -1402,9 +1402,9 @@ async fn test_epoch_vote_already_certified_epoch_dropped_before_verify() -> eyre
 
 /// The epoch-scoped [`PrimaryNetwork`] event loop is torn down and re-spawned every epoch, but it
 /// consumes from the application-scoped `primary_network_events` channel on the [`ConsensusBus`].
-/// That channel is a `QueChannel::new_always_subscribed()`, so events that arrive while no
-/// `PrimaryNetwork` is running are queued (not dropped) and delivered to the next epoch's network.
-/// Stream commands and epoch-record voting depend on this; enforce it going forward.
+/// That channel is an always-subscribed `QueChannel` with a gap policy, so gossip that arrives
+/// while no `PrimaryNetwork` is running is queued (not dropped) and delivered to the next epoch's
+/// network. Epoch-record voting depends on this; enforce it going forward.
 ///
 /// This drives the guarantee end-to-end through the real event loop. `NetworkEvent::Gossip` is the
 /// only variant constructible from this crate (`Request`/`Error` carry a `pub(crate)` libp2p
@@ -1527,6 +1527,8 @@ async fn test_primary_network_events_queue_across_epoch_restart() -> eyre::Resul
     let spawner_b = epoch_b.get_spawner();
     // A non-panicking re-subscribe is itself proof epoch A's loop released the shared receiver
     // (`subscribe()` panics if a receiver is still checked out).
+    // Re-subscribe as the epoch manager does: the gap policy keeps the epoch-vote gossip sent in
+    // the gap.
     PrimaryNetwork::new(
         app.subscribe_primary_network_events(),
         network_handle.clone(),

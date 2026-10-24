@@ -2,8 +2,9 @@
 //! inbound occupancy of one swarm by class.
 //!
 //! The class set and the reason set are closed, so every metric series with a class or reason
-//! label has a fixed cardinality. The classes label metrics only. They do not change how the
-//! swarm forwards, schedules, or sheds work.
+//! label has a fixed cardinality. The classes label the swarm metrics and select the
+//! application's serve budget (see the `serve_permits` module). They do not change how the swarm
+//! forwards, schedules, or sheds work.
 
 #[cfg(test)]
 #[path = "tests/service_class_tests.rs"]
@@ -55,29 +56,48 @@ impl ServiceClass {
     }
 }
 
-/// The reason that the swarm dropped inbound work before the application received it.
+/// The reason that inbound work was dropped before service.
+///
+/// The swarm drops work before the application receives it (`QueueFull`, `Unsubscribed`,
+/// `QueueBudget`). The application drops a forwarded request before any work for it
+/// (`Admission`, `ServeBudget`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ShedReason {
     /// The bounded application event queue was full.
     QueueFull,
     /// The application queue had no subscriber, so the message was dropped instead of queued.
     Unsubscribed,
+    /// The application queue had no subscriber and already held as many messages or bytes as
+    /// its gap policy allows, so the message was dropped instead of queued.
+    QueueBudget,
     /// The primary dropped an epoch-record request at its admission cap before serving it. The
     /// dropped response channel then also counts the request as an `omitted` failure in
     /// `inbound_requests_failed_total`.
     Admission,
+    /// A request handler dropped a forwarded request because the application's serve budget
+    /// for its class had no free permit. The dropped response channel then also counts the
+    /// request as an `omitted` failure, as for `Admission`.
+    ServeBudget,
 }
 
 impl ShedReason {
     /// Every reason, in label order.
-    pub(crate) const ALL: [Self; 3] = [Self::QueueFull, Self::Unsubscribed, Self::Admission];
+    pub(crate) const ALL: [Self; 5] = [
+        Self::QueueFull,
+        Self::Unsubscribed,
+        Self::QueueBudget,
+        Self::Admission,
+        Self::ServeBudget,
+    ];
 
     /// The metric label value for this reason.
     pub(crate) fn label(self) -> &'static str {
         match self {
             Self::QueueFull => "queue_full",
             Self::Unsubscribed => "unsubscribed",
+            Self::QueueBudget => "queue_budget",
             Self::Admission => "admission",
+            Self::ServeBudget => "serve_budget",
         }
     }
 }

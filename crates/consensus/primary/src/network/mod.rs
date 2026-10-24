@@ -23,7 +23,7 @@ use tn_network_libp2p::{
         NetworkResult,
     },
     write_frame, AdmissionShed, DenyReason, GossipMessage, Penalty, PrimarySyncRequest,
-    ResponseChannel, Stream, StreamError, SyncFrame, SyncFrameError,
+    ResponseChannel, ServiceClass, Stream, StreamError, SyncFrame, SyncFrameError,
 };
 use tn_network_types::{WorkerOthersBatchMessage, WorkerOwnBatchMessage, WorkerToPrimaryClient};
 use tn_storage::{
@@ -38,6 +38,7 @@ use tn_types::{
 };
 use tokio::sync::{mpsc, oneshot, OwnedSemaphorePermit, Semaphore};
 use tracing::{debug, info, warn};
+pub(crate) mod gap_policy;
 pub mod handler;
 mod message;
 mod sync_codec;
@@ -1550,35 +1551,49 @@ where
         channel: ResponseChannel<PrimaryResponse>,
         cancel: oneshot::Receiver<()>,
     ) {
-        // clone for spawned tasks
-        let request_handler = self.request_handler.clone();
-        let network_handle = self.network_handle.clone();
-        let task_name = format!("VoteRequest-{}", header.digest());
+        // Serve budget: offer the request to the vote class before any work for it. `None` means
+        // the class has no free permit; the shed is already counted under `serve_budget`.
+        // Dropping the response channel and the cancel receiver sends no reply, so the swarm
+        // also counts the request as an `omitted` failure, exactly as an admission shed does.
+        // The default budget is unbounded, so this only observes until an operator sets
+        // `serve_budget.vote`. An enforcing vote class also caps each peer at
+        // `MAX_PERMITS_PER_PEER`, so one committee peer cannot hold the whole pool while its
+        // requests wait on its author lock in `RequestHandler::vote`.
+        if let Some(serve_permit) =
+            self.network_handle.handle.serve_permits().try_acquire(ServiceClass::Vote, peer)
+        {
+            // clone for spawned tasks
+            let request_handler = self.request_handler.clone();
+            let network_handle = self.network_handle.clone();
+            let task_name = format!("VoteRequest-{}", header.digest());
 
-        self.task_spawner.spawn_task(task_name, async move {
-            tokio::select! {
-                vote = request_handler.vote(peer, header, parents) => {
-                    // report penalty if any
-                    //
-                    // votes are consensus-critical, so a peer that returns a penalizable
-                    // error must pay the same reputational cost as on every other request
-                    // handler. Route the error through the central PrimaryNetworkError →
-                    // Penalty table before collapsing it into a response, instead of
-                    // silently dropping it.
-                    if let Err(ref e) = vote {
-                        if let Some(penalty) = e.into() {
-                            network_handle.report_penalty(peer, penalty).await;
+            self.task_spawner.spawn_task(task_name, async move {
+                // hold the serve permit for the task's lifetime, so every exit releases it
+                let _serve_permit = serve_permit;
+                tokio::select! {
+                    vote = request_handler.vote(peer, header, parents) => {
+                        // report penalty if any
+                        //
+                        // votes are consensus-critical, so a peer that returns a penalizable
+                        // error must pay the same reputational cost as on every other request
+                        // handler. Route the error through the central PrimaryNetworkError →
+                        // Penalty table before collapsing it into a response, instead of
+                        // silently dropping it.
+                        if let Err(ref e) = vote {
+                            if let Some(penalty) = e.into() {
+                                network_handle.report_penalty(peer, penalty).await;
+                            }
                         }
-                    }
 
-                    let response = vote.into_response();
-                    let _ = network_handle.handle.send_response(response, channel).await;
+                        let response = vote.into_response();
+                        let _ = network_handle.handle.send_response(response, channel).await;
+                    }
+                    // cancel notification from network layer
+                    _ = cancel => (),
                 }
-                // cancel notification from network layer
-                _ = cancel => (),
-            }
-            Ok(())
-        });
+                Ok(())
+            });
+        }
     }
 
     /// Attempt to retrieve consensus chain header from the database.
@@ -1612,31 +1627,41 @@ where
             return;
         };
 
-        // clone for spawned tasks
-        let request_handler = self.request_handler.clone();
-        let network_handle = self.network_handle.clone();
-        let task_name = format!("ConsensusOutputReq-{peer}");
-        self.task_spawner.spawn_task(task_name, async move {
-            // hold the admission permit for the serve's lifetime; dropping it on completion (or
-            // cancel) frees the global slot and decrements the per-peer count
-            let _permit = permit;
-            tokio::select! {
-                header =
-                    request_handler.retrieve_epoch_record(epoch, hash) => {
-                        // penalize peer's reputation for bad request
-                        if let Err(err) = &header {
-                            if let Some(penalty) = err.into() {
-                                network_handle.report_penalty(peer, penalty).await;
+        // Serve budget: after the admission cap, offer the request to the epoch-record class.
+        // `None` sheds it the same way as the admission cap does; the shed is already counted
+        // under `serve_budget`, and the admission permit releases on return. The default budget
+        // is unbounded, so this only observes until an operator sets `serve_budget.epoch_record`.
+        if let Some(serve_permit) =
+            self.network_handle.handle.serve_permits().try_acquire(ServiceClass::EpochRecord, peer)
+        {
+            // clone for spawned tasks
+            let request_handler = self.request_handler.clone();
+            let network_handle = self.network_handle.clone();
+            let task_name = format!("ConsensusOutputReq-{peer}");
+            self.task_spawner.spawn_task(task_name, async move {
+                // hold the admission permit for the serve's lifetime; dropping it on completion
+                // (or cancel) frees the global slot and decrements the per-peer count
+                let _permit = permit;
+                // hold the serve permit for the task's lifetime, so every exit releases it
+                let _serve_permit = serve_permit;
+                tokio::select! {
+                    header =
+                        request_handler.retrieve_epoch_record(epoch, hash) => {
+                            // penalize peer's reputation for bad request
+                            if let Err(err) = &header {
+                                if let Some(penalty) = err.into() {
+                                    network_handle.report_penalty(peer, penalty).await;
+                                }
                             }
+                            let response = header.into_response();
+                            let _ = network_handle.handle.send_response(response, channel).await;
                         }
-                        let response = header.into_response();
-                        let _ = network_handle.handle.send_response(response, channel).await;
-                    }
-                // cancel notification from network layer
-                _ = cancel => (),
-            }
-            Ok(())
-        });
+                    // cancel notification from network layer
+                    _ = cancel => (),
+                }
+                Ok(())
+            });
+        }
     }
 
     /// Process gossip from committee.

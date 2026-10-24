@@ -1210,6 +1210,11 @@ impl AllPeers {
         &self.current_committee
     }
 
+    /// Authoritative previous/current/next slots, including identities not yet resolved.
+    pub(super) fn committee_slots(&self) -> [&HashSet<BlsPublicKey>; 3] {
+        [&self.previous_committee, &self.current_committee, &self.next_committee]
+    }
+
     /// Whether `bls_key` sits in any tracked committee slot (previous, current, or next).
     ///
     /// Committee membership is set every epoch from authoritative consensus state, so this is the
