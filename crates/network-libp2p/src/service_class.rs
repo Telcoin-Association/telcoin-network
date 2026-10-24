@@ -67,8 +67,8 @@ pub(crate) enum ShedReason {
     QueueFull,
     /// The application queue had no subscriber, so the message was dropped instead of queued.
     Unsubscribed,
-    /// The application queue already held as many messages or bytes of the class as its
-    /// budget allows, so the message was dropped instead of queued.
+    /// The application queue had no subscriber and already held as many messages or bytes as
+    /// its gap policy allows, so the message was dropped instead of queued.
     QueueBudget,
     /// The primary dropped an epoch-record request at its admission cap before serving it. The
     /// dropped response channel then also counts the request as an `omitted` failure in

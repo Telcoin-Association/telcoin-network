@@ -64,48 +64,42 @@ stream protocol, and the swarm cannot see their class before it forwards them, s
 Thus `other` is not a low-priority class.
 
 The classes label the swarm metrics below and select the application's
-[serve budget](#serve-permits). They do not change swarm admission or scheduling. They set queue
-space only on the primary network event queue, see
-[Primary event queue bounds](#primary-event-queue-bounds).
+[serve budget](#serve-permits). They do not change swarm admission, queue space or scheduling.
 A message is shed, whatever its class, for one of five reasons. `queue_full`: the queue is full.
-`unsubscribed`: no application task receives from a regular queue. The primary network event queue
-does not use this reason. `queue_budget`: the primary network event queue already holds the item
-cap or the byte cap of the class. `admission`: the application drops the request at its admission
-check.
+`unsubscribed`: no application task receives from the queue. The primary network event queue uses
+this reason only for events other than gossip in a gap, see
+[Primary event queue bounds](#primary-event-queue-bounds). `queue_budget`: the primary network
+event queue already holds its gap cap. `admission`: the application drops the request at its
+admission check.
 `serve_budget`: the application's serve budget for the class had no free permit. A
 shed request gets no response: the swarm drops the response channel, libp2p closes the stream, and
 the requester gets a stream error at once. It does not wait for its request timeout. The swarm does
-not schedule by priority, so on a regular queue unanswered requests of any class can fill the queue
-and make the swarm shed votes. The primary network event queue gives each class its own caps, so
-other classes cannot take the room of votes there.
+not schedule by priority, so unanswered requests of any class can fill the queue and make the swarm
+shed votes.
 
 ### Primary event queue bounds
 
 The primary network event queue holds the requests and gossip that the swarm forwards to the
-primary. It keeps events while no event loop receives them, for example between two epochs. Each
-service class has its own item cap and byte cap. The swarm sheds a message whose class is at a cap
-as `queue_budget`. A class at its caps does not stop another class, so gossip and other traffic
-cannot take the room of votes and epoch-record requests.
+primary. The queue lives for the full process, but its event loop lives for one epoch. A live event
+loop receives each event when it arrives, so the queue can fill only in a gap with no event loop:
+between two epochs, and at start before the first epoch. While an event loop receives from the
+queue, the queue has no caps other than its capacity.
 
-| Class | Item cap | Byte cap |
-| --- | --- | --- |
-| `vote` | 1,000 | 64 MiB |
-| `epoch_record` | 1,000 | 1 MiB |
-| `certificate_sync` | 500 | 4 MiB |
-| `batch` | 500 | 4 MiB |
-| `gossip` | 4,000 | 32 MiB |
-| `other` | 1,000 | 8 MiB |
+In a gap, the queue holds only gossip, because the epoch votes arrive as gossip between two epochs
+and epoch-record voting needs them. The byte weight of gossip is the length of its data. In one gap
+the queue holds a maximum of 4,000 gossip messages and 32 MiB. The swarm sheds gossip past one of
+these caps as `queue_budget`. It sheds all other events in a gap as `unsubscribed`. A shed request
+drops its response channel, and the peer sends the request again. The certifier sends a vote
+request again until a new proposal replaces it. Peers send epoch-record and stream requests again.
 
-The item caps sum to 8,000, less than the queue capacity of 10,000, so this queue does not shed as
-`queue_full`. The byte weight of a request is an estimate from its variable-length parts (header
-payload and parents, parent certificates) plus fixed overheads. The byte weight of gossip is the
-length of its data. At most once every 10 seconds, the primary writes one warning with the number
-of messages shed per class since the last warning.
+The item cap is less than the queue capacity of 10,000, so the gossip that the queue holds in a gap
+does not fill the queue. The honest burst is approximately 40 rounds of certificates from a
+100-member committee, plus the epoch votes of the committee.
 
-When the event loop of a new epoch subscribes, the queue discards the events that are stale in the
-new epoch: requests that the swarm already ended and vote requests for headers from earlier epochs.
-It keeps gossip (including the epoch votes that arrive between the two event loops), epoch-record
-requests, inbound streams and error events.
+When the event loop of a new epoch subscribes, the queue discards the events other than gossip that
+the previous event loop left. It keeps the gossip in order and sets the gap counts to zero. If the
+gap dropped or discarded events, the primary writes one warning with the number of events kept,
+dropped, over the caps and discarded.
 
 ## Serve permits
 

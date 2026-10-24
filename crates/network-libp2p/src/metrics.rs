@@ -1240,8 +1240,8 @@ impl SwarmMetrics {
     /// Count a forward to the application that did not queue its work as shed.
     ///
     /// A full queue counts as [`ShedReason::QueueFull`]. A queue with no subscriber drops the
-    /// work instead of queuing it, so it counts as [`ShedReason::Unsubscribed`]. A queue that
-    /// already holds its budget for the class drops the work too, so it counts as
+    /// work instead of queuing it, so it counts as [`ShedReason::Unsubscribed`]. A queue with no
+    /// subscriber that already holds its gap cap drops the work too, so it counts as
     /// [`ShedReason::QueueBudget`]. A closed queue
     /// occurs at the epoch boundary, not under load, so it is not counted. A broadcast failure
     /// is not a full queue, so it is not counted either.
