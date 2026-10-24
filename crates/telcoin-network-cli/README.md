@@ -370,8 +370,12 @@ Complete tree after the node has run:
   db/                             # execution layer database (Reth/MDBX)
     static_files/                 #   static block data
   consensus-db/                   # consensus protocol database
-    epoch/                        #   per-epoch consensus data (certs, votes, payloads)
-    epochs/                       #   epoch pack files for archive storage
+    tndb/                         #   consensus DB (tndb): one log per environment
+      epoch/                      #     certificates, votes, payloads, last proposal
+      kad/                        #     peer records
+      cache/                      #     batch cache
+      mdbx-migrated               #     marker: the one-time copy from MDBX is done
+    epochs/                       #   per-epoch consensus packs, epoch records, certificate packs
 ```
 
 ## RPC configuration

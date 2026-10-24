@@ -27,6 +27,14 @@ filter = "package(e2e-tests)"
 test-group = "e2e"
 slow-timeout = { period = "720s", terminate-after = 3 }
 
+# tn-storage's tests take seconds, but some wait on background threads (a compaction, a commit
+# round): a hung one fails the run instead of stalling it (a test's `compact_now` also panics
+# after 120 s of its own). The #[ignore]d benches (`*_bench` modules) run for minutes and are
+# left out.
+[[profile.default.overrides]]
+filter = "package(tn-storage) & not test(/_bench::/)"
+slow-timeout = { period = "60s", terminate-after = 5 }
+
 # Fleet-timed crash captures have longer bounded waits than the ordinary e2e lane.
 # Keep the ordinary lane's limits; select this profile explicitly for SIGKILL captures.
 [profile.sigkill]
@@ -47,3 +55,7 @@ filter = "package(e2e-tests)"
 test-group = "e2e"
 retries = 0
 slow-timeout = { period = "720s", terminate-after = 3 }
+
+[[profile.ci.overrides]]
+filter = "package(tn-storage) & not test(/_bench::/)"
+slow-timeout = { period = "60s", terminate-after = 5 }
