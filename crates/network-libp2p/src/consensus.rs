@@ -90,6 +90,9 @@ mod inbound_service_tests;
 #[cfg(test)]
 #[path = "tests/admission_contention.rs"]
 mod admission_contention;
+#[cfg(test)]
+#[path = "tests/catch_up_contention.rs"]
+mod catch_up_contention;
 
 #[cfg(test)]
 #[path = "tests/loop_budget_tests.rs"]

@@ -10,6 +10,7 @@
 * [P2P Network](network/README.md)
   * [Transport](network/transport.md)
   * [Established connection calibration](network/resource-budget.md)
+  * [Vote latency during catch-up](network/catch-up-vote-latency.md)
   * [Handshake-start accounting](network/handshake-starts.md)
   * [Early Identity Refusal](network/early-identity-refusal.md)
   * [Gossip](network/gossip.md)
