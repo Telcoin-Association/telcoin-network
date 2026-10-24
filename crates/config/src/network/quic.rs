@@ -1,7 +1,22 @@
 //! QUIC settings shared by the node and independently resolved transport fixtures.
 
 use serde::{Deserialize, Serialize};
-use std::time::Duration;
+use std::{num::NonZeroUsize, time::Duration};
+
+/// Where a QUIC listener decides on inbound connection attempts and accepts them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "mode")]
+pub enum InboundAcceptTask {
+    /// The shipped default: the listener decides and accepts inside the swarm task.
+    #[default]
+    Inline,
+    /// A measurement prototype for issue #1741: a dedicated task decides and accepts, and
+    /// the accepted handshakes wait in a bounded queue until the swarm takes them.
+    Spawned {
+        /// Accepted handshakes that may wait for the swarm at one time.
+        capacity: NonZeroUsize,
+    },
+}
 
 /// Configure the quic transport for libp2p.
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -33,6 +48,11 @@ pub struct QuicConfig {
     ///
     /// Default `true`. Set `false` only as an operator rollback switch.
     pub retry_unvalidated_incoming: bool,
+    /// Where a listener decides on inbound connection attempts and accepts them.
+    ///
+    /// Default [`InboundAcceptTask::Inline`]. The spawned mode is a measurement prototype
+    /// for issue #1741 and not a production setting.
+    pub inbound_accept_task: InboundAcceptTask,
 }
 
 impl Default for QuicConfig {
@@ -48,6 +68,7 @@ impl Default for QuicConfig {
             max_stream_data: 50 * 1024 * 1024,      // 50MiB
             max_connection_data: 100 * 1024 * 1024, // 100MiB
             retry_unvalidated_incoming: true,
+            inbound_accept_task: InboundAcceptTask::Inline,
         }
     }
 }
@@ -64,14 +85,21 @@ impl QuicConfig {
         config.max_concurrent_stream_limit = self.max_concurrent_stream_limit;
         config.max_stream_data = self.max_stream_data;
         config.max_connection_data = self.max_connection_data;
+        config.inbound_accept_task = match self.inbound_accept_task {
+            InboundAcceptTask::Inline => None,
+            InboundAcceptTask::Spawned { capacity } => Some(capacity),
+        };
         config
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::QuicConfig;
-    use std::time::Duration;
+    use super::{InboundAcceptTask, QuicConfig};
+    use std::{num::NonZeroUsize, time::Duration};
+
+    /// A nondefault accept queue capacity (64).
+    const CAPACITY: NonZeroUsize = NonZeroUsize::MIN.saturating_add(63);
 
     /// Every configurable field must reach the transport, including nondefault operator settings.
     #[test]
@@ -83,6 +111,7 @@ mod tests {
             max_concurrent_stream_limit: 19,
             max_stream_data: 12_345,
             max_connection_data: 54_321,
+            inbound_accept_task: InboundAcceptTask::Spawned { capacity: CAPACITY },
             ..QuicConfig::default()
         };
         let key = libp2p::identity::Keypair::generate_ed25519();
@@ -93,5 +122,38 @@ mod tests {
         assert_eq!(config.max_concurrent_stream_limit, settings.max_concurrent_stream_limit);
         assert_eq!(config.max_stream_data, settings.max_stream_data);
         assert_eq!(config.max_connection_data, settings.max_connection_data);
+        assert_eq!(config.inbound_accept_task, Some(CAPACITY));
+    }
+
+    /// The shipped default keeps the inline path, and the default settings map it to `None`.
+    #[test]
+    fn inline_default_keeps_the_inline_path() {
+        let key = libp2p::identity::Keypair::generate_ed25519();
+        let config = QuicConfig::default().apply_to(libp2p::quic::Config::new(&key));
+        assert_eq!(QuicConfig::default().inbound_accept_task, InboundAcceptTask::Inline);
+        assert_eq!(config.inbound_accept_task, None);
+    }
+
+    /// The accept task setting round-trips through YAML, an explicit spawned section parses,
+    /// and an empty section (or an empty `quic_config`) yields the inline default.
+    #[test]
+    fn inbound_accept_task_round_trips() -> Result<(), serde_yaml::Error> {
+        let spawned = QuicConfig {
+            inbound_accept_task: InboundAcceptTask::Spawned { capacity: CAPACITY },
+            ..QuicConfig::default()
+        };
+        let text = serde_yaml::to_string(&spawned)?;
+        assert!(text.contains("mode: spawned"), "{text}");
+        assert!(text.contains("capacity: 64"), "{text}");
+        let parsed: QuicConfig = serde_yaml::from_str(&text)?;
+        assert_eq!(parsed.inbound_accept_task, spawned.inbound_accept_task);
+        let explicit: QuicConfig =
+            serde_yaml::from_str("inbound_accept_task:\n  mode: spawned\n  capacity: 64\n")?;
+        assert_eq!(explicit.inbound_accept_task, InboundAcceptTask::Spawned { capacity: CAPACITY });
+        let empty: QuicConfig = serde_yaml::from_str("{}")?;
+        assert_eq!(empty.inbound_accept_task, InboundAcceptTask::Inline);
+        let node: crate::NetworkConfig = serde_yaml::from_str("quic_config: {}")?;
+        assert_eq!(node.quic_config().inbound_accept_task, InboundAcceptTask::Inline);
+        Ok(())
     }
 }

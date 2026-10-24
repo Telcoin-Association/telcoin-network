@@ -18,7 +18,7 @@
 // FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 // DEALINGS IN THE SOFTWARE.
 
-use std::{sync::Arc, time::Duration};
+use std::{num::NonZeroUsize, sync::Arc, time::Duration};
 
 use quinn::{
     MtuDiscoveryConfig, VarInt,
@@ -110,6 +110,21 @@ pub struct Config {
     /// Shared counters of the listener decisions. Keep a clone of the [`Arc`]
     /// before the transport is built to read them.
     pub incoming_stats: Arc<IncomingStats>,
+
+    /// Where a listener decides on inbound connection attempts and accepts them.
+    ///
+    /// `None` (default) keeps the inline path: the listener decides and accepts
+    /// inside `Transport::poll`, on the swarm task. `Some(capacity)`: each
+    /// listener spawns one task on the provider runtime that waits for attempts,
+    /// applies the Retry policy and the per-poll outcome cap, runs
+    /// `Incoming::accept`, and queues the accepted handshakes in a bounded channel
+    /// of `capacity` entries until the swarm takes them. The bound is explicit: at
+    /// most `capacity` accepted handshakes wait for the swarm, and
+    /// [`Config::max_incoming`] bounds the attempts ahead of them.
+    ///
+    /// A measurement prototype for telcoin-network issue #1741, not a production
+    /// default.
+    pub inbound_accept_task: Option<NonZeroUsize>,
 }
 
 #[expect(deprecated)]
@@ -144,6 +159,7 @@ impl Config {
             incoming_buffer_size_total: None,
             max_incoming_outcomes_per_poll: 128,
             incoming_stats: Arc::new(IncomingStats::default()),
+            inbound_accept_task: None,
         }
     }
 
@@ -192,6 +208,7 @@ impl From<Config> for QuinnConfig {
             incoming_buffer_size_total,
             max_incoming_outcomes_per_poll: _,
             incoming_stats,
+            inbound_accept_task: _,
         } = config;
         let mut transport = quinn::TransportConfig::default();
         // Disable uni-directional streams.
