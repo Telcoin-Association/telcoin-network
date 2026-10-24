@@ -23,6 +23,102 @@ use tn_types::{
 };
 use tokio::fs::create_dir_all;
 
+/// Loss of two authors produces one idle-time shortfall; restored traffic commits normally.
+///
+/// Paused Tokio time services the production driver's timer, so no wall-clock sleep or
+/// direct call to the observer's expiry or commit methods can make this test pass.
+#[tokio::test(start_paused = true)]
+async fn quorum_loss_and_recovery_through_consensus_driver() -> Result<(), String> {
+    use crate::metrics::test_recorder::TestMetricsRecorder;
+    use futures::{stream, StreamExt, TryStreamExt};
+    use metrics_util::debugging::DebugValue;
+    use tn_test_utils::wait_until;
+
+    let recorder = TestMetricsRecorder::new();
+    let metric = |name: &str| recorder.metric(name);
+    let cb = metrics::with_local_recorder(&recorder, ConsensusBus::new);
+    let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+    let committee = fixture.committee();
+    let config =
+        fixture.authorities().next().ok_or("missing fixture authority")?.consensus_config().clone();
+    let ids: Vec<_> = fixture.authorities().map(|authority| authority.id()).collect();
+    let genesis = Certificate::genesis(&committee).iter().map(|cert| cert.digest()).collect();
+    let (certificates, _) = make_optimal_certificates(&committee, 1..=5, &genesis, &ids);
+    let temp_dir = TempDir::new().map_err(|error| error.to_string())?;
+    let chain = ConsensusChain::new_for_test(temp_dir.path().to_owned(), committee.clone())
+        .await
+        .map_err(|error| error.to_string())?;
+    let schedule =
+        LeaderSchedule::from_store(committee.clone(), &chain, DEFAULT_BAD_NODES_STAKE_THRESHOLD)
+            .await
+            .map_err(|error| error.to_string())?;
+    let protocol =
+        Bullshark::new(committee.clone(), 3, schedule, DEFAULT_BAD_NODES_STAKE_THRESHOLD);
+    cb.app().recent_blocks().send_modify(|blocks| {
+        blocks.push_latest(
+            0,
+            ConsensusNumHash::new(0, ConsensusHeaderDigest::default()),
+            Some(SealedHeader::new(ExecHeader::default(), B256::default())),
+        )
+    });
+    let mut output = cb.subscribe_sequence();
+    let tasks = TaskManager::default();
+    Consensus::spawn(config.clone(), &cb, protocol, &tasks, &chain, None)
+        .await
+        .map_err(|error| error.to_string())?;
+
+    stream::iter(certificates.iter().filter(|cert| cert.round() == 1).take(2).cloned())
+        .then(|certificate| cb.new_certificates().send(certificate))
+        .try_collect::<Vec<_>>()
+        .await
+        .map_err(|error| error.to_string())?;
+    wait_until(
+        Duration::from_secs(35),
+        "idle consensus round has one quorum shortfall",
+        || async {
+            Ok(matches!(
+                metric("tn_primary.round_quorum_shortfalls_total"),
+                Some(DebugValue::Counter(1))
+            ))
+        },
+    )
+    .await
+    .map_err(|error| error.to_string())?;
+    assert!(matches!(metric("tn_primary.rounds_evaluated_total"), Some(DebugValue::Counter(1))));
+    assert!(matches!(metric("tn_primary.last_commit_timestamp_seconds"),
+        Some(DebugValue::Gauge(value)) if value.0 == 0.0));
+
+    // The same certificates include duplicates and late authors from the finalized round.
+    stream::iter(certificates)
+        .then(|certificate| cb.new_certificates().send(certificate))
+        .try_collect::<Vec<_>>()
+        .await
+        .map_err(|error| error.to_string())?;
+    wait_until(Duration::from_secs(5), "restored quorum commits again", || async {
+        Ok(*cb.app().committed_round_updates().borrow() >= 4
+            && matches!(metric("tn_primary.last_commit_timestamp_seconds"),
+                Some(DebugValue::Gauge(value)) if value.0 > 0.0))
+    })
+    .await
+    .map_err(|error| error.to_string())?;
+    assert!(output.try_recv().is_ok());
+    assert!(matches!(
+        metric("tn_primary.round_quorum_shortfalls_total"),
+        Some(DebugValue::Counter(1))
+    ));
+    assert!(matches!(metric("tn_primary.rounds_evaluated_total"),
+        Some(DebugValue::Counter(value)) if value >= 4));
+
+    config.shutdown().notify();
+    wait_until(Duration::from_secs(5), "shutdown disables the quorum observer", || async {
+        Ok(matches!(metric("tn_primary.quorum_observation_active"),
+            Some(DebugValue::Gauge(value)) if value.0 == 0.0))
+    })
+    .await
+    .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
 /// The fold domain separator, duplicated here on purpose (see [`independent_fold`]).
 const FOLD_DOMAIN: &[u8] = b"TN_EPOCH_SEED_FOLD_V1";
 

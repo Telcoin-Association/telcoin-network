@@ -13,12 +13,14 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tn_test_utils::wait_until;
-use tn_types::{get_available_tcp_port, Address, NodeMode, MIN_PROTOCOL_BASE_FEE};
+use tn_types::{
+    get_available_tcp_port, Address, GenesisAccount, NodeMode, MIN_PROTOCOL_BASE_FEE, U256,
+};
 
 use super::common::{
     address_from_word, current_epoch, epoch_seconds_remaining, get_block, get_block_number,
     get_key, get_latest_consensus_header_number, get_node_mode, get_tx_receipt_block,
-    scrape_metrics, send_tel, start_validator_with_args, wait_for_rpc,
+    scrape_metrics, send_tel, start_validator_with_args, wait_for_rpc, WEI_PER_TEL,
 };
 
 /// Where to interrupt the validator relative to its measured epoch schedule.
@@ -114,6 +116,9 @@ impl Endpoint {
             })
     }
 }
+
+/// Genesis-funded sender dedicated to load, leaving `test-source` unused for the recovery probe.
+const LOAD_SOURCE: &str = "sigkill-load-source";
 
 /// Nonce-ordered traffic offered on each bounded observation poll.
 struct Traffic {
@@ -270,7 +275,10 @@ async fn run_network(
     e2e_tests::config_local_testnet_with_worker_fee_configs(
         data,
         Some("restart_test".to_string()),
-        None,
+        Some(vec![(
+            address_from_word(LOAD_SOURCE),
+            GenesisAccount::default().with_balance(U256::from(1_000_000 * WEI_PER_TEL)),
+        )]),
         Some(u32::try_from(timing.epoch.as_secs())?),
         &[],
     )?;
@@ -300,7 +308,7 @@ async fn run_network(
     };
     let traffic = Traffic {
         nonce: Mutex::new(0),
-        key: get_key("test-source"),
+        key: get_key(LOAD_SOURCE),
         recipient: address_from_word(test),
     };
     wait_until(timing.epoch.saturating_mul(3), "measured SIGKILL phase under load", || async {
@@ -401,8 +409,19 @@ async fn run_network(
     assert_same_block(logs, peer, victim, target_height, "restart-target")?;
     let caught_up_height = get_block_number(&peer.rpc.0)?.min(get_block_number(&victim.rpc.0)?);
     assert_same_block(logs, peer, victim, caught_up_height, "catch-up")?;
-    let transaction = traffic.submit(&victim.rpc)?;
-    wait_until(
+    // Validator pools do not gossip transactions. The restarted node may lack the load sender's
+    // earlier pending nonces, so its next load nonce can be queued indefinitely. Use the untouched
+    // genesis-funded account to test execution through the restarted validator independently.
+    let transaction = send_tel(
+        &victim.rpc.0,
+        &get_key("test-source"),
+        traffic.recipient,
+        1,
+        u128::from(MIN_PROTOCOL_BASE_FEE).saturating_mul(100),
+        21_000,
+        0,
+    )?;
+    let executed = wait_until(
         timing.recovery,
         "post-restart transaction executes on both chains (possible divergence)",
         || async {
@@ -410,7 +429,9 @@ async fn run_network(
                 && get_tx_receipt_block(&peer.rpc.0, &transaction).is_ok())
         },
     )
-    .await?;
+    .await;
+    snapshot(logs, data, "transaction-result", &victim_provider, victim).await?;
+    executed?;
     let transaction_height = get_tx_receipt_block(&victim.rpc.0, &transaction)?;
     eyre::ensure!(
         get_tx_receipt_block(&peer.rpc.0, &transaction)? == transaction_height,
