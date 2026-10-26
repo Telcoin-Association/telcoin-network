@@ -119,10 +119,17 @@ of tndb's.
 **The Linux gate** decides M2's performance: each bench at most 1.10× MDBX, with at most one
 explained row up to 1.25×. Run it three times at reth's sizes, pinned to performance cores with
 the temp dir on a real disk (as the engine README's run tip says; the run stops if the temp
-dir is on a tmpfs). From the repository root:
+dir is on a tmpfs), with the drive's autonomous power states off and the CPU governor and energy
+preference at `performance` (the README gives the commands; all three reset on a reboot or a
+sleep). From the repository root:
 
 ```text
-mkdir -p tmp; for i in 1 2 3; do TMPDIR=$PWD/tmp TNDB_RETH_BENCH_N=10000,100000,1000000 cargo test --release -p tndb-b-reth tndb_reth_vs_mdbx -- --ignored --nocapture --test-threads 1 | grep '^|' > reth-bench-$i.txt; done
+mkdir -p tmp; for i in 1 2 3; do TMPDIR=$PWD/tmp TNDB_RETH_BENCH_N=10000,100000,1000000 taskset -c 0-7 cargo test --release -p tndb-b-reth tndb_reth_vs_mdbx -- --ignored --nocapture --test-threads 1 | grep '^|' > reth-bench-$i.txt; done
 ```
 
-Report each cell as the median of the three.
+Report each cell as the median of the three. A consumer NVMe drive syncs a commit at one of two
+speeds and switches during a run, for both engines at once (the README's "Durable write rows on a
+consumer drive"), so a durable write row over 1.10× is the engine's only if it stays over at the
+drive's fast speed (the runs where MDBX's time for that row is lowest) or under
+`TNDB_RETH_BENCH_SYNC=nosync`. Both engines issue the same syncs per commit; a change to tndb's
+commit path that adds one is the engine's cost, whatever the drive does.

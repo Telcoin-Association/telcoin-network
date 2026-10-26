@@ -6,7 +6,7 @@ report MDBX's error codes, so reth's code and reth's MDBX tests run on it unchan
 dup-sort tables are stored as composite keys; the engine has no dup-sort feature.
 
 **Status: pre-production.** The crate is a workspace member, but nothing in TN uses it yet: TN's
-reth database is still MDBX. Next come the Linux gate run of the benchmark below, then TN
+reth database is still MDBX. The benchmark below passed its Linux gate on 2026-10-26. Next comes TN
 integration behind a feature.
 
 The crate docs (`src/lib.rs`) are the reference: the type mapping, the dup layout and the mapping
@@ -125,81 +125,98 @@ module docs give each workload, the data, the timing and where they differ from 
 **The Linux gate** decides: each bench at most 1.10× MDBX, with at most one explained row up to
 1.25×. Run it three times at reth's sizes, on performance cores with the temp dir on a real disk
 (see the engine README's run tip; the run stops if the temp dir is on a tmpfs), and take
-each cell's median. From the repository root:
+each cell's median. Pin the power settings first: the drive's autonomous power states off, and the
+CPU governor and energy preference at `performance` (all three reset on a reboot or a sleep). From
+the repository root, with the performance cores in `taskset` (`lscpu -e` shows which CPUs they are):
 
 ```text
-mkdir -p tmp; for i in 1 2 3; do TMPDIR=$PWD/tmp TNDB_RETH_BENCH_N=10000,100000,1000000 cargo test --release -p tndb-b-reth tndb_reth_vs_mdbx -- --ignored --nocapture --test-threads 1 | grep '^|' > reth-bench-$i.txt; done
+sudo nvme set-feature /dev/nvme0 -f 0x0c -v 0
+echo performance | sudo tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
+echo performance | sudo tee /sys/devices/system/cpu/cpu*/cpufreq/energy_performance_preference
+mkdir -p tmp; for i in 1 2 3; do TMPDIR=$PWD/tmp TNDB_RETH_BENCH_N=10000,100000,1000000 taskset -c 0-7 cargo test --release -p tndb-b-reth tndb_reth_vs_mdbx -- --ignored --nocapture --test-threads 1 | grep '^|' > reth-bench-$i.txt; done
 ```
+
+**Durable write rows on a consumer drive.** A laptop NVMe drive syncs a commit at one of two speeds
+(on the gate laptop about 0.7 ms or about 5 ms), and it switches between them during a run, for
+both engines at once: MDBX's own time for a write row can move 5× from one run to the next, with
+the power settings pinned. tndb and MDBX issue the same syncs per commit (a data `msync`, a size
+sync when the file grew, a meta `msync`), so the drive's state, not the engine, decides which speed
+a row lands on. A durable write row over 1.10× is the engine's only if it stays over with the
+drive at its fast speed (the runs where MDBX's time for that row is lowest) or with
+`TNDB_RETH_BENCH_SYNC=nosync`.
 
 ### Linux run (the gate)
 
 **Run:** Linux x86_64 laptop (i7-1360P, NVMe, ext4), 2026-10-22, the gate command above (three full
-runs at reth's sizes, the temp dir on the NVMe drive). Each cell is the median of its three runs, so
-a ratio need not be the quotient of the two times beside it. **Code:** `5b709590a`, after the gate's
-tuning round (below); "before tuning" is the same command on `26cfa37cc`.
+runs at reth's sizes, the temp dir on the NVMe drive, the power settings pinned, the performance
+cores in `taskset`). Each cell is the median of its three runs, so a ratio need not be the quotient
+of the two times beside it. **Code:** `87f7c81fc`, after the gate's tuning round and the append
+tuning (below); "before tuning" is the same command on `26cfa37cc`. **Verdict (2026-10-26):
+passed.** The one row over 1.10× that is the engine's is the explained dup read; the six durable
+write rows over 1.10× are the drive's (see "Over 1.10× on Linux").
 
 | bench | ops | tndb | MDBX | tndb/MDBX | before tuning |
 |---|--:|--:|--:|--:|--:|
-| CanonicalHeaders.SeqWrite | 1000 | 810.0 ns | 893.0 ns | 0.93 | 0.94 |
-| CanonicalHeaders.RandomWrite | 10 | 72.84 us | 81.74 us | 0.89 | 0.89 |
+| CanonicalHeaders.SeqWrite | 1000 | 832.0 ns | 853.0 ns | 0.97 | 0.94 |
+| CanonicalHeaders.RandomWrite | 10 | 72.25 us | 74.27 us | 0.96 | 0.89 |
 | CanonicalHeaders.SeqRead | 1000 | 33.0 ns | 41.0 ns | 0.80 | 0.83 |
-| CanonicalHeaders.RandomRead | 10 | 147.0 ns | 144.0 ns | 1.02 | 1.38 |
-| HeaderNumbers.SeqWrite | 1000 | 4.03 us | 5.20 us | 0.91 | 0.97 |
-| HeaderNumbers.RandomWrite | 10 | 461.84 us | 481.37 us | 0.96 | 0.98 |
+| CanonicalHeaders.RandomRead | 10 | 147.0 ns | 143.0 ns | 1.03 | 1.38 |
+| HeaderNumbers.SeqWrite | 1000 | 842.0 ns | 864.0 ns | 0.98 | 0.97 |
+| HeaderNumbers.RandomWrite | 10 | 172.75 us | 163.00 us | 0.97 | 0.98 |
 | HeaderNumbers.SeqRead | 1000 | 35.0 ns | 44.0 ns | 0.80 | 0.82 |
-| HeaderNumbers.RandomRead | 10 | 148.0 ns | 144.0 ns | 1.03 | 1.30 |
-| Headers.SeqWrite | 1000 | 5.52 us | 5.86 us | 0.94 | 0.95 |
-| Headers.RandomWrite | 10 | 466.38 us | 482.80 us | 0.96 | 0.96 |
-| Headers.SeqRead | 1000 | 155.0 ns | 163.0 ns | 0.95 | 0.98 |
+| HeaderNumbers.RandomRead | 10 | 147.0 ns | 144.0 ns | 1.02 | 1.30 |
+| Headers.SeqWrite | 1000 | 5.58 us | 5.79 us | 0.95 | 0.95 |
+| Headers.RandomWrite | 10 | 493.36 us | 502.65 us | 0.98 | 0.96 |
+| Headers.SeqRead | 1000 | 154.0 ns | 163.0 ns | 0.95 | 0.98 |
 | Headers.RandomRead | 10 | 251.0 ns | 270.0 ns | 0.93 | 1.05 |
-| BlockBodyIndices.SeqWrite | 1000 | 4.75 us | 4.80 us | 0.99 | 0.97 |
-| BlockBodyIndices.RandomWrite | 10 | 481.48 us | 473.92 us | 1.00 | 0.90 |
-| BlockBodyIndices.SeqRead | 1000 | 57.0 ns | 62.0 ns | 0.92 | 0.87 |
-| BlockBodyIndices.RandomRead | 10 | 158.0 ns | 164.0 ns | 0.96 | 1.25 |
-| BlockOmmers.SeqWrite | 100 | 9.51 us | 9.41 us | 1.02 | 1.00 |
-| BlockOmmers.RandomWrite | 10 | 75.35 us | 83.27 us | 0.90 | 0.97 |
-| BlockOmmers.SeqRead | 100 | 166.0 ns | 163.0 ns | 1.02 | 1.02 |
-| BlockOmmers.RandomRead | 10 | 241.0 ns | 239.0 ns | 1.01 | 1.17 |
-| TransactionHashNumbers.SeqWrite | 1000 | 828.0 ns | 880.0 ns | 0.92 | 0.92 |
-| TransactionHashNumbers.RandomWrite | 10 | 75.73 us | 84.12 us | 0.92 | 0.88 |
+| BlockBodyIndices.SeqWrite | 1000 | 4.92 us | 4.95 us | 1.13 | 0.97 |
+| BlockBodyIndices.RandomWrite | 10 | 469.48 us | 479.88 us | 0.98 | 0.90 |
+| BlockBodyIndices.SeqRead | 1000 | 57.0 ns | 63.0 ns | 0.90 | 0.87 |
+| BlockBodyIndices.RandomRead | 10 | 157.0 ns | 164.0 ns | 0.96 | 1.25 |
+| BlockOmmers.SeqWrite | 100 | 60.06 us | 56.91 us | 1.06 | 1.00 |
+| BlockOmmers.RandomWrite | 10 | 486.90 us | 490.51 us | 0.95 | 0.97 |
+| BlockOmmers.SeqRead | 100 | 168.0 ns | 164.0 ns | 1.02 | 1.02 |
+| BlockOmmers.RandomRead | 10 | 244.0 ns | 241.0 ns | 1.01 | 1.17 |
+| TransactionHashNumbers.SeqWrite | 1000 | 5.00 us | 3.93 us | 1.20 | 0.92 |
+| TransactionHashNumbers.RandomWrite | 10 | 478.60 us | 497.67 us | 0.96 | 0.88 |
 | TransactionHashNumbers.SeqRead | 1000 | 36.0 ns | 45.0 ns | 0.80 | 0.80 |
-| TransactionHashNumbers.RandomRead | 10 | 146.0 ns | 146.0 ns | 1.00 | 1.30 |
-| Transactions.SeqWrite | 100 | 9.60 us | 10.59 us | 0.91 | 0.92 |
-| Transactions.RandomWrite | 10 | 77.09 us | 86.48 us | 0.89 | 0.90 |
-| Transactions.SeqRead | 100 | 153.0 ns | 183.0 ns | 0.84 | 1.01 |
-| Transactions.RandomRead | 10 | 266.0 ns | 272.0 ns | 0.98 | 1.10 |
-| PlainStorageState.SeqWrite | 1095 | 4.81 us | 4.48 us | 0.97 | 0.93 |
-| PlainStorageState.RandomWrite | 10 | 481.74 us | 493.34 us | 0.96 | 0.92 |
-| PlainStorageState.SeqRead | 268 | 66.0 ns | 65.0 ns | 1.02 | 1.03 |
-| PlainStorageState.RandomRead | 10 | 192.0 ns | 171.0 ns | 1.12 | 1.63 |
-| PlainAccountState.SeqWrite | 1000 | 4.87 us | 4.88 us | 1.00 | 0.95 |
-| PlainAccountState.RandomWrite | 10 | 466.60 us | 482.61 us | 0.97 | 0.97 |
+| TransactionHashNumbers.RandomRead | 10 | 145.0 ns | 147.0 ns | 0.99 | 1.30 |
+| Transactions.SeqWrite | 100 | 59.13 us | 59.95 us | 0.99 | 0.92 |
+| Transactions.RandomWrite | 10 | 550.25 us | 590.79 us | 1.03 | 0.90 |
+| Transactions.SeqRead | 100 | 155.0 ns | 184.0 ns | 0.84 | 1.01 |
+| Transactions.RandomRead | 10 | 269.0 ns | 272.0 ns | 0.98 | 1.10 |
+| PlainStorageState.SeqWrite | 1095 | 3.39 us | 4.48 us | 0.85 | 0.93 |
+| PlainStorageState.RandomWrite | 10 | 464.42 us | 458.76 us | 0.97 | 0.92 |
+| PlainStorageState.SeqRead | 268 | 65.0 ns | 65.0 ns | 1.00 | 1.03 |
+| PlainStorageState.RandomRead | 10 | 191.0 ns | 171.0 ns | 1.12 | 1.63 |
+| PlainAccountState.SeqWrite | 1000 | 1.03 us | 944.0 ns | 0.98 | 0.95 |
+| PlainAccountState.RandomWrite | 10 | 74.03 us | 75.43 us | 0.94 | 0.97 |
 | PlainAccountState.SeqRead | 1000 | 59.0 ns | 69.0 ns | 0.86 | 0.88 |
-| PlainAccountState.RandomRead | 10 | 178.0 ns | 168.0 ns | 1.06 | 1.24 |
-| hash append_all (pre 0, write 20000) | 20000 | 307.0 ns | 326.0 ns | 0.93 | 0.93 |
-| hash append_input (pre 0, write 10000) | 10000 | 554.0 ns | 559.0 ns | 0.96 | 0.96 |
-| hash insert_unsorted (pre 10000, write 10000) | 10000 | 779.0 ns | 578.0 ns | 1.06 | 1.05 |
-| hash insert_sorted (pre 10000, write 10000) | 10000 | 286.0 ns | 289.0 ns | 0.99 | 1.01 |
-| hash put_unsorted (pre 10000, write 10000) | 10000 | 398.0 ns | 403.0 ns | 0.99 | 0.99 |
-| hash put_sorted (pre 10000, write 10000) | 10000 | 841.0 ns | 911.0 ns | 0.92 | 0.89 |
-| hash append_all (pre 0, write 200000) | 200000 | 147.0 ns | 145.0 ns | 1.00 | 0.92 |
-| hash append_input (pre 0, write 100000) | 100000 | 174.0 ns | 182.0 ns | 0.98 | 0.99 |
-| hash insert_unsorted (pre 100000, write 100000) | 100000 | 543.0 ns | 568.0 ns | 1.00 | 1.06 |
-| hash insert_sorted (pre 100000, write 100000) | 100000 | 444.0 ns | 409.0 ns | 1.03 | 1.04 |
-| hash put_unsorted (pre 100000, write 100000) | 100000 | 553.0 ns | 559.0 ns | 0.99 | 0.99 |
-| hash put_sorted (pre 100000, write 100000) | 100000 | 433.0 ns | 504.0 ns | 0.86 | 0.87 |
-| hash append_all (pre 0, write 2000000) | 2000000 | 139.0 ns | 148.0 ns | 0.98 | 1.00 |
-| hash append_input (pre 0, write 1000000) | 1000000 | 133.0 ns | 120.0 ns | 1.11 | 1.23 |
-| hash insert_unsorted (pre 1000000, write 1000000) | 1000000 | 667.0 ns | 796.0 ns | 0.85 | 0.84 |
-| hash insert_sorted (pre 1000000, write 1000000) | 1000000 | 241.0 ns | 216.0 ns | 1.10 | 1.02 |
-| hash put_unsorted (pre 1000000, write 1000000) | 1000000 | 666.0 ns | 737.0 ns | 0.90 | 0.99 |
-| hash put_sorted (pre 1000000, write 1000000) | 1000000 | 241.0 ns | 312.0 ns | 0.77 | 0.93 |
-| Get.get | 1000000 | 23.0 ns | 30.0 ns | 0.77 | 0.59 |
+| PlainAccountState.RandomRead | 10 | 177.0 ns | 168.0 ns | 1.05 | 1.24 |
+| hash append_all (pre 0, write 20000) | 20000 | 105.0 ns | 109.0 ns | 0.96 | 0.93 |
+| hash append_input (pre 0, write 10000) | 10000 | 150.0 ns | 150.0 ns | 1.00 | 0.96 |
+| hash insert_unsorted (pre 10000, write 10000) | 10000 | 847.0 ns | 644.0 ns | 1.15 | 1.05 |
+| hash insert_sorted (pre 10000, write 10000) | 10000 | 756.0 ns | 615.0 ns | 1.13 | 1.01 |
+| hash put_unsorted (pre 10000, write 10000) | 10000 | 877.0 ns | 674.0 ns | 1.19 | 0.99 |
+| hash put_sorted (pre 10000, write 10000) | 10000 | 767.0 ns | 827.0 ns | 0.94 | 0.89 |
+| hash append_all (pre 0, write 200000) | 200000 | 139.0 ns | 147.0 ns | 0.94 | 0.92 |
+| hash append_input (pre 0, write 100000) | 100000 | 178.0 ns | 191.0 ns | 0.97 | 0.99 |
+| hash insert_unsorted (pre 100000, write 100000) | 100000 | 609.0 ns | 595.0 ns | 1.03 | 1.06 |
+| hash insert_sorted (pre 100000, write 100000) | 100000 | 449.0 ns | 440.0 ns | 1.02 | 1.04 |
+| hash put_unsorted (pre 100000, write 100000) | 100000 | 591.0 ns | 583.0 ns | 1.02 | 0.99 |
+| hash put_sorted (pre 100000, write 100000) | 100000 | 445.0 ns | 492.0 ns | 0.89 | 0.87 |
+| hash append_all (pre 0, write 2000000) | 2000000 | 139.0 ns | 121.0 ns | 1.16 | 1.00 |
+| hash append_input (pre 0, write 1000000) | 1000000 | 103.0 ns | 98.0 ns | 1.05 | 1.23 |
+| hash insert_unsorted (pre 1000000, write 1000000) | 1000000 | 701.0 ns | 779.0 ns | 0.90 | 0.84 |
+| hash insert_sorted (pre 1000000, write 1000000) | 1000000 | 250.0 ns | 233.0 ns | 1.06 | 1.02 |
+| hash put_unsorted (pre 1000000, write 1000000) | 1000000 | 659.0 ns | 695.0 ns | 0.97 | 0.99 |
+| hash put_sorted (pre 1000000, write 1000000) | 1000000 | 238.0 ns | 301.0 ns | 0.79 | 0.93 |
+| Get.get | 1000000 | 23.0 ns | 31.0 ns | 0.74 | 0.59 |
 | Get.get_by_encoded_key | 1000000 | 23.0 ns | 29.0 ns | 0.79 | 0.55 |
-| Put.put | 1000000 | 50.0 ns | 131.0 ns | 0.38 | 0.42 |
-| Put.append | 1000000 | 50.0 ns | 75.0 ns | 0.67 | 0.71 |
+| Put.put | 1000000 | 48.0 ns | 131.0 ns | 0.37 | 0.42 |
+| Put.append | 1000000 | 48.0 ns | 76.0 ns | 0.63 | 0.71 |
 
-**The tuning round** took every plain `RandomRead` from 1.10 to 1.38 down to 0.93 to 1.06, and the
+**The tuning round** took every plain `RandomRead` from 1.10 to 1.38 down to 0.93 to 1.05, and the
 dup `RandomRead` from 1.63 to 1.12. It made five changes:
 
 - a snapshot resolves each table handle once, for all its read transactions (the engine's
@@ -210,6 +227,10 @@ dup `RandomRead` from 1.63 to 1.12. It made five changes:
   `seek_with_key_tail`);
 - copy-on-write copies a page once.
 
+**The append tuning** that followed copies each row's small pieces without a libc call and splits
+the rightmost leaf of an append without a second descent. It took `hash append_input` at 1M from
+1.11 to 1.05 (CPU only, from 1.10 to 1.02).
+
 `Get.get` went from 17 to 23 ns (0.59 to 0.77 of MDBX) on this machine but not on the Mac, where the
 same path does less work than before; it is not explained.
 
@@ -218,15 +239,20 @@ same path does less work than before; it is not explained.
 - `PlainStorageState.RandomRead` (1.12): reth's storage-slot read, `seek_by_key_subkey`. tndb seeks
   a 52-byte composite key (`address ‖ slot`) in one tree, where MDBX seeks the 20-byte key, then the
   slot in the key's own sub-tree.
-- `hash append_input` at 1M (1.11; the runs 1.21, 1.11 and 1.01): noisy. Each sample is one
-  transaction of 1M appends and its commit (a 49 MiB table), and MDBX's own time ranges from 92 to
-  134 ns over the three runs, tndb's from 111 to 136.
+- Six durable write rows (1.13 to 1.20): `BlockBodyIndices.SeqWrite`,
+  `TransactionHashNumbers.SeqWrite`, `hash insert_unsorted`, `insert_sorted` and `put_unsorted` at
+  10K, and `hash append_all` at 2M. These are the drive's two commit speeds (see "Durable write rows
+  on a consumer drive"). In two more full runs of the same code on 2026-10-26, under the same
+  settings, the six rows read 0.99 to 1.09. Run alone (one row, one engine per process),
+  `append_all` at 2M reads 1.00 and `insert_sorted` at 10K 1.03, with the commits equal in a system
+  call trace. Reserving the file's blocks as it grows, which MDBX does not do, is not the cause: a
+  build with sparse growth, alternated with those two runs, read no better (`append_all` at 2M 1.22
+  and 0.90).
 
-**CPU only:** with the commit syncs off (`TNDB_RETH_BENCH_SYNC=nosync`, one run at 1M),
-`append_input` is 1.10 (57 against 52 ns) and `append_all` at 2M 1.06 (57 against 54 ns), so tndb's
-append costs about 57 ns a row at both sizes. The others are under MDBX: `insert_unsorted` 0.77,
-`insert_sorted` 0.93, `put_unsorted` 0.92, `put_sorted` 0.63. `hash insert_sorted` at 1M is at the
-limit on the durable runs (1.10; the runs 1.10, 1.05 and 1.12).
+**CPU only:** with the commit syncs off (`TNDB_RETH_BENCH_SYNC=nosync`, three runs at 1M),
+`append_input` is 1.02 (54 against 53 ns) and `append_all` at 2M 1.00 (54 against 54 ns). The
+others are under MDBX: `insert_unsorted` 0.79, `insert_sorted` 0.92, `put_unsorted` 0.91,
+`put_sorted` 0.64.
 
 ### Mac run
 

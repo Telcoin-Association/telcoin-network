@@ -52,12 +52,11 @@ does not depend on `tn-storage` or reth. reth's database API on top of it is a s
   a delete in one descent; the read-only open; owned (`RoCursor`) and detached (`TxnCursor`)
   cursors; `insert` (`KeyExists`); prefix steps; MDBX's cursor state after a delete (on the
   follower); `KeyTail`; and the reth adapter, [`tndb-b-reth`](../tndb-b-reth/README.md).
-- **Next:** the Linux gate run (the adapter's benches, each at most 1.10× MDBX with at most one
-  explained row up to 1.25×, plus a fresh run of this crate's: the Linux tables below predate M2);
-  TN integration behind a feature; and the open performance items: the descent of a small random
-  read, dup-table reads, the commit of overflow runs, the one-range `msync` at 16 KiB on macOS,
-  and 1–4 KB values taking a run page at 4 KiB pages (see [Benchmark](#benchmark-tndb-b-vs-mdbx)
-  and the adapter's README).
+- **Next:** a fresh Linux run of this crate's benches (the Linux tables below predate M2; the
+  adapter's benches passed their Linux gate on 2026-10-26, see its README); TN integration behind
+  a feature; and the open performance items: the descent of a small random read, dup-table reads,
+  the commit of overflow runs, the one-range `msync` at 16 KiB on macOS, and 1–4 KB values taking a
+  run page at 4 KiB pages (see [Benchmark](#benchmark-tndb-b-vs-mdbx) and the adapter's README).
 
 ---
 
@@ -1215,6 +1214,11 @@ cores (`lscpu -e` shows which CPUs are which), for example:
 TMPDIR=/path/on/disk taskset -c 0-7 cargo test --release -p tndb-b tndb_b_vs_mdbx -- --ignored --nocapture --test-threads 1
 ```
 
+For the durable rows, also turn off the drive's autonomous power states and set the CPU governor
+and energy preference to `performance` (the adapter README's gate gives the commands). Even then a
+consumer NVMe drive syncs a commit at one of two speeds and switches between them during a run, for
+every engine at once; judge a durable row against MDBX's time for it in the same run.
+
 Environment variables select what runs (the `bench.rs` module docs have the details):
 
 - `TNDB_B_BENCH_N`: entries per bulk table (default 1,000,000).
@@ -1259,7 +1263,7 @@ synced by its own `msync` (one `fdatasync` past 16 runs), and there the "fdatasy
 those msyncs on every commit. They also predate every M2 change (format v2 and its page counters,
 overflow runs, merging, the one-descent delete, the owned and detached cursors). The large-value
 and delete tables further down were taken during M2, each with its code state given. None has
-been rerun on the final M2 code; the Linux gate run will refresh them.
+been rerun on the final M2 code; the adapter's Linux gate ran reth's benches, not these.
 
 #### macOS run
 
