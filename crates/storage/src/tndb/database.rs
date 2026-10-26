@@ -12,7 +12,7 @@ use super::{
     commit::{Committer, Durability},
     compact::Compactor,
     metrics::{TnDbMetrics, UNNAMED_ENV},
-    store::{BatchOp, Core, ScanKind, TableShared},
+    store::{check_read_ksize, BatchOp, Core, ScanKind, TableShared},
     TableId,
 };
 
@@ -272,12 +272,18 @@ fn first_of<T: Table>(core: &Core, kind: ScanKind) -> Option<(T::Key, T::Value)>
 
 fn get<T: Table>(core: &Core, key: &T::Key) -> eyre::Result<Option<T::Value>> {
     let table = table::<T>(core)?;
-    with_key(key, |key| table.get_with(core, key, |bytes| decode::<T::Value>(bytes)))
+    with_key(key, |key| {
+        check_read_ksize(&table, key)?;
+        table.get_with(core, key, |bytes| decode::<T::Value>(bytes))
+    })
 }
 
 fn contains_key<T: Table>(core: &Core, key: &T::Key) -> eyre::Result<bool> {
     let table = table::<T>(core)?;
-    with_key(key, |key| table.contains(core, key))
+    with_key(key, |key| {
+        check_read_ksize(&table, key)?;
+        table.contains(core, key)
+    })
 }
 
 /// A read transaction: reads the tables' published snapshots.
@@ -415,6 +421,7 @@ impl DbTx for TnDbTxMut {
     fn get<T: Table>(&self, key: &T::Key) -> eyre::Result<Option<T::Value>> {
         let table = table::<T>(&self.core)?;
         let encoded = encode_key(key);
+        check_read_ksize(&table, &encoded)?;
         match self.last_write(table.id, &encoded) {
             Some(Some(value)) => Ok(Some(decode::<T::Value>(value))),
             Some(None) => Ok(None),
@@ -429,14 +436,9 @@ impl DbTxMut for TnDbTxMut {
         let start = self.bytes.len();
         encode_key_into(&mut self.bytes, key)?;
         let key_end = self.bytes.len();
-        let fixed = shared.ksize();
-        if fixed != 0 && key_end - start != fixed as usize {
+        if let Err(e) = check_read_ksize(&shared, &self.bytes[start..key_end]) {
             self.bytes.truncate(start);
-            eyre::bail!(
-                "tndb: a {}-byte key in table {} of {fixed}-byte keys",
-                key_end - start,
-                T::NAME
-            );
+            return Err(e);
         }
         if let Err(e) = encode_into_buffer(&mut self.bytes, value) {
             self.bytes.truncate(start);
@@ -451,6 +453,10 @@ impl DbTxMut for TnDbTxMut {
         let shared = table::<T>(&self.core)?;
         let start = self.bytes.len();
         encode_key_into(&mut self.bytes, key)?;
+        if let Err(e) = check_read_ksize(&shared, &self.bytes[start..]) {
+            self.bytes.truncate(start);
+            return Err(e);
+        }
         let write = TxWrite { key: start..self.bytes.len(), value: None };
         self.table_mut(shared).writes.push(write);
         Ok(())

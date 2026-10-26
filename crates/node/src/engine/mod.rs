@@ -49,15 +49,14 @@ pub struct TnBuilder {
     ///
     /// The metrics will be served at the given interface and port.
     pub metrics: Option<SocketAddr>,
-    /// Optional TCP port to start healthcheck service.
-    /// If a port is provided, the healthcheck service will spawn. Otherwise, no healthcheck
-    /// service starts.
+    /// Optional healthcheck listener bind. `None` starts no listener.
     ///
-    /// IMPORTANT: only enable healthcheck if the endpoint is protected by a firewall. The
-    /// liveness route responds unconditionally; `/health/workers` reports transaction acceptance
-    /// and `/health/network` reports cached swarm reachability and established-peer counts,
-    /// returning 503 while not-ready. This reads from the `HEALTHCHECK_TCP_PORT` env var.
-    pub healthcheck: Option<u16>,
+    /// A bare port binds IPv4 loopback; an explicit socket address binds that interface (a
+    /// wildcard has to be written out). The liveness route responds unconditionally;
+    /// `/health/workers` reports transaction acceptance and `/health/network` reports cached
+    /// swarm reachability and established-peer counts, returning 503 while not-ready. Read from
+    /// `--healthcheck` / `HEALTHCHECK_TCP_PORT`. A bind failure fails node startup (#1689).
+    pub healthcheck: Option<crate::health::HealthcheckBind>,
     /// Export each epoch's final execution state to a snapshot pack when set.
     pub enable_state_export: bool,
     /// Maximum completed export bundles to retain, or unlimited when absent.

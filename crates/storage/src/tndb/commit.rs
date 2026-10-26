@@ -63,7 +63,8 @@ pub(super) struct Durability {
     durable_changed: Condvar,
     /// The first failure, if any (never cleared).
     failed: Mutex<Option<String>>,
-    /// Set by every failure but damage a read found ([`Self::fail_damaged`]): a failed sync, a
+    /// Set by every failure but those [`Self::fail_damaged`] latches (damage a read found, a
+    /// failure before anything was appended): a failed sync, a
     /// writer that stopped part way or a panic leaves the log's state on disk unknown, so it must
     /// never be sealed as clean. Kept apart from `failed`, which holds only the first cause, so a
     /// sync failing after a read's damage still blocks the seal.
@@ -84,6 +85,9 @@ pub(super) struct Durability {
     /// Test-only: the commit thread's next sync fails.
     #[cfg(test)]
     pub(super) fail_next_sync: std::sync::atomic::AtomicBool,
+    /// Test-only: the commit thread's next `fsync` of the log's growth fails after the call.
+    #[cfg(test)]
+    pub(super) fail_next_growth_sync: std::sync::atomic::AtomicBool,
     /// Test-only: the syncs of this database's log so far.
     #[cfg(test)]
     pub(super) syncs: AtomicU64,
@@ -117,6 +121,8 @@ impl Durability {
             stopped: AtomicBool::new(false),
             #[cfg(test)]
             fail_next_sync: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            fail_next_growth_sync: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
             syncs: AtomicU64::new(0),
             #[cfg(test)]
@@ -196,8 +202,9 @@ impl Durability {
     }
 
     /// Latch damage a read found (see `Core::read_damaged`; a removal's lookup too, see
-    /// `Writer::latch_if_poisoned`): every later write and persist fails, as after any failure,
-    /// but the log itself is as it was, so the close still seals it.
+    /// `Writer::latch_if_poisoned`), or an I/O failure before anything was appended (a table's
+    /// registration or first-row setup, see `Core::fail_setup`): every later write and persist
+    /// fails, as after any failure, but the log itself is as it was, so the close still seals it.
     pub(super) fn fail_damaged(&self, cause: String) {
         self.latch(cause);
     }
@@ -384,7 +391,21 @@ fn sync_round(core: &Core) {
         // every growth below the frontier's end.
         let growths = sync.growths.load(Ordering::Acquire);
         if growths != sync.size_synced.load(Ordering::Relaxed) {
-            fsync_file(&sync.file)?;
+            let grown = fsync_file(&sync.file);
+            #[cfg(test)]
+            let grown = grown.and_then(|()| {
+                match durability.fail_next_growth_sync.swap(false, Ordering::Relaxed) {
+                    true => Err(std::io::Error::other("injected growth sync failure")),
+                    false => Ok(()),
+                }
+            });
+            if let Err(e) = grown {
+                // A barrier on the log run outside it (a duplicate descriptor): latch the log's
+                // poison through its view, as a failed `MapView::msync` does, so its close never
+                // seals it however it is dropped, not only through the writer's `log_unknown`.
+                sync.view.poison();
+                return Err(e);
+            }
             sync.size_synced.store(growths, Ordering::Relaxed);
         }
         Ok(())

@@ -1,4 +1,11 @@
 //! Pack file for storing Certificates, indexed by certificate digest (header hash).
+//!
+//! One exception to the crate's rule that an absent file beside an index that attests data counts
+//! as corrupt, never new: a writable open whose data log (`cert_data`) is missing starts a new log
+//! and discards a leftover digest index (`cert_hash/`), with a warning naming both files when that
+//! index attests certificates. Nothing in production reads a certificate pack (it is written for
+//! the current epoch and sealed; past epochs' packs are not reopened), and refusing would stop the
+//! node over an archive. `EpochRecordDb` refuses the same shape (`CorruptLog`).
 
 use std::{
     error::Error, fmt::Display, fs::File, hash::BuildHasherDefault, io, path::Path, sync::Arc,
@@ -15,6 +22,7 @@ use tracing::{error, info, warn};
 
 use crate::{
     archive::{
+        data_file::create_dir_synced,
         digest_index::HdxIndex,
         error::{fetch::FetchError, open::OpenError},
         fxhasher::FxHasher,
@@ -372,8 +380,9 @@ impl Inner {
     /// The lock is `flock(LOCK_EX)` (what [`File::lock`] is on Linux and macOS) on a file of its
     /// own. It belongs to the open file description, so two opens in one process exclude each
     /// other, and the kernel drops it when the holder's file closes, crash included, so a stale
-    /// lock file never blocks. The wait runs on the pack's own thread; meanwhile saves queue, and
-    /// `try_save` reports `SendFull` once the channel fills.
+    /// lock file never blocks. The wait runs on the pack's own thread, logged with a warning when
+    /// the lock is not free at once; meanwhile saves queue, and `try_save` reports `SendFull` once
+    /// the channel fills.
     fn lock_epoch_dir(base_dir: &Path) -> Result<File, PackError> {
         let file = std::fs::OpenOptions::new()
             .read(true)
@@ -381,9 +390,29 @@ impl Inner {
             .create(true)
             .truncate(false)
             .open(base_dir.join(Self::LOCK_NAME))?;
+        // Say so when a previous writer holds it: the wait has no bound, and saves queue meanwhile.
+        match file.try_lock() {
+            Ok(()) => return Ok(file),
+            Err(std::fs::TryLockError::WouldBlock) => warn!(
+                target: "cert-pack",
+                dir = %base_dir.display(),
+                "waiting for the previous writer of this epoch's certificate pack to finish its seal"
+            ),
+            Err(std::fs::TryLockError::Error(e)) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(std::fs::TryLockError::Error(e)) => return Err(e.into()),
+        }
+        let started = std::time::Instant::now();
         loop {
             match file.lock() {
-                Ok(()) => return Ok(file),
+                Ok(()) => {
+                    info!(
+                        target: "cert-pack",
+                        dir = %base_dir.display(),
+                        waited_ms = started.elapsed().as_millis() as u64,
+                        "took the certificate pack's writer lock"
+                    );
+                    return Ok(file);
+                }
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
                 Err(e) => return Err(e.into()),
             }
@@ -407,6 +436,36 @@ impl Inner {
         .map_err(Into::into)
     }
 
+    /// Before a writable open of a missing data log discards a leftover digest index: warn, naming
+    /// both files, if that index attests certificates (or cannot be read to tell), since their log
+    /// is gone. Logging only; an index that attests nothing past a header is discarded quietly.
+    fn warn_of_a_lost_log(base_dir: &Path, data: &Pack<Certificate>) {
+        let index = base_dir.join(Self::HASH_NAME);
+        // A stat error counts as present: the open below then reports what it is.
+        if !index.try_exists().unwrap_or(true) {
+            return;
+        }
+        let log = base_dir.join(Self::DATA_NAME);
+        match Self::try_open_index(base_dir, data, true).map(|idx| idx.data_file_length()) {
+            Ok(attested) if attested <= data.file_len() => {}
+            Ok(attested) => warn!(
+                target: "cert-pack",
+                log = %log.display(),
+                index = %index.display(),
+                attested,
+                "the certificate log is missing beside an index that attests {attested} bytes of \
+                 it; those certificates are lost, and a new log and index start in their place"
+            ),
+            Err(e) => warn!(
+                target: "cert-pack",
+                log = %log.display(),
+                index = %index.display(),
+                "the certificate log is missing beside an index that could not be read ({e}); \
+                 a new log and index start in their place"
+            ),
+        }
+    }
+
     /// Discard the digest index sidecar directory and reopen a fresh (empty) copy for rebuild. A
     /// missing directory is tolerated. Mirrors `ConsensusPack`'s index reset
     /// (`open_indexes_for_append`).
@@ -423,7 +482,8 @@ impl Inner {
     /// `ConsensusPack::recover_pack`). Capture `logical_position()` before each `next()` as the
     /// cert's stored offset, advance the consistent end only past a fully-decoded cert, and stop at
     /// the first torn/short cert so an incomplete tail is dropped; then roll the log back to that
-    /// end, flush the zeros written over the cut, and reconcile the digest marker. Keyed by
+    /// end whenever bytes remain past it (a tail too short for a size prefix included), flush the
+    /// zeros written over the cut, and reconcile the digest marker. Keyed by
     /// `Certificate::digest`, matching [`Self::save`]. A read the disk fails is an error, never a
     /// tear: the log is left as it is for a retry.
     fn rebuild_index(
@@ -460,7 +520,10 @@ impl Inner {
         // `iter` owns a cloned file handle, but drop it before `rewind_to` for clarity.
         drop(iter);
         let file_len = data.file_len();
-        if torn && consistent_end < file_len {
+        // Any bytes past the last whole record are a tail to cut: a record that failed to decode,
+        // or 1-3 bytes too short for a size prefix, on which the walk ends without an error.
+        // Kept, they would be sealed as data and misframe every record appended after them.
+        if consistent_end < file_len {
             let dropped = file_len - consistent_end;
             if sealed {
                 // Fail closed rather than zeroing committed, durably-acked certificates (INV4).
@@ -476,6 +539,7 @@ impl Inner {
                 consistent_end,
                 file_len,
                 dropped_bytes = dropped,
+                torn,
                 "certificate log has a torn tail; truncating the unacked bytes and rebuilding the index"
             );
             if let Some(cut) = data.rewind_to(consistent_end) {
@@ -549,7 +613,7 @@ impl Inner {
     fn open<P: AsRef<Path>>(path: P, read_only: bool) -> Result<Self, PackError> {
         let base_dir = path.as_ref();
         if !read_only {
-            let _ = std::fs::create_dir_all(base_dir);
+            create_dir_synced(base_dir)?;
         }
         // Before touching any pack file: wait out a previous writer of this epoch.
         let epoch_lock = if read_only { None } else { Some(Self::lock_epoch_dir(base_dir)?) };
@@ -569,7 +633,10 @@ impl Inner {
         let mut digest_idx = if fresh && !read_only {
             // A new log starts with a new index. A leftover `cert_hash/` (only the data file was
             // deleted) opens fine, as its header matches any cert log, but its entries point
-            // into a log that no longer exists.
+            // into a log that no longer exists. Discarding it is this pack's exception to the
+            // crate's rule that an absent file beside an index that attests data counts as
+            // corrupt (see the module docs), so say what is discarded.
+            Self::warn_of_a_lost_log(base_dir, &data);
             Self::reset_index(base_dir, &data)?
         } else {
             match Self::try_open_index(base_dir, &data, read_only) {
@@ -1087,6 +1154,52 @@ mod test {
         );
     }
 
+    /// An UNCLEAN cert log ending in 1-3 bytes past its last record (too short for a size prefix,
+    /// so the rebuild's walk ends there without an error) is cut back to that record: kept, the
+    /// bytes would be sealed as data, and the next cert appended after them would misframe.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_cert_rebuild_cuts_a_tail_shorter_than_a_size_prefix() {
+        let temp_dir = TempDir::with_prefix("cert_short_tail").expect("temp dir");
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let dir = temp_dir.path().join("epoch-0");
+
+        let mut certs = Vec::new();
+        {
+            let mut inner = super::Inner::open(&dir, false).expect("open pack");
+            for i in 0..4usize {
+                let cert = make_unique_cert(&fixture, i);
+                inner.save(&cert).expect("save cert");
+                certs.push(cert);
+            }
+            inner.persist().expect("persist");
+            // A clean close leaves no padding: the file is the records, then the sentinel.
+        }
+
+        // Unclean, with 2 bytes past the last record: the sentinel stripped and 2 bytes written.
+        let data_path = dir.join(super::Inner::DATA_NAME);
+        let end = {
+            let f = std::fs::OpenOptions::new().write(true).open(&data_path).expect("open data");
+            let end = f.metadata().expect("meta").len() - crate::archive::data_file::SENTINEL_LEN;
+            f.set_len(end).expect("strip the sentinel");
+            std::os::unix::fs::FileExt::write_all_at(&f, &[0xab, 0xcd], end).expect("short tail");
+            end
+        };
+
+        let mut inner = super::Inner::open(&dir, false).expect("reopen cuts the short tail");
+        assert_eq!(inner.data.file_len(), end, "the log ends at its last record");
+        for cert in &certs {
+            assert!(inner.contains(cert.digest()), "every cert is kept");
+        }
+        let next = make_unique_cert(&fixture, 4);
+        inner.save(&next).expect("save after the cut");
+        inner.persist().expect("persist");
+        simulate_crash(inner);
+        let mut inner =
+            super::Inner::open(&dir, false).expect("the next rebuild frames every record");
+        assert!(inner.contains(next.digest()), "the cert appended after the cut is found");
+        assert!(inner.contains(certs[3].digest()), "and the ones before it");
+    }
+
     /// Model a crash: skip `inner`'s clean close, so neither the log nor the index is sealed, but
     /// release the epoch lock as the dying process's closed descriptors would.
     fn simulate_crash(mut inner: super::Inner) {
@@ -1248,16 +1361,21 @@ mod test {
     }
 
     /// A new data file paired with a leftover `cert_hash/` (only the data file was deleted) must
-    /// not inherit the old index: its entries point into a log that no longer exists.
+    /// not inherit the old index: its entries point into a log that no longer exists. The open
+    /// keeps going (nothing reads past certificate packs) but warns that the attested
+    /// certificates are lost; a brand-new pack opens quietly.
     #[tokio::test(flavor = "multi_thread")]
     async fn fresh_data_file_discards_a_leftover_index() {
+        use crate::consensus_pack::test::warnings_and_errors;
         let temp_dir = TempDir::with_prefix("cert_leftover_index").expect("temp dir");
         let fixture = CommitteeFixture::builder(MemDatabase::default).build();
         let dir = temp_dir.path().join("epoch-0");
 
         // A populated pack, cleanly closed.
         {
-            let mut inner = super::Inner::open(&dir, false).expect("open pack");
+            let (inner, levels) = warnings_and_errors(|| super::Inner::open(&dir, false));
+            assert!(levels.is_empty(), "a brand-new pack opens quietly: {levels:?}");
+            let mut inner = inner.expect("open pack");
             for i in 0..8usize {
                 inner.save(&make_unique_cert(&fixture, i)).expect("save cert");
             }
@@ -1266,7 +1384,9 @@ mod test {
         std::fs::remove_file(dir.join(super::Inner::DATA_NAME)).expect("remove the data file");
 
         // A new log, filled past where the old certs sat.
-        let mut inner = super::Inner::open(&dir, false).expect("open over a leftover index");
+        let (inner, levels) = warnings_and_errors(|| super::Inner::open(&dir, false));
+        let mut inner = inner.expect("open over a leftover index");
+        assert_eq!(levels, vec![tracing::Level::WARN], "the lost log is reported");
         for i in 100..116usize {
             inner.save(&make_unique_cert(&fixture, i)).expect("save cert");
         }
@@ -1414,6 +1534,34 @@ mod test {
             out.status,
             String::from_utf8_lossy(&out.stderr)
         );
+    }
+
+    /// Taking the epoch's writer lock logs nothing when it is free, and a warning when a previous
+    /// writer holds it (the wait has no bound), then takes it once that writer lets go.
+    #[test]
+    fn lock_epoch_dir_warns_while_a_previous_writer_holds_it() {
+        use crate::consensus_pack::test::warnings_and_errors;
+        let temp_dir = TempDir::with_prefix("cert_lock_wait").expect("temp dir");
+        let dir = temp_dir.path().to_path_buf();
+        let (held, levels) = warnings_and_errors(|| super::Inner::lock_epoch_dir(&dir));
+        let held = held.expect("a free lock");
+        assert!(levels.is_empty(), "a free lock is taken quietly: {levels:?}");
+
+        let started = Arc::new(std::sync::Barrier::new(2));
+        let waiter = std::thread::spawn({
+            let started = Arc::clone(&started);
+            move || {
+                started.wait();
+                warnings_and_errors(|| super::Inner::lock_epoch_dir(&dir).map(drop))
+            }
+        });
+        // The waiter is running; give it ample time to reach the lock (an open and a try-lock).
+        started.wait();
+        std::thread::sleep(Duration::from_millis(200));
+        drop(held);
+        let (taken, levels) = waiter.join().expect("the waiter");
+        taken.expect("taken once the previous writer lets go");
+        assert_eq!(levels, vec![tracing::Level::WARN], "the wait is logged once");
     }
 
     /// The body of [`same_epoch_reopen_waits_for_the_old_seal`]; a no-op unless that test runs it

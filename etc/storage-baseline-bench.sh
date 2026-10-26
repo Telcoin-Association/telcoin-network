@@ -3,7 +3,7 @@
 # report file (system, disk, a raw sync probe, then each workload's tables), for comparing the
 # backends on the production OS. Written for Linux; also runs on macOS.
 #
-# Usage: etc/storage-baseline-bench.sh <empty dir on the disk under test> [report file]
+# Usage: etc/storage-baseline-bench.sh <dir on the disk under test> [report file]
 #   BASELINE_QUICK=1 ...    one pass with only the columns the backend decision needs (Split
 #                           tndb, tndb group, production MDBX); skips the reference columns
 #                           that sync every write, which dominate the run time on a disk whose
@@ -32,14 +32,25 @@
 #
 # Needs this checkout's tn-storage with the tndb work (an uncommitted tree can be copied over
 # with `rsync -a --exclude target <repo>/ <host>:<repo>/`), a Rust toolchain, and a few GB free in
-# the bench directory. The benches create their databases under TMPDIR, set here to that
-# directory: on Linux /tmp is often tmpfs (RAM), where every sync is free, so tmpfs is refused.
+# the bench directory. The benches create their databases under TMPDIR, set here to a private
+# directory the script makes under the bench directory, not /tmp: on Linux /tmp is often tmpfs
+# (RAM), where every sync is free, so tmpfs is refused. Each workload gets a fresh one, removed
+# after it, and the script removes its own directory on exit (an interrupt included); nothing else
+# in the bench directory is touched.
 # A full run takes roughly 1-2 hours; keep the machine otherwise idle.
 set -euo pipefail
 
 bench_dir="${1:?usage: $0 <dir on the disk under test> [report file]}"
+if [ -e "$bench_dir" ] && [ ! -d "$bench_dir" ]; then
+    echo "error: $bench_dir is not a directory" >&2
+    exit 1
+fi
 mkdir -p "$bench_dir"
-bench_dir="$(cd "$bench_dir" && pwd)"
+bench_dir="$(cd "$bench_dir" && pwd -P)"
+if [ "$bench_dir" = / ]; then
+    echo "error: refusing / as the bench directory" >&2
+    exit 1
+fi
 repo="$(cd "$(dirname "$0")/.." && pwd)"
 report="${2:-$repo/storage-baseline-$(hostname -s)-$(date +%Y%m%d-%H%M%S).txt}"
 quick="${BASELINE_QUICK:-}"
@@ -68,6 +79,10 @@ if [ ! -d "$repo/crates/storage/src/tndb" ]; then
     echo "error: $repo has no crates/storage/src/tndb; copy over the tree with the tndb work" >&2
     exit 1
 fi
+scratch="$(mktemp -d "$bench_dir/storage-baseline-tmp.XXXXXX")"
+trap 'rm -rf "$scratch"' EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 section() { printf '\n### %s\n' "$*" >>"$report"; }
 kv() { printf '%-16s %s\n' "$1:" "$2" >>"$report"; }
@@ -76,7 +91,7 @@ try() { "$@" 2>/dev/null || echo "?"; }
 cd "$repo"
 echo "building the tn-storage bench binary (release, all features)..."
 build_log="$(mktemp)"
-if ! cargo test --release -p tn-storage --all-features --lib --no-run >"$build_log" 2>&1; then
+if ! cargo test --locked --release -p tn-storage --all-features --lib --no-run >"$build_log" 2>&1; then
     tail -30 "$build_log" >&2
     exit 1
 fi
@@ -139,7 +154,7 @@ fi
 
 # Raw sync latency and throughput, to read the durable latencies against.
 section SYNC-PROBE
-probe="$bench_dir/sync-probe.$$"
+probe="$scratch/sync-probe"
 if [ "$os" = "Linux" ]; then
     { dd if=/dev/zero of="$probe" bs=4k count=2000 oflag=dsync 2>&1 | tail -1 |
         sed 's/^/dsync 4k x2000:  /'; } >>"$report" || true
@@ -177,8 +192,9 @@ test_path() {
 }
 
 run() {
-    local name="$1" label="$2" out start end status rss="" columns="" path fork_env=""
+    local name="$1" label="$2" out start end status rss="" columns="" path fork_env="" db_dir
     out="$(mktemp)"
+    db_dir="$(mktemp -d "$scratch/run.XXXXXX")"
     path="$(test_path "$name")"
     [ -n "$quick" ] && columns="$(quick_columns "$name")"
     # The pack workload writes headers in the mainnet layout. This binary has every feature, so
@@ -193,12 +209,12 @@ run() {
     start="$(date +%s)"
     set +e
     if [ "$os" = "Linux" ] && [ -x /usr/bin/time ]; then
-        TN_BENCH_COLUMNS="$columns" TMPDIR="$bench_dir" NO_COLOR=1 /usr/bin/time -v -o "$out.time" \
+        TN_BENCH_COLUMNS="$columns" TMPDIR="$db_dir" NO_COLOR=1 /usr/bin/time -v -o "$out.time" \
             env $fork_env "$bin" "$path" --exact --ignored --nocapture --test-threads 1 >"$out" 2>&1
         status=$?
         rss="$(awk -F: '/Maximum resident set size/ {gsub(/ /, "", $2); print $2 " KiB"}' "$out.time")"
     else
-        TN_BENCH_COLUMNS="$columns" TMPDIR="$bench_dir" NO_COLOR=1 env $fork_env "$bin" \
+        TN_BENCH_COLUMNS="$columns" TMPDIR="$db_dir" NO_COLOR=1 env $fork_env "$bin" \
             "$path" --exact --ignored --nocapture --test-threads 1 >"$out" 2>&1
         status=$?
     fi
@@ -211,7 +227,7 @@ run() {
     grep -vE '^(running [0-9]+ tests?|test result:|$)' "$out" >>"$report" || true
     grep -m1 '^test result:' "$out" >>"$report" || true
     rm -f "$out" "$out.time"
-    rm -rf "${bench_dir:?}"/.tmp* 2>/dev/null || true
+    rm -rf "${db_dir:?}" 2>/dev/null || true
 }
 
 run msync_concurrency_probe "run 1"

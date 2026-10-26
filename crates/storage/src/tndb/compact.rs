@@ -87,6 +87,10 @@ const PACE_SLICE: Duration = Duration::from_millis(10);
 /// take): the new log's growth preallocation, at most this much past its data.
 const DISK_HEADROOM: u64 = 128 << 20;
 
+/// Test-only: how long `CompactShared::compact_now` waits for its compaction before it panics.
+#[cfg(test)]
+const COMPACT_NOW_TIMEOUT: Duration = Duration::from_secs(120);
+
 /// After a failed automatic compaction, the automatic trigger waits this long before trying again,
 /// doubling with each further failure up to [`AUTO_BACKOFF_MAX`].
 const AUTO_BACKOFF_MIN: Duration = Duration::from_secs(60);
@@ -135,15 +139,19 @@ const STALL_TAIL_MAX: u64 = 64 << 20;
 /// under the writer's own log growth would stop the database until a restart.
 const MIN_FREE: u64 = 2 * DISK_HEADROOM;
 
-/// A generation's `compacted` file: the log's length when the compaction that made it switched.
+/// A generation's `compacted` file: the trigger's base, the new log's length just before the
+/// switch's final tail (the batches it replays under the write lock), not at the switch itself:
+/// it is written before the write lock is taken, so the switch's stall holds no extra file sync.
+/// The tail is small next to the log (at most [`STALL_TAIL_MAX`]), so the trigger barely moves.
 const COMPACTED: &str = "compacted";
 const COMPACTED_TMP: &str = "compacted.tmp";
 
 /// A record's frame beyond its payload: its length and CRC.
 pub(super) const FRAME: u64 = 8;
 
-/// The log's length right after the compaction that made the generation at `gen_path`, or 0 when
-/// none did (or its `compacted` file is unreadable: it is only the trigger's starting point).
+/// The trigger's base of the generation at `gen_path` (its log's length before the final tail of
+/// the switch that made it; see [`COMPACTED`]), or 0 when no compaction made it (or its
+/// `compacted` file is unreadable: it is only the trigger's starting point).
 pub(super) fn read_base(gen_path: &Path) -> u64 {
     let path = gen_path.join(COMPACTED);
     match fs::read(&path) {
@@ -271,16 +279,26 @@ impl CompactShared {
     }
 
     /// Test-only: compact now, whatever the log's size, and wait for it: whether it switched, or
-    /// why it was abandoned.
+    /// why it was abandoned. Panics if it has not finished within [`COMPACT_NOW_TIMEOUT`], so a
+    /// stuck compaction fails its test rather than hanging it.
     #[cfg(test)]
     pub(super) fn compact_now(&self) -> Result<bool, String> {
+        self.compact_now_within(COMPACT_NOW_TIMEOUT)
+    }
+
+    /// Test-only: [`Self::compact_now`], panicking unless it finishes within `timeout`.
+    #[cfg(test)]
+    pub(super) fn compact_now_within(&self, timeout: Duration) -> Result<bool, String> {
         self.test.force.store(true, Ordering::Relaxed);
+        let deadline = Instant::now() + timeout;
         let mut state = self.state.lock();
         let target = state.done + 1 + u64::from(self.running.load(Ordering::Acquire));
         state.requested = true;
         self.wake.notify_one();
         while state.done < target {
-            self.finished.wait(&mut state);
+            if self.finished.wait_until(&mut state, deadline).timed_out() && state.done < target {
+                panic!("compact_now: compaction {target} did not finish within {timeout:?}");
+            }
         }
         state.outcomes[target as usize - 1].clone()
     }
@@ -321,6 +339,10 @@ pub(super) struct TestHooks {
     pub(super) fail_next: AtomicBool,
     /// The next compaction's copy skips a row (so its switch finds a row count wrong).
     pub(super) skip_a_row: AtomicBool,
+    /// The next compaction's new log is tracked by the disk model
+    /// (`archive::data_file::disk_model`) from its creation, so its image holds only what the
+    /// compaction itself synced.
+    pub(super) track_new_log: AtomicBool,
     /// The free space the disk guards see.
     pub(super) free_space: Mutex<Option<u64>>,
     /// How many times a disk guard has run.
@@ -730,7 +752,13 @@ enum Net {
 /// Bring `out` up to date with the old log's batches in `[from, to)` (whole batches: both ends
 /// lie between batches): their net effect, in key order: each table they cleared cleared, then
 /// each touched key's last write.
-fn catch_up(
+///
+/// # Safety
+///
+/// [`MapView::tail_within`]'s, for `[from, to)` of the log `view` maps: the writer appended every
+/// byte of it in full before the call (`to` is a frontier it stored after a batch, or its end
+/// read under its lock), and writes and cuts none of it while the call runs.
+unsafe fn catch_up(
     out: &mut Builder,
     view: &MapView,
     from: u64,
@@ -751,7 +779,8 @@ fn catch_up(
             check_stop(core)?;
             next_check = pos + BATCH_BYTES;
         }
-        let payload = Log::record_bytes_within(view, pos, to, MAX_RECORD)?;
+        // SAFETY: `pos < to`, and `[from, to)` meets `tail_within`'s contract (this fn's own).
+        let payload = unsafe { Log::record_bytes_within(view, pos, to, MAX_RECORD)? };
         let record = record::parse(payload, |id| ksizes.get(id)).map_err(|e| {
             DamagedRecord(format!("tndb: compaction: the record at {pos} does not parse: {e:#}"))
         })?;
@@ -776,7 +805,8 @@ fn catch_up(
     for ((id, key), last) in net {
         match last {
             Net::Put(pos) => {
-                let payload = Log::record_bytes_within(view, pos, to, MAX_RECORD)?;
+                // SAFETY: as above: `pos` is a record this call read below `to`.
+                let payload = unsafe { Log::record_bytes_within(view, pos, to, MAX_RECORD)? };
                 let ksize = ksizes.get(id).unwrap_or(0);
                 out.copy_row(id, ksize, &key, payload)?;
                 if let Some((pacer, core)) = pacer.as_mut() {
@@ -826,6 +856,11 @@ fn compact_once(core: &Core, requested: bool, rate: u64) -> eyre::Result<bool> {
     let view = Arc::clone(&snap.view);
     let ksizes = Ksizes::new(core, &snap.tables);
     let mut out = Builder::new(compact_dir(&core.root, snap.gen + 1))?;
+    // Nothing is written to the new log yet but the header its open synced.
+    #[cfg(test)]
+    if shared.test.track_new_log.swap(false, Ordering::Relaxed) {
+        crate::archive::data_file::disk_model::track(&out.dir.join("log"));
+    }
 
     // 1. Every table's rows, in key order; each snapshot dropped once copied.
     let mut pacer = Pacer::new(rate);
@@ -839,8 +874,12 @@ fn compact_once(core: &Core, requested: bool, rate: u64) -> eyre::Result<bool> {
             if std::mem::take(&mut skip_a_row) {
                 continue;
             }
-            let payload =
-                Log::record_bytes_within(&published.view, pos, published.limit, MAX_RECORD)?;
+            // SAFETY: as for a reader (`store::Published::value_at`): `limit` is the old log's
+            // length at the publish this snapshot came from, written in full before it and never
+            // rewritten or cut while `_alive` keeps the generation open.
+            let payload = unsafe {
+                Log::record_bytes_within(&published.view, pos, published.limit, MAX_RECORD)?
+            };
             // A damaged index entry is abandoned on, not copied into the new generation.
             record::put_value(payload, id, key)?;
             out.copy_row(id, ksize, key, payload)?;
@@ -859,7 +898,11 @@ fn compact_once(core: &Core, requested: bool, rate: u64) -> eyre::Result<bool> {
         check_stop(core)?;
         check_room(core)?;
         let to = core.frontier.load().end;
-        catch_up(&mut out, &view, done, to, &ksizes, Some(core))?;
+        // SAFETY: the frontier is stored (`Core::store_frontier`) under the write lock after a
+        // batch was appended in full, so the `ArcSwap` load orders those appends before this read.
+        // Only this thread switches generations, so it is still the old log's. The writer writes
+        // past it only: a failed batch rewinds to its own start, at or past the frontier.
+        unsafe { catch_up(&mut out, &view, done, to, &ksizes, Some(core))? };
         let behind = to - done;
         done = to;
         out.sync()?;
@@ -887,9 +930,15 @@ fn compact_once(core: &Core, requested: bool, rate: u64) -> eyre::Result<bool> {
         check_stop(core)?;
         check_room(core)?;
         let to = core.frontier.load().end;
-        catch_up(&mut out, &view, done, to, &ksizes, Some(core))?;
+        // SAFETY: the frontier is stored (`Core::store_frontier`) under the write lock after a
+        // batch was appended in full, so the `ArcSwap` load orders those appends before this read.
+        // Only this thread switches generations, so it is still the old log's. The writer writes
+        // past it only: a failed batch rewinds to its own start, at or past the frontier.
+        unsafe { catch_up(&mut out, &view, done, to, &ksizes, Some(core))? };
         done = to;
         out.sync()?;
+        // Before the final tail below: written under the write lock, it would add a file sync to
+        // the switch's stall (see `COMPACTED`).
         let base = out.log_len();
         write_base(&out.dir, base)?;
         #[cfg(test)]
@@ -910,7 +959,9 @@ fn compact_once(core: &Core, requested: bool, rate: u64) -> eyre::Result<bool> {
             continue;
         }
         // Under the write lock, and at most a tail's worth (the cap above): no checks.
-        catch_up(&mut out, &view, done, end, &ksizes, None)?;
+        // SAFETY: `end` is the writer's log length read under its lock, held across this call:
+        // every append below it is complete and ordered by the lock, and none can start.
+        unsafe { catch_up(&mut out, &view, done, end, &ksizes, None)? };
         for (id, rows) in writer.table_rows() {
             if out.rows(id) != rows {
                 bail!(
@@ -1083,6 +1134,7 @@ fn run(core: &Core, rate: u64) {
                     let cause = cause(&e);
                     if cause == Cause::Corruption {
                         tracing::error!(target: "tndb", "compaction abandoned: {e:#}");
+                        core.compaction_damaged();
                     } else {
                         tracing::warn!(target: "tndb", "compaction abandoned: {e:#}");
                     }
@@ -1191,6 +1243,30 @@ mod test {
             assert!(Instant::now() < deadline, "the compaction started");
             std::thread::sleep(Duration::from_millis(5));
         }
+    }
+
+    /// A test's `compact_now` waits a bounded time: a compaction that does not finish (here held
+    /// at a gate) fails the test with a panic naming it instead of hanging it.
+    #[test]
+    fn test_tndb_compact_now_panics_past_its_timeout() {
+        let tmp = TempDir::with_prefix("tndb_compact_now_timeout").expect("temp dir");
+        let db = open(tmp.path(), manual());
+        db.insert::<TestTable>(&1, &"a".to_string()).expect("insert");
+        let compact = &db.core().compact;
+        let (arrivals, release) = compact.test.gate_next();
+        std::thread::scope(|s| {
+            let waiter = s.spawn(|| compact.compact_now_within(Duration::from_millis(200)));
+            assert_eq!(
+                arrivals.recv_timeout(Duration::from_secs(20)),
+                Ok(1),
+                "held after the copy"
+            );
+            let panicked = waiter.join().expect_err("the wait times out while the gate holds it");
+            let message = panicked.downcast_ref::<String>().cloned().unwrap_or_default();
+            assert!(message.contains("did not finish within"), "the panic names it: {message}");
+            drop(release);
+        });
+        assert!(compact.wait_done(1).is_some(), "the released compaction finishes");
     }
 
     /// The epoch-end reset (every table emptied) needs no room for a copy: with free space above
@@ -1318,7 +1394,9 @@ mod test {
         let ksizes = Ksizes::new(core, &[]);
         let catch_up_into = |name: &str, from, to| {
             let mut out = Builder::new(tmp.path().join(name)).expect("builder");
-            let result = catch_up(&mut out, &view, from, to, &ksizes, Some(core));
+            // SAFETY: the test's own appends end at `end`, before this call, and the log is
+            // written no more while the view is read.
+            let result = unsafe { catch_up(&mut out, &view, from, to, &ksizes, Some(core)) };
             (result, out.rows(id))
         };
 

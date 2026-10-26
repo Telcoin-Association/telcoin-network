@@ -23,6 +23,11 @@
 //! clean shutdown) instead of a SIGBUS on the first `memcpy` store into an unbacked hole page. The
 //! reserved padding is transient — the clean-close `Drop` truncates it back to the logical end — so
 //! the extra real disk (≤ one growth step past the data) is only used while a file is open.
+//! This holds where the filesystem implements preallocation: on Linux, ext4 and xfs, the supported
+//! filesystems. Where it does not (`EOPNOTSUPP`/`ENOSYS`: ext2/ext3, NFS before 4.2,
+//! FUSE without `fallocate`), growth falls back to a sparse `set_len`, with a warning logged once
+//! per process on Linux, and a full disk may then surface as SIGBUS. On copy-on-write filesystems
+//! (btrfs, ZFS) even a successful preallocation does not guarantee a later write can allocate.
 //!
 //! ## Transient padding, exact on exposure
 //!
@@ -43,6 +48,12 @@
 //! and the pack's CRC + `recover_pack` path truncates it back to the last good record. The
 //! self-referential second CRC is what stops trailing zero padding from masquerading as a clean
 //! close (`crc32(0x00000000) != 0`).
+//!
+//! A writable reopen of a sealed file retires the sentinel on disk at open, so a crash after it
+//! reopens unclean. With [`MmapFileOptions::defer_seal_retire`] the retirement waits for the
+//! handle's first write instead: until then the file stays sealed exactly as it was opened, and a
+//! drop leaves it untouched (tndb's log, whose open replays it and must refuse, never cut, a sealed
+//! log that does not replay whole).
 //!
 //! ## Durability
 //!
@@ -97,14 +108,39 @@ use crate::archive::error::rename::RenameError;
 /// that file's contents instead of providing the directory-entry durability
 /// guarantee callers expect, so all in-crate call sites pass a directory.
 pub(crate) fn fsync_directory(path: &Path) -> Result<(), io::Error> {
+    #[cfg(test)]
+    if FAIL_DIR_SYNC.with_borrow(|fail| fail.as_deref() == Some(path)) {
+        return Err(io::Error::other(format!("injected directory fsync failure for {path:?}")));
+    }
     fsync_file(&File::open(path)?)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only: the next [`MapView::msync`] on this thread fails after its `msync` call (a
+    /// failed writeback).
+    pub(crate) static FAIL_NEXT_VIEW_MSYNC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Test-only: every [`fsync_directory`] of this path on this thread fails (a failed directory
+    /// sync), so a test can check that a create propagates it.
+    pub(crate) static FAIL_DIR_SYNC: std::cell::RefCell<Option<PathBuf>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// The directory holding `path`'s entry: its parent, with `.` for a bare relative name (whose
+/// [`Path::parent`] is empty), or `None` for a root.
+fn entry_dir(path: &Path) -> Option<&Path> {
+    path.parent().map(|parent| if parent.as_os_str().is_empty() { Path::new(".") } else { parent })
 }
 
 /// `fsync(2)` `file`: [`File::sync_all`] everywhere but macOS, where that is `F_FULLFSYNC`
 /// (see the module docs' Durability section) and this is a plain `fsync`.
 pub(crate) fn fsync_file(file: &File) -> io::Result<()> {
-    // Retried when a signal interrupts it, as `File::sync_all` does: every caller fail-stops on a
-    // sync error, and an interrupted call is not one.
+    // Retried when a signal interrupts it, as `File::sync_all` does: an interrupted call is not a
+    // sync error, and the callers that fail-stop on one (the barriers, which poison the file, the
+    // tndb commit thread, an open) would stop the node for nothing. Not every caller fail-stops:
+    // the clean-close seal in `Drop` only logs a failed fsync (the file was msynced before its
+    // seal, and a lost seal costs a recovery pass; an owner that must know seals explicitly with
+    // `MmapDataFile::seal`), as do the `LatestConsensus` slot syncs.
     #[cfg(target_os = "macos")]
     let synced = loop {
         // SAFETY: `fsync` on a file descriptor `file` owns and keeps open for the call; it touches
@@ -144,15 +180,49 @@ pub(crate) fn fdatasync_file(file: &File) -> io::Result<()> {
     }
 }
 
+/// Drop `file`'s cached pages, so later reads of it come from the disk (Linux:
+/// `posix_fadvise(POSIX_FADV_DONTNEED)` over the whole file). An unclean open with
+/// [`MmapFileOptions::drop_cache_on_unclean_open`] calls it right after its fsync and before it
+/// maps the file, so no page is dirty and this handle maps none. The kernel keeps any page that
+/// is dirty, locked, under writeback or mapped by another process; nothing in this crate maps the
+/// file then (tndb's `lock_dir` keeps a second handle off its directory, and `try_clone` readers
+/// use `pread`). Elsewhere a no-op: macOS has no such advice, and is not a validator platform.
+fn drop_cached_pages(file: &File) -> io::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        // SAFETY: a plain syscall on a file descriptor `file` owns and keeps open for the call; it
+        // touches no Rust memory. Offset 0 with length 0 covers the whole file.
+        let rc = unsafe { libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED) };
+        // `posix_fadvise` returns the error number itself, not -1 with `errno` set.
+        if rc != 0 {
+            return Err(io::Error::from_raw_os_error(rc));
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = file;
+    #[cfg(test)]
+    disk_model::cache_dropped(file);
+    Ok(())
+}
+
 /// Test-only model of what a power loss keeps (the tndb power-loss tests use it): for each
-/// tracked file (by inode, so a rename keeps it), an image of the bytes that reached the disk.
-/// Every real flush updates it: an msync copies the pages it covers (whole pages, as the kernel
-/// flushes them), an fsync the whole file. A power loss writes the image back over the file and
-/// zeroes everything past it: bytes never flushed are gone. Untracked files cost one atomic load
-/// per flush.
+/// tracked file (by inode, so a rename keeps it), an image of the bytes that reached the disk and
+/// the file's durable length. Every real flush updates the bytes: an msync copies the pages it
+/// covers (whole pages, as the kernel flushes them), an fsync or fdatasync the whole file. Only an
+/// fsync or fdatasync moves the durable length (both make the size durable; an msync writes data
+/// pages but no size change): it starts at the file's length when tracked. A power loss cuts the
+/// file back to its durable length and writes the image over it, zeroing what the image lacks:
+/// bytes never flushed are gone, and so are bytes msynced past a size no sync made durable (a lost
+/// size update leaves the file shorter, not zero-filled). A dropped page cache
+/// (`drop_cached_pages`) leaves the file reading the image's bytes at its current length. Untracked
+/// files cost one atomic load per flush.
+///
+/// [`set_flushes_lost`] models a failed writeback that a sync can no longer report: the flushes
+/// succeed, the image stays as it was, and the page cache keeps the newer bytes.
 #[cfg(test)]
 pub(crate) mod disk_model {
     use std::{
+        cell::Cell,
         collections::HashMap,
         fs::{File, OpenOptions},
         os::unix::fs::{FileExt as _, MetadataExt as _},
@@ -164,17 +234,44 @@ pub(crate) mod disk_model {
     };
 
     static TRACKED: AtomicUsize = AtomicUsize::new(0);
-    static IMAGES: Mutex<Option<HashMap<u64, Vec<u8>>>> = Mutex::new(None);
+    static IMAGES: Mutex<Option<HashMap<u64, Image>>> = Mutex::new(None);
 
-    fn images() -> std::sync::MutexGuard<'static, Option<HashMap<u64, Vec<u8>>>> {
+    /// What the disk holds of one tracked file.
+    struct Image {
+        /// The bytes that reached the disk; an msync can carry them past `durable_len`.
+        bytes: Vec<u8>,
+        /// The file's length on the disk: its length when tracked, then as of its last fsync or
+        /// fdatasync.
+        durable_len: usize,
+    }
+
+    thread_local! {
+        /// See [`set_flushes_lost`].
+        static FLUSHES_LOST: Cell<bool> = const { Cell::new(false) };
+    }
+
+    /// While `lost`, the flushes this thread runs (msyncs and fsyncs) report success but leave
+    /// every image as it was. That is what a process restarted after a failed writeback sees on
+    /// Linux: the error is reported once, to the process that then exited, and the failed pages
+    /// stay in the page cache, clean, so the next open's fsync succeeds without writing them.
+    pub(crate) fn set_flushes_lost(lost: bool) {
+        FLUSHES_LOST.with(|flag| flag.set(lost));
+    }
+
+    fn flushes_lost() -> bool {
+        FLUSHES_LOST.with(Cell::get)
+    }
+
+    fn images() -> std::sync::MutexGuard<'static, Option<HashMap<u64, Image>>> {
         IMAGES.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Start modeling the file at `path`: its current bytes are taken as on disk.
+    /// Start modeling the file at `path`: its current bytes and length are taken as on disk.
     pub(crate) fn track(path: &Path) {
         let ino = std::fs::metadata(path).expect("metadata").ino();
         let bytes = std::fs::read(path).expect("read the tracked file");
-        images().get_or_insert_with(HashMap::new).insert(ino, bytes);
+        let image = Image { durable_len: bytes.len(), bytes };
+        images().get_or_insert_with(HashMap::new).insert(ino, image);
         TRACKED.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -188,7 +285,7 @@ pub(crate) mod disk_model {
 
     /// An msync of `[start, end)` of the file with inode `ino`, whose mapping is `map`.
     pub(crate) fn flushed_range(ino: u64, map: &[u8], start: u64, end: u64) {
-        if TRACKED.load(Ordering::Relaxed) == 0 || start >= end {
+        if TRACKED.load(Ordering::Relaxed) == 0 || start >= end || flushes_lost() {
             return;
         }
         let mut images = images();
@@ -201,6 +298,7 @@ pub(crate) mod disk_model {
         if from >= to {
             return;
         }
+        let image = &mut image.bytes;
         if image.len() < to {
             image.resize(to, 0);
         }
@@ -212,7 +310,7 @@ pub(crate) mod disk_model {
     /// in the last page can be written meanwhile (the model keeps whatever the page holds, as the
     /// flush did).
     pub(crate) fn flushed_range_raw(ino: u64, base: *const u8, mapped: u64, start: u64, end: u64) {
-        if TRACKED.load(Ordering::Relaxed) == 0 || start >= end {
+        if TRACKED.load(Ordering::Relaxed) == 0 || start >= end || flushes_lost() {
             return;
         }
         let mut images = images();
@@ -225,6 +323,7 @@ pub(crate) mod disk_model {
         if from >= to {
             return;
         }
+        let image = &mut image.bytes;
         if image.len() < to {
             image.resize(to, 0);
         }
@@ -243,10 +342,10 @@ pub(crate) mod disk_model {
         file.metadata().map(|meta| meta.ino()).unwrap_or(0)
     }
 
-    /// An fsync of `file`: every byte of it is on disk.
+    /// An fsync or fdatasync of `file`: every byte of it is on disk, and so is its length.
     pub(crate) fn flushed_all(file: &File) {
         let ino = ino_if_tracking(file);
-        if ino == 0 {
+        if ino == 0 || flushes_lost() {
             return;
         }
         let mut images = images();
@@ -256,19 +355,42 @@ pub(crate) mod disk_model {
         let len = file.metadata().map(|meta| meta.len()).unwrap_or(0) as usize;
         let mut bytes = vec![0_u8; len];
         if file.read_exact_at(&mut bytes, 0).is_ok() {
-            *image = bytes;
+            *image = Image { bytes, durable_len: len };
         }
     }
 
-    /// A power loss: the file at `path` keeps only what its image holds (its length is kept,
-    /// every byte past the image reads zero).
+    /// A power loss: the file at `path` is cut back (or extended) to its durable length and keeps
+    /// only what its image holds below it; every byte the image lacks reads zero. The image is cut
+    /// with it: what lay past the durable length is gone from the disk too.
     pub(crate) fn power_loss(path: &Path) {
         let ino = std::fs::metadata(path).expect("metadata").ino();
-        let image = images()
-            .as_ref()
-            .and_then(|images| images.get(&ino).cloned())
-            .expect("the file is tracked");
+        let mut images = images();
+        let image =
+            images.as_mut().and_then(|images| images.get_mut(&ino)).expect("the file is tracked");
+        image.bytes.resize(image.durable_len, 0);
         let file = OpenOptions::new().write(true).open(path).expect("open");
+        file.set_len(image.durable_len as u64).expect("cut to the durable length");
+        restore(&file, &image.bytes);
+    }
+
+    /// `file`'s cached pages were dropped (`drop_cached_pages`): a tracked file now reads what its
+    /// image holds, as after a power loss, but keeps its length (the size is not cached data; it
+    /// is opened writable then).
+    pub(crate) fn cache_dropped(file: &File) {
+        let ino = ino_if_tracking(file);
+        if ino == 0 {
+            return;
+        }
+        let Some(bytes) =
+            images().as_ref().and_then(|images| images.get(&ino).map(|image| image.bytes.clone()))
+        else {
+            return;
+        };
+        restore(file, &bytes);
+    }
+
+    /// Write `image` over `file`, keeping its length: every byte past the image reads zero.
+    fn restore(file: &File, image: &[u8]) {
         let len = file.metadata().expect("metadata").len() as usize;
         file.write_all_at(&image[..image.len().min(len)], 0).expect("write the image");
         let zeros = vec![0_u8; 1 << 20];
@@ -281,13 +403,26 @@ pub(crate) mod disk_model {
     }
 }
 
-/// Create `dir` (and any missing parents) and fsync its parent so the new directory
-/// entry survives a crash. Best-effort fsync; a redundant fsync when `dir` already
-/// exists is harmless.
+/// Create `dir` and any missing parents, and fsync the directory holding each level it created,
+/// the outermost first, so every new entry survives a crash (an entry is durable only once the
+/// directory holding it is synced, and a lost upper level loses everything below it). A failed
+/// sync is an error. When `dir` already exists this syncs its parent once, which is harmless and
+/// covers a retried call whose earlier sync failed after the create.
 pub(crate) fn create_dir_synced(dir: &Path) -> Result<(), io::Error> {
+    let mut missing = Vec::new();
+    let mut level = Some(dir);
+    while let Some(d) = level.filter(|d| !d.as_os_str().is_empty() && !d.exists()) {
+        missing.push(d);
+        level = d.parent();
+    }
     std::fs::create_dir_all(dir)?;
-    if let Some(parent) = dir.parent() {
-        let _ = fsync_directory(parent);
+    if missing.is_empty() {
+        missing.push(dir);
+    }
+    for created in missing.iter().rev() {
+        if let Some(parent) = entry_dir(created) {
+            fsync_directory(parent)?;
+        }
     }
     Ok(())
 }
@@ -353,8 +488,12 @@ pub struct MmapFileOptions {
     /// a growth's size becomes durable at the clean-close seal (or [`MmapDataFile::sync_disk`]).
     /// After a crash such a file may be shorter than its own header claims; that is safe only
     /// because an unsealed derived file is never trusted to keep data: its owner rebuilds it, and
-    /// the one read of one before that (the consensus pack's position index in `recover_pack`)
-    /// takes it only as evidence to refuse a cut.
+    /// nothing reads one before that except the consensus pack's position index in
+    /// `recover_pack`, which takes it only as evidence to refuse a cut. The position indexes
+    /// (pdx) and tndb's B+tree indexes set it. The digest indexes (hdx, odx) do not: the epoch
+    /// records' and certificate pack's recoveries read an unsealed hdx's attested data length
+    /// before any rebuild, as evidence to refuse a cut, and a short hdx fails to open, attesting
+    /// nothing.
     pub derived: bool,
     /// Bytes of address space a writable handle reserves for its mapping (0 = off). With a
     /// reservation the file is mapped once, at `max(reserve, file length)` bytes, and grows
@@ -370,6 +509,27 @@ pub struct MmapFileOptions {
     /// log that is never read from a peer may take more (tndb's does); the data file ignores
     /// it.
     pub max_record_size: Option<u32>,
+    /// A writable open of a sealed file keeps its clean-close sentinel, on disk and in the
+    /// mapping, until the handle's first [`Write::write`], instead of retiring it at open (see
+    /// [`MmapDataFile::open_with`]). Until then the file stays sealed exactly as it was opened: a
+    /// crash, a panic or a failed open leaves it sealed, and its drop changes no byte. For a log
+    /// whose owner replays it at open and must refuse, not cut, a sealed log that does not
+    /// replay whole (tndb's): with the sentinel retired before that replay, a kill during a
+    /// failing open would let the next open take the damage for a crash's torn tail. Such a file
+    /// must change only through `write` while the seal is pending (`slice_mut`, `ensure_len`,
+    /// `truncate` and a `rewind_to` below the end assert it in debug builds).
+    pub defer_seal_retire: bool,
+    /// An unclean writable open drops the file's cached pages right after its fsync (see
+    /// [`MmapDataFile::open_with`]), so the open, and its owner's recovery, read what the disk
+    /// holds rather than what the page cache holds. Linux reports a writeback error once: when
+    /// the process that saw it has exited, the next open's fsync succeeds while the failed pages
+    /// sit in the page cache, clean (so no later sync writes them) but never written. A recovery
+    /// reading them would accept bytes the disk lacks, and new writes acknowledged after them
+    /// would sit past a hole that a power loss reveals. For a log whose owner replays it at open
+    /// and goes on appending (tndb's). It costs that replay a read from the disk instead of the
+    /// warm cache, which is why the packs (which mostly refuse at such a hole rather than cut)
+    /// keep the cache. Linux only; elsewhere the drop is a no-op.
+    pub drop_cache_on_unclean_open: bool,
 }
 
 impl Default for MmapFileOptions {
@@ -383,6 +543,8 @@ impl Default for MmapFileOptions {
             derived: false,
             reserve: 0,
             max_record_size: None,
+            defer_seal_retire: false,
+            drop_cache_on_unclean_open: false,
         }
     }
 }
@@ -392,17 +554,38 @@ impl Default for MmapFileOptions {
 /// lock-free readers; the file updates the mapping fields whenever its mapping changes, and the
 /// owner advances [`Self::publish_len`].
 ///
-/// Validity: a slice from [`Self::slice`] borrows mapped memory. The owner must keep the file open
-/// while any reader can reach the view, and a mapping replaced while the view is shared is retired
-/// (kept mapped until the file drops) rather than unmapped, so a reader that loaded the old base is
-/// still reading live memory. Mapping changes only ever grow the mapping while readers exist (a
-/// reservation overflow); anything that shrinks or unmaps happens with no readers (open-time
-/// recovery, close).
+/// Validity, checked rather than trusted: a slice borrows mapped memory, so
+/// - every read is clamped to the published length, the mapping, and the file's physical size
+///   (stored before any shrink), so a stale length returns `None` instead of reaching unmapped or
+///   truncated pages;
+/// - the file refuses to shrink or rewind below the published length (`truncate` errs, `rewind_to`
+///   poisons), so no published byte a reader borrowed is cut or zeroed;
+/// - a mapping replaced while the view is shared is retired (kept mapped until the file drops), and
+///   a file dropped while the view is still shared hands its mappings to the view, which unmaps
+///   them when the last reader lets go.
+///
+/// What no check sees is why [`Self::slice`] and [`Self::tail_within`] are `unsafe`: bytes past the
+/// published length that `tail_within` reads under the caller's own limit, and in-place rewrites
+/// of published bytes (a B+tree reuses only pages no reader's snapshot reaches). Each states the
+/// contract its caller keeps (`# Safety`). [`Self::msync`] borrows no memory and stays safe.
 #[derive(Debug)]
 pub(crate) struct MapView {
     base: AtomicPtr<u8>,
     mapped: AtomicU64,
     published: AtomicU64,
+    /// The file's sticky poison latch (see [`MmapDataFile::poison`]). Kept here, not on the file,
+    /// so a barrier that fails through a shared view ([`Self::msync`], from tndb's commit thread
+    /// or a pack's rollback) latches the file wherever it runs, without its owner having to
+    /// remember to. Relaxed: the latch orders no other memory, and an owner that acts on a
+    /// barrier's failure learns of it through the channel or lock that reported it, which orders
+    /// the store before its load.
+    write_failed: AtomicBool,
+    /// The file's physical size: stored after the file grows and before it shrinks, so a read
+    /// clamped to it never reaches a page past the end of the file (a SIGBUS).
+    physical: AtomicU64,
+    /// Mappings the file left when it dropped while this view was still shared (see
+    /// `MmapDataFile::release_mappings`): unmapped when the last reader drops the view.
+    kept: std::sync::Mutex<Vec<Backing>>,
     /// Test-only: the file's inode, for the disk model (see [`disk_model`]).
     #[cfg(test)]
     ino: AtomicU64,
@@ -414,6 +597,9 @@ impl MapView {
             base: AtomicPtr::new(std::ptr::null_mut()),
             mapped: AtomicU64::new(0),
             published: AtomicU64::new(0),
+            write_failed: AtomicBool::new(false),
+            physical: AtomicU64::new(0),
+            kept: std::sync::Mutex::new(Vec::new()),
             #[cfg(test)]
             ino: AtomicU64::new(0),
         }
@@ -434,9 +620,23 @@ impl MapView {
         self.published.store(len, Ordering::Release);
     }
 
+    /// Latch the file's poison (see [`MmapDataFile::poison`]) from a holder of the view: for a
+    /// barrier on the file run outside both the file and the view (tndb's commit thread fsyncs a
+    /// duplicate descriptor after its log grows), so a failure there keeps the file unsealed
+    /// however its owner is later dropped.
+    pub(crate) fn poison(&self) {
+        self.write_failed.store(true, Ordering::Relaxed);
+    }
+
+    /// The readable bound: the mapping and the file's physical size, whichever is shorter.
+    fn backed(&self) -> u64 {
+        self.mapped.load(Ordering::Acquire).min(self.physical.load(Ordering::Acquire))
+    }
+
     /// `msync(MS_SYNC)` the mapped bytes `[start, end)` (the start rounded down to a page), from
     /// any thread, while the owner keeps appending past `end` (tndb's commit thread syncs its log
-    /// this way). The caller keeps the file open for the call (see the type docs).
+    /// this way). The caller keeps the file open for the call (see the type docs). A failure
+    /// latches the file's poison (see [`MmapDataFile::poison`]).
     pub(crate) fn msync(&self, start: u64, end: u64) -> io::Result<()> {
         if start >= end {
             return Ok(());
@@ -445,8 +645,9 @@ impl MapView {
         // one still mapped, covers `[0, mapped)`.
         let mapped = self.mapped.load(Ordering::Acquire);
         let base = self.base.load(Ordering::Acquire);
-        if base.is_null() || end > mapped {
-            return Err(io::Error::other("sync range is not mapped"));
+        if base.is_null() || end > mapped.min(self.physical.load(Ordering::Acquire)) {
+            self.poison();
+            return Err(io::Error::other("sync range is not mapped within the file"));
         }
         let aligned = start - start % page_size();
         // SAFETY: `[base, base + mapped)` is a live mapping (a mapping replaced while the view is
@@ -456,8 +657,15 @@ impl MapView {
         let rc = unsafe {
             libc::msync(base.add(aligned as usize).cast(), (end - aligned) as usize, libc::MS_SYNC)
         };
-        if rc != 0 {
-            return Err(io::Error::last_os_error());
+        let synced = if rc == 0 { Ok(()) } else { Err(io::Error::last_os_error()) };
+        #[cfg(test)]
+        let synced = synced.and_then(|()| match FAIL_NEXT_VIEW_MSYNC.replace(false) {
+            true => Err(io::Error::other("injected msync failure")),
+            false => Ok(()),
+        });
+        if let Err(error) = synced {
+            self.poison();
+            return Err(error);
         }
         #[cfg(test)]
         disk_model::flushed_range_raw(self.ino.load(Ordering::Relaxed), base, mapped, start, end);
@@ -468,9 +676,19 @@ impl MapView {
     /// `None`. Only those bytes are borrowed, so a file whose owner rewrites other published bytes
     /// in place (a B+tree reusing a page no reader's snapshot can reach) is never borrowed from
     /// where it is being written.
-    pub(crate) fn slice(&self, offset: u64, len: usize) -> Option<&[u8]> {
+    ///
+    /// # Safety
+    ///
+    /// No byte of `[offset, offset + len)` may be written while the returned slice lives, and
+    /// every earlier write to it must happen before this call. The view checks that the range is
+    /// published, mapped and inside the file, and the file never cuts, zeroes or unmaps a
+    /// published byte under it, so an owner that writes bytes before publishing them
+    /// ([`Self::publish_len`]) and never again meets this. What the view cannot see is an owner
+    /// rewriting published bytes in place: the caller must know no such rewrite reaches the range
+    /// (a B+tree reuses a page only once no snapshot that reaches it is alive).
+    pub(crate) unsafe fn slice(&self, offset: u64, len: usize) -> Option<&[u8]> {
         let end = offset.checked_add(len as u64)?;
-        let limit = self.published.load(Ordering::Acquire).min(self.mapped.load(Ordering::Acquire));
+        let limit = self.published.load(Ordering::Acquire).min(self.backed());
         if end > limit {
             return None;
         }
@@ -478,9 +696,9 @@ impl MapView {
         if base.is_null() {
             return None;
         }
-        // SAFETY: `[base, base + mapped)` is a live mapping (see the type docs), and
-        // `[offset, end)` lies within it and within the published bytes, which the owner does not
-        // modify while a reader can reach them.
+        // SAFETY: `[base, base + mapped)` is a live mapping (see the type docs), `[offset, end)`
+        // lies within it, within the file and within the published bytes, and the caller keeps
+        // every byte of it unwritten while the slice lives (this fn's `# Safety`).
         Some(unsafe { std::slice::from_raw_parts(base.add(offset as usize), len) })
     }
 
@@ -488,17 +706,27 @@ impl MapView {
     /// the owner wrote in full before the reader's snapshot: one bounds check for a reader that
     /// learns a record's length from its own prefix. For an append-only file (a log), whose
     /// written bytes never change; a file rewritten in place reads through [`Self::slice`].
-    pub(crate) fn tail_within(&self, offset: u64, limit: u64) -> Option<&[u8]> {
-        let end = limit.min(self.mapped.load(Ordering::Acquire));
+    ///
+    /// # Safety
+    ///
+    /// Every byte of `[offset, limit)` must be written in full before the call, by writes that
+    /// happen before it (the caller learned `limit` under the writer's lock, or by loading a value
+    /// the writer stored after those writes), and none may be written, or cut from the file
+    /// (`truncate`, `rewind_to`), while the returned slice lives. The view clamps the range to the
+    /// mapping and the file's physical size but not to the published length (a log's owner reads
+    /// bytes it wrote and never published), so it cannot check this: a `limit` past what the
+    /// writer has finished reads bytes it may be writing.
+    pub(crate) unsafe fn tail_within(&self, offset: u64, limit: u64) -> Option<&[u8]> {
+        let end = limit.min(self.backed());
         let len = end.checked_sub(offset)?;
         let base = self.base.load(Ordering::Acquire);
         if base.is_null() {
             return None;
         }
-        // SAFETY: `[base, base + mapped)` is a live mapping (see the type docs: the owner keeps the
-        // file open while readers can reach the view, and replaced mappings stay mapped until the
-        // file drops), and `[offset, end)` lies within it and within the published bytes, which
-        // the owner never modifies while readers can see them.
+        // SAFETY: `[base, base + mapped)` is a live mapping (see the type docs: replaced mappings
+        // stay mapped until the file drops, and a dropped file's go to the view), `[offset, end)`
+        // lies within it and within the file, and the caller has written every byte of it before
+        // the call and neither writes nor cuts any while the slice lives (this fn's `# Safety`).
         Some(unsafe { std::slice::from_raw_parts(base.add(offset as usize), len as usize) })
     }
 }
@@ -652,22 +880,21 @@ pub struct MmapDataFile {
     /// was not sealed by a clean `Drop` and is most likely still padded, so the pack's heal path
     /// should run. Set once at open; a fresh (0-length) file is not considered unclean.
     opened_unclean: bool,
+    /// A writable handle opened a sealed file with [`MmapFileOptions::defer_seal_retire`] and has
+    /// not yet written: the clean-close sentinel still sits at `[end, end + SENTINEL_LEN)`, on
+    /// disk and in the mapping, and the file on disk is exactly as it was opened. The first
+    /// `write` retires the sentinel ([`Self::retire_seal_if_pending`]); until then `Drop` leaves
+    /// the file alone.
+    seal_pending: bool,
+    /// Set by [`Self::seal`]: the handle is closed (sealed, or its seal failed and was reported),
+    /// so `Drop` leaves the file as the seal left it.
+    closed: bool,
     /// Durable `committed_end` recovered from the tail commit marker of an unclean file, if a
     /// valid one is present (see [`Self::stamp_commit_marker`] / [`Self::committed_end`]).
     /// `None` on clean or fresh opens, or when no valid marker was written/flushed
     /// (best-effort). Recovery uses it as an index-free acked-data watermark to catch at-rest
     /// corruption of the last committed record.
     committed_marker: Option<u64>,
-    /// Sticky "poison" latch set on any failed durability barrier (`msync`/`fsync`) or failed
-    /// `remap`. Once set, `write`/`ensure_len` and the sync entry points return `Err` without
-    /// retrying (a retried `msync` after a writeback error can spuriously succeed on Linux errseq,
-    /// laundering lost data), `stamp_commit_marker` is a no-op, and `Drop` skips the clean-close
-    /// seal so the next open re-runs recovery instead of trusting a possibly-non-durable tail.
-    /// `AtomicBool` (not `bool`) so it can be set from the `&self` sync paths (`flush_dirty`,
-    /// `sync_range`, `try_clone`) — same reason `flushed_end` is an `AtomicU64`. Never cleared for
-    /// the life of the handle (a durability failure is permanent until reopen); in particular
-    /// `mark_consistent` does NOT clear it, so recovery cannot paper over lost data.
-    write_failed: AtomicBool,
     /// Set when a growth extended the file's size since the last fsync. `msync` does not persist
     /// size (inode metadata), so the next durability barrier fsyncs once before it returns (see
     /// [`Self::sync_size_if_grown`]); a growth itself does not sync. `AtomicBool` because the
@@ -690,6 +917,14 @@ pub struct MmapDataFile {
     /// Test-only: how many open-time fsyncs of an unclean file's existing bytes this open ran.
     #[cfg(test)]
     open_syncs: std::sync::atomic::AtomicUsize,
+    /// Test-only: how many times this open dropped the file's cached pages after its fsync (see
+    /// [`MmapFileOptions::drop_cache_on_unclean_open`]).
+    #[cfg(test)]
+    open_evictions: std::sync::atomic::AtomicUsize,
+    /// Test-only: the next clean-close seal's final fsync reports a failure after it ran (see
+    /// [`Self::fail_next_seal_sync_for_test`]).
+    #[cfg(test)]
+    fail_seal_sync: bool,
     opts: MmapFileOptions,
 }
 
@@ -707,16 +942,21 @@ impl MmapDataFile {
     ) -> io::Result<Self> {
         let path = path.as_ref();
         if !read_only {
-            // Create the file if missing and fsync the parent so the entry is durable. A redundant
-            // create attempt just fails and is ignored.
-            if File::create_new(path).is_ok() {
-                if let Some(parent) = path.parent() {
-                    let _ = fsync_directory(parent);
-                }
-            }
+            // Create the file if missing. A create that fails (the file exists) is ignored; the
+            // open below reports any real error.
+            let _ = File::create_new(path);
         }
         let file = OpenOptions::new().read(true).write(!read_only).open(path)?;
         let orig_len = file.metadata()?.len();
+        if !read_only && orig_len == 0 {
+            // Sync the new entry before anything is written to the file, so data later made
+            // durable never sits in a file the directory lost. A 0-length file that already
+            // existed is synced as well: it is a retried open whose create may have landed while
+            // its sync did not. A failed sync fails the open.
+            if let Some(parent) = entry_dir(path) {
+                fsync_directory(parent)?;
+            }
+        }
 
         // A clean `Drop` appends an 8-byte sentinel at physical EOF (see `clean_close_sentinel`).
         // Detect it here: a valid sentinel means the file was sealed, so the logical data ends 8
@@ -725,10 +965,48 @@ impl MmapDataFile {
         // path runs — the logical end is left at physical EOF for that scan.
         let (logical_end, opened_unclean) = detect_sentinel(&file, orig_len)?;
 
+        // An unclean file's bytes are readable but not necessarily durable: the process that
+        // crashed wrote them through its mapping and may never have msynced them, so they can
+        // still be dirty pages in the page cache. `flushed_end` below starts the barriers at
+        // `logical_end`, and they flush only from there on (a ranged msync does not flush pages
+        // outside its range), so fsync the whole file once first; that flushes the inode's dirty
+        // pages whichever process dirtied them. A clean close msynced before it sealed, a
+        // read-only handle vouches for nothing, and a derived file is rebuilt after any unclean
+        // open, so none of those need it.
+        //
+        // The fsync does not prove the bytes are on disk. Linux reports a writeback error once:
+        // if the process that saw it has exited (a failed sync stops the node, and a supervisor
+        // restarts it in the same boot), this fsync succeeds while the failed pages sit in the
+        // page cache never written, and clean, so no sync writes them again. With
+        // `drop_cache_on_unclean_open` (tndb's logs) the open then drops the file's cached pages
+        // before anything maps it, so it and its owner's recovery read what the disk holds, and
+        // the recovery stops at the hole instead of building on it. Without it the owner reads
+        // the page cache (a pack's recovery mostly refuses, rather than cuts, at a hole a later
+        // power loss reveals). The kernel keeps any page another process maps; nothing in this
+        // crate maps the file at this point (see `drop_cached_pages`).
+        #[cfg(test)]
+        let (mut open_syncs, mut open_evictions) = (0, 0);
+        if !read_only && opened_unclean && !opts.derived {
+            fsync_file(&file)?;
+            #[cfg(test)]
+            {
+                open_syncs += 1;
+            }
+            if opts.drop_cache_on_unclean_open {
+                drop_cached_pages(&file)?;
+                #[cfg(test)]
+                {
+                    open_evictions += 1;
+                }
+            }
+        }
+
         // On an unclean file, recover a durable commit marker from the tail of the mmap capacity if
         // one is present (best-effort — see `stamp_commit_marker`). A clean/fresh file has none (a
         // clean close truncates the padding, and its own trailing bytes are the 8-byte clean-close
         // sentinel, not this 16-byte marker). Absent/torn/stale → `None` → the WAL probe decides.
+        // Read after the fsync and any cache drop above: the marker's page may hold a marker
+        // only the page cache has.
         let committed_marker = if opened_unclean && orig_len >= COMMIT_MARKER_LEN {
             let mut tail = [0_u8; COMMIT_MARKER_LEN as usize];
             file.read_exact_at(&mut tail, orig_len - COMMIT_MARKER_LEN)?;
@@ -736,24 +1014,6 @@ impl MmapDataFile {
         } else {
             None
         };
-
-        // An unclean file's bytes are readable but not necessarily durable: the process that
-        // crashed wrote them through its mapping and may never have msynced them, so they can
-        // still be dirty pages in the page cache. `flushed_end` below vouches for
-        // `[0, logical_end)`, and later barriers flush only from there on (a ranged msync does
-        // not flush pages outside its range), so fsync the whole file once first; that flushes
-        // the inode's dirty pages whichever process dirtied them. A clean close synced before it
-        // sealed, a read-only handle vouches for nothing, and a derived file is rebuilt after any
-        // unclean open, so none of those need it.
-        #[cfg(test)]
-        let mut open_syncs = 0;
-        if !read_only && opened_unclean && !opts.derived {
-            fsync_file(&file)?;
-            #[cfg(test)]
-            {
-                open_syncs += 1;
-            }
-        }
 
         // A writable reopen of a sealed file retires its clean-close sentinel on disk, durably,
         // before anything is written. The sentinel only vouches for the bytes as they were sealed;
@@ -764,7 +1024,13 @@ impl MmapDataFile {
         // capacity padding past `logical_end`, so a crash right after this leaves exactly the
         // zero padding every unclean-recovery path already expects. One 8-byte write and a data
         // sync per writable reopen of a sealed file (an open, never the persist hot path).
-        if !read_only && !opened_unclean && logical_end < orig_len {
+        //
+        // With `defer_seal_retire` the retirement waits for the handle's first `write` instead
+        // (`retire_seal_if_pending`), so the file stays sealed through whatever its owner does at
+        // open (tndb's replay), and through a crash or failure before anything is written.
+        let sealed_reopen = !read_only && !opened_unclean && logical_end < orig_len;
+        let seal_pending = sealed_reopen && opts.defer_seal_retire;
+        if sealed_reopen && !seal_pending {
             file.write_all_at(&[0_u8; SENTINEL_LEN as usize], logical_end)?;
             fdatasync_file(&file)?;
         }
@@ -772,9 +1038,9 @@ impl MmapDataFile {
         // Map only the bytes that already exist. A fresh (0-length) RW file is left unallocated
         // until the first write, so a crash before any data keeps it 0-length (and it reopens as
         // empty). Existing content is mapped as-is, including a clean file's 8 trailing bytes in
-        // the `[end, capacity)` padding region (the sentinel on a read-only open; zeros on a
-        // writable one, retired above); any trailing padding a crashed writer left is handled by
-        // the pack's heal path.
+        // the `[end, capacity)` padding region (the sentinel on a read-only open or while its
+        // retirement is deferred; zeros on a writable one, retired above); any trailing padding a
+        // crashed writer left is handled by the pack's heal path.
         // A writable handle with a reservation maps it once (even over an empty file) and grows the
         // file underneath; if the address space cannot be reserved, it runs in the classic mode.
         let reserved_map = if !read_only && opts.reserve > 0 {
@@ -832,12 +1098,16 @@ impl MmapDataFile {
             seek_pos: 0,
             read_only,
             remove_on_drop: false,
-            // Existing content is durable on disk (sealed after a sync, or synced above after an
-            // unclean open), so the sync fast path starts here.
+            // The sync fast path starts at the existing content's end: a sealed file was msynced
+            // before its seal, and an unclean one fsynced above. That fsync cannot vouch for pages
+            // a failed writeback left clean in the page cache but never wrote; with
+            // `drop_cache_on_unclean_open` they were dropped and the content is what the disk
+            // holds, without it the owner trusts the page cache's view (see above).
             flushed_end: AtomicU64::new(logical_end),
             opened_unclean,
+            seal_pending,
+            closed: false,
             committed_marker,
-            write_failed: AtomicBool::new(false),
             size_unsynced: AtomicBool::new(false),
             growths: 0,
             reserved,
@@ -847,6 +1117,10 @@ impl MmapDataFile {
             size_syncs: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(test)]
             open_syncs: std::sync::atomic::AtomicUsize::new(open_syncs),
+            #[cfg(test)]
+            open_evictions: std::sync::atomic::AtomicUsize::new(open_evictions),
+            #[cfg(test)]
+            fail_seal_sync: false,
             opts,
         };
         df.sync_view();
@@ -890,22 +1164,52 @@ impl MmapDataFile {
     /// rather than left to replay on every restart. Because [`Self::opened_unclean`] gates the
     /// clean-close seal in `Drop`, a recovered handle that is never marked would never re-seal.
     ///
-    /// Does NOT clear [`Self::write_failed`]: a durability failure (a failed `msync`/`fsync`/remap)
-    /// independently suppresses the seal, so recovery can never paper over data that did not reach
-    /// disk. A no-op signal, cheap to call unconditionally on every recovery success path.
+    /// Does NOT clear the poison latch ([`Self::poison`]): a durability failure (a failed
+    /// `msync`/`fsync`/remap) independently suppresses the seal, so recovery can never paper
+    /// over data that did not reach disk. A no-op signal, cheap to call unconditionally on
+    /// every recovery success path.
     pub fn mark_consistent(&mut self) {
         self.opened_unclean = false;
     }
 
-    /// Latch the sticky write/sync poison (see [`Self::write_failed`]). Callable behind `&self` so
-    /// the `&self` sync paths can set it.
-    pub(crate) fn poison(&self) {
-        self.write_failed.store(true, Ordering::Relaxed);
+    /// Retire a deferred clean-close sentinel (see [`MmapFileOptions::defer_seal_retire`]) before
+    /// the first byte is written: zero `[end, end + SENTINEL_LEN)` with a positional write (the
+    /// shared mapping sees it) and data-sync it, so from here a crash reopens the file unclean and
+    /// recovery runs, exactly as for a sentinel retired at open. A no-op once retired, or when
+    /// nothing was deferred. A failure poisons the handle and keeps the seal pending, so `Drop`
+    /// leaves the file alone: no data byte was written, and whether the zeros reach the disk
+    /// decides only whether the next open replays the data as sealed or as unclean.
+    fn retire_seal_if_pending(&mut self) -> io::Result<()> {
+        if !self.seal_pending {
+            return Ok(());
+        }
+        self.file
+            .write_all_at(&[0_u8; SENTINEL_LEN as usize], self.end)
+            .and_then(|()| fdatasync_file(&self.file))
+            .inspect_err(|_| self.poison())?;
+        self.seal_pending = false;
+        Ok(())
     }
 
-    /// True once any durability barrier or remap has failed on this handle.
+    /// Latch the sticky "poison", set on any failed durability barrier (`msync`/`fsync`) or failed
+    /// `remap`, and by an owner that finds its file's durability unknown. Once set,
+    /// `write`/`ensure_len` and this handle's sync entry points return `Err` without retrying (a
+    /// retried `msync` after a writeback error can spuriously succeed on Linux errseq, laundering
+    /// lost data), `stamp_commit_marker` is a no-op, and `Drop` skips the clean-close seal so the
+    /// next open re-runs recovery instead of trusting a possibly-non-durable tail. The latch lives
+    /// in the shared [`MapView`], so a barrier that fails through a view (`MapView::msync`, on
+    /// whatever thread) sets it too. Callable behind `&self` so the `&self` sync paths
+    /// (`flush_dirty`, `sync_range`, `try_clone`) can set it. Never cleared for the life of the
+    /// handle (a durability failure is permanent until reopen); in particular `mark_consistent`
+    /// does NOT clear it, so recovery cannot paper over lost data.
+    pub(crate) fn poison(&self) {
+        self.view.poison();
+    }
+
+    /// True once any durability barrier or remap has failed on this file, through this handle or
+    /// through its shared [`MapView`] (see [`Self::poison`]).
     pub(crate) fn is_poisoned(&self) -> bool {
-        self.write_failed.load(Ordering::Relaxed)
+        self.view.write_failed.load(Ordering::Relaxed)
     }
 
     /// True iff the file has a physical size but every logical byte is zero — the signature of a
@@ -941,7 +1245,8 @@ impl MmapDataFile {
     }
 
     /// Write the commit marker (`committed_end == end`) into the last `COMMIT_MARKER_LEN` bytes
-    /// of the mmap capacity. Best-effort: it dirties one padding page but adds NO sync — the
+    /// of the mmap capacity (see [`Self::stamp_commit_marker_at`], which also reports whether
+    /// it stamped). Best-effort: it dirties one padding page but adds NO sync — the
     /// durability barrier stays the caller's `sync_all` (`msync` of `[flushed_end, end)`),
     /// which does not cover this page, so the marker reaches disk via OS writeback or the next
     /// fsync (a barrier after a growth, or the clean close). That is enough for its purpose
@@ -949,39 +1254,46 @@ impl MmapDataFile {
     ///
     /// Fail-safe by construction: callers stamp *after* the data `msync`, so the marker can never
     /// be ahead of durable data — a crash leaves it behind or absent, never fabricating a
-    /// watermark past real data. A no-op on a read-only handle, an empty file, or when the
-    /// capacity padding cannot hold the marker without overlapping `[0, end)` (in which case it
-    /// is simply skipped this time — the next stamp, after the next append grows capacity,
-    /// records it).
+    /// watermark past real data. A no-op on a read-only handle, an empty file, a sealed file
+    /// whose sentinel is still pending (see [`MmapFileOptions::defer_seal_retire`]: it has no
+    /// padding, and the sentinel must stay intact), or when the capacity padding cannot hold the
+    /// marker without overlapping `[0, end)` (in which case it is simply skipped this time — the
+    /// next stamp, after the next append grows capacity, records it).
     pub fn stamp_commit_marker(&mut self) {
         self.stamp_commit_marker_at(self.end);
     }
 
     /// [`Self::stamp_commit_marker`] for a committed end below the current one: the end a sync
     /// made outside this file covered while appends continued past it (see [`Self::note_synced`]).
-    /// Ignored past the synced watermark, so it never claims bytes not yet durable.
-    pub(crate) fn stamp_commit_marker_at(&mut self, committed: u64) {
+    /// Ignored past the synced watermark, so it never claims bytes not yet durable. Returns
+    /// whether the marker was stamped, so a caller tracking what the marker covers records only
+    /// a stamp that landed.
+    pub(crate) fn stamp_commit_marker_at(&mut self, committed: u64) -> bool {
         if self.read_only
+            || self.seal_pending
             || committed == 0
             || committed > self.end
             || committed > self.flushed_end.load(Ordering::Relaxed)
             || self.is_poisoned()
         {
-            return;
+            return false;
         }
         // Need `end + COMMIT_MARKER_LEN <= capacity` so the marker sits in the padding past the
         // data.
         let Some(marker_pos) = self.capacity.checked_sub(COMMIT_MARKER_LEN) else {
-            return;
+            return false;
         };
         if marker_pos < self.end {
-            return; // no headroom this persist; skip (fail-safe — falls back to the WAL probe)
+            // No headroom this persist; skip (fail-safe — falls back to the WAL probe).
+            return false;
         }
-        if let Backing::Rw(map) = &mut self.backing {
-            let marker = commit_marker(committed);
-            let pos = marker_pos as usize;
-            map_range_mut(map, pos, COMMIT_MARKER_LEN as usize).copy_from_slice(&marker);
-        }
+        let Backing::Rw(map) = &mut self.backing else {
+            return false;
+        };
+        let marker = commit_marker(committed);
+        let pos = marker_pos as usize;
+        map_range_mut(map, pos, COMMIT_MARKER_LEN as usize).copy_from_slice(&marker);
+        true
     }
 
     /// Clamp a read-only handle's read bound down to `logical_end` (the caller's index-attested
@@ -1042,6 +1354,7 @@ impl MmapDataFile {
     /// returned slice borrows `&mut self`, so no concurrent write/remap (which needs `&mut self`)
     /// can invalidate it while it is held.
     pub fn slice_mut(&mut self, offset: u64, len: usize) -> Option<&mut [u8]> {
+        debug_assert!(!self.seal_pending, "a sealed file changes only through `write`");
         let range_end = offset.checked_add(len as u64)?;
         if range_end > self.end {
             return None;
@@ -1095,6 +1408,20 @@ impl MmapDataFile {
             Backing::Empty => (std::ptr::null(), 0),
         };
         self.view.set_mapping(base, len);
+        self.view.physical.store(self.capacity, Ordering::Release);
+    }
+
+    /// Unmap this file's mappings, current and retired, or, while a reader may still hold its view
+    /// (and so a slice borrowed through it), hand them to the view, which unmaps them when the last
+    /// reader drops it. No reader can obtain the view once its count is 1: a new one comes from
+    /// [`Self::view`], which this `&mut self` excludes.
+    fn release_mappings(&mut self) {
+        let mut maps = std::mem::take(&mut self.retired);
+        maps.push(std::mem::replace(&mut self.backing, Backing::Empty));
+        maps.retain(|map| !matches!(map, Backing::Empty));
+        if !maps.is_empty() && Arc::strong_count(&self.view) > 1 {
+            self.view.kept.lock().unwrap_or_else(std::sync::PoisonError::into_inner).extend(maps);
+        }
     }
 
     /// Take the current mapping out of `backing`, retiring it (kept mapped until drop) when a
@@ -1127,6 +1454,8 @@ impl MmapDataFile {
         // failure below must leave `capacity == 0` rather than a stale value that lies about the
         // mapping size. Restored to `new_len` only once the new map is installed.
         self.capacity = 0;
+        // Readers clamp to the physical size: lower it before the file shrinks.
+        self.view.physical.fetch_min(new_len, Ordering::AcqRel);
         // A failed resize/remap leaves the handle with no live mapping and unknown durability for
         // any tail dirtied through the released map; latch the poison so later writes/syncs fail
         // and `Drop` does not seal a file whose mapping was lost mid-flight.
@@ -1183,7 +1512,8 @@ impl MmapDataFile {
     /// The reserved padding is transient: the clean-close `Drop` truncates back to `end`, so the
     /// real disk cost (≤ one growth step past the data) is only paid while the file is open.
     /// Where the platform/filesystem cannot preallocate, it falls back to a plain resize (the
-    /// old sparse behaviour) so the file still functions.
+    /// old sparse behaviour) so the file still functions, and warns once per process (Linux)
+    /// that a full disk may then surface as SIGBUS.
     #[cfg(target_os = "linux")]
     fn allocate_range(&self, from: u64, to: u64) -> io::Result<()> {
         let len = to.saturating_sub(from);
@@ -1201,9 +1531,20 @@ impl MmapDataFile {
             return Ok(());
         }
         let err = io::Error::last_os_error();
-        // Some filesystems (tmpfs, some network/older FS) don't implement fallocate; fall back to a
-        // plain resize (sparse) rather than failing an otherwise-serviceable write.
+        // Some filesystems (ext2/ext3, NFS before 4.2, FUSE without fallocate, older ZFS) don't
+        // implement it; fall back to a plain resize (sparse) rather than failing an
+        // otherwise-serviceable write, but say once per process what that costs.
         if matches!(err.raw_os_error(), Some(libc::EOPNOTSUPP) | Some(libc::ENOSYS)) {
+            static WARNED: AtomicBool = AtomicBool::new(false);
+            if !WARNED.swap(true, Ordering::Relaxed) {
+                tracing::warn!(
+                    file = %self.path.display(),
+                    error = %err,
+                    "this filesystem cannot preallocate (fallocate); storage files grow sparse, so \
+                     a full disk may stop the node with SIGBUS instead of a write error. ext4 and \
+                     xfs are the supported filesystems (logged once per process)"
+                );
+            }
             return self.file.set_len(to);
         }
         Err(err) // ENOSPC / EDQUOT / EFBIG / EIO propagate as the write's io::Error
@@ -1274,6 +1615,7 @@ impl MmapDataFile {
             // The reserved mapping already covers the grown file (`allocate_range` extended it to
             // `new_cap`): no remap, so the mapping does not move.
             self.capacity = new_cap;
+            self.view.physical.store(new_cap, Ordering::Release);
         } else {
             self.remap(new_cap)?;
         }
@@ -1321,13 +1663,17 @@ impl MmapDataFile {
     /// The extended region reads as zero: a fresh grow is zero-filled (preallocation /
     /// ftruncate-extend), and the one historical exception — the previous clean-close sentinel
     /// sitting in the `[end, end + SENTINEL_LEN)` padding after a clean reopen — is now zeroed
-    /// at open (see `open_with`). Never shrinks. Unlike [`Self::truncate`], growth is geometric
-    /// (a remap only when a step crosses the current capacity), so repeated one-record
-    /// extensions (e.g. the digest index adding a bucket per split) do not remap every call.
+    /// at open (see `open_with`), or with [`MmapFileOptions::defer_seal_retire`] by the first
+    /// `write`, before which this must not be called. Never shrinks. Unlike [`Self::truncate`],
+    /// growth is geometric (a remap only when a step crosses the current capacity), so repeated
+    /// one-record extensions (e.g. the digest index adding a bucket per split) do not remap
+    /// every call.
     pub fn ensure_len(&mut self, new_len: u64) -> io::Result<()> {
         if new_len <= self.end {
             return Ok(());
         }
+        // The region it extends into would hold a pending sentinel, not zeros.
+        debug_assert!(!self.seal_pending, "a sealed file changes only through `write`");
         if self.read_only {
             return Err(io::Error::new(
                 io::ErrorKind::ReadOnlyFilesystem,
@@ -1351,8 +1697,10 @@ impl MmapDataFile {
     /// extending here via the bare `remap` below would leave a sparse (unbacked) region that
     /// SIGBUSes on the first store when the disk is full — the very footgun the preallocation
     /// path exists to close. For a cheap LOGICAL shrink that keeps the physical file (no
-    /// ftruncate/remap), use [`Self::rewind_to`] instead.
+    /// ftruncate/remap), use [`Self::rewind_to`] instead. Errs, changing nothing, for a `len`
+    /// below the length published to the file's [`MapView`] readers.
     pub fn truncate(&mut self, len: u64) -> io::Result<()> {
+        debug_assert!(!self.seal_pending, "a sealed file changes only through `write`");
         if self.read_only {
             return Err(io::Error::new(
                 io::ErrorKind::ReadOnlyFilesystem,
@@ -1375,9 +1723,19 @@ impl MmapDataFile {
                 ),
             ));
         }
+        let published = self.view.published.load(Ordering::Acquire);
+        if len < published {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "truncate to {len} would cut bytes published to readers (up to {published})"
+                ),
+            ));
+        }
         if self.reserved > 0 && matches!(self.backing, Backing::Rw(_)) {
             // Shrink the file under the reserved mapping, which stays put; the pages past the new
             // EOF are never touched (and read back as zeros if a later growth re-extends the file).
+            self.view.physical.fetch_min(len, Ordering::AcqRel);
             self.file.set_len(len).inspect_err(|_| self.poison())?;
             self.capacity = len;
         } else {
@@ -1407,9 +1765,25 @@ impl MmapDataFile {
     /// Used to atomically undo a partial append (see the consensus pack's save rollback). `new_len`
     /// must be `<= end`; a value at or beyond `end` is ignored (use [`Self::ensure_len`] to grow).
     /// No-op on a read-only handle. Returns the span it zeroed (the chunks that held non-zero
-    /// bytes), if any, for a caller that must flush the zeros or report what it cut.
+    /// bytes), if any, for a caller that must flush the zeros or report what it cut. A `new_len`
+    /// below the length published to the file's [`MapView`] readers is refused: nothing is cut,
+    /// and the file is poisoned (see [`Self::poison`]), so every later write and sync fails.
     pub fn rewind_to(&mut self, new_len: u64) -> Option<std::ops::Range<u64>> {
         if self.read_only || new_len >= self.end {
+            return None;
+        }
+        debug_assert!(!self.seal_pending, "a sealed file changes only through `write`");
+        let published = self.view.published.load(Ordering::Acquire);
+        if new_len < published {
+            // Zeroing bytes a reader may be borrowing is a data race: refuse, leave every byte in
+            // place, and poison the file, so it accepts no later write or sync and is not sealed
+            // (the next open recovers it).
+            tracing::error!(
+                "MmapDataFile: refusing to rewind {:?} to {new_len}, below the {published} bytes \
+                 published to readers; the file is poisoned",
+                self.path
+            );
+            self.poison();
             return None;
         }
         let mut zeroed: Option<std::ops::Range<u64>> = None;
@@ -1830,6 +2204,9 @@ impl Write for MmapDataFile {
         if buf.is_empty() {
             return Ok(0);
         }
+        // The first write after a sealed open with a deferred retirement retires the sentinel
+        // (durably) before it changes a byte.
+        self.retire_seal_if_pending()?;
         let n = buf.len() as u64;
         let start = match self.opts.write_mode {
             WriteMode::Append => self.end,
@@ -1865,11 +2242,19 @@ impl Write for MmapDataFile {
 
 impl Drop for MmapDataFile {
     fn drop(&mut self) {
+        self.close_on_drop();
+        self.release_mappings();
+    }
+}
+
+impl MmapDataFile {
+    /// `Drop`'s work before the mappings go: remove, leave, or seal the file.
+    fn close_on_drop(&mut self) {
         // Whatever path this takes, a reader still holding the view finds nothing mapped from now
         // on, rather than a mapping about to go.
         self.view.set_mapping(std::ptr::null(), 0);
         if self.remove_on_drop {
-            self.backing = Backing::Empty; // release the map before removing the file
+            self.release_mappings(); // release the map before removing the file
             match std::fs::remove_file(&self.path) {
                 // Already unlinked (e.g. its directory was removed while it was still mapped).
                 Err(e) if e.kind() == io::ErrorKind::NotFound => {}
@@ -1880,7 +2265,14 @@ impl Drop for MmapDataFile {
             }
             return;
         }
-        if self.read_only {
+        // A read-only handle writes nothing, and [`Self::seal`] already closed a sealed one.
+        if self.read_only || self.closed {
+            return;
+        }
+        // A sealed file whose sentinel retirement is still pending was never written: on disk it
+        // is still sealed, exactly as it was opened. Leave it alone; a re-seal here would
+        // truncate and rewrite the sentinel, and a crash inside that would leave it unsealed.
+        if self.seal_pending {
             return;
         }
         // Seal with the clean-close sentinel ONLY when this handle was opened clean (or a
@@ -1906,25 +2298,88 @@ impl Drop for MmapDataFile {
             }
             return;
         }
-        // Clean close: msync, truncate away the padding, then (only if the msync succeeded) append
-        // an 8-byte clean-close sentinel and fsync so the on-disk file is exactly `end` data bytes
-        // plus the sentinel and durable — a reopen validates the sentinel, strips it back to `end`,
-        // and knows the file was sealed. A 0-length file is left empty (nothing to seal).
+        // Best effort: each failed step is logged by `clean_close`; an owner that must know the
+        // outcome seals explicitly with `seal`.
+        let _ = self.clean_close();
+    }
+
+    /// Seal the file now with the clean-close seal `Drop` runs (msync, truncate to the logical
+    /// end, the clean-close sentinel, fsync) and report its outcome: the first step that failed,
+    /// or a refusal. For an owner that installs, trusts or deletes something on the strength of
+    /// the seal: a seal in `Drop` can only log a failure, and a read-back of the file afterwards
+    /// goes through the page cache, so it cannot see a failed final fsync (after a power loss the
+    /// truncate and the sentinel may then be gone).
+    ///
+    /// It is refused, with an error and nothing written, where `Drop` would leave the file
+    /// unsealed: opened unclean and not recovered ([`Self::mark_consistent`]), poisoned
+    /// ([`Self::poison`]), dropped during a panic, read-only, or to be removed on drop. `Drop`
+    /// then does what it always does. A sealed file never written since its open (a deferred
+    /// sentinel retirement, see [`MmapFileOptions::defer_seal_retire`]) is sealed on disk as it
+    /// was opened: `Ok` with nothing written.
+    ///
+    /// Once the seal ran, whatever its outcome, the handle is closed: its mappings are released,
+    /// `Drop` does nothing more (a retried sync after a failed one could report success for
+    /// writes that never reached the disk), and it must not be used again; a second `seal` is
+    /// refused.
+    pub(crate) fn seal(&mut self) -> io::Result<()> {
+        let refused = if self.closed {
+            Some("it was already sealed")
+        } else if self.read_only {
+            Some("it is read-only")
+        } else if self.remove_on_drop {
+            Some("it is to be removed on drop")
+        } else if self.opened_unclean {
+            Some("it was opened unclean and not recovered")
+        } else if self.is_poisoned() {
+            Some("an earlier write or sync failed (poisoned)")
+        } else if std::thread::panicking() {
+            Some("the thread is panicking")
+        } else {
+            None
+        };
+        if let Some(why) = refused {
+            return Err(io::Error::other(format!("{} not sealed: {why}", self.path.display())));
+        }
+        self.closed = true;
+        self.view.set_mapping(std::ptr::null(), 0);
+        if self.seal_pending {
+            self.release_mappings();
+            return Ok(());
+        }
+        self.clean_close()
+    }
+
+    /// The clean-close seal: msync, truncate away the padding, then (only if the msync succeeded)
+    /// append an 8-byte clean-close sentinel and fsync, so the on-disk file is exactly `end` data
+    /// bytes plus the sentinel and durable — a reopen validates the sentinel, strips it back to
+    /// `end`, and knows the file was sealed. A 0-length file is left empty (nothing to seal).
+    /// Every step runs whatever the earlier ones returned (as `Drop` always has); each failure is
+    /// logged, and the first is returned. Callers check the gate first (see `close_on_drop` and
+    /// [`Self::seal`]).
+    fn clean_close(&mut self) -> io::Result<()> {
+        let mut first: Option<io::Error> = None;
+        let path = self.path.clone();
+        let mut failed = |step: &str, e: io::Error| {
+            tracing::error!("MmapDataFile: failed to {step} {} on close: {e}", path.display());
+            if first.is_none() {
+                first = Some(io::Error::new(
+                    e.kind(),
+                    format!("failed to {step} {} on close: {e}", path.display()),
+                ));
+            }
+        };
         let flushed = match self.flush_dirty(true) {
             Ok(()) => true,
             Err(e) => {
-                if !std::thread::panicking() {
-                    tracing::error!("MmapDataFile: failed to msync on drop: {e}");
-                }
+                failed("msync", e);
                 false
             }
         };
         self.view.set_mapping(std::ptr::null(), 0);
-        self.backing = Backing::Empty; // unmap before truncating
+        self.view.physical.fetch_min(self.end, Ordering::AcqRel);
+        self.release_mappings(); // unmap before truncating
         if let Err(e) = self.file.set_len(self.end) {
-            if !std::thread::panicking() {
-                tracing::error!("MmapDataFile: failed to truncate on drop: {e}");
-            }
+            failed("truncate", e);
         }
         // Only stamp the clean-close sentinel when the tail msync succeeded. If it failed we cannot
         // vouch for the durability of the `[flushed_end, end)` tail, so leave the file unsentineled
@@ -1943,18 +2398,34 @@ impl Drop for MmapDataFile {
         if flushed && self.end > 0 {
             let sentinel = clean_close_sentinel(self.end);
             if let Err(e) = self.file.write_all_at(&sentinel, self.end) {
-                if !std::thread::panicking() {
-                    tracing::error!(
-                        "MmapDataFile: failed to write clean-close sentinel on drop: {e}"
-                    );
-                }
+                failed("write the clean-close sentinel of", e);
             }
         }
-        if let Err(e) = fsync_file(&self.file) {
-            if !std::thread::panicking() {
-                tracing::error!("MmapDataFile: failed to fsync on drop: {e}");
+        let synced = fsync_file(&self.file);
+        #[cfg(test)]
+        let synced = match synced {
+            Ok(()) if std::mem::take(&mut self.fail_seal_sync) => {
+                Err(io::Error::other("injected seal fsync failure"))
             }
+            synced => synced,
+        };
+        if let Err(e) = synced {
+            failed("fsync", e);
         }
+        first.map_or(Ok(()), Err)
+    }
+
+    /// Test-only: the next clean-close seal of this handle ([`Self::seal`] or `Drop`) reports its
+    /// final fsync as failed after the fsync ran: the sentinel is then in the page cache (and, in
+    /// a test, on disk), so a read-back finds the file sealed, as after a real fsync error.
+    #[cfg(test)]
+    pub(crate) fn fail_next_seal_sync_for_test(&mut self) {
+        self.fail_seal_sync = true;
+    }
+
+    /// True once [`Self::seal`] ran on this handle (whatever its outcome).
+    pub(crate) fn is_closed(&self) -> bool {
+        self.closed
     }
 }
 
@@ -2012,6 +2483,8 @@ mod tests {
             derived: false,
             reserve: 0,
             max_record_size: None,
+            defer_seal_retire: false,
+            drop_cache_on_unclean_open: false,
         }
     }
 
@@ -2025,6 +2498,8 @@ mod tests {
             derived: false,
             reserve: 0,
             max_record_size: None,
+            defer_seal_retire: false,
+            drop_cache_on_unclean_open: false,
         }
     }
 
@@ -2092,59 +2567,117 @@ mod tests {
         df.open_syncs.load(Ordering::Relaxed)
     }
 
-    /// A writable open of an unclean file fsyncs it once before `flushed_end` vouches for its
-    /// existing bytes: the crashed writer may never have msynced them, and later barriers flush
-    /// only from `flushed_end` on.
-    #[test]
-    fn unclean_writable_open_syncs_existing_bytes_once() {
-        let tmp = TempDir::with_prefix("mmap_df_unclean_open_sync").expect("temp dir");
-        let path = tmp.path().join("data");
-        write_and_crash(&path, tiny_opts(), 200);
-        let df = MmapDataFile::open_with(&path, false, tiny_opts()).expect("unclean reopen");
-        assert!(df.opened_unclean(), "precondition: opened unclean");
-        assert_eq!(open_syncs(&df), 1, "an unclean writable open syncs the file once");
-        assert_eq!(df.synced_end(), df.len(), "the synced bytes are the durable watermark");
-        std::mem::forget(df); // no recovery in this unit test; don't seal the padding on drop
+    fn open_evictions(df: &MmapDataFile) -> usize {
+        df.open_evictions.load(Ordering::Relaxed)
     }
 
-    /// A clean close synced before sealing, so a clean reopen trusts its bytes without a sync.
+    /// [`tiny_opts`] with [`MmapFileOptions::drop_cache_on_unclean_open`] (tndb's logs set it).
+    fn drop_cache_opts() -> MmapFileOptions {
+        MmapFileOptions { drop_cache_on_unclean_open: true, ..tiny_opts() }
+    }
+
+    /// A writable open of an unclean file fsyncs it once before `flushed_end` vouches for its
+    /// existing bytes: the crashed writer may never have msynced them, and later barriers flush
+    /// only from `flushed_end` on. With `drop_cache_on_unclean_open` it then drops the file's
+    /// cached pages once; without it, never.
+    #[test]
+    fn unclean_writable_open_syncs_existing_bytes_once() {
+        for opts in [tiny_opts(), drop_cache_opts()] {
+            let tmp = TempDir::with_prefix("mmap_df_unclean_open_sync").expect("temp dir");
+            let path = tmp.path().join("data");
+            write_and_crash(&path, opts, 200);
+            let df = MmapDataFile::open_with(&path, false, opts).expect("unclean reopen");
+            assert!(df.opened_unclean(), "precondition: opened unclean");
+            assert_eq!(open_syncs(&df), 1, "an unclean writable open syncs the file once");
+            let evictions = usize::from(opts.drop_cache_on_unclean_open);
+            assert_eq!(open_evictions(&df), evictions, "cache drops with {opts:?}");
+            assert_eq!(df.synced_end(), df.len(), "the synced bytes are the durable watermark");
+            assert_eq!(df.slice(0, 200), Some(&pattern(200)[..]), "the bytes read back whole");
+            std::mem::forget(df); // no recovery in this unit test; don't seal the padding on drop
+        }
+    }
+
+    /// A clean close synced before sealing, so a clean reopen trusts its bytes without a sync,
+    /// and keeps its cached pages.
     #[test]
     fn clean_open_skips_the_open_sync() {
         let tmp = TempDir::with_prefix("mmap_df_clean_open_sync").expect("temp dir");
         let path = tmp.path().join("data");
         {
-            let mut df = MmapDataFile::open_with(&path, false, tiny_opts()).expect("open");
+            let mut df = MmapDataFile::open_with(&path, false, drop_cache_opts()).expect("open");
             df.write_all(&pattern(200)).expect("write");
             assert_eq!(open_syncs(&df), 0, "a fresh file has nothing to sync");
+            assert_eq!(open_evictions(&df), 0, "a fresh file has nothing to drop");
         }
-        let df = MmapDataFile::open_with(&path, false, tiny_opts()).expect("clean reopen");
+        let df = MmapDataFile::open_with(&path, false, drop_cache_opts()).expect("clean reopen");
         assert!(!df.opened_unclean(), "precondition: opened clean");
         assert_eq!(open_syncs(&df), 0, "a clean open needs no open-time sync");
+        assert_eq!(open_evictions(&df), 0, "a clean open keeps the cache");
     }
 
-    /// A read-only handle never writes or advances a durable watermark, so it never syncs at open.
+    /// A read-only handle never writes or advances a durable watermark, so it never syncs at open
+    /// (nor drops the cache).
     #[test]
     fn read_only_open_skips_the_open_sync() {
         let tmp = TempDir::with_prefix("mmap_df_ro_open_sync").expect("temp dir");
         let path = tmp.path().join("data");
-        write_and_crash(&path, tiny_opts(), 200);
-        let df = MmapDataFile::open_with(&path, true, tiny_opts()).expect("read-only reopen");
+        write_and_crash(&path, drop_cache_opts(), 200);
+        let df = MmapDataFile::open_with(&path, true, drop_cache_opts()).expect("read-only reopen");
         assert!(df.opened_unclean(), "precondition: opened unclean");
         assert_eq!(open_syncs(&df), 0, "a read-only open never syncs");
+        assert_eq!(open_evictions(&df), 0, "a read-only open keeps the cache");
     }
 
     /// A derived file is rebuilt from the data log after any unclean open, so its existing bytes
-    /// are never trusted and need no open-time sync.
+    /// are never trusted and need no open-time sync (nor a cache drop).
     #[test]
     fn derived_unclean_open_skips_the_open_sync() {
         let tmp = TempDir::with_prefix("mmap_df_derived_open_sync").expect("temp dir");
         let path = tmp.path().join("index");
-        let opts = MmapFileOptions { derived: true, ..tiny_opts() };
+        let opts = MmapFileOptions { derived: true, ..drop_cache_opts() };
         write_and_crash(&path, opts, 200);
         let df = MmapDataFile::open_with(&path, false, opts).expect("unclean reopen");
         assert!(df.opened_unclean(), "precondition: opened unclean");
         assert_eq!(open_syncs(&df), 0, "a derived file is rebuilt, not synced, after a crash");
+        assert_eq!(open_evictions(&df), 0, "a derived file keeps the cache");
         std::mem::forget(df);
+    }
+
+    /// A process restarted after a failed writeback whose error went to the process that exited:
+    /// newer bytes and a later commit marker sit in the page cache, clean but never written, and
+    /// the open's fsync succeeds without writing them (Linux reports a writeback error once). With
+    /// `drop_cache_on_unclean_open` the open reads what the disk holds: the commit marker that
+    /// reached the disk, and the disk's bytes past the last good write.
+    #[test]
+    fn unclean_open_drops_the_cache_and_reads_the_disk() {
+        let tmp = TempDir::with_prefix("mmap_df_drop_cache").expect("temp dir");
+        let path = tmp.path().join("data");
+        let opts = MmapFileOptions { drop_cache_on_unclean_open: true, ..Default::default() };
+        let mut df = MmapDataFile::open_with(&path, false, opts).expect("open");
+        disk_model::track(&path);
+        df.write_all(&pattern(200)).expect("write");
+        df.sync_all().expect("msync");
+        df.stamp_commit_marker();
+        df.sync_disk().expect("the marker reaches the disk");
+
+        // Writeback fails from here on, and no sync of this thread reaches the model's disk: not
+        // the newer bytes, not their marker, and not the restarted open's fsync.
+        disk_model::set_flushes_lost(true);
+        df.write_all(&[0xAB; 300]).expect("newer bytes");
+        df.sync_all().expect("msync");
+        df.stamp_commit_marker();
+        df.sync_disk().expect("fsync");
+        std::mem::forget(df); // the process exits: no seal
+        let reopened = MmapDataFile::open_with(&path, false, opts);
+        disk_model::set_flushes_lost(false);
+        let df = reopened.expect("unclean reopen");
+        assert!(df.opened_unclean(), "precondition: opened unclean");
+        assert_eq!(open_evictions(&df), 1, "the open dropped the cache");
+        assert_eq!(df.committed_end(), Some(200), "the marker the disk holds, not the cache's 500");
+        assert_eq!(df.slice(0, 200), Some(&pattern(200)[..]), "the bytes that reached the disk");
+        assert_eq!(df.slice(200, 300), Some(&[0_u8; 300][..]), "the disk's zeros past them");
+        std::mem::forget(df);
+        disk_model::untrack(&path);
     }
 
     /// The reserving mode's point: the mapping never moves while the file grows underneath it, and
@@ -2225,26 +2758,33 @@ mod tests {
         let mut df = MmapDataFile::open_with(&path, false, opts).expect("open");
         let view = df.view();
         df.write_all(&pattern(1_000)).expect("write");
-        assert_eq!(view.slice(0, 100), None, "nothing published yet");
-        view.publish_len(1_000);
-        let old = view.slice(0, 1_000).expect("published slice");
-        assert_eq!(old, &pattern(1_000)[..]);
-        assert_eq!(view.slice(900, 101), None, "past the published length");
-        assert_eq!(view.slice(1_000, 0).map(<[u8]>::len), Some(0));
-        assert_eq!(view.slice(1_001, 0), None);
-        assert_eq!(
-            view.tail_within(900, 1_000).map(<[u8]>::len),
-            Some(100),
-            "the tail stops at its limit"
-        );
-        assert_eq!(view.tail_within(1_001, 1_000), None);
+        // SAFETY (each view read in this test): one thread, and every write lands before the reads
+        // after it, past every byte a live slice borrows (the growth appends past the published
+        // length).
+        let old = unsafe {
+            assert_eq!(view.slice(0, 100), None, "nothing published yet");
+            view.publish_len(1_000);
+            let old = view.slice(0, 1_000).expect("published slice");
+            assert_eq!(old, &pattern(1_000)[..]);
+            assert_eq!(view.slice(900, 101), None, "past the published length");
+            assert_eq!(view.slice(1_000, 0).map(<[u8]>::len), Some(0));
+            assert_eq!(view.slice(1_001, 0), None);
+            assert_eq!(
+                view.tail_within(900, 1_000).map(<[u8]>::len),
+                Some(100),
+                "the tail stops at its limit"
+            );
+            assert_eq!(view.tail_within(1_001, 1_000), None);
+            old
+        };
 
         df.write_all(&pattern(40_000)[1_000..]).expect("grow past the reservation");
         assert!(df.reserved >= 40_000, "re-reserved larger (reserved {})", df.reserved);
         assert_eq!(df.retired.len(), 1, "the old mapping is retired, not unmapped");
         assert_eq!(old, &pattern(1_000)[..], "a slice of the old mapping is still readable");
         view.publish_len(40_000);
-        let new = view.slice(0, 40_000).expect("slice after the move");
+        // SAFETY: as above.
+        let new = unsafe { view.slice(0, 40_000) }.expect("slice after the move");
         assert_eq!(new, &pattern(40_000)[..]);
         assert_ne!(new.as_ptr(), old.as_ptr(), "the view follows the new mapping");
     }
@@ -2261,16 +2801,19 @@ mod tests {
             df.write_all(&pattern(1_000)).expect("write");
             let view = df.view();
             view.publish_len(1_000);
-            assert_eq!(view.slice(10, 20).map(<[u8]>::len), Some(20), "exactly the bytes asked");
+            // SAFETY (each view read in this test): one thread; nothing writes a byte a live
+            // slice borrows.
+            let asked = unsafe { view.slice(10, 20) }.map(<[u8]>::len);
+            assert_eq!(asked, Some(20), "exactly the bytes asked");
             df.sync_all().expect("sync");
         }
         let read_only = MmapDataFile::open_with(&path, true, tiny_opts()).expect("open read-only");
         let view = read_only.view();
         view.publish_len(1_000);
-        assert!(view.slice(0, 8).is_some(), "mapped while the file is open");
+        assert!(unsafe { view.slice(0, 8) }.is_some(), "mapped while the file is open");
         drop(read_only);
-        assert_eq!(view.slice(0, 8), None, "nothing mapped once a read-only file drops");
-        assert_eq!(view.tail_within(0, 8), None);
+        assert_eq!(unsafe { view.slice(0, 8) }, None, "nothing mapped once a read-only file drops");
+        assert_eq!(unsafe { view.tail_within(0, 8) }, None);
 
         let mut unclean = MmapDataFile::open_with(&path, false, tiny_opts()).expect("open");
         unclean.write_all(&pattern(10)).expect("write");
@@ -2278,7 +2821,75 @@ mod tests {
         let view = unclean.view();
         view.publish_len(8);
         drop(unclean);
-        assert_eq!(view.slice(0, 8), None, "nor once an unclean file drops, unsealed");
+        assert_eq!(unsafe { view.slice(0, 8) }, None, "nor once an unclean file drops, unsealed");
+    }
+
+    /// A [`MapView`] read is clamped to the file's physical size, not only to the published length
+    /// and the mapping: under a reservation the mapping runs past the end of the file, so a length
+    /// published (or a limit passed) past it reads nothing there instead of a page past EOF.
+    #[test]
+    fn map_view_clamps_to_the_physical_size() {
+        let tmp = TempDir::with_prefix("mmap_df_view_physical").expect("temp dir");
+        let path = tmp.path().join("data");
+        let opts = MmapFileOptions { reserve: 1 << 20, ..tiny_opts() };
+        let mut df = MmapDataFile::open_with(&path, false, opts).expect("open");
+        df.write_all(&pattern(100)).expect("write");
+        let physical = df.capacity;
+        let view = df.view();
+        assert!(view.mapped.load(Ordering::Relaxed) > physical + 8192, "the reservation runs on");
+        // A stale or wrong length, past the file.
+        view.publish_len(physical + 8192);
+        // SAFETY: one thread, every write before the reads and none while they live.
+        unsafe {
+            assert!(view.slice(0, 100).is_some(), "bytes in the file read");
+            assert!(view.slice(physical, 8).is_none(), "nothing past the physical size");
+            let tail = view.tail_within(0, physical + 8192).map(<[u8]>::len);
+            assert_eq!(tail, Some(physical as usize));
+        }
+        assert!(view.msync(0, physical + 8192).is_err(), "a sync past the file errs");
+    }
+
+    /// The file refuses to cut or zero bytes published to readers: `truncate` below the published
+    /// length errs and `rewind_to` below it poisons the file, each leaving every byte in place.
+    #[test]
+    fn shrinks_below_the_published_length_are_refused() {
+        let tmp = TempDir::with_prefix("mmap_df_shrink_refused").expect("temp dir");
+        let path = tmp.path().join("data");
+        let data = pattern(200);
+        let mut df = MmapDataFile::open_with(&path, false, tiny_opts()).expect("open");
+        df.write_all(&data).expect("write");
+        let view = df.view();
+        view.publish_len(100);
+        assert!(df.rewind_to(150).is_some(), "a rewind above the published length runs");
+        assert!(df.truncate(50).is_err(), "a truncate below it is refused");
+        assert_eq!(df.len(), 150);
+        df.truncate(120).expect("a truncate down to it runs");
+        assert_eq!(df.rewind_to(50), None, "a rewind below it is refused");
+        assert!(df.is_poisoned(), "and poisons the file");
+        assert_eq!(df.len(), 120);
+        // SAFETY: one thread, every write before the read and none while it lives.
+        let published = unsafe { view.slice(0, 100) };
+        assert_eq!(published, Some(&data[..100]), "the published bytes are untouched");
+    }
+
+    /// A file dropped while its [`MapView`] is still shared leaves its mapping to the view, so a
+    /// slice borrowed through the view stays readable until the view goes.
+    #[test]
+    fn dropped_file_leaves_its_mapping_to_a_shared_view() {
+        let tmp = TempDir::with_prefix("mmap_df_view_keeps_map").expect("temp dir");
+        let path = tmp.path().join("data");
+        let data = pattern(1_000);
+        let mut df = MmapDataFile::open_with(&path, false, tiny_opts()).expect("open");
+        df.write_all(&data).expect("write");
+        let view = df.view();
+        view.publish_len(1_000);
+        // SAFETY (each view read in this test): one thread; the drop's clean close writes its
+        // sentinel and cuts the file only past the published bytes.
+        let borrowed = unsafe { view.slice(0, 1_000) }.expect("published");
+        drop(df);
+        assert!(!view.kept.lock().expect("kept").is_empty(), "the view keeps the mapping");
+        assert_eq!(borrowed, &data[..], "the borrowed bytes are still mapped");
+        assert_eq!(unsafe { view.slice(0, 8) }, None, "but the view reads nothing new");
     }
 
     /// An empty file opened with a reservation is mapped at once (no first-write remap) and works
@@ -2745,6 +3356,61 @@ mod tests {
         assert!(reopened.opened_unclean(), "an unsealed in-place write must reopen unclean");
     }
 
+    /// With `defer_seal_retire`, a writable open of a sealed file keeps its sentinel on disk until
+    /// the first write: a drop or a crash with nothing written leaves the file byte-identical and
+    /// sealed. The first write (here in place, which never overwrites the sentinel itself) retires
+    /// it on disk, so a crash after it reopens unclean.
+    #[test]
+    fn deferred_seal_retire_keeps_the_seal_until_the_first_write() {
+        let tmp = TempDir::with_prefix("mmap_df_defer_seal").expect("temp dir");
+        let path = tmp.path().join("data");
+        let data = pattern(100);
+        {
+            let mut df = MmapDataFile::open_with(&path, false, random_opts()).expect("open");
+            df.write_all(&data).expect("write"); // clean close on drop seals the file
+        }
+        let sealed = std::fs::read(&path).expect("read file");
+        assert_eq!(sealed.len() as u64, data.len() as u64 + SENTINEL_LEN, "precondition: sealed");
+        // An old modification time, which any write (a re-seal's truncate and sentinel included)
+        // would move to now, whatever the clock's granularity.
+        let old = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1 << 20);
+        File::options().write(true).open(&path).expect("open").set_modified(old).expect("mtime");
+        let modified = || std::fs::metadata(&path).expect("meta").modified().expect("mtime");
+        let opts = MmapFileOptions { defer_seal_retire: true, ..random_opts() };
+
+        for crash in [false, true] {
+            let mut df = MmapDataFile::open_with(&path, false, opts).expect("reopen rw");
+            assert!(!df.opened_unclean(), "a sealed file reopens clean");
+            assert_eq!(std::fs::read(&path).expect("read file"), sealed, "the sentinel stays");
+            assert!(!df.stamp_commit_marker_at(df.len()), "no marker over a pending sentinel");
+            df.sync_all().expect("a barrier with nothing written");
+            if crash {
+                std::mem::forget(df);
+            } else {
+                drop(df);
+            }
+            assert_eq!(
+                std::fs::read(&path).expect("read file"),
+                sealed,
+                "byte-identical with nothing written (crash: {crash})"
+            );
+            assert_eq!(modified(), old, "never written, not even re-sealed (crash: {crash})");
+        }
+
+        let mut df = MmapDataFile::open_with(&path, false, opts).expect("reopen rw");
+        df.seek(SeekFrom::Start(10)).expect("seek");
+        df.write_all(&[0xAB; 5]).expect("in-place write");
+        assert_eq!(
+            &std::fs::read(&path).expect("read file")[data.len()..],
+            &[0_u8; SENTINEL_LEN as usize],
+            "the first write retired the sentinel on disk"
+        );
+        // Crash: the handle never runs its clean-close seal.
+        std::mem::forget(df);
+        let reopened = MmapDataFile::open_with(&path, true, opts).expect("reopen after crash");
+        assert!(reopened.opened_unclean(), "an unsealed in-place write must reopen unclean");
+    }
+
     #[test]
     fn rewind_to_rolls_back_logical_end_without_physical_truncate() {
         let tmp = TempDir::with_prefix("mmap_df_rewind").expect("temp dir");
@@ -3016,6 +3682,89 @@ mod tests {
         );
     }
 
+    /// A barrier that fails through a shared [`MapView`] on another thread (as tndb's commit
+    /// thread syncs its log) poisons the owning file without the owner calling `poison`: its own
+    /// barriers then refuse, and its `Drop` leaves the file unsealed.
+    #[test]
+    fn failed_view_msync_poisons_the_owner() {
+        let tmp = TempDir::with_prefix("mmap_df_view_poison").expect("temp dir");
+        let path = tmp.path().join("data");
+        let data = pattern(80);
+        {
+            let mut df = MmapDataFile::open_with(&path, false, tiny_opts()).expect("open");
+            df.write_all(&data).expect("write");
+            let view = df.view();
+            view.publish_len(data.len() as u64);
+            std::thread::spawn(move || {
+                FAIL_NEXT_VIEW_MSYNC.set(true);
+                assert!(view.msync(0, data.len() as u64).is_err(), "the injected failure");
+            })
+            .join()
+            .expect("sync thread");
+            assert!(df.is_poisoned(), "a failed view barrier poisons the owner");
+            assert!(df.sync_all().is_err(), "the owner's barriers refuse after it");
+        } // Drop: poisoned → must NOT seal.
+        let df = MmapDataFile::open(&path, true).expect("reopen");
+        assert!(df.opened_unclean(), "a file whose barrier failed is not sealed");
+    }
+
+    /// An explicit [`MmapDataFile::seal`] reports what `Drop` can only log. A good seal leaves the
+    /// file sealed and closes the handle (its `Drop` changes nothing, a second seal is refused); a
+    /// failed final fsync comes back as an error although the file then reads back sealed (the
+    /// sentinel is in the page cache), which is why an owner must not infer the seal from a
+    /// read-back; and a file `Drop` would leave unsealed (poisoned, or opened unclean and not
+    /// recovered) is refused with nothing written.
+    #[test]
+    fn seal_reports_its_outcome() {
+        let tmp = TempDir::with_prefix("mmap_df_seal").expect("temp dir");
+        let data = pattern(80);
+        let sealed_len = data.len() as u64 + SENTINEL_LEN;
+
+        let good = tmp.path().join("good");
+        let mut df = MmapDataFile::open_with(&good, false, tiny_opts()).expect("open");
+        df.write_all(&data).expect("write");
+        df.seal().expect("a healthy file seals");
+        assert!(df.is_closed());
+        assert_eq!(std::fs::metadata(&good).expect("stat").len(), sealed_len, "truncated, sealed");
+        let on_disk = std::fs::read(&good).expect("read");
+        assert!(df.seal().is_err(), "a second seal is refused");
+        let barriers = SYNC_BARRIERS.get();
+        drop(df);
+        assert_eq!(SYNC_BARRIERS.get(), barriers, "Drop ran no second seal");
+        assert_eq!(std::fs::read(&good).expect("read"), on_disk, "Drop changed nothing");
+        let reopened = MmapDataFile::open_with(&good, true, tiny_opts()).expect("reopen");
+        assert!(!reopened.opened_unclean());
+        assert_eq!(reopened.len(), data.len() as u64);
+
+        let fsync_failed = tmp.path().join("fsync_failed");
+        let mut df = MmapDataFile::open_with(&fsync_failed, false, tiny_opts()).expect("open");
+        df.write_all(&data).expect("write");
+        df.fail_next_seal_sync_for_test();
+        let err = df.seal().expect_err("a failed final fsync fails the seal");
+        assert!(err.to_string().contains("fsync"), "{err}");
+        let barriers = SYNC_BARRIERS.get();
+        drop(df);
+        assert_eq!(SYNC_BARRIERS.get(), barriers, "Drop does not retry a failed seal");
+        let reopened = MmapDataFile::open_with(&fsync_failed, true, tiny_opts()).expect("reopen");
+        assert!(!reopened.opened_unclean(), "the read-back cannot see the failed fsync");
+
+        let poisoned = tmp.path().join("poisoned");
+        let mut df = MmapDataFile::open_with(&poisoned, false, tiny_opts()).expect("open");
+        df.write_all(&data).expect("write");
+        df.poison();
+        let err = df.seal().expect_err("a poisoned file is not sealed");
+        assert!(err.to_string().contains("poisoned"), "{err}");
+        assert!(!df.is_closed(), "a refused seal leaves the handle to its Drop");
+        drop(df);
+        let mut df = MmapDataFile::open_with(&poisoned, false, tiny_opts()).expect("reopen");
+        assert!(df.opened_unclean(), "the refused seal wrote nothing");
+        let err = df.seal().expect_err("an unrecovered unclean file is not sealed");
+        assert!(err.to_string().contains("unclean"), "{err}");
+        drop(df);
+        let reopened = MmapDataFile::open_with(&poisoned, true, tiny_opts()).expect("reopen");
+        assert!(reopened.opened_unclean(), "still unsealed");
+    }
+
     #[test]
     fn rename_moves_file() {
         let tmp = TempDir::with_prefix("mmap_df_rename").expect("temp dir");
@@ -3130,6 +3879,8 @@ mod tests {
             derived: false,
             reserve: 0,
             max_record_size: None,
+            defer_seal_retire: false,
+            drop_cache_on_unclean_open: false,
         };
         let mut df = MmapDataFile::open_with(&path, false, opts).expect("open");
         // Fits within the first mapping (<= max_map_size).
@@ -3172,6 +3923,54 @@ mod tests {
         fsync_file(&File::open(tmp.path()).expect("open dir")).expect("fsync a directory");
         fsync_directory(tmp.path()).expect("fsync_directory");
         assert!(fsync_directory(&tmp.path().join("missing")).is_err(), "a missing path errors");
+    }
+
+    /// `create_dir_synced` syncs the directory holding every level it creates, not only the leaf's
+    /// parent, and a failed sync is an error.
+    #[test]
+    fn create_dir_synced_syncs_every_created_level() {
+        let tmp = TempDir::with_prefix("mmap_df_create_dir_synced").expect("temp dir");
+        let root = tmp.path().to_path_buf();
+        let leaf = root.join("a").join("b").join("c");
+        for holder in [root.clone(), root.join("a"), root.join("a").join("b")] {
+            let _ = std::fs::remove_dir_all(root.join("a"));
+            FAIL_DIR_SYNC.set(Some(holder.clone()));
+            let synced = create_dir_synced(&leaf);
+            FAIL_DIR_SYNC.set(None);
+            assert!(synced.is_err(), "a failed sync of {holder:?} must fail the create");
+        }
+        std::fs::remove_dir_all(root.join("a")).expect("remove");
+        create_dir_synced(&leaf).expect("create every level");
+        assert!(leaf.is_dir());
+        // An existing directory syncs only its parent.
+        FAIL_DIR_SYNC.set(Some(root.clone()));
+        let synced = create_dir_synced(&leaf);
+        FAIL_DIR_SYNC.set(None);
+        synced.expect("an existing directory syncs only its parent");
+    }
+
+    /// A writable open that creates a file syncs its directory first and fails when that sync
+    /// fails; a retried open, finding the file present but empty, syncs again. A file holding data
+    /// and a read-only open skip the sync.
+    #[test]
+    fn writable_open_of_a_new_file_syncs_its_directory() {
+        let tmp = TempDir::with_prefix("mmap_df_open_dir_sync").expect("temp dir");
+        let path = tmp.path().join("new.dat");
+        FAIL_DIR_SYNC.set(Some(tmp.path().to_path_buf()));
+        let created = MmapDataFile::open(&path, false).map(drop);
+        let retried = MmapDataFile::open(&path, false).map(drop);
+        FAIL_DIR_SYNC.set(None);
+        assert!(created.is_err(), "a failed directory sync fails the create");
+        assert!(retried.is_err(), "the retried open of the empty file syncs again");
+        let mut df = MmapDataFile::open(&path, false).expect("open");
+        df.write_all(b"data").expect("write");
+        drop(df);
+        FAIL_DIR_SYNC.set(Some(tmp.path().to_path_buf()));
+        let writable = MmapDataFile::open(&path, false).map(drop);
+        let read_only = MmapDataFile::open(&path, true).map(drop);
+        FAIL_DIR_SYNC.set(None);
+        writable.expect("a file holding data skips the directory sync");
+        read_only.expect("a read-only open skips the directory sync");
     }
 
     /// The append `msync` watermark must never drop earlier-synced data. Sync, append past the

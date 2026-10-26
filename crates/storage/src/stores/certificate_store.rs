@@ -1,4 +1,6 @@
-//! NOTE: tests for this module are in test-utils storage_tests.rs to avoid circular dependancies.
+//! NOTE: tests for this module are in test-utils storage_tests.rs to avoid circular dependancies,
+//! apart from `write_all`'s failure path, which needs the crate-internal `FAIL_SAVE_CERT_AFTER`
+//! hook.
 
 use std::{
     cmp::{max, Ordering},
@@ -41,9 +43,10 @@ pub trait CertificateStore {
     /// Inserts a certificate to the store
     fn write(&self, certificate: Certificate) -> StoreResult<()>;
 
-    /// Inserts multiple certificates in the storage. This is an atomic operation.
-    /// In the end it notifies any subscribers that are waiting to hear for the
-    /// value.
+    /// Inserts multiple certificates in the storage in one transaction, then notifies any
+    /// subscribers that are waiting to hear for them. Not atomic on error: if a certificate fails
+    /// to save, the ones before it are still written (with any rows of the failing one written
+    /// before its error) and, once that write succeeds, notified; the error is returned.
     fn write_all<'a>(
         &self,
         certificates: impl IntoIterator<Item = &'a Certificate>,
@@ -134,6 +137,10 @@ fn save_cert<TX: DbTxMut>(
     certificate: &Certificate,
 ) -> StoreResult<()> {
     txn.insert::<Certificates>(&digest, certificate)?;
+    #[cfg(test)]
+    if test_hook::fail_this_save() {
+        eyre::bail!("a save_cert failure injected by a test");
+    }
 
     // write the certificates id by their rounds
     let key = (certificate.round(), certificate.origin().clone());
@@ -186,9 +193,10 @@ impl<DB: Database> CertificateStore for DB {
         Ok(())
     }
 
-    /// Inserts multiple certificates in the storage. This is an atomic operation.
-    /// In the end it notifies any subscribers that are waiting to hear for the
-    /// value.
+    /// Inserts multiple certificates in the storage in one transaction, then notifies any
+    /// subscribers that are waiting to hear for them. Not atomic on error: if a certificate fails
+    /// to save, the ones before it are still written (with any rows of the failing one written
+    /// before its error) and, once that write succeeds, notified; the error is returned.
     fn write_all<'a>(
         &self,
         certificates: impl IntoIterator<Item = &'a Certificate>,
@@ -201,11 +209,18 @@ impl<DB: Database> CertificateStore for DB {
             round = max(round, certificate.round());
             if let Err(e) = save_cert(&mut txn, digest, certificate) {
                 tracing::error!("Failed to write certificate for {digest} due to error {e}.");
-                // The txn ends with the certificates saved so far (no rollback), notified as
-                // before.
-                drop(txn);
-                for (digest, certificate) in saved {
-                    NOTIFY_SUBSCRIBERS.notify(&digest, certificate);
+                // No rollback: the certificates saved so far are written (tndb would write the txn
+                // on drop anyway). Commit here so a failed write is seen, and notify only after one
+                // that succeeded.
+                match txn.commit() {
+                    Ok(()) => {
+                        for (digest, certificate) in saved {
+                            NOTIFY_SUBSCRIBERS.notify(&digest, certificate);
+                        }
+                    }
+                    Err(commit) => tracing::error!(
+                        "Failed to write the certificates saved before {digest}: {commit}"
+                    ),
                 }
                 return Err(e);
             }
@@ -467,3 +482,122 @@ impl<DB: Database> CertificateStore for DB {
 
 // NOTE: tests for this module are in primary/tests/it/storage_tests.rs to avoid circular
 // dependancies.
+
+/// Test-only: make `save_cert` fail part way through a `write_all`.
+#[cfg(test)]
+mod test_hook {
+    use std::cell::Cell;
+
+    thread_local! {
+        /// `save_cert` fails after this many more calls on this thread succeed, once the failing
+        /// call's `Certificates` row is buffered (a failing certificate with some rows written).
+        pub(super) static FAIL_SAVE_CERT_AFTER: Cell<Option<usize>> = const { Cell::new(None) };
+    }
+
+    /// Whether this `save_cert` call is the one to fail (counting down `FAIL_SAVE_CERT_AFTER`).
+    pub(super) fn fail_this_save() -> bool {
+        FAIL_SAVE_CERT_AFTER.with(|after| match after.get() {
+            Some(0) => {
+                after.set(None);
+                true
+            }
+            Some(n) => {
+                after.set(Some(n - 1));
+                false
+            }
+            None => false,
+        })
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use std::{
+        future::Future as _,
+        pin::pin,
+        task::{Context, Poll, Waker},
+    };
+
+    use tempfile::TempDir;
+    use tn_types::{
+        AuthorityIdentifier, Certificate, Database as _, Hash as _, HeaderBuilder, HeaderDigest,
+    };
+
+    use super::{test_hook::FAIL_SAVE_CERT_AFTER, CertificateStore as _, NOTIFY_SUBSCRIBERS};
+    use crate::{
+        tables::{CertificateDigestByOrigin, CertificateDigestByRound, Certificates},
+        tndb::{SplitDatabase, TnDbOptions},
+    };
+
+    /// tndb with the certificate tables open.
+    fn open_db(dir: &TempDir) -> SplitDatabase {
+        let db = SplitDatabase::open_with(dir.path(), TnDbOptions::default()).expect("open tndb");
+        db.open_table::<Certificates>().expect("open table");
+        db.open_table::<CertificateDigestByRound>().expect("open table");
+        db.open_table::<CertificateDigestByOrigin>().expect("open table");
+        db
+    }
+
+    /// Three certificates of round 5, from three authors (distinct digests).
+    fn certificates() -> Vec<Certificate> {
+        (1..=3)
+            .map(|author| {
+                let header = HeaderBuilder::default()
+                    .author(AuthorityIdentifier::dummy_for_test(author))
+                    .round(5)
+                    .epoch(0)
+                    .build();
+                let mut certificate = Certificate::default();
+                certificate.update_header_for_test(header);
+                certificate
+            })
+            .collect()
+    }
+
+    /// Whether a subscriber registered for `digest` before the write has been notified.
+    fn notified(digest: HeaderDigest, write: impl FnOnce()) -> bool {
+        let mut registration = pin!(NOTIFY_SUBSCRIBERS.register_one(&digest));
+        write();
+        matches!(
+            registration.as_mut().poll(&mut Context::from_waker(Waker::noop())),
+            Poll::Ready(_)
+        )
+    }
+
+    /// `write_all` failing on its second certificate keeps and notifies the first (it is not
+    /// atomic) and returns the error; the certificates after the failing one are not written.
+    #[test]
+    fn test_write_all_keeps_the_certificates_before_a_failure() {
+        let dir = TempDir::with_prefix("cert_write_all_failure").expect("temp dir");
+        let db = open_db(&dir);
+        let certs = certificates();
+        let mut result = None;
+        let first_notified = notified(certs[0].digest(), || {
+            FAIL_SAVE_CERT_AFTER.with(|after| after.set(Some(1)));
+            result = Some(db.write_all(&certs));
+        });
+        let err = result.expect("ran").expect_err("the second certificate fails");
+        assert!(err.to_string().contains("injected by a test"), "the save error: {err}");
+        assert!(first_notified, "the certificate written before the failure is notified");
+        assert_eq!(db.read(certs[0].digest()).expect("read"), Some(certs[0].clone()));
+        assert_eq!(db.read(certs[2].digest()).expect("read"), None, "nothing after the failure");
+    }
+
+    /// When the commit of the certificates saved before a failure fails too, none is notified,
+    /// and the error returned is the save's, not the commit's.
+    #[test]
+    fn test_write_all_notifies_nothing_when_the_failure_commit_fails() {
+        let dir = TempDir::with_prefix("cert_write_all_commit_failure").expect("temp dir");
+        let db = open_db(&dir);
+        let certs = certificates();
+        db.fail_durability_for_test::<Certificates>();
+        let mut result = None;
+        let first_notified = notified(certs[0].digest(), || {
+            FAIL_SAVE_CERT_AFTER.with(|after| after.set(Some(1)));
+            result = Some(db.write_all(&certs));
+        });
+        let err = result.expect("ran").expect_err("the second certificate fails");
+        assert!(err.to_string().contains("injected by a test"), "the save error: {err}");
+        assert!(!first_notified, "nothing is notified after a failed write");
+    }
+}

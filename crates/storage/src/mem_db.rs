@@ -546,27 +546,30 @@ mod test {
     }
 
     /// Readers on several threads against a writer that keeps overwriting every key: every read
-    /// sees a whole value for its key, never a torn or foreign one.
+    /// sees a whole value for its key, never a torn or foreign one. The writer starts only once
+    /// every reader has read, so each reader's work is certain however the threads are scheduled.
     #[test]
     fn test_memdb_readers_against_writer() {
         use std::sync::{
-            atomic::{AtomicBool, Ordering},
+            atomic::{AtomicBool, AtomicUsize, Ordering},
             Arc,
         };
 
         const KEYS: u64 = 200;
+        const READERS: usize = 4;
         let db = open_db();
         for k in 0..KEYS {
             db.insert::<TestTable>(&k, &format!("{k}:0")).expect("insert");
         }
         let stop = Arc::new(AtomicBool::new(false));
-        let readers: Vec<_> = (0..4_u64)
+        let ready = Arc::new(AtomicUsize::new(0));
+        let readers: Vec<_> = (0..READERS as u64)
             .map(|t| {
-                let (db, stop) = (db.clone(), stop.clone());
+                let (db, stop, ready) = (db.clone(), stop.clone(), ready.clone());
                 std::thread::spawn(move || {
                     let mut x = t + 1;
                     let mut reads = 0_u64;
-                    while !stop.load(Ordering::Relaxed) {
+                    loop {
                         x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
                         let k = (x >> 33) % KEYS;
                         let v = db.get::<TestTable>(&k).expect("get").expect("always present");
@@ -575,11 +578,21 @@ mod test {
                             assert_eq!(db.iter::<TestTable>().count() as u64, KEYS);
                         }
                         reads += 1;
+                        if reads == 1 {
+                            ready.fetch_add(1, Ordering::Release);
+                        }
+                        if stop.load(Ordering::Relaxed) {
+                            break;
+                        }
                     }
                     reads
                 })
             })
             .collect();
+        // A reader that ended (panicked) before its first read ends the wait: its join reports it.
+        while ready.load(Ordering::Acquire) < READERS && !readers.iter().any(|r| r.is_finished()) {
+            std::thread::yield_now();
+        }
         for generation in 1..=200_u64 {
             for k in 0..KEYS {
                 db.insert::<TestTable>(&k, &format!("{k}:{generation}")).expect("overwrite");

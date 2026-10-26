@@ -186,15 +186,18 @@ fn test_tndb_clean_reopen() {
     assert_eq!(rows::<OtherTable>(&db), vec![(3, "after".to_string())]);
 }
 
-/// Interleaved writes to several tables, then a crash: the reopen rebuilds every table from the
-/// one log, keeping every write made before the crash in `Sync` mode (each durable on return).
+/// Interleaved writes to several tables, then a power loss (the disk model keeps only what was
+/// flushed): the reopen rebuilds every table from the one log, keeping every write made before
+/// it in `Sync` mode (each durable on return).
 #[test]
-fn test_tndb_crash_rebuilds_interleaved_tables() {
+fn test_tndb_power_loss_rebuilds_interleaved_tables() {
+    use crate::archive::data_file::disk_model;
     let tmp = TempDir::with_prefix("tndb_crash").expect("temp dir");
     let mut test = BTreeMap::new();
     let mut other = BTreeMap::new();
     {
         let db = open(tmp.path(), CommitMode::Sync);
+        disk_model::track(&log_path(tmp.path()));
         for i in 0..200u64 {
             db.insert::<TestTable>(&(i % 40), &format!("t{i}")).expect("insert");
             test.insert(i % 40, format!("t{i}"));
@@ -207,11 +210,13 @@ fn test_tndb_crash_rebuilds_interleaved_tables() {
                 test.remove(&(i % 13));
             }
         }
-        crash(db);
+        power_loss(db, tmp.path());
     }
     let db = open(tmp.path(), CommitMode::Sync);
     assert_eq!(rows::<TestTable>(&db), test.into_iter().collect::<Vec<_>>());
     assert_eq!(rows::<OtherTable>(&db), other.into_iter().collect::<Vec<_>>());
+    drop(db);
+    disk_model::untrack(&log_path(tmp.path()));
 }
 
 /// A transaction is atomic across tables: a batch whose flagged last record is torn by the crash
@@ -322,33 +327,43 @@ fn test_tndb_failed_batch_is_taken_back() {
     assert_eq!(rows::<OtherTable>(&db).len(), 20);
 }
 
-/// Group mode: a write is readable at once and durable after `persist` (it survives a crash);
-/// `persist` on one table covers every table's earlier writes.
+/// Group mode: a write is readable at once and durable after `persist` (it survives a power
+/// loss); `persist` on one table covers every table's earlier writes.
 #[test]
 fn test_tndb_group_persist() {
+    use crate::archive::data_file::disk_model;
     let tmp = TempDir::with_prefix("tndb_group").expect("temp dir");
     {
         let db = open(tmp.path(), CommitMode::Group);
+        disk_model::track(&log_path(tmp.path()));
+        // A first round, which also syncs the log's first growth: the rows below are then made
+        // durable by the round's msync alone.
+        db.insert::<OtherTable>(&0, &"first".to_string()).expect("insert");
+        block_on(db.persist::<OtherTable>()).expect("persist");
         for i in 0..100u64 {
             db.insert::<TestTable>(&i, &format!("v{i}")).expect("insert");
         }
         db.insert::<OtherTable>(&1, &"o".to_string()).expect("insert");
         assert_eq!(db.get::<TestTable>(&5).expect("get"), Some("v5".to_string()), "readable");
         block_on(db.persist::<TestTable>()).expect("persist");
-        crash(db);
+        power_loss(db, tmp.path());
     }
     let db = open(tmp.path(), CommitMode::Group);
     assert_eq!(rows::<TestTable>(&db).len(), 100);
     assert_eq!(db.get::<OtherTable>(&1).expect("get"), Some("o".to_string()));
+    drop(db);
+    disk_model::untrack(&log_path(tmp.path()));
 }
 
 /// Writers on several threads in `Sync` mode: every write returned is durable (it survives a
-/// crash), and concurrent writers share syncs.
+/// power loss), and concurrent writers share syncs.
 #[test]
 fn test_tndb_concurrent_sync_writers() {
+    use crate::archive::data_file::disk_model;
     let tmp = TempDir::with_prefix("tndb_threads").expect("temp dir");
     {
         let db = open(tmp.path(), CommitMode::Sync);
+        disk_model::track(&log_path(tmp.path()));
         std::thread::scope(|s| {
             for t in 0..4u64 {
                 let db = db.clone();
@@ -364,11 +379,72 @@ fn test_tndb_concurrent_sync_writers() {
                 });
             }
         });
-        crash(db);
+        power_loss(db, tmp.path());
     }
     let db = open(tmp.path(), CommitMode::Sync);
     assert_eq!(rows::<TestTable>(&db).len(), 600);
     assert_eq!(rows::<OtherTable>(&db).len(), 600);
+    drop(db);
+    disk_model::untrack(&log_path(tmp.path()));
+}
+
+/// `TestTable` and `OtherTable` under another key type: their 8-byte keys read as 4-byte ones.
+#[derive(Debug)]
+struct ShortKeyTestTable;
+impl tn_types::Table for ShortKeyTestTable {
+    type Key = u32;
+    type Value = String;
+
+    const NAME: &'static str = "TestTable";
+    const HINT: tn_types::TableHint = tn_types::TableHint::Cache;
+}
+
+#[derive(Debug)]
+struct ShortKeyOtherTable;
+impl tn_types::Table for ShortKeyOtherTable {
+    type Key = u32;
+    type Value = String;
+
+    const NAME: &'static str = "OtherTable";
+    const HINT: tn_types::TableHint = tn_types::TableHint::Cache;
+}
+
+/// A key of the wrong size for its table is refused by every point op, as a put of it is, rather
+/// than a read answering "absent" or a removal silently doing nothing: a get, a contains, a
+/// transaction's get, a bare removal, a transaction's removal (buffered, and one whose table only
+/// gets its key size at the commit) each fail naming the sizes. None of it latches: the row is
+/// still there, and later writes and a `persist` succeed.
+#[test]
+fn test_tndb_wrong_key_size_is_refused_by_every_point_op() {
+    let tmp = TempDir::with_prefix("tndb_key_size").expect("temp dir");
+    let db = open(tmp.path(), CommitMode::Group);
+    db.insert::<TestTable>(&1, &"a".to_string()).expect("insert");
+    let refused = |what: &str, result: eyre::Result<()>| {
+        let e = format!("{:#}", result.expect_err(what));
+        assert!(e.contains("a 4-byte key in table") && e.contains("of 8-byte keys"), "{what}: {e}");
+    };
+    refused("put", db.insert::<ShortKeyTestTable>(&1, &"b".to_string()));
+    refused("get", db.get::<ShortKeyTestTable>(&1).map(drop));
+    refused("contains", db.contains_key::<ShortKeyTestTable>(&1).map(drop));
+    refused("read txn get", db.read_txn().expect("txn").get::<ShortKeyTestTable>(&1).map(drop));
+    refused("remove", db.remove::<ShortKeyTestTable>(&1));
+    let mut txn = db.write_txn().expect("txn");
+    refused("txn get", txn.get::<ShortKeyTestTable>(&1).map(drop));
+    refused("txn remove", txn.remove::<ShortKeyTestTable>(&1));
+    refused("txn put", txn.insert::<ShortKeyTestTable>(&1, &"b".to_string()));
+    txn.insert::<TestTable>(&2, &"b".to_string()).expect("txn insert");
+    txn.commit().expect("the transaction's other writes commit");
+    // `OtherTable` has no key size while the removal is buffered; the commit's put fixes it.
+    let mut txn = db.write_txn().expect("txn");
+    txn.remove::<ShortKeyOtherTable>(&1).expect("no key size yet: buffered");
+    txn.insert::<OtherTable>(&1, &"c".to_string()).expect("txn insert");
+    refused("a removal checked at the commit", txn.commit());
+
+    assert!(!db.core().durability.is_failed(), "nothing latched");
+    assert_eq!(rows::<TestTable>(&db), [(1, "a".to_string()), (2, "b".to_string())]);
+    assert!(rows::<OtherTable>(&db).is_empty(), "the refused transaction wrote nothing");
+    db.insert::<TestTable>(&3, &"c".to_string()).expect("a later write");
+    block_on(db.persist::<TestTable>()).expect("persist");
 }
 
 /// A record of a table the manifest does not have, or of an unknown kind, fails the open closed
@@ -448,6 +524,29 @@ fn test_tndb_failed_sync_latches() {
     assert!(block_on(db.persist::<OtherTable>()).is_err(), "and it stays latched");
 }
 
+/// A failed `fsync` of the log's growth on the commit thread latches the log's poison itself,
+/// through the log's view, before the writer learns of the failure (no write or close runs
+/// between), and the close leaves the log unsealed.
+#[test]
+fn test_tndb_failed_growth_sync_poisons_the_log() {
+    use std::sync::atomic::Ordering::Relaxed;
+    let tmp = TempDir::with_prefix("tndb_growth_sync").expect("temp dir");
+    {
+        let db = open(tmp.path(), CommitMode::Group);
+        db.core().durability.fail_next_growth_sync.store(true, Relaxed);
+        // A new log's first batch grows it, so its round fsyncs the growth.
+        db.insert::<TestTable>(&1, &"a".to_string()).expect("insert");
+        assert!(block_on(db.persist::<TestTable>()).is_err(), "the growth's sync failed");
+        assert!(
+            !db.core().durability.fail_next_growth_sync.load(Relaxed),
+            "the round reached the growth's fsync"
+        );
+        assert!(db.core().writer.lock().log_failed(), "the commit thread poisoned the log");
+    }
+    let ro = super::store::open_log_read_only(&tmp.path().join("gen-0")).expect("open");
+    assert!(ro.opened_unclean(), "the close left the log unsealed");
+}
+
 /// `failed` stays pending while the database is sound, and resolves promptly with the cause once
 /// a failure latches (a failed sync on the commit thread here); one asked for after that resolves
 /// at once.
@@ -523,20 +622,42 @@ fn test_tndb_stale_index_rebuilds_alone() {
     let _ = test_id;
 }
 
+/// The seed of a randomized test: `default`, unless the environment variable `TNDB_MODEL_SEED`
+/// (decimal, or hex with `0x`) overrides it. Each test prints its seed (on stderr, shown when it
+/// fails) and names it in its assertion messages, so a failure reproduces with that seed, and a
+/// soak can run many seeds while CI keeps the defaults.
+fn model_seed(test: &str, default: u64) -> u64 {
+    let seed = match std::env::var("TNDB_MODEL_SEED") {
+        Ok(text) => {
+            let text = text.trim();
+            let parsed = match text.strip_prefix("0x").or_else(|| text.strip_prefix("0X")) {
+                Some(hex) => u64::from_str_radix(&hex.replace('_', ""), 16),
+                None => text.replace('_', "").parse(),
+            };
+            parsed.unwrap_or_else(|e| panic!("TNDB_MODEL_SEED={text:?} is not a u64: {e}"))
+        }
+        Err(_) => default,
+    };
+    eprintln!("{test}: seed {seed:#x} (TNDB_MODEL_SEED={seed:#x} reproduces it)");
+    seed
+}
+
 /// Random bare writes, transactions (committed or dropped, over both tables), clears, persists
-/// and crashes in group mode: after a crash both tables are exactly one of the states they passed
-/// through together since the last persist (a transaction is never half there, in either table),
-/// and never older than that persist.
+/// and crashes in group mode: a crash is a dead process, whose writes stay in the page cache, so
+/// every reopen finds both tables exactly as the model has them (every batch written before the
+/// crash, a transaction never half there).
 #[test]
 fn test_tndb_random_crashes_against_model() {
-    random_crashes_against_model(0x7E10_6001, false);
+    random_crashes_against_model(model_seed("random_crashes", 0x7E10_6001), false);
 }
 
 /// The randomized model of [`test_tndb_random_crashes_against_model`], with half its crashes also
-/// losing power: every reopen still finds a state written since the last persist.
+/// losing power: a reopen after a power loss finds one of the states the tables passed through
+/// together since the last persist (never older than it), and one after a crash alone still finds
+/// the model exactly.
 #[test]
 fn test_tndb_random_power_losses_against_model() {
-    random_crashes_against_model(0x7E10_6002, true);
+    random_crashes_against_model(model_seed("random_power_losses", 0x7E10_6002), true);
 }
 
 /// The log of the current generation under `root`.
@@ -546,9 +667,17 @@ fn current_log(root: &Path) -> std::path::PathBuf {
 }
 
 /// Random writes, transactions, clears, persists, compactions and crashes (each a power loss too
-/// when `power` and a coin says so), checked after every reopen against the states written since
-/// the last persist.
+/// when `power` and a coin says so), checked after every reopen: after a crash alone, against the
+/// model; after a power loss, against the states written since the last persist.
+///
+/// The crashes fall between steps, so no write is in flight and a process crash loses nothing: a
+/// batch is whole in the log's page cache before its write returns, and the reopen fsyncs an
+/// unclean log before it drops the cached pages it replays from. Only a power loss can take back
+/// what no sync covered (a write in flight at a real crash never returned, so no caller counted
+/// on it).
 fn random_crashes_against_model(seed: u64, power: bool) {
+    use std::sync::atomic::Ordering;
+
     use rand::{rngs::StdRng, Rng as _, SeedableRng as _};
 
     use crate::archive::data_file::disk_model;
@@ -622,14 +751,13 @@ fn random_crashes_against_model(seed: u64, power: bool) {
                 states = vec![model.clone()];
             }
             86..90 => {
-                // A compaction changes no state; the model follows the new generation's log.
+                // A compaction changes no state; the model follows the new generation's log from
+                // its creation, so it holds only what the compaction synced.
                 if power {
                     disk_model::untrack(&current_log(tmp.path()));
+                    db.core().compact.test.track_new_log.store(true, Ordering::Relaxed);
                 }
-                assert_eq!(db.compact_now(), Ok(true), "step {step}: compacted");
-                if power {
-                    disk_model::track(&current_log(tmp.path()));
-                }
+                assert_eq!(db.compact_now(), Ok(true), "seed {seed:#x} step {step}: compacted");
             }
             _ => {
                 let lose_power = power && rng.random_bool(0.5);
@@ -640,11 +768,19 @@ fn random_crashes_against_model(seed: u64, power: bool) {
                 db = open(tmp.path(), CommitMode::Group);
                 let found: Model =
                     (db.iter::<TestTable>().collect(), db.iter::<OtherTable>().collect());
-                assert!(
-                    states.contains(&found),
-                    "step {step}: the reopened tables are not a state since the last persist"
-                );
-                model = found;
+                if lose_power {
+                    assert!(
+                        states.contains(&found),
+                        "seed {seed:#x} step {step}: after a power loss the reopened tables are \
+                         not a state since the last persist"
+                    );
+                    model = found;
+                } else {
+                    assert_eq!(
+                        found, model,
+                        "seed {seed:#x} step {step}: a process crash keeps every batch written"
+                    );
+                }
                 states = vec![model.clone()];
             }
         }
@@ -677,12 +813,15 @@ fn test_tndb_durable_only_after_the_sync() {
 }
 
 /// In `Sync` mode a writer does not need the commit thread: the first writer waiting syncs the log
-/// itself (and later waiters share its sync), so writes complete with the commit thread stopped.
+/// itself (and later waiters share its sync), so writes complete with the commit thread stopped,
+/// and each is durable on return (it survives a power loss).
 #[test]
 fn test_tndb_sync_writers_sync_themselves() {
+    use crate::archive::data_file::disk_model;
     let tmp = TempDir::with_prefix("tndb_leader").expect("temp dir");
     {
         let db = open(tmp.path(), CommitMode::Sync);
+        disk_model::track(&log_path(tmp.path()));
         db.stop_commit_thread();
         let (done, finished) = std::sync::mpsc::channel();
         let writer = db.clone();
@@ -701,10 +840,12 @@ fn test_tndb_sync_writers_sync_themselves() {
             let _ = done.send(());
         });
         finished.recv_timeout(Duration::from_secs(10)).expect("the writers synced themselves");
-        crash(db);
+        power_loss(db, tmp.path());
     }
     let db = open(tmp.path(), CommitMode::Sync);
     assert_eq!(rows::<TestTable>(&db).len(), 200, "every returned write was durable");
+    drop(db);
+    disk_model::untrack(&log_path(tmp.path()));
 }
 
 /// Group mode syncs on demand: a burst of writes nobody waits on is made durable within a short
@@ -1083,7 +1224,8 @@ fn test_tndb_compaction_preserves_rows() {
     let tmp = TempDir::with_prefix("tndb_compact_rows").expect("temp dir");
     let db = open_compacting(tmp.path(), CommitMode::Group, manual());
     db.open_table::<ThirdTable>().expect("open table");
-    let mut rng = rand::rngs::StdRng::seed_from_u64(0xC0_4AC7);
+    let seed = model_seed("compaction_preserves_rows", 0xC0_4AC7);
+    let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
     let mut model: Tables3 = Default::default();
     for (t, rows) in model.iter_mut().enumerate() {
         // Every table's key size fixed, so writes at checkpoint 3 need no registry lock.
@@ -1105,20 +1247,23 @@ fn test_tndb_compaction_preserves_rows() {
                     break;
                 }
             }
-            assert_eq!(seen, [1, 2, 3], "the checkpoints");
+            assert_eq!(seen, [1, 2, 3], "seed {seed:#x}: the checkpoints");
             compaction.join().expect("compaction thread")
         });
-        assert_eq!(switched, Ok(true), "round {round}");
-        assert_eq!(all_rows(&db), model, "round {round}: the rows after the switch");
+        assert_eq!(switched, Ok(true), "seed {seed:#x} round {round}");
+        assert_eq!(all_rows(&db), model, "seed {seed:#x} round {round}: the rows after the switch");
         churn(&db, &mut model, &mut rng, 100, &format!("after{round}-"));
-        assert_eq!(all_rows(&db), model, "round {round}: writes after the switch");
+        assert_eq!(all_rows(&db), model, "seed {seed:#x} round {round}: writes after the switch");
     }
     wait_only_gen(tmp.path(), 3);
     drop(db);
     let db = open_compacting(tmp.path(), CommitMode::Group, manual());
     db.open_table::<ThirdTable>().expect("open table");
-    assert!(db.core().rebuilt_on_open().is_empty(), "a compacted generation reopens clean");
-    assert_eq!(all_rows(&db), model, "the rows after a reopen");
+    assert!(
+        db.core().rebuilt_on_open().is_empty(),
+        "seed {seed:#x}: a compacted generation reopens clean"
+    );
+    assert_eq!(all_rows(&db), model, "seed {seed:#x}: the rows after a reopen");
 }
 
 /// A compaction gives back what removals and overwrites left dead, deletes the old generation,
@@ -1899,21 +2044,83 @@ fn test_tndb_damaged_index_is_rebuilt_at_open() {
     assert_eq!(db.get::<TestTable>(&1_000).expect("get"), None);
 }
 
-/// Zero the CRC trailer of every leaf of each index in generation directory `gen` but the
-/// leftmost: damage the open-time walk (internal pages and the leftmost leaf) does not reach, so
-/// the open trusts the index and the damage is met by the reads and writes that reach it.
-fn damage_index_leaves_past_the_first(gen: &Path) {
+/// Lower by one the entry count of the second leaf of each index of height 2 in generation
+/// directory `gen`, at rest (the database closed): a count still in range, which the reads' cheap
+/// checks accept and which hides the leaf's last row. Only the CRC shows it.
+fn lower_second_leaf_count(gen: &Path) {
     use crate::archive::btree_index::{
         header::BtreeHeader,
         page::{Node, PAGE_SIZE},
     };
+    use std::os::unix::fs::FileExt as _;
     let mut damaged = 0;
     for entry in std::fs::read_dir(gen).expect("read gen").flatten() {
         if !entry.file_name().to_string_lossy().starts_with("idx-") {
             continue;
         }
-        let file = entry.path().join("index.btx");
-        let mut bytes = std::fs::read(&file).expect("read index");
+        let path = entry.path().join("index.btx");
+        let bytes = std::fs::read(&path).expect("read index");
+        let header = BtreeHeader::from_page(&bytes[..PAGE_SIZE]).expect("index header");
+        if header.height != 2 {
+            continue;
+        }
+        let node = Node::new(header.ksize as usize);
+        let page = |p: u32| p as usize * PAGE_SIZE..(p as usize + 1) * PAGE_SIZE;
+        let leaf = node.internal_child(&bytes[page(header.root_page)], 1);
+        let n = node.entry_count(&bytes[page(leaf)]);
+        assert!(node.is_leaf(&bytes[page(leaf)]) && (1..256).contains(&n), "a leaf of {n}");
+        // The count's low byte (a little-endian u16 after the type and flags bytes).
+        let at = page(leaf).start as u64 + 2;
+        let file = std::fs::OpenOptions::new().write(true).open(&path).expect("open index");
+        file.write_all_at(&[n as u8 - 1], at).expect("lower the count");
+        damaged += 1;
+    }
+    assert!(damaged > 0, "an index of height 2");
+}
+
+/// A table index damaged at rest in a way the reads' cheap checks pass (a leaf's entry count
+/// lowered by one, still in range, which would hide that leaf's last row from every get and
+/// scan) fails the open's walk, which checks every leaf's CRC: the open rebuilds the index from
+/// the log, every row reads back, and a removed row stays removed.
+#[test]
+fn test_tndb_leaf_count_damage_at_rest_rebuilds_the_index() {
+    let tmp = TempDir::with_prefix("tndb_leaf_count_damage").expect("temp dir");
+    {
+        let db = open(tmp.path(), CommitMode::Group);
+        for i in 0..2_000_u64 {
+            db.insert::<TestTable>(&i, &format!("v{i}")).expect("insert");
+        }
+        db.remove::<TestTable>(&300).expect("remove");
+    }
+    lower_second_leaf_count(&tmp.path().join("gen-0"));
+    let db = open(tmp.path(), CommitMode::Group);
+    assert_eq!(db.core().rebuilt_on_open().len(), 1, "the damaged index rebuilt from the log");
+    for i in (0..2_000_u64).filter(|&i| i != 300) {
+        assert_eq!(db.get::<TestTable>(&i).expect("get"), Some(format!("v{i}")), "row {i}");
+    }
+    assert_eq!(db.get::<TestTable>(&300).expect("get"), None, "the removed row stays removed");
+    assert_eq!(rows::<TestTable>(&db).len(), 1_999, "a scan finds every row");
+}
+
+/// Zero the CRC trailer of every leaf of each index in generation directory `gen` but the
+/// leftmost, in place, while an open database maps the files: damage that arises after the open
+/// (whose walk checks every page's CRC and would rebuild an index damaged at rest), met by the
+/// reads and writes that reach it. Each trailer is written with `write_at`, which a shared
+/// mapping sees; rewriting the whole file would truncate it under the live mapping.
+fn damage_index_leaves_past_the_first(gen: &Path) {
+    use crate::archive::btree_index::{
+        header::BtreeHeader,
+        page::{Node, PAGE_SIZE},
+    };
+    use std::os::unix::fs::FileExt as _;
+    let mut damaged = 0;
+    for entry in std::fs::read_dir(gen).expect("read gen").flatten() {
+        if !entry.file_name().to_string_lossy().starts_with("idx-") {
+            continue;
+        }
+        let path = entry.path().join("index.btx");
+        let bytes = std::fs::read(&path).expect("read index");
+        let file = std::fs::OpenOptions::new().write(true).open(&path).expect("open index");
         let header = BtreeHeader::from_page(&bytes[..PAGE_SIZE]).expect("index header");
         let node = Node::new(header.ksize as usize);
         let page = |p: u32| p as usize * PAGE_SIZE..(p as usize + 1) * PAGE_SIZE;
@@ -1923,17 +2130,16 @@ fn damage_index_leaves_past_the_first(gen: &Path) {
         }
         for p in (1..header.page_count).filter(|&p| p != leftmost) {
             if node.is_leaf(&bytes[page(p)]) {
-                let end = page(p).end;
-                bytes[end - 4..end].fill(0);
+                let end = page(p).end as u64;
+                file.write_all_at(&[0; 4], end - 4).expect("zero the trailer");
                 damaged += 1;
             }
         }
-        std::fs::write(&file, bytes).expect("write index");
     }
     assert!(damaged > 0, "an index with leaves past its first");
 }
 
-/// A removal whose key the index cannot read (a damaged page the open trusted) fails: counted as
+/// A removal whose key the index cannot read (a page damaged after the open) fails: counted as
 /// "absent", it would write nothing, and the row would silently survive its removal. The damage
 /// latches as a read's does: nothing of the batch was appended, so the close still seals the log
 /// (with every index stale), and the next open replays it to rebuild every index, keeping every
@@ -1948,9 +2154,9 @@ fn test_tndb_remove_through_a_damaged_index_fails() {
         }
         db.insert::<OtherTable>(&1, &"o".to_string()).expect("insert");
     }
-    damage_index_leaves_past_the_first(&tmp.path().join("gen-0"));
     {
         let db = open(tmp.path(), CommitMode::Group);
+        damage_index_leaves_past_the_first(&tmp.path().join("gen-0"));
         db.insert::<OtherTable>(&2, &"o2".to_string()).expect("insert");
         block_on(db.persist::<OtherTable>()).expect("acknowledged");
         let removed = db.remove::<TestTable>(&1_000);
@@ -1983,9 +2189,9 @@ fn test_tndb_scan_through_a_damaged_index_stops_the_database() {
             db.insert::<TestTable>(&i, &format!("v{i}")).expect("insert");
         }
     }
-    damage_index_leaves_past_the_first(&tmp.path().join("gen-0"));
     {
         let db = open(tmp.path(), CommitMode::Group);
+        damage_index_leaves_past_the_first(&tmp.path().join("gen-0"));
         assert!(db.iter::<TestTable>().count() < 2_000, "the scan ended at the damage");
         let write = db.insert::<OtherTable>(&1, &"o".to_string());
         assert!(write.is_err(), "the short scan stopped the database: {write:?}");
@@ -2006,9 +2212,10 @@ enum DamageRead {
 /// seals the log, with every index stale: the next open replays the sealed log, fails naming the
 /// damage, changes no byte, and fails again on every retry. Left unsealed, the replay would take
 /// the damaged record for a crash's torn tail and cut every acknowledged batch after it, unless a
-/// write in the session happened to stamp a commit marker past it. Checked with no write in the
-/// session, with one acknowledged write (no marker stamped), with two (a marker stamped), and with
-/// a scan finding the damage instead of a get.
+/// write in the session stamped a commit marker past it (the first write stamps one covering the
+/// log as it opened, best effort). Checked with no write in the session (the log still sealed as
+/// it opened), with one acknowledged write (a marker over the log as it opened), with two (a marker
+/// over the first), and with a scan finding the damage instead of a get.
 #[test]
 fn test_tndb_read_damage_in_the_log_refuses_the_next_open() {
     let cases =
@@ -2080,9 +2287,9 @@ fn test_tndb_read_damage_in_an_index_rebuilds_at_the_next_open() {
         }
         db.insert::<OtherTable>(&1, &"o".to_string()).expect("insert");
     }
-    damage_index_leaves_past_the_first(&tmp.path().join("gen-0"));
     {
         let db = open(tmp.path(), CommitMode::Group);
+        damage_index_leaves_past_the_first(&tmp.path().join("gen-0"));
         let got = db.get::<TestTable>(&1_000);
         assert!(got.is_err(), "a get through a damaged leaf: {got:?}");
         let write = db.insert::<OtherTable>(&2, &"o".to_string());
@@ -2099,28 +2306,40 @@ fn test_tndb_read_damage_in_an_index_rebuilds_at_the_next_open() {
 }
 
 /// A sync failure after a read's damage still leaves the log's state on disk unknown: the close
-/// does not seal it, although the read's damage latched first (and so names the failure).
+/// does not seal it, although the read's damage latched first (and so names the failure). A
+/// session that wrote nothing leaves the log as it opened, still sealed: none of its bytes is of
+/// unknown durability, and its seal was never retired.
 #[test]
 fn test_tndb_failed_sync_after_read_damage_leaves_the_log_unsealed() {
-    let tmp = TempDir::with_prefix("tndb_read_damage_sync").expect("temp dir");
-    {
-        let db = open(tmp.path(), CommitMode::Group);
-        for i in 0..2_000_u64 {
-            db.insert::<TestTable>(&i, &format!("v{i}")).expect("insert");
+    for wrote in [true, false] {
+        let tmp = TempDir::with_prefix("tndb_read_damage_sync").expect("temp dir");
+        {
+            let db = open(tmp.path(), CommitMode::Group);
+            for i in 0..2_000_u64 {
+                db.insert::<TestTable>(&i, &format!("v{i}")).expect("insert");
+            }
         }
-    }
-    damage_index_leaves_past_the_first(&tmp.path().join("gen-0"));
-    {
+        let log = log_path(tmp.path());
+        let before = std::fs::read(&log).expect("read");
+        {
+            let db = open(tmp.path(), CommitMode::Group);
+            damage_index_leaves_past_the_first(&tmp.path().join("gen-0"));
+            if wrote {
+                db.insert::<OtherTable>(&1, &"o".to_string()).expect("insert");
+            }
+            assert!(db.get::<TestTable>(&1_000).is_err(), "a get through a damaged leaf");
+            // A sync round already running when the get latched fails.
+            db.fail_durability_for_test();
+        }
+        let ro = super::store::open_log_read_only(&tmp.path().join("gen-0")).expect("open");
+        assert_eq!(ro.opened_unclean(), wrote, "the close left the log unsealed if it wrote");
+        drop(ro);
+        if !wrote {
+            assert_eq!(std::fs::read(&log).expect("read"), before, "the log as it opened");
+        }
         let db = open(tmp.path(), CommitMode::Group);
-        assert!(db.get::<TestTable>(&1_000).is_err(), "a get through a damaged leaf");
-        // A sync round already running when the get latched fails.
-        db.fail_durability_for_test();
+        assert_eq!(db.iter::<TestTable>().count(), 2_000, "the replay rebuilt every row");
     }
-    let log = super::store::open_log_read_only(&tmp.path().join("gen-0")).expect("open the log");
-    assert!(log.opened_unclean(), "the close left the log unsealed");
-    drop(log);
-    let db = open(tmp.path(), CommitMode::Group);
-    assert_eq!(db.iter::<TestTable>().count(), 2_000, "the replay rebuilt every row");
 }
 
 /// A read the disk fails during an unclean open's replay is an error, never a torn tail: the open
@@ -2199,30 +2418,146 @@ fn test_tndb_tear_below_the_commit_marker_fails_the_open() {
     assert_eq!(std::fs::read(&log).expect("read"), before, "the failed opens changed nothing");
 }
 
-/// A cleanly closed log that does not replay to its end (a damaged record, here with its index
-/// gone so it must replay) fails the open, changes no byte, and stays refused on every retry: a
-/// failed open re-seals it rather than leave it to be cut as a crash's tail.
-#[test]
-fn test_tndb_damaged_sealed_log_stays_refused() {
-    let tmp = TempDir::with_prefix("tndb_sealed_damage").expect("temp dir");
+/// A database at `root` closed cleanly over 500 rows, then a record in the middle of its sealed
+/// log damaged and its index removed, so the next open must replay the log and meet the damage.
+/// Returns the log's bytes.
+fn damaged_sealed_log(root: &Path) -> Vec<u8> {
     {
-        let db = open(tmp.path(), CommitMode::Group);
+        let db = open(root, CommitMode::Group);
         for i in 0..500_u64 {
             db.insert::<TestTable>(&i, &format!("v{i}")).expect("insert");
         }
     }
-    std::fs::remove_dir_all(tmp.path().join("gen-0").join("idx-0")).expect("remove the index");
-    let log = log_path(tmp.path());
+    std::fs::remove_dir_all(root.join("gen-0").join("idx-0")).expect("remove the index");
+    let log = log_path(root);
     let ends = record_ends(&log);
     flip_byte(&log, ends[ends.len() / 2] + 6);
-    let before = std::fs::read(&log).expect("read");
+    std::fs::read(&log).expect("read")
+}
+
+/// The open of the database at `root` fails, refusing a sealed log that does not replay whole.
+fn assert_refused_as_sealed(root: &Path, attempt: usize) {
+    let err = TnDatabase::open_with(root, options(CommitMode::Group))
+        .err()
+        .unwrap_or_else(|| panic!("attempt {attempt} opened"));
+    assert!(format!("{err:#}").contains("closed cleanly"), "{err:#}");
+}
+
+/// A cleanly closed log that does not replay to its end (a damaged record, here with its index
+/// gone so it must replay) fails the open, changes no byte, and stays refused on every retry: a
+/// failed open leaves it sealed rather than leave it to be cut as a crash's tail.
+#[test]
+fn test_tndb_damaged_sealed_log_stays_refused() {
+    let tmp = TempDir::with_prefix("tndb_sealed_damage").expect("temp dir");
+    let before = damaged_sealed_log(tmp.path());
     for attempt in 0..3 {
-        let err = TnDatabase::open_with(tmp.path(), options(CommitMode::Group))
-            .err()
-            .unwrap_or_else(|| panic!("attempt {attempt} opened"));
-        assert!(format!("{err:#}").contains("closed cleanly"), "{err:#}");
+        assert_refused_as_sealed(tmp.path(), attempt);
     }
-    assert_eq!(std::fs::read(&log).expect("read"), before, "byte-identical after the retries");
+    assert_eq!(
+        std::fs::read(log_path(tmp.path())).expect("read"),
+        before,
+        "byte-identical after the retries"
+    );
+}
+
+/// A failing open of a damaged sealed log killed before its log handle drops (here: the log
+/// opened writable, as the open does before its replay, and leaked) leaves the log sealed and
+/// byte-identical: the seal is retired only by the first write, so the next open still refuses
+/// the damage rather than take it for a crash's torn tail and cut every batch after it.
+#[test]
+fn test_tndb_killed_failing_open_keeps_the_log_sealed() {
+    let tmp = TempDir::with_prefix("tndb_sealed_damage_kill").expect("temp dir");
+    let before = damaged_sealed_log(tmp.path());
+    for attempt in 0..3 {
+        std::mem::forget(super::store::open_log(&tmp.path().join("gen-0")).expect("open the log"));
+        assert_refused_as_sealed(tmp.path(), attempt);
+    }
+    assert_eq!(
+        std::fs::read(log_path(tmp.path())).expect("read"),
+        before,
+        "byte-identical after the killed opens"
+    );
+}
+
+/// An open that panics during the replay of a damaged sealed log drops its log handle while
+/// unwinding, which never seals: the log is still sealed (its seal was never retired), changes no
+/// byte, and the next open still refuses it.
+#[test]
+fn test_tndb_panic_in_a_failing_open_keeps_the_log_sealed() {
+    let tmp = TempDir::with_prefix("tndb_sealed_damage_panic").expect("temp dir");
+    let before = damaged_sealed_log(tmp.path());
+    super::store::PANIC_IN_REPLAY.with(|panic| panic.set(true));
+    let opened = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        TnDatabase::open_with(tmp.path(), options(CommitMode::Group))
+    }));
+    super::store::PANIC_IN_REPLAY.with(|panic| panic.set(false));
+    assert!(opened.is_err(), "the replay panicked");
+    let log = log_path(tmp.path());
+    assert_eq!(std::fs::read(&log).expect("read"), before, "byte-identical after the panic");
+    let sealed = super::store::open_log_read_only(&tmp.path().join("gen-0")).expect("open");
+    assert!(!sealed.opened_unclean(), "the log is still sealed");
+    drop(sealed);
+    assert_refused_as_sealed(tmp.path(), 0);
+    assert_eq!(std::fs::read(&log).expect("read"), before, "byte-identical after the retry");
+}
+
+/// A sealed log reopened and then lost to a crash with nothing written is still sealed: damage
+/// the next open finds in it is refused, never cut as a torn tail.
+#[test]
+fn test_tndb_crash_after_a_sealed_reopen_keeps_the_seal() {
+    let tmp = TempDir::with_prefix("tndb_sealed_reopen_crash").expect("temp dir");
+    {
+        let db = open(tmp.path(), CommitMode::Group);
+        for i in 0..200_u64 {
+            db.insert::<TestTable>(&i, &format!("v{i}")).expect("insert");
+            block_on(db.persist::<TestTable>()).expect("acknowledged");
+        }
+    }
+    let db = open(tmp.path(), CommitMode::Group);
+    assert_eq!(rows::<TestTable>(&db).len(), 200, "reopened");
+    crash(db);
+    let log = log_path(tmp.path());
+    let ends = record_ends(&log);
+    assert_eq!(ends.len(), 200, "one record per batch");
+    flip_byte(&log, ends[99] + 6);
+    let before = std::fs::read(&log).expect("read");
+    assert_refused_as_sealed(tmp.path(), 0);
+    assert_eq!(std::fs::read(&log).expect("read"), before, "the failed open changed nothing");
+}
+
+/// After a sealed reopen, the first acknowledged write leaves a commit marker covering the log as
+/// it opened (the write's append grows the log, so the stamp lands, and the sync that acknowledges
+/// it fsyncs the growth and the marker's page with it). A power loss after it, then damage below
+/// that marker, fails the open rather than cut every acknowledged batch after the damage.
+#[test]
+fn test_tndb_first_write_after_a_sealed_reopen_stamps_a_marker() {
+    use crate::archive::data_file::disk_model;
+    let tmp = TempDir::with_prefix("tndb_sealed_reopen_marker").expect("temp dir");
+    {
+        let db = open(tmp.path(), CommitMode::Group);
+        for i in 0..200_u64 {
+            db.insert::<TestTable>(&i, &format!("v{i}")).expect("insert");
+            block_on(db.persist::<TestTable>()).expect("acknowledged");
+        }
+    }
+    let log = log_path(tmp.path());
+    let db = open(tmp.path(), CommitMode::Group);
+    let open_len = db.core().frontier.load().end;
+    disk_model::track(&log);
+    db.insert::<OtherTable>(&1, &"o".to_string()).expect("insert");
+    block_on(db.persist::<OtherTable>()).expect("acknowledged");
+    power_loss(db, tmp.path());
+    assert_eq!(commit_marker(&log), Some(open_len), "a marker covers the log as it opened");
+    let ends = record_ends(&log);
+    assert_eq!(ends.len(), 201, "every acknowledged batch survived the power loss");
+    flip_byte(&log, ends[99] + 6);
+    let before = std::fs::read(&log).expect("read");
+    let err = TnDatabase::open_with(tmp.path(), options(CommitMode::Group))
+        .err()
+        .unwrap_or_else(|| panic!("the damaged log opened"));
+    assert!(format!("{err:#}").contains("below its commit marker"), "{err:#}");
+    assert_eq!(std::fs::read(&log).expect("read"), before, "the failed open changed nothing");
+    disk_model::untrack(&log);
 }
 
 /// A cleanly closed log must replay whole, in whole batches: one whose last record does not end
@@ -2352,6 +2687,35 @@ fn test_tndb_misindexed_row_is_corrupt_not_another_value() {
     let scanned: Vec<u64> = db.iter::<TestTable>().map(|(k, _)| k).collect();
     assert_eq!(scanned, [0, 1, 2], "a scan ends at the mismatch");
     assert!(block_on(db.persist::<TestTable>()).is_err(), "and no persist acknowledges past it");
+}
+
+/// Damage a compaction found is not latched (the database keeps writing), but the close after it
+/// marks every index stale instead of stamping the damaged one current: the inspection says so,
+/// and the next open replays the log and rebuilds it, so the damaged entry reads right again.
+#[test]
+fn test_tndb_compaction_damage_marks_the_indexes_stale() {
+    use tn_types::Table as _;
+    let tmp = TempDir::with_prefix("tndb_compaction_damage").expect("temp dir");
+    {
+        let db = open_compacting(tmp.path(), CommitMode::Group, manual());
+        for i in 0..10_u64 {
+            db.insert::<TestTable>(&i, &format!("v{i}")).expect("insert");
+        }
+        let id = db.core().table(TestTable::NAME).expect("open").id;
+        db.core().misindex(id, &tn_types::encode_key(&3_u64), &tn_types::encode_key(&7_u64));
+        let compacted = db.compact_now().expect_err("the copy finds the mismatch");
+        assert!(compacted.contains("index"), "{compacted}");
+        db.insert::<TestTable>(&10, &"v10".to_string()).expect("nothing is latched");
+        block_on(db.persist::<TestTable>()).expect("persist");
+    }
+    let index =
+        |root: &Path| table_report(&super::inspect(root).expect("inspect"), TestTable::NAME).index;
+    assert_eq!(index(tmp.path()), super::IndexState::Stale, "the close did not stamp it current");
+    let db = open(tmp.path(), CommitMode::Group);
+    let id = db.core().table(TestTable::NAME).expect("open").id;
+    assert!(db.core().rebuilt_on_open().contains(&id), "the next open rebuilds it");
+    assert_eq!(db.get::<TestTable>(&3).expect("get"), Some("v3".to_string()), "3 reads right");
+    assert_eq!(db.iter::<TestTable>().count(), 11, "every row, the one after the abandon too");
 }
 
 // ---- production metrics ----
@@ -2621,6 +2985,30 @@ fn test_tndb_inspect_reports_rows_and_dead_bytes() {
     assert_eq!(table_report(&report, TestTable::NAME).rows, 90);
 }
 
+/// An inspection checks a clean, current index's tree as the open's walk does: leaf damage at
+/// rest that the reads' cheap checks pass (an entry count lowered within range) reads as
+/// unreadable, the state the next open rebuilds, never as current.
+#[test]
+fn test_tndb_inspect_reports_leaf_damage_as_unreadable() {
+    use tn_types::Table as _;
+    let tmp = TempDir::with_prefix("tndb_inspect_leaf_damage").expect("temp dir");
+    {
+        let db = open(tmp.path(), CommitMode::Group);
+        for i in 0..2_000_u64 {
+            db.insert::<TestTable>(&i, &format!("v{i}")).expect("insert");
+        }
+    }
+    let index =
+        |root: &Path| table_report(&super::inspect(root).expect("inspect"), TestTable::NAME).index;
+    assert_eq!(index(tmp.path()), super::IndexState::Current, "a sound index");
+    lower_second_leaf_count(&tmp.path().join("gen-0"));
+    assert_eq!(index(tmp.path()), super::IndexState::Unreadable, "a damaged leaf");
+    let db = open(tmp.path(), CommitMode::Group);
+    assert_eq!(db.core().rebuilt_on_open().len(), 1, "which the next open rebuilds");
+    drop(db);
+    assert_eq!(index(tmp.path()), super::IndexState::Current, "sound again after the rebuild");
+}
+
 /// An inspection after a crash reports the log unclean and the index as the next open would
 /// rebuild it, and changes no file (the next open still recovers every row).
 #[test]
@@ -2690,8 +3078,8 @@ fn test_tndb_inspect_reports_damage() {
     assert!(super::inspect(tmp.path()).is_err(), "a record of an unknown table");
 }
 
-/// A `SplitDatabase`'s inspection covers each environment present, and notes the MDBX
-/// migration's marker.
+/// A `SplitDatabase`'s inspection covers each environment, and notes the MDBX migration's marker.
+/// A missing environment is reported as an error, not skipped.
 #[test]
 fn test_tndb_inspect_split() {
     let tmp = TempDir::with_prefix("tndb_inspect_split").expect("temp dir");
@@ -2703,6 +3091,21 @@ fn test_tndb_inspect_split() {
     assert!(!report.migrated);
     std::fs::write(tmp.path().join(super::MDBX_MIGRATED), b"").expect("marker");
     assert!(super::inspect_split(tmp.path()).migrated);
+
+    std::fs::remove_dir_all(tmp.path().join("kad")).expect("lose an environment");
+    let report = super::inspect_split(tmp.path());
+    let names: Vec<&str> = report.envs.iter().map(|(name, _)| *name).collect();
+    assert_eq!(names, ["epoch", "kad", "cache"], "the missing environment is still reported");
+    for (name, env) in &report.envs {
+        match *name {
+            "kad" => {
+                let err = format!("{:#}", env.as_ref().expect_err("a missing environment"));
+                assert!(err.contains("missing"), "the error says it is missing: {err}");
+            }
+            _ => assert!(env.is_ok(), "{name} still reads"),
+        }
+    }
+    assert!(!tmp.path().join("kad").exists(), "the inspection created nothing");
 }
 
 // ---- failure handling: rollback, latches ----
@@ -2758,6 +3161,47 @@ fn test_tndb_poisoned_index_latches() {
     assert!(db.insert::<OtherTable>(&1, &"o".to_string()).is_err(), "latched");
 }
 
+/// An I/O failure in a table's first-row setup (the manifest rewrite, the index's creation)
+/// latches the database like any other write failure: every later write and persist fails, and a
+/// later key-size fix or table registration writes nothing (the manifest is left as it was).
+/// Nothing was appended, so the close still seals the log and the reopen keeps every row.
+#[test]
+fn test_tndb_failed_table_setup_latches() {
+    use super::{
+        manifest::FAIL_NEXT_WRITE as FAIL_NEXT_MANIFEST_WRITE, store::FAIL_NEXT_INDEX_CREATE,
+    };
+    for hook in [&FAIL_NEXT_MANIFEST_WRITE, &FAIL_NEXT_INDEX_CREATE] {
+        let tmp = TempDir::with_prefix("tndb_setup_fails").expect("temp dir");
+        {
+            let db = open(tmp.path(), CommitMode::Group);
+            db.insert::<OtherTable>(&1, &"o".to_string()).expect("insert");
+            block_on(db.persist::<OtherTable>()).expect("persist");
+            hook.with(|fail| fail.set(true));
+            let first = db.insert::<TestTable>(&1, &"a".to_string());
+            assert!(first.is_err(), "the first row's setup fails: {first:?}");
+            assert!(db.insert::<OtherTable>(&2, &"o".to_string()).is_err(), "latched");
+            assert!(block_on(db.persist::<OtherTable>()).is_err(), "no persist resolves Ok");
+            let manifest = std::fs::read(tmp.path().join("tables")).expect("manifest");
+            let again = db.insert::<TestTable>(&1, &"a".to_string());
+            assert!(again.is_err(), "a latched database fixes no key size: {again:?}");
+            assert!(db.open_table::<ThirdTable>().is_err(), "and registers no table");
+            let after = std::fs::read(tmp.path().join("tables")).expect("manifest");
+            assert_eq!(after, manifest, "so the manifest is left as it was");
+        }
+        assert!(super::inspect(tmp.path()).expect("inspect").clean, "the close sealed the log");
+        let db = open(tmp.path(), CommitMode::Group);
+        assert_eq!(rows::<OtherTable>(&db), [(1, "o".to_string())], "the persisted row is kept");
+        db.insert::<TestTable>(&1, &"a".to_string()).expect("the reopened table takes its row");
+    }
+    // A table's registration latches the same way.
+    let tmp = TempDir::with_prefix("tndb_register_fails").expect("temp dir");
+    let db = open(tmp.path(), CommitMode::Group);
+    db.insert::<OtherTable>(&1, &"o".to_string()).expect("insert");
+    FAIL_NEXT_MANIFEST_WRITE.with(|fail| fail.set(true));
+    assert!(db.open_table::<ThirdTable>().is_err(), "the registration fails");
+    assert!(db.insert::<OtherTable>(&2, &"o".to_string()).is_err(), "latched");
+}
+
 /// A rolled-back batch's zeroed bytes are flushed at once: a sync or a writeback may already have
 /// put the batch on disk, and only the zeros reaching it keep a power loss from bringing it back.
 #[test]
@@ -2806,6 +3250,38 @@ fn test_tndb_a_lost_manifest_fails_the_open() {
     drop(open(fresh.path(), CommitMode::Group));
     std::fs::remove_file(fresh.path().join("tables")).ok();
     drop(open(fresh.path(), CommitMode::Group));
+}
+
+/// A table manifest is written only after generation 0 exists, so a manifest with no generation
+/// beside it means the log was lost (an operator's deletion, a partial restore): the open is
+/// refused rather than started as an empty database, and builds no generation 0.
+#[test]
+fn test_tndb_a_manifest_without_a_generation_fails_the_open() {
+    let tmp = TempDir::with_prefix("tndb_lost_gens").expect("temp dir");
+    {
+        let db = open(tmp.path(), CommitMode::Group);
+        db.insert::<TestTable>(&1, &"a".to_string()).expect("insert");
+        block_on(db.persist::<TestTable>()).expect("persist");
+    }
+    assert!(tmp.path().join("tables").exists(), "the manifest's path");
+    let mut lost = 0;
+    for entry in std::fs::read_dir(tmp.path()).expect("read root") {
+        let path = entry.expect("entry").path();
+        if path.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with("gen-")) {
+            std::fs::remove_dir_all(&path).expect("lose a generation");
+            lost += 1;
+        }
+    }
+    assert!(lost > 0, "the database had a generation to lose");
+    let before = files_under(tmp.path());
+    let reopened = TnDatabase::open_with(
+        tmp.path(),
+        TnDbOptions { commit: CommitMode::Group, ..Default::default() },
+    );
+    let err = format!("{:#}", reopened.expect_err("a manifest with no generation must not open"));
+    assert!(err.contains("has a table manifest but no generation"), "the refusal names it: {err}");
+    assert!(!tmp.path().join("gen-0").exists(), "the refused open built no generation 0");
+    assert_eq!(files_under(tmp.path()), before, "and created or deleted no file");
 }
 
 /// Every file path under `dir`, sorted.
@@ -3040,6 +3516,47 @@ fn test_tndb_power_loss_keeps_rows_from_before_an_unclean_reopen() {
     disk_model::untrack(&log_path(tmp.path()));
 }
 
+/// A restart after a failed writeback whose error went to the process that exited: the failed
+/// rows sit in the page cache but never reached the disk, and the reopen's fsync succeeds without
+/// writing them (Linux reports a writeback error once). The open drops the log's cached pages, so
+/// its replay reads the disk and stops where the failed rows begin; rows acknowledged after the
+/// reopen then follow the last row on disk, and a power loss keeps them all (built on the page
+/// cache, they would sit past a hole, and the replay after the power loss would cut them).
+#[test]
+fn test_tndb_power_loss_after_a_lost_writeback_keeps_acknowledged_rows() {
+    use crate::archive::data_file::disk_model;
+    let tmp = TempDir::with_prefix("tndb_power_lost_writeback").expect("temp dir");
+    let db = open(tmp.path(), CommitMode::Group);
+    disk_model::track(&log_path(tmp.path()));
+    db.insert::<TestTable>(&0, &"a".to_string()).expect("insert");
+    block_on(db.persist::<TestTable>()).expect("persist: on disk");
+    db.stop_commit_thread();
+    // 40 KiB of rows whose writeback fails: they span pages (16 KiB on Apple silicon) that the
+    // later msyncs, from where the log then ends, do not reach.
+    for i in 1..=10_u64 {
+        db.insert::<TestTable>(&i, &"v".repeat(4096)).expect("insert, never on disk");
+    }
+    crash(db);
+    // The restarted open's fsync writes nothing (and neither does anything else in the open).
+    disk_model::set_flushes_lost(true);
+    let reopened = TnDatabase::open_with(tmp.path(), options(CommitMode::Group));
+    disk_model::set_flushes_lost(false);
+    let db = reopened.expect("reopen");
+    db.open_table::<TestTable>().expect("open table");
+    assert_eq!(rows::<TestTable>(&db), [(0, "a".to_string())], "the replay read the disk");
+    for i in 11..=20_u64 {
+        db.insert::<TestTable>(&i, &format!("v{i}")).expect("insert");
+    }
+    block_on(db.persist::<TestTable>()).expect("persist: acknowledged");
+    power_loss(db, tmp.path());
+    let db = open(tmp.path(), CommitMode::Group);
+    let keys: Vec<u64> = rows::<TestTable>(&db).into_iter().map(|(key, _)| key).collect();
+    let acknowledged: Vec<u64> = [0].into_iter().chain(11..=20).collect();
+    assert_eq!(keys, acknowledged, "every acknowledged row survives the power loss");
+    drop(db);
+    disk_model::untrack(&log_path(tmp.path()));
+}
+
 /// Recovery that cuts a log back to its last whole batch flushes the zeros it leaves at once. The
 /// open-time sync made the old tail durable (here a damaged batch and a whole one after it), and
 /// zeros only in memory would leave it on disk past the cut after a power loss, for a later
@@ -3126,6 +3643,70 @@ fn test_tndb_power_loss_never_brings_back_a_rolled_back_batch() {
     disk_model::untrack(&log_path(tmp.path()));
 }
 
+/// A log that grows past its first capacity (1 MiB) before a persist: the sync round that
+/// acknowledges the rows past the old length also fsyncs the growth, so a power loss keeps them.
+/// (An `msync` writes data pages but not a size change: the disk model cuts a file back to the
+/// length its last fsync made durable.)
+#[test]
+fn test_tndb_power_loss_keeps_rows_past_a_log_growth() {
+    use crate::archive::data_file::disk_model;
+    let tmp = TempDir::with_prefix("tndb_power_growth").expect("temp dir");
+    let db = open(tmp.path(), CommitMode::Group);
+    let log = log_path(tmp.path());
+    disk_model::track(&log);
+    let tracked_len = std::fs::metadata(&log).expect("log").len();
+    let value = "g".repeat(4096);
+    for i in 0..300_u64 {
+        db.insert::<TestTable>(&i, &value).expect("insert");
+    }
+    block_on(db.persist::<TestTable>()).expect("persist: acknowledged");
+    let grown_len = std::fs::metadata(&log).expect("log").len();
+    assert!(
+        grown_len > tracked_len.max(1 << 20),
+        "precondition: the log grew past 1 MiB ({tracked_len} -> {grown_len} bytes)"
+    );
+    power_loss(db, tmp.path());
+    let db = open(tmp.path(), CommitMode::Group);
+    assert_eq!(rows::<TestTable>(&db).len(), 300, "every row acknowledged past the old length");
+    drop(db);
+    disk_model::untrack(&log);
+}
+
+/// A compaction syncs its new log before the switch, since the commit thread counts the new log
+/// as synced up to its length at the switch and never syncs those bytes again. With the new log
+/// tracked by the disk model from its creation (`TestHooks::track_new_log`), so its image holds
+/// only what the compaction synced, a power loss after the compaction (and an acknowledged write
+/// after it, short of a growth) keeps every row.
+#[test]
+fn test_tndb_power_loss_after_a_compaction_keeps_every_row() {
+    use std::sync::atomic::Ordering::Relaxed;
+
+    use crate::archive::data_file::disk_model;
+    let tmp = TempDir::with_prefix("tndb_power_compaction").expect("temp dir");
+    let db = open(tmp.path(), CommitMode::Group);
+    let mut expected = BTreeMap::new();
+    for i in 0..100_u64 {
+        db.insert::<TestTable>(&i, &format!("v{i}")).expect("insert");
+        expected.insert(i, format!("v{i}"));
+    }
+    db.remove::<TestTable>(&0).expect("a dead row");
+    expected.remove(&0);
+    block_on(db.persist::<TestTable>()).expect("persist");
+    db.core().compact.test.track_new_log.store(true, Relaxed);
+    assert_eq!(db.compact_now(), Ok(true), "compacted");
+    let log = current_log(tmp.path());
+    assert!(log.starts_with(tmp.path().join("gen-1")), "precondition: {}", log.display());
+    db.insert::<TestTable>(&1000, &"after".to_string()).expect("insert");
+    expected.insert(1000, "after".to_string());
+    block_on(db.persist::<TestTable>()).expect("persist after the switch");
+    crash(db);
+    disk_model::power_loss(&log);
+    let db = open(tmp.path(), CommitMode::Group);
+    assert_eq!(rows::<TestTable>(&db), expected.into_iter().collect::<Vec<_>>());
+    drop(db);
+    disk_model::untrack(&log);
+}
+
 // ---- concurrency ----
 
 /// Writers (bare writes and transactions, each on its own keys), a scanner, a persister and
@@ -3138,6 +3719,7 @@ fn test_tndb_concurrent_stress() {
     use rand::{rngs::StdRng, Rng as _, SeedableRng as _};
 
     type Model = (BTreeMap<u64, String>, BTreeMap<u64, String>);
+    let seed = model_seed("concurrent_stress", 0x5713_0000);
     let tmp = TempDir::with_prefix("tndb_stress").expect("temp dir");
     let db = open_compacting(tmp.path(), CommitMode::Group, manual());
     let stop = AtomicBool::new(false);
@@ -3146,7 +3728,7 @@ fn test_tndb_concurrent_stress() {
         let writers: Vec<_> = (0..4_u64)
             .map(|w| {
                 s.spawn(move || {
-                    let mut rng = StdRng::seed_from_u64(0x5713_0000 + w);
+                    let mut rng = StdRng::seed_from_u64(seed.wrapping_add(w));
                     let mut model = Model::default();
                     let mut n = 0_u64;
                     while !stop.load(Relaxed) {
@@ -3185,8 +3767,14 @@ fn test_tndb_concurrent_stress() {
         let scanner = s.spawn(move || {
             while !stop.load(Relaxed) {
                 let keys: Vec<u64> = db.iter::<TestTable>().map(|(k, _)| k).collect();
-                assert!(keys.windows(2).all(|pair| pair[0] < pair[1]), "a scan is in key order");
-                assert!(keys.iter().all(|k| k % 1_000 < 202), "only keys some writer wrote");
+                assert!(
+                    keys.windows(2).all(|pair| pair[0] < pair[1]),
+                    "seed {seed:#x}: a scan is in key order"
+                );
+                assert!(
+                    keys.iter().all(|k| k % 1_000 < 202),
+                    "seed {seed:#x}: only keys some writer wrote"
+                );
             }
         });
         let persister = s.spawn(move || {
@@ -3214,7 +3802,7 @@ fn test_tndb_concurrent_stress() {
             writers.into_iter().map(|writer| writer.join().expect("writer")).collect();
         (models, compacted)
     });
-    assert!(compacted > 0, "compactions ran alongside");
+    assert!(compacted > 0, "seed {seed:#x}: compactions ran alongside");
     let mut expected = Model::default();
     for (test, other) in models {
         expected.0.extend(test);
@@ -3223,11 +3811,11 @@ fn test_tndb_concurrent_stress() {
     let found = |db: &TnDatabase| -> Model {
         (db.iter::<TestTable>().collect(), db.iter::<OtherTable>().collect())
     };
-    assert!(found(&db) == expected, "the tables are the writers' models");
+    assert!(found(&db) == expected, "seed {seed:#x}: the tables are the writers' models");
     block_on(db.persist::<TestTable>()).expect("persist");
     crash(db);
     let db = open(tmp.path(), CommitMode::Group);
-    assert!(found(&db) == expected, "and so is the reopened database");
+    assert!(found(&db) == expected, "seed {seed:#x}: and so is the reopened database");
 }
 
 /// The log outgrows its mapping's reservation several times (each time remapping) while the

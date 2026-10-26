@@ -428,8 +428,8 @@ pub async fn catchup_accumulator(
 
         // count leaders from consensus db for the current epoch
         // NOTE: replay_missed_consensus catches up rounds above last_executed_round.
-        // The consensus chain refuses unless its current pack is `last_executed_epoch`'s: another
-        // epoch's leaders would become this epoch's rewards.
+        // The consensus chain counts only `last_executed_epoch`'s pack (reopening it as the current
+        // one if the slot hint lagged): another epoch's leaders would become this epoch's rewards.
         if last_executed_round > 0 && last_executed_epoch == epoch_state.epoch {
             consensus_chain
                 .count_leaders(
@@ -908,7 +908,7 @@ where
         // Bind operator endpoints before any startup synchronization waits for peers.
         let (network_readiness_tx, network_readiness_rx) =
             watch::channel(NetworkReadiness::pending());
-        if let Some(port) = self.builder.healthcheck {
+        if let Some(bind) = self.builder.healthcheck {
             let engine = engine.clone();
             let consensus_bus = self.consensus_bus.clone();
             let worker_ready = move || {
@@ -918,13 +918,14 @@ where
                 let mode: tn_types::NodeMode = consensus_bus.current_node_mode().into();
                 async move { engine.worker_readiness(mode).await }
             };
-            let _ = HealthcheckServer::spawn(
+            // Propagate health bind errors: the operator requested this endpoint (#1689).
+            HealthcheckServer::spawn(
                 node_task_manager.get_spawner(),
-                port,
+                bind,
                 worker_ready,
                 network_readiness_rx,
             )
-            .await;
+            .await?;
         }
 
         // Propagate metrics bind errors because the operator requested this endpoint.

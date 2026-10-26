@@ -18,6 +18,7 @@ use crate::archive::{
         iter::{BtreeCursor, PageSource},
         page::Node,
     },
+    error::fetch::FetchError,
     pack::{DataHeader, PackCompression},
 };
 
@@ -344,10 +345,135 @@ fn assert_model(entries: &[(Vec<u8>, u64)], model: &BTreeMap<Vec<u8>, u64>, what
     );
 }
 
-/// The writer's tree is sound, holds exactly the model, and counts it right.
-fn check_writer(idx: &BtreeIndex, model: &BTreeMap<Vec<u8>, u64>, what: impl Display) {
+/// A tree the model tests read: the writer's or a published snapshot, scanned through a
+/// [`BtreeCursor`] and loaded one key at a time.
+trait ModelReads: PageSource {
+    /// The value stored for `key`, or [`FetchError::NotFound`].
+    fn load_key(&self, key: &[u8]) -> Result<u64, FetchError>;
+}
+
+impl ModelReads for BtreeIndex {
+    fn load_key(&self, key: &[u8]) -> Result<u64, FetchError> {
+        self.load(key)
+    }
+}
+
+impl ModelReads for IndexSnapshot {
+    fn load_key(&self, key: &[u8]) -> Result<u64, FetchError> {
+        self.load(key)
+    }
+}
+
+/// Which of the model's keys [`check_reads`] loads.
+#[derive(Clone, Copy, Debug)]
+enum Loads {
+    /// Every key.
+    Every,
+    /// The first and last few keys and about [`SAMPLED_LOADS`] spread evenly between them.
+    Sample,
+}
+
+/// About how many keys a [`Loads::Sample`] check loads.
+const SAMPLED_LOADS: usize = 16;
+
+/// `key` one up (`up`) or one down as a big-endian number of its own length, or `None` past the
+/// end. Between `key` and its neighbour in the model, unless that neighbour is the result.
+fn key_step(key: &[u8], up: bool) -> Option<Vec<u8>> {
+    let mut k = key.to_vec();
+    let (from, to) = if up { (0xFF, 0x00) } else { (0x00, 0xFF) };
+    for b in k.iter_mut().rev() {
+        if *b != from {
+            *b = if up { *b + 1 } else { *b - 1 };
+            return Some(k);
+        }
+        *b = to;
+    }
+    None
+}
+
+/// Reads of `src` agree with `model`: a forward and a reverse full cursor scan each yield exactly
+/// the model's entries, and point loads (see [`Loads`]) return each loaded key's value and
+/// `NotFound` for absent keys: the smallest and largest keys of the key size, and the keys just
+/// above and below each key loaded (those that are not in the model), which fall between it and
+/// its neighbours, inside its leaf or in the gap to the next leaf.
+fn check_reads<S: ModelReads>(
+    src: &S,
+    model: &BTreeMap<Vec<u8>, u64>,
+    loads: Loads,
+    what: impl Display,
+) {
+    // Compared entry by entry as the cursor yields them: copying out every key of every scan
+    // would cost more than the scans.
+    let head = |key: &[u8]| key[..key.len().min(8)].to_vec();
+    for reverse in [false, true] {
+        let mut want: Box<dyn Iterator<Item = (&Vec<u8>, &u64)>> =
+            if reverse { Box::new(model.iter().rev()) } else { Box::new(model.iter()) };
+        let mut cursor = BtreeCursor::new(src, reverse, Bound::Unbounded, Bound::Unbounded)
+            .unwrap_or_else(|e| panic!("{what}: cursor (reverse {reverse}): {e:?}"));
+        let mut n = 0;
+        while let Some(item) = cursor.next(src) {
+            let (key, value) =
+                item.unwrap_or_else(|e| panic!("{what}: scan step {n} (reverse {reverse}): {e:?}"));
+            let Some((k, v)) = want.next() else {
+                panic!("{what}: a scan (reverse {reverse}) yields more than the model's {n}");
+            };
+            assert!(
+                key == k.as_slice() && value == *v,
+                "{what}: scan step {n} (reverse {reverse}) yields {:02x?}.. = {value}, the model \
+                 {:02x?}.. = {v}",
+                head(key),
+                head(k)
+            );
+            n += 1;
+        }
+        assert_eq!(n, model.len(), "{what}: entries a scan (reverse {reverse}) yields");
+    }
+
+    let absent = |key: &[u8]| {
+        assert!(
+            matches!(src.load_key(key), Err(FetchError::NotFound)),
+            "{what}: absent key {key:02x?} loads {:?}",
+            src.load_key(key)
+        );
+    };
+    let ksize = src.node().ksize();
+    for edge in [vec![0; ksize], vec![0xFF; ksize]] {
+        if !model.contains_key(&edge) {
+            absent(&edge);
+        }
+    }
+    let stride = match loads {
+        Loads::Every => 1,
+        Loads::Sample => (model.len() / SAMPLED_LOADS).max(1),
+    };
+    let last = model.len().saturating_sub(1);
+    for (i, (key, value)) in model.iter().enumerate() {
+        if i % stride != 0 && i >= 4 && i + 4 <= last {
+            continue;
+        }
+        match src.load_key(key) {
+            Ok(got) => assert_eq!(got, *value, "{what}: load of key {i}"),
+            Err(e) => panic!("{what}: load of key {i} ({key:02x?}): {e:?}"),
+        }
+        for up in [false, true] {
+            if let Some(near) = key_step(key, up).filter(|k| !model.contains_key(k)) {
+                absent(&near);
+            }
+        }
+    }
+}
+
+/// The writer's tree is sound, holds exactly the model, counts it right, and reads it back (see
+/// [`check_reads`]).
+fn check_writer(
+    idx: &BtreeIndex,
+    model: &BTreeMap<Vec<u8>, u64>,
+    loads: Loads,
+    what: impl Display,
+) {
     assert_model(&walk_tree(idx, Some(idx.height())), model, &what);
     assert_eq!(idx.len(), model.len(), "{what}: value count");
+    check_reads(idx, model, loads, &what);
 }
 
 /// How often each operation and path ran: every one must have run at least once.
@@ -411,6 +537,13 @@ struct BatchRun {
     seed: u64,
     /// The height the tree must reach.
     min_height: u32,
+    /// How much [`check_reads`] reads. The writer loads every key at each batch's end, one held
+    /// snapshot a round (in turn) is walked and read, and every held snapshot is read in full at
+    /// the end. Between those, with `full_reads` (the long run) each operation loads every key
+    /// and every other held snapshot is scanned and loads a sample each round; without it (the
+    /// default tests, which CI runs unoptimized) each operation loads a sample and every other
+    /// held snapshot checks its count and its first and last keys.
+    full_reads: bool,
 }
 
 /// tndb-shaped batches over a small-page tree, against a `BTreeMap` model. Each round is a batch
@@ -418,14 +551,16 @@ struct BatchRun {
 /// batches has an allocation failure injected (the batch then rolls back with
 /// `revert_to_published`, as tndb's does), the others publish. Snapshots are held and dropped out
 /// of order, and some batches sync. After every operation the tree passes [`walk_tree`] and holds
-/// exactly the model; a revert restores the published root and height; a publish leaves no
-/// private page and its snapshot passes the walk; a sync leaves no dirty or corrupt page; every
-/// held snapshot keeps reading the state it was published with. Finally a clean close and reopen
-/// serves the same tree, and writes after it (reusing the free pages recovered by the open) keep
-/// the tree sound.
+/// exactly the model, and reads it back through forward and reverse cursor scans and point loads
+/// ([`check_reads`]); a revert restores the published root and height; a publish leaves no private
+/// page and its snapshot passes the walk; a sync leaves no dirty or corrupt page; every held
+/// snapshot keeps reading the state it was published with (see [`BatchRun::full_reads`] for how
+/// much is read when). Finally a clean close and reopen serves the same tree, and writes after it
+/// (reusing the free pages recovered by the open) keep the tree sound.
 fn random_batches(run: BatchRun) {
     let _seed = ReportSeed(run.seed);
-    let BatchRun { ksize, key_space, rounds, phase, seed, min_height } = run;
+    let BatchRun { ksize, key_space, rounds, phase, seed, min_height, full_reads } = run;
+    let op_loads = if full_reads { Loads::Every } else { Loads::Sample };
     let tmp = TempDir::with_prefix("test_archive_btx_batches").expect("temp dir");
     let dir = tmp.path().join("idx");
     let mut idx = open(&dir, ksize);
@@ -437,7 +572,7 @@ fn random_batches(run: BatchRun) {
     let mut held: Vec<(IndexSnapshot, BTreeMap<Vec<u8>, u64>)> = Vec::new();
     let mut ascending = 0_u64;
     let mut descending = key_space * 4;
-    let mut max_height = 0;
+    let (mut max_height, mut max_keys) = (0, 0);
     let mut seen = Coverage::default();
     for round in 0..rounds {
         let ops = 1 + rng.below(12);
@@ -497,8 +632,9 @@ fn random_batches(run: BatchRun) {
                 failed = true;
                 break;
             }
-            check_writer(&idx, &model, format_args!("round {round} op {op}"));
+            check_writer(&idx, &model, op_loads, format_args!("round {round} op {op}"));
             max_height = max_height.max(idx.height());
+            max_keys = max_keys.max(model.len());
         }
         idx.fail_allocations_after(None);
         if failed {
@@ -511,13 +647,22 @@ fn random_batches(run: BatchRun) {
                 "round {round}: a revert restores the published root and height"
             );
             assert_eq!(idx.private_pages(), 0, "round {round}: a revert frees every new page");
-            check_writer(&idx, &model, format_args!("round {round}, after the revert"));
+            check_writer(
+                &idx,
+                &model,
+                Loads::Every,
+                format_args!("round {round}, after the revert"),
+            );
             continue;
         }
         let snap = idx.publish();
         assert_eq!(idx.private_pages(), 0, "round {round}: a publish stamps every new page");
         assert_eq!(snap.len(), model.len());
         assert_model(&walk_tree(&snap, None), &model, format_args!("round {round}, snapshot"));
+        check_reads(&idx, &model, Loads::Every, format_args!("round {round}, after the publish"));
+        if full_reads {
+            check_reads(&snap, &model, Loads::Every, format_args!("round {round}, snapshot"));
+        }
         published = (model.clone(), idx.root(), idx.height());
         if rng.below(3) == 0 {
             seen.snapshots_held += 1;
@@ -535,25 +680,33 @@ fn random_batches(run: BatchRun) {
             idx.sync().expect("sync");
             let crc = idx.page_crc_scan();
             assert_eq!((crc.dirty, crc.corrupt), (0, 0), "round {round}: pages after a sync");
-            check_writer(&idx, &model, format_args!("round {round}, after the sync"));
+            check_writer(&idx, &model, op_loads, format_args!("round {round}, after the sync"));
         }
-        for (s, m) in &held {
-            assert_eq!(s.len(), m.len(), "round {round}: held snapshot's count");
-            for (k, v) in m.iter().take(4).chain(m.iter().rev().take(4)) {
-                assert_eq!(s.load(k).expect("snapshot load"), *v, "round {round}: held snapshot");
+        for (i, (s, m)) in held.iter().enumerate() {
+            assert_eq!(s.len(), m.len(), "round {round}: held snapshot {i}'s count");
+            let what = format_args!("round {round}, held snapshot {i}");
+            if i == round % held.len() {
+                assert_model(&walk_tree(s, None), m, what);
+                check_reads(s, m, op_loads, what);
+            } else if full_reads {
+                check_reads(s, m, Loads::Sample, what);
+            } else {
+                for (k, v) in m.iter().take(4).chain(m.iter().rev().take(4)) {
+                    assert_eq!(s.load(k).expect("load"), *v, "round {round}: held snapshot {i}");
+                }
             }
         }
-        if !held.is_empty() {
-            let (s, m) = &held[round % held.len()];
-            assert_model(&walk_tree(s, None), m, format_args!("round {round}, held snapshot"));
-        }
     }
-    eprintln!("ksize {ksize}: max height {max_height}, final keys {}, {seen:?}", model.len());
+    eprintln!(
+        "ksize {ksize}: max height {max_height}, max keys {max_keys}, final keys {}, {seen:?}",
+        model.len()
+    );
     assert!(max_height >= min_height, "the tree reached height {max_height}, not {min_height}");
     assert!(seen.missing().is_empty(), "never ran: {:?} ({seen:?})", seen.missing());
     assert!(seen.reverts > 10, "too few failed batches: {seen:?}");
     for (i, (s, m)) in held.iter().enumerate() {
         assert_model(&walk_tree(s, None), m, format_args!("held snapshot {i} at the end"));
+        check_reads(s, m, Loads::Every, format_args!("held snapshot {i} at the end"));
     }
 
     // A clean close (the drop syncs and seals) and reopen serves the same tree.
@@ -561,7 +714,7 @@ fn random_batches(run: BatchRun) {
     drop(idx);
     let mut idx = open(&dir, ksize);
     assert!(!idx.opened_unclean(), "a clean close reopens clean");
-    check_writer(&idx, &model, "after the reopen");
+    check_writer(&idx, &model, Loads::Every, "after the reopen");
     // Writes after the reopen take their pages from the free list the open recovered (the file
     // does not grow), and none of those pages may still be in use.
     let pages_at_open = idx.page_count();
@@ -575,7 +728,7 @@ fn random_batches(run: BatchRun) {
             let had = model.remove(&k).is_some();
             assert_eq!(idx.remove(&k).expect("remove after the reopen"), had);
         }
-        check_writer(&idx, &model, format_args!("after the reopen, op {op}"));
+        check_writer(&idx, &model, op_loads, format_args!("after the reopen, op {op}"));
     }
     assert_eq!(idx.page_count(), pages_at_open, "writes after the reopen reuse free pages");
     idx.sync().expect("sync");
@@ -583,16 +736,17 @@ fn random_batches(run: BatchRun) {
     assert_eq!((crc.dirty, crc.corrupt), (0, 0), "pages after the last sync");
 }
 
-/// 8-byte keys (255 per leaf): wide, shallow trees of thousands of keys.
+/// 8-byte keys (255 per leaf): wide, shallow trees of a few hundred keys.
 #[test]
 fn test_archive_btx_random_batches_keep_invariants_ksize_8() {
     random_batches(BatchRun {
         ksize: 8,
         key_space: 200_000,
-        rounds: 1_100,
-        phase: 250,
+        rounds: 550,
+        phase: 125,
         seed: 0xA5A5_5A5A_1234_4321,
         min_height: 2,
+        full_reads: false,
     });
 }
 
@@ -602,10 +756,11 @@ fn test_archive_btx_random_batches_keep_invariants_ksize_500() {
     random_batches(BatchRun {
         ksize: 500,
         key_space: 3_000,
-        rounds: 1_100,
-        phase: 250,
+        rounds: 550,
+        phase: 125,
         seed: 0x5151_7272_9393_A4A4,
         min_height: 4,
+        full_reads: false,
     });
 }
 
@@ -615,10 +770,11 @@ fn test_archive_btx_random_batches_keep_invariants_ksize_1000() {
     random_batches(BatchRun {
         ksize: 1000,
         key_space: 1_500,
-        rounds: 1_100,
-        phase: 250,
+        rounds: 550,
+        phase: 125,
         seed: 0x1234_5678_9ABC_DEF1,
         min_height: 4,
+        full_reads: false,
     });
 }
 
@@ -629,15 +785,19 @@ fn test_archive_btx_random_batches_keep_invariants_ksize_2032() {
     random_batches(BatchRun {
         ksize: 2032,
         key_space: 400,
-        rounds: 1_100,
-        phase: 250,
+        rounds: 550,
+        phase: 125,
         seed: 0x9E37_79B9_7F4A_7C15,
         min_height: 5,
+        full_reads: false,
     });
 }
 
-/// The randomized batches at every key size, over more seeds and longer runs: `TN_BTX_ROUNDS`
-/// rounds per run (default 3100) and, to replay one run, `TN_BTX_SEED` (decimal or `0x` hex).
+/// The randomized batches at every key size, over more seeds and longer runs, reading every key
+/// and every held snapshot after each step: `TN_BTX_ROUNDS` rounds per run (default 3100). Without
+/// `TN_BTX_SEED` each key size runs its fixed seeds and one seed drawn from entropy for this run
+/// (printed at the start, and by a failing run); `TN_BTX_SEED` (decimal or `0x` hex) replays that
+/// one seed at every key size instead.
 #[test]
 #[ignore = "on-demand long randomized run; run with --release --ignored --nocapture"]
 fn test_archive_btx_random_batches_keep_invariants_long() {
@@ -649,6 +809,11 @@ fn test_archive_btx_random_batches_keep_invariants_long() {
             .map_or_else(|| s.parse(), |hex| u64::from_str_radix(hex, 16))
             .expect("TN_BTX_SEED")
     });
+    // xorshift needs a nonzero seed.
+    let drawn = rand::random::<u64>().max(1);
+    if replay.is_none() {
+        eprintln!("this run's entropy seed: {drawn:#018x} (replay with TN_BTX_SEED)");
+    }
     let runs: [(usize, u64, u32, &[u64]); 4] = [
         (8, 200_000, 2, &[0xA5A5_5A5A_1234_4321, 0x0BAD_C0DE_F00D_D00D]),
         (500, 3_000, 4, &[0x5151_7272_9393_A4A4, 0x7F4A_7C15_9E37_79B9]),
@@ -656,9 +821,20 @@ fn test_archive_btx_random_batches_keep_invariants_long() {
         (2032, 400, 5, &[0x9E37_79B9_7F4A_7C15, 0x2545_F491_4F6C_DD1D, 0xDEAD_BEEF_CAFE_F00D]),
     ];
     for (ksize, key_space, min_height, seeds) in runs {
-        let replayed = replay.map(|seed| vec![seed]);
-        for &seed in replayed.as_deref().unwrap_or(seeds) {
-            random_batches(BatchRun { ksize, key_space, rounds, phase: 250, seed, min_height });
+        let seeds = match replay {
+            Some(seed) => vec![seed],
+            None => seeds.iter().copied().chain([drawn]).collect(),
+        };
+        for seed in seeds {
+            random_batches(BatchRun {
+                ksize,
+                key_space,
+                rounds,
+                phase: 250,
+                seed,
+                min_height,
+                full_reads: true,
+            });
         }
     }
 }

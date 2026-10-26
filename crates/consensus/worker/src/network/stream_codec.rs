@@ -10,7 +10,7 @@ use crate::batch_fetcher::get_batches_local;
 
 use super::error::WorkerNetworkResult;
 use futures::{AsyncWrite, AsyncWriteExt};
-use std::collections::BTreeSet;
+use std::{collections::BTreeSet, future::Future, time::Duration};
 use tn_network_libp2p::{write_frame, SyncFrame, WorkerSyncRequest};
 use tn_storage::consensus::ConsensusChain;
 use tn_types::{encode, max_batch_size, Database, Epoch, B256};
@@ -53,6 +53,13 @@ where
 /// Each `Data` payload is the BCS-encoded [`Batch`]; the frame layer adds its own
 /// length prefix and compression, bounded by `max_frame`.
 ///
+/// Every write has its own time limit, so a peer that stops reading cannot hold
+/// the caller's batch-serve permit until the whole-stream limit. The `Ack` write
+/// and flush are bounded by `SYNC_REQUEST_READ_TIMEOUT` (see
+/// [`write_ack_frame_bounded`]); each `Data` write, chunk flush, and the `End`
+/// write and flush by `frame_bound`. A write that trips its limit fails with an
+/// I/O error of kind [`std::io::ErrorKind::TimedOut`].
+///
 /// Only batches present in storage are streamed, so a requester tolerant of
 /// partial results fetches the rest elsewhere. The caller has already admitted the
 /// exchange against the concurrency caps and read the opening request frame.
@@ -63,6 +70,7 @@ pub(crate) async fn send_sync_batches_over_stream<DB, S>(
     batch_digests: &BTreeSet<B256>,
     epoch: Epoch,
     max_frame: usize,
+    frame_bound: Duration,
 ) -> WorkerNetworkResult<()>
 where
     DB: Database,
@@ -77,15 +85,7 @@ where
     // accept the exchange before streaming any data, flushing so the requester
     // receives the `Ack` within its ack timeout even when the first chunk's DB
     // reads are slow or no batches match (an empty response flushes only at `End`)
-    write_frame(
-        stream,
-        &SyncFrame::<WorkerSyncRequest>::Ack,
-        &mut encode_buffer,
-        &mut compressed_buffer,
-        max_frame,
-    )
-    .await?;
-    stream.flush().await?;
+    write_ack_frame_bounded(stream, max_frame, crate::network::SYNC_REQUEST_READ_TIMEOUT).await?;
 
     // stream each found batch as its own Data frame (chunked DB reads)
     let digests: Vec<_> = batch_digests.iter().copied().collect();
@@ -93,31 +93,86 @@ where
         let batches: Vec<_> = get_batches_local(epoch, chunk, store, consensus_chain).await?;
         for batch in &batches {
             let frame = SyncFrame::<WorkerSyncRequest>::Data(encode(batch));
-            write_frame(stream, &frame, &mut encode_buffer, &mut compressed_buffer, max_frame)
-                .await?;
+            bounded_write(
+                frame_bound,
+                "timeout writing sync data frame",
+                write_frame(stream, &frame, &mut encode_buffer, &mut compressed_buffer, max_frame),
+            )
+            .await?;
         }
 
-        // flush per chunk
-        stream.flush().await?;
+        // flush per chunk, bounded like each frame write
+        bounded_write(frame_bound, "timeout flushing sync data chunk", stream.flush()).await?;
     }
 
-    // orderly end of the response stream
-    write_frame(
-        stream,
-        &SyncFrame::<WorkerSyncRequest>::End,
-        &mut encode_buffer,
-        &mut compressed_buffer,
-        max_frame,
-    )
+    // orderly end of the response stream, bounded like each data frame write
+    bounded_write(frame_bound, "timeout writing sync end frame", async {
+        write_frame(
+            stream,
+            &SyncFrame::<WorkerSyncRequest>::End,
+            &mut encode_buffer,
+            &mut compressed_buffer,
+            max_frame,
+        )
+        .await?;
+        stream.flush().await
+    })
     .await?;
-    stream.flush().await?;
 
     Ok(())
+}
+
+/// Write the [`SyncFrame::Ack`] that accepts a sync exchange and flush it, within
+/// `bound`.
+///
+/// The requester waits for this frame before it reads any data, so it is flushed
+/// at once. A peer that gives the stream no write credit makes the write fail
+/// with [`std::io::ErrorKind::TimedOut`] at `bound`, so it cannot pin the caller
+/// or the permits the caller holds.
+pub(crate) async fn write_ack_frame_bounded<S>(
+    stream: &mut S,
+    max_frame: usize,
+    bound: Duration,
+) -> std::io::Result<()>
+where
+    S: AsyncWrite + Unpin + Send,
+{
+    let (mut encode_buffer, mut compressed_buffer) = (Vec::new(), Vec::new());
+    bounded_write(bound, "timeout writing sync ack frame", async {
+        write_frame(
+            stream,
+            &SyncFrame::<WorkerSyncRequest>::Ack,
+            &mut encode_buffer,
+            &mut compressed_buffer,
+            max_frame,
+        )
+        .await?;
+        stream.flush().await
+    })
+    .await
+}
+
+/// Run one frame write or flush within `bound`.
+///
+/// A write that is still pending at `bound` fails with an I/O error of kind
+/// [`std::io::ErrorKind::TimedOut`] and `context` as its message, so the caller
+/// can classify the failure as a stall.
+async fn bounded_write<F>(bound: Duration, context: &'static str, write: F) -> std::io::Result<()>
+where
+    F: Future<Output = std::io::Result<()>>,
+{
+    tokio::time::timeout(bound, write)
+        .await
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, context))
+        .and_then(|written| written)
 }
 
 #[cfg(test)]
 mod tests {
     use crate::{
+        network::{
+            error::WorkerNetworkError, handler::SEND_STREAM_FRAME_TIMEOUT, SyncServeOutcome,
+        },
         test_utils::{create_test_batches, setup_batch_db},
         WorkerNetworkHandle,
     };
@@ -156,9 +211,17 @@ mod tests {
 
         // responder serializes Ack + one Data frame per batch + End
         let mut output = Vec::new();
-        send_sync_batches_over_stream(&mut output, &db, &consensus_chain, &digests, 0, max_frame)
-            .await
-            .expect("serve sync batches");
+        send_sync_batches_over_stream(
+            &mut output,
+            &db,
+            &consensus_chain,
+            &digests,
+            0,
+            max_frame,
+            SEND_STREAM_FRAME_TIMEOUT,
+        )
+        .await
+        .expect("serve sync batches");
 
         // requester reads the opening Ack, then the Data/End stream
         let mut cursor = Cursor::new(output);
@@ -193,9 +256,17 @@ mod tests {
         let max_frame = crate::network::handle::max_sync_frame_size(0);
 
         let mut output = Vec::new();
-        send_sync_batches_over_stream(&mut output, &db, &consensus_chain, &digests, 0, max_frame)
-            .await
-            .expect("serve sync batches");
+        send_sync_batches_over_stream(
+            &mut output,
+            &db,
+            &consensus_chain,
+            &digests,
+            0,
+            max_frame,
+            SEND_STREAM_FRAME_TIMEOUT,
+        )
+        .await
+        .expect("serve sync batches");
 
         let mut cursor = Cursor::new(output);
         read_sync_ack(&mut cursor, max_frame).await;
@@ -285,6 +356,7 @@ mod tests {
             &digest_set,
             0,
             max_frame,
+            SEND_STREAM_FRAME_TIMEOUT,
         )
         .await
         .expect("serve sync batches");
@@ -336,9 +408,17 @@ mod tests {
         let max_frame = crate::network::handle::max_sync_frame_size(0);
 
         let mut output = Vec::new();
-        send_sync_batches_over_stream(&mut output, &db, &consensus_chain, &digests, 0, max_frame)
-            .await
-            .expect("serve sync batches");
+        send_sync_batches_over_stream(
+            &mut output,
+            &db,
+            &consensus_chain,
+            &digests,
+            0,
+            max_frame,
+            SEND_STREAM_FRAME_TIMEOUT,
+        )
+        .await
+        .expect("serve sync batches");
 
         let mut cursor = Cursor::new(output);
         read_sync_ack(&mut cursor, max_frame).await;
@@ -497,5 +577,94 @@ mod tests {
             elapsed >= BATCH_STREAM_TOTAL_TIMEOUT && elapsed < BATCH_STREAM_TOTAL_TIMEOUT + gap * 2,
             "total timeout should fire at ~{BATCH_STREAM_TOTAL_TIMEOUT:?}, fired at {elapsed:?}"
         );
+    }
+
+    /// Where a [`StallAfterAck`] writer is in the exchange.
+    #[derive(Clone, Copy, Debug, Default)]
+    enum AckPhase {
+        /// The `Ack` is not flushed yet: writes complete.
+        #[default]
+        Writing,
+        /// The `Ack` was flushed: every later write stays pending.
+        Flushed,
+    }
+
+    /// A writer that accepts the `Ack` and its flush, then never accepts another
+    /// byte: a requester that read the `Ack` and then stopped reading.
+    #[derive(Debug, Default)]
+    struct StallAfterAck {
+        /// How far the exchange got.
+        phase: AckPhase,
+    }
+
+    impl AsyncWrite for StallAfterAck {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            match self.phase {
+                AckPhase::Writing => std::task::Poll::Ready(Ok(buf.len())),
+                AckPhase::Flushed => std::task::Poll::Pending,
+            }
+        }
+
+        fn poll_flush(
+            mut self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            self.phase = AckPhase::Flushed;
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn poll_close(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    /// A requester that reads the `Ack` and then stops reading trips the per-frame
+    /// limit on the first `Data` write: the serve fails with an `StdIo` error of
+    /// kind `TimedOut` at `SEND_STREAM_FRAME_TIMEOUT`, which classifies as a stall.
+    #[tokio::test(start_paused = true)]
+    async fn stalled_data_frame_write_times_out_at_frame_bound() {
+        let batches = create_test_batches(1);
+        let db = setup_batch_db(&batches);
+        let temp_dir = TempDir::new().expect("tempdir");
+        let consensus_chain =
+            ConsensusChain::new(temp_dir.path().to_path_buf(), Committee::default())
+                .expect("consensus chain");
+        let digests: BTreeSet<B256> = batches.iter().map(|b| b.digest()).collect();
+        let max_frame = crate::network::handle::max_sync_frame_size(0);
+        let mut writer = StallAfterAck::default();
+
+        let started = tokio::time::Instant::now();
+        let served = send_sync_batches_over_stream(
+            &mut writer,
+            &db,
+            &consensus_chain,
+            &digests,
+            0,
+            max_frame,
+            SEND_STREAM_FRAME_TIMEOUT,
+        )
+        .await;
+        let elapsed = started.elapsed();
+
+        assert!(matches!(writer.phase, AckPhase::Flushed), "the ack was written and flushed");
+        assert!(
+            elapsed >= SEND_STREAM_FRAME_TIMEOUT,
+            "the data write fails at its limit, took {elapsed:?}"
+        );
+        assert!(
+            matches!(
+                &served,
+                Err(WorkerNetworkError::StdIo(e)) if e.kind() == std::io::ErrorKind::TimedOut
+            ),
+            "a stalled data write fails with a timed-out io error, got {served:?}"
+        );
+        assert_eq!(SyncServeOutcome::of(&served), SyncServeOutcome::Stalled);
     }
 }

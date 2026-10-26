@@ -125,15 +125,22 @@ where
 
     /// [`Self::record_bytes`] through a lock-free [`MapView`], bounded by `limit` (see
     /// [`MapView::tail_within`]): CRC-check the record at `pos` and borrow its payload. Log
-    /// records never change once appended, so a published record is safe to read with no lock.
-    /// `max` is the pack's record cap (see [`MmapFileOptions::max_record_size`]).
-    pub(crate) fn record_bytes_within(
+    /// records never change once appended, so a record written before the call is safe to read
+    /// with no lock. `max` is the pack's record cap (see [`MmapFileOptions::max_record_size`]).
+    ///
+    /// # Safety
+    ///
+    /// [`MapView::tail_within`]'s, for `[pos, limit)`: every byte of it written in full by writes
+    /// that happen before the call, and none written or cut while the payload lives. The
+    /// contract rests on where the caller's `limit` came from, which this fn cannot see.
+    pub(crate) unsafe fn record_bytes_within(
         view: &MapView,
         pos: u64,
         limit: u64,
         max: u32,
     ) -> Result<&[u8], FetchError> {
-        checked_payload_in(view.tail_within(pos, limit), max)
+        // SAFETY: this fn's own contract is `tail_within`'s, for the same range.
+        checked_payload_in(unsafe { view.tail_within(pos, limit) }, max)
     }
 
     /// The on-disk size of the record at `pos` (its frame: payload plus 8 bytes), CRC-checked.
@@ -302,6 +309,22 @@ where
         self.inner.data_file.committed_end()
     }
 
+    /// Seal the data file now and report the outcome (see [`MmapDataFile::seal`]), for an owner
+    /// that installs or trusts the pack on the strength of its seal: dropping the pack seals it
+    /// too, but can only log a failure. A pack in the failed state is refused with that state's
+    /// cause, nothing written. Consumes the pack; whatever the outcome, its `Drop` writes nothing
+    /// more.
+    pub(crate) fn seal(mut self) -> io::Result<()> {
+        self.inner.seal()
+    }
+
+    /// Test-only: the data file's next seal reports a failed final fsync (see
+    /// [`MmapDataFile::fail_next_seal_sync_for_test`]).
+    #[cfg(test)]
+    pub(crate) fn fail_next_seal_sync_for_test(&mut self) {
+        self.inner.data_file.fail_next_seal_sync_for_test();
+    }
+
     /// Poison the data file: a sync of it failed elsewhere (see [`Self::note_synced`]), so its
     /// state on disk is unknown. It refuses every later append and barrier, and is never sealed
     /// as clean (the next open recovers it).
@@ -331,9 +354,10 @@ where
     }
 
     /// Stamp the tail commit marker at `committed`, an end a sync made outside this pack covered
-    /// (see [`Self::note_synced`] and [`MmapDataFile::stamp_commit_marker_at`]).
-    pub(crate) fn stamp_commit_marker_at(&mut self, committed: u64) {
-        self.inner.data_file.stamp_commit_marker_at(committed);
+    /// (see [`Self::note_synced`] and [`MmapDataFile::stamp_commit_marker_at`]). Returns whether
+    /// the marker was stamped.
+    pub(crate) fn stamp_commit_marker_at(&mut self, committed: u64) -> bool {
+        self.inner.data_file.stamp_commit_marker_at(committed)
     }
 
     /// Stamp the tail commit marker (`committed_end == file_len()`) — a best-effort, no-extra-sync
@@ -388,8 +412,9 @@ where
     V: Debug + Serialize + DeserializeOwned,
 {
     fn drop(&mut self) {
-        // A file to be removed (an abandoned build) is discarded, not made durable.
-        if !self.read_only && !self.data_file.removes_on_drop() {
+        // A file to be removed (an abandoned build) is discarded, not made durable, and a sealed
+        // one ([`Pack::seal`]) is closed.
+        if !self.read_only && !self.data_file.removes_on_drop() && !self.data_file.is_closed() {
             let _ = self.commit();
         }
     }
@@ -649,6 +674,12 @@ where
     /// append or commit reports the root cause of the failed state.
     fn failed_cause(&self) -> Result<(), io::Error> {
         self.failed.as_ref().map_or(Ok(()), |cause| Err(Self::copy_io_error(cause)))
+    }
+
+    /// See [`Pack::seal`].
+    fn seal(&mut self) -> io::Result<()> {
+        self.failed_cause()?;
+        self.data_file.seal()
     }
 
     /// Return the DB version.
@@ -1824,21 +1855,27 @@ mod tests {
         .expect("an uncompressed pack reads what it wrote");
     }
 
-    /// A compressed record whose decoded bytes declare a length far past what is there is a decode
-    /// error, not a panic or an abort.
+    /// A record whose decoded bytes declare a length far past what is there is a decode error, not
+    /// a panic or an abort: on a compressed pack, where the value is decoded from the decompressed
+    /// slice, and on an uncompressed one. The record beside it, the same bytes with an honest
+    /// length, decodes, so the failure is the lying length's.
     #[test]
     fn zstd_read_of_a_lying_length_prefix_fails_cleanly() {
-        let tmp_path = TempDir::with_prefix("test_pack_zstd_lying_len").expect("temp dir");
-        let path = tmp_path.path().join("pack");
-        let mut db: Pack<Vec<u8>> =
-            Pack::open(&path, 0, false, PackCompression::ZStd, 0).expect("open pack");
-        // ULEB128 for 2^31 - 2 (bcs's longest sequence), then three bytes.
-        let lying = [0xfe_u8, 0xff, 0xff, 0xff, 0x07, 1, 2, 3];
-        let compressed = zstd::bulk::compress(&lying, 3).expect("compress");
-        let pos = db.append_raw(&compressed).expect("append");
-        db.commit().expect("commit");
-        let err = db.fetch(pos).expect_err("a length past the bytes");
-        assert!(matches!(err, FetchError::DeserializeValue(_)), "got {err:?}");
+        for compression in [PackCompression::ZStd, PackCompression::None] {
+            let tmp_path = TempDir::with_prefix("test_pack_zstd_lying_len").expect("temp dir");
+            let path = tmp_path.path().join("pack");
+            let mut db: Pack<Vec<u8>> =
+                Pack::open(&path, 0, false, compression, 0).expect("open pack");
+            // `append_raw` stores the encoded value as the pack stores any value (compressed once
+            // on a compressed pack). ULEB128 for 3, then three bytes.
+            let honest = db.append_raw(&[3, 1, 2, 3]).expect("append");
+            // ULEB128 for 2^31 - 2 (bcs's longest sequence), then the same three bytes.
+            let lying = db.append_raw(&[0xfe, 0xff, 0xff, 0xff, 0x07, 1, 2, 3]).expect("append");
+            db.commit().expect("commit");
+            assert_eq!(db.fetch(honest).expect("an honest length decodes"), vec![1, 2, 3]);
+            let err = db.fetch(lying).expect_err("a length past the bytes");
+            assert!(matches!(err, FetchError::DeserializeValue(_)), "{compression:?}: got {err:?}");
+        }
     }
 
     fn archive_pack_(compression: PackCompression) {

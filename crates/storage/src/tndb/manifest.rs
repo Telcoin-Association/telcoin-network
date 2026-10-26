@@ -24,6 +24,13 @@ use crate::{
     tndb::TableId,
 };
 
+#[cfg(test)]
+thread_local! {
+    /// Test-only: this thread's next [`Manifest::write`] fails, as a full disk or an I/O error
+    /// would.
+    pub(super) static FAIL_NEXT_WRITE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 const FILE: &str = "tables";
 const TMP: &str = "tables.tmp";
 const MAGIC: &[u8; 8] = b"TNDBTABL";
@@ -134,6 +141,10 @@ impl Manifest {
 
     /// Durably replace the manifest at `root`: a crash leaves the old file or the new one.
     pub(super) fn write(&self, root: &Path) -> eyre::Result<()> {
+        #[cfg(test)]
+        if FAIL_NEXT_WRITE.with(|fail| fail.replace(false)) {
+            bail!("a manifest write failure injected by a test");
+        }
         let tmp = root.join(TMP);
         {
             let mut file = fs::File::create(&tmp)?;

@@ -3866,8 +3866,6 @@ fn test_import_fault_is_peer_caused_whitelist() {
     assert!(peer_caused(cc(PackError::OutputTooLarge { size: 2, max: 1 })));
     assert!(peer_caused(cc(PackError::TooManyBatches(9))));
     assert!(peer_caused(cc(PackError::MissingBatch)));
-    assert!(peer_caused(ConsensusChainError::EmptyImport));
-    assert!(peer_caused(ConsensusChainError::InvalidImport));
     // A record out of place / not what the header declares, or one that fails its CRC/decode, is
     // the sender's bytes: charged at Medium (an honest peer's at-rest pack damage looks the
     // same).
@@ -3896,6 +3894,12 @@ fn test_import_fault_is_peer_caused_whitelist() {
     assert!(!peer_caused(cc(PackError::PersistError("disk full".into()))));
     assert!(!peer_caused(cc(PackError::Append("io".into()))));
     assert!(!peer_caused(cc(PackError::ReadOnly)));
+    // Local IO (a leftover import dir we could not remove, a full disk) is never the peer's.
+    let io = || std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+    assert!(!peer_caused(ConsensusChainError::IO(io())));
+    assert!(!peer_caused(cc(PackError::IO(Arc::new(io())))));
+    assert!(PrimaryNetworkHandle::consensus_chain_error_to_penalty(&ConsensusChainError::IO(io()))
+        .is_none());
     // A transport failure or timeout says nothing about the sender's bytes.
     assert!(!peer_caused(cc(PackError::ReadError("timeout".into()))));
     assert!(!peer_caused(ConsensusChainError::EpochMismatch));

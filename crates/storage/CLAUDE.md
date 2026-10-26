@@ -94,12 +94,19 @@ and remember that everything after `mod test` is tests (more than half of `conse
 - **Destructive recovery fails closed.** Validate the data log (the WAL) before deleting indexes
   (`recover_pack`, `check_recoverable`). An open that would initialise a file must first prove it
   holds nothing past its header. Never let a failed attempt or a corrupt proxy authorize erasing
-  committed data. A read error is never a torn tail (only `UnexpectedEof` is a tear; `FetchError::is_read_failure`,
-  next to `pack_iter::read_frame`, is the one rule), and an absent
-  file beside an index that attests data counts as corrupt, never new.
+  committed data. A read error is never a torn tail (only `UnexpectedEof` is a tear;
+  `FetchError::is_read_failure`, next to `pack_iter::read_frame`, is the one rule), and an absent
+  file beside an index that attests data counts as corrupt, never new. (One exception:
+  `CertificatePack`'s writable open starts a new log over a missing `cert_data` and discards the
+  leftover `cert_hash/` with a warning; nothing reads the pack. See its module docs.)
 - **The clean-close seal is gated.**
   - `MmapDataFile`'s `Drop` seals only when the file is not `opened_unclean`, not poisoned (any
-    failed write, sync, grow or remap sets the latch), and not dropped during a panic.
+    failed write, sync, grow or remap sets the latch), and not dropped during a panic. An owner
+    that installs or trusts files on the strength of their seal uses the checked seal
+    (`MmapDataFile::seal`, `ConsensusPack::close_checked`), which reports what `Drop` only logs.
+  - With `MmapFileOptions::defer_seal_retire` (tndb's logs), a writable open of a sealed file keeps
+    its sentinel until the handle's first write, and `Drop` leaves a never-written file untouched,
+    so a failed or killed open that replays it still finds it sealed.
   - Every recovery or heal must `mark_consistent` its data log and every index file, or the pack
     rebuilds on every open.
 - **Persist on the hot path is the data log's msync, nothing more.**
@@ -136,9 +143,13 @@ and remember that everything after `mod test` is tests (more than half of `conse
     structs;
   - a variable-length `Vec<u8>` must use `tn_types::byte_vec`/`ByteVec`, or bcs encodes it one
     byte at a time.
-- **Formats and backends:** tndb is pre-release, so its formats and paths change freely, with no
-  migration shims. MDBX remains only for the one-release migration (`migrate_from_mdbx`); delete
-  it the release after.
+- **Formats and backends:** tndb is the node's production consensus DB, so its on-disk formats
+  and paths are a compatibility surface (`PACK_VERSION`, the `tndb/record.rs` layout, the
+  manifest's `MAGIC`/`VERSION`, `TNDB_DIR`, `ENVIRONMENTS`, `gen-N`, `idx-N`). A format change
+  bumps its version and either migrates the old format at open or refuses it with an error naming
+  both versions. A path change finds the old path and moves it or refuses, never opens an empty
+  database beside it. MDBX remains only for the one-release migration (`migrate_from_mdbx`);
+  delete it the release after.
 - **Packs whose last handle drops on a multi-thread runtime seal on the blocking pool.** In tests
   and benches, `close().await` a pack before reopening its files.
 
@@ -164,18 +175,39 @@ and remember that everything after `mod test` is tests (more than half of `conse
 - **Pack test hooks:** `fail_next_save` (rollback), `panic_next_save` (the unsealed panic path),
   `set_encode_lanes` (force the split encode), `slow_batch_reads` (slow batch reads, for
   cancellation and lock-yield tests), `pause_batches_after` (a `batches` request pauses after n
-  reads, outside the locks, for a seal-under-request test); thread-local `SKIP_NEXT_LEGACY_CHECK`, `FAIL_NEXT_INSTALL`,
-  `FAIL_NEXT_MIGRATION_SEAL`, `FAIL_NEXT_HEAL_SEAL` (a legacy pack reaching the writable open, a
-  failed install rename, an unsealed staged migration, an index heal that did not seal);
-  `ENVIRONMENTAL_NEXT_SEAL_CHECK` (the next `check_installed_pack_sealed` fails as descriptor
-  exhaustion does; `stream_import` carries it onto its blocking thread);
-  `pack_iter::{FAIL_READ_AT, FAIL_READ_SKIP, FAIL_READ_TORN}` (a read error or short read at a
-  frame, optionally on a later pass; the epoch DB and cert pack tests reach each walk by choosing
-  which attestations survive). `ConsensusPack::poison_data_for_test` and
-  `ConsensusChain::poison_current_pack_for_test` (test-utils: poison the data log as a failed sync
-  does; the second for node tests); thread-local `FAIL_NEXT_IMPORT_SEAL` in `consensus.rs` (an
-  imported pack left unsealed). `EpochRecordDb`: `fail_index_save_after_append`,
-  `fail_epoch_slot_save_after_digest`. Log assertions: `consensus_pack::test::warnings_and_errors`.
+  reads, outside the locks, for seal-under-request, save-between-reads and cancellation tests),
+  `Shared::batches_read` (how many batches `batches` requests have read); thread-local `SKIP_NEXT_LEGACY_CHECK`,
+  `FAIL_NEXT_INSTALL`, `FAIL_NEXT_MIGRATION_SEAL`, `FAIL_NEXT_HEAL_SEAL` (a legacy pack reaching the
+  writable open, a failed install rename, an unsealed staged migration, an index heal that did not
+  seal; the seal hooks take a `SealFault`: `Unsealed`, or `Sync`, a failed final fsync only the
+  seal's result shows); `fail_next_seal_sync_for_test` (on `MmapDataFile`, `Pack`,
+  `PositionIndex`, `ConsensusPack`: the next seal's fsync reports failure after it ran);
+  `ENVIRONMENTAL_NEXT_SEAL_CHECK` (the next `check_installed_pack_sealed` or `pack_is_sealed`
+  fails as descriptor exhaustion does; `stream_import` and `seal_previous_pack` carry it onto their
+  blocking threads); `ENVIRONMENTAL_NEXT_RECOVERY_CHECK` and `ENVIRONMENTAL_NEXT_INDEX_OPEN` (`db
+  repair`'s check and apply arms meeting descriptor exhaustion); `FAIL_HEAL_DATA_OPEN` (`(skip,
+  errno)`: a read-side heal's, migration's or `check_recoverable`'s read-only data-log open fails
+  with that OS error after `skip` such opens); `pack_iter::{FAIL_READ_AT,
+  FAIL_READ_SKIP, FAIL_READ_TORN}` (a read error or short read at a frame, optionally on a later
+  pass; the epoch DB and cert pack tests reach each walk by choosing which attestations survive);
+  `position_index::index::{FAIL_NEXT_PDX_READ, FAIL_NEXT_PDX_OPEN}` (the next `raw_entries` or
+  `open_pdx_file` on the thread fails as a disk read does, `EIO`).
+  `ConsensusPack::poison_data_for_test` and `ConsensusChain::poison_current_pack_for_test`
+  (test-utils: poison the data log as a failed sync does; the second for node tests); thread-local
+  `FAIL_NEXT_IMPORT_SEAL` in `consensus.rs` (an imported pack whose seal fails, a `SealFault`) and
+  `FAIL_NEXT_SWAP_OPEN` (the swap of `current_pack` after an install of the live epoch fails);
+  `FAIL_NEXT_IMPORT_INDEX_OPEN` (an import's last index, the batch digests, fails to open);
+  thread-local `PANIC_IN_REPLAY` in `tndb/store.rs` (a panic inside a tndb replay);
+  `store::FAIL_NEXT_INDEX_CREATE` and `manifest::FAIL_NEXT_WRITE` (a failed table setup);
+  `compact::compact_now_within` (a compaction wait with a deadline);
+  `compact::TestHooks::track_new_log` (the next compaction's new log tracked by the disk model
+  from its creation);
+  `certificate_store::FAIL_SAVE_CERT_AFTER` (a `write_all` whose k-th certificate fails);
+  `archive::data_file::disk_model` (`track`, `power_loss`, which also cuts a file back to the
+  length its last fsync made durable, and `set_flushes_lost`, a failed writeback a later sync can
+  no longer report). `EpochRecordDb`: `fail_index_save_after_append`,
+  `fail_epoch_slot_save_after_digest`, thread-local `FAIL_NEXT_ATTESTED_END` (the next digest-index
+  attestation read fails, `EIO`). Log assertions: `consensus_pack::test::warnings_and_errors`.
 - **Check a new test with a mutation:** break the code it guards, see it fail, restore.
 
 ## Benchmarks

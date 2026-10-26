@@ -4,7 +4,7 @@
 # root (`storage-ab-<host>-<time>.txt`). For judging a storage change on the machine and disk that
 # matter (Linux for anything durable: a macOS fsync/msync doesn't flush the drive).
 #
-# Usage: etc/storage-ab-bench.sh <empty dir on the disk under test> <before-commit> [bench]
+# Usage: etc/storage-ab-bench.sh <dir on the disk under test> <before-commit> [bench]
 #   bench            a tn-storage test path (default pack_bench::consensus_pack_workload); see the
 #                    crate README's Benchmarks section. Its module must exist in the before commit.
 #   AB_ROUNDS=1      one before and one after run instead of before/after/after/before
@@ -23,18 +23,23 @@
 # tree's files can look older than its artifacts and be skipped). Each side's test binary
 # is run directly, its md5 and test count recorded, and the run refused if the two binaries match.
 # Needs a Rust toolchain, git, and room in the bench dir for a release build plus the bench's data.
+# In the bench dir the script writes only `src-before/` (marked as its own, re-exported each run and
+# removed on exit), `target-before-*/` and `build-*.log` (kept for reruns), and a private temp dir
+# for the bench's files (removed on exit); it removes nothing else there.
 set -euo pipefail
 
-bench_dir="${1:?usage: $0 <empty dir on the disk under test> <before-commit> [bench]}"
-before="${2:?usage: $0 <empty dir on the disk under test> <before-commit> [bench]}"
+die() { echo "$*" >&2; exit 1; }
+bench_dir="${1:?usage: $0 <dir on the disk under test> <before-commit> [bench]}"
+before="${2:?usage: $0 <dir on the disk under test> <before-commit> [bench]}"
 bench="${3:-pack_bench::consensus_pack_workload}"
+[ ! -e "$bench_dir" ] || [ -d "$bench_dir" ] || die "refusing $bench_dir: not a directory"
 mkdir -p "$bench_dir"
-bench_dir="$(cd "$bench_dir" && pwd)"
+bench_dir="$(cd "$bench_dir" && pwd -P)"
+[ "$bench_dir" != / ] || die "refusing / as the bench dir"
 repo="$(cd "$(dirname "$0")" && git rev-parse --show-toplevel)"
 report="$repo/storage-ab-$(uname -n | cut -d. -f1)-$(date +%Y%m%d-%H%M%S).txt"
 read -r -a features <<<"${AB_FEATURES:-}"
 
-die() { echo "$*" >&2; exit 1; }
 if [ "$(uname -s)" = "Linux" ]; then
     case "$(stat -f -c %T "$bench_dir")" in
         tmpfs | ramfs) die "refusing $bench_dir: it is tmpfs/ramfs (syncs are free there)" ;;
@@ -52,11 +57,21 @@ bench_file="crates/storage/src/${module//:://}.rs"
 [ -f "$repo/$bench_file" ] || die "no $bench_file for bench $bench"
 grep -q "fn $bench_fn()" "$repo/$bench_file" || die "no fn $bench_fn in $bench_file"
 
+# A src-before this script did not create (no marker) is refused, never removed.
 src_before="$bench_dir/src-before"
-rm -rf "$src_before"
-mkdir -p "$src_before"
-cleanup() { rm -rf "$src_before" "$bench_dir"/.tmp* 2>/dev/null || true; }
+src_marker="$src_before/.storage-ab-bench"
+if [ -e "$src_before" ] || [ -L "$src_before" ]; then
+    [ -d "$src_before" ] && [ ! -L "$src_before" ] && [ -f "$src_marker" ] \
+        || die "refusing to remove $src_before: this script did not create it"
+    rm -rf "$src_before"
+fi
+tmp_dir="$(mktemp -d "$bench_dir/storage-ab-tmp.XXXXXX")"
+cleanup() { rm -rf "$src_before" "$tmp_dir" 2>/dev/null || true; }
 trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+mkdir "$src_before"
+: >"$src_marker"
 git -C "$repo" archive "$before" | tar -x -C "$src_before"
 rm -rf "$src_before/tn-contracts"
 ln -s "$repo/tn-contracts" "$src_before/tn-contracts"
@@ -81,7 +96,7 @@ fi
 target_before="$bench_dir/target-before-$target_key"
 target_after="${CARGO_TARGET_DIR:-$repo/target}"
 unset CARGO_TARGET_DIR
-export TMPDIR="$bench_dir"
+export TMPDIR="$tmp_dir"
 
 kv() { printf '%-18s %s\n' "$1:" "$2" >>"$report"; }
 digest() {
@@ -101,7 +116,7 @@ if [ "$(uname -s)" = "Linux" ]; then
     kv mount "$part $(stat -f -c %T "$bench_dir")"
     dev="$(lsblk -no PKNAME "$part" 2>/dev/null | head -1 || true)"
     [ -n "$dev" ] && kv device "$(lsblk -dno NAME,MODEL,SIZE "/dev/$dev" 2>/dev/null || echo "$dev")"
-    probe="$bench_dir/sync-probe"
+    probe="$tmp_dir/sync-probe"
     kv "dsync 4k x2000" "$(dd if=/dev/zero of="$probe" bs=4k count=2000 oflag=dsync 2>&1 | tail -1)"
     rm -f "$probe"
 fi
@@ -117,7 +132,7 @@ kv knobs "$(env | grep -E '^(TN_BENCH_|INDEX_BENCH_)' | tr '\n' ' ')"
 
 build() { # <label> <source tree> <target dir>: prints the test binary's path
     echo "building the $1 test binary..." >&2
-    (cd "$2" && CARGO_TARGET_DIR="$3" cargo test --release -p tn-storage --lib \
+    (cd "$2" && CARGO_TARGET_DIR="$3" cargo test --locked --release -p tn-storage --lib \
         ${features[@]+"${features[@]}"} --no-run) >"$bench_dir/build-$1.log" 2>&1 || {
         tail -30 "$bench_dir/build-$1.log" >&2
         die "build of $1 failed; see $bench_dir/build-$1.log"

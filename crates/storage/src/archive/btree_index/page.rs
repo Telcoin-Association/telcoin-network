@@ -140,6 +140,31 @@ impl Node {
         buf[2..4].copy_from_slice(&(n as u16).to_le_bytes());
     }
 
+    /// Zero leaf slots `from..to` (keys and values): a vacated slot past the entry count holds no
+    /// stale entry, so a count damaged upwards reads zero bytes, not a removed or moved entry.
+    fn zero_leaf_slots(&self, buf: &mut [u8], from: usize, to: usize) {
+        if from >= to {
+            return;
+        }
+        let z = self.ksize;
+        buf[LEAF_KEYS_OFF + from * z..LEAF_KEYS_OFF + to * z].fill(0);
+        let vs = self.leaf_values_off;
+        buf[vs + from * VALUE_SIZE..vs + to * VALUE_SIZE].fill(0);
+    }
+
+    /// Zero internal key slots `from..to` and the child slots right of them (`from + 1..=to`):
+    /// see [`Self::zero_leaf_slots`].
+    fn zero_internal_slots(&self, buf: &mut [u8], from: usize, to: usize) {
+        if from >= to {
+            return;
+        }
+        let z = self.ksize;
+        let ks = self.internal_keys_off;
+        buf[ks + from * z..ks + to * z].fill(0);
+        let cs = INTERNAL_CHILDREN_OFF;
+        buf[cs + (from + 1) * 4..cs + (to + 1) * 4].fill(0);
+    }
+
     // ---- leaf accessors ----
 
     /// Initialize `buf` as an empty leaf with the given (unused, see [`LINKS`]) sibling links.
@@ -224,7 +249,8 @@ impl Node {
         self.set_entry_count(buf, n + 1);
     }
 
-    /// Remove the entry at leaf slot `i` by shifting the tail one position left.
+    /// Remove the entry at leaf slot `i` by shifting the tail one position left. The vacated last
+    /// slot is zeroed.
     pub(crate) fn leaf_delete(&self, buf: &mut [u8], i: usize) {
         let n = self.entry_count(buf);
         let z = self.ksize;
@@ -232,6 +258,7 @@ impl Node {
         buf.copy_within(ks + (i + 1) * z..ks + n * z, ks + i * z);
         let vs = self.leaf_values_off;
         buf.copy_within(vs + (i + 1) * VALUE_SIZE..vs + n * VALUE_SIZE, vs + i * VALUE_SIZE);
+        self.zero_leaf_slots(buf, n - 1, n);
         self.set_entry_count(buf, n - 1);
     }
 
@@ -241,7 +268,8 @@ impl Node {
     ///
     /// The left keeps half the entries, or with `append` (the new key goes past the end of the
     /// tree's rightmost leaf: `at` is the entry count) all of the old ones, so ascending inserts
-    /// fill leaves instead of leaving each half empty behind them.
+    /// fill leaves instead of leaving each half empty behind them. The left's vacated slots are
+    /// zeroed.
     pub(crate) fn leaf_split(
         &self,
         left: &mut [u8],
@@ -277,6 +305,8 @@ impl Node {
             self.set_leaf_key(left, i, &keys[i * z..(i + 1) * z]);
             self.set_leaf_value(left, i, vals[i]);
         }
+        // The entries that moved right leave the left's slots past its count.
+        self.zero_leaf_slots(left, left_count, n);
 
         let right_count = total - left_count;
         right[0] = PAGE_TYPE_LEAF;
@@ -354,7 +384,7 @@ impl Node {
 
     /// Remove child `ci` from an internal node, with the separator beside it: separator `ci − 1`
     /// (or separator 0 when `ci` is 0), so the neighbouring child takes over its key range. The
-    /// node must hold at least one key (two children).
+    /// node must hold at least one key (two children). The vacated last key and child are zeroed.
     pub(crate) fn internal_remove_child(&self, buf: &mut [u8], ci: usize) {
         let n = self.entry_count(buf);
         debug_assert!(n >= 1 && ci <= n, "remove child {ci} of a node with {n} keys");
@@ -364,6 +394,7 @@ impl Node {
         buf.copy_within(ks + (k + 1) * z..ks + n * z, ks + k * z);
         let cs = INTERNAL_CHILDREN_OFF;
         buf.copy_within(cs + (ci + 1) * 4..cs + (n + 1) * 4, cs + ci * 4);
+        self.zero_internal_slots(buf, n - 1, n);
         self.set_entry_count(buf, n - 1);
     }
 
@@ -372,7 +403,8 @@ impl Node {
     /// the caller lifts into the parent.  `right` may be any scratch buffer.
     ///
     /// The split is at the middle, or with `append` (on the tree's rightmost path: `sep` goes
-    /// last) just before the last key, so the left keeps all but one of the old keys.
+    /// last) just before the last key, so the left keeps all but one of the old keys. The left's
+    /// vacated slots are zeroed.
     pub(crate) fn internal_split(
         &self,
         left: &mut [u8],
@@ -413,6 +445,8 @@ impl Node {
         for (i, c) in kids.iter().take(mid + 1).enumerate() {
             self.set_internal_child(left, i, *c);
         }
+        // The keys and children that moved right (or up) leave the left's slots past its count.
+        self.zero_internal_slots(left, mid, n);
 
         // Right takes keys[mid+1..] and children[mid+1..].
         let right_keys = total - mid - 1;
@@ -427,5 +461,122 @@ impl Node {
             self.set_internal_child(right, i, kids[mid + 1 + i]);
         }
         median
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    const KSIZE: usize = 8;
+
+    fn key(k: u64) -> [u8; KSIZE] {
+        k.to_be_bytes()
+    }
+
+    /// True if every leaf slot past the entry count (keys and values) is zero.
+    fn leaf_tail_zero(node: &Node, buf: &[u8]) -> bool {
+        let n = node.entry_count(buf);
+        let max = node.max_leaf_keys();
+        let keys = &buf[LEAF_KEYS_OFF + n * KSIZE..LEAF_KEYS_OFF + max * KSIZE];
+        let vs = node.leaf_values_off;
+        let vals = &buf[vs + n * VALUE_SIZE..vs + max * VALUE_SIZE];
+        keys.iter().chain(vals).all(|&b| b == 0)
+    }
+
+    /// True if every internal key slot past the entry count, and every child slot past the last
+    /// child, is zero.
+    fn internal_tail_zero(node: &Node, buf: &[u8]) -> bool {
+        let n = node.entry_count(buf);
+        let max = node.max_internal_keys();
+        let ks = node.internal_keys_off;
+        let keys = &buf[ks + n * KSIZE..ks + max * KSIZE];
+        let cs = INTERNAL_CHILDREN_OFF;
+        let kids = &buf[cs + (n + 1) * 4..cs + (max + 1) * 4];
+        keys.iter().chain(kids).all(|&b| b == 0)
+    }
+
+    /// A leaf holding keys `0, 2, 4, ..` (`count` of them), each valued by its key + 1.
+    fn leaf_with(node: &Node, count: usize) -> Vec<u8> {
+        let mut buf = vec![0_u8; PAGE_SIZE];
+        node.init_leaf(&mut buf, NULL_PAGE, NULL_PAGE);
+        for i in 0..count {
+            let k = 2 * i as u64;
+            node.leaf_insert(&mut buf, i, &key(k), k + 1);
+        }
+        buf
+    }
+
+    /// An internal page holding separators `10, 20, ..` (`count` of them) and children `1, 2, ..`.
+    fn internal_with(node: &Node, count: usize) -> Vec<u8> {
+        let mut buf = vec![0_u8; PAGE_SIZE];
+        node.init_internal(&mut buf, 1);
+        for i in 0..count {
+            node.internal_insert(&mut buf, i, &key(10 * (i as u64 + 1)), i as u32 + 2);
+        }
+        buf
+    }
+
+    #[test]
+    fn leaf_delete_zeroes_the_vacated_slot() {
+        let node = Node::new(KSIZE);
+        let mut buf = leaf_with(&node, 10);
+        // The last slot, then one in the middle: either way the slot past the new count is zero.
+        node.leaf_delete(&mut buf, 9);
+        assert_eq!(node.entry_count(&buf), 9);
+        assert!(leaf_tail_zero(&node, &buf), "a delete of the last slot leaves it stale");
+        node.leaf_delete(&mut buf, 3);
+        assert_eq!(node.entry_count(&buf), 8);
+        assert!(leaf_tail_zero(&node, &buf), "a delete in the middle leaves the last slot stale");
+        assert_eq!(node.leaf_key(&buf, 3), key(8));
+        assert_eq!(node.leaf_value(&buf, 7), 17);
+    }
+
+    #[test]
+    fn leaf_split_zeroes_the_left_tail() {
+        let node = Node::new(KSIZE);
+        for append in [false, true] {
+            let max = node.max_leaf_keys();
+            let mut left = leaf_with(&node, max);
+            let mut right = vec![0_u8; PAGE_SIZE];
+            let (at, k) = if append { (max, 2 * max as u64) } else { (3, 5) };
+            let sep = node.leaf_split(&mut left, &mut right, at, &key(k), k + 1, append);
+            let (l, r) = (node.entry_count(&left), node.entry_count(&right));
+            assert_eq!(l + r, max + 1);
+            assert!(leaf_tail_zero(&node, &left), "the left keeps stale slots (append {append})");
+            assert!(leaf_tail_zero(&node, &right));
+            assert_eq!(node.leaf_key(&right, 0), &sep[..]);
+        }
+    }
+
+    #[test]
+    fn internal_remove_child_zeroes_the_vacated_slots() {
+        let node = Node::new(KSIZE);
+        let mut buf = internal_with(&node, 10);
+        node.internal_remove_child(&mut buf, 10);
+        assert_eq!(node.entry_count(&buf), 9);
+        assert!(internal_tail_zero(&node, &buf), "removing the last child leaves it stale");
+        node.internal_remove_child(&mut buf, 0);
+        assert_eq!(node.entry_count(&buf), 8);
+        assert!(internal_tail_zero(&node, &buf), "removing the first child leaves the tail stale");
+        assert_eq!(node.internal_child(&buf, 0), 2);
+        assert_eq!(node.internal_key(&buf, 0), key(20));
+    }
+
+    #[test]
+    fn internal_split_zeroes_the_left_tail() {
+        let node = Node::new(KSIZE);
+        for append in [false, true] {
+            let max = node.max_internal_keys();
+            let mut left = internal_with(&node, max);
+            let mut right = vec![0_u8; PAGE_SIZE];
+            let (at, k) = if append { (max, 10 * (max as u64 + 1)) } else { (2, 25) };
+            let rc = max as u32 + 2;
+            node.internal_split(&mut left, &mut right, at, &key(k), rc, append);
+            let (l, r) = (node.entry_count(&left), node.entry_count(&right));
+            assert_eq!(l + r + 1, max + 1);
+            assert!(internal_tail_zero(&node, &left), "the left keeps stale slots ({append})");
+            assert!(internal_tail_zero(&node, &right));
+        }
     }
 }

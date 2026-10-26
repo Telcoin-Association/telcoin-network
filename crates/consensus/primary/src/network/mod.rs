@@ -3,12 +3,15 @@
 //! This module includes implementations for when the primary receives network
 //! requests from it's own workers and other primaries.
 
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{collections::HashMap, future::Future, sync::Arc, time::Duration};
 
 use crate::{
-    proposer::OurDigestMessage, state_sync::StateSynchronizer, ConsensusBus, ConsensusBusApp,
+    error::{PrimaryNetworkError, PrimaryNetworkResult},
+    proposer::OurDigestMessage,
+    state_sync::StateSynchronizer,
+    ConsensusBus, ConsensusBusApp,
 };
-use futures::{AsyncWriteExt as _, FutureExt as _, StreamExt as _};
+use futures::{AsyncRead, AsyncWrite, AsyncWriteExt as _, FutureExt as _, StreamExt as _};
 use handler::RequestHandler;
 pub use message::{MissingCertificatesRequest, PrimaryRequest, PrimaryResponse};
 use message::{PrimaryGossip, PrimaryRPCError};
@@ -22,8 +25,9 @@ use tn_network_libp2p::{
         IntoResponse as _, NetworkCommand, NetworkEvent, NetworkHandle, NetworkResponseMessage,
         NetworkResult,
     },
-    write_frame, AdmissionShed, DenyReason, GossipMessage, Penalty, PrimarySyncRequest,
-    ResponseChannel, Stream, StreamError, SyncFrame, SyncFrameError,
+    write_frame, AdmissionShed, DenyReason, GossipMessage, PeerSlot, PeerSlots, PeerTier, Penalty,
+    PrimarySyncRequest, ReservedPeers, ReservedPool, ResponseChannel, ServiceClass, Stream,
+    StreamError, SyncFrame, SyncFrameError,
 };
 use tn_network_types::{WorkerOthersBatchMessage, WorkerOwnBatchMessage, WorkerToPrimaryClient};
 use tn_storage::{
@@ -51,11 +55,38 @@ pub(crate) type Req = PrimaryRequest;
 /// Convenience type for Primary network.
 pub(crate) type Res = PrimaryResponse;
 
-/// Maximum number of concurrent epoch stream operations (pending + active).
+/// Public share of each inbound sync serve class.
 ///
-/// A semaphore permit is held from RPC acceptance through stream completion,
-/// so this bounds the true concurrent count—not just the pending map size.
+/// The primary serves inbound sync requests from one serve pool per class (epoch pack, missing
+/// certificates, consensus output; see `SyncServePools`), so a flood of one class cannot
+/// starve another. Any peer may take one of these permits. Each pool also holds
+/// `COMMITTEE_RESERVED_SYNC_STREAMS` permits that only a peer of the current or the next
+/// committee may take. A serve permit is held only while its request is served, never during
+/// the opening read (see `MAX_CONCURRENT_OPENING_READS`).
 pub const MAX_CONCURRENT_EPOCH_STREAMS: usize = 5;
+
+/// Committee reserve of each inbound sync serve class.
+///
+/// Each serve pool holds this many permits on top of its public share
+/// ([`MAX_CONCURRENT_EPOCH_STREAMS`]), and only a committee-tier peer may take them. Four is two
+/// committee peers at the per-peer cap ([`MAX_PENDING_REQUESTS_PER_PEER`]), so peers outside the
+/// committee that fill the public share cannot stop a lagging validator from fetching
+/// certificates and epoch packs from committee primaries. See GHSA-9h5w-9282-pc3g.
+pub(crate) const COMMITTEE_RESERVED_SYNC_STREAMS: usize = 4;
+
+/// Public share of the opening-read budget for inbound sync streams.
+///
+/// A permit is held only while the responder waits up to [`SYNC_REQUEST_READ_TIMEOUT`] for the
+/// opening request frame of a stream. It is released before the request is served, when that
+/// read times out, or when the task ends. In the worst case this many opening reads (plus the
+/// committee reserve) are in flight, each bounded by [`MAX_SYNC_REQUEST_FRAME_SIZE`].
+pub(crate) const MAX_CONCURRENT_OPENING_READS: usize = 8;
+
+/// Committee reserve of the opening-read budget for inbound sync streams.
+///
+/// Only a committee-tier peer may take these permits, so silent streams from peers outside the
+/// committee cannot stop a committee peer from sending its request.
+pub(crate) const COMMITTEE_RESERVED_OPENING_READS: usize = 4;
 
 /// Maximum number of concurrent `EpochRecord` request-response serves across all peers.
 ///
@@ -109,8 +140,10 @@ pub const MAX_PENDING_REQUESTS_PER_PEER: usize = 2;
 /// beyond the admission caps fans out to one task each, bounded only by the
 /// stream behavior's per-peer inbound rate limit (#1308). Past this budget the
 /// stream is dropped without spawning (the requester sees a reset and retries
-/// elsewhere), so the primary's total sync-task fan-out stays bounded by
-/// [`MAX_CONCURRENT_EPOCH_STREAMS`] admitted tasks plus this many shed tasks.
+/// elsewhere). Admitted tasks are bounded by the opening-read budget
+/// ([`MAX_CONCURRENT_OPENING_READS`]), the serve pools ([`SyncServePools`]) and the per-peer
+/// cap ([`MAX_PENDING_REQUESTS_PER_PEER`]), so the primary's total sync-task fan-out stays
+/// bounded by those budgets plus this many shed tasks.
 pub(crate) const MAX_CONCURRENT_SHED_TASKS: usize = 8;
 
 /// Longest peer-supplied error text, in characters, that a vote request keeps.
@@ -230,8 +263,9 @@ struct ConsensusOutputSyncRequest<'a> {
 ///
 /// Holds a semaphore permit and counts toward the peer's entry in a per-peer in-flight
 /// counter. Dropping it releases the global slot and decrements the per-peer count, so a
-/// finished or aborted request frees capacity again. Reused by the inbound sync epoch-pack
-/// path and the `EpochRecord` request-response path, each with its own semaphore and counter.
+/// finished or aborted request frees capacity again. Used by the `EpochRecord`
+/// request-response path ([`try_admit_epoch_record`]); the inbound sync path admits with
+/// [`PeerSlots`] and [`ReservedPool`] instead.
 #[derive(Debug)]
 pub(crate) struct PeerSlotPermit {
     /// Global concurrency permit, released on drop.
@@ -254,25 +288,6 @@ impl Drop for PeerSlotPermit {
     }
 }
 
-/// Try to admit one inbound sync epoch-pack stream for `peer`.
-///
-/// Acquires a global permit and admits only if the peer's in-flight sync-stream
-/// count is below [`MAX_PENDING_REQUESTS_PER_PEER`]. Returns `None` (shedding the
-/// global permit) when either cap is hit.
-fn try_admit_sync(
-    semaphore: &Arc<Semaphore>,
-    sync_peers: &Arc<Mutex<HashMap<BlsPublicKey, usize>>>,
-    peer: BlsPublicKey,
-) -> Option<PeerSlotPermit> {
-    let permit = semaphore.clone().try_acquire_owned().ok()?;
-    let mut sync_guard = sync_peers.lock();
-    let sync_count = sync_guard.get(&peer).copied().unwrap_or(0);
-    (sync_count < MAX_PENDING_REQUESTS_PER_PEER).then(|| {
-        *sync_guard.entry(peer).or_insert(0) += 1;
-        PeerSlotPermit { _permit: permit, peers: sync_peers.clone(), peer }
-    })
-}
-
 /// Try to reserve a slot in the bounded shed-task budget.
 ///
 /// Returns `None` when [`MAX_CONCURRENT_SHED_TASKS`] shed tasks are already in
@@ -288,8 +303,8 @@ fn try_admit_shed(semaphore: &Arc<Semaphore>) -> Option<OwnedSemaphorePermit> {
 /// peer has fewer than [`MAX_PENDING_REQUESTS_PER_PEER`] in-flight epoch-record serves. Returns
 /// `None` (shedding the global permit) when either cap is hit, so the caller sheds the request
 /// without spawning work. The returned [`PeerSlotPermit`] is held for the serve's lifetime and
-/// frees both caps on drop. Unlike [`try_admit_sync`] this path has its own semaphore and
-/// counter, so it neither consults nor contends the stream pending map.
+/// frees both caps on drop. This path has its own semaphore and counter, separate from the
+/// inbound sync budgets, so it neither consults nor contends them.
 pub(crate) fn try_admit_epoch_record(
     semaphore: &Arc<Semaphore>,
     peers: &Arc<Mutex<HashMap<BlsPublicKey, usize>>>,
@@ -302,6 +317,303 @@ pub(crate) fn try_admit_epoch_record(
         *guard.entry(peer).or_insert(0) += 1;
         PeerSlotPermit { _permit: permit, peers: peers.clone(), peer }
     })
+}
+
+/// The serve class of an inbound sync request. Each class has its own serve pool in
+/// [`SyncServePools`], so a flood of one class cannot starve another class.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SyncClass {
+    /// A full or a partial epoch pack (`EpochPack` or `EpochPackPartial`).
+    EpochPack,
+    /// The certificates that a lagging peer is missing (`MissingCertificates`).
+    MissingCertificates,
+    /// One consensus output (`ConsensusOutput`).
+    ConsensusOutput,
+}
+
+impl SyncClass {
+    /// The serve class of `request`. A partial epoch pack shares the class of the full pack.
+    pub(crate) fn of(request: &PrimarySyncRequest) -> Self {
+        match request {
+            PrimarySyncRequest::EpochPack { .. } | PrimarySyncRequest::EpochPackPartial { .. } => {
+                Self::EpochPack
+            }
+            PrimarySyncRequest::MissingCertificates { .. } => Self::MissingCertificates,
+            PrimarySyncRequest::ConsensusOutput { .. } => Self::ConsensusOutput,
+        }
+    }
+}
+
+/// The serve pools of the inbound sync path: one [`ReservedPool`] for each [`SyncClass`].
+///
+/// Each pool has [`MAX_CONCURRENT_EPOCH_STREAMS`] public permits plus
+/// [`COMMITTEE_RESERVED_SYNC_STREAMS`] permits that only a committee-tier peer may take. A clone
+/// shares the same permits.
+#[derive(Clone, Debug)]
+pub(crate) struct SyncServePools {
+    /// The pool for full and partial epoch-pack serves.
+    epoch_pack: ReservedPool,
+    /// The pool for missing-certificates serves.
+    missing_certificates: ReservedPool,
+    /// The pool for consensus-output serves.
+    consensus_output: ReservedPool,
+}
+
+impl SyncServePools {
+    /// Create the three serve pools, each with its public share and its committee reserve.
+    pub(crate) fn new() -> Self {
+        let pool =
+            || ReservedPool::new(MAX_CONCURRENT_EPOCH_STREAMS, COMMITTEE_RESERVED_SYNC_STREAMS);
+        Self { epoch_pack: pool(), missing_certificates: pool(), consensus_output: pool() }
+    }
+
+    /// The pool that serves requests of `class`.
+    pub(crate) fn pool(&self, class: SyncClass) -> &ReservedPool {
+        match class {
+            SyncClass::EpochPack => &self.epoch_pack,
+            SyncClass::MissingCertificates => &self.missing_certificates,
+            SyncClass::ConsensusOutput => &self.consensus_output,
+        }
+    }
+}
+
+/// How an inbound sync serve ended, as the admission layer sees it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SyncServeOutcome {
+    /// The serve finished without an error. A `Deny(Unavailable)` answer is a completed serve.
+    Completed,
+    /// A write to the requester timed out: the requester stopped reading, read below the
+    /// throughput floor, or held the epoch-pack serve past its total deadline. Only this outcome
+    /// earns a penalty, and only a public-tier peer pays it.
+    Stalled,
+    /// The serve failed for a different reason (a local error, a reset stream, a malformed
+    /// request, or an overall serve timeout). No penalty.
+    Failed,
+}
+
+impl SyncServeOutcome {
+    /// Classify the result of a serve. A [`PrimaryNetworkError::StdIo`] error of kind
+    /// [`std::io::ErrorKind::TimedOut`] is [`Self::Stalled`]; a different error is
+    /// [`Self::Failed`].
+    pub(crate) fn of(served: &PrimaryNetworkResult<()>) -> Self {
+        served.as_ref().map_or_else(
+            |error| {
+                let stalled = matches!(
+                    error,
+                    PrimaryNetworkError::StdIo(io) if io.kind() == std::io::ErrorKind::TimedOut
+                );
+                if stalled {
+                    Self::Stalled
+                } else {
+                    Self::Failed
+                }
+            },
+            |&()| Self::Completed,
+        )
+    }
+}
+
+/// The grants that admit one inbound sync stream, taken before its task is spawned.
+#[derive(Debug)]
+pub(crate) struct SyncAdmission {
+    /// The peer that opened the stream.
+    peer: BlsPublicKey,
+    /// The admission tier of the peer.
+    tier: PeerTier,
+    /// The per-peer slot, held for the whole life of the task.
+    slot: PeerSlot,
+    /// The opening-read permit, released before the serve starts, when the opening read times
+    /// out, or when the task ends.
+    opening: OwnedSemaphorePermit,
+}
+
+/// The next step for an admitted sync stream once its opening read ends.
+#[derive(Debug)]
+enum SyncOpening {
+    /// No frame arrived before [`SYNC_REQUEST_READ_TIMEOUT`].
+    Silent,
+    /// The opening frame could not be read (oversized, undecodable or a reset stream).
+    Unreadable,
+    /// The opening frame was not `Req`.
+    Unexpected,
+    /// The serve class of the request has no free permit for the peer's tier.
+    AtCapacity(SyncClass),
+    /// The request holds a serve permit for its class.
+    Admitted {
+        /// The request to serve.
+        request: PrimarySyncRequest,
+        /// The serve class of the request.
+        class: SyncClass,
+        /// The serve permit, held only while the serve runs.
+        permit: OwnedSemaphorePermit,
+    },
+}
+
+impl SyncOpening {
+    /// Classify a readable opening frame and, for a `Req`, try to take a serve permit of its
+    /// class for a peer of `tier`.
+    fn of_frame(
+        frame: SyncFrame<PrimarySyncRequest>,
+        pools: &SyncServePools,
+        tier: PeerTier,
+    ) -> Self {
+        match frame {
+            SyncFrame::Req(request) => {
+                let class = SyncClass::of(&request);
+                let admitted = |permit| Self::Admitted { request, class, permit };
+                pools.pool(class).try_acquire(tier).map_or(Self::AtCapacity(class), admitted)
+            }
+            SyncFrame::Ack
+            | SyncFrame::Deny(_)
+            | SyncFrame::Data(_)
+            | SyncFrame::End
+            | SyncFrame::Err(_) => Self::Unexpected,
+        }
+    }
+}
+
+/// Drive one admitted inbound sync stream: read the opening request, take a serve permit for its
+/// class, and serve it.
+///
+/// The per-peer slot is held for the whole task. The opening-read permit is held while the
+/// opening request is read and is released before `serve` runs or when that read times out (a
+/// stream that ends with a bounded control frame keeps it until the task ends). The serve permit
+/// is held only while `serve` runs. A public-tier peer is charged [`Penalty::Mild`] when its
+/// opening read times out or when `serve` reports [`SyncServeOutcome::Stalled`].
+pub(crate) async fn admit_and_serve_sync_stream<S, F, Fut>(
+    mut stream: S,
+    admission: SyncAdmission,
+    serve_pools: SyncServePools,
+    network_handle: PrimaryNetworkHandle,
+    serve: F,
+) where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    F: FnOnce(S, PrimarySyncRequest) -> Fut + Send,
+    Fut: Future<Output = SyncServeOutcome> + Send,
+{
+    let SyncAdmission { peer, tier, slot: _slot, opening } = admission;
+    let (mut decode_buffer, mut decompress_buffer) = (Vec::new(), Vec::new());
+    let step = tokio::time::timeout(
+        SYNC_REQUEST_READ_TIMEOUT,
+        read_frame::<_, PrimarySyncRequest>(
+            &mut stream,
+            &mut decode_buffer,
+            &mut decompress_buffer,
+            MAX_SYNC_REQUEST_FRAME_SIZE,
+        ),
+    )
+    .await
+    .map_or(SyncOpening::Silent, |read| {
+        read.map_or_else(
+            |e| {
+                warn!(target: "primary::network", %peer, ?e, "unreadable sync request frame");
+                SyncOpening::Unreadable
+            },
+            |frame| SyncOpening::of_frame(frame, &serve_pools, tier),
+        )
+    });
+    match step {
+        SyncOpening::Silent => {
+            drop(opening);
+            warn!(target: "primary::network", %peer, ?tier, "no sync request before timeout");
+            charge_public_peer(&network_handle, peer, tier).await;
+            let _ = tokio::time::timeout(SYNC_REQUEST_READ_TIMEOUT, stream.close()).await;
+        }
+        SyncOpening::Unreadable => {
+            let _ = tokio::time::timeout(SYNC_REQUEST_READ_TIMEOUT, stream.close()).await;
+        }
+        SyncOpening::Unexpected => {
+            warn!(target: "primary::network", %peer, "unexpected opening sync frame");
+            write_control_frame_and_close(&mut stream, SyncFrame::Err(SyncFrameError::Malformed))
+                .await;
+        }
+        SyncOpening::AtCapacity(class) => {
+            debug!(target: "primary::network", %peer, ?class, ?tier, "sync serve class full");
+            write_control_frame_and_close(&mut stream, SyncFrame::Deny(DenyReason::AtCapacity))
+                .await;
+        }
+        SyncOpening::Admitted { request, class, permit } => {
+            drop(opening);
+            let outcome = serve(stream, request).await;
+            drop(permit);
+            match outcome {
+                SyncServeOutcome::Stalled => {
+                    warn!(target: "primary::network", %peer, ?class, ?tier, "sync serve stalled");
+                    charge_public_peer(&network_handle, peer, tier).await;
+                }
+                SyncServeOutcome::Completed | SyncServeOutcome::Failed => {}
+            }
+        }
+    }
+}
+
+/// Charge a public-tier peer [`Penalty::Mild`] for holding a sync budget without progress. A
+/// committee-tier peer is never charged. Fifty mild penalties reach the default ban threshold.
+async fn charge_public_peer(handle: &PrimaryNetworkHandle, peer: BlsPublicKey, tier: PeerTier) {
+    match tier {
+        PeerTier::Public => handle.report_penalty(peer, Penalty::Mild).await,
+        PeerTier::Committee => {}
+    }
+}
+
+/// Best-effort write of one control frame (`Deny` or `Err`), then a close. The write and the
+/// close share one [`SYNC_REQUEST_READ_TIMEOUT`] bound, so a peer that never reads cannot pin the
+/// task and the budgets that it holds.
+async fn write_control_frame_and_close<S: AsyncWrite + Unpin + Send>(
+    stream: &mut S,
+    frame: SyncFrame<PrimarySyncRequest>,
+) {
+    let (mut encode_buffer, mut compressed_buffer) = (Vec::new(), Vec::new());
+    let _ = tokio::time::timeout(SYNC_REQUEST_READ_TIMEOUT, async {
+        let _ = write_frame(
+            &mut *stream,
+            &frame,
+            &mut encode_buffer,
+            &mut compressed_buffer,
+            MAX_SYNC_REQUEST_FRAME_SIZE,
+        )
+        .await;
+        let _ = stream.close().await;
+    })
+    .await;
+}
+
+/// Serve one inbound sync request through the matching request-handler path.
+///
+/// `EpochPack` and `EpochPackPartial` stream the full pack or its verifiable prefix,
+/// `MissingCertificates` streams the matching certificates, and `ConsensusOutput` streams one
+/// output's raw bytes, each as `Ack` + `Data`* + `End`.
+async fn serve_sync_request<DB: Database>(
+    handler: &RequestHandler<DB>,
+    peer: BlsPublicKey,
+    stream: Stream,
+    request: PrimarySyncRequest,
+    consensus_chain: &ConsensusChain,
+) -> SyncServeOutcome {
+    match request {
+        PrimarySyncRequest::EpochPack { epoch } => {
+            handler.process_sync_epoch_pack_stream(peer, stream, epoch, None, consensus_chain).await
+        }
+        PrimarySyncRequest::EpochPackPartial { epoch, last_consensus_number } => {
+            handler
+                .process_sync_epoch_pack_stream(
+                    peer,
+                    stream,
+                    epoch,
+                    Some(last_consensus_number),
+                    consensus_chain,
+                )
+                .await
+        }
+        PrimarySyncRequest::MissingCertificates { exclusive_lower_bound, skip_rounds } => {
+            handler
+                .process_sync_missing_certs_stream(peer, stream, exclusive_lower_bound, skip_rounds)
+                .await
+        }
+        PrimarySyncRequest::ConsensusOutput { number } => {
+            handler.process_sync_consensus_output_stream(peer, stream, number).await
+        }
+    }
 }
 
 /// Primary network specific handle.
@@ -1196,8 +1508,8 @@ impl PrimaryNetworkHandle {
                 // honest pack finishes at any sustained rate at/above the floor
                 // while a drip/stalled peer is cut quickly. On such an error the
                 // future resolves `Err`, which unwinds `stream_import` so its
-                // `ImportPath` guard clears the `.inproc` sentinel and the epoch is
-                // retryable against another peer.
+                // `ImportPath` guard removes the import dir, releases the epoch's claim, and the
+                // epoch is retryable against another peer.
                 match import.await {
                     Ok(()) => Ok(()),
                     Err(e) => {
@@ -1289,9 +1601,6 @@ impl PrimaryNetworkHandle {
             ConsensusChainError::EpochMismatch
             | ConsensusChainError::PrevCommitteeEpochMismatch
             | ConsensusChainError::CrcError => Some(Penalty::Mild),
-            ConsensusChainError::EmptyImport | ConsensusChainError::InvalidImport => {
-                Some(Penalty::Severe)
-            }
             ConsensusChainError::StreamUnavailable
             | ConsensusChainError::NoCurrentEpoch
             | ConsensusChainError::EpochDbError(_)
@@ -1364,8 +1673,6 @@ impl PrimaryNetworkHandle {
                 | PackError::InvalidVersion(_, _)
                 | PackError::ConsensusNumberTooHigh => false,
             },
-            // The imported stream had no / an invalid final output: the peer served a bad pack.
-            ConsensusChainError::EmptyImport | ConsensusChainError::InvalidImport => true,
             // Local chain state, our own storage, or a benign mismatch: never charge the peer.
             ConsensusChainError::EpochMismatch
             | ConsensusChainError::PrevCommitteeEpochMismatch
@@ -1422,14 +1729,19 @@ pub struct PrimaryNetwork<DB, Events> {
     task_spawner: TaskSpawner,
     /// Hold a reference to the consensus chain.
     consensus_chain: ConsensusChain,
-    /// Semaphore bounding total concurrent stream operations (pending + active), shared by epoch
-    /// pack and single consensus-output streams.
-    epoch_stream_semaphore: Arc<Semaphore>,
-    /// Per-peer count of in-flight sync epoch-pack streams.
-    ///
-    /// Admission checks this count against [`MAX_PENDING_REQUESTS_PER_PEER`], the
-    /// sole per-peer cap now that every bulk path rides the typed sync protocol.
-    sync_stream_peers: Arc<Mutex<HashMap<BlsPublicKey, usize>>>,
+    /// Opening-read budget for inbound sync streams: [`MAX_CONCURRENT_OPENING_READS`] public
+    /// permits plus [`COMMITTEE_RESERVED_OPENING_READS`] committee-only permits. A permit is held
+    /// only while the opening request frame is read (bounded by [`SYNC_REQUEST_READ_TIMEOUT`]).
+    sync_opening: ReservedPool,
+    /// Serve pools for inbound sync requests, one per [`SyncClass`]. A permit is held only while
+    /// its request is served.
+    sync_serve: SyncServePools,
+    /// Per-peer cap on in-flight inbound sync streams across every phase, at
+    /// [`MAX_PENDING_REQUESTS_PER_PEER`]. A slot is held for the whole life of the stream task.
+    sync_peer_slots: PeerSlots,
+    /// BLS keys of the current and the next committee, captured when the network is built for
+    /// the epoch. A peer in this set may take the committee reserve of every sync budget.
+    reserved_peers: ReservedPeers,
     /// Semaphore bounding concurrent shed tasks for denied sync streams.
     ///
     /// A permit is held for the lifetime of a shed task (the bounded
@@ -1438,8 +1750,9 @@ pub struct PrimaryNetwork<DB, Events> {
     shed_task_semaphore: Arc<Semaphore>,
     /// Semaphore bounding concurrent `EpochRecord` request-response serves.
     ///
-    /// Separate from `epoch_stream_semaphore` so an epoch-record flood and the stream-serving
-    /// paths never starve one another. See [`MAX_CONCURRENT_EPOCH_RECORD_REQUESTS`].
+    /// Separate from the inbound sync budgets (`sync_opening`, `sync_serve`) so an epoch-record
+    /// flood and the stream-serving paths never starve one another. See
+    /// [`MAX_CONCURRENT_EPOCH_RECORD_REQUESTS`].
     epoch_record_semaphore: Arc<Semaphore>,
     /// Per-peer count of in-flight `EpochRecord` request-response serves, capped at
     /// [`MAX_PENDING_REQUESTS_PER_PEER`].
@@ -1464,21 +1777,30 @@ where
         task_spawner: TaskSpawner,
         consensus_chain: ConsensusChain,
     ) -> Self {
+        // capture the committee tier before `consensus_config` moves into the request handler:
+        // the current and the next committee may take the reserve of every sync budget
+        let committee_keys = consensus_config.committee().bls_keys();
+        let next_keys = consensus_config.next_committee_keys().iter().copied();
+        let reserved_peers = ReservedPeers::new(committee_keys.into_iter().chain(next_keys));
         let request_handler = RequestHandler::new(
             consensus_config,
             consensus_bus,
             state_sync.clone(),
             consensus_chain.clone(),
         );
-        let epoch_stream_semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_EPOCH_STREAMS));
         Self {
             network_events,
             network_handle,
             request_handler,
             task_spawner,
             consensus_chain,
-            epoch_stream_semaphore,
-            sync_stream_peers: Arc::new(Mutex::new(HashMap::default())),
+            sync_opening: ReservedPool::new(
+                MAX_CONCURRENT_OPENING_READS,
+                COMMITTEE_RESERVED_OPENING_READS,
+            ),
+            sync_serve: SyncServePools::new(),
+            sync_peer_slots: PeerSlots::new(MAX_PENDING_REQUESTS_PER_PEER),
+            reserved_peers,
             shed_task_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_SHED_TASKS)),
             epoch_record_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_EPOCH_RECORD_REQUESTS)),
             epoch_record_peers: Arc::new(Mutex::new(HashMap::default())),
@@ -1556,35 +1878,49 @@ where
         channel: ResponseChannel<PrimaryResponse>,
         cancel: oneshot::Receiver<()>,
     ) {
-        // clone for spawned tasks
-        let request_handler = self.request_handler.clone();
-        let network_handle = self.network_handle.clone();
-        let task_name = format!("VoteRequest-{}", header.digest());
+        // Serve budget: offer the request to the vote class before any work for it. `None` means
+        // the class has no free permit; the shed is already counted under `serve_budget`.
+        // Dropping the response channel and the cancel receiver sends no reply, so the swarm
+        // also counts the request as an `omitted` failure, exactly as an admission shed does.
+        // The default budget is unbounded, so this only observes until an operator sets
+        // `serve_budget.vote`. An enforcing vote class also caps each peer at
+        // `MAX_PERMITS_PER_PEER`, so one committee peer cannot hold the whole pool while its
+        // requests wait on its author lock in `RequestHandler::vote`.
+        if let Some(serve_permit) =
+            self.network_handle.handle.serve_permits().try_acquire(ServiceClass::Vote, peer)
+        {
+            // clone for spawned tasks
+            let request_handler = self.request_handler.clone();
+            let network_handle = self.network_handle.clone();
+            let task_name = format!("VoteRequest-{}", header.digest());
 
-        self.task_spawner.spawn_task(task_name, async move {
-            tokio::select! {
-                vote = request_handler.vote(peer, header, parents) => {
-                    // report penalty if any
-                    //
-                    // votes are consensus-critical, so a peer that returns a penalizable
-                    // error must pay the same reputational cost as on every other request
-                    // handler. Route the error through the central PrimaryNetworkError →
-                    // Penalty table before collapsing it into a response, instead of
-                    // silently dropping it.
-                    if let Err(ref e) = vote {
-                        if let Some(penalty) = e.into() {
-                            network_handle.report_penalty(peer, penalty).await;
+            self.task_spawner.spawn_task(task_name, async move {
+                // hold the serve permit for the task's lifetime, so every exit releases it
+                let _serve_permit = serve_permit;
+                tokio::select! {
+                    vote = request_handler.vote(peer, header, parents) => {
+                        // report penalty if any
+                        //
+                        // votes are consensus-critical, so a peer that returns a penalizable
+                        // error must pay the same reputational cost as on every other request
+                        // handler. Route the error through the central PrimaryNetworkError →
+                        // Penalty table before collapsing it into a response, instead of
+                        // silently dropping it.
+                        if let Err(ref e) = vote {
+                            if let Some(penalty) = e.into() {
+                                network_handle.report_penalty(peer, penalty).await;
+                            }
                         }
-                    }
 
-                    let response = vote.into_response();
-                    let _ = network_handle.handle.send_response(response, channel).await;
+                        let response = vote.into_response();
+                        let _ = network_handle.handle.send_response(response, channel).await;
+                    }
+                    // cancel notification from network layer
+                    _ = cancel => (),
                 }
-                // cancel notification from network layer
-                _ = cancel => (),
-            }
-            Ok(())
-        });
+                Ok(())
+            });
+        }
     }
 
     /// Attempt to retrieve consensus chain header from the database.
@@ -1618,31 +1954,41 @@ where
             return;
         };
 
-        // clone for spawned tasks
-        let request_handler = self.request_handler.clone();
-        let network_handle = self.network_handle.clone();
-        let task_name = format!("ConsensusOutputReq-{peer}");
-        self.task_spawner.spawn_task(task_name, async move {
-            // hold the admission permit for the serve's lifetime; dropping it on completion (or
-            // cancel) frees the global slot and decrements the per-peer count
-            let _permit = permit;
-            tokio::select! {
-                header =
-                    request_handler.retrieve_epoch_record(epoch, hash) => {
-                        // penalize peer's reputation for bad request
-                        if let Err(err) = &header {
-                            if let Some(penalty) = err.into() {
-                                network_handle.report_penalty(peer, penalty).await;
+        // Serve budget: after the admission cap, offer the request to the epoch-record class.
+        // `None` sheds it the same way as the admission cap does; the shed is already counted
+        // under `serve_budget`, and the admission permit releases on return. The default budget
+        // is unbounded, so this only observes until an operator sets `serve_budget.epoch_record`.
+        if let Some(serve_permit) =
+            self.network_handle.handle.serve_permits().try_acquire(ServiceClass::EpochRecord, peer)
+        {
+            // clone for spawned tasks
+            let request_handler = self.request_handler.clone();
+            let network_handle = self.network_handle.clone();
+            let task_name = format!("ConsensusOutputReq-{peer}");
+            self.task_spawner.spawn_task(task_name, async move {
+                // hold the admission permit for the serve's lifetime; dropping it on completion
+                // (or cancel) frees the global slot and decrements the per-peer count
+                let _permit = permit;
+                // hold the serve permit for the task's lifetime, so every exit releases it
+                let _serve_permit = serve_permit;
+                tokio::select! {
+                    header =
+                        request_handler.retrieve_epoch_record(epoch, hash) => {
+                            // penalize peer's reputation for bad request
+                            if let Err(err) = &header {
+                                if let Some(penalty) = err.into() {
+                                    network_handle.report_penalty(peer, penalty).await;
+                                }
                             }
+                            let response = header.into_response();
+                            let _ = network_handle.handle.send_response(response, channel).await;
                         }
-                        let response = header.into_response();
-                        let _ = network_handle.handle.send_response(response, channel).await;
-                    }
-                // cancel notification from network layer
-                _ = cancel => (),
-            }
-            Ok(())
-        });
+                    // cancel notification from network layer
+                    _ = cancel => (),
+                }
+                Ok(())
+            });
+        }
     }
 
     /// Process gossip from committee.
@@ -1680,139 +2026,45 @@ where
         });
     }
 
-    /// Process an inbound sync epoch-pack stream.
+    /// Process an inbound sync stream.
     ///
-    /// Admission against the per-peer concurrency cap happens here on stream open:
-    /// the request rides in the opening frame, so there is no `(peer, digest)`
-    /// pending map for this path. Admission runs ahead of any task spawn (#1308).
-    /// A shedding responder writes [`DenyReason::AtCapacity`] without reading so
-    /// the requester retries elsewhere immediately; that shed write runs on its
-    /// own task gated by the [`MAX_CONCURRENT_SHED_TASKS`] budget (see
-    /// [`Self::shed_inbound_sync_stream`]). Once admitted, the opening request
-    /// frame is read (bounded by [`SYNC_REQUEST_READ_TIMEOUT`]) and an
-    /// `EpochPack` request is served by
-    /// [`RequestHandler::process_sync_epoch_pack_stream`]. The admission permit is
-    /// held for the lifetime of the spawned task.
+    /// Admission runs on stream open, ahead of any task spawn (#1308). The stream takes a slot
+    /// under the per-peer cap ([`MAX_PENDING_REQUESTS_PER_PEER`]) and a permit from the
+    /// opening-read budget ([`MAX_CONCURRENT_OPENING_READS`], plus
+    /// [`COMMITTEE_RESERVED_OPENING_READS`] for a committee-tier peer). A stream that misses
+    /// either takes the bounded shed path ([`Self::shed_inbound_sync_stream`]), which writes
+    /// [`DenyReason::AtCapacity`] without reading so the requester retries elsewhere at once.
+    ///
+    /// An admitted stream runs [`admit_and_serve_sync_stream`] on its own task. The task reads
+    /// the opening request frame (bounded by [`SYNC_REQUEST_READ_TIMEOUT`]), releases the
+    /// opening-read permit, and takes a permit from the serve pool of the request's class
+    /// ([`SyncServePools`]) before [`RequestHandler`] serves it. The per-peer slot is held for the
+    /// life of the task and the serve permit only while the serve runs, so a silent peer holds no
+    /// serve capacity. A peer of the current or the next committee may take the committee
+    /// reserve of each budget, so peers outside the committee cannot stop a lagging validator
+    /// from syncing. See GHSA-9h5w-9282-pc3g.
     fn process_inbound_sync_stream(&self, peer: BlsPublicKey, stream: Stream) {
-        // admit against the caps before spawning; the permit moves into the task
-        // and frees capacity on drop. A denied stream takes the bounded shed
-        // path instead of spawning here, so over-cap substream bursts cannot fan
-        // out past the shed budget (#1308).
-        let Some(permit) =
-            try_admit_sync(&self.epoch_stream_semaphore, &self.sync_stream_peers, peer)
+        let tier = self.reserved_peers.tier(&peer);
+        // take both admission grants before spawning; a stream that misses either takes the
+        // bounded shed path instead, so over-cap substream bursts cannot fan out past the shed
+        // budget (#1308)
+        let Some((slot, opening)) =
+            self.sync_peer_slots.try_take(peer).zip(self.sync_opening.try_acquire(tier))
         else {
             self.shed_inbound_sync_stream(peer, stream);
             return;
         };
+        let admission = SyncAdmission { peer, tier, slot, opening };
+        let serve_pools = self.sync_serve.clone();
+        let handle = self.network_handle.clone();
         let request_handler = self.request_handler.clone();
         let consensus_chain = self.consensus_chain.clone();
         let task_name = format!("sync-epoch-pack-{peer}");
         self.task_spawner.spawn_task(task_name, async move {
-            // hold the admission permit for the lifetime of the exchange
-            let _permit = permit;
-            let mut stream = stream;
-            // bounds the opening `Req` read and the tiny control writes below; the
-            // per-request-type data bounds live in each serve function.
-            let max_frame = MAX_SYNC_REQUEST_FRAME_SIZE;
-            let (mut encode_buffer, mut compressed_buffer) = (Vec::new(), Vec::new());
-
-            // read the opening request frame; a peer that never sends one (timeout)
-            // or sends a malformed one (io error) is dropped after releasing the
-            // permit. Collapse the timeout/io results rather than nesting matches.
-            let (mut decode_buffer, mut decompress_buffer) = (Vec::new(), Vec::new());
-            let request = tokio::time::timeout(
-                SYNC_REQUEST_READ_TIMEOUT,
-                read_frame::<_, PrimarySyncRequest>(
-                    &mut stream,
-                    &mut decode_buffer,
-                    &mut decompress_buffer,
-                    max_frame,
-                ),
-            )
-            .await
-            .ok()
-            .and_then(Result::ok);
-            let Some(request) = request else {
-                warn!(target: "primary::network", %peer, "no readable sync request frame");
-                // bound the best-effort close for parity with the shed and
-                // unexpected-frame paths: the held admission permit must free
-                // promptly even if the connection's send buffer is backed up.
-                let _ = tokio::time::timeout(SYNC_REQUEST_READ_TIMEOUT, stream.close()).await;
-                return Ok(());
+            let serve = move |stream, request| async move {
+                serve_sync_request(&request_handler, peer, stream, request, &consensus_chain).await
             };
-
-            match request {
-                SyncFrame::Req(PrimarySyncRequest::EpochPack { epoch }) => {
-                    request_handler
-                        .process_sync_epoch_pack_stream(peer, stream, epoch, None, &consensus_chain)
-                        .await?;
-                }
-                // `EpochPackPartial` over sync (item 9): serve the verifiable prefix of
-                // an in-progress epoch, replacing the legacy `StreamEpochPartial`
-                // ack-plus-digest path. Same serve as the full pack, bounded to the
-                // prefix length by `Some(last_consensus_number)`.
-                SyncFrame::Req(PrimarySyncRequest::EpochPackPartial {
-                    epoch,
-                    last_consensus_number,
-                }) => {
-                    request_handler
-                        .process_sync_epoch_pack_stream(
-                            peer,
-                            stream,
-                            epoch,
-                            Some(last_consensus_number),
-                            &consensus_chain,
-                        )
-                        .await?;
-                }
-                // `MissingCertificates` over sync (item 7): serve the matching
-                // certificates as a streamed `Ack` + `Data`* + `End`, replacing the
-                // legacy request-response `RequestedCertificates` reply.
-                SyncFrame::Req(PrimarySyncRequest::MissingCertificates {
-                    exclusive_lower_bound,
-                    skip_rounds,
-                }) => {
-                    request_handler
-                        .process_sync_missing_certs_stream(
-                            peer,
-                            stream,
-                            exclusive_lower_bound,
-                            skip_rounds,
-                        )
-                        .await?;
-                }
-                // `ConsensusOutput` over sync (item 9b): serve one output's raw bytes
-                // as a streamed `Ack` + `Data`* + `End`, replacing the legacy
-                // `StreamConsensusOutput` ack-plus-digest path.
-                SyncFrame::Req(PrimarySyncRequest::ConsensusOutput { number }) => {
-                    request_handler
-                        .process_sync_consensus_output_stream(peer, stream, number)
-                        .await?;
-                }
-                // a well-behaved requester always opens with `Req`; anything else is
-                // malformed. Signal it and drop (metrics-only, no penalty).
-                SyncFrame::Ack
-                | SyncFrame::Deny(_)
-                | SyncFrame::Data(_)
-                | SyncFrame::End
-                | SyncFrame::Err(_) => {
-                    warn!(target: "primary::network", %peer, "unexpected opening sync frame from requester");
-                    // bound the best-effort error write so a non-reading peer cannot
-                    // pin the held admission permit on an unbounded write.
-                    let _ = tokio::time::timeout(SYNC_REQUEST_READ_TIMEOUT, async {
-                        let _ = write_frame(
-                            &mut stream,
-                            &SyncFrame::<PrimarySyncRequest>::Err(SyncFrameError::Malformed),
-                            &mut encode_buffer,
-                            &mut compressed_buffer,
-                            max_frame,
-                        )
-                        .await;
-                        let _ = stream.close().await;
-                    })
-                    .await;
-                }
-            }
+            admit_and_serve_sync_stream(stream, admission, serve_pools, handle, serve).await;
             Ok(())
         });
     }
@@ -1962,5 +2214,286 @@ mod clip_peer_error_tests {
         let clipped = clip_peer_error(wide);
         assert_eq!(clipped.chars().count(), MAX_PEER_ERROR_LEN);
         assert_eq!(clipped, "€".repeat(MAX_PEER_ERROR_LEN));
+    }
+}
+
+/// Tests of the inbound sync admission budgets: the per-peer cap, the opening-read budget, and
+/// the per-class serve pools with their committee reserves (GHSA-9h5w-9282-pc3g).
+#[cfg(test)]
+mod sync_admission_tests {
+    use super::{
+        admit_and_serve_sync_stream, PrimaryNetworkHandle, Req, Res, SyncAdmission, SyncClass,
+        SyncServeOutcome, SyncServePools, COMMITTEE_RESERVED_OPENING_READS,
+        COMMITTEE_RESERVED_SYNC_STREAMS, MAX_CONCURRENT_EPOCH_STREAMS,
+        MAX_CONCURRENT_OPENING_READS, MAX_PENDING_REQUESTS_PER_PEER,
+    };
+    use futures::{AsyncRead, AsyncWrite, StreamExt as _};
+    use rand::{rngs::StdRng, SeedableRng as _};
+    use std::{
+        io,
+        pin::Pin,
+        sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        },
+        task::{Context, Poll},
+        time::Duration,
+    };
+    use tn_network_libp2p::{
+        types::NetworkCommand, PeerSlots, PeerTier, Penalty, PrimarySyncRequest, ReservedPeers,
+        ReservedPool,
+    };
+    use tn_types::{BlsKeypair, BlsPublicKey};
+    use tokio::{sync::mpsc, task::JoinHandle};
+
+    /// Every serve class.
+    const CLASSES: [SyncClass; 3] =
+        [SyncClass::EpochPack, SyncClass::MissingCertificates, SyncClass::ConsensusOutput];
+
+    /// A deterministic BLS public key for `seed`.
+    fn key(seed: u64) -> BlsPublicKey {
+        *BlsKeypair::generate(&mut StdRng::seed_from_u64(seed)).public()
+    }
+
+    /// True when the serve pool of `class` still has its whole public share.
+    fn public_share_whole(pools: &SyncServePools, class: SyncClass) -> bool {
+        pools.pool(class).available_public() == MAX_CONCURRENT_EPOCH_STREAMS
+    }
+
+    /// True when every serve pool still has all of its public and reserved permits.
+    fn serve_pools_untouched(pools: &SyncServePools) -> bool {
+        let whole = |class: SyncClass| {
+            let pool = pools.pool(class);
+            pool.available_public() == MAX_CONCURRENT_EPOCH_STREAMS
+                && pool.available_reserved() == COMMITTEE_RESERVED_SYNC_STREAMS
+        };
+        CLASSES.into_iter().all(whole)
+    }
+
+    /// The opening-read budget at its production sizes.
+    fn opening_pool() -> ReservedPool {
+        ReservedPool::new(MAX_CONCURRENT_OPENING_READS, COMMITTEE_RESERVED_OPENING_READS)
+    }
+
+    /// Let the spawned tasks run until each one waits on the paused clock or finishes.
+    async fn settle() {
+        futures::stream::iter(0..16).for_each(|_| tokio::task::yield_now()).await;
+    }
+
+    /// The peer of a mild penalty report, or `None` for a different command.
+    fn mild_penalty_peer(command: NetworkCommand<Req, Res>) -> Option<BlsPublicKey> {
+        if let NetworkCommand::ReportPenalty { peer, penalty: Penalty::Mild } = command {
+            Some(peer)
+        } else {
+            None
+        }
+    }
+
+    /// A requester that opens a sync stream and never sends its request frame. Reads stay
+    /// pending; writes and the close succeed at once.
+    #[derive(Debug)]
+    struct SilentStream;
+
+    impl AsyncRead for SilentStream {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &mut [u8],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Pending
+        }
+    }
+
+    impl AsyncWrite for SilentStream {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_close(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    /// The inbound sync admission state of one responder, wired the way the primary network
+    /// wires it.
+    struct Responder {
+        /// The committee tier.
+        reserved: ReservedPeers,
+        /// The per-peer cap.
+        slots: PeerSlots,
+        /// The opening-read budget.
+        opening: ReservedPool,
+        /// The per-class serve pools.
+        pools: SyncServePools,
+        /// The handle that receives penalty reports.
+        handle: PrimaryNetworkHandle,
+        /// Set when any stream reaches its serve.
+        served: Arc<AtomicBool>,
+    }
+
+    impl Responder {
+        /// A responder whose committee tier is `committee`, and the receiver of its commands.
+        fn new(committee: BlsPublicKey) -> (Self, mpsc::Receiver<NetworkCommand<Req, Res>>) {
+            let (sender, commands) = mpsc::channel(64);
+            let responder = Self {
+                reserved: ReservedPeers::new([committee]),
+                slots: PeerSlots::new(MAX_PENDING_REQUESTS_PER_PEER),
+                opening: opening_pool(),
+                pools: SyncServePools::new(),
+                handle: PrimaryNetworkHandle::new_for_test(sender),
+                served: Arc::new(AtomicBool::new(false)),
+            };
+            (responder, commands)
+        }
+
+        /// Admit a silent stream from `peer` the way the primary network does and drive it on a
+        /// task. `None` when the stream would be shed.
+        fn open_silent_stream(&self, peer: BlsPublicKey) -> Option<JoinHandle<()>> {
+            let tier = self.reserved.tier(&peer);
+            let grants = self.slots.try_take(peer).zip(self.opening.try_acquire(tier));
+            grants.map(|(slot, opening)| {
+                let grant = SyncAdmission { peer, tier, slot, opening };
+                let (pools, net) = (self.pools.clone(), self.handle.clone());
+                let served = self.served.clone();
+                let serve = move |_stream: SilentStream, _request: PrimarySyncRequest| {
+                    served.store(true, Ordering::SeqCst);
+                    std::future::ready(SyncServeOutcome::Completed)
+                };
+                tokio::spawn(admit_and_serve_sync_stream(SilentStream, grant, pools, net, serve))
+            })
+        }
+
+        /// The in-flight stream count of each of `peers`.
+        fn in_flight(&self, peers: &[BlsPublicKey]) -> Vec<usize> {
+            peers.iter().map(|peer| self.slots.in_flight(peer)).collect()
+        }
+    }
+
+    /// Open a silent stream from `peer`, let the responder task start, then let one second pass.
+    async fn open_then_wait(responder: &Responder, peer: BlsPublicKey) -> Option<JoinHandle<()>> {
+        let task = responder.open_silent_stream(peer);
+        settle().await;
+        tokio::time::advance(Duration::from_secs(1)).await;
+        task
+    }
+
+    /// Public keys that fill the public share of a serve class cannot lock out a committee key.
+    /// Three public keys at the per-peer cap (two, two and one streams) fill the share of five, a
+    /// fourth public key is refused, the committee key is served from the reserve, the other
+    /// classes keep their whole share, and released permits refill the public share.
+    #[test]
+    fn committee_key_is_served_when_public_keys_fill_a_serve_class() {
+        let committee = key(1);
+        let reserved = ReservedPeers::new([committee]);
+        let slots = PeerSlots::new(MAX_PENDING_REQUESTS_PER_PEER);
+        let pools = SyncServePools::new();
+        let pool = pools.pool(SyncClass::EpochPack);
+        let held: Option<Vec<_>> = [(key(10), 2), (key(11), 2), (key(12), 1)]
+            .into_iter()
+            .flat_map(|(peer, count)| std::iter::repeat_n(peer, count))
+            .map(|peer| slots.try_take(peer).zip(pool.try_acquire(reserved.tier(&peer))))
+            .collect();
+        assert_eq!(held.as_ref().map(Vec::len), Some(MAX_CONCURRENT_EPOCH_STREAMS));
+        assert_eq!(pool.available_public(), 0);
+        // a third stream from a public key at the per-peer cap is refused by its slot
+        assert!(slots.try_take(key(10)).is_none());
+        // a fourth public key has a free slot but no serve permit
+        assert!(slots.try_take(key(13)).is_some());
+        assert!(pool.try_acquire(reserved.tier(&key(13))).is_none());
+        // the committee key is served from the reserve
+        assert_eq!(reserved.tier(&committee), PeerTier::Committee);
+        let committee_permit = pool.try_acquire(reserved.tier(&committee));
+        assert!(committee_permit.is_some());
+        assert_eq!(pool.available_reserved(), COMMITTEE_RESERVED_SYNC_STREAMS.saturating_sub(1));
+        // a flood of one class does not touch the other classes
+        assert!(public_share_whole(&pools, SyncClass::MissingCertificates));
+        assert!(public_share_whole(&pools, SyncClass::ConsensusOutput));
+        // released permits refill the public share
+        drop(held);
+        assert_eq!(pool.available_public(), MAX_CONCURRENT_EPOCH_STREAMS);
+        assert!(pool.try_acquire(reserved.tier(&key(13))).is_some());
+    }
+
+    /// Opening reads draw only on the opening-read budget. Four public keys at the per-peer cap
+    /// fill its public share of eight, a fifth public key is refused, a committee key still
+    /// opens from the reserve, and every serve pool stays whole.
+    #[test]
+    fn opening_reads_leave_the_serve_pools_untouched() {
+        let committee = key(2);
+        let reserved = ReservedPeers::new([committee]);
+        let slots = PeerSlots::new(MAX_PENDING_REQUESTS_PER_PEER);
+        let opening = opening_pool();
+        let pools = SyncServePools::new();
+        let held: Option<Vec<_>> = (20..24)
+            .flat_map(|seed| std::iter::repeat_n(key(seed), MAX_PENDING_REQUESTS_PER_PEER))
+            .map(|peer| slots.try_take(peer).zip(opening.try_acquire(reserved.tier(&peer))))
+            .collect();
+        assert_eq!(held.as_ref().map(Vec::len), Some(MAX_CONCURRENT_OPENING_READS));
+        assert_eq!(opening.available_public(), 0);
+        assert!(opening.try_acquire(reserved.tier(&key(24))).is_none());
+        let committee_opening = opening.try_acquire(reserved.tier(&committee));
+        assert!(committee_opening.is_some());
+        assert!(serve_pools_untouched(&pools));
+        drop((held, committee_opening));
+        assert_eq!(opening.available_public(), MAX_CONCURRENT_OPENING_READS);
+        assert_eq!(opening.available_reserved(), COMMITTEE_RESERVED_OPENING_READS);
+    }
+
+    /// Silent streams hold only the opening-read budget, and only until the opening read times
+    /// out. The serve pools stay whole, each stream frees its opening permit and its peer slot at
+    /// the timeout, nothing is served, and each public peer (but not the committee peer) is
+    /// charged one mild penalty.
+    #[tokio::test(start_paused = true)]
+    async fn silent_streams_hold_only_the_opening_budget_and_are_charged() {
+        let (committee, first, second, third) = (key(3), key(30), key(31), key(32));
+        let peers = [committee, first, second, third];
+        let (open_cap, open_reserve) =
+            (MAX_CONCURRENT_OPENING_READS, COMMITTEE_RESERVED_OPENING_READS);
+        let (responder, mut commands) = Responder::new(committee);
+        // the committee stream and the first public stream open at 0 s, the others at 1 s and 2 s
+        let opened = [
+            responder.open_silent_stream(committee),
+            open_then_wait(&responder, first).await,
+            open_then_wait(&responder, second).await,
+            open_then_wait(&responder, third).await,
+        ];
+        let tasks: Option<Vec<JoinHandle<()>>> = opened.into_iter().collect();
+        assert!(tasks.is_some());
+
+        // 3 s: four opening reads are in flight, and no serve permit is taken
+        assert_eq!(responder.opening.available_public(), open_cap.saturating_sub(3));
+        assert_eq!(responder.opening.available_reserved(), open_reserve.saturating_sub(1));
+        assert_eq!(responder.in_flight(&peers), vec![1, 1, 1, 1]);
+        assert!(serve_pools_untouched(&responder.pools));
+
+        // 5.5 s: the committee read and the first public read timed out
+        tokio::time::advance(Duration::from_millis(2_500)).await;
+        settle().await;
+        assert_eq!(responder.opening.available_public(), open_cap.saturating_sub(2));
+        assert_eq!(responder.opening.available_reserved(), open_reserve);
+        assert_eq!(responder.in_flight(&peers), vec![0, 0, 1, 1]);
+        assert!(serve_pools_untouched(&responder.pools));
+
+        // 7.5 s: every read timed out, and every budget is whole again
+        tokio::time::advance(Duration::from_secs(2)).await;
+        settle().await;
+        assert_eq!(responder.opening.available_public(), open_cap);
+        assert_eq!(responder.in_flight(&peers), vec![0, 0, 0, 0]);
+        assert!(tasks.is_some_and(|tasks| tasks.iter().all(JoinHandle::is_finished)));
+        assert!(serve_pools_untouched(&responder.pools));
+        assert!(!responder.served.load(Ordering::SeqCst));
+
+        // one mild penalty per public peer, in timeout order, and none to the committee peer
+        let reports = std::iter::from_fn(|| commands.try_recv().ok());
+        let charged: Vec<_> = reports.map(mild_penalty_peer).collect();
+        assert_eq!(charged, vec![Some(first), Some(second), Some(third)]);
     }
 }
