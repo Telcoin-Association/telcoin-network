@@ -280,8 +280,8 @@ def capacity(records):
         rows.append({
             "run_id": record.get("run_id"),
             "received_total_rate_pps": dig(record, "host_and_traffic", "received", "total_rate_pps"),
-            "result": ("unknown" if not results or "unknown" in results
-                       else "fail" if "fail" in results else "pass"),
+            "result": ("fail" if "fail" in results
+                       else "unknown" if not results or "unknown" in results else "pass"),
         })
     figure = {"schema_version": SCHEMA_VERSION, "configuration": names[0] if len(names) == 1 else None,
               "capacity_received_rate_pps": None, "run_id": None, "records": rows, "reason": None,

@@ -73,7 +73,7 @@ struct PendingInbound {
 
 /// An outbound request that the swarm sent and that has not yet resolved.
 #[derive(Debug)]
-struct PendingOutbound<Res> {
+struct PendingOutbound<Res: TNMessage> {
     /// The caller's channel for the response or the failure.
     reply: NetworkResponseSender<Res>,
     /// The time that the swarm sent the request, for the round-trip histogram.
@@ -837,6 +837,7 @@ where
             .with_tokio()
             .with_quic_config(|config| {
                 let mut config = quic_config.apply_to(config);
+                config.inbound_accept_task = quic_config.inbound_accept_task.spawned_capacity();
                 quic_limits.apply(
                     &mut config,
                     network_config.quic_config().retry_unvalidated_incoming,

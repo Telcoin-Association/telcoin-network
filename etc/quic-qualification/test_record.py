@@ -158,13 +158,17 @@ class ThresholdTests(unittest.TestCase):
         self.assertEqual(record.evaluate_threshold("maximum_socket_drops", entry, 6)["result"], "fail")
 
 
+FIXTURE = object()
+
+
 class BuildRecordTests(unittest.TestCase):
-    def build(self, meta=None, summary=None, measured=None, gens=None):
+    def build(self, meta=FIXTURE, summary=FIXTURE, measured=FIXTURE, gens=FIXTURE):
+        """Build a record from the fixtures; pass an argument (`None` included) to replace one."""
         limitations, artifacts = [], []
-        document = record.build_record(manifest(), metadata() if meta is None else meta,
-                                       collector_summary() if summary is None else summary,
-                                       measurement() if measured is None else measured,
-                                       generators() if gens is None else gens, "plain", limitations, artifacts)
+        document = record.build_record(manifest(), metadata() if meta is FIXTURE else meta,
+                                       collector_summary() if summary is FIXTURE else summary,
+                                       measurement() if measured is FIXTURE else measured,
+                                       generators() if gens is FIXTURE else gens, "plain", limitations, artifacts)
         return document, limitations
 
     def test_every_group(self):

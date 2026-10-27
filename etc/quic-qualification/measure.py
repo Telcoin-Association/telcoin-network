@@ -121,12 +121,13 @@ def matches(labels, where):
 
 
 def group_reduce(table, keys, combine, where=None):
-    """Reduce a metric's label sets down to `keys`, keeping only rows matching `where`."""
+    """Reduce a metric's label sets down to `keys`, in that order, keeping only rows matching `where`."""
     grouped = {}
     for labels, value in table.items():
         if where and not matches(labels, where):
             continue
-        key = tuple((name, text) for name, text in labels if name in keys)
+        present = dict(labels)
+        key = tuple((name, present[name]) for name in keys if name in present)
         grouped[key] = combine(grouped[key], value) if key in grouped else value
     return grouped
 

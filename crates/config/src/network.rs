@@ -1994,4 +1994,12 @@ hostname: "my-validator"
         assert_eq!(parsed.max_proposed_header_age_limit, config.max_proposed_header_age_limit);
         Ok(())
     }
+
+    /// An empty `quic_config` section yields the inline accept task on the node configuration.
+    #[test]
+    fn empty_quic_section_keeps_the_inline_accept_task() -> Result<(), serde_yaml::Error> {
+        let node: NetworkConfig = serde_yaml::from_str("quic_config: {}")?;
+        assert_eq!(node.quic_config().inbound_accept_task, super::InboundAcceptTask::Inline);
+        Ok(())
+    }
 }

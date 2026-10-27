@@ -254,8 +254,10 @@ effective receive buffer comes from the collector's `ss -uamnep` capture
 (`skmem` `rb` on the node's sockets), never from a sysctl alone. Each threshold
 in `predeclared_acceptance` is `{value, owner, date}` and is evaluated to
 `pass`, `fail` or `unknown` with a reason. `capacity` takes the highest received
-rate among the records whose thresholds all pass for one configuration, and
-reports `null` with a reason when any threshold is unknown. Exit codes: 0 no
+rate among the records whose thresholds all pass for one configuration. A record
+is `fail` when one threshold fails, `unknown` when none fails and one is unknown,
+and the figure reports `null` with a reason when a record is `unknown` or no
+record passes. Exit codes: 0 no
 limitations, 2 manifest unusable, 3 one or more limitations recorded.
 
 ## Run order
