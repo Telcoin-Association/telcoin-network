@@ -28,7 +28,9 @@ pub(crate) const GOSSIP_PUBLISH_ENVELOPE_BOUND: usize = 512;
 /// Byte limit on the control and subscription fields of one frame.
 ///
 /// Equal to the gossipsub 0.50.0 default (16 KiB). It is set explicitly so that a library
-/// upgrade cannot change it, and because it sizes [`GOSSIP_FRAME_BOUND`].
+/// upgrade cannot change it, and because it sizes [`GOSSIP_FRAME_BOUND`]. The limit applies to
+/// the control frames the node sends too, such as its own `IHAVE` gossip.
+/// [`GOSSIP_MAX_IHAVE_IDS`] keeps those frames under it.
 pub(crate) const GOSSIP_CONTROL_SIZE: usize = 16 * 1024;
 
 /// Bytes the codec reader adds to its buffer for each read.
@@ -46,7 +48,9 @@ const GOSSIP_LENGTH_PREFIX_BOUND: usize = 3;
 /// Largest frame an honest peer sends, in bytes.
 ///
 /// An honest frame is either one publish entry (payload bound plus envelope) or one control or
-/// subscription field (control limit plus length prefix). This is the larger of the two.
+/// subscription field (control limit plus length prefix). This is the larger of the two. The
+/// node's own `IHAVE` frames have the control shape because [`GOSSIP_MAX_IHAVE_IDS`] keeps them
+/// under the control limit.
 pub(crate) const GOSSIP_FRAME_BOUND: usize = larger(
     MAX_GOSSIP_MESSAGE_SIZE + GOSSIP_PUBLISH_ENVELOPE_BOUND,
     GOSSIP_CONTROL_SIZE + GOSSIP_LENGTH_PREFIX_BOUND,
@@ -65,6 +69,48 @@ pub(crate) const GOSSIP_MAX_TRANSMIT_SIZE: usize = GOSSIP_FRAME_BOUND + GOSSIP_R
 /// checks per frame and leaves room for a future sender that batches a few entries. This is
 /// not a rate bound. Per-peer and per-topic rate budgets are separate work.
 pub(crate) const GOSSIP_MAX_PUBLISH_PER_FRAME: usize = 8;
+
+/// Upper bound, in bytes, on one gossip message id.
+///
+/// The node uses the gossipsub 0.50.0 default message id (`config.rs` lines 526-539): the base58
+/// source peer id followed by the decimal sequence number. A peer id is at most 44 bytes (an
+/// identity multihash of a key of up to 42 bytes), which is at most 60 base58 characters. A
+/// `u64` sequence number is at most 20 digits. An ed25519 source with a nanosecond sequence
+/// number gives a 71-byte id today.
+pub(crate) const GOSSIP_MESSAGE_ID_BOUND: usize = 80;
+
+/// Upper bound, in bytes, on one gossip topic name in an `IHAVE`.
+///
+/// The longest topic the node uses is `tn-consensus-output-{chain_id}`, which is 40 bytes with
+/// the widest chain id. 64 leaves room for a longer topic. A topic of up to 127 bytes keeps a
+/// one-byte length prefix.
+pub(crate) const GOSSIP_TOPIC_BOUND: usize = 64;
+
+/// Upper bound, in bytes, on the framing of one `IHAVE` control field, without its ids.
+///
+/// The `Rpc.control` tag and length (1 + 2), the `ControlMessage.ihave` tag and length (1 + 2)
+/// and the `topic_id` tag and length (1 + 1). A length below 16 KiB fits in two varint bytes.
+const GOSSIP_IHAVE_FRAMING_BOUND: usize = 8;
+
+/// The gossipsub `max_control_messages_sent`: the message ids the node puts in one `IHAVE`.
+///
+/// Each heartbeat, gossipsub 0.50.0 sends one `IHAVE` for each topic in its mesh and fanout to
+/// subscribed peers outside that topic's mesh or fanout set, except explicit peers (`behaviour.rs`
+/// `emit_gossip`, lines 2788-2861). The `IHAVE` holds the validated ids of the last three
+/// heartbeats (`history_gossip`) and has no byte cap. With the library default of 5000 ids, one
+/// busy topic is enough: about 225 ids of 71 bytes on a 15-byte topic pass
+/// [`GOSSIP_CONTROL_SIZE`], and the receiver closes the stream (issue #1700).
+///
+/// The cap is the largest id count whose `IHAVE` fits in [`GOSSIP_CONTROL_SIZE`] with ids of
+/// [`GOSSIP_MESSAGE_ID_BOUND`] bytes on a topic of [`GOSSIP_TOPIC_BOUND`] bytes. Each id costs its
+/// bytes plus a tag and a one-byte length (2). Above the cap, gossipsub sends each peer a
+/// different random subset of the ids (lines 2840-2846). Gossip coverage drops, but the streams
+/// stay open. The same setting caps the ids the node asks one peer for with `IWANT` in one
+/// heartbeat (lines 1412-1435), so an `IWANT` for ids within the bound fits under the limit too.
+/// The cap changes only the frames this node sends. Peers on other versions need no change.
+pub(crate) const GOSSIP_MAX_IHAVE_IDS: usize =
+    (GOSSIP_CONTROL_SIZE - GOSSIP_IHAVE_FRAMING_BOUND - GOSSIP_TOPIC_BOUND)
+        / (2 + GOSSIP_MESSAGE_ID_BOUND);
 
 /// Return the larger of two sizes in a const context.
 const fn larger(a: usize, b: usize) -> usize {
@@ -95,6 +141,10 @@ const fn larger(a: usize, b: usize) -> usize {
 ///    then the duplicate cache (line 1983), then the subscribed-topic check (line 2020).
 /// 6. `verify_gossip` in this crate: the [`MAX_GOSSIP_MESSAGE_SIZE`] payload check and the
 ///    publisher checks. That check is a separate control and stays in place.
+///
+/// Send side: the node's peers apply the same codec gate to the frames the node sends. The
+/// `IHAVE` gossip (`behaviour.rs` `emit_gossip`, lines 2788-2861) has no byte cap of its own, so
+/// [`GOSSIP_MAX_IHAVE_IDS`] caps its id count (truncation at lines 2840-2846).
 pub fn gossipsub_config(chain_id: u64) -> Result<gossipsub::Config, ConfigBuilderError> {
     gossipsub::ConfigBuilder::default()
         // explicitly set default
@@ -117,5 +167,8 @@ pub fn gossipsub_config(chain_id: u64) -> Result<gossipsub::Config, ConfigBuilde
         .max_publish_messages(GOSSIP_MAX_PUBLISH_PER_FRAME)
         // explicitly set default
         .max_control_message_size(GOSSIP_CONTROL_SIZE)
+        // Keep each IHAVE the node sends under the control limit (issue #1700). The setter
+        // also caps the ids the node asks one peer for with IWANT in one heartbeat.
+        .max_control_messages_sent(GOSSIP_MAX_IHAVE_IDS)
         .build()
 }
