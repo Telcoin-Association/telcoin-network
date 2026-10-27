@@ -470,6 +470,9 @@ const DUP_MATCHED: &[&str] = &[
     "se:2 d ld",
     "se:2 d ld d c",
     "se:2 d d c",
+    "se:2 d d n",
+    "se:2 d d p",
+    "se:2 d d pd",
     "se:2 d dd c",
     "se:2 d nnd",
     "se:2 d p",
@@ -585,6 +588,11 @@ fn dup_cursor_steps_after_a_delete_or_last_match_mdbx() {
 /// - **`last_dup` right after a delete of a key's only row** (or after
 ///   `delete_current_duplicates`): both return the follower's key's last value, but MDBX's cursor
 ///   stays on the follower, as right after the delete; tndb-b's is on that last row.
+/// - **`delete_current` right after a delete of a key's only row** (or after
+///   `delete_current_duplicates`): both delete the follower and are then on the row after it. When
+///   that row is in the follower's key, MDBX's `next_dup` and `next_dup_val` find nothing and its
+///   `next_no_dup` returns that row, as if the cursor were outside the key's rows; tndb-b's act as
+///   after any delete (`next_dup` returns the row, `next_no_dup` the next key's first).
 /// - **Another writer changes the key the cursor is in** (the crate docs' zone where MDBX is no
 ///   oracle): MDBX's cursor works from a stale copy of the key's rows. After the transaction's
 ///   delete of a key's last row while the key keeps earlier rows, it ends the key's rows on the row
@@ -622,6 +630,10 @@ const DUP_DEVIATIONS: &[(&str, &str, &str)] = &[
     ("f p dd c", "f=1/1 p=none dd=ok c=2/2", "f=1/1 p=none dd=nodata c=none"),
     ("se:2 d ld n p", "se:2=2/2 d=ok ld=2 n=4/1 p=1/5", "se:2=2/2 d=ok ld=2 n=none p=4/2"),
     ("se:1 dd ld n", "se:1=1/1 dd=ok ld=2 n=2/2", "se:1=1/1 dd=ok ld=2 n=4/1"),
+    ("se:2 d d nd", "se:2=2/2 d=ok d=ok nd=none", "se:2=2/2 d=ok d=ok nd=4/2"),
+    ("se:2 d d ndv", "se:2=2/2 d=ok d=ok ndv=none", "se:2=2/2 d=ok d=ok ndv=2"),
+    ("se:2 d d nnd", "se:2=2/2 d=ok d=ok nnd=4/2", "se:2=2/2 d=ok d=ok nnd=none"),
+    ("se:2 dd d nd", "se:2=2/2 dd=ok d=ok nd=none", "se:2=2/2 dd=ok d=ok nd=4/2"),
     ("sk:1/5 del:1/5 c ld", "sk:1/5=5 del:1/5=ok c=1/3 ld=3", "sk:1/5=5 del:1/5=ok c=2/2 ld=2"),
     ("ad:4/2", "ad:4/2=ok", "ad:4/2=keymismatch"),
     ("a:5/1 a:5/2 p", "a:5/1=ok a:5/2=ok p=4/2", "a:5/1=ok a:5/2=ok p=5/1"),

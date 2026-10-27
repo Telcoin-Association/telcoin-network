@@ -78,9 +78,10 @@ stack. A row this layout cannot hold is `MDBX_BAD_VALSIZE`.
   encodes that wide).
 - **Cursor positions:** past either end the cursor is past the end where MDBX's stays on the end
   row; after another writer's delete and put the cursor finds its place again lazily, at its next
-  call; and a few dup-sort positions differ (`last_dup` after a key's only row is deleted,
-  `append_dup` with the subkey of a key's last row, `last_dup` before the first row, a dup key of
-  one row). After `last` a cursor, read-only or write, ends the table as MDBX's does.
+  call; and a few dup-sort positions differ (`last_dup`, or the dup moves after a
+  `delete_current`, right after a key's only row is deleted; `append_dup` with the subkey of a
+  key's last row; `last_dup` before the first row; a dup key of one row). After `last` a cursor,
+  read-only or write, ends the table as MDBX's does.
 - **Where MDBX is no oracle:** when another writer in the same transaction changes the rows of the
   dup key a cursor is in, MDBX's cursor works from a stale copy of the key's rows. The
   differential test found it skipping rows, leaving the table's `entries` count one off, and

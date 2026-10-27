@@ -154,9 +154,13 @@
 //!    follower;
 //! 3. **another writer changes the cursor's dup key:** the cursor finds its place again by key at
 //!    its next call, where MDBX's works from a stale copy of the key's rows (below);
-//! 4. **`last_dup` right after a delete of a key's only row,** or after
-//!    `delete_current_duplicates`: both return the follower's key's last value, but MDBX's cursor
-//!    stays on the follower and this one is on that last row, so the moves after it differ;
+//! 4. **`last_dup` or `delete_current` right after a delete of a key's only row,** or after
+//!    `delete_current_duplicates`, which leave the cursor on the follower: `last_dup` returns the
+//!    follower's key's last value on both, but MDBX's cursor stays on the follower and this one is
+//!    on that last row, so the moves after it differ; `delete_current` deletes the follower on
+//!    both, and when the row after it is in the same key, MDBX's dup moves then act as if its
+//!    cursor were outside the key's rows (`next_dup` and `next_dup_val` find nothing, `next_no_dup`
+//!    returns that row) where this one's act as after any delete;
 //! 5. **`append_dup` with the subkey of a key's last row,** with two rows or more: refused here for
 //!    its order, taken by MDBX (above);
 //! 6. **one value per subkey:** a second value for a (key, subkey) is refused here, stored by MDBX
