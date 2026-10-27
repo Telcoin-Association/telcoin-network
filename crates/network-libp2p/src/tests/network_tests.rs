@@ -3665,11 +3665,14 @@ async fn test_kad_self_advertisement_confirms_when_store_is_full() -> eyre::Resu
 
     // Two valid records per relay stay below both the per-source message limit and the
     // tracked-source cap. Fill the real store through the inbound handler without confirming
-    // any of the non-committee identities advertised by these relays.
+    // any of the non-committee identities advertised by these relays. Refill the shared budget
+    // before each record: this test pins store saturation, and the shared budget has its own
+    // tests.
     std::iter::repeat_with(PeerId::random)
         .flat_map(|source| std::iter::repeat_n(source, 2))
         .take(max_records)
         .try_for_each(|source| -> eyre::Result<()> {
+            network.swarm.behaviour_mut().peer_manager.refill_put_record_budget();
             let bls = BlsKeypair::generate(&mut rng);
             let netkey = NetworkKeypair::generate_ed25519();
             let record = NodeRecord::build(
@@ -4678,6 +4681,53 @@ async fn test_add_provider_drops_remote_provider_without_penalty() -> eyre::Resu
         primary_counters_eq(&snapshotter, &[("tn_network.add_provider_remote_dropped_total", 1)]),
         "the remote drop is counted once",
     );
+    Ok(())
+}
+
+/// A cached URL is insufficient: coverage needs a live, matching verified record.
+#[tokio::test]
+async fn committee_convergence_excludes_stale_records() -> eyre::Result<()> {
+    let TestTypes { peer1, peer2, .. } =
+        create_test_types::<TestWorkerRequest, TestWorkerResponse>();
+    let mut network = peer1.network;
+    let owner = peer2.config.key_config().primary_public_key();
+    let publisher = *peer2.network.swarm.local_peer_id();
+    let keys = peer2.config.key_config();
+    let rpc = RpcInfo { http: "https://validator.example.com:8545/".parse()?, ws: None };
+    let record = NodeRecord::build(
+        RecordDomain::new(
+            peer2.config.network_config().libp2p_config().chain_id,
+            NetworkType::Primary,
+        ),
+        keys.primary_network_public_key(),
+        peer2.config.primary_address(),
+        Some(rpc),
+        |data| keys.request_signature_direct(data),
+    );
+    network.process_command(NetworkCommand::UpdateCommittees {
+        previous: HashSet::new(),
+        current: HashSet::from([owner]),
+        next: HashSet::new(),
+    })?;
+    network.swarm.behaviour_mut().peer_manager.add_restored_peer(owner, record.info.clone());
+    assert_eq!(network.committee_rpc_snapshot().members(), &HashSet::from([owner]));
+    assert!(network.committee_rpc_snapshot().rpcs().is_empty());
+    let kad_record = kad::Record {
+        key: node_record_key(&owner),
+        value: encode(&record),
+        publisher: Some(publisher),
+        expires: None,
+    };
+    network.process_kad_put_request(publisher, kad_record.clone())?;
+    assert_eq!(network.committee_rpc_snapshot().rpcs().len(), 1);
+    network
+        .swarm
+        .behaviour_mut()
+        .kademlia
+        .store_mut()
+        .put(kad::Record { expires: Some(std::time::Instant::now()), ..kad_record })?;
+    assert!(network.swarm.behaviour().peer_manager.get_rpc(&owner).is_some());
+    assert!(network.committee_rpc_snapshot().rpcs().is_empty());
     Ok(())
 }
 
@@ -5924,6 +5974,87 @@ async fn connection_limit_swarm_frees_slot_of_timed_out_pending_connection() {
         matches!(&event, SwarmEvent::ConnectionEstablished { peer_id, .. } if *peer_id == b2_peer_id),
         "client B2 must connect through the freed slot, got {event:?}"
     );
+}
+
+/// Repeated listener errors and malformed input preserve exact counters and command progress.
+#[tokio::test]
+async fn diagnostic_suppression_preserves_network_progress_and_counters() -> eyre::Result<()> {
+    use crate::diagnostics::emission_tests::Capture;
+    use futures::TryStreamExt as _;
+    use libp2p::core::transport::ListenerId;
+    use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
+    let recorder = DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    let _recorder = metrics::set_default_local_recorder(&recorder);
+    let TestTypes { peer1, _task_manager, .. } =
+        create_test_types::<TestWorkerRequest, TestWorkerResponse>();
+    let capture = Capture::default();
+    let _subscriber = tracing::subscriber::set_default(capture.clone());
+    let mut network = futures::stream::iter((0_u64..128).map(Ok::<_, NetworkError>))
+        .try_fold(peer1.network, |mut network, identity| async move {
+            network
+                .process_event(SwarmEvent::ListenerError {
+                    listener_id: ListenerId::next(),
+                    error: std::io::Error::other(format!("changing listener error {identity}")),
+                })
+                .await?;
+            let source = PeerId::random();
+            network.process_gossip_event(GossipEvent::Message {
+                propagation_source: source,
+                message_id: gossipsub::MessageId::from(identity.to_le_bytes().to_vec()),
+                message: test_gossip_message(),
+            })?;
+            let mut malformed = kad::Record::new(identity.to_le_bytes().to_vec(), vec![0xff]);
+            malformed.publisher = Some(source);
+            network.process_kad_put_request(source, malformed)?;
+            Ok(network)
+        })
+        .await?;
+
+    let (reply, received) = oneshot::channel();
+    network.process_command(NetworkCommand::EstablishedPeerCount { reply })?;
+    assert_eq!(received.await?, 0, "the next command still makes progress after the event stream");
+    // Read the recorder once: every snapshot resets its counters to zero.
+    let snapshot = snapshotter.snapshot().into_vec();
+    // The listener error count carries a fixed reason class; the error text never becomes a label.
+    [
+        ("listener_errors_total", &[("network", "primary"), ("reason", "other")][..]),
+        ("gossip_received_total", &[("network", "primary")][..]),
+        ("gossip_rejected_total", &[("network", "primary")][..]),
+    ]
+    .into_iter()
+    .for_each(|(suffix, expected)| {
+        assert!(
+            snapshot.iter().any(|(key, _, _, value)| {
+                key.key().name() == format!("tn_network.{suffix}")
+                    && key.key().labels().count() == expected.len()
+                    && key
+                        .key()
+                        .labels()
+                        .all(|label| expected.contains(&(label.key(), label.value())))
+                    && matches!(value, DebugValue::Counter(128))
+            }),
+            "every event is counted without remote label values: {suffix}"
+        );
+    });
+
+    // The transport has not been polled, so it has no active listener addresses yet.
+    assert!(network.swarm.listeners().next().is_none());
+    let result = network
+        .process_event(SwarmEvent::ListenerClosed {
+            listener_id: ListenerId::next(),
+            addresses: Vec::new(),
+            reason: Err(std::io::Error::other("terminal listener loss")),
+        })
+        .await;
+    assert!(matches!(result, Err(NetworkError::AllListenersClosed)));
+    assert_eq!(
+        capture.message_count("no listeners for swarm"),
+        1,
+        "terminal loss bypasses suppression"
+    );
+    Ok(())
 }
 
 /// The inbound denial warning stays silent for a short burst of refusals and fires once per window
