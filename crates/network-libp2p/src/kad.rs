@@ -729,10 +729,12 @@ impl<DB: Database> KadStore<DB> {
             .filter_map(|(hash, row)| {
                 let records = row.decode_records(&hash)?;
                 let total = records.len();
-                let local: Vec<KadProviderRecord> = (row.key.as_ref().len()
-                    == BlsPublicKey::COMPRESSED_BYTES)
-                    .then(|| records.into_iter().filter(|r| r.provider == local_peer_id).collect())
-                    .unwrap_or_default();
+                let local: Vec<KadProviderRecord> =
+                    if row.key.as_ref().len() == BlsPublicKey::COMPRESSED_BYTES {
+                        records.into_iter().filter(|r| r.provider == local_peer_id).collect()
+                    } else {
+                        Vec::new()
+                    };
                 (local.len() < total).then_some((hash, row.key, local))
             })
             .partition(|(_, _, local)| local.is_empty());
@@ -1574,12 +1576,13 @@ mod test {
         assert_eq!(kad_store_worker.num_providers, 1);
         assert_eq!(kad_store_worker.providers(&provider_rec2.key).len(), 0);
 
-        // Bogus remove, mismatches key and provider.
-        kad_store.remove_provider(&provider_rec3.key, &provider_rec2.provider);
+        // Bogus remove: a remote provider that never held the key. Every stored record now
+        // belongs to the local node (issue #1720), so `provider_rec2.provider` would match.
+        kad_store.remove_provider(&provider_rec3.key, &provider_rec1_1.provider);
         assert_eq!(kad_store.num_providers, 1);
         kad_store.remove_provider(&provider_rec3.key, &provider_rec3.provider);
         assert_eq!(kad_store.num_providers, 0);
-        kad_store_worker.remove_provider(&provider_rec3.key, &provider_rec2.provider);
+        kad_store_worker.remove_provider(&provider_rec3.key, &provider_rec1_1.provider);
         assert_eq!(kad_store_worker.num_providers, 1);
         kad_store_worker.remove_provider(&provider_rec3.key, &provider_rec3.provider);
         assert_eq!(kad_store_worker.num_providers, 0);
