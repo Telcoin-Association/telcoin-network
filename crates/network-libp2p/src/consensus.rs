@@ -1149,6 +1149,10 @@ where
             self.metrics.set_pending_incoming_connections(
                 self.swarm.network_info().connection_counters().num_pending_incoming(),
             );
+            self.swarm
+                .behaviour()
+                .peer_manager
+                .observe_committee_resolution(self.key_config.primary_public_key());
         }
     }
 
