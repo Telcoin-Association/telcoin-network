@@ -688,7 +688,7 @@ async fn test_gossip_key_field_rejected_on_the_wire() -> eyre::Result<()> {
     let padded = [clean.clone(), field(6, &vec![0xffu8; MAX_GOSSIP_MESSAGE_SIZE])].concat();
     let sentinel = signed_message(&sender_key, 2, &topic, b"sentinel");
     // the padded frame is inside the frame limits, so only the transform can stop it
-    assert!(publish_frame(&[padded.clone()]).len() <= GOSSIP_FRAME_BOUND);
+    assert!(publish_frame(std::slice::from_ref(&padded)).len() <= GOSSIP_FRAME_BOUND);
 
     let mut substream = open_substream(&opener).await?;
     substream.write_all(&publish_frame(&[padded])).await?;
