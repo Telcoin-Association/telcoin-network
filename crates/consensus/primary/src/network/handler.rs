@@ -1,6 +1,6 @@
 //! Handle specific request types received from the network.
 
-use super::PrimaryResponse;
+use super::{PrimaryResponse, SyncServeOutcome};
 use crate::{
     error::{CertManagerError, PrimaryNetworkError, PrimaryNetworkResult},
     network::message::{PrimaryGossip, PrimaryRPCError},
@@ -1342,10 +1342,13 @@ where
     /// The exchange has already been admitted against the concurrency caps and its
     /// opening request frame read by the caller. This streams the pack via
     /// [`send_sync_epoch_pack_over_stream`], which bounds a slow reader with a per-frame write
-    /// timeout and a rolling throughput floor rather than a total timeout. A send failure is
-    /// logged and best-effort signalled with [`SyncFrame::Err`] so the requester
-    /// stops waiting; it is not a peer fault, so no penalty is returned (metrics-only
-    /// during the item-6 rollout, like the legacy responder).
+    /// timeout, a rolling throughput floor and a total deadline sized from the pack length. A
+    /// send failure is logged and best-effort signalled with [`SyncFrame::Err`] so the requester
+    /// stops waiting.
+    ///
+    /// Returns [`SyncServeOutcome::Completed`] when the pack was sent or shed with `Deny`,
+    /// [`SyncServeOutcome::Stalled`] when a write timed out (the caller may charge a public-tier
+    /// peer), and [`SyncServeOutcome::Failed`] for any other error.
     ///
     /// [`send_sync_epoch_pack_over_stream`]: crate::network::sync_codec::send_sync_epoch_pack_over_stream
     pub(super) async fn process_sync_epoch_pack_stream(
@@ -1355,15 +1358,16 @@ where
         epoch: Epoch,
         stop_number: Option<u64>,
         consensus_chain: &ConsensusChain,
-    ) -> PrimaryNetworkResult<()> {
+    ) -> SyncServeOutcome {
         debug!(target: "primary::network", %peer, epoch, ?stop_number, "serving inbound sync epoch pack stream");
         let max_frame = crate::network::sync_codec::MAX_SYNC_PACK_FRAME_SIZE;
 
-        // No fixed overall serve cap: `send_sync_epoch_pack_over_stream` enforces a per-frame write
-        // timeout (`SEND_STREAM_BUFFER_TIMEOUT`) AND a rolling-window throughput floor, so a large
-        // honest pack can take as long as it needs at/above the floor while a drip-reading peer
-        // (which keeps resetting the per-frame timer) is cut within roughly one window —
-        // without capping the pack size a slow-but-honest requester could ever receive.
+        // `send_sync_epoch_pack_over_stream` bounds the serve three ways: a per-frame write
+        // timeout (`SEND_STREAM_BUFFER_TIMEOUT`), a rolling-window throughput floor, and a total
+        // deadline (`pack_serve_deadline`) of one floor window per started MiB of pack plus one.
+        // A large honest pack at or above the floor finishes inside the deadline; a drip reader
+        // that keeps resetting the per-frame timer is cut by the floor or, at the latest, by the
+        // deadline.
         let served = crate::network::sync_codec::send_sync_epoch_pack_over_stream(
             &mut stream,
             consensus_chain,
@@ -1374,8 +1378,10 @@ where
         )
         .await;
 
-        // a send failure or timeout is logged and best-effort signalled so the
-        // requester stops waiting; it is not a peer fault, so no penalty
+        // a send failure or timeout is logged and best-effort signalled so the requester stops
+        // waiting; a timed-out write is classified `Stalled` so the admission layer can charge a
+        // public-tier peer
+        let outcome = SyncServeOutcome::of(&served);
         if let Err(e) = served {
             warn!(target: "primary::network", %peer, ?e, "failed to serve sync epoch pack stream");
             // bound the best-effort error write: a peer that read the `Ack` then
@@ -1398,7 +1404,7 @@ where
         // reading cannot pin this responder task on the FIN flush
         let _ = timeout(crate::network::SYNC_REQUEST_READ_TIMEOUT, stream.close()).await;
 
-        Ok(())
+        outcome
     }
 
     /// Serve an inbound missing-certificates sync exchange.
@@ -1415,8 +1421,12 @@ where
     /// A request whose `skip_rounds` is out of bounds fails the collector build and is
     /// declined with [`SyncFrame::Err`]`(`[`SyncFrameError::Malformed`]`)` before any
     /// `Ack`; any later serve failure is logged and best-effort signalled with
-    /// `SyncFrame::Err`. Errors are metrics-only during the rollout (no penalty),
-    /// matching the legacy responder and the epoch-pack sync path.
+    /// `SyncFrame::Err`.
+    ///
+    /// Returns [`SyncServeOutcome::Completed`] when the certificates were sent,
+    /// [`SyncServeOutcome::Stalled`] when a write timed out (the caller may charge a public-tier
+    /// peer), and [`SyncServeOutcome::Failed`] for a malformed request, an overall serve timeout
+    /// or any other error.
     ///
     /// [`send_sync_certificates_over_stream`]: crate::network::sync_codec::send_sync_certificates_over_stream
     pub(super) async fn process_sync_missing_certs_stream(
@@ -1425,7 +1435,7 @@ where
         mut stream: Stream,
         exclusive_lower_bound: Round,
         skip_rounds: Vec<(AuthorityIdentifier, Vec<u8>)>,
-    ) -> PrimaryNetworkResult<()> {
+    ) -> SyncServeOutcome {
         debug!(target: "primary::network", %peer, exclusive_lower_bound, "serving inbound sync missing certificates stream");
         let max_frame = crate::network::sync_codec::MAX_SYNC_CERT_FRAME_SIZE;
         let (mut encode_buffer, mut compressed_buffer) = (Vec::new(), Vec::new());
@@ -1451,7 +1461,7 @@ where
                 stream.close().await
             })
             .await;
-            return Ok(());
+            return SyncServeOutcome::Failed;
         };
 
         // bound the whole serve; flatten the timeout's outer Result into the send's
@@ -1467,8 +1477,10 @@ where
         .map_err(PrimaryNetworkError::from)
         .and_then(|served| served);
 
-        // a serve failure or timeout is logged and best-effort signalled so the
-        // requester stops waiting; it is not a peer fault, so no penalty
+        // a serve failure or timeout is logged and best-effort signalled so the requester stops
+        // waiting; a timed-out write is classified `Stalled` so the admission layer can charge a
+        // public-tier peer
+        let outcome = SyncServeOutcome::of(&served);
         if let Err(e) = served {
             warn!(target: "primary::network", %peer, ?e, "failed to serve sync missing certificates stream");
             // bound the best-effort error write: a peer that read the `Ack` then
@@ -1490,7 +1502,7 @@ where
         // reading cannot pin this responder task on the FIN flush
         let _ = timeout(crate::network::SYNC_REQUEST_READ_TIMEOUT, stream.close()).await;
 
-        Ok(())
+        outcome
     }
 
     /// Serve an inbound single-consensus-output sync exchange.
@@ -1503,8 +1515,11 @@ where
     /// `Ack` + `Data`* + `End`; a benign miss (unknown number, or one not yet built
     /// during catch-up) sheds with a [`SyncFrame::Deny`]`(Unavailable)` frame so the
     /// requester retries elsewhere. A send failure is logged and best-effort signalled
-    /// with [`SyncFrame::Err`]; it is not a peer fault, so no penalty is returned
-    /// (metrics-only during the item-9b rollout, like the epoch-pack sync path).
+    /// with [`SyncFrame::Err`].
+    ///
+    /// Returns [`SyncServeOutcome::Completed`] when the output was sent or shed with `Deny`,
+    /// [`SyncServeOutcome::Stalled`] when a write timed out (the caller may charge a public-tier
+    /// peer), and [`SyncServeOutcome::Failed`] for an overall serve timeout or any other error.
     ///
     /// [`send_sync_consensus_output_over_stream`]: crate::network::sync_codec::send_sync_consensus_output_over_stream
     pub(super) async fn process_sync_consensus_output_stream(
@@ -1512,7 +1527,7 @@ where
         peer: BlsPublicKey,
         mut stream: Stream,
         number: u64,
-    ) -> PrimaryNetworkResult<()> {
+    ) -> SyncServeOutcome {
         debug!(target: "primary::network", %peer, number, "serving inbound sync consensus output stream");
         let max_frame = crate::network::sync_codec::MAX_SYNC_PACK_FRAME_SIZE;
 
@@ -1535,8 +1550,10 @@ where
         .map_err(PrimaryNetworkError::from)
         .and_then(|served| served);
 
-        // a send failure or timeout is logged and best-effort signalled so the
-        // requester stops waiting; it is not a peer fault, so no penalty
+        // a send failure or timeout is logged and best-effort signalled so the requester stops
+        // waiting; a timed-out write is classified `Stalled` so the admission layer can charge a
+        // public-tier peer
+        let outcome = SyncServeOutcome::of(&served);
         if let Err(e) = served {
             warn!(target: "primary::network", %peer, ?e, "failed to serve sync consensus output stream");
             // bound the best-effort error write: a peer that read the `Ack` then
@@ -1559,7 +1576,7 @@ where
         // reading cannot pin this responder task on the FIN flush
         let _ = timeout(crate::network::SYNC_REQUEST_READ_TIMEOUT, stream.close()).await;
 
-        Ok(())
+        outcome
     }
 }
 
