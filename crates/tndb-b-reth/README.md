@@ -5,10 +5,14 @@ reth's database API (`reth-db-api`, reth v1.11.3) on the [`tndb-b`](../tndb-b/RE
 report MDBX's error codes, so reth's code and reth's MDBX tests run on it unchanged. reth's five
 dup-sort tables are stored as composite keys; the engine has no dup-sort feature.
 
-**Status: pre-production.** The crate is a workspace member, but nothing in TN uses it yet: TN's
-reth database is still MDBX. The benchmark below passed its Linux gate on 2026-10-26. Next comes TN
-integration behind a feature. On a reth upgrade (storage v2 included), follow the checklist in
-`CLAUDE.md` ("On a reth upgrade").
+**Status: pre-production.** TN uses it behind the off-by-default `tndb-b` feature of `tn-reth`
+(forwarded by `tn-node`, `telcoin-network-cli` and `telcoin-network`), which runs TN's reth
+execution database on `TndbEnv` instead of MDBX; the default build is still MDBX. A `tndb-b`
+build migrates an MDBX reth database onto `TndbEnv` at its first open (every table copied raw by
+appends and verified, with `TndbEnv::sync` and `TndbEnv::check`, before MDBX's files are removed).
+`tn-reth`'s README ("Database backend") covers the open path, the backend guard, the migration
+and how reth's `--db.*` flags map onto `TndbArgs`. The benchmark below passed its Linux gate on 2026-10-26. On a reth upgrade
+(storage v2 included), follow the checklist in `CLAUDE.md` ("On a reth upgrade").
 
 The crate docs (`src/lib.rs`) are the reference: the type mapping, the dup layout and the mapping
 of every dup call, the error codes, every difference from MDBX, and the differential and crash
@@ -30,10 +34,21 @@ tx.commit()?;
 - **One file,** `<dir>/tndb.dat` (`DATA_FILE`), locked with the engine's `flock`: a second open of
   a file another handle holds is `MDBX_BUSY`.
 - **`TndbArgs`:** 4 KiB pages by default (any power of two from 4 to 64 KiB, fixed when the file
-  is created), the engine's map reserve, and `SyncMode::Durable` (or `NoSync`, made durable by the
-  engine's `sync` or the drop).
+  is created), the engine's map reserve, and `SyncMode::Durable` (or `NoSync`, made durable by
+  `TndbEnv::sync` or the drop).
 - **`TndbEnvKind::RO`** opens through the engine's read-only open: an existing file no writer
   holds (the node stopped), a shared lock, never written or synced; `tx_mut` is `MDBX_EACCESS`.
+- **Table stats:** `table_stats` gives the figures of each of reth's tables the file has, in the
+  newest committed state: a `RethTableStat` (name, entries, branch, leaf and overflow pages) per
+  table, in the order of `Tables::ALL`; `page_size` gives the file's page size. The
+  `DatabaseMetrics` gauges (`db.table_size`, `db.table_pages`, `db.table_entries`) report the same
+  figures under MDBX's names and labels.
+- **Sync and check:** `sync` makes every `NoSync` commit durable (the engine's `Env::sync`; a
+  failure is `DatabaseError::Commit` and latches the environment). `check` runs the engine's full
+  structural check of the newest committed state (`Env::check`) and returns its `CheckReport`;
+  damage is `DatabaseError::Read` with `MDBX_CORRUPTED`, latches the environment, and its detail
+  is in `failure`. TN's MDBX to tndb-b migration (`tn-reth`) copies with `NoSync`, then syncs and
+  checks before it moves the file into place.
 - **Limits:** a value up to 16 MiB. One up to the inline limit (about a quarter page: 999 bytes
   with an 8-byte key at 4 KiB pages, where MDBX keeps about 2 KB in the leaf) stays in its leaf;
   a larger one goes to an overflow run of contiguous pages, transparently.
@@ -66,8 +81,8 @@ stack. A row this layout cannot hold is `MDBX_BAD_VALSIZE`.
   snapshot from reuse, so the file grows until it ends, and a write commit made once a reader has
   held a superseded snapshot for over 60 s logs a `warn!` with its age, at most once a minute
   (from the engine's lock-free `Env::oldest_reader_age`: readers pay nothing, a commit one atomic
-  load while no reader holds a superseded snapshot, plus a clock read while one does); one file with an `flock`; the metrics skip a table
-  the file lacks.
+  load while no reader holds a superseded snapshot, plus a clock read while one does); one file
+  with an `flock`; the table stats and the metrics skip a table the file lacks.
 - **Data:** a dup-sort subkey holds one value: a second value for an existing (key, subkey) is
   refused with `MDBX_KEYEXIST` and a message saying so, changing nothing, where MDBX stores both
   (writing the value the row holds again succeeds, as on MDBX; reth deletes before it writes, so

@@ -367,8 +367,12 @@ Complete tree after the node has run:
   genesis/                        # chain genesis data
     genesis.yaml                  #   EVM genesis block
     committee.yaml                #   committee membership + bootstrap peers
-  db/                             # execution layer database (Reth/MDBX)
-    static_files/                 #   static block data
+  db/                             # execution layer database (reth): mdbx.dat, or tndb.dat
+                                  #   in a build with the `tndb-b` feature, which moves an
+                                  #   MDBX database onto tndb-b at its first start and leaves
+                                  #   the marker mdbx-migrated (the copy is built in
+                                  #   tndb-migrating/, gone once the migration is done)
+  static_files/                   # execution layer static files (block data)
   consensus-db/                   # consensus protocol database
     tndb/                         #   consensus DB (tndb): one log per environment
       epoch/                      #     certificates, votes, payloads, last proposal
@@ -377,6 +381,13 @@ Complete tree after the node has run:
       mdbx-migrated               #     marker: the one-time copy from MDBX is done
     epochs/                       #   per-epoch consensus packs, epoch records, certificate packs
 ```
+
+`telcoin-network db stats` prints the static files and each table of the execution database:
+rows, pages and size. The default build reads while the node runs. A build with the `tndb-b`
+feature needs the node stopped: it refuses while a node holds the datadir, and holds the datadir
+while it runs, so a node started meanwhile is refused until the report finishes. It never runs the
+MDBX to tndb-b migration: an MDBX database not yet migrated is refused until the node has started
+once.
 
 ## RPC configuration
 

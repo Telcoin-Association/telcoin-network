@@ -55,6 +55,14 @@ help:
 	@echo "    :::> Build the adiri e2e node binary and run the governance-Safe fork across a live boundary." ;
 	@echo "    :::> The only lane where TN_GOVERNANCE_SAFE_FORK_EPOCH is not inert." ;
 	@echo ;
+	@echo "make test-e2e-tndb" ;
+	@echo "    :::> Build the e2e node binary with its reth database on tndb-b and run the restart, epoch and sigkill suites on it," ;
+	@echo "    :::> then test-e2e-reth-migration. test-restarts-tndb, test-epochs-tndb and test-sigkill-tndb run one suite each." ;
+	@echo ;
+	@echo "make test-e2e-reth-migration" ;
+	@echo "    :::> Build the default (MDBX) and tndb-b e2e node binaries; start a committee on MDBX and restart each validator on tndb-b." ;
+	@echo "    :::> Each must migrate its reth database and follow the chain. TN_BIN_PATH_PREV = MDBX binary, TN_BIN_PATH = tndb-b binary." ;
+	@echo ;
 	@echo "make build-e2e-bin-prev" ;
 	@echo "    :::> Build the e2e node binary at TN_PREV_REF (default ba7654d8a) for the mixed-binary (rolling upgrade) e2e tests." ;
 	@echo "    :::> Export the path it prints as TN_BIN_PATH_PREV; the tests that need it skip without it." ;
@@ -181,6 +189,24 @@ build-e2e-bin-adiri:
 # Location of the binary built by build-e2e-bin-adiri. Same expression pairing as E2E_BIN above,
 # so the producing and the consuming path cannot diverge.
 E2E_BIN_ADIRI := $(E2E_TARGET_ROOT_ADIRI)/e2e/telcoin-network
+
+# Target root for the TNDB e2e node binary: the one whose reth execution database runs on tndb-b
+# instead of MDBX. Nested in E2E_TARGET_ROOT, and separate from it, for the same reasons as
+# E2E_TARGET_ROOT_ADIRI: `tndb-b` changes tn-reth and everything built on it, so a shared root
+# would rebuild on every switch between lanes and leave `target/e2e/telcoin-network` running
+# whichever backend built last, with no way for a lane consuming TN_BIN_PATH to tell.
+E2E_TARGET_ROOT_TNDB := $(E2E_TARGET_ROOT)/tndb-e2e
+
+# Build the node binary WITH `tndb-b`. Like build-e2e-bin it builds without `adiri`, so the fork
+# variables below mean on the tndb lanes what they mean on test-restarts, test-epochs and
+# test-sigkill.
+.PHONY: build-e2e-bin-tndb
+build-e2e-bin-tndb:
+	cargo build --profile e2e --bin telcoin-network --features tn-storage/test-utils,telcoin-network/tndb-b --target-dir "$(E2E_TARGET_ROOT_TNDB)" ;
+
+# Location of the binary built by build-e2e-bin-tndb. Same expression pairing as E2E_BIN above,
+# so the producing and the consuming path cannot diverge.
+E2E_BIN_TNDB := $(E2E_TARGET_ROOT_TNDB)/e2e/telcoin-network
 
 # The commit the mixed-binary (rolling upgrade) e2e tests run as the PREVIOUS node version: the old
 # half of an in-place upgrade, or a validator still on the old binary when the rest of the network
@@ -381,6 +407,37 @@ test-e2e-forked:
 # other lane must not use.
 test-e2e-governance-safe: build-e2e-bin-adiri
 	TN_BIN_PATH="$(E2E_BIN_ADIRI)" TN_E2E_ADIRI_BIN=1 TN_SEED_SIGNATURE_FORK_EPOCH=$(TN_SEED_SIGNATURE_FORK_EPOCH) TN_MULTI_WORKERS_FORK_EPOCH=$(TN_MULTI_WORKERS_FORK_EPOCH) TN_PREVRANDAO_FORK_EPOCH=$(TN_PREVRANDAO_FORK_EPOCH) TN_LEADER_SEEDED_ORDERING_FORK_EPOCH=$(TN_LEADER_SEEDED_ORDERING_FORK_EPOCH) TN_SUBSECOND_TIMESTAMP_FORK_EPOCH=$(TN_SUBSECOND_TIMESTAMP_FORK_EPOCH) TN_GOVERNANCE_SAFE_FORK_EPOCH=$(TN_E2E_GOVERNANCE_SAFE_FORK_EPOCH) cargo nextest run -p e2e-tests --test it --run-ignored all test_governance_safe_fork ;
+
+# run the restart, epoch and sigkill suites on the tndb node binary: the spawned nodes keep their
+# reth execution database on tndb-b, so these are the crash and restart cycles for that engine.
+# Each suite has its own target (the same command line as test-restarts, test-epochs and
+# test-sigkill, with TN_BIN_PATH from E2E_BIN_TNDB) so one can be rerun alone; test-e2e-tndb runs
+# all three in order, then test-e2e-reth-migration (below: how an MDBX node moves onto tndb-b),
+# and stops at the first that fails. The test binaries themselves build without `tndb-b`: they
+# drive the node processes and never open a spawned node's reth database.
+.PHONY: test-e2e-tndb test-restarts-tndb test-epochs-tndb test-sigkill-tndb
+test-e2e-tndb: test-restarts-tndb test-epochs-tndb test-sigkill-tndb test-e2e-reth-migration
+
+test-restarts-tndb: build-e2e-bin-tndb
+	TN_BIN_PATH="$(E2E_BIN_TNDB)" TN_SEED_SIGNATURE_FORK_EPOCH=$(TN_SEED_SIGNATURE_FORK_EPOCH) TN_MULTI_WORKERS_FORK_EPOCH=$(TN_MULTI_WORKERS_FORK_EPOCH) TN_PREVRANDAO_FORK_EPOCH=$(TN_PREVRANDAO_FORK_EPOCH) TN_LEADER_SEEDED_ORDERING_FORK_EPOCH=$(TN_LEADER_SEEDED_ORDERING_FORK_EPOCH) TN_SUBSECOND_TIMESTAMP_FORK_EPOCH=$(TN_SUBSECOND_TIMESTAMP_FORK_EPOCH) TN_GOVERNANCE_SAFE_FORK_EPOCH=$(TN_GOVERNANCE_SAFE_FORK_EPOCH) cargo nextest run --run-ignored all test_restarts ;
+
+test-epochs-tndb: build-e2e-bin-tndb
+	TN_BIN_PATH="$(E2E_BIN_TNDB)" TN_SEED_SIGNATURE_FORK_EPOCH=$(TN_SEED_SIGNATURE_FORK_EPOCH) TN_MULTI_WORKERS_FORK_EPOCH=$(TN_MULTI_WORKERS_FORK_EPOCH) TN_PREVRANDAO_FORK_EPOCH=$(TN_PREVRANDAO_FORK_EPOCH) TN_LEADER_SEEDED_ORDERING_FORK_EPOCH=$(TN_LEADER_SEEDED_ORDERING_FORK_EPOCH) TN_SUBSECOND_TIMESTAMP_FORK_EPOCH=$(TN_SUBSECOND_TIMESTAMP_FORK_EPOCH) TN_GOVERNANCE_SAFE_FORK_EPOCH=$(TN_GOVERNANCE_SAFE_FORK_EPOCH) cargo nextest run -p e2e-tests --test it --run-ignored all test_epoch ;
+
+test-sigkill-tndb: build-e2e-bin-tndb
+	TN_BIN_PATH="$(E2E_BIN_TNDB)" TN_SEED_SIGNATURE_FORK_EPOCH=$(TN_SEED_SIGNATURE_FORK_EPOCH) TN_MULTI_WORKERS_FORK_EPOCH=$(TN_MULTI_WORKERS_FORK_EPOCH) TN_PREVRANDAO_FORK_EPOCH=$(TN_PREVRANDAO_FORK_EPOCH) TN_LEADER_SEEDED_ORDERING_FORK_EPOCH=$(TN_LEADER_SEEDED_ORDERING_FORK_EPOCH) TN_SUBSECOND_TIMESTAMP_FORK_EPOCH=$(TN_SUBSECOND_TIMESTAMP_FORK_EPOCH) TN_GOVERNANCE_SAFE_FORK_EPOCH=$(TN_GOVERNANCE_SAFE_FORK_EPOCH) cargo nextest run --profile sigkill --locked -p e2e-tests --test it --run-ignored all -E '$(SIGKILL_FILTER)' ;
+
+# run the MDBX to tndb-b reth database migration on live validators
+# (crates/e2e-tests/tests/it/reth_db_migration.rs): the committee starts on the default e2e binary,
+# then each validator in turn restarts on the tndb e2e binary and must migrate its reth database
+# and follow the chain. Both binaries are built from this tree, in these roles:
+#   TN_BIN_PATH_PREV = E2E_BIN       the default build, reth database on MDBX (what a node runs now)
+#   TN_BIN_PATH      = E2E_BIN_TNDB  the tndb-b build (what the node is upgraded to)
+# TN_E2E_TNDB_BIN=1 is the marker the test reads to tell this lane from `make test-e2e`, which
+# selects every #[ignore] test with TN_BIN_PATH at the default binary; without it the test skips.
+.PHONY: test-e2e-reth-migration
+test-e2e-reth-migration: build-e2e-bin build-e2e-bin-tndb
+	TN_BIN_PATH="$(E2E_BIN_TNDB)" TN_BIN_PATH_PREV="$(E2E_BIN)" TN_E2E_TNDB_BIN=1 TN_SEED_SIGNATURE_FORK_EPOCH=$(TN_SEED_SIGNATURE_FORK_EPOCH) TN_MULTI_WORKERS_FORK_EPOCH=$(TN_MULTI_WORKERS_FORK_EPOCH) TN_PREVRANDAO_FORK_EPOCH=$(TN_PREVRANDAO_FORK_EPOCH) TN_LEADER_SEEDED_ORDERING_FORK_EPOCH=$(TN_LEADER_SEEDED_ORDERING_FORK_EPOCH) TN_SUBSECOND_TIMESTAMP_FORK_EPOCH=$(TN_SUBSECOND_TIMESTAMP_FORK_EPOCH) TN_GOVERNANCE_SAFE_FORK_EPOCH=$(TN_GOVERNANCE_SAFE_FORK_EPOCH) cargo nextest run -p e2e-tests --test it --run-ignored all reth_db_migration:: ;
 
 # run tests with coverage (using llvm-cov + nextest)
 coverage:

@@ -79,7 +79,7 @@ fi
 # Refuse to attest content that is behind main.
 #
 # This matters more, not less, now that main uses a merge queue. The queue re-runs fmt,
-# clippy and the two test lanes against `main + PR`, so a stale branch is caught there for
+# clippy and the three test lanes against `main + PR`, so a stale branch is caught there for
 # everything CI can afford to run. What the queue can NOT re-run is the e2e suite below --
 # it is the reason this script exists, and it only ever executes here, against whatever
 # this branch happens to be based on. Attesting a branch that is behind main therefore
@@ -113,7 +113,7 @@ fi
 # check the attested run had never made.
 ./etc/rocksdb-gate.sh
 
-# fmt, clippy and both unit-test lanes. These live in etc/ci-lanes.sh because
+# fmt, clippy and the three unit-test lanes. These live in etc/ci-lanes.sh because
 # .github/workflows/pr.yaml runs the very same file, on `pull_request` and again on
 # `merge_group` against main + this PR. One definition, so the queue cannot end up
 # enforcing something narrower than what gets attested here.
@@ -121,6 +121,7 @@ fi
 ./etc/ci-lanes.sh clippy
 ./etc/ci-lanes.sh test-default
 ./etc/ci-lanes.sh test-adiri
+./etc/ci-lanes.sh test-tndb
 
 # The e2e suites: the part CI does not run, and the reason this script attests anything at
 # all. They are split into two invocations to avoid any port/node confusion.
@@ -176,5 +177,5 @@ echo
 echo "This attestation satisfies the 'verify-on-chain' lane on the pull request. Attesting"
 echo "changes nothing on GitHub, so re-run that lane on this sha yourself: request a review"
 echo "on the PR, or re-run the failed job. Do not push -- a new sha needs a new attestation."
-echo "When the PR is queued, the merge queue re-runs fmt, clippy and both test lanes against"
+echo "When the PR is queued, the merge queue re-runs fmt, clippy and the three test lanes against"
 echo "main + this PR; expect that second run and do not force-push while it is queued."

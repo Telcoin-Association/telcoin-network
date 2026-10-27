@@ -14,6 +14,7 @@ mod genesis_tests;
 mod governance_safe_fork;
 mod metrics;
 mod restarts;
+mod reth_db_migration;
 mod rpc_namespaces;
 #[cfg(unix)]
 mod sigkill;

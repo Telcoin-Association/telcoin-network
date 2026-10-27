@@ -24,6 +24,9 @@ adiri = ["telcoin-network-cli/adiri", "tn-node/adiri"]
 # is MDBX-only today, so the node uses reth's zero-size `RocksDBProvider` stub and skips
 # compiling the RocksDB C++ engine. Must be enabled before any storage-v2 experimentation.
 rocksdb = ["telcoin-network-cli/rocksdb", "tn-node/rocksdb"]
+# Run the reth execution database on the tndb-b engine instead of MDBX. Off by default.
+# MDBX stays compiled either way. See crates/tn-reth/README.md, "Database backend".
+tndb-b = ["telcoin-network-cli/tndb-b", "tn-node/tndb-b"]
 
 # Faucet build (devnet). Propagates `faucet` down to `tn-reth`, the only crate with faucet-gated
 # code (the unrestricted `mint` precompile used by faucets). Enabled for the `docker-devnet` image

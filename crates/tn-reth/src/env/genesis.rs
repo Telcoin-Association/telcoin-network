@@ -57,13 +57,13 @@ use std::{path::Path, sync::Arc};
 
 use alloy::{hex, sol_types::SolConstructor as _};
 use eyre::OptionExt as _;
-use reth::{
-    args::{DatabaseArgs, DatadirArgs, RpcServerArgs},
-    dirs::MaybePlatformPath,
-};
 use reth_chainspec::ChainSpec as RethChainSpec;
 use reth_evm::{ConfigureEvm as _, Evm as _, EvmFactory as _};
 use reth_node_builder::NodeConfig;
+use reth_node_core::{
+    args::{DatadirArgs, RpcServerArgs},
+    dirs::MaybePlatformPath,
+};
 use reth_revm::{
     cached::CachedReads,
     context::result::{ExecutionResult, ResultAndState},
@@ -82,6 +82,7 @@ use tn_types::{
 };
 use tracing::debug;
 
+use super::database;
 use crate::{
     init_reth_defaults,
     system_calls::{
@@ -137,16 +138,6 @@ impl RethEnv {
         rewards: Option<GasAccumulator>,
         rpc: RpcServerArgs,
     ) -> eyre::Result<Self> {
-        /// MDBX map-size ceiling for throwaway temp-chain envs. reth defaults to 8 TB per
-        /// environment; `cargo test` runs a test binary as threads in ONE process, so N
-        /// concurrent 8 TB virtual reservations exhaust the address space and MDBX aborts
-        /// env-open with ENOMEM ("Cannot allocate memory (12)"). A temp chain never holds a
-        /// full node's history, so a small ceiling is safe and lets many envs coexist.
-        const TEMP_CHAIN_DB_MAX_SIZE: usize = 2 * 1024 * 1024 * 1024; // 2 GiB
-        /// Grow the temp DB file in small increments so throwaway DBs stay tiny on disk
-        /// (reth pairs its 8 TB default with a 4 GiB step; mirror reth's `test()` 4 MiB step).
-        const TEMP_CHAIN_DB_GROWTH_STEP: usize = 4 * 1024 * 1024; // 4 MiB
-
         // `NodeConfig::default` reads reth's process-wide pool and RPC-server defaults through
         // the args types' `Default` impls, which lock them. Seed first so a temp chain built
         // before any command is parsed does not fix reth's own values (per-sender slots 16,
@@ -163,12 +154,8 @@ impl RethEnv {
                 pprof_dumps_path: None,
             },
             chain,
-            // Bound the MDBX geometry for throwaway temp chains (see const docs).
-            db: DatabaseArgs {
-                max_size: Some(TEMP_CHAIN_DB_MAX_SIZE),
-                growth_step: Some(TEMP_CHAIN_DB_GROWTH_STEP),
-                ..Default::default()
-            },
+            // Bound the database's address space for throwaway temp chains.
+            db: database::temp_chain_db_args(),
             // Injected as given: `new_for_temp_chain` passes `ipcdisable: true` (issue #1165).
             rpc,
             ..NodeConfig::default()

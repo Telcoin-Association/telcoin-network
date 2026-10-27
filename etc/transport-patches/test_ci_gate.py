@@ -18,7 +18,7 @@ def gate_script():
 
 def execute(event, run_lanes, transport, script=None, connection_limits="success", pins="success",
             quinn_proto="success"):
-    lanes = ("adiri-test", "archive-mode-gate", "clippy", "fmt", "test")
+    lanes = ("adiri-test", "archive-mode-gate", "clippy", "fmt", "test", "tndb-test")
     results = {name: {"result": "success" if run_lanes else "skipped"} for name in lanes}
     results.update({"ci-scope": {"result": "success", "outputs": {"run_lanes": str(run_lanes).lower()}},
                     "attest": {"result": "success" if event == "pull_request" else "skipped"},

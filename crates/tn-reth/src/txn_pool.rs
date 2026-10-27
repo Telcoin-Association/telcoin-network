@@ -33,10 +33,6 @@ use crate::metrics::{
 };
 use alloy::primitives::{keccak256, map::AddressSet, B256};
 use futures::{future::OptionFuture, stream, Stream, StreamExt as _};
-use reth::transaction_pool::{
-    blobstore::DiskFileBlobStore, BlockInfo as RethBlockInfo, EthTransactionPool,
-    TransactionValidationTaskExecutor,
-};
 use reth_chainspec::ChainSpec;
 use reth_node_builder::{NodeConfig, RethTransactionPoolConfig};
 use reth_primitives_traits::SignerRecoverable;
@@ -47,13 +43,15 @@ use reth_provider::{
 };
 use reth_rpc_eth_types::utils::recover_raw_transaction as reth_recover_raw_transaction;
 use reth_transaction_pool::{
+    blobstore::DiskFileBlobStore,
     error::{
         Eip4844PoolTransactionError, Eip7702PoolTransactionError, InvalidPoolTransactionError,
         PoolError, PoolTransactionError,
     },
-    AddedTransactionOutcome, BestTransactions, CanonicalStateUpdate, EthPooledTransaction,
-    PoolSize, PoolTransaction, PoolUpdateKind, TransactionEvents, TransactionOrigin,
-    TransactionPool as _, TransactionPoolExt as _, ValidPoolTransaction,
+    AddedTransactionOutcome, BestTransactions, BlockInfo as RethBlockInfo, CanonicalStateUpdate,
+    EthPooledTransaction, EthTransactionPool, PoolSize, PoolTransaction, PoolUpdateKind,
+    TransactionEvents, TransactionOrigin, TransactionPool as _, TransactionPoolExt as _,
+    TransactionValidationTaskExecutor, ValidPoolTransaction,
 };
 use std::{
     collections::{BTreeMap, HashMap},
@@ -1912,7 +1910,8 @@ mod tests {
         let task_manager = TaskManager::default();
         let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
         // 1,000 wei cap: a 21,000-gas transfer at 7 wei/gas costs at most 147,000 wei.
-        let rpc_args = reth::args::RpcServerArgs { rpc_tx_fee_cap: 1_000, ..Default::default() };
+        let rpc_args =
+            reth_node_core::args::RpcServerArgs { rpc_tx_fee_cap: 1_000, ..Default::default() };
         let reth_env = RethEnv::new_for_temp_chain_with_rpc_args(
             chain.clone(),
             tmp_dir.path(),

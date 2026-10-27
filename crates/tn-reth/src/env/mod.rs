@@ -24,7 +24,6 @@ use std::{
 };
 
 use reth_chainspec::ChainSpec as RethChainSpec;
-use reth_db::{init_db, DatabaseEnv};
 use reth_db_common::init::init_genesis;
 use reth_node_builder::NodeConfig;
 use reth_provider::{
@@ -44,11 +43,14 @@ use crate::{
     WorkerTxPool, BASEFEE_ADDRESS,
 };
 
+pub(crate) mod database;
 mod epoch;
 mod execution;
 mod genesis;
 mod helpers;
 mod output_overlay;
+#[cfg(test)]
+mod persist_bench;
 mod rpc;
 
 pub use output_overlay::OutputTrieOverlay;
@@ -211,15 +213,16 @@ impl RethEnv {
     /// Create a new Reth DB.
     /// Break this out so this can be created upfront and used even on a
     /// restart (when catching up for instance).
+    ///
+    /// Opens on this build's engine, MDBX or tndb-b, and refuses a directory holding the other
+    /// engine's database (`database::open_rw`).
     pub fn new_database<P: AsRef<Path>>(
         reth_config: &RethConfig,
         db_path: P,
     ) -> eyre::Result<RethDb> {
         let db_path = db_path.as_ref();
         info!(target: "tn::reth", path = ?db_path, "opening database");
-        // with_metrics: record per-operation db latency metrics (noop unless the global
-        // metrics recorder is installed, i.e. the node runs with `--metrics`)
-        Ok(Arc::new(init_db(db_path, reth_config.0.db.database_args())?.with_metrics()))
+        database::open_rw(reth_config, db_path)
     }
 
     /// Absolute path of the restored-state floor marker inside `node_config`'s datadir root.
@@ -329,7 +332,7 @@ impl RethEnv {
     /// Initialize the provider factory and related components
     fn init_provider_factory(
         node_config: &NodeConfig<RethChainSpec>,
-        database: Arc<DatabaseEnv>,
+        database: RethDb,
     ) -> eyre::Result<ProviderFactory<TelcoinNode>> {
         // Initialize provider factory with static files
         let datadir = node_config.datadir();

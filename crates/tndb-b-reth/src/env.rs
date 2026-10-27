@@ -24,7 +24,7 @@ use std::{
     },
     time::{Duration, Instant},
 };
-use tndb_b::{Env, EnvOptions, ReadTxn, SyncMode, Table};
+use tndb_b::{CheckReport, Env, EnvOptions, ReadTxn, SyncMode, Table};
 
 /// The name of the page file inside the environment's directory.
 pub const DATA_FILE: &str = "tndb.dat";
@@ -253,6 +253,29 @@ pub(crate) fn resolve<'m, T: RethTable>(
     }
 }
 
+/// The figures of one of reth's tables in a committed state ([`TndbEnv::table_stats`]), as MDBX's
+/// `db_stat` reports them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RethTableStat {
+    /// The table's name ([`Tables::name`]).
+    pub name: &'static str,
+    /// Its rows: MDBX's count of key/value pairs (each value of a dup-sort table is one).
+    pub entries: u64,
+    /// The branch pages of its tree: every level above the leaves.
+    pub branch_pages: u64,
+    /// The leaf pages of its tree.
+    pub leaf_pages: u64,
+    /// The pages of the overflow runs holding its values too large for a leaf.
+    pub overflow_pages: u64,
+}
+
+impl RethTableStat {
+    /// Every page the table holds: its branch, leaf and overflow pages.
+    pub const fn pages(&self) -> u64 {
+        self.branch_pages + self.leaf_pages + self.overflow_pages
+    }
+}
+
 /// reth's database on tndb-b: one page file, `<dir>/tndb.dat` ([`DATA_FILE`]), and a map from
 /// each table's name to its engine handle. It implements reth's [`Database`] (transactions
 /// [`TndbTx`] and [`TndbTxMut`]) and [`DatabaseMetrics`].
@@ -338,27 +361,70 @@ impl TndbEnv {
         self.env.failure()
     }
 
-    /// The figures of each of reth's [`Tables`] in the newest committed state, as metrics.
+    /// The file's page size, fixed when it was created.
+    pub fn page_size(&self) -> u32 {
+        self.env.stat().page_size
+    }
+
+    /// Make every commit durable: the engine's `Env::sync`. A [`SyncMode::NoSync`] commit is
+    /// durable only at the next sync (or when the environment drops, which syncs unless it
+    /// latched). A no-op when nothing is pending, in [`SyncMode::Durable`] and in a read-only
+    /// environment. Waits while a write transaction is open. A failure is
+    /// [`DatabaseError::Commit`] and latches the environment: later writes and commits fail
+    /// until it is reopened.
+    pub fn sync(&self) -> Result<(), DatabaseError> {
+        self.env.sync().map_err(|e| DatabaseError::Commit(error::info(&e)))
+    }
+
+    /// Check the newest committed state in full: the engine's `Env::check` (every page of every
+    /// tree, every overflow run with its full CRC, each table's entry and page counts, and the
+    /// exact accounting of the file's pages). It reads through a snapshot, beside readers and the
+    /// writer. Damage is [`DatabaseError::Read`] with `MDBX_CORRUPTED` and latches the
+    /// environment; the detail is in [`Self::failure`].
+    pub fn check(&self) -> Result<CheckReport, DatabaseError> {
+        self.env.check().map_err(error::read)
+    }
+
+    /// The figures of each of reth's [`Tables`] in the newest committed state, in the order of
+    /// [`Tables::ALL`]. A table the file lacks is skipped (MDBX's `db_stat` cannot open it).
+    ///
+    /// Starting the read is [`DatabaseError::InitTx`], opening a table the table map lacks
+    /// [`DatabaseError::Open`], and reading a table's figures [`DatabaseError::Stats`].
+    pub fn table_stats(&self) -> Result<Vec<RethTableStat>, DatabaseError> {
+        let txn = self.env.begin_ro().map_err(|e| DatabaseError::InitTx(error::info(&e)))?;
+        let stats_error = |e: tndb_b::Error| DatabaseError::Stats(error::info(&e));
+        let mut stats = Vec::with_capacity(Tables::ALL.len());
+        for name in Tables::ALL.iter().map(Tables::name) {
+            let stat = match self.tables.get(name) {
+                Some(entry) => txn.table_stat(&entry.table).map_err(stats_error)?,
+                None => match txn.open_table(name) {
+                    Ok(Some(table)) => txn.table_stat(&table).map_err(stats_error)?,
+                    Ok(None) => continue,
+                    Err(e) => return Err(DatabaseError::Open(error::info(&e))),
+                },
+            };
+            stats.push(RethTableStat {
+                name,
+                entries: stat.entries,
+                branch_pages: u64::from(stat.branch_pages),
+                leaf_pages: u64::from(stat.leaf_pages),
+                overflow_pages: u64::from(stat.overflow_pages),
+            });
+        }
+        Ok(stats)
+    }
+
+    /// The figures of each of reth's [`Tables`] ([`Self::table_stats`]), as metrics. MDBX's
+    /// metrics stop at a table they cannot open; these skip it.
     fn table_metrics(
         &self,
         metrics: &mut Vec<(&'static str, f64, Vec<Label>)>,
-    ) -> tndb_b::Result<()> {
-        let txn = self.env.begin_ro()?;
-        let page_size = f64::from(self.env.stat().page_size);
-        for name in Tables::ALL.iter().map(Tables::name) {
-            let stat = match self.tables.get(name) {
-                Some(entry) => txn.table_stat(&entry.table)?,
-                None => match txn.open_table(name)? {
-                    Some(table) => txn.table_stat(&table)?,
-                    // MDBX's metrics stop at a table they cannot open; these skip it.
-                    None => continue,
-                },
-            };
-            let (leaf, branch, overflow) = (
-                f64::from(stat.leaf_pages),
-                f64::from(stat.branch_pages),
-                f64::from(stat.overflow_pages),
-            );
+    ) -> Result<(), DatabaseError> {
+        let page_size = f64::from(self.page_size());
+        for stat in self.table_stats()? {
+            let name = stat.name;
+            let (leaf, branch, overflow) =
+                (stat.leaf_pages as f64, stat.branch_pages as f64, stat.overflow_pages as f64);
             let table = || Label::new("table", name);
             metrics.push(("db.table_size", page_size * (leaf + branch + overflow), vec![table()]));
             metrics.push(("db.table_pages", leaf, vec![table(), Label::new("type", "leaf")]));
@@ -406,7 +472,7 @@ impl DatabaseMetrics for TndbEnv {
             Ok(pages) => metrics.push(("db.freelist", pages as f64, vec![])),
             Err(error) => tracing::error!(%error, "Failed to read db.freelist"),
         }
-        metrics.push(("db.page_size", f64::from(self.env.stat().page_size), vec![]));
+        metrics.push(("db.page_size", f64::from(self.page_size()), vec![]));
         metrics.push(("db.timed_out_not_aborted_transactions", 0.0, vec![]));
         metrics
     }

@@ -83,3 +83,5 @@ test-utils = ["tn-config/test-utils"]
 adiri = ["tn-node/adiri", "tn-reth/adiri", "tn-storage/adiri", "tn-types/adiri"]
 # Opt back in to reth's RocksDB storage backend: propagate to the node graph.
 rocksdb = ["tn-node/rocksdb", "tn-reth/rocksdb"]
+# Run the reth execution database on tndb-b: propagate to the node graph.
+tndb-b = ["tn-node/tndb-b", "tn-reth/tndb-b"]

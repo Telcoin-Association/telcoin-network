@@ -20,7 +20,7 @@ use alloy::{
 };
 use async_trait::async_trait;
 use jsonrpsee::{core::RpcResult, proc_macros::rpc};
-use reth::rpc::api::DebugApiServer;
+use reth_rpc_api::DebugApiServer;
 use tn_types::gas_accumulator::WorkerBaseFee;
 
 /// The debug methods that simulate new calls on a selected state.

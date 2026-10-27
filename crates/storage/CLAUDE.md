@@ -49,7 +49,7 @@ and remember that everything after `mod test` is tests (more than half of `conse
 | `pack_validate.rs` | read-only pack validation (`db validate`) |
 | `epoch_db_recovery.rs` | the startup check, on every `open_db`, that the epoch tables' headers decode with this binary: drops a seconds-only fork-epoch `LastProposed`, refuses any other undecodable row (#1572) |
 | `tndb/` | the shared-log `Database` (see its README): `store.rs` (log + indexes, the one write lock), `commit.rs` (the commit thread), `database.rs` (`TnDatabase`), `split.rs` (`SplitDatabase`, one log per environment), `compact.rs`, `record.rs`, `layout.rs`, `manifest.rs`, `metrics.rs`, `inspect.rs`, `test.rs` |
-| `lib.rs` | the tables (`mod tables`), `DatabaseType = tndb::SplitDatabase`, `open_db`, the MDBX → tndb migration (`migrate_from_mdbx`) |
+| `lib.rs` | the tables (`mod tables`), `DatabaseType = tndb::SplitDatabase`, `open_db`, the MDBX → tndb migration (`migrate_from_mdbx`), `disk` (the sync helpers `fsync_file`/`fsync_directory` and `tndb`'s `available_bytes`, re-exported for other crates: `tn-reth`'s migration) |
 | `stores/` | typed stores over `Database` (certificates, payload, proposer, votes) |
 | `mdbx/` (`database.rs`, `layered_db.rs`, `composite_db.rs`), `mem_db.rs` | the previous backend and its layers, behind `reth-libmdbx`, kept only as the migration source and for tests and benches (they go with MDBX); `MemDatabase` is the test backend |
 | `*_bench.rs`, `archive/index_bench.rs` | `#[ignore]`d benches (README "Benchmarks") |

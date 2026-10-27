@@ -47,6 +47,16 @@ mod workload_bench;
 
 pub mod tndb;
 
+/// File-system helpers this crate shares with others (the reth database's migration in
+/// `tn-reth`), so none copies them: a plain `fsync` of a file or of a directory's entries (never
+/// `F_FULLFSYNC` on macOS), and the bytes free to this process on a filesystem (`statvfs`).
+pub mod disk {
+    pub use crate::{
+        archive::data_file::{fsync_directory, fsync_file},
+        tndb::layout::available_bytes,
+    };
+}
+
 pub use tn_types::error::StoreError;
 
 #[cfg(all(test, feature = "reth-libmdbx"))]

@@ -5,10 +5,7 @@
 //! deprecates one of these types, only this file has to change — callers keep compiling against
 //! the alias.
 
-use std::sync::Arc;
-
-use reth::rpc::builder::TransportRpcModules;
-use reth_db::DatabaseEnv;
+use reth_rpc_builder::TransportRpcModules;
 use reth_transaction_pool::{
     identifier::TransactionId, EthPooledTransaction, ValidPoolTransaction,
 };
@@ -23,10 +20,9 @@ pub type RpcServer = TransportRpcModules<()>;
 /// This type is a SealedBlock with a list of senders that match the transactions in the block.
 pub type BlockWithSenders = RecoveredBlock<reth_ethereum_primitives::Block>;
 
-/// Type wrapper for a Reth DB.
-/// Used primary as a opaque type to allow
-/// the node launcher to create the DB upfront and reuse.
-pub type RethDb = Arc<DatabaseEnv>;
+/// The reth database (`RethDb`, an `Arc` of `RethDbEnv`): MDBX by default, tndb-b with the
+/// `tndb-b` feature.
+pub use crate::env::database::{RethDb, RethDbEnv};
 
 /// A pooled transaction id.
 pub type PoolTxnId = TransactionId;

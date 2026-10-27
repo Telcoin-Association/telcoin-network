@@ -811,6 +811,188 @@ fn metrics_report_every_table_as_mdbx_does() {
     assert_eq!(have[&("db.freelist".to_string(), vec![])], report.free_pages as f64);
 }
 
+/// `gauge_metrics` reports exactly the tables and figures of `table_stats`.
+fn assert_gauges_match_table_stats(db: &TndbEnv) {
+    let have = gauges(db);
+    let stats = db.table_stats().unwrap();
+    let label = |table: &str| vec![("table".to_string(), table.to_string())];
+    let gauge = |name: &str, labels: Vec<(String, String)>| have[&(name.to_string(), labels)];
+    let page_size = f64::from(db.page_size());
+    for stat in &stats {
+        let pages = |kind: &str| {
+            let mut labels = label(stat.name);
+            labels.push(("type".to_string(), kind.to_string()));
+            gauge("db.table_pages", labels)
+        };
+        assert_eq!(gauge("db.table_entries", label(stat.name)), stat.entries as f64);
+        assert_eq!(pages("leaf"), stat.leaf_pages as f64, "{}", stat.name);
+        assert_eq!(pages("branch"), stat.branch_pages as f64, "{}", stat.name);
+        assert_eq!(pages("overflow"), stat.overflow_pages as f64, "{}", stat.name);
+        let size = gauge("db.table_size", label(stat.name));
+        assert_eq!(size, page_size * stat.pages() as f64, "{}", stat.name);
+    }
+    let gauged: BTreeSet<String> = have
+        .keys()
+        .filter(|(name, _)| name == "db.table_entries")
+        .map(|(_, labels)| labels[0].1.clone())
+        .collect();
+    assert_eq!(gauged, stats.iter().map(|s| s.name.to_string()).collect::<BTreeSet<_>>());
+}
+
+#[test]
+fn table_stats_report_each_tables_rows_and_pages() {
+    use tndb_b::ReadTxn;
+    let (_dir, db) = create_test_db(TndbEnvKind::RW);
+    metrics_writes(&db);
+    // A dup-sort table: two keys, five values.
+    db.update(|tx| {
+        for (a, slots) in [(1u8, 3u8), (2, 2)] {
+            for slot in 0..slots {
+                let entry =
+                    StorageEntry { key: B256::with_last_byte(slot), value: U256::from(slot + 1) };
+                tx.put::<PlainStorageState>(Address::with_last_byte(a), entry)?;
+            }
+        }
+        Ok::<_, DatabaseError>(())
+    })
+    .unwrap()
+    .unwrap();
+    let stats = db.table_stats().unwrap();
+
+    // Every one of reth's tables, in `Tables::ALL`'s order.
+    let names: Vec<_> = stats.iter().map(|s| s.name).collect();
+    assert_eq!(names, Tables::ALL.iter().map(Tables::name).collect::<Vec<_>>());
+    let txn = db.env().begin_ro().unwrap();
+    for stat in &stats {
+        let table = txn.open_table(stat.name).unwrap().unwrap();
+        let s = txn.table_stat(&table).unwrap();
+        assert_eq!(stat.entries, s.entries, "{}", stat.name);
+        assert_eq!(stat.branch_pages, u64::from(s.branch_pages), "{}", stat.name);
+        assert_eq!(stat.leaf_pages, u64::from(s.leaf_pages), "{}", stat.name);
+        assert_eq!(stat.overflow_pages, u64::from(s.overflow_pages), "{}", stat.name);
+    }
+    let stat = |name: &str| *stats.iter().find(|s| s.name == name).unwrap();
+    for (table, entries) in [
+        (CanonicalHeaders::NAME, 500),
+        (PlainAccountState::NAME, 5),
+        (Bytecodes::NAME, 1),
+        (PlainStorageState::NAME, 5),
+        (Tables::Transactions.name(), 0),
+    ] {
+        assert_eq!(stat(table).entries, entries, "{table}");
+    }
+    assert!(stat(CanonicalHeaders::NAME).branch_pages > 0);
+    assert!(stat(Bytecodes::NAME).overflow_pages > 0);
+    assert!(stat(PlainStorageState::NAME).leaf_pages > 0);
+    // A table without rows holds no pages.
+    assert_eq!(stat(Tables::Transactions.name()).pages(), 0);
+    assert_eq!(db.page_size(), 4096);
+    assert_gauges_match_table_stats(&db);
+}
+
+#[test]
+fn table_stats_skip_a_table_the_file_lacks() {
+    use tndb_b::ReadTxn;
+    let dir = tempfile::TempDir::new().unwrap();
+    // No `create_tables`: the file has none of reth's tables.
+    let db = super::open_env(dir.path(), TndbEnvKind::RW, TndbArgs::default()).unwrap();
+    assert_eq!(db.table_stats().unwrap(), []);
+    assert_gauges_match_table_stats(&db);
+    // A table created after the open, which the table map lacks, is opened for its figures.
+    let mut txn = db.env().begin_rw().unwrap();
+    let table = txn.create_table(CanonicalHeaders::NAME).unwrap();
+    txn.put(&table, &[1], &[2]).unwrap();
+    txn.commit().unwrap();
+    let stats = db.table_stats().unwrap();
+    assert_eq!(stats.len(), 1);
+    assert_eq!(stats[0].name, CanonicalHeaders::NAME);
+    assert_eq!(stats[0].entries, 1);
+    assert_eq!((stats[0].leaf_pages, stats[0].branch_pages, stats[0].overflow_pages), (1, 0, 0));
+    let txn = db.env().begin_ro().unwrap();
+    assert!(txn.open_table(PlainAccountState::NAME).unwrap().is_none());
+    assert_gauges_match_table_stats(&db);
+}
+
+/// `sync` makes `NoSync` commits durable. A copy of the file is what a process crash leaves (the
+/// committed pages are in the page cache, but no meta names them until a sync), so each copy here
+/// holds the state of the last sync: before the first, not even the tables; after it, every commit
+/// up to it; a commit after it only once the next sync runs.
+#[test]
+fn sync_makes_no_sync_commits_durable() {
+    use std::path::Path;
+    use tndb_b::SyncMode;
+
+    /// The `CanonicalHeaders` rows of a copy of the file in `dir`, or `None` if it lacks the table.
+    fn durable_rows(dir: &Path) -> Option<usize> {
+        let copy = tempfile::TempDir::new().unwrap();
+        std::fs::copy(dir.join(crate::DATA_FILE), copy.path().join(crate::DATA_FILE)).unwrap();
+        let db = super::open_env(copy.path(), TndbEnvKind::RO, TndbArgs::default()).unwrap();
+        let tx = db.tx().unwrap();
+        tx.entries::<CanonicalHeaders>().ok()
+    }
+
+    let dir = tempfile::TempDir::new().unwrap();
+    let args = TndbArgs::default().with_sync_mode(SyncMode::NoSync);
+    let mut db = super::open_env(dir.path(), TndbEnvKind::RW, args).unwrap();
+    db.create_tables().unwrap();
+    let put = |n: u64| {
+        db.update(|tx| tx.put::<CanonicalHeaders>(n, B256::with_last_byte(n as u8)))
+            .unwrap()
+            .unwrap()
+    };
+    put(1);
+    assert_eq!(durable_rows(dir.path()), None, "no commit is durable before a sync");
+    db.sync().unwrap();
+    assert_eq!(durable_rows(dir.path()), Some(1), "every commit before the sync is durable");
+    put(2);
+    assert_eq!(durable_rows(dir.path()), Some(1), "a commit after the sync is not, yet");
+    db.sync().unwrap();
+    assert_eq!(durable_rows(dir.path()), Some(2), "until the next sync");
+    db.sync().unwrap();
+    assert_eq!(db.failure(), None, "a sync with nothing pending changes nothing");
+}
+
+/// `check` reports the newest committed state's tables. Damage it finds (here an overflow run's
+/// middle page changed on disk, which the open does not read) is `MDBX_CORRUPTED` as a read
+/// error, and latches the environment, with the detail in `failure`.
+#[test]
+fn check_reports_the_tables_and_damage_latches_the_environment() {
+    type Raw = RawTable<Bytecodes>;
+    const MARK: &[u8] = b"overflow middle page";
+    let mut value = vec![7u8; 20_000];
+    value[9000..9000 + MARK.len()].copy_from_slice(MARK);
+    let (dir, db) = create_test_db(TndbEnvKind::RW);
+    db.update(|tx| {
+        for n in 0..300u64 {
+            tx.put::<CanonicalHeaders>(n, B256::with_last_byte(n as u8))?;
+        }
+        tx.put::<Raw>(RawKey::new(B256::with_last_byte(1)), RawValue::from_vec(value))
+    })
+    .unwrap()
+    .unwrap();
+
+    let report = db.check().unwrap();
+    assert_eq!(report.tables[CanonicalHeaders::NAME].entries, 300);
+    let bytecodes = report.tables[Bytecodes::NAME];
+    assert_eq!(bytecodes.entries, 1);
+    assert!(bytecodes.pages >= 5, "the value's run counts as the table's: {bytecodes:?}");
+    assert_eq!(report.tables[Tables::Transactions.name()].entries, 0);
+    assert_eq!(db.failure(), None);
+    drop(db);
+
+    let path = dir.path().join(crate::DATA_FILE);
+    let mut file = std::fs::read(&path).unwrap();
+    let at = file.windows(MARK.len()).position(|w| w == MARK).expect("the value is on disk");
+    file[at] ^= 0xFF;
+    std::fs::write(&path, file).unwrap();
+
+    let db = super::open_env(dir.path(), TndbEnvKind::RW, TndbArgs::default()).unwrap();
+    let damage = db.check().unwrap_err();
+    assert_eq!(dbg(damage), dbg(DatabaseError::Read(Error::Corrupted.into())));
+    assert!(db.failure().is_some(), "the detail is in `failure`");
+    assert!(db.tx_mut().is_err(), "the environment latched");
+}
+
 /// The table map's hasher gives each of reth's tables its own hash, so a lookup is one probe.
 #[test]
 fn name_hasher_separates_reths_tables() {

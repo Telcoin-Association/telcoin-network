@@ -129,7 +129,7 @@ jobs:
 
   # The on-chain attestation gate: is this PR's head commit hash in the attestation
   # registry on adiri? A maintainer writes it there with `make attest`, after the full
-  # local suite (fmt, clippy, both test lanes, and the e2e suites CI cannot afford) has
+  # local suite (fmt, clippy, the three test lanes, and the e2e suites CI cannot afford) has
   # passed on exactly that commit.
   #
   # `pull_request` only, by design. The merge group's commit did not exist when any local
@@ -394,7 +394,7 @@ jobs:
           tool: cargo-nextest
 
       # Restore only (see the clippy job), from the same entry as `test`: cache-deps builds
-      # both test lanes into one target dir, where the adiri variants of the shared
+      # all three test lanes into one target dir, where the adiri variants of the shared
       # dependencies coexist with the default ones.
       - name: Cache dependencies
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
@@ -407,6 +407,44 @@ jobs:
         env:
           NEXTEST_PROFILE: ci
         run: ./etc/ci-lanes.sh test-adiri
+
+  # tndb feature lane: the default-feature test job above runs every reth database on MDBX,
+  # so it never runs reth on tndb-b. This lane reruns the workspace with tn-reth's `tndb-b`
+  # feature; the reason it is a whole-workspace run lives in etc/ci-lanes.sh. Same 45-minute
+  # ceiling as `test`, for the same reasons.
+  tndb-test:
+    needs: ci-scope
+    if: needs.ci-scope.outputs.run_lanes == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: true
+          fetch-depth: 1
+
+      - name: Install Rust toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
+        with:
+          tool: cargo-nextest
+
+      # Restore only (see the clippy job), from the same entry as `test`: cache-deps builds
+      # all three test lanes into one target dir, where the tndb-b variants of the shared
+      # dependencies coexist with the default ones.
+      - name: Cache dependencies
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          prefix-key: v1-rust
+          shared-key: test-cache
+          save-if: "false"
+
+      - name: Run tests on tndb-b
+        env:
+          NEXTEST_PROFILE: ci
+        run: ./etc/ci-lanes.sh test-tndb
 
   # Guard: pinned consensus-registry reads (committee membership, epoch records, epoch state,
   # worker fee configs) resolve historical state through `state_by_block_hash`, which reth fails
@@ -456,7 +494,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     if: always()
-    needs: [ci-scope, attest, fmt, clippy, test, adiri-test, archive-mode-gate, connection-limits-patch, quinn-proto-patch, transport-evidence, quic-profile-pins]
+    needs: [ci-scope, attest, fmt, clippy, test, adiri-test, tndb-test, archive-mode-gate, connection-limits-patch, quinn-proto-patch, transport-evidence, quic-profile-pins]
     steps:
       - name: Check all jobs passed
         env:
@@ -483,7 +521,7 @@ jobs:
           # The job list is asserted, not discovered: a job renamed or dropped from
           # `needs` would otherwise leave this check silently, or turn up as an unnamed
           # lane whose `skipped` the pull_request branch below accepts.
-          expected="adiri-test archive-mode-gate attest ci-scope clippy connection-limits-patch fmt quic-profile-pins quinn-proto-patch test transport-evidence"
+          expected="adiri-test archive-mode-gate attest ci-scope clippy connection-limits-patch fmt quic-profile-pins quinn-proto-patch test tndb-test transport-evidence"
           actual=$(jq -r 'keys | join(" ")' <<<"${RESULTS}")
           if [[ "${actual}" != "${expected}" ]]; then
             echo "::error::needs mismatch: expected [${expected}], got [${actual}]. Update 'expected' in this step together with 'needs'."

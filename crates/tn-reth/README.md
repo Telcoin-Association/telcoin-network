@@ -364,7 +364,7 @@ it so the beneficiary and base-fee accounts are never spuriously touched.
 
 ### Snapshot export / restore
 
-`src/snapshot.rs`. Export (`PinnedStateView`) streams plain state from a pinned read-only MDBX
+`src/snapshot.rs`. Export (`PinnedStateView`) streams plain state from a pinned read-only database
 transaction into a CRC32+zstd state pack; it records the caller-supplied state root **without
 recomputing it**. The restore side is the real integrity check (`SnapshotRestorer`):
 
@@ -385,6 +385,151 @@ recomputing it**. The restore side is the real integrity check (`SnapshotRestore
 
 What restore does *not* verify: the authenticity of the header window itself — that is the
 caller's trust decision (the window is validated upstream against consensus data).
+
+## Database backend
+
+TN's reth execution database lives in `<datadir>/db`. The default build runs it on MDBX
+(`reth_db::DatabaseEnv`, `db/mdbx.dat`). The `tndb-b` feature (forwarded by `tn-node`,
+`telcoin-network-cli` and `telcoin-network`) runs it on the tndb-b engine instead
+(`tndb_b_reth::TndbEnv`, `db/tndb.dat`). reth is not patched: it is generic over the database on
+every path TN uses, and MDBX stays compiled in both builds. Every backend difference lives in
+`src/env/database.rs`; other code names `RethDbEnv` and `RethDb` (`Arc<RethDbEnv>`).
+
+- **Open** (`open_rw`, called by `RethEnv::new_database`): the MDBX build opens through reth's
+  `init_db` with `with_metrics`. The tndb build maps the `--db.*` flags, writes or checks reth's
+  `database.version` file as reth's `create_db` does, opens `TndbEnv`, creates reth's tables and
+  records the client version in `VersionHistory` as reth's `record_client_version` does.
+- **Backend guard** (`check_backend`, both builds): the MDBX build refuses a `db/` holding
+  `tndb.dat`, and the tndb build migrates one holding `mdbx.dat` (below). Opening the wrong engine
+  would create an empty database beside the datadir's static files, and reth's
+  `check_consistency` would then prune the static files back to the empty database's tip. The
+  checks use `try_exists`, so a stat error fails the open. The MDBX build's error names the
+  directory and both engines; the operator runs the matching build or starts from a fresh datadir
+  (or `db load-state`).
+- **MDBX to tndb-b migration** (`src/env/database/migrate.rs`, tndb build): the first open of a
+  `db/` holding `mdbx.dat` moves it onto tndb-b ("Migrating from MDBX" below).
+- **`--db.*` flags on tndb-b** (`tndb_args`): `--db.max-size` is the mapping's address-space
+  reservation (unset: the engine's default, 1 GiB); past it the engine remaps at double the size,
+  so it is not a cap. `--db.page-size` sets a new file's page size (the engine accepts a power of
+  two in 4 KiB..=64 KiB). `--db.sync-mode durable` is durable commits. Refused at startup, naming
+  the flag: `--db.exclusive`, `--db.read-transaction-timeout`, `--db.max-readers`,
+  `--db.growth-step`, `--db.log-level`, `--db.sync-mode safe-no-sync`, and reth's `UtterlyNoSync`
+  and `NoMetaSync` sync modes (neither has a CLI value). The no-sync refusals say why and point at
+  `durable`: the engine's `NoSync` reuses the pages a commit frees only after a sync, and nothing
+  syncs a `NoSync` environment on its own, so the file would grow until one (see "Persist
+  benchmark"). They stay refused until the engine bounds that growth.
+- **Table stats** (`db_table_stats`, behind `telcoin-network db stats`): each of reth's tables the
+  database has, sorted by name, with its rows, branch, leaf and overflow pages, and size (the page
+  size times its pages, `DbTableStat`). A table the database lacks is skipped. The MDBX build
+  opens read-only through reth's `open_db_read_only`, which reads while the node runs, after
+  refusing a `db/` holding `tndb.dat`. The tndb build opens `TndbEnv` read-only from the adapter's
+  `table_stats`, which needs the node stopped (`DB_TABLE_STATS_NEEDS_STOPPED_NODE`): a database a
+  node holds is refused with "in use: stop the node first", and `db stats` holds the datadir lock
+  for the report. It never migrates: a `db/` holding `mdbx.dat` is refused (a migration pending
+  or unfinished, which the node's start runs; beside the marker, as the open refuses it), and
+  with neither `mdbx.dat` nor `tndb.dat` there is no reth database.
+- **What differs on tndb-b:**
+  - no per-operation latency metrics (MDBX's `with_metrics`). The sampled gauges keep MDBX's
+    names (`db.table_size` and the rest), so dashboards and the e2e `reth_db_table_size` check
+    hold;
+  - the snapshot export's long read (`RethEnv::pin_state_view`) has no timeout to disable, and
+    the adapter's long-reader warning can fire, at most once a minute, during a long export: the
+    export holds back page reuse while it runs, so the file grows until it ends.
+
+### Migrating from MDBX
+
+A build with the `tndb-b` feature that finds an MDBX reth database (`db/mdbx.dat`) migrates it at
+the node's first start, when `RethEnv::new_database` opens the database and before reth reads
+anything. The module docs of `src/env/database/migrate.rs` have the states and steps. The node
+logs `mdbx.dat`'s size, the live bytes of reth's tables in it and the free space, each table's
+copy, and at the end the rows copied and the time taken. It warns of any table in MDBX that is not
+one of reth's: its rows are not copied (reth does not read them either).
+
+- **What it does:** it copies every one of reth's tables raw (encoded keys and compressed values;
+  no row is decoded) into a new tndb-b file built in `db/tndb-migrating/`, with the node's
+  `--db.page-size` and `--db.max-size`. Before anything of MDBX's is touched it checks each
+  table's rows against MDBX's count, a read-back hash of each table against the copy, and the
+  synced file against the engine's full check. Then it renames the file to `db/tndb.dat` (the
+  commit point), removes `mdbx.lck` and then `mdbx.dat`, writes the marker `db/mdbx-migrated`
+  (its text lists the rows copied per table) and removes the temp directory. reth's static files
+  and `database.version` file are not touched.
+- **Free space:** the filesystem holds both databases while it copies. The migration refuses to
+  start unless the live bytes of reth's tables in MDBX plus a quarter plus 1 GiB are free
+  (`needed_bytes`), and says the live bytes, how much is needed and how much is free. The live
+  bytes are each table's branch, leaf and overflow pages times the page size, not `mdbx.dat`'s
+  file size, which can be far more: MDBX grows the file in large steps (a local node's is 4 GiB,
+  mostly sparse) and keeps the pages it frees. `db stats` on the MDBX build (the build being
+  replaced) prints the same figures beside a running node, each table's "Total Size" and their sum
+  in the "Tables" row, so the space can be checked before upgrading. The check is an early
+  refusal: a disk that fills during the copy fails the migration the same way, leaving MDBX as it
+  was.
+- **Time:** in proportion to the database's size: one read of MDBX, one write and one read-back of
+  the copy, and one sync. The on-demand test `migrates_a_copy_of_a_real_database` (in
+  `src/env/database/migrate/tests.rs`; its doc comment has the command) migrates a copy of a real
+  `db/` and checks every table, printing the live bytes and the free space needed. On 2026-10-27
+  it migrated a small local-validator database (2110 rows; `mdbx.dat` a 4 GiB file whose tables
+  take 704512 bytes of pages, so the migration needed 1074622464 bytes free, where the file's size
+  would have asked for 6 GiB) in 45 ms on macOS, debug build, into a 1.0 MiB `tndb.dat`. A
+  production-sized database has not been timed yet.
+- **A stop part way** (a kill, a power loss) is safe at every step. Before the commit point MDBX is
+  as it was, and the next start removes the temp directory and migrates again from the beginning.
+  After it, the next start finishes the remaining steps: it removes what is left of MDBX's files
+  and writes the marker.
+- **Refusals.** The node does not start, and nothing is changed:
+
+  | the node finds | why | what to do |
+  |---|---|---|
+  | less free space than the migration needs | the copy is built beside MDBX | free space, then start again |
+  | a row tndb-b cannot store: a second value for a dup-sort subkey (`MDBX_KEYEXIST`), or a value over 16 MiB (`MDBX_BAD_VALSIZE`) | tndb-b stores one value per subkey and values up to 16 MiB; reth writes neither | MDBX is unchanged: run the MDBX build, and report the error |
+  | a copy that fails its checks (a short read, a read-back mismatch, the engine's check) | the copy would lose or change rows | as above |
+  | `mdbx.dat` beside `db/mdbx-migrated` | an MDBX build (an older binary) wrote MDBX after the migration, and the static files may be ahead of `tndb.dat` | resolve by hand: start from a fresh datadir, or `db load-state` |
+  | `db/mdbx-migrated` without `tndb.dat` | the migrated database is missing | restore `tndb.dat`, or start from a fresh datadir (or `db load-state`) |
+
+- **No rollback:** once `mdbx.dat` is removed there is no way back to MDBX. The MDBX build refuses a
+  `db/` holding `tndb.dat`, so going back means a fresh datadir (or `db load-state`). Problems are
+  fixed forward, as for the consensus DB.
+- **`db stats`** never migrates: it refuses a `db/` holding `mdbx.dat` until a node start has run
+  the migration.
+
+### Persist benchmark
+
+`env::persist_bench::per_block_persist` (`src/env/persist_bench.rs`, `#[ignore]`d) times
+`RethEnv::persist_executed_output` alone on a production-configured chain: blocks of transfers (to
+new and existing accounts) and contract writes (new and existing slots) over a prefilled state,
+persisted one block per commit and several per commit (production persists once per consensus
+output). It also reports reth's own split of each persist (`save_blocks_mdbx`, the database's
+writes, and `save_blocks_commit_mdbx`, its commit, against the static files' write and commit), so
+the engine's share is visible. The knobs (`TN_PERSIST_BENCH_*`) are in its doc comment. Run each
+build from its own target directory:
+
+```sh
+TMPDIR=$PWD/target/persist-bench-tmp CARGO_TARGET_DIR=target/persist-mdbx \
+  cargo test --release -p tn-reth --lib env::persist_bench::per_block_persist -- --ignored --exact --nocapture
+TMPDIR=$PWD/target/persist-bench-tmp CARGO_TARGET_DIR=target/persist-tndb \
+  cargo test --release -p tn-reth --features tndb-b --lib env::persist_bench::per_block_persist -- --ignored --exact --nocapture
+```
+
+Mac results, 2026-10-27 (release, default knobs: 400 blocks of 200 transactions over 10000
+accounts; the median of 5 alternating runs per build; ms per commit):
+
+| sync | blocks per commit | MDBX p99 | tndb-b p99 | ratio | database part p99, MDBX / tndb-b |
+|---|---|---|---|---|---|
+| no-sync | 1 | 78.3 | 72.2 | 0.92 | 43.8 / 14.4 (0.33) |
+| no-sync | 4 | 86.9 | 77.7 | 0.89 | 41.9 / 30.6 (0.73) |
+
+Both are well inside the reference (tndb-b's per-block persist p99 at most 1.25× MDBX's). Most of a
+persist on macOS is reth's static files: their commit is a `File::sync_all`, which is
+`F_FULLFSYNC` on macOS, on every commit in both builds. The verdict uses the no-sync runs
+(MDBX on `--db.sync-mode safe-no-sync`, tndb-b on the engine's `NoSync`), because a durable commit on macOS is `F_FULLFSYNC` for reth's
+MDBX but a plain fsync for tndb-b, so durable rows are not a like-for-like engine comparison (3+3
+durable runs: p99 ratio 0.93 and 0.91). Linux runs are pending.
+
+Under no-sync, `tndb.dat` grew to 2 GiB in every run, against 65 MiB durable: the pages a commit
+frees are reused only after a sync, and a no-sync run never syncs. The engine then remapped past
+its 1 GiB reservation, and those commits are the run's slowest (up to 436 ms, below p99). The
+tndb build therefore refuses `--db.sync-mode safe-no-sync` (`tndb_args`) until the engine bounds
+that growth, and the bench's no-sync runs reach the engine's `NoSync` through a test-only path
+instead (`database::TEST_NO_SYNC`, which the bench sets before it opens the database).
 
 ## Determinism rules
 
@@ -414,10 +559,12 @@ Block production must be a pure function of certified consensus output. Concrete
 | `src/cli.rs` | `RethCommand`/`RethConfig`: RPC namespace allowlist, disabling reth networking/discovery, per-sender pool-slot default (256). |
 | `src/dirs.rs` | TN data-directory layout and conversion to reth `DatadirArgs`. |
 | `src/env/mod.rs` | `RethEnv` wrapper (node config, blockchain provider, EVM config, task spawner); DB open/genesis init; sets `BASEFEE_ADDRESS`; shared read-only state-DB stack. |
+| `src/env/database.rs` | The database backend (`RethDbEnv`/`RethDb`, MDBX or tndb-b): `open_rw`, the backend guard, the `--db.*` mapping, the table stats of `db stats` (`db_table_stats`; see "Database backend"). `src/env/database/migrate.rs`: the MDBX to tndb-b migration (tndb build). |
 | `src/env/epoch.rs` | Startup healing and epoch-boundary reads: `EpochState`, committees, BLS pubkeys, worker fee configs, classified registry reads (node-local vs chain-global failures). |
 | `src/env/execution.rs` | `build_block_from_batch_payload` (recover → execute → assemble), `finish_executing_output` (atomic blocks + finality markers), `finalize_block` (in-memory watches). |
 | `src/env/genesis.rs` | Genesis construction, including `ConsensusRegistry` account generation via a pre-genesis EVM and embedded-artifact JSON parsing; temp-chain env for tests. |
 | `src/env/helpers.rs` | Read-side accessors: headers, blocks, receipts, accounts, `read_contract*`, canonical streams and tips. |
+| `src/env/persist_bench.rs` | Test-only, `#[ignore]`d: the per-block persist benchmark (`per_block_persist`; see "Persist benchmark" under "Database backend"). |
 | `src/env/rpc.rs` | Assembles and starts reth's RPC server over the worker pool + `WorkerNetwork`; no engine namespace. |
 | `src/error.rs` | `TnRethError` and the state-read error taxonomy. |
 | `src/evm/mod.rs` | `TNEvm` wrapper over revm; `transact_system_call` (100M gas, fee-exempt, nonce-check disabled); pre-genesis create. |
@@ -437,7 +584,7 @@ Block production must be a pure function of certified consensus output. Concrete
 | `src/system_calls.rs` | `sol!` bindings for `ConsensusRegistry`/`WorkerConfigs`, `SYSTEM_ADDRESS`, registry address, `EpochState`. |
 | `src/traits.rs` | `TelcoinNode` node-type wiring and the fail-loud `TNExecution` shim. |
 | `src/txn_pool.rs` | `WorkerTxPool` wrapper: canonical-state maintenance, blob-tx removal, raw-tx recovery helpers. |
-| `src/types.rs` | Type aliases (`RpcServer`, `RethDb`, `PoolTxn`, `TNPrimitives`). |
+| `src/types.rs` | Type aliases (`RpcServer`, `RethDb`, `PoolTxn`, `TNPrimitives`); `RethDb` is re-exported from `src/env/database.rs`. |
 | `src/worker.rs` | `WorkerComponents` and the `WorkerNetwork` RPC shim (libp2p peer count for `net_*`). |
 | `src/test_utils.rs` | `TransactionFactory` and payload-execution helpers (`test-utils` feature / tests). |
 
@@ -450,4 +597,15 @@ From `crates/tn-reth/Cargo.toml`:
 | `faucet` | Instant role-gated TEL mint replacing the timelocked mint. **Never on mainnet.** |
 | `adiri` | Adiri-testnet build: forwards `tn-types/adiri`, which compiles the adiri fork gates in `tn-types` `forks.rs`, and **implies `faucet`**. Each gate names the first adiri epoch on the new behaviour: 383 seed signatures (epoch seed chain replaces the leader-aggregate shuffle seed), 407 `ConsensusRegistry` and `WorkerConfigs` swap, 554 governance Safe onto the canonical v1.4.1 suite, 567 leader-seeded intra-round certificate order, 570 multi-worker `Committee` encoding, 574 seed-chain `PREVRANDAO`. This crate applies the two state-swap forks (407 and 554) itself, in the closing block of the epoch before (steps 1 and 2 of "Epoch close"). Non-adiri builds compile none of these constants and run the post-fork behaviour from genesis. |
 | `test-utils` | Test factories and payload helpers. |
-| `rocksdb` | Opt back in to reth's RocksDB backend (storage is MDBX-only today). |
+| `rocksdb` | Opt back in to reth's RocksDB backend (storage is MDBX-only today). Turns on the `rocksdb` features of `reth-node-core`, `reth-provider`, `reth-db-common`, `reth-stages` and `reth-prune`. |
+| `tndb-b` | Run the reth execution database on the tndb-b engine (`tndb_b_reth::TndbEnv`) instead of MDBX. Off by default; see "Database backend". |
+
+The crate takes reth's individual crates, never the `reth` umbrella crate (which only re-exports
+them and pulls reth's CLI, `reth-ethereum-cli` and `reth-cli-commands`, into the graph). The
+umbrella's default features are always on, enabled on the crates it forwarded them to: `jemalloc`
+(`reth-cli-util`, `reth-node-core`; not `reth-node-metrics`, whose jemalloc stats feed only
+reth's own metrics server, which TN never starts), `otlp` and `otlp-logs` (`reth-node-core`), `js-tracer`
+(`reth-node-builder`, `reth-node-ethereum`, `reth-rpc`, `reth-rpc-eth-types`),
+`keccak-cache-global` (`reth-node-core`, `reth-node-ethereum`), `asm-keccak` (`reth-node-core`,
+`reth-node-ethereum`, `reth-primitives`) and `min-debug-logs` (`reth-node-core`, which caps
+`tracing` at debug in release builds).

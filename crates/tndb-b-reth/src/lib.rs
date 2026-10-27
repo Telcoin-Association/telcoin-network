@@ -11,7 +11,8 @@
 //! | `Database::TXMut` | [`TndbTxMut`] | [`tndb_b::RwTxn`] behind a shared mutex |
 //! | `DbTx::Cursor` (read-only) | [`TndbCursor`] | [`tndb_b::RoCursor`] |
 //! | `DbTxMut::CursorMut` | [`TndbCursorMut`] | [`tndb_b::TxnCursor`] |
-//! | `DatabaseMetrics` | [`TndbEnv`] | [`tndb_b::TableStat`], [`tndb_b::Env::free_pages`] |
+//! | `DatabaseMetrics` | [`TndbEnv`] ([`TndbEnv::table_stats`], [`RethTableStat`]) | [`tndb_b::TableStat`], [`tndb_b::Env::free_pages`] |
+//! | none (MDBX's sync and check are its own tools) | [`TndbEnv::sync`], [`TndbEnv::check`] ([`CheckReport`]) | [`tndb_b::Env::sync`], [`tndb_b::Env::check`] |
 //!
 //! Each of reth's tables is an engine table of the same name; the environment maps each name to
 //! its engine handle. Keys are stored encoded (`Encode`) and values compressed (`Compress`), as
@@ -104,7 +105,8 @@
 //!   atomic load while no reader holds a superseded snapshot, plus a clock read while one does);
 //! - one file, `<dir>/tndb.dat`, with the engine's `flock` as the lock: a second open of a file
 //!   another handle holds is `MDBX_BUSY`;
-//! - the metrics skip a table the file lacks (MDBX's stop at it).
+//! - the table stats ([`TndbEnv::table_stats`]) and the metrics skip a table the file lacks (MDBX's
+//!   metrics stop at it).
 //!
 //! The data:
 //! - a dup-sort table holds one value per subkey: a put, `upsert` or `append` of a second value for
@@ -252,8 +254,8 @@ mod engine_bench;
 mod tests;
 
 pub use cursor::{TndbCursor, TndbCursorMut};
-pub use env::{TndbArgs, TndbEnv, TndbEnvKind, DATA_FILE};
-pub use tndb_b::SyncMode;
+pub use env::{RethTableStat, TndbArgs, TndbEnv, TndbEnvKind, DATA_FILE};
+pub use tndb_b::{CheckReport, SyncMode, TableCheck};
 pub use tx::{TndbTx, TndbTxMut};
 
 #[cfg(test)]

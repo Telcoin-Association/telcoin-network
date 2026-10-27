@@ -20,7 +20,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        lane: [fmt, clippy, test-default, test-adiri]
+        lane: [fmt, clippy, test-default, test-adiri, test-tndb]
     env:
       CARGO_INCREMENTAL: "0"
       RUSTFLAGS: "-D warnings -D unused_extern_crates"

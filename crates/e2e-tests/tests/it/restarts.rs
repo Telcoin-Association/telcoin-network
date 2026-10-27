@@ -1413,7 +1413,8 @@ fn assert_no_evm_timestamp_clamps(
     Ok(())
 }
 
-fn test_blocks_same(client_urls: &[String; 4]) -> eyre::Result<()> {
+/// Check that all four nodes hold the same block hash at node 0's latest block number.
+pub(crate) fn test_blocks_same(client_urls: &[String; 4]) -> eyre::Result<()> {
     info!(target: "restart-test", "calling get_block for {:?}", &client_urls[0]);
     let block0 = get_block(&client_urls[0], None)?;
     let number = u64::from_str_radix(&block0["number"].as_str().unwrap_or("0x100_000")[2..], 16)?;
