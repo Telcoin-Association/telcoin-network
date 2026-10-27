@@ -35,7 +35,6 @@ impl TNMessage for TestPrimaryRequest {
             Self::Vote { .. } => ServiceClass::Vote,
             Self::MissingCertificates(_) => ServiceClass::CertificateSync,
             Self::NewCertificate { .. } => ServiceClass::Other,
-            Self::EpochRecord { .. } => ServiceClass::EpochRecord,
         }
     }
 }
@@ -75,18 +74,9 @@ pub(super) enum TestWorkerResponse {
 /// Requests from Primary.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub(super) enum TestPrimaryRequest {
-    NewCertificate {
-        certificate: Certificate,
-    },
-    Vote {
-        header: Header,
-        parents: Vec<Certificate>,
-    },
+    NewCertificate { certificate: Certificate },
+    Vote { header: Header, parents: Vec<Certificate> },
     MissingCertificates(Vec<HeaderDigest>),
-    /// An epoch record request for the given epoch (test stand-in for the `EpochRecord` class).
-    EpochRecord {
-        epoch: u64,
-    },
 }
 
 /// Response to primary requests.
@@ -95,8 +85,6 @@ pub(super) enum TestPrimaryResponse {
     Vote(Vote),
     MissingCertificates(Vec<Certificate>),
     MissingParents(Vec<HeaderDigest>),
-    /// The epoch record answer that echoes the requested epoch.
-    EpochRecord(u64),
 }
 
 impl From<PeerExchangeMap> for TestWorkerRequest {
