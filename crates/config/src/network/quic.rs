@@ -18,18 +18,6 @@ pub enum InboundAcceptTask {
     },
 }
 
-impl InboundAcceptTask {
-    /// The accepted-handshake queue capacity of the spawned mode; `None` keeps the inline path.
-    ///
-    /// The node writes this to the carried transport. The release fixtures have no such field.
-    pub const fn spawned_capacity(self) -> Option<NonZeroUsize> {
-        match self {
-            Self::Inline => None,
-            Self::Spawned { capacity } => Some(capacity),
-        }
-    }
-}
-
 /// Configure the quic transport for libp2p.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(default)]
@@ -131,14 +119,10 @@ mod tests {
         assert_eq!(config.max_connection_data, settings.max_connection_data);
     }
 
-    /// The shipped default keeps the inline path, which maps to no spawned capacity, and the
-    /// spawned mode maps to its capacity.
+    /// The shipped default keeps the inline path.
     #[test]
     fn inline_default_keeps_the_inline_path() {
         assert_eq!(QuicConfig::default().inbound_accept_task, InboundAcceptTask::Inline);
-        assert_eq!(InboundAcceptTask::Inline.spawned_capacity(), None);
-        let spawned = InboundAcceptTask::Spawned { capacity: CAPACITY };
-        assert_eq!(spawned.spawned_capacity(), Some(CAPACITY));
     }
 
     /// The accept task setting round-trips through serde, an explicit spawned section parses,

@@ -511,7 +511,8 @@ pub(crate) enum HandshakeDirection {
 }
 
 impl HandshakeDirection {
-    /// Every direction, in label order.
+    /// Every direction, in label order. The tests count one series per direction.
+    #[cfg(test)]
     pub(crate) const ALL: [Self; 2] = [Self::Inbound, Self::Outbound];
 
     /// The direction of an established connection from the swarm's view of its endpoint.
@@ -570,7 +571,8 @@ pub(crate) enum OutboundRequestOutcome {
 }
 
 impl OutboundRequestOutcome {
-    /// Every outcome, in label order.
+    /// Every outcome, in label order. The tests count one series per outcome.
+    #[cfg(test)]
     pub(crate) const ALL: [Self; 2] = [Self::Response, Self::Failure];
 
     /// The metric label value for this outcome.
