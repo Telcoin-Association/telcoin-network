@@ -6,7 +6,7 @@ use super::{adapter::create_mdbx_db, mdbx_port::create_test_db};
 use crate::{
     dup::{dup_layout, DupLayout},
     tx::compressed,
-    TndbEnvKind,
+    TndbEnv, TndbEnvKind,
 };
 use alloy::primitives::{Address, B256, U256};
 use reth_db_api::{
@@ -24,7 +24,7 @@ use reth_db_api::{
 };
 use reth_libmdbx::Error;
 use reth_primitives_traits::{Account, StorageEntry, ValueWithSubKey};
-use reth_storage_errors::db::{DatabaseWriteError, DatabaseWriteOperation};
+use reth_storage_errors::db::{DatabaseErrorInfo, DatabaseWriteError, DatabaseWriteOperation};
 use reth_trie_common::{BranchNodeCompact, Nibbles, StorageTrieEntry, StoredNibblesSubKey};
 use std::fmt::Debug;
 
@@ -340,7 +340,8 @@ fn done(result: Result<(), DatabaseError>) -> String {
     result.map_or_else(error_name, |()| "ok".into())
 }
 
-/// `nodata` or `keymismatch` for those MDBX errors, else the error.
+/// `nodata`, `keymismatch` or `keyexist` for those MDBX errors, `second` for `MDBX_KEYEXIST` with
+/// this crate's message (a second value for a subkey refused), else the error.
 pub(super) fn error_name(e: DatabaseError) -> String {
     let info = match &e {
         DatabaseError::Delete(info) | DatabaseError::Read(info) => info.clone(),
@@ -351,9 +352,32 @@ pub(super) fn error_name(e: DatabaseError) -> String {
         "nodata".into()
     } else if info == Error::KeyMismatch.into() {
         "keymismatch".into()
+    } else if info == Error::KeyExist.into() {
+        "keyexist".into()
+    } else if info.code == DatabaseErrorInfo::from(Error::KeyExist).code {
+        // This crate's refusal of a second value for a subkey, in its own words.
+        "second".into()
     } else {
         format!("{e:?}")
     }
+}
+
+/// Whether `result` is this crate's refusal, by `operation`, of a second value for a (key,
+/// subkey) of `PlainStorageState` that holds another value, `key` being the row's key: a write
+/// error with MDBX's `MDBX_KEYEXIST` code and a message of this crate's saying it stores one value
+/// per subkey.
+pub(super) fn second_value_refused(
+    result: &Result<(), DatabaseError>,
+    operation: DatabaseWriteOperation,
+    key: Address,
+) -> bool {
+    let Err(DatabaseError::Write(write)) = result else { return false };
+    let key_exist = DatabaseErrorInfo::from(Error::KeyExist);
+    write.info.code == key_exist.code
+        && write.info.message.contains("one value per subkey")
+        && write.operation == operation
+        && write.table_name == PlainStorageState::NAME
+        && write.key == key.encode().as_slice()
 }
 
 /// Runs `steps` (space-separated) on a write transaction holding `PlainStorageState` rows of
@@ -362,9 +386,10 @@ pub(super) fn error_name(e: DatabaseError) -> String {
 /// `sk:K/S` `seek_by_key_subkey`, `se:K` `seek_exact`, `f` `first`, `l` `last`, `n` `next`, `p`
 /// `prev`, `c` `current`, `nd` `next_dup`, `pd` `prev_dup`, `nnd` `next_no_dup`, `ld`
 /// `last_dup`, `ndv` `next_dup_val`, `d` `delete_current`, `dd` `delete_current_duplicates`,
-/// `ad:K/S` `append_dup`, `adx:K/S` `append_dup` of another value for that subkey, `a:K/S`
-/// `append`; `put:K/S`, `tap:K/S` and `del:K/S` the transaction's `put`, `append` and `delete` of
-/// that row; `en` the transaction's `entries`. The transaction aborts.
+/// `ad:K/S` `append_dup`, `a:K/S` `append`, `u:K/S` `upsert`; `put:K/S`, `tap:K/S` and `del:K/S`
+/// the transaction's `put`, `append` and `delete` of that row; `en` the transaction's `entries`. A
+/// row's value is the one the rows above hold for its subkey; `adx`, `ax`, `ux`, `putx` and `tapx`
+/// write another value for the subkey. The transaction aborts.
 fn dup_steps<D: Database>(db: &D, steps: &str) -> String {
     let entry = |s: u8| e(s, u64::from(s));
     let tx = db.tx_mut().unwrap();
@@ -395,6 +420,11 @@ fn dup_steps<D: Database>(db: &D, steps: &str) -> String {
             "ad" => done(c.append_dup(a(k), entry(sk))),
             "a" => done(c.append(a(k), &entry(sk))),
             "adx" => done(c.append_dup(a(k), e(sk, 99))),
+            "u" => done(c.upsert(a(k), &entry(sk))),
+            "ux" => done(c.upsert(a(k), &e(sk, 99))),
+            "ax" => done(c.append(a(k), &e(sk, 99))),
+            "putx" => done(tx.put::<PlainStorageState>(a(k), e(sk, 99))),
+            "tapx" => done(tx.append::<PlainStorageState>(a(k), e(sk, 99))),
             "tap" => done(tx.append::<PlainStorageState>(a(k), entry(sk))),
             "put" => done(tx.put::<PlainStorageState>(a(k), entry(sk))),
             "del" => done(tx.delete::<PlainStorageState>(a(k), Some(entry(sk))).map(drop)),
@@ -1323,4 +1353,117 @@ fn a_dup_write_refused_for_its_size_leaves_the_cursor_where_it_was() {
         let without: Vec<&str> = seq.split(' ').filter(|step| !big(step)).collect();
         assert_eq!(rest.join(" "), big_write_steps(&mdbx, &without.join(" ")), "{seq}");
     }
+}
+
+/// Rewrites of a row with the value it holds, through every write path that stores a row, as
+/// [`dup_steps`]: MDBX takes the pair it holds again and changes nothing, and so does this crate,
+/// leaving the cursor where MDBX's is.
+#[test]
+fn a_dup_row_written_again_with_its_value_matches_mdbx() {
+    const SEQS: &[&str] = &[
+        "sk:1/1 u:1/3 c n p en",
+        "sk:1/1 u:4/2 c p nd en",
+        "l u:1/3 c nd pd",
+        "sk:1/5 u:1/5 c nd",
+        "sk:1/1 a:4/2 c p en",
+        "sk:1/1 a:4/1 c n nd en",
+        "se:2 put:1/3 c n en",
+        "se:2 tap:4/2 c n en",
+        "se:2 tap:4/1 c n en",
+    ];
+    let (_mdbx_dir, mdbx) = create_mdbx_db();
+    let (_dir, db) = create_test_db(TndbEnvKind::RW);
+    assert_eq!(dup_steps(&db, SEQS[0]), "sk:1/1=1 u:1/3=ok c=1/3 n=1/5 p=1/3 en=6");
+    for seq in SEQS {
+        assert_eq!(dup_steps(&db, seq), dup_steps(&mdbx, seq), "{seq}");
+    }
+}
+
+/// A second value for a (key, subkey) that holds another, through every write path that stores a
+/// row (the steps ending in `x`, as [`dup_steps`]), is refused (`second`: `MDBX_KEYEXIST` with
+/// this crate's message) and changes nothing: the steps around it give what MDBX gives without it,
+/// so the table and the cursor (its row, or its unset or ended state) are as they were. MDBX would
+/// store the second value beside the first. An `append_dup` of a subkey the key holds is refused
+/// for its order first (`keymismatch`).
+#[test]
+fn a_second_value_for_a_subkey_is_refused_and_changes_nothing() {
+    const SEQS: &[&str] = &[
+        "sk:1/1 ux:1/3 c n p en",
+        "sk:1/1 ux:1/1 c n",
+        "sk:1/1 ux:4/2 c n p",
+        "sk:1/2 ux:1/3 c n p",
+        "l ux:1/3 c nd p",
+        "sk:1/5 d ux:1/3 c pd",
+        "sk:1/1 ax:4/1 c n nd",
+        "sk:1/1 ax:4/2 c n en",
+        "l ax:4/2 c nd p",
+        "se:2 putx:1/3 c n en",
+        "se:2 putx:2/2 c n",
+        "se:2 tapx:4/2 c en",
+        "se:2 tapx:4/1 c n en",
+        "sk:1/1 putx:1/1 tapx:4/2 ux:2/2 ax:4/1 c n en",
+    ];
+    let (_mdbx_dir, mdbx) = create_mdbx_db();
+    let (_dir, db) = create_test_db(TndbEnvKind::RW);
+    assert_eq!(dup_steps(&db, SEQS[0]), "sk:1/1=1 ux:1/3=second c=1/1 n=1/3 p=1/1 en=6");
+    for seq in SEQS {
+        let second = |step: &str| step.split(':').next().is_some_and(|op| op.ends_with('x'));
+        let outcomes = dup_steps(&db, seq);
+        let (refused, rest): (Vec<&str>, Vec<&str>) = outcomes.split(' ').partition(|s| second(s));
+        assert!(refused.iter().all(|s| s.ends_with("=second")), "{seq}: {refused:?}");
+        let without: Vec<&str> = seq.split(' ').filter(|step| !second(step)).collect();
+        assert_eq!(rest.join(" "), dup_steps(&mdbx, &without.join(" ")), "{seq}");
+    }
+    assert_eq!(dup_steps(&db, "sk:1/1 adx:1/3 c"), "sk:1/1=1 adx:1/3=keymismatch c=1/5");
+}
+
+/// The refusal of a second value for a subkey names its operation, the table and the key, with
+/// MDBX's `MDBX_KEYEXIST` code and this crate's message; it changes no row and does not fail the
+/// environment. A table without duplicates still takes a new value for a key, on every path.
+#[test]
+fn a_second_value_refusal_is_a_write_error_and_plain_tables_still_overwrite() {
+    use DatabaseWriteOperation::{CursorAppend, CursorUpsert, PutAppend, PutUpsert};
+    let (_dir, db) = create_test_db(TndbEnvKind::RW);
+    let tx = db.tx_mut().unwrap();
+    tx.put::<PlainStorageState>(a(1), e(1, 1)).unwrap();
+    tx.put::<PlainStorageState>(a(2), e(1, 1)).unwrap();
+    let rows = |tx: &<TndbEnv as Database>::TXMut| {
+        let mut c = tx.cursor_dup_read::<PlainStorageState>().unwrap();
+        c.walk(None).unwrap().collect::<Result<Vec<_>, _>>().unwrap()
+    };
+    let before = rows(&tx);
+    assert!(second_value_refused(&tx.put::<PlainStorageState>(a(1), e(1, 2)), PutUpsert, a(1)));
+    assert!(second_value_refused(&tx.append::<PlainStorageState>(a(2), e(1, 2)), PutAppend, a(2)));
+    let mut c = tx.cursor_dup_write::<PlainStorageState>().unwrap();
+    assert!(second_value_refused(&c.upsert(a(1), &e(1, 2)), CursorUpsert, a(1)));
+    assert!(second_value_refused(&c.append(a(2), &e(1, 2)), CursorAppend, a(2)));
+    drop(c);
+    assert_eq!(rows(&tx), before);
+    let Err(DatabaseError::Write(write)) = tx.put::<PlainStorageState>(a(1), e(1, 2)) else {
+        panic!("not refused")
+    };
+    assert_eq!(
+        &*write.info.message,
+        "tndb-b-reth stores one value per subkey in dup-sort table PlainStorageState, and this key \
+         and subkey already hold a different value"
+    );
+    // A new subkey is stored, on the transaction and through a cursor.
+    tx.put::<PlainStorageState>(a(1), e(2, 2)).unwrap();
+    tx.cursor_dup_write::<PlainStorageState>().unwrap().upsert(a(1), &e(3, 3)).unwrap();
+    // A table without duplicates: every path replaces the key's value.
+    let v = B256::with_last_byte;
+    tx.put::<CanonicalHeaders>(1, v(1)).unwrap();
+    tx.put::<CanonicalHeaders>(1, v(2)).unwrap();
+    tx.append::<CanonicalHeaders>(1, v(3)).unwrap();
+    let mut c = tx.cursor_write::<CanonicalHeaders>().unwrap();
+    c.upsert(1, &v(4)).unwrap();
+    c.append(1, &v(5)).unwrap();
+    drop(c);
+    assert_eq!(tx.get::<CanonicalHeaders>(1).unwrap(), Some(v(5)));
+    tx.commit().unwrap();
+    assert_eq!(db.failure(), None);
+    let tx = db.tx().unwrap();
+    let mut c = tx.cursor_dup_read::<PlainStorageState>().unwrap();
+    let stored = c.walk(None).unwrap().collect::<Result<Vec<_>, _>>().unwrap();
+    assert_eq!(stored, [(a(1), e(1, 1)), (a(1), e(2, 2)), (a(1), e(3, 3)), (a(2), e(1, 1))]);
 }

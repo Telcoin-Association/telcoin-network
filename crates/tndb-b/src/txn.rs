@@ -755,21 +755,21 @@ impl RwTxn {
     }
 
     /// Store `value` under `key` in `table` as its new last entry: `key` must sort strictly after
-    /// the table's last key (an empty table takes any key), else [`Error::AppendOutOfOrder`]. Like
-    /// MDBX's `MDBX_APPEND`, it is the fast way to load keys in ascending order: an append into
-    /// the table's cached rightmost leaf neither descends nor searches. The table's path cache
-    /// holds the leaf of its last put or append in this transaction (after an append split, the
-    /// new right leaf) until a page is allocated or freed; any other append descends. A refused
-    /// append ([`Error::AppendOutOfOrder`], [`Error::KeyTooLarge`], [`Error::ValueTooLarge`])
-    /// changes nothing and does not fail the environment.
+    /// the table's last key (an empty table takes any key), else [`Error::AppendOutOfOrder`]. It is
+    /// the fast way to load keys in ascending order: an append into the table's cached rightmost
+    /// leaf neither descends nor searches. The table's path cache holds the leaf of its last put or
+    /// append in this transaction (after an append split, the new right leaf) until a page is
+    /// allocated or freed; any other append descends. A refused append
+    /// ([`Error::AppendOutOfOrder`], [`Error::KeyTooLarge`], [`Error::ValueTooLarge`]) changes
+    /// nothing and does not fail the environment.
     pub fn append(&mut self, table: &Table, key: &[u8], value: &[u8]) -> Result<()> {
         self.put_entry(table, key, value, PutKind::Append, None).map(drop)
     }
 
-    /// Store `value` under `key` in `table` only if the table does not hold `key`: a present key
-    /// is [`Error::KeyExists`] (like MDBX's `MDBX_NOOVERWRITE`), found by the put's own search (in
-    /// the table's cached leaf, else after its descent) and refused before anything changes, with
-    /// no latch. A new key is stored exactly as [`Self::put`] stores it.
+    /// Store `value` under `key` in `table` only if the table does not hold `key`: a present key is
+    /// [`Error::KeyExists`], found by the put's own search (in the table's cached leaf, else after
+    /// its descent) and refused before anything changes, with no latch. A new key is stored exactly
+    /// as [`Self::put`] stores it.
     pub fn insert(&mut self, table: &Table, key: &[u8], value: &[u8]) -> Result<()> {
         self.put_entry(table, key, value, PutKind::Insert, None).map(drop)
     }
@@ -860,7 +860,6 @@ impl RwTxn {
                 key: Vec::new(),
                 deleted: false,
                 deleted_key: Vec::new(),
-                soft_end: false,
                 #[cfg(test)]
                 reseeks: 0,
             };
@@ -937,20 +936,19 @@ impl ReadTxn for RwTxn {
 /// [`RwTxn::cursor_mut`]). Its moves are a [`Cursor`]'s, over the transaction's working state;
 /// the entries it returns are borrowed until its next call.
 ///
-/// [`Self::put`], [`Self::append`] and [`Self::insert`] write through the transaction and leave
-/// the cursor at the entry written. [`Self::delete_current`] removes the entry the cursor is at
-/// and leaves it on the entry that followed it (the follower) in a deleted state, as MDBX's
-/// cursor is left: [`Self::next`] returns the follower without stepping past it, [`Self::current`]
-/// returns it too, [`Self::prev`] returns the entry before it, another [`Self::delete_current`]
-/// deletes it, and the prefix steps compare with the deleted entry's key
+/// [`Self::put`], [`Self::append`] and [`Self::insert`] write through the transaction and leave the
+/// cursor at the entry written. [`Self::delete_current`] removes the entry the cursor is at and
+/// leaves it on the entry that followed it (the follower) in a deleted state, so a walk that
+/// deletes as it goes skips nothing: [`Self::next`] returns the follower without stepping past it,
+/// [`Self::current`] returns it too, [`Self::prev`] returns the entry before it, another
+/// [`Self::delete_current`] deletes it, and the prefix steps compare with the deleted entry's key
 /// ([`Self::next_in_prefix`]). Each of these ends the deleted state, except a prefix step that
-/// finds nothing (a delete starts a new one). With no follower (the table's last entry deleted)
-/// the cursor is after the end: [`Self::next`], [`Self::current`] and a delete find nothing, and
-/// [`Self::prev`] returns the new last entry (MDBX's `GET_CURRENT` returns that entry too, as it
-/// does after a `seek` past the end). A put that did not split its leaf, or did an append split,
-/// places the cursor from the path the table's path cache then holds for the entry; any other
-/// split, and a delete, find the place again by key, so a delete that merged pages still leaves
-/// the cursor on the follower.
+/// finds nothing (a delete starts a new one). With no follower (the table's last entry deleted) the
+/// cursor is after the end: [`Self::next`], [`Self::current`] and a delete find nothing, and
+/// [`Self::prev`] returns the new last entry. A put that did not split its leaf, or did an append
+/// split, places the cursor from the path the table's path cache then holds for the entry; any
+/// other split, and a delete, find the place again by key, so a delete that merged pages still
+/// leaves the cursor on the follower.
 /// Errors are the transaction's (a failure latches the environment).
 pub struct RwCursor<'t> {
     txn: &'t mut RwTxn,
@@ -1026,7 +1024,7 @@ impl RwCursor<'_> {
 
     /// The entry the cursor is at, if it is at one. Right after [`Self::delete_current`] that is
     /// the deleted entry's follower, and the cursor is then at it as after any move ([`Self::next`]
-    /// steps past it), as MDBX's `GET_CURRENT` is. The cursor does not move.
+    /// steps past it). The cursor does not move.
     pub fn current(&mut self) -> Result<Option<(&[u8], &[u8])>> {
         self.deleted = false;
         let txn: &RwTxn = self.txn;
@@ -1046,11 +1044,11 @@ impl RwCursor<'_> {
 
     /// Move to the next entry only if its key shares the first `n` bytes of the current entry's
     /// key, and return it; else return `None` and stay where the cursor is. The edge rules are
-    /// [`Cursor::next_in_prefix`]'s. Right after [`Self::delete_current`] the prefix is the
-    /// deleted key's (as an MDBX cursor keeps its key): the deleted entry's follower is returned,
-    /// and the cursor moves to it, if it shares the deleted key's first `n` bytes; else `None`,
-    /// and the cursor stays on the follower in the deleted state (`n` longer than the deleted key
-    /// included), so [`Self::next`] still returns the follower.
+    /// [`Cursor::next_in_prefix`]'s. Right after [`Self::delete_current`] the prefix is the deleted
+    /// key's, so a walk of a prefix that deletes as it goes stays in it: the deleted entry's
+    /// follower is returned, and the cursor moves to it, if it shares the deleted key's first `n`
+    /// bytes; else `None`, and the cursor stays on the follower in the deleted state (`n` longer
+    /// than the deleted key included), so [`Self::next`] still returns the follower.
     pub fn next_in_prefix(&mut self, n: usize) -> Result<Option<(&[u8], &[u8])>> {
         self.step_in_prefix(n, true)
     }
@@ -1107,10 +1105,10 @@ impl RwCursor<'_> {
     }
 
     /// Remove the entry the cursor is at and return `true`: right after a delete, the deleted
-    /// entry's follower, as MDBX's cursor deletes it. `false` (nothing changes) if the cursor is
-    /// not at an entry: unset, before the start, or after the end (a delete of the table's last
-    /// entry leaves it there). The cursor is left on the deleted entry's follower in the deleted
-    /// state (see the type docs).
+    /// entry's follower, so repeated deletes remove the entries in order. `false` (nothing changes)
+    /// if the cursor is not at an entry: unset, before the start, or after the end (a delete of the
+    /// table's last entry leaves it there). The cursor is left on the deleted entry's follower in
+    /// the deleted state (see the type docs).
     pub fn delete_current(&mut self) -> Result<bool> {
         // The key goes into the deleted-key buffer, reused from the last delete.
         let Self { txn, tree, deleted_key, .. } = self;
@@ -1230,19 +1228,17 @@ fn save_key(saved: &mut Vec<u8>, key: &[u8]) {
 ///   transaction's `put`, `append`, `insert`, `delete` or `clear_table`), the cursor takes the
 ///   table's new tree and finds its entry again by key. If the key is still there the cursor stays
 ///   on it (with its new value, if it changed). If not, the cursor is left as if it had deleted the
-///   entry itself ([`Self::delete_current`]), which is what an MDBX cursor does when another cursor
-///   deletes its entry: on the first entry after the key (the follower) in the deleted state, so
-///   [`Self::next`] and [`Self::current`] return the follower, [`Self::prev`] the entry before it,
-///   a delete deletes it, and the prefix steps compare with the gone key. A cursor already in that
-///   state stays in it, on its follower, or on the first entry after the follower if that is gone
-///   too. An unset cursor, or one after the end or before the start, keeps its state over the new
-///   tree. A reseek that finds the cursor's entry keeps the end [`Self::last`] sets; one that does
-///   not clears it.
+///   entry itself ([`Self::delete_current`]), so another writer's delete reads as its own: on the
+///   first entry after the key (the follower) in the deleted state, so [`Self::next`] and
+///   [`Self::current`] return the follower, [`Self::prev`] the entry before it, a delete deletes
+///   it, and the prefix steps compare with the gone key. A cursor already in that state stays in
+///   it, on its follower, or on the first entry after the follower if that is gone too. An unset
+///   cursor, or one after the end or before the start, keeps its state over the new tree.
 ///
 /// The reseek is lazy: it sees the table as it is at the cursor's next call. So if, before that
 /// call, another writer deleted the cursor's entry and put it back, or put an entry between it
-/// and its follower, the cursor is on that entry, where MDBX's cursor, moved at the delete, is on
-/// the follower.
+/// and its follower, the cursor is on that entry, not on the follower the delete left: it finds
+/// its place at that call, not at the delete.
 ///
 /// A write to another table, and the cursor's own writes, cause no reseek. Each landing on an
 /// entry keeps a copy of its key, so the cursor can find it again.
@@ -1275,12 +1271,6 @@ pub struct TxnCursor {
     /// The deleted entry's key while `deleted` is set, for the prefix steps (the buffer is
     /// reused).
     deleted_key: Vec<u8>,
-    /// Set by [`Self::last`] (or [`Self::prev`] from an unset cursor) when it lands on an entry:
-    /// [`Self::next`] and
-    /// [`Self::next_in_prefix`] then return nothing and stay on that entry, even after another
-    /// writer added entries past it, as MDBX's cursor does after `last`. Every other move and
-    /// write clears it, and so does a reseek that does not find the entry.
-    soft_end: bool,
     /// Test-only: how many times the cursor found its place again after another writer's change.
     #[cfg(test)]
     pub(crate) reseeks: u32,
@@ -1292,7 +1282,6 @@ impl std::fmt::Debug for TxnCursor {
             .field("table", &self.table)
             .field("state", &self.tree.state())
             .field("deleted", &self.deleted)
-            .field("soft_end", &self.soft_end)
             .finish_non_exhaustive()
     }
 }
@@ -1403,13 +1392,12 @@ impl TxnCursor {
         if self.tree.state() != State::At {
             return Ok(());
         }
-        let Self { tree, root, key, deleted, deleted_key, soft_end, .. } = self;
+        let Self { tree, root, key, deleted, deleted_key, .. } = self;
         // At the entry `key` (while `deleted`, the deleted entry's follower): back on it if it is
         // still there, else on the first entry after it, as if its own delete had moved it there.
         let found = match tree.seek(store, root, key) {
             Ok(Some((k, _))) if k == key.as_slice() => Ok(()),
             Ok(landed) => {
-                *soft_end = false;
                 if !*deleted {
                     *deleted = true;
                     std::mem::swap(key, deleted_key);
@@ -1424,7 +1412,6 @@ impl TxnCursor {
         };
         if found.is_err() {
             *deleted = false;
-            *soft_end = false;
         }
         found
     }
@@ -1456,8 +1443,7 @@ impl TxnCursor {
         moved
     }
 
-    /// Run a plain move (it leaves the deleted state and the end `last` set) and keep the key it
-    /// lands on.
+    /// Run a plain move (it leaves the deleted state) and keep the key it lands on.
     fn moved<'t>(
         &mut self,
         txn: &'t RwTxn,
@@ -1465,7 +1451,6 @@ impl TxnCursor {
     ) -> Result<Option<(&'t [u8], &'t [u8])>> {
         self.call(txn, |c, store| {
             c.deleted = false;
-            c.soft_end = false;
             let moved = op(&mut c.tree, store, &c.root);
             c.landed(moved)
         })
@@ -1476,25 +1461,19 @@ impl TxnCursor {
         self.moved(txn, |c, store, root| c.first(store, root))
     }
 
-    /// Move to the last entry and return it (`None` for an empty table). As MDBX's cursor, it
-    /// then ends the table: [`Self::next`] and [`Self::next_in_prefix`] return nothing and stay on
-    /// the entry, even after another writer appended past it, until another move or a write.
+    /// Move to the last entry and return it (`None` for an empty table). The cursor is then on
+    /// that entry as after any move: [`Self::next`] returns an entry another writer has put past
+    /// it since, else nothing (the cursor after the end).
     pub fn last<'t>(&mut self, txn: &'t RwTxn) -> Result<Option<(&'t [u8], &'t [u8])>> {
-        let found = self.moved(txn, |c, store, root| c.last(store, root));
-        self.soft_end = matches!(found, Ok(Some(_)));
-        found
+        self.moved(txn, |c, store, root| c.last(store, root))
     }
 
     /// Move to the next entry and return it (after the cursor's entry was deleted, by this cursor
-    /// or another writer: the first entry after the deleted key; right after [`Self::last`]:
-    /// nothing, and the cursor stays); see [`Cursor::next`].
+    /// or another writer: the first entry after the deleted key); see [`Cursor::next`].
     // A cursor's moves are fallible and go both ways: it is not an `Iterator`.
     #[allow(clippy::should_implement_trait)]
     pub fn next<'t>(&mut self, txn: &'t RwTxn) -> Result<Option<(&'t [u8], &'t [u8])>> {
         self.call(txn, |c, store| {
-            if c.soft_end {
-                return Ok(None);
-            }
             let moved = if std::mem::take(&mut c.deleted) {
                 c.tree.current(store)
             } else {
@@ -1505,20 +1484,15 @@ impl TxnCursor {
     }
 
     /// Move to the previous entry and return it (after the cursor's entry was deleted: the entry
-    /// before the deleted entry's follower); see [`Cursor::prev`]. From an unset cursor that is the
-    /// last entry, which then ends the table as after [`Self::last`] (MDBX's cursor takes it by
-    /// its `last`).
+    /// before the deleted entry's follower; from an unset cursor: the last entry); see
+    /// [`Cursor::prev`].
     pub fn prev<'t>(&mut self, txn: &'t RwTxn) -> Result<Option<(&'t [u8], &'t [u8])>> {
-        let from_unset = self.tree.state() == State::Unset;
-        let found = self.moved(txn, |c, store, root| c.prev(store, root));
-        self.soft_end = from_unset && matches!(found, Ok(Some(_)));
-        found
+        self.moved(txn, |c, store, root| c.prev(store, root))
     }
 
     /// The entry the cursor is at, if it is at one: after its entry was deleted, the deleted
     /// entry's follower, which the cursor is then at as after any move ([`Self::next`] steps past
-    /// it), as MDBX's `GET_CURRENT` is. The cursor does not move, unless the table changed and it
-    /// finds its place again.
+    /// it). The cursor does not move, unless the table changed and it finds its place again.
     pub fn current<'t>(&mut self, txn: &'t RwTxn) -> Result<Option<(&'t [u8], &'t [u8])>> {
         self.call(txn, |c, store| {
             c.deleted = false;
@@ -1557,7 +1531,6 @@ impl TxnCursor {
     ) -> Result<Option<(&'t [u8], KeyTail<'t>)>> {
         self.call(txn, |c, store| {
             c.deleted = false;
-            c.soft_end = false;
             let found = c.tree.seek_with_key_tail(store, &c.root, key, t);
             if let Ok(Some((k, _))) = found {
                 save_key(&mut c.key, k);
@@ -1570,7 +1543,6 @@ impl TxnCursor {
     pub fn seek_exact<'t>(&mut self, txn: &'t RwTxn, key: &[u8]) -> Result<Option<&'t [u8]>> {
         self.call(txn, |c, store| {
             c.deleted = false;
-            c.soft_end = false;
             let found = c.tree.seek_exact(store, &c.root, key);
             if let Ok(Some(_)) = found {
                 save_key(&mut c.key, key);
@@ -1582,8 +1554,7 @@ impl TxnCursor {
     /// Move to the next entry only if its key shares the first `n` bytes of the current entry's
     /// key, and return it; else return `None` and stay where the cursor is. The edge rules are
     /// [`Cursor::next_in_prefix`]'s, and after the cursor's entry was deleted (by it or another
-    /// writer) [`RwCursor::next_in_prefix`]'s: the prefix is the deleted key's. Right after
-    /// [`Self::last`] it returns nothing, as [`Self::next`] does.
+    /// writer) [`RwCursor::next_in_prefix`]'s: the prefix is the deleted key's.
     pub fn next_in_prefix<'t>(
         &mut self,
         txn: &'t RwTxn,
@@ -1612,10 +1583,6 @@ impl TxnCursor {
         forward: bool,
     ) -> Result<Option<Entry<'t>>> {
         self.call(txn, |c, store| {
-            if forward && c.soft_end {
-                return Ok(None);
-            }
-            c.soft_end = false;
             let moved = prefix_step(
                 &mut c.tree,
                 store,
@@ -1665,7 +1632,6 @@ impl TxnCursor {
         let Self { table, root, tree, .. } = self;
         let placed = txn.put_entry(table, key, value, kind, Some((tree, root)))?;
         self.deleted = false;
-        self.soft_end = false;
         save_key(&mut self.key, key);
         self.writes = self.table_writes(&txn.work);
         if placed {
@@ -1703,7 +1669,6 @@ impl TxnCursor {
             return Err(Error::Failed(cause));
         }
         self.writes = self.table_writes(&txn.work);
-        self.soft_end = false;
         let Self { table, root, tree, .. } = self;
         let found = find_again(&txn.work, table, root, tree, key, false).and_then(|()| {
             // The follower's key, which a reseek finds the cursor again by.

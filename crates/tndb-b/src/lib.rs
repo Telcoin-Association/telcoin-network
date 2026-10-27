@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
-//! tndb-b: an embedded key-value engine in the LMDB/MDBX mould.
+//! tndb-b: an embedded, transactional key-value engine.
 //!
 //! One page file holds every table as a copy-on-write B+tree with the values in its leaves, or,
 //! for a value too large for its leaf, in an overflow run of contiguous pages (up to 16 MiB). A

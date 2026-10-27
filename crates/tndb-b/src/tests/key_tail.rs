@@ -282,11 +282,10 @@ fn seek_with_key_tail_is_a_seek_then_current_with_key_tail() {
 }
 
 /// `seek_with_key_tail` takes a detached write cursor out of its end and deleted states, as
-/// `seek` does: after `last`, after `prev` from an unset cursor (each ends the table for `next`
-/// and `next_in_prefix`) and after `delete_current` (the cursor on the follower, which `next`
-/// would return), the steps after it (`next` or `next_in_prefix` first, then `current`, `prev`
-/// and `next`) agree with a twin cursor's after the same state, `seek` and
-/// `current_with_key_tail`.
+/// `seek` does: after `last` or `prev` from an unset cursor, then `next` (the cursor after the
+/// end), and after `delete_current` (the cursor on the follower, which `next` would return), the
+/// steps after it (`next` or `next_in_prefix` first, then `current`, `prev` and `next`) agree
+/// with a twin cursor's after `seek` and `current_with_key_tail`.
 #[test]
 fn seek_with_key_tail_clears_a_txn_cursors_end_and_deleted_states() {
     let (_dir, path) = temp("tndb-b-seek-key-tail-states");
@@ -330,7 +329,7 @@ fn seek_with_key_tail_clears_a_txn_cursors_end_and_deleted_states() {
                 }
             }
             if before != "delete_current" {
-                // The end is set: `next` returns nothing and keeps it.
+                // From the last row, `next` goes past the end.
                 assert_eq!(fused.next(&txn).expect("next"), None, "{before}");
             }
             let t = TAILS[(n + s) % TAILS.len()];

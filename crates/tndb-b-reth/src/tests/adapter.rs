@@ -1,10 +1,14 @@
 //! The adapter's own tests: MDBX's error codes, the metrics, a blocked second writer, cursors
-//! sharing a write transaction (run on MDBX too, which is the oracle), and the long-read tests of
-//! `reth-db`'s `implementation/mdbx/tx.rs` (tndb-b has no read timeout).
+//! sharing a write transaction (run on MDBX too, which is the oracle), the long-read tests of
+//! `reth-db`'s `implementation/mdbx/tx.rs` (tndb-b has no read timeout), and the long-reader
+//! warning that replaces it.
 
 use super::{dup::error_name, mdbx_port::create_test_db};
-use crate::{error, TndbArgs, TndbEnvKind};
-use alloy::primitives::{Address, Bytes, B256};
+use crate::{
+    env::{warning_due, NEVER_WARNED},
+    error, TndbArgs, TndbEnv, TndbEnvKind,
+};
+use alloy::primitives::{Address, Bytes, B256, U256};
 use reth_db::{mdbx::DatabaseArguments, ClientVersion, DatabaseEnv, DatabaseEnvKind};
 use reth_db_api::{
     common::PairResult,
@@ -13,14 +17,14 @@ use reth_db_api::{
     database_metrics::DatabaseMetrics,
     table::Table,
     tables::{
-        Bytecodes, CanonicalHeaders, PlainAccountState, RawKey, RawTable, RawValue, Tables,
-        Transactions,
+        Bytecodes, CanonicalHeaders, PlainAccountState, PlainStorageState, RawKey, RawTable,
+        RawValue, Tables, Transactions,
     },
     transaction::{DbTx, DbTxMut},
     DatabaseError,
 };
 use reth_libmdbx::Error;
-use reth_primitives_traits::{Account, Bytecode};
+use reth_primitives_traits::{Account, Bytecode, StorageEntry};
 use reth_storage_errors::db::{DatabaseWriteError, DatabaseWriteOperation};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -74,6 +78,78 @@ fn long_read_transaction_safety_enabled() {
     thread::sleep(LONG_READ);
     assert_eq!(tx.get::<CanonicalHeaders>(7).unwrap(), Some(B256::with_last_byte(7)));
     assert!(matches!(tx.get::<Transactions>(0), Ok(None)), "a read after the wait is no timeout");
+}
+
+/// The first long-reader warning is due at once, and each later one a full interval after the
+/// last.
+#[test]
+fn a_long_reader_warning_is_due_first_then_once_per_interval() {
+    let minute = Duration::from_secs(60);
+    let secs = |s: u64| s * 1_000_000_000;
+    assert!(warning_due(NEVER_WARNED, 0, minute), "the first");
+    assert!(warning_due(NEVER_WARNED, secs(5), minute), "the first, later");
+    assert!(!warning_due(secs(5), secs(5), minute), "just warned");
+    assert!(!warning_due(secs(5), secs(65) - 1, minute), "under the interval");
+    assert!(warning_due(secs(5), secs(65), minute), "a full interval later");
+    assert!(!warning_due(secs(65), secs(5), minute), "a time before the last warning");
+}
+
+/// Keeps the text of each `WARN` event emitted on the thread it is the default subscriber of.
+struct WarnCapture(Arc<parking_lot::Mutex<Vec<String>>>);
+
+impl tracing::Subscriber for WarnCapture {
+    fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+        true
+    }
+    fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+    fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+    fn event(&self, event: &tracing::Event<'_>) {
+        if *event.metadata().level() == tracing::Level::WARN {
+            let mut text = String::new();
+            event.record(&mut |field: &tracing::field::Field, value: &dyn std::fmt::Debug| {
+                text += &format!("{}={value:?} ", field.name());
+            });
+            self.0.lock().push(text);
+        }
+    }
+    fn enter(&self, _: &tracing::span::Id) {}
+    fn exit(&self, _: &tracing::span::Id) {}
+}
+
+/// A commit warns once a reader has held a superseded snapshot past the limit, at most once per
+/// interval, and not once the reader has ended. The limits are shortened for the test.
+#[test]
+fn a_long_reader_warns_after_a_commit_at_most_once_per_interval() {
+    const AGE: Duration = Duration::from_millis(100);
+    let (_dir, mut db) = create_test_db(TndbEnvKind::RW);
+    let put = |db: &TndbEnv, n: u64| {
+        db.update(|tx| tx.put::<CanonicalHeaders>(n, B256::with_last_byte(1))).unwrap().unwrap();
+    };
+    let warnings = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let count = || warnings.lock().len();
+    tracing::subscriber::with_default(WarnCapture(Arc::clone(&warnings)), || {
+        db.set_long_reader_limits(AGE, Duration::from_secs(3600));
+        let reader = db.tx().unwrap();
+        put(&db, 1);
+        assert_eq!(count(), 0, "the reader's snapshot was superseded just now");
+        thread::sleep(2 * AGE);
+        put(&db, 2);
+        assert_eq!(count(), 1, "the reader is past the limit");
+        assert!(warnings.lock()[0].contains("age="), "{:?}", warnings.lock());
+        put(&db, 3);
+        assert_eq!(count(), 1, "one warning per interval");
+
+        db.set_long_reader_limits(AGE, Duration::ZERO);
+        put(&db, 4);
+        put(&db, 5);
+        assert_eq!(count(), 3, "a warning per commit with no interval");
+        drop(reader);
+        put(&db, 6);
+        assert_eq!(count(), 3, "no reader left");
+    });
 }
 
 #[test]
@@ -487,7 +563,8 @@ fn cursor_steps_after_a_delete_or_last_match_mdbx() {
 ///   the last row, or a `seek` past it, leaves it on the (new) last row, which `current` returns.
 ///   tndb-b's cursor is then after the end (or before the start), where `current` finds nothing, a
 ///   delete is `MDBX_ENODATA`, and `prev` (or `next`) takes the last (or first) row. A row `last`
-///   placed the cursor on is the exception (see [`MATCHED`]). Two cursors a missed `seek_exact`
+///   placed the cursor on is the exception (see [`MATCHED`]), until another writer deletes it: the
+///   cursor is then after the deleted row as after any delete. Two cursors a missed `seek_exact`
 ///   left unset are placed by another writer on MDBX: on an empty table, a put makes it a fresh
 ///   cursor (`next` takes the first row); and once deletes have taken the row the miss landed on
 ///   and every row after it, it is at the end (`prev` takes the new last row). tndb-b's stays
@@ -495,7 +572,7 @@ fn cursor_steps_after_a_delete_or_last_match_mdbx() {
 /// - **Another writer's delete and put before the cursor's next call.** MDBX moves its cursor to
 ///   the follower when the row goes; tndb-b's cursor finds its row again by key at its next call,
 ///   so a key put meanwhile between the row and its follower is taken as the follower, and the
-///   row's key put back is the cursor's row again.
+///   row's key put back is the cursor's row again (after `last`, still ending the table).
 const DEVIATIONS: &[(&[u64], &str, &str, &str)] = &[
     (&[2, 4, 6, 8], "se:8 d c n p", "se:8=8 d=ok c=6 n=none p=4", "se:8=8 d=ok c=none n=none p=6"),
     (&[2, 4, 6, 8], "s:9 c p", "s:9=none c=8 p=8", "s:9=none c=none p=8"),
@@ -521,6 +598,24 @@ const DEVIATIONS: &[(&[u64], &str, &str, &str)] = &[
     ),
     (&[], "se:0 put:0 n", "se:0=none put:0=ok n=0", "se:0=none put:0=ok n=none"),
     (&[2, 5, 9], "se:6 del:9 p", "se:6=none del:9=ok p=5", "se:6=none del:9=ok p=none"),
+    (
+        &[2, 4, 6, 8],
+        "l del:8 put:9 put:10 c n",
+        "l=8 del:8=ok put:9=ok put:10=ok c=6 n=none",
+        "l=8 del:8=ok put:9=ok put:10=ok c=9 n=10",
+    ),
+    (
+        &[2, 4, 6, 8],
+        "l 2se:8 2d 2a:9 n",
+        "l=8 2se:8=8 2d=ok 2a:9=ok n=none",
+        "l=8 2se:8=8 2d=ok 2a:9=ok n=9",
+    ),
+    (
+        &[2, 4, 6, 8],
+        "l del:8 put:8 2a:9 n c",
+        "l=8 del:8=ok put:8=ok 2a:9=ok n=none c=6",
+        "l=8 del:8=ok put:8=ok 2a:9=ok n=none c=8",
+    ),
 ];
 
 #[test]
@@ -531,6 +626,82 @@ fn known_cursor_deviations_from_mdbx() {
         assert_eq!(steps(&mdbx, keys, seq), *on_mdbx, "MDBX");
         assert_eq!(steps(&db, keys, seq), *on_tndb, "tndb-b");
     }
+}
+
+/// Runs `steps` (`f`, `l`, `n`, `p` and `c`, as in [`steps`]) on a fresh cursor of table `T` in a
+/// read-only transaction, and returns each step with its outcome, a row shown by `show`.
+fn ro_steps<D: Database, T: Table>(
+    db: &D,
+    steps: &str,
+    show: impl Fn(T::Key, T::Value) -> String,
+) -> String {
+    let tx = db.tx().unwrap();
+    let mut c = tx.cursor_read::<T>().unwrap();
+    let mut out = Vec::new();
+    for step in steps.split_whitespace() {
+        let row = match step {
+            "f" => c.first(),
+            "l" => c.last(),
+            "n" => c.next(),
+            "p" => c.prev(),
+            "c" => c.current(),
+            _ => panic!("unknown step {step}"),
+        };
+        let outcome = match row {
+            Ok(Some((k, v))) => show(k, v),
+            Ok(None) => "none".into(),
+            Err(e) => error_name(e),
+        };
+        out.push(format!("{step}={outcome}"));
+    }
+    out.join(" ")
+}
+
+/// A read-only cursor ends the table after `last` (or a fresh `prev`) as MDBX's does, as a write
+/// cursor does ([`MATCHED`]): `next` finds nothing and the cursor stays on the row, so `current`
+/// returns it and `prev` the row before. On a dup-sort table it ends the last key's rows as a
+/// write cursor does: `next` there finds nothing and goes past the end, where MDBX's `current`
+/// finds nothing too, but its `prev` skips the key's other rows, a difference the write cursor's
+/// `known_dup_cursor_deviations_from_mdbx` pins (`l n p`), pinned here on both sides too.
+#[test]
+fn read_only_cursor_steps_after_last_match_mdbx() {
+    fn fill<D: Database>(db: &D) {
+        db.update(|tx| {
+            for k in [2, 4, 6, 8] {
+                tx.put::<CanonicalHeaders>(k, B256::with_last_byte(k as u8))?;
+                for s in [1, 2] {
+                    let entry = StorageEntry { key: B256::with_last_byte(s), value: U256::from(s) };
+                    tx.put::<PlainStorageState>(Address::with_last_byte(k as u8), entry)?;
+                }
+            }
+            Ok::<_, DatabaseError>(())
+        })
+        .unwrap()
+        .unwrap();
+    }
+    let (_mdbx_dir, mdbx) = create_mdbx_db();
+    let (_dir, db) = create_test_db(TndbEnvKind::RW);
+    fill(&mdbx);
+    fill(&db);
+    let plain = |k: u64, _| k.to_string();
+    let dup = |k: Address, v: StorageEntry| format!("{}.{}", k.0[19], v.key.0[31]);
+    for seq in ["l n c p", "l n n c p n", "l c n p", "p n c p", "l n p n c"] {
+        assert_eq!(
+            ro_steps::<_, CanonicalHeaders>(&db, seq, plain),
+            ro_steps::<_, CanonicalHeaders>(&mdbx, seq, plain),
+            "{seq}"
+        );
+    }
+    assert_eq!(ro_steps::<_, CanonicalHeaders>(&db, "l n c p", plain), "l=8 n=none c=8 p=6");
+    for seq in ["l n c", "l n n c", "l c p n", "p n c", "l p n c"] {
+        assert_eq!(
+            ro_steps::<_, PlainStorageState>(&db, seq, dup),
+            ro_steps::<_, PlainStorageState>(&mdbx, seq, dup),
+            "dup {seq}"
+        );
+    }
+    assert_eq!(ro_steps::<_, PlainStorageState>(&mdbx, "l n p", dup), "l=8.2 n=none p=6.2");
+    assert_eq!(ro_steps::<_, PlainStorageState>(&db, "l n p", dup), "l=8.2 n=none p=8.2");
 }
 
 /// A range walk may start past an excluded key, where MDBX's cursor panics.

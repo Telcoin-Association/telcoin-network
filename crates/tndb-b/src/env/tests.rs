@@ -7,7 +7,7 @@ use std::{
     os::unix::fs::FileExt as _,
     path::{Path, PathBuf},
     sync::mpsc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use tempfile::TempDir;
@@ -880,6 +880,59 @@ fn oldest_reader_txn_tracks_live_snapshots() {
     assert!(queued <= 2 * 16 + 1, "the queue holds {queued} snapshots");
     drop(stuck);
     assert_eq!(oldest(&env), 203);
+}
+
+/// The oldest reader's age counts from when a commit superseded the oldest snapshot a live reader
+/// holds: `None` for readers of the current snapshot, the older reader's age with two, and
+/// `None` again once it ends and the next commit runs. A read-only environment never has one.
+#[test]
+fn oldest_reader_age_follows_the_oldest_superseded_reader() {
+    const PAUSE: Duration = Duration::from_millis(50);
+    let (_dir, path) = temp();
+    let env = Env::open(&path, options(4096, SyncMode::NoSync)).expect("open");
+    assert_eq!(env.oldest_reader_age(), None);
+    put_all(&env, "a", &[(b"k", b"0")]);
+    assert_eq!(env.oldest_reader_age(), None, "no reader");
+
+    // A reader of the current snapshot does not count until a commit supersedes it, and its
+    // age starts then, not when its snapshot was published.
+    let r1 = env.begin_ro().expect("ro");
+    std::thread::sleep(PAUSE);
+    assert_eq!(env.oldest_reader_age(), None, "r1 reads the current snapshot");
+    let before = Instant::now();
+    put_all(&env, "a", &[(b"k", b"1")]);
+    let first = env.oldest_reader_age().expect("r1's snapshot is superseded");
+    let bound = before.elapsed();
+    assert!(first <= bound, "counted from the commit, not the publish: {first:?} > {bound:?}");
+
+    // The age grows while r1 lives, across commits; with a second reader it is r1's.
+    std::thread::sleep(PAUSE);
+    let r2 = env.begin_ro().expect("ro");
+    let r2_superseded = Instant::now();
+    put_all(&env, "a", &[(b"k", b"2")]);
+    let both = env.oldest_reader_age().expect("two superseded readers");
+    assert!(both >= first + PAUSE, "r1's age grows: {first:?} then {both:?}");
+
+    // Once r1 ends, the next commit makes r2 the oldest, superseded at the commit after it began.
+    drop(r1);
+    put_all(&env, "a", &[(b"k", b"3")]);
+    let second = env.oldest_reader_age().expect("r2's snapshot is superseded");
+    let bound = r2_superseded.elapsed();
+    assert!(second <= bound, "r2's age, from the commit after it began: {second:?} > {bound:?}");
+
+    // With no reader left, the next commit clears it.
+    drop(r2);
+    assert!(env.oldest_reader_age().is_some(), "refreshed only at a commit");
+    put_all(&env, "a", &[(b"k", b"4")]);
+    assert_eq!(env.oldest_reader_age(), None);
+    let r3 = env.begin_ro().expect("ro");
+    assert_eq!(env.oldest_reader_age(), None, "r3 reads the current snapshot");
+    drop(r3);
+    drop(env);
+
+    let env = Env::open_read_only(&path, EnvOptions::default()).expect("open read-only");
+    let _reader = env.begin_ro().expect("ro");
+    assert_eq!(env.oldest_reader_age(), None, "a read-only environment never commits");
 }
 
 /// The handles and transactions can be shared and sent across threads.

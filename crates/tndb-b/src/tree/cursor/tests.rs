@@ -1228,10 +1228,9 @@ fn cursors_are_send_and_sync() {
 }
 
 /// The model of an [`crate::RwCursor`]: a [`Model`] whose position can also be "after a deleted
-/// entry", given as the index of its follower in the remaining entries (`len`: none). As in
-/// MDBX, the cursor is then on the follower: `next` and `current` return it and leave the
-/// deleted state (so `next` after `current` steps past it), `prev` steps back from it, and
-/// `delete_current` deletes it.
+/// entry", given as the index of its follower in the remaining entries (`len`: none). The cursor is
+/// then on the follower: `next` and `current` return it and leave the deleted state (so `next`
+/// after `current` steps past it), `prev` steps back from it, and `delete_current` deletes it.
 #[derive(Debug)]
 struct RwModel {
     read: Model,
@@ -1439,12 +1438,11 @@ fn rw_cursor_moves_and_writes_match_a_model() {
     }
 }
 
-/// `delete_current` leaves the cursor on the deleted entry's follower, as MDBX does: `next`
-/// returns the follower (so first + delete/next removes everything in order), `current` returns
-/// it too and leaves the cursor at it (`next` then steps past it), `prev` returns the entry before
-/// the deleted one, and a second delete removes the follower; with no entry under the cursor, or
-/// no follower, it changes nothing. Over a multi-level tree, so deletes empty and unlink leaves
-/// under the cursor.
+/// `delete_current` leaves the cursor on the deleted entry's follower: `next` returns the follower
+/// (so first + delete/next removes everything in order), `current` returns it too and leaves the
+/// cursor at it (`next` then steps past it), `prev` returns the entry before the deleted one, and a
+/// second delete removes the follower; with no entry under the cursor, or no follower, it changes
+/// nothing. Over a multi-level tree, so deletes empty and unlink leaves under the cursor.
 #[test]
 fn delete_current_then_next_returns_the_follower() {
     let (_dir, env) = temp_env();
@@ -1502,8 +1500,7 @@ fn delete_current_then_next_returns_the_follower() {
     assert_eq!(c.state(), (State::AfterEnd, true));
     assert!(!c.delete_current().expect("delete"), "no follower: nothing to delete");
     assert_eq!(c.state(), (State::AfterEnd, true), "a refused delete changes nothing");
-    // After the end `current` is nothing, after a delete as after a seek past the end (MDBX's
-    // cursor stays on the new last entry there).
+    // After the end `current` is nothing, after a delete as after a seek past the end.
     assert_eq!(c.current().expect("current"), None);
     assert_eq!(c.state(), (State::AfterEnd, false));
     assert_eq!(key(c.prev().expect("prev")), rw_key(1));
@@ -1767,11 +1764,10 @@ fn damage_under_an_owned_cursor_latches() {
     assert!(env.failure().is_some_and(|c| c.contains("zero CRC")), "{:?}", env.failure());
 }
 
-/// After `delete_current` the prefix steps compare with the deleted key (as an MDBX cursor keeps
-/// its key): the follower (forward) or the entry before the deleted one (backward) is returned,
-/// and the cursor moves to it, when it shares the prefix; otherwise nothing, and the cursor stays
-/// on the follower in the deleted state (with `n` past the deleted key too). `n = 0` takes the
-/// follower; the ends of the table hold.
+/// After `delete_current` the prefix steps compare with the deleted key: the follower (forward) or
+/// the entry before the deleted one (backward) is returned, and the cursor moves to it, when it
+/// shares the prefix; otherwise nothing, and the cursor stays on the follower in the deleted state
+/// (with `n` past the deleted key too). `n = 0` takes the follower; the ends of the table hold.
 #[test]
 fn prefix_steps_after_delete_current_use_the_deleted_key() {
     let (_dir, env) = temp_env();

@@ -12592,7 +12592,6 @@ dependencies = [
  "memmap2",
  "parking_lot",
  "proptest",
- "reth-libmdbx",
  "tempfile",
  "thiserror 1.0.69",
  "tracing",

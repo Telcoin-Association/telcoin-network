@@ -1200,7 +1200,7 @@ fn fs_type(dir: &Path) -> Option<String> {
 
 /// Print the bench's temp dir, and stop the run when it is on a file system held in memory
 /// (tmpfs, ramfs): syncs there cost nothing, so durable commits would time no disk.
-fn announce_temp_dir(dir: &Path) {
+pub(crate) fn announce_temp_dir(dir: &Path) {
     let fs = fs_type(dir);
     match &fs {
         Some(fs) => println!("bench temp dir: {} ({fs})", dir.display()),
@@ -1216,7 +1216,7 @@ fn announce_temp_dir(dir: &Path) {
 }
 
 /// The OS page size.
-fn page_size() -> usize {
+pub(crate) fn page_size() -> usize {
     // SAFETY: `sysconf` reads a constant of the system.
     let size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
     usize::try_from(size).unwrap_or(4096)

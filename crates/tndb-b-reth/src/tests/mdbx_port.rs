@@ -2,10 +2,12 @@
 //! `test_import_table_with_range_works_on_dupsort` of its `cursor.rs`), with only the constructor
 //! swapped for [`TndbEnv`]'s; `Address::random` and `B256::random` (alloy's `rand` feature)
 //! became fixed values. Three dup-sort tests assert this crate's documented deviation instead of
-//! MDBX's behaviour: a second value with the same subkey replaces the first (`db_cursor_upsert`'s
-//! dup-sort half, `db_dup_cursor_delete_first` and `dup_value_with_same_subkey`). Not ported:
+//! MDBX's behaviour: a second value with the same subkey is refused with `MDBX_KEYEXIST`, the first
+//! kept (`db_cursor_upsert`'s dup-sort half, `db_dup_cursor_delete_first` and
+//! `dup_value_with_same_subkey`). Not ported:
 //! `db_drop_orphan_table` (MDBX's table handles).
 
+use super::dup::second_value_refused;
 use crate::{TndbArgs, TndbEnv, TndbEnvKind};
 use alloy::{
     consensus::Header,
@@ -515,13 +517,15 @@ fn db_cursor_upsert() {
     assert_eq!(dup_cursor.seek_by_key_subkey(key, subkey).unwrap(), Some(entry1));
 
     // Deviation: MDBX keeps both values of the subkey (`entry1`, then `entry2` from
-    // `next_dup_val`). Here a subkey has one row, so the second upsert replaces the first. reth
-    // deletes a (key, subkey) entry before it writes a new one (`seek_by_key_subkey`, then
-    // `delete_current`, then `upsert`), so it never asks for two.
+    // `next_dup_val`). Here a subkey holds one value, so the second upsert is refused with
+    // `MDBX_KEYEXIST` and the first stays. reth deletes a (key, subkey) entry before it writes a
+    // new one (`seek_by_key_subkey`, then `delete_current`, then `upsert`), so it never asks for
+    // two.
     let value = U256::from(2);
     let entry2 = StorageEntry { key: subkey, value };
-    dup_cursor.upsert(key, &entry2).expect(ERROR_UPSERT);
-    assert_eq!(dup_cursor.seek_by_key_subkey(key, subkey).unwrap(), Some(entry2));
+    let upsert = dup_cursor.upsert(key, &entry2);
+    assert!(second_value_refused(&upsert, DatabaseWriteOperation::CursorUpsert, key), "{upsert:?}");
+    assert_eq!(dup_cursor.seek_by_key_subkey(key, subkey).unwrap(), Some(entry1));
     assert_eq!(dup_cursor.next_dup_val().unwrap(), None);
 }
 
@@ -615,14 +619,16 @@ fn db_dup_cursor_delete_first() {
     let entry_1 = StorageEntry { key: B256::with_last_byte(1), value: U256::from(1) };
 
     dup_cursor.upsert(Address::with_last_byte(1), &entry_0).expect(ERROR_UPSERT);
-    dup_cursor.upsert(Address::with_last_byte(1), &entry_1).expect(ERROR_UPSERT);
+    let upsert = dup_cursor.upsert(Address::with_last_byte(1), &entry_1);
 
-    // Deviation: `entry_0` and `entry_1` share a subkey, so the second upsert replaced the first
-    // (MDBX keeps both: see `db_cursor_upsert`). The rest of the test, a walker deleting its
-    // first row, runs on `entry_1` and a second key's row in place of MDBX's two values.
+    // Deviation: `entry_0` and `entry_1` share a subkey, so the second upsert is refused (MDBX
+    // keeps both: see `db_cursor_upsert`). The rest of the test, a walker deleting its first row,
+    // runs on `entry_0` and a second key's row in place of MDBX's two values.
+    let key = Address::with_last_byte(1);
+    assert!(second_value_refused(&upsert, DatabaseWriteOperation::CursorUpsert, key), "{upsert:?}");
     assert_eq!(
         dup_cursor.walk(None).unwrap().collect::<Result<Vec<_>, _>>().unwrap(),
-        vec![(Address::with_last_byte(1), entry_1)]
+        vec![(Address::with_last_byte(1), entry_0)]
     );
     dup_cursor.upsert(Address::with_last_byte(2), &entry_0).expect(ERROR_UPSERT);
 
@@ -640,7 +646,7 @@ fn db_dup_cursor_delete_first() {
             .collect::<Result<Vec<_>, _>>()
             .unwrap(),
         vec![
-            (Address::with_last_byte(2), entry_0), // This is ok - we removed entry_1
+            (Address::with_last_byte(2), entry_0), // This is ok - we removed the first row
         ]
     );
 
@@ -914,9 +920,11 @@ fn dup_value_with_same_subkey() {
     let value01 = StorageEntry { key: B256::with_last_byte(0), value: U256::from(1) };
     env.update(|tx| tx.put::<PlainStorageState>(key1, value01).expect(ERROR_PUT)).unwrap();
 
-    // PUT key1 (0,0)
+    // PUT key1 (0,0). Deviation: subkey 0 holds `value01`, so this put of a second value for it is
+    // refused (MDBX keeps both: see `db_cursor_upsert`).
     let value00 = StorageEntry::default();
-    env.update(|tx| tx.put::<PlainStorageState>(key1, value00).expect(ERROR_PUT)).unwrap();
+    let put = env.update(|tx| tx.put::<PlainStorageState>(key1, value00)).unwrap();
+    assert!(second_value_refused(&put, DatabaseWriteOperation::PutUpsert, key1), "{put:?}");
 
     // PUT key2 (2,2)
     let value22 = StorageEntry { key: B256::with_last_byte(2), value: U256::from(2) };
@@ -930,8 +938,8 @@ fn dup_value_with_same_subkey() {
         let mut walker = cursor.walk(Some(first.0)).unwrap();
 
         // Deviation: MDBX keeps both values of subkey 0, `value00` then `value01`. Here the
-        // second put replaced the first (see `db_cursor_upsert`).
-        assert_eq!((key1, value00), walker.next().unwrap().unwrap());
+        // second put was refused (see `db_cursor_upsert`).
+        assert_eq!((key1, value01), walker.next().unwrap().unwrap());
         assert_eq!((key2, value22), walker.next().unwrap().unwrap());
         assert!(walker.next().is_none());
     }
@@ -941,8 +949,9 @@ fn dup_value_with_same_subkey() {
         let tx = env.tx().expect(ERROR_INIT_TX);
         let mut cursor = tx.cursor_dup_read::<PlainStorageState>().unwrap();
 
-        // MDBX shows the first of its two values with this subkey; here it is the only one.
-        assert_eq!(value00, cursor.seek_by_key_subkey(key1, value00.key).unwrap().unwrap());
+        // MDBX shows the first of its two values with this subkey, `value00`; here the only one is
+        // `value01`.
+        assert_eq!(value01, cursor.seek_by_key_subkey(key1, value00.key).unwrap().unwrap());
         // key1 but value is greater than the one in the DB
         assert_eq!(None, cursor.seek_by_key_subkey(key1, value22.key).unwrap());
     }

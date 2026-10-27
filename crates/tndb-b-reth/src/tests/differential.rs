@@ -41,9 +41,17 @@
 //!    right after the cursor's delete of a key's only row or its `delete_current_duplicates` runs,
 //!    then taints it;
 //! 5. **`append_dup` of the key's last value:** an `append_dup` whose subkey is the key's last
-//!    row's while the key has two rows or more is skipped;
-//! 6. **one value per subkey:** avoided by construction: a write to a dup row that exists writes
-//!    the value it holds (MDBX then keeps the pair as it is), so no subkey ever holds two values;
+//!    row's while the key has two rows or more is skipped (tndb-b refuses it for its order; MDBX
+//!    takes it);
+//! 6. **one value per subkey:** a write to a dup row that exists mostly writes the value it holds
+//!    (both databases keep the pair as it is); a quarter of them ([`K::other_value`]) write another
+//!    value. A `put`, `upsert`, or `append` of the table's last key (a transaction's or a cursor's)
+//!    with another value is a second value for the subkey: MDBX would store it beside the first, so
+//!    it is skipped there and counted here, while tndb-b runs it and must refuse it
+//!    (`MDBX_KEYEXIST` with this crate's message, `second_value_refused`) and change nothing: its
+//!    outcome reads as the skip on both, and every op after it must still match MDBX's, which never
+//!    ran it. (Another value for an earlier key's row by `append` is refused for its order on both
+//!    and runs on both; `insert` and `append_dup` write the value the row holds.)
 //! 7. **`last_dup` before the first row** (libmdbx aborts): only a cursor tainted by `prev` finding
 //!    nothing (or a reverse walk running out) gets there; such a skip counts here;
 //! 8. **a dup key of one row** (MDBX keeps a key's only value apart from its dup values): a
@@ -54,10 +62,12 @@
 //!    row from a cursor that has moved.
 //!
 //! An error other than the expected ones (`MDBX_KEYEXIST`, `MDBX_EKEYMISMATCH`, `MDBX_ENODATA`)
-//! also taints the cursor, counted apart. On a difference proptest shrinks the script, then
-//! prints it with both outcome lists.
+//! also taints the cursor, counted apart. About 4% of the ops are skipped (about 3% in the
+//! default's shorter scripts); a run fails if a tenth or more are (skipped against run), as its
+//! scripts would then test little. On a difference proptest shrinks the script, then prints it
+//! with both outcome lists.
 
-use super::{adapter::create_mdbx_db, mdbx_port::create_test_db};
+use super::{adapter::create_mdbx_db, dup::second_value_refused, mdbx_port::create_test_db};
 use crate::TndbEnvKind;
 use alloy::primitives::{Address, Bytes, B256, U256};
 use proptest::{
@@ -74,6 +84,7 @@ use reth_db_api::{
     DatabaseError,
 };
 use reth_primitives_traits::{Bytecode, StorageEntry};
+use reth_storage_errors::db::DatabaseWriteOperation;
 use std::{cell::RefCell, collections::BTreeMap, mem, ops::Bound};
 
 /// A row of the model: the key's index and, on `PlainStorageState`, the slot's (else 0). Rows
@@ -121,6 +132,15 @@ impl Tb {
 /// A drawn key: a key index and a slot index, each table reading them in its own range.
 #[derive(Clone, Copy, Debug)]
 struct K(u8, u8);
+
+impl K {
+    /// Whether a write of a dup row that exists writes another value for its subkey (class 6): a
+    /// key index of 12 or more, which names the same dup key as one under 12, so a quarter of
+    /// such writes.
+    const fn other_value(self) -> bool {
+        self.0 >= 12
+    }
+}
 
 /// Which value a `delete` passes.
 #[derive(Clone, Copy, Debug)]
@@ -244,7 +264,7 @@ const CLASSES: [&str; 9] = [
     "3 another writer changes the cursor's dup key",
     "4 last_dup or delete_current after an outer delete",
     "5 append_dup of the key's last value",
-    "6 one value per subkey (by construction)",
+    "6 one value per subkey (a second value, refused on tndb-b only)",
     "7 last_dup before the first row",
     "8 a dup key of one row",
     "an unexpected error",
@@ -254,6 +274,7 @@ const RESEEK: usize = 1;
 const KEY_CHANGED: usize = 2;
 const LAST_DUP_AFTER_OUTER: usize = 3;
 const APPEND_DUP_EQUAL: usize = 4;
+const SECOND_VALUE: usize = 5;
 const LAST_DUP_BEFORE_FIRST: usize = 6;
 const ONE_ROW_KEY: usize = 7;
 const UNEXPECTED: usize = 8;
@@ -549,6 +570,9 @@ type Tables = [BTreeMap<Row, u32>; 3];
 /// Runs scripts on one database.
 struct Runner<'d, DB: Database> {
     db: &'d DB,
+    /// Run the writes of a second value for a dup row's subkey, which must be refused (tndb-b);
+    /// else skip them (MDBX, which would store the second value).
+    second_values: bool,
     tx: Option<DB::TXMut>,
     cursors: [Option<AnyCursor<DB::TXMut>>; 3],
     models: [Option<CurModel>; 3],
@@ -598,10 +622,12 @@ const SEED: [Op; 10] = [
     Op::Commit,
 ];
 
-/// Runs `ops` (after [`SEED`]) on `db`, then commits and reads every table back.
-fn run<DB: Database>(db: &DB, ops: &[Op]) -> Run {
+/// Runs `ops` (after [`SEED`]) on `db`, then commits and reads every table back; with
+/// `second_values`, the writes of a second value for a dup row's subkey too ([`Runner`]).
+fn run<DB: Database>(db: &DB, ops: &[Op], second_values: bool) -> Run {
     let mut r = Runner {
         db,
+        second_values,
         tx: Some(db.tx_mut().expect("begin")),
         cursors: [None, None, None],
         models: [None, None, None],
@@ -659,14 +685,48 @@ impl<DB: Database> Runner<'_, DB> {
         self.rows(tb).range((k, 0)..=(k, u8::MAX)).map(|(r, _)| *r)
     }
 
-    /// A new version, or on a dup table the version of the row when it exists: one value per
-    /// subkey, by construction.
-    fn write_ver(&mut self, tb: Tb, row: Row) -> u32 {
-        if let Some(&v) = self.rows(tb).get(&row).filter(|_| tb.dup()) {
+    /// A new version; on a dup table, when the row exists, the version it holds (MDBX keeps the
+    /// pair as it is), unless `other` asks for another: a second value for its subkey (class 6).
+    fn write_ver(&mut self, tb: Tb, row: Row, other: bool) -> u32 {
+        if let Some(&v) = self.rows(tb).get(&row).filter(|_| tb.dup() && !other) {
             return v;
         }
         self.ver += 1;
         self.ver
+    }
+
+    /// Whether a write of version `ver` of `row` (by an append with `append`) gives the row's
+    /// subkey a second value (class 6): on the dup table, the row holds another version, and an
+    /// append names the table's last key (one of an earlier key is refused for its order on both
+    /// databases, and is run on both).
+    fn second_value(&self, tb: Tb, row: Row, ver: u32, append: bool) -> bool {
+        let last_key = || self.rows(tb).last_key_value().is_some_and(|(&(k, _), _)| k == row.0);
+        tb.dup()
+            && self.rows(tb).get(&row).is_some_and(|&held| held != ver)
+            && (!append || last_key())
+    }
+
+    /// A write of a second value for a dup row's subkey, `label`, by `write` with `operation` of
+    /// the row of key `key` (class 6). MDBX would store it beside the first, so it is skipped
+    /// there; tndb-b must refuse it ([`second_value_refused`]) and change nothing, which the ops
+    /// after it check against MDBX, which never ran it. Its outcome reads as the skip on both,
+    /// unless tndb-b's result is not that refusal.
+    fn second_value_write(
+        &mut self,
+        label: String,
+        key: Address,
+        operation: DatabaseWriteOperation,
+        write: impl FnOnce(&mut Self) -> Result<(), DatabaseError>,
+    ) {
+        self.run.skips[SECOND_VALUE] += 1;
+        let mut result = format!("skipped: {}", CLASSES[SECOND_VALUE]);
+        if self.second_values {
+            let res = write(self);
+            if !second_value_refused(&res, operation, key) {
+                result = show_done(&res);
+            }
+        }
+        self.push(label, result);
     }
 
     /// The row after the table's last (on the dup table, mostly a slot after it), for appends in
@@ -693,24 +753,44 @@ impl<DB: Database> Runner<'_, DB> {
             }
             Op::Put(tb, k) => {
                 let row = tb.row(k);
-                let ver = self.write_ver(tb, row);
+                let ver = self.write_ver(tb, row, k.other_value());
+                let label = format!("put {tb:?} {row:?} v{ver}");
+                if self.second_value(tb, row, ver, false) {
+                    self.second_value_write(
+                        label,
+                        S::key(row),
+                        DatabaseWriteOperation::PutUpsert,
+                        |r| r.tx().put::<S>(S::key(row), S::value(row, ver)),
+                    );
+                    return;
+                }
                 let res = by_table!(tb, T => self.tx().put::<T>(T::key(row), T::value(row, ver)));
                 self.run.ran += 1;
                 if res.is_ok() {
                     self.written(None, tb, row, ver);
                 }
-                self.push(format!("put {tb:?} {row:?} v{ver}"), show_done(&res));
+                self.push(label, show_done(&res));
             }
             Op::Append(tb, k, in_order) => {
                 let row = if in_order { self.next_row(tb, k) } else { tb.row(k) };
-                let ver = self.write_ver(tb, row);
+                let ver = self.write_ver(tb, row, k.other_value());
+                let label = format!("append {tb:?} {row:?} v{ver}");
+                if self.second_value(tb, row, ver, true) {
+                    self.second_value_write(
+                        label,
+                        S::key(row),
+                        DatabaseWriteOperation::PutAppend,
+                        |r| r.tx().append::<S>(S::key(row), S::value(row, ver)),
+                    );
+                    return;
+                }
                 let res =
                     by_table!(tb, T => self.tx().append::<T>(T::key(row), T::value(row, ver)));
                 self.run.ran += 1;
                 if res.is_ok() {
                     self.written(None, tb, row, ver);
                 }
-                self.push(format!("append {tb:?} {row:?} v{ver}"), show_done(&res));
+                self.push(label, show_done(&res));
             }
             Op::Delete(tb, k, del) => self.delete(tb, k, del),
             Op::Clear(tb) => {
@@ -983,15 +1063,15 @@ impl<DB: Database> Runner<'_, DB> {
             C::SeekExact(k) => Call::SeekExact(key(k)),
             C::Upsert(k) => {
                 let row = tb.row(k);
-                Call::Upsert(row, self.write_ver(tb, row))
+                Call::Upsert(row, self.write_ver(tb, row, k.other_value()))
             }
             C::Insert(k) => {
                 let row = tb.row(k);
-                Call::Insert(row, self.write_ver(tb, row))
+                Call::Insert(row, self.write_ver(tb, row, false))
             }
             C::Append(k, in_order) => {
                 let row = if in_order { self.next_row(tb, k) } else { tb.row(k) };
-                Call::Append(row, self.write_ver(tb, row))
+                Call::Append(row, self.write_ver(tb, row, k.other_value()))
             }
             C::DeleteCurrent => Call::DeleteCurrent,
             C::NextDup => Call::NextDup,
@@ -1007,7 +1087,7 @@ impl<DB: Database> Runner<'_, DB> {
                         row.1 = last.1.saturating_add(1);
                     }
                 }
-                Call::AppendDup(row, self.write_ver(tb, row))
+                Call::AppendDup(row, self.write_ver(tb, row, false))
             }
             C::DeleteCurrentDuplicates => Call::DeleteCurrentDuplicates,
             C::Walk(s, n) => Call::Walk(s.map(key), n),
@@ -1051,6 +1131,26 @@ impl<DB: Database> Runner<'_, DB> {
             self.run.skips[class] += 1;
             self.push(label, format!("skipped: {}", CLASSES[class]));
             return;
+        }
+        if let Call::Upsert(row, ver) | Call::Append(row, ver) = call {
+            let append = matches!(call, Call::Append(..));
+            if self.second_value(tb, row, ver, append) {
+                let operation = if append {
+                    DatabaseWriteOperation::CursorAppend
+                } else {
+                    DatabaseWriteOperation::CursorUpsert
+                };
+                self.second_value_write(label, S::key(row), operation, |r| {
+                    match r.cursors[slot].as_mut().map(|c| match c {
+                        AnyCursor::S(c) => exec_dup_rw(c, &call),
+                        _ => unreachable!("a dup row write on a write cursor of the dup table"),
+                    }) {
+                        Some(Res::Done(res)) => res,
+                        other => unreachable!("{other:?}"),
+                    }
+                });
+                return;
+            }
         }
         self.run.ran += 1;
         let res = match self.cursors[slot].as_mut().expect("open") {
@@ -1468,8 +1568,8 @@ fn render(want: &[Outcome], have: &[Outcome]) -> String {
 fn differential(ops: &[Op]) -> Result<Run, TestCaseError> {
     let (_mdbx_dir, mdbx) = create_mdbx_db();
     let (_dir, db) = create_test_db(TndbEnvKind::RW);
-    let want = run(&mdbx, ops);
-    let have = run(&db, ops);
+    let want = run(&mdbx, ops, false);
+    let have = run(&db, ops, true);
     if !want.model_misses.is_empty() {
         let misses = want.model_misses.join("\n");
         return Err(TestCaseError::fail(format!(
@@ -1508,7 +1608,10 @@ fn differential_cases(cases: u32, len: usize) {
     for (class, n) in CLASSES.iter().zip(totals.skips) {
         println!("  {n:7}  {class}");
     }
-    assert!(skipped * 5 < totals.ran, "over a sixth of the ops skipped: the scripts test little");
+    assert!(
+        skipped * 10 < totals.ran,
+        "skipped ops reached a tenth of the ops run: the scripts test little"
+    );
 }
 
 /// Random scripts of transaction and cursor calls on three tables (one dup-sort, one with

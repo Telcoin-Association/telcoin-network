@@ -35,6 +35,10 @@
 //! not once per transaction. The writer keeps a weak reference to every snapshot it
 //! published, oldest first, to learn the oldest state a reader may still be reading
 //! ([`Writer::oldest_reader_txn`]): a page freed after that state must not be reused yet.
+//! Each snapshot in that queue records when the next commit superseded it (one clock read per
+//! commit), and each commit stores the time the oldest live reader's snapshot was superseded,
+//! which [`Env::oldest_reader_age`] reads without a lock: a long reader keeps freed pages from
+//! reuse, so the file grows, and this lets a caller notice. Readers pay nothing for it.
 //!
 //! ## Page reuse
 //!
@@ -49,9 +53,10 @@ use std::{
     os::unix::fs::{FileExt as _, MetadataExt as _},
     path::{Path, PathBuf},
     sync::{
-        atomic::{fence, Ordering},
+        atomic::{fence, AtomicU64, Ordering},
         Arc, Weak,
     },
+    time::{Duration, Instant},
 };
 
 use parking_lot::{Condvar, Mutex, RwLock};
@@ -235,6 +240,12 @@ pub(crate) struct EnvInner {
     /// A read-only environment's mapping ([`Env::open_read_only`]); `None` in one with a writer,
     /// whose page file the writer's state holds.
     read_only: Option<ReadOnlyFile>,
+    /// The base of the writer's clock ([`Self::clock`]).
+    clock_base: Instant,
+    /// When the snapshot of the oldest live reader was superseded, as of the last commit
+    /// ([`Writer::publish`]), on [`Self::clock`]; [`NOT_SUPERSEDED`] when that reader holds the
+    /// current snapshot. Read by [`Env::oldest_reader_age`].
+    oldest_superseded: AtomicU64,
     /// Test-only: drop as a crash would, without the final sync.
     #[cfg(test)]
     pub(crate) crash_on_drop: std::sync::atomic::AtomicBool,
@@ -258,6 +269,8 @@ impl EnvInner {
             writer: Mutex::new(writer),
             writer_back: Condvar::new(),
             read_only,
+            clock_base: Instant::now(),
+            oldest_superseded: AtomicU64::new(NOT_SUPERSEDED),
             #[cfg(test)]
             crash_on_drop: std::sync::atomic::AtomicBool::new(false),
         }
@@ -266,6 +279,12 @@ impl EnvInner {
     /// The newest committed state.
     pub(crate) fn current(&self) -> Arc<Snapshot> {
         Arc::clone(&self.current.read())
+    }
+
+    /// The time since [`Self::clock_base`], in nanoseconds: the clock of the reader queue's
+    /// superseded-at times.
+    fn clock(&self) -> u64 {
+        u64::try_from(self.clock_base.elapsed().as_nanos()).unwrap_or(NOT_SUPERSEDED - 1)
     }
 
     /// `Err(ReadOnly)` in a read-only environment: it has no writer, so whatever needs one
@@ -333,6 +352,30 @@ impl Drop for EnvInner {
     }
 }
 
+/// [`Published::superseded_at`] of the current snapshot, and [`EnvInner::oldest_superseded`]
+/// when no live reader holds a superseded one.
+const NOT_SUPERSEDED: u64 = u64::MAX;
+
+/// A snapshot the writer published, in its reader queue ([`Writer::readers`]).
+#[derive(Debug)]
+struct Published {
+    /// The snapshot's txn.
+    txn: u64,
+    /// The snapshot, alive while the environment or a reader holds it.
+    snapshot: Weak<Snapshot>,
+    /// When the next commit published over it, on [`EnvInner::clock`] ([`NOT_SUPERSEDED`] while
+    /// it is the current snapshot).
+    superseded_at: u64,
+}
+
+impl Published {
+    /// The current snapshot's entry.
+    fn current(snapshot: &Arc<Snapshot>) -> Self {
+        let txn = snapshot.meta.txn;
+        Self { txn, snapshot: Arc::downgrade(snapshot), superseded_at: NOT_SUPERSEDED }
+    }
+}
+
 /// The single writer's state, held by one write transaction at a time: the page file, the
 /// page allocator, the newest committed state, what the meta slots hold on disk, and the
 /// snapshots published to readers.
@@ -356,7 +399,7 @@ pub(crate) struct Writer {
     /// [`SyncMode::NoSync`]: the pages commits stamped since the last sync.
     unsynced: PageSet,
     /// The snapshots published, oldest first (see [`Self::oldest_reader_txn`]).
-    readers: VecDeque<(u64, Weak<Snapshot>)>,
+    readers: VecDeque<Published>,
     /// The queue's length after its last full pass (see [`Self::prune_readers`]).
     readers_kept: usize,
     /// The tree writes' reused buffers ([`PageWrite::take_scratch`]).
@@ -505,26 +548,32 @@ impl Writer {
     }
 
     /// Publish `meta` as the newest committed state (commit step 7): readers that begin from
-    /// now on see it.
+    /// now on see it. The snapshot it supersedes records the time, and the superseded-at time of
+    /// the oldest live reader's snapshot goes to [`EnvInner::oldest_superseded`].
     pub(crate) fn publish(&mut self, inner: &EnvInner, meta: Meta) {
         let view = self.file.view();
         view.publish_len(u64::from(meta.page_count) * self.geometry.page_size() as u64);
         let snapshot = Arc::new(Snapshot::new(meta, self.geometry, view));
-        self.readers.push_back((meta.txn, Arc::downgrade(&snapshot)));
+        if let Some(previous) = self.readers.back_mut() {
+            previous.superseded_at = inner.clock();
+        }
+        self.readers.push_back(Published::current(&snapshot));
         self.last = meta;
         *inner.current.write() = snapshot;
         self.prune_readers();
+        let oldest = self.readers.front().map_or(NOT_SUPERSEDED, |p| p.superseded_at);
+        inner.oldest_superseded.store(oldest, Ordering::Relaxed);
     }
 
     /// Drop the snapshots no reader holds from the front of the queue. A reader stuck on an old
     /// snapshot keeps the front, so the dead entries behind it are also dropped, in a pass each
     /// time the queue doubles: it stays bounded by the live snapshots.
     fn prune_readers(&mut self) {
-        while self.readers.front().is_some_and(|(_, r)| r.strong_count() == 0) {
+        while self.readers.front().is_some_and(|p| p.snapshot.strong_count() == 0) {
             self.readers.pop_front();
         }
         if self.readers.len() > 2 * self.readers_kept.max(16) {
-            self.readers.retain(|(_, r)| r.strong_count() > 0);
+            self.readers.retain(|p| p.snapshot.strong_count() > 0);
             self.readers_kept = self.readers.len();
         }
     }
@@ -534,7 +583,7 @@ impl Writer {
     /// live reader's snapshot.
     pub(crate) fn oldest_reader_txn(&mut self) -> u64 {
         self.prune_readers();
-        let txn = self.readers.front().map_or(self.last.txn, |&(txn, _)| txn);
+        let txn = self.readers.front().map_or(self.last.txn, |p| p.txn);
         // Pairs with the `Release` decrement of each snapshot's last `Arc` drop, so a reader's
         // final reads of a page happen before this writer reuses it.
         fence(Ordering::Acquire);
@@ -863,7 +912,7 @@ impl Env {
             last: meta,
             slots: chosen.slots,
             unsynced: PageSet::default(),
-            readers: VecDeque::from([(meta.txn, Arc::downgrade(&snapshot))]),
+            readers: VecDeque::from([Published::current(&snapshot)]),
             readers_kept: 1,
             scratch: Scratch::default(),
             #[cfg(test)]
@@ -916,6 +965,22 @@ impl Env {
     /// table for as long as it lives, whatever commits meanwhile.
     pub fn begin_ro(&self) -> Result<RoTxn> {
         Ok(RoTxn::new(Arc::clone(&self.inner), self.inner.current()))
+    }
+
+    /// How long the oldest live reader has held a superseded snapshot: the time since a commit
+    /// published a newer state over the oldest snapshot a reader still holds. `None` when every
+    /// live reader holds the current snapshot (or none is open), and always in an environment
+    /// opened read-only, which never commits. While such a reader lives, the pages freed after
+    /// its snapshot are not reused, so the file grows instead; they become reusable once it
+    /// ends.
+    ///
+    /// Lock-free, and free for readers: each commit records the time and refreshes the value
+    /// after it publishes, so between commits a reader that has ended still counts until the
+    /// next commit.
+    pub fn oldest_reader_age(&self) -> Option<Duration> {
+        let since = self.inner.oldest_superseded.load(Ordering::Relaxed);
+        (since != NOT_SUPERSEDED)
+            .then(|| Duration::from_nanos(self.inner.clock().saturating_sub(since)))
     }
 
     /// Begin the write transaction, waiting while another one is open (from any thread: a
@@ -978,10 +1043,9 @@ impl Env {
         }
     }
 
-    /// The pages the free list of the newest committed state holds: pages a later write may
-    /// reuse, once no reader needs them (MDBX's `freelist`). It reads every free record, with the
-    /// checks the allocator's reads make; damage is [`Error::Corrupt`] and latches the
-    /// environment.
+    /// The pages the free list of the newest committed state holds: pages a later write may reuse,
+    /// once no reader needs them. It reads every free record, with the checks the allocator's reads
+    /// make; damage is [`Error::Corrupt`] and latches the environment.
     pub fn free_pages(&self) -> Result<u64> {
         let inner = &self.inner;
         let snapshot = inner.current();

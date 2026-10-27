@@ -3,7 +3,7 @@
 use crate::{
     cursor::{TndbCursor, TndbCursorMut},
     dup::DupLayout,
-    env::{resolve, TableMap},
+    env::{resolve, ReaderWatch, TableMap},
     error::{self, Mdbx},
 };
 use parking_lot::Mutex;
@@ -114,8 +114,9 @@ impl DbTx for TndbTx {
         Ok(stat.entries as usize)
     }
 
-    /// Does nothing: tndb-b never times a read transaction out. A long one only holds back page
-    /// reuse, so the file grows instead.
+    /// Does nothing: tndb-b has no read timeout to disable. A long read transaction only holds
+    /// back page reuse, so the file grows until it ends; a commit made while it has held a
+    /// superseded snapshot for over a minute logs a warning instead (at most once a minute).
     fn disable_long_read_transaction_safety(&mut self) {}
 }
 
@@ -127,11 +128,13 @@ impl DbTx for TndbTx {
 pub struct TndbTxMut {
     txn: SharedTxn,
     tables: Arc<TableMap>,
+    /// The environment's long-reader warning, run after a successful commit.
+    watch: Arc<ReaderWatch>,
 }
 
 impl TndbTxMut {
-    pub(crate) fn new(txn: RwTxn, tables: Arc<TableMap>) -> Self {
-        Self { txn: Arc::new(Mutex::new(Some(txn))), tables }
+    pub(crate) fn new(txn: RwTxn, tables: Arc<TableMap>, watch: Arc<ReaderWatch>) -> Self {
+        Self { txn: Arc::new(Mutex::new(Some(txn))), tables, watch }
     }
 
     /// Run `f` on the transaction; `on_finished` makes the error for one already finished
@@ -148,8 +151,8 @@ impl TndbTxMut {
 
     /// `tx.put` or `tx.append` (`append`) of `key` and `value` into `T`. An append follows
     /// MDBX's rule: the table's last key is taken again, its value replaced (on a dup-sort table,
-    /// with a value anywhere among its rows). On a dup-sort table a put stores the row of
-    /// `value`'s subkey (replacing one with the same subkey).
+    /// with a value anywhere among its rows). On a dup-sort table both store the row of `value`'s
+    /// subkey as [`insert_dup`] does: a second value for a subkey the key holds is refused.
     fn put_kind<T: Table>(
         &self,
         key: T::Key,
@@ -186,22 +189,45 @@ impl TndbTxMut {
             let rest = dup
                 .join(key, value, &mut stored)
                 .ok_or_else(|| error::bad_size(operation, T::NAME, key))?;
-            if !append {
-                return txn.put(table, &stored, rest).map_err(fail);
-            }
-            match txn.append(table, &stored, rest) {
-                Err(tndb_b::Error::AppendOutOfOrder) => {
-                    let last = txn.cursor(table).map_err(fail)?.last().map_err(fail)?;
-                    if last.is_some_and(|(found, _)| dup.is_row_of(found, key)) {
-                        txn.put(table, &stored, rest)
-                    } else {
-                        Err(tndb_b::Error::AppendOutOfOrder)
+            let stored_row = if append {
+                match txn.append(table, &stored, rest) {
+                    Err(tndb_b::Error::AppendOutOfOrder) => {
+                        let last = txn.cursor(table).map_err(fail)?.last().map_err(fail)?;
+                        if last.is_some_and(|(found, _)| dup.is_row_of(found, key)) {
+                            insert_dup(txn, table, &stored, rest)
+                        } else {
+                            Err(tndb_b::Error::AppendOutOfOrder)
+                        }
                     }
+                    appended => appended.map(|()| true),
                 }
-                appended => appended,
+            } else {
+                insert_dup(txn, table, &stored, rest)
+            };
+            if stored_row.map_err(fail)? {
+                Ok(())
+            } else {
+                Err(error::second_dup_value(operation, T::NAME, key))
             }
-            .map_err(fail)
         })
+    }
+}
+
+/// Insert the dup-sort row `stored` (its stored key, `key ‖ subkey`) with stored value `rest` into
+/// `table`, as MDBX puts a (key, subkey) pair: `Ok(true)` when the row is new and stored, and when
+/// it holds `rest` already (MDBX's put of a pair it holds, which changes nothing). `Ok(false)`
+/// when it holds another value: a second value for the subkey, which this crate refuses, having
+/// changed nothing (the crate docs' differences from MDBX). The present row is found by the
+/// insert's own search, so a new row costs what a put does.
+pub(crate) fn insert_dup(
+    txn: &mut RwTxn,
+    table: &EngineTable,
+    stored: &[u8],
+    rest: &[u8],
+) -> tndb_b::Result<bool> {
+    match txn.insert(table, stored, rest) {
+        Err(tndb_b::Error::KeyExists) => Ok(txn.get(table, stored)? == Some(rest)),
+        inserted => inserted.map(|()| true),
     }
 }
 
@@ -234,7 +260,9 @@ impl DbTx for TndbTxMut {
     fn commit(self) -> Result<(), DatabaseError> {
         let commit_error = |e: tndb_b::Error| DatabaseError::Commit(error::info(&e));
         let txn = self.txn.lock().take().ok_or_else(|| commit_error(error::finished()))?;
-        txn.commit().map(drop).map_err(commit_error)
+        txn.commit().map_err(commit_error)?;
+        self.watch.after_commit();
+        Ok(())
     }
 
     fn abort(self) {

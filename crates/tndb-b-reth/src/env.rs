@@ -18,12 +18,93 @@ use std::{
     collections::HashMap,
     hash::{BuildHasherDefault, Hasher},
     path::Path,
-    sync::Arc,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
+    time::{Duration, Instant},
 };
 use tndb_b::{Env, EnvOptions, ReadTxn, SyncMode, Table};
 
 /// The name of the page file inside the environment's directory.
 pub const DATA_FILE: &str = "tndb.dat";
+
+/// How long a reader may hold a superseded snapshot ([`Env::oldest_reader_age`]) before a commit
+/// warns about it. While it does, the pages freed since are not reused, so the file grows.
+pub(crate) const LONG_READER_WARN_AFTER: Duration = Duration::from_secs(60);
+
+/// The least time between two long-reader warnings of one environment.
+pub(crate) const LONG_READER_WARN_INTERVAL: Duration = Duration::from_secs(60);
+
+/// [`ReaderWatch::last_warned`] before the first warning.
+pub(crate) const NEVER_WARNED: u64 = u64::MAX;
+
+/// The long-reader warning of one environment: after each commit, a `warn!` when the oldest live
+/// reader has held a superseded snapshot for over `warn_after`, at most once per `interval`.
+/// Readers pay nothing for it, and a commit one atomic load and a comparison while no reader
+/// holds a superseded snapshot, plus a clock read while one does.
+#[derive(Debug)]
+pub(crate) struct ReaderWatch {
+    /// The environment watched.
+    env: Env,
+    /// The age past which a reader is reported ([`LONG_READER_WARN_AFTER`]).
+    warn_after: Duration,
+    /// The least time between two warnings ([`LONG_READER_WARN_INTERVAL`]).
+    interval: Duration,
+    /// The base of the clock of [`Self::last_warned`].
+    clock_base: Instant,
+    /// When the last warning was given, in nanoseconds since [`Self::clock_base`]
+    /// ([`NEVER_WARNED`] before the first).
+    last_warned: AtomicU64,
+}
+
+impl ReaderWatch {
+    /// A watch of `env` that warns about a reader older than `warn_after`, at most once per
+    /// `interval`.
+    pub(crate) fn new(env: Env, warn_after: Duration, interval: Duration) -> Self {
+        let last_warned = AtomicU64::new(NEVER_WARNED);
+        Self { env, warn_after, interval, clock_base: Instant::now(), last_warned }
+    }
+
+    /// Run after each successful commit: warn if the oldest reader is over the limit and no
+    /// warning was given in the last `interval`.
+    pub(crate) fn after_commit(&self) {
+        if let Some(age) = self.env.oldest_reader_age() {
+            if age > self.warn_after {
+                self.warn(age);
+            }
+        }
+    }
+
+    /// Warn about a reader of age `age`, unless the last warning was under `interval` ago. Of
+    /// commits finishing at once, only the one whose exchange wins warns.
+    #[cold]
+    #[inline(never)]
+    fn warn(&self, age: Duration) {
+        let now = u64::try_from(self.clock_base.elapsed().as_nanos()).unwrap_or(NEVER_WARNED - 1);
+        let last = self.last_warned.load(Ordering::Relaxed);
+        if warning_due(last, now, self.interval)
+            && self
+                .last_warned
+                .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+        {
+            tracing::warn!(
+                age = ?age,
+                "A database read transaction has held an old snapshot for over {:?}: pages freed \
+                 since it began are not reused until it ends, so the file grows meanwhile",
+                self.warn_after,
+            );
+        }
+    }
+}
+
+/// Whether a long-reader warning is due at `now` when the last one was given at `last` (both in
+/// nanoseconds on [`ReaderWatch`]'s clock; `last` is [`NEVER_WARNED`] before the first): the first
+/// is, and then one at least `interval` after the last.
+pub(crate) fn warning_due(last: u64, now: u64, interval: Duration) -> bool {
+    last == NEVER_WARNED || Duration::from_nanos(now.saturating_sub(last)) >= interval
+}
 
 /// How an environment is opened: as reth's `DatabaseEnvKind`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -180,6 +261,8 @@ pub struct TndbEnv {
     env: Env,
     tables: Arc<TableMap>,
     kind: TndbEnvKind,
+    /// The long-reader warning, which each write transaction runs after its commit.
+    watch: Arc<ReaderWatch>,
 }
 
 impl TndbEnv {
@@ -206,7 +289,15 @@ impl TndbEnv {
                 tables.insert(name, TableEntry::new(table));
             }
         }
-        Ok(Self { env, tables: Arc::new(tables), kind })
+        let watch =
+            ReaderWatch::new(env.clone(), LONG_READER_WARN_AFTER, LONG_READER_WARN_INTERVAL);
+        Ok(Self { env, tables: Arc::new(tables), kind, watch: Arc::new(watch) })
+    }
+
+    /// Test-only: warn about a reader older than `warn_after`, at most once per `interval`.
+    #[cfg(test)]
+    pub(crate) fn set_long_reader_limits(&mut self, warn_after: Duration, interval: Duration) {
+        self.watch = Arc::new(ReaderWatch::new(self.env.clone(), warn_after, interval));
     }
 
     /// Create every one of reth's [`Tables`] the file lacks, and add them to the table map, as
@@ -226,6 +317,7 @@ impl TndbEnv {
             created.push((name, TableEntry::new(table)));
         }
         txn.commit().map_err(|e| DatabaseError::Commit(error::info(&e)))?;
+        self.watch.after_commit();
         Arc::make_mut(&mut self.tables).extend(created);
         Ok(())
     }
@@ -295,7 +387,7 @@ impl Database for TndbEnv {
     /// crate's while it waits.
     fn tx_mut(&self) -> Result<Self::TXMut, DatabaseError> {
         let txn = self.env.begin_rw().map_err(|e| DatabaseError::InitTx(error::info(&e)))?;
-        Ok(TndbTxMut::new(txn, Arc::clone(&self.tables)))
+        Ok(TndbTxMut::new(txn, Arc::clone(&self.tables), Arc::clone(&self.watch)))
     }
 }
 

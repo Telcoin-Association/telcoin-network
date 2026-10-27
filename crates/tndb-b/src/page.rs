@@ -24,9 +24,9 @@
 //! `upper − (24 + 2·nkeys)`. With `used` = the bytes of every cell plus its slot,
 //! `free + used == U` always holds, where `U = P − 28` (header and trailer).
 //!
-//! **Branches** hold one cell per child (LMDB-style uniform cells): cell i's key is the lower
-//! bound of child i's key range, and cell 0's key is empty and stands for −∞, so the child for a
-//! key is the last cell whose key is `<=` it.
+//! **Branches** hold one cell per child (each a key and a child): cell i's key is the lower bound
+//! of child i's key range, and cell 0's key is empty and stands for −∞, so the child for a key is
+//! the last cell whose key is `<=` it.
 //!
 //! **Limits.** An entry (cell plus slot) is at most `MAX_ENTRY = U / 4` bytes:
 //! `max_key = MAX_ENTRY − 12` (so any key fits a branch cell as a separator) and

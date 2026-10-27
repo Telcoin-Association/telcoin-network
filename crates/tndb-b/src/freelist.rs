@@ -1,5 +1,5 @@
 //! The free list: a B+tree (the free tree, named by the meta) of the pages committed transactions
-//! freed, LMDB style.
+//! freed.
 //!
 //! A record's key is `txn u64 BE | seq u32 BE` (a transaction and a sequence number, so records
 //! sort by txn) and its value the page numbers, strictly ascending, as `u32` LE (at most
@@ -20,16 +20,16 @@
 //!
 //! **Saving** at commit ([`save`]), with loading stopped (pages come from the pool or the end of
 //! the file): the records taken are deleted, then the pages to list are written. Those left in the
-//! pool (taken from records, or added to the file by this transaction, and in no tree now) are
-//! free in every state a durable meta or a reader holds, so they go back under the keys of the
-//! records taken, which the gate has passed, and the next transaction may take them at once, as
-//! LMDB and MDBX do. Those the transaction freed, and pool pages past what the keys taken hold,
-//! are written as records `(M, 0..k)` of the committing txn `M`. Two records never list one page:
-//! the records taken are gone, and the keys taken are free for the save to write. Writing can take
-//! pages from the pool and free pages of the free tree, which changes the lists, so they are
-//! written again until they list exactly what they should: a fixed point, reached in at most three
-//! rounds. Keys are never deleted inside the loop (a record no longer needed is left empty), so a
-//! round never frees a page a later round must list.
+//! pool (taken from records, or added to the file by this transaction, and in no tree now) are free
+//! in every state a durable meta or a reader holds, so they go back under the keys of the records
+//! taken, which the gate has passed, and the next transaction may take them at once. Those the
+//! transaction freed, and pool pages past what the keys taken hold, are written as records
+//! `(M, 0..k)` of the committing txn `M`. Two records never list one page: the records taken are
+//! gone, and the keys taken are free for the save to write. Writing can take pages from the pool
+//! and free pages of the free tree, which changes the lists, so they are written again until they
+//! list exactly what they should: a fixed point, reached in at most three rounds. Keys are never
+//! deleted inside the loop (a record no longer needed is left empty), so a round never frees a page
+//! a later round must list.
 
 use crate::{
     crc::{self, CrcState},

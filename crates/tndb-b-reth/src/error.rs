@@ -137,6 +137,23 @@ pub(crate) fn bad_size(
         .into()
 }
 
+/// The error for a write of a second value for a (key, subkey) that dup-sort table `table_name`
+/// holds with another value: this crate stores one value per subkey (the crate docs' differences
+/// from MDBX), so it refuses the write, which changed nothing, with MDBX's `MDBX_KEYEXIST` code and
+/// a message of its own, as a write error naming the key.
+pub(crate) fn second_dup_value(
+    operation: DatabaseWriteOperation,
+    table_name: &'static str,
+    key: &[u8],
+) -> DatabaseError {
+    let message = format!(
+        "tndb-b-reth stores one value per subkey in dup-sort table {table_name}, and this key and \
+         subkey already hold a different value"
+    );
+    let info = Mdbx::KEY_EXIST.with_message(message);
+    DatabaseWriteError { info, operation, table_name, key: key.to_vec() }.into()
+}
+
 /// The error for a table that does not exist, as MDBX reports a table it cannot open.
 pub(crate) fn table_not_found() -> DatabaseError {
     DatabaseError::Open(Mdbx::NOT_FOUND.info())

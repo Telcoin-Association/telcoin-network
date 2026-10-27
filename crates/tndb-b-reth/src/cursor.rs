@@ -1,18 +1,19 @@
 //! reth's cursors: [`TndbCursor`] over a read-only transaction and [`TndbCursorMut`] over a
 //! read-write one.
 //!
-//! Both follow MDBX's rules, which the engine's cursors share: `seek` lands on the first key at or
-//! after its key, and after `delete_current` the cursor is on the deleted row's follower, as
-//! MDBX's is: `next` and `current` return the follower, `prev` the row before it, and another
-//! `delete_current` deletes it. After `last` a cursor ends the table: `next` finds nothing and the
-//! cursor stays on the row, even once another cursor appends past it. A missed `seek_exact` or
+//! Both follow MDBX's rules, most of which are the engine cursors' own: `seek` lands on the first
+//! key at or after its key, and after `delete_current` the cursor is on the deleted row's
+//! follower, as MDBX's is: `next` and `current` return the follower, `prev` the row before it, and
+//! another `delete_current` deletes it. After `last` the cursor ends the table, as MDBX's does (its
+//! `Pos::End` state; the engine's cursor is simply on the row): `next` finds nothing and the cursor
+//! stays on the row, even once another cursor appends past it. A missed `seek_exact` or
 //! `seek_by_key_subkey` leaves the cursor unset, as MDBX's: every relative move (`next`, `prev`,
 //! `current` and the dup moves) then finds nothing and a delete has nothing to delete, until an
 //! absolute move or a write places it again. After `upsert`, `insert` or `append` the cursor is on
 //! the row written; after a refused `insert` it is on the present key, after a refused `append` on
-//! the table's last row, and after an `append` that replaces the last key's value it ends the
-//! table as after `last`, as MDBX leaves it. A write refused for its size leaves the cursor where
-//! it was, in whatever state, as MDBX's refusal does.
+//! the table's last row as after `last`, and after an `append` that replaces the last key's value
+//! it ends the table as after `last`, as MDBX leaves it. A write refused for its size leaves the
+//! cursor where it was, in whatever state, as MDBX's refusal does.
 //!
 //! On a dup-sort table (stored as composite keys, see [`crate::dup`]) a row's value (subkey, then
 //! the rest) is read as one slice of the page, since a leaf cell holds its value right after its
@@ -154,8 +155,8 @@ impl Moves for Locked<'_, '_> {
 }
 
 /// Where a cursor is, beyond its engine cursor's state: MDBX tells a fresh cursor from one a
-/// missed lookup left unset, which the engine's cursors (unset in both cases) do not, and a
-/// dup-sort cursor at the end of its key's rows after a delete.
+/// missed lookup left unset, which the engine's cursors (unset in both cases) do not, a cursor
+/// that ends the table after `last`, and a dup-sort cursor at the end of its key's rows.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Pos {
     /// Made and not moved: `next_dup`, `next_no_dup` and `next_dup_val` go to the first row and
@@ -166,6 +167,15 @@ enum Pos {
     Missed,
     /// The engine cursor's state is the cursor's.
     Engine,
+    /// A cursor over a table without duplicates on the table's last row, where MDBX's cursor ends
+    /// the table: left by `last`, a fresh `prev`, and an `append` of the last key (taken
+    /// again) or refused for its order. `next` finds nothing and the cursor stays on the row, even
+    /// once another writer has put a later key, until another move or a write. The row's key is
+    /// kept ([`Rows::end_key`]): once the row is deleted (by another writer, or by the cursor's
+    /// own `delete_current`), the engine cursor is on its follower in its deleted state, which
+    /// `next` and `current` return, as from [`Pos::Engine`], and the cursor is then as there.
+    /// Every other call is as from [`Pos::Engine`].
+    End,
     /// Right after its own delete of a dup key's last row that left the key no rows (or its
     /// `delete_current_duplicates`): the engine cursor is on the follower, the next key's first
     /// row, in its deleted state. `prev_dup` finds nothing, as MDBX's does, even once another
@@ -191,6 +201,8 @@ struct Rows {
     dup: Option<DupLayout>,
     pos: Pos,
     value: Vec<u8>,
+    /// The key of the row a [`Pos::End`] cursor is on (reused).
+    end_key: Vec<u8>,
 }
 
 /// The width of the stack buffer a `seek_by_key_subkey` key, `key ‖ subkey`, is built in
@@ -250,7 +262,7 @@ fn dup_value_of<T: Table>(row: Option<Entry<'_>>) -> ValueOnlyResult<T> {
 
 impl Rows {
     const fn new(dup: Option<DupLayout>) -> Self {
-        Self { dup, pos: Pos::Fresh, value: Vec::new() }
+        Self { dup, pos: Pos::Fresh, value: Vec::new(), end_key: Vec::new() }
     }
 
     /// Where a write through the cursor that ended with `result` leaves it. A write the engine
@@ -325,18 +337,29 @@ impl Rows {
 
     fn last<T: Table>(&mut self, m: &mut impl Moves) -> PairResult<T> {
         let entry = m.last().map_err(error::read)?;
-        self.pos = self.ended(entry.is_some());
+        self.pos = self.ended(entry.map(|(key, _)| key));
         pair!(self, m, entry)
     }
 
-    /// The position after a move that took the table's last row as MDBX's `last` does (`found`:
-    /// there was one): on a dup-sort table, the end of its key's rows.
-    const fn ended(&self, found: bool) -> Pos {
-        if found && self.dup.is_some() {
-            Pos::DupEnd { soft: true }
-        } else {
-            Pos::Engine
+    /// The position after a move that took the table's last row as MDBX's `last` does, the row
+    /// of the stored key `landed` (`None`: the table is empty): on a dup-sort table, the end of
+    /// its key's rows; on another table, the end of the table, with the key kept.
+    fn ended(&mut self, landed: Option<&[u8]>) -> Pos {
+        match landed {
+            Some(_) if self.dup.is_some() => Pos::DupEnd { soft: true },
+            Some(key) => {
+                self.end_key.clear();
+                self.end_key.extend_from_slice(key);
+                Pos::End
+            }
+            None => Pos::Engine,
         }
+    }
+
+    /// Whether `entry`, the engine cursor's current row as a [`Pos::End`] cursor's call found it,
+    /// is still the row the cursor ends the table at: else another writer deleted it.
+    fn on_end_row(&self, entry: Option<Entry<'_>>) -> bool {
+        entry.is_some_and(|(key, _)| key == self.end_key)
     }
 
     fn seek<T: Table>(&mut self, m: &mut impl Moves, key: &[u8]) -> PairResult<T> {
@@ -365,6 +388,16 @@ impl Rows {
                 return Ok(None);
             }
             Pos::DupEnd { .. } => past_dup_end(m, self.layout::<T>()?, false),
+            // Nothing, the cursor staying on the row; once another writer has deleted it, the
+            // follower, which `current` returns as `next` would.
+            Pos::End => {
+                let entry = m.current().map_err(error::read)?;
+                if self.on_end_row(entry) {
+                    self.pos = Pos::End;
+                    return Ok(None);
+                }
+                Ok(entry)
+            }
             Pos::Fresh | Pos::Engine | Pos::KeyDeleted => m.next(),
         };
         let entry = entry.map_err(error::read)?;
@@ -381,10 +414,10 @@ impl Rows {
             // From a fresh cursor the last row, which MDBX takes by its `last`.
             Pos::Fresh => {
                 let entry = m.prev();
-                self.pos = self.ended(matches!(entry, Ok(Some(_))));
+                self.pos = self.ended(landed(&entry));
                 entry
             }
-            Pos::DupEnd { soft: true } | Pos::Engine | Pos::KeyDeleted => m.prev(),
+            Pos::DupEnd { soft: true } | Pos::Engine | Pos::End | Pos::KeyDeleted => m.prev(),
         };
         let entry = entry.map_err(error::read)?;
         pair!(self, m, entry)
@@ -395,6 +428,9 @@ impl Rows {
             return Ok(None);
         }
         let entry = m.current().map_err(error::read)?;
+        if self.pos == Pos::End && !self.on_end_row(entry) {
+            self.pos = Pos::Engine;
+        }
         pair!(self, m, entry)
     }
 
@@ -448,7 +484,7 @@ impl Rows {
                 self.pos = Pos::DupEnd { soft: true };
                 Ok(None)
             }
-            Pos::Engine => m.next_in_prefix(dup.key),
+            Pos::Engine | Pos::End => m.next_in_prefix(dup.key),
             Pos::KeyDeleted => {
                 let entry = m.next_in_prefix(dup.key);
                 if matches!(entry, Ok(Some(_))) {
@@ -468,7 +504,7 @@ impl Rows {
         match std::mem::replace(&mut self.pos, Pos::Engine) {
             Pos::Fresh => {
                 let entry = m.last();
-                self.pos = self.ended(matches!(entry, Ok(Some(_))));
+                self.pos = self.ended(landed(&entry));
                 entry
             }
             pos @ (Pos::Missed | Pos::KeyDeleted) => {
@@ -476,7 +512,7 @@ impl Rows {
                 Ok(None)
             }
             Pos::DupEnd { soft: false } => past_dup_end(m, dup, true),
-            Pos::DupEnd { soft: true } | Pos::Engine => m.prev_in_prefix(dup.key),
+            Pos::DupEnd { soft: true } | Pos::Engine | Pos::End => m.prev_in_prefix(dup.key),
         }
     }
 
@@ -496,7 +532,7 @@ impl Rows {
                 return Ok(None);
             }
             Pos::DupEnd { .. } => return past_dup_end(m, dup, false),
-            Pos::Engine | Pos::KeyDeleted => {}
+            Pos::Engine | Pos::End | Pos::KeyDeleted => {}
         }
         match m.next_in_prefix(dup.key)?.map(|(stored, _)| dup.past(stored)) {
             Some(past) => m.seek(&past),
@@ -517,7 +553,7 @@ impl Rows {
         let entry = match self.pos {
             Pos::Fresh | Pos::Missed => return Ok(None),
             Pos::DupEnd { .. } => past_dup_end(m, dup, true)?,
-            Pos::Engine | Pos::KeyDeleted => {
+            Pos::Engine | Pos::End | Pos::KeyDeleted => {
                 if m.current()?.is_none() {
                     return Ok(None);
                 }
@@ -579,6 +615,14 @@ fn past_dup_end(
         m.prev()
     } else {
         m.seek(&past)
+    }
+}
+
+/// The stored key of the row a move landed on, if it landed on one.
+fn landed<'a>(moved: &tndb_b::Result<Option<Entry<'a>>>) -> Option<&'a [u8]> {
+    match moved {
+        Ok(Some((key, _))) => Some(key),
+        _ => None,
     }
 }
 
@@ -838,7 +882,8 @@ impl<T: Table> DbCursorRO<T> for TndbCursorMut<T> {
 
 impl<T: Table> TndbCursorMut<T> {
     /// A write through the cursor of `key` and `value` by `operation`; see [`Rows::wrote`] for
-    /// where it leaves the cursor.
+    /// where it leaves the cursor. A second value for a dup-sort row's subkey is refused before
+    /// that ([`insert_dup_at`]), so it leaves the cursor as it was.
     fn write(
         &mut self,
         key: T::Key,
@@ -853,6 +898,8 @@ impl<T: Table> TndbCursorMut<T> {
         let mut guard = txn.lock();
         let txn = live(&mut guard, fail)?;
         let Some(dup) = rows.dup else {
+            // Where an append that met the table's last key leaves the cursor ([`Pos::End`]).
+            let mut ends = None;
             let result = match operation {
                 DatabaseWriteOperation::CursorInsert => match cursor.insert(txn, key, value) {
                     // MDBX leaves a cursor whose insert it refused on the present key; the engine
@@ -866,11 +913,12 @@ impl<T: Table> TndbCursorMut<T> {
                     // MDBX's append takes the table's last key again, replacing its value, and
                     // leaves the cursor ending the table as after `last` (`next` finds nothing,
                     // even once another writer adds a later key); it leaves a cursor whose append
-                    // it refused on the last row. The engine's refuses both and leaves the cursor
-                    // where it was.
+                    // it refused on the last row, ending the table too. The engine's refuses both
+                    // and leaves the cursor where it was.
                     Err(tndb_b::Error::AppendOutOfOrder) => {
-                        let last_key =
-                            cursor.last(txn).map_err(fail)?.is_some_and(|(found, _)| found == key);
+                        let last = cursor.last(txn).map_err(fail)?;
+                        let last_key = last.is_some_and(|(found, _)| found == key);
+                        ends = Some(rows.ended(last.map(|(found, _)| found)));
                         if last_key {
                             cursor.put(txn, key, value).and_then(|()| cursor.last(txn).map(drop))
                         } else {
@@ -882,13 +930,17 @@ impl<T: Table> TndbCursorMut<T> {
                 _ => cursor.put(txn, key, value),
             };
             rows.wrote(&result);
+            if let (Some(pos), Ok(()) | Err(tndb_b::Error::AppendOutOfOrder)) = (ends, &result) {
+                rows.pos = pos;
+            }
             return result.map_err(fail);
         };
         let rest =
             dup.join(key, value, stored).ok_or_else(|| error::bad_size(operation, T::NAME, key))?;
         let stored = stored.as_slice();
+        // `Ok(false)`: a second value for a subkey the key holds, refused ([`insert_dup_at`]).
         let result = match operation {
-            DatabaseWriteOperation::CursorUpsert => cursor.put(txn, stored, rest),
+            DatabaseWriteOperation::CursorUpsert => insert_dup_at(cursor, txn, table, stored, rest),
             DatabaseWriteOperation::CursorInsert => {
                 // MDBX refuses a key that has any row, and leaves the cursor on its first. The
                 // key's rows are looked for apart from the cursor, so a row the engine refuses (by
@@ -902,26 +954,29 @@ impl<T: Table> TndbCursorMut<T> {
                 if taken {
                     cursor.seek(txn, key).and(Err(tndb_b::Error::KeyExists))
                 } else {
-                    cursor.insert(txn, stored, rest)
+                    cursor.insert(txn, stored, rest).map(|()| true)
                 }
             }
             DatabaseWriteOperation::CursorAppend => match cursor.append(txn, stored, rest) {
                 // MDBX's append to a dup-sort table also takes the last key again, with a value
                 // anywhere among its rows; a smaller key is refused with the cursor on the last
-                // row, as after `last`.
+                // row, as after `last`. The last row is looked for apart from the cursor, so a
+                // refused second value leaves the cursor where it was.
                 Err(tndb_b::Error::AppendOutOfOrder) => {
-                    let last_key = cursor
-                        .last(txn)
+                    let last_key = txn
+                        .cursor(table)
+                        .and_then(|mut rows_of| rows_of.last().map(|last| last.map(|(f, _)| f)))
                         .map_err(fail)?
-                        .is_some_and(|(found, _)| dup.is_row_of(found, key));
+                        .is_some_and(|found| dup.is_row_of(found, key));
                     if last_key {
-                        cursor.put(txn, stored, rest)
+                        insert_dup_at(cursor, txn, table, stored, rest)
                     } else {
+                        cursor.last(txn).map_err(fail)?;
                         rows.pos = Pos::DupEnd { soft: true };
                         return Err(fail(tndb_b::Error::AppendOutOfOrder));
                     }
                 }
-                appended => appended,
+                appended => appended.map(|()| true),
             },
             // MDBX's `APPEND_DUP`: the value must sort after the key's last, and a key without
             // rows takes any value, wherever it sorts. A refused one leaves the cursor on the
@@ -944,20 +999,48 @@ impl<T: Table> TndbCursorMut<T> {
                             }
                             Err(tndb_b::Error::AppendOutOfOrder)
                         }
-                        _ => cursor.put(txn, stored, rest),
+                        _ => insert_dup_at(cursor, txn, table, stored, rest),
                     }
                 }
-                appended => appended,
+                appended => appended.map(|()| true),
             },
+        };
+        let result = match result {
+            // Nothing changed, the cursor's state included.
+            Ok(false) => return Err(error::second_dup_value(operation, T::NAME, key)),
+            result => result.map(drop),
         };
         rows.wrote(&result);
         result.map_err(fail)
     }
 }
 
+/// [`crate::tx::insert_dup`] through `cursor`: a row new or held already (`Ok(true)`) leaves the
+/// cursor on it, as MDBX's put of a pair it holds does; a second value for the subkey (`Ok(false)`)
+/// leaves it where it was, since a refused insert does not move the engine's cursor.
+fn insert_dup_at(
+    cursor: &mut TxnCursor,
+    txn: &mut RwTxn,
+    table: &EngineTable,
+    stored: &[u8],
+    rest: &[u8],
+) -> tndb_b::Result<bool> {
+    match cursor.insert(txn, stored, rest) {
+        Err(tndb_b::Error::KeyExists) => {
+            if txn.get(table, stored)? != Some(rest) {
+                return Ok(false);
+            }
+            cursor.seek_exact(txn, stored).map(|_| true)
+        }
+        inserted => inserted.map(|()| true),
+    }
+}
+
 impl<T: Table> DbCursorRW<T> for TndbCursorMut<T> {
-    /// On a dup-sort table this stores the row of `value`'s subkey, replacing one with the same
-    /// subkey (MDBX would add a second value for that subkey).
+    /// On a dup-sort table this stores the row of `value`'s subkey. The value that row holds
+    /// already changes nothing and moves the cursor to the row, as MDBX's re-put of a pair does;
+    /// another value for that subkey (MDBX would store a second) is refused with `MDBX_KEYEXIST`
+    /// and this crate's message, changing nothing, the cursor included.
     fn upsert(&mut self, key: T::Key, value: &T::Value) -> Result<(), DatabaseError> {
         self.write(key, value, DatabaseWriteOperation::CursorUpsert)
     }
@@ -972,7 +1055,8 @@ impl<T: Table> DbCursorRW<T> for TndbCursorMut<T> {
     /// A key that sorts before the table's last is refused with MDBX's `MDBX_EKEYMISMATCH`, and
     /// leaves the cursor on the last row. The last key itself is taken again, as MDBX takes it:
     /// its value replaced (the cursor then ends the table, as after `last`), or on a dup-sort
-    /// table with a value anywhere among its rows.
+    /// table with a value anywhere among its rows, stored as by `upsert` (another value for a
+    /// subkey the key holds is refused).
     fn append(&mut self, key: T::Key, value: &T::Value) -> Result<(), DatabaseError> {
         self.write(key, value, DatabaseWriteOperation::CursorAppend)
     }

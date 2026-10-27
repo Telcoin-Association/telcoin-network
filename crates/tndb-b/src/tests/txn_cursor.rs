@@ -28,14 +28,10 @@ fn owned(entry: Option<(&[u8], &[u8])>) -> Option<Kv> {
 enum Pos {
     Unset,
     At(Vec<u8>),
-    /// At the entry `last` (or `prev` from an unset cursor) landed on, which ends the table for
-    /// the cursor (as in MDBX): `next` and `next_in_prefix` return nothing and stay, even after
-    /// entries were added past it.
-    Last(Vec<u8>),
     AfterEnd,
     BeforeStart,
-    /// After the entry `key` was deleted (as in MDBX): on its follower, the entry `on` (`None`:
-    /// after the end), which `next` and `current` return; the prefix steps compare with `key`.
+    /// After the entry `key` was deleted: on its follower, the entry `on` (`None`: after the end),
+    /// which `next` and `current` return; the prefix steps compare with `key`.
     Deleted {
         on: Option<Vec<u8>>,
         key: Vec<u8>,
@@ -74,7 +70,7 @@ impl Pos {
     /// entry after that (entries put between the deleted key and the follower stay behind it).
     fn resolved(self, rows: &Rows) -> Self {
         match self {
-            Pos::At(k) | Pos::Last(k) if !rows.contains_key(&k) => Pos::deleted(rows, k),
+            Pos::At(k) if !rows.contains_key(&k) => Pos::deleted(rows, k),
             Pos::Deleted { on: Some(f), key } if !rows.contains_key(&f) => {
                 Pos::Deleted { on: after(rows, &f).map(|(k, _)| k), key }
             }
@@ -86,7 +82,7 @@ impl Pos {
     fn state(&self) -> (State, bool) {
         match self {
             Pos::Unset => (State::Unset, false),
-            Pos::At(_) | Pos::Last(_) => (State::At, false),
+            Pos::At(_) => (State::At, false),
             Pos::AfterEnd => (State::AfterEnd, false),
             Pos::BeforeStart => (State::BeforeStart, false),
             Pos::Deleted { on: Some(_), .. } => (State::At, true),
@@ -104,10 +100,7 @@ impl Pos {
     }
 
     fn last(rows: &Rows) -> (Self, Option<Kv>) {
-        match rows.last_key_value() {
-            Some((k, v)) => (Pos::Last(k.clone()), Some((k.clone(), v.clone()))),
-            None => (Pos::BeforeStart, None),
-        }
+        land(rows.last_key_value().map(|(k, v)| (k.clone(), v.clone())), Pos::BeforeStart)
     }
 
     fn next(self, rows: &Rows) -> (Self, Option<Kv>) {
@@ -115,7 +108,6 @@ impl Pos {
             Pos::Unset | Pos::BeforeStart => Self::first(rows),
             Pos::AfterEnd => (Pos::AfterEnd, None),
             Pos::At(k) => land(after(rows, &k), Pos::AfterEnd),
-            Pos::Last(k) => (Pos::Last(k), None),
             Pos::Deleted { on, .. } => land(Self::on(rows, &on), Pos::AfterEnd),
         }
     }
@@ -126,7 +118,7 @@ impl Pos {
             Pos::Unset => Self::last(rows),
             Pos::AfterEnd => land(last(), Pos::BeforeStart),
             Pos::BeforeStart => (Pos::BeforeStart, None),
-            Pos::At(k) | Pos::Last(k) => land(before(rows, &k, false), Pos::BeforeStart),
+            Pos::At(k) => land(before(rows, &k, false), Pos::BeforeStart),
             // Back from the follower: a key put since the delete, the deleted one included,
             // comes before the cursor.
             Pos::Deleted { on: Some(f), .. } => land(before(rows, &f, false), Pos::BeforeStart),
@@ -137,7 +129,7 @@ impl Pos {
     /// `current`: after a delete, the follower, which the cursor is then at.
     fn current(self, rows: &Rows) -> (Self, Option<Kv>) {
         match self {
-            Pos::At(ref k) | Pos::Last(ref k) => {
+            Pos::At(ref k) => {
                 let entry = rows.get(k).map(|v| (k.clone(), v.clone()));
                 (self, entry)
             }
@@ -150,12 +142,7 @@ impl Pos {
     /// After a delete the candidates are the follower and the entry before it, and the prefix is
     /// the deleted key's.
     fn step_in_prefix(self, rows: &Rows, n: usize, forward: bool) -> (Self, Option<Kv>) {
-        let this = match self {
-            Pos::Last(k) if forward => return (Pos::Last(k), None),
-            Pos::Last(k) => Pos::At(k),
-            pos => pos,
-        };
-        let candidate = match &this {
+        let candidate = match &self {
             Pos::At(k) if n <= k.len() => {
                 if forward {
                     after(rows, k)
@@ -170,13 +157,13 @@ impl Pos {
             },
             _ => None,
         };
-        let prefix = match &this {
+        let prefix = match &self {
             Pos::At(k) | Pos::Deleted { key: k, .. } => k.get(..n).unwrap_or_default().to_vec(),
             _ => Vec::new(),
         };
         match candidate {
             Some(kv) if kv.0.starts_with(&prefix) => (Pos::At(kv.0.clone()), Some(kv)),
-            _ => (this, None),
+            _ => (self, None),
         }
     }
 }
@@ -208,9 +195,9 @@ struct Coverage {
     follower_gone: usize,
     /// `current` calls after a delete that returned the follower.
     current_after_delete: usize,
-    /// `next` and `next_in_prefix` calls after `last` that returned nothing although entries
-    /// were added past the cursor's since.
-    soft_ends: usize,
+    /// `next` and `next_in_prefix` calls after `last` (or `prev` from an unset cursor) with
+    /// entries added past the cursor's since, which they move to.
+    past_last: usize,
     /// Deletes after a delete (of the follower).
     redeletes: usize,
     /// Prefix steps that moved.
@@ -227,13 +214,16 @@ struct Coverage {
 struct Model {
     table: usize,
     pos: Pos,
+    /// The cursor's last call was `last`, or `prev` from an unset cursor, and landed on an entry
+    /// (for [`Coverage::past_last`]).
+    from_last: bool,
 }
 
 /// A key near where cursor `c` is (its key's `i`, give or take 2), else a random one.
 fn near(rng: &mut Rng, models: &[Model], keys: u64) -> Vec<u8> {
     let c = &models[rng.below(models.len() as u64) as usize];
     match &c.pos {
-        Pos::At(k) | Pos::Last(k) | Pos::Deleted { key: k, .. } if rng.below(4) != 0 => {
+        Pos::At(k) | Pos::Deleted { key: k, .. } if rng.below(4) != 0 => {
             key((key_index(k) + rng.below(5)).saturating_sub(2))
         }
         _ => key(rng.below(keys)),
@@ -295,15 +285,17 @@ fn run_steps(
         let (c, m) = (&mut cursors[i], &mut models[i]);
         let rows = &want[m.table];
         let pos = std::mem::replace(&mut m.pos, Pos::Unset);
+        let from_last = std::mem::take(&mut m.from_last);
+        let to_last = op == 1 || op == 4 && pos == Pos::Unset;
         let refusable = matches!(op, 11 | 12);
         // A refused write does not bring the cursor up to date; every other call does.
         let pos = if refusable {
             pos
         } else {
             match &pos {
-                Pos::At(k) | Pos::Last(k) if !rows.contains_key(k) => cov.deleted_under += 1,
-                Pos::Last(k) if matches!(op, 2 | 3 | 8) && after(rows, k).is_some() => {
-                    cov.soft_ends += 1;
+                Pos::At(k) if !rows.contains_key(k) => cov.deleted_under += 1,
+                Pos::At(k) if from_last && matches!(op, 2 | 3 | 8) && after(rows, k).is_some() => {
+                    cov.past_last += 1;
                 }
                 Pos::Deleted { on: Some(f), .. } if !rows.contains_key(f) => cov.follower_gone += 1,
                 _ => {}
@@ -385,7 +377,7 @@ fn run_steps(
                 let deleted = c.delete_current(rw).expect("delete_current");
                 let pos_was_deleted = pos.state().1;
                 let pos = match pos {
-                    Pos::At(k) | Pos::Last(k) | Pos::Deleted { on: Some(k), .. } => {
+                    Pos::At(k) | Pos::Deleted { on: Some(k), .. } => {
                         assert!(deleted, "step {step}: delete_current at an entry");
                         cov.redeletes += usize::from(pos_was_deleted);
                         want[t].remove(&k).expect("the entry under the cursor");
@@ -401,6 +393,7 @@ fn run_steps(
         };
         assert_eq!(got, expected, "step {step} op {op} cursor {i}");
         assert_eq!(c.state(), pos.state(), "step {step} op {op} cursor {i}");
+        m.from_last = to_last && got.is_some();
         m.pos = pos;
     }
 }
@@ -451,8 +444,10 @@ fn model_test(seeds: &[(u64, u32, u64)], rounds: usize, steps: usize) {
                     want[t].insert(key(i), vec![i as u8; 40]);
                 }
             }
-            let mut models: Vec<Model> =
-                [0, 0, 1].into_iter().map(|table| Model { table, pos: Pos::Unset }).collect();
+            let mut models: Vec<Model> = [0, 0, 1]
+                .into_iter()
+                .map(|table| Model { table, pos: Pos::Unset, from_last: false })
+                .collect();
             let mut cursors: Vec<TxnCursor> = models
                 .iter()
                 .map(|m| rw.cursor_detached(&tables[m.table]).expect("cursor"))
@@ -489,7 +484,7 @@ fn model_test(seeds: &[(u64, u32, u64)], rounds: usize, steps: usize) {
         assert!(cov.deleted_under > 20, "seed {seed}: {cov:?}");
         assert!(cov.follower_gone > 5, "seed {seed}: {cov:?}");
         assert!(cov.current_after_delete > 10 && cov.redeletes > 10, "seed {seed}: {cov:?}");
-        assert!(cov.soft_ends > 3, "seed {seed}: {cov:?}");
+        assert!(cov.past_last > 3, "seed {seed}: {cov:?}");
         assert!(cov.prefix_hits > 50 && cov.refused > 20 && cov.clears == rounds, "{cov:?}");
         assert!(cov.max_leaves > 4 || keys < 100, "seed {seed}: the tables grew: {cov:?}");
         assert!(reseeks as usize > steps / 4, "seed {seed}: {reseeks} reseeks");
@@ -670,14 +665,13 @@ fn a_refused_insert_through_a_txn_cursor_changes_nothing() {
     check(&env);
 }
 
-/// After `last`, or `prev` from an unset cursor, the cursor ends the table as MDBX's does: `next`
-/// and `next_in_prefix` return nothing and leave it on the entry, even after another cursor or
-/// the transaction appended past it, and `current` keeps that. `prev`, another move or a write
-/// ends it, and so does another writer's delete of the entry (the after-delete rules then hold).
-/// `next` or a seek landing on the last entry, and `prev` from after the end, do not end the
-/// table.
+/// After `last`, or `prev` from an unset cursor, the cursor is on the table's last entry as after
+/// any move: `next` and `next_in_prefix` move to an entry another cursor or the transaction has put
+/// past it since, and with none return nothing, the cursor then after the end (`current` finds
+/// nothing, `prev` returns the last entry). Another writer's delete of the entry leaves the cursor
+/// after the deleted entry, as any cursor whose entry another writer deleted.
 #[test]
-fn last_ends_the_table_for_next_until_another_move() {
+fn next_after_last_finds_entries_put_past_it() {
     let (_dir, path) = temp("tndb_b_txn_cursor_last");
     let env = open(&path, SyncMode::NoSync);
     let [a] = filled(&env, &["a"], 10).try_into().expect("one table");
@@ -686,44 +680,29 @@ fn last_ends_the_table_for_next_until_another_move() {
     let mut other = rw.cursor_detached(&a).expect("cursor");
     assert_eq!(key_of(c.last(&rw).expect("last")), 9);
     other.append(&mut rw, &key(10), b"v").expect("append");
-    assert_eq!(c.next(&rw).expect("next"), None, "another cursor's append");
-    assert_eq!(c.next_in_prefix(&rw, 0).expect("step"), None);
-    assert_eq!(key_of(c.current(&rw).expect("current")), 9, "the cursor stays on the entry");
+    assert_eq!(key_of(c.next(&rw).expect("next")), 10, "another cursor's append");
+    assert_eq!(key_of(c.last(&rw).expect("last")), 10);
     rw.put(&a, &key(11), b"v").expect("put");
-    assert_eq!(c.next(&rw).expect("next"), None, "the transaction's own put");
-    assert_eq!(key_of(c.prev(&rw).expect("prev")), 8, "prev ends it");
-    assert_eq!(key_of(c.next(&rw).expect("next")), 9);
-    assert_eq!(key_of(c.next(&rw).expect("next")), 10);
+    assert_eq!(key_of(c.next_in_prefix(&rw, 0).expect("step")), 11, "the transaction's own put");
 
-    // Landing on the last entry otherwise does not end the table.
-    assert_eq!(key_of(c.next(&rw).expect("next")), 11);
-    other.append(&mut rw, &key(12), b"v").expect("append");
-    assert_eq!(key_of(c.next(&rw).expect("next")), 12, "next landed on the last entry");
-    assert!(c.seek_exact(&rw, &key(12)).expect("seek").is_some());
-    other.append(&mut rw, &key(13), b"v").expect("append");
-    assert_eq!(key_of(c.next(&rw).expect("next")), 13, "a seek landed on the last entry");
-    assert_eq!(c.seek(&rw, &key(99)).expect("seek"), None);
-    assert_eq!(key_of(c.prev(&rw).expect("prev")), 13, "prev from after the end");
-    other.append(&mut rw, &key(14), b"v").expect("append");
-    assert_eq!(key_of(c.next(&rw).expect("next")), 14);
+    // With no entry past it, `next` goes past the end.
+    assert_eq!(key_of(c.last(&rw).expect("last")), 11);
+    assert_eq!(c.next(&rw).expect("next"), None);
+    assert_eq!(c.state(), (State::AfterEnd, false));
+    assert_eq!(c.current(&rw).expect("current"), None);
+    assert_eq!(key_of(c.prev(&rw).expect("prev")), 11, "prev from after the end");
 
-    // A write through the cursor ends it.
-    assert_eq!(key_of(c.last(&rw).expect("last")), 14);
-    c.put(&mut rw, &key(14), b"w").expect("put");
-    other.append(&mut rw, &key(15), b"v").expect("append");
-    assert_eq!(key_of(c.next(&rw).expect("next")), 15, "after the cursor's own write");
-
-    // Another writer's delete of the entry ends it: the cursor is after a deleted last entry.
-    assert_eq!(key_of(c.last(&rw).expect("last")), 15);
-    assert!(rw.delete(&a, &key(15)).expect("delete"));
+    // Another writer's delete of the entry: the cursor is after a deleted last entry.
+    assert_eq!(key_of(c.last(&rw).expect("last")), 11);
+    assert!(rw.delete(&a, &key(11)).expect("delete"));
     assert_eq!(c.next(&rw).expect("next"), None);
     assert_eq!(c.state(), (State::AfterEnd, false));
 
     // `prev` from an unset cursor takes the last entry as `last` does.
     let mut fresh = rw.cursor_detached(&a).expect("cursor");
-    assert_eq!(key_of(fresh.prev(&rw).expect("prev")), 14);
-    other.append(&mut rw, &key(16), b"v").expect("append");
-    assert_eq!(fresh.next(&rw).expect("next"), None, "prev from an unset cursor");
+    assert_eq!(key_of(fresh.prev(&rw).expect("prev")), 10);
+    other.append(&mut rw, &key(12), b"v").expect("append");
+    assert_eq!(key_of(fresh.next(&rw).expect("next")), 12, "prev from an unset cursor");
     assert!(env.failure().is_none());
     rw.commit().expect("commit");
     check(&env);

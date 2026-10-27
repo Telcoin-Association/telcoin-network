@@ -50,9 +50,9 @@
 //! | `next_no_dup` | `seek(k ‖ 0xFF × (W + 1))`, past every row of `k`, when another row of `k` follows; else `next` |
 //! | `last_dup` | that seek, then `prev` |
 //! | `walk_dup` | MDBX's start (`first`; `seek_exact`; `seek_by_key_subkey`; with a subkey only, `first` then `seek_by_key_subkey` of its key), then `next_dup` |
-//! | `put`, `upsert` | a put of the row: one with the same subkey is replaced |
+//! | `put`, `upsert` | the engine's insert of the row: a new subkey is stored, the same value again changes nothing (the cursor then on the row), another value for a subkey the key holds is refused with `MDBX_KEYEXIST` |
 //! | `insert` | `MDBX_KEYEXIST` if the key has any row (the cursor then on its first) |
-//! | `append` | the engine's append, or a put if the key is the table's last key (MDBX takes a value anywhere among the last key's); a smaller key is `MDBX_EKEYMISMATCH`, the cursor on the last row |
+//! | `append` | the engine's append, or an insert as by `put` if the key is the table's last key (MDBX takes a value anywhere among the last key's); a smaller key is `MDBX_EKEYMISMATCH`, the cursor on the last row |
 //! | `append_dup` | the value must sort after the key's last (by subkey), else `MDBX_EKEYMISMATCH` with the cursor on the key's last row (on its first when the value is exactly the first's); a key without rows takes any value, wherever the key sorts |
 //! | `delete(k, Some(v))` | deletes the row of `v`'s subkey if it holds exactly the rest of `v` |
 //! | `delete(k, None)`, `delete_current_duplicates` | delete every row of the key |
@@ -71,7 +71,7 @@
 //!
 //! | engine | MDBX |
 //! |---|---|
-//! | `KeyExists` | `MDBX_KEYEXIST` |
+//! | `KeyExists` | `MDBX_KEYEXIST` (for a second value for a dup row's subkey, with this crate's message) |
 //! | `AppendOutOfOrder` | `MDBX_EKEYMISMATCH` |
 //! | `KeyTooLarge`, `ValueTooLarge` | `MDBX_BAD_VALSIZE` |
 //! | `Corrupt` | `MDBX_CORRUPTED` (the detail is in [`TndbEnv::failure`]) |
@@ -82,11 +82,13 @@
 //! | an unpositioned `delete_current` | `MDBX_ENODATA` |
 //! | `InvalidTableName`, `InvalidPageSize` | `MDBX_EINVAL` |
 //!
-//! Four engine errors keep their own message, which says more than MDBX's would, under the MDBX
-//! code reth reads the same way: `Failed` (the environment latched an earlier failure: writes and
-//! commits fail until it is reopened) is `MDBX_PANIC`, MDBX's "fatal environment error"; `Io`
-//! carries the OS error number when there is one, else `EIO`; `NotTndbB` is `MDBX_INVALID`; and
-//! `UnsupportedVersion` is `MDBX_VERSION_MISMATCH`.
+//! A refused second value for a dup-sort row's subkey (below) is `MDBX_KEYEXIST` with a message of
+//! this crate's saying it stores one value per subkey. Four engine errors keep their own message,
+//! which says more than MDBX's would, under the MDBX code reth reads the same way: `Failed` (the
+//! environment latched an earlier failure: writes and commits fail until it is reopened) is
+//! `MDBX_PANIC`, MDBX's "fatal environment error"; `Io` carries the OS error number when there is
+//! one, else `EIO`; `NotTndbB` is `MDBX_INVALID`; and `UnsupportedVersion` is
+//! `MDBX_VERSION_MISMATCH`.
 //!
 //! **Differences from MDBX.** reth's code reaches none of them. Each cursor difference is pinned
 //! beside MDBX's result by `known_cursor_deviations_from_mdbx` or
@@ -94,17 +96,27 @@
 //!
 //! The environment:
 //! - no read transaction times out, so `disable_long_read_transaction_safety` does nothing and
-//!   `db.timed_out_not_aborted_transactions` is always 0;
+//!   `db.timed_out_not_aborted_transactions` is always 0. A long reader is reported instead: while
+//!   a read transaction holds a superseded snapshot, the pages freed since are not reused, so the
+//!   file grows until it ends and they return; a write commit made once that has lasted over 60
+//!   seconds logs a `warn!` with its age, at most once a minute per environment
+//!   (`tndb_b::Env::oldest_reader_age`, a lock-free read: readers pay nothing, and a commit one
+//!   atomic load while no reader holds a superseded snapshot, plus a clock read while one does);
 //! - one file, `<dir>/tndb.dat`, with the engine's `flock` as the lock: a second open of a file
 //!   another handle holds is `MDBX_BUSY`;
 //! - the metrics skip a table the file lacks (MDBX's stop at it).
 //!
 //! The data:
-//! - a dup-sort table holds one value per subkey: a put, `upsert` or `append` of a second value
-//!   with the same subkey replaces the first, where MDBX keeps both. reth never writes two: it
-//!   deletes a (key, subkey) entry before it writes a new one (`seek_by_key_subkey`, then
-//!   `delete_current`, then `upsert`). For the same reason an `append_dup` of a value with the
-//!   subkey of the key's last is refused (MDBX takes it when the key has two rows or more);
+//! - a dup-sort table holds one value per subkey: a put, `upsert` or `append` of a second value for
+//!   an existing (key, subkey) is refused with `MDBX_KEYEXIST` and a message saying so, and changes
+//!   nothing (not the table, not the cursor, and the environment does not latch), where MDBX stores
+//!   both. Writing the value the row holds again succeeds, as on MDBX. reth deletes a (key, subkey)
+//!   entry before it writes a new one (`seek_by_key_subkey`, then `delete_current`, then `upsert`),
+//!   so it never meets the refusal; a future reth change that writes real duplicates fails loudly
+//!   instead of losing a row;
+//! - an `append_dup` with the subkey of the key's last row is refused for its order
+//!   (`MDBX_EKEYMISMATCH`, whatever its value), where MDBX takes it when the key has two rows or
+//!   more (a second value, or the pair it holds again) and refuses it when the key has one;
 //! - a dup-sort table takes values up to 16 MiB (the engine's limit, in overflow runs), where MDBX
 //!   refuses a dup value much larger than its key size with `MDBX_BAD_VALSIZE`. reth's dup values
 //!   are far smaller. A cursor `insert` of a key that has rows is refused as present
@@ -123,8 +135,9 @@
 //! The cursor positions. Right after a delete the cursor is on the follower as MDBX's is
 //! (`current` returns it, `delete_current` deletes it, `delete_current_duplicates` deletes its
 //! key's rows), on a dup-sort table a delete of a key's last row that leaves the key earlier rows
-//! ends the key's rows as MDBX's does, and after `last` (or an `append` that replaces the last
-//! key's value) the cursor ends the table as MDBX's does. These still differ:
+//! ends the key's rows as MDBX's does, and after `last` (or a fresh cursor's `prev`, a refused
+//! `append`, or an `append` that replaces the last key's value) a cursor, read-only or write, ends
+//! the table as MDBX's does. These still differ:
 //! 1. **past either end:** after `next` past the last row, `prev` before the first, a delete of the
 //!    table's last row or a `seek` past the end, MDBX's cursor stays on the end row (`current`
 //!    returns it, `delete_current` deletes it, `next` and `prev` step from it), where this one is
@@ -144,8 +157,10 @@
 //! 4. **`last_dup` right after a delete of a key's only row,** or after
 //!    `delete_current_duplicates`: both return the follower's key's last value, but MDBX's cursor
 //!    stays on the follower and this one is on that last row, so the moves after it differ;
-//! 5. **`append_dup` of the value a key's last row holds,** with two rows or more (above);
-//! 6. **one value per subkey** (above);
+//! 5. **`append_dup` with the subkey of a key's last row,** with two rows or more: refused here for
+//!    its order, taken by MDBX (above);
+//! 6. **one value per subkey:** a second value for a (key, subkey) is refused here, stored by MDBX
+//!    (above);
 //! 7. **`last_dup` before the first row** is `None`, where libmdbx aborts (below);
 //! 8. **a dup key of one row,** where MDBX's cursor misbehaves (below) and this one acts as on any
 //!    key.
@@ -194,9 +209,12 @@
 //! differences above or in the zone where MDBX is no oracle, counting each skip by class: past
 //! either end; another writer's delete and put; another writer's change to the cursor's dup key;
 //! `last_dup` or `delete_current` after an outer delete; `append_dup` of the key's last value;
-//! one value per subkey (avoided by construction: a write to a dup row that exists writes the value
-//! it holds); `last_dup` before the first row; a dup key of one row. Under 5% of the ops are
-//! skipped. On a difference proptest shrinks the script and prints both outcome lists.
+//! one value per subkey; `last_dup` before the first row; a dup key of one row. A write to a dup
+//! row that exists mostly writes the value it holds, which both databases take; a quarter of them
+//! write another value, a second value for the subkey, which runs on tndb-b only and must be
+//! refused (`MDBX_KEYEXIST` with this crate's message) and change nothing: it is skipped on MDBX,
+//! and the ops after it must still match MDBX's. About 4% of the ops are skipped; the test fails if
+//! a tenth or more are. On a difference proptest shrinks the script and prints both outcome lists.
 //!
 //! **The crash cycles** (`killed_child_reopens_to_its_last_commit`, 5 cycles, and
 //! `killed_child_reopens_to_its_last_commit_heavy`, 200 in release; Unix only) run a child process
@@ -213,7 +231,8 @@
 //! give the command, the selectors and a table) runs the workloads of reth's database benches
 //! (`criterion.rs`, `hash_keys.rs`, `get.rs`, `put.rs`) on a [`TndbEnv`] and on reth's MDBX
 //! `DatabaseEnv` with the same seeded data, and prints the time per operation of each with the
-//! ratio.
+//! ratio. A second one, `tndb_b_vs_mdbx` (the `engine_bench` module; its runs are in
+//! `engine-bench.md`), runs the engine itself, through its own API, against `reth-libmdbx`.
 
 mod cursor;
 mod dup;
@@ -223,6 +242,8 @@ mod tx;
 
 #[cfg(test)]
 mod bench;
+#[cfg(test)]
+mod engine_bench;
 #[cfg(test)]
 mod tests;
 

@@ -7,7 +7,8 @@ dup-sort tables are stored as composite keys; the engine has no dup-sort feature
 
 **Status: pre-production.** The crate is a workspace member, but nothing in TN uses it yet: TN's
 reth database is still MDBX. The benchmark below passed its Linux gate on 2026-10-26. Next comes TN
-integration behind a feature.
+integration behind a feature. On a reth upgrade (storage v2 included), follow the checklist in
+`CLAUDE.md` ("On a reth upgrade").
 
 The crate docs (`src/lib.rs`) are the reference: the type mapping, the dup layout and the mapping
 of every dup call, the error codes, every difference from MDBX, and the differential and crash
@@ -61,17 +62,25 @@ stack. A row this layout cannot hold is `MDBX_BAD_VALSIZE`.
 
 `lib.rs` lists each one. reth's code reaches none of them.
 
-- **Environment:** no read transaction times out; one file with an `flock`; the metrics skip a
-  table the file lacks.
-- **Data:** a dup-sort subkey holds one value (a second write with the same subkey replaces the
-  first; reth deletes before it writes); dup values may be up to 16 MiB; a range walk may start
+- **Environment:** no read transaction times out: a long reader keeps the pages freed since its
+  snapshot from reuse, so the file grows until it ends, and a write commit made once a reader has
+  held a superseded snapshot for over 60 s logs a `warn!` with its age, at most once a minute
+  (from the engine's lock-free `Env::oldest_reader_age`: readers pay nothing, a commit one atomic
+  load while no reader holds a superseded snapshot, plus a clock read while one does); one file with an `flock`; the metrics skip a table
+  the file lacks.
+- **Data:** a dup-sort subkey holds one value: a second value for an existing (key, subkey) is
+  refused with `MDBX_KEYEXIST` and a message saying so, changing nothing, where MDBX stores both
+  (writing the value the row holds again succeeds, as on MDBX; reth deletes before it writes, so
+  it never meets the refusal, and a future reth change that writes real duplicates fails loudly
+  instead of losing a row); dup values may be up to 16 MiB; a range walk may start
   past an excluded key; a raw subkey wider than the table's subkey, which starts with a row's
   subkey, can make `seek_by_key_subkey` take the row after the one MDBX takes (no reth subkey type
   encodes that wide).
 - **Cursor positions:** past either end the cursor is past the end where MDBX's stays on the end
   row; after another writer's delete and put the cursor finds its place again lazily, at its next
   call; and a few dup-sort positions differ (`last_dup` after a key's only row is deleted,
-  `append_dup` of a key's last value, `last_dup` before the first row, a dup key of one row).
+  `append_dup` with the subkey of a key's last row, `last_dup` before the first row, a dup key of
+  one row). After `last` a cursor, read-only or write, ends the table as MDBX's does.
 - **Where MDBX is no oracle:** when another writer in the same transaction changes the rows of the
   dup key a cursor is in, MDBX's cursor works from a stale copy of the key's rows. The
   differential test found it skipping rows, leaving the table's `entries` count one off, and
@@ -81,15 +90,16 @@ stack. A row this layout cannot hold is `MDBX_BAD_VALSIZE`.
 ## Tests
 
 - **reth's MDBX tests,** ported with only the constructor swapped (`tests/mdbx_port.rs`); three
-  dup-sort tests assert the one-value-per-subkey difference instead.
+  dup-sort tests assert the one-value-per-subkey refusal instead.
 - **The adapter's own** (`tests/adapter.rs`, `tests/dup.rs`): MDBX's error codes, reth's error
   variants, the metrics, every dup cursor call and the cursor steps after a delete or `last`, each
   run on MDBX too, the layouts against reth's encodings, and the differences pinned beside MDBX's
   results.
 - **A differential test** (`tests/differential.rs`): random scripts of transaction and cursor
   calls (two write cursors and a read cursor, commits, aborts, a held read transaction) run on
-  both databases, whose outcome lists must be equal; it skips the documented differences, under
-  5% of ops. `random_scripts_match_mdbx` runs 32 scripts in the default suite, and its `_heavy`
+  both databases, whose outcome lists must be equal; it skips the documented differences, about
+  4% of ops, and fails if a tenth or more are skipped. A second value for a dup row's subkey runs on tndb-b only, which must refuse it and
+  change nothing (the ops after it still match MDBX's). `random_scripts_match_mdbx` runs 32 scripts in the default suite, and its `_heavy`
   twin 2000 in release.
 - **Crash cycles** (`tests/crash.rs`, Unix only): a child process writing reth-style rounds is
   killed with `SIGKILL` in its open, its writes or its commit, and the reopened environment must
@@ -98,7 +108,7 @@ stack. A row this layout cannot hold is `MDBX_BAD_VALSIZE`.
 
 ```text
 cargo nextest run -p tndb-b-reth                                              # default suite
-cargo test --release -p tndb-b-reth -- --ignored --skip tndb_reth_vs_mdbx    # heavy variants
+cargo test --release -p tndb-b-reth -- --ignored --skip tndb_reth_vs_mdbx --skip tndb_b_vs_mdbx  # heavy variants
 ```
 
 ## Benchmark: reth's db benches against MDBX
@@ -124,10 +134,11 @@ module docs give each workload, the data, the timing and where they differ from 
 
 **The Linux gate** decides: each bench at most 1.10× MDBX, with at most one explained row up to
 1.25×. Run it three times at reth's sizes, on performance cores with the temp dir on a real disk
-(see the engine README's run tip; the run stops if the temp dir is on a tmpfs), and take
-each cell's median. Pin the power settings first: the drive's autonomous power states off, and the
-CPU governor and energy preference at `performance` (all three reset on a reboot or a sleep). From
-the repository root, with the performance cores in `taskset` (`lscpu -e` shows which CPUs they are):
+(see the [run tip](engine-bench.md#run-tip-linux); the run stops if the temp dir is on a tmpfs),
+and take each cell's median. Pin the power settings first: the drive's autonomous power states off,
+and the CPU governor and energy preference at `performance` (all three reset on a reboot or a
+sleep). From the repository root, with the performance cores in `taskset` (`lscpu -e` shows which
+CPUs they are):
 
 ```text
 sudo nvme set-feature /dev/nvme0 -f 0x0c -v 0
@@ -262,8 +273,16 @@ zero-copy dup reads, before the gate's tuning round (see the Linux run); "before
 ratio before the two tuning changes. The last fixes (a write cursor's state after a refused write,
 the engine's free walk and merge checks, a dup `insert`'s presence check) came after these runs and
 are not re-measured; of them only the write cursor's state update is on a timed path, one branch per
-write. On macOS `msync` does not flush the drive's cache, so the write rows, which are mostly the
-commit, flatter tndb here and say little about Linux.
+write. Neither are four later changes:
+- the cursor end after `last` now lives in this crate's cursor state, not the engine's;
+- read-only cursors end the table too;
+- dup-sort writes refuse a second value for a subkey;
+- the long-reader check runs after each commit.
+
+An A/B on the Mac (2026-10-26, syncs off, tndb only, five alternating runs of each build) found
+them flat: a geomean of 1.01, and every row within the runs' own spread. On macOS `msync` does not
+flush the drive's cache, so the write rows, which are mostly the commit, flatter tndb here and say
+little about Linux.
 
 | bench | ops | tndb | MDBX | tndb/MDBX | before tuning |
 |---|--:|--:|--:|--:|--:|
@@ -375,3 +394,14 @@ after each step costs about what the copy did.
   then the zero-copy re-read above); `RandomRead` seeks a 52-byte composite key where MDBX seeks
   the 20-byte key, then the subkey in the key's own sub-tree.
 - `hash append_all` at 100k (1.12; 0.95 at 10k and 0.97 at 1M): not profiled.
+
+## Benchmark: the engine against MDBX
+
+`tndb_b_vs_mdbx` (`src/engine_bench.rs`, `#[ignore]`d) runs the `tndb-b` engine through its own API
+(`Env`, not the adapter) against MDBX (`reth-libmdbx`, opened as `tn-storage` opens it): bulk
+inserts, gets, scans, seeks, small commits, deletes and large values, on the same seeded data.
+[`engine-bench.md`](engine-bench.md) gives the command, the selectors, the runs and what they show.
+
+```text
+cargo test --release -p tndb-b-reth tndb_b_vs_mdbx -- --ignored --nocapture --test-threads 1
+```

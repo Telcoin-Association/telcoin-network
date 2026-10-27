@@ -1,6 +1,6 @@
 # `tndb-b`: a copy-on-write B+tree key-value engine
 
-An embedded key-value engine in the LMDB/MDBX mould. One page file holds every table as a
+An embedded, memory-mapped key-value engine. One page file holds every table as a
 copy-on-write B+tree with the values in its leaves, or, for a value too large for its leaf, in an
 overflow run of contiguous pages (up to 16 MiB). A single writer builds the next version of
 the trees in pages no reader can reach, while any number of readers see consistent snapshots
@@ -38,7 +38,7 @@ does not depend on `tn-storage` or reth. reth's database API on top of it is a s
 | `crc.rs`, `page_set.rs` | copied from `crates/storage/src/archive/` (`page_set.rs` adds a touched-word list, so `clear` and `drain` cost the words touched, not the file) |
 | `disk_model.rs` | test-only page-cache and power-loss model |
 | `tests/`, `*/tests.rs` | crash, damage, multi-table model, merging, path cache, append, detached cursor, key tail, concurrency and read-only suites, per-module tests |
-| `bench.rs` | the on-demand benchmark against MDBX |
+| `bench.rs` | the on-demand benchmark of step 4's data sync and of merging, each against its test-only switch |
 
 ## Milestones
 
@@ -50,13 +50,15 @@ does not depend on `tn-storage` or reth. reth's database API on top of it is a s
   for values up to 16 MiB, with run allocation (first fit, gated records loaded for a fit, tail
   reuse) and a record's leftover pages listed again under the consumed keys; merging on delete;
   a delete in one descent; the read-only open; owned (`RoCursor`) and detached (`TxnCursor`)
-  cursors; `insert` (`KeyExists`); prefix steps; MDBX's cursor state after a delete (on the
-  follower); `KeyTail`; and the reth adapter, [`tndb-b-reth`](../tndb-b-reth/README.md).
-- **Next:** a fresh Linux run of this crate's benches (the Linux tables below predate M2; the
-  adapter's benches passed their Linux gate on 2026-10-26, see its README); TN integration behind
-  a feature; and the open performance items: the descent of a small random read, dup-table reads,
-  the commit of overflow runs, the one-range `msync` at 16 KiB on macOS, and 1–4 KB values taking a
-  run page at 4 KiB pages (see [Benchmark](#benchmark-tndb-b-vs-mdbx) and the adapter's README).
+  cursors; `insert` (`KeyExists`); prefix steps; a cursor that rests on the follower after a
+  delete, so a walk that deletes as it goes skips nothing; `KeyTail`; and the reth adapter, [`tndb-b-reth`](../tndb-b-reth/README.md).
+- **Next:** a fresh Linux run of the engine's benches (its Linux tables, in the adapter crate's
+  [`engine-bench.md`](../tndb-b-reth/engine-bench.md), predate M2; the adapter's benches passed
+  their Linux gate on 2026-10-26, see its README); TN integration behind a feature; and the open
+  performance items: the descent of a small random read, dup-table reads, the commit of overflow
+  runs, the one-range `msync` at 16 KiB on macOS, and 1–4 KB values taking a run page at 4 KiB
+  pages (see [`engine-bench.md`](../tndb-b-reth/engine-bench.md),
+  [Step 4](#step-4-one-msync-or-one-fdatasync) and the adapter's README).
 
 ---
 
@@ -201,8 +203,8 @@ trailer (4):  CRC32 over bytes 0..P−4
   covers them as it covers every byte of the page, and nothing ever reads them.
 - **Leaf cell:** `vlen u32 | klen u16 | flags u16 | key | value`. Flags 0 holds the value
   inline; flags 1 makes the cell an overflow cell (below). Any other flag is `Corrupt`.
-- **Branch cell:** `child u32 | child_txn u32 | klen u16 | key`. There is one cell per child, in
-  LMDB style. Cell i's key is the lower bound of child i, and cell 0's key is empty and stands for
+- **Branch cell:** `child u32 | child_txn u32 | klen u16 | key`. There is one cell per child, with
+  no separate rightmost-child pointer. Cell i's key is the lower bound of child i, and cell 0's key is empty and stands for
   −∞. `child_txn` is the low 32 bits of the child page's header txn.
 - **CRC trailer.** It is stamped at commit with `add_crc32_nonzero`, which maps a computed CRC of 0
   to a fixed non-zero value. **An all-zero trailer means "dirty"**: a page being built by the
@@ -547,9 +549,7 @@ invariant, which returns `Failed` and latches.
 **Leftover pages are reusable at once.** When a transaction consumes a record but uses only some
 of its pages, the rest stay in `pool`, and step 2 lists them again under a consumed key. No two
 records list one page: the records consumed are deleted in step 1, and their keys are free for
-step 2. LMDB does the same (`mdb_freelist_save` writes the reclaimed pages under keys up to the
-last record it consumed), and so does MDBX (`gc_update` stores them under reclaimed ids, or ids
-below its oldest record). Listing them under M instead made them wait two more commits, longer
+step 2. Listing them under M instead made them wait two more commits, longer
 under a held reader: each commit then took more records and left more over, and under churn of a
 tenth of the pages per commit with readers held the file reached 2.5 times its live pages, against
 1.6 now (`run_churn_with_readers_keeps_the_file_bounded`).
@@ -572,6 +572,18 @@ A `Snapshot` holds `{ meta, geometry, view: Arc<MapView>, tables: TableRoots }`.
 as an `Arc` under a `parking_lot::RwLock`. `begin_ro` clones the current one, so a reader sees one
 state of every table. The environment's own `Arc` to the current snapshot keeps the reader queue
 non-empty.
+
+**A long reader shows, at no cost to readers.** A reader holding a superseded snapshot keeps every
+page freed after it from reuse (the gate in [Free list and page reuse](#free-list-and-page-reuse)),
+so the file grows while it lives; the pages become reusable once it ends.
+`Env::oldest_reader_age() -> Option<Duration>` says how long the oldest live reader has held a
+superseded snapshot. Each entry of the writer's reader queue records when the next commit
+superseded its snapshot (one monotonic clock read per commit, in `Writer::publish`), and each
+commit, after pruning the queue, stores the oldest live entry's time in an atomic of the shared
+state. The call loads it and subtracts it from now, with no lock; `begin_ro` and a reader's drop
+do nothing for it. A reader of the current snapshot does not count, as it holds back no page a
+commit freed. The value is refreshed only at commits: between them, a reader that has ended still
+counts until the next commit. A read-only environment never commits, so it always returns `None`.
 
 **A snapshot resolves each table handle once.** `TableRoots` remembers the tree roots its
 readers resolved, in 32 slots (`OnceLock<(Table, TreeRoot)>`): a handle's slot is the first one
@@ -708,7 +720,8 @@ later commit overwrites.
 **Known limit: open cannot see a meta writeback error reported earlier.** If a meta msync fails
 (say EIO), the environment latches. On Linux the page cache may keep the new meta in a page now
 marked clean while the disk holds the slot's old bytes, and the error is reported once, to the
-file already open, not to one opened later (the "fsyncgate" pattern; LMDB shares it). A reopen
+file already open, not to one opened later (the "fsyncgate" pattern, common to engines that
+rely on the page cache for writeback). A reopen
 in the same boot then reads the cached meta, and step 7's `fsync_file` succeeds without writing
 it, so later commits can build on a meta the disk does not hold. A read-only open
 (`Env::open_read_only`) in the same boot reads the same cached meta, so it can report a state the
@@ -806,20 +819,21 @@ A latched NoSync environment skips its final sync on drop.
 | `EnvOptions { page_size, map_reserve, sync }` | defaults: 4096, 1 GiB, `SyncMode::Durable`. `page_size` applies at create; an existing file keeps its own. |
 | `SyncMode::{Durable, NoSync}` | durable at commit, or at the next `Env::sync` or drop |
 | `Env::begin_ro() / begin_rw() / try_begin_rw()` | start transactions: an `RoTxn` (one committed state of every table, kept intact while it lives), an `RwTxn` (`ReadOnly` in a read-only environment) |
+| `Env::oldest_reader_age() -> Option<Duration>` | how long the oldest live reader has held a superseded snapshot (pages freed after it wait for it to end, so the file grows meanwhile); `None` when every reader holds the current snapshot, and in a read-only environment. Lock-free; refreshed at each commit (see [Readers and snapshots](#readers-and-snapshots)) |
 | `Env::sync()` | make NoSync commits durable (a no-op when nothing is pending, and in a read-only environment) |
 | `Env::check() -> CheckReport` | full structural check plus exact page accounting, each root's entry count and page counters compared with its tree. `CheckReport` gives the state's txn id and page count, the catalog, table, free-tree and free pages, the free records, and a `TableCheck { entries, pages, height }` per table. |
 | `Env::stat() -> EnvStat` | `page_size`, `txn_id`, `page_count`, `tables` |
-| `Env::free_pages() -> u64` | the pages the newest committed state's free list holds (MDBX's `freelist`, for reth's `db.freelist` gauge): every free record read with the allocator's checks, so damage is `Corrupt` and latches |
+| `Env::free_pages() -> u64` | the pages the newest committed state's free list holds (space the file can reuse before it grows; the reth adapter reports it as reth's `db.freelist` gauge): every free record read with the allocator's checks, so damage is `Corrupt` and latches |
 | `Env::failure()` | the latched cause, if any |
 | `Env::max_key_len() / max_value_len(klen)` | the entry limits of this page size. `max_value_len` is the table limit: 16 MiB for a key up to `max_key_len − 10` bytes, else the inline limit. A value over the inline limit is stored in an overflow run transparently: `put`, `get` and the cursors take and return its bytes as for any value. |
 | `ReadTxn` (both txn kinds) | `open_table(name) -> Option<Table>`, `get`, `cursor`, `txn_id`, `table_stat -> TableStat { entries, height, branch_pages, leaf_pages, overflow_pages }` (O(1), from the root record) |
 | `RwTxn::create_table(name)` | open or create |
 | `RwTxn::drop_table(Table) / clear_table(&Table)` | free the tree's pages (both are copy-on-write: readers keep the old tree) |
 | `RwTxn::put / delete -> bool` | point writes |
-| `RwTxn::insert(table, key, value)` | put only a key the table does not hold: a present key is `KeyExists` (like `MDBX_NOOVERWRITE`), found by the put's own search (in the table's cached leaf, else by the descent's plan) and refused before anything changes, with no latch; a new key is stored exactly as `put` stores it |
-| `RwTxn::append(table, key, value)` | put a new last entry: `key` must sort strictly after the table's last key (an empty table takes any key), else `AppendOutOfOrder`, refused before anything changes (like `MDBX_APPEND`). An append into the table's cached rightmost leaf neither descends nor searches; the cache holds the leaf of the table's last put or append in this transaction (after an append split, the new right leaf) until a page is allocated or freed, and any other append descends. |
-| `RwTxn::cursor_mut -> RwCursor` | cursor moves and prefix steps plus `put`, `append` (as `RwTxn::append`), `insert` (as `RwTxn::insert`) and `delete_current`. A put, append or insert leaves the cursor at its entry: placed from the path it wrote (after an append split, from the new path the split refills the table's path cache with), or re-sought by key after any other split; a refused one leaves the cursor where it was. A delete re-seeks by key, so after any merges the cursor is on the deleted entry's follower in a deleted state, as MDBX's cursor is: `next` returns the follower without stepping past it, `current` returns it too, `prev` returns the entry before it, and another `delete_current` deletes it. Right after a delete the prefix steps compare with the deleted key: the follower (`next_in_prefix`) or the entry before (`prev_in_prefix`) if it shares the prefix, else `None` with the cursor still on the follower in the deleted state. With no follower the cursor is after the end: `next`, `current` and `delete_current` find nothing and `prev` returns the new last entry (MDBX's `GET_CURRENT` returns that entry, as after a `seek` past the end). |
-| `RwTxn::cursor_detached(&self, &Table) -> TxnCursor` | a write cursor that holds no borrow of the transaction: its moves (`first`, `last`, `next`, `prev`, `current`, `seek`, `seek_exact`, the prefix steps) take `&RwTxn` and return entries borrowed from it; its writes (`put`, `insert`, `append`, `delete_current`) take `&mut RwTxn`. The states, the writes' placement and the deleted state are `RwCursor`'s. As MDBX's cursor after `last`, a `TxnCursor` whose `last` (or `prev` from unset) landed on an entry ends the table: `next` and `next_in_prefix` return `None` and stay on the entry, even after another writer appends past it, until another move or write. Several cursors, over one table or several, and the transaction's own writes interleave, each seeing the others' writes; see [Detached cursors](#detached-cursors-txncursor) below. |
+| `RwTxn::insert(table, key, value)` | put only a key the table does not hold: a present key is `KeyExists`, found by the put's own search (in the table's cached leaf, else by the descent's plan) and refused before anything changes, with no latch; a new key is stored exactly as `put` stores it |
+| `RwTxn::append(table, key, value)` | put a new last entry: `key` must sort strictly after the table's last key (an empty table takes any key), else `AppendOutOfOrder`, refused before anything changes. An append into the table's cached rightmost leaf neither descends nor searches; the cache holds the leaf of the table's last put or append in this transaction (after an append split, the new right leaf) until a page is allocated or freed, and any other append descends. |
+| `RwTxn::cursor_mut -> RwCursor` | cursor moves and prefix steps plus `put`, `append` (as `RwTxn::append`), `insert` (as `RwTxn::insert`) and `delete_current`. A put, append or insert leaves the cursor at its entry: placed from the path it wrote (after an append split, from the new path the split refills the table's path cache with), or re-sought by key after any other split; a refused one leaves the cursor where it was. A delete re-seeks by key, so after any merges the cursor is on the deleted entry's follower in a deleted state, so a walk that deletes as it goes skips nothing: `next` returns the follower without stepping past it, `current` returns it too, `prev` returns the entry before it, and another `delete_current` deletes it. Right after a delete the prefix steps compare with the deleted key: the follower (`next_in_prefix`) or the entry before (`prev_in_prefix`) if it shares the prefix, else `None` with the cursor still on the follower in the deleted state. With no follower the cursor is after the end: `next`, `current` and `delete_current` find nothing and `prev` returns the new last entry. |
+| `RwTxn::cursor_detached(&self, &Table) -> TxnCursor` | a write cursor that holds no borrow of the transaction: its moves (`first`, `last`, `next`, `prev`, `current`, `seek`, `seek_exact`, the prefix steps) take `&RwTxn` and return entries borrowed from it; its writes (`put`, `insert`, `append`, `delete_current`) take `&mut RwTxn`. The states, the writes' placement and the deleted state are `RwCursor`'s. After `last` (or `prev` from unset) the cursor is on that entry as after any move: `next` and `next_in_prefix` return an entry another writer has put past it since, else `None` (the cursor after the end). Several cursors, over one table or several, and the transaction's own writes interleave, each seeing the others' writes; see [Detached cursors](#detached-cursors-txncursor) below. |
 | `RwTxn::commit() -> txn id / abort()` | finish |
 | `Cursor` | `first`, `last`, `next`, `prev`, `current`, `seek` (first `>= key`), `seek_exact`, and the prefix steps `next_in_prefix(n)`, `prev_in_prefix(n)` (below) |
 | `RoTxn::cursor_owned(self: &Arc<RoTxn>, &Table) -> RoCursor` | a read cursor that owns a share of its transaction: no lifetime, `Send + Sync`, the same moves, states and prefix steps as `Cursor`; the entries it returns, overflow values included, borrow the cursor until its next call. Each step fetches its leaf again by page number (see [Readers and snapshots](#readers-and-snapshots)), so a scan costs about 4–8% more per entry than `Cursor`'s (macOS). |
@@ -867,23 +881,22 @@ the cursor saw at its last call, inline:
   and a dropped one (perhaps re-created since) is `StaleTable`;
 - **its table changed** (its write stamp moved): the cursor takes the table's new tree and seeks
   its saved key. If the key is still there the cursor stays on it, with its new value if it
-  changed. If not, the cursor is left as if it had deleted the entry itself, which is what an MDBX
-  cursor does when another cursor deletes its entry: on the first entry after the key (the
+  changed. If not, the cursor is left as if it had deleted the entry itself, so it behaves the
+  same whichever writer deleted its entry: on the first entry after the key (the
   follower) in the deleted state, so `next` and `current` return the follower, `prev` the entry
   before it, `delete_current` deletes it, and the prefix steps compare with the gone key. Its
   saved key becomes the follower's (the gone key is kept apart, `deleted_key`, for the prefix
   steps). A cursor already in that state stays in it, on its follower, or on the first entry
   after the follower if that is gone too. An unset cursor, or one after the end or before the
-  start, keeps its state over the new tree. A reseek that finds the entry keeps the end `last`
-  sets (`soft_end`); one that does not clears it.
+  start, keeps its state over the new tree.
 
 The reseek is lazy: it sees the table as it is at the cursor's next call. If, before that call,
 another writer deleted the cursor's entry and put it back, or put an entry between it and its
-follower, the cursor is on that entry, where MDBX's cursor, moved at the delete, is on the
-follower. The other place the cursors differ from MDBX's is past either end: MDBX's cursor stays
-on the end entry after stepping past it, after a `seek` past the end or after deleting the last
-entry (`current` returns it, `delete_current` deletes it), where tndb-b's is after the end or
-before the start (`current` finds nothing, `delete_current` returns `false`).
+follower, the cursor is on that entry: it reseeks the key it saved, not the delete it never
+saw. Past either end the cursor has left the entries: after stepping past the end entry, after a
+`seek` past the end or after deleting the last entry it is after the end or before the start
+(`current` finds nothing, `delete_current` returns `false`), and a step the other way returns
+the end entry.
 
 A write to another table (each table has its own stamp) and the cursor's own writes (it records
 the stamp its write left) cause no reseek. A `put`, `insert` or `append` through the cursor checks
@@ -930,8 +943,8 @@ it lands on, a multi-page overflow value in full).
 - **macOS: msync and fsync are not power-loss barriers.** Neither flushes the drive's write cache.
   Only `F_FULLFSYNC` does, at 10–20 ms each, and the crate deliberately never issues it. Never
   call `File::sync_all`; use `sys::fsync_file` and `fdatasync_file`. A process or kernel crash
-  loses nothing committed durably, but a power loss can, exactly as with MDBX's `Durable` mode on
-  macOS. Production durability is a Linux property, where `msync(MS_SYNC)` and `fdatasync` each
+  loses nothing committed durably, but a power loss can, as with any engine that syncs without
+  `F_FULLFSYNC` on macOS. Production durability is a Linux property, where `msync(MS_SYNC)` and `fdatasync` each
   take the file system's fsync path, drive-cache flush included.
 - **A page size below the OS page puts both metas in one OS page** (4 KiB pages on Apple
   Silicon's 16 KiB OS pages, or on a 64 KiB-page arm64 or ppc64 Linux kernel). A mapped write
@@ -959,10 +972,11 @@ it lands on, a multi-page overflow value in full).
   the file grew sparse. Growth leaves slack past the pages in use, and a durable commit that grew
   the file fsyncs it (the size sync, or the `fdatasync` data sync), so the puts of a long-lived
   environment into slack grown before a durable commit pay this, on overflow runs and tree
-  pages alike. In the `big` benchmark rows, run in one shared environment, a `t4d` put of an
-  8 KiB value took 9.5 us, against 2.0 us in a fresh environment; most of it was the run's
-  first-touch faults. MDBX grows the file sparse on macOS, so it does not pay this. tndb-b keeps
-  growing with real blocks by design: a full disk must be an `io::Error`, not a `SIGBUS`. The
+  pages alike. When the comparison benchmark's `big` rows
+  ([`engine-bench.md`](../tndb-b-reth/engine-bench.md#large-values-overflow-runs)) ran in one
+  shared environment, a `t4d` put of an 8 KiB value took 9.5 us, against 2.0 us in a fresh
+  environment; most of it was the run's first-touch faults. A file grown sparse does not pay
+  this, but tndb-b keeps growing with real blocks by design: a full disk must be an `io::Error`, not a `SIGBUS`. The
   cause is specific to macOS; Linux is not measured.
 
 ---
@@ -976,7 +990,7 @@ These limits and non-goals are known:
   stores a dup table's rows as ordinary keys `key ‖ subkey`. Leaf cell flags other than 0 and 1
   (overflow) are refused.
 - **The inline limit is about a quarter of a page** (`MAX_ENTRY = U / 4`, kept for its one-split
-  proof): about 1 KB at 4 KiB pages, against MDBX's about 2 KB. A value of 1–4 KB at 4 KiB pages
+  proof): about 1 KB at 4 KiB pages. A value of 1–4 KB at 4 KiB pages
   therefore takes a run page of its own. Raising it needs a new split proof and a format change.
 - **No multi-process access** alongside a live writer: there is no shared reader table. A
   read-only open takes the lock shared, so it and a writer exclude each other.
@@ -986,9 +1000,9 @@ These limits and non-goals are known:
   a delete changes are merge-closed.
 - No sibling links. A cursor crosses leaves through their parents (copy-on-write cannot keep
   sibling links).
-- A `TxnCursor` reseeks lazily, and the engine's cursors end past either end where MDBX's stay on
-  the end entry: the two places its cursors still differ from MDBX's (see
-  [Detached cursors](#detached-cursors-txncursor)).
+- A `TxnCursor` reseeks lazily, at its next call, so it does not see a delete and re-put of its
+  entry between two calls; and a cursor stepped past either end rests after the end or before
+  the start, not on the end entry (see [Detached cursors](#detached-cursors-txncursor)).
 - The height is capped at 48, a corruption tripwire far above any real height.
 - Table names are 1..=255 bytes of UTF-8.
 
@@ -1053,7 +1067,8 @@ These limits and non-goals are known:
      as the separator, which can be longer than the one it replaces, so a delete could overflow a
      parent and split, and its reservation would need a split cascade's worst case. Merge-only
      keeps it to the path's copies.
-   - **A quarter is LMDB's and MDBX's default merge threshold.** It is enough in practice: after
+   - **A quarter is the merge threshold.** It leaves a wide gap below the half-full pages a split
+     makes, so a page does not swing between splitting and merging, and it is enough in practice: after
      90% of a random fill is deleted at random, the leaves stay 0.40–0.47 full, against about 0.08
      without merging (`deleting_90_percent_leaves_no_page_merge_open`).
    - **Single-child branches are still possible**, as they were before merging. A branch that an
@@ -1133,11 +1148,11 @@ These limits and non-goals are known:
     CRC** (`RunCrc::MultiPage`), so a get of such a value reads all its bytes. Pages 2..n of a run
     carry no header: a middle page reused or redirected by damage passes every header check of
     the first page, and only the CRC catches it. The rule is never wrong data, so the CRC stays.
-    It costs a pass over the value. In the `big` benchmark rows (macOS, medians of three, each
-    value size in a fresh environment) a get takes about 1.1 us at 8 KiB and 2.1 us at 32 KiB at
-    4 KiB pages (`t4d`, runs of 3 and 9 pages), and 1.4 and 2.6 us at 16 KiB pages (`t16d`),
-    against MDBX's about 0.3 us, which returns a pointer without reading the value. With the CRC
-    skipped in an experiment, the same `t4d` and `t16d` gets took 0.34–0.40 us. A 1-page run
+    It costs a pass over the value. In the comparison benchmark's `big` rows
+    ([`engine-bench.md`](../tndb-b-reth/engine-bench.md#large-values-overflow-runs); macOS,
+    medians of three, each value size in a fresh environment) a get takes about 1.1 us at 8 KiB
+    and 2.1 us at 32 KiB at 4 KiB pages (`t4d`, runs of 3 and 9 pages), and 1.4 and 2.6 us at
+    16 KiB pages (`t16d`). With the CRC skipped in an experiment, the same `t4d` and `t16d` gets took 0.34–0.40 us. A 1-page run
     has no page without a header, so its read skips the CRC as a leaf's does (item 3): that took
     a `t4d` 2 KiB get from 724 to 302 ns and a `t16d` 8 KiB get from 1.30 us to 271 ns.
 14. **An owned cursor's step re-fetches its leaf without the per-fetch checks**
@@ -1186,279 +1201,49 @@ The default tests are small and fast, because CI runs nextest in debug. The heav
 | `tests/multi_model.rs` | a random multi-table workload with crashes against a model; its large-value variant spreads values over inline and 1–10-page runs, with drops and clears of tables holding runs; a draining variant (stretches of mostly deletes, `a_draining_multi_table_workload_with_crashes_matches_the_model`) makes pages merge, and every variant's coverage gate counts merging deletes |
 | `tests/path_cache.rs` | random multi-table workloads (puts, deletes, clears, drops, commits, aborts, readers held) on a cached and an uncached environment: the same outcomes and byte-identical files after every commit; a cached leaf reused by another table in the same txn is not written; an aborted transaction's cache never reaches the next |
 | `tests/append.rs` | `RwTxn::append`, `RwCursor::put`/`append` and both inserts against `RwTxn::put`: byte-identical files and a model across splits, aborts, deletes and stale path caches; an append out of order, and an insert of a present key (in the cached leaf, on the descent, over an overflow value), is refused without a latch, a change or a moved epoch; a cursor put or insert lands on its entry (`current`, `next`, `prev`) |
-| `tests/txn_cursor.rs` | detached cursors sharing one write transaction: three `TxnCursor`s over two tables and the transaction's own puts, deletes and a `clear_table`, interleaved at random, against a model of each cursor (its entry, or the follower and the deleted key after a delete, and the end `last` sets, over the table's rows) in every result and state, with writes next to where the cursors sit (before and after their slot, deleting their entry and its neighbours), overflow values and refused inserts and appends; each round commits and checks, a cursor of an earlier round is `WrongTxn`, and the file reopens to the model (`txn_cursors_and_direct_writes_match_a_model`, `_heavy`); another table's writes, a table created and the cursor's own writes cause no reseek, a write to its table one (`a_write_to_another_table_causes_no_reseek`); a dropped table is `StaleTable` for every call, touched in the transaction or not, and after a re-create (`drop_table_under_a_live_cursor_is_stale_table`); a later transaction, the successor of an aborted one with its txn id, and another environment's are `WrongTxn`, changing nothing, without a latch (`a_cursor_used_with_another_transaction_is_wrong_txn`); a refused insert changes nothing and keeps the cursor and its saved key, and after a delete a reseek finds the follower by its key (`a_refused_insert_through_a_txn_cursor_changes_nothing`); `last` ends the table for `next` and `next_in_prefix` past another writer's append, until another move (`last_ends_the_table_for_next_until_another_move`); prefix steps after another cursor's insert and delete and through a group split under the cursor (`prefix_steps_through_txn_cursors_follow_other_writes`) |
+| `tests/txn_cursor.rs` | detached cursors sharing one write transaction: three `TxnCursor`s over two tables and the transaction's own puts, deletes and a `clear_table`, interleaved at random, against a model of each cursor (its entry, or the follower and the deleted key after a delete, over the table's rows) in every result and state, with writes next to where the cursors sit (before and after their slot, deleting their entry and its neighbours), overflow values and refused inserts and appends; each round commits and checks, a cursor of an earlier round is `WrongTxn`, and the file reopens to the model (`txn_cursors_and_direct_writes_match_a_model`, `_heavy`); another table's writes, a table created and the cursor's own writes cause no reseek, a write to its table one (`a_write_to_another_table_causes_no_reseek`); a dropped table is `StaleTable` for every call, touched in the transaction or not, and after a re-create (`drop_table_under_a_live_cursor_is_stale_table`); a later transaction, the successor of an aborted one with its txn id, and another environment's are `WrongTxn`, changing nothing, without a latch (`a_cursor_used_with_another_transaction_is_wrong_txn`); a refused insert changes nothing and keeps the cursor and its saved key, and after a delete a reseek finds the follower by its key (`a_refused_insert_through_a_txn_cursor_changes_nothing`); after `last` (or `prev` from unset) `next` and `next_in_prefix` move to an entry another writer put past it, and with none go past the end (`next_after_last_finds_entries_put_past_it`); prefix steps after another cursor's insert and delete and through a group split under the cursor (`prefix_steps_through_txn_cursors_follow_other_writes`) |
 | `tests/key_tail.rs` | `current_with_key_tail` on `Cursor`, `RoCursor` and `TxnCursor` against `current`: inline, empty and overflow values, over walks, seeks, prefix steps, a reseek and a delete; `seek_with_key_tail` on `RoCursor` and `TxnCursor` against `seek` then `current_with_key_tail` (hits, misses, both ends, an empty table, and the moves after: `seek_with_key_tail_is_a_seek_then_current_with_key_tail`), and a `TxnCursor` taken out of the end that `last` (or `prev` from unset) sets, and out of the deleted state, as `seek` takes it (`seek_with_key_tail_clears_a_txn_cursors_end_and_deleted_states`); the page codec's span is tested in `page.rs` (`key_tail_joins_the_keys_last_bytes_to_an_inline_value`, and on damaged pages) |
 | `tests/concurrency.rs` | reader threads rescan pinned snapshots and take fresh ones while a writer replaces, deletes and clears (pages freed and reused): no read sees damage or a torn state |
 | `tests/read_only.rs` | `Env::open_read_only` on a file of several commits (inline values, runs of 1–18 pages, a dropped table): every key reads back through gets and both scans, `check` passes, and the file is byte-identical with its mtime unchanged after the open, the reads, the check, a sync and the drop; a mode-0444 file opens (`a_read_only_open_reads_every_table_and_changes_nothing`); an unsynced meta in the page cache is read and still lost to a power loss: the open synced nothing (`a_read_only_open_syncs_nothing`); read-only opens coexist and exclude a writer both ways (`read_only_opens_share_the_lock_and_exclude_a_writer`); `begin_rw` and `try_begin_rw` are `ReadOnly` without a latch; a missing, empty or foreign file is refused with nothing created; a damaged newest meta falls back one txn, unrepaired; a read-only damage sweep (`damage_at_rest_is_met_by_read_only_reads_and_check`, on `tests/damage.rs`'s fixture): damage to a leaf, a branch, the catalog or the free list is `Corrupt` from the first get or scan that reaches it, else from `check`, latched by that operation, and a damaged tree root fails the open closed, the file unchanged |
 
 ```text
 cargo nextest run -p tndb-b                                    # default suite (debug)
-cargo test --release -p tndb-b -- --ignored --skip tndb_b_vs_mdbx  # heavy variants (about 4–5 min)
-cargo test --release -p tndb-b tndb_b_vs_mdbx -- --ignored --nocapture --test-threads 1  # benchmark
+cargo test --release -p tndb-b -- --ignored --skip tndb_b_sync_and_merge  # heavy variants (about 4–5 min)
+cargo test --release -p tndb-b tndb_b_sync_and_merge -- --ignored --nocapture --test-threads 1  # benchmark
 ```
 
-### Benchmark: tndb-b vs MDBX
+### Benchmark: step 4 and merging
 
-`bench.rs` (`tndb_b_vs_mdbx`) runs each column in a fresh temp dir on the same seeded streams:
-1M entries per bulk table, 8-byte BE sequential keys and 32-byte random keys, 100-byte values.
+`bench.rs` (`tndb_b_sync_and_merge`) times two engine choices against their test-only switches,
+in fresh environments on seeded streams (32-byte random keys, 100-byte values):
+
+- **small:** 2000 transactions of 3 puts, each committed and timed, with step 4's own choice
+  against step 4 forced to one `fdatasync` for every commit (`Writer::data_by_fdatasync`, the
+  "fdatasync" rows). The two modes alternate in blocks of 100 transactions (A B B A order) on the
+  same table, so neither gains from running second. They differ only on one-range commits, which
+  step 4 syncs by one `msync`.
+- **churn:** ten rounds over a table of N/4 random keys, each a fill and a delete of 90% of the
+  keys at random, timed as a whole; then the table's pages, the file's used span and its size. It
+  runs with merging and without (`Writer::no_merge`, the "churn (no merge)" rows), to show what
+  merging saves.
 
 ```text
-cargo test --release -p tndb-b tndb_b_vs_mdbx -- --ignored --nocapture --test-threads 1
+cargo test --release -p tndb-b tndb_b_sync_and_merge -- --ignored --nocapture --test-threads 1
 ```
 
-**Run tip (Linux):** pin the run to performance cores, and put the temp dir on a real disk (never
-a tmpfs: on Linux the run stops if it is one), scoped to the one command. On a CPU with P and E
-cores (`lscpu -e` shows which CPUs are which), for example:
+`TNDB_B_BENCH_N` sets N (default 1,000,000), `TNDB_B_BENCH_ENGINES` the columns (`t4d` and `t16d`,
+`Durable` with 4 and 16 KiB pages; `t4n`, 4 KiB `NoSync`, which has no step 4 and runs only the
+first mode), and `TNDB_B_BENCH_ROWS` the groups (`small`, `churn`). Put the temp dir on a real disk
+(`TMPDIR`, scoped to the one command): on a tmpfs syncs cost nothing, and on Linux the run stops.
 
-```text
-TMPDIR=/path/on/disk taskset -c 0-7 cargo test --release -p tndb-b tndb_b_vs_mdbx -- --ignored --nocapture --test-threads 1
-```
+**Merging** (Apple M1 Max, macOS, 2026-10-21, N = 300k, medians of three runs, at 4 KiB pages; code
+before the owned and detached cursors): after the churn the table took 2.3 MiB of pages, against
+13.1 MiB without merging, and the churn took 729.2 ms against 742.5 ms. The delete rows of the
+same runs stayed within a few percent of merging off, and the other rows were unchanged.
 
-For the durable rows, also turn off the drive's autonomous power states and set the CPU governor
-and energy preference to `performance` (the adapter README's gate gives the commands). Even then a
-consumer NVMe drive syncs a commit at one of two speeds and switches between them during a run, for
-every engine at once; judge a durable row against MDBX's time for it in the same run.
-
-Environment variables select what runs (the `bench.rs` module docs have the details):
-
-- `TNDB_B_BENCH_N`: entries per bulk table (default 1,000,000).
-- `TNDB_B_BENCH_ENGINES`: the columns, comma-separated (default all): `t4d`, `t16d`, `t4n`,
-  `md`, `md4`, `mn`.
-- `TNDB_B_BENCH_ROWS`: the row groups, comma-separated (default all): `seq`, `rand`, `get-hit`,
-  `get-miss`, `scan-fwd`, `scan-rev`, `seek`, `small`, `mixed`, `clear`, `append` (the API rows),
-  `big` (the large-value rows, see [Large values](#large-values-overflow-runs)), `delete` (the
-  delete rows, see [Deletes](#deletes)), and the aliases `bulk`, `get` and `scan`.
-- `TNDB_B_BENCH_REPEAT=k`: each selected read row runs k times and reports the median.
-
-The columns:
-
-- `t4d` and `t16d`: tndb-b `Durable` with 4 KiB and 16 KiB pages; `t4n`: 4 KiB `NoSync`.
-- `md`: MDBX (`reth-libmdbx`) `Durable`, opened as `tn-storage` opens it: a `write_map`
-  environment with the OS page size and a generous geometry. `md4`: the same with 4 KiB pages.
-  `mn`: MDBX `SafeNoSync`. On x86_64 the OS page is 4 KiB, so `md` and `md4` are the same
-  configuration there.
-
-**Like-for-like pairs:** `t4d` with `md4` everywhere, and `t16d` with `md` on Apple Silicon,
-where the OS page is 16 KiB. On x86_64 `t16d` has no MDBX twin. `t4n` has none either: a
-`SafeNoSync` commit costs far more than a tndb-b NoSync commit on both platforms (see
-[NoSync against SafeNoSync](#nosync-against-safenosync)).
-
-A bulk row's "put loop" runs from `begin` to just before `commit`, and its "commit" is the rest.
-The API rows time the put loop into a fresh environment: tndb-b's `RwTxn::append`,
-`RwCursor::put` and `RwCursor::append` against MDBX's `put` with `WriteFlags::APPEND`,
-`Cursor::put`, and `Cursor::put` with `WriteFlags::APPEND`. The "txn cursor" rows run the same
-puts through `TxnCursor::put` and `TxnCursor::append` (tndb-b only): the cost of a cursor that
-shares its transaction, against the `RwCursor` rows.
-
-The "fdatasync" rows rerun the small-commit workload with commit step 4 forced to one
-`fdatasync` of the whole file for every commit (a test-only switch, `Writer::data_by_fdatasync`).
-Step 4 picks the `fdatasync` itself whenever the dirty pages form two or more ranges or more
-than 16 runs, so the two modes differ only on one-range commits, which step 4 syncs by one
-`msync`. The two modes alternate in blocks of 100 transactions (A B B A order) on the same
-table, so neither gains from running second.
-
-**Which code the tables measured.** The macOS and Linux tables below were both taken on
-2026-10-20 with M1 and its performance work, before step 4 became one sync: each dirty range was
-synced by its own `msync` (one `fdatasync` past 16 runs), and there the "fdatasync" rows replaced
-those msyncs on every commit. They also predate every M2 change (format v2 and its page counters,
-overflow runs, merging, the one-descent delete, the owned and detached cursors). The large-value
-and delete tables further down were taken during M2, each with its code state given. None has
-been rerun on the final M2 code; the adapter's Linux gate ran reth's benches, not these.
-
-#### macOS run
-
-**Run:** Apple M1 Max, 64 GiB RAM, internal SSD (APFS), macOS (Darwin 24.6), 2026-10-20; code: M1
-with its performance work, per-range msyncs at step 4, before M2. Each cell is the median of
-three full runs (each about 45 s). The Mac had background load, and the
-MDBX cells moved by up to 20% between runs (`md` random insert: 779–894 ms), so a difference
-under about 10% is noise. How step 4 syncs matters mainly to the small-commit rows: a bulk
-commit is one range, synced by one `msync` before and after, and nearly every mixed-row commit
-already took the `fdatasync` past 16 runs. Since step 4 became one sync, the Mac's small-commit
-median is 73 us at 4K and 90 us at 16K, against 114 and 130 us here (see
-[Step 4](#step-4-one-msync-or-one-fdatasync)).
-
-| | `t4d` | `t16d` | `t4n` | `md` | `md4` | `mn` |
-|---|--:|--:|--:|--:|--:|--:|
-| seq insert 1M, 1 txn | 96.7 ms | 81.8 ms | 62.1 ms | 140.4 ms | 147.3 ms | 127.2 ms |
-| seq: put loop | 59.8 ms | 47.3 ms | 57.0 ms | 110.5 ms | 115.4 ms | 109.6 ms |
-| seq: commit | 36.9 ms | 34.5 ms | 5.1 ms | 29.9 ms | 31.5 ms | 16.1 ms |
-| random insert 1M, 1 txn | 892.1 ms | 829.9 ms | 801.6 ms | 820.3 ms | 773.0 ms | 830.7 ms |
-| random: put loop | 800.9 ms | 741.4 ms | 792.9 ms | 754.0 ms | 683.4 ms | 795.1 ms |
-| random: commit | 91.2 ms | 91.1 ms | 8.6 ms | 66.3 ms | 61.1 ms | 30.8 ms |
-| file size (st_size) | 520.0 MiB | 528.0 MiB | 520.0 MiB | 512.0 MiB | 512.0 MiB | 512.0 MiB |
-| file used (pages × P) | 318.1 MiB | 311.0 MiB | 318.1 MiB | 312.3 MiB | 324.6 MiB | 312.3 MiB |
-| get hit (per op) | 717 ns | 668 ns | 724 ns | 696 ns | 681 ns | 713 ns |
-| get miss (per op) | 752 ns | 746 ns | 698 ns | 742 ns | 712 ns | 768 ns |
-| scan forward 1M | 46.6 ms | 27.1 ms | 43.0 ms | 30.2 ms | 55.8 ms | 31.7 ms |
-| scan reverse 1M | 38.8 ms | 24.9 ms | 36.6 ms | 30.0 ms | 37.1 ms | 29.2 ms |
-| seek + 10 entries (per seek) | 1.2 us | 1.1 us | 1.1 us | 1.1 us | 1.1 us | 1.1 us |
-| small txn (3 puts) median | 114.4 us | 129.9 us | 5.9 us | 1.3 ms | 1.3 ms | 2.3 ms |
-| small txn p99 | 189.5 us | 192.0 us | 14.1 us | 3.8 ms | 3.8 ms | 6.6 ms |
-| small txns total (2000) | 234.7 ms | 262.7 ms | 14.0 ms | 2.98 s | 2.95 s | 5.42 s |
-| fdatasync: median | 75.3 us | 83.9 us | - | - | - | - |
-| fdatasync: p99 | 125.8 us | 117.2 us | - | - | - | - |
-| fdatasync: total | 155.7 ms | 171.9 ms | - | - | - | - |
-| mixed 100k upd/del (1000/txn) | 3.34 s | 2.63 s | 256.5 ms | 3.27 s | 4.26 s | 1.62 s |
-| clear_table 1M + commit | 1.4 ms | 569.0 us | 1.4 ms | 2.2 ms | 2.7 ms | 3.6 ms |
-| append put 1M (put loop) | 53.9 ms | 48.3 ms | 59.4 ms | 64.6 ms | 69.2 ms | 67.7 ms |
-| cursor put 1M (put loop) | 58.5 ms | 52.3 ms | 61.4 ms | 50.1 ms | 51.2 ms | 50.7 ms |
-| cursor put APPEND 1M (put loop) | 57.8 ms | 51.5 ms | 60.2 ms | 57.9 ms | 61.6 ms | 59.2 ms |
-
-**What M1's performance work changed** (this table replaced a run of the first M1 code). Every
-guarantee and damage check is kept; the checks moved to where they are needed.
-
-- **Provenance trust.** The writer's descent skips the per-fetch and separator-range checks on
-  pages this transaction built, and computes the separator bounds only when it first meets a
-  published page (item 11 of the
-  [do-not-flag list](#intentional-design-decisions-please-do-not-flag-these)).
-- **The path cache.** A table put that lands in the leaf of the table's last put goes straight
-  into it, with no descent (item 12).
-- **Append and cursor put.** `RwTxn::append`, and `RwCursor::put`/`append` placed from the path
-  the write took. An append split leaves the left leaf as it is and refills the path cache.
-- **One header parse per page, cold errors.** The parsed views (`View`, `LeafView`,
-  `BranchView`, `LeafMut`) check a page's header once for many cell reads. The hot accessors are
-  `#[inline]` and build their errors in `#[cold]` functions.
-- **Search prefetch.** Each binary-search probe prefetches the two cells the next probe may read.
-- **Cheaper splits.** `SplitBuf` plans a split in reused buffers and writes the right half
-  straight into the zeroed new page, with no heap allocation per split.
-
-At 16K, against the run this table replaces: the sequential insert went from 391 to 82 ms (its
-put loop from about 367 to 47 ms), the random insert from 1097 to 830 ms, the forward scan from
-38.8 to 27.1 ms, and a seek from 1.3 to 1.1 us. Small commits, the mixed workload and
-`clear_table` stayed level in back-to-back comparisons.
-
-#### Linux run
-
-**Run:** Linux x86_64 laptop (i7-1360P, NVMe, ext4), 2026-10-20, three full runs; code: M1 with
-its performance work, per-range msyncs at step 4 (before the one-range rule), before M2. Each run
-took 132–163 s.
-
-**CPU-bound rows.** Each cell is the median of the three runs. tndb-b's cells repeated within a
-few percent, and the median drops a few one-run outliers in `mn`. The NoSync bulk totals are
-shown for `t4n` and `mn` only; the durable totals follow the drive (below).
-
-| | `t4d` | `t16d` | `t4n` | `md` | `md4` | `mn` |
-|---|--:|--:|--:|--:|--:|--:|
-| seq: put loop | 53.5 ms | 46.0 ms | 53.6 ms | 115.7 ms | 115.8 ms | 115.8 ms |
-| random: put loop | 512.9 ms | 557.8 ms | 517.4 ms | 544.2 ms | 546.8 ms | 563.3 ms |
-| seq insert 1M, 1 txn (NoSync) | - | - | 60.3 ms | - | - | 116.1 ms |
-| random insert 1M, 1 txn (NoSync) | - | - | 531.3 ms | - | - | 563.8 ms |
-| file size (st_size) | 516.0 MiB | 528.0 MiB | 516.0 MiB | 512.0 MiB | 512.0 MiB | 512.0 MiB |
-| file used (pages × P) | 318.1 MiB | 311.0 MiB | 318.1 MiB | 324.6 MiB | 324.6 MiB | 324.6 MiB |
-| get hit (per op) | 497 ns | 545 ns | 494 ns | 587 ns | 602 ns | 603 ns |
-| get miss (per op) | 505 ns | 569 ns | 504 ns | 619 ns | 626 ns | 632 ns |
-| scan forward 1M | 31.9 ms | 20.8 ms | 31.9 ms | 42.7 ms | 42.5 ms | 35.2 ms |
-| scan reverse 1M | 32.6 ms | 21.2 ms | 32.6 ms | 30.2 ms | 30.3 ms | 30.4 ms |
-| seek + 10 entries (per seek) | 1.1 us | 855 ns | 1.1 us | 1.0 us | 1.0 us | 1.1 us |
-| append put 1M (put loop) | 52.2 ms | 46.0 ms | 52.8 ms | 56.2 ms | 56.2 ms | 55.6 ms |
-| cursor put 1M (put loop) | 55.4 ms | 48.6 ms | 55.7 ms | 48.3 ms | 47.5 ms | 47.2 ms |
-| cursor put APPEND 1M (put loop) | 54.4 ms | 48.2 ms | 54.8 ms | 52.6 ms | 52.9 ms | 52.1 ms |
-
-The MDBX forward-scan medians hide a split: each MDBX column had runs of about 32 ms and runs of
-about 42.7 ms, while tndb-b's scans moved by at most 0.2 ms. The cause is unconfirmed; the core
-type the run landed on is one guess (see the run tip).
-
-**Durable rows.** Each cell is the range (min–max) of the three runs.
-
-| | `t4d` | `t16d` | `md` | `md4` |
-|---|--:|--:|--:|--:|
-| seq: commit | 32.7–119.3 ms | 28.6–127.2 ms | 33.0–143.4 ms | 104.0–170.9 ms |
-| random: commit | 51.9–214.6 ms | 63.0–223.8 ms | 50.2–406.3 ms | 191.7–280.6 ms |
-| small txn (3 puts) median | 904.3–920.2 us | 703.2–931.3 us | 543.6 us–3.5 ms | 3.4 ms (all three) |
-| small txn p99 | 4.9–16.9 ms | 5.6–7.1 ms | 848.6 us–7.0 ms | 3.9–7.3 ms |
-| small txns total (2000) | 2.15–5.45 s | 1.85–4.29 s | 1.13–8.19 s | 5.72–6.48 s |
-| fdatasync: median | 514.5–515.9 us | 531.8–568.1 us | - | - |
-| fdatasync: p99 | 3.4–7.2 ms | 3.5–3.9 ms | - | - |
-| fdatasync: total | 1.21–3.17 s | 1.54–3.38 s | - | - |
-| mixed 100k upd/del (1000/txn) | 7.90–57.80 s | 3.11–10.62 s | 33.33–43.74 s | 3.47–27.54 s |
-| clear_table 1M + commit | 4.3–9.1 ms | 900.8 us–4.0 ms | 1.6–11.6 ms | 1.6–7.2 ms |
-
-**These rows measure the drive's state, not the engine.** On x86_64 `md` and `md4` are the same
-configuration, yet within one run they differed by up to 12.6× (mixed 43.7 s vs 3.5 s;
-sequential commit 33 vs 171 ms). By estimate, each column writes 1–3 GB (two bulk loads, the
-mixed commits and three fresh 1M-entry files), so a later column meets a busier drive. The
-fastest runs are level:
-sequential commit 32.7 ms (`t4d`) vs 33.0 ms (`md`), random commit 51.9 vs 50.2 ms.
-
-**The small-commit A/B rows do not drift with the drive,** because the two modes alternate on one
-table. They are why step 4 changed (see [Step 4](#step-4-one-msync-or-one-fdatasync)). Under the
-one-range rule, about 3 in 4 small commits have two or more ranges and take the `fdatasync` path,
-so the next Linux run should show a small-commit median near the "fdatasync" rows. That is not
-yet measured.
-
-#### Where tndb-b wins and loses
-
-From the macOS and Linux tables above, so for the code before M2.
-
-**On Apple Silicon, where tndb-b loses, and why** (the macOS table):
-
-- **The commit of a bulk load costs more:** 91 ms against MDBX's 61–66 ms after the random
-  insert, and 35–37 ms against 30–32 ms after the sequential one. A tndb-b commit stamps a CRC on
-  every page it wrote, msyncs the dirty pages (one range for a bulk load), and fsyncs the file's
-  growth; in a profile of the sequential commit, msync took about 77%, CRCs 15% and the growth
-  fsync 8%.
-- **Random inserts at 4K:** the put loop takes 801 ms against `md4`'s 683 ms (+17%). Random keys
-  rarely land in the cached leaf, so each put descends. MDBX's put loop gets faster at 4K than at
-  16K while tndb-b's gets slower, which points at tndb-b's per-page costs: each level of the
-  descent, and each split (about four times as frequent per entry at 4K). At 16K the put loop is
-  level with MDBX (741 vs 754 ms).
-- **A plain cursor put at 4K** takes 58.5 ms against `md4`'s 51.2 ms (+14%); at 16K it is level
-  (52.3 vs 50.1 ms).
-- **Point reads at 4K** are about 5% slower than `md4` (717 vs 681 ns hit, 752 vs 712 ns miss),
-  which is at the noise level. A fetch from the published file keeps its range, trailer, page
-  number and txn checks, and a miss checks the leaf against its separators. At 16K reads are level
-  with MDBX.
-
-**On Apple Silicon, where tndb-b wins:**
-
-- **Sequential loads:** the put loop is 2.3× faster than MDBX's at 16K (47 vs 111 ms) and 1.9×
-  at 4K (60 vs 115 ms), because almost every put lands in the cached leaf. A plain put even beats
-  MDBX's `APPEND` put (65–69 ms). `RwTxn::append` takes 48–54 ms, and `RwCursor::append` is a
-  little faster than MDBX's cursor `APPEND` (51.5 vs 57.9 ms at 16K, 57.8 vs 61.6 ms at 4K).
-- **Small durable commits are about 10× cheaper** in the table (130 us vs 1.3 ms median at 16K,
-  114 us vs 1.3 ms at 4K), and more since step 4 became one sync (90 and 73 us; see
-  [Step 4](#step-4-one-msync-or-one-fdatasync)). tndb-b syncs only the pages the commit dirtied,
-  by one `msync` or one `fdatasync`, plus one meta page. MDBX msyncs the whole used span of the
-  map on every commit (about 312 MB here), and on macOS that walk is the cost.
-- **Scans** are 10–17% faster than MDBX's at 16K (27.1 vs 30.2 ms forward, 24.9 vs 30.0 ms
-  reverse). At 4K the forward scan beats `md4` (46.6 vs 55.8 ms), and the reverse one is level.
-- **`clear_table`** frees a 1M-entry tree 2–4× faster (569 us vs 2.2 ms at 16K).
-- **The durable mixed workload** matches MDBX or beats it (2.63 vs 3.27 s at 16K, 3.34 vs 4.26 s
-  at 4K). MDBX's own cell moved most between runs here (2.72–3.33 s at 16K), so read this row as
-  parity.
-- **File sizes match:** the used pages within 2%, the file lengths within 3%.
-
-**On Linux x86_64** (the Linux tables; "MDBX" is the median of the six `md` and `md4` runs, the
-same configuration there):
-
-- **At 4K, tndb-b wins** the sequential put loop by 2.2× (53.5 vs 115.7 ms), the random put loop
-  by 6% (512.9 vs 545.5 ms), `RwTxn::append` by 7% (52.2 vs 56.2 ms), and gets by 16–19% (497 vs
-  589 ns hit, 505 vs 622 ns miss). Small durable commits took 0.90–0.92 ms with per-range
-  msyncs, against 3.4–3.5 ms in 5 of the 6 MDBX runs; the sixth, an `md` run, took 0.54 ms.
-- **At 4K, level:** the forward scan against MDBX's fast runs (31.8–31.9 ms both; its slow runs
-  took about 42.7 ms), and the bulk commits at the fastest runs (above).
-- **At 4K, tndb-b loses** on a plain cursor put (+15%: 55.4 vs 48.2 ms), the reverse scan (+8%:
-  32.6 vs 30.3 ms) and the cursor `APPEND` (+3%: 54.4 vs 52.6 ms). A seek is about level (1.0–1.1
-  vs 1.0 us, at the table's 0.1 us resolution).
-- **At 16K, tndb-b beats MDBX on every CPU row but two:** the random put loop (557.8 vs 545.5 ms,
-  +2%) and the plain cursor put, which is level (48.6 vs 48.2 ms).
-- **4K against 16K:** 16K wins the scans by 35%, a seek by about 20% and the sequential puts by
-  11–14%. 4K wins gets by 9–11% and random puts by 8%.
-- **The Mac's 4K losses do not occur here.** The random put loop (+17% on the Mac) and point
-  reads (+5%) both beat MDBX at 4K, and tndb-b's random put loop is faster at 4K than at 16K, so
-  the per-page explanation above is an Apple Silicon finding.
-
-#### NoSync against SafeNoSync
-
-**On macOS**, MDBX under `SafeNoSync` still issues an `MS_ASYNC` msync of the whole span every
-commit (`MDBX_MMAP_NEEDS_JOLT` is set off Linux). That makes its small commits slower than its
-own Durable mode (2.3 vs 1.3 ms median), and it is most of why tndb-b's NoSync mixed workload is
-about 6× faster (256.5 ms vs 1.62 s).
-
-**On Linux**, `mn` took a median of 0.58–3.5 ms per small commit (`t4n` 3.8 us) and 4.3–5.4 s on
-the mixed row (`t4n` 0.25 s). The cause was not investigated.
-
-On both platforms, a tndb-b NoSync commit does no I/O, and its deferred `Env::sync` is not timed.
+Comparison benchmarks live in the reth adapter crate:
+[`tndb-b-reth/engine-bench.md`](../tndb-b-reth/engine-bench.md) runs this engine through its own
+API, and the adapter's [README](../tndb-b-reth/README.md) runs reth's database benches.
 
 #### Step 4: one msync or one fdatasync
 
@@ -1484,118 +1269,17 @@ behind the rule:
   (16.5 vs 3.7 ms at 4K). Syncing the runs one by one, or a smaller merge gap, cost the same as
   the merged span. So past 16 runs even one range takes the `fdatasync`.
 
-The Linux numbers are the A/B rows of the Linux run above; the macOS ones come from the Mac of the
-macOS run, 2026-10-20, in targeted runs on the same code.
+The Linux numbers are the A/B rows of three runs on a Linux x86_64 laptop (i7-1360P, NVMe, ext4),
+2026-10-20; the macOS ones come from an Apple M1 Max (internal SSD, APFS), 2026-10-20, in targeted
+runs on the same code. They were taken when these rows ran in the comparison bench, whose runs are
+in [`engine-bench.md`](../tndb-b-reth/engine-bench.md).
 
 **After the change**, on the Mac (medians of three targeted runs, 2026-10-20, before M2), the
 small-commit median is 73.2 us at 4K and 90.2 us at 16K (it was 114 and 130 us; the "fdatasync"
 rows read 72 and 81 us in the same runs), and the bulk commits, the mixed row and `clear_table`
 are level (sequential commit 34.5 vs 34.9 ms, random 85.5 vs 87.9 ms at 4K). On Linux the small
-commits are not yet measured under the new rule (see the Linux run).
+commits are not yet measured under the new rule (see
+[`engine-bench.md`](../tndb-b-reth/engine-bench.md#linux-run)).
 
 **Open:** at 16K on the Mac, a one-range small commit synced by `msync` is still slower than by
 `fdatasync` (median 89–90 vs 81–82 us, p99 158–165 vs 96–97 us). At 4K the two match.
-
-#### Large values (overflow runs)
-
-The `big` rows (`TNDB_B_BENCH_ROWS=big`) put values of 2, 8 and 32 KiB: 20k, 10k and 4k entries
-under 8-byte keys in a scrambled order, in one transaction. They time the put loop (per put),
-its commit, and then a get of every key in another scrambled order (per get). At 4 KiB pages
-the values take runs of 1, 3 and 9 pages; at 16 KiB the 2 KiB value is inline and the others take
-runs of 1 and 3 pages. Each value size runs in its own fresh environment, so no row writes into
-file space another row grew and synced (see the macOS note in
-[Platform notes](#platform-notes)). `TNDB_B_BENCH_N` does not scale these rows.
-
-**Run:** the Mac above, 2026-10-20, medians of three runs; code: M2 with overflow runs and the
-one-sync step 4, before run allocation loaded records for a fit, merging and the later M2
-changes. Not rerun since.
-
-| | `t4d` | `t16d` | `md` | `md4` |
-|---|--:|--:|--:|--:|
-| put 2 KiB (per op) | 918 ns | 1.60 us | 1.30 us | 671 ns |
-| commit | 29.9 ms | 19.0 ms | 16.6 ms | 22.9 ms |
-| get 2 KiB (per op) | 302 ns ¹ | 419 ns | 361 ns | 293 ns |
-| put 8 KiB (per op) | 2.00 us | 2.30 us | 2.00 us | 1.70 us |
-| commit | 36.5 ms | 61.3 ms | 38.0 ms | 32.4 ms |
-| get 8 KiB (per op) | 1.10 us | 271 ns ¹ | 286 ns | 286 ns |
-| put 32 KiB (per op) | 4.30 us | 8.00 us | 4.90 us | 4.20 us |
-| commit | 57.9 ms | 65.0 ms | 46.3 ms | 36.5 ms |
-| get 32 KiB (per op) | 2.20 us | 2.60 us | 282 ns | 274 ns |
-
-¹ A 1-page run, read with its header checks only (do-not-flag item 13). These two cells come from
-a later set of three interleaved runs, after that change; before it the same gets took 724 ns and
-1.30 us, and the multi-page gets did not move.
-
-- **Puts** of 2 and 8 KiB at 4 KiB pages are level with MDBX or within about 0.3 us of `md4`, and
-  32 KiB puts are level with `md4` (4.3 vs 4.2 us). The `t16d` 32 KiB put varied most (5.4–8.0 us
-  across the three runs).
-- **Gets** of a multi-page run cost the CRC pass over the value (item 13): 1.1 and 2.2 us at 4 KiB
-  pages against MDBX's 0.3 us, which hands back a pointer. A 1-page run reads like an inline
-  value.
-- **Commits** stamp one CRC per run and sync every run page, so they grow with the bytes written,
-  as MDBX's do, but faster: at 32 KiB, 57.9 ms for `t4d` against 36.5 ms for `md4`. The cause is
-  not investigated.
-
-#### Deletes
-
-The `delete` rows (`TNDB_B_BENCH_ROWS=delete`) time deletes, which merge pages in tndb-b (see
-[Deletes and merging](#deletes-and-merging)) and rebalance them in MDBX. Each runs in a fresh environment, so it
-changes no table another row reads:
-
-- **delete 90% + commit:** a random table of N entries is filled (untimed), then 90% of its keys
-  are deleted in a random order in one transaction, timed as a whole and split into the delete
-  loop and the commit, as a bulk insert is.
-- **scan after:** a forward scan of the tenth left, which shows how well the deletes left the
-  pages filled.
-- **mixed 50/50:** operations over a random table of N entries in transactions of a fixed size:
-  half delete a random present key, and half put, re-inserting the key deleted longest ago. The
-  table stays within a few hundred entries of N, so the row measures deletes and inserts at a
-  steady size.
-- **churn file size (merge on/off):** ten rounds over a table of N/4 random keys, each a fill and a
-  delete of 90% of the keys at random, timed as a whole; then the file's used span (pages times
-  the page size) and its size. tndb-b runs the churn twice, with merging and without (the "churn
-  (no merge)" rows, through the test-only `Writer::no_merge`), to show what merging saves.
-
-**Run:** Apple M1 Max, macOS, 2026-10-21, N = 300k, medians of three runs; code: M2 with merging
-and the one-descent delete, before the owned and detached cursors, the MDBX-aligned state after a
-delete and the adapter. Not rerun since. The "merging off" column reruns tndb-b's rows with
-merging turned off; MDBX's two columns are `md` (16 KiB pages here) and `md4`.
-
-| | `t4d` | `t16d` | `t4d`, merging off | `md` | `md4` |
-|---|--:|--:|--:|--:|--:|
-| delete 90% + commit | 232.0 ms | 268.8 ms | 235.7 ms | 220.3 ms | 213.9 ms |
-| delete loop | 207.2 ms | 245.7 ms | 210.6 ms | 204.6 ms | 197.4 ms |
-| commit | 24.5 ms | 22.8 ms | 25.9 ms | 16.3 ms | 16.9 ms |
-| scan of the tenth left | 2.5 ms | 1.0 ms | 7.6 ms | 0.9 ms | 1.8 ms |
-| mixed 50/50, 100k ops | 923.3 ms | 1009.5 ms | 940.8 ms | 1291.6 ms | 1603.9 ms |
-| churn, 10 rounds of 75k | 729.2 ms | 761.4 ms | 742.5 ms | 811.4 ms | 743.2 ms |
-| churn: table pages × P | 2.3 MiB | 2.4 MiB | 13.1 MiB | 3.4 MiB | 3.3 MiB |
-| churn: file used | 45.6 MiB | 44.9 MiB | 45.7 MiB | 30.2 MiB | 31.1 MiB |
-
-A single run at N = 1M agrees: the delete loop takes 892 ms (`t4d`) and 1046 ms (`t16d`) against
-MDBX's 908 ms (`md`) and 1021 ms (`md4`), and after the churn tndb-b's table holds 7.8 MiB
-(43.8 MiB without merging) against MDBX's 11.2 MiB, in a used span of 152 MiB against
-101–104 MiB.
-
-What the rows show:
-- **Merging works.** After the churn the table takes 5–6 times fewer pages than without merging
-  (2.3 against 13.1 MiB at 4K), and is smaller than MDBX's. After deleting 90% of a table, the scan
-  of what is left is three times faster at 4K.
-- **Merging costs almost nothing.** Delete, mixed and churn times are within a few percent of
-  merging off. The other rows (puts, small commits, mixed updates, `clear_table`) are unchanged.
-- **Random deletes are level with MDBX's.** At 300k the 4K delete loop is within 5% of `md4`
-  (207 vs 197 ms, the noise level here), and at 1M it is level or faster (892 vs 908–1021 ms).
-  They were 44% slower while `write::delete` descended twice, once to look the key up, so a miss
-  changed nothing, and again to plan the change (304 vs 200 ms in the same session). Now one
-  descent does both: it defers the verification of the published pages it passes to a hit
-  (`Verify::Later`, `verify_path`), so a miss still changes and verifies nothing. That cut the
-  delete loop by 32% at 4K and 30% at 16K, and the churn by 21–25%. What is left of the delete
-  loop is that one descent and the leaf search (about 60% of it in a profile), the cell's removal
-  (12%), and the copies of the path (6% zero-filling the page `alloc` returns, then the copy).
-- **The mixed 50/50 workload is faster than MDBX's** at both page sizes.
-- **After the churn, the file's used span is about 1.5× MDBX's,** even though tndb-b's tree is
-  smaller. Each round is a fill transaction followed by a delete transaction, and a page freed by
-  one transaction is reused only from the second transaction after it, once no meta slot names a
-  state that reaches it (the reuse gate). So each fill grows the file instead of reusing the pages
-  the delete just freed. The gate is deliberate: it keeps the previous state recoverable if the
-  newest meta is lost.
