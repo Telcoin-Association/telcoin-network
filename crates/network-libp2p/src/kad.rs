@@ -2576,7 +2576,7 @@ mod test {
         let seed_1 = KadStore::new(db.clone(), local_peer_id, &key_config, NetworkType::Worker(1));
         let key = fresh_record_key();
         let remote = live_provider_under(&key, PeerId::random());
-        seed_worker_provider_row(&seed_0, &key, &[remote.clone()]);
+        seed_worker_provider_row(&seed_0, &key, std::slice::from_ref(&remote));
         seed_worker_provider_row(&seed_1, &key, &[remote]);
 
         let mut worker_0 =
