@@ -615,4 +615,62 @@ mod tests {
             "total timeout should fire at ~{BATCH_STREAM_TOTAL_TIMEOUT:?}, fired at {elapsed:?}"
         );
     }
+
+    /// A peer that negotiates the sync protocol but never reads cannot hold the
+    /// request write open: `SYNC_REQUEST_WRITE_TIMEOUT` bounds the write and the
+    /// flush, and the stall maps to `SyncAttempt::Failed` so the caller tries the
+    /// next peer. Regression test for issue #1717.
+    #[tokio::test(start_paused = true)]
+    async fn write_sync_request_is_bounded_by_write_timeout() {
+        use crate::network::handle::{SyncAttempt, SYNC_REQUEST_WRITE_TIMEOUT};
+        use futures::AsyncWrite;
+        use std::{
+            io,
+            pin::Pin,
+            task::{Context, Poll},
+            time::Duration,
+        };
+
+        /// A stream whose peer never grants credit: every write, flush and close
+        /// stays pending.
+        struct StalledWriter;
+
+        impl AsyncWrite for StalledWriter {
+            fn poll_write(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+                _buf: &[u8],
+            ) -> Poll<io::Result<usize>> {
+                Poll::Pending
+            }
+
+            fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+                Poll::Pending
+            }
+
+            fn poll_close(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+                Poll::Pending
+            }
+        }
+
+        let digests: BTreeSet<B256> = create_test_batches(4).iter().map(|b| b.digest()).collect();
+        let task_manager = TaskManager::default();
+        let handle = WorkerNetworkHandle::new_for_test(task_manager.get_spawner());
+
+        let start = tokio::time::Instant::now();
+        let outcome = handle.write_sync_request(&mut StalledWriter, &digests).await;
+        let elapsed = start.elapsed();
+
+        // the write is cut off and classified as a transient exchange failure
+        assert!(
+            matches!(outcome, Err(SyncAttempt::Failed(_))),
+            "expected a write timeout, got {outcome:?}"
+        );
+        // and it is the write bound (~5s) that fired
+        assert!(
+            elapsed >= SYNC_REQUEST_WRITE_TIMEOUT
+                && elapsed < SYNC_REQUEST_WRITE_TIMEOUT + Duration::from_secs(1),
+            "write timeout should fire at ~{SYNC_REQUEST_WRITE_TIMEOUT:?}, fired at {elapsed:?}"
+        );
+    }
 }

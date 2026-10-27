@@ -54,9 +54,11 @@ impl<DB: Database> PrimaryToWorkerClient for PrimaryReceiverHandler<DB> {
 
         // `request_batches` removes each successfully fetched digest from `missing` as it goes,
         // so snapshot the originally requested set before the call. Afterwards `missing` holds
-        // only the digests that could not be fetched.
+        // only the digests that could not be fetched. The header author is tried first, because it
+        // is the peer most likely to hold the batches, and the call is bounded by a total timeout,
+        // so a set of stalling peers cannot hold this vote-path request open.
         let requested = missing.clone();
-        let response = network.request_batches(&mut missing).await?;
+        let response = network.request_batches(&mut missing, Some(&message.target)).await?;
 
         self.store_synced_batches(response, &requested, &missing, message.is_certified)
     }

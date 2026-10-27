@@ -1083,6 +1083,11 @@ impl PeerManager {
         self.peers.connected_or_dialing_peers()
     }
 
+    /// Return `true` if `bls_key` belongs to a member of the current committee.
+    pub(crate) fn is_current_committee_member(&self, bls_key: &BlsPublicKey) -> bool {
+        self.peers.current_committee().contains(bls_key)
+    }
+
     /// Record an inbound `AddProvider` from `provider` and report whether it
     /// exceeds the per-provider window budget.
     ///

@@ -199,7 +199,7 @@ where
                     // normal worker path, while a CVV catching up to rejoin gets the most out of
                     // the prefetch — the cache survives the mode-change re-entry that promotes it.
                     let mut missing = BTreeSet::from([batch_hash]);
-                    match self.network_handle.request_batches(&mut missing).await {
+                    match self.network_handle.request_batches(&mut missing, None).await {
                         Ok(batches) => {
                             if let Some((digest, batch)) = batches.first() {
                                 self.validate_and_cache_prefetched_batch(digest, batch)?;
