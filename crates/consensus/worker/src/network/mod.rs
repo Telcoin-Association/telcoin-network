@@ -223,6 +223,43 @@ fn shed_sync_stream<S>(
     )
 }
 
+/// Whether the node serves a sync batch request for `req_epoch`.
+///
+/// An honest requester names its own current epoch. The node serves its own
+/// epoch and the previous one, for a requester still finishing the prior epoch
+/// at the boundary. Any other epoch is denied before the `Ack`, so a peer cannot
+/// make the node open older retained epoch packs or churn the pack cache
+/// (#1718). At epoch 0 only epoch 0 is served.
+fn serves_sync_epoch(node_epoch: Epoch, req_epoch: Epoch) -> bool {
+    req_epoch == node_epoch || req_epoch == node_epoch.saturating_sub(1)
+}
+
+/// Deny an admitted sync request for an epoch the node does not serve.
+///
+/// Writes [`DenyReason::Unavailable`] and closes, with no `Ack` and no storage
+/// read, so the requester tries another peer. The caller only logs the request;
+/// there is no penalty. The write and close are bounded by
+/// [`SYNC_REQUEST_READ_TIMEOUT`], so a requester that stops reading cannot pin
+/// the admission permit the caller holds.
+async fn deny_unserved_sync_epoch<S>(stream: &mut S, max_frame: usize)
+where
+    S: AsyncWrite + Unpin + Send,
+{
+    let (mut encode_buffer, mut compressed_buffer) = (Vec::new(), Vec::new());
+    let _ = tokio::time::timeout(SYNC_REQUEST_READ_TIMEOUT, async {
+        let _ = write_frame(
+            &mut *stream,
+            &SyncFrame::<WorkerSyncRequest>::Deny(DenyReason::Unavailable),
+            &mut encode_buffer,
+            &mut compressed_buffer,
+            max_frame,
+        )
+        .await;
+        let _ = stream.close().await;
+    })
+    .await;
+}
+
 /// Handle inter-node communication between primaries.
 #[derive(Debug)]
 pub struct WorkerNetwork<DB, Events> {
@@ -431,9 +468,13 @@ where
     /// requester gives up immediately and tries elsewhere; that shed write runs
     /// on its own task gated by the [`MAX_CONCURRENT_SHED_TASKS`] budget (see
     /// [`Self::shed_inbound_sync_stream`]). Once admitted, the opening request
-    /// frame is read (bounded by [`SYNC_REQUEST_READ_TIMEOUT`]) and the batches
-    /// are served by [`RequestHandler::process_sync_batches_stream`]. The
-    /// admission permit is held for the lifetime of the spawned task.
+    /// frame is read (bounded by [`SYNC_REQUEST_READ_TIMEOUT`]). A request for an
+    /// epoch outside the node's serve window (see [`serves_sync_epoch`]) is denied
+    /// with [`DenyReason::Unavailable`] before the `Ack` and any storage read
+    /// (#1718). Otherwise the batches are served by
+    /// [`RequestHandler::process_sync_batches_stream`], with the frame limit taken
+    /// from the node's own epoch. The admission permit is held for the lifetime of
+    /// the spawned task.
     fn process_inbound_sync_stream(&self, peer: BlsPublicKey, stream: Stream) {
         // admit against the caps before spawning; the permit moves into the task
         // and frees capacity on drop. A denied stream takes the bounded shed
@@ -483,29 +524,46 @@ where
 
             match request {
                 SyncFrame::Req(WorkerSyncRequest::Batches { batch_digests, epoch: req_epoch }) => {
-                    // cap to the node's max
-                    let batch_digests: BTreeSet<B256> =
-                        if batch_digests.len() > MAX_BATCH_DIGESTS_PER_REQUEST {
-                            warn!(
-                                target: "worker::network",
-                                %peer,
-                                requested = batch_digests.len(),
-                                max = MAX_BATCH_DIGESTS_PER_REQUEST,
-                                "truncating oversized sync batch request"
-                            );
-                            batch_digests.into_iter().take(MAX_BATCH_DIGESTS_PER_REQUEST).collect()
-                        } else {
-                            batch_digests
-                        };
-                    request_handler
-                        .process_sync_batches_stream(
-                            peer,
-                            stream,
-                            batch_digests,
+                    // serve only the node's epoch window: deny anything else before
+                    // the Ack and any storage read (#1718). Log only, no penalty.
+                    if serves_sync_epoch(epoch, req_epoch) {
+                        // cap to the node's max
+                        let batch_digests: BTreeSet<B256> =
+                            if batch_digests.len() > MAX_BATCH_DIGESTS_PER_REQUEST {
+                                warn!(
+                                    target: "worker::network",
+                                    %peer,
+                                    requested = batch_digests.len(),
+                                    max = MAX_BATCH_DIGESTS_PER_REQUEST,
+                                    "truncating oversized sync batch request"
+                                );
+                                batch_digests
+                                    .into_iter()
+                                    .take(MAX_BATCH_DIGESTS_PER_REQUEST)
+                                    .collect()
+                            } else {
+                                batch_digests
+                            };
+                        request_handler
+                            .process_sync_batches_stream(
+                                peer,
+                                stream,
+                                batch_digests,
+                                req_epoch,
+                                max_frame,
+                                &consensus_chain,
+                            )
+                            .await?;
+                    } else {
+                        debug!(
+                            target: "worker::network",
+                            %peer,
                             req_epoch,
-                            &consensus_chain,
-                        )
-                        .await?;
+                            epoch,
+                            "denying sync batch request for an unserved epoch"
+                        );
+                        deny_unserved_sync_epoch(&mut stream, max_frame).await;
+                    }
                 }
                 // a well-behaved requester always opens with `Req`; anything else
                 // is malformed. Signal it and drop (metrics-only, no penalty).
@@ -785,5 +843,83 @@ mod tests {
             matches!(frame, SyncFrame::Deny(DenyReason::AtCapacity)),
             "shed task writes Deny(AtCapacity), got {frame:?}"
         );
+    }
+
+    // The serve window is the node's epoch and the one before it; every other
+    // request epoch is denied, and epoch 0 serves only epoch 0 (#1718).
+    #[test]
+    fn serves_sync_epoch_window() {
+        let cases = [
+            (5, 5, true),
+            (5, 4, true),
+            (5, 3, false),
+            (5, 6, false),
+            (5, 0, false),
+            (0, 0, true),
+            (0, 1, false),
+            (0, u32::MAX, false),
+        ];
+        cases.iter().for_each(|&(node_epoch, req_epoch, expected)| {
+            assert_eq!(
+                serves_sync_epoch(node_epoch, req_epoch),
+                expected,
+                "node epoch {node_epoch}, request epoch {req_epoch}"
+            );
+        });
+    }
+
+    // A denied unserved epoch gets exactly one Deny(Unavailable) frame: no Ack,
+    // no Data, so the responder never touches storage for it (#1718).
+    #[tokio::test]
+    async fn deny_unserved_sync_epoch_writes_only_deny_unavailable() {
+        let mut writer = CapturingWriter::default();
+        let max_frame = max_sync_frame_size(0);
+        deny_unserved_sync_epoch(&mut writer, max_frame).await;
+
+        let written = writer.bytes.lock().clone();
+        let mut reader = written.as_slice();
+        let frame = read_frame::<_, WorkerSyncRequest>(
+            &mut reader,
+            &mut Vec::new(),
+            &mut Vec::new(),
+            max_frame,
+        )
+        .await
+        .expect("captured bytes decode to a sync frame");
+        assert!(
+            matches!(frame, SyncFrame::Deny(DenyReason::Unavailable)),
+            "unserved epoch writes Deny(Unavailable), got {frame:?}"
+        );
+        assert!(reader.is_empty(), "nothing follows the deny frame");
+    }
+
+    // A requester that stops reading cannot pin the admission permit through the
+    // unserved-epoch deny: the SYNC_REQUEST_READ_TIMEOUT bound ends the write and
+    // the permit returns (#1718).
+    #[tokio::test(start_paused = true)]
+    async fn deny_unserved_sync_epoch_is_bounded_and_frees_permit() {
+        let p = peer();
+        let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_BATCH_STREAMS));
+        let sync = Arc::new(Mutex::new(HashMap::new()));
+        let permit = try_admit_sync(&semaphore, &sync, p).expect("admit below the caps");
+
+        // hold the permit on a task blocked on the pending deny write
+        let task = tokio::spawn(async move {
+            let _permit = permit;
+            let mut stream = PendingWriter;
+            deny_unserved_sync_epoch(&mut stream, max_sync_frame_size(0)).await;
+        });
+        tokio::task::yield_now().await;
+        assert_eq!(
+            semaphore.available_permits(),
+            MAX_CONCURRENT_BATCH_STREAMS - 1,
+            "the blocked deny task holds its permit"
+        );
+
+        // the bounded write trips SYNC_REQUEST_READ_TIMEOUT and the permit returns
+        tokio::time::advance(SYNC_REQUEST_READ_TIMEOUT + Duration::from_secs(1)).await;
+        task.await.expect("deny task completes");
+        assert_eq!(semaphore.available_permits(), MAX_CONCURRENT_BATCH_STREAMS);
+        assert!(sync.lock().get(&p).is_none());
     }
 }
