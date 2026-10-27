@@ -12,6 +12,10 @@ use std::{
     sync::Mutex,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
+use timing::{
+    SHORT_RUN_BEFORE_CLOSE_SECS, SHORT_RUN_DOWNTIME_SECS, SHORT_RUN_EPOCH_SECS,
+    SHORT_RUN_RECOVERY_SECS,
+};
 use tn_test_utils::wait_until;
 use tn_types::{
     get_available_tcp_port, Address, GenesisAccount, NodeMode, MIN_PROTOCOL_BASE_FEE, U256,
@@ -46,12 +50,23 @@ struct Timing {
 
 impl Timing {
     /// Reject malformed settings and kill offsets outside the configured epoch.
+    ///
+    /// The short-run defaults live in `sigkill/timing.rs`, next to the restart window they satisfy.
     fn from_env() -> eyre::Result<Self> {
         let timing = Self {
-            epoch: Duration::from_secs(setting("TN_SIGKILL_EPOCH_SECS", 30)?),
-            before_close: Duration::from_secs(setting("TN_SIGKILL_BEFORE_CLOSE_SECS", 2)?),
-            downtime: Duration::from_secs(setting("TN_SIGKILL_DOWNTIME_SECS", 45)?),
-            recovery: Duration::from_secs(setting("TN_SIGKILL_RECOVERY_SECS", 180)?),
+            epoch: Duration::from_secs(setting("TN_SIGKILL_EPOCH_SECS", SHORT_RUN_EPOCH_SECS)?),
+            before_close: Duration::from_secs(setting(
+                "TN_SIGKILL_BEFORE_CLOSE_SECS",
+                SHORT_RUN_BEFORE_CLOSE_SECS,
+            )?),
+            downtime: Duration::from_secs(setting(
+                "TN_SIGKILL_DOWNTIME_SECS",
+                SHORT_RUN_DOWNTIME_SECS,
+            )?),
+            recovery: Duration::from_secs(setting(
+                "TN_SIGKILL_RECOVERY_SECS",
+                SHORT_RUN_RECOVERY_SECS,
+            )?),
         };
         eyre::ensure!(timing.epoch.as_secs() >= 5, "epoch must be at least five seconds");
         eyre::ensure!(
@@ -69,6 +84,17 @@ impl Timing {
             required < timing::TEST_TIMEOUT_SECS,
             "SIGKILL settings need {required}s, exceeding the {}s watchdog budget; reduce timing inputs",
             timing::TEST_TIMEOUT_SECS
+        );
+        let two_epochs_after_kill = timing::restarts_land_two_epochs_after_kill(
+            timing.epoch.as_secs(),
+            timing.before_close.as_secs(),
+            timing.downtime.as_secs(),
+        )
+        .ok_or_else(|| eyre::eyre!("SIGKILL restart window overflow"))?;
+        // Advisory only: fleet B restarts in the epoch right after the kill and starts active.
+        tracing::info!(
+            two_epochs_after_kill,
+            "SIGKILL restart window; see sigkill/timing.rs for the invariant"
         );
         Ok(timing)
     }
