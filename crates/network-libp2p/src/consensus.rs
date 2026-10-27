@@ -4,6 +4,7 @@
 
 use crate::{
     codec::{PeerExchangeCodec, TNCodec, TNMessage},
+    diagnostics::{bounded_error, bounded_reply_error as error, bounded_warn},
     error::NetworkError,
     gossip_config::gossipsub_config,
     kad::{node_record_key, KadStore},
@@ -15,6 +16,7 @@ use crate::{
     quic_incoming::QuicIncomingLimits,
     record_exchange::{RecordCodec, RecordExchange, RecordResponse},
     send_or_log_error,
+    serve_permits::ServePermits,
     service_class::{InboundOccupancy, ServiceClass},
     stream::{StreamBehavior, StreamEvent},
     types::{
@@ -58,7 +60,7 @@ use tokio::sync::{
     mpsc::{Receiver, Sender},
     oneshot,
 };
-use tracing::{debug, error, info, instrument, trace, warn};
+use tracing::{debug, info, instrument, trace};
 
 /// An inbound request that the swarm forwarded to the application and has not yet answered.
 #[derive(Debug)]
@@ -105,6 +107,8 @@ enum LoopEvent<E, C> {
     RecordRetry,
     /// Sample transport work that can finish without producing a swarm event.
     MetricsTick,
+    /// Report elapsed diagnostic windows, including suppressed tails with no new input.
+    DiagnosticReport,
     /// The swarm produced an event.
     Swarm(E),
     /// The command channel produced a command.
@@ -559,6 +563,8 @@ where
     record_retry_interval: Duration,
     /// Prometheus metrics for swarm-level events (gossip, requests).
     metrics: SwarmMetrics,
+    /// The application's per-class serve permits, shared with every handle of this swarm.
+    serve_permits: ServePermits,
     /// Rate limit for the warning about inbound connections that a `connection_limits` bound
     /// refuses.
     inbound_denial_warning: InboundDenialWarning,
@@ -735,7 +741,7 @@ where
                 }
                 // How did we get a KAD record with a broken key?
                 Err(error) => {
-                    error!(target: "network-kad", ?error, "Invalid/corrupt KAD DB store!");
+                    bounded_error!(Kademlia, target: "network-kad", ?error, "Invalid/corrupt KAD DB store!");
                     corrupt.push(record.key.clone());
                 }
             }
@@ -744,7 +750,7 @@ where
         // Purge corrupt records before moving the store into the kademlia behaviour
         // so its record accounting stays accurate.
         for key in corrupt {
-            warn!(target: "network-kad", ?key, "removing invalid record from kad store (undecodable or wrong signing domain)");
+            bounded_warn!(Kademlia, target: "network-kad", ?key, "removing invalid record from kad store (undecodable or wrong signing domain)");
             kad_store.remove(&key);
         }
 
@@ -754,7 +760,7 @@ where
         // then repeat that panic on every restart (issue #999).
         let purged_providers = kad_store.scrub_corrupt_providers();
         if purged_providers > 0 {
-            warn!(
+            bounded_warn!(Kademlia,
                 target: "network-kad",
                 purged_providers,
                 "purged undecodable provider records from kad store at startup"
@@ -889,6 +895,7 @@ where
             ),
             record_retry_interval,
             metrics: SwarmMetrics::new_for(&network_type).with_capacity(&quic_config, budget),
+            serve_permits: ServePermits::new(&network_type, network_config.serve_budget()),
             inbound_denial_warning: InboundDenialWarning::default(),
             listener_error_log: ListenerErrorLog::default(),
             quic_incoming,
@@ -896,8 +903,11 @@ where
     }
 
     /// Return a [NetworkHandle] to send commands to this network.
+    ///
+    /// The handle shares this swarm's serve permits, so every request handler offers inbound
+    /// requests to the same per-class budget.
     pub fn network_handle(&self) -> NetworkHandle<Req, Res> {
-        NetworkHandle::new(self.handle.clone())
+        NetworkHandle::new(self.handle.clone()).with_serve_permits(self.serve_permits.clone())
     }
 
     /// Attach the process-wide source budget before starting the swarm.
@@ -995,7 +1005,7 @@ where
 
         // The shared decoder validates nonempty, bounded IP/QUIC endpoints before BLS verification.
         if node_record.info.multiaddrs.len() > MAX_ADVERTISED_MULTIADDRS {
-            warn!(
+            bounded_warn!(Record,
                 target: "network-kad",
                 count = node_record.info.multiaddrs.len(),
                 max = MAX_ADVERTISED_MULTIADDRS,
@@ -1008,7 +1018,7 @@ where
         // this prevents replay attacks where malicious nodes republish outdated records
         let expected_peer_id: PeerId = node_record.info.pubkey.clone().into();
         if record.publisher != Some(expected_peer_id) {
-            warn!(
+            bounded_warn!(Record,
                 target: "network-kad",
                 "NodeRecord validation failed: publisher {:?} doesn't match network key (expected {:?})",
                 record.publisher, expected_peer_id
@@ -1027,15 +1037,17 @@ where
         let key = record.key.clone();
         if let Err(err) = self.swarm.behaviour_mut().kademlia.put_record(record, kad::Quorum::One) {
             match &err {
-                kad::store::Error::ValueTooLarge => error!(
+                kad::store::Error::ValueTooLarge => bounded_error!(Kademlia,
                     target: "network-kad",
                     "node record exceeds kad value-size limit; RPC endpoint NOT advertised to peers ({err})"
                 ),
-                _ => error!(target: "network-kad", "Failed to store record locally: {err}"),
+                _ => {
+                    bounded_error!(Kademlia, target: "network-kad", "Failed to store record locally: {err}")
+                }
             }
         }
         if let Err(err) = self.swarm.behaviour_mut().kademlia.start_providing(key) {
-            error!(target: "network-kad", "Failed to start providing key: {err}");
+            bounded_error!(Kademlia, target: "network-kad", "Failed to start providing key: {err}");
         }
     }
 
@@ -1071,6 +1083,10 @@ where
         // add peer record if address confirmed
         self.swarm.behaviour_mut().kademlia.set_mode(Some(Mode::Server));
         self.provide_our_data();
+        self.swarm
+            .behaviour()
+            .peer_manager
+            .observe_committee_resolution(self.key_config.primary_public_key());
 
         // Startup already published our record. Refresh only after the first full interval,
         // and skip missed ticks to avoid a burst of signing and publication after a stall.
@@ -1083,20 +1099,24 @@ where
         record_retry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut metrics_tick = tokio::time::interval(Duration::from_secs(1));
         metrics_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut diagnostic_reports = tokio::time::interval(crate::diagnostics::INTERVAL);
+        diagnostic_reports.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         loop {
             let event = tokio::select! {
                 event = next_loop_event(&mut record_refresh, &mut self.swarm, &mut self.commands) => event,
                 _ = record_retry.tick() => LoopEvent::RecordRetry,
                 _ = metrics_tick.tick() => LoopEvent::MetricsTick,
+                _ = diagnostic_reports.tick() => LoopEvent::DiagnosticReport,
             };
             match event {
                 LoopEvent::Refresh => self.refresh_own_record(),
                 LoopEvent::RecordRetry => self.retry_record_requests(),
                 LoopEvent::MetricsTick => {}
+                LoopEvent::DiagnosticReport => crate::diagnostics::flush(),
                 LoopEvent::Swarm(event) => {
                     if let Err(e) = self.process_event(event).await {
-                        error!(target: "network", ?e, "network event error");
+                        bounded_error!(Swarm, target: "network", ?e, "network event error");
                         if let NetworkError::AllListenersClosed = e {
                             // In this case go ahead and kill the node.
                             return Err(e);
@@ -1105,7 +1125,7 @@ where
                 }
                 LoopEvent::Command(c) => {
                     if let Err(e) = self.process_command(c) {
-                        error!(target: "network", ?e, "network command error")
+                        bounded_error!(Command, target: "network", ?e, "network command error")
                     }
                 }
                 LoopEvent::CommandsClosed => {
@@ -1122,6 +1142,10 @@ where
             let (pending, deferred) = self.record_exchange.counts();
             self.metrics.set_record_exchange_pending(pending, deferred);
             self.metrics.record_quic_incoming(&self.quic_incoming);
+            self.swarm
+                .behaviour()
+                .peer_manager
+                .observe_committee_resolution(self.key_config.primary_public_key());
             self.metrics.set_pending_incoming_connections(
                 self.swarm.network_info().connection_counters().num_pending_incoming(),
             );
@@ -1173,7 +1197,7 @@ where
                 // emit warning if peers report different external address
                 let expected = &self.node_record.info().multiaddrs;
                 if !expected.contains(&address) {
-                    warn!(target: "network", ?expected, reported=?address, "peer reporting different external addr:")
+                    bounded_warn!(Swarm, target: "network", ?expected, reported=?address, "peer reporting different external addr:")
                 }
             }
             SwarmEvent::ExpiredListenAddr { address, .. } => {
@@ -1189,7 +1213,7 @@ where
                 let reason = self.metrics.record_listener_error(&error);
                 self.listener_error_log.record(tokio::time::Instant::now()).into_iter().for_each(
                     |suppressed| {
-                        error!(
+                        tracing::error!(
                             target: "network",
                             ?listener_id,
                             ?error,
@@ -1205,12 +1229,12 @@ where
                 // count every close by outcome, then log errors
                 self.metrics.record_listener_closed(&reason);
                 if let Err(e) = reason {
-                    error!(target: "network", ?e, "listener unexpectedly closed");
+                    tracing::error!(target: "network", ?e, "listener unexpectedly closed");
                 }
 
                 // critical failure
                 if self.swarm.listeners().count() == 0 {
-                    error!(target: "network", ?addresses, "no listeners for swarm - network shutting down");
+                    tracing::error!(target: "network", ?addresses, "no listeners for swarm - network shutting down");
                     return Err(NetworkError::AllListenersClosed);
                 }
             }
@@ -1228,7 +1252,7 @@ where
                         .record(tokio::time::Instant::now())
                         .into_iter()
                         .for_each(|denied| {
-                            warn!(
+                            tracing::warn!(
                                 target: "network",
                                 denied,
                                 window = ?INBOUND_DENIAL_WARN_INTERVAL,
@@ -1526,7 +1550,7 @@ where
                 if let Some((peer, _)) = self.swarm.behaviour().peer_manager.auth_to_peer(peer) {
                     self.swarm.behaviour_mut().peer_manager.process_penalty(peer, penalty);
                 } else {
-                    warn!(target: "peer-manager", ?peer, "unable to assess penalty for peer");
+                    bounded_warn!(Command, target: "peer-manager", ?peer, "unable to assess penalty for peer");
                 }
             }
             NetworkCommand::DisconnectPeer { peer_id, reply } => {
@@ -1616,6 +1640,11 @@ where
                 let rpcs = self.swarm.behaviour_mut().peer_manager.current_committee_rpcs();
                 send_or_log_error!(reply, rpcs, "GetAllValidatorRpcs");
             }
+            NetworkCommand::GetCommitteeRpcSnapshot { reply } => {
+                let snapshot = self.committee_rpc_snapshot();
+                self.query_missing_required_records();
+                send_or_log_error!(reply, snapshot, "GetCommitteeRpcSnapshot");
+            }
             NetworkCommand::OpenStream { peer, reply } => {
                 // Look up the peer's PeerId from their BLS key
                 let (peer_id, addrs) = match self.swarm.behaviour().peer_manager.auth_to_peer(peer)
@@ -1681,6 +1710,38 @@ where
         }
     }
 
+    /// Read submit advertisements only while their matching signed store record is live.
+    /// The resolution cache deliberately outlives DHT expiry for consensus liveness; that
+    /// cached identity alone cannot prove fresh submit coverage.
+    fn committee_rpc_snapshot(&mut self) -> crate::types::CommitteeRpcSnapshot {
+        let behaviour = self.swarm.behaviour_mut();
+        let snapshot = behaviour.peer_manager.committee_rpc_snapshot();
+        let rpcs: Vec<_> = snapshot
+            .rpcs()
+            .iter()
+            .filter(|(key, rpc)| {
+                behaviour
+                    .kademlia
+                    .store_mut()
+                    .get(&node_record_key(key))
+                    .and_then(|record| NodeRecord::try_decode_compat(&record.value))
+                    .is_some_and(|record| {
+                        record.info.rpc.as_ref() == Some(rpc)
+                            && behaviour
+                                .peer_manager
+                                .record_timestamp(key, record.info.timestamp)
+                                .is_some()
+                    })
+            })
+            .cloned()
+            .collect();
+        crate::types::CommitteeRpcSnapshot::new(
+            snapshot.members().clone(),
+            rpcs,
+            snapshot.advertisements().to_vec(),
+        )
+    }
+
     /// Refill required rows after ownership updates, even if the restored peer cache already
     /// resolves a key. Queries hold no persistent ownership and are deduplicated by requested key.
     fn query_missing_required_records(&mut self) {
@@ -1714,7 +1775,7 @@ where
                     &propagation_source,
                     msg_acceptance.into(),
                 ) {
-                    error!(target: "network", topics=?self.authorized_publishers.keys(), ?propagation_source, ?message_id, "error reporting message validation result");
+                    bounded_error!(Gossip, target: "network", topics=?self.authorized_publishers.keys(), ?propagation_source, ?message_id, "error reporting message validation result");
                 }
 
                 // process gossip in application layer
@@ -1758,7 +1819,7 @@ where
                             .try_send_outcome(accepted_gossip_event(message, relayer, author));
                         self.metrics.record_forward(ServiceClass::Gossip, &forwarded);
                         if forwarded.inspect_err(|e| {
-                            error!(target: "network", topics=?self.authorized_publishers.keys(), ?propagation_source, ?message_id, ?e, "failed to forward gossip!");
+                            bounded_error!(Gossip, target: "network", topics=?self.authorized_publishers.keys(), ?propagation_source, ?message_id, ?e, "failed to forward gossip!");
                         }).is_err() {
                             // ignore failures at the epoch boundary
                             // During epoch change the event_stream reciever can be closed.
@@ -1781,7 +1842,7 @@ where
                         let topic = &message.topic;
                         match reason.penalty(relayer.is_some(), author.is_some()) {
                             RejectPenalty::FatalRelayer => {
-                                warn!(
+                                bounded_warn!(Gossip,
                                     target: "network",
                                     ?topic,
                                     "oversized gossip - applying fatal penalty to propagation source: {propagation_source:?}"
@@ -1794,7 +1855,7 @@ where
                             RejectPenalty::FatalAuthor => {
                                 // `author.is_some()` guarantees `author_id` is `Some`.
                                 if let Some(author_id) = author_id {
-                                    warn!(
+                                    bounded_warn!(Gossip,
                                         target: "network",
                                         ?author_id,
                                         ?topic,
@@ -1883,7 +1944,7 @@ where
                             // Only queued requests become pending. An unsubscribed queue
                             // drops the response channel, and epoch-boundary errors are ignored.
                             if !forwarded.inspect_err(|e| {
-                                error!(target: "network", topics=?self.authorized_publishers.keys(), ?request_id, ?e, "failed to forward request!");
+                                bounded_error!(Request, target: "network", topics=?self.authorized_publishers.keys(), ?request_id, ?e, "failed to forward request!");
                             }).is_ok_and(|outcome| outcome == TrySendOutcome::Queued) {
                                 return Ok(());
                             }
@@ -1898,14 +1959,14 @@ where
                                 PendingInbound { notify, class, received: Instant::now() },
                             ) {
                                 // cancel if this is a duplicate request
-                                warn!(target: "network", ?peer, "duplicate request id from peer");
+                                bounded_warn!(Request, target: "network", ?peer, "duplicate request id from peer");
                                 self.close_inbound(duplicate);
                             }
                         } else if let Err(e) = self.event_stream.try_send(NetworkEvent::Error(
                             format!("requesting peer unknown: {peer:?}"),
                             ResponseChannel::new(peer, channel),
                         )) {
-                            error!(target: "network", topics=?self.authorized_publishers.keys(), ?request_id, ?e, "failed to forward request!");
+                            bounded_error!(Request, target: "network", topics=?self.authorized_publishers.keys(), ?request_id, ?e, "failed to forward request!");
                             // ignore failures at the epoch boundary
                             // During epoch change the event_stream reciever can be closed.
                             return Ok(());
@@ -1962,7 +2023,7 @@ where
                             // transport flap on WAN — no penalty
                         }
                         _ => {
-                            warn!(
+                            bounded_warn!(Request,
                                 target: "network",
                                 ?e, ?peer, ?request_id,
                                 "outbound IO failure (likely codec violation)"
@@ -1987,7 +2048,7 @@ where
                     // the #765 chain-id protocol split into a network partition. Warn for
                     // operator visibility only.
                     ReqResOutboundFailure::UnsupportedProtocols => {
-                        warn!(target: "network", ?peer, ?request_id, "outbound failure: unsupported protocol (not penalized)");
+                        bounded_warn!(Request, target: "network", ?peer, ?request_id, "outbound failure: unsupported protocol (not penalized)");
                     }
                 }
 
@@ -2017,7 +2078,7 @@ where
                             // transport flap on WAN — no penalty
                         }
                         _ => {
-                            warn!(
+                            bounded_warn!(Request,
                                 target: "network",
                                 ?e, ?peer, ?request_id,
                                 "inbound IO failure (likely codec violation)"
@@ -2035,7 +2096,7 @@ where
                     // blocker for the #765 chain-id protocol split. Warn for operator
                     // visibility only.
                     ReqResInboundFailure::UnsupportedProtocols => {
-                        warn!(target: "network", ?peer, ?request_id, ?error, "inbound failure: unsupported protocol (not penalized)");
+                        bounded_warn!(Request, target: "network", ?peer, ?request_id, ?error, "inbound failure: unsupported protocol (not penalized)");
                     }
                     ReqResInboundFailure::Timeout | ReqResInboundFailure::ConnectionClosed => {
                         // peer dropped or stalled mid-request — expected on WAN, no penalty
@@ -2458,7 +2519,7 @@ where
 
                 // Check if there are any connections still in the pool
                 if self.swarm.is_connected(&peer_id) {
-                    warn!(
+                    bounded_warn!(PeerState,
                         target: "network",
                         ?peer_id,
                         "PeerDisconnected event but swarm still has connections - forcing disconnect"
@@ -2553,7 +2614,7 @@ where
                 }
             }
             PeerEvent::Banned(peer_id) => {
-                warn!(target: "network", ?peer_id, "peer banned");
+                bounded_warn!(PeerState, target: "network", ?peer_id, "peer banned");
                 self.swarm.behaviour_mut().gossipsub.remove_explicit_peer(&peer_id);
                 // blacklist gossipsub
                 self.swarm.behaviour_mut().gossipsub.blacklist_peer(&peer_id);
@@ -2609,14 +2670,14 @@ where
                 // Forward the raw stream to the application layer, which reads it
                 // as a typed sync stream.
                 self.swarm.behaviour().peer_manager.peer_to_bls(&peer).map_or_else(
-                    || warn!(target: "network", ?peer, "received inbound stream from unknown peer"),
+                    || bounded_warn!(Stream, target: "network", ?peer, "received inbound stream from unknown peer"),
                     |bls| {
                         let forwarded = self
                             .event_stream
                             .try_send_outcome(NetworkEvent::InboundStream { peer: bls, stream });
                         self.metrics.record_forward(ServiceClass::Other, &forwarded);
                         forwarded.err().into_iter().for_each(|e| {
-                            error!(target: "network", ?e, "failed to forward inbound stream");
+                            bounded_error!(Stream, target: "network", ?e, "failed to forward inbound stream");
                         });
                     },
                 );
@@ -2679,7 +2740,7 @@ where
                         );
                     }
                     kad::QueryResult::GetProviders(Err(err)) => {
-                        error!(target: "network-kad", "Failed to get providers: {err:?}");
+                        bounded_error!(Kademlia, target: "network-kad", "Failed to get providers: {err:?}");
                     }
                     kad::QueryResult::GetRecord(Ok(kad::GetRecordOk::FoundRecord(
                         kad::PeerRecord { record, peer },
@@ -2783,7 +2844,7 @@ where
                         );
                     }
                     kad::QueryResult::StartProviding(Err(err)) => {
-                        warn!(
+                        bounded_warn!(Kademlia,
                             target: "network-kad",
                             key = ?BlsPublicKey::from_literal_bytes(err.key().as_ref()),
                             ?err,
@@ -2875,7 +2936,7 @@ where
 
         // reject record
         if publisher_is_banned || source_is_banned {
-            error!(target: "network-kad", ?publisher_is_banned, ?source_is_banned, ?source, publisher=?record.publisher, "rejecting put request for record");
+            bounded_error!(Record, target: "network-kad", ?publisher_is_banned, ?source_is_banned, ?source, publisher=?record.publisher, "rejecting put request for record");
             // Do NOT `remove_record(&record.key)` on the reject path. Kademlia runs
             // with `StoreInserts::FilterBoth`, so this inbound record was never
             // written to the store; the only record `remove_record` can delete is one
@@ -2968,7 +3029,7 @@ where
                         self.swarm.behaviour_mut().kademlia.store_mut()
                             .retain_connected(source, record.key.clone())
                             .unwrap_or_else(|error| {
-                                warn!(target: "network-kad", ?source, ?error,
+                                bounded_warn!(Record, target: "network-kad", ?source, ?error,
                                     "connected binding could not be retained; identity remains confirmed");
                             });
                     }
@@ -2985,7 +3046,7 @@ where
                                         debug!(target: "network-kad", ?source, "dropping inbound kad record: store at capacity");
                                     }
                                     kad::store::Error::ValueTooLarge | kad::store::Error::MaxProvidedKeys => {
-                                        warn!(target: "network-kad", ?source, ?error, "dropping inbound kad record");
+                                        bounded_warn!(Record, target: "network-kad", ?source, ?error, "dropping inbound kad record");
                                     }
                                 },
                                 );
@@ -2999,7 +3060,7 @@ where
                         }
                     }
                 }).unwrap_or_else(|| {
-                    warn!(target: "network-kad", "Received invalid peer record!");
+                    bounded_warn!(Record, target: "network-kad", "Received invalid peer record!");
 
                     // assess penalty for invalid peer record
                     trace!(target: "network-kad", ?source, "processing fatal penalty for invalid peer record");
@@ -3057,7 +3118,7 @@ where
                             debug!(target: "network-kad", ?provider, "dropping inbound provider record: store at capacity");
                         }
                         kad::store::Error::ValueTooLarge | kad::store::Error::MaxRecords => {
-                            warn!(target: "network-kad", ?provider, ?error, "dropping inbound provider record");
+                            bounded_warn!(Record, target: "network-kad", ?provider, ?error, "dropping inbound provider record");
                         }
                     },
                 );

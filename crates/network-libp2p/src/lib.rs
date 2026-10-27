@@ -19,6 +19,7 @@
 pub mod admission;
 mod codec;
 mod consensus;
+mod diagnostics;
 pub mod error;
 mod freshness;
 mod gossip_config;
@@ -28,6 +29,7 @@ mod peers;
 mod quic_incoming;
 mod record_exchange;
 mod retention;
+mod serve_permits;
 mod service_class;
 pub mod source_admission;
 pub mod stream;
@@ -42,6 +44,7 @@ pub use metrics::AdmissionShed;
 pub use peers::{
     AdmissionFallback, AdmissionStatus, CommitteeUpdate, LoadPenalty, PeerExchangeMap, Penalty,
 };
+pub use serve_permits::{ServePermit, ServePermits, MAX_PERMITS_PER_PEER};
 pub use service_class::ServiceClass;
 pub use stream::StreamError;
 pub use sync::{
