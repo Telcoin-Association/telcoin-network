@@ -78,7 +78,11 @@ use crate::{
     init_reth_defaults,
     payload::TNPayload,
     rpc_server_args::RpcServerArgs,
-    test_utils::{consensus_output_for_tests_at, TransactionFactory},
+    test_utils::{
+        consensus_output_for_tests_at,
+        load::{announce_temp_dir, db_file_bytes},
+        TransactionFactory,
+    },
     ExecutedBlock, NewCanonicalChain, OutputTrieOverlay, RethChainSpec, RethCommand, RethConfig,
 };
 use alloy::primitives::keccak256;
@@ -93,7 +97,6 @@ use reth_node_core::args::{DatabaseArgs, TxPoolArgs};
 use reth_provider::{BlockNumReader as _, DatabaseProviderFactory as _};
 use secp256k1::rand::{rngs::StdRng, SeedableRng as _};
 use std::{
-    os::unix::fs::MetadataExt as _,
     path::Path,
     sync::Arc,
     time::{Duration, Instant},
@@ -474,9 +477,8 @@ fn run_mode(
     read_back(&reth_env, &parent, last_number, &last_txs);
     drop(reth_env);
 
-    let data_file = if cfg!(feature = "tndb-b") { "tndb.dat" } else { "mdbx.dat" };
-    let meta = std::fs::metadata(db_dir.join(data_file)).expect("database file");
-    ModeRun { commits, splits, db_bytes: meta.len(), db_alloc_bytes: meta.blocks() * 512 }
+    let (db_bytes, db_alloc_bytes) = db_file_bytes(&db_dir).expect("database file");
+    ModeRun { commits, splits, db_bytes, db_alloc_bytes }
 }
 
 /// Assert the last persisted block is in the database tables: the last block number, the last
@@ -577,41 +579,4 @@ fn per_block_persist() {
             report(&knobs, per_commit, &run);
         }
     });
-}
-
-/// The type of the file system holding `dir`, from Linux's `/proc/self/mountinfo` (the mount
-/// whose point is the longest prefix of `dir`'s canonical path); `None` where that file does not
-/// exist, as on macOS.
-fn fs_type(dir: &Path) -> Option<String> {
-    let dir = dir.canonicalize().ok()?;
-    let mounts = std::fs::read_to_string("/proc/self/mountinfo").ok()?;
-    mounts
-        .lines()
-        .filter_map(|line| {
-            let (fields, rest) = line.split_once(" - ")?;
-            // The mount point is the fifth field, with a space as `\040`.
-            let point = fields.split(' ').nth(4)?.replace("\\040", " ");
-            let fs = rest.split(' ').next()?;
-            dir.starts_with(&point).then(|| (point.len(), fs.to_owned()))
-        })
-        // Of equal lengths `max_by_key` takes the last: a later mount on a point hides the earlier.
-        .max_by_key(|(len, _)| *len)
-        .map(|(_, fs)| fs)
-}
-
-/// Print the bench's temp dir, and stop the run when it is on a file system held in memory
-/// (tmpfs, ramfs): syncs there cost nothing, so durable commits would time no disk.
-fn announce_temp_dir(dir: &Path) {
-    let fs = fs_type(dir);
-    match &fs {
-        Some(fs) => println!("bench temp dir: {} ({fs})", dir.display()),
-        None => println!("bench temp dir: {}", dir.display()),
-    }
-    assert!(
-        !matches!(fs.as_deref(), Some("tmpfs" | "ramfs")),
-        "the bench temp dir {} is on {}: syncs there cost nothing, so durable commits would time \
-         no disk. Set TMPDIR to a directory on a real disk, for this command only.",
-        dir.display(),
-        fs.unwrap_or_default(),
-    );
 }

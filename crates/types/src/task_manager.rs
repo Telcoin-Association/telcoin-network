@@ -414,6 +414,14 @@ impl TaskManager {
         self.join_tasks_within(grace).await
     }
 
+    /// Signal every task this manager spawned to exit, as dropping the manager does, and keep the
+    /// manager so [`Self::wait_for_exit`] can wait for them. Reth's blocking tasks
+    /// (`spawn_reth_task` on the blocking pool) end only on this notice: [`Self::abort`] cannot
+    /// stop a blocking task.
+    pub fn signal_shutdown(&self) {
+        self.local_shutdown.notify();
+    }
+
     /// Abort all of our direct tasks (not sub task managers though).
     pub fn abort(&self) {
         for task in self.tasks.iter() {
@@ -654,7 +662,7 @@ pub enum TaskJoinError {
 
 #[cfg(test)]
 mod test {
-    use std::time::Duration;
+    use std::{sync::Arc, time::Duration};
 
     use tokio::sync::mpsc::{self, Receiver, Sender};
 
@@ -910,5 +918,34 @@ mod test {
         );
         task_manager.abort_all_tasks();
         task_manager.wait_for_task_shutdown().await;
+    }
+
+    /// A reth blocking task outlives an abort and ends on `signal_shutdown`, which leaves the
+    /// manager in place so `wait_for_exit` sees it go and what it held is released.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_signal_shutdown_ends_reth_blocking_tasks() {
+        let mut task_manager = TaskManager::default();
+        let held = Arc::new(());
+        let task_held = held.clone();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        reth_tasks::TaskSpawner::spawn_blocking_task(
+            &task_manager.get_spawner(),
+            Box::pin(async move {
+                let _held = task_held;
+                let _ = started_tx.send(());
+                std::future::pending::<()>().await;
+            }),
+        );
+        task_manager.update_tasks();
+        // a blocking task that has not started yet is cancelled by an abort; this one is running
+        started_rx.await.expect("the task starts");
+        task_manager.abort();
+        assert!(
+            !task_manager.wait_for_exit(Duration::from_millis(200)).await,
+            "an abort does not stop a blocking task"
+        );
+        task_manager.signal_shutdown();
+        assert!(task_manager.wait_for_exit(Duration::from_secs(5)).await, "the task exits");
+        assert_eq!(Arc::strong_count(&held), 1, "the task released what it held");
     }
 }

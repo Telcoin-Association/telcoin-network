@@ -38,6 +38,26 @@ from the code at the cited paths; when the code and this file disagree, the code
   Duplicates across workers stay tolerated at execution; this only stops this node from packing a
   copy of what a peer is already proposing.
 
+### Block-building timings
+
+`RethEnv::build_block_from_batch_payload` times the stages of each block it builds into six
+histograms (`RethEnvMetrics` in `src/metrics.rs`), one sample per block each. Execute, finish and
+overlay extend run back to back, and the other three are parts of them. A stage that fails records
+nothing, and neither do the stages after it.
+
+| Metric | Spans |
+|---|---|
+| `tn_reth_block_execute_seconds` | Creating the block builder, the pre-execution changes, signer recovery and the transaction loop (`src/env/execution.rs`). |
+| `tn_reth_block_signer_recovery_seconds` | Recovering every transaction's signer, in parallel on rayon. Part of execute. |
+| `tn_reth_block_finish_seconds` | The block builder's `finish`: the post-execution changes (on an epoch-closing block, the closing system calls), merging the state transitions, hashing the post-state, the state root, and assembling the block. |
+| `tn_reth_block_hashed_state_seconds` | Hashing the block's post-execution state (`hashed_post_state`). Part of finish. |
+| `tn_reth_block_state_root_seconds` | The state root and trie updates over the output's accumulated overlay (`OutputTrieOverlay::layered_root_with_updates` in `src/env/output_overlay.rs`), from opening its read-only database transaction to closing it. Part of finish. |
+| `tn_reth_block_overlay_extend_seconds` | From the end of finish to the built block: sorting the block's hashed state and trie updates, then extending the output's overlay with them. |
+
+None of them covers the persist, which runs once per output after every block is built; reth's
+`save_blocks_*` histograms time that. The Prometheus buckets for `_seconds` series (tn-metrics)
+start at 5 ms, so a stage shorter than that reads only as "under 5 ms" on a dashboard.
+
 ## Header field mapping
 
 TN repurposes several Ethereum header fields for protocol data. Assembly happens in
@@ -531,6 +551,224 @@ tndb build therefore refuses `--db.sync-mode safe-no-sync` (`tndb_args`) until t
 that growth, and the bench's no-sync runs reach the engine's `NoSync` through a test-only path
 instead (`database::TEST_NO_SYNC`, which the bench sets before it opens the database).
 
+### Execution benchmark
+
+`etc/reth-exec-bench.sh <bench dir> [before-commit]` runs `tn-engine`'s busy-node execution bench
+(`exec_bench` in `crates/engine/tests/exec_bench/main.rs`, `#[ignore]`d, its knobs in the module
+docs), which times `execute_consensus_output` per output and splits each output's time by stage.
+Without a commit it builds this checkout twice, MDBX (the default features) and tndb-b
+(`--features tn-reth/tndb-b`), each into its own target directory under the bench directory, and
+refuses identical binaries; with a commit it compares that commit (which must have the bench)
+against this checkout on one backend (`EXEC_BACKEND`, default `tndb-b`). It runs the profiles in
+`EXEC_PROFILES` (`busy`, `busy-readers`, `peak`, `busy-metrics` by default; `busy-epoch` and
+`busy-export` when named) as interleaved pairs
+(`EXEC_ROUNDS`, default 2: A B B A), passes any other `TN_EXEC_BENCH_*` knob through, and writes one
+report to the repo root, `reth-exec-<host>-<time>.txt`: per profile, each side's medians over the
+rounds and each pair's B/A ratio, with the median ratio and its spread, beside each run's JSON
+report under `<bench dir>/reports/`. The script's header lists its settings and everything it
+writes. On macOS a durable commit is `F_FULLFSYNC` for libmdbx but a plain fsync for tndb-b, so
+durable commit times there are not like-for-like between the backends.
+
+#### Mac baseline, 2026-10-28
+
+The setup:
+- **Machine:** an Apple M1 Max (10 cores, 64 GiB) on its internal SSD (APFS), release builds,
+  durable sync on both backends.
+- **Run:** `etc/reth-exec-bench.sh` in backend mode, 2 ABBA rounds per profile, the bench's
+  defaults:
+  - state: 1M prefilled accounts, 10k senders, 64 pools, 200 aging and 20 warm-up outputs;
+  - load: 300 timed outputs, back to back, each 8 batches of 15M gas (about 2,400 transactions and
+    120M gas per output).
+- **Figures:** medians over the rounds, in ms per output. A ratio is tndb-b over MDBX, the median of
+  the two pairs' ratios.
+
+| profile | MDBX mean | tndb-b mean | ratio | MDBX p99 | tndb-b p99 | ratio [pairs] | Mgas/s, MDBX / tndb-b |
+|---|---|---|---|---|---|---|---|
+| `busy` | 801.5 | 852.5 | 1.06 | 1154 | 1358 | 1.18 [0.96..1.40] | 149.2 / 140.2 |
+| `busy-readers` (4 readers, the poller, the submitter) | 852.6 | 923.5 | 1.08 | 1213 | 1317 | 1.09 [1.05..1.12] | 140.2 / 129.5 |
+| `busy-metrics` (Prometheus, with readers) | 858.2 | 908.6 | 1.06 | 1185 | 1196 | 1.01 [0.96..1.06] | 139.3 / 131.6 |
+| `busy-epoch` (a close every 50 outputs) | 803.0 | 849.9 | 1.06 | 1118 | 1216 | 1.09 [0.96..1.22] | 148.9 / 140.7 |
+| `busy-export` (a state-pack export beside the writer) | 847.6 | 849.7 | 1.00 | 1299 | 1152 | 0.89 [0.86..0.91] | 141.0 / 140.7 |
+| `peak` (20 batches of 30M gas) | 2624 | 3878 | 1.48 | 3642 | 7599 | 2.09 [1.69..2.49] | 228.2 / 154.5 |
+
+Where an output's time goes, `busy`, mean ms:
+
+| stage | MDBX | share | tndb-b | share | ratio |
+|---|---|---|---|---|---|
+| EVM execution (with signer recovery: 10.9 / 10.8) | 37.0 | 4.6% | 40.6 | 4.8% | 1.10 |
+| state root (`finish`: hashed state 1.4, state root 156.2 / 175.6) | 163.8 | 20.4% | 183.1 | 21.5% | 1.12 |
+| overlay extend | 5.6 | 0.7% | 5.5 | 0.6% | 1.00 |
+| writes (`save_blocks`: the database's writes beside the static files') | 139.0 | 17.3% | 114.6 | 13.4% | 0.82 |
+| static-file commit | 34.4 | 4.3% | 33.6 | 3.9% | 0.98 |
+| database commit | 419.3 | 52.3% | 472.6 | 55.4% | 1.13 |
+| other | 2.5 | 0.3% | 2.5 | 0.3% | 0.99 |
+
+The database's writes split into these stages:
+
+| write stage | MDBX | tndb-b | ratio |
+|---|---|---|---|
+| `insert_block` | 0.3 | 0.2 | 0.77 |
+| `write_state` | 38.5 | 23.2 | 0.60 |
+| `write_hashed_state` | 25.6 | 19.6 | 0.77 |
+| `write_trie_updates` | 24.1 | 35.9 | 1.49 |
+| `update_history_indices` | 38.7 | 29.2 | 0.75 |
+
+What the runs and two `sample` profiles show (one busy run per backend, 120 s inside the timed
+loop):
+- **The database commit is I/O.** It is half of each output on both backends.
+  - On MDBX it is 99.9% `msync`: reth opens MDBX with a write map, so the commit writes back the
+    dirty mapped pages. On tndb-b it is 91% `fsync`, which writes back tndb-b's dirty mapped pages.
+  - The cost follows the pages a commit dirties, not the logical bytes. MDBX's file grew 616 MiB
+    while the export held its read for about 2.6 s (3–4 outputs): about 150–200 MiB of pages per
+    output, against 1.1 MiB of logical growth. Random keys over 1M accounts dirty a leaf, and its
+    path, per key touched.
+  - On macOS the write-back is at the VM page, 16 KiB on Apple Silicon. MDBX uses that as its page
+    size (reth's default, the OS page). tndb-b-reth uses 4 KiB pages, so each scattered page it
+    dirties writes back 16 KiB.
+  - libmdbx's durable sync is `F_FULLFSYNC` and tndb-b's a plain fsync. The Linux run (4 KiB pages,
+    `fdatasync`) is needed before ranking the backends on this stage.
+- **`peak` is tndb-b's weak spot.** Its commit grows over the run: per-decile means rise from
+  1.9 s to 3.25 s, with outputs up to 13 s. MDBX's stays at 1.0–1.3 s. In `busy`, tndb-b's commit
+  is about 620 ms for the first ~90 outputs, then about 400 ms (MDBX about 415).
+- **The rest of the run:**
+  - **History:** apart from tndb-b's early commits, each stage is flat from the first third of the
+    timed outputs to the last in `busy`.
+  - **Side load:** the readers cost the writer at most 5% (writer on/off 0.97–1.05 per run). Read
+    latencies match across the backends: p50 within 5%; `eth_getBlockByNumber` is 0.81x on tndb-b.
+  - **Prometheus:** no measurable cost.
+  - **Epoch close:** a closing output costs what a normal one does.
+- **The export:** it wrote 1.08M accounts, 2.07M storage slots and 25.8k bytecodes (a 152 MiB
+  pack) in 2.5–2.7 s (MDBX) and 2.2 s (tndb-b). The writer ran at 1.03x beside it on MDBX and 1.41x
+  on tndb-b, over only 2–4 outputs. tndb-b's growth while pinned reads 0: its file grows in
+  preallocated steps.
+
+#### Improvement candidates, by measured share (Mac)
+
+1. **The database commit, 52–55%:** the page write-back volume.
+   - **Persist every K outputs, not every output.** This amortizes the shared branch pages and the
+     hot leaves over K outputs. After a crash, the node would re-execute the outputs since the last
+     persist; it already replays the consensus output it missed on restart (`run_epoch`). It is a
+     TN design change (the overlay would span K outputs); no fork. The bench can measure it with a
+     persist-interval knob.
+   - **tndb-b:** an A/B of the page size (16 KiB, the OS page, on macOS) and of allocation locality.
+     A delta or WAL commit, writing the changed records and checkpointing pages later, is the
+     structural fix: an engine change.
+   - **Before tuning,** find what grows tndb-b's commit over a `peak` run.
+2. **The state root, 20–22%:** TN calls the serial `StateRoot::root_with_updates`.
+   reth-trie-parallel's `ParallelStateRoot` computes the storage roots on rayon. That is a tn-reth
+   change; no fork. tndb-b is 12% slower here, in cursor descents (`TreeCursor::descend`, 9% of an
+   output).
+3. **The database's writes, 13–17%:**
+   - **MDBX:** libmdbx's `mincore` residency check on page touch is 6.4% of an output.
+   - **tndb-b:** zero-filling each new page (`memset` in `Writer::alloc`) is 4.7% of an output, a
+     third of the write stage.
+   - **tndb-b's dup-sort emulation:** reth's writers do `seek_by_key_subkey`, `delete_current`,
+     then `upsert` per changed slot and trie node, where one put would do. The seek and the delete
+     are about 4% of an output (`delete_current` 3.1%, the seek 1.1%), and `write_trie_updates`
+     runs at 1.49x MDBX.
+   - **The fork question:** this stage is the one a reth fork could change. A one-call dup put
+     would remove the seek and the delete. The adapter can first try a cached seek position,
+     without a fork.
+4. **The static-file commit, 4%:** NippyJar's `File::sync_all` on every persist, which is
+   `F_FULLFSYNC` on macOS. It is reth code (a fork or an upstream change). Linux's `fsync` should
+   cost much less (not measured yet).
+5. **EVM execution, 5%,** with signer recovery at 1.4%. `CachedReads` is dropped every block
+   (`env/execution.rs`), so the hot token and router accounts are read again by each of an
+   output's blocks.
+
+The two largest stages (the commit's I/O, the state root) are reachable without forking reth. The
+parts a fork would change (the write pattern, about 4% on tndb-b, and the static-file sync, 4%)
+are smaller. The Linux run (the user's, with the same script) decides the commit ranking.
+
+#### The load generator (`src/test_utils/load/`, `test-utils`)
+
+- **`CaptureRecorder`:** a global metrics recorder that keeps the raw samples of allowlisted
+  histograms (raw names such as `storage.providers.database.save_blocks_total` and
+  `tn_reth.block_execute_seconds`) and forwards the rest to an optional inner recorder (tn-metrics'
+  `build_recorder`). Install it before the first `RethEnv::new_database`: reth's metric handles bind
+  to the recorder current at their first registration.
+- **`env`:**
+  - `open_production_env` opens a reth env as the node opens it: the given `--db.*` flags parsed by
+    `RethCommand`, never the temp chain's caps; HTTP RPC on, IPC off, ports 0.
+  - `clone_datadir` copies a closed datadir with `cp -c -R` (APFS `clonefile`) on macOS and
+    `cp -a --reflink=auto --sparse=always` elsewhere, and refuses an existing destination.
+  - `announce_temp_dir` prints a bench's temp dir and stops on tmpfs/ramfs (`fs_type`, `fs_type_in`
+    over Linux's mountinfo; the persist bench uses it too).
+  - `db_file_bytes` and `dir_bytes` give the length and allocated bytes of the database file and of
+    a directory such as `static_files`.
+- **`state`:** `PrefillSpec { accounts, senders, pools, seed, registry }` builds a deterministic
+  prefilled genesis (`genesis()`), on `test_genesis_at(GENESIS_TIMESTAMP)` or, with `registry`, on
+  `test_genesis_with_consensus_registry` (which needs a tokio runtime).
+  - `senders` keyed accounts (`sender(i)`, `sender_factories()`: keys from a `StdRng` seeded with
+    `keccak256("sender" ‖ seed ‖ i)`) and `accounts` keyless addresses (`account(i)`) hold native
+    balances and balances on two `Stablecoin` tokens, `STABLECOIN_A` and `STABLECOIN_B`. The tokens
+    are the artifact's `deployedBytecode` (it has no immutables), with OpenZeppelin 5.2's ERC-7201
+    `ERC20Storage` written directly: `balance_slot`, `allowance_slot`, `total_supply_slot`.
+  - `SWAP_ROUTER` is hand-assembled code (`router_code`) taking calldata `(pool, amount_in)`
+    (`swap_calldata`). It calls `A.transferFrom(caller, router, amount_in)` on each sender's
+    prefilled allowance, rewrites the pool's two reserve slots (`reserve_slots`), pays
+    `B.transfer(caller, amount_out)` from its prefilled balance and logs `ISwapRouter::Swap`. It
+    reverts when a token call fails.
+  - On the test chain a token transfer uses 38,974 gas and a swap 79,520.
+- **`base`:** `build_base(spec, cache_dir)` builds a spec's genesis once per backend into a closed
+  datadir, `<cache_dir>/base-<backend>-<key>`, with production `--db.*` and durable sync.
+  - The key (`base_dir_name`) is 16 hex digits of `keccak256` over the spec and `LAYOUT_VERSION`. A
+    derived datadir, such as an aged one, appends its own `extra` component.
+  - It writes `bench-base.json` (`BaseMeta`: the spec, the backend, the layout version, the sealed
+    genesis header, the slim genesis hash, build times and sizes), then renames `<name>.building`
+    into place. A later call returns the cached base.
+  - An existing base whose meta does not match (layout version, backend, spec, header hash, or the
+    slim genesis hash, which changes with the token or router code or the test genesis), or that
+    has no meta, is an error. It is never rebuilt over.
+  - `slim_chain(meta)` reopens a clone of the base: the chain spec of `PrefillSpec::slim()` (no
+    senders or accounts) with the cached genesis header in place of its own, so an open never
+    recomputes a 1M-account genesis root. `init_genesis` checks an existing genesis by hash only and
+    refuses another header (`GenesisHashMismatch`). The slim chain's `genesis().alloc` lacks the
+    prefill; nothing on the open or execute path reads it.
+  - Measured 2026-10-27 (Apple M-series laptop, release, durable, `build_base_at_scale` with 1M
+    accounts and 10k senders):
+
+    | backend | build | genesis and chain spec | `init_genesis` | data file allocated | peak RSS |
+    |---|---|---|---|---|---|
+    | MDBX | 12.9 s | 4.2 s | 8.6 s | `mdbx.dat` 712 MiB | 4.4 GB |
+    | tndb-b | 13.2 s | 4.2 s | 9.0 s | `tndb.dat` 1040 MiB | 4.7 GB |
+- **`workload`:** `Workload::new(env, spec, WorkloadConfig)` draws a seeded mix from the senders'
+  on-chain nonces: by default 40% native transfers, 40% ERC20 transfers, 15% swaps and 5% 1 KiB
+  creations, with 20% fresh recipients and the rest Zipf-hot `account(i)`. `next_batch(target_gas)`
+  signs a `LoadBatch` filled by exact expected gas, each gas limit 10% over it and within
+  `block_gas_limit` (30M). Gas on the test chain:
+
+  | transaction | gas |
+  |---|---|
+  | native transfer | 21,000 |
+  | ERC20 transfer to a holder | 21,000 + calldata + 17,390 (~39.0k) |
+  | ERC20 transfer to a fresh address | 21,000 + calldata + 34,490 (~56.1k) |
+  | swap | 21,000 + calldata + 58,180 (~79.5k) |
+  | 1 KiB creation | ~275k |
+- **`output`:** `OutputFactory::new(env, spec, WorkloadConfig, OutputConfig)` packs `batches` (8)
+  workload batches of about `batch_gas` (15M) into each production-shaped `ConsensusOutput`
+  (`next_output`, or `generate(n)` up front).
+  - On a `registry` spec the leader rotates through the registry's committee, which `committee()`
+    returns for `set_committee`.
+  - Outputs chain after the output the env's tip executed (its `parent_beacon_block_root` and
+    nonce, with the leader round twice the consensus number). They are committed `interval_ms`
+    (1 s) apart from one second past the tip, so `execute_consensus_output` never clamps a block's
+    timestamp.
+  - On a `registry` spec `next_output_closing()` builds an output that closes its epoch. Once it
+    has executed, `begin_epoch(env)` enters the next epoch: its number and committee are read from
+    the registry at the tip, and the seed chain restarts at the epoch root. A factory opened on a
+    tip that closed an epoch starts there too. `generate` never crosses a pending close.
+- **`readers`:** the concurrent side load of a busy node.
+  - `Readers`: reader threads call the in-process HTTP RPC methods through `Handle::block_on` on a
+    multi-thread runtime. They call `eth_getBalance` and `eth_call` of `balanceOf` for Zipf-drawn
+    accounts, `eth_getTransactionReceipt` of recent transactions, `eth_getLogs` of the router's swaps
+    over 64 blocks, and `eth_getBlockByNumber(latest, true)`. A thread also runs the batch builder's
+    `get_account_balances` poll every 250 ms. All of them sit behind one on/off gate, whose close
+    waits for the calls in flight.
+  - `Submitter`: `eth_sendRawTransaction`, counting `nonce too low` and `already known` apart from
+    errors.
+  - Each drains per-window latency samples and error counts, keeping the first error message.
+
 ## Determinism rules
 
 Block production must be a pure function of certified consensus output. Concretely:
@@ -577,7 +815,7 @@ Block production must be a pure function of certified consensus output. Concrete
 | `src/evm/tel_precompile/` | Native TEL issuance at `0x…07e1` (see its README). |
 | `src/evm/bls_precompile/` | BLS12-381 signature verification at `0x…b151`. |
 | `src/forward.rs` | `WorkerRpcForwarder`: observer → committee transaction forwarding. |
-| `src/metrics.rs` | Block-building drop counters (`unrecoverable` alertable, `invalid` expected) and the epoch-close system-call gas gauges. |
+| `src/metrics.rs` | Block-building drop counters (`unrecoverable` alertable, `invalid` expected), the per-block stage timings, and the epoch-close system-call gas gauges. |
 | `src/payload.rs` | `TNPayload` and `BuildArguments`: consensus data shaped for execution. |
 | `src/rpc_server_args.rs` | RPC CLI argument subset and transport-limit defaults. |
 | `src/snapshot.rs` | State-pack export (`PinnedStateView`) and verified restore (`SnapshotRestorer`). |
@@ -587,6 +825,7 @@ Block production must be a pure function of certified consensus output. Concrete
 | `src/types.rs` | Type aliases (`RpcServer`, `RethDb`, `PoolTxn`, `TNPrimitives`); `RethDb` is re-exported from `src/env/database.rs`. |
 | `src/worker.rs` | `WorkerComponents` and the `WorkerNetwork` RPC shim (libp2p peer count for `net_*`). |
 | `src/test_utils.rs` | `TransactionFactory` and payload-execution helpers (`test-utils` feature / tests). |
+| `src/test_utils/load/` | Shared code for the busy-node execution bench (`test-utils`): the capture recorder, the production env and datadir clones (`env`), the prefilled state (`state`) and its cached base (`base`), the transaction mix (`workload`), the consensus outputs (`output`) and the RPC side load (`readers`). See "Execution benchmark". |
 
 ## Feature flags
 

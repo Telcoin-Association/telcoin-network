@@ -5,7 +5,9 @@
 //! 1. [`install_recorder`] - installs the global `metrics` recorder backed by a Prometheus
 //!    registry. Telcoin metrics (names starting with `tn`) pass through untouched; all other
 //!    metrics (reth's built-in db/txpool/provider instrumentation, process metrics) get a `reth.`
-//!    prefix so they render identically to a stock reth node.
+//!    prefix so they render identically to a stock reth node. [`build_recorder`] builds the same
+//!    recorder without installing it, with the [`PrometheusHandle`] that renders it, for a process
+//!    that installs its own global recorder and wraps this one.
 //! 2. [`start_metrics_server`] - a minimal HTTP endpoint that renders the registry for Prometheus
 //!    scrapes, with pre-scrape [`MetricsHooks`] for sampled metrics (process stats, db table
 //!    sizes).
@@ -28,7 +30,10 @@
 //! # Testing instrumented crates
 //!
 //! Never install the global recorder in tests outside this crate - the global registry is
-//! shared per-process, so parallel tests would stomp each other. Use a local recorder:
+//! shared per-process, so parallel tests would stomp each other. The exception is a bench that
+//! is its own test binary and must see metrics from rayon, blocking and tokio threads; `tn-reth`'s
+//! `test_utils::load::CaptureRecorder` is installed that way. Everywhere else, use a local
+//! recorder:
 //!
 //! ```ignore
 //! use metrics_util::debugging::{DebuggingRecorder, DebugValue};
@@ -52,5 +57,6 @@ mod recorder;
 mod server;
 
 pub use exposure::{report_listener_bound, ListenerExposure};
-pub use recorder::install_recorder;
+pub use metrics_exporter_prometheus::PrometheusHandle;
+pub use recorder::{build_recorder, install_recorder};
 pub use server::{start_metrics_server, MetricsHooks};

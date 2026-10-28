@@ -9,6 +9,13 @@
 //! independently-batching workers, labeled by `reason`, see [`InvalidTxSkipReason`]). See
 //! [`RethEnvMetrics`] and the skip-reason docs for per-series semantics.
 //!
+//! Six histograms in the same group time the stages of each block that function builds, one
+//! sample per block each: `tn_reth.block_execute_seconds` (with
+//! `tn_reth.block_signer_recovery_seconds` inside it), `tn_reth.block_finish_seconds` (with
+//! `tn_reth.block_hashed_state_seconds` and `tn_reth.block_state_root_seconds` inside it), and
+//! `tn_reth.block_overlay_extend_seconds`. Execute, finish and overlay extend run back to back.
+//! See [`RethEnvMetrics`] for the span each one covers.
+//!
 //! Observer transaction forwarding. A base series counts every transaction handed to the
 //! forwarder ([`crate::WorkerRpcForwarder`]): `tn_reth.forwarded_txns_queued_total`. Read
 //! against it, `tn_reth.forwarded_txns_dropped_total` (labeled by `reason`, see
@@ -42,8 +49,9 @@
 //!
 //! # Two mechanisms in one module
 //!
-//! The counters use the `reth_metrics::Metrics` derive; the epoch-close gauges use the
-//! `metrics::gauge!` / `metrics::describe_gauge!` macros. The split is not stylistic:
+//! The counters and the block-timing histograms use the `reth_metrics::Metrics` derive; the
+//! epoch-close gauges use the `metrics::gauge!` / `metrics::describe_gauge!` macros. The split
+//! is not stylistic:
 //!
 //! 1. The per-call gauge carries a `call` label, which a derive field cannot express — the derive
 //!    generates one unlabelled series per field.
@@ -55,6 +63,12 @@
 //!    `new_with_labels`; the gauges get the property for free, which is what lets a real epoch
 //!    close be asserted on (`env/epoch.rs`).
 //!
+//! The block-timing histograms stay on the derive despite that: they record on every block, and
+//! a cached handle records without the registry lookup a macro makes on each call. The test that
+//! drives them through real block building (`env/execution.rs`) therefore binds the static
+//! itself, under its own recorder, which holds because nextest runs each test in its own
+//! process.
+//!
 //! Everything here binds to the process-global `metrics` recorder, so
 //! `tn_metrics::install_recorder` must run first — the node installs it before opening the
 //! database (`RethEnv::new_database`), and the two registration entry points ([`init`], called
@@ -63,7 +77,10 @@
 //! process start.
 
 use alloy_evm::InvalidTxError;
-use reth_metrics::{metrics::Counter, Metrics};
+use reth_metrics::{
+    metrics::{Counter, Histogram},
+    Metrics,
+};
 use reth_revm::context::result::InvalidTransaction;
 use reth_transaction_pool::error::PoolErrorKind;
 use std::sync::LazyLock;
@@ -109,6 +126,11 @@ pub(crate) fn init() {
 
 /// Metrics for the execution environment: block building from certified batch payloads, plus
 /// the worker pool's canonical-state subscription health and parked-transaction expiry.
+///
+/// The `block_*_seconds` histograms time the stages of each block
+/// `build_block_from_batch_payload` builds. Each records one sample per block, when its span
+/// completes without error, so a failed build leaves no sample for the stage that failed or any
+/// stage after it.
 ///
 /// The unrecoverable-drop counter and the labeled skip series under [`INVALID_TXS_SKIPPED`]
 /// cover transactions that `build_block_from_batch_payload` silently declines to include in
@@ -164,6 +186,44 @@ pub(crate) struct RethEnvMetrics {
     /// does not fall back to zero means the resync is stuck retrying the same senders and
     /// the pool's view of them stays stale.
     pub(crate) canon_state_resync_read_failures_total: Counter,
+
+    /// Time to execute one block's transactions in `build_block_from_batch_payload`.
+    ///
+    /// Spans creating the block builder, the pre-execution changes, signer recovery
+    /// ([`RethEnvMetrics::block_signer_recovery_seconds`]) and the transaction loop, and ends
+    /// where [`RethEnvMetrics::block_finish_seconds`] starts.
+    pub(crate) block_execute_seconds: Histogram,
+
+    /// Time to recover the signers of one block's transactions, in parallel on rayon.
+    ///
+    /// Part of [`RethEnvMetrics::block_execute_seconds`].
+    pub(crate) block_signer_recovery_seconds: Histogram,
+
+    /// Time for the block builder's `finish` on one block.
+    ///
+    /// Spans the post-execution changes (on an epoch-closing block, the closing system calls),
+    /// merging the state transitions, hashing the post-state
+    /// ([`RethEnvMetrics::block_hashed_state_seconds`]), the state root
+    /// ([`RethEnvMetrics::block_state_root_seconds`]) and assembling the block. It ends where
+    /// [`RethEnvMetrics::block_overlay_extend_seconds`] starts.
+    pub(crate) block_finish_seconds: Histogram,
+
+    /// Time to hash one block's post-execution bundle state (`hashed_post_state`).
+    ///
+    /// Part of [`RethEnvMetrics::block_finish_seconds`].
+    pub(crate) block_hashed_state_seconds: Histogram,
+
+    /// Time to compute one block's state root and trie updates over the output's accumulated
+    /// overlay (`OutputTrieOverlay::layered_root_with_updates`), including opening and closing
+    /// the read-only database transaction the root runs over.
+    ///
+    /// Part of [`RethEnvMetrics::block_finish_seconds`].
+    pub(crate) block_state_root_seconds: Histogram,
+
+    /// Time from the end of `finish` to the built block: sorting the block's hashed state and
+    /// trie updates, then extending the output's overlay with them
+    /// (`OutputTrieOverlay::extend_from_block`).
+    pub(crate) block_overlay_extend_seconds: Histogram,
 }
 
 impl RethEnvMetrics {

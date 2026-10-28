@@ -596,12 +596,20 @@ fn a_table_that_is_not_reths_is_listed_and_not_copied() {
     let path = tmp.path().join("db");
     let expected = build_mdbx(&path);
     {
+        // `create_db` opens the existing database without recording a client version, as
+        // `open_db` would: that row's key is the current second, so whether the migrating open's
+        // row replaced it would depend on the clock
         let args = DatabaseArgs { page_size: Some(MDBX_PAGE_SIZE), ..temp_chain_db_args() };
-        let db = reth_db::open_db(&path, args.database_args()).expect("open MDBX");
+        let db = reth_db::create_db(&path, args.database_args()).expect("open MDBX");
         let txn = db.begin_rw_txn().expect("begin");
         let table = txn.create_db(Some(FOREIGN), DatabaseFlags::default()).expect("create");
         txn.put(table.dbi(), b"key", b"value", Default::default()).expect("put");
         txn.commit().expect("commit");
+        assert_eq!(
+            raw_rows(&db),
+            expected,
+            "adding the foreign table leaves reth's tables as built"
+        );
     }
     {
         let db =

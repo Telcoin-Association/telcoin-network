@@ -19,6 +19,8 @@
 //! - Consensus/payload-execution helpers: `consensus_output_for_tests`, and
 //!   `execute_payload_and_update_canonical_chain`, which builds a block and commits it as the
 //!   canonical tip, standing in for the engine's payload builder.
+//! - [`load`]: shared code for the busy-node execution bench, such as [`load::CaptureRecorder`] and
+//!   [`load::open_production_env`].
 //! - [`plant_finalized_marker`]: writes the finalized/safe database markers directly — a test-only
 //!   backdoor into storage state for reconstructing pre-fix crash layouts.
 
@@ -82,6 +84,8 @@ use tn_types::{
     ETHEREUM_BLOCK_GAS_LIMIT_30M, MIN_PROTOCOL_BASE_FEE, U256,
 };
 use tracing::debug;
+pub mod load;
+
 // re-exports for tests
 pub use crate::evm::precompile_test_utils;
 pub use alloy::eips::{
@@ -817,6 +821,12 @@ pub fn seeded_genesis_from_random_batches<'a>(
 
 /// Helper function to create a committee for tests from on-chain data.
 pub async fn create_committee_from_state(epoch_state: EpochState) -> eyre::Result<Committee> {
+    committee_from_epoch_state(epoch_state)
+}
+
+/// The blocking form of [`create_committee_from_state`]: the committee of `epoch_state`, read from
+/// the `ConsensusRegistry`.
+pub fn committee_from_epoch_state(epoch_state: EpochState) -> eyre::Result<Committee> {
     // deconstruct epoch information
     let EpochState { epoch, validators, bls_pubkeys, .. } = epoch_state;
     let validators = validators

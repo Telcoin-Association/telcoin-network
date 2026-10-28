@@ -36,7 +36,7 @@ use reth_rpc_builder::{
     config::RethRpcServerConfig as _, RethRpcModule, RpcModuleBuilder, RpcServerHandle,
 };
 use reth_rpc_eth_api::RpcNodeCore;
-use reth_rpc_eth_types::EthConfig;
+use reth_rpc_eth_types::{EthConfig, EthStateCache};
 use reth_transaction_pool::{blobstore::DiskFileBlobStore, EthTransactionPool};
 use tn_types::{gas_accumulator::WorkerBaseFee, NodeMode, WorkerId};
 
@@ -290,6 +290,21 @@ impl RethEnv {
         } else {
             modules_config
         };
+        // RPC transaction pool insertion batching is configured by the txpool CLI args.
+        let eth_config = self
+            .node_config()
+            .rpc
+            .eth_config()
+            .max_batch_size(self.node_config().txpool.max_batch_size);
+        // Reth's eth tasks run on the env's task manager, not on reth's default
+        // `TokioTaskExecutor`: the state cache and the fee-history task (which follows the
+        // canonical-state stream, open for the env's whole life) hold the provider, so untracked
+        // they would keep the database open after the node's tasks shut down.
+        let eth_cache = EthStateCache::spawn_with(
+            self.inner.blockchain_provider.clone(),
+            eth_config.cache,
+            self.inner.task_spawner.clone(),
+        );
         let eth_api = apply_eth_config(
             EthApi::builder(
                 self.inner.blockchain_provider.clone(),
@@ -297,12 +312,10 @@ impl RethEnv {
                 network,
                 self.inner.evm_config.clone(),
             ),
-            // RPC transaction pool insertion batching is configured by the txpool CLI args.
-            self.node_config()
-                .rpc
-                .eth_config()
-                .max_batch_size(self.node_config().txpool.max_batch_size),
+            eth_config,
         )
+        .task_spawner(self.inner.task_spawner.clone())
+        .eth_cache(eth_cache)
         .build();
 
         let engine_events = reth_tokio_util::EventSender::default();

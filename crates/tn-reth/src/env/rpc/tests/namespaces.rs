@@ -290,3 +290,34 @@ async fn trace_filter_honours_max_trace_filter_blocks() -> eyre::Result<()> {
     assert_eq!(array_len(&single)?, 1, "{single}");
     Ok(())
 }
+
+/// Every task the RPC server spawns runs on the env's task manager: once the manager's tasks have
+/// exited and the server and the env are dropped, the database is closed and opens again. On
+/// reth's default executor the eth state cache and the fee-history task would still hold it.
+#[tokio::test(flavor = "multi_thread")]
+async fn rpc_tasks_release_the_database_on_shutdown() -> eyre::Result<()> {
+    let tmp_dir = TempDir::new()?;
+    let mut task_manager = TaskManager::default();
+    let served = server_from_cli(&["--http", "--ipcdisable"], &task_manager, &tmp_dir)?;
+    mine_transfer(&served)?;
+    drop(served);
+    task_manager.update_tasks();
+    task_manager.signal_shutdown();
+    task_manager.abort();
+    let grace = std::time::Duration::from_secs(10);
+    assert!(task_manager.wait_for_exit(grace).await, "tasks still ran: {task_manager}");
+    // the pool's maintenance hands reloads to `spawn_blocking`, and such a closure outlives its
+    // task by the moment it takes to finish, holding the provider meanwhile
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let stats = loop {
+        match crate::db_table_stats(tmp_dir.path()) {
+            Ok(stats) => break stats,
+            Err(_) if std::time::Instant::now() < deadline => {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await
+            }
+            Err(e) => return Err(e),
+        }
+    };
+    assert!(!stats.is_empty(), "the reopened database lists its tables");
+    Ok(())
+}

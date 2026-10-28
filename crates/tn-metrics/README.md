@@ -12,7 +12,11 @@ both telcoin (`tn_*`) and reth (`reth_*`) metric namespaces in the Prometheus te
   metric names starting with `tn` pass through untouched, everything else gets `reth.`
   prepended. The result is that reth's built-in instrumentation (db, txpool, provider) and
   process metrics render as `reth_db_*`, `reth_process_*`, etc. — identical to a stock reth
-  node — while telcoin metrics keep their `tn_*` names.
+  node — while telcoin metrics keep their `tn_*` names. `build_recorder` builds the same
+  recorder without installing it and returns it with the `PrometheusHandle` (re-exported) that
+  renders its registry. A process that installs its own global recorder wraps it to get a
+  `--metrics` node's names and buckets; the execution bench's `CaptureRecorder` (`tn-reth`,
+  `test-utils`) does this.
 - **Server** (`start_metrics_server`): a hand-rolled ~100-line HTTP responder following the
   node healthcheck pattern. No request parsing, no connection limits; every connection
   receives the rendered registry with `Content-Type: text/plain; version=0.0.4`. Runs as a
@@ -70,7 +74,9 @@ reason.
 ## Testing instrumented crates
 
 The global recorder can only be installed once per process. Only this crate's own tests
-install it. Everywhere else, use a local recorder:
+install it, plus a bench that is its own test binary and has to see metrics recorded on rayon,
+blocking and tokio threads (`tn-reth`'s `test_utils::load::CaptureRecorder`). Everywhere else,
+use a local recorder:
 
 ```rust,ignore
 use metrics_util::debugging::{DebugValue, DebuggingRecorder};
