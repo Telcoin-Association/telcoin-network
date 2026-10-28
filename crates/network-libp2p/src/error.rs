@@ -19,6 +19,9 @@ pub enum NetworkError {
     /// Configured advertised endpoints violate the signed-record constraints.
     #[error(transparent)]
     AdvertisedAddresses(#[from] tn_node_record::AddressError),
+    /// Our own node record could not be signed.
+    #[error(transparent)]
+    NodeRecord(#[from] tn_node_record::RecordError),
     /// Swarm error dialing a peer.
     #[error("{0}")]
     Dial(String),

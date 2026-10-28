@@ -34,9 +34,9 @@ mod record;
 pub use addresses::{validate_advertised_addresses, AddressError, MAX_ADVERTISED_MULTIADDRS};
 pub use parse::{parse_bls_pubkey, ParseBlsPubkeyError};
 pub use protocol::{gossip_protocol_id_prefix, NetworkType};
-pub use record::{NetworkInfo, NodeRecord, RecordDomain};
+pub use record::{NetworkInfo, NodeRecord, RecordDomain, RecordError};
 
 // re-export the libp2p and tn-types items that appear in this crate's public API so a consumer
 // can name them without a direct dependency on either
 pub use libp2p::Multiaddr;
-pub use tn_types::{BlsPublicKey, RpcInfo};
+pub use tn_types::{BlsPublicKey, NetworkKeypair, RpcInfo};
