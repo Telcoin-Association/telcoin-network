@@ -37,7 +37,7 @@ correlation map to maintain.
 │  (Serves inbound sync streams from peers)                       │
 ├─────────────────────────────────────────────────────────────────┤
 │                                                                 │
-│  process_inbound_sync_stream() ──► try_admit_sync() (or Deny)   │
+│  process_inbound_sync_stream() ──► try_admit_opening() (or Deny)│
 │                                    reads opening Req frame       │
 │  process_sync_batches_stream() ──► stream_codec::               │
 │                                    send_sync_batches_over_stream │
@@ -151,23 +151,45 @@ for the rest of the epoch.
 
 ### Concurrency Limiting
 
-#### Global Semaphore (`MAX_CONCURRENT_BATCH_STREAMS`)
+Admission of an inbound sync stream has two phases. Each phase has a pool (`ReservedPool`) with
+a public share and a committee reserve. Committee peers are the keys of the current and the next
+committee (`ReservedPeers`). A committee peer takes a permit from the reserve first and then from
+the public share. A public peer takes a permit only from the public share. Thus public peers
+cannot use the capacity that a committee request needs.
 
-A tokio `Semaphore` with `MAX_CONCURRENT_BATCH_STREAMS` (5) permits bounds the total number of
-concurrent inbound batch serves. Admission happens in `try_admit_sync()` *before* the serving task
-is spawned; the permit is held for the whole serve via the `SyncStreamPermit` RAII guard and released
-when it drops.
+#### Opening-Read Pool (`MAX_CONCURRENT_OPENING_READS`)
 
-If no permit is available, the responder writes `Deny(DenyReason::AtCapacity)` and the requesting peer
-tries another node.
+The opening-read pool has 8 public permits (`MAX_CONCURRENT_OPENING_READS`) and 4 committee
+permits (`COMMITTEE_RESERVED_OPENING_READS`). `try_admit_opening()` takes a permit *before* the
+serving task is spawned. The task holds the permit while it reads the opening `Req` frame, for a
+maximum of `SYNC_REQUEST_READ_TIMEOUT` (5 s). A served stream releases the permit before the serve
+starts. A stream that is not served keeps it only for its bounded refusal or error write. If a
+public peer sends no frame in time, the worker charges the peer `Penalty::Mild`.
+
+If no permit is available, the responder writes `Deny(DenyReason::AtCapacity)` on a budgeted shed
+task, and the requesting peer tries another node.
+
+#### Batch Serve Pool (`MAX_CONCURRENT_BATCH_STREAMS`)
+
+The batch serve pool has 5 public permits (`MAX_CONCURRENT_BATCH_STREAMS`) and 4 committee permits
+(`COMMITTEE_RESERVED_BATCH_STREAMS`). The task takes a permit after it reads the request frame and
+holds it until the serve ends. If no permit is available, the responder writes
+`Deny(DenyReason::AtCapacity)` and closes the stream.
+
+Time limits release the permit when a peer stops reading:
+- `SYNC_REQUEST_READ_TIMEOUT` (5 s) for the `Ack` write and flush.
+- `SEND_STREAM_FRAME_TIMEOUT` (30 s) for each `Data` write, each chunk flush, and the `End` write.
+- `SEND_STREAM_TIMEOUT` (200 s) for the whole serve.
+
+The serve returns a `SyncServeOutcome`. A `Stalled` serve (a time limit expired) charges a public
+peer `Penalty::Mild`. A `Failed` serve (for example, a storage error) charges no penalty.
 
 #### Per-Peer Rate Limiting (`MAX_PENDING_REQUESTS_PER_PEER`)
 
-Each peer is limited to `MAX_PENDING_REQUESTS_PER_PEER` (2) concurrent in-flight batch serves,
-tracked in the `sync_stream_peers` map. This prevents a single malicious peer from monopolizing all
-global semaphore slots. `try_admit_sync()` admits a stream only when both the global semaphore has a
-permit and the peer is below its per-peer cap, incrementing the peer's count on admission;
-`SyncStreamPermit::drop` decrements it (and removes the entry at zero).
+Each peer can have a maximum of `MAX_PENDING_REQUESTS_PER_PEER` (2) sync streams in flight, which
+`PeerSlots` counts. A stream holds its peer slot through both phases. Thus one peer cannot fill a
+pool. `try_admit_opening()` takes the peer slot first and then the opening-read permit. If one of
+them is not available, it releases what it took and refuses the stream.
 
 #### Oversized Request Truncation (`MAX_BATCH_DIGESTS_PER_REQUEST`)
 
@@ -272,8 +294,13 @@ Stream codec functions are tested in isolation with mock streams.
 Integration tests in `tests/it/network_tests.rs` verify end-to-end batch synchronization between workers.
 
 Concurrency tests cover:
-- Global semaphore exhaustion sheds with `Deny(AtCapacity)`
-- RAII permit release when a `SyncStreamPermit` is dropped
+- Exhaustion of the public share of the batch serve pool sheds with `Deny(AtCapacity)`
+- Release of the peer slot and the pool permits when an admission is dropped
+- Public peers cannot use the committee reserve of the opening-read or the batch serve pool
+- Silent public streams release their opening-read permits at `SYNC_REQUEST_READ_TIMEOUT` and get
+  one `Penalty::Mild` each
+- Stalled `Ack` and `Data` writes fail with `TimedOut` at their limits and release the batch serve
+  permit
 - Per-peer limit enforcement across distinct peers
 - Capacity at exactly `MAX_CONCURRENT_BATCH_STREAMS` across multiple peers
 - Retry logic succeeding after initial peer rejection

@@ -151,8 +151,10 @@ const MISSING_CERTS_FRAME_TIMEOUT: Duration = Duration::from_secs(10);
 /// ends with [`SyncFrame::End`]. A partial transfer bounds the source reader to the
 /// prefix length so it never streams past the verifiable point. Each frame write is
 /// bounded by `buffer_timeout` so a peer that stops reading cannot stall the
-/// responder task on an unbounded write. The caller has already admitted the
-/// exchange against the concurrency caps and read the opening request frame.
+/// responder task on an unbounded write. The whole data stream is also bounded by
+/// [`pack_serve_deadline`] of the pack length, so a requester cannot hold the serve
+/// longer than an honest link at the throughput floor needs. The caller has already
+/// admitted the exchange against the concurrency caps and read the opening request frame.
 pub(crate) async fn send_sync_epoch_pack_over_stream<S>(
     stream: &mut S,
     consensus_chain: &ConsensusChain,
@@ -203,11 +205,50 @@ where
     )
     .await?;
 
-    // `cap` bounds the reader to the pack's logical length in both cases — a full transfer to
-    // `[0, data_len)`, a partial prefix to `[0, end)` — so `take(cap)` stops the stream there and
-    // the trailing mmap capacity padding is never sent.
-    write_pack_data_frames(&mut epoch_stream.take(cap), stream, buffer_timeout).await?;
+    // `cap` bounds the reader to the pack's logical length in both cases (a full transfer to
+    // `[0, data_len)`, a partial prefix to `[0, end)`), so `take(cap)` stops the stream there
+    // and the trailing mmap capacity padding is never sent. The same length sizes the total
+    // serve deadline.
+    let mut capped = epoch_stream.take(cap);
+    write_pack_data_frames_within_deadline(&mut capped, cap, stream, buffer_timeout).await?;
     Ok(())
+}
+
+/// The total time an epoch-pack serve of `pack_bytes` bytes may take: one
+/// [`SYNC_RATE_WINDOW`] for each started [`SYNC_RATE_MIN_BYTES`] of pack, plus one window of
+/// slack. A requester that reads at the throughput floor finishes inside it, so the deadline
+/// never cuts a link the floor admits; a 100 MiB pack gets 50.5 minutes.
+pub(crate) fn pack_serve_deadline(pack_bytes: u64) -> Duration {
+    let windows = pack_bytes.div_ceil(SYNC_RATE_MIN_BYTES).saturating_add(1);
+    SYNC_RATE_WINDOW.saturating_mul(u32::try_from(windows).unwrap_or(u32::MAX))
+}
+
+/// Stream a pack reader as [`write_pack_data_frames`] does, bounded by the total deadline
+/// [`pack_serve_deadline`] of `pack_bytes`.
+///
+/// The per-frame write timeout and the throughput floor are checked frame by frame. The deadline
+/// is a hard upper bound on the whole serve that holds whatever those checks measure, so a
+/// requester that keeps each frame just inside its timeout still releases the serve slot. A
+/// missed deadline is an [`std::io::ErrorKind::TimedOut`] error, which the admission layer
+/// classifies as a stalled serve.
+pub(crate) async fn write_pack_data_frames_within_deadline<R, S>(
+    reader: &mut R,
+    pack_bytes: u64,
+    stream: &mut S,
+    buffer_timeout: Duration,
+) -> std::io::Result<()>
+where
+    R: TokioAsyncRead + Unpin + Send,
+    S: FuturesAsyncWrite + Unpin + Send,
+{
+    tokio::time::timeout(
+        pack_serve_deadline(pack_bytes),
+        write_pack_data_frames(reader, stream, buffer_timeout),
+    )
+    .await
+    .map_err(|_elapsed| {
+        std::io::Error::new(std::io::ErrorKind::TimedOut, "epoch pack serve missed its deadline")
+    })?
 }
 
 /// Stream a pack reader as [`SyncFrame::Data`] frames terminated by
@@ -711,7 +752,118 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{
+        pin::Pin,
+        task::{Context, Poll},
+    };
     use tn_network_libp2p::SyncFrameError;
+
+    /// Four throughput-floor units of pack: sixteen full `Data` frames.
+    const DRIP_PACK_LEN: usize = 4 << 20;
+
+    /// A requester that takes `delay` to accept each frame flush, so every frame lands inside the
+    /// per-frame write timeout while the whole serve runs as long as the frame count allows.
+    /// Writes and close complete at once.
+    struct DripSink {
+        /// How long each flush waits.
+        delay: Duration,
+        /// The flush in progress, if any.
+        pending: Option<Pin<Box<tokio::time::Sleep>>>,
+    }
+
+    impl FuturesAsyncWrite for DripSink {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            let delay = self.delay;
+            let pending = &mut self.pending;
+            let ready = std::future::Future::poll(
+                pending.get_or_insert_with(|| Box::pin(tokio::time::sleep(delay))).as_mut(),
+                cx,
+            );
+            ready.map(|()| {
+                *pending = None;
+                Ok(())
+            })
+        }
+
+        fn poll_close(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    /// The length of the drip pack as the deadline sees it.
+    fn drip_pack_bytes() -> u64 {
+        u64::try_from(DRIP_PACK_LEN).unwrap_or(u64::MAX)
+    }
+
+    /// Serve a [`DRIP_PACK_LEN`] pack of zeros to a [`DripSink`] that takes `delay` to accept each
+    /// frame, with a 10 s per-frame write timeout. Returns the serve result and the (paused) time
+    /// it took.
+    async fn drip_serve(delay: Duration) -> (std::io::Result<()>, Duration) {
+        let mut reader = std::io::Cursor::new(vec![0u8; DRIP_PACK_LEN]);
+        let mut sink = DripSink { delay, pending: None };
+        let start = tokio::time::Instant::now();
+        let served = write_pack_data_frames_within_deadline(
+            &mut reader,
+            drip_pack_bytes(),
+            &mut sink,
+            Duration::from_secs(10),
+        )
+        .await;
+        (served, start.elapsed())
+    }
+
+    /// The total epoch-pack serve deadline is one throughput-floor window per started MiB of
+    /// pack, plus one window, and saturates instead of overflowing.
+    #[test]
+    fn pack_serve_deadline_is_one_window_per_floor_plus_one() {
+        assert_eq!(pack_serve_deadline(0), Duration::from_secs(30));
+        assert_eq!(pack_serve_deadline(SYNC_RATE_MIN_BYTES), Duration::from_secs(60));
+        assert_eq!(
+            pack_serve_deadline(SYNC_RATE_MIN_BYTES.saturating_add(1)),
+            Duration::from_secs(90)
+        );
+        assert_eq!(
+            pack_serve_deadline(SYNC_RATE_MIN_BYTES.saturating_mul(100)),
+            Duration::from_secs(3030)
+        );
+        assert_eq!(pack_serve_deadline(u64::MAX), SYNC_RATE_WINDOW.saturating_mul(u32::MAX));
+    }
+
+    /// A requester that keeps every frame inside the per-frame write timeout, but reads so slowly
+    /// that the whole serve would outlast its deadline, is cut at the deadline with a `TimedOut`
+    /// error. Paused time leaves the wall-clock throughput floor idle, so only the deadline can
+    /// end this serve.
+    #[tokio::test(start_paused = true)]
+    async fn drip_reader_is_cut_at_the_pack_serve_deadline() {
+        let deadline = pack_serve_deadline(drip_pack_bytes());
+        let (served, elapsed) = drip_serve(Duration::from_millis(9_900)).await;
+        let err = served.expect_err("a drip reader must not finish the serve");
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut, "got {err:?}");
+        assert!(err.to_string().contains("deadline"), "got {err:?}");
+        assert!(elapsed >= deadline, "cut at {elapsed:?}, before the {deadline:?} deadline");
+        assert!(
+            elapsed < deadline.saturating_add(Duration::from_secs(1)),
+            "cut at {elapsed:?}, well after the {deadline:?} deadline"
+        );
+    }
+
+    /// A requester that accepts each frame after one second finishes the same serve well inside
+    /// its deadline.
+    #[tokio::test(start_paused = true)]
+    async fn steady_reader_finishes_inside_the_pack_serve_deadline() {
+        let deadline = pack_serve_deadline(drip_pack_bytes());
+        let (served, elapsed) = drip_serve(Duration::from_secs(1)).await;
+        assert!(served.is_ok(), "got {served:?}");
+        assert!(elapsed < deadline, "took {elapsed:?}, past the {deadline:?} deadline");
+    }
 
     /// F15: the throughput floor trips only on a COMPLETED window that carried fewer than
     /// `min_bytes`; an at/above-floor window resets and does not trip, and a partial

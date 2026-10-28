@@ -7,7 +7,7 @@ use super::{
 use crate::{
     batch_fetcher::get_batch_local_cache,
     metrics::WorkerMetrics,
-    network::{stream_codec, MAX_CONCURRENT_GOSSIP_PREFETCHES},
+    network::{stream_codec, SyncServeOutcome, MAX_CONCURRENT_GOSSIP_PREFETCHES},
 };
 use futures::AsyncWriteExt as _;
 use parking_lot::Mutex;
@@ -37,6 +37,15 @@ use tracing::{debug, warn};
 /// read tolerance (`INTER_CHUNK_STREAM_TIMEOUT`) to be at least this whole-stream
 /// cap so an honest sender is never disconnected mid-transfer.
 pub(crate) const SEND_STREAM_TIMEOUT: Duration = Duration::from_secs(200);
+
+/// Timeout for writing one sync `Data` frame, flushing one chunk, or writing the
+/// `End` frame.
+///
+/// The limit restarts for every frame, so an honest reader must only keep up with
+/// one frame (at most one batch, about 1 MiB) per 30 seconds. A peer that stops
+/// reading releases its batch-serve permit within one limit instead of holding
+/// it for the whole [`SEND_STREAM_TIMEOUT`].
+pub(crate) const SEND_STREAM_FRAME_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// RAII guard for an admitted gossip-triggered batch prefetch.
 ///
@@ -365,17 +374,21 @@ where
         )
     }
 
-    /// Serve an admitted inbound sync batch exchange.
+    /// Serve an admitted inbound sync batch exchange and report how it ended.
     ///
-    /// The opening [`SyncFrame::Req`] has already been read and validated by the
-    /// caller, and the exchange has been admitted against the concurrency caps.
-    /// This writes the [`SyncFrame::Ack`], streams the requested batches as
-    /// [`SyncFrame::Data`] frames, and ends the stream with [`SyncFrame::End`].
+    /// The opening [`SyncFrame::Req`] has already been read and the exchange has
+    /// passed both admission phases. This writes the [`SyncFrame::Ack`], streams
+    /// the requested batches as [`SyncFrame::Data`] frames, and ends the stream
+    /// with [`SyncFrame::End`]. The `Ack` write is bounded by
+    /// `SYNC_REQUEST_READ_TIMEOUT`; each `Data` write, chunk flush, and the `End`
+    /// write by [`SEND_STREAM_FRAME_TIMEOUT`]; and the whole serve by
+    /// [`SEND_STREAM_TIMEOUT`]. Thus a peer that stops reading releases the
+    /// batch-serve permit at the first limit it trips.
     ///
-    /// A send failure or storage error is logged and best-effort signalled to the
-    /// requester with a [`SyncFrame::Err`] so it stops waiting; it is not a peer
-    /// fault, so no penalty is returned. The sync responder reports errors
-    /// metrics-only during the item-5 rollout.
+    /// A failed serve is logged and best-effort signalled to the requester with a
+    /// [`SyncFrame::Err`] so it stops waiting. The returned [`SyncServeOutcome`]
+    /// tells the caller if the failure was a stall, which it charges to a public
+    /// peer, or another failure, which it does not charge.
     ///
     /// `epoch` is the request epoch, which the caller has checked is inside the
     /// node's serve window; it selects the epoch pack read on a cache miss.
@@ -389,7 +402,7 @@ where
         epoch: Epoch,
         max_frame: usize,
         consensus_chain: &ConsensusChain,
-    ) -> WorkerNetworkResult<()> {
+    ) -> SyncServeOutcome {
         debug!(
             target: "worker::network",
             %peer,
@@ -411,16 +424,24 @@ where
                 &batch_digests,
                 epoch,
                 max_frame,
+                SEND_STREAM_FRAME_TIMEOUT,
             ),
         )
         .await
         .map_err(WorkerNetworkError::from)
         .and_then(|sent| sent);
+        let outcome = SyncServeOutcome::of(&served);
 
-        // a send failure or timeout is logged and best-effort signalled so the
-        // requester stops waiting; it is not a peer fault, so no penalty
+        // a failed serve is logged and best-effort signalled so the requester
+        // stops waiting; the caller decides on a penalty from `outcome`
         if let Err(e) = served {
-            warn!(target: "worker::network", %peer, ?e, "failed to serve sync batch stream");
+            warn!(
+                target: "worker::network",
+                %peer,
+                ?e,
+                ?outcome,
+                "failed to serve sync batch stream"
+            );
             // bound the best-effort error write: a peer that passed admission, read
             // the `Ack`, then stopped reading would otherwise pin this responder
             // task on an unbounded write. Mirrors the shed/malformed error writes in
@@ -446,7 +467,7 @@ where
         let _ =
             tokio::time::timeout(crate::network::SYNC_REQUEST_READ_TIMEOUT, stream.close()).await;
 
-        Ok(())
+        outcome
     }
 }
 
