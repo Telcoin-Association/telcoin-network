@@ -722,8 +722,19 @@ impl WorkerNetworkHandle {
     /// nothing.
     pub fn new_for_test(task_spawner: TaskSpawner) -> Self {
         let (tx, _rx) = tokio::sync::mpsc::channel(5);
+        Self::new_for_test_with_sender(tx, task_spawner)
+    }
+
+    /// Like [`Self::new_for_test`], but sends network commands to `sender`, so a test
+    /// can observe what the handle reports (for example a peer penalty).
+    pub fn new_for_test_with_sender(
+        sender: tokio::sync::mpsc::Sender<
+            tn_network_libp2p::types::NetworkCommand<WorkerRequest, WorkerResponse>,
+        >,
+        task_spawner: TaskSpawner,
+    ) -> Self {
         Self {
-            handle: NetworkHandle::new(tx),
+            handle: NetworkHandle::new(sender),
             task_spawner,
             epoch: 0,
             chain_id: 0,
