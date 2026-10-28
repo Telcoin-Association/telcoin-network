@@ -683,7 +683,8 @@ fn test_is_author_content_fault() {
 // ============================================================================
 
 /// Test that acquiring all MAX_CONCURRENT_BATCH_STREAMS permits causes try_acquire_owned to fail,
-/// which is how the sync responder sheds load (a denied admission writes `Deny(AtCapacity)`).
+/// which is how the public share of the sync responder's batch-serve pool sheds load from public
+/// peers (a refused serve writes `Deny(AtCapacity)`; committee peers still have their reserve).
 #[tokio::test]
 async fn test_semaphore_exhaustion_denies_admission() {
     let semaphore = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_BATCH_STREAMS));

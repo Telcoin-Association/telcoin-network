@@ -1,0 +1,25 @@
+# Scrape config for the 4-validator compose network (etc/compose.yaml), mounted by
+# compose.observability.yaml. Every target is a validator's private compose-network address;
+# nothing here is reachable from outside the `validators` bridge network.
+#
+# Health is a plain HTTP route on port 8080 of the same addresses (`/health/network`). Probe it
+# with the compose healthcheck on each validator service, or by hand:
+#   docker compose exec validator1 bash -c 'exec 3<>/dev/tcp/10.10.0.21/8080; printf "GET /health/network HTTP/1.1\r\n\r\n" >&3; head -c 200 <&3'
+global:
+  scrape_interval: 15s
+
+scrape_configs:
+  - job_name: telcoin-validators
+    static_configs:
+      - targets: ["10.10.0.21:9101"]
+        labels:
+          validator: validator1
+      - targets: ["10.10.0.22:9101"]
+        labels:
+          validator: validator2
+      - targets: ["10.10.0.23:9101"]
+        labels:
+          validator: validator3
+      - targets: ["10.10.0.24:9101"]
+        labels:
+          validator: validator4

@@ -22,6 +22,7 @@
 * [Getting Started](getting-started/README.md)
   * [Bootstrap Peers](getting-started/bootstrap-peers.md)
   * [Validator Production Operations](getting-started/validator-operations.md)
+  * [Private Observability Listeners](getting-started/observability-listeners.md)
   * [Host Network Observability](getting-started/host-network-observability.md)
   * [Consensus Liveness](getting-started/consensus-liveness.md)
   * [Reading Blockchain Data](getting-started/reading-blockchain-data/README.md)

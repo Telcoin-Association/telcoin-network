@@ -1,3 +1,5 @@
+# Health and metrics bind each validator's compose-network address and are not published to
+# the host; see docs/src/getting-started/observability-listeners.md and compose.observability.yaml.
 services:
   # build image once
   telcoin-base:
@@ -116,9 +118,16 @@ services:
       --http
       --http.addr 0.0.0.0
       --http.port 8545
+      --healthcheck 10.10.0.21:8080
       --metrics 10.10.0.21:9101
     ports:
       - 8545:8545
+    healthcheck:
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/10.10.0.21/8080 && printf 'GET /health/network HTTP/1.1\\r\\n\\r\\n' >&3 && read -r status <&3 && [[ \"$$status\" == *\" 200 \"* ]]"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 90s
     volumes:
       - validator1-data:/home/nonroot/data
     networks:
@@ -139,9 +148,16 @@ services:
       --http
       --http.addr 0.0.0.0
       --http.port 8545
+      --healthcheck 10.10.0.22:8080
       --metrics 10.10.0.22:9101
     ports:
       - 8544:8545
+    healthcheck:
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/10.10.0.22/8080 && printf 'GET /health/network HTTP/1.1\\r\\n\\r\\n' >&3 && read -r status <&3 && [[ \"$$status\" == *\" 200 \"* ]]"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 90s
     volumes:
       - validator2-data:/home/nonroot/data
     networks:
@@ -162,9 +178,16 @@ services:
       --http
       --http.addr 0.0.0.0
       --http.port 8545
+      --healthcheck 10.10.0.23:8080
       --metrics 10.10.0.23:9101
     ports:
       - 8543:8545
+    healthcheck:
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/10.10.0.23/8080 && printf 'GET /health/network HTTP/1.1\\r\\n\\r\\n' >&3 && read -r status <&3 && [[ \"$$status\" == *\" 200 \"* ]]"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 90s
     volumes:
       - validator3-data:/home/nonroot/data
     networks:
@@ -185,9 +208,16 @@ services:
       --http
       --http.addr 0.0.0.0
       --http.port 8545
+      --healthcheck 10.10.0.24:8080
       --metrics 10.10.0.24:9101
     ports:
       - 8542:8545
+    healthcheck:
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/10.10.0.24/8080 && printf 'GET /health/network HTTP/1.1\\r\\n\\r\\n' >&3 && read -r status <&3 && [[ \"$$status\" == *\" 200 \"* ]]"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 90s
     volumes:
       - validator4-data:/home/nonroot/data
     networks:

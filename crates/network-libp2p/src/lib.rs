@@ -48,8 +48,8 @@ pub use serve_permits::{ServePermit, ServePermits, MAX_PERMITS_PER_PEER};
 pub use service_class::ServiceClass;
 pub use stream::StreamError;
 pub use sync::{
-    read_frame, write_frame, DenyReason, PrimarySyncRequest, SyncFrame, SyncFrameError,
-    WorkerSyncRequest,
+    read_frame, write_frame, DenyReason, PeerSlot, PeerSlots, PeerTier, PrimarySyncRequest,
+    ReservedPeers, ReservedPool, SyncFrame, SyncFrameError, WorkerSyncRequest,
 };
 pub use tn_node_record::{validate_advertised_addresses, MAX_ADVERTISED_MULTIADDRS};
 pub use types::ResponseChannel;
