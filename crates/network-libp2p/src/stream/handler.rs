@@ -21,10 +21,12 @@ use crate::{
     types::NetworkResult,
 };
 
-/// Timeout for negotiating a single outbound stream substream.
+/// Timeout for negotiating a single stream substream, inbound or outbound.
 ///
 /// Enforced by libp2p via [`SubstreamProtocol::with_timeout`]; on expiry the
-/// handler receives a [`StreamUpgradeError::Timeout`].
+/// handler receives a [`StreamUpgradeError::Timeout`]. An inbound stream that
+/// sends no protocol header holds its negotiation slot for this long, so the
+/// swarm reaches the data streams queued behind it within a bounded time.
 pub(crate) const STREAM_OPEN_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Upper bound on outbound opens a single connection handler will buffer before
@@ -138,7 +140,7 @@ impl ConnectionHandler for StreamHandler {
     type OutboundOpenInfo = OutboundOpen;
 
     fn listen_protocol(&self) -> SubstreamProtocol<Self::InboundProtocol, Self::InboundOpenInfo> {
-        SubstreamProtocol::new(self.listen_upgrade(), ())
+        SubstreamProtocol::new(self.listen_upgrade(), ()).with_timeout(STREAM_OPEN_TIMEOUT)
     }
 
     fn on_behaviour_event(&mut self, event: Self::FromBehaviour) {

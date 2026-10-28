@@ -1038,9 +1038,11 @@ impl SwarmMetrics {
         quic: &QuicConfig,
         budget: Option<SwarmNetworkBudget>,
     ) -> Self {
-        self.handles
-            .established_connection_limit
-            .set(f64::from(budget.map_or(0, |budget| budget.connections())));
+        self.handles.established_connection_limit.set(f64::from(
+            budget.map_or(crate::consensus::MAX_ESTABLISHED_CONNECTIONS, |budget| {
+                budget.connections()
+            }),
+        ));
         self.handles
             .inbound_streams_per_connection_limit
             .set(f64::from(quic.max_concurrent_stream_limit));
@@ -1667,9 +1669,9 @@ mod tests {
             })
         };
         assert!(gauge_is("tn_network.established_connections", 7.0));
-        assert!(gauge_is("tn_network.established_connection_limit", 0.0));
-        assert!(gauge_is("tn_network.inbound_streams_per_connection_limit", 10_000.0));
-        assert!(gauge_is("tn_network.receive_credit_per_connection_bytes", 104_857_600.0));
+        assert!(gauge_is("tn_network.established_connection_limit", 128.0));
+        assert!(gauge_is("tn_network.inbound_streams_per_connection_limit", 256.0));
+        assert!(gauge_is("tn_network.receive_credit_per_connection_bytes", 4_194_304.0));
         assert!(snapshot.iter().any(|(key, _, _, value)| key.key().name()
             == "tn_network.connection_limit_rejections_total"
             && key
