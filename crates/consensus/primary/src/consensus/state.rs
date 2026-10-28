@@ -1,13 +1,17 @@
 //! The state of consensus
 
 use crate::{
-    consensus::{bullshark::Bullshark, utils::gc_round, ConsensusError},
+    consensus::{
+        bullshark::Bullshark, liveness::RoundQuorumObserver, utils::gc_round, ConsensusError,
+        Outcome,
+    },
     ConsensusBus, NodeMode,
 };
 use std::{
     cmp::{max, Ordering},
     collections::{BTreeMap, BTreeSet, HashMap},
     fmt::Debug,
+    time::Duration,
 };
 use tn_config::ConsensusConfig;
 use tn_storage::{
@@ -514,11 +518,20 @@ impl<DB: Database> Consensus<DB> {
         Ok(())
     }
 
+    /// Run active consensus and service observation deadlines without new traffic.
     async fn run(
         mut self,
         mut rx_new_certificates: impl TnReceiver<Certificate>,
     ) -> Result<(), ConsensusError> {
         self.active = self.consensus_bus.is_active_cvv();
+        let mut observer = RoundQuorumObserver::from_recovered_dag(
+            self.committee.clone(),
+            self.consensus_bus.app().metrics().clone(),
+            self.state.last_round.committed_round,
+            &self.state.dag,
+        );
+        let mut observation_tick = tokio::time::interval(Duration::from_secs(1));
+        observation_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         // Listen to incoming certificates.
         loop {
@@ -533,9 +546,12 @@ impl<DB: Database> Consensus<DB> {
                 }
 
                 Some(certificate) = rx_new_certificates.recv() => {
-                    self.new_certificate(certificate).await.inspect_err(|e| {
+                    self.new_certificate(certificate, &mut observer).await.inspect_err(|e| {
                         error!(target: "epoch-manager", ?e, "new certificate failed");
                     })?;
+                },
+                _ = observation_tick.tick() => {
+                    observer.evaluate_expired(tokio::time::Instant::now());
                 },
             }
         }
@@ -543,7 +559,11 @@ impl<DB: Database> Consensus<DB> {
 
     /// Process a new certificate.
     #[instrument(level = "debug", skip_all, fields(round = certificate.round(), origin = ?certificate.origin()))]
-    async fn new_certificate(&mut self, certificate: Certificate) -> Result<(), ConsensusError> {
+    async fn new_certificate(
+        &mut self,
+        certificate: Certificate,
+        observer: &mut RoundQuorumObserver,
+    ) -> Result<(), ConsensusError> {
         match certificate.epoch().cmp(&self.committee.epoch()) {
             Ordering::Equal => {
                 // we can proceed.
@@ -566,8 +586,13 @@ impl<DB: Database> Consensus<DB> {
             }
         }
         // Process the certificate using the selected consensus protocol.
+        let round = certificate.round();
+        let origin = certificate.origin().clone();
         let (outcome, committed_sub_dags) =
             self.protocol.process_certificate(&mut self.state, certificate)?;
+        if outcome != Outcome::CertificateBelowCommitRound {
+            observer.observe(self.committee.epoch(), round, &origin, tokio::time::Instant::now());
+        }
         if self.active {
             let mut own_rounds_committed = Vec::new();
             let mut leader_commit_round = 0;
@@ -621,6 +646,7 @@ impl<DB: Database> Consensus<DB> {
                     .send(committed_sub_dag)
                     .await
                     .map_err(|_| ConsensusError::ShuttingDown)?;
+                observer.record_commit();
             }
 
             if has_headers {

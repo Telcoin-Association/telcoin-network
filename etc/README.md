@@ -14,6 +14,9 @@ The `setup_validator.sh` script is used to facilitate all the necessary commands
 A committee service generates genesis and distributes the `committee.yaml`, `genesis.yaml`, and `parameters.yaml` files.
 Finally, validator services are launched to start the network.
 
+Each validator binds its health and metrics listeners to its own compose-network address (`10.10.0.2N:8080`, `10.10.0.2N:9101`); neither is published to the host.
+`compose.observability.yaml` is an overlay that adds a Prometheus collector on that network (`docker compose -f compose.yaml -f compose.observability.yaml up`); its UI is published on host loopback only, at `127.0.0.1:9090`.
+
 RPCs can be reached at:
 
 - validator 1: 127.0.0.1:8545

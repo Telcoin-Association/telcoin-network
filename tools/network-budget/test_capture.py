@@ -54,9 +54,10 @@ class CaptureTests(unittest.TestCase):
             'tn_network_inbound_requests_shed_total{network="primary",class="epoch_record",reason="admission"} 1',
             'tn_network_inbound_requests_failed_total{network="worker-0",class="batch",outcome="omitted"} 2',
             'tn_network_connection_limit_rejections_total{network="primary",reason="established_total"} 3',
-            'tn_network_inbound_connections_denied_total{network="primary",reason="other_limit"} 4',
+            'tn_network_inbound_connections_denied_total{network="primary",reason="other_limit",stage="transport_cap"} 4',
+            'tn_network_inbound_connections_denied_total{network="primary",reason="unknown",stage="unknown"} 5',
         ])
-        self.assertEqual([item["value"] for item in capture.observations(accepted, 1)], [1, 1, 2, 3, 4])
+        self.assertEqual([item["value"] for item in capture.observations(accepted, 1)], [1, 1, 2, 3, 4, 5])
         self.assertTrue({capture.FAILED, capture.DENIALS} <= capture.REQUIRED_METRICS)
 
     def test_block_number_is_a_quantity_or_missing(self):
@@ -84,6 +85,8 @@ class CaptureTests(unittest.TestCase):
             'tn_network_connection_limit_rejections_total{network="primary",reason="queue_full"} 1',
             'tn_network_connection_limit_rejections_total{network="primary"} 1',
             'tn_network_inbound_connections_denied_total{network="primary",reason="established_total"} 1',
+            'tn_network_inbound_connections_denied_total{network="primary",reason="other_limit"} 1',
+            'tn_network_inbound_connections_denied_total{network="primary",reason="other_limit",stage="handshake"} 1',
             'tn_network_inbound_request_service_seconds{network="primary",class="vote",quantile="1.5"} 1',
             'tn_network_inbound_request_service_seconds_bucket{network="primary",class="vote",le="-Inf"} 1',
             'tn_network_inbound_request_service_seconds_bucket{network="primary",class="vote",le="nan"} 1',

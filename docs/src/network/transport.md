@@ -104,7 +104,7 @@ The external address advertised to peers still comes from the node's info file, 
 
 Operators arriving from other clients go looking for `--p2p-port` or `--listen-addr`.
 Neither flag exists; `--bootstrap-peers` is available to override bootstrap dial hints for the current process.
-The node command's flags cover the named chain, bootstrap dial hints, a consensus-metrics socket, an instance number, state export and its retention limit, the re-pack monitor, unused-port mode, a healthcheck port, a node name, and a tracing endpoint, plus a global data directory and the JSON-RPC server arguments.
+The node command's flags cover the named chain, bootstrap dial hints, a consensus-metrics socket, an instance number, state export and its retention limit, the re-pack monitor, unused-port mode, a healthcheck bind (port or socket address), a node name, and a tracing endpoint, plus a global data directory and the JSON-RPC server arguments.
 
 Listener addresses come from the generated node info and the two override variables above.
 Bootstrap peers come from the network config's `bootstrap_peers` map, falling back to the genesis committee when the map is empty.

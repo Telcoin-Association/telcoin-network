@@ -25,11 +25,20 @@
 //! which the stream behaviour registers as its sole upgrade. Every bulk path
 //! (worker batch, epoch pack, missing certificates, consensus output) rides this layer.
 //!
+//! ## Admission
+//!
+//! The `admission` submodule holds the committee-aware budgets that a responder uses to admit
+//! inbound sync streams: an opening-read budget, one serve pool per request class (each a
+//! [`ReservedPool`] with a public share and a committee reserve), and a per-peer cap
+//! ([`PeerSlots`]) across every phase.
+//!
 //! [`encode_message`]: crate::encode_message
 //! [`decode_message`]: crate::decode_message
 
+mod admission;
 mod frame;
 mod request;
 
+pub use admission::{PeerSlot, PeerSlots, PeerTier, ReservedPeers, ReservedPool};
 pub use frame::{read_frame, write_frame, DenyReason, SyncFrame, SyncFrameError};
 pub use request::{PrimarySyncRequest, WorkerSyncRequest};
