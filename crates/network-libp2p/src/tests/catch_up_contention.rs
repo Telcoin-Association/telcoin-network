@@ -509,13 +509,45 @@ fn spawn_drain(peer: &mut HarnessPeer) -> eyre::Result<()> {
     Ok(())
 }
 
+/// Add a peer as explicit, so `from` can resolve its BLS key for requests and streams.
+async fn register(from: &Handle, to: &HarnessPeer) -> eyre::Result<()> {
+    from.add_explicit_peer(
+        to.config.key_config().primary_public_key(),
+        to.config.primary_networkkey(),
+        to.config.primary_address(),
+    )
+    .await
+    .map_err(Into::into)
+}
+
 /// Add a peer as explicit and dial it, establishing an outbound connection.
+///
+/// Adding the peer can start the peer manager's own dial before `dial_by_bls` runs, so a dial
+/// that loses that race is not an error. The caller waits for the established connection count.
 async fn connect(from: &Handle, to: &HarnessPeer) -> eyre::Result<()> {
-    let bls = to.config.key_config().primary_public_key();
-    from.add_explicit_peer(bls, to.config.primary_networkkey(), to.config.primary_address())
-        .await?;
-    from.dial_by_bls(bls).await?;
-    Ok(())
+    register(from, to).await?;
+    from.dial_by_bls(to.config.key_config().primary_public_key())
+        .await
+        .or_else(|error| {
+            if matches!(
+                error,
+                NetworkError::AlreadyConnected(_)
+                    | NetworkError::AlreadyDialing(_)
+                    | NetworkError::RedialAttempt
+                    | NetworkError::Dial(_)
+            ) {
+                Ok(())
+            } else {
+                Err(error)
+            }
+        })
+        .map_err(Into::into)
+}
+
+/// Whether peer `from` dials peer `to` during setup. Committee peers dial every higher committee
+/// peer; the catching-up and hostile peers dial every committee peer.
+fn dials(workload: Workload, from: usize, to: usize) -> bool {
+    to < workload.committee && (to > from || from >= workload.committee)
 }
 
 /// Complete and validate one request, bounding command submission and response waiting together.
@@ -1106,13 +1138,10 @@ async fn run_arm(
         .try_for_each(|from| {
             let committee = &committee;
             async move {
-                stream::iter(committee.iter().filter(|to| {
-                    from.index < workload.committee && to.index > from.index
-                        || from.index >= workload.committee
-                }))
-                .map(Ok::<_, eyre::Report>)
-                .try_for_each(|to| connect(&from.handle, to))
-                .await
+                stream::iter(committee.iter().filter(|to| dials(workload, from.index, to.index)))
+                    .map(Ok::<_, eyre::Report>)
+                    .try_for_each(|to| connect(&from.handle, to))
+                    .await
             }
         })
         .await?;
@@ -1132,6 +1161,21 @@ async fn run_arm(
             .await
         })
         .await?;
+    // A peer resolves a BLS key only through its own registration, and an inbound connection
+    // does not register its opener. Each dialed peer registers its openers once the connections
+    // are up.
+    stream::iter(peers.iter())
+        .map(Ok::<_, eyre::Report>)
+        .try_for_each(|to| {
+            let peers = &peers;
+            async move {
+                stream::iter(peers.iter().filter(|from| dials(workload, from.index, to.index)))
+                    .map(Ok::<_, eyre::Report>)
+                    .try_for_each(|from| register(&to.handle, from))
+                    .await
+            }
+        })
+        .await?;
 
     let telemetry = Arc::new(Telemetry::new(workload.peers()));
     let store = Arc::new(SampleStore::new());
@@ -1145,6 +1189,54 @@ async fn run_arm(
     let plain_ref = *refs.get(1).ok_or_else(|| eyre::eyre!("missing committee peer 1"))?;
     let probe_handle =
         &peers.first().ok_or_else(|| eyre::eyre!("missing committee peer 0"))?.handle;
+    // A registered peer is an unconfirmed stub until its signed record arrives. Until both ends
+    // of a connection confirm each other, a request fails: `PeerUnresolved` at the requester, or
+    // an outbound failure when the responder drops a request from an unknown peer. Look up both
+    // ends of every connection, then wait for one vote round trip across each before any load
+    // starts.
+    let pairs = peers
+        .iter()
+        .flat_map(|from| {
+            peers
+                .iter()
+                .filter(move |to| dials(workload, from.index, to.index))
+                .map(move |to| (from, to))
+        })
+        .collect::<Vec<(&HarnessPeer, &HarnessPeer)>>();
+    stream::iter(pairs)
+        .map(Ok::<_, eyre::Report>)
+        .try_for_each(|(from, to)| {
+            let vote = &vote;
+            let vote_reply = &vote_reply;
+            async move {
+                let to_bls = to.config.key_config().primary_public_key();
+                from.handle.find_authorities(vec![to_bls]).await?;
+                to.handle
+                    .find_authorities(vec![from.config.key_config().primary_public_key()])
+                    .await?;
+                wait_until(
+                    setup_timeout,
+                    "connected peers resolve each other",
+                    move || async move {
+                        round_trip(&from.handle, to_bls, vote, vote_reply, workload.request_timeout)
+                            .await
+                            .map(|_| true)
+                            .or_else(|report| {
+                                if matches!(
+                                    report.downcast_ref::<NetworkError>(),
+                                    Some(NetworkError::PeerUnresolved | NetworkError::Outbound(_))
+                                ) {
+                                    Ok(false)
+                                } else {
+                                    Err(report)
+                                }
+                            })
+                    },
+                )
+                .await
+            }
+        })
+        .await?;
 
     let mut loaders: JoinSet<eyre::Result<()>> = JoinSet::new();
     loaders.spawn(sample_loop(source.clone(), store.clone()));
