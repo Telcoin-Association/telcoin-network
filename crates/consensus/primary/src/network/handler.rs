@@ -41,7 +41,7 @@ const SEND_STREAM_BUFFER_TIMEOUT: Duration = Duration::from_secs(10);
 /// A single output is small and bounded (unlike a whole epoch pack, whose serve is bounded by a
 /// throughput floor rather than a fixed wall-clock cap — see `send_sync_epoch_pack_over_stream`),
 /// so a fixed backstop is fine here: it caps the admission slot a drip-reading peer can hold.
-const SEND_SYNC_PACK_TIMEOUT: Duration = Duration::from_secs(200);
+pub(crate) const SEND_SYNC_PACK_TIMEOUT: Duration = Duration::from_secs(200);
 
 /// Total timeout for serving a missing-certificates response over the sync protocol.
 ///

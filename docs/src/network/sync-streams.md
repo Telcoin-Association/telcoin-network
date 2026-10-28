@@ -49,7 +49,8 @@ The chain id in the protocol name means a node on one chain fails negotiation ag
 The requester waits 5 seconds for the first response frame.
 A peer that negotiates the protocol but never answers trips that timeout, and the requester moves to the next peer instead of stalling the whole catch-up.
 On the responding side, a peer that opens a stream and never sends its request frame is dropped after 5 seconds.
-While it waits it holds only an opening-read slot, never a serve slot, and a public-tier peer is charged a mild penalty when the read times out (see [Admission](#admission)).
+While it waits it holds only an opening-read slot, never a serve slot.
+A public-tier peer is charged a mild penalty for a silent, unreadable or unexpected opening, for a stalled serve, and, for an epoch pack, for a serve cut at the 200-second hold limit; an `AtCapacity` refusal is not charged (see [Admission](#admission)).
 
 ## Frame tags
 
@@ -137,18 +138,20 @@ A peer whose BLS key is in the current committee or the next committee is in the
 The committee keys are captured when the network is built for an epoch.
 
 1. **Per-peer cap.** One peer can hold at most two in-flight sync streams. A third stream is shed.
-2. **Opening read.** The stream takes an opening-read slot while the responder reads the request frame, for at most 5 seconds. There are 8 slots for any peer and 4 more that only committee peers can take. The slot is released when the read ends, or, for a stream that is refused, after the bounded refusal write and close. A stream that never sends a valid request never takes a serve slot.
+2. **Opening read.** The stream takes an opening-read slot while the responder reads the request frame, for at most 5 seconds. There are 8 slots for any peer and 4 more that only committee peers can take. The opening-read slot is released as soon as the read ends, before any control write or close; the per-peer slot lasts for the whole task. A stream that never sends a valid request never takes a serve slot.
 3. **Serve.** The request selects its serve class: epoch pack, missing certificates, or consensus output. Each class has its own pool of 5 slots for any peer and 4 more that only committee peers can take, so public peers that fill one class cannot block a committee peer or a different class. A full class answers `Deny(AtCapacity)`.
 
 The worker batch sync stream uses the same tiers, with one pool of 5 slots for any peer and 4 for committee peers.
 
 Each serve is also bounded in time:
 
-- An epoch-pack serve has a 10-second write timeout per frame, a throughput floor of 1 MiB per 30-second window, and a total deadline of 30 seconds for each started MiB of pack plus 30 seconds. A requester that reads at the floor finishes inside the deadline; a 100 MiB pack gets 50.5 minutes.
+- An epoch-pack serve has a 10-second write timeout per frame, a throughput floor of 1 MiB per 30-second window, and a total deadline of 30 seconds for each started MiB of pack plus 30 seconds. A requester that reads at the floor finishes inside the deadline; a 100 MiB pack gets 50.5 minutes. That floor-derived deadline is the only time bound for a committee-tier serve. A public-tier epoch-pack serve is also cut at 200 seconds in total, the same cap the other two classes apply, and a serve that outlives it is charged as a stall.
 - A missing-certificates or consensus-output serve is bounded at 200 seconds in total.
 - A worker batch serve has 5 seconds to write its `Ack` and 30 seconds for each data frame, inside the 200-second total.
 
-A public-tier peer is charged a mild penalty when its opening read times out and when a serve stalls on a write timeout or a missed deadline.
+A public-tier peer is charged a mild penalty for a silent, unreadable or unexpected opening, for a stalled serve, and, for an epoch pack, for a serve cut at the 200-second hold limit.
+A serve stalls when it hits a write timeout or a missed deadline. On the primary, the whole-serve timeout of a missing-certificates or consensus-output serve is a stall; on the worker, a requester that stops or closes the stream after the `Ack` is a stall.
+An `AtCapacity` refusal is not charged, because an honest peer gets it when a pool is full.
 Committee peers are not charged by admission.
 A mild penalty lowers the peer score by 1.0; the score thresholds are -20.0 for a disconnect and -50.0 for a ban, so, ignoring decay, twenty stalls disconnect a public peer and fifty ban it.
 These admission penalties are enforced, unlike the stream-failure penalties under [Failure classification](#failure-classification).
@@ -168,6 +171,7 @@ These admission penalties are enforced, unlike the stream-failure penalties unde
 | Serve slots per class | 5 + 4 committee | Concurrent serves of each class: epoch pack, missing certificates, consensus output |
 | Worker batch serves | 5 + 4 committee | Concurrent worker batch sync serves |
 | Epoch-pack serve deadline | 30s per started MiB, plus 30s | Total time one epoch-pack serve can take |
+| Public epoch-pack serve hold limit | 200s | Bound on a public-tier epoch-pack serve (`PUBLIC_EPOCH_PACK_SERVE_TIMEOUT`, equal to `SEND_SYNC_PACK_TIMEOUT`); a serve that outlives it is dropped and charged as a stall; committee-tier serves keep the throughput-floor deadline |
 
 The 15-second and 10-second budgets nest: the total open budget covers a dial that may itself have to establish a connection, while the negotiation timeout applies only once a connection exists.
 An open that is dispatch-ready when its peer disconnects is re-queued for dialing rather than handed to a handler that no longer exists.
