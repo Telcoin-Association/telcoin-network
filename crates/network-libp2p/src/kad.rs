@@ -756,7 +756,7 @@ impl<DB: Database> KadStore<DB> {
                     }
                 }
                 .inspect_err(|error| {
-                    error!(target: "network-kad", ?error, kad_type = ?self.kad_type, "failed to rewrite Kademlia provider records at startup");
+                    bounded_error!(Store, target: "network-kad", ?error, kad_type = ?self.kad_type, "failed to rewrite Kademlia provider records at startup");
                     self.record_provider_write_failure();
                 })
                 .is_ok()
