@@ -9,6 +9,7 @@ The `verify-on-chain` lane in `.github/workflows/pr.yaml` reads that registry ba
 The lanes themselves live in **`etc/ci-lanes.sh`**, and both `test-and-attest.sh` and `pr.yaml` call it.
 That is the only reason "the queue runs what was attested" is a fact rather than a hope: when the two spelled out their own commands, they had already drifted (CI ran clippy under `--all-features` only, and excluded a package deleted long ago).
 Edit a lane there and both callers change together.
+Two more callers run on `main`: `cache-deps.yaml` compiles the lanes to warm the caches the queue restores (see "Caches"), and `main-compiles.yaml` compiles them after every push to `main`, as a tripwire for commits that never went through the queue (see "Where the coverage gap is").
 The e2e suites are deliberately not in that file -- anything added to it lands in the merge queue.
 
 ## What the merge queue changes
@@ -24,6 +25,7 @@ So the two gates cover different things and neither replaces the other:
 | commit tested | the PR head | main + this PR + every PR ahead of it in the batch |
 | suite | everything, e2e included | everything CI can afford; no e2e |
 | runs on | a maintainer's machine | GitHub runners |
+| on the pull request | checked on every run | `fmt`, `clippy` and the guards for every PR, drafts included; `test` and `adiri-test` skipped for a draft or a maintainer-authored PR |
 
 The queue builds a temporary `gh-readonly-queue/main/...` branch and fires a `merge_group` event against it.
 Three consequences worth remembering:
@@ -33,9 +35,11 @@ Three consequences worth remembering:
   ejects the PR. `pr.yaml` triggers on both events, and `CI Success` is the only required
   check, on purpose: a second required name means a second workflow that has to learn the
   same lesson.
-- **The maintainer and draft skips do not apply in the queue.** Whoever wrote the PR, the
-  merged commit has never been compiled anywhere, so every lane runs. `CI Success` treats a
-  skipped lane as a failure on `merge_group` for the same reason.
+- **The maintainer and draft skips cover the two test lanes only, and never apply in the queue.**
+  On a pull request, `ci-scope` skips `test` and `adiri-test` for a draft or a maintainer-authored PR.
+  `fmt`, `clippy` and the guards run for every author, draft or not, so a PR whose test code does not compile fails on its own run instead of being ejected from the queue.
+  In the queue, whoever wrote the PR, the merged commit has never been compiled anywhere, so every lane runs.
+  `CI Success` treats a skipped lane as a failure on `merge_group` for the same reason; on a pull request it accepts a skip of the two test lanes only, and only when `ci-scope` asked for it.
 - **The attestation is checked on the pull request only, never in the queue.** GitHub
   creates the merge group's commit seconds before CI starts, so no local run could have
   covered it and nothing can attest it; a lane that demanded one would hang the queue until
@@ -49,6 +53,8 @@ Three consequences worth remembering:
 `make attest` writes to adiri and touches nothing on GitHub, so nothing re-runs `verify-on-chain` by itself.
 Two ways to re-run it on the same sha: request a review on the PR (`review_requested` is in the workflow's `pull_request.types` for exactly this), or re-run the failed job from the Actions tab.
 Both run the script as it stands on `main` at that moment, so a change to the script or its registry address reaches an open PR on its next run.
+A review request re-runs the whole workflow, so `fmt`, `clippy` and the guards run again on a sha they have already checked.
+That is deliberate: the newest run on a sha is the one the required check reads, and a review-request run that skipped them and accepted the skip could turn `CI Success` green on a sha whose earlier run failed `clippy`.
 Do not push: a new sha needs a new attestation.
 
 ### Why SQUASH
@@ -73,6 +79,31 @@ This is why `test-and-attest.sh` refuses to attest a branch that is behind `orig
 `ALLOW_STALE_BASE=1` overrides it when the drift is provably irrelevant.
 The nightly `durable-e2e` lane is the backstop for what still slips through.
 
+The second gap is a merge that goes around the queue altogether.
+The fix for a GitHub security advisory is developed in a temporary private fork and merged from the advisory.
+GitHub runs no status checks on a temporary fork and enforces no branch protection when an advisory is merged, so neither `pull_request` nor `merge_group` fires and the ruleset never asks for `CI Success`.
+On 2026-10-29, between 02:26 and 02:32 UTC, four advisory fixes landed that way: GHSA-qf73 as `87180d74f`, GHSA-86x7 as `5f912b1dd`, GHSA-4947 as `ed092164d` and GHSA-f64w as `b68ce0c78`.
+Each had been forked from `main` on its own, and the four met for the first time on `main`, where the test targets no longer compiled: two E0061 errors and an E0308 in the `tn-network-libp2p` library tests, clippy's `manual_repeat_n` in two test modules, and two tests that still asserted the behavior the fixes had changed.
+Only the push-triggered workflows ran on those commits: CodeQL, and `cache-deps.yaml`, whose warm job failed on the errors but is a cache warmer that nobody reads as a gate.
+The nightly `durable-e2e` failed the same way.
+From then on every queued PR failed its `test` lane on `main + PR`, whatever it changed.
+
+`.github/workflows/main-compiles.yaml` (*Main compiles*) is the tripwire for that.
+On every push to `main` it runs `fmt` and the three `clippy` passes, builds the test binaries of both test lanes under the stable pin that builds releases, and runs the library tests of the two carried patch crates.
+It cannot block anything.
+No check can gate an advisory merge, so it is not a required check, and it reports only once the commit is on `main`: a failed run shows on `main`'s commit list and emails the account that pushed, and nobody else.
+It compiles the workspace tests without running them, so a test that fails on `main` still surfaces first in the next queued PR's `test` lane.
+
+Before merging advisory fixes, do the queue's job by hand:
+
+1. Cut a local branch from the current `origin/main`.
+2. Merge the head of every pending advisory fork onto it.
+3. Run `./etc/ci-lanes.sh all` on the combined tip.
+4. Only once that passes, merge the advisories.
+
+Or publish the advisory and route the fix through the queue as an ordinary pull request.
+What broke `main` on 2026-10-29 was four separately forked fixes meeting for the first time there.
+
 ### Repository settings this requires
 
 The workflow changes are not enough on their own.
@@ -86,12 +117,10 @@ In order of importance:
    `verify-on-chain`, which is a job inside `pr.yaml` that `CI Success` already depends on.
    GitHub matches a required check by name, so a job called `CI Success` in any workflow
    would satisfy it; keep the name unique to `pr.yaml`.
-2. **Merge queue.** Merge method `SQUASH` (already set). Recommended, and not yet set: a
-   build concurrency of **2** (the ruleset has 5): each group runs seven jobs, so five
-   groups is about 35 concurrent jobs queueing behind the organization's runner
-   concurrency. And a status check timeout of **90 minutes** (it is 60): it counts from
-   the group's creation, runner backlog included, so 60 can eject a lane that took 45
-   after queueing for 15.
+2. **Merge queue.** Merge method `SQUASH` (already set).
+   Recommended, and not yet set: a build concurrency of **2** (the ruleset has 5).
+   `pr.yaml` reports twelve jobs, counting `CI Success` and the reusable transport workflow's `transport-evidence / qualify`, and eleven of them run in a merge group, where `verify-on-chain` is skipped; five groups is about 55 concurrent jobs queueing behind the organization's runner concurrency.
+   And a status check timeout of **90 minutes** (it is 60): it counts from the group's creation, runner backlog included, so 60 can eject a lane that took 45 after queueing for 15.
 3. **Pull request rule.** One approval is required. *Dismiss stale pull request approvals
    when new commits are pushed* (already set) is, together with (1), what makes a late push
    cost a re-approval. *Require review from Code Owners* (`require_code_owner_review`) is
@@ -143,44 +172,41 @@ That includes the tool configuration: `[profile.ci]` in `.config/nextest.toml` i
 The admin role can bypass the `main` ruleset, and with it both the approval and `CI Success`.
 All four code owners hold that role, so the code-owner review is a check on everyone but them: any one of the four can land a change to the gate that no second owner has read, and so can every other account with admin on the repository (Settings -> Collaborators and teams), code owner or not.
 The bypass mode is *Always allow*, which also lets an admin push to `main` with no pull request at all; *For pull requests only* would keep the escape hatch in item 6 and leave a pull request behind every bypass.
+An advisory merge is a second route around the ruleset: GitHub enforces no branch protection when a security advisory's fix is merged, so it needs neither the approval nor `CI Success` ("Where the coverage gap is" above).
+Nothing stops either route beforehand.
+*Main compiles* runs on every push to `main`, so it catches a commit from either route that breaks the build, after the fact.
 
 ## Caches
 
 `main` is the only writer of the cache entries the lanes restore.
-`.github/workflows/cache-deps.yaml` runs there and saves two entries: `clippy-cache` (dependencies for both clippy passes under the nightly pin) and `test-cache` (dependencies for both test lanes, default and adiri features, under the stable pin). `Swatinem/rust-cache` does not save the workspace crates or their test binaries, so each PR still builds those from its own source.
+`.github/workflows/cache-deps.yaml` runs there and saves two entries: `clippy-cache` (dependencies for all three clippy passes, every target included, under the nightly pin) and `test-cache` (dependencies for both test lanes, default and adiri features, under the stable pin).
+`Swatinem/rust-cache` does not save the workspace crates or their test binaries, so each PR still builds those from its own source.
 The lanes in `pr.yaml` restore those and never save (`save-if: "false"`): a cache saved by a `pull_request` run is scoped to that PR's branch and one saved by a `merge_group` run lands on the queue's throwaway branch, so nothing else could ever read them, while the upload adds minutes to the critical path and eats quota that evicts the entries the queue does read.
+`main-compiles.yaml` restores the same two entries and never saves either, although it runs on `main` and could: it is outside the `cache-deps` concurrency group, so on a `Cargo.lock` push it would race the warm to save the same key, and `cache-deps.yaml` stays the single writer.
+Six workflows name `clippy-cache`: `cache-deps.yaml` writes it, and `pr.yaml`, `main-compiles.yaml`, `quic-observations.yaml`, `consensus-liveness.yaml` and `committee-convergence.yaml` restore it.
+The last three set `env:` blocks that differ from the warm's, and those variables are hashed into the key (below), so their restores miss.
 The rust-cache step in `quic-interop.yaml` keys its own `quic-<release>` entries and saves them only on `main` (`save-if: ${{ github.ref == 'refs/heads/main' }}`, so the weekly schedule or a dispatch there), for the same reason.
 
 A warm runs on a push to `main` that touches a `Cargo.toml`, `Cargo.lock`, `rust-toolchain.toml`, `rust-nightly`, `.cargo/config.toml`, `etc/ci-lanes.sh` or the workflow itself; on a schedule twice a week (GitHub deletes an entry not accessed for seven days, and a quiet week would otherwise leave the queue cold); and by hand from the Actions tab (*Warm dependency cache* -> *Run workflow*).
 When the entry already matches, the run restores it, rebuilds only the workspace crates, saves nothing, and is done in a few minutes.
 
-All seven cache steps (two in `cache-deps.yaml`, three in `pr.yaml`, one in `durable-e2e.yaml`, one in `quic-interop.yaml`) pin the same `Swatinem/rust-cache` release.
+All seventeen cache steps pin the same `Swatinem/rust-cache` release: two in `cache-deps.yaml`, three in `pr.yaml`, two in `main-compiles.yaml`, three in `quic-observations.yaml`, two each in `consensus-liveness.yaml` and `committee-convergence.yaml`, and one each in `durable-e2e.yaml`, `sigkill-recovery.yaml` and `quic-interop.yaml`.
 Three of its properties shape all of this.
 They were checked against v2.9.2, and a later release can change them; the third is about a release that changes the key:
 
-- The key is `<prefix-key>-<shared-key>-<os>-<arch>-<env hash>-<hash of relevant Cargo
-  manifests, lockfiles and toolchain/config files>`, so the two entries start with
-  `v1-rust-clippy-cache-Linux-x64-` and `v1-rust-test-cache-Linux-x64-`. The env hash
-  covers `rustc -vV` of every toolchain that `rustup toolchain list` reports, and every
-  variable whose name starts with `CARGO`, `CC`, `CFLAGS`, `CXX`, `CMAKE` or `RUST` and
-  whose value is non-empty. So the `env:` block and the steps before the cache step,
-  including every step that installs a toolchain, must be identical in `cache-deps.yaml`
-  and `pr.yaml`; they are, and both files say so. The clippy jobs hash seven variables
-  (the six in `env:` plus `RUST_NIGHTLY`, written to `GITHUB_ENV` before the cache step);
-  the test jobs hash six. The toolchains hashed are the stable Rust preinstalled on the
-  runner image, the stable pinned in `rust-toolchain.toml`, and in the clippy jobs the
-  pinned nightly. Each cache step prints what it computed in its "Cache Configuration"
-  log group: Restore Key, Cache Key, and the environment considered, which includes a
-  "Rust Versions:" list of every toolchain it hashed. When a restore misses, compare that
-  group between the two workflows first.
-- Entries are immutable, and an exact key hit skips the save. So changing *what* a warm job
-  builds (a lane added, a feature set changed) writes nothing until the key changes: bump
-  `prefix-key` in both workflows, in the same pull request; the next bullet says why not
-  `cache-deps.yaml` first. (Or delete the entries under Settings -> Actions -> Caches and
-  re-run the warm.) Both workflows now use `prefix-key: v1-rust`. Entries under an older
-  key, `v0-rust-clippy-cache-*` and `v0-rust-test-cache-*` from before `v1-rust` and
-  rust-cache v2.7.7's with no `x64` after `Linux-`, are superseded generations, which the
-  `prune-caches` job (below) deletes.
+- The key is `<prefix-key>-<shared-key>-<os>-<arch>-<env hash>-<hash of relevant Cargo manifests, lockfiles and toolchain/config files>`, so the two entries start with `v2-rust-clippy-cache-Linux-x64-` and `v1-rust-test-cache-Linux-x64-`.
+  The env hash covers `rustc -vV` of every toolchain that `rustup toolchain list` reports, and every variable whose name starts with `CARGO`, `CC`, `CFLAGS`, `CXX`, `CMAKE` or `RUST` and whose value is non-empty.
+  So the `env:` block and the steps before the cache step, including every step that installs a toolchain, must be identical in `cache-deps.yaml`, `pr.yaml` and `main-compiles.yaml`; they are, and all three files say so.
+  The clippy jobs hash seven variables (the six in `env:` plus `RUST_NIGHTLY`, written to `GITHUB_ENV` before the cache step); the test jobs hash six.
+  The toolchains hashed are the stable Rust preinstalled on the runner image, the stable pinned in `rust-toolchain.toml`, and in the clippy jobs the pinned nightly.
+  Each cache step prints what it computed in its "Cache Configuration" log group: Restore Key, Cache Key, and the environment considered, which includes a "Rust Versions:" list of every toolchain it hashed.
+  When a restore misses, start by comparing that group in the warm's log with the one in the run that missed.
+- Entries are immutable, and an exact key hit skips the save.
+  So changing *what* a warm job builds (a lane added, a feature set changed) writes nothing until the key changes: bump that entry's `prefix-key` in every workflow that names its shared key, in the same pull request; the next bullet says why not `cache-deps.yaml` first.
+  (Or delete the entries under Settings -> Actions -> Caches and re-run the warm.)
+  The prefix-key is per entry: `clippy-cache` is on `v2-rust`, bumped when the clippy lane began compiling every target, and `test-cache` is on `v1-rust`.
+  `durable-e2e.yaml` and `sigkill-recovery.yaml` set no prefix-key, so their `durable-e2e-cache` entries carry rust-cache's default, `v0-rust`.
+  Entries under an older key are superseded generations, which the `prune-caches` job (below) deletes: `v1-rust-clippy-cache-*` from before that bump, and `v0-rust-clippy-cache-*` and `v0-rust-test-cache-*` from before `v1-rust` and rust-cache v2.7.7's with no `x64` after `Linux-`.
 - How the key is computed belongs to the release, so a `Swatinem/rust-cache` release that
   changes it is a change of key like any other. Whoever reviews a rust-cache bump reads
   the release notes of every release it covers for anything about the key, hashing or
@@ -199,6 +225,7 @@ They were checked against v2.9.2, and a later release can change them; the third
 
 Warm timings measured on `main`: the `--all-features` clippy pass compiles in about 20 s, all workspace test binaries build in 1 m 48 s, checkout with submodules takes about 80 s and the restore about 20 s.
 After a heavy dependency bump, with only a partial cache to fall back on, clippy took 11.5 min and the test build 9.5 min.
+Every clippy figure in this paragraph, the cold one included, was measured when the lane compiled libraries only, before it gained `--all-targets` and its third pass; until the three-pass lane is timed, read them as lower bounds.
 The lane ceilings in `pr.yaml` (`timeout-minutes: 45`) are set from the second set of numbers, not the first; a lane anywhere near 45 minutes means the cache is broken.
 The lanes have been timed from a cold cache once, on 2026-09-30, with every restore missing: `clippy` took 10.5 min, `test` 14 min and `adiri-test` 12 min, start to finish, tests included.
 The warm of 2026-08-28, whose test cache step restored nothing, built the test binaries of both lanes in about 15 minutes.
@@ -220,7 +247,7 @@ When GitHub updates the image to a new Rust release (roughly every six weeks, pl
 A missed restore whose "Rust Versions:" list shows a new stable is the sign.
 When it happens, dispatch a warm by hand (*Warm dependency cache* -> *Run workflow*); until that warm has finished, the lanes build cold.
 While the rollout lasts, the warm can itself land on an old image, which its own "Rust Versions:" list shows, and then it has to be dispatched again.
-The alternative, making the installed set deterministic by removing the image's own toolchain before each of the six cache steps, in lockstep, was considered and not adopted; it is untested on a runner.
+The alternative, making the installed set deterministic by removing the image's own toolchain before every cache step, in lockstep, was considered and not adopted; it is untested on a runner.
 
 ## Action pins
 
