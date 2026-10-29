@@ -88,26 +88,34 @@ lane_fmt() {
 }
 
 lane_clippy() {
-    # Three passes, because none of them compiles what the others do.
+    # Two passes, because neither compiles what the other does.
     #
-    # 1. Libraries and binaries under default features: the release's own configuration.
-    #    With --all-targets cargo unifies dev-dependency features into the library build
-    #    (eight crates enable tn-storage/test-utils from [dev-dependencies]; see
-    #    crates/state-sync/Cargo.toml), so this is the one pass that still compiles each
-    #    library the way the release does. Code that builds only because a test helper
-    #    feature happened to be on fails here.
-    # 2. --all-targets under default features: every lib, bin, test, bench and example
-    #    target, so test code is compiled and linted too. Before this pass existed the lane
-    #    built libraries only, and test code that did not compile reached main
-    #    (2026-10-29).
-    # 3. --all-targets --all-features: the feature-gated code, which the default graph never
-    #    compiles, plus the targets that require a feature. crates/tn-reth's output_overlay
-    #    bench needs `bench-internals`, and no lane compiled it before. The default passes
-    #    in turn are the only ones that compile a `#[cfg(not(feature = ...))]` arm.
-    run cargo "+${NIGHTLY}" clippy --locked --workspace -- -D warnings
-    run cargo "+${NIGHTLY}" clippy --locked --workspace --all-targets -- -D warnings
+    # 1. The release graph: the packages of the three shipped binaries, libraries and
+    #    binaries only, under default features and with no dev-dependencies. `--workspace`
+    #    cannot stand in for it. e2e-tests, tn-test-utils and tn-test-utils-committee are
+    #    workspace members with normal dependencies on tn-types/test-utils and
+    #    tn-reth/test-utils, so any workspace build unifies `test-utils` into tn-types,
+    #    tn-reth, tn-config and telcoin-network-cli. The three packages alone turn no
+    #    `test-utils` feature on (the only extras their union adds are reqwest/json and
+    #    hyper-util/server-graceful), so this pass compiles each crate the way the release
+    #    does, and it is the only compile of the `#[cfg(not(feature = "test-utils"))]` arms
+    #    in tn-types. No lane compiled that graph before this pass (2026-10-29).
+    # 2. --workspace --all-targets --all-features: every lib, bin, test, bench and example
+    #    target and every positive feature arm, so test code is compiled and linted too.
+    #    When the lane built libraries only, test code that did not compile reached main
+    #    (2026-10-29). crates/tn-reth's output_overlay bench needs `bench-internals`, and
+    #    no lane compiled it before.
+    #
+    # Neither pass lints code that compiles only under default features outside the release
+    # graph, test code and its `#[cfg(not(feature = ...))]` arms included. lane_test_default
+    # compiles it under the same RUSTFLAGS wherever it runs (the merge queue, and pull
+    # requests that are neither drafts nor a maintainer's), and the attested run compiles
+    # it before a maintainer's PR can be queued. A third pass, --all-targets under default
+    # features, compiled exactly the targets nextest compiles under the same feature
+    # resolution, and was dropped for that reason.
+    run cargo "+${NIGHTLY}" clippy --locked -p telcoin-network -p tn-worker-gateway -p tn-node-record-api -- -D warnings
     run cargo "+${NIGHTLY}" clippy --locked --workspace --all-targets --all-features -- -D warnings
-    echo "clippy for workspace passed: default libs, default all targets, all features all targets"
+    echo "clippy passed: release graph, workspace all targets with all features"
 }
 
 lane_test_default() {

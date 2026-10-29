@@ -293,20 +293,21 @@ jobs:
 
   # Clippy - replaces cargo check, catches more issues.
   #
-  # Three passes: libraries and binaries under default features, every target under
-  # default features, and every target under --all-features (etc/ci-lanes.sh says what each
-  # compiles that the others do not). Every target means tests, benches and examples too,
-  # so this is the lane that compiles test code in CI, and like fmt it runs for every
-  # author on both events, drafts included. The passes unify features differently, so each
-  # compiles its own artifacts; cache-deps.yaml warms all three.
+  # Two passes: the release graph (the packages of the three shipped binaries, default
+  # features, no dev-dependencies) and every target under --all-features (etc/ci-lanes.sh
+  # says what each compiles that the other does not). Every target means tests, benches
+  # and examples too, so this is the lane that compiles test code in CI, and like fmt it
+  # runs for every author on both events, drafts included. The passes unify features
+  # differently, so each compiles its own artifacts; cache-deps.yaml warms both.
   #
-  # 45 minutes is a ceiling, not the budget. The timings here were measured when the lane
-  # compiled libraries only, and the three-pass lane has not been timed yet. Warm, the
-  # library-only --all-features pass compiled in 20 s on main (checkout with submodules
-  # ~80 s, restore ~20 s). The ceiling covers the window after a heavy dependency bump
-  # before cache-deps has re-warmed: 11.5 min measured for one library-only pass with a
-  # partial cache. A lane anywhere near 45 min means the cache is broken, not that the build
-  # is slow.
+  # 45 minutes is a ceiling, not the budget. Cold, the three-pass lane this replaced
+  # compiled for 16.5 min (7m32s, 1m15s and 7m19s; librocksdb-sys under --all-features is
+  # the long pole), and the two-pass lane has not been timed in CI yet. The warm figures
+  # were measured when the lane compiled libraries only: the --all-features pass compiled
+  # in 20 s on main (checkout with submodules ~80 s, restore ~20 s). The ceiling covers the
+  # window after a heavy dependency bump before cache-deps has re-warmed: 11.5 min measured
+  # for one library-only pass with a partial cache. A lane anywhere near 45 min means the
+  # cache is broken, not that the build is slow.
   clippy:
     runs-on: ubuntu-latest
     timeout-minutes: 45

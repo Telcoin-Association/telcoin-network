@@ -89,7 +89,7 @@ The nightly `durable-e2e` failed the same way.
 From then on every queued PR failed its `test` lane on `main + PR`, whatever it changed.
 
 `.github/workflows/main-compiles.yaml` (*Main compiles*) is the tripwire for that.
-On every push to `main` it runs `fmt` and the three `clippy` passes, builds the test binaries of both test lanes under the stable pin that builds releases, and runs the library tests of the two carried patch crates.
+On every push to `main` it runs `fmt` and both `clippy` passes, builds the test binaries of both test lanes under the stable pin that builds releases, and runs the library tests of the two carried patch crates.
 It cannot block anything.
 No check can gate an advisory merge, so it is not a required check, and it reports only once the commit is on `main`: a failed run shows on `main`'s commit list and emails the account that pushed, and nobody else.
 It compiles the workspace tests without running them, so a test that fails on `main` still surfaces first in the next queued PR's `test` lane.
@@ -179,7 +179,7 @@ Nothing stops either route beforehand.
 ## Caches
 
 `main` is the only writer of the cache entries the lanes restore.
-`.github/workflows/cache-deps.yaml` runs there and saves two entries: `clippy-cache` (dependencies for all three clippy passes, every target included, under the nightly pin) and `test-cache` (dependencies for both test lanes, default and adiri features, under the stable pin).
+`.github/workflows/cache-deps.yaml` runs there and saves two entries: `clippy-cache` (dependencies for both clippy passes, the release graph and every target under `--all-features`, under the nightly pin) and `test-cache` (dependencies for both test lanes, default and adiri features, under the stable pin).
 `Swatinem/rust-cache` does not save the workspace crates or their test binaries, so each PR still builds those from its own source.
 The lanes in `pr.yaml` restore those and never save (`save-if: "false"`): a cache saved by a `pull_request` run is scoped to that PR's branch and one saved by a `merge_group` run lands on the queue's throwaway branch, so nothing else could ever read them, while the upload adds minutes to the critical path and eats quota that evicts the entries the queue does read.
 `main-compiles.yaml` restores the same two entries and never saves either, although it runs on `main` and could: it is outside the `cache-deps` concurrency group, so on a `Cargo.lock` push it would race the warm to save the same key, and `cache-deps.yaml` stays the single writer.
@@ -205,7 +205,7 @@ They were checked against v2.9.2, and a later release can change them; the third
 - Entries are immutable, and an exact key hit skips the save.
   So changing *what* a warm job builds (a lane added, a feature set changed) writes nothing until the key changes: bump that entry's `prefix-key` in every workflow that names its shared key, in the same pull request; the next bullet says why not `cache-deps.yaml` first.
   (Or delete the entries under Settings -> Actions -> Caches and re-run the warm.)
-  The prefix-key is per entry: `clippy-cache` is on `v2-rust`, bumped when the clippy lane began compiling every target, and `test-cache` is on `v1-rust`.
+  The prefix-key is per entry: `clippy-cache` is on `v2-rust`, bumped when the clippy lane's two library-only passes became the release-graph pass and the all-targets `--all-features` pass, and `test-cache` is on `v1-rust`.
   `durable-e2e.yaml` and `sigkill-recovery.yaml` set no prefix-key, so their `durable-e2e-cache` entries carry rust-cache's default, `v0-rust`.
   Entries under an older key are superseded generations, which the `prune-caches` job (below) deletes: `v1-rust-clippy-cache-*` from before that bump, and `v0-rust-clippy-cache-*` and `v0-rust-test-cache-*` from before `v1-rust` and rust-cache v2.7.7's with no `x64` after `Linux-`.
 - How the key is computed belongs to the release, so a `Swatinem/rust-cache` release that
@@ -226,9 +226,10 @@ They were checked against v2.9.2, and a later release can change them; the third
 
 Warm timings measured on `main`: the `--all-features` clippy pass compiles in about 20 s, all workspace test binaries build in 1 m 48 s, checkout with submodules takes about 80 s and the restore about 20 s.
 After a heavy dependency bump, with only a partial cache to fall back on, clippy took 11.5 min and the test build 9.5 min.
-Every clippy figure in this paragraph, the cold one included, was measured when the lane compiled libraries only, before it gained `--all-targets` and its third pass; until the three-pass lane is timed, read them as lower bounds.
+Those clippy figures, and the 2026-09-30 cold one below, were measured when the lane compiled libraries only, before it gained `--all-targets`; until the two-pass lane is timed, read them as lower bounds.
 The lane ceilings in `pr.yaml` (`timeout-minutes: 45`) are set from the second set of numbers, not the first; a lane anywhere near 45 minutes means the cache is broken.
 The lanes have been timed from a cold cache once, on 2026-09-30, with every restore missing: `clippy` took 10.5 min, `test` 14 min and `adiri-test` 12 min, start to finish, tests included.
+The clippy lane has been timed cold once since, in the three-pass form that came before the current two passes: it compiled for 16.5 min (7m32s, 1m15s and 7m19s; `librocksdb-sys` under `--all-features` is the long pole).
 The warm of 2026-08-28, whose test cache step restored nothing, built the test binaries of both lanes in about 15 minutes.
 Each `Cargo.lock` change on `main` writes a new generation of every entry, and GitHub would keep the previous one until it went 7 days without a restore, or evict the least recently used entries once the total passed the quota, which can take a live one with it.
 The `prune-caches` job in `cache-deps.yaml` deletes those superseded generations of the three entries after every successful warm on `main`.

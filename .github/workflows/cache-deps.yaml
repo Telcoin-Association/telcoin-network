@@ -13,9 +13,9 @@
 #
 # Two warm jobs, two entries, one per toolchain pr.yaml uses:
 #
-#   clippy-cache  all three clippy passes (etc/ci-lanes.sh), every target included, under
-#                 the nightly pin; read by pr.yaml's `clippy` job and main-compiles.yaml's
-#                 `fmt-clippy`
+#   clippy-cache  both clippy passes (etc/ci-lanes.sh), the release graph and every target
+#                 under --all-features, under the nightly pin; read by pr.yaml's `clippy`
+#                 job and main-compiles.yaml's `fmt-clippy`
 #   test-cache    dependencies for both test lanes (default and adiri features) under
 #                 the stable pin; read by pr.yaml's `test` and `adiri-test` and by
 #                 main-compiles.yaml's `build-tests`. Workspace test binaries are rebuilt
@@ -52,9 +52,10 @@
 # builds (a lane added, a feature set changed) is therefore never written while the key
 # stays the same: bump that entry's `prefix-key` here and in every workflow that names
 # its shared-key, in the same pull request (or delete the entries under Settings >
-# Actions > Caches). clippy-cache moved from v1-rust to v2-rust when the clippy lane began
-# compiling every target; its v1-rust-clippy-cache-* entries are a superseded generation,
-# which prune-caches deletes.
+# Actions > Caches). clippy-cache moved from v1-rust to v2-rust when the clippy lane's two
+# library-only passes became the release-graph pass and the all-targets --all-features
+# pass; its v1-rust-clippy-cache-* entries are a superseded generation, which prune-caches
+# deletes.
 #
 # A rust-cache release that changes how the key is computed is a change of key too, and
 # moves the same way, here, in pr.yaml and in main-compiles.yaml together. The merge queue
@@ -119,9 +120,9 @@ jobs:
   # `fmt-clippy` job.
   warm-clippy-cache:
     runs-on: ubuntu-latest
-    # All three passes from cold, after a heavy dependency bump or a prefix-key bump. One
-    # library-only pass took 11.5 min with a partial cache; the three-pass lane has not
-    # been timed.
+    # Both passes from cold, after a heavy dependency bump or a prefix-key bump. The
+    # three-pass lane this replaced took 16.5 min cold, and one library-only pass 11.5 min
+    # with a partial cache; the two-pass lane has not been timed in CI.
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -143,7 +144,7 @@ jobs:
           shared-key: clippy-cache
 
       # The same lane the queue runs, so the same artifacts.
-      - name: Build all three clippy passes
+      - name: Build both clippy passes
         run: ./etc/ci-lanes.sh clippy
 
   # Steps up to the cache step mirror pr.yaml's `test` and `adiri-test` jobs and

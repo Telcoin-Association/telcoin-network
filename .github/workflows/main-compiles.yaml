@@ -26,8 +26,8 @@
 #
 # The jobs compile what the queue compiles, through etc/ci-lanes.sh:
 #
-#   fmt-clippy       fmt and the three clippy passes, every target included, under the
-#                    nightly pin
+#   fmt-clippy       fmt and both clippy passes, the release graph and every target under
+#                    --all-features, under the nightly pin
 #   build-tests      both test lanes with `--build-only`, under the stable pin that builds
 #                    releases: the same build of the workspace test binaries that failed in
 #                    cache-deps.yaml and durable-e2e.yaml on 2026-10-29
@@ -72,7 +72,7 @@ env:
 jobs:
   # Steps up to and including the cache step are pr.yaml's `clippy` job, byte for byte.
   # 90 minutes because the first run after a clippy-cache prefix-key bump finds no entry
-  # and compiles all three passes cold.
+  # and compiles both passes cold.
   fmt-clippy:
     runs-on: ubuntu-latest
     timeout-minutes: 90
