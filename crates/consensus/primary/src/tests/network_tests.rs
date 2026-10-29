@@ -3775,18 +3775,19 @@ fn test_order_probe_peers_puts_last_server_first() {
     );
 }
 
-/// Both probe loops open the last peer that served first, failed and unsupported probes leave the
-/// preference in place, and a preferred peer that already failed this epoch is opened after every
-/// fresh peer.
+/// Both probe loops open the last peer that served first. A probe of that peer that does not
+/// serve (`Failed` or `Unsupported`) drops the preference, another peer's failed probe does not,
+/// and a preferred peer that already failed this epoch is opened after every fresh peer.
 #[tokio::test]
 async fn test_probe_loops_open_last_server_first() {
     let (peers, chain, _temp_dir) = sync_probe_peers_and_chain().await;
     let record = EpochRecord::default();
 
-    // four peers refuse the protocol (`Unsupported`) and the rest time out (`Failed`); neither
-    // outcome may move the preference
+    // four peers refuse the protocol (`Unsupported`) and the rest time out (`Failed`)
     let unsupported: HashSet<_> = peers[..4].iter().copied().collect();
-    let (handle, opened) = spawn_scripted_swarm(peers.clone(), unsupported);
+    let (handle, opened) = spawn_scripted_swarm(peers.clone(), unsupported.clone());
+
+    // pack walk: the preferred peer is opened first, times out and loses the preference
     handle.record_sync_served(peers[9]);
     let result = handle.request_epoch_pack(&record, &record, &chain, Duration::from_secs(10));
     assert!(result.await.is_err(), "no peer serves, so the pack fetch must fail");
@@ -3795,12 +3796,14 @@ async fn test_probe_loops_open_last_server_first() {
     assert_eq!(opens[0], peers[9], "the pack fetch must open the last server first");
     assert_eq!(
         *handle.last_sync_server.lock(),
-        Some(peers[9]),
-        "failed and unsupported probes must not move the preference"
+        None,
+        "a failed pack probe of the preferred peer must drop the preference"
     );
 
-    // the four unsupported peers are now cached unsyncable and skipped; every other peer failed
-    // epoch 0 above, and the preferred peer leads that group
+    // output walk: serving again restores the preference and clears its epoch-0 failure; the
+    // four unsupported peers are now cached unsyncable and skipped, and every other peer failed
+    // epoch 0 above, so the preferred peer is the only fresh one
+    handle.record_sync_served(peers[9]);
     let result = handle.request_consensus_output(1, &chain, ConsensusHeaderDigest::default()).await;
     assert!(result.is_err(), "no peer serves, so the output fetch must fail");
     let opens = std::mem::take(&mut *opened.lock());
@@ -3808,8 +3811,51 @@ async fn test_probe_loops_open_last_server_first() {
     assert_eq!(opens[0], peers[9], "the output fetch must open the last server first");
     assert_eq!(
         *handle.last_sync_server.lock(),
-        Some(peers[9]),
-        "failed probes must not move the preference"
+        None,
+        "a failed output probe of the preferred peer must drop the preference"
+    );
+
+    // other peers' failed probes leave a preference for a key that is not connected in place
+    let stranger = *BlsKeypair::generate(&mut StdRng::from_seed([9; 32])).public();
+    assert!(!peers.contains(&stranger), "the stranger must not be a connected peer");
+    handle.record_sync_served(stranger);
+    let result = handle.request_epoch_pack(&record, &record, &chain, Duration::from_secs(10));
+    assert!(result.await.is_err(), "no peer serves, so the pack fetch must fail");
+    let result = handle.request_consensus_output(1, &chain, ConsensusHeaderDigest::default()).await;
+    assert!(result.is_err(), "no peer serves, so the output fetch must fail");
+    let opens = std::mem::take(&mut *opened.lock());
+    assert_eq!(opens.len(), 24, "each walk must open the twelve sync-capable peers");
+    assert!(!opens.contains(&stranger), "a key that is not connected must never be opened");
+    assert_eq!(
+        *handle.last_sync_server.lock(),
+        Some(stranger),
+        "other peers' failed probes must not move the preference"
+    );
+
+    // an `Unsupported` probe of the preferred peer drops the preference on both walks. The output
+    // walk runs first on a fresh swarm, so no pack walk has cached the peer unsyncable yet.
+    let (handle, opened) = spawn_scripted_swarm(peers.clone(), unsupported);
+    handle.record_sync_served(peers[0]);
+    let result = handle.request_consensus_output(1, &chain, ConsensusHeaderDigest::default()).await;
+    assert!(result.is_err(), "no peer serves, so the output fetch must fail");
+    let opens = std::mem::take(&mut *opened.lock());
+    assert_eq!(opens.len(), 16, "the output fetch must open one stream to every peer");
+    assert_eq!(opens[0], peers[0], "the output fetch must open the last server first");
+    assert_eq!(
+        *handle.last_sync_server.lock(),
+        None,
+        "an unsupported output probe of the preferred peer must drop the preference"
+    );
+    handle.record_sync_served(peers[0]);
+    let result = handle.request_epoch_pack(&record, &record, &chain, Duration::from_secs(10));
+    assert!(result.await.is_err(), "no peer serves, so the pack fetch must fail");
+    let opens = std::mem::take(&mut *opened.lock());
+    assert_eq!(opens.len(), 16, "the pack fetch must open one stream to every peer");
+    assert_eq!(opens[0], peers[0], "the pack fetch must open the last server first");
+    assert_eq!(
+        *handle.last_sync_server.lock(),
+        None,
+        "an unsupported pack probe of the preferred peer must drop the preference"
     );
 
     // a preferred peer that already failed this epoch goes behind every fresh peer
