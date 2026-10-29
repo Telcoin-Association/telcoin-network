@@ -700,7 +700,14 @@ where
         // name, so the peer-exchange map no longer has to ride inside the consensus
         // request enums. The embedded variants remain as the fallback for
         // not-yet-upgraded peers until the coordinated `/0.0.2` bump.
-        let px_codec = PeerExchangeCodec::new(network_config.libp2p_config().max_rpc_message_size);
+        // A goodbye carries at most a capped map (`MAX_PEER_EXCHANGE_MESSAGE_SIZE`), so the
+        // exchange codec never commits the full RPC budget to one stream.
+        let px_codec = PeerExchangeCodec::new(
+            network_config
+                .libp2p_config()
+                .max_rpc_message_size
+                .min(peers::MAX_PEER_EXCHANGE_MESSAGE_SIZE),
+        );
         let peer_exchange = request_response::Behaviour::with_codec(
             px_codec,
             vec![(network_type.peer_exchange_protocol(chain_id)?, ProtocolSupport::Full)],
@@ -2408,9 +2415,21 @@ where
                 }
             }
             ReqResEvent::InboundFailure { peer, request_id, error, connection_id: _ } => {
-                // never penalized: the exchange is best-effort and both sides
-                // disconnect afterwards regardless
                 debug!(target: "network", ?peer, ?request_id, ?error, "Inbound failure for peer exchange");
+                // A frame the codec rejects (bad prefix, bad snappy, bad BCS, or a map over
+                // the entry or address caps) is a protocol violation, charged like the same
+                // violation on the consensus req-res protocol. Everything else is a transport
+                // flap or honest version skew: the exchange is best-effort and both sides
+                // disconnect afterwards regardless.
+                if matches!(&error, ReqResInboundFailure::Io(e) if e.kind() == ErrorKind::InvalidData)
+                {
+                    bounded_warn!(Request,
+                        target: "network",
+                        ?peer, ?request_id,
+                        "malformed peer exchange (codec violation)"
+                    );
+                    self.swarm.behaviour_mut().peer_manager.process_penalty(peer, Penalty::Medium);
+                }
             }
             ReqResEvent::ResponseSent { peer, .. } => {
                 trace!(target: "network", ?peer, "peer exchange ack sent");
