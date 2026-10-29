@@ -5438,9 +5438,11 @@ fn historical_epoch_replay_never_charges_the_author() {
                 RejectPenalty::Skip
             );
         });
+        let expected =
+            if relayer_resolved { RejectPenalty::FatalRelayer } else { RejectPenalty::Skip };
         assert_eq!(
-            RejectReason::TooLarge.penalty(true, relayer_resolved, EpochPosition::Historical),
-            RejectPenalty::FatalRelayer
+            RejectReason::TooLarge.penalty(relayer_resolved, true, EpochPosition::Historical),
+            expected
         );
     });
 }
@@ -5513,11 +5515,17 @@ async fn live_epoch_still_bans_unauthorized_author() -> eyre::Result<()> {
 #[test]
 fn oversized_reject_penalizes_only_a_resolved_relayer() {
     for author_resolved in [true, false] {
-        assert_eq!(
-            RejectReason::TooLarge.penalty(true, author_resolved),
-            RejectPenalty::FatalRelayer
-        );
-        assert_eq!(RejectReason::TooLarge.penalty(false, author_resolved), RejectPenalty::Skip);
+        // the size bound is protocol wide, so the charge does not depend on the epoch position
+        for position in [EpochPosition::Live, EpochPosition::Historical] {
+            assert_eq!(
+                RejectReason::TooLarge.penalty(true, author_resolved, position),
+                RejectPenalty::FatalRelayer
+            );
+            assert_eq!(
+                RejectReason::TooLarge.penalty(false, author_resolved, position),
+                RejectPenalty::Skip
+            );
+        }
     }
 }
 
