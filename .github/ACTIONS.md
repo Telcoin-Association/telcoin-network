@@ -9,7 +9,7 @@ The `verify-on-chain` lane in `.github/workflows/pr.yaml` reads that registry ba
 The lanes themselves live in **`etc/ci-lanes.sh`**, and both `test-and-attest.sh` and `pr.yaml` call it.
 That is the only reason "the queue runs what was attested" is a fact rather than a hope: when the two spelled out their own commands, they had already drifted (CI ran clippy under `--all-features` only, and excluded a package deleted long ago).
 Edit a lane there and both callers change together.
-Two more callers run on `main`: `cache-deps.yaml` compiles the lanes to warm the caches the queue restores (see "Caches"), and `main-compiles.yaml` compiles them after every push to `main`, as a tripwire for commits that never went through the queue (see "Where the coverage gap is").
+Two more callers run on `main`: `cache-deps.yaml` compiles the lanes to warm the caches the queue restores (see "Caches"), and `main-compiles.yaml` compiles them after every push to `main` that the merge queue did not make, as a tripwire for commits that never went through the queue (see "Where the coverage gap is").
 The e2e suites are deliberately not in that file -- anything added to it lands in the merge queue.
 
 ## What the merge queue changes
@@ -89,10 +89,15 @@ The nightly `durable-e2e` failed the same way.
 From then on every queued PR failed its `test` lane on `main + PR`, whatever it changed.
 
 `.github/workflows/main-compiles.yaml` (*Main compiles*) is the tripwire for that.
-On every push to `main` it runs `fmt` and both `clippy` passes, builds the test binaries of both test lanes under the stable pin that builds releases, and runs the library tests of the two carried patch crates.
+On every push to `main` that the merge queue did not make, it runs `fmt` and both `clippy` passes, builds the test binaries of both test lanes under the stable pin that builds releases, and runs the library tests of the two carried patch crates.
 It cannot block anything.
 No check can gate an advisory merge, so it is not a required check, and it reports only once the commit is on `main`: a failed run shows on `main`'s commit list and emails the account that pushed, and nobody else.
 It compiles the workspace tests without running them, so a test that fails on `main` still surfaces first in the next queued PR's `test` lane.
+
+*Main compiles* skips its jobs on a push the queue made (`github.actor` is `github-merge-queue[bot]`): that push lands the very `merge_group` commit, same sha, that `pr.yaml` has just compiled and tested.
+The commit cannot tell the routes apart, since queue, advisory and admin merges are all committed by `web-flow` with one parent, but the actor can.
+A renamed bot makes the jobs run, which is the safe direction, and a dispatch from the Actions tab always runs.
+The skip trusts the queue's run, so it holds only while `CI Success` is required: if the check is removed under the escape hatch (item 6 of the settings below) and a PR still goes through the queue, its push is skipped although its `merge_group` run may have failed.
 
 Before merging advisory fixes, do the queue's job by hand:
 
@@ -174,7 +179,7 @@ All four code owners hold that role, so the code-owner review is a check on ever
 The bypass mode is *Always allow*, which also lets an admin push to `main` with no pull request at all; *For pull requests only* would keep the escape hatch in item 6 and leave a pull request behind every bypass.
 An advisory merge is a second route around the ruleset: GitHub enforces no branch protection when a security advisory's fix is merged, so it needs neither the approval nor `CI Success` ("Where the coverage gap is" above).
 Nothing stops either route beforehand.
-*Main compiles* runs on every push to `main`, so it catches a commit from either route that breaks the build, after the fact.
+*Main compiles* runs on every push to `main` that the merge queue did not make, so it catches a commit from either route that breaks the build, after the fact.
 
 ## Caches
 
@@ -182,7 +187,7 @@ Nothing stops either route beforehand.
 `.github/workflows/cache-deps.yaml` runs there and saves two entries: `clippy-cache` (dependencies for both clippy passes, the release graph and every target under `--all-features`, under the nightly pin) and `test-cache` (dependencies for both test lanes, default and adiri features, under the stable pin).
 `Swatinem/rust-cache` does not save the workspace crates or their test binaries, so each PR still builds those from its own source.
 The lanes in `pr.yaml` restore those and never save (`save-if: "false"`): a cache saved by a `pull_request` run is scoped to that PR's branch and one saved by a `merge_group` run lands on the queue's throwaway branch, so nothing else could ever read them, while the upload adds minutes to the critical path and eats quota that evicts the entries the queue does read.
-`main-compiles.yaml` restores the same two entries and never saves either, although it runs on `main` and could: it is outside the `cache-deps` concurrency group, so on a `Cargo.lock` push it would race the warm to save the same key, and `cache-deps.yaml` stays the single writer.
+`main-compiles.yaml` restores the same two entries and never saves either, although it runs on `main` and could: it is outside the `cache-deps` concurrency group, so on a `Cargo.lock` push that the queue did not make it would race the warm to save the same key, and `cache-deps.yaml` stays the single writer.
 Three workflows name `clippy-cache`: `cache-deps.yaml` writes it, and `pr.yaml` and `main-compiles.yaml` restore it.
 `test-cache` has four more readers: the `metrics` job in `quic-observations.yaml`, the `regression` job in `consensus-liveness.yaml` and both jobs in `committee-convergence.yaml`.
 All four run with `env:` blocks that differ from the warm's (`consensus-liveness.yaml` sets none), and those variables are hashed into the key (below), so their restores miss.

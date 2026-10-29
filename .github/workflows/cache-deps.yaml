@@ -9,7 +9,8 @@
 #
 # main-compiles.yaml also runs on main and could save, but it restores only, so this
 # workflow stays the single writer. It is not in the `cache-deps` concurrency group below,
-# and on a Cargo.lock push it would race a warm here to save the same key.
+# and on a Cargo.lock push that the merge queue did not make (it skips the queue's) it
+# would race a warm here to save the same key.
 #
 # Two warm jobs, two entries, one per toolchain pr.yaml uses:
 #

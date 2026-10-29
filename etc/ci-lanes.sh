@@ -16,9 +16,9 @@
 # exists only because nextest has no other way to build a lane without running it.
 #
 # A fourth, .github/workflows/main-compiles.yaml, runs fmt, clippy and both test lanes with
-# `--build-only` on every push to main. A security-advisory merge reaches main without
-# either pr.yaml event, so that workflow is what says such a commit still compiles. It
-# reports after the fact and gates nothing.
+# `--build-only` after every push to main that the merge queue did not make. A
+# security-advisory merge reaches main without either pr.yaml event, so that workflow is
+# what says such a commit still compiles. It reports after the fact and gates nothing.
 #
 # Before this file existed the two copies had already diverged: CI ran clippy only under
 # --all-features and excluded a package that no longer exists, so "CI runs what the

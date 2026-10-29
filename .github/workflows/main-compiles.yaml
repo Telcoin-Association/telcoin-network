@@ -1,5 +1,5 @@
-# Compiles main after every push: a tripwire for commits that reached main without the
-# merge queue.
+# Compiles main after every push the merge queue did not make: a tripwire for commits that
+# reached main without the queue.
 #
 # The queue (pr.yaml on `merge_group`) is what keeps main compiling, and a security
 # advisory merge goes around it. The fix for a GitHub security advisory is developed in a
@@ -18,6 +18,19 @@
 # required check, and none could stop the commit it reports on. A failed run shows as a
 # red mark on main's commit list and emails the account that pushed, and only that
 # account. An admin push that bypasses the ruleset is caught the same way.
+#
+# Every job is skipped on a push the merge queue made (`github.actor` is
+# github-merge-queue[bot]). The queue pushes the very `merge_group` commit, same sha, that
+# pr.yaml has just compiled and tested, so a run here would only repeat that one. The
+# commit cannot tell the routes apart (queue, advisory and admin merges are all committed
+# by web-flow with one parent), but the actor can: of the last 40 pushes to main as of
+# 2026-10-29, every queue merge ran as github-merge-queue[bot], and the advisory and admin
+# merges as the person who merged. A renamed bot makes the jobs run, which is the safe
+# direction, and a `workflow_dispatch` always runs, since its actor is whoever dispatched
+# it. The skip trusts the queue's run, so it holds only while `CI Success` is required: if
+# an admin removes the required check (.github/ACTIONS.md, the escape hatch) and a PR still
+# goes through the queue, its push is skipped here although its `merge_group` run may have
+# failed.
 #
 # It is a file of its own because pr.yaml must never gain a third trigger: GitHub matches
 # a required check by name on the head sha, so a `push` run there would stand in for the
@@ -40,14 +53,14 @@
 #
 # Every cache step restores and never saves (`save-if: "false"`). cache-deps.yaml stays the
 # single writer on main: this workflow is not in its `cache-deps` concurrency group, and on
-# a Cargo.lock push the two would race to save the same key. For a restore to hit, the env
-# block and every step up to and including each cache step must match cache-deps.yaml and
-# pr.yaml (cache-deps.yaml's header says why): `fmt-clippy` mirrors pr.yaml's `clippy`
-# job and `build-tests` mirrors pr.yaml's `test` job. Change them in all three files in one
-# pull request.
+# a Cargo.lock push outside the queue the two would race to save the same key. For a
+# restore to hit, the env block and every step up to and including each cache step must
+# match cache-deps.yaml and pr.yaml (cache-deps.yaml's header says why): `fmt-clippy`
+# mirrors pr.yaml's `clippy` job and `build-tests` mirrors pr.yaml's `test` job. Change
+# them in all three files in one pull request.
 #
-# No concurrency block: every push to main gets its own verdict, and a later push must not
-# cancel the run that reports on an earlier one.
+# No concurrency block: every push this workflow compiles gets its own verdict, and a later
+# push must not cancel the run that reports on an earlier one.
 name: Main compiles
 
 on:
@@ -74,6 +87,7 @@ jobs:
   # 90 minutes because the first run after a clippy-cache prefix-key bump finds no entry
   # and compiles both passes cold.
   fmt-clippy:
+    if: github.actor != 'github-merge-queue[bot]'
     runs-on: ubuntu-latest
     timeout-minutes: 90
     steps:
@@ -115,6 +129,7 @@ jobs:
   # Steps up to and including the cache step are pr.yaml's `test` job, comments aside, and
   # cache-deps.yaml's `warm-test-cache` apart from `save-if`.
   build-tests:
+    if: github.actor != 'github-merge-queue[bot]'
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
@@ -150,6 +165,7 @@ jobs:
   # The commands of pr.yaml's `connection-limits-patch` and `quinn-proto-patch` jobs, in
   # one job. No cache step, as there: main warms no entry for these crates.
   carried-patches:
+    if: github.actor != 'github-merge-queue[bot]'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
