@@ -41,6 +41,9 @@
 # every step before the cache step must match this file: the same six variables, plus
 # RUST_NIGHTLY written to GITHUB_ENV before the cache step in the clippy jobs, and the
 # same steps that install a toolchain, because the set of installed toolchains is hashed.
+# The four evidence jobs that restore test-cache (quic-observations.yaml's `metrics`,
+# consensus-liveness.yaml's `regression` and both committee-convergence.yaml jobs) must
+# hash the same six variables and the same toolchains too, with steps of their own.
 # The ubuntu-latest image brings a stable Rust of its own, which this repository does not
 # control and which differs between runners (1.99.0 and 1.99.1 were both in the fleet in
 # October 2026), so every job that restores or saves an entry removes it (`rustup
@@ -50,7 +53,7 @@
 # repository. The hashed set is then the stable pin, plus the nightly pin in the clippy
 # jobs, whichever image a job lands on. With no default toolchain left, a bare `cargo` or
 # `rustc` outside the repository fails, so every later step runs in it or names its
-# toolchain (`cargo +1.94`). Keep the three files in lockstep by hand; there is no shared
+# toolchain (`cargo +1.94`). Keep these files in lockstep by hand; there is no shared
 # definition yet. A `rust-nightly` bump changes RUST_NIGHTLY and the installed nightly, so
 # the whole key, which is why that file is in `paths` below. Each cache step prints the
 # computed key in its "Cache Configuration" log group, with a "Rust Versions:" list of

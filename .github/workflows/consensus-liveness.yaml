@@ -22,6 +22,16 @@ jobs:
   regression:
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    # cache-deps.yaml's six variables: rust-cache hashes them into the key, and this job
+    # restores the test-cache entry that cache-deps.yaml warms on main. Keep them, and the
+    # toolchains installed before the cache step, in lockstep with that file.
+    env:
+      CARGO_INCREMENTAL: 0
+      RUSTFLAGS: "-D warnings -D unused_extern_crates"
+      CARGO_TERM_COLOR: always
+      RUST_BACKTRACE: 1
+      CARGO_PROFILE_DEV_DEBUG: 0
+      CARGO_PROFILE_TEST_DEBUG: 0
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -52,8 +62,12 @@ jobs:
           import subprocess
 
           root = Path("crates/consensus/primary/src/consensus")
+          # The mutants build under this job's -D warnings, so a replacement keeps every
+          # binding, field and method it bypasses referenced: an unused one is a compile
+          # error, not a caught mutation.
           mutations = [
-              ("liveness.rs", "if self.authors.insert(author.clone()) {", "if true {", [
+              ("liveness.rs", "if self.authors.insert(author.clone()) {",
+               "if { let _ = (&self.authors, author); true } {", [
                   "quorum_timeout_deduplicates_authors_polls_and_late_arrivals",
                   "quorum_voting_power_is_unique_author_weight",
                   "quorum_round_state_is_bounded_and_recovery_skips_history",
@@ -68,10 +82,12 @@ jobs:
               ("liveness.rs", ".max(committed_round)", ".min(committed_round)", [
                   "quorum_recovered_uncommitted_authors_are_not_sampled_again",
               ]),
-              ("state.rs", "observer.record_commit();", "/* mutation: omit commit progress */", [
+              ("state.rs", "observer.record_commit();",
+               "let _ = RoundQuorumObserver::record_commit; /* mutation: omit commit progress */", [
                   "quorum_loss_and_recovery_through_consensus_driver",
               ]),
           ]
+          build = ["cargo", "nextest", "run", "--locked", "--workspace"]
           for filename, before, after, tests in mutations:
               path = root / filename
               original = path.read_text()
@@ -79,10 +95,11 @@ jobs:
                   raise RuntimeError(f"mutation anchor must occur once: {filename}: {before}")
               try:
                   path.write_text(original.replace(before, after, 1))
+                  # A compiler error is not evidence that a regression caught the mutation.
+                  subprocess.run(build + ["--no-run"], check=True)
                   for test in tests:
                       print(f"Confirming mutation is rejected by {test}", flush=True)
-                      result = subprocess.run([
-                          "cargo", "nextest", "run", "--locked", "--workspace",
+                      result = subprocess.run(build + [
                           "--no-tests=fail", "-E", f"package(tn-primary) & test({test})",
                       ], check=False)
                       # Nextest distinguishes assertion failures (100) from build errors (101).

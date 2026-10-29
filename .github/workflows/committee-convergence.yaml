@@ -21,11 +21,16 @@ jobs:
       fail-fast: false
       matrix:
         lane: [test-default, test-adiri]
+    # cache-deps.yaml's six variables: rust-cache hashes them into the key, and this job
+    # restores the test-cache entry that cache-deps.yaml warms on main. Keep them, and the
+    # toolchains installed before the cache step, in lockstep with that file.
     env:
-      CARGO_INCREMENTAL: "0"
+      CARGO_INCREMENTAL: 0
       RUSTFLAGS: "-D warnings -D unused_extern_crates"
-      CARGO_PROFILE_DEV_DEBUG: "0"
-      CARGO_PROFILE_TEST_DEBUG: "0"
+      CARGO_TERM_COLOR: always
+      RUST_BACKTRACE: 1
+      CARGO_PROFILE_DEV_DEBUG: 0
+      CARGO_PROFILE_TEST_DEBUG: 0
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
@@ -48,16 +53,24 @@ jobs:
           shared-key: test-cache
           save-if: "false"
       - name: Run existing workspace CI lane
+        # The `ci` nextest profile, as in pr.yaml's test lanes.
+        env:
+          NEXTEST_PROFILE: ci
         run: ./etc/ci-lanes.sh ${{ matrix.lane }}
 
   regressions:
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    # cache-deps.yaml's six variables: rust-cache hashes them into the key, and this job
+    # restores the test-cache entry that cache-deps.yaml warms on main. Keep them, and the
+    # toolchains installed before the cache step, in lockstep with that file.
     env:
-      CARGO_INCREMENTAL: "0"
+      CARGO_INCREMENTAL: 0
       RUSTFLAGS: "-D warnings -D unused_extern_crates"
-      CARGO_PROFILE_DEV_DEBUG: "0"
-      CARGO_PROFILE_TEST_DEBUG: "0"
+      CARGO_TERM_COLOR: always
+      RUST_BACKTRACE: 1
+      CARGO_PROFILE_DEV_DEBUG: 0
+      CARGO_PROFILE_TEST_DEBUG: 0
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:

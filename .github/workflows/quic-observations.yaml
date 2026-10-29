@@ -19,17 +19,16 @@ concurrency:
   group: quic-observations-${{ github.head_ref || github.run_id }}
   cancel-in-progress: true
 
-env:
-  CARGO_BUILD_JOBS: 2
-  CARGO_INCREMENTAL: 0
-  CARGO_PROFILE_DEV_DEBUG: 0
-  CARGO_PROFILE_TEST_DEBUG: 0
-  RUSTC_WRAPPER: ""
-
 jobs:
   observations:
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    env:
+      CARGO_BUILD_JOBS: 2
+      CARGO_INCREMENTAL: 0
+      CARGO_PROFILE_DEV_DEBUG: 0
+      CARGO_PROFILE_TEST_DEBUG: 0
+      RUSTC_WRAPPER: ""
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install pinned toolchain
@@ -39,6 +38,12 @@ jobs:
           workspaces: |
             patches/quinn-proto
             testing/quic-interop/releases/candidate
+          # Restore only. A pull_request run saves into its PR's own scope, where no other
+          # run reads it and nothing prunes it: this step had left 12 PR-scoped entries,
+          # 4 GB, with the repository's cache at 97 % of its 10 GB quota, so GitHub evicted
+          # main's warm entries to make room. Nothing warms this key on main, so the two
+          # workspaces build cold, as pr.yaml's quinn-proto-patch lane does.
+          save-if: "false"
       - name: Exercise endpoint decision sites and occupancy cleanup
         run: cargo +1.94 test --locked --manifest-path patches/quinn-proto/Cargo.toml --lib
       - name: Exercise Retry behavior and observation consumers together
@@ -58,6 +63,16 @@ jobs:
   metrics:
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    # cache-deps.yaml's six variables: rust-cache hashes them into the key, and this job
+    # restores the test-cache entry that cache-deps.yaml warms on main. Keep them, and the
+    # toolchains installed before the cache step, in lockstep with that file.
+    env:
+      CARGO_INCREMENTAL: 0
+      RUSTFLAGS: "-D warnings -D unused_extern_crates"
+      CARGO_TERM_COLOR: always
+      RUST_BACKTRACE: 1
+      CARGO_PROFILE_DEV_DEBUG: 0
+      CARGO_PROFILE_TEST_DEBUG: 0
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

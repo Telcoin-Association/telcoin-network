@@ -191,8 +191,10 @@ The lanes in `pr.yaml` restore those and never save (`save-if: "false"`): a cach
 `main-compiles.yaml` restores the same two entries and never saves either, although it runs on `main` and could: it is outside the `cache-deps` concurrency group, so on a `Cargo.lock` push that the queue did not make it would race the warm to save the same key, and `cache-deps.yaml` stays the single writer.
 Three workflows name `clippy-cache`: `cache-deps.yaml` writes it, and `pr.yaml` and `main-compiles.yaml` restore it.
 `test-cache` has four more readers: the `metrics` job in `quic-observations.yaml`, the `regression` job in `consensus-liveness.yaml` and both jobs in `committee-convergence.yaml`.
-All four run with `env:` blocks that differ from the warm's (`consensus-liveness.yaml` sets none), and those variables are hashed into the key (below), so their restores miss.
+They hash what the warm hashes, the same six `env:` variables and the same toolchains, so they restore its entry, and each says so above its `env:` block.
+Their mutation harnesses therefore build under `-D warnings` as well: every mutant is written to compile warning-free, and each harness tells a compile error from a caught mutation (a `--no-run` build before the tests, or the test's own failure markers) and fails on the former.
 The rust-cache step in `quic-interop.yaml` keys its own `quic-<release>` entries and saves them only on `main` (`save-if: ${{ github.ref == 'refs/heads/main' }}`, so the weekly schedule or a dispatch there), for the same reason.
+The `observations` job in `quic-observations.yaml` keys its own entry too and never saves it: it runs only on pull requests and by hand, and its PR-scoped entries, 12 of them and 4 GB with the cache at 97 % of its quota, were evicting `main`'s warm entries.
 
 A warm runs on a push to `main` that touches a `Cargo.toml`, `Cargo.lock`, `rust-toolchain.toml`, `rust-nightly`, `.cargo/config.toml`, `etc/ci-lanes.sh` or the workflow itself; on a schedule twice a week (GitHub deletes an entry not accessed for seven days, and a quiet week would otherwise leave the queue cold); and by hand from the Actions tab (*Warm dependency cache* -> *Run workflow*).
 When the entry already matches, the run restores it, rebuilds only the workspace crates, saves nothing, and is done in a few minutes.
@@ -204,6 +206,7 @@ They were checked against v2.9.2, and a later release can change them; the third
 - The key is `<prefix-key>-<shared-key>-<os>-<arch>-<env hash>-<hash of relevant Cargo manifests, lockfiles and toolchain/config files>`, so the two entries start with `v2-rust-clippy-cache-Linux-x64-` and `v1-rust-test-cache-Linux-x64-`.
   The env hash covers `rustc -vV` of every toolchain that `rustup toolchain list` reports, and every variable whose name starts with `CARGO`, `CC`, `CFLAGS`, `CXX`, `CMAKE` or `RUST` and whose value is non-empty.
   So the `env:` block and the steps before the cache step, including every step that installs a toolchain, must be identical in `cache-deps.yaml`, `pr.yaml` and `main-compiles.yaml`; they are, and all three files say so.
+  The four other `test-cache` readers (above) must hash the same six variables and toolchains; they do, with steps of their own.
   The clippy jobs hash seven variables (the six in `env:` plus `RUST_NIGHTLY`, written to `GITHUB_ENV` before the cache step); the test jobs hash six.
   The toolchains hashed are the stable pinned in `rust-toolchain.toml` and, in the clippy jobs, the pinned nightly.
   The runner image brings a stable Rust of its own, and every job that restores or saves a `clippy-cache`, `test-cache` or `durable-e2e-cache` entry removes it (`rustup toolchain uninstall stable`) after its last toolchain install and before its cache step, then lists what is left.
