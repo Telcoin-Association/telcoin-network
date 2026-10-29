@@ -1,7 +1,7 @@
 //! Detached write cursors ([`TxnCursor`]) sharing one write transaction: several cursors over two
 //! tables and the transaction's own writes, interleaved at random, against a model of each cursor
-//! (its key, or after a delete its follower's and the deleted key, over the table's rows); a write
-//! to another table causing no reseek;
+//! (its key, or after a delete its follower's and the deleted key, over the table's rows), its
+//! `follower_shares_prefix` answers among them; a write to another table causing no reseek;
 //! a dropped table, another transaction, a refused insert; and prefix steps that follow other
 //! writers' changes.
 
@@ -168,6 +168,21 @@ impl Pos {
     }
 }
 
+impl Pos {
+    /// `follower_shares_prefix(n)`: after a delete, whether the cursor is on a follower whose key
+    /// starts with the deleted key's first `n` bytes; `false` in every other position.
+    fn follower_shares_prefix(&self, n: usize) -> bool {
+        match self {
+            Pos::Deleted { on: Some(f), key } => key.get(..n).is_some_and(|p| f.starts_with(p)),
+            _ => false,
+        }
+    }
+}
+
+/// The prefix lengths the model test asks `follower_shares_prefix` about: none, a group of 65536
+/// keys, of 256, one key, the whole key, past it.
+const PREFIXES: [usize; 6] = [0, 6, 7, 8, 32, 33];
+
 /// A key of the model test: `i` in front of 24 bytes, so 7 bytes group 256 keys and 8 name one.
 fn key(i: u64) -> Vec<u8> {
     let mut k = vec![0xA5; 32];
@@ -202,6 +217,14 @@ struct Coverage {
     redeletes: usize,
     /// Prefix steps that moved.
     prefix_hits: usize,
+    /// `follower_shares_prefix` answers after a delete with a follower: `true`, and `false`.
+    shares: usize,
+    not_shares: usize,
+    /// Deletes whose follower was in the next leaf, and deletes of the table's last entry.
+    next_leaf_followers: usize,
+    end_deletes: usize,
+    /// `follower_shares_prefix` calls in the deleted state that found the cursor's place again.
+    stale_shares: usize,
     /// Refused cursor writes (`KeyExists`, `AppendOutOfOrder`).
     refused: usize,
     /// `clear_table` calls under the cursors.
@@ -255,18 +278,18 @@ fn run_steps(
             want[t].clear();
             cov.clears += 1;
         }
-        let op = rng.below(22);
-        if op >= 15 {
+        let op = rng.below(23);
+        if op >= 16 {
             // The transaction's own writes, often next to where a cursor is.
             let t = rng.below(2) as usize;
             match op {
-                15..=17 => {
+                16..=18 => {
                     let k = near(rng, models, keys);
                     let v = value(rng, step);
                     rw.put(&tables[t], &k, &v).expect("put");
                     want[t].insert(k, v);
                 }
-                18..=20 => {
+                19..=21 => {
                     let k = near(rng, models, keys);
                     let found = rw.delete(&tables[t], &k).expect("delete");
                     assert_eq!(found, want[t].remove(&k).is_some(), "step {step}: delete");
@@ -372,16 +395,58 @@ fn run_steps(
                 rows.insert(k.clone(), v.clone());
                 (owned(c.current(rw).expect("current")), (Pos::At(k.clone()), Some((k, v))))
             }
+            15 => {
+                // In any position, stale included: the answer, and the cursor stays put.
+                let n = PREFIXES[rng.below(PREFIXES.len() as u64) as usize];
+                let reseeks = c.reseeks;
+                let shares = c.follower_shares_prefix(rw, n).expect("follower_shares_prefix");
+                assert_eq!(shares, pos.follower_shares_prefix(n), "step {step}: n {n}, {pos:?}");
+                cov.stale_shares += usize::from(c.reseeks > reseeks && pos.state().1);
+                (None, (pos, None))
+            }
             _ => {
                 let t = m.table;
+                // Whether the entry under the cursor ends its leaf (its follower in the next one).
+                let leaf = |c: &TxnCursor, rw: &RwTxn| c.position(rw).1.last().map(|&(p, _)| p);
+                let next_leaf = match &pos {
+                    Pos::At(k) | Pos::Deleted { on: Some(k), .. } => {
+                        let mut probe = rw.cursor_detached(&tables[t]).expect("cursor");
+                        probe.seek(rw, k).expect("seek");
+                        let at = leaf(&probe, rw);
+                        probe.next(rw).expect("next").is_some() && leaf(&probe, rw) != at
+                    }
+                    _ => false,
+                };
                 let deleted = c.delete_current(rw).expect("delete_current");
                 let pos_was_deleted = pos.state().1;
                 let pos = match pos {
                     Pos::At(k) | Pos::Deleted { on: Some(k), .. } => {
                         assert!(deleted, "step {step}: delete_current at an entry");
+                        // Placed as a fresh cursor's seek of the deleted key places it.
+                        let mut fresh = rw.cursor_detached(&tables[t]).expect("cursor");
+                        fresh.seek(rw, &k).expect("seek");
+                        assert_eq!(
+                            c.position(rw),
+                            fresh.position(rw),
+                            "step {step}: delete_current lands as a seek of the deleted key"
+                        );
                         cov.redeletes += usize::from(pos_was_deleted);
                         want[t].remove(&k).expect("the entry under the cursor");
-                        Pos::deleted(&want[t], k)
+                        let pos = Pos::deleted(&want[t], k);
+                        // Whether the follower is the deleted key's, at every prefix length,
+                        // the cursor staying on it.
+                        for n in PREFIXES {
+                            let shares =
+                                c.follower_shares_prefix(rw, n).expect("follower_shares_prefix");
+                            assert_eq!(shares, pos.follower_shares_prefix(n), "step {step}: n {n}");
+                            if matches!(pos, Pos::Deleted { on: Some(_), .. }) {
+                                cov.shares += usize::from(shares);
+                                cov.not_shares += usize::from(!shares);
+                            }
+                        }
+                        cov.next_leaf_followers += usize::from(next_leaf);
+                        cov.end_deletes += usize::from(pos.state().0 == State::AfterEnd);
+                        pos
                     }
                     pos => {
                         assert!(!deleted, "step {step}: delete_current at no entry");
@@ -402,8 +467,10 @@ fn run_steps(
 /// deletes and clears, interleaved at random, match a model of each cursor in every result and
 /// state: writes into the leaf a cursor sits in, before and after its slot, deletes of its entry
 /// and its neighbours, overflow values, refused inserts and appends, and `clear_table` under the
-/// cursors. Each round commits; a cursor of an earlier round is `WrongTxn` in a later one; the
-/// file then reopens with exact accounting.
+/// cursors. `follower_shares_prefix` matches the model after each delete at every prefix length
+/// (a follower in the next leaf and a delete of the table's last entry among them), and in any
+/// position, stale included. Each round commits; a cursor of an earlier round is `WrongTxn` in a
+/// later one; the file then reopens with exact accounting.
 #[test]
 fn txn_cursors_and_direct_writes_match_a_model() {
     model_test(&[(1, 4096, 700), (2, 16384, 2500), (3, 4096, 60)], 3, 2500);
@@ -487,6 +554,9 @@ fn model_test(seeds: &[(u64, u32, u64)], rounds: usize, steps: usize) {
         assert!(cov.past_last > 3, "seed {seed}: {cov:?}");
         assert!(cov.prefix_hits > 50 && cov.refused > 20 && cov.clears == rounds, "{cov:?}");
         assert!(cov.max_leaves > 4 || keys < 100, "seed {seed}: the tables grew: {cov:?}");
+        assert!(cov.shares > 100 && cov.not_shares > 100, "seed {seed}: {cov:?}");
+        assert!(cov.next_leaf_followers > 0 && cov.end_deletes > 10, "seed {seed}: {cov:?}");
+        assert!(cov.stale_shares > 5, "seed {seed}: {cov:?}");
         assert!(reseeks as usize > steps / 4, "seed {seed}: {reseeks} reseeks");
     }
 }
@@ -708,6 +778,41 @@ fn next_after_last_finds_entries_put_past_it() {
     check(&env);
 }
 
+/// A `delete_current` that is the table's first write since the commit copies the published root,
+/// and the cursor, placed from the path cache (its entry not the last of its leaf), reads the new
+/// tree: right after the delete, before any step, its `position` (the root included) equals a new
+/// cursor's seek of the deleted key.
+#[test]
+fn a_txn_cursor_delete_that_copies_the_root_places_the_cursor_in_the_new_tree() {
+    let (_dir, path) = temp("tndb_b_txn_cursor_delete_root");
+    let env = open(&path, SyncMode::NoSync);
+    let [a] = filled(&env, &["a"], 300).try_into().expect("one table");
+    let mut rw = env.begin_rw().expect("begin");
+    let mut c = rw.cursor_detached(&a).expect("cursor");
+    let mut follower = rw.cursor_detached(&a).expect("cursor");
+    let leaf = |c: &TxnCursor, rw: &RwTxn| c.position(rw).1.last().map(|&(page, _)| page);
+    // A key whose follower shares its leaf: the delete leaves it a slot to place the cursor at.
+    let k = (100..200)
+        .find(|&k| {
+            c.seek(&rw, &key(k)).expect("seek");
+            follower.seek(&rw, &key(k + 1)).expect("seek");
+            leaf(&c, &rw) == leaf(&follower, &rw)
+        })
+        .expect("a key that is not its leaf's last");
+    let published = c.position(&rw).2;
+    assert!(c.delete_current(&mut rw).expect("delete_current"));
+    let mut fresh = rw.cursor_detached(&a).expect("cursor");
+    assert_eq!(key_of(fresh.seek(&rw, &key(k)).expect("seek")), k + 1);
+    assert_ne!(fresh.position(&rw).2.root, published.root, "the delete copied the root");
+    assert_eq!(
+        c.position(&rw),
+        fresh.position(&rw),
+        "delete_current lands in the new tree as a seek of the deleted key"
+    );
+    rw.commit().expect("commit");
+    check(&env);
+}
+
 /// A grouped key: group `g`, then `s` (a cursor's prefix steps over 4 bytes walk one group).
 fn gkey(g: u32, s: u32) -> Vec<u8> {
     let mut k = g.to_be_bytes().to_vec();
@@ -770,6 +875,85 @@ fn prefix_steps_through_txn_cursors_follow_other_writes() {
     let want: Vec<(u32, u32)> = (0..200).filter(|&s| s != 8).map(|s| (2, s)).collect();
     assert_eq!(walked, want, "the walk through the split group");
     assert_eq!(sub(a.next(&rw).expect("next")), (3, 0));
+    rw.commit().expect("commit");
+    check(&env);
+}
+
+/// `follower_shares_prefix` answers from the keys the cursor kept, in each state, without moving
+/// it: `false` before a delete and after a move; after a delete, whether the follower shares the
+/// deleted key's first `n` bytes (`false` past the key's length, even for a follower that extends
+/// the deleted key), the follower in the next leaf included; `false` after a delete of the
+/// table's last entry; and after another writer's delete of the follower, for the entry after
+/// it, found again by key.
+#[test]
+fn follower_shares_prefix_answers_for_the_deleted_entrys_follower() {
+    let (_dir, path) = temp("tndb_b_txn_cursor_follower");
+    let env = open(&path, SyncMode::NoSync);
+    let mut rw = env.begin_rw().expect("begin");
+    let t = rw.create_table("t").expect("table");
+    for g in 0..4 {
+        for s in (0..200).step_by(2) {
+            rw.put(&t, &gkey(g, s), &[s as u8; 30]).expect("put");
+        }
+    }
+    let mut c = rw.cursor_detached(&t).expect("cursor");
+    assert!(c.seek_exact(&rw, &gkey(1, 50)).expect("seek").is_some());
+    assert!(!c.follower_shares_prefix(&rw, 4).expect("ask"), "no delete yet");
+
+    assert!(c.delete_current(&mut rw).expect("delete"));
+    let asks = [0, 4, 7, 8, 9].map(|n| c.follower_shares_prefix(&rw, n).expect("ask"));
+    assert_eq!(asks, [true, true, true, false, false], "the follower (1, 52)");
+    assert_eq!(c.state(), (State::At, true), "the cursor did not move");
+    assert_eq!(sub(c.next_in_prefix(&rw, 4).expect("step")), (1, 52));
+    assert!(!c.follower_shares_prefix(&rw, 4).expect("ask"), "after a move");
+
+    // Another writer deletes the follower: the cursor finds the entry after it.
+    assert!(c.delete_current(&mut rw).expect("delete"), "deletes (1, 52)");
+    assert!(rw.delete(&t, &gkey(1, 54)).expect("delete"));
+    let reseeks = c.reseeks;
+    assert!(c.follower_shares_prefix(&rw, 4).expect("ask"), "the follower (1, 56)");
+    assert_eq!(c.reseeks, reseeks + 1);
+    assert_eq!(sub(c.next(&rw).expect("next")), (1, 56));
+
+    // A group's last entry: the follower is the next group's first.
+    assert!(c.seek_exact(&rw, &gkey(1, 198)).expect("seek").is_some());
+    assert!(c.delete_current(&mut rw).expect("delete"));
+    assert!(!c.follower_shares_prefix(&rw, 4).expect("ask"), "the follower (2, 0)");
+    assert!(c.follower_shares_prefix(&rw, 3).expect("ask"), "groups 1 and 2 share 3 bytes");
+
+    // An entry that ends its leaf: the follower is the next leaf's first.
+    let mut probe = rw.cursor_detached(&t).expect("cursor");
+    let leaf = |c: &TxnCursor, rw: &RwTxn| c.position(rw).1.last().map(|&(page, _)| page);
+    let s = (0..196)
+        .step_by(2)
+        .find(|&s| {
+            probe.seek(&rw, &gkey(2, s)).expect("seek");
+            let at = leaf(&probe, &rw);
+            probe.next(&rw).expect("next");
+            leaf(&probe, &rw) != at
+        })
+        .expect("a leaf ends inside group 2");
+    assert!(c.seek_exact(&rw, &gkey(2, s)).expect("seek").is_some());
+    assert!(c.delete_current(&mut rw).expect("delete"));
+    assert!(c.follower_shares_prefix(&rw, 4).expect("ask"), "the next leaf's first");
+    assert!(!c.follower_shares_prefix(&rw, 8).expect("ask"));
+    assert_eq!(sub(c.next(&rw).expect("next")), (2, s + 2));
+
+    // A follower that extends the deleted key: `n` past the deleted key's length is `false`.
+    let longer = [gkey(3, 10), vec![1]].concat();
+    rw.put(&t, &longer, b"longer").expect("put");
+    assert!(c.seek_exact(&rw, &gkey(3, 10)).expect("seek").is_some());
+    assert!(c.delete_current(&mut rw).expect("delete"));
+    assert!(c.follower_shares_prefix(&rw, 8).expect("ask"), "the whole deleted key");
+    assert!(!c.follower_shares_prefix(&rw, 9).expect("ask"), "past the deleted key");
+    assert_eq!(c.next(&rw).expect("next").map(|(k, _)| k.to_vec()), Some(longer));
+
+    // The table's last entry: after the end, no follower.
+    assert_eq!(sub(c.last(&rw).expect("last")), (3, 198));
+    assert!(c.delete_current(&mut rw).expect("delete"));
+    assert_eq!(c.state(), (State::AfterEnd, true));
+    assert!(!c.follower_shares_prefix(&rw, 0).expect("ask"), "after the end");
+    assert!(env.failure().is_none());
     rw.commit().expect("commit");
     check(&env);
 }

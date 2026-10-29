@@ -1,6 +1,7 @@
 //! The write-path cache (`write::PathCache`) against the descent: the same operations on two
-//! environments, one with the cache and one without (`Writer::no_path_cache`), give the same
-//! results and byte-identical files; and a cache never outlives the pages it names.
+//! environments, one with the cache and one without (`Writer::no_path_cache`, under which a
+//! delete also leaves a detached cursor to find its place again by key), give the same results
+//! and byte-identical files; and a cache never outlives the pages it names.
 
 use std::{collections::BTreeMap, fs, path::Path};
 
@@ -17,6 +18,24 @@ use crate::{
 fn cached_puts() -> u64 {
     #[cfg(debug_assertions)]
     return crate::tree::write::CACHED_PUTS.with(std::cell::Cell::get);
+    #[cfg(not(debug_assertions))]
+    0
+}
+
+/// The deletes done in a cached leaf on this thread so far (`write::CACHED_DELETES`), as
+/// [`cached_puts`] counts.
+fn cached_deletes() -> u64 {
+    #[cfg(debug_assertions)]
+    return crate::tree::write::CACHED_DELETES.with(std::cell::Cell::get);
+    #[cfg(not(debug_assertions))]
+    0
+}
+
+/// The moves that descended from the root on this thread so far (`cursor::ROOT_DESCENTS`), as
+/// [`cached_puts`] counts.
+fn root_descents() -> u64 {
+    #[cfg(debug_assertions)]
+    return crate::tree::cursor::ROOT_DESCENTS.with(std::cell::Cell::get);
     #[cfg(not(debug_assertions))]
     0
 }
@@ -44,6 +63,13 @@ enum Op {
     /// `n` largest keys, largest first (emptying its rightmost leaves), and put the next
     /// ascending key (in the range of the leaves just emptied).
     Slide(usize, u8),
+    /// Through a detached cursor: seek the key, then delete up to `n` entries as a walk does,
+    /// each `delete_current` deleting the follower the last one left (read with `current` after
+    /// every other delete, else deleted from the deleted state).
+    CursorDelete(usize, Key, u8),
+    /// A slot rewrite through a detached cursor: seek the key, delete the entry if the seek
+    /// landed on it, then put the key with a new value.
+    Slot(usize, Key, u16),
     Clear(usize),
     Drop(usize),
     Commit,
@@ -66,9 +92,11 @@ fn op_strategy() -> impl Strategy<Value = Op> {
     let table = prop_oneof![6 => Just(0), 1 => Just(1), 1 => Just(2)];
     let vlen = prop_oneof![3 => 0..200u16, 1 => 0..900u16];
     prop_oneof![
-        24 => (table.clone(), key_strategy(), vlen).prop_map(|(t, k, v)| Op::Put(t, k, v)),
+        24 => (table.clone(), key_strategy(), vlen.clone()).prop_map(|(t, k, v)| Op::Put(t, k, v)),
         6 => (table.clone(), key_strategy()).prop_map(|(t, k)| Op::Delete(t, k)),
         2 => (table.clone(), 1..40u8).prop_map(|(t, n)| Op::Slide(t, n)),
+        3 => (table.clone(), key_strategy(), 1..12u8).prop_map(|(t, k, n)| Op::CursorDelete(t, k, n)),
+        6 => (table.clone(), key_strategy(), vlen.clone()).prop_map(|(t, k, v)| Op::Slot(t, k, v)),
         1 => table.clone().prop_map(Op::Clear),
         1 => table.prop_map(Op::Drop),
         2 => Just(Op::Commit),
@@ -100,7 +128,13 @@ impl Side {
     /// Run `op` (its keys already chosen) and describe the outcome.
     fn run(&mut self, op: Op, keys: &[Vec<u8>], val: &[u8]) -> String {
         match op {
-            Op::Put(t, ..) | Op::Delete(t, _) | Op::Slide(t, _) | Op::Clear(t) | Op::Drop(t) => {
+            Op::Put(t, ..)
+            | Op::Delete(t, _)
+            | Op::Slide(t, _)
+            | Op::CursorDelete(t, ..)
+            | Op::Slot(t, ..)
+            | Op::Clear(t)
+            | Op::Drop(t) => {
                 let txn = self.txn();
                 let table = txn.create_table(TABLES[t]).expect("create");
                 match op {
@@ -111,6 +145,31 @@ impl Side {
                         let (last, top) = keys[1..].split_last().expect("the last put's key");
                         let found: Vec<_> = top.iter().map(|k| txn.delete(&table, k)).collect();
                         format!("{first:?} {found:?} {:?}", txn.put(&table, last, val))
+                    }
+                    Op::CursorDelete(_, _, n) => {
+                        let mut c = txn.cursor_detached(&table).expect("cursor");
+                        let mut out = format!("{:?}", c.seek(txn, &keys[0]));
+                        for i in 0..n {
+                            let deleted = c.delete_current(txn);
+                            out += &format!(" {deleted:?} {:?}", c.state());
+                            if i % 2 == 0 {
+                                out += &format!(" {:?}", c.current(txn));
+                            }
+                            if !matches!(deleted, Ok(true)) {
+                                break;
+                            }
+                        }
+                        out
+                    }
+                    Op::Slot(..) => {
+                        let mut c = txn.cursor_detached(&table).expect("cursor");
+                        let landed = c.seek(txn, &keys[0]).map(|e| e.map(|(k, _)| k.to_vec()));
+                        let mut out = format!("{landed:?}");
+                        if matches!(&landed, Ok(Some(k)) if *k == keys[0]) {
+                            out += &format!(" {:?} {:?}", c.delete_current(txn), c.state());
+                        }
+                        let put = c.put(txn, &keys[0], val);
+                        format!("{out} {put:?} {:?} {:?}", c.current(txn), c.next(txn))
                     }
                     Op::Clear(_) => format!("{:?}", txn.clear_table(&table)),
                     _ => format!("{:?}", txn.drop_table(table)),
@@ -189,6 +248,17 @@ impl Model {
                 }
                 rows.insert(last.clone(), ());
             }
+            Op::CursorDelete(t, _, n) => {
+                let rows = self.current.entry(t).or_default();
+                let gone: Vec<_> =
+                    rows.range(keys[0].clone()..).take(n.into()).map(|(k, ())| k.clone()).collect();
+                for key in gone {
+                    rows.remove(&key);
+                }
+            }
+            Op::Slot(t, ..) => {
+                self.current.entry(t).or_default().insert(keys[0].clone(), ());
+            }
             Op::Clear(t) | Op::Drop(t) => {
                 self.current.remove(&t);
             }
@@ -200,17 +270,20 @@ impl Model {
 }
 
 /// Run `ops` on a cached and an uncached environment: every outcome must match, and after every
-/// commit the two files must be byte-identical. Returns the puts done in a cached leaf.
-fn cached_matches_uncached(ops: &[Op]) -> u64 {
+/// commit the two files must be byte-identical. Returns the puts and the deletes done in a cached
+/// leaf.
+fn cached_matches_uncached(ops: &[Op]) -> (u64, u64) {
     let (_dir_a, path_a) = temp("tndb-b-cache-on");
     let (_dir_b, path_b) = temp("tndb-b-cache-off");
     let mut on = Side::open(&path_a, true);
     let mut off = Side::open(&path_b, false);
     let mut model = Model::default();
-    let before = cached_puts();
+    let before = (cached_puts(), cached_deletes());
     for (i, &op) in ops.iter().enumerate() {
         let keys = match op {
-            Op::Put(t, k, _) | Op::Delete(t, k) => vec![model.key(t, k)],
+            Op::Put(t, k, _) | Op::Delete(t, k) | Op::CursorDelete(t, k, _) | Op::Slot(t, k, _) => {
+                vec![model.key(t, k)]
+            }
             Op::Slide(t, n) => {
                 let first = model.key(t, Key::Seq);
                 model.current.entry(t).or_default().insert(first.clone(), ());
@@ -222,7 +295,9 @@ fn cached_matches_uncached(ops: &[Op]) -> u64 {
             _ => Vec::new(),
         };
         let val = match op {
-            Op::Put(_, _, len) => value(i as u32, keys[0].len() as u32, len as usize),
+            Op::Put(_, _, len) | Op::Slot(_, _, len) => {
+                value(i as u32, keys[0].len() as u32, len as usize)
+            }
             Op::Slide(..) => value(i as u32, 0, 100),
             _ => Vec::new(),
         };
@@ -234,7 +309,7 @@ fn cached_matches_uncached(ops: &[Op]) -> u64 {
             assert!(fa == fb, "op {i}: the files differ after the commit");
         }
     }
-    let hits = cached_puts() - before;
+    let hits = (cached_puts() - before.0, cached_deletes() - before.1);
     for side in [&mut on, &mut off] {
         side.readers.clear();
         if let Some(txn) = side.txn.take() {
@@ -247,17 +322,21 @@ fn cached_matches_uncached(ops: &[Op]) -> u64 {
 }
 
 fn cache_vs_descent(cases: u32, ops: usize) {
-    let hits = std::cell::Cell::new(0);
+    let hits = std::cell::Cell::new((0, 0));
     let config = ProptestConfig { cases, failure_persistence: None, ..ProptestConfig::default() };
     proptest!(config, |(ops in prop::collection::vec(op_strategy(), 1..ops))| {
-        hits.set(hits.get() + cached_matches_uncached(&ops));
+        let (puts, deletes) = cached_matches_uncached(&ops);
+        hits.set((hits.get().0 + puts, hits.get().1 + deletes));
     });
-    assert!(hits.get() > 0 || !cfg!(debug_assertions), "no put went through a cached leaf");
+    let (puts, deletes) = hits.get();
+    assert!(puts > 0 || !cfg!(debug_assertions), "no put went through a cached leaf");
+    assert!(deletes > 0 || !cfg!(debug_assertions), "no delete went through a cached leaf");
 }
 
 /// Random multi-table puts (ascending, scattered, clustered, replacing with other sizes),
-/// deletes, clears, drops, commits and aborts, with readers held: the cached environment answers
-/// as the uncached one and writes the same file bytes.
+/// deletes (direct, a detached cursor's walks and slot rewrites), clears, drops, commits and
+/// aborts, with readers held: the cached environment answers as the uncached one (a cursor's
+/// place after a delete included) and writes the same file bytes.
 #[test]
 fn the_path_cache_changes_nothing_but_speed() {
     cache_vs_descent(16, 800);
@@ -348,6 +427,58 @@ fn an_aborted_transactions_cache_never_reaches_the_next() {
         ops.push(Op::Put(0, Key::Seq, 200));
     }
     ops.push(Op::Commit);
-    let hits = cached_matches_uncached(&ops);
+    let (hits, _) = cached_matches_uncached(&ops);
     assert!(hits > 0 || !cfg!(debug_assertions), "the cache served some puts");
+}
+
+/// The slot rewrite over sorted keys, through one detached cursor: seek the key, delete it,
+/// put it back with a new value. In each leaf only the first delete descends (it copies the
+/// published leaf and refills the cache), or each one in a leaf under a quarter full; every other
+/// one is done in the cached leaf, and no
+/// `delete_current` descends from the root to find its place again: each lands on its follower
+/// from the cached path.
+#[test]
+fn slot_rewrites_over_sorted_keys_delete_in_the_cached_leaf() {
+    let (_dir, path) = temp("tndb-b-cache-slots");
+    let env = Env::open(&path, EnvOptions::default()).expect("open");
+    let n = 3000;
+    let mut txn = env.begin_rw().expect("begin");
+    let t = txn.create_table("t").expect("create");
+    for i in 0..n {
+        txn.put(&t, &seq_key(i), &value(0, i, 40)).expect("put");
+    }
+    txn.commit().expect("commit");
+
+    let mut txn = env.begin_rw().expect("begin");
+    let leaves = u64::from(txn.table_stat(&t).expect("stat").leaf_pages);
+    let mut c = txn.cursor_detached(&t).expect("cursor");
+    let deletes = cached_deletes();
+    let mut descents = 0;
+    for i in 0..n {
+        let k = seq_key(i);
+        let landed = c.seek(&txn, &k).expect("seek").map(|(k, _)| k.to_vec());
+        assert_eq!(landed, Some(k.clone()), "key {i}");
+        let before = root_descents();
+        assert!(c.delete_current(&mut txn).expect("delete_current"), "key {i}");
+        descents += root_descents() - before;
+        let follower = c.current(&txn).expect("current").map(|(k, _)| k.to_vec());
+        assert_eq!(follower, (i + 1 < n).then(|| seq_key(i + 1)), "the follower of key {i}");
+        c.put(&mut txn, &k, &value(1, i, 40)).expect("put");
+    }
+    let cached = cached_deletes() - deletes;
+    if cfg!(debug_assertions) {
+        assert_eq!(descents, 0, "a delete_current found its place again from the root");
+        // The rightmost leaf, which the ascending load left with what its last append split put
+        // there, may hold under a quarter: each delete there is due a merge test and descends.
+        let quarter = u64::from(n) / leaves / 4;
+        assert!(cached + leaves + quarter >= u64::from(n), "{cached} cached, {leaves} leaves");
+    }
+    assert_eq!(txn.table_stat(&t).expect("stat").leaf_pages, leaves as u32, "same leaves");
+    txn.commit().expect("commit");
+    let state = newest_state(&env);
+    assert_eq!(state["t"].len(), n as usize);
+    for (i, (k, v)) in state["t"].iter().enumerate() {
+        assert_eq!((k, v), (&seq_key(i as u32), &value(1, i as u32, 40)), "entry {i}");
+    }
+    check(&env);
 }

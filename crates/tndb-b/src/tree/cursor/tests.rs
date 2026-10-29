@@ -9,6 +9,7 @@ use tempfile::TempDir;
 use super::*;
 use crate::{
     catalog,
+    page::BranchView,
     tree::{
         test_harness::{walk_tree, MemStore, ReportSeed, Rng},
         write::plain::{delete, put},
@@ -272,6 +273,9 @@ trait Moves<'s> {
     fn state(&self) -> State;
     fn current_with_key_tail(&self, t: usize) -> Result<Option<(&'s [u8], KeyTail<'s>)>>;
 
+    /// The cursor's path.
+    fn path(&self) -> &TreeCursor;
+
     /// A seek and the entry as `current_with_key_tail(t)` gives it: the cursor's own
     /// `seek_with_key_tail` where it has one, else a seek followed by `current_with_key_tail`.
     fn seek_with_key_tail(
@@ -328,10 +332,12 @@ impl<'s, S: PageRead + ?Sized> Moves<'s> for Detached<'s, S> {
         self.cursor.current(self.store)
     }
     fn seek(&mut self, key: &[u8]) -> Result<Option<Entry<'s>>> {
-        self.cursor.seek(self.store, &self.root, key)
+        let leaf = self.cursor.leaf_page(self.store)?;
+        self.cursor.seek(self.store, &self.root, leaf, key)
     }
     fn seek_exact(&mut self, key: &[u8]) -> Result<Option<&'s [u8]>> {
-        self.cursor.seek_exact(self.store, &self.root, key)
+        let leaf = self.cursor.leaf_page(self.store)?;
+        self.cursor.seek_exact(self.store, &self.root, leaf, key)
     }
     fn next_in_prefix(&mut self, n: usize) -> Result<Option<Entry<'s>>> {
         self.cursor.step_in_prefix(self.store, &self.root, None, n, true).map(entry)
@@ -345,12 +351,16 @@ impl<'s, S: PageRead + ?Sized> Moves<'s> for Detached<'s, S> {
     fn current_with_key_tail(&self, t: usize) -> Result<Option<(&'s [u8], KeyTail<'s>)>> {
         self.cursor.current_with_key_tail(self.store, None, t)
     }
+    fn path(&self) -> &TreeCursor {
+        &self.cursor
+    }
     fn seek_with_key_tail(
         &mut self,
         key: &[u8],
         t: usize,
     ) -> Result<Option<(&'s [u8], KeyTail<'s>)>> {
-        self.cursor.seek_with_key_tail(self.store, &self.root, key, t)
+        let leaf = self.cursor.leaf_page(self.store)?;
+        self.cursor.seek_with_key_tail(self.store, &self.root, leaf, key, t)
     }
 }
 
@@ -387,6 +397,9 @@ impl<'s> Moves<'s> for Cursor<'s> {
     }
     fn current_with_key_tail(&self, t: usize) -> Result<Option<(&'s [u8], KeyTail<'s>)>> {
         Cursor::current_with_key_tail(self, t)
+    }
+    fn path(&self) -> &TreeCursor {
+        &self.tree
     }
 }
 
@@ -536,9 +549,9 @@ fn the_ends_of_empty_and_single_entry_trees() {
     assert_eq!(c.state(), State::AfterEnd);
     assert_eq!(c.last(&store, &empty).expect("last"), None);
     assert_eq!(c.state(), State::BeforeStart);
-    assert_eq!(c.seek(&store, &empty, b"k").expect("seek"), None);
+    assert_eq!(c.seek(&store, &empty, None, b"k").expect("seek"), None);
     assert_eq!(c.state(), State::AfterEnd);
-    assert_eq!(c.seek_exact(&store, &empty, b"k").expect("seek_exact"), None);
+    assert_eq!(c.seek_exact(&store, &empty, None, b"k").expect("seek_exact"), None);
     assert_eq!(c.state(), State::Unset);
     assert_eq!(c.prev(&store, &empty).expect("prev"), None);
     assert_eq!(c.state(), State::BeforeStart);
@@ -562,13 +575,13 @@ fn the_ends_of_empty_and_single_entry_trees() {
     assert_eq!(c.next(s, r).expect("next"), None, "stays after the end");
     assert_eq!(c.prev(s, r).expect("prev"), kv, "prev after the end = last");
     assert_eq!(c.current(s).expect("current"), kv);
-    assert_eq!(c.seek(s, r, b"a").expect("seek"), kv);
-    assert_eq!(c.seek(s, r, b"k").expect("seek"), kv);
-    assert_eq!(c.seek(s, r, b"k\0").expect("seek"), None);
+    assert_eq!(c.seek(s, r, None, b"a").expect("seek"), kv);
+    assert_eq!(c.seek(s, r, None, b"k").expect("seek"), kv);
+    assert_eq!(c.seek(s, r, None, b"k\0").expect("seek"), None);
     assert_eq!(c.state(), State::AfterEnd);
-    assert_eq!(c.seek_exact(s, r, b"k").expect("seek_exact"), Some(&b"v"[..]));
+    assert_eq!(c.seek_exact(s, r, None, b"k").expect("seek_exact"), Some(&b"v"[..]));
     assert_eq!(c.state(), State::At);
-    assert_eq!(c.seek_exact(s, r, b"j").expect("seek_exact"), None);
+    assert_eq!(c.seek_exact(s, r, None, b"j").expect("seek_exact"), None);
     assert_eq!(c.state(), State::Unset);
     assert_eq!(c.next(s, r).expect("next"), kv, "next from unset = first");
 }
@@ -620,7 +633,7 @@ fn moves_cross_leaf_boundaries_both_ways() {
     let key = |e: Option<(&[u8], &[u8])>| e.expect("an entry").0.to_vec();
     for i in 0..keys.len() - 1 {
         let mut c = TreeCursor::default();
-        assert!(c.seek_exact(s, r, &keys[i]).expect("seek_exact").is_some());
+        assert!(c.seek_exact(s, r, None, &keys[i]).expect("seek_exact").is_some());
         assert_eq!(key(c.next(s, r).expect("next")), keys[i + 1], "next from {i}");
         assert_eq!(key(c.prev(s, r).expect("prev")), keys[i], "prev from {}", i + 1);
         assert_eq!(key(c.next(s, r).expect("next")), keys[i + 1], "next again from {i}");
@@ -694,7 +707,7 @@ fn seeks_land_between_before_and_after() {
     let (s, r) = (&store.reader(), &root);
     let mut c = TreeCursor::default();
     for i in 0..n {
-        let got = c.seek(s, r, &key_of(2 * i + 1)).expect("seek");
+        let got = c.seek(s, r, None, &key_of(2 * i + 1)).expect("seek");
         if i + 1 < n {
             assert_eq!(got.expect("a next key").0, key_of(2 * i + 2), "seek between {i}");
             assert_eq!(c.prev(s, r).expect("prev").expect("entry").0, key_of(2 * i));
@@ -703,11 +716,11 @@ fn seeks_land_between_before_and_after() {
             assert_eq!(c.state(), State::AfterEnd);
             assert_eq!(c.prev(s, r).expect("prev").expect("entry").0, key_of(2 * i));
         }
-        assert_eq!(c.seek_exact(s, r, &key_of(2 * i + 1)).expect("seek_exact"), None);
+        assert_eq!(c.seek_exact(s, r, None, &key_of(2 * i + 1)).expect("seek_exact"), None);
         assert_eq!(c.state(), State::Unset);
     }
-    assert_eq!(c.seek(s, r, b"").expect("seek").expect("first").0, key_of(0));
-    assert_eq!(c.seek(s, r, &[0xFF; 9]).expect("seek"), None);
+    assert_eq!(c.seek(s, r, None, b"").expect("seek").expect("first").0, key_of(0));
+    assert_eq!(c.seek(s, r, None, &[0xFF; 9]).expect("seek"), None);
     assert_eq!(c.state(), State::AfterEnd);
     assert_eq!(c.next(s, r).expect("next"), None);
     assert_eq!(c.prev(s, r).expect("prev").expect("last").0, key_of(2 * (n - 1)));
@@ -783,9 +796,9 @@ fn fused_seek_matches_seek_then_current<S: PageRead + ?Sized>(
     for probe in probes {
         for t in TAILS {
             let (mut fused, mut apart) = (TreeCursor::default(), TreeCursor::default());
-            let got = fused.seek_with_key_tail(store, root, probe, t);
+            let got = fused.seek_with_key_tail(store, root, None, probe, t);
             let want = apart
-                .seek(store, root, probe)
+                .seek(store, root, None, probe)
                 .and_then(|_| apart.current_with_key_tail(store, None, t));
             match (got, want) {
                 (Ok(got), Ok(want)) => {
@@ -987,8 +1000,11 @@ fn damage_under_a_cursor_is_corrupt() {
         } else {
             page::branch_key(&original, 1).expect("separator").to_vec()
         };
-        assert!(corrupt(TreeCursor::default().seek(s, r, &lost)), "{from} -> {to}: seek");
-        assert!(corrupt(TreeCursor::default().seek_exact(s, r, &lost)), "{from} -> {to}: exact");
+        assert!(corrupt(TreeCursor::default().seek(s, r, None, &lost)), "{from} -> {to}: seek");
+        assert!(
+            corrupt(TreeCursor::default().seek_exact(s, r, None, &lost)),
+            "{from} -> {to}: exact"
+        );
         store.raw_mut(root.root).copy_from_slice(&original);
     }
 
@@ -1005,7 +1021,10 @@ fn damage_under_a_cursor_is_corrupt() {
         assert!(corrupt(scan(s, r, true)), "leaf {from} -> {to}: forward");
         assert!(corrupt(scan(s, r, false)), "leaf {from} -> {to}: backward");
         let lost = page::branch_key(&saved, from).expect("separator").to_vec();
-        assert!(corrupt(TreeCursor::default().seek(s, r, &lost)), "leaf {from} -> {to}: seek");
+        assert!(
+            corrupt(TreeCursor::default().seek(s, r, None, &lost)),
+            "leaf {from} -> {to}: seek"
+        );
         store.raw_mut(branch).copy_from_slice(&saved);
     }
 
@@ -1037,7 +1056,7 @@ fn damage_under_a_cursor_is_corrupt() {
     for height in [2, 4] {
         let wrong = TreeRoot { height, ..root };
         assert!(corrupt(scan(&store.reader(), &wrong, true)), "height {height}");
-        assert!(corrupt(TreeCursor::default().seek(&store.reader(), &wrong, &key_of(8))));
+        assert!(corrupt(TreeCursor::default().seek(&store.reader(), &wrong, None, &key_of(8))));
     }
     assert_eq!(scan(&store.reader(), &root, false).expect("scan"), n as usize);
 }
@@ -1085,7 +1104,7 @@ fn the_descent_names_the_first_check_a_page_fails() {
         let header = message(View::new(store.raw(leaf)).map(|_| ()));
         assert!(header.starts_with(&format!("page {leaf}: ")), "{what}: {header}");
         let s = &store.reader();
-        assert_eq!(message(TreeCursor::default().seek(s, &root, &key_of(0))), want, "{what}");
+        assert_eq!(message(TreeCursor::default().seek(s, &root, None, &key_of(0))), want, "{what}");
         assert_eq!(message(TreeCursor::default().first(s, &root)), want, "{what}: first");
         store.raw_mut(leaf).copy_from_slice(&saved);
     }
@@ -1101,7 +1120,11 @@ fn the_descent_names_the_first_check_a_page_fails() {
     store.restamp(root.root);
     let want = format!("page {last} is a Leaf at depth 2 of a tree of height 3");
     let s = &store.reader();
-    assert_eq!(message(TreeCursor::default().seek(s, &root, &key_of(0))), want, "a misrouted cell");
+    assert_eq!(
+        message(TreeCursor::default().seek(s, &root, None, &key_of(0))),
+        want,
+        "a misrouted cell"
+    );
     assert_eq!(message(TreeCursor::default().first(s, &root)), want, "a misrouted cell: first");
     store.raw_mut(root.root).copy_from_slice(&original);
     assert_eq!(scan(&store.reader(), &root, true).expect("scan"), 1_000);
@@ -1549,7 +1572,7 @@ fn prefix_steps_from_every_entry_match_a_model() {
     let leaf_of: Vec<u32> = keys
         .iter()
         .map(|k| {
-            probe.seek_exact(&reader, &root, k).expect("seek").expect("a hit");
+            probe.seek_exact(&reader, &root, None, k).expect("seek").expect("a hit");
             probe.leaf_pgno().expect("at an entry")
         })
         .collect();
@@ -1585,7 +1608,7 @@ fn prefix_steps_from_every_entry_match_a_model() {
     for setup in 0..3 {
         match setup {
             0 => {}
-            1 => assert_eq!(c.seek(&reader, &root, &[0xFF; 4]).expect("seek"), None),
+            1 => assert_eq!(c.seek(&reader, &root, None, &[0xFF; 4]).expect("seek"), None),
             _ => {
                 c.first(&reader, &root).expect("first");
                 assert_eq!(c.prev(&reader, &root).expect("prev"), None);
@@ -1834,4 +1857,651 @@ fn tree_cursor_stays_small() {
         "TreeCursor is {} bytes for a path of {path}",
         size_of::<TreeCursor>()
     );
+}
+
+// ---- seeks from the cursor's position ----
+
+/// The root descents so far on this thread ([`ROOT_DESCENTS`]); zero in a release test build,
+/// where the counter does not exist.
+fn root_descents() -> u64 {
+    #[cfg(debug_assertions)]
+    return ROOT_DESCENTS.with(std::cell::Cell::get);
+    #[cfg(not(debug_assertions))]
+    0
+}
+
+/// The separators of the tree `cursor` reads: every branch key on the way to each leaf (cell 0's
+/// −∞ aside), collected from the cursor's path as it walks the leaves.
+fn separators(mut cursor: Cursor<'_>) -> Vec<Vec<u8>> {
+    let (store, root) = (cursor.store, cursor.root);
+    let mut seps = std::collections::BTreeSet::new();
+    let mut leaf = None;
+    let mut entry = cursor.tree.first(store, &root).expect("first");
+    while entry.is_some() {
+        if cursor.tree.leaf_pgno() != leaf {
+            leaf = cursor.tree.leaf_pgno();
+            let path = &cursor.tree;
+            for (&pgno, &ci) in path.pages[..path.depth - 1].iter().zip(&path.slots) {
+                if ci > 0 {
+                    let branch = store.page(pgno).expect("branch");
+                    seps.insert(page::branch_key(branch, usize::from(ci)).expect("key").to_vec());
+                }
+            }
+        }
+        entry = cursor.tree.next(store, &root).expect("next");
+    }
+    seps.into_iter().collect()
+}
+
+/// The seek targets of a tree, sorted and without repeats: every key and gap
+/// ([`every_key_and_gap`]: so each leaf's first and last keys, the gaps between leaves, a key
+/// before the first and one after the last) and every separator with the keys just around it.
+fn seek_targets(entries: &[Kv], separators: &[Vec<u8>]) -> Vec<Vec<u8>> {
+    let seps: Vec<Kv> = separators.iter().map(|k| (k.clone(), Vec::new())).collect();
+    let mut targets = every_key_and_gap(entries);
+    targets.extend(every_key_and_gap(&seps));
+    targets.sort();
+    targets.dedup();
+    targets
+}
+
+/// A target near `key` among the sorted `targets`, from a little before it to a few leaves past
+/// it (where a forward seek goes); anywhere one time in four, or when there is no `key`.
+fn near_target<'a>(rng: &mut Rng, targets: &'a [Vec<u8>], key: Option<&[u8]>) -> &'a [u8] {
+    let at = match key {
+        Some(key) if rng.below(4) != 0 => targets.partition_point(|t| t.as_slice() < key),
+        _ => return &targets[rng.below(targets.len() as u64) as usize],
+    };
+    &targets[(at + rng.below(60) as usize).saturating_sub(12).min(targets.len() - 1)]
+}
+
+/// A seek of `target`: `seek`, `seek_exact` (a miss for a gap) or `seek_with_key_tail`.
+fn seek_op(rng: &mut Rng, target: &[u8]) -> Op {
+    match rng.below(3) {
+        0 => Op::Seek(target.to_vec()),
+        1 => Op::SeekExact(target.to_vec()),
+        _ => Op::SeekWithKeyTail(target.to_vec(), TAILS[rng.below(4) as usize]),
+    }
+}
+
+/// A move that leaves a cursor somewhere: at an entry near `key` or anywhere, at either end,
+/// after the end or before the start (a step past an end), or unset (a `seek_exact` miss).
+fn position_op(rng: &mut Rng, targets: &[Vec<u8>], key: Option<&[u8]>) -> Op {
+    match rng.below(10) {
+        0 => Op::First,
+        1 => Op::Last,
+        2 | 3 => Op::Next,
+        4 => Op::Prev,
+        5 => Op::SeekExact(near_target(rng, targets, key).to_vec()),
+        _ => Op::Seek(near_target(rng, targets, key).to_vec()),
+    }
+}
+
+/// The key a seek op seeks.
+fn target_of(op: &Op) -> &[u8] {
+    match op {
+        Op::Seek(k) | Op::SeekExact(k) | Op::SeekWithKeyTail(k, _) => k,
+        other => panic!("not a seek: {other:?}"),
+    }
+}
+
+/// A step op, forward or backward.
+fn step_op(rng: &mut Rng) -> Op {
+    if rng.below(2) == 0 {
+        Op::Next
+    } else {
+        Op::Prev
+    }
+}
+
+/// Where a key lies against the leaf a cursor is at, before a seek.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Against {
+    /// Between the leaf's first and last keys.
+    In,
+    /// Below its first key.
+    Below,
+    /// Above its last key.
+    Above,
+}
+
+/// Where `key` lies against the leaf `path` is at (`None` unless it is at an entry).
+fn against<S: PageRead + ?Sized>(path: &TreeCursor, store: &S, key: &[u8]) -> Option<Against> {
+    let leaf = LeafView::new(store.page(path.leaf_pgno()?).ok()?).ok()?;
+    let (first, last) = (leaf.key(0).ok()?, leaf.key(leaf.nkeys() - 1).ok()?);
+    Some(if page::cmp_keys(key, first).is_lt() {
+        Against::Below
+    } else if page::cmp_keys(key, last).is_gt() {
+        Against::Above
+    } else {
+        Against::In
+    })
+}
+
+/// How the seeks of the position tests went.
+#[derive(Debug, Default)]
+struct SeekCount {
+    /// Seeks from an entry, by where the key lay against its leaf: inside it (these start from
+    /// the leaf), below or above it (these descend from the root).
+    in_leaf: usize,
+    below: usize,
+    above: usize,
+    /// Seeks of a detached write cursor made stale by another writer, and from its deleted state.
+    stale: usize,
+    deleted: usize,
+}
+
+impl SeekCount {
+    /// Count a seek from `class` that did (`descended`) or did not descend from the root. A key
+    /// inside the cursor's leaf never descends, and in debug builds, where the descents are
+    /// counted, a key outside it always does.
+    fn add(&mut self, class: Option<Against>, descended: bool, context: &str) {
+        match class {
+            Some(Against::In) => {
+                assert!(!descended, "{context}: a key inside the leaf descended");
+                self.in_leaf += 1;
+            }
+            Some(outside) => {
+                let counted = cfg!(debug_assertions);
+                assert!(descended || !counted, "{context}: a key outside the leaf did not descend");
+                if outside == Against::Below {
+                    self.below += 1;
+                } else {
+                    self.above += 1;
+                }
+            }
+            None => {}
+        }
+    }
+}
+
+/// `rounds` of: a positioning move or two of `cursor`, then a seek of a target near where it is
+/// (or anywhere), compared with `fresh()`'s, a new cursor whose seek descends from the root, and
+/// two steps of both after it: every result and every state the same. The cursor's path
+/// ([`Moves::path`]) is read against `store` to count which seeks started from the leaf.
+fn seek_from_positions<'s, C: Moves<'s>, F: Moves<'s>, S: PageRead + ?Sized>(
+    cursor: &mut C,
+    fresh: impl Fn() -> F,
+    store: &S,
+    targets: &[Vec<u8>],
+    rng: &mut Rng,
+    rounds: usize,
+    count: &mut SeekCount,
+) {
+    let mut key: Option<Vec<u8>> = None;
+    for round in 0..rounds {
+        for _ in 0..=rng.below(2) {
+            let op = position_op(rng, targets, key.as_deref());
+            key = cursor.apply(&op).map(|(k, _)| k);
+        }
+        let target = near_target(rng, targets, key.as_deref());
+        let seek = seek_op(rng, target);
+        let class = against(cursor.path(), store, target_of(&seek));
+        let from = cursor.state();
+        let context = format!("round {round}: {seek:?} from {from:?} {class:?}");
+        let before = root_descents();
+        let got = cursor.apply(&seek);
+        count.add(class, root_descents() != before, &context);
+        let mut f = fresh();
+        assert_eq!(got, f.apply(&seek), "{context}");
+        assert_eq!(cursor.state(), f.state(), "{context}");
+        key = got.map(|(k, _)| k);
+        for _ in 0..2 {
+            let step = step_op(rng);
+            let got = cursor.apply(&step);
+            assert_eq!(got, f.apply(&step), "{context}, then {step:?}");
+            assert_eq!(cursor.state(), f.state(), "{context}, then {step:?}");
+            key = got.map(|(k, _)| k).or(key);
+        }
+    }
+}
+
+/// [`seek_from_positions`] on the detached and the public cursor over `seeds` trees of each of
+/// `shapes` on [`MemStore`].
+fn seeks_from_positions_on_trees(shapes: &[Shape], seeds: u64, rounds: usize) -> SeekCount {
+    let mut count = SeekCount::default();
+    for (i, &shape) in shapes.iter().enumerate() {
+        for seed in 0..seeds {
+            let seed = 0x5EE4_F000 + 100 * i as u64 + seed;
+            let _report = ReportSeed(seed);
+            let mut rng = Rng(seed);
+            let (store, root, map) = build(shape, &mut rng);
+            let reader = store.reader();
+            let latch = Latch::default();
+            let entries: Vec<Kv> = map.into_iter().collect();
+            let targets = seek_targets(&entries, &separators(Cursor::new(&reader, root, &latch)));
+            let detached = || Detached { cursor: TreeCursor::default(), store: &reader, root };
+            let mut cursor = detached();
+            seek_from_positions(
+                &mut cursor,
+                detached,
+                &reader,
+                &targets,
+                &mut rng,
+                rounds,
+                &mut count,
+            );
+            let public = || Cursor::new(&reader, root, &latch);
+            let mut cursor = public();
+            seek_from_positions(
+                &mut cursor,
+                public,
+                &reader,
+                &targets,
+                &mut rng,
+                rounds,
+                &mut count,
+            );
+            assert_eq!(latch.failure(), None);
+        }
+    }
+    count
+}
+
+/// [`Moves::apply`] for a detached write cursor in `txn`.
+fn apply_txn(c: &mut crate::TxnCursor, txn: &crate::RwTxn, op: &Op) -> Option<Kv> {
+    match op {
+        Op::First => owned(c.first(txn).expect("first")),
+        Op::Last => owned(c.last(txn).expect("last")),
+        Op::Next => owned(c.next(txn).expect("next")),
+        Op::Prev => owned(c.prev(txn).expect("prev")),
+        Op::Current => owned(c.current(txn).expect("current")),
+        Op::Seek(key) => owned(c.seek(txn, key).expect("seek")),
+        Op::SeekExact(key) => {
+            c.seek_exact(txn, key).expect("seek_exact").map(|v| (key.clone(), v.to_vec()))
+        }
+        Op::SeekWithKeyTail(key, t) => {
+            owned_tail(c.seek_with_key_tail(txn, key, *t).expect("seek_with_key_tail"), *t)
+        }
+        Op::NextInPrefix(n) => owned(c.next_in_prefix(txn, *n).expect("next_in_prefix")),
+        Op::PrevInPrefix(n) => owned(c.prev_in_prefix(txn, *n).expect("prev_in_prefix")),
+    }
+}
+
+/// The environment's cursors from random positions: an `RoCursor` on a committed table, and a
+/// `TxnCursor` in write transactions where, between its positioning moves and its seek, it may
+/// delete its entry (the deleted state) or another writer may put or delete a key near it (so the
+/// cursor is stale at the seek); each seek, and two steps after it, against a new cursor's.
+fn seeks_from_positions_in_an_env(n: usize, rounds: usize, seed: u64) -> SeekCount {
+    let _report = ReportSeed(seed);
+    let mut rng = Rng(seed);
+    let (dir, env) = temp_env();
+    let shape = Shape { page_size: 4096, n, keys: (4, 40), vmax: 40, delete_pct: 15, groups: 0 };
+    let mut map = BTreeMap::new();
+    let mut rw = env.begin_rw().expect("begin");
+    let t = rw.create_table("t").expect("table");
+    for _ in 0..n {
+        let key = shape_key(&mut rng, &shape);
+        let len = if rng.below(25) == 0 { 1500 + rng.len_upto(9000) } else { rng.len_upto(40) };
+        let value = vec![rng.next() as u8; len];
+        rw.put(&t, &key, &value).expect("put");
+        map.insert(key, value);
+    }
+    let keys: Vec<Vec<u8>> = map.keys().cloned().collect();
+    for key in keys {
+        if rng.below(100) < shape.delete_pct {
+            assert!(rw.delete(&t, &key).expect("delete"));
+            map.remove(&key);
+        }
+    }
+    rw.commit().expect("commit");
+    let ro = Arc::new(env.begin_ro().expect("ro"));
+    assert!(ro.table_stat(&t).expect("stat").height >= 2);
+    let entries: Vec<Kv> = map.into_iter().collect();
+    let targets = seek_targets(&entries, &separators(ro.cursor(&t).expect("cursor")));
+    let mut count = SeekCount::default();
+
+    let mut c = ro.cursor_owned(&t).expect("cursor");
+    let mut key: Option<Vec<u8>> = None;
+    for round in 0..rounds {
+        for _ in 0..=rng.below(2) {
+            key = apply_owned(&mut c, &position_op(&mut rng, &targets, key.as_deref()))
+                .map(|(k, _)| k);
+        }
+        let target = near_target(&mut rng, &targets, key.as_deref());
+        let seek = seek_op(&mut rng, target);
+        let context = format!("owned round {round}: {seek:?} from {:?}", c.state());
+        let (from, before) = (c.state(), root_descents());
+        let got = apply_owned(&mut c, &seek);
+        if from == State::At && root_descents() == before {
+            count.in_leaf += 1;
+        }
+        let mut f = ro.cursor_owned(&t).expect("cursor");
+        assert_eq!(got, apply_owned(&mut f, &seek), "{context}");
+        assert_eq!(c.state(), f.state(), "{context}");
+        key = got.map(|(k, _)| k);
+        for _ in 0..2 {
+            let step = step_op(&mut rng);
+            let got = apply_owned(&mut c, &step);
+            assert_eq!(got, apply_owned(&mut f, &step), "{context}, then {step:?}");
+            assert_eq!(c.state(), f.state(), "{context}, then {step:?}");
+            key = got.map(|(k, _)| k).or(key);
+        }
+    }
+    drop((c, ro));
+
+    let mut rw = env.begin_rw().expect("begin");
+    let mut c = rw.cursor_detached(&t).expect("cursor");
+    let mut key: Option<Vec<u8>> = None;
+    for round in 0..rounds {
+        if round % 40 == 39 {
+            rw.commit().expect("commit");
+            rw = env.begin_rw().expect("begin");
+            c = rw.cursor_detached(&t).expect("cursor");
+        }
+        for _ in 0..=rng.below(2) {
+            key = apply_txn(&mut c, &rw, &position_op(&mut rng, &targets, key.as_deref()))
+                .map(|(k, _)| k);
+        }
+        let mut stale = false;
+        match rng.below(6) {
+            0 => {
+                c.delete_current(&mut rw).expect("delete_current");
+            }
+            1 | 2 => {
+                let k = near_target(&mut rng, &targets, key.as_deref()).to_vec();
+                stale = if rng.below(2) == 0 {
+                    rw.put(&t, &k, b"w").expect("put");
+                    true
+                } else {
+                    rw.delete(&t, &k).expect("delete")
+                };
+            }
+            _ => {}
+        }
+        let target = near_target(&mut rng, &targets, key.as_deref());
+        let seek = seek_op(&mut rng, target);
+        let from = c.state();
+        let context = format!("txn round {round}: {seek:?} from {from:?}, stale {stale}");
+        count.stale += usize::from(stale);
+        count.deleted += usize::from(from == (State::At, true));
+        let got = apply_txn(&mut c, &rw, &seek);
+        let mut f = rw.cursor_detached(&t).expect("cursor");
+        assert_eq!(got, apply_txn(&mut f, &rw, &seek), "{context}");
+        assert_eq!(c.state(), f.state(), "{context}");
+        key = got.map(|(k, _)| k);
+        for _ in 0..2 {
+            let step = step_op(&mut rng);
+            let got = apply_txn(&mut c, &rw, &step);
+            assert_eq!(got, apply_txn(&mut f, &rw, &step), "{context}, then {step:?}");
+            assert_eq!(c.state(), f.state(), "{context}, then {step:?}");
+            key = got.map(|(k, _)| k).or(key);
+        }
+    }
+    rw.commit().expect("commit");
+    env.check().expect("check");
+    assert!(env.failure().is_none(), "{:?}", env.failure());
+    drop(dir);
+    count
+}
+
+/// Assert that the position tests reached every kind of seek: seeks from an entry of a key inside
+/// its leaf, below it and above it, and stale and deleted-state seeks.
+fn assert_seek_coverage(count: &SeekCount) {
+    assert!(count.in_leaf > 0 && count.below > 0 && count.above > 0, "{count:?}");
+    assert!(count.stale > 0 && count.deleted > 0, "{count:?}");
+}
+
+/// Seeks from random positions (after seeks, steps, `first` and `last`, past either end, after a
+/// `seek_exact` miss) equal a new cursor's seek, which descends from the root, in the entry, the
+/// state and the two steps after it: on [`MemStore`] through the detached and the public cursor,
+/// and in an environment through `RoCursor` and `TxnCursor` (from its deleted state, and stale
+/// after another writer's change). The targets are every key and gap, every separator and the
+/// keys around it, and keys before the first and after the last; a quarter of them are
+/// `seek_exact` misses or hits.
+#[test]
+fn seeks_from_random_positions_match_a_fresh_seek() {
+    let shapes = [SEEK_SHAPES[0], SEEK_SHAPES[1], SEEK_SHAPES[3], SEEK_SHAPES[6]];
+    let mut count = seeks_from_positions_on_trees(&shapes, 1, 300);
+    let env = seeks_from_positions_in_an_env(1500, 400, 0x5EE4_E000);
+    count.in_leaf += env.in_leaf;
+    (count.stale, count.deleted) = (env.stale, env.deleted);
+    assert_seek_coverage(&count);
+}
+
+/// [`seeks_from_random_positions_match_a_fresh_seek`] over every seek shape, more trees and
+/// rounds, and three environments.
+#[test]
+#[ignore = "heavy: run with --release"]
+fn seeks_from_random_positions_match_a_fresh_seek_heavy() {
+    let mut count = seeks_from_positions_on_trees(&SEEK_SHAPES, 6, 3000);
+    for seed in 0..3 {
+        let env = seeks_from_positions_in_an_env(6000, 4000, 0x5EE4_E100 + seed);
+        count.in_leaf += env.in_leaf;
+        count.stale += env.stale;
+        count.deleted += env.deleted;
+    }
+    assert_seek_coverage(&count);
+}
+
+/// `f`'s result and the root descents it made (counted in debug builds only).
+#[cfg(debug_assertions)]
+fn counted<T>(f: impl FnOnce() -> T) -> (T, u64) {
+    let before = root_descents();
+    let got = f();
+    (got, root_descents() - before)
+}
+
+/// A leaf of `tree` with a separator on each side in its parent (neither its parent's first nor
+/// its last child), not the tree's last leaf: its page number and its first and last keys' `i`
+/// (`key_of(i)`).
+fn a_middle_leaf(store: &MemStore, root: &TreeRoot) -> (u32, u64, u64) {
+    let reader = store.reader();
+    let mut c = TreeCursor::default();
+    let mut entry = c.first(&reader, root).expect("first");
+    while entry.is_some() {
+        let (depth, leaf) = (c.depth, c.leaf_pgno().expect("at an entry"));
+        let ci = usize::from(c.slots[depth - 2]);
+        let parent = BranchView::new(store.raw(c.pages[depth - 2])).expect("branch");
+        if ci > 0 && ci + 2 < parent.nkeys() {
+            let page = LeafView::new(store.raw(leaf)).expect("leaf");
+            let i = |k: &[u8]| u64::from_be_bytes(k[..8].try_into().expect("8 bytes"));
+            let first = i(page.key(0).expect("first"));
+            return (leaf, first, i(page.key(page.nkeys() - 1).expect("last")));
+        }
+        // On to the next leaf.
+        c.set_top_slot(page::nkeys(store.raw(leaf)) - 1);
+        entry = c.next(&reader, root).expect("next");
+    }
+    panic!("no leaf with separators on both sides");
+}
+
+/// A seek inside the leaf the cursor is at starts from that leaf, with no descent from the root:
+/// keys and gaps from the leaf's first key to its last, and `seek_exact` misses there. A key
+/// outside the leaf descends once, even next to it: below its first key down to the separator
+/// before it (the leaf's first key deleted, so the separator is a gap), past its last key up to
+/// the separator after it, and an exact miss on either side. So does any seek of a cursor not at
+/// an entry. Debug builds only (the counter).
+#[cfg(debug_assertions)]
+#[test]
+fn a_seek_near_the_cursor_starts_from_its_leaf() {
+    let (mut store, mut root) = even_tree(1_000);
+    let (_, first, last) = a_middle_leaf(&store, &root);
+    // Delete the leaf's first key: the separator before it stays, now a gap below the leaf.
+    assert!(delete(&mut store, &mut root, &key_of(first)).expect("delete"));
+    store.commit_like();
+    let reader = store.reader();
+    let latch = Latch::default();
+    let mut c = Cursor::new(&reader, root, &latch);
+    let seek = |c: &mut Cursor<'_>, i: u64| {
+        counted(|| c.seek(&key_of(i)).expect("seek").map(|(k, _)| k.to_vec()))
+    };
+    let exact = |c: &mut Cursor<'_>, i: u64| {
+        counted(|| c.seek_exact(&key_of(i)).expect("seek_exact").map(<[u8]>::to_vec))
+    };
+
+    assert_eq!(seek(&mut c, first + 4), (Some(key_of(first + 4)), 1), "from unset");
+    assert_eq!(seek(&mut c, first + 6), (Some(key_of(first + 6)), 0), "in the leaf");
+    assert_eq!(seek(&mut c, first + 2), (Some(key_of(first + 2)), 0), "the leaf's first key");
+    assert_eq!(seek(&mut c, first + 3), (Some(key_of(first + 4)), 0), "a gap in the leaf");
+    assert_eq!(seek(&mut c, last), (Some(key_of(last)), 0), "the leaf's last key");
+    assert_eq!(exact(&mut c, last - 1), (None, 0), "a miss in the leaf");
+    assert_eq!(c.state(), State::Unset);
+    assert_eq!(seek(&mut c, first + 2), (Some(key_of(first + 2)), 1), "from unset");
+    assert_eq!(seek(&mut c, first), (Some(key_of(first + 2)), 1), "the separator below");
+    assert_eq!(seek(&mut c, first + 1), (Some(key_of(first + 2)), 1), "above it");
+    assert_eq!(exact(&mut c, first + 1), (None, 1), "a miss below the leaf");
+    assert_eq!(seek(&mut c, last), (Some(key_of(last)), 1), "from unset");
+    assert_eq!(exact(&mut c, last + 1), (None, 1), "a miss past the leaf");
+    assert_eq!(seek(&mut c, last), (Some(key_of(last)), 1), "from unset");
+    let leaf = c.tree.leaf_pgno();
+    assert_eq!(seek(&mut c, last + 1), (Some(key_of(last + 2)), 1), "to the next leaf");
+    assert_ne!(c.tree.leaf_pgno(), leaf);
+    assert_eq!(seek(&mut c, last + 2), (Some(key_of(last + 2)), 0), "its first key");
+    assert_eq!(seek(&mut c, first - 1), (Some(key_of(first + 2)), 1), "back: a descent");
+    assert_eq!(seek(&mut c, 1_500), (Some(key_of(1_500)), 1), "far: a descent");
+    assert_eq!(seek(&mut c, 5_000), (None, 1), "past the last key: a descent");
+    assert_eq!(seek(&mut c, 5_000), (None, 1), "after the end: a descent");
+    assert_eq!(latch.failure(), None);
+}
+
+/// The owned and the detached write cursors seek from their leaf too: a seek of the entry a
+/// cursor is at makes no root descent. A `TxnCursor` made stale by another writer's put descends
+/// once from the table's new tree, with no reseek of its saved key first, and a seek from the
+/// deleted state starts from the follower's leaf and leaves that state. Debug builds only.
+#[cfg(debug_assertions)]
+#[test]
+fn owned_and_txn_cursors_seek_from_their_leaf() {
+    let (_dir, env) = temp_env();
+    let mut rw = env.begin_rw().expect("begin");
+    let t = rw.create_table("t").expect("table");
+    for i in 0..400_u64 {
+        rw.put(&t, &key_of(2 * i), b"v").expect("put");
+    }
+    rw.commit().expect("commit");
+    let key = |entry: Option<(&[u8], &[u8])>| entry.map(|(k, _)| k.to_vec());
+    let tail = |entry: Option<(&[u8], KeyTail<'_>)>| entry.map(|(k, _)| k.to_vec());
+    let want = |i: u64| Some(key_of(i));
+
+    let ro = Arc::new(env.begin_ro().expect("ro"));
+    let mut c = ro.cursor_owned(&t).expect("cursor");
+    assert_eq!(counted(|| key(c.seek(&key_of(100)).expect("seek"))), (want(100), 1));
+    assert_eq!(counted(|| key(c.seek(&key_of(100)).expect("seek"))), (want(100), 0));
+    let found = counted(|| c.seek_exact(&key_of(100)).expect("exact").map(<[u8]>::to_vec));
+    assert_eq!(found, (Some(b"v".to_vec()), 0));
+    let found = counted(|| tail(c.seek_with_key_tail(&key_of(100), 3).expect("seek")));
+    assert_eq!(found, (want(100), 0));
+    assert_eq!(counted(|| key(c.seek(&key_of(700)).expect("seek"))), (want(700), 1));
+    drop((c, ro));
+
+    let mut rw = env.begin_rw().expect("begin");
+    let mut c = rw.cursor_detached(&t).expect("cursor");
+    assert_eq!(counted(|| key(c.seek(&rw, &key_of(100)).expect("seek"))), (want(100), 1));
+    assert_eq!(counted(|| key(c.seek(&rw, &key_of(100)).expect("seek"))), (want(100), 0));
+    rw.put(&t, &key_of(601), b"w").expect("put");
+    let reseeks = c.reseeks;
+    assert_eq!(
+        counted(|| key(c.seek(&rw, &key_of(100)).expect("seek"))),
+        (want(100), 1),
+        "stale: one descent from the new tree"
+    );
+    assert_eq!(c.reseeks, reseeks, "no reseek of the saved key first");
+    let found = counted(|| c.seek_exact(&rw, &key_of(100)).expect("exact").map(<[u8]>::to_vec));
+    assert_eq!(found, (Some(b"v".to_vec()), 0), "up to date again");
+    assert!(c.delete_current(&mut rw).expect("delete"));
+    assert_eq!(c.state(), (State::At, true), "on the follower, deleted");
+    let found = counted(|| tail(c.seek_with_key_tail(&rw, &key_of(102), 0).expect("seek")));
+    assert_eq!(found, (want(102), 0), "from the follower's leaf");
+    assert_eq!(c.state(), (State::At, false), "the seek left the deleted state");
+    drop(c);
+    rw.commit().expect("commit");
+}
+
+/// A table created or dropped in the transaction moves its schema counter but not the write
+/// stamp of a `TxnCursor`'s table, so `TxnCursor::retarget` keeps the cursor's path: a seek inside
+/// its leaf after the change makes no root descent and lands where a new cursor's seek lands.
+/// Debug builds only.
+#[cfg(debug_assertions)]
+#[test]
+fn a_txn_cursor_seeks_from_its_leaf_after_a_schema_change() {
+    let (_dir, env) = temp_env();
+    let mut rw = env.begin_rw().expect("begin");
+    let t = rw.create_table("t").expect("table");
+    for i in 0..400_u64 {
+        rw.put(&t, &key_of(2 * i), b"v").expect("put");
+    }
+    rw.commit().expect("commit");
+    let entry = |e: Option<(&[u8], &[u8])>| e.map(|(k, v)| (k.to_vec(), v.to_vec()));
+
+    let mut rw = env.begin_rw().expect("begin");
+    rw.put(&t, &key_of(601), b"w").expect("put");
+    let mut c = rw.cursor_detached(&t).expect("cursor");
+    assert_eq!(counted(|| entry(c.seek(&rw, &key_of(100)).expect("seek"))).1, 1);
+    let reseeks = c.reseeks;
+
+    let u = rw.create_table("u").expect("create");
+    let (got, descents) = counted(|| entry(c.seek(&rw, &key_of(100)).expect("seek")));
+    let mut fresh = rw.cursor_detached(&t).expect("cursor");
+    assert_eq!(got, entry(fresh.seek(&rw, &key_of(100)).expect("seek")), "a fresh seek's entry");
+    assert_eq!(descents, 0, "after a create: from the leaf");
+
+    rw.drop_table(u).expect("drop");
+    let (got, descents) =
+        counted(|| c.seek_exact(&rw, &key_of(100)).expect("exact").map(<[u8]>::to_vec));
+    let mut fresh = rw.cursor_detached(&t).expect("cursor");
+    let want = fresh.seek_exact(&rw, &key_of(100)).expect("exact").map(<[u8]>::to_vec);
+    assert_eq!(got, want, "a fresh exact seek's value");
+    assert_eq!(descents, 0, "after a drop: from the leaf");
+    assert_eq!(entry(c.next(&rw).expect("next")), entry(fresh.next(&rw).expect("next")));
+    assert_eq!(entry(c.prev(&rw).expect("prev")), entry(fresh.prev(&rw).expect("prev")));
+    assert_eq!(c.reseeks, reseeks, "no reseek");
+    drop((c, fresh));
+    rw.commit().expect("commit");
+}
+
+/// A seek of a cursor at an entry meets damage in a page it enters with a descent's exact
+/// message, the one a new cursor's seek meets: the next leaf, sought from the leaf's end (a key
+/// past the leaf descends from the root), with its kind byte changed (and its CRC restamped).
+/// Damage on the path the cursor already holds is not met again: with the root's kind changed, a
+/// new cursor's seek fails at the root, and a seek inside the cursor's leaf does not.
+#[test]
+fn a_seek_from_the_leaf_meets_damage_as_a_descent_does() {
+    /// The kind byte of a page header (`page.rs`).
+    const KIND: usize = 4;
+    fn message<T: std::fmt::Debug>(r: Result<T>) -> String {
+        match r {
+            Err(Error::Corrupt(m)) => m,
+            other => panic!("not Corrupt: {other:?}"),
+        }
+    }
+    let (mut store, root) = even_tree(1_000);
+    assert_eq!(root.height, 3);
+    let (leaf, _, last) = a_middle_leaf(&store, &root);
+    let leaves = walk_tree(&store.reader(), &root).leaves;
+    let next = leaves[leaves.iter().position(|&l| l == leaf).expect("a leaf") + 1];
+    let saved = store.raw(next).to_vec();
+    let branch_kind = store.raw(root.root)[KIND];
+    store.raw_mut(next)[KIND] = branch_kind;
+    store.restamp(next);
+    let want = format!("page {next} is a Branch at depth 3 of a tree of height 3");
+    let s = &store.reader();
+    let mut c = TreeCursor::default();
+    assert_eq!(
+        c.seek(s, &root, None, &key_of(last)).expect("seek"),
+        Some((&key_of(last)[..], &(last / 2).to_le_bytes()[..]))
+    );
+    let page = c.leaf_page(s).expect("leaf");
+    assert_eq!(message(c.seek(s, &root, page, &key_of(last + 1))), want, "from the leaf");
+    assert_eq!(c.state(), State::Unset, "an error leaves the cursor unset");
+    assert_eq!(message(TreeCursor::default().seek(s, &root, None, &key_of(last + 1))), want);
+    let latch = Latch::default();
+    let mut public = Cursor::new(s, root, &latch);
+    assert!(public.seek(&key_of(last)).expect("seek").is_some());
+    assert_eq!(message(public.seek(&key_of(last + 1))), want, "the public cursor");
+    store.raw_mut(next).copy_from_slice(&saved);
+    store.restamp(next);
+
+    let s = &store.reader();
+    let mut c = TreeCursor::default();
+    c.seek(s, &root, None, &key_of(last)).expect("seek");
+    let saved = store.raw(root.root).to_vec();
+    store.raw_mut(root.root)[KIND] = saved[KIND] ^ 0x03;
+    store.restamp(root.root);
+    let s = &store.reader();
+    assert!(message(TreeCursor::default().seek(s, &root, None, &key_of(last)))
+        .starts_with(&format!("page {}", root.root)));
+    let page = c.leaf_page(s).expect("leaf");
+    let got = c.seek(s, &root, page, &key_of(last - 2)).expect("inside the leaf");
+    assert_eq!(got.map(|(k, _)| k.to_vec()), Some(key_of(last - 2)));
+    store.raw_mut(root.root).copy_from_slice(&saved);
 }

@@ -19,6 +19,12 @@
 //! view, in that order. It hands the leaf's view to the move that settles there, which reads the
 //! entry through it: an exact seek's hit is the search's own result ([`Find::Found`]), not a
 //! second read of the cell.
+//!
+//! A seek starts from the leaf the cursor is at when its caller holds that leaf's page and vouches
+//! that the path is still the tree's ([`TreeCursor::seek`]): a key between the leaf's first and
+//! last keys is searched in that leaf alone, and any other key descends from the root
+//! ([`TreeCursor::near`]). Such a key's entry is the one a descent from the root finds; the leaf
+//! the cursor already holds is not checked again, as a step does not check it again.
 
 use super::{read::tighten, PageRead, TreeRoot, MAX_HEIGHT};
 use crate::{
@@ -26,6 +32,15 @@ use crate::{
     latch::Latch,
     page::{self, Find, Kind, LeafView, Search, Val, View},
 };
+
+// Test-only, in debug test builds only: the release benchmark is compiled with the test
+// configuration, and a thread-local update on a timed path would show in its timings.
+#[cfg(all(test, debug_assertions))]
+thread_local! {
+    /// Test-only: how many moves descended from the root ([`TreeCursor::start_with`] and
+    /// [`TreeCursor::find`]), so a test can tell a seek that started from the cursor's leaf.
+    pub(crate) static ROOT_DESCENTS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
 
 /// A `(key, value)` entry borrowed from a page store.
 pub(crate) type Entry<'s> = (&'s [u8], &'s [u8]);
@@ -139,6 +154,11 @@ enum Edge<'k> {
 /// holds it.
 type Reached<'s> = (LeafView<'s>, Option<Val<'s>>);
 
+/// What a seek from the leaf the cursor is at returns ([`TreeCursor::seek_from_leaf`],
+/// [`TreeCursor::find_from_leaf`]): the landing, an entry `T` with its leaf's page or none, when
+/// that leaf settled the seek; `None` when the seek must start from the root.
+type FromLeaf<'s, T> = Option<Option<(T, &'s [u8])>>;
+
 /// The position of a cursor over one tree, detached from it: each move takes the page store and
 /// the tree's root (see the module docs). An error leaves it [`State::Unset`].
 ///
@@ -179,6 +199,12 @@ impl TreeCursor {
     /// Where the cursor is.
     pub(crate) fn state(&self) -> State {
         self.state
+    }
+
+    /// Test-only: the path in use, as `(page, slot)` per level from the root.
+    #[cfg(test)]
+    pub(crate) fn path(&self) -> Vec<(u32, u16)> {
+        self.pages.iter().copied().zip(self.slots.iter().copied()).take(self.depth).collect()
     }
 
     /// The last step of the path: the leaf and the entry while the cursor is at one.
@@ -233,6 +259,29 @@ impl TreeCursor {
         (self.pages[branches.len()], self.slots[branches.len()]) = (leaf, narrow(slot));
         self.depth = depth;
         self.state = State::At;
+    }
+
+    /// Place the cursor where a seek of a key just deleted from entry `slot` of `leaf`, below
+    /// `branches` (as [`Self::place`] takes them), lands, and return the entry there: entry `slot`
+    /// of the leaf if it has one, else the first entry of the leaves after it, or after the end.
+    /// The caller is the writer whose delete took the entry out of that leaf of its own pages and
+    /// changed no separator, so a descent for the key would take exactly this path and find its
+    /// insertion point at `slot`; from there this lands as [`Self::seek`] does ([`Self::land`]).
+    pub(crate) fn place_after_delete<'s, S: PageRead + ?Sized>(
+        &mut self,
+        store: &'s S,
+        root: &TreeRoot,
+        branches: &[(u32, usize)],
+        leaf: u32,
+        slot: usize,
+    ) -> Result<Option<Entry<'s>>> {
+        self.place(branches, leaf, slot);
+        let read = |leaf: &LeafView<'s>, i| view_entry(store, leaf, i);
+        self.guarded(|c| {
+            let view = LeafView::new(store.page(leaf)?)?;
+            c.land(store, root, view, true, read)
+        })
+        .map(entry)
     }
 
     /// Move to the first entry (after the end of an empty tree).
@@ -307,39 +356,51 @@ impl TreeCursor {
     }
 
     /// Move to the first entry `>= key`; after the end if there is none.
+    ///
+    /// `leaf` is the page of the leaf the cursor is at, passed by a caller that holds it and
+    /// vouches that the cursor's path is still a path of `root`'s tree (the tree has not changed
+    /// since the cursor last moved): the seek then starts from that leaf ([`Self::near`]). With
+    /// `None`, or a cursor not at an entry, it descends from the root. A caller whose tree changed
+    /// under the path passes `None`.
     pub(crate) fn seek<'s, S: PageRead + ?Sized>(
         &mut self,
         store: &'s S,
         root: &TreeRoot,
+        leaf: Option<&'s [u8]>,
         key: &[u8],
     ) -> Result<Option<Entry<'s>>> {
-        self.guarded(|c| c.start(store, root, Edge::Key(key))).map(entry)
+        let read = |leaf: &LeafView<'s>, i| view_entry(store, leaf, i);
+        self.guarded(|c| c.start_near(store, root, leaf, key, read)).map(entry)
     }
 
     /// [`Self::seek`] followed by [`Self::current_with_key_tail`]: move to the first entry `>=
     /// key` (after the end if there is none) and return it as its key and its value joined to the
-    /// key's last `t` bytes ([`KeyTail`]). The entry is read through the view the descent parsed,
-    /// so the leaf is fetched and its header parsed once, and an overflow value read once.
+    /// key's last `t` bytes ([`KeyTail`]). The entry is read through the view the seek parsed, so
+    /// the leaf is fetched and its header parsed once, and an overflow value read once. `leaf` is
+    /// [`Self::seek`]'s.
     pub(crate) fn seek_with_key_tail<'s, S: PageRead + ?Sized>(
         &mut self,
         store: &'s S,
         root: &TreeRoot,
+        leaf: Option<&'s [u8]>,
         key: &[u8],
         t: usize,
     ) -> Result<Option<(&'s [u8], KeyTail<'s>)>> {
         let read = |leaf: &LeafView<'s>, i| key_tail(store, leaf.entry_with_key_tail(i, t)?);
-        let landed = self.guarded(|c| c.start_with(store, root, Edge::Key(key), read))?;
+        let landed = self.guarded(|c| c.start_near(store, root, leaf, key, read))?;
         Ok(landed.map(|(entry, _)| entry))
     }
 
-    /// Move to the entry `key` and return its value; unset if there is none.
+    /// Move to the entry `key` and return its value; unset if there is none. `leaf` is
+    /// [`Self::seek`]'s.
     pub(crate) fn seek_exact<'s, S: PageRead + ?Sized>(
         &mut self,
         store: &'s S,
         root: &TreeRoot,
+        leaf: Option<&'s [u8]>,
         key: &[u8],
     ) -> Result<Option<&'s [u8]>> {
-        Ok(self.guarded(|c| c.find(store, root, key))?.map(|(value, _)| value))
+        Ok(self.guarded(|c| c.find_near(store, root, leaf, key))?.map(|(value, _)| value))
     }
 
     /// Move one entry forward (`forward`) or backward only if the entry there shares the first
@@ -424,6 +485,18 @@ impl TreeCursor {
         (self.state == State::At).then(|| self.pages[self.depth - 1])
     }
 
+    /// The page of the leaf the cursor is at, fetched with the per-fetch checks
+    /// ([`PageRead::page`]), for a seek from it ([`Self::seek`]); `None` if the cursor is not at
+    /// an entry. An error leaves the cursor unset.
+    #[inline]
+    pub(crate) fn leaf_page<'s, S: PageRead + ?Sized>(
+        &mut self,
+        store: &'s S,
+    ) -> Result<Option<&'s [u8]>> {
+        let Some(pgno) = self.leaf_pgno() else { return Ok(None) };
+        self.guarded(|_| store.page(pgno)).map(Some)
+    }
+
     /// [`Self::next`] (`forward`) or [`Self::prev`] for a cursor at an entry, from `leaf`: the page
     /// of the leaf it is at, as the cursor fetched it with every check when it entered it.
     pub(crate) fn step_from<'s, S: PageRead + ?Sized>(
@@ -467,6 +540,8 @@ impl TreeCursor {
         if root.is_empty() {
             return Ok(None);
         }
+        #[cfg(all(test, debug_assertions))]
+        ROOT_DESCENTS.with(|n| n.set(n.get() + 1));
         match self.descend(store, root, root.root, root.root_txn, Edge::Exact(key))? {
             (leaf, Some(value)) => {
                 self.state = State::At;
@@ -522,8 +597,115 @@ impl TreeCursor {
             self.state = if forward { State::AfterEnd } else { State::BeforeStart };
             return Ok(None);
         }
+        #[cfg(all(test, debug_assertions))]
+        ROOT_DESCENTS.with(|n| n.set(n.get() + 1));
         let (leaf, _) = self.descend(store, root, root.root, root.root_txn, edge)?;
         self.land(store, root, leaf, forward, read)
+    }
+
+    /// [`Self::seek`]'s move: from the leaf the cursor is at when the caller passes its page
+    /// (`leaf`) and the cursor is at an entry, as [`Self::seek_from_leaf`] settles it; else, or
+    /// when that leaf does not settle it, descend from the root ([`Self::start_with`]). The entry
+    /// settled on is `read(leaf, slot)`, returned with the leaf's page.
+    #[inline]
+    fn start_near<'s, S: PageRead + ?Sized, T>(
+        &mut self,
+        store: &'s S,
+        root: &TreeRoot,
+        leaf: Option<&'s [u8]>,
+        key: &[u8],
+        read: impl Fn(&LeafView<'s>, usize) -> Result<T>,
+    ) -> Result<Option<(T, &'s [u8])>> {
+        if let (State::At, Some(page)) = (self.state, leaf) {
+            if let Some(landing) = self.seek_from_leaf(store, root, page, key, &read)? {
+                return Ok(landing);
+            }
+        }
+        self.start_with(store, root, Edge::Key(key), read)
+    }
+
+    /// [`Self::seek_exact`]'s move, [`Self::start_near`]'s rules: from the leaf the cursor is at,
+    /// as [`Self::find_from_leaf`] settles it; else, or when that leaf does not settle it, find
+    /// the key from the root ([`Self::find`]).
+    #[inline]
+    fn find_near<'s, S: PageRead + ?Sized>(
+        &mut self,
+        store: &'s S,
+        root: &TreeRoot,
+        leaf: Option<&'s [u8]>,
+        key: &[u8],
+    ) -> Result<Option<(&'s [u8], &'s [u8])>> {
+        if let (State::At, Some(page)) = (self.state, leaf) {
+            if let Some(found) = self.find_from_leaf(store, page, key)? {
+                return Ok(found);
+            }
+        }
+        self.find(store, root, key)
+    }
+
+    /// [`Self::start_near`] from `page`, the page of the leaf the cursor is at: settle in that
+    /// leaf when [`Self::near`] places the key in it, returning the landing; `None` if the seek
+    /// must descend from the root.
+    ///
+    /// Never inlined: a new cursor's seek, and the adapter's cursor per read, must compile as the
+    /// root descent alone. With this code inlined beside it, [`Self::find`] and
+    /// [`Self::land_beyond`] went out of line and every seek grew, positioned or not.
+    #[inline(never)]
+    fn seek_from_leaf<'s, S: PageRead + ?Sized, T>(
+        &mut self,
+        store: &'s S,
+        root: &TreeRoot,
+        page: &'s [u8],
+        key: &[u8],
+        read: impl Fn(&LeafView<'s>, usize) -> Result<T>,
+    ) -> Result<FromLeaf<'s, T>> {
+        let Some(view) = self.near(page, key)? else { return Ok(None) };
+        let (Search::Found(slot) | Search::NotFound(slot)) = view.search(key)?;
+        self.set_top_slot(slot);
+        self.land(store, root, view, true, read).map(Some)
+    }
+
+    /// [`Self::find_near`] from `page`, the page of the leaf the cursor is at: a key
+    /// [`Self::near`] places in that leaf is found by its search (a hit returns the search's value
+    /// with the leaf's page; a miss leaves the cursor unset, as [`Self::find`] leaves it, `None`
+    /// inside); `None` if the key must be found from the root. Never inlined, as
+    /// [`Self::seek_from_leaf`] is not.
+    #[inline(never)]
+    fn find_from_leaf<'s, S: PageRead + ?Sized>(
+        &mut self,
+        store: &'s S,
+        page: &'s [u8],
+        key: &[u8],
+    ) -> Result<FromLeaf<'s, &'s [u8]>> {
+        let Some(view) = self.near(page, key)? else { return Ok(None) };
+        let Find::Found { index, value } = view.find(key)? else {
+            self.reset(State::Unset);
+            return Ok(Some(None));
+        };
+        self.set_top_slot(index);
+        Ok(Some(Some((store.value(value)?, page))))
+    }
+
+    /// The view of `page`, the page of the leaf the cursor is at, when `key` lies between the
+    /// leaf's first and last keys; `None` for any other key, which descends from the root.
+    ///
+    /// The cursor entered the leaf with a descent's checks, so its keys lie in the range the
+    /// separators of all its ancestors give it, and a key between its first and last keys lies
+    /// there too: a descent from the root takes the cursor's own path and searches this leaf.
+    /// A key outside the leaf is not placed from the parent's separators: a seek that misses the
+    /// leaf would pay that fetch and its compares before descending anyway, and seeks that go on
+    /// forward mostly land in the leaf they are at.
+    ///
+    /// Inlined into its two callers, [`Self::seek_from_leaf`] and [`Self::find_from_leaf`], which
+    /// are never inlined themselves, so a seek from the leaf makes one call.
+    #[inline(always)]
+    fn near<'s>(&self, page: &'s [u8], key: &[u8]) -> Result<Option<LeafView<'s>>> {
+        debug_assert_eq!(page::pgno(page), self.pages[self.depth - 1], "the cursor's leaf");
+        let leaf = LeafView::new(page)?;
+        let Some(last) = leaf.nkeys().checked_sub(1) else { return Ok(None) };
+        let inside = page::cmp_keys(key, leaf.key(0)?).is_ge()
+            && page::cmp_keys(key, leaf.key(last)?).is_le();
+        Ok(inside.then_some(leaf))
     }
 
     /// From the entry the cursor is at, move one entry forward or backward, crossing to the
@@ -852,16 +1034,21 @@ impl<'t> Cursor<'t> {
 
     /// Move to the first entry whose key is `>= key` and return it; `None` (the cursor after the
     /// end) if there is none.
+    ///
+    /// The seek starts from the remembered leaf (see the module docs): the transaction's tree
+    /// cannot change while the cursor borrows it.
     pub fn seek(&mut self, key: &[u8]) -> Result<Option<(&'t [u8], &'t [u8])>> {
-        let (store, root) = (self.store, &self.root);
-        let moved = self.tree.guarded(|c| c.start(store, root, Edge::Key(key)));
+        let (store, root, leaf) = (self.store, &self.root, self.leaf);
+        let read = |leaf: &LeafView<'t>, i| view_entry(store, leaf, i);
+        let moved = self.tree.guarded(|c| c.start_near(store, root, leaf, key, read));
         self.track(moved)
     }
 
     /// Move to the entry `key` and return its value; `None` (the cursor unset) if there is none.
+    /// The seek starts from the remembered leaf, as [`Self::seek`] does.
     pub fn seek_exact(&mut self, key: &[u8]) -> Result<Option<&'t [u8]>> {
-        let (store, root) = (self.store, &self.root);
-        let moved = self.tree.guarded(|c| c.find(store, root, key));
+        let (store, root, leaf) = (self.store, &self.root, self.leaf);
+        let moved = self.tree.guarded(|c| c.find_near(store, root, leaf, key));
         self.track(moved)
     }
 

@@ -297,8 +297,8 @@ impl Allocator {
     }
 
     /// Take a page for the transaction: one from `pool`, else the next page number, for which
-    /// `grow(new_page_count)` must first make room. The caller zero-fills the page. A failure
-    /// changes nothing.
+    /// `grow(new_page_count)` must first make room. The page keeps its old bytes: the caller
+    /// lays it out (`PageWrite::alloc`). A failure changes nothing.
     pub(crate) fn allocate(&mut self, grow: impl FnOnce(u32) -> Result<()>) -> Result<u32> {
         self.bump_epoch();
         #[cfg(test)]

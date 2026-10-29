@@ -380,10 +380,35 @@ impl RoCursor {
     }
 
     /// Move to the first entry whose key is `>= key` and return it; `None` (the cursor after the
-    /// end) if there is none.
+    /// end) if there is none. From an entry, the seek starts from the page of its leaf, fetched
+    /// again as [`Self::next`] fetches it (see [`Cursor::seek`]).
+    //
+    // A cursor not at an entry seeks with no leaf, from the root: that constant `None` folds the
+    // seek from a leaf away, so the seek of a new cursor (the adapter makes one per read)
+    // compiles as the root descent alone, plus one compare. A cursor at an entry makes one call,
+    // `seek_at_entry`. `seek_exact` and `seek_with_key_tail` are built the same way.
     #[inline]
     pub fn seek(&mut self, key: &[u8]) -> Result<Option<(&[u8], &[u8])>> {
-        self.moved(|c, store, root| c.seek(store, root, key))
+        if self.tree.state() == State::At {
+            self.seek_at_entry(key)
+        } else {
+            self.moved(|c, store, root| c.seek(store, root, None, key))
+        }
+    }
+
+    /// [`Self::seek`] from an entry: from the page of its leaf ([`Self::leaf`]). Never inlined:
+    /// that fetch and the seek from the leaf, inline in the seek's body, grew the seek of a new
+    /// cursor too, which never takes them.
+    #[inline(never)]
+    fn seek_at_entry(&mut self, key: &[u8]) -> Result<Option<(&[u8], &[u8])>> {
+        self.moved(|c, store, root| c.seek(store, root, Self::leaf(c, store), key))
+    }
+
+    /// The page of the leaf `tree` is at, fetched again without the per-fetch checks it passed
+    /// when the cursor entered it ([`Snapshot::page_again`]), for a seek from it.
+    #[inline]
+    fn leaf<'s>(tree: &TreeCursor, snapshot: &'s Snapshot) -> Option<&'s [u8]> {
+        tree.leaf_pgno().and_then(|p| snapshot.page_again(p))
     }
 
     /// [`Self::seek`] followed by [`Self::current_with_key_tail`], from one leaf access: move to
@@ -397,13 +422,39 @@ impl RoCursor {
         key: &[u8],
         t: usize,
     ) -> Result<Option<(&[u8], KeyTail<'_>)>> {
-        self.moved(|c, store, root| c.seek_with_key_tail(store, root, key, t))
+        if self.tree.state() == State::At {
+            self.seek_with_key_tail_at_entry(key, t)
+        } else {
+            self.moved(|c, store, root| c.seek_with_key_tail(store, root, None, key, t))
+        }
+    }
+
+    /// [`Self::seek_with_key_tail`] from an entry, never inlined as [`Self::seek_at_entry`] is
+    /// not.
+    #[inline(never)]
+    fn seek_with_key_tail_at_entry(
+        &mut self,
+        key: &[u8],
+        t: usize,
+    ) -> Result<Option<(&[u8], KeyTail<'_>)>> {
+        self.moved(|c, store, root| c.seek_with_key_tail(store, root, Self::leaf(c, store), key, t))
     }
 
     /// Move to the entry `key` and return its value; `None` (the cursor unset) if there is none.
+    /// The seek starts as [`Self::seek`]'s does.
     #[inline]
     pub fn seek_exact(&mut self, key: &[u8]) -> Result<Option<&[u8]>> {
-        self.moved(|c, store, root| c.seek_exact(store, root, key))
+        if self.tree.state() == State::At {
+            self.seek_exact_at_entry(key)
+        } else {
+            self.moved(|c, store, root| c.seek_exact(store, root, None, key))
+        }
+    }
+
+    /// [`Self::seek_exact`] from an entry, never inlined as [`Self::seek_at_entry`] is not.
+    #[inline(never)]
+    fn seek_exact_at_entry(&mut self, key: &[u8]) -> Result<Option<&[u8]>> {
+        self.moved(|c, store, root| c.seek_exact(store, root, Self::leaf(c, store), key))
     }
 
     /// Move to the next entry only if its key shares the first `n` bytes of the current entry's
@@ -823,14 +874,33 @@ impl RwTxn {
     /// a quarter full absorbs same-parent siblings that fit, and the parents that lose a cell get
     /// the same test, up the tree.
     pub fn delete(&mut self, table: &Table, key: &[u8]) -> Result<bool> {
+        Ok(self.delete_entry(table, key)?.found)
+    }
+
+    /// [`Self::delete`] through the table's path cache ([`write::delete_cached`]), returning where
+    /// the delete left the cache ([`write::Removed::slot`]: the leaf it names holds the deleted
+    /// entry's follower at that slot).
+    fn delete_entry(&mut self, table: &Table, key: &[u8]) -> Result<write::Removed> {
         self.write(|work| {
             let i = work.working(table)?;
-            let (mut record, mut trusted) = (work.tables[i].record, work.tables[i].trusted);
-            let found = write::delete(work.writer_mut(), &mut record.root, &mut trusted, key)?;
-            if found {
+            let (writer, w) = work.writer_and_table(i);
+            let (mut record, mut trusted) = (w.record, w.trusted);
+            // Test-only: an emptied cache per delete, so every delete descends, and no slot, so a
+            // cursor finds its place again by key: the delete as it was before the cache.
+            #[cfg(test)]
+            let uncached = writer.no_path_cache;
+            #[cfg(test)]
+            if uncached {
+                w.cache.forget();
+            }
+            let removed =
+                write::delete_cached(writer, &mut record.root, &mut trusted, &mut w.cache, key)?;
+            #[cfg(test)]
+            let removed = write::Removed { slot: removed.slot.filter(|_| !uncached), ..removed };
+            if removed.found {
                 work.set_record(i, record, trusted);
             }
-            Ok(found)
+            Ok(removed)
         })
     }
 
@@ -1041,12 +1111,12 @@ impl RwCursor<'_> {
     /// Move to the first entry whose key is `>= key` and return it; `None` (the cursor after the
     /// end) if there is none.
     pub fn seek(&mut self, key: &[u8]) -> Result<Option<(&[u8], &[u8])>> {
-        self.moved(|c, store, root| c.seek(store, root, key))
+        self.moved(|c, store, root| c.seek(store, root, None, key))
     }
 
     /// Move to the entry `key` and return its value; `None` (the cursor unset) if there is none.
     pub fn seek_exact(&mut self, key: &[u8]) -> Result<Option<&[u8]>> {
-        self.moved(|c, store, root| c.seek_exact(store, root, key))
+        self.moved(|c, store, root| c.seek_exact(store, root, None, key))
     }
 
     /// Move to the next entry only if its key shares the first `n` bytes of the current entry's
@@ -1193,14 +1263,14 @@ fn find_again(
     *root = work.record(table)?.root;
     let store = work.writer();
     if put {
-        if tree.seek_exact(store, root, key)?.is_none() {
+        if tree.seek_exact(store, root, None, key)?.is_none() {
             return Err(Error::Failed(format!(
                 "the entry just put in table {:?} is missing",
                 table.name()
             )));
         }
     } else {
-        tree.seek(store, root, key)?;
+        tree.seek(store, root, None, key)?;
     }
     Ok(())
 }
@@ -1241,6 +1311,11 @@ fn save_key(saved: &mut Vec<u8>, key: &[u8]) {
 ///   it, and the prefix steps compare with the gone key. A cursor already in that state stays in
 ///   it, on its follower, or on the first entry after the follower if that is gone too. An unset
 ///   cursor, or one after the end or before the start, keeps its state over the new tree.
+///
+/// A seek ([`Self::seek`], [`Self::seek_exact`], [`Self::seek_with_key_tail`]) places the cursor
+/// anew, so on a changed table it takes the new tree and descends once from its root, without first
+/// finding its saved key again. While the table is unchanged (a table created or dropped changes
+/// none), it starts from the leaf the cursor is at.
 ///
 /// The reseek is lazy: it sees the table as it is at the cursor's next call. So if, before that
 /// call, another writer deleted the cursor's entry and put it back, or put an entry between it
@@ -1293,11 +1368,25 @@ impl std::fmt::Debug for TxnCursor {
     }
 }
 
+/// Test-only: what [`TxnCursor::position`] reports.
+#[cfg(test)]
+pub(crate) type CursorPosition = (State, Vec<(u32, u16)>, TreeRoot, Option<Vec<u8>>, bool);
+
 impl TxnCursor {
     /// Test-only: where the cursor is, and whether it sits after a deleted entry.
     #[cfg(test)]
     pub(crate) fn state(&self) -> (State, bool) {
         (self.tree.state(), self.deleted)
+    }
+
+    /// Test-only: what places the cursor, as a seek leaves it: its state and path, the tree it
+    /// reads, the key it would find its entry again by (while at one), and whether it is up to
+    /// date with `txn` (its next call makes no reseek).
+    #[cfg(test)]
+    pub(crate) fn position(&self, txn: &RwTxn) -> CursorPosition {
+        let at = self.tree.state() == State::At;
+        let key = at.then(|| self.key.clone());
+        (self.tree.state(), self.tree.path(), self.root, key, self.up_to_date(&txn.work))
     }
 
     /// The table's write stamp in `work` (0 while it has no working record), from the remembered
@@ -1402,7 +1491,7 @@ impl TxnCursor {
         let Self { tree, root, key, deleted, deleted_key, .. } = self;
         // At the entry `key` (while `deleted`, the deleted entry's follower): back on it if it is
         // still there, else on the first entry after it, as if its own delete had moved it there.
-        let found = match tree.seek(store, root, key) {
+        let found = match tree.seek(store, root, None, key) {
             Ok(Some((k, _))) if k == key.as_slice() => Ok(()),
             Ok(landed) => {
                 if !*deleted {
@@ -1421,6 +1510,48 @@ impl TxnCursor {
             *deleted = false;
         }
         found
+    }
+
+    /// For a seek, which places the cursor anew: [`Self::sync_slow`]'s checks, then the table's
+    /// new tree if it changed, without finding the place again ([`Self::refresh`]). Returns
+    /// whether the cursor's path is still a path of its tree (the table unchanged), so the seek
+    /// may start from its leaf; else the seek descends from the new root. [`Error::WrongTxn`] and
+    /// [`Error::StaleTable`] change nothing.
+    #[inline(never)]
+    fn retarget(&mut self, work: &Work) -> Result<bool> {
+        self.check(work)?;
+        let writes = self.table_writes(work);
+        if writes == self.writes {
+            return Ok(true);
+        }
+        self.root = match self.slot {
+            Some(i) => work.tables[i].record.root,
+            None => work.record(&self.table)?.root,
+        };
+        self.writes = writes;
+        Ok(false)
+    }
+
+    /// Run a seek: bring the cursor up to date with `txn` as [`Self::retarget`] does, leave the
+    /// deleted state, then `op` with the page of the leaf the cursor is at, fetched with the
+    /// checks ([`TreeCursor::leaf_page`]) while its path is still its tree's, else `None` (see
+    /// [`TreeCursor::seek`]). A failure latches the environment if it is one that latches.
+    #[inline(always)]
+    fn seek_call<'t, T>(
+        &mut self,
+        txn: &'t RwTxn,
+        op: impl FnOnce(&mut Self, &'t Writer, Option<&'t [u8]>) -> Result<T>,
+    ) -> Result<T> {
+        let work = &txn.work;
+        let store = work.writer();
+        let holds = if self.up_to_date(work) { Ok(true) } else { self.retarget(work) };
+        holds
+            .and_then(|holds| {
+                self.deleted = false;
+                let leaf = if holds { self.tree.leaf_page(store)? } else { None };
+                op(self, store, leaf)
+            })
+            .inspect_err(|e| txn.inner.latch.latch_error(e))
     }
 
     /// Run a call: bring the cursor up to date with `txn`, then `op`. A failure latches the
@@ -1521,24 +1652,28 @@ impl TxnCursor {
     }
 
     /// Move to the first entry whose key is `>= key` and return it; `None` (the cursor after the
-    /// end) if there is none.
+    /// end) if there is none. While the table is unchanged since the cursor's last call, the seek
+    /// starts from the leaf the cursor is at (see [`Cursor::seek`]); after a change it descends
+    /// once from the table's new tree, without first finding its old place again.
     pub fn seek<'t>(&mut self, txn: &'t RwTxn, key: &[u8]) -> Result<Option<(&'t [u8], &'t [u8])>> {
-        self.moved(txn, |c, store, root| c.seek(store, root, key))
+        self.seek_call(txn, |c, store, leaf| {
+            let moved = c.tree.seek(store, &c.root, leaf, key);
+            c.landed(moved)
+        })
     }
 
     /// [`Self::seek`] followed by [`Self::current_with_key_tail`], from one leaf access: move to
     /// the first entry whose key is `>= key` and return it as its key and its value with the
     /// key's last `t` bytes before it ([`KeyTail`]); `None` (the cursor after the end) if there
-    /// is none. The cursor is left as [`Self::seek`] leaves it.
+    /// is none. The cursor is left as [`Self::seek`] leaves it, and the seek starts as its does.
     pub fn seek_with_key_tail<'t>(
         &mut self,
         txn: &'t RwTxn,
         key: &[u8],
         t: usize,
     ) -> Result<Option<(&'t [u8], KeyTail<'t>)>> {
-        self.call(txn, |c, store| {
-            c.deleted = false;
-            let found = c.tree.seek_with_key_tail(store, &c.root, key, t);
+        self.seek_call(txn, |c, store, leaf| {
+            let found = c.tree.seek_with_key_tail(store, &c.root, leaf, key, t);
             if let Ok(Some((k, _))) = found {
                 save_key(&mut c.key, k);
             }
@@ -1547,10 +1682,10 @@ impl TxnCursor {
     }
 
     /// Move to the entry `key` and return its value; `None` (the cursor unset) if there is none.
+    /// The seek starts as [`Self::seek`]'s does.
     pub fn seek_exact<'t>(&mut self, txn: &'t RwTxn, key: &[u8]) -> Result<Option<&'t [u8]>> {
-        self.call(txn, |c, store| {
-            c.deleted = false;
-            let found = c.tree.seek_exact(store, &c.root, key);
+        self.seek_call(txn, |c, store, leaf| {
+            let found = c.tree.seek_exact(store, &c.root, leaf, key);
             if let Ok(Some(_)) = found {
                 save_key(&mut c.key, key);
             }
@@ -1667,22 +1802,51 @@ impl TxnCursor {
         deleted.map(|()| true)
     }
 
-    /// [`Self::delete_current`] of the entry `key`, which must be there.
+    /// Whether the deleted entry's follower shares the deleted key's first `n` bytes: after the
+    /// cursor's entry was deleted (by it or another writer), `true` if the cursor is on a follower
+    /// whose key starts with them, the entry [`Self::next_in_prefix`] would return; `false` if it
+    /// is after the end or `n` is longer than the deleted key. `false` too if the cursor is not in
+    /// the deleted state (no delete since its last move). The cursor does not move and stays in
+    /// the deleted state, unless the table changed and it finds its place again, as every call
+    /// does (a follower another writer deleted is then the first entry after it). Up to date, it
+    /// reads no page: the answer comes from the saved keys.
+    #[inline]
+    pub fn follower_shares_prefix(&mut self, txn: &RwTxn, n: usize) -> Result<bool> {
+        self.call(txn, |c, _| {
+            let on_follower = c.deleted && c.tree.state() == State::At;
+            Ok(on_follower && c.deleted_key.get(..n).is_some_and(|p| c.key.starts_with(p)))
+        })
+    }
+
+    /// [`Self::delete_current`] of the entry `key`, which must be there. The cursor lands on the
+    /// deleted entry's follower (or after the end): placed from the table's path cache when the
+    /// delete left it naming the entry's leaf ([`write::Removed::slot`]), else found again by key.
     fn delete_key(&mut self, txn: &mut RwTxn, key: &[u8]) -> Result<()> {
-        if !txn.delete(&self.table, key)? {
+        let removed = txn.delete_entry(&self.table, key)?;
+        if !removed.found {
             let cause =
                 format!("the entry under a cursor of table {:?} is missing", self.table.name());
             txn.inner.latch.fail(cause.clone());
             return Err(Error::Failed(cause));
         }
+        // Also leaves `slot` on the table's working record, which the delete created if needed.
         self.writes = self.table_writes(&txn.work);
-        let Self { table, root, tree, .. } = self;
-        let found = find_again(&txn.work, table, root, tree, key, false).and_then(|()| {
+        let Self { table, root, tree, slot, .. } = self;
+        let found = match (removed.slot, *slot) {
+            (Some(at), Some(i)) => {
+                let w = &txn.work.tables[i];
+                *root = w.record.root;
+                let store = txn.work.writer();
+                tree.place_after_delete(store, root, w.cache.branches(), w.cache.leaf(), at)
+            }
+            _ => find_again(&txn.work, table, root, tree, key, false)
+                .and_then(|()| tree.current(txn.work.writer())),
+        }
+        .map(|follower| {
             // The follower's key, which a reseek finds the cursor again by.
-            if let Some((k, _)) = tree.current(txn.work.writer())? {
+            if let Some((k, _)) = follower {
                 save_key(&mut self.key, k);
             }
-            Ok(())
         });
         self.deleted = found.is_ok();
         found.inspect_err(|e| txn.inner.latch.latch_error(e))

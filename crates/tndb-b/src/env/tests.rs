@@ -1293,3 +1293,91 @@ fn every_mapping_carries_the_random_read_flag_on_linux() {
         drop(ro);
     }
 }
+
+/// A value of `len` bytes for the stamp tests' key `i`.
+fn stamp_value(i: u32, len: usize) -> Vec<u8> {
+    (0..len).map(|j| (j as u32).wrapping_mul(31).wrapping_add(i.wrapping_mul(7)) as u8).collect()
+}
+
+/// Run the stamp tests' commits on a new file at `path`, with commit step 3's CRCs computed on
+/// `threads` threads (`Writer::stamp_threads`; `None`: `stamp::threads`' choice), then reopen
+/// it, check it and read every value back. The commits stamp tree pages and overflow runs of 1 to
+/// 10 pages, replace values in both directions and delete some; `big` adds a commit of 3 MiB of
+/// runs, past `stamp::threads`' threshold. Returns the threads each commit's CRCs took
+/// (`Writer::stamped_on`).
+fn stamp_workload(path: &Path, threads: Option<usize>, big: bool) -> Vec<usize> {
+    const LENS: [usize; 6] = [100, 3000, 5000, 9000, 20_000, 37_000];
+    let env = open(path);
+    env.with_writer(|w| w.stamp_threads = threads);
+    let mut model = BTreeMap::new();
+    let mut txn = env.begin_rw().expect("begin");
+    let t = txn.create_table("s").expect("table");
+    for i in 0u32..60 {
+        let v = stamp_value(i, LENS[i as usize % 6] + i as usize);
+        txn.put(&t, &i.to_be_bytes(), &v).expect("put");
+        model.insert(i, v);
+    }
+    txn.commit().expect("commit");
+    let mut on = vec![env.with_writer(|w| w.stamped_on)];
+    let mut txn = env.begin_rw().expect("begin");
+    for i in 0u32..60 {
+        if i % 5 == 0 {
+            assert!(txn.delete(&t, &i.to_be_bytes()).expect("delete"));
+            model.remove(&i);
+        } else if i % 3 == 0 {
+            let v = stamp_value(i + 100, LENS[(i as usize + 3) % 6]);
+            txn.put(&t, &i.to_be_bytes(), &v).expect("put");
+            model.insert(i, v);
+        }
+    }
+    txn.commit().expect("commit");
+    on.push(env.with_writer(|w| w.stamped_on));
+    if big {
+        let mut txn = env.begin_rw().expect("begin");
+        for i in 100u32..148 {
+            let v = stamp_value(i, 64 << 10);
+            txn.put(&t, &i.to_be_bytes(), &v).expect("put");
+            model.insert(i, v);
+        }
+        txn.commit().expect("commit");
+        on.push(env.with_writer(|w| w.stamped_on));
+    }
+    env.check().expect("check");
+    drop(env);
+    let env = open(path);
+    env.check().expect("check after reopen");
+    let txn = env.begin_ro().expect("begin");
+    let t = table(&txn, "s");
+    for (i, v) in &model {
+        assert_eq!(val(&txn, &t, &i.to_be_bytes()).as_ref(), Some(v), "key {i}");
+    }
+    on
+}
+
+#[test]
+fn a_parallel_stamp_writes_the_serial_stamps_bytes() {
+    // The same commits, their CRCs computed on 2, 3 and 5 threads, leave the file the serial
+    // loop leaves, byte for byte, which reopens, checks and reads back.
+    let (_serial_dir, serial) = temp();
+    assert_eq!(stamp_workload(&serial, Some(1), false), [1, 1]);
+    let serial = fs::read(&serial).expect("read");
+    for threads in [2, 3, 5] {
+        let (_dir, path) = temp();
+        assert_eq!(stamp_workload(&path, Some(threads), false), [threads, threads]);
+        assert!(fs::read(&path).expect("read") == serial, "{threads} threads");
+    }
+}
+
+#[test]
+fn a_commit_past_the_stamp_threshold_writes_the_serial_stamps_bytes() {
+    // A commit of 3 MiB of runs takes several threads by `stamp::threads`' own choice, unless
+    // the process may use one CPU only, and leaves the file the serial loop leaves.
+    let cpus = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
+    let (_serial_dir, serial) = temp();
+    assert_eq!(stamp_workload(&serial, Some(1), true), [1, 1, 1]);
+    let (_dir, path) = temp();
+    let on = stamp_workload(&path, None, true);
+    assert_eq!(on[..2], [1, 1], "the small commits stamp serially");
+    assert!(cpus == 1 || on[2] > 1, "the 3 MiB commit takes several threads: {on:?}");
+    assert!(fs::read(&path).expect("read") == fs::read(&serial).expect("read"));
+}

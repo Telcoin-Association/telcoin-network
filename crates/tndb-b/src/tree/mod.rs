@@ -33,6 +33,18 @@ pub(crate) const MAX_HEIGHT: u32 = 48;
 /// The most pages one tree can hold: every page number but the two meta pages and [`NULL_PGNO`].
 pub(crate) const MAX_TREE_PAGES: u64 = NULL_PGNO as u64 - 2;
 
+/// The byte debug builds fill every page [`PageWrite::alloc`] and [`PageWrite::alloc_run`] hand
+/// out with ([`poison`]): release builds leave a new page's old bytes, so no layout may rely on
+/// zeros, and the debug test suite runs every layout over this garbage to show none does.
+#[cfg(any(test, debug_assertions))]
+pub(crate) const POISON: u8 = 0xA5;
+
+/// Fill `bytes`, a page or run just allocated, with [`POISON`] (debug builds only).
+#[cfg(debug_assertions)]
+pub(crate) fn poison(bytes: &mut [u8]) {
+    bytes.fill(POISON);
+}
+
 /// The handle of one B+tree: where its root is and what it holds. An empty tree costs no pages.
 ///
 /// Encoding (32 bytes, little-endian; [`Self::encode`]):
@@ -266,7 +278,11 @@ pub(crate) trait PageWrite: PageRead {
     /// pages, so while every tree keeps its shape and separators.
     fn epoch(&self) -> u64;
 
-    /// A new private page, all zeros. A failure (e.g. the file cannot grow) changes nothing.
+    /// A new private page. Its bytes are not zeroed (debug builds fill it with [`POISON`]): the
+    /// caller overwrites it whole ([`Self::copy_published`]) or lays it out as a fresh page
+    /// (`page::init_header` and the cells after it), which writes every byte but the free gap of
+    /// the page it lays out, bytes that nothing reads. A failure (e.g. the file cannot grow)
+    /// changes nothing.
     fn alloc(&mut self) -> Result<u32>;
 
     /// The bytes of private page `pgno`, to change in place. A page that is not private is
@@ -290,8 +306,8 @@ pub(crate) trait PageWrite: PageRead {
     fn run_privacy(&self, pgno: u32, npages: u32) -> Option<bool>;
 
     /// A new private overflow run of `npages` contiguous pages, returning its first page. Its
-    /// bytes are not zeroed: the caller writes all of them ([`crate::overflow::encode_run`]). A
-    /// failure changes nothing.
+    /// bytes are not zeroed (debug builds fill them with [`POISON`]): the caller writes all of
+    /// them ([`crate::overflow::encode_run`]). A failure changes nothing.
     fn alloc_run(&mut self, npages: u32) -> Result<u32>;
 
     /// The bytes of private run `pgno` of `npages` pages, to write once before a leaf names it. A

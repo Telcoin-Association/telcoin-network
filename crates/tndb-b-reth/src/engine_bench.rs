@@ -13,7 +13,8 @@
 //! sequential keys and 32-byte random keys, each with a 100-byte value. One column runs, in order:
 //! a bulk sequential insert and a bulk random insert (one transaction each, timed as a whole and
 //! split into the put loop and the commit), the file size, point gets that all hit and that all
-//! miss, forward and reverse full scans, seeks each followed by a short range, small transactions
+//! miss, forward and reverse full scans, seeks each followed by a short range (at random targets,
+//! then at the same targets sorted ascending, the way a walker seeks forward), small transactions
 //! committed one by one, random updates and deletes over the random table, a `clear_table` of the
 //! sequential table, and then the put loops of the API rows (an append put, a cursor put with and
 //! without append, and the same through a detached cursor, `TxnCursor`, each of N sequential keys
@@ -54,14 +55,15 @@
 //!   order): `t4d` (tndb-b 4K Durable), `t16d` (16K Durable), `t4n` (4K NoSync), `md` (MDBX
 //!   Durable), `md4` (MDBX Durable with 4 KiB pages), `mn` (MDBX SafeNoSync).
 //! - `TNDB_B_BENCH_ROWS` picks the row groups, comma-separated (default all): `seq`, `rand`,
-//!   `get-hit`, `get-miss`, `scan-fwd`, `scan-rev`, `seek`, `small`, `mixed`, `clear`, `append`,
-//!   `delete` (the delete rows), `big` (the large-value rows), and the aliases `bulk` (`seq,rand`),
-//!   `get` (both gets) and `scan` (both scans). The file size rows come with `seq` or `rand`. A
-//!   group that needs a bulk table (`clear` the sequential one; the gets, scans, `seek` and `mixed`
-//!   the random one) builds it untimed when its own group is not selected. Only rows with a
-//!   measured cell are printed.
-//! - `TNDB_B_BENCH_REPEAT=k` (default 1) runs each selected read row (the gets, the scans and
-//!   `seek`) k times back to back and reports the median, so one read row can dominate a profile:
+//!   `get-hit`, `get-miss`, `scan-fwd`, `scan-rev`, `seek`, `seek-fwd` (the seek row's targets
+//!   sorted ascending, so each seek lands at or a little past the last one, often in the same leaf
+//!   or the next), `small`, `mixed`, `clear`, `append`, `delete` (the delete rows), `big` (the
+//!   large-value rows), and the aliases `bulk` (`seq,rand`), `get` (both gets) and `scan` (both
+//!   scans). The file size rows come with `seq` or `rand`. A group that needs a bulk table (`clear`
+//!   the sequential one; the gets, scans, both seeks and `mixed` the random one) builds it untimed
+//!   when its own group is not selected. Only rows with a measured cell are printed.
+//! - `TNDB_B_BENCH_REPEAT=k` (default 1) runs each selected read row (the gets, the scans and both
+//!   seeks) k times back to back and reports the median, so one read row can dominate a profile:
 //!   for example `TNDB_B_BENCH_ENGINES=t16d TNDB_B_BENCH_ROWS=get-hit TNDB_B_BENCH_REPEAT=20`. To
 //!   profile a put loop or a commit, select `seq` or `rand` and raise `TNDB_B_BENCH_N` instead.
 //!
@@ -175,6 +177,8 @@ struct Data {
     rand_keys: Vec<[u8; 32]>,
     /// Keys absent from the random table (also the seek targets).
     miss_keys: Vec<[u8; 32]>,
+    /// The forward seek row's targets: the seek row's, sorted ascending.
+    fwd_keys: Vec<[u8; 32]>,
     /// The values, picked by index modulo the pool.
     values: Vec<[u8; VALUE_LEN]>,
     /// The mixed row: (index into `rand_keys`, delete?).
@@ -250,6 +254,8 @@ impl Data {
         };
         let rand_keys: Vec<[u8; 32]> = (0..n).map(|_| key()).collect();
         let miss_keys: Vec<[u8; 32]> = (0..n).map(|_| key()).collect();
+        let mut fwd_keys = miss_keys[..SEEKS.min(n)].to_vec();
+        fwd_keys.sort_unstable();
         let mut rng = Rng(0x5eed_0000_0000_0002);
         let values = (0..VALUE_POOL)
             .map(|_| {
@@ -276,6 +282,7 @@ impl Data {
             n,
             rand_keys,
             miss_keys,
+            fwd_keys,
             values,
             mixed,
             big_keys,
@@ -320,6 +327,7 @@ enum Group {
     ScanFwd,
     ScanRev,
     Seek,
+    SeekFwd,
     Small,
     Mixed,
     Clear,
@@ -329,7 +337,7 @@ enum Group {
 }
 
 /// The names `TNDB_B_BENCH_ROWS` accepts, each with the groups it selects.
-const GROUP_NAMES: [(&str, &[Group]); 16] = [
+const GROUP_NAMES: [(&str, &[Group]); 17] = [
     ("seq", &[Group::Seq]),
     ("rand", &[Group::Rand]),
     ("bulk", &[Group::Seq, Group::Rand]),
@@ -340,6 +348,7 @@ const GROUP_NAMES: [(&str, &[Group]); 16] = [
     ("scan-rev", &[Group::ScanRev]),
     ("scan", &[Group::ScanFwd, Group::ScanRev]),
     ("seek", &[Group::Seek]),
+    ("seek-fwd", &[Group::SeekFwd]),
     ("small", &[Group::Small]),
     ("mixed", &[Group::Mixed]),
     ("clear", &[Group::Clear]),
@@ -437,7 +446,9 @@ impl Selection {
     /// Whether some selected group needs the random table.
     fn needs_rand(&self) -> bool {
         use Group::*;
-        [Rand, GetHit, GetMiss, ScanFwd, ScanRev, Seek, Mixed].into_iter().any(|g| self.has(g))
+        [Rand, GetHit, GetMiss, ScanFwd, ScanRev, Seek, SeekFwd, Mixed]
+            .into_iter()
+            .any(|g| self.has(g))
     }
 
     /// Run a read row `repeat` times and return the median wall time.
@@ -501,6 +512,7 @@ enum Row {
     ScanForward,
     ScanReverse,
     SeekRange,
+    SeekFwdRange,
     SmallMedian,
     SmallP99,
     SmallTotal,
@@ -547,6 +559,7 @@ impl Row {
         Row::ScanForward,
         Row::ScanReverse,
         Row::SeekRange,
+        Row::SeekFwdRange,
         Row::SmallMedian,
         Row::SmallP99,
         Row::SmallTotal,
@@ -594,6 +607,7 @@ impl Row {
             Row::ScanForward => format!("scan forward {k}k"),
             Row::ScanReverse => format!("scan reverse {k}k"),
             Row::SeekRange => format!("seek + {SEEK_RANGE} entries (per seek)"),
+            Row::SeekFwdRange => format!("seek fwd + {SEEK_RANGE} entries (per seek)"),
             Row::SmallMedian => format!("small txn ({SMALL_PUTS} puts) median"),
             Row::SmallP99 => "small txn p99".to_string(),
             Row::SmallTotal => format!("small txns total ({SMALL_TXNS})"),
@@ -1027,12 +1041,18 @@ fn tndb_reads(env: &Env, rand: &Table, data: &Data, sel: &Selection, col: &mut C
         col.set(Row::ScanReverse, Cell::Total(time));
     }
 
-    if sel.has(Group::Seek) {
-        let seeks = SEEKS.min(n);
+    let seeks = &data.miss_keys[..SEEKS.min(n)];
+    for (group, row, targets) in [
+        (Group::Seek, Row::SeekRange, seeks),
+        (Group::SeekFwd, Row::SeekFwdRange, &data.fwd_keys[..]),
+    ] {
+        if !sel.has(group) {
+            continue;
+        }
         let time = sel.median(|| {
             let start = Instant::now();
             let mut bytes = 0;
-            for k in &data.miss_keys[..seeks] {
+            for k in targets {
                 let mut entry = cursor.seek(k).expect("seek");
                 for _ in 1..SEEK_RANGE {
                     let Some((_, v)) = entry else { break };
@@ -1043,7 +1063,7 @@ fn tndb_reads(env: &Env, rand: &Table, data: &Data, sel: &Selection, col: &mut C
             black_box(bytes);
             start.elapsed()
         });
-        col.set(Row::SeekRange, Cell::PerOp(time, seeks));
+        col.set(row, Cell::PerOp(time, targets.len()));
     }
 }
 
@@ -1438,12 +1458,18 @@ fn mdbx_reads(env: &Environment, rand: u32, data: &Data, sel: &Selection, col: &
         col.set(Row::ScanReverse, Cell::Total(time));
     }
 
-    if sel.has(Group::Seek) {
-        let seeks = SEEKS.min(n);
+    let seeks = &data.miss_keys[..SEEKS.min(n)];
+    for (group, row, targets) in [
+        (Group::Seek, Row::SeekRange, seeks),
+        (Group::SeekFwd, Row::SeekFwdRange, &data.fwd_keys[..]),
+    ] {
+        if !sel.has(group) {
+            continue;
+        }
         let time = sel.median(|| {
             let start = Instant::now();
             let mut bytes = 0;
-            for k in &data.miss_keys[..seeks] {
+            for k in targets {
                 let mut entry: Kv<'_> = cursor.set_range(k).expect("seek");
                 for _ in 1..SEEK_RANGE {
                     let Some((_, v)) = entry else { break };
@@ -1454,7 +1480,7 @@ fn mdbx_reads(env: &Environment, rand: u32, data: &Data, sel: &Selection, col: &
             black_box(bytes);
             start.elapsed()
         });
-        col.set(Row::SeekRange, Cell::PerOp(time, seeks));
+        col.set(row, Cell::PerOp(time, targets.len()));
     }
 }
 

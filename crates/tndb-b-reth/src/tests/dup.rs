@@ -578,6 +578,42 @@ fn dup_cursor_steps_after_a_delete_or_last_match_mdbx() {
     }
 }
 
+/// A delete of each row of a key whose subkeys differ in their first byte (as hashed storage slots
+/// and trie paths do; the [`dup_steps`] rows' subkeys differ only in their last), then one step:
+/// the cursor is MDBX's. Whether the key keeps rows after the deleted one is told by the key's
+/// bytes alone, not by the subkey's.
+#[test]
+fn dup_delete_in_a_key_whose_subkeys_differ_in_their_first_byte_matches_mdbx() {
+    fn steps<D: Database>(db: &D, at: u8, then: &str) -> String {
+        let tx = db.tx_mut().unwrap();
+        for sk in [1, 2, 3] {
+            let entry = StorageEntry { key: B256::repeat_byte(sk), value: U256::from(sk) };
+            tx.put::<PlainStorageState>(a(1), entry).unwrap();
+        }
+        tx.put::<PlainStorageState>(a(2), e(1, 1)).unwrap();
+        let mut c = tx.cursor_dup_write::<PlainStorageState>().unwrap();
+        let sought = val(c.seek_by_key_subkey(a(1), B256::repeat_byte(at)));
+        let deleted = done(c.delete_current());
+        let step = match then {
+            "c" => row(c.current()),
+            "n" => row(c.next()),
+            "p" => row(c.prev()),
+            "nd" => row(c.next_dup()),
+            "pd" => row(c.prev_dup()),
+            "d" => done(c.delete_current()),
+            _ => panic!("unknown step {then}"),
+        };
+        format!("sk:1/{at}={sought} d={deleted} {then}={step}")
+    }
+    let (_mdbx_dir, mdbx) = create_mdbx_db();
+    let (_dir, db) = create_test_db(TndbEnvKind::RW);
+    for at in [1, 2, 3] {
+        for then in ["c", "n", "p", "nd", "pd", "d"] {
+            assert_eq!(steps(&db, at, then), steps(&mdbx, at, then));
+        }
+    }
+}
+
 /// The known differences from MDBX's dup cursors, pinned on both sides (as `(steps, MDBX's
 /// outcome, tndb-b's)`) so a change in either shows.
 ///

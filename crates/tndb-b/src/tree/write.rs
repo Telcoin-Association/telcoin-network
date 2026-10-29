@@ -41,6 +41,8 @@ thread_local! {
     pub(crate) static COW_VERIFIES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     /// Test-only: how many puts [`put_cached`] did in the cached leaf.
     pub(crate) static CACHED_PUTS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// Test-only: how many deletes [`delete_cached`] did in the cached leaf.
+    pub(crate) static CACHED_DELETES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 /// What a put does to the leaf it reaches.
@@ -78,6 +80,18 @@ pub(crate) struct Placed {
     /// The entry's slot in the leaf the table's [`PathCache`] then names; `None` after a split
     /// that left the cache empty (every split but an append split through a cache, which fills
     /// it with the new path: see [`put_from_root`]).
+    pub(crate) slot: Option<usize>,
+}
+
+/// What a delete through a table's [`PathCache`] did ([`delete_cached`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Removed {
+    /// True if the key was there (and is now gone).
+    pub(crate) found: bool,
+    /// The deleted entry's old slot in the leaf the table's [`PathCache`] then names, which is
+    /// now its follower's slot (the leaf's entry count if it was the last); `None` when the cache
+    /// is empty after the delete (a miss, or a delete that unlinked, collapsed, emptied or
+    /// merged).
     pub(crate) slot: Option<usize>,
 }
 
@@ -186,7 +200,7 @@ fn put_from_root<S: PageWrite + ?Sized>(
             },
         };
         let leaf = store.page_mut(p)?;
-        page::init_leaf_zeroed(leaf, p, txn);
+        page::init_leaf_header(leaf, p, txn);
         if page::LeafMut::new(leaf)?.insert(0, key, val)? == Fit::Full {
             return Err(bug("an entry overflows an empty leaf"));
         }
@@ -292,7 +306,7 @@ fn put_from_root<S: PageWrite + ?Sized>(
         },
         (LeafChange::Split { .. }, _) => (leaf, None),
     };
-    if let (Some(tail), Some(_)) = (tail, slot) {
+    if let (Some(mut tail), Some(_)) = (tail, slot) {
         tail.fill(store, leaf, path)?;
     }
     Ok(Placed { replaced, slot })
@@ -343,7 +357,7 @@ impl CacheTail<'_> {
     /// Fill the cache: `leaf`, reached by the trusted `path` the put left (already in the cache's
     /// buffer), with the range [`Self::set_range`] copied, in the current epoch.
     fn fill<S: PageWrite + ?Sized>(
-        self,
+        &mut self,
         store: &S,
         leaf: u32,
         path: &[(u32, usize)],
@@ -359,22 +373,24 @@ impl CacheTail<'_> {
     }
 }
 
-/// A table's write-path cache: the leaf its latest put reached, the branches above it, and the
+/// A table's write-path cache: the leaf its latest write reached, the branches above it, and the
 /// key range `[lo, hi)` that routes to that leaf (the intersection of every ancestor's
-/// separators, as [`read::descend`] keeps it), so the next put landing there skips the descent
-/// ([`put_cached`]). The bounds are owned copies in buffers the cache reuses.
+/// separators, as [`read::descend`] keeps it), so the next put or delete landing there skips the
+/// descent ([`put_cached`], [`delete_cached`]). The bounds are owned copies in buffers the cache
+/// reuses.
 ///
 /// It is filled after a put that ended on a trusted path (every page private, built here: see
 /// [`descend_write`]) without a split, or after an append split with the new path (from the split
 /// itself when the leaf's parent took the separator, else from a second descent: see
-/// [`put_from_root`]), and holds only while the allocator's epoch ([`PageWrite::epoch`]) is the one
-/// it was filled in. Every change to a tree's shape or separators allocates or frees a page (a
-/// copy, a split, a new root, an unlink or a collapse; a cleared or dropped tree frees its pages),
-/// and a commit or abort ends the transaction's private pages, each with a new epoch. An in-place
-/// insert, replace or delete changes only its leaf and no separator. So within the epoch the root
-/// still names the cached path, every page on it is still private, and exactly the keys in
-/// `[lo, hi)` route to the leaf. The catalog and the free list write through [`put`] and
-/// [`delete`] and have no cache.
+/// [`put_from_root`]); after a delete that only took the entry out of its leaf, and after a miss
+/// on a trusted path ([`delete_from_root`]). It holds only while the allocator's epoch
+/// ([`PageWrite::epoch`]) is the one it was filled in. Every change to a tree's shape or separators
+/// allocates or frees a page (a copy, a split, a new root, an unlink or a collapse; a cleared or
+/// dropped tree frees its pages), and a commit or abort ends the transaction's private pages, each
+/// with a new epoch. An in-place insert, replace or delete changes only its leaf and no separator.
+/// So within the epoch the root still names the cached path, every page on it is still private, and
+/// exactly the keys in `[lo, hi)` route to the leaf. The catalog and the free list write through
+/// [`put`] and [`delete`] and have no cache.
 #[derive(Debug)]
 pub(crate) struct PathCache {
     /// The epoch it was filled in; 0 (never an epoch) while empty.
@@ -408,8 +424,8 @@ impl PathCache {
     }
 
     /// The branches above the cached leaf, root first, as `(pgno, child index taken)`: the path a
-    /// descent for any key of the leaf's range takes. Meaningful only right after a put that
-    /// returned a slot ([`Placed::slot`]).
+    /// descent for any key of the leaf's range takes. Meaningful only right after a put or a
+    /// delete that returned a slot ([`Placed::slot`], [`Removed::slot`]).
     pub(crate) fn branches(&self) -> &[(u32, usize)] {
         &self.path
     }
@@ -526,6 +542,89 @@ fn put_in_cached_leaf<S: PageWrite + ?Sized>(
     #[cfg(all(test, debug_assertions))]
     CACHED_PUTS.with(|n| n.set(n.get() + 1));
     Ok(Some(Placed { replaced, slot: Some(slot) }))
+}
+
+/// [`delete`] through a table's write-path `cache` ([`PathCache`]), the twin of [`put_cached`]: a
+/// delete whose key lies in the cached leaf's range and whose entry leaves that leaf as it is (an
+/// inline value, another entry left, no merge due: [`merge_due`]) changes the leaf in place with no
+/// descent, exactly as the descent's delete would (the same leaf, change, entry count and bytes;
+/// nothing allocated or freed, so the cache stays valid). A key in the range that the leaf does not
+/// hold is a miss with no descent. Any other delete descends ([`delete_from_root`]) and refills the
+/// cache after a delete that only took the entry out of its leaf (or a miss on a path of this
+/// transaction's own pages). The returned slot places a cursor at the deleted entry's follower
+/// ([`Removed::slot`]).
+pub(crate) fn delete_cached<S: PageWrite + ?Sized>(
+    store: &mut S,
+    root: &mut TreeRoot,
+    trusted: &mut bool,
+    cache: &mut PathCache,
+    key: &[u8],
+) -> Result<Removed> {
+    if *trusted && cache.epoch == store.epoch() {
+        if let Some(removed) = delete_in_cached_leaf(store, root, cache, key)? {
+            return Ok(removed);
+        }
+    }
+    delete_from_root(store, root, trusted, Some(cache), key)
+}
+
+/// [`delete_cached`]'s delete in the cached leaf, which the caller found valid in this epoch for a
+/// trusted root: done if the key lies in the leaf's `[lo, hi)` and its delete changes only the
+/// leaf (`Some`); else `None`, having changed nothing. The descent's plan of such a delete is a
+/// [`DeleteShape::Leaf`] with no merge and no copy (every page on a cached path is private), so
+/// its change is this one: the cell out of the leaf, one entry fewer on the handle. It descends
+/// instead for a value in an overflow run (freed with the tree's other changes), the leaf's last
+/// entry (an unlink or a collapse), a leaf the delete would leave due a merge, or a handle that
+/// does not count the entry and another (the descent's plan reports it).
+fn delete_in_cached_leaf<S: PageWrite + ?Sized>(
+    store: &mut S,
+    root: &mut TreeRoot,
+    cache: &PathCache,
+    key: &[u8],
+) -> Result<Option<Removed>> {
+    let top = cache.path.first().map_or(cache.leaf, |&(p, _)| p);
+    let names_root = top == root.root && cache.path.len() + 1 == root.height as usize;
+    debug_assert!(names_root, "a path cache of this epoch names another tree");
+    if !names_root
+        || root.entries < 2
+        || cache.hi.get().is_some_and(|hi| page::cmp_keys(key, hi).is_ge())
+        || cache.lo.get().is_some_and(|lo| page::cmp_keys(key, lo).is_lt())
+    {
+        return Ok(None);
+    }
+    // The leaf's index on the path, for the merge rule; a root leaf never merges.
+    let (depth, merge) = (cache.path.len(), merging(store));
+    let (usable, leaf, txn) = (store.geometry().usable(), cache.leaf, store.txn());
+    let page = store.page_mut(leaf)?;
+    if page::pgno(page) != leaf || page::txn(page) != txn {
+        return Err(Error::Corrupt(format!(
+            "cached leaf {leaf} (txn {}) is not the page this txn wrote",
+            page::txn(page)
+        )));
+    }
+    // One header parse for the search and the change.
+    let page = page::LeafMut::new(page)?;
+    let index = {
+        let view = page.view();
+        let (index, value) = match view.find(key)? {
+            Find::Found { index, value } => (index, value),
+            // The key routes to this leaf only, and the leaf does not hold it.
+            Find::NotFound { .. } => return Ok(Some(Removed { found: false, slot: None })),
+        };
+        // The run must be freed with the tree's other changes: descend.
+        if matches!(value, Val::Overflow(_)) || view.nkeys() < 2 {
+            return Ok(None);
+        }
+        if merge && merge_due(depth, leaf_used_after_delete(&view, key, value), usable) {
+            return Ok(None);
+        }
+        index
+    };
+    page.delete(index)?;
+    root.entries -= 1;
+    #[cfg(all(test, debug_assertions))]
+    CACHED_DELETES.with(|n| n.set(n.get() + 1));
+    Ok(Some(Removed { found: true, slot: Some(index) }))
 }
 
 /// Test-only forms of [`put`] and [`delete`] for trees whose holder is not tracked: the root is
@@ -1240,8 +1339,9 @@ fn apply<S: PageWrite + ?Sized>(
     let Scratch { reserved, split, .. } = scratch;
     let mut take = || reserved.pop().ok_or_else(|| bug("a split ran out of reserved pages"));
 
-    // Split the leaf: plan from it, then write the right half into its new page (all zeros from
-    // the allocation) and the left half over the leaf.
+    // Split the leaf: plan from it, then write the right half into its new page (whatever bytes
+    // the allocation left: the layout writes all but the free gap) and the left half over the
+    // leaf.
     let mut right = take()?;
     split.split_leaf(store.page_mut(leaf)?, at, key, value, append)?;
     split.write_right(store.page_mut(right)?, right, txn)?;
@@ -1436,19 +1536,44 @@ pub(crate) fn delete<S: PageWrite + ?Sized>(
     trusted: &mut bool,
     key: &[u8],
 ) -> Result<bool> {
+    Ok(delete_from_root(store, root, trusted, None, key)?.found)
+}
+
+/// [`delete`], with a table's `cache` if given: the descent records its path straight into the
+/// cache's buffer ([`PathCache::lend_path`], which empties the cache), and the cache is filled
+/// again with the entry's leaf and the path to it (private and trusted once the delete is done)
+/// after a [`DeleteShape::Leaf`] delete that merged nothing, with the epoch its copies left; a
+/// miss fills it when every page on its path is this transaction's own (nothing copied, nothing
+/// verified, the epoch unchanged). Any other delete (an unlink, a collapse, an empty tree, a
+/// merge) frees pages and leaves the cache empty.
+fn delete_from_root<S: PageWrite + ?Sized>(
+    store: &mut S,
+    root: &mut TreeRoot,
+    trusted: &mut bool,
+    cache: Option<&mut PathCache>,
+    key: &[u8],
+) -> Result<Removed> {
+    const MISS: Removed = Removed { found: false, slot: None };
     root.check()?;
     if root.is_empty() {
-        return Ok(false);
+        return Ok(MISS);
     }
-    let mut path = Path::new();
-    let Some(plan) = plan_delete(&*store, root, *trusted, key, &mut path)? else {
-        return Ok(false);
+    let mut own_path = None;
+    let (path, mut tail) = match cache {
+        Some(cache) => {
+            let (path, tail) = cache.lend_path();
+            (path, Some(tail))
+        }
+        None => (own_path.insert(Path::new()), None),
+    };
+    let Some(plan) = plan_delete(&*store, root, *trusted, key, path, tail.as_mut())? else {
+        return Ok(MISS);
     };
     let buffers = plan.copies != 0 || !plan.merges.is_empty();
     let mut scratch = if buffers { store.take_scratch() } else { Scratch::default() };
     // A failed reservation gives its pages back itself; the buffers go back either way.
     let result = reserve(store, plan.copies, &mut scratch.reserved)
-        .and_then(|()| apply_delete(store, root, &mut path, &plan, &mut scratch));
+        .and_then(|()| apply_delete(store, root, path, &plan, &mut scratch));
     // Every reserved page is used, so this frees nothing unless the apply failed part way.
     for p in scratch.reserved.drain(..) {
         store.free(p);
@@ -1456,7 +1581,7 @@ pub(crate) fn delete<S: PageWrite + ?Sized>(
     if buffers {
         store.put_scratch(scratch);
     }
-    result?;
+    let changed = result?;
     // Only a delete that merged or read a sibling reports: on the release benchmark's timed path
     // (compiled with the test configuration) the hook costs a branch.
     #[cfg(test)]
@@ -1471,7 +1596,16 @@ pub(crate) fn delete<S: PageWrite + ?Sized>(
         DeleteShape::Collapse { root: new_root, .. } => store.is_private(new_root),
         DeleteShape::Empty => false,
     };
-    Ok(true)
+    // The entry left its leaf and nothing else changed: `path` leads to the leaf, private now,
+    // whose range `plan_delete` copied into the cache. Its follower is at the entry's old slot.
+    let slot = match (plan.shape, changed, tail) {
+        (DeleteShape::Leaf, Some(leaf), Some(mut tail)) if plan.merges.is_empty() => {
+            tail.fill(store, leaf, path)?;
+            Some(plan.at)
+        }
+        _ => None,
+    };
+    Ok(Removed { found: true, slot })
 }
 
 /// The read-only first half of a delete of `key` from a non-empty tree: descend to its leaf with
@@ -1480,19 +1614,31 @@ pub(crate) fn delete<S: PageWrite + ?Sized>(
 /// lookup's miss is checked), with nothing verified ([`Verify::Later`]). A hit verifies the
 /// published pages on the path ([`verify_path`]) before anything reads them further, and decides
 /// the change.
+///
+/// With a table's cache (`tail`, its path being `path`), a hit copies the leaf's range into it
+/// before anything changes, for [`delete_from_root`] to fill it once the delete is done; a miss
+/// fills it at once when the descent met only this transaction's own pages from a trusted root
+/// (the path a put's descent caches), since a miss changes nothing.
 fn plan_delete<S: PageWrite + ?Sized>(
     store: &S,
     root: &TreeRoot,
     root_trusted: bool,
     key: &[u8],
     path: &mut Path,
+    mut tail: Option<&mut CacheTail<'_>>,
 ) -> Result<Option<DeletePlan>> {
     let geometry = store.geometry();
-    let (leaf, _) = descend_write(store, root, root_trusted, key, Verify::Later, path)?;
+    let (leaf, published) = descend_write(store, root, root_trusted, key, Verify::Later, path)?;
+    if let Some(tail) = &mut tail {
+        tail.set_range(leaf.range);
+    }
     let (at, value) = match leaf.view.find(key)? {
         Find::Found { index, value } => (index, value),
         Find::NotFound { before, after, .. } => {
             check_miss(leaf.pgno, before, after, leaf.range.0, leaf.range.1)?;
+            if let Some(tail) = tail.filter(|_| root_trusted && published == 0) {
+                tail.fill(store, leaf.pgno, path)?;
+            }
             return Ok(None);
         }
     };
@@ -1549,11 +1695,7 @@ fn plan_delete<S: PageWrite + ?Sized>(
     // without the entry, or the keeper without the child (a first child takes the next one's
     // key with it, [`page::branch_delete`]).
     let changed = match shape {
-        DeleteShape::Leaf => {
-            // The entry's key is `key`, which its search compared equal.
-            let gone = page::cell_size_leaf(key.len(), value.cell_len()) + page::SLOT;
-            Some((path.len(), leaf.view.used().saturating_sub(gone)))
-        }
+        DeleteShape::Leaf => Some((path.len(), leaf_used_after_delete(&leaf.view, key, value))),
         DeleteShape::Unlink(d) => {
             let (p, ci) = path[d];
             let keeper = page::BranchView::new(path_page(store, p)?)?;
@@ -1600,6 +1742,24 @@ fn plan_delete<S: PageWrite + ?Sized>(
         merged_root,
         refused,
     }))
+}
+
+/// The bytes of cells and slots ([`page::LeafView::used`]) a leaf holds once the entry `key`, with
+/// `value` as its cell holds it, leaves it. The entry's key is `key`, which its search compared
+/// equal.
+#[inline]
+fn leaf_used_after_delete(view: &page::LeafView<'_>, key: &[u8], value: Val<'_>) -> usize {
+    let gone = page::cell_size_leaf(key.len(), value.cell_len()) + page::SLOT;
+    view.used().saturating_sub(gone)
+}
+
+/// Whether a delete that leaves the page at path index `k` (the leaf when `k` is the path's
+/// length, else a branch) holding `used` bytes of cells and slots looks for a sibling to absorb
+/// ([`plan_merges`]): the page is not the root and holds under a quarter of `U` (`usable`). The
+/// one rule of both delete paths: [`delete_cached`] changes a leaf in place only when it is false.
+#[inline]
+fn merge_due(k: usize, used: usize, usable: usize) -> bool {
+    k >= 1 && 4 * used < usable
 }
 
 /// Whether deletes merge under-full pages: always, but for the test-only knob
@@ -1662,7 +1822,7 @@ fn plan_merges<S: PageWrite + ?Sized>(
 ) -> Result<(bool, bool)> {
     let usable = store.geometry().usable();
     let mut refused = false;
-    while k >= 1 && 4 * used < usable {
+    while merge_due(k, used, usable) {
         let (p, ci) = path[k - 1];
         let parent_trusted = store.is_private(p);
         let parent = page::BranchView::new(path_page(store, p)?)?;
@@ -1673,7 +1833,7 @@ fn plan_merges<S: PageWrite + ?Sized>(
         let mut x_key1 = if leaf_level { None } else { key1(path_page(store, path[k].0)?)? };
         let (mut lefts, mut rights, mut lost) = (0, 0, 0);
         let mut side = Side::Left;
-        while 4 * used < usable {
+        while merge_due(k, used, usable) {
             let si = match side {
                 Side::Left => ci.checked_sub(lefts + 1),
                 Side::Right => Some(ci + rights + 1).filter(|&i| i < n),
@@ -2002,13 +2162,15 @@ fn collapse_to<S: PageWrite + ?Sized>(
 /// `scratch.reserved`; a root the merges leave with one child is not among them), take the entry
 /// or the emptied child out, apply the merges ([`apply_merges`]), free the dropped pages (the
 /// absorbed siblings among them) and update the handle to the plan's (`DeletePlan::after`).
+/// Returns the page the change left, writable now (the leaf without the entry, or the branch
+/// without the child), with `path` leading to it; `None` for a collapse or an empty tree.
 fn apply_delete<S: PageWrite + ?Sized>(
     store: &mut S,
     root: &mut TreeRoot,
     path: &mut Path,
     plan: &DeletePlan,
     scratch: &mut Scratch,
-) -> Result<()> {
+) -> Result<Option<u32>> {
     let top = usize::from(plan.merged_root);
     let changed = match plan.shape {
         DeleteShape::Leaf => {
@@ -2045,7 +2207,7 @@ fn apply_delete<S: PageWrite + ?Sized>(
         }
         (DeleteShape::Collapse { .. } | DeleteShape::Empty, _) => plan.after,
     };
-    Ok(())
+    Ok(changed)
 }
 
 /// Apply a planned delete's merges ([`DeletePlan::merges`]) bottom-up along the writable `path`,
@@ -2297,6 +2459,41 @@ mod tests {
         },
     };
     use plain::{clear, delete, put};
+
+    /// The deletes [`delete_cached`] did in a cached leaf on this thread so far
+    /// ([`CACHED_DELETES`]); 0 in a release build, whose callers then check nothing.
+    fn cached_deletes() -> u64 {
+        #[cfg(debug_assertions)]
+        return CACHED_DELETES.with(std::cell::Cell::get);
+        #[cfg(not(debug_assertions))]
+        0
+    }
+
+    /// [`put`], through a table's path cache when given ([`put_cached`]).
+    fn put_through(
+        store: &mut MemStore,
+        root: &mut TreeRoot,
+        cache: Option<&mut PathCache>,
+        key: &[u8],
+        value: &[u8],
+    ) -> Result<bool> {
+        let Some(cache) = cache else { return put(store, root, key, value) };
+        store.geometry().place(key.len(), value.len())?;
+        let mut trusted = !root.is_empty() && store.is_private(root.root);
+        Ok(put_cached(store, root, &mut trusted, cache, key, value, PutKind::Upsert)?.replaced)
+    }
+
+    /// [`delete`], through a table's path cache when given ([`delete_cached`]).
+    fn delete_through(
+        store: &mut MemStore,
+        root: &mut TreeRoot,
+        cache: Option<&mut PathCache>,
+        key: &[u8],
+    ) -> Result<bool> {
+        let Some(cache) = cache else { return delete(store, root, key) };
+        let mut trusted = !root.is_empty() && store.is_private(root.root);
+        Ok(delete_cached(store, root, &mut trusted, cache, key)?.found)
+    }
 
     /// A random entry: a fresh key (mostly short, sometimes up to the key limit) or, a third of the
     /// time, one of `keys` again; a value mostly short, sometimes up to the limit for its key.
@@ -2953,6 +3150,151 @@ mod tests {
         walk_tree(&store, &root);
         #[cfg(debug_assertions)]
         assert_eq!(cached() - before, 1, "only the inline put took the cached leaf");
+        store.commit_like();
+        store.assert_accounting(&[root]);
+    }
+
+    /// A tree of several leaves with merging off (an emptied leaf unlinks), its path cache filled
+    /// by a delete in a middle leaf, then the rest of that leaf deleted without the cache: the
+    /// leaf unlinked and its page freed, so the epoch moved while the root and the height stayed.
+    /// Returns the store, the tree, its trust, that stale cache and the key the cached delete took.
+    fn stale_cache_over_an_unlinked_leaf() -> (MemStore, TreeRoot, bool, PathCache, Vec<u8>) {
+        let mut store = MemStore::new(4096);
+        store.no_merge = true;
+        let mut root = TreeRoot::EMPTY;
+        let key = |i: u32| format!("key{i:04}").into_bytes();
+        for i in 0..60 {
+            put(&mut store, &mut root, &key(i), &[7; 300]).expect("put");
+        }
+        assert!(root.height == 2 && root.leaf_pages >= 4, "a root over several leaves");
+        let (mut trusted, mut cache) = (store.is_private(root.root), PathCache::default());
+        let removed = delete_cached(&mut store, &mut root, &mut trusted, &mut cache, &key(30))
+            .expect("delete");
+        assert!(removed.found && removed.slot.is_some(), "the delete filled the cache");
+        let in_leaf = |k: &[u8]| {
+            cache.lo.get().is_none_or(|lo| page::cmp_keys(k, lo).is_ge())
+                && cache.hi.get().is_none_or(|hi| page::cmp_keys(k, hi).is_lt())
+        };
+        let rest: Vec<u32> = (0..60).filter(|&i| i != 30 && in_leaf(&key(i))).collect();
+        let (top, height, epoch) = (root.root, root.height, cache.epoch);
+        for &i in &rest {
+            assert!(delete(&mut store, &mut root, &key(i)).expect("delete"), "key {i}");
+        }
+        assert_eq!((root.root, root.height), (top, height), "an unlink, the root kept");
+        assert_ne!(store.epoch(), epoch, "the unlink freed the cached leaf");
+        (store, root, trusted, cache, key(30))
+    }
+
+    /// A put or a delete through a path cache takes the cached leaf only in the epoch the cache
+    /// was filled in: through a cache whose leaf was unlinked since by writes that bypassed it
+    /// ([`stale_cache_over_an_unlinked_leaf`]), a put of a key in the leaf's old range lands in
+    /// the tree, and a delete of such a key, put back without the cache, finds it.
+    #[test]
+    fn a_path_cache_of_another_epoch_is_never_used() {
+        let (mut store, mut root, mut trusted, mut cache, k) = stale_cache_over_an_unlinked_leaf();
+        let entries = root.entries;
+        put_cached(&mut store, &mut root, &mut trusted, &mut cache, &k, b"back", PutKind::Upsert)
+            .expect("put");
+        assert_eq!(get(&store, &root, &k).expect("get"), Some(&b"back"[..]));
+        assert_eq!(root.entries, entries + 1);
+        store.commit_like();
+        store.assert_accounting(&[root]);
+
+        let (mut store, mut root, mut trusted, mut cache, k) = stale_cache_over_an_unlinked_leaf();
+        put(&mut store, &mut root, &k, b"back").expect("put");
+        let removed =
+            delete_cached(&mut store, &mut root, &mut trusted, &mut cache, &k).expect("delete");
+        assert!(removed.found, "the key was found where it lives");
+        assert_eq!(get(&store, &root, &k).expect("get"), None);
+        assert_eq!(root.entries, entries);
+        store.commit_like();
+        store.assert_accounting(&[root]);
+    }
+
+    /// Twin stores holding the same tree of several leaves (60 keys of 300 B: a root over five
+    /// leaves) with merging off, one for writes through a path cache and one for the same writes
+    /// without it, and the tree's keys.
+    fn twin_trees() -> ([(MemStore, TreeRoot); 2], impl Fn(u32) -> Vec<u8>) {
+        let key = |i: u32| format!("key{i:04}").into_bytes();
+        let build = || {
+            let mut store = MemStore::new(4096);
+            store.no_merge = true;
+            let mut root = TreeRoot::EMPTY;
+            for i in 0..60 {
+                put(&mut store, &mut root, &key(i), &[7; 300]).expect("put");
+            }
+            assert!(root.height == 2 && root.leaf_pages >= 4, "a root over several leaves");
+            (store, root)
+        };
+        ([build(), build()], key)
+    }
+
+    /// Whether `key` lies in the cached leaf's range `[lo, hi)`.
+    fn in_cached_range(cache: &PathCache, key: &[u8]) -> bool {
+        cache.lo.get().is_none_or(|lo| page::cmp_keys(key, lo).is_ge())
+            && cache.hi.get().is_none_or(|hi| page::cmp_keys(key, hi).is_lt())
+    }
+
+    /// With merging off, deletes through the path cache take a middle leaf's entries down to its
+    /// last one in the leaf, and the delete of that last one unlinks the leaf, as the same deletes
+    /// without the cache do: after each, both trees' handles agree, and the leaf is gone (a
+    /// non-root leaf is never empty).
+    #[test]
+    fn a_cached_delete_leaves_a_leafs_last_entry_to_the_descent() {
+        let ([(mut store, mut root), (mut plain, mut plain_root)], key) = twin_trees();
+        let mut cache = PathCache::default();
+        assert!(delete_through(&mut store, &mut root, Some(&mut cache), &key(30)).expect("delete"));
+        assert!(delete(&mut plain, &mut plain_root, &key(30)).expect("delete"));
+        assert!(cache.lo.get().is_some() && cache.hi.get().is_some(), "a middle leaf is cached");
+        let rest: Vec<u32> =
+            (0..60).filter(|&i| i != 30 && in_cached_range(&cache, &key(i))).collect();
+        assert!(rest.len() >= 2, "the leaf holds more entries");
+        let (leaves, before) = (root.leaf_pages, cached_deletes());
+        for &i in &rest {
+            assert!(
+                delete_through(&mut store, &mut root, Some(&mut cache), &key(i)).expect("delete")
+            );
+            assert!(delete(&mut plain, &mut plain_root, &key(i)).expect("delete"));
+            assert_eq!(
+                root, plain_root,
+                "key {i}: the cached delete changed what the descent does"
+            );
+        }
+        assert_eq!(root.leaf_pages, leaves - 1, "the emptied leaf was unlinked");
+        let cached = cached_deletes() - before;
+        assert!(
+            cached == rest.len() as u64 - 1 || !cfg!(debug_assertions),
+            "{cached} deletes in the cached leaf: all but its last entry's"
+        );
+        assert_eq!(walk_tree(&store, &root).entries, walk_tree(&plain, &plain_root).entries);
+        store.commit_like();
+        store.assert_accounting(&[root]);
+    }
+
+    /// A delete's miss refills the path cache only on a path of this transaction's own pages:
+    /// after a commit, a put through the cache in one leaf copies its path (the root is then
+    /// private and trusted), a miss in another leaf, still published, descends from that root, and
+    /// a put into the published leaf's range through the cache then copies its path, as the same
+    /// writes without the cache do.
+    #[test]
+    fn a_delete_miss_over_a_published_leaf_leaves_the_path_cache_empty() {
+        let ([(mut store, mut root), (mut plain, mut plain_root)], key) = twin_trees();
+        store.commit_like();
+        plain.commit_like();
+        let mut cache = PathCache::default();
+        assert!(put_through(&mut store, &mut root, Some(&mut cache), &key(5), b"a").expect("put"));
+        assert!(put(&mut plain, &mut plain_root, &key(5), b"a").expect("put"));
+        assert!(store.is_private(root.root) && in_cached_range(&cache, &key(5)), "leaf A cached");
+        // Absent, between two keys of a leaf the put did not copy; then put there.
+        let missing = b"key0040x".to_vec();
+        assert!(!in_cached_range(&cache, &missing), "another leaf");
+        assert!(!delete_through(&mut store, &mut root, Some(&mut cache), &missing).expect("delete"));
+        assert!(!delete(&mut plain, &mut plain_root, &missing).expect("delete"));
+        assert!(!put_through(&mut store, &mut root, Some(&mut cache), &missing, b"b").expect("put"));
+        assert!(!put(&mut plain, &mut plain_root, &missing, b"b").expect("put"));
+        assert_eq!(root, plain_root, "the put through the cache changed what the descent does");
+        assert_eq!(get(&store, &root, &missing).expect("get"), Some(&b"b"[..]));
+        assert_eq!(walk_tree(&store, &root).entries, walk_tree(&plain, &plain_root).entries);
         store.commit_like();
         store.assert_accounting(&[root]);
     }
@@ -4532,6 +4874,7 @@ mod tests {
     /// the right, branch merges, a root giving way after merges, a refused merge (a sibling that
     /// does not fit) and a cascade over two levels or more. Without it, no delete merges.
     fn random_batches(run: BatchRun) {
+        let deletes_before = cached_deletes();
         let _seed = ReportSeed(run.seed);
         let BatchRun { page_size, key_space, rounds, phase, seed, min_height, merge, gate_merges } =
             run;
@@ -4560,6 +4903,10 @@ mod tests {
             }
             let grow = (round / phase) % 2 == 0;
             let mut failed = false;
+            // Every other batch writes through a path cache, as a table does; a batch is one
+            // transaction, so the cache starts empty.
+            let mut cache = PathCache::default();
+            let cached = round % 2 == 1;
             for op in 0..ops {
                 let r = rng.below(100);
                 let (put_below, delete_below) = if grow { (85, 99) } else { (5, 100) };
@@ -4594,7 +4941,8 @@ mod tests {
                     let old_run = model.get(&k).map(|old| is_run(old, &k));
                     let new_run = is_run(&v, &k);
                     let count = store.alloc.page_count();
-                    put(&mut store, &mut root, &k, &v).map(|replaced| {
+                    let cache = cached.then_some(&mut cache);
+                    put_through(&mut store, &mut root, cache, &k, &v).map(|replaced| {
                         if new_run {
                             let Some(Val::Overflow(ovf)) = find(&store, &root, &k).expect("find")
                             else {
@@ -4638,7 +4986,8 @@ mod tests {
                     let keys_before =
                         if merge && hit { level_keys(&store, &root) } else { Vec::new() };
                     store.merge_report = MergeReport::default();
-                    delete(&mut store, &mut root, &k).map(|removed| {
+                    let cache = cached.then_some(&mut cache);
+                    delete_through(&mut store, &mut root, cache, &k).map(|removed| {
                         let old = model.remove(&k);
                         assert_eq!(removed, old.is_some(), "{what}: delete");
                         let Some(old) = old else {
@@ -4749,6 +5098,8 @@ mod tests {
         let missing = seen.missing(merge, merge && gate_merges);
         assert!(missing.is_empty(), "never ran: {missing:?} ({seen:?})");
         assert!(seen.aborts > 10, "too few aborted batches: {seen:?}");
+        let cached = cached_deletes() - deletes_before;
+        assert!(cached > 0 || !cfg!(debug_assertions), "no delete in a cached leaf: {seen:?}");
         for (t, r, m) in &held {
             let walk = walk_tree(&store.reader_at(*t), r);
             assert!(walk.entries.iter().map(|(k, v)| (k, v)).eq(m.iter()), "held {t} at the end");

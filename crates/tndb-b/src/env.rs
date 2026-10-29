@@ -69,7 +69,7 @@ use std::{
 use parking_lot::{Condvar, Mutex, RwLock};
 
 use crate::{
-    alloc::{Allocator, RUN_LOAD_RECORDS},
+    alloc::{Allocator, PrivatePages, RUN_LOAD_RECORDS},
     check::{self, CheckReport},
     crc::{self, CrcState},
     error::{Error, Result},
@@ -80,6 +80,7 @@ use crate::{
     overflow::{checked_run, Ovf, RunCrc},
     page::{self, Geometry, Kind},
     page_set::PageSet,
+    stamp,
     stats::{elapsed_ns, lap, IoStats},
     sys,
     tree::{
@@ -477,6 +478,14 @@ pub(crate) struct Writer {
     /// [`freelist::record_capacity`], so a commit writes many small records.
     #[cfg(test)]
     pub(crate) record_pages: Option<usize>,
+    /// Test-only: the threads commit step 3 computes the CRCs on, in place of
+    /// [`stamp::threads`]' choice (1: the serial loop), so a small commit can take either path.
+    #[cfg(test)]
+    pub(crate) stamp_threads: Option<usize>,
+    /// Test-only: the threads the latest commit's step 3 computed its CRCs on (1: the serial
+    /// loop).
+    #[cfg(test)]
+    pub(crate) stamped_on: usize,
 }
 
 /// Test-only: a point of the commit protocol (see the env module docs) at which
@@ -505,15 +514,52 @@ impl Writer {
     /// Stamp the CRCs of what the transaction wrote (commit step 3): each tree page's, and one
     /// over each overflow run ([`crate::alloc::PrivatePages::units`]). Returns every page written,
     /// ascending, for the data sync; the tree pages then count as stamped by this writer.
+    ///
+    /// Units of many bytes have their CRCs computed on several threads first ([`Self::unit_crcs`]),
+    /// which this stores in unit order; else each unit is stamped in turn. Both write the same
+    /// bytes in the same order, and fail at the same unit with the same error.
     pub(crate) fn stamp_private(&mut self) -> Result<Vec<u32>> {
         let started = Instant::now();
         let size = self.geometry.page_size();
         let private = self.alloc.stamp_private();
-        for (p, n) in private.units() {
-            crc::add_crc32_nonzero(self.file.pages_mut(p, size, n as usize * size)?);
+        let threads = stamp::threads(private.pages.len() * size);
+        #[cfg(test)]
+        let threads = self.stamp_threads.unwrap_or(threads);
+        let crcs = self.unit_crcs(&private, threads);
+        #[cfg(test)]
+        {
+            self.stamped_on = if crcs.is_some() { threads } else { 1 };
+        }
+        match crcs {
+            Some(crcs) => {
+                for ((p, n), crc) in private.units().zip(crcs) {
+                    stamp::put_crc(self.file.pages_mut(p, size, n as usize * size)?, crc);
+                }
+            }
+            None => {
+                for (p, n) in private.units() {
+                    crc::add_crc32_nonzero(self.file.pages_mut(p, size, n as usize * size)?);
+                }
+            }
         }
         self.stats.stamp_ns += elapsed_ns(started);
         Ok(private.pages)
+    }
+
+    /// The CRC of each of `private`'s units, in unit order, computed on `threads` threads (the
+    /// count [`stamp::threads`] gives the units' bytes) from read-only slices of the units
+    /// ([`PageFile::pages`]). `None` for one thread, which leaves the units to the serial loop,
+    /// and when a unit lies past the end of the file, whose error the serial loop then raises.
+    fn unit_crcs(&self, private: &PrivatePages, threads: usize) -> Option<Vec<u32>> {
+        let size = self.geometry.page_size();
+        if threads < 2 {
+            return None;
+        }
+        let units: Vec<&[u8]> = private
+            .units()
+            .map(|(p, n)| self.file.pages(p, size, n as usize * size))
+            .collect::<Option<_>>()?;
+        Some(stamp::crcs(&units, threads))
     }
 
     /// Record pages stamped by a [`SyncMode::NoSync`] commit, for the next sync.
@@ -800,7 +846,15 @@ impl PageWrite for Writer {
         let from_end = p >= end;
         self.stats.pages_from_end += u64::from(from_end);
         self.stats.pages_from_pool += u64::from(!from_end);
-        self.file.page_mut(p, size)?.fill(0);
+        if from_end {
+            // The page's first write, in the order pages are allocated: a put reserves its pages
+            // before it writes them and may write one after pages past it, and on macOS first
+            // writes into preallocated space after an fsync are slow, slower out of that order
+            // (README, Platform notes). One byte is enough; the layout writes the page anyway.
+            self.file.page_mut(p, size)?[0] = 0;
+        }
+        #[cfg(debug_assertions)]
+        crate::tree::poison(self.file.page_mut(p, size)?);
         Ok(p)
     }
 
@@ -877,6 +931,8 @@ impl PageWrite for Writer {
         {
             self.alloc.run_stats.steps[step] += 1;
         }
+        #[cfg(debug_assertions)]
+        crate::tree::poison(self.file.pages_mut(p, size, npages as usize * size)?);
         Ok(p)
     }
 
@@ -1028,6 +1084,10 @@ impl Env {
             merging_deletes: 0,
             #[cfg(test)]
             record_pages: None,
+            #[cfg(test)]
+            stamp_threads: None,
+            #[cfg(test)]
+            stamped_on: 0,
         };
         let inner = EnvInner::new(geometry, options.sync, snapshot, Some(Box::new(writer)), None);
         Ok(Env { inner: Arc::new(inner) })

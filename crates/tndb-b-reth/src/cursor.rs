@@ -1073,32 +1073,23 @@ impl<T: Table> DbCursorRW<T> for TndbCursorMut<T> {
         };
         let mut guard = txn.lock();
         let txn = live(&mut guard, error::delete)?;
-        let Some(dup) = dup else {
-            return if cursor.delete_current(txn).map_err(error::delete)? {
-                Ok(())
-            } else {
-                Err(no_data())
-            };
-        };
-        // On a dup-sort table: whether the row is its key's last (on the row first: right after
-        // a delete, the follower; at a key's end after `last`, the row found again by key, which
-        // ends the engine cursor's end), and after the delete whether the key keeps an earlier
-        // row.
-        let Some((stored, _)) = cursor.current(txn).map_err(error::delete)? else {
-            return Err(no_data());
-        };
+        // At a dup key's end after `last`, the row is found again by key first, which ends the
+        // engine cursor's end.
         if rows.pos == (Pos::DupEnd { soft: true }) {
+            let Some((stored, _)) = cursor.current(txn).map_err(error::delete)? else {
+                return Err(no_data());
+            };
             let stored = stored.to_vec();
             cursor.seek_exact(txn, &stored).map_err(error::delete)?;
-        }
-        let key_last = cursor.next_in_prefix(txn, dup.key).map_err(error::delete)?.is_none();
-        if !key_last {
-            cursor.prev(txn).map_err(error::delete)?;
         }
         if !cursor.delete_current(txn).map_err(error::delete)? {
             return Err(no_data());
         }
-        rows.pos = if !key_last {
+        // On a dup-sort table the key keeps later rows if the follower is the key's (the engine
+        // tells from the keys it kept, without a step), else earlier ones if a step back finds
+        // one.
+        let Some(dup) = dup else { return Ok(()) };
+        rows.pos = if cursor.follower_shares_prefix(txn, dup.key).map_err(error::delete)? {
             Pos::Engine
         } else if cursor.prev_in_prefix(txn, dup.key).map_err(error::delete)?.is_some() {
             Pos::DupEnd { soft: false }

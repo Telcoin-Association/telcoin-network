@@ -58,6 +58,7 @@
 //! | `append_dup` | the value must sort after the key's last (by subkey), else `MDBX_EKEYMISMATCH` with the cursor on the key's last row (on its first when the value is exactly the first's); a key without rows takes any value, wherever the key sorts |
 //! | `delete(k, Some(v))` | deletes the row of `v`'s subkey if it holds exactly the rest of `v` |
 //! | `delete(k, None)`, `delete_current_duplicates` | delete every row of the key |
+//! | `delete_current` | the engine's `delete_current`, then its `follower_shares_prefix` over the key's width, with no step: a follower of the key's leaves the cursor on it, else `prev_in_prefix` finds whether the key keeps an earlier row (the cursor then ends the key's rows, on it) or none (the cursor on the next key's first row) |
 //! | `entries` | the rows: MDBX's count of key/value pairs |
 //!
 //! As on MDBX, a fresh cursor's `next_dup`, `next_no_dup` and `next_dup_val` start at the first

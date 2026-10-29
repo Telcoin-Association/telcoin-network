@@ -340,7 +340,8 @@ impl PageWrite for MemStore {
             }
             Ok(())
         })?;
-        self.raw_mut(p).fill(0);
+        #[cfg(debug_assertions)]
+        super::poison(self.raw_mut(p));
         Ok(p)
     }
 
@@ -374,12 +375,15 @@ impl PageWrite for MemStore {
 
     fn alloc_run(&mut self, npages: u32) -> Result<u32> {
         let (data, size) = (&mut self.data, self.geometry.page_size());
-        self.alloc.allocate_run(npages, |count| {
+        let p = self.alloc.allocate_run(npages, |count| {
             if data.len() < count as usize * size {
                 data.resize(count as usize * size, 0);
             }
             Ok(())
-        })
+        })?;
+        #[cfg(debug_assertions)]
+        super::poison(self.raw_span_mut(p, npages as usize * size));
+        Ok(p)
     }
 
     fn run_mut(&mut self, pgno: u32, npages: u32) -> Result<&mut [u8]> {

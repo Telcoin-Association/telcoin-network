@@ -32,6 +32,7 @@ mod meta;
 mod overflow;
 mod page;
 mod page_set;
+mod stamp;
 mod stats;
 mod sys;
 #[cfg(test)]

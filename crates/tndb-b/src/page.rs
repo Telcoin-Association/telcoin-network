@@ -8,7 +8,7 @@
 //! slots:        nkeys × u16 cell offsets from byte 24; slot i addresses cell i (key order)
 //! free space:   from the end of the slot array up to `upper`
 //! cells:        packed from `upper` up to P − 4, in no particular order
-//! trailer (4):  CRC32, stamped at commit (all zeros = dirty); this codec never touches it
+//! trailer (4):  CRC32, stamped at commit (all zeros = dirty); this codec only zeroes it
 //!
 //! leaf cell:    vlen u32 | klen u16 | flags u16 | key | value
 //! branch cell:  child u32 | child_txn u32 | klen u16 | key
@@ -22,7 +22,9 @@
 //! deleting or shrinking a cell closes its gap at once (the cells below it move up and their slots
 //! follow), so a page never fragments and its free space is the single gap
 //! `upper − (24 + 2·nkeys)`. With `used` = the bytes of every cell plus its slot,
-//! `free + used == U` always holds, where `U = P − 28` (header and trailer).
+//! `free + used == U` always holds, where `U = P − 28` (header and trailer). Nothing reads the
+//! gap, so it need not be zero: [`init_header`] lays out a page over whatever bytes it holds,
+//! writing the header and zeroing the trailer (dirty), and the gap keeps the old bytes.
 //!
 //! **Branches** hold one cell per child (each a key and a child): cell i's key is the lower bound
 //! of child i's key range, and cell 0's key is empty and stands for −∞, so the child for a key is
@@ -502,17 +504,16 @@ pub(crate) fn upper(page: &[u8]) -> usize {
 
 fn init(page: &mut [u8], kind: Kind, pgno: u32, txn: u64) {
     page.fill(0);
-    init_zeroed(page, kind, pgno, txn);
+    init_header(page, kind, pgno, txn);
 }
 
-/// [`init`] of a page that is all zeros already: a page the writer just allocated
-/// (`PageWrite::alloc` returns it zero-filled, and each reserved page is used once). It writes
-/// every byte a reader interprets, the whole header and the trailer (zero: dirty), and leaves
-/// only the free gap to the allocation's zeros; the debug assert checks that the image is then
-/// exactly [`init`]'s.
-fn init_zeroed(page: &mut [u8], kind: Kind, pgno: u32, txn: u64) {
+/// [`init`] without the fill: lay out an empty page over whatever bytes `page` holds, such as a
+/// page the writer just allocated (`PageWrite::alloc`, whose bytes are not zeroed). It writes
+/// every byte a reader of an empty page interprets, the whole header (its flags and reserved
+/// bytes zero) and the trailer (zero: dirty), and leaves the rest, the empty page's free gap, as
+/// it is: nothing reads the gap, and the CRC covers it as it is.
+fn init_header(page: &mut [u8], kind: Kind, pgno: u32, txn: u64) {
     debug_assert!(valid_len(page.len()), "page buffer of {} bytes", page.len());
-    debug_assert!(page.iter().all(|&b| b == 0), "init_zeroed of a page that is not all zeros");
     let trailer = page.len() - TRAILER;
     page[..HEADER].fill(0);
     page[trailer..].fill(0);
@@ -528,10 +529,10 @@ pub(crate) fn init_leaf(page: &mut [u8], pgno: u32, txn: u64) {
     init(page, Kind::Leaf, pgno, txn);
 }
 
-/// [`init`] of a page that is all zeros already (a page just allocated) as an empty leaf: only
-/// the header and the trailer are written ([`init_zeroed`]).
-pub(crate) fn init_leaf_zeroed(page: &mut [u8], pgno: u32, txn: u64) {
-    init_zeroed(page, Kind::Leaf, pgno, txn);
+/// Lay out `page`, whatever its bytes (a page just allocated), as an empty leaf: only the header
+/// and the trailer are written ([`init_header`]).
+pub(crate) fn init_leaf_header(page: &mut [u8], pgno: u32, txn: u64) {
+    init_header(page, Kind::Leaf, pgno, txn);
 }
 
 /// Initialise `page` (all of it, trailer zeroed = dirty) as a branch with no children yet: add
@@ -1012,9 +1013,9 @@ pub(crate) struct LeafView<'a> {
 
 impl<'a> LeafView<'a> {
     /// Parse `page`'s header: [`Error::Corrupt`] unless it passes [`hdr`]'s checks and is a
-    /// leaf's. Test-only: the engine builds its leaf views inside this module ([`View::new`],
-    /// [`LeafMut::view`] and the one-call helpers).
-    #[cfg(test)]
+    /// leaf's. A descent builds its views with [`View::new`]; this is for a leaf the caller
+    /// entered before and holds again (a cursor's seek from its leaf).
+    #[inline]
     pub(crate) fn new(page: &'a [u8]) -> Result<Self> {
         Ok(Self { page, h: hdr_of(page, Kind::Leaf)? })
     }
@@ -1486,6 +1487,13 @@ impl<'a> LeafMut<'a> {
         value.write(&mut page[off..off + keep + new_len], keep);
         Ok(Fit::Done)
     }
+
+    /// [`leaf_delete`] of entry `i` through the parsed header.
+    #[inline]
+    pub(crate) fn delete(self, i: usize) -> Result<()> {
+        let Self { page, h } = self;
+        remove_cell(page, &h, i)
+    }
 }
 
 /// Delete leaf entry `i`, compacting the cell area.
@@ -1604,8 +1612,9 @@ pub(crate) fn branch_delete(page: &mut [u8], i: usize) -> Result<()> {
     Ok(())
 }
 
-/// Initialise `page`, all zeros (a page just allocated), as a new root over two children: `left`
-/// (cell 0, from −∞) and `right` (from `sep`), each `(child_pgno, child_txn)`.
+/// Lay out `page`, whatever its bytes (a page just allocated), as a new root over two children:
+/// `left` (cell 0, from −∞) and `right` (from `sep`), each `(child_pgno, child_txn)`
+/// ([`init_header`], then the two cells).
 pub(crate) fn init_root(
     page: &mut [u8],
     pgno: u32,
@@ -1614,7 +1623,7 @@ pub(crate) fn init_root(
     sep: &[u8],
     right: (u32, u32),
 ) -> Result<()> {
-    init_zeroed(page, Kind::Branch, pgno, txn);
+    init_header(page, Kind::Branch, pgno, txn);
     if branch_insert(page, 0, &[], left.0, left.1)? == Fit::Full
         || branch_insert(page, 1, sep, right.0, right.1)? == Fit::Full
     {
@@ -1631,8 +1640,8 @@ pub(crate) fn init_root(
 /// 1. [`Self::split_leaf`] or [`Self::split_branch`] plans it from the page that splits (`src`): it
 ///    copies `src`, encodes the pending cell after the copy, picks the cut and checks that both
 ///    halves fit. It changes no page, so an error leaves both pages unchanged.
-/// 2. [`Self::write_right`] writes the right half into its new page, one just allocated (all
-///    zeros).
+/// 2. [`Self::write_right`] writes the right half into its new page, one just allocated (its bytes
+///    not zeroed: every byte but the free gap is written).
 /// 3. [`Self::write_left`] rewrites `src` as the left half, keeping its page number and txn.
 ///
 /// [`Self::sep`] is then the separator, which goes up to the parent. Each half's bytes are those
@@ -1801,13 +1810,14 @@ impl SplitBuf {
         Ok(())
     }
 
-    /// Write the planned right half into `dst`, page `pgno` just allocated (all zeros), as a page
-    /// of transaction `txn`.
+    /// Write the planned right half into `dst`, page `pgno` just allocated (whatever its bytes),
+    /// as a page of transaction `txn`: the header and trailer ([`init_header`]) and every cell
+    /// and slot ([`place_cells`]), so only the free gap keeps `dst`'s old bytes.
     pub(crate) fn write_right(&self, dst: &mut [u8], pgno: u32, txn: u64) -> Result<()> {
         let Some(kind) = self.kind.filter(|_| dst.len() == self.page_size) else {
             return Err(corrupt(dst, "split target is not a page of the planned source's size"));
         };
-        init_zeroed(dst, kind, pgno, txn);
+        init_header(dst, kind, pgno, txn);
         place_cells(dst, &self.copy, &self.cells[self.left..], kind == Kind::Branch);
         Ok(())
     }
@@ -1960,15 +1970,16 @@ pub(crate) fn split_branch(
     split_into(&buf, src, dst, Kind::Branch)
 }
 
-/// Write a planned split's halves into `src` and `dst` (an empty `kind` page, re-zeroed and
-/// re-initialised with its page number and txn).
+/// Write a planned split's halves into `src` and `dst` (an empty `kind` page, filled with
+/// [`crate::tree::POISON`], as a page just allocated in a debug build, and re-initialised with
+/// its page number and txn).
 #[cfg(test)]
 fn split_into(buf: &SplitBuf, src: &mut [u8], dst: &mut [u8], kind: Kind) -> Result<Vec<u8>> {
     if dst.len() != src.len() || hdr_of(dst, kind)?.nkeys != 0 {
         return Err(corrupt(dst, "split target is not an empty page of the source's size"));
     }
     let (p, t) = (pgno(dst), txn(dst));
-    dst.fill(0);
+    dst.fill(crate::tree::POISON);
     buf.write_right(dst, p, t)?;
     buf.write_left(src)?;
     Ok(buf.sep.clone())
@@ -2136,6 +2147,13 @@ mod tests {
 
     fn geometry(size: u32) -> Geometry {
         Geometry::new(size).unwrap()
+    }
+
+    /// A page's bytes without its free gap (from the end of the slot array to `upper`, by its
+    /// header): every byte a layout writes, for comparing pages whose gaps hold different bytes.
+    fn outside_gap(page: &[u8]) -> Vec<u8> {
+        let slots_end = HEADER + SLOT * nkeys(page);
+        [&page[..slots_end], &page[upper(page)..]].concat()
     }
 
     fn fresh(g: &Geometry, kind: Kind) -> Vec<u8> {
@@ -3416,11 +3434,12 @@ mod tests {
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(64))]
 
-        /// Splits through one reused [`SplitBuf`], the right half written into a zeroed page as
-        /// the writer's fresh allocation is, give exactly the bytes of the reference split (the
-        /// right half built in an empty page, the left one re-appended from a copy): both halves
-        /// and the separator, for leaves and branches at every page size, with the pending cell
-        /// anywhere, with and without `append`.
+        /// Splits through one reused [`SplitBuf`], the right half written into a page of
+        /// garbage ([`crate::tree::POISON`]) as the writer's fresh allocation may be, give exactly
+        /// the bytes of the reference split (the right half built in an empty page, the left one
+        /// re-appended from a copy), the right half's free gap aside ([`outside_gap`]): both
+        /// halves and the separator, for leaves and branches at every page size, with the pending
+        /// cell anywhere, with and without `append`.
         #[test]
         fn splits_match_the_reference_split(
             specs in vec(spec(), 1..40),
@@ -3435,7 +3454,8 @@ mod tests {
                     let (src, at, key, value) =
                         scrambled_full_page(&g, kind, &specs, &ranks, at_sel);
                     let (mut want_src, mut want_dst) = (src.clone(), fresh(&g, kind));
-                    let (mut got_src, mut got_dst) = (src.clone(), vec![0; g.page_size()]);
+                    let (mut got_src, mut got_dst) =
+                        (src.clone(), vec![crate::tree::POISON; g.page_size()]);
                     let want = match kind {
                         Kind::Leaf => {
                             buf.split_leaf(&got_src, at, &key, Val::Inline(&value), append).unwrap();
@@ -3456,7 +3476,10 @@ mod tests {
                     buf.write_left(&mut got_src).unwrap();
                     prop_assert_eq!(buf.sep(), &want[..], "{} {:?}: separator", size, kind);
                     prop_assert!(got_src == want_src, "{size} {kind:?} at {at}: left halves differ");
-                    prop_assert!(got_dst == want_dst, "{size} {kind:?} at {at}: right halves differ");
+                    prop_assert!(
+                        outside_gap(&got_dst) == outside_gap(&want_dst),
+                        "{size} {kind:?} at {at}: right halves differ"
+                    );
                     validate(&got_src, &g).unwrap();
                     validate(&got_dst, &g).unwrap();
                 }

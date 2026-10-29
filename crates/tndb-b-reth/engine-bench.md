@@ -35,7 +35,8 @@ Environment variables select what runs (the `src/engine_bench.rs` module docs ha
 - `TNDB_B_BENCH_ENGINES`: the columns, comma-separated (default all): `t4d`, `t16d`, `t4n`,
   `md`, `md4`, `mn`.
 - `TNDB_B_BENCH_ROWS`: the row groups, comma-separated (default all): `seq`, `rand`, `get-hit`,
-  `get-miss`, `scan-fwd`, `scan-rev`, `seek`, `small`, `mixed`, `clear`, `append` (the API rows),
+  `get-miss`, `scan-fwd`, `scan-rev`, `seek`, `seek-fwd` (the seek row's targets sorted
+  ascending), `small`, `mixed`, `clear`, `append` (the API rows),
   `big` (the large-value rows, see [Large values](#large-values-overflow-runs)), `delete` (the
   delete rows, see [Deletes](#deletes)), and the aliases `bulk`, `get` and `scan`.
 - `TNDB_B_BENCH_REPEAT=k`: each selected read row runs k times and reports the median.
@@ -139,7 +140,7 @@ guarantee and damage check is kept; the checks moved to where they are needed.
   `#[inline]` and build their errors in `#[cold]` functions.
 - **Search prefetch.** Each binary-search probe prefetches the two cells the next probe may read.
 - **Cheaper splits.** `SplitBuf` plans a split in reused buffers and writes the right half
-  straight into the zeroed new page, with no heap allocation per split.
+  straight into the new page, with no heap allocation per split.
 
 At 16K, against the run this table replaces: the sequential insert went from 391 to 82 ms (its
 put loop from about 367 to 47 ms), the random insert from 1097 to 830 ms, the forward scan from
@@ -377,7 +378,8 @@ What the rows show:
   (`Verify::Later`, `verify_path`), so a miss still changes and verifies nothing. That cut the
   delete loop by 32% at 4K and 30% at 16K, and the churn by 21–25%. What is left of the delete
   loop is that one descent and the leaf search (about 60% of it in a profile), the cell's removal
-  (12%), and the copies of the path (6% zero-filling the page `alloc` returns, then the copy).
+  (12%), and the copies of the path (6% zero-filling the page `alloc` returned, then the copy;
+  `alloc` no longer zero-fills, tndb-b's README do-not-flag item 17).
 - **The mixed 50/50 workload is faster than MDBX's** at both page sizes.
 - **After the churn, the file's used span is about 1.5× MDBX's,** even though tndb-b's tree is
   smaller. Each round is a fill transaction followed by a delete transaction, and a page freed by
