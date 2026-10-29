@@ -10,6 +10,7 @@
 //! the tndb build migrates an MDBX database onto tndb-b (`migrate`).
 //! [`db_table_stats`] reads each table's figures for `db stats`: live beside a running node on
 //! MDBX, with the node stopped on tndb-b ([`DB_TABLE_STATS_NEEDS_STOPPED_NODE`]).
+//! [`default_page_size`] is the page size a new database gets without `--db.page-size`.
 
 use std::{path::Path, sync::Arc};
 
@@ -71,15 +72,50 @@ pub(crate) fn temp_chain_db_args() -> DatabaseArgs {
     }
 }
 
+/// The page size, in bytes, of a new reth database when `--db.page-size` is unset: the one source
+/// `open_rw` and the callers that key data by the page size (the execution bench's cached
+/// bases) both read, so they cannot drift.
+///
+/// The MDBX build's is reth's own default: the OS page size clamped to 4 KiB..=64 KiB (16 KiB on
+/// Apple Silicon, 4 KiB on x86 Linux), which `open_rw` passes to MDBX explicitly.
+#[cfg(not(feature = "tndb-b"))]
+pub fn default_page_size() -> u32 {
+    /// The smallest page size reth gives MDBX: smaller pages may not hold reth's largest rows.
+    const MIN: usize = 4096;
+    /// libmdbx's largest page size.
+    const MAX: usize = 0x10000;
+    // at most 64 KiB, so the cast is exact
+    page_size::get().clamp(MIN, MAX) as u32
+}
+
+/// The page size, in bytes, of a new reth database when `--db.page-size` is unset: the one source
+/// `open_rw` and the callers that key data by the page size (the execution bench's cached
+/// bases) both read, so they cannot drift.
+///
+/// The tndb build's is the adapter's default (`tndb_b_reth::TndbArgs::default()`, 4 KiB), which
+/// `tndb_args` starts from.
+#[cfg(feature = "tndb-b")]
+pub fn default_page_size() -> u32 {
+    tndb_b_reth::TndbArgs::default().page_size
+}
+
+// The MDBX build's `default_page_size` reads the OS page size through `page_size`, as reth's own
+// default does; the tndb build does not.
+#[cfg(feature = "tndb-b")]
+use page_size as _;
+
 /// Open (or create) the read-write reth database in directory `path`, after [`check_backend`].
 ///
-/// The MDBX build opens through reth's `init_db` and records per-operation latency metrics
-/// (`with_metrics`; a noop unless the global metrics recorder is installed, i.e. the node runs
-/// with `--metrics`).
+/// The MDBX build opens through reth's `init_db`, a new file with `--db.page-size` or else
+/// [`default_page_size`], and records per-operation latency metrics (`with_metrics`; a noop unless
+/// the global metrics recorder is installed, i.e. the node runs with `--metrics`).
 #[cfg(not(feature = "tndb-b"))]
 pub(crate) fn open_rw(reth_config: &RethConfig, path: &Path) -> eyre::Result<RethDb> {
     check_backend(path)?;
-    Ok(Arc::new(reth_db::init_db(path, reth_config.0.db.database_args())?.with_metrics()))
+    let db_args = &reth_config.0.db;
+    let page_size = db_args.page_size.unwrap_or(default_page_size() as usize);
+    let args = db_args.database_args().with_geometry_page_size(Some(page_size));
+    Ok(Arc::new(reth_db::init_db(path, args)?.with_metrics()))
 }
 
 /// Open (or create) the read-write reth database in directory `path`, after [`check_backend`].

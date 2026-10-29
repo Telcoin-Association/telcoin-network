@@ -18,6 +18,8 @@
 //! transaction can free: a run private to this transaction named by a leaf it did not write is
 //! [`Error::Corrupt`], as a private page under an untrusted parent is ([`descend_write`]).
 
+use std::time::Instant;
+
 use super::{
     read::{check_miss, tighten},
     PageRead, PageWrite, TreeRoot, MAX_HEIGHT,
@@ -28,6 +30,7 @@ use crate::{
     overflow::{self, Ovf, RunCrc, OVF_CELL},
     page::{self, Find, Fit, Geometry, Kind, Place, Val},
     page_set::PageSet,
+    stats::elapsed_ns,
 };
 
 // Test-only counters, debug builds only: the benchmark is compiled with the test configuration,
@@ -720,7 +723,7 @@ fn descend_write<'s, S: PageWrite + ?Sized>(
             if !store.is_stamped(pgno) {
                 match verify {
                     Verify::Now => {
-                        verify_published(page, &geometry)?;
+                        verify_published(store, page, &geometry)?;
                         check_cells_naming_this_txn(store, pgno, &view)?;
                     }
                     Verify::Later => unverified = true,
@@ -851,7 +854,7 @@ fn verify_path<S: PageWrite + ?Sized>(store: &S, path: &[(u32, usize)], leaf: u3
             continue;
         }
         let page = store.page(p)?;
-        verify_published(page, &geometry)?;
+        verify_published(store, page, &geometry)?;
         check_cells_naming_this_txn(store, p, &page::View::new(page)?)?;
     }
     Ok(())
@@ -978,8 +981,21 @@ fn leaving_run<S: PageWrite + ?Sized>(store: &S, leaf: u32, ovf: Ovf) -> Result<
 
 /// A published page about to be copied must pass its CRC and [`page::validate`]: the copy is
 /// stamped afresh at commit, so copying a page damaged at rest would make the damage CRC-valid
-/// and invisible, and the mutators keep a page valid only if it was valid.
-fn verify_published(page: &[u8], geometry: &Geometry) -> Result<()> {
+/// and invisible, and the mutators keep a page valid only if it was valid. The check and its
+/// time are counted on `store` ([`PageWrite::count_verify`]).
+fn verify_published<S: PageWrite + ?Sized>(
+    store: &S,
+    page: &[u8],
+    geometry: &Geometry,
+) -> Result<()> {
+    let started = Instant::now();
+    let checked = check_published(page, geometry);
+    store.count_verify(elapsed_ns(started));
+    checked
+}
+
+/// [`verify_published`]'s checks.
+fn check_published(page: &[u8], geometry: &Geometry) -> Result<()> {
     #[cfg(all(test, debug_assertions))]
     COW_VERIFIES.with(|n| n.set(n.get() + 1));
     if crc::crc_state(page) != CrcState::Valid {
@@ -1786,7 +1802,7 @@ fn check_sibling<'s, S: PageWrite + ?Sized>(
         return Ok(());
     }
     if !store.is_stamped(s) {
-        verify_published(page, &store.geometry())?;
+        verify_published(store, page, &store.geometry())?;
         check_cells_naming_this_txn(store, s, view)?;
     }
     let (mut lo, mut hi) = (None, None);
@@ -1854,7 +1870,7 @@ fn check_sibling_chain<'s, S: PageWrite + ?Sized>(
             return Err(Error::Corrupt(format!("non-root page {pgno} is empty")));
         }
         if !store.is_stamped(pgno) {
-            verify_published(page, &geometry)?;
+            verify_published(store, page, &geometry)?;
         }
         if !view.keys_in_range(lo, hi)? {
             return Err(Error::Corrupt(format!(
@@ -1968,7 +1984,7 @@ fn collapse_to<S: PageWrite + ?Sized>(
             )));
         }
         if !store.is_private(pgno) && !store.is_stamped(pgno) {
-            verify_published(page, geometry)?;
+            verify_published(store, page, geometry)?;
         }
         if kind == Kind::Leaf && page::nkeys(page) == 0 {
             return Err(Error::Corrupt(format!("non-root leaf {pgno} is empty")));
@@ -2160,7 +2176,7 @@ pub(crate) fn tree_pages<S: PageWrite + ?Sized>(
             }
             let private = store.is_private(p);
             if !private && !store.is_stamped(p) {
-                verify_published(page, &geometry)?;
+                verify_published(store, page, &geometry)?;
             }
             for i in 0..page::nkeys(page) {
                 let (child, child_txn) = page::branch_child(page, i)?;
@@ -2197,7 +2213,7 @@ pub(crate) fn tree_pages<S: PageWrite + ?Sized>(
             return Err(corrupt(format!("height {} does not reach the leaves", root.height)));
         };
         if !store.is_private(p) && !store.is_stamped(p) {
-            verify_published(page, &geometry)?;
+            verify_published(store, page, &geometry)?;
         }
         for i in 0..view.nkeys() {
             let (_, Val::Overflow(ovf)) = view.entry(i)? else {

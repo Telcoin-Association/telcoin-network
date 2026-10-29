@@ -678,7 +678,7 @@ fn run_tndb(
 ) -> Column {
     let mut col = Column::new(name);
     let path = dir.join("data.tndb-b");
-    let options = EnvOptions { page_size, map_reserve: 8 << 30, sync };
+    let options = EnvOptions { page_size, map_reserve: 8 << 30, sync, ..EnvOptions::default() };
     let env = Env::open(&path, options).expect("open tndb-b");
     let n = data.n;
 

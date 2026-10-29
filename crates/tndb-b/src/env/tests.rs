@@ -1188,3 +1188,108 @@ fn more_tables_than_a_snapshot_remembers_still_resolve() {
         assert_eq!(catalog_resolves() - start, 40 + 8 + 8, "32 remembered, 8 resolved each time");
     }
 }
+
+/// `EnvOptions::readahead` defaults to `false` on Linux and `true` elsewhere, and reaches every
+/// mapping an environment makes: without it `Env::open`'s and each remap's past the reservation
+/// are advised `MADV_RANDOM`, as is `Env::open_read_only`'s; with it, none is advised.
+#[test]
+fn every_mapping_follows_the_readahead_option() {
+    assert_eq!(
+        EnvOptions::default().readahead,
+        !cfg!(target_os = "linux"),
+        "random access is the default on Linux only"
+    );
+    for (readahead, want) in [(false, Some(memmap2::Advice::Random)), (true, None)] {
+        let (_dir, path) = temp();
+        // A 16 KiB reservation: the commit's first growth (to 1 MiB) remaps.
+        let options = EnvOptions { map_reserve: 16 << 10, readahead, ..EnvOptions::default() };
+        crate::file::take_advice_log();
+        let env = Env::open(&path, options).expect("open");
+        put_all(&env, "t", &[(b"k", &[7; 64])]);
+        let log = crate::file::take_advice_log();
+        assert!(log.len() >= 2, "readahead {readahead}: the open's mapping and a remap: {log:?}");
+        assert!(log.iter().all(|a| *a == want), "readahead {readahead}: {log:?}");
+        drop(env);
+        let ro = Env::open_read_only(&path, EnvOptions { readahead, ..EnvOptions::default() })
+            .expect("open read-only");
+        assert_eq!(crate::file::take_advice_log(), [want], "readahead {readahead}: read-only");
+        drop(ro);
+    }
+}
+
+/// The `VmFlags` of each mapping of `path` in `smaps` (the format of Linux's `/proc/self/smaps`),
+/// in address order. A mapping's header line starts with its address range (`lo-hi`, in hex) and
+/// ends with the path it maps; its `VmFlags:` line lists two-letter flags (`rr`: random read,
+/// `MADV_RANDOM`).
+fn vm_flags_of<'a>(smaps: &'a str, path: &Path) -> Vec<Vec<&'a str>> {
+    let path = path.to_str().expect("a UTF-8 path");
+    let mut flags = Vec::new();
+    let mut in_path = false;
+    for line in smaps.lines() {
+        let mut words = line.split_whitespace();
+        let first = words.next().unwrap_or_default();
+        if first.contains('-') && first.chars().all(|c| c == '-' || c.is_ascii_hexdigit()) {
+            // A header: range, perms, offset, device, inode, then the path (if any).
+            in_path = words.nth(4) == Some(path);
+        } else if in_path && first == "VmFlags:" {
+            flags.push(words.collect());
+        }
+    }
+    flags
+}
+
+/// [`vm_flags_of`] picks the `VmFlags` of exactly the mappings of the path, past other mappings'
+/// lines and its own other fields.
+#[test]
+fn vm_flags_of_reads_each_mapping_of_the_path() {
+    let smaps = "\
+7f0000000000-7f0000100000 rw-s 00000000 103:03 4242                       /tmp/x/db
+Size:               1024 kB
+VmFlags: rd wr sh mr mw me ms rr sd
+7f0000200000-7f0000201000 r--p 00000000 103:03 99                         /usr/lib/libc.so
+VmFlags: rd mr mw me sd
+7f0000300000-7f0000500000 rw-s 00000000 103:03 4242                       /tmp/x/db
+Rss:                   8 kB
+VmFlags: rd wr sh mr mw me ms sd
+7f0000600000-7f0000601000 rw-p 00000000 00:00 0
+VmFlags: rd wr mr mw me ac sd
+";
+    let flags = vm_flags_of(smaps, Path::new("/tmp/x/db"));
+    assert_eq!(
+        flags,
+        [
+            vec!["rd", "wr", "sh", "mr", "mw", "me", "ms", "rr", "sd"],
+            vec!["rd", "wr", "sh", "mr", "mw", "me", "ms", "sd"],
+        ]
+    );
+    assert!(vm_flags_of(smaps, Path::new("/tmp/x/other")).is_empty());
+}
+
+/// On Linux the kernel holds the advice: every mapping of the file, the writer's (the current and
+/// the retired ones, after a remap past the reservation) and a read-only environment's, carries
+/// `rr` (`VM_RAND_READ`) in `/proc/self/smaps` by default, and none does with `readahead`.
+#[cfg(target_os = "linux")]
+#[test]
+fn every_mapping_carries_the_random_read_flag_on_linux() {
+    for readahead in [false, true] {
+        let (dir, _) = temp();
+        let path = dir.path().canonicalize().expect("canonical temp dir").join("db");
+        let options = EnvOptions { map_reserve: 16 << 10, readahead, ..EnvOptions::default() };
+        let env = Env::open(&path, options).expect("open");
+        put_all(&env, "t", &[(b"k", &[7; 64])]);
+        let smaps = fs::read_to_string("/proc/self/smaps").expect("read smaps");
+        let flags = vm_flags_of(&smaps, &path);
+        assert!(flags.len() >= 2, "readahead {readahead}: the current and a retired mapping");
+        for f in &flags {
+            assert_eq!(f.contains(&"rr"), !readahead, "readahead {readahead}: {f:?}");
+        }
+        drop(env);
+        let ro = Env::open_read_only(&path, EnvOptions { readahead, ..EnvOptions::default() })
+            .expect("open read-only");
+        let smaps = fs::read_to_string("/proc/self/smaps").expect("read smaps");
+        let flags = vm_flags_of(&smaps, &path);
+        assert_eq!(flags.len(), 1, "readahead {readahead}: one read-only mapping");
+        assert_eq!(flags[0].contains(&"rr"), !readahead, "readahead {readahead}: {:?}", flags[0]);
+        drop(ro);
+    }
+}

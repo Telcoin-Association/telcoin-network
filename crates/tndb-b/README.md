@@ -706,7 +706,8 @@ enters, runs the same checks as `Cursor`'s.
    the older meta.
 7. **`fsync_file` once.** A crash may have left a meta in the page cache whose msync never
    finished. What open reads must be durable before anything is built on it.
-8. **Map** inside a reservation of `max(map_reserve, file length)`.
+8. **Map** inside a reservation of `max(map_reserve, file length)`, advised `MADV_RANDOM` unless
+   `readahead` is set (do-not-flag item 16); a remap past the reservation is advised the same way.
 9. **Check both tree roots** (`check_root`). Each root must be a tree page in range that passes
    its full CRC and `page::validate`. Its header must name it, with `txn as u32 == root_txn` and
    txn no later than the meta's. It must be a leaf exactly when the height is 1. The height is
@@ -735,7 +736,8 @@ same cache and cannot tell.
 reads it (a tool run while the node is stopped). It shares the steps of `Env::open` that read,
 in the same code (`choose_state`, `checked_snapshot`), and skips every one that writes:
 
-1. **Validate the page size**, as `Env::open` does. No other field of `EnvOptions` applies.
+1. **Validate the page size**, as `Env::open` does. Of the other fields of `EnvOptions` only
+   `readahead` applies (step 8).
 2. **Never create.** A missing file is `Io(NotFound)`. An empty file is `NotTndbB` (step 4 finds
    no meta in it). No `<path>.creating` file is made.
 3. **Lock shared** (`open_shared`): `O_RDONLY`, then `flock(LOCK_SH | LOCK_NB)`
@@ -748,7 +750,8 @@ in the same code (`choose_state`, `checked_snapshot`), and skips every one that 
    cache unsynced is the state it reads, and a power loss afterwards can still lose that state;
    the next `Env::open` then makes durable whichever meta it reads.
 8. **Map read-only:** one `PROT_READ` shared mapping of the file's length (`ReadOnlyFile`), with
-   no reservation and no growth. Readers reach it through the same `MapView`.
+   no reservation and no growth, advised as in `Env::open`'s step 8. Readers reach it through the
+   same `MapView`.
 9. **Check both tree roots**, as above.
 
 The environment has no writer. `begin_rw` and `try_begin_rw` return `ReadOnly`, which does not
@@ -816,7 +819,7 @@ A latched NoSync environment skips its final sync on drop.
 |---|---|
 | `Env::open(path, EnvOptions) -> Result<Env>` | open or create, then recover (see above) |
 | `Env::open_read_only(path, EnvOptions) -> Result<Env>` | open an existing file no writer holds, read-only (see [Read-only open](#read-only-open)): a shared lock, the same meta choice and root checks, a read-only mapping; never creates, writes or syncs; `begin_rw`/`try_begin_rw` return `ReadOnly` |
-| `EnvOptions { page_size, map_reserve, sync }` | defaults: 4096, 1 GiB, `SyncMode::Durable`. `page_size` applies at create; an existing file keeps its own. |
+| `EnvOptions { page_size, map_reserve, sync, readahead }` | defaults: 4096, 1 GiB, `SyncMode::Durable`, `false` on Linux and `true` elsewhere. `page_size` applies at create; an existing file keeps its own. `readahead: false` advises every mapping of the file `MADV_RANDOM`; `true` leaves the kernel's readahead (do-not-flag item 16). |
 | `SyncMode::{Durable, NoSync}` | durable at commit, or at the next `Env::sync` or drop |
 | `Env::begin_ro() / begin_rw() / try_begin_rw()` | start transactions: an `RoTxn` (one committed state of every table, kept intact while it lives), an `RwTxn` (`ReadOnly` in a read-only environment) |
 | `Env::oldest_reader_age() -> Option<Duration>` | how long the oldest live reader has held a superseded snapshot (pages freed after it wait for it to end, so the file grows meanwhile); `None` when every reader holds the current snapshot, and in a read-only environment. Lock-free; refreshed at each commit (see [Readers and snapshots](#readers-and-snapshots)) |
@@ -824,6 +827,8 @@ A latched NoSync environment skips its final sync on drop.
 | `Env::check() -> CheckReport` | full structural check plus exact page accounting, each root's entry count and page counters compared with its tree. `CheckReport` gives the state's txn id and page count, the catalog, table, free-tree and free pages, the free records, and a `TableCheck { entries, pages, height }` per table. |
 | `Env::stat() -> EnvStat` | `page_size`, `txn_id`, `page_count`, `tables` |
 | `Env::free_pages() -> u64` | the pages the newest committed state's free list holds (space the file can reuse before it grows; the reth adapter reports it as reth's `db.freelist` gauge): every free record read with the allocator's checks, so damage is `Corrupt` and latches |
+| `Env::io_stats() -> IoStats` | the writer's I/O and allocation counters (see [I/O counters](#io-counters) below): in memory only, cumulative since this open, all zero in a read-only environment; published at the end of every commit, abort and `Env::sync`, read with one short lock of that copy (never a wait for an open write transaction) |
+| `IoStats::since(&earlier) -> IoStats` | the difference of two reads: each counter's, saturating, but `max_gate_lag`, a maximum since the open, which is the later read's |
 | `Env::failure()` | the latched cause, if any |
 | `Env::max_key_len() / max_value_len(klen)` | the entry limits of this page size. `max_value_len` is the table limit: 16 MiB for a key up to `max_key_len − 10` bytes, else the inline limit. A value over the inline limit is stored in an overflow run transparently: `put`, `get` and the cursors take and return its bytes as for any value. |
 | `ReadTxn` (both txn kinds) | `open_table(name) -> Option<Table>`, `get`, `cursor`, `txn_id`, `table_stat -> TableStat { entries, height, branch_pages, leaf_pages, overflow_pages }` (O(1), from the root record) |
@@ -864,6 +869,27 @@ keys built as `key ‖ subkey` they walk one key's subkeys (the reth adapter's `
 - `n = 0`: `next` (`prev`), except that at the last (first) entry it returns `None` and stays.
 - At a leaf's end the step peeks into the adjacent leaf with a copy of the cursor and keeps its
   position unless the entry there shares the prefix.
+
+### I/O counters
+
+`Env::io_stats` returns an `IoStats`, a `Copy` struct of counters the writer keeps in plain fields of
+its state as it works: an add beside each event, and a clock read only around a whole commit step,
+a published page's check (`verify_published`) and a refill of the pool. Whenever the writer's
+state comes back to the environment (`EnvInner::return_writer`: the end of a commit, an abort,
+and an `Env::sync`), it copies them into one `Mutex<IoStats>`, which `io_stats` copies out: a
+reader sees one consistent set as of the last of those points, and the values do not move while a
+write transaction runs. An aborted transaction's work counts (it was done). Times are in
+nanoseconds. A benchmark takes two reads and `IoStats::since` for one commit's or one interval's
+work.
+
+| group | counters |
+|---|---|
+| commits | `commits` (each run of steps 4–6: a `Durable` commit, or an `Env::sync` that had a `NoSync` state to make durable), `nosync_commits`, `grown_commits` (the file grew since the last durable state) |
+| step 4 | `pages_synced` (pages, not bytes), `msync_syncs` and `fdatasync_syncs` (which one step 4 took), `msync_span_pages` (the one range's pages, clean ones included) |
+| growth | `bytes_grown` (the physical length, which grows geometrically ahead of the pages in use) |
+| step times | `save_ns` (step 1: the catalog's roots and the free list's save), `stamp_ns` (step 3), `data_sync_ns` (4), `size_sync_ns` (5), `meta_sync_ns` (6); `free_list_save_rounds` (write rounds of the fixed-point save) |
+| a transaction's pages | `cow_copies`, `verifies` and `verify_ns` (checks of published pages this writer did not stamp), `pages_from_pool`, `pages_from_end` (single and run pages) |
+| free list | `records_loaded`, `refill_ns`; `runs_by_step` (the run policy's four steps); `gate_lag_sum`, `gate_lag_samples` and `max_gate_lag` (at each load of records, the writing txn minus the reuse gate: 2 in `Durable` with no reader on an old snapshot, more under a held reader or `NoSync` commits not yet synced) |
 
 ### Detached cursors (`TxnCursor`)
 
@@ -1174,6 +1200,35 @@ These limits and non-goals are known:
     id). Each commit publishes a new snapshot with nothing remembered, so every handle is checked
     against each new catalog. Damage in the catalog is met by the first resolve in each snapshot and
     by every `open_table`, which never uses the cache.
+16. **On Linux every mapping of the file is advised `MADV_RANDOM`** (`file::advise_access`),
+    unless `EnvOptions::readahead` is set: the writer's mapping at open and after each remap past
+    the reservation, and a read-only environment's. Elsewhere `readahead` defaults to `true`, so no
+    advice is given unless it is cleared. Why:
+    - A B+tree's faults are random. A descent touches one page per level, far from its
+      neighbours, so readahead mostly reads pages nothing asks for.
+    - On Linux, readahead sizes what a commit writes. The page cache holds a file in folios, and
+      readahead builds large ones; a page dirtied through a shared mapping writes back its whole
+      folio. Measured on Linux 7.1, ext4, NVMe, as disk KiB written per 4 KiB page dirtied through
+      a shared mapping and synced (2000 random pages): 439 for a file written by `write(2)` and
+      still cached (what a copy leaves), 115 after a cold full sequential read with the default
+      readahead, 4.2 after cold random reads with it, 4.0 with `MADV_RANDOM`.
+    - The advice cannot help a file already cached in large folios by buffered writes (a copy, a
+      restore written with `write(2)`). Evict such a file from the page cache before opening it
+      (sync it, then `posix_fadvise(POSIX_FADV_DONTNEED)`): a commit on a copy left cached grew
+      from 82 to 583 ms over 300 commits in one measured workload, all in its one
+      `fdatasync`, as the disk wrote 199 to 532 MiB per commit.
+    - A failed `madvise` is not an error: the advice is a hint, so it is logged (`tracing::warn!`)
+      and the mapping is used without it. Mappings are made at open and at a growth past the
+      reservation, so the log is rare.
+    - The cost is a cold scan: with no readahead, each page of a sequential scan of uncached
+      pages is its own fault and read. Set `readahead` for a workload that scans whole tables
+      cold.
+    - Why not on macOS: a page dirtied through a shared mapping there writes back its whole VM page
+      (16 KiB on Apple silicon) with or without the advice, so it saves nothing at commit, and on
+      an Apple M1 Max it made first writes into new file space slower (the comparison benchmark,
+      A B B A: large-value puts 1.13–1.32x, sequential put loops 1.05–1.07x, small-transaction
+      p99 1.5–1.7x; reads, scans and commits within the spread). Clear `readahead` to get the
+      advice there.
 
 ---
 

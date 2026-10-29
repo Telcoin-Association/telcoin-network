@@ -4,9 +4,12 @@
 //! the catalog of the state they are used in; a read-only transaction's handle is checked once
 //! per snapshot, which every transaction on it shares ([`TableRoots`]).
 
-use std::sync::{
-    atomic::{AtomicU64, Ordering},
-    Arc, OnceLock,
+use std::{
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, OnceLock,
+    },
+    time::Instant,
 };
 
 #[cfg(test)]
@@ -19,6 +22,7 @@ use crate::{
     latch::UnwindLatch,
     meta::Meta,
     page,
+    stats::elapsed_ns,
     tree::{
         cursor::{self, Cursor, Entry, KeyTail, State, TreeCursor},
         read,
@@ -617,14 +621,17 @@ impl Work {
         let writer = writer.as_deref_mut().expect("a live write transaction holds the writer");
         #[cfg(test)]
         writer.crash_point(CrashAt::BeforeSave)?;
+        let started = Instant::now();
         for (name, record) in &dirty {
             catalog::put(writer, catalog, catalog_trusted, name, record)?;
         }
         let mut free = base.free;
-        let _rounds = freelist::save(writer, &mut free)?;
+        let rounds = freelist::save(writer, &mut free)?;
+        writer.stats.save_ns += elapsed_ns(started);
+        writer.stats.free_list_save_rounds += u64::from(rounds);
         #[cfg(test)]
         {
-            writer.max_save_rounds = writer.max_save_rounds.max(_rounds);
+            writer.max_save_rounds = writer.max_save_rounds.max(rounds);
             writer.crash_point(CrashAt::AfterSave)?;
         }
         let meta = Meta {

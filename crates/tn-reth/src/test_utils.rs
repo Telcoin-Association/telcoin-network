@@ -19,8 +19,8 @@
 //! - Consensus/payload-execution helpers: `consensus_output_for_tests`, and
 //!   `execute_payload_and_update_canonical_chain`, which builds a block and commits it as the
 //!   canonical tip, standing in for the engine's payload builder.
-//! - [`load`]: shared code for the busy-node execution bench, such as [`load::CaptureRecorder`] and
-//!   [`load::open_production_env`].
+//! - [`load`]: shared code for the busy-node execution bench, such as [`load::CaptureRecorder`],
+//!   [`load::open_production_env`] and the database counters [`load::DbCounters`].
 //! - [`plant_finalized_marker`]: writes the finalized/safe database markers directly — a test-only
 //!   backdoor into storage state for reconstructing pre-fix crash layouts.
 

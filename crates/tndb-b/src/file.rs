@@ -16,6 +16,22 @@
 //! the writer's and the readers' alike, is formed from the base pointer over exactly its own
 //! bytes, so no reference to the whole mapping ever exists beside a reader's slice.
 //!
+//! ## Access advice
+//!
+//! Every mapping of the file, the writer's at open and after each remap past the reservation and
+//! a read-only environment's, is advised `MADV_RANDOM` ([`advise_access`]) unless the environment
+//! was opened with `EnvOptions::readahead`, which defaults to `false` on Linux only (macOS writes
+//! back a whole VM page either way, and the advice slowed its first writes into new file space,
+//! README do-not-flag item 16). A B+tree's faults are random: a descent touches one
+//! page per level, nowhere near its neighbours, so readahead mostly reads pages nothing asks for.
+//! On Linux it also sizes what a commit writes: the page cache holds a file in folios, readahead
+//! builds large ones, and a page dirtied through a shared mapping writes back its whole folio.
+//! Measured on Linux 7.1, ext4, NVMe, as the disk bytes written per 4 KiB page dirtied through a
+//! shared mapping and synced: 439 KiB for a file written by `write(2)` and still cached, 115 KiB
+//! for one read cold in full with the default readahead, 4.2 KiB for one read cold at random with
+//! it, and 4.0 KiB with `MADV_RANDOM`. Advice is a hint: a failed one is logged and the mapping is
+//! used without it, reading the same bytes.
+//!
 //! ## Growth
 //!
 //! [`PageFile::ensure_len`] grows geometrically: to at least the length asked for, and at least by
@@ -51,7 +67,7 @@ use std::{
     },
 };
 
-use memmap2::{Mmap, MmapOptions, MmapRaw};
+use memmap2::{Advice, Mmap, MmapOptions, MmapRaw};
 
 use crate::{
     error::{Error, Result},
@@ -144,9 +160,14 @@ pub(crate) struct PageFile {
     /// Mappings replaced while [`Self::view`] was shared: kept mapped until this file drops so a
     /// reader still holding an old base stays valid.
     retired: Vec<MmapRaw>,
+    /// Leave every mapping to the kernel's readahead instead of advising `MADV_RANDOM` (see the
+    /// module docs' Access advice): `EnvOptions::readahead`, applied to each remap too.
+    readahead: bool,
     /// Set when a growth extended the file since the last size sync (see
     /// [`Self::sync_size_if_grown`]).
     size_unsynced: AtomicBool,
+    /// The bytes the growths added since this file was mapped ([`Self::bytes_grown`]).
+    bytes_grown: u64,
     /// Sticky latch set by any failed sync or growth (see the module docs). Never cleared.
     poisoned: AtomicBool,
     /// Test-only: the file's inode, for the disk model.
@@ -159,7 +180,7 @@ pub(crate) struct PageFile {
 
 impl PageFile {
     /// Open (creating it if missing) the file at `path` read-write and map it with a reservation
-    /// of `reserve` bytes of address space.
+    /// of `reserve` bytes of address space, advised `MADV_RANDOM` (the default access advice).
     #[cfg(test)]
     pub(crate) fn open(path: &std::path::Path, reserve: u64) -> Result<Self> {
         let file = std::fs::OpenOptions::new()
@@ -168,15 +189,16 @@ impl PageFile {
             .create(true)
             .truncate(false)
             .open(path)?;
-        Self::from_file(file, reserve)
+        Self::from_file(file, reserve, false)
     }
 
     /// Map `file`, opened read-write (the caller has locked and validated it), with a reservation
-    /// of `reserve` bytes of address space (at least the file's length). Fails if the address
-    /// space cannot be reserved.
-    pub(crate) fn from_file(file: File, reserve: u64) -> Result<Self> {
+    /// of `reserve` bytes of address space (at least the file's length), advised `MADV_RANDOM`
+    /// unless `readahead` (see the module docs' Access advice). Fails if the address space cannot
+    /// be reserved.
+    pub(crate) fn from_file(file: File, reserve: u64, readahead: bool) -> Result<Self> {
         let len = file.metadata()?.len();
-        let map = map_reservation(&file, reserve.max(len))?;
+        let map = map_reservation(&file, reserve.max(len), readahead)?;
         let view = Arc::new(MapView::new());
         view.set_mapping(map.as_ptr(), map.len() as u64);
         Ok(Self {
@@ -187,7 +209,9 @@ impl PageFile {
             len,
             view,
             retired: Vec::new(),
+            readahead,
             size_unsynced: AtomicBool::new(false),
+            bytes_grown: 0,
             poisoned: AtomicBool::new(false),
             #[cfg(test)]
             fail_next_msync: AtomicBool::new(false),
@@ -246,16 +270,31 @@ impl PageFile {
         if target > self.map.len() as u64 {
             self.remap(target)?;
         }
+        self.bytes_grown += target - self.len;
         self.len = target;
         self.size_unsynced.store(true, Ordering::Relaxed);
         Ok(())
     }
 
-    /// Map a new reservation of `max(target, 2 × the current one)` bytes and point the view at it,
-    /// retiring the old mapping if a clone of the view may hold its base (else it unmaps here).
+    /// The bytes the growths added to the file's physical length since it was mapped
+    /// (`IoStats::bytes_grown`).
+    pub(crate) fn bytes_grown(&self) -> u64 {
+        self.bytes_grown
+    }
+
+    /// True if a growth extended the file since the last size sync (or `fdatasync`): its size
+    /// is not yet durable.
+    pub(crate) fn size_unsynced(&self) -> bool {
+        self.size_unsynced.load(Ordering::Relaxed)
+    }
+
+    /// Map a new reservation of `max(target, 2 × the current one)` bytes, advised as the first
+    /// one was, and point the view at it, retiring the old mapping if a clone of the view may hold
+    /// its base (else it unmaps here).
     fn remap(&mut self, target: u64) -> Result<()> {
         let reserve = target.max((self.map.len() as u64).saturating_mul(2));
-        let old = std::mem::replace(&mut self.map, map_reservation(&self.file, reserve)?);
+        let new = map_reservation(&self.file, reserve, self.readahead)?;
+        let old = std::mem::replace(&mut self.map, new);
         self.view.set_mapping(self.map.as_ptr(), self.map.len() as u64);
         // `&mut self` means the writer holds no page borrow through the file, and every other
         // borrow goes through a clone of the view: a reader's, or the writer's own
@@ -436,13 +475,15 @@ pub(crate) struct ReadOnlyFile {
 
 impl ReadOnlyFile {
     /// Map all of `file`, opened read-only (the caller has locked it shared and checked that it
-    /// is not empty).
-    pub(crate) fn from_file(file: File) -> Result<Self> {
+    /// is not empty), advised `MADV_RANDOM` unless `readahead` (see the module docs' Access
+    /// advice).
+    pub(crate) fn from_file(file: File, readahead: bool) -> Result<Self> {
         let len = usize::try_from(file.metadata()?.len()).map_err(io::Error::other)?;
         // SAFETY: the shared lock keeps every tndb-b writer out, so nothing changes the file while
         // it is mapped (a foreign process truncating it is outside the crate's contract, as for a
         // writer's mapping), and readers read only the published bytes, inside the file.
         let map = unsafe { MmapOptions::new().len(len).map(&file) }?;
+        advise_access(readahead, |advice| map.advise(advice));
         let view = Arc::new(MapView::new());
         view.set_mapping(map.as_ptr(), map.len() as u64);
         Ok(Self { _file: file, _map: map, view })
@@ -462,16 +503,61 @@ impl Drop for ReadOnlyFile {
 }
 
 /// Map `[0, len)` of `file` (at least one OS page) read-write and shared (`PROT_READ |
-/// PROT_WRITE`, `MAP_SHARED`). The range may extend past the end of file; those pages are never
-/// touched.
-fn map_reservation(file: &File, len: u64) -> Result<MmapRaw> {
+/// PROT_WRITE`, `MAP_SHARED`), advised `MADV_RANDOM` unless `readahead` ([`advise_access`]). The
+/// range may extend past the end of file; those pages are never touched.
+fn map_reservation(file: &File, len: u64, readahead: bool) -> Result<MmapRaw> {
     let len = usize::try_from(len.max(os_page_size())).map_err(io::Error::other)?;
     // `map_raw` is safe because an `MmapRaw` hands out only raw pointers; the slices this file
     // forms from them are sound because the file is only modified through this mapping by its
     // single writer (the database holds an exclusive lock on it), and the pages past the end of
     // file are never touched: the writer's accessors stop at the file length, readers at the
     // published length.
-    Ok(MmapOptions::new().len(len).map_raw(file)?)
+    let map = MmapOptions::new().len(len).map_raw(file)?;
+    advise_access(readahead, |advice| map.advise(advice));
+    Ok(map)
+}
+
+/// Advise a new mapping of the page file through `advise` (its `advise` method): `MADV_RANDOM`,
+/// unless `readahead`, which leaves the kernel's default (see the module docs' Access advice).
+/// Advice is a hint, so a failure does not fail the open or the growth that made the mapping: it
+/// is logged, and the mapping reads the same bytes with the kernel's readahead. Mappings are made
+/// at open and at a growth past the reservation, so a failure logs rarely.
+fn advise_access(readahead: bool, advise: impl FnOnce(Advice) -> io::Result<()>) {
+    let applied = if readahead {
+        None
+    } else {
+        match advise(Advice::Random) {
+            Ok(()) => Some(Advice::Random),
+            Err(e) => {
+                tracing::warn!(
+                    target: "tndb_b",
+                    "madvise(MADV_RANDOM) on the page file's mapping failed: {e}; the mapping \
+                     keeps the kernel's readahead"
+                );
+                None
+            }
+        }
+    };
+    #[cfg(test)]
+    ADVICE_LOG.with(|log| log.borrow_mut().push(applied));
+    #[cfg(not(test))]
+    let _ = applied;
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only: the advice [`advise_access`] put into effect on each mapping this thread made, in
+    /// order (`None`: no advice, as `readahead` asks, or a failed one). Read with
+    /// [`take_advice_log`].
+    static ADVICE_LOG: std::cell::RefCell<Vec<Option<Advice>>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Test-only: the advice put into effect on each mapping this thread made since the last call,
+/// oldest first (see [`ADVICE_LOG`]).
+#[cfg(test)]
+pub(crate) fn take_advice_log() -> Vec<Option<Advice>> {
+    ADVICE_LOG.with(|log| std::mem::take(&mut *log.borrow_mut()))
 }
 
 #[cfg(test)]
@@ -616,6 +702,40 @@ mod tests {
         assert!(pf.page(0, 4096).expect("reads continue").iter().all(|&b| b == 1));
     }
 
+    /// Every mapping a page file makes is advised `MADV_RANDOM` (`advise_access`): the first and
+    /// each remap's past the reservation, unless the file was mapped with `readahead`, which
+    /// advises none. A read-only file's one mapping likewise.
+    #[test]
+    fn every_mapping_is_advised_random_unless_readahead() {
+        let tmp = TempDir::with_prefix("tndb_b_file_advice").expect("temp dir");
+        for (readahead, want) in [(false, Some(Advice::Random)), (true, None)] {
+            let path = tmp.path().join(format!("db-{readahead}"));
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(&path)
+                .expect("open");
+            take_advice_log();
+            let mut pf = PageFile::from_file(file, MIN_GROWTH, readahead).expect("map");
+            let _reader = pf.view();
+            pf.ensure_len(2 * MIN_GROWTH).expect("grow past the reservation");
+            pf.ensure_len(8 * MIN_GROWTH).expect("grow past it again");
+            assert_eq!(pf.retired.len(), 2, "two remaps");
+            assert_eq!(
+                take_advice_log(),
+                [want; 3],
+                "readahead {readahead}: open, then each remap"
+            );
+            drop(pf);
+            let ro = ReadOnlyFile::from_file(File::open(&path).expect("open read-only"), readahead)
+                .expect("map");
+            assert_eq!(take_advice_log(), [want], "readahead {readahead}: a read-only mapping");
+            drop(ro);
+        }
+    }
+
     /// A read-only mapping of a file opened read-only (mode 0444 here) reads its bytes up to the
     /// published length, and maps nothing once dropped.
     #[test]
@@ -627,7 +747,7 @@ mod tests {
         std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o444))
             .expect("chmod");
         let file = File::open(&path).expect("open read-only");
-        let ro = ReadOnlyFile::from_file(file).expect("map");
+        let ro = ReadOnlyFile::from_file(file, false).expect("map");
         let view = ro.view();
         assert_eq!(view.slice(0, 1), None, "nothing published yet");
         view.publish_len(2 * 4096);

@@ -32,6 +32,7 @@ mod meta;
 mod overflow;
 mod page;
 mod page_set;
+mod stats;
 mod sys;
 #[cfg(test)]
 mod tests;
@@ -41,5 +42,6 @@ mod txn;
 pub use check::{CheckReport, TableCheck};
 pub use env::{Env, EnvOptions, EnvStat, SyncMode};
 pub use error::{Error, Result};
+pub use stats::IoStats;
 pub use tree::cursor::{Cursor, KeyTail};
 pub use txn::{ReadTxn, RoCursor, RoTxn, RwCursor, RwTxn, Table, TableStat, TxnCursor};

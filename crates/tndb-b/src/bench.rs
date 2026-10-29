@@ -437,7 +437,8 @@ fn tndb_b_sync_and_merge() {
         .map(|(&(dir_name, name, page_size, sync), _)| {
             let dir = tmp.path().join(dir_name);
             std::fs::create_dir(&dir).expect("column dir");
-            let options = EnvOptions { page_size, map_reserve: 8 << 30, sync };
+            let options =
+                EnvOptions { page_size, map_reserve: 8 << 30, sync, ..EnvOptions::default() };
             let mut col = Column { name, cells: Default::default() };
             if run_small {
                 small(&dir.join("small.tndb-b"), options, &data, &mut col);

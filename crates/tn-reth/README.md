@@ -438,6 +438,10 @@ every path TN uses, and MDBX stays compiled in both builds. Every backend differ
   `durable`: the engine's `NoSync` reuses the pages a commit frees only after a sync, and nothing
   syncs a `NoSync` environment on its own, so the file would grow until one (see "Persist
   benchmark"). They stay refused until the engine bounds that growth.
+- **Default page size** (`default_page_size`): the page size of a new database without
+  `--db.page-size`. The MDBX build's is reth's own default, the OS page size clamped to 4 KiB..=64
+  KiB (16 KiB on Apple Silicon, 4 KiB on x86 Linux), which its `open_rw` passes to MDBX explicitly;
+  the tndb build's is the adapter's 4 KiB. The execution bench keys its cached bases by it.
 - **Table stats** (`db_table_stats`, behind `telcoin-network db stats`): each of reth's tables the
   database has, sorted by name, with its rows, branch, leaf and overflow pages, and size (the page
   size times its pages, `DbTableStat`). A table the database lacks is skipped. The MDBX build
@@ -565,9 +569,61 @@ against this checkout on one backend (`EXEC_BACKEND`, default `tndb-b`). It runs
 (`EXEC_ROUNDS`, default 2: A B B A), passes any other `TN_EXEC_BENCH_*` knob through, and writes one
 report to the repo root, `reth-exec-<host>-<time>.txt`: per profile, each side's medians over the
 rounds and each pair's B/A ratio, with the median ratio and its spread, beside each run's JSON
-report under `<bench dir>/reports/`. The script's header lists its settings and everything it
-writes. On macOS a durable commit is `F_FULLFSYNC` for libmdbx but a plain fsync for tndb-b, so
+report under `<bench dir>/reports/`. `EXEC_PAGE_SIZE_MDBX` and `EXEC_PAGE_SIZE_TNDB` set each
+backend's database page size independently (the bench's `TN_EXEC_BENCH_PAGE_SIZE`, a power of two
+from 4096 to 65536 bytes; unset, the backend's default from `default_page_size`: MDBX the OS page,
+tndb-b 4096), and the report names each side's page size; each page size has its own cached bases.
+The script's header lists its settings and everything it writes. On macOS a durable commit is `F_FULLFSYNC` for libmdbx but a plain fsync for tndb-b, so
 durable commit times there are not like-for-like between the backends.
+
+From the per-output rows the script's report adds the tail and drift rows: the total's p90, p95 and
+p99 pooled over every output of a side's paired rounds (one percentile, linear between the closest
+ranks), the database commit's last-third over first-third mean per run, and one line per run of the
+commit's mean over ten consecutive groups of outputs. With report v4 it adds a block per side of the
+database writes per output (the commit's ms, disk MiB, file growth and each counter that moved),
+each as the run's mean, first third and last third, ending with the commit's ms per page written
+(tndb-b: per `tndb_pages_synced`; MDBX: per `mdbx_newly + mdbx_cow + mdbx_split`): a commit that
+grows at the same ms per page writes more pages, one that grows per page writes the same pages
+slower. `etc/reth-exec-bench.sh --report-only <bench dir>` renders the report again from a bench
+directory's `reports/` (its `runs.tsv`, else the report names), with no builds and no runs. On Linux,
+`EXEC_SYS_SAMPLE=1` runs a sampler beside each run (every second: `/proc/meminfo`'s Dirty and
+Writeback, the `/proc/diskstats` line of the whole disk under the bench directory and the drive's
+temperature; `filefrag`'s extent count of the data file when it appears and every 30 s, when
+installed), and the report gives per side the disk's write MiB/s, ms per write, busy %, flushes and
+ms per flush, Dirty and Writeback, the temperature and the extents over each run's timed loop and
+its first and last third. It samples the whole disk, so other writers on it show up.
+
+Each timed output also records what it wrote, read just before and just after its
+`execute_consensus_output` call (outside its wall time; the database commit completes inside the
+call on both backends): the database's own counters over the call (`db_counters`, `mdbx_*` or
+`tndb_*`, see `src/test_utils/load/db_counters.rs`), the bytes the process wrote to disk
+(`proc_pid_rusage`'s `ri_diskio_byteswritten` on macOS, `/proc/self/io`'s `write_bytes` on Linux,
+none elsewhere) and the database data file's length after it. The report's "database writes per
+output" section gives each counter that moved as its mean per output (`_ns` counters in ms, the
+`tndb_max_gate_lag` maximum as its largest), the disk MiB and the data file's growth per output and
+over the run, then deciles (ten consecutive groups of outputs) of the commit's ms, the disk MiB and
+the file's length, which show whether the commit grows over a long run. The JSON report (version
+4) carries them per row (`db_counters`, `disk_bytes_written`, `db_file_len_bytes`), the source and
+the counters' names in the build's order in its header (`disk_bytes_source`, `db_counter_names`)
+and the summary as `db_writes`. Caveats: the disk bytes are an
+approximation: Linux counts a page as it is dirtied (a page dirtied once and synced counts once),
+including the static files' writes and anything else the process writes, and macOS counts the I/O
+the process issues and misses background writeback; a "pages synced" counter is in database pages,
+not bytes (an OS page larger than the database page writes more); MDBX's counters count from its
+lock file's creation, per environment, so only the per-output differences mean anything.
+
+Each run opens a copy of a cached base datadir (`clone_datadir`). On Linux the copy is then evicted
+from the page cache (each regular file synced, then `posix_fadvise(POSIX_FADV_DONTNEED)`), so both
+backends start cold, as a restarted node does. Without it `cp` leaves the copy cached in large
+page-cache folios, and a page a commit dirties through a shared mapping writes back its whole folio
+(measured on Linux 7.1, ext4: 439 KiB written per 4 KiB page dirtied in a file written by `write(2)`
+and still cached, 4 KiB in one read cold at random): in a Linux run on a cached copy, tndb-b's busy
+commit grew from 82 to 583 ms over 300 outputs, all in its one `fdatasync` (199 to 532 MiB written
+per commit), and MDBX wrote about 970 MiB per commit. Linux commit numbers from runs on a cached copy
+are not comparable with later ones. On macOS nothing is evicted: it has no per-file eviction, and no
+folio writeback of this kind. On Linux tndb-b also advises its mappings `MADV_RANDOM`
+(`EnvOptions::readahead`, off by default there), as reth's MDBX does, so its own faults do not build
+large folios.
 
 #### Mac baseline, 2026-10-28
 
@@ -690,12 +746,23 @@ are smaller. The Linux run (the user's, with the same script) decides the commit
 - **`env`:**
   - `open_production_env` opens a reth env as the node opens it: the given `--db.*` flags parsed by
     `RethCommand`, never the temp chain's caps; HTTP RPC on, IPC off, ports 0.
+    `open_production_env_with_db` also returns the database handle (`RethDb`), which keeps the
+    database open (and, on tndb-b, locked) until it drops too.
   - `clone_datadir` copies a closed datadir with `cp -c -R` (APFS `clonefile`) on macOS and
-    `cp -a --reflink=auto --sparse=always` elsewhere, and refuses an existing destination.
+    `cp -a --reflink=auto --sparse=always` elsewhere, and refuses an existing destination. On
+    Linux it then evicts the copy from the page cache (`evict_from_page_cache`: every regular file
+    synced, then `posix_fadvise(POSIX_FADV_DONTNEED)`; a failure is an error naming the file), so
+    the env opened on it starts cold; elsewhere that step does nothing.
   - `announce_temp_dir` prints a bench's temp dir and stops on tmpfs/ramfs (`fs_type`, `fs_type_in`
     over Linux's mountinfo; the persist bench uses it too).
   - `db_file_bytes` and `dir_bytes` give the length and allocated bytes of the database file and of
     a directory such as `static_files`.
+- **`db_counters`:** backend-neutral reads of the open database. `db_counters(&db)` gives
+  `DbCounters`, its cumulative counters by name: MDBX's page operations (`Info::page_ops`, as
+  `mdbx_newly`, `mdbx_cow`, `mdbx_msync`, ...) or tndb-b's `IoStats` (as `tndb_commits`,
+  `tndb_pages_synced`, ..., times in `_ns`); `since` subtracts an earlier read, so a read before
+  and after an output gives what it wrote. A read is one `mdbx_env_info_ex` or one short lock of
+  tndb-b's published copy. `db_page_size(&db)` gives the page size the file was created with.
 - **`state`:** `PrefillSpec { accounts, senders, pools, seed, registry }` builds a deterministic
   prefilled genesis (`genesis()`), on `test_genesis_at(GENESIS_TIMESTAMP)` or, with `registry`, on
   `test_genesis_with_consensus_registry` (which needs a tokio runtime).
@@ -710,16 +777,18 @@ are smaller. The Linux run (the user's, with the same script) decides the commit
     `B.transfer(caller, amount_out)` from its prefilled balance and logs `ISwapRouter::Swap`. It
     reverts when a token call fails.
   - On the test chain a token transfer uses 38,974 gas and a swap 79,520.
-- **`base`:** `build_base(spec, cache_dir)` builds a spec's genesis once per backend into a closed
-  datadir, `<cache_dir>/base-<backend>-<key>`, with production `--db.*` and durable sync.
+- **`base`:** `build_base(spec, page_size, cache_dir)` builds a spec's genesis once per backend and
+  page size into a closed datadir, `<cache_dir>/base-<backend>-pg<page_size>-<key>`, with
+  production `--db.*`, durable sync and `--db.page-size <page_size>`; a database with another page
+  size (`db_page_size`) is an error.
   - The key (`base_dir_name`) is 16 hex digits of `keccak256` over the spec and `LAYOUT_VERSION`. A
     derived datadir, such as an aged one, appends its own `extra` component.
-  - It writes `bench-base.json` (`BaseMeta`: the spec, the backend, the layout version, the sealed
-    genesis header, the slim genesis hash, build times and sizes), then renames `<name>.building`
-    into place. A later call returns the cached base.
-  - An existing base whose meta does not match (layout version, backend, spec, header hash, or the
-    slim genesis hash, which changes with the token or router code or the test genesis), or that
-    has no meta, is an error. It is never rebuilt over.
+  - It writes `bench-base.json` (`BaseMeta`: the spec, the backend, the page size, the layout
+    version, the sealed genesis header, the slim genesis hash, build times and sizes), then renames
+    `<name>.building` into place. A later call returns the cached base.
+  - An existing base whose meta does not match (layout version, backend, page size, spec, header
+    hash, or the slim genesis hash, which changes with the token or router code or the test
+    genesis), or that has no meta, is an error. It is never rebuilt over.
   - `slim_chain(meta)` reopens a clone of the base: the chain spec of `PrefillSpec::slim()` (no
     senders or accounts) with the cached genesis header in place of its own, so an open never
     recomputes a 1M-account genesis root. `init_genesis` checks an existing genesis by hash only and
@@ -825,7 +894,7 @@ Block production must be a pure function of certified consensus output. Concrete
 | `src/types.rs` | Type aliases (`RpcServer`, `RethDb`, `PoolTxn`, `TNPrimitives`); `RethDb` is re-exported from `src/env/database.rs`. |
 | `src/worker.rs` | `WorkerComponents` and the `WorkerNetwork` RPC shim (libp2p peer count for `net_*`). |
 | `src/test_utils.rs` | `TransactionFactory` and payload-execution helpers (`test-utils` feature / tests). |
-| `src/test_utils/load/` | Shared code for the busy-node execution bench (`test-utils`): the capture recorder, the production env and datadir clones (`env`), the prefilled state (`state`) and its cached base (`base`), the transaction mix (`workload`), the consensus outputs (`output`) and the RPC side load (`readers`). See "Execution benchmark". |
+| `src/test_utils/load/` | Shared code for the busy-node execution bench (`test-utils`): the capture recorder, the production env and datadir clones (`env`), the database's counters and page size (`db_counters`), the prefilled state (`state`) and its cached base (`base`), the transaction mix (`workload`), the consensus outputs (`output`) and the RPC side load (`readers`). See "Execution benchmark". |
 
 ## Feature flags
 

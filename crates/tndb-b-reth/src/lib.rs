@@ -13,6 +13,7 @@
 //! | `DbTxMut::CursorMut` | [`TndbCursorMut`] | [`tndb_b::TxnCursor`] |
 //! | `DatabaseMetrics` | [`TndbEnv`] ([`TndbEnv::table_stats`], [`RethTableStat`]) | [`tndb_b::TableStat`], [`tndb_b::Env::free_pages`] |
 //! | none (MDBX's sync and check are its own tools) | [`TndbEnv::sync`], [`TndbEnv::check`] ([`CheckReport`]) | [`tndb_b::Env::sync`], [`tndb_b::Env::check`] |
+//! | none (MDBX's `page_ops` in its environment info are the nearest) | [`TndbEnv::io_stats`] ([`IoStats`]) | [`tndb_b::Env::io_stats`] |
 //!
 //! Each of reth's tables is an engine table of the same name; the environment maps each name to
 //! its engine handle. Keys are stored encoded (`Encode`) and values compressed (`Compress`), as
@@ -255,7 +256,7 @@ mod tests;
 
 pub use cursor::{TndbCursor, TndbCursorMut};
 pub use env::{RethTableStat, TndbArgs, TndbEnv, TndbEnvKind, DATA_FILE};
-pub use tndb_b::{CheckReport, SyncMode, TableCheck};
+pub use tndb_b::{CheckReport, IoStats, SyncMode, TableCheck};
 pub use tx::{TndbTx, TndbTxMut};
 
 #[cfg(test)]

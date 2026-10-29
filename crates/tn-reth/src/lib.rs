@@ -148,7 +148,7 @@ pub use cli::{
     init_reth_defaults, RethCommand, RethConfig, TN_TXPOOL_MAX_ACCOUNT_SLOTS_PER_SENDER,
 };
 pub use env::{
-    database::{db_table_stats, DbTableStat, DB_TABLE_STATS_NEEDS_STOPPED_NODE},
+    database::{db_table_stats, default_page_size, DbTableStat, DB_TABLE_STATS_NEEDS_STOPPED_NODE},
     *,
 };
 #[cfg(feature = "faucet")]

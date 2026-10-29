@@ -952,6 +952,25 @@ fn sync_makes_no_sync_commits_durable() {
     assert_eq!(db.failure(), None, "a sync with nothing pending changes nothing");
 }
 
+/// `io_stats` is the engine's counters: a reth write through the adapter counts one durable
+/// commit and the pages it synced, a reth read nothing, and a read-only open stays at zero.
+#[test]
+fn io_stats_count_a_reth_commit() {
+    let (dir, db) = create_test_db(TndbEnvKind::RW);
+    let before = db.io_stats();
+    db.update(|tx| tx.put::<CanonicalHeaders>(1, B256::with_last_byte(1))).unwrap().unwrap();
+    let d = db.io_stats().since(&before);
+    assert_eq!(d.commits, 1, "{d:?}");
+    assert!(d.pages_synced > 0, "{d:?}");
+    assert_eq!(d.msync_syncs + d.fdatasync_syncs, 1, "{d:?}");
+    let written = db.io_stats();
+    assert!(db.tx().unwrap().get::<CanonicalHeaders>(1).unwrap().is_some());
+    assert_eq!(db.io_stats(), written, "a read counts nothing");
+    drop(db);
+    let ro = super::open_env(dir.path(), TndbEnvKind::RO, TndbArgs::default()).unwrap();
+    assert_eq!(ro.io_stats(), crate::IoStats::default());
+}
+
 /// `check` reports the newest committed state's tables. Damage it finds (here an overflow run's
 /// middle page changed on disk, which the open does not read) is `MDBX_CORRUPTED` as a read
 /// error, and latches the environment, with the detail in `failure`.

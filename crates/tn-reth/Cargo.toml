@@ -109,6 +109,8 @@ tokio-stream = { workspace = true }
 reth-ethereum-primitives = { workspace = true }
 secp256k1 = { workspace = true, optional = true }
 tndb-b-reth = { workspace = true, optional = true }
+# The OS page size, as reth reads it for MDBX's default page size (`default_page_size`).
+page_size = "0.6.0"
 
 [dev-dependencies]
 metrics-util = { workspace = true }

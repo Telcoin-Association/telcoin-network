@@ -24,7 +24,7 @@ use std::{
     },
     time::{Duration, Instant},
 };
-use tndb_b::{CheckReport, Env, EnvOptions, ReadTxn, SyncMode, Table};
+use tndb_b::{CheckReport, Env, EnvOptions, IoStats, ReadTxn, SyncMode, Table};
 
 /// The name of the page file inside the environment's directory.
 pub const DATA_FILE: &str = "tndb.dat";
@@ -161,8 +161,15 @@ impl TndbArgs {
         self
     }
 
-    const fn options(&self) -> EnvOptions {
-        EnvOptions { page_size: self.page_size, map_reserve: self.map_reserve, sync: self.sync }
+    /// The engine's options: these settings, and the engine's defaults for the rest (its access
+    /// advice among them).
+    fn options(&self) -> EnvOptions {
+        EnvOptions {
+            page_size: self.page_size,
+            map_reserve: self.map_reserve,
+            sync: self.sync,
+            ..EnvOptions::default()
+        }
     }
 }
 
@@ -383,6 +390,17 @@ impl TndbEnv {
     /// environment; the detail is in [`Self::failure`].
     pub fn check(&self) -> Result<CheckReport, DatabaseError> {
         self.env.check().map_err(error::read)
+    }
+
+    /// The engine's I/O and allocation counters ([`IoStats`]: the commits, the pages each step
+    /// syncs, the growth, the copy-on-write copies, the allocations and the time in each commit
+    /// step), cumulative since the environment opened: the engine's `Env::io_stats`. In memory
+    /// only, published at the end of each commit, abort and [`Self::sync`]; all zero in a
+    /// read-only environment. Lock-free for practical purposes: one short lock of a copy, never a
+    /// wait for an open write transaction. Two reads and [`IoStats::since`] give what happened
+    /// between them, such as one commit's I/O.
+    pub fn io_stats(&self) -> IoStats {
+        self.env.io_stats()
     }
 
     /// The figures of each of reth's [`Tables`] in the newest committed state, in the order of

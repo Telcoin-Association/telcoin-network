@@ -1,9 +1,16 @@
-//! The bench's environment: a reth env opened as the node opens it, cheap copies of a datadir, the
-//! temp-dir guard against memory file systems, and the on-disk size of the database.
+//! The bench's environment: a reth env opened as the node opens it, cheap copies of a datadir
+//! (evicted from the page cache on Linux), the temp-dir guard against memory file systems, and the
+//! on-disk size of the database.
 
-use crate::{init_reth_defaults, RethChainSpec, RethCommand, RethConfig, RethEnv};
+use crate::{init_reth_defaults, RethChainSpec, RethCommand, RethConfig, RethDb, RethEnv};
 use clap::Parser as _;
-use std::{os::unix::fs::MetadataExt as _, path::Path, process::Command, sync::Arc};
+use std::{
+    os::unix::fs::MetadataExt as _,
+    path::{Path, PathBuf},
+    process::Command,
+    sync::Arc,
+};
+use tn_storage::disk::{drop_cached_pages, fsync_file};
 use tn_types::{gas_accumulator::GasAccumulator, TaskManager};
 
 /// This build's database data file inside the database directory.
@@ -29,13 +36,27 @@ const DATA_FILE: &str = tndb_b_reth::DATA_FILE;
 ///
 /// The database stays open until the env, its clones and `task_manager`'s tasks holding it are
 /// dropped; the tndb build holds a lock on it until then, so a second open of the same datadir
-/// fails meanwhile.
+/// fails meanwhile. [`open_production_env_with_db`] also returns the database handle.
 pub fn open_production_env(
     datadir: &Path,
     chain: Arc<RethChainSpec>,
     db_flags: &[&str],
     task_manager: &TaskManager,
 ) -> eyre::Result<RethEnv> {
+    open_production_env_with_db(datadir, chain, db_flags, task_manager).map(|(env, _)| env)
+}
+
+/// [`open_production_env`], returning the env's database handle beside it, for reads the env does
+/// not offer ([`db_counters`](fn@super::db_counters), [`db_page_size`](super::db_page_size)).
+///
+/// The handle is one more owner of the database: it stays open (and, on tndb-b, locked) until the
+/// handle drops too, so drop it with the env before reopening the datadir.
+pub fn open_production_env_with_db(
+    datadir: &Path,
+    chain: Arc<RethChainSpec>,
+    db_flags: &[&str],
+    task_manager: &TaskManager,
+) -> eyre::Result<(RethEnv, RethDb)> {
     if let Some(flag) = db_flags.iter().find(|w| w.starts_with('-') && !w.starts_with("--db.")) {
         eyre::bail!("open_production_env takes only --db.* flags, not {flag}");
     }
@@ -46,12 +67,26 @@ pub fn open_production_env(
     command.rpc.ipcdisable = true;
     let reth_config = RethConfig::new(command, None, datadir, true, chain);
     let database = RethEnv::new_database(&reth_config, datadir.join("db"))?;
-    RethEnv::new(&reth_config, task_manager, database, None, GasAccumulator::default())
+    let env = RethEnv::new(
+        &reth_config,
+        task_manager,
+        database.clone(),
+        None,
+        GasAccumulator::default(),
+    )?;
+    Ok((env, database))
 }
 
 /// Copy the datadir `src` to `dst`, sharing blocks where the file system can: `cp -c -R`
 /// (`clonefile`) on macOS, `cp -a --reflink=auto --sparse=always` elsewhere. A database's
 /// preallocated or sparse tail stays unallocated in the copy.
+///
+/// On Linux the copy is then pushed out of the page cache ([`evict_from_page_cache`]), so the env
+/// opened on it starts cold, as a restarted node's does, on either backend. Without it the copy's
+/// pages stay cached as `cp` wrote them, in large folios, and a page a commit dirties through a
+/// shared mapping writes back its whole folio: measured on Linux 7.1, ext4, 439 KiB written per
+/// 4 KiB page dirtied in a file written by `write(2)` and still cached, against 4 KiB in one read
+/// cold at random, which inflated every commit of the run.
 ///
 /// `dst` must not exist; its parent must. `src` must not be open by a writer (close its env
 /// first): the copy is file by file, so a database written meanwhile copies torn.
@@ -74,7 +109,51 @@ pub fn clone_datadir(src: &Path, dst: &Path) -> eyre::Result<()> {
             String::from_utf8_lossy(&output.stderr).trim(),
         );
     }
+    evict_from_page_cache(dst)
+        .map_err(|e| eyre::eyre!("clone_datadir: the copy {} stays cached: {e}", dst.display()))?;
     Ok(())
+}
+
+/// Push every regular file under `dir` (recursively, symlinks not followed) out of the page cache
+/// on Linux: each is synced ([`fsync_file`]), so none of its pages is dirty, then its cached pages
+/// are dropped ([`drop_cached_pages`]: `posix_fadvise(POSIX_FADV_DONTNEED)`). Returns the number
+/// of files evicted. A failure is an error naming the file.
+///
+/// Elsewhere it does nothing and returns 0: macOS has no per-file eviction (no `posix_fadvise`),
+/// and no page-cache folio writeback of this kind to undo.
+fn evict_from_page_cache(dir: &Path) -> eyre::Result<usize> {
+    if !cfg!(target_os = "linux") {
+        return Ok(0);
+    }
+    let files = regular_files(dir)?;
+    for path in &files {
+        let evict = || {
+            let file = std::fs::File::open(path)?;
+            fsync_file(&file)?;
+            drop_cached_pages(&file)
+        };
+        evict().map_err(|e: std::io::Error| {
+            eyre::eyre!("evicting {} from the page cache failed: {e}", path.display())
+        })?;
+    }
+    Ok(files.len())
+}
+
+/// The regular files under `dir`, recursively, symlinks not followed, in no particular order.
+fn regular_files(dir: &Path) -> eyre::Result<Vec<PathBuf>> {
+    let mut files = Vec::new();
+    for entry in std::fs::read_dir(dir)
+        .map_err(|e| eyre::eyre!("reading the directory {} failed: {e}", dir.display()))?
+    {
+        let path = entry?.path();
+        let meta = path.symlink_metadata()?;
+        if meta.is_dir() {
+            files.extend(regular_files(&path)?);
+        } else if meta.is_file() {
+            files.push(path);
+        }
+    }
+    Ok(files)
 }
 
 /// The type of the file system holding `dir`, from Linux's `/proc/self/mountinfo` (see
@@ -233,6 +312,39 @@ mod tests {
         }
         assert_eq!(reopened_tip(&clone, &chain)?.number, 3, "the clone took a block");
         assert_eq!(reopened_tip(&original, &chain)?, tip, "the original is as it was");
+        Ok(())
+    }
+
+    /// `regular_files` finds every regular file under a directory, in nested directories too,
+    /// and neither a directory nor a symlink (to a file or to a directory).
+    #[test]
+    fn test_regular_files_finds_every_regular_file() -> eyre::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("db/sub"))?;
+        std::fs::create_dir(root.join("empty"))?;
+        for name in ["top", "db/data", "db/sub/deep"] {
+            std::fs::write(root.join(name), name)?;
+        }
+        std::os::unix::fs::symlink(root.join("top"), root.join("link"))?;
+        std::os::unix::fs::symlink(root.join("db"), root.join("db-link"))?;
+        let mut found = regular_files(root)?;
+        found.sort();
+        let want: Vec<PathBuf> =
+            ["db/data", "db/sub/deep", "top"].iter().map(|name| root.join(name)).collect();
+        assert_eq!(found, want);
+
+        // Eviction syncs and drops exactly those files on Linux; elsewhere it does nothing, not
+        // even read the directory, so a missing one is no error there.
+        let evicted = evict_from_page_cache(root)?;
+        assert_eq!(evicted, if cfg!(target_os = "linux") { 3 } else { 0 });
+        let missing = evict_from_page_cache(&root.join("missing"));
+        if cfg!(target_os = "linux") {
+            let message = missing.expect_err("a missing directory").to_string();
+            assert!(message.contains("missing"), "the error names the directory: {message}");
+        } else {
+            assert_eq!(missing?, 0, "a no-op off Linux");
+        }
         Ok(())
     }
 

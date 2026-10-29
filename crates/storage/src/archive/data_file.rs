@@ -187,7 +187,8 @@ pub(crate) fn fdatasync_file(file: &File) -> io::Result<()> {
 /// is dirty, locked, under writeback or mapped by another process; nothing in this crate maps the
 /// file then (tndb's `lock_dir` keeps a second handle off its directory, and `try_clone` readers
 /// use `pread`). Elsewhere a no-op: macOS has no such advice, and is not a validator platform.
-fn drop_cached_pages(file: &File) -> io::Result<()> {
+/// Shared through [`crate::disk`] (`tn-reth`'s benchmark evicts its datadir copies with it).
+pub fn drop_cached_pages(file: &File) -> io::Result<()> {
     #[cfg(target_os = "linux")]
     {
         // SAFETY: a plain syscall on a file descriptor `file` owns and keeps open for the call; it

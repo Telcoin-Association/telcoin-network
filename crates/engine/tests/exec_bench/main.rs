@@ -18,8 +18,9 @@
 //!    per-block stages (`tn_reth.block_*_seconds`) and of reth's `save_blocks_*` split; with
 //!    `METRICS=prom` everything also goes to tn-metrics' Prometheus recorder, as on a node run with
 //!    `--metrics`.
-//! 2. The base: [`build_base`] builds the prefilled genesis once per spec and backend in
-//!    `CACHE_DIR`.
+//! 2. The base: [`build_base`] builds the prefilled genesis once per spec, backend and page size in
+//!    `CACHE_DIR`, with `--db.page-size` set to `PAGE_SIZE`: both backends fix the page size when
+//!    the file is created, so the base, the aged base and every clone share it.
 //! 3. The aged base: `AGING` outputs executed on a clone of the base, closed and cached beside it
 //!    under [`base_dir_name`] with an `extra` that keys the aging ([`Aging::extra`]). It is built
 //!    in a `.building` dir, its meta ([`AgedMeta`]) synced, and becomes the aged base by one
@@ -27,12 +28,18 @@
 //!    error, never rebuilt over. `AGING=0` runs on the base itself.
 //! 4. The run: the aged base is cloned into a fresh dir under `TMPDIR` (refused on tmpfs, and when
 //!    it is on another file system than the cache: the clone would copy every byte) and opened with
-//!    [`slim_chain`] and the production `--db.*` flags for `SYNC`. Worker 0's transaction pool and
-//!    HTTP RPC methods are built on it as the node builds them ([`BenchNode::serve`]), so the
+//!    [`slim_chain`] and the production `--db.*` flags for `SYNC` and `PAGE_SIZE`; a clone whose
+//!    database has another page size ([`db_page_size`]) stops the run. Worker 0's transaction pool
+//!    and HTTP RPC methods are built on it as the node builds them ([`BenchNode::serve`]), so the
 //!    pool's maintenance follows every executed output, side load or not. `WARMUP` outputs execute
 //!    untimed, then all `OUTPUTS` outputs are built and signed up front, then the timed loop
 //!    executes them. Each output runs on a blocking task, as `ExecutorEngine` runs it, while a task
-//!    drains the engine-update channel.
+//!    drains the engine-update channel. Just before and just after each output's call, outside its
+//!    wall time, the bench reads the database's own counters ([`db_counters`]) and the process's
+//!    disk bytes written ([`disk_bytes_written`]), and after it the data file's length (one `stat`,
+//!    [`db_file_bytes`]): the database commit completes inside the call on both backends
+//!    (`persist_executed_output` commits in line, and neither backend defers its sync to another
+//!    thread), and nothing else writes the database, so the differences are the output's.
 //!
 //!    With `EPOCH_EVERY`, every `EPOCH_EVERY`-th timed output closes its epoch
 //!    ([`OutputFactory::next_output_closing`]) and is timed like any other. No output can be built
@@ -83,6 +90,10 @@
 //! - `TN_EXEC_BENCH_METRICS` (`off`): `off`, or `prom` for a `--metrics` node's recorder.
 //! - `TN_EXEC_BENCH_SYNC` (`durable`): `durable` (`--db.sync-mode durable`) or `nosync`
 //!   (`--db.sync-mode safe-no-sync`, MDBX only: the tndb-b build refuses that flag).
+//! - `TN_EXEC_BENCH_PAGE_SIZE` (the backend's default, [`default_page_size`]: MDBX the OS page
+//!   size, 16384 on Apple Silicon and 4096 on x86 Linux; tndb-b 4096): the database page size in
+//!   bytes, a power of two from 4096 to 65536, passed as `--db.page-size` to the base's build and
+//!   every open. Each page size has its own base and aged base.
 //! - `TN_EXEC_BENCH_READERS` (0): reader threads, plus the balance poller when above 0; 0 runs no
 //!   side load.
 //! - `TN_EXEC_BENCH_SUBMIT_FRACTION` (0.25): the fraction, from 0 to 1, of each on-window output's
@@ -98,9 +109,11 @@
 //! - `TN_EXEC_BENCH_REPORT` (unset): a path to also write the report to as JSON ([`json_report`]).
 //!   Its dir must exist; it is checked before the run.
 //!
-//! **Report.** A header with the backend, sync mode, metrics mode, pacing, every knob, the host
-//! and the date (the base's `db` size is its data file's allocated bytes, then its length, which
-//! MDBX preallocates), and `pool + RPC: on`; one row per stage with the mean, p50, p90, p99
+//! **Report.** A header with the backend, sync mode, metrics mode, pacing, every knob, the page
+//! size (the open clone's, read with [`db_page_size`], and `PAGE_SIZE` as set or `default`), where
+//! the disk bytes come from ([`DISK_BYTES_SOURCE`], with the first failed read's reason), the
+//! host and the date (the base's `db` size is its data file's allocated bytes, then its length,
+//! which MDBX preallocates), and `pool + RPC: on`; one row per stage with the mean, p50, p90, p99
 //! (nearest rank) and max in milliseconds per output and its share of the total; then the
 //! throughput. Then:
 //!
@@ -113,6 +126,14 @@
 //!   the logical growth, the tables' total size added per executed output (warm-up and timed), from
 //!   the clone before the env opened to the closed clone ([`Footprint`]). tndb-b's data file grows
 //!   in preallocated steps, so over a short run its allocated growth reads 0.
+//! - `database writes per output`, after the sizes: what each timed output's call wrote
+//!   ([`DbWrites`]): each database counter that moved, as its mean per output (`_ns` counters in
+//!   ms; `tndb_max_gate_lag`, a maximum since the open, as its largest, [`MAXIMA`]), leaving out
+//!   the counters that never moved; the disk MiB per output; the data file's growth per output and
+//!   over the run, from its length before the first timed output; then the deciles: the timed
+//!   outputs in ten consecutive groups (group `k` from `k * n / 10` to `(k + 1) * n / 10`), each
+//!   with its outputs, its mean `commit mdbx` ms and disk MiB per output, and the data file's
+//!   length at its end. None for fewer than 10 outputs.
 //! - `table`: the largest of reth's tables in the closed clone (`db_table_stats`), with rows and
 //!   size, then the total over every table. When the table stats fail, the section says so with the
 //!   error, the report and the JSON are still written, and the bench then fails.
@@ -150,17 +171,30 @@
 //!   `commit mdbx`: the engine's own work, announcing the output and finalizing.
 //!
 //! **JSON report.** One object, its names snake_case with the unit in the name, for scripts that
-//! aggregate runs: `report_version` (3); `header` (backend, sync, metrics, pacing, host, date,
-//! base, aged, `pool_rpc`, and `knobs`, every knob); `rows`, one per timed output (`first_block`,
-//! `last_block`, `gas`, `txs`, `late`, `side_load`, `epoch_close`, `export_active`, and each stage
-//! as `<key>_ms`); `stats`, per
+//! aggregate runs: `report_version` (4); `header` (backend, sync, `page_size_bytes` (the open
+//! clone's), `disk_bytes_source` (`"proc_pid_rusage"`, `"/proc/self/io"` or null),
+//! `disk_bytes_error` (the first failed read's reason, or null), `db_counter_names` (the database
+//! counters' names in the build's order: JSON objects come out with their keys sorted), metrics,
+//! pacing, host, date, base, aged, `pool_rpc`, and `knobs`, every knob, with `page_size` null for
+//! the backend's default);
+//! `rows`, one per timed output (`first_block`, `last_block`, `gas`, `txs`, `late`, `side_load`,
+//! `epoch_close`, `export_active`, each stage as `<key>_ms`, `db_counters` (an object of each
+//! database counter's name, `mdbx_*` or `tndb_*`, and its difference over the output),
+//! `disk_bytes_written` (null when a read failed or the target has no
+//! source) and `db_file_len_bytes` (after the output)); `stats`, per
 //! stage key (`mean_ms`, `p50_ms`, `p90_ms`, `p99_ms`, `max_ms`, `share_pct`); `throughput`;
 //! `thirds` (null for fewer than 3 outputs: `outputs_per_third` and per stage key `first_mean_ms`,
 //! `first_p50_ms`, `last_mean_ms`, `last_p50_ms`, `mean_ratio`, `p50_ratio`); `sizes` (`open`,
 //! `before_timed`, `after_timed` and `closed`, each `db_len_bytes`, `db_allocated_bytes`,
 //! `static_files_len_bytes` and `static_files_allocated_bytes`, then
 //! `db_growth_per_output_bytes`, `static_files_growth_per_output_bytes` and
-//! `db_logical_growth_per_output_bytes`); `tables` (`failed`, `error`, `baseline_total_size_bytes`,
+//! `db_logical_growth_per_output_bytes`); `db_writes` (`counters_mean_per_output`, every counter's
+//! mean per output but the maxima, `counters_max`, each of [`MAXIMA`]'s largest,
+//! `disk_bytes_mean_per_output` (null when no output has it), `disk_bytes_outputs`,
+//! `db_file_len_before_bytes`, `db_file_len_after_bytes`, `db_file_growth_bytes`,
+//! `db_file_growth_per_output_bytes`, and `deciles`, null for fewer than 10 outputs, else ten of
+//! `outputs`, `commit_mdbx_mean_ms`, `disk_bytes_mean` (or null), `db_file_len_mean_bytes` and
+//! `db_file_len_end_bytes`); `tables` (`failed`, `error`, `baseline_total_size_bytes`,
 //! `count`, `total_entries`, `total_size_bytes`, and `by_size`, every table largest first; the last
 //! four null when `failed`); and `side_load`, null with `READERS=0`, else `off_outputs`,
 //! `on_outputs`, `on_time_s`, `errors`, `writer` (per [`SPLIT_KEYS`] key `off` and `on`, each
@@ -180,6 +214,15 @@
 //!
 //! **Durable sync on macOS.** libmdbx's durable commit uses `F_FULLFSYNC` and tndb-b's a plain
 //! fsync, so Mac durable commit times are not like-for-like between the backends.
+//!
+//! **Reading the database writes.** The disk bytes are only an approximation: Linux's
+//! `write_bytes` counts a page as it is dirtied, so a page dirtied once and synced counts once, and
+//! it includes the static files' (NippyJar) writes and anything else the process writes (the
+//! export's pack, say); macOS counts the I/O the process issues and misses background writeback. A
+//! "pages synced" counter is in database pages, not bytes: an OS page larger than the database page
+//! writes more. MDBX's counters are per environment and count from its lock file's creation, so
+//! only the per-output differences mean anything; `mdbx_wops` stays 0 (reth maps MDBX writable, so
+//! its syncs show in `mdbx_msync`).
 
 #![allow(unused_crate_dependencies)]
 
@@ -197,13 +240,14 @@ use std::{
 use tempfile::TempDir;
 use tn_engine::execute_consensus_output;
 use tn_reth::{
-    db_table_stats,
+    db_table_stats, default_page_size,
     payload::BuildArguments,
     snapshot::PinnedStateView,
     test_utils::load::{
         announce_temp_dir,
         base::{base_dir_name, BACKEND, META_FILE},
-        build_base, clone_datadir, db_file_bytes, dir_bytes, open_production_env, poll_addresses,
+        build_base, clone_datadir, db_counters, db_file_bytes, db_page_size, dir_bytes,
+        open_production_env_with_db, poll_addresses,
         readers::{KindSamples, PollSamples, POLL_INTERVAL},
         slim_chain,
         workload::WorkloadConfig,
@@ -211,7 +255,7 @@ use tn_reth::{
         ReadSamples, Readers, SubmitSamples, Submitter,
     },
     worker::WorkerNetwork,
-    DbTableStat, RethChainSpec, RethEnv, WorkerTxPool,
+    DbTableStat, RethChainSpec, RethDb, RethEnv, WorkerTxPool,
 };
 use tn_storage::{
     disk::{fsync_directory, fsync_file},
@@ -227,6 +271,10 @@ use tokio::{sync::mpsc, task::JoinHandle};
 /// A reth env opened as the node opens it, with the gas accumulator the engine credits.
 struct BenchNode {
     env: RethEnv,
+    /// The env's database, for the reads the env does not offer (its page size, its counters).
+    db: RethDb,
+    /// The datadir's `db` dir, holding the database's data file ([`db_file_bytes`]).
+    db_dir: PathBuf,
     gas_accumulator: GasAccumulator,
     _tasks: TaskManager,
     _tmp: Option<TempDir>,
@@ -249,8 +297,15 @@ impl BenchNode {
         tmp: Option<TempDir>,
     ) -> eyre::Result<Self> {
         let tasks = TaskManager::default();
-        let env = open_production_env(datadir, chain, db_flags, &tasks)?;
-        Ok(Self { env, gas_accumulator: GasAccumulator::new(1), _tasks: tasks, _tmp: tmp })
+        let (env, db) = open_production_env_with_db(datadir, chain, db_flags, &tasks)?;
+        Ok(Self {
+            env,
+            db,
+            db_dir: datadir.join("db"),
+            gas_accumulator: GasAccumulator::new(1),
+            _tasks: tasks,
+            _tmp: tmp,
+        })
     }
 
     /// A factory after the env's last executed output, with its committee (if any) set on the
@@ -301,14 +356,15 @@ impl BenchNode {
         Ok((pool, methods))
     }
 
-    /// Close the env and wait until its database is closed: drop it, then signal and abort the
-    /// tasks spawned on its task manager (the pool's maintenance and transaction validation and
-    /// the RPC's state cache hold the database) and wait for them; a task's join resolves once its
-    /// future, and what it holds, is dropped. The validation service runs on the blocking pool,
-    /// which only the shutdown signal ends, and dropping the manager would signal without waiting.
+    /// Close the env and wait until its database is closed: drop it and the database handle, then
+    /// signal and abort the tasks spawned on its task manager (the pool's maintenance and
+    /// transaction validation and the RPC's state cache hold the database) and wait for them; a
+    /// task's join resolves once its future, and what it holds, is dropped. The validation
+    /// service runs on the blocking pool, which only the shutdown signal ends, and dropping the
+    /// manager would signal without waiting.
     async fn close(self) -> eyre::Result<()> {
-        let Self { env, gas_accumulator, _tasks: mut tasks, _tmp } = self;
-        drop((env, gas_accumulator));
+        let Self { env, db, db_dir: _, gas_accumulator, _tasks: mut tasks, _tmp } = self;
+        drop((env, db, gas_accumulator));
         tasks.update_tasks();
         tasks.signal_shutdown();
         tasks.abort();
@@ -520,7 +576,7 @@ async fn test_load_outputs_close_three_epochs_through_execute_consensus_output()
 const KNOB_PREFIX: &str = "TN_EXEC_BENCH_";
 
 /// The knob names this build reads, after [`KNOB_PREFIX`].
-const KNOB_NAMES: [&str; 20] = [
+const KNOB_NAMES: [&str; 21] = [
     "OUTPUTS",
     "BATCHES",
     "GAS",
@@ -534,6 +590,7 @@ const KNOB_NAMES: [&str; 20] = [
     "PACE_MS",
     "METRICS",
     "SYNC",
+    "PAGE_SIZE",
     "READERS",
     "SUBMIT_FRACTION",
     "WINDOW",
@@ -576,6 +633,16 @@ impl SyncMode {
     }
 }
 
+/// The smallest and the largest `PAGE_SIZE`, in bytes: the range both backends accept.
+const PAGE_SIZES: std::ops::RangeInclusive<u32> = 4096..=65_536;
+
+/// The `--db.*` flags that open a datadir with `sync` and, for a new database file, `page_size`
+/// (a number of bytes) pages; an existing file keeps its own page size.
+fn db_flags(sync: SyncMode, page_size: &str) -> [&str; 4] {
+    let [mode_flag, mode] = sync.db_flags();
+    [mode_flag, mode, "--db.page-size", page_size]
+}
+
 /// Where metrics go besides the capture recorder.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum MetricsMode {
@@ -611,6 +678,8 @@ struct Knobs {
     pace_ms: u64,
     metrics: MetricsMode,
     sync: SyncMode,
+    /// The requested page size in bytes; `None` for the backend's default ([`Knobs::page_size`]).
+    page_size: Option<u32>,
     readers: usize,
     submit_fraction: f64,
     window: usize,
@@ -638,7 +707,8 @@ impl Knobs {
 
     /// The knobs from the `TN_EXEC_BENCH_*` variables in `vars` (others are ignored), the
     /// defaults for those absent, for the database backend `backend`. Refuses an unknown knob, a
-    /// malformed value, `SYNC=nosync` on tndb-b, and `EPOCH_EVERY` without `REGISTRY=1`.
+    /// malformed value, a `PAGE_SIZE` that is not a power of two from 4096 to 65536,
+    /// `SYNC=nosync` on tndb-b, and `EPOCH_EVERY` without `REGISTRY=1`.
     fn parse(
         vars: impl IntoIterator<Item = (String, String)>,
         backend: &str,
@@ -688,6 +758,22 @@ impl Knobs {
             "{KNOB_PREFIX}SYNC=nosync is --db.sync-mode safe-no-sync, which the tndb-b build \
              refuses: run tndb-b with SYNC=durable"
         );
+        let page_size = match get("PAGE_SIZE") {
+            None => None,
+            Some(value) => {
+                let refuse = || {
+                    eyre::eyre!(
+                        "{KNOB_PREFIX}PAGE_SIZE={value:?} is not a page size: a power of two from \
+                         {} to {} bytes",
+                        PAGE_SIZES.start(),
+                        PAGE_SIZES.end()
+                    )
+                };
+                let parsed: u32 = value.parse().map_err(|_| refuse())?;
+                eyre::ensure!(parsed.is_power_of_two() && PAGE_SIZES.contains(&parsed), refuse());
+                Some(parsed)
+            }
+        };
         let submit_fraction = match get("SUBMIT_FRACTION") {
             None => 0.25,
             Some(value) => {
@@ -731,6 +817,7 @@ impl Knobs {
             pace_ms: number("PACE_MS", 0, 0)?,
             metrics,
             sync,
+            page_size,
             readers: count("READERS", 0, 0)?,
             submit_fraction,
             window: count("WINDOW", 20, 1)?,
@@ -771,6 +858,17 @@ impl Knobs {
         WorkloadConfig { seed: self.seed.wrapping_add(1), ..WorkloadConfig::default() }
     }
 
+    /// The page size in bytes of the bases and the run's database: `PAGE_SIZE`, or else the
+    /// backend's default ([`default_page_size`], the one the database opener uses).
+    fn page_size(&self) -> u32 {
+        self.page_size.unwrap_or_else(default_page_size)
+    }
+
+    /// `PAGE_SIZE` as the knob line and the report show it: the bytes, or `default`.
+    fn page_size_label(&self) -> String {
+        self.page_size.map_or_else(|| "default".to_owned(), |bytes| bytes.to_string())
+    }
+
     /// The pause between paced output starts, or `None` back to back.
     fn pace(&self) -> Option<Duration> {
         (self.pace_ms > 0).then(|| Duration::from_millis(self.pace_ms))
@@ -788,8 +886,8 @@ impl Knobs {
     fn line(&self) -> String {
         format!(
             "outputs={} batches={} gas={} warmup={} aging={} prefill={} senders={} pools={} \
-             seed={} registry={} pace_ms={} metrics={} sync={} readers={} submit_fraction={} \
-             window={} epoch_every={} export={} cache_dir={} report={}",
+             seed={} registry={} pace_ms={} metrics={} sync={} page_size={} readers={} \
+             submit_fraction={} window={} epoch_every={} export={} cache_dir={} report={}",
             self.outputs,
             self.batches,
             self.gas,
@@ -803,6 +901,7 @@ impl Knobs {
             self.pace_ms,
             self.metrics.label(),
             self.sync.label(),
+            self.page_size_label(),
             self.readers,
             self.submit_fraction,
             self.window,
@@ -994,7 +1093,7 @@ async fn aged_base(
     aging: &Aging,
     recorder: &CaptureRecorder,
 ) -> eyre::Result<Source> {
-    let name = base_dir_name(&base.spec, &aging.extra()?)?;
+    let name = base_dir_name(&base.spec, base.page_size, &aging.extra()?)?;
     let dir = cache_dir.join(&name);
     if dir.symlink_metadata().is_ok() {
         let meta_path = dir.join(AGED_META_FILE);
@@ -1027,8 +1126,9 @@ async fn aged_base(
     // the copied base meta would make the aged dir look like a base; the aged meta embeds it
     std::fs::remove_file(building.join(META_FILE))?;
     let tip = {
-        let node =
-            BenchNode::open_at(&building, slim_chain(base), &SyncMode::Durable.db_flags(), None)?;
+        let page_text = base.page_size.to_string();
+        let flags = db_flags(SyncMode::Durable, &page_text);
+        let node = BenchNode::open_at(&building, slim_chain(base), &flags, None)?;
         let mut factory = node.factory(base.spec, aging.workload, aging.output_config)?;
         let updates = EngineUpdates::spawn();
         let mut left = aging.outputs;
@@ -1154,6 +1254,18 @@ struct OutputRow {
     epoch_close: bool,
     /// Whether the export ran at any point during the output ([`Export::active_during`]).
     export_active: bool,
+    /// What the database's own counters moved by over the output's call ([`DbCounters::since`]
+    /// of [`db_counters`] read just before and just after it), named, in
+    /// [`DbCounters::entries`]'s order.
+    ///
+    /// [`DbCounters::since`]: tn_reth::test_utils::load::DbCounters::since
+    /// [`DbCounters::entries`]: tn_reth::test_utils::load::DbCounters::entries
+    db_counters: Vec<(&'static str, u64)>,
+    /// The bytes the process wrote to disk over the output's call ([`disk_bytes_written`] just
+    /// before and just after it), or `None` when a read failed or the target has no source.
+    disk_bytes: Option<u64>,
+    /// The database data file's length after the output, in bytes ([`db_file_bytes`]).
+    db_file_len: u64,
 }
 
 impl OutputRow {
@@ -1570,9 +1682,66 @@ fn segments(outputs: usize, epoch_every: usize) -> Vec<(usize, bool)> {
     plan
 }
 
+/// Where [`disk_bytes_written`] reads on this target, as the report names it; `None` on a target
+/// without a source.
+const DISK_BYTES_SOURCE: Option<&str> = if cfg!(target_os = "macos") {
+    Some("proc_pid_rusage")
+} else if cfg!(target_os = "linux") {
+    Some("/proc/self/io")
+} else {
+    None
+};
+
+/// The bytes this process has written to disk since it started, from [`DISK_BYTES_SOURCE`]:
+/// `proc_pid_rusage`'s `ri_diskio_byteswritten` on macOS. Only a difference of two reads means
+/// anything, and only approximately (the module docs' caveats). The error says why the read
+/// failed.
+#[cfg(target_os = "macos")]
+fn disk_bytes_written() -> Result<u64, String> {
+    let mut info = std::mem::MaybeUninit::<libc::rusage_info_v2>::zeroed();
+    // SAFETY: `info` is a writable `rusage_info_v2`, the struct the `RUSAGE_INFO_V2` flavor fills,
+    // and it outlives the call; `proc_pid_rusage` takes it as a `rusage_info_t *`, so the pointer
+    // is cast to that. `getpid` has no preconditions.
+    let status = unsafe {
+        libc::proc_pid_rusage(libc::getpid(), libc::RUSAGE_INFO_V2, info.as_mut_ptr().cast())
+    };
+    if status != 0 {
+        return Err(format!("proc_pid_rusage failed: {}", std::io::Error::last_os_error()));
+    }
+    // SAFETY: every field of `rusage_info_v2` is an integer or an array of them, so the zeroed
+    // buffer was already a valid value, and the call succeeded in filling it.
+    Ok(unsafe { info.assume_init() }.ri_diskio_byteswritten)
+}
+
+/// The bytes this process has written to disk since it started, from [`DISK_BYTES_SOURCE`]:
+/// `/proc/self/io`'s `write_bytes` on Linux. Only a difference of two reads means anything, and
+/// only approximately (the module docs' caveats). The error says why the read failed.
+#[cfg(target_os = "linux")]
+fn disk_bytes_written() -> Result<u64, String> {
+    let io = std::fs::read_to_string("/proc/self/io")
+        .map_err(|e| format!("reading /proc/self/io failed: {e}"))?;
+    proc_io_write_bytes(&io)
+}
+
+/// No disk-bytes source on this target ([`DISK_BYTES_SOURCE`] is `None`): always an error.
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn disk_bytes_written() -> Result<u64, String> {
+    Err("this target has no disk-bytes source".to_owned())
+}
+
+/// The `write_bytes:` field of a `/proc/<pid>/io` text.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn proc_io_write_bytes(io: &str) -> Result<u64, String> {
+    let value = io
+        .lines()
+        .find_map(|line| line.strip_prefix("write_bytes:"))
+        .ok_or_else(|| "/proc/self/io has no write_bytes line".to_owned())?;
+    value.trim().parse().map_err(|e| format!("/proc/self/io write_bytes {value:?}: {e}"))
+}
+
 /// What the timed loop carries across its segments' [`run_outputs`] calls: the next output's
-/// index, the pacing, the side load and the export. The warm-up runs with the default: no pacing,
-/// side load or export.
+/// index, the pacing, the side load, the export and the first disk-bytes read failure. The warm-up
+/// runs with the default: no pacing, side load or export.
 #[derive(Default)]
 struct Timed<'a> {
     pace: Option<Duration>,
@@ -1585,9 +1754,21 @@ struct Timed<'a> {
     t0: Option<Instant>,
     /// When the last segment's last output ended.
     paused: Option<Instant>,
+    /// Why a [`disk_bytes_written`] read failed, the first time one did.
+    disk_error: Option<String>,
 }
 
 impl Timed<'_> {
+    /// [`disk_bytes_written`] now, or `None` when the read fails; the first failure's reason is
+    /// kept for the report's header.
+    fn disk_bytes(&mut self) -> Option<u64> {
+        disk_bytes_written()
+            .map_err(|e| {
+                self.disk_error.get_or_insert(e);
+            })
+            .ok()
+    }
+
     /// Start a segment: move `t0` on by the time since the last segment ended, so that neither the
     /// pacing nor the wall clock counts the time between segments (building the next, entering an
     /// epoch).
@@ -1657,12 +1838,19 @@ async fn run_outputs(
         for (name, _) in CAPTURED {
             recorder.drain(name);
         }
+        // the database's and the process's write counters around the call, outside its wall
+        // time: the commit completes inside the call, so the difference is this output's
+        let counters_before = db_counters(&node.db)?;
+        let disk_before = timed.disk_bytes();
         let started = Instant::now();
         let (tip, wall) = node.execute_timed(load.output, &updates.tx).await?;
         let export_active = timed
             .export
             .as_ref()
             .is_some_and(|export| export.active_during(started, Instant::now()));
+        let disk_after = timed.disk_bytes();
+        let counters = db_counters(&node.db)?.since(&counters_before);
+        let (db_file_len, _) = db_file_bytes(&node.db_dir)?;
         let stages = stage_sums(|name| recorder.drain(name), blocks)?;
         if let (Some(side), Some(hashes)) = (timed.side.as_deref_mut(), hashes) {
             side.readers.feed_tx_hashes(hashes);
@@ -1681,6 +1869,11 @@ async fn run_outputs(
             side_load,
             epoch_close,
             export_active,
+            db_counters: counters.entries(),
+            disk_bytes: disk_before
+                .zip(disk_after)
+                .map(|(before, after)| after.saturating_sub(before)),
+            db_file_len,
             ..OutputRow::default()
         });
         parent = tip.number;
@@ -2035,6 +2228,223 @@ impl Footprint {
     }
 }
 
+/// The database counters whose [`OutputRow::db_counters`] value is not a difference but a maximum
+/// since the open (`DbCounters::since` keeps the later read's): their summary is the largest, not
+/// the mean.
+const MAXIMA: [&str; 1] = ["tndb_max_gate_lag"];
+
+/// How many equal consecutive groups [`DbWrites::of`] splits the timed outputs into.
+const DECILES: usize = 10;
+
+/// One database counter over the timed outputs ([`DbWrites::counters`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct CounterSummary {
+    name: &'static str,
+    /// Its mean per output, or for one of the [`MAXIMA`] its largest value.
+    value: f64,
+    /// Whether one of [`MAXIMA`].
+    maximum: bool,
+    /// Whether it moved in any output.
+    moved: bool,
+}
+
+/// A tenth of the timed outputs, consecutive ([`DbWrites::of`]).
+#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
+struct Decile {
+    outputs: usize,
+    /// The database commit's (`commit mdbx`) mean, in milliseconds per output.
+    commit_mdbx_mean_ms: f64,
+    /// The disk bytes' mean per output over its outputs that have them, or `None` when none has.
+    disk_bytes_mean: Option<f64>,
+    /// The database data file's mean length after its outputs.
+    db_file_len_mean_bytes: f64,
+    /// The database data file's length after its last output.
+    db_file_len_end_bytes: u64,
+}
+
+/// What the database and the process wrote over the timed outputs ([`OutputRow::db_counters`],
+/// [`OutputRow::disk_bytes`], [`OutputRow::db_file_len`]).
+#[derive(Clone, Debug, PartialEq)]
+struct DbWrites {
+    /// Each counter, in the rows' order.
+    counters: Vec<CounterSummary>,
+    /// The disk bytes' mean per output over the outputs that have them, or `None` when none has.
+    disk_bytes_mean: Option<f64>,
+    /// The outputs that have disk bytes.
+    disk_outputs: usize,
+    /// The data file's length before the first timed output.
+    db_file_len_before: u64,
+    /// The data file's length after the last timed output.
+    db_file_len_after: u64,
+    /// The outputs' deciles: [`DECILES`] groups, group `k` the outputs from `k * n / 10` up to
+    /// `(k + 1) * n / 10` (sizes differ by at most one); `None` for fewer than [`DECILES`].
+    deciles: Option<Vec<Decile>>,
+}
+
+/// The mean of `values`, or `None` for none.
+fn mean_of(values: impl Iterator<Item = f64>) -> Option<f64> {
+    let (sum, count) = values.fold((0.0, 0_usize), |(sum, count), value| (sum + value, count + 1));
+    (count > 0).then(|| sum / count as f64)
+}
+
+impl DbWrites {
+    /// The writes over `rows`, which must not be empty, whose data file was `db_file_len_before`
+    /// bytes long before the first.
+    fn of(rows: &[OutputRow], db_file_len_before: u64) -> Self {
+        let count = |row: &OutputRow, name: &str| {
+            row.db_counters.iter().find(|(entry, _)| *entry == name).map_or(0, |(_, value)| *value)
+        };
+        let counters = rows[0]
+            .db_counters
+            .iter()
+            .map(|&(name, _)| {
+                let maximum = MAXIMA.contains(&name);
+                let values = rows.iter().map(|row| count(row, name));
+                let value = if maximum {
+                    values.max().unwrap_or(0) as f64
+                } else {
+                    values.sum::<u64>() as f64 / rows.len() as f64
+                };
+                let moved = rows.iter().any(|row| count(row, name) > 0);
+                CounterSummary { name, value, maximum, moved }
+            })
+            .collect();
+        let disk_mean = |rows: &[OutputRow]| {
+            mean_of(rows.iter().filter_map(|row| row.disk_bytes).map(|b| b as f64))
+        };
+        let deciles = (rows.len() >= DECILES).then(|| {
+            (0..DECILES)
+                .map(|k| {
+                    let group = &rows[k * rows.len() / DECILES..(k + 1) * rows.len() / DECILES];
+                    Decile {
+                        outputs: group.len(),
+                        commit_mdbx_mean_ms: mean_of(
+                            group.iter().map(|row| row.stage(COMMIT_MDBX) * 1e3),
+                        )
+                        .unwrap_or_default(),
+                        disk_bytes_mean: disk_mean(group),
+                        db_file_len_mean_bytes: mean_of(
+                            group.iter().map(|row| row.db_file_len as f64),
+                        )
+                        .unwrap_or_default(),
+                        db_file_len_end_bytes: group.last().map_or(0, |row| row.db_file_len),
+                    }
+                })
+                .collect()
+        });
+        Self {
+            counters,
+            disk_bytes_mean: disk_mean(rows),
+            disk_outputs: rows.iter().filter(|row| row.disk_bytes.is_some()).count(),
+            db_file_len_before,
+            db_file_len_after: rows[rows.len() - 1].db_file_len,
+            deciles,
+        }
+    }
+
+    /// The data file's growth over the timed outputs, negative when it shrank.
+    fn db_file_growth(&self) -> i64 {
+        self.db_file_len_after as i64 - self.db_file_len_before as i64
+    }
+}
+
+/// The report's line naming where the disk bytes come from ([`DISK_BYTES_SOURCE`]), with the
+/// first failed read's `error`, if any.
+fn disk_bytes_line(source: Option<&str>, error: Option<&str>) -> String {
+    match (source, error) {
+        (None, _) => "  disk bytes: none (this target has no source)\n".to_owned(),
+        (Some(source), None) => {
+            format!("  disk bytes: {source} (the process's bytes written, approximate)\n")
+        }
+        (Some(source), Some(e)) => {
+            format!("  disk bytes: {source}, a read FAILED (its outputs have none): {e}\n")
+        }
+    }
+}
+
+/// The report's database-writes section: each counter's mean per output (a maximum's largest),
+/// leaving out those that never moved, `_ns` counters in milliseconds; the disk bytes and the
+/// data file's growth per output; then the deciles.
+fn db_writes_report(writes: &DbWrites, outputs: usize) -> String {
+    let mut out = "database writes per output: the database's own counters over each timed \
+                   output's call (mean per output; counters that never moved left out)\n"
+        .to_owned();
+    for counter in writes.counters.iter().filter(|counter| counter.moved) {
+        let value = if counter.maximum {
+            format!("{:.0} (max)", counter.value)
+        } else if counter.name.ends_with("_ns") {
+            format!("{:.3} ms", counter.value / 1e6)
+        } else {
+            format!("{:.3}", counter.value)
+        };
+        out += &format!("  {:<28} {value:>16}\n", counter.name);
+    }
+    out += &match writes.disk_bytes_mean {
+        Some(bytes) => format!(
+            "  {:<28} {:>16} per output ({} outputs read)\n",
+            "disk written",
+            format!("{:.3} MiB", bytes / f64::from(1 << 20)),
+            writes.disk_outputs
+        ),
+        None => format!("  {:<28} {:>16}\n", "disk written", "-"),
+    };
+    let growth = writes.db_file_growth() as f64 / f64::from(1 << 20);
+    out += &format!(
+        "  {:<28} {:>16} per output, {growth:.1} MiB over {outputs} outputs\n",
+        "db file growth",
+        format!("{:.3} MiB", growth / outputs as f64)
+    );
+    let Some(deciles) = &writes.deciles else {
+        out += &format!("deciles: none for fewer than {DECILES} timed outputs\n");
+        return out;
+    };
+    out += &format!(
+        "{:<8} {:>8} {:>12} {:>10} {:>12}   (means per output; file at the decile's end)\n",
+        "decile", "outputs", "commit ms", "disk MiB", "file MiB"
+    );
+    for (k, decile) in deciles.iter().enumerate() {
+        let disk = decile
+            .disk_bytes_mean
+            .map_or_else(|| "-".to_owned(), |bytes| format!("{:.3}", bytes / f64::from(1 << 20)));
+        out += &format!(
+            "  {:<6} {:>8} {:>12.3} {disk:>10} {:>12.1}\n",
+            k + 1,
+            decile.outputs,
+            decile.commit_mdbx_mean_ms,
+            mib(decile.db_file_len_end_bytes)
+        );
+    }
+    out
+}
+
+/// The JSON report's `db_writes`: per counter its mean per output (`counters_mean_per_output`,
+/// the differences) or its largest (`counters_max`, the [`MAXIMA`]), in the rows' order; the disk
+/// bytes' mean and how many outputs have them; the data file's length before and after the timed
+/// outputs and its growth; and the deciles.
+fn db_writes_json(writes: &DbWrites, outputs: usize) -> serde_json::Value {
+    use serde_json::{json, Map, Value};
+
+    let counters = |maximum: bool| -> Map<String, Value> {
+        writes
+            .counters
+            .iter()
+            .filter(|counter| counter.maximum == maximum)
+            .map(|counter| (counter.name.to_owned(), counter.value.into()))
+            .collect()
+    };
+    json!({
+        "counters_mean_per_output": counters(false),
+        "counters_max": counters(true),
+        "disk_bytes_mean_per_output": writes.disk_bytes_mean,
+        "disk_bytes_outputs": writes.disk_outputs,
+        "db_file_len_before_bytes": writes.db_file_len_before,
+        "db_file_len_after_bytes": writes.db_file_len_after,
+        "db_file_growth_bytes": writes.db_file_growth(),
+        "db_file_growth_per_output_bytes": writes.db_file_growth() as f64 / outputs as f64,
+        "deciles": writes.deciles,
+    })
+}
+
 /// The main stages the side-load writer split compares, by [`STAGES`] key.
 const SPLIT_KEYS: [&str; 8] = [
     "total",
@@ -2123,6 +2533,8 @@ fn p50_p99_text(stats: Option<Stats>) -> (String, String) {
 /// What the report's header says besides the knobs.
 struct Header {
     knobs: Knobs,
+    /// The run's database page size in bytes, read from the open clone ([`db_page_size`]).
+    page_size: u32,
     host: String,
     date: String,
     base: String,
@@ -2132,6 +2544,8 @@ struct Header {
     elapsed: Duration,
     /// With `EXPORT=1`, what the export wrote, or its error.
     export: Option<Result<ExportRun, String>>,
+    /// Why a timed output's [`disk_bytes_written`] read failed, the first time one did.
+    disk_error: Option<String>,
 }
 
 /// `bytes` in MiB.
@@ -2160,6 +2574,12 @@ fn report(
         knobs.pacing()
     );
     out += &format!("  knobs: {}\n", knobs.line());
+    out += &format!(
+        "  page size: {} bytes (PAGE_SIZE={})\n",
+        header.page_size,
+        knobs.page_size_label()
+    );
+    out += &disk_bytes_line(DISK_BYTES_SOURCE, header.disk_error.as_deref());
     out += &format!("  host: {}  date: {}\n", header.host, header.date);
     if cfg!(target_os = "macos") && knobs.sync == SyncMode::Durable {
         out += "  note: on macOS libmdbx's durable commit uses F_FULLFSYNC and tndb-b's a plain \
@@ -2257,6 +2677,7 @@ fn report(
                  failed\n"
             .to_owned(),
     };
+    out += &db_writes_report(&DbWrites::of(rows, sizes.before_timed.db_len_bytes), rows.len());
     out += &export_report(header.export.as_ref(), rows);
 
     let tables = match &footprint.tables {
@@ -2451,7 +2872,7 @@ fn export_report(export: Option<&Result<ExportRun, String>>, rows: &[OutputRow])
 }
 
 /// The JSON report's layout version, bumped when a field changes meaning or goes away.
-const JSON_REPORT_VERSION: u32 = 3;
+const JSON_REPORT_VERSION: u32 = 4;
 
 /// The JSON report of the timed `rows`, the clone's `footprint` and the `side` load, if it ran
 /// (see the module docs). Its field names stay stable for the scripts that aggregate runs:
@@ -2481,6 +2902,14 @@ fn json_report(
             for (_, key, stage) in STAGES {
                 fields.insert(format!("{key}_ms"), (stage.of(row) * 1e3).into());
             }
+            let counters: Map<String, Value> = row
+                .db_counters
+                .iter()
+                .map(|&(name, value)| (name.to_owned(), value.into()))
+                .collect();
+            fields.insert("db_counters".to_owned(), counters.into());
+            fields.insert("disk_bytes_written".to_owned(), json!(row.disk_bytes));
+            fields.insert("db_file_len_bytes".to_owned(), row.db_file_len.into());
             Value::Object(fields)
         })
         .collect();
@@ -2545,11 +2974,18 @@ fn json_report(
         json!({ "closes": closes, "normal_outputs": rows.len() - closes, "writer": writer })
     });
 
+    let db_writes =
+        db_writes_json(&DbWrites::of(rows, sizes.before_timed.db_len_bytes), rows.len());
+    let counter_names: Vec<&str> = rows[0].db_counters.iter().map(|&(name, _)| name).collect();
     json!({
         "report_version": JSON_REPORT_VERSION,
         "header": {
             "backend": BACKEND,
             "sync": knobs.sync.label(),
+            "page_size_bytes": header.page_size,
+            "disk_bytes_source": DISK_BYTES_SOURCE,
+            "disk_bytes_error": header.disk_error,
+            "db_counter_names": counter_names,
             "metrics": knobs.metrics.label(),
             "pacing": knobs.pacing(),
             "host": header.host,
@@ -2571,6 +3007,7 @@ fn json_report(
                 "pace_ms": knobs.pace_ms,
                 "metrics": knobs.metrics.label(),
                 "sync": knobs.sync.label(),
+                "page_size": knobs.page_size,
                 "readers": knobs.readers,
                 "submit_fraction": knobs.submit_fraction,
                 "window": knobs.window,
@@ -2596,6 +3033,7 @@ fn json_report(
         },
         "thirds": thirds,
         "sizes": sizes_json,
+        "db_writes": db_writes,
         "tables": tables,
         "side_load": side.map(|side| side_json(rows, side)),
         "epoch_closes": epoch_closes,
@@ -2807,8 +3245,9 @@ async fn exec_bench() -> eyre::Result<()> {
     let tmp_root = std::env::temp_dir();
     announce_temp_dir(&tmp_root);
     let spec = knobs.spec();
-    let base_cached = knobs.cache_dir.join(base_dir_name(&spec, "")?).exists();
-    let (base_dir, base) = build_base(&spec, &knobs.cache_dir)?;
+    let page_size = knobs.page_size();
+    let base_cached = knobs.cache_dir.join(base_dir_name(&spec, page_size, "")?).exists();
+    let (base_dir, base) = build_base(&spec, page_size, &knobs.cache_dir)?;
     let base_line = format!(
         "{} ({}, {} accounts, db {} MiB allocated of {} MiB)",
         base_dir.display(),
@@ -2853,7 +3292,14 @@ async fn exec_bench() -> eyre::Result<()> {
     let baseline_table_bytes =
         db_table_stats(&datadir.join("db"))?.iter().map(|stat| stat.total_size).sum();
     // the driver keeps `tmp`: the clone outlives the env, to be measured closed
-    let node = BenchNode::open_at(&datadir, slim_chain(&base), &knobs.sync.db_flags(), None)?;
+    let page_text = page_size.to_string();
+    let node =
+        BenchNode::open_at(&datadir, slim_chain(&base), &db_flags(knobs.sync, &page_text), None)?;
+    let effective_page_size = db_page_size(&node.db)?;
+    eyre::ensure!(
+        effective_page_size == page_size,
+        "the clone's database has {effective_page_size}-byte pages, the run asked for {page_size}"
+    );
     let (pool, methods) = node.serve()?;
     let mut sizes = RunSizes { open: Sizes::of(&datadir)?, ..RunSizes::default() };
     let tip = node.env.canonical_tip();
@@ -2896,6 +3342,7 @@ async fn exec_bench() -> eyre::Result<()> {
     }
     let elapsed = timed.elapsed();
     let export = timed.export.take();
+    let disk_error = timed.disk_error.take();
     drop(timed);
     let side = side_load.map(SideLoad::finish).transpose()?;
     sizes.after_timed = Sizes::of(&datadir)?;
@@ -2934,8 +3381,17 @@ async fn exec_bench() -> eyre::Result<()> {
         Footprint { sizes, baseline_table_bytes, executed: knobs.warmup + knobs.outputs, tables };
 
     let date = command_line("date", &["-u", "+%Y-%m-%dT%H:%M:%SZ"]).unwrap_or_default();
-    let header =
-        Header { knobs, host: host(), date, base: base_line, aged: aged_line, elapsed, export };
+    let header = Header {
+        knobs,
+        page_size: effective_page_size,
+        host: host(),
+        date,
+        base: base_line,
+        aged: aged_line,
+        elapsed,
+        export,
+        disk_error,
+    };
     print!("{}", report(&header, &rows, &footprint, side.as_ref()));
     if let Some((dir, name)) = report_target {
         write_json(&dir, &name, &json_report(&header, &rows, &footprint, side.as_ref()))?;
@@ -2996,6 +3452,7 @@ mod tests {
             pace_ms: 0,
             metrics: MetricsMode::Off,
             sync: SyncMode::Durable,
+            page_size: None,
             readers: 0,
             submit_fraction: 0.25,
             window: 20,
@@ -3010,6 +3467,36 @@ mod tests {
         assert!(workspace.join("crates/engine/Cargo.toml").exists(), "{}", workspace.display());
         assert_eq!(knobs.pace(), None);
         assert_eq!(knobs.sync.db_flags(), ["--db.sync-mode", "durable"]);
+        assert_eq!(knobs.page_size(), default_page_size(), "the opener's default page size");
+        assert!(knobs.line().contains(" sync=durable page_size=default "), "{}", knobs.line());
+    }
+
+    /// `PAGE_SIZE` takes a power of two from 4096 to 65536 bytes and refuses anything else by
+    /// name, with the range; the flags carry it to the database as `--db.page-size`.
+    #[test]
+    fn test_knobs_page_size() {
+        for bytes in [4096, 16_384, 65_536] {
+            let knobs = Knobs::parse(vars(&[("PAGE_SIZE", &bytes.to_string())]), "mdbx").unwrap();
+            assert_eq!((knobs.page_size, knobs.page_size()), (Some(bytes), bytes));
+            assert!(knobs.line().contains(&format!(" page_size={bytes} ")), "{}", knobs.line());
+        }
+        for value in ["2048", "131072", "12288", "16k", "", "-4096", "0"] {
+            let err =
+                Knobs::parse(vars(&[("PAGE_SIZE", value)]), "tndb-b").unwrap_err().to_string();
+            let needle = format!(
+                "TN_EXEC_BENCH_PAGE_SIZE={value:?} is not a page size: a power of two from 4096 \
+                 to 65536 bytes"
+            );
+            assert!(err.contains(&needle), "{value:?}: {err}");
+        }
+        assert_eq!(
+            db_flags(SyncMode::Durable, "16384"),
+            ["--db.sync-mode", "durable", "--db.page-size", "16384"]
+        );
+        assert_eq!(
+            db_flags(SyncMode::NoSync, "4096"),
+            ["--db.sync-mode", "safe-no-sync", "--db.page-size", "4096"]
+        );
     }
 
     /// Every knob is read from its variable and shapes the spec, the outputs and the workloads.
@@ -3334,12 +3821,12 @@ mod tests {
     /// close count and split, and the export's figures and split, null but for the error, the
     /// overlap and the split when it failed.
     #[test]
-    fn test_json_v3_closes_and_export() {
+    fn test_json_closes_and_export() {
         use serde_json::Value;
 
         let rows = export_rows();
         let plain = json_report(&header(defaults()), &rows, &footprint(), None);
-        assert_eq!(plain["report_version"], 3);
+        assert_eq!(plain["report_version"], 4);
         assert_eq!(plain["epoch_closes"], Value::Null);
         assert_eq!(plain["export"], Value::Null);
         assert_eq!(plain["header"]["knobs"]["epoch_every"], 0);
@@ -3457,6 +3944,7 @@ mod tests {
         BaseMeta {
             layout_version: 1,
             backend: BACKEND.to_owned(),
+            page_size: 4096,
             spec: defaults().spec(),
             slim_genesis_hash: B256::ZERO,
             genesis_hash: B256::ZERO,
@@ -3697,12 +4185,14 @@ mod tests {
     fn header(knobs: Knobs) -> Header {
         Header {
             knobs,
+            page_size: 16_384,
             host: "host (cpu)".to_owned(),
             date: "today".to_owned(),
             base: "base".to_owned(),
             aged: "aged".to_owned(),
             elapsed: Duration::from_secs(1),
             export: None,
+            disk_error: None,
         }
     }
 
@@ -3876,6 +4366,7 @@ mod tests {
             "exec_bench backend={BACKEND} sync=durable metrics=off pacing=paced every 250 ms"
         );
         assert!(report.starts_with(&first), "{report}");
+        assert!(report.contains("\n  page size: 16384 bytes (PAGE_SIZE=default)\n"), "{report}");
         for (label, _, _) in STAGES {
             let rows = report.lines().filter(|line| line.starts_with(&format!("{label} ")));
             assert_eq!(rows.count(), 2, "{label}: a stats row and a thirds row\n{report}");
@@ -3986,14 +4477,28 @@ mod tests {
         for (row, execute) in rows.iter_mut().zip([0.1, 0.2, 0.3]) {
             row.stages[0] = execute;
         }
+        for (i, row) in (0_u64..).zip(rows.iter_mut()) {
+            row.db_counters = vec![("tndb_pages_synced", 10 * i), ("tndb_commits", 1)];
+            row.disk_bytes = (i != 2).then_some(4096 * i);
+            row.db_file_len = (4 << 30) + (1 << 20) * i;
+        }
         let text = serde_json::to_string(&json_report(&header, &rows, &footprint(), None)).unwrap();
         let json: serde_json::Value = serde_json::from_str(&text).unwrap();
         let at = |pointer: &str| {
             json.pointer(pointer).unwrap_or_else(|| panic!("no {pointer} in {json:#}")).clone()
         };
-        assert_eq!(at("/report_version"), 3);
+        assert_eq!(at("/report_version"), 4);
         assert_eq!(at("/header/backend"), BACKEND);
         assert_eq!(at("/header/sync"), "durable");
+        assert_eq!(at("/header/page_size_bytes"), 16_384);
+        assert_eq!(at("/header/disk_bytes_source"), serde_json::json!(DISK_BYTES_SOURCE));
+        assert_eq!(at("/header/disk_bytes_error"), serde_json::Value::Null);
+        let names = serde_json::json!(["tndb_pages_synced", "tndb_commits"]);
+        assert_eq!(at("/header/db_counter_names"), names, "in the rows' order");
+        let failed = Header { disk_error: Some("no io".to_owned()), ..self::header(defaults()) };
+        let failed = json_report(&failed, &rows, &footprint(), None);
+        assert_eq!(failed["header"]["disk_bytes_error"], "no io");
+        assert_eq!(at("/header/knobs/page_size"), serde_json::Value::Null, "the default");
         assert_eq!(at("/header/pacing"), "back to back");
         assert_eq!(at("/header/host"), "host (cpu)");
         assert_eq!(at("/header/knobs/outputs"), 300);
@@ -4014,6 +4519,21 @@ mod tests {
         assert_eq!(at("/rows/1/execute_ms"), 200.0);
         assert_eq!(at("/rows/1/gas"), 40);
         assert_eq!(at("/rows/1/late"), false);
+        assert_eq!(at("/rows/1/db_counters/tndb_commits"), 1);
+        assert_eq!(at("/rows/1/db_counters/tndb_pages_synced"), 10);
+        assert_eq!(at("/rows/1/db_counters").as_object().unwrap().len(), 2);
+        assert_eq!(at("/rows/1/disk_bytes_written"), 4096);
+        assert_eq!(at("/rows/2/disk_bytes_written"), serde_json::Value::Null, "a failed read");
+        assert_eq!(at("/rows/2/db_file_len_bytes"), (4_u64 << 30) + (2 << 20));
+        assert_eq!(at("/db_writes/counters_mean_per_output/tndb_commits"), 1.0);
+        assert_eq!(at("/db_writes/counters_mean_per_output/tndb_pages_synced"), 10.0);
+        assert_eq!(at("/db_writes/counters_max"), serde_json::json!({}));
+        assert_eq!(at("/db_writes/disk_bytes_mean_per_output"), 2048.0);
+        assert_eq!(at("/db_writes/disk_bytes_outputs"), 2);
+        assert_eq!(at("/db_writes/db_file_len_before_bytes"), 4_u64 << 30, "before_timed's");
+        assert_eq!(at("/db_writes/db_file_growth_bytes"), 2 << 20);
+        assert_eq!(at("/db_writes/db_file_growth_per_output_bytes"), f64::from(2 << 20) / 3.0);
+        assert_eq!(at("/db_writes/deciles"), serde_json::Value::Null, "fewer than 10 outputs");
         for (_, key, _) in STAGES {
             assert!(json["rows"][0][format!("{key}_ms")].is_f64(), "{key}_ms");
             assert!(json["stats"][key]["p99_ms"].is_f64(), "stats {key}");
@@ -4048,6 +4568,9 @@ mod tests {
 
         let two = json_report(&header, &rows[..2], &footprint(), None);
         assert_eq!(two["thirds"], serde_json::Value::Null);
+        let set = self::header(Knobs { page_size: Some(4096), ..defaults() });
+        let set = json_report(&set, &rows, &footprint(), None);
+        assert_eq!(set["header"]["knobs"]["page_size"], 4096, "a set PAGE_SIZE is its bytes");
 
         // a failed table read keeps the section's keys, null, with the error
         let failed = Footprint { tables: Err("the db is open".to_owned()), ..footprint() };
@@ -4107,6 +4630,181 @@ mod tests {
         assert_eq!(at("/side_load/poller/p99_ms"), 3.0);
         assert_eq!(at("/side_load/poller/degraded_windows"), 0);
         assert_eq!(at("/side_load/off_window_calls"), 0);
+    }
+
+    /// A timed output for the database-writes summary: `counters`, the disk bytes, the data
+    /// file's length after it, and its database commit in milliseconds.
+    fn db_row(
+        counters: Vec<(&'static str, u64)>,
+        disk_bytes: Option<u64>,
+        db_file_len: u64,
+        commit_ms: f64,
+    ) -> OutputRow {
+        let mut row = OutputRow {
+            db_counters: counters,
+            disk_bytes,
+            db_file_len,
+            ..row(1, 8, 0.5, 1, 1, false)
+        };
+        let commit = CAPTURED.iter().position(|(name, _)| *name == COMMIT_MDBX).unwrap();
+        row.stages[commit] = commit_ms / 1e3;
+        row
+    }
+
+    /// The database-writes summary: each counter's mean over every output (a maximum's largest),
+    /// whether it moved, the disk bytes' mean over the outputs that have them, the data file's
+    /// growth from before the first output, and ten consecutive deciles whose sizes differ by at
+    /// most one; none for fewer than ten outputs.
+    #[test]
+    fn test_db_writes_summary() {
+        let rows: Vec<OutputRow> = (0_u64..25)
+            .map(|i| {
+                db_row(
+                    vec![("pages", i + 1), ("tndb_max_gate_lag", i % 7), ("never", 0)],
+                    (i != 3).then_some((i + 1) * 1000),
+                    1000 + 10 * i,
+                    (i + 1) as f64,
+                )
+            })
+            .collect();
+        let writes = DbWrites::of(&rows, 900);
+        let summary =
+            |name: &str| *writes.counters.iter().find(|counter| counter.name == name).unwrap();
+        assert_eq!(writes.counters.len(), 3, "every counter, moved or not");
+        let pages = summary("pages");
+        assert_eq!((pages.value, pages.maximum, pages.moved), (13.0, false, true), "325 / 25");
+        let lag = summary("tndb_max_gate_lag");
+        assert_eq!((lag.value, lag.maximum, lag.moved), (6.0, true, true), "the largest");
+        let never = summary("never");
+        assert_eq!((never.value, never.moved), (0.0, false));
+        assert_eq!(writes.disk_bytes_mean, Some(321_000.0 / 24.0), "over the 24 that have it");
+        assert_eq!(writes.disk_outputs, 24);
+        assert_eq!((writes.db_file_len_before, writes.db_file_len_after), (900, 1240));
+        assert_eq!(writes.db_file_growth(), 340);
+
+        let deciles = writes.deciles.as_ref().expect("25 outputs have deciles");
+        let sizes: Vec<usize> = deciles.iter().map(|decile| decile.outputs).collect();
+        assert_eq!(sizes, [2, 3, 2, 3, 2, 3, 2, 3, 2, 3], "boundaries at k * 25 / 10");
+        let first = Decile {
+            outputs: 2,
+            commit_mdbx_mean_ms: 1.5,
+            disk_bytes_mean: Some(1500.0),
+            db_file_len_mean_bytes: 1005.0,
+            db_file_len_end_bytes: 1010,
+        };
+        assert_eq!(deciles[0], first);
+        let second = Decile {
+            outputs: 3,
+            commit_mdbx_mean_ms: 4.0,
+            disk_bytes_mean: Some(4000.0),
+            db_file_len_mean_bytes: 1030.0,
+            db_file_len_end_bytes: 1040,
+        };
+        assert_eq!(deciles[1], second, "the output without disk bytes is left out of the mean");
+        let last = Decile {
+            outputs: 3,
+            commit_mdbx_mean_ms: 24.0,
+            disk_bytes_mean: Some(24_000.0),
+            db_file_len_mean_bytes: 1230.0,
+            db_file_len_end_bytes: 1240,
+        };
+        assert_eq!(deciles[9], last);
+
+        assert_eq!(DbWrites::of(&rows[..10], 900).deciles.unwrap().len(), 10, "one output each");
+        assert_eq!(DbWrites::of(&rows[..9], 900).deciles, None);
+        let blind: Vec<OutputRow> =
+            rows.iter().map(|row| OutputRow { disk_bytes: None, ..row.clone() }).collect();
+        let blind = DbWrites::of(&blind, 900);
+        assert_eq!((blind.disk_bytes_mean, blind.disk_outputs), (None, 0));
+        assert_eq!(blind.deciles.unwrap()[0].disk_bytes_mean, None);
+    }
+
+    /// The text section prints the counters that moved, `_ns` ones in milliseconds and a maximum
+    /// marked, leaves out the counters that never moved, and gives the disk bytes and the data
+    /// file's growth; the deciles table needs ten outputs. The header names the disk bytes' source
+    /// and the first failed read.
+    #[test]
+    fn test_db_writes_report() {
+        let counters = |commits| {
+            vec![
+                ("tndb_commits", commits),
+                ("tndb_save_ns", 2_500_000),
+                ("tndb_verifies", 0),
+                ("tndb_max_gate_lag", 3),
+            ]
+        };
+        let rows: Vec<OutputRow> = (0_u64..3)
+            .map(|i| db_row(counters(i), Some(1 << 20), (1 << 30) + (1 << 20) * i, 2.0))
+            .collect();
+        let text = db_writes_report(&DbWrites::of(&rows, (1 << 30) - (1 << 20)), rows.len());
+        assert!(text.starts_with("database writes per output: "), "{text}");
+        let line = |name: &str| text.lines().find(|line| line.trim_start().starts_with(name));
+        assert!(line("tndb_commits").unwrap().ends_with(" 1.000"), "{text}");
+        assert!(line("tndb_save_ns").unwrap().ends_with(" 2.500 ms"), "{text}");
+        assert!(line("tndb_max_gate_lag").unwrap().ends_with(" 3 (max)"), "{text}");
+        assert_eq!(line("tndb_verifies"), None, "never moved\n{text}");
+        assert!(
+            line("disk written").unwrap().contains(" 1.000 MiB per output (3 outputs read)"),
+            "{text}"
+        );
+        let growth = line("db file growth").unwrap();
+        assert!(growth.contains(" 1.000 MiB per output, 3.0 MiB over 3 outputs"), "{text}");
+        assert!(text.ends_with("deciles: none for fewer than 10 timed outputs\n"), "{text}");
+
+        let ten: Vec<OutputRow> =
+            (0_u64..10).map(|i| db_row(counters(1), None, (1 << 20) * (i + 1), 2.0)).collect();
+        let text = db_writes_report(&DbWrites::of(&ten, 0), ten.len());
+        assert!(line_of(&text, "disk written").ends_with(" -"), "{text}");
+        assert!(text.contains("\ndecile "), "{text}");
+        let deciles: Vec<&str> =
+            text.lines().skip_while(|line| !line.starts_with("decile ")).skip(1).collect();
+        assert_eq!(deciles.len(), 10, "{text}");
+        let last: Vec<&str> = deciles[9].split_whitespace().collect();
+        assert_eq!(last, ["10", "1", "2.000", "-", "10.0"], "{text}");
+
+        assert_eq!(disk_bytes_line(None, None), "  disk bytes: none (this target has no source)\n");
+        assert!(disk_bytes_line(Some("/proc/self/io"), None)
+            .starts_with("  disk bytes: /proc/self/io ("));
+        let failed = disk_bytes_line(Some("proc_pid_rusage"), Some("EPERM"));
+        assert!(failed.contains("a read FAILED") && failed.ends_with(": EPERM\n"), "{failed}");
+        let header = header(defaults());
+        let report = report(&header, &rows, &footprint(), None);
+        assert!(report.contains(&disk_bytes_line(DISK_BYTES_SOURCE, None)), "{report}");
+        assert!(report.contains("\ndatabase writes per output: "), "{report}");
+    }
+
+    /// The first line of `text` that starts, after its indent, with `name`.
+    fn line_of<'a>(text: &'a str, name: &str) -> &'a str {
+        text.lines()
+            .find(|line| line.trim_start().starts_with(name))
+            .unwrap_or_else(|| panic!("no {name} line in {text}"))
+    }
+
+    /// The process's disk bytes written read on macOS and Linux, and do not go down across a
+    /// few MiB written and synced (no exact amount: macOS may attribute the writes later); a
+    /// target without a source reads none. `/proc/<pid>/io`'s `write_bytes` field parses.
+    #[test]
+    fn test_disk_bytes_written() {
+        let Some(_) = DISK_BYTES_SOURCE else {
+            assert!(disk_bytes_written().is_err());
+            return;
+        };
+        let before = disk_bytes_written().expect("this target has a source");
+        let dir = tempfile::tempdir().unwrap();
+        let mut file = File::create(dir.path().join("written")).unwrap();
+        let chunk = vec![0xa5_u8; 1 << 20];
+        for _ in 0..4 {
+            file.write_all(&chunk).unwrap();
+        }
+        fsync_file(&file).unwrap();
+        let after = disk_bytes_written().expect("a second read");
+        assert!(after >= before, "{after} bytes written after {before}");
+
+        let io = "rchar: 3239\nwchar: 3229\nsyscr: 63\nsyscw: 62\nread_bytes: 4096\n\
+                  write_bytes: 323932160\ncancelled_write_bytes: 0\n";
+        assert_eq!(proc_io_write_bytes(io), Ok(323_932_160));
+        assert!(proc_io_write_bytes("read_bytes: 1\n").is_err());
+        assert!(proc_io_write_bytes("write_bytes: lots\n").is_err());
     }
 
     /// The report path splits into an existing dir and a file name; a missing dir or no file

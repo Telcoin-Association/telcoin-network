@@ -44,6 +44,13 @@
 //!
 //! Pages a commit freed are listed in the free tree ([`crate::freelist`]) and reused once no
 //! durable meta and no live reader can reach them ([`Writer::reuse_gate`]).
+//!
+//! ## I/O counters
+//!
+//! The writer counts what it does in plain fields of its state ([`Writer::stats`]): each commit
+//! step's pages, syncs and time, the copies, checks and allocations of a transaction, and the
+//! refills of its pool. [`EnvInner::return_writer`], where the state comes back after every
+//! commit, abort and sync, copies them out for [`Env::io_stats`] (see [`IoStats`]).
 
 use std::{
     collections::VecDeque,
@@ -73,6 +80,7 @@ use crate::{
     overflow::{checked_run, Ovf, RunCrc},
     page::{self, Geometry, Kind},
     page_set::PageSet,
+    stats::{elapsed_ns, lap, IoStats},
     sys,
     tree::{
         read::{checked_child, checked_page},
@@ -114,7 +122,8 @@ pub enum SyncMode {
 }
 
 /// How [`Env::open`] opens (or creates) a file. [`Env::open_read_only`] validates `page_size` as
-/// [`Env::open`] does and uses no other field: it maps the file at its length and commits nothing.
+/// [`Env::open`] does and uses `readahead`, and no other field: it maps the file at its length and
+/// commits nothing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct EnvOptions {
     /// The page size of a new file: a power of two in 4 KiB..=64 KiB (default 4096). An
@@ -125,11 +134,25 @@ pub struct EnvOptions {
     pub map_reserve: u64,
     /// When commits become durable (default [`SyncMode::Durable`]).
     pub sync: SyncMode,
+    /// Let the kernel read ahead on the file's page faults (default `false` on Linux, `true`
+    /// elsewhere). With `false` every mapping of the file is advised `MADV_RANDOM`. On Linux a
+    /// B+tree's reads are random, so readahead mostly reads pages nothing asks for, and the large
+    /// page-cache folios it builds make each page a commit dirties write back its whole folio
+    /// (measured on Linux 7.1, ext4: 4.0 KiB written per 4 KiB page dirtied with the advice, 115
+    /// KiB after a full cold read with readahead). On macOS a dirtied page writes back its VM page
+    /// either way, and the advice measured slower first writes into new file space, so it is off
+    /// there. `true` gives no advice, for a workload that scans whole tables cold.
+    pub readahead: bool,
 }
 
 impl Default for EnvOptions {
     fn default() -> Self {
-        Self { page_size: 4096, map_reserve: DEFAULT_RESERVE, sync: SyncMode::Durable }
+        Self {
+            page_size: 4096,
+            map_reserve: DEFAULT_RESERVE,
+            sync: SyncMode::Durable,
+            readahead: !cfg!(target_os = "linux"),
+        }
     }
 }
 
@@ -246,6 +269,9 @@ pub(crate) struct EnvInner {
     /// ([`Writer::publish`]), on [`Self::clock`]; [`NOT_SUPERSEDED`] when that reader holds the
     /// current snapshot. Read by [`Env::oldest_reader_age`].
     oldest_superseded: AtomicU64,
+    /// The writer's counters as of the last time its state came back ([`Self::return_writer`]),
+    /// which [`Env::io_stats`] copies: all zero in a read-only environment.
+    io_stats: Mutex<IoStats>,
     /// Test-only: drop as a crash would, without the final sync.
     #[cfg(test)]
     pub(crate) crash_on_drop: std::sync::atomic::AtomicBool,
@@ -271,6 +297,7 @@ impl EnvInner {
             read_only,
             clock_base: Instant::now(),
             oldest_superseded: AtomicU64::new(NOT_SUPERSEDED),
+            io_stats: Mutex::new(IoStats::default()),
             #[cfg(test)]
             crash_on_drop: std::sync::atomic::AtomicBool::new(false),
         }
@@ -326,8 +353,11 @@ impl EnvInner {
         f(back.1.as_deref_mut().expect("a waiting take returns the writer"))
     }
 
-    /// Give the writer's state back and wake one waiter.
+    /// Give the writer's state back and wake one waiter, first publishing its counters
+    /// ([`Writer::io_stats`]). Every commit, abort and sync ends here, so the published
+    /// counters include each one's work.
     pub(crate) fn return_writer(&self, writer: Box<Writer>) {
+        *self.io_stats.lock() = writer.io_stats();
         *self.writer.lock() = Some(writer);
         self.writer_back.notify_one();
     }
@@ -404,6 +434,15 @@ pub(crate) struct Writer {
     readers_kept: usize,
     /// The tree writes' reused buffers ([`PageWrite::take_scratch`]).
     scratch: Scratch,
+    /// The running totals of the I/O and allocation counters, but for those [`Self::io_stats`]
+    /// takes from elsewhere ([`Self::verifies`], [`Self::verify_ns`], the file's growth).
+    pub(crate) stats: IoStats,
+    /// [`IoStats::verifies`]: counted by [`PageWrite::count_verify`], whose callers hold the store
+    /// by shared reference (and the store is `Sync`), so an atomic. Only the writing
+    /// transaction's thread changes it, by a relaxed load and store, never a read-modify-write.
+    verifies: AtomicU64,
+    /// [`IoStats::verify_ns`], kept as [`Self::verifies`] is.
+    verify_ns: AtomicU64,
     /// Test-only: the most rounds a commit's free-list save took.
     #[cfg(test)]
     pub(crate) max_save_rounds: u32,
@@ -467,16 +506,19 @@ impl Writer {
     /// over each overflow run ([`crate::alloc::PrivatePages::units`]). Returns every page written,
     /// ascending, for the data sync; the tree pages then count as stamped by this writer.
     pub(crate) fn stamp_private(&mut self) -> Result<Vec<u32>> {
+        let started = Instant::now();
         let size = self.geometry.page_size();
         let private = self.alloc.stamp_private();
         for (p, n) in private.units() {
             crc::add_crc32_nonzero(self.file.pages_mut(p, size, n as usize * size)?);
         }
+        self.stats.stamp_ns += elapsed_ns(started);
         Ok(private.pages)
     }
 
     /// Record pages stamped by a [`SyncMode::NoSync`] commit, for the next sync.
     pub(crate) fn defer_sync(&mut self, pages: &[u32]) {
+        self.stats.nosync_commits += 1;
         for &p in pages {
             self.unsynced.insert(p);
         }
@@ -501,14 +543,27 @@ impl Writer {
         {
             self.data_by_file = plan == DataSync::File;
         }
+        let grown = self.file.size_unsynced();
+        let mut clock = Instant::now();
         match plan {
             DataSync::Nothing => {}
-            DataSync::Range(range) => self.file.msync_range(range)?,
-            DataSync::File => self.file.fdatasync_all()?,
+            DataSync::Range(range) => {
+                let span = (range.end - range.start) / size as u64;
+                self.file.msync_range(range)?;
+                self.stats.msync_syncs += 1;
+                self.stats.msync_span_pages += span;
+            }
+            DataSync::File => {
+                self.file.fdatasync_all()?;
+                self.stats.fdatasync_syncs += 1;
+            }
         }
+        self.stats.pages_synced += pages.len() as u64;
+        self.stats.data_sync_ns += lap(&mut clock);
         #[cfg(test)]
         self.crash_point(CrashAt::AfterDataSync)?;
         self.file.sync_size_if_grown()?;
+        self.stats.size_sync_ns += lap(&mut clock);
         #[cfg(test)]
         self.crash_point(CrashAt::AfterSizeSync)?;
         let slot = slot_to_write(&self.slots);
@@ -517,9 +572,22 @@ impl Writer {
         self.crash_point(CrashAt::AfterMetaCopy)?;
         self.file.msync_page(slot as u32, size)?;
         self.slots[slot] = Some(meta.txn);
+        self.stats.meta_sync_ns += lap(&mut clock);
+        self.stats.commits += 1;
+        self.stats.grown_commits += u64::from(grown);
         #[cfg(test)]
         self.crash_point(CrashAt::AfterMetaMsync)?;
         Ok(())
+    }
+
+    /// The I/O and allocation counters' totals so far ([`Env::io_stats`]).
+    pub(crate) fn io_stats(&self) -> IoStats {
+        IoStats {
+            verifies: self.verifies.load(Ordering::Relaxed),
+            verify_ns: self.verify_ns.load(Ordering::Relaxed),
+            bytes_grown: self.file.bytes_grown(),
+            ..self.stats
+        }
     }
 
     /// Test-only: stop here if [`Self::crash_at`] names `at` (once): the caller returns the
@@ -621,7 +689,12 @@ impl Writer {
     /// rest of the transaction. A damaged record is [`Error::Corrupt`] and none of its pages is
     /// taken.
     fn load(&mut self, mut enough: impl FnMut(&mut Allocator, u32) -> bool) -> Result<()> {
+        let started = Instant::now();
         let gate = self.reuse_gate();
+        let lag = self.alloc.txn().saturating_sub(gate);
+        self.stats.gate_lag_sum += lag;
+        self.stats.gate_lag_samples += 1;
+        self.stats.max_gate_lag = self.stats.max_gate_lag.max(lag);
         let (free, page_count) = (self.last.free, self.last.page_count);
         let mut records = 0;
         while self.alloc.loading() && !enough(&mut self.alloc, records) {
@@ -631,10 +704,12 @@ impl Writer {
                     let pages = freelist::decode_pages(value, page_count)?;
                     records += 1;
                     self.alloc.load_record(key, pages)?;
+                    self.stats.records_loaded += 1;
                 }
                 _ => self.alloc.stop_loading(),
             }
         }
+        self.stats.refill_ns += elapsed_ns(started);
         Ok(())
     }
 
@@ -719,8 +794,12 @@ impl PageWrite for Writer {
             self.refill()?;
         }
         let size = self.geometry.page_size();
+        let end = self.alloc.page_count();
         let file = &mut self.file;
         let p = self.alloc.allocate(|count| file.ensure_len(u64::from(count) * size as u64))?;
+        let from_end = p >= end;
+        self.stats.pages_from_end += u64::from(from_end);
+        self.stats.pages_from_pool += u64::from(!from_end);
         self.file.page_mut(p, size)?.fill(0);
         Ok(p)
     }
@@ -744,6 +823,7 @@ impl PageWrite for Writer {
         if self.alloc.is_private(from) {
             return Err(private_source(from));
         }
+        self.stats.cow_copies += 1;
         let size = self.geometry.page_size();
         let Some(src) = self.view.slice(u64::from(from) * size as u64, size) else {
             return copy_unpublished(self, from, to);
@@ -779,18 +859,22 @@ impl PageWrite for Writer {
         }
         let size = self.geometry.page_size();
         let file = &mut self.file;
-        #[cfg(test)]
         let end = self.alloc.page_count();
         let p = self
             .alloc
             .allocate_run(npages, |count| file.ensure_len(u64::from(count) * size as u64))?;
+        // The run starts at or below the old end (tail reuse, or new pages from it).
+        let from_end = p.saturating_add(npages).saturating_sub(end);
+        let step = match (from_end == 0, p < end) {
+            (true, _) => usize::from(loads),
+            (false, true) => 2,
+            (false, false) => 3,
+        };
+        self.stats.runs_by_step[step] += 1;
+        self.stats.pages_from_end += u64::from(from_end);
+        self.stats.pages_from_pool += u64::from(npages - from_end);
         #[cfg(test)]
         {
-            let step = match (p.saturating_add(npages) <= end, p < end) {
-                (true, _) => usize::from(loads),
-                (false, true) => 2,
-                (false, false) => 3,
-            };
             self.alloc.run_stats.steps[step] += 1;
         }
         Ok(p)
@@ -814,6 +898,14 @@ impl PageWrite for Writer {
 
     fn put_scratch(&mut self, scratch: Scratch) {
         self.scratch = scratch;
+    }
+
+    fn count_verify(&self, ns: u64) {
+        let add = |counter: &AtomicU64, n: u64| {
+            counter.store(counter.load(Ordering::Relaxed).wrapping_add(n), Ordering::Relaxed);
+        };
+        add(&self.verifies, 1);
+        add(&self.verify_ns, ns);
     }
 
     #[cfg(test)]
@@ -902,7 +994,7 @@ impl Env {
         // A crash may have left a meta in the page cache whose msync never finished: make what
         // this open reads durable before anything is built on it.
         sys::fsync_file(&file)?;
-        let file = PageFile::from_file(file, options.map_reserve)?;
+        let file = PageFile::from_file(file, options.map_reserve, options.readahead)?;
         let snapshot = checked_snapshot(meta, geometry, file.view())?;
         let writer = Writer {
             view: file.view(),
@@ -915,6 +1007,9 @@ impl Env {
             readers: VecDeque::from([Published::current(&snapshot)]),
             readers_kept: 1,
             scratch: Scratch::default(),
+            stats: IoStats::default(),
+            verifies: AtomicU64::new(0),
+            verify_ns: AtomicU64::new(0),
             #[cfg(test)]
             max_save_rounds: 0,
             #[cfg(test)]
@@ -949,13 +1044,14 @@ impl Env {
     ///
     /// Errors: as [`Self::open`]'s, except that a missing file is [`Error::Io`] (`NotFound`) and
     /// an empty one [`Error::NotTndbB`]; [`Error::Locked`] if a handle with a writer holds it.
-    /// `options.page_size` is validated as [`Self::open`] validates it; no other field applies.
+    /// `options.page_size` is validated as [`Self::open`] validates it and `options.readahead`
+    /// advises the mapping as [`Self::open`]'s; no other field applies.
     pub fn open_read_only(path: impl AsRef<Path>, options: EnvOptions) -> Result<Env> {
         Geometry::new(options.page_size)?;
         let file = open_shared(path.as_ref())?;
         let (chosen, geometry) = choose_state(&file)?;
         // No sync, unlike `open`: nothing is built on what this open reads.
-        let file = ReadOnlyFile::from_file(file)?;
+        let file = ReadOnlyFile::from_file(file, options.readahead)?;
         let snapshot = checked_snapshot(chosen.meta, geometry, file.view())?;
         let inner = EnvInner::new(geometry, SyncMode::Durable, snapshot, None, Some(file));
         Ok(Env { inner: Arc::new(inner) })
@@ -981,6 +1077,15 @@ impl Env {
         let since = self.inner.oldest_superseded.load(Ordering::Relaxed);
         (since != NOT_SUPERSEDED)
             .then(|| Duration::from_nanos(self.inner.clock().saturating_sub(since)))
+    }
+
+    /// The writer's I/O and allocation counters, cumulative since this environment opened (see
+    /// [`IoStats`]): in memory only, published at the end of every commit, abort and
+    /// [`Self::sync`], so between those they stay put. All zero in an environment opened
+    /// read-only. One short lock of the published copy: a caller never waits for an open write
+    /// transaction.
+    pub fn io_stats(&self) -> IoStats {
+        *self.inner.io_stats.lock()
     }
 
     /// Begin the write transaction, waiting while another one is open (from any thread: a
@@ -1288,5 +1393,7 @@ fn check_root(snapshot: &Snapshot, root: &TreeRoot, what: &str) -> Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
+mod io_stats_tests;
 #[cfg(test)]
 pub(crate) mod tests;

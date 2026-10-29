@@ -309,6 +309,11 @@ pub(crate) trait PageWrite: PageRead {
     /// Hand back the buffers [`Self::take_scratch`] took.
     fn put_scratch(&mut self, scratch: write::Scratch);
 
+    /// Count one check of a published page ([`write::verify_published`]) that took `ns`
+    /// nanoseconds, for the writer's I/O counters (`IoStats::verifies`, `IoStats::verify_ns`).
+    /// The checks run where the store is borrowed shared. A store with no counters ignores it.
+    fn count_verify(&self, _ns: u64) {}
+
     /// Test-only: true when deletes must not merge under-full pages ([`write::delete`]), so a
     /// test can build the shapes a tree without merging has.
     #[cfg(test)]
