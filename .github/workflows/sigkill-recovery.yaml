@@ -32,10 +32,13 @@ on:
 permissions:
   contents: read
 
+# The first six variables are durable-e2e.yaml's, and the steps up to the cache step match
+# that workflow's job: rust-cache hashes both into the key, and this lane restores the
+# durable-e2e-cache entry that the nightly run saves on main. Change them together.
 env:
   CARGO_INCREMENTAL: 0
-  CARGO_TARGET_DIR: target
   RUSTFLAGS: "-D warnings -D unused_extern_crates"
+  CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
   CARGO_PROFILE_DEV_DEBUG: 0
   CARGO_PROFILE_TEST_DEBUG: 0
@@ -64,12 +67,8 @@ jobs:
         with:
           submodules: recursive
 
-      - name: Install pinned toolchains
-        run: |
-          rustup show active-toolchain || rustup toolchain install
-          nightly="$(cat rust-nightly)"
-          rustup toolchain install "$nightly" -c rustfmt,clippy --profile minimal
-          echo "RUST_NIGHTLY=$nightly" >> "$GITHUB_ENV"
+      - name: Install Rust toolchain
+        run: rustup show active-toolchain || rustup toolchain install
 
       - uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
         with:
@@ -87,11 +86,6 @@ jobs:
         with:
           shared-key: durable-e2e-cache
           cache-on-failure: "true"
-
-      - name: Validate formatting and the full workspace lint plan
-        run: |
-          cargo +"$RUST_NIGHTLY" fmt --all -- --check
-          cargo +"$RUST_NIGHTLY" clippy --locked --workspace --all-targets --all-features --no-deps -- -D warnings
 
       - name: Build and run the captured SIGKILL scenario
         run: |

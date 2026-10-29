@@ -36,6 +36,9 @@ on:
 permissions:
   contents: read
 
+# sigkill-recovery.yaml restores this job's durable-e2e-cache entry, so its env block and
+# its steps up to the cache step match these: rust-cache hashes both into the key. Change
+# them together.
 env:
   CARGO_INCREMENTAL: 0
   RUSTFLAGS: "-D warnings -D unused_extern_crates"
