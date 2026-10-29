@@ -51,10 +51,11 @@ Three consequences worth remembering:
 ### Re-running the attestation check
 
 `make attest` writes to adiri and touches nothing on GitHub, so nothing re-runs `verify-on-chain` by itself.
-Two ways to re-run it on the same sha: request a review on the PR (`review_requested` is in the workflow's `pull_request.types` for exactly this), or re-run the failed job from the Actions tab.
-Both run the script as it stands on `main` at that moment, so a change to the script or its registry address reaches an open PR on its next run.
-A review request re-runs the whole workflow, so `fmt`, `clippy` and the guards run again on a sha they have already checked.
-That is deliberate: the newest run on a sha is the one the required check reads, and a review-request run that skipped them and accepted the skip could turn `CI Success` green on a sha whose earlier run failed `clippy`.
+After attesting, open the PR's failed run in the Actions tab and choose *Re-run failed jobs*.
+That re-runs the failed `verify-on-chain` and `CI Success` in the same run, and `CI Success` reads the other jobs' results from the first attempt, so nothing is compiled or tested again and nothing can turn `CI Success` green on a sha whose compile lanes failed.
+`gh run rerun <run-id> --failed` does the same from a shell, but only with a token that has `actions: write`, so the Actions tab is the documented path.
+The re-run uses the script as it stands on `main` at that moment, so a change to the script or its registry address reaches an open PR on its next run.
+Requesting a review re-runs nothing: `review_requested` used to be the trigger for this, and it re-ran the whole workflow (8 minutes warm, 16 cold) for one job, and opening a PR whose paths have code owners fired it three times.
 Do not push: a new sha needs a new attestation.
 
 ### Why SQUASH
@@ -166,7 +167,7 @@ The real gate here is the attestation plus the approval: `CI Success` depends on
 That binds a PR that leaves the gate alone, and only such a PR.
 
 `verify-on-chain` runs `.github/scripts/verify_commit_hash.sh` from `main` as it stands when the job starts, not from the PR, so editing the script does nothing for the PR that edits it.
-The new script judges every run after it lands on `main`, on every open PR, a re-run or a review request included.
+The new script judges every run after it lands on `main`, on every open PR, a re-run of failed jobs included.
 The `attest` job definition and the `CI Success` allowlist still come from the PR's merge commit, though, and the queue run uses the PR's `pr.yaml` and skips `verify-on-chain`.
 So a PR that edits the job or the allowlist can turn `CI Success` green without an attestation, on the PR and in the queue.
 The lanes are in the same position: the queue runs `etc/ci-lanes.sh` from the merge commit, so a PR that edits it is tested by its own edit.

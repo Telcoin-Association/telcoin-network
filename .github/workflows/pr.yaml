@@ -54,10 +54,14 @@ name: Pull Request and Merge Queue Checks
 on:
   pull_request:
     branches: [main, 'staging/**']
-    # `review_requested` is load-bearing, not cosmetic: `make attest` writes to adiri and
-    # touches nothing on GitHub, so after attesting a maintainer requests a review to
-    # re-run `verify-on-chain` on the same sha. A push would mint a new, unattested sha.
-    types: [opened, synchronize, reopened, review_requested, ready_for_review]
+    # `make attest` writes to adiri and touches nothing on GitHub, so after attesting a
+    # maintainer opens the failed run in the Actions tab and uses "Re-run failed jobs". That
+    # re-runs the failed `verify-on-chain` and `CI Success`, and `CI Success` reads the other
+    # jobs' results from the first attempt. `gh run rerun <run-id> --failed` does the same but
+    # needs a token with `actions: write`, so the Actions tab is the documented path. A push
+    # would mint a new, unattested sha. `review_requested` is left out on purpose: it re-ran
+    # the whole workflow for that one job, three times on opening a PR with code-owned paths.
+    types: [opened, synchronize, reopened, ready_for_review]
   # No `branches:` filter here -- on this event the ref is the queue's temporary
   # `gh-readonly-queue/main/...` branch, which a `[main]` filter would not match.
   merge_group:
@@ -94,11 +98,10 @@ jobs:
   # (etc/test-and-attest.sh), so running its tests again on GitHub buys nothing. The skip
   # saves test runs, not compiling. clippy compiles every target, tests included, so a PR
   # whose tests do not build fails on its own pull_request run instead of in the queue,
-  # where ejecting it rebuilds every group behind it. A review request re-runs fmt, clippy
-  # and the guards on a sha they have already checked; leave that alone. The newest run on
-  # a sha is the one the required check reads, so a `review_requested` run that skipped
-  # clippy and accepted the skip would turn `CI Success` green on a sha whose `synchronize`
-  # run failed it.
+  # where ejecting it rebuilds every group behind it. The re-run that follows `make attest`
+  # re-runs the failed jobs inside the same run, and the jobs it does not repeat keep the
+  # first attempt's results, so it cannot turn `CI Success` green on a sha whose compile
+  # lanes failed.
   #
   # Neither reason survives into the merge queue. The queue's commit is main + this PR,
   # which no local run covered no matter who authored it, so every lane runs there for
@@ -167,7 +170,7 @@ jobs:
       # turn this check green with no attestation. main moves only through the ruleset or
       # an admin bypassing it, so the author cannot choose what is checked out here, nor
       # keep an old copy by not pushing, as `pull_request.base.sha` would allow: that does
-      # not follow main, and neither a review request nor a re-run moves it.
+      # not follow main, and a re-run does not move it.
       #
       # The ref is spelled `refs/heads/main`, fully qualified so that a tag named `main`
       # cannot be picked up, rather than taken from `github.base_ref` or
