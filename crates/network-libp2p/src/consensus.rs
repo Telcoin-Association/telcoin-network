@@ -7,7 +7,7 @@ use crate::{
     diagnostics::{bounded_error, bounded_reply_error as error, bounded_warn},
     error::NetworkError,
     gossip_config::gossipsub_config,
-    kad::{node_record_key, KadStore},
+    kad::{identical_refresh, node_record_key, KadStore},
     metrics::{
         ConnectionLimitReason, InboundFailureOutcome, InboundRejection, PeerManagerMetrics,
         SwarmMetrics,
@@ -3019,15 +3019,23 @@ where
                     let timestamp = self.admission_timestamp(key, value.info.timestamp, observed);
                     let freshness = self.record_freshness(&record, timestamp, observed);
                     let should_store = if freshness == RecordFreshness::Identical {
-                        // A relayed identical copy can carry less remaining TTL. Refreshing it must
-                        // not shorten the lifetime we already accepted. None means no expiry.
+                        // A relayed identical copy carries a fresh wire expiry, so the stored
+                        // expiry moves on every copy. Writing the row each time turns a free relay
+                        // (no BLS work after the first copy) into one durable commit on the kad
+                        // writer that every swarm shares (GHSA-4947-9xvx-pv2m). Keep the longer
+                        // lifetime and write the row only when the refresh is due. None means no
+                        // expiry.
+                        let ttl = self.config.kad_record_ttl;
                         self.swarm.behaviour_mut().kademlia.store_mut().get(&record.key).is_none_or(
                             |existing| {
-                                record.expires = existing
-                                    .expires
-                                    .zip(record.expires)
-                                    .map(|(old, new)| old.max(new));
-                                record.expires != existing.expires
+                                let refresh = identical_refresh(
+                                    existing.expires,
+                                    record.expires,
+                                    std::time::Instant::now(),
+                                    ttl,
+                                );
+                                record.expires = refresh.expires();
+                                refresh.store()
                             },
                         )
                     } else {
