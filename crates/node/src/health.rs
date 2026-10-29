@@ -15,8 +15,21 @@
 //! endpoint always answers `200`; the JSON body is the machine-readable signal,
 //! so the gateway (not the node) is responsible for translating "not accepting"
 //! into a client-facing `503`.
+//!
+//! # Binding
+//!
+//! `--healthcheck 8080` binds `127.0.0.1:8080`; `--healthcheck [::1]:8080` or
+//! `--healthcheck 10.0.0.5:8080` bind exactly that address; `--healthcheck 0.0.0.0:8080` is the
+//! only way to listen on every interface (issue #1689). The bound endpoint and its reach are
+//! reported at startup through `tn_metrics::report_listener_bound`.
 
-use std::{future::Future, net::SocketAddr, time::Duration};
+use std::{
+    fmt,
+    future::Future,
+    net::{Ipv4Addr, SocketAddr},
+    str::FromStr,
+    time::Duration,
+};
 
 use crate::network_readiness::NetworkReadiness;
 use futures::{Stream, StreamExt};
@@ -62,6 +75,59 @@ const LIVENESS_RESPONSE: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nO
 /// Fallback body used only if the readiness payload (impossibly) fails to
 /// serialize: report no ready workers so the gateway fails closed.
 const READINESS_FALLBACK: &str = r#"{"version":1,"workers":[]}"#;
+
+/// Where the healthcheck listener binds, as the operator wrote it.
+///
+/// Parsed from `--healthcheck` / `HEALTHCHECK_TCP_PORT`. A bare port is the pre-#1689 form and
+/// binds IPv4 loopback; a full socket address is the operator's explicit interface choice. A
+/// wildcard bind (`0.0.0.0:<port>`, `[::]:<port>`) therefore has to be written out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HealthcheckBind {
+    /// A bare port: binds `127.0.0.1:<port>`.
+    LegacyPort(u16),
+    /// An explicit socket address (IPv4 or IPv6).
+    Explicit(SocketAddr),
+}
+
+impl HealthcheckBind {
+    /// The host a bare port binds.
+    pub const LEGACY_HOST: Ipv4Addr = Ipv4Addr::LOCALHOST;
+
+    /// The socket address this bind resolves to.
+    pub fn socket_addr(self) -> SocketAddr {
+        match self {
+            Self::LegacyPort(port) => (Self::LEGACY_HOST, port).into(),
+            Self::Explicit(addr) => addr,
+        }
+    }
+}
+
+/// A `--healthcheck` value that is neither a port nor a socket address.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HealthcheckBindError(String);
+
+impl fmt::Display for HealthcheckBindError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "invalid healthcheck bind `{}`: expected a port (binds 127.0.0.1) or a socket address such as 127.0.0.1:8080, [::1]:8080 or 0.0.0.0:8080",
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for HealthcheckBindError {}
+
+impl FromStr for HealthcheckBind {
+    type Err = HealthcheckBindError;
+
+    fn from_str(raw: &str) -> Result<Self, Self::Err> {
+        raw.parse::<u16>()
+            .map(Self::LegacyPort)
+            .or_else(|_| raw.parse::<SocketAddr>().map(Self::Explicit))
+            .map_err(|_| HealthcheckBindError(raw.to_owned()))
+    }
+}
 
 /// Readiness of a single worker, as reported by `GET /health/workers`.
 #[derive(Debug, PartialEq, Eq, Serialize)]
@@ -121,7 +187,7 @@ where
 
 /// Minimal HTTP health/readiness responder for service monitoring.
 ///
-/// Binds to a TCP port and serves liveness, `/health/workers` transaction readiness,
+/// Binds a TCP address and serves liveness, `/health/workers` transaction readiness,
 /// and `/health/network` cached swarm reachability. Uses raw TCP sockets for minimal
 /// overhead and dependencies.
 ///
@@ -132,13 +198,14 @@ where
 /// network readiness exposes aggregate reachability, configured worker ids, each swarm's
 /// probe status and established-peer count. Neither route certifies consensus or sync readiness.
 ///
-/// Node operators must ensure the endpoint is protected by a firewall.
-/// This service is off by default, but can be enabled through the CLI node
-/// command. Each connection is handled synchronously in the accept loop, with a
+/// Operators choose the bind address: a bare port binds loopback; a specific interface or a
+/// wildcard must be written out. The bound endpoint and its reach are reported at startup.
+/// Firewalls are defense in depth. This service is off by default, but can be enabled through
+/// the CLI node command. Each connection is handled synchronously in the accept loop, with a
 /// read timeout so a slow client cannot stall the loop. No connection limits or
 /// rate limiting are implemented. Connections are closed after the response.
 ///
-/// To enable on node startup, use `telcoin-network node --healthcheck <PORT>`.
+/// To enable on node startup, use `telcoin-network node --healthcheck <PORT|ADDR>`.
 /// See `telcoin-network-cli::node` for more info.
 #[derive(Debug)]
 pub(crate) struct HealthcheckServer;
@@ -146,7 +213,7 @@ pub(crate) struct HealthcheckServer;
 impl HealthcheckServer {
     /// Spawns the health check server task and returns the bound address.
     ///
-    /// Binds to the given `port` (or lets the OS assign one if `0`).
+    /// Binds `bind` (a port of `0` lets the OS assign one).
     ///
     /// `worker_ready` is polled per readiness request for all initialized workers'
     /// current accepting states. It is a closure (rather than a concrete
@@ -157,9 +224,10 @@ impl HealthcheckServer {
     ///
     /// # Network Binding
     ///
-    /// Binds to 0.0.0.0 (all interfaces) to allow external health checkers.
-    /// This makes the service accessible on all network interfaces including
-    /// public IPs.
+    /// [`HealthcheckBind::LegacyPort`] binds IPv4 loopback, so only this host (or this network
+    /// namespace) can reach it. [`HealthcheckBind::Explicit`] binds exactly the written
+    /// address: one interface, or every interface for a wildcard such as `0.0.0.0:<port>`. A
+    /// bind failure is returned to the caller, which fails node startup (issue #1689).
     ///
     /// # Protocol
     ///
@@ -172,7 +240,7 @@ impl HealthcheckServer {
     /// snapshot never waits for a network command or implies consensus/sync readiness.
     pub(crate) async fn spawn<F, Fut>(
         task_spawner: TaskSpawner,
-        port: u16,
+        bind: HealthcheckBind,
         worker_ready: F,
         network_readiness: watch::Receiver<NetworkReadiness>,
     ) -> eyre::Result<SocketAddr>
@@ -180,10 +248,9 @@ impl HealthcheckServer {
         F: Fn() -> Fut + Send + 'static,
         Fut: Future<Output = Vec<WorkerReadiness>> + Send,
     {
-        // IMPORTANT: use firewall to protect this endpoint
-        let addr: SocketAddr = ([0, 0, 0, 0], port).into();
-        let listener = TcpListener::bind(addr).await?;
+        let listener = TcpListener::bind(bind.socket_addr()).await?;
         let listen_on = listener.local_addr()?;
+        tn_metrics::report_listener_bound("healthcheck", listen_on);
         info!(target: "epoch-manager", ?listen_on, "healthcheck listening");
 
         // wrap the listener in a stream so the accept loop is a testable seam
@@ -291,15 +358,21 @@ fn request_path(request: &[u8]) -> Option<&str> {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use std::{
+        io::ErrorKind,
+        net::{IpAddr, Ipv4Addr},
+        time::Duration,
+    };
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
         net::TcpStream,
     };
 
     use super::{
-        probe_readiness, readiness_json, request_path, serve, HealthcheckServer, WorkerReadiness,
+        probe_readiness, readiness_json, request_path, serve, HealthcheckBind, HealthcheckServer,
+        WorkerReadiness,
     };
+    use crate::network_readiness::NetworkReadiness;
     use futures::StreamExt;
     use tn_types::TaskManager;
 
@@ -324,7 +397,7 @@ mod tests {
         // liveness path never polls the readiness probe
         let addr = HealthcheckServer::spawn(
             task_spawner.clone(),
-            0,
+            HealthcheckBind::LegacyPort(0),
             futures::future::pending,
             tokio::sync::watch::channel(crate::network_readiness::NetworkReadiness::pending()).1,
         )
@@ -353,7 +426,7 @@ mod tests {
 
         let addr = HealthcheckServer::spawn(
             task_spawner.clone(),
-            0,
+            HealthcheckBind::LegacyPort(0),
             || async { vec![WorkerReadiness::new(0, false)] },
             tokio::sync::watch::channel(crate::network_readiness::NetworkReadiness::pending()).1,
         )
@@ -380,7 +453,7 @@ mod tests {
     /// Cached reachability fails closed, preserves liveness, and publishes subsequent recovery.
     #[tokio::test]
     async fn network_health_serves_cached_readiness_and_recovery() -> eyre::Result<()> {
-        use crate::network_readiness::{monitor, NetworkReadiness};
+        use crate::network_readiness::monitor;
         use std::{
             future::{pending, ready},
             time::Duration,
@@ -389,7 +462,7 @@ mod tests {
         let (publisher, mut readiness) = tokio::sync::watch::channel(NetworkReadiness::pending());
         let addr = HealthcheckServer::spawn(
             tasks.get_spawner(),
-            0,
+            HealthcheckBind::LegacyPort(0),
             futures::future::pending,
             readiness.clone(),
         )
@@ -436,7 +509,7 @@ mod tests {
 
         let addr = HealthcheckServer::spawn(
             task_spawner.clone(),
-            0,
+            HealthcheckBind::LegacyPort(0),
             || async { vec![WorkerReadiness::new(0, true), WorkerReadiness::new(1, false)] },
             tokio::sync::watch::channel(crate::network_readiness::NetworkReadiness::pending()).1,
         )
@@ -534,5 +607,131 @@ mod tests {
         assert_eq!(request_path(b"GET / HTTP/1.1\r\n\r\n"), Some("/"));
         assert_eq!(request_path(b""), None);
         assert_eq!(request_path(b"garbage"), None);
+    }
+
+    /// A readiness receiver that stays pending, for spawn calls that only need liveness.
+    fn pending_readiness() -> tokio::sync::watch::Receiver<NetworkReadiness> {
+        tokio::sync::watch::channel(NetworkReadiness::pending()).1
+    }
+
+    /// A bare port binds IPv4 loopback and still serves every existing route.
+    #[tokio::test]
+    async fn legacy_port_binds_loopback_and_serves_existing_routes() -> eyre::Result<()> {
+        let task_manager = TaskManager::default();
+        let addr = HealthcheckServer::spawn(
+            task_manager.get_spawner(),
+            HealthcheckBind::LegacyPort(0),
+            || async { vec![WorkerReadiness::new(0, true)] },
+            pending_readiness(),
+        )
+        .await?;
+
+        assert_eq!(addr.ip(), IpAddr::V4(Ipv4Addr::LOCALHOST), "a bare port must bind loopback");
+        let workers = roundtrip(addr, b"GET /health/workers HTTP/1.1\r\n\r\n").await?;
+        assert!(workers.starts_with("HTTP/1.1 200 OK"), "got: {workers}");
+        assert!(workers.contains("\"accepting_transactions\":true"), "got: {workers}");
+        let network = roundtrip(addr, b"GET /health/network HTTP/1.1\r\n\r\n").await?;
+        assert!(network.starts_with("HTTP/1.1 503 Service Unavailable"), "got: {network}");
+        let liveness = roundtrip(addr, b"GET / HTTP/1.1\r\n\r\n").await?;
+        assert!(liveness.starts_with("HTTP/1.1 200 OK"), "got: {liveness}");
+        assert!(liveness.ends_with("OK"), "got: {liveness}");
+        Ok(())
+    }
+
+    /// An explicit IPv6 loopback bind opens nothing on IPv4.
+    #[tokio::test]
+    async fn explicit_ipv6_loopback_bind_is_not_reachable_over_ipv4() -> eyre::Result<()> {
+        let task_manager = TaskManager::default();
+        let bind: HealthcheckBind = "[::1]:0".parse()?;
+        let spawned = HealthcheckServer::spawn(
+            task_manager.get_spawner(),
+            bind,
+            || async { Vec::new() },
+            pending_readiness(),
+        )
+        .await;
+        // a host without an IPv6 loopback cannot exercise this case
+        let ipv6_unavailable = spawned
+            .as_ref()
+            .err()
+            .and_then(|err| err.downcast_ref::<std::io::Error>())
+            .is_some_and(|err| {
+                err.kind() == ErrorKind::AddrNotAvailable || err.kind() == ErrorKind::Unsupported
+            });
+        if ipv6_unavailable {
+            tracing::debug!(target: "epoch-manager", "no IPv6 loopback on this host; skipping");
+            return Ok(());
+        }
+        let addr = spawned?;
+        assert!(addr.is_ipv6() && addr.ip().is_loopback(), "got: {addr}");
+        let liveness = roundtrip(addr, b"GET / HTTP/1.1\r\n\r\n").await?;
+        assert!(liveness.starts_with("HTTP/1.1 200 OK"), "got: {liveness}");
+        let over_ipv4 = tokio::time::timeout(
+            Duration::from_millis(500),
+            TcpStream::connect((Ipv4Addr::LOCALHOST, addr.port())),
+        )
+        .await;
+        assert!(
+            over_ipv4.ok().and_then(Result::ok).is_none(),
+            "an IPv6 loopback bind must not accept IPv4 connections"
+        );
+        Ok(())
+    }
+
+    /// An explicit IPv4 loopback bind reports the requested address with the assigned port.
+    #[tokio::test]
+    async fn explicit_ipv4_loopback_bind_reports_requested_address() -> eyre::Result<()> {
+        let task_manager = TaskManager::default();
+        let addr = HealthcheckServer::spawn(
+            task_manager.get_spawner(),
+            HealthcheckBind::Explicit((Ipv4Addr::LOCALHOST, 0).into()),
+            || async { Vec::new() },
+            pending_readiness(),
+        )
+        .await?;
+        assert_eq!(addr.ip(), IpAddr::V4(Ipv4Addr::LOCALHOST));
+        assert_ne!(addr.port(), 0);
+        Ok(())
+    }
+
+    /// A bind on an address that is already taken is an error, not a silent skip.
+    #[tokio::test]
+    async fn bind_failure_is_an_error() -> eyre::Result<()> {
+        let taken = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let port = taken.local_addr()?.port();
+        let task_manager = TaskManager::default();
+        let result = HealthcheckServer::spawn(
+            task_manager.get_spawner(),
+            HealthcheckBind::Explicit((Ipv4Addr::LOCALHOST, port).into()),
+            || async { Vec::new() },
+            pending_readiness(),
+        )
+        .await;
+        assert!(result.is_err(), "binding a taken port must fail");
+        Ok(())
+    }
+
+    /// The flag value parses as a bare port (loopback) or an explicit socket address.
+    #[test]
+    fn healthcheck_bind_parses_port_and_socket_forms() -> eyre::Result<()> {
+        let legacy: HealthcheckBind = "8080".parse()?;
+        assert_eq!(legacy, HealthcheckBind::LegacyPort(8080));
+        assert_eq!(legacy.socket_addr(), "127.0.0.1:8080".parse::<std::net::SocketAddr>()?);
+        ["0.0.0.0:8080", "[::1]:8080", "10.10.0.21:8080"].into_iter().try_for_each(
+            |raw| -> eyre::Result<()> {
+                let explicit: HealthcheckBind = raw.parse()?;
+                assert_eq!(explicit, HealthcheckBind::Explicit(raw.parse()?));
+                assert_eq!(explicit.socket_addr(), raw.parse::<std::net::SocketAddr>()?);
+                Ok(())
+            },
+        )?;
+        ["127.0.0.1", "nope", "70000", ""].into_iter().for_each(|raw| {
+            let error = raw.parse::<HealthcheckBind>().err();
+            assert!(
+                error.as_ref().is_some_and(|err| err.to_string().contains(raw)),
+                "{raw:?} must be rejected, got {error:?}"
+            );
+        });
+        Ok(())
     }
 }

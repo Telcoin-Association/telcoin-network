@@ -48,7 +48,8 @@ The chain id in the protocol name means a node on one chain fails negotiation ag
 
 The requester waits 5 seconds for the first response frame.
 A peer that negotiates the protocol but never answers trips that timeout, and the requester moves to the next peer instead of stalling the whole catch-up.
-On the responding side, a peer that opens a stream and never sends its request frame is dropped after 5 seconds, so it cannot hold an admission slot by staying silent.
+On the responding side, a peer that opens a stream and never sends its request frame is dropped after 5 seconds.
+While it waits it holds only an opening-read slot, never a serve slot, and a public-tier peer is charged a mild penalty when the read times out (see [Admission](#admission)).
 
 ## Frame tags
 
@@ -114,7 +115,7 @@ It reports that the responder gave up, which is different from the transport fai
 
 ## Deny is backpressure, not a fault
 
-A responder admits a bounded number of concurrent sync streams: five per role, and at most two in-flight sync streams from any one peer.
+A responder admits a bounded number of concurrent sync streams: each serve class has its own slot pool with a reserve for committee peers, and one peer can hold at most two in-flight sync streams (see [Admission](#admission)).
 Past that it does not drop the stream.
 It writes `Deny(AtCapacity)` and closes.
 
@@ -127,6 +128,31 @@ A node catching up against a busy committee therefore keeps moving instead of se
 The shed path is itself bounded.
 Writing a `Deny` costs a short-lived task, and at most eight of those run at once; beyond that budget the stream is dropped without a `Deny`, and the requester sees a reset and retries elsewhere.
 
+## Admission
+
+A responder admits an inbound sync stream in stages, so a peer that opens streams and stays silent cannot use the slots that serve real requests.
+
+Each peer is in one of two tiers.
+A peer whose BLS key is in the current committee or the next committee is in the committee tier; every other peer is in the public tier.
+The committee keys are captured when the network is built for an epoch.
+
+1. **Per-peer cap.** One peer can hold at most two in-flight sync streams. A third stream is shed.
+2. **Opening read.** The stream takes an opening-read slot while the responder reads the request frame, for at most 5 seconds. There are 8 slots for any peer and 4 more that only committee peers can take. The slot is released when the read ends, or, for a stream that is refused, after the bounded refusal write and close. A stream that never sends a valid request never takes a serve slot.
+3. **Serve.** The request selects its serve class: epoch pack, missing certificates, or consensus output. Each class has its own pool of 5 slots for any peer and 4 more that only committee peers can take, so public peers that fill one class cannot block a committee peer or a different class. A full class answers `Deny(AtCapacity)`.
+
+The worker batch sync stream uses the same tiers, with one pool of 5 slots for any peer and 4 for committee peers.
+
+Each serve is also bounded in time:
+
+- An epoch-pack serve has a 10-second write timeout per frame, a throughput floor of 1 MiB per 30-second window, and a total deadline of 30 seconds for each started MiB of pack plus 30 seconds. A requester that reads at the floor finishes inside the deadline; a 100 MiB pack gets 50.5 minutes.
+- A missing-certificates or consensus-output serve is bounded at 200 seconds in total.
+- A worker batch serve has 5 seconds to write its `Ack` and 30 seconds for each data frame, inside the 200-second total.
+
+A public-tier peer is charged a mild penalty when its opening read times out and when a serve stalls on a write timeout or a missed deadline.
+Committee peers are not charged by admission.
+A mild penalty lowers the peer score by 1.0; the score thresholds are -20.0 for a disconnect and -50.0 for a ban, so, ignoring decay, twenty stalls disconnect a public peer and fifty ban it.
+These admission penalties are enforced, unlike the stream-failure penalties under [Failure classification](#failure-classification).
+
 ## Limits
 
 | Limit | Value | What it bounds |
@@ -137,6 +163,11 @@ Writing a `Deny` costs a short-lived task, and at most eight of those run at onc
 | Stale sweep | 1s | How often expired pending opens are failed and cleared |
 | Inbound streams per peer | 256 per second | Inbound sync streams accepted from one peer per one-second window; the next one is refused |
 | Pending outbound per connection | 256 | Opens buffered by one connection handler before it sheds |
+| In-flight sync streams per peer | 2 | Sync streams one peer can hold on a responder at once |
+| Opening reads | 8 + 4 committee | Streams waiting up to 5s for their request frame |
+| Serve slots per class | 5 + 4 committee | Concurrent serves of each class: epoch pack, missing certificates, consensus output |
+| Worker batch serves | 5 + 4 committee | Concurrent worker batch sync serves |
+| Epoch-pack serve deadline | 30s per started MiB, plus 30s | Total time one epoch-pack serve can take |
 
 The 15-second and 10-second budgets nest: the total open budget covers a dial that may itself have to establish a connection, while the negotiation timeout applies only once a connection exists.
 An open that is dispatch-ready when its peer disconnects is re-queued for dialing rather than handed to a handler that no longer exists.
@@ -159,10 +190,11 @@ InboundRateLimited    medium    abuse of the inbound stream path
 A failed negotiation is not even reported to the behaviour.
 Probing whether a peer speaks the sync protocol is a normal thing to do during a rolling upgrade, and a probe that comes back negative should cost nothing.
 
-**These penalties are classified and logged, not enforced.**
+**These stream-failure penalties are classified and logged, not enforced.**
 Every classified failure produces a log line recording the penalty it would incur, and nothing is applied to the peer's score.
 Enforcement is gated on telemetry confirming the classification does not fire on healthy peers.
-Until it is turned on, a peer cannot be banned by anything on this page — see [Peers](peers.md) for the scoring that is enforced.
+The admission penalties in [Admission](#admission) are different: they are applied to the peer's score.
+Apart from those admission penalties, nothing on this page changes a peer's score; see [Peers](peers.md) for the scoring that is enforced.
 
 ## Source of truth
 
@@ -173,6 +205,8 @@ Until it is turned on, a peer cannot be banned by anything on this page — see 
 | Open budget, stale sweep, inbound rate limit, pending-open cap | `crates/network-libp2p/src/stream/behavior.rs` |
 | Negotiation timeout, per-connection pending cap, error classification | `crates/network-libp2p/src/stream/handler.rs` |
 | Advertised upgrade, failure taxonomy and penalty mapping | `crates/network-libp2p/src/stream/upgrade.rs` |
+| Peer tiers, tiered slot pools, per-peer stream slots | `crates/network-libp2p/src/sync/admission.rs` |
+| Primary sync admission, serve classes, admission penalties | `crates/consensus/primary/src/network/mod.rs` |
 | Penalty reporting (metrics-only, not enforced) | `crates/network-libp2p/src/consensus.rs` (`process_stream_event`) |
 | Sync protocol IDs | `crates/network-libp2p/src/types.rs` (`sync_protocol`) |
 | Shared codec bounds | `crates/network-libp2p/src/codec.rs` |

@@ -312,7 +312,7 @@ telcoin-network node \
 | `--chain`             | none           | Join a named network (`adiri`, `test-net`, `main-net`)                                         |
 | `--instance`          | none           | Instance number (1-200) for port offsetting. See [Multi-instance setup](#multi-instance-setup) |
 | `--metrics`           | none           | Enable Prometheus metrics at this socket address (e.g. `127.0.0.1:9101`)                       |
-| `--healthcheck`       | none           | TCP health check port. Env: `HEALTHCHECK_TCP_PORT`                                             |
+| `--healthcheck`       | none           | Health listener: a port (binds `127.0.0.1`) or a socket address (`[::1]:8080`, `0.0.0.0:8080`). Env: `HEALTHCHECK_TCP_PORT`                                             |
 | `--node-name`         | auto-generated | Name for OpenTelemetry service identification                                                  |
 | `--tracing-url`       | none           | OpenTelemetry collector URL (e.g. `http://192.168.1.2:4317`). Env: `TN_TRACING_URL`            |
 | `--with-unused-ports` | `false`        | Let the OS assign all ports (mutually exclusive with `--instance`)                             |
@@ -348,7 +348,7 @@ Default data directory by platform:
 | `TN_EXTERNAL_PRIMARY_ADDR` | keytool generate | External multiaddr for primary P2P                         |
 | `TN_EXTERNAL_WORKER_ADDRS` | keytool generate | External multiaddrs for worker P2P (comma-separated)       |
 | `TN_TRACING_URL`           | node             | OpenTelemetry collector endpoint                           |
-| `HEALTHCHECK_TCP_PORT`     | node             | TCP health check port                                      |
+| `HEALTHCHECK_TCP_PORT`     | node             | Health listener bind: port or socket address (same as `--healthcheck`)                                      |
 | `RUST_LOG`                 | all              | Standard Rust log filter directive (e.g. `info,evm=debug`) |
 
 ## Data directory layout
@@ -492,7 +492,8 @@ Inbound (must be open; the P2P rows use the conventional ports, so substitute th
 | 49594 | UDP      | Worker consensus P2P                                          |
 | 8545  | TCP      | HTTP RPC (if enabled; restrict to trusted sources)            |
 | 8546  | TCP      | WebSocket RPC (if enabled; restrict to trusted sources)       |
-| 9101  | TCP      | Prometheus metrics (if enabled; restrict to monitoring infra) |
+| 9101  | TCP      | Prometheus metrics (if enabled; bind loopback or a private interface, see [Private observability listeners](../../docs/src/getting-started/observability-listeners.md)) |
+| 8080  | TCP      | Health check (if enabled; bind loopback or a private interface)   |
 
 Outbound: Unrestricted UDP for QUIC connections to peers.
 
@@ -693,10 +694,10 @@ Traces are exported every 30 seconds. Only spans with targets prefixed `telcoin`
 Enable a TCP health check for load balancers and monitoring:
 
 ```bash
-telcoin-network node --healthcheck 8080
+telcoin-network node --healthcheck 127.0.0.1:8080
 ```
 
-The endpoint binds to `0.0.0.0` on the specified port and serves three HTTP routes before closing each connection:
+A bare port binds `127.0.0.1`; a socket address binds that interface; `0.0.0.0:<port>` must be written out to listen on every interface. Startup logs `operator listener bound` with the address and its reach. The endpoint serves three HTTP routes before closing each connection:
 
 | Request path | Response | Meaning |
 | --- | --- | --- |
@@ -707,7 +708,16 @@ The endpoint binds to `0.0.0.0` on the specified port and serves three HTTP rout
 Network reachability is sampled every five seconds with bounded probes and served from a cache; it can recover after peers become reachable without restarting the node.
 It does not certify consensus or synchronization readiness, and is separate from transaction acceptance.
 
-Warning: This endpoint accepts connections from any source, exposes established-peer counts, and has no connection limits or rate limiting. Place it behind a firewall and do not expose it to the public internet.
+Warning: This endpoint has no connection limits or rate limiting and exposes established-peer counts. Keep the bind private (loopback or an operator-selected interface); a firewall is defense in depth.
+
+Migration from the port-only flag:
+
+| Before | After |
+| --- | --- |
+| `--healthcheck 8080` or `HEALTHCHECK_TCP_PORT=8080` bound `0.0.0.0:8080` | Still accepted; binds `127.0.0.1:8080` |
+| Probes from another host or the kubelet reached the wildcard bind | Refused; write `--healthcheck 0.0.0.0:8080` or the node's private address |
+
+See [Private observability listeners](../../docs/src/getting-started/observability-listeners.md) for the full migration table and deployment examples.
 
 ### Log verbosity
 
@@ -790,6 +800,8 @@ docker compose up
 ```
 
 Validators are accessible on host ports 8545-8542 (mapped from container port 8545).
+
+Health and metrics bind each validator's compose-network address (`10.10.0.2N:8080`, `10.10.0.2N:9101`) and are not published to the host. `compose.observability.yaml` adds a Prometheus scraper on that network; see [Private observability listeners](../../docs/src/getting-started/observability-listeners.md).
 
 ## Staking registration
 
@@ -900,8 +912,8 @@ chmod 600 /var/lib/telcoin/node-keys/*
 ### Network security
 
 - RPC endpoints: Bind to `127.0.0.1` (the default) unless you need external access. If exposing RPC, use a reverse proxy with authentication and rate limiting. The endpoint a validator advertises is the exception: observers call it without credentials, so serve it over HTTPS with rate limiting only (see [Advertising a JSON-RPC endpoint](#advertising-a-json-rpc-endpoint)).
-- Health check: The `--healthcheck` endpoint has no rate limiting (see [Health check endpoint](#health-check-endpoint)). Keep it behind a firewall.
-- Metrics: Restrict Prometheus metrics to your monitoring infrastructure. Do not expose port 9101 publicly.
+- Health check: Bind `--healthcheck` to loopback or a private interface (`--healthcheck 127.0.0.1:8080`); the endpoint has no rate limiting (see [Health check endpoint](#health-check-endpoint)).
+- Metrics: Bind `--metrics` to loopback or a private interface and restrict it to your monitoring infrastructure. Never publish port 9101 on a public interface.
 - P2P ports: the primary and worker UDP ports from `node-info.yaml` (49590 and 49594 by convention) must be reachable by other validators. All other ports should be firewalled.
 
 ### Proof of possession
