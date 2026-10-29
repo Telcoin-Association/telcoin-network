@@ -183,14 +183,15 @@ Nothing stops either route beforehand.
 `Swatinem/rust-cache` does not save the workspace crates or their test binaries, so each PR still builds those from its own source.
 The lanes in `pr.yaml` restore those and never save (`save-if: "false"`): a cache saved by a `pull_request` run is scoped to that PR's branch and one saved by a `merge_group` run lands on the queue's throwaway branch, so nothing else could ever read them, while the upload adds minutes to the critical path and eats quota that evicts the entries the queue does read.
 `main-compiles.yaml` restores the same two entries and never saves either, although it runs on `main` and could: it is outside the `cache-deps` concurrency group, so on a `Cargo.lock` push it would race the warm to save the same key, and `cache-deps.yaml` stays the single writer.
-Six workflows name `clippy-cache`: `cache-deps.yaml` writes it, and `pr.yaml`, `main-compiles.yaml`, `quic-observations.yaml`, `consensus-liveness.yaml` and `committee-convergence.yaml` restore it.
-The last three set `env:` blocks that differ from the warm's, and those variables are hashed into the key (below), so their restores miss.
+Three workflows name `clippy-cache`: `cache-deps.yaml` writes it, and `pr.yaml` and `main-compiles.yaml` restore it.
+`test-cache` has four more readers: the `metrics` job in `quic-observations.yaml`, the `regression` job in `consensus-liveness.yaml` and both jobs in `committee-convergence.yaml`.
+All four run with `env:` blocks that differ from the warm's (`consensus-liveness.yaml` sets none), and those variables are hashed into the key (below), so their restores miss.
 The rust-cache step in `quic-interop.yaml` keys its own `quic-<release>` entries and saves them only on `main` (`save-if: ${{ github.ref == 'refs/heads/main' }}`, so the weekly schedule or a dispatch there), for the same reason.
 
 A warm runs on a push to `main` that touches a `Cargo.toml`, `Cargo.lock`, `rust-toolchain.toml`, `rust-nightly`, `.cargo/config.toml`, `etc/ci-lanes.sh` or the workflow itself; on a schedule twice a week (GitHub deletes an entry not accessed for seven days, and a quiet week would otherwise leave the queue cold); and by hand from the Actions tab (*Warm dependency cache* -> *Run workflow*).
 When the entry already matches, the run restores it, rebuilds only the workspace crates, saves nothing, and is done in a few minutes.
 
-All seventeen cache steps pin the same `Swatinem/rust-cache` release: two in `cache-deps.yaml`, three in `pr.yaml`, two in `main-compiles.yaml`, three in `quic-observations.yaml`, two each in `consensus-liveness.yaml` and `committee-convergence.yaml`, and one each in `durable-e2e.yaml`, `sigkill-recovery.yaml` and `quic-interop.yaml`.
+All fifteen cache steps pin the same `Swatinem/rust-cache` release: two in `cache-deps.yaml`, three in `pr.yaml`, two in `main-compiles.yaml`, two each in `quic-observations.yaml` and `committee-convergence.yaml`, and one each in `consensus-liveness.yaml`, `durable-e2e.yaml`, `sigkill-recovery.yaml` and `quic-interop.yaml`.
 Three of its properties shape all of this.
 They were checked against v2.9.2, and a later release can change them; the third is about a release that changes the key:
 

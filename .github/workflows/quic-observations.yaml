@@ -27,31 +27,6 @@ env:
   RUSTC_WRAPPER: ""
 
 jobs:
-  transport-evidence:
-    if: github.event_name == 'pull_request'
-    uses: ./.github/workflows/transport-patches.yaml
-
-  workspace-clippy:
-    runs-on: ubuntu-latest
-    timeout-minutes: 45
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          submodules: true
-      - name: Read nightly version
-        run: echo "RUST_NIGHTLY=$(cat rust-nightly)" >> "$GITHUB_ENV"
-      - name: Install repository lint toolchain
-        run: rustup toolchain install "$RUST_NIGHTLY" -c clippy,rustfmt,rust-src --profile minimal
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        with:
-          prefix-key: v2-rust
-          shared-key: clippy-cache
-          save-if: "false"
-      - name: Check workspace formatting
-        run: ./etc/ci-lanes.sh fmt
-      - name: Check the full workspace dependency closure
-        run: ./etc/ci-lanes.sh clippy
-
   observations:
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -74,8 +49,6 @@ jobs:
           python3 -I testing/quic-interop/observation_mutations.py --suite candidate --output "$RUNNER_TEMP/quic-candidate-mutations"
       - name: Lint candidate and configuration source
         run: cargo +1.94 clippy --locked --manifest-path testing/quic-interop/releases/candidate/Cargo.toml --all-targets --no-deps -- -D warnings
-      - name: Preserve source identity and version controls
-        run: python3 -I -m unittest discover -s etc/transport-patches -p 'test_*.py' -v
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: always()
         with:

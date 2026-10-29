@@ -19,27 +19,6 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  lint:
-    runs-on: ubuntu-latest
-    timeout-minutes: 45
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          submodules: true
-      - name: Read nightly version
-        run: echo "RUST_NIGHTLY=$(cat rust-nightly)" >> "$GITHUB_ENV"
-      - name: Install nightly
-        run: rustup toolchain install "$RUST_NIGHTLY" -c clippy,rustfmt,rust-src --profile minimal
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        with:
-          prefix-key: v2-rust
-          shared-key: clippy-cache
-          save-if: "false"
-      - name: Check formatting and both workspace clippy lanes
-        run: |
-          ./etc/ci-lanes.sh fmt
-          ./etc/ci-lanes.sh clippy
-
   regression:
     runs-on: ubuntu-latest
     timeout-minutes: 45

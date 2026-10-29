@@ -20,7 +20,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        lane: [fmt, clippy, test-default, test-adiri]
+        lane: [test-default, test-adiri]
     env:
       CARGO_INCREMENTAL: "0"
       RUSTFLAGS: "-D warnings -D unused_extern_crates"
@@ -32,18 +32,13 @@ jobs:
           submodules: true
       - name: Install pinned Rust toolchain
         run: rustup show active-toolchain || rustup toolchain install
-      - name: Install pinned nightly tools
-        if: matrix.lane == 'fmt' || matrix.lane == 'clippy'
-        run: rustup toolchain install "$(cat rust-nightly)" -c rustfmt,clippy,rust-src --profile minimal
       - uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0
-        if: startsWith(matrix.lane, 'test-')
         with:
           tool: cargo-nextest
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
-        if: matrix.lane != 'fmt'
         with:
-          prefix-key: ${{ matrix.lane == 'clippy' && 'v2-rust' || 'v1-rust' }}
-          shared-key: ${{ matrix.lane == 'clippy' && 'clippy-cache' || 'test-cache' }}
+          prefix-key: v1-rust
+          shared-key: test-cache
           save-if: "false"
       - name: Run existing workspace CI lane
         run: ./etc/ci-lanes.sh ${{ matrix.lane }}
