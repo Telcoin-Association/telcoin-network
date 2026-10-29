@@ -1,10 +1,20 @@
 name: QUIC release interoperability
 
+# Not in the merge queue: nothing here is behind `CI Success`, so a queue run gated nothing
+# and started 14 jobs per entry. The weekly schedule keeps covering main.
 on:
   pull_request:
     branches: [main, 'staging/**']
-  merge_group:
-    types: [checks_requested]
+    # run.py compares the fixtures' lockfiles with the root Cargo.lock, the candidate builds
+    # the carried crates in patches/, the builds use the rust-toolchain.toml pin and the
+    # format job the rust-nightly one.
+    paths:
+      - 'testing/quic-interop/**'
+      - 'patches/**'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+      - 'rust-nightly'
+      - '.github/workflows/quic-interop.yaml'
   workflow_dispatch:
   schedule:
     - cron: "23 6 * * 1"
@@ -13,7 +23,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: quic-interop-${{ github.event.merge_group.head_ref || github.head_ref || github.run_id }}
+  group: quic-interop-${{ github.head_ref || github.run_id }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
@@ -45,7 +55,7 @@ jobs:
         run: |
           rustup show active-toolchain
           rustup component add clippy
-      # Saves only on main (the weekly schedule or a dispatch); PR and queue runs restore.
+      # Saves only on main (the weekly schedule or a dispatch); PR runs restore.
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: testing/quic-interop/releases/${{ matrix.release }}

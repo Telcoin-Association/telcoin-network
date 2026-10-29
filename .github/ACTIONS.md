@@ -124,7 +124,8 @@ In order of importance:
    would satisfy it; keep the name unique to `pr.yaml`.
 2. **Merge queue.** Merge method `SQUASH` (already set).
    Recommended, and not yet set: a build concurrency of **2** (the ruleset has 5).
-   `pr.yaml` reports twelve jobs, counting `CI Success` and the reusable transport workflow's `transport-evidence / qualify`, and eleven of them run in a merge group, where `verify-on-chain` is skipped; five groups is about 55 concurrent jobs queueing behind the organization's runner concurrency.
+   `pr.yaml` is the only workflow that runs on `merge_group`, so a queue entry starts its jobs and nothing else.
+   It reports twelve jobs, counting `CI Success` and the reusable transport workflow's `transport-evidence / qualify`, and eleven of them run in a merge group, where `verify-on-chain` is skipped; five groups is about 55 concurrent jobs queueing behind the organization's runner concurrency.
    And a status check timeout of **90 minutes** (it is 60): it counts from the group's creation, runner backlog included, so 60 can eject a lane that took 45 after queueing for 15.
 3. **Pull request rule.** One approval is required. *Dismiss stale pull request approvals
    when new commits are pushed* (already set) is, together with (1), what makes a late push

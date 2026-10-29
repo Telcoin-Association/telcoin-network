@@ -479,9 +479,10 @@ jobs:
   # refuses to measure when the two disagree, but the workflow that runs it is not behind
   # `CI Success`: #1462 moved those crates in the merge group right after #1451 added the
   # profile, the profile workflow failed there, and the queue merged it anyway. This lane makes
-  # the drift itself block the merge. Like transport evidence it runs for every author and on
-  # every change, not only on Cargo.lock: the merge group is where two such changes first meet,
-  # and the attested local suite does not run it.
+  # the drift itself block the merge. The profile workflow no longer runs in the queue at all,
+  # so there this lane is the only guard of the drift. Like transport evidence it runs for every
+  # author and on every change, not only on Cargo.lock: the merge group is where two such
+  # changes first meet, and the attested local suite does not run it.
   # Parses two lockfiles and the profile's Cargo.toml - nothing is resolved or compiled, so no
   # toolchain or cache is needed.
   quic-profile-pins:

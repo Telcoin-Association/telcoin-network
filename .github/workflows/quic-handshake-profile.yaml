@@ -6,7 +6,6 @@ on:
       - 'testing/quic-handshake/**'
       - 'Cargo.lock'
       - '.github/workflows/quic-handshake-profile.yaml'
-  merge_group:
   workflow_dispatch:
 
 permissions:
