@@ -303,14 +303,15 @@ jobs:
   # runs for every author on both events, drafts included. The passes unify features
   # differently, so each compiles its own artifacts; cache-deps.yaml warms both.
   #
-  # 45 minutes is a ceiling, not the budget. Cold, the three-pass lane this replaced
-  # compiled for 16.5 min (7m32s, 1m15s and 7m19s; librocksdb-sys under --all-features is
-  # the long pole), and the two-pass lane has not been timed in CI yet. The warm figures
-  # were measured when the lane compiled libraries only: the --all-features pass compiled
-  # in 20 s on main (checkout with submodules ~80 s, restore ~20 s). The ceiling covers the
-  # window after a heavy dependency bump before cache-deps has re-warmed: 11.5 min measured
-  # for one library-only pass with a partial cache. A lane anywhere near 45 min means the
-  # cache is broken, not that the build is slow.
+  # 45 minutes is a ceiling, not the budget. Cold, with no cache entry to restore, the two
+  # passes took 10 m 21 s on 2026-10-29 (5 m 21 s for the release graph, 5 m 00 s for every
+  # target under --all-features; the job 10 m 44 s). The three-pass lane this replaced took
+  # 16.5 min cold (7m32s, 1m15s and 7m19s; librocksdb-sys under --all-features is the long
+  # pole). The warm figures were measured when the lane compiled libraries only: the
+  # --all-features pass compiled in 20 s on main (checkout with submodules ~80 s, restore
+  # ~20 s). The ceiling covers the window after a heavy dependency bump before cache-deps
+  # has re-warmed: 11.5 min measured for one library-only pass with a partial cache. A lane
+  # anywhere near 45 min means the cache is broken, not that the build is slow.
   clippy:
     runs-on: ubuntu-latest
     timeout-minutes: 45

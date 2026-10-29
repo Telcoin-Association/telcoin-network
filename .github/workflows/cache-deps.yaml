@@ -131,9 +131,10 @@ jobs:
   # `fmt-clippy` job.
   warm-clippy-cache:
     runs-on: ubuntu-latest
-    # Both passes from cold, after a heavy dependency bump or a prefix-key bump. The
-    # three-pass lane this replaced took 16.5 min cold, and one library-only pass 11.5 min
-    # with a partial cache; the two-pass lane has not been timed in CI.
+    # Both passes from cold, after a heavy dependency bump or a prefix-key bump: 10 m 21 s
+    # with no entry to restore (2026-10-29; 5 m 21 s release graph, 5 m 00 s all targets
+    # under --all-features). The three-pass lane this replaced took 16.5 min cold, and one
+    # library-only pass 11.5 min with a partial cache.
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

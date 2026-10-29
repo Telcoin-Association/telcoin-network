@@ -238,10 +238,11 @@ They were checked against v2.9.2, and a later release can change them; the third
 
 Warm timings measured on `main`: the `--all-features` clippy pass compiles in about 20 s, all workspace test binaries build in 1 m 48 s, checkout with submodules takes about 80 s and the restore about 20 s.
 After a heavy dependency bump, with only a partial cache to fall back on, clippy took 11.5 min and the test build 9.5 min.
-Those clippy figures, and the 2026-09-30 cold one below, were measured when the lane compiled libraries only, before it gained `--all-targets`; until the two-pass lane is timed, read them as lower bounds.
+Those clippy figures, and the 2026-09-30 cold one below, were measured when the lane compiled libraries only, before it gained `--all-targets`.
 The lane ceilings in `pr.yaml` (`timeout-minutes: 45`) are set from the second set of numbers, not the first; a lane anywhere near 45 minutes means the cache is broken.
 The lanes have been timed from a cold cache once, on 2026-09-30, with every restore missing: `clippy` took 10.5 min, `test` 14 min and `adiri-test` 12 min, start to finish, tests included.
 The clippy lane has been timed cold once since, in the three-pass form that came before the current two passes: it compiled for 16.5 min (7m32s, 1m15s and 7m19s; `librocksdb-sys` under `--all-features` is the long pole).
+The two-pass lane was timed cold on 2026-10-29, with no entry to restore: 10 m 21 s, 5 m 21 s for the release graph and 5 m 00 s for every target under `--all-features`, in a `clippy` job of 10 m 44 s.
 The warm of 2026-08-28, whose test cache step restored nothing, built the test binaries of both lanes in about 15 minutes.
 Each `Cargo.lock` change on `main` writes a new generation of every entry, and GitHub would keep the previous one until it went 7 days without a restore, or evict the least recently used entries once the total passed the quota, which can take a live one with it.
 The `prune-caches` job in `cache-deps.yaml` deletes those superseded generations of the three entries after every successful warm on `main`.
