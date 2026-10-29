@@ -42,7 +42,8 @@ pub use consensus::ConsensusNetwork;
 pub use gossip_config::gossipsub_config;
 pub use metrics::AdmissionShed;
 pub use peers::{
-    AdmissionFallback, AdmissionStatus, CommitteeUpdate, LoadPenalty, PeerExchangeMap, Penalty,
+    AdmissionFallback, AdmissionStatus, CommitteeUpdate, LoadPenalty, PeerExchangeKey,
+    PeerExchangeMap, Penalty, MAX_PEER_EXCHANGE_ADDRS_PER_PEER, MAX_PEER_EXCHANGE_ENTRIES,
 };
 pub use serve_permits::{ServePermit, ServePermits, MAX_PERMITS_PER_PEER};
 pub use service_class::ServiceClass;
@@ -52,7 +53,7 @@ pub use sync::{
     ReservedPeers, ReservedPool, SyncFrame, SyncFrameError, WorkerSyncRequest,
 };
 pub use tn_node_record::{validate_advertised_addresses, MAX_ADVERTISED_MULTIADDRS};
-pub use types::ResponseChannel;
+pub use types::{EpochPosition, ResponseChannel};
 
 // re-export specific libp2p types
 pub use libp2p::{

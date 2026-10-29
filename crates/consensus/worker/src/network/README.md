@@ -74,14 +74,17 @@ Req(Batches{digests, epoch})  ──►
 ```
 
 Instead of `Ack`, a responder that is shedding load writes `Deny(DenyReason::AtCapacity)` and closes
-without reading, so the requester gives up on that peer immediately and tries another. A serve that
-fails partway (storage or encoding error) is terminated with `Err(SyncFrameError::Internal)`, and a
+without reading, so the requester gives up on that peer immediately and tries another. A responder
+serves only its own epoch and the previous one. A `Req` for any other epoch is answered with
+`Deny(DenyReason::Unavailable)` before the `Ack` and before any storage read. A serve that fails
+partway (storage or encoding error) is terminated with `Err(SyncFrameError::Internal)`, and a
 malformed opening frame is answered with `Err(SyncFrameError::Malformed)`.
 
 Each batch is one [`SyncFrame::Data`] frame carrying the BCS-encoded batch. The stream is delimited
-by the terminating `End` frame; there is no on-wire batch count. The responder reads batches from the
-database in chunks of `BATCH_DIGESTS_READ_CHUNK_SIZE` (200) to bound the working set of a single
-serve — this is a database-read batching detail, not a wire-visible framing.
+by the terminating `End` frame; there is no on-wire batch count. The responder reads one batch at a
+time and drops it before the next read, and it flushes every `SYNC_SERVE_FLUSH_INTERVAL` (200)
+batches. A single serve holds at most one batch plus two reusable frame buffers, sized from the
+node's own epoch. This is a read and flush detail, not a wire-visible framing.
 
 ### Frame Wire Format
 
@@ -124,6 +127,10 @@ When a worker needs batches it doesn't have locally, `request_batches()` tries c
 one at a time. If a peer is unavailable (it sheds with `Deny`, or a transient stream error occurs),
 the next peer is tried.
 
+Peer order: `connected_peers()` returns current-committee members first. When the caller names a
+preferred authority (the vote-path `synchronize` passes the header author), that peer is tried
+first, because it is the peer most likely to hold the batches.
+
 If **all** peers fail a single pass, the method retries up to `MAX_BATCH_REQUEST_RETRIES` (3)
 times through the full peer list, with a `BATCH_REQUEST_RETRY_DELAY` (500ms) pause between
 attempts. This gives peer capacity time to free up.
@@ -136,13 +143,23 @@ Attempt 2: peer_a → Ack → batches received → return Ok
 
 Key behaviors:
 - **Re-fetches peers** each attempt to pick up newly connected nodes.
+- **Skips failed peers**: a peer that answers `Deny` stays eligible for later passes. A peer that
+  fails in any other way (open error, unsupported protocol, write or read timeout, protocol error)
+  is not tried again in the same call.
 - **Returns immediately** on any partial success (at least one batch received).
 - **Accumulates batches** across retries — digests fulfilled on earlier attempts are removed.
+- **Bounded in total**: the whole call runs under `BATCH_REQUEST_TOTAL_TIMEOUT` (480s). On expiry
+  it returns the batches fetched so far, or `NetworkError::Timeout` if none were fetched.
 - **Returns `RPCError`** only after all retries are exhausted with zero batches.
 
 A transient post-negotiation failure (a slow but sync-capable peer) is classified as a retryable
 failure rather than an "unsupported" verdict, so a momentarily-slow peer is not cached as unusable
 for the rest of the epoch.
+
+Each exchange is bounded step by step: the request write and flush by `SYNC_REQUEST_WRITE_TIMEOUT`
+(5s), the `Ack`/`Deny` read by `SYNC_ACK_TIMEOUT` (5s), and the data read by
+`BATCH_STREAM_TOTAL_TIMEOUT` (210s). A peer that negotiates the sync protocol and then never reads
+the request cannot hold the requester.
 
 ## Security Measures
 

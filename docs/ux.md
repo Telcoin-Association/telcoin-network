@@ -11,30 +11,6 @@ without an entry change, that is a bug.
 Behaviors are grouped by area. Commit hashes refer to the history of the
 branch that introduced the docs and its successors.
 
-## Versioning
-
-- **Version picker.** The header's right-button cluster contains a version
-  pill immediately after the theme switch. It shows the version the current
-  build lives under and opens a dropdown of all published versions. `latest`
-  is always listed first and is the default: it is the build of `main`,
-  served at the site root. Tagged versions (`v*` tags whose tree contains
-  `docs/book.toml`) are served under `/<tag>/` and listed newest-first from
-  `versions.json`, which CI writes at the site root on every deploy.
-- **Same-page switching.** Switching versions keeps the reader on the page
-  they were reading when the target version has it (checked with a HEAD
-  request; the `#fragment` is preserved).
-- **Missing-page fallback.** If the target version does not have the page,
-  the reader lands on that version's start page with a notice explaining
-  that the requested page is not available in this version. The requested
-  page is remembered for the session: switching to a version that does have
-  it returns the reader to that page. Navigating anywhere else drops the
-  remembered page — from then on, switching follows the current page again.
-- **Old-version banner.** Every page of a non-latest version shows a banner
-  ("You are viewing documentation for vX.Y.Z") with a link that switches to
-  latest using the same same-page-with-fallback rules.
-- **Local builds.** `mdbook build`/`serve` have no `versions.json`; the
-  picker degrades to showing only the current version and nothing errors.
-
 ## Header
 
 - **Logo.** The wordmark swaps with the theme: `tn-light.svg` on light,
@@ -44,8 +20,8 @@ branch that introduced the docs and its successors.
   header too much for the wordmark. All logo art is SVG. (c513775b,
   61b30594, 52558404)
 - **Desktop-only chrome.** The print, repository, and edit links hide below
-  768px; the search pill collapses to its icon. The theme switch and the
-  version pill always remain. (c513775b)
+  768px; the search pill collapses to its icon.
+  The theme switch always remains. (c513775b)
 - **Search.** The search pill shows a ⌘K hint and opens a floating centered
   panel; `⌘K`/`Ctrl+K` and `/`/`s` all open it. (c513775b)
 - **Theme switch.** A three-way Light / System / Dark pill relays clicks to
@@ -76,7 +52,7 @@ branch that introduced the docs and its successors.
   a TN-EDIT to index.hbs) adds Open Graph and Twitter card tags. The card is
   `assets/og-image.png` (1200x630, badge centered on the navy ground).
   Scrapers ignore relative image URLs and mdBook exposes no site origin to
-  templates, so head.hbs points every version at
+  templates, so head.hbs points every page at
   `https://docs.telcoin.network/assets/og-image.png`.
 
 ## Sidebar
@@ -106,3 +82,13 @@ branch that introduced the docs and its successors.
   last heading. (c513775b)
 - **Sticky header clearance.** Page titles are never hidden under the
   sticky header on load or on anchor jumps. (c513775b)
+
+## Publishing
+
+- **Main only.** CI builds `main` and publishes it at the site root.
+  There are no tag builds and no version picker.
+  Pages that tag builds used to serve under `/vX.Y.Z-adiri/` now return 404.
+  Reintroducing versioned docs requires changing this entry in the same PR.
+- **Release notes.** `getting-started/release-notes.md` includes the repository's `CHANGELOG.md` from its `releases` anchor.
+  A push that changes `CHANGELOG.md` rebuilds the site.
+  The docs workflow fails if the anchor is missing or the include is left unresolved in the rendered page.

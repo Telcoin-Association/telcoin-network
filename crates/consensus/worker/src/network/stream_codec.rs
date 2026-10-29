@@ -6,23 +6,23 @@
 //! To start stream, peers exchange `B256` (32-byte) digest at the
 //! beginning of the stream.
 
-use crate::batch_fetcher::get_batches_local;
+use crate::batch_fetcher::get_batch_local;
 
 use super::error::WorkerNetworkResult;
 use futures::{AsyncWrite, AsyncWriteExt};
 use std::{collections::BTreeSet, future::Future, time::Duration};
 use tn_network_libp2p::{write_frame, SyncFrame, WorkerSyncRequest};
 use tn_storage::consensus::ConsensusChain;
-use tn_types::{encode, max_batch_size, Database, Epoch, B256};
+use tn_types::{encode, Database, Epoch, B256};
 // `Batch` is only named by the test-only `write_batch` encoder below.
 #[cfg(any(test, feature = "test-utils"))]
 use tn_types::Batch;
 
-/// Max number of batch digests per chunk.
-/// Batch db reads are chunked to limit the amount of batches in memory.
+/// Number of digests served between stream flushes.
 ///
-/// SAFETY: current max batch size is 1MB.
-pub(crate) const BATCH_DIGESTS_READ_CHUNK_SIZE: usize = 200;
+/// The responder reads one batch at a time (#1718), so this sets only the flush
+/// cadence, not how many batches are held in memory.
+pub(crate) const SYNC_SERVE_FLUSH_INTERVAL: usize = 200;
 
 /// Write a single batch as length-prefixed, snappy-compressed data.
 ///
@@ -40,7 +40,7 @@ pub(crate) async fn write_batch<T>(
 where
     T: AsyncWrite + Unpin + Send,
 {
-    let max_batch_size = max_batch_size(epoch);
+    let max_batch_size = tn_types::max_batch_size(epoch);
     tn_network_libp2p::encode_message(io, batch, encode_buffer, compressed_buffer, max_batch_size)
         .await?;
     Ok(())
@@ -49,9 +49,14 @@ where
 /// Serve an accepted sync batch exchange over `stream`.
 ///
 /// Writes a [`SyncFrame::Ack`], then one [`SyncFrame::Data`] frame per batch
-/// found in storage (looked up in chunks), terminated by a [`SyncFrame::End`].
-/// Each `Data` payload is the BCS-encoded [`Batch`]; the frame layer adds its own
-/// length prefix and compression, bounded by `max_frame`.
+/// found in storage, terminated by a [`SyncFrame::End`]. Each `Data` payload is
+/// the BCS-encoded [`Batch`]; the frame layer adds its own length prefix and
+/// compression, bounded by `max_frame`.
+///
+/// Batches are read one at a time, and each batch is dropped before the next
+/// read. A requester that stops reading pins at most one encoded batch plus the
+/// two reusable frame buffers (#1718). The stream is flushed every
+/// [`SYNC_SERVE_FLUSH_INTERVAL`] digests.
 ///
 /// Every write has its own time limit, so a peer that stops reading cannot hold
 /// the caller's batch-serve permit until the whole-stream limit. The `Ack` write
@@ -62,7 +67,10 @@ where
 ///
 /// Only batches present in storage are streamed, so a requester tolerant of
 /// partial results fetches the rest elsewhere. The caller has already admitted the
-/// exchange against the concurrency caps and read the opening request frame.
+/// exchange against the concurrency caps, read the opening request frame, and
+/// checked that `epoch` (the request epoch) is inside the node's serve window.
+/// `epoch` only selects the epoch pack read on a cache miss. `max_frame` is the
+/// node's own frame limit and sizes the reusable buffers.
 pub(crate) async fn send_sync_batches_over_stream<DB, S>(
     stream: &mut S,
     store: &DB,
@@ -76,32 +84,41 @@ where
     DB: Database,
     S: AsyncWrite + Unpin + Send,
 {
-    let max_size = max_batch_size(epoch);
-
-    // reusable buffers for the frame layer
-    let mut encode_buffer = Vec::with_capacity(max_size);
-    let mut compressed_buffer = Vec::with_capacity(snap::raw::max_compress_len(max_size));
+    // reusable buffers for the frame layer, sized from the node's own frame limit
+    let mut encode_buffer = Vec::with_capacity(max_frame);
+    let mut compressed_buffer = Vec::with_capacity(snap::raw::max_compress_len(max_frame));
 
     // accept the exchange before streaming any data, flushing so the requester
     // receives the `Ack` within its ack timeout even when the first chunk's DB
     // reads are slow or no batches match (an empty response flushes only at `End`)
     write_ack_frame_bounded(stream, max_frame, crate::network::SYNC_REQUEST_READ_TIMEOUT).await?;
 
-    // stream each found batch as its own Data frame (chunked DB reads)
+    // stream each found batch as its own Data frame, reading one batch at a time
+    // so a requester that stops reading pins at most one batch (#1718)
     let digests: Vec<_> = batch_digests.iter().copied().collect();
-    for chunk in digests.chunks(BATCH_DIGESTS_READ_CHUNK_SIZE) {
-        let batches: Vec<_> = get_batches_local(epoch, chunk, store, consensus_chain).await?;
-        for batch in &batches {
-            let frame = SyncFrame::<WorkerSyncRequest>::Data(encode(batch));
-            bounded_write(
-                frame_bound,
-                "timeout writing sync data frame",
-                write_frame(stream, &frame, &mut encode_buffer, &mut compressed_buffer, max_frame),
-            )
-            .await?;
+    for chunk in digests.chunks(SYNC_SERVE_FLUSH_INTERVAL) {
+        for digest in chunk {
+            // encode, then drop the batch, so only its frame payload stays resident
+            let frame = get_batch_local(epoch, *digest, store, consensus_chain)
+                .await?
+                .map(|batch| SyncFrame::<WorkerSyncRequest>::Data(encode(&batch)));
+            if let Some(frame) = frame {
+                bounded_write(
+                    frame_bound,
+                    "timeout writing sync data frame",
+                    write_frame(
+                        stream,
+                        &frame,
+                        &mut encode_buffer,
+                        &mut compressed_buffer,
+                        max_frame,
+                    ),
+                )
+                .await?;
+            }
         }
 
-        // flush per chunk, bounded like each frame write
+        // flush once per interval, bounded like each frame write
         bounded_write(frame_bound, "timeout flushing sync data chunk", stream.flush()).await?;
     }
 
@@ -170,6 +187,7 @@ where
 #[cfg(test)]
 mod tests {
     use crate::{
+        batch_fetcher::get_batches_local,
         network::{
             error::WorkerNetworkError, handler::SEND_STREAM_FRAME_TIMEOUT, SyncServeOutcome,
         },
@@ -392,11 +410,12 @@ mod tests {
             .expect("synchronize must find evicted batches locally, without a network request");
     }
 
-    /// Multi-chunk sync serve (>200 batches): the responder emits one Data frame
-    /// per batch across chunk boundaries and the requester reassembles them all.
+    /// Sync serve past one flush interval (>200 batches): the responder emits one
+    /// Data frame per batch across flush boundaries and the requester reassembles
+    /// them all.
     #[tokio::test]
     async fn test_send_receive_sync_multi_chunk() {
-        let batch_count = BATCH_DIGESTS_READ_CHUNK_SIZE + 50;
+        let batch_count = SYNC_SERVE_FLUSH_INTERVAL + 50;
         let batches = create_test_batches(batch_count);
         let db = setup_batch_db(&batches);
         let temp_dir = TempDir::new().expect("tempdir");
@@ -431,6 +450,118 @@ mod tests {
         assert_eq!(result.len(), batch_count);
         let received: BTreeSet<B256> = result.iter().map(|(d, _)| *d).collect();
         assert_eq!(received, digests);
+    }
+
+    /// A writer that keeps every byte and, on the first byte written after the
+    /// opening `Ack`, evicts every requested batch from `NodeBatchesCache`.
+    struct EvictingWriter {
+        /// Every byte written so far.
+        bytes: Vec<u8>,
+        /// A clone of the store the responder reads, so the eviction is visible to it.
+        db: tn_storage::mem_db::MemDatabase,
+        /// The digests to evict.
+        digests: Vec<B256>,
+        /// Byte length of the opening `Ack` frame.
+        ack_len: usize,
+        /// Whether the eviction has run.
+        evicted: bool,
+    }
+
+    impl futures::io::AsyncWrite for EvictingWriter {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            let this = self.get_mut();
+            this.bytes.extend_from_slice(buf);
+            if !this.evicted && this.bytes.len() > this.ack_len {
+                this.digests.iter().for_each(|digest| {
+                    this.db
+                        .remove::<tn_storage::tables::NodeBatchesCache>(digest)
+                        .expect("evict batch");
+                });
+                this.evicted = true;
+            }
+            std::task::Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn poll_close(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    /// Regression test for #1718: the responder reads one batch at a time, so a
+    /// requester that stops reading pins at most one batch, not a whole chunk.
+    /// The writer evicts every batch once the first `Data` byte lands, so only the
+    /// batch read before that write can still be served.
+    #[tokio::test]
+    async fn sync_serve_reads_one_batch_at_a_time() {
+        let batches = create_test_batches(SYNC_SERVE_FLUSH_INTERVAL);
+        let db = setup_batch_db(&batches);
+        let temp_dir = TempDir::new().expect("tempdir");
+        let consensus_chain =
+            ConsensusChain::new(temp_dir.path().to_path_buf(), Committee::default())
+                .expect("consensus chain");
+        consensus_chain.persist_current().await.expect("clean open");
+        let digests: BTreeSet<B256> = batches.iter().map(|b| b.digest()).collect();
+        assert_eq!(digests.len(), batches.len(), "test batches must be distinct");
+        let max_frame = crate::network::handle::max_sync_frame_size(0);
+
+        // the length of the opening Ack, so the writer can spot the first Data byte
+        let mut ack = Vec::new();
+        write_frame(
+            &mut ack,
+            &SyncFrame::<WorkerSyncRequest>::Ack,
+            &mut Vec::new(),
+            &mut Vec::new(),
+            max_frame,
+        )
+        .await
+        .expect("ack encodes");
+
+        let mut writer = EvictingWriter {
+            bytes: Vec::new(),
+            db: db.clone(),
+            digests: digests.iter().copied().collect(),
+            ack_len: ack.len(),
+            evicted: false,
+        };
+        send_sync_batches_over_stream(
+            &mut writer,
+            &db,
+            &consensus_chain,
+            &digests,
+            0,
+            max_frame,
+            SEND_STREAM_FRAME_TIMEOUT,
+        )
+        .await
+        .expect("serve sync batches");
+
+        let mut cursor = Cursor::new(writer.bytes);
+        read_sync_ack(&mut cursor, max_frame).await;
+        let task_manager = TaskManager::default();
+        let handle = WorkerNetworkHandle::new_for_test(task_manager.get_spawner());
+        let result =
+            handle.read_sync_batches(&mut cursor, &digests).await.expect("read sync batches");
+
+        // the first batch was read before its Data write triggered the eviction, and
+        // every later batch was read after it; a whole-chunk read up front would
+        // serve all of them
+        let served: Vec<B256> = result.iter().map(|(d, _)| *d).collect();
+        let first: Vec<B256> = digests.iter().copied().take(1).collect();
+        assert_eq!(served, first, "only the batch read before the eviction is served");
     }
 
     /// An [`AsyncRead`] that replays pre-serialized frames, pausing `gap` of
@@ -576,6 +707,64 @@ mod tests {
         assert!(
             elapsed >= BATCH_STREAM_TOTAL_TIMEOUT && elapsed < BATCH_STREAM_TOTAL_TIMEOUT + gap * 2,
             "total timeout should fire at ~{BATCH_STREAM_TOTAL_TIMEOUT:?}, fired at {elapsed:?}"
+        );
+    }
+
+    /// A peer that negotiates the sync protocol but never reads cannot hold the
+    /// request write open: `SYNC_REQUEST_WRITE_TIMEOUT` bounds the write and the
+    /// flush, and the stall maps to `SyncAttempt::Failed` so the caller tries the
+    /// next peer. Regression test for issue #1717.
+    #[tokio::test(start_paused = true)]
+    async fn write_sync_request_is_bounded_by_write_timeout() {
+        use crate::network::handle::{SyncAttempt, SYNC_REQUEST_WRITE_TIMEOUT};
+        use futures::AsyncWrite;
+        use std::{
+            io,
+            pin::Pin,
+            task::{Context, Poll},
+            time::Duration,
+        };
+
+        /// A stream whose peer never grants credit: every write, flush and close
+        /// stays pending.
+        struct StalledWriter;
+
+        impl AsyncWrite for StalledWriter {
+            fn poll_write(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+                _buf: &[u8],
+            ) -> Poll<io::Result<usize>> {
+                Poll::Pending
+            }
+
+            fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+                Poll::Pending
+            }
+
+            fn poll_close(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+                Poll::Pending
+            }
+        }
+
+        let digests: BTreeSet<B256> = create_test_batches(4).iter().map(|b| b.digest()).collect();
+        let task_manager = TaskManager::default();
+        let handle = WorkerNetworkHandle::new_for_test(task_manager.get_spawner());
+
+        let start = tokio::time::Instant::now();
+        let outcome = handle.write_sync_request(&mut StalledWriter, &digests).await;
+        let elapsed = start.elapsed();
+
+        // the write is cut off and classified as a transient exchange failure
+        assert!(
+            matches!(outcome, Err(SyncAttempt::Failed(_))),
+            "expected a write timeout, got {outcome:?}"
+        );
+        // and it is the write bound (~5s) that fired
+        assert!(
+            elapsed >= SYNC_REQUEST_WRITE_TIMEOUT
+                && elapsed < SYNC_REQUEST_WRITE_TIMEOUT + Duration::from_secs(1),
+            "write timeout should fire at ~{SYNC_REQUEST_WRITE_TIMEOUT:?}, fired at {elapsed:?}"
         );
     }
 

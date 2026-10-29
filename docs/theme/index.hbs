@@ -3,7 +3,7 @@
     <head>
         <!-- Book generated using mdBook -->
         <!-- TN-EDIT E0: Telcoin Network theme. Based on the stock mdBook 0.5.4 index.hbs
-             with six marked edits (E0-E5). When upgrading mdbook, re-dump the stock theme
+             with marked edits E0-E6. When upgrading mdbook, re-dump the stock theme
              (`mdbook init <dir> --theme`) and re-apply the TN-EDIT blocks on top. -->
         <meta charset="UTF-8">
         <title>{{ title }}</title>
@@ -201,18 +201,6 @@
                             <button type="button" class="tn-theme-choice" data-theme-choice="navy" role="radio" aria-checked="false" title="Dark theme" aria-label="Dark theme">
                                 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>
                             </button>
-                        </div>
-                        <!-- TN-EDIT E7: version picker. tn-custom.js labels the button with the
-                             version this build lives under (site root = latest, /vX.Y.Z/ = tag)
-                             and fills the menu from versions.json at the site root, which CI
-                             writes when it assembles the multi-version site. Local builds have
-                             no versions.json and list only the current version. -->
-                        <div class="tn-version-picker">
-                            <button type="button" id="tn-version-button" class="tn-version-button" aria-haspopup="listbox" aria-expanded="false" aria-controls="tn-version-menu" title="Switch documentation version">
-                                <span class="tn-version-label">latest</span>
-                                <svg class="tn-version-caret" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 9l6 6 6-6"/></svg>
-                            </button>
-                            <ul id="tn-version-menu" class="tn-version-menu" role="listbox" aria-label="Documentation versions" hidden></ul>
                         </div>
                         {{#if print_enable}}
                         <a href="{{ path_to_root }}print.html" title="Print this book" aria-label="Print this book">

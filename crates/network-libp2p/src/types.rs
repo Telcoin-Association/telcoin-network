@@ -502,6 +502,12 @@ where
         /// The next epoch committee.
         next: HashSet<BlsPublicKey>,
     },
+    /// Tell the gossip reject path where the epoch this node runs stands relative to the live
+    /// network. Sent at every epoch entry, before the topic allowlists of that epoch.
+    SetEpochPosition {
+        /// Live tip or historical replay.
+        position: EpochPosition,
+    },
     /// Set or renew a complete authoritative admission window at an epoch revision.
     UpdateAdmissionCommittees {
         /// Epoch-start publication or lease renewal.
@@ -820,6 +826,10 @@ where
     }
 
     /// Retrieve a collection of connected peers.
+    ///
+    /// Members of the current committee come first. Within each group the order is the peer
+    /// manager's order, so a caller that tries peers in turn reaches committee members before
+    /// other peers.
     pub async fn connected_peers(&self) -> NetworkResult<Vec<BlsPublicKey>> {
         let (reply, peers) = oneshot::channel();
         self.sender.send(NetworkCommand::ConnectedPeers { reply }).await?;
@@ -901,6 +911,14 @@ where
         next: HashSet<BlsPublicKey>,
     ) -> NetworkResult<()> {
         self.sender.send(NetworkCommand::UpdateCommittees { previous, current, next }).await?;
+        Ok(())
+    }
+
+    /// Tell the swarm whether this node runs the live epoch or replays a historical one.
+    ///
+    /// The gossip reject path charges an unauthorized author only at [`EpochPosition::Live`].
+    pub async fn set_epoch_position(&self, position: EpochPosition) -> NetworkResult<()> {
+        self.sender.send(NetworkCommand::SetEpochPosition { position }).await?;
         Ok(())
     }
 
@@ -1159,4 +1177,20 @@ where
         self.sender.send(NetworkCommand::KadStoreGet { key, reply }).await?;
         rx.await.map_err(Into::into)
     }
+}
+
+/// Where the epoch this node runs stands relative to the live network.
+///
+/// The gossip reject path consults it before it charges an unauthorized author. A node that
+/// replays a historical epoch holds the publisher allowlists and committee slots of that epoch,
+/// so a live committee member outside its window is not misbehaving when its gossip arrives
+/// here: the message is still dropped, but the author is not charged.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum EpochPosition {
+    /// The node runs the latest epoch it knows; an unauthorized author is charged.
+    #[default]
+    Live,
+    /// The node replays an epoch its committee already closed; an unauthorized author is dropped
+    /// without a penalty.
+    Historical,
 }

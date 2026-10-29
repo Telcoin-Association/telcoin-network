@@ -208,7 +208,7 @@ where
                     // normal worker path, while a CVV catching up to rejoin gets the most out of
                     // the prefetch — the cache survives the mode-change re-entry that promotes it.
                     let mut missing = BTreeSet::from([batch_hash]);
-                    match self.network_handle.request_batches(&mut missing).await {
+                    match self.network_handle.request_batches(&mut missing, None).await {
                         Ok(batches) => {
                             if let Some((digest, batch)) = batches.first() {
                                 self.validate_and_cache_prefetched_batch(digest, batch)?;
@@ -389,12 +389,18 @@ where
     /// [`SyncFrame::Err`] so it stops waiting. The returned [`SyncServeOutcome`]
     /// tells the caller if the failure was a stall, which it charges to a public
     /// peer, or another failure, which it does not charge.
+    ///
+    /// `epoch` is the request epoch, which the caller has checked is inside the
+    /// node's serve window; it selects the epoch pack read on a cache miss.
+    /// `max_frame` is the node's own frame limit, taken from the node's epoch, so
+    /// the requester cannot size the responder's buffers (#1718).
     pub(super) async fn process_sync_batches_stream(
         &self,
         peer: BlsPublicKey,
         mut stream: Stream,
         batch_digests: BTreeSet<B256>,
         epoch: Epoch,
+        max_frame: usize,
         consensus_chain: &ConsensusChain,
     ) -> SyncServeOutcome {
         debug!(
@@ -406,7 +412,6 @@ where
         );
 
         let store = self.consensus_config.node_storage();
-        let max_frame = crate::network::handle::max_sync_frame_size(epoch);
 
         // set timeout to prevent slow-read attack; flatten the timeout's outer
         // `Result` into the send's so a single error path handles both
