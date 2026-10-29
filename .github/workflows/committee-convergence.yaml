@@ -42,14 +42,11 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
         if: matrix.lane != 'fmt'
         with:
-          prefix-key: v1-rust
+          prefix-key: ${{ matrix.lane == 'clippy' && 'v2-rust' || 'v1-rust' }}
           shared-key: ${{ matrix.lane == 'clippy' && 'clippy-cache' || 'test-cache' }}
           save-if: "false"
       - name: Run existing workspace CI lane
         run: ./etc/ci-lanes.sh ${{ matrix.lane }}
-      - name: Include all targets required by the scope plan
-        if: matrix.lane == 'clippy'
-        run: cargo "+$(cat rust-nightly)" clippy --locked --workspace --all-targets --no-deps -- -D warnings
 
   regressions:
     runs-on: ubuntu-latest

@@ -15,6 +15,11 @@
 # the queue's lanes need, flag for flag; `--build-only` below is its one concession, and it
 # exists only because nextest has no other way to build a lane without running it.
 #
+# A fourth, .github/workflows/main-compiles.yaml, runs fmt, clippy and both test lanes with
+# `--build-only` on every push to main. A security-advisory merge reaches main without
+# either pr.yaml event, so that workflow is what says such a commit still compiles. It
+# reports after the fact and gates nothing.
+#
 # Before this file existed the two copies had already diverged: CI ran clippy only under
 # --all-features and excluded a package that no longer exists, so "CI runs what the
 # attested local run runs" was true only by inspection, and it was not true.
@@ -83,12 +88,26 @@ lane_fmt() {
 }
 
 lane_clippy() {
-    # Both feature sets, because neither lints what the other does: --all-features never
-    # compiles a `#[cfg(not(feature = ...))]` arm, and the default graph never compiles the
-    # gated code at all.
+    # Three passes, because none of them compiles what the others do.
+    #
+    # 1. Libraries and binaries under default features: the release's own configuration.
+    #    With --all-targets cargo unifies dev-dependency features into the library build
+    #    (eight crates enable tn-storage/test-utils from [dev-dependencies]; see
+    #    crates/state-sync/Cargo.toml), so this is the one pass that still compiles each
+    #    library the way the release does. Code that builds only because a test helper
+    #    feature happened to be on fails here.
+    # 2. --all-targets under default features: every lib, bin, test, bench and example
+    #    target, so test code is compiled and linted too. Before this pass existed the lane
+    #    built libraries only, and test code that did not compile reached main
+    #    (2026-10-29).
+    # 3. --all-targets --all-features: the feature-gated code, which the default graph never
+    #    compiles, plus the targets that require a feature. crates/tn-reth's output_overlay
+    #    bench needs `bench-internals`, and no lane compiled it before. The default passes
+    #    in turn are the only ones that compile a `#[cfg(not(feature = ...))]` arm.
     run cargo "+${NIGHTLY}" clippy --locked --workspace -- -D warnings
-    run cargo "+${NIGHTLY}" clippy --locked --workspace --all-features -- -D warnings
-    echo "clippy for workspace: default and all features passed"
+    run cargo "+${NIGHTLY}" clippy --locked --workspace --all-targets -- -D warnings
+    run cargo "+${NIGHTLY}" clippy --locked --workspace --all-targets --all-features -- -D warnings
+    echo "clippy for workspace passed: default libs, default all targets, all features all targets"
 }
 
 lane_test_default() {
