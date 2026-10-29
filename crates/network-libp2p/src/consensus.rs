@@ -92,6 +92,9 @@ mod inbound_service_tests;
 #[cfg(test)]
 #[path = "tests/admission_contention.rs"]
 mod admission_contention;
+#[cfg(test)]
+#[path = "tests/catch_up_contention.rs"]
+mod catch_up_contention;
 
 #[cfg(test)]
 #[path = "tests/loop_budget_tests.rs"]
@@ -1149,6 +1152,10 @@ where
             self.metrics.set_pending_incoming_connections(
                 self.swarm.network_info().connection_counters().num_pending_incoming(),
             );
+            self.swarm
+                .behaviour()
+                .peer_manager
+                .observe_committee_resolution(self.key_config.primary_public_key());
         }
     }
 
@@ -1463,14 +1470,15 @@ where
                 send_or_log_error!(reply, self.connected_peers.len(), "EstablishedPeerCount");
             }
             NetworkCommand::ConnectedPeers { reply } => {
-                let peers = self
-                    .swarm
-                    .behaviour()
-                    .peer_manager
+                let peer_manager = &self.swarm.behaviour().peer_manager;
+                // current-committee members first (stable order), so a caller that tries
+                // peers in order reaches the peers most likely to hold consensus data first
+                let (committee, others): (Vec<_>, Vec<_>) = peer_manager
                     .connected_or_dialing_peers()
                     .iter()
-                    .flat_map(|id| self.swarm.behaviour().peer_manager.peer_to_bls(id))
-                    .collect();
+                    .flat_map(|id| peer_manager.peer_to_bls(id))
+                    .partition(|bls| peer_manager.is_current_committee_member(bls));
+                let peers: Vec<_> = committee.into_iter().chain(others).collect();
                 debug!(target: "network", ?peers, "peer manager connected peers:");
                 send_or_log_error!(reply, peers, "ConnectedPeers");
             }
