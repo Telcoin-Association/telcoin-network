@@ -326,6 +326,20 @@ jobs:
       - name: Install nightly toolchain
         run: rustup toolchain install "$RUST_NIGHTLY" -c clippy,rust-src --profile minimal
 
+      # rust-cache's `rustc -vV` probe runs in the repository, where rust-toolchain.toml
+      # makes rustup install the stable pin if it is missing, so the pin is hashed either
+      # way. Installing it here makes the hashed set the two pins by construction.
+      - name: Install Rust toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+
+      # The runner image's own stable Rust would be hashed into the cache key, so it goes
+      # after the last toolchain install and before the cache step (cache-deps.yaml's
+      # header says why). The list that follows is the set the key hashes.
+      - name: Remove the runner image's Rust
+        run: |
+          rustup toolchain uninstall stable
+          rustup toolchain list
+
       # Restore only; cache-deps.yaml writes the v2-rust entries on main.
       - name: Cache dependencies
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
@@ -361,6 +375,14 @@ jobs:
         uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
         with:
           tool: cargo-nextest
+
+      # The runner image's own stable Rust would be hashed into the cache key, so it goes
+      # after the last toolchain install and before the cache step (cache-deps.yaml's
+      # header says why). The list that follows is the set the key hashes.
+      - name: Remove the runner image's Rust
+        run: |
+          rustup toolchain uninstall stable
+          rustup toolchain list
 
       # Restore only; see the clippy job.
       - name: Cache dependencies
@@ -406,6 +428,14 @@ jobs:
         uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
         with:
           tool: cargo-nextest
+
+      # The runner image's own stable Rust would be hashed into the cache key, so it goes
+      # after the last toolchain install and before the cache step (cache-deps.yaml's
+      # header says why). The list that follows is the set the key hashes.
+      - name: Remove the runner image's Rust
+        run: |
+          rustup toolchain uninstall stable
+          rustup toolchain list
 
       # Restore only (see the clippy job), from the same entry as `test`: cache-deps builds
       # both test lanes into one target dir, where the adiri variants of the shared

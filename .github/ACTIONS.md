@@ -204,7 +204,9 @@ They were checked against v2.9.2, and a later release can change them; the third
   The env hash covers `rustc -vV` of every toolchain that `rustup toolchain list` reports, and every variable whose name starts with `CARGO`, `CC`, `CFLAGS`, `CXX`, `CMAKE` or `RUST` and whose value is non-empty.
   So the `env:` block and the steps before the cache step, including every step that installs a toolchain, must be identical in `cache-deps.yaml`, `pr.yaml` and `main-compiles.yaml`; they are, and all three files say so.
   The clippy jobs hash seven variables (the six in `env:` plus `RUST_NIGHTLY`, written to `GITHUB_ENV` before the cache step); the test jobs hash six.
-  The toolchains hashed are the stable Rust preinstalled on the runner image, the stable pinned in `rust-toolchain.toml`, and in the clippy jobs the pinned nightly.
+  The toolchains hashed are the stable pinned in `rust-toolchain.toml` and, in the clippy jobs, the pinned nightly.
+  The runner image brings a stable Rust of its own, and every job that restores or saves a `clippy-cache`, `test-cache` or `durable-e2e-cache` entry removes it (`rustup toolchain uninstall stable`) after its last toolchain install and before its cache step, then lists what is left.
+  The clippy jobs install the stable pin explicitly too; otherwise rust-cache's `rustc -vV` probe installs it as a side effect, because `rust-toolchain.toml` applies in the repository.
   Each cache step prints what it computed in its "Cache Configuration" log group: Restore Key, Cache Key, and the environment considered, which includes a "Rust Versions:" list of every toolchain it hashed.
   When a restore misses, start by comparing that group in the warm's log with the one in the run that missed.
 - Entries are immutable, and an exact key hit skips the save.
@@ -249,12 +251,12 @@ One exposure to know about: `rust-toolchain.toml` pins `channel = "1.94"`, so a 
 Pinning `1.94.x` would make the rotation explicit and deliberate.
 That is a decision to make, not one made here.
 
-A second exposure, new with v2.9.2: the stable Rust preinstalled on the `ubuntu-latest` image is one of the toolchains hashed into every key, and this repository does not control it.
-When GitHub updates the image to a new Rust release (roughly every six weeks, plus point releases, rolled out to the runners over several days), every entry misses with no fallback until the next warm, and while the rollout is in progress a writer and a reader can land on different images and compute different keys.
-A missed restore whose "Rust Versions:" list shows a new stable is the sign.
-When it happens, dispatch a warm by hand (*Warm dependency cache* -> *Run workflow*); until that warm has finished, the lanes build cold.
-While the rollout lasts, the warm can itself land on an old image, which its own "Rust Versions:" list shows, and then it has to be dispatched again.
-The alternative, making the installed set deterministic by removing the image's own toolchain before every cache step, in lockstep, was considered and not adopted; it is untested on a runner.
+The runner image's own stable Rust used to be hashed into every key as well, since rust-cache v2.9.2 hashes every installed toolchain, and this repository does not control it.
+In October 2026 two flavours of `ubuntu-latest`, with Rust 1.99.0 and 1.99.1, were in the fleet at once, so a job that landed on the other flavour from the warm's missed its restore; most `merge_group` test lanes sampled were cold for that reason, `test` taking 15.1 min against 5.2 with a hit, `adiri-test` 14.3 against 2.9 and `clippy` 14.4 against 1.7.
+That is why every cache step of the three families now comes after the step that removes the image's toolchain (above), so no image update or rollout changes a key.
+With no default toolchain left, a bare `cargo` or `rustc` outside the repository fails; every later step in those jobs runs in the repository, where `rust-toolchain.toml` applies, or names its toolchain with `+`.
+Build scripts run in their dependency's own directory but inherit the toolchain, because rustup sets `RUSTUP_TOOLCHAIN` for the `cargo` it starts.
+A "Rust Versions:" list with a toolchain the job did not install by name means a step before the cache step installed one, and that job's restores miss.
 
 ## Action pins
 

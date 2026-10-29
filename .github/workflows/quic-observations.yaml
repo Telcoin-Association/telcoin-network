@@ -66,6 +66,13 @@ jobs:
         run: rustup toolchain install 1.94 --profile minimal
       - name: Configure build inputs
         run: cp .env.example .env
+      # The runner image's own stable Rust would be hashed into the cache key, so it goes
+      # after the last toolchain install and before the cache step (cache-deps.yaml's
+      # header says why). The list that follows is the set the key hashes.
+      - name: Remove the runner image's Rust
+        run: |
+          rustup toolchain uninstall stable
+          rustup toolchain list
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           prefix-key: v1-rust

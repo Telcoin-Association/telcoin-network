@@ -41,13 +41,20 @@
 # every step before the cache step must match this file: the same six variables, plus
 # RUST_NIGHTLY written to GITHUB_ENV before the cache step in the clippy jobs, and the
 # same steps that install a toolchain, because the set of installed toolchains is hashed.
-# That set also holds the stable Rust preinstalled on the ubuntu-latest image, which this
-# repository does not control: when GitHub updates the image to a new Rust release, every
-# key changes with it (.github/ACTIONS.md, "Caches"). Keep the three files in lockstep by
-# hand; there is no shared definition yet. A `rust-nightly` bump changes RUST_NIGHTLY and
-# the installed nightly, so the whole key, which is why that file is in `paths` below.
-# Each cache step prints the computed key in its "Cache Configuration" log group, with a
-# "Rust Versions:" list of every toolchain it hashed.
+# The ubuntu-latest image brings a stable Rust of its own, which this repository does not
+# control and which differs between runners (1.99.0 and 1.99.1 were both in the fleet in
+# October 2026), so every job that restores or saves an entry removes it (`rustup
+# toolchain uninstall stable`) after its last toolchain install and before its cache step.
+# The clippy jobs also install the stable pin explicitly, which rust-cache's `rustc -vV`
+# probe would otherwise install as a side effect, since rust-toolchain.toml applies in the
+# repository. The hashed set is then the stable pin, plus the nightly pin in the clippy
+# jobs, whichever image a job lands on. With no default toolchain left, a bare `cargo` or
+# `rustc` outside the repository fails, so every later step runs in it or names its
+# toolchain (`cargo +1.94`). Keep the three files in lockstep by hand; there is no shared
+# definition yet. A `rust-nightly` bump changes RUST_NIGHTLY and the installed nightly, so
+# the whole key, which is why that file is in `paths` below. Each cache step prints the
+# computed key in its "Cache Configuration" log group, with a "Rust Versions:" list of
+# every toolchain it hashed.
 #
 # Entries are immutable and an exact key hit skips the save. A change to WHAT a job here
 # builds (a lane added, a feature set changed) is therefore never written while the key
@@ -86,8 +93,8 @@ on:
       - ".cargo/config.toml"
       - "etc/ci-lanes.sh"
       - ".github/workflows/cache-deps.yaml"
-  # Re-warm by hand: after deleting entries, when a warm failed, or when the runner
-  # image's stable Rust changed and every key with it.
+  # Re-warm by hand: after deleting entries, when a warm failed, or when a point release of
+  # the stable pin changed every key (.github/ACTIONS.md, "Caches").
   workflow_dispatch:
   # GitHub deletes an entry not accessed for 7 days, so a quiet week would leave the queue
   # cold. Twice a week keeps the entries alive; on an exact hit the run restores, rebuilds
@@ -138,6 +145,20 @@ jobs:
       - name: Install nightly toolchain
         run: rustup toolchain install "$RUST_NIGHTLY" -c clippy,rust-src --profile minimal
 
+      # rust-cache's `rustc -vV` probe runs in the repository, where rust-toolchain.toml
+      # makes rustup install the stable pin if it is missing, so the pin is hashed either
+      # way. Installing it here makes the hashed set the two pins by construction.
+      - name: Install Rust toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+
+      # The runner image's own stable Rust would be hashed into the cache key, so it goes
+      # after the last toolchain install and before the cache step (cache-deps.yaml's
+      # header says why). The list that follows is the set the key hashes.
+      - name: Remove the runner image's Rust
+        run: |
+          rustup toolchain uninstall stable
+          rustup toolchain list
+
       - name: Cache dependencies
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
@@ -168,6 +189,14 @@ jobs:
         uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
         with:
           tool: cargo-nextest
+
+      # The runner image's own stable Rust would be hashed into the cache key, so it goes
+      # after the last toolchain install and before the cache step (cache-deps.yaml's
+      # header says why). The list that follows is the set the key hashes.
+      - name: Remove the runner image's Rust
+        run: |
+          rustup toolchain uninstall stable
+          rustup toolchain list
 
       - name: Cache dependencies
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
