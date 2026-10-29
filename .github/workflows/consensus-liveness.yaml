@@ -108,5 +108,6 @@ jobs:
               finally:
                   path.write_text(original)
           PY
-      - name: Verify restored implementation passes
-        run: cargo nextest run --locked --workspace --no-fail-fast -E 'package(tn-primary) & test(quorum_)'
+      # The quorum tests already passed on this tree before the mutations; re-running them rebuilt tn-primary's dependents.
+      - name: Verify the mutated files were restored byte for byte
+        run: git diff --exit-code -- crates/consensus/primary
