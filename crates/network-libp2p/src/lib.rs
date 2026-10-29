@@ -52,7 +52,7 @@ pub use sync::{
     ReservedPeers, ReservedPool, SyncFrame, SyncFrameError, WorkerSyncRequest,
 };
 pub use tn_node_record::{validate_advertised_addresses, MAX_ADVERTISED_MULTIADDRS};
-pub use types::ResponseChannel;
+pub use types::{EpochPosition, ResponseChannel};
 
 // re-export specific libp2p types
 pub use libp2p::{

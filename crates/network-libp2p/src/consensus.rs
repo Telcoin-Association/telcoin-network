@@ -20,9 +20,9 @@ use crate::{
     service_class::{InboundOccupancy, ServiceClass},
     stream::{StreamBehavior, StreamEvent},
     types::{
-        GossipPayload, KadQuery, NetworkCommand, NetworkEvent, NetworkHandle, NetworkInfo,
-        NetworkResponseMessage, NetworkResponseSender, NetworkResult, NetworkType, NetworkTypeExt,
-        NodeRecord, RecordDomain, ResponseChannel, RpcInfo,
+        EpochPosition, GossipPayload, KadQuery, NetworkCommand, NetworkEvent, NetworkHandle,
+        NetworkInfo, NetworkResponseMessage, NetworkResponseSender, NetworkResult, NetworkType,
+        NetworkTypeExt, NodeRecord, RecordDomain, ResponseChannel, RpcInfo,
     },
     PeerExchangeMap,
 };
@@ -490,6 +490,13 @@ where
     /// This set must be updated at the start of each epoch. It is used to verify messages
     /// published on certain topics. These are updated when the caller subscribes to a topic.
     authorized_publishers: HashMap<String, Option<HashSet<BlsPublicKey>>>,
+    /// Where the epoch this node runs stands relative to the live network.
+    ///
+    /// Set at every epoch entry with the allowlists of that epoch. The reject path charges an
+    /// unauthorized author only at `EpochPosition::Live`: while the node replays a historical
+    /// epoch, a resolved author outside the replayed allowlists is most likely a live committee
+    /// member of a later epoch, so the message is dropped without a penalty.
+    epoch_position: EpochPosition,
     /// The collection of pending _graceful_ disconnects.
     ///
     /// This node disconnects from new peers if it already has the target number of peers.
@@ -874,6 +881,7 @@ where
             commands,
             event_stream,
             authorized_publishers: Default::default(),
+            epoch_position: EpochPosition::default(),
             outbound_requests: Default::default(),
             inbound_requests: Default::default(),
             inbound_pending: InboundOccupancy::default(),
@@ -1570,6 +1578,10 @@ where
                 let peers = self.swarm.behaviour_mut().peer_manager.peers_for_exchange();
                 send_or_log_error!(reply, peers, "PeersForExchange");
             }
+            NetworkCommand::SetEpochPosition { position } => {
+                debug!(target: "network", ?position, "setting the epoch position for gossip rejects");
+                self.epoch_position = position;
+            }
             NetworkCommand::UpdateCommittees { previous, current, next } => {
                 self.swarm.behaviour_mut().peer_manager.invalidate_admission();
                 // The network mirrors three of the on-chain registry's committees: previous,
@@ -1839,8 +1851,9 @@ where
                         // Resolve both candidate culprits, then let `reason` decide accountability
                         // (see `RejectReason::penalty`): an oversized payload is charged to the
                         // relaying peer, an unauthorized author to the author, each only once its
-                        // identity has resolved. The relaying peer is never penalized for an
-                        // author fault (#801/#785).
+                        // identity has resolved and, for the author, only while this node runs the
+                        // live epoch. The relaying peer is never penalized for an author fault
+                        // (#801/#785).
                         let relayer =
                             self.swarm.behaviour().peer_manager.peer_to_bls(&propagation_source);
                         let author_id = message.source;
@@ -1848,7 +1861,11 @@ where
                             .as_ref()
                             .and_then(|id| self.swarm.behaviour().peer_manager.peer_to_bls(id));
                         let topic = &message.topic;
-                        match reason.penalty(relayer.is_some(), author.is_some()) {
+                        match reason.penalty(
+                            relayer.is_some(),
+                            author.is_some(),
+                            self.epoch_position,
+                        ) {
                             RejectPenalty::FatalRelayer => {
                                 bounded_warn!(Gossip,
                                     target: "network",
@@ -1881,7 +1898,7 @@ where
                                     ?reason,
                                     ?topic,
                                     ?propagation_source,
-                                    "rejecting gossip without an attributable penalty (unresolved relayer/author, or this node's committee-view lag)"
+                                    "rejecting gossip without an attributable penalty (unresolved relayer/author, this node's committee-view lag, or a historical epoch replay)"
                                 );
                             }
                         }
@@ -3381,11 +3398,28 @@ impl RejectReason {
     /// exemption in the peer manager. Either penalty is skipped until the accountable peer's
     /// identity resolves: unattributable otherwise (the same join-window race the Accept path
     /// documents), which for the author also covers the anonymous-message and view-lag cases.
-    fn penalty(self, relayer_resolved: bool, author_resolved: bool) -> RejectPenalty {
+    ///
+    /// The author penalty also needs `position` to be [`EpochPosition::Live`]. A replaying node
+    /// holds the publisher allowlists of the historical epoch it replays, while the live committee
+    /// of a later epoch publishes on the same topics (topic names carry only the chain id). A
+    /// resolved author outside the replayed allowlists is then most likely a live committee member
+    /// outside the replayed committee window, which the peer manager's committee exemption does
+    /// not cover, so the message is dropped without a penalty. The size penalty does not depend on
+    /// the position: that bound is protocol wide.
+    fn penalty(
+        self,
+        relayer_resolved: bool,
+        author_resolved: bool,
+        position: EpochPosition,
+    ) -> RejectPenalty {
         match self {
             RejectReason::TooLarge if relayer_resolved => RejectPenalty::FatalRelayer,
             RejectReason::TooLarge => RejectPenalty::Skip,
-            RejectReason::UnauthorizedAuthor if author_resolved => RejectPenalty::FatalAuthor,
+            RejectReason::UnauthorizedAuthor
+                if author_resolved && position == EpochPosition::Live =>
+            {
+                RejectPenalty::FatalAuthor
+            }
             RejectReason::UnauthorizedAuthor => RejectPenalty::Skip,
         }
     }
@@ -3410,6 +3444,7 @@ where
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ConsensusNetwork")
             .field("authorized_publishers", &self.authorized_publishers)
+            .field("epoch_position", &self.epoch_position)
             .field("pending_px_disconnects", &self.pending_px_disconnects)
             .field("pending_goodbyes", &self.pending_goodbyes)
             .field("outbound_requests", &self.outbound_requests.len())

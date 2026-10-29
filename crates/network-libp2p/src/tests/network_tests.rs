@@ -7,7 +7,7 @@ use crate::{
         TestWorkerResponse, TEST_HEARTBEAT_INTERVAL,
     },
     freshness::RecordTimestamp,
-    types::RecordDomain,
+    types::{EpochPosition, RecordDomain},
 };
 use assert_matches::assert_matches;
 use eyre::eyre;
@@ -5410,16 +5410,99 @@ fn accepted_gossip_carries_resolved_author_identity() -> eyre::Result<()> {
 /// relayer, regardless of whether either identity has resolved.
 #[test]
 fn author_attributable_reject_charges_the_author_never_the_relayer() {
-    for relayer_resolved in [true, false] {
+    [true, false].into_iter().for_each(|relayer_resolved| {
         assert_eq!(
-            RejectReason::UnauthorizedAuthor.penalty(relayer_resolved, true),
+            RejectReason::UnauthorizedAuthor.penalty(relayer_resolved, true, EpochPosition::Live),
             RejectPenalty::FatalAuthor
         );
         assert_eq!(
-            RejectReason::UnauthorizedAuthor.penalty(relayer_resolved, false),
+            RejectReason::UnauthorizedAuthor.penalty(relayer_resolved, false, EpochPosition::Live),
             RejectPenalty::Skip
         );
-    }
+    });
+}
+
+/// A replaying node never charges an unauthorized author: its allowlists belong to the
+/// historical epoch it replays, so a resolved author outside them is most likely a live committee
+/// member of a later epoch. The size penalty stays with the relayer; that bound is protocol wide.
+#[test]
+fn historical_epoch_replay_never_charges_the_author() {
+    [true, false].into_iter().for_each(|relayer_resolved| {
+        [true, false].into_iter().for_each(|author_resolved| {
+            assert_eq!(
+                RejectReason::UnauthorizedAuthor.penalty(
+                    relayer_resolved,
+                    author_resolved,
+                    EpochPosition::Historical
+                ),
+                RejectPenalty::Skip
+            );
+        });
+        assert_eq!(
+            RejectReason::TooLarge.penalty(true, relayer_resolved, EpochPosition::Historical),
+            RejectPenalty::FatalRelayer
+        );
+    });
+}
+
+/// Drive the reject arm at `position` with a resolved author that no committee slot exempts, on
+/// a topic whose allowlist excludes it. Returns whether the author ended up banned.
+async fn unauthorized_author_banned_at(position: EpochPosition) -> eyre::Result<bool> {
+    let TestTypes { peer1, peer2, _task_manager } =
+        create_test_types::<TestWorkerRequest, TestWorkerResponse>();
+    let outsider = peer1.config.key_config().primary_public_key();
+    let mut network = peer1.network;
+    let member = peer2.config.key_config().primary_public_key();
+    let source = *peer2.network.swarm.local_peer_id();
+    let record = peer2.network.get_peer_record();
+    // resolve the author's BLS identity through its kad record while it holds a committee slot
+    network.process_command(NetworkCommand::UpdateCommittees {
+        previous: HashSet::new(),
+        current: HashSet::from([member]),
+        next: HashSet::new(),
+    })?;
+    network.process_kad_put_request(source, record)?;
+    // move the window past the author: a live member two epochs ahead holds no slot here
+    network.process_command(NetworkCommand::UpdateCommittees {
+        previous: HashSet::new(),
+        current: HashSet::from([outsider]),
+        next: HashSet::new(),
+    })?;
+    assert_eq!(network.swarm.behaviour().peer_manager.peer_to_bls(&source), Some(member));
+    let (reply, _subscribed) = tokio::sync::oneshot::channel();
+    network.process_command(NetworkCommand::Subscribe {
+        topic: TEST_TOPIC.to_string(),
+        publishers: Some(HashSet::from([outsider])),
+        reply,
+    })?;
+    network.process_command(NetworkCommand::SetEpochPosition { position })?;
+    network.process_gossip_event(GossipEvent::Message {
+        propagation_source: PeerId::random(),
+        message_id: gossipsub::MessageId::from(b"unauthorized-author-gossip".to_vec()),
+        message: GossipMessage { source: Some(source), ..test_gossip_message() },
+    })?;
+    Ok(network.swarm.behaviour().peer_manager.peer_banned(&source))
+}
+
+/// A replaying node rejects the message and leaves the resolved author unbanned.
+#[tokio::test]
+async fn historical_replay_rejects_unauthorized_author_without_a_ban() -> eyre::Result<()> {
+    assert!(
+        !unauthorized_author_banned_at(EpochPosition::Historical).await?,
+        "a replaying node must not ban a resolved author outside the replayed allowlist"
+    );
+    Ok(())
+}
+
+/// The same reject at the live tip still charges the resolved author: the position guard spares
+/// only a replaying node.
+#[tokio::test]
+async fn live_epoch_still_bans_unauthorized_author() -> eyre::Result<()> {
+    assert!(
+        unauthorized_author_banned_at(EpochPosition::Live).await?,
+        "a node at the tip still bans a resolved author outside the allowlist"
+    );
+    Ok(())
 }
 
 /// An oversized payload is the only relayer-attributable reject — the size bound is a compile-time
