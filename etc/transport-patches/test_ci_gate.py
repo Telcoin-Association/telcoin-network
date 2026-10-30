@@ -107,11 +107,17 @@ class CompileGate(unittest.TestCase):
 
     def test_merge_queue_skips_nothing(self):
         # run_tests=False cannot come out of ci-scope on merge_group; it is here to show the
-        # queue's refusal does not depend on what ci-scope said.
+        # queue's refusal does not depend on what ci-scope said. The fixture marks both test
+        # lanes skipped when run_tests is False, which the queue refuses on its own, so each
+        # subtest sets them to success and skips only the lane under test.
         for run_tests in (True, False):
+            self.assertEqual(
+                execute("merge_group", run_tests, "success", test="success", adiri_test="success").returncode, 0
+            )
             for lane in ALWAYS_RUN + GATED:
                 with self.subTest(run_tests=run_tests, lane=lane):
-                    result = execute("merge_group", run_tests, "success", **{lane_keyword(lane): "skipped"})
+                    lanes = {"test": "success", "adiri_test": "success", lane_keyword(lane): "skipped"}
+                    result = execute("merge_group", run_tests, "success", **lanes)
                     self.assertNotEqual(result.returncode, 0)
 
 
