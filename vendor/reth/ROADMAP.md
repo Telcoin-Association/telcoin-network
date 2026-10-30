@@ -57,7 +57,12 @@ node-metrics.
 `reth-engine-local` stays: `reth-node-core` depends on it. It is a Phase 2 item, together
 with `reth-rpc-engine-api`, which `reth-rpc` and `reth-rpc-builder` depend on.
 
-## Phase 2: the Ethereum p2p and node-config stack [in progress]
+## Phase 2: the Ethereum p2p and node-config stack [done]
+
+Done 2026-10-30 as planned below (CHANGES.md TN-0006 to TN-0009): 10 reth crates and 27
+third-party crates left the graph. One surprise: `reth-rpc` needed `reth-chain-state`'s `serde`
+feature without declaring it, and got it only through reth-network (TN-0007). The follow-up
+(a TN-owned config struct replacing `NodeConfig`) is still open.
 
 After Phase 1, `reth-node-core` holds the devp2p stack in the graph. It is reached from
 `tn-reth`, `reth-rpc-builder` (for `RpcServerArgs`) and `reth-node-api`; the RPC crates need
@@ -87,7 +92,7 @@ Keep `reth-network-api` (small, and the `EthApi` bounds need its traits) and
 struct replacing `NodeConfig` altogether is the follow-up. It would also let `reth-rpc-builder`
 take its server arguments from a small struct instead of `reth-node-core`.
 
-## Phase 3: tndb-b as the reth database [later; owned by the tndb-b work]
+## Phase 3: tndb-b as the reth database [next; owned by the tndb-b work]
 
 Vendoring makes it possible to change reth's storage crates directly instead of working around
 them:

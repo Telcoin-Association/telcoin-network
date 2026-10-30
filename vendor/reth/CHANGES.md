@@ -105,3 +105,11 @@ newest last.
   *Why*: TN runs no devp2p network (its peers speak libp2p) and no dev-mode miner. Only
   `NodeConfig`'s network arguments kept the devp2p stack in the graph, and `tn-reth` filled them
   with disabled values. *Upstream*: no.
+
+- **TN-0009** — Remove 10 crates TN no longer reaches. *Kind*: removal.
+  *Files*: removed with `vendor.py remove`: node/api, payload/basic, net/{discv4,discv5,dns,
+  ecies,eth-wire,nat,network}, engine/local.
+  *Why*: after TN-0006 (reth-node-api out of the RPC crates) and TN-0008 (the devp2p parts of
+  reth-node-core gone, tn-reth off reth-network/discv4/eth-wire), nothing in any feature
+  configuration reaches them. 27 third-party crates left with them (discv5, hickory DNS,
+  ed25519, a second libp2p-identity, moka, ...). *Upstream*: n/a.

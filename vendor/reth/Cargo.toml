@@ -15,7 +15,6 @@ members = [
     "crates/config/",
     "crates/consensus/common/",
     "crates/consensus/consensus/",
-    "crates/engine/local",
     "crates/engine/primitives/",
     "crates/errors/",
     "crates/ethereum/hardforks/",
@@ -28,22 +27,13 @@ members = [
     "crates/evm/execution-types",
     "crates/metrics/",
     "crates/net/banlist/",
-    "crates/net/discv4/",
-    "crates/net/discv5/",
-    "crates/net/dns/",
-    "crates/net/ecies/",
     "crates/net/eth-wire-types",
-    "crates/net/eth-wire/",
-    "crates/net/nat/",
     "crates/net/network-api/",
     "crates/net/network-types/",
-    "crates/net/network/",
     "crates/net/p2p/",
     "crates/net/peers/",
-    "crates/node/api/",
     "crates/node/core/",
     "crates/node/types",
-    "crates/payload/basic/",
     "crates/payload/builder/",
     "crates/payload/builder-primitives/",
     "crates/payload/primitives/",
@@ -249,7 +239,6 @@ incremental = false
 
 [workspace.dependencies]
 # reth
-reth-basic-payload-builder = { path = "crates/payload/basic" }
 reth-chain-state = { path = "crates/chain-state" }
 reth-chainspec = { path = "crates/chainspec", default-features = false }
 reth-cli-util = { path = "crates/cli/util" }
@@ -262,14 +251,8 @@ reth-db = { path = "crates/storage/db", default-features = false }
 reth-db-api = { path = "crates/storage/db-api" }
 reth-db-common = { path = "crates/storage/db-common" }
 reth-db-models = { path = "crates/storage/db-models", default-features = false }
-reth-discv4 = { path = "crates/net/discv4" }
-reth-discv5 = { path = "crates/net/discv5" }
-reth-dns-discovery = { path = "crates/net/dns" }
-reth-ecies = { path = "crates/net/ecies" }
-reth-engine-local = { path = "crates/engine/local" }
 reth-engine-primitives = { path = "crates/engine/primitives", default-features = false }
 reth-errors = { path = "crates/errors" }
-reth-eth-wire = { path = "crates/net/eth-wire" }
 reth-eth-wire-types = { path = "crates/net/eth-wire-types" }
 reth-ethereum-engine-primitives = { path = "crates/ethereum/engine-primitives", default-features = false }
 reth-ethereum-forks = { path = "crates/ethereum/hardforks", default-features = false }
@@ -285,14 +268,11 @@ reth-libmdbx = { path = "crates/storage/libmdbx-rs" }
 reth-mdbx-sys = { path = "crates/storage/libmdbx-rs/mdbx-sys" }
 reth-metrics = { path = "crates/metrics" }
 reth-net-banlist = { path = "crates/net/banlist" }
-reth-net-nat = { path = "crates/net/nat" }
-reth-network = { path = "crates/net/network" }
 reth-network-api = { path = "crates/net/network-api" }
 reth-network-p2p = { path = "crates/net/p2p" }
 reth-network-peers = { path = "crates/net/peers", default-features = false }
 reth-network-types = { path = "crates/net/network-types" }
 reth-nippy-jar = { path = "crates/storage/nippy-jar" }
-reth-node-api = { path = "crates/node/api" }
 reth-node-core = { path = "crates/node/core" }
 reth-node-types = { path = "crates/node/types" }
 reth-payload-builder = { path = "crates/payload/builder" }
