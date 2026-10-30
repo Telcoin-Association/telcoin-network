@@ -23,8 +23,7 @@ use reth_evm::{
     env::BlockEnvironment, execute::BlockBuilder, ConfigureEvm, Evm, EvmEnvFor, HaltReasonFor,
     InspectorFor, TransactionEnv, TxEnvFor,
 };
-use reth_node_api::BlockBody;
-use reth_primitives_traits::Recovered;
+use reth_primitives_traits::{BlockBody, Recovered};
 use reth_revm::{
     cancelled::CancelOnDrop,
     database::StateProviderDatabase,

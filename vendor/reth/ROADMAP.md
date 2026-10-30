@@ -57,23 +57,35 @@ node-metrics.
 `reth-engine-local` stays: `reth-node-core` depends on it. It is a Phase 2 item, together
 with `reth-rpc-engine-api`, which `reth-rpc` and `reth-rpc-builder` depend on.
 
-## Phase 2: the Ethereum p2p and node-config stack [next]
+## Phase 2: the Ethereum p2p and node-config stack [in progress]
 
-What still holds the devp2p stack (`reth-network`, `eth-wire`, `discv4`/`discv5`,
-`dns-discovery`, `ecies`, `net-nat`) in the graph is `reth-node-core`, through `NodeConfig`'s
-argument groups. `reth-rpc-builder` depends on `reth-node-core` for `RpcServerArgs`. TN's own
-uses are type-only (a dummy key, `NetworkArgs` enums, stub `NetworkInfo`/`Peers` impls for the
-`net_` namespace, `BlockHashNumber`, `NatResolver::None`).
+After Phase 1, `reth-node-core` holds the devp2p stack in the graph. It is reached from
+`tn-reth`, `reth-rpc-builder` (for `RpcServerArgs`) and `reth-node-api`; the RPC crates need
+`reth-node-api` only for re-exports. TN's own uses are type-only: a dummy key, `NetworkArgs`
+enums, stub `NetworkInfo`/`Peers` impls for the `net_` namespace, `BlockHashNumber`,
+`NatResolver::None`. Of `NodeConfig`, `tn-reth` reads only `chain`, `datadir()`, `rpc`, `txpool`,
+`db` and `pruning`. A simulation of the cuts below on the Phase 1 graph removes 10 reth crates
+(node-api, basic-payload-builder, network, discv4, discv5, dns-discovery, ecies, eth-wire,
+net-nat, engine-local) and 17 third-party ones (hickory DNS, discv5, a second libp2p-identity,
+...).
 
-Options, in order of preference:
+- **2a** (TN-0006): take `reth-node-api` out of `reth-rpc` and `reth-rpc-eth-api`. Remove the
+  blanket `RpcNodeCore` impl over `FullNodeComponents` and the `EthApiFor`-style aliases, and
+  import the rest from `reth-primitives-traits` and `reth-payload-primitives`.
+- **2b**: slim the vendored `reth-node-core`. Drop `NodeConfig::network` and `args/network.rs`
+  (`NetworkArgs`, `DiscoveryArgs`), the `RethNetworkConfig` trait, the tip-from-network helpers
+  (`max_block`, `lookup_or_fetch_tip`, `fetch_tip_from_network`, `utils.rs`'s header fetchers)
+  and `dev_mining_mode` (the only `reth-engine-local` use). Keep the port-adjusting helpers for
+  RPC only. `tn-reth/src/cli.rs` stops pinning network values.
+- **2c**: `tn-reth` drops `reth-network`, `reth-discv4` and `reth-eth-wire`. The stub key comes
+  from `secp256k1`, `BlockHashNumber` becomes alloy's `BlockNumHash`, and `DisconnectReason`
+  comes from where `reth-network-api`'s `Peers` trait takes it. `vendor.py remove` the crates
+  that leave.
 
-- A TN-owned config struct instead of `NodeConfig` (`tn-reth/src/cli.rs:287-540` already pins
-  every group but RPC, txpool and DB). Patch the vendored `reth-rpc-builder` to take its server
-  arguments from a small struct instead of `reth-node-core`.
-- Then make the network arg groups and their dependencies optional in the vendored
-  `reth-node-core`, or stop depending on it altogether.
-- Keep `reth-network-api` (small, and the `EthApi` bounds need its traits). Drop `reth-network`
-  and the discovery crates. Replace `BlockHashNumber` with alloy's `BlockNumHash`.
+Keep `reth-network-api` (small, and the `EthApi` bounds need its traits) and
+`reth-network-p2p`/`reth-eth-wire-types` (the pool and network-api use them). A TN-owned config
+struct replacing `NodeConfig` altogether is the follow-up. It would also let `reth-rpc-builder`
+take its server arguments from a small struct instead of `reth-node-core`.
 
 ## Phase 3: tndb-b as the reth database [later; owned by the tndb-b work]
 
