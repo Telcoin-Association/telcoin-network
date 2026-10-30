@@ -26,7 +26,12 @@ reth v1.11.3 vendored under `vendor/reth`; 101 crates plus `reth-testing-utils`.
 resolves to the same third-party versions and features as the git dependency did. Tag
 `reth-vendor-v1.11.3`.
 
-## Phase 1: drop the node-builder and node-ethereum layers [next]
+## Phase 1: drop the node-builder and node-ethereum layers [done]
+
+Done 2026-10-30: 24 reth crates and 9 third-party crates left the graph (CHANGES.md TN-0004,
+TN-0005). The numbered steps below are kept as a record. One correction to the plan:
+`DefaultEthPayloadTypes` is not dead, because `traits.rs` tests use it as a fixture, so it
+stayed.
 
 TN never uses reth's node builder. It assembles provider, EVM, pool and RPC itself. It still
 depends on `reth-node-builder` (for re-exports only) and `reth-node-ethereum` (for two types).
@@ -49,10 +54,10 @@ node-metrics.
 5. `vendor.py remove` every crate that left the graph, and delete their root `Cargo.toml`
    entries.
 
-Some of these crates may still be reachable through `reth-node-core` or `reth-rpc-builder`
-(`reth-engine-local`, for instance). Whatever stays is a Phase 2 item.
+`reth-engine-local` stays: `reth-node-core` depends on it. It is a Phase 2 item, together
+with `reth-rpc-engine-api`, which `reth-rpc` and `reth-rpc-builder` depend on.
 
-## Phase 2: the Ethereum p2p and node-config stack [later]
+## Phase 2: the Ethereum p2p and node-config stack [next]
 
 What still holds the devp2p stack (`reth-network`, `eth-wire`, `discv4`/`discv5`,
 `dns-discovery`, `ecies`, `net-nat`) in the graph is `reth-node-core`, through `NodeConfig`'s
