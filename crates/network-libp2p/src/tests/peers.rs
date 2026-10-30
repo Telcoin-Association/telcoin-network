@@ -3,7 +3,7 @@
 use super::*;
 use crate::{
     common::{create_multiaddr, random_ip_addr},
-    PeerExchangeKey,
+    peers::PeerExchangeKey,
 };
 use libp2p::PeerId;
 use rand::{rngs::StdRng, Rng as _, SeedableRng as _};
@@ -227,7 +227,7 @@ fn test_peer_exchange() {
     assert_eq!(exchange.0.len(), 3);
     let mut rng = StdRng::from_seed([0; 32]);
     let bls = *BlsKeypair::generate(&mut rng).public();
-    assert!(!exchange.0.contains_key(&PeerExchangeKey::from(bls)));
+    assert!(!exchange.0.contains_key(&PeerExchangeKey::from(&bls)));
 }
 
 #[test]

@@ -3519,15 +3519,15 @@ async fn test_kad_record_jobs_never_republish_stored_records() -> eyre::Result<(
     Ok(())
 }
 
-/// An identical signed PUT refreshes the stored row only when the refresh is due: its expiry must
-/// extend the stored one by more than half the configured TTL (see `identical_refresh`). An
-/// identical copy with a shorter expiry never undoes a refresh.
+/// An identical signed PUT carries a fresh wire expiry. The stored copy is rewritten only when
+/// the copy extends its expiry by more than half the configured TTL (or the row has lapsed), so
+/// a relayed copy cannot force one durable write per copy (GHSA-4947-9xvx-pv2m), and the kept
+/// expiry never shrinks.
 #[tokio::test]
 async fn test_identical_kad_record_refreshes_expiry() -> eyre::Result<()> {
     let TestTypes { peer1, peer2, .. } =
         create_test_types::<TestWorkerRequest, TestWorkerResponse>();
     let mut network = peer1.network;
-    let ttl = network.config.kad_record_ttl;
     let source = *peer2.network.swarm.local_peer_id();
     let mut record = peer2.network.get_peer_record();
     network
@@ -3536,6 +3536,7 @@ async fn test_identical_kad_record_refreshes_expiry() -> eyre::Result<()> {
         .kademlia
         .store_mut()
         .retain_connected(source, record.key.clone())?;
+    let ttl = network.config.kad_record_ttl;
     let instant = std::time::Instant::now();
     record.expires = Some(instant + Duration::from_secs(60));
     network.process_kad_put_request(source, record.clone())?;
@@ -3548,7 +3549,7 @@ async fn test_identical_kad_record_refreshes_expiry() -> eyre::Result<()> {
         .and_then(|stored| stored.expires)
         .ok_or_else(|| eyre!("initial expiry"))?;
 
-    // An identical copy that extends the row by less than ttl/2 is not worth a durable write.
+    // A copy that extends the expiry by less than half the TTL is a free relay: nothing is written.
     record.expires = Some(instant + Duration::from_secs(120));
     network.process_kad_put_request(source, record.clone())?;
     let stored = network
@@ -3557,34 +3558,35 @@ async fn test_identical_kad_record_refreshes_expiry() -> eyre::Result<()> {
         .kademlia
         .store_mut()
         .get(&record.key)
-        .ok_or_else(|| eyre!("record after an early identical copy"))?
+        .ok_or_else(|| eyre!("record after a short extension"))?
         .into_owned();
     assert_eq!(stored.value, record.value);
     assert_eq!(stored.publisher, record.publisher);
-    let kept_expiry = stored.expires.ok_or_else(|| eyre!("kept expiry"))?;
+    // The store rebuilds the `Instant` on every read, so compare with a tolerance.
+    let unchanged_expiry = stored.expires.ok_or_else(|| eyre!("expiry after a short extension"))?;
     assert!(
-        kept_expiry.saturating_duration_since(first_expiry) < Duration::from_secs(1)
-            && first_expiry.saturating_duration_since(kept_expiry) < Duration::from_secs(1),
-        "an identical copy that is not due must leave the stored expiry in place"
+        unchanged_expiry.saturating_duration_since(first_expiry) < Duration::from_secs(1)
+            && first_expiry.saturating_duration_since(unchanged_expiry) < Duration::from_secs(1),
+        "a short extension must not rewrite the row"
     );
 
-    // An identical copy that extends the row by more than ttl/2 refreshes it.
-    record.expires = Some(instant + ttl);
+    // A copy that extends it by more than half the TTL refreshes the stored copy.
+    record.expires = Some(instant + Duration::from_secs(120) + ttl / 2);
     network.process_kad_put_request(source, record.clone())?;
-    let refreshed_expiry = network
+    let stored = network
         .swarm
         .behaviour_mut()
         .kademlia
         .store_mut()
         .get(&record.key)
-        .and_then(|stored| stored.expires)
-        .ok_or_else(|| eyre!("refreshed expiry"))?;
-    assert!(
-        refreshed_expiry > first_expiry + ttl / 2,
-        "an identical copy that is due must refresh the stored expiry"
-    );
+        .ok_or_else(|| eyre!("refreshed record"))?
+        .into_owned();
+    assert_eq!(stored.value, record.value);
+    assert_eq!(stored.publisher, record.publisher);
+    assert!(stored.expires.is_some_and(|expiry| expiry > first_expiry + ttl / 2));
 
     // A replicated copy with less remaining TTL must not undo the refresh.
+    let refreshed_expiry = stored.expires.ok_or_else(|| eyre!("refreshed expiry"))?;
     record.expires = Some(instant + Duration::from_secs(90));
     network.process_kad_put_request(source, record.clone())?;
     let retained_expiry = network
@@ -5462,11 +5464,9 @@ fn historical_epoch_replay_never_charges_the_author() {
                 RejectPenalty::Skip
             );
         });
-        let expected =
-            if relayer_resolved { RejectPenalty::FatalRelayer } else { RejectPenalty::Skip };
         assert_eq!(
-            RejectReason::TooLarge.penalty(relayer_resolved, true, EpochPosition::Historical),
-            expected
+            RejectReason::TooLarge.penalty(true, relayer_resolved, EpochPosition::Historical),
+            RejectPenalty::FatalRelayer
         );
     });
 }
@@ -5534,12 +5534,11 @@ async fn live_epoch_still_bans_unauthorized_author() -> eyre::Result<()> {
 /// An oversized payload is the only relayer-attributable reject — the size bound is a compile-time
 /// protocol constant (`MAX_GOSSIP_MESSAGE_SIZE`), identical on every honest node and enforced on
 /// both the publish and receive paths, so an honest peer never originates or forwards one — and it
-/// is charged to the forwarder only once its BLS identity has resolved (the author's resolution is
-/// irrelevant), mirroring the Accept path's unresolved-relayer skip.
+/// is charged to the forwarder only once its BLS identity has resolved (the author's resolution and
+/// the epoch position are irrelevant), mirroring the Accept path's unresolved-relayer skip.
 #[test]
 fn oversized_reject_penalizes_only_a_resolved_relayer() {
     for author_resolved in [true, false] {
-        // the size bound is protocol wide, so the charge does not depend on the epoch position
         for position in [EpochPosition::Live, EpochPosition::Historical] {
             assert_eq!(
                 RejectReason::TooLarge.penalty(true, author_resolved, position),
