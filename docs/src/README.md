@@ -7,10 +7,13 @@ This documentation is designed to help familiarize builders with the Telcoin Net
 Brief run downs of the docs sections are given below:
 
 * Getting Started - Guides to help developers start building with Telcoin Network.
+  * Installing a Release - Download a signed node binary or Docker image and verify it.
+  * Release Notes - Changes in each tagged release, newest first.
   * Reading Blockchain Data - An overview of the simplest types of blockchain interactions.
   * Dapp Development - Let's start building decentralized apps!
 * Networks and RPC Endpoints - Reference documentation for connecting to Telcoin Network.
 * RPC Methods - Reference documentation providing information on interacting with nodes.
+* Maintainers - How maintainers cut, sign, and publish releases.
 
 ### Windows users
 

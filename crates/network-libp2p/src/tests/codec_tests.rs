@@ -434,3 +434,41 @@ async fn test_withheld_body_holds_no_declared_memory_while_parked() {
     assert_eq!(compressed_buffer.len(), 0, "no body bytes arrived while parked");
     assert_eq!(decode_buffer.len(), 0, "decompression never ran while parked");
 }
+
+/// A goodbye map over the entry cap is a codec violation (`InvalidData`), the class the exchange
+/// handler charges, and is rejected from its length prefix before any entry decodes.
+#[tokio::test]
+async fn test_peer_exchange_codec_rejects_map_over_entry_cap() {
+    use crate::peers::{
+        PeerExchangeKey, MAX_PEER_EXCHANGE_ENTRIES, MAX_PEER_EXCHANGE_MESSAGE_SIZE,
+    };
+    use rand::{rngs::StdRng, SeedableRng};
+    use std::collections::{HashMap, HashSet};
+    use tn_types::{BlsKeypair, NetworkKeypair, NetworkPublicKey};
+
+    let mut rng = StdRng::from_seed([1; 32]);
+    let net: NetworkPublicKey = NetworkKeypair::generate_ed25519().public().clone().into();
+    let entry = |_: usize| {
+        let key = PeerExchangeKey::from(*BlsKeypair::generate(&mut rng).public());
+        (key, (net.clone(), HashSet::<libp2p::Multiaddr>::new()))
+    };
+    let over_cap: HashMap<_, _> = (0..=MAX_PEER_EXCHANGE_ENTRIES).map(entry).collect();
+    assert_eq!(over_cap.len(), MAX_PEER_EXCHANGE_ENTRIES + 1);
+    let exchange = PeerExchangeMap::from(over_cap);
+
+    // the producer side is trusted: encoding is unbounded
+    let mut encoded = Vec::new();
+    encode_message(&mut encoded, &exchange, &mut Vec::new(), &mut Vec::new(), 1024 * 1024)
+        .await
+        .expect("encode over-cap map");
+
+    let err = decode_message::<_, PeerExchangeMap>(
+        &mut encoded.as_slice(),
+        &mut Vec::new(),
+        &mut Vec::new(),
+        MAX_PEER_EXCHANGE_MESSAGE_SIZE,
+    )
+    .await
+    .expect_err("map over the entry cap must not decode");
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+}

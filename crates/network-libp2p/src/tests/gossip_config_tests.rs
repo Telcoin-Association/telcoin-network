@@ -1,4 +1,5 @@
-//! Tests for the explicit gossipsub frame limits (issue #1655).
+//! Tests for the explicit gossipsub frame limits (issue #1655) and the cap on message ids per
+//! `IHAVE` (issue #1700).
 
 use super::*;
 use eyre::eyre;
@@ -474,5 +475,243 @@ async fn test_gossip_frame_limits_on_the_wire() -> eyre::Result<()> {
         expected.iter().map(Vec::len).collect::<Vec<_>>()
     );
     assert!(delivered == expected, "the delivered payloads differ from the honest payloads");
+    Ok(())
+}
+
+/// A sequence number like the ones gossipsub 0.50.0 publishes: a Unix time in nanoseconds
+/// (19 digits).
+const NANOSECOND_SEQNO: u64 = 1_760_000_000_000_000_000;
+
+/// Encode one length-prefixed RPC frame whose control field holds one `IHAVE` for `topic` with
+/// `ids` (`Rpc.control` = 3, `ControlMessage.ihave` = 1, `topic_id` = 1, `message_ids` = 2).
+///
+/// Return the frame and the control bytes the codec counts for it: the whole `Rpc.control`
+/// field, with its tag and length.
+fn ihave_frame(topic: &str, ids: &[Vec<u8>]) -> (Vec<u8>, usize) {
+    let ihave =
+        [field(1, topic.as_bytes()), ids.iter().flat_map(|id| field(2, id)).collect()].concat();
+    let control = field(3, &field(1, &ihave));
+    let control_bytes = control.len();
+    ([varint(control_bytes), control].concat(), control_bytes)
+}
+
+/// The control bytes the codec counts for one `IWANT` of `ids` (`ControlMessage.iwant` = 2,
+/// `message_ids` = 1).
+fn iwant_control_bytes(ids: &[Vec<u8>]) -> usize {
+    let iwant: Vec<u8> = ids.iter().flat_map(|id| field(1, id)).collect();
+    field(3, &field(2, &iwant)).len()
+}
+
+/// The default message id the node's gossipsub configuration gives a message from `source`
+/// with sequence number `seqno`.
+fn default_message_id(config: &gossipsub::Config, source: PeerId, seqno: u64) -> Vec<u8> {
+    config
+        .message_id(&gossipsub::Message {
+            source: Some(source),
+            data: Vec::new(),
+            sequence_number: Some(seqno),
+            topic: gossipsub::TopicHash::from_raw("unused"),
+        })
+        .0
+}
+
+/// `count` distinct default message ids of one ed25519 publisher with nanosecond sequence
+/// numbers. Each id is 71 bytes.
+fn ed25519_ids(config: &gossipsub::Config, count: usize) -> eyre::Result<Vec<Vec<u8>>> {
+    let source = Keypair::generate_ed25519().public().to_peer_id();
+    Ok((0..u64::try_from(count)?)
+        .map(|offset| default_message_id(config, source, NANOSECOND_SEQNO + offset))
+        .collect())
+}
+
+/// `count` distinct message ids of exactly [`GOSSIP_MESSAGE_ID_BOUND`] bytes.
+fn bound_ids(count: usize) -> Vec<Vec<u8>> {
+    let width = GOSSIP_MESSAGE_ID_BOUND;
+    (0..count).map(|index| format!("{index:0width$}").into_bytes()).collect()
+}
+
+/// A topic of exactly [`GOSSIP_TOPIC_BOUND`] bytes: [`longest_topic`] padded with `-`.
+fn bound_topic() -> String {
+    let topic = longest_topic();
+    let width = GOSSIP_TOPIC_BOUND;
+    format!("{topic:-<width$}")
+}
+
+/// The cap on message ids per `IHAVE` reaches the gossipsub config, and each bound equals a
+/// pinned number.
+#[test]
+fn test_gossipsub_config_pins_ihave_id_cap() -> Result<(), ConfigBuilderError> {
+    let config = gossipsub_config(TEST_CHAIN_ID)?;
+
+    // the setter writes the IHAVE cap and the IWANT cap per peer per heartbeat
+    assert_eq!(config.max_control_messages_sent(), GOSSIP_MAX_IHAVE_IDS);
+
+    // pinned values: a change here must be a reviewed decision
+    assert_eq!(GOSSIP_MAX_IHAVE_IDS, 198);
+    assert_eq!(GOSSIP_MESSAGE_ID_BOUND, 80);
+    assert_eq!(GOSSIP_TOPIC_BOUND, 64);
+
+    // one IHAVE lists the ids of the last three heartbeats
+    assert_eq!(config.history_gossip(), 3);
+    // the longest topic the node uses is within the topic bound
+    assert!(longest_topic().len() <= GOSSIP_TOPIC_BOUND);
+    Ok(())
+}
+
+/// [`GOSSIP_MESSAGE_ID_BOUND`] covers every default message id: an ed25519 publisher gives 71
+/// bytes, and the longest peer id with the widest sequence number gives exactly the bound.
+#[test]
+fn test_gossip_message_id_bound_covers_default_ids() -> eyre::Result<()> {
+    let config = gossipsub_config(TEST_CHAIN_ID)?;
+
+    // ed25519 peer id (52 base58 characters) and a nanosecond sequence number (19 digits)
+    let ed25519 = Keypair::generate_ed25519().public().to_peer_id();
+    assert_eq!(default_message_id(&config, ed25519, NANOSECOND_SEQNO).len(), 71);
+
+    // the longest peer id is an identity multihash of a 42-byte key (44 bytes, 60 base58
+    // characters), and u64::MAX has 20 digits
+    let longest_bytes: Vec<u8> = [0x00, 0x2a].into_iter().chain([0xff; 42]).collect();
+    let longest = PeerId::from_bytes(&longest_bytes)?;
+    assert_eq!(longest.to_bytes().len(), 44);
+    assert_eq!(default_message_id(&config, longest, u64::MAX).len(), GOSSIP_MESSAGE_ID_BOUND);
+    Ok(())
+}
+
+/// Without the cap, honest gossip passes the control limit. An `IHAVE` of 71-byte ids passes
+/// it at 225 ids on a 15-byte topic and at 224 ids on the longest topic, and the library
+/// default lets the node send up to 5000 ids.
+#[test]
+fn test_ihave_of_default_ids_passes_the_control_limit() -> eyre::Result<()> {
+    let config = gossipsub_config(TEST_CHAIN_ID)?;
+    let limit = config.max_control_message_size();
+    let control_bytes = |topic: &str, count: usize| -> eyre::Result<usize> {
+        Ok(ihave_frame(topic, &ed25519_ids(&config, count)?).1)
+    };
+
+    let short_topic = "t".repeat(15);
+    assert!(control_bytes(&short_topic, 224)? <= limit);
+    assert!(control_bytes(&short_topic, 225)? > limit);
+
+    let topic = longest_topic();
+    assert_eq!(topic.len(), 40);
+    assert!(control_bytes(&topic, 223)? <= limit);
+    assert!(control_bytes(&topic, 224)? > limit);
+
+    // the cap is below both counts
+    assert!(config.max_control_messages_sent() < 223);
+    Ok(())
+}
+
+/// An `IHAVE` at the cap fits the control limit with the largest ids on the largest topic, and
+/// one more id does not. An `IWANT` at the cap fits too.
+#[test]
+fn test_ihave_id_cap_fits_the_control_limit() -> eyre::Result<()> {
+    let config = gossipsub_config(TEST_CHAIN_ID)?;
+    let limit = config.max_control_message_size();
+    let cap = config.max_control_messages_sent();
+    let topic = bound_topic();
+    assert_eq!(topic.len(), GOSSIP_TOPIC_BOUND);
+
+    // ids at the id bound on a topic at the topic bound
+    let (frame, at_cap) = ihave_frame(&topic, &bound_ids(cap));
+    assert!(at_cap <= limit);
+    assert!(frame.len() <= GOSSIP_FRAME_BOUND);
+    assert!(ihave_frame(&topic, &bound_ids(cap + 1)).1 > limit);
+
+    // ids of today's size on the longest topic the node uses
+    assert!(ihave_frame(&longest_topic(), &ed25519_ids(&config, cap)?).1 <= limit);
+
+    // the IWANT the node sends one peer in one heartbeat
+    assert!(iwant_control_bytes(&bound_ids(cap)) <= limit);
+    Ok(())
+}
+
+/// Start a receiver that runs [`gossipsub_config`] subscribed to `topic`, and a raw sender
+/// connected to it.
+///
+/// Return the sender's substream opener, the payloads the receiver delivers (in delivery
+/// order) and the sender's identity.
+async fn raw_gossip_pair(
+    topic: &str,
+) -> eyre::Result<(SubstreamOpener, mpsc::UnboundedReceiver<Vec<u8>>, Keypair)> {
+    let protocol = StreamProtocol::try_from_owned(format!(
+        "{}/1.1.0",
+        gossip_protocol_id_prefix(TEST_CHAIN_ID)
+    ))
+    .map_err(|e| eyre!("gossip protocol: {e:?}"))?;
+
+    // receiver: the node's gossipsub configuration, subscribed to the topic
+    let receiver_key = Keypair::generate_ed25519();
+    let mut gossip: gossipsub::Behaviour = gossipsub::Behaviour::new(
+        gossipsub::MessageAuthenticity::Signed(receiver_key.clone()),
+        gossipsub_config(TEST_CHAIN_ID)?,
+    )
+    .map_err(|e| eyre!("gossipsub behaviour: {e}"))?;
+    gossip.subscribe(&gossipsub::IdentTopic::new(topic)).map_err(|e| eyre!("subscribe: {e:?}"))?;
+    let mut receiver = SwarmBuilder::with_existing_identity(receiver_key)
+        .with_tokio()
+        .with_quic()
+        .with_behaviour(|_| gossip)
+        .map_err(|e| eyre!("receiver behaviour: {e:?}"))?
+        .with_swarm_config(|c| c.with_idle_connection_timeout(WIRE_TIMEOUT))
+        .build();
+    receiver.listen_on("/ip4/127.0.0.1/udp/0/quic-v1".parse()?)?;
+    let address = (&mut receiver)
+        .filter_map(listen_address)
+        .next()
+        .await
+        .ok_or_else(|| eyre!("the receiver stopped before it listened"))?;
+
+    // forward every delivered payload, in delivery order
+    let (delivered_tx, delivered_rx) = mpsc::unbounded_channel();
+    tokio::spawn(receiver.for_each(move |event| {
+        if let SwarmEvent::Behaviour(gossipsub::Event::Message { message, .. }) = event {
+            let _ = delivered_tx.send(message.data);
+        }
+        future::ready(())
+    }));
+
+    // sender: raw substreams on the same gossipsub protocol
+    let sender_key = Keypair::generate_ed25519();
+    let (opener, requests) = mpsc::unbounded_channel();
+    let raw_sender = RawGossipSender { protocol, requests: Some(requests) };
+    let mut sender = SwarmBuilder::with_existing_identity(sender_key.clone())
+        .with_tokio()
+        .with_quic()
+        .with_behaviour(|_| raw_sender)
+        .map_err(|e| eyre!("sender behaviour: {e:?}"))?
+        .with_swarm_config(|c| c.with_idle_connection_timeout(WIRE_TIMEOUT))
+        .build();
+    sender.dial(address)?;
+    tokio::spawn(sender.for_each(|_| future::ready(())));
+    Ok((opener, delivered_rx, sender_key))
+}
+
+/// On the wire, through the gossipsub 0.50.0 handler and codec, an `IHAVE` at the cap keeps its
+/// substream open, and one more id closes the substream.
+///
+/// The ids are at the id bound and the topic is at the topic bound. A sentinel publish frame
+/// follows the `IHAVE` on the same substream, and the receiver delivers it only if it did not
+/// close that substream.
+#[tokio::test]
+async fn test_ihave_id_cap_on_the_wire() -> eyre::Result<()> {
+    let topic = bound_topic();
+    let cap = gossipsub_config(TEST_CHAIN_ID)?.max_control_messages_sent();
+    let (opener, mut delivered_rx, sender_key) = raw_gossip_pair(&topic).await?;
+
+    // an IHAVE at the cap, then a sentinel, on one substream
+    let mut honest = open_substream(&opener).await?;
+    honest.write_all(&ihave_frame(&topic, &bound_ids(cap)).0).await?;
+    honest
+        .write_all(&publish_frame(&[signed_message(&sender_key, 1, &topic, b"sentinel")]))
+        .await?;
+    honest.flush().await?;
+    let delivered = tokio::time::timeout(WIRE_TIMEOUT, delivered_rx.recv())
+        .await
+        .map_err(|_| eyre!("the receiver closed the substream of an IHAVE at the cap"))?;
+    assert_eq!(delivered, Some(b"sentinel".to_vec()));
+
+    // one id over the cap: the receiver closes the substream
+    expect_refused(&opener, &ihave_frame(&topic, &bound_ids(cap + 1)).0).await?;
     Ok(())
 }

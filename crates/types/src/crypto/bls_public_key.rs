@@ -250,49 +250,38 @@ impl Serialize for BlsPublicKey {
     }
 }
 
-impl<'de> Deserialize<'de> for BlsPublicKeyBytes {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+/// Serde visitor that decompresses the G2 point exactly once and keeps the result.
+///
+/// Both [`BlsPublicKey`] and [`BlsPublicKeyBytes`] deserialize through it, so a key costs one
+/// decompression on every serde path. The bytes form compresses the validated point back out,
+/// which is cheap, instead of validating the bytes here and decompressing them again in `From`.
+struct BlsPublicKeyVisitor;
+
+impl serde::de::Visitor<'_> for BlsPublicKeyVisitor {
+    type Value = BlsPublicKey;
+
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "valid bls public key bytes")
+    }
+
+    fn visit_bytes<E>(self, v: &[u8]) -> Result<Self::Value, E>
     where
-        D: serde::Deserializer<'de>,
+        E: serde::de::Error,
     {
-        use serde::de::*;
+        // Deserialize into an actual BLS public key so we are sure to have valid bytes.
+        blst::min_sig::PublicKey::deserialize(v)
+            .map(Into::into)
+            .map_err(|_| E::invalid_value(serde::de::Unexpected::Bytes(v), &self))
+    }
 
-        struct BlsPublicKeyBytesVisitor;
-
-        impl Visitor<'_> for BlsPublicKeyBytesVisitor {
-            type Value = BlsPublicKeyBytes;
-
-            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-                write!(f, "valid bls public key bytes")
-            }
-
-            fn visit_bytes<E>(self, v: &[u8]) -> Result<Self::Value, E>
-            where
-                E: Error,
-            {
-                // Deserialize into an actual BLS publix key so we are sure to have valid bytes.
-                let pubkey: CorePublicKey = blst::min_sig::PublicKey::deserialize(v)
-                    .map_err(|_| Error::invalid_value(Unexpected::Bytes(v), &self))?;
-                let pubkey: BlsPublicKey = pubkey.into();
-                Ok(pubkey.into())
-            }
-
-            fn visit_str<E>(self, v: &str) -> Result<Self::Value, E>
-            where
-                E: Error,
-            {
-                let bytes = bs58::decode(v)
-                    .into_vec()
-                    .map_err(|_| Error::invalid_value(Unexpected::Str(v), &self))?;
-                self.visit_bytes(&bytes)
-            }
-        }
-
-        if deserializer.is_human_readable() {
-            deserializer.deserialize_str(BlsPublicKeyBytesVisitor)
-        } else {
-            deserializer.deserialize_bytes(BlsPublicKeyBytesVisitor)
-        }
+    fn visit_str<E>(self, v: &str) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        let bytes = bs58::decode(v)
+            .into_vec()
+            .map_err(|_| E::invalid_value(serde::de::Unexpected::Str(v), &self))?;
+        self.visit_bytes(&bytes)
     }
 }
 
@@ -301,7 +290,20 @@ impl<'de> Deserialize<'de> for BlsPublicKey {
     where
         D: serde::Deserializer<'de>,
     {
-        Ok(BlsPublicKeyBytes::deserialize(deserializer)?.into())
+        if deserializer.is_human_readable() {
+            deserializer.deserialize_str(BlsPublicKeyVisitor)
+        } else {
+            deserializer.deserialize_bytes(BlsPublicKeyVisitor)
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for BlsPublicKeyBytes {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        <BlsPublicKey as Deserialize>::deserialize(deserializer).map(Into::into)
     }
 }
 
@@ -310,6 +312,30 @@ mod tests {
     use super::*;
     use crate::BlsKeypair;
     use rand::{rngs::StdRng, SeedableRng};
+
+    /// Both serde forms share one visitor: a key decodes to the same point on either path, the
+    /// bytes form keeps the compressed wire encoding, and junk of the right length is rejected
+    /// by both.
+    #[test]
+    fn serde_forms_agree_and_reject_non_points() {
+        let keypair = BlsKeypair::generate(&mut StdRng::from_seed([12u8; 32]));
+        let key = *keypair.public();
+        let encoded = bcs::to_bytes(&key).expect("encode key");
+
+        let decoded_key: BlsPublicKey = bcs::from_bytes(&encoded).expect("decode key");
+        let decoded_bytes: BlsPublicKeyBytes = bcs::from_bytes(&encoded).expect("decode bytes");
+        assert_eq!(decoded_key, key);
+        assert_eq!(decoded_bytes, BlsPublicKeyBytes::from(key));
+        assert_eq!(bcs::to_bytes(&decoded_bytes).expect("encode bytes"), encoded);
+
+        // a bcs byte string of the compressed length that is not a point
+        let junk: Vec<u8> =
+            std::iter::once(u8::try_from(BlsPublicKey::COMPRESSED_BYTES).expect("fits u8"))
+                .chain(std::iter::repeat(7u8).take(BlsPublicKey::COMPRESSED_BYTES))
+                .collect();
+        assert!(bcs::from_bytes::<BlsPublicKey>(&junk).is_err());
+        assert!(bcs::from_bytes::<BlsPublicKeyBytes>(&junk).is_err());
+    }
 
     /// The two encoding lengths are the ones `blst` actually accepts, taken from a real key rather
     /// than asserted from the constants alone. If `blst` ever changed either size, the constants

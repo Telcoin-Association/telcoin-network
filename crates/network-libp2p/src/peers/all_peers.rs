@@ -995,6 +995,9 @@ impl AllPeers {
     }
 
     /// Collect connected peers to exchange with disconnecting peer.
+    ///
+    /// Truncated to [`MAX_PEER_EXCHANGE_ENTRIES`](super::types::MAX_PEER_EXCHANGE_ENTRIES) so
+    /// the receiver's bounded decoder always accepts an honest map.
     pub(super) fn peer_exchange(&self) -> PeerExchangeMap {
         self.peers
             .values()
@@ -1005,6 +1008,7 @@ impl AllPeers {
                     None
                 }
             })
+            .take(super::types::MAX_PEER_EXCHANGE_ENTRIES)
             .collect::<HashMap<_, _>>()
             .into()
     }

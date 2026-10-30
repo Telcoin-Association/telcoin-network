@@ -7,7 +7,7 @@ use crate::{
     diagnostics::{bounded_error, bounded_reply_error as error, bounded_warn},
     error::NetworkError,
     gossip_config::gossipsub_config,
-    kad::{node_record_key, KadStore},
+    kad::{identical_refresh, node_record_key, KadStore},
     metrics::{
         ConnectionLimitReason, InboundFailureOutcome, InboundRejection, PeerManagerMetrics,
         SwarmMetrics,
@@ -20,9 +20,9 @@ use crate::{
     service_class::{InboundOccupancy, ServiceClass},
     stream::{StreamBehavior, StreamEvent},
     types::{
-        GossipPayload, KadQuery, NetworkCommand, NetworkEvent, NetworkHandle, NetworkInfo,
-        NetworkResponseMessage, NetworkResponseSender, NetworkResult, NetworkType, NetworkTypeExt,
-        NodeRecord, RecordDomain, ResponseChannel, RpcInfo,
+        EpochPosition, GossipPayload, KadQuery, NetworkCommand, NetworkEvent, NetworkHandle,
+        NetworkInfo, NetworkResponseMessage, NetworkResponseSender, NetworkResult, NetworkType,
+        NetworkTypeExt, NodeRecord, RecordDomain, ResponseChannel, RpcInfo,
     },
     PeerExchangeMap,
 };
@@ -92,6 +92,9 @@ mod inbound_service_tests;
 #[cfg(test)]
 #[path = "tests/admission_contention.rs"]
 mod admission_contention;
+#[cfg(test)]
+#[path = "tests/catch_up_contention.rs"]
+mod catch_up_contention;
 
 #[cfg(test)]
 #[path = "tests/loop_budget_tests.rs"]
@@ -487,6 +490,13 @@ where
     /// This set must be updated at the start of each epoch. It is used to verify messages
     /// published on certain topics. These are updated when the caller subscribes to a topic.
     authorized_publishers: HashMap<String, Option<HashSet<BlsPublicKey>>>,
+    /// Where the epoch this node runs stands relative to the live network.
+    ///
+    /// Set at every epoch entry with the allowlists of that epoch. The reject path charges an
+    /// unauthorized author only at `EpochPosition::Live`: while the node replays a historical
+    /// epoch, a resolved author outside the replayed allowlists is most likely a live committee
+    /// member of a later epoch, so the message is dropped without a penalty.
+    epoch_position: EpochPosition,
     /// The collection of pending _graceful_ disconnects.
     ///
     /// This node disconnects from new peers if it already has the target number of peers.
@@ -690,7 +700,14 @@ where
         // name, so the peer-exchange map no longer has to ride inside the consensus
         // request enums. The embedded variants remain as the fallback for
         // not-yet-upgraded peers until the coordinated `/0.0.2` bump.
-        let px_codec = PeerExchangeCodec::new(network_config.libp2p_config().max_rpc_message_size);
+        // A goodbye carries at most a capped map (`MAX_PEER_EXCHANGE_MESSAGE_SIZE`), so the
+        // exchange codec never commits the full RPC budget to one stream.
+        let px_codec = PeerExchangeCodec::new(
+            network_config
+                .libp2p_config()
+                .max_rpc_message_size
+                .min(peers::MAX_PEER_EXCHANGE_MESSAGE_SIZE),
+        );
         let peer_exchange = request_response::Behaviour::with_codec(
             px_codec,
             vec![(network_type.peer_exchange_protocol(chain_id)?, ProtocolSupport::Full)],
@@ -871,6 +888,7 @@ where
             commands,
             event_stream,
             authorized_publishers: Default::default(),
+            epoch_position: EpochPosition::default(),
             outbound_requests: Default::default(),
             inbound_requests: Default::default(),
             inbound_pending: InboundOccupancy::default(),
@@ -1149,6 +1167,10 @@ where
             self.metrics.set_pending_incoming_connections(
                 self.swarm.network_info().connection_counters().num_pending_incoming(),
             );
+            self.swarm
+                .behaviour()
+                .peer_manager
+                .observe_committee_resolution(self.key_config.primary_public_key());
         }
     }
 
@@ -1463,14 +1485,15 @@ where
                 send_or_log_error!(reply, self.connected_peers.len(), "EstablishedPeerCount");
             }
             NetworkCommand::ConnectedPeers { reply } => {
-                let peers = self
-                    .swarm
-                    .behaviour()
-                    .peer_manager
+                let peer_manager = &self.swarm.behaviour().peer_manager;
+                // current-committee members first (stable order), so a caller that tries
+                // peers in order reaches the peers most likely to hold consensus data first
+                let (committee, others): (Vec<_>, Vec<_>) = peer_manager
                     .connected_or_dialing_peers()
                     .iter()
-                    .flat_map(|id| self.swarm.behaviour().peer_manager.peer_to_bls(id))
-                    .collect();
+                    .flat_map(|id| peer_manager.peer_to_bls(id))
+                    .partition(|bls| peer_manager.is_current_committee_member(bls));
+                let peers: Vec<_> = committee.into_iter().chain(others).collect();
                 debug!(target: "network", ?peers, "peer manager connected peers:");
                 send_or_log_error!(reply, peers, "ConnectedPeers");
             }
@@ -1561,6 +1584,10 @@ where
             NetworkCommand::PeersForExchange { reply } => {
                 let peers = self.swarm.behaviour_mut().peer_manager.peers_for_exchange();
                 send_or_log_error!(reply, peers, "PeersForExchange");
+            }
+            NetworkCommand::SetEpochPosition { position } => {
+                debug!(target: "network", ?position, "setting the epoch position for gossip rejects");
+                self.epoch_position = position;
             }
             NetworkCommand::UpdateCommittees { previous, current, next } => {
                 self.swarm.behaviour_mut().peer_manager.invalidate_admission();
@@ -1831,8 +1858,9 @@ where
                         // Resolve both candidate culprits, then let `reason` decide accountability
                         // (see `RejectReason::penalty`): an oversized payload is charged to the
                         // relaying peer, an unauthorized author to the author, each only once its
-                        // identity has resolved. The relaying peer is never penalized for an
-                        // author fault (#801/#785).
+                        // identity has resolved and, for the author, only while this node runs the
+                        // live epoch. The relaying peer is never penalized for an author fault
+                        // (#801/#785).
                         let relayer =
                             self.swarm.behaviour().peer_manager.peer_to_bls(&propagation_source);
                         let author_id = message.source;
@@ -1840,7 +1868,11 @@ where
                             .as_ref()
                             .and_then(|id| self.swarm.behaviour().peer_manager.peer_to_bls(id));
                         let topic = &message.topic;
-                        match reason.penalty(relayer.is_some(), author.is_some()) {
+                        match reason.penalty(
+                            relayer.is_some(),
+                            author.is_some(),
+                            self.epoch_position,
+                        ) {
                             RejectPenalty::FatalRelayer => {
                                 bounded_warn!(Gossip,
                                     target: "network",
@@ -1873,7 +1905,7 @@ where
                                     ?reason,
                                     ?topic,
                                     ?propagation_source,
-                                    "rejecting gossip without an attributable penalty (unresolved relayer/author, or this node's committee-view lag)"
+                                    "rejecting gossip without an attributable penalty (unresolved relayer/author, this node's committee-view lag, or a historical epoch replay)"
                                 );
                             }
                         }
@@ -2383,9 +2415,21 @@ where
                 }
             }
             ReqResEvent::InboundFailure { peer, request_id, error, connection_id: _ } => {
-                // never penalized: the exchange is best-effort and both sides
-                // disconnect afterwards regardless
                 debug!(target: "network", ?peer, ?request_id, ?error, "Inbound failure for peer exchange");
+                // A frame the codec rejects (bad prefix, bad snappy, bad BCS, or a map over
+                // the entry or address caps) is a protocol violation, charged like the same
+                // violation on the consensus req-res protocol. Everything else is a transport
+                // flap or honest version skew: the exchange is best-effort and both sides
+                // disconnect afterwards regardless.
+                if matches!(&error, ReqResInboundFailure::Io(e) if e.kind() == ErrorKind::InvalidData)
+                {
+                    bounded_warn!(Request,
+                        target: "network",
+                        ?peer, ?request_id,
+                        "malformed peer exchange (codec violation)"
+                    );
+                    self.swarm.behaviour_mut().peer_manager.process_penalty(peer, Penalty::Medium);
+                }
             }
             ReqResEvent::ResponseSent { peer, .. } => {
                 trace!(target: "network", ?peer, "peer exchange ack sent");
@@ -2994,15 +3038,23 @@ where
                     let timestamp = self.admission_timestamp(key, value.info.timestamp, observed);
                     let freshness = self.record_freshness(&record, timestamp, observed);
                     let should_store = if freshness == RecordFreshness::Identical {
-                        // A relayed identical copy can carry less remaining TTL. Refreshing it must
-                        // not shorten the lifetime we already accepted. None means no expiry.
+                        // A relayed identical copy carries a fresh wire expiry, so the stored
+                        // expiry moves on every copy. Writing the row each time turns a free relay
+                        // (no BLS work after the first copy) into one durable commit on the kad
+                        // writer that every swarm shares (GHSA-4947-9xvx-pv2m). Keep the longer
+                        // lifetime and write the row only when the refresh is due. None means no
+                        // expiry.
+                        let ttl = self.config.kad_record_ttl;
                         self.swarm.behaviour_mut().kademlia.store_mut().get(&record.key).is_none_or(
                             |existing| {
-                                record.expires = existing
-                                    .expires
-                                    .zip(record.expires)
-                                    .map(|(old, new)| old.max(new));
-                                record.expires != existing.expires
+                                let refresh = identical_refresh(
+                                    existing.expires,
+                                    record.expires,
+                                    std::time::Instant::now(),
+                                    ttl,
+                                );
+                                record.expires = refresh.expires();
+                                refresh.store()
                             },
                         )
                     } else {
@@ -3373,11 +3425,28 @@ impl RejectReason {
     /// exemption in the peer manager. Either penalty is skipped until the accountable peer's
     /// identity resolves: unattributable otherwise (the same join-window race the Accept path
     /// documents), which for the author also covers the anonymous-message and view-lag cases.
-    fn penalty(self, relayer_resolved: bool, author_resolved: bool) -> RejectPenalty {
+    ///
+    /// The author penalty also needs `position` to be [`EpochPosition::Live`]. A replaying node
+    /// holds the publisher allowlists of the historical epoch it replays, while the live committee
+    /// of a later epoch publishes on the same topics (topic names carry only the chain id). A
+    /// resolved author outside the replayed allowlists is then most likely a live committee member
+    /// outside the replayed committee window, which the peer manager's committee exemption does
+    /// not cover, so the message is dropped without a penalty. The size penalty does not depend on
+    /// the position: that bound is protocol wide.
+    fn penalty(
+        self,
+        relayer_resolved: bool,
+        author_resolved: bool,
+        position: EpochPosition,
+    ) -> RejectPenalty {
         match self {
             RejectReason::TooLarge if relayer_resolved => RejectPenalty::FatalRelayer,
             RejectReason::TooLarge => RejectPenalty::Skip,
-            RejectReason::UnauthorizedAuthor if author_resolved => RejectPenalty::FatalAuthor,
+            RejectReason::UnauthorizedAuthor
+                if author_resolved && position == EpochPosition::Live =>
+            {
+                RejectPenalty::FatalAuthor
+            }
             RejectReason::UnauthorizedAuthor => RejectPenalty::Skip,
         }
     }
@@ -3402,6 +3471,7 @@ where
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ConsensusNetwork")
             .field("authorized_publishers", &self.authorized_publishers)
+            .field("epoch_position", &self.epoch_position)
             .field("pending_px_disconnects", &self.pending_px_disconnects)
             .field("pending_goodbyes", &self.pending_goodbyes)
             .field("outbound_requests", &self.outbound_requests.len())
