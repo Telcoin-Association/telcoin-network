@@ -114,8 +114,9 @@ them:
 - `reth-evm-ethereum` contributes three items. TN pins all forks at genesis, so a TN-owned
   `revm_spec` and receipt builder are small.
 - `reth-metrics` in nine TN crates becomes `metrics` plus `metrics-derive` (mechanical).
-- `reth-primitives` becomes `reth-primitives-traits` plus `reth-ethereum-primitives` (easy). Going
-  further (TN-owned `Sealed*`/`Recovered*`) touches about 150 sites through `tn-types`.
+- [done, TN-0012] `reth-primitives` became `reth-primitives-traits` plus `reth-ethereum-primitives`;
+  `tn-types` now owns the `Block`/`BlockBody`/`SealedBlock` aliases. Going further (TN-owned
+  `Sealed*`/`Recovered*`) touches about 150 sites through `tn-types`.
 - `reth-chainspec`: a TN chainspec implementing `EthChainSpec`/`EthereumHardforks`, so the
   provider, `EthApi` and pool bounds keep working.
 

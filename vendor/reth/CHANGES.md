@@ -132,3 +132,9 @@ newest last.
   *Files*: removed with `vendor.py remove`: rpc/rpc-engine-api, payload/builder,
   consensus/common.
   *Why*: after TN-0010 only the removed RPC modules reached them. *Upstream*: n/a.
+
+- **TN-0012** — Remove `reth-primitives`. *Kind*: removal.
+  *Files*: `crates/primitives` removed with `vendor.py remove`.
+  *Why*: a re-export crate. Once `tn-types` and `tn-reth` took its items from
+  `reth-primitives-traits` and `reth-ethereum-primitives` (with `tn-types` defining the `Block`,
+  `BlockBody` and `SealedBlock` aliases it had provided), nothing reaches it. *Upstream*: n/a.

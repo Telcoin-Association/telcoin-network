@@ -6,7 +6,7 @@ possible but optional.
 
 - Base: upstream `v1.11.3` (`d6324d63e27ef6b7c49cdc9b1977c1b808234c7b`); the pin is in
   `tn/upstream.toml`.
-- Carried: the reth crates in TN's dependency graph (64 after reduction Phases 1, 2 and 6a;
+- Carried: the reth crates in TN's dependency graph (63 after reduction Phases 1, 2, 4a and 6a;
   101 at import), plus the test-only `reth-testing-utils`. The list is in `tn/crates.txt`.
 - TN's changes against upstream: CHANGES.md, the ledger.
 - Why it is built this way: DECISIONS.md.

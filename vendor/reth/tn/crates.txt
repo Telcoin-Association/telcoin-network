@@ -30,7 +30,6 @@ crates/node/core
 crates/node/types
 crates/payload/builder-primitives
 crates/payload/primitives
-crates/primitives
 crates/primitives-traits
 crates/prune/types
 crates/revm
