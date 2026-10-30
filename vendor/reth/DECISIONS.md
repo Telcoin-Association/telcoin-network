@@ -120,3 +120,20 @@ When a surviving crate's tests need a crate that reduction removed (TN-0004:
 Keeping a removed crate as a dev-only dependency would keep its whole subgraph in the nested
 workspace and defeat the reduction. Where only part of a suite is affected, only that part
 goes (rpc-builder keeps its http/ws/startup tests).
+
+## D12. Slim vendored crates in place before replacing them
+
+Phase 2 removed the devp2p parts of `reth-node-core` (TN-0008) instead of replacing
+`NodeConfig` with a TN-owned struct. The slimming took a dozen deletions and left every remaining
+API as it was, so `tn-reth` and `reth-rpc-builder` kept compiling unchanged apart from the
+dropped arguments. A replacement would touch every `NodeConfig` user at once. Prefer the
+smallest in-place cut that removes a dependency edge, and record it in the ledger. Leave
+redesigns (a TN config struct) for when the remaining surface is small enough to see whole.
+
+## D13. A crate declares the features it uses
+
+Feature unification hides missing feature declarations. `reth-rpc` serialized
+`CanonStateNotification` without asking for `reth-chain-state/serde`, and compiled only because
+the devp2p crates enabled it (TN-0007). When a removal breaks a crate this way, fix the
+manifest of the crate that uses the feature, at the use site, not of whichever crate happened to
+enable it. Such fixes are worth offering upstream.
