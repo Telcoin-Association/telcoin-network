@@ -1,7 +1,11 @@
 //! Implement the libp2p network behavior to manage peers in the swarm.
 
 use super::{manager::PeerManager, types::DialRequest, PeerEvent};
-use crate::peers::types::ConnectionType;
+use crate::{
+    diagnostics::bounded_error,
+    metrics::{ConnectionDirection, ListenFailureReason},
+    peers::types::ConnectionType,
+};
 use libp2p::{
     core::{transport::PortUse, ConnectedPoint, Endpoint},
     swarm::{
@@ -9,16 +13,16 @@ use libp2p::{
         dial_opts::{DialOpts, PeerCondition},
         dummy::ConnectionHandler,
         ConnectionClosed, ConnectionDenied, ConnectionId, DialError, DialFailure, FromSwarm,
-        ListenError, ListenFailure, NetworkBehaviour, THandler, THandlerInEvent, ToSwarm,
+        ListenFailure, NetworkBehaviour, THandler, THandlerInEvent, ToSwarm,
     },
     Multiaddr, PeerId,
 };
 use std::task::{Context, Poll};
-use tracing::{debug, error, info, trace};
+use tracing::{debug, info, trace};
 
 /// A policy denial owned by the peer manager, preserved through libp2p's error wrapper.
-#[derive(Debug, Clone, Copy)]
-pub(super) enum PeerAdmissionDenied {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PeerAdmissionDenied {
     /// The remote identity is this swarm's own identity.
     LocalPeer,
     /// The authenticated remote peer is banned.
@@ -30,8 +34,12 @@ pub(super) enum PeerAdmissionDenied {
 }
 
 impl PeerAdmissionDenied {
+    /// Every policy denial, in label order.
+    pub(crate) const ALL: [Self; 4] =
+        [Self::LocalPeer, Self::BannedPeer, Self::InvalidIp, Self::ClosedAdmission];
+
     /// The bounded metric reason for this policy denial.
-    fn reason(&self) -> &'static str {
+    pub(crate) fn reason(&self) -> &'static str {
         match self {
             Self::LocalPeer => "peer_manager_local_peer",
             Self::BannedPeer => "peer_manager_banned_peer",
@@ -79,7 +87,7 @@ impl NetworkBehaviour for PeerManager {
     ) -> Result<Vec<Multiaddr>, ConnectionDenied> {
         // Check before the in-flight shortcut and Kademlia registration. Unknown identities
         // cannot start a Closed dial; every established connection is checked again.
-        self.check_admission(maybe_peer.as_ref(), "out")?;
+        self.check_admission(maybe_peer.as_ref(), ConnectionDirection::Outbound)?;
         // kademlia can initiate dial attempts
         //
         // ensure PeerId isn't banned if known and register dial attempt
@@ -154,9 +162,9 @@ impl NetworkBehaviour for PeerManager {
             return Err(ConnectionDenied::new(PeerAdmissionDenied::BannedPeer));
         }
         // Check admission after the local and ban checks, so those denials keep their labels.
-        self.check_admission(Some(&peer), "in")?;
+        self.check_admission(Some(&peer), ConnectionDirection::Inbound)?;
 
-        self.reserve_source(connection_id, peer, remote_addr, "in")?;
+        self.reserve_source(connection_id, peer, remote_addr, ConnectionDirection::Inbound)?;
         Ok(ConnectionHandler)
     }
 
@@ -176,16 +184,16 @@ impl NetworkBehaviour for PeerManager {
             return Err(ConnectionDenied::new("self-connection: remote peer id is our own"));
         }
         if self.peer_banned(&peer) {
-            error!(target: "peer-manager", ?peer, ?addr, "established outbound connection with banned peer - disconnecting...");
+            bounded_error!(PeerAdmission, target: "peer-manager", ?peer, ?addr, "established outbound connection with banned peer - disconnecting...");
             return Err(ConnectionDenied::new("peer is banned"));
         }
 
         // kad may dial peers by PeerId only, so always santize ban IPs after connection established
         self.sanitize_ip_addr(addr)?;
         // Check admission after the local, ban and IP checks, so those denials keep their causes.
-        self.check_admission(Some(&peer), "out")?;
+        self.check_admission(Some(&peer), ConnectionDirection::Outbound)?;
 
-        self.reserve_source(connection_id, peer, addr, "out")?;
+        self.reserve_source(connection_id, peer, addr, ConnectionDirection::Outbound)?;
         Ok(ConnectionHandler)
     }
 
@@ -219,16 +227,7 @@ impl NetworkBehaviour for PeerManager {
                 // connection_limits own pending slots and clean them up on this same event.
                 // Do not disconnect the peer or complete a concurrent outbound dial here.
                 // Counters replace per-attempt logs on this remotely driven failure path.
-                let reason = match error {
-                    ListenError::Denied { cause } => cause
-                        .downcast_ref::<PeerAdmissionDenied>()
-                        .map_or("other_behaviour_denied", PeerAdmissionDenied::reason),
-                    ListenError::Transport(_) => "transport",
-                    ListenError::WrongPeerId { .. } => "wrong_peer_id",
-                    ListenError::LocalPeerId { .. } => "local_peer_id",
-                    ListenError::Aborted => "aborted",
-                };
-                self.metrics.record_listen_failure(reason);
+                self.metrics.record_listen_failure(ListenFailureReason::from_error(error));
             }
             FromSwarm::ExternalAddrConfirmed(_) => {
                 // The external address was confirmed: possible to support NAT traversal

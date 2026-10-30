@@ -13,11 +13,15 @@ mod score;
 mod status;
 mod types;
 pub use admission::{AdmissionFallback, AdmissionStatus, CommitteeUpdate};
+pub(crate) use behavior::PeerAdmissionDenied;
 pub(crate) use manager::{PeerManager, PutRecordRate};
 pub use penalty::LoadPenalty;
 pub(crate) use penalty::Severity;
-pub(crate) use types::{PeerEvent, PenaltyOutcome};
-pub use types::{PeerExchangeMap, Penalty};
+pub(crate) use types::{PeerEvent, PenaltyOutcome, MAX_PEER_EXCHANGE_MESSAGE_SIZE};
+pub use types::{
+    PeerExchangeKey, PeerExchangeMap, Penalty, MAX_PEER_EXCHANGE_ADDRS_PER_PEER,
+    MAX_PEER_EXCHANGE_ENTRIES,
+};
 
 // visibility for tests
 #[cfg(test)]

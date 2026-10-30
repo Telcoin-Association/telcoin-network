@@ -7,7 +7,7 @@ use crate::{
         TestWorkerResponse, TEST_HEARTBEAT_INTERVAL,
     },
     freshness::RecordTimestamp,
-    types::RecordDomain,
+    types::{EpochPosition, RecordDomain},
 };
 use assert_matches::assert_matches;
 use eyre::eyre;
@@ -1214,6 +1214,260 @@ async fn test_publish_to_one_peer() -> eyre::Result<()> {
     Ok(())
 }
 
+/// Gossip topic of the stalled subscriber in `test_publish_to_stalled_peer_never_blocks_swarm`.
+const STALL_TOPIC: &str = "stall-topic";
+
+/// Gossip topic of the healthy subscriber in `test_publish_to_stalled_peer_never_blocks_swarm`.
+const HEALTHY_TOPIC: &str = "healthy-topic";
+
+/// The most publishes `test_publish_to_stalled_peer_never_blocks_swarm` sends to fill the send
+/// queue of the stalled peer.
+///
+/// The publisher first writes one QUIC receive window to the stalled peer. With the default
+/// `QuicConfig` that window is at most 100 MiB, which is about 8700 payloads of
+/// `MAX_GOSSIP_MESSAGE_SIZE` bytes. Then gossipsub queues `connection_handler_queue_len` (5000)
+/// more messages. The cap is a bound, not the expected count.
+const STALL_FILL_ATTEMPTS: usize = 20_000;
+
+/// A distinct payload of `MAX_GOSSIP_MESSAGE_SIZE` bytes for publish number `n`.
+///
+/// `MAX_GOSSIP_MESSAGE_SIZE` is the largest payload the publish path accepts, so the stalled
+/// stream fills in the fewest publishes. Distinct payloads keep each publish out of the gossipsub
+/// duplicate cache.
+fn stall_payload(n: usize) -> Vec<u8> {
+    n.to_le_bytes().into_iter().chain(std::iter::repeat(0)).take(MAX_GOSSIP_MESSAGE_SIZE).collect()
+}
+
+/// Issue #1656: a peer that stops reading its gossip stream never blocks the swarm task of the
+/// publisher.
+///
+/// The stalled peer runs until it is subscribed and connected. Then its swarm is held without
+/// being polled, so its connection stops reading. The publisher publishes on the topic of the
+/// stalled peer until gossipsub refuses with `AllQueuesFull`. After that refusal:
+///
+/// - each further publish on that topic is refused at once,
+/// - another command still gets an answer,
+/// - a publish on the topic of a healthy peer is delivered.
+///
+/// The test fails if the swarm task waits for queue space or retries a refused publish: the
+/// refusal does not come back within the attempt cap or the timeout, or the later command does
+/// not get an answer.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_publish_to_stalled_peer_never_blocks_swarm() -> eyre::Result<()> {
+    use futures::{future, stream, StreamExt as _};
+
+    let mut settings = NetworkConfig::default();
+    settings.peer_config_mut().heartbeat_interval = TEST_HEARTBEAT_INTERVAL;
+    let fixture =
+        CommitteeFixture::builder(MemDatabase::default).with_network_config(settings).build();
+    let mut configs = fixture.authorities().take(3).map(|authority| authority.consensus_config());
+    let tasks = TaskManager::default();
+
+    // the publisher runs normally
+    let NetworkPeer { config: publisher_config, network_handle: publisher, network, .. } =
+        trusted_hub_network(configs.next().expect("publisher config"), &tasks)?;
+    tokio::spawn(async move {
+        network.run().await.expect("publisher network run failed!");
+    });
+
+    // the stalled peer runs until `freeze`, then its swarm is held without being polled. `run`
+    // stays in scope, so the swarm and its connections are not dropped.
+    let NetworkPeer {
+        config: stalled_config,
+        network_handle: stalled,
+        network: stalled_network,
+        ..
+    } = trusted_hub_network(configs.next().expect("stalled config"), &tasks)?;
+    let (freeze, frozen) = oneshot::channel::<()>();
+    let (frozen_ack, frozen_seen) = oneshot::channel::<()>();
+    tokio::spawn(async move {
+        let run = stalled_network.run();
+        tokio::pin!(run);
+        tokio::select! {
+            res = &mut run => res.expect("stalled network run failed!"),
+            _ = frozen => {}
+        }
+        let _ = frozen_ack.send(());
+        std::future::pending::<()>().await;
+    });
+
+    // the healthy peer runs normally
+    let NetworkPeer {
+        config: healthy_config,
+        network_handle: healthy,
+        network_events: mut healthy_events,
+        network,
+    } = trusted_hub_network(configs.next().expect("healthy config"), &tasks)?;
+    tokio::spawn(async move {
+        network.run().await.expect("healthy network run failed!");
+    });
+
+    // listen, subscribe each subscriber to its own topic, and dial the publisher
+    publisher.start_listening(publisher_config.primary_address()).await?;
+    stalled.start_listening(stalled_config.primary_address()).await?;
+    healthy.start_listening(healthy_config.primary_address()).await?;
+    let publisher_addr =
+        publisher.listeners().await?.first().expect("publisher listen addr").clone();
+    stalled
+        .subscribe_with_publishers(STALL_TOPIC.into(), publisher_config.committee_pub_keys())
+        .await?;
+    healthy
+        .subscribe_with_publishers(HEALTHY_TOPIC.into(), publisher_config.committee_pub_keys())
+        .await?;
+    stalled
+        .add_trusted_peer_and_dial(
+            publisher_config.key_config().primary_public_key(),
+            publisher_config.key_config().primary_network_public_key(),
+            publisher_addr.clone(),
+        )
+        .await?;
+    healthy
+        .add_trusted_peer_and_dial(
+            publisher_config.key_config().primary_public_key(),
+            publisher_config.key_config().primary_network_public_key(),
+            publisher_addr,
+        )
+        .await?;
+
+    // wait until the publisher has observed both subscriptions
+    let stall_hash = TopicHash::from_raw(STALL_TOPIC);
+    let healthy_hash = TopicHash::from_raw(HEALTHY_TOPIC);
+    let (stall_ref, healthy_ref, handle) = (&stall_hash, &healthy_hash, &publisher);
+    wait_until(
+        Duration::from_secs(10),
+        "publisher observes the stalled and the healthy subscriber",
+        move || async move {
+            let peers = handle.all_peers().await?;
+            Ok(peers.values().any(|topics| topics.contains(stall_ref))
+                && peers.values().any(|topics| topics.contains(healthy_ref)))
+        },
+    )
+    .await?;
+
+    // freeze the stalled peer and wait until its swarm is no longer polled
+    freeze.send(()).map_err(|_| eyre!("stalled network stopped before the freeze"))?;
+    timeout(Duration::from_secs(5), frozen_seen).await??;
+
+    // publish distinct payloads until gossipsub refuses: the only recipient is the stalled peer
+    let mut fill = std::pin::pin!(stream::iter(0..STALL_FILL_ATTEMPTS)
+        .then(move |n| handle.publish(STALL_TOPIC.into(), stall_payload(n)))
+        .skip_while(|res| future::ready(res.is_ok())));
+    let first_refusal = timeout(Duration::from_secs(120), fill.next()).await?.ok_or_else(|| {
+        eyre!("send queue of the stalled peer not full after {STALL_FILL_ATTEMPTS} publishes")
+    })?;
+    assert_matches!(first_refusal, Err(NetworkError::Publish(PublishError::AllQueuesFull(1))));
+
+    // the queue stays full, and each further publish is refused at once
+    let refusals =
+        timeout(
+            Duration::from_secs(10),
+            future::join_all((1..=3).map(|n| {
+                handle.publish(STALL_TOPIC.into(), stall_payload(STALL_FILL_ATTEMPTS + n))
+            })),
+        )
+        .await?;
+    assert!(
+        refusals
+            .iter()
+            .all(|res| matches!(res, Err(NetworkError::Publish(PublishError::AllQueuesFull(1))))),
+        "a full send queue refuses each publish at once"
+    );
+
+    // the swarm task still answers another command
+    timeout(Duration::from_secs(5), publisher.local_peer_id()).await??;
+
+    // a publish to the healthy peer is delivered
+    let random_block = fixture_batch_with_transactions(10);
+    let sealed_block = random_block.seal_slow();
+    let expected_result = Vec::from(&sealed_block);
+    timeout(
+        Duration::from_secs(5),
+        publisher.publish(HEALTHY_TOPIC.into(), expected_result.clone()),
+    )
+    .await??;
+    let event =
+        timeout(Duration::from_secs(5), healthy_events.recv()).await?.expect("gossip received");
+    if let NetworkEvent::Gossip(gossip) = event {
+        assert_eq!(gossip.message.data, expected_result);
+    } else {
+        panic!("unexpected network event received");
+    }
+
+    Ok(())
+}
+
+/// Issue #1656: a publish waits while the command channel is full and resolves when the swarm
+/// task runs.
+///
+/// The network is built but not run, so nothing takes commands from the channel. The test sends
+/// one more publish than the channel holds. When the channel is full, no caller has a result.
+/// After `run()` starts, every caller gets the gossipsub result (no subscriber). A second network
+/// is dropped without running: every caller that waits on it gets an error, not a hang.
+#[tokio::test]
+async fn test_full_command_channel_publish_waits_then_resolves() -> eyre::Result<()> {
+    let TestTypes { peer1, peer2, .. } =
+        create_test_types::<TestWorkerRequest, TestWorkerResponse>();
+    let spawn_publishes = |handle: &NetworkHandle<TestWorkerRequest, TestWorkerResponse>,
+                           count: usize| {
+        (0..count)
+            .map(|n| {
+                let handle = handle.clone();
+                tokio::spawn(async move {
+                    handle.publish(TEST_TOPIC.into(), n.to_le_bytes().to_vec()).await
+                })
+            })
+            .collect::<Vec<_>>()
+    };
+
+    // the network is not run yet
+    let NetworkPeer { network_handle: handle, network, .. } = peer1;
+    let (_, capacity) = handle.command_channel_slots();
+    let waiting = spawn_publishes(&handle, capacity + 1);
+
+    // the channel fills: `capacity` publishes are in it and one more waits to send
+    let slots = &handle;
+    wait_until(Duration::from_secs(5), "command channel is full", move || async move {
+        Ok(slots.command_channel_slots().0 == 0)
+    })
+    .await?;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        waiting.iter().all(|task| !task.is_finished()),
+        "no publish resolves before the swarm task runs"
+    );
+
+    // the swarm task takes every command from the channel and replies to every caller
+    tokio::spawn(async move {
+        network.run().await.expect("network run failed!");
+    });
+    let results = timeout(Duration::from_secs(10), futures::future::join_all(waiting)).await?;
+    assert_eq!(results.len(), capacity + 1);
+    assert!(
+        results.iter().all(|res| matches!(
+            res,
+            Ok(Err(NetworkError::Publish(PublishError::NoPeersSubscribedToTopic)))
+        )),
+        "every waiting publish gets the gossipsub result"
+    );
+
+    // a network that is dropped without running gives every waiting caller an error
+    let NetworkPeer { network_handle: orphan_handle, network: orphan, .. } = peer2;
+    let orphaned = spawn_publishes(&orphan_handle, capacity + 1);
+    let orphan_slots = &orphan_handle;
+    wait_until(Duration::from_secs(5), "orphan command channel is full", move || async move {
+        Ok(orphan_slots.command_channel_slots().0 == 0)
+    })
+    .await?;
+    drop(orphan);
+    let results = timeout(Duration::from_secs(10), futures::future::join_all(orphaned)).await?;
+    assert!(
+        results.iter().all(|res| matches!(res, Ok(Err(_)))),
+        "every caller of a dropped network gets an error"
+    );
+
+    Ok(())
+}
+
 #[tokio::test]
 async fn test_unsubscribe_stops_gossip_delivery() -> eyre::Result<()> {
     // start honest cvv network
@@ -1959,6 +2213,68 @@ async fn test_banned_peer_reconnection_attempt() -> eyre::Result<()> {
     );
 
     Ok(())
+}
+
+/// Every signed endpoint gets a fresh QUIC window, and the caller survives intermediate timeouts.
+#[tokio::test]
+async fn serial_dial_reaches_last_live_signed_address() -> eyre::Result<()> {
+    let mut settings = NetworkConfig::default();
+    settings.peer_config_mut().heartbeat_interval = TEST_HEARTBEAT_INTERVAL;
+    // A legacy or explicitly short peer timeout must not race the transport's fallback sequence.
+    settings.peer_config_mut().dial_timeout = Duration::from_millis(1);
+    let fixture =
+        CommitteeFixture::builder(MemDatabase::default).with_network_config(settings).build();
+    let mut configs = fixture.authorities().take(2).map(|authority| authority.consensus_config());
+    let tasks = TaskManager::default();
+    let mut client =
+        trusted_hub_network(configs.next().ok_or_else(|| eyre!("client config"))?, &tasks)?;
+    let server =
+        trusted_hub_network(configs.next().ok_or_else(|| eyre!("server config"))?, &tasks)?;
+    // Bound UDP sockets stay silent without returning ICMP errors or rejecting a handshake.
+    let silent = futures::future::try_join_all(
+        (1..crate::consensus::MAX_ADVERTISED_MULTIADDRS)
+            .map(|_| tokio::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0))),
+    )
+    .await?;
+    let addresses = silent
+        .iter()
+        .map(|socket| {
+            socket.local_addr().map_err(eyre::Report::from).and_then(|endpoint| {
+                format!("/ip4/{}/udp/{}/quic-v1", endpoint.ip(), endpoint.port())
+                    .parse::<Multiaddr>()
+                    .map_err(Into::into)
+            })
+        })
+        .chain(std::iter::once(Ok(server.config.primary_address())))
+        .collect::<eyre::Result<Vec<_>>>()?;
+    let server_network = server.network.with_advertised_addresses(addresses)?;
+    let server_id = *server_network.swarm.local_peer_id();
+    let server_bls = server.config.key_config().primary_public_key();
+    client
+        .network
+        .swarm
+        .behaviour_mut()
+        .peer_manager
+        .add_known_peer(server_bls, server_network.node_record.info.clone());
+    let client_task = tokio::spawn(client.network.run());
+    let server_task = tokio::spawn(server_network.run());
+    client.network_handle.start_listening(client.config.primary_address()).await?;
+    server.network_handle.start_listening(server.config.primary_address()).await?;
+    let handle = client.network_handle.clone();
+    let mut dial = tokio::spawn(async move { handle.dial_by_bls(server_bls).await });
+    let result = timeout(Duration::from_secs(45), async {
+        let first = silent.first().ok_or_else(|| eyre!("silent first endpoint"))?;
+        let mut datagram = [0_u8; 2048];
+        timeout(Duration::from_secs(5), first.recv_from(&mut datagram)).await??;
+        (&mut dial).await??;
+        assert!(client.network_handle.connected_peer_ids().await?.contains(&server_id));
+        Ok::<(), eyre::Report>(())
+    })
+    .await;
+    dial.abort();
+    client_task.abort();
+    server_task.abort();
+    result.map_err(eyre::Report::from).and_then(std::convert::identity)
 }
 
 #[tokio::test]
@@ -3203,7 +3519,10 @@ async fn test_kad_record_jobs_never_republish_stored_records() -> eyre::Result<(
     Ok(())
 }
 
-/// An identical signed PUT carries a fresh wire expiry and refreshes the stored copy.
+/// An identical signed PUT carries a fresh wire expiry. The stored copy is rewritten only when
+/// the copy extends its expiry by more than half the configured TTL (or the row has lapsed), so
+/// a relayed copy cannot force one durable write per copy (GHSA-4947-9xvx-pv2m), and the kept
+/// expiry never shrinks.
 #[tokio::test]
 async fn test_identical_kad_record_refreshes_expiry() -> eyre::Result<()> {
     let TestTypes { peer1, peer2, .. } =
@@ -3217,6 +3536,7 @@ async fn test_identical_kad_record_refreshes_expiry() -> eyre::Result<()> {
         .kademlia
         .store_mut()
         .retain_connected(source, record.key.clone())?;
+    let ttl = network.config.kad_record_ttl;
     let instant = std::time::Instant::now();
     record.expires = Some(instant + Duration::from_secs(60));
     network.process_kad_put_request(source, record.clone())?;
@@ -3229,7 +3549,29 @@ async fn test_identical_kad_record_refreshes_expiry() -> eyre::Result<()> {
         .and_then(|stored| stored.expires)
         .ok_or_else(|| eyre!("initial expiry"))?;
 
+    // A copy that extends the expiry by less than half the TTL is a free relay: nothing is written.
     record.expires = Some(instant + Duration::from_secs(120));
+    network.process_kad_put_request(source, record.clone())?;
+    let stored = network
+        .swarm
+        .behaviour_mut()
+        .kademlia
+        .store_mut()
+        .get(&record.key)
+        .ok_or_else(|| eyre!("record after a short extension"))?
+        .into_owned();
+    assert_eq!(stored.value, record.value);
+    assert_eq!(stored.publisher, record.publisher);
+    // The store rebuilds the `Instant` on every read, so compare with a tolerance.
+    let unchanged_expiry = stored.expires.ok_or_else(|| eyre!("expiry after a short extension"))?;
+    assert!(
+        unchanged_expiry.saturating_duration_since(first_expiry) < Duration::from_secs(1)
+            && first_expiry.saturating_duration_since(unchanged_expiry) < Duration::from_secs(1),
+        "a short extension must not rewrite the row"
+    );
+
+    // A copy that extends it by more than half the TTL refreshes the stored copy.
+    record.expires = Some(instant + Duration::from_secs(120) + ttl / 2);
     network.process_kad_put_request(source, record.clone())?;
     let stored = network
         .swarm
@@ -3241,7 +3583,7 @@ async fn test_identical_kad_record_refreshes_expiry() -> eyre::Result<()> {
         .into_owned();
     assert_eq!(stored.value, record.value);
     assert_eq!(stored.publisher, record.publisher);
-    assert!(stored.expires.is_some_and(|expiry| expiry > first_expiry + Duration::from_secs(30)));
+    assert!(stored.expires.is_some_and(|expiry| expiry > first_expiry + ttl / 2));
 
     // A replicated copy with less remaining TTL must not undo the refresh.
     let refreshed_expiry = stored.expires.ok_or_else(|| eyre!("refreshed expiry"))?;
@@ -3349,11 +3691,14 @@ async fn test_kad_self_advertisement_confirms_when_store_is_full() -> eyre::Resu
 
     // Two valid records per relay stay below both the per-source message limit and the
     // tracked-source cap. Fill the real store through the inbound handler without confirming
-    // any of the non-committee identities advertised by these relays.
+    // any of the non-committee identities advertised by these relays. Refill the shared budget
+    // before each record: this test pins store saturation, and the shared budget has its own
+    // tests.
     std::iter::repeat_with(PeerId::random)
         .flat_map(|source| std::iter::repeat_n(source, 2))
         .take(max_records)
         .try_for_each(|source| -> eyre::Result<()> {
+            network.swarm.behaviour_mut().peer_manager.refill_put_record_budget();
             let bls = BlsKeypair::generate(&mut rng);
             let netkey = NetworkKeypair::generate_ed25519();
             let record = NodeRecord::build(
@@ -4268,6 +4613,53 @@ async fn test_add_provider_rate_limit_counts_drops_before_storage() {
     }));
 }
 
+/// A cached URL is insufficient: coverage needs a live, matching verified record.
+#[tokio::test]
+async fn committee_convergence_excludes_stale_records() -> eyre::Result<()> {
+    let TestTypes { peer1, peer2, .. } =
+        create_test_types::<TestWorkerRequest, TestWorkerResponse>();
+    let mut network = peer1.network;
+    let owner = peer2.config.key_config().primary_public_key();
+    let publisher = *peer2.network.swarm.local_peer_id();
+    let keys = peer2.config.key_config();
+    let rpc = RpcInfo { http: "https://validator.example.com:8545/".parse()?, ws: None };
+    let record = NodeRecord::build(
+        RecordDomain::new(
+            peer2.config.network_config().libp2p_config().chain_id,
+            NetworkType::Primary,
+        ),
+        keys.primary_network_public_key(),
+        peer2.config.primary_address(),
+        Some(rpc),
+        |data| keys.request_signature_direct(data),
+    );
+    network.process_command(NetworkCommand::UpdateCommittees {
+        previous: HashSet::new(),
+        current: HashSet::from([owner]),
+        next: HashSet::new(),
+    })?;
+    network.swarm.behaviour_mut().peer_manager.add_restored_peer(owner, record.info.clone());
+    assert_eq!(network.committee_rpc_snapshot().members(), &HashSet::from([owner]));
+    assert!(network.committee_rpc_snapshot().rpcs().is_empty());
+    let kad_record = kad::Record {
+        key: node_record_key(&owner),
+        value: encode(&record),
+        publisher: Some(publisher),
+        expires: None,
+    };
+    network.process_kad_put_request(publisher, kad_record.clone())?;
+    assert_eq!(network.committee_rpc_snapshot().rpcs().len(), 1);
+    network
+        .swarm
+        .behaviour_mut()
+        .kademlia
+        .store_mut()
+        .put(kad::Record { expires: Some(std::time::Instant::now()), ..kad_record })?;
+    assert!(network.swarm.behaviour().peer_manager.get_rpc(&owner).is_some());
+    assert!(network.committee_rpc_snapshot().rpcs().is_empty());
+    Ok(())
+}
+
 /// A signed record advertising an RPC endpoint with a well-formed URL but the
 /// wrong scheme is accepted (the signature is authentic) and promoted with the
 /// malformed endpoint stripped, without penalizing the sender.
@@ -5044,31 +5436,119 @@ fn accepted_gossip_carries_resolved_author_identity() -> eyre::Result<()> {
 /// relayer, regardless of whether either identity has resolved.
 #[test]
 fn author_attributable_reject_charges_the_author_never_the_relayer() {
-    for relayer_resolved in [true, false] {
+    [true, false].into_iter().for_each(|relayer_resolved| {
         assert_eq!(
-            RejectReason::UnauthorizedAuthor.penalty(relayer_resolved, true),
+            RejectReason::UnauthorizedAuthor.penalty(relayer_resolved, true, EpochPosition::Live),
             RejectPenalty::FatalAuthor
         );
         assert_eq!(
-            RejectReason::UnauthorizedAuthor.penalty(relayer_resolved, false),
+            RejectReason::UnauthorizedAuthor.penalty(relayer_resolved, false, EpochPosition::Live),
             RejectPenalty::Skip
         );
-    }
+    });
+}
+
+/// A replaying node never charges an unauthorized author: its allowlists belong to the
+/// historical epoch it replays, so a resolved author outside them is most likely a live committee
+/// member of a later epoch. The size penalty stays with the relayer; that bound is protocol wide.
+#[test]
+fn historical_epoch_replay_never_charges_the_author() {
+    [true, false].into_iter().for_each(|relayer_resolved| {
+        [true, false].into_iter().for_each(|author_resolved| {
+            assert_eq!(
+                RejectReason::UnauthorizedAuthor.penalty(
+                    relayer_resolved,
+                    author_resolved,
+                    EpochPosition::Historical
+                ),
+                RejectPenalty::Skip
+            );
+        });
+        assert_eq!(
+            RejectReason::TooLarge.penalty(true, relayer_resolved, EpochPosition::Historical),
+            RejectPenalty::FatalRelayer
+        );
+    });
+}
+
+/// Drive the reject arm at `position` with a resolved author that no committee slot exempts, on
+/// a topic whose allowlist excludes it. Returns whether the author ended up banned.
+async fn unauthorized_author_banned_at(position: EpochPosition) -> eyre::Result<bool> {
+    let TestTypes { peer1, peer2, _task_manager } =
+        create_test_types::<TestWorkerRequest, TestWorkerResponse>();
+    let outsider = peer1.config.key_config().primary_public_key();
+    let mut network = peer1.network;
+    let member = peer2.config.key_config().primary_public_key();
+    let source = *peer2.network.swarm.local_peer_id();
+    let record = peer2.network.get_peer_record();
+    // resolve the author's BLS identity through its kad record while it holds a committee slot
+    network.process_command(NetworkCommand::UpdateCommittees {
+        previous: HashSet::new(),
+        current: HashSet::from([member]),
+        next: HashSet::new(),
+    })?;
+    network.process_kad_put_request(source, record)?;
+    // move the window past the author: a live member two epochs ahead holds no slot here
+    network.process_command(NetworkCommand::UpdateCommittees {
+        previous: HashSet::new(),
+        current: HashSet::from([outsider]),
+        next: HashSet::new(),
+    })?;
+    assert_eq!(network.swarm.behaviour().peer_manager.peer_to_bls(&source), Some(member));
+    let (reply, _subscribed) = tokio::sync::oneshot::channel();
+    network.process_command(NetworkCommand::Subscribe {
+        topic: TEST_TOPIC.to_string(),
+        publishers: Some(HashSet::from([outsider])),
+        reply,
+    })?;
+    network.process_command(NetworkCommand::SetEpochPosition { position })?;
+    network.process_gossip_event(GossipEvent::Message {
+        propagation_source: PeerId::random(),
+        message_id: gossipsub::MessageId::from(b"unauthorized-author-gossip".to_vec()),
+        message: GossipMessage { source: Some(source), ..test_gossip_message() },
+    })?;
+    Ok(network.swarm.behaviour().peer_manager.peer_banned(&source))
+}
+
+/// A replaying node rejects the message and leaves the resolved author unbanned.
+#[tokio::test]
+async fn historical_replay_rejects_unauthorized_author_without_a_ban() -> eyre::Result<()> {
+    assert!(
+        !unauthorized_author_banned_at(EpochPosition::Historical).await?,
+        "a replaying node must not ban a resolved author outside the replayed allowlist"
+    );
+    Ok(())
+}
+
+/// The same reject at the live tip still charges the resolved author: the position guard spares
+/// only a replaying node.
+#[tokio::test]
+async fn live_epoch_still_bans_unauthorized_author() -> eyre::Result<()> {
+    assert!(
+        unauthorized_author_banned_at(EpochPosition::Live).await?,
+        "a node at the tip still bans a resolved author outside the allowlist"
+    );
+    Ok(())
 }
 
 /// An oversized payload is the only relayer-attributable reject — the size bound is a compile-time
 /// protocol constant (`MAX_GOSSIP_MESSAGE_SIZE`), identical on every honest node and enforced on
 /// both the publish and receive paths, so an honest peer never originates or forwards one — and it
-/// is charged to the forwarder only once its BLS identity has resolved (the author's resolution is
-/// irrelevant), mirroring the Accept path's unresolved-relayer skip.
+/// is charged to the forwarder only once its BLS identity has resolved (the author's resolution and
+/// the epoch position are irrelevant), mirroring the Accept path's unresolved-relayer skip.
 #[test]
 fn oversized_reject_penalizes_only_a_resolved_relayer() {
     for author_resolved in [true, false] {
-        assert_eq!(
-            RejectReason::TooLarge.penalty(true, author_resolved),
-            RejectPenalty::FatalRelayer
-        );
-        assert_eq!(RejectReason::TooLarge.penalty(false, author_resolved), RejectPenalty::Skip);
+        for position in [EpochPosition::Live, EpochPosition::Historical] {
+            assert_eq!(
+                RejectReason::TooLarge.penalty(true, author_resolved, position),
+                RejectPenalty::FatalRelayer
+            );
+            assert_eq!(
+                RejectReason::TooLarge.penalty(false, author_resolved, position),
+                RejectPenalty::Skip
+            );
+        }
     }
 }
 
@@ -5466,6 +5946,87 @@ async fn connection_limit_swarm_frees_slot_of_timed_out_pending_connection() {
     );
 }
 
+/// Repeated listener errors and malformed input preserve exact counters and command progress.
+#[tokio::test]
+async fn diagnostic_suppression_preserves_network_progress_and_counters() -> eyre::Result<()> {
+    use crate::diagnostics::emission_tests::Capture;
+    use futures::TryStreamExt as _;
+    use libp2p::core::transport::ListenerId;
+    use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
+    let recorder = DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    let _recorder = metrics::set_default_local_recorder(&recorder);
+    let TestTypes { peer1, _task_manager, .. } =
+        create_test_types::<TestWorkerRequest, TestWorkerResponse>();
+    let capture = Capture::default();
+    let _subscriber = tracing::subscriber::set_default(capture.clone());
+    let mut network = futures::stream::iter((0_u64..128).map(Ok::<_, NetworkError>))
+        .try_fold(peer1.network, |mut network, identity| async move {
+            network
+                .process_event(SwarmEvent::ListenerError {
+                    listener_id: ListenerId::next(),
+                    error: std::io::Error::other(format!("changing listener error {identity}")),
+                })
+                .await?;
+            let source = PeerId::random();
+            network.process_gossip_event(GossipEvent::Message {
+                propagation_source: source,
+                message_id: gossipsub::MessageId::from(identity.to_le_bytes().to_vec()),
+                message: test_gossip_message(),
+            })?;
+            let mut malformed = kad::Record::new(identity.to_le_bytes().to_vec(), vec![0xff]);
+            malformed.publisher = Some(source);
+            network.process_kad_put_request(source, malformed)?;
+            Ok(network)
+        })
+        .await?;
+
+    let (reply, received) = oneshot::channel();
+    network.process_command(NetworkCommand::EstablishedPeerCount { reply })?;
+    assert_eq!(received.await?, 0, "the next command still makes progress after the event stream");
+    // Read the recorder once: every snapshot resets its counters to zero.
+    let snapshot = snapshotter.snapshot().into_vec();
+    // The listener error count carries a fixed reason class; the error text never becomes a label.
+    [
+        ("listener_errors_total", &[("network", "primary"), ("reason", "other")][..]),
+        ("gossip_received_total", &[("network", "primary")][..]),
+        ("gossip_rejected_total", &[("network", "primary")][..]),
+    ]
+    .into_iter()
+    .for_each(|(suffix, expected)| {
+        assert!(
+            snapshot.iter().any(|(key, _, _, value)| {
+                key.key().name() == format!("tn_network.{suffix}")
+                    && key.key().labels().count() == expected.len()
+                    && key
+                        .key()
+                        .labels()
+                        .all(|label| expected.contains(&(label.key(), label.value())))
+                    && matches!(value, DebugValue::Counter(128))
+            }),
+            "every event is counted without remote label values: {suffix}"
+        );
+    });
+
+    // The transport has not been polled, so it has no active listener addresses yet.
+    assert!(network.swarm.listeners().next().is_none());
+    let result = network
+        .process_event(SwarmEvent::ListenerClosed {
+            listener_id: ListenerId::next(),
+            addresses: Vec::new(),
+            reason: Err(std::io::Error::other("terminal listener loss")),
+        })
+        .await;
+    assert!(matches!(result, Err(NetworkError::AllListenersClosed)));
+    assert_eq!(
+        capture.message_count("no listeners for swarm"),
+        1,
+        "terminal loss bypasses suppression"
+    );
+    Ok(())
+}
+
 /// The inbound denial warning stays silent for a short burst of refusals and fires once per window
 /// when refusals persist.
 #[test]
@@ -5494,5 +6055,33 @@ fn inbound_denial_warning_fires_only_when_refusals_persist() {
         warning.record(start + interval * 2),
         Some(2),
         "refusals that persist for a second window fire the warning again"
+    );
+}
+
+/// The listener error log fires for the first error at once, suppresses errors inside the interval
+/// and reports the suppressed count with the first error after the interval.
+#[test]
+fn listener_error_log_suppresses_errors_inside_the_interval() {
+    let start = tokio::time::Instant::now();
+    let interval = LISTENER_ERROR_LOG_INTERVAL;
+    let mut log = ListenerErrorLog::default();
+
+    assert_eq!(log.record(start), Some(0), "the first error logs at once");
+    assert_eq!(
+        log.record(start + interval / 2),
+        None,
+        "an error inside the interval is suppressed"
+    );
+    assert_eq!(log.record(start + interval * 3 / 4), None, "a second error is suppressed too");
+    assert_eq!(
+        log.record(start + interval),
+        Some(2),
+        "the first error after the interval logs with the suppressed count"
+    );
+    assert_eq!(log.record(start + interval), None, "the log restarts the interval");
+    assert_eq!(
+        log.record(start + interval * 2),
+        Some(1),
+        "the next log carries only the errors suppressed since the last log"
     );
 }

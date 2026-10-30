@@ -1,13 +1,18 @@
 //! The state of consensus
 
 use crate::{
-    consensus::{bullshark::Bullshark, utils::gc_round, ConsensusError},
+    consensus::{
+        bullshark::Bullshark, liveness::RoundQuorumObserver, utils::gc_round, ConsensusError,
+        Outcome,
+    },
     ConsensusBus, NodeMode,
 };
 use std::{
     cmp::{max, Ordering},
     collections::{BTreeMap, BTreeSet, HashMap},
     fmt::Debug,
+    sync::Arc,
+    time::Duration,
 };
 use tn_config::ConsensusConfig;
 use tn_storage::{
@@ -322,15 +327,31 @@ pub struct Consensus<DB> {
 
     /// Optional pack that is available we want to save all our certificates into
     /// before sending to bullshark.
-    certificate_pack: Option<CertificatePack>,
+    ///
+    /// Shared with the epoch's owner (`run_epoch` in the node), which seals it once this task has
+    /// ended and stops the node if the seal reports a failed save: an error this task returned
+    /// after the epoch's shutdown was signalled would only be logged.
+    certificate_pack: Option<Arc<CertificatePack>>,
 }
 
-/// Whether to keep using a certificate pack whose `try_save` returned `error`. Only a full channel
-/// is transient backpressure. Any other error is permanent for this pack: a latched open or save
-/// failure is returned by every later call, and a closed channel means its thread is gone. Keeping
-/// such a pack would only log the same failure once per certificate.
-fn keep_certificate_pack_after(error: &PackError) -> bool {
-    matches!(error, PackError::SendFull)
+/// The outcome of archiving a certificate in this epoch's certificate pack, given what
+/// [`CertificatePack::try_save`] returned.
+///
+/// Only a full channel ([`PackError::SendFull`]) is transient backpressure: that certificate goes
+/// unarchived and consensus carries on. Any other error means the pack has failed for good, and it
+/// is this node's own storage failing, never a peer's input: certificates are verified before they
+/// reach consensus, and nothing a peer sends can latch the pack (only its own open, write or sync
+/// failing, or its thread being gone, does), short of a peer's batch flood filling the shared disk
+/// (the known exception in the storage README §8). So it ends the consensus task, which stops the
+/// node.
+fn certificate_archived(saved: Result<(), PackError>) -> Result<(), ConsensusError> {
+    match saved {
+        Err(PackError::SendFull) => {
+            warn!(target: "telcoin::consensus_state", "cert pack is backed up; this certificate was not archived");
+            Ok(())
+        }
+        saved => saved.map_err(ConsensusError::CertificatePack),
+    }
 }
 
 /// Resolve the epoch seed chain anchor from the two cursors recovered at startup, failing closed
@@ -425,7 +446,7 @@ impl<DB: Database> Consensus<DB> {
         protocol: Bullshark,
         task_manager: &TaskManager,
         consensus_chain: &impl ConsensusChainReader,
-        certificate_pack: Option<CertificatePack>,
+        certificate_pack: Option<Arc<CertificatePack>>,
     ) -> Result<(), ConsensusError> {
         let rx_shutdown = consensus_config.shutdown().subscribe();
         // The consensus state (everything else is immutable).
@@ -514,28 +535,34 @@ impl<DB: Database> Consensus<DB> {
         Ok(())
     }
 
+    /// Run active consensus and service observation deadlines without new traffic.
     async fn run(
         mut self,
         mut rx_new_certificates: impl TnReceiver<Certificate>,
     ) -> Result<(), ConsensusError> {
         self.active = self.consensus_bus.is_active_cvv();
+        let mut observer = RoundQuorumObserver::from_recovered_dag(
+            self.committee.clone(),
+            self.consensus_bus.app().metrics().clone(),
+            self.state.last_round.committed_round,
+            &self.state.dag,
+        );
+        let mut observation_tick = tokio::time::interval(Duration::from_secs(1));
+        observation_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         // Listen to incoming certificates.
         loop {
             tokio::select! {
-                _ = &self.rx_shutdown => {
-                    if let Some(pack) = self.certificate_pack {
-                        if let Err(e) = pack.shutdown().await {
-                            error!(target: "epoch-manager", ?e, "error shutting down certificate pack");
-                        }
-                    }
-                    return Ok(())
-                }
+                // The epoch's owner seals the certificate pack once this task has ended.
+                _ = &self.rx_shutdown => return Ok(()),
 
                 Some(certificate) = rx_new_certificates.recv() => {
-                    self.new_certificate(certificate).await.inspect_err(|e| {
+                    self.new_certificate(certificate, &mut observer).await.inspect_err(|e| {
                         error!(target: "epoch-manager", ?e, "new certificate failed");
                     })?;
+                },
+                _ = observation_tick.tick() => {
+                    observer.evaluate_expired(tokio::time::Instant::now());
                 },
             }
         }
@@ -543,7 +570,11 @@ impl<DB: Database> Consensus<DB> {
 
     /// Process a new certificate.
     #[instrument(level = "debug", skip_all, fields(round = certificate.round(), origin = ?certificate.origin()))]
-    async fn new_certificate(&mut self, certificate: Certificate) -> Result<(), ConsensusError> {
+    async fn new_certificate(
+        &mut self,
+        certificate: Certificate,
+        observer: &mut RoundQuorumObserver,
+    ) -> Result<(), ConsensusError> {
         match certificate.epoch().cmp(&self.committee.epoch()) {
             Ordering::Equal => {
                 // we can proceed.
@@ -554,20 +585,16 @@ impl<DB: Database> Consensus<DB> {
             }
         }
         if let Some(certificate_pack) = &self.certificate_pack {
-            if let Err(e) = certificate_pack.try_save(certificate.clone()) {
-                // Not a critical path, so a failed pack does not stop consensus (but a node whose
-                // storage is failing is probably not long for this world).
-                if keep_certificate_pack_after(&e) {
-                    tracing::warn!(target: "telcoin::consensus_state", ?e, "cert pack is backed up; this certificate was not archived");
-                } else {
-                    tracing::error!(target: "telcoin::consensus_state", ?e, "cert pack failed; no longer archiving certificates this epoch");
-                    self.certificate_pack = None;
-                }
-            }
+            certificate_archived(certificate_pack.try_save(certificate.clone()))?;
         }
         // Process the certificate using the selected consensus protocol.
+        let round = certificate.round();
+        let origin = certificate.origin().clone();
         let (outcome, committed_sub_dags) =
             self.protocol.process_certificate(&mut self.state, certificate)?;
+        if outcome != Outcome::CertificateBelowCommitRound {
+            observer.observe(self.committee.epoch(), round, &origin, tokio::time::Instant::now());
+        }
         if self.active {
             let mut own_rounds_committed = Vec::new();
             let mut leader_commit_round = 0;
@@ -621,6 +648,7 @@ impl<DB: Database> Consensus<DB> {
                     .send(committed_sub_dag)
                     .await
                     .map_err(|_| ConsensusError::ShuttingDown)?;
+                observer.record_commit();
             }
 
             if has_headers {

@@ -1,15 +1,18 @@
 //! Test network handler tests.
 
 use assert_matches::assert_matches;
+use futures::{future, StreamExt as _};
 use std::{
     collections::BTreeSet,
     sync::{
         atomic::{AtomicUsize, Ordering},
         Arc,
     },
+    time::Duration,
 };
 use tn_batch_validator::NoopBatchValidator;
 use tn_network_libp2p::{
+    error::NetworkError,
     types::{NetworkCommand, NetworkHandle},
     GossipMessage, Penalty, TopicHash,
 };
@@ -19,8 +22,8 @@ use tn_network_types::{
 use tn_storage::{mem_db::MemDatabase, tables::NodeBatchesCache};
 use tn_test_utils::CommitteeFixture;
 use tn_types::{
-    Address, Batch, BatchValidation, BatchValidationError, BcsError, BlsPublicKey, Database,
-    SealedBatch, TaskManager, B256,
+    Address, AuthorityIdentifier, Batch, BatchValidation, BatchValidationError, BcsError,
+    BlsPublicKey, Database, SealedBatch, TaskManager, B256,
 };
 use tn_worker::{
     RequestHandler, WorkerGossip, WorkerNetworkError, WorkerNetworkHandle, WorkerRequest,
@@ -592,9 +595,121 @@ async fn test_request_batches_no_peers() {
     });
 
     let mut digests = BTreeSet::from([B256::random()]);
-    let result = handle.pub_request_batches(&mut digests).await;
+    let result = handle.pub_request_batches(&mut digests, None).await;
     // no peers → returns Ok(empty)
     assert!(result.unwrap().is_empty());
+}
+
+/// The commands a [`WorkerNetworkHandle`] sends to its swarm, as a stream for a mock swarm.
+fn swarm_commands(
+    rx: mpsc::Receiver<NetworkCommand<WorkerRequest, WorkerResponse>>,
+) -> impl futures::Stream<Item = NetworkCommand<WorkerRequest, WorkerResponse>> {
+    futures::stream::unfold(rx, |mut rx| async move { rx.recv().await.map(|cmd| (cmd, rx)) })
+}
+
+/// A mock swarm for `request_batches`: it answers `ConnectedPeers` with `peers`, records the peer
+/// of each `OpenStream` on `opened`, and fails each open with a dial error. A dial error is not a
+/// negotiation failure, so the worker does not cache the peer as unsupported.
+async fn failing_open_swarm(
+    rx: mpsc::Receiver<NetworkCommand<WorkerRequest, WorkerResponse>>,
+    peers: Vec<BlsPublicKey>,
+    opened: mpsc::UnboundedSender<BlsPublicKey>,
+) {
+    swarm_commands(rx)
+        .for_each(|cmd| {
+            if let NetworkCommand::ConnectedPeers { reply } = cmd {
+                reply.send(peers.clone()).expect("send peers");
+            } else if let NetworkCommand::OpenStream { peer, reply, .. } = cmd {
+                opened.send(peer).expect("record open");
+                assert!(
+                    reply.send(Err(NetworkError::Dial("mock open failure".to_string()))).is_ok(),
+                    "send open result"
+                );
+            }
+            future::ready(())
+        })
+        .await;
+}
+
+/// `request_batches` tries the preferred peer (the header author) first, whatever order the swarm
+/// reports peers in, then the rest in the reported order. Each peer whose open fails is tried once.
+#[tokio::test]
+async fn test_request_batches_tries_preferred_peer_first() {
+    let committee = CommitteeFixture::builder(MemDatabase::default).randomize_ports(true).build();
+    let unknown = BlsPublicKey::default();
+    let other = committee.first_authority().primary_public_key();
+    let author = committee.last_authority().primary_public_key();
+    let (tx, rx) = mpsc::channel(10);
+    let (opened_tx, mut opened_rx) = mpsc::unbounded_channel();
+    tokio::spawn(failing_open_swarm(rx, vec![unknown, other, author], opened_tx));
+    let task_manager = TaskManager::default();
+    let handle =
+        WorkerNetworkHandle::new(NetworkHandle::new(tx), task_manager.get_spawner(), 0, 0, 0);
+
+    let mut digests = BTreeSet::from([B256::random()]);
+    let preferred = AuthorityIdentifier::from(author);
+    let result = handle.pub_request_batches(&mut digests, Some(&preferred)).await;
+    assert!(result.is_err(), "every open fails, so nothing is fetched");
+
+    let opened: Vec<BlsPublicKey> = std::iter::from_fn(|| opened_rx.try_recv().ok()).collect();
+    assert_eq!(opened, vec![author, unknown, other]);
+}
+
+/// A peer whose stream open never completes cannot hold `request_batches` past
+/// `BATCH_REQUEST_TOTAL_TIMEOUT`. The bound releases the caller: a gossip prefetch frees its
+/// permit, and the vote-path `synchronize` returns an error that its caller retries. Regression
+/// test for issue #1717.
+#[tokio::test(start_paused = true)]
+async fn test_request_batches_is_bounded_by_total_timeout() {
+    // `BATCH_REQUEST_TOTAL_TIMEOUT` is crate-private; keep this value in step with it
+    let total_timeout = Duration::from_secs(480);
+    let peers = vec![BlsPublicKey::default()];
+    let (tx, rx) = mpsc::channel(10);
+    tokio::spawn(swarm_commands(rx).fold(Vec::new(), move |mut held_opens, cmd| {
+        if let NetworkCommand::ConnectedPeers { reply } = cmd {
+            reply.send(peers.clone()).expect("send peers");
+        } else if let NetworkCommand::OpenStream { reply, .. } = cmd {
+            // hold the reply, so the open never completes or fails
+            held_opens.push(reply);
+        }
+        future::ready(held_opens)
+    }));
+    let task_manager = TaskManager::default();
+    let handle =
+        WorkerNetworkHandle::new(NetworkHandle::new(tx), task_manager.get_spawner(), 0, 0, 0);
+
+    let mut digests = BTreeSet::from([B256::random()]);
+    let start = tokio::time::Instant::now();
+    let result = handle.pub_request_batches(&mut digests, None).await;
+    let elapsed = start.elapsed();
+
+    assert_matches!(result, Err(NetworkError::Timeout));
+    assert!(
+        elapsed >= total_timeout && elapsed < total_timeout + Duration::from_secs(1),
+        "total timeout should fire at ~{total_timeout:?}, fired at {elapsed:?}"
+    );
+    assert_eq!(digests.len(), 1, "an unfetched digest stays requested");
+}
+
+/// A peer whose exchange fails in a way a retry does not fix (here, the stream open) is not tried
+/// again in the same `request_batches` call. Before this rule it was tried on each of the
+/// `MAX_BATCH_REQUEST_RETRIES` (3) passes.
+#[tokio::test]
+async fn test_request_batches_skips_failed_peer_on_later_passes() {
+    let peer = BlsPublicKey::default();
+    let (tx, rx) = mpsc::channel(10);
+    let (opened_tx, mut opened_rx) = mpsc::unbounded_channel();
+    tokio::spawn(failing_open_swarm(rx, vec![peer], opened_tx));
+    let task_manager = TaskManager::default();
+    let handle =
+        WorkerNetworkHandle::new(NetworkHandle::new(tx), task_manager.get_spawner(), 0, 0, 0);
+
+    let mut digests = BTreeSet::from([B256::random()]);
+    let result = handle.pub_request_batches(&mut digests, None).await;
+    assert!(result.is_err(), "the only peer fails, so nothing is fetched");
+
+    let opened: Vec<BlsPublicKey> = std::iter::from_fn(|| opened_rx.try_recv().ok()).collect();
+    assert_eq!(opened, vec![peer], "the failed peer is opened once, not once per pass");
 }
 
 // ============================================================================
@@ -683,7 +798,8 @@ fn test_is_author_content_fault() {
 // ============================================================================
 
 /// Test that acquiring all MAX_CONCURRENT_BATCH_STREAMS permits causes try_acquire_owned to fail,
-/// which is how the sync responder sheds load (a denied admission writes `Deny(AtCapacity)`).
+/// which is how the public share of the sync responder's batch-serve pool sheds load from public
+/// peers (a refused serve writes `Deny(AtCapacity)`; committee peers still have their reserve).
 #[tokio::test]
 async fn test_semaphore_exhaustion_denies_admission() {
     let semaphore = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_BATCH_STREAMS));

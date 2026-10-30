@@ -43,7 +43,7 @@ use std::{
 use tn_config::{
     Config, ConfigFmt, ConfigTrait as _, ConsensusConfig, NetworkConfig, PriorEpoch, TelcoinDirs,
 };
-use tn_network_libp2p::{error::NetworkError, types::NetworkHandle, TNMessage};
+use tn_network_libp2p::{error::NetworkError, types::NetworkHandle, EpochPosition, TNMessage};
 use tn_primary::{
     network::{PrimaryNetwork, PrimaryNetworkHandle},
     ConsensusBus, ConsensusBusApp, NodeMode, StateSynchronizer,
@@ -65,6 +65,20 @@ use tn_types::{
 use tn_worker::{WorkerNetwork, WorkerNetworkHandle};
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
+
+/// Clears an epoch's observer observations when its monitor is cancelled or exits.
+struct SubmitCoverageMonitor {
+    /// Forwarder whose admission cache is the authoritative endpoint consumer.
+    forwarder: Arc<WorkerRpcForwarder>,
+    /// Configured worker swarm whose series this monitor owns.
+    worker: WorkerId,
+}
+
+impl Drop for SubmitCoverageMonitor {
+    fn drop(&mut self) {
+        self.forwarder.clear_submit_coverage(self.worker);
+    }
+}
 
 /// Worker-independent RPC state shared while initializing an epoch's workers.
 ///
@@ -385,20 +399,32 @@ where
             PriorEpoch { record: prior_epoch_record, close: prior_epoch_close },
         )?;
 
-        // a missing record, a missing certificate and a storage error all mean "not known to be
-        // closed", so only a verified certificate relaxes the check
-        let closed = self.consensus_chain.epochs().certified_record_by_epoch(epoch).await.is_ok();
-        if closed {
-            info!(
+        match self.epoch_position(epoch).await {
+            EpochPosition::Historical => info!(
                 target: "epoch-manager",
                 epoch,
                 "epoch already closed by its committee; replaying it without the vote-window check"
-            );
-        } else {
-            consensus_config.validate_epoch_timing()?;
+            ),
+            EpochPosition::Live => consensus_config.validate_epoch_timing()?,
         }
 
         Ok(consensus_config)
+    }
+
+    /// Whether `epoch` is a historical replay or the live epoch, from the node's own records.
+    ///
+    /// A certificate that verifies exists only after the epoch closed, so `Historical` is
+    /// trustworthy. `Live` only means "not known to be closed": a node whose startup record sync
+    /// failed enters a replayed epoch as `Live`, and the next epoch entry re-reads the record the
+    /// collector stores in the meantime.
+    async fn epoch_position(&self, epoch: tn_types::Epoch) -> EpochPosition {
+        // a missing record, a missing certificate and a storage error all mean "not known to be
+        // closed", so only a verified certificate marks the epoch as historical
+        self.consensus_chain
+            .epochs()
+            .certified_record_by_epoch(epoch)
+            .await
+            .map_or(EpochPosition::Live, |_| EpochPosition::Historical)
     }
 
     /// Resolve the [`Committee`] for `epoch`, the first step of configuring consensus.
@@ -783,6 +809,47 @@ where
             Some(engine.get_worker_transaction_pool(&worker_id).await?),
         ));
 
+        forwarder.clear_submit_coverage(worker_id);
+        let in_committee =
+            consensus_config.authority_id().is_some_and(|id| consensus_config.in_committee(&id));
+        if !in_committee {
+            let coverage =
+                SubmitCoverageMonitor { forwarder: forwarder.clone(), worker: worker_id };
+            let handle = network_handle.inner_handle().clone();
+            network_handle.get_task_spawner().spawn_task("Observer submit coverage", async move {
+                let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
+                interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                futures::stream::unfold(
+                    (interval, coverage, handle),
+                    |(mut interval, coverage, handle)| async move {
+                        interval.tick().await;
+                        // Bound a stalled command channel and a lost reply. Missing observations
+                        // must not leave the last successful snapshot looking ready indefinitely.
+                        let observation = tokio::time::timeout(
+                            std::time::Duration::from_secs(5),
+                            handle.get_committee_rpc_snapshot(),
+                        )
+                        .await;
+                        observation.ok().and_then(Result::ok).map_or_else(
+                            || coverage.forwarder.clear_submit_coverage(coverage.worker),
+                            |snapshot| {
+                                coverage.forwarder.observe_submit_coverage(
+                                    coverage.worker,
+                                    snapshot.members(),
+                                    snapshot.rpcs(),
+                                    snapshot.advertisements(),
+                                )
+                            },
+                        );
+                        Some(((), (interval, coverage, handle)))
+                    },
+                )
+                .for_each(|()| std::future::ready(()))
+                .await;
+                Ok(())
+            });
+        }
+
         let worker = WorkerNode::new(
             worker_id,
             consensus_config.clone(),
@@ -863,6 +930,13 @@ where
             consensus_config.network_config().admission().refresh_interval(),
         )
         .await?;
+
+        // The allowlists set below belong to the epoch the node enters. The position tells the
+        // reject path whether a resolved author outside them may be charged: only at the live
+        // tip. A replaying node drops such gossip without a penalty, because the author is most
+        // likely a live committee member of a later epoch.
+        let position = self.epoch_position(consensus_config.committee().epoch()).await;
+        network_handle.inner_handle().set_epoch_position(position).await?;
 
         // Update the authorized publishers for gossip every epoch. `primary_topic`,
         // `epoch_vote_topic` and `consensus_output_topic` are all committee-only publish topics:
@@ -1040,6 +1114,11 @@ where
             consensus_config.network_config().admission().refresh_interval(),
         )
         .await?;
+
+        // the batch topic allowlist below belongs to the entered epoch: only a node at the live
+        // tip may charge a resolved author outside it (see the primary network for the reason)
+        let position = self.epoch_position(consensus_config.committee().epoch()).await;
+        network_handle.inner_handle().set_epoch_position(position).await?;
 
         let worker_address = consensus_config.worker_address(*worker_id);
 
@@ -2148,6 +2227,16 @@ mod tests {
         assert!(
             epochs.certified_record_by_epoch(1).await.is_ok(),
             "epoch 1's stored record must verify against its certificate"
+        );
+        assert_eq!(
+            manager.epoch_position(1).await,
+            EpochPosition::Historical,
+            "a certified record marks the epoch as a historical replay"
+        );
+        assert_eq!(
+            manager.epoch_position(2).await,
+            EpochPosition::Live,
+            "an epoch without a certified record stays live"
         );
         manager
             .configure_consensus(

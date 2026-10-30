@@ -19,6 +19,7 @@
 pub mod admission;
 mod codec;
 mod consensus;
+mod diagnostics;
 pub mod error;
 mod freshness;
 mod gossip_config;
@@ -28,6 +29,7 @@ mod peers;
 mod quic_incoming;
 mod record_exchange;
 mod retention;
+mod serve_permits;
 mod service_class;
 pub mod source_admission;
 pub mod stream;
@@ -40,16 +42,18 @@ pub use consensus::ConsensusNetwork;
 pub use gossip_config::gossipsub_config;
 pub use metrics::AdmissionShed;
 pub use peers::{
-    AdmissionFallback, AdmissionStatus, CommitteeUpdate, LoadPenalty, PeerExchangeMap, Penalty,
+    AdmissionFallback, AdmissionStatus, CommitteeUpdate, LoadPenalty, PeerExchangeKey,
+    PeerExchangeMap, Penalty, MAX_PEER_EXCHANGE_ADDRS_PER_PEER, MAX_PEER_EXCHANGE_ENTRIES,
 };
+pub use serve_permits::{ServePermit, ServePermits, MAX_PERMITS_PER_PEER};
 pub use service_class::ServiceClass;
 pub use stream::StreamError;
 pub use sync::{
-    read_frame, write_frame, DenyReason, PrimarySyncRequest, SyncFrame, SyncFrameError,
-    WorkerSyncRequest,
+    read_frame, write_frame, DenyReason, PeerSlot, PeerSlots, PeerTier, PrimarySyncRequest,
+    ReservedPeers, ReservedPool, SyncFrame, SyncFrameError, WorkerSyncRequest,
 };
 pub use tn_node_record::{validate_advertised_addresses, MAX_ADVERTISED_MULTIADDRS};
-pub use types::ResponseChannel;
+pub use types::{EpochPosition, ResponseChannel};
 
 // re-export specific libp2p types
 pub use libp2p::{

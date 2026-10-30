@@ -18,7 +18,8 @@ the dependency. A template with pending fields is not release approval.
 
 The [carried libp2p-quic record](libp2p-quic/README.md) covers the active vendored
 Retry and queue bounds patch, accepted owners, measured advisory gaps and the
-required compatibility gate. The
+required compatibility gate. Its [Quinn observation companion](quinn-proto/README.md)
+records the pre-application observation source and its bounded metric contract. The
 [libp2p-tls upstream candidate](libp2p-tls-6634/README.md) records a concrete patch
 and the checks still required before adopting it in a Telcoin release.
 

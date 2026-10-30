@@ -9,6 +9,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use tn_types::{Noticer, TaskSpawner};
 use tracing::debug;
 
+#[cfg(test)]
+#[path = "tests/metrics_recorder.rs"]
+pub(crate) mod test_recorder;
+
 /// Process-wide running max of consensus output byte sizes.
 ///
 /// The `metrics` `Gauge` handle has no getter, so the "max since startup" gauge needs an
@@ -58,6 +62,16 @@ pub struct PrimaryMetrics {
     pub(crate) round: Gauge,
     /// Highest committed round (mirrored from the committed-round watch channel).
     pub(crate) committed_round: Gauge,
+    /// Distinct observed rounds finalized at the next round or the observation deadline.
+    pub(crate) rounds_evaluated_total: Counter,
+    /// Evaluated rounds below the committee quorum voting power, counting each author once.
+    pub(crate) round_quorum_shortfalls_total: Counter,
+    /// One while the active consensus task owns a quorum observer, otherwise zero.
+    pub(crate) quorum_observation_active: Gauge,
+    /// Unix seconds when the current active observer started, zero before startup.
+    pub(crate) liveness_started_timestamp_seconds: Gauge,
+    /// Unix seconds of the last successful subdag handoff this observer witnessed, or zero.
+    pub(crate) last_commit_timestamp_seconds: Gauge,
     /// Committed subdags.
     pub(crate) subdags_committed_total: Counter,
     /// Time from leader header creation to subdag commit, in fractional seconds at millisecond

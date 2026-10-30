@@ -521,15 +521,16 @@ impl<DB: Database> Certifier<DB> {
             // the comment where the formed-certificate path drops the lock).
             //
             // If the barrier fails, the epoch DB has latched a failed commit (or its runner is
-            // gone), so the record can be lost on restart. Refuse to republish and fail-stop the
-            // node. This task is not critical, so returning the error alone would not stop it.
+            // gone), so the record can be lost on restart. Refuse to republish and end the epoch:
+            // `run_epoch` then finds the store unable to make writes durable and stops the node.
+            // This task is not critical, so returning the error alone would not end the epoch.
             drop(_guard);
             self.config
                 .node_storage()
                 .persist::<ProposedCertificates>()
                 .await
                 .inspect_err(|e| {
-                    error!(target: "primary::certifier", "durable barrier failed for already-certified certificate, refusing to re-publish; initiating node shutdown: {e}");
+                    error!(target: "primary::certifier", "durable barrier failed for already-certified certificate, refusing to re-publish; ending the epoch (the node stops if its stores cannot write): {e}");
                     self.config.shutdown().notify();
                 })
                 .map_err(|e| TaskError::from_message(e.to_string()))?;
@@ -551,12 +552,13 @@ impl<DB: Database> Certifier<DB> {
                 match proposal_result {
                     Ok(mut certificate) => {
                         // A failed insert leaves no guard record, so a later proposal of this header
-                        // could certify it again with a different aggregate. Fail-stop the node:
-                        // this task is spawned as a non-critical task, and the task manager
-                        // discards a non-critical task's error, so returning it alone would not
-                        // stop the node (issue #1530).
+                        // could certify it again with a different aggregate. End the epoch (this
+                        // certificate never leaves the node): `run_epoch` then stops the node if
+                        // the store can no longer make writes durable. This task is spawned as a
+                        // non-critical task, and the task manager discards a non-critical task's
+                        // error, so returning it alone would not end the epoch (issue #1530).
                         if let Err(e) = self.config.node_storage().insert::<ProposedCertificates>(&header_digest, &certificate) {
-                            error!(target: "primary::certifier", "error accepting own certificate, unable to save the certificate; initiating node shutdown: {e}");
+                            error!(target: "primary::certifier", "error accepting own certificate, unable to save the certificate; ending the epoch (the node stops if its stores cannot write): {e}");
                             self.config.shutdown().notify();
                             return Err(TaskError::from_message(e.to_string()));
                         }
@@ -565,17 +567,17 @@ impl<DB: Database> Certifier<DB> {
                         //
                         // The lock exists to make the already-certified check at the top of this
                         // method atomic with the insert above, and that pair is now complete: the
-                        // insert updates the in-memory layer synchronously, so any later proposal
-                        // reaching that check already observes this certificate. Nothing below
-                        // needs the exclusion.
+                        // insert is readable as soon as it returns, so any later proposal reaching
+                        // that check already observes this certificate. Nothing below needs the
+                        // exclusion.
                         //
-                        // Holding it across the barrier would be actively harmful, because
-                        // `persist` is a *whole-DB* barrier - the table parameter is unused
-                        // and only selects which of the three DBs to target - so it defers while
-                        // any write txn on the epoch DB is open and drains only at refcount zero,
-                        // with no timeout. Under catch-up or epoch close that is tens to hundreds
-                        // of milliseconds during which every other proposal would queue behind this
-                        // lock. Do not widen this critical section back out.
+                        // Holding it across the barrier would be actively harmful: `persist` waits
+                        // for a sync round of the whole epoch environment's log (the table only
+                        // selects the environment) covering every write made before it, so it
+                        // waits on the disk (an msync, plus an fsync if the log grew), longest on
+                        // a slow volume, under catch-up or at epoch close, and every other proposal
+                        // would queue behind this lock meanwhile. Do not widen this critical
+                        // section back out.
                         drop(_guard);
 
                         // Wait for the `ProposedCertificates` record to be durable before
@@ -592,15 +594,16 @@ impl<DB: Database> Certifier<DB> {
                         // would externalize a certificate whose guard record can be lost on restart -
                         // exactly the re-proposal and leader-signature perturbation this barrier
                         // exists to prevent. Refuse rather than externalize a non-durable certificate
-                        // (issue #975), and fail-stop the node as the vote barriers do (#979):
-                        // returning the error from this non-critical task alone would not stop it
-                        // (issue #1530).
+                        // (issue #975), and end the epoch as the vote barriers do (#979), after
+                        // which `run_epoch` finds the store unable to make writes durable and stops
+                        // the node: returning the error from this non-critical task alone would not
+                        // end the epoch (issue #1530).
                         self.config
                             .node_storage()
                             .persist::<ProposedCertificates>()
                             .await
                             .map_err(|e| {
-                                error!(target: "primary::certifier", "durable barrier failed for own certificate, refusing to externalize; initiating node shutdown: {e}");
+                                error!(target: "primary::certifier", "durable barrier failed for own certificate, refusing to externalize; ending the epoch (the node stops if its stores cannot write): {e}");
                                 self.config.shutdown().notify();
                                 TaskError::from_message(e.to_string())
                             })?;

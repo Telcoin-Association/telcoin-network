@@ -11,7 +11,7 @@ use std::{
     thread::available_parallelism,
 };
 use tn_config::{Config, KeyConfig, PidLock, TelcoinDirs as _};
-use tn_node::engine::TnBuilder;
+use tn_node::{engine::TnBuilder, HealthcheckBind};
 use tn_reth::{parse_socket_address, RethChainSpec, RethCommand, RethConfig, FAUCET_ENABLED};
 use tn_types::{BlsPublicKey, BootstrapServer, Genesis, B256, MAINNET_GENESIS};
 use tokio::task::JoinHandle;
@@ -130,20 +130,18 @@ pub struct NodeCommand<Ext: clap::Args + fmt::Debug = NoArgs> {
     #[clap(flatten)]
     pub reth: RethCommand,
 
-    /// TCP health check endpoint port.
+    /// Healthcheck listener bind: a port or a socket address.
     ///
-    /// When a port is specified, the node will spawn a TCP health check service
-    /// on that port. The health check endpoint is useful for load balancers and
-    /// monitoring systems to verify that the node process is running.
+    /// A bare port (`8080`, the pre-#1689 form) binds `127.0.0.1:8080`. A socket address binds
+    /// exactly that interface: `[::1]:8080`, `10.10.0.21:8080`, or `0.0.0.0:8080` to listen on
+    /// every interface (write the wildcard out; it is never implied). The listener serves
+    /// liveness, `/health/workers` and `/health/network`. Unset starts no listener. A bind
+    /// failure stops startup; an unparsable value is rejected here.
     ///
-    /// If not specified, the health check service will not be started.
-    ///
-    /// WARNING: ensure the health endpoint is behind a firewall.
-    /// Each connection is handled synchronously in the main accept loop.
-    /// No connection limits or rate limiting are implemented.
-    /// Connections are immediately closed after sending response.
-    #[arg(long, value_name = "HEALTHCHECK_TCP_PORT", global = true, env = "HEALTHCHECK_TCP_PORT")]
-    pub healthcheck: Option<u16>,
+    /// Each connection is handled synchronously in the accept loop with a read timeout; no
+    /// connection limits or rate limiting, so keep the bind private.
+    #[arg(long, value_name = "PORT|ADDR", global = true, env = "HEALTHCHECK_TCP_PORT")]
+    pub healthcheck: Option<HealthcheckBind>,
 
     /// Assign this name to node.  Currently used to name it's opentracing service.
     #[arg(long, value_name = "NODE_NAME", global = true)]
@@ -429,6 +427,33 @@ mod tests {
                 assert_eq!(result, Err(ErrorKind::ValueValidation));
             },
         );
+        Ok(())
+    }
+
+    /// `--healthcheck` accepts a bare port (loopback) or an explicit socket address and
+    /// rejects anything else at parse time.
+    #[test]
+    fn healthcheck_flag_accepts_port_and_socket_address() -> Result<(), std::net::AddrParseError> {
+        let parse = |args: &[&str]| {
+            NodeCommand::<NoArgs>::try_parse_from(args)
+                .map(|cmd| cmd.healthcheck)
+                .map_err(|err| err.kind())
+        };
+        assert_eq!(
+            parse(&["node", "--healthcheck", "8080"]),
+            Ok(Some(HealthcheckBind::LegacyPort(8080)))
+        );
+        assert_eq!(
+            parse(&["node", "--healthcheck", "[::1]:8080"]),
+            Ok(Some(HealthcheckBind::Explicit("[::1]:8080".parse()?)))
+        );
+        assert_eq!(
+            parse(&["node", "--healthcheck", "0.0.0.0:8080"]),
+            Ok(Some(HealthcheckBind::Explicit("0.0.0.0:8080".parse()?)))
+        );
+        assert_eq!(parse(&["node", "--healthcheck", "127.0.0.1"]), Err(ErrorKind::ValueValidation));
+        assert_eq!(parse(&["node", "--healthcheck", "nope"]), Err(ErrorKind::ValueValidation));
+        assert_eq!(parse(&["node"]), Ok(None));
         Ok(())
     }
 

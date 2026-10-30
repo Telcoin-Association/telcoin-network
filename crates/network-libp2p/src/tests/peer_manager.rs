@@ -2264,6 +2264,66 @@ async fn test_learned_pinned_record_not_regressed_by_older_query_result() {
     assert_eq!(cached.rpc, Some(rpc), "older query result must not drop the advertised rpc");
 }
 
+/// Resolution observations follow learned records, exclude self, and replace all three slots.
+#[tokio::test]
+async fn committee_convergence_tracks_resolution_and_rotation() {
+    use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+    let recorder = DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    let mut manager = create_test_peer_manager(None);
+    let [local, learned, stub, missing, incoming] = [101, 102, 103, 104, 105]
+        .map(|seed| *BlsKeypair::generate(&mut StdRng::from_seed([seed; 32])).public());
+    let (info, _) = random_network_info_with_rpc();
+    manager.add_restored_peer(learned, info);
+    let (stub_info, _) = random_network_info_with_rpc();
+    manager.add_known_peer(stub, stub_info.clone());
+    manager.update_committees(
+        HashSet::from([local, learned]),
+        HashSet::from([learned, stub, missing]),
+        HashSet::from([stub, incoming]),
+    );
+    metrics::with_local_recorder(&recorder, || manager.observe_committee_resolution(local));
+    // The debugging recorder drains every gauge when taking a snapshot.
+    let observations = std::cell::RefCell::new(snapshotter.snapshot().into_vec());
+    let refresh = || *observations.borrow_mut() = snapshotter.snapshot().into_vec();
+    let gauge = |name: &str, slot: &str| {
+        observations.borrow().iter().find_map(|(key, _, _, value)| {
+            (key.key().name() == name
+                && key.key().labels().count() == 2
+                && key.key().labels().any(|label| label.key() == "slot" && label.value() == slot))
+            .then_some(value)
+            .and_then(|value| match value {
+                DebugValue::Gauge(value) => Some(value.0),
+                DebugValue::Counter(_) | DebugValue::Histogram(_) => None,
+            })
+        })
+    };
+    assert_eq!(gauge("tn_network.committee_required_members", "previous"), Some(1.0));
+    assert_eq!(gauge("tn_network.committee_unresolved_members", "previous"), Some(0.0));
+    assert_eq!(gauge("tn_network.committee_required_members", "current"), Some(3.0));
+    assert_eq!(gauge("tn_network.committee_unresolved_members", "current"), Some(2.0));
+    assert_eq!(gauge("tn_network.committee_unresolved_members", "next"), Some(2.0));
+    let snapshot = manager.committee_rpc_snapshot();
+    assert_eq!(snapshot.members().len(), 3);
+    assert_eq!(
+        snapshot.rpcs().iter().map(|(key, _)| *key).collect::<HashSet<_>>(),
+        HashSet::from([learned])
+    );
+    // Accepting verified metadata upgrades a stub without requiring a restart.
+    manager.add_restored_peer(stub, stub_info);
+    metrics::with_local_recorder(&recorder, || manager.observe_committee_resolution(local));
+    refresh();
+    assert_eq!(gauge("tn_network.committee_unresolved_members", "current"), Some(1.0));
+    assert_eq!(manager.committee_rpc_snapshot().rpcs().len(), 2);
+    manager.update_committees(HashSet::from([learned]), HashSet::from([incoming]), HashSet::new());
+    metrics::with_local_recorder(&recorder, || manager.observe_committee_resolution(local));
+    refresh();
+    assert_eq!(gauge("tn_network.committee_required_members", "current"), Some(1.0));
+    assert_eq!(gauge("tn_network.committee_unresolved_members", "current"), Some(1.0));
+    assert_eq!(gauge("tn_network.committee_required_members", "next"), Some(0.0));
+    assert!(manager.committee_rpc_snapshot().rpcs().is_empty());
+}
+
 /// Build a [`NetworkInfo`] like [`random_network_info`], but advertising a valid [`RpcInfo`].
 fn random_network_info_with_rpc() -> (NetworkInfo, RpcInfo) {
     let rpc = RpcInfo {
@@ -3769,7 +3829,10 @@ async fn test_kad_rate_windows_heartbeat_retains_live_and_sweeps_expired() {
 async fn test_kad_rate_windows_hard_cap_preserves_live_budgets() {
     let mut peer_manager = create_test_peer_manager(None);
     let tracked: Vec<PeerId> = (0..1024).map(|_| PeerId::random()).collect();
+    // Refill the shared budget before each record: this test pins per-source tracking, and
+    // the shared budget has its own tests.
     tracked.iter().for_each(|source| {
+        peer_manager.put_record_budget = PutRecordBudget::new(Instant::now());
         assert_eq!(peer_manager.put_record_rate_limited(*source), PutRecordRate::Allowed);
         assert!(!peer_manager.add_provider_rate_limited(*source));
         peer_manager.register_disconnected(source);
@@ -3790,6 +3853,7 @@ async fn test_kad_rate_windows_hard_cap_preserves_live_budgets() {
     // Full maps preserve each tracked source's remaining allowance and exhaustion.
     tracked.iter().for_each(|source| {
         (1..MAX_PUT_RECORDS_PER_WINDOW).for_each(|_| {
+            peer_manager.put_record_budget = PutRecordBudget::new(Instant::now());
             assert_eq!(peer_manager.put_record_rate_limited(*source), PutRecordRate::Allowed);
         });
         (1..MAX_ADD_PROVIDERS_PER_WINDOW)
@@ -3811,6 +3875,158 @@ async fn test_kad_rate_windows_hard_cap_preserves_live_budgets() {
     let newcomer = PeerId::random();
     assert_eq!(peer_manager.put_record_rate_limited(newcomer), PutRecordRate::Allowed);
     assert!(!peer_manager.add_provider_rate_limited(newcomer));
+}
+
+/// Send [`MAX_PUT_RECORDS_PER_WINDOW`] inbound kad `PutRecord`s from each source at `at`.
+fn put_record_round(
+    peer_manager: &mut PeerManager,
+    sources: &[PeerId],
+    at: Instant,
+) -> Vec<PutRecordRate> {
+    sources
+        .iter()
+        .flat_map(|source| (0..MAX_PUT_RECORDS_PER_WINDOW).map(move |_| *source))
+        .map(|source| peer_manager.put_record_rate_limited_at(source, at))
+        .collect()
+}
+
+/// Count the outcomes that let a record through to the verify.
+fn allowed_count(rates: &[PutRecordRate]) -> usize {
+    rates.iter().filter(|rate| **rate == PutRecordRate::Allowed).count()
+}
+
+/// Untrusted sources share one verify budget, a budget shed never scores the source, and a
+/// committee source bypasses the budget.
+#[tokio::test(start_paused = true)]
+async fn test_put_record_shared_budget_sheds_untrusted_and_spares_validator() -> eyre::Result<()> {
+    let mut peer_manager = create_test_peer_manager(None);
+    let start = Instant::now();
+    let sources: Vec<PeerId> = (0..8).map(|_| PeerId::random()).collect();
+
+    // Each source stays inside its own window, so only the shared budget sheds.
+    let rates = put_record_round(&mut peer_manager, &sources, start);
+    assert_eq!(allowed_count(&rates), usize::try_from(PUT_RECORD_BUDGET_BURST)?);
+    assert!(!rates.contains(&PutRecordRate::Flooding), "a budget shed never scores the source");
+    assert_eq!(
+        peer_manager.put_record_rate_limited_at(PeerId::random(), start),
+        PutRecordRate::Shed
+    );
+
+    let (bls, endpoint) = configured_hub(40);
+    let validator: PeerId = endpoint.network_key.clone().into();
+    let info = NetworkInfo {
+        pubkey: endpoint.network_key.clone(),
+        multiaddrs: vec![endpoint.network_address.clone()],
+        timestamp: now(),
+        rpc: None,
+    };
+    peer_manager.peers.upsert_peer(bls, info.pubkey.clone(), info.multiaddrs.clone());
+    peer_manager.cache_known_peer(bls, info);
+    peer_manager.update_committees(HashSet::new(), HashSet::from([bls]), HashSet::new());
+    assert!(peer_manager.peer_policy(&validator).exempts_shared_record_budget());
+    assert_eq!(peer_manager.put_record_rate_limited_at(validator, start), PutRecordRate::Allowed);
+    Ok(())
+}
+
+/// At an aligned window boundary the per-source windows alone admit a second full round; the
+/// shared budget admits none of it, then refills at its steady rate.
+#[tokio::test(start_paused = true)]
+async fn test_put_record_shared_budget_bounds_window_boundary_burst() -> eyre::Result<()> {
+    let mut peer_manager = create_test_peer_manager(None);
+    let start = Instant::now();
+    let sources: Vec<PeerId> = (0..8).map(|_| PeerId::random()).collect();
+    let burst = usize::try_from(PUT_RECORD_BUDGET_BURST)?;
+
+    let first = put_record_round(&mut peer_manager, &sources, start);
+    assert_eq!(allowed_count(&first), burst);
+
+    // Expire every window at `start`, so each source gets a fresh per-source allowance.
+    let expired = start
+        .checked_sub(PUT_RECORD_RATE_WINDOW)
+        .ok_or_else(|| eyre::eyre!("start predates one rate window"))?;
+    peer_manager.put_record_windows.values_mut().for_each(|window| window.started = expired);
+    let second = put_record_round(&mut peer_manager, &sources, start);
+    assert_eq!(allowed_count(&second), 0, "per-source windows alone would admit this round");
+    assert_eq!(allowed_count(&first) + allowed_count(&second), burst);
+
+    // One second later the budget has refilled at its steady rate, and no faster.
+    let refill = usize::try_from(PUT_RECORD_BUDGET_REFILL_PER_SEC)?;
+    let later = start + Duration::from_secs(1);
+    let fresh: Vec<PutRecordRate> = (0..=refill)
+        .map(|_| peer_manager.put_record_rate_limited_at(PeerId::random(), later))
+        .collect();
+    assert_eq!(fresh.first(), Some(&PutRecordRate::Allowed));
+    assert_eq!(allowed_count(&fresh), refill);
+    Ok(())
+}
+
+/// The shared budget refills per whole elapsed second, keeps the partial-second remainder,
+/// and never holds more than its burst.
+#[tokio::test(start_paused = true)]
+async fn test_put_record_budget_refills_whole_seconds_up_to_burst() -> eyre::Result<()> {
+    let start = Instant::now();
+    let burst = usize::try_from(PUT_RECORD_BUDGET_BURST)?;
+    let refill = usize::try_from(PUT_RECORD_BUDGET_REFILL_PER_SEC)?;
+    // One more attempt than the burst, so a count below the attempts proves the last one failed.
+    let takes = |budget: &mut PutRecordBudget, at: Instant| {
+        (0..=PUT_RECORD_BUDGET_BURST).filter(|_| budget.try_take(at)).count()
+    };
+
+    let mut budget = PutRecordBudget::new(start);
+    assert_eq!(takes(&mut budget, start), burst);
+    assert_eq!(takes(&mut budget, start + Duration::from_secs(1)), refill);
+    assert_eq!(takes(&mut budget, start + Duration::from_secs(3600)), burst, "idle caps at burst");
+
+    // A partial second credits nothing, and its remainder carries into the next refill.
+    let mut empty = PutRecordBudget { tokens: 0, last_refill: start };
+    assert!(!empty.try_take(start + Duration::from_millis(600)));
+    assert_eq!(takes(&mut empty, start + Duration::from_millis(1200)), refill);
+    assert_eq!(takes(&mut empty, start + Duration::from_millis(2000)), refill);
+    Ok(())
+}
+
+/// A shared budget shed has its own metric label, apart from per-source sheds and floods.
+#[tokio::test(start_paused = true)]
+async fn test_put_record_rate_limit_metric_counts_budget_shed() {
+    use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
+    let recorder = DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+
+    metrics::with_local_recorder(&recorder, || {
+        let mut peer_manager = create_test_peer_manager(None);
+        // One record per distinct source, so only the shared budget sheds.
+        (0..=PUT_RECORD_BUDGET_BURST).for_each(|_| {
+            peer_manager.put_record_rate_limited(PeerId::random());
+        });
+    });
+
+    let snapshot = snapshotter.snapshot().into_vec();
+    let has_outcome = |outcome: &str| {
+        snapshot.iter().any(|(key, ..)| {
+            key.key().name() == "tn_network.put_records_rate_limited_total"
+                && key.key().labels().any(|l| l.key() == "outcome" && l.value() == outcome)
+        })
+    };
+    let count_for = |outcome: &str| {
+        snapshot
+            .iter()
+            .find(|(key, ..)| {
+                key.key().name() == "tn_network.put_records_rate_limited_total"
+                    && key.key().labels().any(|l| l.key() == "outcome" && l.value() == outcome)
+            })
+            .map(|(_, _, _, value)| match value {
+                DebugValue::Counter(c) => *c,
+                DebugValue::Gauge(_) | DebugValue::Histogram(_) => {
+                    panic!("rate-limit metric must be a counter")
+                }
+            })
+            .unwrap_or_else(|| panic!("no rate-limit counter for outcome {outcome}"))
+    };
+
+    assert_eq!(count_for("budget"), 1);
+    assert!(!has_outcome("shed"), "a budget shed is not a per-source shed");
+    assert!(!has_outcome("flood"), "a budget shed never scores the source");
 }
 
 /// A source-budget denial is counted with its direction and reason.
@@ -3849,10 +4065,20 @@ async fn test_source_admission_denial_metric_records_reason() {
             .expect("valid source budget");
         peer_manager.set_source_budget(Some(budget));
         assert!(peer_manager
-            .reserve_source(ConnectionId::new_unchecked(1), peer, &endpoint, "in")
+            .reserve_source(
+                ConnectionId::new_unchecked(1),
+                peer,
+                &endpoint,
+                crate::metrics::ConnectionDirection::Inbound
+            )
             .is_ok());
         assert!(peer_manager
-            .reserve_source(ConnectionId::new_unchecked(2), peer, &endpoint, "in")
+            .reserve_source(
+                ConnectionId::new_unchecked(2),
+                peer,
+                &endpoint,
+                crate::metrics::ConnectionDirection::Inbound
+            )
             .is_err());
     });
 

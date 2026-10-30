@@ -1,6 +1,6 @@
 //! Handle specific request types received from the network.
 
-use super::PrimaryResponse;
+use super::{PrimaryResponse, SyncServeOutcome};
 use crate::{
     error::{CertManagerError, PrimaryNetworkError, PrimaryNetworkResult},
     network::message::{PrimaryGossip, PrimaryRPCError},
@@ -173,7 +173,9 @@ where
         // too far behind.
         let (exec_number, exec_epoch, exec_round) = self
             .consensus_bus
-            .last_consensus_block(&self.consensus_chain)
+            .with_last_consensus_block(&self.consensus_chain, |h| {
+                (h.number, h.sub_dag.leader_epoch(), h.sub_dag.leader_round())
+            })
             .await
             .inspect_err(|e| {
                 // A failed lookup is logged loudly but degrades to the same conservative
@@ -184,7 +186,6 @@ where
             })
             .ok()
             .flatten()
-            .map(|h| (h.number, h.sub_dag.leader_epoch(), h.sub_dag.leader_round()))
             .unwrap_or((0, 0, 0));
         // When empty outputs are skipped by execution, no new EVM block is produced.
         // In that case, rely on the most recent consensus round processed by the engine.
@@ -605,19 +606,19 @@ where
 
                 // This fast path recasts a stored vote before taking the per-author lock, so it
                 // must be gated on the same durability barrier as the slow paths.
-                // If any epoch-DB commit has failed, the `Votes` guard for this
-                // author/round may live only in the authoritative mem layer and
-                // never on disk, so recasting here would risk the same
-                // self-inflicted equivocation on restart that the first-vote barrier guards
-                // against. The poison latch fails this barrier after any failed
-                // commit; fail-stop the node rather than recast a non-durable vote
-                // (issue #975).
+                // If any epoch-DB write or sync has failed, the `Votes` guard for this
+                // author/round may be readable without ever having reached disk, so recasting
+                // here would risk the same self-inflicted equivocation on restart that the
+                // first-vote barrier guards against. The store's failure latch fails this
+                // barrier after any failed write or sync; end the epoch rather than recast a
+                // non-durable vote (issue #975), after which `run_epoch` finds the store unable
+                // to make writes durable and stops the node.
                 self.consensus_config
                     .node_storage()
                     .persist::<Votes>()
                     .await
                     .inspect_err(|e| {
-                        error!(target: "primary", "epoch DB durable barrier failed on fast vote recast; initiating node shutdown: {e}");
+                        error!(target: "primary", "epoch DB durable barrier failed on fast vote recast; ending the epoch (the node stops if its stores cannot write): {e}");
                         self.consensus_config.shutdown().notify();
                     })?;
                 info!(target: "primary", "Recast vote {vote:?} for {} at round {}", header, header.round());
@@ -1106,19 +1107,19 @@ where
                             header,
                             header.round()
                         );
-                        // Recast of a prior matching vote. If any epoch-DB commit has since failed,
-                        // the `Votes` guard for this author/round may live only in the
-                        // authoritative mem layer and not on disk, so
-                        // resending it here would risk the same
-                        // self-inflicted equivocation on restart. The poison latch fails this
-                        // barrier after any failed commit; fail-stop rather than recast a
-                        // non-durable vote (issue #975).
+                        // Recast of a prior matching vote. If any epoch-DB write or sync has since
+                        // failed, the `Votes` guard for this author/round may be readable without
+                        // ever having reached disk, so resending it here would risk the same
+                        // self-inflicted equivocation on restart. The store's failure latch fails
+                        // this barrier after any failed write or sync; end the epoch rather than
+                        // recast a non-durable vote (issue #975), and `run_epoch` then stops the
+                        // node.
                         self.consensus_config
                             .node_storage()
                             .persist::<Votes>()
                             .await
                             .inspect_err(|e| {
-                                error!(target: "primary", "epoch DB durable barrier failed on vote recast; initiating node shutdown: {e}");
+                                error!(target: "primary", "epoch DB durable barrier failed on vote recast; ending the epoch (the node stops if its stores cannot write): {e}");
                                 self.consensus_config.shutdown().notify();
                             })?;
                         return Ok(PrimaryResponse::Vote(vote));
@@ -1147,8 +1148,9 @@ where
         // ordinary crash. See issue #934.
         //
         // If the barrier reports a failed commit (disk full, `EIO`, checksum), the vote is not on
-        // disk, so returning it would risk that same self-inflicted equivocation. Fail-stop the
-        // node and refuse to return the vote. The error maps to `PrimaryNetworkError::Storage`,
+        // disk, so returning it would risk that same self-inflicted equivocation. Refuse to return
+        // the vote and end the epoch: `run_epoch` then finds the store unable to make writes
+        // durable and stops the node. The error maps to `PrimaryNetworkError::Storage`,
         // which carries no peer penalty: this is our local disk failure, not the peer's fault
         // (issue #975).
         self.consensus_config
@@ -1156,7 +1158,7 @@ where
             .persist::<Votes>()
             .await
             .inspect_err(|e| {
-                error!(target: "primary", "epoch DB durable barrier failed for vote; initiating node shutdown: {e}");
+                error!(target: "primary", "epoch DB durable barrier failed for vote; ending the epoch (the node stops if its stores cannot write): {e}");
                 self.consensus_config.shutdown().notify();
             })?;
 
@@ -1342,10 +1344,13 @@ where
     /// The exchange has already been admitted against the concurrency caps and its
     /// opening request frame read by the caller. This streams the pack via
     /// [`send_sync_epoch_pack_over_stream`], which bounds a slow reader with a per-frame write
-    /// timeout and a rolling throughput floor rather than a total timeout. A send failure is
-    /// logged and best-effort signalled with [`SyncFrame::Err`] so the requester
-    /// stops waiting; it is not a peer fault, so no penalty is returned (metrics-only
-    /// during the item-6 rollout, like the legacy responder).
+    /// timeout, a rolling throughput floor and a total deadline sized from the pack length. A
+    /// send failure is logged and best-effort signalled with [`SyncFrame::Err`] so the requester
+    /// stops waiting.
+    ///
+    /// Returns [`SyncServeOutcome::Completed`] when the pack was sent or shed with `Deny`,
+    /// [`SyncServeOutcome::Stalled`] when a write timed out (the caller may charge a public-tier
+    /// peer), and [`SyncServeOutcome::Failed`] for any other error.
     ///
     /// [`send_sync_epoch_pack_over_stream`]: crate::network::sync_codec::send_sync_epoch_pack_over_stream
     pub(super) async fn process_sync_epoch_pack_stream(
@@ -1355,15 +1360,16 @@ where
         epoch: Epoch,
         stop_number: Option<u64>,
         consensus_chain: &ConsensusChain,
-    ) -> PrimaryNetworkResult<()> {
+    ) -> SyncServeOutcome {
         debug!(target: "primary::network", %peer, epoch, ?stop_number, "serving inbound sync epoch pack stream");
         let max_frame = crate::network::sync_codec::MAX_SYNC_PACK_FRAME_SIZE;
 
-        // No fixed overall serve cap: `send_sync_epoch_pack_over_stream` enforces a per-frame write
-        // timeout (`SEND_STREAM_BUFFER_TIMEOUT`) AND a rolling-window throughput floor, so a large
-        // honest pack can take as long as it needs at/above the floor while a drip-reading peer
-        // (which keeps resetting the per-frame timer) is cut within roughly one window —
-        // without capping the pack size a slow-but-honest requester could ever receive.
+        // `send_sync_epoch_pack_over_stream` bounds the serve three ways: a per-frame write
+        // timeout (`SEND_STREAM_BUFFER_TIMEOUT`), a rolling-window throughput floor, and a total
+        // deadline (`pack_serve_deadline`) of one floor window per started MiB of pack plus one.
+        // A large honest pack at or above the floor finishes inside the deadline; a drip reader
+        // that keeps resetting the per-frame timer is cut by the floor or, at the latest, by the
+        // deadline.
         let served = crate::network::sync_codec::send_sync_epoch_pack_over_stream(
             &mut stream,
             consensus_chain,
@@ -1374,8 +1380,10 @@ where
         )
         .await;
 
-        // a send failure or timeout is logged and best-effort signalled so the
-        // requester stops waiting; it is not a peer fault, so no penalty
+        // a send failure or timeout is logged and best-effort signalled so the requester stops
+        // waiting; a timed-out write is classified `Stalled` so the admission layer can charge a
+        // public-tier peer
+        let outcome = SyncServeOutcome::of(&served);
         if let Err(e) = served {
             warn!(target: "primary::network", %peer, ?e, "failed to serve sync epoch pack stream");
             // bound the best-effort error write: a peer that read the `Ack` then
@@ -1398,7 +1406,7 @@ where
         // reading cannot pin this responder task on the FIN flush
         let _ = timeout(crate::network::SYNC_REQUEST_READ_TIMEOUT, stream.close()).await;
 
-        Ok(())
+        outcome
     }
 
     /// Serve an inbound missing-certificates sync exchange.
@@ -1415,8 +1423,12 @@ where
     /// A request whose `skip_rounds` is out of bounds fails the collector build and is
     /// declined with [`SyncFrame::Err`]`(`[`SyncFrameError::Malformed`]`)` before any
     /// `Ack`; any later serve failure is logged and best-effort signalled with
-    /// `SyncFrame::Err`. Errors are metrics-only during the rollout (no penalty),
-    /// matching the legacy responder and the epoch-pack sync path.
+    /// `SyncFrame::Err`.
+    ///
+    /// Returns [`SyncServeOutcome::Completed`] when the certificates were sent,
+    /// [`SyncServeOutcome::Stalled`] when a write timed out (the caller may charge a public-tier
+    /// peer), and [`SyncServeOutcome::Failed`] for a malformed request, an overall serve timeout
+    /// or any other error.
     ///
     /// [`send_sync_certificates_over_stream`]: crate::network::sync_codec::send_sync_certificates_over_stream
     pub(super) async fn process_sync_missing_certs_stream(
@@ -1425,7 +1437,7 @@ where
         mut stream: Stream,
         exclusive_lower_bound: Round,
         skip_rounds: Vec<(AuthorityIdentifier, Vec<u8>)>,
-    ) -> PrimaryNetworkResult<()> {
+    ) -> SyncServeOutcome {
         debug!(target: "primary::network", %peer, exclusive_lower_bound, "serving inbound sync missing certificates stream");
         let max_frame = crate::network::sync_codec::MAX_SYNC_CERT_FRAME_SIZE;
         let (mut encode_buffer, mut compressed_buffer) = (Vec::new(), Vec::new());
@@ -1451,7 +1463,7 @@ where
                 stream.close().await
             })
             .await;
-            return Ok(());
+            return SyncServeOutcome::Failed;
         };
 
         // bound the whole serve; flatten the timeout's outer Result into the send's
@@ -1467,8 +1479,10 @@ where
         .map_err(PrimaryNetworkError::from)
         .and_then(|served| served);
 
-        // a serve failure or timeout is logged and best-effort signalled so the
-        // requester stops waiting; it is not a peer fault, so no penalty
+        // a serve failure or timeout is logged and best-effort signalled so the requester stops
+        // waiting; a timed-out write is classified `Stalled` so the admission layer can charge a
+        // public-tier peer
+        let outcome = SyncServeOutcome::of(&served);
         if let Err(e) = served {
             warn!(target: "primary::network", %peer, ?e, "failed to serve sync missing certificates stream");
             // bound the best-effort error write: a peer that read the `Ack` then
@@ -1490,7 +1504,7 @@ where
         // reading cannot pin this responder task on the FIN flush
         let _ = timeout(crate::network::SYNC_REQUEST_READ_TIMEOUT, stream.close()).await;
 
-        Ok(())
+        outcome
     }
 
     /// Serve an inbound single-consensus-output sync exchange.
@@ -1503,8 +1517,11 @@ where
     /// `Ack` + `Data`* + `End`; a benign miss (unknown number, or one not yet built
     /// during catch-up) sheds with a [`SyncFrame::Deny`]`(Unavailable)` frame so the
     /// requester retries elsewhere. A send failure is logged and best-effort signalled
-    /// with [`SyncFrame::Err`]; it is not a peer fault, so no penalty is returned
-    /// (metrics-only during the item-9b rollout, like the epoch-pack sync path).
+    /// with [`SyncFrame::Err`].
+    ///
+    /// Returns [`SyncServeOutcome::Completed`] when the output was sent or shed with `Deny`,
+    /// [`SyncServeOutcome::Stalled`] when a write timed out (the caller may charge a public-tier
+    /// peer), and [`SyncServeOutcome::Failed`] for an overall serve timeout or any other error.
     ///
     /// [`send_sync_consensus_output_over_stream`]: crate::network::sync_codec::send_sync_consensus_output_over_stream
     pub(super) async fn process_sync_consensus_output_stream(
@@ -1512,7 +1529,7 @@ where
         peer: BlsPublicKey,
         mut stream: Stream,
         number: u64,
-    ) -> PrimaryNetworkResult<()> {
+    ) -> SyncServeOutcome {
         debug!(target: "primary::network", %peer, number, "serving inbound sync consensus output stream");
         let max_frame = crate::network::sync_codec::MAX_SYNC_PACK_FRAME_SIZE;
 
@@ -1535,8 +1552,10 @@ where
         .map_err(PrimaryNetworkError::from)
         .and_then(|served| served);
 
-        // a send failure or timeout is logged and best-effort signalled so the
-        // requester stops waiting; it is not a peer fault, so no penalty
+        // a send failure or timeout is logged and best-effort signalled so the requester stops
+        // waiting; a timed-out write is classified `Stalled` so the admission layer can charge a
+        // public-tier peer
+        let outcome = SyncServeOutcome::of(&served);
         if let Err(e) = served {
             warn!(target: "primary::network", %peer, ?e, "failed to serve sync consensus output stream");
             // bound the best-effort error write: a peer that read the `Ack` then
@@ -1559,7 +1578,7 @@ where
         // reading cannot pin this responder task on the FIN flush
         let _ = timeout(crate::network::SYNC_REQUEST_READ_TIMEOUT, stream.close()).await;
 
-        Ok(())
+        outcome
     }
 }
 

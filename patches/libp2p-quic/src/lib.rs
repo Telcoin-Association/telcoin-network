@@ -71,7 +71,7 @@ use std::net::SocketAddr;
 
 pub use config::Config;
 pub use connection::{Connecting, Connection, Stream};
-pub use incoming::IncomingStats;
+pub use incoming::{IncomingOutcome, IncomingStats};
 pub use provider::Provider;
 #[cfg(feature = "tokio")]
 pub use provider::tokio;
