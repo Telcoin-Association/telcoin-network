@@ -170,6 +170,12 @@ module, then `vendor.py remove` what leaves. `RethRpcModule` itself lives in
 
 ## Taking upstream changes as the code diverges
 
+- **Pending decision:** `tn/notes/upstream-backports.md` lists upstream fixes since v1.11.4 that
+  matter to TN, each with a trial-pick result. The High ones include a WebSocket origin check that
+  `--ws.origins` never enforces (ff2657600), transaction-pool memory growth (792ee9245) and a
+  log-subscription panic (6e4009eed). There is also a JS-tracer DoS that needs a newer
+  revm-inspectors. None are applied yet.
+
 - While a crate is only lightly changed, `vendor.py sync` and `pick` keep working. Watch reth
   releases for fixes in the crates TN still carries close to upstream: rpc, transaction-pool,
   trie, provider, chain-state.
