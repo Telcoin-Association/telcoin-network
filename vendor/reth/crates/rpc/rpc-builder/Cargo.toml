@@ -65,7 +65,7 @@ reth-rpc-api = { workspace = true, features = ["client"] }
 reth-rpc-engine-api.workspace = true
 reth-tracing.workspace = true
 reth-transaction-pool = { workspace = true, features = ["test-utils"] }
-reth-node-ethereum.workspace = true
+# TN(TN-0004): reth-node-ethereum dropped with the auth-server tests (tests/it/auth.rs).
 
 alloy-primitives.workspace = true
 alloy-rpc-types-eth.workspace = true

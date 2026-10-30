@@ -1,6 +1,6 @@
 #![allow(missing_docs)]
 
-mod auth;
+// TN(TN-0004): `mod auth;` removed; it tested reth's engine-API auth server.
 mod http;
 mod middleware;
 mod serde;

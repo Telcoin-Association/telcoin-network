@@ -52,6 +52,6 @@ reth-ethereum-primitives.workspace = true
 reth-payload-builder = { workspace = true, features = ["test-utils"] }
 reth-testing-utils.workspace = true
 alloy-rlp.workspace = true
-reth-node-ethereum.workspace = true
+# TN(TN-0004): reth-node-ethereum dropped with the engine_api.rs unit tests.
 
 assert_matches.workspace = true
