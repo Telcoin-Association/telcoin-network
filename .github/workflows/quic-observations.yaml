@@ -76,7 +76,7 @@ jobs:
         run: cargo +1.94 clippy --locked --manifest-path testing/quic-interop/releases/candidate/Cargo.toml --all-targets --no-deps -- -D warnings
       - name: Preserve source identity and version controls
         run: python3 -I -m unittest discover -s etc/transport-patches -p 'test_*.py' -v
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
         with:
           name: quic-observation-mutations
@@ -102,7 +102,7 @@ jobs:
         run: cargo +1.94 test --locked -p tn-network-libp2p metrics::tests::quic_metrics --lib
       - name: Confirm metric regression assertions reject observation mutations
         run: python3 -I testing/quic-interop/observation_mutations.py --suite metrics --output "$RUNNER_TEMP/quic-metrics-mutations"
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
         with:
           name: quic-metric-mutations
