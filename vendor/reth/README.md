@@ -4,8 +4,11 @@ Telcoin Network's execution layer is built on [reth](https://github.com/paradigm
 directory holds the reth crates TN uses, as source, so TN can change them. Upstream syncs stay
 possible but optional.
 
-- Base: upstream `v1.11.3` (`d6324d63e27ef6b7c49cdc9b1977c1b808234c7b`); the pin is in
-  `tn/upstream.toml`.
+- Base: imported from upstream `v1.11.3` (`d6324d63e27e`), synced to `v1.11.4`
+  (`2ac58a25f561`). The current pin is always in `tn/upstream.toml`.
+- Tags: `reth-vendor-import-v1.11.3` (verbatim import), `reth-vendor-v1.11.3` (vendoring done
+  and verified), `reth-reduction-start` (last commit before reduction). `git diff
+  reth-reduction-start` shows everything the reduction changed.
 - Carried: the reth crates in TN's dependency graph (63 after reduction Phases 1, 2, 4a and 6a;
   101 at import), plus the test-only `reth-testing-utils`. The list is in `tn/crates.txt`.
 - TN's changes against upstream: CHANGES.md, the ledger.
