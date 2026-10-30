@@ -458,7 +458,7 @@ umbrella's default features are always on, enabled on the crates it forwarded th
 (`reth-cli-util`, `reth-node-core`; not `reth-node-metrics`, whose jemalloc stats feed only
 reth's own metrics server, which TN never starts), `otlp` and `otlp-logs` (`reth-node-core`), `js-tracer`
 (`reth-rpc`, `reth-rpc-eth-api`, `reth-rpc-eth-types`), `keccak-cache-global` (`reth-node-core`),
-`asm-keccak` (`reth-node-core`, `reth-primitives`, `revm`) and `min-debug-logs` (`reth-node-core`,
+`asm-keccak` (`reth-node-core`, `revm`) and `min-debug-logs` (`reth-node-core`,
 which caps `tracing` at debug in release builds).
 
 reth's node builder is not a dependency: this crate wires the provider, EVM, pool and RPC itself.

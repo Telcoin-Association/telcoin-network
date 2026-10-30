@@ -130,7 +130,6 @@ zeroize = "1.8.2"
 # zero-size stub with the feature off). Re-enable explicitly via the off-by-default `rocksdb`
 # feature on tn-reth / tn-node / telcoin-network-cli / telcoin-network.
 # NOTE: reth's `edge` features imply `rocksdb`; do not enable them while this gate is off.
-reth-primitives = { path = "vendor/reth/crates/primitives" }
 reth-primitives-traits = { path = "vendor/reth/crates/primitives-traits" }
 reth-chainspec = { path = "vendor/reth/crates/chainspec" }
 reth-chain-state = { path = "vendor/reth/crates/chain-state" }
