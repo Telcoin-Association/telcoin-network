@@ -33,3 +33,10 @@ newest last.
   `rustfmt.toml`. That nightly formats these two spots differently from the one reth used.
   When TN bumps its nightly, rerun `make fmt` and record any vendored reformatting the same
   way. *Upstream*: no.
+
+- **TN-0003** — Fix a reth-trie unit test that does not compile upstream. *Kind*: test.
+  *Files*: `crates/trie/trie/src/proof_v2/mod.rs` (`test_proof_calculator_reuse_after_error`).
+  *Why*: upstream backported the test to the 1.11 branch (#22781) still naming `ProofV2Target`,
+  the v2 name of the type that 1.11 calls `Target`, so `reth-trie`'s lib tests fail to build at
+  v1.11.3 and v1.11.4. Found by building the nested workspace with `--all-targets`. *Upstream*:
+  moot. The v1.11 line is finished and v2 has `ProofV2Target`.
