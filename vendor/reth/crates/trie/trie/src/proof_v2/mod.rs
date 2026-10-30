@@ -1886,8 +1886,9 @@ mod tests {
         );
         let mut sorted_addresses = addresses.to_vec();
         sorted_addresses.sort();
-        let mut targets: Vec<ProofV2Target> =
-            sorted_addresses.iter().copied().map(ProofV2Target::new).collect();
+        // TN(TN-0003): upstream backported this test from v2, where the type is `ProofV2Target`;
+        // in 1.11 it is `Target`.
+        let mut targets: Vec<Target> = sorted_addresses.iter().copied().map(Target::new).collect();
 
         let result = proof_calculator.proof(&mut value_encoder, &mut targets).unwrap();
 
