@@ -27,10 +27,11 @@ parking_lot = { workspace = true }
 # `Cargo.toml`). The umbrella's default features are enabled here on the crates it forwarded
 # them to: jemalloc (reth-cli-util, reth-node-core; not reth-node-metrics, whose jemalloc
 # stats feed only reth's own metrics server, which TN never starts); otlp and otlp-logs
-# (reth-node-core); js-tracer (reth-node-builder, reth-node-ethereum, reth-rpc,
-# reth-rpc-eth-types); keccak-cache-global (reth-node-core, reth-node-ethereum); asm-keccak
-# (reth-node-core, reth-node-ethereum, reth-primitives); min-debug-logs (reth-node-core, which
-# caps `tracing` at debug in release builds).
+# (reth-node-core); js-tracer (reth-rpc, reth-rpc-eth-api, reth-rpc-eth-types);
+# keccak-cache-global (reth-node-core); asm-keccak (reth-node-core, reth-primitives);
+# min-debug-logs (reth-node-core, which caps `tracing` at debug in release builds).
+# TN does not use reth's node builder (it wires provider, EVM, pool and RPC itself), so neither
+# reth-node-builder nor reth-node-ethereum is a dependency; see vendor/reth/ROADMAP.md.
 reth-db = { workspace = true }
 reth-db-common = { workspace = true }
 reth-node-core = { workspace = true, features = [
@@ -41,26 +42,25 @@ reth-node-core = { workspace = true, features = [
     "asm-keccak",
     "min-debug-logs",
 ] }
-reth-node-ethereum = { workspace = true, features = [
-    "js-tracer",
-    "keccak-cache-global",
-    "asm-keccak",
-] }
 reth-chainspec = { workspace = true }
-reth-chain-state = { workspace = true }
+reth-chain-state = { workspace = true, features = ["rayon"] }
 reth-cli-util = { workspace = true, features = ["jemalloc"] }
 reth-primitives = { workspace = true, features = ["asm-keccak"] }
 reth-consensus = { workspace = true }
 reth-evm-ethereum = { workspace = true }
 reth-engine-primitives = { workspace = true }
-reth-revm = { workspace = true }
+reth-revm = { workspace = true, features = ["optional-balance-check"] }
+# Direct dependencies only for their features, which reth-node-ethereum and reth-engine-tree
+# used to enable before TN stopped depending on them (vendor/reth/ROADMAP.md, Phase 1). revm's
+# precompile backends (secp256k1, blst, c-kzg) and asm-keccak are consensus-relevant: they pick
+# the ecrecover, BLS12-381, KZG and keccak implementations. trie-sparse's std selects its
+# parallel paths. `tn/graph.py diff` against the previous graph must stay empty for these.
+revm = { workspace = true, features = ["secp256k1", "blst", "c-kzg", "memory_limit", "asm-keccak"] }
+reth-trie-sparse = { workspace = true, features = ["std", "metrics"] }
 reth-evm = { workspace = true }
-reth-node-builder = { workspace = true, features = ["js-tracer"] }
+reth-node-types = { workspace = true }
+reth-payload-primitives = { workspace = true }
 reth-provider = { workspace = true }
-# Direct dependencies only so `rocksdb` reaches their own `rocksdb` features, as the umbrella's
-# `rocksdb` did (through reth-cli-commands).
-reth-prune = { workspace = true, optional = true }
-reth-stages = { workspace = true, optional = true }
 reth-prune-types = { workspace = true }
 reth-primitives-traits = { workspace = true }
 reth-stages-types = { workspace = true }
@@ -73,7 +73,7 @@ reth-errors = { workspace = true }
 reth-rpc = { workspace = true, features = ["js-tracer"] }
 reth-rpc-api = { workspace = true }
 reth-rpc-builder = { workspace = true }
-reth-rpc-eth-api = { workspace = true }
+reth-rpc-eth-api = { workspace = true, features = ["js-tracer"] }
 reth-rpc-eth-types = { workspace = true, features = ["js-tracer"] }
 reth-network = { workspace = true }
 reth-network-peers = { workspace = true }
@@ -146,10 +146,6 @@ rocksdb = [
     "reth-node-core/rocksdb",
     "reth-provider/rocksdb",
     "reth-db-common/rocksdb",
-    "dep:reth-stages",
-    "reth-stages/rocksdb",
-    "dep:reth-prune",
-    "reth-prune/rocksdb",
 ]
 
 [[bench]]

@@ -59,10 +59,10 @@ use alloy::{hex, sol_types::SolConstructor as _};
 use eyre::OptionExt as _;
 use reth_chainspec::ChainSpec as RethChainSpec;
 use reth_evm::{ConfigureEvm as _, Evm as _, EvmFactory as _};
-use reth_node_builder::NodeConfig;
 use reth_node_core::{
     args::{DatabaseArgs, DatadirArgs, RpcServerArgs},
     dirs::MaybePlatformPath,
+    node_config::NodeConfig,
 };
 use reth_revm::{
     cached::CachedReads,
