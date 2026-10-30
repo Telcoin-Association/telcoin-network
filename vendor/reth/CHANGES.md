@@ -138,3 +138,11 @@ newest last.
   *Why*: a re-export crate. Once `tn-types` and `tn-reth` took its items from
   `reth-primitives-traits` and `reth-ethereum-primitives` (with `tn-types` defining the `Block`,
   `BlockBody` and `SealedBlock` aliases it had provided), nothing reaches it. *Upstream*: n/a.
+
+## Upstream syncs
+
+- **TN-0013** — Sync to upstream v1.11.4 (`2ac58a25f561`). *Kind*: sync.
+  *Files*: `tn/upstream.toml` only.
+  *Why*: `vendor.py sync v1.11.4` found no change in the vendored scope. The release changed only
+  `crates/engine/tree/src/tree/precompile_cache.rs`, which TN no longer carries (TN-0005). The pin
+  moves so later syncs start from v1.11.4. *Upstream*: n/a.
