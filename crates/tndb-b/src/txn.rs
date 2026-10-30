@@ -212,14 +212,15 @@ fn split_dup_key(key: &[u8], key_len: u16) -> Result<(&[u8], &[u8])> {
 
 /// The outer cell of key `k` in the dup table `table`'s outer tree `outer`: the nested cell's
 /// root bytes, `None` for no cell. Any other cell is [`Error::Corrupt`] (this build writes only
-/// nested cells into an outer tree).
+/// nested cells into an outer tree), as is a miss beside an outer key of another width than `k`'s
+/// ([`read::find_outer`]).
 fn outer_cell<'s, S: PageRead + ?Sized>(
     store: &'s S,
     table: &Table,
     outer: &TreeRoot,
     k: &[u8],
 ) -> Result<Option<&'s [u8; page::NESTED_CELL]>> {
-    match read::find(store, outer, k)? {
+    match read::find_outer(store, outer, k)? {
         None => Ok(None),
         Some(Val::Nested(b)) => Ok(Some(b)),
         Some(Val::Inline(_)) => Err(Error::Corrupt(format!(
@@ -346,6 +347,15 @@ fn dup_put(work: &mut Work, i: usize, key: &[u8], value: &[u8], kind: PutKind) -
     }
     let new_key = match kind {
         PutKind::Append => match read::last_key(&*writer, &w.record.root)? {
+            // Every outer key has the table's width (as `outer_cell`'s lookups hold it).
+            Some(last) if last.len() != k.len() => {
+                return Err(Error::Corrupt(format!(
+                    "dup table {}: its last outer key has {} bytes, not the table's width {}",
+                    w.table.name(),
+                    last.len(),
+                    k.len()
+                )))
+            }
             Some(last) if k < last => return Err(Error::AppendOutOfOrder),
             Some(last) => k != last,
             None => true,

@@ -30,7 +30,7 @@ use crate::{
 };
 
 /// The options of the dup tables these tests create.
-const OPTIONS: DupOptions = DupOptions { key_len: 4, packed_max: 0 };
+pub(super) const OPTIONS: DupOptions = DupOptions { key_len: 4, packed_max: 0 };
 
 /// `Env::check` of `env`, which must pass, with dup table `name`'s figures those of its
 /// `table_stat`: its rows, its outer and nested pages (runs included) and its outer tree's height.
@@ -222,7 +222,7 @@ fn with_record(dir: &Path, edit: impl FnOnce(&mut TableRecord)) -> (PathBuf, cra
 
 /// Table `d`'s record in the cleanly closed file at `path`, whose catalog is one leaf, changed by
 /// `edit` in place (keeping the record rules), the leaf's CRC stamped again.
-fn restamp_record(path: &Path, edit: impl FnOnce(&mut TableRecord)) {
+pub(super) fn restamp_record(path: &Path, edit: impl FnOnce(&mut TableRecord)) {
     let catalog = {
         let env = open(path, SyncMode::Durable);
         let meta = env.inner().current().meta;
@@ -291,7 +291,7 @@ fn a_packed_dup_record_is_refused() {
 type Rows = BTreeMap<Vec<u8>, Vec<u8>>;
 
 /// The logical key of outer key number `k` (a big-endian [`OPTIONS`]-wide key) and subkey `s`.
-fn dup_key(k: u32, s: &[u8]) -> Vec<u8> {
+pub(super) fn dup_key(k: u32, s: &[u8]) -> Vec<u8> {
     [&k.to_be_bytes()[..], s].concat()
 }
 
@@ -1159,7 +1159,7 @@ fn damaged(
 
 /// Replace the value of `key`'s cell in the leaf `pgno` of the file at `path` with `value`, the
 /// leaf's CRC stamped again.
-fn restamp_cell(path: &Path, pgno: u32, key: &[u8], value: impl page::CellVal) {
+pub(super) fn restamp_cell(path: &Path, pgno: u32, key: &[u8], value: impl page::CellVal) {
     restamped(path, pgno, |page| {
         let Find::Found { index, .. } = page::leaf_find(page, key).expect("find") else {
             panic!("{key:02x?} is in leaf {pgno}");
@@ -1231,6 +1231,48 @@ fn check_refuses_an_outer_key_of_another_width() {
         restamp_record(path, |record| record.dup.as_mut().expect("dup").key_len = 3);
     });
     assert_check_refuses("width 3", &path, &["outer key of 4 bytes in a table of width 3"]);
+}
+
+/// A dup record whose outer key width is 3 over a tree of 4-byte outer keys is `Corrupt` at first
+/// use, before `Env::check`, and latches, each op on a fresh copy: a get in either transaction, a
+/// put of a new key, a delete and a `delete_prefix` (a 3-byte key is never found, and a miss
+/// beside a 4-byte key is refused, naming the leaf), and an append in order by the 3-byte key
+/// (the last outer key has 4 bytes), none of which may answer `None` or write a 3-byte cell.
+#[test]
+fn a_dup_record_of_another_width_is_corrupt_at_first_use() {
+    let dir = TempDir::with_prefix("tndb_b_dup_width_use").expect("temp dir");
+    let mut first = 0;
+    let (path, _) = damaged(dir.path(), |path, cells| {
+        first = cells[&0].0;
+        restamp_record(path, |record| record.dup.as_mut().expect("dup").key_len = 3);
+    });
+    let miss = format!("page {first}: an outer key of 4 bytes in a dup table of width 3");
+    let last = "its last outer key has 4 bytes, not the table's width 3".to_string();
+    let key = dup_key(COLD, &[0]);
+    for op in ["ro get", "rw get", "put", "append", "delete", "delete_prefix"] {
+        let (_dir, env) = copy_of(&path);
+        let result = if op == "ro get" {
+            let ro = env.begin_ro().expect("ro");
+            let d = ro.open_table("d").expect("open").expect("d");
+            ro.get(&d, &key).map(drop)
+        } else {
+            let mut txn = env.begin_rw().expect("rw");
+            let d = txn.open_table("d").expect("open").expect("d");
+            match op {
+                "rw get" => txn.get(&d, &key).map(drop),
+                "put" => txn.put(&d, &dup_key(40, b"new"), b"value"),
+                "append" => txn.append(&d, &dup_key(u32::MAX, b"new"), b"value"),
+                "delete" => txn.delete(&d, &key).map(drop),
+                _ => txn.delete_prefix(&d, &key[..3]).map(drop),
+            }
+        };
+        let message = if op == "append" { &last } else { &miss };
+        assert!(
+            matches!(&result, Err(Error::Corrupt(m)) if m.contains(message.as_str())),
+            "{op}: {result:?}"
+        );
+        assert!(env.failure().is_some(), "{op}: latched");
+    }
 }
 
 /// An outer cell that is not a nested cell fails `Env::check`, and latches: an inline value (every

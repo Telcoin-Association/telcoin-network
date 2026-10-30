@@ -193,6 +193,28 @@ pub(crate) fn find<'s, S: PageRead + ?Sized>(
     root: &TreeRoot,
     key: &[u8],
 ) -> Result<Option<Val<'s>>> {
+    find_in(store, root, key, None)
+}
+
+/// [`find`] in a dup table's outer tree, every key of which has the table's width, `key.len()`
+/// bytes: the keys either side of a miss must have it too, else [`Error::Corrupt`] naming the
+/// leaf. A record of another width is then refused at first use, not a wrong `None` (or a new
+/// cell of that width beside the old ones). A hit needs no check: the key found is `key`.
+pub(crate) fn find_outer<'s, S: PageRead + ?Sized>(
+    store: &'s S,
+    root: &TreeRoot,
+    key: &[u8],
+) -> Result<Option<Val<'s>>> {
+    find_in(store, root, key, Some(key.len()))
+}
+
+/// [`find`], a miss's neighbours in the leaf held to `width` bytes when it is given.
+fn find_in<'s, S: PageRead + ?Sized>(
+    store: &'s S,
+    root: &TreeRoot,
+    key: &[u8],
+    width: Option<usize>,
+) -> Result<Option<Val<'s>>> {
     let Some(leaf) = descend(store, root, key, |_, _, _, _| Ok(()), None)? else {
         return Ok(None);
     };
@@ -202,6 +224,15 @@ pub(crate) fn find<'s, S: PageRead + ?Sized>(
         Find::Found { value, .. } => Ok(Some(value)),
         Find::NotFound { before, after, .. } => {
             check_miss(leaf.pgno, before, after, leaf.lo, leaf.hi)?;
+            let wide = |k: &&[u8]| width.is_some_and(|n| k.len() != n);
+            if let Some(k) = [before, after].into_iter().flatten().find(wide) {
+                return Err(Error::Corrupt(format!(
+                    "page {}: an outer key of {} bytes in a dup table of width {}",
+                    leaf.pgno,
+                    k.len(),
+                    key.len()
+                )));
+            }
             Ok(None)
         }
     }
