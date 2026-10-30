@@ -40,3 +40,17 @@ newest last.
   the v2 name of the type that 1.11 calls `Target`, so `reth-trie`'s lib tests fail to build at
   v1.11.3 and v1.11.4. Found by building the nested workspace with `--all-targets`. *Upstream*:
   moot. The v1.11 line is finished and v2 has `ProofV2Target`.
+
+## Reduction (after tag `reth-reduction-start`)
+
+- **TN-0004** — Drop the engine-API tests that need `reth-node-ethereum`. *Kind*: test.
+  *Files*: `crates/rpc/rpc-engine-api/src/engine_api.rs` (the `#[cfg(test)] mod tests`
+  module), `crates/rpc/rpc-engine-api/Cargo.toml` (dev-dependency);
+  `crates/rpc/rpc-builder/tests/it/utils.rs` (`launch_auth` and its imports),
+  `crates/rpc/rpc-builder/tests/it/main.rs` (`mod auth`), deleted
+  `crates/rpc/rpc-builder/tests/it/auth.rs`, `crates/rpc/rpc-builder/Cargo.toml`
+  (dev-dependency).
+  *Why*: these tests build reth's engine API around `reth-node-ethereum`'s
+  `EthereumEngineValidator`, which needs `reth-ethereum-payload-builder`, so keeping them would
+  keep the whole node-builder subgraph in the nested workspace. TN does not serve the engine
+  API. rpc-builder's http, ws, startup, middleware and serde tests stay. *Upstream*: n/a.
