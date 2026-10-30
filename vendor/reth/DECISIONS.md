@@ -137,3 +137,14 @@ Feature unification hides missing feature declarations. `reth-rpc` serialized
 the devp2p crates enabled it (TN-0007). When a removal breaks a crate this way, fix the
 manifest of the crate that uses the feature, at the use site, not of whichever crate happened to
 enable it. Such fixes are worth offering upstream.
+
+## D14. No RocksDB anywhere
+
+Decided by the maintainer, 2026-10-30: RocksDB must be gone from the vendored reth and from TN.
+That means no off-by-default feature, no dev-dependency and no code path. librocksdb-sys is a
+very expensive native build, and the team is removing every need for it. Step A (TN-0014)
+removed the backend, the features and the crate, with the expanded source of the touched crates
+proven unchanged. Step B, removing the zero-size stub and the storage-v2 plumbing typed against
+it, changes compiled code and is planned in ROADMAP.md. `etc/rocksdb-gate.sh` now fails if
+`Cargo.lock` or any manifest (comments aside) mentions rocksdb, so an upstream sync cannot
+quietly bring it back.

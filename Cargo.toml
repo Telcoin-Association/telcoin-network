@@ -123,14 +123,12 @@ rpassword = "7.4.0"
 # graph. tn-reth's manifest enables the umbrella's default features (jemalloc, otlp, otlp-logs,
 # js-tracer, keccak-cache-global, asm-keccak, min-debug-logs) on the crates they forward to.
 #
-# `rocksdb` stays off: librocksdb-sys (the entire RocksDB C++ engine, 332 translation units,
-# the single largest native compile in the tree) enters the graph only through reth's
-# `rocksdb` features, and our storage is MDBX-only (`RocksDBProvider` resolves to reth's
-# zero-size stub with the feature off). Re-enable explicitly via the off-by-default `rocksdb`
-# feature on tn-reth / tn-node / telcoin-network-cli / telcoin-network.
-# The off-by-default `tndb-b` feature on the same four crates swaps TN's reth database from
-# MDBX to the tndb-b engine (`tndb-b-reth`); MDBX stays compiled either way.
-# NOTE: reth's `edge` features imply `rocksdb`; do not enable them while this gate is off.
+# RocksDB is not part of TN in any configuration: the vendored reth has its RocksDB backend,
+# `rocksdb`/`edge` features and the `rocksdb` crate removed (vendor/reth CHANGES.md TN-0014),
+# and etc/rocksdb-gate.sh fails if a rocksdb package ever enters Cargo.lock again.
+# The off-by-default `tndb-b` feature on tn-reth / tn-node / telcoin-network-cli /
+# telcoin-network swaps TN's reth database from MDBX to the tndb-b engine (`tndb-b-reth`);
+# MDBX stays compiled either way.
 reth-primitives-traits = { path = "vendor/reth/crates/primitives-traits" }
 reth-chainspec = { path = "vendor/reth/crates/chainspec" }
 reth-chain-state = { path = "vendor/reth/crates/chain-state" }

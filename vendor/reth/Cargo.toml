@@ -511,8 +511,6 @@ c-kzg = "2.1.5"
 # config
 toml = "0.9"
 
-# rocksdb
-rocksdb = { version = "0.24" }
 
 # otlp obs
 opentelemetry_sdk = "0.31"

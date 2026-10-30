@@ -119,6 +119,32 @@ Steps, once tndb-b is the default backend:
 4. Keep the `reth_db_*` metric names, or change them together with the e2e tests and
    `tn-metrics` that assert on them.
 
+## RocksDB step B: remove the stub and the storage-v2 plumbing [next]
+
+Step A (TN-0014) removed RocksDB itself. What remains compiles in every build but never does
+RocksDB work:
+
+- `providers/rocksdb_stub.rs`: the zero-size `RocksDBProvider`, `RocksDBBatch`, `RocksTx`,
+  `RocksDBBuilder`, iterators and stats types.
+- `ProviderFactory` holds a `rocksdb_provider` field, and its constructors take one (TN passes
+  `RocksDBProvider::new(datadir)`, `tn-reth/src/env/mod.rs`). `RocksDBProviderFactory`
+  (`traits/rocksdb_provider.rs`) exposes it.
+- `EitherWriter`/`EitherReader` (`either_writer.rs`) still have the `RocksBatchArg`/`RocksTxRefArg`
+  parameters, typed `()`, and `storage_v2` routing in `StorageSettings` (reth-db-api
+  `models/metadata.rs`).
+- `check_consistency()` returns a RocksDB unwind target (always `None`), which TN logs in
+  `env/mod.rs`. `DatadirArgs::rocksdb_path` and `ChainPath`'s RocksDB directory live in
+  reth-node-core (`args/datadir_args.rs`, `dirs.rs`), and TN sets `rocksdb_path: None` in
+  `dirs.rs`, `genesis.rs` and `snapshot.rs`.
+
+Plan: drop the stub types and the field and parameters from the provider factory; collapse
+`EitherWriter`/`EitherReader` to their database and static-file arms; remove `storage_v2`'s RocksDB
+routing and `rocksdb_path`; adjust `check_consistency`'s return type and TN's call sites. This
+changes compiled storage code (state and history writes), so it needs the full test suite and the
+e2e restart/epoch suites. Coordinate with the tndb-b work: `EitherWriter` is where reth abstracts
+storage backends. Verify by running `etc/rocksdb-gate.sh` and grepping for `[Rr]ocks` (only
+CHANGES.md and DECISIONS.md should remain).
+
 ## Phase 4: alloy and revm directly [later]
 
 - `reth-revm` is mostly revm re-exports. Import `revm::` directly and keep only `State`,

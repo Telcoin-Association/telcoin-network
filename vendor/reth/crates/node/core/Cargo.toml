@@ -79,12 +79,6 @@ min-info-logs = ["tracing/release_max_level_info"]
 min-debug-logs = ["tracing/release_max_level_debug"]
 min-trace-logs = ["tracing/release_max_level_trace"]
 
-# Route supported tables to RocksDB instead of MDBX
-rocksdb = ["reth-storage-api/rocksdb"]
-
-# Marker feature for edge/unstable builds - enables rocksdb and sets v2 defaults
-edge = ["rocksdb"]
-
 [build-dependencies]
 vergen = { workspace = true, features = ["build", "cargo", "emit_and_set"] }
 vergen-git2.workspace = true
