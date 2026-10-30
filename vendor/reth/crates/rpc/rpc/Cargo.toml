@@ -23,7 +23,9 @@ reth-errors.workspace = true
 reth-metrics.workspace = true
 reth-storage-api.workspace = true
 reth-execution-types.workspace = true
-reth-chain-state.workspace = true
+# TN(TN-0007): `serde` is needed by `reth_subscribeChainStateChanges` (src/reth.rs); upstream gets it
+# only through feature unification with reth-network.
+reth-chain-state = { workspace = true, features = ["serde"] }
 reth-transaction-pool.workspace = true
 reth-network-api.workspace = true
 reth-rpc-engine-api.workspace = true

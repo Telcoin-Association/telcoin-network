@@ -83,3 +83,11 @@ newest last.
   `reth-primitives-traits` and `reth-payload-primitives`) and for conveniences over
   `FullNodeComponents`. Without it, `reth-node-api` and `reth-basic-payload-builder` leave the
   graph. *Upstream*: no.
+
+- **TN-0007** — Declare the `reth-chain-state` `serde` feature `reth-rpc` relies on. *Kind*: fix.
+  *Files*: `crates/rpc/rpc/Cargo.toml`.
+  *Why*: `reth_subscribeChainStateChanges` (`crates/rpc/rpc/src/reth.rs`) serializes
+  `CanonStateNotification`, which needs `reth-chain-state/serde`. Upstream never declares it and
+  gets it only because `reth-node-core` enables `reth-network/serde`, which reaches chain-state
+  through feature unification. TN-0008 removes that path, so `reth-rpc` stops compiling.
+  *Upstream*: yes, a real (latent) manifest bug.
