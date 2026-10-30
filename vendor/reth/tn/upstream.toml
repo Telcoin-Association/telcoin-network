@@ -1,0 +1,6 @@
+# Upstream pin for vendor/reth. Written by tn/vendor.py (`sync` moves it); do not hand-edit.
+# `commit` is the merge base for every 3-way sync, so it must name exactly the upstream tree
+# the vendored copy was taken from (or last synced to).
+repo = "https://github.com/paradigmxyz/reth"
+tag = "v1.11.3"
+commit = "d6324d63e27ef6b7c49cdc9b1977c1b808234c7b"
