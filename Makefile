@@ -430,7 +430,7 @@ coverage-html:
 
 # format using the nightly toolchain pinned in rust-nightly
 fmt:
-	cargo +$(NIGHTLY) fmt ;
+	cargo +$(NIGHTLY) fmt --all ;
 
 # clippy formatter + try to fix problems (nightly toolchain pinned in rust-nightly)
 clippy:
