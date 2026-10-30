@@ -400,6 +400,14 @@ pub fn validate_pack_file(
     validate_pack_file_bounded(path, epoch, previous, None)
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Test-only: the next [`validate_pack_file_bounded`] on this thread fails as descriptor
+    /// exhaustion opening its data log does (an environmental open error).
+    pub(crate) static ENVIRONMENTAL_NEXT_VALIDATE_OPEN: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
 /// Like [`validate_pack_file`], but clamps the logical read to `read_bound` bytes when it is
 /// `Some`.
 ///
@@ -414,6 +422,13 @@ pub fn validate_pack_file_bounded(
     previous: Option<&EpochRecord>,
     read_bound: Option<u64>,
 ) -> Result<PackValidationReport, PackError> {
+    #[cfg(test)]
+    if ENVIRONMENTAL_NEXT_VALIDATE_OPEN.with(|fail| fail.replace(false)) {
+        use crate::archive::error::{load_header::LoadHeaderError, open::OpenError};
+        return Err(PackError::Open(std::sync::Arc::new(OpenError::DataFileOpen(
+            LoadHeaderError::IO(std::io::Error::from_raw_os_error(libc::EMFILE)),
+        ))));
+    }
     // Read-only open of just the data file — `Pack::open` loads/cross-checks the header (the wrong
     // epoch fails here with an open error) and needs no sidecar index files.
     let mut pack =

@@ -475,7 +475,8 @@ pub struct ConsensusChain {
     recent_headers: Arc<Mutex<VecDeque<RecentHeader>>>,
     /// The epoch whose in-place install replaced the live epoch's files but whose swap of
     /// `current_pack` failed (its `open_static`): `current_pack` still holds the replaced files
-    /// until the next [`Self::stream_import`] swaps them, first thing, under `pack_install`.
+    /// until the next [`Self::stream_import`] swaps them, first thing, under `pack_install`. A
+    /// swap that fails again fails only an import of this epoch (another epoch's import goes on).
     /// Stream serving refuses the replaced handle meanwhile (its data log is not the one at the
     /// path).
     pending_swap: Arc<Mutex<Option<Epoch>>>,
@@ -889,8 +890,19 @@ impl ConsensusChain {
         let epoch = epoch_record.epoch;
         let epoch_final_hash = epoch_record.final_consensus.hash;
         // Before the idempotency check below, which would find the installed epoch and return
-        // without ever swapping the live handle.
-        self.complete_pending_swap().await?;
+        // without ever swapping the live handle. Only the pending epoch's import needs the swap:
+        // another epoch's install never touches `current_pack`, so it goes on, and the swap is
+        // tried again by the next import.
+        if let Err(e) = self.complete_pending_swap().await {
+            if *self.pending_swap.lock() == Some(epoch) {
+                return Err(e);
+            }
+            warn!(
+                target: "consensus::store",
+                epoch,
+                "{e}; importing epoch {epoch} with the swap still pending"
+            );
+        }
         if let Ok(pack) = self.get_static(epoch).await {
             // Idempotency / anti-truncation guard: if we already contain the requested final
             // consensus header, there is nothing to import. Checking *by number* (rather than only
@@ -1019,7 +1031,7 @@ impl ConsensusChain {
         install_result?;
         if replace_current {
             // Do this directly, using get_static() will short circuit on the old pack. A failed
-            // swap is left pending, for the next import of any epoch to finish.
+            // swap is left pending, for the next import to finish (`complete_pending_swap`).
             if let Err(e) = self.swap_in_installed(epoch).await {
                 *self.pending_swap.lock() = Some(epoch);
                 return Err(Self::swap_failed(epoch, e).into());
@@ -1057,7 +1069,11 @@ impl ConsensusChain {
 
     /// Finish a swap of `current_pack` that an install of the live epoch left pending (see
     /// `pending_swap`), under `pack_install`. Once another epoch is current the handoff has closed
-    /// the replaced handle, and nothing is left to do. A swap that fails again stays pending.
+    /// the replaced handle, and nothing is left to do. A swap that fails again stays pending: for
+    /// a reason the environment caused (descriptor or memory exhaustion) the error comes back as
+    /// it came, to clear on its own; any other failure to open files that passed their seal check
+    /// when they were installed is damage on this node's disk, logged at `error!` naming
+    /// `db repair` and returned as [`PackError::CorruptPack`], which no caller charges to a peer.
     async fn complete_pending_swap(&self) -> Result<(), ConsensusChainError> {
         if self.pending_swap.lock().is_none() {
             return Ok(());
@@ -1065,7 +1081,21 @@ impl ConsensusChain {
         let _install = self.pack_install.lock().await;
         let Some(epoch) = *self.pending_swap.lock() else { return Ok(()) };
         if self.current_pack.lock().epoch() == epoch {
-            self.swap_in_installed(epoch).await.map_err(|e| Self::swap_failed(epoch, e))?;
+            self.swap_in_installed(epoch).await.map_err(|e| {
+                if e.is_environmental() {
+                    return e;
+                }
+                error!(
+                    target: "consensus::store",
+                    epoch,
+                    "the installed epoch {epoch} pack failed to open again ({e}); run \
+                     `telcoin-network db repair --epoch {epoch}`"
+                );
+                PackError::CorruptPack(format!(
+                    "epoch {epoch}: the installed pack failed to open as the live pack twice \
+                     ({e}); run `telcoin-network db repair --epoch {epoch}`"
+                ))
+            })?;
             self.install_generation.fetch_add(1, Ordering::Release);
         }
         *self.pending_swap.lock() = None;
@@ -5464,6 +5494,117 @@ mod test {
         let (_, len) = live.get_epoch_stream(0).await.expect("the installed epoch streams");
         assert_eq!(len, live.current_pack().data_file_len().await.expect("len"));
         live.get_partial_epoch_stream(0, 1).await.expect("a prefix streams");
+        source.close().await;
+        live.close().await;
+    }
+
+    /// A pending swap (see `test_failed_live_swap_completes_on_the_next_import`) that fails again
+    /// fails only an import of the pending epoch, as `CorruptPack` naming `db repair`, and stays
+    /// pending; an import of another epoch goes on meanwhile, and a later import of the pending
+    /// epoch finishes the swap once the open succeeds.
+    #[tokio::test]
+    async fn test_pending_swap_fails_only_the_pending_epochs_import() {
+        use tokio::io::AsyncReadExt as _;
+
+        // The source holds sealed epoch 0 and a complete live epoch 1.
+        let source_dir = TempDir::with_prefix("test_pending_swap_other_source").expect("temp dir");
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let committee = fixture.committee();
+        let committee1 = committee.advance_epoch_for_test(1);
+        let (source, record0, mut parent) =
+            chain_with_epoch0_outputs(&source_dir, &committee, &chain).await;
+        source.persist_current().await.expect("persist source");
+        source.epochs().save_record(record0.clone()).await.expect("save epoch 0 record");
+        source.new_epoch(record0.clone(), committee1.clone()).await.expect("source handoff");
+        for n in 4..=6u64 {
+            let output = make_test_output(&committee1, (n as usize) % 4, chain.clone(), n, parent);
+            parent = output.digest();
+            source.save_consensus_output(output).await.expect("save source output");
+        }
+        source.persist_current().await.expect("persist source");
+        let record1 = EpochRecord {
+            epoch: 1,
+            committee: committee1.bls_keys().iter().copied().collect(),
+            next_committee: committee1.bls_keys().iter().copied().collect(),
+            parent_hash: record0.digest(),
+            final_consensus: ConsensusNumHash { number: 6, hash: parent },
+            ..Default::default()
+        };
+        source.epochs().save_record(record1.clone()).await.expect("save epoch 1 record");
+        let epoch0_previous = EpochRecord {
+            epoch: 0,
+            committee: committee.bls_keys().iter().copied().collect(),
+            next_committee: committee.bls_keys().iter().copied().collect(),
+            ..Default::default()
+        };
+        let import = |target: &ConsensusChain, epoch: Epoch| {
+            let (record, previous) = if epoch == 0 {
+                (record0.clone(), epoch0_previous.clone())
+            } else {
+                (record1.clone(), record0.clone())
+            };
+            let (source, target) = (&source, target.clone());
+            async move {
+                let (stream, len) =
+                    source.get_epoch_stream(epoch).await.expect("source epoch stream");
+                target
+                    .stream_import(stream.take(len), &record, &previous, Duration::from_secs(5))
+                    .await
+            }
+        };
+
+        // The live target is at epoch 1 with its first two outputs and its stored record; its
+        // epoch 0 is the meta-only pack `ConsensusChain::new` opened, which lacks the final.
+        let live_dir = TempDir::with_prefix("test_pending_swap_other_live").expect("temp dir");
+        let live = ConsensusChain::new(live_dir.path().to_owned(), committee.clone()).unwrap();
+        live.new_epoch(record0.clone(), committee1.clone()).await.unwrap();
+        for n in 4..=5u64 {
+            let output = source.get_consensus_output_current(n).await.expect("source output");
+            live.save_consensus_output(output).await.unwrap();
+        }
+        live.persist_current().await.expect("persist the live pack");
+        live.epochs().save_record(record0.clone()).await.expect("save epoch 0 record");
+        live.epochs().save_record(record1.clone()).await.expect("save epoch 1 record");
+
+        super::FAIL_NEXT_SWAP_OPEN.with(|fail| fail.set(true));
+        let err = import(&live, 1).await.expect_err("a failed swap fails the import");
+        assert!(
+            matches!(
+                &err,
+                ConsensusChainError::PackError(crate::consensus_pack::PackError::ReadError(_))
+            ),
+            "the first failure is this node's own error, got {err:?}"
+        );
+        assert_eq!(*live.pending_swap.lock(), Some(1), "the swap is pending");
+
+        // The retry fails again: the pending epoch's import fails as local damage, and the swap
+        // stays pending.
+        super::FAIL_NEXT_SWAP_OPEN.with(|fail| fail.set(true));
+        let err = import(&live, 1).await.expect_err("a second failed swap fails the import");
+        assert!(!super::FAIL_NEXT_SWAP_OPEN.with(|fail| fail.get()), "the hook fired");
+        assert!(
+            matches!(&err, ConsensusChainError::PackError(crate::consensus_pack::PackError::CorruptPack(msg))
+                if msg.contains("db repair --epoch 1")),
+            "a second failure is damage naming db repair, got {err:?}"
+        );
+        assert_eq!(*live.pending_swap.lock(), Some(1), "the swap is still pending");
+        assert!(!live.current_pack().is_static(), "the replaced handle is still current");
+
+        // Another epoch's import goes on although the swap fails again.
+        super::FAIL_NEXT_SWAP_OPEN.with(|fail| fail.set(true));
+        import(&live, 0).await.expect("another epoch imports while the swap is pending");
+        assert!(!super::FAIL_NEXT_SWAP_OPEN.with(|fail| fail.get()), "the swap was retried");
+        assert_eq!(*live.pending_swap.lock(), Some(1), "the swap is still pending");
+        let (_, len) = live.get_epoch_stream(0).await.expect("the imported epoch 0 streams");
+        assert!(len > 0, "epoch 0 has bytes");
+
+        // Once the open succeeds, the pending epoch's import finishes the swap.
+        import(&live, 1).await.expect("the next import of the pending epoch finishes the swap");
+        assert!(live.current_pack().is_static(), "the installed epoch is now current");
+        assert!(live.pending_swap.lock().is_none(), "nothing is pending");
+        let header = live.current_pack().consensus_header_by_number(6).await.expect("final");
+        assert_eq!(header.digest(), record1.final_consensus.hash, "the installed epoch's final");
         source.close().await;
         live.close().await;
     }

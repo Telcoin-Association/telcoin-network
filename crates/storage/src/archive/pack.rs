@@ -117,8 +117,11 @@ where
         self.inner.record_bytes(pos)
     }
 
-    /// The lock-free reader view of the data file's mapping (see [`MapView`]). The owner publishes
-    /// how much of the log readers may see ([`MapView::publish_len`]).
+    /// The lock-free reader view of the data file's mapping (see [`MapView`]). An owner may
+    /// publish how much of the log readers may see ([`MapView::publish_len`]; the B+tree index
+    /// does); tndb does not, and bounds each read by its snapshot's own limit instead
+    /// (`MapView::tail_within`), so its rollback's rewind is guarded by that limit, not by the
+    /// view.
     pub(crate) fn view(&self) -> std::sync::Arc<MapView> {
         self.inner.data_file.view()
     }

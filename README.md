@@ -9,12 +9,22 @@ Requires Rust 1.94
 
 The Telcoin Network protocol client supports Linux and MacOS operating systems. For Windows users, use WSL to run a Linux environment in which the client compiles and runs properly.
 
+## Install
+
+Releases are signed git tags with a Linux x86_64 tarball and a `linux/amd64` container image published as `ghcr.io/telcoin-association/telcoin-network:<tag>`. Tags ending in `-adiri` are built with the `adiri` feature for the adiri testnet. Each release lists the tarball and the image digest in `SHA256SUMS`, and `SHA256SUMS.asc` carries a detached signature over that file from a maintainer's OpenPGP key held on a YubiKey. Follow [Installing a release](https://docs.telcoin.network/getting-started/installing-a-release.html) to download a release and check its signature and checksums before you run it. The check takes the maintainer keys from `.github/maintainer-gpg-keys/` on `main`, never from the release's tag, and has you compare their fingerprints with the table in `SECURITY.md` and with the maintainers' keys on GitHub.
+
+On macOS or any other platform, build from source as shown in the Quick Start below.
+
+Maintainers cutting a release follow [Releasing](https://docs.telcoin.network/maintainers/releasing.html).
+
 ## Quick Start
 
 Check out the repo and update the submodules:
 `make init-submodules` or `git submodule update --init --recursive`
 
 ### Run an observer against testnet
+
+On Linux x86_64 you can skip this build and run a signed release instead; [Installing a release](https://docs.telcoin.network/getting-started/installing-a-release.html) shows how to download and verify one.
 
 Build a release version of the node software with the `adiri` feature (required to join the
 adiri testnet — the node refuses the `--chain adiri` flag at startup without it):
@@ -182,9 +192,9 @@ See [docs/src/gas-penalty.md](docs/src/gas-penalty.md) for the formula, examples
 Developer documentation lives in [`docs/`](docs/) and is built into a static site with [mdBook](https://rust-lang.github.io/mdBook/) 0.5.4.
 Markdown sources are in `docs/src/`, with `docs/src/SUMMARY.md` defining the sidebar.
 `docs/book.toml` is the book configuration and `docs/theme/` holds the site theme.
-CI publishes the book to GitHub Pages whenever a merge into `main` touches `docs/` or the docs workflow (`.github/workflows/docs.yaml`), and on every `v*` tag push.
-The site is versioned: `main` is served at the site root as **latest** (the default), and every `v*` tag that contains `docs/book.toml` is served under `/<tag>/`; readers switch versions with the picker in the book header.
-Intended site behaviors (version switching, sidebar, header, cursor) are pinned in [`docs/ux.md`](docs/ux.md) — update it in the same PR when a theme change intentionally alters one.
+CI publishes the book to GitHub Pages whenever a merge into `main` touches `docs/`, the docs workflow (`.github/workflows/docs.yaml`) or `CHANGELOG.md`, which the [Release notes](https://docs.telcoin.network/getting-started/release-notes.html) page includes.
+The site publishes only `main`; there are no per-release copies.
+Intended site behaviors (sidebar, header, cursor) are pinned in [`docs/ux.md`](docs/ux.md) — update it in the same PR when a theme change intentionally alters one.
 
 To preview locally, install mdBook with `cargo install mdbook --version 0.5.4 --locked`, then:
 

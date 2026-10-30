@@ -892,13 +892,22 @@ impl ConsensusPack {
                      remove `epoch-{epoch}/` -- it is recreated on the next epoch transition."
                 )));
             }
+            // A failure the environment caused (descriptor or memory exhaustion) is no verdict:
+            // it must not turn a healthy pack into a repair plan.
+            Err(e) if e.is_environmental() => return Err(e),
             Err(_) => false,
         };
-        // A read the disk failed is no verdict: it must not turn a healthy pack into a repair
-        // plan. Any other validation failure is judged by the classifier below.
+        // A read the disk failed, an OS failure, or a failure the environment caused is no
+        // verdict either (the same test as the recoverability check and the apply below). Any
+        // other validation failure is judged by the classifier below.
         let validation = match crate::pack_validate::validate_pack_file(&data_file, epoch, None) {
             Ok(report) => Some(report),
-            Err(e @ PackError::ReadError(_)) => return Err(e),
+            Err(e)
+                if matches!(e, PackError::ReadError(_) | PackError::IO(_))
+                    || e.is_environmental() =>
+            {
+                return Err(e)
+            }
             Err(_) => None,
         };
         let validates_clean = matches!(
@@ -1038,10 +1047,12 @@ impl ConsensusPack {
 
         // Apply: the writable open runs recover_pack (truncate torn tail) + open_indexes_for_append
         // (rebuild indexes); persist + drop re-seals. If recover_pack finds mid-log corruption the
-        // best-effort classifier missed, this surfaces as an error -> Unrepairable. A read error or
+        // best-effort classifier missed, this surfaces as an error -> Unrepairable. A read error,
         // an environmental failure (descriptor or memory exhaustion, a full disk while rebuilding)
-        // comes back as the error it is: recovery cut nothing, and only derived indexes may be
-        // gone, so a rerun once the cause is fixed completes the repair.
+        // or a staged rebuild or migration that did not sync or seal (`recover_pack` seals the
+        // indexes it rebuilt before it cuts the log) comes back as the error it is: recovery cut
+        // nothing, and only derived indexes may be gone, so a rerun once the cause is fixed
+        // completes the repair.
         match Self::open_append_exists(epochs_dir, epoch) {
             Ok(pack) => {
                 // Async-close (sole handle) so the seal does not block a worker on either the
@@ -1052,10 +1063,14 @@ impl ConsensusPack {
                 }
                 pack.close().await;
             }
-            // No verdict on the pack (recovery cut nothing), see above.
+            // No verdict on the pack (recovery cut nothing), see above. A `PersistError` from
+            // this open is a staged index or migration that did not sync or seal, before
+            // anything was cut.
             Err(e)
-                if matches!(e, PackError::ReadError(_) | PackError::IO(_))
-                    || e.is_environmental() =>
+                if matches!(
+                    e,
+                    PackError::ReadError(_) | PackError::IO(_) | PackError::PersistError(_)
+                ) || e.is_environmental() =>
             {
                 return Err(e)
             }
@@ -2015,6 +2030,9 @@ thread_local! {
     /// exhaustion does (an environmental index-open error).
     static ENVIRONMENTAL_NEXT_INDEX_OPEN: std::cell::Cell<bool> =
         const { std::cell::Cell::new(false) };
+    /// Test-only: the next `Inner::rebuild_recovered_indexes` on this thread seals its rebuilt
+    /// position index with a failed final fsync (see `SealFault::Sync`).
+    static FAIL_NEXT_RECOVERY_SEAL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// Test-only: `Some((skip, errno))` makes the read-only data-log open of a read-side heal, a
     /// migration or `Inner::check_recoverable` (`open_data_read_only`) on this thread fail with OS
     /// error `errno`, as the disk or the descriptor table fails it, after `skip` such opens
@@ -3711,6 +3729,12 @@ impl Inner {
     ) -> Result<(), PackError> {
         let (consensus_pos_idx, consensus_digests, batch_digests) =
             Self::replay_into(data, base_dir, side, consistent_end)?;
+        #[cfg(test)]
+        let mut consensus_pos_idx = consensus_pos_idx;
+        #[cfg(test)]
+        if FAIL_NEXT_RECOVERY_SEAL.with(|fail| fail.replace(false)) {
+            consensus_pos_idx.fail_next_seal_sync_for_test();
+        }
         Self::seal_indexes(consensus_pos_idx, consensus_digests, batch_digests)?;
         Self::fsync_index_dirs(side)
     }
@@ -11762,6 +11786,74 @@ pub(crate) mod test {
             .await
             .expect("a rerun once the cause is gone");
         assert!(matches!(applied, EpochRepair::Repaired(_)), "got {applied:?}");
+        assert_pack_reads_back(&temp_dir, 4).await;
+    }
+
+    /// A recovery whose rebuilt indexes did not seal (a failed final fsync in `recover_pack`'s
+    /// pass 2, before anything is cut) is no verdict on the pack: `repair_epoch`'s apply returns
+    /// the `PersistError` as an error to retry, never `Unrepairable` with re-sync advice. The data
+    /// log is unchanged, and a rerun repairs the epoch.
+    #[tokio::test]
+    async fn test_repair_epoch_reports_an_unsealed_recovery_as_an_error() {
+        use super::{PackError, FAIL_NEXT_RECOVERY_SEAL};
+        let temp_dir = TempDir::with_prefix("test_repair_unsealed_recovery").expect("temp dir");
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let committee = fixture.committee();
+        let previous_epoch = test_previous_epoch(&committee);
+        build_test_pack(&temp_dir, &committee, &chain, &previous_epoch, 4).await;
+        break_index_file(&temp_dir.path().join("epoch-0").join("idx").join("index_pos.pdx"));
+        let data_path = temp_dir.path().join("epoch-0").join(Inner::DATA_NAME);
+        let before = std::fs::read(&data_path).expect("read data");
+
+        FAIL_NEXT_RECOVERY_SEAL.with(|fail| fail.set(true));
+        let err = ConsensusPack::repair_epoch(temp_dir.path(), 0, true)
+            .await
+            .expect_err("an unsealed recovery is an error, not a verdict");
+        assert!(!FAIL_NEXT_RECOVERY_SEAL.with(|fail| fail.get()), "the hook fired");
+        assert!(matches!(err, PackError::PersistError(_)), "got {err:?}");
+        assert_eq!(std::fs::read(&data_path).expect("read data"), before, "nothing was cut");
+
+        let applied = ConsensusPack::repair_epoch(temp_dir.path(), 0, true)
+            .await
+            .expect("a rerun once the cause is gone");
+        assert!(matches!(applied, EpochRepair::Repaired(_)), "got {applied:?}");
+        assert_pack_reads_back(&temp_dir, 4).await;
+    }
+
+    /// A validation whose data-log open fails for an environmental reason (descriptor exhaustion)
+    /// is no verdict on the pack: `repair_epoch` returns the error to retry, dry run and apply
+    /// alike, rather than reporting a healthy pack as `WouldRepair` (and, on the apply, wiping and
+    /// rebuilding its indexes for nothing). Nothing changes, and a rerun reports it healthy.
+    #[tokio::test]
+    async fn test_repair_epoch_reports_an_environmental_validate_failure_as_an_error() {
+        use crate::pack_validate::ENVIRONMENTAL_NEXT_VALIDATE_OPEN;
+        let temp_dir = TempDir::with_prefix("test_repair_validate_env").expect("temp dir");
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let committee = fixture.committee();
+        let previous_epoch = test_previous_epoch(&committee);
+        build_test_pack(&temp_dir, &committee, &chain, &previous_epoch, 4).await;
+        let epoch_dir = temp_dir.path().join("epoch-0");
+        let index_dirs =
+            [Inner::CONSENSUS_HASH_NAME, Inner::BATCH_HASH_NAME].map(|name| epoch_dir.join(name));
+
+        for apply in [false, true] {
+            ENVIRONMENTAL_NEXT_VALIDATE_OPEN.with(|fail| fail.set(true));
+            let err = ConsensusPack::repair_epoch(temp_dir.path(), 0, apply)
+                .await
+                .expect_err("an environmental failure is an error, not a verdict");
+            assert!(!ENVIRONMENTAL_NEXT_VALIDATE_OPEN.with(|fail| fail.get()), "the hook fired");
+            assert!(err.is_environmental(), "apply={apply}: got {err:?}");
+            for dir in &index_dirs {
+                assert!(dir.is_dir(), "apply={apply}: {} was not touched", dir.display());
+            }
+        }
+
+        let healthy = ConsensusPack::repair_epoch(temp_dir.path(), 0, true)
+            .await
+            .expect("a rerun once the cause is gone");
+        assert!(matches!(healthy, EpochRepair::Healthy), "got {healthy:?}");
         assert_pack_reads_back(&temp_dir, 4).await;
     }
 

@@ -30,8 +30,9 @@ use parking_lot::{Condvar, Mutex};
 use super::store::Core;
 use crate::archive::data_file::fsync_file;
 
-/// The longest a write nobody waits on stays unsynced in `CommitMode::Group` (the data a crash can
-/// lose that no `persist` was told is durable).
+/// The longest a write nobody waits on stays unsynced in `CommitMode::Group` (the data a power
+/// loss can lose that no `persist` was told is durable; a process crash loses nothing, since the
+/// next open syncs an unclean log before it replays it).
 const SYNC_DELAY: Duration = Duration::from_millis(2);
 
 /// Unsynced bytes at which the commit thread syncs without waiting out [`SYNC_DELAY`].
@@ -517,8 +518,14 @@ fn run(core: &Core) {
                     return;
                 }
                 let durable = durability.durable();
-                let frontier = core.frontier.load();
-                if frontier.seq <= durable {
+                // Copy the frontier out: a guard held across the waits below would keep a
+                // compaction's retired generation (its log and indexes, unlinked but mapped)
+                // alive until the next write woke this thread.
+                let (seq, end, synced) = {
+                    let frontier = core.frontier.load();
+                    (frontier.seq, frontier.end, frontier.sync.synced.load(Ordering::Acquire))
+                };
+                if seq <= durable {
                     pending_since = None;
                     if *run == Run::Finish {
                         return;
@@ -535,8 +542,7 @@ fn run(core: &Core) {
                 }
                 let since = *pending_since.get_or_insert_with(Instant::now);
                 let wanted = durability.wanted.load(Ordering::Acquire) > durable;
-                let pending =
-                    frontier.end.saturating_sub(frontier.sync.synced.load(Ordering::Acquire));
+                let pending = end.saturating_sub(synced);
                 let delay = durability.delay();
                 if wanted
                     || pending >= SYNC_BYTES
