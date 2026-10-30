@@ -94,15 +94,30 @@ take its server arguments from a small struct instead of `reth-node-core`.
 
 ## Phase 3: tndb-b as the reth database [next; owned by the tndb-b work]
 
-Vendoring makes it possible to change reth's storage crates directly instead of working around
-them:
+Vendoring lets the tndb-b work change reth's storage crates directly instead of working around
+them. Where MDBX is wired in (2026-10-30, at the 63-crate state):
 
-- Feature-gate MDBX in the vendored `reth-db` (and `reth-provider`), so a tndb-b build stops
-  compiling `reth-mdbx-sys`. MDBX has to stay while it is the default backend and the migration
-  source (`tn-storage` uses `reth-libmdbx` for its own migration path).
-- Decide whether static files (`reth-nippy-jar`, `StaticFileProvider`) stay or move into tndb-b.
-- Keep the `reth_db_*` metric names, or change them together with the e2e tests and `tn-metrics`
-  that assert on them.
+- `reth-db`: `mdbx` is a default feature (`reth-libmdbx`, `page_size`, MDBX metrics).
+- Hard `reth-db/mdbx` enables: `reth-node-core` (its `DatabaseArgs` convert to MDBX's
+  `DatabaseArguments`), `reth-db-common` and `reth-provider`.
+- `reth-provider`: MDBX-only constructors and `impl` blocks for `DB = DatabaseEnv` in
+  `providers/database/mod.rs` and `builder.rs` (`init_db`, `open_db_read_only`,
+  `DatabaseArguments`), plus test utilities on `TempDatabase<DatabaseEnv>`.
+- TN's own MDBX users: `tn-storage` (feature `reth-libmdbx`, default on; the migration source
+  for TN's consensus DB) and `tndb-b-reth`'s differential tests (dev-dependency).
+
+Steps, once tndb-b is the default backend:
+
+1. Gate the MDBX constructors and `impl` blocks in the vendored `reth-provider`,
+   `reth-node-core` and `reth-db-common` behind an `mdbx` feature on each crate that forwards to
+   `reth-db/mdbx`, and make `reth-db`'s default `[]`. TN enables `mdbx` only where it still needs
+   it.
+2. When `tn-storage`'s MDBX migration path is retired, the `tndb-b` build stops compiling
+   `reth-mdbx-sys` (the C library) entirely. `vendor.py remove` `reth-libmdbx`/`reth-mdbx-sys`
+   only once no TN feature uses them.
+3. Decide whether static files (`reth-nippy-jar`, `StaticFileProvider`) stay or move into tndb-b.
+4. Keep the `reth_db_*` metric names, or change them together with the e2e tests and
+   `tn-metrics` that assert on them.
 
 ## Phase 4: alloy and revm directly [later]
 
