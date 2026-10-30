@@ -309,19 +309,24 @@ impl<Ext: clap::Args + fmt::Debug> Cli<Ext> {
     }
 }
 
+/// Serializes every test in this crate that changes the process environment or reads it
+/// without std's environment lock. `cargo test` runs tests on concurrent threads of one
+/// process, so an unserialized `set_var` in one test can `realloc` libc's `environ` array while
+/// another test walks it with `zero_env_values` or `libc::getenv`. Take the guard as the first
+/// statement of the test and hold it to the end.
+#[cfg(test)]
+static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Lock [`ENV_LOCK`]. A test that panicked while holding it does not fail the others.
+#[cfg(test)]
+pub(crate) fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+    ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::cli::Cli;
-    use std::sync::{Mutex, MutexGuard, PoisonError};
-
-    /// Serializes the tests in this module that read or write the process environment, which
-    /// is process-global while `cargo test` runs tests on concurrent threads.
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
-
-    fn env_lock() -> MutexGuard<'static, ()> {
-        ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner)
-    }
 
     fn cli(args: &[&str]) -> Cli {
         Cli::try_parse_args_from(args).expect("cli parses")
@@ -464,8 +469,9 @@ mod tests {
         let prefix = CString::new(format!("{BLS_PASSPHRASE_ENVVAR}=")).expect("prefix");
         for value in [b"sekrit".as_ref(), b"sek\xffrit"] {
             std::env::set_var(BLS_PASSPHRASE_ENVVAR, std::ffi::OsStr::from_bytes(value));
-            // SAFETY: the env lock is held and the variable was set just above, so getenv
-            // returns a live, nul-terminated value, which stays live until the remove below.
+            // SAFETY: every test in this crate that changes the environment holds `env_lock`,
+            // as this one does, and the variable was set just above, so getenv returns a live,
+            // nul-terminated value, which stays live until the remove below.
             let (ptr, len) = unsafe {
                 let ptr = libc::getenv(name.as_ptr());
                 assert!(!ptr.is_null());
@@ -473,8 +479,10 @@ mod tests {
             };
             assert_eq!(len, value.len());
 
-            // SAFETY: the env lock is held and the harness's own threads never touch the
-            // environment, so nothing reads or changes it during the call.
+            // SAFETY: every test in this crate that changes the environment holds `env_lock`,
+            // as this one does, so no `set_var` or `remove_var` reallocates `environ` or
+            // replaces an entry during the call. Tests without the lock only look up other
+            // variables through std, and the call writes nothing but this variable's value.
             unsafe { zero_env_values(environ, &prefix) };
             // SAFETY: the entry is still in the environment, so its value bytes are readable.
             let scrubbed = unsafe { std::slice::from_raw_parts(ptr.cast::<u8>(), len) };
@@ -499,8 +507,9 @@ mod tests {
 
         std::env::set_var(BLS_PASSPHRASE_ENVVAR, "sekrit");
         let name = CString::new(BLS_PASSPHRASE_ENVVAR).expect("name");
-        // SAFETY: the env lock is held and the variable was set just above, so getenv returns
-        // a live, nul-terminated value.
+        // SAFETY: every test in this crate that changes the environment holds `env_lock`, as
+        // this one does, and the variable was set just above, so getenv returns a live,
+        // nul-terminated value.
         let (ptr, len) = unsafe {
             let ptr = libc::getenv(name.as_ptr());
             assert!(!ptr.is_null());

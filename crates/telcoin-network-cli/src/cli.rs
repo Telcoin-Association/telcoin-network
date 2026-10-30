@@ -294,6 +294,9 @@ mod tests {
 
     #[test]
     fn parse_env_filter_directives() {
+        // held to the end: `set_var` below and `run` reading `RUST_LOG` both touch the
+        // process environment
+        let _env = crate::passphrase::env_lock();
         let temp_dir = tempfile::tempdir().unwrap();
 
         // Create a key file or the tested command will fail.
