@@ -3,7 +3,6 @@
 use alloy_eips::eip1559::ETHEREUM_BLOCK_GAS_LIMIT_36M;
 use alloy_primitives::Bytes;
 use reth_chainspec::{Chain, ChainKind, NamedChain};
-use reth_network::{protocol::IntoRlpxSubProtocol, NetworkPrimitives};
 use reth_transaction_pool::PoolConfig;
 use std::{borrow::Cow, time::Duration};
 
@@ -55,33 +54,7 @@ pub trait PayloadBuilderConfig {
     }
 }
 
-/// A trait that represents the configured network and can be used to apply additional configuration
-/// to the network.
-pub trait RethNetworkConfig {
-    /// Adds a new additional protocol to the `RLPx` sub-protocol list.
-    ///
-    /// These additional protocols are negotiated during the `RLPx` handshake.
-    /// If both peers share the same protocol, the corresponding handler will be included alongside
-    /// the `eth` protocol.
-    ///
-    /// See also [`ProtocolHandler`](reth_network::protocol::ProtocolHandler)
-    fn add_rlpx_sub_protocol(&mut self, protocol: impl IntoRlpxSubProtocol);
-
-    /// Returns the secret key used for authenticating sessions.
-    fn secret_key(&self) -> secp256k1::SecretKey;
-
-    // TODO add more network config methods here
-}
-
-impl<N: NetworkPrimitives> RethNetworkConfig for reth_network::NetworkManager<N> {
-    fn add_rlpx_sub_protocol(&mut self, protocol: impl IntoRlpxSubProtocol) {
-        Self::add_rlpx_sub_protocol(self, protocol);
-    }
-
-    fn secret_key(&self) -> secp256k1::SecretKey {
-        Self::secret_key(self)
-    }
-}
+// TN(TN-0008): the `RethNetworkConfig` trait (devp2p `NetworkManager` configuration) is removed.
 
 /// A trait that provides all basic config values for the transaction pool and is implemented by the
 /// [`TxPoolArgs`](crate::args::TxPoolArgs) type.

@@ -1,37 +1,33 @@
 //! Support for customizing the node
+//!
+//! TN(TN-0008): the devp2p parts are removed: the `network` field, `with_network`,
+//! `with_disabled_discovery`, the tip-from-network helpers and `dev_mining_mode`.
 
 use crate::{
     args::{
-        DatabaseArgs, DatadirArgs, DebugArgs, DevArgs, EngineArgs, NetworkArgs, PayloadBuilderArgs,
-        PruningArgs, RpcServerArgs, StaticFilesArgs, StorageArgs, TxPoolArgs,
+        DatabaseArgs, DatadirArgs, DebugArgs, DevArgs, EngineArgs, PayloadBuilderArgs, PruningArgs,
+        RpcServerArgs, StaticFilesArgs, StorageArgs, TxPoolArgs,
     },
     dirs::{ChainPath, DataDirPath},
-    utils::get_single_header,
 };
 use alloy_consensus::BlockHeader;
-use alloy_eips::BlockHashOrNumber;
-use alloy_primitives::{BlockNumber, B256, U256};
+use alloy_primitives::U256;
 use eyre::eyre;
 use reth_chainspec::{ChainSpec, EthChainSpec, MAINNET};
 use reth_config::config::PruneConfig;
-use reth_engine_local::MiningMode;
 use reth_ethereum_forks::{EthereumHardforks, Head};
-use reth_network_p2p::headers::client::HeadersClient;
-use reth_primitives_traits::SealedHeader;
 use reth_stages_types::StageId;
 use reth_storage_api::{
     BlockHashReader, DatabaseProviderFactory, HeaderProvider, StageCheckpointReader,
     StorageSettings,
 };
 use reth_storage_errors::provider::ProviderResult;
-use reth_transaction_pool::TransactionPool;
 use serde::{de::DeserializeOwned, Serialize};
 use std::{
     fs,
     path::{Path, PathBuf},
     sync::Arc,
 };
-use tracing::*;
 
 use crate::args::{EraArgs, MetricArgs};
 pub use reth_engine_primitives::{
@@ -119,9 +115,6 @@ pub struct NodeConfig<ChainSpec> {
     /// - `IPC_PATH`: default + `instance`
     pub instance: Option<u16>,
 
-    /// All networking related arguments
-    pub network: NetworkArgs,
-
     /// All rpc related arguments
     pub rpc: RpcServerArgs,
 
@@ -173,7 +166,6 @@ impl<ChainSpec> NodeConfig<ChainSpec> {
             chain,
             metrics: MetricArgs::default(),
             instance: None,
-            network: NetworkArgs::default(),
             rpc: RpcServerArgs::default(),
             txpool: TxPoolArgs::default(),
             builder: PayloadBuilderArgs::default(),
@@ -190,12 +182,8 @@ impl<ChainSpec> NodeConfig<ChainSpec> {
     }
 
     /// Sets --dev mode for the node.
-    ///
-    /// In addition to setting the `--dev` flag, this also:
-    ///   - disables discovery in [`NetworkArgs`].
     pub const fn dev(mut self) -> Self {
         self.dev.dev = true;
-        self.network.discovery.disable_discovery = true;
         self
     }
 
@@ -249,7 +237,6 @@ impl<ChainSpec> NodeConfig<ChainSpec> {
             config,
             metrics,
             instance,
-            network,
             rpc,
             txpool,
             builder,
@@ -269,7 +256,6 @@ impl<ChainSpec> NodeConfig<ChainSpec> {
             chain: chain.into(),
             metrics,
             instance,
-            network,
             rpc,
             txpool,
             builder,
@@ -299,12 +285,6 @@ impl<ChainSpec> NodeConfig<ChainSpec> {
     /// Returns the instance value, defaulting to 1 if not set.
     pub fn get_instance(&self) -> u16 {
         self.instance.unwrap_or(1)
-    }
-
-    /// Set the network args for the node
-    pub fn with_network(mut self, network: NetworkArgs) -> Self {
-        self.network = network;
-        self
     }
 
     /// Set the rpc args for the node
@@ -376,28 +356,6 @@ impl<ChainSpec> NodeConfig<ChainSpec> {
         }
     }
 
-    /// Returns the max block that the node should run to, looking it up from the network if
-    /// necessary
-    pub async fn max_block<Provider, Client>(
-        &self,
-        network_client: Client,
-        provider: Provider,
-    ) -> eyre::Result<Option<BlockNumber>>
-    where
-        Provider: HeaderProvider,
-        Client: HeadersClient<Header: reth_primitives_traits::BlockHeader>,
-    {
-        let max_block = if let Some(block) = self.debug.max_block {
-            Some(block)
-        } else if let Some(tip) = self.debug.tip {
-            Some(self.lookup_or_fetch_tip(provider, network_client, tip).await?)
-        } else {
-            None
-        };
-
-        Ok(max_block)
-    }
-
     /// Fetches the head block from the database.
     ///
     /// If the database is empty, returns the genesis block.
@@ -428,78 +386,16 @@ impl<ChainSpec> NodeConfig<ChainSpec> {
         })
     }
 
-    /// Attempt to look up the block number for the tip hash in the database.
-    /// If it doesn't exist, download the header and return the block number.
-    ///
-    /// NOTE: The download is attempted with infinite retries.
-    pub async fn lookup_or_fetch_tip<Provider, Client>(
-        &self,
-        provider: Provider,
-        client: Client,
-        tip: B256,
-    ) -> ProviderResult<u64>
-    where
-        Provider: HeaderProvider,
-        Client: HeadersClient<Header: reth_primitives_traits::BlockHeader>,
-    {
-        let header = provider.header_by_hash_or_number(tip.into())?;
-
-        // try to look up the header in the database
-        if let Some(header) = header {
-            info!(target: "reth::cli", ?tip, "Successfully looked up tip block in the database");
-            return Ok(header.number())
-        }
-
-        Ok(self.fetch_tip_from_network(client, tip.into()).await.number())
-    }
-
-    /// Attempt to look up the block with the given number and return the header.
-    ///
-    /// NOTE: The download is attempted with infinite retries.
-    pub async fn fetch_tip_from_network<Client>(
-        &self,
-        client: Client,
-        tip: BlockHashOrNumber,
-    ) -> SealedHeader<Client::Header>
-    where
-        Client: HeadersClient<Header: reth_primitives_traits::BlockHeader>,
-    {
-        info!(target: "reth::cli", ?tip, "Fetching tip block from the network.");
-        let mut fetch_failures = 0;
-        loop {
-            match get_single_header(&client, tip).await {
-                Ok(tip_header) => {
-                    info!(target: "reth::cli", ?tip, "Successfully fetched tip");
-                    return tip_header
-                }
-                Err(error) => {
-                    fetch_failures += 1;
-                    if fetch_failures % 20 == 0 {
-                        error!(target: "reth::cli", ?fetch_failures, %error, "Failed to fetch the tip. Retrying...");
-                    }
-                }
-            }
-        }
-    }
-
     /// Change rpc port numbers based on the instance number, using the inner
     /// [`RpcServerArgs::adjust_instance_ports`] method.
     pub fn adjust_instance_ports(&mut self) {
-        self.network.adjust_instance_ports(self.instance);
         self.rpc.adjust_instance_ports(self.instance);
     }
 
-    /// Sets networking and RPC ports to zero, causing the OS to choose random unused ports when
-    /// sockets are bound.
+    /// Sets RPC ports to zero, causing the OS to choose random unused ports when sockets are
+    /// bound.
     pub fn with_unused_ports(mut self) -> Self {
         self.rpc = self.rpc.with_unused_ports();
-        self.network = self.network.with_unused_ports();
-        self
-    }
-
-    /// Disables all discovery services for the node.
-    pub const fn with_disabled_discovery(mut self) -> Self {
-        self.network.discovery.disable_discovery = true;
         self
     }
 
@@ -559,7 +455,6 @@ impl<ChainSpec> NodeConfig<ChainSpec> {
             config: self.config,
             metrics: self.metrics,
             instance: self.instance,
-            network: self.network,
             rpc: self.rpc,
             txpool: self.txpool,
             builder: self.builder,
@@ -571,18 +466,6 @@ impl<ChainSpec> NodeConfig<ChainSpec> {
             era: self.era,
             static_files: self.static_files,
             storage: self.storage,
-        }
-    }
-
-    /// Returns the [`MiningMode`] intended for --dev mode.
-    pub fn dev_mining_mode<Pool>(&self, pool: Pool) -> MiningMode<Pool>
-    where
-        Pool: TransactionPool + Unpin,
-    {
-        if let Some(interval) = self.dev.block_time {
-            MiningMode::interval(interval)
-        } else {
-            MiningMode::instant(pool, self.dev.block_max_transactions)
         }
     }
 }
@@ -600,7 +483,6 @@ impl<ChainSpec> Clone for NodeConfig<ChainSpec> {
             config: self.config.clone(),
             metrics: self.metrics.clone(),
             instance: self.instance,
-            network: self.network.clone(),
             rpc: self.rpc.clone(),
             txpool: self.txpool.clone(),
             builder: self.builder.clone(),
