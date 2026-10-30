@@ -16,8 +16,10 @@ tracing.workspace = true
 tn-types = { workspace = true }
 eyre = { workspace = true }
 ouroboros = { workspace = true }
-parking_lot = { workspace = true }
+parking_lot = { workspace = true, features = ["arc_lock"] }
+arc-swap = { workspace = true }
 dashmap = { workspace = true }
+foldhash = { workspace = true }
 # Counts layered-DB write failures per storage environment.
 metrics = { workspace = true }
 # For the persist async implemetation. `rt` is needed for `spawn_blocking` (offloading the blocking
@@ -25,7 +27,7 @@ metrics = { workspace = true }
 # feature unification so a lib-only `cargo build -p tn-storage` also resolves it.
 tokio = { workspace = true, features = [ "sync", "fs", "rt" ] }
 crc32fast = "1.5.0"
-cfg-if = { workspace = true }
+cfg-if = { workspace = true, optional = true }
 serde = { workspace = true }
 # Headers are stored RLP-encoded (their canonical form); the BCS record codec cannot
 # round-trip alloy's serde types (skip_serializing_if / quantity attributes).
@@ -37,10 +39,7 @@ memmap2 = { workspace = true }
 # io::Error instead of a SIGBUS on the next memcpy into an unbacked page (see archive/data_file.rs).
 libc = "0.2"
 
-# redb backend
-redb = { version = "3.1.0", optional = false }
-
-# mdbx backend- default
+# MDBX: the migration source, and a test and bench backend (see the `reth-libmdbx` feature)
 reth-libmdbx = { workspace = true, optional = true, features = [
     "return-borrowed",
     "read-tx-timeouts",
@@ -49,6 +48,8 @@ page_size = { version = "0.6.0", optional = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+# A test recorder for the tndb metrics tests (`metrics_util::debugging`).
+metrics-util = { workspace = true }
 tn-reth = { workspace = true }
 tn-test-utils = { workspace = true }
 rand = { workspace = true }
@@ -60,8 +61,9 @@ roaring = { workspace = true }
 tokio = { workspace = true, features = [ "macros", "rt", "time", "test-util", "io-util" ] }
 
 [features]
-redb = []
-reth-libmdbx = ["dep:reth-libmdbx", "dep:page_size"]
+# MDBX: the consensus DB of the release before tndb, read once by the migration to tndb
+# (`migrate_from_mdbx`), and a backend for tests and benches. The node's consensus DB is tndb.
+reth-libmdbx = ["dep:reth-libmdbx", "dep:page_size", "dep:cfg-if"]
 default = ["reth-libmdbx"]
 # Re-exports tn-types' test hooks: `make build-e2e-bin` enables `tn-storage/test-utils` on the
 # node binary, and the `TN_SEED_SIGNATURE_FORK_EPOCH` override the e2e harness pins lives

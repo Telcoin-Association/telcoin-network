@@ -7,7 +7,7 @@ use crate::{
         TestWorkerResponse, TEST_HEARTBEAT_INTERVAL,
     },
     freshness::RecordTimestamp,
-    types::RecordDomain,
+    types::{EpochPosition, RecordDomain},
 };
 use assert_matches::assert_matches;
 use eyre::eyre;
@@ -3519,7 +3519,10 @@ async fn test_kad_record_jobs_never_republish_stored_records() -> eyre::Result<(
     Ok(())
 }
 
-/// An identical signed PUT carries a fresh wire expiry and refreshes the stored copy.
+/// An identical signed PUT carries a fresh wire expiry. The stored copy is rewritten only when
+/// the copy extends its expiry by more than half the configured TTL (or the row has lapsed), so
+/// a relayed copy cannot force one durable write per copy (GHSA-4947-9xvx-pv2m), and the kept
+/// expiry never shrinks.
 #[tokio::test]
 async fn test_identical_kad_record_refreshes_expiry() -> eyre::Result<()> {
     let TestTypes { peer1, peer2, .. } =
@@ -3533,6 +3536,7 @@ async fn test_identical_kad_record_refreshes_expiry() -> eyre::Result<()> {
         .kademlia
         .store_mut()
         .retain_connected(source, record.key.clone())?;
+    let ttl = network.config.kad_record_ttl;
     let instant = std::time::Instant::now();
     record.expires = Some(instant + Duration::from_secs(60));
     network.process_kad_put_request(source, record.clone())?;
@@ -3545,7 +3549,29 @@ async fn test_identical_kad_record_refreshes_expiry() -> eyre::Result<()> {
         .and_then(|stored| stored.expires)
         .ok_or_else(|| eyre!("initial expiry"))?;
 
+    // A copy that extends the expiry by less than half the TTL is a free relay: nothing is written.
     record.expires = Some(instant + Duration::from_secs(120));
+    network.process_kad_put_request(source, record.clone())?;
+    let stored = network
+        .swarm
+        .behaviour_mut()
+        .kademlia
+        .store_mut()
+        .get(&record.key)
+        .ok_or_else(|| eyre!("record after a short extension"))?
+        .into_owned();
+    assert_eq!(stored.value, record.value);
+    assert_eq!(stored.publisher, record.publisher);
+    // The store rebuilds the `Instant` on every read, so compare with a tolerance.
+    let unchanged_expiry = stored.expires.ok_or_else(|| eyre!("expiry after a short extension"))?;
+    assert!(
+        unchanged_expiry.saturating_duration_since(first_expiry) < Duration::from_secs(1)
+            && first_expiry.saturating_duration_since(unchanged_expiry) < Duration::from_secs(1),
+        "a short extension must not rewrite the row"
+    );
+
+    // A copy that extends it by more than half the TTL refreshes the stored copy.
+    record.expires = Some(instant + Duration::from_secs(120) + ttl / 2);
     network.process_kad_put_request(source, record.clone())?;
     let stored = network
         .swarm
@@ -3557,7 +3583,7 @@ async fn test_identical_kad_record_refreshes_expiry() -> eyre::Result<()> {
         .into_owned();
     assert_eq!(stored.value, record.value);
     assert_eq!(stored.publisher, record.publisher);
-    assert!(stored.expires.is_some_and(|expiry| expiry > first_expiry + Duration::from_secs(30)));
+    assert!(stored.expires.is_some_and(|expiry| expiry > first_expiry + ttl / 2));
 
     // A replicated copy with less remaining TTL must not undo the refresh.
     let refreshed_expiry = stored.expires.ok_or_else(|| eyre!("refreshed expiry"))?;
@@ -3665,11 +3691,14 @@ async fn test_kad_self_advertisement_confirms_when_store_is_full() -> eyre::Resu
 
     // Two valid records per relay stay below both the per-source message limit and the
     // tracked-source cap. Fill the real store through the inbound handler without confirming
-    // any of the non-committee identities advertised by these relays.
+    // any of the non-committee identities advertised by these relays. Refill the shared budget
+    // before each record: this test pins store saturation, and the shared budget has its own
+    // tests.
     std::iter::repeat_with(PeerId::random)
         .flat_map(|source| std::iter::repeat_n(source, 2))
         .take(max_records)
         .try_for_each(|source| -> eyre::Result<()> {
+            network.swarm.behaviour_mut().peer_manager.refill_put_record_budget();
             let bls = BlsKeypair::generate(&mut rng);
             let netkey = NetworkKeypair::generate_ed25519();
             let record = NodeRecord::build(
@@ -5407,31 +5436,119 @@ fn accepted_gossip_carries_resolved_author_identity() -> eyre::Result<()> {
 /// relayer, regardless of whether either identity has resolved.
 #[test]
 fn author_attributable_reject_charges_the_author_never_the_relayer() {
-    for relayer_resolved in [true, false] {
+    [true, false].into_iter().for_each(|relayer_resolved| {
         assert_eq!(
-            RejectReason::UnauthorizedAuthor.penalty(relayer_resolved, true),
+            RejectReason::UnauthorizedAuthor.penalty(relayer_resolved, true, EpochPosition::Live),
             RejectPenalty::FatalAuthor
         );
         assert_eq!(
-            RejectReason::UnauthorizedAuthor.penalty(relayer_resolved, false),
+            RejectReason::UnauthorizedAuthor.penalty(relayer_resolved, false, EpochPosition::Live),
             RejectPenalty::Skip
         );
-    }
+    });
+}
+
+/// A replaying node never charges an unauthorized author: its allowlists belong to the
+/// historical epoch it replays, so a resolved author outside them is most likely a live committee
+/// member of a later epoch. The size penalty stays with the relayer; that bound is protocol wide.
+#[test]
+fn historical_epoch_replay_never_charges_the_author() {
+    [true, false].into_iter().for_each(|relayer_resolved| {
+        [true, false].into_iter().for_each(|author_resolved| {
+            assert_eq!(
+                RejectReason::UnauthorizedAuthor.penalty(
+                    relayer_resolved,
+                    author_resolved,
+                    EpochPosition::Historical
+                ),
+                RejectPenalty::Skip
+            );
+        });
+        assert_eq!(
+            RejectReason::TooLarge.penalty(true, relayer_resolved, EpochPosition::Historical),
+            RejectPenalty::FatalRelayer
+        );
+    });
+}
+
+/// Drive the reject arm at `position` with a resolved author that no committee slot exempts, on
+/// a topic whose allowlist excludes it. Returns whether the author ended up banned.
+async fn unauthorized_author_banned_at(position: EpochPosition) -> eyre::Result<bool> {
+    let TestTypes { peer1, peer2, _task_manager } =
+        create_test_types::<TestWorkerRequest, TestWorkerResponse>();
+    let outsider = peer1.config.key_config().primary_public_key();
+    let mut network = peer1.network;
+    let member = peer2.config.key_config().primary_public_key();
+    let source = *peer2.network.swarm.local_peer_id();
+    let record = peer2.network.get_peer_record();
+    // resolve the author's BLS identity through its kad record while it holds a committee slot
+    network.process_command(NetworkCommand::UpdateCommittees {
+        previous: HashSet::new(),
+        current: HashSet::from([member]),
+        next: HashSet::new(),
+    })?;
+    network.process_kad_put_request(source, record)?;
+    // move the window past the author: a live member two epochs ahead holds no slot here
+    network.process_command(NetworkCommand::UpdateCommittees {
+        previous: HashSet::new(),
+        current: HashSet::from([outsider]),
+        next: HashSet::new(),
+    })?;
+    assert_eq!(network.swarm.behaviour().peer_manager.peer_to_bls(&source), Some(member));
+    let (reply, _subscribed) = tokio::sync::oneshot::channel();
+    network.process_command(NetworkCommand::Subscribe {
+        topic: TEST_TOPIC.to_string(),
+        publishers: Some(HashSet::from([outsider])),
+        reply,
+    })?;
+    network.process_command(NetworkCommand::SetEpochPosition { position })?;
+    network.process_gossip_event(GossipEvent::Message {
+        propagation_source: PeerId::random(),
+        message_id: gossipsub::MessageId::from(b"unauthorized-author-gossip".to_vec()),
+        message: GossipMessage { source: Some(source), ..test_gossip_message() },
+    })?;
+    Ok(network.swarm.behaviour().peer_manager.peer_banned(&source))
+}
+
+/// A replaying node rejects the message and leaves the resolved author unbanned.
+#[tokio::test]
+async fn historical_replay_rejects_unauthorized_author_without_a_ban() -> eyre::Result<()> {
+    assert!(
+        !unauthorized_author_banned_at(EpochPosition::Historical).await?,
+        "a replaying node must not ban a resolved author outside the replayed allowlist"
+    );
+    Ok(())
+}
+
+/// The same reject at the live tip still charges the resolved author: the position guard spares
+/// only a replaying node.
+#[tokio::test]
+async fn live_epoch_still_bans_unauthorized_author() -> eyre::Result<()> {
+    assert!(
+        unauthorized_author_banned_at(EpochPosition::Live).await?,
+        "a node at the tip still bans a resolved author outside the allowlist"
+    );
+    Ok(())
 }
 
 /// An oversized payload is the only relayer-attributable reject — the size bound is a compile-time
 /// protocol constant (`MAX_GOSSIP_MESSAGE_SIZE`), identical on every honest node and enforced on
 /// both the publish and receive paths, so an honest peer never originates or forwards one — and it
-/// is charged to the forwarder only once its BLS identity has resolved (the author's resolution is
-/// irrelevant), mirroring the Accept path's unresolved-relayer skip.
+/// is charged to the forwarder only once its BLS identity has resolved (the author's resolution and
+/// the epoch position are irrelevant), mirroring the Accept path's unresolved-relayer skip.
 #[test]
 fn oversized_reject_penalizes_only_a_resolved_relayer() {
     for author_resolved in [true, false] {
-        assert_eq!(
-            RejectReason::TooLarge.penalty(true, author_resolved),
-            RejectPenalty::FatalRelayer
-        );
-        assert_eq!(RejectReason::TooLarge.penalty(false, author_resolved), RejectPenalty::Skip);
+        for position in [EpochPosition::Live, EpochPosition::Historical] {
+            assert_eq!(
+                RejectReason::TooLarge.penalty(true, author_resolved, position),
+                RejectPenalty::FatalRelayer
+            );
+            assert_eq!(
+                RejectReason::TooLarge.penalty(false, author_resolved, position),
+                RejectPenalty::Skip
+            );
+        }
     }
 }
 

@@ -371,8 +371,12 @@ Complete tree after the node has run:
   db/                             # execution layer database (Reth/MDBX)
     static_files/                 #   static block data
   consensus-db/                   # consensus protocol database
-    epoch/                        #   per-epoch consensus data (certs, votes, payloads)
-    epochs/                       #   epoch pack files for archive storage
+    tndb/                         #   consensus DB (tndb): one log per environment
+      epoch/                      #     certificates, votes, payloads, last proposal
+      kad/                        #     peer records
+      cache/                      #     batch cache
+      mdbx-migrated               #     marker: the one-time copy from MDBX is done
+    epochs/                       #   per-epoch consensus packs, epoch records, certificate packs
 ```
 
 ## RPC configuration
@@ -639,6 +643,8 @@ To choose a value, write it as a humantime string, for example `max_header_time_
 The node reads the file once, at startup, so restart it after an edit.
 
 #### Rolling back to an older binary
+
+A node that has started a tndb release (the consensus DB under `consensus-db/tndb`) cannot roll back to an MDBX release such as `v0.15.0-adiri`: the move from MDBX is one-way and one-time, and the older binary would start with no record of this validator's votes and proposals. See [Upgrade and rollback](../../docs/src/getting-started/validator-operations.md#release-and-network-update-process). The rest of this section applies to a node that has not yet started a tndb release.
 
 Binaries from before sub-second timestamps, such as `v0.15.0-adiri`, read this field as a whole number of seconds and reject a string.
 A `network-config` holding a humantime value (every datadir a newer binary created, and any file edited to a value such as `250ms`) fails to parse on an older binary, and that binary does not start.
