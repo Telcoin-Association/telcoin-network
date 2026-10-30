@@ -28,7 +28,7 @@ parking_lot = { workspace = true }
 # them to: jemalloc (reth-cli-util, reth-node-core; not reth-node-metrics, whose jemalloc
 # stats feed only reth's own metrics server, which TN never starts); otlp and otlp-logs
 # (reth-node-core); js-tracer (reth-rpc, reth-rpc-eth-api, reth-rpc-eth-types);
-# keccak-cache-global (reth-node-core); asm-keccak (reth-node-core, reth-primitives);
+# keccak-cache-global (reth-node-core); asm-keccak (reth-node-core, revm);
 # min-debug-logs (reth-node-core, which caps `tracing` at debug in release builds).
 # TN does not use reth's node builder (it wires provider, EVM, pool and RPC itself), so neither
 # reth-node-builder nor reth-node-ethereum is a dependency; see vendor/reth/ROADMAP.md.
@@ -45,7 +45,6 @@ reth-node-core = { workspace = true, features = [
 reth-chainspec = { workspace = true }
 reth-chain-state = { workspace = true, features = ["rayon"] }
 reth-cli-util = { workspace = true, features = ["jemalloc"] }
-reth-primitives = { workspace = true, features = ["asm-keccak"] }
 reth-consensus = { workspace = true }
 reth-evm-ethereum = { workspace = true }
 reth-engine-primitives = { workspace = true }

@@ -85,7 +85,17 @@ pub use libp2p::{multiaddr::Protocol, Multiaddr};
 pub fn batch_allowlisted_tx_type<T: Typed2718>(tx: &T) -> bool {
     tx.is_legacy() || tx.is_eip2930() || tx.is_eip1559()
 }
-pub use reth_primitives::{
-    Account, Block, BlockBody, EthPrimitives, NodePrimitives, PooledTransaction, Receipt,
-    Recovered, RecoveredBlock, SealedBlock, SealedHeader, Transaction, TransactionSigned,
+pub use reth_ethereum_primitives::{
+    EthPrimitives, PooledTransaction, Receipt, Transaction, TransactionSigned,
 };
+pub use reth_primitives_traits::{
+    Account, NodePrimitives, Recovered, RecoveredBlock, SealedHeader,
+};
+
+/// An Ethereum block over TN's transaction type. Same definition as the `Block` alias of
+/// reth-primitives, which TN no longer depends on.
+pub type Block<T = TransactionSigned, H = ExecHeader> = alloy::consensus::Block<T, H>;
+/// A block body over TN's transaction type. Same definition as reth-primitives' `BlockBody`.
+pub type BlockBody<T = TransactionSigned, H = ExecHeader> = alloy::consensus::BlockBody<T, H>;
+/// A sealed block. Same definition as reth-primitives' `SealedBlock`.
+pub type SealedBlock<B = Block> = reth_primitives_traits::SealedBlock<B>;

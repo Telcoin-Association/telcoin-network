@@ -131,7 +131,6 @@ rpassword = "7.4.0"
 # The off-by-default `tndb-b` feature on the same four crates swaps TN's reth database from
 # MDBX to the tndb-b engine (`tndb-b-reth`); MDBX stays compiled either way.
 # NOTE: reth's `edge` features imply `rocksdb`; do not enable them while this gate is off.
-reth-primitives = { path = "vendor/reth/crates/primitives" }
 reth-primitives-traits = { path = "vendor/reth/crates/primitives-traits" }
 reth-chainspec = { path = "vendor/reth/crates/chainspec" }
 reth-chain-state = { path = "vendor/reth/crates/chain-state" }

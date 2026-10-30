@@ -140,8 +140,7 @@ use reth_evm::{
     execute::{BlockAssembler, BlockAssemblerInput},
     FromRecoveredTx, FromTxWithEncoded, OnStateHook, RecoveredTx,
 };
-use reth_primitives::logs_bloom;
-use reth_primitives_traits::proofs::calculate_withdrawals_root;
+use reth_primitives_traits::{logs_bloom, proofs::calculate_withdrawals_root};
 use reth_revm::{
     context::{
         result::{ExecutionResult, ResultAndState},
