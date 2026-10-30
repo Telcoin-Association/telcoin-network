@@ -96,6 +96,16 @@ ExecStart=/usr/local/bin/telcoin-network --bls-passphrase-source credential node
 
 systemd decrypts the credential when the unit starts and places it in the unit's credential directory, which it names in `CREDENTIALS_DIRECTORY`. The node reads the passphrase from there, so it never appears on the command line, in the unit's `Environment=`, or in the process environment. `LoadCredential=bls-passphrase:<path>` works the same way for an unencrypted file. To use another credential name, pass `--bls-passphrase-credential <NAME>` or set `TN_BLS_PASSPHRASE_CREDENTIAL`; an empty value keeps the default, `bls-passphrase`. The name is checked only when the `credential` source reads it.
 
+An existing unit that passes the passphrase through `Environment=TN_BLS_PASSPHRASE=...` or an `EnvironmentFile=` moves to the credential in five steps:
+
+1. Encrypt the passphrase with the `systemd-creds encrypt` command above.
+2. Replace the `Environment=` or `EnvironmentFile=` line with `LoadCredentialEncrypted=bls-passphrase:<path>`, where `<path>` is the file step 1 wrote. If the environment file sets other variables too, keep the `EnvironmentFile=` line, delete only the `TN_BLS_PASSPHRASE` line from that file, and add the `LoadCredentialEncrypted=` line next to it.
+3. Add `--bls-passphrase-source credential` to `ExecStart=` before the `node` subcommand, as in the example above.
+4. Run `systemctl daemon-reload` and restart the unit.
+5. Confirm in the journal (`journalctl -u <unit>`) that the node started. Then check that the node's environment no longer holds the variable: `sudo cat /proc/$(systemctl show -p MainPID --value <unit>)/environ | tr '\0' '\n' | grep '^TN_BLS_PASSPHRASE='` prints nothing.
+
+The key file `node-keys/bls.kw` and the passphrase do not change, so nothing is re-keyed. The previous unit keeps working as the rollback, because `env` remains the default source: restore it, and its environment file if step 2 changed that, then reload and restart.
+
 Encrypted keys use AES-256-GCM-SIV with PBKDF2-HMAC-SHA256 key derivation (1,000,000 iterations). The encrypted file is saved as `node-keys/bls.kw`; unencrypted keys are saved as `node-keys/bls.key`.
 
 The current binary decrypts the BLS key into node process memory and does not provide an HSM or remote signer interface. See [Validator production operations](../../docs/src/getting-started/validator-operations.md#bls-key-custody) for production custody, backup, and isolation guidance.
