@@ -46,7 +46,8 @@ pub const DEFAULT_BLS_PASSPHRASE_CREDENTIAL: &str = "bls-passphrase";
 /// The in-place zeroing writes to the environment block without std's environment
 /// lock, so on Linux it runs only after `/proc/self/task` confirms the process has a
 /// single thread. With other threads present (or `/proc` unreadable) the value is not
-/// zeroed, the variable is still removed, and a warning is logged.
+/// zeroed, the variable is still removed, and a warning is written to stderr. The warning
+/// does not go through `tracing` because this runs before any tracing subscriber exists.
 pub fn get_bls_passphrase_from_env() -> Option<Zeroizing<String>> {
     let value = std::env::var_os(BLS_PASSPHRASE_ENVVAR)?;
     // `value` is now the only copy the node keeps, so wipe the originals
@@ -80,15 +81,15 @@ pub fn get_bls_passphrase_from_env() -> Option<Zeroizing<String>> {
 /// root and to the service user for the life of the process. `execve` does not de-duplicate
 /// names and `getenv` returns only the first match, so this walks every entry.
 ///
-/// Skipped, with a warning, unless the process has a single thread: the write bypasses std's
-/// environment lock and libc's own environment functions.
+/// Skipped unless the process has a single thread: the write bypasses std's environment lock
+/// and libc's own environment functions. The skip is reported on stderr, not through `tracing`:
+/// this runs before any tracing subscriber exists, so a `tracing` event would reach no output.
 #[cfg(target_os = "linux")]
 fn scrub_env_values(name: &str) {
     if !is_single_threaded() {
-        tracing::warn!(
-            target: "cli",
-            "{name} removed from the environment but not zeroed in place: other threads may \
-             exist (read it before starting threads)"
+        eprintln!(
+            "warning: {name} removed from the environment but not zeroed in place: other \
+             threads may exist (read it before starting threads)"
         );
         return;
     }
