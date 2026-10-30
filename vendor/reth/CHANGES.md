@@ -24,3 +24,12 @@ newest last.
   *Why*: `reth-e2e-test-utils` depends on `reth-cli-commands`, so carrying it would pull reth's
   whole CLI into the vendored set only for these integration tests. The crates' unit tests and
   `reth-node-ethereum`'s `tests/it` still run. See DECISIONS.md D5. *Upstream*: n/a.
+
+- **TN-0002** — Reformat two files with TN's pinned nightly rustfmt. *Kind*: build.
+  *Files*: `crates/engine/tree/src/tree/payload_processor/mod.rs` (a `while let ... &&`
+  chain), `crates/ethereum/primitives/src/receipt.rs` (import order).
+  *Why*: CI runs `cargo +nightly fmt --all -- --check`, and `--all` covers path dependencies,
+  so the vendored code is checked with TN's nightly (`rust-nightly`, 2026-03-20) under reth's
+  `rustfmt.toml`. That nightly formats these two spots differently from the one reth used.
+  When TN bumps its nightly, rerun `make fmt` and record any vendored reformatting the same
+  way. *Upstream*: no.
