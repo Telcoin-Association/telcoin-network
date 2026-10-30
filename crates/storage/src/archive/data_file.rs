@@ -1330,7 +1330,8 @@ impl MmapDataFile {
     /// block for zero-copy record reads (no `memcpy`, no allocation).
     ///
     /// Returns `None` if the range falls outside the logical data `[0, len())` (so the transient
-    /// capacity padding past `end` is never exposed) or the file is currently unmapped. The
+    /// capacity padding past `end` is never exposed), the file is currently unmapped, or the
+    /// mapping does not cover the range (a file that shrank under a read-only open). The
     /// returned slice borrows `&self`, so no concurrent write/remap (which needs `&mut self`)
     /// can invalidate it while it is held. A caller that does not know a record's length up
     /// front takes [`Self::tail`] and parses the prefix from it.
@@ -1341,16 +1342,16 @@ impl MmapDataFile {
         }
         let start = offset as usize;
         match &self.backing {
-            Backing::Rw(map) => Some(&map[start..start + len]),
-            Backing::Ro(map) => Some(&map[start..start + len]),
+            Backing::Rw(map) => map.get(start..start + len),
+            Backing::Ro(map) => map.get(start..start + len),
             // Only a zero-length borrow (necessarily at offset 0) is valid with no mapping.
             Backing::Empty if len == 0 => Some(&[]),
             Backing::Empty => None,
         }
     }
 
-    /// Borrow the logical data from `offset` to the end (`None` past the end): see
-    /// [`Self::slice`].
+    /// Borrow the logical data from `offset` to the end (`None` past the end, or where the
+    /// mapping does not reach the end): see [`Self::slice`].
     pub fn tail(&self, offset: u64) -> Option<&[u8]> {
         self.slice(offset, usize::try_from(self.end.checked_sub(offset)?).ok()?)
     }
@@ -1359,9 +1360,9 @@ impl MmapDataFile {
     /// block for zero-copy record reads (no `memcpy`, no allocation).
     ///
     /// Returns `None` if the range falls outside the logical data `[0, len())` (so the transient
-    /// capacity padding past `end` is never exposed) or the file is currently unmapped. The
-    /// returned slice borrows `&mut self`, so no concurrent write/remap (which needs `&mut self`)
-    /// can invalidate it while it is held.
+    /// capacity padding past `end` is never exposed), the file is currently unmapped, or the
+    /// mapping does not cover the range. The returned slice borrows `&mut self`, so no
+    /// concurrent write/remap (which needs `&mut self`) can invalidate it while it is held.
     pub fn slice_mut(&mut self, offset: u64, len: usize) -> Option<&mut [u8]> {
         debug_assert!(!self.seal_pending, "a sealed file changes only through `write`");
         let range_end = offset.checked_add(len as u64)?;
@@ -1370,7 +1371,14 @@ impl MmapDataFile {
         }
         let start = offset as usize;
         match &mut self.backing {
-            Backing::Rw(map) => Some(map_range_mut(map, start, len)),
+            Backing::Rw(map) => {
+                // Bounded here, not with `get_mut` (which would borrow the whole mapping; see
+                // `map_range_mut`), so a short mapping is `None` rather than its assert.
+                if start + len > map.len() {
+                    return None;
+                }
+                Some(map_range_mut(map, start, len))
+            }
             Backing::Ro(_map) => None,
             Backing::Empty => None,
         }
@@ -2153,7 +2161,9 @@ impl MmapDataFile {
 
 impl Read for MmapDataFile {
     /// Read from the logical `[0, end)` region at the current seek position. Never reads capacity
-    /// padding. An empty target buffer reads nothing.
+    /// padding. An empty target buffer reads nothing. Fails with `UnexpectedEof` if the mapping
+    /// does not cover the range (a file that shrank under a read-only open), as a file read past
+    /// its end would.
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         if buf.is_empty() || self.seek_pos >= self.end {
             return Ok(0);
@@ -2161,11 +2171,18 @@ impl Read for MmapDataFile {
         let start = self.seek_pos as usize;
         let avail = (self.end - self.seek_pos) as usize;
         let n = avail.min(buf.len());
-        match &self.backing {
-            Backing::Rw(map) => buf[..n].copy_from_slice(&map[start..start + n]),
-            Backing::Ro(map) => buf[..n].copy_from_slice(&map[start..start + n]),
+        let src = match &self.backing {
+            Backing::Rw(map) => map.get(start..start + n),
+            Backing::Ro(map) => map.get(start..start + n),
             Backing::Empty => return Ok(0),
-        }
+        };
+        let src = src.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                format!("{} is shorter than its logical end", self.path.display()),
+            )
+        })?;
+        buf[..n].copy_from_slice(src);
         self.seek_pos += n as u64;
         Ok(n)
     }
