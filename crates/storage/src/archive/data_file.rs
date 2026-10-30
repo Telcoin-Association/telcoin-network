@@ -1074,13 +1074,22 @@ impl MmapDataFile {
             // clean-close sentinel, validated above; `opened_unclean` flags a file that was not)
             // and has no live writer. A writer that later shrinks the file under this
             // mapping would make a touch of a page past the new EOF deliver SIGBUS, which no Rust
-            // error path catches. The pack upholds this: `get_static` serves the live epoch from
-            // the writer handle (never a read-only map of it), and `open_static` runs
-            // only on sealed epochs and is gated by `files_consistent`. As
-            // defense-in-depth, the read bound (`end`) is additionally clamped to the
-            // index-attested length via `set_read_bound`, so reads never touch bytes a
-            // writer truncation could remove even if that discipline slipped.
+            // error path catches. `get_static` serves the live epoch from the writer handle (never
+            // a read-only map of it), but `open_static` is not gated by `files_consistent` before
+            // this map (it checks the files after the open), so a writer still sealing the file
+            // can shrink it between the `metadata()` above and this map. Two guards keep reads
+            // inside the file: the length check below refuses a mapping shorter than `orig_len`,
+            // so at open the mapping covers every offset below `end` (mapping `orig_len`
+            // explicitly instead would turn the shrink into SIGBUS); and `set_read_bound` clamps
+            // `end` afterward to the index-attested length, so reads never touch bytes a later
+            // writer truncation could remove.
             let map = unsafe { Mmap::map(&file)? };
+            if (map.len() as u64) < orig_len {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    format!("{} shrank while being opened read-only", path.display()),
+                ));
+            }
             (Backing::Ro(map), orig_len, 0)
         } else {
             // SAFETY: single-writer pack model — we hold the file open for writing for this
@@ -2061,9 +2070,19 @@ impl MmapDataFile {
                     // (a cleanly-closed writer, physical == logical + sentinel,
                     // no live writer). Following a mid-append writer would
                     // adopt its padded physical size and SIGBUS on a later
-                    // truncation; pair with `set_read_bound` (see the read-only branch of
-                    // `open_with`).
-                    Backing::Ro(unsafe { Mmap::map(&self.file)? })
+                    // truncation; pair with `set_read_bound`. A mapping shorter than `disk_len`
+                    // is refused, as in the read-only branch of `open_with`.
+                    let map = unsafe { Mmap::map(&self.file)? };
+                    if (map.len() as u64) < disk_len {
+                        return Err(io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            format!(
+                                "{} shrank while being refreshed read-only",
+                                self.path.display()
+                            ),
+                        ));
+                    }
+                    Backing::Ro(map)
                 } else {
                     // SAFETY: single-writer model — this handle is the sole writer for its
                     // lifetime.
