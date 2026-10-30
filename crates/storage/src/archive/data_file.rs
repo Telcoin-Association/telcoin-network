@@ -3077,6 +3077,50 @@ mod tests {
         assert!(empty.slice(0, 1).is_none());
     }
 
+    /// A mapping shorter than the logical end (a file that shrank under a read-only open) makes the
+    /// borrows and reads report the gap instead of panicking, while in-range borrows still succeed.
+    #[test]
+    fn borrows_past_the_mapping_fail_without_panicking() {
+        let tmp = TempDir::with_prefix("mmap_df_short_map").expect("temp dir");
+        let path = tmp.path().join("data");
+        let data = pattern(20);
+        {
+            let mut df = MmapDataFile::open_with(&path, false, tiny_opts()).expect("open");
+            df.write_all(&data).expect("write");
+        } // clean close: the file is the data plus the sentinel
+
+        let mut ro = MmapDataFile::open_with(&path, true, tiny_opts()).expect("open ro");
+        let Backing::Ro(map) = &ro.backing else { panic!("a read-only open maps the file") };
+        let mapped = map.len() as u64;
+        assert_eq!(mapped, 20 + SENTINEL_LEN);
+        // Leave `end` past the mapping, as a file that shrank between the open's length read and
+        // its map would without the open-time check.
+        ro.end = mapped + 8;
+        let len = ro.end as usize;
+        assert!(ro.slice(0, len).is_none(), "a slice past the mapping is None");
+        assert!(ro.tail(0).is_none(), "a tail past the mapping is None");
+        assert!(!ro.is_unwritten(), "an unreadable range is not classified as unwritten");
+        assert_eq!(ro.slice(0, 20).expect("in-range slice"), &data[..]);
+        let mut buf = vec![0u8; len];
+        let err = ro.read(&mut buf).expect_err("a read past the mapping fails");
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+
+        // The same on a writable handle, whose mapping is exactly its capacity.
+        let mut rw =
+            MmapDataFile::open_with(tmp.path().join("rw"), false, tiny_opts()).expect("open rw");
+        rw.write_all(&data).expect("write");
+        let Backing::Rw(map) = &rw.backing else { panic!("a written file is mapped") };
+        let mapped = map.len() as u64;
+        let end = rw.end;
+        rw.end = mapped + 8;
+        let len = rw.end as usize;
+        assert!(rw.slice(0, len).is_none(), "a slice past the mapping is None");
+        assert!(rw.slice_mut(0, len).is_none(), "a mutable slice past the mapping is None");
+        assert!(rw.slice_mut(0, 20).is_some(), "an in-range mutable slice");
+        // Restore the real end before the clean close.
+        rw.end = end;
+    }
+
     #[test]
     fn roundtrip_and_empty_read() {
         let tmp = TempDir::with_prefix("mmap_df_roundtrip").expect("temp dir");
