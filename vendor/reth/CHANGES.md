@@ -91,3 +91,17 @@ newest last.
   gets it only because `reth-node-core` enables `reth-network/serde`, which reaches chain-state
   through feature unification. TN-0008 removes that path, so `reth-rpc` stops compiling.
   *Upstream*: yes, a real (latent) manifest bug.
+
+- **TN-0008** — Remove the devp2p parts of `reth-node-core`. *Kind*: removal.
+  *Files*: `crates/node/core/src/args/network.rs` (deleted: `NetworkArgs`, `DiscoveryArgs`),
+  `crates/node/core/src/args/mod.rs`; `crates/node/core/src/node_config.rs` (the `network`
+  field, `with_network`, `with_disabled_discovery`, `max_block`, `lookup_or_fetch_tip`,
+  `fetch_tip_from_network`, `dev_mining_mode`; `dev()`, `adjust_instance_ports` and
+  `with_unused_ports` now touch RPC only); `crates/node/core/src/cli/config.rs`
+  (`RethNetworkConfig`); `crates/node/core/src/utils.rs` (`get_single_header`,
+  `get_single_body`); `crates/node/core/Cargo.toml` (drops reth-network, reth-network-p2p,
+  reth-discv4, reth-discv5, reth-net-nat, reth-net-banlist, reth-network-peers,
+  reth-engine-local, reth-consensus, secp256k1, ipnet).
+  *Why*: TN runs no devp2p network (its peers speak libp2p) and no dev-mode miner. Only
+  `NodeConfig`'s network arguments kept the devp2p stack in the graph, and `tn-reth` filled them
+  with disabled values. *Upstream*: no.

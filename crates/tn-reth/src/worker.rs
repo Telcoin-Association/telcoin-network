@@ -13,13 +13,12 @@
 //! respawned when the epoch rolls over).
 
 use crate::{ChainSpec, RethEnv, WorkerTxPool};
+use enr::secp256k1::SecretKey;
 use futures::{FutureExt as _, StreamExt as _};
 use jsonrpsee::{core::RpcResult, types::ErrorObjectOwned};
 use parking_lot::RwLock;
 use reth_chainspec::ChainSpec as RethChainSpec;
-use reth_discv4::DEFAULT_DISCOVERY_PORT;
-use reth_eth_wire::DisconnectReason;
-use reth_network::config::SecretKey;
+use reth_eth_wire_types::DisconnectReason;
 use reth_network_api::{
     EthProtocolInfo, NetworkError, NetworkInfo, NetworkStatus, PeerInfo, PeerKind, Peers,
     PeersInfo, Reputation, ReputationChangeKind,
@@ -269,10 +268,14 @@ impl WorkerNetwork {
     }
 }
 
+/// reth's default devp2p discovery port (`reth_discv4::DEFAULT_DISCOVERY_PORT`), reported by the
+/// `net_` stubs below. TN runs no devp2p network, so nothing listens on it.
+const DEVP2P_DEFAULT_PORT: u16 = 30303;
+
 impl NetworkInfo for WorkerNetwork {
     // TN Unused
     fn local_addr(&self) -> SocketAddr {
-        (IpAddr::from(std::net::Ipv4Addr::UNSPECIFIED), DEFAULT_DISCOVERY_PORT).into()
+        (IpAddr::from(std::net::Ipv4Addr::UNSPECIFIED), DEVP2P_DEFAULT_PORT).into()
     }
 
     #[allow(deprecated, reason = "EthProtocolInfo::difficulty is deprecated")]

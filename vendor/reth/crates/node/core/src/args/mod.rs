@@ -1,8 +1,7 @@
 //! Parameters for configuring the rpc more granularity via CLI
 
-/// NetworkArg struct for configuring the network
-mod network;
-pub use network::{DiscoveryArgs, NetworkArgs};
+// TN(TN-0008): `NetworkArgs` and `DiscoveryArgs` (mod network) are removed. TN runs no devp2p
+// network; its peers speak libp2p.
 
 /// RpcServerArg struct for configuring the RPC
 mod rpc_server;
