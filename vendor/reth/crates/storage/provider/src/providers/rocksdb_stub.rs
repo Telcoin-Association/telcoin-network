@@ -1,8 +1,9 @@
 //! Stub implementation of `RocksDB` provider.
 //!
-//! This module provides placeholder types that allow the code to compile when `RocksDB` is not
-//! available (either on non-Unix platforms or when the `rocksdb` feature is not enabled).
-//! All method calls are cfg-guarded in the calling code, so only type definitions are needed here.
+//! TN(TN-0014): TN removed RocksDB, so these zero-size placeholder types are the only
+//! `RocksDBProvider` there is. They remain only because the provider API (factory constructors,
+//! `EitherWriter`/`EitherReader` arguments, `check_consistency`) is typed against them. Removing
+//! them is "RocksDB step B" in vendor/reth/ROADMAP.md.
 
 use alloy_primitives::BlockNumber;
 use metrics::Label;

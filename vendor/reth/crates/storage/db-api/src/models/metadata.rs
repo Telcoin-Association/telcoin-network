@@ -27,16 +27,12 @@ pub struct StorageSettings {
 }
 
 impl StorageSettings {
-    /// Returns the default base `StorageSettings`.
+    /// Returns the default base `StorageSettings`: [`Self::v1()`].
     ///
-    /// When the `edge` feature is enabled, returns [`Self::v2()`] so that CI and
-    /// edge builds automatically use v2 storage defaults. Otherwise returns
-    /// [`Self::v1()`]. The `--storage.v2` CLI flag can also opt into v2 at runtime
-    /// regardless of feature flags.
+    /// TN(TN-0014): the `edge` feature that made this v2 is removed. v2 routes history indices to
+    /// `RocksDB`, which TN does not carry, and TN pins `--storage.v2` off.
     pub const fn base() -> Self {
-        {
-            Self::v1()
-        }
+        Self::v1()
     }
 
     /// Creates `StorageSettings` for v2 nodes with all storage features enabled:
