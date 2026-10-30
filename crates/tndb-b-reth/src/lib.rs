@@ -76,14 +76,15 @@
 //! |---|---|
 //! | `KeyExists` | `MDBX_KEYEXIST` (for a second value for a dup row's subkey, with this crate's message) |
 //! | `AppendOutOfOrder` | `MDBX_EKEYMISMATCH` |
-//! | `KeyTooLarge`, `ValueTooLarge` | `MDBX_BAD_VALSIZE` |
+//! | `KeyTooLarge`, `KeyTooShort`, `ValueTooLarge` | `MDBX_BAD_VALSIZE` |
 //! | `Corrupt` | `MDBX_CORRUPTED` (the detail is in [`TndbEnv::failure`]) |
 //! | `Locked` | `MDBX_BUSY` |
 //! | `ReadOnly` | `MDBX_EACCESS` |
 //! | `WrongTxn`, a write transaction already finished | `MDBX_BAD_TXN` |
 //! | `TableNotFound`, `StaleTable`, a table never created | `MDBX_NOTFOUND` |
 //! | an unpositioned `delete_current` | `MDBX_ENODATA` |
-//! | `InvalidTableName`, `InvalidPageSize` | `MDBX_EINVAL` |
+//! | `TableKind` | `MDBX_INCOMPATIBLE` |
+//! | `InvalidTableName`, `InvalidPageSize`, `InvalidDupOptions` | `MDBX_EINVAL` |
 //!
 //! A refused second value for a dup-sort row's subkey (below) is `MDBX_KEYEXIST` with a message of
 //! this crate's saying it stores one value per subkey. Four engine errors keep their own message,

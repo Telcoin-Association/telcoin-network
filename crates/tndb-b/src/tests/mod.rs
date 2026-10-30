@@ -24,6 +24,7 @@ mod crash_runs;
 mod damage;
 mod damage_merge;
 mod damage_runs;
+mod dup;
 mod key_tail;
 mod merge;
 mod multi_model;

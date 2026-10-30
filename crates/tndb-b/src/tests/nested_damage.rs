@@ -1,8 +1,10 @@
-//! Nested cells and dup table records at rest in a file whose tables are all plain: the engine
-//! writes neither, so each is damage. A nested cell (flags `CELL_NESTED`, a valid encoded root)
-//! in a published leaf, or a valid dup record in the catalog, with the page's CRC stamped again
-//! so only the cell and record rules find it, is `Error::Corrupt` at every use that meets it (a
-//! read, a write, a free, `Env::check`), and the error latches the environment.
+//! Nested cells in a plain table, and a dup table record over a plain table's tree. A nested cell
+//! (flags `CELL_NESTED`, a valid encoded root) in a published leaf of a plain table, with the
+//! page's CRC stamped again so only the cell rules find it, is `Error::Corrupt` at every use that
+//! meets it (a read, a write, a free, `Env::check`), and the error latches the environment. A
+//! valid dup record in the catalog is a dup table's: it opens, and a call for a plain table on it
+//! is `Error::TableKind`, with no latch; the plain table's inline cells it now names as outer
+//! cells are `Error::Corrupt` at their first use, and latch.
 
 use std::{
     fmt::Debug,
@@ -33,9 +35,6 @@ const K: u32 = 150;
 
 /// What every use of a nested cell says ([`page::nested_error`]).
 const NESTED: &str = "a nested cell in a tree that holds none";
-
-/// What every use of a dup table's record says ([`TableRecord::plain`]).
-const DUP: &str = "a dup table";
 
 /// Row `i`'s key.
 fn key(i: u32) -> [u8; 4] {
@@ -174,12 +173,15 @@ fn a_forged_nested_cell_is_corrupt_and_latches_at_every_use() {
 }
 
 /// A valid dup table record (the table's tree intact, each row counted as a nested tree) in the
-/// catalog, its leaf's CRC stamped again, is refused wherever a table is resolved: a read
-/// transaction's and a write transaction's `open_table`, `create_table` of its name, a get and
-/// a drop through a handle taken before, and `Env::check`'s catalog walk. Each is `Corrupt` and
-/// latches.
+/// catalog, its leaf's CRC stamped again, is a dup table's: both kinds of transaction open it, its
+/// figures are the record's, a get of an outer key it lacks is a miss, `create_dup_table` with its
+/// options returns its handle, and `create_table` of its name is `TableKind`, with no latch. Its
+/// outer cells are the plain table's inline values, so each first use of one is `Corrupt` and
+/// latches (a fresh copy per use): a get of a row under a present outer key in either transaction,
+/// a put, a delete and a `delete_prefix` of one, a put of a new outer key (the copy of the leaf
+/// meets its cells), a drop and a clear (the free walk) and `Env::check`.
 #[test]
-fn a_dup_table_record_is_refused_at_open_drop_and_check() {
+fn a_dup_record_over_inline_cells_is_corrupt_at_first_use() {
     let (_dir, path) = temp("tndb_b_dup_record");
     let (d, catalog) = {
         let env = open(&path, SyncMode::Durable);
@@ -222,18 +224,56 @@ fn a_dup_table_record_is_refused_at_open_drop_and_check() {
         assert_eq!(ro.get(&p, &key(0)).expect("get"), Some(&b"v"[..]));
         assert!(env.failure().is_none(), "the plain table met no damage");
     }
-    for what in ["ro open_table", "ro get", "rw open_table", "create_table", "drop_table", "check"]
+    let absent = [&key(9)[..], b"s"].concat();
     {
         let (_dir, env) = copy_of(&path);
-        let result = match what {
-            "ro open_table" => env.begin_ro().expect("ro").open_table("d").map(drop),
-            "ro get" => env.begin_ro().expect("ro").get(&d, &key(0)).map(drop),
-            "rw open_table" => env.begin_rw().expect("rw").open_table("d").map(drop),
-            "create_table" => env.begin_rw().expect("rw").create_table("d").map(drop),
-            "drop_table" => env.begin_rw().expect("rw").drop_table(d.clone()),
-            _ => env.check().map(drop),
+        let ro = env.begin_ro().expect("ro");
+        assert_eq!(ro.open_table("d").expect("ro open"), Some(d.clone()));
+        let stat = ro.table_stat(&d).expect("stat");
+        let options = crate::DupOptions { key_len: 4, packed_max: 0 };
+        assert_eq!((stat.entries, stat.nested_trees, stat.dup), (3, 3, Some(options)));
+        assert_eq!(ro.get(&d, &absent).expect("an outer key it lacks"), None);
+        let mut rw = env.begin_rw().expect("rw");
+        assert_eq!(rw.open_table("d").expect("rw open"), Some(d.clone()));
+        assert_eq!(rw.create_dup_table("d", options).expect("the same options"), d);
+        assert!(matches!(rw.create_table("d"), Err(Error::TableKind(n)) if n == "d"));
+        assert_eq!(rw.get(&d, &absent).expect("an outer key it lacks"), None);
+        assert!(env.failure().is_none(), "no latch");
+    }
+    let row = [&key(1)[..], b"s"].concat();
+    const NO_TREE: &str = "the outer cell of key [00, 00, 00, 01] holds no nested tree";
+    const AT_COPY: &str = "an outer cell of a dup table that is not a nested tree";
+    const WALK: &str = "a cell that is not nested in a dup table's outer tree";
+    let uses = [
+        ("ro get", NO_TREE),
+        ("rw get", NO_TREE),
+        ("put", NO_TREE),
+        ("delete", NO_TREE),
+        ("delete_prefix", NO_TREE),
+        ("put of a new outer key", AT_COPY),
+        ("drop", WALK),
+        ("clear", WALK),
+        ("check", WALK),
+    ];
+    for (what, message) in uses {
+        let (_dir, env) = copy_of(&path);
+        let result = if what == "ro get" {
+            env.begin_ro().expect("ro").get(&d, &row).map(drop)
+        } else if what == "check" {
+            env.check().map(drop)
+        } else {
+            let mut rw = env.begin_rw().expect("rw");
+            match what {
+                "rw get" => rw.get(&d, &row).map(drop),
+                "put" => rw.put(&d, &row, b"w"),
+                "delete" => rw.delete(&d, &row).map(drop),
+                "delete_prefix" => rw.delete_prefix(&d, &key(1)).map(drop),
+                "put of a new outer key" => rw.put(&d, &absent, b"w"),
+                "drop" => rw.drop_table(d.clone()),
+                _ => rw.clear_table(&d),
+            }
         };
-        assert_corrupt(what, result, DUP);
+        assert_corrupt(what, result, message);
         assert!(env.failure().is_some(), "{what}: latched");
     }
 }

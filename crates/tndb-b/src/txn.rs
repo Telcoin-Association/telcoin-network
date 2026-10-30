@@ -5,6 +5,7 @@
 //! per snapshot, which every transaction on it shares ([`TableRoots`]).
 
 use std::{
+    collections::BTreeMap,
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc, OnceLock,
@@ -15,19 +16,19 @@ use std::{
 #[cfg(test)]
 use crate::env::CrashAt;
 use crate::{
-    catalog::{self, TableRecord},
+    catalog::{self, DupOptions, DupRecord, TableRecord},
     env::{EnvInner, Snapshot, SyncMode, Writer},
     error::{Error, Result},
     freelist,
     latch::UnwindLatch,
     meta::Meta,
-    page,
+    page::{self, Val},
     stats::elapsed_ns,
     tree::{
         cursor::{self, Cursor, Entry, KeyTail, State, TreeCursor},
         read,
         write::{self, PutKind},
-        TreeRoot,
+        PageRead, PageWrite, TreeRoot,
     },
 };
 
@@ -81,30 +82,50 @@ const _: fn() = || {
 // `RoTxn::cursor_owned` takes: the table roots it resolves live in its snapshot (`TableRoots`).
 const _: () = assert!(std::mem::size_of::<RoTxn>() == 2 * std::mem::size_of::<usize>());
 
-/// Figures about one table in a transaction's state, read from its tree's root record: O(1),
-/// with no page read. An empty table has every figure zero.
+/// Figures about one table in a transaction's state, read from its catalog record: O(1), with no
+/// page read. An empty plain table has every figure zero; an empty dup table has them zero but
+/// [`Self::dup`]. A dup table's page figures sum its outer tree's and its nested trees'; its
+/// `entries` are its rows, and `height` is the outer tree's.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct TableStat {
-    /// The number of entries.
+    /// The number of entries (a dup table's rows: every `k ‖ s` it holds).
     pub entries: u64,
-    /// The height of the table's B+tree (0: empty).
+    /// The height of the table's B+tree (0: empty; a dup table's outer tree).
     pub height: u32,
-    /// The branch pages of its tree: every level above the leaves.
+    /// The branch pages of its trees: every level above the leaves.
     pub branch_pages: u32,
-    /// The leaf pages of its tree.
+    /// The leaf pages of its trees.
     pub leaf_pages: u32,
     /// The pages of the overflow runs holding its values too large for a leaf.
     pub overflow_pages: u32,
+    /// A dup table's nested trees, one per outer key (0 for a plain table).
+    pub nested_trees: u32,
+    /// A dup table's shape; `None` for a plain table.
+    pub dup: Option<DupOptions>,
 }
 
 impl TableStat {
-    fn of(root: &TreeRoot) -> Self {
-        Self {
+    /// The figures of a table whose tree is `root`, with `dup` for a dup table: its outer and
+    /// nested trees summed. The record rules bound the sums ([`TableRecord::decode`]).
+    fn of(root: &TreeRoot, dup: Option<&DupRecord>) -> Self {
+        let plain = Self {
             entries: root.entries,
             height: root.height,
             branch_pages: root.branch_pages,
             leaf_pages: root.leaf_pages,
             overflow_pages: root.overflow_pages,
+            nested_trees: 0,
+            dup: None,
+        };
+        let Some(d) = dup else { return plain };
+        Self {
+            entries: d.nested_entries + d.packed_rows,
+            branch_pages: plain.branch_pages + d.nested_branch_pages,
+            leaf_pages: plain.leaf_pages + d.nested_leaf_pages,
+            overflow_pages: plain.overflow_pages + d.nested_overflow_pages,
+            nested_trees: d.nested_trees,
+            dup: Some(d.options()),
+            ..plain
         }
     }
 }
@@ -120,17 +141,25 @@ pub trait ReadTxn {
     /// The value stored under `key` in `table`, borrowed from the mapping for as long as the
     /// transaction lives. A value held in an overflow run is borrowed from the run's pages; a run
     /// of more than one page passes its full CRC first, so such a get reads every byte of it.
+    ///
+    /// In a dup table `key` is the logical key `k ‖ s`: its first `key_len` bytes are the outer
+    /// key `k`, the rest the subkey `s`, and the value is `s`'s in `k`'s nested tree. A key of at
+    /// most `key_len` bytes (no subkey) is [`Error::KeyTooShort`], with no latch; a key over the
+    /// page size's `max_key` misses, as in a plain table. A write transaction reads its own
+    /// unflushed nested trees.
     fn get<'t>(&'t self, table: &Table, key: &[u8]) -> Result<Option<&'t [u8]>>;
 
     /// A new, unset cursor over `table`: ordered access to its entries in both directions,
     /// borrowed from the transaction for as long as it lives (see [`Cursor`]).
+    /// [`Error::TableKind`] for a dup table.
     fn cursor<'t>(&'t self, table: &Table) -> Result<Cursor<'t>>;
 
     /// The id of the state this transaction reads: a read-only transaction's snapshot, or the
     /// id the write transaction commits as.
     fn txn_id(&self) -> u64;
 
-    /// Figures about `table` in this state.
+    /// Figures about `table` in this state, O(1) for either kind (see [`TableStat`]); a write
+    /// transaction's include its changes not yet committed.
     fn table_stat(&self, table: &Table) -> Result<TableStat>;
 }
 
@@ -146,6 +175,443 @@ fn resolve(found: Option<TableRecord>, table: &Table, next_table_id: u32) -> Res
     }
 }
 
+/// One outer key's nested tree in the write transaction: an entry of [`Working::nested`], the
+/// working map of a dup table. The map, not the outer cell, is the truth for its key until
+/// commit: the cell may name a superseded root.
+struct Nested {
+    /// The working nested root: never empty while in the map (an emptied tree leaves with its
+    /// cell).
+    root: TreeRoot,
+    /// Its provenance, as [`write::put_sized`]'s: true only after this transaction's writer wrote
+    /// it. A root read from a cell is never trusted ([`load_cell`]).
+    trusted: bool,
+    /// True when the outer cell does not hold `root`: the flush at commit writes it
+    /// ([`Work::flush_nested`]).
+    changed: bool,
+    /// The nested tree's write-path cache (boxed: the map's nodes then move small values).
+    cache: Box<write::PathCache>,
+}
+
+/// The working map of a dup table: its nested trees written (or loaded for a write) in this
+/// transaction, by outer key. Every outer key whose nested tree this transaction created or
+/// changed has an entry from that write until commit, or until the key is removed, and the
+/// entry's root is the key's current nested root; entries are never evicted. So a cell naming a
+/// page private to this transaction always has an entry, and a cell with no entry holds the
+/// committed root.
+type NestedMap = BTreeMap<Box<[u8]>, Nested>;
+
+/// Split a dup table's logical `key` into its outer key (the table's `key_len` bytes) and its
+/// subkey (the rest, at least one byte), else [`Error::KeyTooShort`].
+fn split_dup_key(key: &[u8], key_len: u16) -> Result<(&[u8], &[u8])> {
+    let k = usize::from(key_len);
+    if key.len() <= k {
+        return Err(Error::KeyTooShort { len: key.len(), min: k + 1 });
+    }
+    Ok(key.split_at(k))
+}
+
+/// The outer cell of key `k` in the dup table `table`'s outer tree `outer`: the nested cell's
+/// root bytes, `None` for no cell. Any other cell is [`Error::Corrupt`] (this build writes only
+/// nested cells into an outer tree).
+fn outer_cell<'s, S: PageRead + ?Sized>(
+    store: &'s S,
+    table: &Table,
+    outer: &TreeRoot,
+    k: &[u8],
+) -> Result<Option<&'s [u8; page::NESTED_CELL]>> {
+    match read::find(store, outer, k)? {
+        None => Ok(None),
+        Some(Val::Nested(b)) => Ok(Some(b)),
+        Some(Val::Inline(_)) => Err(Error::Corrupt(format!(
+            "dup table {}: the outer cell of key {k:02x?} holds no nested tree",
+            table.name()
+        ))),
+        Some(Val::Overflow(_)) => Err(Error::Corrupt(format!(
+            "dup table {}: an overflow cell in a dup table's outer tree (key {k:02x?})",
+            table.name()
+        ))),
+    }
+}
+
+/// The nested root an outer cell of key `k` holds (`b`), decoded and checked: a cell names a
+/// non-empty tree, else [`Error::Corrupt`].
+fn cell_root(table: &Table, k: &[u8], b: &[u8; page::NESTED_CELL]) -> Result<TreeRoot> {
+    let root = TreeRoot::decode(b)?;
+    if root.is_empty() {
+        return Err(Error::Corrupt(format!(
+            "dup table {}: the outer cell of key {k:02x?} names an empty nested tree",
+            table.name()
+        )));
+    }
+    Ok(root)
+}
+
+/// The nested root of a cell met in the write transaction with no entry in the working map: the
+/// committed root ([`NestedMap`]), untrusted. A cell naming a page private to this transaction
+/// with no entry is [`Error::Corrupt`]: only a superseded root of this transaction can do that.
+fn load_cell(
+    writer: &Writer,
+    table: &Table,
+    k: &[u8],
+    b: &[u8; page::NESTED_CELL],
+) -> Result<TreeRoot> {
+    let root = cell_root(table, k, b)?;
+    if writer.is_private(root.root) {
+        return Err(Error::Corrupt(format!(
+            "dup table {}: the outer cell of key {k:02x?} names page {}, private to this \
+             transaction, with no working root",
+            table.name(),
+            root.root
+        )));
+    }
+    Ok(root)
+}
+
+/// The working map's entry of outer key `k` (the dup table `table`, outer tree `outer`, map
+/// `map`), loaded from its cell on a miss ([`load_cell`]); `None` when the key has no cell.
+/// Every dup write takes its nested root here.
+fn nested_entry<'m>(
+    writer: &Writer,
+    table: &Table,
+    outer: &TreeRoot,
+    map: &'m mut NestedMap,
+    k: &[u8],
+) -> Result<Option<&'m mut Nested>> {
+    if !map.contains_key(k) {
+        let Some(b) = outer_cell(writer, table, outer, k)? else {
+            return Ok(None);
+        };
+        let root = load_cell(writer, table, k, b)?;
+        let entry = Nested { root, trusted: false, changed: false, cache: Box::default() };
+        map.insert(k.into(), entry);
+    }
+    Ok(map.get_mut(k))
+}
+
+/// A dup table's totals in its working record (`record.dup` of a table whose kind was checked).
+fn dup_mut(dup: &mut Option<DupRecord>) -> &mut DupRecord {
+    dup.as_mut().expect("a dup table's working record holds its dup record")
+}
+
+/// The [`Error::Corrupt`] of dup totals that cannot count the nested tree of outer key `k` in
+/// `table` (only a damaged record gets there).
+#[cold]
+fn totals_error(table: &Table, k: &[u8]) -> Error {
+    Error::Corrupt(format!(
+        "dup table {}: the dup table totals do not count the nested tree of key {k:02x?}",
+        table.name()
+    ))
+}
+
+/// Move the dup totals `dup` from nested tree `before` to `after` (of outer key `k` in `table`):
+/// rows and pages, with checked arithmetic ([`totals_error`]).
+fn apply_delta(
+    dup: &mut DupRecord,
+    table: &Table,
+    k: &[u8],
+    before: &TreeRoot,
+    after: &TreeRoot,
+) -> Result<()> {
+    let pages = |n: u32, before: u32, after: u32| n.checked_sub(before)?.checked_add(after);
+    let moved = (
+        dup.nested_entries.checked_sub(before.entries).and_then(|n| n.checked_add(after.entries)),
+        pages(dup.nested_branch_pages, before.branch_pages, after.branch_pages),
+        pages(dup.nested_leaf_pages, before.leaf_pages, after.leaf_pages),
+        pages(dup.nested_overflow_pages, before.overflow_pages, after.overflow_pages),
+    );
+    let (Some(entries), Some(branch), Some(leaf), Some(overflow)) = moved else {
+        return Err(totals_error(table, k));
+    };
+    dup.nested_entries = entries;
+    dup.nested_branch_pages = branch;
+    dup.nested_leaf_pages = leaf;
+    dup.nested_overflow_pages = overflow;
+    Ok(())
+}
+
+/// The put, insert or append (`kind`) of the logical `key` and `value` into the dup table at `i`
+/// in [`Work::tables`]: into the key's nested tree, or a new tree and its outer cell. An append's
+/// order rule is the plain table's over the logical key: the outer key must not sort before the
+/// table's last outer key, and with that key the subkey must sort after its last subkey.
+#[inline(never)]
+fn dup_put(work: &mut Work, i: usize, key: &[u8], value: &[u8], kind: PutKind) -> Result<()> {
+    let key_len = dup_mut(&mut work.tables[i].record.dup).key_len;
+    let (k, s) = split_dup_key(key, key_len)?;
+    let (writer, w) = work.writer_and_table(i);
+    // Test-only: emptied caches per write, so every write descends.
+    #[cfg(test)]
+    if writer.no_path_cache {
+        w.cache.forget();
+        w.nested.values_mut().for_each(|n| n.cache.forget());
+    }
+    let new_key = match kind {
+        PutKind::Append => match read::last_key(&*writer, &w.record.root)? {
+            Some(last) if k < last => return Err(Error::AppendOutOfOrder),
+            Some(last) => k != last,
+            None => true,
+        },
+        PutKind::Upsert | PutKind::Insert => false,
+    };
+    let (mut outer, mut trusted) = (w.record.root, w.trusted);
+    let entry =
+        if new_key { None } else { nested_entry(writer, &w.table, &outer, &mut w.nested, k)? };
+    if let Some(n) = entry {
+        let before = n.root;
+        write::put_cached(writer, &mut n.root, &mut n.trusted, &mut n.cache, s, value, kind)?;
+        n.changed = true;
+        apply_delta(dup_mut(&mut w.record.dup), &w.table, k, &before, &n.root)?;
+        work.set_dup_record(i, outer, trusted);
+        return Ok(());
+    }
+    // A key with no cell: its nested tree first, then the cell naming it, current from the start.
+    let (mut root, mut root_trusted) = (TreeRoot::EMPTY, false);
+    let mut cache = Box::<write::PathCache>::default();
+    write::put_cached(writer, &mut root, &mut root_trusted, &mut cache, s, value, PutKind::Upsert)?;
+    let outer_kind = if kind == PutKind::Append { PutKind::Append } else { PutKind::Insert };
+    match write::put_outer_cell(
+        writer,
+        &mut outer,
+        &mut trusted,
+        &mut w.cache,
+        k,
+        &root,
+        outer_kind,
+    ) {
+        Ok(_) => {}
+        Err(Error::KeyExists | Error::AppendOutOfOrder) => {
+            return Err(Error::Failed(format!(
+                "dup table {}: the outer put refused the new cell of key {k:02x?}",
+                w.table.name()
+            )))
+        }
+        Err(e) => return Err(e),
+    }
+    let dup = dup_mut(&mut w.record.dup);
+    dup.nested_trees = dup.nested_trees.checked_add(1).ok_or_else(|| totals_error(&w.table, k))?;
+    apply_delta(dup, &w.table, k, &TreeRoot::EMPTY, &root)?;
+    w.nested.insert(k.into(), Nested { root, trusted: root_trusted, changed: false, cache });
+    work.set_dup_record(i, outer, trusted);
+    Ok(())
+}
+
+/// The delete of the logical `key` from the dup table at `i` in [`Work::tables`]: from the key's
+/// nested tree, and the tree's outer cell with it when the delete empties the tree.
+#[inline(never)]
+fn dup_delete(work: &mut Work, i: usize, key: &[u8]) -> Result<write::Removed> {
+    let missed = write::Removed { found: false, slot: None };
+    let key_len = dup_mut(&mut work.tables[i].record.dup).key_len;
+    let (k, s) = split_dup_key(key, key_len)?;
+    let (writer, w) = work.writer_and_table(i);
+    #[cfg(test)]
+    if writer.no_path_cache {
+        w.cache.forget();
+        w.nested.values_mut().for_each(|n| n.cache.forget());
+    }
+    let (mut outer, mut trusted) = (w.record.root, w.trusted);
+    let Some(n) = nested_entry(writer, &w.table, &outer, &mut w.nested, k)? else {
+        return Ok(missed);
+    };
+    let before = n.root;
+    if !write::delete_cached(writer, &mut n.root, &mut n.trusted, &mut n.cache, s)?.found {
+        return Ok(missed);
+    }
+    let after = n.root;
+    n.changed = true;
+    let dup = dup_mut(&mut w.record.dup);
+    apply_delta(dup, &w.table, k, &before, &after)?;
+    if after.is_empty() {
+        // The delete freed the tree's last leaf: its cell and its entry go too.
+        let removed = write::delete_outer_cell(writer, &mut outer, &mut trusted, &mut w.cache, k)?;
+        if !removed.found {
+            return Err(no_cell(&w.table, k));
+        }
+        w.nested.remove(k);
+        dup.nested_trees =
+            dup.nested_trees.checked_sub(1).ok_or_else(|| totals_error(&w.table, k))?;
+    }
+    work.set_dup_record(i, outer, trusted);
+    Ok(write::Removed { found: true, slot: None })
+}
+
+/// The get of the logical `key` from the dup table `table` whose outer tree is `outer` in a
+/// published state (`store`): the key's nested tree, through its outer cell.
+#[inline(never)]
+fn dup_get<'s, S: PageRead + ?Sized>(
+    store: &'s S,
+    table: &Table,
+    outer: &TreeRoot,
+    dup: &DupRecord,
+    key: &[u8],
+) -> Result<Option<&'s [u8]>> {
+    let (k, s) = split_dup_key(key, dup.key_len)?;
+    match outer_cell(store, table, outer, k)? {
+        None => Ok(None),
+        Some(b) => read::get(store, &cell_root(table, k, b)?, s),
+    }
+}
+
+/// [`dup_get`] in the write transaction: the key's nested root from the working map, else from
+/// its cell ([`Work::nested_root`]).
+#[inline(never)]
+fn dup_get_in_txn<'t>(
+    work: &'t Work,
+    table: &Table,
+    outer: &TreeRoot,
+    dup: &DupRecord,
+    key: &[u8],
+) -> Result<Option<&'t [u8]>> {
+    let (k, s) = split_dup_key(key, dup.key_len)?;
+    match work.nested_root(table, outer, k)? {
+        None => Ok(None),
+        Some(root) => read::get(work.writer(), &root, s),
+    }
+}
+
+/// Test-only: every row of a dup table whose outer tree is `outer` in `store`, as `(logical key,
+/// value)` in key order, each nested root from `working` (the write transaction's map) else from
+/// its cell; every tree is walked with the test walkers' checks, and the totals in `dup` must
+/// count exactly the trees walked.
+#[cfg(test)]
+fn dup_rows<S: PageRead + ?Sized>(
+    store: &S,
+    outer: &TreeRoot,
+    dup: &DupRecord,
+    working: impl Fn(&[u8]) -> Option<TreeRoot>,
+) -> Vec<(Vec<u8>, Vec<u8>)> {
+    use crate::tree::test_harness::{walk_outer_tree, walk_tree};
+    let mut rows = Vec::new();
+    let mut sums =
+        DupRecord { key_len: dup.key_len, packed_max: dup.packed_max, ..DupRecord::default() };
+    for (k, cell) in walk_outer_tree(store, outer).entries {
+        assert_eq!(k.len(), usize::from(dup.key_len), "an outer key of the table's width");
+        let root = working(&k).unwrap_or_else(|| {
+            TreeRoot::decode(cell.as_slice().try_into().expect("a 32-byte cell")).expect("a root")
+        });
+        assert!(!root.is_empty(), "the outer cell of key {k:02x?} names an empty tree");
+        sums.nested_trees += 1;
+        sums.nested_entries += root.entries;
+        sums.nested_branch_pages += root.branch_pages;
+        sums.nested_leaf_pages += root.leaf_pages;
+        sums.nested_overflow_pages += root.overflow_pages;
+        for (s, v) in walk_tree(store, &root).entries {
+            rows.push(([k.as_slice(), &s].concat(), v));
+        }
+    }
+    assert_eq!(sums, *dup, "the dup totals against the trees walked");
+    rows
+}
+
+/// The [`Error::Corrupt`] of a key with a nested tree in the working map but no outer cell in
+/// the dup table `table`.
+#[cold]
+fn no_cell(table: &Table, k: &[u8]) -> Error {
+    Error::Corrupt(format!("dup table {}: no outer cell for key {k:02x?}", table.name()))
+}
+
+/// The delete of every row under the outer key `key` from the dup table at `i` in
+/// [`Work::tables`]: the key's nested tree is freed in one walk ([`write::free_subtree`]: its
+/// pages are collected first, so damage frees nothing), then its cell and its entry go; returns
+/// the rows removed. The totals are moved first, so a record that cannot count the tree frees
+/// nothing either. A key of another width than the table's is refused before anything changes.
+fn dup_delete_prefix(work: &mut Work, i: usize, key: &[u8]) -> Result<u64> {
+    let key_len = usize::from(dup_mut(&mut work.tables[i].record.dup).key_len);
+    if key.len() < key_len {
+        return Err(Error::KeyTooShort { len: key.len(), min: key_len });
+    }
+    if key.len() > key_len {
+        return Err(Error::KeyTooLarge { len: key.len(), max: key_len });
+    }
+    let (writer, w) = work.writer_and_table(i);
+    #[cfg(test)]
+    if writer.no_path_cache {
+        w.cache.forget();
+        w.nested.values_mut().for_each(|n| n.cache.forget());
+    }
+    let (mut outer, mut trusted) = (w.record.root, w.trusted);
+    let Some(n) = nested_entry(writer, &w.table, &outer, &mut w.nested, key)? else {
+        return Ok(0);
+    };
+    let (root, root_trusted) = (n.root, n.trusted);
+    let mut totals = *dup_mut(&mut w.record.dup);
+    totals.nested_trees =
+        totals.nested_trees.checked_sub(1).ok_or_else(|| totals_error(&w.table, key))?;
+    apply_delta(&mut totals, &w.table, key, &root, &TreeRoot::EMPTY)?;
+    write::free_subtree(writer, &root, root_trusted)?;
+    let removed = write::delete_outer_cell(writer, &mut outer, &mut trusted, &mut w.cache, key)?;
+    if !removed.found {
+        return Err(no_cell(&w.table, key));
+    }
+    w.nested.remove(key);
+    w.record.dup = Some(totals);
+    work.set_dup_record(i, outer, trusted);
+    Ok(root.entries)
+}
+
+/// The nested roots of a free walk over a dup table's outer tree ([`write::free_dup_tree`]): for
+/// a key the working map holds, its entry's root and provenance (each such hit counted), else the
+/// cell's committed root, untrusted (so a cell naming a page private to this transaction with no
+/// entry is refused by the walk). Once walked, every entry must have been met (each has its cell)
+/// and the nested counters must be the table's totals, else nothing is freed.
+struct WalkRoots<'a> {
+    table: &'a Table,
+    map: &'a NestedMap,
+    dup: &'a DupRecord,
+    hits: usize,
+}
+
+impl write::NestedRoots for WalkRoots<'_> {
+    fn root(&mut self, key: &[u8], cell: &[u8; page::NESTED_CELL]) -> Result<(TreeRoot, bool)> {
+        if let Some(n) = self.map.get(key) {
+            self.hits += 1;
+            return Ok((n.root, n.trusted));
+        }
+        Ok((cell_root(self.table, key, cell)?, false))
+    }
+
+    fn walked(&mut self, sums: &write::NestedSums) -> Result<()> {
+        if self.hits != self.map.len() {
+            return Err(Error::Failed(format!(
+                "dup table {}: the free walk met {} of its {} working nested roots",
+                self.table.name(),
+                self.hits,
+                self.map.len()
+            )));
+        }
+        let d = self.dup;
+        let fields = [
+            ("nested trees", sums.trees, u64::from(d.nested_trees)),
+            ("nested entries", sums.entries, d.nested_entries),
+            ("nested branch pages", sums.branch, u64::from(d.nested_branch_pages)),
+            ("nested leaf pages", sums.leaf, u64::from(d.nested_leaf_pages)),
+            ("nested overflow pages", sums.overflow, u64::from(d.nested_overflow_pages)),
+        ];
+        for (field, walked, record) in fields {
+            if walked != record {
+                return Err(Error::Corrupt(format!(
+                    "dup table {}: its nested trees count {walked} {field}, its record {record}",
+                    self.table.name()
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Free the dup table `table`'s outer tree `outer` (provenance `trusted`) and every nested tree
+/// its cells name, each root through the working map `map` ([`WalkRoots`]), checked against the
+/// totals `dup` before anything is freed ([`write::free_dup_tree`]).
+fn free_dup_table(
+    writer: &mut Writer,
+    table: &Table,
+    outer: &TreeRoot,
+    trusted: bool,
+    dup: &DupRecord,
+    map: &NestedMap,
+) -> Result<()> {
+    let mut roots = WalkRoots { table, map, dup, hits: 0 };
+    write::free_dup_tree(writer, outer, trusted, usize::from(dup.key_len), &mut roots).map(drop)
+}
+
 // Test-only counter, debug builds only: the benchmark is compiled with the test configuration,
 // and a thread-local update on a timed path would show in its release timings.
 #[cfg(all(test, debug_assertions))]
@@ -157,8 +623,13 @@ thread_local! {
 /// How many tables a snapshot's [`TableRoots`] remembers.
 const SNAPSHOT_TABLES: usize = 32;
 
-/// The tree roots of the tables resolved in one snapshot, shared by every [`RoTxn`] on it
-/// ([`RoTxn::root`]). The snapshot's catalog never changes, so a handle resolved once resolves
+/// A table resolved in a snapshot: its tree's root and, for a dup table, the dup fields of its
+/// record.
+type Resolved = (TreeRoot, Option<DupRecord>);
+
+/// The tree roots (with a dup table's [`DupRecord`]) of the tables resolved in one snapshot,
+/// shared by every [`RoTxn`] on it ([`RoTxn::root`], [`RoTxn::resolved`]). The snapshot's catalog
+/// never changes, so a handle resolved once resolves
 /// the same for the snapshot's life, and each commit publishes a new snapshot with an empty set.
 /// Only a resolved handle is remembered: a refused one is checked again each time. A handle's
 /// slot is the first one from `id % SNAPSHOT_TABLES` on (wrapping) that no other handle holds,
@@ -167,7 +638,7 @@ const SNAPSHOT_TABLES: usize = 32;
 /// transaction created, may carry the same id). Once every slot holds another handle, a handle
 /// resolves through the catalog on each use.
 #[derive(Default)]
-pub(crate) struct TableRoots([OnceLock<(Table, TreeRoot)>; SNAPSHOT_TABLES]);
+pub(crate) struct TableRoots([OnceLock<(Table, TreeRoot, Option<DupRecord>)>; SNAPSHOT_TABLES]);
 
 impl std::fmt::Debug for TableRoots {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -183,23 +654,24 @@ impl TableRoots {
         table.id as usize % SNAPSHOT_TABLES
     }
 
-    /// `table`'s root if its first slot holds it: the hit path of [`RoTxn::root`].
+    /// `table`'s slot if its first slot holds it: the hit path of [`RoTxn::root`] and
+    /// [`RoTxn::resolved`].
     #[inline]
-    fn at_home(&self, table: &Table) -> Option<TreeRoot> {
+    fn at_home(&self, table: &Table) -> Option<&(Table, TreeRoot, Option<DupRecord>)> {
         match self.0[Self::home(table)].get() {
-            Some((known, root)) if known.is(table) => Some(*root),
+            Some(slot) if slot.0.is(table) => Some(slot),
             _ => None,
         }
     }
 
-    /// `table`'s root, or else the first empty slot of its probe (`None`: every slot holds
+    /// `table`'s resolution, or else the first empty slot of its probe (`None`: every slot holds
     /// another handle).
-    fn find(&self, table: &Table) -> std::result::Result<TreeRoot, Option<usize>> {
+    fn find(&self, table: &Table) -> std::result::Result<Resolved, Option<usize>> {
         let home = Self::home(table);
         for i in 0..SNAPSHOT_TABLES {
             let at = (home + i) % SNAPSHOT_TABLES;
             match self.0[at].get() {
-                Some((known, root)) if known.is(table) => return Ok(*root),
+                Some((known, root, dup)) if known.is(table) => return Ok((*root, *dup)),
                 Some(_) => {}
                 None => return Err(Some(at)),
             }
@@ -207,13 +679,13 @@ impl TableRoots {
         Err(None)
     }
 
-    /// Remember `table`'s `root` in the first empty slot from `from` on, the one [`Self::find`]
-    /// gave. A racing reader may take that slot first: for this handle, which ends the search, or
-    /// for another, which moves it to the next.
-    fn remember(&self, from: usize, table: &Table, root: TreeRoot) {
+    /// Remember `table`'s resolution in the first empty slot from `from` on, the one
+    /// [`Self::find`] gave. A racing reader may take that slot first: for this handle, which ends
+    /// the search, or for another, which moves it to the next.
+    fn remember(&self, from: usize, table: &Table, (root, dup): Resolved) {
         for i in 0..SNAPSHOT_TABLES {
             let slot = &self.0[(from + i) % SNAPSHOT_TABLES];
-            if slot.get_or_init(|| (table.clone(), root)).0.is(table) {
+            if slot.get_or_init(|| (table.clone(), root, dup)).0.is(table) {
                 return;
             }
         }
@@ -243,40 +715,78 @@ impl RoTxn {
         op(&self.snapshot).inspect_err(|e| self.inner.latch.latch_error(e))
     }
 
-    /// `table`'s tree root in the snapshot (see [`resolve`]): from the snapshot's
-    /// [`TableRoots`] once a reader on it resolved the handle, else from the catalog
-    /// ([`Self::resolve_root`]).
+    /// The tree root of the plain table `table` in the snapshot (see [`resolve`]): from the
+    /// snapshot's [`TableRoots`] once a reader on it resolved the handle, else from the catalog
+    /// ([`Self::resolve_root`]). A dup table is [`Error::TableKind`]: the root of its outer tree
+    /// is not a tree of the table's rows.
     #[inline]
     fn root(&self, table: &Table) -> Result<TreeRoot> {
         match self.snapshot.tables.at_home(table) {
-            Some(root) => Ok(root),
-            None => self.resolve_root(table),
+            Some((_, root, None)) => Ok(*root),
+            _ => self.resolve_root(table),
         }
     }
 
-    /// [`Self::root`] past the handle's first slot: the rest of its probe, else the catalog,
-    /// whose answer is remembered if it resolved and a slot is free.
+    /// [`Self::root`] past its hit path: [`Self::resolve_table`], then the kind.
     #[inline(never)]
     fn resolve_root(&self, table: &Table) -> Result<TreeRoot> {
+        match self.resolve_table(table)? {
+            (root, None) => Ok(root),
+            (_, Some(_)) => Err(Error::TableKind(table.name().to_string())),
+        }
+    }
+
+    /// `table`'s tree root and, for a dup table, its [`DupRecord`] in the snapshot: [`Self::root`]
+    /// for a table of either kind.
+    #[inline]
+    fn resolved(&self, table: &Table) -> Result<Resolved> {
+        match self.snapshot.tables.at_home(table) {
+            Some((_, root, dup)) => Ok((*root, *dup)),
+            None => self.resolve_table(table),
+        }
+    }
+
+    /// `table`'s resolution past the handle's first slot: the rest of its probe, else the
+    /// catalog, whose answer is remembered if it resolved and a slot is free.
+    #[inline(never)]
+    fn resolve_table(&self, table: &Table) -> Result<Resolved> {
         let tables = &self.snapshot.tables;
         let free = match tables.find(table) {
-            Ok(root) => return Ok(root),
+            Ok(resolved) => return Ok(resolved),
             Err(free) => free,
         };
         #[cfg(all(test, debug_assertions))]
         CATALOG_RESOLVES.with(|n| n.set(n.get() + 1));
         let meta = &self.snapshot.meta;
         let found = catalog::get(&*self.snapshot, &meta.catalog, table.name())?;
-        let root = resolve(found, table, meta.next_table_id)?.root;
+        let record = resolve(found, table, meta.next_table_id)?;
+        let resolved = (record.root, record.dup);
         if let Some(from) = free {
-            tables.remember(from, table, root);
+            tables.remember(from, table, resolved);
         }
-        Ok(root)
+        Ok(resolved)
+    }
+
+    /// [`ReadTxn::get`] past its hit path (a plain table in its first slot, read from the slot
+    /// with no copy of the resolution): the handle resolved, then the get of its kind.
+    #[inline(never)]
+    fn get_past_home<'t>(&'t self, table: &Table, key: &[u8]) -> Result<Option<&'t [u8]>> {
+        match self.resolved(table)? {
+            (root, None) => read::get(&*self.snapshot, &root, key),
+            (outer, Some(dup)) => dup_get(&*self.snapshot, table, &outer, &dup, key),
+        }
+    }
+
+    /// Test-only: every row of the dup table `table` in this snapshot, checked ([`dup_rows`]).
+    #[cfg(test)]
+    pub(crate) fn dup_rows_for_test(&self, table: &Table) -> Vec<(Vec<u8>, Vec<u8>)> {
+        let (outer, dup) = self.resolved(table).expect("the table resolves");
+        dup_rows(&*self.snapshot, &outer, &dup.expect("a dup table"), |_| None)
     }
 
     /// A new, unset cursor over `table` that owns a share of this transaction (see
     /// [`RoCursor`]): it has no lifetime, and keeps the snapshot readable after every other
-    /// handle of the transaction drops.
+    /// handle of the transaction drops. [`Error::TableKind`] for a dup table.
     #[inline]
     pub fn cursor_owned(self: &Arc<Self>, table: &Table) -> Result<RoCursor> {
         let root = self.read(|_| self.root(table))?;
@@ -483,7 +993,10 @@ impl ReadTxn for RoTxn {
     }
 
     fn get<'t>(&'t self, table: &Table, key: &[u8]) -> Result<Option<&'t [u8]>> {
-        self.read(|s| read::get(s, &self.root(table)?, key))
+        self.read(|s| match self.snapshot.tables.at_home(table) {
+            Some((_, root, None)) => read::get(s, root, key),
+            _ => self.get_past_home(table, key),
+        })
     }
 
     fn cursor<'t>(&'t self, table: &Table) -> Result<Cursor<'t>> {
@@ -496,7 +1009,7 @@ impl ReadTxn for RoTxn {
     }
 
     fn table_stat(&self, table: &Table) -> Result<TableStat> {
-        self.read(|_| Ok(TableStat::of(&self.root(table)?)))
+        self.read(|_| self.resolved(table).map(|(root, dup)| TableStat::of(&root, dup.as_ref())))
     }
 }
 
@@ -506,9 +1019,9 @@ impl ReadTxn for RoTxn {
 ///
 /// Any I/O error, growth failure or damage met by an operation latches the environment: that
 /// operation returns the error, and every later write and commit returns [`Error::Failed`].
-/// Validation errors ([`Error::KeyTooLarge`], [`Error::ValueTooLarge`],
-/// [`Error::AppendOutOfOrder`], [`Error::KeyExists`], table errors) change nothing and do not
-/// latch.
+/// Validation errors ([`Error::KeyTooLarge`], [`Error::KeyTooShort`], [`Error::ValueTooLarge`],
+/// [`Error::AppendOutOfOrder`], [`Error::KeyExists`], table errors, [`Error::TableKind`],
+/// [`Error::InvalidDupOptions`]) change nothing and do not latch.
 pub struct RwTxn {
     inner: Arc<EnvInner>,
     work: Work,
@@ -573,6 +1086,9 @@ struct Working {
     /// The write stamp of its last change ([`Work::set_record`]; 0: unchanged in this
     /// transaction). A [`TxnCursor`] that saw another stamp finds its place again.
     writes: u64,
+    /// A dup table's working map ([`NestedMap`]; empty for a plain table, and `BTreeMap::new`
+    /// allocates nothing).
+    nested: NestedMap,
 }
 
 impl Working {
@@ -584,6 +1100,7 @@ impl Working {
             cache: write::PathCache::default(),
             changed: false,
             writes: 0,
+            nested: NestedMap::new(),
         }
     }
 }
@@ -617,6 +1134,59 @@ impl Work {
             Some(w) => Ok(w.record),
             None => resolve(self.lookup(table.name())?, table, self.next_table_id),
         }
+    }
+
+    /// The nested root of outer key `k` in the dup table `table` whose working outer root is
+    /// `outer`, for a read: the working map's entry, else the key's cell ([`load_cell`]); `None`
+    /// when the key has no cell. A table with no working record has no map: its cells are
+    /// committed.
+    fn nested_root(&self, table: &Table, outer: &TreeRoot, k: &[u8]) -> Result<Option<TreeRoot>> {
+        let working = self.tables.iter().find(|w| w.table == *table);
+        if let Some(n) = working.and_then(|w| w.nested.get(k)) {
+            return Ok(Some(n.root));
+        }
+        let writer = self.writer();
+        match outer_cell(writer, table, outer, k)? {
+            None => Ok(None),
+            Some(b) => load_cell(writer, table, k, b).map(Some),
+        }
+    }
+
+    /// `table`'s working root for a plain cursor: [`Error::TableKind`] for a dup table.
+    fn plain_root(&self, table: &Table) -> Result<TreeRoot> {
+        let record = self.record(table)?;
+        match record.dup {
+            None => Ok(record.root),
+            Some(_) => Err(Error::TableKind(table.name().to_string())),
+        }
+    }
+
+    /// Open the table `name`, creating it (empty, with a new id) if it does not exist: a plain
+    /// table, or with `dup` a dup table of that shape. An existing table of the other kind, or a
+    /// dup table of other options, is [`Error::TableKind`], changing nothing.
+    fn create(&mut self, name: &str, dup: Option<DupOptions>) -> Result<Table> {
+        if let Some(record) = self.lookup(name)? {
+            return if record.dup.map(|d| d.options()) == dup {
+                Ok(Table::new(record.id, name))
+            } else {
+                Err(Error::TableKind(name.to_string()))
+            };
+        }
+        let id = self.next_table_id;
+        self.next_table_id = id
+            .checked_add(1)
+            .ok_or_else(|| Error::Failed("every table id has been used".to_string()))?;
+        let record = match dup {
+            None => TableRecord::new(id, self.txn),
+            Some(options) => TableRecord::new_dup(id, self.txn, options),
+        };
+        let (writer, catalog, trusted) = self.catalog_mut();
+        catalog::put(writer, catalog, trusted, name, &record)?;
+        self.changed = true;
+        self.schema += 1;
+        let table = Table::new(id, name);
+        self.tables.push(Working::new(table.clone(), record));
+        Ok(table)
     }
 
     /// The index in [`Self::tables`] of `table`'s working record (see [`resolve`]), added if
@@ -659,10 +1229,65 @@ impl Work {
         self.changed = true;
     }
 
+    /// [`Self::set_record`] after a dup write, which moved the table's totals in place: debug
+    /// builds check that the record the commit writes still decodes.
+    fn set_dup_record(&mut self, i: usize, root: TreeRoot, trusted: bool) {
+        self.set_record(i, root, trusted);
+        debug_assert_eq!(
+            self.tables[i].record.dup.and_then(|d| d.broken_rule(&root)),
+            None,
+            "dup table {}: the working record breaks a record rule",
+            self.tables[i].table.name()
+        );
+    }
+
+    /// Write the changed nested roots of the dup table at `i` in [`Self::tables`] into their
+    /// outer cells, in key order: commit's first step. A cell replaced with a cell of the same
+    /// size changes its leaf in place, so a published outer path is copied once and the keys of
+    /// one leaf then hit the outer path cache.
+    fn flush_nested(&mut self, i: usize) -> Result<()> {
+        let (writer, w) = self.writer_and_table(i);
+        let (mut outer, mut trusted) = (w.record.root, w.trusted);
+        let mut flushed = false;
+        for (k, n) in w.nested.iter_mut().filter(|(_, n)| n.changed) {
+            let placed = write::put_outer_cell(
+                writer,
+                &mut outer,
+                &mut trusted,
+                &mut w.cache,
+                k,
+                &n.root,
+                PutKind::Upsert,
+            )?;
+            if !placed.replaced {
+                return Err(Error::Failed(format!(
+                    "dup table {}: the working root of key {k:02x?} had no outer cell",
+                    w.table.name()
+                )));
+            }
+            n.changed = false;
+            flushed = true;
+        }
+        #[cfg(debug_assertions)]
+        for (k, n) in &w.nested {
+            let cell = outer_cell(&*writer, &w.table, &outer, k).ok().flatten();
+            assert_eq!(cell, Some(&n.root.encode()), "the flushed outer cell of key {k:02x?}");
+        }
+        if flushed {
+            self.set_record(i, outer, trusted);
+        }
+        Ok(())
+    }
+
     /// Commit steps 1–7 (see the env module docs): the changed tables' roots into the catalog,
     /// the free list's save, the new meta, the pages' CRCs, the durable steps (or their deferral),
     /// and publication.
     fn commit(&mut self, inner: &EnvInner) -> Result<u64> {
+        for i in 0..self.tables.len() {
+            if !self.tables[i].nested.is_empty() {
+                self.flush_nested(i)?;
+            }
+        }
         let mut dirty: Vec<_> = std::mem::take(&mut self.tables)
             .into_iter()
             .filter_map(|w| w.changed.then_some((w.table.name, w.record)))
@@ -749,35 +1374,46 @@ impl RwTxn {
     }
 
     /// Open the table named `name`, creating it (empty, with a new id) if it does not exist.
-    /// [`Error::InvalidTableName`] unless the name is 1..=255 bytes.
+    /// [`Error::InvalidTableName`] unless the name is 1..=255 bytes; [`Error::TableKind`] if `name`
+    /// is a dup table.
     pub fn create_table(&mut self, name: &str) -> Result<Table> {
         catalog::check_name(name)?;
-        self.write(|work| {
-            if let Some(record) = work.lookup(name)? {
-                return Ok(Table::new(record.id, name));
-            }
-            let id = work.next_table_id;
-            work.next_table_id = id
-                .checked_add(1)
-                .ok_or_else(|| Error::Failed("every table id has been used".to_string()))?;
-            let record = TableRecord::new(id, work.txn);
-            let (writer, catalog, trusted) = work.catalog_mut();
-            catalog::put(writer, catalog, trusted, name, &record)?;
-            work.changed = true;
-            work.schema += 1;
-            let table = Table::new(id, name);
-            work.tables.push(Working::new(table.clone(), record));
-            Ok(table)
-        })
+        self.write(|work| work.create(name, None))
+    }
+
+    /// Open the dup table `name`, creating it (empty, new id) if it does not exist: every key of
+    /// the table is `k ‖ s`, an outer key `k` of exactly `options.key_len` bytes and a subkey `s`
+    /// of at least one byte. [`Error::InvalidTableName`] unless the name is 1..=255 bytes;
+    /// [`Error::InvalidDupOptions`] unless `options.packed_max` is 0 and `options.key_len` is at
+    /// least 1 and leaves the outer cell (the key and a 32-byte nested root) an inline entry with
+    /// room for a 1-byte subkey (975 bytes at 4 KiB pages); [`Error::TableKind`] if `name` is a
+    /// plain table or a dup table of other options. Each refusal changes nothing and does not
+    /// latch.
+    pub fn create_dup_table(&mut self, name: &str, options: DupOptions) -> Result<Table> {
+        catalog::check_name(name)?;
+        options.check(&self.inner.geometry)?;
+        self.write(|work| work.create(name, Some(options)))
     }
 
     /// Drop `table`: its pages are freed and its name removed from the catalog. Every handle of
-    /// it is stale from now on.
+    /// it is stale from now on. A dup table's nested trees are freed with it, in one walk that
+    /// collects every page first: damage (a page reached twice, an outer cell that is not a
+    /// nested tree, totals that do not count the trees) is [`Error::Corrupt`] and frees nothing.
     pub fn drop_table(&mut self, table: Table) -> Result<()> {
         self.write(|work| {
             let record = work.record(&table)?;
             let trusted = work.tables.iter().any(|w| w.table == table && w.trusted);
-            write::free_subtree(work.writer_mut(), &record.root, trusted)?;
+            match &record.dup {
+                None => write::free_subtree(work.writer_mut(), &record.root, trusted)?,
+                Some(dup) => {
+                    // A table with no working record has no map: its cells are committed.
+                    let empty = NestedMap::new();
+                    let working = work.tables.iter().find(|w| w.table == table);
+                    let map = working.map_or(&empty, |w| &w.nested);
+                    let writer = work.writer.as_deref_mut().expect("a live write transaction");
+                    free_dup_table(writer, &table, &record.root, trusted, dup, map)?;
+                }
+            }
             let (writer, catalog, trusted) = work.catalog_mut();
             if !catalog::delete(writer, catalog, trusted, table.name())? {
                 return Err(Error::Failed(format!(
@@ -792,12 +1428,22 @@ impl RwTxn {
         })
     }
 
-    /// Remove every entry of `table` (its pages are freed; the table stays).
+    /// Remove every entry of `table` (its pages are freed; the table stays). A dup table's nested
+    /// trees are freed as by [`Self::drop_table`], and it stays a dup table of the same options.
     pub fn clear_table(&mut self, table: &Table) -> Result<()> {
         self.write(|work| {
             let i = work.working(table)?;
             let (mut root, trusted) = (work.tables[i].record.root, work.tables[i].trusted);
             if root.is_empty() {
+                return Ok(());
+            }
+            if let Some(dup) = work.tables[i].record.dup {
+                let (writer, w) = work.writer_and_table(i);
+                free_dup_table(writer, &w.table, &root, trusted, &dup, &w.nested)?;
+                w.nested.clear();
+                let (key_len, packed_max) = (dup.key_len, dup.packed_max);
+                w.record.dup = Some(DupRecord { key_len, packed_max, ..DupRecord::default() });
+                work.set_dup_record(i, TreeRoot::EMPTY, false);
                 return Ok(());
             }
             write::clear(work.writer_mut(), &mut root, trusted)?;
@@ -809,6 +1455,11 @@ impl RwTxn {
     /// Store `value` under `key` in `table`, replacing any value there. An entry over the page
     /// size's limits is refused first ([`Error::KeyTooLarge`], [`Error::ValueTooLarge`]; see
     /// `Env::max_key_len` and `Env::max_value_len`), changing nothing.
+    ///
+    /// In a dup table `key` is the logical key `k ‖ s` (see [`Self::create_dup_table`]): the
+    /// limits above apply to the whole key, so a dup table refuses exactly the entries a plain
+    /// table keyed `k ‖ s` refuses, and a key with no subkey (at most `key_len` bytes) is then
+    /// [`Error::KeyTooShort`]. The row goes into `k`'s nested tree, which a new `k` creates.
     pub fn put(&mut self, table: &Table, key: &[u8], value: &[u8]) -> Result<()> {
         self.put_entry(table, key, value, PutKind::Upsert, None).map(drop)
     }
@@ -821,6 +1472,11 @@ impl RwTxn {
     /// allocated or freed; any other append descends. A refused append
     /// ([`Error::AppendOutOfOrder`], [`Error::KeyTooLarge`], [`Error::ValueTooLarge`]) changes
     /// nothing and does not fail the environment.
+    ///
+    /// In a dup table the order is the logical key's, `k ‖ s` (every outer key has the same
+    /// width): a `k` before the table's last outer key is refused, the last one appends to its
+    /// nested tree (a subkey not past that tree's last is refused), and a later one starts a new
+    /// nested tree. A key with no subkey is [`Error::KeyTooShort`].
     pub fn append(&mut self, table: &Table, key: &[u8], value: &[u8]) -> Result<()> {
         self.put_entry(table, key, value, PutKind::Append, None).map(drop)
     }
@@ -828,7 +1484,8 @@ impl RwTxn {
     /// Store `value` under `key` in `table` only if the table does not hold `key`: a present key is
     /// [`Error::KeyExists`], found by the put's own search (in the table's cached leaf, else after
     /// its descent) and refused before anything changes, with no latch. A new key is stored exactly
-    /// as [`Self::put`] stores it.
+    /// as [`Self::put`] stores it. In a dup table `key` is the logical key `k ‖ s`: a present
+    /// subkey under `k` is [`Error::KeyExists`], and a key with no subkey [`Error::KeyTooShort`].
     pub fn insert(&mut self, table: &Table, key: &[u8], value: &[u8]) -> Result<()> {
         self.put_entry(table, key, value, PutKind::Insert, None).map(drop)
     }
@@ -848,6 +1505,14 @@ impl RwTxn {
         self.inner.geometry.place(key.len(), value.len())?;
         self.write(|work| {
             let i = work.working(table)?;
+            if work.tables[i].record.dup.is_some() {
+                // No plain cursor exists on a dup table (its constructors refuse one).
+                debug_assert!(cursor.is_none(), "a plain cursor's put into a dup table");
+                if cursor.is_some() {
+                    return Err(Error::TableKind(table.name().to_string()));
+                }
+                return dup_put(work, i, key, value, kind).map(|()| false);
+            }
             let (writer, w) = work.writer_and_table(i);
             let (mut root, mut trusted) = (w.record.root, w.trusted);
             // Test-only: an emptied cache per put, so every put descends.
@@ -874,6 +1539,10 @@ impl RwTxn {
     /// Remove `key` from `table`, returning whether it was there. A page the delete leaves under
     /// a quarter full absorbs same-parent siblings that fit, and the parents that lose a cell get
     /// the same test, up the tree.
+    ///
+    /// In a dup table `key` is the logical key `k ‖ s`: a key with no subkey is
+    /// [`Error::KeyTooShort`] (use [`Self::delete_prefix`] for every row of `k`), and a delete
+    /// that empties `k`'s nested tree removes `k` from the outer tree.
     pub fn delete(&mut self, table: &Table, key: &[u8]) -> Result<bool> {
         Ok(self.delete_entry(table, key)?.found)
     }
@@ -884,6 +1553,9 @@ impl RwTxn {
     fn delete_entry(&mut self, table: &Table, key: &[u8]) -> Result<write::Removed> {
         self.write(|work| {
             let i = work.working(table)?;
+            if work.tables[i].record.dup.is_some() {
+                return dup_delete(work, i, key);
+            }
             let (writer, w) = work.writer_and_table(i);
             let (mut root, mut trusted) = (w.record.root, w.trusted);
             // Test-only: an emptied cache per delete, so every delete descends, and no slot, so a
@@ -904,11 +1576,28 @@ impl RwTxn {
         })
     }
 
+    /// Remove every row of the dup table `table` whose key starts with the outer key `key`
+    /// (exactly the table's `key_len` bytes), returning the rows removed (0: no such key, and
+    /// nothing changes). The key's nested tree is freed in one walk that collects every page and
+    /// run before any is freed, and its outer cell removed. [`Error::TableKind`] for a plain
+    /// table; [`Error::KeyTooShort`] for a key shorter than `key_len`, [`Error::KeyTooLarge`] for
+    /// a longer one; each refusal changes nothing and does not latch.
+    pub fn delete_prefix(&mut self, table: &Table, key: &[u8]) -> Result<u64> {
+        self.write(|work| {
+            let i = work.working(table)?;
+            if work.tables[i].record.dup.is_none() {
+                return Err(Error::TableKind(table.name().to_string()));
+            }
+            dup_delete_prefix(work, i, key)
+        })
+    }
+
     /// A new, unset cursor over `table` that can also write: the moves of a [`Cursor`] over this
     /// transaction's working state, plus [`RwCursor::put`], [`RwCursor::append`] and
     /// [`RwCursor::delete_current`]. It holds the transaction until it is dropped.
+    /// [`Error::TableKind`] for a dup table.
     pub fn cursor_mut(&mut self, table: &Table) -> Result<RwCursor<'_>> {
-        let root = self.read(|work| Ok(work.record(table)?.root))?;
+        let root = self.read(|work| work.plain_root(table))?;
         Ok(RwCursor {
             txn: self,
             table: table.clone(),
@@ -922,9 +1611,10 @@ impl RwTxn {
     /// A new, unset cursor over `table` that holds no borrow of this transaction (see
     /// [`TxnCursor`]): each call takes the transaction, `&self` for a move and `&mut self` for a
     /// write, so several cursors and the transaction's own `put` and `delete` can interleave, each
-    /// seeing the others' writes.
+    /// seeing the others' writes. [`Error::TableKind`] for a dup table.
     pub fn cursor_detached(&self, table: &Table) -> Result<TxnCursor> {
         self.read(|work| {
+            let root = work.plain_root(table)?;
             let mut cursor = TxnCursor {
                 table: table.clone(),
                 serial: work.serial,
@@ -932,7 +1622,7 @@ impl RwTxn {
                 slot: None,
                 scanned: usize::MAX,
                 writes: 0,
-                root: work.record(table)?.root,
+                root,
                 tree: TreeCursor::default(),
                 key: Vec::new(),
                 deleted: false,
@@ -974,6 +1664,32 @@ impl RwTxn {
     pub fn abort(self) {
         drop(self);
     }
+
+    /// Test-only: every row of the dup table `table` in the working state, each nested root from
+    /// the working map else from its cell, checked ([`dup_rows`]).
+    #[cfg(test)]
+    pub(crate) fn dup_rows_for_test(&self, table: &Table) -> Vec<(Vec<u8>, Vec<u8>)> {
+        let record = self.work.record(table).expect("the table resolves");
+        let working = self.work.tables.iter().find(|w| w.table == *table);
+        let entry = |k: &[u8]| working.and_then(|w| w.nested.get(k)).map(|n| n.root);
+        dup_rows(self.work.writer(), &record.root, &record.dup.expect("a dup table"), entry)
+    }
+
+    /// Test-only: the write stamp of `table`'s last change in this transaction
+    /// ([`Working::writes`]; 0: none).
+    #[cfg(test)]
+    pub(crate) fn table_writes(&self, table: &Table) -> u64 {
+        self.work.tables.iter().find(|w| w.table == *table).map_or(0, |w| w.writes)
+    }
+
+    /// Test-only: drop outer key `k`'s entry from the dup table `table`'s working map, changing
+    /// nothing else (so its cell may name a superseded root, or a page private to this
+    /// transaction); true if there was one.
+    #[cfg(test)]
+    pub(crate) fn forget_nested(&mut self, table: &Table, k: &[u8]) -> bool {
+        let working = self.work.tables.iter_mut().find(|w| w.table == *table);
+        working.is_some_and(|w| w.nested.remove(k).is_some())
+    }
 }
 
 impl Drop for RwTxn {
@@ -992,11 +1708,17 @@ impl ReadTxn for RwTxn {
     }
 
     fn get<'t>(&'t self, table: &Table, key: &[u8]) -> Result<Option<&'t [u8]>> {
-        self.read(|work| read::get(work.writer(), &work.record(table)?.root, key))
+        self.read(|work| {
+            let record = work.record(table)?;
+            match record.dup {
+                None => read::get(work.writer(), &record.root, key),
+                Some(dup) => dup_get_in_txn(work, table, &record.root, &dup, key),
+            }
+        })
     }
 
     fn cursor<'t>(&'t self, table: &Table) -> Result<Cursor<'t>> {
-        let root = self.read(|work| Ok(work.record(table)?.root))?;
+        let root = self.read(|work| work.plain_root(table))?;
         Ok(Cursor::new(self.work.writer(), root, &self.inner.latch))
     }
 
@@ -1005,7 +1727,7 @@ impl ReadTxn for RwTxn {
     }
 
     fn table_stat(&self, table: &Table) -> Result<TableStat> {
-        self.read(|work| Ok(TableStat::of(&work.record(table)?.root)))
+        self.read(|work| work.record(table).map(|r| TableStat::of(&r.root, r.dup.as_ref())))
     }
 }
 

@@ -17,13 +17,24 @@ pub enum Error {
     /// file is reopened.
     #[error("tndb-b: environment failed: {0}")]
     Failed(String),
-    /// A key longer than the page size allows.
+    /// A key longer than the page size allows, or an outer key passed to
+    /// [`crate::RwTxn::delete_prefix`] longer than its dup table's `key_len`.
     #[error("tndb-b: key of {len} bytes exceeds the maximum of {max}")]
     KeyTooLarge {
         /// The key's length.
         len: usize,
-        /// The largest key this page size allows.
+        /// The largest key this page size (or this dup table's outer key width) allows.
         max: usize,
+    },
+    /// A key too short for its dup table: a point operation's key with no subkey (at most
+    /// `key_len` bytes), or an outer key passed to [`crate::RwTxn::delete_prefix`] shorter than
+    /// `key_len`. It is refused before anything changes and does not latch.
+    #[error("tndb-b: key of {len} bytes is shorter than the minimum of {min}")]
+    KeyTooShort {
+        /// The key's length.
+        len: usize,
+        /// The shortest key the call accepts for this table.
+        min: usize,
     },
     /// A value longer than a table accepts with its key: 16 MiB (in an overflow run) for a key
     /// that leaves room for the run's reference in its leaf, else what the leaf holds
@@ -52,6 +63,16 @@ pub enum Error {
     /// handle was obtained.
     #[error("tndb-b: table handle {0:?} is stale")]
     StaleTable(String),
+    /// A call that needs the other kind of table: [`crate::RwTxn::create_table`] on a dup table,
+    /// [`crate::RwTxn::create_dup_table`] on a plain table or on a dup table of other options, a
+    /// plain cursor on a dup table, or [`crate::RwTxn::delete_prefix`] on a plain table. It
+    /// changes nothing and does not latch.
+    #[error("tndb-b: table {0:?} is of the other kind for this call")]
+    TableKind(String),
+    /// [`crate::DupOptions`] this build does not accept (see [`crate::RwTxn::create_dup_table`]).
+    /// It changes nothing and does not latch.
+    #[error("tndb-b: invalid dup table options: {0}")]
+    InvalidDupOptions(String),
     /// A table name that is empty or longer than 255 bytes.
     #[error("tndb-b: invalid table name (must be 1..=255 bytes)")]
     InvalidTableName,

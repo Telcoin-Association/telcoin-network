@@ -53,11 +53,14 @@ impl Latch {
             Error::Corrupt(cause) => self.fail_damaged(cause.clone()),
             Error::Io(_) | Error::Failed(_) => self.fail(error.to_string()),
             Error::KeyTooLarge { .. }
+            | Error::KeyTooShort { .. }
             | Error::ValueTooLarge { .. }
             | Error::AppendOutOfOrder
             | Error::KeyExists
             | Error::TableNotFound(_)
             | Error::StaleTable(_)
+            | Error::TableKind(_)
+            | Error::InvalidDupOptions(_)
             | Error::InvalidTableName
             | Error::NotTndbB
             | Error::UnsupportedVersion(_)

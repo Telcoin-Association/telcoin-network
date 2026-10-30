@@ -3,12 +3,15 @@
 //! `2..page_count` is either reachable from exactly one tree, once, or listed exactly once by the
 //! free list. Each tree's root must count the entries and the pages of each kind the walk finds.
 //! Every overflow run a leaf names is checked as a read checks it, plus the full CRC of every run
-//! (a 1-page one too) and its zero pad, and its pages count as its table's.
+//! (a 1-page one too) and its zero pad, and its pages count as its table's. A dup table's outer
+//! tree holds one nested cell per outer key of the table's width; each nested tree is walked as
+//! a plain one, under the table's name, and the record's nested totals must be the sums of the
+//! nested roots' counters (`Checker::walk_dup`).
 
 use std::collections::BTreeMap;
 
 use crate::{
-    catalog::{self, TableRecord},
+    catalog::{self, DupRecord, TableRecord},
     crc::{self, CrcState},
     env::Snapshot,
     error::{Error, Result},
@@ -53,6 +56,17 @@ pub struct TableCheck {
 /// Who uses a page: index into [`Checker::owners`] (0: nothing).
 type Owner = u32;
 
+/// What the leaves of a walked tree may hold.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Leaves {
+    /// Inline values and overflow runs: a nested cell is [`Error::Corrupt`]. The catalog, the
+    /// free tree, a plain table's tree and a dup table's nested trees.
+    Plain,
+    /// A dup table's outer tree: nested cells, which the entry callback checks (an inline cell
+    /// is its refusal), and no overflow cell.
+    DupOuter,
+}
+
 /// The page walk's state: who uses each page, and every page claimed twice.
 struct Checker<'s> {
     snapshot: &'s Snapshot,
@@ -80,14 +94,16 @@ impl Checker<'_> {
         true
     }
 
-    /// Walk the tree `root` names for `owner`, checking every page and passing each leaf entry
-    /// to `entry`. Returns the tree's page count. A page claimed already is noted and not
-    /// descended into. A root whose entry count or page counters differ from what the walk found
-    /// is [`Error::Corrupt`] (unless a page was claimed twice: the accounting reports that).
+    /// Walk the tree `root` names for `owner`, checking every page, holding its leaves to
+    /// `policy` and passing each leaf entry to `entry`. Returns the tree's page count. A page
+    /// claimed already is noted and not descended into. A root whose entry count or page
+    /// counters differ from what the walk found is [`Error::Corrupt`] (unless a page was
+    /// claimed twice: the accounting reports that).
     fn walk(
         &mut self,
         root: &TreeRoot,
         owner: Owner,
+        policy: Leaves,
         mut entry: impl FnMut(&mut Self, &[u8], Val<'_>) -> Result<()>,
     ) -> Result<u64> {
         root.check()?;
@@ -133,6 +149,16 @@ impl Checker<'_> {
                 entries += n as u64;
                 for i in 0..n {
                     let (k, v) = page::leaf_entry(page, i)?;
+                    if let (Leaves::DupOuter, Val::Overflow(ovf)) = (policy, v) {
+                        return Err(corrupt(
+                            p,
+                            format!(
+                                "holds an overflow cell in a dup table's outer tree (a \
+                                 reference to run {})",
+                                ovf.pgno
+                            ),
+                        ));
+                    }
                     entry(self, k, v).map_err(|e| corrupt(p, e.to_string()))?;
                     match v {
                         Val::Inline(_) => {}
@@ -141,9 +167,10 @@ impl Checker<'_> {
                                 .claim_run(ovf, owner)
                                 .map_err(|e| corrupt(p, e.to_string()))?;
                         }
-                        Val::Nested(root) => {
+                        Val::Nested(root) if policy == Leaves::Plain => {
                             return Err(corrupt(p, page::nested_error(root).to_string()));
                         }
+                        Val::Nested(_) => {}
                     }
                 }
                 continue;
@@ -190,6 +217,90 @@ impl Checker<'_> {
         Ok(branches + leaves + overflows)
     }
 
+    /// Walk a dup table's outer tree `root` and every nested tree its cells name, all for `owner`
+    /// (so a page any two of them name is claimed twice), then hold the record `dup` to the
+    /// trees found. Each outer key is `dup.key_len` bytes and each cell nested; each nested tree
+    /// passes the walk of a plain tree (its pages, its counters against them, its runs), with
+    /// subkeys of 1 byte up to the table's widest. Unless a page was claimed twice (the page
+    /// accounting reports that), the record's nested totals are the sums of the nested roots'
+    /// counters, there is one nested tree per outer entry and no packed row; any other figure is
+    /// [`Error::Corrupt`], naming the field.
+    fn walk_dup(&mut self, root: &TreeRoot, dup: &DupRecord, owner: Owner) -> Result<TableCheck> {
+        let width = usize::from(dup.key_len);
+        let max_subkey = self.snapshot.geometry.max_key().saturating_sub(width);
+        // The nested roots' counters, summed: [trees, entries, branch, leaf, overflow pages].
+        let mut sums = [0_u64; 5];
+        let mut nested_pages = 0;
+        let outer_pages = self.walk(root, owner, Leaves::DupOuter, |checker, k, v| {
+            if k.len() != width {
+                return Err(Error::Corrupt(format!(
+                    "outer key of {} bytes in a table of width {width}",
+                    k.len()
+                )));
+            }
+            let Val::Nested(cell) = v else {
+                return Err(Error::Corrupt(
+                    "a cell that is not nested in a dup table's outer tree, which nests every key"
+                        .to_string(),
+                ));
+            };
+            let in_key = |e: Error| match e {
+                Error::Corrupt(m) => Error::Corrupt(format!("key {}: {m}", hex(k))),
+                other => other,
+            };
+            let nested = TreeRoot::decode(cell).map_err(in_key)?;
+            nested_pages += checker
+                .walk(&nested, owner, Leaves::Plain, |_, subkey, _| {
+                    if (1..=max_subkey).contains(&subkey.len()) {
+                        Ok(())
+                    } else {
+                        Err(Error::Corrupt(format!(
+                            "subkey of {} bytes, not 1 to {max_subkey}",
+                            subkey.len()
+                        )))
+                    }
+                })
+                .map_err(in_key)?;
+            let counters = [
+                1,
+                nested.entries,
+                u64::from(nested.branch_pages),
+                u64::from(nested.leaf_pages),
+                u64::from(nested.overflow_pages),
+            ];
+            for (sum, n) in sums.iter_mut().zip(counters) {
+                *sum = sum.saturating_add(n);
+            }
+            Ok(())
+        })?;
+        if self.twice.is_empty() {
+            let [trees, entries, branches, leaves, overflows] = sums;
+            let fields = [
+                ("nested_trees", trees, u64::from(dup.nested_trees)),
+                ("nested_entries", entries, dup.nested_entries),
+                ("nested_branch_pages", branches, u64::from(dup.nested_branch_pages)),
+                ("nested_leaf_pages", leaves, u64::from(dup.nested_leaf_pages)),
+                ("nested_overflow_pages", overflows, u64::from(dup.nested_overflow_pages)),
+                ("packed_rows", 0, dup.packed_rows),
+                ("outer entries", trees, root.entries),
+            ];
+            for (field, found, recorded) in fields {
+                if found != recorded {
+                    return Err(Error::Corrupt(format!(
+                        "check: {}: {field} {found} in its trees, not the {recorded} its record \
+                         counts",
+                        self.owners[owner as usize]
+                    )));
+                }
+            }
+        }
+        Ok(TableCheck {
+            entries: dup.nested_entries.saturating_add(dup.packed_rows),
+            pages: outer_pages + nested_pages,
+            height: root.height,
+        })
+    }
+
     /// Check the overflow run `ovf` names as a read does, plus its full CRC even for a 1-page run
     /// ([`RunCrc::Always`]) and its zero pad, then claim each of its pages for `owner`. Returns
     /// its page count.
@@ -219,12 +330,12 @@ pub(crate) fn check_snapshot(snapshot: &Snapshot) -> Result<CheckReport> {
         CheckReport { txn_id: meta.txn, page_count: meta.page_count, ..Default::default() };
 
     let mut tables: Vec<(String, TableRecord)> = Vec::new();
-    report.catalog_pages = checker.walk(&meta.catalog, CATALOG, |_, k, v| {
+    report.catalog_pages = checker.walk(&meta.catalog, CATALOG, Leaves::Plain, |_, k, v| {
         let name = std::str::from_utf8(k)
             .map_err(|_| Error::Corrupt("a table name is not UTF-8".to_string()))?;
         catalog::check_name(name)
             .map_err(|_| Error::Corrupt(format!("bad table name {name:?}")))?;
-        let record = *TableRecord::decode(v.inline()?)?.plain()?;
+        let record = *TableRecord::decode(v.inline()?)?.usable(&snapshot.geometry)?;
         if record.id >= meta.next_table_id || record.created_txn > meta.txn {
             return Err(Error::Corrupt(format!(
                 "table {name:?} has an impossible record {record:?}"
@@ -242,27 +353,31 @@ pub(crate) fn check_snapshot(snapshot: &Snapshot) -> Result<CheckReport> {
     for (name, record) in tables {
         let owner = checker.owners.len() as Owner;
         checker.owners.push(format!("table {name:?}"));
-        let pages = checker.walk(&record.root, owner, |_, _, _| Ok(()))?;
-        report.table_pages += pages;
-        report.tables.insert(
-            name,
-            TableCheck { entries: record.root.entries, pages, height: record.root.height },
-        );
+        let table = match &record.dup {
+            None => {
+                let pages = checker.walk(&record.root, owner, Leaves::Plain, |_, _, _| Ok(()))?;
+                TableCheck { entries: record.root.entries, pages, height: record.root.height }
+            }
+            Some(dup) => checker.walk_dup(&record.root, dup, owner)?,
+        };
+        report.table_pages += table.pages;
+        report.tables.insert(name, table);
     }
 
     let (mut free_pages, mut free_records) = (0, 0);
-    report.free_tree_pages = checker.walk(&meta.free, FREE_TREE, |checker, k, v| {
-        let key = RecordKey::decode(k)?;
-        if key.txn > meta.txn {
-            return Err(Error::Corrupt(format!("record {key:?} is later than the state")));
-        }
-        free_records += 1;
-        for p in decode_pages(v.inline()?, meta.page_count)? {
-            free_pages += 1;
-            checker.claim(p, FREE_LIST);
-        }
-        Ok(())
-    })?;
+    report.free_tree_pages =
+        checker.walk(&meta.free, FREE_TREE, Leaves::Plain, |checker, k, v| {
+            let key = RecordKey::decode(k)?;
+            if key.txn > meta.txn {
+                return Err(Error::Corrupt(format!("record {key:?} is later than the state")));
+            }
+            free_records += 1;
+            for p in decode_pages(v.inline()?, meta.page_count)? {
+                free_pages += 1;
+                checker.claim(p, FREE_LIST);
+            }
+            Ok(())
+        })?;
     report.free_pages = free_pages;
     report.free_records = free_records;
 
@@ -284,6 +399,11 @@ pub(crate) fn check_snapshot(snapshot: &Snapshot) -> Result<CheckReport> {
         page_runs(&leaked),
         twice.join(", ")
     )))
+}
+
+/// `bytes` in hex, for a message.
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// `pages` (ascending) as compact runs: `[2, 5..8]`.

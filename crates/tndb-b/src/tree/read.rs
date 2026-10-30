@@ -207,6 +207,54 @@ pub(crate) fn find<'s, S: PageRead + ?Sized>(
     }
 }
 
+/// The last key of the tree `root` names (`None` for the empty tree): the rightmost descent, with
+/// [`descend`]'s checks of every page, to the last leaf, whose last key must lie inside the range
+/// its ancestors' separators give it (a misrouted pointer to another leaf of the tree is
+/// [`Error::Corrupt`], not a wrong key). An append's order rule over a dup table's outer keys
+/// asks it.
+pub(crate) fn last_key<'s, S: PageRead + ?Sized>(
+    store: &'s S,
+    root: &TreeRoot,
+) -> Result<Option<&'s [u8]>> {
+    root.check()?;
+    if root.is_empty() {
+        return Ok(None);
+    }
+    let (mut pgno, mut want_txn) = (root.root, root.root_txn);
+    let (mut lo, mut hi): (Option<&'s [u8]>, Option<&'s [u8]>) = (None, None);
+    for depth in 1..=root.height {
+        let page = store.child(pgno, want_txn)?;
+        let at_leaf_level = depth == root.height;
+        let kind = page::kind(page)?;
+        if (kind == Kind::Leaf) != at_leaf_level {
+            return Err(Error::Corrupt(format!(
+                "page {pgno} is a {kind:?} at depth {depth} of a tree of height {}",
+                root.height
+            )));
+        }
+        let n = page::nkeys(page);
+        if at_leaf_level {
+            let Some(last) = n.checked_sub(1) else {
+                if depth > 1 {
+                    return Err(Error::Corrupt(format!("non-root leaf {pgno} is empty")));
+                }
+                return Ok(None);
+            };
+            let key = page::leaf_key(page, last)?;
+            check_miss(pgno, Some(key), None, lo, hi)?;
+            return Ok(Some(key));
+        }
+        let Some(last) = n.checked_sub(1) else {
+            return Err(Error::Corrupt(format!("branch {pgno} has no child")));
+        };
+        let route = page::BranchView::new(page)?.route_at(last)?;
+        tighten(&route, &mut lo, &mut hi);
+        (pgno, want_txn) = (route.child, route.child_txn);
+    }
+    // The loop returns at depth == height (checked to be >= 1 by `root.check`).
+    Err(Error::Corrupt(format!("descent of a tree of height {} found no leaf", root.height)))
+}
+
 /// The check of a miss in leaf `leaf`, whose search put the key between `before` and `after`
 /// ([`Find::NotFound`]), against the range `[lo, hi)` its ancestors' separators give it (`None`:
 /// unbounded). A miss must come from the leaf whose range holds the key: the keys either side of
@@ -389,5 +437,51 @@ mod tests {
             store.raw_mut(root.root).copy_from_slice(&original);
             assert!(get(&store.reader(), &root, &lost).expect("get").is_some());
         }
+    }
+
+    /// [`last_key`] against a sorted model, through the writer's view (private pages included)
+    /// after every put and delete, and through a reader after each commit: the empty tree's is
+    /// `None`, and the trees grow to three levels and shrink again. A rightmost pointer misrouted
+    /// to the first subtree (both cell fields copied, so the page and txn checks pass) is
+    /// `Corrupt`: the last key it reaches lies below the root's last separator.
+    #[test]
+    fn last_key_is_the_trees_last_key() {
+        use crate::tree::{test_harness::Rng, write::plain::delete};
+        let mut rng = Rng(0x1A57_0F7E_E5ED);
+        let (mut store, mut root) = (MemStore::new(4096), TreeRoot::EMPTY);
+        let mut model = std::collections::BTreeSet::new();
+        assert_eq!(last_key(&store, &root).expect("empty"), None);
+        let mut height = 0;
+        for op in 0..3_000 {
+            let key = key_of(rng.below(2_000));
+            if op < 2_000 || rng.below(3) == 0 {
+                put(&mut store, &mut root, &key, &[op as u8; 8]).expect("put");
+                model.insert(key);
+            } else {
+                delete(&mut store, &mut root, &key).expect("delete");
+                model.remove(&key);
+            }
+            let want = model.last().map(Vec::as_slice);
+            assert_eq!(last_key(&store, &root).expect("last key"), want, "op {op}");
+            if rng.below(50) == 0 {
+                store.commit_like();
+                assert_eq!(last_key(&store.reader(), &root).expect("reader"), want, "op {op}");
+            }
+            height = height.max(root.height);
+        }
+        assert_eq!(height, 3, "the trees reached three levels");
+
+        let (mut store, root) = committed_tree(1_000);
+        assert_eq!(root.height, 3);
+        let original = store.raw(root.root).to_vec();
+        let last = page::nkeys(&original) - 1;
+        let first = page::branch_child(&original, 0).expect("child");
+        page::branch_set_child(store.raw_mut(root.root), last, first.0, first.1).expect("set");
+        store.restamp(root.root);
+        let got = last_key(&store.reader(), &root).map(|k| k.map(<[u8]>::to_vec));
+        assert!(matches!(got, Err(Error::Corrupt(_))), "misrouted: {got:?}");
+        store.raw_mut(root.root).copy_from_slice(&original);
+        let want = key_of(999);
+        assert_eq!(last_key(&store.reader(), &root).expect("restored"), Some(&want[..]));
     }
 }

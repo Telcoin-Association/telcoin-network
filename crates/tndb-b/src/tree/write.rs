@@ -101,6 +101,112 @@ fn bug(what: impl std::fmt::Display) -> Error {
     Error::Failed(format!("b+tree write invariant broken: {what}"))
 }
 
+/// The leaf values of the tree a write changes: what the entry it replaces or deletes may hold,
+/// and what the published leaves it copies or absorbs may hold. A table's tree, the catalog's and
+/// the free list's hold inline values and overflow references ([`Cells::Plain`]: a nested cell
+/// there is damage, [`page::nested_error`]); a dup table's outer tree holds one nested root per
+/// key ([`Cells::Outer`]: any other cell there is damage). The nested writes own the trees the
+/// outer cells name, so an outer write that replaces or deletes a cell never frees what it names.
+///
+/// The policy is read only where a write meets a value its own tree may not hold (the cold arms)
+/// and once per published leaf [`check_cells_naming_this_txn`] checks; a put takes it from its
+/// value ([`NewVal::cells`]), so a table put compiles to code that never sees an outer cell.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Cells {
+    /// A table's tree (and the catalog's and the free list's): inline values and overflow runs.
+    Plain,
+    /// A dup table's outer tree: a nested tree's root in every cell ([`put_outer_cell`]).
+    Outer,
+}
+
+impl Cells {
+    /// The [`Error::Corrupt`] of a leaf value this policy refuses: a nested cell in a plain tree
+    /// ([`page::nested_error`]), an inline value or an overflow reference in an outer tree.
+    #[cold]
+    #[inline(never)]
+    fn refused(self, value: Val<'_>) -> Error {
+        match (self, value) {
+            (Cells::Plain, Val::Nested(root)) => page::nested_error(root),
+            (Cells::Outer, Val::Inline(_)) => {
+                Error::Corrupt("an outer cell of a dup table that is not a nested tree".to_string())
+            }
+            (Cells::Outer, Val::Overflow(ovf)) => Error::Corrupt(format!(
+                "an overflow cell in a dup table's outer tree (a reference to run {ovf:?})"
+            )),
+            (cells, value) => {
+                bug(format!("the {cells:?} policy refused a value it holds: {value:?}"))
+            }
+        }
+    }
+}
+
+/// What a put writes: a table entry's value, inline or in an overflow run as [`Geometry::place`]
+/// decides ([`NewVal::Bytes`]), or a dup table's outer cell, the encoded root of the key's nested
+/// tree ([`NewVal::Nested`]: always inline, never a run). [`put_from_root`] and
+/// [`put_in_cached_leaf`] take any `Into<NewVal>` and convert it first, so each is monomorphized
+/// per source and its matches on the variant fold away: a table put compiles to the code it was
+/// before outer cells existed.
+#[derive(Clone, Copy, Debug)]
+enum NewVal<'v> {
+    /// A table entry's value.
+    Bytes(&'v [u8]),
+    /// A nested tree's root ([`TreeRoot::encode`]), written as a nested cell.
+    Nested(&'v [u8; page::NESTED_CELL]),
+}
+
+impl<'v> NewVal<'v> {
+    /// The leaf values of the tree this value goes into.
+    #[inline(always)]
+    fn cells(self) -> Cells {
+        match self {
+            NewVal::Bytes(_) => Cells::Plain,
+            NewVal::Nested(_) => Cells::Outer,
+        }
+    }
+
+    /// The value's bytes in its cell when stored inline.
+    #[inline(always)]
+    fn cell_len(self) -> usize {
+        match self {
+            NewVal::Bytes(bytes) => bytes.len(),
+            NewVal::Nested(_) => page::NESTED_CELL,
+        }
+    }
+
+    /// The bytes an overflow run holds, for a value [`Geometry::place`] sent to one (a nested
+    /// root never goes to a run).
+    #[inline(always)]
+    fn bytes(self) -> &'v [u8] {
+        match self {
+            NewVal::Bytes(bytes) => bytes,
+            NewVal::Nested(root) => root,
+        }
+    }
+
+    /// The value as an inline cell holds it.
+    #[inline(always)]
+    fn inline(self) -> Val<'v> {
+        match self {
+            NewVal::Bytes(bytes) => Val::Inline(bytes),
+            NewVal::Nested(root) => Val::Nested(root),
+        }
+    }
+}
+
+impl<'v> From<&'v [u8]> for NewVal<'v> {
+    #[inline(always)]
+    fn from(bytes: &'v [u8]) -> Self {
+        NewVal::Bytes(bytes)
+    }
+}
+
+impl<'v> From<&'v [u8; page::NESTED_CELL]> for NewVal<'v> {
+    #[inline(always)]
+    fn from(root: &'v [u8; page::NESTED_CELL]) -> Self {
+        NewVal::Nested(root)
+    }
+}
+
 /// Insert `(key, value)` into the tree `root` names, or replace the value if `key` is present
 /// (returning true). Entries over the size limits are refused ([`Error::KeyTooLarge`],
 /// [`Error::ValueTooLarge`]) before anything changes; then as [`put_sized`]. The catalog and the
@@ -164,34 +270,70 @@ pub(crate) fn put_cached<S: PageWrite + ?Sized>(
     put_from_root(store, root, trusted, Some(cache), key, value, kind)
 }
 
+/// Write the cell of `key` in a dup table's outer tree `root` ([`Cells::Outer`]): the encoded
+/// root of the key's nested tree, `nested` (a nested cell, [`page::NESTED_CELL`] bytes, always
+/// inline), as [`put_cached`] writes a table entry: in the cached leaf if it lands and fits
+/// there, else by a descent that copies, splits and refills `cache` as a table put does. `kind`
+/// is the outer put's ([`PutKind`]): `Insert` creates the cell of a key with none, `Upsert`
+/// replaces the cell of a key whose nested root moved, `Append` creates one past the last key.
+/// The cell it replaces must be a nested cell (any other is [`Error::Corrupt`]); the tree that
+/// cell named is not freed here: the nested writes own it. The outer key's length is held to the
+/// inline limits ([`Geometry::check_entry`]); an empty `nested` is a broken invariant (an outer
+/// cell names a non-empty tree, which [`page::validate`] requires of every nested cell).
+pub(crate) fn put_outer_cell<S: PageWrite + ?Sized>(
+    store: &mut S,
+    root: &mut TreeRoot,
+    trusted: &mut bool,
+    cache: &mut PathCache,
+    key: &[u8],
+    nested: &TreeRoot,
+    kind: PutKind,
+) -> Result<Placed> {
+    if nested.is_empty() {
+        return Err(bug("an outer cell naming an empty nested tree"));
+    }
+    store.geometry().check_entry(key.len(), page::NESTED_CELL)?;
+    let cell = nested.encode();
+    if *trusted && cache.epoch == store.epoch() {
+        if let Some(placed) = put_in_cached_leaf(store, root, cache, key, &cell, kind)? {
+            return Ok(placed);
+        }
+    }
+    put_from_root(store, root, trusted, Some(cache), key, &cell, kind)
+}
+
 /// [`put_sized`], or an append or an insert (`kind`): descend from the root, plan, reserve,
 /// apply; then fill `cache`, if given, with the entry's path (private and trusted once the put
 /// is done) when the put did not split, or did an append split. After an append split whose
 /// separator the leaf's parent took, the most common one, the new path is the descent's with the
 /// parent's step moved to its new last cell and the new right leaf, which holds only the entry;
 /// after one that split a branch or grew a new root, a second, trusted descent finds it.
-fn put_from_root<S: PageWrite + ?Sized>(
+fn put_from_root<'v, S: PageWrite + ?Sized>(
     store: &mut S,
     root: &mut TreeRoot,
     trusted: &mut bool,
     cache: Option<&mut PathCache>,
     key: &[u8],
-    value: &[u8],
+    value: impl Into<NewVal<'v>>,
     kind: PutKind,
 ) -> Result<Placed> {
+    let value: NewVal<'v> = value.into();
     root.check()?;
     let txn = store.txn();
-    let run_pages = match store.geometry().place(key.len(), value.len())? {
-        Place::Inline => None,
-        Place::Overflow { npages } => {
-            Some(u32::try_from(npages).map_err(|_| bug("a run of over 2^32 pages"))?)
-        }
+    let run_pages = match value {
+        NewVal::Bytes(bytes) => match store.geometry().place(key.len(), bytes.len())? {
+            Place::Inline => None,
+            Place::Overflow { npages } => {
+                Some(u32::try_from(npages).map_err(|_| bug("a run of over 2^32 pages"))?)
+            }
+        },
+        NewVal::Nested(_) => None,
     };
     if root.is_empty() {
         let p = store.alloc()?;
         let val = match run_pages {
-            None => Val::Inline(value),
-            Some(n) => match write_run(store, n, value) {
+            None => value.inline(),
+            Some(n) => match write_run(store, n, value.bytes()) {
                 Ok(ovf) => Val::Overflow(ovf),
                 Err(e) => {
                     store.free(p);
@@ -230,8 +372,8 @@ fn put_from_root<S: PageWrite + ?Sized>(
         }
         None => (own_path.insert(Path::new()), None),
     };
-    let vlen = if run_pages.is_some() { OVF_CELL } else { value.len() };
-    let planned = plan(&*store, root, *trusted, key, vlen, kind, path)?;
+    let vlen = if run_pages.is_some() { OVF_CELL } else { value.cell_len() };
+    let planned = plan(&*store, root, *trusted, key, vlen, kind, value.cells(), path)?;
     let Planned { leaf, change, needed, range, old_run } = planned;
     if let Some(tail) = tail.as_mut() {
         tail.set_range(range);
@@ -246,8 +388,8 @@ fn put_from_root<S: PageWrite + ?Sized>(
     }
     // A put that needs no page (a private path, no split) needs no scratch either.
     let mut scratch = if needed == 0 { Scratch::default() } else { store.take_scratch() };
-    let val = match reserve_put(store, needed, &mut scratch.reserved, run_pages, value) {
-        Ok(ovf) => ovf.map_or(Val::Inline(value), Val::Overflow),
+    let val = match reserve_put(store, needed, &mut scratch.reserved, run_pages, value.bytes()) {
+        Ok(ovf) => ovf.map_or(value.inline(), Val::Overflow),
         Err(e) => {
             if needed != 0 {
                 store.put_scratch(scratch);
@@ -287,7 +429,7 @@ fn put_from_root<S: PageWrite + ?Sized>(
             // descent of the new path finds, without the descent.
             Some(right) => {
                 #[cfg(debug_assertions)]
-                assert_found_again(&*store, root, key, path, right);
+                assert_found_again(&*store, root, key, value.cells(), path, right);
                 tail.set_range((Some(key), None));
                 (right, Some(0))
             }
@@ -296,7 +438,8 @@ fn put_from_root<S: PageWrite + ?Sized>(
             // non-emptiness).
             None => {
                 path.len = 0;
-                let (found, _) = descend_write(&*store, root, true, key, Verify::Now, path)?;
+                let (found, _) =
+                    descend_write(&*store, root, true, key, Verify::Now, value.cells(), path)?;
                 let Find::Found { index, .. } = found.view.find(key)? else {
                     return Err(bug("a split lost the entry it put"));
                 };
@@ -320,11 +463,12 @@ fn assert_found_again<S: PageWrite + ?Sized>(
     store: &S,
     root: &TreeRoot,
     key: &[u8],
+    cells: Cells,
     path: &[(u32, usize)],
     right: u32,
 ) {
     let mut again = Path::new();
-    let found = descend_write(store, root, true, key, Verify::Now, &mut again)
+    let found = descend_write(store, root, true, key, Verify::Now, cells, &mut again)
         .and_then(|(found, _)| Ok((found.pgno, found.range, found.view.find(key)?)));
     let same = match found {
         Ok((pgno, (Some(lo), None), Find::Found { index: 0, .. })) => {
@@ -467,15 +611,17 @@ impl Bound {
 /// read, so a key elsewhere costs at most two compares; in the leaf, a key past its last key (an
 /// ascending run) needs no search. An append needs the rightmost leaf (no `hi`), whose last key
 /// is the tree's: a key not past it is [`Error::AppendOutOfOrder`]. An insert of a key the leaf
-/// holds is [`Error::KeyExists`].
-fn put_in_cached_leaf<S: PageWrite + ?Sized>(
+/// holds is [`Error::KeyExists`]. A replaced value its tree may not hold ([`NewVal::cells`]) is
+/// [`Error::Corrupt`].
+fn put_in_cached_leaf<'v, S: PageWrite + ?Sized>(
     store: &mut S,
     root: &mut TreeRoot,
     cache: &PathCache,
     key: &[u8],
-    value: &[u8],
+    value: impl Into<NewVal<'v>>,
     kind: PutKind,
 ) -> Result<Option<Placed>> {
+    let value: NewVal<'v> = value.into();
     let top = cache.path.first().map_or(cache.leaf, |&(p, _)| p);
     let names_root = top == root.root && cache.path.len() + 1 == root.height as usize;
     debug_assert!(names_root, "a path cache of this epoch names another tree");
@@ -509,30 +655,33 @@ fn put_in_cached_leaf<S: PageWrite + ?Sized>(
         } else {
             view.find(key)?
         };
+        let new = value.cell_len();
         match found {
             Find::Found { .. } if kind == PutKind::Insert => return Err(Error::KeyExists),
-            // The old run must be freed with the tree's other changes: descend.
-            Find::Found { value: Val::Overflow(_), .. } => return Ok(None),
-            Find::Found { value: Val::Nested(root), .. } => return Err(page::nested_error(root)),
-            Find::Found { index, value: Val::Inline(old) } => {
-                let old = old.len();
-                if value.len() > old && value.len() - old > view.free_space() {
+            Find::Found { index, value: old } => {
+                let old = match (value.cells(), old) {
+                    (Cells::Plain, Val::Inline(old)) => old.len(),
+                    (Cells::Outer, Val::Nested(_)) => page::NESTED_CELL,
+                    // The old run must be freed with the tree's other changes: descend.
+                    (Cells::Plain, Val::Overflow(_)) => return Ok(None),
+                    (cells, old) => return Err(cells.refused(old)),
+                };
+                if new > old && new - old > view.free_space() {
                     return Ok(None);
                 }
                 LeafChange::Replace(index)
             }
             Find::NotFound { index, .. } => {
-                if !view.fits(page::cell_size_leaf(key.len(), value.len())) {
+                if !view.fits(page::cell_size_leaf(key.len(), new)) {
                     return Ok(None);
                 }
                 LeafChange::Insert(index)
             }
         }
     };
-    let (fit, replaced, slot) = match change {
-        LeafChange::Replace(i) => (page.replace_value(i, value)?, true, i),
-        LeafChange::Insert(i) => (page.insert(i, key, value)?, false, i),
-        LeafChange::Split { .. } => return Err(bug("a split planned in a cached leaf")),
+    let (fit, replaced, slot) = match value {
+        NewVal::Bytes(bytes) => change_cached_leaf(page, change, key, bytes)?,
+        NewVal::Nested(root) => change_cached_leaf(page, change, key, Val::Nested(root))?,
     };
     if fit == Fit::Full {
         return Err(bug("an entry did not fit its cached leaf as planned"));
@@ -543,6 +692,23 @@ fn put_in_cached_leaf<S: PageWrite + ?Sized>(
     #[cfg(all(test, debug_assertions))]
     CACHED_PUTS.with(|n| n.set(n.get() + 1));
     Ok(Some(Placed { replaced, slot: Some(slot) }))
+}
+
+/// [`put_in_cached_leaf`]'s change to its leaf, with the value in the form the leaf mutators
+/// write ([`page::CellVal`]: inline bytes for a table put, the nested cell for an outer one):
+/// whether it fit, whether it replaced, and the entry's slot.
+#[inline(always)]
+fn change_cached_leaf(
+    page: page::LeafMut<'_>,
+    change: LeafChange,
+    key: &[u8],
+    value: impl page::CellVal,
+) -> Result<(Fit, bool, usize)> {
+    Ok(match change {
+        LeafChange::Replace(i) => (page.replace_value(i, value)?, true, i),
+        LeafChange::Insert(i) => (page.insert(i, key, value)?, false, i),
+        LeafChange::Split { .. } => return Err(bug("a split planned in a cached leaf")),
+    })
 }
 
 /// [`delete`] through a table's write-path `cache` ([`PathCache`]), the twin of [`put_cached`]: a
@@ -562,11 +728,31 @@ pub(crate) fn delete_cached<S: PageWrite + ?Sized>(
     key: &[u8],
 ) -> Result<Removed> {
     if *trusted && cache.epoch == store.epoch() {
-        if let Some(removed) = delete_in_cached_leaf(store, root, cache, key)? {
+        if let Some(removed) = delete_in_cached_leaf(store, root, cache, key, Cells::Plain)? {
             return Ok(removed);
         }
     }
-    delete_from_root(store, root, trusted, Some(cache), key)
+    delete_from_root(store, root, trusted, Some(cache), key, Cells::Plain)
+}
+
+/// Delete the cell of `key` from a dup table's outer tree `root` ([`Cells::Outer`]), as
+/// [`delete_cached`] deletes a table entry: in the cached leaf when the delete changes only that
+/// leaf, else by a descent that copies, unlinks, merges or collapses as a table delete does. The
+/// cell must be a nested cell (any other is [`Error::Corrupt`]); the tree it named is not freed
+/// here: the nested writes own it (and emptied it, or free it themselves).
+pub(crate) fn delete_outer_cell<S: PageWrite + ?Sized>(
+    store: &mut S,
+    root: &mut TreeRoot,
+    trusted: &mut bool,
+    cache: &mut PathCache,
+    key: &[u8],
+) -> Result<Removed> {
+    if *trusted && cache.epoch == store.epoch() {
+        if let Some(removed) = delete_in_cached_leaf(store, root, cache, key, Cells::Outer)? {
+            return Ok(removed);
+        }
+    }
+    delete_from_root(store, root, trusted, Some(cache), key, Cells::Outer)
 }
 
 /// [`delete_cached`]'s delete in the cached leaf, which the caller found valid in this epoch for a
@@ -576,12 +762,16 @@ pub(crate) fn delete_cached<S: PageWrite + ?Sized>(
 /// its change is this one: the cell out of the leaf, one entry fewer on the handle. It descends
 /// instead for a value in an overflow run (freed with the tree's other changes), the leaf's last
 /// entry (an unlink or a collapse), a leaf the delete would leave due a merge, or a handle that
-/// does not count the entry and another (the descent's plan reports it).
+/// does not count the entry and another (the descent's plan reports it). A value the tree may
+/// not hold (`cells`) is [`Error::Corrupt`]. Always inlined: each caller passes its policy as a
+/// constant, so a table delete's matches fold to the plain arms.
+#[inline(always)]
 fn delete_in_cached_leaf<S: PageWrite + ?Sized>(
     store: &mut S,
     root: &mut TreeRoot,
     cache: &PathCache,
     key: &[u8],
+    cells: Cells,
 ) -> Result<Option<Removed>> {
     let top = cache.path.first().map_or(cache.leaf, |&(p, _)| p);
     let names_root = top == root.root && cache.path.len() + 1 == root.height as usize;
@@ -612,11 +802,11 @@ fn delete_in_cached_leaf<S: PageWrite + ?Sized>(
             // The key routes to this leaf only, and the leaf does not hold it.
             Find::NotFound { .. } => return Ok(Some(Removed { found: false, slot: None })),
         };
-        match value {
-            Val::Inline(_) => {}
+        match (cells, value) {
+            (Cells::Plain, Val::Inline(_)) | (Cells::Outer, Val::Nested(_)) => {}
             // The run must be freed with the tree's other changes: descend.
-            Val::Overflow(_) => return Ok(None),
-            Val::Nested(root) => return Err(page::nested_error(root)),
+            (Cells::Plain, Val::Overflow(_)) => return Ok(None),
+            (cells, value) => return Err(cells.refused(value)),
         }
         if view.nkeys() < 2 {
             return Ok(None);
@@ -779,13 +969,14 @@ enum Verify {
 /// computed only once the descent first reaches an untrusted page: until then the separators are
 /// not needed. A page [`verify_published`] checks also gets [`check_cells_naming_this_txn`], so
 /// its private copy names no page or run by this transaction's id that the copy-time trust would
-/// not vouch for.
+/// not vouch for; `cells` is the tree's policy for the leaf it checks ([`Cells`]).
 fn descend_write<'s, S: PageWrite + ?Sized>(
     store: &'s S,
     root: &TreeRoot,
     root_trusted: bool,
     key: &[u8],
     verify: Verify,
+    cells: Cells,
     path: &mut Path,
 ) -> Result<(WriteLeaf<'s>, usize)> {
     let geometry = store.geometry();
@@ -829,7 +1020,7 @@ fn descend_write<'s, S: PageWrite + ?Sized>(
                 match verify {
                     Verify::Now => {
                         verify_published(store, page, &geometry)?;
-                        check_cells_naming_this_txn(store, pgno, &view)?;
+                        check_cells_naming_this_txn(store, pgno, &view, cells)?;
                     }
                     Verify::Later => unverified = true,
                 }
@@ -886,6 +1077,13 @@ fn descend_write<'s, S: PageWrite + ?Sized>(
 /// cell would free a run this transaction wrote for another entry (a private run named by a
 /// private leaf is one this writer may free).
 ///
+/// A published leaf of a dup table's outer tree ([`Cells::Outer`]) must hold only nested cells,
+/// and one whose root's `root_txn` is this transaction's id must name a live published page, by
+/// the branch rule: else the private copy keeps a cell naming a page this transaction allocated
+/// (for another tree, say), and the key's next nested write would load it as the key's tree. A
+/// plain tree's leaf ([`Cells::Plain`]) holding a nested cell is [`page::nested_error`]. The
+/// policy is read once per leaf, so a table leaf's loop is the one it always was.
+///
 /// It runs where [`verify_published`] does: a page this writer stamped holds only cells it wrote
 /// from checked pages (the trust that skips the CRC and [`page::validate`] there), and a forged
 /// cell is damage at rest.
@@ -893,6 +1091,7 @@ fn check_cells_naming_this_txn<S: PageWrite + ?Sized>(
     store: &S,
     pgno: u32,
     view: &page::View<'_>,
+    cells: Cells,
 ) -> Result<()> {
     let txn = store.txn();
     let forged = |what: String, header_txn: u64| {
@@ -912,6 +1111,21 @@ fn check_cells_naming_this_txn<S: PageWrite + ?Sized>(
                 let header_txn = page::txn(store.page(child)?);
                 if header_txn as u32 != child_txn || header_txn >= txn {
                     return Err(forged(format!("page {child}"), header_txn));
+                }
+            }
+        }
+        page::View::Leaf(leaf) if cells == Cells::Outer => {
+            for i in 0..leaf.nkeys() {
+                let root = match leaf.entry(i)?.1 {
+                    Val::Nested(cell) => TreeRoot::decode(cell)?,
+                    other => return Err(cells.refused(other)),
+                };
+                if root.root_txn != txn as u32 {
+                    continue;
+                }
+                let header_txn = page::txn(store.page(root.root)?);
+                if header_txn as u32 != root.root_txn || header_txn >= txn {
+                    return Err(forged(format!("nested root page {}", root.root), header_txn));
                 }
             }
         }
@@ -954,7 +1168,12 @@ fn path_bounds<'s, S: PageWrite + ?Sized>(
 /// The verification [`Verify::Later`] left out of a [`descend_write`] to `leaf` along `path`:
 /// [`verify_published`] and [`check_cells_naming_this_txn`] of each published page on it that
 /// this writer did not stamp, root first. The descent made the other checks of every page.
-fn verify_path<S: PageWrite + ?Sized>(store: &S, path: &[(u32, usize)], leaf: u32) -> Result<()> {
+fn verify_path<S: PageWrite + ?Sized>(
+    store: &S,
+    path: &[(u32, usize)],
+    leaf: u32,
+    cells: Cells,
+) -> Result<()> {
     let geometry = store.geometry();
     for p in path.iter().map(|&(p, _)| p).chain([leaf]) {
         if store.is_private(p) || store.is_stamped(p) {
@@ -962,7 +1181,7 @@ fn verify_path<S: PageWrite + ?Sized>(store: &S, path: &[(u32, usize)], leaf: u3
         }
         let page = store.page(p)?;
         verify_published(store, page, &geometry)?;
-        check_cells_naming_this_txn(store, p, &page::View::new(page)?)?;
+        check_cells_naming_this_txn(store, p, &page::View::new(page)?, cells)?;
     }
     Ok(())
 }
@@ -992,6 +1211,13 @@ struct Planned<'s> {
 /// past the last key of the rightmost leaf (no upper bound). A key past the tree's last key routes
 /// there, since no separator exceeds the keys to its right; a key that lands in another leaf lies
 /// below that leaf's upper bound, so below the keys of the (non-empty) leaves to its right.
+///
+/// A replaced value the tree may not hold (`cells`) is [`Error::Corrupt`]; an outer cell's
+/// nested tree is not this put's to free. Always inlined: [`put_from_root`], its one caller, is
+/// monomorphized per value source and passes `cells` as a constant, so a table put's match folds
+/// to the plain arms.
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
 fn plan<'s, S: PageWrite + ?Sized>(
     store: &'s S,
     root: &TreeRoot,
@@ -999,9 +1225,10 @@ fn plan<'s, S: PageWrite + ?Sized>(
     key: &[u8],
     vlen: usize,
     kind: PutKind,
+    cells: Cells,
     path: &mut Path,
 ) -> Result<Planned<'s>> {
-    let (leaf, copies) = descend_write(store, root, root_trusted, key, Verify::Now, path)?;
+    let (leaf, copies) = descend_write(store, root, root_trusted, key, Verify::Now, cells, path)?;
     let view = leaf.view;
     let found = match kind {
         PutKind::Upsert => view.find(key)?,
@@ -1024,12 +1251,12 @@ fn plan<'s, S: PageWrite + ?Sized>(
     let mut old_run = None;
     let change = match found {
         Find::Found { index: i, value: old } => {
-            match old {
-                Val::Inline(_) => {}
-                Val::Overflow(ovf) => {
+            match (cells, old) {
+                (Cells::Plain, Val::Inline(_)) | (Cells::Outer, Val::Nested(_)) => {}
+                (Cells::Plain, Val::Overflow(ovf)) => {
                     old_run = Some((ovf.pgno, leaving_run(store, leaf.pgno, ovf)?));
                 }
-                Val::Nested(root) => return Err(page::nested_error(root)),
+                (cells, old) => return Err(cells.refused(old)),
             }
             let old = old.cell_len();
             if vlen <= old || vlen - old <= view.free_space() {
@@ -1548,7 +1775,7 @@ pub(crate) fn delete<S: PageWrite + ?Sized>(
     trusted: &mut bool,
     key: &[u8],
 ) -> Result<bool> {
-    Ok(delete_from_root(store, root, trusted, None, key)?.found)
+    Ok(delete_from_root(store, root, trusted, None, key, Cells::Plain)?.found)
 }
 
 /// [`delete`], with a table's `cache` if given: the descent records its path straight into the
@@ -1557,13 +1784,14 @@ pub(crate) fn delete<S: PageWrite + ?Sized>(
 /// after a [`DeleteShape::Leaf`] delete that merged nothing, with the epoch its copies left; a
 /// miss fills it when every page on its path is this transaction's own (nothing copied, nothing
 /// verified, the epoch unchanged). Any other delete (an unlink, a collapse, an empty tree, a
-/// merge) frees pages and leaves the cache empty.
+/// merge) frees pages and leaves the cache empty. `cells` is the tree's policy ([`Cells`]).
 fn delete_from_root<S: PageWrite + ?Sized>(
     store: &mut S,
     root: &mut TreeRoot,
     trusted: &mut bool,
     cache: Option<&mut PathCache>,
     key: &[u8],
+    cells: Cells,
 ) -> Result<Removed> {
     const MISS: Removed = Removed { found: false, slot: None };
     root.check()?;
@@ -1578,7 +1806,7 @@ fn delete_from_root<S: PageWrite + ?Sized>(
         }
         None => (own_path.insert(Path::new()), None),
     };
-    let Some(plan) = plan_delete(&*store, root, *trusted, key, path, tail.as_mut())? else {
+    let Some(plan) = plan_delete(&*store, root, *trusted, key, cells, path, tail.as_mut())? else {
         return Ok(MISS);
     };
     let buffers = plan.copies != 0 || !plan.merges.is_empty();
@@ -1631,16 +1859,21 @@ fn delete_from_root<S: PageWrite + ?Sized>(
 /// before anything changes, for [`delete_from_root`] to fill it once the delete is done; a miss
 /// fills it at once when the descent met only this transaction's own pages from a trusted root
 /// (the path a put's descent caches), since a miss changes nothing.
+///
+/// A deleted value the tree may not hold (`cells`) is [`Error::Corrupt`]; an outer cell's nested
+/// tree is not this delete's to free.
 fn plan_delete<S: PageWrite + ?Sized>(
     store: &S,
     root: &TreeRoot,
     root_trusted: bool,
     key: &[u8],
+    cells: Cells,
     path: &mut Path,
     mut tail: Option<&mut CacheTail<'_>>,
 ) -> Result<Option<DeletePlan>> {
     let geometry = store.geometry();
-    let (leaf, published) = descend_write(store, root, root_trusted, key, Verify::Later, path)?;
+    let (leaf, published) =
+        descend_write(store, root, root_trusted, key, Verify::Later, cells, path)?;
     if let Some(tail) = &mut tail {
         tail.set_range(leaf.range);
     }
@@ -1655,12 +1888,12 @@ fn plan_delete<S: PageWrite + ?Sized>(
         }
     };
     if leaf.unverified {
-        verify_path(store, path, leaf.pgno)?;
+        verify_path(store, path, leaf.pgno, cells)?;
     }
-    let run = match value {
-        Val::Inline(_) => None,
-        Val::Overflow(ovf) => Some((ovf.pgno, leaving_run(store, leaf.pgno, ovf)?)),
-        Val::Nested(root) => return Err(page::nested_error(root)),
+    let run = match (cells, value) {
+        (Cells::Plain, Val::Inline(_)) | (Cells::Outer, Val::Nested(_)) => None,
+        (Cells::Plain, Val::Overflow(ovf)) => Some((ovf.pgno, leaving_run(store, leaf.pgno, ovf)?)),
+        (cells, value) => return Err(cells.refused(value)),
     };
     let mut dropped = Vec::new();
     let shape = if leaf.view.nkeys() > 1 {
@@ -1722,7 +1955,7 @@ fn plan_delete<S: PageWrite + ?Sized>(
     };
     let (mut merges, mut merged_root, mut refused) = (Vec::new(), false, false);
     if let Some((k, used)) = changed.filter(|_| merging(store)) {
-        (merged_root, refused) = plan_merges(store, path, k, used, &mut merges)?;
+        (merged_root, refused) = plan_merges(store, path, k, used, cells, &mut merges)?;
     }
     let kept = match shape {
         DeleteShape::Leaf => path.len() + 1,
@@ -1831,6 +2064,7 @@ fn plan_merges<S: PageWrite + ?Sized>(
     path: &[(u32, usize)],
     mut k: usize,
     mut used: usize,
+    cells: Cells,
     merges: &mut Vec<Absorb>,
 ) -> Result<(bool, bool)> {
     let usable = store.geometry().usable();
@@ -1871,7 +2105,7 @@ fn plan_merges<S: PageWrite + ?Sized>(
                 side = Side::Right;
                 continue;
             };
-            check_sibling(store, path, k - 1, si, s, page, &view)?;
+            check_sibling(store, path, k - 1, si, s, page, &view, cells)?;
             if let page::View::Branch(_) = view {
                 let right_key1 = match side {
                     Side::Left => x_key1,
@@ -1962,6 +2196,7 @@ fn sibling_view<S: PageWrite + ?Sized>(
 /// descent's checks, which a pointer redirected to a single-child branch from elsewhere, or to a
 /// branch of another level, fails. Two cells naming one sibling cannot both pass: their ranges
 /// are disjoint, and the chain ends at a non-empty leaf whose keys must lie in each.
+#[allow(clippy::too_many_arguments)]
 fn check_sibling<'s, S: PageWrite + ?Sized>(
     store: &'s S,
     path: &[(u32, usize)],
@@ -1970,13 +2205,14 @@ fn check_sibling<'s, S: PageWrite + ?Sized>(
     s: u32,
     page: &'s [u8],
     view: &page::View<'s>,
+    cells: Cells,
 ) -> Result<()> {
     if store.is_private(s) {
         return Ok(());
     }
     if !store.is_stamped(s) {
         verify_published(store, page, &store.geometry())?;
-        check_cells_naming_this_txn(store, s, view)?;
+        check_cells_naming_this_txn(store, s, view, cells)?;
     }
     let (mut lo, mut hi) = (None, None);
     let steps = path[..level].iter().copied().chain([(path[level].0, si)]);
@@ -2280,6 +2516,49 @@ fn apply_merges<S: PageWrite + ?Sized>(
     Ok(())
 }
 
+/// How [`tree_pages`] reads a tree's leaf values.
+pub(crate) enum Leaves<'r> {
+    /// A plain tree (a table's, the catalog's, the free list's, or a dup table's nested tree):
+    /// inline values and overflow references; a nested cell is [`Error::Corrupt`].
+    Plain,
+    /// A dup table's outer tree: every cell is a nested cell under an outer key of `key_len`
+    /// bytes, and the nested tree it names is walked too, its root taken from `nested`.
+    Dup {
+        /// The table's outer key width.
+        key_len: usize,
+        /// Where each cell's nested root comes from.
+        nested: &'r mut dyn NestedRoots,
+    },
+}
+
+/// The source of a dup table's nested roots for a free walk ([`free_dup_tree`]): a write
+/// transaction's working state can hold a newer root than the outer cell (which then names the
+/// committed root, or one this transaction superseded).
+pub(crate) trait NestedRoots {
+    /// The nested root to walk for the outer cell of `key` holding `cell`, with its provenance
+    /// (true only for a root this transaction's writer wrote).
+    fn root(&mut self, key: &[u8], cell: &[u8; page::NESTED_CELL]) -> Result<(TreeRoot, bool)>;
+    /// Called once, after the walk collected everything and before anything is freed, with the
+    /// counters of the nested roots walked: the source's own rules over what was walked.
+    fn walked(&mut self, sums: &NestedSums) -> Result<()>;
+}
+
+/// The counters of the nested roots a dup walk ([`tree_pages`] with [`Leaves::Dup`]) met,
+/// summed (saturating: a sum past `u64` cannot match any record).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct NestedSums {
+    /// The nested trees.
+    pub(crate) trees: u64,
+    /// Their rows.
+    pub(crate) entries: u64,
+    /// Their branch pages.
+    pub(crate) branch: u64,
+    /// Their leaf pages.
+    pub(crate) leaf: u64,
+    /// Their overflow pages.
+    pub(crate) overflow: u64,
+}
+
 /// Every page of the tree `root` names, root first, level by level, collected without changing
 /// anything (so a caller freeing them refuses damage before it frees a page). Each branch is read
 /// with a descent's checks (the page its parent names, a branch above the leaf level) and, if
@@ -2294,158 +2573,274 @@ fn apply_merges<S: PageWrite + ?Sized>(
 /// naming a page this transaction allocated for another tree (a tree page, or a page of one of
 /// its runs) would hand that page out again while the other tree holds it.
 ///
-/// A tree counting no overflow page has its leaves taken from their parents' pointers: only the
-/// first is read (it must be a leaf: the tree is balanced, so that checks the height), and the
-/// private ones' headers (in memory) for the identity check. A tree with runs has
-/// every leaf read, with a descent's checks and verified unless private or stamped here, and each
-/// run its overflow cells name taken after its header and identity checks and its provenance
-/// ([`leaving_run`]); their pages, each reached once, must add up to the handle's counter
-/// ([`TreePages`]). Damage is [`Error::Corrupt`].
+/// A plain tree ([`Leaves::Plain`]) counting no overflow page has its leaves taken from their
+/// parents' pointers: only the first is read (it must be a leaf: the tree is balanced, so that
+/// checks the height), and the private ones' headers (in memory) for the identity check. A tree
+/// with runs has every leaf read, with a descent's checks and verified unless private or stamped
+/// here, and each run its overflow cells name taken after its header and identity checks and its
+/// provenance ([`leaving_run`]); their pages, each reached once, must add up to the handle's
+/// counter ([`TreePages`]).
+///
+/// A dup table's outer tree ([`Leaves::Dup`]) counts no overflow page and has every leaf read so:
+/// each cell must be a nested cell under an outer key of the table's width, and the nested tree
+/// it names (its root and provenance from the [`NestedRoots`]) is walked as a plain tree into the
+/// same collection, so a page reached twice, a nested root two cells name included, is refused;
+/// the nested roots' counters are summed ([`TreePages::nested`]). Damage is [`Error::Corrupt`].
 pub(crate) fn tree_pages<S: PageWrite + ?Sized>(
     store: &S,
     root: &TreeRoot,
     root_trusted: bool,
+    leaves: Leaves<'_>,
 ) -> Result<TreePages> {
     root.check()?;
     if root.is_empty() {
         return Ok(TreePages::default());
     }
-    let geometry = store.geometry();
-    let page_count = store.page_count();
-    let corrupt = |what: String| Error::Corrupt(format!("tree walk: {what}"));
-    let check_header = |pgno: u32, txn: u32| -> Result<&[u8]> {
-        let page = store.page(pgno)?;
-        if page::pgno(page) != pgno || page::txn(page) as u32 != txn {
+    let mut walk = PageWalk {
+        store,
+        geometry: store.geometry(),
+        page_count: store.page_count(),
+        seen: PageSet::default(),
+        out: TreePages::default(),
+    };
+    walk.tree(root, root_trusted, leaves)?;
+    Ok(walk.out)
+}
+
+/// One [`tree_pages`] walk: the pages reached so far (shared by a dup table's outer tree and its
+/// nested trees) and what it collected.
+struct PageWalk<'s, S: ?Sized> {
+    store: &'s S,
+    geometry: Geometry,
+    page_count: u32,
+    seen: PageSet,
+    out: TreePages,
+}
+
+impl<'s, S: PageWrite + ?Sized> PageWalk<'s, S> {
+    /// Collect the non-empty tree `root` (provenance `root_trusted`), its leaves read as
+    /// `leaves` says ([`tree_pages`]).
+    fn tree(&mut self, root: &TreeRoot, root_trusted: bool, mut leaves: Leaves<'_>) -> Result<()> {
+        let (store, page_count) = (self.store, self.page_count);
+        let corrupt = |what: String| Error::Corrupt(format!("tree walk: {what}"));
+        let check_header = |pgno: u32, txn: u32| -> Result<&'s [u8]> {
+            let page = store.page(pgno)?;
+            if page::pgno(page) != pgno || page::txn(page) as u32 != txn {
+                return Err(corrupt(format!(
+                    "page {pgno} is not the copy its parent names (txn {txn})"
+                )));
+            }
+            Ok(page)
+        };
+        // Range-check the root as the children are, before it sizes the dense set: a damaged root
+        // number must not allocate a bitset of up to 2^32 bits before it is refused.
+        if root.root < 2 || root.root >= page_count {
             return Err(corrupt(format!(
-                "page {pgno} is not the copy its parent names (txn {txn})"
+                "root {} is outside the file's {page_count} pages",
+                root.root
             )));
         }
-        Ok(page)
-    };
-    // Range-check the root as the children are, before it sizes the dense set: a damaged root
-    // number must not allocate a bitset of up to 2^32 bits before it is refused.
-    if root.root < 2 || root.root >= page_count {
-        return Err(corrupt(format!(
-            "root {} is outside the file's {page_count} pages",
-            root.root
-        )));
-    }
-    let untrusted = |p: u32| {
-        corrupt(format!(
-            "page {p} is private to this transaction but named by a page it did not write"
-        ))
-    };
-    if store.is_private(root.root) && !root_trusted {
-        return Err(untrusted(root.root));
-    }
-    let mut seen = PageSet::default();
-    seen.insert(root.root);
-    let mut pages = vec![root.root];
-    let mut level = vec![(root.root, root.root_txn)];
-    for _ in 1..root.height {
-        let mut next = Vec::new();
+        let untrusted = |p: u32| {
+            corrupt(format!(
+                "page {p} is private to this transaction but named by a page it did not write"
+            ))
+        };
+        if store.is_private(root.root) && !root_trusted {
+            return Err(untrusted(root.root));
+        }
+        self.seen.insert(root.root);
+        self.out.pages.push(root.root);
+        let mut level = vec![(root.root, root.root_txn)];
+        for _ in 1..root.height {
+            let mut next = Vec::new();
+            for &(p, txn) in &level {
+                let page = check_header(p, txn)?;
+                if page::kind(page)? != Kind::Branch {
+                    return Err(corrupt(format!("page {p} is a leaf above the leaves' level")));
+                }
+                let private = store.is_private(p);
+                if !private && !store.is_stamped(p) {
+                    verify_published(store, page, &self.geometry)?;
+                }
+                for i in 0..page::nkeys(page) {
+                    let (child, child_txn) = page::branch_child(page, i)?;
+                    if child < 2 || child >= page_count || self.seen.contains(child) {
+                        return Err(corrupt(format!("page {p} has a bad child {child}")));
+                    }
+                    if store.is_private(child) {
+                        if !private {
+                            return Err(untrusted(child));
+                        }
+                        check_header(child, child_txn)?;
+                    }
+                    self.seen.insert(child);
+                    next.push((child, child_txn));
+                }
+            }
+            self.out.pages.extend(next.iter().map(|&(p, _)| p));
+            level = next;
+        }
+        let Some(&(first, txn)) = level.first() else {
+            return Err(corrupt(format!("a level of the tree of height {} is empty", root.height)));
+        };
+        let dup = matches!(leaves, Leaves::Dup { .. });
+        if !dup && root.overflow_pages == 0 {
+            if page::kind(check_header(first, txn)?)? != Kind::Leaf {
+                return Err(corrupt(format!("height {} does not reach the leaves", root.height)));
+            }
+            return Ok(());
+        }
+        if dup && root.overflow_pages != 0 {
+            return Err(corrupt(format!(
+                "a dup table's outer tree counts {} overflow pages",
+                root.overflow_pages
+            )));
+        }
+        let mut run_pages = 0_u64;
         for &(p, txn) in &level {
             let page = check_header(p, txn)?;
-            if page::kind(page)? != Kind::Branch {
-                return Err(corrupt(format!("page {p} is a leaf above the leaves' level")));
-            }
-            let private = store.is_private(p);
-            if !private && !store.is_stamped(p) {
-                verify_published(store, page, &geometry)?;
-            }
-            for i in 0..page::nkeys(page) {
-                let (child, child_txn) = page::branch_child(page, i)?;
-                if child < 2 || child >= page_count || seen.contains(child) {
-                    return Err(corrupt(format!("page {p} has a bad child {child}")));
-                }
-                if store.is_private(child) {
-                    if !private {
-                        return Err(untrusted(child));
-                    }
-                    check_header(child, child_txn)?;
-                }
-                seen.insert(child);
-                next.push((child, child_txn));
-            }
-        }
-        pages.extend(next.iter().map(|&(p, _)| p));
-        level = next;
-    }
-    let Some(&(first, txn)) = level.first() else {
-        return Err(corrupt(format!("a level of the tree of height {} is empty", root.height)));
-    };
-    if root.overflow_pages == 0 {
-        if page::kind(check_header(first, txn)?)? != Kind::Leaf {
-            return Err(corrupt(format!("height {} does not reach the leaves", root.height)));
-        }
-        return Ok(TreePages { pages, runs: Vec::new() });
-    }
-    let mut runs = Vec::new();
-    let mut run_pages = 0_u64;
-    for &(p, txn) in &level {
-        let page = check_header(p, txn)?;
-        let page::View::Leaf(view) = page::View::new(page)? else {
-            return Err(corrupt(format!("height {} does not reach the leaves", root.height)));
-        };
-        if !store.is_private(p) && !store.is_stamped(p) {
-            verify_published(store, page, &geometry)?;
-        }
-        for i in 0..view.nkeys() {
-            let ovf = match view.entry(i)?.1 {
-                Val::Inline(_) => continue,
-                Val::Overflow(ovf) => ovf,
-                Val::Nested(root) => return Err(page::nested_error(root)),
+            let page::View::Leaf(view) = page::View::new(page)? else {
+                return Err(corrupt(format!("height {} does not reach the leaves", root.height)));
             };
-            let n = leaving_run(store, p, ovf)?;
-            for q in ovf.pgno..ovf.pgno + n {
-                if seen.contains(q) {
-                    return Err(corrupt(format!(
-                        "page {q} of overflow run {} is reached twice",
-                        ovf.pgno
-                    )));
-                }
-                seen.insert(q);
+            if !store.is_private(p) && !store.is_stamped(p) {
+                verify_published(store, page, &self.geometry)?;
             }
-            runs.push((ovf.pgno, n));
-            run_pages += u64::from(n);
+            for i in 0..view.nkeys() {
+                let (key, val) = view.entry(i)?;
+                let ovf = match (&mut leaves, val) {
+                    (Leaves::Plain, Val::Inline(_)) => continue,
+                    (Leaves::Plain, Val::Overflow(ovf)) => ovf,
+                    (Leaves::Plain, Val::Nested(cell)) => return Err(page::nested_error(cell)),
+                    (Leaves::Dup { key_len, nested }, Val::Nested(cell)) => {
+                        if key.len() != *key_len {
+                            return Err(corrupt(format!(
+                                "page {p}: an outer key of {} bytes in a dup table of width \
+                                 {key_len}",
+                                key.len()
+                            )));
+                        }
+                        let (nested_root, trusted) = nested.root(key, cell)?;
+                        self.nested_tree(key, &nested_root, trusted)?;
+                        continue;
+                    }
+                    (Leaves::Dup { .. }, Val::Inline(_)) => {
+                        return Err(corrupt(format!(
+                            "page {p}: a cell that is not nested in a dup table's outer tree"
+                        )))
+                    }
+                    (Leaves::Dup { .. }, Val::Overflow(ovf)) => {
+                        return Err(corrupt(format!(
+                            "page {p}: an overflow cell in a dup table's outer tree (a reference \
+                             to run {})",
+                            ovf.pgno
+                        )))
+                    }
+                };
+                let n = leaving_run(store, p, ovf)?;
+                for q in ovf.pgno..ovf.pgno + n {
+                    if self.seen.contains(q) {
+                        return Err(corrupt(format!(
+                            "page {q} of overflow run {} is reached twice",
+                            ovf.pgno
+                        )));
+                    }
+                    self.seen.insert(q);
+                }
+                self.out.runs.push((ovf.pgno, n));
+                run_pages += u64::from(n);
+            }
         }
+        if run_pages != u64::from(root.overflow_pages) {
+            return Err(corrupt(format!(
+                "the leaves name {run_pages} overflow pages, the handle counts {}",
+                root.overflow_pages
+            )));
+        }
+        Ok(())
     }
-    if run_pages != u64::from(root.overflow_pages) {
-        return Err(corrupt(format!(
-            "the leaves name {run_pages} overflow pages, the handle counts {}",
-            root.overflow_pages
-        )));
+
+    /// Collect the nested tree `root` (provenance `trusted`) of outer key `key` in a dup walk: a
+    /// non-empty plain tree none of whose pages was reached before, its counters summed.
+    fn nested_tree(&mut self, key: &[u8], root: &TreeRoot, trusted: bool) -> Result<()> {
+        root.check()?;
+        if root.is_empty() {
+            return Err(Error::Corrupt(format!(
+                "tree walk: the outer cell of key {key:02x?} names an empty nested tree"
+            )));
+        }
+        if self.seen.contains(root.root) {
+            return Err(Error::Corrupt(format!(
+                "tree walk: the nested root {} of key {key:02x?} is reached twice",
+                root.root
+            )));
+        }
+        self.tree(root, trusted, Leaves::Plain)?;
+        let sums = &mut self.out.nested;
+        sums.trees = sums.trees.saturating_add(1);
+        sums.entries = sums.entries.saturating_add(root.entries);
+        sums.branch = sums.branch.saturating_add(u64::from(root.branch_pages));
+        sums.leaf = sums.leaf.saturating_add(u64::from(root.leaf_pages));
+        sums.overflow = sums.overflow.saturating_add(u64::from(root.overflow_pages));
+        Ok(())
     }
-    Ok(TreePages { pages, runs })
 }
 
 /// What [`tree_pages`] collected.
 #[derive(Debug, Default)]
 pub(crate) struct TreePages {
-    /// The tree's pages, root first, level by level.
+    /// The tree's pages, root first, level by level (a dup walk: each nested tree's after the
+    /// outer leaf level, in key order).
     pub(crate) pages: Vec<u32>,
     /// Its overflow runs as `(first page, pages)`.
     pub(crate) runs: Vec<(u32, u32)>,
+    /// A dup walk's nested roots' counters (zero for a plain walk).
+    pub(crate) nested: NestedSums,
 }
 
-/// Free every page of the tree `root` names and every overflow run: all collected first
-/// ([`tree_pages`], `root_trusted` the handle's provenance), so damage is refused before anything
-/// is freed. A published page is freed
-/// once no reader or durable meta can reach it, a private one is reusable at once; a run leaves
-/// as single pages. The handle is the caller's to drop or reset.
-pub(crate) fn free_subtree<S: PageWrite + ?Sized>(
-    store: &mut S,
-    root: &TreeRoot,
-    root_trusted: bool,
-) -> Result<()> {
-    let TreePages { pages, runs } = tree_pages(&*store, root, root_trusted)?;
+/// Free the pages and runs a walk collected ([`tree_pages`]): a published page is freed once no
+/// reader or durable meta can reach it, a private one is reusable at once; a run leaves as single
+/// pages.
+fn free_collected<S: PageWrite + ?Sized>(store: &mut S, pages: Vec<u32>, runs: Vec<(u32, u32)>) {
     for p in pages {
         store.free(p);
     }
     for (p, n) in runs {
         store.free_run(p, n);
     }
+}
+
+/// Free every page of the tree `root` names and every overflow run: all collected first
+/// ([`tree_pages`], `root_trusted` the handle's provenance), so damage is refused before anything
+/// is freed ([`free_collected`]). The handle is the caller's to drop or reset.
+pub(crate) fn free_subtree<S: PageWrite + ?Sized>(
+    store: &mut S,
+    root: &TreeRoot,
+    root_trusted: bool,
+) -> Result<()> {
+    let TreePages { pages, runs, .. } = tree_pages(&*store, root, root_trusted, Leaves::Plain)?;
+    free_collected(store, pages, runs);
     Ok(())
+}
+
+/// Free a dup table's outer tree `outer` (provenance `outer_trusted`, outer keys of `key_len`
+/// bytes) and every nested tree its cells name, each root from `nested`: all collected first in
+/// one walk ([`tree_pages`] with [`Leaves::Dup`]) and `nested`'s own rules applied to what it
+/// walked ([`NestedRoots::walked`]), so damage is refused before anything is freed
+/// ([`free_collected`]). Returns the nested roots' counters. The handles are the caller's to drop
+/// or reset.
+pub(crate) fn free_dup_tree<S: PageWrite + ?Sized>(
+    store: &mut S,
+    outer: &TreeRoot,
+    outer_trusted: bool,
+    key_len: usize,
+    nested: &mut dyn NestedRoots,
+) -> Result<NestedSums> {
+    let leaves = Leaves::Dup { key_len, nested: &mut *nested };
+    let TreePages { pages, runs, nested: sums } =
+        tree_pages(&*store, outer, outer_trusted, leaves)?;
+    nested.walked(&sums)?;
+    free_collected(store, pages, runs);
+    Ok(sums)
 }
 
 /// Empty the tree `root` names: free every page ([`free_subtree`], `root_trusted` the handle's
@@ -2469,8 +2864,8 @@ mod tests {
     use crate::tree::{
         read::{descend, find, get},
         test_harness::{
-            leaf_fill, level_keys, merge_open_pages, page_fill, walk_tree, MemStore, ReportSeed,
-            Rng,
+            leaf_fill, level_keys, merge_open_pages, page_fill, walk_outer_tree, walk_tree,
+            MemStore, ReportSeed, Rng,
         },
     };
     use plain::{clear, delete, put};
@@ -3332,7 +3727,8 @@ mod tests {
         };
         let mut path = Path::new();
         let (found, _) =
-            descend_write(store, root, true, key, Verify::Now, &mut path).expect("descent");
+            descend_write(store, root, true, key, Verify::Now, Cells::Plain, &mut path)
+                .expect("descent");
         assert_eq!(cache.epoch, store.epoch(), "{what}: the cache holds");
         assert_eq!(cache.branches(), &*path, "{what}: the branches");
         assert_eq!(cache.leaf(), found.pgno, "{what}: the leaf");
@@ -5267,6 +5663,370 @@ mod tests {
         assert_nested_refused("clear", clear(&mut store, &mut root));
         assert_eq!(root, before, "clear");
         assert_nested_refused("free_subtree", free_subtree(&mut store, &root, true));
+    }
+
+    /// A nested root of the shape an outer cell holds (one leaf, `root_txn` the writing
+    /// transaction's id): the outer writes store it and never follow it.
+    fn some_nested_root(rng: &mut Rng, txn: u64) -> TreeRoot {
+        TreeRoot {
+            root: 2 + rng.below(1 << 30) as u32,
+            root_txn: txn as u32,
+            height: 1,
+            entries: 1 + rng.below(1_000),
+            leaf_pages: 1,
+            ..TreeRoot::EMPTY
+        }
+    }
+
+    /// The outer tree `root` against `model`: its walk ([`walk_outer_tree`]: every cell a nested
+    /// cell, the structure and counters checked) holds exactly the model's keys and roots.
+    #[track_caller]
+    fn assert_outer_holds(
+        store: &MemStore,
+        root: &TreeRoot,
+        model: &BTreeMap<Vec<u8>, [u8; page::NESTED_CELL]>,
+    ) {
+        let walk = walk_outer_tree(store, root);
+        let want: Vec<_> = model.iter().map(|(k, v)| (k.clone(), v.to_vec())).collect();
+        assert!(walk.entries == want, "the outer tree's cells are not the model's");
+    }
+
+    /// Random outer-cell writes ([`put_outer_cell`] with each [`PutKind`], [`delete_outer_cell`],
+    /// hits and misses, refused inserts and appends) on outer keys of `klen` bytes, against a
+    /// `BTreeMap` of encoded roots, with merging on, the path cache sometimes emptied, and commits,
+    /// recycling and reopens (published outer leaves verified and checked, [`Cells::Outer`],
+    /// before their first copy) at random. After every op the key reads back as its nested cell;
+    /// every few ops the whole tree is walked. Returns the greatest height and the merging
+    /// deletes.
+    fn outer_cells_match_a_model(klen: usize, seed: u64, ops: usize) -> (u32, usize) {
+        let _report = ReportSeed(seed);
+        let mut rng = Rng(seed);
+        let mut store = MemStore::new(4096);
+        let (mut root, mut trusted, mut cache) = (TreeRoot::EMPTY, false, PathCache::default());
+        let mut model: BTreeMap<Vec<u8>, [u8; page::NESTED_CELL]> = BTreeMap::new();
+        let ids = 4 * ops as u64;
+        let (mut height, mut merges) = (0, 0);
+        #[cfg(debug_assertions)]
+        let cached = (CACHED_PUTS.with(std::cell::Cell::get), cached_deletes());
+        for op in 0..ops {
+            let grow = op < ops * 3 / 5;
+            if rng.below(40) == 0 {
+                match rng.below(3) {
+                    0 => store.commit_like(),
+                    1 => {
+                        store.commit_like();
+                        store.recycle();
+                    }
+                    _ => store.reopen(),
+                }
+                trusted = false;
+            }
+            if rng.below(8) == 0 {
+                cache.forget();
+            }
+            let present = !model.is_empty() && rng.below(2) == 0;
+            let key = if present {
+                let i = rng.below(model.len() as u64) as usize;
+                model.keys().nth(i).expect("a present key").clone()
+            } else {
+                id_key(rng.below(ids), klen)
+            };
+            let nested = some_nested_root(&mut rng, store.txn());
+            let before = root;
+            let roll = rng.below(10);
+            if (grow && roll < 7) || (!grow && roll < 3) {
+                let last = model.keys().next_back().cloned();
+                let kind = match rng.below(4) {
+                    0 => PutKind::Insert,
+                    1 => PutKind::Append,
+                    _ => PutKind::Upsert,
+                };
+                let r = put_outer_cell(
+                    &mut store,
+                    &mut root,
+                    &mut trusted,
+                    &mut cache,
+                    &key,
+                    &nested,
+                    kind,
+                );
+                let exists = model.contains_key(&key);
+                match kind {
+                    PutKind::Insert if exists => {
+                        assert!(matches!(r, Err(Error::KeyExists)), "op {op}: {r:?}");
+                    }
+                    PutKind::Append if last.as_ref().is_some_and(|l| key <= *l) => {
+                        assert!(matches!(r, Err(Error::AppendOutOfOrder)), "op {op}: {r:?}");
+                    }
+                    _ => {
+                        let placed = r.unwrap_or_else(|e| panic!("op {op} {kind:?}: {e}"));
+                        assert_eq!(placed.replaced, exists, "op {op}");
+                        model.insert(key.clone(), nested.encode());
+                    }
+                }
+                if model.get(&key) != Some(&nested.encode()) {
+                    assert_eq!(root, before, "op {op}: a refused put changed the handle");
+                }
+            } else {
+                store.merge_report = MergeReport::default();
+                let removed =
+                    delete_outer_cell(&mut store, &mut root, &mut trusted, &mut cache, &key)
+                        .unwrap_or_else(|e| panic!("op {op} delete: {e}"));
+                assert_eq!(removed.found, model.remove(&key).is_some(), "op {op}");
+                let r = &store.merge_report;
+                merges += usize::from(r.leaf_left + r.leaf_right + r.branches > 0);
+            }
+            let found = find(&store, &root, &key).expect("find");
+            match model.get(&key) {
+                Some(cell) => {
+                    assert!(matches!(found, Some(Val::Nested(c)) if c == cell), "op {op}")
+                }
+                None => assert!(found.is_none(), "op {op}: {found:?}"),
+            }
+            height = height.max(root.height);
+            if op % 16 == 0 {
+                assert_outer_holds(&store, &root, &model);
+            }
+        }
+        assert_outer_holds(&store, &root, &model);
+        store.commit_like();
+        assert_outer_holds(&store, &root, &model);
+        #[cfg(debug_assertions)]
+        assert!(
+            CACHED_PUTS.with(std::cell::Cell::get) > cached.0 && cached_deletes() > cached.1,
+            "no outer write changed the cached leaf"
+        );
+        (height, merges)
+    }
+
+    /// An outer tree holding `n` keys of `klen` bytes, committed and reopened (nothing stamped by
+    /// the writer), with its model; then one outer put that copies the path to `key` and fills
+    /// `cache` there.
+    fn reopened_outer_tree(
+        n: u64,
+        klen: usize,
+        key: &[u8],
+    ) -> (MemStore, TreeRoot, bool, PathCache, BTreeMap<Vec<u8>, [u8; page::NESTED_CELL]>) {
+        let mut rng = Rng(0x0DD5_EED5);
+        let mut store = MemStore::new(4096);
+        let (mut root, mut trusted, mut cache) = (TreeRoot::EMPTY, false, PathCache::default());
+        let mut model = BTreeMap::new();
+        for i in 0..n {
+            let (k, nested) = (id_key(i * 7919 % n, klen), some_nested_root(&mut rng, store.txn()));
+            put_outer_cell(
+                &mut store,
+                &mut root,
+                &mut trusted,
+                &mut cache,
+                &k,
+                &nested,
+                PutKind::Insert,
+            )
+            .expect("insert");
+            model.insert(k, nested.encode());
+        }
+        store.reopen();
+        let mut trusted = false;
+        let nested = some_nested_root(&mut rng, store.txn());
+        put_outer_cell(
+            &mut store,
+            &mut root,
+            &mut trusted,
+            &mut cache,
+            key,
+            &nested,
+            PutKind::Upsert,
+        )
+        .expect("upsert");
+        model.insert(key.to_vec(), nested.encode());
+        (store, root, trusted, cache, model)
+    }
+
+    /// Outer trees of nested cells ([`Cells::Outer`]) against a model: inserts, upserts and
+    /// appends through the cached leaf and through descents, splits to height 3, deletes that
+    /// merge and collapse, and copies of verified published leaves. Then the policies refuse what
+    /// their tree may not hold, with the handle unchanged: a table write ([`Cells::Plain`]) over an
+    /// outer cell or copying a published outer leaf is [`page::nested_error`], and an outer write
+    /// over an inline value or an overflow reference is `Corrupt`, in the cached leaf and from the
+    /// root.
+    #[test]
+    fn outer_trees_of_nested_cells_match_a_model() {
+        let (height, merges) = outer_cells_match_a_model(400, 0x5EED_0001_2345_6789, 3_000);
+        assert!(height >= 3 && merges > 0, "height {height}, merging deletes {merges}");
+        let (height, merges) = outer_cells_match_a_model(8, 0x5EED_0002_2345_6789, 2_000);
+        assert!(height >= 2 && merges > 0, "height {height}, merging deletes {merges}");
+
+        // A table write meets the outer cells: nested_error, nothing changed.
+        let key = id_key(17, 8);
+        let (mut store, mut root, mut trusted, mut cache, model) =
+            reopened_outer_tree(600, 8, &key);
+        let before = root;
+        assert_nested_refused("put", super::put(&mut store, &mut root, &mut trusted, &key, b"v"));
+        let r = put_cached(
+            &mut store,
+            &mut root,
+            &mut trusted,
+            &mut cache,
+            &key,
+            b"v",
+            PutKind::Upsert,
+        );
+        assert_nested_refused("cached put", r);
+        assert_nested_refused(
+            "cached delete",
+            delete_cached(&mut store, &mut root, &mut trusted, &mut cache, &key),
+        );
+        assert_nested_refused("delete", super::delete(&mut store, &mut root, &mut trusted, &key));
+        assert_eq!(root, before, "a refused table write changed the handle");
+        // A table put of a new key copies a published outer leaf: its cells are refused there.
+        let far = id_key(599, 8);
+        let r =
+            put_sized(&mut store, &mut root, &mut trusted, &[&far[..7], &[0xFF]].concat(), b"v");
+        assert_nested_refused("copy of a published outer leaf", r);
+        assert_eq!(root, before);
+        assert_outer_holds(&store, &root, &model);
+
+        // An outer write meets an inline value or an overflow reference in its private leaf.
+        let cases: [(&str, Val<'_>); 2] = [
+            ("not a nested tree", Val::Inline(&[3; 32])),
+            ("an overflow cell", Val::Overflow(Ovf { pgno: 9, txn: 7, len: 5_000 })),
+        ];
+        for (want, forged) in cases {
+            for cached in [true, false] {
+                for delete in [false, true] {
+                    let (mut store, mut root, mut trusted, mut cache, _) =
+                        reopened_outer_tree(600, 8, &key);
+                    let leaf = cache.leaf();
+                    let page = store.page_mut(leaf).expect("a private leaf");
+                    let Find::Found { index, .. } = page::leaf_find(page, &key).expect("find")
+                    else {
+                        panic!("the key is in its cached leaf");
+                    };
+                    let fit = page::LeafMut::new(page).expect("leaf").replace_value(index, forged);
+                    assert_eq!(fit.expect("forge"), Fit::Done);
+                    if !cached {
+                        cache.forget();
+                    }
+                    let before = root;
+                    let nested = TreeRoot {
+                        root: 5,
+                        root_txn: 1,
+                        height: 1,
+                        entries: 1,
+                        leaf_pages: 1,
+                        ..TreeRoot::EMPTY
+                    };
+                    let r = if delete {
+                        delete_outer_cell(&mut store, &mut root, &mut trusted, &mut cache, &key)
+                            .map(|_| ())
+                    } else {
+                        put_outer_cell(
+                            &mut store,
+                            &mut root,
+                            &mut trusted,
+                            &mut cache,
+                            &key,
+                            &nested,
+                            PutKind::Upsert,
+                        )
+                        .map(|_| ())
+                    };
+                    let what = format!("{want}, cached {cached}, delete {delete}");
+                    assert!(
+                        matches!(&r, Err(Error::Corrupt(m)) if m.contains(want)),
+                        "{what}: {r:?}"
+                    );
+                    assert_eq!(root, before, "{what}");
+                }
+            }
+        }
+    }
+
+    /// A published outer leaf whose cell names a root by this transaction's id is refused when a
+    /// write copies the leaf ([`check_cells_naming_this_txn`] with [`Cells::Outer`]): whether the
+    /// page it names is private to this transaction (another tree's, allocated here) or a
+    /// published page of another txn. The same cell with an older txn id is copied as it is: the
+    /// rule reads a page only for a cell carrying this transaction's id.
+    #[test]
+    fn a_published_outer_cell_naming_this_txn_is_refused_at_copy() {
+        let (k1, k2) = (id_key(100, 8), id_key(101, 8));
+        for case in ["private", "published", "older"] {
+            let mut rng = Rng(0xC0FF_EE00);
+            let mut store = MemStore::new(4096);
+            let (mut root, mut trusted, mut cache) = (TreeRoot::EMPTY, false, PathCache::default());
+            for i in 0..600 {
+                let nested = some_nested_root(&mut rng, store.txn());
+                put_outer_cell(
+                    &mut store,
+                    &mut root,
+                    &mut trusted,
+                    &mut cache,
+                    &id_key(i, 8),
+                    &nested,
+                    PutKind::Insert,
+                )
+                .expect("insert");
+            }
+            assert!(root.height >= 2, "{root:?}");
+            store.reopen();
+            let txn = store.txn();
+            let leaf = descend(&store, &root, &k1, |_, _, _, _| Ok(()), None)
+                .expect("descend")
+                .expect("leaf");
+            assert!(
+                page::leaf_find(leaf.page, &k2).is_ok_and(|f| matches!(f, Find::Found { .. })),
+                "one leaf"
+            );
+            let leaf = leaf.pgno;
+            let (named, named_txn) = match case {
+                "private" => {
+                    let (mut other, mut other_trusted) = (TreeRoot::EMPTY, false);
+                    super::put(&mut store, &mut other, &mut other_trusted, b"other", b"t")
+                        .expect("put");
+                    (other.root, txn as u32)
+                }
+                "published" => (root.root, txn as u32),
+                _ => (root.root, txn as u32 - 1),
+            };
+            let forged = TreeRoot {
+                root: named,
+                root_txn: named_txn,
+                height: 1,
+                entries: 1,
+                leaf_pages: 1,
+                ..TreeRoot::EMPTY
+            }
+            .encode();
+            let page = store.raw_mut(leaf);
+            let Find::Found { index, .. } = page::leaf_find(page, &k1).expect("find") else {
+                panic!("k1 is in its leaf");
+            };
+            let fit =
+                page::LeafMut::new(page).expect("leaf").replace_value(index, Val::Nested(&forged));
+            assert_eq!(fit.expect("forge"), Fit::Done);
+            store.restamp(leaf);
+            let before = root;
+            let (mut trusted, mut cache) = (false, PathCache::default());
+            let nested = some_nested_root(&mut rng, txn);
+            let r = put_outer_cell(
+                &mut store,
+                &mut root,
+                &mut trusted,
+                &mut cache,
+                &k2,
+                &nested,
+                PutKind::Upsert,
+            );
+            if case == "older" {
+                assert!(r.is_ok_and(|p| p.replaced), "{case}");
+            } else {
+                assert!(
+                    matches!(&r, Err(Error::Corrupt(m)) if m.contains(&format!("nested root page {named}"))),
+                    "{case}: {r:?}"
+                );
+                assert_eq!(root, before, "{case}");
+            }
+        }
     }
 
     #[test]

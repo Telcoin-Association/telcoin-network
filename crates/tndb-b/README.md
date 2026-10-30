@@ -23,7 +23,7 @@ does not depend on `tn-storage` or reth. reth's database API on top of it is a s
 | `lib.rs` | crate docs, `compile_error!` off unix, re-exports |
 | `error.rs` | `Error`, `Result` |
 | `env.rs` | `Env`, `EnvOptions`, `SyncMode`, `EnvStat`: open and recovery (and the read-only open), the writer hand-off, snapshots, the reader queue, the durable steps of a commit, `sync` |
-| `txn.rs` | `RoTxn`, `RwTxn`, `ReadTxn`, `Table`, `TableStat`, `RoCursor` (the owned read cursor), `RwCursor`, `TxnCursor` (the detached write cursor, with the transaction's write stamps, schema counter and serial); commit steps 1–3 and 7 |
+| `txn.rs` | `RoTxn`, `RwTxn`, `ReadTxn`, `Table`, `TableStat`, `RoCursor` (the owned read cursor), `RwCursor`, `TxnCursor` (the detached write cursor, with the transaction's write stamps, schema counter and serial); dup tables' point ops, `delete_prefix` and the per-transaction map of their nested trees, flushed at commit; commit steps 1–3 and 7 |
 | `meta.rs` | the 128-byte meta record, `choose_meta`, `slot_to_write` |
 | `page.rs` | the slotted page codec (inline, overflow and nested leaf cells, `Val`), `Geometry` (limits, `place`: inline or overflow), `validate` |
 | `overflow.rs` | overflow runs: the 12-byte cell reference (`Ovf`), the run codec, `checked_run` (every check a run read makes), `MAX_VALUE` |
@@ -31,14 +31,14 @@ does not depend on `tn-storage` or reth. reth's database API on top of it is a s
 | `alloc.rs` | the writer's page allocator (`private`, `stamped`, `pool`, `freed`, `next_pgno`) and its overflow runs (`allocate_run`, `free_run`) |
 | `stamp.rs` | commit step 3's CRCs on several threads for a large commit (`threads`, `crcs`, `put_crc`) |
 | `freelist.rs` | free-record codec, gated loading, the fixed-point save |
-| `catalog.rs` | the table catalog (`TableRecord`, the 96-byte record of a plain or a dup table; `TableRecord::plain`) |
-| `check.rs` | `Env::check`: the full structural check (every overflow run's CRC included) and exact page accounting |
+| `catalog.rs` | the table catalog (`TableRecord`, the 96-byte record of a plain or a dup table; `TableRecord::usable`, the limits of this build; `DupOptions`) |
+| `check.rs` | `Env::check`: the full structural check (every overflow run's CRC included, a dup table's nested trees and totals) and exact page accounting |
 | `latch.rs` | the failure latch |
 | `file.rs` | `PageFile` (reserved mapping, preallocated growth, msync, poison), `ReadOnlyFile` (a read-only open's `PROT_READ` mapping) and `MapView` (the lock-free reader view of either) |
 | `sys.rs` | `fsync_file`, `fdatasync_file`, `fsync_directory`, `allocate_range`, `os_page_size`, `flock_exclusive`, `flock_shared` |
 | `crc.rs`, `page_set.rs` | copied from `crates/storage/src/archive/` (`page_set.rs` adds a touched-word list, so `clear` and `drain` cost the words touched, not the file) |
 | `disk_model.rs` | test-only page-cache and power-loss model |
-| `tests/`, `*/tests.rs` | crash, damage (nested cells and dup records included), multi-table model, merging, path cache, append, detached cursor, key tail, concurrency and read-only suites, per-module tests |
+| `tests/`, `*/tests.rs` | crash, damage (nested cells and dup records included), dup tables against a composite-key model, multi-table model, merging, path cache, append, detached cursor, key tail, concurrency and read-only suites, per-module tests |
 | `bench.rs` | the on-demand benchmark of step 4's data sync and of merging, each against its test-only switch |
 
 ## Milestones
@@ -68,18 +68,19 @@ does not depend on `tn-storage` or reth. reth's database API on top of it is a s
 1. [Concepts at a glance](#concepts-at-a-glance)
 2. [On-disk format](#on-disk-format)
 3. [Deletes and merging](#deletes-and-merging)
-4. [Commit protocol](#commit-protocol)
-5. [Free list and page reuse](#free-list-and-page-reuse)
-6. [Readers and snapshots](#readers-and-snapshots)
-7. [Open and recovery](#open-and-recovery)
-8. [Failure latch](#failure-latch)
-9. [Concurrency rules](#concurrency-rules)
-10. [Public API reference](#public-api-reference)
-11. [Errors](#errors)
-12. [Platform notes](#platform-notes)
-13. [Limits and non-goals](#limits-and-non-goals)
-14. [Intentional design decisions: please do not flag these](#intentional-design-decisions-please-do-not-flag-these)
-15. [Tests and benchmarks](#tests-and-benchmarks)
+4. [Dup tables](#dup-tables)
+5. [Commit protocol](#commit-protocol)
+6. [Free list and page reuse](#free-list-and-page-reuse)
+7. [Readers and snapshots](#readers-and-snapshots)
+8. [Open and recovery](#open-and-recovery)
+9. [Failure latch](#failure-latch)
+10. [Concurrency rules](#concurrency-rules)
+11. [Public API reference](#public-api-reference)
+12. [Errors](#errors)
+13. [Platform notes](#platform-notes)
+14. [Limits and non-goals](#limits-and-non-goals)
+15. [Intentional design decisions: please do not flag these](#intentional-design-decisions-please-do-not-flag-these)
+16. [Tests and benchmarks](#tests-and-benchmarks)
 
 ---
 
@@ -113,10 +114,14 @@ does not depend on `tn-storage` or reth. reth's database API on top of it is a s
   while they fit, up the tree. A merge allocates nothing and never splits. See
   [Deletes and merging](#deletes-and-merging).
 
-**Not supported:** dup-sort tables (the reth adapter stores their rows as ordinary keys
-`key ‖ subkey`; the format defines a nested cell and a dup table's record, but no operation
-writes either, see [Nested cells and dup records](#nested-cells-and-dup-records)) and, by design,
-multi-process access alongside a writer. See [Limits and non-goals](#limits-and-non-goals).
+- **Dup tables.** A dup table (`RwTxn::create_dup_table`) keys every row `k ‖ s`, an outer key
+  of a fixed width and a subkey. Its outer tree holds one cell per outer key, naming that key's
+  own nested B+tree of subkeys and values. The point operations take the logical key `k ‖ s`;
+  `delete_prefix(k)` removes a key's rows in one walk. See [Dup tables](#dup-tables).
+
+**Not supported:** packed sets in a dup table (every outer key holds a nested tree), cursors over
+a dup table in this version, and, by design, multi-process access alongside a writer. See
+[Limits and non-goals](#limits-and-non-goals).
 
 ---
 
@@ -218,8 +223,9 @@ trailer (4):  CRC32 over bytes 0..P−4
 
   Any other flags, and flags 1 or 2 with another `vlen`, are `Corrupt`. A nested cell is
   canonical (`page::validate`) when its 32 bytes decode to a non-empty root that passes
-  `TreeRoot::check`; the root's pages are its user's to check. No operation writes a nested cell:
-  one met on disk is damage ([Nested cells and dup records](#nested-cells-and-dup-records)).
+  `TreeRoot::check`; the root's pages are its user's to check. Only a dup table's outer tree
+  holds nested cells, one per outer key; one anywhere else is damage
+  ([Nested cells and dup records](#nested-cells-and-dup-records)).
 - **Branch cell:** `child u32 | child_txn u32 | klen u16 | key`. There is one cell per child, with
   no separate rightmost-child pointer. Cell i's key is the lower bound of child i, and cell 0's key is empty and stands for
   −∞. `child_txn` is the low 32 bits of the child page's header txn.
@@ -323,20 +329,38 @@ broken rule:
 - with `packed_max` 0, `packed_rows` is 0 and `nested_trees` equals `root.entries` (every outer
   cell is nested);
 - with `packed_max` above 0, `packed_rows` is at least `root.entries − nested_trees` (a packed set
-  is non-empty).
+  is non-empty);
+- the outer tree's pages plus the three nested page counts are at most `MAX_TREE_PAGES`, so the
+  page totals of `TableStat` cannot overflow;
+- `nested_entries + packed_rows` does not overflow a `u64` (the table's row count).
 
-The codec reads and writes both kinds, but every use of a record takes a plain one
-(`TableRecord::plain`): see [Nested cells and dup records](#nested-cells-and-dup-records).
+A record that decodes is then held to this build's limits at every use (`TableRecord::usable`,
+behind `catalog::get`, the engine's one read of a record, and `Env::check`'s catalog walk): a dup
+record with `packed_max` above 0 is `Corrupt` ("has packed sets ..., unsupported": no build writes
+one, so it is damage or a newer format), and so is one whose `key_len` is past this page size's
+`max_dup_key_len` (below). A plain record always passes.
 
 Table ids are unique over the file's life, so a dropped and re-created table gets a new id.
 
 ### Nested cells and dup records
 
-The format defines the two parts of a dup table, a nested cell (leaf cell flags 2) and a dup
-table's catalog record (flag bit 0), and their codecs read and write both. No operation writes
-either, so one met on disk is damage: `Corrupt`, which latches as any damage does.
+A dup table is a catalog record with flag bit 0 and an outer tree whose every leaf cell is a
+nested cell (leaf cell flags 2) naming one outer key's nested tree. The outer-cell rule, which
+every read, write, free walk and `Env::check` holds an outer tree to:
 
-- **A nested cell** is refused by every read and write that meets it, with one message
+- every outer key is exactly `key_len` bytes;
+- every outer value is a nested cell: an inline outer cell (no build writes a packed set) and an
+  overflow cell are `Corrupt`;
+- a nested cell decodes to a non-empty root (an emptied nested tree leaves with its cell);
+- a nested tree holds subkeys of 1 to `max_key − key_len` bytes and ordinary values (inline or in
+  overflow runs), never a nested cell;
+- no page is reached twice: a root named by two cells, or a page of two trees, is `Corrupt`.
+
+Anywhere else a nested cell, and a dup record where a plain table is expected, are damage:
+`Corrupt`, which latches as any damage does.
+
+- **A nested cell outside a dup table's outer tree** (in a plain table, the catalog, the free
+  tree or a nested tree) is refused by every read and write that meets it, with one message
   (`page::nested_error`, "a nested cell in a tree that holds none"): a value read
   (`PageRead::value`: gets, cursor moves and seeks), a cursor's `current_with_key_tail` and
   `seek_with_key_tail`, a put or delete of its key (the path cache's included), copy-on-write of
@@ -345,9 +369,12 @@ either, so one met on disk is damage: `Corrupt`, which latches as any damage doe
   `Env::check`. `page::validate` holds it to the canonical shape above. A free walk reads every
   leaf only of a tree with overflow pages; in another tree a nested cell in a leaf the walk does
   not read is not met there, as other damage inside such a leaf is not.
-- **A dup record** is refused by `catalog::get`, the engine's one read of a record (a table's
-  resolution, `open_table`, `create_table`, `drop_table`, `clear_table` and every read or write
-  through a handle), and by `Env::check`'s catalog walk: `TableRecord::plain`, "a dup table".
+- **A dup record** is read by `catalog::get` like any record and must pass
+  `TableRecord::usable` (above), else it is `Corrupt` at every use: a table's resolution,
+  `open_table`, `create_table`, `create_dup_table`, `drop_table`, `clear_table`, every read or
+  write through a handle, and `Env::check`. A call that needs the other kind of table
+  (`create_table` or a plain cursor on a dup table, `delete_prefix` on a plain one) is
+  `TableKind`, a validation error that changes nothing and does not latch.
 
 ### Free-list records
 
@@ -493,6 +520,119 @@ delete that merged nothing, else by key.
 0.69 full after a random fill, and the leaves 0.40–0.47 full after 90% of the keys are deleted at
 random. Without merging, the same deletes leave the leaves about 0.08 full, in about six times the
 pages.
+
+---
+
+## Dup tables
+
+A dup table holds rows keyed `k ‖ s`: an outer key `k` of exactly `key_len` bytes, then a subkey
+`s` of at least one byte. Its outer tree holds one entry per outer key, a nested cell naming that
+key's nested tree, and the nested tree holds the subkeys and their values (inline or in overflow
+runs, as any table's). In this version every outer key holds a nested tree, of at least one page,
+however few rows it has; packed sets (`DupOptions::packed_max` above 0) are not supported.
+
+**Kinds.** A table is plain or dup for its whole life, by its catalog record; a `Table` handle is
+`{id, name}` for both, and the kind comes from the record at each resolution, so a stale or
+re-created table is refused by id, never by a cached kind. A call that needs the other kind is
+`TableKind`, checked before anything changes, with no latch:
+
+| call | on a plain table | on a dup table |
+|---|---|---|
+| `create_table(name)` | its handle | `TableKind` |
+| `create_dup_table(name, options)` | `TableKind` | its handle when the options are the table's, else `TableKind` |
+| `get`, `put`, `insert`, `append`, `delete`, `table_stat`, `drop_table`, `clear_table` | the plain operation | the dup operation (below) |
+| `delete_prefix(k)` | `TableKind` | the dup operation (below) |
+| `cursor`, `cursor_owned`, `cursor_mut`, `cursor_detached` | a cursor | `TableKind` (there is no cursor over a dup table in this version) |
+
+**Options and limits.** `create_dup_table` refuses `packed_max` above 0 and a `key_len` of 0 or
+past `max_dup_key_len = MAX_ENTRY − 42` with `InvalidDupOptions`: the outer cell, the key and a
+32-byte nested root, must be an inline entry (975 bytes at 4 KiB pages, 4047 at 16 KiB, 16335 at
+64 KiB). A point operation's logical key `k ‖ s` of `L` bytes first passes the plain limits
+(`Geometry::place(L, value.len())`: `KeyTooLarge`, `ValueTooLarge`), so a dup table refuses exactly
+the entries a plain table keyed `k ‖ s` refuses; then `L <= key_len` (no subkey) is `KeyTooShort`,
+for `get` and `delete` too (a get of `k` alone is a caller's mistake, not "the first row of `k`").
+A `get` or `delete` of a key over `max_key` misses, as on a plain table. The split is positional:
+`k` is the key's first `key_len` bytes, so a wrong outer width cannot be expressed.
+`delete_prefix` takes `k` alone: shorter than `key_len` is `KeyTooShort`, longer `KeyTooLarge`.
+A write's checks run in this order, all before anything changes: the size limits (checked before
+the table resolves, as for a plain table), the table's resolution (`TableNotFound`, `StaleTable`),
+the kind where the call takes one kind only (`TableKind`), `KeyTooShort`, then the operation's own
+refusals (`KeyExists`, `AppendOutOfOrder`).
+
+**Point operations.** `get(k ‖ s)` finds `k`'s outer cell, then `s` in its nested tree, and
+borrows the value from the mapping as a plain get does. `put`, `insert` and `delete` write the
+key's nested tree through the copy-on-write code every table uses; `insert`'s `KeyExists` is the
+nested tree's. `append` orders by the logical key: an outer key before the table's last is
+`AppendOutOfOrder`; the last outer key appends to its nested tree (whose own rule refuses a subkey
+not past its last); a later one starts a new nested tree. A put of a new outer key builds its
+nested tree first, then writes its outer cell; a delete that empties a nested tree removes its
+outer cell, and the tree's last leaf is freed. `delete_prefix(k)` frees `k`'s whole nested tree in
+one walk, which collects every page and run before it frees any (damage is refused first), removes
+the cell and returns the rows removed (0, and no change, when `k` holds none).
+
+**The working map and the flush at commit.** A write transaction keeps, per dup table, a map from
+each outer key whose nested tree it has loaded or written to that tree's working root, the root's
+provenance (written by this transaction or not), whether the outer cell still holds an older root,
+and the tree's own path cache. A nested write changes only the nested tree and its map entry; the
+outer cell is rewritten once, at commit, before step 1 (the catalog's roots): every changed entry,
+in key order, replaces its cell in place (a 32-byte value over a 32-byte value never splits), so a
+key written many times in a transaction rewrites its outer path once. Creating or removing a key
+changes the outer tree at once (an insert or delete of its cell). Until commit the map, not the
+outer cell, is the truth for its key: every key whose tree the transaction created or changed has
+an entry from that write until commit or until the key is removed, entries are never evicted, and
+every reader of an outer cell inside the transaction (`get`, the free walks) looks in the map
+first. An abort drops the map with the transaction; the flush does no I/O, so a process death
+anywhere before the meta's msync recovers to the previous state, as always. A flush error (damage
+on an outer path) fails the commit and latches.
+
+**Trust.** The writer's provenance trust (do-not-flag item 11) extends to nested
+trees with these rules:
+
+- A nested root is trusted only from its map entry, and only after this transaction wrote it. A
+  root read from an outer cell is untrusted: its pages get every published-page check.
+- An outer cell that names a page private to this transaction, with no map entry for its key, is
+  `Corrupt`: only a forged cell can name one (the transaction's own trees are all in its map).
+- Copy-on-write of a published outer leaf, and a merge absorbing one, checks its nested cells as
+  it checks branch pointers: a cell whose root carries this transaction's id must name a live
+  page published by an earlier transaction, else it is `Corrupt`.
+- A free walk (`drop_table`, `clear_table`) takes each nested root from the map, else from the
+  cell, untrusted. Every map entry must be met by the walk (else `Failed`, a broken invariant).
+- Splits and merges of the outer tree move nested cells as raw cells: the map is keyed by outer
+  key, not by position, so a moved cell keeps its entry. A cell the transaction wrote may name a
+  superseded root until the flush; that is expected (do-not-flag item 18).
+
+**Totals and `TableStat`.** The catalog record keeps a dup table's totals: `nested_trees`,
+`nested_entries`, `packed_rows` (0) and the nested trees' branch, leaf and overflow pages; the outer
+`root` counts the outer tree's own pages and entries. Every write updates them in memory at once,
+with checked arithmetic (a total that would underflow or overflow is `Corrupt`: only a damaged
+record gets there), so a write transaction's `table_stat` includes changes not yet flushed.
+`TableStat` is O(1) for both kinds:
+
+| field | plain | dup |
+|---|---|---|
+| `entries` | the tree's entries | `nested_entries + packed_rows`: every row `k ‖ s` |
+| `height` | the tree's height | the outer tree's height |
+| `branch_pages`, `leaf_pages`, `overflow_pages` | the tree's | the outer tree's plus the nested trees' |
+| `nested_trees` | 0 | one per outer key |
+| `dup` | `None` | `Some(DupOptions)`: the O(1) way to learn a table's kind |
+
+**Drop and clear.** `drop_table` and `clear_table` of a dup table walk the outer tree and every
+nested tree in one walk sharing one page set, collecting every page and run before any is freed:
+every outer leaf is read and held to the outer-cell rule, a page or root reached twice is
+`Corrupt`, and the trees walked must sum to the record's totals (else `Corrupt`, naming the
+field), so a damaged table frees nothing. A dropped table's published pages are reused past the
+reader gate as any freed page is; a held `RoTxn` keeps reading them until it drops. `clear_table`
+leaves an empty dup table of the same options.
+
+**What `Env::check` verifies** for a dup table, beyond a plain table's checks of its outer tree:
+the record passes `usable`; every outer key is `key_len` bytes; every outer cell is a nested cell
+(an inline or overflow outer cell is `Corrupt`); each nested root decodes and its tree passes a
+plain table's whole walk (identity, CRC, validation, kinds, ranges, its counters against its pages,
+runs with their full CRC), with subkeys of 1 to `max_key − key_len` bytes and no nested cell; one
+owner claims the outer and nested pages, so a root or page named twice is a double claim; and the
+walked trees' counts, entries and pages equal the record's totals, with `nested_trees` equal to the
+outer tree's entries. A table's `TableCheck` reports its rows, its outer and nested pages (runs
+included) and its outer height, so `entries` equals `table_stat`'s for both kinds.
 
 ---
 
@@ -780,8 +920,9 @@ and skip the CRC (`RunCrc::Skip`), since they never read the value. Do-not-flag 
 cost.
 
 **A nested cell is `Corrupt` at every value read** (`PageRead::value`) and every key-tail read
-(the cursors' `key_tail`, behind `current_with_key_tail` and `seek_with_key_tail`): no table
-holds one (see [Nested cells and dup records](#nested-cells-and-dup-records)).
+(the cursors' `key_tail`, behind `current_with_key_tail` and `seek_with_key_tail`): no value a
+read returns is one. Only a dup table's outer tree holds nested cells, and its reads match the
+cell itself (see [Dup tables](#dup-tables)); a cursor over a dup table is `TableKind`.
 
 **CRCs are not recomputed on every read** of a tree page. That would cost a pass over the page
 each time. The CRC is verified in these places instead:
@@ -960,10 +1101,12 @@ A latched NoSync environment skips its final sync on drop.
 | `IoStats::since(&earlier) -> IoStats` | the difference of two reads: each counter's, saturating, but `max_gate_lag`, a maximum since the open, which is the later read's |
 | `Env::failure()` | the latched cause, if any |
 | `Env::max_key_len() / max_value_len(klen)` | the entry limits of this page size. `max_value_len` is the table limit: 16 MiB for a key up to `max_key_len − 10` bytes, else the inline limit. A value over the inline limit is stored in an overflow run transparently: `put`, `get` and the cursors take and return its bytes as for any value. |
-| `ReadTxn` (both txn kinds) | `open_table(name) -> Option<Table>`, `get`, `cursor`, `txn_id`, `table_stat -> TableStat { entries, height, branch_pages, leaf_pages, overflow_pages }` (O(1), from the root record) |
-| `RwTxn::create_table(name)` | open or create |
-| `RwTxn::drop_table(Table) / clear_table(&Table)` | free the tree's pages (both are copy-on-write: readers keep the old tree) |
-| `RwTxn::put / delete -> bool` | point writes |
+| `ReadTxn` (both txn kinds) | `open_table(name) -> Option<Table>` (either kind), `get` (a dup table's by the logical key `k ‖ s`), `cursor` (`TableKind` on a dup table), `txn_id`, `table_stat -> TableStat { entries, height, branch_pages, leaf_pages, overflow_pages, nested_trees, dup }` (O(1), from the table's record; a dup table's figures in [Dup tables](#dup-tables)) |
+| `RwTxn::create_table(name)` | open or create a plain table (`TableKind` on a dup table) |
+| `RwTxn::create_dup_table(name, DupOptions { key_len, packed_max })` | open or create a dup table: rows keyed `k ‖ s`, `k` of exactly `key_len` bytes (1 to `max_dup_key_len`, 975 at 4 KiB pages), `packed_max` 0 (else `InvalidDupOptions`); an existing table of the other kind or other options is `TableKind` |
+| `RwTxn::drop_table(Table) / clear_table(&Table)` | free the table's pages, a dup table's nested trees included (both are copy-on-write: readers keep the old tree) |
+| `RwTxn::put / delete -> bool` | point writes; on a dup table by the logical key `k ‖ s` (a key with no subkey is `KeyTooShort`) |
+| `RwTxn::delete_prefix(&Table, k) -> u64` | a dup table's rows under the outer key `k` (exactly `key_len` bytes) removed, its nested tree freed in one walk; returns the rows removed (`TableKind` on a plain table) |
 | `RwTxn::insert(table, key, value)` | put only a key the table does not hold: a present key is `KeyExists`, found by the put's own search (in the table's cached leaf, else by the descent's plan) and refused before anything changes, with no latch; a new key is stored exactly as `put` stores it |
 | `RwTxn::append(table, key, value)` | put a new last entry: `key` must sort strictly after the table's last key (an empty table takes any key), else `AppendOutOfOrder`, refused before anything changes. An append into the table's cached rightmost leaf neither descends nor searches; the cache holds the leaf of the table's last put or append in this transaction (after an append split, the new right leaf) until a page is allocated or freed, and any other append descends. |
 | `RwTxn::cursor_mut -> RwCursor` | cursor moves and prefix steps plus `put`, `append` (as `RwTxn::append`), `insert` (as `RwTxn::insert`) and `delete_current`. A put, append or insert leaves the cursor at its entry: placed from the path it wrote (after an append split, from the new path the split refills the table's path cache with), or re-sought by key after any other split; a refused one leaves the cursor where it was. A delete re-seeks by key, so after any merges the cursor is on the deleted entry's follower in a deleted state, so a walk that deletes as it goes skips nothing: `next` returns the follower without stepping past it, `current` returns it too, `prev` returns the entry before it, and another `delete_current` deletes it. Right after a delete the prefix steps compare with the deleted key: the follower (`next_in_prefix`) or the entry before (`prev_in_prefix`) if it shares the prefix, else `None` with the cursor still on the follower in the deleted state. With no follower the cursor is after the end: `next`, `current` and `delete_current` find nothing and `prev` returns the new last entry. |
@@ -1102,10 +1245,13 @@ it lands on, a multi-page overflow value in full).
 | `Io(io::Error)` | an I/O failure (latches inside a write, commit or sync) |
 | `Corrupt(String)` | damage: a failed CRC, structure, pointer, range or accounting check, or an unopenable file (latches when found by a read) |
 | `Failed(String)` | the environment is latched (the first cause), or a broken internal invariant |
-| `KeyTooLarge { len, max }` / `ValueTooLarge { len, max }` | an entry over the page size's limits (no latch) |
+| `KeyTooLarge { len, max }` / `ValueTooLarge { len, max }` | an entry over the page size's limits, or an outer key passed to `delete_prefix` longer than its dup table's `key_len` (no latch) |
+| `KeyTooShort { len, min }` | a dup table's point operation with no subkey (`len <= key_len`, `min = key_len + 1`), or a `delete_prefix` outer key shorter than `key_len` (no latch) |
 | `AppendOutOfOrder` | an append whose key does not sort strictly after the table's last key (no latch) |
 | `KeyExists` | an insert (`RwTxn::insert`, `RwCursor::insert`, `TxnCursor::insert`) of a key the table holds (no latch) |
 | `TableNotFound(String)` / `StaleTable(String)` / `InvalidTableName` | table errors (no latch) |
+| `TableKind(String)` | a call that needs the other kind of table: `create_table` on a dup table, `create_dup_table` on a plain table or a dup table of other options, a plain cursor on a dup table, `delete_prefix` on a plain table (no latch) |
+| `InvalidDupOptions(String)` | `create_dup_table` with `packed_max` above 0 (packed sets are not supported) or a `key_len` of 0 or past `max_dup_key_len` (no latch) |
 | `NotTndbB` | a non-empty file without the magic in either meta slot |
 | `UnsupportedVersion(u32)` | another format version in a meta slot |
 | `InvalidPageSize(u32)` | `EnvOptions::page_size` is not a power of two in 4K..=64K |
@@ -1179,11 +1325,11 @@ it lands on, a multi-page overflow value in full).
 The entry limits are in [Limits](#limits): a table takes values up to 16 MiB, in overflow runs.
 These limits and non-goals are known:
 
-- **No dup-sort tables.** The reth adapter ([`tndb-b-reth`](../tndb-b-reth/README.md))
-  stores a dup table's rows as ordinary keys `key ‖ subkey`. The format defines a nested cell
-  (leaf cell flags 2) and a dup table's catalog record, but no operation writes either, and one
-  met on disk is `Corrupt` ([Nested cells and dup records](#nested-cells-and-dup-records)). Leaf
-  cell flags other than 0, 1 (overflow) and 2 (nested) are refused.
+- **Dup tables hold nested trees only, with no cursor yet.** Packed sets (`packed_max` above 0)
+  are not supported, so every outer key costs a nested tree of at least one page however few
+  rows it has, and a cursor over a dup table is `TableKind` in this version
+  ([Dup tables](#dup-tables)). Leaf cell flags other than 0, 1 (overflow) and 2 (nested) are
+  refused.
 - **The inline limit is about a quarter of a page** (`MAX_ENTRY = U / 4`, kept for its one-split
   proof): about 1 KB at 4 KiB pages. A value of 1–4 KB at 4 KiB pages
   therefore takes a run page of its own. Raising it needs a new split proof and a format change.
@@ -1430,6 +1576,31 @@ These limits and non-goals are known:
     - Deleted values can stay on disk in gaps until those pages are rewritten, as they already
       could in free pages and in the gap a delete leaves. The engine makes no secure-delete
       promise.
+18. **Inside a write transaction a dup table's outer cell can name a superseded nested root**
+    (`Work::flush_nested`, see [Dup tables](#dup-tables)).
+    - Why: a nested write changes only its nested tree and the transaction's map entry for the
+      key; the outer cell is rewritten once per changed key, at commit. Rewriting it on every
+      write would copy and rewrite the outer path per row.
+    - The map is the truth for its key until commit: every key whose tree the transaction
+      created or changed keeps its entry until commit or the key's removal, entries are never
+      evicted, and every reader of an outer cell inside the transaction looks in the map first.
+      A stale cell's root may even name pages since freed and reused; nothing follows it.
+    - Published outer pages never hold a stale cell: the flush runs before step 1, and a cell on
+      a published page is committed. Debug builds assert after the flush that every entry's cell
+      holds its root.
+19. **Every outer key of a dup table holds a nested tree of at least one page.**
+    - Why: packed sets (a key's few rows inline in its outer cell) are not supported in this
+      version: `packed_max` must be 0, and a record with packed sets is `Corrupt` at use. A key
+      with one row therefore costs a leaf page of its own.
+    - The record's `packed_max` and `packed_rows` fields are decoded and held to their rules
+      already ([Catalog](#catalog)).
+20. **A write transaction keeps one path cache per outer key it writes** (the boxed
+    `write::PathCache` of each map entry, about 1 KiB).
+    - Why: keys written in turn each keep their own cached leaf, so interleaved keys do not
+      evict each other's path; the map's entries are never evicted (item 18).
+    - The memory is bounded by the transaction's own work: every such key already owns at
+      least one private page (a new tree's leaf, or the copy of a committed tree's leaf), so the
+      map stays a fraction of the transaction's dirty pages, and it drops at commit or abort.
 
 ---
 
@@ -1442,10 +1613,10 @@ The default tests are small and fast, because CI runs nextest in debug. The heav
 |---|---|
 | `page.rs` tests | leaf and branch codecs against proptest models; an insert at every index, the end included, against a model (`inserts_at_every_index_match_a_model`); `copy_short` against `copy_from_slice` at every length to 80, and its length-mismatch panic; the parsed views (`View`, `LeafView`, `BranchView`) against an independent model; splits at all five page sizes; `SplitBuf` splits byte-identical to a reference split (leaves and branches, the pending cell anywhere, a quarter of the cases at the append place); append fill; exact limits; a full page left byte-identical; 13 damage kinds; never panicking on fuzzed bytes; overflow cells are canonical references (flags 1 with a 12-byte value, a length past the inline limit and within 16 MiB), and the views model and damaged-page generator include them; nested cells are canonical roots (flags 2 with a 32-byte value that decodes to a non-empty, possible root; every other shape refused, by message: `nested_cells_are_canonical_roots`), and the views model, the damaged-page generator, the key-tail model and the insert-at-every-index model include them; `Geometry::place` keeps every value that fits inline and sends larger ones to runs of the right length (`place_keeps_m1_values_inline_and_sends_larger_ones_to_runs`) |
 | `overflow.rs` | the run codec: a run reads back its value; each kind of damage to a run is `Corrupt` under every `RunCrc` (each header field re-stamped, a zero trailer, a flipped middle page, a range past the end or over a meta page, a page-number overflow, an unmapped run, a txn after the snapshot or not the cell's, a length that disagrees with the run or is over 16 MiB), private runs too; the test store reads runs against its snapshot |
-| `tree/write.rs`, `tree/read.rs` | copy-on-write put and delete against a `BTreeMap` model over random batches (with a coverage gate on split and delete shapes), which also put large values (inline, 1-page and 2–10-page runs) and check the overflow counter and the run pages; a failed allocation leaves the tree identical, also when the put takes a run; a put into a run or a replace of one takes the descent, not the path cache; a published leaf naming a private run, and a copied leaf naming a run this txn allocates later, are refused; a delete refuses a handle miscounting its pages; after every put of appends, inserts and replaces through each split shape (a leaf split its parent takes, a branch split, a new root), the path cache equals a fresh descent (`an_append_split_caches_the_path_a_descent_finds`); a put or delete through a cache whose leaf was unlinked since, by deletes that bypassed it, descends and lands where the key lives (`a_path_cache_of_another_epoch_is_never_used`); with merging off, cached deletes leave a leaf's last entry to the descent, which unlinks the leaf (`a_cached_delete_leaves_a_leafs_last_entry_to_the_descent`); a delete's miss over a published leaf leaves the cache empty, so a put there copies the leaf (`a_delete_miss_over_a_published_leaf_leaves_the_path_cache_empty`); both against the same writes without the cache; split reservation for long separators; append fill; collapse and unlink; `clear` and the free walk refuse damaged or stale pointers, and a page private to the transaction for another tree (its leaf or a run's page) named by a published cell, an untrusted root handle or a forged cell a private copy kept (`the_free_walk_refuses_a_page_private_to_another_tree`); fetch checks, stale copies, redirected children and misrouted pointers are `Corrupt`; copy-on-write's one copy gives the two-step copy's bytes, on `MemStore` and the environment's writer (`copy_on_write_is_the_two_step_copy`), reads a page published before a remap from the new mapping (`copy_on_write_reads_a_page_published_before_a_remap`), and fails exactly as `PageRead::page` fails, a page past the published bytes included (`copy_on_write_fails_as_the_page_fetch_fails`); provenance trust: a trusted path skips the range checks, a private page named by a page this writer did not write (a stamped forged cell, an untrusted root handle, a collapse) is refused, as is a copied cell naming a page this txn allocates later, while a child whose txn wrapped stays live; a nested cell in a private leaf is `Corrupt` at a put, a cached put, a cached delete, a delete, `clear` and `free_subtree`, the handle unchanged (`a_nested_cell_in_a_private_leaf_is_corrupt_at_every_write`) |
+| `tree/write.rs`, `tree/read.rs` | copy-on-write put and delete against a `BTreeMap` model over random batches (with a coverage gate on split and delete shapes), which also put large values (inline, 1-page and 2–10-page runs) and check the overflow counter and the run pages; a failed allocation leaves the tree identical, also when the put takes a run; a put into a run or a replace of one takes the descent, not the path cache; a published leaf naming a private run, and a copied leaf naming a run this txn allocates later, are refused; a delete refuses a handle miscounting its pages; after every put of appends, inserts and replaces through each split shape (a leaf split its parent takes, a branch split, a new root), the path cache equals a fresh descent (`an_append_split_caches_the_path_a_descent_finds`); a put or delete through a cache whose leaf was unlinked since, by deletes that bypassed it, descends and lands where the key lives (`a_path_cache_of_another_epoch_is_never_used`); with merging off, cached deletes leave a leaf's last entry to the descent, which unlinks the leaf (`a_cached_delete_leaves_a_leafs_last_entry_to_the_descent`); a delete's miss over a published leaf leaves the cache empty, so a put there copies the leaf (`a_delete_miss_over_a_published_leaf_leaves_the_path_cache_empty`); both against the same writes without the cache; split reservation for long separators; append fill; collapse and unlink; `clear` and the free walk refuse damaged or stale pointers, and a page private to the transaction for another tree (its leaf or a run's page) named by a published cell, an untrusted root handle or a forged cell a private copy kept (`the_free_walk_refuses_a_page_private_to_another_tree`); fetch checks, stale copies, redirected children and misrouted pointers are `Corrupt`; copy-on-write's one copy gives the two-step copy's bytes, on `MemStore` and the environment's writer (`copy_on_write_is_the_two_step_copy`), reads a page published before a remap from the new mapping (`copy_on_write_reads_a_page_published_before_a_remap`), and fails exactly as `PageRead::page` fails, a page past the published bytes included (`copy_on_write_fails_as_the_page_fetch_fails`); provenance trust: a trusted path skips the range checks, a private page named by a page this writer did not write (a stamped forged cell, an untrusted root handle, a collapse) is refused, as is a copied cell naming a page this txn allocates later, while a child whose txn wrapped stays live; a nested cell in a private leaf is `Corrupt` at a put, a cached put, a cached delete, a delete, `clear` and `free_subtree`, the handle unchanged (`a_nested_cell_in_a_private_leaf_is_corrupt_at_every_write`); an outer tree of nested cells against a model through every write shape, and the refusals of each cell policy (`outer_trees_of_nested_cells_match_a_model`); a published outer cell naming this txn's id refused at copy (`a_published_outer_cell_naming_this_txn_is_refused_at_copy`); `read::last_key` against a model (`last_key_is_the_trees_last_key`) |
 | `tree/write.rs` merging | the random batches with merging on, against the same model (`random_batches_with_merging_match_a_btreemap_model`): odd rounds put and delete through a `PathCache` (`put_cached`, `delete_cached`; debug builds require cached deletes among them), and after every delete, cached or not, the pages it changed are merge-closed and the accounting holds, and the coverage gate adds leaves merged from the left and from the right, branch merges, a cascade over two levels or more, a root giving way and a refused merge; the fill bound (`deleting_90_percent_leaves_no_page_merge_open`: after 90% of a random fill is deleted at random, no page under a quarter fits with a neighbour, and the leaves stay 0.40–0.47 full against about 0.08 without merging); a merge refuses a damaged sibling from either side before anything changes (`a_merge_refuses_a_damaged_leaf_sibling`, `a_merge_refuses_a_damaged_branch_sibling`: a flipped byte under a stale CRC, a stale txn in the parent's cell, an older retired copy, a redirect outside the separators, a private sibling, a cell or overflow cell naming this txn, and for branches a key out of order across the seam); a refused neighbour gets only the cheap checks, and damage only its CRC finds waits for its first use (`a_refused_neighbour_gets_only_the_cheap_checks`); a failed allocation during a merging delete leaves the tree identical (`a_failed_allocation_during_a_merging_delete_leaves_the_tree_identical`); an absorbed branch sibling's child-0 chain is descended to the leaves, so a single-child branch outside the cell's separators, a branch of another level and one branch named by two cells are refused (`a_merge_refuses_a_single_child_branch_outside_the_cell`, `a_merge_refuses_a_branch_sibling_of_another_level`, `a_merge_refuses_a_branch_named_by_two_cells`). `a_collapse_checks_the_page_it_promotes` and `a_delete_refuses_a_handle_miscounting_its_pages` turn merging off (`no_merge`) to reach their shapes |
 | `tree/cursor/tests.rs` | random moves and prefix steps against a sorted model on the detached cursor and the public `Cursor`, over many tree shapes (grouped keys among them) and page sizes, committed and uncommitted; the ends of empty and single-entry trees; leaf crossings; seeks; prefix steps from every entry of a grouped tree, across leaf boundaries both ways (`prefix_steps_from_every_entry_match_a_model`); every key and every gap of many tree shapes through `seek`, `seek_exact` and `seek_with_key_tail`, each followed by a few steps, against the model on both cursors (`seeks_of_every_key_and_gap_match_a_model`, `_heavy`); `seek_with_key_tail` meets damage (a misrouted cell, an emptied leaf, a root of the wrong height, a flipped run byte) with the error a `seek` then `current_with_key_tail` meets (`a_seek_with_key_tail_meets_damage_as_a_seek_does`); two damages on one page met in the descent's order, the error the first check's exact message: the kind check before the header parse and before the range check (`the_descent_names_the_first_check_a_page_fails`); the path stays 6 bytes a level (`tree_cursor_stays_small`); seeks from random positions (after seeks, steps, `first` and `last`, past either end, after a `seek_exact` miss) equal a new cursor's seek and the steps after it, on the detached and public cursors and on `RoCursor` and `TxnCursor` (from the deleted state, and stale after another writer's put or delete), over every key and gap, every separator and the keys around it (`seeks_from_random_positions_match_a_fresh_seek`, `_heavy`); a seek inside the cursor's leaf (its keys and gaps, `seek_exact` misses there) makes no root descent and any other one does, even next to the leaf, a stale `TxnCursor`'s seek one descent and no reseek, and one after only a table created or dropped none (`a_seek_near_the_cursor_starts_from_its_leaf`, `owned_and_txn_cursors_seek_from_their_leaf`, `a_txn_cursor_seeks_from_its_leaf_after_a_schema_change`, debug builds); damage in the next leaf, sought from the leaf's end, is met with the descent's message, damage on the held path is not met again (`a_seek_from_the_leaf_meets_damage_as_a_descent_does`); damage under a cursor latches; `RwCursor` writes and prefix steps against a model (`current` and a second delete right after `delete_current` act on the follower), and prefix steps after `delete_current`; the owned `RoCursor` against the model and `Cursor` on one snapshot with overflow values (the random moves include `seek_with_key_tail`), outliving its transaction handle on another thread while commits free its pages, and latching damage |
-| `meta.rs`, `catalog.rs`, `latch.rs`, `alloc.rs`, `file.rs`, `sys.rs`, `crc.rs`, `page_set.rs`, `disk_model.rs` | codecs (the 96-byte catalog record: its layout, a plain record's zero dup fields and each damaged byte, `table_record_encoding`; a dup record's round trip, each broken rule and `TableRecord::plain`'s refusal, `dup_records_round_trip_and_refuse_damage`; a version-2 meta refused, `a_version_2_record_is_refused`), slot choice, the latch's first-cause rule (`ReadOnly` does not latch), allocator abort, overflow runs in the allocator (the first fit in the pool, else the file end; one CRC per run, its pages never trusted as stamped; a freed run comes back as single pages), growth and remap, a read-only mapping of a mode-0444 file that maps nothing once dropped (`a_read_only_file_maps_its_bytes_until_dropped`), sync wrappers, the exclusive and shared locks (`flock_shared_coexists_and_excludes_an_exclusive_lock`), the power-loss model |
+| `meta.rs`, `catalog.rs`, `latch.rs`, `alloc.rs`, `file.rs`, `sys.rs`, `crc.rs`, `page_set.rs`, `disk_model.rs` | codecs (the 96-byte catalog record: its layout, a plain record's zero dup fields and each damaged byte, `table_record_encoding`; a dup record's round trip and each broken rule, the page and row-sum rules included, `dup_records_round_trip_and_refuse_damage`; a dup record held to this build's limits, packed sets and a key past `max_dup_key_len`, `dup_records_are_usable_within_this_builds_limits`; a version-2 meta refused, `a_version_2_record_is_refused`), slot choice, the latch's first-cause rule (`ReadOnly` does not latch), allocator abort, overflow runs in the allocator (the first fit in the pool, else the file end; one CRC per run, its pages never trusted as stamped; a freed run comes back as single pages), growth and remap, a read-only mapping of a mode-0444 file that maps nothing once dropped (`a_read_only_file_maps_its_bytes_until_dropped`), sync wrappers, the exclusive and shared locks (`flock_shared_coexists_and_excludes_an_exclusive_lock`), the power-loss model |
 | `stamp.rs`, `env/tests.rs` (the stamp) | the parallel stamp against the serial loop (`crc::add_crc32_nonzero` on each unit), byte for byte: tree pages and runs of up to 9 pages, from no unit to more units than threads, on 1 to 9 threads (`crcs_stamp_the_bytes_of_the_serial_loop`); a payload whose CRC is 0 stamped with the all-ones sentinel (`a_zero_crc_payload_gets_the_serial_loops_sentinel`); the shares cover every unit once, in order, in balanced parts (`shares_cover_the_units_in_order_in_balanced_parts`); the thread count's threshold and cap (`threads_grow_with_the_bytes_to_the_cap`); whole commits stamped on 2, 3 and 5 threads leave the serial stamp's file, which reopens, checks and reads back (`a_parallel_stamp_writes_the_serial_stamps_bytes`), as does a 3 MiB commit of runs on `stamp::threads`' own choice (`a_commit_past_the_stamp_threshold_writes_the_serial_stamps_bytes`) |
 | `env/tests.rs` | open steps (create at every page size, leftovers, the lock, a damaged newest meta, damaged roots, short and foreign files, the open fsync), commit and NoSync durability under power loss, a commit of no change, abort, the writer hand-off, readers across commits, step 4's sync choice (`data_sync`: one range or one `fdatasync`), a scattered commit and a two-range commit under power loss, the latch (failed msync, damage, oversized entries do not latch), table handles, a multi-page value read back after a commit and a reopen, `max_value_len` at every page size; the per-snapshot table roots: one catalog resolve per handle per snapshot, whichever read uses it (`a_snapshot_resolves_each_handle_once`), a dropped table's handle stale only in later snapshots (`a_dropped_tables_handle_is_stale_only_in_later_snapshots`), a hit needing the handle's name as well as its id, for another file's handle with the same id and for an aborted create's handle, whose id the next table created takes (`a_remembered_root_needs_the_handles_name_too`), and 40 tables, past the 32 slots, each resolving to its own table (`more_tables_than_a_snapshot_remembers_still_resolve`) |
 | `freelist/tests.rs` | the record codec; reuse after two durable commits or two NoSync syncs, held back by a live reader; damaged records never handed out; abort returns the records taken; dropped and cleared tables' pages reused; steady churn keeps the file bounded; the save settles within three rounds, including a record count that shrinks mid-save; `check` reports damage, leaks and double uses, and compares each root's page counters, and refuses a root branch with one child (`check_refuses_a_root_branch_with_one_child`); exact accounting in a random workload. Overflow runs at the environment level: the runs of cleared and dropped tables are freed and reused; a damaged run (header, leaf, counter) refuses `clear_table` and `drop_table` and changes nothing, the file included; `check` reports a damaged run (a CRC flip, a header or pad byte, a wrong counter) and a run page also on the free list; `check` finds a flip inside a 1-page run that a get does not; a get refuses a 1-page run reused as another page and a flip in a middle page of a run. Run allocation: a run takes a fit from records loaded for it, loads at most `RUN_LOAD_RECORDS` records, and an abort returns the records it loaded; leftover pages of a consumed record are listed under the keys consumed and reused by the next transaction; churn of 4–20 KB values keeps the file bounded (`run_churn_keeps_the_file_bounded`; with held readers, `run_churn_with_readers_keeps_the_file_bounded`, at most 1.75 times the live pages, and both heavy twins, 1.5 times over 50K commits and 1.75 over 20K). Merges free the siblings they absorb, which the save lists like any freed page, and it still settles within three rounds (`merges_feed_the_save_which_still_settles`) |
@@ -1454,7 +1625,8 @@ The default tests are small and fast, because CI runs nextest in debug. The heav
 | `tests/damage.rs` | each kind of damage at rest fails the open closed (the file unchanged) or, once opened, is met by reads, copy-on-write, free-list loads and `check` as `Corrupt`, which latches; nothing panics. A free record listing a live leaf of a tree without runs: a `drop_table` or `clear_table` of that tree after a write handed the leaf out (as a tree page or a 1-page run) is `Corrupt`, frees nothing and leaves the other table readable (`a_free_of_a_tree_refuses_a_leaf_this_transaction_holds_for_another`); after the write committed, the drop frees the leaf again and, once it is reused, the other table's gets are `Corrupt` by txn identity (`a_live_leaf_freed_by_a_later_drop_is_corrupt_once_reused`) |
 | `tests/damage_runs.rs` | a table with inline values and runs of 1, 3 and 9 pages, damaged at rest: `Corrupt` at a get for a flipped byte or a zeroed page in the middle of a run, a zeroed last page (zero trailer), a cell redirected to another run of the same txn (of the same pages: only the length tells) or to its key's stale run of the same length (only the txn identity tells), a cell's length changed, a run's kind changed, a 1-page run's page number or kind changed; at `check` for a flipped byte inside a 1-page run and an overflow counter one too high, which `drop_table` and `clear_table` also refuse; a free record listing a live run's middle page is `Corrupt` at `check`, at the get after a write reused the page (every other value reads back), or at the commit of a write that freed the run while the page sat in the pool; two cells naming one run, both deleted in one transaction, are `Corrupt` at the commit, which latches as damage (`two_cells_naming_one_run_freed_together_are_corrupt_at_commit`) |
 | `tests/damage_merge.rs` | a file whose deletes merge leaves (table `l`) and, after an unlink, branches (table `b`), checked undamaged (`the_fixture_deletes_merge`); damage at rest to the sibling a merge absorbs, from either side (`a_merge_refuses_a_damaged_leaf_sibling`, `a_merge_refuses_a_damaged_branch_sibling`): a flipped byte (the CRC finds it), a stale txn in the parent's cell, a redirect outside the cell's separators, a cell naming a page or run by this transaction's id past the file's end, and for branches the parent's key coming down equal to the right page's key 1 (the seam check). Each is `Corrupt` at the delete, the environment latches, and the file is byte for byte as it was |
-| `tests/nested_damage.rs` | a nested cell forged into a committed table's published leaf, its CRC restamped so only the nested rule finds it: `Corrupt`, latched, at a get, a `Cursor` seek and a step onto it, a `RoCursor` seek, `seek_with_key_tail` on `RoCursor` and `TxnCursor`, a put over it, a put beside it (copy-on-write of its leaf), its delete, `drop_table`, `clear_table` and `Env::check` (`a_forged_nested_cell_is_corrupt_and_latches_at_every_use`); a valid dup record written into the catalog: `Corrupt`, latched, at `open_table` (read and write transactions), a get through a handle taken before, `create_table` of its name, `drop_table` and `Env::check`, while a plain table beside it reads with no latch (`a_dup_table_record_is_refused_at_open_drop_and_check`) |
+| `tests/nested_damage.rs` | a nested cell forged into a committed table's published leaf, its CRC restamped so only the nested rule finds it: `Corrupt`, latched, at a get, a `Cursor` seek and a step onto it, a `RoCursor` seek, `seek_with_key_tail` on `RoCursor` and `TxnCursor`, a put over it, a put beside it (copy-on-write of its leaf), its delete, `drop_table`, `clear_table` and `Env::check` (`a_forged_nested_cell_is_corrupt_and_latches_at_every_use`); a dup record written over a plain table's inline cells: it opens, its stat and a same-options `create_dup_table` answer, `create_table` of its name is `TableKind` with no latch, a get of an absent outer key misses; then, each on a fresh copy, `Corrupt` and latched at a get (read and write transactions), a put, a delete, `delete_prefix`, a put of a new outer key (copy-on-write of the leaf), `drop_table`, `clear_table` and `Env::check` (`a_dup_record_over_inline_cells_is_corrupt_at_first_use`) |
+| `tests/dup.rs` | dup tables: the kinds and options (`table_kinds_are_checked`, `dup_options_are_validated` at 4 and 16 KiB, `a_packed_dup_record_is_refused`, `an_empty_dup_tables_stat_is_its_shape`), the logical key's limits (`dup_keys_are_validated`), append by the logical key (`dup_append_orders_by_the_logical_key`), the working map and the flush (`reads_inside_the_txn_see_unflushed_roots`, `the_flush_writes_every_changed_root`, `nested_writes_move_the_table_stamp`, round trips, abort), the totals after every change against `table_stat` and a walk (`dup_totals_follow_every_change`), `delete_prefix`, drop and clear freeing every page with a reader held (`delete_prefix_frees_the_tree_and_its_cell`, `dropping_or_clearing_a_dup_table_frees_every_page`); forged damage, each `Corrupt` at first use: a cell naming a private page with no working root, a published outer cell naming this txn's id at copy-on-write, a nested cell inside a nested tree, a shared nested root (a double claim; reached twice at drop, nothing freed), totals off by one, an outer key of another width, an inline or overflow outer cell (`check` and the free walks); and Oracle 1, `dup_tables_match_a_composite_model` (a dup table and a plain table keyed `k ‖ s` against one `BTreeMap` model: every op's result, reads, readers, commits, aborts, reopens, clears and drops, `check` after every commit, coverage gates on outer and nested height 2; its `_heavy` twin runs 8 seeds of 40k steps at 4 and 16 KiB) |
 | `tests/merge.rs` | environment-level merging: deletes that merge leaves, a branch and the root, committed, reopened and read back against the model, with `Env::check` and a twin that does not merge (`deletes_that_merge_commit_and_reopen_to_the_model`); `RwCursor::delete_current` sweeps across leaves, every other key and down to one leaf, `next` returning each follower (`delete_current_sweeps_return_each_follower_while_pages_merge`); a put after a merge that freed or kept the cached leaf descends instead of using the stale cache (`a_put_after_a_merge_never_uses_the_cache_of_a_freed_page`); the crash matrix on a commit whose deletes merge and make the root give way (`every_crash_point_of_a_merging_commit_recovers_the_state_the_protocol_allows`, `_heavy`) |
 | `tests/multi_model.rs` | a random multi-table workload with crashes against a model; its large-value variant spreads values over inline and 1–10-page runs, with drops and clears of tables holding runs; a draining variant (stretches of mostly deletes, `a_draining_multi_table_workload_with_crashes_matches_the_model`) makes pages merge, and every variant's coverage gate counts merging deletes |
 | `tests/path_cache.rs` | random multi-table workloads (puts, deletes, a detached cursor's `delete_current` walks and its seek, delete and put of one key, clears, drops, commits, aborts, readers held) on a cached and an uncached environment (the test-only `no_path_cache`, which also drops a delete's slot, so a `TxnCursor` there finds its place by key after a delete): the same outcomes, the cursor's after each delete included, and byte-identical files after every commit, with puts and deletes in the cached leaf counted in debug builds (`CACHED_PUTS`, `CACHED_DELETES`); over 3000 sorted keys, a seek, `delete_current` and cursor put of each key make no root descent inside `delete_current` and delete in the cached leaf but for each leaf's first delete and the deletes in a leaf under a quarter, the cursor on each follower (`slot_rewrites_over_sorted_keys_delete_in_the_cached_leaf`, counted in debug builds); a cached leaf reused by another table in the same txn is not written; an aborted transaction's cache never reaches the next |

@@ -17,8 +17,8 @@
 //! A leaf cell's flags are 0 for a value held in the cell, 1 for an overflow cell, whose
 //! 12-byte value names the overflow run holding the value ([`Val`], [`crate::overflow`]), or 2 for
 //! a nested cell, whose 32-byte value is an encoded [`TreeRoot`] ([`Val::Nested`]); any other flag
-//! is [`Error::Corrupt`]. No table holds nested cells yet, so every reader and writer refuses one
-//! as damage ([`nested_error`]).
+//! is [`Error::Corrupt`]. Only a dup table's outer tree holds nested cells, one per outer key;
+//! every reader and writer of any other tree refuses one as damage ([`nested_error`]).
 //!
 //! **Packing.** The cells tile `upper..P − 4` exactly. A new cell goes just below `upper`;
 //! deleting or shrinking a cell closes its gap at once (the cells below it move up and their slots
@@ -237,8 +237,9 @@ fn inline_error(ovf: Ovf) -> Error {
     Error::Corrupt(format!("an overflow value ({ovf:?}) in a tree of inline values"))
 }
 
-/// The [`Error::Corrupt`] of a nested cell met by any use: no table holds nested trees yet, so a
-/// nested cell is damage wherever a read or a write meets it. The one message of every such use.
+/// The [`Error::Corrupt`] of a nested cell met outside a dup table's outer tree: in a plain
+/// table, the catalog, the free tree or a nested tree a nested cell is damage wherever a read or
+/// a write meets it. The one message of every such use.
 #[cold]
 #[inline(never)]
 pub(crate) fn nested_error(root: &[u8; NESTED_CELL]) -> Error {
@@ -345,6 +346,14 @@ impl Geometry {
     /// The longest key: one whose branch cell (as a separator) is a maximal entry.
     pub(crate) fn max_key(&self) -> usize {
         self.max_entry - BRANCH_CELL_HEADER - SLOT
+    }
+
+    /// The widest outer key a dup table takes: the largest `K` whose outer cell, the key with a
+    /// [`NESTED_CELL`]-byte nested root, is an inline entry (`max_value(K) >= NESTED_CELL`). It is
+    /// below [`Self::max_key`] by more than a byte, so a logical key `k ‖ s` with a 1-byte subkey
+    /// is within the key limit.
+    pub(crate) fn max_dup_key_len(&self) -> usize {
+        self.max_entry - LEAF_CELL_HEADER - SLOT - NESTED_CELL
     }
 
     /// The longest value stored with a `klen`-byte key, or 0 for a key over [`max_key`], which
@@ -823,7 +832,8 @@ fn leaf_cell_other(
 
 /// Whether a cell of flags `flags` (neither 0 nor a 12-byte overflow cell's) with a `vlen`-byte
 /// value is a nested cell: [`CELL_NESTED`] with [`NESTED_CELL`] bytes. Asked only on the cold
-/// paths ([`leaf_cell_other`], [`leaf_cell_error`]): no table holds nested cells yet.
+/// paths ([`leaf_cell_other`], [`leaf_cell_error`]): only a dup table's outer leaves hold
+/// nested cells, and no hot read path reads one.
 #[inline]
 fn nested_shape(flags: usize, vlen: usize) -> bool {
     flags == CELL_NESTED && vlen == NESTED_CELL
@@ -2422,8 +2432,16 @@ mod tests {
             assert!(free_space(&page).unwrap() < g.max_entry());
             validate(&page, &g).unwrap();
         }
+        for size in SIZES {
+            // The widest dup outer key: its cell inline, a 1-byte subkey within the key limit.
+            let g = geometry(size);
+            let k = g.max_dup_key_len();
+            assert!(k < g.max_key() && g.max_value(k) >= NESTED_CELL, "{size}");
+            assert!(g.max_value(k + 1) < NESTED_CELL, "{size}: the largest");
+        }
         let g = geometry(4096);
         assert_eq!((g.max_key(), g.max_value(32)), (1005, 975));
+        assert_eq!(g.max_dup_key_len(), 975);
         // A refused key has no value limit, not the 1 or 0 bytes its entry would leave.
         assert_eq!((g.max_value(1005), g.max_value(1006), g.max_value(1007)), (2, 0, 0));
         assert_eq!(g.max_value(usize::MAX), 0);

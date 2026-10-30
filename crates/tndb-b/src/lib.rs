@@ -9,6 +9,16 @@
 //! highest transaction id), and pages freed by a commit are reused only once no durable meta and no
 //! live reader can reach them, through a free list persisted in the file itself. There is no log:
 //! the meta pages and the gated page reuse carry all crash safety.
+//!
+//! A table is plain or dup. A plain table maps byte-string keys to values. A dup table
+//! ([`RwTxn::create_dup_table`], [`DupOptions`]) keys every row `k ‖ s`, an outer key of a fixed
+//! width and a subkey: its outer tree holds one cell per outer key, naming that key's own nested
+//! B+tree of subkeys and values. Its point operations ([`ReadTxn::get`], [`RwTxn::put`],
+//! [`RwTxn::insert`], [`RwTxn::append`], [`RwTxn::delete`]) take the logical key `k ‖ s`, and
+//! [`RwTxn::delete_prefix`] removes one outer key's rows. A write transaction keeps the nested
+//! roots it writes in memory and rewrites their outer cells once, at commit. A call that needs
+//! the other kind of table is [`Error::TableKind`]; packed sets and cursors over a dup table are
+//! not supported in this version.
 
 // The page file is mmap-backed, synced with `msync`/`fsync`, preallocated with
 // `fallocate`/`F_PREALLOCATE` and locked with `flock`: this crate builds for unix targets only.
@@ -40,6 +50,7 @@ mod tests;
 mod tree;
 mod txn;
 
+pub use catalog::DupOptions;
 pub use check::{CheckReport, TableCheck};
 pub use env::{Env, EnvOptions, EnvStat, SyncMode};
 pub use error::{Error, Result};

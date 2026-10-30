@@ -34,6 +34,11 @@ impl Mdbx {
     pub(crate) const VERSION_MISMATCH: Self = Self { code: -30794, message: "DB version mismatch" };
     /// `MDBX_INVALID`.
     pub(crate) const INVALID: Self = Self { code: -30793, message: "file is not an MDBX file" };
+    /// `MDBX_INCOMPATIBLE`.
+    pub(crate) const INCOMPATIBLE: Self = Self {
+        code: -30784,
+        message: "environment or database is not compatible with the requested operation or flags",
+    };
     /// `MDBX_BAD_TXN`.
     pub(crate) const BAD_TXN: Self =
         Self { code: -30782, message: "transaction is not valid for requested operation" };
@@ -77,13 +82,18 @@ pub(crate) fn info(error: &tndb_b::Error) -> DatabaseErrorInfo {
     match error {
         E::KeyExists => Mdbx::KEY_EXIST.info(),
         E::AppendOutOfOrder => Mdbx::KEY_MISMATCH.info(),
-        E::KeyTooLarge { .. } | E::ValueTooLarge { .. } => Mdbx::BAD_VALSIZE.info(),
+        E::KeyTooLarge { .. } | E::KeyTooShort { .. } | E::ValueTooLarge { .. } => {
+            Mdbx::BAD_VALSIZE.info()
+        }
+        E::TableKind(_) => Mdbx::INCOMPATIBLE.info(),
         E::Corrupt(_) => Mdbx::CORRUPTED.info(),
         E::Locked => Mdbx::BUSY.info(),
         E::ReadOnly => Mdbx::ACCESS.info(),
         E::WrongTxn => Mdbx::BAD_TXN.info(),
         E::TableNotFound(_) | E::StaleTable(_) => Mdbx::NOT_FOUND.info(),
-        E::InvalidTableName | E::InvalidPageSize(_) => Mdbx::INVALID_PARAMETER.info(),
+        E::InvalidTableName | E::InvalidPageSize(_) | E::InvalidDupOptions(_) => {
+            Mdbx::INVALID_PARAMETER.info()
+        }
         E::Failed(_) => Mdbx::PANIC.with_message(error.to_string()),
         E::NotTndbB => Mdbx::INVALID.with_message(error.to_string()),
         E::UnsupportedVersion(_) => Mdbx::VERSION_MISMATCH.with_message(error.to_string()),
