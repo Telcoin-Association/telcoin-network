@@ -176,10 +176,13 @@ cannot use the capacity that a committee request needs.
 The opening-read pool has 8 public permits (`MAX_CONCURRENT_OPENING_READS`) and 4 committee
 permits (`COMMITTEE_RESERVED_OPENING_READS`). `try_admit_opening()` takes a permit *before* the
 serving task is spawned. The task holds the permit while it reads the opening `Req` frame, for a
-maximum of `SYNC_REQUEST_READ_TIMEOUT` (5 s). The task releases the permit as soon as the opening
-read ends, whatever its result, so no serve, control write or close holds it. The worker charges a
-public peer `Penalty::Mild` if it sends no frame in time, a frame that cannot be read, or a frame
-that is not a `Req`. A `Deny(AtCapacity)` answer is not charged, because an honest peer gets it when
+maximum of `PUBLIC_SYNC_REQUEST_READ_TIMEOUT` (1 s) for a public peer and
+`SYNC_REQUEST_READ_TIMEOUT` (5 s) for a committee peer. The task releases the permit as soon as
+the opening read ends, whatever its result, so no serve, control write or close holds it. The
+worker charges a public peer `Penalty::Mild` if it sends no frame in time, a frame that cannot be
+read, or a frame that is not a `Req`. It also charges a public peer `Penalty::Mild` for a valid
+`Req` that arrives after more than half of the 1 s bound, whether the worker then serves or
+refuses it. A prompt `Deny(AtCapacity)` answer is not charged, because an honest peer gets it when
 the batch serve pool is full.
 
 If no permit is available, the responder writes `Deny(DenyReason::AtCapacity)` on a budgeted shed
@@ -316,10 +319,13 @@ Concurrency tests cover:
 - Exhaustion of the public share of the batch serve pool sheds with `Deny(AtCapacity)`
 - Release of the peer slot and the pool permits when an admission is dropped
 - Public peers cannot use the committee reserve of the opening-read or the batch serve pool
-- Silent public streams release their opening-read permits at `SYNC_REQUEST_READ_TIMEOUT` and get
-  one `Penalty::Mild` each
+- Silent public streams release their opening-read permits at `PUBLIC_SYNC_REQUEST_READ_TIMEOUT`
+  and get one `Penalty::Mild` each
+- `late_valid_public_openings_are_charged`: four public identities open two streams each, and
+  each request arrives 1 ms before the bound: all eight are served, each gets one `Penalty::Mild`,
+  and the pools are whole afterwards
 - Unreadable and unexpected public openings release the opening-read permit as soon as the read
-  ends and get one `Penalty::Mild`; an `AtCapacity` refusal releases it and gets no penalty
+  ends and get one `Penalty::Mild`; a prompt `AtCapacity` refusal releases it and gets no penalty
 - A stop or close of the stream after the `Ack` (`ConnectionReset`, `NotConnected`) is a stall
 - Stalled `Ack` and `Data` writes fail with `TimedOut` at their limits and release the batch serve
   permit

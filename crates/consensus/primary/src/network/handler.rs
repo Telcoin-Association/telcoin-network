@@ -36,12 +36,12 @@ use tracing::{debug, error, info, warn};
 /// Set to an arbitrary 10 seconds to read 16kb buffer.
 const SEND_STREAM_BUFFER_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Total timeout for serving a single consensus-output response over the sync protocol.
+/// Wall-clock cap on sending one consensus-output sync pack to a peer.
 ///
-/// A single output is small and bounded (unlike a whole epoch pack, whose serve is bounded by a
-/// throughput floor rather than a fixed wall-clock cap — see `send_sync_epoch_pack_over_stream`),
-/// so a fixed backstop is fine here: it caps the admission slot a drip-reading peer can hold.
-pub(crate) const SEND_SYNC_PACK_TIMEOUT: Duration = Duration::from_secs(200);
+/// It bounds a single message, not a whole epoch pack, so it caps the admission slot a
+/// drip-reading peer can hold during one consensus-output serve. The public epoch-pack serve
+/// bound is `PUBLIC_EPOCH_PACK_SERVE_TIMEOUT` in the network module, which is its own constant.
+const SEND_SYNC_PACK_TIMEOUT: Duration = Duration::from_secs(200);
 
 /// Total timeout for serving a missing-certificates response over the sync protocol.
 ///

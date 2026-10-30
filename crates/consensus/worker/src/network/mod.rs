@@ -53,9 +53,9 @@ pub(crate) const COMMITTEE_RESERVED_BATCH_STREAMS: usize = 4;
 /// Public share of the opening-read pool for inbound sync streams.
 ///
 /// A permit is taken when the stream opens and held while the opening request
-/// frame is read, which [`SYNC_REQUEST_READ_TIMEOUT`] bounds. The permit is
-/// released as soon as the opening read ends, whatever its result, so no serve,
-/// control write or close holds it.
+/// frame is read, which [`opening_read_bound`] bounds for the peer's tier. The
+/// permit is released as soon as the opening read ends, whatever its result, so no
+/// serve, control write or close holds it.
 pub(crate) const MAX_CONCURRENT_OPENING_READS: usize = 8;
 
 /// Opening-read permits reserved for committee peers.
@@ -107,11 +107,24 @@ pub const MAX_CONCURRENT_GOSSIP_PREFETCHES: usize = 8;
 /// pool with its committee reserve).
 pub(crate) const MAX_CONCURRENT_SHED_TASKS: usize = 8;
 
-/// Timeout for reading the opening request frame of an inbound sync stream.
+/// Upper bound on the opening read of a committee-tier sync stream, and on each
+/// control write (`Ack`, `Deny`, `End`) and the close.
 ///
-/// A peer that opens a sync stream but never sends its request frame trips this
-/// and the stream is dropped, so it cannot hold an admission slot indefinitely.
+/// A committee peer that opens a sync stream but never sends its request frame
+/// trips this and the stream is dropped, so it cannot hold an admission slot
+/// indefinitely. Public peers get the shorter [`PUBLIC_SYNC_REQUEST_READ_TIMEOUT`]
+/// for the opening read.
 const SYNC_REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Upper bound on the opening read of a public-tier sync stream.
+///
+/// A public opening request is small (an honest batches request carries at most
+/// [`MAX_BATCH_DIGESTS_PER_REQUEST`] 32-byte digests), so one second is ample on a
+/// working link. A public opening that uses more than half of this bound is charged
+/// [`Penalty::Mild`] whatever frame it carried, so a peer cannot sit on an opening
+/// permit for most of the window at no cost (GHSA-vr4r-x9mm-6x9g).
+/// Committee peers keep [`SYNC_REQUEST_READ_TIMEOUT`].
+const PUBLIC_SYNC_REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// How a served sync batch exchange ended.
 ///
@@ -219,7 +232,7 @@ fn try_admit_opening(
 /// The result of the bounded read of an opening sync request frame.
 #[derive(Debug)]
 enum OpeningRead {
-    /// No frame arrived within [`SYNC_REQUEST_READ_TIMEOUT`].
+    /// No frame arrived within [`opening_read_bound`] for the peer's tier.
     Silent,
     /// The frame could not be read or decoded.
     Unreadable(std::io::Error),
@@ -255,12 +268,21 @@ impl OpeningRead {
     }
 }
 
+/// Opening-read bound for a peer tier: public peers get [`PUBLIC_SYNC_REQUEST_READ_TIMEOUT`],
+/// committee peers keep [`SYNC_REQUEST_READ_TIMEOUT`].
+fn opening_read_bound(tier: PeerTier) -> Duration {
+    match tier {
+        PeerTier::Committee => SYNC_REQUEST_READ_TIMEOUT,
+        PeerTier::Public => PUBLIC_SYNC_REQUEST_READ_TIMEOUT,
+    }
+}
+
 /// Run one inbound sync exchange through both admission phases.
 ///
 /// The opening phase reads the request frame under the opening-read permit in
-/// `admission`, bounded by [`SYNC_REQUEST_READ_TIMEOUT`]. The opening-read permit
-/// is released as soon as that read ends, whatever its result, before any serve,
-/// penalty, control write or close.
+/// `admission`, bounded by [`opening_read_bound`] for the peer's tier. The
+/// opening-read permit is released as soon as that read ends, whatever its
+/// result, before any serve, penalty, control write or close.
 ///
 /// The serve phase needs a permit from `batch_serve` for the peer's tier. A
 /// committee peer draws on the reserve before the public share, so public peers
@@ -269,7 +291,11 @@ impl OpeningRead {
 /// stream gets a bounded [`DenyReason::AtCapacity`] write.
 ///
 /// A public-tier peer is charged [`Penalty::Mild`] for a silent, unreadable or
-/// non-request opening and for a [`SyncServeOutcome::Stalled`] serve. A
+/// non-request opening and for a [`SyncServeOutcome::Stalled`] serve. It is also
+/// charged for a request that arrives in the second half of its opening-read
+/// bound, whether the request is then admitted or refused. That charge is sent
+/// once the stream holds no serve permit: after the serve for an admitted
+/// request, before the deny for a refused one. A prompt
 /// [`DenyReason::AtCapacity`] answer is not charged: an honest peer gets it when
 /// the public share is full, and the refused stream holds no permit. A committee
 /// peer is never charged.
@@ -291,8 +317,10 @@ async fn admit_and_serve_sync_stream<S, F, Fut>(
 {
     let SyncAdmission { peer, tier, slot: _slot, opening } = admission;
     let (mut decode_buffer, mut decompress_buffer) = (Vec::new(), Vec::new());
+    let read_bound = opening_read_bound(tier);
+    let opened = tokio::time::Instant::now();
     let read = tokio::time::timeout(
-        SYNC_REQUEST_READ_TIMEOUT,
+        read_bound,
         read_frame::<_, WorkerSyncRequest>(
             &mut stream,
             &mut decode_buffer,
@@ -306,6 +334,8 @@ async fn admit_and_serve_sync_stream<S, F, Fut>(
             OpeningRead::from_frame(frame, &batch_serve, tier)
         })
     });
+    let elapsed = opened.elapsed();
+    let late = elapsed > read_bound / 2;
 
     // the opening read has ended: release its permit before any serve, penalty, write or close
     drop(opening);
@@ -333,6 +363,14 @@ async fn admit_and_serve_sync_stream<S, F, Fut>(
                 SyncServeOutcome::Stalled => charge_public_peer(&network_handle, peer, tier).await,
                 SyncServeOutcome::Completed | SyncServeOutcome::Failed => {}
             }
+            // a request that used more than half of the opening bound is charged on top of
+            // the serve outcome, so a late opening never pays less than a silent one
+            if late {
+                warn!(
+                    target: "worker::network", %peer, ?tier, ?elapsed, "late sync request opening"
+                );
+                charge_public_peer(&network_handle, peer, tier).await;
+            }
         }
         OpeningRead::AtCapacity => {
             debug!(
@@ -341,6 +379,14 @@ async fn admit_and_serve_sync_stream<S, F, Fut>(
                 ?tier,
                 "batch-serve pool is full, denying inbound sync stream"
             );
+            // a refusal is free only when the request was prompt; the refused stream holds
+            // no serve permit, so the charge goes out before the deny
+            if late {
+                warn!(
+                    target: "worker::network", %peer, ?tier, ?elapsed, "late sync request opening"
+                );
+                charge_public_peer(&network_handle, peer, tier).await;
+            }
             write_control_frame_and_close(
                 &mut stream,
                 &SyncFrame::Deny(DenyReason::AtCapacity),
@@ -370,11 +416,12 @@ async fn admit_and_serve_sync_stream<S, F, Fut>(
 
 /// Charge `peer` a [`Penalty::Mild`] if it is a public peer.
 ///
-/// Called for a silent, unreadable or non-request opening frame and for a
-/// stalled serve (the peer stopped reading, or stopped or closed the stream after
-/// the serve began). A [`DenyReason::AtCapacity`] refusal is not charged. A
-/// committee peer is never charged, because load on either side can slow an
-/// honest committee peer.
+/// Called for a silent, unreadable or non-request opening frame, for a request
+/// that arrives in the second half of its opening-read bound (admitted or
+/// refused), and for a stalled serve (the peer stopped reading, or stopped or
+/// closed the stream after the serve began). A prompt [`DenyReason::AtCapacity`]
+/// refusal is not charged. A committee peer is never charged, because load on
+/// either side can slow an honest committee peer.
 async fn charge_public_peer(
     network_handle: &WorkerNetworkHandle,
     peer: BlsPublicKey,
@@ -1444,6 +1491,52 @@ mod tests {
         }
     }
 
+    /// A sync stream whose peer sends its opening bytes only after a delay; writes
+    /// and closes complete at once.
+    struct DelayedStream {
+        /// The delay before the peer's bytes become readable.
+        delay: Pin<Box<tokio::time::Sleep>>,
+        /// The bytes the peer sends once the delay has passed.
+        wire: Cursor<Vec<u8>>,
+    }
+
+    impl DelayedStream {
+        /// A stream that makes `wire` readable once `delay` has passed.
+        fn new(delay: Duration, wire: Vec<u8>) -> Self {
+            Self { delay: Box::pin(tokio::time::sleep(delay)), wire: Cursor::new(wire) }
+        }
+    }
+
+    impl AsyncRead for DelayedStream {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut [u8],
+        ) -> Poll<std::io::Result<usize>> {
+            let this = self.get_mut();
+            std::task::ready!(this.delay.as_mut().poll(cx));
+            Pin::new(&mut this.wire).poll_read(cx, buf)
+        }
+    }
+
+    impl AsyncWrite for DelayedStream {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_close(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
     /// Public peers can fill only the public share of the opening-read pool: past
     /// it a new public peer is refused, while committee peers are still admitted
     /// from their reserve until it is full too.
@@ -1569,12 +1662,14 @@ mod tests {
         assert!(drain_mild_penalties(&mut commands).is_empty(), "no stream was charged");
     }
 
-    /// Three public peers each open a sync stream one second apart and never
-    /// send the request frame. Each stream's opening-read permit returns at
-    /// `SYNC_REQUEST_READ_TIMEOUT` after that stream opened, each peer is charged
-    /// one `Mild` penalty at that point, and no stream reaches the serve phase.
+    /// Three public peers each open a sync stream a quarter of the public
+    /// opening-read bound apart and never send the request frame. Each stream's
+    /// opening-read permit returns at `opening_read_bound(PeerTier::Public)` after
+    /// that stream opened, each peer is charged one `Mild` penalty at that point,
+    /// and no stream reaches the serve phase.
     #[tokio::test(start_paused = true)]
     async fn silent_public_streams_free_opening_permits_and_are_charged_once() {
+        let step = opening_read_bound(PeerTier::Public) / 4;
         let task_manager = TaskManager::default();
         let (handle, mut commands) = observed_handle(&task_manager);
         let (slots, opening, batch_serve) = admission_budgets();
@@ -1593,25 +1688,25 @@ mod tests {
             ))
         };
 
-        // open the three streams at t = 0 s, 1 s, and 2 s
+        // open the three streams at t = 0, 1 and 2 steps (0, 250 and 500 ms)
         let first = open(first_peer);
         tokio::task::yield_now().await;
-        tokio::time::advance(Duration::from_secs(1)).await;
+        tokio::time::advance(step).await;
         let second = open(second_peer);
         tokio::task::yield_now().await;
-        tokio::time::advance(Duration::from_secs(1)).await;
+        tokio::time::advance(step).await;
         let third = open(third_peer);
         tokio::task::yield_now().await;
         assert_eq!(opening.available_public(), MAX_CONCURRENT_OPENING_READS.saturating_sub(3));
 
-        // t = 5.5 s: only the first stream's read window has closed
-        tokio::time::advance(Duration::from_millis(3500)).await;
+        // t = 4.5 steps (1125 ms): only the first stream's read window has closed
+        tokio::time::advance(step * 2 + step / 2).await;
         first.await.expect("first silent stream task");
         assert_eq!(drain_mild_penalties(&mut commands), vec![Some(first_peer)]);
         assert_eq!(opening.available_public(), MAX_CONCURRENT_OPENING_READS.saturating_sub(2));
 
-        // t = 7.5 s: the other two read windows have closed
-        tokio::time::advance(Duration::from_secs(2)).await;
+        // t = 6.5 steps (1625 ms): the other two read windows have closed
+        tokio::time::advance(step * 2).await;
         second.await.expect("second silent stream task");
         third.await.expect("third silent stream task");
         let charged = drain_mild_penalties(&mut commands);
@@ -1769,6 +1864,68 @@ mod tests {
         // the held permits keep the public share full for the whole exchange
         drop(held);
         assert_eq!(batch_serve.available_public(), MAX_CONCURRENT_BATCH_STREAMS);
+    }
+
+    /// A valid request that arrives in the second half of the public window is
+    /// admitted and served, but charged. So four public identities, each at the
+    /// per-peer cap, cannot park all eight public opening-read permits for free.
+    #[tokio::test(start_paused = true)]
+    async fn late_valid_public_openings_are_charged() {
+        let task_manager = TaskManager::default();
+        let (handle, mut commands) = observed_handle(&task_manager);
+        let (slots, opening, batch_serve) = admission_budgets();
+        let served = Arc::new(AtomicUsize::new(0));
+        let max_frame = max_sync_frame_size(0);
+        let request = encoded_request(BTreeSet::from([B256::default()])).await;
+        let late = PUBLIC_SYNC_REQUEST_READ_TIMEOUT - Duration::from_millis(1);
+        let peers: Vec<_> = (1_u64..=4).map(key).collect();
+
+        // eight streams: two from each of four public identities
+        let tasks: Vec<_> = peers
+            .iter()
+            .flat_map(|peer| std::iter::repeat_n(*peer, MAX_PENDING_REQUESTS_PER_PEER))
+            .map(|public| {
+                let admission = try_admit_opening(&slots, &opening, public, PeerTier::Public)
+                    .expect("public opening read admitted");
+                let served = served.clone();
+                tokio::spawn(admit_and_serve_sync_stream(
+                    DelayedStream::new(late, request.clone()),
+                    admission,
+                    batch_serve.clone(),
+                    handle.clone(),
+                    max_frame,
+                    move |_stream: DelayedStream, _request: WorkerSyncRequest| {
+                        served.fetch_add(1, Ordering::SeqCst);
+                        std::future::ready(SyncServeOutcome::Completed)
+                    },
+                ))
+            })
+            .collect();
+        assert_eq!(opening.available_public(), 0, "the late openings fill the public share");
+
+        // every request arrives just inside the public read bound
+        tokio::task::yield_now().await;
+        tokio::time::advance(late).await;
+        futures::future::join_all(tasks)
+            .await
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()
+            .expect("late opening tasks");
+
+        assert_eq!(served.load(Ordering::SeqCst), 8, "every late request is served");
+        let charged = drain_mild_penalties(&mut commands);
+        assert_eq!(charged.len(), 8, "every late request is charged once");
+        peers.iter().for_each(|peer| {
+            assert_eq!(
+                charged.iter().filter(|charge| **charge == Some(*peer)).count(),
+                MAX_PENDING_REQUESTS_PER_PEER,
+                "each late stream of a peer is charged"
+            );
+        });
+        assert_eq!(opening.available_public(), MAX_CONCURRENT_OPENING_READS);
+        assert_eq!(batch_serve.available_public(), MAX_CONCURRENT_BATCH_STREAMS);
+        assert_eq!(batch_serve.available_reserved(), COMMITTEE_RESERVED_BATCH_STREAMS);
+        assert!(peers.iter().all(|peer| slots.in_flight(peer) == 0));
     }
 
     /// The write errors quinn reports when the requester stops the stream

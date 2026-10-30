@@ -76,10 +76,10 @@ pub(crate) const COMMITTEE_RESERVED_SYNC_STREAMS: usize = 4;
 
 /// Public share of the opening-read budget for inbound sync streams.
 ///
-/// A permit is held only while the responder waits up to [`SYNC_REQUEST_READ_TIMEOUT`] for the
-/// opening request frame of a stream. It is released as soon as that read ends, whatever its
-/// result, so no serve, control write or close holds it. In the worst case this many opening
-/// reads (plus the committee reserve) are in flight, each bounded by
+/// A permit is held only while the responder waits up to [`opening_read_bound`] (1 s public,
+/// 5 s committee) for the opening request frame of a stream. It is released as soon as that
+/// read ends, whatever its result, so no serve, control write or close holds it. In the worst
+/// case this many opening reads (plus the committee reserve) are in flight, each bounded by
 /// [`MAX_SYNC_REQUEST_FRAME_SIZE`].
 pub(crate) const MAX_CONCURRENT_OPENING_READS: usize = 8;
 
@@ -173,32 +173,39 @@ const SYNC_ACK_TIMEOUT: Duration = Duration::from_secs(5);
 /// window is treated as failed and another peer (or the legacy path) is tried.
 const MISSING_CERTS_RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Timeout for reading the opening request frame of an inbound sync stream, and the
-/// bound on every best-effort trailing write (shed `Deny`, malformed `Err`). A peer
-/// that opens a sync stream but never sends its request, or applies receive
-/// backpressure and stops reading, cannot hold an admission slot indefinitely.
+/// Upper bound on the opening read of a committee-tier inbound sync stream, and on each control
+/// write (`Ack`, `Deny`, `End`, malformed `Err`) and the close. A peer that opens a sync stream
+/// but never sends its request, or applies receive backpressure and stops reading, cannot hold
+/// an admission slot indefinitely. Public-tier openings use the shorter
+/// [`PUBLIC_SYNC_REQUEST_READ_TIMEOUT`].
 const SYNC_REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Hold limit on a public-tier epoch-pack serve.
+/// Upper bound on the opening read of a public-tier sync stream.
 ///
-/// A missing-certificates or consensus-output serve runs under a fixed whole-serve timeout, but an
-/// epoch-pack serve is bounded only by its throughput floor and the deadline derived from it, so a
-/// public-tier reader at the floor held a public serve permit for about 30 s per MiB, ended
-/// `Completed`, and was never charged. A public-tier epoch-pack serve now runs for at most this
-/// long, the cap the other two classes already apply; a serve that outlives it is dropped and
-/// charged as [`SyncServeOutcome::Stalled`]. A committee-tier serve keeps the floor-derived
-/// deadline. See GHSA-vr4r-x9mm-6x9g.
-pub(crate) const PUBLIC_EPOCH_PACK_SERVE_TIMEOUT: Duration = handler::SEND_SYNC_PACK_TIMEOUT;
+/// A public opening request is small (an epoch number, or one bitmap per authority for a
+/// missing-certificates request), so one second is ample on a working link. A public opening
+/// that uses more than half of this bound is charged `Penalty::Mild` whatever frame it carried,
+/// so a peer cannot sit on an opening permit for most of the window at no cost
+/// (GHSA-vr4r-x9mm-6x9g). Committee peers keep [`SYNC_REQUEST_READ_TIMEOUT`].
+const PUBLIC_SYNC_REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(1);
 
-/// Deadline for writing and flushing the opening request frame of an outbound sync stream on
-/// every primary client path (epoch pack, consensus output, missing certificates). The
-/// responder reads that frame under [`SYNC_REQUEST_READ_TIMEOUT`] and drops the stream when it
-/// does not arrive in time, so a write still pending after the same window can no longer be
-/// served and is cut here instead. Without this bound a peer that completes stream negotiation
-/// and then grants no further receive credit holds the request write pending for the life of
-/// the connection, the serial probe walk never reaches the next peer, and the state-sync
-/// fetcher that drives the walk stalls until restart.
-const SYNC_REQUEST_WRITE_TIMEOUT: Duration = SYNC_REQUEST_READ_TIMEOUT;
+/// Fixed, size-independent wall-clock cap on one public-tier epoch-pack serve.
+///
+/// This bounds how long one public serve permit can be held, not how fast the pack streams.
+/// A serve that runs past it is cut, classed as a stall and charged. It is its own constant,
+/// not the consensus-output pack timeout in `handler.rs`, which bounds a much smaller message.
+/// Interim limit: a pack must stream at pack length / 200 s to complete, so a long
+/// high-throughput epoch can be cut before its pack ends. A follow-up scales the public bound
+/// by pack length and adds a per-identity hold budget.
+pub(crate) const PUBLIC_EPOCH_PACK_SERVE_TIMEOUT: Duration = Duration::from_secs(200);
+
+/// Deadline for writing and flushing the opening request frame on the requester side.
+///
+/// It tracks the public opening-read bound: a responder drops a public opening that does not
+/// arrive within [`PUBLIC_SYNC_REQUEST_READ_TIMEOUT`] and charges one that arrives in the
+/// second half of it, so a requester that cannot flush the frame inside the same window gives
+/// up instead of holding a responder opening permit.
+const SYNC_REQUEST_WRITE_TIMEOUT: Duration = PUBLIC_SYNC_REQUEST_READ_TIMEOUT;
 
 /// Bound on the opening `Req` frame of an inbound sync stream (and on the tiny
 /// best-effort control writes that follow). The `EpochPack` request is a few bytes,
@@ -406,26 +413,35 @@ pub(crate) enum SyncServeOutcome {
     Completed,
     /// The serve ran out of time: a write to the requester timed out, the requester read below
     /// the throughput floor or past the epoch-pack deadline, the whole serve timed out, or a
-    /// public-tier epoch-pack serve outlived [`PUBLIC_EPOCH_PACK_SERVE_TIMEOUT`]. Only this
-    /// outcome earns a penalty, and only a public-tier peer pays it.
+    /// public-tier epoch-pack serve outlived [`PUBLIC_EPOCH_PACK_SERVE_TIMEOUT`]. It also covers
+    /// a requester that stopped or closed the stream during the serve (a reset or not-connected
+    /// write error), the same set the worker uses. Only this outcome earns a penalty, and only a
+    /// public-tier peer pays it.
     Stalled,
-    /// The serve failed for a different reason (a local error, a reset stream, or a malformed
-    /// request). No penalty.
+    /// The serve failed for a different reason (a local error or a malformed request). No
+    /// penalty.
     Failed,
 }
 
 impl SyncServeOutcome {
     /// Classify the result of a serve. A [`PrimaryNetworkError::Timeout`] error (the whole-serve
     /// timeout) and a [`PrimaryNetworkError::StdIo`] error of kind
-    /// [`std::io::ErrorKind::TimedOut`] (a write timeout, a missed floor or a missed deadline)
-    /// are [`Self::Stalled`]; a different error is [`Self::Failed`].
+    /// [`std::io::ErrorKind::TimedOut`] (a write timeout, a missed floor or a missed deadline),
+    /// [`std::io::ErrorKind::ConnectionReset`] or [`std::io::ErrorKind::NotConnected`] (the
+    /// requester stopped or closed the stream) are [`Self::Stalled`]; a different error is
+    /// [`Self::Failed`].
     pub(crate) fn of(served: &PrimaryNetworkResult<()>) -> Self {
         served.as_ref().map_or_else(
             |error| {
                 let stalled = matches!(error, PrimaryNetworkError::Timeout(_))
                     || matches!(
                         error,
-                        PrimaryNetworkError::StdIo(io) if io.kind() == std::io::ErrorKind::TimedOut
+                        PrimaryNetworkError::StdIo(io) if matches!(
+                            io.kind(),
+                            std::io::ErrorKind::TimedOut
+                                | std::io::ErrorKind::ConnectionReset
+                                | std::io::ErrorKind::NotConnected
+                        )
                     );
                 if stalled {
                     Self::Stalled
@@ -489,7 +505,7 @@ pub(crate) struct SyncAdmission {
 /// The next step for an admitted sync stream once its opening read ends.
 #[derive(Debug)]
 enum SyncOpening {
-    /// No frame arrived before [`SYNC_REQUEST_READ_TIMEOUT`].
+    /// No frame arrived within [`opening_read_bound`] for the peer's tier.
     Silent,
     /// The opening frame could not be read (oversized, undecodable or a reset stream).
     Unreadable,
@@ -531,17 +547,29 @@ impl SyncOpening {
     }
 }
 
+/// Opening-read bound for a peer tier: public peers get [`PUBLIC_SYNC_REQUEST_READ_TIMEOUT`],
+/// committee peers keep [`SYNC_REQUEST_READ_TIMEOUT`].
+fn opening_read_bound(tier: PeerTier) -> Duration {
+    match tier {
+        PeerTier::Committee => SYNC_REQUEST_READ_TIMEOUT,
+        PeerTier::Public => PUBLIC_SYNC_REQUEST_READ_TIMEOUT,
+    }
+}
+
 /// Drive one admitted inbound sync stream: read the opening request, take a serve permit for its
 /// class, and serve it.
 ///
-/// The per-peer slot is held for the whole task. The opening-read permit is released as soon as
+/// The per-peer slot is held for the whole task. The opening read is bounded by
+/// [`opening_read_bound`] for the peer's tier. The opening-read permit is released as soon as
 /// the opening read ends, whatever its result, so no serve, control write or close holds it. The
 /// serve permit is held only while `serve` runs, and a public-tier epoch-pack serve runs for at
 /// most [`PUBLIC_EPOCH_PACK_SERVE_TIMEOUT`]. A public-tier peer is charged [`Penalty::Mild`] for
-/// a `Silent`, `Unreadable` or `Unexpected` opening, for a serve that reports
-/// [`SyncServeOutcome::Stalled`], and for an epoch-pack serve cut at that limit. An `AtCapacity`
-/// answer is not charged: an honest peer gets it when the public share of a class is full, and
-/// it no longer holds a permit.
+/// a `Silent`, `Unreadable` or `Unexpected` opening, for a public opening that arrives in the
+/// second half of its bound (charged Mild whether it is then admitted or refused), for a serve
+/// that reports [`SyncServeOutcome::Stalled`], and for an epoch-pack serve cut at that limit. A
+/// prompt `AtCapacity` answer is not charged: an honest peer gets it when the public share of a
+/// class is full, and it no longer holds a permit. The late charge is sent once the stream holds
+/// no serve permit: after the serve for an admitted request, before the deny for a refused one.
 pub(crate) async fn admit_and_serve_sync_stream<S, F, Fut>(
     mut stream: S,
     admission: SyncAdmission,
@@ -555,8 +583,10 @@ pub(crate) async fn admit_and_serve_sync_stream<S, F, Fut>(
 {
     let SyncAdmission { peer, tier, slot: _slot, opening } = admission;
     let (mut decode_buffer, mut decompress_buffer) = (Vec::new(), Vec::new());
+    let read_bound = opening_read_bound(tier);
+    let opened = tokio::time::Instant::now();
     let step = tokio::time::timeout(
-        SYNC_REQUEST_READ_TIMEOUT,
+        read_bound,
         read_frame::<_, PrimarySyncRequest>(
             &mut stream,
             &mut decode_buffer,
@@ -574,6 +604,8 @@ pub(crate) async fn admit_and_serve_sync_stream<S, F, Fut>(
             |frame| SyncOpening::of_frame(frame, &serve_pools, tier),
         )
     });
+    let elapsed = opened.elapsed();
+    let late = elapsed > read_bound / 2;
     // the opening read has ended: release its permit before any serve, penalty, write or close
     drop(opening);
     match step {
@@ -594,11 +626,20 @@ pub(crate) async fn admit_and_serve_sync_stream<S, F, Fut>(
         }
         SyncOpening::AtCapacity(class) => {
             debug!(target: "primary::network", %peer, ?class, ?tier, "sync serve class full");
+            // a refusal is free only when the request was prompt; the refused stream holds no
+            // serve permit, so the charge goes out before the deny
+            if late {
+                warn!(
+                    target: "primary::network", %peer, ?tier, ?elapsed, "late sync request opening"
+                );
+                charge_public_peer(&network_handle, peer, tier).await;
+            }
             write_control_frame_and_close(&mut stream, SyncFrame::Deny(DenyReason::AtCapacity))
                 .await;
         }
         SyncOpening::Admitted { request, class, permit } => {
             let outcome = ServeHoldLimit::of(tier, class).run(serve(stream, request)).await;
+            // free the serve permit before any penalty send so a stall cannot hold it
             drop(permit);
             match outcome {
                 SyncServeOutcome::Stalled => {
@@ -607,14 +648,24 @@ pub(crate) async fn admit_and_serve_sync_stream<S, F, Fut>(
                 }
                 SyncServeOutcome::Completed | SyncServeOutcome::Failed => {}
             }
+            // a request that used more than half of the opening bound is charged on top of the
+            // serve outcome, so a late opening never pays less than a silent one
+            if late {
+                warn!(
+                    target: "primary::network", %peer, ?tier, ?elapsed, "late sync request opening"
+                );
+                charge_public_peer(&network_handle, peer, tier).await;
+            }
         }
     }
 }
 
 /// Charge a public-tier peer [`Penalty::Mild`] for holding a sync budget without progress: a
-/// `Silent`, `Unreadable` or `Unexpected` opening, or a [`SyncServeOutcome::Stalled`] serve (a
-/// write timeout, a missed floor or deadline, the whole-serve timeout, or a public-tier epoch-pack
-/// serve cut at [`PUBLIC_EPOCH_PACK_SERVE_TIMEOUT`]). An `AtCapacity` answer is not charged. A
+/// `Silent`, `Unreadable` or `Unexpected` opening, a public opening that arrives in the second
+/// half of its bound (whether it is then admitted or refused), or a
+/// [`SyncServeOutcome::Stalled`] serve (a write timeout, a missed floor or deadline, the
+/// whole-serve timeout, a reset or closed stream, or a public-tier epoch-pack serve cut at
+/// [`PUBLIC_EPOCH_PACK_SERVE_TIMEOUT`]). A prompt `AtCapacity` answer is not charged. A
 /// committee-tier peer is never charged. Fifty mild penalties reach the default ban threshold.
 async fn charge_public_peer(handle: &PrimaryNetworkHandle, peer: BlsPublicKey, tier: PeerTier) {
     match tier {
@@ -1593,7 +1644,10 @@ impl PrimaryNetworkHandle {
                 // while a drip/stalled peer is cut quickly. On such an error the
                 // future resolves `Err`, which unwinds `stream_import` so its
                 // `ImportPath` guard clears the `.inproc` sentinel and the epoch is
-                // retryable against another peer.
+                // retryable against another peer. The responder applies
+                // `PUBLIC_EPOCH_PACK_SERVE_TIMEOUT` to a public requester's serve, so a pack cut
+                // there ends the stream before its `End` frame (the reader reports an early EOF as
+                // `ConnectionAborted`), and the requester retries from the next peer.
                 match import.await {
                     Ok(()) => Ok(()),
                     Err(e) => {
@@ -1854,7 +1908,8 @@ pub struct PrimaryNetwork<DB, Events> {
     consensus_chain: ConsensusChain,
     /// Opening-read budget for inbound sync streams: [`MAX_CONCURRENT_OPENING_READS`] public
     /// permits plus [`COMMITTEE_RESERVED_OPENING_READS`] committee-only permits. A permit is held
-    /// only while the opening request frame is read (bounded by [`SYNC_REQUEST_READ_TIMEOUT`]).
+    /// only while the opening request frame is read (bounded by [`opening_read_bound`], 1 s
+    /// public, 5 s committee).
     sync_opening: ReservedPool,
     /// Serve pools for inbound sync requests, one per [`SyncClass`]. A permit is held only while
     /// its request is served.
@@ -2159,7 +2214,7 @@ where
     /// [`DenyReason::AtCapacity`] without reading so the requester retries elsewhere at once.
     ///
     /// An admitted stream runs [`admit_and_serve_sync_stream`] on its own task. The task reads
-    /// the opening request frame (bounded by [`SYNC_REQUEST_READ_TIMEOUT`]), releases the
+    /// the opening request frame (bounded by [`opening_read_bound`]), releases the
     /// opening-read permit, and takes a permit from the serve pool of the request's class
     /// ([`SyncServePools`]) before [`RequestHandler`] serves it. The per-peer slot is held for the
     /// life of the task and the serve permit only while the serve runs, so a silent peer holds no
@@ -2345,11 +2400,13 @@ mod clip_peer_error_tests {
 #[cfg(test)]
 mod sync_admission_tests {
     use super::{
-        admit_and_serve_sync_stream, write_frame, PrimaryNetworkError, PrimaryNetworkHandle, Req,
-        Res, ServeHoldLimit, SyncAdmission, SyncClass, SyncFrame, SyncServeOutcome, SyncServePools,
-        COMMITTEE_RESERVED_OPENING_READS, COMMITTEE_RESERVED_SYNC_STREAMS,
-        MAX_CONCURRENT_EPOCH_STREAMS, MAX_CONCURRENT_OPENING_READS, MAX_PENDING_REQUESTS_PER_PEER,
-        MAX_SYNC_REQUEST_FRAME_SIZE, PUBLIC_EPOCH_PACK_SERVE_TIMEOUT, SYNC_REQUEST_READ_TIMEOUT,
+        admit_and_serve_sync_stream, opening_read_bound, write_frame, PrimaryNetworkError,
+        PrimaryNetworkHandle, Req, Res, ServeHoldLimit, SyncAdmission, SyncClass, SyncFrame,
+        SyncServeOutcome, SyncServePools, COMMITTEE_RESERVED_OPENING_READS,
+        COMMITTEE_RESERVED_SYNC_STREAMS, MAX_CONCURRENT_EPOCH_STREAMS,
+        MAX_CONCURRENT_OPENING_READS, MAX_PENDING_REQUESTS_PER_PEER, MAX_SYNC_REQUEST_FRAME_SIZE,
+        PUBLIC_EPOCH_PACK_SERVE_TIMEOUT, PUBLIC_SYNC_REQUEST_READ_TIMEOUT,
+        SYNC_REQUEST_READ_TIMEOUT,
     };
     use futures::{io::Cursor, AsyncRead, AsyncWrite, StreamExt as _};
     use rand::{rngs::StdRng, SeedableRng as _};
@@ -2447,6 +2504,53 @@ mod sync_admission_tests {
         }
     }
 
+    /// A requester that sends `wire` as its opening bytes only after `delay`. Reads stay pending
+    /// until the delay ends and then drain `wire`; writes, flushes and the close succeed at once.
+    #[derive(Debug)]
+    struct DelayedStream {
+        /// The wait before the opening bytes arrive.
+        delay: Pin<Box<tokio::time::Sleep>>,
+        /// The opening bytes.
+        wire: Cursor<Vec<u8>>,
+    }
+
+    impl DelayedStream {
+        /// A stream whose opening bytes `wire` arrive after `delay`.
+        fn new(delay: Duration, wire: Vec<u8>) -> Self {
+            Self { delay: Box::pin(tokio::time::sleep(delay)), wire: Cursor::new(wire) }
+        }
+    }
+
+    impl AsyncRead for DelayedStream {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut [u8],
+        ) -> Poll<io::Result<usize>> {
+            let this = self.get_mut();
+            std::task::ready!(this.delay.as_mut().poll(cx));
+            Pin::new(&mut this.wire).poll_read(cx, buf)
+        }
+    }
+
+    impl AsyncWrite for DelayedStream {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_close(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
     /// The inbound sync admission state of one responder, wired the way the primary network
     /// wires it.
     struct Responder {
@@ -2524,11 +2628,17 @@ mod sync_admission_tests {
         }
     }
 
-    /// Open a silent stream from `peer`, let the responder task start, then let one second pass.
+    /// A quarter of the public opening-read bound: the spacing of the silent-stream opens.
+    fn opening_step() -> Duration {
+        opening_read_bound(PeerTier::Public) / 4
+    }
+
+    /// Open a silent stream from `peer`, let the responder task start, then let one opening step
+    /// pass.
     async fn open_then_wait(responder: &Responder, peer: BlsPublicKey) -> Option<JoinHandle<()>> {
         let task = responder.open_silent_stream(peer);
         settle().await;
-        tokio::time::advance(Duration::from_secs(1)).await;
+        tokio::time::advance(opening_step()).await;
         task
     }
 
@@ -2584,6 +2694,17 @@ mod sync_admission_tests {
         move |_stream: S, _request: PrimarySyncRequest| {
             served.store(true, Ordering::SeqCst);
             std::future::pending()
+        }
+    }
+
+    /// A serve that records in `served` that it ran and then completes at once.
+    fn completed_serve<S: 'static>(
+        served: Arc<AtomicBool>,
+    ) -> impl FnOnce(S, PrimarySyncRequest) -> std::future::Ready<SyncServeOutcome> + Send + 'static
+    {
+        move |_stream: S, _request: PrimarySyncRequest| {
+            served.store(true, Ordering::SeqCst);
+            std::future::ready(SyncServeOutcome::Completed)
         }
     }
 
@@ -2700,10 +2821,11 @@ mod sync_admission_tests {
         assert_eq!(opening.available_reserved(), COMMITTEE_RESERVED_OPENING_READS);
     }
 
-    /// Silent streams hold only the opening-read budget, and only until the opening read times
-    /// out. The serve pools stay whole, each stream frees its opening permit and its peer slot at
-    /// the timeout, nothing is served, and each public peer (but not the committee peer) is
-    /// charged one mild penalty.
+    /// Silent streams hold only the opening-read budget, and only until the opening read for
+    /// their tier times out (one second for a public peer, five for the committee peer). The
+    /// serve pools stay whole, each stream frees its opening permit and its peer slot at its own
+    /// timeout, nothing is served, and each public peer (but not the committee peer) is charged
+    /// one mild penalty.
     #[tokio::test(start_paused = true)]
     async fn silent_streams_hold_only_the_opening_budget_and_are_charged() {
         let (committee, first, second, third) = (key(3), key(30), key(31), key(32));
@@ -2711,7 +2833,12 @@ mod sync_admission_tests {
         let (open_cap, open_reserve) =
             (MAX_CONCURRENT_OPENING_READS, COMMITTEE_RESERVED_OPENING_READS);
         let (responder, mut commands) = Responder::new(committee);
-        // the committee stream and the first public stream open at 0 s, the others at 1 s and 2 s
+        let mut charged = || {
+            let reports = std::iter::from_fn(|| commands.try_recv().ok());
+            reports.map(mild_penalty_peer).collect::<Vec<_>>()
+        };
+        // the committee stream and the first public stream open at 0 ms, the others one and two
+        // opening steps (250 ms each) later
         let opened = [
             responder.open_silent_stream(committee),
             open_then_wait(&responder, first).await,
@@ -2721,33 +2848,43 @@ mod sync_admission_tests {
         let tasks: Option<Vec<JoinHandle<()>>> = opened.into_iter().collect();
         assert!(tasks.is_some());
 
-        // 3 s: four opening reads are in flight, and no serve permit is taken
+        // 750 ms: four opening reads are in flight, and no serve permit is taken
         assert_eq!(responder.opening.available_public(), open_cap.saturating_sub(3));
         assert_eq!(responder.opening.available_reserved(), open_reserve.saturating_sub(1));
         assert_eq!(responder.in_flight(&peers), vec![1, 1, 1, 1]);
         assert!(serve_pools_untouched(&responder.pools));
 
-        // 5.5 s: the committee read and the first public read timed out
-        tokio::time::advance(Duration::from_millis(2_500)).await;
+        // 1125 ms: only the first public read timed out, and only its peer is charged
+        tokio::time::advance(opening_step().saturating_add(opening_step() / 2)).await;
         settle().await;
         assert_eq!(responder.opening.available_public(), open_cap.saturating_sub(2));
-        assert_eq!(responder.opening.available_reserved(), open_reserve);
-        assert_eq!(responder.in_flight(&peers), vec![0, 0, 1, 1]);
+        assert_eq!(responder.opening.available_reserved(), open_reserve.saturating_sub(1));
+        assert_eq!(responder.in_flight(&peers), vec![1, 0, 1, 1]);
         assert!(serve_pools_untouched(&responder.pools));
+        assert_eq!(charged(), vec![Some(first)]);
 
-        // 7.5 s: every read timed out, and every budget is whole again
-        tokio::time::advance(Duration::from_secs(2)).await;
+        // 1625 ms: the other public reads timed out, and the public share is whole again
+        tokio::time::advance(opening_step().saturating_mul(2)).await;
         settle().await;
         assert_eq!(responder.opening.available_public(), open_cap);
+        assert_eq!(responder.opening.available_reserved(), open_reserve.saturating_sub(1));
+        assert_eq!(responder.in_flight(&peers), vec![1, 0, 0, 0]);
+        assert!(serve_pools_untouched(&responder.pools));
+        let later = charged();
+        assert_eq!(later.len(), 2);
+        assert!(later.contains(&Some(second)) && later.contains(&Some(third)));
+
+        // the committee read times out at its own, longer bound: every budget is whole, nothing
+        // is served, and the committee peer is not charged
+        tokio::time::advance(opening_read_bound(PeerTier::Committee)).await;
+        settle().await;
+        assert_eq!(responder.opening.available_public(), open_cap);
+        assert_eq!(responder.opening.available_reserved(), open_reserve);
         assert_eq!(responder.in_flight(&peers), vec![0, 0, 0, 0]);
         assert!(tasks.is_some_and(|tasks| tasks.iter().all(JoinHandle::is_finished)));
         assert!(serve_pools_untouched(&responder.pools));
         assert!(!responder.served.load(Ordering::SeqCst));
-
-        // one mild penalty per public peer, in timeout order, and none to the committee peer
-        let reports = std::iter::from_fn(|| commands.try_recv().ok());
-        let charged: Vec<_> = reports.map(mild_penalty_peer).collect();
-        assert_eq!(charged, vec![Some(first), Some(second), Some(third)]);
+        assert!(charged().is_empty());
     }
 
     /// A stream whose opening frame is unreadable (the requester ends its write side at once, so
@@ -2799,8 +2936,51 @@ mod sync_admission_tests {
         assert!(serve_pools_untouched(&responder.pools));
     }
 
-    /// The whole-serve timeout is a stall, as is a timed-out write; a reset stream is a failure,
-    /// and a finished serve is complete.
+    /// A valid request that arrives in the second half of the public opening window is admitted
+    /// and served, but charged, so four identities cannot park eight opening permits for free.
+    #[tokio::test(start_paused = true)]
+    async fn late_valid_public_openings_are_charged() {
+        let (responder, mut commands) = Responder::new(key(9));
+        let peers = [key(90), key(91), key(92), key(93)];
+        let late = PUBLIC_SYNC_REQUEST_READ_TIMEOUT.saturating_sub(Duration::from_millis(1));
+        let wire = encoded(SyncFrame::Req(PrimarySyncRequest::EpochPack { epoch: 0 })).await;
+        // each public key opens two streams whose request arrives just inside the window
+        let opened: Option<Vec<JoinHandle<()>>> = peers
+            .iter()
+            .flat_map(|&peer| std::iter::repeat_n(peer, MAX_PENDING_REQUESTS_PER_PEER))
+            .map(|peer| {
+                let stream = DelayedStream::new(late, wire.clone());
+                responder.open_stream(peer, stream, completed_serve(responder.served.clone()))
+            })
+            .collect();
+        assert_eq!(opened.as_ref().map(Vec::len), Some(MAX_CONCURRENT_OPENING_READS));
+        settle().await;
+        // the eight openings hold the whole public opening share, and nothing is charged yet
+        assert_eq!(responder.opening.available_public(), 0);
+        assert!(opened.as_ref().is_some_and(|tasks| tasks.iter().all(|task| !task.is_finished())));
+        assert!(commands.try_recv().is_err());
+        // the requests arrive late: each one is admitted and served, and every budget is whole
+        tokio::time::advance(late).await;
+        settle().await;
+        assert!(opened.is_some_and(|tasks| tasks.iter().all(JoinHandle::is_finished)));
+        assert!(responder.served.load(Ordering::SeqCst));
+        assert_eq!(responder.opening.available_public(), MAX_CONCURRENT_OPENING_READS);
+        assert_eq!(responder.opening.available_reserved(), COMMITTEE_RESERVED_OPENING_READS);
+        assert_eq!(responder.in_flight(&peers), vec![0; peers.len()]);
+        assert!(serve_pools_untouched(&responder.pools));
+        // every late opening costs one mild penalty, two per key
+        let reports = std::iter::from_fn(|| commands.try_recv().ok());
+        let charged: Vec<_> = reports.map(mild_penalty_peer).collect();
+        assert_eq!(charged.len(), MAX_CONCURRENT_OPENING_READS);
+        let per_key: Vec<_> = peers
+            .iter()
+            .map(|&peer| charged.iter().filter(|charge| **charge == Some(peer)).count())
+            .collect();
+        assert_eq!(per_key, vec![MAX_PENDING_REQUESTS_PER_PEER; peers.len()]);
+    }
+
+    /// The whole-serve timeout is a stall, as is a timed-out write, and a finished serve is
+    /// complete.
     #[tokio::test]
     async fn a_whole_serve_timeout_is_a_stall() {
         let elapsed = tokio::time::timeout(Duration::ZERO, std::future::pending::<()>())
@@ -2815,11 +2995,20 @@ mod sync_admission_tests {
             SyncServeOutcome::of(&Err(io_error(io::ErrorKind::TimedOut))),
             SyncServeOutcome::Stalled
         );
-        assert_eq!(
-            SyncServeOutcome::of(&Err(io_error(io::ErrorKind::ConnectionReset))),
-            SyncServeOutcome::Failed
-        );
         assert_eq!(SyncServeOutcome::of(&Ok(())), SyncServeOutcome::Completed);
+    }
+
+    /// A requester that stops or closes the stream during the serve is a stall, as on the worker.
+    /// Any other I/O failure is a plain failure.
+    #[test]
+    fn a_reset_or_closed_stream_during_the_serve_is_a_stall() {
+        let classify = |kind: io::ErrorKind| {
+            SyncServeOutcome::of(&Err(PrimaryNetworkError::StdIo(io::Error::from(kind))))
+        };
+        assert_eq!(classify(io::ErrorKind::ConnectionReset), SyncServeOutcome::Stalled);
+        assert_eq!(classify(io::ErrorKind::NotConnected), SyncServeOutcome::Stalled);
+        assert_eq!(classify(io::ErrorKind::TimedOut), SyncServeOutcome::Stalled);
+        assert_eq!(classify(io::ErrorKind::InvalidData), SyncServeOutcome::Failed);
     }
 
     /// A public-tier epoch-pack serve is cut at the hold limit: it holds its serve permit up to

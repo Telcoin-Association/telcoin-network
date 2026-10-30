@@ -53,11 +53,11 @@ const EPOCH_PACK_FRAME_TIMEOUT: Duration = Duration::from_secs(10);
 const SYNC_RATE_WINDOW: Duration = Duration::from_secs(30);
 
 /// Minimum bytes an epoch-pack transfer must carry per [`SYNC_RATE_WINDOW`] (~35 KiB/s). Below this
-/// a transfer is treated as a drip/stall and aborted. This replaces the old fixed, size-independent
-/// wall-clock caps (a large honest pack could not finish inside them on a slow link, while a
-/// Byzantine peer could dribble just inside the per-frame timeout for the whole cap): a pack now
-/// finishes at any sustained rate at/above the floor, and a below-floor peer is cut within roughly
-/// one window.
+/// a transfer is treated as a drip/stall and aborted, so a pack finishes at any sustained rate
+/// at/above the floor, and a below-floor peer is cut within roughly one window. Both the
+/// requester's reads and the responder's writes check this floor. The responder additionally
+/// applies a fixed, size-independent `PUBLIC_EPOCH_PACK_SERVE_TIMEOUT` to public-tier epoch-pack
+/// serves, as an interim bound until a length-scaled bound lands.
 const SYNC_RATE_MIN_BYTES: u64 = 1 << 20;
 
 /// How long one pack record may take to arrive over a sync stream: the time the largest record a
@@ -288,8 +288,9 @@ where
                     .await?;
                     // Enforce the throughput floor on bytes the requester actually accepted (a
                     // completed `write_one_frame` means the frame was flushed): a drip-reading peer
-                    // that keeps resetting the per-frame timer is cut here instead of pinning the
-                    // responder task (and its admission slot) for a fixed wall-clock cap.
+                    // that keeps resetting the per-frame timer is cut here, within about one
+                    // window, rather than holding the responder task (and its admission slot)
+                    // until a whole-serve bound expires.
                     if !watch.record(Instant::now(), len) {
                         return Err(std::io::Error::new(
                             std::io::ErrorKind::TimedOut,
