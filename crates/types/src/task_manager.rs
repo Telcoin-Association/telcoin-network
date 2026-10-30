@@ -473,8 +473,11 @@ impl TaskManager {
                                 continue;
                             }
                             tracing::info!(target: "tn::tasks", "{}: {} returned Ok, exiting", self.name, info.name);
-                            // Ok exit is fine if we are shutting down.
-                            if !rx_shutdown.noticed() {
+                            // Ok exit is fine if we are shutting down. Ask the notifier, not
+                            // `rx_shutdown`: `notify` sets its noticers one at a time, so a task
+                            // can see its own set and exit before `rx_shutdown`'s is, while
+                            // `is_notified` waits for `notify` to finish.
+                            if !shutdown.is_notified() {
                                 result = Err(TaskJoinError::CriticalExitOk(info.name));
                             }
                         }
@@ -483,10 +486,13 @@ impl TaskManager {
                             if !info.critical {
                                 continue;
                             }
-                            // Ok exit is fine if we are shutting down.
-                            if !rx_shutdown.noticed() {
+                            if !shutdown.is_notified() {
                                 tracing::error!(target: "tn::tasks", "{}: {} returned error {join_err}, exiting", self.name, info.name);
                                 result = Err(join_err);
+                            } else {
+                                // Already shutting down: the shutdown decides the exit, but the
+                                // error is still the task's, so it is logged.
+                                tracing::warn!(target: "tn::tasks", "{}: {} returned error {join_err} while shutting down", self.name, info.name);
                             }
                         }
                     }
@@ -688,6 +694,34 @@ mod test {
         async fn ping(&mut self, p: u32) -> eyre::Result<u32> {
             self.ping_tx.send(p).await?;
             self.pong_rx.recv().await.map_or_else(|| Err(eyre::eyre!("No Pong!")), Ok)
+        }
+    }
+
+    /// A critical task that exits because the shutdown was notified is a normal exit, even when it
+    /// exits while `notify` is still setting the other noticers (it sets them one at a time):
+    /// `until_task_ends` must not report it as an unexpected `CriticalExitOk`. The noticers between
+    /// the task's and the manager's own widen that window enough to hit it every time.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn critical_exit_mid_notify_is_a_shutdown() {
+        for round in 0..10 {
+            let mut task_manager = TaskManager::default();
+            let shutdown = ShutdownNotifier::new();
+            let task_rx = shutdown.subscribe();
+            let _between: Vec<_> = (0..200_000).map(|_| shutdown.subscribe()).collect();
+            task_manager.spawn_critical_task("watcher", async move {
+                while !task_rx.noticed() {
+                    tokio::task::yield_now().await;
+                }
+                Ok(())
+            });
+            let notifier = shutdown.clone();
+            let notify = std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(20));
+                notifier.notify();
+            });
+            let result = task_manager.until_task_ends(shutdown).await;
+            notify.join().unwrap();
+            assert!(result.is_ok(), "round {round}: {result:?}");
         }
     }
 

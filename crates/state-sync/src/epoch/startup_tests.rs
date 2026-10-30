@@ -20,12 +20,13 @@ async fn startup_sync_requires_equal_consecutive_passes() {
         || ready(1),
         |epoch| {
             requested.borrow_mut().push(epoch);
-            ready(results.next().unwrap_or(5))
+            ready(Ok(results.next().unwrap_or(5)))
         },
         || ready(0),
         pending(),
     )
-    .await;
+    .await
+    .unwrap();
     assert_eq!(*requested.borrow(), [0, 4, 3, 5]);
 }
 
@@ -42,7 +43,7 @@ async fn startup_sync_waits_without_established_peers() {
         },
         |epoch| {
             work.set(work.get() + 1);
-            ready(epoch)
+            ready(Ok(epoch))
         },
         || {
             work.set(work.get() + 1);
@@ -50,7 +51,8 @@ async fn startup_sync_waits_without_established_peers() {
         },
         pending(),
     )
-    .await;
+    .await
+    .unwrap();
     assert_eq!(work.get(), 0);
     assert!(polls.get() > 1);
     assert_eq!(start.elapsed(), STARTUP_SYNC_TIMEOUT);
@@ -70,12 +72,13 @@ async fn startup_sync_collects_after_delayed_connection() {
         |epoch| {
             assert_eq!(polls.get(), 3);
             passes.set(passes.get() + 1);
-            ready(epoch)
+            ready(Ok(epoch))
         },
         || ready(0),
         pending(),
     )
-    .await;
+    .await
+    .unwrap();
     assert_eq!(passes.get(), 2);
     assert_eq!(start.elapsed(), STARTUP_PEER_POLL_INTERVAL * 2);
 }
@@ -97,7 +100,8 @@ async fn startup_sync_peer_wait_does_not_renew_deadline() {
         || ready(prefix.get()),
         pending(),
     )
-    .await;
+    .await
+    .unwrap();
     assert_eq!(prefix.get(), 1);
     assert_eq!(start.elapsed(), STARTUP_SYNC_TIMEOUT);
 }
@@ -111,12 +115,13 @@ async fn startup_sync_shutdown_cancels_peer_wait() {
         || ready(0),
         |epoch| {
             passes.set(passes.get() + 1);
-            ready(epoch)
+            ready(Ok(epoch))
         },
         || ready(0),
         tokio::time::sleep(STARTUP_PEER_POLL_INTERVAL),
     )
-    .await;
+    .await
+    .unwrap();
     assert_eq!(passes.get(), 0);
     assert_eq!(start.elapsed(), STARTUP_PEER_POLL_INTERVAL);
 }
@@ -135,7 +140,8 @@ async fn startup_sync_caps_a_stalled_cohort() {
         || ready(0),
         pending(),
     )
-    .await;
+    .await
+    .unwrap();
     assert_eq!(passes.get(), 1);
     assert_eq!(start.elapsed(), STARTUP_SYNC_PASS_TIMEOUT);
 }
@@ -156,14 +162,15 @@ async fn startup_sync_resumes_after_a_capped_pass_with_progress() {
                     prefix.set(6);
                     pending().await
                 } else {
-                    5
+                    Ok(5)
                 }
             }
         },
         || ready(prefix.get()),
         pending(),
     )
-    .await;
+    .await
+    .unwrap();
     assert_eq!(*requested.borrow(), [0, 5, 5]);
 }
 
@@ -181,7 +188,8 @@ async fn startup_sync_deadline_bounds_continuous_progress() {
         || ready(prefix.get()),
         pending(),
     )
-    .await;
+    .await
+    .unwrap();
     assert_eq!(start.elapsed(), STARTUP_SYNC_TIMEOUT);
     assert!(prefix.get() > 1, "the gate must continue after a productive capped pass");
 }
@@ -190,7 +198,9 @@ async fn startup_sync_deadline_bounds_continuous_progress() {
 #[tokio::test(start_paused = true)]
 async fn startup_sync_deadline_bounds_peer_count() {
     let start = Instant::now();
-    drive_epoch_record_sync(pending, ready, || ready(0), pending()).await;
+    drive_epoch_record_sync(pending, |epoch| ready(Ok(epoch)), || ready(0), pending())
+        .await
+        .unwrap();
     assert_eq!(start.elapsed(), STARTUP_SYNC_TIMEOUT);
 }
 
@@ -209,7 +219,8 @@ async fn startup_sync_shutdown_cancels_collection() {
         || ready(0),
         tokio::time::sleep(shutdown_after),
     )
-    .await;
+    .await
+    .unwrap();
     assert_eq!(passes.get(), 1);
     assert_eq!(start.elapsed(), shutdown_after);
 }
@@ -223,10 +234,33 @@ async fn startup_sync_honors_existing_shutdown() {
             work.set(work.get() + 1);
             1
         },
-        ready,
+        |epoch| ready(Ok(epoch)),
         || ready(0),
         ready(()),
     )
-    .await;
+    .await
+    .unwrap();
     assert_eq!(work.get(), 0);
+}
+
+/// A pass that finds our own store failing ends startup sync with its error at once: the node
+/// must not start on an epoch store that cannot save records.
+#[tokio::test(start_paused = true)]
+async fn startup_sync_stops_on_a_local_storage_failure() {
+    let start = Instant::now();
+    let passes = Cell::new(0);
+    let result = drive_epoch_record_sync(
+        || ready(1),
+        |_| {
+            passes.set(passes.get() + 1);
+            ready(Err(eyre::eyre!("failed to persist downloaded epoch record/certs")))
+        },
+        || ready(0),
+        pending(),
+    )
+    .await;
+    let err = result.expect_err("a failed epoch store must fail startup sync");
+    assert!(err.to_string().contains("failed to persist"), "unexpected error: {err}");
+    assert_eq!(passes.get(), 1);
+    assert_eq!(start.elapsed(), Duration::ZERO);
 }

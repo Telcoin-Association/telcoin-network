@@ -1761,13 +1761,14 @@ async fn already_certified_republish_waits_for_durable_barrier() {
     assert!(result.is_ok(), "committed barrier: expected Ok(()), got {result:?}");
     assert!(
         !cx.proposer().consensus_config().shutdown().is_notified(),
-        "committed barrier: a durable republish must not shut the node down"
+        "committed barrier: a durable republish must not end the epoch"
     );
     cx.network.assert_quiet("committed barrier: no vote request may follow").await;
 }
 
 /// An already-certified header whose `ProposedCertificates` barrier fails is not republished:
-/// `spawn_header_proposal` fails with exactly the barrier's error and shuts the node down, because
+/// `spawn_header_proposal` fails with exactly the barrier's error and ends the epoch (`run_epoch`
+/// then stops the node, its store unable to write), because
 /// the stored record can be lost on restart (issue #1530).
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn already_certified_republish_refused_when_durable_barrier_fails() {
@@ -1784,13 +1785,13 @@ async fn already_certified_republish_refused_when_durable_barrier_fails() {
     );
     assert!(
         cx.proposer().consensus_config().shutdown().is_notified(),
-        "failed barrier: refusing the republish must shut the node down"
+        "failed barrier: refusing the republish must end the epoch"
     );
 }
 
 /// A certificate whose `ProposedCertificates` record the durable barrier fails to make durable is
-/// never externalized: `spawn_header_proposal` fails with exactly the barrier's error and shuts the
-/// node down, and the certificate is neither delivered to the node nor gossiped.
+/// never externalized: `spawn_header_proposal` fails with exactly the barrier's error and ends the
+/// epoch (`run_epoch` then stops the node), and the certificate is neither delivered nor gossiped.
 ///
 /// Every peer votes, so the certificate forms, and exactly one `ProposedCertificates` barrier is
 /// awaited: the refusal is the barrier's, not an earlier failure. The network is checked first
@@ -1816,7 +1817,7 @@ async fn certificate_withheld_when_durable_barrier_fails() {
     );
     assert!(
         cx.proposer().consensus_config().shutdown().is_notified(),
-        "failed barrier: refusing a non-durable certificate must shut the node down"
+        "failed barrier: refusing a non-durable certificate must end the epoch"
     );
     if let Ok(result) = tokio::time::timeout(QUIET_WINDOW, cert_rx.recv()).await {
         panic!("failed barrier: expected no certificate delivered, got {result:?}");
@@ -1843,7 +1844,7 @@ async fn certificate_withheld_when_durable_barrier_fails() {
     );
     assert!(
         !cx.proposer().consensus_config().shutdown().is_notified(),
-        "healthy barrier: a durable certificate must not shut the node down"
+        "healthy barrier: a durable certificate must not end the epoch"
     );
 }
 

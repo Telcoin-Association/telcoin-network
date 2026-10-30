@@ -49,6 +49,9 @@ pub enum LoadHeaderError {
     /// not corrupt — a writable open reinitializes it; a read-only open surfaces this so the
     /// operator can remove the pack directory.
     Unwritten,
+    /// An index's open-time check of its pages found damage at rest (a page failing its CRC, or a
+    /// child pointer that is out of bounds or reached twice): its owner rebuilds it.
+    CorruptIndex(String),
 }
 
 impl Error for LoadHeaderError {}
@@ -74,6 +77,7 @@ impl fmt::Display for LoadHeaderError {
             Self::ReadOnlyEmpty => write!(f, "attempted to open index read only with no index"),
             Self::BloomError(e) => write!(f, "bloom error: {e}"),
             Self::InvalidCompression => write!(f, "invalid compression value"),
+            Self::CorruptIndex(what) => write!(f, "corrupt index: {what}"),
             Self::Unwritten => {
                 write!(f, "data file is all zeros (sized but never written); remove the pack directory and it will be recreated")
             }

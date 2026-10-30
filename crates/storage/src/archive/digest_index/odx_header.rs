@@ -81,10 +81,13 @@ impl OdxHeader {
     ) -> Result<(MmapDataFile, OdxHeader), LoadHeaderError> {
         let path = path.as_ref();
         // The digest index does point lookups over fixed-offset hash buckets — random
-        // access with no benefit from readahead — so hint `MADV_RANDOM`.
+        // access with no benefit from readahead — so hint `MADV_RANDOM`. Not `derived`, like the
+        // hdx it overflows (whose attested length recovery reads before any rebuild): the first
+        // barrier after a growth fsyncs its size.
         let opts = MmapFileOptions {
             write_mode: WriteMode::Random,
             access: MmapAccess::Random,
+            derived: false,
             ..Default::default()
         };
         let mut file = MmapDataFile::open_with(path, read_only, opts)?;
