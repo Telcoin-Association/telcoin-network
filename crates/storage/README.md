@@ -243,7 +243,10 @@ only with its stored record's chain, anything else, such as a prefix's partial f
 An import that replaces the live epoch swaps `current_pack` for a static handle on the installed files;
 if that open fails, the import fails as a local error and the swap is left pending, for the next
 `stream_import` to finish before anything else (before its idempotency check, which would otherwise find
-the epoch complete and return). Stream serving (`get_epoch_stream`, `get_partial_epoch_stream`) takes the
+the epoch complete and return). A swap that fails again fails only an import of the pending epoch
+(another epoch's import goes on), as `CorruptPack` naming `db repair` unless the environment caused it:
+the installed files passed their seal check, so a second refusal to open them is damage on this node's
+disk. Stream serving (`get_epoch_stream`, `get_partial_epoch_stream`) takes the
 length from a pack handle but opens the data log by path, so it serves the file only if no install of
 the epoch ran meanwhile and the file is the handle's (same device and inode); otherwise it answers
 `StreamUnavailable` and the requester retries.
@@ -425,11 +428,11 @@ command, and the recovery check reports an unopenable log as "recoverability unk
 transient failure never reads as a truncatable tail or a skipped index check. `telcoin-network db repair [--epoch N] [--force]` repairs epoch packs **at rest** (node
 stopped): it truncates a torn tail and rebuilds indexes from the WAL for damaged epochs, dry-run by
 default, skipping the current/latest epoch unless named. Meta/mid-log corruption is reported for
-re-sync, never "fixed". A read the disk failed (opening the data log included), any other OS failure
-(a sync, a rename, an unlink),
-or a failure the environment caused (descriptor or memory exhaustion, a permission problem, a full
-disk), is no verdict on the epoch: it is reported as
-an error to rerun once the cause is fixed, never as unrepairable. A legacy (pre-v2) pack's torn tail is judged by the migration to v2 (which
+re-sync, never "fixed". A read the disk failed (opening the data log included, for the validation
+too), any other OS failure (a sync, a rename, an unlink), a failure the environment caused
+(descriptor or memory exhaustion, a permission problem, a full disk), or a rebuilt index that did not
+sync or seal (recovery seals its rebuilt indexes before it cuts the log), is no verdict on the epoch:
+it is reported as an error to rerun once the cause is fixed, never as unrepairable. A legacy (pre-v2) pack's torn tail is judged by the migration to v2 (which
 drops an unacked tail), so `db validate`, `db repair` and `db migrate` agree on it. Only the newest
 epoch's legacy pack can drop an unacked tail: a past epoch (one with a later `epoch-N` directory) was
 complete when the next epoch began, so a tail its replay cannot reach is refused as damage by the

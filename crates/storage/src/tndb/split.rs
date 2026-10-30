@@ -53,12 +53,17 @@ const EPOCH: usize = 0;
 const KAD: usize = 1;
 const CACHE: usize = 2;
 
-/// Refuse a `SplitDatabase` at `root` that lost an environment's directory. [`MDBX_MIGRATED`] is
-/// written only after the first open has created all three (`open_db` opens them before
-/// `migrate_from_mdbx` runs), so with it present a missing environment was deleted or not
-/// restored, and opening it would start that environment empty: for `epoch`, with no record of
-/// this node's votes and proposals. Before the marker exists (a first start), the environments
-/// are created as usual. A stat error is an error, never read as absent.
+/// Refuse a `SplitDatabase` at `root` that lost an environment: its directory, or the files in
+/// it. [`MDBX_MIGRATED`] is written only after the first open has created all three and opened a
+/// table in each, which writes each one's manifest (`open_db` opens them before
+/// `migrate_from_mdbx` runs), so with the marker present a missing directory, or one without a
+/// manifest, was deleted or not restored (an operator's `rm`, a restore of the tree without its
+/// files, an unmounted volume's empty mount point), and opening it would start that environment
+/// empty: for `epoch`, with no record of this node's votes and proposals. `Core::open` itself
+/// refuses a manifest without a generation and a generation without a manifest; a directory with
+/// neither is what it would open as new, so the check is here. Before the marker exists (a first
+/// start), the environments are created as usual. A stat error is an error, never read as
+/// absent.
 fn check_environments(root: &Path) -> eyre::Result<()> {
     let marker = root.join(MDBX_MIGRATED);
     let stat = |path: &Path| {
@@ -73,6 +78,14 @@ fn check_environments(root: &Path) -> eyre::Result<()> {
             bail!(
                 "tndb: environment {} is missing beside {} (its log is lost); refusing to open \
                  it empty",
+                dir.display(),
+                marker.display()
+            );
+        }
+        if !stat(&dir.join(super::manifest::FILE))? {
+            bail!(
+                "tndb: environment {} has no table manifest beside {} (its files are lost); \
+                 refusing to open it empty",
                 dir.display(),
                 marker.display()
             );
@@ -519,6 +532,33 @@ mod test {
                 "{lost}: the refusal names it: {err}"
             );
             assert!(!tmp.path().join(lost).exists(), "{lost}: the refused open created nothing");
+
+            // The directory survives but its files are gone (a restore of the tree without its
+            // files, an unmounted volume's mount point): refused the same way, not opened as new.
+            std::fs::remove_file(tmp.path().join(MDBX_MIGRATED)).expect("marker");
+            drop(open(tmp.path()));
+            std::fs::write(tmp.path().join(MDBX_MIGRATED), b"").expect("marker");
+            let dir = tmp.path().join(lost);
+            for entry in std::fs::read_dir(&dir).expect("read the environment").flatten() {
+                if entry.file_type().expect("file type").is_dir() {
+                    std::fs::remove_dir_all(entry.path()).expect("lose a directory");
+                } else {
+                    std::fs::remove_file(entry.path()).expect("lose a file");
+                }
+            }
+            let err = SplitDatabase::open_with(tmp.path(), TnDbOptions::default())
+                .err()
+                .unwrap_or_else(|| panic!("{lost}: an emptied environment must not open empty"));
+            let err = format!("{err:#}");
+            assert!(
+                err.contains(&format!("environment {}", dir.display()))
+                    && err.contains("no table manifest beside"),
+                "{lost}: the refusal names it: {err}"
+            );
+            assert!(
+                std::fs::read_dir(&dir).expect("read the environment").next().is_none(),
+                "{lost}: the refused open created nothing in it"
+            );
         }
     }
 

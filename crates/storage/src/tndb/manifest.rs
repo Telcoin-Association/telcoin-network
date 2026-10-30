@@ -31,7 +31,7 @@ thread_local! {
     pub(super) static FAIL_NEXT_WRITE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-const FILE: &str = "tables";
+pub(super) const FILE: &str = "tables";
 const TMP: &str = "tables.tmp";
 const MAGIC: &[u8; 8] = b"TNDBTABL";
 const VERSION: u8 = 1;

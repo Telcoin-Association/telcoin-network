@@ -934,7 +934,13 @@ impl Core {
             let idx = if dir.exists() {
                 match BtreeIndex::open_btx_file(&dir, &header, entry.ksize, false) {
                     Ok(idx) => Some(idx),
-                    Err(LoadHeaderError::IO(e)) => return Err(e.into()),
+                    Err(LoadHeaderError::IO(e)) => {
+                        return Err(eyre::Report::new(e).wrap_err(format!(
+                            "tndb: open table {}'s index {}",
+                            entry.name,
+                            dir.display()
+                        )))
+                    }
                     Err(_) => None,
                 }
             } else {
@@ -1189,7 +1195,9 @@ impl Core {
 
     /// Fix `table`'s key size at `ksize` if its first row is being written, or check `ksize`
     /// against it: the manifest records it and the table's index is created (and published, so a
-    /// batch can be reverted to it), before the write lock is taken.
+    /// batch can be reverted to it), before the write lock is taken. A key the index cannot hold
+    /// (an empty one, or one longer than a B+tree page fits two of) is refused as the caller's
+    /// error before the manifest records it: recorded, it would fail every later open.
     pub(super) fn ensure_ksize(&self, table: &TableShared, ksize: usize) -> eyre::Result<()> {
         let fixed = table.ksize();
         if fixed != 0 {
@@ -1199,6 +1207,12 @@ impl Core {
             .map_err(|_| eyre::eyre!("tndb: a {ksize}-byte key is too long"))?;
         if ksize16 == 0 {
             bail!("tndb: table {} has an empty key", table.name);
+        }
+        if !crate::archive::btree_index::page::Node::new(ksize).geometry_ok() {
+            bail!(
+                "tndb: a {ksize}-byte key in table {} is longer than an index key can be",
+                table.name
+            );
         }
         let mut manifest = self.registry.lock();
         let fixed = table.ksize();
@@ -1217,7 +1231,10 @@ impl Core {
         };
         let _ = fs::remove_dir_all(&dir);
         let mut idx = create_index(&dir, &header, ksize16)
-            .inspect_err(|e| self.fail_setup(&format!("create table {}'s index", table.name), e))?;
+            .wrap_err_with(|| {
+                format!("tndb: create table {}'s index {}", table.name, dir.display())
+            })
+            .inspect_err(|e| self.durability.fail_damaged(format!("{e:#}")))?;
         idx.publish();
         let mut writer = self.writer.lock();
         let entry = writer.tables.get_mut(&table.id).expect("a registered table");
@@ -1797,7 +1814,14 @@ fn recover(
         // Close the stale index before its directory goes.
         idxs.insert(entry.id, None);
         let _ = fs::remove_dir_all(&dir);
-        sink.0.insert(entry.id, BtreeIndex::open_btx_file(&dir, header, entry.ksize, false)?);
+        let idx = BtreeIndex::open_btx_file(&dir, header, entry.ksize, false).map_err(|e| {
+            eyre::Report::new(e).wrap_err(format!(
+                "tndb: rebuild table {}'s index {}",
+                entry.name,
+                dir.display()
+            ))
+        })?;
+        sink.0.insert(entry.id, idx);
     }
     let Replayed { end, tear } = replay(log, manifest, &mut sink)?;
     let file_len = log.file_len();

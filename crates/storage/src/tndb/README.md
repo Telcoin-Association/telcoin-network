@@ -91,9 +91,10 @@ does a rollback that panics, a batch whose index is poisoned (a failed growth: i
 every later growth, so one table would fail its writes while the rest carried on), and a panic
 while a batch is being published.
 
-**Removals.** A removal of a key that isn't present writes nothing. A batch that changes nothing
-isn't numbered; in `Sync` mode it still waits until the state it observed is durable (an earlier
-batch, perhaps not yet synced).
+**Removals.** A removal of a key that isn't present writes nothing. A batch that writes nothing
+(each of its ops a removal of an absent key) isn't numbered; in `Sync` mode it still waits until the
+state it observed is durable (an earlier batch, perhaps not yet synced). A CLEAR is always
+written, of an empty table too (the epoch end clears every epoch table without looking).
 
 **Encode buffers.** Bare writes and point reads encode into per-thread buffers; one grown past
 4 MiB by a large value is let go after use, so a thread does not keep the largest value it ever
@@ -169,10 +170,12 @@ numbered up to the frontier's number is durable. No round takes the write lock.
 **One sync in flight.** One round runs at a time (the core's sync lock), shared by every writer
 waiting. That matters on Linux, where two overlapping syncs of one file could otherwise ack data a
 failed writeback lost. The commit marker is stamped lazily by the next writer, under the write
-lock, and only a stamp that landed counts (`Writer::stamp_synced`). A reopened log has no room past
-its end for one until it grows, so the first write stamps again after its append: a marker over the
-log as it opened, made durable by the sync round that acknowledges that write (it `fsync`s the
-growth, and the marker's page with it).
+lock, and only a stamp that landed counts (`Writer::stamp_synced`). A reopened sealed log has no
+room past its end for one until it grows, so the first write stamps again after its append: a
+marker over the log as it opened, made durable by the sync round that acknowledges that write (it
+`fsync`s the growth, and the marker's page with it). An unclean reopen keeps its padding, so its
+first write stamps before its append, and that marker reaches the disk as any other does (see
+Recovery: by writeback, a growth's `fsync` or the close).
 
 **Modes:**
 - **`CommitMode::Sync`:** each write, or transaction commit, waits until it is durable before it
@@ -242,9 +245,13 @@ and a crash with nothing written all leave the log sealed and byte-identical, an
 refuses damage in it again rather than cut it. Once the log is written, a crash leaves it unclean,
 and the commit marker is what tells damage below it from a torn tail: the first write stamps one
 over the log as it opened (see Durability), and later writes move it up to the last sync they saw.
-The marker is best effort, never synced on its own: in the one commit round between the first write
-and the sync that acknowledges it, a crash leaves no marker over the old data, and damage at rest
-there is cut as a torn tail (the same holds for a later marker's lag behind the last sync).
+The marker is best effort, never synced on its own: no sync round flushes its page (it `msync`s
+the records and `fsync`s only a growth), so a stamp reaches the disk by the system's writeback
+(about 30 s on Linux), by a growth's `fsync` (which covers a sealed reopen's first write) or by
+the clean close. Until then a power loss leaves the previous marker on the disk, or none, and
+damage at rest between it and the last sync is cut as a torn tail rather than refused. No
+acknowledged batch is at stake, only how at-rest damage below the last sync is classified. A
+compaction's new log is stamped the same way, before the rename, with the same lag.
 
 **An unclean log is replayed from the disk, not the page cache.** The open fsyncs an unclean log
 once and then drops its cached pages (`MmapFileOptions::drop_cache_on_unclean_open`, set by
@@ -331,7 +338,11 @@ an ordinary crash only the padding's zeros and the marker do.
   after a reopen, after an emptying during the reset, and after a second emptying during a retried
   reset; not again when the reset copied nothing); a catch-up removal of a row the new log never
   held leaving nothing dead; writeback as the copy goes; and compactions inside the randomized crash model;
-- hardening: a failed open keeping the older generation; an interrupted creation reopening; a
+- hardening: a key too long for an index refused before the manifest records it (the database
+  reopens); an index whose open fails naming the table and its directory; a compaction's catch-up
+  writing a CLEAR of rows an earlier round copied, a net removal of a copied row, and a re-put of
+  a removed row; the idle commit thread releasing a retired generation at the switch; a failed open
+  keeping the older generation; an interrupted creation reopening; a
   removal through a damaged index failing and leaving the log sealed; a misindexed row read as
   `CorruptIndex`; a damaged log record found by a read refusing every later open with the log
   unchanged (no write, one acknowledged write and stamped writes in the session, or a scan), index
@@ -400,7 +411,9 @@ sync round that skips its msync (the randomized power-loss model, and the `Sync`
 batch, lost-writeback, sealed-reopen and `SplitDatabase` power-loss tests), a compaction that
 never syncs its new log before the switch (`Builder::sync`'s commit:
 `test_tndb_power_loss_after_a_compaction_keeps_every_row` and the randomized power-loss model),
-and tndb's log at the default 16 MiB record cap. For the seal until the first write: retiring the sentinel at open (the killed,
+one that skips only the sync of the switch's final tail, written under the write lock
+(`test_tndb_power_loss_keeps_the_switch_tail`; the other two start their compaction with no write
+in flight, so their tail is empty), and tndb's log at the default 16 MiB record cap. For the seal until the first write: retiring the sentinel at open (the killed,
 panicking and crashed-reopen tests), and no stamp after the first append, or a skipped stamp
 counted as stamped (the sealed-reopen power-loss test). For the cache drop: no drop after the
 unclean open's fsync (the lost-writeback power-loss test: the acknowledged rows after the reopen
@@ -473,15 +486,18 @@ compaction needs the generation's size plus 128 MiB, plus the 256 MiB floor, fre
 is not admitted only to give way near the copy's end; one whose snapshot has every table empty
 (the epoch-end reset) has nothing to copy, and needs only the 384 MiB. A close cancels a running
 compaction, and a latched durability failure stops one the same way (it could never switch):
-checked each MiB of the copy, during pacing sleeps, each MiB a catch-up round reads, between
-rounds and before each sync; its unfinished log is discarded without a flush, so the close does
-not wait on writing out what it throws away.
+checked each MiB of the copy, during pacing sleeps, each MiB a catch-up round reads, and before
+each catch-up round (never inside the switch); its unfinished log is discarded without a flush, so
+the close does not wait on writing out what it throws away.
 
 **Durability across the switch.** The new log is synced before the rename, and the root
 directory before the new frontier is stored, so no round acks a batch while the next open might
 still pick the old generation. A sync round already running on the old generation keeps it
 mapped (`GenSync`'s `GenAlive`) and acks only batches durable in both. Old snapshots and scans
-keep the old generation's files (retired into its `GenAlive`, deleted on close) until they drop.
+keep the old generation's files (retired into its `GenAlive`) until they drop: its directory is
+unlinked at the switch, and the files close with the last holder. The commit thread holds none
+while it idles (it copies the frontier's numbers out of its guard before it waits), so a quiet
+log's retired generation goes at the switch, not at its next write.
 
 **Cost to other logs.** A compaction's writes and flushes queue on the disk ahead of other logs'
 syncs. Under the worst case measured (`workload_mixed`: 256 KB batches written to the cache log as
@@ -532,11 +548,14 @@ also wrap each database in a `LayeredDatabase`, whose in-memory layer and writer
   (`ensure_stores_durable`) persists one table in each environment (votes, kad records, the batch
   cache), and `Database::failed` resolves, naming the environment, once any of the three latches a
   failure.
-- A missing environment directory is refused once the MDBX migration's marker (`mdbx-migrated`)
-  is in the root: the marker is written only after the first open has created all three, so a
-  missing one was lost (an operator's deletion, a partial restore), and opening it would start it
-  empty (for `epoch`, with no record of this node's votes and proposals). Before the marker, a
-  first start creates them. `db tndb-stat` reports a missing environment as an error.
+- A missing environment is refused once the MDBX migration's marker (`mdbx-migrated`) is in
+  the root: its directory, or a directory without its manifest (`tables`). The marker is written
+  only after the first open has created all three and opened a table in each, so a missing one
+  was lost (an operator's deletion, a partial restore, an unmounted volume's empty mount point),
+  and opening it would start it empty (for `epoch`, with no record of this node's votes and
+  proposals); a directory with neither manifest nor generation is the one state `Core::open`
+  would otherwise open as new. Before the marker, a first start creates them. `db tndb-stat`
+  reports a missing environment as an error.
 
 **Gate** (`workload_bench`, 3 runs, this Mac). On consensus alone, Split matches one log (both
 2.9-3.0 ms per round at N=50; vote durable p50 0.33 ms, against the per-table engine's 0.97 ms, both in group commit). Beside the
@@ -606,8 +625,10 @@ has its epoch tables (its anti-equivocation records: last proposal, votes, propo
 kad tables and both batch caches copied over (`migrate_from_mdbx` in `lib.rs`) and made durable.
 Then the MDBX environments are deleted (MDBX's own files, and each directory if nothing else is
 in it), so a later reset of tndb cannot bring back their state from the time of the switch, and
-the migration is marked done (`tndb/mdbx-migrated`). A crash before the marker reruns the copy
-for whatever is still there. `ConsensusCache` starts empty: it holds outputs the network already
+the migration is marked done (`tndb/mdbx-migrated`). A crash or failure before the marker reruns
+the copy for whatever is still there, each table cleared in tndb before it is copied again: until
+the marker, MDBX is the only source of truth, so nothing a copy that failed part way left behind
+survives beside the next. `ConsensusCache` starts empty: it holds outputs the network already
 committed, which state sync reads again from the consensus chain or fetches from peers. The
 switch is one-way: a downgrade to an MDBX build after it is not supported (that build would start
 with empty epoch tables, no record of this node's votes and proposals, and could sign conflicting
@@ -682,6 +703,10 @@ non-zero if an environment is missing or could not be read.
 
 ## Limits and choices
 
+- **Key size.** A table's key encodes to at most 2032 bytes (a B+tree leaf must hold two). A
+  first row with a longer key is refused as the caller's error, before the manifest records the
+  size: recorded, no index could open and every later open would fail. Production keys are at
+  most 48 bytes.
 - **Address space.** Each log reserves 16 GiB of address space and each index 1 GiB (about 62 GiB
   for a `SplitDatabase` at rest, more while a compaction holds both generations). The
   reservations are virtual, shared and not commit-charged; a process under a `ulimit -v` too small

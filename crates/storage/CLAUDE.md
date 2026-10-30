@@ -184,8 +184,10 @@ and remember that everything after `mod test` is tests (more than half of `conse
   `PositionIndex`, `ConsensusPack`: the next seal's fsync reports failure after it ran);
   `ENVIRONMENTAL_NEXT_SEAL_CHECK` (the next `check_installed_pack_sealed` or `pack_is_sealed`
   fails as descriptor exhaustion does; `stream_import` and `seal_previous_pack` carry it onto their
-  blocking threads); `ENVIRONMENTAL_NEXT_RECOVERY_CHECK` and `ENVIRONMENTAL_NEXT_INDEX_OPEN` (`db
-  repair`'s check and apply arms meeting descriptor exhaustion); `FAIL_HEAL_DATA_OPEN` (`(skip,
+  blocking threads); `ENVIRONMENTAL_NEXT_RECOVERY_CHECK`, `ENVIRONMENTAL_NEXT_INDEX_OPEN` and
+  `pack_validate::ENVIRONMENTAL_NEXT_VALIDATE_OPEN` (`db repair`'s check, apply and validation
+  arms meeting descriptor exhaustion); `FAIL_NEXT_RECOVERY_SEAL` (the next `recover_pack` pass 2
+  seals its rebuilt position index with a failed final fsync); `FAIL_HEAL_DATA_OPEN` (`(skip,
   errno)`: a read-side heal's, migration's or `check_recoverable`'s read-only data-log open fails
   with that OS error after `skip` such opens); `pack_iter::{FAIL_READ_AT,
   FAIL_READ_SKIP, FAIL_READ_TORN}` (a read error or short read at a frame, optionally on a later

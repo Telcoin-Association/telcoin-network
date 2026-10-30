@@ -3707,6 +3707,51 @@ fn test_tndb_power_loss_after_a_compaction_keeps_every_row() {
     disk_model::untrack(&log);
 }
 
+/// The switch's final tail (what landed while it waited for the write lock, written to the new
+/// log under that lock) is synced before the rename: the commit thread takes the new generation
+/// as all synced, so nothing syncs that tail later, and a power loss after the switch must still
+/// find its rows (they were acknowledged durable in the old log, which the switch unlinked).
+#[test]
+fn test_tndb_power_loss_keeps_the_switch_tail() {
+    use std::sync::atomic::Ordering::Relaxed;
+
+    use crate::archive::data_file::disk_model;
+    let tmp = TempDir::with_prefix("tndb_power_switch_tail").expect("temp dir");
+    let db = open_compacting(tmp.path(), CommitMode::Group, manual());
+    let mut expected = BTreeMap::new();
+    for i in 0..50_u64 {
+        db.insert::<TestTable>(&i, &format!("v{i}")).expect("insert");
+        expected.insert(i, format!("v{i}"));
+    }
+    block_on(db.persist::<TestTable>()).expect("persist");
+    db.core().compact.test.track_new_log.store(true, Relaxed);
+    let (arrivals, release) = db.core().compact.test.gate_next();
+    let switched = std::thread::scope(|s| {
+        let compaction = s.spawn(|| db.compact_now());
+        for n in [1, 2] {
+            assert_eq!(next_checkpoint(&arrivals), n);
+            release.send(()).expect("release");
+        }
+        assert_eq!(next_checkpoint(&arrivals), 3, "the base written, before the write lock");
+        for i in 100..110_u64 {
+            db.insert::<TestTable>(&i, &format!("tail{i}")).expect("insert");
+            expected.insert(i, format!("tail{i}"));
+        }
+        block_on(db.persist::<TestTable>()).expect("the tail acknowledged in the old log");
+        drop(release);
+        compaction.join().expect("compaction thread")
+    });
+    assert_eq!(switched, Ok(true));
+    let log = current_log(tmp.path());
+    assert!(log.starts_with(tmp.path().join("gen-1")), "precondition: {}", log.display());
+    crash(db);
+    disk_model::power_loss(&log);
+    let db = open_compacting(tmp.path(), CommitMode::Group, manual());
+    assert_eq!(rows::<TestTable>(&db), expected.into_iter().collect::<Vec<_>>());
+    drop(db);
+    disk_model::untrack(&log);
+}
+
 // ---- concurrency ----
 
 /// Writers (bare writes and transactions, each on its own keys), a scanner, a persister and
@@ -3857,4 +3902,197 @@ fn test_tndb_log_grows_past_its_reservation() {
     let db = open(tmp.path(), CommitMode::Group);
     assert_eq!(db.iter::<TestTable>().count(), 16_000);
     assert_eq!(db.get::<TestTable>(&12_345).expect("get"), Some(value(12_345)));
+}
+
+/// A table whose key encodes to more than a B+tree page can hold two of (2032 bytes): a
+/// `Vec<u8>` of 2032 bytes is 2040 bytes with bincode's 8-byte length prefix.
+#[derive(Debug)]
+struct LongKeyTable;
+impl tn_types::Table for LongKeyTable {
+    type Key = Vec<u8>;
+    type Value = String;
+
+    const NAME: &'static str = "LongKeyTable";
+    const HINT: tn_types::TableHint = tn_types::TableHint::Cache;
+}
+
+/// A first row whose key is longer than an index can hold is refused as the caller's error,
+/// before the manifest records the size: nothing latches, and the database reopens. (Recorded,
+/// no index could be created, and every later open would fail rebuilding it.)
+#[test]
+fn test_tndb_key_too_long_for_an_index_is_refused_before_the_manifest() {
+    let tmp = TempDir::with_prefix("tndb_long_key").expect("temp dir");
+    {
+        let db = open(tmp.path(), CommitMode::Sync);
+        db.open_table::<LongKeyTable>().expect("open table");
+        db.insert::<TestTable>(&1, &"kept".to_string()).expect("insert");
+        let err = db
+            .insert::<LongKeyTable>(&vec![7_u8; 2032], &"v".to_string())
+            .expect_err("the B+tree cannot hold a 2040-byte key");
+        assert!(format!("{err:#}").contains("2040-byte key"), "{err:#}");
+        db.insert::<TestTable>(&2, &"after".to_string()).expect("a caller's error latches nothing");
+        let manifest = super::manifest::Manifest::read(tmp.path())
+            .expect("read manifest")
+            .expect("a manifest");
+        let ksize = manifest.entry(<LongKeyTable as tn_types::Table>::NAME).expect("entry").ksize;
+        assert_eq!(ksize, 0, "the manifest must not record a key size no index can hold");
+    }
+    let db = open(tmp.path(), CommitMode::Sync);
+    assert_eq!(db.get::<TestTable>(&1).expect("get"), Some("kept".to_string()));
+    assert_eq!(db.get::<TestTable>(&2).expect("get"), Some("after".to_string()));
+}
+
+/// An index whose open fails with an I/O error fails the open with an error naming the table and
+/// the index's directory, not a bare OS error.
+#[test]
+fn test_tndb_index_open_io_error_names_the_index() {
+    let tmp = TempDir::with_prefix("tndb_idx_io_err").expect("temp dir");
+    {
+        let db = open(tmp.path(), CommitMode::Sync);
+        db.insert::<TestTable>(&1, &"a".to_string()).expect("insert");
+    }
+    let idx = tmp.path().join("gen-0").join("idx-0");
+    assert!(idx.is_dir(), "precondition: {}", idx.display());
+    std::fs::remove_dir_all(&idx).expect("rm idx");
+    std::fs::write(&idx, b"not a directory").expect("a file where the index dir was");
+    let err = TnDatabase::open_with(tmp.path(), options(CommitMode::Sync))
+        .expect_err("an index that cannot open fails the open");
+    let err = format!("{err:#}");
+    assert!(err.contains("TestTable") && err.contains("idx-0"), "names the index: {err}");
+}
+
+/// After a compaction switch, nothing keeps the retired generation's files alive once every
+/// snapshot of it has dropped: the idle commit thread in particular holds no guard on the old
+/// frontier across its wait, so a quiet log's old generation goes at the switch, not at its next
+/// write.
+#[test]
+fn test_tndb_idle_commit_thread_releases_the_retired_generation() {
+    use std::sync::Arc;
+
+    let tmp = TempDir::with_prefix("tndb_idle_release").expect("temp dir");
+    let db = open_compacting(tmp.path(), CommitMode::Group, manual());
+    for i in 0..100_u64 {
+        db.insert::<TestTable>(&i, &format!("v{i}")).expect("insert");
+    }
+    db.remove::<TestTable>(&0).expect("a dead row");
+    block_on(db.persist::<TestTable>()).expect("persist");
+    // Let the commit thread settle into its idle wait.
+    std::thread::sleep(Duration::from_millis(200));
+    let weak = Arc::downgrade(&db.core().frontier.load().sync._alive);
+    assert_eq!(db.compact_now(), Ok(true), "compacted");
+    wait_only_gen(tmp.path(), 1);
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while weak.upgrade().is_some() && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        weak.upgrade().is_none(),
+        "the retired generation is still held (strong count {}) with no write since the switch",
+        weak.strong_count()
+    );
+}
+
+/// A CLEAR during a later catch-up round of a table whose rows in the new log all came from an
+/// earlier round (none from the copy) is written to the new log, so a crash's replay of the new
+/// generation does not bring the cleared rows back.
+#[test]
+fn test_tndb_compaction_catch_up_clears_rows_an_earlier_round_wrote() {
+    let tmp = TempDir::with_prefix("tndb_catchup_clear").expect("temp dir");
+    let db = open_compacting(tmp.path(), CommitMode::Group, manual());
+    for i in 0..50_u64 {
+        db.insert::<TestTable>(&i, &format!("t{i}")).expect("insert");
+    }
+    // Fix OtherTable's key size, but leave it empty at the snapshot.
+    db.insert::<OtherTable>(&1, &"gone".to_string()).expect("insert");
+    db.remove::<OtherTable>(&1).expect("remove");
+    let (arrivals, release) = db.core().compact.test.gate_next();
+    let switched = std::thread::scope(|s| {
+        let compaction = s.spawn(|| db.compact_now());
+        assert_eq!(next_checkpoint(&arrivals), 1, "after the copy");
+        for i in 0..5_u64 {
+            db.insert::<OtherTable>(&i, &format!("o{i}")).expect("rows written during the copy");
+        }
+        // Over a round's worth, so the catch-up takes a second round.
+        let big = "v".repeat(64 << 10);
+        for i in 1_000..1_020_u64 {
+            db.insert::<TestTable>(&i, &big).expect("insert");
+        }
+        release.send(()).expect("release");
+        assert_eq!(next_checkpoint(&arrivals), 2, "the round that copied OtherTable's rows");
+        db.clear_table::<OtherTable>().expect("clear the round-written rows");
+        drop(release);
+        compaction.join().expect("compaction thread")
+    });
+    assert_eq!(switched, Ok(true));
+    assert_eq!(db.iter::<OtherTable>().count(), 0, "cleared, live");
+    crash(db);
+    let db = open_compacting(tmp.path(), CommitMode::Group, manual());
+    assert_eq!(
+        rows::<OtherTable>(&db),
+        Vec::<(u64, String)>::new(),
+        "an unclean reopen replays the new log: the CLEAR must be in it"
+    );
+    assert_eq!(db.iter::<TestTable>().count(), 70);
+}
+
+/// A put then a removal of a copied key inside one catch-up round nets to a removal of a row
+/// the new log holds, written as its own batch: the row is gone live and after a crash's replay.
+#[test]
+fn test_tndb_compaction_catch_up_removes_a_copied_row_put_and_removed_in_one_round() {
+    let tmp = TempDir::with_prefix("tndb_catchup_net_remove").expect("temp dir");
+    let db = open_compacting(tmp.path(), CommitMode::Group, manual());
+    for i in 0..50_u64 {
+        db.insert::<TestTable>(&i, &format!("t{i}")).expect("insert");
+    }
+    let (arrivals, release) = db.core().compact.test.gate_next();
+    let switched = std::thread::scope(|s| {
+        let compaction = s.spawn(|| db.compact_now());
+        assert_eq!(next_checkpoint(&arrivals), 1, "after the copy");
+        db.insert::<TestTable>(&7, &"overwritten".to_string()).expect("insert");
+        db.remove::<TestTable>(&7).expect("remove");
+        drop(release);
+        compaction.join().expect("compaction thread")
+    });
+    assert_eq!(switched, Ok(true));
+    assert_eq!(db.get::<TestTable>(&7).expect("get"), None, "removed, live");
+    assert_eq!(db.iter::<TestTable>().count(), 49);
+    crash(db);
+    let db = open_compacting(tmp.path(), CommitMode::Group, manual());
+    assert_eq!(db.get::<TestTable>(&7).expect("get"), None, "the removal is in the new log");
+    assert_eq!(db.iter::<TestTable>().count(), 49);
+}
+
+/// A copied key removed in one catch-up round and put again in a later one holds the new value
+/// after the switch and after a crash's replay (the later round's put follows the earlier
+/// round's removal in the new log).
+#[test]
+fn test_tndb_compaction_catch_up_re_puts_a_row_removed_in_an_earlier_round() {
+    let tmp = TempDir::with_prefix("tndb_catchup_re_put").expect("temp dir");
+    let db = open_compacting(tmp.path(), CommitMode::Group, manual());
+    for i in 0..50_u64 {
+        db.insert::<TestTable>(&i, &format!("t{i}")).expect("insert");
+    }
+    let (arrivals, release) = db.core().compact.test.gate_next();
+    let switched = std::thread::scope(|s| {
+        let compaction = s.spawn(|| db.compact_now());
+        assert_eq!(next_checkpoint(&arrivals), 1, "after the copy");
+        db.remove::<TestTable>(&7).expect("remove");
+        // Over a round's worth, so the catch-up takes a second round.
+        let big = "v".repeat(64 << 10);
+        for i in 1_000..1_020_u64 {
+            db.insert::<TestTable>(&i, &big).expect("insert");
+        }
+        release.send(()).expect("release");
+        assert_eq!(next_checkpoint(&arrivals), 2, "the round that wrote the removal");
+        db.insert::<TestTable>(&7, &"again".to_string()).expect("re-put");
+        drop(release);
+        compaction.join().expect("compaction thread")
+    });
+    assert_eq!(switched, Ok(true));
+    assert_eq!(db.get::<TestTable>(&7).expect("get"), Some("again".to_string()));
+    assert_eq!(db.iter::<TestTable>().count(), 70);
+    crash(db);
+    let db = open_compacting(tmp.path(), CommitMode::Group, manual());
+    assert_eq!(db.get::<TestTable>(&7).expect("get"), Some("again".to_string()));
+    assert_eq!(db.iter::<TestTable>().count(), 70);
 }

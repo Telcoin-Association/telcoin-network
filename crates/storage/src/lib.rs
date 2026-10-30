@@ -227,13 +227,14 @@ fn open_mdbx_env(store_path: &std::path::Path, env: MdbxEnv) -> eyre::Result<Mdb
 /// Once the copy is durable, the MDBX environments it read are deleted (MDBX's own files, and each
 /// directory if nothing else is in it), so a later reset of tndb cannot bring back their state from
 /// the time of the switch; then a marker file in `tndb_root` records that the migration is done.
-/// Until then every open runs it again: an environment still present is copied again (MDBX is not
-/// written meanwhile, so that only rewrites the same rows) and deleted, and one already deleted was
-/// copied before it. A file whose presence cannot be checked (a stat error other than not-found)
-/// fails the open rather than counting as absent. The switch is one-way: a downgrade to an MDBX
-/// build after it is not supported, because that build would start with empty epoch tables (no
-/// record of this node's votes and proposals) and could sign conflicting messages. Problems after
-/// the switch are fixed forward.
+/// Until then every open runs it again: an environment still present has each of its tables
+/// cleared in tndb and copied again (until the marker, MDBX is the only source of truth: a copy
+/// that failed part way must leave nothing beside the next one) and is then deleted, and one
+/// already deleted was copied before it. A file whose presence cannot be checked (a stat error
+/// other than not-found) fails the open rather than counting as absent. The switch is one-way: a
+/// downgrade to an MDBX build after it is not supported, because that build would start with
+/// empty epoch tables (no record of this node's votes and proposals) and could sign conflicting
+/// messages. Problems after the switch are fixed forward.
 #[cfg(feature = "reth-libmdbx")]
 pub(crate) fn migrate_from_mdbx(
     store_path: &std::path::Path,
@@ -243,9 +244,10 @@ pub(crate) fn migrate_from_mdbx(
     use eyre::WrapErr as _;
     use std::io::Write as _;
 
-    // Presence is decided by `try_exists`: any error other than not-found (EACCES on a directory,
-    // an unmounted volume behind a symlink) fails the open. `exists` would read it as "absent", and
-    // the marker written below would then make the loss of the epoch tables permanent.
+    // Presence is decided by `try_exists`: any stat error other than not-found (EACCES on the
+    // directory) fails the open. `exists` would read it as "absent", and the marker written below
+    // would then make the loss of the epoch tables permanent. A dangling symlink or an empty mount
+    // point stats as not-found: the store must be mounted before the first start.
     let exists = |path: &std::path::Path| {
         path.try_exists().wrap_err_with(|| format!("Cannot check {}", path.display()))
     };
@@ -360,8 +362,11 @@ const ROWS_PER_TXN: usize = 10_000;
 
 /// Copy every row of table `T` from `src` into `dst`, in transactions of at most `rows_per_txn`
 /// rows (the whole copy is made durable, and marked done, by the caller). Returns the rows copied.
-/// A read error, or fewer rows than MDBX counts, is an error ([`MdbxDatabase::try_for_each`]):
-/// MDBX is deleted after the copy, so a copy cut short must never look complete.
+/// The table is cleared in `dst` first, in the transaction of its first rows: until the caller's
+/// marker is written, MDBX is the only source of truth, and the rows a copy that failed part way
+/// left behind must not survive beside the next copy. A read error, or fewer rows than MDBX
+/// counts, is an error ([`MdbxDatabase::try_for_each`]): MDBX is deleted after the copy, so a copy
+/// cut short must never look complete.
 #[cfg(feature = "reth-libmdbx")]
 fn copy_table<T: tn_types::Table, D: tn_types::Database>(
     src: &MdbxDatabase,
@@ -371,7 +376,11 @@ fn copy_table<T: tn_types::Table, D: tn_types::Database>(
     use tn_types::{Database as _, DbTxMut as _};
 
     src.open_table::<T>()?;
+    dst.open_table::<T>()?;
     let mut txn = dst.write_txn()?;
+    // Rows of an earlier attempt that failed part way (the marker is absent, so MDBX is the only
+    // source of truth), gone with the first rows' commit.
+    txn.clear_table::<T>()?;
     let mut in_txn = 0;
     let rows = src.try_for_each::<T>(|key, value| {
         txn.insert::<T>(&key, &value)?;
@@ -609,6 +618,49 @@ mod migrate_test {
         assert!(!root.join(MDBX_MIGRATED).exists(), "and the move is not marked done");
         assert_eq!(migrate_from_mdbx(store, &root, &db).expect("retry"), 10, "a retry copies all");
         assert!(!store.join("epoch").exists(), "then MDBX is deleted");
+    }
+
+    /// A copy that failed part way leaves the tables it had committed in tndb, with MDBX kept and
+    /// the move not marked done. Until the marker MDBX is the only source of truth, so the retry
+    /// copies what MDBX holds then, not that beside it: a row of the failed attempt whose key MDBX
+    /// no longer has is gone after the retry.
+    #[test]
+    fn test_migrate_from_mdbx_replaces_rows_of_a_failed_attempt() {
+        let tmp = TempDir::with_prefix("migrate_mdbx_retry").expect("temp dir");
+        let store = tmp.path();
+        let stale = (B256::repeat_byte(1), 0);
+        let fresh = (B256::repeat_byte(2), 0);
+        {
+            let mdbx = crate::_open_mdbx(store);
+            mdbx.insert::<Payload>(&stale, &1).expect("payload");
+            for i in 0..5 {
+                mdbx.insert::<KadRecords>(&B256::repeat_byte(i), &vec![i]).expect("kad");
+            }
+            mdbx.sync_persist();
+        }
+        let root = store.join(TNDB_DIR);
+        let db = open_split(&root);
+        // The epoch tables (one `Payload` row) are copied and committed; the kad walk, the first
+        // to reach 4 rows, fails there.
+        crate::mdbx::database::fail_next_walk_after(4);
+        let err = migrate_from_mdbx(store, &root, &db).expect_err("a read error fails the move");
+        assert!(err.to_string().contains("kad_record"), "the kad walk fails: {err}");
+        assert_eq!(db.get::<Payload>(&stale).expect("get"), Some(1), "the epoch copy committed");
+        assert!(store.join("epoch").join("mdbx.dat").exists(), "MDBX is kept");
+        assert!(!root.join(MDBX_MIGRATED).exists(), "and the move is not marked done");
+        // MDBX, still the source of truth, holds other rows by the retry.
+        {
+            let mdbx = crate::_open_mdbx(store);
+            mdbx.remove::<Payload>(&stale).expect("remove");
+            mdbx.insert::<Payload>(&fresh, &2).expect("payload");
+            mdbx.sync_persist();
+        }
+        assert_eq!(migrate_from_mdbx(store, &root, &db).expect("retry"), 6, "the retry copies all");
+        assert_eq!(db.get::<Payload>(&stale).expect("get"), None, "the failed attempt's row");
+        assert_eq!(db.get::<Payload>(&fresh).expect("get"), Some(2), "MDBX's row");
+        assert_eq!(db.get::<KadRecords>(&B256::repeat_byte(4)).expect("get"), Some(vec![4]));
+        assert!(!store.join("epoch").exists(), "then MDBX is deleted");
+        assert!(root.join(MDBX_MIGRATED).exists(), "and the move is marked done");
     }
 
     /// An environment that cannot be checked (here a directory the node may not search: EACCES on
