@@ -127,3 +127,8 @@ newest last.
   engine API, and `tn-reth/src/traits.rs` requires that `ValidationApi` never be registered. The
   registry already mapped `flashbots` and `testing` to empty modules. `reth-rpc-engine-api`,
   `reth-payload-builder` and `reth-consensus-common` leave the graph. *Upstream*: no.
+
+- **TN-0011** — Remove 3 crates TN no longer reaches. *Kind*: removal.
+  *Files*: removed with `vendor.py remove`: rpc/rpc-engine-api, payload/builder,
+  consensus/common.
+  *Why*: after TN-0010 only the removed RPC modules reached them. *Upstream*: n/a.
