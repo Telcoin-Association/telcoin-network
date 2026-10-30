@@ -5508,16 +5508,21 @@ async fn live_epoch_still_bans_unauthorized_author() -> eyre::Result<()> {
 /// An oversized payload is the only relayer-attributable reject — the size bound is a compile-time
 /// protocol constant (`MAX_GOSSIP_MESSAGE_SIZE`), identical on every honest node and enforced on
 /// both the publish and receive paths, so an honest peer never originates or forwards one — and it
-/// is charged to the forwarder only once its BLS identity has resolved (the author's resolution is
-/// irrelevant), mirroring the Accept path's unresolved-relayer skip.
+/// is charged to the forwarder only once its BLS identity has resolved (the author's resolution and
+/// the epoch position are irrelevant), mirroring the Accept path's unresolved-relayer skip.
 #[test]
 fn oversized_reject_penalizes_only_a_resolved_relayer() {
     for author_resolved in [true, false] {
-        assert_eq!(
-            RejectReason::TooLarge.penalty(true, author_resolved),
-            RejectPenalty::FatalRelayer
-        );
-        assert_eq!(RejectReason::TooLarge.penalty(false, author_resolved), RejectPenalty::Skip);
+        for position in [EpochPosition::Live, EpochPosition::Historical] {
+            assert_eq!(
+                RejectReason::TooLarge.penalty(true, author_resolved, position),
+                RejectPenalty::FatalRelayer
+            );
+            assert_eq!(
+                RejectReason::TooLarge.penalty(false, author_resolved, position),
+                RejectPenalty::Skip
+            );
+        }
     }
 }
 
