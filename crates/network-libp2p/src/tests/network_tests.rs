@@ -3519,7 +3519,10 @@ async fn test_kad_record_jobs_never_republish_stored_records() -> eyre::Result<(
     Ok(())
 }
 
-/// An identical signed PUT carries a fresh wire expiry and refreshes the stored copy.
+/// An identical signed PUT carries a fresh wire expiry. The stored copy is rewritten only when
+/// the copy extends its expiry by more than half the configured TTL (or the row has lapsed), so
+/// a relayed copy cannot force one durable write per copy (GHSA-4947-9xvx-pv2m), and the kept
+/// expiry never shrinks.
 #[tokio::test]
 async fn test_identical_kad_record_refreshes_expiry() -> eyre::Result<()> {
     let TestTypes { peer1, peer2, .. } =
@@ -3533,6 +3536,7 @@ async fn test_identical_kad_record_refreshes_expiry() -> eyre::Result<()> {
         .kademlia
         .store_mut()
         .retain_connected(source, record.key.clone())?;
+    let ttl = network.config.kad_record_ttl;
     let instant = std::time::Instant::now();
     record.expires = Some(instant + Duration::from_secs(60));
     network.process_kad_put_request(source, record.clone())?;
@@ -3545,7 +3549,29 @@ async fn test_identical_kad_record_refreshes_expiry() -> eyre::Result<()> {
         .and_then(|stored| stored.expires)
         .ok_or_else(|| eyre!("initial expiry"))?;
 
+    // A copy that extends the expiry by less than half the TTL is a free relay: nothing is written.
     record.expires = Some(instant + Duration::from_secs(120));
+    network.process_kad_put_request(source, record.clone())?;
+    let stored = network
+        .swarm
+        .behaviour_mut()
+        .kademlia
+        .store_mut()
+        .get(&record.key)
+        .ok_or_else(|| eyre!("record after a short extension"))?
+        .into_owned();
+    assert_eq!(stored.value, record.value);
+    assert_eq!(stored.publisher, record.publisher);
+    // The store rebuilds the `Instant` on every read, so compare with a tolerance.
+    let unchanged_expiry = stored.expires.ok_or_else(|| eyre!("expiry after a short extension"))?;
+    assert!(
+        unchanged_expiry.saturating_duration_since(first_expiry) < Duration::from_secs(1)
+            && first_expiry.saturating_duration_since(unchanged_expiry) < Duration::from_secs(1),
+        "a short extension must not rewrite the row"
+    );
+
+    // A copy that extends it by more than half the TTL refreshes the stored copy.
+    record.expires = Some(instant + Duration::from_secs(120) + ttl / 2);
     network.process_kad_put_request(source, record.clone())?;
     let stored = network
         .swarm
@@ -3557,7 +3583,7 @@ async fn test_identical_kad_record_refreshes_expiry() -> eyre::Result<()> {
         .into_owned();
     assert_eq!(stored.value, record.value);
     assert_eq!(stored.publisher, record.publisher);
-    assert!(stored.expires.is_some_and(|expiry| expiry > first_expiry + Duration::from_secs(30)));
+    assert!(stored.expires.is_some_and(|expiry| expiry > first_expiry + ttl / 2));
 
     // A replicated copy with less remaining TTL must not undo the refresh.
     let refreshed_expiry = stored.expires.ok_or_else(|| eyre!("refreshed expiry"))?;
