@@ -42,7 +42,7 @@ pub struct QuicConfig {
 /// a well-behaved peer and a bound for a hostile one. quinn buffers data for every opened stream
 /// until the swarm accepts it in index order, and every empty stream ahead of the data costs one
 /// inbound upgrade timeout, so the stream ceiling also bounds how long buffered data can wait.
-pub const DEFAULT_MAX_CONCURRENT_STREAM_LIMIT: u32 = 256;
+pub(crate) const DEFAULT_MAX_CONCURRENT_STREAM_LIMIT: u32 = 256;
 
 /// Default receive credit per stream, in bytes: 2 MiB.
 ///
@@ -50,7 +50,7 @@ pub const DEFAULT_MAX_CONCURRENT_STREAM_LIMIT: u32 = 256;
 /// stays under 2 MiB, and a sync frame is read in bounded chunks, so one stream window holds the
 /// largest message a protocol reads in one step with the same amount of headroom. A larger message
 /// still arrives: quinn re-issues stream credit as the handler reads.
-pub const DEFAULT_MAX_STREAM_DATA: u32 = 2 * 1024 * 1024;
+pub(crate) const DEFAULT_MAX_STREAM_DATA: u32 = 2 * 1024 * 1024;
 
 /// Default receive credit per connection, in bytes: 4 MiB, two full stream windows.
 ///
@@ -59,7 +59,7 @@ pub const DEFAULT_MAX_STREAM_DATA: u32 = 2 * 1024 * 1024;
 /// pins at most 32 MiB and a whole swarm at most 512 MiB. The previous 100 MiB window allowed
 /// 800 MiB per peer id and had no swarm bound. Throughput per connection stays at the window over
 /// the round-trip time: 40 MiB/s at 100 ms.
-pub const DEFAULT_MAX_CONNECTION_DATA: u32 = 4 * 1024 * 1024;
+pub(crate) const DEFAULT_MAX_CONNECTION_DATA: u32 = 4 * 1024 * 1024;
 
 impl Default for QuicConfig {
     fn default() -> Self {
