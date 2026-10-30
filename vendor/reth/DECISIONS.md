@@ -148,3 +148,16 @@ proven unchanged. Step B, removing the zero-size stub and the storage-v2 plumbin
 it, changes compiled code and is planned in ROADMAP.md. `etc/rocksdb-gate.sh` now fails if
 `Cargo.lock` or any manifest (comments aside) mentions rocksdb, so an upstream sync cannot
 quietly bring it back.
+
+## D15. RocksDB step B waits for the storage work
+
+Step B (removing the zero-size `RocksDBProvider` stub, the `RocksBatchArg`/`RocksTxRefArg`
+placeholders, `ProviderFactory`'s RocksDB field and parameters, and `storage_v2`'s RocksDB
+routing) was planned on 2026-10-30 but not done unattended. Step A already removed everything
+that builds or runs RocksDB, and the gate enforces it, so step B saves no build time. Step B
+rewrites live storage code: the history and changeset write routing in `EitherWriter`, the
+persisted `StorageSettings` (whose `storage_v2` flag is part of the on-disk metadata and has to
+keep decoding), and `check_consistency`. That is the code the tndb-b work owns (Phase 3). Do it
+there, or as its own reviewed change with the full test and e2e suites. Until then, a v2
+database is impossible for TN because `tn-reth` pins `StorageArgs { v2: false }` and does not
+expose the flag.
