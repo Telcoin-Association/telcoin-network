@@ -1,0 +1,132 @@
+# ROADMAP: from vendored reth to a TN-owned execution layer
+
+Where the vendored reth goes next, in the order that makes each step cheap and safe. Read
+`tn/notes/usage-map.md` first: it records what TN actually uses from each crate and where. Status
+markers: **[done]**, **[next]**, **[later]**.
+
+## Ground rules for every step
+
+- One logical change per commit, and every commit builds and passes. Each change to vendored
+  files gets a CHANGES.md entry. `vendor.py status` must list nothing the ledger does not cover.
+- Before removing a crate or a dependency edge, snapshot the feature graph and diff it
+  afterwards: `python3 -I vendor/reth/tn/graph.py snapshot|diff`. A third-party crate that loses
+  a feature needs an explanation in the commit. The revm precompile backends (`secp256k1`, `blst`,
+  `c-kzg`) and `asm-keccak` are consensus-relevant: losing one can change results or performance
+  without a compile error.
+- Verification ladder, cheapest first: `cargo check --workspace --all-targets` (default and
+  `--features tn-reth/tndb-b`), `etc/ci-lanes.sh fmt` and `clippy`, the nextest lanes, then the
+  e2e restart and epoch suites (`make test-restarts`, `make test-epochs`, and the `-tndb`
+  variants). Run reth's own tests for any vendored crate you change (`tn/cargo.sh test -p ...`).
+- Tag `reth-reduction-start` sits on the last commit before the first reduction. `git diff
+  reth-reduction-start` shows everything reduction has done.
+
+## Phase 0: vendor [done]
+
+reth v1.11.3 vendored under `vendor/reth`; 101 crates plus `reth-testing-utils`. The build
+resolves to the same third-party versions and features as the git dependency did. Tag
+`reth-vendor-v1.11.3`.
+
+## Phase 1: drop the node-builder and node-ethereum layers [next]
+
+TN never uses reth's node builder. It assembles provider, EVM, pool and RPC itself. It still
+depends on `reth-node-builder` (for re-exports only) and `reth-node-ethereum` (for two types).
+Those two pull in engine-tree, engine-service, engine-local, exex, downloaders, stages, era*,
+payload builders, node-ethstats, consensus-debug-client, invalid-block-hooks, node-events and
+node-metrics.
+
+1. In `crates/tn-reth`, import from where the items live: `NodeConfig` and
+   `RethTransactionPoolConfig` from `reth-node-core`, the node types from
+   `reth-node-types`/`reth-node-api`, `PayloadTypes`/`BuiltPayload` from
+   `reth-payload-primitives`, the `DEFAULT_*` constants from `reth-engine-primitives`.
+2. `EthEngineTypes` comes from `reth-ethereum-engine-primitives`, and `EthPayloadAttributes` is
+   alloy's `PayloadAttributes`. Delete the dead `DefaultEthPayloadTypes` and the dead
+   re-exports listed in the usage map.
+3. `reth-node-ethereum` enables revm `secp256k1`, `blst`, `c-kzg` and `memory_limit`, and
+   forwards `asm-keccak`/`keccak-cache-global`. Enable these where TN depends on revm, then
+   prove with `graph.py diff` that nothing third-party lost a feature.
+4. `js-tracer` is already set on `reth-rpc` and `reth-rpc-eth-types`. Drop the forwarding
+   through node-builder.
+5. `vendor.py remove` every crate that left the graph, and delete their root `Cargo.toml`
+   entries.
+
+Some of these crates may still be reachable through `reth-node-core` or `reth-rpc-builder`
+(`reth-engine-local`, for instance). Whatever stays is a Phase 2 item.
+
+## Phase 2: the Ethereum p2p and node-config stack [later]
+
+What still holds the devp2p stack (`reth-network`, `eth-wire`, `discv4`/`discv5`,
+`dns-discovery`, `ecies`, `net-nat`) in the graph is `reth-node-core`, through `NodeConfig`'s
+argument groups. `reth-rpc-builder` depends on `reth-node-core` for `RpcServerArgs`. TN's own
+uses are type-only (a dummy key, `NetworkArgs` enums, stub `NetworkInfo`/`Peers` impls for the
+`net_` namespace, `BlockHashNumber`, `NatResolver::None`).
+
+Options, in order of preference:
+
+- A TN-owned config struct instead of `NodeConfig` (`tn-reth/src/cli.rs:287-540` already pins
+  every group but RPC, txpool and DB). Patch the vendored `reth-rpc-builder` to take its server
+  arguments from a small struct instead of `reth-node-core`.
+- Then make the network arg groups and their dependencies optional in the vendored
+  `reth-node-core`, or stop depending on it altogether.
+- Keep `reth-network-api` (small, and the `EthApi` bounds need its traits). Drop `reth-network`
+  and the discovery crates. Replace `BlockHashNumber` with alloy's `BlockNumHash`.
+
+## Phase 3: tndb-b as the reth database [later; owned by the tndb-b work]
+
+Vendoring makes it possible to change reth's storage crates directly instead of working around
+them:
+
+- Feature-gate MDBX in the vendored `reth-db` (and `reth-provider`), so a tndb-b build stops
+  compiling `reth-mdbx-sys`. MDBX has to stay while it is the default backend and the migration
+  source (`tn-storage` uses `reth-libmdbx` for its own migration path).
+- Decide whether static files (`reth-nippy-jar`, `StaticFileProvider`) stay or move into tndb-b.
+- Keep the `reth_db_*` metric names, or change them together with the e2e tests and `tn-metrics`
+  that assert on them.
+
+## Phase 4: alloy and revm directly [later]
+
+- `reth-revm` is mostly revm re-exports. Import `revm::` directly and keep only `State`,
+  `StateProviderDatabase` and `CachedReads` from reth (or own them).
+- `reth-evm`: import alloy-evm items from `alloy_evm`. Keep `ConfigureEvm`, `BlockBuilder` and
+  `BlockAssembler` until TN's execution path (`env/execution.rs`) is rewritten on its own
+  traits.
+- `reth-evm-ethereum` contributes three items. TN pins all forks at genesis, so a TN-owned
+  `revm_spec` and receipt builder are small.
+- `reth-metrics` in nine TN crates becomes `metrics` plus `metrics-derive` (mechanical).
+- `reth-primitives` becomes `reth-primitives-traits` plus `reth-ethereum-primitives` (easy). Going
+  further (TN-owned `Sealed*`/`Recovered*`) touches about 150 sites through `tn-types`.
+- `reth-chainspec`: a TN chainspec implementing `EthChainSpec`/`EthereumHardforks`, so the
+  provider, `EthApi` and pool bounds keep working.
+
+## Phase 5: a transaction pool for TN [later]
+
+TN wraps reth's `EthTransactionPool` (`tn-reth/src/txn_pool.rs`), runs its own maintenance
+loop and disables EIP-4844 and EIP-7702. With the code vendored, candidates are: drop the blob
+store and the 4844 paths, give batch building its own ordering, and simplify validation to TN's
+rules.
+
+## Phase 6: RPC surface [later]
+
+The `eth`, `debug` and `trace` namespaces come from reth-rpc; TN overrides seven methods. Once
+Phase 1 lands, see what still pulls in `reth-rpc-engine-api` and the engine API types, and cut
+whatever TN does not serve.
+
+## Taking upstream changes as the code diverges
+
+- While a crate is only lightly changed, `vendor.py sync` and `pick` keep working. Watch reth
+  releases for fixes in the crates TN still carries close to upstream: rpc, transaction-pool,
+  trie, provider, chain-state.
+- A trial `sync v2.0.0` (2026-10-30) showed the shape of the next major step:
+  `reth-primitives-traits`, `reth-codecs(-derive)` and `reth-zstd-compressors` move to crates.io,
+  `reth-primitives` and `reth-engine-service` disappear, `engine/execution-cache` is new, and revm
+  goes from 34 to 36. Do Phase 1 before attempting it: fewer crates, fewer conflicts.
+- Security fixes in revm and alloy arrive through crates.io, independent of reth. Bump them in
+  `vendor/reth/Cargo.toml` and the root `Cargo.lock`.
+
+## Forking a crate off
+
+When TN has changed most of a crate and upstream syncs no longer apply to it:
+
+1. Record the decision in DECISIONS.md and CHANGES.md.
+2. `vendor.py remove` it, move it into TN's workspace (`crates/`), rename it `tn-*`, give it
+   TN's lints, and fix up the dependents.
+3. Its upstream fixes become manual ports from then on. Note the last upstream commit it tracked.
