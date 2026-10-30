@@ -10,7 +10,7 @@
 //! | off | size | field |
 //! |---|---|---|
 //! | 0 | 8 | magic `b"tndb-b\0\0"` |
-//! | 8 | 4 | format version (2) |
+//! | 8 | 4 | format version (3) |
 //! | 12 | 4 | page size |
 //! | 16 | 8 | txn id |
 //! | 24 | 4 | page count (pages `0..page_count` are allocated) |
@@ -33,7 +33,7 @@ use crate::{
 pub(crate) const MAGIC: [u8; 8] = *b"tndb-b\0\0";
 
 /// The on-disk format version this build reads and writes.
-pub(crate) const FORMAT_VERSION: u32 = 2;
+pub(crate) const FORMAT_VERSION: u32 = 3;
 
 /// The size of a meta record (at offset 0 of its page).
 pub(crate) const META_LEN: usize = 128;
@@ -47,7 +47,7 @@ const CATALOG: std::ops::Range<usize> = 32..32 + TreeRoot::ENCODED_LEN;
 /// Where the free tree's [`TreeRoot`] lies.
 const FREE: std::ops::Range<usize> = CATALOG.end..CATALOG.end + TreeRoot::ENCODED_LEN;
 
-/// The bytes the format reserves (zero in version 2).
+/// The bytes the format reserves (zero in version 3).
 const RESERVED: std::ops::Range<usize> = FREE.end..CRC_AT;
 
 /// Every page size a file can have, smallest first: where meta 1 may lie when meta 0 cannot be
@@ -458,6 +458,23 @@ mod tests {
         assert!(refused(choose(&image(4096, Some(newer), Some(ok)))));
         assert!(refused(choose(&image(4096, Some(ok), Some(newer)))));
         assert!(refused(choose(&image(4096, None, Some(newer)))));
+    }
+
+    /// A version-2 record (a 56-byte table record, no nested cells) is refused before its CRC,
+    /// stamped or not: the format is pre-release, with no migration.
+    #[test]
+    fn a_version_2_record_is_refused() {
+        assert_eq!(FORMAT_VERSION, 3);
+        for stamp in [false, true] {
+            let mut rec = meta(4096, 5).encode();
+            rec[8..12].copy_from_slice(&2_u32.to_le_bytes());
+            if stamp {
+                restamp(&mut rec);
+            }
+            assert!(matches!(Meta::decode(&rec), Err(Error::UnsupportedVersion(2))), "{stamp}");
+            let file = image(4096, Some(rec), Some(rec));
+            assert!(matches!(choose(&file), Err(Error::UnsupportedVersion(2))), "{stamp}");
+        }
     }
 
     /// The commit writes over the lower txn, an invalid slot first, slot 1 on a tie.

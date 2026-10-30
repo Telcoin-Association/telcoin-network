@@ -134,9 +134,16 @@ impl Checker<'_> {
                 for i in 0..n {
                     let (k, v) = page::leaf_entry(page, i)?;
                     entry(self, k, v).map_err(|e| corrupt(p, e.to_string()))?;
-                    if let Val::Overflow(ovf) = v {
-                        overflows +=
-                            self.claim_run(ovf, owner).map_err(|e| corrupt(p, e.to_string()))?;
+                    match v {
+                        Val::Inline(_) => {}
+                        Val::Overflow(ovf) => {
+                            overflows += self
+                                .claim_run(ovf, owner)
+                                .map_err(|e| corrupt(p, e.to_string()))?;
+                        }
+                        Val::Nested(root) => {
+                            return Err(corrupt(p, page::nested_error(root).to_string()));
+                        }
                     }
                 }
                 continue;
@@ -217,7 +224,7 @@ pub(crate) fn check_snapshot(snapshot: &Snapshot) -> Result<CheckReport> {
             .map_err(|_| Error::Corrupt("a table name is not UTF-8".to_string()))?;
         catalog::check_name(name)
             .map_err(|_| Error::Corrupt(format!("bad table name {name:?}")))?;
-        let record = TableRecord::decode(v.inline()?)?;
+        let record = *TableRecord::decode(v.inline()?)?.plain()?;
         if record.id >= meta.next_table_id || record.created_txn > meta.txn {
             return Err(Error::Corrupt(format!(
                 "table {name:?} has an impossible record {record:?}"

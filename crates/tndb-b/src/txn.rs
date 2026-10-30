@@ -644,14 +644,15 @@ impl Work {
         (writer, &mut self.tables[i])
     }
 
-    /// Record the changed tree of the table at `i` in [`Self::tables`], with its root's
-    /// provenance, under a new write stamp. Every change to a table's tree comes here (put,
+    /// Record the changed tree of the table at `i` in [`Self::tables`], its new `root` with the
+    /// root's provenance, under a new write stamp. Every change to a table's tree comes here (put,
     /// append, insert, delete, clear), so the stamp tells a [`TxnCursor`] whether its table
-    /// changed since its last call.
-    fn set_record(&mut self, i: usize, record: TableRecord, trusted: bool) {
+    /// changed since its last call. It takes the root alone, not the whole [`TableRecord`]: a put
+    /// copies only what it changes.
+    fn set_record(&mut self, i: usize, root: TreeRoot, trusted: bool) {
         self.stamp += 1;
         let w = &mut self.tables[i];
-        w.record = record;
+        w.record.root = root;
         w.trusted = trusted;
         w.changed = true;
         w.writes = self.stamp;
@@ -795,12 +796,12 @@ impl RwTxn {
     pub fn clear_table(&mut self, table: &Table) -> Result<()> {
         self.write(|work| {
             let i = work.working(table)?;
-            let (mut record, trusted) = (work.tables[i].record, work.tables[i].trusted);
-            if record.root.is_empty() {
+            let (mut root, trusted) = (work.tables[i].record.root, work.tables[i].trusted);
+            if root.is_empty() {
                 return Ok(());
             }
-            write::clear(work.writer_mut(), &mut record.root, trusted)?;
-            work.set_record(i, record, false);
+            write::clear(work.writer_mut(), &mut root, trusted)?;
+            work.set_record(i, root, false);
             Ok(())
         })
     }
@@ -848,7 +849,7 @@ impl RwTxn {
         self.write(|work| {
             let i = work.working(table)?;
             let (writer, w) = work.writer_and_table(i);
-            let (mut record, mut trusted) = (w.record, w.trusted);
+            let (mut root, mut trusted) = (w.record.root, w.trusted);
             // Test-only: an emptied cache per put, so every put descends.
             #[cfg(test)]
             if writer.no_path_cache {
@@ -856,16 +857,16 @@ impl RwTxn {
             }
             let cache = &mut w.cache;
             let placed =
-                write::put_cached(writer, &mut record.root, &mut trusted, cache, key, value, kind)?;
+                write::put_cached(writer, &mut root, &mut trusted, cache, key, value, kind)?;
             let mut at = false;
-            if let Some((tree, root)) = cursor {
-                *root = record.root;
+            if let Some((tree, cursor_root)) = cursor {
+                *cursor_root = root;
                 if let Some(slot) = placed.slot {
                     tree.place(cache.branches(), cache.leaf(), slot);
                     at = true;
                 }
             }
-            work.set_record(i, record, trusted);
+            work.set_record(i, root, trusted);
             Ok(at)
         })
     }
@@ -884,7 +885,7 @@ impl RwTxn {
         self.write(|work| {
             let i = work.working(table)?;
             let (writer, w) = work.writer_and_table(i);
-            let (mut record, mut trusted) = (w.record, w.trusted);
+            let (mut root, mut trusted) = (w.record.root, w.trusted);
             // Test-only: an emptied cache per delete, so every delete descends, and no slot, so a
             // cursor finds its place again by key: the delete as it was before the cache.
             #[cfg(test)]
@@ -893,12 +894,11 @@ impl RwTxn {
             if uncached {
                 w.cache.forget();
             }
-            let removed =
-                write::delete_cached(writer, &mut record.root, &mut trusted, &mut w.cache, key)?;
+            let removed = write::delete_cached(writer, &mut root, &mut trusted, &mut w.cache, key)?;
             #[cfg(test)]
             let removed = write::Removed { slot: removed.slot.filter(|_| !uncached), ..removed };
             if removed.found {
-                work.set_record(i, record, trusted);
+                work.set_record(i, root, trusted);
             }
             Ok(removed)
         })

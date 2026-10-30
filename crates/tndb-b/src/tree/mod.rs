@@ -244,12 +244,14 @@ pub(crate) trait PageRead {
     }
 
     /// A leaf value as a reader sees it: the inline bytes, or the value its run holds
-    /// ([`Self::overflow`]).
+    /// ([`Self::overflow`]). A nested root is no value: [`Error::Corrupt`]
+    /// ([`crate::page::nested_error`]).
     #[inline]
     fn value<'s>(&'s self, val: Val<'s>) -> Result<&'s [u8]> {
         match val {
             Val::Inline(v) => Ok(v),
             Val::Overflow(ovf) => self.overflow(ovf),
+            Val::Nested(root) => Err(crate::page::nested_error(root)),
         }
     }
 }

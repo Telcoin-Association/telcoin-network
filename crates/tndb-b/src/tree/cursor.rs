@@ -96,7 +96,7 @@ fn leaf_entry_with_key_tail<'s, S: PageRead + ?Sized>(
 }
 
 /// An entry as [`page::LeafView::entry_with_key_tail`] gives it, with an overflow value read from
-/// its run ([`KeyTail`]).
+/// its run ([`KeyTail`]); a nested root is [`crate::Error::Corrupt`] ([`page::nested_error`]).
 #[inline]
 fn key_tail<'s, S: PageRead + ?Sized>(
     store: &'s S,
@@ -105,6 +105,7 @@ fn key_tail<'s, S: PageRead + ?Sized>(
     let tail = match val {
         Val::Inline(joined) => KeyTail::Joined(joined),
         Val::Overflow(ovf) => KeyTail::Apart(store.overflow(ovf)?),
+        Val::Nested(root) => return Err(page::nested_error(root)),
     };
     Ok((key, tail))
 }

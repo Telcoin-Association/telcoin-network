@@ -241,9 +241,13 @@ impl MemStore {
                 continue;
             }
             for i in 0..page::nkeys(buf) {
-                if let (_, Val::Overflow(ovf)) = page::leaf_entry(buf, i).expect("entry") {
-                    let n = run_pages(ovf.len as usize, self.geometry.page_size()) as u32;
-                    pages.extend(ovf.pgno..ovf.pgno + n);
+                match page::leaf_entry(buf, i).expect("entry").1 {
+                    Val::Inline(_) => {}
+                    Val::Overflow(ovf) => {
+                        let n = run_pages(ovf.len as usize, self.geometry.page_size()) as u32;
+                        pages.extend(ovf.pgno..ovf.pgno + n);
+                    }
+                    Val::Nested(root) => panic!("leaf {p}, cell {i}: a nested cell {root:?}"),
                 }
             }
         }
@@ -501,12 +505,16 @@ impl<'s, S: PageRead + ?Sized> Walker<'s, S> {
                 if let Some((last, _)) = self.walk.entries.last() {
                     assert!(last.as_slice() < k, "leaf {p}: key {i} is not above the last key");
                 }
-                if let Val::Overflow(ovf) = v {
-                    let n = run_pages(ovf.len as usize, self.geometry.page_size()) as u32;
-                    for q in ovf.pgno..ovf.pgno + n {
-                        assert!(self.seen.insert(q), "leaf {p}: run page {q} is reached twice");
+                match v {
+                    Val::Inline(_) => {}
+                    Val::Overflow(ovf) => {
+                        let n = run_pages(ovf.len as usize, self.geometry.page_size()) as u32;
+                        for q in ovf.pgno..ovf.pgno + n {
+                            assert!(self.seen.insert(q), "leaf {p}: run page {q} is reached twice");
+                        }
+                        self.walk.overflow_pages += n as usize;
                     }
-                    self.walk.overflow_pages += n as usize;
+                    Val::Nested(root) => panic!("leaf {p}, key {i}: a nested cell {root:?}"),
                 }
                 let v = self.store.value(v).unwrap_or_else(|e| panic!("leaf {p}, key {i}: {e}"));
                 self.walk.entries.push((k.to_vec(), v.to_vec()));

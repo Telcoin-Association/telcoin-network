@@ -513,6 +513,7 @@ fn put_in_cached_leaf<S: PageWrite + ?Sized>(
             Find::Found { .. } if kind == PutKind::Insert => return Err(Error::KeyExists),
             // The old run must be freed with the tree's other changes: descend.
             Find::Found { value: Val::Overflow(_), .. } => return Ok(None),
+            Find::Found { value: Val::Nested(root), .. } => return Err(page::nested_error(root)),
             Find::Found { index, value: Val::Inline(old) } => {
                 let old = old.len();
                 if value.len() > old && value.len() - old > view.free_space() {
@@ -611,8 +612,13 @@ fn delete_in_cached_leaf<S: PageWrite + ?Sized>(
             // The key routes to this leaf only, and the leaf does not hold it.
             Find::NotFound { .. } => return Ok(Some(Removed { found: false, slot: None })),
         };
-        // The run must be freed with the tree's other changes: descend.
-        if matches!(value, Val::Overflow(_)) || view.nkeys() < 2 {
+        match value {
+            Val::Inline(_) => {}
+            // The run must be freed with the tree's other changes: descend.
+            Val::Overflow(_) => return Ok(None),
+            Val::Nested(root) => return Err(page::nested_error(root)),
+        }
+        if view.nkeys() < 2 {
             return Ok(None);
         }
         if merge && merge_due(depth, leaf_used_after_delete(&view, key, value), usable) {
@@ -911,8 +917,10 @@ fn check_cells_naming_this_txn<S: PageWrite + ?Sized>(
         }
         page::View::Leaf(leaf) => {
             for i in 0..leaf.nkeys() {
-                let (_, Val::Overflow(ovf)) = leaf.entry(i)? else {
-                    continue;
+                let ovf = match leaf.entry(i)?.1 {
+                    Val::Inline(_) => continue,
+                    Val::Overflow(ovf) => ovf,
+                    Val::Nested(root) => return Err(page::nested_error(root)),
                 };
                 if ovf.txn != txn as u32 {
                     continue;
@@ -1016,8 +1024,12 @@ fn plan<'s, S: PageWrite + ?Sized>(
     let mut old_run = None;
     let change = match found {
         Find::Found { index: i, value: old } => {
-            if let Val::Overflow(ovf) = old {
-                old_run = Some((ovf.pgno, leaving_run(store, leaf.pgno, ovf)?));
+            match old {
+                Val::Inline(_) => {}
+                Val::Overflow(ovf) => {
+                    old_run = Some((ovf.pgno, leaving_run(store, leaf.pgno, ovf)?));
+                }
+                Val::Nested(root) => return Err(page::nested_error(root)),
             }
             let old = old.cell_len();
             if vlen <= old || vlen - old <= view.free_space() {
@@ -1648,6 +1660,7 @@ fn plan_delete<S: PageWrite + ?Sized>(
     let run = match value {
         Val::Inline(_) => None,
         Val::Overflow(ovf) => Some((ovf.pgno, leaving_run(store, leaf.pgno, ovf)?)),
+        Val::Nested(root) => return Err(page::nested_error(root)),
     };
     let mut dropped = Vec::new();
     let shape = if leaf.view.nkeys() > 1 {
@@ -2378,8 +2391,10 @@ pub(crate) fn tree_pages<S: PageWrite + ?Sized>(
             verify_published(store, page, &geometry)?;
         }
         for i in 0..view.nkeys() {
-            let (_, Val::Overflow(ovf)) = view.entry(i)? else {
-                continue;
+            let ovf = match view.entry(i)?.1 {
+                Val::Inline(_) => continue,
+                Val::Overflow(ovf) => ovf,
+                Val::Nested(root) => return Err(page::nested_error(root)),
             };
             let n = leaving_run(store, p, ovf)?;
             for q in ovf.pgno..ovf.pgno + n {
@@ -5168,6 +5183,90 @@ mod tests {
             merge: true,
             gate_merges: true,
         });
+    }
+
+    /// The key whose cell [`private_tree_with_a_nested_cell`] makes a nested cell.
+    const NESTED_KEY: [u8; 4] = 150u32.to_be_bytes();
+
+    /// A tree private to the store's transaction (300 entries of 4-byte keys and 32-byte values,
+    /// plus one value in an overflow run), with its trusted handle and a path cache filled at
+    /// [`NESTED_KEY`]'s leaf, whose cell for that key was then made a nested cell in place (flags
+    /// `CELL_NESTED`, a valid encoded root). A private page carries no CRC, so only the cell rules
+    /// can find it, and the edit leaves the cache's epoch valid.
+    fn private_tree_with_a_nested_cell() -> (MemStore, TreeRoot, PathCache) {
+        let (mut store, mut root, mut cache) =
+            (MemStore::new(4096), TreeRoot::EMPTY, PathCache::default());
+        for i in 0..300u32 {
+            put(&mut store, &mut root, &i.to_be_bytes(), &[i as u8; 32]).expect("put");
+        }
+        put(&mut store, &mut root, &u32::MAX.to_be_bytes(), &[7; 3 * 4096]).expect("run");
+        assert!(root.height >= 2 && root.overflow_pages > 0, "{root:?}");
+        put_through(&mut store, &mut root, Some(&mut cache), &NESTED_KEY, &[150; 32])
+            .expect("fill");
+        let leaf = descend(&store, &root, &NESTED_KEY, |_, _, _, _| Ok(()), None)
+            .expect("descend")
+            .expect("leaf")
+            .pgno;
+        let nested = TreeRoot {
+            root: 9,
+            root_txn: 7,
+            height: 1,
+            entries: 3,
+            leaf_pages: 1,
+            ..TreeRoot::EMPTY
+        }
+        .encode();
+        let page = store.page_mut(leaf).expect("a private leaf");
+        let Find::Found { index, .. } = page::leaf_find(page, &NESTED_KEY).expect("find") else {
+            panic!("the key is in its leaf");
+        };
+        let fit =
+            page::LeafMut::new(page).expect("leaf").replace_value(index, Val::Nested(&nested));
+        assert_eq!(fit.expect("a nested cell"), Fit::Done);
+        (store, root, cache)
+    }
+
+    /// `result` is the [`page::nested_error`] refusal.
+    #[track_caller]
+    fn assert_nested_refused<T: std::fmt::Debug>(what: &str, result: Result<T>) {
+        const NONE: &str = "a nested cell in a tree that holds none";
+        assert!(
+            matches!(&result, Err(Error::Corrupt(m)) if m.contains(NONE)),
+            "{what}: {result:?}"
+        );
+    }
+
+    /// A nested cell in a plain tree's private leaf is damage to every write that reads the old
+    /// value or walks the leaf ([`page::nested_error`]): a put over it from the root ([`plan`]) and
+    /// in the cached leaf ([`put_cached`]), its delete in the cached leaf ([`delete_cached`]) and
+    /// from the root ([`plan_delete`]), and a clear or free of the tree ([`tree_pages`]). Each is
+    /// refused with the handle unchanged.
+    #[test]
+    fn a_nested_cell_in_a_private_leaf_is_corrupt_at_every_write() {
+        let value = [1; 32];
+        let (mut store, mut root, _) = private_tree_with_a_nested_cell();
+        let before = root;
+        assert_nested_refused("put", put(&mut store, &mut root, &NESTED_KEY, &value));
+        assert_eq!(root, before, "put");
+
+        let (mut store, mut root, mut cache) = private_tree_with_a_nested_cell();
+        let r = put_through(&mut store, &mut root, Some(&mut cache), &NESTED_KEY, &value);
+        assert_nested_refused("cached put", r);
+        assert_eq!(root, before, "cached put");
+
+        let (mut store, mut root, mut cache) = private_tree_with_a_nested_cell();
+        let r = delete_through(&mut store, &mut root, Some(&mut cache), &NESTED_KEY);
+        assert_nested_refused("cached delete", r);
+        assert_eq!(root, before, "cached delete");
+
+        let (mut store, mut root, _) = private_tree_with_a_nested_cell();
+        assert_nested_refused("delete", delete(&mut store, &mut root, &NESTED_KEY));
+        assert_eq!(root, before, "delete");
+
+        let (mut store, mut root, _) = private_tree_with_a_nested_cell();
+        assert_nested_refused("clear", clear(&mut store, &mut root));
+        assert_eq!(root, before, "clear");
+        assert_nested_refused("free_subtree", free_subtree(&mut store, &root, true));
     }
 
     #[test]

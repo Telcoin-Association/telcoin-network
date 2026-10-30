@@ -14,9 +14,11 @@
 //! branch cell:  child u32 | child_txn u32 | klen u16 | key
 //! ```
 //!
-//! A leaf cell's flags are 0 for a value held in the cell, or 1 for an overflow cell, whose
-//! 12-byte value names the overflow run holding the value ([`Val`], [`crate::overflow`]); any
-//! other flag is [`Error::Corrupt`].
+//! A leaf cell's flags are 0 for a value held in the cell, 1 for an overflow cell, whose
+//! 12-byte value names the overflow run holding the value ([`Val`], [`crate::overflow`]), or 2 for
+//! a nested cell, whose 32-byte value is an encoded [`TreeRoot`] ([`Val::Nested`]); any other flag
+//! is [`Error::Corrupt`]. No table holds nested cells yet, so every reader and writer refuses one
+//! as damage ([`nested_error`]).
 //!
 //! **Packing.** The cells tile `upper..P − 4` exactly. A new cell goes just below `upper`;
 //! deleting or shrinking a cell closes its gap at once (the cells below it move up and their slots
@@ -60,6 +62,7 @@ use std::{cmp::Ordering, fmt::Display};
 use crate::{
     error::{Error, Result},
     overflow::{self, Ovf, MAX_VALUE, OVF_CELL},
+    tree::TreeRoot,
 };
 
 /// Smallest supported page size.
@@ -91,6 +94,12 @@ const KIND_LEAF: u8 = 2;
 
 /// A leaf cell's flag: the value is an overflow reference ([`Ovf`], [`OVF_CELL`] bytes).
 const CELL_OVERFLOW: usize = 0x0001;
+
+/// A leaf cell's flag: the value is a nested tree's root ([`Val::Nested`], [`NESTED_CELL`] bytes).
+const CELL_NESTED: usize = 0x0002;
+
+/// The value bytes of a nested cell: an encoded [`TreeRoot`].
+pub(crate) const NESTED_CELL: usize = TreeRoot::ENCODED_LEN;
 
 /// The two kinds of tree page.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -128,33 +137,44 @@ pub(crate) enum Search {
     NotFound(usize),
 }
 
-/// A leaf entry's value as its cell holds it: the bytes themselves, or a reference to the
-/// overflow run holding them. A put passes the same form to the leaf mutators.
+/// A leaf entry's value as its cell holds it: the bytes themselves, a reference to the
+/// overflow run holding them, or a nested tree's root. A put passes the same form to the leaf
+/// mutators.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Val<'a> {
     /// The value, in the cell.
     Inline(&'a [u8]),
     /// The value's overflow run ([`crate::overflow`]).
     Overflow(Ovf),
+    /// A nested tree's root as the cell holds it: the encoded [`TreeRoot`], undecoded and
+    /// unchecked, since a root read from a cell is untrusted until its use checks it. No table
+    /// holds one yet: every use refuses it ([`nested_error`]).
+    Nested(&'a [u8; NESTED_CELL]),
 }
 
+// `Val` rides in every entry read and in `Find::Found`: the nested form must not grow it.
+const _: () = assert!(std::mem::size_of::<Val<'static>>() <= 24);
+
 impl<'a> Val<'a> {
-    /// The bytes of the value in the cell: the value, or [`OVF_CELL`] for a reference.
+    /// The bytes of the value in the cell: the value, [`OVF_CELL`] for a reference, or
+    /// [`NESTED_CELL`] for a nested root.
     #[inline]
     pub(crate) fn cell_len(&self) -> usize {
         match self {
             Self::Inline(v) => v.len(),
             Self::Overflow(_) => OVF_CELL,
+            Self::Nested(_) => NESTED_CELL,
         }
     }
 
     /// The value of a tree that holds only inline values (the catalog, the free list): an
-    /// overflow reference there is [`Error::Corrupt`].
+    /// overflow reference or a nested root there is [`Error::Corrupt`].
     #[inline]
     pub(crate) fn inline(self) -> Result<&'a [u8]> {
         match self {
             Self::Inline(v) => Ok(v),
             Self::Overflow(ovf) => Err(inline_error(ovf)),
+            Self::Nested(root) => Err(nested_error(root)),
         }
     }
 }
@@ -201,6 +221,11 @@ impl CellVal for Val<'_> {
                 put_u16(cell, 6, CELL_OVERFLOW);
                 cell[v..v + OVF_CELL].copy_from_slice(&ovf.encode());
             }
+            Val::Nested(root) => {
+                put_u32(cell, 0, NESTED_CELL as u32);
+                put_u16(cell, 6, CELL_NESTED);
+                cell[v..v + NESTED_CELL].copy_from_slice(root);
+            }
         }
     }
 }
@@ -210,6 +235,14 @@ impl CellVal for Val<'_> {
 #[inline(never)]
 fn inline_error(ovf: Ovf) -> Error {
     Error::Corrupt(format!("an overflow value ({ovf:?}) in a tree of inline values"))
+}
+
+/// The [`Error::Corrupt`] of a nested cell met by any use: no table holds nested trees yet, so a
+/// nested cell is damage wherever a read or a write meets it. The one message of every such use.
+#[cold]
+#[inline(never)]
+pub(crate) fn nested_error(root: &[u8; NESTED_CELL]) -> Error {
+    Error::Corrupt(format!("a nested cell in a tree that holds none (root bytes {root:02x?})"))
 }
 
 /// Where a put stores a value ([`Geometry::place`]).
@@ -747,10 +780,13 @@ fn cell_error(page: &[u8], h: &Hdr, i: usize) -> Error {
 }
 
 /// Leaf cell `i` as `(offset, klen, vlen)`, checked to end inside the cell area and to carry
-/// flags 0 (an inline value) or [`CELL_OVERFLOW`] with a 12-byte value (an overflow reference,
-/// [`leaf_val`]); every other flag is refused. Always inlined: every leaf read runs it, and with
-/// this many callers a plain `#[inline]` left it a call in hot paths such as
-/// [`crate::RoCursor::current_with_key_tail`] as the adapter crate compiles it.
+/// flags 0 (an inline value), [`CELL_OVERFLOW`] with a 12-byte value (an overflow reference) or
+/// [`CELL_NESTED`] with a 32-byte value (a nested root, [`leaf_val`]); every other flag is
+/// refused. Always inlined: every leaf read runs it, and with this many callers a plain
+/// `#[inline]` left it a call in hot paths such as [`crate::RoCursor::current_with_key_tail`] as
+/// the adapter crate compiles it. A nested cell fails the inline and overflow tests and is
+/// accepted on the cold path ([`leaf_cell_other`]), so an inline or overflow cell runs only the
+/// compares it ran before the nested form existed.
 #[inline(always)]
 fn leaf_cell(page: &[u8], h: &Hdr, i: usize) -> Result<(usize, usize, usize)> {
     let off = cell_off(page, h, i)?;
@@ -762,21 +798,57 @@ fn leaf_cell(page: &[u8], h: &Hdr, i: usize) -> Result<(usize, usize, usize)> {
         || vlen > room
         || klen > room - vlen
     {
-        return Err(leaf_cell_error(page, i, off, (klen, vlen, cell_flags)));
+        return leaf_cell_other(page, i, off, room, (klen, vlen, cell_flags));
     }
     Ok((off, klen, vlen))
 }
 
+/// [`leaf_cell`]'s cold path for cell `i` at `off`, read as `(klen, vlen, flags)` with `room`
+/// bytes after its header: a nested cell ([`nested_shape`]) that ends inside the cell area is
+/// `(off, klen, vlen)`; any other cell is [`leaf_cell_error`]'s [`Error::Corrupt`].
+#[cold]
+#[inline(never)]
+fn leaf_cell_other(
+    page: &[u8],
+    i: usize,
+    off: usize,
+    room: usize,
+    (klen, vlen, flags): (usize, usize, usize),
+) -> Result<(usize, usize, usize)> {
+    if nested_shape(flags, vlen) && vlen <= room && klen <= room - vlen {
+        return Ok((off, klen, vlen));
+    }
+    Err(leaf_cell_error(page, i, off, (klen, vlen, flags)))
+}
+
+/// Whether a cell of flags `flags` (neither 0 nor a 12-byte overflow cell's) with a `vlen`-byte
+/// value is a nested cell: [`CELL_NESTED`] with [`NESTED_CELL`] bytes. Asked only on the cold
+/// paths ([`leaf_cell_other`], [`leaf_cell_error`]): no table holds nested cells yet.
+#[inline]
+fn nested_shape(flags: usize, vlen: usize) -> bool {
+    flags == CELL_NESTED && vlen == NESTED_CELL
+}
+
 /// The value of the leaf cell at `off` with a `klen`-byte key and a `vlen`-byte value, as
-/// [`leaf_cell`] checked it: the bytes, or the overflow reference its 12 bytes hold.
+/// [`leaf_cell`] checked it: the bytes, the overflow reference its 12 bytes hold, or the nested
+/// root its 32 bytes hold.
 #[inline]
 fn leaf_val(page: &[u8], off: usize, klen: usize, vlen: usize) -> Val<'_> {
     let v = off + LEAF_CELL_HEADER + klen;
-    if read_u16(page, off + 6) == CELL_OVERFLOW {
-        Val::Overflow(Ovf::decode(page[v..v + OVF_CELL].try_into().expect("12 bytes")))
-    } else {
-        Val::Inline(&page[v..v + vlen])
+    match read_u16(page, off + 6) {
+        0 => Val::Inline(&page[v..v + vlen]),
+        CELL_OVERFLOW => {
+            Val::Overflow(Ovf::decode(page[v..v + OVF_CELL].try_into().expect("12 bytes")))
+        }
+        _ => nested_val(page, v),
     }
+}
+
+/// [`leaf_val`] of a nested cell whose value starts at `v` ([`leaf_cell`] checked its shape).
+#[cold]
+#[inline(never)]
+fn nested_val(page: &[u8], v: usize) -> Val<'_> {
+    Val::Nested(page[v..v + NESTED_CELL].try_into().expect("32 bytes"))
 }
 
 /// [`leaf_cell`]'s [`Error::Corrupt`] for cell `i` at `off`, read as `(klen, vlen, flags)`.
@@ -788,7 +860,7 @@ fn leaf_cell_error(
     off: usize,
     (klen, vlen, flags): (usize, usize, usize),
 ) -> Error {
-    if flags > CELL_OVERFLOW {
+    if flags > CELL_OVERFLOW && !nested_shape(flags, vlen) {
         return corrupt(page, format_args!("cell {i} has flags {flags:#x}"));
     }
     if flags == CELL_OVERFLOW && vlen != OVF_CELL {
@@ -1087,7 +1159,7 @@ impl<'a> LeafView<'a> {
         let v = k + klen;
         let val = match leaf_val(page, off, klen, vlen) {
             Val::Inline(_) => Val::Inline(&page[v - t.min(klen)..v + vlen]),
-            ovf => ovf,
+            other @ (Val::Overflow(_) | Val::Nested(_)) => other,
         };
         Ok((&page[k..v], val))
     }
@@ -1261,8 +1333,9 @@ impl<'a> BranchView<'a> {
 /// `upper` and `upper` below the trailer; every slot addressing a cell that lies in the cell area
 /// with lengths inside the page; a leaf cell's flags 0, or 1 for an overflow cell, whose value is
 /// 12 bytes naming a length past the inline limit ([`Geometry::max_value`]) and within
-/// [`MAX_VALUE`]; the cells tiling `upper..P − 4` exactly (no
-/// overlap, no gap); every entry within the geometry's maximal entry (`U / 4`) and every key
+/// [`MAX_VALUE`], or 2 for a nested cell, whose 32 bytes decode to a non-empty root that passes
+/// [`TreeRoot::check`] (its pages are its use's to check); the cells tiling `upper..P − 4` exactly
+/// (no overlap, no gap); every entry within the geometry's maximal entry (`U / 4`) and every key
 /// within its `max_key` (for a branch cell the entry limit is that, for a leaf cell it is not);
 /// keys strictly ascending; and for a branch at least one child, with cell 0's key empty. The page
 /// number, transaction id and CRC are the caller's to check.
@@ -1302,13 +1375,24 @@ pub(crate) fn validate(page: &[u8], geometry: &Geometry) -> Result<()> {
         }
         if h.kind == Kind::Leaf {
             let (off, klen, vlen) = leaf_cell(page, &h, i)?;
-            if let Val::Overflow(ovf) = leaf_val(page, off, klen, vlen) {
-                let len = ovf.len as usize;
-                if len <= geometry.max_value(klen) || len > MAX_VALUE {
-                    return Err(corrupt(
-                        page,
-                        format_args!("overflow cell {i} holds a value of {len} bytes"),
-                    ));
+            match leaf_val(page, off, klen, vlen) {
+                Val::Inline(_) => {}
+                Val::Overflow(ovf) => {
+                    let len = ovf.len as usize;
+                    if len <= geometry.max_value(klen) || len > MAX_VALUE {
+                        return Err(corrupt(
+                            page,
+                            format_args!("overflow cell {i} holds a value of {len} bytes"),
+                        ));
+                    }
+                }
+                Val::Nested(root) => {
+                    if !TreeRoot::decode(root).is_ok_and(|r| !r.is_empty()) {
+                        return Err(corrupt(
+                            page,
+                            format_args!("nested cell {i} holds an impossible or empty tree root"),
+                        ));
+                    }
                 }
             }
         }
@@ -2627,7 +2711,8 @@ mod tests {
 
     /// An insert at every index of leaves of 0..=10 entries, the end (`i == nkeys`, which moves
     /// no slot in [`reserve`]) included, against a sorted model. Key lengths vary so the key
-    /// copies take every [`copy_short`] size class.
+    /// copies take every [`copy_short`] size class. The entry inserted at an odd index is a
+    /// nested cell, read back as [`Val::Nested`].
     #[test]
     fn inserts_at_every_index_match_a_model() {
         let g = geometry(4096);
@@ -2646,11 +2731,37 @@ mod tests {
                     model.push((key, value));
                 }
                 let rank = 2 * i + 1;
-                let (key, value) = (ranked_key(rank, klen(rank)), vec![0xee; 8]);
-                assert_eq!(leaf_insert(&mut page, i as usize, &key, &value).unwrap(), Fit::Done);
+                let key = ranked_key(rank, klen(rank));
+                let nested = i % 2 == 1;
+                let root = TreeRoot {
+                    root: 9 + i,
+                    root_txn: 7,
+                    height: 1,
+                    entries: 3,
+                    leaf_pages: 1,
+                    ..TreeRoot::EMPTY
+                }
+                .encode();
+                let fit = if nested {
+                    LeafMut::new(&mut page).unwrap().insert(i as usize, &key, Val::Nested(&root))
+                } else {
+                    leaf_insert(&mut page, i as usize, &key, &[0xee; 8])
+                };
+                assert_eq!(fit.unwrap(), Fit::Done);
+                let value = if nested { root.to_vec() } else { vec![0xee; 8] };
                 model.insert(i as usize, (key, value));
                 validate(&page, &g).unwrap();
-                assert_eq!(entries(&page), model, "{n} entries, insert at {i}");
+                let got: Vec<_> =
+                    (0..nkeys(&page)).map(|j| leaf_entry(&page, j).unwrap()).collect();
+                let want: Vec<_> = model
+                    .iter()
+                    .enumerate()
+                    .map(|(j, (k, v))| match v.as_slice().try_into() {
+                        Ok(root) if nested && j == i as usize => (k.as_slice(), Val::Nested(root)),
+                        _ => (k.as_slice(), Val::Inline(v)),
+                    })
+                    .collect();
+                assert_eq!(got, want, "{n} entries, insert at {i}");
             }
         }
     }
@@ -2936,7 +3047,8 @@ mod tests {
     }
 
     /// A valid leaf or branch of random content with a few random bytes overwritten, mostly in
-    /// the header and slot array.
+    /// the header and slot array. A leaf's cells are inline, overflow (a random reference) or
+    /// nested (a valid root).
     fn damaged_page(seed: u64, size: u32, flips: usize) -> Vec<u8> {
         let mut s = seed;
         let g = geometry(size);
@@ -2953,6 +3065,19 @@ mod tests {
                 let ovf = Ovf { pgno: i, txn: (r >> 16) as u32, len: (r >> 32) as u32 };
                 LeafMut::new(&mut page)
                     .and_then(|m| m.insert(i as usize - 1, &key, Val::Overflow(ovf)))
+            } else if leaf && (r >> 56) & 3 == 1 {
+                // A nested cell: a valid tree root's 32 bytes with flags 2.
+                let root = TreeRoot {
+                    root: i,
+                    root_txn: (r >> 16) as u32,
+                    height: 1,
+                    entries: 1 + (r >> 32) % 9,
+                    leaf_pages: 1,
+                    ..TreeRoot::EMPTY
+                }
+                .encode();
+                LeafMut::new(&mut page)
+                    .and_then(|m| m.insert(i as usize - 1, &key, Val::Nested(&root)))
             } else if leaf {
                 leaf_insert(&mut page, i as usize - 1, &key, &vec![7; (r >> 8) as usize % 200])
             } else {
@@ -3007,7 +3132,7 @@ mod tests {
     /// [`leaf_entry_with_key_tail`] against [`leaf_entry`] on any page: both refuse, or both give
     /// the key, and for an inline value the key's last `t` bytes (all of them for a `t` past its
     /// length) and the value as one slice of the page, starting inside the key; an overflow
-    /// reference is the same reference.
+    /// reference or a nested root is the same one.
     fn assert_key_tail_matches(page: &[u8], i: usize, t: usize) {
         let (got, want) = (leaf_entry_with_key_tail(page, i, t), leaf_entry(page, i));
         let ((key, tail), (want_key, want_val)) = match (got, want) {
@@ -3023,7 +3148,7 @@ mod tests {
                 // One slice of the page, from inside the key: no copy.
                 assert_eq!(joined.as_ptr(), key[start..].as_ptr(), "cell {i}, t {t}");
             }
-            (tail, value) => assert_eq!(tail, value, "cell {i}, t {t}: an overflow reference"),
+            (tail, value) => assert_eq!(tail, value, "cell {i}, t {t}: a reference or a root"),
         }
     }
 
@@ -3166,7 +3291,8 @@ mod tests {
             if self.leaf {
                 let (vlen, klen) = (self.u32_at(off) as usize, self.u16_at(off + 4));
                 let flags = self.u16_at(off + 6);
-                if (flags != 0 && (flags != 1 || vlen != 12)) || off + 8 + klen + vlen > self.end {
+                let shaped = flags == 0 || (flags == 1 && vlen == 12) || (flags == 2 && vlen == 32);
+                if !shaped || off + 8 + klen + vlen > self.end {
                     return None;
                 }
                 let k = off + 8;
@@ -3181,14 +3307,14 @@ mod tests {
         }
 
         /// Leaf cell `i` as `(key, value)`: flags 1 makes its 12 value bytes an overflow
-        /// reference.
+        /// reference, flags 2 its 32 value bytes a nested root.
         fn entry(&self, i: usize) -> Option<(&'a [u8], Val<'a>)> {
             let (k, v) = self.cell(i)?;
             let off = self.u16_at(24 + 2 * i);
-            Some(if self.u16_at(off + 6) == 1 {
-                (k, Val::Overflow(Ovf::decode(v.try_into().unwrap())))
-            } else {
-                (k, Val::Inline(v))
+            Some(match self.u16_at(off + 6) {
+                1 => (k, Val::Overflow(Ovf::decode(v.try_into().unwrap()))),
+                2 => (k, Val::Nested(v.try_into().unwrap())),
+                _ => (k, Val::Inline(v)),
             })
         }
 
@@ -3602,13 +3728,157 @@ mod tests {
         }
     }
 
+    /// Whether `r` is [`Error::Corrupt`] with a message containing `what`.
+    fn corrupt_with<T>(r: Result<T>, what: &str) -> bool {
+        matches!(&r, Err(Error::Corrupt(m)) if m.contains(what))
+    }
+
+    /// A nested cell (flags 2, 32 value bytes: an encoded [`TreeRoot`]) reads back as
+    /// [`Val::Nested`] through every reader, the key-tail one included, replaces and is replaced
+    /// by inline values in place, and is canonical: [`validate`] refuses one whose bytes are an
+    /// impossible or an empty root, which the cell readers pass on unchecked. The cell checks
+    /// refuse flags 3, flags 1 and flags 0x102 on it, flags 2 on a value of another length (with
+    /// the message they gave before nested cells existed), and an overrunning nested cell as an
+    /// overrun. The inline readers ([`Val::inline`]) refuse it ([`nested_error`]).
+    #[test]
+    fn nested_cells_are_canonical_roots() {
+        const NONE: &str = "a nested cell in a tree that holds none";
+        const NOT_A_TREE: &str = "holds an impossible or empty tree root";
+        for size in SIZES {
+            let g = geometry(size);
+            let key = b"key".as_slice();
+            let tree = TreeRoot {
+                root: 9,
+                root_txn: 7,
+                height: 1,
+                entries: 3,
+                leaf_pages: 1,
+                ..TreeRoot::EMPTY
+            };
+            let root = tree.encode();
+            let mut page = fresh(&g, Kind::Leaf);
+            assert_eq!(leaf_insert(&mut page, 0, b"a", b"inline").unwrap(), Fit::Done);
+            let fit = LeafMut::new(&mut page).unwrap().insert(1, key, Val::Nested(&root)).unwrap();
+            assert_eq!(fit, Fit::Done);
+            validate(&page, &g).expect("a canonical nested cell");
+            let off = slot(&page, 1);
+            assert_eq!(read_u32(&page, off) as usize, NESTED_CELL, "{size}: vlen");
+            assert_eq!(read_u16(&page, off + 6), CELL_NESTED, "{size}: flags");
+            assert_eq!(leaf_entry(&page, 1).unwrap(), (key, Val::Nested(&root)));
+            assert_eq!(leaf_entry(&page, 0).unwrap(), (b"a".as_slice(), Val::Inline(b"inline")));
+            assert_eq!(
+                leaf_find(&page, key).unwrap(),
+                Find::Found { index: 1, value: Val::Nested(&root) }
+            );
+            for t in [0, 1, key.len(), key.len() + 5] {
+                let got = leaf_entry_with_key_tail(&page, 1, t).unwrap();
+                assert_eq!(got, (key, Val::Nested(&root)), "{size}: t {t}");
+            }
+            assert_eq!(Val::Nested(&root).cell_len(), NESTED_CELL);
+            assert!(corrupt_with(Val::Nested(&root).inline(), NONE), "{size}: Val::inline");
+            assert!(corrupt_with(leaf_inline_entry(&page, 1), NONE), "{size}: leaf_inline_entry");
+            assert_eq!(
+                free_space(&page).unwrap() + 2 * (SLOT + 8) + 1 + 6 + 3 + NESTED_CELL,
+                g.usable()
+            );
+
+            // Replace in place: nested -> inline -> nested, the free space following.
+            let free = free_space(&page).unwrap();
+            let fit = LeafMut::new(&mut page).unwrap().replace_value(1, Val::Inline(&[5; 40]));
+            assert_eq!(fit.unwrap(), Fit::Done);
+            assert_eq!(leaf_entry(&page, 1).unwrap(), (key, Val::Inline(&[5; 40])));
+            assert_eq!(free_space(&page).unwrap(), free - 8);
+            validate(&page, &g).expect("inline again");
+            let other = TreeRoot {
+                root: 11,
+                root_txn: 8,
+                height: 2,
+                overflow_pages: 3,
+                entries: 900,
+                branch_pages: 1,
+                leaf_pages: 4,
+            }
+            .encode();
+            let fit = LeafMut::new(&mut page).unwrap().replace_value(1, Val::Nested(&other));
+            assert_eq!(fit.unwrap(), Fit::Done);
+            assert_eq!(leaf_entry(&page, 1).unwrap(), (key, Val::Nested(&other)));
+            assert_eq!(free_space(&page).unwrap(), free);
+            validate(&page, &g).expect("another nested root");
+
+            let off = slot(&page, 1);
+            let damaged = |change: &dyn Fn(&mut [u8])| {
+                let mut p = page.clone();
+                change(&mut p);
+                p
+            };
+            // Cell shapes the cell checks refuse, at cell `i`, each with its message.
+            for (what, i, bad, msg) in [
+                ("flags 3", 1, damaged(&|p| put_u16(p, off + 6, 3)), "cell 1 has flags 0x3"),
+                (
+                    "flags 1",
+                    1,
+                    damaged(&|p| put_u16(p, off + 6, CELL_OVERFLOW)),
+                    "overflow cell 1 has a 32-byte value",
+                ),
+                ("flags 0x102", 1, damaged(&|p| put_u16(p, off + 6, 0x102)), "has flags 0x102"),
+                (
+                    "flags 2 on 6 bytes",
+                    0,
+                    damaged(&|p| put_u16(p, slot(p, 0) + 6, CELL_NESTED)),
+                    "cell 0 has flags 0x2",
+                ),
+                ("overrun", 1, damaged(&|p| put_u16(p, off + 4, 0xffff)), "overruns"),
+            ] {
+                let entry = format!("{:?}", leaf_entry(&bad, i));
+                assert!(corrupt_with(leaf_entry(&bad, i), msg), "{size}: {what}: {entry}");
+                assert!(corrupt_with(validate(&bad, &g), msg), "{size}: {what}: validate");
+                assert!(leaf_entry_with_key_tail(&bad, i, 2).is_err(), "{size}: {what}: tail");
+                if i == 1 {
+                    assert!(leaf_find(&bad, key).is_err(), "{size}: {what}: leaf_find");
+                }
+            }
+            // Root bytes that are no tree: the readers pass them on (a root read from a cell is
+            // checked where it is used), `validate` refuses them.
+            let v = off + LEAF_CELL_HEADER + key.len();
+            for (what, bytes) in [
+                ("empty", TreeRoot::EMPTY.encode()),
+                ("zeros", [0; NESTED_CELL]),
+                ("ones", [0xff; NESTED_CELL]),
+                ("impossible", TreeRoot { leaf_pages: 2, ..tree }.encode()),
+            ] {
+                let bad = damaged(&|p| p[v..v + NESTED_CELL].copy_from_slice(&bytes));
+                assert_eq!(
+                    leaf_entry(&bad, 1).unwrap(),
+                    (key, Val::Nested(&bytes)),
+                    "{size}: {what}"
+                );
+                let refused = validate(&bad, &g);
+                assert!(corrupt_with(refused, "nested cell 1 holds"), "{size}: {what}");
+            }
+            // Flags 2 on an inline value of 32 bytes makes it a nested cell of whatever root its
+            // bytes hold.
+            let mut flagged = page.clone();
+            let zeros = [0; NESTED_CELL];
+            assert_eq!(leaf_insert(&mut flagged, 2, b"z", &zeros).unwrap(), Fit::Done);
+            validate(&flagged, &g).expect("an inline value of 32 bytes");
+            let z = slot(&flagged, 2);
+            put_u16(&mut flagged, z + 6, CELL_NESTED);
+            assert_eq!(leaf_entry(&flagged, 2).unwrap(), (b"z".as_slice(), Val::Nested(&zeros)));
+            assert!(corrupt_with(validate(&flagged, &g), NOT_A_TREE), "{size}: flags 2 on zeros");
+            let z = z + LEAF_CELL_HEADER + 1;
+            flagged[z..z + NESTED_CELL].copy_from_slice(&root);
+            validate(&flagged, &g).expect("flags 2 on the 32 bytes of a valid root");
+        }
+    }
+
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(64))]
 
         /// `leaf_entry_with_key_tail` on random valid leaves (an empty first key now and then,
-        /// keys up to `max_key`, values up to the inline limit, overflow cells among them): the
-        /// key, and for an inline value `key[klen − t..] ‖ value` for `t` of 0, the key's length,
-        /// past it (clamped: `key ‖ value`) and in between; an overflow cell's reference.
+        /// keys up to `max_key`, values up to the inline limit, overflow and nested cells among
+        /// them): the key, and for an inline value `key[klen − t..] ‖ value` for `t` of 0, the
+        /// key's length, past it (clamped: `key ‖ value`) and in between; an overflow cell's
+        /// reference; a nested cell's root bytes.
         #[test]
         fn key_tail_joins_the_keys_last_bytes_to_an_inline_value(
             size in select(&SIZES[..]),
@@ -3618,7 +3888,10 @@ mod tests {
         ) {
             let g = geometry(size);
             let mut page = fresh(&g, Kind::Leaf);
-            let mut model: Vec<(Vec<u8>, Val<'static>, Vec<u8>)> = Vec::new();
+            // Each cell's key, its overflow reference or `None`, whether it is nested, and the
+            // bytes of its inline value or nested root.
+            type ModelCell = (Vec<u8>, Option<Ovf>, bool, Vec<u8>);
+            let mut model: Vec<ModelCell> = Vec::new();
             for (n, (s, ovf_sel)) in specs.iter().enumerate() {
                 let key = if n == 0 && empty_first {
                     Vec::new()
@@ -3631,29 +3904,45 @@ mod tests {
                     txn: 0xC0FF_EE00 | n as u32,
                     len: (g.max_value(key.len()) + 1) as u32,
                 });
+                let nested = ovf_sel % 4 == 1 && g.max_value(key.len()) >= NESTED_CELL;
+                let root = TreeRoot {
+                    root: n as u32 + 9,
+                    root_txn: 0xC0DE_0000 | n as u32,
+                    height: 1,
+                    entries: n as u64 + 1,
+                    leaf_pages: 1,
+                    ..TreeRoot::EMPTY
+                }
+                .encode();
                 let leaf = LeafMut::new(&mut page).unwrap();
                 let fit = match ovf {
                     Some(ovf) => leaf.insert(model.len(), &key, Val::Overflow(ovf)),
+                    None if nested => leaf.insert(model.len(), &key, Val::Nested(&root)),
                     None => leaf.insert(model.len(), &key, value.as_slice()),
                 };
                 if fit.unwrap() == Fit::Full {
                     break;
                 }
-                let val = ovf.map_or(Val::Inline(&[]), Val::Overflow);
-                model.push((key, val, value));
+                let bytes = if nested { root.to_vec() } else { value };
+                model.push((key, ovf, nested, bytes));
             }
             validate(&page, &g).unwrap();
-            for (i, (key, val, value)) in model.iter().enumerate() {
+            for (i, (key, ovf, nested, value)) in model.iter().enumerate() {
                 let klen = key.len();
+                let want = match (ovf, nested) {
+                    (Some(ovf), _) => Some(Val::Overflow(*ovf)),
+                    (None, true) => Some(Val::Nested(value.as_slice().try_into().unwrap())),
+                    (None, false) => None,
+                };
                 for t in [0, klen, klen + 1 + tsel % 50, tsel % (klen + 1)] {
                     let (got_key, tail) = leaf_entry_with_key_tail(&page, i, t).unwrap();
                     prop_assert_eq!(got_key, key.as_slice());
-                    match (tail, val) {
-                        (Val::Inline(joined), Val::Inline(_)) => {
+                    match (tail, want) {
+                        (Val::Inline(joined), None) => {
                             let want = [&key[klen - t.min(klen)..], value.as_slice()].concat();
                             prop_assert_eq!(joined, want.as_slice(), "cell {}, t {}", i, t);
                         }
-                        (tail, val) => prop_assert_eq!(tail, *val, "cell {}, t {}", i, t),
+                        (tail, want) => prop_assert_eq!(Some(tail), want, "cell {}, t {}", i, t),
                     }
                     assert_key_tail_matches(&page, i, t);
                 }
