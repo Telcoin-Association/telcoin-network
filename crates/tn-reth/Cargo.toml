@@ -23,32 +23,59 @@ tn-storage = { workspace = true }
 dirs-next = "2.0.0"
 parking_lot = { workspace = true }
 
-reth = { workspace = true }
+# TN takes reth's individual crates, not the `reth` umbrella crate (see the root
+# `Cargo.toml`). The umbrella's default features are enabled here on the crates it forwarded
+# them to: jemalloc (reth-cli-util, reth-node-core; not reth-node-metrics, whose jemalloc
+# stats feed only reth's own metrics server, which TN never starts); otlp and otlp-logs
+# (reth-node-core); js-tracer (reth-node-builder, reth-node-ethereum, reth-rpc,
+# reth-rpc-eth-types); keccak-cache-global (reth-node-core, reth-node-ethereum); asm-keccak
+# (reth-node-core, reth-node-ethereum, reth-primitives); min-debug-logs (reth-node-core, which
+# caps `tracing` at debug in release builds).
 reth-db = { workspace = true }
 reth-db-common = { workspace = true }
-reth-node-core = { workspace = true }
-reth-node-ethereum = { workspace = true }
+reth-node-core = { workspace = true, features = [
+    "jemalloc",
+    "otlp",
+    "otlp-logs",
+    "keccak-cache-global",
+    "asm-keccak",
+    "min-debug-logs",
+] }
+reth-node-ethereum = { workspace = true, features = [
+    "js-tracer",
+    "keccak-cache-global",
+    "asm-keccak",
+] }
 reth-chainspec = { workspace = true }
 reth-chain-state = { workspace = true }
-reth-cli-util = { workspace = true }
-reth-primitives = { workspace = true }
+reth-cli-util = { workspace = true, features = ["jemalloc"] }
+reth-primitives = { workspace = true, features = ["asm-keccak"] }
 reth-consensus = { workspace = true }
 reth-evm-ethereum = { workspace = true }
 reth-engine-primitives = { workspace = true }
 reth-revm = { workspace = true }
 reth-evm = { workspace = true }
-reth-node-builder = { workspace = true }
+reth-node-builder = { workspace = true, features = ["js-tracer"] }
 reth-provider = { workspace = true }
+# Direct dependencies only so `rocksdb` reaches their own `rocksdb` features, as the umbrella's
+# `rocksdb` did (through reth-cli-commands).
+reth-prune = { workspace = true, optional = true }
+reth-stages = { workspace = true, optional = true }
 reth-prune-types = { workspace = true }
 reth-primitives-traits = { workspace = true }
 reth-stages-types = { workspace = true }
 reth-trie = { workspace = true }
 reth-trie-db = { workspace = true }
 reth-transaction-pool = { workspace = true }
+reth-ethereum-engine-primitives = { workspace = true }
 
 reth-errors = { workspace = true }
+reth-rpc = { workspace = true, features = ["js-tracer"] }
+reth-rpc-api = { workspace = true }
+reth-rpc-builder = { workspace = true }
 reth-rpc-eth-api = { workspace = true }
-reth-rpc-eth-types = { workspace = true }
+reth-rpc-eth-types = { workspace = true, features = ["js-tracer"] }
+reth-network = { workspace = true }
 reth-network-peers = { workspace = true }
 reth-network-api = { workspace = true }
 reth-discv4 = { workspace = true }
@@ -81,6 +108,9 @@ tower = { workspace = true }
 tokio-stream = { workspace = true }
 reth-ethereum-primitives = { workspace = true }
 secp256k1 = { workspace = true, optional = true }
+tndb-b-reth = { workspace = true, optional = true }
+# The OS page size, as reth reads it for MDBX's default page size (`default_page_size`).
+page_size = "0.6.0"
 
 [dev-dependencies]
 metrics-util = { workspace = true }
@@ -115,7 +145,19 @@ adiri = ["faucet", "tn-types/adiri"]
 # Off by default: storage is MDBX-only today, so `RocksDBProvider` resolves to reth's
 # zero-size stub and the 332-translation-unit native compile is skipped entirely.
 # Required before any storage-v2 / `StorageSettings` experimentation.
-rocksdb = ["reth/rocksdb"]
+rocksdb = [
+    "reth-node-core/rocksdb",
+    "reth-provider/rocksdb",
+    "reth-db-common/rocksdb",
+    "dep:reth-stages",
+    "reth-stages/rocksdb",
+    "dep:reth-prune",
+    "reth-prune/rocksdb",
+]
+# Run TN's reth execution database on the tndb-b engine (`tndb_b_reth::TndbEnv`) instead of
+# MDBX. Off by default. MDBX stays compiled: reth's crates require it. See the README's
+# "Database backend" section.
+tndb-b = ["dep:tndb-b-reth"]
 
 [[bench]]
 name = "output_overlay"

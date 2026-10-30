@@ -14,25 +14,20 @@
 //! issue #1048 and the [`TNExecution`] docs). Researchers auditing block validation should look at
 //! consensus-side certification and the TN execution path, not these stubs.
 
-use alloy::rpc::types::engine::ExecutionPayload;
-use reth::{
-    payload::{EthBuiltPayload, EthPayloadBuilderAttributes},
-    rpc::types::engine::ExecutionData,
-};
+use alloy::rpc::types::engine::{ExecutionData, ExecutionPayload};
 use reth_chainspec::ChainSpec;
 pub use reth_consensus::{Consensus, ConsensusError};
 use reth_consensus::{FullConsensus, HeaderValidator, ReceiptRootBloom};
-use reth_db::DatabaseEnv;
 use reth_engine_primitives::PayloadValidator;
+use reth_ethereum_engine_primitives::{EthBuiltPayload, EthPayloadBuilderAttributes};
 use reth_node_builder::{BuiltPayload, NewPayloadError, NodeTypes, NodeTypesWithDB, PayloadTypes};
 use reth_node_ethereum::{engine::EthPayloadAttributes, EthEngineTypes};
 use reth_primitives_traits::Block;
 use reth_provider::{BlockExecutionResult, EthStorage};
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
 use tn_types::{NodePrimitives, RecoveredBlock, SealedBlock, SealedHeader};
 
-use crate::TNPrimitives;
+use crate::{RethDb, TNPrimitives};
 
 /// Empty struct that implements Reth traits to supply GATs and functionality for Reth integration.
 #[derive(Clone, Debug)]
@@ -46,7 +41,7 @@ impl NodeTypes for TelcoinNode {
 }
 
 impl NodeTypesWithDB for TelcoinNode {
-    type DB = Arc<DatabaseEnv>;
+    type DB = RethDb;
 }
 
 /// Compatibility type that stands in for reth's beacon-engine consensus and payload machinery.

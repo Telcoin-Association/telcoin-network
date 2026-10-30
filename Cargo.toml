@@ -19,6 +19,8 @@ members = [
     "crates/kad-client",
     "crates/state-sync",
     "crates/tn-metrics",
+    "crates/tndb-b",
+    "crates/tndb-b-reth",
     "crates/tn-reth",
     "crates/e2e-tests",
     "crates/telcoin-network-cli",
@@ -104,32 +106,30 @@ rpassword = "7.4.0"
 
 # execution
 #
-# Default features minus `rocksdb`: librocksdb-sys (the entire RocksDB C++ engine, 332
-# translation units, the single largest native compile in the tree) enters the graph only
-# through reth's default set, and our storage is MDBX-only (`RocksDBProvider` resolves to
-# reth's zero-size stub with the feature off). Re-enable explicitly via the off-by-default
-# `rocksdb` feature on tn-reth / tn-node / telcoin-network-cli / telcoin-network.
-# `reth-revm/portable` (a dependency-feature, not nameable in this list) is re-enabled on
-# the `reth-revm` entry below and reaches reth's copy through feature unification.
-# NOTE: reth's `edge` feature implies `rocksdb`; do not enable it while this gate is off.
-reth = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3", default-features = false, features = [
-    "jemalloc",
-    "otlp",
-    "otlp-logs",
-    "js-tracer",
-    "keccak-cache-global",
-    "asm-keccak",
-    "min-debug-logs",
-] }
+# TN depends on reth's individual crates, never the `reth` umbrella crate: the umbrella only
+# re-exports them, and it pulls reth's CLI (`reth-ethereum-cli`, `reth-cli-commands`) into the
+# graph. tn-reth's manifest enables the umbrella's default features (jemalloc, otlp, otlp-logs,
+# js-tracer, keccak-cache-global, asm-keccak, min-debug-logs) on the crates they forward to.
+#
+# `rocksdb` stays off: librocksdb-sys (the entire RocksDB C++ engine, 332 translation units,
+# the single largest native compile in the tree) enters the graph only through reth's
+# `rocksdb` features, and our storage is MDBX-only (`RocksDBProvider` resolves to reth's
+# zero-size stub with the feature off). Re-enable explicitly via the off-by-default `rocksdb`
+# feature on tn-reth / tn-node / telcoin-network-cli / telcoin-network.
+# The off-by-default `tndb-b` feature on the same four crates swaps TN's reth database from
+# MDBX to the tndb-b engine (`tndb-b-reth`); MDBX stays compiled either way.
+# NOTE: reth's `edge` features imply `rocksdb`; do not enable them while this gate is off.
 reth-primitives = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
 reth-primitives-traits = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
 reth-chainspec = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
 reth-chain-state = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
 reth-config = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
 reth-db = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
+reth-db-api = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
 reth-db-common = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
 reth-engine-primitives = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
-reth-ethereum-engine-primitives = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
+# Without `std`, as every reth crate takes it: tn-reth only names its payload types.
+reth-ethereum-engine-primitives = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3", default-features = false }
 reth-ethereum-primitives = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
 reth-evm-ethereum = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
 reth-evm-config = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
@@ -138,16 +138,19 @@ reth-network-api = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3
 reth-network-peers = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
 reth-evm = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
 reth-execution-types = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
-# `portable` replaces the `reth-revm/portable` entry dropped from the curated `reth`
-# feature list above (dependency-features cannot appear in a dependency's `features` key);
-# tn-reth depends on reth-revm directly, so unification applies it to reth's copy too.
+# `portable` is one of the `reth` umbrella's default features (`reth-revm/portable`);
+# unification applies it to every reth crate's copy of reth-revm.
 reth-revm = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3", features = ["portable"] }
 reth-rpc = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
+reth-rpc-api = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
+reth-rpc-builder = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
 reth-rpc-eth-api = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
 reth-rpc-eth-types = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
 reth-tracing = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
 reth-provider = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
+reth-prune = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
 reth-prune-types = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
+reth-stages = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
 reth-stages-types = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
 reth-trie = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
 reth-trie-db = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
@@ -162,6 +165,7 @@ reth-discv4 = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
 reth-eth-wire = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
 reth-cli-util = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
 reth-errors = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
+reth-storage-errors = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
 reth-libmdbx = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
 reth-metrics = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
 
@@ -185,6 +189,7 @@ assert_matches = { version = "1.5.0" }
 tn-types = { path = "./crates/types" }
 tn-metrics = { path = "./crates/tn-metrics" }
 tn-reth = { path = "./crates/tn-reth" }
+tndb-b-reth = { path = "./crates/tndb-b-reth" }
 tn-node = { path = "./crates/node" }
 tn-config = { path = "./crates/config" }
 tn-network-libp2p = { path = "./crates/network-libp2p" }

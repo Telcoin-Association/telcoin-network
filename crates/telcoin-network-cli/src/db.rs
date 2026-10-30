@@ -22,9 +22,8 @@ use std::{
 };
 use tn_config::{Config, ConfigFmt, ConfigTrait as _, PidLock, TelcoinDirs as _};
 use tn_reth::{
-    iter_static_files, open_db_read_only, snapshot::SnapshotRestorer, DatabaseArguments,
-    DatabaseEnv, RethCommand, RethConfig, RethDatabaseT as _, RethEnv, RethMdbxError,
-    StaticFileProvider, TNPrimitives, Tables,
+    db_table_stats, iter_static_files, snapshot::SnapshotRestorer, DbTableStat, RethCommand,
+    RethConfig, RethEnv, StaticFileProvider, TNPrimitives, DB_TABLE_STATS_NEEDS_STOPPED_NODE,
 };
 use tn_storage::{
     consensus::ConsensusChain,
@@ -55,7 +54,11 @@ pub struct DbCommand {
 /// Supported database diagnostics subcommands.
 #[derive(Debug, Subcommand)]
 enum DbSubcommand {
-    /// Print execution database statistics.
+    /// Print execution database statistics: the static files and each table of the reth
+    /// database. The default build reads while the node runs. A build with the `tndb-b` feature
+    /// needs the node stopped: it refuses while a node holds the datadir, and holds the datadir
+    /// while it runs, so a node started meanwhile is refused until the report finishes. It
+    /// refuses an MDBX database not yet migrated to tndb-b: the node's first start migrates it.
     Stats,
 
     /// Validate a consensus epoch pack file: walk the `data` stream and report integrity issues.
@@ -92,8 +95,12 @@ impl DbCommand {
     pub fn execute(&self, datadir: PathBuf) -> eyre::Result<()> {
         match &self.command {
             DbSubcommand::Stats => {
-                let db_path = datadir.reth_db_path();
-                let db = open_db_read_only(&db_path, DatabaseArguments::default())?;
+                // Held for the whole report when the reth database cannot be read beside a
+                // running node, as the other at-rest tools hold it.
+                let _pid_lock = DB_TABLE_STATS_NEEDS_STOPPED_NODE
+                    .then(|| PidLock::acquire(&datadir))
+                    .transpose()?;
+                let db_stats = db_table_stats(&datadir.reth_db_path())?;
                 if let Some(static_files_table) = static_files_summary_table_for_datadir(&datadir)?
                 {
                     println!("{static_files_table}");
@@ -105,7 +112,7 @@ impl DbCommand {
                     );
                     println!();
                 }
-                println!("{}", db_stats_table(&db)?);
+                println!("{}", stats_table(&db_stats));
             }
             DbSubcommand::Validate(args) => args.execute()?,
             DbSubcommand::Repair(args) => args.execute(datadir)?,
@@ -1305,17 +1312,7 @@ struct StaticFileSegmentStats {
     total_size: u64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct TableStats {
-    name: &'static str,
-    entries: u64,
-    branch_pages: u64,
-    leaf_pages: u64,
-    overflow_pages: u64,
-    total_size: u64,
-}
-
-fn stats_table(stats: &[TableStats]) -> ComfyTable {
+fn stats_table(stats: &[DbTableStat]) -> ComfyTable {
     let mut table = ComfyTable::new();
     table.load_preset(comfy_table::presets::ASCII_MARKDOWN);
     table.set_header([
@@ -1460,50 +1457,6 @@ fn static_files_summary_table(stats: &[StaticFileSegmentStats]) -> ComfyTable {
     table.add_row(total_row);
 
     table
-}
-
-fn db_stats_table(db: &DatabaseEnv) -> eyre::Result<ComfyTable> {
-    let mut stats = Vec::new();
-
-    db.view(|tx| {
-        let mut db_tables = Tables::ALL.iter().map(|table| table.name()).collect::<Vec<_>>();
-        db_tables.sort();
-
-        for db_table in db_tables {
-            // A read-only transaction cannot create a sub-database, so a table that was never
-            // written reports `NotFound`. Skip it rather than aborting the whole report — this
-            // keeps `db stats` working against an older on-disk DB whose schema
-            // predates a table later added to `Tables::ALL` (schema skew).
-            let table_db = match tx.inner().open_db(Some(db_table)) {
-                Ok(table_db) => table_db,
-                Err(RethMdbxError::NotFound) => continue,
-                Err(err) => return Err(eyre::eyre!("Could not open table {db_table}: {err}")),
-            };
-            let table_stats = tx.inner().db_stat(table_db.dbi()).map_err(|err| {
-                eyre::eyre!("Could not read statistics for table {db_table}: {err}")
-            })?;
-
-            let page_size = table_stats.page_size() as usize;
-            let leaf_pages = table_stats.leaf_pages();
-            let branch_pages = table_stats.branch_pages();
-            let overflow_pages = table_stats.overflow_pages();
-            let num_pages = leaf_pages + branch_pages + overflow_pages;
-            let table_size = page_size.saturating_mul(num_pages) as u64;
-
-            stats.push(TableStats {
-                name: db_table,
-                entries: table_stats.entries() as u64,
-                branch_pages: branch_pages as u64,
-                leaf_pages: leaf_pages as u64,
-                overflow_pages: overflow_pages as u64,
-                total_size: table_size,
-            });
-        }
-
-        Ok::<(), eyre::Report>(())
-    })??;
-
-    Ok(stats_table(&stats))
 }
 
 /// `db tndb-stat`: print the report of the node's tndb database (see
@@ -1719,6 +1672,28 @@ mod tests {
             .execute(datadir)
             .expect_err("load-state must refuse while a node holds the lock");
         assert!(err.to_string().contains("another telcoin process"), "unexpected error: {err}");
+    }
+
+    /// `db stats` holds the datadir lock only when the reth database cannot be read beside a
+    /// running node: then it refuses while a node holds the lock, and releases the lock on exit.
+    /// Otherwise it reads without the lock (here it fails on the absent database instead).
+    #[test]
+    fn db_stats_takes_the_datadir_lock_only_when_the_node_must_be_stopped() {
+        use tn_config::PidLock;
+        let dir = tempfile::tempdir().unwrap();
+        let datadir = dir.path().to_path_buf();
+        let stats =
+            || super::DbCommand { command: super::DbSubcommand::Stats }.execute(datadir.clone());
+
+        let held = PidLock::acquire(&datadir).expect("acquire datadir lock");
+        let err = format!("{:#}", stats().expect_err("no reth database"));
+        let refused = err.contains("another telcoin process");
+        assert_eq!(refused, tn_reth::DB_TABLE_STATS_NEEDS_STOPPED_NODE, "unexpected error: {err}");
+
+        drop(held);
+        let err = format!("{:#}", stats().expect_err("no reth database"));
+        assert!(!err.contains("another telcoin process"), "unexpected error: {err}");
+        drop(PidLock::acquire(&datadir).expect("stats must release the lock on exit"));
     }
 
     #[test]

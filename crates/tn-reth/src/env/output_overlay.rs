@@ -18,7 +18,7 @@
 //! merge+clone+re-sort; prefix sets come from the current block's own hashed state
 //! only, exactly as in reth's path (ancestors contribute empty prefix sets there).
 
-use std::sync::Arc;
+use std::{sync::Arc, time::Instant};
 
 use reth_chain_state::ComputedTrieData;
 use reth_db::transaction::DbTx;
@@ -35,7 +35,7 @@ use reth_trie::{
 use reth_trie_db::{DatabaseHashedCursorFactory, DatabaseTrieCursorFactory};
 use tn_types::{Address, B256};
 
-use crate::traits::TelcoinNode;
+use crate::{metrics::RETH_METRICS, traits::TelcoinNode};
 
 mod cursors;
 mod sorted_runs;
@@ -142,6 +142,10 @@ impl OutputTrieOverlay {
 /// just quadratic - to the inner provider, and overrides only
 /// `state_root_with_updates` with [`OutputTrieOverlay::layered_root_with_updates`]
 /// over a fresh read-only database transaction (issue #1301).
+///
+/// The two methods `finish` calls also take their per-block timings here
+/// (`RethEnvMetrics::block_hashed_state_seconds` and `block_state_root_seconds`), the
+/// only point where the hashing and the root can be timed apart from the rest of `finish`.
 pub(crate) struct OverlayRootStateProvider<'a, P> {
     /// The parent-state provider from `state_by_block_hash`, unchanged for all
     /// account/storage/bytecode reads.
@@ -201,10 +205,13 @@ impl<P: StateProvider> reth_provider::BytecodeReader for OverlayRootStateProvide
 
 /// Delegated 1:1 to the inner provider: the hashed post-state MUST come from the
 /// inner provider so the key-hasher identity used for the deltas matches the one
-/// used for every read.
+/// used for every read. Timed into `RethEnvMetrics::block_hashed_state_seconds`.
 impl<P: StateProvider> HashedPostStateProvider for OverlayRootStateProvider<'_, P> {
     fn hashed_post_state(&self, bundle_state: &reth_revm::db::BundleState) -> HashedPostState {
-        self.inner.hashed_post_state(bundle_state)
+        let started = Instant::now();
+        let hashed_state = self.inner.hashed_post_state(bundle_state);
+        RETH_METRICS.block_hashed_state_seconds.record(started.elapsed());
+        hashed_state
     }
 }
 
@@ -222,12 +229,19 @@ impl<P: StateProvider> StateRootProvider for OverlayRootStateProvider<'_, P> {
 
     /// The #1301 layered root: current-block deltas over the accumulated output
     /// overlay over the database, with prefix sets from the current block only.
+    /// Timed into `RethEnvMetrics::block_state_root_seconds`, from opening the
+    /// read-only transaction to closing it.
     fn state_root_with_updates(
         &self,
         hashed_state: HashedPostState,
     ) -> ProviderResult<(B256, TrieUpdates)> {
-        let provider = self.blockchain_provider.database_provider_ro()?;
-        self.overlay.layered_root_with_updates(provider.tx_ref(), hashed_state)
+        let started = Instant::now();
+        let root = {
+            let provider = self.blockchain_provider.database_provider_ro()?;
+            self.overlay.layered_root_with_updates(provider.tx_ref(), hashed_state)?
+        };
+        RETH_METRICS.block_state_root_seconds.record(started.elapsed());
+        Ok(root)
     }
 
     fn state_root_from_nodes_with_updates(

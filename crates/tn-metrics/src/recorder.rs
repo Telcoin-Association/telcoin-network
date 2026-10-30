@@ -124,12 +124,24 @@ pub fn install_recorder() -> eyre::Result<&'static PrometheusHandle> {
         return Ok(handle);
     }
 
-    let recorder = build_prometheus_recorder()?;
-    let handle = recorder.handle();
-    metrics::set_global_recorder(TnPrefixRecorder { inner: recorder })
+    let (recorder, handle) = build_recorder()?;
+    metrics::set_global_recorder(recorder)
         .map_err(|e| eyre!("failed to install global metrics recorder: {e}"))?;
 
     Ok(RECORDER_HANDLE.get_or_init(|| handle))
+}
+
+/// Build the node's recorder without installing it, plus the handle that renders its registry.
+///
+/// The recorder is the one [`install_recorder`] installs: a Prometheus registry with the
+/// node's histogram buckets behind the selective `reth.` prefix. A caller that installs its
+/// own global recorder can wrap this one to get the same rendered names and buckets as a node
+/// run with `--metrics`. The registry is private to the returned pair, so building one never
+/// touches the global recorder or the handle [`install_recorder`] returns.
+pub fn build_recorder() -> eyre::Result<(impl Recorder + Send + Sync + 'static, PrometheusHandle)> {
+    let inner = build_prometheus_recorder()?;
+    let handle = inner.handle();
+    Ok((TnPrefixRecorder { inner }, handle))
 }
 
 /// Build the underlying Prometheus recorder with explicit histogram buckets.
@@ -290,6 +302,28 @@ mod tests {
         assert!(rendered.contains("tn_worker_batches_sealed_total 2"), "{rendered}");
         assert!(rendered.contains("reth_db_fake_metric 3"), "{rendered}");
         assert!(rendered.contains("reth_process_fake_gauge 7"), "{rendered}");
+    }
+
+    /// `build_recorder` returns the node's recorder unwrapped from the global: the prefix
+    /// rewrite and the bucket layouts apply, and its own handle renders what it recorded.
+    #[test]
+    fn test_build_recorder_records_and_renders() {
+        let (recorder, handle) = build_recorder().expect("recorder builds");
+
+        metrics::with_local_recorder(&recorder, || {
+            metrics::counter!("tn_test.built_total").increment(4);
+            metrics::counter!("db.built_metric").increment(5);
+            metrics::histogram!("storage.providers.database.built_seconds").record(0.3);
+        });
+
+        let rendered = handle.render();
+        assert!(rendered.contains("tn_test_built_total 4"), "{rendered}");
+        assert!(rendered.contains("reth_db_built_metric 5"), "{rendered}");
+        assert!(
+            rendered
+                .contains("reth_storage_providers_database_built_seconds_bucket{le=\"0.5\"} 1\n"),
+            "{rendered}"
+        );
     }
 
     /// Histograms matched by the bucket configuration must render as aggregatable

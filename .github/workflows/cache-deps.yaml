@@ -11,8 +11,9 @@
 #
 #   clippy-cache  both clippy passes (default and --all-features) under the nightly pin;
 #                 read by pr.yaml's `clippy` job
-#   test-cache    dependencies for both test lanes (default and adiri features) under
-#                 the stable pin; read by `test` and `adiri-test`. Workspace test binaries
+#   test-cache    dependencies for the three test lanes (default, adiri and tndb-b
+#                 features) under the stable pin; read by `test`, `adiri-test` and
+#                 `tndb-test`. Workspace test binaries
 #                 are rebuilt per run because rust-cache does not save workspace crates.
 #
 # A third job, prune-caches, runs after both warms on main and deletes the superseded
@@ -134,10 +135,10 @@ jobs:
       - name: Build both clippy passes
         run: ./etc/ci-lanes.sh clippy
 
-  # Steps up to the cache step mirror pr.yaml's `test` and `adiri-test` jobs.
+  # Steps up to the cache step mirror pr.yaml's `test`, `adiri-test` and `tndb-test` jobs.
   warm-test-cache:
     runs-on: ubuntu-latest
-    # Both lanes' test binaries from cold; the default lane alone took 9.5 min with a
+    # All three lanes' test binaries from cold; the default lane alone took 9.5 min with a
     # partial cache after a heavy dependency bump.
     timeout-minutes: 120
     steps:
@@ -160,15 +161,18 @@ jobs:
           prefix-key: v1-rust
           shared-key: test-cache
 
-      # Both test lanes into one target dir. The adiri feature set unifies differently
+      # All three test lanes into one target dir. The adiri feature set unifies differently
       # (tn-reth/adiri pulls in faucet and tn-types/adiri, and resolver-2 unification is
       # per selected package), so its dependency artifacts are distinct from the default
-      # lane's; the two sets coexist in target/, and rust-cache keeps every variant of a
-      # dependency it finds there. One entry keeps the quota predictable.
-      - name: Build the test binaries of both test lanes
+      # lane's; the sets coexist in target/, and rust-cache keeps every variant of a
+      # dependency it finds there. The tndb-b lane is built for the same reason: whatever
+      # its feature set unifies differently is saved beside the rest. One entry keeps the
+      # quota predictable.
+      - name: Build the test binaries of the three test lanes
         run: |
           ./etc/ci-lanes.sh test-default --build-only
           ./etc/ci-lanes.sh test-adiri --build-only
+          ./etc/ci-lanes.sh test-tndb --build-only
 
   # Deletes the superseded cache generations, through .github/scripts/prune_caches.sh,
   # whose header has the rule in full. A family is every entry on refs/heads/main whose

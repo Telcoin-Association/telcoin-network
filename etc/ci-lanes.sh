@@ -24,11 +24,11 @@
 # cannot afford them. A lane added to this file lands in the merge queue too, so anything
 # that takes hours does not belong in it.
 #
-# Usage: etc/ci-lanes.sh <fmt|clippy|test-default|test-adiri|all>
-#        etc/ci-lanes.sh <test-default|test-adiri> --build-only
+# Usage: etc/ci-lanes.sh <fmt|clippy|test-default|test-adiri|test-tndb|all>
+#        etc/ci-lanes.sh <test-default|test-adiri|test-tndb> --build-only
 #
 # `--build-only` compiles a test lane's binaries without running them. It is accepted for
-# the two test lanes and nothing else, and it is the only option there is: no flag passes
+# the test lanes and nothing else, and it is the only option there is: no flag passes
 # through to cargo, so a caller still cannot weaken a lane, only skip the run.
 #
 # NEXTEST_PROFILE selects a profile from .config/nextest.toml. CI sets it to `ci`
@@ -58,8 +58,8 @@ export CARGO_PROFILE_TEST_DEBUG=0
 NIGHTLY=$(cat rust-nightly)
 
 usage() {
-    echo "usage: $0 <fmt|clippy|test-default|test-adiri|all>" >&2
-    echo "       $0 <test-default|test-adiri> --build-only" >&2
+    echo "usage: $0 <fmt|clippy|test-default|test-adiri|test-tndb|all>" >&2
+    echo "       $0 <test-default|test-adiri|test-tndb> --build-only" >&2
     exit 2
 }
 
@@ -122,12 +122,21 @@ lane_test_adiri() {
         "${run_mode[@]}"
 }
 
+lane_test_tndb() {
+    # lane_test_default runs every reth database on MDBX, the default backend, so it never
+    # runs reth on tndb-b. This is the same workspace run with tn-reth's `tndb-b` feature:
+    # feature unification switches every crate that opens a reth database (tn-reth, tn-node,
+    # the CLI and every test built on them) to tndb-b, so between the two lanes each of those
+    # tests runs once against each engine.
+    run cargo nextest run --locked --workspace --features tn-reth/tndb-b "${run_mode[@]}"
+}
+
 (($# <= 2)) || usage
 case "${2:-}" in
 "") ;;
 --build-only)
     case "${1:-}" in
-    test-default | test-adiri) run_mode=(--no-run) ;;
+    test-default | test-adiri | test-tndb) run_mode=(--no-run) ;;
     *) usage ;;
     esac
     ;;
@@ -139,11 +148,13 @@ fmt) lane_fmt ;;
 clippy) lane_clippy ;;
 test-default) lane_test_default ;;
 test-adiri) lane_test_adiri ;;
+test-tndb) lane_test_tndb ;;
 all)
     lane_fmt
     lane_clippy
     lane_test_default
     lane_test_adiri
+    lane_test_tndb
     ;;
 *) usage ;;
 esac

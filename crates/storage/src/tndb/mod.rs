@@ -18,7 +18,7 @@ mod commit;
 mod compact;
 pub mod database;
 pub mod inspect;
-mod layout;
+pub(crate) mod layout;
 mod manifest;
 mod metrics;
 mod record;

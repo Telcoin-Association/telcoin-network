@@ -77,8 +77,8 @@ async fn assert_simulation_cap_rejected(
 async fn test_rpc_simulation_epoch_fee_below_header() -> eyre::Result<()> {
     init_reth_defaults();
     let transports = [
-        reth::args::RpcServerArgs { http: true, ipcdisable: true, ..Default::default() },
-        reth::args::RpcServerArgs { ws: true, ipcdisable: true, ..Default::default() },
+        reth_node_core::args::RpcServerArgs { http: true, ipcdisable: true, ..Default::default() },
+        reth_node_core::args::RpcServerArgs { ws: true, ipcdisable: true, ..Default::default() },
     ];
     try_join_all(transports.into_iter().map(|rpc_args| async move {
         let tmp_dir = TempDir::new()?;
@@ -222,9 +222,12 @@ async fn test_rpc_simulation_fill_preserves_explicit_cap() -> eyre::Result<()> {
 }
 
 /// Enable eth and debug on a single transport, with explicit pending-block behavior.
-fn remaining_rpc_args(http: bool, pending: PendingBlockKind) -> reth::args::RpcServerArgs {
+fn remaining_rpc_args(
+    http: bool,
+    pending: PendingBlockKind,
+) -> reth_node_core::args::RpcServerArgs {
     let modules = vec![RethRpcModule::Eth, RethRpcModule::Debug];
-    reth::args::RpcServerArgs {
+    reth_node_core::args::RpcServerArgs {
         http,
         ws: !http,
         ipcdisable: true,

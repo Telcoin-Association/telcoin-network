@@ -265,7 +265,7 @@ pub(crate) struct EpochManager<P, DB> {
     /// part of a commit never affects the decision). Once an output reaches the
     /// boundary the manager closes the epoch after the engine executes all data.
     epoch_boundary: TimestampSec,
-    /// Reth (MDBX) database handle. Held for the whole process so the execution engine can be
+    /// Reth database handle. Held for the whole process so the execution engine can be
     /// recreated without reopening storage.
     reth_db: RethDb,
     /// Consensus database handle. Held for the whole process; shared with the p2p networks

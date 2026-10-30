@@ -8,16 +8,19 @@
 //!
 //! # Export: pinned, read-consistent view over reth's plain EVM state
 //!
-//! [`RethEnv::pin_state_view`] opens a single reth `Tx<RO>` on the MDBX environment and calls
-//! `disable_long_read_transaction_safety()` on it. MDBX enforces a reader timeout (~5 minutes) that
-//! kills long-lived read transactions to keep the free list from stalling; a full-state export can
-//! easily run longer than that. Disabling the guard exempts *only this one transaction* — it does
-//! not touch any env-wide configuration, so other readers and the writer keep their normal safety
-//! limits.
+//! [`RethEnv::pin_state_view`] opens a single reth read-only transaction on the reth database
+//! ([`RethDbEnv`]) and calls `disable_long_read_transaction_safety()` on it. On MDBX (the default
+//! build) this matters: MDBX enforces a reader timeout (~5 minutes) that kills long-lived read
+//! transactions to keep the free list from stalling, and a full-state export can easily run longer
+//! than that. Disabling the guard exempts *only this one transaction* — it does not touch any
+//! env-wide configuration, so other readers and the writer keep their normal safety limits. On
+//! tndb-b (the `tndb-b` feature) the call does nothing: the engine has no reader timeout. A long
+//! export only holds back page reuse while it runs, and the engine logs a long-reader warning, at
+//! most once a minute, while a reader has held a superseded snapshot for over a minute.
 //!
-//! The returned [`PinnedStateView`] owns the transaction (which itself keeps the MDBX environment
-//! alive) and is [`Send`], so an uploader can move it into a background task and stream the export
-//! off the hot path.
+//! The returned [`PinnedStateView`] owns the transaction (which itself keeps the database
+//! environment alive) and is [`Send`], so an uploader can move it into a background task and stream
+//! the export off the hot path.
 //!
 //! # Storage format is the exec state pack (not JSONL)
 //!
@@ -64,7 +67,7 @@
 
 use crate::{
     error::{TnRethError, TnRethResult},
-    DatabaseEnv, RethConfig, RethDatabaseT, RethDb, RethEnv,
+    RethConfig, RethDatabaseT, RethDb, RethDbEnv, RethEnv,
 };
 use alloy::consensus::constants::KECCAK_EMPTY;
 use eyre::{eyre, WrapErr as _};
@@ -103,8 +106,8 @@ use tn_types::{
 };
 use tracing::{debug, info};
 
-/// The pinned read-only MDBX transaction type — reth's `Tx<RO>` with long-read safety disabled.
-type PinnedTx = <DatabaseEnv as RethDatabaseT>::TX;
+/// The pinned read-only transaction type of the reth database — with long-read safety disabled.
+type PinnedTx = <RethDbEnv as RethDatabaseT>::TX;
 
 /// Emit a scaffold-progress log every this many blocks. The chain scaffold's cost scales with chain
 /// height (not state size), so on a mature chain the header/body loops churn through millions of
@@ -113,13 +116,14 @@ const SCAFFOLD_LOG_INTERVAL: u64 = 500_000;
 
 /// A read-consistent view of reth's plain EVM state pinned to the tip at open time.
 ///
-/// Wraps a single reth `Tx<RO>` that has been exempted from the long-read-transaction reader-kill
-/// (see the module docs). The view reads only MDBX-resident tables (`PlainAccountState`,
-/// `PlainStorageState`, `Bytecodes`, `HeaderNumbers`, `BlockBodyIndices`), so the transaction alone
-/// is enough to keep everything it needs alive; no static-file or provider handle is required.
+/// Wraps a single reth read-only transaction that has been exempted from the
+/// long-read-transaction reader-kill (see the module docs). The view reads only database-resident
+/// tables (`PlainAccountState`, `PlainStorageState`, `Bytecodes`, `HeaderNumbers`,
+/// `BlockBodyIndices`), so the transaction alone is enough to keep everything it needs alive; no
+/// static-file or provider handle is required.
 ///
 /// The transaction keeps its MVCC snapshot for as long as this value lives, so callers should drop
-/// it promptly once the export finishes to let MDBX reclaim retained pages.
+/// it promptly once the export finishes to let the database reclaim retained pages.
 pub struct PinnedStateView {
     /// The pinned read-only transaction. `Send`, and self-sufficient for keeping the env alive.
     tx: PinnedTx,
@@ -381,14 +385,15 @@ impl std::fmt::Debug for PinnedStateView {
 }
 
 impl RethEnv {
-    /// Open a read-only MDBX transaction pinned to the current tip for snapshot export.
+    /// Open a read-only database transaction pinned to the current tip for snapshot export.
     ///
     /// The transaction is exempted from the long-read-transaction reader-kill (see the module docs)
-    /// so a full-state export can run without racing MDBX's reader timeout. The returned
-    /// [`PinnedStateView`] is `Send` and self-contained, ready to be handed to a background task.
+    /// so a full-state export can run without racing MDBX's reader timeout (tndb-b has none). The
+    /// returned [`PinnedStateView`] is `Send` and self-contained, ready to be handed to a
+    /// background task.
     pub fn pin_state_view(&self) -> TnRethResult<PinnedStateView> {
         // one RO transaction, exempted from the reader-kill, then unwrapped to the raw tx so the
-        // view only carries what it needs (the plain-state tables all live in mdbx, not static
+        // view only carries what it needs (the plain-state tables all live in the db, not static
         // files, so no provider/static-file handle has to be kept alive alongside it)
         let tx = self
             .blockchain_provider()
@@ -1196,12 +1201,13 @@ mod tests {
         MaybePlatformPath, RethChainSpec, RethConfig, RethDb, RethEnv,
     };
     use alloy::{eips::eip7685::EMPTY_REQUESTS_HASH, primitives::aliases::U184};
-    use reth::{args::DatadirArgs, builder::NodeConfig};
     use reth_db::{
         cursor::{DbCursorRW, DbDupCursorRO},
         tables::{HashedAccounts, HashedStorages, PlainAccountState, PlainStorageState},
         transaction::{DbTx, DbTxMut},
     };
+    use reth_node_builder::NodeConfig;
+    use reth_node_core::args::DatadirArgs;
     use reth_primitives_traits::{Account, StorageEntry};
     use reth_provider::{
         AccountReader, ChangeSetReader, DBProvider, DatabaseProviderFactory, StateProvider,

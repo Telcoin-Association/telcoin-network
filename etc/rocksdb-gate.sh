@@ -3,9 +3,10 @@
 # RocksDB guard: fail if rocksdb enters the default feature graph.
 #
 # librocksdb-sys is the entire RocksDB C++ engine (332 translation units) and the single
-# largest native compile in the tree. Storage here is MDBX-only, so the workspace manifest
-# takes reth without its default features and leaves `rocksdb` off; see the note above the
-# `reth` entry in Cargo.toml, including the warning that reth's `edge` feature implies it.
+# largest native compile in the tree. Storage here is MDBX-only, so the workspace takes reth's
+# individual crates (never the `reth` umbrella, whose defaults include it) and leaves `rocksdb`
+# off; see the note above the reth entries in Cargo.toml, including the warning that reth's
+# `edge` features imply it.
 # This guard catches the bump that re-introduces it through some other default set: the
 # cost would land on every build, and the cache warm on main would absorb it without a
 # word.
@@ -44,8 +45,8 @@ if [[ "$hits" -ne 0 ]]; then
 rocksdb is gated behind an off-by-default feature so that no build in this workspace pays
 for the RocksDB C++ engine. A dependency change has pulled it back into the default graph.
 Find the edge in the tree above and cut it (turn the feature off on that dependency, or
-take it without default features and re-enable the ones needed). The note above the `reth`
-entry in Cargo.toml has the background.
+take it without default features and re-enable the ones needed). The note above the reth
+entries in Cargo.toml has the background.
 EOF
     exit 1
 fi
