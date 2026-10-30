@@ -24,6 +24,7 @@ newest last.
   *Why*: `reth-e2e-test-utils` depends on `reth-cli-commands`, so carrying it would pull reth's
   whole CLI into the vendored set only for these integration tests. The crates' unit tests and
   `reth-node-ethereum`'s `tests/it` still run. See DECISIONS.md D5. *Upstream*: n/a.
+  *Superseded*: both crates were removed in TN-0005, so nothing of this entry remains.
 
 - **TN-0002** — Reformat two files with TN's pinned nightly rustfmt. *Kind*: build.
   *Files*: `crates/engine/tree/src/tree/payload_processor/mod.rs` (a `while let ... &&`
@@ -32,7 +33,8 @@ newest last.
   so the vendored code is checked with TN's nightly (`rust-nightly`, 2026-03-20) under reth's
   `rustfmt.toml`. That nightly formats these two spots differently from the one reth used.
   When TN bumps its nightly, rerun `make fmt` and record any vendored reformatting the same
-  way. *Upstream*: no.
+  way. *Upstream*: no. *Partly superseded*: engine-tree was removed in TN-0005; only the
+  `receipt.rs` change remains.
 
 - **TN-0003** — Fix a reth-trie unit test that does not compile upstream. *Kind*: test.
   *Files*: `crates/trie/trie/src/proof_v2/mod.rs` (`test_proof_calculator_reuse_after_error`).
@@ -54,3 +56,16 @@ newest last.
   `EthereumEngineValidator`, which needs `reth-ethereum-payload-builder`, so keeping them would
   keep the whole node-builder subgraph in the nested workspace. TN does not serve the engine
   API. rpc-builder's http, ws, startup, middleware and serde tests stay. *Upstream*: n/a.
+
+- **TN-0005** — Remove 24 crates TN no longer depends on. *Kind*: removal.
+  *Files*: removed from `tn/crates.txt` and the nested manifest with `vendor.py remove`:
+  consensus/debug-client, engine/{invalid-block-hooks,service,tree,util}, era,
+  era-downloader, era-utils, ethereum/{consensus,node,payload}, exex/{exex,types},
+  net/downloaders, node/{builder,ethstats,events,metrics}, payload/validator, prune/prune,
+  stages/{api,stages}, static-file/static-file, trie/parallel.
+  *Why*: TN wires reth's components itself. Once `tn-reth` stopped importing through
+  `reth-node-builder` and `reth-node-ethereum` (commit "tn-reth: stop depending on
+  reth-node-builder and reth-node-ethereum"), nothing reaches these crates in any feature
+  configuration. Features they used to enable that matter (the revm precompile backends,
+  `asm-keccak`, `optional-balance-check`, chain-state `rayon`, trie-sparse `std`/`metrics`) are
+  now set by `tn-reth` itself. *Upstream*: n/a.

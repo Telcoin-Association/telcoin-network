@@ -6,8 +6,8 @@ possible but optional.
 
 - Base: upstream `v1.11.3` (`d6324d63e27ef6b7c49cdc9b1977c1b808234c7b`); the pin is in
   `tn/upstream.toml`.
-- Carried: 101 crates in TN's dependency graph, plus the test-only `reth-testing-utils`. The
-  list is in `tn/crates.txt`.
+- Carried: the reth crates in TN's dependency graph (77 after the Phase 1 reduction; 101 at
+  import), plus the test-only `reth-testing-utils`. The list is in `tn/crates.txt`.
 - TN's changes against upstream: CHANGES.md, the ledger.
 - Why it is built this way: DECISIONS.md.
 - What comes next (tndb-b, trimming Ethereum-only code, alloy/revm directly): ROADMAP.md.

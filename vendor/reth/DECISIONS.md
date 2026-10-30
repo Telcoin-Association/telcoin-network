@@ -101,3 +101,22 @@ The tndb-b work (`tndb-b-reth`, the `tndb-b` feature) is replacing MDBX as TN's 
 but MDBX is still the default and the migration source. The vendored `reth-libmdbx` and
 `reth-mdbx-sys` stay in place. Gating them out is listed in ROADMAP.md, for whoever lands the
 tndb-b switch.
+
+## D10. Reduction keeps behavior identical: restore the features a removed crate enabled
+
+Removing a crate can switch off features it enabled on crates that stay, through feature
+unification. Phase 1 would have dropped revm's `secp256k1`, `blst` and `c-kzg` precompile
+backends and `asm-keccak`, and reth-chain-state's `rayon`. The rule: snapshot the feature graph
+before and after (`tn/graph.py`). Every feature that changes behavior or performance on a
+surviving crate is restored explicitly where TN depends on that crate, with a comment saying
+why. Features that only gate APIs TN does not use (serde bincode compat, RPC client traits,
+`send_guard`, fixed-cache's allocating constructor) may go. The compiler proves they were
+unused. Each one is named in the commit message.
+
+## D11. Tests that need a removed crate are dropped, not kept alive
+
+When a surviving crate's tests need a crate that reduction removed (TN-0004:
+`EthereumEngineValidator` for the engine-API tests), the tests go and the ledger says so.
+Keeping a removed crate as a dev-only dependency would keep its whole subgraph in the nested
+workspace and defeat the reduction. Where only part of a suite is affected, only that part
+goes (rpc-builder keeps its http/ws/startup tests).
