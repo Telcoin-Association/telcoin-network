@@ -74,7 +74,12 @@ dev-dependencies are reth's). Use:
 ```
 vendor/reth/tn/cargo.sh test -p reth-db --lib
 vendor/reth/tn/cargo.sh nextest run -p reth-provider
+vendor/reth/tn/cargo.sh check --workspace --all-targets   # every vendored crate's tests compile
 ```
+
+Some crates' test code needs their own `test-utils` feature, which upstream's CI only gets from
+workspace-wide `--all-features`. If `--all-targets` fails on a missing optional dependency, add
+`--all-features`. (At import this hit `reth-downloaders`, which is no longer carried.)
 
 `cargo.sh` seeds `vendor/reth/Cargo.lock` from TN's lockfile (the nested lockfile is
 git-ignored) and builds into `target/vendor-reth`. When one of reth's dev-dependencies needs a

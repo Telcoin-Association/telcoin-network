@@ -126,11 +126,24 @@ loop and disables EIP-4844 and EIP-7702. With the code vendored, candidates are:
 store and the 4844 paths, give batch building its own ordering, and simplify validation to TN's
 rules.
 
-## Phase 6: RPC surface [later]
+## Phase 6: RPC surface [next after the Phase 1-2 test pass]
 
-The `eth`, `debug` and `trace` namespaces come from reth-rpc; TN overrides seven methods. Once
-Phase 1 lands, see what still pulls in `reth-rpc-engine-api` and the engine API types, and cut
-whatever TN does not serve.
+TN serves only `eth`, `net`, `web3`, `debug`, `trace` and `rpc` (`ALLOWED_MODULES` in
+`tn-reth/src/cli.rs`) plus its own `tn` namespace, and overrides seven methods. The vendored
+`reth-rpc` also carries `admin`, `engine` (`EngineEthApi`, the `EngineApi` re-export), `miner`,
+`otterscan`, `reth`, `testing`, `txpool` and `validation` (flashbots `ValidationApi`, which
+`tn-reth/src/traits.rs` says must never be registered), and `reth-rpc-builder` carries the JWT
+auth server for the engine API. After Phase 2 these are the only reasons for
+`reth-rpc-engine-api` and `reth-payload-builder` (both reached only through `reth-rpc`),
+`reth-consensus-common` (`validation.rs`, `testing.rs`) and probably `reth-rpc-layer` (auth;
+check that `CompressionLayer` is not used by the main server first).
+
+Plan: remove the unserved modules from `reth-rpc` and their registration arms from
+`reth-rpc-builder` (the `RethRpcModule` match in `lib.rs`), remove `rpc-builder`'s `auth`
+module, then `vendor.py remove` what leaves. `RethRpcModule` itself lives in
+`reth-rpc-server-types`. Shrink it only if nothing parses the removed names, because operators'
+`--http.api` lists are validated against it (`validate_rpc_modules`). Verify with
+`tn-reth`'s `env/rpc/tests` (namespace tests) and the e2e RPC tests.
 
 ## Taking upstream changes as the code diverges
 
