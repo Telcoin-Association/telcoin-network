@@ -41,9 +41,10 @@
 #
 #   fmt-clippy       fmt and both clippy passes, the release graph and every target under
 #                    --all-features, under the nightly pin
-#   build-tests      both test lanes with `--build-only`, under the stable pin that builds
-#                    releases: the same build of the workspace test binaries that failed in
-#                    cache-deps.yaml and durable-e2e.yaml on 2026-10-29
+#   build-tests      the rocksdb guard, then both test lanes with `--build-only`, under the
+#                    stable pin that builds releases: the same build of the workspace test
+#                    binaries that failed in cache-deps.yaml and durable-e2e.yaml on
+#                    2026-10-29
 #   carried-patches  the library tests of the two carried patch crates, which sit outside
 #                    the workspace and which an advisory fix can touch too
 #
@@ -175,6 +176,13 @@ jobs:
           prefix-key: v1-rust
           shared-key: test-cache
           save-if: "false"
+
+      # pr.yaml's `test` job and etc/test-and-attest.sh run this guard before they build; a
+      # bump that pulls librocksdb-sys back into the default graph through a push the queue
+      # did not make is the class of gap this workflow exists to catch. It only resolves
+      # metadata: seconds with the restored cargo home.
+      - name: Assert rocksdb absent from the default feature graph
+        run: ./etc/rocksdb-gate.sh
 
       - name: Build the default lane's test binaries
         run: ./etc/ci-lanes.sh test-default --build-only
