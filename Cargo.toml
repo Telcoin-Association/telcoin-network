@@ -159,20 +159,19 @@ reth-rpc-eth-api = { path = "vendor/reth/crates/rpc/rpc-eth-api" }
 reth-rpc-eth-types = { path = "vendor/reth/crates/rpc/rpc-eth-types" }
 reth-tracing = { path = "vendor/reth/crates/tracing" }
 reth-provider = { path = "vendor/reth/crates/storage/provider" }
-reth-prune = { path = "vendor/reth/crates/prune/prune" }
 reth-prune-types = { path = "vendor/reth/crates/prune/types" }
-reth-stages = { path = "vendor/reth/crates/stages/stages" }
 reth-stages-types = { path = "vendor/reth/crates/stages/types" }
 reth-trie = { path = "vendor/reth/crates/trie/trie" }
 reth-trie-db = { path = "vendor/reth/crates/trie/db" }
 reth-trie-common = { path = "vendor/reth/crates/trie/common" }
+reth-trie-sparse = { path = "vendor/reth/crates/trie/sparse" }
 reth-tasks = { path = "vendor/reth/crates/tasks" }
 reth-tokio-util = { path = "vendor/reth/crates/tokio-util" }
 reth-transaction-pool = { path = "vendor/reth/crates/transaction-pool" }
 reth-consensus = { path = "vendor/reth/crates/consensus/consensus" }
-reth-node-builder = { path = "vendor/reth/crates/node/builder" }
 reth-node-core = { path = "vendor/reth/crates/node/core" }
-reth-node-ethereum = { path = "vendor/reth/crates/ethereum/node" }
+reth-node-types = { path = "vendor/reth/crates/node/types" }
+reth-payload-primitives = { path = "vendor/reth/crates/payload/primitives" }
 reth-discv4 = { path = "vendor/reth/crates/net/discv4" }
 reth-eth-wire = { path = "vendor/reth/crates/net/eth-wire" }
 reth-cli-util = { path = "vendor/reth/crates/cli/util" }
@@ -185,6 +184,8 @@ reth-metrics = { path = "vendor/reth/crates/metrics" }
 alloy = { version = "1.6.3", features = ["full"] }
 alloy-rlp = "0.3.13"
 alloy-evm = { version = "0.27.2" }
+# Same requirement as vendor/reth/Cargo.toml; tn-reth names it only to set features.
+revm = { version = "34.0.0", default-features = false }
 
 tn-batch-validator = { path = "crates/batch-validator" }
 tn-engine = { path = "crates/engine" }

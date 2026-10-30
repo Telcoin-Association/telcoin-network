@@ -34,7 +34,7 @@ use crate::metrics::{
 use alloy::primitives::{keccak256, map::AddressSet, B256};
 use futures::{future::OptionFuture, stream, Stream, StreamExt as _};
 use reth_chainspec::ChainSpec;
-use reth_node_builder::{NodeConfig, RethTransactionPoolConfig};
+use reth_node_core::{cli::config::RethTransactionPoolConfig, node_config::NodeConfig};
 use reth_primitives_traits::SignerRecoverable;
 use reth_provider::{
     providers::BlockchainProvider, AccountReader as _, CanonStateNotification,
