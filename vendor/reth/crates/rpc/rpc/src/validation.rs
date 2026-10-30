@@ -28,7 +28,7 @@ use reth_metrics::{
     metrics::{gauge, Gauge},
     Metrics,
 };
-use reth_node_api::{NewPayloadError, PayloadTypes};
+use reth_payload_primitives::{NewPayloadError, PayloadTypes};
 use reth_primitives_traits::{
     constants::GAS_LIMIT_BOUND_DIVISOR, BlockBody, GotExpected, NodePrimitives, RecoveredBlock,
     SealedBlock, SealedHeaderFor,

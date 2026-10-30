@@ -69,3 +69,17 @@ newest last.
   configuration. Features they used to enable that matter (the revm precompile backends,
   `asm-keccak`, `optional-balance-check`, chain-state `rayon`, trie-sparse `std`/`metrics`) are
   now set by `tn-reth` itself. *Upstream*: n/a.
+
+- **TN-0006** — Take `reth-node-api` out of the RPC crates. *Kind*: removal.
+  *Files*: `crates/rpc/rpc-eth-api/src/node.rs` (the blanket
+  `impl<T: FullNodeComponents> RpcNodeCore for T`, imports, doc links),
+  `crates/rpc/rpc-eth-api/src/helpers/{block,call,config}.rs` (imports),
+  `crates/rpc/rpc-eth-api/Cargo.toml`; `crates/rpc/rpc/src/eth/core.rs` (the
+  `EthRpcConverterFor`, `EthApiFor` and `EthApiBuilderFor` aliases), `crates/rpc/rpc/src/eth/mod.rs`,
+  `crates/rpc/rpc/src/validation.rs` (imports from `reth-payload-primitives`),
+  `crates/rpc/rpc/Cargo.toml`.
+  *Why*: `reth-node-api` is the node builder's component API, and TN builds `EthApi` from
+  `RpcNodeCoreAdapter`. The RPC crates used it only for re-exports (now taken from
+  `reth-primitives-traits` and `reth-payload-primitives`) and for conveniences over
+  `FullNodeComponents`. Without it, `reth-node-api` and `reth-basic-payload-builder` leave the
+  graph. *Upstream*: no.
