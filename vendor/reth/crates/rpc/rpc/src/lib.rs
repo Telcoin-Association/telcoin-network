@@ -25,26 +25,24 @@
 #![cfg_attr(docsrs, feature(doc_cfg))]
 #![cfg_attr(not(test), warn(unused_crate_dependencies))]
 
+// TN(TN-0010): the `engine` (EngineApi re-export, EngineEthApi), `testing` and `validation`
+// (flashbots ValidationApi) modules are removed; TN serves none of them.
 mod admin;
 mod aliases;
 mod debug;
-mod engine;
 pub mod eth;
 mod miner;
 mod net;
 mod otterscan;
 mod reth;
 mod rpc;
-mod testing;
 mod trace;
 mod txpool;
-mod validation;
 mod web3;
 
 pub use admin::AdminApi;
 pub use aliases::*;
 pub use debug::DebugApi;
-pub use engine::{EngineApi, EngineEthApi};
 pub use eth::{helpers::SyncListener, EthApi, EthApiBuilder, EthBundle, EthFilter, EthPubSub};
 pub use miner::MinerApi;
 pub use net::NetApi;
@@ -52,8 +50,6 @@ pub use otterscan::OtterscanApi;
 pub use reth::RethApi;
 pub use reth_rpc_convert::RpcTypes;
 pub use rpc::RPCApi;
-pub use testing::TestingApi;
 pub use trace::TraceApi;
 pub use txpool::TxPoolApi;
-pub use validation::{ValidationApi, ValidationApiConfig};
 pub use web3::Web3Api;

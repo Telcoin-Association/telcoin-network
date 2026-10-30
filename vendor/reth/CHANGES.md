@@ -113,3 +113,17 @@ newest last.
   reth-node-core gone, tn-reth off reth-network/discv4/eth-wire), nothing in any feature
   configuration reaches them. 27 third-party crates left with them (discv5, hickory DNS,
   ed25519, a second libp2p-identity, moka, ...). *Upstream*: n/a.
+
+- **TN-0010** — Remove the RPC pieces TN never serves: the engine-API auth server, `EngineEthApi`,
+  flashbots `ValidationApi`, `TestingApi`. *Kind*: removal.
+  *Files*: deleted `crates/rpc/rpc/src/{engine,testing,validation}.rs` and
+  `crates/rpc/rpc-builder/src/auth.rs`; `crates/rpc/rpc/src/lib.rs`, `crates/rpc/rpc/Cargo.toml`
+  (drops reth-rpc-engine-api, reth-consensus-common and nine dependencies only those modules
+  used); `crates/rpc/rpc-builder/src/lib.rs` (`build_with_auth_server`, `create_auth_module`,
+  `mod auth`), `crates/rpc/rpc-builder/src/config.rs` (`auth_server_config`,
+  `auth_jwt_secret`, `flashbots_config`), `crates/rpc/rpc-builder/Cargo.toml` (two
+  dev-dependencies the auth test used, see TN-0004).
+  *Why*: TN serves only eth, net, web3, debug, trace and rpc (plus its own tn), never runs the
+  engine API, and `tn-reth/src/traits.rs` requires that `ValidationApi` never be registered. The
+  registry already mapped `flashbots` and `testing` to empty modules. `reth-rpc-engine-api`,
+  `reth-payload-builder` and `reth-consensus-common` leave the graph. *Upstream*: no.
