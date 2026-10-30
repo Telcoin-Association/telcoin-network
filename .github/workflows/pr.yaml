@@ -396,11 +396,9 @@ jobs:
           shared-key: test-cache
           save-if: "false"
 
-      # Resolves the dependency graph only (compiles nothing; seconds, with the registry
-      # index restored above). The script says why rocksdb must stay out of the default
-      # graph. It runs inside this job to reuse the restored cargo home instead of cloning
-      # reth's git repository again in a job of its own.
-      - name: Assert rocksdb absent from the default feature graph
+      # Reads Cargo.lock and the manifests only (compiles nothing; under a second). The
+      # script says why RocksDB must stay out of TN and the vendored reth entirely.
+      - name: Assert rocksdb absent from the lockfile and manifests
         run: ./etc/rocksdb-gate.sh
 
       - name: Run tests

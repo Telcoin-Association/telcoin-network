@@ -139,6 +139,24 @@ newest last.
   `reth-primitives-traits` and `reth-ethereum-primitives` (with `tn-types` defining the `Block`,
   `BlockBody` and `SealedBlock` aliases it had provided), nothing reaches it. *Upstream*: n/a.
 
+- **TN-0014** — Remove RocksDB: the backend, the `rocksdb`/`edge` features and the `rocksdb`
+  crate. *Kind*: removal.
+  *Files*: deleted `crates/storage/provider/src/providers/rocksdb/` (the real implementation);
+  every `cfg(all(unix, feature = "rocksdb"))` item and every `cfg(feature = "edge")` item removed
+  from `crates/storage/provider/src/{either_writer.rs, providers/database/{mod,provider}.rs,
+  providers/{consistent,blockchain_provider,mod}.rs, providers/state/historical.rs,
+  traits/rocksdb_provider.rs, test_utils/noop.rs}`, `crates/storage/db-common/src/init.rs` and
+  `crates/storage/db-api/src/models/metadata.rs` (their `not(...)` twins became unconditional);
+  the `rocksdb` and `edge` features removed from provider, storage-api, db-common, db-api and
+  node-core, and the optional `rocksdb` dependency from provider and the workspace manifest.
+  *Why*: maintainer decision (2026-10-30, DECISIONS.md D14): RocksDB is gone from TN in every
+  configuration. Before, it was an off-by-default feature. Proof that nothing TN compiles
+  changed: the macro-expanded source (`-Zunpretty=expanded`) of reth-provider, reth-db-common
+  and reth-db-api is identical before and after, apart from the source line numbers `tracing`
+  embeds. Cargo.lock loses rocksdb, librocksdb-sys, bzip2-sys and lz4-sys.
+  *Still present*: the zero-size `RocksDBProvider` stub (`providers/rocksdb_stub.rs`) and the
+  storage-v2 plumbing that takes it (ROADMAP.md, "RocksDB step B"). *Upstream*: no.
+
 ## Upstream syncs
 
 - **TN-0013** — Sync to upstream v1.11.4 (`2ac58a25f561`). *Kind*: sync.

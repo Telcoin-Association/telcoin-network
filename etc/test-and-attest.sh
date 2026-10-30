@@ -108,7 +108,7 @@ fi
 # nothing, so it runs first and fails fast)
 ./etc/archive-mode-guard.sh
 
-# guard against rocksdb re-entering the default feature graph (resolves the graph, compiles
+# guard against rocksdb coming back anywhere (reads Cargo.lock and the manifests, compiles
 # nothing). The merge queue runs this too; until it ran here as well, the queue enforced a
 # check the attested run had never made.
 ./etc/rocksdb-gate.sh
