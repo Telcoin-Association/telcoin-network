@@ -27,6 +27,7 @@
   * [Validator Production Operations](getting-started/validator-operations.md)
   * [Private Observability Listeners](getting-started/observability-listeners.md)
   * [Consensus Liveness](getting-started/consensus-liveness.md)
+  * [Public RPC Nodes](getting-started/public-rpc-nodes.md)
   * [Reading Blockchain Data](getting-started/reading-blockchain-data/README.md)
     * [cURL requests](getting-started/reading-blockchain-data/curl-requests.md)
     * [Programmatic Requests](getting-started/reading-blockchain-data/programmatic-requests/README.md)

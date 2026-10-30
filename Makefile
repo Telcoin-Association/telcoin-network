@@ -168,6 +168,8 @@ test:
 # NOTE: tests that pin fork epochs through TN_*_FORK_EPOCH (proposer, voter, sub-DAG clamp,
 # payload and engine tests) rely on nextest's one-process-per-test model; the overrides are
 # latched once per process, so under a single-process `cargo test` those tests fail loudly.
+# The worker gateway's throttled-warning log tests rely on the same model (their throttles
+# are process-wide statics) and skip themselves with a message outside it.
 test-cargo:
 	cargo test --workspace --no-fail-fast -- --show-output ;
 

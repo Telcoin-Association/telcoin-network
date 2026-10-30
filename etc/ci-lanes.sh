@@ -91,11 +91,80 @@ lane_clippy() {
     echo "clippy for workspace: default and all features passed"
 }
 
+# Rebuild the gateway image's build context from HEAD, resolve the workspace in it and check
+# the gateway in it. bin/worker-gateway/Dockerfile copies only the paths it names
+# (etc/Dockerfile copies everything), and cargo cannot load the workspace when an explicit
+# member or a [patch.crates-io] path source is missing, even for `-p`. The metadata call
+# resolves dependencies on purpose: `--no-deps` would hide a missing patch source. Takes an
+# optional Dockerfile path so the check can be pointed at another copy of the file.
+check_gateway_image_context() {
+    local dockerfile=${1:-bin/worker-gateway/Dockerfile}
+    local line word tmp
+    local -a words paths=()
+    # `COPY [--flag]... <src>... <dest>`: keep the sources. A `COPY --from=` line copies out
+    # of another build stage, not out of the context, so it is skipped.
+    while read -r line; do
+        read -r -a words <<<"$line"
+        [[ " ${words[*]} " == *" --from="* ]] && continue
+        for word in "${words[@]:1:${#words[@]}-2}"; do
+            [[ $word == --* ]] || paths+=("$word")
+        done
+    done < <(grep -E '^COPY[[:space:]]' "$dockerfile")
+    if ((${#paths[@]} == 0)); then
+        echo "check_gateway_image_context: no COPY sources in $dockerfile" >&2
+        return 1
+    fi
+    tmp=$(mktemp -d)
+    # A subshell, so its EXIT trap removes the copy when cargo fails as well as when it passes.
+    (
+        trap 'rm -rf -- "$tmp"' EXIT
+        # The sources go to git quoted, so git, not the shell, expands a glob such as
+        # `Cargo*`. The tn-contracts submodule archives as an empty directory, which is all
+        # cargo metadata needs; the gateway's own dependencies (tn-types, tn-metrics) read
+        # nothing from it. Without `-m`, tar would keep the commit time as every file's
+        # mtime, and cargo, which keys a path crate's fingerprint on its path relative to
+        # the workspace root, would then judge the copied path crates fresh against the
+        # shared target dir whenever the checkout had been checked after the commit, so a
+        # missing input would go unnoticed. `-m` stamps the copy with the extraction time,
+        # so every path crate recompiles under the copy's path.
+        git archive HEAD -- "${paths[@]}" | tar -xm -C "$tmp"
+        # --offline needs every locked crate source in CARGO_HOME.
+        run cargo fetch --locked
+        # `run` traces to stdout, which this redirect would discard with the JSON, so
+        # trace the call here: a failure then follows its own command line in the log.
+        echo "+ cargo metadata --locked --offline --format-version 1 --manifest-path $tmp/Cargo.toml"
+        cargo metadata --locked --offline --format-version 1 --manifest-path "$tmp/Cargo.toml" >/dev/null
+        # Resolving the workspace is not enough: a compile-time input of the gateway's
+        # dependencies, such as the chain-configs/ files tn-types reads with
+        # include_str!, can be missing from the COPY list and still resolve, so check
+        # the gateway in the copy too. This does not replace the standalone build in
+        # lane_test_default: that build links the production binary with the
+        # gateway's own feature set, and this check proves compile-time inputs such
+        # as chain-configs/ are in the image's COPY set. The shared target dir reuses
+        # the registry crates; the path crates recompile under the copy's path on every
+        # run, because `tar -xm` above makes their sources newer than any output.
+        CARGO_TARGET_DIR="$PWD/target" run cargo check --locked --offline \
+            -p tn-worker-gateway --bin worker-gateway --manifest-path "$tmp/Cargo.toml"
+    )
+    echo "gateway image context resolves and compiles: ${paths[*]}"
+}
+
 lane_test_default() {
     run python3 -B -I -m unittest discover -s tools/network-budget -p 'test_*.py'
     # Keep this library-only: workspace tests unify dev-dependency features and can
     # hide missing dependency features in tn-types/test-utils.
     run cargo check --locked -p tn-types --features test-utils --lib
+    # The gateway image copies only the paths its Dockerfile names, so a new workspace
+    # member, patch source or compile-time input (such as chain-configs/) missing from
+    # that COPY list fails here.
+    check_gateway_image_context
+    # The gateway ships as its own binary (bin/worker-gateway/Dockerfile builds it with
+    # -p), but the workspace build below unifies features across every member, so a
+    # feature the gateway needs and does not enable on its own dependencies still
+    # compiles there, and neither `cargo check` nor the test build links the production
+    # binary. Build it alone so a missing feature or a link failure fails here;
+    # `check_gateway_image_context` above covers the image's COPY list.
+    run cargo build --locked -p tn-worker-gateway --bin worker-gateway
     run cargo nextest run --locked --workspace "${run_mode[@]}"
 }
 
