@@ -1,22 +1,21 @@
 use jsonrpsee::server::ServerConfigBuilder;
-use reth_node_core::{args::RpcServerArgs, utils::get_or_create_jwt_secret_from_path};
-use reth_rpc::ValidationApiConfig;
+use reth_node_core::args::RpcServerArgs;
 use reth_rpc_eth_types::{EthConfig, EthStateCacheConfig, GasPriceOracleConfig};
-use reth_rpc_layer::{JwtError, JwtSecret};
+use reth_rpc_layer::JwtSecret;
 use reth_rpc_server_types::RpcModuleSelection;
-use std::{net::SocketAddr, path::PathBuf};
+use std::net::SocketAddr;
 use tower::layer::util::Identity;
-use tracing::{debug, warn};
+use tracing::warn;
 
-use crate::{
-    auth::AuthServerConfig, error::RpcError, IpcServerBuilder, RpcModuleConfig, RpcServerConfig,
-    TransportRpcModuleConfig,
-};
+use crate::{IpcServerBuilder, RpcModuleConfig, RpcServerConfig, TransportRpcModuleConfig};
 
 /// A trait that provides a configured RPC server.
 ///
 /// This provides all basic config values for the RPC server and is implemented by the
 /// [`RpcServerArgs`] type.
+///
+/// TN(TN-0010): the engine-API auth server and flashbots settings (`auth_server_config`,
+/// `auth_jwt_secret`, `flashbots_config`) are removed with the auth server and `ValidationApi`.
 pub trait RethRpcServerConfig {
     /// Returns whether ipc is enabled.
     fn is_ipc_enabled(&self) -> bool;
@@ -26,9 +25,6 @@ pub trait RethRpcServerConfig {
 
     /// The configured ethereum RPC settings.
     fn eth_config(&self) -> EthConfig;
-
-    /// The configured ethereum RPC settings.
-    fn flashbots_config(&self) -> ValidationApiConfig;
 
     /// Returns state cache configuration.
     fn state_cache_config(&self) -> EthStateCacheConfig;
@@ -56,24 +52,6 @@ pub trait RethRpcServerConfig {
 
     /// Creates the [`RpcServerConfig`] from cli args.
     fn rpc_server_config(&self) -> RpcServerConfig;
-
-    /// Creates the [`AuthServerConfig`] from cli args.
-    fn auth_server_config(&self, jwt_secret: JwtSecret) -> Result<AuthServerConfig, RpcError>;
-
-    /// The execution layer and consensus layer clients SHOULD accept a configuration parameter:
-    /// jwt-secret, which designates a file containing the hex-encoded 256 bit secret key to be used
-    /// for verifying/generating JWT tokens.
-    ///
-    /// If such a parameter is given, but the file cannot be read, or does not contain a hex-encoded
-    /// key of 256 bits, the client SHOULD treat this as an error.
-    ///
-    /// If such a parameter is not given, the client SHOULD generate such a token, valid for the
-    /// duration of the execution, and SHOULD store the hex-encoded secret as a jwt.hex file on
-    /// the filesystem. This file can then be used to provision the counterpart client.
-    ///
-    /// The `default_jwt_path` provided as an argument will be used as the default location for the
-    /// jwt secret in case the `auth_jwtsecret` argument is not provided.
-    fn auth_jwt_secret(&self, default_jwt_path: PathBuf) -> Result<JwtSecret, JwtError>;
 
     /// Returns the configured jwt secret key for the regular rpc servers, if any.
     ///
@@ -108,13 +86,6 @@ impl RethRpcServerConfig for RpcServerArgs {
             .raw_tx_forwarder(self.rpc_forwarder.clone())
             .rpc_evm_memory_limit(self.rpc_evm_memory_limit)
             .force_blob_sidecar_upcasting(self.rpc_force_blob_sidecar_upcasting)
-    }
-
-    fn flashbots_config(&self) -> ValidationApiConfig {
-        ValidationApiConfig {
-            disallow: self.builder_disallow.clone().unwrap_or_default(),
-            validation_window: self.rpc_eth_proof_window,
-        }
     }
 
     fn state_cache_config(&self) -> EthStateCacheConfig {
@@ -224,28 +195,6 @@ impl RethRpcServerConfig for RpcServerArgs {
         }
 
         config
-    }
-
-    fn auth_server_config(&self, jwt_secret: JwtSecret) -> Result<AuthServerConfig, RpcError> {
-        let address = SocketAddr::new(self.auth_addr, self.auth_port);
-
-        let mut builder = AuthServerConfig::builder(jwt_secret).socket_addr(address);
-        if self.auth_ipc {
-            builder = builder
-                .ipc_endpoint(self.auth_ipc_path.clone())
-                .with_ipc_config(self.ipc_server_builder());
-        }
-        Ok(builder.build())
-    }
-
-    fn auth_jwt_secret(&self, default_jwt_path: PathBuf) -> Result<JwtSecret, JwtError> {
-        match self.auth_jwtsecret.as_ref() {
-            Some(fpath) => {
-                debug!(target: "reth::cli", user_path=?fpath, "Reading JWT auth secret file");
-                JwtSecret::from_file(fpath)
-            }
-            None => get_or_create_jwt_secret_from_path(&default_jwt_path),
-        }
     }
 
     fn rpc_secret_key(&self) -> Option<JwtSecret> {

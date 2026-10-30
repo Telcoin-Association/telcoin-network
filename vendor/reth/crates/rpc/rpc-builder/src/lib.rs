@@ -19,7 +19,7 @@
 #![cfg_attr(not(test), warn(unused_crate_dependencies))]
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
-use crate::{auth::AuthRpcModule, error::WsHttpSamePortError, metrics::RpcRequestMetrics};
+use crate::{error::WsHttpSamePortError, metrics::RpcRequestMetrics};
 use alloy_network::{Ethereum, IntoWallet};
 use alloy_provider::{fillers::RecommendedFillers, Provider, ProviderBuilder};
 use core::marker::PhantomData;
@@ -37,8 +37,8 @@ use reth_evm::ConfigureEvm;
 use reth_network_api::{noop::NoopNetwork, NetworkInfo, Peers};
 use reth_primitives_traits::{NodePrimitives, TxTy};
 use reth_rpc::{
-    AdminApi, DebugApi, EngineEthApi, EthApi, EthApiBuilder, EthBundle, MinerApi, NetApi,
-    OtterscanApi, RPCApi, RethApi, TraceApi, TxPoolApi, Web3Api,
+    AdminApi, DebugApi, EthApi, EthApiBuilder, EthBundle, MinerApi, NetApi, OtterscanApi, RPCApi,
+    RethApi, TraceApi, TxPoolApi, Web3Api,
 };
 use reth_rpc_api::servers::*;
 use reth_rpc_eth_api::{
@@ -80,8 +80,7 @@ pub use reth_ipc::server::{
 pub use reth_rpc_server_types::{constants, RpcModuleSelection};
 pub use tower::layer::util::{Identity, Stack};
 
-/// Auth server utilities.
-pub mod auth;
+// TN(TN-0010): `pub mod auth` (the engine-API auth server) is removed.
 
 /// RPC server utilities.
 pub mod config;
@@ -322,34 +321,7 @@ where
     EvmConfig: ConfigureEvm<Primitives = N> + 'static,
     Consensus: FullConsensus<N> + Clone + 'static,
 {
-    /// Configures all [`RpcModule`]s specific to the given [`TransportRpcModuleConfig`] which can
-    /// be used to start the transport server(s).
-    ///
-    /// This behaves exactly as [`RpcModuleBuilder::build`] for the [`TransportRpcModules`], but
-    /// also configures the auth (engine api) server, which exposes a subset of the `eth_`
-    /// namespace.
-    pub fn build_with_auth_server<EthApi>(
-        self,
-        module_config: TransportRpcModuleConfig,
-        engine: impl IntoEngineApiRpcModule,
-        eth: EthApi,
-        engine_events: EventSender<ConsensusEngineEvent<N>>,
-    ) -> (
-        TransportRpcModules,
-        AuthRpcModule,
-        RpcRegistryInner<Provider, Pool, Network, EthApi, EvmConfig, Consensus>,
-    )
-    where
-        EthApi: FullEthApiServer<Provider = Provider, Pool = Pool>,
-    {
-        let config = module_config.config.clone().unwrap_or_default();
-
-        let mut registry = self.into_registry(config, eth, engine_events);
-        let modules = registry.create_transport_rpc_modules(module_config);
-        let auth_module = registry.create_auth_module(engine);
-
-        (modules, auth_module, registry)
-    }
+    // TN(TN-0010): `build_with_auth_server` (the engine-API auth server) is removed.
 
     /// Converts the builder into a [`RpcRegistryInner`] which can be used to create all
     /// components.
@@ -859,22 +831,7 @@ where
     EvmConfig: ConfigureEvm<Primitives = N> + 'static,
     Consensus: FullConsensus<N> + Clone + 'static,
 {
-    /// Configures the auth module that includes the
-    ///   * `engine_` namespace
-    ///   * `api_` namespace
-    ///
-    /// Note: This does _not_ register the `engine_` in this registry.
-    pub fn create_auth_module(&self, engine_api: impl IntoEngineApiRpcModule) -> AuthRpcModule {
-        let mut module = engine_api.into_rpc_module();
-
-        // also merge a subset of `eth_` handlers
-        let eth_handlers = self.eth_handlers();
-        let engine_eth = EngineEthApi::new(eth_handlers.api.clone(), eth_handlers.filter.clone());
-
-        module.merge(engine_eth.into_rpc()).expect("No conflicting methods");
-
-        AuthRpcModule { inner: module }
-    }
+    // TN(TN-0010): `create_auth_module` (engine API plus `EngineEthApi`) is removed.
 
     /// Helper function to create a [`RpcModule`] if it's not `None`
     fn maybe_module(&mut self, config: Option<&RpcModuleSelection>) -> Option<RpcModule<()>> {
