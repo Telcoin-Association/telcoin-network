@@ -2,7 +2,10 @@
 //!
 //! Starts the client
 use crate::{version::SHORT_VERSION, NoArgs};
-use clap::{value_parser, Parser};
+use clap::{
+    builder::{PathBufValueParser, TypedValueParser as _},
+    value_parser, Parser,
+};
 use core::fmt;
 use fdlimit::raise_fd_limit;
 use rayon::ThreadPoolBuilder;
@@ -25,8 +28,11 @@ fn parse_bootstrap_peers(
 }
 
 /// Read a bootstrap dial hints file and parse it with [`parse_bootstrap_peers`].
+///
+/// Takes the path from [`PathBufValueParser`], so a path that is not valid UTF-8 reaches the
+/// filesystem instead of failing clap's UTF-8 check.
 fn parse_bootstrap_peers_file(
-    path: &str,
+    path: PathBuf,
 ) -> Result<BTreeMap<BlsPublicKey, BootstrapServer>, String> {
     let raw = std::fs::read_to_string(path).map_err(|err| format!("cannot read file: {err}"))?;
     parse_bootstrap_peers(&raw).map_err(|err| err.to_string())
@@ -67,7 +73,7 @@ pub struct NodeCommand<Ext: clap::Args + fmt::Debug = NoArgs> {
     #[arg(
         long,
         value_name = "PATH",
-        value_parser = parse_bootstrap_peers_file,
+        value_parser = PathBufValueParser::new().try_map(parse_bootstrap_peers_file),
         conflicts_with = "bootstrap_peers"
     )]
     bootstrap_peers_file: Option<BTreeMap<BlsPublicKey, BootstrapServer>>,
@@ -521,6 +527,41 @@ mod tests {
             assert_eq!(kind, ErrorKind::ValueValidation, "{path:?}");
             assert!(message.contains(path.to_str().expect("utf-8 temp path")), "{message}");
         });
+        Ok(())
+    }
+
+    /// A file name that is not valid UTF-8 is read like any other, and a missing file under
+    /// such a name still fails at argument parsing.
+    #[cfg(unix)]
+    #[test]
+    fn bootstrap_peers_file_accepts_non_utf8_path() -> eyre::Result<()> {
+        use std::{ffi::OsStr, os::unix::ffi::OsStrExt as _};
+
+        let committee: tn_types::Committee = serde_yaml::from_str(tn_types::MAINNET_COMMITTEE)?;
+        let peers = committee.bootstrap_servers();
+        assert!(!peers.is_empty());
+        let raw = serde_yaml::to_string(&peers)?;
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join(OsStr::from_bytes(b"bootstrap-\xff.yaml"));
+        assert!(path.to_str().is_none(), "the file name must not be valid UTF-8");
+        let parse = |path: &std::path::Path| {
+            NodeCommand::<NoArgs>::try_parse_from([
+                "node".as_ref(),
+                "--bootstrap-peers-file".as_ref(),
+                path.as_os_str(),
+            ])
+        };
+
+        let missing = parse(&path).map(|_| ()).map_err(|error| (error.kind(), error.to_string()));
+        let (kind, message) = missing.expect_err("a missing file must not parse");
+        assert_eq!(kind, ErrorKind::ValueValidation);
+        assert!(message.contains(path.to_string_lossy().as_ref()), "{message}");
+
+        std::fs::write(&path, &raw)?;
+        let from_file = parse(&path)?;
+        let inline = NodeCommand::<NoArgs>::try_parse_from(["node", "--bootstrap-peers", &raw])?;
+        assert!(from_file.bootstrap_peers_file.is_some());
+        assert_eq!(from_file.bootstrap_peers_file, inline.bootstrap_peers);
         Ok(())
     }
 
