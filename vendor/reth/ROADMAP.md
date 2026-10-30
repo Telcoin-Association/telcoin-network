@@ -126,7 +126,14 @@ loop and disables EIP-4844 and EIP-7702. With the code vendored, candidates are:
 store and the 4844 paths, give batch building its own ordering, and simplify validation to TN's
 rules.
 
-## Phase 6: RPC surface [next after the Phase 1-2 test pass]
+## Phase 6: RPC surface [6a done]
+
+6a done 2026-10-30 (CHANGES.md TN-0010, TN-0011): the engine-API auth server, `EngineEthApi`,
+`ValidationApi` and `TestingApi` are gone, and with them `reth-rpc-engine-api`,
+`reth-payload-builder` and `reth-consensus-common`. `reth-rpc-layer` stays: the main server uses
+its `CompressionLayer` and optional JWT layer. Still open (6b): the unserved namespaces that cost
+no crates (`admin`, `miner`, `otterscan`, `reth`, `txpool`). Removing them is code reduction
+only. Weigh it against upstream-sync friction.
 
 TN serves only `eth`, `net`, `web3`, `debug`, `trace` and `rpc` (`ALLOWED_MODULES` in
 `tn-reth/src/cli.rs`) plus its own `tn` namespace, and overrides seven methods. The vendored

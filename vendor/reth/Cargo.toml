@@ -13,7 +13,6 @@ members = [
     "crates/chainspec/",
     "crates/cli/util/",
     "crates/config/",
-    "crates/consensus/common/",
     "crates/consensus/consensus/",
     "crates/engine/primitives/",
     "crates/errors/",
@@ -34,7 +33,6 @@ members = [
     "crates/net/peers/",
     "crates/node/core/",
     "crates/node/types",
-    "crates/payload/builder/",
     "crates/payload/builder-primitives/",
     "crates/payload/primitives/",
     "crates/primitives-traits/",
@@ -44,7 +42,6 @@ members = [
     "crates/rpc/ipc/",
     "crates/rpc/rpc-api/",
     "crates/rpc/rpc-builder/",
-    "crates/rpc/rpc-engine-api/",
     "crates/rpc/rpc-eth-api/",
     "crates/rpc/rpc-eth-types/",
     "crates/rpc/rpc-layer",
@@ -246,7 +243,6 @@ reth-codecs = { path = "crates/storage/codecs" }
 reth-codecs-derive = { path = "crates/storage/codecs/derive" }
 reth-config = { path = "crates/config", default-features = false }
 reth-consensus = { path = "crates/consensus/consensus", default-features = false }
-reth-consensus-common = { path = "crates/consensus/common", default-features = false }
 reth-db = { path = "crates/storage/db", default-features = false }
 reth-db-api = { path = "crates/storage/db-api" }
 reth-db-common = { path = "crates/storage/db-common" }
@@ -275,7 +271,6 @@ reth-network-types = { path = "crates/net/network-types" }
 reth-nippy-jar = { path = "crates/storage/nippy-jar" }
 reth-node-core = { path = "crates/node/core" }
 reth-node-types = { path = "crates/node/types" }
-reth-payload-builder = { path = "crates/payload/builder" }
 reth-payload-builder-primitives = { path = "crates/payload/builder-primitives" }
 reth-payload-primitives = { path = "crates/payload/primitives" }
 reth-primitives = { path = "crates/primitives", default-features = false }
@@ -286,7 +281,6 @@ reth-revm = { path = "crates/revm", default-features = false }
 reth-rpc = { path = "crates/rpc/rpc" }
 reth-rpc-api = { path = "crates/rpc/rpc-api" }
 reth-rpc-builder = { path = "crates/rpc/rpc-builder" }
-reth-rpc-engine-api = { path = "crates/rpc/rpc-engine-api" }
 reth-rpc-eth-api = { path = "crates/rpc/rpc-eth-api" }
 reth-rpc-eth-types = { path = "crates/rpc/rpc-eth-types", default-features = false }
 reth-rpc-layer = { path = "crates/rpc/rpc-layer" }

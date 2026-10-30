@@ -7,7 +7,6 @@ crates/chain-state
 crates/chainspec
 crates/cli/util
 crates/config
-crates/consensus/common
 crates/consensus/consensus
 crates/engine/primitives
 crates/errors
@@ -29,7 +28,6 @@ crates/net/p2p
 crates/net/peers
 crates/node/core
 crates/node/types
-crates/payload/builder
 crates/payload/builder-primitives
 crates/payload/primitives
 crates/primitives
@@ -41,7 +39,6 @@ crates/rpc/rpc
 crates/rpc/rpc-api
 crates/rpc/rpc-builder
 crates/rpc/rpc-convert
-crates/rpc/rpc-engine-api
 crates/rpc/rpc-eth-api
 crates/rpc/rpc-eth-types
 crates/rpc/rpc-layer
