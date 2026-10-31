@@ -19,8 +19,9 @@
 //! the rest) is read as one slice of the page, since a leaf cell holds its value right after its
 //! key: no copy, unless the value is in an overflow run, whose rest is joined to the subkey in a
 //! buffer of the cursor's. A move reads its row again once the move is done, through the engine's
-//! `current_with_key_tail`; `seek_by_key_subkey`, and a `walk_dup` started from a subkey, read it
-//! in the seek itself, from the leaf the seek fetched ([`Moves::seek_with_key_tail`]). The dup
+//! `current_with_key_tail`; `seek_exact`, `seek_by_key_subkey`, and a `walk_dup` started from a
+//! key or a subkey, read it in the seek itself, from the leaf the seek fetched
+//! ([`Moves::seek_dup_with_key_tail`]). The dup
 //! moves are the engine's prefix steps over the key's width: `next_dup` and `prev_dup` stay within
 //! the current key's rows, from a fresh cursor `next_dup`, `next_no_dup` and `next_dup_val` go to
 //! the first row and `prev_dup` to the last, as MDBX's do. Where MDBX's cursor ends a key's rows,
@@ -50,8 +51,12 @@ use reth_storage_errors::db::DatabaseWriteOperation;
 use std::{
     marker::PhantomData,
     ops::{Bound, RangeBounds},
+    sync::Arc,
 };
-use tndb_b::{KeyTail, ReadTxn, RoCursor, RwTxn, Table as EngineTable, TxnCursor};
+use tndb_b::{
+    DupRoCursor, DupTxnCursor, KeyTail, ReadTxn, RoCursor, RoTxn, RwTxn, Table as EngineTable,
+    TxnCursor,
+};
 
 /// A stored row: its key and value as the engine holds them.
 type Entry<'a> = (&'a [u8], &'a [u8]);
@@ -59,8 +64,8 @@ type Entry<'a> = (&'a [u8], &'a [u8]);
 /// A stored row with its value joined to its key's last bytes ([`KeyTail`]).
 type Tailed<'a> = (&'a [u8], KeyTail<'a>);
 
-/// The moves of an engine cursor: a read-only one's, or a write one's with its transaction locked
-/// ([`Locked`]). The adapter's moves ([`Rows`]) are written once over these.
+/// The moves of an engine cursor: a read-only one's ([`ReadCursor`]), or a write one's with its
+/// transaction locked ([`Locked`]). The adapter's moves ([`Rows`]) are written once over these.
 trait Moves {
     fn first(&mut self) -> tndb_b::Result<Option<Entry<'_>>>;
     fn last(&mut self) -> tndb_b::Result<Option<Entry<'_>>>;
@@ -72,49 +77,241 @@ trait Moves {
     fn next_in_prefix(&mut self, n: usize) -> tndb_b::Result<Option<Entry<'_>>>;
     fn prev_in_prefix(&mut self, n: usize) -> tndb_b::Result<Option<Entry<'_>>>;
     fn current_with_key_tail(&mut self, t: usize) -> tndb_b::Result<Option<Tailed<'_>>>;
-    /// `seek(key)` followed by `current_with_key_tail(t)`, from one leaf access.
-    fn seek_with_key_tail(&mut self, key: &[u8], t: usize) -> tndb_b::Result<Option<Tailed<'_>>>;
+    /// The first row of `key` whose subkey is at or after `subkey`, with its value joined to the
+    /// stored key's last `t` bytes, from the seek's own leaf access; never a row of another key on
+    /// a dup cursor. `key` is the table's key width (the caller checks). On a plain engine cursor
+    /// this is the engine's `seek_with_key_tail(key ‖ subkey, t)` ([`flat_seek_dup`]), which may
+    /// land on a later key's row: the caller keeps the row only if it is `key`'s.
+    fn seek_dup_with_key_tail(
+        &mut self,
+        key: &[u8],
+        subkey: &[u8],
+        t: usize,
+    ) -> tndb_b::Result<Option<Tailed<'_>>>;
 }
 
-impl Moves for RoCursor {
+/// The engine cursor under a reth read cursor, chosen at open from the table's [`DupLayout`]: a
+/// plain one (plain tables and dup-sort tables stored as composite keys) or a dup one (dup-sort
+/// tables stored as engine dup tables, [`DupLayout::nested`]).
+#[derive(Debug)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "the dup arm is the hot one; boxing it would allocate for every fresh cursor"
+)]
+pub(crate) enum ReadCursor {
+    Flat(RoCursor),
+    Dup(DupRoCursor),
+}
+
+/// The engine cursor under a reth write cursor, chosen as [`ReadCursor`]'s is.
+#[derive(Debug)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "the dup arm is the hot one; boxing it would allocate for every fresh cursor"
+)]
+pub(crate) enum WriteCursor {
+    Flat(TxnCursor),
+    Dup(DupTxnCursor),
+}
+
+/// `$call` on the engine cursor `$c` of the [`ReadCursor`] or [`WriteCursor`] `$cursor` (named by
+/// its type, `$kind`), whichever its arm: each arm's call has the same signature.
+macro_rules! on_cursor {
+    ($kind:ident, $cursor:expr, $c:ident => $call:expr) => {
+        match $cursor {
+            $kind::Flat($c) => $call,
+            $kind::Dup($c) => $call,
+        }
+    };
+}
+
+impl ReadCursor {
+    /// A new, unset cursor over `table` of the read-only transaction `txn`: a dup one if `dup`
+    /// says the table is an engine dup table, else a plain one.
+    pub(crate) fn open(
+        txn: &Arc<RoTxn>,
+        table: &EngineTable,
+        dup: Option<DupLayout>,
+    ) -> tndb_b::Result<Self> {
+        Ok(if dup.is_some_and(|dup| dup.nested) {
+            Self::Dup(txn.dup_cursor_owned(table)?)
+        } else {
+            Self::Flat(txn.cursor_owned(table)?)
+        })
+    }
+}
+
+impl Moves for ReadCursor {
     fn first(&mut self) -> tndb_b::Result<Option<Entry<'_>>> {
-        Self::first(self)
+        on_cursor!(ReadCursor, self, c => c.first())
     }
     fn last(&mut self) -> tndb_b::Result<Option<Entry<'_>>> {
-        Self::last(self)
+        on_cursor!(ReadCursor, self, c => c.last())
     }
     fn next(&mut self) -> tndb_b::Result<Option<Entry<'_>>> {
-        Self::next(self)
+        on_cursor!(ReadCursor, self, c => c.next())
     }
     fn prev(&mut self) -> tndb_b::Result<Option<Entry<'_>>> {
-        Self::prev(self)
+        on_cursor!(ReadCursor, self, c => c.prev())
     }
     fn current(&mut self) -> tndb_b::Result<Option<Entry<'_>>> {
-        Self::current(self)
+        on_cursor!(ReadCursor, self, c => c.current())
     }
     fn seek(&mut self, key: &[u8]) -> tndb_b::Result<Option<Entry<'_>>> {
-        Self::seek(self, key)
+        on_cursor!(ReadCursor, self, c => c.seek(key))
     }
     fn seek_exact(&mut self, key: &[u8]) -> tndb_b::Result<Option<&[u8]>> {
-        Self::seek_exact(self, key)
+        on_cursor!(ReadCursor, self, c => c.seek_exact(key))
     }
     fn next_in_prefix(&mut self, n: usize) -> tndb_b::Result<Option<Entry<'_>>> {
-        Self::next_in_prefix(self, n)
+        on_cursor!(ReadCursor, self, c => c.next_in_prefix(n))
     }
     fn prev_in_prefix(&mut self, n: usize) -> tndb_b::Result<Option<Entry<'_>>> {
-        Self::prev_in_prefix(self, n)
+        on_cursor!(ReadCursor, self, c => c.prev_in_prefix(n))
     }
     fn current_with_key_tail(&mut self, t: usize) -> tndb_b::Result<Option<Tailed<'_>>> {
-        Self::current_with_key_tail(self, t)
+        on_cursor!(ReadCursor, self, c => c.current_with_key_tail(t))
     }
-    fn seek_with_key_tail(&mut self, key: &[u8], t: usize) -> tndb_b::Result<Option<Tailed<'_>>> {
-        Self::seek_with_key_tail(self, key, t)
+    fn seek_dup_with_key_tail(
+        &mut self,
+        key: &[u8],
+        subkey: &[u8],
+        t: usize,
+    ) -> tndb_b::Result<Option<Tailed<'_>>> {
+        match self {
+            Self::Flat(c) => {
+                let mut stack = [0; SEEK_KEY_STACK];
+                let mut heap = Vec::new();
+                c.seek_with_key_tail(flat_seek_dup(&mut stack, &mut heap, key, subkey), t)
+            }
+            Self::Dup(c) => c.seek_dup_with_key_tail(key, subkey, t),
+        }
+    }
+}
+
+/// The seek key of a `seek_dup` on a plain engine cursor over composite rows, `key ‖ subkey`:
+/// built in `stack` ([`SEEK_KEY_STACK`] bytes), or when longer (only a raw key or subkey can be)
+/// in `heap`: the same seek either way.
+fn flat_seek_dup<'b>(
+    stack: &'b mut [u8; SEEK_KEY_STACK],
+    heap: &'b mut Vec<u8>,
+    key: &[u8],
+    subkey: &[u8],
+) -> &'b [u8] {
+    if let Some(target) = stack.get_mut(..key.len() + subkey.len()) {
+        let (key_part, subkey_part) = target.split_at_mut(key.len());
+        key_part.copy_from_slice(key);
+        subkey_part.copy_from_slice(subkey);
+        target
+    } else {
+        heap.extend_from_slice(key);
+        heap.extend_from_slice(subkey);
+        heap
+    }
+}
+
+/// The engine calls of a [`WriteCursor`], each its arm's call: the moves, which take the
+/// transaction shared (and return rows borrowing the cursor and the transaction, as a dup
+/// cursor's do), and the writes, which take it exclusively.
+impl WriteCursor {
+    /// A new, unset cursor over `table` of the write transaction `txn`, detached from it: a dup
+    /// one if `dup` says the table is an engine dup table, else a plain one.
+    pub(crate) fn open(
+        txn: &RwTxn,
+        table: &EngineTable,
+        dup: Option<DupLayout>,
+    ) -> tndb_b::Result<Self> {
+        Ok(if dup.is_some_and(|dup| dup.nested) {
+            Self::Dup(txn.dup_cursor_detached(table)?)
+        } else {
+            Self::Flat(txn.cursor_detached(table)?)
+        })
+    }
+
+    fn first<'c>(&'c mut self, txn: &'c RwTxn) -> tndb_b::Result<Option<Entry<'c>>> {
+        on_cursor!(WriteCursor, self, c => c.first(txn))
+    }
+    fn last<'c>(&'c mut self, txn: &'c RwTxn) -> tndb_b::Result<Option<Entry<'c>>> {
+        on_cursor!(WriteCursor, self, c => c.last(txn))
+    }
+    fn next<'c>(&'c mut self, txn: &'c RwTxn) -> tndb_b::Result<Option<Entry<'c>>> {
+        on_cursor!(WriteCursor, self, c => c.next(txn))
+    }
+    fn prev<'c>(&'c mut self, txn: &'c RwTxn) -> tndb_b::Result<Option<Entry<'c>>> {
+        on_cursor!(WriteCursor, self, c => c.prev(txn))
+    }
+    fn current<'c>(&'c mut self, txn: &'c RwTxn) -> tndb_b::Result<Option<Entry<'c>>> {
+        on_cursor!(WriteCursor, self, c => c.current(txn))
+    }
+    fn seek<'c>(&'c mut self, txn: &'c RwTxn, key: &[u8]) -> tndb_b::Result<Option<Entry<'c>>> {
+        on_cursor!(WriteCursor, self, c => c.seek(txn, key))
+    }
+    fn seek_exact<'c>(
+        &'c mut self,
+        txn: &'c RwTxn,
+        key: &[u8],
+    ) -> tndb_b::Result<Option<&'c [u8]>> {
+        on_cursor!(WriteCursor, self, c => c.seek_exact(txn, key))
+    }
+    fn next_in_prefix<'c>(
+        &'c mut self,
+        txn: &'c RwTxn,
+        n: usize,
+    ) -> tndb_b::Result<Option<Entry<'c>>> {
+        on_cursor!(WriteCursor, self, c => c.next_in_prefix(txn, n))
+    }
+    fn prev_in_prefix<'c>(
+        &'c mut self,
+        txn: &'c RwTxn,
+        n: usize,
+    ) -> tndb_b::Result<Option<Entry<'c>>> {
+        on_cursor!(WriteCursor, self, c => c.prev_in_prefix(txn, n))
+    }
+    fn current_with_key_tail<'c>(
+        &'c mut self,
+        txn: &'c RwTxn,
+        t: usize,
+    ) -> tndb_b::Result<Option<Tailed<'c>>> {
+        on_cursor!(WriteCursor, self, c => c.current_with_key_tail(txn, t))
+    }
+    /// See [`Moves::seek_dup_with_key_tail`].
+    fn seek_dup_with_key_tail<'c>(
+        &'c mut self,
+        txn: &'c RwTxn,
+        key: &[u8],
+        subkey: &[u8],
+        t: usize,
+    ) -> tndb_b::Result<Option<Tailed<'c>>> {
+        match self {
+            Self::Flat(c) => {
+                let mut stack = [0; SEEK_KEY_STACK];
+                let mut heap = Vec::new();
+                c.seek_with_key_tail(txn, flat_seek_dup(&mut stack, &mut heap, key, subkey), t)
+            }
+            Self::Dup(c) => c.seek_dup_with_key_tail(txn, key, subkey, t),
+        }
+    }
+    fn follower_shares_prefix(&mut self, txn: &RwTxn, n: usize) -> tndb_b::Result<bool> {
+        on_cursor!(WriteCursor, self, c => c.follower_shares_prefix(txn, n))
+    }
+
+    fn put(&mut self, txn: &mut RwTxn, key: &[u8], value: &[u8]) -> tndb_b::Result<()> {
+        on_cursor!(WriteCursor, self, c => c.put(txn, key, value))
+    }
+    fn insert(&mut self, txn: &mut RwTxn, key: &[u8], value: &[u8]) -> tndb_b::Result<()> {
+        on_cursor!(WriteCursor, self, c => c.insert(txn, key, value))
+    }
+    fn append(&mut self, txn: &mut RwTxn, key: &[u8], value: &[u8]) -> tndb_b::Result<()> {
+        on_cursor!(WriteCursor, self, c => c.append(txn, key, value))
+    }
+    fn delete_current(&mut self, txn: &mut RwTxn) -> tndb_b::Result<bool> {
+        on_cursor!(WriteCursor, self, c => c.delete_current(txn))
     }
 }
 
 /// A write cursor with its transaction locked, for one call.
 struct Locked<'c, 't> {
-    cursor: &'c mut TxnCursor,
+    cursor: &'c mut WriteCursor,
     txn: &'t RwTxn,
 }
 
@@ -149,8 +346,13 @@ impl Moves for Locked<'_, '_> {
     fn current_with_key_tail(&mut self, t: usize) -> tndb_b::Result<Option<Tailed<'_>>> {
         self.cursor.current_with_key_tail(self.txn, t)
     }
-    fn seek_with_key_tail(&mut self, key: &[u8], t: usize) -> tndb_b::Result<Option<Tailed<'_>>> {
-        self.cursor.seek_with_key_tail(self.txn, key, t)
+    fn seek_dup_with_key_tail(
+        &mut self,
+        key: &[u8],
+        subkey: &[u8],
+        t: usize,
+    ) -> tndb_b::Result<Option<Tailed<'_>>> {
+        self.cursor.seek_dup_with_key_tail(self.txn, key, subkey, t)
     }
 }
 
@@ -205,19 +407,21 @@ struct Rows {
     end_key: Vec<u8>,
 }
 
-/// The width of the stack buffer a `seek_by_key_subkey` key, `key ‖ subkey`, is built in
-/// ([`Rows::seek_by_key_subkey_row`]). Every layout's `key + subkey` fits (`StoragesTrie`'s 97
-/// bytes is the widest), so building the seek key from reth's encoded keys allocates nothing; only
-/// a longer raw input takes a `Vec`. The encodes themselves may allocate: `StoragesTrie`'s subkey,
-/// `StoredNibblesSubKey`, encodes to a `Vec`.
+/// The width of the stack buffer a `seek_by_key_subkey` key, `key ‖ subkey`, is built in on a
+/// plain engine cursor ([`flat_seek_dup`]). Every layout's `key + subkey` fits (`StoragesTrie`'s
+/// 97 bytes is the widest), so building the seek key from reth's encoded keys allocates nothing;
+/// only a longer raw input takes a `Vec`. The encodes themselves may allocate: `StoragesTrie`'s
+/// subkey, `StoredNibblesSubKey`, encodes to a `Vec`.
 const SEEK_KEY_STACK: usize = 128;
 
-// Every layout's `key ‖ subkey` fits the stack buffer, checked at compile time.
+// Every layout's `key ‖ subkey` fits the stack buffer, and its key width the engine's `u16`
+// `DupOptions::key_len` ([`DupLayout::options`]), checked at compile time.
 const _: () = {
     let mut i = 0;
     while i < DUP_LAYOUTS.len() {
         let layout = DUP_LAYOUTS[i].1;
         assert!(layout.key + layout.subkey <= SEEK_KEY_STACK);
+        assert!(layout.key <= u16::MAX as usize);
         i += 1;
     }
 };
@@ -368,17 +572,16 @@ impl Rows {
         pair!(self, m, entry)
     }
 
-    /// The row `key` (on a dup-sort table, its first): a `seek`, then a check that the row found
-    /// is the key's. A miss leaves the cursor unset ([`Pos::Missed`]).
+    /// The row `key` (on a dup-sort table, its first: [`Rows::seek_by_key_subkey_row`] with an
+    /// empty subkey). A miss leaves the cursor unset ([`Pos::Missed`]).
     fn seek_exact<T: Table>(&mut self, m: &mut impl Moves, key: &[u8]) -> PairResult<T> {
-        let found = match self.dup {
-            None => m.seek_exact(key).map_err(error::read)?.map(|value| (key, value)),
-            Some(dup) => {
-                m.seek(key).map_err(error::read)?.filter(|&(stored, _)| dup.is_row_of(stored, key))
-            }
+        let Some(dup) = self.dup else {
+            let found = m.seek_exact(key).map_err(error::read)?.map(|value| (key, value));
+            self.pos = if found.is_some() { Pos::Engine } else { Pos::Missed };
+            return plain::<T>(found);
         };
-        self.pos = if found.is_some() { Pos::Engine } else { Pos::Missed };
-        pair!(self, m, found)
+        let row = self.seek_by_key_subkey_row(m, dup, key, &[])?;
+        dup_decoded::<T>(dup, row)
     }
 
     fn next<T: Table>(&mut self, m: &mut impl Moves) -> PairResult<T> {
@@ -435,11 +638,10 @@ impl Rows {
     }
 
     /// Move to the first row of `key` whose subkey is at or after `subkey` (MDBX's
-    /// `get_both_range`) and return it, as [`Rows::dup_row`] does: a `seek` of `key ‖ subkey`,
-    /// never past the key's rows, that reads the row it lands on from the same leaf access
-    /// ([`Moves::seek_with_key_tail`]). A miss leaves the cursor unset ([`Pos::Missed`]). The seek
-    /// key is built on the stack ([`SEEK_KEY_STACK`] bytes), or when longer (only a raw key or
-    /// subkey can be) in a `Vec` of its own: the same seek either way.
+    /// `get_both_range`) and return it, as [`Rows::dup_row`] does: never a row of another key, read
+    /// from the leaf access of the seek itself ([`Moves::seek_dup_with_key_tail`]). A miss, and a
+    /// `key` of another width than the table's (only a raw key can be: no row's, so no engine
+    /// call), leaves the cursor unset ([`Pos::Missed`]).
     fn seek_by_key_subkey_row<'a>(
         &'a mut self,
         m: &'a mut impl Moves,
@@ -447,19 +649,12 @@ impl Rows {
         key: &[u8],
         subkey: &[u8],
     ) -> Result<Option<Entry<'a>>, DatabaseError> {
-        let mut stack = [0; SEEK_KEY_STACK];
-        let heap;
-        let target = if let Some(target) = stack.get_mut(..key.len() + subkey.len()) {
-            let (key_part, subkey_part) = target.split_at_mut(key.len());
-            key_part.copy_from_slice(key);
-            subkey_part.copy_from_slice(subkey);
-            &*target
-        } else {
-            heap = [key, subkey].concat();
-            &heap
-        };
+        if key.len() != dup.key {
+            self.pos = Pos::Missed;
+            return Ok(None);
+        }
         let row = m
-            .seek_with_key_tail(target, dup.subkey)
+            .seek_dup_with_key_tail(key, subkey, dup.subkey)
             .map_err(error::read)?
             .filter(|&(stored, _)| dup.is_row_of(stored, key));
         self.pos = if row.is_some() { Pos::Engine } else { Pos::Missed };
@@ -786,23 +981,24 @@ macro_rules! dup_reads {
 }
 
 /// A cursor over one table of a read-only transaction ([`crate::TndbTx`]): the engine's
-/// [`RoCursor`], which owns a share of the transaction.
+/// [`RoCursor`] or, on an engine dup table, [`DupRoCursor`] (`ReadCursor`), which owns a share
+/// of the transaction.
 #[derive(Debug)]
 pub struct TndbCursor<T: Table> {
-    cursor: RoCursor,
+    cursor: ReadCursor,
     rows: Rows,
     _table: PhantomData<T>,
 }
 
 impl<T: Table> TndbCursor<T> {
-    pub(crate) const fn new(cursor: RoCursor, dup: Option<DupLayout>) -> Self {
+    pub(crate) const fn new(cursor: ReadCursor, dup: Option<DupLayout>) -> Self {
         Self { cursor, rows: Rows::new(dup), _table: PhantomData }
     }
 
     /// Run `f` on the cursor's rows and its engine cursor.
     fn with<R>(
         &mut self,
-        f: impl FnOnce(&mut Rows, &mut RoCursor) -> Result<R, DatabaseError>,
+        f: impl FnOnce(&mut Rows, &mut ReadCursor) -> Result<R, DatabaseError>,
     ) -> Result<R, DatabaseError> {
         f(&mut self.rows, &mut self.cursor)
     }
@@ -817,7 +1013,8 @@ impl<T: DupSort> DbDupCursorRO<T> for TndbCursor<T> {
 }
 
 /// A cursor over one table of a read-write transaction ([`crate::TndbTxMut`]): the engine's
-/// detached [`TxnCursor`], with a share of the transaction. Each call locks the transaction,
+/// detached [`TxnCursor`] or, on an engine dup table, [`DupTxnCursor`] (`WriteCursor`), with a
+/// share of the transaction. Each call locks the transaction,
 /// moves or writes, decodes, and unlocks. Several cursors and the transaction's own writes see
 /// each other's changes: a cursor whose row another one deleted is on the row's follower, as if it
 /// had deleted the row itself, as an MDBX cursor is (the crate docs list the two cases where it is
@@ -828,7 +1025,7 @@ pub struct TndbCursorMut<T: Table> {
     txn: SharedTxn,
     /// The engine's handle on the table, for a lookup apart from the cursor.
     table: EngineTable,
-    cursor: TxnCursor,
+    cursor: WriteCursor,
     rows: Rows,
     /// The compressed value of the last write (reused).
     buf: Vec<u8>,
@@ -841,7 +1038,7 @@ impl<T: Table> TndbCursorMut<T> {
     pub(crate) const fn new(
         txn: SharedTxn,
         table: EngineTable,
-        cursor: TxnCursor,
+        cursor: WriteCursor,
         dup: Option<DupLayout>,
     ) -> Self {
         Self {
@@ -943,15 +1140,9 @@ impl<T: Table> TndbCursorMut<T> {
             DatabaseWriteOperation::CursorUpsert => insert_dup_at(cursor, txn, table, stored, rest),
             DatabaseWriteOperation::CursorInsert => {
                 // MDBX refuses a key that has any row, and leaves the cursor on its first. The
-                // key's rows are looked for apart from the cursor, so a row the engine refuses (by
-                // its size) leaves the cursor where it was.
-                let row_of_key =
-                    |found: Option<Entry<'_>>| found.is_some_and(|(f, _)| dup.is_row_of(f, key));
-                let taken = txn
-                    .cursor(table)
-                    .and_then(|mut rows_of| rows_of.seek(key).map(row_of_key))
-                    .map_err(fail)?;
-                if taken {
+                // key's rows are looked for apart from the cursor ([`has_rows`]), so a row the
+                // engine refuses (by its size) leaves the cursor where it was.
+                if has_rows(txn, table, dup, key).map_err(fail)? {
                     cursor.seek(txn, key).and(Err(tndb_b::Error::KeyExists))
                 } else {
                     cursor.insert(txn, stored, rest).map(|()| true)
@@ -960,15 +1151,10 @@ impl<T: Table> TndbCursorMut<T> {
             DatabaseWriteOperation::CursorAppend => match cursor.append(txn, stored, rest) {
                 // MDBX's append to a dup-sort table also takes the last key again, with a value
                 // anywhere among its rows; a smaller key is refused with the cursor on the last
-                // row, as after `last`. The last row is looked for apart from the cursor, so a
-                // refused second value leaves the cursor where it was.
+                // row, as after `last`. The last row is looked for apart from the cursor
+                // ([`last_is_row_of`]), so a refused second value leaves the cursor where it was.
                 Err(tndb_b::Error::AppendOutOfOrder) => {
-                    let last_key = txn
-                        .cursor(table)
-                        .and_then(|mut rows_of| rows_of.last().map(|last| last.map(|(f, _)| f)))
-                        .map_err(fail)?
-                        .is_some_and(|found| dup.is_row_of(found, key));
-                    if last_key {
+                    if last_is_row_of(txn, table, dup, key).map_err(fail)? {
                         insert_dup_at(cursor, txn, table, stored, rest)
                     } else {
                         cursor.last(txn).map_err(fail)?;
@@ -1019,7 +1205,7 @@ impl<T: Table> TndbCursorMut<T> {
 /// cursor on it, as MDBX's put of a pair it holds does; a second value for the subkey (`Ok(false)`)
 /// leaves it where it was, since a refused insert does not move the engine's cursor.
 fn insert_dup_at(
-    cursor: &mut TxnCursor,
+    cursor: &mut WriteCursor,
     txn: &mut RwTxn,
     table: &EngineTable,
     stored: &[u8],
@@ -1034,6 +1220,37 @@ fn insert_dup_at(
         }
         inserted => inserted.map(|()| true),
     }
+}
+
+/// Whether `key` (the table's key width) has a row in the dup-sort table `table`, looked for by
+/// an engine cursor of its own, so the caller's is not moved: on an engine dup table a detached
+/// dup cursor's `seek_key`, else a plain cursor's `seek` and [`DupLayout::is_row_of`].
+pub(crate) fn has_rows(
+    txn: &RwTxn,
+    table: &EngineTable,
+    dup: DupLayout,
+    key: &[u8],
+) -> tndb_b::Result<bool> {
+    if dup.nested {
+        return Ok(txn.dup_cursor_detached(table)?.seek_key(txn, key)?.is_some());
+    }
+    Ok(txn.cursor(table)?.seek(key)?.is_some_and(|(found, _)| dup.is_row_of(found, key)))
+}
+
+/// Whether the last row of the dup-sort table `table` is a row of `key`, looked for as
+/// [`has_rows`] looks, with `last`.
+pub(crate) fn last_is_row_of(
+    txn: &RwTxn,
+    table: &EngineTable,
+    dup: DupLayout,
+    key: &[u8],
+) -> tndb_b::Result<bool> {
+    let row_of_key =
+        |last: Option<Entry<'_>>| last.is_some_and(|(found, _)| dup.is_row_of(found, key));
+    if dup.nested {
+        return Ok(row_of_key(txn.dup_cursor_detached(table)?.last(txn)?));
+    }
+    Ok(row_of_key(txn.cursor(table)?.last()?))
 }
 
 impl<T: Table> DbCursorRW<T> for TndbCursorMut<T> {
@@ -1121,10 +1338,18 @@ impl<T: DupSort> DbDupCursorRW<T> for TndbCursorMut<T> {
             Some((stored, _)) => dup.split(stored).ok_or(DatabaseError::Decode)?.0.to_vec(),
             None => return Err(no_data()),
         };
-        self.cursor.seek(txn, &key).map_err(error::delete)?;
-        while self.cursor.delete_current(txn).map_err(error::delete)? {
-            if self.cursor.next_in_prefix(txn, dup.key).map_err(error::delete)?.is_none() {
-                break;
+        if dup.nested {
+            // The key's tree in one walk. The cursor is stale after it: its next call finds its
+            // place again by its row's key, the next key's first row in the deleted state, where
+            // the loop below leaves it.
+            let deleted = txn.delete_prefix(&self.table, &key).map_err(error::delete)?;
+            debug_assert!(deleted > 0, "the cursor's row was a row of the key");
+        } else {
+            self.cursor.seek(txn, &key).map_err(error::delete)?;
+            while self.cursor.delete_current(txn).map_err(error::delete)? {
+                if self.cursor.next_in_prefix(txn, dup.key).map_err(error::delete)?.is_none() {
+                    break;
+                }
             }
         }
         self.rows.pos = Pos::KeyDeleted;

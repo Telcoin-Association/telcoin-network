@@ -5,8 +5,9 @@
 
 use super::{dup::error_name, mdbx_port::create_test_db};
 use crate::{
+    cursor::{ReadCursor, WriteCursor},
     env::{warning_due, NEVER_WARNED},
-    error, TndbArgs, TndbEnv, TndbEnvKind,
+    error, TndbArgs, TndbCursor, TndbCursorMut, TndbEnv, TndbEnvKind,
 };
 use alloy::primitives::{Address, Bytes, B256, U256};
 use reth_db::{mdbx::DatabaseArguments, ClientVersion, DatabaseEnv, DatabaseEnvKind};
@@ -18,7 +19,7 @@ use reth_db_api::{
     table::Table,
     tables::{
         Bytecodes, CanonicalHeaders, PlainAccountState, PlainStorageState, RawKey, RawTable,
-        RawValue, Tables, Transactions,
+        RawValue, StorageChangeSets, Tables, Transactions,
     },
     transaction::{DbTx, DbTxMut},
     DatabaseError,
@@ -320,6 +321,59 @@ fn a_table_created_after_open_is_found_by_name() {
     assert_eq!(tx.get::<CanonicalHeaders>(1).unwrap(), Some(B256::with_last_byte(1)));
     assert_eq!(tx.entries::<CanonicalHeaders>().unwrap(), 1);
     assert_eq!(tx.cursor_read::<CanonicalHeaders>().unwrap().last().unwrap().unwrap().0, 1);
+}
+
+/// A table the file holds in another form than this build's layout stores it in is refused with
+/// `MDBX_INCOMPATIBLE` and a message naming both forms: by a transaction that finds it after the
+/// open, by `create_tables`, and at open (read-write and read-only). Here `StorageChangeSets`,
+/// whose rows are composite keys in a plain engine table, is made an engine dup table by hand. A
+/// file whose every table has its layout's form opens.
+#[test]
+fn a_table_in_another_form_than_its_layout_is_refused() {
+    let refused = |result: Result<(), DatabaseError>| match result.err() {
+        Some(DatabaseError::Open(info)) => {
+            assert_eq!(info.code, Error::Incompatible.to_err_code());
+            info.message.to_string()
+        }
+        other => panic!("not refused at open: {:?}", other.map(dbg)),
+    };
+    let message = "table StorageChangeSets is stored as a dup table with key_len 28, this build \
+                   stores it as a plain table; the file was written by another tndb-b-reth layout";
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = super::open_env(dir.path(), TndbEnvKind::RW, TndbArgs::default()).unwrap();
+    let mut txn = db.env().begin_rw().unwrap();
+    let options = tndb_b::DupOptions { key_len: 28, packed_max: 0 };
+    let table = txn.create_dup_table(StorageChangeSets::NAME, options).unwrap();
+    txn.put(&table, &[7; 60], &[1]).unwrap();
+    txn.commit().unwrap();
+    assert_eq!(refused(db.tx().unwrap().entries::<StorageChangeSets>().map(drop)), message);
+    assert_eq!(
+        refused(db.tx_mut().unwrap().cursor_write::<StorageChangeSets>().map(drop)),
+        message
+    );
+    assert!(matches!(
+        db.create_tables().unwrap_err(),
+        DatabaseError::CreateTable(info) if info == Error::Incompatible.into()));
+    drop(db);
+    for kind in [TndbEnvKind::RW, TndbEnvKind::RO] {
+        assert_eq!(
+            refused(super::open_env(dir.path(), kind, TndbArgs::default()).map(drop)),
+            message
+        );
+    }
+    // Every table in its layout's form: reopened, read and written.
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = super::open_env(dir.path(), TndbEnvKind::RW, TndbArgs::default()).unwrap();
+    db.create_tables().unwrap();
+    let row = StorageEntry { key: B256::with_last_byte(1), value: U256::from(2) };
+    db.update(|tx| tx.put::<PlainStorageState>(Address::with_last_byte(1), row)).unwrap().unwrap();
+    drop(db);
+    let db = super::open_env(dir.path(), TndbEnvKind::RW, TndbArgs::default()).unwrap();
+    assert_eq!(
+        db.tx().unwrap().get::<PlainStorageState>(Address::with_last_byte(1)).unwrap(),
+        Some(row)
+    );
+    assert_eq!(db.tx().unwrap().entries::<StorageChangeSets>().unwrap(), 0);
 }
 
 #[test]
@@ -1023,4 +1077,23 @@ fn name_hasher_separates_reths_tables() {
     let hasher = std::hash::BuildHasherDefault::<NameHasher>::default();
     let hashes: BTreeSet<u64> = Tables::ALL.iter().map(|t| hasher.hash_one(t.name())).collect();
     assert_eq!(hashes.len(), Tables::ALL.len());
+}
+
+/// The reth cursors hold their engine cursor inline ([`ReadCursor`], [`WriteCursor`]), as large
+/// as its larger arm plus at most a tag word (neither arm boxed, never both held), and beside it
+/// only the adapter's own fields: 80 bytes for a read cursor (its `Rows`), 160 for a write cursor
+/// (`Rows`, the shared transaction, the table handle and two buffers).
+#[cfg(target_pointer_width = "64")]
+#[test]
+fn tndb_cursors_stay_small() {
+    use std::mem::size_of;
+    use tndb_b::{DupRoCursor, DupTxnCursor, RoCursor, TxnCursor};
+    let read = size_of::<RoCursor>().max(size_of::<DupRoCursor>());
+    let write = size_of::<TxnCursor>().max(size_of::<DupTxnCursor>());
+    assert!(size_of::<ReadCursor>() <= read + 8, "{}", size_of::<ReadCursor>());
+    assert!(size_of::<WriteCursor>() <= write + 8, "{}", size_of::<WriteCursor>());
+    let cursor = size_of::<TndbCursor<PlainStorageState>>();
+    assert!(cursor <= read + 8 + 80, "{cursor} over {read}");
+    let cursor = size_of::<TndbCursorMut<PlainStorageState>>();
+    assert!(cursor <= write + 8 + 160, "{cursor} over {write}");
 }

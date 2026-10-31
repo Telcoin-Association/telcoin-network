@@ -129,6 +129,29 @@ pub(crate) const fn finished() -> tndb_b::Error {
     tndb_b::Error::WrongTxn
 }
 
+/// The error for a table whose form in the file (`found`: an engine dup table's options, `None`
+/// for a plain table) is not the one this build's layout stores it in (`expected`, from
+/// [`crate::dup::DupLayout::options`]): `MDBX_INCOMPATIBLE`, as [`DatabaseError::Open`], with this
+/// crate's message naming the table and both forms. A layout change is a format change for every
+/// file holding the table, so such a file is refused at open rather than at its first cursor.
+pub(crate) fn form_mismatch(
+    table: &str,
+    found: Option<tndb_b::DupOptions>,
+    expected: Option<tndb_b::DupOptions>,
+) -> DatabaseError {
+    let form = |dup: Option<tndb_b::DupOptions>| match dup {
+        Some(options) => format!("a dup table with key_len {}", options.key_len),
+        None => "a plain table".to_string(),
+    };
+    let message = format!(
+        "table {table} is stored as {}, this build stores it as {}; the file was written by \
+         another tndb-b-reth layout",
+        form(found),
+        form(expected)
+    );
+    DatabaseError::Open(Mdbx::INCOMPATIBLE.with_message(message))
+}
+
 /// The error for a dup-sort table this crate does not store, and for a dup cursor call on a
 /// table without duplicates.
 pub(crate) fn dup_sort_unsupported(table: &'static str) -> DatabaseError {

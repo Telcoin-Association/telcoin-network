@@ -1,7 +1,7 @@
 //! reth's transactions: [`TndbTx`] (read-only) and [`TndbTxMut`] (read-write).
 
 use crate::{
-    cursor::{TndbCursor, TndbCursorMut},
+    cursor::{last_is_row_of, ReadCursor, TndbCursor, TndbCursorMut, WriteCursor},
     dup::DupLayout,
     env::{resolve, ReaderWatch, TableMap},
     error::{self, Mdbx},
@@ -14,7 +14,7 @@ use reth_db_api::{
 };
 use reth_storage_errors::db::DatabaseWriteOperation;
 use std::sync::Arc;
-use tndb_b::{ReadTxn, RoTxn, RwTxn, Table as EngineTable};
+use tndb_b::{KeyTail, ReadTxn, RoTxn, RwTxn, Table as EngineTable};
 
 /// A write transaction shared by its handle and its cursors. `None` once it committed or
 /// aborted: a cursor that outlives it then gets `MDBX_BAD_TXN`.
@@ -38,14 +38,30 @@ fn decompress<T: Table>(bytes: Option<&[u8]>) -> Result<Option<T::Value>, Databa
 /// The value of `key` in table `T` (on a dup-sort table, the key's first, as MDBX's `get`
 /// returns), read through `txn`.
 fn get_value<T: Table>(
-    txn: &impl ReadTxn,
+    txn: &impl DupLookup,
     (table, dup): (&EngineTable, Option<DupLayout>),
     key: &[u8],
 ) -> Result<Option<T::Value>, DatabaseError> {
     let Some(dup) = dup else {
-        return decompress::<T>(txn.get(table, key).map_err(error::read)?);
+        return decompress::<T>(txn.reads().get(table, key).map_err(error::read)?);
     };
-    let mut cursor = txn.cursor(table).map_err(error::read)?;
+    let mut value = Vec::new();
+    if dup.nested {
+        // A key of another width is no row's (the engine would refuse it).
+        if key.len() != dup.key {
+            return Ok(None);
+        }
+        return txn
+            .first_row_of(table, key, dup.subkey, |row| {
+                let Some((stored, tail)) = row.filter(|&(stored, _)| dup.is_row_of(stored, key))
+                else {
+                    return Ok(None);
+                };
+                decompress::<T>(dup.joined(stored, tail, &mut value))
+            })
+            .map_err(error::read)?;
+    }
+    let mut cursor = txn.reads().cursor(table).map_err(error::read)?;
     if !cursor.seek(key).map_err(error::read)?.is_some_and(|(stored, _)| dup.is_row_of(stored, key))
     {
         return Ok(None);
@@ -54,8 +70,66 @@ fn get_value<T: Table>(
     else {
         return Ok(None);
     };
-    let mut value = Vec::new();
     decompress::<T>(dup.joined(stored, tail, &mut value))
+}
+
+/// A transaction [`get_value`] reads through: its [`ReadTxn`] calls, and the lookup of an outer
+/// key's first row in an engine dup table, by a dup cursor of the transaction's kind (a read-only
+/// transaction's owns a share of it, a write transaction's is detached).
+trait DupLookup {
+    /// The transaction's [`ReadTxn`].
+    type Reads: ReadTxn;
+
+    fn reads(&self) -> &Self::Reads;
+
+    /// `f` of the first row of the outer key `key` (the table's key width) in the engine dup
+    /// table `table`, with its value joined to its stored key's last `t` bytes; `None` if `key`
+    /// has no row.
+    fn first_row_of<R>(
+        &self,
+        table: &EngineTable,
+        key: &[u8],
+        t: usize,
+        f: impl FnOnce(Option<(&[u8], KeyTail<'_>)>) -> R,
+    ) -> tndb_b::Result<R>;
+}
+
+impl DupLookup for Arc<RoTxn> {
+    type Reads = RoTxn;
+
+    fn reads(&self) -> &RoTxn {
+        self
+    }
+
+    fn first_row_of<R>(
+        &self,
+        table: &EngineTable,
+        key: &[u8],
+        t: usize,
+        f: impl FnOnce(Option<(&[u8], KeyTail<'_>)>) -> R,
+    ) -> tndb_b::Result<R> {
+        let mut cursor = self.dup_cursor_owned(table)?;
+        Ok(f(cursor.seek_dup_with_key_tail(key, &[], t)?))
+    }
+}
+
+impl DupLookup for RwTxn {
+    type Reads = Self;
+
+    fn reads(&self) -> &Self {
+        self
+    }
+
+    fn first_row_of<R>(
+        &self,
+        table: &EngineTable,
+        key: &[u8],
+        t: usize,
+        f: impl FnOnce(Option<(&[u8], KeyTail<'_>)>) -> R,
+    ) -> tndb_b::Result<R> {
+        let mut cursor = self.dup_cursor_detached(table)?;
+        Ok(f(cursor.seek_dup_with_key_tail(self, key, &[], t)?))
+    }
 }
 
 /// A read-only transaction: one committed state, unaffected by later commits. Its cursors
@@ -85,7 +159,7 @@ impl DbTx for TndbTx {
         key: &<T::Key as Encode>::Encoded,
     ) -> Result<Option<T::Value>, DatabaseError> {
         let entry = resolve::<T>(&self.tables, &*self.txn)?;
-        get_value::<T>(&*self.txn, entry.check::<T>()?, key.as_ref())
+        get_value::<T>(&self.txn, entry.check::<T>()?, key.as_ref())
     }
 
     /// Ends the transaction; a read-only one has nothing to commit.
@@ -98,8 +172,8 @@ impl DbTx for TndbTx {
     fn cursor_read<T: Table>(&self) -> Result<Self::Cursor<T>, DatabaseError> {
         let entry = resolve::<T>(&self.tables, &*self.txn)?;
         let (table, dup) = entry.check::<T>()?;
-        let cursor =
-            self.txn.cursor_owned(table).map_err(|e| DatabaseError::InitCursor(error::info(&e)))?;
+        let cursor = ReadCursor::open(&self.txn, table, dup)
+            .map_err(|e| DatabaseError::InitCursor(error::info(&e)))?;
         Ok(TndbCursor::new(cursor, dup))
     }
 
@@ -192,8 +266,7 @@ impl TndbTxMut {
             let stored_row = if append {
                 match txn.append(table, &stored, rest) {
                     Err(tndb_b::Error::AppendOutOfOrder) => {
-                        let last = txn.cursor(table).map_err(fail)?.last().map_err(fail)?;
-                        if last.is_some_and(|(found, _)| dup.is_row_of(found, key)) {
+                        if last_is_row_of(txn, table, dup, key).map_err(fail)? {
                             insert_dup(txn, table, &stored, rest)
                         } else {
                             Err(tndb_b::Error::AppendOutOfOrder)
@@ -354,7 +427,7 @@ impl DbTxMut for TndbTxMut {
         let (table, cursor, dup) = self.with(init_error, |txn| {
             let entry = resolve::<T>(&self.tables, txn)?;
             let (table, dup) = entry.check::<T>()?;
-            Ok((table.clone(), txn.cursor_detached(table).map_err(init_error)?, dup))
+            Ok((table.clone(), WriteCursor::open(txn, table, dup).map_err(init_error)?, dup))
         })?;
         Ok(TndbCursorMut::new(Arc::clone(&self.txn), table, cursor, dup))
     }
@@ -366,13 +439,20 @@ impl DbTxMut for TndbTxMut {
 
 impl TableImporter for TndbTxMut {}
 
-/// Deletes every row of `key` in a dup-sort table; `true` if there was one.
+/// Deletes every row of `key` in a dup-sort table; `true` if there was one. On an engine dup
+/// table the key's tree goes in one walk (a key of another width is no row's).
 fn delete_rows_of(
     txn: &mut RwTxn,
     table: &EngineTable,
     dup: DupLayout,
     key: &[u8],
 ) -> Result<bool, DatabaseError> {
+    if dup.nested {
+        if key.len() != dup.key {
+            return Ok(false);
+        }
+        return Ok(txn.delete_prefix(table, key).map_err(error::delete)? > 0);
+    }
     let mut cursor = txn.cursor_mut(table).map_err(error::delete)?;
     let first = cursor.seek(key).map_err(error::delete)?;
     if !first.is_some_and(|(stored, _)| dup.is_row_of(stored, key)) {

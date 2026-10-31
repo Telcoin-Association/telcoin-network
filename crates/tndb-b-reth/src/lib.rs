@@ -35,19 +35,20 @@
 //! stored value is the rest. A leaf cell holds its value right after its key, so a read takes the
 //! value, the key's last W bytes then the rest, as one slice of the page (the engine's
 //! `current_with_key_tail`), with no copy; only a value in an overflow run is joined in a buffer
-//! of the cursor's. `seek_by_key_subkey` reads its row in the seek itself, from the leaf the seek
-//! fetched (the engine's `seek_with_key_tail`). Since each table's keys have one width, the rows
-//! sort by key, then by subkey, as MDBX sorts a key's values. A row this layout cannot hold (a
-//! value shorter than W, or a key of another width) is refused with `MDBX_BAD_VALSIZE`. Another
-//! dup-sort table (reth has none) is created, counted and cleared, but every other access to its
-//! rows is refused with a [`DatabaseError::Other`](reth_db_api::DatabaseError), as is a dup cursor
-//! call on a table without duplicates. reth's calls map onto the engine's ordered rows:
+//! of the cursor's. A cursor's `seek_exact` and `seek_by_key_subkey` read their row in the seek
+//! itself, from the leaf the seek fetched (the engine's `seek_with_key_tail`). Since each table's
+//! keys have one width, the rows sort by key, then by subkey, as MDBX sorts a key's values. A row
+//! this layout cannot hold (a value shorter than W, or a key of another width) is refused with
+//! `MDBX_BAD_VALSIZE`. Another dup-sort table (reth has none) is created, counted and cleared, but
+//! every other access to its rows is refused with a
+//! [`DatabaseError::Other`](reth_db_api::DatabaseError), as is a dup cursor call on a table without
+//! duplicates. reth's calls map onto the engine's ordered rows:
 //!
 //! | reth | here |
 //! |---|---|
-//! | `get(k)`, `seek_exact(k)` | `seek(k)`, and the row found must be `k`'s: the key's first value |
+//! | `get(k)`, `seek_exact(k)` | `seek(k)` (a cursor's `seek_exact` as `seek_by_key_subkey(k, [])`), and the row found must be `k`'s: the key's first value; a `k` of another width than the key's misses with no seek |
 //! | `seek(k)` | `seek(k)`: the first row of the first key at or after `k` |
-//! | `seek_by_key_subkey(k, s)` | `seek_with_key_tail(k ‖ s, W)`: `seek(k ‖ s)` and the row's read from one leaf access, `k ‖ s` built on the stack; the row found must be `k`'s (MDBX's `get_both_range` never leaves the key) |
+//! | `seek_by_key_subkey(k, s)` | `seek_with_key_tail(k ‖ s, W)`: `seek(k ‖ s)` and the row's read from one leaf access, `k ‖ s` built on the stack; the row found must be `k`'s (MDBX's `get_both_range` never leaves the key); a `k` of another width misses with no seek |
 //! | `next_dup`, `prev_dup`, `next_dup_val` | the engine's prefix steps over the key's width |
 //! | `next_no_dup` | `seek(k ‖ 0xFF × (W + 1))`, past every row of `k`, when another row of `k` follows; else `next` |
 //! | `last_dup` | that seek, then `prev` |

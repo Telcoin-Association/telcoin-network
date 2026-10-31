@@ -178,16 +178,26 @@ impl TndbArgs {
 pub(crate) struct TableEntry {
     /// The engine's handle.
     pub(crate) table: Table,
-    /// For a dup-sort table stored as composite keys, its layout ([`DupLayout`]); `None` for a
-    /// plain table, and for a dup-sort table this crate does not store (each access to its rows
-    /// is refused, see [`TableEntry::check`]).
+    /// For a dup-sort table this crate stores, its layout ([`DupLayout`]: composite keys in a
+    /// plain engine table, or an engine dup table); `None` for a plain table, and for a dup-sort
+    /// table this crate does not store (each access to its rows is refused, see
+    /// [`TableEntry::check`]).
     pub(crate) dup: Option<DupLayout>,
 }
 
 impl TableEntry {
-    fn new(table: Table) -> Self {
+    /// The entry of `table`, which `txn` holds, once its form in the file (an engine dup table
+    /// or a plain one, from its catalog record) is the one its layout stores it in
+    /// ([`DupLayout::options`]; plain for every table without a layout); another form is
+    /// [`error::form_mismatch`].
+    fn open(txn: &impl ReadTxn, table: Table) -> Result<Self, DatabaseError> {
         let dup = dup_layout(table.name());
-        Self { table, dup }
+        let expected = dup.and_then(|layout| layout.options());
+        let found = txn.table_stat(&table).map_err(|e| DatabaseError::Open(error::info(&e)))?.dup;
+        if found != expected {
+            return Err(error::form_mismatch(table.name(), found, expected));
+        }
+        Ok(Self { table, dup })
     }
 
     /// The handle and row layout for reading and writing the rows of `T` through this entry: a
@@ -254,7 +264,7 @@ pub(crate) fn resolve<'m, T: RethTable>(
         return Ok(Cow::Borrowed(entry));
     }
     match txn.open_table(T::NAME) {
-        Ok(Some(table)) => Ok(Cow::Owned(TableEntry::new(table))),
+        Ok(Some(table)) => TableEntry::open(txn, table).map(Cow::Owned),
         Ok(None) => Err(error::table_not_found()),
         Err(e) => Err(DatabaseError::Open(error::info(&e))),
     }
@@ -300,7 +310,9 @@ impl TndbEnv {
     /// one of reth's [`Tables`] the file has; [`Self::create_tables`] creates the rest.
     ///
     /// A file another handle holds is `MDBX_BUSY`; a read-only open of a missing file is an I/O
-    /// error (`ENOENT`). Both are [`DatabaseError::Open`].
+    /// error (`ENOENT`); a table the file holds in another form than this build's layout stores
+    /// it in (an engine dup table or a plain one) is `MDBX_INCOMPATIBLE`. All are
+    /// [`DatabaseError::Open`].
     pub fn open(dir: &Path, kind: TndbEnvKind, args: TndbArgs) -> Result<Self, DatabaseError> {
         let open_error = |e: tndb_b::Error| DatabaseError::Open(error::info(&e));
         let path = dir.join(DATA_FILE);
@@ -316,7 +328,7 @@ impl TndbEnv {
         let mut tables = TableMap::default();
         for name in Tables::ALL.iter().map(Tables::name) {
             if let Some(table) = txn.open_table(name).map_err(open_error)? {
-                tables.insert(name, TableEntry::new(table));
+                tables.insert(name, TableEntry::open(&txn, table)?);
             }
         }
         let watch =
@@ -336,15 +348,21 @@ impl TndbEnv {
         self.create_tables_for::<Tables>()
     }
 
-    /// Create every table of `TS` the file lacks, and add them to the table map.
+    /// Create every table of `TS` the file lacks, and add them to the table map: a dup-sort
+    /// table whose layout is an engine dup table as one (`DupLayout::options`), every other
+    /// table as a plain one. A table the file holds in the other form (or a dup table with other
+    /// options) is the engine's `TableKind`, `MDBX_INCOMPATIBLE` as [`DatabaseError::CreateTable`].
     pub fn create_tables_for<TS: TableSet>(&mut self) -> Result<(), DatabaseError> {
         let mut txn = self.env.begin_rw().map_err(|e| DatabaseError::InitTx(error::info(&e)))?;
         let mut created = Vec::new();
         for info in TS::tables() {
             let name = info.name();
-            let table =
-                txn.create_table(name).map_err(|e| DatabaseError::CreateTable(error::info(&e)))?;
-            created.push((name, TableEntry::new(table)));
+            let table = match dup_layout(name).and_then(|layout| layout.options()) {
+                Some(options) => txn.create_dup_table(name, options),
+                None => txn.create_table(name),
+            }
+            .map_err(|e| DatabaseError::CreateTable(error::info(&e)))?;
+            created.push((name, TableEntry::open(&txn, table)?));
         }
         txn.commit().map_err(|e| DatabaseError::Commit(error::info(&e)))?;
         self.watch.after_commit();
