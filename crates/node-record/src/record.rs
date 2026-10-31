@@ -4,13 +4,17 @@ use crate::{validate_advertised_addresses, AddressError, NetworkType};
 use libp2p::Multiaddr;
 use serde::{Deserialize, Serialize};
 use tn_types::{
-    encode, now, try_decode, BlsPublicKey, BlsSignature, NetworkPublicKey, RpcInfo, TimestampSec,
-    WorkerId,
+    encode, now, try_decode, BlsPublicKey, BlsSignature, NetworkKeypair, NetworkPublicKey,
+    NetworkSignature, RpcInfo, TimestampSec, WorkerId,
 };
 
 /// List of addresses for a node, signature will be the nodes BLS signature
 /// over the addresses to verify they are from the node in question.
 /// Used to publish this to kademlia.
+///
+/// The network key named in the record co-signs its binding to the BLS key (see
+/// `network_signature`), so a record verifies only under a BLS key that its network key
+/// agreed to (issue #1751).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct NodeRecord {
     /// The network information contained within the record.
@@ -20,6 +24,14 @@ pub struct NodeRecord {
     /// that can be used for verifiction.  Intended to stop malicious
     /// nodes from poisoning the routing table.
     pub signature: BlsSignature,
+    /// Signature by the network key in `info.pubkey` over the BLS key the record is published
+    /// under, the [RecordDomain] and the same [NetworkInfo] (see `network_signing_bytes`).
+    ///
+    /// It proves that the holder of the network key agreed to be bound to that BLS key. Without
+    /// it a committee BLS key could publish a record that names another validator's network key
+    /// and re-bind that validator's peer id to itself on every node that took the record (issue
+    /// #1751). BCS appends it at the end: a ULEB128 length (`0x40`) then the 64 ed25519 bytes.
+    pub network_signature: NetworkSignature,
 }
 
 /// Pre-`rpc` [NetworkInfo] layout.
@@ -53,7 +65,13 @@ impl From<LegacyNodeRecord> for NodeRecord {
             info: LegacyNetworkInfo { pubkey, multiaddrs, timestamp },
             signature,
         } = legacy;
-        Self { info: NetworkInfo { pubkey, multiaddrs, timestamp, rpc: None }, signature }
+        // Legacy records predate the network-key co-signature. An empty signature never
+        // verifies, so these records stay inspection-only (issue #1751).
+        Self {
+            info: NetworkInfo { pubkey, multiaddrs, timestamp, rpc: None },
+            signature,
+            network_signature: Vec::new(),
+        }
     }
 }
 
@@ -64,6 +82,12 @@ impl From<LegacyNodeRecord> for NodeRecord {
 /// version: bumping it invalidates every prior signature and forces a
 /// coordinated re-sign across the network.
 const NODE_RECORD_SIGNING_LABEL: &[u8] = b"telcoin-network/node-record/v1";
+
+/// Domain-separation label folded into every [NodeRecord] network-key co-signature.
+///
+/// It is distinct from `NODE_RECORD_SIGNING_LABEL`, so the BLS signature and the network-key
+/// co-signature never verify as the payload of the other (issue #1751).
+const NODE_RECORD_NETWORK_SIGNING_LABEL: &[u8] = b"telcoin-network/node-record/network-key/v1";
 
 /// The `(chain, role)` network a [NodeRecord] signature is bound to.
 ///
@@ -124,68 +148,138 @@ impl NodeRecord {
         encode(&(NODE_RECORD_SIGNING_LABEL, domain.chain_id, role, worker_id, info))
     }
 
-    /// Helper method to build a [NodeRecord] signed for `domain`.
-    pub fn build<F>(
+    /// The exact bytes the network-key co-signature covers: a label distinct from the BLS
+    /// payload label, the `(chain_id, role, worker_id)` [RecordDomain], the BLS key the record
+    /// is published under, and the BCS encoding of the advertised [NetworkInfo].
+    ///
+    /// The BLS key is part of the payload, so a co-signature binds the network key to exactly
+    /// one BLS key and the record verifies under no other BLS key (issue #1751).
+    fn network_signing_bytes(
         domain: RecordDomain,
-        pubkey: NetworkPublicKey,
-        multiaddr: Multiaddr,
-        rpc: Option<RpcInfo>,
+        bls_key: &BlsPublicKey,
+        info: &NetworkInfo,
+    ) -> Vec<u8> {
+        let (role, worker_id) = domain.role_parts();
+        encode(&(
+            NODE_RECORD_NETWORK_SIGNING_LABEL,
+            domain.chain_id,
+            role,
+            worker_id,
+            bls_key,
+            info,
+        ))
+    }
+
+    /// Sign `info` for `domain` with both keys.
+    ///
+    /// The network keypair co-signs the binding to `bls_key` first, then `signer` makes the BLS
+    /// signature over the unchanged BLS payload. `signer` must sign with the key `bls_key`.
+    fn sign<F>(
+        domain: RecordDomain,
+        bls_key: &BlsPublicKey,
+        network_keypair: &NetworkKeypair,
+        info: NetworkInfo,
         signer: F,
-    ) -> NodeRecord
+    ) -> Result<Self, RecordError>
     where
         F: FnOnce(&[u8]) -> BlsSignature,
     {
-        let info = NetworkInfo { pubkey, multiaddrs: vec![multiaddr], timestamp: now(), rpc };
-        let data = Self::signing_bytes(domain, &info);
-        let signature = signer(&data);
-        Self { info, signature }
+        let network_signature =
+            network_keypair.sign(&Self::network_signing_bytes(domain, bls_key, &info))?;
+        let signature = signer(&Self::signing_bytes(domain, &info));
+        Ok(Self { info, signature, network_signature })
+    }
+
+    /// Helper method to build a [NodeRecord] signed for `domain`.
+    ///
+    /// The record names the public key of `network_keypair`, which co-signs the binding to
+    /// `bls_key`. `signer` must sign with the key `bls_key`.
+    pub fn build<F>(
+        domain: RecordDomain,
+        bls_key: &BlsPublicKey,
+        network_keypair: &NetworkKeypair,
+        multiaddr: Multiaddr,
+        rpc: Option<RpcInfo>,
+        signer: F,
+    ) -> Result<NodeRecord, RecordError>
+    where
+        F: FnOnce(&[u8]) -> BlsSignature,
+    {
+        let info = NetworkInfo {
+            pubkey: network_keypair.public().into(),
+            multiaddrs: vec![multiaddr],
+            timestamp: now(),
+            rpc,
+        };
+        Self::sign(domain, bls_key, network_keypair, info, signer)
     }
 
     /// Sign a nonempty, ordered endpoint list within the shared migration budget.
     ///
-    /// Uses the existing v1 signing domain and BCS layout. Order and every endpoint byte are
-    /// authenticated; the first endpoint is the operator's preferred dial candidate.
+    /// Uses the existing v1 BLS signing payload. Order and every endpoint byte are authenticated
+    /// by both signatures; the first endpoint is the operator's preferred dial candidate. The
+    /// record names the public key of `network_keypair`, which co-signs the binding to `bls_key`.
     pub fn build_multi<F>(
         domain: RecordDomain,
-        pubkey: NetworkPublicKey,
+        bls_key: &BlsPublicKey,
+        network_keypair: &NetworkKeypair,
         multiaddrs: Vec<Multiaddr>,
         rpc: Option<RpcInfo>,
         signer: F,
-    ) -> Result<NodeRecord, AddressError>
+    ) -> Result<NodeRecord, RecordError>
     where
         F: FnOnce(&[u8]) -> BlsSignature,
     {
+        let pubkey: NetworkPublicKey = network_keypair.public().into();
         validate_advertised_addresses(&multiaddrs, &pubkey)?;
         let info = NetworkInfo { pubkey, multiaddrs, timestamp: now(), rpc };
-        let signature = signer(&Self::signing_bytes(domain, &info));
-        Ok(Self { info, signature })
+        Self::sign(domain, bls_key, network_keypair, info, signer)
     }
 
-    /// Refresh the timestamp and signature while preserving configured endpoint order.
-    pub fn refresh<F>(&mut self, domain: RecordDomain, signer: F)
+    /// Refresh the timestamp and both signatures while preserving configured endpoint order.
+    ///
+    /// The record names the public key of `network_keypair` after the refresh. The record is not
+    /// changed when the network key cannot sign.
+    pub fn refresh<F>(
+        &mut self,
+        domain: RecordDomain,
+        bls_key: &BlsPublicKey,
+        network_keypair: &NetworkKeypair,
+        signer: F,
+    ) -> Result<(), RecordError>
     where
         F: FnOnce(&[u8]) -> BlsSignature,
     {
-        self.info.timestamp = now();
-        self.signature = signer(&Self::signing_bytes(domain, &self.info));
+        let info = NetworkInfo {
+            pubkey: network_keypair.public().into(),
+            timestamp: now(),
+            ..self.info.clone()
+        };
+        *self = Self::sign(domain, bls_key, network_keypair, info, signer)?;
+        Ok(())
     }
 
-    /// Verify the record's signature against `domain` and `pubkey`.
+    /// Verify the record's signatures against `domain` and `pubkey`.
     ///
     /// Fails if the record was signed for a different `(chain, role)` network,
     /// even when the BLS `pubkey` matches: the domain is part of the signed
     /// bytes (see [RecordDomain]).
+    ///
+    /// Also fails when the network key named in the record did not co-sign its binding to
+    /// `pubkey` (issue #1751). The ed25519 co-signature is checked first because it is the
+    /// cheaper of the two checks.
     pub fn verify(
         self,
         domain: RecordDomain,
         pubkey: &BlsPublicKey,
     ) -> Option<(BlsPublicKey, NodeRecord)> {
-        let data = Self::signing_bytes(domain, &self.info);
-        if self.signature.verify_raw(&data, pubkey) {
-            Some((*pubkey, self))
-        } else {
-            None
-        }
+        let bound = libp2p::identity::PublicKey::verify(
+            &self.info.pubkey,
+            &Self::network_signing_bytes(domain, pubkey, &self.info),
+            &self.network_signature,
+        );
+        (bound && self.signature.verify_raw(&Self::signing_bytes(domain, &self.info), pubkey))
+            .then_some((*pubkey, self))
     }
 
     /// Return a reference to the record's [NetworkInfo].
@@ -208,6 +302,10 @@ impl NodeRecord {
     /// - Current bytes fail the legacy decode: the legacy decoder reads the `rpc` Option tag
     ///   (`0x00`/`0x01`) as the signature's length prefix, yielding a 0- or 1-byte slice that
     ///   `BlsSignature` rejects as an invalid signature.
+    /// - Pre-#1751 bytes (the current `NetworkInfo` and the BLS signature, without the trailing
+    ///   `network_signature`) fail both decodes: the current decoder reaches the end of input where
+    ///   it expects the co-signature, and the legacy decoder reads the `rpc` Option tag as the
+    ///   signature's length prefix. Such records carry no co-signature and cannot verify.
     ///
     /// Does NOT verify the signature — use [Self::decode_and_verify] when
     /// authenticity matters.
@@ -232,6 +330,10 @@ impl NodeRecord {
     /// do not cover the `(chain, role)` domain, which is exactly the
     /// cross-network replay this rejects (GHSA-cc64-wfq5-56ph); such records no
     /// longer verify and are dropped after upgrade.
+    ///
+    /// The record must also carry the network-key co-signature over `key` (issue #1751).
+    /// Records from software that predates it carry no co-signature, so they no longer decode or
+    /// verify and are dropped after upgrade, the same posture as GHSA-cc64-wfq5-56ph.
     pub fn decode_and_verify(
         value: &[u8],
         domain: RecordDomain,
@@ -241,6 +343,17 @@ impl NodeRecord {
         validate_advertised_addresses(&record.info.multiaddrs, &record.info.pubkey).ok()?;
         record.verify(domain, key)
     }
+}
+
+/// Why a [NodeRecord] could not be built or re-signed.
+#[derive(Debug, thiserror::Error)]
+pub enum RecordError {
+    /// The advertised endpoint list failed the shared address policy.
+    #[error(transparent)]
+    Address(#[from] AddressError),
+    /// The network keypair could not sign the binding payload.
+    #[error("network key could not sign the node record: {0}")]
+    NetworkSignature(#[from] libp2p::identity::SigningError),
 }
 
 /// The network information needed for consensus.

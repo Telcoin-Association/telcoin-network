@@ -49,8 +49,9 @@ pub(crate) enum RejectReason {
     /// The node assesses a fatal penalty on the peer that returned it
     /// (`process_kad_query_result`); the client only discards the copy.
     KeyMismatch,
-    /// The value did not decode as a [`NodeRecord`], or its signature did not verify for the
-    /// queried key under the client's `(chain_id, network_type)` domain.
+    /// The value did not decode as a [`NodeRecord`], its signature did not verify for the
+    /// queried key under the client's `(chain_id, network_type)` domain, or the network key it
+    /// names did not co-sign its binding to the queried key (issue #1751).
     ///
     /// A record signed for another chain or role fails here even when the BLS key matches: the
     /// domain is folded into the signed bytes but never transmitted (GHSA-cc64-wfq5-56ph).
@@ -73,7 +74,8 @@ pub(crate) enum RejectReason {
 /// Checks run in the same order as the node's `peer_record_valid`:
 /// 1. the record key must decode as a BLS public key equal to `expected`;
 /// 2. the value must decode as a [`NodeRecord`] with a nonempty, bounded IP/QUIC endpoint list;
-/// 3. its signature must verify for `expected` under `domain`;
+/// 3. its BLS signature must verify for `expected` under `domain`, and the network key it names
+///    must have co-signed the binding to `expected` (issue #1751);
 /// 4. the kademlia `publisher` must equal the peer id of the record's network public key.
 pub(crate) fn verify_record(
     domain: RecordDomain,
@@ -158,9 +160,10 @@ mod tests {
 
         /// Sign a record for `domain` exactly as the node does.
         fn node_record(&self, domain: RecordDomain, rpc: Option<RpcInfo>) -> NodeRecord {
-            NodeRecord::build(domain, self.network_key(), multiaddr(), rpc, |data| {
+            NodeRecord::build(domain, &self.bls_key(), &self.network, multiaddr(), rpc, |data| {
                 self.bls.sign(data)
             })
+            .expect("ed25519 signing is infallible")
         }
 
         /// The kademlia record the node would put for `node_record`: keyed by the raw BLS key,
@@ -189,9 +192,11 @@ mod tests {
             record.info.timestamp,
             &record.signature,
         ));
+        // The legacy mirror carries no network-key co-signature, so the in-memory check rejects
+        // it too (issue #1751).
         assert!(NodeRecord::try_decode_compat(&value)
             .and_then(|decoded| decoded.verify(domain, &signer.bls_key()))
-            .is_some());
+            .is_none());
         assert!(NodeRecord::decode_and_verify(&value, domain, &signer.bls_key()).is_none());
         let mut kad = signer.kad_record(&record);
         kad.value = value;
@@ -332,6 +337,21 @@ mod tests {
         signer.bls.sign(&encode(&(LABEL, domain.chain_id(), role, worker_id, info)))
     }
 
+    /// Co-sign `info` for `domain` with the signer's network key over the same payload the record
+    /// crate co-signs: a distinct label, chain id, role discriminant, worker id, the signer's BLS
+    /// key, and BCS-encoded info. Mirrors the private `NodeRecord::network_signing_bytes`.
+    fn cosign_info(signer: &Signer, domain: RecordDomain, info: &NetworkInfo) -> Vec<u8> {
+        const LABEL: &[u8] = b"telcoin-network/node-record/network-key/v1";
+        let (role, worker_id): (u8, WorkerId) = match domain.network_type() {
+            NetworkType::Primary => (0, 0),
+            NetworkType::Worker(id) => (1, id),
+        };
+        signer
+            .network
+            .sign(&encode(&(LABEL, domain.chain_id(), role, worker_id, &signer.bls_key(), info)))
+            .expect("ed25519 signing is infallible")
+    }
+
     /// A validly signed record that advertises more than the cap is rejected after the signature
     /// check, with the offending count reported.
     #[test]
@@ -357,7 +377,8 @@ mod tests {
                 rpc: None,
             };
             let signature = sign_info(&signer, worker_domain(), &info);
-            signer.kad_record(&NodeRecord { info, signature })
+            let network_signature = cosign_info(&signer, worker_domain(), &info);
+            signer.kad_record(&NodeRecord { info, signature, network_signature })
         };
 
         // exactly at the cap: the hand-signed payload verifies, proving the signing mirror

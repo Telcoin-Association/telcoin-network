@@ -166,6 +166,26 @@ fn record_endpoint() -> Multiaddr {
         .with(libp2p::multiaddr::Protocol::QuicV1)
 }
 
+/// Co-sign `info` with `network_key` for the primary domain on `chain_id`, binding the network
+/// key to `bls_key`. Mirrors the private `NodeRecord::network_signing_bytes` (issue #1751).
+fn primary_cosignature(
+    network_key: &NetworkKeypair,
+    chain_id: u64,
+    bls_key: &BlsPublicKey,
+    info: &NetworkInfo,
+) -> Vec<u8> {
+    network_key
+        .sign(&encode(&(
+            b"telcoin-network/node-record/network-key/v1".as_slice(),
+            chain_id,
+            0u8,
+            0u16,
+            bls_key,
+            info,
+        )))
+        .expect("ed25519 signing is infallible")
+}
+
 /// Query both public counts while processing only commands, leaving swarm progress under the
 /// test's control so a pending dial cannot race a handshake or a dial failure.
 async fn query_peer_counts(
@@ -3102,8 +3122,14 @@ async fn test_node_record_validation_rejects_oversized_multiaddr_list() {
         let signing_bytes =
             encode(&(b"telcoin-network/node-record/v1".as_slice(), chain_id, 0u8, 0u16, &info));
         let signature = key_config.request_signature_direct(&signing_bytes);
+        let network_signature = primary_cosignature(
+            &network.network_keypair,
+            chain_id,
+            &key_config.primary_public_key(),
+            &info,
+        );
         let mut record = network.get_peer_record();
-        record.value = encode(&NodeRecord { info, signature });
+        record.value = encode(&NodeRecord { info, signature, network_signature });
         record
     };
 
@@ -3342,11 +3368,12 @@ async fn test_kad_retention_rejects_unrelated_records() -> eyre::Result<()> {
     let unrelated_network = NetworkKeypair::generate_ed25519();
     let unrelated = NodeRecord::build(
         domain,
-        unrelated_network.public().into(),
+        unrelated_bls.public(),
+        &unrelated_network,
         record_endpoint(),
         None,
         |data| unrelated_bls.sign(data),
-    );
+    )?;
     let unrelated_record = kad::Record {
         key: kad::RecordKey::new(unrelated_bls.public()),
         value: encode(&unrelated),
@@ -3630,8 +3657,14 @@ async fn test_stale_kad_records_do_not_replace_or_penalize() -> eyre::Result<()>
         let bytes =
             encode(&(b"telcoin-network/node-record/v1".as_slice(), chain_id, 0u8, 0u16, &info));
         let signature = peer2.config.key_config().request_signature_direct(&bytes);
+        let network_signature = primary_cosignature(
+            &peer2.network.network_keypair,
+            chain_id,
+            &peer2.config.key_config().primary_public_key(),
+            &info,
+        );
         let candidate = kad::Record {
-            value: encode(&NodeRecord { info, signature }),
+            value: encode(&NodeRecord { info, signature, network_signature }),
             expires: Some(std::time::Instant::now() + Duration::from_secs(120)),
             ..current.clone()
         };
@@ -3703,11 +3736,12 @@ async fn test_kad_self_advertisement_confirms_when_store_is_full() -> eyre::Resu
             let netkey = NetworkKeypair::generate_ed25519();
             let record = NodeRecord::build(
                 domain,
-                netkey.public().into(),
+                bls.public(),
+                &netkey,
                 record_endpoint(),
                 None,
                 |data| bls.sign(data),
-            );
+            )?;
             network.process_kad_put_request(
                 source,
                 kad::Record {
@@ -3795,7 +3829,13 @@ fn check_kad_self_advertisement_after_relay(timestamp_lag: u64) -> eyre::Result<
     let signing_bytes =
         encode(&(b"telcoin-network/node-record/v1".as_slice(), chain_id, 0u8, 0u16, &info));
     let signature = peer2.config.key_config().request_signature_direct(&signing_bytes);
-    peer2.network.node_record = NodeRecord { info, signature };
+    let network_signature = primary_cosignature(
+        &peer2.network.network_keypair,
+        chain_id,
+        &peer2.config.key_config().primary_public_key(),
+        &info,
+    );
+    peer2.network.node_record = NodeRecord { info, signature, network_signature };
     let self_record = peer2.network.get_peer_record();
     assert!(network.peer_record_valid(&self_record).is_some());
     let timestamp = RecordTimestamp::admit(peer2.network.node_record.info.timestamp, observed);
@@ -3847,7 +3887,13 @@ async fn test_newer_kad_record_replaced() -> eyre::Result<()> {
     let signing_bytes =
         encode(&(b"telcoin-network/node-record/v1".as_slice(), chain_id, 0u8, 0u16, &peer2_info));
     let signature = peer2.config.key_config().request_signature_direct(&signing_bytes);
-    let old_record = NodeRecord { info: peer2_info, signature };
+    let network_signature = primary_cosignature(
+        &peer2.network.network_keypair,
+        chain_id,
+        &peer2.config.key_config().primary_public_key(),
+        &peer2_info,
+    );
+    let old_record = NodeRecord { info: peer2_info, signature, network_signature };
     // assert old record is valid
     let peer2_pubkey = peer2.config.key_config().primary_public_key();
     assert!(old_record.clone().verify(domain, &peer2_pubkey).is_some());
@@ -4100,7 +4146,17 @@ async fn test_advertise_rpc_via_kad() -> eyre::Result<()> {
         encode(&(b"telcoin-network/node-record/v1".as_slice(), chain_id, 0u8, 0u16, &target_info));
     let target_signature =
         target_peer.config.key_config().request_signature_direct(&target_signing_bytes);
-    target_network.node_record = NodeRecord { info: target_info, signature: target_signature };
+    let target_network_signature = primary_cosignature(
+        &target_network.network_keypair,
+        chain_id,
+        &target_peer.config.key_config().primary_public_key(),
+        &target_info,
+    );
+    target_network.node_record = NodeRecord {
+        info: target_info,
+        signature: target_signature,
+        network_signature: target_network_signature,
+    };
 
     let target_peer_bls = target_peer.config.key_config().primary_public_key();
     let target_peer_net = target_peer.config.primary_networkkey();
@@ -4223,7 +4279,17 @@ async fn test_advertise_rpc_via_kad_late_committee_seed() -> eyre::Result<()> {
         encode(&(b"telcoin-network/node-record/v1".as_slice(), chain_id, 0u8, 0u16, &target_info));
     let target_signature =
         target_peer.config.key_config().request_signature_direct(&target_signing_bytes);
-    target_network.node_record = NodeRecord { info: target_info, signature: target_signature };
+    let target_network_signature = primary_cosignature(
+        &target_network.network_keypair,
+        chain_id,
+        &target_peer.config.key_config().primary_public_key(),
+        &target_info,
+    );
+    target_network.node_record = NodeRecord {
+        info: target_info,
+        signature: target_signature,
+        network_signature: target_network_signature,
+    };
 
     let target_peer_bls = target_peer.config.key_config().primary_public_key();
     let target_peer_net = target_peer.config.primary_networkkey();
@@ -4628,11 +4694,12 @@ async fn committee_convergence_excludes_stale_records() -> eyre::Result<()> {
             peer2.config.network_config().libp2p_config().chain_id,
             NetworkType::Primary,
         ),
-        keys.primary_network_public_key(),
+        &keys.primary_public_key(),
+        keys.primary_network_keypair(),
         peer2.config.primary_address(),
         Some(rpc),
         |data| keys.request_signature_direct(data),
-    );
+    )?;
     network.process_command(NetworkCommand::UpdateCommittees {
         previous: HashSet::new(),
         current: HashSet::from([owner]),
@@ -4681,11 +4748,12 @@ async fn test_malformed_rpc_scheme_stripped_on_promotion() -> eyre::Result<()> {
             peer2.config.network_config().libp2p_config().chain_id,
             NetworkType::Primary,
         ),
-        key_config.primary_network_public_key(),
+        &key_config.primary_public_key(),
+        key_config.primary_network_keypair(),
         peer2.config.primary_address(),
         Some(rpc),
         |data| key_config.request_signature_direct(data),
-    );
+    )?;
 
     let kad_record = kad::Record {
         key: kad::RecordKey::new(&owner_bls),
@@ -4866,18 +4934,22 @@ async fn test_worker_startup_preserves_sibling_kad_records() -> eyre::Result<()>
     let worker_0_address = record_endpoint();
     let worker_0_record = NodeRecord::build(
         RecordDomain::new(chain_id, NetworkType::Worker(0)),
-        worker_0_key.public().into(),
+        &publisher_key_config.primary_public_key(),
+        &worker_0_key,
         worker_0_address.clone(),
         None,
         |data| publisher_key_config.request_signature_direct(data),
-    );
+    )
+    .expect("sign record");
     let worker_1_record = NodeRecord::build(
         RecordDomain::new(chain_id, NetworkType::Worker(1)),
-        worker_1_key.public().into(),
+        &publisher_key_config.primary_public_key(),
+        &worker_1_key,
         record_endpoint(),
         None,
         |data| publisher_key_config.request_signature_direct(data),
-    );
+    )
+    .expect("sign record");
     let mut store_0 = KadStore::new(
         db.clone(),
         local_network_key.public().into(),
@@ -4986,11 +5058,13 @@ async fn test_restored_records_survive_only_committee_rotation() -> eyre::Result
         );
         let authority_record = NodeRecord::build(
             domain,
-            key_config_2.primary_network_public_key(),
+            &key_config_2.primary_public_key(),
+            key_config_2.primary_network_keypair(),
             config_2.primary_address(),
             None,
             |data| key_config_2.request_signature_direct(data),
-        );
+        )
+        .expect("sign record");
         kad_store.put(kad::Record {
             key: kad::RecordKey::new(&authority_bls),
             value: encode(&authority_record),
@@ -4998,11 +5072,16 @@ async fn test_restored_records_survive_only_committee_rotation() -> eyre::Result
             expires: None,
         })?;
 
-        let outsider_netkey: NetworkPublicKey = NetworkKeypair::generate_ed25519().public().into();
-        let outsider_record =
-            NodeRecord::build(domain, outsider_netkey, record_endpoint(), None, |data| {
-                outsider_keypair.sign(data)
-            });
+        let outsider_netkey = NetworkKeypair::generate_ed25519();
+        let outsider_record = NodeRecord::build(
+            domain,
+            outsider_keypair.public(),
+            &outsider_netkey,
+            record_endpoint(),
+            None,
+            |data| outsider_keypair.sign(data),
+        )
+        .expect("sign record");
         kad_store.put(kad::Record {
             key: kad::RecordKey::new(&outsider_bls),
             value: encode(&outsider_record),
@@ -5095,11 +5174,13 @@ async fn test_restore_skips_own_record() -> eyre::Result<()> {
         );
         let own_record = NodeRecord::build(
             domain,
-            key_config.primary_network_public_key(),
+            &key_config.primary_public_key(),
+            key_config.primary_network_keypair(),
             config_1.primary_address(),
             None,
             |data| key_config.request_signature_direct(data),
-        );
+        )
+        .expect("sign record");
         kad_store.put(kad::Record {
             key: node_record_key(&own_bls),
             value: encode(&own_record),
@@ -5235,7 +5316,13 @@ async fn test_record_retrieval_recovers_suppressed_update() -> eyre::Result<()> 
         0u16,
         &current_info,
     )));
-    peer2.network.node_record = NodeRecord { info: current_info, signature: current_signature };
+    let current_network_signature =
+        primary_cosignature(&peer2.network.network_keypair, chain, &key, &current_info);
+    peer2.network.node_record = NodeRecord {
+        info: current_info,
+        signature: current_signature,
+        network_signature: current_network_signature,
+    };
     let expected = encode(&peer2.network.node_record);
     let mut old_info = peer2.network.node_record.info.clone();
     old_info.timestamp = old_info.timestamp.saturating_sub(1);
@@ -5250,7 +5337,13 @@ async fn test_record_retrieval_recovers_suppressed_update() -> eyre::Result<()> 
     )));
     let mut old = peer2.network.get_peer_record();
     old.key = node_record_key(&previous_key);
-    old.value = encode(&NodeRecord { info: old_info, signature: old_signature });
+    let old_network_signature =
+        primary_cosignature(&peer2.network.network_keypair, chain, &previous_key, &old_info);
+    old.value = encode(&NodeRecord {
+        info: old_info,
+        signature: old_signature,
+        network_signature: old_network_signature,
+    });
     peer1.network.process_kad_put_request(peer2_id, old)?;
     assert!(peer1.network.mark_published_to_peer(peer2_id));
     assert!(peer2.network.mark_published_to_peer(peer1_id));
@@ -6084,4 +6177,58 @@ fn listener_error_log_suppresses_errors_inside_the_interval() {
         Some(1),
         "the next log carries only the errors suppressed since the last log"
     );
+}
+
+/// Issue #1751: a committee BLS key cannot publish a record that names another validator's
+/// network key. The forged record fails validation, and the victim's peer id is not bound to the
+/// attacker's BLS key.
+#[tokio::test]
+async fn forged_committee_record_cannot_rebind_another_peer_id() -> eyre::Result<()> {
+    use libp2p::kad;
+    use tn_types::Signer as _;
+
+    let TestTypes { peer1, peer2, .. } =
+        create_test_types::<TestWorkerRequest, TestWorkerResponse>();
+    let mut network = peer1.network;
+    let victim_bls = peer2.config.key_config().primary_public_key();
+    let victim_peer_id = *peer2.network.swarm.local_peer_id();
+    let attacker = BlsKeypair::generate(&mut StdRng::from_seed([175; 32]));
+    let attacker_bls = *attacker.public();
+    let chain_id = peer2.config.network_config().libp2p_config().chain_id;
+
+    // Both keys are in the current committee, so a valid record for either key reaches the
+    // committee cache branch of the peer manager.
+    network.process_command(NetworkCommand::UpdateCommittees {
+        previous: HashSet::new(),
+        current: HashSet::from([victim_bls, attacker_bls]),
+        next: HashSet::new(),
+    })?;
+    network.process_kad_put_request(victim_peer_id, peer2.network.get_peer_record())?;
+
+    // The attacker signs the victim's network info with its own BLS key and copies the victim's
+    // co-signature, which covers the victim's BLS key and not the attacker's.
+    let victim_record = peer2.network.node_record.clone();
+    let payload = encode(&(
+        b"telcoin-network/node-record/v1".as_slice(),
+        chain_id,
+        0u8,
+        0u16,
+        &victim_record.info,
+    ));
+    let forged_record = NodeRecord { signature: attacker.sign(&payload), ..victim_record };
+    let forged = kad::Record {
+        key: node_record_key(&attacker_bls),
+        value: encode(&forged_record),
+        publisher: Some(victim_peer_id),
+        expires: None,
+    };
+    assert!(network.peer_record_valid(&forged).is_none());
+
+    // The handler can reject the forged put with an error; only its effect is checked here.
+    let _forged_put = network.process_kad_put_request(PeerId::random(), forged);
+    assert_ne!(
+        network.swarm.behaviour().peer_manager.peer_to_bls(&victim_peer_id),
+        Some(attacker_bls)
+    );
+    Ok(())
 }
