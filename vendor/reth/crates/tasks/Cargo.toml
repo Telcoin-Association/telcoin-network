@@ -14,7 +14,6 @@ workspace = true
 [dependencies]
 # async
 tokio = { workspace = true, features = ["sync", "rt", "rt-multi-thread"] }
-tracing-futures.workspace = true
 futures-util = { workspace = true, features = ["std"] }
 
 # metrics
