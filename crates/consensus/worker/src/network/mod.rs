@@ -39,16 +39,21 @@ pub(crate) type Res = WorkerResponse;
 ///
 /// A permit is taken after the opening request frame is read and held until the
 /// serve ends, so this bounds the count of concurrent serves for public peers.
-/// Committee peers (the current and the next committee) draw first on a separate
-/// reserve of `COMMITTEE_RESERVED_BATCH_STREAMS` permits that public peers cannot
+/// Each committee key (the current and the next committee) draws first on its own
+/// reserve of `COMMITTEE_RESERVED_BATCH_STREAMS` permits that no other key can
 /// take, so public peers that fill this share cannot block a committee request.
 pub const MAX_CONCURRENT_BATCH_STREAMS: usize = 5;
 
-/// Batch-serve permits reserved for committee peers.
+/// Batch-serve permits reserved for each committee key.
 ///
-/// A committee peer takes a permit from this reserve first and then from the
-/// [`MAX_CONCURRENT_BATCH_STREAMS`] public share. A public peer never takes one.
-pub(crate) const COMMITTEE_RESERVED_BATCH_STREAMS: usize = 4;
+/// Each key of the current or the next committee has its own reserve of this many
+/// permits. That key takes a permit from its reserve first and then from the
+/// [`MAX_CONCURRENT_BATCH_STREAMS`] public share. A public peer never takes one,
+/// and no other committee key can take from this reserve. So committee keys that
+/// hold streams without progress cannot stop a different committee key from
+/// catching up (issue #1750). The per-peer cap ([`MAX_PENDING_REQUESTS_PER_PEER`],
+/// 2) lets a committee key open one more stream from the public share.
+pub(crate) const COMMITTEE_RESERVED_BATCH_STREAMS: usize = 1;
 
 /// Public share of the opening-read pool for inbound sync streams.
 ///
@@ -58,11 +63,16 @@ pub(crate) const COMMITTEE_RESERVED_BATCH_STREAMS: usize = 4;
 /// keeps it only for its bounded refusal or error write and close.
 pub(crate) const MAX_CONCURRENT_OPENING_READS: usize = 8;
 
-/// Opening-read permits reserved for committee peers.
+/// Opening-read permits reserved for each committee key.
 ///
-/// A committee peer takes a permit from this reserve first and then from the
-/// [`MAX_CONCURRENT_OPENING_READS`] public share. A public peer never takes one.
-pub(crate) const COMMITTEE_RESERVED_OPENING_READS: usize = 4;
+/// Each key of the current or the next committee has its own reserve of this many
+/// permits. That key takes a permit from its reserve first and then from the
+/// [`MAX_CONCURRENT_OPENING_READS`] public share. A public peer never takes one,
+/// and no other committee key can take from this reserve. So committee keys that
+/// hold streams without progress cannot stop a different committee key from
+/// catching up (issue #1750). The per-peer cap ([`MAX_PENDING_REQUESTS_PER_PEER`],
+/// 2) lets a committee key open one more stream from the public share.
+pub(crate) const COMMITTEE_RESERVED_OPENING_READS: usize = 1;
 
 /// Maximum batch digests allowed per sync batch request (`WorkerSyncRequest::Batches`).
 ///
@@ -184,8 +194,8 @@ struct SyncAdmission {
 ///
 /// Takes a per-peer slot first, so a peer at [`MAX_PENDING_REQUESTS_PER_PEER`]
 /// never holds a pool permit, then an opening-read permit for `tier`. A committee
-/// peer draws on the reserve before the public share; a public peer draws only on
-/// the public share. Returns `None` when either budget is full, and a slot taken
+/// peer draws on its own reserve before the public share; a public peer draws
+/// only on the public share. Returns `None` when either budget is full, and a slot taken
 /// before a refusal is released on drop.
 fn try_admit_opening(
     slots: &PeerSlots,
@@ -194,7 +204,12 @@ fn try_admit_opening(
     tier: PeerTier,
 ) -> Option<SyncAdmission> {
     slots.try_take(peer).and_then(|slot| {
-        opening.try_acquire(tier).map(|permit| SyncAdmission { peer, tier, slot, opening: permit })
+        opening.try_acquire(&peer, tier).map(|permit| SyncAdmission {
+            peer,
+            tier,
+            slot,
+            opening: permit,
+        })
     })
 }
 
@@ -216,17 +231,19 @@ enum OpeningRead {
 impl OpeningRead {
     /// Classify a decoded opening frame.
     ///
-    /// A request takes a permit from `batch_serve` for `tier` here, before the
-    /// caller releases the opening-read permit, so the stream always holds one of
-    /// the two.
+    /// A request takes a permit from `batch_serve` for `peer`, a peer of `tier`,
+    /// here, before the caller releases the opening-read permit, so the stream
+    /// always holds one of the two. A committee-tier `peer` takes the permit from
+    /// its own reserve first and then from the public share.
     fn from_frame(
         frame: SyncFrame<WorkerSyncRequest>,
         batch_serve: &ReservedPool,
+        peer: &BlsPublicKey,
         tier: PeerTier,
     ) -> Self {
         match frame {
             SyncFrame::Req(request) => batch_serve
-                .try_acquire(tier)
+                .try_acquire(peer, tier)
                 .map_or(Self::AtCapacity, |permit| Self::Admitted(request, permit)),
             SyncFrame::Ack
             | SyncFrame::Deny(_)
@@ -279,7 +296,7 @@ async fn admit_and_serve_sync_stream<S, F, Fut>(
     .await
     .map_or(OpeningRead::Silent, |frame| {
         frame.map_or_else(OpeningRead::Unreadable, |frame| {
-            OpeningRead::from_frame(frame, &batch_serve, tier)
+            OpeningRead::from_frame(frame, &batch_serve, &peer, tier)
         })
     });
 
@@ -393,33 +410,62 @@ where
 
 /// Serve one admitted sync batch request on a live network stream.
 ///
-/// Caps the digest set at [`MAX_BATCH_DIGESTS_PER_REQUEST`], then streams the
-/// batches through [`RequestHandler::process_sync_batches_stream`] and returns
-/// how the serve ended.
+/// `epoch` is the node's own epoch and `max_frame` the frame limit of that
+/// epoch, so the requester cannot size the responder's buffers (#1718). A
+/// request for an epoch outside the node's serve window (see
+/// [`serves_sync_epoch`]) is denied with [`DenyReason::Unavailable`] before the
+/// `Ack` and any storage read; that is not a peer fault, so it ends as a
+/// completed serve. Otherwise the digest set is capped at
+/// [`MAX_BATCH_DIGESTS_PER_REQUEST`], the batches are streamed through
+/// [`RequestHandler::process_sync_batches_stream`], and the result says how
+/// the serve ended.
 async fn serve_sync_request<DB: Database>(
     request_handler: &RequestHandler<DB>,
     peer: BlsPublicKey,
-    stream: Stream,
+    mut stream: Stream,
     request: WorkerSyncRequest,
+    epoch: Epoch,
+    max_frame: usize,
     consensus_chain: &ConsensusChain,
 ) -> SyncServeOutcome {
-    let WorkerSyncRequest::Batches { batch_digests, epoch } = request;
-    // cap to the node's max
-    let batch_digests: BTreeSet<B256> = if batch_digests.len() > MAX_BATCH_DIGESTS_PER_REQUEST {
-        warn!(
+    let WorkerSyncRequest::Batches { batch_digests, epoch: req_epoch } = request;
+    // serve only the node's epoch window: deny anything else before the Ack and
+    // any storage read (#1718). Log only, no penalty.
+    if serves_sync_epoch(epoch, req_epoch) {
+        // cap to the node's max
+        let batch_digests: BTreeSet<B256> = if batch_digests.len() > MAX_BATCH_DIGESTS_PER_REQUEST {
+            warn!(
+                target: "worker::network",
+                %peer,
+                requested = batch_digests.len(),
+                max = MAX_BATCH_DIGESTS_PER_REQUEST,
+                "truncating oversized sync batch request"
+            );
+            batch_digests.into_iter().take(MAX_BATCH_DIGESTS_PER_REQUEST).collect()
+        } else {
+            batch_digests
+        };
+        request_handler
+            .process_sync_batches_stream(
+                peer,
+                stream,
+                batch_digests,
+                req_epoch,
+                max_frame,
+                consensus_chain,
+            )
+            .await
+    } else {
+        debug!(
             target: "worker::network",
             %peer,
-            requested = batch_digests.len(),
-            max = MAX_BATCH_DIGESTS_PER_REQUEST,
-            "truncating oversized sync batch request"
+            req_epoch,
+            epoch,
+            "denying sync batch request for an unserved epoch"
         );
-        batch_digests.into_iter().take(MAX_BATCH_DIGESTS_PER_REQUEST).collect()
-    } else {
-        batch_digests
-    };
-    request_handler
-        .process_sync_batches_stream(peer, stream, batch_digests, epoch, consensus_chain)
-        .await
+        deny_unserved_sync_epoch(&mut stream, max_frame).await;
+        SyncServeOutcome::Completed
+    }
 }
 
 /// Try to reserve a slot in the bounded shed-task budget.
@@ -510,6 +556,43 @@ fn shed_sync_stream<S>(
     )
 }
 
+/// Whether the node serves a sync batch request for `req_epoch`.
+///
+/// An honest requester names its own current epoch. The node serves its own
+/// epoch and the previous one, for a requester still finishing the prior epoch
+/// at the boundary. Any other epoch is denied before the `Ack`, so a peer cannot
+/// make the node open older retained epoch packs or churn the pack cache
+/// (#1718). At epoch 0 only epoch 0 is served.
+fn serves_sync_epoch(node_epoch: Epoch, req_epoch: Epoch) -> bool {
+    req_epoch == node_epoch || req_epoch == node_epoch.saturating_sub(1)
+}
+
+/// Deny an admitted sync request for an epoch the node does not serve.
+///
+/// Writes [`DenyReason::Unavailable`] and closes, with no `Ack` and no storage
+/// read, so the requester tries another peer. The caller only logs the request;
+/// there is no penalty. The write and close are bounded by
+/// [`SYNC_REQUEST_READ_TIMEOUT`], so a requester that stops reading cannot pin
+/// the admission permit the caller holds.
+async fn deny_unserved_sync_epoch<S>(stream: &mut S, max_frame: usize)
+where
+    S: AsyncWrite + Unpin + Send,
+{
+    let (mut encode_buffer, mut compressed_buffer) = (Vec::new(), Vec::new());
+    let _ = tokio::time::timeout(SYNC_REQUEST_READ_TIMEOUT, async {
+        let _ = write_frame(
+            &mut *stream,
+            &SyncFrame::<WorkerSyncRequest>::Deny(DenyReason::Unavailable),
+            &mut encode_buffer,
+            &mut compressed_buffer,
+            max_frame,
+        )
+        .await;
+        let _ = stream.close().await;
+    })
+    .await;
+}
+
 /// Handle inter-node communication between primaries.
 #[derive(Debug)]
 pub struct WorkerNetwork<DB, Events> {
@@ -523,13 +606,15 @@ pub struct WorkerNetwork<DB, Events> {
     ///
     /// A stream holds a permit while its opening request frame is read, which
     /// [`SYNC_REQUEST_READ_TIMEOUT`] bounds: [`MAX_CONCURRENT_OPENING_READS`] public
-    /// permits plus [`COMMITTEE_RESERVED_OPENING_READS`] for committee peers only.
+    /// permits plus [`COMMITTEE_RESERVED_OPENING_READS`] for each committee key,
+    /// which only that key may take.
     sync_opening: ReservedPool,
     /// Batch-serve pool for inbound sync streams.
     ///
     /// A stream takes a permit after its request frame is read and holds it until
     /// the serve ends: [`MAX_CONCURRENT_BATCH_STREAMS`] public permits plus
-    /// [`COMMITTEE_RESERVED_BATCH_STREAMS`] for committee peers only.
+    /// [`COMMITTEE_RESERVED_BATCH_STREAMS`] for each committee key, which only that
+    /// key may take.
     batch_serve: ReservedPool,
     /// Per-peer in-flight sync streams, capped at [`MAX_PENDING_REQUESTS_PER_PEER`].
     ///
@@ -742,6 +827,11 @@ where
     /// phase takes the shed path, which writes [`DenyReason::AtCapacity`] on its own
     /// task gated by the [`MAX_CONCURRENT_SHED_TASKS`] budget (see
     /// [`Self::shed_inbound_sync_stream`]).
+    ///
+    /// A request for an epoch outside the serve window of the node (see
+    /// [`serves_sync_epoch`]) is denied with [`DenyReason::Unavailable`] before
+    /// the `Ack` and any storage read (#1718). A served request uses the frame
+    /// limit of the epoch of the node, not of the request epoch.
     fn process_inbound_sync_stream(&self, peer: BlsPublicKey, stream: Stream) {
         // admit the opening phase before spawning; the slot and permit move into
         // the task and free capacity on drop. A refused stream takes the bounded
@@ -758,7 +848,8 @@ where
         let consensus_chain = self.consensus_chain.clone();
         let batch_serve = self.batch_serve.clone();
         let network_handle = self.network_handle.clone();
-        let max_frame = max_sync_frame_size(self.network_handle.epoch());
+        let epoch = self.network_handle.epoch();
+        let max_frame = max_sync_frame_size(epoch);
         let task_name = format!("sync-batches-{peer}");
         self.network_handle.get_task_spawner().spawn_task(task_name, async move {
             admit_and_serve_sync_stream(
@@ -768,8 +859,16 @@ where
                 network_handle,
                 max_frame,
                 move |stream, request| async move {
-                    serve_sync_request(&request_handler, peer, stream, request, &consensus_chain)
-                        .await
+                    serve_sync_request(
+                        &request_handler,
+                        peer,
+                        stream,
+                        request,
+                        epoch,
+                        max_frame,
+                        &consensus_chain,
+                    )
+                    .await
                 },
             )
             .await;
@@ -1035,6 +1134,81 @@ mod tests {
         );
     }
 
+    // The serve window is the node's epoch and the one before it; every other
+    // request epoch is denied, and epoch 0 serves only epoch 0 (#1718).
+    #[test]
+    fn serves_sync_epoch_window() {
+        let cases = [
+            (5, 5, true),
+            (5, 4, true),
+            (5, 3, false),
+            (5, 6, false),
+            (5, 0, false),
+            (0, 0, true),
+            (0, 1, false),
+            (0, u32::MAX, false),
+        ];
+        cases.iter().for_each(|&(node_epoch, req_epoch, expected)| {
+            assert_eq!(
+                serves_sync_epoch(node_epoch, req_epoch),
+                expected,
+                "node epoch {node_epoch}, request epoch {req_epoch}"
+            );
+        });
+    }
+
+    // A denied unserved epoch gets exactly one Deny(Unavailable) frame: no Ack,
+    // no Data, so the responder never touches storage for it (#1718).
+    #[tokio::test]
+    async fn deny_unserved_sync_epoch_writes_only_deny_unavailable() {
+        let mut writer = CapturingWriter::default();
+        let max_frame = max_sync_frame_size(0);
+        deny_unserved_sync_epoch(&mut writer, max_frame).await;
+
+        let written = writer.bytes.lock().clone();
+        let mut reader = written.as_slice();
+        let frame = read_frame::<_, WorkerSyncRequest>(
+            &mut reader,
+            &mut Vec::new(),
+            &mut Vec::new(),
+            max_frame,
+        )
+        .await
+        .expect("captured bytes decode to a sync frame");
+        assert!(
+            matches!(frame, SyncFrame::Deny(DenyReason::Unavailable)),
+            "unserved epoch writes Deny(Unavailable), got {frame:?}"
+        );
+        assert!(reader.is_empty(), "nothing follows the deny frame");
+    }
+
+    // A requester that stops reading cannot pin the batch-serve permit through
+    // the unserved-epoch deny: the SYNC_REQUEST_READ_TIMEOUT bound ends the write
+    // and the permit returns (#1718).
+    #[tokio::test(start_paused = true)]
+    async fn deny_unserved_sync_epoch_is_bounded_and_frees_permit() {
+        let (_slots, _opening, batch_serve) = admission_budgets();
+        let permit = batch_serve.try_acquire(PeerTier::Public).expect("admit below the caps");
+
+        // hold the permit on a task blocked on the pending deny write
+        let task = tokio::spawn(async move {
+            let _permit = permit;
+            let mut stream = PendingWriter;
+            deny_unserved_sync_epoch(&mut stream, max_sync_frame_size(0)).await;
+        });
+        tokio::task::yield_now().await;
+        assert_eq!(
+            batch_serve.available_public(),
+            MAX_CONCURRENT_BATCH_STREAMS.saturating_sub(1),
+            "the blocked deny task holds its permit"
+        );
+
+        // the bounded write trips SYNC_REQUEST_READ_TIMEOUT and the permit returns
+        tokio::time::advance(SYNC_REQUEST_READ_TIMEOUT + Duration::from_secs(1)).await;
+        task.await.expect("deny task completes");
+        assert_eq!(batch_serve.available_public(), MAX_CONCURRENT_BATCH_STREAMS);
+    }
+
     /// A deterministic BLS public key for `seed`, for tests that need several
     /// distinct peer identities.
     fn key(seed: u64) -> BlsPublicKey {
@@ -1201,11 +1375,13 @@ mod tests {
     }
 
     /// Public peers can fill only the public share of the opening-read pool: past
-    /// it a new public peer is refused, while committee peers are still admitted
-    /// from their reserve until it is full too.
+    /// it a new public peer is refused. A committee key is still admitted from its
+    /// own reserve until that reserve is empty, and then it is refused. A second
+    /// committee key keeps its whole reserve and is still admitted (issue #1750).
     #[test]
     fn public_opening_reads_cannot_exhaust_the_committee_reserve() {
         let (slots, opening, _batch_serve) = admission_budgets();
+        let (committee, other) = (key(200), key(201));
 
         // one opening read each from as many public peers as the public share holds
         let public: Vec<_> = (0_u64..)
@@ -1220,39 +1396,49 @@ mod tests {
             try_admit_opening(&slots, &opening, key(100), PeerTier::Public).is_none(),
             "a new public peer is refused once the public share is full"
         );
-        assert_eq!(opening.available_reserved(), COMMITTEE_RESERVED_OPENING_READS);
+        assert_eq!(opening.available_reserved(&committee), COMMITTEE_RESERVED_OPENING_READS);
 
-        // committee peers still open streams, drawing on the reserve
-        let committee: Vec<_> = (200_u64..)
-            .take(COMMITTEE_RESERVED_OPENING_READS)
-            .map(|seed| {
-                try_admit_opening(&slots, &opening, key(seed), PeerTier::Committee)
-                    .expect("committee opening read from the reserve")
-            })
-            .collect();
-        assert_eq!(opening.available_reserved(), 0);
+        // one committee key opens streams from its own reserve until it is empty
+        let drained: Vec<_> = std::iter::repeat_with(|| {
+            try_admit_opening(&slots, &opening, committee, PeerTier::Committee)
+                .expect("committee opening read from its own reserve")
+        })
+        .take(COMMITTEE_RESERVED_OPENING_READS)
+        .collect();
+        assert_eq!(opening.available_reserved(&committee), 0);
         assert!(
-            try_admit_opening(&slots, &opening, key(300), PeerTier::Committee).is_none(),
-            "a committee peer is refused once both the reserve and the public share are full"
+            try_admit_opening(&slots, &opening, committee, PeerTier::Committee).is_none(),
+            "a committee key is refused once its own reserve and the public share are full"
         );
 
-        drop((public, committee));
+        // a second committee key keeps its whole reserve and is still admitted
+        assert_eq!(opening.available_reserved(&other), COMMITTEE_RESERVED_OPENING_READS);
+        let admitted = try_admit_opening(&slots, &opening, other, PeerTier::Committee)
+            .expect("a second committee key opens from its own reserve");
+        assert_eq!(
+            opening.available_reserved(&other),
+            COMMITTEE_RESERVED_OPENING_READS.saturating_sub(1)
+        );
+
+        drop((public, drained, admitted));
         assert_eq!(opening.available_public(), MAX_CONCURRENT_OPENING_READS);
-        assert_eq!(opening.available_reserved(), COMMITTEE_RESERVED_OPENING_READS);
+        assert_eq!(opening.available_reserved(&committee), COMMITTEE_RESERVED_OPENING_READS);
+        assert_eq!(opening.available_reserved(&other), COMMITTEE_RESERVED_OPENING_READS);
     }
 
     /// Three public identities, each at the per-peer cap, open six streams with
     /// readable requests while every serve stays pending. Five streams fill the
     /// public share of the batch-serve pool and the sixth is refused, but none of
-    /// them can take the committee reserve, so a committee request is still
-    /// admitted and served.
+    /// them can take a committee reserve, so a committee request is still
+    /// admitted and served from the reserve of its key. A second committee key
+    /// keeps its whole reserve, and its request is served too (issue #1750).
     #[tokio::test(start_paused = true)]
     async fn three_public_identities_cannot_block_a_committee_batches_request() {
         let task_manager = TaskManager::default();
         let (handle, mut commands) = observed_handle(&task_manager);
         let (slots, opening, batch_serve) = admission_budgets();
-        let committee = key(0);
-        let reserved = ReservedPeers::new([committee]);
+        let (committee, other) = (key(0), key(4));
+        let reserved = ReservedPeers::new([committee, other]);
         let served = Arc::new(AtomicUsize::new(0));
         let max_frame = max_sync_frame_size(0);
         let request = encoded_request(BTreeSet::from([B256::default()])).await;
@@ -1283,9 +1469,9 @@ mod tests {
         );
         assert_eq!(batch_serve.available_public(), 0, "the public share is full");
         assert_eq!(
-            batch_serve.available_reserved(),
+            batch_serve.available_reserved(&committee),
             COMMITTEE_RESERVED_BATCH_STREAMS,
-            "public peers never take the committee reserve"
+            "public peers never take a committee reserve"
         );
         assert_eq!(
             tasks.iter().filter(|task| task.is_finished()).count(),
@@ -1302,7 +1488,7 @@ mod tests {
         let admission = try_admit_opening(&slots, &opening, committee, reserved.tier(&committee))
             .expect("committee opening read admitted");
         let committee_task = tokio::spawn(admit_and_serve_sync_stream(
-            RequestStream::new(request, WriteCredit::Granted),
+            RequestStream::new(request.clone(), WriteCredit::Granted),
             admission,
             batch_serve.clone(),
             handle.clone(),
@@ -1317,11 +1503,41 @@ mod tests {
             "the committee request is served"
         );
         assert_eq!(
-            batch_serve.available_reserved(),
+            batch_serve.available_reserved(&committee),
             COMMITTEE_RESERVED_BATCH_STREAMS.saturating_sub(1),
-            "the committee serve holds a reserved permit"
+            "the committee serve holds a permit from the reserve of its key"
         );
         assert!(!committee_task.is_finished(), "the committee serve is still in flight");
+
+        // a second committee key keeps its whole reserve, so its request is served too
+        assert_eq!(
+            batch_serve.available_reserved(&other),
+            COMMITTEE_RESERVED_BATCH_STREAMS,
+            "one committee key never takes the reserve of another"
+        );
+        let admission = try_admit_opening(&slots, &opening, other, reserved.tier(&other))
+            .expect("second committee opening read admitted");
+        let other_task = tokio::spawn(admit_and_serve_sync_stream(
+            RequestStream::new(request, WriteCredit::Granted),
+            admission,
+            batch_serve.clone(),
+            handle.clone(),
+            max_frame,
+            pending_serve(served.clone()),
+        ));
+        tokio::time::sleep(Duration::from_millis(1)).await;
+
+        assert_eq!(
+            served.load(Ordering::SeqCst),
+            MAX_CONCURRENT_BATCH_STREAMS.saturating_add(2),
+            "the second committee request is served"
+        );
+        assert_eq!(
+            batch_serve.available_reserved(&other),
+            COMMITTEE_RESERVED_BATCH_STREAMS.saturating_sub(1),
+            "the second committee serve holds a permit from the reserve of its key"
+        );
+        assert!(!other_task.is_finished(), "the second committee serve is still in flight");
         assert!(drain_mild_penalties(&mut commands).is_empty(), "no stream was charged");
     }
 

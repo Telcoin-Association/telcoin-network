@@ -748,6 +748,36 @@ const FOREIGN_PARENTS_LOG: &str = "ignoring parent certificates from another epo
 /// The error peers answer a vote request with when the header's parents are from another epoch.
 const INVALID_EPOCH_LOG: &str = "Invalid epoch";
 
+/// The test-utils hook that fails a node's peer-record store once the named epoch's tasks are
+/// running (`tn_types::test_hooks::fail_store_at_epoch`).
+const FAIL_STORE_AT_EPOCH_ENV: &str = "TN_TEST_FAIL_STORE_AT_EPOCH";
+
+/// The warn line, with field `epoch`, a node logs as [`FAIL_STORE_AT_EPOCH_ENV`] fails its store.
+const FAIL_STORE_HOOK_LOG: &str = "test hook: failed the peer-record store";
+
+/// The error `run_epoch` stops the node with when a consensus store latches a failure mid-epoch
+/// (`store_failure`).
+const STORE_FAILED_LOG: &str =
+    "a consensus store can no longer make writes durable; stopping the node";
+
+/// The store [`STORE_FAILED_LOG`] names when the peer-record store failed: the consensus DB's
+/// kad environment.
+const KAD_STORE_FAILED_LOG: &str = "the kad environment failed";
+
+/// The tail of the error the end-of-epoch check stops the node with when a store failed
+/// (`ensure_stores_durable`).
+const ENSURE_DURABLE_LOG: &str = "can no longer make writes durable; stopping the node (a restart";
+
+/// The info line a node logs once it closed an epoch at the boundary.
+const BOUNDARY_SUCCESS_LOG: &str = "epoch boundary success";
+
+/// The epoch whose run [`test_restarts_store_failure_stops_the_node_mid_epoch`] fails a store in:
+/// early, so the test stays short, and past the epochs in which a node may still be starting up.
+const STORE_FAILURE_EPOCH: Epoch = 3;
+
+/// Epoch duration (seconds) for [`test_restarts_store_failure_stops_the_node_mid_epoch`].
+const STORE_FAILURE_EPOCH_SECS: u32 = 5;
+
 /// A window of a live epoch close that [`restarts_cohort_in_epoch_boundary_window`] stops every
 /// validator inside, through the test-utils hook that stops a node there.
 struct BoundaryWindow {
@@ -1138,6 +1168,144 @@ async fn restarts_cohort_in_epoch_boundary_window(window: BoundaryWindow) -> eyr
         ?hooked,
         "cohort restarted from the epoch boundary window kept closing epochs"
     );
+
+    guard.kill_all();
+    Ok(())
+}
+
+/// A store that fails mid-epoch stops the node at once, through `run_epoch`'s store-failure arm,
+/// not at the epoch's end.
+///
+/// One validator runs with [`FAIL_STORE_AT_EPOCH_ENV`] set to [`STORE_FAILURE_EPOCH`] (E = 3): once
+/// epoch E's tasks are running, the hook latches a durability failure in its peer-record store, as
+/// a failed sync does. No epoch task writes that store every round, and a failed peer-record write
+/// is only logged, so the only thing that can stop the node before E's boundary is the select arm
+/// that waits on `store_failure`. Without it the node runs on to the boundary, closes E, and stops
+/// only in the end-of-epoch check (`ensure_stores_durable`).
+///
+/// The validator must exit with code 1 (an error from `main`, not a signal), and its log must
+/// carry the hook's line for E followed by the store-failure error naming the kad environment,
+/// with no epoch boundary closed after the hook and no end-of-epoch durability error. The other
+/// three are a quorum and must close epoch E without it.
+///
+/// Four validators run [`STORE_FAILURE_EPOCH_SECS`] s epochs at the delayed restart tests' gc
+/// depth. Nothing here depends on a fork.
+#[test]
+#[ignore = "should not run with a default cargo test, run restart tests as seperate step"]
+fn test_restarts_store_failure_stops_the_node_mid_epoch() -> eyre::Result<()> {
+    const E: Epoch = STORE_FAILURE_EPOCH;
+    const REFERENCE: usize = 0;
+    const FAILED: usize = 3;
+    let _permit = super::common::acquire_test_permit();
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_io()
+        .enable_time()
+        .build()
+        .expect("tokio runtime");
+    // short on purpose: node IPC socket paths are built under the temp dir
+    let test = "storefail";
+    let temp_dir = tempfile::TempDir::with_prefix(test)?;
+    let temp_path = temp_dir.path();
+    config_local_testnet_with_gc_depth_and_epoch_duration(
+        temp_path,
+        Some("restart_test".to_string()),
+        None,
+        RESTART_TEST_GC_DEPTH,
+        STORE_FAILURE_EPOCH_SECS,
+    )?;
+    let bin = e2e_tests::get_telcoin_network_binary();
+    let hook_epoch = E.to_string();
+
+    let mut guard = ProcessGuard::empty();
+    let mut rpc_ports = [0u16; 4];
+    for (instance, rpc_port) in rpc_ports.iter_mut().enumerate() {
+        *rpc_port =
+            get_available_tcp_port("127.0.0.1").ok_or_else(|| eyre::eyre!("no free local port"))?;
+        let env: &[(&str, &str)] = if instance == FAILED {
+            &[(FAIL_STORE_AT_EPOCH_ENV, hook_epoch.as_str())]
+        } else {
+            &[]
+        };
+        guard.push(start_validator_with_env(
+            instance,
+            bin,
+            temp_path,
+            *rpc_port,
+            test,
+            0,
+            &[],
+            env,
+        ));
+    }
+    let reference = ProviderBuilder::new()
+        .connect_http(format!("http://127.0.0.1:{}", rpc_ports[REFERENCE]).parse()?);
+    runtime.block_on(wait_for_rpc(&reference))?;
+
+    // the hook fires as E's tasks start; a node that reaches E's boundary would exit there at the
+    // latest, through the end-of-epoch check
+    let exit_window =
+        Duration::from_secs(u64::from(E + 2) * u64::from(STORE_FAILURE_EPOCH_SECS) + 60);
+    let (_, status) = guard
+        .wait_for_natural_exits([FAILED], exit_window)?
+        .pop()
+        .ok_or_else(|| eyre::eyre!("no exit status for validator-{}", FAILED + 1))?;
+
+    let log = node_log_lines(test, FAILED, 0)?;
+    let stderr = plain_log_lines(&node_log_path(test, FAILED, 0, true))?;
+    let hook_fields = [format!("epoch={E}")];
+    let hooked =
+        log.iter().position(|line| log_line_matches(line, FAIL_STORE_HOOK_LOG, &hook_fields));
+    let Some(hooked) = hooked else {
+        return Err(eyre::eyre!(
+            "validator-{} exited ({status}) without the hook's `{FAIL_STORE_HOOK_LOG}` line for \
+             epoch {E}: test_logs/{test}/node{FAILED}-run0.stderr.log carries its fatal error",
+            FAILED + 1
+        ));
+    };
+    let after = &log[hooked..];
+    if let Some(line) = after.iter().find(|line| line.contains(BOUNDARY_SUCCESS_LOG)) {
+        return Err(eyre::eyre!(
+            "validator-{} closed epoch {E} after its store failed, so nothing stopped it \
+             mid-epoch: {line}",
+            FAILED + 1
+        ));
+    }
+    if let Some(line) = log.iter().chain(&stderr).find(|line| line.contains(ENSURE_DURABLE_LOG)) {
+        return Err(eyre::eyre!(
+            "validator-{} was stopped by the end-of-epoch durability check, not the store-failure \
+             arm: {line}",
+            FAILED + 1
+        ));
+    }
+    let failed =
+        after.iter().position(|line| line.contains(STORE_FAILED_LOG)).ok_or_else(|| {
+            eyre::eyre!(
+                "validator-{} logged no `{STORE_FAILED_LOG}` error after the hook's line (exit \
+             {status}; see test_logs/{test}/node{FAILED}-run0.stderr.log)",
+                FAILED + 1
+            )
+        })?;
+    eyre::ensure!(
+        after[failed..].iter().any(|line| line.contains(KAD_STORE_FAILED_LOG)),
+        "validator-{}'s store-failure error does not name the peer-record store \
+         (`{KAD_STORE_FAILED_LOG}`)",
+        FAILED + 1
+    );
+    eyre::ensure!(
+        stderr.iter().any(|line| line.contains(STORE_FAILED_LOG)),
+        "validator-{} stderr lacks the `{STORE_FAILED_LOG}` error it exited with",
+        FAILED + 1
+    );
+    eyre::ensure!(
+        status.code() == Some(1),
+        "validator-{} stopped on its failed store but exited with {status}, not the error exit \
+         (code 1)",
+        FAILED + 1
+    );
+
+    // the store failed in one node only: the other three are a quorum and close E without it
+    runtime.block_on(wait_for_epoch_at_least(&reference, E + 1))?;
+    info!(target: "restart-test", "a failed store stopped its node mid-epoch; the rest closed it");
 
     guard.kill_all();
     Ok(())

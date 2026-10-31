@@ -10,7 +10,9 @@
 * [P2P Network](network/README.md)
   * [Transport](network/transport.md)
   * [Established connection calibration](network/resource-budget.md)
+  * [Vote latency during catch-up](network/catch-up-vote-latency.md)
   * [Handshake-start accounting](network/handshake-starts.md)
+  * [Inbound capacity qualification](network/inbound-capacity-qualification.md)
   * [Early Identity Refusal](network/early-identity-refusal.md)
   * [Gossip](network/gossip.md)
   * [Discovery](network/discovery.md)
@@ -20,6 +22,8 @@
   * [Request-response](network/request-response.md)
   * [Sync streams](network/sync-streams.md)
 * [Getting Started](getting-started/README.md)
+  * [Installing a Release](getting-started/installing-a-release.md)
+  * [Release Notes](getting-started/release-notes.md)
   * [Bootstrap Peers](getting-started/bootstrap-peers.md)
   * [Validator Production Operations](getting-started/validator-operations.md)
   * [Private Observability Listeners](getting-started/observability-listeners.md)
@@ -159,6 +163,9 @@
 * [EVM Compatibility](evm-compatibility.md)
 * [Epoch Boundaries](epoch-boundaries.md)
 * [Canonical Updates](canonical-updates.md)
+* [Maintainers](maintainers/README.md)
+  * [Releasing](maintainers/releasing.md)
+  * [YubiKey Signing Setup](maintainers/yubikey-setup.md)
 
 # FAQs
 

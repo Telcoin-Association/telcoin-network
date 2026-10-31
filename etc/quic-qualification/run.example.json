@@ -5,14 +5,26 @@
     "node_commit": null,
     "dirty_diff_artifact": null,
     "lockfile_sha256": null,
+    "carried_patch_revision": null,
     "minimum_retry_revision": null,
     "integrated_scheduling_revision": null,
     "build_command": null,
     "rust_toolchain": null,
-    "features": []
+    "features": [],
+    "configuration": {
+      "name": null,
+      "receive_buffer_bytes_requested": null,
+      "receive_buffer_bytes_effective": null,
+      "inbound_accept_task": null
+    }
   },
   "deployment": {
     "topology_artifact": null,
+    "roles": null,
+    "worker_count": null,
+    "honest_peers": null,
+    "shared_addresses": null,
+    "admission_policy_state": null,
     "representative_hardware_rationale": null,
     "link_speed_bps": null,
     "mtu": null,
@@ -32,19 +44,32 @@
     "generator_revision_and_command": null,
     "source_address_population": null,
     "packet_sizes_and_offered_rates": null,
+    "honest_workload": null,
+    "generator_limits": null,
     "warmup_seconds": null,
     "steady_state_seconds": null,
     "ip_family": null
   },
-  "predeclared_acceptance": {
-    "maximum_ingress_bps": null,
-    "maximum_link_utilization_fraction": null,
-    "minimum_honest_throughput": null,
-    "maximum_honest_p99_latency_ms": null,
-    "maximum_honest_connection_failure_fraction": null,
-    "required_honest_sample_count": null,
-    "maximum_collector_overhead_fraction": null
+  "method": {
+    "metric_definitions": null,
+    "sampling": null,
+    "trial_count": null,
+    "baseline_run_id": null,
+    "instrumentation_overhead": null
   },
+  "predeclared_acceptance": {
+    "maximum_ingress_bps": { "value": null, "owner": null, "date": null },
+    "maximum_link_utilization_fraction": { "value": null, "owner": null, "date": null },
+    "minimum_honest_throughput": { "value": null, "owner": null, "date": null },
+    "maximum_honest_p99_latency_ms": { "value": null, "owner": null, "date": null },
+    "maximum_honest_connection_failure_fraction": { "value": null, "owner": null, "date": null },
+    "maximum_socket_drops": { "value": null, "owner": null, "date": null },
+    "minimum_commit_rate_per_second": { "value": null, "owner": null, "date": null },
+    "maximum_process_cpu_cores": { "value": null, "owner": null, "date": null },
+    "required_honest_sample_count": { "value": null, "owner": null, "date": null },
+    "maximum_collector_overhead_fraction": { "value": null, "owner": null, "date": null }
+  },
+  "open_limitations": [],
   "external_evidence": {
     "achieved_ingress_timeseries": null,
     "established_committee_results": null,

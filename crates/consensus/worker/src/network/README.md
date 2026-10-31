@@ -74,14 +74,17 @@ Req(Batches{digests, epoch})  ──►
 ```
 
 Instead of `Ack`, a responder that is shedding load writes `Deny(DenyReason::AtCapacity)` and closes
-without reading, so the requester gives up on that peer immediately and tries another. A serve that
-fails partway (storage or encoding error) is terminated with `Err(SyncFrameError::Internal)`, and a
+without reading, so the requester gives up on that peer immediately and tries another. A responder
+serves only its own epoch and the previous one. A `Req` for any other epoch is answered with
+`Deny(DenyReason::Unavailable)` before the `Ack` and before any storage read. A serve that fails
+partway (storage or encoding error) is terminated with `Err(SyncFrameError::Internal)`, and a
 malformed opening frame is answered with `Err(SyncFrameError::Malformed)`.
 
 Each batch is one [`SyncFrame::Data`] frame carrying the BCS-encoded batch. The stream is delimited
-by the terminating `End` frame; there is no on-wire batch count. The responder reads batches from the
-database in chunks of `BATCH_DIGESTS_READ_CHUNK_SIZE` (200) to bound the working set of a single
-serve — this is a database-read batching detail, not a wire-visible framing.
+by the terminating `End` frame; there is no on-wire batch count. The responder reads one batch at a
+time and drops it before the next read, and it flushes every `SYNC_SERVE_FLUSH_INTERVAL` (200)
+batches. A single serve holds at most one batch plus two reusable frame buffers, sized from the
+node's own epoch. This is a read and flush detail, not a wire-visible framing.
 
 ### Frame Wire Format
 
@@ -124,6 +127,10 @@ When a worker needs batches it doesn't have locally, `request_batches()` tries c
 one at a time. If a peer is unavailable (it sheds with `Deny`, or a transient stream error occurs),
 the next peer is tried.
 
+Peer order: `connected_peers()` returns current-committee members first. When the caller names a
+preferred authority (the vote-path `synchronize` passes the header author), that peer is tried
+first, because it is the peer most likely to hold the batches.
+
 If **all** peers fail a single pass, the method retries up to `MAX_BATCH_REQUEST_RETRIES` (3)
 times through the full peer list, with a `BATCH_REQUEST_RETRY_DELAY` (500ms) pause between
 attempts. This gives peer capacity time to free up.
@@ -136,42 +143,55 @@ Attempt 2: peer_a → Ack → batches received → return Ok
 
 Key behaviors:
 - **Re-fetches peers** each attempt to pick up newly connected nodes.
+- **Skips failed peers**: a peer that answers `Deny` stays eligible for later passes. A peer that
+  fails in any other way (open error, unsupported protocol, write or read timeout, protocol error)
+  is not tried again in the same call.
 - **Returns immediately** on any partial success (at least one batch received).
 - **Accumulates batches** across retries — digests fulfilled on earlier attempts are removed.
+- **Bounded in total**: the whole call runs under `BATCH_REQUEST_TOTAL_TIMEOUT` (480s). On expiry
+  it returns the batches fetched so far, or `NetworkError::Timeout` if none were fetched.
 - **Returns `RPCError`** only after all retries are exhausted with zero batches.
 
 A transient post-negotiation failure (a slow but sync-capable peer) is classified as a retryable
 failure rather than an "unsupported" verdict, so a momentarily-slow peer is not cached as unusable
 for the rest of the epoch.
 
+Each exchange is bounded step by step: the request write and flush by `SYNC_REQUEST_WRITE_TIMEOUT`
+(5s), the `Ack`/`Deny` read by `SYNC_ACK_TIMEOUT` (5s), and the data read by
+`BATCH_STREAM_TOTAL_TIMEOUT` (210s). A peer that negotiates the sync protocol and then never reads
+the request cannot hold the requester.
+
 ## Security Measures
 
 ### Concurrency Limiting
 
-Admission of an inbound sync stream has two phases. Each phase has a pool (`ReservedPool`) with
-a public share and a committee reserve. Committee peers are the keys of the current and the next
-committee (`ReservedPeers`). A committee peer takes a permit from the reserve first and then from
-the public share. A public peer takes a permit only from the public share. Thus public peers
-cannot use the capacity that a committee request needs.
+Admission of an inbound sync stream has two phases. Each phase has a pool (`ReservedPool`) with a
+public share and a reserve for each committee key. Committee peers are the keys of the current and
+the next committee (`ReservedPeers`). A committee peer takes a permit from its own reserve first and
+then from the public share. A public peer takes a permit only from the public share. No committee
+key can take the reserve of another. Thus public peers, and committee keys that hold streams without
+progress, cannot use the capacity that a different committee key needs to catch up (issue #1750).
+The per-peer cap of 2 lets a committee key open one more stream from the public share.
 
 #### Opening-Read Pool (`MAX_CONCURRENT_OPENING_READS`)
 
-The opening-read pool has 8 public permits (`MAX_CONCURRENT_OPENING_READS`) and 4 committee
-permits (`COMMITTEE_RESERVED_OPENING_READS`). `try_admit_opening()` takes a permit *before* the
-serving task is spawned. The task holds the permit while it reads the opening `Req` frame, for a
-maximum of `SYNC_REQUEST_READ_TIMEOUT` (5 s). A served stream releases the permit before the serve
-starts. A stream that is not served keeps it only for its bounded refusal or error write. If a
-public peer sends no frame in time, the worker charges the peer `Penalty::Mild`.
+The opening-read pool has 8 public permits (`MAX_CONCURRENT_OPENING_READS`) and 1 permit for each
+committee key (`COMMITTEE_RESERVED_OPENING_READS`), which only that key can take.
+`try_admit_opening()` takes a permit *before* the serving task is spawned. The task holds the permit
+while it reads the opening `Req` frame, for a maximum of `SYNC_REQUEST_READ_TIMEOUT` (5 s). A served
+stream releases the permit before the serve starts. A stream that is not served keeps it only for
+its bounded refusal or error write. If a public peer sends no frame in time, the worker charges the
+peer `Penalty::Mild`.
 
 If no permit is available, the responder writes `Deny(DenyReason::AtCapacity)` on a budgeted shed
 task, and the requesting peer tries another node.
 
 #### Batch Serve Pool (`MAX_CONCURRENT_BATCH_STREAMS`)
 
-The batch serve pool has 5 public permits (`MAX_CONCURRENT_BATCH_STREAMS`) and 4 committee permits
-(`COMMITTEE_RESERVED_BATCH_STREAMS`). The task takes a permit after it reads the request frame and
-holds it until the serve ends. If no permit is available, the responder writes
-`Deny(DenyReason::AtCapacity)` and closes the stream.
+The batch serve pool has 5 public permits (`MAX_CONCURRENT_BATCH_STREAMS`) and 1 permit for each
+committee key (`COMMITTEE_RESERVED_BATCH_STREAMS`), which only that key can take. The task takes a
+permit after it reads the request frame and holds it until the serve ends. If no permit is
+available, the responder writes `Deny(DenyReason::AtCapacity)` and closes the stream.
 
 Time limits release the permit when a peer stops reading:
 - `SYNC_REQUEST_READ_TIMEOUT` (5 s) for the `Ack` write and flush.
@@ -293,7 +313,8 @@ Integration tests in `tests/it/network_tests.rs` verify end-to-end batch synchro
 Concurrency tests cover:
 - Exhaustion of the public share of the batch serve pool sheds with `Deny(AtCapacity)`
 - Release of the peer slot and the pool permits when an admission is dropped
-- Public peers cannot use the committee reserve of the opening-read or the batch serve pool
+- Public peers cannot use a committee reserve of the opening-read or the batch serve pool, and one
+  committee key cannot use the reserve of another
 - Silent public streams release their opening-read permits at `SYNC_REQUEST_READ_TIMEOUT` and get
   one `Penalty::Mild` each
 - Stalled `Ack` and `Data` writes fail with `TimedOut` at their limits and release the batch serve
