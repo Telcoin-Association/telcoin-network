@@ -229,3 +229,7 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   Applied in upstream order, one commit each:
   - b7a7a8a72: `eth_callMany` takes a blocking-IO permit (`rpc-eth-api/src/helpers/call.rs`).
   - f2d2bd233: `eth_simulateV1` takes a blocking-IO permit (same file).
+  - de401d9b4: blocking-IO tasks and `eth_getLogs` range scans skip or stop work once the request is
+    dropped (`blocking_task.rs`, `rpc/src/eth/filter.rs`). Conflicts only from TN's tree wrapping
+    the tasks in `Box::pin` (v1.11's `TaskSpawner` takes a `BoxFuture`). `tokio::select!`
+    relies on the workspace enabling tokio `macros`, as upstream does.
