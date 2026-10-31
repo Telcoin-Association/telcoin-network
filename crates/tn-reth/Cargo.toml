@@ -25,19 +25,17 @@ parking_lot = { workspace = true }
 
 # TN takes reth's individual crates, not the `reth` umbrella crate (see the root
 # `Cargo.toml`). The umbrella's default features are enabled here on the crates it forwarded
-# them to, except jemalloc: it only matters to a binary that installs jemalloc as its
-# `#[global_allocator]`, which the umbrella's `reth` binary does and TN's binaries do not, so
-# enabling it only compiled jemalloc's C library. Enabled: otlp and otlp-logs
-# (reth-node-core); js-tracer (reth-rpc, reth-rpc-eth-api, reth-rpc-eth-types);
-# keccak-cache-global (reth-node-core); asm-keccak (reth-node-core, revm);
+# them to, with two exceptions. jemalloc only matters to a binary that installs jemalloc as its
+# `#[global_allocator]`, which the umbrella's `reth` binary does and TN's binaries do not.
+# otlp and otlp-logs only fed reth's own OTLP exporters, which are removed (vendor/reth
+# CHANGES.md TN-0029); TN wires its own. Enabled: js-tracer (reth-rpc, reth-rpc-eth-api,
+# reth-rpc-eth-types); keccak-cache-global (reth-node-core); asm-keccak (reth-node-core, revm);
 # min-debug-logs (reth-node-core, which caps `tracing` at debug in release builds).
 # TN does not use reth's node builder (it wires provider, EVM, pool and RPC itself), so neither
 # reth-node-builder nor reth-node-ethereum is a dependency; see vendor/reth/ROADMAP.md.
 reth-db = { workspace = true }
 reth-db-common = { workspace = true }
 reth-node-core = { workspace = true, features = [
-    "otlp",
-    "otlp-logs",
     "keccak-cache-global",
     "asm-keccak",
     "min-debug-logs",

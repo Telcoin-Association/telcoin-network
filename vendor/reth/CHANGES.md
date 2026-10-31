@@ -225,6 +225,17 @@ newest last.
   unchanged. TN's snapshot restore never used this path (`tn-reth/src/snapshot.rs` explains
   why). *Upstream*: no.
 
+- **TN-0029** — Remove reth's own OTLP exporters. *Kind*: removal.
+  *Files*: `crates/tracing/{src/layers.rs, Cargo.toml}` (`with_span_layer`, `with_log_layer`,
+  the `otlp`/`otlp-logs` features and the default), `crates/node/core/{src/args/mod.rs,
+  Cargo.toml}` (deleted `src/args/trace.rs`, `TraceArgs`); `crates/tracing-otlp` removed from
+  the vendored set. Outside: `crates/tn-reth/Cargo.toml` stops enabling `otlp`/`otlp-logs`.
+  *Why*: TN adds its own OpenTelemetry layers (`telcoin-network-cli/src/open_telemetry.rs`) and
+  never used `TraceArgs` (reth's `--tracing-otlp*`/`--logs-otlp*` flags) or the two `Layers`
+  methods, so reth-tracing-otlp and `opentelemetry-appender-tracing` were compiled for nothing.
+  `opentelemetry` and `opentelemetry_sdk` lose only their `default` marker feature: every
+  feature it implied stays enabled through opentelemetry-otlp. *Upstream*: no.
+
 ## Upstream syncs
 
 - **TN-0013** — Sync to upstream v1.11.4 (`2ac58a25f561`). *Kind*: sync.

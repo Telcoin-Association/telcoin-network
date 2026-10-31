@@ -23,9 +23,7 @@ pub use database::DatabaseArgs;
 mod log;
 pub use log::{ColorMode, LogArgs, Verbosity};
 
-/// `TraceArgs` for tracing and spans support
-mod trace;
-pub use trace::{OtlpInitStatus, OtlpLogsStatus, TraceArgs};
+// TN(TN-0029): upstream's `TraceArgs` (reth's `--tracing-otlp*`/`--logs-otlp*` flags) is removed.
 
 /// `MetricArgs` to configure metrics.
 mod metric;
