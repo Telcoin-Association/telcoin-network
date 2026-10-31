@@ -67,7 +67,8 @@ jsonrpsee-types.workspace = true
 
 # async
 async-trait.workspace = true
-tokio = { workspace = true, features = ["sync"] }
+# TN(TN-0017): `time` for the JS tracer timeout; upstream gets it through feature unification.
+tokio = { workspace = true, features = ["sync", "time"] }
 tokio-stream.workspace = true
 pin-project.workspace = true
 parking_lot.workspace = true
@@ -80,6 +81,7 @@ serde.workspace = true
 thiserror.workspace = true
 derive_more.workspace = true
 itertools.workspace = true
+humantime = { workspace = true, optional = true }
 
 [dev-dependencies]
 reth-ethereum-primitives.workspace = true
@@ -94,6 +96,7 @@ jsonrpsee = { workspace = true, features = ["client"] }
 
 [features]
 js-tracer = [
+    "dep:humantime",
     "revm-inspectors/js-tracer",
     "reth-rpc-eth-types/js-tracer",
     "reth-rpc-eth-api/js-tracer",

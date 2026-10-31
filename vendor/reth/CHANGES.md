@@ -189,3 +189,24 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   so the new layer sits after `maybe_compression_layer(self.http_disable_compression)`.
   Verified: with the validator disabled, the test fails (101 Switching Protocols where 403 is
   expected). *Upstream*: n/a (upstream commit).
+
+- **TN-0017** — Backport 57825d41d: interrupt JS tracers on timeout and drop. *Kind*: backport
+  (security), adapted.
+  *Files*: `crates/rpc/rpc/src/debug.rs` (`JsTraceInterrupt` and the three call sites, as upstream;
+  plus `TraceInspector` and tests), new `crates/rpc/rpc/src/js_tracer_interrupt.rs` (TN-owned; the
+  `js_interrupt` submodule of `debug`, kept out of `debug/` because TN's root `.gitignore` ignores
+  that name), `crates/rpc/rpc/Cargo.toml` (optional `humantime` as upstream; tokio `time`).
+  *Why*: a JS tracer in `debug_traceTransaction`/`debug_traceCall` ignored its `timeout` and kept
+  running on a blocking thread after the client dropped the request, until it finished or the node
+  ran out of memory (upstream #27543). TN serves `debug` and builds with `js-tracer`. Now the
+  timeout is honored (geth's 5 s default; expiry returns `ExecutionTimedOut`) and a timed-out or
+  dropped request stops the trace at the next inspector hook.
+  *Adaptation*: upstream uses `JsInspectorInterrupt` from revm-inspectors 0.44.2, which needs
+  revm 43. `js_tracer_interrupt.rs` ports the same mechanism (a shared flag checked at every hook,
+  which halts the EVM with "JavaScript tracing interrupted") as a wrapper around `DebugInspector`,
+  applied only to JS tracers. Upstream's tests are ported, plus one that interrupts a trace already
+  running on another thread: it stops within milliseconds, but runs over 60 s to gas exhaustion with
+  the interrupt disabled. When revm-inspectors reaches 0.44.2, delete `js_tracer_interrupt.rs` and
+  take upstream's `attach` (`js.with_interrupt(...)`). Block-level traces and `debug_traceCallMany`
+  still stop only between transactions, as upstream.
+  *Upstream*: n/a (port of an upstream commit).
