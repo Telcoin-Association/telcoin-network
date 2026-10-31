@@ -3,7 +3,7 @@
 //! `reth-db`'s `implementation/mdbx/tx.rs` (tndb-b has no read timeout), and the long-reader
 //! warning that replaces it.
 
-use super::{dup::error_name, mdbx_port::create_test_db};
+use super::{dup::error_name, mdbx_port::create_test_db, Form};
 use crate::{
     cursor::{ReadCursor, ReadPool, WriteCursor},
     env::{warning_due, NEVER_WARNED},
@@ -337,8 +337,9 @@ fn a_table_in_another_form_than_its_layout_is_refused() {
         }
         other => panic!("not refused at open: {:?}", other.map(dbg)),
     };
-    let message = "table StorageChangeSets is stored as a dup table with key_len 28, this build \
-                   stores it as a plain table; the file was written by another tndb-b-reth layout";
+    let message = "table StorageChangeSets is stored as a dup table with key_len 28 and \
+                   packed_max 0, this build stores it as a plain table; the file was written by \
+                   another tndb-b-reth layout";
     let dir = tempfile::tempdir().unwrap();
     let mut db = super::open_env(dir.path(), TndbEnvKind::RW, TndbArgs::default()).unwrap();
     let mut txn = db.env().begin_rw().unwrap();
@@ -376,39 +377,94 @@ fn a_table_in_another_form_than_its_layout_is_refused() {
     assert_eq!(db.tx().unwrap().entries::<StorageChangeSets>().unwrap(), 0);
 }
 
-/// `args` for one form of the nested layouts' tables: engine dup tables (`nested`), or composite
-/// keys in plain tables.
-pub(super) fn form_args(nested: bool) -> TndbArgs {
-    let args = TndbArgs::default();
-    if nested {
-        args
-    } else {
-        args.composite_dup_tables()
-    }
-}
-
 /// After `create_tables`, the three state tables are engine dup tables keyed by their key widths
-/// (20, 32 and 32 bytes), and every other table (the changesets among them) a plain one; with
-/// `TndbArgs::composite_dup_tables` all are plain.
+/// (20, 32 and 32 bytes) whose packed sets take the longest inline value of that width at 4 KiB
+/// pages (987 and 975 bytes; [`crate::env::PACKED_SMALL_RETH`] under
+/// `TndbArgs::packed_dup_max`), and every other table (the changesets among them) a plain one;
+/// with `TndbArgs::composite_dup_tables` all are plain.
 #[test]
 fn nested_tables_are_engine_dup_tables() {
     use tndb_b::ReadTxn;
-    const NESTED: [(&str, u16); 3] =
-        [("PlainStorageState", 20), ("HashedStorages", 32), ("StoragesTrie", 32)];
-    for nested in [true, false] {
+    const NESTED: [(&str, u16, u16); 3] =
+        [("PlainStorageState", 20, 987), ("HashedStorages", 32, 975), ("StoragesTrie", 32, 975)];
+    for form in Form::ALL {
         let dir = tempfile::tempdir().unwrap();
-        let mut db = super::open_env(dir.path(), TndbEnvKind::RW, form_args(nested)).unwrap();
+        let mut db = super::open_env(dir.path(), TndbEnvKind::RW, form.args()).unwrap();
         db.create_tables().unwrap();
         let txn = db.env().begin_ro().unwrap();
         for name in Tables::ALL.iter().map(Tables::name) {
             let table = txn.open_table(name).unwrap().unwrap();
-            let expected = NESTED
-                .iter()
-                .find(|&&(table, _)| nested && table == name)
-                .map(|&(_, key_len)| tndb_b::DupOptions { key_len, packed_max: 0 });
-            assert_eq!(txn.table_stat(&table).unwrap().dup, expected, "{name}, nested {nested}");
+            let expected = NESTED.iter().find(|&&(table, ..)| table == name).and_then(
+                |&(_, key_len, most)| {
+                    let packed_max = match form {
+                        Form::Packed => most,
+                        Form::PackedSmall => crate::env::PACKED_SMALL_RETH,
+                        Form::Composite => return None,
+                    };
+                    Some(tndb_b::DupOptions { key_len, packed_max })
+                },
+            );
+            assert_eq!(txn.table_stat(&table).unwrap().dup, expected, "{name}, {form:?}");
         }
     }
+}
+
+/// A file whose engine dup tables were made with another `packed_max` (0: every key a nested
+/// tree, or [`crate::env::PACKED_SMALL_RETH`]) is refused at a default open, read-write and
+/// read-only, with `MDBX_INCOMPATIBLE` and a message naming both bounds; the refusal writes
+/// nothing (the file's bytes are unchanged), so the file then opens with its own bound and rows.
+/// A file of 16 KiB pages, its bound resolved at that page size, opens with the default.
+#[test]
+fn a_dup_table_with_other_packing_is_refused_at_open() {
+    let a = Address::with_last_byte(1);
+    let row = StorageEntry { key: B256::with_last_byte(1), value: U256::from(2) };
+    for packed_max in [0, crate::env::PACKED_SMALL_RETH] {
+        let args = TndbArgs::default().packed_dup_max(packed_max);
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = super::open_env(dir.path(), TndbEnvKind::RW, args).unwrap();
+        db.create_tables().unwrap();
+        db.update(|tx| tx.put::<PlainStorageState>(a, row)).unwrap().unwrap();
+        drop(db);
+        let file = dir.path().join(crate::DATA_FILE);
+        let bytes = std::fs::read(&file).unwrap();
+        let message = format!(
+            "table PlainStorageState is stored as a dup table with key_len 20 and packed_max \
+             {packed_max}, this build stores it as a dup table with key_len 20 and packed_max \
+             987; the file was written by another tndb-b-reth layout"
+        );
+        for kind in [TndbEnvKind::RW, TndbEnvKind::RO] {
+            match super::open_env(dir.path(), kind, TndbArgs::default()).map(drop) {
+                Err(DatabaseError::Open(info)) => {
+                    assert_eq!(info.code, Error::Incompatible.to_err_code());
+                    assert_eq!(info.message.to_string(), message, "{kind:?}");
+                }
+                other => panic!("not refused at open: {:?}", other.map_err(dbg)),
+            }
+            assert!(std::fs::read(&file).unwrap() == bytes, "the refused open wrote ({kind:?})");
+        }
+        let db = super::open_env(dir.path(), TndbEnvKind::RO, args).unwrap();
+        assert_eq!(db.tx().unwrap().get::<PlainStorageState>(a).unwrap(), Some(row));
+    }
+    // The bound is resolved at the file's own page size: a file of 16 KiB pages opens with the
+    // default arguments, whose page size (4 KiB) is only a new file's.
+    let dir = tempfile::tempdir().unwrap();
+    let args = TndbArgs::default().with_page_size(16_384);
+    let mut db = super::open_env(dir.path(), TndbEnvKind::RW, args).unwrap();
+    db.create_tables().unwrap();
+    db.update(|tx| tx.put::<PlainStorageState>(a, row)).unwrap().unwrap();
+    drop(db);
+    let mut db = super::open_env(dir.path(), TndbEnvKind::RW, TndbArgs::default()).unwrap();
+    db.create_tables().unwrap();
+    assert_eq!(db.page_size(), 16_384);
+    let recorded = {
+        use tndb_b::ReadTxn;
+        let txn = db.env().begin_ro().unwrap();
+        let table = txn.open_table(PlainStorageState::NAME).unwrap().unwrap();
+        txn.table_stat(&table).unwrap().dup.unwrap()
+    };
+    assert_eq!(recorded, tndb_b::DupOptions::packed(20).resolved(16_384).unwrap());
+    assert!(recorded.packed_max > 987, "{recorded:?}");
+    assert_eq!(db.tx().unwrap().get::<PlainStorageState>(a).unwrap(), Some(row));
 }
 
 /// A file whose state tables are in one form (engine dup tables, or composite keys with
@@ -419,10 +475,11 @@ fn nested_tables_are_engine_dup_tables() {
 fn a_file_whose_table_form_disagrees_is_refused_at_open() {
     let a = Address::with_last_byte(1);
     let row = StorageEntry { key: B256::with_last_byte(1), value: U256::from(2) };
-    let nested_form = "a dup table with key_len 20";
+    let nested_form = "a dup table with key_len 20 and packed_max 987";
     for nested in [true, false] {
         let dir = tempfile::tempdir().unwrap();
-        let mut db = super::open_env(dir.path(), TndbEnvKind::RW, form_args(nested)).unwrap();
+        let form = |nested| Form::nested(nested).args();
+        let mut db = super::open_env(dir.path(), TndbEnvKind::RW, form(nested)).unwrap();
         db.create_tables().unwrap();
         db.update(|tx| tx.put::<PlainStorageState>(a, row)).unwrap().unwrap();
         drop(db);
@@ -433,7 +490,7 @@ fn a_file_whose_table_form_disagrees_is_refused_at_open() {
              the file was written by another tndb-b-reth layout"
         );
         for kind in [TndbEnvKind::RW, TndbEnvKind::RO] {
-            match super::open_env(dir.path(), kind, form_args(!nested)).map(drop) {
+            match super::open_env(dir.path(), kind, form(!nested)).map(drop) {
                 Err(DatabaseError::Open(info)) => {
                     assert_eq!(info.code, Error::Incompatible.to_err_code());
                     assert_eq!(info.message.to_string(), message, "nested {nested}");
@@ -441,7 +498,7 @@ fn a_file_whose_table_form_disagrees_is_refused_at_open() {
                 other => panic!("not refused at open: {:?}", other.map_err(dbg)),
             }
         }
-        let db = super::open_env(dir.path(), TndbEnvKind::RO, form_args(nested)).unwrap();
+        let db = super::open_env(dir.path(), TndbEnvKind::RO, form(nested)).unwrap();
         assert_eq!(db.tx().unwrap().get::<PlainStorageState>(a).unwrap(), Some(row));
     }
 }

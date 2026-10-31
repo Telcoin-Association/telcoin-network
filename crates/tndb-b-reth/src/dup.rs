@@ -6,9 +6,11 @@
 //! and its stored value is the rest. Every one of these tables' keys encodes to a fixed width, so
 //! the logical keys sort by key, then by subkey, as MDBX sorts a key's values by their leading
 //! bytes. A layout's form ([`DupLayout::nested`]) says how the engine holds the rows: an engine
-//! dup table (each key's rows in a nested tree of their own, the state tables), or composite keys
-//! in a plain engine table (the logical key as the stored key, the changesets). The form is part
-//! of the file's format: `TableEntry::open` (in `crate::env`) refuses a table in the other form.
+//! dup table (the state tables: each key's few rows packed in its outer cell, more in a nested
+//! tree of their own), or composite keys in a plain engine table (the logical key as the stored
+//! key, the changesets). The form and an engine dup table's options are part of the file's
+//! format: `TableEntry::open` (in `crate::env`) refuses a table in another form, or a dup table
+//! with another key width or `packed_max`.
 //!
 //! MDBX's cursor on such a table is two cursors, one over the keys and one over a key's values,
 //! and the inner one can end a key's values (after `last`, or after a delete of a key's last value
@@ -33,9 +35,9 @@ pub(crate) struct DupLayout {
     /// The width of the subkey: the encoded `DupSort::SubKey`, which every compressed value of the
     /// table starts with.
     pub(crate) subkey: usize,
-    /// Whether the table is an engine dup table ([`Self::options`]): each key's rows in a nested
-    /// tree of their own, the stored key being the engine's logical key `key ‖ subkey`. Else its
-    /// rows are composite keys in a plain engine table.
+    /// Whether the table is an engine dup table ([`Self::options`]): each key's rows packed in
+    /// its outer cell or in a nested tree of their own, the stored key being the engine's logical
+    /// key `key ‖ subkey`. Else its rows are composite keys in a plain engine table.
     pub(crate) nested: bool,
 }
 
@@ -61,10 +63,12 @@ pub(crate) fn dup_layout(name: &str) -> Option<DupLayout> {
 
 impl DupLayout {
     /// The engine's options for this table if it is stored as an engine dup table
-    /// ([`Self::nested`]), else `None`: its rows are composite keys in a plain engine table.
+    /// ([`Self::nested`]), else `None`: its rows are composite keys in a plain engine table. An
+    /// engine dup table packs: a key whose rows encode within the most the page size allows
+    /// ([`DupOptions::packed`]) keeps them in its outer cell, a key of more holds a nested tree.
     pub(crate) const fn options(&self) -> Option<DupOptions> {
         if self.nested {
-            Some(DupOptions { key_len: self.key as u16, packed_max: 0 })
+            Some(DupOptions::packed(self.key as u16))
         } else {
             None
         }

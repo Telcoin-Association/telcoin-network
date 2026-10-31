@@ -38,19 +38,24 @@
 //! | `StoragesTrie` | `B256` (32) | `StoredNibblesSubKey` (65) | nested |
 //!
 //! - **Nested** (the state tables): an engine dup table ([`tndb_b::RwTxn::create_dup_table`],
-//!   [`tndb_b::DupOptions`] with `key_len` K and `packed_max` 0). Each key is one cell of the
-//!   table's outer tree, naming a nested tree of the key's rows by subkey, so a seek bounded to a
-//!   key never reads the next key's cell, and a key's wipe frees its tree in one walk.
+//!   [`tndb_b::DupOptions::packed`] of `key_len` K: `packed_max` the most the page size allows, 987
+//!   bytes for K 20 at 4 KiB pages). Each key is one cell of the table's outer tree, holding its
+//!   rows packed when they encode within `packed_max` (most accounts' few slots), else naming a
+//!   nested tree of them by subkey; a seek bounded to a key never reads the next key's cell, and a
+//!   key's wipe frees its tree in one walk.
 //! - **Composite** (the changesets, appended by block and read by range): a plain engine table
 //!   keyed `k ‖ s`, each value a row of its own, the rows of a block range one leaf chain.
 //!
 //! Both forms hold the same logical rows, in key then subkey order, as MDBX sorts a key's values.
-//! The form is part of the file's format: `create_tables` creates each table in its layout's
-//! form, and the open (and a table resolved later) refuses a table the file holds in the other
-//! form, as `create_tables` does: `DatabaseError::Open` (`DatabaseError::CreateTable`) with
-//! `MDBX_INCOMPATIBLE` and a message naming the table and both forms. A test-only knob,
-//! `TndbArgs::composite_dup_tables`, opens the nested layouts' tables composite, so the tests
-//! run every call on both forms (the composite one is the changesets' path).
+//! The form, and a dup table's options as the engine records them (resolved at the file's page
+//! size), are part of the file's format: `create_tables` creates each table in its layout's form,
+//! and the open (and a table resolved later) refuses a table the file holds in the other form, or
+//! a dup table with another key width or `packed_max`, as `create_tables` does:
+//! `DatabaseError::Open` (`DatabaseError::CreateTable`) with `MDBX_INCOMPATIBLE` and a message
+//! naming the table and both forms. Test-only knobs, `TndbArgs::composite_dup_tables` and
+//! `TndbArgs::packed_dup_max`, open the nested layouts' tables composite or with a small bound
+//! (128 bytes: a key promotes at its second or third row), so the tests run every call on three
+//! forms: packed, packed-small and composite (the changesets' path).
 //!
 //! A leaf cell holds its value right after its key, so a read takes the value, the subkey then
 //! the rest, as one slice of the page (the engine's `current_with_key_tail`), with no copy; only
@@ -230,8 +235,8 @@
 //!
 //! **The differential test** (`random_scripts_match_mdbx`, and `random_scripts_match_mdbx_heavy`
 //! in release) draws random scripts with proptest and runs each on reth's MDBX `DatabaseEnv` and
-//! on a [`TndbEnv`] in each form of the nested tables (nested, then composite through
-//! `TndbArgs::composite_dup_tables`, the form asserted); each outcome list must equal MDBX's,
+//! on a [`TndbEnv`] in each form of the nested tables (packed, packed-small, then composite,
+//! each form asserted); each outcome list must equal MDBX's,
 //! value for value and error for error.
 //! A script works on `CanonicalHeaders`, `PlainStorageState` (dup-sort, with keys and subkeys
 //! drawn from small sets so rows collide) and `Bytecodes` (values from 8 bytes to 40 KiB, so

@@ -24,7 +24,7 @@ use std::{
     },
     time::{Duration, Instant},
 };
-use tndb_b::{CheckReport, Env, EnvOptions, IoStats, ReadTxn, SyncMode, Table};
+use tndb_b::{CheckReport, DupOptions, Env, EnvOptions, IoStats, ReadTxn, SyncMode, Table};
 
 /// The name of the page file inside the environment's directory.
 pub const DATA_FILE: &str = "tndb.dat";
@@ -138,7 +138,19 @@ pub struct TndbArgs {
     /// as composite keys in a plain table, so the composite path stays checked against MDBX.
     #[cfg(test)]
     nested_dup: bool,
+    /// Test-only: the `packed_max` of the engine dup tables (default
+    /// [`DupOptions::PACKED_DEFAULT`], the most the page size allows); a smaller one
+    /// ([`Self::packed_dup_max`]) packs a key's first rows and promotes it at the next, so that
+    /// path stays checked against MDBX.
+    #[cfg(test)]
+    packed_max: u16,
 }
+
+/// Test-only: a `packed_max` of the engine dup tables ([`TndbArgs::packed_dup_max`]) that holds a
+/// `PlainStorageState` key's first row or two (each `StorageEntry` 4 + 32 + 1..=32 bytes) and
+/// promotes it at its second or third.
+#[cfg(test)]
+pub(crate) const PACKED_SMALL_RETH: u16 = 128;
 
 impl Default for TndbArgs {
     fn default() -> Self {
@@ -149,6 +161,8 @@ impl Default for TndbArgs {
             sync: SyncMode::Durable,
             #[cfg(test)]
             nested_dup: true,
+            #[cfg(test)]
+            packed_max: DupOptions::PACKED_DEFAULT,
         }
     }
 }
@@ -190,6 +204,24 @@ impl TndbArgs {
         true
     }
 
+    /// Test-only: create the engine dup tables with `packed_max` (0: every key in a nested tree),
+    /// and require it of the file's. A file whose dup tables have another is refused
+    /// (`MDBX_INCOMPATIBLE`).
+    #[cfg(test)]
+    pub(crate) const fn packed_dup_max(mut self, packed_max: u16) -> Self {
+        self.packed_max = packed_max;
+        self
+    }
+
+    /// The `packed_max` of the engine dup tables: [`DupOptions::PACKED_DEFAULT`], but under the
+    /// test-only [`Self::packed_dup_max`].
+    const fn packed_max(&self) -> u16 {
+        #[cfg(test)]
+        return self.packed_max;
+        #[cfg(not(test))]
+        DupOptions::PACKED_DEFAULT
+    }
+
     /// The engine's options: these settings, and the engine's defaults for the rest (its access
     /// advice among them).
     fn options(&self) -> EnvOptions {
@@ -216,15 +248,16 @@ pub(crate) struct TableEntry {
 
 impl TableEntry {
     /// The entry of `table`, which `txn` holds, with its layout `dup` ([`TableMap::layout`]),
-    /// once its form in the file (an engine dup table or a plain one, from its catalog record) is
-    /// the one that layout stores it in ([`DupLayout::options`]; plain for every table without a
-    /// layout); another form is [`error::form_mismatch`].
+    /// once its form in the file (from its catalog record: a plain table, or a dup table with its
+    /// options) is `expected`, the one that layout stores it in ([`TableMap::options`]: `None`
+    /// for a plain table); another form, or a dup table with another key width or `packed_max`,
+    /// is [`error::form_mismatch`].
     fn open(
         txn: &impl ReadTxn,
         table: Table,
         dup: Option<DupLayout>,
+        expected: Option<DupOptions>,
     ) -> Result<Self, DatabaseError> {
-        let expected = dup.and_then(|layout| layout.options());
         let found = txn.table_stat(&table).map_err(|e| DatabaseError::Open(error::info(&e)))?.dup;
         if found != expected {
             return Err(error::form_mismatch(table.name(), found, expected));
@@ -252,12 +285,21 @@ pub(crate) struct TableMap {
     entries: HashMap<&'static str, TableEntry, BuildHasherDefault<NameHasher>>,
     /// Whether nested layouts are engine dup tables ([`TndbArgs::nested_dup`]).
     nested_dup: bool,
+    /// The `packed_max` of the engine dup tables ([`TndbArgs::packed_max`]).
+    packed_max: u16,
+    /// The file's page size, at which [`Self::options`] resolves a dup table's options.
+    page_size: u32,
 }
 
 impl TableMap {
-    /// An empty map; `nested_dup` as [`TndbArgs::nested_dup`].
-    fn new(nested_dup: bool) -> Self {
-        Self { entries: HashMap::default(), nested_dup }
+    /// An empty map for a file of `page_size`-byte pages opened with `args`.
+    fn new(args: &TndbArgs, page_size: u32) -> Self {
+        Self {
+            entries: HashMap::default(),
+            nested_dup: args.nested_dup(),
+            packed_max: args.packed_max(),
+            page_size,
+        }
     }
 
     /// The layout this environment stores dup-sort table `name` with: its [`dup_layout`], made
@@ -267,10 +309,23 @@ impl TableMap {
             .map(|layout| DupLayout { nested: layout.nested && self.nested_dup, ..layout })
     }
 
+    /// The options this environment stores a table of layout `dup` with, as the engine records
+    /// them: for an engine dup table its [`DupLayout::options`] with this map's `packed_max`,
+    /// resolved at the file's page size ([`DupOptions::resolved`]); `None` for a plain table (no
+    /// layout, or composite keys).
+    fn options(&self, dup: Option<DupLayout>) -> tndb_b::Result<Option<DupOptions>> {
+        dup.and_then(|layout| layout.options())
+            .map(|options| {
+                DupOptions { packed_max: self.packed_max, ..options }.resolved(self.page_size)
+            })
+            .transpose()
+    }
+
     /// The entry of `table`, which `txn` holds, with its layout ([`TableEntry::open`]).
     fn entry(&self, txn: &impl ReadTxn, table: Table) -> Result<TableEntry, DatabaseError> {
         let dup = self.layout(table.name());
-        TableEntry::open(txn, table, dup)
+        let expected = self.options(dup).map_err(|e| DatabaseError::Open(error::info(&e)))?;
+        TableEntry::open(txn, table, dup, expected)
     }
 }
 
@@ -382,7 +437,7 @@ impl TndbEnv {
         }
         .map_err(open_error)?;
         let txn = env.begin_ro().map_err(open_error)?;
-        let mut tables = TableMap::new(args.nested_dup());
+        let mut tables = TableMap::new(&args, env.stat().page_size);
         for name in Tables::ALL.iter().map(Tables::name) {
             if let Some(table) = txn.open_table(name).map_err(open_error)? {
                 let entry = tables.entry(&txn, table)?;
@@ -407,19 +462,22 @@ impl TndbEnv {
     }
 
     /// Create every table of `TS` the file lacks, and add them to the table map: a dup-sort
-    /// table whose layout is an engine dup table as one (`DupLayout::options`), every other
-    /// table as a plain one. A table the file holds in the other form (or a dup table with other
-    /// options) is the engine's `TableKind`, `MDBX_INCOMPATIBLE` as [`DatabaseError::CreateTable`].
+    /// table whose layout is an engine dup table as one (`DupLayout::options`, resolved at the
+    /// file's page size), every other table as a plain one. A table the file holds in the other
+    /// form (or a dup table with other options) is the engine's `TableKind`, `MDBX_INCOMPATIBLE`
+    /// as [`DatabaseError::CreateTable`].
     pub fn create_tables_for<TS: TableSet>(&mut self) -> Result<(), DatabaseError> {
         let mut txn = self.env.begin_rw().map_err(|e| DatabaseError::InitTx(error::info(&e)))?;
         let mut created = Vec::new();
         for info in TS::tables() {
             let name = info.name();
-            let table = match self.tables.layout(name).and_then(|layout| layout.options()) {
+            let create_error = |e: tndb_b::Error| DatabaseError::CreateTable(error::info(&e));
+            let options = self.tables.options(self.tables.layout(name)).map_err(create_error)?;
+            let table = match options {
                 Some(options) => txn.create_dup_table(name, options),
                 None => txn.create_table(name),
             }
-            .map_err(|e| DatabaseError::CreateTable(error::info(&e)))?;
+            .map_err(create_error)?;
             created.push((name, self.tables.entry(&txn, table)?));
         }
         txn.commit().map_err(|e| DatabaseError::Commit(error::info(&e)))?;

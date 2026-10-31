@@ -7,7 +7,7 @@
 //! `dup_value_with_same_subkey`). Not ported:
 //! `db_drop_orphan_table` (MDBX's table handles).
 
-use super::dup::second_value_refused;
+use super::{dup::second_value_refused, Form};
 use crate::{TndbArgs, TndbEnv, TndbEnvKind};
 use alloy::{
     consensus::Header,
@@ -33,16 +33,13 @@ use tempfile::TempDir;
 
 /// Create database for testing. Returns the `TempDir` to prevent cleanup until test ends.
 pub(super) fn create_test_db(kind: TndbEnvKind) -> (TempDir, TndbEnv) {
-    create_test_db_with(kind, true)
+    create_test_db_with(kind, Form::Packed)
 }
 
-/// [`create_test_db`] with the tables of the nested dup layouts in one form: engine dup tables
-/// (`nested`), or composite keys in plain tables ([`TndbArgs::composite_dup_tables`]).
-pub(super) fn create_test_db_with(kind: TndbEnvKind, nested: bool) -> (TempDir, TndbEnv) {
+/// [`create_test_db`] with the tables of the nested dup layouts in `form`.
+pub(super) fn create_test_db_with(kind: TndbEnvKind, form: Form) -> (TempDir, TndbEnv) {
     let tempdir = tempfile::TempDir::new().expect(ERROR_TEMPDIR);
-    let args =
-        if nested { TndbArgs::default() } else { TndbArgs::default().composite_dup_tables() };
-    let env = create_test_db_with_path(kind, tempdir.path(), args);
+    let env = create_test_db_with_path(kind, tempdir.path(), form.args());
     (tempdir, env)
 }
 

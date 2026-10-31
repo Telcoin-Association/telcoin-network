@@ -75,15 +75,17 @@ sort by key, then by subkey, as MDBX sorts a key's values. Each table has one of
 | `AccountChangeSets` | `BlockNumber` (8) | `Address` (20) | composite |
 | `StoragesTrie` | `B256` (32) | `StoredNibblesSubKey` (65) | nested |
 
-- **Nested** (the state tables): an engine dup table, each key one cell of an outer tree naming a
-  nested tree of the key's rows. A seek bounded to a key (`seek_exact`, `seek_by_key_subkey`, a
+- **Nested** (the state tables): an engine dup table, each key one cell of an outer tree holding
+  the key's rows packed when they encode within the page size's most (`DupOptions::packed`, 987
+  bytes for a 20-byte key at 4 KiB pages), else naming a nested tree of them. A seek bounded to a key (`seek_exact`, `seek_by_key_subkey`, a
   dup `get`) never reads the next key's cell, and a key's wipe (`delete_current_duplicates`,
   `delete(k, None)`) frees its tree in one walk.
 - **Composite** (the changesets, appended by block and read by range): a plain engine table keyed
   `key ‖ subkey`, a block range's rows one leaf chain.
 
-The form is part of the file's format: the open refuses a table held in the other form
-(`MDBX_INCOMPATIBLE`, naming the table and both forms). A read returns the value (subkey, then the
+The form is part of the file's format: the open refuses a table held in the other form, or a dup
+table with another key width or `packed_max` (`MDBX_INCOMPATIBLE`, naming the table and both
+forms). A read returns the value (subkey, then the
 rest) as one slice of the page, through the engine's `current_with_key_tail`, with no copy.
 `seek_by_key_subkey` reads its row in the seek itself, from the leaf the seek fetched (the engine's
 `seek_with_key_tail`, with `key ‖ subkey` built on the stack; `seek_dup_with_key_tail` on a nested
@@ -121,18 +123,19 @@ table, the subkey given apart). A row this layout cannot hold is `MDBX_BAD_VALSI
 
 ## Tests
 
-Every test of a dup-sort table runs on both forms: the production one, and every table composite
-through a test-only knob (`TndbArgs::composite_dup_tables`), the changesets' path.
+Every test of a dup-sort table runs on three forms: the production one (packed), a small packing
+bound (`TndbArgs::packed_dup_max(128)`: a key promotes at its second or third row), and every
+table composite (`TndbArgs::composite_dup_tables`), the changesets' path.
 
 - **reth's MDBX tests,** ported with only the constructor swapped (`tests/mdbx_port.rs`); three
   dup-sort tests assert the one-value-per-subkey refusal instead.
 - **The adapter's own** (`tests/adapter.rs`, `tests/dup.rs`): MDBX's error codes, reth's error
   variants, the metrics, every dup cursor call and the cursor steps after a delete or `last`, each
-  run on MDBX too and on both forms, the layouts and forms against reth's encodings, the form
+  run on MDBX too and on every form, the layouts and forms against reth's encodings, the form
   check at open, and the differences pinned beside MDBX's results.
 - **A differential test** (`tests/differential.rs`): random scripts of transaction and cursor
   calls (two write cursors and a read cursor, commits, aborts, a held read transaction) run on
-  MDBX and on tndb-b in both forms, each form's outcome list equal to MDBX's; it skips the
+  MDBX and on tndb-b in every form, each form's outcome list equal to MDBX's; it skips the
   documented differences, about 4% of ops, each form's skips equal to MDBX's run's, and fails if a
   tenth or more are skipped. A second value for a dup row's subkey runs on tndb-b only, which must
   refuse it and change nothing (the ops after it still match MDBX's). `random_scripts_match_mdbx`

@@ -13,6 +13,9 @@
 //! `delete_current_duplicates`, a key's rows then put again) and the transaction, and every 13th
 //! round first clears that table; puts rows of one account of [`BIG_SLOTS`] slots, whose rows span
 //! several of the engine's nested leaves, and every 11th round first wipes it; puts and deletes
+//! rows of [`SMALL_ACCOUNTS`] accounts of a few slots each (packed sets rewritten, now and then
+//! emptied) and puts [`GROWING_PUTS`] rows of one more account (packed after the table's clear,
+//! promoted to a nested tree some rounds later); puts and deletes
 //! `Bytecodes` values of 1.5 KiB to 70 KiB (overflow runs); and writes the
 //! progress row. The puts and deletes take keys of a fixed set, so later rounds replace and delete
 //! earlier rounds' rows; the appends take keys (and subkeys) from the round, so each sorts after
@@ -38,7 +41,7 @@
 //! engine's commit as a whole under process death, not power loss: the engine's crash matrix
 //! (`tndb-b`'s `tests::crash`) covers lost and torn writes with a disk model.
 
-use super::adapter::form_args;
+use super::Form;
 use crate::{TndbEnv, TndbEnvKind};
 use alloy::primitives::{Address, Bytes, B256, U256};
 use reth_db_api::{
@@ -88,6 +91,17 @@ const CODE_KEYS: u64 = 20;
 const BIG_SLOTS: u64 = 600;
 const BIG_PUTS: u64 = 60;
 
+/// The small accounts ([`small_account`]), each of up to [`SMALL_SLOTS`] rows: a packed set on an
+/// engine dup table, which each round rewrites.
+const SMALL_ACCOUNTS: u64 = 8;
+const SMALL_SLOTS: u64 = 3;
+
+/// The slots of the growing account ([`growing_account`]), of which a round puts
+/// [`GROWING_PUTS`] new ones: from the table's clear every 13th round it packs, and some rounds
+/// later a commit promotes it to a nested tree.
+const GROWING_SLOTS: u64 = 64;
+const GROWING_PUTS: u64 = 3;
+
 /// The lengths of `Bytecodes` values: all past a 4 KiB page's inline limit, up to runs of 18
 /// pages.
 const CODE_SIZES: [usize; 6] = [1_500, 4_100, 9_000, 17_000, 40_000, 70_000];
@@ -133,6 +147,16 @@ fn slot(i: u64) -> B256 {
 /// An account outside the [`ACCOUNTS`], of up to [`BIG_SLOTS`] rows ([`big_slot`]).
 fn big_account() -> Address {
     account(ACCOUNTS)
+}
+
+/// The `i`th account of a few rows, outside the [`ACCOUNTS`] and the big one.
+fn small_account(i: u64) -> Address {
+    account(ACCOUNTS + 1 + i)
+}
+
+/// The account whose rows grow from the table's clear ([`GROWING_SLOTS`]).
+fn growing_account() -> Address {
+    account(ACCOUNTS + 1 + SMALL_ACCOUNTS)
 }
 
 fn big_slot(i: u64) -> B256 {
@@ -239,6 +263,23 @@ fn round_ops(round: u64) -> Vec<Op> {
         };
         ops.push(Op::PutStorage(big_account(), entry));
     }
+    // The small accounts: puts rewriting their packed sets, and a delete that now and then leaves
+    // one empty; then the growing account's new slots.
+    for i in 0..3 {
+        let entry = StorageEntry {
+            key: slot((r + i) % SMALL_SLOTS),
+            value: U256::from((r << 8) | (16 + i)),
+        };
+        ops.push(Op::PutStorage(small_account((r * 3 + i) % SMALL_ACCOUNTS), entry));
+    }
+    ops.push(Op::DelStorageRow(small_account((r * 5) % SMALL_ACCOUNTS), slot(r % SMALL_SLOTS)));
+    for i in 0..GROWING_PUTS {
+        let entry = StorageEntry {
+            key: slot((r * GROWING_PUTS + i) % GROWING_SLOTS),
+            value: U256::from((r << 8) | i | 1),
+        };
+        ops.push(Op::PutStorage(growing_account(), entry));
+    }
     ops.push(Op::DelCode(code_key((r * 7) % CODE_KEYS)));
     ops.push(Op::Progress(r));
     ops
@@ -303,7 +344,7 @@ fn say(line: &str) {
 #[test]
 fn crash_cycle_child() {
     let Some(dir) = std::env::var_os(CHILD_ENV) else { return };
-    let args = form_args(std::env::var_os(COMPOSITE_ENV).is_none());
+    let args = Form::nested(std::env::var_os(COMPOSITE_ENV).is_none()).args();
     let mut db = super::open_env(Path::new(&dir), TndbEnvKind::RW, args).unwrap();
     db.create_tables().unwrap();
     let start = progress(&db.tx().unwrap()) + 1;
@@ -495,7 +536,7 @@ fn crash_cycles(cycles: u32, nested: bool) -> (u64, Landed) {
     let mut rng = Rng(seed);
     let dir = tempfile::tempdir().unwrap();
     // The tables exist before the first child, so a lost commit shows as lost progress.
-    super::open_env(dir.path(), TndbEnvKind::RW, form_args(nested))
+    super::open_env(dir.path(), TndbEnvKind::RW, Form::nested(nested).args())
         .and_then(|mut db| db.create_tables())
         .unwrap();
     let exe = std::env::current_exe().unwrap();
@@ -581,7 +622,7 @@ fn crash_cycles(cycles: u32, nested: bool) -> (u64, Landed) {
             Some(Line::Commit(n)) => n - 1..=*n,
         };
 
-        let db = super::open_env(dir.path(), TndbEnvKind::RW, form_args(nested))
+        let db = super::open_env(dir.path(), TndbEnvKind::RW, Form::nested(nested).args())
             .unwrap_or_else(|e| panic!("cycle {cycle} ({kill_at:?}): reopen failed: {e:?}"));
         assert_eq!(db.failure(), None, "cycle {cycle}: a failure latched at reopen");
         let got = progress(&db.tx().unwrap());

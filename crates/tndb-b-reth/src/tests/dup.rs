@@ -1,12 +1,13 @@
 //! Dup-sort tables: each reth call on a dup-sort table, run on MDBX too (the oracle), the
 //! layouts against reth's encodings, rows the layout cannot hold, and the known differences from
-//! MDBX's cursors. The calls on `PlainStorageState` run on both of its forms
-//! ([`on_both_forms`]): an engine dup table, and composite keys in a plain table (the
-//! changesets' form).
+//! MDBX's cursors. The calls on `PlainStorageState` run on each of its forms
+//! ([`on_every_form`]): an engine dup table packing up to the page size's most, one packing at
+//! most a key's first row or two, and composite keys in a plain table (the changesets' form).
 
 use super::{
     adapter::create_mdbx_db,
     mdbx_port::{create_test_db, create_test_db_with},
+    Form,
 };
 use crate::{
     dup::{dup_layout, DupLayout, DUP_LAYOUTS},
@@ -32,23 +33,23 @@ use reth_primitives_traits::{Account, StorageEntry, ValueWithSubKey};
 use reth_storage_errors::db::{DatabaseErrorInfo, DatabaseWriteError, DatabaseWriteOperation};
 use reth_trie_common::{BranchNodeCompact, Nibbles, StorageTrieEntry, StoredNibblesSubKey};
 use std::fmt::Debug;
+use tndb_b::DupOptions;
 
 /// Runs `test` on a new database (and its directory) once per form of the nested layouts'
-/// tables: engine dup tables, then composite keys in plain tables
-/// ([`crate::TndbArgs::composite_dup_tables`]). A panic names the form it failed on.
-fn on_both_forms(test: impl Fn(TndbEnv)) {
+/// tables ([`Form::ALL`]). A panic names the form it failed on.
+fn on_every_form(test: impl Fn(TndbEnv)) {
     /// Names its form when dropped by a panic.
-    struct Form(bool);
-    impl Drop for Form {
+    struct Named(Form);
+    impl Drop for Named {
         fn drop(&mut self) {
             if std::thread::panicking() {
-                eprintln!("failed on the {} form", if self.0 { "nested" } else { "composite" });
+                eprintln!("failed on the {} form", self.0.name());
             }
         }
     }
-    for nested in [true, false] {
-        let (_dir, db) = create_test_db_with(TndbEnvKind::RW, nested);
-        let _form = Form(nested);
+    for form in Form::ALL {
+        let (_dir, db) = create_test_db_with(TndbEnvKind::RW, form);
+        let _form = Named(form);
         test(db);
     }
 }
@@ -331,7 +332,7 @@ fn dup_moves<D: Database>(db: &D) -> Vec<String> {
 
 #[test]
 fn dup_cursor_calls_match_mdbx() {
-    on_both_forms(|db| {
+    on_every_form(|db| {
         let (_mdbx_dir, mdbx) = create_mdbx_db();
         let expected = dup_moves(&mdbx);
         let got = dup_moves(&db);
@@ -597,7 +598,7 @@ const DUP_MATCHED: &[&str] = &[
 
 #[test]
 fn dup_cursor_steps_after_a_delete_or_last_match_mdbx() {
-    on_both_forms(|db| {
+    on_every_form(|db| {
         let (_mdbx_dir, mdbx) = create_mdbx_db();
         for seq in DUP_MATCHED {
             assert_eq!(dup_steps(&db, seq), dup_steps(&mdbx, seq));
@@ -632,7 +633,7 @@ fn dup_delete_in_a_key_whose_subkeys_differ_in_their_first_byte_matches_mdbx() {
         };
         format!("sk:1/{at}={sought} d={deleted} {then}={step}")
     }
-    on_both_forms(|db| {
+    on_every_form(|db| {
         let (_mdbx_dir, mdbx) = create_mdbx_db();
         for at in [1, 2, 3] {
             for then in ["c", "n", "p", "nd", "pd", "d"] {
@@ -745,7 +746,7 @@ const DUP_DEVIATIONS: &[(&str, &str, &str)] = &[
 
 #[test]
 fn known_dup_cursor_deviations_from_mdbx() {
-    on_both_forms(|db| {
+    on_every_form(|db| {
         let (_mdbx_dir, mdbx) = create_mdbx_db();
         for (seq, on_mdbx, on_tndb) in DUP_DEVIATIONS {
             assert_eq!(dup_steps(&mdbx, seq), *on_mdbx, "MDBX");
@@ -819,8 +820,15 @@ fn dup_layouts_match_reths_encodings() {
     for (name, layout) in DUP_LAYOUTS {
         let nested = [PlainStorageState::NAME, HashedStorages::NAME, StoragesTrie::NAME];
         assert_eq!(layout.nested, nested.contains(&name), "{name}");
-        let options = layout.options().map(|options| (options.key_len, options.packed_max));
-        assert_eq!(options, layout.nested.then_some((layout.key as u16, 0)), "{name}");
+        let options = layout.options();
+        assert_eq!(options, layout.nested.then(|| DupOptions::packed(layout.key as u16)), "{name}");
+        // As the engine records them at 4 KiB pages: the longest inline value of the key width.
+        let resolved = options.map(|options| {
+            let options = options.resolved(4096).unwrap();
+            (options.key_len, options.packed_max)
+        });
+        let most = if layout.key == 20 { 987 } else { 975 };
+        assert_eq!(resolved, layout.nested.then_some((layout.key as u16, most)), "{name}");
     }
 }
 
@@ -937,7 +945,7 @@ fn a_raw_key_of_another_width_misses_as_on_mdbx() {
         log.push(format!("get: {:?}", tx.get::<PlainStorageState>(a(1))));
         log
     }
-    on_both_forms(|db| {
+    on_every_form(|db| {
         let (_mdbx_dir, mdbx) = create_mdbx_db();
         assert_eq!(probes(&db), probes(&mdbx));
     });
@@ -1020,7 +1028,7 @@ where
 /// last.
 #[test]
 fn seek_by_key_subkey_matches_mdbx_at_every_layouts_widths() {
-    on_both_forms(|db| {
+    on_every_form(|db| {
         let (_mdbx_dir, mdbx) = create_mdbx_db();
         macro_rules! same {
             ($table:ty) => {{
@@ -1069,7 +1077,7 @@ fn seek_by_key_subkey_matches_mdbx_at_every_layouts_widths() {
 /// subkeys at and past the stack buffer's limit.
 #[test]
 fn seek_by_key_subkey_longer_than_the_stack_buffer_matches_mdbx() {
-    on_both_forms(|db| {
+    on_every_form(|db| {
         let (_mdbx_dir, mdbx) = create_mdbx_db();
         let layout = dup_layout(PlainStorageState::NAME).unwrap();
         let (key, subkey) = (|n| wide_key(layout, n), |n| wide_subkey(layout, n));
@@ -1312,7 +1320,7 @@ fn a_range_walk_on_a_dup_table_starts_past_every_row_of_an_excluded_key() {
 #[test]
 fn dup_values_in_overflow_runs_read_back_whole() {
     type Raw = RawDupSort<PlainStorageState>;
-    on_both_forms(|db| {
+    on_every_form(|db| {
         let key = |n: u8| RawKey::<Address>::from_vec(vec![n; 20]);
         // Subkey `s`, then a rest of `len` bytes: 5000 and 3000 take overflow runs, 10 is inline.
         let value = |s: u8, len: usize| {
@@ -1474,7 +1482,7 @@ fn a_dup_write_refused_for_its_size_leaves_the_cursor_where_it_was() {
         "bu:1/9 n",
         "bi:3/1 p",
     ];
-    on_both_forms(|db| {
+    on_every_form(|db| {
         let (_mdbx_dir, mdbx) = create_mdbx_db();
         assert_eq!(
             big_write_steps(&db, SEQS[0]),
@@ -1507,7 +1515,7 @@ fn a_dup_row_written_again_with_its_value_matches_mdbx() {
         "se:2 tap:4/2 c n en",
         "se:2 tap:4/1 c n en",
     ];
-    on_both_forms(|db| {
+    on_every_form(|db| {
         let (_mdbx_dir, mdbx) = create_mdbx_db();
         assert_eq!(dup_steps(&db, SEQS[0]), "sk:1/1=1 u:1/3=ok c=1/3 n=1/5 p=1/3 en=6");
         for seq in SEQS {
@@ -1540,7 +1548,7 @@ fn a_second_value_for_a_subkey_is_refused_and_changes_nothing() {
         "se:2 tapx:4/1 c n en",
         "sk:1/1 putx:1/1 tapx:4/2 ux:2/2 ax:4/1 c n en",
     ];
-    on_both_forms(|db| {
+    on_every_form(|db| {
         let (_mdbx_dir, mdbx) = create_mdbx_db();
         assert_eq!(dup_steps(&db, SEQS[0]), "sk:1/1=1 ux:1/3=second c=1/1 n=1/3 p=1/1 en=6");
         for seq in SEQS {
@@ -1562,7 +1570,7 @@ fn a_second_value_for_a_subkey_is_refused_and_changes_nothing() {
 #[test]
 fn a_second_value_refusal_is_a_write_error_and_plain_tables_still_overwrite() {
     use DatabaseWriteOperation::{CursorAppend, CursorUpsert, PutAppend, PutUpsert};
-    on_both_forms(|db| {
+    on_every_form(|db| {
         let tx = db.tx_mut().unwrap();
         tx.put::<PlainStorageState>(a(1), e(1, 1)).unwrap();
         tx.put::<PlainStorageState>(a(2), e(1, 1)).unwrap();
