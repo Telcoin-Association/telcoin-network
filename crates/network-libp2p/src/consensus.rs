@@ -794,6 +794,18 @@ where
             );
         }
 
+        // Drop provider rows that hold records from other peers or a key that is not a BLS
+        // public key. The store no longer accepts them, and no code reads them, so a node
+        // that upgrades must not keep them for the provider TTL (issue #1720).
+        let purged_remote_providers = kad_store.scrub_remote_providers();
+        if purged_remote_providers > 0 {
+            info!(
+                target: "network-kad",
+                purged_remote_providers,
+                "purged provider records from remote providers from kad store at startup"
+            );
+        }
+
         kad_store
             .enable_retention()
             .map_err(|error| NetworkError::StoreKademliaRecord(error.to_string()))?;
@@ -3174,55 +3186,62 @@ where
 
     /// Process an inbound kad add-provider request.
     ///
-    /// Brought to parity with [`Self::process_kad_put_request`]. Kademlia runs
-    /// under [`kad::StoreInserts::FilterBoth`], so this arm is the sole write
-    /// path for inbound provider records: an attacker-supplied record would
-    /// otherwise be persisted with no ban or authenticity check, unlike every
-    /// other sender-supplied write. libp2p has already verified that a provider
-    /// record's `provider` equals the authenticated request source, so gating on
-    /// [`PeerManager::peer_banned`] rejects records from banned peers (including a
-    /// peer banned at the application layer that the `PutRecord` path would also
-    /// reject) before anything reaches the store. Records from banned peers are
-    /// dropped rather than written. See issue #1001.
+    /// Kademlia runs under [`kad::StoreInserts::FilterBoth`], so this arm is the sole write
+    /// path for inbound provider records. libp2p has already verified that a record's
+    /// `provider` equals the authenticated request source.
     ///
-    /// Two further bounds keep one unbanned peer from starving the network task
-    /// through this write path (GHSA-5475-xf29-3rv8). First, a per-provider rate
-    /// limit ([`PeerManager::add_provider_rate_limited`]): each admitted message
-    /// costs a row decode, merge, re-encode, insert, and a physical MDBX commit,
-    /// and repeating `AddProvider` for an already-stored key skips the store's
-    /// capacity gate, so an unbounded stream would run that work at line rate;
-    /// over-budget messages are dropped with `Penalty::Load(LoadPenalty::KademliaRateLimit)`
-    /// at Medium weight. Second, the
-    /// expected capacity rejection is logged at `debug!` and never propagated:
-    /// once the provider table saturates, `MaxProvidedKeys` is remotely
-    /// triggerable, so propagating it would amplify a flood in the run-loop's
-    /// per-event `error!`. Other store rejections remain visible at `warn!`, and
-    /// database failures are logged at `error!` by the store with their cause.
-    /// Rate-limit drops are counted separately for the primary and worker networks.
+    /// The node stores only its own provider record. No code in the node reads a provider
+    /// record from another peer, so a stored inbound row has no consumer. It only costs
+    /// memory, a row decode and re-encode, and an MDBX commit, and it lets any connected peer
+    /// fill the provider table (issue #1720). So every record whose `provider` is not the
+    /// local peer is dropped with a `trace!` log and counted. The sender is not penalized,
+    /// because an honest peer sends `AddProvider` when it starts providing its own key.
+    ///
+    /// Two checks run first and stay in place. The ban filter
+    /// ([`PeerManager::peer_banned`]) drops records from banned peers (issue #1001). The
+    /// per-provider rate limit ([`PeerManager::add_provider_rate_limited`]) drops
+    /// over-budget messages with `Penalty::Load(LoadPenalty::KademliaRateLimit)` at Medium
+    /// weight, so a flood still costs the sender (GHSA-5475-xf29-3rv8).
+    ///
+    /// A record that reaches the store is logged by error class. The capacity rejection
+    /// `MaxProvidedKeys` is logged at `debug!` and never propagated, so a flood can not
+    /// amplify into the run-loop's per-event `error!`. Other store rejections remain visible
+    /// at `warn!`, and the store logs database failures at `error!` with their cause.
+    /// Rate-limit drops and remote-provider drops are counted separately for the primary and
+    /// worker networks.
     fn process_kad_add_provider(&mut self, record: Option<kad::ProviderRecord>) {
         // The ban check borrows the swarm immutably and yields an owned `Option`
         // before the rate-limit and store steps borrow it mutably, so no two
         // borrows are held at once.
         let permitted = record
             .filter(|record| !self.swarm.behaviour().peer_manager.peer_banned(&record.provider));
+        let local_peer_id = *self.swarm.local_peer_id();
 
         permitted.into_iter().for_each(|record| {
             let provider = record.provider;
-            if self.swarm.behaviour_mut().peer_manager.add_provider_rate_limited(provider) {
-                trace!(target: "network-kad", ?provider, "rate limiting inbound add provider");
-                self.metrics.record_add_provider_rate_limited();
-                self.swarm.behaviour_mut().peer_manager.process_penalty(provider, Penalty::Load(LoadPenalty::KademliaRateLimit));
-            } else {
-                self.swarm.behaviour_mut().kademlia.store_mut().add_provider(record).unwrap_or_else(
-                    |error| match error {
-                        kad::store::Error::MaxProvidedKeys => {
-                            debug!(target: "network-kad", ?provider, "dropping inbound provider record: store at capacity");
-                        }
-                        kad::store::Error::ValueTooLarge | kad::store::Error::MaxRecords => {
-                            bounded_warn!(Record, target: "network-kad", ?provider, ?error, "dropping inbound provider record");
-                        }
-                    },
-                );
+            match () {
+                _ if self.swarm.behaviour_mut().peer_manager.add_provider_rate_limited(provider) => {
+                    trace!(target: "network-kad", ?provider, "rate limiting inbound add provider");
+                    self.metrics.record_add_provider_rate_limited();
+                    self.swarm.behaviour_mut().peer_manager.process_penalty(provider, Penalty::Load(LoadPenalty::KademliaRateLimit));
+                }
+                _ if provider != local_peer_id => {
+                    // Only the local self-provide is stored. A remote record has no reader.
+                    trace!(target: "network-kad", ?provider, "dropping inbound provider record from a remote provider");
+                    self.metrics.record_add_provider_remote_dropped();
+                }
+                _ => {
+                    self.swarm.behaviour_mut().kademlia.store_mut().add_provider(record).unwrap_or_else(
+                        |error| match error {
+                            kad::store::Error::MaxProvidedKeys => {
+                                debug!(target: "network-kad", ?provider, "dropping inbound provider record: store at capacity");
+                            }
+                            kad::store::Error::ValueTooLarge | kad::store::Error::MaxRecords => {
+                                bounded_warn!(Record, target: "network-kad", ?provider, ?error, "dropping inbound provider record");
+                            }
+                        },
+                    );
+                }
             }
         });
     }

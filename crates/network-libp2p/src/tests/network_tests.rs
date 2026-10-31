@@ -4493,78 +4493,116 @@ async fn test_publisherless_put_cannot_delete_own_record() -> eyre::Result<()> {
     Ok(())
 }
 
-/// Inbound `AddProvider` gates the store write on the provider's ban status, at
-/// parity with the `PutRecord` path (issue #1001). Under `StoreInserts::FilterBoth`
-/// this arm is the sole write path for inbound provider records, so an un-gated
-/// arm would persist an attacker-supplied record from a peer already banned at the
-/// application layer.
+/// Whether one snapshot of `snapshotter` holds every primary-network counter in `expected`
+/// at its value.
+fn primary_counters_eq(
+    snapshotter: &metrics_util::debugging::Snapshotter,
+    expected: &[(&str, u64)],
+) -> bool {
+    use metrics_util::debugging::DebugValue;
+
+    let snapshot = snapshotter.snapshot().into_vec();
+    expected.iter().all(|(name, count)| {
+        snapshot.iter().any(|(key, _, _, value)| {
+            key.key().name() == *name
+                && key
+                    .key()
+                    .labels()
+                    .any(|label| label.key() == "network" && label.value() == "primary")
+                && matches!(value, DebugValue::Counter(seen) if seen == count)
+        })
+    })
+}
+
+/// Inbound `AddProvider` checks the provider's ban status first, at parity with the
+/// `PutRecord` path (issue #1001). The store keeps only the local self-provide (issue
+/// #1720), so no remote record is stored, and the remote-drop counter shows how far a
+/// record got.
 ///
-/// A record from an un-banned provider is stored; a record from a banned provider
-/// is dropped before it reaches the store. Deleting the ban filter in
-/// `process_kad_add_provider` (storing unconditionally, i.e. today's behaviour)
-/// makes the banned-provider assertion fail, pinning the gate.
+/// A record from an un-banned provider passes the ban filter, is dropped as a remote
+/// record and is counted. A record from a banned provider is dropped by the ban filter
+/// first and is not counted. Deleting the ban filter in `process_kad_add_provider` lets
+/// the banned record reach the remote drop, so the counter reads 2 and the test fails.
 #[tokio::test]
 async fn test_add_provider_rejects_banned_provider() {
     use libp2p::kad;
+    use metrics_util::debugging::DebuggingRecorder;
 
-    let TestTypes { peer1, .. } = create_test_types::<TestWorkerRequest, TestWorkerResponse>();
-    let mut network = peer1.network;
+    let recorder = DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    metrics::with_local_recorder(&recorder, || {
+        let TestTypes { peer1, .. } = create_test_types::<TestWorkerRequest, TestWorkerResponse>();
+        let mut network = peer1.network;
 
-    // An un-banned provider: its record is persisted (positive path preserved).
-    // libp2p guarantees `provider == source`, so the provider id is authenticated;
-    // this test drives the handler directly and keys each record on its provider.
-    let honest = PeerId::random();
-    let honest_record = kad::ProviderRecord {
-        key: kad::RecordKey::new(&honest.to_bytes()),
-        provider: honest,
-        expires: None,
-        addresses: vec![],
-    };
-    assert!(!network.swarm.behaviour().peer_manager.peer_banned(&honest));
-    network.process_kad_add_provider(Some(honest_record.clone()));
-    assert_eq!(
-        network.swarm.behaviour_mut().kademlia.store_mut().providers(&honest_record.key).len(),
-        1,
-        "un-banned provider record is stored",
-    );
+        // An un-banned remote provider: its record is dropped before storage and counted.
+        // libp2p guarantees `provider == source`, so the provider id is authenticated;
+        // this test drives the handler directly.
+        let honest = PeerId::random();
+        let honest_record = kad::ProviderRecord {
+            key: kad::RecordKey::new(&[0_u8; BlsPublicKey::COMPRESSED_BYTES]),
+            provider: honest,
+            expires: None,
+            addresses: vec![],
+        };
+        assert!(!network.swarm.behaviour().peer_manager.peer_banned(&honest));
+        network.process_kad_add_provider(Some(honest_record.clone()));
+        assert!(
+            network
+                .swarm
+                .behaviour_mut()
+                .kademlia
+                .store_mut()
+                .providers(&honest_record.key)
+                .is_empty(),
+            "remote provider record is not stored (issue #1720)",
+        );
 
-    // A banned provider: register a default record then apply a Fatal penalty,
-    // which crosses the ban threshold on the first hit.
-    let attacker = PeerId::random();
-    network.swarm.behaviour_mut().peer_manager.disconnect_peer(attacker, false);
-    network.swarm.behaviour_mut().peer_manager.process_penalty(attacker, Penalty::Fatal);
+        // A banned provider: register a default record then apply a Fatal penalty,
+        // which crosses the ban threshold on the first hit.
+        let attacker = PeerId::random();
+        network.swarm.behaviour_mut().peer_manager.disconnect_peer(attacker, false);
+        network.swarm.behaviour_mut().peer_manager.process_penalty(attacker, Penalty::Fatal);
+        assert!(
+            network.swarm.behaviour().peer_manager.peer_banned(&attacker),
+            "attacker provider is banned",
+        );
+
+        // Its `AddProvider` is dropped by the ban filter: nothing lands in the store.
+        let attacker_record = kad::ProviderRecord {
+            key: kad::RecordKey::new(&[1_u8; BlsPublicKey::COMPRESSED_BYTES]),
+            provider: attacker,
+            expires: None,
+            addresses: vec![],
+        };
+        network.process_kad_add_provider(Some(attacker_record.clone()));
+        assert!(
+            network
+                .swarm
+                .behaviour_mut()
+                .kademlia
+                .store_mut()
+                .providers(&attacker_record.key)
+                .is_empty(),
+            "banned provider record is not stored (issue #1001)",
+        );
+    });
+
     assert!(
-        network.swarm.behaviour().peer_manager.peer_banned(&attacker),
-        "attacker provider is banned",
-    );
-
-    // Its `AddProvider` is dropped: nothing lands in the store for the attacker key.
-    let attacker_record = kad::ProviderRecord {
-        key: kad::RecordKey::new(&attacker.to_bytes()),
-        provider: attacker,
-        expires: None,
-        addresses: vec![],
-    };
-    network.process_kad_add_provider(Some(attacker_record.clone()));
-    assert!(
-        network
-            .swarm
-            .behaviour_mut()
-            .kademlia
-            .store_mut()
-            .providers(&attacker_record.key)
-            .is_empty(),
-        "banned provider record is not stored (issue #1001)",
+        primary_counters_eq(&snapshotter, &[("tn_network.add_provider_remote_dropped_total", 1)]),
+        "only the un-banned record reaches the remote-provider drop",
     );
 }
 
-/// The sixth provider announcement is dropped before storage and counted once.
+/// The sixth provider announcement from one peer is rate limited before storage and
+/// counted once. The first five pass the rate limit and are then dropped as remote
+/// records (issue #1720), so none of the six is stored and the sixth is not counted as a
+/// remote drop.
 ///
-/// Distinct keys make an accidental over-budget write observable even though
-/// repeated announcements for the same key would replace the existing provider.
+/// Distinct keys make an accidental write observable even though repeated announcements
+/// for the same key would replace the existing provider.
 #[tokio::test]
 async fn test_add_provider_rate_limit_counts_drops_before_storage() {
-    use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+    use metrics_util::debugging::DebuggingRecorder;
 
     let recorder = DebuggingRecorder::new();
     let snapshotter = recorder.snapshotter();
@@ -4575,20 +4613,23 @@ async fn test_add_provider_rate_limit_counts_drops_before_storage() {
 
         (0_u8..5).for_each(|key| {
             let record = kad::ProviderRecord {
-                key: kad::RecordKey::new(&[key]),
+                key: kad::RecordKey::new(&[key; BlsPublicKey::COMPRESSED_BYTES]),
                 provider,
                 expires: None,
                 addresses: vec![],
             };
             network.process_kad_add_provider(Some(record.clone()));
-            assert_eq!(
-                network.swarm.behaviour_mut().kademlia.store_mut().providers(&record.key).len(),
-                1,
-            );
+            assert!(network
+                .swarm
+                .behaviour_mut()
+                .kademlia
+                .store_mut()
+                .providers(&record.key)
+                .is_empty());
         });
 
         let rejected = kad::ProviderRecord {
-            key: kad::RecordKey::new(&b"over-budget"),
+            key: kad::RecordKey::new(&[0xff_u8; BlsPublicKey::COMPRESSED_BYTES]),
             provider,
             expires: None,
             addresses: vec![],
@@ -4603,14 +4644,70 @@ async fn test_add_provider_rate_limit_counts_drops_before_storage() {
             .is_empty());
     });
 
-    assert!(snapshotter.snapshot().into_vec().iter().any(|(key, _, _, value)| {
-        key.key().name() == "tn_network.add_provider_rate_limited_total"
-            && key
-                .key()
-                .labels()
-                .any(|label| label.key() == "network" && label.value() == "primary")
-            && matches!(value, DebugValue::Counter(1))
-    }));
+    assert!(primary_counters_eq(
+        &snapshotter,
+        &[
+            ("tn_network.add_provider_remote_dropped_total", 5),
+            ("tn_network.add_provider_rate_limited_total", 1),
+        ],
+    ));
+}
+
+/// Inbound `AddProvider` from a remote provider is dropped before storage and counted, with
+/// no penalty (issue #1720). Providing a key breaks no protocol rule, so the drop must not
+/// score the source. The local self-provide still reaches the store.
+#[tokio::test]
+async fn test_add_provider_drops_remote_provider_without_penalty() -> eyre::Result<()> {
+    use metrics_util::debugging::DebuggingRecorder;
+
+    let recorder = DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    metrics::with_local_recorder(&recorder, || -> eyre::Result<()> {
+        let TestTypes { peer1, .. } = create_test_types::<TestWorkerRequest, TestWorkerResponse>();
+        let mut network = peer1.network;
+        let source = register_untrusted_put_record_source(&mut network)?;
+
+        let remote = kad::ProviderRecord {
+            key: kad::RecordKey::new(&[0_u8; BlsPublicKey::COMPRESSED_BYTES]),
+            provider: source,
+            expires: None,
+            addresses: vec![],
+        };
+        network.process_kad_add_provider(Some(remote.clone()));
+        assert!(
+            network.swarm.behaviour_mut().kademlia.store_mut().providers(&remote.key).is_empty(),
+            "remote provider record is not stored",
+        );
+        assert_eq!(
+            network.swarm.behaviour().peer_manager.peer_score(&source),
+            Some(0.0),
+            "the drop must not penalize the source",
+        );
+        assert!(
+            !network.swarm.behaviour().peer_manager.peer_banned(&source),
+            "the drop must not ban the source",
+        );
+
+        let local = kad::ProviderRecord {
+            key: kad::RecordKey::new(&[1_u8; BlsPublicKey::COMPRESSED_BYTES]),
+            provider: *network.swarm.local_peer_id(),
+            expires: None,
+            addresses: vec![],
+        };
+        network.process_kad_add_provider(Some(local.clone()));
+        assert_eq!(
+            network.swarm.behaviour_mut().kademlia.store_mut().providers(&local.key).len(),
+            1,
+            "the local self-provide is stored",
+        );
+        Ok(())
+    })?;
+
+    assert!(
+        primary_counters_eq(&snapshotter, &[("tn_network.add_provider_remote_dropped_total", 1)]),
+        "the remote drop is counted once",
+    );
+    Ok(())
 }
 
 /// A cached URL is insufficient: coverage needs a live, matching verified record.
