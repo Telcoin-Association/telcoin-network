@@ -177,7 +177,10 @@ reth-libmdbx = { path = "vendor/reth/crates/storage/libmdbx-rs" }
 reth-metrics = { path = "vendor/reth/crates/metrics" }
 
 # eth
-alloy = { version = "1.6.3", features = ["full"] }
+# `rand` gives alloy's maps (`AddressMap`, `B256Map`, ...) a randomly seeded hasher, which resists
+# hash flooding, and provides `Address::random*`. reth-network-types used to enable it; TN now
+# asks for it itself (vendor/reth CHANGES.md TN-0031).
+alloy = { version = "1.6.3", features = ["full", "rand"] }
 alloy-rlp = "0.3.13"
 alloy-evm = { version = "0.27.2" }
 # Same requirement as vendor/reth/Cargo.toml; tn-reth names it only to set features.

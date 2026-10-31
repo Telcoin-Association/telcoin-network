@@ -245,6 +245,26 @@ newest last.
   `toml_datetime`, `serde_spanned` and `toml_writer` leave the build; toml stays a dev-dependency
   for reth-config's backwards-compatibility parsing tests. *Upstream*: no.
 
+- **TN-0031** — reth-network-api keeps only what reth's RPC uses. *Kind*: removal.
+  *Files*: `crates/net/network-api/{src/lib.rs, src/noop.rs, Cargo.toml}` (deleted
+  `src/{downloaders.rs, events.rs, test_utils/}`), `crates/config/{src/config.rs, Cargo.toml}`
+  (the `peers` and `sessions` sections, `peers_config_with_basic_nodes_from_file` and their
+  tests), `crates/rpc/rpc-builder/src/lib.rs` (`Peers` bounds become `PeersInfo`);
+  `crates/net/{p2p, network-types, banlist}` removed from the vendored set. Outside:
+  `crates/tn-reth/src/worker.rs` drops its no-op `Peers` impl, and the root `Cargo.toml` enables
+  alloy's `rand` feature.
+  *Why*: after TN-0021 removed the admin namespace, reth's RPC bounds only on `NetworkInfo`
+  (`eth_syncing`, `eth_chainId`, `web3_clientVersion`, `eth_protocolVersion`) and `PeersInfo`
+  (`net_peerCount`). `FullNetwork`, `Peers`, `PeerInfo`, the event and downloader traits and
+  `NoopNetwork`'s impls of them were the only users of reth-network-p2p, reth-network-types and
+  reth-net-banlist, and reth-config's devp2p sections the only other user of network-types.
+  `NetworkStatus` and alloy-rpc-types-admin stay (`network_status`).
+  *Feature check*: reth-network-types was what enabled alloy-primitives' `rand` feature, which
+  gives alloy's maps a randomly seeded hasher (hash-flooding resistance) and `Address::random*`
+  (TN's committee test builder uses it). Without it the graph silently lost the feature and the
+  test builder stopped compiling, so TN now requests it directly (`alloy` `rand`); `graph.py diff`
+  then shows no third-party feature change. *Upstream*: no.
+
 ## Upstream syncs
 
 - **TN-0013** — Sync to upstream v1.11.4 (`2ac58a25f561`). *Kind*: sync.

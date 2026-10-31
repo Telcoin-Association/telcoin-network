@@ -7159,7 +7159,6 @@ name = "reth-config"
 version = "1.11.3"
 dependencies = [
  "eyre",
- "reth-network-types",
  "reth-prune-types",
  "reth-stages-types",
  "reth-static-file-types",
@@ -7495,55 +7494,17 @@ dependencies = [
 ]
 
 [[package]]
-name = "reth-net-banlist"
-version = "1.11.3"
-dependencies = [
- "alloy-primitives",
- "ipnet",
-]
-
-[[package]]
 name = "reth-network-api"
 version = "1.11.3"
 dependencies = [
- "alloy-consensus",
  "alloy-primitives",
  "alloy-rpc-types-admin",
- "alloy-rpc-types-eth",
  "auto_impl",
- "derive_more",
  "enr",
- "futures",
  "reth-eth-wire-types",
- "reth-ethereum-forks",
- "reth-network-p2p",
  "reth-network-peers",
- "reth-network-types",
- "reth-tokio-util",
  "thiserror 2.0.18",
  "tokio",
- "tokio-stream",
-]
-
-[[package]]
-name = "reth-network-p2p"
-version = "1.11.3"
-dependencies = [
- "alloy-consensus",
- "alloy-eips",
- "alloy-primitives",
- "auto_impl",
- "derive_more",
- "futures",
- "reth-consensus",
- "reth-eth-wire-types",
- "reth-ethereum-primitives",
- "reth-network-peers",
- "reth-network-types",
- "reth-primitives-traits",
- "reth-storage-errors",
- "tokio",
- "tracing",
 ]
 
 [[package]]
@@ -7557,17 +7518,6 @@ dependencies = [
  "serde_with 3.18.0",
  "thiserror 2.0.18",
  "url",
-]
-
-[[package]]
-name = "reth-network-types"
-version = "1.11.3"
-dependencies = [
- "alloy-eip2124",
- "reth-net-banlist",
- "reth-network-peers",
- "serde_json",
- "tracing",
 ]
 
 [[package]]
