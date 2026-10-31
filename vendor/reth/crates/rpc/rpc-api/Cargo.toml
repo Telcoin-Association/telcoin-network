@@ -14,10 +14,9 @@ workspace = true
 [dependencies]
 # reth
 reth-rpc-eth-api.workspace = true
-reth-engine-primitives.workspace = true
-reth-network-peers.workspace = true
 reth-trie-common.workspace = true
-reth-chain-state.workspace = true
+# TN(TN-0021): reth-engine-primitives, reth-network-peers, reth-chain-state, alloy-serde and the
+# alloy admin/anvil/txpool/beacon/engine rpc types served only the removed namespaces.
 
 # ethereum
 alloy-eip7928 = { workspace = true, features = ["serde"] }
@@ -28,13 +27,7 @@ alloy-rpc-types-eth.workspace = true
 alloy-rpc-types.workspace = true
 alloy-rpc-types-debug.workspace = true
 alloy-rpc-types-trace.workspace = true
-alloy-rpc-types-anvil.workspace = true
 alloy-rpc-types-mev.workspace = true
-alloy-rpc-types-txpool.workspace = true
-alloy-rpc-types-admin.workspace = true
-alloy-serde.workspace = true
-alloy-rpc-types-beacon.workspace = true
-alloy-rpc-types-engine.workspace = true
 alloy-genesis.workspace = true
 
 # misc

@@ -14,24 +14,14 @@
 #![cfg_attr(not(test), warn(unused_crate_dependencies))]
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
-mod admin;
-mod anvil;
+// TN(TN-0021): the traits of namespaces TN never serves are removed: admin, anvil, engine,
+// hardhat, miner, otterscan, reth, testing, txpool and validation.
 mod debug;
-mod engine;
-mod hardhat;
 mod mev;
-mod miner;
 mod net;
-mod otterscan;
-mod reth;
 mod rpc;
-mod testing;
 mod trace;
-mod txpool;
-mod validation;
 mod web3;
-
-pub use testing::{TestingBuildBlockRequestV1, TESTING_BUILD_BLOCK_V1};
 
 /// re-export of all server traits
 pub use servers::*;
@@ -39,19 +29,11 @@ pub use servers::*;
 /// Aggregates all server traits.
 pub mod servers {
     pub use crate::{
-        admin::AdminApiServer,
         debug::{DebugApiServer, DebugExecutionWitnessApiServer},
-        engine::{EngineApiServer, EngineEthApiServer, IntoEngineApiRpcModule},
         mev::{MevFullApiServer, MevSimApiServer},
-        miner::MinerApiServer,
         net::NetApiServer,
-        otterscan::OtterscanServer,
-        reth::RethApiServer,
         rpc::RpcApiServer,
-        testing::TestingApiServer,
         trace::TraceApiServer,
-        txpool::TxPoolApiServer,
-        validation::BlockSubmissionValidationApiServer,
         web3::Web3ApiServer,
     };
     pub use reth_rpc_eth_api::{
@@ -68,21 +50,11 @@ pub use clients::*;
 #[cfg(feature = "client")]
 pub mod clients {
     pub use crate::{
-        admin::AdminApiClient,
-        anvil::AnvilApiClient,
         debug::{DebugApiClient, DebugExecutionWitnessApiClient},
-        engine::{EngineApiClient, EngineEthApiClient},
-        hardhat::HardhatApiClient,
         mev::{MevFullApiClient, MevSimApiClient},
-        miner::MinerApiClient,
         net::NetApiClient,
-        otterscan::OtterscanClient,
-        reth::RethApiClient,
         rpc::RpcApiServer,
-        testing::TestingApiClient,
         trace::TraceApiClient,
-        txpool::TxPoolApiClient,
-        validation::BlockSubmissionValidationApiClient,
         web3::Web3ApiClient,
     };
     pub use reth_rpc_eth_api::{

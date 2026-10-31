@@ -2,7 +2,7 @@
 //! Standalone http tests
 
 use crate::utils::{launch_http, launch_http_ws, launch_ws};
-use alloy_eips::{eip1898::LenientBlockNumberOrTag, BlockId, BlockNumberOrTag};
+use alloy_eips::{BlockId, BlockNumberOrTag};
 use alloy_primitives::{hex_literal::hex, Address, Bytes, TxHash, B256, B64, U256, U64};
 use alloy_rpc_types_eth::{
     transaction::TransactionRequest, Block, FeeHistory, Filter, Header, Index, Log,
@@ -19,11 +19,10 @@ use jsonrpsee::{
     types::error::ErrorCode,
 };
 use reth_ethereum_primitives::{Receipt, TransactionSigned};
-use reth_network_peers::NodeRecord;
+// TN(TN-0021): the admin and otterscan tests went with those namespaces.
 use reth_rpc_api::{
-    clients::{AdminApiClient, EthApiClient},
-    DebugApiClient, EthCallBundleApiClient, EthFilterApiClient, NetApiClient, OtterscanClient,
-    TraceApiClient, Web3ApiClient,
+    clients::EthApiClient, DebugApiClient, EthCallBundleApiClient, EthFilterApiClient,
+    NetApiClient, TraceApiClient, Web3ApiClient,
 };
 use reth_rpc_server_types::RethRpcModule;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
@@ -132,20 +131,6 @@ where
         EthFilterApiClient::<Transaction>::new_filter(client, Filter::default()).await.unwrap();
     EthFilterApiClient::<Transaction>::filter_logs(client, id.clone()).await.unwrap();
     EthFilterApiClient::<Transaction>::uninstall_filter(client, id).await.unwrap();
-}
-
-async fn test_basic_admin_calls<C>(client: &C)
-where
-    C: ClientT + SubscriptionClientT + Sync,
-{
-    let url = "enode://6f8a80d14311c39f35f516fa664deaaaa13e85b2f7493f37f6144d86991ec012937307647bd3b9a82abe2974e1407241d54947bbb39763a4cac9f77166ad92a0@10.3.58.6:30303?discport=30301";
-    let node: NodeRecord = url.parse().unwrap();
-
-    AdminApiClient::add_peer(client, node).await.unwrap();
-    AdminApiClient::remove_peer(client, node.into()).await.unwrap();
-    AdminApiClient::add_trusted_peer(client, node.into()).await.unwrap();
-    AdminApiClient::remove_trusted_peer(client, node.into()).await.unwrap();
-    AdminApiClient::node_info(client).await.unwrap();
 }
 
 async fn test_basic_eth_calls<C>(client: &C)
@@ -515,97 +500,6 @@ where
     Web3ApiClient::sha3(client, Bytes::default()).await.unwrap();
 }
 
-async fn test_basic_otterscan_calls<C>(client: &C)
-where
-    C: ClientT + SubscriptionClientT + Sync,
-{
-    let address = Address::default();
-    let sender = Address::default();
-    let tx_hash = TxHash::default();
-    let block_number = 1;
-    let page_number = 1;
-    let page_size = 10;
-    let nonce = 1;
-    let block_hash = B256::default();
-
-    OtterscanClient::<Transaction, Header>::get_header_by_number(
-        client,
-        LenientBlockNumberOrTag::new(BlockNumberOrTag::Number(block_number)),
-    )
-    .await
-    .unwrap();
-
-    OtterscanClient::<Transaction, Header>::has_code(client, address, None).await.unwrap();
-    OtterscanClient::<Transaction, Header>::has_code(client, address, Some(block_number.into()))
-        .await
-        .unwrap();
-
-    OtterscanClient::<Transaction, Header>::get_api_level(client).await.unwrap();
-
-    OtterscanClient::<Transaction, Header>::get_internal_operations(client, tx_hash).await.unwrap();
-
-    OtterscanClient::<Transaction, Header>::get_transaction_error(client, tx_hash).await.unwrap();
-
-    OtterscanClient::<Transaction, Header>::trace_transaction(client, tx_hash).await.unwrap();
-
-    OtterscanClient::<Transaction, Header>::get_block_details(
-        client,
-        LenientBlockNumberOrTag::new(BlockNumberOrTag::Number(block_number)),
-    )
-    .await
-    .unwrap_err();
-    OtterscanClient::<Transaction, Header>::get_block_details(client, Default::default())
-        .await
-        .unwrap_err();
-
-    OtterscanClient::<Transaction, Header>::get_block_details_by_hash(client, block_hash)
-        .await
-        .unwrap_err();
-
-    OtterscanClient::<Transaction, Header>::get_block_transactions(
-        client,
-        LenientBlockNumberOrTag::new(BlockNumberOrTag::Number(block_number)),
-        page_number,
-        page_size,
-    )
-    .await
-    .err()
-    .unwrap();
-
-    assert!(is_unimplemented(
-        OtterscanClient::<Transaction, Header>::search_transactions_before(
-            client,
-            address,
-            LenientBlockNumberOrTag::new(BlockNumberOrTag::Number(block_number)),
-            page_size,
-        )
-        .await
-        .err()
-        .unwrap()
-    ));
-    assert!(is_unimplemented(
-        OtterscanClient::<Transaction, Header>::search_transactions_after(
-            client,
-            address,
-            LenientBlockNumberOrTag::new(BlockNumberOrTag::Number(block_number)),
-            page_size,
-        )
-        .await
-        .err()
-        .unwrap()
-    ));
-    assert!(OtterscanClient::<Transaction, Header>::get_transaction_by_sender_and_nonce(
-        client, sender, nonce
-    )
-    .await
-    .err()
-    .is_none());
-    assert!(OtterscanClient::<Transaction, Header>::get_contract_creator(client, address)
-        .await
-        .unwrap()
-        .is_none());
-}
-
 #[tokio::test(flavor = "multi_thread")]
 async fn test_call_filter_functions_http() {
     reth_tracing::init_test_tracing();
@@ -613,33 +507,6 @@ async fn test_call_filter_functions_http() {
     let handle = launch_http(vec![RethRpcModule::Eth]).await;
     let client = handle.http_client().unwrap();
     test_filter_calls(&client).await;
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn test_call_admin_functions_http() {
-    reth_tracing::init_test_tracing();
-
-    let handle = launch_http(vec![RethRpcModule::Admin]).await;
-    let client = handle.http_client().unwrap();
-    test_basic_admin_calls(&client).await;
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn test_call_admin_functions_ws() {
-    reth_tracing::init_test_tracing();
-
-    let handle = launch_ws(vec![RethRpcModule::Admin]).await;
-    let client = handle.ws_client().await.unwrap();
-    test_basic_admin_calls(&client).await;
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn test_call_admin_functions_http_and_ws() {
-    reth_tracing::init_test_tracing();
-
-    let handle = launch_http_ws(vec![RethRpcModule::Admin]).await;
-    let client = handle.http_client().unwrap();
-    test_basic_admin_calls(&client).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -777,34 +644,6 @@ async fn test_call_web3_functions_http_and_ws() {
     test_basic_web3_calls(&client).await;
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn test_call_otterscan_functions_http() {
-    reth_tracing::init_test_tracing();
-
-    let handle = launch_http(vec![RethRpcModule::Ots]).await;
-    let client = handle.http_client().unwrap();
-    test_basic_otterscan_calls(&client).await;
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn test_call_otterscan_functions_ws() {
-    reth_tracing::init_test_tracing();
-
-    let handle = launch_ws(vec![RethRpcModule::Ots]).await;
-    let client = handle.ws_client().await.unwrap();
-    test_basic_otterscan_calls(&client).await;
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn test_call_otterscan_functions_http_and_ws() {
-    reth_tracing::init_test_tracing();
-
-    let handle = launch_http_ws(vec![RethRpcModule::Ots]).await;
-    let client = handle.http_client().unwrap();
-    test_basic_otterscan_calls(&client).await;
-}
-
-// <https://github.com/paradigmxyz/reth/issues/5830>
 #[tokio::test(flavor = "multi_thread")]
 async fn test_eth_logs_args() {
     reth_tracing::init_test_tracing();

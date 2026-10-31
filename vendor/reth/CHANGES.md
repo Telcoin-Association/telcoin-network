@@ -90,7 +90,8 @@ newest last.
   `CanonStateNotification`, which needs `reth-chain-state/serde`. Upstream never declares it and
   gets it only because `reth-node-core` enables `reth-network/serde`, which reaches chain-state
   through feature unification. TN-0008 removes that path, so `reth-rpc` stops compiling.
-  *Upstream*: yes, a real (latent) manifest bug.
+  *Upstream*: yes, a real (latent) manifest bug. *Superseded*: TN-0021 removed `reth.rs`, so the
+  line is back to upstream's.
 
 - **TN-0008** — Remove the devp2p parts of `reth-node-core`. *Kind*: removal.
   *Files*: `crates/node/core/src/args/network.rs` (deleted: `NetworkArgs`, `DiscoveryArgs`),
@@ -170,6 +171,27 @@ newest last.
   changes on top. They are used only for the client version reth's database records on open, and
   for payload extra data, which TN does not build. git2, libgit2-sys, libz-sys, vcpkg and
   vergen-git2 leave the graph. *Upstream*: n/a.
+
+- **TN-0021** — Remove the RPC namespaces TN never serves: admin, miner, otterscan, reth and
+  txpool, plus the unused anvil, hardhat, engine, testing and validation traits. *Kind*: removal.
+  *Files*: deleted `crates/rpc/rpc/src/{admin,miner,otterscan,reth,txpool}.rs` and
+  `crates/rpc/rpc-api/src/{admin,anvil,engine,hardhat,miner,otterscan,reth,testing,txpool,validation}.rs`;
+  `crates/rpc/rpc/src/lib.rs`, `crates/rpc/rpc-api/src/lib.rs`; `crates/rpc/rpc-builder/src/lib.rs`
+  (`admin_api`, `register_admin`, `register_ots`, `register_reth`, `otterscan_api`, `reth_api`;
+  the registry maps the five modules to empty method sets, like `flashbots` and `testing`);
+  `crates/rpc/rpc-builder/tests/it/http.rs` (the admin and otterscan tests); the manifests of
+  reth-rpc, reth-rpc-api and reth-rpc-builder (dependencies only those modules used;
+  `revm-primitives` and `alloy-rpc-types-admin` become reth-rpc dev-dependencies for its unit
+  tests).
+  *Why*: TN's allowlist (`tn-reth/src/cli.rs`, `ALLOWED_MODULES`) drops these namespaces from any
+  selection, so the code was compiled and never reachable. `RethRpcModule` keeps its variants, so
+  operator lists that name them still parse and are warned about as before. About 2.3k lines go.
+  `alloy-rpc-types-beacon` leaves the graph. `reth-chain-state`'s `serde` (TN-0007) went with
+  `reth.rs`. With it, `serde` drops from reth-chain-state, reth-execution-types, reth-storage-api,
+  reth-trie and parking_lot. That is no behavior change: it removes (de)serialization impls only,
+  and reth-trie's optional `parking_lot` dependency, used only by its test mocks. tn-reth now
+  declares reth-network-peers' `secp256k1` itself (for `Enr`), which it used to get from reth-rpc.
+  *Upstream*: no.
 
 ## Upstream syncs
 

@@ -27,29 +27,21 @@
 
 // TN(TN-0010): the `engine` (EngineApi re-export, EngineEthApi), `testing` and `validation`
 // (flashbots ValidationApi) modules are removed; TN serves none of them.
-mod admin;
+// TN(TN-0021): so are `admin`, `miner`, `otterscan`, `reth` and `txpool`, which TN's RPC
+// allowlist (`tn-reth/src/cli.rs`) never lets an operator enable.
 mod aliases;
 mod debug;
 pub mod eth;
-mod miner;
 mod net;
-mod otterscan;
-mod reth;
 mod rpc;
 mod trace;
-mod txpool;
 mod web3;
 
-pub use admin::AdminApi;
 pub use aliases::*;
 pub use debug::DebugApi;
 pub use eth::{helpers::SyncListener, EthApi, EthApiBuilder, EthBundle, EthFilter, EthPubSub};
-pub use miner::MinerApi;
 pub use net::NetApi;
-pub use otterscan::OtterscanApi;
-pub use reth::RethApi;
 pub use reth_rpc_convert::RpcTypes;
 pub use rpc::RPCApi;
 pub use trace::TraceApi;
-pub use txpool::TxPoolApi;
 pub use web3::Web3Api;

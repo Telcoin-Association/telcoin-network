@@ -36,10 +36,7 @@ use reth_engine_primitives::ConsensusEngineEvent;
 use reth_evm::ConfigureEvm;
 use reth_network_api::{noop::NoopNetwork, NetworkInfo, Peers};
 use reth_primitives_traits::{NodePrimitives, TxTy};
-use reth_rpc::{
-    AdminApi, DebugApi, EthApi, EthApiBuilder, EthBundle, MinerApi, NetApi, OtterscanApi, RPCApi,
-    RethApi, TraceApi, TxPoolApi, Web3Api,
-};
+use reth_rpc::{DebugApi, EthApi, EthApiBuilder, EthBundle, NetApi, RPCApi, TraceApi, Web3Api};
 use reth_rpc_api::servers::*;
 use reth_rpc_eth_api::{
     helpers::{
@@ -587,29 +584,9 @@ where
     Provider: BlockReader + ChainSpecProvider<ChainSpec: EthereumHardforks>,
     EvmConfig: ConfigureEvm,
 {
-    /// Instantiates `AdminApi`
-    pub fn admin_api(&self) -> AdminApi<Network, Provider::ChainSpec, Pool>
-    where
-        Network: Peers,
-        Pool: TransactionPool + Clone + 'static,
-    {
-        AdminApi::new(self.network.clone(), self.provider.chain_spec(), self.pool.clone())
-    }
-
     /// Instantiates `Web3Api`
     pub fn web3_api(&self) -> Web3Api<Network> {
         Web3Api::new(self.network.clone())
-    }
-
-    /// Register Admin Namespace
-    pub fn register_admin(&mut self) -> &mut Self
-    where
-        Network: Peers,
-        Pool: TransactionPool + Clone + 'static,
-    {
-        let adminapi = self.admin_api();
-        self.modules.insert(RethRpcModule::Admin, adminapi.into_rpc().into());
-        self
     }
 
     /// Register Web3 Namespace
@@ -656,20 +633,6 @@ where
         self
     }
 
-    /// Register Otterscan Namespace
-    ///
-    /// # Panics
-    ///
-    /// If called outside of the tokio runtime. See also [`Self::eth_api`]
-    pub fn register_ots(&mut self) -> &mut Self
-    where
-        EthApi: TraceExt + EthTransactions<Primitives = N>,
-    {
-        let otterscan_api = self.otterscan_api();
-        self.modules.insert(RethRpcModule::Ots, otterscan_api.into_rpc().into());
-        self
-    }
-
     /// Register Debug Namespace
     ///
     /// # Panics
@@ -712,29 +675,6 @@ where
         let netapi = self.net_api();
         self.modules.insert(RethRpcModule::Net, netapi.into_rpc().into());
         self
-    }
-
-    /// Register Reth namespace
-    ///
-    /// See also [`Self::eth_api`]
-    ///
-    /// # Panics
-    ///
-    /// If called outside of the tokio runtime.
-    pub fn register_reth(&mut self) -> &mut Self {
-        let rethapi = self.reth_api();
-        self.modules.insert(RethRpcModule::Reth, rethapi.into_rpc().into());
-        self
-    }
-
-    /// Instantiates `OtterscanApi`
-    ///
-    /// # Panics
-    ///
-    /// If called outside of the tokio runtime. See also [`Self::eth_api`]
-    pub fn otterscan_api(&self) -> OtterscanApi<EthApi> {
-        let eth_api = self.eth_api().clone();
-        OtterscanApi::new(eth_api)
     }
 }
 
@@ -807,11 +747,6 @@ where
     {
         let eth_api = self.eth_api().clone();
         NetApi::new(self.network.clone(), eth_api)
-    }
-
-    /// Instantiates `RethApi`
-    pub fn reth_api(&self) -> RethApi<Provider> {
-        RethApi::new(self.provider.clone(), self.executor.clone())
     }
 }
 
@@ -891,13 +826,6 @@ where
                 self.modules
                     .entry(namespace.clone())
                     .or_insert_with(|| match namespace.clone() {
-                        RethRpcModule::Admin => AdminApi::new(
-                            self.network.clone(),
-                            self.provider.chain_spec(),
-                            self.pool.clone(),
-                        )
-                        .into_rpc()
-                        .into(),
                         RethRpcModule::Debug => DebugApi::new(
                             eth_api.clone(),
                             self.blocking_pool_guard.clone(),
@@ -934,12 +862,6 @@ where
                         .into_rpc()
                         .into(),
                         RethRpcModule::Web3 => Web3Api::new(self.network.clone()).into_rpc().into(),
-                        RethRpcModule::Txpool => TxPoolApi::new(
-                            self.eth.api.pool().clone(),
-                            dyn_clone::clone(self.eth.api.converter()),
-                        )
-                        .into_rpc()
-                        .into(),
                         RethRpcModule::Rpc => RPCApi::new(
                             namespaces
                                 .iter()
@@ -948,13 +870,6 @@ where
                         )
                         .into_rpc()
                         .into(),
-                        RethRpcModule::Ots => OtterscanApi::new(eth_api.clone()).into_rpc().into(),
-                        RethRpcModule::Reth => {
-                            RethApi::new(self.provider.clone(), self.executor.clone())
-                                .into_rpc()
-                                .into()
-                        }
-                        RethRpcModule::Miner => MinerApi::default().into_rpc().into(),
                         RethRpcModule::Mev => {
                             EthSimBundle::new(eth_api.clone(), self.blocking_pool_guard.clone())
                                 .into_rpc()
@@ -963,8 +878,15 @@ where
                         // these are implementation specific and need to be handled during
                         // initialization and should be registered via extend_rpc_modules in the
                         // nodebuilder rpc addon stack
+                        // TN(TN-0021): admin, txpool, ots, reth and miner have no implementation
+                        // here any more; TN's allowlist never selects them.
                         RethRpcModule::Flashbots |
                         RethRpcModule::Testing |
+                        RethRpcModule::Admin |
+                        RethRpcModule::Txpool |
+                        RethRpcModule::Ots |
+                        RethRpcModule::Reth |
+                        RethRpcModule::Miner |
                         RethRpcModule::Other(_) => Default::default(),
                     })
                     .clone()
