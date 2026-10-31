@@ -164,3 +164,14 @@ newest last.
   *Why*: `vendor.py sync v1.11.4` found no change in the vendored scope. The release changed only
   `crates/engine/tree/src/tree/precompile_cache.rs`, which TN no longer carries (TN-0005). The pin
   moves so later syncs start from v1.11.4. *Upstream*: n/a.
+
+## Backports (upstream commits applied on top of the pin)
+
+Applied with `vendor.py pick <sha>`. The next `vendor.py sync` past each commit should merge
+cleanly; if it conflicts, take upstream's side for the files listed here.
+
+- **TN-0015** — Backport 997af404a: trim spaces in CORS domain parsing. *Kind*: backport.
+  *Files*: `crates/rpc/rpc-builder/src/cors.rs`.
+  *Why*: `--http.corsdomain "https://a, https://b"` kept the leading space on the second origin,
+  so it never matched and a `"https://a, *"` list was not rejected. It is also the base the
+  WebSocket origin fix (TN-0016) is written against. *Upstream*: n/a (upstream commit).
