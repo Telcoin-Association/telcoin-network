@@ -1447,6 +1447,14 @@ struct PeerManagerMetricHandles {
     discovery_peers: Gauge,
     /// Peers currently banned.
     banned_peers: Gauge,
+    /// Members of the current committee; zero until a committee is known.
+    committee_size: Gauge,
+    /// Committee peers this node expects to reach: `committee_size` minus one when this node is a
+    /// current member, else 0 (the committee alerts skip non-members).
+    committee_peers_expected: Gauge,
+    /// Unique current committee members (by BLS key) with at least one established
+    /// connection on this network; members of only the previous committee are not counted.
+    committee_peers_connected: Gauge,
     /// Connections closed (all directions).
     connections_closed_total: Counter,
     /// Failed dial attempts.
@@ -1579,6 +1587,25 @@ impl PeerManagerMetrics {
         self.handles.known_peers.set(known as f64);
         self.handles.discovery_peers.set(discovery as f64);
         self.handles.banned_peers.set(banned as f64);
+    }
+
+    /// Update the committee connectivity gauges (called from the peer manager heartbeat and
+    /// after every committee update).
+    pub(crate) fn set_committee_connectivity(
+        &self,
+        size: usize,
+        expected: usize,
+        connected: usize,
+    ) {
+        self.handles.committee_size.set(Self::gauge_value(size));
+        self.handles.committee_peers_expected.set(Self::gauge_value(expected));
+        self.handles.committee_peers_connected.set(Self::gauge_value(connected));
+    }
+
+    /// Convert a peer count to a gauge value without a lossy cast; counts above `u32::MAX`
+    /// saturate.
+    fn gauge_value(count: usize) -> f64 {
+        f64::from(u32::try_from(count).unwrap_or(u32::MAX))
     }
 
     /// Record an established connection by direction ({`in`, `out`}).
@@ -2009,7 +2036,9 @@ mod tests {
             let first = PeerManagerMetrics::new_for(&NetworkType::Worker(0));
             let second = PeerManagerMetrics::new_for(&NetworkType::Worker(1));
             first.set_peer_counts(3, 3, 3, 3);
+            first.set_committee_connectivity(3, 3, 3);
             second.set_peer_counts(7, 7, 7, 7);
+            second.set_committee_connectivity(7, 7, 7);
             [&first, &second].into_iter().for_each(|peers| {
                 peers.record_connection_established("in");
                 peers.record_penalty(&Penalty::Severe, PenaltyOutcome::Applied);
@@ -2037,6 +2066,9 @@ mod tests {
                 "tn_network.known_peers",
                 "tn_network.discovery_peers",
                 "tn_network.banned_peers",
+                "tn_network.committee_size",
+                "tn_network.committee_peers_expected",
+                "tn_network.committee_peers_connected",
             ]
             .into_iter()
             .for_each(|name| {
@@ -2095,6 +2127,41 @@ mod tests {
             assert_eq!(super::ConnectionLimitReason::from_text(&text).label(), *label);
         });
         assert_eq!(super::ConnectionLimitReason::from_text("other text").label(), "unknown");
+    }
+
+    /// The committee gauges start at zero and carry the values the peer manager writes, each
+    /// under the `network` label only.
+    #[test]
+    fn committee_connectivity_gauges_follow_setter() {
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        metrics::with_local_recorder(&recorder, || {
+            // no committee is known on worker-1, so its gauges stay at zero
+            let _unset = PeerManagerMetrics::new_for(&NetworkType::Worker(1));
+            PeerManagerMetrics::new_for(&NetworkType::Primary).set_committee_connectivity(5, 4, 3);
+        });
+        let snapshot = snapshotter.snapshot().into_vec();
+        let gauge_is = |name: &str, network: &str, expected: f64| {
+            snapshot.iter().any(|(key, _, _, value)| {
+                key.key().name() == name
+                    && key.key().labels().count() == 1
+                    && key
+                        .key()
+                        .labels()
+                        .all(|label| label.key() == "network" && label.value() == network)
+                    && matches!(value, DebugValue::Gauge(value) if value.0 == expected)
+            })
+        };
+        [
+            ("tn_network.committee_size", 5.0),
+            ("tn_network.committee_peers_expected", 4.0),
+            ("tn_network.committee_peers_connected", 3.0),
+        ]
+        .into_iter()
+        .for_each(|(name, expected)| {
+            assert!(gauge_is(name, "primary", expected), "{name} must carry the primary value");
+            assert!(gauge_is(name, "worker-1", 0.0), "{name} must start at zero");
+        });
     }
 
     /// Every counter in the recorder as `(key, value)` pairs.
