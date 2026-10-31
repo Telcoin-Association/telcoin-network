@@ -1188,7 +1188,8 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn deny_unserved_sync_epoch_is_bounded_and_frees_permit() {
         let (_slots, _opening, batch_serve) = admission_budgets();
-        let permit = batch_serve.try_acquire(PeerTier::Public).expect("admit below the caps");
+        let permit =
+            batch_serve.try_acquire(&key(1), PeerTier::Public).expect("admit below the caps");
 
         // hold the permit on a task blocked on the pending deny write
         let task = tokio::spawn(async move {
