@@ -2,8 +2,9 @@
 
 reth's database API (`reth-db-api`, reth v1.11.3) on the [`tndb-b`](../tndb-b/README.md) engine.
 `TndbEnv` is a reth `Database` whose transactions and cursors behave as reth's MDBX ones do and
-report MDBX's error codes, so reth's code and reth's MDBX tests run on it unchanged. reth's five
-dup-sort tables are stored as composite keys; the engine has no dup-sort feature.
+report MDBX's error codes, so reth's code and reth's MDBX tests run on it unchanged. Of reth's
+five dup-sort tables, the state tables are the engine's dup tables (each key's rows in a nested
+tree) and the changesets composite keys in plain engine tables.
 
 **Status: pre-production.** TN uses it behind the off-by-default `tndb-b` feature of `tn-reth`
 (forwarded by `tn-node`, `telcoin-network-cli` and `telcoin-network`), which runs TN's reth
@@ -56,22 +57,31 @@ tx.commit()?;
 ## Dup-sort tables
 
 Each value of a dup-sort table is a row of its own. reth's dup values start with their encoded
-subkey (`DupSort::SubKey`), so a row's stored key is the encoded key followed by the value's first
+subkey (`DupSort::SubKey`), so a row's logical key is the encoded key followed by the value's first
 W bytes, and its stored value is the rest. Every key of these tables has one width, so the rows
-sort by key, then by subkey, as MDBX sorts a key's values.
+sort by key, then by subkey, as MDBX sorts a key's values. Each table has one of two forms:
 
-| table | key | subkey (W) |
-|---|---|---|
-| `PlainStorageState` | `Address` (20 bytes) | `B256` slot (32) |
-| `StorageChangeSets` | `BlockNumberAddress` (28) | `B256` slot (32) |
-| `HashedStorages` | `B256` (32) | `B256` slot (32) |
-| `AccountChangeSets` | `BlockNumber` (8) | `Address` (20) |
-| `StoragesTrie` | `B256` (32) | `StoredNibblesSubKey` (65) |
+| table | key | subkey (W) | form |
+|---|---|---|---|
+| `PlainStorageState` | `Address` (20 bytes) | `B256` slot (32) | nested |
+| `StorageChangeSets` | `BlockNumberAddress` (28) | `B256` slot (32) | composite |
+| `HashedStorages` | `B256` (32) | `B256` slot (32) | nested |
+| `AccountChangeSets` | `BlockNumber` (8) | `Address` (20) | composite |
+| `StoragesTrie` | `B256` (32) | `StoredNibblesSubKey` (65) | nested |
 
-A read returns the value (subkey, then the rest) as one slice of the page, through the engine's
-`current_with_key_tail`, with no copy. `seek_by_key_subkey` reads its row in the seek itself, from
-the leaf the seek fetched (the engine's `seek_with_key_tail`), with `key ‖ subkey` built on the
-stack. A row this layout cannot hold is `MDBX_BAD_VALSIZE`.
+- **Nested** (the state tables): an engine dup table, each key one cell of an outer tree naming a
+  nested tree of the key's rows. A seek bounded to a key (`seek_exact`, `seek_by_key_subkey`, a
+  dup `get`) never reads the next key's cell, and a key's wipe (`delete_current_duplicates`,
+  `delete(k, None)`) frees its tree in one walk.
+- **Composite** (the changesets, appended by block and read by range): a plain engine table keyed
+  `key ‖ subkey`, a block range's rows one leaf chain.
+
+The form is part of the file's format: the open refuses a table held in the other form
+(`MDBX_INCOMPATIBLE`, naming the table and both forms). A read returns the value (subkey, then the
+rest) as one slice of the page, through the engine's `current_with_key_tail`, with no copy.
+`seek_by_key_subkey` reads its row in the seek itself, from the leaf the seek fetched (the engine's
+`seek_with_key_tail`, with `key ‖ subkey` built on the stack; `seek_dup_with_key_tail` on a nested
+table, the subkey given apart). A row this layout cannot hold is `MDBX_BAD_VALSIZE`.
 
 ## Differences from MDBX, in brief
 
@@ -105,22 +115,29 @@ stack. A row this layout cannot hold is `MDBX_BAD_VALSIZE`.
 
 ## Tests
 
+Every test of a dup-sort table runs on both forms: the production one, and every table composite
+through a test-only knob (`TndbArgs::composite_dup_tables`), the changesets' path.
+
 - **reth's MDBX tests,** ported with only the constructor swapped (`tests/mdbx_port.rs`); three
   dup-sort tests assert the one-value-per-subkey refusal instead.
 - **The adapter's own** (`tests/adapter.rs`, `tests/dup.rs`): MDBX's error codes, reth's error
   variants, the metrics, every dup cursor call and the cursor steps after a delete or `last`, each
-  run on MDBX too, the layouts against reth's encodings, and the differences pinned beside MDBX's
-  results.
+  run on MDBX too and on both forms, the layouts and forms against reth's encodings, the form
+  check at open, and the differences pinned beside MDBX's results.
 - **A differential test** (`tests/differential.rs`): random scripts of transaction and cursor
   calls (two write cursors and a read cursor, commits, aborts, a held read transaction) run on
-  both databases, whose outcome lists must be equal; it skips the documented differences, about
-  4% of ops, and fails if a tenth or more are skipped. A second value for a dup row's subkey runs on tndb-b only, which must refuse it and
-  change nothing (the ops after it still match MDBX's). `random_scripts_match_mdbx` runs 32 scripts in the default suite, and its `_heavy`
-  twin 2000 in release.
-- **Crash cycles** (`tests/crash.rs`, Unix only): a child process writing reth-style rounds is
-  killed with `SIGKILL` in its open, its writes or its commit, and the reopened environment must
-  hold its last committed round exactly and pass the engine's `check` (5 cycles; 200 in the
-  heavy twin).
+  MDBX and on tndb-b in both forms, each form's outcome list equal to MDBX's; it skips the
+  documented differences, about 4% of ops, each form's skips equal to MDBX's run's, and fails if a
+  tenth or more are skipped. A second value for a dup row's subkey runs on tndb-b only, which must
+  refuse it and change nothing (the ops after it still match MDBX's). `random_scripts_match_mdbx`
+  runs 32 scripts in the default suite, and its `_heavy` variant 2000 in release, from a new seed
+  each run (printed; `PROPTEST_RNG_SEED=<seed>` reruns a failure).
+  `random_scripts_skip_counts_are_pinned_at_seed_1` (and `_heavy`) runs seed 1's scripts and pins
+  the skip counts by class, so a class whose share moved fails.
+- **Crash cycles** (`tests/crash.rs`, Unix only): a child process writing reth-style rounds (one
+  storage key of them over several nested leaves, wiped now and then) is killed with `SIGKILL` in
+  its open, its writes or its commit, and the reopened environment must hold its last committed
+  round exactly and pass the engine's `check` (5 cycles, on each form; 200 in the heavy variant).
 
 ```text
 cargo nextest run -p tndb-b-reth                                              # default suite

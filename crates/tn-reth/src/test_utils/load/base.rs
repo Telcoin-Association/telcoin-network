@@ -60,7 +60,13 @@ pub const META_FILE: &str = "bench-base.json";
 /// The version of the base datadir's layout. Bump it when a base built by earlier code no longer
 /// matches what this code would build for the same spec and the genesis check cannot tell
 /// ([`BaseMeta::slim_genesis_hash`]): a reth table layout, say.
-pub const LAYOUT_VERSION: u32 = 1;
+///
+/// Version 2: on the tndb-b backend, `tndb-b-reth` stores reth's state tables
+/// (`PlainStorageState`, `HashedStorages`, `StoragesTrie`) as the engine's dup tables, no longer
+/// as composite keys in plain tables, and refuses at open a file that holds them in the other
+/// form. Every base is renamed, so none built in the old form is ever opened; the MDBX bases,
+/// whose layout did not change, rebuild once with them (the version is one for both backends).
+pub const LAYOUT_VERSION: u32 = 2;
 
 /// This build's database backend, as [`BaseMeta::backend`] records it.
 pub const BACKEND: &str = if cfg!(feature = "tndb-b") { "tndb-b" } else { "mdbx" };

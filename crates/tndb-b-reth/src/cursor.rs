@@ -15,13 +15,13 @@
 //! it ends the table as after `last`, as MDBX leaves it. A write refused for its size leaves the
 //! cursor where it was, in whatever state, as MDBX's refusal does.
 //!
-//! On a dup-sort table (stored as composite keys, see [`crate::dup`]) a row's value (subkey, then
-//! the rest) is read as one slice of the page, since a leaf cell holds its value right after its
-//! key: no copy, unless the value is in an overflow run, whose rest is joined to the subkey in a
-//! buffer of the cursor's. A move reads its row again once the move is done, through the engine's
-//! `current_with_key_tail`; `seek_exact`, `seek_by_key_subkey`, and a `walk_dup` started from a
-//! key or a subkey, read it in the seek itself, from the leaf the seek fetched
-//! ([`Moves::seek_dup_with_key_tail`]). The dup
+//! On a dup-sort table (an engine dup table or composite keys, see [`crate::dup`]) a row's value
+//! (subkey, then the rest) is read as one slice of the page, since a leaf cell holds its value
+//! right after its key: no copy, unless the value is in an overflow run, whose rest is joined to
+//! the subkey in a buffer of the cursor's. A move reads its row again once the move is done,
+//! through the engine's `current_with_key_tail`; `seek_exact`, `seek_by_key_subkey`, and a
+//! `walk_dup` started from a key or a subkey, read it in the seek itself, from the leaf the seek
+//! fetched ([`Moves::seek_dup_with_key_tail`]). The dup
 //! moves are the engine's prefix steps over the key's width: `next_dup` and `prev_dup` stay within
 //! the current key's rows, from a fresh cursor `next_dup`, `next_no_dup` and `next_dup_val` go to
 //! the first row and `prev_dup` to the last, as MDBX's do. Where MDBX's cursor ends a key's rows,

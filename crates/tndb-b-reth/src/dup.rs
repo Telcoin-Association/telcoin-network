@@ -1,11 +1,14 @@
-//! Dup-sort tables as composite keys: the row layout of each dup-sort table this crate stores.
+//! Dup-sort tables: the row layout of each dup-sort table this crate stores, and its form.
 //!
 //! MDBX holds several values under one key of a dup-sort table, sorted by value. Each of reth's
 //! dup-sort values starts with its subkey (`DupSort::SubKey`, encoded), so here each value is a row
-//! of its own: the stored key is the encoded key followed by the value's first `subkey` bytes,
-//! and the stored value is the rest. Every one of these tables' keys encodes to a fixed width, so
-//! the stored keys sort by key, then by subkey, as MDBX sorts a key's values by their leading
-//! bytes.
+//! of its own: its logical key is the encoded key followed by the value's first `subkey` bytes,
+//! and its stored value is the rest. Every one of these tables' keys encodes to a fixed width, so
+//! the logical keys sort by key, then by subkey, as MDBX sorts a key's values by their leading
+//! bytes. A layout's form ([`DupLayout::nested`]) says how the engine holds the rows: an engine
+//! dup table (each key's rows in a nested tree of their own, the state tables), or composite keys
+//! in a plain engine table (the logical key as the stored key, the changesets). The form is part
+//! of the file's format: `TableEntry::open` (in `crate::env`) refuses a table in the other form.
 //!
 //! MDBX's cursor on such a table is two cursors, one over the keys and one over a key's values,
 //! and the inner one can end a key's values (after `last`, or after a delete of a key's last value

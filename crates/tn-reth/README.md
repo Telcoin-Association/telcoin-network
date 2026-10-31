@@ -452,6 +452,15 @@ every path TN uses, and MDBX stays compiled in both builds. Every backend differ
   for the report. It never migrates: a `db/` holding `mdbx.dat` is refused (a migration pending
   or unfinished, which the node's start runs; beside the marker, as the open refuses it), and
   with neither `mdbx.dat` nor `tndb.dat` there is no reth database.
+- **reth's dup-sort tables on tndb-b** (the adapter's crate docs, "Dup-sort tables"): the state
+  tables (`PlainStorageState`, `HashedStorages`, `StoragesTrie`) are the engine's dup tables, each
+  key's rows in a nested tree of their own, so a seek bounded to an account's or a trie's rows
+  never reads the next key's; the changesets (`AccountChangeSets`, `StorageChangeSets`), appended
+  by block and read by range, are composite keys (`key ‖ subkey`) in plain engine tables. A
+  table's form is part of the file's format: the open refuses a file holding one in the other
+  form (`MDBX_INCOMPATIBLE`, naming the table and both forms). No tndb-b file in the other form
+  exists outside tests (the backend is pre-release and off by default), so there is no migration
+  between the forms.
 - **What differs on tndb-b:**
   - no per-operation latency metrics (MDBX's `with_metrics`). The sampled gauges keep MDBX's
     names (`db.table_size` and the rest), so dashboards and the e2e `reth_db_table_size` check
@@ -476,7 +485,10 @@ one of reth's: its rows are not copied (reth does not read them either).
   synced file against the engine's full check. Then it renames the file to `db/tndb.dat` (the
   commit point), removes `mdbx.lck` and then `mdbx.dat`, writes the marker `db/mdbx-migrated`
   (its text lists the rows copied per table) and removes the temp directory. reth's static files
-  and `database.version` file are not touched.
+  and `database.version` file are not touched. The copy needs no case of its own for the dup-sort
+  tables' forms: MDBX walks a key's values in subkey order, so each row is an append of
+  `key ‖ subkey` in order, a key's rows going to its nested tree on a dup table, also when they
+  span the copy's commits (`a_dup_key_with_more_rows_than_a_commit_migrates_whole`).
 - **Free space:** the filesystem holds both databases while it copies. The migration refuses to
   start unless the live bytes of reth's tables in MDBX plus a quarter plus 1 GiB are free
   (`needed_bytes`), and says the live bytes, how much is needed and how much is free. The live
@@ -782,7 +794,10 @@ are smaller. The Linux run (the user's, with the same script) decides the commit
   production `--db.*`, durable sync and `--db.page-size <page_size>`; a database with another page
   size (`db_page_size`) is an error.
   - The key (`base_dir_name`) is 16 hex digits of `keccak256` over the spec and `LAYOUT_VERSION`. A
-    derived datadir, such as an aged one, appends its own `extra` component.
+    derived datadir, such as an aged one, appends its own `extra` component. `LAYOUT_VERSION` is 2
+    since the state tables became the engine's dup tables on tndb-b, which renamed every base:
+    each backend's bases, and their aged children, rebuild once (a tndb-b base of layout 1 holds
+    those tables composite, which the open refuses).
   - It writes `bench-base.json` (`BaseMeta`: the spec, the backend, the page size, the layout
     version, the sealed genesis header, the slim genesis hash, build times and sizes), then renames
     `<name>.building` into place. A later call returns the cached base.

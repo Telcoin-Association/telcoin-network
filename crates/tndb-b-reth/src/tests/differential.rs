@@ -67,14 +67,17 @@
 //! scripts would then test little. On a difference proptest shrinks the script, then prints it
 //! with both outcome lists.
 //!
-//! **Forms and twins.** Each test runs on tndb-b in one form of the nested dup layouts' tables,
-//! `PlainStorageState` among them: engine dup tables (production), or composite keys in plain
-//! tables ([`TndbArgs::composite_dup_tables`](crate::TndbArgs::composite_dup_tables), the
-//! changesets' path); the `_composite` tests are the twins. The runner asserts the form it asked
-//! for. The scripts come from a fixed seed ([`RNG_SEED`]; `PROPTEST_RNG_SEED` picks others), so a
-//! twin pair runs the same scripts: the skips depend only on the outcomes, which equal MDBX's on
-//! both forms, so each script's skips must equal MDBX's run's, and the totals by class at
-//! [`RNG_SEED`] are pinned, the same for both twins.
+//! **Forms and seeds.** Each script runs on MDBX and on tndb-b in both forms of the nested dup
+//! layouts' tables, `PlainStorageState` among them: engine dup tables (production), then
+//! composite keys in plain tables
+//! ([`TndbArgs::composite_dup_tables`](crate::TndbArgs::composite_dup_tables), the changesets'
+//! path). The runner asserts each form it asked for, and each form's outcomes and skips by class
+//! must equal MDBX's (the skips depend only on the outcomes), so within a run both forms take the
+//! same scripts and skip the same ops. The random tests draw their scripts from a new seed each
+//! run (`PROPTEST_RNG_SEED` picks one), printed with the totals and in a failure's message, which
+//! `PROPTEST_RNG_SEED` then reruns. `random_scripts_skip_counts_are_pinned_at_seed_1` and its
+//! `_heavy` variant run the same strategies from the fixed [`RNG_SEED`] and pin the totals by
+//! class, so a class whose share moved fails there.
 
 use super::{adapter::create_mdbx_db, dup::second_value_refused, mdbx_port::create_test_db_with};
 use crate::{TndbEnv, TndbEnvKind};
@@ -94,7 +97,13 @@ use reth_db_api::{
 };
 use reth_primitives_traits::{Bytecode, StorageEntry};
 use reth_storage_errors::db::DatabaseWriteOperation;
-use std::{cell::RefCell, collections::BTreeMap, mem, ops::Bound};
+use std::{
+    cell::RefCell,
+    collections::BTreeMap,
+    hash::{BuildHasher as _, RandomState},
+    mem,
+    ops::Bound,
+};
 
 /// A row of the model: the key's index and, on `PlainStorageState`, the slot's (else 0). Rows
 /// sort as their tables' rows do.
@@ -1583,56 +1592,78 @@ fn assert_form(db: &TndbEnv, nested: bool) {
     assert_eq!(dup.is_some(), nested, "PlainStorageState's form: {dup:?}, asked nested {nested}");
 }
 
-/// Runs `ops` on MDBX and on tndb-b (its nested layouts' tables `nested`, else composite), each
-/// in a new environment, and compares the outcomes and the skips. Returns tndb-b's run.
-fn differential(ops: &[Op], nested: bool) -> Result<Run, TestCaseError> {
-    let (_mdbx_dir, mdbx) = create_mdbx_db();
-    let (_dir, db) = create_test_db_with(TndbEnvKind::RW, nested);
-    assert_form(&db, nested);
-    let want = run(&mdbx, ops, false);
-    let have = run(&db, ops, true);
-    if !want.model_misses.is_empty() {
-        let misses = want.model_misses.join("\n");
-        return Err(TestCaseError::fail(format!(
-            "the test's model disagrees with MDBX:\n{misses}\nscript: {ops:?}\n{}",
-            render(&want.outcomes, &have.outcomes)
-        )));
+/// The name of a form of the nested layouts' tables, for messages.
+const fn form_name(nested: bool) -> &'static str {
+    if nested {
+        "nested"
+    } else {
+        "composite"
     }
-    if want.outcomes != have.outcomes {
-        return Err(TestCaseError::fail(format!(
-            "tndb-b's outcomes differ from MDBX's\nscript: {ops:?}\n{}",
-            render(&want.outcomes, &have.outcomes)
-        )));
-    }
-    if (have.ran, have.skips) != (want.ran, want.skips) {
-        return Err(TestCaseError::fail(format!(
-            "tndb-b's run skipped other ops than MDBX's: ran {} against {}, skips {:?} against \
-             {:?}\nscript: {ops:?}",
-            have.ran, want.ran, have.skips, want.skips
-        )));
-    }
-    Ok(have)
 }
 
-/// The seed of the scripts, unless `PROPTEST_RNG_SEED` gives one.
+/// Runs `ops` on MDBX and on tndb-b in both forms of its nested layouts' tables (engine dup
+/// tables, then composite keys), each in a new environment, and compares each form's outcomes and
+/// skips with MDBX's. Returns MDBX's run, which both forms' equal.
+fn differential(ops: &[Op]) -> Result<Run, TestCaseError> {
+    let (_mdbx_dir, mdbx) = create_mdbx_db();
+    let want = run(&mdbx, ops, false);
+    for nested in [true, false] {
+        let form = form_name(nested);
+        let (_dir, db) = create_test_db_with(TndbEnvKind::RW, nested);
+        assert_form(&db, nested);
+        let have = run(&db, ops, true);
+        if !want.model_misses.is_empty() {
+            let misses = want.model_misses.join("\n");
+            return Err(TestCaseError::fail(format!(
+                "the test's model disagrees with MDBX:\n{misses}\nscript: {ops:?}\n{}",
+                render(&want.outcomes, &have.outcomes)
+            )));
+        }
+        if want.outcomes != have.outcomes {
+            return Err(TestCaseError::fail(format!(
+                "tndb-b's outcomes ({form}) differ from MDBX's\nscript: {ops:?}\n{}",
+                render(&want.outcomes, &have.outcomes)
+            )));
+        }
+        if (have.ran, have.skips) != (want.ran, want.skips) {
+            return Err(TestCaseError::fail(format!(
+                "tndb-b's run ({form}) skipped other ops than MDBX's: ran {} against {}, skips \
+                 {:?} against {:?}\nscript: {ops:?}",
+                have.ran, want.ran, have.skips, want.skips
+            )));
+        }
+    }
+    Ok(want)
+}
+
+/// The fixed seed of the pinned tests' scripts.
 const RNG_SEED: u64 = 1;
+
+/// The seed of a random test's scripts: `PROPTEST_RNG_SEED` when it is set, else a new random
+/// one for each run.
+fn random_seed() -> u64 {
+    match ProptestConfig::default().rng_seed {
+        RngSeed::Fixed(seed) => seed,
+        RngSeed::Random => RandomState::new().hash_one(0u8),
+    }
+}
 
 /// Ops run and skipped by class ([`CLASSES`]) over a test's scripts.
 type Totals = (u64, [u64; 9]);
 
-/// Runs `cases` scripts of up to `len` ops on tndb-b in one form (`nested`, else composite) and
-/// prints the ops run and skipped (by class). At [`RNG_SEED`] the totals must be `pinned` (both
-/// forms', and the pre-P7 composite run's); another seed pins nothing.
-fn differential_cases(cases: u32, len: usize, nested: bool, pinned: Totals) {
-    let (rng_seed, pinned) = match ProptestConfig::default().rng_seed {
-        RngSeed::Random => (RngSeed::Fixed(RNG_SEED), Some(pinned)),
-        seed => (seed, None),
+/// Runs `cases` scripts of up to `len` ops from `seed`, each on MDBX and on both forms of tndb-b
+/// ([`differential`]), prints the ops run and skipped (by class) with the seed, and returns them.
+/// A failure's message names the seed, which `PROPTEST_RNG_SEED` reruns.
+fn differential_cases(cases: u32, len: usize, seed: u64) -> Totals {
+    let config = ProptestConfig {
+        cases,
+        rng_seed: RngSeed::Fixed(seed),
+        failure_persistence: None,
+        ..ProptestConfig::default()
     };
-    let config =
-        ProptestConfig { cases, rng_seed, failure_persistence: None, ..ProptestConfig::default() };
     let totals = RefCell::new(Run::default());
     let result = TestRunner::new(config).run(&prop::collection::vec(op(), 1..=len), |ops| {
-        let run = differential(&ops, nested)?;
+        let run = differential(&ops)?;
         let mut totals = totals.borrow_mut();
         totals.ran += run.ran;
         for (sum, n) in totals.skips.iter_mut().zip(run.skips) {
@@ -1641,13 +1672,12 @@ fn differential_cases(cases: u32, len: usize, nested: bool, pinned: Totals) {
         Ok(())
     });
     if let Err(e) = result {
-        panic!("{e}");
+        panic!("{e}\nseed {seed}: PROPTEST_RNG_SEED={seed} reruns these scripts");
     }
     let totals = totals.into_inner();
     let skipped: u64 = totals.skips.iter().sum();
-    let form = if nested { "nested" } else { "composite" };
     println!(
-        "differential ({form}, seed {rng_seed}): {cases} scripts, {} ops run, {skipped} skipped",
+        "differential (seed {seed}, both forms): {cases} scripts, {} ops run, {skipped} skipped",
         totals.ran
     );
     for (class, n) in CLASSES.iter().zip(totals.skips) {
@@ -1655,46 +1685,46 @@ fn differential_cases(cases: u32, len: usize, nested: bool, pinned: Totals) {
     }
     assert!(
         skipped * 10 < totals.ran,
-        "skipped ops reached a tenth of the ops run: the scripts test little"
+        "skipped ops reached a tenth of the ops run at seed {seed}: the scripts test little"
     );
-    if let Some(pinned) = pinned {
-        assert_eq!(
-            (totals.ran, totals.skips),
-            pinned,
-            "ops run and skipped by class at seed {RNG_SEED}, against the pinned figures (a \
-             change of the scripts' strategy changes them: pin the new ones only if both forms \
-             agree)"
-        );
-    }
+    (totals.ran, totals.skips)
 }
 
-/// [`random_scripts_match_mdbx`]'s totals at [`RNG_SEED`].
+/// What a pinned test's message says when its totals moved.
+const PINNED_MOVED: &str = "ops run and skipped by class at the fixed seed, against the pinned \
+                            figures: a change of the scripts' strategy changes them (pin the new \
+                            ones), anything else is a behaviour change to find first";
+
+/// [`random_scripts_skip_counts_are_pinned_at_seed_1`]'s totals.
 const DEFAULT_TOTALS: Totals = (1455, [18, 0, 5, 0, 0, 6, 0, 2, 0]);
 
-/// [`random_scripts_match_mdbx_heavy`]'s totals at [`RNG_SEED`].
+/// [`random_scripts_skip_counts_are_pinned_at_seed_1_heavy`]'s totals.
 const HEAVY_TOTALS: Totals = (287_215, [7650, 3, 2504, 61, 73, 1136, 45, 938, 0]);
 
 /// Random scripts of transaction and cursor calls on three tables (one dup-sort, one with
-/// overflow values) give the same outcomes on tndb-b as on MDBX.
+/// overflow values) give the same outcomes on tndb-b, in both forms, as on MDBX.
 #[test]
 fn random_scripts_match_mdbx() {
-    differential_cases(32, 64, true, DEFAULT_TOTALS);
-}
-
-/// [`random_scripts_match_mdbx`] on the composite form.
-#[test]
-fn random_scripts_match_mdbx_composite() {
-    differential_cases(32, 64, false, DEFAULT_TOTALS);
+    differential_cases(32, 64, random_seed());
 }
 
 #[test]
 #[ignore = "heavy: run with --release"]
 fn random_scripts_match_mdbx_heavy() {
-    differential_cases(2000, 256, true, HEAVY_TOTALS);
+    differential_cases(2000, 256, random_seed());
 }
 
+/// [`random_scripts_match_mdbx`]'s scripts from [`RNG_SEED`] run and skip the pinned ops by
+/// class, on both forms.
+#[test]
+fn random_scripts_skip_counts_are_pinned_at_seed_1() {
+    assert_eq!(differential_cases(32, 64, RNG_SEED), DEFAULT_TOTALS, "{PINNED_MOVED}");
+}
+
+/// [`random_scripts_match_mdbx_heavy`]'s scripts from [`RNG_SEED`] run and skip the pinned ops
+/// by class, on both forms.
 #[test]
 #[ignore = "heavy: run with --release"]
-fn random_scripts_match_mdbx_composite_heavy() {
-    differential_cases(2000, 256, false, HEAVY_TOTALS);
+fn random_scripts_skip_counts_are_pinned_at_seed_1_heavy() {
+    assert_eq!(differential_cases(2000, 256, RNG_SEED), HEAVY_TOTALS, "{PINNED_MOVED}");
 }

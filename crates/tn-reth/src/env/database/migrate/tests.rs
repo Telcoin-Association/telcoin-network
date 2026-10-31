@@ -5,8 +5,10 @@
 use super::*;
 use crate::env::database::{db_table_stats, open_tndb, temp_chain_db_args, RethDb};
 use reth_db::{
+    cursor::DbDupCursorRO as _,
     mdbx::DatabaseFlags,
-    tables::{self, RawKey, RawValue},
+    table::DupSort,
+    tables::{self, RawDupSort, RawKey, RawValue},
     transaction::DbTxMut,
     ClientVersion,
 };
@@ -96,6 +98,69 @@ fn mdbx_rows() -> BTreeMap<&'static str, Rows> {
     });
     rows.insert(tables::VersionHistory::NAME, history.collect());
     rows
+}
+
+/// The dup-sort tables [`rows_with_big_dup_keys`] gives a [`big_key`], with its rows: more than
+/// [`COMMIT_ROWS`], so the copy commits inside the key (twice, or once for `StoragesTrie`). The
+/// three state tables are the adapter's nested ones, `StorageChangeSets` a composite one.
+const BIG_KEYS: [(&str, u64); 4] = [
+    (tables::PlainStorageState::NAME, 2500),
+    (tables::StorageChangeSets::NAME, 2500),
+    (tables::HashedStorages::NAME, 2500),
+    (tables::StoragesTrie::NAME, 1200),
+];
+
+/// The big key of a dup-sort table whose keys are `key_len` bytes: between [`mdbx_rows`]'s second
+/// and third keys, so rows of other keys come before and after it.
+fn big_key(key_len: usize) -> Vec<u8> {
+    let mut key = vec![2; key_len];
+    key[key_len - 1] = 0x80;
+    key
+}
+
+/// [`mdbx_rows`] with a [`big_key`] in each table of [`BIG_KEYS`], of that many rows: subkey `n`
+/// is `n` big-endian in a 32-byte subkey, and in `StoragesTrie`'s 65-byte one the nibble path of
+/// `n`'s three low nibbles (64 nibble bytes, then the path's length, as reth encodes a
+/// `StoredNibblesSubKey`).
+fn rows_with_big_dup_keys() -> BTreeMap<&'static str, Rows> {
+    let mut rows = mdbx_rows();
+    for (name, count) in BIG_KEYS {
+        assert!(count > COMMIT_ROWS, "{name}: the big key's rows span a commit");
+        let (_, key_len, subkey_len) =
+            DUP_TABLES.into_iter().find(|(table, ..)| *table == name).expect("a dup-sort table");
+        let table = rows.get_mut(name).expect("a dup-sort table's rows");
+        for n in 0..count {
+            let mut value = vec![0; subkey_len];
+            if subkey_len == 65 {
+                value[..3].copy_from_slice(&[
+                    (n >> 8) as u8 & 0xf,
+                    (n >> 4) as u8 & 0xf,
+                    n as u8 & 0xf,
+                ]);
+                value[64] = 3;
+            } else {
+                value[subkey_len - 8..].copy_from_slice(&n.to_be_bytes());
+            }
+            value.extend([n as u8, 1]);
+            table.push((big_key(key_len), value));
+        }
+        table.sort();
+    }
+    rows
+}
+
+/// The passes of [`Step::MidCopy`] a migration of `rows` makes before it copies `table`: a table
+/// copied before it (in the order of `Tables::ALL`) passes once per bounded commit and once at its
+/// end, and [`MISSING`], which MDBX lacks, not at all.
+fn mid_copy_passes_before(rows: &BTreeMap<&'static str, Rows>, table: &str) -> u32 {
+    let passes: u64 = Tables::ALL
+        .iter()
+        .map(Tables::name)
+        .take_while(|name| *name != table)
+        .filter(|name| *name != MISSING)
+        .map(|name| rows.get(name).map_or(0, Vec::len) as u64 / COMMIT_ROWS + 1)
+        .sum();
+    passes.try_into().expect("passes")
 }
 
 /// The [`TableViewer`] that writes a table's rows from a map of raw rows.
@@ -271,15 +336,81 @@ fn an_mdbx_database_migrates_row_for_row() {
     assert_eq!(std::fs::read_to_string(path.join(MIGRATED_MARKER)).expect("marker"), marker);
 }
 
+/// A dup key whose rows outnumber a commit's ([`COMMIT_ROWS`]) migrates whole: the copy commits
+/// inside the key ([`BIG_KEYS`]), and the next write transaction appends the key's further rows
+/// to those committed, on the adapter's nested tables (`PlainStorageState`, `HashedStorages`,
+/// `StoragesTrie`) and on a composite one (`StorageChangeSets`). The migration's own verification
+/// passes, and the open after it checks each table's form against its layout. Every table holds
+/// MDBX's rows, row for row, and counts them (`entries`); each big key reads back whole by
+/// `walk_dup` and row by row by `seek_by_key_subkey`.
+#[test]
+fn a_dup_key_with_more_rows_than_a_commit_migrates_whole() {
+    let tmp = TempDir::new().expect("tempdir");
+    let path = tmp.path().join("db");
+    let expected = build_mdbx_with(&path, rows_with_big_dup_keys());
+
+    let db = open(&path).expect("the open migrates");
+    let mut migrated = raw_rows(&*db);
+    migrated.get_mut(tables::VersionHistory::NAME).expect("history").pop();
+    assert!(migrated == expected, "every table, row for row");
+    let tx = db.tx().expect("tx");
+    read_back_big_key::<tables::PlainStorageState>(&tx, &expected);
+    read_back_big_key::<tables::StorageChangeSets>(&tx, &expected);
+    read_back_big_key::<tables::HashedStorages>(&tx, &expected);
+    read_back_big_key::<tables::StoragesTrie>(&tx, &expected);
+}
+
+/// Check table `T` in `tx` against `expected`: its row count, and its [`big_key`]'s rows, read
+/// whole by `walk_dup` and one by one by `seek_by_key_subkey`.
+fn read_back_big_key<T: DupSort>(tx: &impl DbTx, expected: &BTreeMap<&'static str, Rows>) {
+    let name = T::NAME;
+    let rows = &expected[name];
+    assert_eq!(tx.entries::<RawDupSort<T>>().expect("entries"), rows.len(), "{name}: entries");
+    let (_, key_len, subkey_len) =
+        DUP_TABLES.into_iter().find(|(table, ..)| *table == name).expect("a dup-sort table");
+    let key = big_key(key_len);
+    let big: Rows = rows.iter().filter(|(k, _)| *k == key).cloned().collect();
+    assert!(big.len() as u64 > COMMIT_ROWS, "{name}: the big key's rows span a commit");
+
+    let mut cursor = tx.cursor_dup_read::<RawDupSort<T>>().expect("cursor");
+    let walked: Rows = cursor
+        .walk_dup(Some(RawKey::from_vec(key.clone())), None)
+        .expect("walk_dup")
+        .map(|row| row.map(|(k, v)| (k.into_key(), v.into_value())))
+        .collect::<Result<_, _>>()
+        .expect("the key's rows");
+    assert!(
+        walked == big,
+        "{name}: walk_dup reads {} of the big key's {} rows",
+        walked.len(),
+        big.len()
+    );
+    for (n, (_, value)) in big.iter().enumerate() {
+        let subkey = RawKey::from_vec(value[..subkey_len].to_vec());
+        let found = cursor.seek_by_key_subkey(RawKey::from_vec(key.clone()), subkey).expect("seek");
+        assert_eq!(found.map(RawValue::into_value).as_ref(), Some(value), "{name}: row {n}");
+    }
+}
+
 /// Stop a migration of [`build_mdbx`]'s database at `stop`, after letting `passes` earlier passes
 /// of that step by, as a kill would stop it (no cleanup), and check what the stop left with
 /// `left`. Then open again: the open completes the migration, with every row as MDBX held it,
 /// MDBX's files and the temp directory gone and the marker written, and a further open is a normal
 /// one, which changes neither. Returns the marker's text.
 fn stop_then_reopen(stop: Step, passes: u32, left: impl FnOnce(&Path)) -> String {
+    stop_then_reopen_with(mdbx_rows(), stop, passes, left)
+}
+
+/// [`stop_then_reopen`] of a migration of an MDBX database holding `rows`.
+fn stop_then_reopen_with(
+    rows: BTreeMap<&'static str, Rows>,
+    stop: Step,
+    passes: u32,
+    left: impl FnOnce(&Path),
+) -> String {
     let tmp = TempDir::new().expect("tempdir");
     let path = tmp.path().join("db");
-    let expected = build_mdbx(&path);
+    let expected = build_mdbx_with(&path, rows);
 
     STOP_AT.set(Some(stop));
     STOP_PASSES.set(passes);
@@ -325,13 +456,28 @@ fn assert_stopped_before_the_commit_point(path: &Path) {
 }
 
 /// A migration stopped right after a bounded commit in the middle of a table, its temp file
-/// holding part of the table, migrates afresh at the next open.
+/// holding part of the table, migrates afresh at the next open; so does one stopped inside a dup
+/// key of a nested table (`PlainStorageState`'s [`big_key`]), its temp file holding part of the
+/// key's rows.
 #[test]
 fn a_migration_stopped_inside_a_table_migrates_again_at_the_next_open() {
     stop_then_reopen(Step::MidCopy, 0, |path| {
         assert_stopped_before_the_commit_point(path);
         let partial = temp_rows(path).remove(tables::CanonicalHeaders::NAME).expect("headers");
         assert_eq!(partial.len() as u64, COMMIT_ROWS, "one commit of the first table's 3000 rows");
+    });
+
+    let rows = rows_with_big_dup_keys();
+    let name = tables::PlainStorageState::NAME;
+    let all = rows[name].clone();
+    let passes = mid_copy_passes_before(&rows, name);
+    stop_then_reopen_with(rows, Step::MidCopy, passes, |path| {
+        assert_stopped_before_the_commit_point(path);
+        let partial = temp_rows(path).remove(name).expect("PlainStorageState");
+        let committed = COMMIT_ROWS as usize;
+        assert!(partial[..] == all[..committed], "the table's first commit, as MDBX holds it");
+        let key = big_key(20);
+        assert!(partial[committed - 1].0 == key && all[committed].0 == key, "inside the big key");
     });
 }
 

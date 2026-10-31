@@ -9,8 +9,8 @@
 //! | `DatabaseEnv` (`DatabaseEnvKind`, `DatabaseArguments`) | [`TndbEnv`] ([`TndbEnvKind`], [`TndbArgs`]) | [`tndb_b::Env`], read-only through [`tndb_b::Env::open_read_only`] |
 //! | `Database::TX` | [`TndbTx`] | an `Arc` of [`tndb_b::RoTxn`] |
 //! | `Database::TXMut` | [`TndbTxMut`] | [`tndb_b::RwTxn`] behind a shared mutex |
-//! | `DbTx::Cursor` (read-only) | [`TndbCursor`] | [`tndb_b::RoCursor`] |
-//! | `DbTxMut::CursorMut` | [`TndbCursorMut`] | [`tndb_b::TxnCursor`] |
+//! | `DbTx::Cursor` (read-only) | [`TndbCursor`] | [`tndb_b::RoCursor`], or [`tndb_b::DupRoCursor`] on a nested dup-sort table |
+//! | `DbTxMut::CursorMut` | [`TndbCursorMut`] | [`tndb_b::TxnCursor`], or [`tndb_b::DupTxnCursor`] on a nested dup-sort table |
 //! | `DatabaseMetrics` | [`TndbEnv`] ([`TndbEnv::table_stats`], [`RethTableStat`]) | [`tndb_b::TableStat`], [`tndb_b::Env::free_pages`] |
 //! | none (MDBX's sync and check are its own tools) | [`TndbEnv::sync`], [`TndbEnv::check`] ([`CheckReport`]) | [`tndb_b::Env::sync`], [`tndb_b::Env::check`] |
 //! | none (MDBX's `page_ops` in its environment info are the nearest) | [`TndbEnv::io_stats`] ([`IoStats`]) | [`tndb_b::Env::io_stats`] |
@@ -19,48 +19,63 @@
 //! its engine handle. Keys are stored encoded (`Encode`) and values compressed (`Compress`), as
 //! MDBX stores them.
 //!
-//! **Dup-sort tables** are stored as composite keys: each value is a row of its own. reth's five
-//! dup-sort tables each have a fixed-width key and values that start with their encoded subkey
-//! (`DupSort::SubKey`):
+//! **Dup-sort tables.** reth's five dup-sort tables each have a fixed-width key and values that
+//! start with their encoded subkey (`DupSort::SubKey`). A row's logical key is the encoded key
+//! followed by the compressed value's first W bytes, `k ‖ s`, and its stored value is the rest.
+//! Each table has one of two forms, fixed by its layout:
 //!
-//! | table | key | subkey (W) |
-//! |---|---|---|
-//! | `PlainStorageState` | `Address` (20 bytes) | `B256` slot (32) |
-//! | `StorageChangeSets` | `BlockNumberAddress` (28) | `B256` slot (32) |
-//! | `HashedStorages` | `B256` (32) | `B256` slot (32) |
-//! | `AccountChangeSets` | `BlockNumber` (8) | `Address` (20) |
-//! | `StoragesTrie` | `B256` (32) | `StoredNibblesSubKey` (65) |
+//! | table | key | subkey (W) | form |
+//! |---|---|---|---|
+//! | `PlainStorageState` | `Address` (20 bytes) | `B256` slot (32) | nested |
+//! | `StorageChangeSets` | `BlockNumberAddress` (28) | `B256` slot (32) | composite |
+//! | `HashedStorages` | `B256` (32) | `B256` slot (32) | nested |
+//! | `AccountChangeSets` | `BlockNumber` (8) | `Address` (20) | composite |
+//! | `StoragesTrie` | `B256` (32) | `StoredNibblesSubKey` (65) | nested |
 //!
-//! A row's stored key is the encoded key followed by the compressed value's first W bytes, and its
-//! stored value is the rest. A leaf cell holds its value right after its key, so a read takes the
-//! value, the key's last W bytes then the rest, as one slice of the page (the engine's
-//! `current_with_key_tail`), with no copy; only a value in an overflow run is joined in a buffer
-//! of the cursor's. A cursor's `seek_exact` and `seek_by_key_subkey` read their row in the seek
-//! itself, from the leaf the seek fetched (the engine's `seek_with_key_tail`). Since each table's
-//! keys have one width, the rows sort by key, then by subkey, as MDBX sorts a key's values. A row
-//! this layout cannot hold (a value shorter than W, or a key of another width) is refused with
-//! `MDBX_BAD_VALSIZE`. Another dup-sort table (reth has none) is created, counted and cleared, but
-//! every other access to its rows is refused with a
+//! - **Nested** (the state tables): an engine dup table ([`tndb_b::RwTxn::create_dup_table`],
+//!   [`tndb_b::DupOptions`] with `key_len` K and `packed_max` 0). Each key is one cell of the
+//!   table's outer tree, naming a nested tree of the key's rows by subkey, so a seek bounded to a
+//!   key never reads the next key's cell, and a key's wipe frees its tree in one walk.
+//! - **Composite** (the changesets, appended by block and read by range): a plain engine table
+//!   keyed `k ‖ s`, each value a row of its own, the rows of a block range one leaf chain.
+//!
+//! Both forms hold the same logical rows, in key then subkey order, as MDBX sorts a key's values.
+//! The form is part of the file's format: `create_tables` creates each table in its layout's
+//! form, and the open (and a table resolved later) refuses a table the file holds in the other
+//! form, as `create_tables` does: `DatabaseError::Open` (`DatabaseError::CreateTable`) with
+//! `MDBX_INCOMPATIBLE` and a message naming the table and both forms. A test-only knob,
+//! `TndbArgs::composite_dup_tables`, opens the nested layouts' tables composite, so the tests
+//! run every call on both forms (the composite one is the changesets' path).
+//!
+//! A leaf cell holds its value right after its key, so a read takes the value, the subkey then
+//! the rest, as one slice of the page (the engine's `current_with_key_tail`), with no copy; only
+//! a value in an overflow run is joined in a buffer of the cursor's. A cursor's `seek_exact` and
+//! `seek_by_key_subkey` read their row in the seek itself, from the leaf the seek fetched (the
+//! engine's `seek_with_key_tail`, and `seek_dup_with_key_tail` on a nested table, which takes the
+//! key and the subkey apart). A row this layout cannot hold (a value shorter than W, or a key of
+//! another width) is refused with `MDBX_BAD_VALSIZE`. Another dup-sort table (reth has none) is
+//! created, counted and cleared, but every other access to its rows is refused with a
 //! [`DatabaseError::Other`](reth_db_api::DatabaseError), as is a dup cursor call on a table without
-//! duplicates. reth's calls map onto the engine's ordered rows:
+//! duplicates. reth's calls map onto the engine's ordered rows, the same engine calls on both
+//! forms but where the nested column says otherwise:
 //!
-//! | reth | here |
-//! |---|---|
-//! | `get(k)`, `seek_exact(k)` | `seek(k)` (a cursor's `seek_exact` as `seek_by_key_subkey(k, [])`), and the row found must be `k`'s: the key's first value; a `k` of another width than the key's misses with no seek |
-//! | `seek(k)` | `seek(k)`: the first row of the first key at or after `k` |
-//! | `seek_by_key_subkey(k, s)` | `seek_with_key_tail(k ‖ s, W)`: `seek(k ‖ s)` and the row's read from one leaf access, `k ‖ s` built on the stack; the row found must be `k`'s (MDBX's `get_both_range` never leaves the key); a `k` of another width misses with no seek |
-//! | `next_dup`, `prev_dup`, `next_dup_val` | the engine's prefix steps over the key's width |
-//! | `next_no_dup` | `seek(k ‖ 0xFF × (W + 1))`, past every row of `k`, when another row of `k` follows; else `next` |
-//! | `last_dup` | that seek, then `prev` |
-//! | `walk_dup` | MDBX's start (`first`; `seek_exact`; `seek_by_key_subkey`; with a subkey only, `first` then `seek_by_key_subkey` of its key), then `next_dup` |
-//! | `put`, `upsert` | the engine's insert of the row: a new subkey is stored, the same value again changes nothing (the cursor then on the row), another value for a subkey the key holds is refused with `MDBX_KEYEXIST` |
-//! | `insert` | `MDBX_KEYEXIST` if the key has any row (the cursor then on its first) |
-//! | `append` | the engine's append, or an insert as by `put` if the key is the table's last key (MDBX takes a value anywhere among the last key's); a smaller key is `MDBX_EKEYMISMATCH`, the cursor on the last row |
-//! | `append_dup` | the value must sort after the key's last (by subkey), else `MDBX_EKEYMISMATCH` with the cursor on the key's last row (on its first when the value is exactly the first's); a key without rows takes any value, wherever the key sorts |
-//! | `delete(k, Some(v))` | deletes the row of `v`'s subkey if it holds exactly the rest of `v` |
-//! | `delete(k, None)`, `delete_current_duplicates` | delete every row of the key |
-//! | `delete_current` | the engine's `delete_current`, then its `follower_shares_prefix` over the key's width, with no step: a follower of the key's leaves the cursor on it, else `prev_in_prefix` finds whether the key keeps an earlier row (the cursor then ends the key's rows, on it) or none (the cursor on the next key's first row) |
-//! | `entries` | the rows: MDBX's count of key/value pairs |
+//! | reth | composite | nested |
+//! |---|---|---|
+//! | `get(k)`, `seek_exact(k)` | `seek(k)` (a cursor's `seek_exact` as `seek_by_key_subkey(k, [])`), and the row found must be `k`'s: the key's first value; a `k` of another width than the key's misses with no seek | `seek_dup_with_key_tail(k, [], W)`, bounded to `k`: a miss reads no other key's cell and leaves the engine cursor unset |
+//! | `seek(k)` | `seek(k)`: the first row of the first key at or after `k` | the same: the outer seek, then that key's first row |
+//! | `seek_by_key_subkey(k, s)` | `seek_with_key_tail(k ‖ s, W)`: `seek(k ‖ s)` and the row's read from one leaf access, `k ‖ s` built on the stack; the row found must be `k`'s (MDBX's `get_both_range` never leaves the key); a `k` of another width misses with no seek | `seek_dup_with_key_tail(k, s, W)`, bounded to `k`, the subkey given apart (no buffer) |
+//! | `next_dup`, `prev_dup`, `next_dup_val` | the engine's prefix steps over the key's width | the same, inside the key's nested tree |
+//! | `next_no_dup` | `seek(k ‖ 0xFF × (W + 1))`, past every row of `k`, when another row of `k` follows; else `next` | the same (the seek past the key's nested tree, then the next key's first row) |
+//! | `last_dup` | that seek, then `prev` | the same |
+//! | `walk_dup` | MDBX's start (`first`; `seek_exact`; `seek_by_key_subkey`; with a subkey only, `first` then `seek_by_key_subkey` of its key), then `next_dup` | the same |
+//! | `put`, `upsert` | the engine's insert of the row: a new subkey is stored, the same value again changes nothing (the cursor then on the row), another value for a subkey the key holds is refused with `MDBX_KEYEXIST` | the same, the engine's dup insert |
+//! | `insert` | `MDBX_KEYEXIST` if the key has any row (the cursor then on its first) | the same, the key's rows found by a dup cursor's `seek_key` |
+//! | `append` | the engine's append, or an insert as by `put` if the key is the table's last key (MDBX takes a value anywhere among the last key's); a smaller key is `MDBX_EKEYMISMATCH`, the cursor on the last row | the same, the engine's dup append: a key's first row makes its cell and tree, its later rows go to the tree's right edge |
+//! | `append_dup` | the value must sort after the key's last (by subkey), else `MDBX_EKEYMISMATCH` with the cursor on the key's last row (on its first when the value is exactly the first's); a key without rows takes any value, wherever the key sorts | the same |
+//! | `delete(k, Some(v))` | deletes the row of `v`'s subkey if it holds exactly the rest of `v` | the same, the engine's dup point calls |
+//! | `delete(k, None)`, `delete_current_duplicates` | delete every row of the key, a row at a time | `delete_prefix(k)`: one walk frees the key's tree; the cursor ends on the next key's first row, as after the composite loop |
+//! | `delete_current` | the engine's `delete_current`, then its `follower_shares_prefix` over the key's width, with no step: a follower of the key's leaves the cursor on it, else `prev_in_prefix` finds whether the key keeps an earlier row (the cursor then ends the key's rows, on it) or none (the cursor on the next key's first row) | the same |
+//! | `entries` | the rows: MDBX's count of key/value pairs | the same (the engine's dup totals count rows, not keys) |
 //!
 //! As on MDBX, a fresh cursor's `next_dup`, `next_no_dup` and `next_dup_val` start at the first
 //! row and its `prev_dup` at the last, a missed `seek_exact` or `seek_by_key_subkey` leaves the
@@ -131,12 +146,13 @@
 //!   one);
 //! - a raw subkey `s` wider than the layout's W that starts with a row's subkey, its bytes past W
 //!   sorting at or before that row's rest, makes `seek_by_key_subkey` take the row after: the seek
-//!   key `k ‖ s` sorts after the row's stored key `k ‖ s[..W]`, of which it is a longer copy, while
-//!   MDBX compares the row's whole value (subkey, then the rest) with `s` and takes the row. No
-//!   reth subkey type encodes wider than W, so only a raw view (`RawDupSort`) meets this (the
-//!   differential test's typed subkeys never do); `known_dup_cursor_deviations_from_mdbx` pins it
-//!   beside MDBX's result, and `seek_by_key_subkey_longer_than_the_stack_buffer_matches_mdbx` with
-//!   seek keys at and past the cursor's stack buffer.
+//!   key `k ‖ s` sorts after the row's stored key `k ‖ s[..W]` (on a nested table, `s` after the
+//!   row's subkey), of which it is a longer copy, while MDBX compares the row's whole value
+//!   (subkey, then the rest) with `s` and takes the row. No reth subkey type encodes wider than W,
+//!   so only a raw view (`RawDupSort`) meets this (the differential test's typed subkeys never do);
+//!   `known_dup_cursor_deviations_from_mdbx` pins it beside MDBX's result, and
+//!   `seek_by_key_subkey_longer_than_the_stack_buffer_matches_mdbx` with seek keys at and past the
+//!   cursor's stack buffer.
 //!
 //! The cursor positions. Right after a delete the cursor is on the follower as MDBX's is
 //! (`current` returns it, `delete_current` deletes it, `delete_current_duplicates` deletes its
@@ -208,8 +224,10 @@
 //! model tests and this crate's multi-cursor tests cover that.
 //!
 //! **The differential test** (`random_scripts_match_mdbx`, and `random_scripts_match_mdbx_heavy`
-//! in release) draws random scripts with proptest and runs each on a [`TndbEnv`] and on reth's
-//! MDBX `DatabaseEnv`; the two outcome lists must be equal, value for value and error for error.
+//! in release) draws random scripts with proptest and runs each on reth's MDBX `DatabaseEnv` and
+//! on a [`TndbEnv`] in each form of the nested tables (nested, then composite through
+//! `TndbArgs::composite_dup_tables`, the form asserted); each outcome list must equal MDBX's,
+//! value for value and error for error.
 //! A script works on `CanonicalHeaders`, `PlainStorageState` (dup-sort, with keys and subkeys
 //! drawn from small sets so rows collide) and `Bytecodes` (values from 8 bytes to 40 KiB, so
 //! overflow runs), through the transaction's calls, two write cursors and a read cursor (every
@@ -224,18 +242,24 @@
 //! write another value, a second value for the subkey, which runs on tndb-b only and must be
 //! refused (`MDBX_KEYEXIST` with this crate's message) and change nothing: it is skipped on MDBX,
 //! and the ops after it must still match MDBX's. About 4% of the ops are skipped; the test fails if
-//! a tenth or more are. On a difference proptest shrinks the script and prints both outcome lists.
+//! a tenth or more are, and each form's skips by class must equal MDBX's run's. On a difference
+//! proptest shrinks the script and prints both outcome lists. The scripts come from a new random
+//! seed each run, printed with the counts and in a failure's message (`PROPTEST_RNG_SEED` reruns
+//! it, or picks the seed); `random_scripts_skip_counts_are_pinned_at_seed_1` (and `_heavy`) runs
+//! the scripts of seed 1 and pins their counts by class, so a class whose share moved fails.
 //!
 //! **The crash cycles** (`killed_child_reopens_to_its_last_commit`, 5 cycles, and
 //! `killed_child_reopens_to_its_last_commit_heavy`, 200 in release; Unix only) run a child process
 //! that commits rounds of puts, appends and deletes (`CanonicalHeaders`, with cursor `append`s;
-//! dup rows of `PlainStorageState`, with `append_dup`, `delete_current_duplicates` and now and
-//! then a `clear`; overflow-sized `Bytecodes`; and a progress row) and kill it with `SIGKILL` at a
+//! dup rows of `PlainStorageState`, with `append_dup`, `delete_current_duplicates` and a key's
+//! rows put again, now and then a `clear`, and one key of 600 rows over several nested leaves, now
+//! and then wiped; overflow-sized `Bytecodes`; and a progress row) and kill it with `SIGKILL` at a
 //! random point: in its open, its writes or its commit. The reopened environment must hold the
 //! last round the child reported committed (or, killed in a commit, the round before), every table
 //! exactly as a model of those rounds, and pass the engine's `check`. The heavy variant also
-//! requires a kill in a commit. A `SIGKILL` keeps the page cache, so this tests process death; the
-//! engine's own crash tests cover power loss.
+//! requires a kill in a commit. `killed_child_reopens_to_its_last_commit_composite` runs the
+//! cycles on the composite form. A `SIGKILL` keeps the page cache, so this tests process death;
+//! the engine's own crash tests cover power loss.
 //!
 //! **The benchmark** (`tndb_reth_vs_mdbx`, `#[ignore]`d; the `bench` module docs and the README
 //! give the command, the selectors and a table) runs the workloads of reth's database benches
