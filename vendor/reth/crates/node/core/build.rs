@@ -1,20 +1,21 @@
 #![allow(missing_docs)]
 
-use std::{env, error::Error, path::Path};
-use vergen::{BuildBuilder, CargoBuilder, Emitter};
+use std::{
+    env,
+    error::Error,
+    path::Path,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 fn main() -> Result<(), Box<dyn Error>> {
-    let mut emitter = Emitter::default();
-
-    let build_builder = BuildBuilder::default().build_timestamp(true).build()?;
-
-    emitter.add_instructions(&build_builder)?;
-
-    let cargo_builder = CargoBuilder::default().features(true).target_triple(true).build()?;
-
-    emitter.add_instructions(&cargo_builder)?;
-
-    emitter.emit_and_set()?;
+    // TN(TN-0025): the three values upstream took from vergen come from cargo and the clock, so
+    // vergen and its build-time dependencies are not compiled.
+    let build_timestamp = build_timestamp()?;
+    let cargo_features = cargo_features();
+    let target_triple = env::var("TARGET")?;
+    println!("cargo:rustc-env=VERGEN_BUILD_TIMESTAMP={build_timestamp}");
+    println!("cargo:rustc-env=VERGEN_CARGO_FEATURES={cargo_features}");
+    println!("cargo:rustc-env=VERGEN_CARGO_TARGET_TRIPLE={target_triple}");
 
     // TN(TN-0020): describe the upstream commit this copy was taken from (`tn/upstream.toml`),
     // not TN's git state. Upstream ran vergen-git2 here, which inside TN's repository rebuilt
@@ -67,14 +68,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     // ```
     println!("cargo:rustc-env=RETH_LONG_VERSION_0=Version: {pkg_version}{version_suffix}");
     println!("cargo:rustc-env=RETH_LONG_VERSION_1=Commit SHA: {sha}");
-    println!(
-        "cargo:rustc-env=RETH_LONG_VERSION_2=Build Timestamp: {}",
-        env::var("VERGEN_BUILD_TIMESTAMP")?
-    );
-    println!(
-        "cargo:rustc-env=RETH_LONG_VERSION_3=Build Features: {}",
-        env::var("VERGEN_CARGO_FEATURES")?
-    );
+    println!("cargo:rustc-env=RETH_LONG_VERSION_2=Build Timestamp: {build_timestamp}");
+    println!("cargo:rustc-env=RETH_LONG_VERSION_3=Build Features: {cargo_features}");
     println!("cargo:rustc-env=RETH_LONG_VERSION_4=Build Profile: {profile}");
 
     // The version information for reth formatted for P2P (devp2p).
@@ -84,7 +79,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     // Example: reth/v0.1.0-alpha.1-428a6dc2f/aarch64-apple-darwin
     println!(
         "cargo:rustc-env=RETH_P2P_CLIENT_VERSION={}",
-        format_args!("reth/v{pkg_version}-{sha_short}/{}", env::var("VERGEN_CARGO_TARGET_TRIPLE")?)
+        format_args!("reth/v{pkg_version}-{sha_short}/{target_triple}")
     );
 
     Ok(())
@@ -96,4 +91,34 @@ fn pin_value(toml: &str, key: &str) -> Option<String> {
         let (k, v) = line.split_once('=')?;
         (k.trim() == key).then(|| v.trim().trim_matches('"').to_string())
     })
+}
+
+/// TN(TN-0025): the build time as RFC 3339 UTC, or `SOURCE_DATE_EPOCH` for reproducible builds.
+fn build_timestamp() -> Result<String, Box<dyn Error>> {
+    println!("cargo:rerun-if-env-changed=SOURCE_DATE_EPOCH");
+    let secs = match env::var("SOURCE_DATE_EPOCH") {
+        Ok(epoch) => epoch.parse::<i64>()?,
+        Err(_) => SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs().try_into()?,
+    };
+    let (days, rem) = (secs.div_euclid(86_400), secs.rem_euclid(86_400));
+    // Civil date from days since 1970-01-01 (Howard Hinnant's `civil_from_days`).
+    let z = days + 719_468;
+    let (era, doe) = (z.div_euclid(146_097), z.rem_euclid(146_097));
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    let (hour, min, sec) = (rem / 3600, rem % 3600 / 60, rem % 60);
+    Ok(format!("{year:04}-{month:02}-{day:02}T{hour:02}:{min:02}:{sec:02}Z"))
+}
+
+/// TN(TN-0025): the enabled features, as vergen listed them (lowercase, comma-separated).
+fn cargo_features() -> String {
+    let mut features: Vec<_> = env::vars()
+        .filter_map(|(key, _)| key.strip_prefix("CARGO_FEATURE_").map(str::to_lowercase))
+        .collect();
+    features.sort();
+    features.join(",")
 }
