@@ -269,13 +269,7 @@ fn cells(packed_max: u16) -> write::Cells {
 #[cold]
 #[inline(never)]
 fn packed_error(table: &Table, k: &[u8], e: Error) -> Error {
-    match e {
-        Error::Corrupt(m) => Error::Corrupt(format!(
-            "dup table {}: the packed set of key {k:02x?}: {m}",
-            table.name()
-        )),
-        e => e,
-    }
+    packed::packed_error(table.name(), k, e)
 }
 
 /// The nested root an outer cell of key `k` holds (`b`), decoded and checked: a cell names a
@@ -1402,9 +1396,10 @@ impl RoTxn {
     /// (its first slot read here, as `RoTxn::root` reads it), only the slot's index.
     #[inline]
     pub fn dup_cursor_owned(self: &Arc<Self>, table: &Table) -> Result<DupRoCursor> {
-        let (handle, outer_root, key_len) = match self.snapshot.tables.at_home(table) {
+        let (handle, outer_root, (key_len, packed_max)) = match self.snapshot.tables.at_home(table)
+        {
             Some((_, root, Some(dup))) => {
-                (DupHandle::Slot(TableRoots::home(table)), *root, dup.key_len)
+                (DupHandle::Slot(TableRoots::home(table)), *root, (dup.key_len, dup.packed_max))
             }
             _ => self.dup_resolve(table)?,
         };
@@ -1412,6 +1407,7 @@ impl RoTxn {
             txn: Arc::clone(self),
             outer_root,
             handle,
+            packed_max,
             walk: DupWalk::new(key_len, self.snapshot.geometry.max_subkey(usize::from(key_len))),
         })
     }
@@ -1419,7 +1415,7 @@ impl RoTxn {
     /// [`Self::dup_cursor_owned`] past its hit path: [`Self::resolve_table`], the kind, and the
     /// slot that remembers the handle, else a copy of it.
     #[inline(never)]
-    fn dup_resolve(&self, table: &Table) -> Result<(DupHandle, TreeRoot, u16)> {
+    fn dup_resolve(&self, table: &Table) -> Result<(DupHandle, TreeRoot, (u16, u16))> {
         let (outer_root, dup) = self.read(|_| self.resolve_table(table))?;
         let Some(dup) = dup else {
             return Err(Error::TableKind(table.name().to_string()));
@@ -1428,7 +1424,7 @@ impl RoTxn {
             Some(at) => DupHandle::Slot(at),
             None => DupHandle::Own(table.clone()),
         };
-        Ok((handle, outer_root, dup.key_len))
+        Ok((handle, outer_root, (dup.key_len, dup.packed_max)))
     }
 }
 
@@ -1638,9 +1634,10 @@ impl RoCursor {
 }
 
 /// A reader's nested roots: each outer cell's own ([`cell_root`]), a snapshot's cells being its
-/// truth.
+/// truth; and the table's packed-set limit, its record's.
 struct SnapshotRoots<'a> {
     table: &'a Table,
+    packed_max: u16,
 }
 
 impl NestedRoots for SnapshotRoots<'_> {
@@ -1651,6 +1648,11 @@ impl NestedRoots for SnapshotRoots<'_> {
     #[inline]
     fn root(&mut self, k: &[u8], cell: &[u8; page::NESTED_CELL]) -> Result<TreeRoot> {
         cell_root(self.table, k, cell)
+    }
+
+    #[inline]
+    fn packed_max(&self) -> usize {
+        usize::from(self.packed_max)
     }
 }
 
@@ -1681,6 +1683,8 @@ pub struct DupRoCursor {
     /// The table's outer tree in the transaction's snapshot.
     outer_root: TreeRoot,
     handle: DupHandle,
+    /// The table's packed-set limit, its record's in the snapshot.
+    packed_max: u16,
     walk: DupWalk,
 }
 
@@ -1738,6 +1742,12 @@ impl DupRoCursor {
         }
     }
 
+    /// The cursor's root source, for a read that does not move it.
+    #[inline]
+    fn roots(&self) -> SnapshotRoots<'_> {
+        SnapshotRoots { table: table_of(&self.txn, &self.handle), packed_max: self.packed_max }
+    }
+
     /// Run a walker move over the snapshot, latching damage it finds, and pair the value it
     /// returns with the logical key. `op` takes the walker, the snapshot, the outer root and the
     /// root source.
@@ -1746,9 +1756,9 @@ impl DupRoCursor {
         &'c mut self,
         op: impl FnOnce(&mut DupWalk, &'c Snapshot, &TreeRoot, &mut SnapshotRoots<'_>) -> Walked<'c>,
     ) -> Result<Option<(&'c [u8], &'c [u8])>> {
-        let Self { txn, outer_root, handle, walk } = self;
+        let Self { txn, outer_root, handle, packed_max, walk } = self;
         let txn: &'c RoTxn = txn;
-        let mut roots = SnapshotRoots { table: table_of(txn, handle) };
+        let mut roots = SnapshotRoots { table: table_of(txn, handle), packed_max: *packed_max };
         let value = op(walk, &txn.snapshot, outer_root, &mut roots)
             .inspect_err(|e| txn.inner.latch.latch_error(e))?;
         let walk: &'c DupWalk = walk;
@@ -1782,7 +1792,7 @@ impl DupRoCursor {
         let snapshot = &*self.txn.snapshot;
         let value = self
             .walk
-            .current(snapshot, &again(snapshot))
+            .current(snapshot, &self.roots(), &again(snapshot))
             .inspect_err(|e| self.txn.inner.latch.latch_error(e))?;
         Ok(value.map(|v| (self.walk.key(), v)))
     }
@@ -1797,7 +1807,7 @@ impl DupRoCursor {
         let snapshot = &*self.txn.snapshot;
         let tail = self
             .walk
-            .current_with_key_tail(snapshot, &again(snapshot), t)
+            .current_with_key_tail(snapshot, &self.roots(), &again(snapshot), t)
             .inspect_err(|e| self.txn.inner.latch.latch_error(e))?;
         Ok(tail.map(|tail| (self.walk.key(), tail)))
     }
@@ -3674,6 +3684,13 @@ impl NestedRoots for WorkRoots<'_> {
         }
         load_cell(self.writer, self.table, k, cell)
     }
+
+    /// 0: a write transaction's dup cursor reads no packed set yet, so its walker refuses a
+    /// packed key's cell as [`Error::Corrupt`] (fail closed).
+    #[inline]
+    fn packed_max(&self) -> usize {
+        0
+    }
 }
 
 /// A write transaction's fetch of a leaf a dup cursor is at, for a move from it: the page with
@@ -3946,7 +3963,7 @@ impl DupTxnCursor {
         let value = self.call(txn, |c, work| {
             if std::mem::take(&mut c.deleted) {
                 let store = work.writer();
-                return c.walk.current(store, &checked(store));
+                return c.walk.current(store, &WorkRoots::new(work, &c.track), &checked(store));
             }
             c.walk_op(work, |w, store, root, roots| {
                 w.step(store, root, roots, &checked(store), true)
@@ -3967,7 +3984,7 @@ impl DupTxnCursor {
         let value = self.call(txn, |c, work| {
             c.deleted = false;
             let store = work.writer();
-            c.walk.current(store, &checked(store))
+            c.walk.current(store, &WorkRoots::new(work, &c.track), &checked(store))
         })?;
         Ok(self.row(value))
     }
@@ -3982,7 +3999,7 @@ impl DupTxnCursor {
         let tail = self.call(txn, |c, work| {
             c.deleted = false;
             let store = work.writer();
-            c.walk.current_with_key_tail(store, &checked(store), t)
+            c.walk.current_with_key_tail(store, &WorkRoots::new(work, &c.track), &checked(store), t)
         })?;
         Ok(tail.map(|tail| (self.walk.key(), tail)))
     }
@@ -4020,7 +4037,7 @@ impl DupTxnCursor {
             if found.is_none() {
                 return Ok(None);
             }
-            c.walk.current_with_key_tail(store, &checked(store), t)
+            c.walk.current_with_key_tail(store, &WorkRoots::new(work, &c.track), &checked(store), t)
         })?;
         Ok(tail.map(|tail| (self.walk.key(), tail)))
     }
@@ -4082,7 +4099,7 @@ impl DupTxnCursor {
             if found.is_none() {
                 return Ok(None);
             }
-            c.walk.current_with_key_tail(store, &checked(store), t)
+            c.walk.current_with_key_tail(store, &WorkRoots::new(work, &c.track), &checked(store), t)
         })?;
         Ok(tail.map(|tail| (self.walk.key(), tail)))
     }
@@ -4128,7 +4145,8 @@ impl DupTxnCursor {
             let Some(prefix) = deleted_key.get(..n) else { return Ok(None) };
             // The position is the deleted row's follower (or after the end).
             let landed = if forward {
-                walk.current(store, &again).map(|v| v.filter(|_| walk.key().starts_with(prefix)))
+                walk.current(store, &roots, &again)
+                    .map(|v| v.filter(|_| walk.key().starts_with(prefix)))
             } else {
                 walk.step_if(store, outer_root, &mut roots, &again, prefix, false, target)
             };

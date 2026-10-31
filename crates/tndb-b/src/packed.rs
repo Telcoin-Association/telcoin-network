@@ -100,6 +100,14 @@ impl<'a> PackedView<'a> {
     /// An `i` past the rows is [`Error::Corrupt`] too.
     #[inline]
     pub(crate) fn row(&self, i: usize, max_subkey: usize) -> Result<(&'a [u8], &'a [u8])> {
+        let (start, slen, end) = self.row_span(i, max_subkey)?;
+        Ok(self.blob[start..end].split_at(slen))
+    }
+
+    /// Row `i`'s span in the blob, `(start_i, slen[i], end[i])`, with [`Self::row`]'s checks: the
+    /// subkey is `blob[start..start + slen]` and the value `blob[start + slen..end]`.
+    #[inline]
+    pub(crate) fn row_span(&self, i: usize, max_subkey: usize) -> Result<(usize, usize, usize)> {
         let (start, end, slen) = self.slots(i)?;
         if start < rows_start(self.n) || start > end || end > self.blob.len() {
             return Err(self.bad_span(i, start, end));
@@ -107,7 +115,13 @@ impl<'a> PackedView<'a> {
         if slen == 0 || slen > max_subkey || slen > end - start {
             return Err(bad_subkey(i, slen, end - start, max_subkey));
         }
-        Ok(self.blob[start..end].split_at(slen))
+        Ok((start, slen, end))
+    }
+
+    /// The whole encoding, which [`Self::row_span`]'s offsets index.
+    #[inline]
+    pub(crate) fn blob(&self) -> &'a [u8] {
+        self.blob
     }
 
     /// The binary search for the subkey `s`. Each probe reads its row's subkey with the subkey
@@ -319,6 +333,19 @@ fn put_u16(out: &mut Vec<u8>, x: usize) {
 fn put_slot(out: &mut Vec<u8>, end: usize, slen: usize) {
     put_u16(out, end);
     put_u16(out, slen);
+}
+
+/// A packed set's [`Error::Corrupt`] from this codec, naming the dup table `name` and the outer
+/// key `k` (the codec's own messages name neither); any other error as it is.
+#[cold]
+#[inline(never)]
+pub(crate) fn packed_error(name: &str, k: &[u8], e: Error) -> Error {
+    match e {
+        Error::Corrupt(m) => {
+            Error::Corrupt(format!("dup table {name}: the packed set of key {k:02x?}: {m}"))
+        }
+        e => e,
+    }
 }
 
 #[cold]

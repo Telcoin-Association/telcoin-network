@@ -9,8 +9,16 @@
 //! transaction's working map before its cells), so one walker serves a reader's cursor and a write
 //! transaction's. The outer tree is read through [`Cells`] (an outer cell as it is), and the
 //! walker checks every outer key it lands on before it reads the key's cell: the table's key
-//! width, then a nested cell ([`nested_cell`]). The nested trees are plain trees
-//! ([`super::cursor::Values`]).
+//! width, then the cell, a nested cell ([`nested_cell`]) or, in a table that packs
+//! ([`NestedRoots::packed_max`] not 0), an inline cell holding the key's packed set
+//! ([`crate::packed`]). The nested trees are plain trees ([`super::cursor::Values`]).
+//!
+//! **Packed mode.** At a row of a packed key the nested path is unset and the walker holds the
+//! set's row count and the row's index; each move re-reads the cell from the outer leaf it is at
+//! and decodes it again (O(1), [`PackedView::new`]), so the walker borrows no page. A step inside
+//! the set compares the new row's subkey with the previous one, so a walk over a key checks the
+//! order of every row it passes; a landing (an edge row, a seek's) needs no compare. A nested
+//! key's moves pay one compare of the row count for this mode, an absent key none.
 //!
 //! The logical key is not contiguous in any page (`k` sits in an outer leaf, `s` in a nested
 //! leaf), so the walker keeps it in a buffer, rewritten past `k` on each move inside a key and
@@ -23,8 +31,10 @@ use super::{
 };
 use crate::{
     error::{Error, Result},
-    page::{self, LeafView, Val},
+    packed::{packed_error, PackedView},
+    page::{self, cmp_keys, LeafView, Search, Val},
 };
+use std::cmp::Ordering;
 
 /// Where a dup walker gets the nested root of each outer key it lands on.
 pub(crate) trait NestedRoots {
@@ -35,6 +45,11 @@ pub(crate) trait NestedRoots {
     /// itself, a write transaction's from its working map when the map holds `k`, never from a
     /// cell the map supersedes. A cell naming an empty tree is [`Error::Corrupt`].
     fn root(&mut self, k: &[u8], cell: &[u8; page::NESTED_CELL]) -> Result<TreeRoot>;
+
+    /// The table's packed-set limit, its record's resolved `packed_max`, fixed for a cursor's
+    /// life: an inline outer cell is a packed set of at most this many bytes when it is not 0, and
+    /// [`Error::Corrupt`] at 0.
+    fn packed_max(&self) -> usize;
 }
 
 /// The nested root bytes of outer key `k`'s cell `val` in the dup table `name`: any other cell is
@@ -46,13 +61,30 @@ pub(crate) fn nested_cell<'s>(
 ) -> Result<&'s [u8; page::NESTED_CELL]> {
     match val {
         Val::Nested(b) => Ok(b),
-        Val::Inline(_) => Err(Error::Corrupt(format!(
-            "dup table {name}: the outer cell of key {k:02x?} holds no nested tree"
-        ))),
-        Val::Overflow(_) => Err(Error::Corrupt(format!(
-            "dup table {name}: an overflow cell in a dup table's outer tree (key {k:02x?})"
-        ))),
+        val => Err(refused_cell(name, k, val)),
     }
+}
+
+/// The error of outer key `k`'s cell `val` in the dup table `name` when it is not a cell the
+/// table holds: an overflow cell in any dup table, an inline cell in one that does not pack.
+#[cold]
+#[inline(never)]
+fn refused_cell(name: &str, k: &[u8], val: Val<'_>) -> Error {
+    match val {
+        Val::Overflow(_) => Error::Corrupt(format!(
+            "dup table {name}: an overflow cell in a dup table's outer tree (key {k:02x?})"
+        )),
+        _ => Error::Corrupt(format!(
+            "dup table {name}: the outer cell of key {k:02x?} holds no nested tree"
+        )),
+    }
+}
+
+/// How the walker is inside the key it is at: by the nested tree (with the page of the nested
+/// leaf it is at, when a caller holds it), or by the key's packed set.
+enum Inside<'s> {
+    Nested(Option<&'s [u8]>),
+    Packed(PackedView<'s>),
 }
 
 /// The error of an outer key of `len` bytes in the dup table `name` of key width `kl`: a damaged
@@ -81,9 +113,10 @@ fn held<'s>(
 /// A position in a dup table: the outer tree's path, the current outer key's nested tree and its
 /// path, and the logical key `k ‖ s` of the row it is at (see the module docs).
 ///
-/// Its state is the nested path's while the outer path is at an entry, else the outer path's.
-/// After every move an outer path at an entry sits over a nested path at an entry: the walker
-/// never stops at a nested tree's end, it steps the outer path on. An error leaves both paths
+/// Its state is the nested path's while the outer path is at an entry of a nested key, at a row
+/// while it is at a packed key's, else the outer path's. After every move an outer path at an
+/// entry sits over a nested path at an entry or over a packed row: the walker never stops at a
+/// nested tree's or a packed set's end, it steps the outer path on. An error leaves both paths
 /// unset.
 #[derive(Clone, Debug)]
 pub(crate) struct DupWalk {
@@ -97,6 +130,11 @@ pub(crate) struct DupWalk {
     key_len: u16,
     /// The longest subkey a row of the table has ([`crate::page::Geometry::max_subkey`]).
     max_subkey: u16,
+    /// The rows of the packed set of the key the walker is at; 0 while the key is nested (or the
+    /// outer path at none). A set's row count is a `u16` of its encoding.
+    packed_rows: u16,
+    /// The packed row the walker is at (meaningful while `packed_rows` is not 0).
+    packed_at: u16,
 }
 
 impl DupWalk {
@@ -110,6 +148,8 @@ impl DupWalk {
             key: Vec::new(),
             key_len,
             max_subkey: u16::try_from(max_subkey).unwrap_or(u16::MAX),
+            packed_rows: 0,
+            packed_at: 0,
         }
     }
 
@@ -137,6 +177,7 @@ impl DupWalk {
     #[inline]
     pub(crate) fn state(&self) -> State {
         match self.outer.state() {
+            State::At if self.packed_rows != 0 => State::At,
             State::At => self.inner.state(),
             outer => outer,
         }
@@ -163,6 +204,7 @@ impl DupWalk {
     pub(crate) fn unset(&mut self) {
         self.outer.unset();
         self.inner.unset();
+        self.packed_rows = 0;
     }
 
     /// Rewrite the logical key's subkey with the key of the nested row just landed on: 1 to
@@ -189,18 +231,253 @@ impl DupWalk {
     }
 
     /// The outer path just landed on key `k` with cell `val`: check the key's width and its cell,
-    /// take its nested root and write `k` into the logical key. The nested path is left for the
-    /// caller to land.
-    fn enter<N: NestedRoots>(&mut self, roots: &mut N, k: &[u8], val: Val<'_>) -> Result<()> {
+    /// write `k` into the logical key and say how the walker is inside the key: a nested key's
+    /// root taken, the nested path left for the caller to land; or a packed key's set decoded, the
+    /// nested path unset and the row left for the caller to pick. The nested arm comes first, so
+    /// a nested key pays the match it paid before packing and one store.
+    fn enter<'s, N: NestedRoots>(
+        &mut self,
+        roots: &mut N,
+        k: &[u8],
+        val: Val<'s>,
+    ) -> Result<Inside<'s>> {
         self.check_width(roots, k)?;
-        let cell = nested_cell(roots.name(), k, val)?;
-        self.nested = roots.root(k, cell)?;
+        let inside = match val {
+            Val::Nested(cell) => {
+                self.nested = roots.root(k, cell)?;
+                self.packed_rows = 0;
+                Inside::Nested(None)
+            }
+            Val::Inline(b) if roots.packed_max() != 0 => self.enter_packed(roots, k, b)?,
+            val => return Err(refused_cell(roots.name(), k, val)),
+        };
         if self.key.capacity() == 0 {
             self.key.reserve(self.kl() + 64);
         }
         self.key.clear();
         self.key.extend_from_slice(k);
+        Ok(inside)
+    }
+
+    /// [`Self::enter`]'s packed arm: decode outer key `k`'s set `b` with [`PackedView::new`]'s
+    /// checks and unset the nested path.
+    #[inline(never)]
+    fn enter_packed<'s, N: NestedRoots>(
+        &mut self,
+        roots: &N,
+        k: &[u8],
+        b: &'s [u8],
+    ) -> Result<Inside<'s>> {
+        let view =
+            PackedView::new(b, roots.packed_max()).map_err(|e| packed_error(roots.name(), k, e))?;
+        self.inner.unset();
+        // Lossless: the row count is a u16 of the encoding.
+        self.packed_rows = view.rows() as u16;
+        Ok(Inside::Packed(view))
+    }
+
+    /// Land on the first (`forward`) or last row of the key just entered (`inside`) and return
+    /// its value.
+    #[inline]
+    fn land_edge_of<'s, S: PageRead + ?Sized, N: NestedRoots>(
+        &mut self,
+        store: &'s S,
+        roots: &N,
+        inside: Inside<'s>,
+        forward: bool,
+    ) -> Result<&'s [u8]> {
+        match inside {
+            Inside::Nested(_) => self.land_edge(store, forward),
+            Inside::Packed(view) => {
+                let i = if forward { 0 } else { view.rows() - 1 };
+                self.land_packed(roots.name(), &view, i)
+            }
+        }
+    }
+
+    /// The packed set of the key the walker is at, read again from the outer leaf it is at
+    /// (`again`'s page, else fetched) and decoded with [`PackedView::new`]'s checks. A cell no
+    /// longer inline, or a set of another row count than the landing's, is [`Error::Corrupt`]: a
+    /// snapshot does not change, and a change a write transaction makes to the table refreshes
+    /// its cursors before they move.
+    #[inline(never)]
+    fn packed<'s, S: PageRead + ?Sized, N: NestedRoots>(
+        &self,
+        store: &'s S,
+        roots: &N,
+        again: &impl Fn(u32) -> Result<Option<&'s [u8]>>,
+    ) -> Result<PackedView<'s>> {
+        let name = roots.name();
+        let leaf = held(&self.outer, again)?;
+        let view = match self.outer.current_in::<Cells, S>(store, leaf)? {
+            Some((_, Val::Inline(b))) => {
+                PackedView::new(b, roots.packed_max()).map_err(|e| self.packed_err(name, e))?
+            }
+            _ => return Err(self.packed_changed(name)),
+        };
+        if view.rows() != usize::from(self.packed_rows) {
+            return Err(self.packed_changed(name));
+        }
+        Ok(view)
+    }
+
+    /// The packed row beside the one the walker is at, the next (`forward`) or the previous;
+    /// `None` at the set's edge.
+    #[inline]
+    fn packed_neighbour(&self, forward: bool) -> Option<usize> {
+        let i = usize::from(self.packed_at);
+        if forward {
+            (i + 1 < usize::from(self.packed_rows)).then_some(i + 1)
+        } else {
+            i.checked_sub(1)
+        }
+    }
+
+    /// Row `i` of the current key's set `view`: its subkey and value, with [`PackedView::row`]'s
+    /// checks.
+    #[inline]
+    fn packed_row<'s>(
+        &self,
+        name: &str,
+        view: &PackedView<'s>,
+        i: usize,
+    ) -> Result<(&'s [u8], &'s [u8])> {
+        view.row(i, usize::from(self.max_subkey)).map_err(|e| self.packed_err(name, e))
+    }
+
+    /// Land on packed row `i` of the current key's set `view` and return its value: an edge row
+    /// or a search's, which needs no order compare (the next step compares against it).
+    fn land_packed<'s>(&mut self, name: &str, view: &PackedView<'s>, i: usize) -> Result<&'s [u8]> {
+        let (s, v) = self.packed_row(name, view, i)?;
+        self.set_sub(s)?;
+        // Lossless: `i` is below the set's u16 row count.
+        self.packed_at = i as u16;
+        Ok(v)
+    }
+
+    /// Step to packed row `to`, the next (`forward`) or the previous of the one the walker is at,
+    /// whose subkey is `s`: above (below) the current subkey, else [`Error::Corrupt`] (a set's
+    /// subkeys strictly ascend, so an equal pair is damage too).
+    fn packed_move(&mut self, name: &str, s: &[u8], to: usize, forward: bool) -> Result<()> {
+        let want = if forward { Ordering::Greater } else { Ordering::Less };
+        if cmp_keys(s, &self.key[self.kl()..]) != want {
+            return Err(
+                self.packed_err(name, Error::Corrupt(format!("subkeys out of order at row {to}")))
+            );
+        }
+        self.set_sub(s)?;
+        // Lossless: `to` is below the set's u16 row count.
+        self.packed_at = to as u16;
         Ok(())
+    }
+
+    /// The first row of the current key's set `view` whose subkey is `>= s`; `None` past its last.
+    fn packed_find(&self, name: &str, view: &PackedView<'_>, s: &[u8]) -> Result<Option<usize>> {
+        let (Search::Found(j) | Search::NotFound(j)) =
+            view.find(s, usize::from(self.max_subkey)).map_err(|e| self.packed_err(name, e))?;
+        Ok((j < view.rows()).then_some(j))
+    }
+
+    /// [`Self::step`] at a packed row: to the set's neighbouring row (the order compared), else
+    /// across to the next (previous) key.
+    #[inline(never)]
+    fn step_packed<'s, S: PageRead + ?Sized, N: NestedRoots>(
+        &mut self,
+        store: &'s S,
+        outer_root: &TreeRoot,
+        roots: &mut N,
+        again: &impl Fn(u32) -> Result<Option<&'s [u8]>>,
+        forward: bool,
+    ) -> Result<Option<&'s [u8]>> {
+        if let Some(to) = self.packed_neighbour(forward) {
+            let view = self.packed(store, roots, again)?;
+            let (s, v) = self.packed_row(roots.name(), &view, to)?;
+            self.packed_move(roots.name(), s, to, forward)?;
+            return Ok(Some(v));
+        }
+        self.cross_key(store, outer_root, roots, again, forward)
+    }
+
+    /// [`Self::step_in_prefix`] at a packed row with a neighbouring row `to` in the set: move
+    /// there (the order compared) when the logical keys share their first `n` bytes, else `None`,
+    /// the walker unmoved.
+    #[inline(never)]
+    fn step_in_prefix_packed<'s, S: PageRead + ?Sized, N: NestedRoots>(
+        &mut self,
+        store: &'s S,
+        roots: &N,
+        again: &impl Fn(u32) -> Result<Option<&'s [u8]>>,
+        to: usize,
+        n: usize,
+        forward: bool,
+    ) -> Result<Option<&'s [u8]>> {
+        let (kl, name) = (self.kl(), roots.name());
+        let view = self.packed(store, roots, again)?;
+        let (s, v) = self.packed_row(name, &view, to)?;
+        // The rows of one key share its `K` bytes, so only a prefix past them can differ.
+        if n > kl && !s.starts_with(&self.key[kl..n]) {
+            return Ok(None);
+        }
+        self.packed_move(name, s, to, forward)?;
+        Ok(Some(v))
+    }
+
+    /// Move to the first row `>= s` of the current key's set `view` (an empty `s`: its first),
+    /// else across to the next key's first row.
+    #[inline(never)]
+    fn seek_packed<'s, S: PageRead + ?Sized, N: NestedRoots>(
+        &mut self,
+        store: &'s S,
+        outer_root: &TreeRoot,
+        roots: &mut N,
+        again: &impl Fn(u32) -> Result<Option<&'s [u8]>>,
+        view: &PackedView<'s>,
+        s: &[u8],
+    ) -> Result<Option<&'s [u8]>> {
+        match self.packed_find(roots.name(), view, s)? {
+            Some(j) => self.land_packed(roots.name(), view, j).map(Some),
+            None => self.cross_key(store, outer_root, roots, again, true),
+        }
+    }
+
+    /// The value of the packed row the walker is at with the logical key's last `t` bytes: the
+    /// row is `s ‖ v` in one slice of the outer leaf, so a tail inside the subkey comes joined.
+    #[inline(never)]
+    fn packed_tail<'s, S: PageRead + ?Sized, N: NestedRoots>(
+        &self,
+        store: &'s S,
+        roots: &N,
+        again: &impl Fn(u32) -> Result<Option<&'s [u8]>>,
+        t: usize,
+    ) -> Result<KeyTail<'s>> {
+        let name = roots.name();
+        let view = self.packed(store, roots, again)?;
+        let (start, slen, end) = view
+            .row_span(usize::from(self.packed_at), usize::from(self.max_subkey))
+            .map_err(|e| self.packed_err(name, e))?;
+        let blob = view.blob();
+        Ok(if t <= slen {
+            KeyTail::Joined(&blob[start + slen - t..end])
+        } else {
+            KeyTail::Apart(&blob[start + slen..end])
+        })
+    }
+
+    /// A packed-set error `e` of the codec, naming the table `name` and the current outer key.
+    #[cold]
+    #[inline(never)]
+    fn packed_err(&self, name: &str, e: Error) -> Error {
+        packed_error(name, &self.key[..self.kl().min(self.key.len())], e)
+    }
+
+    /// The error of a packed set that is not the one the walker landed on.
+    #[cold]
+    #[inline(never)]
+    fn packed_changed(&self, name: &str) -> Error {
+        Error::Corrupt(format!(
+            "dup table {name}: the packed set of key {:02x?} changed under a cursor",
+            &self.key[..self.kl().min(self.key.len())]
+        ))
     }
 
     /// An outer key the outer path landed on has the table's width, else [`Error::Corrupt`] (a
@@ -248,8 +525,8 @@ impl DupWalk {
     ) -> Result<Option<&'s [u8]>> {
         match landed {
             Some((k, val)) => {
-                self.enter(roots, k, val)?;
-                self.land_edge(store, forward).map(Some)
+                let inside = self.enter(roots, k, val)?;
+                self.land_edge_of(store, roots, inside, forward).map(Some)
             }
             None => {
                 self.inner.unset();
@@ -297,6 +574,9 @@ impl DupWalk {
             }
             (State::AfterEnd, true) | (State::BeforeStart, false) => Ok(None),
             (State::At, _) => self.guarded(|w| {
+                if w.packed_rows != 0 {
+                    return w.step_packed(store, outer_root, roots, again, forward);
+                }
                 let stepped = match held(&w.inner, again)? {
                     Some(leaf) => w.inner.step_from(store, &w.nested, leaf, forward)?,
                     None if forward => w.inner.next(store, &w.nested)?,
@@ -348,6 +628,10 @@ impl DupWalk {
         self.guarded(|w| {
             let at = w.state() == State::At;
             if at && x.len() >= kl && w.key[..kl] == *xk {
+                if w.packed_rows != 0 {
+                    let view = w.packed(store, roots, again)?;
+                    return w.seek_packed(store, outer_root, roots, again, &view, xs);
+                }
                 let leaf = held(&w.inner, again)?;
                 return match w.inner.seek(store, &w.nested, leaf, xs)? {
                     Some((s, v)) => {
@@ -362,10 +646,13 @@ impl DupWalk {
             let Some((k, val)) = w.outer.seek_in::<Cells, S>(store, outer_root, leaf, xk)? else {
                 return Ok(None);
             };
-            w.enter(roots, k, val)?;
+            let inside = w.enter(roots, k, val)?;
             // Every row of a key above `xk`, and of `xk` itself when `x` has no subkey, is `> x`.
             if k != xk || x.len() <= kl {
-                return w.land_edge(store, true).map(Some);
+                return w.land_edge_of(store, roots, inside, true).map(Some);
+            }
+            if let Inside::Packed(view) = &inside {
+                return w.seek_packed(store, outer_root, roots, again, view, xs);
             }
             match w.inner.seek(store, &w.nested, None, xs)? {
                 Some((s, v)) => {
@@ -392,12 +679,20 @@ impl DupWalk {
             return Ok(None);
         }
         let (xk, xs) = x.split_at(self.kl());
-        self.bounded(store, outer_root, roots, again, xk, |w, store, leaf| {
-            let found = w.inner.seek_exact(store, &w.nested, leaf, xs)?;
-            if found.is_some() {
-                w.set_sub(xs)?;
+        self.bounded(store, outer_root, roots, again, xk, |w, store, name, inside| match inside {
+            Inside::Nested(leaf) => {
+                let found = w.inner.seek_exact(store, &w.nested, leaf, xs)?;
+                if found.is_some() {
+                    w.set_sub(xs)?;
+                }
+                Ok(found)
             }
-            Ok(found)
+            Inside::Packed(view) => {
+                match view.find(xs, usize::from(w.max_subkey)).map_err(|e| w.packed_err(name, e))? {
+                    Search::Found(j) => w.land_packed(name, &view, j).map(Some),
+                    Search::NotFound(_) => Ok(None),
+                }
+            }
         })
     }
 
@@ -415,7 +710,14 @@ impl DupWalk {
         s: &[u8],
     ) -> Result<Option<&'s [u8]>> {
         self.check_key(k)?;
-        self.bounded(store, outer_root, roots, again, k, |w, store, leaf| {
+        self.bounded(store, outer_root, roots, again, k, |w, store, name, inside| {
+            let leaf = match inside {
+                Inside::Nested(leaf) => leaf,
+                Inside::Packed(view) => {
+                    let j = if s.is_empty() { Some(0) } else { w.packed_find(name, &view, s)? };
+                    return j.map(|j| w.land_packed(name, &view, j)).transpose();
+                }
+            };
             let landed = if s.is_empty() {
                 w.inner.first(store, &w.nested)?
             } else {
@@ -434,7 +736,8 @@ impl DupWalk {
     /// A seek bounded to the outer key `k` (of the key width): onto `k`'s nested tree, the outer
     /// path unmoved when the walker is at a row of `k`, else found from the outer leaf the walker
     /// is at or the root (an exact search, as a plain `seek_exact`'s); then `inner(walker, store,
-    /// nested leaf held)` settles the nested path, a miss leaving both paths unset. An outer
+    /// table name, inside)` settles the row inside the key (the nested leaf held, or the packed
+    /// set), a miss leaving both paths unset. An outer
     /// search that misses `k` reads one key beside it, the leaf's key after `k` (its last when
     /// `k` is past it), only for its width, and leaves the walker unset.
     fn bounded<'s, S: PageRead + ?Sized, N: NestedRoots>(
@@ -444,13 +747,17 @@ impl DupWalk {
         roots: &mut N,
         again: &impl Fn(u32) -> Result<Option<&'s [u8]>>,
         k: &[u8],
-        inner: impl FnOnce(&mut Self, &'s S, Option<&'s [u8]>) -> Result<Option<&'s [u8]>>,
+        inner: impl FnOnce(&mut Self, &'s S, &str, Inside<'s>) -> Result<Option<&'s [u8]>>,
     ) -> Result<Option<&'s [u8]>> {
         self.guarded(|w| {
             let at = w.state() == State::At;
             if at && w.key[..w.kl()] == *k {
-                let leaf = held(&w.inner, again)?;
-                let found = inner(w, store, leaf)?;
+                let inside = if w.packed_rows != 0 {
+                    Inside::Packed(w.packed(store, roots, again)?)
+                } else {
+                    Inside::Nested(held(&w.inner, again)?)
+                };
+                let found = inner(w, store, roots.name(), inside)?;
                 if found.is_none() {
                     w.unset();
                 }
@@ -475,8 +782,8 @@ impl DupWalk {
             else {
                 return Ok(None);
             };
-            w.enter(roots, k, val)?;
-            let found = inner(w, store, None)?;
+            let inside = w.enter(roots, k, val)?;
+            let found = inner(w, store, roots.name(), inside)?;
             if found.is_none() {
                 w.unset();
             }
@@ -486,8 +793,9 @@ impl DupWalk {
 
     /// Move to the next (`forward`) or previous row only if its logical key shares the first `n`
     /// bytes of the current row's; else `None`, the walker unmoved (a plain cursor's prefix step
-    /// on the twin). `n` of at least the key width stays inside the key's nested tree; a shorter
-    /// `n` crosses to the neighbouring key when the key's tree ends, comparing outer keys only.
+    /// on the twin). `n` of at least the key width stays inside the key's nested tree or packed
+    /// set; a shorter `n` crosses to the neighbouring key when the key's rows end, comparing outer
+    /// keys only.
     pub(crate) fn step_in_prefix<'s, S: PageRead + ?Sized, N: NestedRoots>(
         &mut self,
         store: &'s S,
@@ -502,13 +810,19 @@ impl DupWalk {
         }
         let kl = self.kl();
         self.guarded(|w| {
-            let leaf = held(&w.inner, again)?;
-            let within = n.saturating_sub(kl);
-            if let Some(((s, v), _)) =
-                w.inner.step_in_prefix(store, &w.nested, leaf, within, forward)?
-            {
-                w.set_sub(s)?;
-                return Ok(Some(v));
+            if w.packed_rows != 0 {
+                if let Some(to) = w.packed_neighbour(forward) {
+                    return w.step_in_prefix_packed(store, roots, again, to, n, forward);
+                }
+            } else {
+                let leaf = held(&w.inner, again)?;
+                let within = n.saturating_sub(kl);
+                if let Some(((s, v), _)) =
+                    w.inner.step_in_prefix(store, &w.nested, leaf, within, forward)?
+                {
+                    w.set_sub(s)?;
+                    return Ok(Some(v));
+                }
             }
             if n >= kl {
                 return Ok(None);
@@ -516,8 +830,8 @@ impl DupWalk {
             let leaf = held(&w.outer, again)?;
             match w.outer.step_in_prefix_in::<Cells, S>(store, outer_root, leaf, n, forward)? {
                 Some(((k, val), _)) => {
-                    w.enter(roots, k, val)?;
-                    w.land_edge(store, forward).map(Some)
+                    let inside = w.enter(roots, k, val)?;
+                    w.land_edge_of(store, roots, inside, forward).map(Some)
                 }
                 None => Ok(None),
             }
@@ -539,12 +853,14 @@ impl DupWalk {
         spare: &mut Vec<u8>,
     ) -> Result<Option<&'s [u8]>> {
         let (outer, inner, nested) = (self.outer.clone(), self.inner.clone(), self.nested);
+        let packed = (self.packed_rows, self.packed_at);
         spare.clear();
         spare.extend_from_slice(&self.key);
         match self.step(store, outer_root, roots, again, forward)? {
             Some(v) if self.key.starts_with(prefix) => Ok(Some(v)),
             _ => {
                 (self.outer, self.inner, self.nested) = (outer, inner, nested);
+                (self.packed_rows, self.packed_at) = packed;
                 std::mem::swap(&mut self.key, spare);
                 Ok(None)
             }
@@ -565,6 +881,7 @@ impl DupWalk {
     ) -> Result<()> {
         self.guarded(|w| {
             w.nested = nested;
+            w.packed_rows = 0;
             w.inner.place(branches, leaf, slot);
             w.set_sub(s)
         })
@@ -587,6 +904,7 @@ impl DupWalk {
     ) -> Result<Option<&'s [u8]>> {
         self.guarded(|w| {
             w.nested = nested;
+            w.packed_rows = 0;
             match w.inner.place_after_delete(store, &w.nested, branches, leaf, slot)? {
                 Some((s, v)) => {
                     w.set_sub(s)?;
@@ -618,28 +936,34 @@ impl DupWalk {
     }
 
     /// The value of the row the walker is at, if it is at one.
-    pub(crate) fn current<'s, S: PageRead + ?Sized>(
+    pub(crate) fn current<'s, S: PageRead + ?Sized, N: NestedRoots>(
         &self,
         store: &'s S,
+        roots: &N,
         again: &impl Fn(u32) -> Result<Option<&'s [u8]>>,
     ) -> Result<Option<&'s [u8]>> {
-        Ok(self.current_with_key_tail(store, again, 0)?.map(|tail| match tail {
+        Ok(self.current_with_key_tail(store, roots, again, 0)?.map(|tail| match tail {
             KeyTail::Joined(v) | KeyTail::Apart(v) => v,
         }))
     }
 
     /// The value of the row the walker is at, if it is at one, with the logical key's last `t`
     /// bytes: a tail inside the subkey (`t <= |s|`) and an inline value come joined from the nested
-    /// leaf ([`KeyTail::Joined`]); a value in a run, or a tail reaching into the outer key, come
-    /// apart ([`KeyTail::Apart`]: the value alone, for the caller to join to the key's tail).
-    pub(crate) fn current_with_key_tail<'s, S: PageRead + ?Sized>(
+    /// leaf, or a packed row from the outer leaf ([`KeyTail::Joined`]); a value in a run, or a tail
+    /// reaching into the outer key, come apart ([`KeyTail::Apart`]: the value alone, for the
+    /// caller to join to the key's tail).
+    pub(crate) fn current_with_key_tail<'s, S: PageRead + ?Sized, N: NestedRoots>(
         &self,
         store: &'s S,
+        roots: &N,
         again: &impl Fn(u32) -> Result<Option<&'s [u8]>>,
         t: usize,
     ) -> Result<Option<KeyTail<'s>>> {
         if self.state() != State::At {
             return Ok(None);
+        }
+        if self.packed_rows != 0 {
+            return self.packed_tail(store, roots, again, t).map(Some);
         }
         let leaf = held(&self.inner, again)?;
         let sub = self.key.len() - self.kl();
@@ -676,11 +1000,85 @@ pub(crate) type LeafBounds = Option<(Vec<u8>, Vec<u8>)>;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tree::{test_harness::MemStore, write};
+
+    /// The root source of an outer tree of packed sets alone, of up to 512 bytes each.
+    struct Packing;
+
+    impl NestedRoots for Packing {
+        fn name(&self) -> &str {
+            "t"
+        }
+
+        fn root(&mut self, _: &[u8], _: &[u8; page::NESTED_CELL]) -> Result<TreeRoot> {
+            Err(Error::Corrupt("no nested tree here".into()))
+        }
+
+        fn packed_max(&self) -> usize {
+            512
+        }
+    }
+
+    /// No held leaf: every move fetches its page.
+    fn no_leaf<'s>(_: u32) -> Result<Option<&'s [u8]>> {
+        Ok(None)
+    }
+
+    /// A packed set of `rows` in the order given, laid out as the codec lays one out (a forger's
+    /// encoder: no order check).
+    fn forge(rows: &[(&[u8], &[u8])]) -> Vec<u8> {
+        let mut out = (rows.len() as u16).to_le_bytes().to_vec();
+        let mut end = 2 + 4 * rows.len();
+        for (s, v) in rows {
+            end += s.len() + v.len();
+            out.extend((end as u16).to_le_bytes());
+            out.extend((s.len() as u16).to_le_bytes());
+        }
+        for (s, v) in rows {
+            out.extend(*s);
+            out.extend(*v);
+        }
+        out
+    }
+
+    /// Every step inside a packed set compares the new row's subkey with the one before: a set
+    /// whose last two rows are swapped (which passes the O(1) checks) is `Corrupt` at the step
+    /// onto the out-of-order row, forward and backward, by the exact message, the walker unset;
+    /// the set's edge rows land with no compare.
+    #[test]
+    fn the_walk_order_check_catches_a_forged_swap() {
+        let mut store = MemStore::new(4096);
+        let (mut root, mut trusted) = (TreeRoot::EMPTY, false);
+        let blob = forge(&[(b"a", b"1"), (b"c", b"3"), (b"b", b"2")]);
+        write::put(&mut store, &mut root, &mut trusted, &[0, 0, 0, 1], &blob).expect("put");
+        let refused = |row: usize| {
+            format!(
+                "dup table t: the packed set of key [00, 00, 00, 01]: subkeys out of order at row \
+                 {row}"
+            )
+        };
+        let mut w = DupWalk::new(4, 64);
+        let walk = &mut w;
+        assert_eq!(walk.start(&store, &root, &mut Packing, true).expect("row 0"), Some(&b"1"[..]));
+        let step = walk.step(&store, &root, &mut Packing, &no_leaf, true).expect("row 1");
+        assert_eq!((step, walk.key()), (Some(&b"3"[..]), &b"\0\0\0\x01c"[..]));
+        let step = walk.step(&store, &root, &mut Packing, &no_leaf, true);
+        assert!(matches!(&step, Err(Error::Corrupt(m)) if *m == refused(2)), "{step:?}");
+        assert_eq!(walk.state(), State::Unset);
+
+        assert_eq!(walk.start(&store, &root, &mut Packing, false).expect("row 2"), Some(&b"2"[..]));
+        let step = walk.step(&store, &root, &mut Packing, &no_leaf, false);
+        assert!(matches!(&step, Err(Error::Corrupt(m)) if *m == refused(1)), "{step:?}");
+        assert_eq!(walk.state(), State::Unset);
+    }
 
     /// A walker is two tree paths, a nested root and the key buffer: nothing else rides along.
+    /// The packed mode's two `u16`s took the padding after the key width and `max_subkey`: the
+    /// exact size is the size before them, so a later field cannot hide in slack.
     #[test]
     fn dup_walk_stays_small() {
         let most = 2 * size_of::<TreeCursor>() + size_of::<TreeRoot>() + 32;
         assert!(size_of::<DupWalk>() <= most, "{} > {most}", size_of::<DupWalk>());
+        assert_eq!(size_of::<DupWalk>(), 672);
     }
 }

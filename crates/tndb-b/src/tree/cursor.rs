@@ -439,11 +439,26 @@ impl TreeCursor {
         &self,
         store: &'s S,
     ) -> Result<Option<Entry<'s>>> {
+        self.current_in::<Values, S>(store, None)
+    }
+
+    /// [`Self::current`], the entry read by `R`. `leaf` is the page of the leaf the cursor is at,
+    /// when the caller holds it (else it is fetched, as [`Self::current`] fetches it).
+    #[inline]
+    pub(crate) fn current_in<'s, R: CellRead, S: PageRead + ?Sized>(
+        &self,
+        store: &'s S,
+        leaf: Option<&'s [u8]>,
+    ) -> Result<Option<EntryOf<'s, R>>> {
         if self.state != State::At {
             return Ok(None);
         }
         let (pgno, slot) = self.top();
-        Ok(Some(leaf_entry::<Values, S>(store, store.page(pgno)?, slot)?))
+        let leaf = match leaf {
+            Some(leaf) => leaf,
+            None => store.page(pgno)?,
+        };
+        Ok(Some(leaf_entry::<R, S>(store, leaf, slot)?))
     }
 
     /// The entry the cursor is at, if it is at one, as its key and its value joined to the key's

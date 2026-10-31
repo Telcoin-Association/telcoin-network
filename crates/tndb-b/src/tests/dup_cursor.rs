@@ -21,7 +21,7 @@ use crate::{
             KeyTail, State,
         },
         dup_cursor::LeafBounds,
-        test_harness::{walk_outer_tree, ReportSeed, Rng},
+        test_harness::{walk_outer_tree, walk_packing_tree, ReportSeed, Rng},
         TreeRoot,
     },
     DupRoCursor, DupTxnCursor, Env, Error, ReadTxn as _, Result, RoCursor, RwTxn, Table,
@@ -1236,4 +1236,312 @@ fn dup_seeks_from_random_positions_match_a_fresh_seek() {
 fn dup_seeks_from_random_positions_match_a_fresh_seek_heavy() {
     let shape = Shape { keys: 3000, big_keys: 2, big_rows: 40_000, run_pct: 2, nested_height: 3 };
     seeks_from_positions(&shape, 0..12, 12_000);
+}
+
+/// A dup table of [`OPTIONS`]' key width that packs: a key's rows stay in its outer cell while
+/// they encode in at most 160 bytes.
+const PACKING: crate::DupOptions = crate::DupOptions { key_len: OPTIONS.key_len, packed_max: 160 };
+
+/// The outer keys of the packing twins and their row counts: 1 to 5 rows stay packed, 80 promote
+/// to a nested tree, so packed keys come first, between nested keys and last, and neighbouring
+/// outer keys share 0 to K - 1 leading bytes.
+const MIXED: [(u32, usize); 6] = [
+    (0x0000_0001, 3),
+    (0x0000_0002, 80),
+    (0x0000_0100, 1),
+    (0x0001_0000, 5),
+    (0x0100_0000, 80),
+    (0x0100_0001, 2),
+];
+
+/// The subkey of row `i` of a packing twin's key: 1 or 2 bytes, each odd row the even row before
+/// it and one more byte, so neighbouring rows share leading bytes.
+fn mixed_subkey(i: usize) -> Vec<u8> {
+    let first = 0x10 + (i / 2) as u8;
+    if i.is_multiple_of(2) {
+        vec![first]
+    } else {
+        vec![first, 0x80]
+    }
+}
+
+/// Dup table `d` of [`PACKING`] and its composite twin `p` in `env`, committed with the rows of
+/// `keys` (row `i` of a key: [`mixed_subkey`], a value of `i % 7` bytes, empty for row 0); the
+/// rows and the nested trees (the keys of more than 5 rows) checked by `table_stat`.
+fn packed_twins(env: &Env, keys: &[(u32, usize)]) -> (Table, Table, Vec<Kv>) {
+    let mut rows = Rows::new();
+    for &(k, n) in keys {
+        for i in 0..n {
+            rows.insert(dup_key(k, &mixed_subkey(i)), vec![(k as u8) ^ (i as u8); i % 7]);
+        }
+    }
+    let mut txn = env.begin_rw().expect("rw");
+    let d = txn.create_dup_table("d", PACKING).expect("d");
+    let p = txn.create_table("p").expect("p");
+    for (key, value) in &rows {
+        txn.put(&d, key, value).expect("put d");
+        txn.put(&p, key, value).expect("put p");
+    }
+    txn.commit().expect("commit");
+    let stat = env.begin_ro().expect("ro").table_stat(&d).expect("stat");
+    let nested = keys.iter().filter(|(_, n)| *n > 5).count();
+    assert_eq!((stat.entries, stat.nested_trees as usize), (rows.len() as u64, nested), "{stat:?}");
+    (d, p, rows.into_iter().collect())
+}
+
+/// `op` on the dup cursor and on the twin's: the same result, which is no error, and the same
+/// state after it.
+#[track_caller]
+fn same(dup: &mut DupRoCursor, twin: &mut RoCursor, op: &Op, what: &str) -> Option<Kv> {
+    let want = on_twin(twin, op);
+    let got = on_dup(dup, op);
+    assert_eq!(got, want, "{what}: {op:?}");
+    assert_eq!(dup.state(), twin.state(), "{what}: {op:?}");
+    got.expect("no error")
+}
+
+/// A walk over packed, nested and packed keys gives the twin's rows and states, forward and
+/// backward, from `first`/`last` and from an unset cursor, each row's `current` included, and
+/// stays past the end.
+#[test]
+fn a_walk_crosses_packed_then_nested_then_packed_keys() {
+    let (_dir, path) = temp("tndb_b_dup_cursor_packed_walk");
+    let env = open(&path, SyncMode::NoSync);
+    let (d, p, rows) = packed_twins(&env, &MIXED);
+    let ro = Arc::new(env.begin_ro().expect("ro"));
+    for (forward, start, step) in [(true, Op::First, Op::Next), (false, Op::Last, Op::Prev)] {
+        for from_unset in [false, true] {
+            let (mut dup, mut twin) = fresh(&ro, &d, &p);
+            let mut op = if from_unset { step.clone() } else { start.clone() };
+            let mut seen = Vec::new();
+            while let Some(row) = same(&mut dup, &mut twin, &op, "walk") {
+                seen.push(row);
+                same(&mut dup, &mut twin, &Op::Current, "current");
+                op = step.clone();
+            }
+            same(&mut dup, &mut twin, &step, "past the end");
+            if !forward {
+                seen.reverse();
+            }
+            assert_eq!(seen, rows, "forward {forward}, from unset {from_unset}");
+        }
+    }
+    assert!(env.failure().is_none(), "no call latched: {:?}", env.failure());
+}
+
+/// The prefix steps from every row of every key (a packed set's edge rows and inner rows among
+/// them, beside nested and packed neighbours) with `n` = 0, K − 1, K, K + 1, |key| and |key| + 1,
+/// both ways: the twin's rows and states, the cursor unmoved when the step refuses.
+#[test]
+fn prefix_steps_at_a_packed_keys_edges() {
+    let (_dir, path) = temp("tndb_b_dup_cursor_packed_prefix");
+    let env = open(&path, SyncMode::NoSync);
+    let (d, p, rows) = packed_twins(&env, &MIXED);
+    let ro = Arc::new(env.begin_ro().expect("ro"));
+    let (mut dup, mut twin) = fresh(&ro, &d, &p);
+    let (mut moved, mut refused) = (0, 0);
+    for (key, _) in &rows {
+        for n in [0, K - 1, K, K + 1, key.len(), key.len() + 1] {
+            for op in [Op::NextInPrefix(n), Op::PrevInPrefix(n)] {
+                same(&mut dup, &mut twin, &Op::SeekExact(key.clone()), "place");
+                match same(&mut dup, &mut twin, &op, "step") {
+                    Some(_) => moved += 1,
+                    None => refused += 1,
+                }
+                same(&mut dup, &mut twin, &Op::Current, "after the step");
+            }
+        }
+    }
+    assert!(moved > 0 && refused > 0, "moved {moved}, refused {refused}");
+    assert!(env.failure().is_none(), "no call latched: {:?}", env.failure());
+}
+
+/// `seek`, `seek_exact` and `seek_with_key_tail` of every row of the packed keys, the gap after
+/// each row, before row 0, past the last row (the next key's first row), the outer key alone and
+/// a key shorter than it: from a new cursor, from each row of the packed keys and from each key's
+/// first row, each followed by `next`, the twin's rows and states.
+#[test]
+fn seeks_land_inside_between_and_past_packed_keys() {
+    let (_dir, path) = temp("tndb_b_dup_cursor_packed_seeks");
+    let env = open(&path, SyncMode::NoSync);
+    let (d, p, rows) = packed_twins(&env, &MIXED);
+    let ro = Arc::new(env.begin_ro().expect("ro"));
+    let packed = |key: &[u8]| MIXED.iter().any(|&(k, n)| n <= 5 && key[..K] == k.to_be_bytes());
+    let mut targets = Vec::new();
+    for &(k, n) in MIXED.iter().filter(|(_, n)| *n <= 5) {
+        let outer = k.to_be_bytes();
+        targets.extend([outer[..K - 1].to_vec(), outer.to_vec(), dup_key(k, &[0x00])]);
+        for i in 0..n {
+            let s = mixed_subkey(i);
+            targets.extend([dup_key(k, &s), dup_key(k, &[&s[..], &[0x00]].concat())]);
+        }
+        targets.push(dup_key(k, &[0xff]));
+    }
+    let mut froms: Vec<Option<Vec<u8>>> = vec![None];
+    froms.extend(rows.iter().filter(|(key, _)| packed(key)).map(|(key, _)| Some(key.clone())));
+    froms.extend(MIXED.iter().map(|&(k, _)| Some(dup_key(k, &mixed_subkey(0)))));
+    for x in &targets {
+        for op in [Op::Seek(x.clone()), Op::SeekExact(x.clone()), Op::SeekWithKeyTail(x.clone(), 2)]
+        {
+            for from in &froms {
+                let (mut dup, mut twin) = fresh(&ro, &d, &p);
+                if let Some(from) = from {
+                    same(&mut dup, &mut twin, &Op::SeekExact(from.clone()), "place");
+                }
+                same(&mut dup, &mut twin, &op, "seek");
+                same(&mut dup, &mut twin, &Op::Next, "then next");
+            }
+        }
+    }
+    assert!(env.failure().is_none(), "no call latched: {:?}", env.failure());
+}
+
+/// The bounded seeks of a packed key read only its own set: with the nested roots of its
+/// neighbours garbled, `seek_key` and `seek_dup` of each row, of a gap and past its last row
+/// (from a new cursor and from a row: `None`, the cursor unset, nothing latched),
+/// `seek_dup_with_key_tail` and a `seek_exact` past its last row succeed; a plain `seek` past it
+/// must cross into the next key's tree and is `Corrupt`.
+#[test]
+fn seek_dup_past_a_packed_keys_last_row_is_unset() {
+    let dir = TempDir::with_prefix("tndb_b_dup_packed_bounded").expect("temp dir");
+    let path = dir.path().join("db");
+    let (garbled, rows) = {
+        let env = open(&path, SyncMode::Durable);
+        let (_, _, rows) = packed_twins(&env, &[(7, 80), (8, 3), (9, 80)]);
+        let snapshot = env.inner().current();
+        let outer = walk_packing_tree(&*snapshot, &tree(&env, "d"));
+        let garbled: Vec<u32> = outer
+            .entries
+            .iter()
+            .filter(|(k, _)| k[..] != 8u32.to_be_bytes())
+            .map(|(_, cell)| {
+                let cell = cell.as_slice().try_into().expect("a nested cell");
+                TreeRoot::decode(cell).expect("a nested root").root
+            })
+            .collect();
+        assert_eq!(garbled.len(), 2);
+        (garbled, rows)
+    };
+    for pgno in garbled {
+        garble(&path, pgno);
+    }
+    let env = open(&path, SyncMode::Durable);
+    let ro = Arc::new(env.begin_ro().expect("ro"));
+    let d = ro.open_table("d").expect("open").expect("d");
+    let k = 8u32.to_be_bytes();
+    let own: Vec<Kv> = rows.iter().filter(|(key, _)| key.starts_with(&k)).cloned().collect();
+    let past = [0xff];
+
+    let mut fresh = ro.dup_cursor_owned(&d).expect("cursor");
+    assert_eq!(fresh.seek_dup(&k, &past).expect("miss"), None);
+    assert_eq!(fresh.state(), State::Unset);
+    let mut c = ro.dup_cursor_owned(&d).expect("cursor");
+    assert_eq!(owned(c.seek_key(&k).expect("seek_key")), Some(own[0].clone()));
+    for row in own.iter().rev() {
+        assert_eq!(owned(c.seek_dup(&k, &row.0[K..]).expect("hit")), Some(row.clone()));
+    }
+    let gap = [&own[0].0[K..], &[0x00]].concat();
+    assert_eq!(owned(c.seek_dup(&k, &gap).expect("a gap")), Some(own[1].clone()));
+    let last = own.last().expect("a row");
+    let tail = c.seek_dup_with_key_tail(&k, &last.0[K..], 1).expect("hit");
+    assert_eq!(owned_tail(tail, 1).map(|(key, _)| key), Some(last.0.clone()));
+    assert_eq!(c.seek_dup(&k, &past).expect("miss from a row"), None);
+    assert_eq!(c.state(), State::Unset);
+    assert_eq!(c.seek_dup_with_key_tail(&k, &past, 1).expect("miss"), None);
+    assert_eq!(owned(c.seek_key(&k).expect("seek_key")), Some(own[0].clone()));
+    assert_eq!(c.seek_exact(&dup_key(8, &past)).expect("seek_exact miss from a row"), None);
+    assert_eq!(c.state(), State::Unset);
+    assert!(env.failure().is_none(), "nothing latched: {:?}", env.failure());
+
+    assert_eq!(owned(c.seek_key(&k).expect("seek_key")), Some(own[0].clone()));
+    let crossed = c.seek(&dup_key(8, &past));
+    assert!(matches!(crossed, Err(Error::Corrupt(_))), "{crossed:?}");
+    assert_eq!(c.state(), State::Unset);
+    assert!(env.failure().is_some(), "the crossing latched");
+}
+
+/// A packed row is `s ‖ v` in one slice of the outer leaf: a tail inside the subkey comes joined,
+/// ending where the value does (an empty value too); a tail past the subkey comes apart.
+#[test]
+fn current_with_key_tail_of_a_packed_row() {
+    let (_dir, path) = temp("tndb_b_dup_cursor_packed_tail");
+    let env = open(&path, SyncMode::NoSync);
+    let mut txn = env.begin_rw().expect("rw");
+    let d = txn.create_dup_table("d", PACKING).expect("d");
+    let (small, empty) = (dup_key(5, b"abc"), dup_key(5, b"e"));
+    txn.put(&d, &small, b"v1").expect("put");
+    txn.put(&d, &empty, b"").expect("put an empty value");
+    txn.commit().expect("commit");
+    let ro = Arc::new(env.begin_ro().expect("ro"));
+    assert_eq!(ro.table_stat(&d).expect("stat").nested_trees, 0, "one packed set");
+    let value_end = ro.get(&d, &small).expect("get").expect("the row").as_ptr_range().end;
+    let mut c = ro.dup_cursor_owned(&d).expect("cursor");
+    assert_eq!(c.seek_exact(&small).expect("seek_exact"), Some(&b"v1"[..]));
+    for (t, want) in [(0, &b"v1"[..]), (1, b"cv1"), (2, b"bcv1"), (3, b"abcv1")] {
+        let (key, tail) = c.current_with_key_tail(t).expect("tail").expect("a row");
+        assert_eq!(key, &small[..]);
+        let KeyTail::Joined(joined) = tail else { panic!("t {t}: {tail:?}") };
+        assert_eq!((joined, joined.as_ptr_range().end), (want, value_end), "t {t}: the leaf's");
+    }
+    for t in [4, 7, usize::MAX] {
+        let (_, tail) = c.current_with_key_tail(t).expect("tail").expect("a row");
+        assert_eq!(tail, KeyTail::Apart(b"v1"), "t {t}");
+    }
+    assert_eq!(owned(c.next().expect("next")), Some((empty.clone(), Vec::new())));
+    for (t, want) in
+        [(0, KeyTail::Joined(b"")), (1, KeyTail::Joined(b"e")), (2, KeyTail::Apart(b""))]
+    {
+        assert_eq!(c.current_with_key_tail(t).expect("tail"), Some((&empty[..], want)), "t {t}");
+    }
+    let (key, tail) = c.seek_with_key_tail(&small, 2).expect("seek").expect("abc");
+    assert_eq!((key, tail), (&small[..], KeyTail::Joined(b"bcv1")));
+    let (key, tail) =
+        c.seek_dup_with_key_tail(&5u32.to_be_bytes(), b"ab", 1).expect("seek").expect("abc");
+    assert_eq!((key, tail), (&small[..], KeyTail::Joined(b"cv1")));
+    assert!(env.failure().is_none(), "no call latched: {:?}", env.failure());
+}
+
+/// A packed landing has no nested descent: in debug builds (which count root descents) a seek of
+/// a packed key costs one descent fewer than the same seek of a nested key, from a new cursor
+/// (packed 1, nested 2) and from a row of another key in the same outer leaf (packed 0, nested
+/// 1), and none from a row of the same packed key.
+#[test]
+fn packed_landings_skip_the_nested_descent() {
+    let (_dir, path) = temp("tndb_b_dup_cursor_packed_descents");
+    let env = open(&path, SyncMode::NoSync);
+    let (d, _p, _rows) = packed_twins(&env, &MIXED);
+    let ro = Arc::new(env.begin_ro().expect("ro"));
+    let counted = |n: u64| if cfg!(debug_assertions) { n } else { 0 };
+    let (packed, nested) = (0x0001_0000u32, 0x0000_0002u32);
+    let ops = |k: u32| {
+        [
+            Op::Seek(dup_key(k, &mixed_subkey(3))),
+            Op::SeekExact(dup_key(k, &mixed_subkey(3))),
+            Op::SeekWithKeyTail(dup_key(k, &mixed_subkey(3)), 1),
+            Op::SeekDup(k.to_be_bytes().to_vec(), mixed_subkey(3)),
+            Op::SeekKey(k.to_be_bytes().to_vec()),
+        ]
+    };
+    let run = |from: Option<Vec<u8>>, op: &Op| {
+        let mut c = ro.dup_cursor_owned(&d).expect("cursor");
+        if let Some(from) = from {
+            assert!(matches!(on_dup(&mut c, &Op::SeekExact(from)), Ok(Some(_))), "placed");
+        }
+        let (got, spent) = measured(|| on_dup(&mut c, op));
+        assert!(matches!(got, Ok(Some(_))), "{op:?}: {got:?}");
+        spent
+    };
+    for (k, other) in [(packed, nested), (nested, packed)] {
+        let (fresh, beside) = if k == packed { (1, 0) } else { (2, 1) };
+        for op in ops(k) {
+            assert_eq!(run(None, &op), counted(fresh), "fresh {op:?}");
+            let from = Some(dup_key(other, &mixed_subkey(0)));
+            assert_eq!(run(from, &op), counted(beside), "from key {other:#x}: {op:?}");
+        }
+    }
+    for op in ops(packed) {
+        let from = Some(dup_key(packed, &mixed_subkey(1)));
+        assert_eq!(run(from, &op), 0, "from the same packed key: {op:?}");
+    }
+    assert!(env.failure().is_none(), "no call latched: {:?}", env.failure());
 }
