@@ -239,3 +239,6 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
     permit inside the blocking task, so a client that disconnects no longer frees it while the work
     runs on. Conflict in `eth_simulateV1`, whose body predates upstream's refactor: TN's body kept,
     permit moved into its closure. Upstream's `bal.rs` change does not apply (no such file).
+  - e88a669b1: `eth_getProof` holds its tracing permit inside the blocking task
+    (`rpc-eth-api/src/helpers/state.rs`). Ported by hand: TN's tree has only the one proof method;
+    upstream's second site (the v2 multiproof) does not exist here.
