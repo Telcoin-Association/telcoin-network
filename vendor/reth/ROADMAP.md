@@ -4,6 +4,24 @@ Where the vendored reth goes next, in the order that makes each step cheap and s
 `tn/notes/usage-map.md` first: it records what TN actually uses from each crate and where. Status
 markers: **[done]**, **[next]**, **[later]**.
 
+## Status (2026-10-30)
+
+- 101 reth crates were vendored at v1.11.3; 63 remain after reduction Phases 1, 2, 4a and 6a.
+  Synced to v1.11.4. RocksDB is gone (TN-0014). The ledger runs TN-0001 to TN-0014.
+- Verified:
+  - `cargo nextest run --workspace` on the 63-crate tree (7d2aa76c8): 3719 passed / 0 failed,
+    90 skipped by design. The later commits don't change compiled code: the v1.11.4 sync
+    touched nothing in scope (TN-0013), and TN-0014's expanded source is identical.
+  - On the final head: `make test-restarts` 8/8 and `make test-epochs` 11/11. Also clean
+    there: clippy (nightly, CI RUSTFLAGS) with default and all features, `ci-lanes.sh fmt`,
+    `etc/rocksdb-gate.sh`, and the nested workspace built with `--all-targets`.
+- Waiting on a maintainer decision:
+  - The backports in `tn/notes/upstream-backports.md`, above all the `--ws.origins` fix
+    (ff2657600) and the JS-tracer DoS (needs a newer revm-inspectors).
+  - RocksDB step B (D15).
+- Next reductions: Phase 3 (MDBX optional, with the tndb-b work), Phase 4 (alloy/revm
+  directly), Phase 5 (txpool), Phase 6b (unserved RPC namespaces, code only).
+
 ## Ground rules for every step
 
 - One logical change per commit, and every commit builds and passes. Each change to vendored
