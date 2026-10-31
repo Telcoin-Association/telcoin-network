@@ -236,6 +236,15 @@ newest last.
   `opentelemetry` and `opentelemetry_sdk` lose only their `default` marker feature: every
   feature it implied stays enabled through opentelemetry-otlp. *Upstream*: no.
 
+- **TN-0030** — Remove the TOML config loaders. *Kind*: removal.
+  *Files*: `crates/config/{src/config.rs, Cargo.toml}` (`Config::from_path`, `Config::save`, the
+  `EXTENSION` constant and the tests that load or save files), `crates/node/core/{src/node_config.rs,
+  Cargo.toml}` (`NodeConfig::load_path`; no `toml` or `serde` dependency, no `reth-config/serde`).
+  *Why*: TN never reads or writes a reth.toml (`etc/archive-mode-guard.sh` refuses a loader in TN's
+  own code, since a `[prune]` section would break pinned reads). With the loaders gone, `toml`,
+  `toml_datetime`, `serde_spanned` and `toml_writer` leave the build; toml stays a dev-dependency
+  for reth-config's backwards-compatibility parsing tests. *Upstream*: no.
+
 ## Upstream syncs
 
 - **TN-0013** — Sync to upstream v1.11.4 (`2ac58a25f561`). *Kind*: sync.
