@@ -59,7 +59,6 @@ crates/storage/zstd-compressors
 crates/tasks
 crates/tokio-util
 crates/tracing
-crates/tracing-otlp
 crates/transaction-pool
 crates/trie/common
 crates/trie/db
