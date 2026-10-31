@@ -120,8 +120,9 @@ rpassword = "7.4.0"
 #
 # TN depends on reth's individual crates, never the `reth` umbrella crate: the umbrella only
 # re-exports them, and it pulls reth's CLI (`reth-ethereum-cli`, `reth-cli-commands`) into the
-# graph. tn-reth's manifest enables the umbrella's default features (jemalloc, otlp, otlp-logs,
-# js-tracer, keccak-cache-global, asm-keccak, min-debug-logs) on the crates they forward to.
+# graph. tn-reth's manifest enables the umbrella's default features (otlp, otlp-logs, js-tracer,
+# keccak-cache-global, asm-keccak, min-debug-logs) on the crates they forward to; jemalloc is
+# left out because no TN binary installs it as the global allocator.
 #
 # RocksDB is not part of TN in any configuration: the vendored reth has its RocksDB backend,
 # `rocksdb`/`edge` features and the `rocksdb` crate removed (vendor/reth CHANGES.md TN-0014),

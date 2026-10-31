@@ -203,3 +203,15 @@ comes from TN's removals (TN-0006 took away the path through which rpc-eth-api g
 breaks reth-ethereum-primitives). D13 still applies when a change breaks TN's build or
 `tn/cargo.sh check --workspace`, the two configurations that matter. Per-crate standalone
 breakage is left alone. Check vendored changes with `--workspace`.
+
+## D19. jemalloc is not compiled in until TN installs it
+
+TN's `tn-reth` manifest enabled `jemalloc` on reth-cli-util and reth-node-core, copied from the
+reth umbrella crate's default features when TN switched to individual crates (2026-10-27). That
+feature only matters to a binary that sets jemalloc as its `#[global_allocator]`. reth's own
+binary does; no TN binary does (only a benchmark sets an allocator, a counting wrapper over
+`System`). So TN compiled jemalloc's C library and never used it. Dropped 2026-10-31, with no
+runtime change. If the team wants jemalloc (reth recommends it for memory fragmentation),
+re-enable the feature and install it in `bin/telcoin-network`
+(`#[global_allocator] static ALLOC: reth_cli_util::allocator::Allocator =
+reth_cli_util::allocator::new_allocator();`). That is a behavior change to benchmark first.
