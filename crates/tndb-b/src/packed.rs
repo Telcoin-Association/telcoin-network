@@ -39,7 +39,8 @@ use crate::{
     page::{cmp_keys, Search},
 };
 
-/// The smallest blob: one row of a 1-byte subkey and an empty value.
+/// The smallest blob: one row of a 1-byte subkey and an empty value. A dup table's `packed_max` is
+/// 0 or at least this (`DupOptions::resolved`).
 pub(crate) const PACKED_MIN: usize = HEADER + SLOT + 1;
 
 /// The row count's bytes.

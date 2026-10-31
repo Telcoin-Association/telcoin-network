@@ -29,6 +29,7 @@
 
 use crate::{
     error::{Error, Result},
+    packed::PACKED_MIN,
     page::Geometry,
     tree::{read, write, PageRead, PageWrite, TreeRoot, MAX_TREE_PAGES},
 };
@@ -50,11 +51,6 @@ const CREATED: std::ops::Range<usize> = 80..88;
 
 /// The reserved bytes, zero in every record.
 const RESERVED: [std::ops::Range<usize>; 2] = [76..80, CREATED.end..RECORD_LEN];
-
-/// The smallest packed set, in bytes of its encoding: one row of a 1-byte subkey and an empty
-/// value. The packed-set codec holds every set to it; a dup table's `packed_max` is 0 or at least
-/// this.
-pub(crate) const PACKED_MIN: usize = 7;
 
 /// The shape of a dup table (`RwTxn::create_dup_table`): every key is `k ‖ s`, an outer key `k`
 /// of exactly `key_len` bytes and a subkey `s` of at least one byte. Each outer key holds its rows
