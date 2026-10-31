@@ -17,6 +17,11 @@ markers: **[done]**, **[next]**, **[later]**.
   native C builds left the graph.
 - Phase 6b done (TN-0021): about 2.3k lines of unreachable RPC code removed.
 - `tn/notes/usage-map.md` was regenerated for the 63-crate tree on 2026-10-31.
+- Verified 2026-10-31. Backport head `f093532ca`: nextest 3719 passed, 0 failed, 90 skipped;
+  `make test-restarts` 8/8; `make test-epochs` 11/11. Final head `c8a527384`: the same counts,
+  plus the nested workspace check, both clippy lanes, fmt and the RocksDB gate. nextest's LEAK
+  flags differ from run to run (5 tests on one run, 1 on another, none twice); each flagged test
+  reran clean.
 - Out of scope here: Phase 3 and RocksDB step B belong to the tndb-b work, which happens
   elsewhere.
 - Next, roughly by value: Phase 5 (txpool, needs TN design input), Phase 4 (alloy/revm
