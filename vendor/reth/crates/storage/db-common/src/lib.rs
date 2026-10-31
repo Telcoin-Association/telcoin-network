@@ -10,5 +10,4 @@
 
 pub mod init;
 
-mod db_tool;
-pub use db_tool::*;
+// TN(TN-0028): upstream's `DbTool` (the `reth db` CLI helper) is removed; TN has no reth CLI.

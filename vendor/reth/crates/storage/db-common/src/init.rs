@@ -3,24 +3,19 @@
 use alloy_consensus::BlockHeader;
 use alloy_genesis::GenesisAccount;
 use alloy_primitives::{
-    keccak256,
     map::{AddressMap, B256Map, HashMap},
     Address, B256, U256,
 };
 use reth_chainspec::EthChainSpec;
 use reth_codecs::Compact;
-use reth_config::config::EtlConfig;
 use reth_db_api::{
     models::{storage_sharded_key::StorageShardedKey, ShardedKey},
     tables,
     transaction::DbTxMut,
     BlockNumberList, DatabaseError,
 };
-use reth_etl::Collector;
 use reth_execution_errors::StateRootError;
-use reth_primitives_traits::{
-    Account, Bytecode, GotExpected, NodePrimitives, SealedHeader, StorageEntry,
-};
+use reth_primitives_traits::{Account, Bytecode, GotExpected, NodePrimitives, StorageEntry};
 use reth_provider::{
     errors::provider::ProviderResult, providers::StaticFileWriter, BlockHashReader, BlockNumReader,
     BundleStateInit, ChainSpecProvider, DBProvider, DatabaseProviderFactory, EitherWriter,
@@ -32,27 +27,11 @@ use reth_provider::{
 use reth_stages_types::{StageCheckpoint, StageId};
 use reth_static_file_types::StaticFileSegment;
 use reth_trie::{
-    prefix_set::{TriePrefixSets, TriePrefixSetsMut},
-    IntermediateStateRootState, Nibbles, StateRoot as StateRootComputer, StateRootProgress,
+    prefix_set::TriePrefixSets, IntermediateStateRootState, StateRoot as StateRootComputer,
+    StateRootProgress,
 };
 use reth_trie_db::DatabaseStateRoot;
-use serde::{Deserialize, Serialize};
-use std::io::BufRead;
 use tracing::{debug, error, info, trace, warn};
-
-/// Default soft limit for number of bytes to read from state dump file, before inserting into
-/// database.
-///
-/// Default is 1 GB.
-pub const DEFAULT_SOFT_LIMIT_BYTE_LEN_ACCOUNTS_CHUNK: usize = 1_000_000_000;
-
-/// Approximate number of accounts per 1 GB of state dump file. One account is approximately 3.5 KB
-///
-/// Approximate is 285 228 accounts.
-//
-// (14.05 GB OP mainnet state dump at Bedrock block / 4 007 565 accounts in file > 3.5 KB per
-// account)
-pub const AVERAGE_COUNT_ACCOUNTS_PER_GB_STATE_DUMP: usize = 285_228;
 
 /// Soft limit for the number of flushed updates after which to log progress summary.
 const SOFT_LIMIT_COUNT_FLUSHED_UPDATES: usize = 1_000_000;
@@ -588,234 +567,8 @@ where
     Ok(())
 }
 
-/// Reads account state from a [`BufRead`] reader and initializes it at the highest block that can
-/// be found on database.
-///
-/// It's similar to [`init_genesis`] but supports importing state too big to fit in memory, and can
-/// be set to the highest block present. One practical usecase is to import OP mainnet state at
-/// bedrock transition block.
-pub fn init_from_state_dump<Provider>(
-    mut reader: impl BufRead,
-    provider_rw: &Provider,
-    etl_config: EtlConfig,
-) -> eyre::Result<B256>
-where
-    Provider: StaticFileProviderFactory
-        + DBProvider<Tx: DbTxMut>
-        + BlockNumReader
-        + BlockHashReader
-        + ChainSpecProvider
-        + StageCheckpointWriter
-        + HistoryWriter
-        + HeaderProvider
-        + HashingWriter
-        + TrieWriter
-        + StateWriter
-        + StorageSettingsCache
-        + RocksDBProviderFactory
-        + NodePrimitivesProvider
-        + AsRef<Provider>,
-{
-    if etl_config.file_size == 0 {
-        return Err(eyre::eyre!("ETL file size cannot be zero"))
-    }
-
-    let block = provider_rw.last_block_number()?;
-
-    let hash = provider_rw
-        .block_hash(block)?
-        .ok_or_else(|| eyre::eyre!("Block hash not found for block {}", block))?;
-    let header = provider_rw
-        .header_by_number(block)?
-        .map(SealedHeader::seal_slow)
-        .ok_or_else(|| ProviderError::HeaderNotFound(block.into()))?;
-
-    let expected_state_root = header.state_root();
-
-    // first line can be state root
-    let dump_state_root = parse_state_root(&mut reader)?;
-    if expected_state_root != dump_state_root {
-        error!(target: "reth::cli",
-            ?dump_state_root,
-            ?expected_state_root,
-            header=?header.num_hash(),
-            "State root from state dump does not match state root in current header."
-        );
-        return Err(InitStorageError::StateRootMismatch(GotExpected {
-            got: dump_state_root,
-            expected: expected_state_root,
-        })
-        .into())
-    }
-
-    debug!(target: "reth::cli",
-        block,
-        chain=%provider_rw.chain_spec().chain(),
-        "Initializing state at block"
-    );
-
-    // remaining lines are accounts
-    let collector = parse_accounts(&mut reader, etl_config)?;
-
-    // write state to db and collect prefix sets
-    let mut prefix_sets = TriePrefixSetsMut::default();
-    dump_state(collector, provider_rw, block, &mut prefix_sets)?;
-
-    info!(target: "reth::cli", "All accounts written to database, starting state root computation (may take some time)");
-
-    // compute and compare state root. this advances the stage checkpoints.
-    let computed_state_root = compute_state_root(provider_rw, Some(prefix_sets.freeze()))?;
-    if computed_state_root == expected_state_root {
-        info!(target: "reth::cli",
-            ?computed_state_root,
-            "Computed state root matches state root in state dump"
-        );
-    } else {
-        error!(target: "reth::cli",
-            ?computed_state_root,
-            ?expected_state_root,
-            "Computed state root does not match state root in state dump"
-        );
-
-        return Err(InitStorageError::StateRootMismatch(GotExpected {
-            got: computed_state_root,
-            expected: expected_state_root,
-        })
-        .into())
-    }
-
-    // insert sync stages for stages that require state
-    for stage in StageId::STATE_REQUIRED {
-        provider_rw.save_stage_checkpoint(stage, StageCheckpoint::new(block))?;
-    }
-
-    Ok(hash)
-}
-
-/// Parses and returns expected state root.
-fn parse_state_root(reader: &mut impl BufRead) -> eyre::Result<B256> {
-    let mut line = String::new();
-    reader.read_line(&mut line)?;
-
-    let expected_state_root = serde_json::from_str::<StateRoot>(&line)?.root;
-    trace!(target: "reth::cli",
-        root=%expected_state_root,
-        "Read state root from file"
-    );
-    Ok(expected_state_root)
-}
-
-/// Parses accounts and pushes them to a [`Collector`].
-fn parse_accounts(
-    mut reader: impl BufRead,
-    etl_config: EtlConfig,
-) -> Result<Collector<Address, GenesisAccount>, eyre::Error> {
-    let mut line = String::new();
-    let mut collector = Collector::new(etl_config.file_size, etl_config.dir);
-
-    loop {
-        let n = reader.read_line(&mut line)?;
-        if n == 0 {
-            break
-        }
-
-        let GenesisAccountWithAddress { genesis_account, address } = serde_json::from_str(&line)?;
-        collector.insert(address, genesis_account)?;
-
-        if !collector.is_empty() &&
-            collector.len().is_multiple_of(AVERAGE_COUNT_ACCOUNTS_PER_GB_STATE_DUMP)
-        {
-            info!(target: "reth::cli",
-                parsed_new_accounts=collector.len(),
-            );
-        }
-
-        line.clear();
-    }
-
-    Ok(collector)
-}
-
-/// Takes a [`Collector`] and processes all accounts.
-fn dump_state<Provider>(
-    mut collector: Collector<Address, GenesisAccount>,
-    provider_rw: &Provider,
-    block: u64,
-    prefix_sets: &mut TriePrefixSetsMut,
-) -> Result<(), eyre::Error>
-where
-    Provider: StaticFileProviderFactory
-        + DBProvider<Tx: DbTxMut>
-        + HeaderProvider
-        + HashingWriter
-        + HistoryWriter
-        + StateWriter
-        + StorageSettingsCache
-        + RocksDBProviderFactory
-        + NodePrimitivesProvider
-        + AsRef<Provider>,
-{
-    let accounts_len = collector.len();
-    let mut accounts = Vec::with_capacity(AVERAGE_COUNT_ACCOUNTS_PER_GB_STATE_DUMP);
-    let mut total_inserted_accounts = 0;
-
-    for (index, entry) in collector.iter()?.enumerate() {
-        let (address, account) = entry?;
-        let (address, _) = Address::from_compact(address.as_slice(), address.len());
-        let (account, _) = GenesisAccount::from_compact(account.as_slice(), account.len());
-
-        // Add to prefix sets
-        let hashed_address = keccak256(address);
-        prefix_sets.account_prefix_set.insert(Nibbles::unpack(hashed_address));
-
-        // Add storage keys to prefix sets if storage exists
-        if let Some(ref storage) = account.storage {
-            for key in storage.keys() {
-                let hashed_key = keccak256(key);
-                prefix_sets
-                    .storage_prefix_sets
-                    .entry(hashed_address)
-                    .or_default()
-                    .insert(Nibbles::unpack(hashed_key));
-            }
-        }
-
-        accounts.push((address, account));
-
-        if (index > 0 && index.is_multiple_of(AVERAGE_COUNT_ACCOUNTS_PER_GB_STATE_DUMP)) ||
-            index == accounts_len - 1
-        {
-            total_inserted_accounts += accounts.len();
-
-            info!(target: "reth::cli",
-                total_inserted_accounts,
-                "Writing accounts to db"
-            );
-
-            // use transaction to insert genesis header
-            insert_genesis_hashes(
-                provider_rw,
-                accounts.iter().map(|(address, account)| (address, account)),
-            )?;
-
-            insert_history(
-                provider_rw,
-                accounts.iter().map(|(address, account)| (address, account)),
-                block,
-            )?;
-
-            // block is already written to static files
-            insert_state(
-                provider_rw,
-                accounts.iter().map(|(address, account)| (address, account)),
-                block,
-            )?;
-
-            accounts.clear();
-        }
-    }
-    Ok(())
-}
+// TN(TN-0028): upstream's `init_from_state_dump` (JSONL state import through ETL) and its
+// parsers are removed; TN initializes from its genesis only.
 
 /// Computes the state root (from scratch) based on the accounts and storages present in the
 /// database.
@@ -876,23 +629,6 @@ where
             }
         }
     }
-}
-
-/// Type to deserialize state root from state dump file.
-#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
-struct StateRoot {
-    root: B256,
-}
-
-/// An account as in the state dump file. This contains a [`GenesisAccount`] and the account's
-/// address.
-#[derive(Debug, Serialize, Deserialize)]
-struct GenesisAccountWithAddress {
-    /// The account's balance, nonce, code, and storage.
-    #[serde(flatten)]
-    genesis_account: GenesisAccount,
-    /// The account's address.
-    address: Address,
 }
 
 #[cfg(test)]

@@ -1970,15 +1970,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "boyer-moore-magiclen"
-version = "0.2.22"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7441b4796eb8a7107d4cd99d829810be75f5573e1081c37faa0e8094169ea0d6"
-dependencies = [
- "debug-helper",
-]
-
-[[package]]
 name = "brotli"
 version = "8.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2760,12 +2751,6 @@ dependencies = [
  "data-encoding",
  "syn 2.0.117",
 ]
-
-[[package]]
-name = "debug-helper"
-version = "0.3.13"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f578e8e2c440e7297e008bb5486a3a8a194775224bbc23729b0dbdfaeebf162e"
 
 [[package]]
 name = "der"
@@ -7264,24 +7249,16 @@ dependencies = [
  "alloy-consensus",
  "alloy-genesis",
  "alloy-primitives",
- "boyer-moore-magiclen",
- "eyre",
  "reth-chainspec",
  "reth-codecs",
- "reth-config",
  "reth-db-api",
- "reth-etl",
  "reth-execution-errors",
- "reth-fs-util",
- "reth-node-types",
  "reth-primitives-traits",
  "reth-provider",
  "reth-stages-types",
  "reth-static-file-types",
  "reth-trie",
  "reth-trie-db",
- "serde",
- "serde_json",
  "thiserror 2.0.18",
  "tracing",
 ]
@@ -7398,15 +7375,6 @@ dependencies = [
  "reth-zstd-compressors",
  "serde",
  "serde_with 3.18.0",
-]
-
-[[package]]
-name = "reth-etl"
-version = "1.11.3"
-dependencies = [
- "rayon",
- "reth-db-api",
- "tempfile",
 ]
 
 [[package]]
