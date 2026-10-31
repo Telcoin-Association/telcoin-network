@@ -14,10 +14,9 @@
 #![cfg_attr(not(test), warn(unused_crate_dependencies))]
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
-// TN(TN-0021): the traits of namespaces TN never serves are removed: admin, anvil, engine,
-// hardhat, miner, otterscan, reth, testing, txpool and validation.
+// TN(TN-0021, TN-0033): the traits of namespaces TN never serves are removed: admin, anvil,
+// engine, hardhat, mev, miner, otterscan, reth, testing, txpool and validation.
 mod debug;
-mod mev;
 mod net;
 mod rpc;
 mod trace;
@@ -30,7 +29,6 @@ pub use servers::*;
 pub mod servers {
     pub use crate::{
         debug::{DebugApiServer, DebugExecutionWitnessApiServer},
-        mev::{MevFullApiServer, MevSimApiServer},
         net::NetApiServer,
         rpc::RpcApiServer,
         trace::TraceApiServer,
@@ -51,7 +49,6 @@ pub use clients::*;
 pub mod clients {
     pub use crate::{
         debug::{DebugApiClient, DebugExecutionWitnessApiClient},
-        mev::{MevFullApiClient, MevSimApiClient},
         net::NetApiClient,
         rpc::RpcApiServer,
         trace::TraceApiClient,
