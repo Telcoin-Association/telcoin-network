@@ -57,10 +57,6 @@ reth-revm = { workspace = true }
 reth-evm = { workspace = true }
 reth-node-builder = { workspace = true, features = ["js-tracer"] }
 reth-provider = { workspace = true }
-# Direct dependencies only so `rocksdb` reaches their own `rocksdb` features, as the umbrella's
-# `rocksdb` did (through reth-cli-commands).
-reth-prune = { workspace = true, optional = true }
-reth-stages = { workspace = true, optional = true }
 reth-prune-types = { workspace = true }
 reth-primitives-traits = { workspace = true }
 reth-stages-types = { workspace = true }
@@ -141,19 +137,6 @@ test-utils = ["dep:secp256k1"]
 # Expose the production sorted-run accumulator to the allocation benchmark.
 bench-internals = []
 adiri = ["faucet", "tn-types/adiri"]
-# Opt back in to reth's RocksDB storage backend (librocksdb-sys, the RocksDB C++ engine).
-# Off by default: storage is MDBX-only today, so `RocksDBProvider` resolves to reth's
-# zero-size stub and the 332-translation-unit native compile is skipped entirely.
-# Required before any storage-v2 / `StorageSettings` experimentation.
-rocksdb = [
-    "reth-node-core/rocksdb",
-    "reth-provider/rocksdb",
-    "reth-db-common/rocksdb",
-    "dep:reth-stages",
-    "reth-stages/rocksdb",
-    "dep:reth-prune",
-    "reth-prune/rocksdb",
-]
 # Run TN's reth execution database on the tndb-b engine (`tndb_b_reth::TndbEnv`) instead of
 # MDBX. Off by default. MDBX stays compiled: reth's crates require it. See the README's
 # "Database backend" section.

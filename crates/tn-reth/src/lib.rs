@@ -75,12 +75,6 @@ mod clippy {
     use tn_reth as _;
 }
 
-// Dependencies only for their own `rocksdb` features (see the `rocksdb` feature in Cargo.toml).
-#[cfg(feature = "rocksdb")]
-use reth_prune as _;
-#[cfg(feature = "rocksdb")]
-use reth_stages as _;
-
 use alloy::primitives::ChainId;
 use reth_chainspec::EthChainSpec;
 use std::sync::{Arc, OnceLock};

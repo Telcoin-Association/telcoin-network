@@ -54,8 +54,6 @@ adiri = [
     "tn-storage/adiri",
     "tn-types/adiri",
 ]
-# Opt back in to reth's RocksDB storage backend; tn-node has no rocksdb code of its own.
-rocksdb = ["tn-reth/rocksdb"]
 # Run the reth execution database on tndb-b; tn-node has no backend code of its own.
 tndb-b = ["tn-reth/tndb-b"]
 
