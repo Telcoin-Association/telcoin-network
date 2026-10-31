@@ -80,6 +80,11 @@ vendor/reth/tn/cargo.sh nextest run -p reth-provider
 vendor/reth/tn/cargo.sh check --workspace --all-targets   # every vendored crate's tests compile
 ```
 
+On macOS, `reth-db --lib` fails a few MDBX tests at the default thread count with `Cannot
+allocate memory` (ENOMEM when opening the environment): each test reserves a large memory map,
+and with 16 running at once some opens fail. The failing set changes from run to run, and all
+pass with `-- --test-threads=2`. This predates every TN change to the crate.
+
 Some crates' test code needs their own `test-utils` feature, which upstream's CI only gets from
 workspace-wide `--all-features`. If `--all-targets` fails on a missing optional dependency, add
 `--all-features`. (At import this hit `reth-downloaders`, which is no longer carried.)
