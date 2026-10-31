@@ -193,6 +193,15 @@ newest last.
   declares reth-network-peers' `secp256k1` itself (for `Enr`), which it used to get from reth-rpc.
   *Upstream*: no.
 
+- **TN-0025** — reth-node-core's build script no longer uses vergen. *Kind*: build.
+  *Files*: `crates/node/core/{build.rs, Cargo.toml}`, the workspace `vergen` entry.
+  *Why*: after TN-0020, vergen only supplied the build timestamp, the enabled features and the
+  target triple. Cargo gives a build script the last two (`CARGO_FEATURE_*`, `TARGET`), and the
+  timestamp is a few lines of date arithmetic (RFC 3339 UTC; `SOURCE_DATE_EPOCH` honored).
+  vergen 9, vergen-lib, cargo_metadata, cargo-platform and derive_builder's three crates leave
+  the build. The emitted `VERGEN_*`/`RETH_*` variables are unchanged, so `version.rs` is
+  untouched. *Upstream*: no.
+
 ## Upstream syncs
 
 - **TN-0013** — Sync to upstream v1.11.4 (`2ac58a25f561`). *Kind*: sync.
