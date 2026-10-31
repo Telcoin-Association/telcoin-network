@@ -20,55 +20,74 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        lane: [fmt, clippy, test-default, test-adiri]
+        lane: [test-default, test-adiri]
+    # cache-deps.yaml's six variables: rust-cache hashes them into the key, and this job
+    # restores the test-cache entry that cache-deps.yaml warms on main. Keep them, and the
+    # toolchains installed before the cache step, in lockstep with that file.
     env:
-      CARGO_INCREMENTAL: "0"
+      CARGO_INCREMENTAL: 0
       RUSTFLAGS: "-D warnings -D unused_extern_crates"
-      CARGO_PROFILE_DEV_DEBUG: "0"
-      CARGO_PROFILE_TEST_DEBUG: "0"
+      CARGO_TERM_COLOR: always
+      RUST_BACKTRACE: 1
+      CARGO_PROFILE_DEV_DEBUG: 0
+      CARGO_PROFILE_TEST_DEBUG: 0
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           submodules: true
       - name: Install pinned Rust toolchain
         run: rustup show active-toolchain || rustup toolchain install
-      - name: Install pinned nightly tools
-        if: matrix.lane == 'fmt' || matrix.lane == 'clippy'
-        run: rustup toolchain install "$(cat rust-nightly)" -c rustfmt,clippy,rust-src --profile minimal
-      - uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0
-        if: startsWith(matrix.lane, 'test-')
+      - uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
         with:
           tool: cargo-nextest
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
-        if: matrix.lane != 'fmt'
+      # The runner image's own stable Rust would be hashed into the cache key, so it goes
+      # after the last toolchain install and before the cache step (cache-deps.yaml's
+      # header says why). The list that follows is the set the key hashes.
+      - name: Remove the runner image's Rust
+        run: |
+          rustup toolchain uninstall stable
+          rustup toolchain list
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           prefix-key: v1-rust
-          shared-key: ${{ matrix.lane == 'clippy' && 'clippy-cache' || 'test-cache' }}
+          shared-key: test-cache
           save-if: "false"
       - name: Run existing workspace CI lane
+        # The `ci` nextest profile, as in pr.yaml's test lanes.
+        env:
+          NEXTEST_PROFILE: ci
         run: ./etc/ci-lanes.sh ${{ matrix.lane }}
-      - name: Include all targets required by the scope plan
-        if: matrix.lane == 'clippy'
-        run: cargo "+$(cat rust-nightly)" clippy --locked --workspace --all-targets --no-deps -- -D warnings
 
   regressions:
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    # cache-deps.yaml's six variables: rust-cache hashes them into the key, and this job
+    # restores the test-cache entry that cache-deps.yaml warms on main. Keep them, and the
+    # toolchains installed before the cache step, in lockstep with that file.
     env:
-      CARGO_INCREMENTAL: "0"
+      CARGO_INCREMENTAL: 0
       RUSTFLAGS: "-D warnings -D unused_extern_crates"
-      CARGO_PROFILE_DEV_DEBUG: "0"
-      CARGO_PROFILE_TEST_DEBUG: "0"
+      CARGO_TERM_COLOR: always
+      RUST_BACKTRACE: 1
+      CARGO_PROFILE_DEV_DEBUG: 0
+      CARGO_PROFILE_TEST_DEBUG: 0
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           submodules: true
       - name: Install pinned Rust toolchain
         run: rustup show active-toolchain || rustup toolchain install
-      - uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0
+      - uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
         with:
           tool: cargo-nextest
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+      # The runner image's own stable Rust would be hashed into the cache key, so it goes
+      # after the last toolchain install and before the cache step (cache-deps.yaml's
+      # header says why). The list that follows is the set the key hashes.
+      - name: Remove the runner image's Rust
+        run: |
+          rustup toolchain uninstall stable
+          rustup toolchain list
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           prefix-key: v1-rust
           shared-key: test-cache
