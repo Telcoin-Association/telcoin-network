@@ -55,7 +55,8 @@ enum LeafChange {
     Insert(usize),
     /// The leaf overflows: split it, inserting the entry at `at` (after deleting the old entry
     /// there first when `replace`), in append mode when the entry goes past the end of the tree's
-    /// rightmost leaf.
+    /// rightmost leaf (an insert there, or a replace of its last entry): the leaf keeps its other
+    /// entries as they are and the entry alone starts the new right leaf.
     Split { at: usize, replace: bool, append: bool },
 }
 
@@ -1266,6 +1267,10 @@ struct Planned<'s> {
 /// there, since no separator exceeds the keys to its right; a key that lands in another leaf lies
 /// below that leaf's upper bound, so below the keys of the (non-empty) leaves to its right.
 ///
+/// A leaf that overflows splits in append mode ([`LeafChange::Split`]) for an entry past the end
+/// of the rightmost leaf, an insert there or a replace of its last entry; any other split cuts the
+/// leaf in the middle.
+///
 /// A replaced value the tree may not hold (`cells`) is [`Error::Corrupt`]; an outer cell's
 /// nested tree is not this put's to free. Always inlined: [`put_from_root`], its one caller, is
 /// monomorphized per value source and passes `cells` as a constant, so a table put's match folds
@@ -1317,7 +1322,12 @@ fn plan<'s, S: PageWrite + ?Sized>(
             if vlen <= old || vlen - old <= view.free_space() {
                 LeafChange::Replace(i)
             } else {
-                LeafChange::Split { at: i, replace: true, append: false }
+                // A grown last value of the rightmost leaf (a dup key's packed set growing while
+                // its rows arrive in key order) splits as an append: the leaf keeps its other
+                // cells and the entry starts the new right leaf, so an ascending load fills its
+                // leaves. The rightmost path is read only here, on the overflow path.
+                let append = i + 1 == view.nkeys() && is_rightmost(store, path)?;
+                LeafChange::Split { at: i, replace: true, append }
             }
         }
         Find::NotFound { index: at, .. } => {
@@ -3837,14 +3847,15 @@ mod tests {
 
     /// Ascending puts through a table's path cache (appends, and upserts and inserts past the last
     /// key, which split in append mode too) across leaf, branch and root splits, with replaces of
-    /// present keys (growing some until they split), inserts and upserts of new keys between
-    /// present keys (some past the last key of a full leaf, which split it as any other) and
-    /// commits (the next put copies its path) between them: after every put, the cache names
-    /// what a fresh descent finds ([`assert_cache_found`]), and the tree holds the model. Every
-    /// shape of split happens: past the last key, the leaf's parent takes the separator (the
-    /// cache filled from the split, on a private path and on one the put copied), a branch
-    /// below the root splits, or a new root grows (both filled by a descent); elsewhere, the
-    /// cache is left empty.
+    /// present keys (growing some until they split; a grown last key's split is an append split
+    /// too), inserts and upserts of new keys between present keys (some past the last key of a
+    /// full leaf, which split it as any other) and commits (the next put copies its path) between
+    /// them: after every put, the cache names what a fresh descent finds ([`assert_cache_found`]),
+    /// and the tree holds the model. Every shape of split happens: past the last key, the leaf's
+    /// parent takes the separator (the cache filled from the split, on a private path and on one
+    /// the put copied), a branch below the root splits, or a new root grows (both filled by a
+    /// descent); a replace of the last key, its separator taken by the leaf's parent or not;
+    /// elsewhere, the cache is left empty.
     #[test]
     fn an_append_split_caches_the_path_a_descent_finds() {
         let mut store = MemStore::new(4096);
@@ -3853,8 +3864,9 @@ mod tests {
         let mut model = BTreeMap::new();
         // Leaf splits by shape: past the last key, the separator taken by the leaf's parent (0),
         // by a branch below the root that split (1), or by a new root (2); elsewhere (3); and
-        // shape 0 again where the put copied its path from published pages (4).
-        let mut splits = [0u32; 5];
+        // shape 0 again where the put copied its path from published pages (4); a replace of the
+        // last key, its separator taken by the leaf's parent (5) or not (6).
+        let mut splits = [0u32; 7];
         // 200-byte keys: about 19 children a branch, so the tree reaches height 3 and splits
         // branches below its root within a few hundred leaves.
         let key = |id: u64| id_key(id, 200);
@@ -3868,20 +3880,31 @@ mod tests {
                     k if model.contains_key(&k) || rng.below(2) == 0 => (k, PutKind::Upsert),
                     k => (k, PutKind::Insert),
                 },
+                4 if next > 0 => (key(2 * next - 2), PutKind::Upsert),
                 _ => (key(2 * next), PutKind::Append),
             };
             let past_last = model.last_key_value().is_none_or(|(last, _)| k > *last);
+            let is_last = model.last_key_value().is_some_and(|(last, _)| k == *last);
             if past_last {
                 next += 1;
             }
-            let v = vec![op as u8; 40 + rng.below(160) as usize];
+            // The last key's values grow further, so its replaces split its leaf too.
+            let v = vec![op as u8; 40 + rng.below(if is_last { 480 } else { 160 }) as usize];
             let (before, copied) = (root, !trusted);
             let placed = put_cached(&mut store, &mut root, &mut trusted, &mut cache, &k, &v, kind)
                 .expect("put");
             assert_eq!(placed.replaced, model.insert(k.clone(), v).is_some(), "op {op}");
             // A put into the empty tree adds the first leaf: no split.
             if before.height > 0 && root.leaf_pages > before.leaf_pages {
-                let shape = if !past_last {
+                let grew = root.height > before.height || root.branch_pages > before.branch_pages;
+                let shape = if is_last {
+                    assert_eq!(placed.slot, Some(0), "op {op}: a grown last key's append split");
+                    if grew {
+                        6
+                    } else {
+                        5
+                    }
+                } else if !past_last {
                     3
                 } else if root.height > before.height {
                     2
@@ -3906,6 +3929,232 @@ mod tests {
         assert_holds(&store, &root, &model);
         store.commit_like();
         store.assert_accounting(&[root]);
+    }
+
+    /// A replace that grows the value of the tree's last key past its leaf's free space (the
+    /// rightmost leaf's last entry) splits as an append ([`plan`]): the leaf keeps its other cells
+    /// byte for byte as the replace's delete left them, the entry alone starts the new right leaf,
+    /// and the path cache names that leaf at slot 0, as a fresh descent finds it. For a table's
+    /// tree, a value grown by replaces, and for an outer tree that packs ([`Cells::Packing`]), a
+    /// packed set grown a row at a time beside packed sets and nested roots, as a dup table's
+    /// rows arrive in key order; each in a root leaf (the split grows a new root) and under a
+    /// branch (the leaf's parent takes the separator). A table's key before the last, and the
+    /// last key of a leaf left of the rightmost, still split in the middle, the cache left empty.
+    /// The tree then holds the model.
+    #[test]
+    fn a_growing_last_value_in_the_rightmost_leaf_splits_as_an_append() {
+        for leaves in [1u32, 3] {
+            // A table's tree: 16-byte keys and 60-byte values appended until the rightmost leaf
+            // is nearly full (the leaves before it are full: their splits were appends). Grown,
+            // its last key splits as an append; its key before the last, or with three leaves
+            // the first leaf's last key, splits in the middle and leaves the cache empty.
+            for grown in 0..if leaves == 1 { 2 } else { 3 } {
+                let mut store = MemStore::new(4096);
+                let (mut root, mut trusted, mut cache) =
+                    (TreeRoot::EMPTY, false, PathCache::default());
+                let mut model = BTreeMap::new();
+                let mut id = 0;
+                while root.leaf_pages < leaves || free_in_cached_leaf(&store, &cache) >= 200 {
+                    let (k, v) = (id_key(id, 16), vec![id as u8; 60]);
+                    put_cached(
+                        &mut store,
+                        &mut root,
+                        &mut trusted,
+                        &mut cache,
+                        &k,
+                        &v,
+                        PutKind::Append,
+                    )
+                    .expect("append");
+                    model.insert(k, v);
+                    id += 1;
+                }
+                let key = match grown {
+                    0 => id_key(id - 1, 16),
+                    1 => id_key(id - 2, 16),
+                    _ => last_key_of_leaf(&store, &root, &id_key(0, 16)),
+                };
+                let heights = grow_until_it_splits(
+                    &mut store,
+                    &mut root,
+                    &mut cache,
+                    &key,
+                    Cells::Plain,
+                    grown == 0,
+                    |store, root, cache, step| {
+                        let v = vec![step as u8; 60 + 24 * (step + 1)];
+                        let placed =
+                            put_cached(store, root, &mut trusted, cache, &key, &v, PutKind::Upsert)
+                                .expect("replace");
+                        model.insert(key.clone(), v.clone());
+                        (placed, v)
+                    },
+                );
+                assert_eq!(heights, (leaves.min(2), 2), "a table's tree of {leaves} leaves");
+                assert_holds(&store, &root, &model);
+                store.commit_like();
+                store.assert_accounting(&[root]);
+            }
+
+            // An outer tree that packs: 20-byte keys, a nested root under every fifth, else a
+            // packed set of three rows, appended until the rightmost leaf is nearly full and its
+            // last key holds a set; then that set grows a row at a time.
+            let mut rng = Rng(0x0A99_E5D5 + u64::from(leaves));
+            let mut store = MemStore::new(4096);
+            let (mut root, mut trusted, mut cache) = (TreeRoot::EMPTY, false, PathCache::default());
+            let mut model = BTreeMap::new();
+            let mut id = 0;
+            // Until the last key appended holds a packed set too.
+            while id % 5 == 0
+                || root.leaf_pages < leaves
+                || free_in_cached_leaf(&store, &cache) >= 200
+            {
+                let (set, nested) =
+                    (rows_set(3, id as u8), some_nested_root(&mut rng, store.txn()));
+                let (cell, want) = if id % 5 == 4 {
+                    (OuterCell::Nested(&nested), PackingCell::Nested(nested.encode()))
+                } else {
+                    (OuterCell::Packed(&set), PackingCell::Packed(set.clone()))
+                };
+                let k = id_key(id, 20);
+                put_outer_cell(
+                    &mut store,
+                    &mut root,
+                    &mut trusted,
+                    &mut cache,
+                    &k,
+                    cell,
+                    Cells::Packing,
+                    PutKind::Append,
+                )
+                .expect("append");
+                model.insert(k, want);
+                id += 1;
+            }
+            let last = id_key(id - 1, 20);
+            let heights = grow_until_it_splits(
+                &mut store,
+                &mut root,
+                &mut cache,
+                &last,
+                Cells::Packing,
+                true,
+                |store, root, cache, step| {
+                    let set = rows_set(4 + step, step as u8);
+                    let placed = put_outer_cell(
+                        store,
+                        root,
+                        &mut trusted,
+                        cache,
+                        &last,
+                        OuterCell::Packed(&set),
+                        Cells::Packing,
+                        PutKind::Upsert,
+                    )
+                    .expect("replace");
+                    model.insert(last.clone(), PackingCell::Packed(set.clone()));
+                    (placed, set)
+                },
+            );
+            assert_eq!(heights, (leaves.min(2), 2), "an outer tree of {leaves} leaves");
+            assert_packing_holds(&store, &root, &model);
+            store.commit_like();
+            assert_packing_holds(&store, &root, &model);
+        }
+    }
+
+    /// The free space of the leaf `cache` names.
+    fn free_in_cached_leaf(store: &MemStore, cache: &PathCache) -> usize {
+        page::free_space(store.page(cache.leaf()).expect("the cached leaf")).expect("a leaf")
+    }
+
+    /// A packed set of `rows` rows: subkeys `0..rows` of one byte, each with a 30-byte value of
+    /// `fill`.
+    fn rows_set(rows: usize, fill: u8) -> Vec<u8> {
+        let mut set = Vec::new();
+        packed::build_one(&[0], &[fill; 30], &mut set);
+        for r in 1..rows {
+            let view = packed::PackedView::new(&set, usize::MAX).expect("a built set");
+            let mut out = Vec::new();
+            packed::build_with(&view, page::Search::NotFound(r), &[r as u8], &[fill; 30], &mut out);
+            set = out;
+        }
+        assert_ne!(set.len(), page::NESTED_CELL, "a packed set of a nested cell's length");
+        set
+    }
+
+    /// The last key of the leaf that holds `key`.
+    fn last_key_of_leaf(store: &MemStore, root: &TreeRoot, key: &[u8]) -> Vec<u8> {
+        let mut path = Path::new();
+        let (found, _) =
+            descend_write(store, root, true, key, Verify::Now, Cells::Plain, &mut path)
+                .expect("descent");
+        found.view.key(found.view.nkeys() - 1).expect("a key").to_vec()
+    }
+
+    /// Replace the value of `key` through `put(store, root, cache, step)` for steps 0, 1, ...
+    /// (each returning its placement and the cell value it wrote) until its leaf splits. Before
+    /// each replace the leaf holds another entry too, and `append` says whether the key is the
+    /// last entry of the rightmost leaf. With `append` the split must be an append split: the
+    /// leaf then holds, byte for byte, what deleting the entry left of it (its other cells, which
+    /// could not take the new cell), and a fresh descent finds the entry alone in a new leaf, its
+    /// range from the key up, where the cache names it at slot 0. Without, it must cut the leaf
+    /// elsewhere and leave the cache empty. Returns the tree's height before and after the split.
+    #[track_caller]
+    #[allow(clippy::too_many_arguments)]
+    fn grow_until_it_splits(
+        store: &mut MemStore,
+        root: &mut TreeRoot,
+        cache: &mut PathCache,
+        key: &[u8],
+        cells: Cells,
+        append: bool,
+        mut put: impl FnMut(&mut MemStore, &mut TreeRoot, &mut PathCache, usize) -> (Placed, Vec<u8>),
+    ) -> (u32, u32) {
+        for step in 0..64 {
+            let mut path = Path::new();
+            let (found, _) = descend_write(&*store, root, true, key, Verify::Now, cells, &mut path)
+                .expect("descent");
+            let (leaf, n, before) = (found.pgno, found.view.nkeys(), found.page.to_vec());
+            let at = found.view.find(key).expect("find");
+            let Find::Found { index, .. } = at else { panic!("step {step}: {at:?}") };
+            let rightmost_last = found.range.1.is_none() && index + 1 == n;
+            assert!(n >= 2 && rightmost_last == append, "step {step}: {index} of {n}");
+            let (leaf_pages, height) = (root.leaf_pages, root.height);
+            let (placed, value) = put(store, root, cache, step);
+            assert!(placed.replaced, "step {step}: the put replaced");
+            if root.leaf_pages == leaf_pages {
+                continue;
+            }
+            assert_eq!(root.leaf_pages, leaf_pages + 1, "step {step}: one new leaf");
+            let mut left = before;
+            page::leaf_delete(&mut left, index).expect("delete the entry");
+            let kept = store.page(leaf).expect("left") == &left[..];
+            if !append {
+                assert!(!kept, "a middle split kept the leaf's other cells as they were");
+                assert_eq!((placed.slot, cache.epoch), (None, 0), "a middle split left a cache");
+                return (height, root.height);
+            }
+            assert!(kept, "the leaf's other cells moved");
+            let cell = page::cell_size_leaf(key.len(), value.len());
+            assert!(!page::fits(&left, cell).expect("a leaf"), "the left leaf had room");
+            let mut path = Path::new();
+            let (found, _) = descend_write(&*store, root, true, key, Verify::Now, cells, &mut path)
+                .expect("descent");
+            assert!(found.pgno != leaf && found.view.nkeys() == 1, "the entry starts a new leaf");
+            assert_eq!(found.range, (Some(key), None), "the new leaf's range");
+            let at = found.view.find(key).expect("find");
+            assert!(
+                matches!(at, Find::Found { index: 0, value: Val::Inline(v) } if v == &value[..]),
+                "the new leaf's entry: {at:?}"
+            );
+            assert_eq!(placed.slot, Some(0), "the entry's slot");
+            assert_eq!(cache.epoch, store.epoch(), "the cache holds");
+            assert_eq!((cache.branches(), cache.leaf()), (&*path, found.pgno), "the cached path");
+            assert_eq!((cache.lo.get(), cache.hi.get()), found.range, "the cached range");
+            return (height, root.height);
+        }
+        panic!("the value never split its leaf");
     }
 
     /// Over-limit entries are refused before anything changes.
