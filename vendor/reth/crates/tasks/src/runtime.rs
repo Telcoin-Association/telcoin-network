@@ -28,8 +28,7 @@ use std::{
     time::Duration,
 };
 use tokio::{runtime::Handle, sync::mpsc::UnboundedSender, task::JoinHandle};
-use tracing::{debug, error};
-use tracing_futures::Instrument;
+use tracing::{debug, error, Instrument};
 
 use tokio::runtime::Runtime as TokioRuntime;
 

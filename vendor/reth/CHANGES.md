@@ -202,6 +202,18 @@ newest last.
   the build. The emitted `VERGEN_*`/`RETH_*` variables are unchanged, so `version.rs` is
   untouched. *Upstream*: no.
 
+- **TN-0026** — reth-tasks uses `tracing::Instrument` instead of the `tracing-futures` crate.
+  *Kind*: build. *Files*: `crates/tasks/{src/runtime.rs, Cargo.toml}`, the workspace entry.
+  *Why*: the one import has the same trait in `tracing` itself, so `tracing-futures` leaves the
+  build. *Upstream*: yes.
+
+- **TN-0027** — reth-transaction-pool no longer depends on `aquamarine`. *Kind*: build.
+  *Files*: `crates/transaction-pool/{src/lib.rs, src/pool/txpool.rs, Cargo.toml}`, the workspace
+  entry.
+  *Why*: aquamarine is a proc macro that renders one mermaid diagram in `TxPool`'s rustdoc
+  (`#[cfg_attr(doc, ...)]`), yet it was compiled in every build, with `include_dir` and an old
+  `itertools`. The diagram source stays in the doc comment as a code block. *Upstream*: no.
+
 ## Upstream syncs
 
 - **TN-0013** — Sync to upstream v1.11.4 (`2ac58a25f561`). *Kind*: sync.

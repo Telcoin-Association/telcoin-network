@@ -44,10 +44,7 @@ use std::{
 };
 use tracing::{trace, warn};
 
-#[cfg_attr(doc, aquamarine::aquamarine)]
-// TODO: Inlined diagram due to a bug in aquamarine library, should become an include when it's
-// fixed. See https://github.com/mersinvald/aquamarine/issues/50
-// include_mmd!("docs/mermaid/txpool.mmd")
+// TN(TN-0027): upstream renders this mermaid diagram with aquamarine; here it stays a code block.
 /// A pool that manages transactions.
 ///
 /// This pool maintains the state of all transactions and stores them accordingly.
