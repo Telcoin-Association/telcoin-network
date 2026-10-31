@@ -88,20 +88,17 @@ use tn_types::{Address, BlockBody, Genesis, SealedBlock, SealedHeader};
 pub use alloy::primitives::FixedBytes;
 pub use reth_chain_state::{CanonicalInMemoryState, ExecutedBlock, NewCanonicalChain};
 pub use reth_chainspec::ChainSpec as RethChainSpec;
-pub use reth_cli_util::{parse_duration_from_secs, parse_socket_address};
+pub use reth_cli_util::parse_socket_address;
 pub use reth_db::{
     mdbx::{open_db_read_only, DatabaseArguments, Error as RethMdbxError},
     static_file::iter_static_files,
     Database as RethDatabaseT, DatabaseEnv, Tables,
 };
 pub use reth_errors::{ProviderError, RethError};
-pub use reth_ethereum_engine_primitives::BlobSidecars;
 pub use reth_node_core::{
     args::{ColorMode, LogArgs},
     dirs::MaybePlatformPath,
-    node_config::DEFAULT_PERSISTENCE_THRESHOLD,
 };
-pub use reth_primitives_traits::crypto::secp256k1::sign_message;
 /// Test-only re-export so engine tests can construct static-file provider errors.
 #[cfg(feature = "test-utils")]
 pub use reth_provider::StaticFileSegment;
@@ -110,11 +107,11 @@ pub use reth_provider::{
 };
 pub use reth_rpc_builder::RpcServerHandle;
 pub use reth_rpc_eth_types::EthApiError;
-pub use reth_tracing::{FileWorkerGuard, Layers};
+pub use reth_tracing::Layers;
 pub use reth_transaction_pool::{
     error::{InvalidPoolTransactionError, PoolError, PoolTransactionError},
     identifier::{SenderId, SenderIdentifiers},
-    BestTransactions, EthPooledTransaction, TransactionPool as TransactionPoolT,
+    BestTransactions, EthPooledTransaction,
 };
 
 mod cli;

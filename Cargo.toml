@@ -131,7 +131,6 @@ zeroize = "1.8.2"
 reth-primitives-traits = { path = "vendor/reth/crates/primitives-traits" }
 reth-chainspec = { path = "vendor/reth/crates/chainspec" }
 reth-chain-state = { path = "vendor/reth/crates/chain-state" }
-reth-config = { path = "vendor/reth/crates/config" }
 reth-db = { path = "vendor/reth/crates/storage/db" }
 reth-db-common = { path = "vendor/reth/crates/storage/db-common" }
 reth-engine-primitives = { path = "vendor/reth/crates/engine/primitives" }
