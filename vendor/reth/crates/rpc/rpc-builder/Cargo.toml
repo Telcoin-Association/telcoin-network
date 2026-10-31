@@ -73,3 +73,5 @@ alloy-rpc-types-engine.workspace = true
 
 serde_json.workspace = true
 clap = { workspace = true, features = ["derive"] }
+# TN(TN-0016): upstream added this in 39f078e40; the backported ws-origin test needs it.
+reqwest.workspace = true

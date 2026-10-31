@@ -175,3 +175,17 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   *Why*: `--http.corsdomain "https://a, https://b"` kept the leading space on the second origin,
   so it never matched and a `"https://a, *"` list was not rejected. It is also the base the
   WebSocket origin fix (TN-0016) is written against. *Upstream*: n/a (upstream commit).
+
+- **TN-0016** — Backport ff2657600: enforce WebSocket origin allowlists. *Kind*: backport
+  (security).
+  *Files*: `crates/rpc/rpc-builder/src/{cors.rs, lib.rs}`, `tests/it/startup.rs` (upstream's
+  `test_ws_upgrade_origin_allowlist`), `Cargo.toml` (`reqwest` dev-dependency, which upstream
+  added in 39f078e40).
+  *Why*: `--ws.origins` only set CORS response headers. Browsers don't apply CORS to WebSocket
+  upgrades, so any web page could open a WS connection to a node's RPC (cross-site WebSocket
+  hijacking). A `WsOriginValidator` layer now answers 403 to an upgrade whose `Origin` is not on
+  the list. Requests without an `Origin` header (non-browser clients) still pass, and plain HTTP
+  is unchanged. Merge conflict: TN's tree lacks upstream's HTTP compression-algorithm argument,
+  so the new layer sits after `maybe_compression_layer(self.http_disable_compression)`.
+  Verified: with the validator disabled, the test fails (101 Switching Protocols where 403 is
+  expected). *Upstream*: n/a (upstream commit).
