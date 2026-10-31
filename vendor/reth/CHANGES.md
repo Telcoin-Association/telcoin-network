@@ -298,3 +298,6 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   - b629142d0: a jar loaded on a cache miss no longer overwrites an entry that `update_index`
     published meanwhile, so readers stop seeing a stale row count after an append
     (`provider/src/providers/static_file/manager.rs`).
+  - 01d039b1f: re-initializing the index (after a heal, prune or unwind) bumps a cache
+    generation, and an in-flight load re-checks it under the entry's shard lock, so a jar loaded
+    before the invalidation cannot repopulate the cache (same file, with upstream's two tests).
