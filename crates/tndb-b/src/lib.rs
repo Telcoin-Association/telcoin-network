@@ -17,8 +17,9 @@
 //! [`RwTxn::insert`], [`RwTxn::append`], [`RwTxn::delete`]) take the logical key `k ‖ s`, and
 //! [`RwTxn::delete_prefix`] removes one outer key's rows. A write transaction keeps the nested
 //! roots it writes in memory and rewrites their outer cells once, at commit. A call that needs
-//! the other kind of table is [`Error::TableKind`]; packed sets are not supported in this
-//! version.
+//! the other kind of table is [`Error::TableKind`]. A dup table records a packed-set limit
+//! ([`DupOptions::packed_max`], resolved at the page size by [`DupOptions::resolved`]); this
+//! version still holds every outer key's rows in a nested tree.
 //!
 //! A dup table's cursors are [`DupRoCursor`] ([`RoTxn::dup_cursor_owned`], owned as a
 //! [`RoCursor`] is) and [`DupTxnCursor`] ([`RwTxn::dup_cursor_detached`], detached as a

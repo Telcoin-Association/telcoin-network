@@ -1814,15 +1814,19 @@ impl RwTxn {
 
     /// Open the dup table `name`, creating it (empty, new id) if it does not exist: every key of
     /// the table is `k ‖ s`, an outer key `k` of exactly `options.key_len` bytes and a subkey `s`
-    /// of at least one byte. [`Error::InvalidTableName`] unless the name is 1..=255 bytes;
-    /// [`Error::InvalidDupOptions`] unless `options.packed_max` is 0 and `options.key_len` is at
-    /// least 1 and leaves the outer cell (the key and a 32-byte nested root) an inline entry with
-    /// room for a 1-byte subkey (975 bytes at 4 KiB pages); [`Error::TableKind`] if `name` is a
-    /// plain table or a dup table of other options. Each refusal changes nothing and does not
-    /// latch.
+    /// of at least one byte. The table records `options` resolved at the file's page size
+    /// ([`DupOptions::resolved`]: [`DupOptions::PACKED_DEFAULT`] becomes the number it stands
+    /// for), and an existing table is compared on those, so asking for `PACKED_DEFAULT` or for
+    /// its number gives the same table. [`Error::InvalidTableName`] unless the name is 1..=255
+    /// bytes; [`Error::InvalidDupOptions`] unless `options.key_len` is at least 1 and leaves the
+    /// outer cell (the key and a 32-byte nested root) an inline entry with room for a 1-byte
+    /// subkey (975 bytes at 4 KiB pages), and `options.packed_max` is 0, `PACKED_DEFAULT` or in
+    /// `7..=` the longest value an inline entry of a `key_len`-byte key takes;
+    /// [`Error::TableKind`] if `name` is a plain table or a dup table of other resolved options.
+    /// Each refusal changes nothing and does not latch.
     pub fn create_dup_table(&mut self, name: &str, options: DupOptions) -> Result<Table> {
         catalog::check_name(name)?;
-        options.check(&self.inner.geometry)?;
+        let options = options.resolve(&self.inner.geometry)?;
         self.write(|work| work.create(name, Some(options)))
     }
 

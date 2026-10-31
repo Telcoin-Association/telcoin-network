@@ -24,8 +24,8 @@
 //! the bytes at a given distance from a record's end mean what they meant there.
 //!
 //! Every use of a record (a table's resolution, `Env::check`) takes it through
-//! [`TableRecord::usable`]: a dup record of a shape this build does not serve (packed sets, an
-//! outer key too wide for the page size) is damage.
+//! [`TableRecord::usable`]: a dup record of a shape this build does not serve (an outer key too
+//! wide for the page size, a packed-set limit past its inline entry) is damage.
 
 use crate::{
     error::{Error, Result},
@@ -51,6 +51,11 @@ const CREATED: std::ops::Range<usize> = 80..88;
 /// The reserved bytes, zero in every record.
 const RESERVED: [std::ops::Range<usize>; 2] = [76..80, CREATED.end..RECORD_LEN];
 
+/// The smallest packed set, in bytes of its encoding: one row of a 1-byte subkey and an empty
+/// value. The packed-set codec holds every set to it; a dup table's `packed_max` is 0 or at least
+/// this.
+pub(crate) const PACKED_MIN: usize = 7;
+
 /// The shape of a dup table (`RwTxn::create_dup_table`): every key is `k ‖ s`, an outer key `k`
 /// of exactly `key_len` bytes and a subkey `s` of at least one byte. Each outer key holds its rows
 /// in a nested B+tree of its own, named by the key's one cell in the table's outer tree.
@@ -61,28 +66,59 @@ pub struct DupOptions {
     /// pages, 4047 at 16 KiB, 16335 at 64 KiB). A logical key `k ‖ s` is still held to the page
     /// size's `max_key`, so the subkey takes at most `max_key − key_len` bytes.
     pub key_len: u16,
-    /// The most rows a key keeps in a packed set; 0: every key holds a nested tree. Only 0 is
-    /// supported (anything else is [`Error::InvalidDupOptions`]).
+    /// The largest packed set, in bytes of its encoding: a key whose rows encode within it keeps
+    /// them in its outer cell; 0: every key holds a nested tree. Else at least 7 and at most the
+    /// longest value an inline entry of a `key_len`-byte key takes (987 bytes at `key_len` 20 and
+    /// 4 KiB pages), or [`Self::PACKED_DEFAULT`] for that most; see [`Self::resolved`]. This
+    /// version holds every key in a nested tree whatever the limit.
     pub packed_max: u16,
 }
 
 impl DupOptions {
-    /// Check the options against the page size `geometry`: `packed_max` 0 and `key_len` in
-    /// `1..=`[`Geometry::max_dup_key_len`], else [`Error::InvalidDupOptions`].
-    pub(crate) fn check(&self, geometry: &Geometry) -> Result<()> {
+    /// The request for the largest `packed_max` the page size allows, the longest value an inline
+    /// entry of a `key_len`-byte key takes. Never a limit itself (no page size allows a value this
+    /// long inline): [`Self::resolved`] and `RwTxn::create_dup_table` replace it with that number.
+    pub const PACKED_DEFAULT: u16 = u16::MAX;
+
+    /// Options of `key_len`-byte outer keys whose packed sets take the most the page size allows
+    /// ([`Self::PACKED_DEFAULT`]).
+    pub const fn packed(key_len: u16) -> Self {
+        Self { key_len, packed_max: Self::PACKED_DEFAULT }
+    }
+
+    /// The options a dup table created with these at `page_size`-byte pages records, which its
+    /// `TableStat::dup` reports and `RwTxn::create_dup_table` compares on an existing table:
+    /// these with [`Self::PACKED_DEFAULT`] replaced by the longest value an inline entry of a
+    /// `key_len`-byte key takes. [`Error::InvalidPageSize`] for a page size `Env::open` refuses;
+    /// [`Error::InvalidDupOptions`] for options `create_dup_table` refuses: `key_len` 0 or too
+    /// wide for the page size, or `packed_max` neither 0 nor in `7..=` that longest value.
+    pub fn resolved(&self, page_size: u32) -> Result<Self> {
+        self.resolve(&Geometry::new(page_size)?)
+    }
+
+    /// [`Self::resolved`] at the page size `geometry`: `key_len` in
+    /// `1..=`[`Geometry::max_dup_key_len`] and `packed_max` 0, [`Self::PACKED_DEFAULT`] (which
+    /// resolves to [`Geometry::max_value`]`(key_len)`) or in [`PACKED_MIN`]`..=` that, else
+    /// [`Error::InvalidDupOptions`].
+    pub(crate) fn resolve(&self, geometry: &Geometry) -> Result<Self> {
         let max = geometry.max_dup_key_len();
-        if self.packed_max != 0 {
-            Err(Error::InvalidDupOptions(
-                "packed sets are not supported: packed_max must be 0".to_string(),
-            ))
-        } else if self.key_len == 0 || usize::from(self.key_len) > max {
-            Err(Error::InvalidDupOptions(format!(
+        if self.key_len == 0 || usize::from(self.key_len) > max {
+            return Err(Error::InvalidDupOptions(format!(
                 "key_len {} outside 1..={max} for this page size",
                 self.key_len
-            )))
-        } else {
-            Ok(())
+            )));
         }
+        let most = geometry.max_value(usize::from(self.key_len));
+        let packed_max = match self.packed_max {
+            Self::PACKED_DEFAULT => u16::try_from(most).expect("a value limit below u16::MAX"),
+            n if n == 0 || (PACKED_MIN..=most).contains(&usize::from(n)) => n,
+            n => {
+                return Err(Error::InvalidDupOptions(format!(
+                    "packed_max {n} outside {PACKED_MIN}..={most} for this page size"
+                )))
+            }
+        };
+        Ok(Self { packed_max, ..*self })
     }
 }
 
@@ -108,7 +144,8 @@ pub(crate) struct TableRecord {
 pub(crate) struct DupRecord {
     /// The width of every outer key, at least 1.
     pub(crate) key_len: u16,
-    /// The most rows a packed set holds; 0: the table never packs, every outer cell is nested.
+    /// The largest packed set, in bytes of its encoding ([`DupOptions::packed_max`], resolved);
+    /// 0: the table never packs, every outer cell is nested.
     pub(crate) packed_max: u16,
     /// The rows in nested trees.
     pub(crate) nested_entries: u64,
@@ -133,8 +170,11 @@ impl DupRecord {
     /// The record rules a dup table's fields obey against its outer tree `root`, else the broken
     /// rule: an outer key of at least 1 byte; at most one nested tree per outer entry; every
     /// nested tree non-empty, so with a leaf and an entry of its own, and none of them without a
-    /// nested tree; with no packing every outer cell nested and no packed row, and with packing a
-    /// row in each outer cell that is not nested; the outer and nested pages together at most
+    /// nested tree; with no packing every outer cell nested and no packed row; with packing a
+    /// limit of at least [`PACKED_MIN`] bytes, a row in each packed set (an outer cell that is not
+    /// nested), a packed set if there is a packed row, and no more packed rows than the sets can
+    /// hold (a row takes at least a 4-byte slot and a 1-byte subkey, after a set's 2-byte
+    /// header); the outer and nested pages together at most
     /// [`MAX_TREE_PAGES`], and the nested and packed rows a total that fits a `u64` (so a table's
     /// page and row totals are sums that cannot overflow).
     pub(crate) fn broken_rule(&self, root: &TreeRoot) -> Option<&'static str> {
@@ -152,8 +192,17 @@ impl DupRecord {
             Some("a nested tree without a leaf or a row")
         } else if self.packed_max == 0 && (self.packed_rows != 0 || trees != root.entries) {
             Some("packed rows or an unnested outer entry in a table that never packs")
+        } else if self.packed_max != 0 && usize::from(self.packed_max) < PACKED_MIN {
+            Some("a packed-set limit below the smallest set")
         } else if self.packed_max != 0 && self.packed_rows < root.entries - trees {
             Some("fewer packed rows than packed sets")
+        } else if self.packed_rows != 0 && root.entries == trees {
+            Some("packed rows without a packed set")
+        } else if (root.entries - trees)
+            .checked_mul(u64::from(self.packed_max.saturating_sub(2) / 5))
+            .is_some_and(|most| self.packed_rows > most)
+        {
+            Some("more packed rows than the packed sets can hold")
         } else if root.pages() + pages > MAX_TREE_PAGES {
             Some("more outer and nested pages than a file holds")
         } else if self.nested_entries.checked_add(self.packed_rows).is_none() {
@@ -181,22 +230,25 @@ impl TableRecord {
     }
 
     /// The record, if this build serves its table at the page size `geometry`: every plain
-    /// record, and a dup record with no packed sets and an outer key of at most
-    /// [`Geometry::max_dup_key_len`] bytes. Every use of a record (a table's resolution,
+    /// record, and a dup record whose outer key has at most [`Geometry::max_dup_key_len`] bytes
+    /// and whose `packed_max` is 0 or at most [`Geometry::max_value`]`(key_len)` (decode already
+    /// holds a nonzero one to [`PACKED_MIN`]). Every use of a record (a table's resolution,
     /// `Env::check`) takes this. Neither refusal is a record this build writes, so each is damage
     /// (or a newer format): [`Error::Corrupt`].
     pub(crate) fn usable(&self, geometry: &Geometry) -> Result<&Self> {
         let Some(d) = &self.dup else { return Ok(self) };
         let (id, max) = (self.id, geometry.max_dup_key_len());
-        if d.packed_max != 0 {
-            Err(Error::Corrupt(format!(
-                "catalog record: dup table {id} has packed sets (packed_max {}), unsupported",
-                d.packed_max
-            )))
-        } else if usize::from(d.key_len) > max {
+        let most = geometry.max_value(usize::from(d.key_len));
+        if usize::from(d.key_len) > max {
             Err(Error::Corrupt(format!(
                 "catalog record: dup table {id}: key_len {} past this page size's {max}",
                 d.key_len
+            )))
+        } else if d.packed_max != 0 && !(PACKED_MIN..=most).contains(&usize::from(d.packed_max)) {
+            Err(Error::Corrupt(format!(
+                "catalog record: dup table {id}: packed_max {} outside {PACKED_MIN}..={most} for \
+                 this page size",
+                d.packed_max
             )))
         } else {
             Ok(self)
@@ -454,6 +506,22 @@ mod tests {
         broken("never packs", outer, DupRecord { packed_rows: 1, ..nested });
         broken("never packs", outer, DupRecord { nested_trees: 4, ..nested });
         broken("fewer packed rows", outer, DupRecord { packed_rows: 1, ..packed });
+        // A packing table's limit is at least the smallest set's 7 bytes.
+        for packed_max in 1..PACKED_MIN as u16 {
+            broken("limit below the smallest set", outer, DupRecord { packed_max, ..packed });
+        }
+        let seven = TableRecord { dup: Some(DupRecord { packed_max: 7, ..packed }), ..record };
+        assert_eq!(TableRecord::decode(&seven.encode()).expect("a 7-byte limit"), seven);
+        // A packed row needs a packed set: five outer cells, all nested.
+        let all_nested = DupRecord { packed_max: 8, packed_rows: 1, nested_trees: 5, ..nested };
+        broken("packed rows without a packed set", outer, all_nested);
+        // Two sets of at most 12 bytes hold two rows each ((12 − 2) / 5), so four rows at most.
+        let roomy = DupRecord { packed_max: 12, packed_rows: 4, ..packed };
+        let full_sets = TableRecord { dup: Some(roomy), ..record };
+        assert_eq!(TableRecord::decode(&full_sets.encode()).expect("full sets"), full_sets);
+        let over_full = DupRecord { packed_rows: 5, ..roomy };
+        broken("more packed rows than the packed sets can hold", outer, over_full);
+        broken("can hold", outer, DupRecord { packed_rows: 3, ..packed });
         // The outer page (1) and the nested ones (3 + 40 + overflow) past MAX_TREE_PAGES.
         let at_most = (MAX_TREE_PAGES - 44) as u32;
         let full = TableRecord {
@@ -499,44 +567,72 @@ mod tests {
         );
     }
 
-    /// A dup record is served when it never packs and its outer key fits the page size's
-    /// [`Geometry::max_dup_key_len`]; a packing record or a wider key is `Corrupt` at every use,
-    /// and the options a new dup table is given obey the same limits ([`DupOptions::check`]).
+    /// A dup record is served when its outer key fits the page size's
+    /// [`Geometry::max_dup_key_len`] and its `packed_max` is 0 or in `7..=max_value(key_len)`; a
+    /// wider key or a limit outside that is `Corrupt` at every use. The options a new dup table is
+    /// given obey the same limits ([`DupOptions::resolve`]), with [`DupOptions::PACKED_DEFAULT`]
+    /// resolving to `max_value(key_len)`, at every page size and through the public
+    /// [`DupOptions::resolved`].
     #[test]
     fn dup_records_are_usable_within_this_builds_limits() {
         for size in [4096, 16384, 65536] {
             let g = Geometry::new(size).expect("geometry");
             let max = g.max_dup_key_len() as u16;
             let options = |key_len, packed_max| DupOptions { key_len, packed_max };
-            for key_len in [1, 4, max] {
-                let record = TableRecord::new_dup(7, 3, options(key_len, 0));
-                assert_eq!(record.dup.expect("dup").options(), options(key_len, 0));
-                assert_eq!((record.id, record.created_txn, record.root), (7, 3, TreeRoot::EMPTY));
-                assert_eq!(TableRecord::decode(&record.encode()).expect("decode"), record);
-                assert_eq!(record.usable(&g).expect("usable"), &record, "{size} {key_len}");
-                assert!(options(key_len, 0).check(&g).is_ok());
+            for key_len in [1, 4, 20, max] {
+                let most = g.max_value(usize::from(key_len)) as u16;
+                assert!(usize::from(most) >= PACKED_MIN, "{size} {key_len}");
+                for packed_max in [0, 7, 8, most - 1, most] {
+                    let shape = options(key_len, packed_max);
+                    let record = TableRecord::new_dup(7, 3, shape);
+                    assert_eq!(record.dup.expect("dup").options(), shape);
+                    assert_eq!(
+                        (record.id, record.created_txn, record.root),
+                        (7, 3, TreeRoot::EMPTY)
+                    );
+                    assert_eq!(TableRecord::decode(&record.encode()).expect("decode"), record);
+                    assert_eq!(record.usable(&g).expect("usable"), &record, "{size} {shape:?}");
+                    assert_eq!(shape.resolve(&g).expect("valid"), shape, "{size}");
+                    assert_eq!(shape.resolved(size).expect("valid"), shape, "{size}");
+                }
+                let default = DupOptions::packed(key_len);
+                assert_eq!(default, options(key_len, DupOptions::PACKED_DEFAULT));
+                assert_eq!(default.resolve(&g).expect("the default"), options(key_len, most));
+                assert_eq!(default.resolved(size).expect("the default"), options(key_len, most));
+                for packed_max in [1, 6, most + 1, DupOptions::PACKED_DEFAULT] {
+                    let record = TableRecord::new_dup(7, 3, options(key_len, packed_max));
+                    let what = format!("packed_max {packed_max} outside 7..={most} for");
+                    assert!(
+                        matches!(record.usable(&g), Err(Error::Corrupt(m)) if m.contains(&what)),
+                        "{size}: a record with {what}"
+                    );
+                }
+                for packed_max in [1, 6, most + 1] {
+                    let bad = options(key_len, packed_max);
+                    let what = format!("packed_max {packed_max} outside 7..={most} for");
+                    assert!(
+                        matches!(bad.resolve(&g), Err(Error::InvalidDupOptions(m)) if m.contains(&what)),
+                        "{size}: options with {what}"
+                    );
+                }
             }
             let wide = TableRecord::new_dup(7, 3, options(max + 1, 0));
             assert!(
                 matches!(wide.usable(&g), Err(Error::Corrupt(m)) if m.contains("past this page size")),
                 "{size}: a key wider than the page size serves"
             );
-            let packed = TableRecord::new_dup(7, 3, options(4, 1));
-            assert!(
-                matches!(packed.usable(&g), Err(Error::Corrupt(m)) if m.contains("packed sets")),
-                "{size}: a packing record"
-            );
             for (bad, what) in [
                 (options(0, 0), format!("key_len 0 outside 1..={max}")),
                 (options(max + 1, 0), format!("key_len {} outside 1..={max}", max + 1)),
-                (options(4, 1), "packed_max must be 0".to_string()),
+                (DupOptions::packed(0), format!("key_len 0 outside 1..={max}")),
             ] {
                 assert!(
-                    matches!(bad.check(&g), Err(Error::InvalidDupOptions(m)) if m.contains(&what)),
+                    matches!(bad.resolve(&g), Err(Error::InvalidDupOptions(m)) if m.contains(&what)),
                     "{size}: {what}"
                 );
             }
         }
+        assert!(matches!(DupOptions::packed(4).resolved(1000), Err(Error::InvalidPageSize(1000))));
     }
 
     /// Names of 1..=255 bytes are tables' keys; others are refused before the tree is touched.

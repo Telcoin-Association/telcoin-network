@@ -1,6 +1,5 @@
 //! Dup tables through the public API: the two kinds of table and the calls each takes, the
-//! options a dup table is created with, and the records a build that serves no packed sets
-//! refuses.
+//! options a dup table is created with, and the records this build refuses.
 
 use std::{
     collections::BTreeMap,
@@ -118,12 +117,14 @@ fn table_kinds_are_checked() {
     check(&env);
 }
 
-/// `create_dup_table` refuses an empty outer key, one past [`Geometry::max_dup_key_len`] and
-/// packed sets with `InvalidDupOptions`, creating nothing and with no latch (on a new name and on
-/// an existing one), at 4 KiB and 16 KiB pages; the widest key is accepted, and its table takes
-/// rows of a 1-byte subkey, enough of them for an outer tree of two levels.
+/// `create_dup_table` refuses an empty outer key, one past [`Geometry::max_dup_key_len`] and a
+/// `packed_max` outside `7..=`[`Geometry::max_value`]`(key_len)` (but 0) with `InvalidDupOptions`,
+/// creating nothing and with no latch (on a new name and on an existing one), at 4 KiB and 16 KiB
+/// pages; the widest key is accepted, and its table takes rows of a 1-byte subkey, enough of them
+/// for an outer tree of two levels.
 ///
 /// [`Geometry::max_dup_key_len`]: crate::page::Geometry::max_dup_key_len
+/// [`Geometry::max_value`]: crate::page::Geometry::max_value
 #[test]
 fn dup_options_are_validated() {
     for page_size in [4096, 16384] {
@@ -137,16 +138,22 @@ fn dup_options_are_validated() {
         let widest = DupOptions { key_len: max, packed_max: 0 };
         let w = txn.create_dup_table("widest", widest).expect("the widest outer key");
         assert_eq!(txn.table_stat(&w).expect("stat").dup, Some(widest));
+        let most = env.inner().geometry.max_value(usize::from(OPTIONS.key_len));
+        let widest_most = env.inner().geometry.max_value(usize::from(max));
+        let range = |n: usize, most: usize| format!("packed_max {n} outside 7..={most} for this");
         for (name, options, what) in [
-            ("bad", DupOptions { key_len: 0, ..OPTIONS }, "key_len 0 outside"),
-            ("bad", DupOptions { key_len: max + 1, ..OPTIONS }, "outside 1.."),
-            ("bad", DupOptions { packed_max: 1, ..OPTIONS }, "packed_max must be 0"),
-            ("bad", DupOptions { key_len: 0, packed_max: 8 }, "packed_max must be 0"),
-            ("widest", DupOptions { packed_max: 1, ..widest }, "packed_max must be 0"),
+            ("bad", DupOptions { key_len: 0, ..OPTIONS }, "key_len 0 outside".to_string()),
+            ("bad", DupOptions { key_len: max + 1, ..OPTIONS }, "outside 1..".to_string()),
+            ("bad", DupOptions::packed(0), "key_len 0 outside".to_string()),
+            ("bad", DupOptions { packed_max: 1, ..OPTIONS }, range(1, most)),
+            ("bad", DupOptions { packed_max: 6, ..OPTIONS }, range(6, most)),
+            ("bad", DupOptions { packed_max: most as u16 + 1, ..OPTIONS }, range(most + 1, most)),
+            ("widest", DupOptions { packed_max: 1, ..widest }, range(1, widest_most)),
+            ("widest", DupOptions { packed_max: 33, ..widest }, range(33, widest_most)),
         ] {
             let result = txn.create_dup_table(name, options);
             assert!(
-                matches!(&result, Err(Error::InvalidDupOptions(m)) if m.contains(what)),
+                matches!(&result, Err(Error::InvalidDupOptions(m)) if m.contains(&what)),
                 "{page_size} {name} {options:?}: {result:?}"
             );
         }
@@ -210,9 +217,13 @@ fn an_empty_dup_tables_stat_is_its_shape() {
 }
 
 /// A file with an empty dup table `d` (of [`OPTIONS`]) and a plain table `p` holding one row,
-/// whose catalog leaf holds both records: returns the path and `d`'s handle after `edit` changed
-/// `d`'s record in place, the leaf's CRC stamped again.
-fn with_record(dir: &Path, edit: impl FnOnce(&mut TableRecord)) -> (PathBuf, crate::Table) {
+/// whose catalog leaf holds both records: returns the path and `d`'s handle after `d`'s record
+/// was replaced in place by `encode`'s bytes for it (which need not keep the record rules), the
+/// leaf's CRC stamped again.
+fn with_record(
+    dir: &Path,
+    encode: impl FnOnce(TableRecord) -> [u8; crate::catalog::RECORD_LEN],
+) -> (PathBuf, crate::Table) {
     let path = dir.join("db");
     let d = {
         let env = open(&path, SyncMode::Durable);
@@ -223,13 +234,27 @@ fn with_record(dir: &Path, edit: impl FnOnce(&mut TableRecord)) -> (PathBuf, cra
         txn.commit().expect("commit");
         d
     };
-    restamp_record(&path, edit);
+    restamp_encoded(&path, encode);
     (path, d)
 }
 
 /// Table `d`'s record in the cleanly closed file at `path`, whose catalog is one leaf, changed by
 /// `edit` in place (keeping the record rules), the leaf's CRC stamped again.
 pub(super) fn restamp_record(path: &Path, edit: impl FnOnce(&mut TableRecord)) {
+    restamp_encoded(path, |mut record| {
+        edit(&mut record);
+        let bytes = record.encode();
+        assert_eq!(TableRecord::decode(&bytes).expect("the record rules hold"), record);
+        bytes
+    });
+}
+
+/// Table `d`'s record in the cleanly closed file at `path`, whose catalog is one leaf, replaced in
+/// place by `encode`'s bytes for it, the leaf's CRC stamped again.
+fn restamp_encoded(
+    path: &Path,
+    encode: impl FnOnce(TableRecord) -> [u8; crate::catalog::RECORD_LEN],
+) {
     let catalog = {
         let env = open(path, SyncMode::Durable);
         let meta = env.inner().current().meta;
@@ -242,30 +267,44 @@ pub(super) fn restamp_record(path: &Path, edit: impl FnOnce(&mut TableRecord)) {
             .expect("d's record");
         let (_, value) = page::leaf_inline_entry(page, i).expect("entry");
         let off = value.as_ptr() as usize - page.as_ptr() as usize;
-        let mut record = TableRecord::decode(value).expect("record");
-        edit(&mut record);
-        let bytes = record.encode();
-        assert_eq!(TableRecord::decode(&bytes).expect("the record rules hold"), record);
+        let bytes = encode(TableRecord::decode(value).expect("record"));
         page[off..off + bytes.len()].copy_from_slice(&bytes);
     });
 }
 
-/// A dup record this build does not serve, though it keeps every record rule (one with packed
-/// sets, `packed_max` 1, and one whose outer key is one byte past the page size's widest), is
-/// `Corrupt` wherever the table is resolved: either transaction's `open_table`, `create_table` of
-/// its name, a get and a table stat through a handle taken before, and `Env::check`. Each latches;
-/// the plain table beside it reads on.
+/// A dup record whose `packed_max` is out of range is `Corrupt` wherever the table is resolved:
+/// either transaction's `open_table`, `create_table` of its name, a get and a table stat through a
+/// handle taken before, and `Env::check`. A limit of 1..=6 breaks a record rule (decode refuses
+/// it); one past the longest inline value of the outer key, or the request
+/// [`DupOptions::PACKED_DEFAULT`] itself, keeps every rule but is a record this build does not
+/// serve, as is an outer key one byte past the page size's widest. Each latches; the plain table
+/// beside it reads on.
 #[test]
-fn a_packed_dup_record_is_refused() {
-    let wide = 1 + crate::page::Geometry::new(4096).expect("4 KiB").max_dup_key_len() as u16;
-    for (case, message) in [("packed", "has packed sets"), ("wide", "past this page size")] {
+fn a_dup_record_with_packed_max_out_of_range_is_refused() {
+    let geometry = crate::page::Geometry::new(4096).expect("4 KiB");
+    let wide = 1 + geometry.max_dup_key_len() as u16;
+    let most = geometry.max_value(usize::from(OPTIONS.key_len)) as u16;
+    let past = format!("packed_max {} outside 7..={most} for this page size", most + 1);
+    let request = format!("packed_max {} outside 7..={most}", DupOptions::PACKED_DEFAULT);
+    for (case, message) in [
+        ("low", "a packed-set limit below the smallest set"),
+        ("high", past.as_str()),
+        ("request", request.as_str()),
+        ("wide", "past this page size"),
+    ] {
         let dir = TempDir::with_prefix("tndb_b_dup_packed").expect("temp dir");
-        let (path, d) = with_record(dir.path(), |record| {
+        let (path, d) = with_record(dir.path(), |mut record| {
             let dup = record.dup.as_mut().expect("a dup record");
             match case {
-                "packed" => dup.packed_max = 1,
+                "low" => dup.packed_max = 6,
+                "high" => dup.packed_max = most + 1,
+                "request" => dup.packed_max = DupOptions::PACKED_DEFAULT,
                 _ => dup.key_len = wide,
             }
+            let bytes = record.encode();
+            let decoded = TableRecord::decode(&bytes);
+            assert_eq!(decoded.is_ok(), case != "low", "{case}: the record rules");
+            bytes
         });
         {
             let (_dir, env) = copy_of(&path);
