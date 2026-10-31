@@ -417,7 +417,8 @@ fn dup_put(
         &mut trusted,
         &mut w.cache,
         k,
-        &root,
+        write::OuterCell::Nested(&root),
+        write::Cells::Outer,
         outer_kind,
     ) {
         Ok(_) => {}
@@ -470,7 +471,14 @@ fn dup_delete(work: &mut Work, i: usize, key: &[u8]) -> Result<DupRemoved> {
     apply_delta(dup, &w.table, k, &before, &after)?;
     if after.is_empty() {
         // The delete freed the tree's last leaf: its cell and its entry go too.
-        let removed = write::delete_outer_cell(writer, &mut outer, &mut trusted, &mut w.cache, k)?;
+        let removed = write::delete_outer_cell(
+            writer,
+            &mut outer,
+            &mut trusted,
+            &mut w.cache,
+            k,
+            write::Cells::Outer,
+        )?;
         if !removed.found {
             return Err(no_cell(&w.table, k));
         }
@@ -605,7 +613,14 @@ fn dup_delete_prefix(work: &mut Work, i: usize, key: &[u8]) -> Result<u64> {
         totals.nested_trees.checked_sub(1).ok_or_else(|| totals_error(&w.table, key))?;
     apply_delta(&mut totals, &w.table, key, &root, &TreeRoot::EMPTY)?;
     write::free_subtree(writer, &root, root_trusted)?;
-    let removed = write::delete_outer_cell(writer, &mut outer, &mut trusted, &mut w.cache, key)?;
+    let removed = write::delete_outer_cell(
+        writer,
+        &mut outer,
+        &mut trusted,
+        &mut w.cache,
+        key,
+        write::Cells::Outer,
+    )?;
     if !removed.found {
         return Err(no_cell(&w.table, key));
     }
@@ -677,7 +692,8 @@ fn free_dup_table(
     map: &NestedMap,
 ) -> Result<()> {
     let mut roots = WalkRoots { table, map, dup, hits: 0 };
-    write::free_dup_tree(writer, outer, trusted, usize::from(dup.key_len), &mut roots).map(drop)
+    write::free_dup_tree(writer, outer, trusted, usize::from(dup.key_len), None, &mut roots)
+        .map(drop)
 }
 
 // Test-only counter, debug builds only: the benchmark is compiled with the test configuration,
@@ -1687,7 +1703,8 @@ impl Work {
                 &mut trusted,
                 &mut w.cache,
                 k,
-                &n.root,
+                write::OuterCell::Nested(&n.root),
+                write::Cells::Outer,
                 PutKind::Upsert,
             )?;
             if !placed.replaced {

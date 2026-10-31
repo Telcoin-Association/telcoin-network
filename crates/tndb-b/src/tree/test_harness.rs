@@ -474,6 +474,8 @@ struct Walker<'s, S: ?Sized> {
     height: u32,
     /// A dup table's outer tree: every cell a nested root, its 32 raw bytes the entry's value.
     outer: bool,
+    /// An outer tree that packs: an inline cell too, its bytes the entry's value.
+    packing: bool,
     seen: HashSet<u32>,
     walk: Walk,
 }
@@ -511,6 +513,10 @@ impl<'s, S: PageRead + ?Sized> Walker<'s, S> {
                     // The codec gives `Nested` for a cell of flags 2 with a 32-byte value only.
                     Val::Nested(root) if self.outer => {
                         self.walk.entries.push((k.to_vec(), root.to_vec()));
+                        continue;
+                    }
+                    Val::Inline(set) if self.packing => {
+                        self.walk.entries.push((k.to_vec(), set.to_vec()));
                         continue;
                     }
                     other if self.outer => panic!("leaf {p}, key {i}: an outer cell {other:?}"),
@@ -554,24 +560,31 @@ impl<'s, S: PageRead + ?Sized> Walker<'s, S> {
 /// through the store's checked run read, and no run page is reached twice; and the entry count
 /// and the page counters (branch, leaf, overflow) match.
 pub(crate) fn walk_tree<S: PageRead + ?Sized>(store: &S, root: &TreeRoot) -> Walk {
-    walk(store, root, false)
+    walk(store, root, false, false)
 }
 
 /// [`walk_tree`] of a dup table's outer tree: every cell must be a nested cell (flags 2, a
 /// 32-byte value), and each entry's value is its cell's raw root bytes. What the cells name is
 /// not walked.
 pub(crate) fn walk_outer_tree<S: PageRead + ?Sized>(store: &S, root: &TreeRoot) -> Walk {
-    walk(store, root, true)
+    walk(store, root, true, false)
 }
 
-/// [`walk_tree`] or [`walk_outer_tree`].
-fn walk<S: PageRead + ?Sized>(store: &S, root: &TreeRoot, outer: bool) -> Walk {
+/// [`walk_outer_tree`] of an outer tree that packs: every cell a nested cell or an inline cell
+/// (a packed set, its bytes the entry's value, not parsed).
+pub(crate) fn walk_packing_tree<S: PageRead + ?Sized>(store: &S, root: &TreeRoot) -> Walk {
+    walk(store, root, true, true)
+}
+
+/// [`walk_tree`], [`walk_outer_tree`] or [`walk_packing_tree`].
+fn walk<S: PageRead + ?Sized>(store: &S, root: &TreeRoot, outer: bool, packing: bool) -> Walk {
     root.check().expect("root shape");
     let mut walker = Walker {
         store,
         geometry: store.geometry(),
         height: root.height,
         outer,
+        packing,
         seen: HashSet::new(),
         walk: Walk::default(),
     };
