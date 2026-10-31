@@ -1,10 +1,10 @@
 //! The damage sweeps of `damage.rs` and `read_only.rs` over a dup table: every kind of damage to
 //! a dup table's cells, trees and record is `Corrupt` at the first use that meets it, and latches.
-//! This build has no dup cursor (a cursor over a dup table is `TableKind`), so the scan stage
-//! scans the plain table beside it only. Beside the sweeps: two outer cells naming one nested
-//! root, written in one transaction (`Corrupt` at commit) and in two (found by `Env::check`).
+//! The scan stage scans the dup table with a [`crate::DupRoCursor`], then the plain table beside
+//! it. Beside the sweeps: two outer cells naming one nested root, written in one transaction
+//! (`Corrupt` at commit) and in two (found by `Env::check`).
 
-use std::{collections::BTreeMap, fs};
+use std::{collections::BTreeMap, fs, sync::Arc};
 
 use super::{
     damage::{restamped, tree, Stage, P},
@@ -25,6 +25,9 @@ const COLD: u32 = 8;
 
 /// The outer keys of the fixture's dup table: enough for an outer tree of two levels.
 const OUTER: u32 = 400;
+
+/// The dup table's outer key width.
+const K: usize = OPTIONS.key_len as usize;
 
 /// A cleanly closed file holding dup table `d` (of [`OPTIONS`]: outer keys 0 to [`OUTER`], 1 to 3
 /// rows each but [`HOT`]'s 300 and its run) and plain table `p` (two levels) beside it, and a
@@ -149,12 +152,22 @@ fn empty_subkey(path: &Path, pgno: u32) {
 }
 
 /// Use a damaged environment as `damage.rs`'s sweep does, over plain table `p` and dup table `d`:
-/// get every row of `plain` and `dup`, scan `p`, then (unless `read_only`) put to every fifth row
+/// get every row of `plain` and `dup`, scan `d` (every outer key but `hide`, whose rows `dup`
+/// leaves out too: the dup cursor steps inside each key, crosses to the next key with `next`, and
+/// seeks the key after `hide` past it) and `p`, then (unless `read_only`) put to every fifth row
 /// of each and fill a new table, commit, and check. The first error must be `Corrupt` from `stage`
 /// and the environment latched (read-only: by the operation that returned it); writes fail.
-fn sweep_dup(env: &Env, plain: &Rows, dup: &Rows, what: &str, stage: Stage, read_only: bool) {
+fn sweep_dup(
+    env: &Env,
+    plain: &Rows,
+    dup: &Rows,
+    hide: Option<u32>,
+    what: &str,
+    stage: Stage,
+    read_only: bool,
+) {
     let mut first = None;
-    let ro = env.begin_ro().expect("ro");
+    let ro = Arc::new(env.begin_ro().expect("ro"));
     for (name, rows) in [("d", dup), ("p", plain)] {
         let get = (|| {
             let Some(table) = ro.open_table(name)? else { return Ok(()) };
@@ -168,6 +181,23 @@ fn sweep_dup(env: &Env, plain: &Rows, dup: &Rows, what: &str, stage: Stage, read
         }
     }
     let scan = (|| {
+        if let Some(table) = ro.open_table("d")? {
+            let mut cursor = ro.dup_cursor_owned(&table)?;
+            let mut row = cursor.first()?.map(|(k, _)| k.to_vec());
+            while let Some(key) = row {
+                row = match cursor.next_in_prefix(K)? {
+                    Some((k, _)) => Some(k.to_vec()),
+                    None => {
+                        let after = u32::from_be_bytes(key[..K].try_into().expect("K")) + 1;
+                        match hide == Some(after) {
+                            true => cursor.seek_key(&(after + 1).to_be_bytes())?,
+                            false => cursor.next()?,
+                        }
+                        .map(|(k, _)| k.to_vec())
+                    }
+                };
+            }
+        }
         let Some(table) = ro.open_table("p")? else { return Ok(()) };
         let mut cursor = ro.cursor(&table)?;
         while cursor.next()?.is_some() {}
@@ -229,7 +259,7 @@ fn cases(fx: &DupFixture) -> Vec<Case<'_>> {
             restamp_cell(p, cold_leaf, &COLD.to_be_bytes(), Val::Nested(&root.encode()))
         }) as Box<dyn Fn(&Path)>
     };
-    use Stage::{Check, Get, Write};
+    use Stage::{Check, Get, Scan, Write};
     vec![
         ("empty root", Get, Get, None, nested(TreeRoot::EMPTY)),
         ("impossible root", Get, Get, None, nested(TreeRoot { height: 0, ..cold })),
@@ -273,9 +303,12 @@ fn cases(fx: &DupFixture) -> Vec<Case<'_>> {
             Box::new(move |p| restamp_cell(p, cold.root, &[0], Val::Nested(&cold.encode()))),
         ),
         (
-            "nested leaf",
-            Write,
-            Check,
+            // A byte of a separator in the nested branch root: gets descend past it to a
+            // neighbouring leaf and miss; the cursor's descent checks each page's keys against
+            // its ancestors' separators (as `read_only.rs`'s "root" case).
+            "nested separator",
+            Scan,
+            Scan,
             None,
             Box::new(move |p| crate::env::tests::flip(p, u64::from(hot.root) * P + P - 16)),
         ),
@@ -321,7 +354,7 @@ fn cases(fx: &DupFixture) -> Vec<Case<'_>> {
                 restamp_cell(p, fx.free_leaf.0, &fx.free_leaf.1, Val::Nested(&cold.encode()))
             }),
         ),
-        ("empty subkey", Check, Check, None, Box::new(move |p| empty_subkey(p, cold.root))),
+        ("empty subkey", Get, Get, None, Box::new(move |p| empty_subkey(p, cold.root))),
         (
             "counters off",
             Check,
@@ -348,7 +381,7 @@ fn run(read_only: bool) {
             false => open(&path, SyncMode::Durable),
         };
         let stage = if read_only { *ro_stage } else { *write_stage };
-        sweep_dup(&env, &fx.plain, &dup, what, stage, read_only);
+        sweep_dup(&env, &fx.plain, &dup, *hide, what, stage, read_only);
         drop(env);
         fs::remove_file(&path).expect("remove");
     }
@@ -430,11 +463,9 @@ fn a_shared_nested_root_across_transactions_is_found_by_check() {
 }
 
 /// A nested leaf whose first subkey is empty (the damage of the sweeps' "empty subkey" case): a
-/// get of that row's subkey meets the empty key as its miss's neighbour, which should be `Corrupt`
-/// there, latched, as an outer key of the wrong width is. Today the get is `Ok(None)` and only
-/// `Env::check` refuses.
+/// get of that row's subkey meets the empty key as its miss's neighbour, `Corrupt` there and
+/// latched, as an outer key of the wrong width is.
 #[test]
-#[ignore = "fail-closed gap: a get beside an empty subkey in a nested leaf misses silently"]
 fn an_empty_subkey_is_corrupt_at_first_use() {
     let fx = dup_fixture();
     let path = fx.dir.path().join("empty");

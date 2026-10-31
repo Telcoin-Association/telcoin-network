@@ -2008,6 +2008,8 @@ impl RwTxn {
                 reseeks: 0,
                 #[cfg(test)]
                 placements: 0,
+                #[cfg(test)]
+                landings: [0; 3],
             })
         })
     }
@@ -3099,6 +3101,10 @@ pub struct DupTxnCursor {
     /// Test-only: how many of the cursor's own writes placed it from a nested tree's path cache.
     #[cfg(test)]
     pub(crate) placements: u32,
+    /// Test-only: how the cursor's own deletes landed on the follower: from the nested tree's path
+    /// cache, from the outer path cache (the delete emptied the key), and found again by key.
+    #[cfg(test)]
+    pub(crate) landings: [u32; 3],
 }
 
 impl std::fmt::Debug for DupTxnCursor {
@@ -3122,6 +3128,13 @@ impl DupTxnCursor {
     #[cfg(test)]
     pub(crate) fn deleted_key_for_test(&self) -> Option<&[u8]> {
         self.deleted.then_some(self.deleted_key.as_slice())
+    }
+
+    /// Test-only: the logical key of the row the cursor is at (while deleted, the follower's), as
+    /// of its last call: the key a reseek finds it again by.
+    #[cfg(test)]
+    pub(crate) fn key_for_test(&self) -> Option<&[u8]> {
+        (self.walk.state() == State::At).then(|| self.walk.key())
     }
 
     /// Bring the cursor up to date with `work` (see the type docs).
@@ -3614,6 +3627,10 @@ impl DupTxnCursor {
         let k = &deleted_key[..walk.kl()];
         let landed = match (w, removed.slot) {
             (Some(w), Some(at)) if removed.emptied => {
+                #[cfg(test)]
+                {
+                    self.landings[1] += 1;
+                }
                 let path = (w.cache.branches(), w.cache.leaf(), at);
                 walk.place_after_outer_delete(store, outer_root, &mut roots, path)
             }
@@ -3622,6 +3639,7 @@ impl DupTxnCursor {
                 #[cfg(test)]
                 {
                     self.placements += 1;
+                    self.landings[0] += 1;
                 }
                 let path = (n.cache.branches(), n.cache.leaf(), at);
                 walk.place_after_nested_delete(
@@ -3634,6 +3652,10 @@ impl DupTxnCursor {
                 )
             }
             _ => {
+                #[cfg(test)]
+                {
+                    self.landings[2] += 1;
+                }
                 walk.unset();
                 walk.seek(store, outer_root, &mut roots, &no_leaf, deleted_key)
             }

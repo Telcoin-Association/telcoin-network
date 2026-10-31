@@ -8,7 +8,7 @@ use std::{collections::BTreeMap, sync::Arc};
 use tempfile::TempDir;
 
 use super::{
-    damage::{read_page, restamped, write_page},
+    damage::{read_page, restamped, tree, write_page},
     dup::{copy_of, damaged, dup_key, restamp_record, COLD, HOT, OPTIONS},
     open, temp, Rows,
 };
@@ -20,7 +20,8 @@ use crate::{
             tests::{owned, owned_tail, Kv},
             KeyTail, State,
         },
-        test_harness::{ReportSeed, Rng},
+        test_harness::{walk_outer_tree, ReportSeed, Rng},
+        TreeRoot,
     },
     DupRoCursor, Env, Error, ReadTxn as _, Result, RoCursor, Table,
 };
@@ -29,13 +30,14 @@ use crate::{
 const K: usize = OPTIONS.key_len as usize;
 
 /// The shape of a twin pair's rows: `keys` outer keys, the first `big_keys` of them with about
-/// `big_rows` rows each (nested trees of two levels or more), the others with 1 to 5; `run_pct`
-/// percent of the values in overflow runs.
+/// `big_rows` rows each (nested trees of `nested_height` levels or more), the others with 1 to
+/// 5; `run_pct` percent of the values in overflow runs.
 struct Shape {
     keys: usize,
     big_keys: usize,
     big_rows: usize,
     run_pct: u64,
+    nested_height: u32,
 }
 
 /// A byte from a small alphabet most of the time, so neighbouring keys share leading bytes.
@@ -420,6 +422,17 @@ fn twin_moves(shape: &Shape, seeds: std::ops::Range<u64>, ops: usize) {
         let ro = Arc::new(env.begin_ro().expect("ro"));
         let stat = ro.table_stat(&d).expect("stat");
         assert!(stat.height >= 2 && stat.overflow_pages > 0, "{stat:?}");
+        let snapshot = env.inner().current();
+        let tallest = walk_outer_tree(&*snapshot, &tree(&env, "d"))
+            .entries
+            .iter()
+            .map(|(_, cell)| {
+                let root = TreeRoot::decode(cell.as_slice().try_into().expect("32 bytes"));
+                root.expect("a nested root").height
+            })
+            .max();
+        assert!(tallest >= Some(shape.nested_height), "the tallest nested tree: {tallest:?}");
+        drop(snapshot);
         let rows: Vec<Kv> = rows.into_iter().collect();
         let (mut dup, mut twin) = fresh(&ro, &d, &p);
         for step in 0..ops {
@@ -457,7 +470,7 @@ fn fresh(ro: &Arc<crate::RoTxn>, d: &Table, p: &Table) -> (DupRoCursor, RoCursor
 /// are the plain rules'.
 #[test]
 fn dup_cursor_moves_match_the_composite_twin() {
-    let shape = Shape { keys: 400, big_keys: 3, big_rows: 300, run_pct: 2 };
+    let shape = Shape { keys: 400, big_keys: 3, big_rows: 300, run_pct: 2, nested_height: 2 };
     twin_moves(&shape, 0..3, 3000);
 
     let (_dir, path) = temp("tndb_b_dup_cursor_empty");
@@ -477,6 +490,15 @@ fn dup_cursor_moves_match_the_composite_twin() {
     assert_eq!(c.state(), State::AfterEnd);
     assert_eq!(c.seek_key(&[0; K]).expect("seek_key"), None);
     assert_eq!(c.state(), State::Unset);
+}
+
+/// [`dup_cursor_moves_match_the_composite_twin`] over more seeds and calls and larger shapes:
+/// more outer keys, and nested trees of three levels.
+#[test]
+#[ignore = "heavy: run with --release"]
+fn dup_cursor_moves_match_the_composite_twin_heavy() {
+    let shape = Shape { keys: 3000, big_keys: 2, big_rows: 40_000, run_pct: 2, nested_height: 3 };
+    twin_moves(&shape, 0..16, 60_000);
 }
 
 /// A dup cursor of a plain table is refused with `TableKind`, with no latch.
