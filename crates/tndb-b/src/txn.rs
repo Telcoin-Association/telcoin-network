@@ -320,12 +320,43 @@ fn apply_delta(
     Ok(())
 }
 
+/// Where a dup put left its row, for a [`DupTxnCursor`] to land on it ([`dup_put`]).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct DupPlaced {
+    /// True if the put created its outer key (a new nested tree and its cell): the outer tree
+    /// changed.
+    created: bool,
+    /// The row's slot in the leaf its nested tree's path cache ([`Nested::cache`]) then names;
+    /// `None` when the put left that cache empty.
+    slot: Option<usize>,
+}
+
+/// What a dup delete did, for a [`DupTxnCursor`] to land on the deleted row's follower
+/// ([`dup_delete`]).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct DupRemoved {
+    /// True if the row was there (and is now gone).
+    found: bool,
+    /// True if the delete emptied the key's nested tree, so the key's outer cell went too.
+    emptied: bool,
+    /// The deleted row's old slot ([`write::Removed::slot`]): in the leaf the nested tree's path
+    /// cache names when the tree was kept, else in the leaf the table's outer path cache
+    /// ([`Working::cache`]) names, where the removed cell was; `None` when that cache is empty.
+    slot: Option<usize>,
+}
+
 /// The put, insert or append (`kind`) of the logical `key` and `value` into the dup table at `i`
 /// in [`Work::tables`]: into the key's nested tree, or a new tree and its outer cell. An append's
 /// order rule is the plain table's over the logical key: the outer key must not sort before the
 /// table's last outer key, and with that key the subkey must sort after its last subkey.
 #[inline(never)]
-fn dup_put(work: &mut Work, i: usize, key: &[u8], value: &[u8], kind: PutKind) -> Result<()> {
+fn dup_put(
+    work: &mut Work,
+    i: usize,
+    key: &[u8],
+    value: &[u8],
+    kind: PutKind,
+) -> Result<DupPlaced> {
     let key_len = dup_mut(&mut work.tables[i].record.dup).key_len;
     let (k, s) = split_dup_key(key, key_len)?;
     let (writer, w) = work.writer_and_table(i);
@@ -357,16 +388,25 @@ fn dup_put(work: &mut Work, i: usize, key: &[u8], value: &[u8], kind: PutKind) -
         if new_key { None } else { nested_entry(writer, &w.table, &outer, &mut w.nested, k)? };
     if let Some(n) = entry {
         let before = n.root;
-        write::put_cached(writer, &mut n.root, &mut n.trusted, &mut n.cache, s, value, kind)?;
+        let placed =
+            write::put_cached(writer, &mut n.root, &mut n.trusted, &mut n.cache, s, value, kind)?;
         n.changed = true;
         apply_delta(dup_mut(&mut w.record.dup), &w.table, k, &before, &n.root)?;
         work.set_dup_record(i, outer, trusted);
-        return Ok(());
+        return Ok(DupPlaced { created: false, slot: placed.slot });
     }
     // A key with no cell: its nested tree first, then the cell naming it, current from the start.
     let (mut root, mut root_trusted) = (TreeRoot::EMPTY, false);
     let mut cache = Box::<write::PathCache>::default();
-    write::put_cached(writer, &mut root, &mut root_trusted, &mut cache, s, value, PutKind::Upsert)?;
+    let placed = write::put_cached(
+        writer,
+        &mut root,
+        &mut root_trusted,
+        &mut cache,
+        s,
+        value,
+        PutKind::Upsert,
+    )?;
     let outer_kind = if kind == PutKind::Append { PutKind::Append } else { PutKind::Insert };
     match write::put_outer_cell(
         writer,
@@ -391,19 +431,23 @@ fn dup_put(work: &mut Work, i: usize, key: &[u8], value: &[u8], kind: PutKind) -
     apply_delta(dup, &w.table, k, &TreeRoot::EMPTY, &root)?;
     w.nested.insert(k.into(), Nested { root, trusted: root_trusted, changed: false, cache });
     work.set_dup_record(i, outer, trusted);
-    Ok(())
+    Ok(DupPlaced { created: true, slot: placed.slot })
 }
 
 /// The delete of the logical `key` from the dup table at `i` in [`Work::tables`]: from the key's
 /// nested tree, and the tree's outer cell with it when the delete empties the tree.
 #[inline(never)]
-fn dup_delete(work: &mut Work, i: usize, key: &[u8]) -> Result<write::Removed> {
-    let missed = write::Removed { found: false, slot: None };
+fn dup_delete(work: &mut Work, i: usize, key: &[u8]) -> Result<DupRemoved> {
+    let missed = DupRemoved { found: false, emptied: false, slot: None };
     let key_len = dup_mut(&mut work.tables[i].record.dup).key_len;
     let (k, s) = split_dup_key(key, key_len)?;
     let (writer, w) = work.writer_and_table(i);
+    // Test-only: emptied caches per delete, so every delete descends, and no slot, so a cursor
+    // finds its place again by key (as a plain table's delete under the same flag).
     #[cfg(test)]
-    if writer.no_path_cache {
+    let uncached = writer.no_path_cache;
+    #[cfg(test)]
+    if uncached {
         w.cache.forget();
         w.nested.values_mut().for_each(|n| n.cache.forget());
     }
@@ -412,9 +456,11 @@ fn dup_delete(work: &mut Work, i: usize, key: &[u8]) -> Result<write::Removed> {
         return Ok(missed);
     };
     let before = n.root;
-    if !write::delete_cached(writer, &mut n.root, &mut n.trusted, &mut n.cache, s)?.found {
+    let removed = write::delete_cached(writer, &mut n.root, &mut n.trusted, &mut n.cache, s)?;
+    if !removed.found {
         return Ok(missed);
     }
+    let mut slot = removed.slot;
     let after = n.root;
     n.changed = true;
     let dup = dup_mut(&mut w.record.dup);
@@ -425,12 +471,15 @@ fn dup_delete(work: &mut Work, i: usize, key: &[u8]) -> Result<write::Removed> {
         if !removed.found {
             return Err(no_cell(&w.table, k));
         }
+        slot = removed.slot;
         w.nested.remove(k);
         dup.nested_trees =
             dup.nested_trees.checked_sub(1).ok_or_else(|| totals_error(&w.table, k))?;
     }
     work.set_dup_record(i, outer, trusted);
-    Ok(write::Removed { found: true, slot: None })
+    #[cfg(test)]
+    let slot = slot.filter(|_| !uncached);
+    Ok(DupRemoved { found: true, emptied: after.is_empty(), slot })
 }
 
 /// The get of the logical `key` from the dup table `table` whose outer tree is `outer` in a
@@ -1809,7 +1858,7 @@ impl RwTxn {
                 if cursor.is_some() {
                     return Err(Error::TableKind(table.name().to_string()));
                 }
-                return dup_put(work, i, key, value, kind).map(|()| false);
+                return dup_put(work, i, key, value, kind).map(|_| false);
             }
             let (writer, w) = work.writer_and_table(i);
             let (mut root, mut trusted) = (w.record.root, w.trusted);
@@ -1834,6 +1883,37 @@ impl RwTxn {
         })
     }
 
+    /// [`Self::put_entry`] into the dup table `table` for a [`DupTxnCursor`]: where the row went
+    /// ([`DupPlaced`]). [`Error::TableKind`] for a plain table (no dup cursor exists on one).
+    fn dup_put_entry(
+        &mut self,
+        table: &Table,
+        key: &[u8],
+        value: &[u8],
+        kind: PutKind,
+    ) -> Result<DupPlaced> {
+        self.inner.geometry.place(key.len(), value.len())?;
+        self.write(|work| {
+            let i = work.working(table)?;
+            if work.tables[i].record.dup.is_none() {
+                return Err(Error::TableKind(table.name().to_string()));
+            }
+            dup_put(work, i, key, value, kind)
+        })
+    }
+
+    /// [`Self::delete_entry`] from the dup table `table` for a [`DupTxnCursor`]: what the delete
+    /// did ([`DupRemoved`]). [`Error::TableKind`] for a plain table.
+    fn dup_delete_entry(&mut self, table: &Table, key: &[u8]) -> Result<DupRemoved> {
+        self.write(|work| {
+            let i = work.working(table)?;
+            if work.tables[i].record.dup.is_none() {
+                return Err(Error::TableKind(table.name().to_string()));
+            }
+            dup_delete(work, i, key)
+        })
+    }
+
     /// Remove `key` from `table`, returning whether it was there. A page the delete leaves under
     /// a quarter full absorbs same-parent siblings that fit, and the parents that lose a cell get
     /// the same test, up the tree.
@@ -1852,7 +1932,8 @@ impl RwTxn {
         self.write(|work| {
             let i = work.working(table)?;
             if work.tables[i].record.dup.is_some() {
-                return dup_delete(work, i, key);
+                return dup_delete(work, i, key)
+                    .map(|r| write::Removed { found: r.found, slot: None });
             }
             let (writer, w) = work.writer_and_table(i);
             let (mut root, mut trusted) = (w.record.root, w.trusted);
@@ -1906,6 +1987,31 @@ impl RwTxn {
         })
     }
 
+    /// A new, unset cursor over the dup table `table` that holds no borrow of this transaction
+    /// (see [`DupTxnCursor`]), as [`Self::cursor_detached`]'s does over a plain table.
+    /// [`Error::TableKind`] for a plain table.
+    pub fn dup_cursor_detached(&self, table: &Table) -> Result<DupTxnCursor> {
+        self.read(|work| {
+            let record = work.record(table)?;
+            let Some(dup) = record.dup else {
+                return Err(Error::TableKind(table.name().to_string()));
+            };
+            let key_len = usize::from(dup.key_len);
+            Ok(DupTxnCursor {
+                track: Tracker::new(table.clone(), work),
+                outer_root: record.root,
+                walk: DupWalk::new(dup.key_len, self.inner.geometry.max_subkey(key_len)),
+                deleted: false,
+                deleted_key: Vec::new(),
+                target: Vec::new(),
+                #[cfg(test)]
+                reseeks: 0,
+                #[cfg(test)]
+                placements: 0,
+            })
+        })
+    }
+
     /// A new, unset cursor over `table` that holds no borrow of this transaction (see
     /// [`TxnCursor`]): each call takes the transaction, `&self` for a move and `&mut self` for a
     /// write, so several cursors and the transaction's own `put` and `delete` can interleave, each
@@ -1913,13 +2019,8 @@ impl RwTxn {
     pub fn cursor_detached(&self, table: &Table) -> Result<TxnCursor> {
         self.read(|work| {
             let root = work.plain_root(table)?;
-            let mut cursor = TxnCursor {
-                table: table.clone(),
-                serial: work.serial,
-                schema: work.schema,
-                slot: None,
-                scanned: usize::MAX,
-                writes: 0,
+            Ok(TxnCursor {
+                track: Tracker::new(table.clone(), work),
                 root,
                 tree: TreeCursor::default(),
                 key: Vec::new(),
@@ -1927,9 +2028,7 @@ impl RwTxn {
                 deleted_key: Vec::new(),
                 #[cfg(test)]
                 reseeks: 0,
-            };
-            cursor.writes = cursor.table_writes(work);
-            Ok(cursor)
+            })
         })
     }
 
@@ -2308,46 +2407,10 @@ fn save_key(saved: &mut Vec<u8>, key: &[u8]) {
     }
 }
 
-/// A cursor over one table of a write transaction that holds no borrow of it (created by
-/// [`RwTxn::cursor_detached`]): each call takes the transaction, `&RwTxn` for a move (the entry
-/// returned borrows the transaction) and `&mut RwTxn` for a write. So several cursors, over one
-/// table or several, and the transaction's own writes can interleave, each seeing the others'
-/// writes: what a caller that shares the transaction behind a lock needs (reth's `DbTxMut`, whose
-/// methods all take `&self`). Its moves, states and prefix steps are a [`Cursor`]'s, and its writes
-/// and the deleted state an [`RwCursor`]'s.
-///
-/// **Staleness.** Every call first brings the cursor up to date with the transaction:
-///
-/// - a transaction other than the one that made the cursor (a later one, even one that reuses an
-///   aborted transaction's id) is [`Error::WrongTxn`];
-/// - a dropped table (perhaps re-created since) is [`Error::StaleTable`];
-/// - if the table changed since the cursor's last call (another cursor's write, or the
-///   transaction's `put`, `append`, `insert`, `delete` or `clear_table`), the cursor takes the
-///   table's new tree and finds its entry again by key. If the key is still there the cursor stays
-///   on it (with its new value, if it changed). If not, the cursor is left as if it had deleted the
-///   entry itself ([`Self::delete_current`]), so another writer's delete reads as its own: on the
-///   first entry after the key (the follower) in the deleted state, so [`Self::next`] and
-///   [`Self::current`] return the follower, [`Self::prev`] the entry before it, a delete deletes
-///   it, and the prefix steps compare with the gone key. A cursor already in that state stays in
-///   it, on its follower, or on the first entry after the follower if that is gone too. An unset
-///   cursor, or one after the end or before the start, keeps its state over the new tree.
-///
-/// A seek ([`Self::seek`], [`Self::seek_exact`], [`Self::seek_with_key_tail`]) places the cursor
-/// anew, so on a changed table it takes the new tree and descends once from its root, without first
-/// finding its saved key again. While the table is unchanged (a table created or dropped changes
-/// none), it starts from the leaf the cursor is at.
-///
-/// The reseek is lazy: it sees the table as it is at the cursor's next call. So if, before that
-/// call, another writer deleted the cursor's entry and put it back, or put an entry between it
-/// and its follower, the cursor is on that entry, not on the follower the delete left: it finds
-/// its place at that call, not at the delete.
-///
-/// A write to another table, and the cursor's own writes, cause no reseek. Each landing on an
-/// entry keeps a copy of its key, so the cursor can find it again.
-///
-/// Errors are the transaction's (a failure latches the environment); [`Error::WrongTxn`] and
-/// [`Error::StaleTable`] change nothing and do not latch.
-pub struct TxnCursor {
+/// What a detached cursor of a write transaction ([`TxnCursor`], [`DupTxnCursor`]) checks first on
+/// every call: its transaction, its table, and the table's write stamp as of its last call, with
+/// the remembered index of the table's working record.
+struct Tracker {
     table: Table,
     /// The serial of the transaction the cursor belongs to ([`Work::serial`]).
     serial: u64,
@@ -2360,53 +2423,21 @@ pub struct TxnCursor {
     scanned: usize,
     /// The table's write stamp as of the cursor's last call ([`Working::writes`]).
     writes: u64,
-    /// The table's working tree as of the cursor's last call.
-    root: TreeRoot,
-    tree: TreeCursor,
-    /// The key of the entry the cursor is at (while `deleted`, the deleted entry's follower): the
-    /// key a reseek finds it again by.
-    key: Vec<u8>,
-    /// Set when the cursor's entry was deleted (by it or another writer): the cursor is at the
-    /// deleted entry's follower, or after the end, and the next [`Self::next`] does not move (see
-    /// the type docs).
-    deleted: bool,
-    /// The deleted entry's key while `deleted` is set, for the prefix steps (the buffer is
-    /// reused).
-    deleted_key: Vec<u8>,
-    /// Test-only: how many times the cursor found its place again after another writer's change.
-    #[cfg(test)]
-    pub(crate) reseeks: u32,
 }
 
-impl std::fmt::Debug for TxnCursor {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("TxnCursor")
-            .field("table", &self.table)
-            .field("state", &self.tree.state())
-            .field("deleted", &self.deleted)
-            .finish_non_exhaustive()
-    }
-}
-
-/// Test-only: what [`TxnCursor::position`] reports.
-#[cfg(test)]
-pub(crate) type CursorPosition = (State, Vec<(u32, u16)>, TreeRoot, Option<Vec<u8>>, bool);
-
-impl TxnCursor {
-    /// Test-only: where the cursor is, and whether it sits after a deleted entry.
-    #[cfg(test)]
-    pub(crate) fn state(&self) -> (State, bool) {
-        (self.tree.state(), self.deleted)
-    }
-
-    /// Test-only: what places the cursor, as a seek leaves it: its state and path, the tree it
-    /// reads, the key it would find its entry again by (while at one), and whether it is up to
-    /// date with `txn` (its next call makes no reseek).
-    #[cfg(test)]
-    pub(crate) fn position(&self, txn: &RwTxn) -> CursorPosition {
-        let at = self.tree.state() == State::At;
-        let key = at.then(|| self.key.clone());
-        (self.tree.state(), self.tree.path(), self.root, key, self.up_to_date(&txn.work))
+impl Tracker {
+    /// The tracker of a new cursor over `table` in `work`, up to date with it.
+    fn new(table: Table, work: &Work) -> Self {
+        let mut track = Self {
+            table,
+            serial: work.serial,
+            schema: work.schema,
+            slot: None,
+            scanned: usize::MAX,
+            writes: 0,
+        };
+        track.writes = track.table_writes(work);
+        track
     }
 
     /// The table's write stamp in `work` (0 while it has no working record), from the remembered
@@ -2469,12 +2500,104 @@ impl TxnCursor {
                 None => self.scanned == work.tables.len() && self.writes == 0,
             }
     }
+}
+
+/// A cursor over one table of a write transaction that holds no borrow of it (created by
+/// [`RwTxn::cursor_detached`]): each call takes the transaction, `&RwTxn` for a move (the entry
+/// returned borrows the transaction) and `&mut RwTxn` for a write. So several cursors, over one
+/// table or several, and the transaction's own writes can interleave, each seeing the others'
+/// writes: what a caller that shares the transaction behind a lock needs (reth's `DbTxMut`, whose
+/// methods all take `&self`). Its moves, states and prefix steps are a [`Cursor`]'s, and its writes
+/// and the deleted state an [`RwCursor`]'s.
+///
+/// **Staleness.** Every call first brings the cursor up to date with the transaction:
+///
+/// - a transaction other than the one that made the cursor (a later one, even one that reuses an
+///   aborted transaction's id) is [`Error::WrongTxn`];
+/// - a dropped table (perhaps re-created since) is [`Error::StaleTable`];
+/// - if the table changed since the cursor's last call (another cursor's write, or the
+///   transaction's `put`, `append`, `insert`, `delete` or `clear_table`), the cursor takes the
+///   table's new tree and finds its entry again by key. If the key is still there the cursor stays
+///   on it (with its new value, if it changed). If not, the cursor is left as if it had deleted the
+///   entry itself ([`Self::delete_current`]), so another writer's delete reads as its own: on the
+///   first entry after the key (the follower) in the deleted state, so [`Self::next`] and
+///   [`Self::current`] return the follower, [`Self::prev`] the entry before it, a delete deletes
+///   it, and the prefix steps compare with the gone key. A cursor already in that state stays in
+///   it, on its follower, or on the first entry after the follower if that is gone too. An unset
+///   cursor, or one after the end or before the start, keeps its state over the new tree.
+///
+/// A seek ([`Self::seek`], [`Self::seek_exact`], [`Self::seek_with_key_tail`]) places the cursor
+/// anew, so on a changed table it takes the new tree and descends once from its root, without first
+/// finding its saved key again. While the table is unchanged (a table created or dropped changes
+/// none), it starts from the leaf the cursor is at.
+///
+/// The reseek is lazy: it sees the table as it is at the cursor's next call. So if, before that
+/// call, another writer deleted the cursor's entry and put it back, or put an entry between it
+/// and its follower, the cursor is on that entry, not on the follower the delete left: it finds
+/// its place at that call, not at the delete.
+///
+/// A write to another table, and the cursor's own writes, cause no reseek. Each landing on an
+/// entry keeps a copy of its key, so the cursor can find it again.
+///
+/// Errors are the transaction's (a failure latches the environment); [`Error::WrongTxn`] and
+/// [`Error::StaleTable`] change nothing and do not latch.
+pub struct TxnCursor {
+    /// The table, and what tells whether it changed since the cursor's last call.
+    track: Tracker,
+    /// The table's working tree as of the cursor's last call.
+    root: TreeRoot,
+    tree: TreeCursor,
+    /// The key of the entry the cursor is at (while `deleted`, the deleted entry's follower): the
+    /// key a reseek finds it again by.
+    key: Vec<u8>,
+    /// Set when the cursor's entry was deleted (by it or another writer): the cursor is at the
+    /// deleted entry's follower, or after the end, and the next [`Self::next`] does not move (see
+    /// the type docs).
+    deleted: bool,
+    /// The deleted entry's key while `deleted` is set, for the prefix steps (the buffer is
+    /// reused).
+    deleted_key: Vec<u8>,
+    /// Test-only: how many times the cursor found its place again after another writer's change.
+    #[cfg(test)]
+    pub(crate) reseeks: u32,
+}
+
+impl std::fmt::Debug for TxnCursor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TxnCursor")
+            .field("table", &self.track.table)
+            .field("state", &self.tree.state())
+            .field("deleted", &self.deleted)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Test-only: what [`TxnCursor::position`] reports.
+#[cfg(test)]
+pub(crate) type CursorPosition = (State, Vec<(u32, u16)>, TreeRoot, Option<Vec<u8>>, bool);
+
+impl TxnCursor {
+    /// Test-only: where the cursor is, and whether it sits after a deleted entry.
+    #[cfg(test)]
+    pub(crate) fn state(&self) -> (State, bool) {
+        (self.tree.state(), self.deleted)
+    }
+
+    /// Test-only: what places the cursor, as a seek leaves it: its state and path, the tree it
+    /// reads, the key it would find its entry again by (while at one), and whether it is up to
+    /// date with `txn` (its next call makes no reseek).
+    #[cfg(test)]
+    pub(crate) fn position(&self, txn: &RwTxn) -> CursorPosition {
+        let at = self.tree.state() == State::At;
+        let key = at.then(|| self.key.clone());
+        (self.tree.state(), self.tree.path(), self.root, key, self.track.up_to_date(&txn.work))
+    }
 
     /// Bring the cursor up to date with `work` (see the type docs); [`Self::up_to_date`] is its
     /// fast path.
     #[inline(always)]
     fn sync(&mut self, work: &Work) -> Result<()> {
-        if self.up_to_date(work) {
+        if self.track.up_to_date(work) {
             return Ok(());
         }
         self.sync_slow(work)
@@ -2483,9 +2606,9 @@ impl TxnCursor {
     /// [`Self::sync`] for a cursor that is not up to date.
     #[inline(never)]
     fn sync_slow(&mut self, work: &Work) -> Result<()> {
-        self.check(work)?;
-        let writes = self.table_writes(work);
-        if writes != self.writes {
+        self.track.check(work)?;
+        let writes = self.track.table_writes(work);
+        if writes != self.track.writes {
             self.refresh(work, writes)?;
         }
         Ok(())
@@ -2499,11 +2622,11 @@ impl TxnCursor {
         {
             self.reseeks += 1;
         }
-        self.root = match self.slot {
+        self.root = match self.track.slot {
             Some(i) => work.tables[i].record.root,
-            None => work.record(&self.table)?.root,
+            None => work.record(&self.track.table)?.root,
         };
-        self.writes = writes;
+        self.track.writes = writes;
         let store = work.writer();
         if self.tree.state() != State::At {
             return Ok(());
@@ -2539,16 +2662,16 @@ impl TxnCursor {
     /// [`Error::StaleTable`] change nothing.
     #[inline(never)]
     fn retarget(&mut self, work: &Work) -> Result<bool> {
-        self.check(work)?;
-        let writes = self.table_writes(work);
-        if writes == self.writes {
+        self.track.check(work)?;
+        let writes = self.track.table_writes(work);
+        if writes == self.track.writes {
             return Ok(true);
         }
-        self.root = match self.slot {
+        self.root = match self.track.slot {
             Some(i) => work.tables[i].record.root,
-            None => work.record(&self.table)?.root,
+            None => work.record(&self.track.table)?.root,
         };
-        self.writes = writes;
+        self.track.writes = writes;
         Ok(false)
     }
 
@@ -2564,7 +2687,7 @@ impl TxnCursor {
     ) -> Result<T> {
         let work = &txn.work;
         let store = work.writer();
-        let holds = if self.up_to_date(work) { Ok(true) } else { self.retarget(work) };
+        let holds = if self.track.up_to_date(work) { Ok(true) } else { self.retarget(work) };
         holds
             .and_then(|holds| {
                 self.deleted = false;
@@ -2582,7 +2705,7 @@ impl TxnCursor {
         txn: &'t RwTxn,
         op: impl FnOnce(&mut Self, &'t Writer) -> Result<T>,
     ) -> Result<T> {
-        if !self.up_to_date(&txn.work) {
+        if !self.track.up_to_date(&txn.work) {
             if let Err(e) = self.sync_slow(&txn.work) {
                 txn.inner.latch.latch_error(&e);
                 return Err(e);
@@ -2790,17 +2913,17 @@ impl TxnCursor {
         value: &[u8],
         kind: PutKind,
     ) -> Result<()> {
-        self.check(&txn.work).inspect_err(|e| txn.inner.latch.latch_error(e))?;
-        let Self { table, root, tree, .. } = self;
-        let placed = txn.put_entry(table, key, value, kind, Some((tree, root)))?;
+        self.track.check(&txn.work).inspect_err(|e| txn.inner.latch.latch_error(e))?;
+        let Self { track, root, tree, .. } = self;
+        let placed = txn.put_entry(&track.table, key, value, kind, Some((tree, root)))?;
         self.deleted = false;
         save_key(&mut self.key, key);
-        self.writes = self.table_writes(&txn.work);
+        self.track.writes = self.track.table_writes(&txn.work);
         if placed {
             return Ok(());
         }
-        let Self { table, root, tree, .. } = self;
-        find_again(&txn.work, table, root, tree, key, true)
+        let Self { track, root, tree, .. } = self;
+        find_again(&txn.work, &track.table, root, tree, key, true)
             .inspect_err(|e| txn.inner.latch.latch_error(e))
     }
 
@@ -2842,24 +2965,26 @@ impl TxnCursor {
     /// deleted entry's follower (or after the end): placed from the table's path cache when the
     /// delete left it naming the entry's leaf ([`write::Removed::slot`]), else found again by key.
     fn delete_key(&mut self, txn: &mut RwTxn, key: &[u8]) -> Result<()> {
-        let removed = txn.delete_entry(&self.table, key)?;
+        let removed = txn.delete_entry(&self.track.table, key)?;
         if !removed.found {
-            let cause =
-                format!("the entry under a cursor of table {:?} is missing", self.table.name());
+            let cause = format!(
+                "the entry under a cursor of table {:?} is missing",
+                self.track.table.name()
+            );
             txn.inner.latch.fail(cause.clone());
             return Err(Error::Failed(cause));
         }
         // Also leaves `slot` on the table's working record, which the delete created if needed.
-        self.writes = self.table_writes(&txn.work);
-        let Self { table, root, tree, slot, .. } = self;
-        let found = match (removed.slot, *slot) {
+        self.track.writes = self.track.table_writes(&txn.work);
+        let Self { track, root, tree, .. } = self;
+        let found = match (removed.slot, track.slot) {
             (Some(at), Some(i)) => {
                 let w = &txn.work.tables[i];
                 *root = w.record.root;
                 let store = txn.work.writer();
                 tree.place_after_delete(store, root, w.cache.branches(), w.cache.leaf(), at)
             }
-            _ => find_again(&txn.work, table, root, tree, key, false)
+            _ => find_again(&txn.work, &track.table, root, tree, key, false)
                 .and_then(|()| tree.current(txn.work.writer())),
         }
         .map(|follower| {
@@ -2870,5 +2995,659 @@ impl TxnCursor {
         });
         self.deleted = found.is_ok();
         found.inspect_err(|e| txn.inner.latch.latch_error(e))
+    }
+}
+
+/// The root source of a [`DupTxnCursor`] ([`NestedRoots`]): the table's working map, whose root
+/// of a key is the truth while it holds the key, else the key's cell, which then holds the
+/// committed root ([`load_cell`]); never a cell the map supersedes.
+struct WorkRoots<'a> {
+    writer: &'a Writer,
+    table: &'a Table,
+    /// The table's working map; `None` while the table has none or it is empty (no lookup).
+    map: Option<&'a NestedMap>,
+}
+
+impl<'a> WorkRoots<'a> {
+    /// The root source of a cursor whose tracker `track` is up to date with `work`, so its slot
+    /// names the table's working record whenever the table has one.
+    #[inline]
+    fn new(work: &'a Work, track: &'a Tracker) -> Self {
+        let map = track
+            .slot
+            .and_then(|i| work.tables.get(i))
+            .filter(|w| w.table.id == track.table.id)
+            .map(|w| &w.nested)
+            .filter(|m| !m.is_empty());
+        // A key with an entry has no other truth: the map is never skipped while it has one.
+        debug_assert!(
+            map.is_some()
+                || work.tables.iter().all(|w| w.table.id != track.table.id || w.nested.is_empty()),
+            "dup table {}: a cursor's root source skipped the working map",
+            track.table.name()
+        );
+        Self { writer: work.writer(), table: &track.table, map }
+    }
+}
+
+impl NestedRoots for WorkRoots<'_> {
+    fn name(&self) -> &str {
+        self.table.name()
+    }
+
+    #[inline]
+    fn root(&mut self, k: &[u8], cell: &[u8; page::NESTED_CELL]) -> Result<TreeRoot> {
+        if let Some(n) = self.map.and_then(|m| m.get(k)) {
+            return Ok(n.root);
+        }
+        load_cell(self.writer, self.table, k, cell)
+    }
+}
+
+/// A write transaction's fetch of a leaf a dup cursor is at, for a move from it: the page with
+/// the per-fetch checks ([`PageRead::page`]), as a [`TxnCursor`]'s moves fetch their leaf.
+#[inline(always)]
+fn checked<'s>(writer: &'s Writer) -> impl Fn(u32) -> Result<Option<&'s [u8]>> + 's {
+    move |pgno| PageRead::page(writer, pgno).map(Some)
+}
+
+/// A cursor over one dup table of a write transaction that holds no borrow of it (created by
+/// [`RwTxn::dup_cursor_detached`]), as a [`TxnCursor`] is over a plain table: each call takes the
+/// transaction, `&RwTxn` for a move and `&mut RwTxn` for a write, so several cursors and the
+/// transaction's own writes can interleave, each seeing the others' writes.
+///
+/// It walks the table's rows as the logical keys `k ‖ s` in order, the rows of the composite twin
+/// (a plain table keyed `k ‖ s` holding the same rows), and every call gives what the same call
+/// of a [`TxnCursor`] gives on the twin, as a [`DupRoCursor`] does for a [`RoCursor`]: the same
+/// moves, states, prefix steps, writes, deleted state and staleness, with "entry" read as "row".
+/// The bounded seeks ([`Self::seek_key`], [`Self::seek_dup`], [`Self::seek_dup_with_key_tail`])
+/// and [`Self::current_with_key_tail`] are [`DupRoCursor`]'s. The key and value a call returns
+/// borrow the cursor and the transaction until the cursor's next call.
+///
+/// **Staleness.** A table change since the cursor's last call (another cursor's write, or the
+/// transaction's `put`, `append`, `insert`, `delete`, `delete_prefix` or `clear_table`, a write
+/// to one key's nested tree included) makes the cursor find its row again by its logical key, as
+/// [`TxnCursor`]'s type docs describe: back on it if it is still there, else on the first row
+/// after it in the deleted state. So a cursor whose key another writer emptied (its last row
+/// deleted, `delete_prefix` of the key, or `clear_table`) is left on the next key's first row
+/// (or after the end) in the deleted state, as the twin's cursor is after the same rows went one
+/// by one. A seek on a changed table descends from both roots without first finding its row
+/// again. A key's nested root comes from the transaction's working map while it holds the key,
+/// never from a cell the map supersedes.
+///
+/// Errors are the transaction's (a failure latches the environment; damage is
+/// [`Error::Corrupt`] and leaves the cursor unset); [`Error::WrongTxn`] and
+/// [`Error::StaleTable`] change nothing and do not latch.
+pub struct DupTxnCursor {
+    /// The table, and what tells whether it changed since the cursor's last call.
+    track: Tracker,
+    /// The table's working outer tree as of the cursor's last call.
+    outer_root: TreeRoot,
+    /// The position, with the logical key of the row it is at (while `deleted`, the deleted
+    /// row's follower): the key a reseek finds it again by.
+    walk: DupWalk,
+    /// Set when the cursor's row was deleted (by it or another writer): the cursor is at the
+    /// deleted row's follower, or after the end (see [`TxnCursor`]'s field of the same name).
+    deleted: bool,
+    /// The deleted row's logical key while `deleted` is set, for the prefix steps.
+    deleted_key: Vec<u8>,
+    /// Scratch: a reseek's target, a guarded step's saved key (the buffer is reused).
+    target: Vec<u8>,
+    /// Test-only: how many times the cursor found its place again after another writer's change.
+    #[cfg(test)]
+    pub(crate) reseeks: u32,
+    /// Test-only: how many of the cursor's own writes placed it from a nested tree's path cache.
+    #[cfg(test)]
+    pub(crate) placements: u32,
+}
+
+impl std::fmt::Debug for DupTxnCursor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DupTxnCursor")
+            .field("table", &self.track.table)
+            .field("state", &self.walk.state())
+            .field("deleted", &self.deleted)
+            .finish_non_exhaustive()
+    }
+}
+
+impl DupTxnCursor {
+    /// Test-only: where the cursor is, and whether it sits after a deleted row.
+    #[cfg(test)]
+    pub(crate) fn state(&self) -> (State, bool) {
+        (self.walk.state(), self.deleted)
+    }
+
+    /// Test-only: the deleted row's logical key while the cursor is in the deleted state.
+    #[cfg(test)]
+    pub(crate) fn deleted_key_for_test(&self) -> Option<&[u8]> {
+        self.deleted.then_some(self.deleted_key.as_slice())
+    }
+
+    /// Bring the cursor up to date with `work` (see the type docs).
+    #[inline(always)]
+    fn sync(&mut self, work: &Work) -> Result<()> {
+        if self.track.up_to_date(work) {
+            return Ok(());
+        }
+        self.sync_slow(work)
+    }
+
+    /// [`Self::sync`] for a cursor that is not up to date.
+    #[inline(never)]
+    fn sync_slow(&mut self, work: &Work) -> Result<()> {
+        self.track.check(work)?;
+        let writes = self.track.table_writes(work);
+        if writes != self.track.writes {
+            self.refresh(work, writes)?;
+        }
+        Ok(())
+    }
+
+    /// The table's working outer root in `work`, by the tracker's slot.
+    fn working_root(&self, work: &Work) -> Result<TreeRoot> {
+        match self.track.slot {
+            Some(i) => Ok(work.tables[i].record.root),
+            None => Ok(work.record(&self.track.table)?.root),
+        }
+    }
+
+    /// After a change to the table by another writer: take its new outer tree and find the row
+    /// again by its logical key from both roots (the paths may be stale at both levels), as
+    /// [`TxnCursor`]'s refresh does. An error leaves the cursor unset.
+    #[inline(never)]
+    fn refresh(&mut self, work: &Work, writes: u64) -> Result<()> {
+        #[cfg(test)]
+        {
+            self.reseeks += 1;
+        }
+        self.outer_root = self.working_root(work)?;
+        self.track.writes = writes;
+        if self.walk.state() != State::At {
+            return Ok(());
+        }
+        let Self { track, outer_root, walk, deleted, deleted_key, target, .. } = self;
+        target.clear();
+        target.extend_from_slice(walk.key());
+        walk.unset();
+        let mut roots = WorkRoots::new(work, track);
+        let found = match walk.seek(work.writer(), outer_root, &mut roots, &no_leaf, target) {
+            Ok(Some(_)) if walk.key() == target.as_slice() => Ok(()),
+            Ok(_) => {
+                // Gone: on the first row after it, as if its own delete had moved it there.
+                if !*deleted {
+                    *deleted = true;
+                    std::mem::swap(target, deleted_key);
+                }
+                Ok(())
+            }
+            Err(e) => Err(e),
+        };
+        if found.is_err() {
+            *deleted = false;
+        }
+        found
+    }
+
+    /// For a seek: [`Self::sync_slow`]'s checks, then the table's new outer tree if it changed,
+    /// without finding the row again. Returns whether the cursor's paths are still its trees'.
+    #[inline(never)]
+    fn retarget(&mut self, work: &Work) -> Result<bool> {
+        self.track.check(work)?;
+        let writes = self.track.table_writes(work);
+        if writes == self.track.writes {
+            return Ok(true);
+        }
+        self.outer_root = self.working_root(work)?;
+        self.track.writes = writes;
+        Ok(false)
+    }
+
+    /// Run a seek: bring the cursor up to date as [`Self::retarget`] does, leave the deleted
+    /// state, forget the paths if they are no longer the trees' (the seek then descends from both
+    /// roots), then `op`. A failure latches the environment if it is one that latches.
+    #[inline(always)]
+    fn seek_call<'t, T>(
+        &mut self,
+        txn: &'t RwTxn,
+        op: impl FnOnce(&mut Self, &'t Work) -> Result<T>,
+    ) -> Result<T> {
+        let work = &txn.work;
+        let holds = if self.track.up_to_date(work) { Ok(true) } else { self.retarget(work) };
+        holds
+            .and_then(|holds| {
+                self.deleted = false;
+                if !holds {
+                    self.walk.unset();
+                }
+                op(self, work)
+            })
+            .inspect_err(|e| txn.inner.latch.latch_error(e))
+    }
+
+    /// Run a call: bring the cursor up to date with `txn`, then `op`. A failure latches the
+    /// environment if it is one that latches.
+    #[inline(always)]
+    fn call<'t, T>(
+        &mut self,
+        txn: &'t RwTxn,
+        op: impl FnOnce(&mut Self, &'t Work) -> Result<T>,
+    ) -> Result<T> {
+        let work = &txn.work;
+        if !self.track.up_to_date(work) {
+            if let Err(e) = self.sync_slow(work) {
+                txn.inner.latch.latch_error(&e);
+                return Err(e);
+            }
+        }
+        op(self, work).inspect_err(|e| txn.inner.latch.latch_error(e))
+    }
+
+    /// Run walker move `op` over `work` with the cursor's outer root and root source.
+    #[inline(always)]
+    fn walk_op<'w>(
+        &mut self,
+        work: &'w Work,
+        op: impl FnOnce(&mut DupWalk, &'w Writer, &TreeRoot, &mut WorkRoots<'_>) -> Walked<'w>,
+    ) -> Walked<'w> {
+        let Self { track, outer_root, walk, .. } = self;
+        let mut roots = WorkRoots::new(work, track);
+        op(walk, work.writer(), outer_root, &mut roots)
+    }
+
+    /// Pair the value a move returned with the logical key of the row it landed on.
+    #[inline(always)]
+    fn row<'c>(&'c self, value: Option<&'c [u8]>) -> Option<(&'c [u8], &'c [u8])> {
+        value.map(|v| (self.walk.key(), v))
+    }
+
+    /// Run a plain move (it leaves the deleted state).
+    #[inline]
+    fn moved<'c>(
+        &'c mut self,
+        txn: &'c RwTxn,
+        op: impl FnOnce(&mut DupWalk, &'c Writer, &TreeRoot, &mut WorkRoots<'_>) -> Walked<'c>,
+    ) -> Result<Option<(&'c [u8], &'c [u8])>> {
+        let value = self.call(txn, |c, work| {
+            c.deleted = false;
+            c.walk_op(work, op)
+        })?;
+        Ok(self.row(value))
+    }
+
+    /// Move to the first row and return it (`None` for an empty table).
+    pub fn first<'c>(&'c mut self, txn: &'c RwTxn) -> Result<Option<(&'c [u8], &'c [u8])>> {
+        self.moved(txn, |w, store, root, roots| w.start(store, root, roots, true))
+    }
+
+    /// Move to the last row and return it (`None` for an empty table); see [`TxnCursor::last`].
+    pub fn last<'c>(&'c mut self, txn: &'c RwTxn) -> Result<Option<(&'c [u8], &'c [u8])>> {
+        self.moved(txn, |w, store, root, roots| w.start(store, root, roots, false))
+    }
+
+    /// Move to the next row and return it (after the cursor's row was deleted, by this cursor or
+    /// another writer: the first row after the deleted key); see [`TxnCursor::next`].
+    // A cursor's moves are fallible and go both ways: it is not an `Iterator`.
+    #[allow(clippy::should_implement_trait)]
+    pub fn next<'c>(&'c mut self, txn: &'c RwTxn) -> Result<Option<(&'c [u8], &'c [u8])>> {
+        let value = self.call(txn, |c, work| {
+            if std::mem::take(&mut c.deleted) {
+                let store = work.writer();
+                return c.walk.current(store, &checked(store));
+            }
+            c.walk_op(work, |w, store, root, roots| {
+                w.step(store, root, roots, &checked(store), true)
+            })
+        })?;
+        Ok(self.row(value))
+    }
+
+    /// Move to the previous row and return it (after the cursor's row was deleted: the row before
+    /// the deleted row's follower); see [`TxnCursor::prev`].
+    pub fn prev<'c>(&'c mut self, txn: &'c RwTxn) -> Result<Option<(&'c [u8], &'c [u8])>> {
+        self.moved(txn, |w, store, root, roots| w.step(store, root, roots, &checked(store), false))
+    }
+
+    /// The row the cursor is at, if it is at one (after its row was deleted: the follower); see
+    /// [`TxnCursor::current`].
+    pub fn current<'c>(&'c mut self, txn: &'c RwTxn) -> Result<Option<(&'c [u8], &'c [u8])>> {
+        let value = self.call(txn, |c, work| {
+            c.deleted = false;
+            let store = work.writer();
+            c.walk.current(store, &checked(store))
+        })?;
+        Ok(self.row(value))
+    }
+
+    /// [`Self::current`] with the value and the logical key's last `t` bytes ([`KeyTail`]), as
+    /// [`DupRoCursor::current_with_key_tail`] gives them.
+    pub fn current_with_key_tail<'c>(
+        &'c mut self,
+        txn: &'c RwTxn,
+        t: usize,
+    ) -> Result<Option<(&'c [u8], KeyTail<'c>)>> {
+        let tail = self.call(txn, |c, work| {
+            c.deleted = false;
+            let store = work.writer();
+            c.walk.current_with_key_tail(store, &checked(store), t)
+        })?;
+        Ok(tail.map(|tail| (self.walk.key(), tail)))
+    }
+
+    /// Move to the first row whose logical key is `>= key` (of any length) and return it; `None`
+    /// (the cursor after the end) if there is none. While the table is unchanged since the
+    /// cursor's last call, the seek starts from the leaves the cursor is at, as
+    /// [`DupRoCursor::seek`]'s does; after a change it descends from both roots.
+    pub fn seek<'c>(
+        &'c mut self,
+        txn: &'c RwTxn,
+        key: &[u8],
+    ) -> Result<Option<(&'c [u8], &'c [u8])>> {
+        let value = self.seek_call(txn, |c, work| {
+            c.walk_op(work, |w, store, root, roots| {
+                w.seek(store, root, roots, &checked(store), key)
+            })
+        })?;
+        Ok(self.row(value))
+    }
+
+    /// [`Self::seek`] followed by [`Self::current_with_key_tail`]; `None` (the cursor after the
+    /// end) if there is no row `>= key`.
+    pub fn seek_with_key_tail<'c>(
+        &'c mut self,
+        txn: &'c RwTxn,
+        key: &[u8],
+        t: usize,
+    ) -> Result<Option<(&'c [u8], KeyTail<'c>)>> {
+        let tail = self.seek_call(txn, |c, work| {
+            let store = work.writer();
+            let found = c.walk_op(work, |w, store, root, roots| {
+                w.seek(store, root, roots, &checked(store), key)
+            })?;
+            if found.is_none() {
+                return Ok(None);
+            }
+            c.walk.current_with_key_tail(store, &checked(store), t)
+        })?;
+        Ok(tail.map(|tail| (self.walk.key(), tail)))
+    }
+
+    /// Move to the row `key` and return its value; `None` (the cursor unset) if there is none. A
+    /// key of at most the key width is no row's. The seek starts as [`Self::seek`]'s does.
+    pub fn seek_exact<'c>(&'c mut self, txn: &'c RwTxn, key: &[u8]) -> Result<Option<&'c [u8]>> {
+        self.seek_call(txn, |c, work| {
+            c.walk_op(work, |w, store, root, roots| {
+                w.seek_exact(store, root, roots, &checked(store), key)
+            })
+        })
+    }
+
+    /// Move to the first row of the outer key `k` and return it; `None` (the cursor unset) if `k`
+    /// has none; see [`DupRoCursor::seek_key`]. A `k` of another length than the key width is
+    /// [`Error::KeyTooShort`] or [`Error::KeyTooLarge`], changing nothing.
+    pub fn seek_key<'c>(
+        &'c mut self,
+        txn: &'c RwTxn,
+        k: &[u8],
+    ) -> Result<Option<(&'c [u8], &'c [u8])>> {
+        self.seek_dup(txn, k, &[])
+    }
+
+    /// Move to the first row `k ‖ s'` of the outer key `k` with `s' >= s` and return it; `None`
+    /// (the cursor unset) if `k` has none, never a row of the next key; see
+    /// [`DupRoCursor::seek_dup`] and [`Self::seek_key`]'s refusals.
+    pub fn seek_dup<'c>(
+        &'c mut self,
+        txn: &'c RwTxn,
+        k: &[u8],
+        s: &[u8],
+    ) -> Result<Option<(&'c [u8], &'c [u8])>> {
+        self.walk.check_key(k)?;
+        let value = self.seek_call(txn, |c, work| {
+            c.walk_op(work, |w, store, root, roots| {
+                w.seek_dup(store, root, roots, &checked(store), k, s)
+            })
+        })?;
+        Ok(self.row(value))
+    }
+
+    /// [`Self::seek_dup`] followed by [`Self::current_with_key_tail`]; `None` (the cursor unset)
+    /// if `k` has no such row.
+    pub fn seek_dup_with_key_tail<'c>(
+        &'c mut self,
+        txn: &'c RwTxn,
+        k: &[u8],
+        s: &[u8],
+        t: usize,
+    ) -> Result<Option<(&'c [u8], KeyTail<'c>)>> {
+        self.walk.check_key(k)?;
+        let tail = self.seek_call(txn, |c, work| {
+            let store = work.writer();
+            let found = c.walk_op(work, |w, store, root, roots| {
+                w.seek_dup(store, root, roots, &checked(store), k, s)
+            })?;
+            if found.is_none() {
+                return Ok(None);
+            }
+            c.walk.current_with_key_tail(store, &checked(store), t)
+        })?;
+        Ok(tail.map(|tail| (self.walk.key(), tail)))
+    }
+
+    /// Move to the next row only if its logical key shares the first `n` bytes of the current
+    /// row's, and return it; else return `None` and stay. The rules are
+    /// [`TxnCursor::next_in_prefix`]'s on logical keys (after a delete: the deleted key's prefix).
+    pub fn next_in_prefix<'c>(
+        &'c mut self,
+        txn: &'c RwTxn,
+        n: usize,
+    ) -> Result<Option<(&'c [u8], &'c [u8])>> {
+        self.step_in_prefix(txn, n, true)
+    }
+
+    /// Move to the previous row only if its logical key shares the first `n` bytes of the current
+    /// row's, and return it; else return `None` and stay. The rules are
+    /// [`TxnCursor::prev_in_prefix`]'s on logical keys (after a delete: the deleted key's prefix,
+    /// so after a key's last row went the step reaches the key's new last row).
+    pub fn prev_in_prefix<'c>(
+        &'c mut self,
+        txn: &'c RwTxn,
+        n: usize,
+    ) -> Result<Option<(&'c [u8], &'c [u8])>> {
+        self.step_in_prefix(txn, n, false)
+    }
+
+    /// [`Self::next_in_prefix`] (`forward`) or [`Self::prev_in_prefix`].
+    fn step_in_prefix<'c>(
+        &'c mut self,
+        txn: &'c RwTxn,
+        n: usize,
+        forward: bool,
+    ) -> Result<Option<(&'c [u8], &'c [u8])>> {
+        let value = self.call(txn, |c, work| {
+            let Self { track, outer_root, walk, deleted, deleted_key, target, .. } = c;
+            let store = work.writer();
+            let again = checked(store);
+            let mut roots = WorkRoots::new(work, track);
+            if !*deleted {
+                return walk.step_in_prefix(store, outer_root, &mut roots, &again, n, forward);
+            }
+            let Some(prefix) = deleted_key.get(..n) else { return Ok(None) };
+            // The position is the deleted row's follower (or after the end).
+            let landed = if forward {
+                walk.current(store, &again).map(|v| v.filter(|_| walk.key().starts_with(prefix)))
+            } else {
+                walk.step_if(store, outer_root, &mut roots, &again, prefix, false, target)
+            };
+            if matches!(landed, Ok(Some(_)) | Err(_)) {
+                *deleted = false;
+            }
+            landed
+        })?;
+        Ok(self.row(value))
+    }
+
+    /// Store `value` under the logical `key` (as [`RwTxn::put`] does) and move to that row. A
+    /// refused row ([`Error::KeyTooShort`], [`Error::KeyTooLarge`], [`Error::ValueTooLarge`])
+    /// changes nothing, the cursor included.
+    pub fn put(&mut self, txn: &mut RwTxn, key: &[u8], value: &[u8]) -> Result<()> {
+        self.put_entry(txn, key, value, PutKind::Upsert)
+    }
+
+    /// Store `value` under the logical `key` as the table's new last row (as [`RwTxn::append`]
+    /// does) and move to that row. A refused append ([`Error::AppendOutOfOrder`] and
+    /// [`Self::put`]'s refusals) changes nothing, the cursor included.
+    pub fn append(&mut self, txn: &mut RwTxn, key: &[u8], value: &[u8]) -> Result<()> {
+        self.put_entry(txn, key, value, PutKind::Append)
+    }
+
+    /// Store `value` under the logical `key` only if the table does not hold it (as
+    /// [`RwTxn::insert`] does) and move to that row. A refused insert ([`Error::KeyExists`] and
+    /// [`Self::put`]'s refusals) changes nothing, the cursor included.
+    pub fn insert(&mut self, txn: &mut RwTxn, key: &[u8], value: &[u8]) -> Result<()> {
+        self.put_entry(txn, key, value, PutKind::Insert)
+    }
+
+    /// [`Self::put`], [`Self::append`] or [`Self::insert`] (`kind`): the transaction and table
+    /// checked, but no reseek, since the write places the cursor anew. A write into the key of
+    /// the row the cursor was at, up to date, that created no key changed only that key's nested
+    /// tree: the outer path stays and the nested path is placed from the tree's path cache. Any
+    /// other write finds the row again from both roots. The table's new write stamp is the
+    /// cursor's own, so its write causes it no reseek.
+    fn put_entry(
+        &mut self,
+        txn: &mut RwTxn,
+        key: &[u8],
+        value: &[u8],
+        kind: PutKind,
+    ) -> Result<()> {
+        self.track.check(&txn.work).inspect_err(|e| txn.inner.latch.latch_error(e))?;
+        let was_current = self.track.up_to_date(&txn.work);
+        let placed = txn.dup_put_entry(&self.track.table, key, value, kind)?;
+        self.deleted = false;
+        self.track.writes = self.track.table_writes(&txn.work);
+        let work = &txn.work;
+        // The put took the key: it is longer than the key width.
+        let (k, s) = key.split_at(self.walk.kl());
+        let in_key = was_current
+            && !placed.created
+            && self.walk.state() == State::At
+            && self.walk.key().starts_with(k);
+        let cached = self.track.slot.and_then(|i| work.tables[i].nested.get(k)).zip(placed.slot);
+        let found = match cached {
+            Some((n, slot)) if in_key => {
+                #[cfg(test)]
+                {
+                    self.placements += 1;
+                }
+                self.walk.place_in_key(n.root, n.cache.branches(), n.cache.leaf(), slot, s)
+            }
+            _ => self.find_put(work, key),
+        };
+        found.inspect_err(|e| txn.inner.latch.latch_error(e))
+    }
+
+    /// After the cursor's own put of the row `key`: take the table's working outer tree and find
+    /// the row from both roots; it must be there.
+    fn find_put(&mut self, work: &Work, key: &[u8]) -> Result<()> {
+        self.outer_root = self.working_root(work)?;
+        let Self { track, outer_root, walk, .. } = self;
+        walk.unset();
+        let mut roots = WorkRoots::new(work, track);
+        if walk.seek_exact(work.writer(), outer_root, &mut roots, &no_leaf, key)?.is_none() {
+            return Err(Error::Failed(format!(
+                "the row just put in dup table {:?} is missing",
+                track.table.name()
+            )));
+        }
+        Ok(())
+    }
+
+    /// Remove the row the cursor is at and return `true`: after its row was deleted (by it or
+    /// another writer), the follower. `false` (nothing changes) if the cursor is not at a row. The
+    /// cursor is left on the deleted row's follower (the next row of its key, else the next key's
+    /// first row, else after the end) in the deleted state, as [`TxnCursor::delete_current`]
+    /// leaves it on the twin.
+    pub fn delete_current(&mut self, txn: &mut RwTxn) -> Result<bool> {
+        self.sync(&txn.work).inspect_err(|e| txn.inner.latch.latch_error(e))?;
+        if self.walk.state() != State::At {
+            return Ok(false);
+        }
+        // The row the cursor is at (while `deleted`, the follower) becomes the deleted row.
+        self.deleted_key.clear();
+        self.deleted_key.extend_from_slice(self.walk.key());
+        let removed = match txn.dup_delete_entry(&self.track.table, &self.deleted_key) {
+            Ok(removed) if removed.found => removed,
+            Ok(_) => {
+                let cause = format!(
+                    "the row under a cursor of dup table {:?} is missing",
+                    self.track.table.name()
+                );
+                txn.inner.latch.fail(cause.clone());
+                self.walk.unset();
+                self.deleted = false;
+                return Err(Error::Failed(cause));
+            }
+            Err(e) => {
+                self.walk.unset();
+                self.deleted = false;
+                return Err(e);
+            }
+        };
+        // Also leaves `slot` on the table's working record, which the delete created if needed.
+        self.track.writes = self.track.table_writes(&txn.work);
+        let landed = self.land_after_delete(&txn.work, removed);
+        self.deleted = landed.is_ok();
+        landed.map(|()| true).inspect_err(|e| txn.inner.latch.latch_error(e))
+    }
+
+    /// Land on the follower of the row `deleted_key` the cursor just deleted: from the nested
+    /// tree's path cache when the delete kept the key's tree and left the cache naming the row's
+    /// leaf, from the outer path cache when the delete emptied the key and left that cache naming
+    /// the cell's leaf, else found again from both roots ([`DupRemoved`]).
+    fn land_after_delete(&mut self, work: &Work, removed: DupRemoved) -> Result<()> {
+        self.outer_root = self.working_root(work)?;
+        let Self { track, outer_root, walk, deleted_key, .. } = self;
+        let w = track.slot.map(|i| &work.tables[i]);
+        let store = work.writer();
+        let mut roots = WorkRoots::new(work, track);
+        let k = &deleted_key[..walk.kl()];
+        let landed = match (w, removed.slot) {
+            (Some(w), Some(at)) if removed.emptied => {
+                let path = (w.cache.branches(), w.cache.leaf(), at);
+                walk.place_after_outer_delete(store, outer_root, &mut roots, path)
+            }
+            (Some(w), Some(at)) if w.nested.contains_key(k) => {
+                let n = &w.nested[k];
+                #[cfg(test)]
+                {
+                    self.placements += 1;
+                }
+                let path = (n.cache.branches(), n.cache.leaf(), at);
+                walk.place_after_nested_delete(
+                    store,
+                    outer_root,
+                    &mut roots,
+                    &checked(store),
+                    n.root,
+                    path,
+                )
+            }
+            _ => {
+                walk.unset();
+                walk.seek(store, outer_root, &mut roots, &no_leaf, deleted_key)
+            }
+        };
+        landed.map(drop)
+    }
+
+    /// Whether the deleted row's follower shares the deleted key's first `n` bytes; see
+    /// [`TxnCursor::follower_shares_prefix`], on logical keys. Up to date, it reads no page.
+    #[inline]
+    pub fn follower_shares_prefix(&mut self, txn: &RwTxn, n: usize) -> Result<bool> {
+        self.call(txn, |c, _| {
+            let on_follower = c.deleted && c.walk.state() == State::At;
+            Ok(on_follower && c.deleted_key.get(..n).is_some_and(|p| c.walk.key().starts_with(p)))
+        })
     }
 }

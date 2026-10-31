@@ -106,8 +106,22 @@ impl DupWalk {
 
     /// The key width `K`.
     #[inline]
-    fn kl(&self) -> usize {
+    pub(crate) fn kl(&self) -> usize {
         usize::from(self.key_len)
+    }
+
+    /// `k` has the key width, else [`Error::KeyTooShort`] or [`Error::KeyTooLarge`]: a bounded
+    /// seek's refusal, made before anything moves.
+    #[inline]
+    pub(crate) fn check_key(&self, k: &[u8]) -> Result<()> {
+        let kl = self.kl();
+        if k.len() < kl {
+            return Err(Error::KeyTooShort { len: k.len(), min: kl });
+        }
+        if k.len() > kl {
+            return Err(Error::KeyTooLarge { len: k.len(), max: kl });
+        }
+        Ok(())
     }
 
     /// Where the walker is.
@@ -137,7 +151,7 @@ impl DupWalk {
 
     /// Forget both paths.
     #[inline]
-    fn unset(&mut self) {
+    pub(crate) fn unset(&mut self) {
         self.outer.unset();
         self.inner.unset();
     }
@@ -396,13 +410,7 @@ impl DupWalk {
         k: &[u8],
         s: &[u8],
     ) -> Result<Option<&'s [u8]>> {
-        let kl = self.kl();
-        if k.len() < kl {
-            return Err(Error::KeyTooShort { len: k.len(), min: kl });
-        }
-        if k.len() > kl {
-            return Err(Error::KeyTooLarge { len: k.len(), max: kl });
-        }
+        self.check_key(k)?;
         self.bounded(store, outer_root, roots, again, k, |w, store, leaf| {
             let landed = if s.is_empty() {
                 w.inner.first(store, &w.nested)?
@@ -504,6 +512,99 @@ impl DupWalk {
                 }
                 None => Ok(None),
             }
+        })
+    }
+
+    /// Move to the next (`forward`) or previous row, as [`Self::step`] does, only if its logical
+    /// key starts with `prefix`; else `None`, the walker unmoved. `spare` holds the logical key
+    /// meanwhile (a buffer the caller reuses). An error leaves both paths unset.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn step_if<'s, S: PageRead + ?Sized, N: NestedRoots>(
+        &mut self,
+        store: &'s S,
+        outer_root: &TreeRoot,
+        roots: &mut N,
+        again: &impl Fn(u32) -> Result<Option<&'s [u8]>>,
+        prefix: &[u8],
+        forward: bool,
+        spare: &mut Vec<u8>,
+    ) -> Result<Option<&'s [u8]>> {
+        let (outer, inner, nested) = (self.outer.clone(), self.inner.clone(), self.nested);
+        spare.clear();
+        spare.extend_from_slice(&self.key);
+        match self.step(store, outer_root, roots, again, forward)? {
+            Some(v) if self.key.starts_with(prefix) => Ok(Some(v)),
+            _ => {
+                (self.outer, self.inner, self.nested) = (outer, inner, nested);
+                std::mem::swap(&mut self.key, spare);
+                Ok(None)
+            }
+        }
+    }
+
+    /// Place the walker on the row `s` its writer just put into the current outer key's nested
+    /// tree, now `nested`, at entry `slot` of `leaf` below `branches` (as [`TreeCursor::place`]
+    /// takes them), reading no page. The outer path stays: the caller's put changed only that
+    /// nested tree, and the walker was at a row of its key on the outer tree as it still is.
+    pub(crate) fn place_in_key(
+        &mut self,
+        nested: TreeRoot,
+        branches: &[(u32, usize)],
+        leaf: u32,
+        slot: usize,
+        s: &[u8],
+    ) -> Result<()> {
+        self.guarded(|w| {
+            w.nested = nested;
+            w.inner.place(branches, leaf, slot);
+            w.set_sub(s)
+        })
+    }
+
+    /// Land on the follower of the row its writer just deleted from the current outer key's
+    /// nested tree, which the delete kept, now `nested`, with the follower's slot `slot` in
+    /// `leaf` below `branches` ([`TreeCursor::place_after_delete`]), and return its value: that
+    /// tree's next row, else the next key's first row, else after the end. The outer path must
+    /// still be a path of the outer tree `outer_root` (a nested-only delete leaves it so).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn place_after_nested_delete<'s, S: PageRead + ?Sized, N: NestedRoots>(
+        &mut self,
+        store: &'s S,
+        outer_root: &TreeRoot,
+        roots: &mut N,
+        again: &impl Fn(u32) -> Result<Option<&'s [u8]>>,
+        nested: TreeRoot,
+        (branches, leaf, slot): (&[(u32, usize)], u32, usize),
+    ) -> Result<Option<&'s [u8]>> {
+        self.guarded(|w| {
+            w.nested = nested;
+            match w.inner.place_after_delete(store, &w.nested, branches, leaf, slot)? {
+                Some((s, v)) => {
+                    w.set_sub(s)?;
+                    Ok(Some(v))
+                }
+                None => w.cross_key(store, outer_root, roots, again, true),
+            }
+        })
+    }
+
+    /// Land on the follower of an outer key whose cell its writer just removed from the outer
+    /// tree `outer_root` (the key's last row deleted), with the follower's slot `slot` in `leaf`
+    /// below `branches` (the outer tree's path cache), and return its value: the next key's first
+    /// row, else after the end.
+    pub(crate) fn place_after_outer_delete<'s, S: PageRead + ?Sized, N: NestedRoots>(
+        &mut self,
+        store: &'s S,
+        outer_root: &TreeRoot,
+        roots: &mut N,
+        (branches, leaf, slot): (&[(u32, usize)], u32, usize),
+    ) -> Result<Option<&'s [u8]>> {
+        self.guarded(|w| {
+            w.inner.unset();
+            let landed = w
+                .outer
+                .place_after_delete_in::<Cells, S>(store, outer_root, branches, leaf, slot)?;
+            w.settle(store, roots, landed, true)
         })
     }
 

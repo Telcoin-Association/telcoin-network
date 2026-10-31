@@ -1859,6 +1859,13 @@ fn tree_cursor_stays_small() {
     );
 }
 
+/// A write transaction's detached cursor keeps the size it had before its staleness fields moved
+/// into the shared tracker (in a test build, which adds its reseek counter).
+#[test]
+fn txn_cursor_size_unchanged() {
+    assert_eq!(size_of::<crate::TxnCursor>(), 464, "TxnCursor size");
+}
+
 // ---- seeks from the cursor's position ----
 
 /// The root descents so far on this thread ([`ROOT_DESCENTS`]); zero in a release test build,

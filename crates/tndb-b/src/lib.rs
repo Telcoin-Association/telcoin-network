@@ -57,5 +57,6 @@ pub use error::{Error, Result};
 pub use stats::IoStats;
 pub use tree::cursor::{Cursor, KeyTail};
 pub use txn::{
-    DupRoCursor, ReadTxn, RoCursor, RoTxn, RwCursor, RwTxn, Table, TableStat, TxnCursor,
+    DupRoCursor, DupTxnCursor, ReadTxn, RoCursor, RoTxn, RwCursor, RwTxn, Table, TableStat,
+    TxnCursor,
 };
