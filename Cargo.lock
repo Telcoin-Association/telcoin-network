@@ -629,22 +629,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "alloy-rpc-types-beacon"
-version = "1.8.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f526dbd7bb039327cfd0ccf18c8a29ffd7402616b0c7a0239512bf8417d544c7"
-dependencies = [
- "alloy-eips",
- "alloy-primitives",
- "alloy-rpc-types-engine",
- "derive_more",
- "serde",
- "serde_json",
- "serde_with 3.18.0",
- "thiserror 2.0.18",
-]
-
-[[package]]
 name = "alloy-rpc-types-debug"
 version = "1.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5366,7 +5350,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "224399e74b87b5f3557511d98dff8b14089b3dadafcab6bb93eab67d3aace965"
 dependencies = [
  "scopeguard",
- "serde",
 ]
 
 [[package]]
@@ -7210,7 +7193,6 @@ dependencies = [
  "metrics",
  "parking_lot",
  "pin-project",
- "rand 0.9.2",
  "rayon",
  "reth-chainspec",
  "reth-errors",
@@ -7221,8 +7203,6 @@ dependencies = [
  "reth-storage-api",
  "reth-trie",
  "revm-database",
- "revm-state",
- "serde",
  "tokio",
  "tokio-stream",
  "tracing",
@@ -7940,12 +7920,10 @@ dependencies = [
  "alloy-rlp",
  "alloy-rpc-client",
  "alloy-rpc-types",
- "alloy-rpc-types-admin",
  "alloy-rpc-types-debug",
  "alloy-rpc-types-eth",
  "alloy-rpc-types-mev",
  "alloy-rpc-types-trace",
- "alloy-rpc-types-txpool",
  "alloy-signer",
  "alloy-signer-local",
  "async-trait",
@@ -7965,8 +7943,6 @@ dependencies = [
  "reth-evm",
  "reth-evm-ethereum",
  "reth-network-api",
- "reth-network-peers",
- "reth-network-types",
  "reth-primitives-traits",
  "reth-revm",
  "reth-rpc-api",
@@ -7980,7 +7956,6 @@ dependencies = [
  "reth-trie-common",
  "revm",
  "revm-inspectors",
- "revm-primitives",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
@@ -7999,20 +7974,11 @@ dependencies = [
  "alloy-json-rpc",
  "alloy-primitives",
  "alloy-rpc-types",
- "alloy-rpc-types-admin",
- "alloy-rpc-types-anvil",
- "alloy-rpc-types-beacon",
  "alloy-rpc-types-debug",
- "alloy-rpc-types-engine",
  "alloy-rpc-types-eth",
  "alloy-rpc-types-mev",
  "alloy-rpc-types-trace",
- "alloy-rpc-types-txpool",
- "alloy-serde",
  "jsonrpsee",
- "reth-chain-state",
- "reth-engine-primitives",
- "reth-network-peers",
  "reth-rpc-eth-api",
  "reth-trie-common",
  "serde_json",
@@ -8024,7 +7990,6 @@ version = "1.11.3"
 dependencies = [
  "alloy-network",
  "alloy-provider",
- "dyn-clone",
  "http",
  "jsonrpsee",
  "metrics",
@@ -8371,7 +8336,6 @@ dependencies = [
  "auto_impl",
  "itertools 0.14.0",
  "metrics",
- "parking_lot",
  "reth-execution-errors",
  "reth-metrics",
  "reth-primitives-traits",

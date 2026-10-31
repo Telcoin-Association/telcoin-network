@@ -74,7 +74,9 @@ reth-rpc-api = { workspace = true }
 reth-rpc-builder = { workspace = true }
 reth-rpc-eth-api = { workspace = true, features = ["js-tracer"] }
 reth-rpc-eth-types = { workspace = true, features = ["js-tracer"] }
-reth-network-peers = { workspace = true }
+# `secp256k1` provides `Enr` and `NodeRecord::from_secret_key` for the worker's network stub;
+# reth-rpc enabled it before its admin module went (vendor/reth CHANGES.md TN-0021).
+reth-network-peers = { workspace = true, features = ["secp256k1"] }
 reth-network-api = { workspace = true }
 reth-eth-wire-types = { workspace = true }
 # `enr::secp256k1::SecretKey` is the key type reth-network-api's `local_enr` names.

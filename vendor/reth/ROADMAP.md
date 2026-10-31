@@ -21,8 +21,8 @@ markers: **[done]**, **[next]**, **[later]**.
     nested workspace built with `--all-targets`.
 - Out of scope here: Phase 3 and RocksDB step B belong to the tndb-b work, which happens
   elsewhere.
-- Next reductions: Phase 4 (alloy/revm directly), Phase 5 (txpool), Phase 6b (unserved RPC
-  namespaces, code only), and the Phase 2 follow-up (a TN-owned config instead of `NodeConfig`).
+- Next reductions: Phase 4 (alloy/revm directly), Phase 5 (txpool), and the Phase 2 follow-up
+  (a TN-owned config instead of `NodeConfig`).
 
 ## Ground rules for every step
 
@@ -188,14 +188,16 @@ loop and disables EIP-4844 and EIP-7702. With the code vendored, candidates are:
 store and the 4844 paths, give batch building its own ordering, and simplify validation to TN's
 rules.
 
-## Phase 6: RPC surface [6a done]
+## Phase 6: RPC surface [done]
 
 6a done 2026-10-30 (CHANGES.md TN-0010, TN-0011): the engine-API auth server, `EngineEthApi`,
 `ValidationApi` and `TestingApi` are gone, and with them `reth-rpc-engine-api`,
 `reth-payload-builder` and `reth-consensus-common`. `reth-rpc-layer` stays: the main server uses
-its `CompressionLayer` and optional JWT layer. Still open (6b): the unserved namespaces that cost
-no crates (`admin`, `miner`, `otterscan`, `reth`, `txpool`). Removing them is code reduction
-only. Weigh it against upstream-sync friction.
+its `CompressionLayer` and optional JWT layer. 6b done 2026-10-31 (TN-0021): `admin`, `miner`,
+`otterscan`, `reth` and `txpool` are removed, together with the unused anvil, hardhat, engine,
+testing and validation traits. An upstream change to a deleted file merges as "left deleted";
+only rpc-builder's registry arms and the two `lib.rs` files can conflict. `mev` stays: TN's
+epoch-fee adapter serves `eth_callBundle` through `EthBundle`.
 
 TN serves only `eth`, `net`, `web3`, `debug`, `trace` and `rpc` (`ALLOWED_MODULES` in
 `tn-reth/src/cli.rs`) plus its own `tn` namespace, and overrides seven methods. The vendored

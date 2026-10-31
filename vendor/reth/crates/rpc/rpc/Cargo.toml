@@ -20,22 +20,21 @@ reth-rpc-eth-api.workspace = true
 reth-engine-primitives.workspace = true
 reth-errors.workspace = true
 reth-storage-api.workspace = true
-# TN(TN-0007): `serde` is needed by `reth_subscribeChainStateChanges` (src/reth.rs); upstream gets it
-# only through feature unification with reth-network.
-reth-chain-state = { workspace = true, features = ["serde"] }
+reth-chain-state.workspace = true
 reth-transaction-pool.workspace = true
 reth-network-api.workspace = true
 reth-revm = { workspace = true, features = ["witness"] }
 reth-tasks = { workspace = true, features = ["rayon"] }
 reth-rpc-convert.workspace = true
 revm-inspectors.workspace = true
-reth-network-peers = { workspace = true, features = ["secp256k1"] }
 reth-evm.workspace = true
 reth-evm-ethereum.workspace = true
 reth-rpc-eth-types.workspace = true
 reth-rpc-server-types.workspace = true
-reth-network-types.workspace = true
 reth-trie-common.workspace = true
+# TN(TN-0021): reth-network-peers, reth-network-types and alloy-rpc-types-txpool served only the
+# removed admin/otterscan/reth/txpool modules; revm-primitives and alloy-rpc-types-admin moved to
+# dev-dependencies.
 
 # ethereum
 alloy-eip7928.workspace = true
@@ -55,10 +54,7 @@ alloy-rpc-types-eth = { workspace = true, features = ["serde"] }
 alloy-rpc-types-debug.workspace = true
 alloy-rpc-types-trace.workspace = true
 alloy-rpc-types-mev.workspace = true
-alloy-rpc-types-txpool.workspace = true
-alloy-rpc-types-admin.workspace = true
 revm = { workspace = true, features = ["optional_block_gas_limit", "optional_eip3607", "optional_no_base_fee", "memory_limit"] }
-revm-primitives = { workspace = true, features = ["serde"] }
 
 # rpc
 jsonrpsee.workspace = true
@@ -84,6 +80,9 @@ itertools.workspace = true
 humantime = { workspace = true, optional = true }
 
 [dev-dependencies]
+# TN(TN-0021): now used only by unit tests.
+revm-primitives = { workspace = true, features = ["serde"] }
+alloy-rpc-types-admin.workspace = true
 reth-ethereum-primitives.workspace = true
 reth-testing-utils.workspace = true
 reth-transaction-pool = { workspace = true, features = ["test-utils"] }
