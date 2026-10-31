@@ -219,3 +219,12 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   `get_highest_transaction_by_sender`, so unauthenticated RPC calls with random addresses grew
   node memory without bound. Lookups now use a non-allocating `sender_id`. *Upstream*: n/a
   (upstream commit).
+
+- **TN-0019** — Backport upstream's RPC blocking-work limits. *Kind*: backport (security).
+  *Why*: TN runs consensus and RPC on one tokio runtime, and the execution engine
+  (`crates/engine`, `spawn_blocking_task`) and certificate validation (`spawn_blocking`) use the
+  same blocking pool as RPC. RPC methods that occupied blocking threads without taking a permit
+  from the blocking-IO semaphore, or that released it when the client disconnected, let
+  unauthenticated requests pin an unbounded number of pool threads and delay block execution.
+  Applied in upstream order, one commit each:
+  - b7a7a8a72: `eth_callMany` takes a blocking-IO permit (`rpc-eth-api/src/helpers/call.rs`).
