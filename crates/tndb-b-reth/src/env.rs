@@ -133,12 +133,23 @@ pub struct TndbArgs {
     pub map_reserve: u64,
     /// When commits become durable (default [`SyncMode::Durable`]).
     pub sync: SyncMode,
+    /// Test-only: whether the dup-sort tables whose layout is an engine dup table are stored as
+    /// one (default `true`); `false` ([`Self::composite_dup_tables`]) stores every dup-sort table
+    /// as composite keys in a plain table, so the composite path stays checked against MDBX.
+    #[cfg(test)]
+    nested_dup: bool,
 }
 
 impl Default for TndbArgs {
     fn default() -> Self {
         let engine = EnvOptions::default();
-        Self { page_size: 4096, map_reserve: engine.map_reserve, sync: SyncMode::Durable }
+        Self {
+            page_size: 4096,
+            map_reserve: engine.map_reserve,
+            sync: SyncMode::Durable,
+            #[cfg(test)]
+            nested_dup: true,
+        }
     }
 }
 
@@ -159,6 +170,24 @@ impl TndbArgs {
     pub const fn with_map_reserve(mut self, map_reserve: u64) -> Self {
         self.map_reserve = map_reserve;
         self
+    }
+
+    /// Test-only: store every dup-sort table as composite keys in a plain engine table, the
+    /// nested layouts included. A file is in one form or the other: opening it with the other is
+    /// refused (`MDBX_INCOMPATIBLE`).
+    #[cfg(test)]
+    pub(crate) const fn composite_dup_tables(mut self) -> Self {
+        self.nested_dup = false;
+        self
+    }
+
+    /// Whether nested layouts are stored as engine dup tables: always, but under the test-only
+    /// [`Self::composite_dup_tables`].
+    const fn nested_dup(&self) -> bool {
+        #[cfg(test)]
+        return self.nested_dup;
+        #[cfg(not(test))]
+        true
     }
 
     /// The engine's options: these settings, and the engine's defaults for the rest (its access
@@ -186,12 +215,15 @@ pub(crate) struct TableEntry {
 }
 
 impl TableEntry {
-    /// The entry of `table`, which `txn` holds, once its form in the file (an engine dup table
-    /// or a plain one, from its catalog record) is the one its layout stores it in
-    /// ([`DupLayout::options`]; plain for every table without a layout); another form is
-    /// [`error::form_mismatch`].
-    fn open(txn: &impl ReadTxn, table: Table) -> Result<Self, DatabaseError> {
-        let dup = dup_layout(table.name());
+    /// The entry of `table`, which `txn` holds, with its layout `dup` ([`TableMap::layout`]),
+    /// once its form in the file (an engine dup table or a plain one, from its catalog record) is
+    /// the one that layout stores it in ([`DupLayout::options`]; plain for every table without a
+    /// layout); another form is [`error::form_mismatch`].
+    fn open(
+        txn: &impl ReadTxn,
+        table: Table,
+        dup: Option<DupLayout>,
+    ) -> Result<Self, DatabaseError> {
         let expected = dup.and_then(|layout| layout.options());
         let found = txn.table_stat(&table).map_err(|e| DatabaseError::Open(error::info(&e)))?.dup;
         if found != expected {
@@ -215,7 +247,32 @@ impl TableEntry {
 
 /// The tables by name, built at open and extended by [`TndbEnv::create_tables`]. Every
 /// transaction call looks its table up here, so the map hashes with [`NameHasher`].
-pub(crate) type TableMap = HashMap<&'static str, TableEntry, BuildHasherDefault<NameHasher>>;
+#[derive(Clone, Debug)]
+pub(crate) struct TableMap {
+    entries: HashMap<&'static str, TableEntry, BuildHasherDefault<NameHasher>>,
+    /// Whether nested layouts are engine dup tables ([`TndbArgs::nested_dup`]).
+    nested_dup: bool,
+}
+
+impl TableMap {
+    /// An empty map; `nested_dup` as [`TndbArgs::nested_dup`].
+    fn new(nested_dup: bool) -> Self {
+        Self { entries: HashMap::default(), nested_dup }
+    }
+
+    /// The layout this environment stores dup-sort table `name` with: its [`dup_layout`], made
+    /// composite when nested layouts are not engine dup tables here.
+    fn layout(&self, name: &str) -> Option<DupLayout> {
+        dup_layout(name)
+            .map(|layout| DupLayout { nested: layout.nested && self.nested_dup, ..layout })
+    }
+
+    /// The entry of `table`, which `txn` holds, with its layout ([`TableEntry::open`]).
+    fn entry(&self, txn: &impl ReadTxn, table: Table) -> Result<TableEntry, DatabaseError> {
+        let dup = self.layout(table.name());
+        TableEntry::open(txn, table, dup)
+    }
+}
 
 /// The [`TableMap`]'s hasher: a word at a time, rotate, xor and multiply (FxHash's step), several
 /// times faster than the default SipHash on a table name. The keys are table names from reth's
@@ -260,11 +317,11 @@ pub(crate) fn resolve<'m, T: RethTable>(
     tables: &'m TableMap,
     txn: &impl ReadTxn,
 ) -> Result<Cow<'m, TableEntry>, DatabaseError> {
-    if let Some(entry) = tables.get(T::NAME) {
+    if let Some(entry) = tables.entries.get(T::NAME) {
         return Ok(Cow::Borrowed(entry));
     }
     match txn.open_table(T::NAME) {
-        Ok(Some(table)) => TableEntry::open(txn, table).map(Cow::Owned),
+        Ok(Some(table)) => tables.entry(txn, table).map(Cow::Owned),
         Ok(None) => Err(error::table_not_found()),
         Err(e) => Err(DatabaseError::Open(error::info(&e))),
     }
@@ -325,10 +382,11 @@ impl TndbEnv {
         }
         .map_err(open_error)?;
         let txn = env.begin_ro().map_err(open_error)?;
-        let mut tables = TableMap::default();
+        let mut tables = TableMap::new(args.nested_dup());
         for name in Tables::ALL.iter().map(Tables::name) {
             if let Some(table) = txn.open_table(name).map_err(open_error)? {
-                tables.insert(name, TableEntry::open(&txn, table)?);
+                let entry = tables.entry(&txn, table)?;
+                tables.entries.insert(name, entry);
             }
         }
         let watch =
@@ -357,16 +415,16 @@ impl TndbEnv {
         let mut created = Vec::new();
         for info in TS::tables() {
             let name = info.name();
-            let table = match dup_layout(name).and_then(|layout| layout.options()) {
+            let table = match self.tables.layout(name).and_then(|layout| layout.options()) {
                 Some(options) => txn.create_dup_table(name, options),
                 None => txn.create_table(name),
             }
             .map_err(|e| DatabaseError::CreateTable(error::info(&e)))?;
-            created.push((name, TableEntry::open(&txn, table)?));
+            created.push((name, self.tables.entry(&txn, table)?));
         }
         txn.commit().map_err(|e| DatabaseError::Commit(error::info(&e)))?;
         self.watch.after_commit();
-        Arc::make_mut(&mut self.tables).extend(created);
+        Arc::make_mut(&mut self.tables).entries.extend(created);
         Ok(())
     }
 
@@ -431,7 +489,7 @@ impl TndbEnv {
         let stats_error = |e: tndb_b::Error| DatabaseError::Stats(error::info(&e));
         let mut stats = Vec::with_capacity(Tables::ALL.len());
         for name in Tables::ALL.iter().map(Tables::name) {
-            let stat = match self.tables.get(name) {
+            let stat = match self.tables.entries.get(name) {
                 Some(entry) => txn.table_stat(&entry.table).map_err(stats_error)?,
                 None => match txn.open_table(name) {
                     Ok(Some(table)) => txn.table_stat(&table).map_err(stats_error)?,

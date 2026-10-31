@@ -40,15 +40,15 @@ pub(crate) struct DupLayout {
 /// checks each width against reth's encodings.
 pub(crate) const DUP_LAYOUTS: [(&str, DupLayout); 5] = [
     // `Address` → `StorageEntry` (a `B256` slot first).
-    (PlainStorageState::NAME, DupLayout { key: 20, subkey: 32, nested: false }),
+    (PlainStorageState::NAME, DupLayout { key: 20, subkey: 32, nested: true }),
     // `BlockNumberAddress` (8 + 20 bytes) → `StorageEntry`.
     (StorageChangeSets::NAME, DupLayout { key: 28, subkey: 32, nested: false }),
     // `B256` → `StorageEntry`.
-    (HashedStorages::NAME, DupLayout { key: 32, subkey: 32, nested: false }),
+    (HashedStorages::NAME, DupLayout { key: 32, subkey: 32, nested: true }),
     // `BlockNumber` → `AccountBeforeTx` (an `Address` first).
     (AccountChangeSets::NAME, DupLayout { key: 8, subkey: 20, nested: false }),
     // `B256` → `StorageTrieEntry` (a 65-byte `StoredNibblesSubKey` first).
-    (StoragesTrie::NAME, DupLayout { key: 32, subkey: 65, nested: false }),
+    (StoragesTrie::NAME, DupLayout { key: 32, subkey: 65, nested: true }),
 ];
 
 /// The layout of dup-sort table `name`, if this crate stores it.

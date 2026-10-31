@@ -1339,11 +1339,16 @@ impl<T: DupSort> DbDupCursorRW<T> for TndbCursorMut<T> {
             None => return Err(no_data()),
         };
         if dup.nested {
-            // The key's tree in one walk. The cursor is stale after it: its next call finds its
-            // place again by its row's key, the next key's first row in the deleted state, where
-            // the loop below leaves it.
+            // The key's tree in one walk. The cursor is stale after it, and finds its place again
+            // by its row's key: the next key's first row in the deleted state, where the loop
+            // below leaves it. It does so now (any call that keeps the deleted state), not at its
+            // next call, which another write may come before: by then a row put again in the key
+            // at or after the cursor's subkey would be found instead, where the loop's cursor
+            // stays on the next key's.
             let deleted = txn.delete_prefix(&self.table, &key).map_err(error::delete)?;
             debug_assert!(deleted > 0, "the cursor's row was a row of the key");
+            let shares = self.cursor.follower_shares_prefix(txn, dup.key).map_err(error::delete)?;
+            debug_assert!(!shares, "no row of the key is left");
         } else {
             self.cursor.seek(txn, &key).map_err(error::delete)?;
             while self.cursor.delete_current(txn).map_err(error::delete)? {
@@ -1363,5 +1368,72 @@ impl<T: DupSort> DbDupCursorRW<T> for TndbCursorMut<T> {
     fn append_dup(&mut self, key: T::Key, value: T::Value) -> Result<(), DatabaseError> {
         self.rows.layout::<T>()?;
         self.write(key, &value, DatabaseWriteOperation::CursorAppendDup)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{error, Moves, Table, TndbCursor, TndbCursorMut};
+    use crate::{tests::open_env, TndbArgs, TndbEnvKind};
+    use alloy::primitives::{Address, B256, U256};
+    use reth_db_api::{
+        cursor::{DbCursorRO, DbDupCursorRO},
+        database::Database,
+        tables::PlainStorageState,
+        transaction::{DbTx, DbTxMut},
+    };
+    use reth_primitives_traits::StorageEntry;
+
+    /// The stored key of the row the engine cursor under `c` is at, if any.
+    fn engine_row<T: Table>(c: &mut TndbCursor<T>) -> Option<Vec<u8>> {
+        c.with(|_, m| Ok(m.current().map_err(error::read)?.map(|(k, _)| k.to_vec()))).unwrap()
+    }
+
+    /// [`engine_row`] for a write cursor.
+    fn engine_row_mut<T: Table>(c: &mut TndbCursorMut<T>) -> Option<Vec<u8>> {
+        c.with(|_, m| Ok(m.current().map_err(error::read)?.map(|(k, _)| k.to_vec()))).unwrap()
+    }
+
+    /// A missed `seek_exact` of a key between two present ones, and a `seek_by_key_subkey` past
+    /// a key's last subkey, find nothing on both forms, as on MDBX; on an engine dup table the
+    /// seek is bounded by the key, so it leaves the engine cursor unset, where on composite keys it
+    /// leaves it on the next key's first row. This is the one sign of the bounded seek: every
+    /// reth call after the miss answers the same either way (`Pos::Missed`).
+    #[test]
+    fn bounded_seeks_never_leave_their_key() {
+        let a = Address::with_last_byte;
+        let s = B256::with_last_byte;
+        let e = |n: u8| StorageEntry { key: s(n), value: U256::from(n) };
+        for nested in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let args = TndbArgs::default();
+            let args = if nested { args } else { args.composite_dup_tables() };
+            let mut db = open_env(dir.path(), TndbEnvKind::RW, args).unwrap();
+            db.create_tables().unwrap();
+            let tx = db.tx_mut().unwrap();
+            for (k, sk) in [(1, 1), (1, 3), (3, 2)] {
+                tx.put::<PlainStorageState>(a(k), e(sk)).unwrap();
+            }
+            tx.commit().unwrap();
+            let next_key_row = [a(3).as_slice(), s(2).as_slice()].concat();
+            let left = (!nested).then_some(next_key_row);
+            let form = if nested { "nested" } else { "composite" };
+
+            let tx = db.tx().unwrap();
+            let mut c = tx.cursor_dup_read::<PlainStorageState>().unwrap();
+            assert_eq!(c.seek_exact(a(2)).unwrap(), None);
+            assert_eq!(engine_row(&mut c), left, "{form}: seek_exact");
+            assert_eq!(c.seek_by_key_subkey(a(1), s(4)).unwrap(), None);
+            assert_eq!(engine_row(&mut c), left, "{form}: seek_by_key_subkey");
+            assert_eq!(c.seek_by_key_subkey(a(1), s(3)).unwrap(), Some(e(3)), "{form}");
+            assert_eq!(engine_row(&mut c), Some([a(1).as_slice(), s(3).as_slice()].concat()));
+
+            let tx = db.tx_mut().unwrap();
+            let mut c = tx.cursor_dup_write::<PlainStorageState>().unwrap();
+            assert_eq!(c.seek_exact(a(2)).unwrap(), None);
+            assert_eq!(engine_row_mut(&mut c), left, "{form}: seek_exact, write cursor");
+            assert_eq!(c.seek_by_key_subkey(a(1), s(4)).unwrap(), None);
+            assert_eq!(engine_row_mut(&mut c), left, "{form}: seek_by_key_subkey, write cursor");
+        }
     }
 }

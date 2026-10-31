@@ -1,10 +1,15 @@
-//! Dup-sort tables stored as composite keys: each reth call on a dup-sort table, run on MDBX too
-//! (the oracle), the layouts against reth's encodings, rows the layout cannot hold, and the known
-//! differences from MDBX's cursors.
+//! Dup-sort tables: each reth call on a dup-sort table, run on MDBX too (the oracle), the
+//! layouts against reth's encodings, rows the layout cannot hold, and the known differences from
+//! MDBX's cursors. The calls on `PlainStorageState` run on both of its forms
+//! ([`on_both_forms`]): an engine dup table, and composite keys in a plain table (the
+//! changesets' form).
 
-use super::{adapter::create_mdbx_db, mdbx_port::create_test_db};
+use super::{
+    adapter::create_mdbx_db,
+    mdbx_port::{create_test_db, create_test_db_with},
+};
 use crate::{
-    dup::{dup_layout, DupLayout},
+    dup::{dup_layout, DupLayout, DUP_LAYOUTS},
     tx::compressed,
     TndbEnv, TndbEnvKind,
 };
@@ -27,6 +32,26 @@ use reth_primitives_traits::{Account, StorageEntry, ValueWithSubKey};
 use reth_storage_errors::db::{DatabaseErrorInfo, DatabaseWriteError, DatabaseWriteOperation};
 use reth_trie_common::{BranchNodeCompact, Nibbles, StorageTrieEntry, StoredNibblesSubKey};
 use std::fmt::Debug;
+
+/// Runs `test` on a new database (and its directory) once per form of the nested layouts'
+/// tables: engine dup tables, then composite keys in plain tables
+/// ([`crate::TndbArgs::composite_dup_tables`]). A panic names the form it failed on.
+fn on_both_forms(test: impl Fn(TndbEnv)) {
+    /// Names its form when dropped by a panic.
+    struct Form(bool);
+    impl Drop for Form {
+        fn drop(&mut self) {
+            if std::thread::panicking() {
+                eprintln!("failed on the {} form", if self.0 { "nested" } else { "composite" });
+            }
+        }
+    }
+    for nested in [true, false] {
+        let (_dir, db) = create_test_db_with(TndbEnvKind::RW, nested);
+        let _form = Form(nested);
+        test(db);
+    }
+}
 
 /// The address of key `n`.
 fn a(n: u8) -> Address {
@@ -306,14 +331,15 @@ fn dup_moves<D: Database>(db: &D) -> Vec<String> {
 
 #[test]
 fn dup_cursor_calls_match_mdbx() {
-    let (_mdbx_dir, mdbx) = create_mdbx_db();
-    let (_dir, db) = create_test_db(TndbEnvKind::RW);
-    let expected = dup_moves(&mdbx);
-    let got = dup_moves(&db);
-    for (i, (want, have)) in expected.iter().zip(&got).enumerate() {
-        assert_eq!(have, want, "step {i}");
-    }
-    assert_eq!(got.len(), expected.len());
+    on_both_forms(|db| {
+        let (_mdbx_dir, mdbx) = create_mdbx_db();
+        let expected = dup_moves(&mdbx);
+        let got = dup_moves(&db);
+        for (i, (want, have)) in expected.iter().zip(&got).enumerate() {
+            assert_eq!(have, want, "step {i}");
+        }
+        assert_eq!(got.len(), expected.len());
+    });
 }
 
 /// The outcome of a call, short: a row as `key/subkey` (their last bytes), a value as its
@@ -571,11 +597,12 @@ const DUP_MATCHED: &[&str] = &[
 
 #[test]
 fn dup_cursor_steps_after_a_delete_or_last_match_mdbx() {
-    let (_mdbx_dir, mdbx) = create_mdbx_db();
-    let (_dir, db) = create_test_db(TndbEnvKind::RW);
-    for seq in DUP_MATCHED {
-        assert_eq!(dup_steps(&db, seq), dup_steps(&mdbx, seq));
-    }
+    on_both_forms(|db| {
+        let (_mdbx_dir, mdbx) = create_mdbx_db();
+        for seq in DUP_MATCHED {
+            assert_eq!(dup_steps(&db, seq), dup_steps(&mdbx, seq));
+        }
+    });
 }
 
 /// A delete of each row of a key whose subkeys differ in their first byte (as hashed storage slots
@@ -605,13 +632,14 @@ fn dup_delete_in_a_key_whose_subkeys_differ_in_their_first_byte_matches_mdbx() {
         };
         format!("sk:1/{at}={sought} d={deleted} {then}={step}")
     }
-    let (_mdbx_dir, mdbx) = create_mdbx_db();
-    let (_dir, db) = create_test_db(TndbEnvKind::RW);
-    for at in [1, 2, 3] {
-        for then in ["c", "n", "p", "nd", "pd", "d"] {
-            assert_eq!(steps(&db, at, then), steps(&mdbx, at, then));
+    on_both_forms(|db| {
+        let (_mdbx_dir, mdbx) = create_mdbx_db();
+        for at in [1, 2, 3] {
+            for then in ["c", "n", "p", "nd", "pd", "d"] {
+                assert_eq!(steps(&db, at, then), steps(&mdbx, at, then));
+            }
         }
-    }
+    });
 }
 
 /// The known differences from MDBX's dup cursors, pinned on both sides (as `(steps, MDBX's
@@ -717,31 +745,33 @@ const DUP_DEVIATIONS: &[(&str, &str, &str)] = &[
 
 #[test]
 fn known_dup_cursor_deviations_from_mdbx() {
-    let (_mdbx_dir, mdbx) = create_mdbx_db();
-    let (_dir, db) = create_test_db(TndbEnvKind::RW);
-    for (seq, on_mdbx, on_tndb) in DUP_DEVIATIONS {
-        assert_eq!(dup_steps(&mdbx, seq), *on_mdbx, "MDBX");
-        assert_eq!(dup_steps(&db, seq), *on_tndb, "tndb-b");
-    }
-    let tx = db.tx_mut().unwrap();
-    tx.put::<PlainStorageState>(a(1), e(1, 1)).unwrap();
-    let mut c = tx.cursor_dup_write::<PlainStorageState>().unwrap();
-    assert_eq!(row(c.first()), "1/1");
-    assert_eq!(row(c.prev()), "none");
-    assert_eq!(val(c.last_dup()), "none", "last_dup before the first row");
-    drop(c);
-    drop(tx);
+    on_both_forms(|db| {
+        let (_mdbx_dir, mdbx) = create_mdbx_db();
+        for (seq, on_mdbx, on_tndb) in DUP_DEVIATIONS {
+            assert_eq!(dup_steps(&mdbx, seq), *on_mdbx, "MDBX");
+            assert_eq!(dup_steps(&db, seq), *on_tndb, "tndb-b");
+        }
+        let tx = db.tx_mut().unwrap();
+        tx.put::<PlainStorageState>(a(1), e(1, 1)).unwrap();
+        let mut c = tx.cursor_dup_write::<PlainStorageState>().unwrap();
+        assert_eq!(row(c.first()), "1/1");
+        assert_eq!(row(c.prev()), "none");
+        assert_eq!(val(c.last_dup()), "none", "last_dup before the first row");
+        drop(c);
+        drop(tx);
 
-    // A raw subkey wider than the layout's: subkey 4 of key 2, then bytes that sort before the
-    // row's rest (three 7s) or equal it. MDBX takes the row; tndb-b takes the row after (6).
-    put_wide_rows::<PlainStorageState, _>(&mdbx);
-    put_wide_rows::<PlainStorageState, _>(&db);
-    let layout = dup_layout(PlainStorageState::NAME).unwrap();
-    for past in [&[0][..], &[7, 7, 7]] {
-        let (key, subkey) = (wide_key(layout, 2), [wide_subkey(layout, 4), past.to_vec()].concat());
-        assert_eq!(seek_taken(&mdbx, key.clone(), subkey.clone()), Some(4), "MDBX, {past:?}");
-        assert_eq!(seek_taken(&db, key, subkey), Some(6), "tndb-b, {past:?}");
-    }
+        // A raw subkey wider than the layout's: subkey 4 of key 2, then bytes that sort before the
+        // row's rest (three 7s) or equal it. MDBX takes the row; tndb-b takes the row after (6).
+        put_wide_rows::<PlainStorageState, _>(&mdbx);
+        put_wide_rows::<PlainStorageState, _>(&db);
+        let layout = dup_layout(PlainStorageState::NAME).unwrap();
+        for past in [&[0][..], &[7, 7, 7]] {
+            let (key, subkey) =
+                (wide_key(layout, 2), [wide_subkey(layout, 4), past.to_vec()].concat());
+            assert_eq!(seek_taken(&mdbx, key.clone(), subkey.clone()), Some(4), "MDBX, {past:?}");
+            assert_eq!(seek_taken(&db, key, subkey), Some(6), "tndb-b, {past:?}");
+        }
+    });
 }
 
 /// Checks table `T`'s layout against reth's encodings: `key`'s width, the width of `value`'s
@@ -783,6 +813,14 @@ fn dup_layouts_match_reths_encodings() {
     // Every one of reth's dup-sort tables has a layout, and no other table does.
     for table in Tables::ALL {
         assert_eq!(dup_layout(table.name()).is_some(), table.is_dupsort(), "{}", table.name());
+    }
+    // The state tables are engine dup tables keyed by their key widths; the changesets are
+    // composite.
+    for (name, layout) in DUP_LAYOUTS {
+        let nested = [PlainStorageState::NAME, HashedStorages::NAME, StoragesTrie::NAME];
+        assert_eq!(layout.nested, nested.contains(&name), "{name}");
+        let options = layout.options().map(|options| (options.key_len, options.packed_max));
+        assert_eq!(options, layout.nested.then_some((layout.key as u16, 0)), "{name}");
     }
 }
 
@@ -827,6 +865,17 @@ where
     tx.commit().unwrap();
     let tx = db.tx().unwrap();
     log!(tx.cursor_dup_read::<T>().unwrap().walk_back(None).unwrap().collect::<Vec<_>>());
+    // Wipes, counted mid-transaction (which aborts): a key's rows through a cursor, the other's
+    // through the transaction, then the other again (absent).
+    let tx = db.tx_mut().unwrap();
+    let mut c = tx.cursor_dup_write::<T>().unwrap();
+    log!(c.seek_exact(key.clone()));
+    log!(c.delete_current_duplicates());
+    log!(tx.entries::<T>());
+    log!(tx.delete::<T>(other.clone(), None));
+    log!(tx.entries::<T>());
+    log!(tx.delete::<T>(other.clone(), None));
+    log!(tx.get::<T>(key.clone()));
     log
 }
 
@@ -858,6 +907,40 @@ fn every_dup_table_keeps_its_rows_as_mdbx_does() {
         B256::with_last_byte(2),
         [trie(&[1, 2]), trie(&[1, 2, 3]), trie(&[2])]
     );
+}
+
+/// A raw key one byte narrower or wider than `PlainStorageState`'s (20 bytes), beside a row of
+/// the 20-byte key it starts or extends, is no row's key: `seek_exact`, `seek_by_key_subkey`,
+/// `get` and `delete(k, None)` miss on both forms, as on MDBX, with no error and no row changed.
+#[test]
+fn a_raw_key_of_another_width_misses_as_on_mdbx() {
+    fn probes<D: Database>(db: &D) -> Vec<String> {
+        type Raw = RawDupSort<PlainStorageState>;
+        let tx = db.tx_mut().unwrap();
+        tx.put::<PlainStorageState>(a(1), e(1, 1)).unwrap();
+        let mut log = Vec::new();
+        for len in [19, 21] {
+            let mut bytes = a(1).to_vec();
+            bytes.resize(len, 0);
+            let key = RawKey::<Address>::from_vec(bytes);
+            let subkey = RawKey::<B256>::from_vec(s(1).to_vec());
+            let mut c = tx.cursor_dup_write::<Raw>().unwrap();
+            log.push(format!("{len} se: {:?}", c.seek_exact(key.clone())));
+            log.push(format!("{len} sk: {:?}", c.seek_by_key_subkey(key.clone(), subkey)));
+            drop(c);
+            let mut c = tx.cursor_dup_read::<Raw>().unwrap();
+            log.push(format!("{len} ro se: {:?}", c.seek_exact(key.clone())));
+            log.push(format!("{len} get: {:?}", tx.get::<Raw>(key.clone())));
+            log.push(format!("{len} del: {:?}", tx.delete::<Raw>(key, None)));
+        }
+        log.push(format!("en: {:?}", tx.entries::<PlainStorageState>()));
+        log.push(format!("get: {:?}", tx.get::<PlainStorageState>(a(1))));
+        log
+    }
+    on_both_forms(|db| {
+        let (_mdbx_dir, mdbx) = create_mdbx_db();
+        assert_eq!(probes(&db), probes(&mdbx));
+    });
 }
 
 /// A key or subkey `width` bytes wide whose every byte counts: `base + i` at byte `i`, the last
@@ -937,37 +1020,38 @@ where
 /// last.
 #[test]
 fn seek_by_key_subkey_matches_mdbx_at_every_layouts_widths() {
-    let (_mdbx_dir, mdbx) = create_mdbx_db();
-    let (_dir, db) = create_test_db(TndbEnvKind::RW);
-    macro_rules! same {
-        ($table:ty) => {{
-            let layout = dup_layout(<$table>::NAME).unwrap();
-            let (key, subkey) = (|n| wide_key(layout, n), |n| wide_subkey(layout, n));
-            let seeks = [
-                (key(2), subkey(2)),
-                (key(2), subkey(4)),
-                (key(2), subkey(6)),
-                (key(2), subkey(3)),
-                (key(2), subkey(1)),
-                (key(2), subkey(7)),
-                (key(1), subkey(5)),
-                (key(1), subkey(6)),
-                (key(3), subkey(5)),
-                (key(5), subkey(0)),
-            ];
-            let expected = subkey_seeks::<$table, _>(&mdbx, &seeks);
-            let got = subkey_seeks::<$table, _>(&db, &seeks);
-            for (want, have) in expected.iter().zip(&got) {
-                assert_eq!(have, want, stringify!($table));
-            }
-            assert_eq!(got.len(), expected.len());
-        }};
-    }
-    same!(PlainStorageState);
-    same!(StorageChangeSets);
-    same!(HashedStorages);
-    same!(AccountChangeSets);
-    same!(StoragesTrie);
+    on_both_forms(|db| {
+        let (_mdbx_dir, mdbx) = create_mdbx_db();
+        macro_rules! same {
+            ($table:ty) => {{
+                let layout = dup_layout(<$table>::NAME).unwrap();
+                let (key, subkey) = (|n| wide_key(layout, n), |n| wide_subkey(layout, n));
+                let seeks = [
+                    (key(2), subkey(2)),
+                    (key(2), subkey(4)),
+                    (key(2), subkey(6)),
+                    (key(2), subkey(3)),
+                    (key(2), subkey(1)),
+                    (key(2), subkey(7)),
+                    (key(1), subkey(5)),
+                    (key(1), subkey(6)),
+                    (key(3), subkey(5)),
+                    (key(5), subkey(0)),
+                ];
+                let expected = subkey_seeks::<$table, _>(&mdbx, &seeks);
+                let got = subkey_seeks::<$table, _>(&db, &seeks);
+                for (want, have) in expected.iter().zip(&got) {
+                    assert_eq!(have, want, stringify!($table));
+                }
+                assert_eq!(got.len(), expected.len());
+            }};
+        }
+        same!(PlainStorageState);
+        same!(StorageChangeSets);
+        same!(HashedStorages);
+        same!(AccountChangeSets);
+        same!(StoragesTrie);
+    });
 }
 
 /// A `seek_by_key_subkey` key longer than the cursor's stack buffer for it (128 bytes) is the
@@ -985,38 +1069,39 @@ fn seek_by_key_subkey_matches_mdbx_at_every_layouts_widths() {
 /// subkeys at and past the stack buffer's limit.
 #[test]
 fn seek_by_key_subkey_longer_than_the_stack_buffer_matches_mdbx() {
-    let (_mdbx_dir, mdbx) = create_mdbx_db();
-    let (_dir, db) = create_test_db(TndbEnvKind::RW);
-    let layout = dup_layout(PlainStorageState::NAME).unwrap();
-    let (key, subkey) = (|n| wide_key(layout, n), |n| wide_subkey(layout, n));
-    let longer = |n, len, fill| {
-        let mut bytes = subkey(n);
-        bytes.resize(len, fill);
-        bytes
-    };
-    let mut seeks = Vec::new();
-    for len in [108, 109, 200] {
-        seeks.extend([
-            (key(2), longer(3, len, 0x00)),
-            (key(2), longer(4, len, 0xFF)),
-            (key(2), longer(6, len, 0xFF)),
-        ]);
-    }
-    seeks.push(([key(2), vec![0; 120]].concat(), subkey(4)));
-    let expected = subkey_seeks::<PlainStorageState, _>(&mdbx, &seeks);
-    let got = subkey_seeks::<PlainStorageState, _>(&db, &seeks);
-    for (want, have) in expected.iter().zip(&got) {
-        assert_eq!(have, want);
-    }
-    assert_eq!(got.len(), expected.len());
+    on_both_forms(|db| {
+        let (_mdbx_dir, mdbx) = create_mdbx_db();
+        let layout = dup_layout(PlainStorageState::NAME).unwrap();
+        let (key, subkey) = (|n| wide_key(layout, n), |n| wide_subkey(layout, n));
+        let longer = |n, len, fill| {
+            let mut bytes = subkey(n);
+            bytes.resize(len, fill);
+            bytes
+        };
+        let mut seeks = Vec::new();
+        for len in [108, 109, 200] {
+            seeks.extend([
+                (key(2), longer(3, len, 0x00)),
+                (key(2), longer(4, len, 0xFF)),
+                (key(2), longer(6, len, 0xFF)),
+            ]);
+        }
+        seeks.push(([key(2), vec![0; 120]].concat(), subkey(4)));
+        let expected = subkey_seeks::<PlainStorageState, _>(&mdbx, &seeks);
+        let got = subkey_seeks::<PlainStorageState, _>(&db, &seeks);
+        for (want, have) in expected.iter().zip(&got) {
+            assert_eq!(have, want);
+        }
+        assert_eq!(got.len(), expected.len());
 
-    // The difference, pinned beside MDBX's result: subkey 4, then zeros, which sort before the
-    // row's rest (7s).
-    for len in [108, 200] {
-        let (k, sk) = (key(2), longer(4, len, 0x00));
-        assert_eq!(seek_taken(&mdbx, k.clone(), sk.clone()), Some(4), "{len}");
-        assert_eq!(seek_taken(&db, k, sk), Some(6), "{len}");
-    }
+        // The difference, pinned beside MDBX's result: subkey 4, then zeros, which sort before the
+        // row's rest (7s).
+        for len in [108, 200] {
+            let (k, sk) = (key(2), longer(4, len, 0x00));
+            assert_eq!(seek_taken(&mdbx, k.clone(), sk.clone()), Some(4), "{len}");
+            assert_eq!(seek_taken(&db, k, sk), Some(6), "{len}");
+        }
+    });
 }
 
 /// The last byte of the subkey of the value `seek_by_key_subkey(key, subkey)` takes on
@@ -1227,76 +1312,78 @@ fn a_range_walk_on_a_dup_table_starts_past_every_row_of_an_excluded_key() {
 #[test]
 fn dup_values_in_overflow_runs_read_back_whole() {
     type Raw = RawDupSort<PlainStorageState>;
-    let (_dir, db) = create_test_db(TndbEnvKind::RW);
-    let key = |n: u8| RawKey::<Address>::from_vec(vec![n; 20]);
-    // Subkey `s`, then a rest of `len` bytes: 5000 and 3000 take overflow runs, 10 is inline.
-    let value = |s: u8, len: usize| {
-        let mut v = vec![s; 32];
-        v.extend((0..len).map(|i| (i % 251) as u8 ^ s));
-        RawValue::<StorageEntry>::from_vec(v)
-    };
-    let rows = [
-        (key(1), value(1, 5000)),
-        (key(1), value(2, 10)),
-        (key(1), value(3, 3000)),
-        (key(2), value(1, 4000)),
-    ];
-    let tx = db.tx_mut().unwrap();
-    for (k, v) in rows.iter().rev() {
-        tx.put::<Raw>(k.clone(), v.clone()).unwrap();
-    }
-    assert_eq!(tx.get::<Raw>(key(1)).unwrap(), Some(rows[0].1.clone()));
-    let mut c = tx.cursor_dup_write::<Raw>().unwrap();
-    assert_eq!(c.seek_exact(key(1)).unwrap(), Some(rows[0].clone()));
-    assert_eq!(c.next_dup().unwrap(), Some(rows[1].clone()));
-    assert_eq!(c.next_dup().unwrap(), Some(rows[2].clone()));
-    assert_eq!(c.next_dup().unwrap(), None);
-    assert_eq!(
-        c.seek_by_key_subkey(key(1), RawKey::new(B256::repeat_byte(3))).unwrap(),
-        Some(rows[2].1.clone())
-    );
-    assert_eq!(c.prev_dup().unwrap(), Some(rows[1].clone()));
-    assert_eq!(c.last_dup().unwrap(), Some(rows[2].1.clone()));
-    assert_eq!(c.next_no_dup().unwrap(), Some(rows[3].clone()));
-    assert_eq!(c.current().unwrap(), Some(rows[3].clone()));
-    assert_eq!(c.prev().unwrap(), Some(rows[2].clone()));
-    drop(c);
-    tx.commit().unwrap();
+    on_both_forms(|db| {
+        let key = |n: u8| RawKey::<Address>::from_vec(vec![n; 20]);
+        // Subkey `s`, then a rest of `len` bytes: 5000 and 3000 take overflow runs, 10 is inline.
+        let value = |s: u8, len: usize| {
+            let mut v = vec![s; 32];
+            v.extend((0..len).map(|i| (i % 251) as u8 ^ s));
+            RawValue::<StorageEntry>::from_vec(v)
+        };
+        let rows = [
+            (key(1), value(1, 5000)),
+            (key(1), value(2, 10)),
+            (key(1), value(3, 3000)),
+            (key(2), value(1, 4000)),
+        ];
+        let tx = db.tx_mut().unwrap();
+        for (k, v) in rows.iter().rev() {
+            tx.put::<Raw>(k.clone(), v.clone()).unwrap();
+        }
+        assert_eq!(tx.get::<Raw>(key(1)).unwrap(), Some(rows[0].1.clone()));
+        let mut c = tx.cursor_dup_write::<Raw>().unwrap();
+        assert_eq!(c.seek_exact(key(1)).unwrap(), Some(rows[0].clone()));
+        assert_eq!(c.next_dup().unwrap(), Some(rows[1].clone()));
+        assert_eq!(c.next_dup().unwrap(), Some(rows[2].clone()));
+        assert_eq!(c.next_dup().unwrap(), None);
+        assert_eq!(
+            c.seek_by_key_subkey(key(1), RawKey::new(B256::repeat_byte(3))).unwrap(),
+            Some(rows[2].1.clone())
+        );
+        assert_eq!(c.prev_dup().unwrap(), Some(rows[1].clone()));
+        assert_eq!(c.last_dup().unwrap(), Some(rows[2].1.clone()));
+        assert_eq!(c.next_no_dup().unwrap(), Some(rows[3].clone()));
+        assert_eq!(c.current().unwrap(), Some(rows[3].clone()));
+        assert_eq!(c.prev().unwrap(), Some(rows[2].clone()));
+        drop(c);
+        tx.commit().unwrap();
 
-    let tx = db.tx().unwrap();
-    assert_eq!(tx.get::<Raw>(key(2)).unwrap(), Some(rows[3].1.clone()));
-    let mut c = tx.cursor_dup_read::<Raw>().unwrap();
-    let walked = c.walk(None).unwrap().collect::<Result<Vec<_>, _>>().unwrap();
-    assert_eq!(walked, rows);
-    let back = c.walk_back(None).unwrap().collect::<Result<Vec<_>, _>>().unwrap();
-    assert_eq!(back, rows.iter().rev().cloned().collect::<Vec<_>>());
-    let dups = c.walk_dup(Some(key(1)), None).unwrap().collect::<Result<Vec<_>, _>>().unwrap();
-    assert_eq!(dups, rows[..3]);
-    let from = c.walk_dup(Some(key(1)), Some(RawKey::new(B256::repeat_byte(2)))).unwrap();
-    assert_eq!(from.collect::<Result<Vec<_>, _>>().unwrap(), rows[1..3]);
-    assert_eq!(c.first().unwrap(), Some(rows[0].clone()));
-    assert_eq!(c.next_dup_val().unwrap(), Some(rows[1].1.clone()));
-    assert_eq!(c.last().unwrap(), Some(rows[3].clone()));
+        let tx = db.tx().unwrap();
+        assert_eq!(tx.get::<Raw>(key(2)).unwrap(), Some(rows[3].1.clone()));
+        let mut c = tx.cursor_dup_read::<Raw>().unwrap();
+        let walked = c.walk(None).unwrap().collect::<Result<Vec<_>, _>>().unwrap();
+        assert_eq!(walked, rows);
+        let back = c.walk_back(None).unwrap().collect::<Result<Vec<_>, _>>().unwrap();
+        assert_eq!(back, rows.iter().rev().cloned().collect::<Vec<_>>());
+        let dups = c.walk_dup(Some(key(1)), None).unwrap().collect::<Result<Vec<_>, _>>().unwrap();
+        assert_eq!(dups, rows[..3]);
+        let from = c.walk_dup(Some(key(1)), Some(RawKey::new(B256::repeat_byte(2)))).unwrap();
+        assert_eq!(from.collect::<Result<Vec<_>, _>>().unwrap(), rows[1..3]);
+        assert_eq!(c.first().unwrap(), Some(rows[0].clone()));
+        assert_eq!(c.next_dup_val().unwrap(), Some(rows[1].1.clone()));
+        assert_eq!(c.last().unwrap(), Some(rows[3].clone()));
 
-    // `seek_by_key_subkey` through the read cursor: a hit on a value in a run, and a miss between
-    // two subkeys that lands on one, each leaving the cursor at its row; a subkey past the key's
-    // rows, and a key with no rows, each a miss although the next row (key 2's, in a run) follows.
-    let subkey = |bytes: [u8; 32]| RawKey::new(B256::from(bytes));
-    let mut between = [2; 32];
-    between[31] = 3;
-    assert_eq!(c.seek_by_key_subkey(key(1), subkey([1; 32])).unwrap(), Some(rows[0].1.clone()));
-    assert_eq!(c.current().unwrap(), Some(rows[0].clone()));
-    assert_eq!(c.next_dup().unwrap(), Some(rows[1].clone()));
-    assert_eq!(c.seek_by_key_subkey(key(1), subkey(between)).unwrap(), Some(rows[2].1.clone()));
-    assert_eq!(c.prev_dup().unwrap(), Some(rows[1].clone()));
-    assert_eq!(c.seek_by_key_subkey(key(1), subkey([4; 32])).unwrap(), None);
-    assert_eq!(c.current().unwrap(), None);
-    let mut absent = vec![1; 20];
-    absent[19] = 9;
-    assert_eq!(c.seek_by_key_subkey(RawKey::from_vec(absent), subkey([0; 32])).unwrap(), None);
-    assert_eq!(c.next_dup().unwrap(), None);
-    let from = c.walk_dup(Some(key(1)), Some(subkey(between))).unwrap();
-    assert_eq!(from.collect::<Result<Vec<_>, _>>().unwrap(), rows[2..3]);
+        // `seek_by_key_subkey` through the read cursor: a hit on a value in a run, and a miss
+        // between two subkeys that lands on one, each leaving the cursor at its row; a
+        // subkey past the key's rows, and a key with no rows, each a miss although the next
+        // row (key 2's, in a run) follows.
+        let subkey = |bytes: [u8; 32]| RawKey::new(B256::from(bytes));
+        let mut between = [2; 32];
+        between[31] = 3;
+        assert_eq!(c.seek_by_key_subkey(key(1), subkey([1; 32])).unwrap(), Some(rows[0].1.clone()));
+        assert_eq!(c.current().unwrap(), Some(rows[0].clone()));
+        assert_eq!(c.next_dup().unwrap(), Some(rows[1].clone()));
+        assert_eq!(c.seek_by_key_subkey(key(1), subkey(between)).unwrap(), Some(rows[2].1.clone()));
+        assert_eq!(c.prev_dup().unwrap(), Some(rows[1].clone()));
+        assert_eq!(c.seek_by_key_subkey(key(1), subkey([4; 32])).unwrap(), None);
+        assert_eq!(c.current().unwrap(), None);
+        let mut absent = vec![1; 20];
+        absent[19] = 9;
+        assert_eq!(c.seek_by_key_subkey(RawKey::from_vec(absent), subkey([0; 32])).unwrap(), None);
+        assert_eq!(c.next_dup().unwrap(), None);
+        let from = c.walk_dup(Some(key(1)), Some(subkey(between))).unwrap();
+        assert_eq!(from.collect::<Result<Vec<_>, _>>().unwrap(), rows[2..3]);
+    });
 }
 
 /// [`dup_steps`] through a cursor over the raw view of `PlainStorageState` (whose values can be
@@ -1387,20 +1474,21 @@ fn a_dup_write_refused_for_its_size_leaves_the_cursor_where_it_was() {
         "bu:1/9 n",
         "bi:3/1 p",
     ];
-    let (_mdbx_dir, mdbx) = create_mdbx_db();
-    let (_dir, db) = create_test_db(TndbEnvKind::RW);
-    assert_eq!(
-        big_write_steps(&db, SEQS[0]),
-        "sk:1/9=none d=nodata bu:1/9=badvalsize c=none d=nodata en=6"
-    );
-    for seq in SEQS {
-        let big = |step: &str| step.starts_with('b');
-        let outcomes = big_write_steps(&db, seq);
-        let (refused, rest): (Vec<&str>, Vec<&str>) = outcomes.split(' ').partition(|s| big(s));
-        assert!(refused.iter().all(|s| s.ends_with("=badvalsize")), "{seq}: {refused:?}");
-        let without: Vec<&str> = seq.split(' ').filter(|step| !big(step)).collect();
-        assert_eq!(rest.join(" "), big_write_steps(&mdbx, &without.join(" ")), "{seq}");
-    }
+    on_both_forms(|db| {
+        let (_mdbx_dir, mdbx) = create_mdbx_db();
+        assert_eq!(
+            big_write_steps(&db, SEQS[0]),
+            "sk:1/9=none d=nodata bu:1/9=badvalsize c=none d=nodata en=6"
+        );
+        for seq in SEQS {
+            let big = |step: &str| step.starts_with('b');
+            let outcomes = big_write_steps(&db, seq);
+            let (refused, rest): (Vec<&str>, Vec<&str>) = outcomes.split(' ').partition(|s| big(s));
+            assert!(refused.iter().all(|s| s.ends_with("=badvalsize")), "{seq}: {refused:?}");
+            let without: Vec<&str> = seq.split(' ').filter(|step| !big(step)).collect();
+            assert_eq!(rest.join(" "), big_write_steps(&mdbx, &without.join(" ")), "{seq}");
+        }
+    });
 }
 
 /// Rewrites of a row with the value it holds, through every write path that stores a row, as
@@ -1419,12 +1507,13 @@ fn a_dup_row_written_again_with_its_value_matches_mdbx() {
         "se:2 tap:4/2 c n en",
         "se:2 tap:4/1 c n en",
     ];
-    let (_mdbx_dir, mdbx) = create_mdbx_db();
-    let (_dir, db) = create_test_db(TndbEnvKind::RW);
-    assert_eq!(dup_steps(&db, SEQS[0]), "sk:1/1=1 u:1/3=ok c=1/3 n=1/5 p=1/3 en=6");
-    for seq in SEQS {
-        assert_eq!(dup_steps(&db, seq), dup_steps(&mdbx, seq), "{seq}");
-    }
+    on_both_forms(|db| {
+        let (_mdbx_dir, mdbx) = create_mdbx_db();
+        assert_eq!(dup_steps(&db, SEQS[0]), "sk:1/1=1 u:1/3=ok c=1/3 n=1/5 p=1/3 en=6");
+        for seq in SEQS {
+            assert_eq!(dup_steps(&db, seq), dup_steps(&mdbx, seq), "{seq}");
+        }
+    });
 }
 
 /// A second value for a (key, subkey) that holds another, through every write path that stores a
@@ -1451,18 +1540,20 @@ fn a_second_value_for_a_subkey_is_refused_and_changes_nothing() {
         "se:2 tapx:4/1 c n en",
         "sk:1/1 putx:1/1 tapx:4/2 ux:2/2 ax:4/1 c n en",
     ];
-    let (_mdbx_dir, mdbx) = create_mdbx_db();
-    let (_dir, db) = create_test_db(TndbEnvKind::RW);
-    assert_eq!(dup_steps(&db, SEQS[0]), "sk:1/1=1 ux:1/3=second c=1/1 n=1/3 p=1/1 en=6");
-    for seq in SEQS {
-        let second = |step: &str| step.split(':').next().is_some_and(|op| op.ends_with('x'));
-        let outcomes = dup_steps(&db, seq);
-        let (refused, rest): (Vec<&str>, Vec<&str>) = outcomes.split(' ').partition(|s| second(s));
-        assert!(refused.iter().all(|s| s.ends_with("=second")), "{seq}: {refused:?}");
-        let without: Vec<&str> = seq.split(' ').filter(|step| !second(step)).collect();
-        assert_eq!(rest.join(" "), dup_steps(&mdbx, &without.join(" ")), "{seq}");
-    }
-    assert_eq!(dup_steps(&db, "sk:1/1 adx:1/3 c"), "sk:1/1=1 adx:1/3=keymismatch c=1/5");
+    on_both_forms(|db| {
+        let (_mdbx_dir, mdbx) = create_mdbx_db();
+        assert_eq!(dup_steps(&db, SEQS[0]), "sk:1/1=1 ux:1/3=second c=1/1 n=1/3 p=1/1 en=6");
+        for seq in SEQS {
+            let second = |step: &str| step.split(':').next().is_some_and(|op| op.ends_with('x'));
+            let outcomes = dup_steps(&db, seq);
+            let (refused, rest): (Vec<&str>, Vec<&str>) =
+                outcomes.split(' ').partition(|s| second(s));
+            assert!(refused.iter().all(|s| s.ends_with("=second")), "{seq}: {refused:?}");
+            let without: Vec<&str> = seq.split(' ').filter(|step| !second(step)).collect();
+            assert_eq!(rest.join(" "), dup_steps(&mdbx, &without.join(" ")), "{seq}");
+        }
+        assert_eq!(dup_steps(&db, "sk:1/1 adx:1/3 c"), "sk:1/1=1 adx:1/3=keymismatch c=1/5");
+    });
 }
 
 /// The refusal of a second value for a subkey names its operation, the table and the key, with
@@ -1471,47 +1562,52 @@ fn a_second_value_for_a_subkey_is_refused_and_changes_nothing() {
 #[test]
 fn a_second_value_refusal_is_a_write_error_and_plain_tables_still_overwrite() {
     use DatabaseWriteOperation::{CursorAppend, CursorUpsert, PutAppend, PutUpsert};
-    let (_dir, db) = create_test_db(TndbEnvKind::RW);
-    let tx = db.tx_mut().unwrap();
-    tx.put::<PlainStorageState>(a(1), e(1, 1)).unwrap();
-    tx.put::<PlainStorageState>(a(2), e(1, 1)).unwrap();
-    let rows = |tx: &<TndbEnv as Database>::TXMut| {
+    on_both_forms(|db| {
+        let tx = db.tx_mut().unwrap();
+        tx.put::<PlainStorageState>(a(1), e(1, 1)).unwrap();
+        tx.put::<PlainStorageState>(a(2), e(1, 1)).unwrap();
+        let rows = |tx: &<TndbEnv as Database>::TXMut| {
+            let mut c = tx.cursor_dup_read::<PlainStorageState>().unwrap();
+            c.walk(None).unwrap().collect::<Result<Vec<_>, _>>().unwrap()
+        };
+        let before = rows(&tx);
+        assert!(second_value_refused(&tx.put::<PlainStorageState>(a(1), e(1, 2)), PutUpsert, a(1)));
+        assert!(second_value_refused(
+            &tx.append::<PlainStorageState>(a(2), e(1, 2)),
+            PutAppend,
+            a(2)
+        ));
+        let mut c = tx.cursor_dup_write::<PlainStorageState>().unwrap();
+        assert!(second_value_refused(&c.upsert(a(1), &e(1, 2)), CursorUpsert, a(1)));
+        assert!(second_value_refused(&c.append(a(2), &e(1, 2)), CursorAppend, a(2)));
+        drop(c);
+        assert_eq!(rows(&tx), before);
+        let Err(DatabaseError::Write(write)) = tx.put::<PlainStorageState>(a(1), e(1, 2)) else {
+            panic!("not refused")
+        };
+        assert_eq!(
+            &*write.info.message,
+            "tndb-b-reth stores one value per subkey in dup-sort table PlainStorageState, and this key \
+             and subkey already hold a different value"
+        );
+        // A new subkey is stored, on the transaction and through a cursor.
+        tx.put::<PlainStorageState>(a(1), e(2, 2)).unwrap();
+        tx.cursor_dup_write::<PlainStorageState>().unwrap().upsert(a(1), &e(3, 3)).unwrap();
+        // A table without duplicates: every path replaces the key's value.
+        let v = B256::with_last_byte;
+        tx.put::<CanonicalHeaders>(1, v(1)).unwrap();
+        tx.put::<CanonicalHeaders>(1, v(2)).unwrap();
+        tx.append::<CanonicalHeaders>(1, v(3)).unwrap();
+        let mut c = tx.cursor_write::<CanonicalHeaders>().unwrap();
+        c.upsert(1, &v(4)).unwrap();
+        c.append(1, &v(5)).unwrap();
+        drop(c);
+        assert_eq!(tx.get::<CanonicalHeaders>(1).unwrap(), Some(v(5)));
+        tx.commit().unwrap();
+        assert_eq!(db.failure(), None);
+        let tx = db.tx().unwrap();
         let mut c = tx.cursor_dup_read::<PlainStorageState>().unwrap();
-        c.walk(None).unwrap().collect::<Result<Vec<_>, _>>().unwrap()
-    };
-    let before = rows(&tx);
-    assert!(second_value_refused(&tx.put::<PlainStorageState>(a(1), e(1, 2)), PutUpsert, a(1)));
-    assert!(second_value_refused(&tx.append::<PlainStorageState>(a(2), e(1, 2)), PutAppend, a(2)));
-    let mut c = tx.cursor_dup_write::<PlainStorageState>().unwrap();
-    assert!(second_value_refused(&c.upsert(a(1), &e(1, 2)), CursorUpsert, a(1)));
-    assert!(second_value_refused(&c.append(a(2), &e(1, 2)), CursorAppend, a(2)));
-    drop(c);
-    assert_eq!(rows(&tx), before);
-    let Err(DatabaseError::Write(write)) = tx.put::<PlainStorageState>(a(1), e(1, 2)) else {
-        panic!("not refused")
-    };
-    assert_eq!(
-        &*write.info.message,
-        "tndb-b-reth stores one value per subkey in dup-sort table PlainStorageState, and this key \
-         and subkey already hold a different value"
-    );
-    // A new subkey is stored, on the transaction and through a cursor.
-    tx.put::<PlainStorageState>(a(1), e(2, 2)).unwrap();
-    tx.cursor_dup_write::<PlainStorageState>().unwrap().upsert(a(1), &e(3, 3)).unwrap();
-    // A table without duplicates: every path replaces the key's value.
-    let v = B256::with_last_byte;
-    tx.put::<CanonicalHeaders>(1, v(1)).unwrap();
-    tx.put::<CanonicalHeaders>(1, v(2)).unwrap();
-    tx.append::<CanonicalHeaders>(1, v(3)).unwrap();
-    let mut c = tx.cursor_write::<CanonicalHeaders>().unwrap();
-    c.upsert(1, &v(4)).unwrap();
-    c.append(1, &v(5)).unwrap();
-    drop(c);
-    assert_eq!(tx.get::<CanonicalHeaders>(1).unwrap(), Some(v(5)));
-    tx.commit().unwrap();
-    assert_eq!(db.failure(), None);
-    let tx = db.tx().unwrap();
-    let mut c = tx.cursor_dup_read::<PlainStorageState>().unwrap();
-    let stored = c.walk(None).unwrap().collect::<Result<Vec<_>, _>>().unwrap();
-    assert_eq!(stored, [(a(1), e(1, 1)), (a(1), e(2, 2)), (a(1), e(3, 3)), (a(2), e(1, 1))]);
+        let stored = c.walk(None).unwrap().collect::<Result<Vec<_>, _>>().unwrap();
+        assert_eq!(stored, [(a(1), e(1, 1)), (a(1), e(2, 2)), (a(1), e(3, 3)), (a(2), e(1, 1))]);
+    });
 }

@@ -33,14 +33,22 @@ use tempfile::TempDir;
 
 /// Create database for testing. Returns the `TempDir` to prevent cleanup until test ends.
 pub(super) fn create_test_db(kind: TndbEnvKind) -> (TempDir, TndbEnv) {
+    create_test_db_with(kind, true)
+}
+
+/// [`create_test_db`] with the tables of the nested dup layouts in one form: engine dup tables
+/// (`nested`), or composite keys in plain tables ([`TndbArgs::composite_dup_tables`]).
+pub(super) fn create_test_db_with(kind: TndbEnvKind, nested: bool) -> (TempDir, TndbEnv) {
     let tempdir = tempfile::TempDir::new().expect(ERROR_TEMPDIR);
-    let env = create_test_db_with_path(kind, tempdir.path());
+    let args =
+        if nested { TndbArgs::default() } else { TndbArgs::default().composite_dup_tables() };
+    let env = create_test_db_with_path(kind, tempdir.path(), args);
     (tempdir, env)
 }
 
 /// Create database for testing with specified path
-fn create_test_db_with_path(kind: TndbEnvKind, path: &Path) -> TndbEnv {
-    let mut env = super::open_env(path, kind, TndbArgs::default()).expect(ERROR_DB_CREATION);
+fn create_test_db_with_path(kind: TndbEnvKind, path: &Path, args: TndbArgs) -> TndbEnv {
+    let mut env = super::open_env(path, kind, args).expect(ERROR_DB_CREATION);
     env.create_tables().expect(ERROR_TABLE_CREATION);
     env
 }
@@ -543,7 +551,7 @@ fn db_closure_put_get() {
         Address::from_str("0xa2c122be93b0074270ebee7f6b7292c7deb45047").expect(ERROR_ETH_ADDRESS);
 
     {
-        let env = create_test_db_with_path(TndbEnvKind::RW, path);
+        let env = create_test_db_with_path(TndbEnvKind::RW, path, TndbArgs::default());
 
         // PUT
         let result = env.update(|tx| {
