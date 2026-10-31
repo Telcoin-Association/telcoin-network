@@ -34,7 +34,7 @@ use reth_chainspec::{ChainSpecProvider, EthereumHardforks};
 use reth_consensus::FullConsensus;
 use reth_engine_primitives::ConsensusEngineEvent;
 use reth_evm::ConfigureEvm;
-use reth_network_api::{noop::NoopNetwork, NetworkInfo, Peers};
+use reth_network_api::{noop::NoopNetwork, NetworkInfo, PeersInfo};
 use reth_primitives_traits::{NodePrimitives, TxTy};
 use reth_rpc::{DebugApi, EthApi, EthApiBuilder, EthBundle, NetApi, RPCApi, TraceApi, Web3Api};
 use reth_rpc_api::servers::*;
@@ -314,7 +314,7 @@ where
         + AccountReader
         + ChangeSetReader,
     Pool: TransactionPool + Clone + 'static,
-    Network: NetworkInfo + Peers + Clone + 'static,
+    Network: NetworkInfo + PeersInfo + Clone + 'static,
     EvmConfig: ConfigureEvm<Primitives = N> + 'static,
     Consensus: FullConsensus<N> + Clone + 'static,
 {
@@ -611,7 +611,7 @@ where
         + CanonStateSubscriptions<Primitives = N>
         + ForkChoiceSubscriptions<Header = N::BlockHeader>
         + PersistedBlockSubscriptions,
-    Network: NetworkInfo + Peers + Clone + 'static,
+    Network: NetworkInfo + PeersInfo + Clone + 'static,
     EthApi: EthApiServer<
             RpcTxReq<EthApi::NetworkTypes>,
             RpcTransaction<EthApi::NetworkTypes>,
@@ -689,7 +689,7 @@ where
             Receipt = N::Receipt,
         > + AccountReader
         + ChangeSetReader,
-    Network: NetworkInfo + Peers + Clone + 'static,
+    Network: NetworkInfo + PeersInfo + Clone + 'static,
     EthApi: EthApiTypes,
     EvmConfig: ConfigureEvm<Primitives = N>,
 {
@@ -761,7 +761,7 @@ where
         + AccountReader
         + ChangeSetReader,
     Pool: TransactionPool + Clone + 'static,
-    Network: NetworkInfo + Peers + Clone + 'static,
+    Network: NetworkInfo + PeersInfo + Clone + 'static,
     EthApi: FullEthApiServer,
     EvmConfig: ConfigureEvm<Primitives = N> + 'static,
     Consensus: FullConsensus<N> + Clone + 'static,

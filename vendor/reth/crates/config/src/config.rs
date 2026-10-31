@@ -1,5 +1,4 @@
 //! Configuration files.
-use reth_network_types::{PeersConfig, SessionsConfig};
 use reth_prune_types::PruneModes;
 use reth_stages_types::ExecutionStageThresholds;
 use reth_static_file_types::{StaticFileMap, StaticFileSegment};
@@ -22,10 +21,8 @@ pub struct Config {
     /// Configuration for pruning.
     #[cfg_attr(feature = "serde", serde(default))]
     pub prune: PruneConfig,
-    /// Configuration for the discovery service.
-    pub peers: PeersConfig,
-    /// Configuration for peer sessions.
-    pub sessions: SessionsConfig,
+    // TN(TN-0031): upstream's `peers` and `sessions` sections (devp2p) are removed; TN runs no
+    // devp2p network. Old configs that carry them still parse, as unknown sections.
     /// Configuration for static files.
     #[cfg_attr(feature = "serde", serde(default))]
     pub static_files: StaticFilesConfig,
@@ -38,24 +35,8 @@ impl Config {
     }
 }
 
-#[cfg(feature = "serde")]
-impl Config {
-    // TN(TN-0030): upstream's `from_path` (the reth.toml loader) and `save` are removed; TN
-    // never reads or writes a reth.toml.
-
-    /// Returns the [`PeersConfig`] for the node.
-    ///
-    /// If a peers file is provided, the basic nodes from the file are added to the configuration.
-    pub fn peers_config_with_basic_nodes_from_file(
-        &self,
-        peers_file: Option<&Path>,
-    ) -> PeersConfig {
-        self.peers
-            .clone()
-            .with_basic_nodes_from_file(peers_file)
-            .unwrap_or_else(|_| self.peers.clone())
-    }
-}
+// TN(TN-0030): upstream's `from_path` (the reth.toml loader) and `save` are removed; TN never
+// reads or writes a reth.toml.
 
 /// Configuration for each stage in the pipeline.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -576,7 +557,6 @@ mod tests {
     use super::Config;
     use crate::PruneConfig;
     use alloy_primitives::Address;
-    use reth_network_peers::TrustedPeer;
     use reth_prune_types::{PruneMode, PruneModes, ReceiptsLogPruneConfig};
     use std::{collections::BTreeMap, str::FromStr, time::Duration};
 
@@ -943,46 +923,5 @@ receipts = { distance = 16384 }
         assert_eq!(config1.segments.account_history, Some(PruneMode::Distance(2000)));
         assert_eq!(config1.segments.storage_history, Some(PruneMode::Before(5000)));
         assert_eq!(config1.segments.receipts_log_filter, original_filter);
-    }
-
-    #[test]
-    fn test_conf_trust_nodes_only() {
-        let trusted_nodes_only = r"#
-[peers]
-trusted_nodes_only = true
-#";
-        let conf: Config = toml::from_str(trusted_nodes_only).unwrap();
-        assert!(conf.peers.trusted_nodes_only);
-
-        let trusted_nodes_only = r"#
-[peers]
-connect_trusted_nodes_only = true
-#";
-        let conf: Config = toml::from_str(trusted_nodes_only).unwrap();
-        assert!(conf.peers.trusted_nodes_only);
-    }
-
-    #[test]
-    fn test_can_support_dns_in_trusted_nodes() {
-        let reth_toml = r#"
-    [peers]
-    trusted_nodes = [
-        "enode://0401e494dbd0c84c5c0f72adac5985d2f2525e08b68d448958aae218f5ac8198a80d1498e0ebec2ce38b1b18d6750f6e61a56b4614c5a6c6cf0981c39aed47dc@34.159.32.127:30303",
-        "enode://e9675164b5e17b9d9edf0cc2bd79e6b6f487200c74d1331c220abb5b8ee80c2eefbf18213989585e9d0960683e819542e11d4eefb5f2b4019e1e49f9fd8fff18@berav2-bootnode.staketab.org:30303"
-    ]
-    "#;
-
-        let conf: Config = toml::from_str(reth_toml).unwrap();
-        assert_eq!(conf.peers.trusted_nodes.len(), 2);
-
-        let expected_enodes = vec![
-            "enode://0401e494dbd0c84c5c0f72adac5985d2f2525e08b68d448958aae218f5ac8198a80d1498e0ebec2ce38b1b18d6750f6e61a56b4614c5a6c6cf0981c39aed47dc@34.159.32.127:30303",
-            "enode://e9675164b5e17b9d9edf0cc2bd79e6b6f487200c74d1331c220abb5b8ee80c2eefbf18213989585e9d0960683e819542e11d4eefb5f2b4019e1e49f9fd8fff18@berav2-bootnode.staketab.org:30303",
-        ];
-
-        for enode in expected_enodes {
-            let node = TrustedPeer::from_str(enode).unwrap();
-            assert!(conf.peers.trusted_nodes.contains(&node));
-        }
     }
 }
