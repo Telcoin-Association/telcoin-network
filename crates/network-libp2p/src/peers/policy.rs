@@ -1,6 +1,8 @@
 //! Independent peer privileges, composed from live trust bases.
 //!
-//! These privileges never change connection, stream, memory, or message-class budgets.
+//! These privileges never change connection, stream, memory, or per-source message budgets.
+//! A trusted source only bypasses the inbound kad `PutRecord` budget that untrusted sources
+//! share.
 
 use super::penalty::Penalty;
 
@@ -44,6 +46,16 @@ pub(super) enum ProtocolScoring {
     CommitteeExempt,
 }
 
+/// Treatment by the inbound kad `PutRecord` verify budget that untrusted sources share.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) enum SharedRecordBudget {
+    /// Inbound kad `PutRecord` verifies draw from the budget that untrusted sources share.
+    #[default]
+    Apply,
+    /// Bypass the shared budget; the per-source rate window still applies.
+    Exempt,
+}
+
 /// A live source of peer privileges; overlapping sources compose independently.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum TrustBasis {
@@ -55,7 +67,8 @@ pub(super) enum TrustBasis {
     Validator,
 }
 
-/// Independent admission, retention, load-scoring, and protocol-scoring decisions for one peer.
+/// Independent admission, retention, load-scoring, protocol-scoring, and shared record budget
+/// decisions for one peer.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(super) struct PeerPolicy {
     /// Configured admission eligibility.
@@ -66,6 +79,8 @@ pub(super) struct PeerPolicy {
     load_scoring: LoadScoring,
     /// Committee liveness protection, independent of operator trust.
     protocol_scoring: ProtocolScoring,
+    /// Inbound kad `PutRecord` treatment by the budget that untrusted sources share.
+    shared_record_budget: SharedRecordBudget,
 }
 
 impl PeerPolicy {
@@ -77,11 +92,16 @@ impl PeerPolicy {
     /// Add one trust basis without removing privileges from another basis.
     pub(super) fn grant(self, basis: TrustBasis) -> Self {
         match basis {
-            TrustBasis::Bootstrap => Self { admission: Admission::Authorized, ..self },
+            TrustBasis::Bootstrap => Self {
+                admission: Admission::Authorized,
+                shared_record_budget: SharedRecordBudget::Exempt,
+                ..self
+            },
             TrustBasis::Operator => Self {
                 admission: Admission::Authorized,
                 retention: Retention::Protected,
                 load_scoring: LoadScoring::Exempt,
+                shared_record_budget: SharedRecordBudget::Exempt,
                 ..self
             },
             TrustBasis::Validator => Self {
@@ -89,6 +109,7 @@ impl PeerPolicy {
                 retention: Retention::Protected,
                 load_scoring: LoadScoring::Exempt,
                 protocol_scoring: ProtocolScoring::CommitteeExempt,
+                shared_record_budget: SharedRecordBudget::Exempt,
             },
         }
     }
@@ -108,6 +129,11 @@ impl PeerPolicy {
         self.load_scoring == LoadScoring::Exempt
     }
 
+    /// Whether inbound kad `PutRecord` verifies bypass the budget that untrusted sources share.
+    pub(super) fn exempts_shared_record_budget(self) -> bool {
+        self.shared_record_budget == SharedRecordBudget::Exempt
+    }
+
     /// Whether the score model should apply an attributable penalty.
     pub(super) fn applies(self, penalty: Penalty) -> bool {
         self.protocol_scoring == ProtocolScoring::Apply
@@ -119,7 +145,8 @@ impl PeerPolicy {
 mod tests {
     use super::{
         super::penalty::{LoadPenalty, Penalty},
-        Admission, LoadScoring, PeerPolicy, ProtocolScoring, Retention, TrustBasis,
+        Admission, LoadScoring, PeerPolicy, ProtocolScoring, Retention, SharedRecordBudget,
+        TrustBasis,
     };
 
     /// Ordinary, bootstrap, trusted, and all three committee slots have explicit privileges.
@@ -180,21 +207,27 @@ mod tests {
         });
     }
 
-    /// Admission, retention, and load privileges alone do not suppress protocol penalties.
+    /// Admission, retention, load, and shared record budget privileges alone do not suppress
+    /// protocol penalties.
     #[test]
     fn protocol_penalties_ignore_privileges() {
         [Admission::Discovery, Admission::Authorized].into_iter().for_each(|admission| {
             [Retention::Ordinary, Retention::Protected].into_iter().for_each(|retention| {
                 [LoadScoring::Apply, LoadScoring::Exempt].into_iter().for_each(|load_scoring| {
-                    let policy = PeerPolicy {
-                        admission,
-                        retention,
-                        load_scoring,
-                        protocol_scoring: ProtocolScoring::Apply,
-                    };
-                    [Penalty::Mild, Penalty::Medium, Penalty::Severe, Penalty::Fatal]
-                        .into_iter()
-                        .for_each(|penalty| assert!(policy.applies(penalty)));
+                    [SharedRecordBudget::Apply, SharedRecordBudget::Exempt].into_iter().for_each(
+                        |shared_record_budget| {
+                            let policy = PeerPolicy {
+                                admission,
+                                retention,
+                                load_scoring,
+                                protocol_scoring: ProtocolScoring::Apply,
+                                shared_record_budget,
+                            };
+                            [Penalty::Mild, Penalty::Medium, Penalty::Severe, Penalty::Fatal]
+                                .into_iter()
+                                .for_each(|penalty| assert!(policy.applies(penalty)));
+                        },
+                    );
                 });
             });
         });
@@ -243,5 +276,31 @@ mod tests {
         assert_eq!(PeerPolicy::from_bases([TrustBasis::Bootstrap, TrustBasis::Operator]), trusted);
         assert!(!PeerPolicy::from_bases([]).protects_retention());
         assert!(PeerPolicy::from_bases([]).applies(Penalty::Load(LoadPenalty::Timeout)));
+    }
+
+    /// Every trust basis, alone or overlapping, bypasses the shared inbound record budget,
+    /// and the bypass leaves penalty scoring unchanged.
+    #[test]
+    fn shared_record_budget_matrix() {
+        let ordinary = PeerPolicy::from_bases([]);
+        assert_eq!(ordinary.shared_record_budget, SharedRecordBudget::Apply);
+        assert!(!ordinary.exempts_shared_record_budget());
+        [
+            vec![TrustBasis::Bootstrap],
+            vec![TrustBasis::Operator],
+            vec![TrustBasis::Validator],
+            vec![TrustBasis::Bootstrap, TrustBasis::Operator],
+            vec![TrustBasis::Operator, TrustBasis::Validator],
+            vec![TrustBasis::Validator, TrustBasis::Operator, TrustBasis::Bootstrap],
+        ]
+        .into_iter()
+        .for_each(|bases| {
+            let policy = PeerPolicy::from_bases(bases);
+            assert_eq!(policy.shared_record_budget, SharedRecordBudget::Exempt);
+            assert!(policy.exempts_shared_record_budget());
+        });
+        let bootstrap = PeerPolicy::from_bases([TrustBasis::Bootstrap]);
+        assert!(bootstrap.applies(Penalty::Load(LoadPenalty::KademliaFlood)));
+        assert!(bootstrap.applies(Penalty::Fatal));
     }
 }

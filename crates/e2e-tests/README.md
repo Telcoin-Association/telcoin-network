@@ -14,7 +14,6 @@ and a 180-second recovery deadline, so each case takes about 60 to 75 seconds. T
 B's epoch duration and kill offset:
 
 ```sh
-TN_TEST_MDBX_SYNC=safe-no-sync \
 TN_SIGKILL_EPOCH_SECS=1200 \
 TN_SIGKILL_BEFORE_CLOSE_SECS=59 \
 TN_SIGKILL_DOWNTIME_SECS=300 \

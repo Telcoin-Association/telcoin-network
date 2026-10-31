@@ -1,0 +1,264 @@
+// SPDX-License-Identifier: MIT or Apache-2.0
+
+//! tndb: a `Database` whose tables share one log. It replaced an earlier per-table engine of the
+//! same name, whose separate files cost a sync per table per commit (this one was called
+//! `tnlog` while the two were compared).
+//!
+//! Every table's records go to one CRC-framed log per database ([`record`]); each table keeps its
+//! own B+tree index of positions in it; a manifest ([`manifest`]) names the tables. All writes take
+//! one write lock and land as whole batches (a bare write, or a whole transaction, atomic across
+//! tables), so every batch end is a commit point and the commit thread ([`commit`]) syncs the log
+//! up to the latest without taking the write lock (only the sync lock, which a rollback's flush
+//! and a writer leading its own round also take): one sync per round, however many tables and
+//! writers it covers. Readers take no lock. A compaction thread ([`compact`])
+//! rewrites the log's live rows into a new generation in the background, once the log has doubled
+//! since the last one.
+
+mod commit;
+mod compact;
+pub mod database;
+pub mod inspect;
+mod layout;
+mod manifest;
+mod metrics;
+mod record;
+pub mod split;
+mod store;
+
+pub use database::{CommitMode, CompactionConfig, TnDatabase, TnDbOptions};
+pub use inspect::{inspect, inspect_split, EnvReport, IndexState, SplitReport, TableReport};
+pub use split::{SplitDatabase, CACHE_AUTO_MIN_BYTES, MDBX_MIGRATED};
+
+/// The directory under the node's consensus DB path holding its tndb database (a
+/// [`SplitDatabase`]) when the `tndb` feature picks the backend.
+pub const TNDB_DIR: &str = "tndb";
+
+/// A table's id in the log's records (never reused).
+pub(crate) type TableId = u16;
+
+/// Test-only: what the writers and the commit thread did (process-wide), for the benches.
+#[cfg(test)]
+pub(crate) mod stats {
+    use std::{
+        sync::atomic::{AtomicU64, Ordering},
+        time::Duration,
+    };
+
+    pub(crate) static SYNCS: AtomicU64 = AtomicU64::new(0);
+    pub(crate) static SYNC_NS: AtomicU64 = AtomicU64::new(0);
+    /// The write lock: acquisitions (waits) and holds, by writers.
+    pub(crate) static LOCK_WAITS: AtomicU64 = AtomicU64::new(0);
+    pub(crate) static LOCK_WAIT_NS: AtomicU64 = AtomicU64::new(0);
+    pub(crate) static LOCK_HOLDS: AtomicU64 = AtomicU64::new(0);
+    pub(crate) static LOCK_HOLD_NS: AtomicU64 = AtomicU64::new(0);
+
+    /// Compactions switched to, and how long each switch held the write lock.
+    pub(crate) static COMPACTIONS: AtomicU64 = AtomicU64::new(0);
+    pub(crate) static SWITCH_HOLD_NS: AtomicU64 = AtomicU64::new(0);
+    static SWITCH_HOLD_MAX_NS: AtomicU64 = AtomicU64::new(0);
+
+    /// Per-log counters, one slot per log of a `SplitDatabase` (named by its directory), plus one
+    /// for any other log.
+    pub(crate) const LOG_NAMES: [&str; 4] = ["epoch", "kad", "cache", "other"];
+
+    pub(crate) struct LogCounters {
+        syncs: AtomicU64,
+        sync_ns: AtomicU64,
+        hold_max_ns: AtomicU64,
+        compactions: AtomicU64,
+        switch_ns: AtomicU64,
+        switch_max_ns: AtomicU64,
+        abandoned: AtomicU64,
+        cancelled: AtomicU64,
+    }
+
+    impl LogCounters {
+        const fn new() -> Self {
+            Self {
+                syncs: AtomicU64::new(0),
+                sync_ns: AtomicU64::new(0),
+                hold_max_ns: AtomicU64::new(0),
+                compactions: AtomicU64::new(0),
+                switch_ns: AtomicU64::new(0),
+                switch_max_ns: AtomicU64::new(0),
+                abandoned: AtomicU64::new(0),
+                cancelled: AtomicU64::new(0),
+            }
+        }
+
+        pub(crate) fn sync(&self, took: Duration) {
+            add(&self.syncs, &self.sync_ns, took);
+        }
+
+        pub(crate) fn hold(&self, took: Duration) {
+            self.hold_max_ns.fetch_max(took.as_nanos() as u64, Ordering::Relaxed);
+        }
+
+        pub(crate) fn switch(&self, took: Duration) {
+            add(&self.compactions, &self.switch_ns, took);
+            self.switch_max_ns.fetch_max(took.as_nanos() as u64, Ordering::Relaxed);
+        }
+
+        /// Count one compaction that ended without a switch: cancelled by a close, or abandoned.
+        pub(crate) fn ended(&self, cancelled: bool) {
+            let count = if cancelled { &self.cancelled } else { &self.abandoned };
+            count.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    static PER_LOG: [LogCounters; 4] = [const { LogCounters::new() }; 4];
+
+    /// The slot of the log rooted at `root`.
+    pub(crate) fn slot(root: &std::path::Path) -> usize {
+        let name = root.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        LOG_NAMES[..3].iter().position(|log| *log == name).unwrap_or(3)
+    }
+
+    /// The counters of the log in `slot`.
+    pub(crate) fn log(slot: usize) -> &'static LogCounters {
+        &PER_LOG[slot]
+    }
+
+    /// One log's counters since the last take.
+    #[derive(Clone, Debug, Default)]
+    pub(crate) struct LogStats {
+        pub(crate) name: &'static str,
+        pub(crate) syncs: u64,
+        pub(crate) sync_ns: u64,
+        pub(crate) hold_max_ns: u64,
+        pub(crate) compactions: u64,
+        pub(crate) switch_ns: u64,
+        pub(crate) switch_max_ns: u64,
+        pub(crate) abandoned: u64,
+        pub(crate) cancelled: u64,
+    }
+
+    /// Every log that saw a sync, a compaction, an abandon or a cancel since the last take (counts
+    /// reset).
+    pub(crate) fn take_logs() -> Vec<LogStats> {
+        let take = |c: &AtomicU64| c.swap(0, Ordering::Relaxed);
+        PER_LOG
+            .iter()
+            .zip(LOG_NAMES)
+            .map(|(log, name)| LogStats {
+                name,
+                syncs: take(&log.syncs),
+                sync_ns: take(&log.sync_ns),
+                hold_max_ns: take(&log.hold_max_ns),
+                compactions: take(&log.compactions),
+                switch_ns: take(&log.switch_ns),
+                switch_max_ns: take(&log.switch_max_ns),
+                abandoned: take(&log.abandoned),
+                cancelled: take(&log.cancelled),
+            })
+            .filter(|log| {
+                log.syncs > 0 || log.compactions > 0 || log.abandoned > 0 || log.cancelled > 0
+            })
+            .collect()
+    }
+
+    /// Times a compaction started writing its new log back as it went (see
+    /// `Builder::write_behind`).
+    pub(crate) static WRITEBACKS: AtomicU64 = AtomicU64::new(0);
+
+    /// Compactions abandoned, and the last one's cause; compactions cancelled by a close.
+    static ABANDONED: AtomicU64 = AtomicU64::new(0);
+    static LAST_ABANDON: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+    static CANCELLED: AtomicU64 = AtomicU64::new(0);
+
+    /// Count one compaction that ended without a switch: cancelled by a close, or abandoned
+    /// (and why).
+    pub(crate) fn ended(cause: &str, cancelled: bool) {
+        if cancelled {
+            CANCELLED.fetch_add(1, Ordering::Relaxed);
+        } else {
+            ABANDONED.fetch_add(1, Ordering::Relaxed);
+            *LAST_ABANDON.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
+                cause.to_string();
+        }
+    }
+
+    /// Count one compaction's switch, which held the write lock for `took`.
+    pub(crate) fn switch(took: Duration) {
+        add(&COMPACTIONS, &SWITCH_HOLD_NS, took);
+        SWITCH_HOLD_MAX_NS.fetch_max(took.as_nanos() as u64, Ordering::Relaxed);
+    }
+
+    /// Write-lock holds by power-of-two nanosecond bucket, and the longest.
+    static HOLD_HIST: [AtomicU64; 40] = [const { AtomicU64::new(0) }; 40];
+    static HOLD_MAX_NS: AtomicU64 = AtomicU64::new(0);
+
+    /// Count one event of `count` taking `took` (added to `ns`).
+    pub(crate) fn add(count: &AtomicU64, ns: &AtomicU64, took: Duration) {
+        count.fetch_add(1, Ordering::Relaxed);
+        ns.fetch_add(took.as_nanos() as u64, Ordering::Relaxed);
+    }
+
+    /// Count one hold of the write lock.
+    pub(crate) fn hold(took: Duration) {
+        let ns = took.as_nanos() as u64;
+        add(&LOCK_HOLDS, &LOCK_HOLD_NS, took);
+        HOLD_HIST[(64 - ns.leading_zeros() as usize).min(39)].fetch_add(1, Ordering::Relaxed);
+        HOLD_MAX_NS.fetch_max(ns, Ordering::Relaxed);
+    }
+
+    /// What happened since the last take (counts reset).
+    #[derive(Clone, Debug, Default)]
+    pub(crate) struct Stats {
+        pub(crate) syncs: u64,
+        pub(crate) sync_ns: u64,
+        pub(crate) lock_waits: u64,
+        pub(crate) lock_wait_ns: u64,
+        pub(crate) holds: u64,
+        pub(crate) hold_ns: u64,
+        /// Upper bounds (ns) of the buckets holding the median and the 99th percentile hold.
+        pub(crate) hold_p50_ns: u64,
+        pub(crate) hold_p99_ns: u64,
+        pub(crate) hold_max_ns: u64,
+        pub(crate) compactions: u64,
+        pub(crate) switch_hold_ns: u64,
+        pub(crate) switch_hold_max_ns: u64,
+        pub(crate) abandoned: u64,
+        pub(crate) last_abandon: String,
+        pub(crate) cancelled: u64,
+    }
+
+    pub(crate) fn take() -> Stats {
+        let take = |c: &AtomicU64| c.swap(0, Ordering::Relaxed);
+        let hist: Vec<u64> = HOLD_HIST.iter().map(take).collect();
+        let total: u64 = hist.iter().sum();
+        let quantile = |q: f64| {
+            let want = (total as f64 * q).ceil() as u64;
+            let mut seen = 0;
+            for (bucket, n) in hist.iter().enumerate() {
+                seen += n;
+                if seen >= want.max(1) {
+                    return 1_u64 << bucket;
+                }
+            }
+            0
+        };
+        Stats {
+            syncs: take(&SYNCS),
+            sync_ns: take(&SYNC_NS),
+            lock_waits: take(&LOCK_WAITS),
+            lock_wait_ns: take(&LOCK_WAIT_NS),
+            holds: take(&LOCK_HOLDS),
+            hold_ns: take(&LOCK_HOLD_NS),
+            hold_p50_ns: quantile(0.50),
+            hold_p99_ns: quantile(0.99),
+            hold_max_ns: take(&HOLD_MAX_NS),
+            compactions: take(&COMPACTIONS),
+            switch_hold_ns: take(&SWITCH_HOLD_NS),
+            switch_hold_max_ns: take(&SWITCH_HOLD_MAX_NS),
+            abandoned: take(&ABANDONED),
+            last_abandon: std::mem::take(
+                &mut *LAST_ABANDON.lock().unwrap_or_else(std::sync::PoisonError::into_inner),
+            ),
+            cancelled: take(&CANCELLED),
+        }
+    }
+}
+
+#[cfg(test)]
+mod test;
