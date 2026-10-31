@@ -24,10 +24,12 @@ use crate::{
             tests::{owned, owned_tail, Kv},
             State,
         },
+        dup_cursor::InKey,
         test_harness::{ReportSeed, Rng},
         TreeRoot,
     },
-    DupTxnCursor, Env, Error, ReadTxn as _, Result, RwTxn, Table, TxnCursor,
+    txn::DupCursorPosition,
+    DupOptions, DupTxnCursor, Env, Error, ReadTxn as _, Result, RwTxn, Table, TxnCursor,
 };
 
 /// The key width of the dup tables here ([`OPTIONS`]).
@@ -43,9 +45,13 @@ fn row_value(k: u32, s: u16, tag: u8) -> Vec<u8> {
     vec![tag ^ k as u8 ^ s as u8; 1 + (usize::from(s) % 23)]
 }
 
+/// The dup tables here that pack: [`OPTIONS`] with a packed-set limit, so a key of a few short
+/// rows is a packed set and one past 160 bytes a nested tree.
+const PACKING: DupOptions = DupOptions { key_len: OPTIONS.key_len, packed_max: 160 };
+
 /// Dup table `d` and its twin `p`, committed with `rows` rows under each outer key `k` of
-/// `keys` (`(k, rows)`), subkeys `0..rows`.
-fn twins(env: &Env, keys: &[(u32, u16)]) -> (Table, Table, Rows) {
+/// `keys` (`(k, rows)`), subkeys `0..rows`, `d` created with `options`.
+fn twins(env: &Env, keys: &[(u32, u16)], options: DupOptions) -> (Table, Table, Rows) {
     let mut rows = Rows::new();
     for &(k, n) in keys {
         for s in 0..n {
@@ -53,7 +59,7 @@ fn twins(env: &Env, keys: &[(u32, u16)]) -> (Table, Table, Rows) {
         }
     }
     let mut txn = env.begin_rw().expect("rw");
-    let d = txn.create_dup_table("d", OPTIONS).expect("d");
+    let d = txn.create_dup_table("d", options).expect("d");
     let p = txn.create_table("p").expect("p");
     for (key, value) in &rows {
         txn.put(&d, key, value).expect("put d");
@@ -483,6 +489,8 @@ struct Seen {
     last_row_then_prev: [u32; 2],
     /// `follower_shares_prefix` in the deleted state (false, true).
     shares: [u32; 2],
+    /// Steps that left the dup cursor at a row of a nested key, and of a packed key.
+    at_rows: [u32; 2],
 }
 
 impl Seen {
@@ -501,8 +509,9 @@ impl Seen {
         self.prefix[usize::from(!next)][class][usize::from(r.is_some())] += 1;
     }
 
-    fn assert_complete(&self) {
+    fn assert_complete(&self, packing: bool) {
         let mut gates = vec![
+            ("at a nested row", self.at_rows[0]),
             ("reseeks", self.reseeks),
             ("landed from the nested cache", self.landings[0]),
             ("landed from the outer cache", self.landings[1]),
@@ -524,6 +533,9 @@ impl Seen {
             ("shares false", self.shares[0]),
             ("shares true", self.shares[1]),
         ];
+        if packing {
+            gates.push(("at a packed row", self.at_rows[1]));
+        }
         let classes = [
             ("n<K across", 1),
             ("n<K inside", 1),
@@ -551,12 +563,13 @@ fn leak(name: String) -> &'static str {
 }
 
 /// Oracle 2b over `seeds`: twins of [`OUTER`]'s keys (the third with `big` rows, the others a
-/// few) and `fillers` [`filler`] keys of one row; `rounds` write transactions, each with `pairs`
-/// cursor pairs taking `steps` random steps between them, a pair now and then replaced by a new
-/// one; each round commits (the file then checks) or aborts. Each step's results and the
-/// stepped pair's states are compared, and half the time its `follower_shares_prefix` around
-/// `K`; the coverage gates must all be reached.
+/// few) and `fillers` [`filler`] keys of one row, `d` created with `options`; `rounds` write
+/// transactions, each with `pairs` cursor pairs taking `steps` random steps between them, a pair
+/// now and then replaced by a new one; each round commits (the file then checks) or aborts. Each
+/// step's results and the stepped pair's states are compared, and half the time its
+/// `follower_shares_prefix` around `K`; the coverage gates must all be reached.
 fn lockstep(
+    options: DupOptions,
     seeds: std::ops::Range<u64>,
     big: u16,
     fillers: u32,
@@ -578,7 +591,7 @@ fn lockstep(
             .collect();
         keys.extend((0..fillers).map(|i| (filler(i), 1)));
         keys.sort_unstable();
-        let (d, p, initial) = twins(&env, &keys);
+        let (d, p, initial) = twins(&env, &keys, options);
         let mut model = initial.clone();
         let stat = env.begin_ro().expect("ro").table_stat(&d).expect("stat");
         assert!(fillers == 0 || stat.height >= 2, "the outer tree's height: {stat:?}");
@@ -636,6 +649,11 @@ fn lockstep(
                     }
                 }
                 seen.deleted += u32::from(dup.state().1);
+                match in_key(dup, &txn) {
+                    Some(InKey::Nested(..)) => seen.at_rows[0] += 1,
+                    Some(InKey::Packed { .. }) => seen.at_rows[1] += 1,
+                    None => {}
+                }
                 match &op {
                     Step::NextInPrefix(n) => seen.prefix_step(true, *n, base.as_deref(), &b),
                     Step::PrevInPrefix(n) => {
@@ -699,7 +717,7 @@ fn lockstep(
         }
         assert!(env.failure().is_none(), "no call latched: {:?}", env.failure());
     }
-    seen.assert_complete();
+    seen.assert_complete(options.packed_max != 0);
 }
 
 /// Whether `rows` holds a row under outer key `k`.
@@ -715,11 +733,19 @@ fn has_key(rows: &Rows, k: &[u8]) -> bool {
 /// coverage gates: reseeks, each landing of a cursor's delete, another writer's deletes under a
 /// cursor (its row, its follower, emptying its key, `delete_prefix` of it), the cursor's own
 /// deletes into the next key and of the table's last row, refused and key-creating cursor
-/// writes, prefix steps of every class both ways, and `prev_in_prefix(K)` after a key's last
-/// row is deleted.
+/// writes, prefix steps of every class both ways, `prev_in_prefix(K)` after a key's last row is
+/// deleted, and a cursor at a nested key's row (in a table that packs, at a packed key's too).
 #[test]
 fn dup_txn_cursors_and_direct_writes_match_the_composite_twin() {
-    lockstep(0..6, 300, 300, 5, 3000, 3);
+    lockstep(OPTIONS, 0..6, 300, 300, 5, 3000, 3);
+}
+
+/// [`dup_txn_cursors_and_direct_writes_match_the_composite_twin`] over a table that packs
+/// ([`PACKING`]): the small keys are packed sets, rewritten in place, promoted as they grow and
+/// emptied, under cursors and through them, beside the nested `big` key.
+#[test]
+fn dup_txn_cursors_and_direct_writes_match_the_composite_twin_packed() {
+    lockstep(PACKING, 0..6, 300, 300, 5, 3000, 3);
 }
 
 /// [`dup_txn_cursors_and_direct_writes_match_the_composite_twin`] over more seeds, rounds and
@@ -727,14 +753,23 @@ fn dup_txn_cursors_and_direct_writes_match_the_composite_twin() {
 #[test]
 #[ignore = "heavy: run with --release"]
 fn dup_txn_cursors_and_direct_writes_match_the_composite_twin_heavy() {
-    lockstep(0..64, 1500, 600, 6, 6000, 5);
+    lockstep(OPTIONS, 0..64, 1500, 600, 6, 6000, 5);
 }
 
 /// A fresh environment with `d` and `p` over `keys`, and a write transaction on it.
 fn setup(name: &str, keys: &[(u32, u16)]) -> (TempDir, Env, Table, Table, Rows) {
+    setup_with(name, keys, OPTIONS)
+}
+
+/// [`setup`] with `d` created with `options`.
+fn setup_with(
+    name: &str,
+    keys: &[(u32, u16)],
+    options: DupOptions,
+) -> (TempDir, Env, Table, Table, Rows) {
     let (dir, path) = temp(name);
     let env = open(&path, SyncMode::NoSync);
-    let (d, p, rows) = twins(&env, keys);
+    let (d, p, rows) = twins(&env, keys, options);
     (dir, env, d, p, rows)
 }
 
@@ -1268,4 +1303,245 @@ fn damage_under_a_dup_cursor_is_corrupt() {
             assert!(env.failure().is_some(), "{what} {op}: latched");
         }
     }
+}
+
+/// A fresh cursor's seek of `key` over `d` in `txn`: the position a cursor's placement after its
+/// own write must equal ([`DupTxnCursor::position`]).
+fn fresh_seek(txn: &RwTxn, d: &Table, key: &[u8]) -> DupCursorPosition {
+    let mut fresh = txn.dup_cursor_detached(d).expect("fresh cursor");
+    fresh.seek(txn, key).expect("fresh seek");
+    fresh.position(txn)
+}
+
+/// Where the cursor is inside its key ([`InKey`]), `None` while it is not at a row.
+fn in_key(c: &DupTxnCursor, txn: &RwTxn) -> Option<InKey> {
+    c.position(txn).1.map(|(_, inside)| inside)
+}
+
+/// A cursor's own write on a packed key ([`own_write`]) and the twin's.
+type OwnWrite = dyn Fn(&mut RwTxn, &mut DupTxnCursor, &mut TxnCursor) -> (Got, Got);
+
+/// In a transaction of its own, so that the outer leaf the write rewrites is published (and
+/// copied): both cursors at row `at` of the twins, `write` through each, then the same results
+/// and states, the dup cursor up to date with no reseek and at the position of a fresh cursor's
+/// seek of `sought`, and the same moves from there. Returns where the cursor then is inside its
+/// key and how its deletes landed ([`DupTxnCursor::landings`]).
+fn own_write(
+    env: &Env,
+    (d, p): (&Table, &Table),
+    (at, sought): (&[u8], &[u8]),
+    what: &str,
+    write: &OwnWrite,
+) -> (Option<InKey>, [u32; 3]) {
+    let mut txn = env.begin_rw().expect("rw");
+    let (mut c, mut t) = pair(&txn, d, p);
+    assert!(c.seek_exact(&txn, at).expect("seek").is_some(), "{what}: at {at:02x?}");
+    assert!(t.seek_exact(&txn, at).expect("seek").is_some(), "{what}: the twin at {at:02x?}");
+    let (a, b) = write(&mut txn, &mut c, &mut t);
+    assert_eq!(a, b, "{what}: the write");
+    assert_eq!(c.state(), t.state(), "{what}: state");
+    let position = c.position(&txn);
+    assert_eq!(position, fresh_seek(&txn, d, sought), "{what}: placed as a seek of {sought:02x?}");
+    assert!(position.4, "{what}: up to date");
+    let placed = (in_key(&c, &txn), c.landings);
+    for n in [0, K - 1, K, K + 1, K + 2] {
+        let shares = c.follower_shares_prefix(&txn, n).expect("shares");
+        assert_eq!(shares, t.follower_shares_prefix(&txn, n).expect("shares"), "{what}: n {n}");
+    }
+    assert_eq!(got(c.current(&txn)), got(t.current(&txn)), "{what}: current");
+    assert_eq!(got(c.next(&txn)), got(t.next(&txn)), "{what}: next");
+    assert_eq!(got(c.prev(&txn)), got(t.prev(&txn)), "{what}: prev");
+    assert_eq!(got(c.prev(&txn)), got(t.prev(&txn)), "{what}: prev again");
+    assert_eq!(c.reseeks, 0, "{what}: its own write is no reseek");
+    assert_eq!(txn.get(d, sought).expect("get"), txn.get(p, sought).expect("get"), "{what}");
+    txn.commit().expect("commit");
+    env.check().expect("check");
+    assert!(env.failure().is_none(), "{what}");
+    placed
+}
+
+/// A cursor's own writes on a packed key, each in a transaction of its own: a rewrite of its row
+/// and a new row (the set rewritten, still packed), a new key (a packed set), a row that takes
+/// the set past the limit (promoted: on the row in the new nested tree), and its deletes of a
+/// row with others left (the set rewritten; found again by key, on the next row or the next
+/// key's first row) and of a key's only row (the key emptied; placed from the outer path cache).
+/// After each, the cursor is where a fresh cursor's seek of the row (after a delete, of the
+/// deleted row) puts it, paths included, and moves as the twin's.
+#[test]
+fn a_txn_cursor_follows_its_packed_key_rewritten_promoted_and_emptied() {
+    let keys = [(1, 2), (2, 3), (3, 4), (4, 1), (5, 2), (6, 40)];
+    let (_dir, env, d, p, _) = setup_with("tndb_b_dup_txn_packed_own", &keys, PACKING);
+    let both = (&d, &p);
+    let put = |key: Vec<u8>, value: Vec<u8>| {
+        move |txn: &mut RwTxn, c: &mut DupTxnCursor, t: &mut TxnCursor| {
+            (done(c.put(txn, &key, &value)), done(t.put(txn, &key, &value)))
+        }
+    };
+    let delete = |txn: &mut RwTxn, c: &mut DupTxnCursor, t: &mut TxnCursor| {
+        (flag(c.delete_current(txn)), flag(t.delete_current(txn)))
+    };
+    let packed = |rows, at| Some(InKey::Packed { rows, at });
+    let r = row_key(2, 1);
+    let rewrite = put(r.clone(), row_value(2, 1, 9));
+    assert_eq!(own_write(&env, both, (&r, &r), "rewrite", &rewrite).0, packed(3, 1));
+    let n = row_key(2, 7);
+    let insert = put(n.clone(), row_value(2, 7, 9));
+    assert_eq!(own_write(&env, both, (&r, &n), "insert", &insert).0, packed(4, 3));
+    let new = row_key(7, 0);
+    let create = put(new.clone(), row_value(7, 0, 9));
+    assert_eq!(own_write(&env, both, (&r, &new), "create", &create).0, packed(1, 0));
+    let big = row_key(2, 5);
+    let promote = put(big.clone(), vec![0x5a; 150]);
+    let (inside, _) = own_write(&env, both, (&r, &big), "promotion", &promote);
+    assert!(matches!(inside, Some(InKey::Nested(..))), "promoted: {inside:?}");
+    let m = row_key(3, 1);
+    let (inside, landings) = own_write(&env, both, (&m, &m), "delete inside", &delete);
+    assert_eq!((inside, landings), (packed(3, 1), [0, 0, 1]), "by key");
+    let l = row_key(3, 3);
+    let (inside, landings) = own_write(&env, both, (&l, &l), "delete of the last", &delete);
+    assert_eq!((inside, landings), (packed(1, 0), [0, 0, 1]), "on the next key, by key");
+    let o = row_key(4, 0);
+    let (inside, landings) = own_write(&env, both, (&o, &o), "emptied", &delete);
+    assert_eq!((inside, landings), (packed(2, 0), [0, 1, 0]), "from the outer cache");
+    let txn = env.begin_ro().expect("ro");
+    assert_eq!(txn.get(&d, &o).expect("get"), None);
+    assert_eq!(txn.get(&d, &big).expect("get"), Some(&[0x5a; 150][..]));
+}
+
+/// Another writer's changes to the packed key a cursor is at, each between two calls: its row
+/// rewritten in place (the same row, its new value), the row before it deleted and put back (the
+/// row's index in the set moves), a row that promotes the set (on the row in the new nested
+/// tree), and `delete_prefix` of the key (on the next key's first row in the deleted state, as
+/// the twin's wipe loop leaves its cursor). Each is one reseek, and the cursor is then where a
+/// fresh cursor's seek of its row puts it, as the twin's cursor is.
+#[test]
+fn another_writers_packed_rewrite_reseeks_the_cursor() {
+    let keys = [(1, 2), (2, 3), (3, 2), (4, 1)];
+    let (_dir, env, d, p, _) = setup_with("tndb_b_dup_txn_packed_other", &keys, PACKING);
+    let mut txn = env.begin_rw().expect("rw");
+    let (mut c, mut t) = pair(&txn, &d, &p);
+    let at = row_key(2, 1);
+    assert!(c.seek_exact(&txn, &at).expect("seek").is_some());
+    assert!(t.seek_exact(&txn, &at).expect("seek").is_some());
+    assert_eq!(in_key(&c, &txn), Some(InKey::Packed { rows: 3, at: 1 }));
+    let both = |txn: &mut RwTxn, key: &[u8], value: Option<&[u8]>| match value {
+        Some(v) => {
+            txn.put(&d, key, v).expect("put d");
+            txn.put(&p, key, v).expect("put p");
+        }
+        None => {
+            assert!(txn.delete(&d, key).expect("delete d"));
+            assert!(txn.delete(&p, key).expect("delete p"));
+        }
+    };
+    let mut reseeks = 0;
+    let mut seen = |txn: &RwTxn, c: &mut DupTxnCursor, t: &mut TxnCursor, what: &str| {
+        reseeks += 1;
+        assert_eq!(got(c.current(txn)), got(t.current(txn)), "{what}: current");
+        assert_eq!(c.reseeks, reseeks, "{what}: one reseek");
+        let key = c.key_for_test().expect("at a row").to_vec();
+        assert_eq!(c.position(txn), fresh_seek(txn, &d, &key), "{what}: as a fresh seek");
+        in_key(c, txn)
+    };
+    both(&mut txn, &at, Some(&row_value(2, 1, 9)));
+    let inside = seen(&txn, &mut c, &mut t, "in place");
+    assert_eq!(inside, Some(InKey::Packed { rows: 3, at: 1 }));
+    both(&mut txn, &row_key(2, 0), None);
+    assert_eq!(seen(&txn, &mut c, &mut t, "row 0 gone"), Some(InKey::Packed { rows: 2, at: 0 }));
+    both(&mut txn, &row_key(2, 0), Some(&row_value(2, 0, 9)));
+    assert_eq!(seen(&txn, &mut c, &mut t, "row 0 back"), Some(InKey::Packed { rows: 3, at: 1 }));
+    both(&mut txn, &row_key(2, 9), Some(&[0x5a; 150]));
+    let inside = seen(&txn, &mut c, &mut t, "promoted");
+    assert!(matches!(inside, Some(InKey::Nested(..))), "promoted: {inside:?}");
+    assert_eq!(got(c.next(&txn)), got(t.next(&txn)), "next after the promotion");
+    assert_eq!(got(c.next(&txn)), got(t.next(&txn)), "the promoted row");
+    // The wipe loop's state: `delete_prefix` of the packed key 3 under the cursor.
+    let k = 3u32.to_be_bytes();
+    let at = row_key(3, 1);
+    assert!(c.seek_exact(&txn, &at).expect("seek").is_some());
+    assert!(t.seek_exact(&txn, &at).expect("seek").is_some());
+    assert_eq!(in_key(&c, &txn), Some(InKey::Packed { rows: 2, at: 1 }));
+    let reseeks = c.reseeks;
+    assert_eq!(txn.delete_prefix(&d, &k).expect("delete_prefix"), 2);
+    let (mut w, wiped) = wipe(&mut txn, &p, &k);
+    assert_eq!(wiped, 2);
+    for n in [0, K - 1, K, K + 1, K + 2] {
+        let shares = c.follower_shares_prefix(&txn, n).expect("shares");
+        assert_eq!(shares, w.follower_shares_prefix(&txn, n).expect("shares"), "wiped: n {n}");
+        assert_eq!(shares, t.follower_shares_prefix(&txn, n).expect("shares"), "wiped: n {n}");
+    }
+    assert_eq!(c.reseeks, reseeks + 1, "wiped: one reseek");
+    assert_eq!(c.state(), (State::At, true), "wiped: on the follower, deleted");
+    assert_eq!(c.state(), w.state(), "wiped: the wipe loop's state");
+    assert_eq!(c.deleted_key_for_test(), Some(&at[..]), "wiped: the deleted key");
+    assert_eq!(c.position(&txn), fresh_seek(&txn, &d, &at), "wiped: as a seek of its row");
+    assert_eq!(in_key(&c, &txn), Some(InKey::Packed { rows: 1, at: 0 }), "wiped: on key 4");
+    assert_eq!(got(c.prev_in_prefix(&txn, K)), got(w.prev_in_prefix(&txn, K)), "wiped");
+    assert_eq!(got(c.prev(&txn)), got(w.prev(&txn)), "wiped: prev");
+    assert_eq!(got(c.next(&txn)), got(w.next(&txn)), "wiped: next");
+    txn.commit().expect("commit");
+    env.check().expect("check");
+    assert!(env.failure().is_none());
+}
+
+/// A cursor on a packed row sees the transaction's own puts to its key, which rewrite the set in
+/// place: its `current` the row's new value and `next` the next row's; then a promotion under
+/// it (it steps on through the new nested tree), and the removal of its row and then of its
+/// whole key, one row at a time (it is left on the follower in the deleted state), as the twin's
+/// cursor does.
+#[test]
+fn a_dup_txn_cursor_sees_an_in_place_packed_rewrite() {
+    let keys = [(1, 1), (2, 3), (3, 2), (4, 1)];
+    let (_dir, env, d, p, _) = setup_with("tndb_b_dup_txn_packed_seen", &keys, PACKING);
+    let mut txn = env.begin_rw().expect("rw");
+    let (mut c, mut t) = pair(&txn, &d, &p);
+    let put = |txn: &mut RwTxn, key: &[u8], value: &[u8]| {
+        txn.put(&d, key, value).expect("put d");
+        txn.put(&p, key, value).expect("put p");
+    };
+    let delete = |txn: &mut RwTxn, key: &[u8]| {
+        assert!(txn.delete(&d, key).expect("delete d"));
+        assert!(txn.delete(&p, key).expect("delete p"));
+    };
+    let same = |txn: &RwTxn, c: &mut DupTxnCursor, t: &mut TxnCursor, what: &str| {
+        assert_eq!(c.state(), t.state(), "{what}: state");
+        for n in [0, K - 1, K, K + 1] {
+            let shares = c.follower_shares_prefix(txn, n).expect("shares");
+            assert_eq!(shares, t.follower_shares_prefix(txn, n).expect("shares"), "{what}: {n}");
+        }
+    };
+    assert!(c.seek_exact(&txn, &row_key(2, 0)).expect("seek").is_some());
+    assert!(t.seek_exact(&txn, &row_key(2, 0)).expect("seek").is_some());
+    put(&mut txn, &row_key(2, 0), &row_value(2, 0, 7));
+    put(&mut txn, &row_key(2, 1), &row_value(2, 1, 7));
+    let now = got(c.current(&txn));
+    assert_eq!(now, Ok(Some((row_key(2, 0), row_value(2, 0, 7)))), "the new value");
+    assert_eq!(now, got(t.current(&txn)));
+    let next = got(c.next(&txn));
+    assert_eq!(next, Ok(Some((row_key(2, 1), row_value(2, 1, 7)))), "the next row's new value");
+    assert_eq!(next, got(t.next(&txn)));
+    assert_eq!(in_key(&c, &txn), Some(InKey::Packed { rows: 3, at: 1 }));
+    put(&mut txn, &row_key(2, 4), &[0x5a; 150]);
+    same(&txn, &mut c, &mut t, "promoted");
+    assert_eq!(got(c.next(&txn)), got(t.next(&txn)), "next after the promotion");
+    assert!(matches!(in_key(&c, &txn), Some(InKey::Nested(..))), "in the nested tree");
+    assert_eq!(got(c.next(&txn)), got(t.next(&txn)), "the promoted row");
+    assert_eq!(key_of(c.current(&txn)), Some(row_key(2, 4)));
+    delete(&mut txn, &row_key(2, 4));
+    same(&txn, &mut c, &mut t, "its row removed");
+    assert_eq!(c.state(), (State::At, true), "on the follower, deleted");
+    assert_eq!(got(c.current(&txn)), got(t.current(&txn)), "the follower");
+    assert_eq!(in_key(&c, &txn), Some(InKey::Packed { rows: 2, at: 0 }), "key 3, packed");
+    delete(&mut txn, &row_key(3, 0));
+    same(&txn, &mut c, &mut t, "its row removed again");
+    assert_eq!(in_key(&c, &txn), Some(InKey::Packed { rows: 1, at: 0 }), "key 3's last row");
+    delete(&mut txn, &row_key(3, 1));
+    same(&txn, &mut c, &mut t, "its key removed");
+    assert_eq!(c.deleted_key_for_test(), Some(&row_key(3, 0)[..]), "still the first deleted");
+    assert_eq!(got(c.prev(&txn)), got(t.prev(&txn)), "prev past the removed key");
+    assert_eq!(got(c.next(&txn)), got(t.next(&txn)), "next: key 4");
+    assert_eq!(key_of(c.current(&txn)), Some(row_key(4, 0)));
+    txn.commit().expect("commit");
+    env.check().expect("check");
+    assert!(env.failure().is_none());
 }

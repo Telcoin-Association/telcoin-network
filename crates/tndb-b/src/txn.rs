@@ -433,11 +433,14 @@ fn apply_delta(
 /// Where a dup put left its row, for a [`DupTxnCursor`] to land on it ([`dup_put`]).
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct DupPlaced {
-    /// True if the put created its outer key (a new nested tree and its cell): the outer tree
-    /// changed.
+    /// True if the put created its outer key (a new nested tree or packed set, and its cell):
+    /// the outer tree changed.
     created: bool,
-    /// The row's slot in the leaf its nested tree's path cache ([`Nested::cache`]) then names;
-    /// `None` when the put left that cache empty.
+    /// The row's slot in the leaf its nested tree's path cache ([`Nested::cache`]) then names,
+    /// given only by a put that changed no outer cell (a nested-only write); `None` when the put
+    /// left that cache empty, and for every write of a packed set (a create, a rewrite) and every
+    /// promotion ([`promote`]), which rewrite the key's outer cell, so the outer path a cursor
+    /// holds may be stale: the cursor then finds the row by key.
     slot: Option<usize>,
 }
 
@@ -447,11 +450,14 @@ pub(crate) struct DupPlaced {
 pub(crate) struct DupRemoved {
     /// True if the row was there (and is now gone).
     found: bool,
-    /// True if the delete emptied the key's nested tree, so the key's outer cell went too.
+    /// True if the delete emptied the key's nested tree or packed set, so the key's outer cell
+    /// went too.
     emptied: bool,
     /// The deleted row's old slot ([`write::Removed::slot`]): in the leaf the nested tree's path
     /// cache names when the tree was kept, else in the leaf the table's outer path cache
-    /// ([`Working::cache`]) names, where the removed cell was; `None` when that cache is empty.
+    /// ([`Working::cache`]) names, where the removed cell was (an emptied key, packed or
+    /// nested); `None` when that cache is empty, and for the delete of a packed row that left
+    /// others ([`packed_delete`]), whose rewritten cell the cursor then finds by key.
     slot: Option<usize>,
 }
 
@@ -2640,6 +2646,7 @@ impl RwTxn {
             Ok(DupTxnCursor {
                 track: Tracker::new(table.clone(), work),
                 outer_root: record.root,
+                packed_max: dup.packed_max,
                 walk: DupWalk::new(dup.key_len, self.inner.geometry.max_subkey(key_len)),
                 deleted: false,
                 deleted_key: Vec::new(),
@@ -3218,6 +3225,11 @@ impl std::fmt::Debug for TxnCursor {
 #[cfg(test)]
 pub(crate) type CursorPosition = (State, Vec<(u32, u16)>, TreeRoot, Option<Vec<u8>>, bool);
 
+/// Test-only: a dup cursor's [`DupTxnCursor::position`].
+#[cfg(test)]
+pub(crate) type DupCursorPosition =
+    (State, Option<crate::tree::dup_cursor::WalkPlace>, TreeRoot, Option<Vec<u8>>, bool);
+
 impl TxnCursor {
     /// Test-only: where the cursor is, and whether it sits after a deleted entry.
     #[cfg(test)]
@@ -3642,54 +3654,67 @@ impl TxnCursor {
 
 /// The root source of a [`DupTxnCursor`] ([`NestedRoots`]): the table's working map, whose root
 /// of a key is the truth while it holds the key, else the key's cell, which then holds the
-/// committed root ([`load_cell`]); never a cell the map supersedes.
+/// committed root ([`load_cell`]); never a cell the map supersedes. Building one reads nothing:
+/// the map is looked up only when a landing asks for a root, so a move inside a key and a read
+/// of the row the cursor is at pay no lookup.
 struct WorkRoots<'a> {
     writer: &'a Writer,
-    table: &'a Table,
-    /// The table's working map; `None` while the table has none or it is empty (no lookup).
-    map: Option<&'a NestedMap>,
+    work: &'a Work,
+    track: &'a Tracker,
+    /// The table's packed-set limit, the cursor's ([`DupTxnCursor::packed_max`]).
+    packed_max: u16,
 }
 
 impl<'a> WorkRoots<'a> {
     /// The root source of a cursor whose tracker `track` is up to date with `work`, so its slot
-    /// names the table's working record whenever the table has one.
+    /// names the table's working record whenever the table has one, over a table whose
+    /// packed-set limit is `packed_max`.
     #[inline]
-    fn new(work: &'a Work, track: &'a Tracker) -> Self {
+    fn new(work: &'a Work, track: &'a Tracker, packed_max: u16) -> Self {
+        Self { writer: work.writer(), work, track, packed_max }
+    }
+
+    /// The table's working map; `None` while the table has none or it is empty (no lookup).
+    #[inline]
+    fn map(&self) -> Option<&'a NestedMap> {
+        let track = self.track;
         let map = track
             .slot
-            .and_then(|i| work.tables.get(i))
+            .and_then(|i| self.work.tables.get(i))
             .filter(|w| w.table.id == track.table.id)
             .map(|w| &w.nested)
             .filter(|m| !m.is_empty());
         // A key with an entry has no other truth: the map is never skipped while it has one.
         debug_assert!(
             map.is_some()
-                || work.tables.iter().all(|w| w.table.id != track.table.id || w.nested.is_empty()),
+                || self
+                    .work
+                    .tables
+                    .iter()
+                    .all(|w| w.table.id != track.table.id || w.nested.is_empty()),
             "dup table {}: a cursor's root source skipped the working map",
             track.table.name()
         );
-        Self { writer: work.writer(), table: &track.table, map }
+        map
     }
 }
 
 impl NestedRoots for WorkRoots<'_> {
     fn name(&self) -> &str {
-        self.table.name()
+        self.track.table.name()
     }
 
     #[inline]
     fn root(&mut self, k: &[u8], cell: &[u8; page::NESTED_CELL]) -> Result<TreeRoot> {
-        if let Some(n) = self.map.and_then(|m| m.get(k)) {
+        if let Some(n) = self.map().and_then(|m| m.get(k)) {
             return Ok(n.root);
         }
-        load_cell(self.writer, self.table, k, cell)
+        load_cell(self.writer, &self.track.table, k, cell)
     }
 
-    /// 0: a write transaction's dup cursor reads no packed set yet, so its walker refuses a
-    /// packed key's cell as [`Error::Corrupt`] (fail closed).
     #[inline]
     fn packed_max(&self) -> usize {
-        0
+        usize::from(self.packed_max)
     }
 }
 
@@ -3715,9 +3740,10 @@ fn checked<'s>(writer: &'s Writer) -> impl Fn(u32) -> Result<Option<&'s [u8]>> +
 ///
 /// **Staleness.** A table change since the cursor's last call (another cursor's write, or the
 /// transaction's `put`, `append`, `insert`, `delete`, `delete_prefix` or `clear_table`, a write
-/// to one key's nested tree included) makes the cursor find its row again by its logical key, as
-/// [`TxnCursor`]'s type docs describe: back on it if it is still there, else on the first row
-/// after it in the deleted state. So a cursor whose key another writer emptied (its last row
+/// to one key's nested tree included, and a packed set rewritten in place or promoted to a nested
+/// tree) makes the cursor find its row again by its logical key, as [`TxnCursor`]'s type docs
+/// describe: back on it if it is still there, else on the first row after it in the deleted
+/// state. So a cursor whose key another writer emptied (its last row
 /// deleted, `delete_prefix` of the key, or `clear_table`) is left on the next key's first row
 /// (or after the end) in the deleted state, as the twin's cursor is after the same rows went one
 /// by one. A seek on a changed table descends from both roots without first finding its row
@@ -3732,6 +3758,9 @@ pub struct DupTxnCursor {
     track: Tracker,
     /// The table's working outer tree as of the cursor's last call.
     outer_root: TreeRoot,
+    /// The table's packed-set limit (its record's `packed_max`), fixed for the table's life: a
+    /// key whose outer cell is inline is a packed set when it is not 0.
+    packed_max: u16,
     /// The position, with the logical key of the row it is at (while `deleted`, the deleted
     /// row's follower): the key a reseek finds it again by.
     walk: DupWalk,
@@ -3782,6 +3811,17 @@ impl DupTxnCursor {
     #[cfg(test)]
     pub(crate) fn key_for_test(&self) -> Option<&[u8]> {
         (self.walk.state() == State::At).then(|| self.walk.key())
+    }
+
+    /// Test-only: what places the cursor, as a seek leaves it: its state, where it is in the
+    /// trees while at a row ([`DupWalk::place_for_test`]), the outer tree it reads, the logical
+    /// key it would find its row again by (while at one), and whether it is up to date with `txn`
+    /// (its next call makes no reseek).
+    #[cfg(test)]
+    pub(crate) fn position(&self, txn: &RwTxn) -> DupCursorPosition {
+        let key = self.key_for_test().map(<[u8]>::to_vec);
+        let up_to_date = self.track.up_to_date(&txn.work);
+        (self.walk.state(), self.walk.place_for_test(), self.outer_root, key, up_to_date)
     }
 
     /// Test-only: the first and last keys of the outer and the nested leaf the cursor is at, read
@@ -3836,11 +3876,11 @@ impl DupTxnCursor {
         if self.walk.state() != State::At {
             return Ok(());
         }
-        let Self { track, outer_root, walk, deleted, deleted_key, target, .. } = self;
+        let Self { track, outer_root, walk, packed_max, deleted, deleted_key, target, .. } = self;
         target.clear();
         target.extend_from_slice(walk.key());
         walk.unset();
-        let mut roots = WorkRoots::new(work, track);
+        let mut roots = WorkRoots::new(work, track, *packed_max);
         let found = match walk.seek(work.writer(), outer_root, &mut roots, &no_leaf, target) {
             Ok(Some(_)) if walk.key() == target.as_slice() => Ok(()),
             Ok(_) => {
@@ -3913,6 +3953,12 @@ impl DupTxnCursor {
         op(self, work).inspect_err(|e| txn.inner.latch.latch_error(e))
     }
 
+    /// The cursor's root source over `work` ([`WorkRoots`]), for a read of the row it is at.
+    #[inline(always)]
+    fn roots<'a>(&'a self, work: &'a Work) -> WorkRoots<'a> {
+        WorkRoots::new(work, &self.track, self.packed_max)
+    }
+
     /// Run walker move `op` over `work` with the cursor's outer root and root source.
     #[inline(always)]
     fn walk_op<'w>(
@@ -3920,8 +3966,8 @@ impl DupTxnCursor {
         work: &'w Work,
         op: impl FnOnce(&mut DupWalk, &'w Writer, &TreeRoot, &mut WorkRoots<'_>) -> Walked<'w>,
     ) -> Walked<'w> {
-        let Self { track, outer_root, walk, .. } = self;
-        let mut roots = WorkRoots::new(work, track);
+        let Self { track, outer_root, walk, packed_max, .. } = self;
+        let mut roots = WorkRoots::new(work, track, *packed_max);
         op(walk, work.writer(), outer_root, &mut roots)
     }
 
@@ -3963,7 +4009,7 @@ impl DupTxnCursor {
         let value = self.call(txn, |c, work| {
             if std::mem::take(&mut c.deleted) {
                 let store = work.writer();
-                return c.walk.current(store, &WorkRoots::new(work, &c.track), &checked(store));
+                return c.walk.current(store, &c.roots(work), &checked(store));
             }
             c.walk_op(work, |w, store, root, roots| {
                 w.step(store, root, roots, &checked(store), true)
@@ -3984,7 +4030,7 @@ impl DupTxnCursor {
         let value = self.call(txn, |c, work| {
             c.deleted = false;
             let store = work.writer();
-            c.walk.current(store, &WorkRoots::new(work, &c.track), &checked(store))
+            c.walk.current(store, &c.roots(work), &checked(store))
         })?;
         Ok(self.row(value))
     }
@@ -3999,7 +4045,7 @@ impl DupTxnCursor {
         let tail = self.call(txn, |c, work| {
             c.deleted = false;
             let store = work.writer();
-            c.walk.current_with_key_tail(store, &WorkRoots::new(work, &c.track), &checked(store), t)
+            c.walk.current_with_key_tail(store, &c.roots(work), &checked(store), t)
         })?;
         Ok(tail.map(|tail| (self.walk.key(), tail)))
     }
@@ -4037,7 +4083,7 @@ impl DupTxnCursor {
             if found.is_none() {
                 return Ok(None);
             }
-            c.walk.current_with_key_tail(store, &WorkRoots::new(work, &c.track), &checked(store), t)
+            c.walk.current_with_key_tail(store, &c.roots(work), &checked(store), t)
         })?;
         Ok(tail.map(|tail| (self.walk.key(), tail)))
     }
@@ -4099,7 +4145,7 @@ impl DupTxnCursor {
             if found.is_none() {
                 return Ok(None);
             }
-            c.walk.current_with_key_tail(store, &WorkRoots::new(work, &c.track), &checked(store), t)
+            c.walk.current_with_key_tail(store, &c.roots(work), &checked(store), t)
         })?;
         Ok(tail.map(|tail| (self.walk.key(), tail)))
     }
@@ -4135,10 +4181,10 @@ impl DupTxnCursor {
         forward: bool,
     ) -> Result<Option<(&'c [u8], &'c [u8])>> {
         let value = self.call(txn, |c, work| {
-            let Self { track, outer_root, walk, deleted, deleted_key, target, .. } = c;
+            let Self { track, outer_root, walk, packed_max, deleted, deleted_key, target, .. } = c;
             let store = work.writer();
             let again = checked(store);
-            let mut roots = WorkRoots::new(work, track);
+            let mut roots = WorkRoots::new(work, track, *packed_max);
             if !*deleted {
                 return walk.step_in_prefix(store, outer_root, &mut roots, &again, n, forward);
             }
@@ -4181,10 +4227,11 @@ impl DupTxnCursor {
 
     /// [`Self::put`], [`Self::append`] or [`Self::insert`] (`kind`): the transaction and table
     /// checked, but no reseek, since the write places the cursor anew. A write into the key of
-    /// the row the cursor was at, up to date, that created no key changed only that key's nested
-    /// tree: the outer path stays and the nested path is placed from the tree's path cache. Any
-    /// other write finds the row again from both roots. The table's new write stamp is the
-    /// cursor's own, so its write causes it no reseek.
+    /// the row the cursor was at, up to date, that changed only that key's nested tree (it
+    /// created no key and gave the tree's slot, [`DupPlaced::slot`]): the outer path stays and
+    /// the nested path is placed from the tree's path cache. Any other write, a packed set's
+    /// and a promotion's included, finds the row again from both roots. The table's new write
+    /// stamp is the cursor's own, so its write causes it no reseek.
     fn put_entry(
         &mut self,
         txn: &mut RwTxn,
@@ -4222,9 +4269,9 @@ impl DupTxnCursor {
     /// the row from both roots; it must be there.
     fn find_put(&mut self, work: &Work, key: &[u8]) -> Result<()> {
         self.outer_root = self.working_root(work)?;
-        let Self { track, outer_root, walk, .. } = self;
+        let Self { track, outer_root, walk, packed_max, .. } = self;
         walk.unset();
-        let mut roots = WorkRoots::new(work, track);
+        let mut roots = WorkRoots::new(work, track, *packed_max);
         if walk.seek_exact(work.writer(), outer_root, &mut roots, &no_leaf, key)?.is_none() {
             return Err(Error::Failed(format!(
                 "the row just put in dup table {:?} is missing",
@@ -4274,14 +4321,15 @@ impl DupTxnCursor {
 
     /// Land on the follower of the row `deleted_key` the cursor just deleted: from the nested
     /// tree's path cache when the delete kept the key's tree and left the cache naming the row's
-    /// leaf, from the outer path cache when the delete emptied the key and left that cache naming
-    /// the cell's leaf, else found again from both roots ([`DupRemoved`]).
+    /// leaf, from the outer path cache when the delete emptied the key (nested or packed) and
+    /// left that cache naming the cell's leaf, else found again from both roots ([`DupRemoved`]):
+    /// so after a packed row's delete that left others, one outer descent and no nested one.
     fn land_after_delete(&mut self, work: &Work, removed: DupRemoved) -> Result<()> {
         self.outer_root = self.working_root(work)?;
-        let Self { track, outer_root, walk, deleted_key, .. } = self;
+        let Self { track, outer_root, walk, packed_max, deleted_key, .. } = self;
         let w = track.slot.map(|i| &work.tables[i]);
         let store = work.writer();
-        let mut roots = WorkRoots::new(work, track);
+        let mut roots = WorkRoots::new(work, track, *packed_max);
         let k = &deleted_key[..walk.kl()];
         let landed = match (w, removed.slot) {
             (Some(w), Some(at)) if removed.emptied => {

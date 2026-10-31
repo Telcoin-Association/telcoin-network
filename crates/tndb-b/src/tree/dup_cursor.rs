@@ -991,6 +991,41 @@ impl DupWalk {
         }
         [bounds(&self.outer), bounds(&self.inner)]
     }
+
+    /// Test-only: where the walker is in the trees while it is at a row (`None` otherwise), as a
+    /// seek leaves it: the outer path, and inside the key the nested root and path of a nested
+    /// key or the row count and row of a packed one.
+    #[cfg(test)]
+    pub(crate) fn place_for_test(&self) -> Option<WalkPlace> {
+        if self.state() != State::At {
+            return None;
+        }
+        let inside = if self.packed_rows != 0 {
+            InKey::Packed { rows: self.packed_rows, at: self.packed_at }
+        } else {
+            InKey::Nested(self.nested, self.inner.path())
+        };
+        Some((self.outer.path(), inside))
+    }
+}
+
+/// Test-only: where a walker at a row is ([`DupWalk::place_for_test`]).
+#[cfg(test)]
+pub(crate) type WalkPlace = (Vec<(u32, u16)>, InKey);
+
+/// Test-only: where a walker at a row is inside its key ([`DupWalk::place_for_test`]).
+#[cfg(test)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum InKey {
+    /// A nested key: its root and the nested path.
+    Nested(TreeRoot, Vec<(u32, u16)>),
+    /// A packed key: its row count and the row.
+    Packed {
+        /// The set's row count.
+        rows: u16,
+        /// The row the walker is at.
+        at: u16,
+    },
 }
 
 /// Test-only: a leaf's first and last keys ([`DupWalk::leaf_bounds_for_test`]).
