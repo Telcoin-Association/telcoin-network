@@ -17,8 +17,20 @@
 //! [`RwTxn::insert`], [`RwTxn::append`], [`RwTxn::delete`]) take the logical key `k ‖ s`, and
 //! [`RwTxn::delete_prefix`] removes one outer key's rows. A write transaction keeps the nested
 //! roots it writes in memory and rewrites their outer cells once, at commit. A call that needs
-//! the other kind of table is [`Error::TableKind`]; packed sets and cursors over a dup table are
-//! not supported in this version.
+//! the other kind of table is [`Error::TableKind`]; packed sets are not supported in this
+//! version.
+//!
+//! A dup table's cursors are [`DupRoCursor`] ([`RoTxn::dup_cursor_owned`], owned as a
+//! [`RoCursor`] is) and [`DupTxnCursor`] ([`RwTxn::dup_cursor_detached`], detached as a
+//! [`TxnCursor`] is); the plain cursors refuse a dup table and the dup cursors a plain one. They
+//! walk the rows as the logical keys `k ‖ s` in order, and every call gives what the same call of
+//! the plain cursor gives on the composite twin, a plain table keyed `k ‖ s` holding the same
+//! rows: the moves, seeks, prefix steps (a prefix of at least the key width never leaves the outer
+//! key), key tails, a write cursor's writes, deleted state and staleness. On top of those, the
+//! bounded seeks ([`DupRoCursor::seek_key`], [`DupRoCursor::seek_dup`],
+//! [`DupRoCursor::seek_dup_with_key_tail`]) stay inside one outer key: a miss leaves the cursor
+//! unset and reads no other key's nested tree. The key a call returns is the cursor's copy of
+//! `k ‖ s`, so the results borrow the cursor.
 
 // The page file is mmap-backed, synced with `msync`/`fsync`, preallocated with
 // `fallocate`/`F_PREALLOCATE` and locked with `flock`: this crate builds for unix targets only.

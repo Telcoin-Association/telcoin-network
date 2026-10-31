@@ -4,19 +4,28 @@
 //! transaction's own writes between the moves; then the cases one by one: staleness after
 //! another writer's put, delete, emptied key, `delete_prefix` and `clear_table`, the placements of
 //! the cursor's own deletes and puts (from the path caches and by key), the deleted state and
-//! `follower_shares_prefix`, the working map before the cells, and the refusals.
+//! `follower_shares_prefix`, the working map before the cells, and the refusals; last, damage met
+//! by a write cursor (forged nested pages and outer keys, CRC stamped again).
+
+use std::collections::BTreeMap;
 
 use tempfile::TempDir;
 
-use super::{dup::OPTIONS, open, temp, Rows};
+use super::{
+    damage::{restamped, P},
+    dup::{copy_of, damaged, dup_key, restamp_cell, COLD, HOT, OPTIONS},
+    open, temp, Rows,
+};
 use crate::{
     env::SyncMode,
+    page::{self, Val},
     tree::{
         cursor::{
             tests::{owned, owned_tail, Kv},
             State,
         },
         test_harness::{ReportSeed, Rng},
+        TreeRoot,
     },
     DupTxnCursor, Env, Error, ReadTxn as _, Result, RwTxn, Table, TxnCursor,
 };
@@ -1140,4 +1149,123 @@ fn a_cursor_put_after_another_writers_change_finds_its_row() {
     assert!(env.failure().is_none());
     txn.commit().expect("commit");
     env.check().expect("check");
+}
+
+// ---- damage under a write cursor ----
+
+/// Damage met by a write transaction's dup cursor, each case a file of [`damaged`]'s forged and
+/// CRC-stamped again: a nested cell in [`COLD`]'s nested leaf (in place of its subkey 1), an
+/// outer key of 5 bytes (COLD's, its nested root kept), an empty subkey (in place of COLD's
+/// subkey 0), and a separator byte of [`HOT`]'s nested branch root changed (the first row it
+/// misroutes found by a get that misses it, silently). Each is met, on a fresh copy each, by the
+/// cursor's seek to the damaged row, by its step to it from the row before (`next`), and by
+/// `delete_current` of the row before (its follower the damaged row; the separator's delete meets
+/// the branch's key order as it copies the branch): `Corrupt` naming the damage, the cursor unset
+/// and out of the deleted state, the environment latched.
+#[test]
+fn damage_under_a_dup_cursor_is_corrupt() {
+    let dir = TempDir::with_prefix("tndb_b_dup_txn_damage").expect("temp dir");
+    let forged =
+        TreeRoot { root: 9, root_txn: 7, height: 1, entries: 3, leaf_pages: 1, ..TreeRoot::EMPTY };
+    let (cold, hot_last) = (COLD.to_be_bytes(), dup_key(HOT, b"big"));
+    type Forge = Box<dyn Fn(&std::path::Path, &BTreeMap<u32, (u32, TreeRoot)>)>;
+    let cases: [(&str, &[&str], Forge); 4] = [
+        (
+            "a nested cell in a nested leaf",
+            &["a nested cell in a tree that holds none"],
+            Box::new(move |path, cells| {
+                restamp_cell(path, cells[&COLD].1.root, &[1], Val::Nested(&forged.encode()))
+            }),
+        ),
+        (
+            "an outer key of another width",
+            &["an outer key of 5 bytes, not the table's width 4"],
+            Box::new(move |path, cells| {
+                restamped(path, cells[&COLD].0, |page| {
+                    let page::Find::Found { index, value: Val::Nested(root) } =
+                        page::leaf_find(page, &cold).expect("find")
+                    else {
+                        panic!("COLD's nested cell");
+                    };
+                    let root = *root;
+                    page::LeafMut::new(page).expect("a leaf").delete(index).expect("delete");
+                    let wide = [&cold[..], &[0]].concat();
+                    let fit = page::LeafMut::new(page).expect("a leaf").insert(
+                        index,
+                        &wide,
+                        Val::Nested(&root),
+                    );
+                    assert_eq!(fit.expect("inserted"), page::Fit::Done);
+                })
+            }),
+        ),
+        (
+            "an empty subkey",
+            &["a subkey of 0 bytes"],
+            Box::new(|path, cells| {
+                restamped(path, cells[&COLD].1.root, |page| {
+                    let (s, value) = page::leaf_inline_entry(page, 0).expect("row 0");
+                    assert_eq!(s, [0], "COLD's first subkey");
+                    let value = value.to_vec();
+                    page::LeafMut::new(page).expect("a leaf").delete(0).expect("delete");
+                    let fit = page::LeafMut::new(page).expect("a leaf").insert(0, &[], &value[..]);
+                    assert_eq!(fit.expect("inserted"), page::Fit::Done);
+                })
+            }),
+        ),
+        (
+            "a misrouted separator",
+            &["outside its parents' separators", "out of key order"],
+            Box::new(|path, cells| {
+                let at = (P - 16) as usize;
+                restamped(path, cells[&HOT].1.root, |page| page[at] ^= 0x10);
+            }),
+        ),
+    ];
+    for (i, (what, messages, forge)) in cases.into_iter().enumerate() {
+        let sub = dir.path().join(i.to_string());
+        std::fs::create_dir(&sub).expect("a case's dir");
+        let (path, model) = damaged(&sub, |path, cells| forge(path, cells));
+        // The damaged row and the row before it in F.
+        let (target, before) = match i {
+            0 => (dup_key(COLD, &[1]), dup_key(COLD, &[0])),
+            1 | 2 => (cold.to_vec(), hot_last.clone()),
+            _ => {
+                let (_dir, env) = copy_of(&path);
+                let ro = env.begin_ro().expect("ro");
+                let d = ro.open_table("d").expect("open").expect("d");
+                let missed = model
+                    .keys()
+                    .find(|key| ro.get(&d, key).expect("get").is_none())
+                    .expect("a misrouted row")
+                    .clone();
+                assert!(env.failure().is_none(), "{what}: gets miss, unlatched");
+                let before = model.range(..missed.clone()).next_back().expect("a row before");
+                (missed, before.0.clone())
+            }
+        };
+        for op in ["seek", "next", "delete_current"] {
+            let (_dir, env) = copy_of(&path);
+            let mut txn = env.begin_rw().expect("rw");
+            let d = txn.open_table("d").expect("open").expect("d");
+            let mut c = txn.dup_cursor_detached(&d).expect("cursor");
+            let result = match op {
+                "seek" => c.seek(&txn, &target).map(drop),
+                _ => {
+                    let at = c.seek_exact(&txn, &before).expect("the row before").is_some();
+                    assert!(at, "{what}: {before:02x?} reads");
+                    if op == "next" {
+                        c.next(&txn).map(drop)
+                    } else {
+                        c.delete_current(&mut txn).map(drop)
+                    }
+                }
+            };
+            let corrupt = matches!(&result, Err(Error::Corrupt(m))
+                if messages.iter().any(|message| m.contains(message)));
+            assert!(corrupt, "{what} {op}: {result:?}");
+            assert_eq!(c.state(), (State::Unset, false), "{what} {op}");
+            assert!(env.failure().is_some(), "{what} {op}: latched");
+        }
+    }
 }
