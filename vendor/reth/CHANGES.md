@@ -157,6 +157,20 @@ newest last.
   *Still present*: the zero-size `RocksDBProvider` stub (`providers/rocksdb_stub.rs`) and the
   storage-v2 plumbing that takes it (ROADMAP.md, "RocksDB step B"). *Upstream*: no.
 
+- **TN-0020** — reth-node-core's version info comes from the upstream pin, not TN's git state.
+  *Kind*: build.
+  *Files*: `crates/node/core/build.rs` (reads `commit` from `tn/upstream.toml` instead of running
+  vergen-git2), `crates/node/core/Cargo.toml` (drops the `vergen-git2` build-dependency), the
+  workspace manifest (drops `vergen-git2`).
+  *Why*: inside TN's repository, upstream's build script described TN's git state and registered
+  `rerun-if-changed` on TN's `.git/HEAD` and branch ref. So every TN commit or checkout rebuilt
+  reth-node-core and everything that depends on it (reth-rpc-builder, tn-reth and the TN crates
+  above it), and it compiled libgit2 from C. The pin is what this code actually is. The version
+  strings now read `1.11.3-tn (2ac58a2)`: the pinned commit plus a `-tn` suffix, because TN carries
+  changes on top. They are used only for the client version reth's database records on open, and
+  for payload extra data, which TN does not build. git2, libgit2-sys, libz-sys, vcpkg and
+  vergen-git2 leave the graph. *Upstream*: n/a.
+
 ## Upstream syncs
 
 - **TN-0013** — Sync to upstream v1.11.4 (`2ac58a25f561`). *Kind*: sync.

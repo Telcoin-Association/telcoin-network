@@ -81,4 +81,4 @@ min-trace-logs = ["tracing/release_max_level_trace"]
 
 [build-dependencies]
 vergen = { workspace = true, features = ["build", "cargo", "emit_and_set"] }
-vergen-git2.workspace = true
+# TN(TN-0020): no vergen-git2; the version comes from tn/upstream.toml (see build.rs).

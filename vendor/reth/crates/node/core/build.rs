@@ -1,8 +1,7 @@
 #![allow(missing_docs)]
 
-use std::{env, error::Error};
+use std::{env, error::Error, path::Path};
 use vergen::{BuildBuilder, CargoBuilder, Emitter};
-use vergen_git2::Git2Builder;
 
 fn main() -> Result<(), Box<dyn Error>> {
     let mut emitter = Emitter::default();
@@ -15,21 +14,20 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     emitter.add_instructions(&cargo_builder)?;
 
-    let git_builder =
-        Git2Builder::default().describe(false, true, None).dirty(true).sha(false).build()?;
-
-    emitter.add_instructions(&git_builder)?;
-
     emitter.emit_and_set()?;
-    let sha = env::var("VERGEN_GIT_SHA")?;
+
+    // TN(TN-0020): describe the upstream commit this copy was taken from (`tn/upstream.toml`),
+    // not TN's git state. Upstream ran vergen-git2 here, which inside TN's repository rebuilt
+    // this crate, and everything that depends on it, on every TN commit, and built libgit2.
+    let pin_path = Path::new(&env::var("CARGO_MANIFEST_DIR")?).join("../../../tn/upstream.toml");
+    println!("cargo:rerun-if-changed={}", pin_path.display());
+    let pin = std::fs::read_to_string(&pin_path)?;
+    let sha = pin_value(&pin, "commit").ok_or("tn/upstream.toml has no `commit`")?;
+    println!("cargo:rustc-env=VERGEN_GIT_SHA={sha}");
     let sha_short = &sha[0..7];
 
-    let is_dirty = env::var("VERGEN_GIT_DIRTY")? == "true";
-    // > git describe --always --tags
-    // if not on a tag: v0.2.0-beta.3-82-g1939939b
-    // if on a tag: v0.2.0-beta.3
-    let not_on_tag = env::var("VERGEN_GIT_DESCRIBE")?.ends_with(&format!("-g{sha_short}"));
-    let version_suffix = if is_dirty || not_on_tag { "-dev" } else { "" };
+    // TN carries changes on top of the pin (vendor/reth/CHANGES.md).
+    let version_suffix = "-tn";
     println!("cargo:rustc-env=RETH_VERSION_SUFFIX={version_suffix}");
 
     // Set short SHA
@@ -90,4 +88,12 @@ fn main() -> Result<(), Box<dyn Error>> {
     );
 
     Ok(())
+}
+
+/// TN(TN-0020): reads `key = "value"` from the flat pin file.
+fn pin_value(toml: &str, key: &str) -> Option<String> {
+    toml.lines().find_map(|line| {
+        let (k, v) = line.split_once('=')?;
+        (k.trim() == key).then(|| v.trim().trim_matches('"').to_string())
+    })
 }
