@@ -101,50 +101,145 @@ fn mdbx_rows() -> BTreeMap<&'static str, Rows> {
 }
 
 /// The dup-sort tables [`rows_with_big_dup_keys`] gives a [`big_key`], with its rows: more than
-/// [`COMMIT_ROWS`], so the copy commits inside the key (twice, or once for `StoragesTrie`). The
-/// three state tables are the adapter's nested ones, `StorageChangeSets` a composite one.
-const BIG_KEYS: [(&str, u64); 4] = [
-    (tables::PlainStorageState::NAME, 2500),
-    (tables::StorageChangeSets::NAME, 2500),
-    (tables::HashedStorages::NAME, 2500),
-    (tables::StoragesTrie::NAME, 1200),
+/// [`COMMIT_ROWS`], so the copy commits inside the key (twice, or once for `StoragesTrie`); and
+/// whether the table is one of the adapter's nested ones (`PlainStorageState`, `HashedStorages`,
+/// `StoragesTrie`; `StorageChangeSets` is a composite one), which also gain a [`crossing_key`] and
+/// a [`small_key`]. Each count puts the crossing key's rows across the table's next commit.
+const BIG_KEYS: [(&str, u64, bool); 4] = [
+    (tables::PlainStorageState::NAME, 2980, true),
+    (tables::StorageChangeSets::NAME, 2500, false),
+    (tables::HashedStorages::NAME, 2980, true),
+    (tables::StoragesTrie::NAME, 1980, true),
 ];
+
+/// The rows of a [`crossing_key`]: the key packs while its first rows are copied, the copy commits
+/// it packed, and the next write transaction's appends pass the packed bound and promote it to a
+/// nested tree ([`check_crossing_key`]).
+const CROSSING_ROWS: u64 = 30;
+
+/// The length of each of a [`crossing_key`]'s compressed values, its subkey included: 75 bytes a
+/// row in a packed set, so 12 rows take 902 bytes and 30 take 2252.
+const CROSSING_VALUE_LEN: usize = 71;
+
+/// The rows of a [`small_key`]: few and short, so the key stays a packed set.
+const SMALL_ROWS: u64 = 3;
+
+/// The least packed bound of a nested table at any page size: 975 bytes, a 32-byte key's at 4 KiB
+/// pages (tndb-b's `DupOptions::resolved`).
+const LEAST_PACKED_MAX: usize = 975;
+
+/// The greatest packed bound of a nested table at [`TNDB_PAGE_SIZE`]: 2011 bytes, a 20-byte key's.
+const MOST_PACKED_MAX: usize = 2011;
 
 /// The big key of a dup-sort table whose keys are `key_len` bytes: between [`mdbx_rows`]'s second
 /// and third keys, so rows of other keys come before and after it.
 fn big_key(key_len: usize) -> Vec<u8> {
+    added_key(key_len, 0x80)
+}
+
+/// The crossing key of a nested table whose keys are `key_len` bytes: right after its
+/// [`big_key`].
+fn crossing_key(key_len: usize) -> Vec<u8> {
+    added_key(key_len, 0x90)
+}
+
+/// The small key of a nested table whose keys are `key_len` bytes: right after its
+/// [`crossing_key`], before [`mdbx_rows`]'s third key.
+fn small_key(key_len: usize) -> Vec<u8> {
+    added_key(key_len, 0xa0)
+}
+
+/// A `key_len`-byte key of [`mdbx_rows`]'s second key's bytes but the last, which is `last`.
+fn added_key(key_len: usize, last: u8) -> Vec<u8> {
     let mut key = vec![2; key_len];
-    key[key_len - 1] = 0x80;
+    key[key_len - 1] = last;
     key
 }
 
-/// [`mdbx_rows`] with a [`big_key`] in each table of [`BIG_KEYS`], of that many rows: subkey `n`
-/// is `n` big-endian in a 32-byte subkey, and in `StoragesTrie`'s 65-byte one the nibble path of
-/// `n`'s three low nibbles (64 nibble bytes, then the path's length, as reth encodes a
-/// `StoredNibblesSubKey`).
+/// The keys [`rows_with_big_dup_keys`] adds to table `name`: its [`big_key`] and, in a nested
+/// table, its [`crossing_key`] and [`small_key`].
+fn added_keys(name: &str) -> Vec<Vec<u8>> {
+    let (_, key_len, _) =
+        DUP_TABLES.into_iter().find(|(table, ..)| *table == name).expect("a dup-sort table");
+    let nested = BIG_KEYS.into_iter().any(|(table, _, nested)| table == name && nested);
+    let mut keys = vec![big_key(key_len)];
+    if nested {
+        keys.extend([crossing_key(key_len), small_key(key_len)]);
+    }
+    keys
+}
+
+/// Row `n` of an added key, as a compressed value of `len` bytes: the subkey, `n` big-endian in a
+/// 32-byte subkey and in `StoragesTrie`'s 65-byte one the nibble path of `n`'s three low nibbles
+/// (64 nibble bytes, then the path's length, as reth encodes a `StoredNibblesSubKey`); then `n`'s
+/// low byte, then ones.
+fn added_value(subkey_len: usize, n: u64, len: usize) -> Vec<u8> {
+    let mut value = vec![0; subkey_len];
+    if subkey_len == 65 {
+        value[..3].copy_from_slice(&[(n >> 8) as u8 & 0xf, (n >> 4) as u8 & 0xf, n as u8 & 0xf]);
+        value[64] = 3;
+    } else {
+        value[subkey_len - 8..].copy_from_slice(&n.to_be_bytes());
+    }
+    value.push(n as u8);
+    value.resize(len, 1);
+    value
+}
+
+/// The bytes of a packed set of `rows` (tndb-b's `packed` codec): a 2-byte row count, then per row
+/// a 4-byte slot and the row's subkey and value, which is reth's compressed value.
+fn packed_len(rows: &[(Vec<u8>, Vec<u8>)]) -> usize {
+    2 + rows.iter().map(|(_, value)| 4 + value.len()).sum::<usize>()
+}
+
+/// Check that nested table `name`'s rows (`table`, in order) put its [`crossing_key`] across a
+/// commit of the copy (every [`COMMIT_ROWS`] rows of a table): the rows before the commit pack
+/// within [`LEAST_PACKED_MAX`], so the commit holds the key packed at any page size, and all of
+/// them pass [`MOST_PACKED_MAX`], so the next write transaction promotes it. Its [`small_key`]
+/// packs within [`LEAST_PACKED_MAX`].
+fn check_crossing_key(name: &str, table: &Rows, key_len: usize) {
+    let rows_of = |key: Vec<u8>| {
+        let first = table.iter().position(|(k, _)| *k == key).expect("the key's rows");
+        let end = first + table[first..].iter().take_while(|(k, _)| *k == key).count();
+        (first, end)
+    };
+    let (first, end) = rows_of(crossing_key(key_len));
+    let commit = (first as u64 / COMMIT_ROWS + 1) * COMMIT_ROWS;
+    let commit = usize::try_from(commit).expect("a row index");
+    assert!(commit < end, "{name}: the crossing key's rows span a commit");
+    let packed = packed_len(&table[first..commit]);
+    assert!(packed <= LEAST_PACKED_MAX, "{name}: {packed} bytes packed at the commit");
+    let all = packed_len(&table[first..end]);
+    assert!(all > MOST_PACKED_MAX, "{name}: {all} bytes promote the crossing key");
+    let (first, end) = rows_of(small_key(key_len));
+    let small = packed_len(&table[first..end]);
+    assert!(small <= LEAST_PACKED_MAX, "{name}: the small key's {small} bytes pack");
+}
+
+/// [`mdbx_rows`] with, in each table of [`BIG_KEYS`], a [`big_key`] of that many rows of
+/// [`added_value`]s two bytes past the subkey; and in each nested one a [`crossing_key`] of
+/// [`CROSSING_ROWS`] rows of [`CROSSING_VALUE_LEN`] bytes and a [`small_key`] of [`SMALL_ROWS`]
+/// rows two bytes past the subkey ([`check_crossing_key`]).
 fn rows_with_big_dup_keys() -> BTreeMap<&'static str, Rows> {
     let mut rows = mdbx_rows();
-    for (name, count) in BIG_KEYS {
+    for (name, count, nested) in BIG_KEYS {
         assert!(count > COMMIT_ROWS, "{name}: the big key's rows span a commit");
         let (_, key_len, subkey_len) =
             DUP_TABLES.into_iter().find(|(table, ..)| *table == name).expect("a dup-sort table");
+        let short = subkey_len + 2;
+        let mut keys = vec![(big_key(key_len), count, short)];
+        if nested {
+            keys.push((crossing_key(key_len), CROSSING_ROWS, CROSSING_VALUE_LEN));
+            keys.push((small_key(key_len), SMALL_ROWS, short));
+        }
         let table = rows.get_mut(name).expect("a dup-sort table's rows");
-        for n in 0..count {
-            let mut value = vec![0; subkey_len];
-            if subkey_len == 65 {
-                value[..3].copy_from_slice(&[
-                    (n >> 8) as u8 & 0xf,
-                    (n >> 4) as u8 & 0xf,
-                    n as u8 & 0xf,
-                ]);
-                value[64] = 3;
-            } else {
-                value[subkey_len - 8..].copy_from_slice(&n.to_be_bytes());
-            }
-            value.extend([n as u8, 1]);
-            table.push((big_key(key_len), value));
+        for (key, count, len) in keys {
+            table.extend((0..count).map(|n| (key.clone(), added_value(subkey_len, n, len))));
         }
         table.sort();
+        if nested {
+            check_crossing_key(name, table, key_len);
+        }
     }
     rows
 }
@@ -339,10 +434,13 @@ fn an_mdbx_database_migrates_row_for_row() {
 /// A dup key whose rows outnumber a commit's ([`COMMIT_ROWS`]) migrates whole: the copy commits
 /// inside the key ([`BIG_KEYS`]), and the next write transaction appends the key's further rows
 /// to those committed, on the adapter's nested tables (`PlainStorageState`, `HashedStorages`,
-/// `StoragesTrie`) and on a composite one (`StorageChangeSets`). The migration's own verification
-/// passes, and the open after it checks each table's form against its layout. Every table holds
-/// MDBX's rows, row for row, and counts them (`entries`); each big key reads back whole by
-/// `walk_dup` and row by row by `seek_by_key_subkey`.
+/// `StoragesTrie`) and on a composite one (`StorageChangeSets`). In each nested table a key the
+/// copy commits as a packed set takes rows past the packed bound in the next write transaction
+/// and becomes a nested tree ([`crossing_key`]), and a key of few rows stays packed
+/// ([`small_key`]). The migration's own verification passes, and the open after it checks each
+/// table's form against its layout. Every table holds MDBX's rows, row for row, and counts them
+/// (`entries`); each added key reads back whole by `walk_dup` and row by row by
+/// `seek_by_key_subkey`.
 #[test]
 fn a_dup_key_with_more_rows_than_a_commit_migrates_whole() {
     let tmp = TempDir::new().expect("tempdir");
@@ -354,41 +452,42 @@ fn a_dup_key_with_more_rows_than_a_commit_migrates_whole() {
     migrated.get_mut(tables::VersionHistory::NAME).expect("history").pop();
     assert!(migrated == expected, "every table, row for row");
     let tx = db.tx().expect("tx");
-    read_back_big_key::<tables::PlainStorageState>(&tx, &expected);
-    read_back_big_key::<tables::StorageChangeSets>(&tx, &expected);
-    read_back_big_key::<tables::HashedStorages>(&tx, &expected);
-    read_back_big_key::<tables::StoragesTrie>(&tx, &expected);
+    read_back_added_keys::<tables::PlainStorageState>(&tx, &expected);
+    read_back_added_keys::<tables::StorageChangeSets>(&tx, &expected);
+    read_back_added_keys::<tables::HashedStorages>(&tx, &expected);
+    read_back_added_keys::<tables::StoragesTrie>(&tx, &expected);
 }
 
-/// Check table `T` in `tx` against `expected`: its row count, and its [`big_key`]'s rows, read
-/// whole by `walk_dup` and one by one by `seek_by_key_subkey`.
-fn read_back_big_key<T: DupSort>(tx: &impl DbTx, expected: &BTreeMap<&'static str, Rows>) {
+/// Check table `T` in `tx` against `expected`: its row count, and the rows of each of its
+/// [`added_keys`], read whole by `walk_dup` and one by one by `seek_by_key_subkey`.
+fn read_back_added_keys<T: DupSort>(tx: &impl DbTx, expected: &BTreeMap<&'static str, Rows>) {
     let name = T::NAME;
     let rows = &expected[name];
     assert_eq!(tx.entries::<RawDupSort<T>>().expect("entries"), rows.len(), "{name}: entries");
-    let (_, key_len, subkey_len) =
+    let (_, _, subkey_len) =
         DUP_TABLES.into_iter().find(|(table, ..)| *table == name).expect("a dup-sort table");
-    let key = big_key(key_len);
-    let big: Rows = rows.iter().filter(|(k, _)| *k == key).cloned().collect();
-    assert!(big.len() as u64 > COMMIT_ROWS, "{name}: the big key's rows span a commit");
-
     let mut cursor = tx.cursor_dup_read::<RawDupSort<T>>().expect("cursor");
-    let walked: Rows = cursor
-        .walk_dup(Some(RawKey::from_vec(key.clone())), None)
-        .expect("walk_dup")
-        .map(|row| row.map(|(k, v)| (k.into_key(), v.into_value())))
-        .collect::<Result<_, _>>()
-        .expect("the key's rows");
-    assert!(
-        walked == big,
-        "{name}: walk_dup reads {} of the big key's {} rows",
-        walked.len(),
-        big.len()
-    );
-    for (n, (_, value)) in big.iter().enumerate() {
-        let subkey = RawKey::from_vec(value[..subkey_len].to_vec());
-        let found = cursor.seek_by_key_subkey(RawKey::from_vec(key.clone()), subkey).expect("seek");
-        assert_eq!(found.map(RawValue::into_value).as_ref(), Some(value), "{name}: row {n}");
+    for key in added_keys(name) {
+        let added: Rows = rows.iter().filter(|(k, _)| *k == key).cloned().collect();
+        assert!(!added.is_empty(), "{name}: the added key's rows");
+        let walked: Rows = cursor
+            .walk_dup(Some(RawKey::from_vec(key.clone())), None)
+            .expect("walk_dup")
+            .map(|row| row.map(|(k, v)| (k.into_key(), v.into_value())))
+            .collect::<Result<_, _>>()
+            .expect("the key's rows");
+        assert!(
+            walked == added,
+            "{name}: walk_dup reads {} of the key's {} rows ({key:?})",
+            walked.len(),
+            added.len()
+        );
+        for (n, (_, value)) in added.iter().enumerate() {
+            let subkey = RawKey::from_vec(value[..subkey_len].to_vec());
+            let found =
+                cursor.seek_by_key_subkey(RawKey::from_vec(key.clone()), subkey).expect("seek");
+            assert_eq!(found.map(RawValue::into_value).as_ref(), Some(value), "{name}: row {n}");
+        }
     }
 }
 

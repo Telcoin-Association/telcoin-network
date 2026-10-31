@@ -66,7 +66,11 @@ pub const META_FILE: &str = "bench-base.json";
 /// as composite keys in plain tables, and refuses at open a file that holds them in the other
 /// form. Every base is renamed, so none built in the old form is ever opened; the MDBX bases,
 /// whose layout did not change, rebuild once with them (the version is one for both backends).
-pub const LAYOUT_VERSION: u32 = 2;
+///
+/// Version 3: on the tndb-b backend, the state tables' engine dup tables keep a key of few rows in
+/// its outer cell (a packed set) instead of a nested tree of its own; every base rebuilds once,
+/// the MDBX ones with them.
+pub const LAYOUT_VERSION: u32 = 3;
 
 /// This build's database backend, as [`BaseMeta::backend`] records it.
 pub const BACKEND: &str = if cfg!(feature = "tndb-b") { "tndb-b" } else { "mdbx" };

@@ -794,10 +794,11 @@ are smaller. The Linux run (the user's, with the same script) decides the commit
   production `--db.*`, durable sync and `--db.page-size <page_size>`; a database with another page
   size (`db_page_size`) is an error.
   - The key (`base_dir_name`) is 16 hex digits of `keccak256` over the spec and `LAYOUT_VERSION`. A
-    derived datadir, such as an aged one, appends its own `extra` component. `LAYOUT_VERSION` is 2
-    since the state tables became the engine's dup tables on tndb-b, which renamed every base:
-    each backend's bases, and their aged children, rebuild once (a tndb-b base of layout 1 holds
-    those tables composite, which the open refuses).
+    derived datadir, such as an aged one, appends its own `extra` component. `LAYOUT_VERSION` is 3
+    since the state tables' engine dup tables on tndb-b keep a key of few rows in its outer cell
+    (a packed set), which renamed every base: each backend's bases, and their aged children,
+    rebuild once (a tndb-b base of an earlier layout holds those tables composite or unpacked,
+    which the open refuses).
   - It writes `bench-base.json` (`BaseMeta`: the spec, the backend, the page size, the layout
     version, the sealed genesis header, the slim genesis hash, build times and sizes), then renames
     `<name>.building` into place. A later call returns the cached base.
