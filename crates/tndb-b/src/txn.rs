@@ -395,18 +395,6 @@ fn load_packed(
     }
 }
 
-/// The [`Error::Corrupt`] of a delete that meets outer key `k`'s packed set in the dup table
-/// `table`: this build's deletes refuse a packed set, so the delete changes nothing.
-#[cold]
-#[inline(never)]
-fn packed_delete_refused(table: &Table, k: &[u8]) -> Error {
-    Error::Corrupt(format!(
-        "dup table {}: the outer cell of key {k:02x?} holds a packed set, which this build's \
-         deletes refuse",
-        table.name()
-    ))
-}
-
 /// A dup table's totals in its working record (`record.dup` of a table whose kind was checked).
 fn dup_mut(dup: &mut Option<DupRecord>) -> &mut DupRecord {
     dup.as_mut().expect("a dup table's working record holds its dup record")
@@ -772,7 +760,8 @@ fn promote(
 }
 
 /// The delete of the logical `key` from the dup table at `i` in [`Work::tables`]: from the key's
-/// nested tree, and the tree's outer cell with it when the delete empties the tree.
+/// nested tree, and the tree's outer cell with it when the delete empties the tree, or from its
+/// packed set ([`packed_delete`]). A nested key stays nested at any row count.
 #[inline(never)]
 fn dup_delete(work: &mut Work, i: usize, key: &[u8]) -> Result<DupRemoved> {
     let missed = DupRemoved { found: false, emptied: false, slot: None };
@@ -801,7 +790,12 @@ fn dup_delete(work: &mut Work, i: usize, key: &[u8]) -> Result<DupRemoved> {
     )? {
         DupEntry::Nested(n) => n,
         DupEntry::Absent => return Ok(missed),
-        DupEntry::Packed => return Err(packed_delete_refused(&w.table, k)),
+        DupEntry::Packed => {
+            let removed = packed_delete(work, i, k, s)?;
+            #[cfg(test)]
+            let removed = DupRemoved { slot: removed.slot.filter(|_| !uncached), ..removed };
+            return Ok(removed);
+        }
     };
     let before = n.root;
     let removed = write::delete_cached(writer, &mut n.root, &mut n.trusted, &mut n.cache, s)?;
@@ -835,6 +829,66 @@ fn dup_delete(work: &mut Work, i: usize, key: &[u8]) -> Result<DupRemoved> {
     #[cfg(test)]
     let slot = slot.filter(|_| !uncached);
     Ok(DupRemoved { found: true, emptied: after.is_empty(), slot })
+}
+
+/// [`dup_delete`] of subkey `s` from outer key `k`'s packed set, validated in the table's
+/// [`Working::packed_in`] ([`dup_entry`]). A miss changes nothing. A set of more rows is rebuilt
+/// without the row into [`Working::packed_out`], which rewrites the cell (no slot: the outer path
+/// cache names no row); the delete of a set's last row removes the cell instead (a set never
+/// empties), with the outer delete's slot, as an emptied nested tree's. The new `packed_rows`
+/// is counted first, so a record that cannot count the row changes nothing.
+#[inline(never)]
+fn packed_delete(work: &mut Work, i: usize, k: &[u8], s: &[u8]) -> Result<DupRemoved> {
+    let (writer, w) = work.writer_and_table(i);
+    let packed_max = usize::from(dup_mut(&mut w.record.dup).packed_max);
+    let max_subkey = writer.geometry.max_subkey(k.len());
+    let view =
+        PackedView::new(&w.packed_in, packed_max).map_err(|e| packed_error(&w.table, k, e))?;
+    let Search::Found(at) = view.find(s, max_subkey).map_err(|e| packed_error(&w.table, k, e))?
+    else {
+        return Ok(DupRemoved { found: false, emptied: false, slot: None });
+    };
+    let dup = dup_mut(&mut w.record.dup);
+    let rows = dup.packed_rows.checked_sub(1).ok_or_else(|| totals_error(&w.table, k))?;
+    let (mut outer, mut trusted) = (w.record.root, w.trusted);
+    let emptied = view.rows() == 1;
+    let slot = if emptied {
+        let removed = write::delete_outer_cell(
+            writer,
+            &mut outer,
+            &mut trusted,
+            &mut w.cache,
+            k,
+            write::Cells::Packing,
+        )?;
+        if !removed.found {
+            return Err(no_cell(&w.table, k));
+        }
+        removed.slot
+    } else {
+        packed::build_without(&view, at, &mut w.packed_out);
+        let placed = write::put_outer_cell(
+            writer,
+            &mut outer,
+            &mut trusted,
+            &mut w.cache,
+            k,
+            write::OuterCell::Packed(&w.packed_out),
+            write::Cells::Packing,
+            PutKind::Upsert,
+        )?;
+        if !placed.replaced {
+            return Err(Error::Failed(format!(
+                "dup table {}: the packed set of key {k:02x?} had no outer cell",
+                w.table.name()
+            )));
+        }
+        None
+    };
+    debug_assert!(!w.nested.contains_key(k), "a packed key has no working entry");
+    dup_mut(&mut w.record.dup).packed_rows = rows;
+    work.set_dup_record(i, outer, trusted);
+    Ok(DupRemoved { found: true, emptied, slot })
 }
 
 /// The get of the logical `key` from the dup table `table` whose outer tree is `outer` in a
@@ -976,8 +1030,9 @@ fn no_cell(table: &Table, k: &[u8]) -> Error {
 
 /// The delete of every row under the outer key `key` from the dup table at `i` in
 /// [`Work::tables`]: the key's nested tree is freed in one walk ([`write::free_subtree`]: its
-/// pages are collected first, so damage frees nothing), then its cell and its entry go; returns
-/// the rows removed. The totals are moved first, so a record that cannot count the tree frees
+/// pages are collected first, so damage frees nothing), then its cell and its entry go; a packed
+/// set (validated whole by [`dup_entry`]) frees no page, only its cell goes; returns the rows
+/// removed. The totals are moved first, so a record that cannot count the tree frees
 /// nothing either. A key of another width than the table's is refused before anything changes.
 fn dup_delete_prefix(work: &mut Work, i: usize, key: &[u8]) -> Result<u64> {
     let dup = dup_mut(&mut work.tables[i].record.dup);
@@ -1000,7 +1055,30 @@ fn dup_delete_prefix(work: &mut Work, i: usize, key: &[u8]) -> Result<u64> {
     let n = match entry {
         DupEntry::Nested(n) => n,
         DupEntry::Absent => return Ok(0),
-        DupEntry::Packed => return Err(packed_delete_refused(&w.table, key)),
+        DupEntry::Packed => {
+            // A packed set owns no page: its rows go with its cell.
+            let rows = PackedView::new(&w.packed_in, usize::from(packed_max))
+                .map_err(|e| packed_error(&w.table, key, e))?
+                .rows() as u64;
+            let mut totals = *dup_mut(&mut w.record.dup);
+            totals.packed_rows =
+                totals.packed_rows.checked_sub(rows).ok_or_else(|| totals_error(&w.table, key))?;
+            let removed = write::delete_outer_cell(
+                writer,
+                &mut outer,
+                &mut trusted,
+                &mut w.cache,
+                key,
+                write::Cells::Packing,
+            )?;
+            if !removed.found {
+                return Err(no_cell(&w.table, key));
+            }
+            debug_assert!(!w.nested.contains_key(key), "a packed key has no working entry");
+            w.record.dup = Some(totals);
+            work.set_dup_record(i, outer, trusted);
+            return Ok(rows);
+        }
     };
     let (root, root_trusted) = (n.root, n.trusted);
     let mut totals = *dup_mut(&mut w.record.dup);
@@ -1028,12 +1106,15 @@ fn dup_delete_prefix(work: &mut Work, i: usize, key: &[u8]) -> Result<u64> {
 /// The nested roots of a free walk over a dup table's outer tree ([`write::free_dup_tree`]): for
 /// a key the working map holds, its entry's root and provenance (each such hit counted), else the
 /// cell's committed root, untrusted (so a cell naming a page private to this transaction with no
-/// entry is refused by the walk). Once walked, every entry must have been met (each has its cell)
-/// and the nested counters must be the table's totals, else nothing is freed.
+/// entry is refused by the walk). Once walked, every entry must have been met (each has its cell,
+/// and a packed key has none), the nested counters and the packed rows must be the table's
+/// totals, and the trees and packed sets must be the outer tree's entries, else nothing is freed.
 struct WalkRoots<'a> {
     table: &'a Table,
     map: &'a NestedMap,
     dup: &'a DupRecord,
+    /// The outer tree's entries: one per outer key, a nested tree or a packed set.
+    outer_entries: u64,
     hits: usize,
 }
 
@@ -1071,13 +1152,33 @@ impl write::NestedRoots for WalkRoots<'_> {
                 )));
             }
         }
+        if sums.packed_rows != d.packed_rows {
+            return Err(Error::Corrupt(format!(
+                "dup table {}: its packed sets count {} packed rows, its record {}",
+                self.table.name(),
+                sums.packed_rows,
+                d.packed_rows
+            )));
+        }
+        let keys = sums.trees.saturating_add(sums.packed_sets);
+        if keys != self.outer_entries {
+            return Err(Error::Corrupt(format!(
+                "dup table {}: its outer tree counts {} outer entries, its walk {} nested trees \
+                 and {} packed sets",
+                self.table.name(),
+                self.outer_entries,
+                sums.trees,
+                sums.packed_sets
+            )));
+        }
         Ok(())
     }
 }
 
 /// Free the dup table `table`'s outer tree `outer` (provenance `trusted`) and every nested tree
-/// its cells name, each root through the working map `map` ([`WalkRoots`]), checked against the
-/// totals `dup` before anything is freed ([`write::free_dup_tree`]).
+/// its cells name, each root through the working map `map` ([`WalkRoots`]), every packed set
+/// validated whole at the record's limit, all checked against the totals `dup` before anything
+/// is freed ([`write::free_dup_tree`]).
 fn free_dup_table(
     writer: &mut Writer,
     table: &Table,
@@ -1086,9 +1187,13 @@ fn free_dup_table(
     dup: &DupRecord,
     map: &NestedMap,
 ) -> Result<()> {
-    let mut roots = WalkRoots { table, map, dup, hits: 0 };
-    write::free_dup_tree(writer, outer, trusted, usize::from(dup.key_len), None, &mut roots)
-        .map(drop)
+    let key_len = usize::from(dup.key_len);
+    let packed = (dup.packed_max != 0).then(|| write::PackedLimits {
+        max: usize::from(dup.packed_max),
+        max_subkey: writer.geometry.max_subkey(key_len),
+    });
+    let mut roots = WalkRoots { table, map, dup, outer_entries: outer.entries, hits: 0 };
+    write::free_dup_tree(writer, outer, trusted, key_len, packed, &mut roots).map(drop)
 }
 
 // Test-only counter, debug builds only: the benchmark is compiled with the test configuration,
