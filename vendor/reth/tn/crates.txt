@@ -24,7 +24,6 @@ crates/net/network-api
 crates/net/peers
 crates/node/core
 crates/node/types
-crates/payload/builder-primitives
 crates/payload/primitives
 crates/primitives-traits
 crates/prune/types
