@@ -33,6 +33,7 @@ mod key_tail;
 mod merge;
 mod multi_model;
 mod nested_damage;
+mod packed_damage;
 mod path_cache;
 mod read_only;
 mod txn_cursor;

@@ -251,7 +251,7 @@ pub(super) fn restamp_record(path: &Path, edit: impl FnOnce(&mut TableRecord)) {
 
 /// Table `d`'s record in the cleanly closed file at `path`, whose catalog is one leaf, replaced in
 /// place by `encode`'s bytes for it, the leaf's CRC stamped again.
-fn restamp_encoded(
+pub(super) fn restamp_encoded(
     path: &Path,
     encode: impl FnOnce(TableRecord) -> [u8; crate::catalog::RECORD_LEN],
 ) {
