@@ -279,3 +279,13 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   - e88a669b1: `eth_getProof` holds its tracing permit inside the blocking task
     (`rpc-eth-api/src/helpers/state.rs`). Ported by hand: TN's tree has only the one proof method;
     upstream's second site (the v2 multiproof) does not exist here.
+
+- **TN-0022** — Backport 47544d9a7: add transactions to the pending subpool in nonce order.
+  *Kind*: backport.
+  *Files*: `crates/transaction-pool/src/pool/txpool.rs` (with upstream's three tests).
+  *Why*: when a new transaction promoted a same-sender transaction with a lower nonce (for
+  example by unlocking balance), the pool added the new one first, so a live `BestTransactions`
+  iterator saw nonce N+1 before N. TN's batch builder iterates a live `best_transactions()`, so
+  a batch could get a nonce gap. Updates below the new nonce are now promoted first, then the new
+  transaction, then the rest. Two of the three tests fail without the fix; the gap-fill case
+  was already right. *Upstream*: n/a (upstream commit).
