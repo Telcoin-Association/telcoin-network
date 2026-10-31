@@ -265,6 +265,15 @@ newest last.
   test builder stopped compiling, so TN now requests it directly (`alloy` `rand`); `graph.py diff`
   then shows no third-party feature change. *Upstream*: no.
 
+- **TN-0032** — reth-engine-primitives without the engine-API message types. *Kind*: removal.
+  *Files*: `crates/engine/primitives/{src/lib.rs, Cargo.toml}` (deleted `src/message.rs`; no
+  tokio or futures); `crates/payload/builder-primitives` removed from the vendored set.
+  *Why*: `ConsensusEngineHandle`, `BeaconEngineMessage` and `OnForkChoiceUpdated` carry
+  engine-API requests into reth's engine tree. TN carries neither (Phases 1 and 6a), nothing
+  referenced them, and they were the only user of reth-payload-builder-primitives. The constants,
+  `TreeConfig`, `EngineTypes`, `PayloadValidator` and `ConsensusEngineEvent` that TN, node-core
+  and the RPC crates use stay. *Upstream*: no.
+
 ## Upstream syncs
 
 - **TN-0013** — Sync to upstream v1.11.4 (`2ac58a25f561`). *Kind*: sync.

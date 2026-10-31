@@ -32,10 +32,9 @@ pub use error::*;
 mod forkchoice;
 pub use forkchoice::{ForkchoiceStateHash, ForkchoiceStateTracker, ForkchoiceStatus};
 
-#[cfg(feature = "std")]
-mod message;
-#[cfg(feature = "std")]
-pub use message::*;
+// TN(TN-0032): upstream's `message` module (`ConsensusEngineHandle`, `BeaconEngineMessage`,
+// `OnForkChoiceUpdated`) is removed. It served the engine API and engine tree, which TN does not
+// carry, and was the only user of reth-payload-builder-primitives.
 
 mod event;
 pub use event::*;

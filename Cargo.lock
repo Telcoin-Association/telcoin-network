@@ -7269,19 +7269,16 @@ dependencies = [
  "alloy-primitives",
  "alloy-rpc-types-engine",
  "auto_impl",
- "futures",
  "reth-chain-state",
  "reth-errors",
  "reth-ethereum-primitives",
  "reth-evm",
  "reth-execution-types",
- "reth-payload-builder-primitives",
  "reth-payload-primitives",
  "reth-primitives-traits",
  "reth-trie-common",
  "serde",
  "thiserror 2.0.18",
- "tokio",
 ]
 
 [[package]]
@@ -7583,17 +7580,6 @@ dependencies = [
  "reth-engine-primitives",
  "reth-payload-primitives",
  "reth-primitives-traits",
-]
-
-[[package]]
-name = "reth-payload-builder-primitives"
-version = "1.11.3"
-dependencies = [
- "pin-project",
- "reth-payload-primitives",
- "tokio",
- "tokio-stream",
- "tracing",
 ]
 
 [[package]]
