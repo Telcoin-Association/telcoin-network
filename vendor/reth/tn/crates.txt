@@ -19,11 +19,8 @@ crates/evm/execution-errors
 crates/evm/execution-types
 crates/fs-util
 crates/metrics
-crates/net/banlist
 crates/net/eth-wire-types
 crates/net/network-api
-crates/net/network-types
-crates/net/p2p
 crates/net/peers
 crates/node/core
 crates/node/types

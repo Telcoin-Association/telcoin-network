@@ -24,11 +24,8 @@ members = [
     "crates/evm/execution-errors",
     "crates/evm/execution-types",
     "crates/metrics/",
-    "crates/net/banlist/",
     "crates/net/eth-wire-types",
     "crates/net/network-api/",
-    "crates/net/network-types/",
-    "crates/net/p2p/",
     "crates/net/peers/",
     "crates/node/core/",
     "crates/node/types",
@@ -259,11 +256,8 @@ reth-ipc = { path = "crates/rpc/ipc" }
 reth-libmdbx = { path = "crates/storage/libmdbx-rs" }
 reth-mdbx-sys = { path = "crates/storage/libmdbx-rs/mdbx-sys" }
 reth-metrics = { path = "crates/metrics" }
-reth-net-banlist = { path = "crates/net/banlist" }
 reth-network-api = { path = "crates/net/network-api" }
-reth-network-p2p = { path = "crates/net/p2p" }
 reth-network-peers = { path = "crates/net/peers", default-features = false }
-reth-network-types = { path = "crates/net/network-types" }
 reth-nippy-jar = { path = "crates/storage/nippy-jar" }
 reth-node-core = { path = "crates/node/core" }
 reth-node-types = { path = "crates/node/types" }
