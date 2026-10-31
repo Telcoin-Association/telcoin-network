@@ -9,14 +9,14 @@ on:
   workflow_dispatch:
     inputs:
       epoch_secs:
-        description: "Epoch duration: 30 for a short run, 1200 for fleet B"
-        default: "30"
+        description: "Epoch duration: 10 for a short run, 1200 for fleet B"
+        default: "10"
       before_close_secs:
         description: "Late-kill offset before the boundary: 2 locally, 59 for fleet B"
         default: "2"
       downtime_secs:
-        description: "Minimum time from kill to restart: 45 locally, 300 for fleet B"
-        default: "45"
+        description: "Minimum time from kill to restart: 18 locally, 300 for fleet B"
+        default: "18"
       recovery_secs:
         description: "Catch-up deadline after restart, with capture every minute"
         default: "180"
@@ -31,9 +31,9 @@ env:
   RUST_BACKTRACE: 1
   CARGO_PROFILE_DEV_DEBUG: 0
   CARGO_PROFILE_TEST_DEBUG: 0
-  TN_SIGKILL_EPOCH_SECS: ${{ inputs.epoch_secs || '30' }}
+  TN_SIGKILL_EPOCH_SECS: ${{ inputs.epoch_secs || '10' }}
   TN_SIGKILL_BEFORE_CLOSE_SECS: ${{ inputs.before_close_secs || '2' }}
-  TN_SIGKILL_DOWNTIME_SECS: ${{ inputs.downtime_secs || '45' }}
+  TN_SIGKILL_DOWNTIME_SECS: ${{ inputs.downtime_secs || '18' }}
   TN_SIGKILL_RECOVERY_SECS: ${{ inputs.recovery_secs || '180' }}
 
 jobs:
@@ -85,7 +85,7 @@ jobs:
         env:
           TN_SIGKILL_EPOCH_SECS: "2000"
           TN_SIGKILL_BEFORE_CLOSE_SECS: "2"
-          TN_SIGKILL_DOWNTIME_SECS: "45"
+          TN_SIGKILL_DOWNTIME_SECS: "18"
           TN_SIGKILL_RECOVERY_SECS: "180"
         run: |
           if timeout 60s env TN_BIN_PATH="$PWD/target/e2e/telcoin-network" cargo nextest run --profile sigkill --locked -p e2e-tests --test it --run-ignored all -E "$SIGKILL_FILTER" > timing-budget.log 2>&1; then
@@ -103,7 +103,7 @@ jobs:
         env:
           TN_SIGKILL_EPOCH_SECS: "10"
           TN_SIGKILL_BEFORE_CLOSE_SECS: "2"
-          TN_SIGKILL_DOWNTIME_SECS: "15"
+          TN_SIGKILL_DOWNTIME_SECS: "18"
           TN_SIGKILL_RECOVERY_SECS: "10"
         run: |
           sigkill_source=crates/e2e-tests/tests/it/sigkill.rs
@@ -134,7 +134,7 @@ jobs:
         env:
           TN_SIGKILL_EPOCH_SECS: "10"
           TN_SIGKILL_BEFORE_CLOSE_SECS: "2"
-          TN_SIGKILL_DOWNTIME_SECS: "15"
+          TN_SIGKILL_DOWNTIME_SECS: "18"
           TN_SIGKILL_RECOVERY_SECS: "180"
         run: |
           sigkill_source=crates/e2e-tests/tests/it/sigkill.rs
