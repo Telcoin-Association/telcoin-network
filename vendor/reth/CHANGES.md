@@ -198,9 +198,10 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   that name), `crates/rpc/rpc/Cargo.toml` (optional `humantime` as upstream; tokio `time`).
   *Why*: a JS tracer in `debug_traceTransaction`/`debug_traceCall` ignored its `timeout` and kept
   running on a blocking thread after the client dropped the request, until it finished or the node
-  ran out of memory (upstream #27543). TN serves `debug` and builds with `js-tracer`. Now the
-  timeout is honored (geth's 5 s default; expiry returns `ExecutionTimedOut`) and a timed-out or
-  dropped request stops the trace at the next inspector hook.
+  ran out of memory (upstream #27543). TN builds with `js-tracer` and serves `debug` when an
+  operator names it (off by default). Now the timeout is honored (geth's 5 s default; expiry
+  returns `ExecutionTimedOut`) and a timed-out or dropped request stops the trace at the next
+  inspector hook.
   *Adaptation*: upstream uses `JsInspectorInterrupt` from revm-inspectors 0.44.2, which needs
   revm 43. `js_tracer_interrupt.rs` ports the same mechanism (a shared flag checked at every hook,
   which halts the EVM with "JavaScript tracing interrupted") as a wrapper around `DebugInspector`,
