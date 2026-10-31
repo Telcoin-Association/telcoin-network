@@ -41,6 +41,7 @@ Severity below is for TN, which differs from upstream's in places. Relevant TN f
 | 1e17affd3 | TN-0023 | startup recovery removes transaction row 0 when the checkpoint is TN's empty genesis | upstream test fails without the fix |
 | 0d1324f14, 22e3708b2 | TN-0023 | nippy-jar: `prune_rows` with uncommitted rows; the last value ends at its offset (tip reads during appends, no panic on a stale mmap) | upstream tests fail without the fixes |
 | 95679ace2 | TN-0023 | static-file read errors are errors, not `Ok(None)` ("missing block") | upstream test (adapted) fails without the fix |
+| d3d7fb31d | TN-0024 | the replacement price bump rounds up, so below 10 wei an equal-price replacement is refused. Pool admission only; no batch or block validity change | upstream test fails without the fix |
 
 ## Open
 
@@ -54,7 +55,6 @@ Severity below is for TN, which differs from upstream's in places. Relevant TN f
 
 | sha | subject | crate | why | pick |
 |---|---|---|---|---|
-| d3d7fb31d | ceiling division for replacement price bump | transaction-pool | Below 10 wei the 10% bump rounds to 0, so equal-price replacements are accepted. At TN's 7-wei floor replacements are nearly free with or without it, and the overflow it guards is unreachable (the balance check caps fees far below it). Correctness. **Recommended**: tiny and clean. | clean |
 | 13a59de4b (+ 621f663ed) | stop long blocking jobs once the request is dropped | rpc-eth-api, tasks | Extends TN-0019 to synchronous jobs that never yield (e.g. long `eth_call`s). Needs the `CancelOnDrop` move into reth-tasks first. | not tried |
 | 6d718d0c2 | use the configured limit in `trace_filter` | rpc | `trace` is opt-in. | not tried |
 | 6e4009eed | no panic in log subscription on broadcast lag | rpc | A lagging `eth_subscribe("logs")` client panics its own subscription task. TN ignores non-critical task panics, so only that client's subscription ends (with a panic in the log). | clean |

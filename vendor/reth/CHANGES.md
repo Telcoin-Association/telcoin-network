@@ -321,3 +321,13 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
     was TN's older spelling of the same expression (`map_or(None, |v| v)`); upstream's line
     taken. Upstream's test adapted to v1.11's `read_only(path, watch_directory)`; it fails
     without the fix.
+
+- **TN-0024** — Backport d3d7fb31d: round the replacement price bump up. *Kind*: backport.
+  *Files*: `crates/transaction-pool/src/{validate/mod.rs, pool/txpool.rs}` (with upstream's
+  test).
+  *Why*: the required bump was `fee * (100 + bump) / 100`, which rounds down, so below 10 wei
+  the 10% bump was 0 and an equal-price replacement was accepted. TN's base fee floor is 7 wei.
+  The fix only tightens local pool admission (`AllTransactions::insert_tx` is the one caller);
+  batch validation and execution never apply replacement rules, so nodes with and without it
+  agree on every batch and block. Upstream's test fails without the fix. *Upstream*: n/a
+  (upstream commit).
