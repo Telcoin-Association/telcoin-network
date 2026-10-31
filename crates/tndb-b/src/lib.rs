@@ -53,9 +53,6 @@ mod freelist;
 mod latch;
 mod meta;
 mod overflow;
-// The dup tables' packed-set codec; only its tests use it until the dup layer reads and writes
-// packed sets.
-#[cfg_attr(not(test), allow(dead_code))]
 mod packed;
 mod page;
 mod page_set;

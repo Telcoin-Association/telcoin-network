@@ -22,7 +22,8 @@ use crate::{
     freelist,
     latch::UnwindLatch,
     meta::Meta,
-    page,
+    packed::{self, PackedView},
+    page::{self, Search, Val},
     stats::elapsed_ns,
     tree::{
         cursor::{self, Cursor, Entry, KeyTail, State, TreeCursor},
@@ -214,17 +215,67 @@ fn split_dup_key(key: &[u8], key_len: u16) -> Result<(&[u8], &[u8])> {
     Ok(key.split_at(k))
 }
 
-/// The outer cell of key `k` in the dup table `table`'s outer tree `outer`: the nested cell's
-/// root bytes, `None` for no cell. Any other cell is [`Error::Corrupt`] (this build writes only
-/// nested cells into an outer tree), as is a miss beside an outer key of another width than `k`'s
-/// ([`read::find_outer`]).
+/// What the outer cell of a key in a dup table holds ([`outer_val`]).
+#[derive(Clone, Copy, Debug)]
+enum OuterVal<'s> {
+    /// The root bytes of the key's nested tree, undecoded and unchecked ([`cell_root`]).
+    Nested(&'s [u8; page::NESTED_CELL]),
+    /// The key's packed set, in a table whose record's `packed_max` is not 0: unchecked, each
+    /// use runs the codec's checks ([`packed`]).
+    Packed(&'s [u8]),
+}
+
+/// Outer key `k`'s cell `val` in the dup table `name`, read by the record's packed-set limit
+/// `packed_max`: a nested cell in every dup table, an inline cell (a packed set) in a table that
+/// packs. An inline cell in a table that does not pack and an overflow cell in any are
+/// [`Error::Corrupt`] ([`nested_cell`]'s messages).
+#[inline]
+fn outer_val<'s>(name: &str, k: &[u8], val: Val<'s>, packed_max: u16) -> Result<OuterVal<'s>> {
+    match val {
+        Val::Nested(b) => Ok(OuterVal::Nested(b)),
+        Val::Inline(b) if packed_max != 0 => Ok(OuterVal::Packed(b)),
+        val => nested_cell(name, k, val).map(OuterVal::Nested),
+    }
+}
+
+/// The outer cell of key `k` in the dup table `table`'s outer tree `outer`, read by the record's
+/// packed-set limit `packed_max` ([`outer_val`]), `None` for no cell. A miss beside an outer key
+/// of another width than `k`'s is [`Error::Corrupt`] ([`read::find_outer`]).
 fn outer_cell<'s, S: PageRead + ?Sized>(
     store: &'s S,
     table: &Table,
+    packed_max: u16,
     outer: &TreeRoot,
     k: &[u8],
-) -> Result<Option<&'s [u8; page::NESTED_CELL]>> {
-    read::find_outer(store, outer, k)?.map(|val| nested_cell(table.name(), k, val)).transpose()
+) -> Result<Option<OuterVal<'s>>> {
+    read::find_outer(store, outer, k)?
+        .map(|val| outer_val(table.name(), k, val, packed_max))
+        .transpose()
+}
+
+/// A dup table's outer-cell policy ([`write::Cells`]) by its record's packed-set limit
+/// `packed_max`: `Outer` for a table that never packs, `Packing` for one that does.
+#[inline(always)]
+fn cells(packed_max: u16) -> write::Cells {
+    if packed_max == 0 {
+        write::Cells::Outer
+    } else {
+        write::Cells::Packing
+    }
+}
+
+/// A packed set's [`Error::Corrupt`] from the codec ([`packed`]), naming the dup table `table`
+/// and the outer key `k`.
+#[cold]
+#[inline(never)]
+fn packed_error(table: &Table, k: &[u8], e: Error) -> Error {
+    match e {
+        Error::Corrupt(m) => Error::Corrupt(format!(
+            "dup table {}: the packed set of key {k:02x?}: {m}",
+            table.name()
+        )),
+        e => e,
+    }
 }
 
 /// The nested root an outer cell of key `k` holds (`b`), decoded and checked: a cell names a
@@ -261,25 +312,99 @@ fn load_cell(
     Ok(root)
 }
 
-/// The working map's entry of outer key `k` (the dup table `table`, outer tree `outer`, map
-/// `map`), loaded from its cell on a miss ([`load_cell`]); `None` when the key has no cell.
-/// Every dup write takes its nested root here.
-fn nested_entry<'m>(
+/// What a dup write finds for its outer key ([`dup_entry`]).
+enum DupEntry<'m> {
+    /// No cell: the key is new.
+    Absent,
+    /// The key's nested tree: its working map entry.
+    Nested(&'m mut Nested),
+    /// The key's packed set, copied into the table's [`Working::packed_in`] and validated whole
+    /// there. The key has no working map entry: a key whose cell is a packed set never has one.
+    Packed,
+}
+
+/// The rows of an outer key for a read in the write transaction ([`Work::dup_rows`]).
+enum DupRows<'t> {
+    /// The key's nested tree: its working root, else its cell's committed root.
+    Nested(TreeRoot),
+    /// The key's packed set as its cell holds it, unchecked.
+    Packed(&'t [u8]),
+}
+
+/// The rows of outer key `k` for a write in the dup table `table` (outer tree `outer`, working
+/// map `map`, its record's packed-set limit `packed_max`): the map's entry, else the key's cell.
+/// A nested cell's root is loaded into the map ([`load_cell`]); a packed set is copied into
+/// `packed_in` and validated whole there ([`load_packed`]), before the write changes anything.
+/// Every dup write takes its key's rows here.
+fn dup_entry<'m>(
     writer: &Writer,
     table: &Table,
+    packed_max: u16,
     outer: &TreeRoot,
     map: &'m mut NestedMap,
+    packed_in: &mut Vec<u8>,
     k: &[u8],
-) -> Result<Option<&'m mut Nested>> {
+) -> Result<DupEntry<'m>> {
     if !map.contains_key(k) {
-        let Some(b) = outer_cell(writer, table, outer, k)? else {
-            return Ok(None);
+        let b = match outer_cell(writer, table, packed_max, outer, k)? {
+            None => return Ok(DupEntry::Absent),
+            Some(OuterVal::Nested(b)) => b,
+            Some(OuterVal::Packed(blob)) => {
+                load_packed(writer, table, k, blob, packed_max, packed_in)?;
+                return Ok(DupEntry::Packed);
+            }
         };
         let root = load_cell(writer, table, k, b)?;
         let entry = Nested { root, trusted: false, changed: false, cache: Box::default() };
         map.insert(k.into(), entry);
+    } else if cfg!(debug_assertions) && packed_max != 0 {
+        // A key with a working map entry has a nested cell, never a packed set: entries come only
+        // from a nested cell, a created tree and a promotion, and a nested key never goes back.
+        let cell = outer_cell(writer, table, packed_max, outer, k);
+        assert!(
+            !matches!(cell, Ok(Some(OuterVal::Packed(_)))),
+            "dup table {}: key {k:02x?} has a working entry and a packed set",
+            table.name()
+        );
     }
-    Ok(map.get_mut(k))
+    Ok(match map.get_mut(k) {
+        Some(n) => DupEntry::Nested(n),
+        None => DupEntry::Absent,
+    })
+}
+
+/// Outer key `k`'s packed set `blob` in the dup table `table` (its record's limit `packed_max`),
+/// copied into `packed_in` (its capacity reused) and validated whole there
+/// ([`packed::validate`]): a write's first use of the set. The copy ends the borrow of the
+/// writer's page before the write changes anything.
+#[inline(never)]
+fn load_packed(
+    writer: &Writer,
+    table: &Table,
+    k: &[u8],
+    blob: &[u8],
+    packed_max: u16,
+    packed_in: &mut Vec<u8>,
+) -> Result<()> {
+    packed_in.clear();
+    packed_in.extend_from_slice(blob);
+    let max_subkey = writer.geometry.max_subkey(k.len());
+    match packed::validate(packed_in, usize::from(packed_max), max_subkey) {
+        Ok(_) => Ok(()),
+        Err(e) => Err(packed_error(table, k, e)),
+    }
+}
+
+/// The [`Error::Corrupt`] of a delete that meets outer key `k`'s packed set in the dup table
+/// `table`: this build's deletes refuse a packed set, so the delete changes nothing.
+#[cold]
+#[inline(never)]
+fn packed_delete_refused(table: &Table, k: &[u8]) -> Error {
+    Error::Corrupt(format!(
+        "dup table {}: the outer cell of key {k:02x?} holds a packed set, which this build's \
+         deletes refuse",
+        table.name()
+    ))
 }
 
 /// A dup table's totals in its working record (`record.dup` of a table whose kind was checked).
@@ -349,9 +474,11 @@ pub(crate) struct DupRemoved {
 }
 
 /// The put, insert or append (`kind`) of the logical `key` and `value` into the dup table at `i`
-/// in [`Work::tables`]: into the key's nested tree, or a new tree and its outer cell. An append's
-/// order rule is the plain table's over the logical key: the outer key must not sort before the
-/// table's last outer key, and with that key the subkey must sort after its last subkey.
+/// in [`Work::tables`]: into the key's nested tree or its packed set ([`packed_put`]), or for a
+/// new key a packed set when its first row fits the table's packed-set limit
+/// ([`packed_create`]), else a new tree and its outer cell. An append's order rule is the plain
+/// table's over the logical key: the outer key must not sort before the table's last outer key,
+/// and with that key the subkey must sort after its last subkey.
 #[inline(never)]
 fn dup_put(
     work: &mut Work,
@@ -360,7 +487,8 @@ fn dup_put(
     value: &[u8],
     kind: PutKind,
 ) -> Result<DupPlaced> {
-    let key_len = dup_mut(&mut work.tables[i].record.dup).key_len;
+    let dup = dup_mut(&mut work.tables[i].record.dup);
+    let (key_len, packed_max) = (dup.key_len, dup.packed_max);
     let (k, s) = split_dup_key(key, key_len)?;
     let (writer, w) = work.writer_and_table(i);
     // Test-only: emptied caches per write, so every write descends.
@@ -387,16 +515,35 @@ fn dup_put(
         PutKind::Upsert | PutKind::Insert => false,
     };
     let (mut outer, mut trusted) = (w.record.root, w.trusted);
-    let entry =
-        if new_key { None } else { nested_entry(writer, &w.table, &outer, &mut w.nested, k)? };
-    if let Some(n) = entry {
-        let before = n.root;
-        let placed =
-            write::put_cached(writer, &mut n.root, &mut n.trusted, &mut n.cache, s, value, kind)?;
-        n.changed = true;
-        apply_delta(dup_mut(&mut w.record.dup), &w.table, k, &before, &n.root)?;
-        work.set_dup_record(i, outer, trusted);
-        return Ok(DupPlaced { created: false, slot: placed.slot });
+    let entry = if new_key {
+        DupEntry::Absent
+    } else {
+        dup_entry(writer, &w.table, packed_max, &outer, &mut w.nested, &mut w.packed_in, k)?
+    };
+    match entry {
+        DupEntry::Nested(n) => {
+            let before = n.root;
+            let placed = write::put_cached(
+                writer,
+                &mut n.root,
+                &mut n.trusted,
+                &mut n.cache,
+                s,
+                value,
+                kind,
+            )?;
+            n.changed = true;
+            apply_delta(dup_mut(&mut w.record.dup), &w.table, k, &before, &n.root)?;
+            work.set_dup_record(i, outer, trusted);
+            return Ok(DupPlaced { created: false, slot: placed.slot });
+        }
+        DupEntry::Packed => return packed_put(work, i, k, s, value, kind),
+        DupEntry::Absent
+            if packed_max != 0 && packed::encoded_len_one(s, value) <= usize::from(packed_max) =>
+        {
+            return packed_create(work, i, k, s, value, kind)
+        }
+        DupEntry::Absent => {}
     }
     // A key with no cell: its nested tree first, then the cell naming it, current from the start.
     let (mut root, mut root_trusted) = (TreeRoot::EMPTY, false);
@@ -418,7 +565,7 @@ fn dup_put(
         &mut w.cache,
         k,
         write::OuterCell::Nested(&root),
-        write::Cells::Outer,
+        cells(packed_max),
         outer_kind,
     ) {
         Ok(_) => {}
@@ -438,12 +585,199 @@ fn dup_put(
     Ok(DupPlaced { created: true, slot: placed.slot })
 }
 
+/// [`dup_put`] of the new outer key `k` whose first row (`s`, `v`) fits the dup table's
+/// packed-set limit: a one-row packed set in a new cell, by an outer append for an append, else
+/// an outer insert. Every packed write rewrites the key's cell at once and moves the stamp.
+#[inline(never)]
+fn packed_create(
+    work: &mut Work,
+    i: usize,
+    k: &[u8],
+    s: &[u8],
+    v: &[u8],
+    kind: PutKind,
+) -> Result<DupPlaced> {
+    let (writer, w) = work.writer_and_table(i);
+    let dup = dup_mut(&mut w.record.dup);
+    let rows = dup.packed_rows.checked_add(1).ok_or_else(|| totals_error(&w.table, k))?;
+    packed::build_one(s, v, &mut w.packed_out);
+    let (mut outer, mut trusted) = (w.record.root, w.trusted);
+    let outer_kind = if kind == PutKind::Append { PutKind::Append } else { PutKind::Insert };
+    match write::put_outer_cell(
+        writer,
+        &mut outer,
+        &mut trusted,
+        &mut w.cache,
+        k,
+        write::OuterCell::Packed(&w.packed_out),
+        write::Cells::Packing,
+        outer_kind,
+    ) {
+        Ok(_) => {}
+        Err(Error::KeyExists | Error::AppendOutOfOrder) => {
+            return Err(Error::Failed(format!(
+                "dup table {}: the outer put refused the new cell of key {k:02x?}",
+                w.table.name()
+            )))
+        }
+        Err(e) => return Err(e),
+    }
+    debug_assert!(!w.nested.contains_key(k), "a packed key has no working entry");
+    dup_mut(&mut w.record.dup).packed_rows = rows;
+    work.set_dup_record(i, outer, trusted);
+    Ok(DupPlaced { created: true, slot: None })
+}
+
+/// [`dup_put`] on outer key `k` whose cell holds a packed set, validated in the table's
+/// [`Working::packed_in`] ([`dup_entry`]). Insert's and append's refusals come first; then the
+/// set with the row (`s`, `v`) is rebuilt into [`Working::packed_out`] and rewrites the cell
+/// (a new row counts in `packed_rows`, a new value of a row does not), or, when the rebuilt set
+/// would pass the table's packed-set limit, the set is promoted to a nested tree ([`promote`]).
+#[inline(never)]
+fn packed_put(
+    work: &mut Work,
+    i: usize,
+    k: &[u8],
+    s: &[u8],
+    v: &[u8],
+    kind: PutKind,
+) -> Result<DupPlaced> {
+    let (writer, w) = work.writer_and_table(i);
+    let packed_max = usize::from(dup_mut(&mut w.record.dup).packed_max);
+    let max_subkey = writer.geometry.max_subkey(k.len());
+    let view =
+        PackedView::new(&w.packed_in, packed_max).map_err(|e| packed_error(&w.table, k, e))?;
+    let at = view.find(s, max_subkey).map_err(|e| packed_error(&w.table, k, e))?;
+    match (kind, at) {
+        (PutKind::Insert, Search::Found(_)) => return Err(Error::KeyExists),
+        // An append reaches a packed set only with the table's last outer key.
+        (PutKind::Append, Search::NotFound(j)) if j == view.rows() => {}
+        (PutKind::Append, _) => return Err(Error::AppendOutOfOrder),
+        _ => {}
+    }
+    if packed::encoded_len_with(&view, at, s, v) > packed_max {
+        return promote(work, i, k, s, v, at);
+    }
+    let dup = dup_mut(&mut w.record.dup);
+    let rows = match at {
+        Search::Found(_) => dup.packed_rows,
+        Search::NotFound(_) => {
+            dup.packed_rows.checked_add(1).ok_or_else(|| totals_error(&w.table, k))?
+        }
+    };
+    packed::build_with(&view, at, s, v, &mut w.packed_out);
+    let (mut outer, mut trusted) = (w.record.root, w.trusted);
+    let placed = write::put_outer_cell(
+        writer,
+        &mut outer,
+        &mut trusted,
+        &mut w.cache,
+        k,
+        write::OuterCell::Packed(&w.packed_out),
+        write::Cells::Packing,
+        PutKind::Upsert,
+    )?;
+    if !placed.replaced {
+        return Err(Error::Failed(format!(
+            "dup table {}: the packed set of key {k:02x?} had no outer cell",
+            w.table.name()
+        )));
+    }
+    debug_assert!(!w.nested.contains_key(k), "a packed key has no working entry");
+    dup_mut(&mut w.record.dup).packed_rows = rows;
+    work.set_dup_record(i, outer, trusted);
+    Ok(DupPlaced { created: false, slot: None })
+}
+
+/// The promotion of outer key `k`'s packed set (validated in the table's
+/// [`Working::packed_in`]) to a nested tree, for the row (`s`, `v`) at `at` (a new row where
+/// `NotFound` puts it, or `Found`'s row with a new value) that takes the set past the table's
+/// packed-set limit. The totals first, in a copy, so a record that cannot count them changes
+/// nothing; then the tree, by appending the rows in order to an empty tree through its own path
+/// cache (O(1) each); then the cell's packed set replaced by the tree's root, and a working map
+/// entry, trusted as a created tree's. A nested key never goes back to a packed set.
+#[inline(never)]
+fn promote(
+    work: &mut Work,
+    i: usize,
+    k: &[u8],
+    s: &[u8],
+    v: &[u8],
+    at: Search,
+) -> Result<DupPlaced> {
+    let (writer, w) = work.writer_and_table(i);
+    let mut totals = *dup_mut(&mut w.record.dup);
+    let max_subkey = writer.geometry.max_subkey(k.len());
+    let view = PackedView::new(&w.packed_in, usize::from(totals.packed_max))
+        .map_err(|e| packed_error(&w.table, k, e))?;
+    let n = view.rows();
+    totals.packed_rows =
+        totals.packed_rows.checked_sub(n as u64).ok_or_else(|| totals_error(&w.table, k))?;
+    totals.nested_trees =
+        totals.nested_trees.checked_add(1).ok_or_else(|| totals_error(&w.table, k))?;
+    let (mut root, mut root_trusted) = (TreeRoot::EMPTY, false);
+    let mut cache = Box::<write::PathCache>::default();
+    let name = w.table.name();
+    let mut append = |sj: &[u8], vj: &[u8]| match write::put_cached(
+        writer,
+        &mut root,
+        &mut root_trusted,
+        &mut cache,
+        sj,
+        vj,
+        PutKind::Append,
+    ) {
+        Ok(_) => Ok(()),
+        Err(Error::KeyExists | Error::AppendOutOfOrder) => Err(Error::Failed(format!(
+            "dup table {name}: the promotion of key {k:02x?} met its rows out of order"
+        ))),
+        Err(e) => Err(e),
+    };
+    for j in 0..n {
+        if at == Search::NotFound(j) {
+            append(s, v)?;
+        }
+        if at == Search::Found(j) {
+            append(s, v)?;
+        } else {
+            let (sj, vj) = view.row(j, max_subkey).map_err(|e| packed_error(&w.table, k, e))?;
+            append(sj, vj)?;
+        }
+    }
+    if at == Search::NotFound(n) {
+        append(s, v)?;
+    }
+    apply_delta(&mut totals, &w.table, k, &TreeRoot::EMPTY, &root)?;
+    let (mut outer, mut trusted) = (w.record.root, w.trusted);
+    let placed = write::put_outer_cell(
+        writer,
+        &mut outer,
+        &mut trusted,
+        &mut w.cache,
+        k,
+        write::OuterCell::Nested(&root),
+        write::Cells::Packing,
+        PutKind::Upsert,
+    )?;
+    if !placed.replaced {
+        return Err(Error::Failed(format!(
+            "dup table {}: the promoted packed set of key {k:02x?} had no outer cell",
+            w.table.name()
+        )));
+    }
+    w.record.dup = Some(totals);
+    w.nested.insert(k.into(), Nested { root, trusted: root_trusted, changed: false, cache });
+    work.set_dup_record(i, outer, trusted);
+    Ok(DupPlaced { created: false, slot: None })
+}
+
 /// The delete of the logical `key` from the dup table at `i` in [`Work::tables`]: from the key's
 /// nested tree, and the tree's outer cell with it when the delete empties the tree.
 #[inline(never)]
 fn dup_delete(work: &mut Work, i: usize, key: &[u8]) -> Result<DupRemoved> {
     let missed = DupRemoved { found: false, emptied: false, slot: None };
-    let key_len = dup_mut(&mut work.tables[i].record.dup).key_len;
+    let dup = dup_mut(&mut work.tables[i].record.dup);
+    let (key_len, packed_max) = (dup.key_len, dup.packed_max);
     let (k, s) = split_dup_key(key, key_len)?;
     let (writer, w) = work.writer_and_table(i);
     // Test-only: emptied caches per delete, so every delete descends, and no slot, so a cursor
@@ -456,8 +790,18 @@ fn dup_delete(work: &mut Work, i: usize, key: &[u8]) -> Result<DupRemoved> {
         w.nested.values_mut().for_each(|n| n.cache.forget());
     }
     let (mut outer, mut trusted) = (w.record.root, w.trusted);
-    let Some(n) = nested_entry(writer, &w.table, &outer, &mut w.nested, k)? else {
-        return Ok(missed);
+    let n = match dup_entry(
+        writer,
+        &w.table,
+        packed_max,
+        &outer,
+        &mut w.nested,
+        &mut w.packed_in,
+        k,
+    )? {
+        DupEntry::Nested(n) => n,
+        DupEntry::Absent => return Ok(missed),
+        DupEntry::Packed => return Err(packed_delete_refused(&w.table, k)),
     };
     let before = n.root;
     let removed = write::delete_cached(writer, &mut n.root, &mut n.trusted, &mut n.cache, s)?;
@@ -477,7 +821,7 @@ fn dup_delete(work: &mut Work, i: usize, key: &[u8]) -> Result<DupRemoved> {
             &mut trusted,
             &mut w.cache,
             k,
-            write::Cells::Outer,
+            cells(packed_max),
         )?;
         if !removed.found {
             return Err(no_cell(&w.table, k));
@@ -506,10 +850,34 @@ fn dup_get<'s, S: PageRead + ?Sized>(
     max_subkey: usize,
 ) -> Result<Option<&'s [u8]>> {
     let (k, s) = split_dup_key(key, dup.key_len)?;
-    match outer_cell(store, table, outer, k)? {
+    match outer_cell(store, table, dup.packed_max, outer, k)? {
         None => Ok(None),
-        Some(b) => nested_get(store, &cell_root(table, k, b)?, s, max_subkey),
+        Some(OuterVal::Nested(b)) => nested_get(store, &cell_root(table, k, b)?, s, max_subkey),
+        Some(OuterVal::Packed(b)) => packed_get(table, k, b, dup.packed_max, s, max_subkey),
     }
+}
+
+/// The get of subkey `s` from outer key `k`'s packed set `blob` in the dup table `table` (its
+/// record's packed-set limit `packed_max`), with the reads' lazy checks only
+/// ([`PackedView::new`], then [`PackedView::find`]'s probes and a hit's row): damage is
+/// [`Error::Corrupt`] where the read touches it.
+#[inline(never)]
+fn packed_get<'s>(
+    table: &Table,
+    k: &[u8],
+    blob: &'s [u8],
+    packed_max: u16,
+    s: &[u8],
+    max_subkey: usize,
+) -> Result<Option<&'s [u8]>> {
+    let get = || {
+        let view = PackedView::new(blob, usize::from(packed_max))?;
+        match view.find(s, max_subkey)? {
+            Search::Found(i) => Ok(Some(view.row(i, max_subkey)?.1)),
+            Search::NotFound(_) => Ok(None),
+        }
+    };
+    get().map_err(|e| packed_error(table, k, e))
 }
 
 /// The get of subkey `s` from the nested tree `root`, a miss beside a subkey of another length
@@ -523,8 +891,8 @@ fn nested_get<'s, S: PageRead + ?Sized>(
     read::find_nested(store, root, s, max_subkey)?.map(|v| store.value(v)).transpose()
 }
 
-/// [`dup_get`] in the write transaction: the key's nested root from the working map, else from
-/// its cell ([`Work::nested_root`]).
+/// [`dup_get`] in the write transaction: the key's nested root from the working map, else its
+/// cell's nested root or packed set ([`Work::dup_rows`]).
 #[inline(never)]
 fn dup_get_in_txn<'t>(
     work: &'t Work,
@@ -534,19 +902,24 @@ fn dup_get_in_txn<'t>(
     key: &[u8],
 ) -> Result<Option<&'t [u8]>> {
     let (k, s) = split_dup_key(key, dup.key_len)?;
-    match work.nested_root(table, outer, k)? {
+    match work.dup_rows(table, outer, dup.packed_max, k)? {
         None => Ok(None),
-        Some(root) => {
+        Some(DupRows::Nested(root)) => {
             let writer = work.writer();
             nested_get(writer, &root, s, writer.geometry.max_subkey(usize::from(dup.key_len)))
+        }
+        Some(DupRows::Packed(b)) => {
+            let max_subkey = work.writer().geometry.max_subkey(usize::from(dup.key_len));
+            packed_get(table, k, b, dup.packed_max, s, max_subkey)
         }
     }
 }
 
 /// Test-only: every row of a dup table whose outer tree is `outer` in `store`, as `(logical key,
 /// value)` in key order, each nested root from `working` (the write transaction's map) else from
-/// its cell; every tree is walked with the test walkers' checks, and the totals in `dup` must
-/// count exactly the trees walked.
+/// its cell, each packed set from its cell (and never in `working`); every tree is walked with
+/// the test walkers' checks, every packed set validated whole, and the totals in `dup` must
+/// count exactly the trees and sets walked.
 #[cfg(test)]
 fn dup_rows<S: PageRead + ?Sized>(
     store: &S,
@@ -554,12 +927,29 @@ fn dup_rows<S: PageRead + ?Sized>(
     dup: &DupRecord,
     working: impl Fn(&[u8]) -> Option<TreeRoot>,
 ) -> Vec<(Vec<u8>, Vec<u8>)> {
-    use crate::tree::test_harness::{walk_outer_tree, walk_tree};
+    use crate::tree::test_harness::{walk_outer_tree, walk_packing_tree, walk_tree};
     let mut rows = Vec::new();
     let mut sums =
         DupRecord { key_len: dup.key_len, packed_max: dup.packed_max, ..DupRecord::default() };
-    for (k, cell) in walk_outer_tree(store, outer).entries {
+    let max_subkey = store.geometry().max_subkey(usize::from(dup.key_len));
+    let walked = match dup.packed_max {
+        0 => walk_outer_tree(store, outer),
+        _ => walk_packing_tree(store, outer),
+    };
+    for (k, cell) in walked.entries {
         assert_eq!(k.len(), usize::from(dup.key_len), "an outer key of the table's width");
+        let val = read::find_outer(store, outer, &k).expect("a lookup").expect("the walked cell");
+        if let Val::Inline(blob) = val {
+            assert!(working(&k).is_none(), "the packed key {k:02x?} has a working entry");
+            let view = packed::validate(blob, usize::from(dup.packed_max), max_subkey)
+                .expect("a valid packed set");
+            sums.packed_rows += view.rows() as u64;
+            for j in 0..view.rows() {
+                let (s, v) = view.row(j, max_subkey).expect("a row");
+                rows.push(([k.as_slice(), s].concat(), v.to_vec()));
+            }
+            continue;
+        }
         let root = working(&k).unwrap_or_else(|| {
             TreeRoot::decode(cell.as_slice().try_into().expect("a 32-byte cell")).expect("a root")
         });
@@ -590,7 +980,8 @@ fn no_cell(table: &Table, k: &[u8]) -> Error {
 /// the rows removed. The totals are moved first, so a record that cannot count the tree frees
 /// nothing either. A key of another width than the table's is refused before anything changes.
 fn dup_delete_prefix(work: &mut Work, i: usize, key: &[u8]) -> Result<u64> {
-    let key_len = usize::from(dup_mut(&mut work.tables[i].record.dup).key_len);
+    let dup = dup_mut(&mut work.tables[i].record.dup);
+    let (key_len, packed_max) = (usize::from(dup.key_len), dup.packed_max);
     if key.len() < key_len {
         return Err(Error::KeyTooShort { len: key.len(), min: key_len });
     }
@@ -604,8 +995,12 @@ fn dup_delete_prefix(work: &mut Work, i: usize, key: &[u8]) -> Result<u64> {
         w.nested.values_mut().for_each(|n| n.cache.forget());
     }
     let (mut outer, mut trusted) = (w.record.root, w.trusted);
-    let Some(n) = nested_entry(writer, &w.table, &outer, &mut w.nested, key)? else {
-        return Ok(0);
+    let entry =
+        dup_entry(writer, &w.table, packed_max, &outer, &mut w.nested, &mut w.packed_in, key)?;
+    let n = match entry {
+        DupEntry::Nested(n) => n,
+        DupEntry::Absent => return Ok(0),
+        DupEntry::Packed => return Err(packed_delete_refused(&w.table, key)),
     };
     let (root, root_trusted) = (n.root, n.trusted);
     let mut totals = *dup_mut(&mut w.record.dup);
@@ -619,7 +1014,7 @@ fn dup_delete_prefix(work: &mut Work, i: usize, key: &[u8]) -> Result<u64> {
         &mut trusted,
         &mut w.cache,
         key,
-        write::Cells::Outer,
+        cells(packed_max),
     )?;
     if !removed.found {
         return Err(no_cell(&w.table, key));
@@ -1536,6 +1931,13 @@ struct Working {
     /// A dup table's working map ([`NestedMap`]; empty for a plain table, and `BTreeMap::new`
     /// allocates nothing).
     nested: NestedMap,
+    /// A copy of the packed set a dup write found in its key's cell, validated whole
+    /// ([`dup_entry`]); its capacity is reused, so a table's writes allocate nothing here once
+    /// it has grown to the table's packed-set limit.
+    packed_in: Vec<u8>,
+    /// The packed set a dup write rebuilds, then writes into the key's cell ([`packed_put`]);
+    /// its capacity is reused as `packed_in`'s.
+    packed_out: Vec<u8>,
 }
 
 impl Working {
@@ -1548,6 +1950,8 @@ impl Working {
             changed: false,
             writes: 0,
             nested: NestedMap::new(),
+            packed_in: Vec::new(),
+            packed_out: Vec::new(),
         }
     }
 }
@@ -1583,19 +1987,30 @@ impl Work {
         }
     }
 
-    /// The nested root of outer key `k` in the dup table `table` whose working outer root is
-    /// `outer`, for a read: the working map's entry, else the key's cell ([`load_cell`]); `None`
-    /// when the key has no cell. A table with no working record has no map: its cells are
-    /// committed.
-    fn nested_root(&self, table: &Table, outer: &TreeRoot, k: &[u8]) -> Result<Option<TreeRoot>> {
+    /// The rows of outer key `k` in the dup table `table` whose working outer root is `outer`
+    /// and whose record's packed-set limit is `packed_max`, for a read: the working map's entry
+    /// (a nested tree: a key with an entry never has a packed set), else the key's cell, a
+    /// nested root ([`load_cell`]) or a packed set, unchecked (each read runs the codec's
+    /// checks); `None` when the key has no cell. A table with no working record has no map: its
+    /// cells are committed.
+    fn dup_rows(
+        &self,
+        table: &Table,
+        outer: &TreeRoot,
+        packed_max: u16,
+        k: &[u8],
+    ) -> Result<Option<DupRows<'_>>> {
         let working = self.tables.iter().find(|w| w.table == *table);
         if let Some(n) = working.and_then(|w| w.nested.get(k)) {
-            return Ok(Some(n.root));
+            return Ok(Some(DupRows::Nested(n.root)));
         }
         let writer = self.writer();
-        match outer_cell(writer, table, outer, k)? {
+        match outer_cell(writer, table, packed_max, outer, k)? {
             None => Ok(None),
-            Some(b) => load_cell(writer, table, k, b).map(Some),
+            Some(OuterVal::Nested(b)) => {
+                load_cell(writer, table, k, b).map(|r| Some(DupRows::Nested(r)))
+            }
+            Some(OuterVal::Packed(b)) => Ok(Some(DupRows::Packed(b))),
         }
     }
 
@@ -1694,6 +2109,7 @@ impl Work {
     /// one leaf then hit the outer path cache.
     fn flush_nested(&mut self, i: usize) -> Result<()> {
         let (writer, w) = self.writer_and_table(i);
+        let packed_max = w.record.dup.map_or(0, |d| d.packed_max);
         let (mut outer, mut trusted) = (w.record.root, w.trusted);
         let mut flushed = false;
         for (k, n) in w.nested.iter_mut().filter(|(_, n)| n.changed) {
@@ -1704,7 +2120,7 @@ impl Work {
                 &mut w.cache,
                 k,
                 write::OuterCell::Nested(&n.root),
-                write::Cells::Outer,
+                cells(packed_max),
                 PutKind::Upsert,
             )?;
             if !placed.replaced {
@@ -1718,7 +2134,11 @@ impl Work {
         }
         #[cfg(debug_assertions)]
         for (k, n) in &w.nested {
-            let cell = outer_cell(&*writer, &w.table, &outer, k).ok().flatten();
+            // A key with a working entry has a nested cell, never a packed set.
+            let cell = match outer_cell(&*writer, &w.table, packed_max, &outer, k) {
+                Ok(Some(OuterVal::Nested(b))) => Some(b),
+                _ => None,
+            };
             assert_eq!(cell, Some(&n.root.encode()), "the flushed outer cell of key {k:02x?}");
         }
         if flushed {

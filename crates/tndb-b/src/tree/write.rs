@@ -283,8 +283,6 @@ pub(crate) enum OuterCell<'a> {
     /// The key's nested tree, written as a nested cell ([`page::NESTED_CELL`] bytes).
     Nested(&'a TreeRoot),
     /// The key's packed set, written as an inline cell (flags 0); this layer never parses it.
-    // Only the tests write a packed set until the dup layer packs.
-    #[cfg_attr(not(test), allow(dead_code))]
     Packed(&'a [u8]),
 }
 

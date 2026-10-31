@@ -226,6 +226,8 @@ pub(crate) fn encoded_len_with(view: &PackedView<'_>, at: Search, s: &[u8], v: &
 }
 
 /// The length [`build_without`] gives for the same arguments.
+// No caller outside the tests until the dup layer deletes packed rows.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn encoded_len_without(view: &PackedView<'_>, i: usize) -> usize {
     let (start, end) = view.range(i);
     view.blob.len() - SLOT - (end - start)
@@ -279,6 +281,8 @@ pub(crate) fn build_with(view: &PackedView<'_>, at: Search, s: &[u8], v: &[u8], 
 /// Into `out` (cleared first, its capacity reused): the set of the validated `view` without row
 /// `i`. The view has at least 2 rows (a set never empties: its last row's delete removes the
 /// cell). O(blob).
+// No caller outside the tests until the dup layer deletes packed rows.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn build_without(view: &PackedView<'_>, i: usize, out: &mut Vec<u8>) {
     debug_assert!(view.n >= 2 && i < view.n);
     let n = view.n;
