@@ -12,14 +12,16 @@
 //!
 //! A table is plain or dup. A plain table maps byte-string keys to values. A dup table
 //! ([`RwTxn::create_dup_table`], [`DupOptions`]) keys every row `k ‖ s`, an outer key of a fixed
-//! width and a subkey: its outer tree holds one cell per outer key, naming that key's own nested
-//! B+tree of subkeys and values. Its point operations ([`ReadTxn::get`], [`RwTxn::put`],
-//! [`RwTxn::insert`], [`RwTxn::append`], [`RwTxn::delete`]) take the logical key `k ‖ s`, and
-//! [`RwTxn::delete_prefix`] removes one outer key's rows. A write transaction keeps the nested
-//! roots it writes in memory and rewrites their outer cells once, at commit. A call that needs
-//! the other kind of table is [`Error::TableKind`]. A dup table records a packed-set limit
-//! ([`DupOptions::packed_max`], resolved at the page size by [`DupOptions::resolved`]); this
-//! version still holds every outer key's rows in a nested tree.
+//! width and a subkey: its outer tree holds one cell per outer key. A key whose rows encode within
+//! the table's packed-set limit ([`DupOptions::packed_max`], in bytes, resolved at the page size
+//! by [`DupOptions::resolved`]; [`DupOptions::packed`] asks for the most the page size allows)
+//! keeps them in that cell, a packed set; a key that outgrows it moves them to a nested B+tree of
+//! its own, named by the cell, and stays nested. Its point operations ([`ReadTxn::get`],
+//! [`RwTxn::put`], [`RwTxn::insert`], [`RwTxn::append`], [`RwTxn::delete`]) take the logical key
+//! `k ‖ s`, and [`RwTxn::delete_prefix`] removes one outer key's rows. A write transaction
+//! rewrites a packed set's cell at once, and keeps the nested roots it writes in memory and
+//! rewrites their outer cells once, at commit. A call that needs the other kind of table is
+//! [`Error::TableKind`].
 //!
 //! A dup table's cursors are [`DupRoCursor`] ([`RoTxn::dup_cursor_owned`], owned as a
 //! [`RoCursor`] is) and [`DupTxnCursor`] ([`RwTxn::dup_cursor_detached`], detached as a
@@ -30,7 +32,7 @@
 //! key), key tails, a write cursor's writes, deleted state and staleness. On top of those, the
 //! bounded seeks ([`DupRoCursor::seek_key`], [`DupRoCursor::seek_dup`],
 //! [`DupRoCursor::seek_dup_with_key_tail`]) stay inside one outer key: a miss leaves the cursor
-//! unset and reads no other key's nested tree. The key a call returns is the cursor's copy of
+//! unset and reads no other key's rows. The key a call returns is the cursor's copy of
 //! `k ‖ s`, so the results borrow the cursor.
 
 // The page file is mmap-backed, synced with `msync`/`fsync`, preallocated with

@@ -31,11 +31,11 @@
 //!
 //! | table | key | subkey (W) | form |
 //! |---|---|---|---|
-//! | `PlainStorageState` | `Address` (20 bytes) | `B256` slot (32) | nested |
+//! | `PlainStorageState` | `Address` (20 bytes) | `B256` slot (32) | nested (dup, packed) |
 //! | `StorageChangeSets` | `BlockNumberAddress` (28) | `B256` slot (32) | composite |
-//! | `HashedStorages` | `B256` (32) | `B256` slot (32) | nested |
+//! | `HashedStorages` | `B256` (32) | `B256` slot (32) | nested (dup, packed) |
 //! | `AccountChangeSets` | `BlockNumber` (8) | `Address` (20) | composite |
-//! | `StoragesTrie` | `B256` (32) | `StoredNibblesSubKey` (65) | nested |
+//! | `StoragesTrie` | `B256` (32) | `StoredNibblesSubKey` (65) | nested (dup, packed) |
 //!
 //! - **Nested** (the state tables): an engine dup table ([`tndb_b::RwTxn::create_dup_table`],
 //!   [`tndb_b::DupOptions::packed`] of `key_len` K: `packed_max` the most the page size allows, 987
@@ -83,7 +83,7 @@
 //! | `append` | the engine's append, or an insert as by `put` if the key is the table's last key (MDBX takes a value anywhere among the last key's); a smaller key is `MDBX_EKEYMISMATCH`, the cursor on the last row | the same, the engine's dup append: a key's first row makes its cell and tree, its later rows go to the tree's right edge |
 //! | `append_dup` | the value must sort after the key's last (by subkey), else `MDBX_EKEYMISMATCH` with the cursor on the key's last row (on its first when the value is exactly the first's); a key without rows takes any value, wherever the key sorts | the same |
 //! | `delete(k, Some(v))` | deletes the row of `v`'s subkey if it holds exactly the rest of `v` | the same, the engine's dup point calls |
-//! | `delete(k, None)`, `delete_current_duplicates` | delete every row of the key, a row at a time | `delete_prefix(k)`: one walk frees the key's tree; the cursor ends on the next key's first row, as after the composite loop |
+//! | `delete(k, None)`, `delete_current_duplicates` | delete every row of the key, a row at a time | `delete_prefix(k)`: one walk frees the key's tree, or removes its packed set; the cursor ends on the next key's first row, as after the composite loop |
 //! | `delete_current` | the engine's `delete_current`, then its `follower_shares_prefix` over the key's width, with no step: a follower of the key's leaves the cursor on it, else `prev_in_prefix` finds whether the key keeps an earlier row (the cursor then ends the key's rows, on it) or none (the cursor on the next key's first row) | the same |
 //! | `entries` | the rows: MDBX's count of key/value pairs | the same (the engine's dup totals count rows, not keys) |
 //!

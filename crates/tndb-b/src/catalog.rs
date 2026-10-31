@@ -53,8 +53,9 @@ const CREATED: std::ops::Range<usize> = 80..88;
 const RESERVED: [std::ops::Range<usize>; 2] = [76..80, CREATED.end..RECORD_LEN];
 
 /// The shape of a dup table (`RwTxn::create_dup_table`): every key is `k ‖ s`, an outer key `k`
-/// of exactly `key_len` bytes and a subkey `s` of at least one byte. Each outer key holds its rows
-/// in a nested B+tree of its own, named by the key's one cell in the table's outer tree.
+/// of exactly `key_len` bytes and a subkey `s` of at least one byte. Each outer key has one cell in
+/// the table's outer tree: a packed set of its rows while they encode within `packed_max` bytes,
+/// else the root of a nested B+tree of its own.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct DupOptions {
     /// The width of every outer key, in bytes: at least 1, and at most what leaves the outer cell
@@ -65,8 +66,8 @@ pub struct DupOptions {
     /// The largest packed set, in bytes of its encoding: a key whose rows encode within it keeps
     /// them in its outer cell; 0: every key holds a nested tree. Else at least 7 and at most the
     /// longest value an inline entry of a `key_len`-byte key takes (987 bytes at `key_len` 20 and
-    /// 4 KiB pages), or [`Self::PACKED_DEFAULT`] for that most; see [`Self::resolved`]. This
-    /// version holds every key in a nested tree whatever the limit.
+    /// 4 KiB pages), or [`Self::PACKED_DEFAULT`] for that most; see [`Self::resolved`]. A key
+    /// whose rows outgrow it moves them to a nested tree and stays nested.
     pub packed_max: u16,
 }
 
