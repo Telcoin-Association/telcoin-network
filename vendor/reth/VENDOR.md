@@ -11,9 +11,11 @@ LICENSE-APACHE and LICENSE-MIT apply to every file under this directory.
   `warnings = "allow"`, and the subset of upstream's `[workspace.dependencies]` that a kept
   crate still inherits. It has no `[patch]` table and no profiles.
 - The telcoin-network root workspace lists `vendor/reth` in `exclude`. The vendored crates are
-  path dependencies of the root workspace, not members: `cargo test --workspace`,
-  `cargo clippy --all` and `cargo fmt --all` do not visit them, and their dev-dependencies are
-  not in `Cargo.lock`.
+  path dependencies of the root workspace, not members: `cargo test --workspace` and
+  `cargo clippy --all` do not visit them, and their dev-dependencies are not in `Cargo.lock`.
+  `cargo fmt --all` does visit them, because it formats local path dependencies. The
+  `rustfmt.toml` here is upstream's, so the nearest config for every vendored file is reth's
+  own and the files keep upstream's formatting.
 - Every crate keeps its upstream path under `crates/`, so an upstream diff applies as is.
 
 ## What was removed
@@ -35,15 +37,14 @@ workspace.
    are removed, and `x/f` items for a dependency the manifest no longer declares are removed.
    Upstream lists dev-dependency features (for example `alloy-rlp/std`) in `[features]`, and
    cargo accepts them only while the dev-dependency exists.
-4. **Sources.** A `.rs` file is kept when a chain of `mod` declarations reaches it from a crate
-   root (`src/lib.rs`, `src/main.rs`, `build.rs`, `[[bin]]` paths, `src/bin/`) with every
-   removed feature false and `cfg(test)` false. `#[path]`, `cfg_attr(.., path = ..)` and
-   inline modules follow the Rust reference rules. `include!`, `include_str!` and
-   `include_bytes!` targets are kept. Markdown files are removed unless a source file includes
-   them. Build scripts, C sources (libmdbx) and other assets are kept.
-
-A dangling `#[cfg(feature = "x")] mod x;` line whose file is gone is fine: the predicate is
-false in every telcoin-network build, so rustc never looks for the file.
+4. **Sources.** Every `.rs` file of a kept crate stays, including the `test_utils` modules and
+   the files behind `cfg(test)` that no telcoin-network build compiles. Two things need them:
+   `cargo fmt --all` resolves every `mod` declaration before it reads a `cfg`, so a missing
+   file behind a false predicate fails the fmt lane; and some crates declare modules through
+   a macro (`cond_mod!` in `reth-codecs`), which a `mod`-walk does not see. The one removed
+   source directory is `providers/rocksdb/` in `reth-provider` (see RocksDB). Markdown files
+   are removed unless a source file includes them. Build scripts, C sources (libmdbx) and
+   other assets are kept.
 
 ## RocksDB
 
