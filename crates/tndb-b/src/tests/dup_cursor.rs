@@ -17,13 +17,14 @@ use crate::{
     page,
     tree::{
         cursor::{
-            tests::{owned, owned_tail, Kv},
+            tests::{owned, owned_tail, root_descents, Kv},
             KeyTail, State,
         },
+        dup_cursor::LeafBounds,
         test_harness::{walk_outer_tree, ReportSeed, Rng},
         TreeRoot,
     },
-    DupRoCursor, Env, Error, ReadTxn as _, Result, RoCursor, Table,
+    DupRoCursor, DupTxnCursor, Env, Error, ReadTxn as _, Result, RoCursor, RwTxn, Table,
 };
 
 /// The key width of the dup tables here ([`OPTIONS`]).
@@ -118,6 +119,11 @@ fn pick_row<'r>(rng: &mut Rng, rows: &'r [Kv]) -> &'r [u8] {
 /// key, or a random one.
 fn target(rng: &mut Rng, rows: &[Kv]) -> Vec<u8> {
     let r = pick_row(rng, rows).to_vec();
+    shaped(rng, r)
+}
+
+/// [`target`]'s length classes made from the row key `r`.
+fn shaped(rng: &mut Rng, r: Vec<u8>) -> Vec<u8> {
     match rng.below(9) {
         0 => r,
         1 => r[..rng.below(K as u64) as usize].to_vec(),
@@ -358,6 +364,15 @@ impl Coverage {
                 (true, false) => "tail apart: a run",
                 (true, true) => "tail apart: t > |s|",
             });
+        }
+    }
+
+    /// Every one of `cases` seen.
+    #[track_caller]
+    fn assert_has(&self, cases: &[&str], what: &str) {
+        for case in cases {
+            let seen = self.0.get(case).is_some_and(|&n| n > 0);
+            assert!(seen, "{what}: never seen: {case}; {:?}", self.0);
         }
     }
 
@@ -713,4 +728,433 @@ fn an_empty_subkey_is_corrupt_at_first_use() {
     let result = env.check();
     let corrupt = matches!(&result, Err(Error::Corrupt(m)) if m.contains("subkey of 0 bytes"));
     assert!(corrupt, "check: {result:?}");
+}
+
+// ---- seeks from random positions ----
+
+/// A row key near `at` among the sorted `rows`: `at` itself, up to 16 rows either side, or up to
+/// 400 (another nested leaf of a big key, another outer leaf); any row one time in four, or with
+/// no `at`.
+fn near_row<'r>(rng: &mut Rng, rows: &'r [Kv], at: Option<&'r [u8]>) -> &'r [u8] {
+    let (at, reach) = match (at, rng.below(4)) {
+        (Some(at), 0) => return at,
+        (Some(at), 1) => (at, 16),
+        (Some(at), 2) => (at, 400),
+        _ => return pick_row(rng, rows),
+    };
+    let i = rows.partition_point(|(k, _)| k.as_slice() < at) + rng.below(2 * reach) as usize;
+    &rows[i.saturating_sub(reach as usize).min(rows.len() - 1)].0
+}
+
+/// A seek of each kind for a cursor at `at`, of a target near it ([`near_row`]): in [`target`]'s
+/// length classes for the unbounded seeks, or past the near key's last subkey;
+/// [`bounded_target`]'s keys for the bounded ones.
+fn seek_near(rng: &mut Rng, rows: &[Kv], at: Option<&[u8]>) -> Op {
+    let near = near_row(rng, rows, at).to_vec();
+    let t = [0, 1, 3, usize::MAX][rng.below(4) as usize];
+    match rng.below(7) {
+        0 => Op::Seek(shaped(rng, near)),
+        6 => Op::Seek([&near[..K], &[0xFF; 13][..]].concat()),
+        1 => Op::SeekExact(shaped(rng, near)),
+        2 => Op::SeekWithKeyTail(shaped(rng, near), t),
+        3 => Op::SeekKey(bounded_target(rng, rows, Some(&near)).0),
+        4 => {
+            let (k, s) = bounded_target(rng, rows, Some(&near));
+            Op::SeekDup(k, s)
+        }
+        _ => {
+            let (k, s) = bounded_target(rng, rows, Some(&near));
+            Op::SeekDupWithKeyTail(k, s, t)
+        }
+    }
+}
+
+/// The whole outer key (of the key width) whose rows seek `op` may land on: `x[..K]` of a seek
+/// of at least K bytes or a `seek_exact` of more, a bounded seek's `k`.
+fn outer_target(op: &Op) -> Option<&[u8]> {
+    match op {
+        Op::Seek(x) | Op::SeekWithKeyTail(x, _) if x.len() >= K => Some(&x[..K]),
+        Op::SeekExact(x) if x.len() > K => Some(&x[..K]),
+        Op::SeekKey(k) | Op::SeekDup(k, _) | Op::SeekDupWithKeyTail(k, _, _) if k.len() == K => {
+            Some(k)
+        }
+        _ => None,
+    }
+}
+
+/// A cursor at a row whose leaves a seek starts from: the row's logical key and the first and
+/// last keys of its outer and nested leaves.
+struct Held<'a> {
+    key: &'a [u8],
+    leaves: &'a [LeafBounds; 2],
+}
+
+/// `key` lies between the first and last keys of the leaf `bounds`: a seek from that leaf settles
+/// in it.
+fn inside(bounds: &LeafBounds, key: &[u8]) -> bool {
+    bounds.as_ref().is_some_and(|(first, last)| first.as_slice() <= key && key <= last.as_slice())
+}
+
+/// The class of seek `op` and the root descents it makes at both levels: from `held` (`None`: a
+/// cursor not at a row, or stale, which descends from the roots), landing on the row `landed` (its
+/// logical key); `has_key`: [`outer_target`] has rows, `empty`: the table has none. A seek inside
+/// the cursor's key never moves the outer path (0 inside the nested leaf, else 1; a seek past the
+/// key's last subkey then steps the outer path from its leaf and descends the next key's nested
+/// root); a seek to another key starts from the outer leaf when the key lies in it (else 1) and
+/// descends the new key's nested root (1, and 1 more when it misses there and crosses to the next
+/// key); from the roots the outer descent is 1 (0 on an empty table).
+fn expected(
+    op: &Op,
+    held: Option<&Held<'_>>,
+    landed: Option<&[u8]>,
+    has_key: bool,
+    empty: bool,
+) -> (&'static str, u64) {
+    let left = |xk: &[u8]| landed.is_none_or(|to| to[..K] != *xk);
+    let crossed = |xk: &[u8]| landed.is_some_and(|to| to[..K] != *xk);
+    let same = |xk: &[u8]| held.filter(|h| xk.len() == K && h.key[..K] == *xk);
+    let nested = |h: &Held<'_>, s: &[u8]| {
+        if inside(&h.leaves[1], s) {
+            ("same key inside the nested leaf", 0)
+        } else {
+            ("same key outside the nested leaf", 1)
+        }
+    };
+    let other = |xk: &[u8]| match held {
+        Some(h) if inside(&h.leaves[0], xk) => ("another key inside the outer leaf", 0),
+        Some(_) => ("another key outside the outer leaf", 1),
+        None => ("from the roots", u64::from(!empty)),
+    };
+    match op {
+        Op::Seek(x) | Op::SeekWithKeyTail(x, _) => {
+            let (xk, xs) = x.split_at(K.min(x.len()));
+            if let Some(h) = same(xk) {
+                let (class, d) = nested(h, xs);
+                if left(xk) {
+                    return ("same key past its last subkey", d + u64::from(crossed(xk)));
+                }
+                return (class, d);
+            }
+            let (class, d) = other(xk);
+            match (x.len() >= K && has_key, x.len() == K) {
+                (false, _) => (class, d + u64::from(landed.is_some())),
+                (true, true) => (class, d + 1),
+                (true, false) => (class, d + 1 + u64::from(crossed(xk))),
+            }
+        }
+        Op::SeekExact(x) if x.len() <= K => ("seek_exact of at most K bytes", 0),
+        Op::SeekExact(x) => {
+            let (xk, xs) = x.split_at(K);
+            match same(xk) {
+                Some(h) => nested(h, xs),
+                None => {
+                    let (class, d) = other(xk);
+                    (class, d + u64::from(has_key))
+                }
+            }
+        }
+        Op::SeekKey(k) | Op::SeekDup(k, _) | Op::SeekDupWithKeyTail(k, _, _) if k.len() != K => {
+            (REFUSED, 0)
+        }
+        Op::SeekKey(k) | Op::SeekDup(k, _) | Op::SeekDupWithKeyTail(k, _, _) => {
+            let s: &[u8] = match op {
+                Op::SeekDup(_, s) | Op::SeekDupWithKeyTail(_, s, _) => s,
+                _ => &[],
+            };
+            match same(k) {
+                Some(_) if s.is_empty() => ("same key, its first row", 1),
+                Some(h) => nested(h, s),
+                None => {
+                    let (class, d) = other(k);
+                    (class, d + u64::from(has_key))
+                }
+            }
+        }
+        other => panic!("not a seek: {other:?}"),
+    }
+}
+
+/// `f`'s result and the root descents it made.
+fn measured(f: impl FnOnce() -> Got) -> (Got, u64) {
+    let before = root_descents();
+    let got = f();
+    (got, root_descents() - before)
+}
+
+/// A seek from a position against a new cursor's: the same result, and (in debug builds, which
+/// count them) each cursor's root descents [`expected`]'s for its class; the class noted and
+/// returned.
+#[allow(clippy::too_many_arguments)]
+fn check_seek(
+    seek: &Op,
+    held: Option<&Held<'_>>,
+    (got, made): &(Got, u64),
+    (want, fresh_made): &(Got, u64),
+    (has_key, empty): (bool, bool),
+    context: &str,
+    seen: &mut Coverage,
+) -> &'static str {
+    assert_eq!(got, want, "{context}");
+    let landed = |g: &Got| g.as_ref().ok().and_then(Option::as_ref).map(|(k, _)| k.to_vec());
+    let (class, descents) = expected(seek, held, landed(got).as_deref(), has_key, empty);
+    let (_, fresh) = expected(seek, None, landed(want).as_deref(), has_key, empty);
+    if cfg!(debug_assertions) {
+        assert_eq!(*made, descents, "{context}: {class}");
+        assert_eq!(*fresh_made, fresh, "{context}: the new cursor's");
+    }
+    seen.note(class);
+    class
+}
+
+/// A width refusal leaves the cursor where it was (a new cursor stays unset): no state to compare
+/// and no steps after it.
+const REFUSED: &str = "width refusal";
+
+/// A call that positions a cursor at `at` somewhere: any call ([`Op::pick`]: rows, ends, past
+/// them, unset), or half the time a seek near `at` (at a row).
+fn position_op(rng: &mut Rng, rows: &[Kv], at: Option<&[u8]>) -> Op {
+    if rng.below(2) == 0 {
+        return Op::pick(rng, rows, at);
+    }
+    Op::Seek(near_row(rng, rows, at).to_vec())
+}
+
+/// A positioning call's result: a row, none, or a bounded seek's width refusal.
+#[track_caller]
+fn positioned(got: Got) {
+    if let Err(e) = got {
+        assert!(e.starts_with("KeyToo"), "a positioning call failed: {e}");
+    }
+}
+
+/// The seek classes each cursor kind must meet.
+const SEEK_CLASSES: [&str; 9] = [
+    "same key inside the nested leaf",
+    "same key outside the nested leaf",
+    "same key, its first row",
+    "same key past its last subkey",
+    "another key inside the outer leaf",
+    "another key outside the outer leaf",
+    "from the roots",
+    "seek_exact of at most K bytes",
+    "width refusal",
+];
+
+/// `rounds` seeks of a [`DupRoCursor`] over `d` from the positions its random calls leave it at,
+/// each with two steps after it, against a new cursor's.
+fn ro_positions(ro: &Arc<crate::RoTxn>, d: &Table, rows: &[Kv], rng: &mut Rng, rounds: usize) {
+    let mut seen = Coverage::default();
+    let mut c = ro.dup_cursor_owned(d).expect("cursor");
+    for round in 0..rounds {
+        for _ in 0..=rng.below(2) {
+            let at = c.current().expect("current").map(|(k, _)| k.to_vec());
+            positioned(on_dup(&mut c, &position_op(rng, rows, at.as_deref())));
+        }
+        let at = c.current().expect("current").map(|(k, _)| k.to_vec());
+        let leaves = c.leaf_bounds_for_test();
+        let held = at.as_deref().map(|key| Held { key, leaves: &leaves });
+        let seek = seek_near(rng, rows, at.as_deref());
+        let mut probe = ro.dup_cursor_owned(d).expect("probe");
+        let has_key = outer_target(&seek).is_some_and(|k| probe.seek_key(k).expect("p").is_some());
+        let empty = probe.first().expect("probe").is_none();
+        let context = format!("ro round {round}: {seek:02x?} from {at:02x?} {leaves:02x?}");
+        let from = c.state();
+        let mine = measured(|| on_dup(&mut c, &seek));
+        let mut f = ro.dup_cursor_owned(d).expect("fresh");
+        let theirs = measured(|| on_dup(&mut f, &seek));
+        let class =
+            check_seek(&seek, held.as_ref(), &mine, &theirs, (has_key, empty), &context, &mut seen);
+        if class == REFUSED {
+            assert_eq!(c.state(), from, "{context}");
+            continue;
+        }
+        assert_eq!(c.state(), f.state(), "{context}");
+        for _ in 0..2 {
+            let step = if rng.below(2) == 0 { Op::Next } else { Op::Prev };
+            assert_eq!(on_dup(&mut c, &step), on_dup(&mut f, &step), "{context}, then {step:?}");
+            assert_eq!(c.state(), f.state(), "{context}, then {step:?}");
+        }
+    }
+    seen.assert_has(&SEEK_CLASSES, "ro");
+}
+
+/// `op` on the write cursor.
+fn on_txn(c: &mut DupTxnCursor, txn: &RwTxn, op: &Op) -> Got {
+    let got: Result<Option<Kv>> = match op {
+        Op::First => c.first(txn).map(owned),
+        Op::Last => c.last(txn).map(owned),
+        Op::Next => c.next(txn).map(owned),
+        Op::Prev => c.prev(txn).map(owned),
+        Op::Current => c.current(txn).map(owned),
+        Op::CurrentWithKeyTail(t) => c.current_with_key_tail(txn, *t).map(|e| owned_tail(e, *t)),
+        Op::Seek(x) => c.seek(txn, x).map(owned),
+        Op::SeekExact(x) => c.seek_exact(txn, x).map(|v| v.map(|v| (x.clone(), v.to_vec()))),
+        Op::SeekWithKeyTail(x, t) => c.seek_with_key_tail(txn, x, *t).map(|e| owned_tail(e, *t)),
+        Op::NextInPrefix(n) => c.next_in_prefix(txn, *n).map(owned),
+        Op::PrevInPrefix(n) => c.prev_in_prefix(txn, *n).map(owned),
+        Op::SeekKey(k) => c.seek_key(txn, k).map(owned),
+        Op::SeekDup(k, s) => c.seek_dup(txn, k, s).map(owned),
+        Op::SeekDupWithKeyTail(k, s, t) => {
+            c.seek_dup_with_key_tail(txn, k, s, *t).map(|e| owned_tail(e, *t))
+        }
+    };
+    got.map_err(|e| format!("{e:?}"))
+}
+
+/// The logical keys of outer key `k`'s rows in `txn`.
+fn rows_of(txn: &RwTxn, d: &Table, k: &[u8]) -> Vec<Vec<u8>> {
+    let mut c = txn.dup_cursor_detached(d).expect("cursor");
+    let mut keys = Vec::new();
+    let mut row = c.seek_key(txn, k).expect("seek_key").map(|(key, _)| key.to_vec());
+    while let Some(key) = row {
+        keys.push(key);
+        row = c.next_in_prefix(txn, K).expect("next_in_prefix").map(|(key, _)| key.to_vec());
+    }
+    keys
+}
+
+/// Between a write cursor's positioning and its seek: maybe its own `delete_current` (the
+/// deleted state), or a change near its row by the transaction's direct writes: a put (of a
+/// row or a new one after it), a delete of a row near it or of its own, every row of its key
+/// deleted one by one, `delete_prefix` of its key; after a change, one time in three, a call that
+/// finds its row again (the deleted state if the row went). Returns whether the cursor is stale
+/// at the seek: the table changed since its last call.
+fn disturb(rw: &mut RwTxn, d: &Table, c: &mut DupTxnCursor, rows: &[Kv], rng: &mut Rng) -> bool {
+    let at = c.key_for_test().map(<[u8]>::to_vec);
+    let near = near_row(rng, rows, at.as_deref()).to_vec();
+    let k = at.as_deref().unwrap_or(&near)[..K].to_vec();
+    let changed = match rng.below(9) {
+        0 | 1 => {
+            c.delete_current(rw).expect("delete_current");
+            false
+        }
+        2 => {
+            let key = if rng.below(2) == 0 { near } else { [&near[..], &[0]].concat() };
+            rw.put(d, &key, &rng.next().to_le_bytes()).expect("put");
+            true
+        }
+        3 => rw.delete(d, &near).expect("delete"),
+        4 => at.as_ref().is_some_and(|at| rw.delete(d, at).expect("delete its row")),
+        5 if rng.below(3) == 0 => {
+            let doomed = rows_of(rw, d, &k);
+            for key in &doomed {
+                assert!(rw.delete(d, key).expect("delete"), "{key:02x?}");
+            }
+            !doomed.is_empty()
+        }
+        6 if rng.below(3) == 0 => rw.delete_prefix(d, &k).expect("delete_prefix") > 0,
+        _ => false,
+    };
+    if changed && rng.below(3) == 0 {
+        c.follower_shares_prefix(rw, K).expect("follower_shares_prefix");
+        return false;
+    }
+    changed
+}
+
+/// `rounds` seeks of [`DupTxnCursor`]s over `d` in write transactions (each ended after 40
+/// rounds, committed one time in four, else aborted; a new cursor opened), from the positions
+/// random calls leave them at, disturbed between ([`disturb`]): up to date, stale, in the deleted
+/// state; each with two steps after it, against a new cursor's.
+fn txn_positions(env: &Env, d: &Table, rows: &[Kv], rng: &mut Rng, rounds: usize) {
+    let mut seen = Coverage::default();
+    let mut rw = env.begin_rw().expect("rw");
+    let mut c = rw.dup_cursor_detached(d).expect("cursor");
+    for round in 0..rounds {
+        if round % 40 == 39 {
+            if rng.below(4) == 0 {
+                rw.commit().expect("commit");
+            } else {
+                rw.abort();
+            }
+            rw = env.begin_rw().expect("rw");
+            c = rw.dup_cursor_detached(d).expect("cursor");
+        }
+        for _ in 0..=rng.below(2) {
+            let at = c.key_for_test().map(<[u8]>::to_vec);
+            positioned(on_txn(&mut c, &rw, &position_op(rng, rows, at.as_deref())));
+        }
+        let stale = disturb(&mut rw, d, &mut c, rows, rng);
+        let from = c.state();
+        let at = c.key_for_test().map(<[u8]>::to_vec);
+        if stale && at.is_some() {
+            seen.note("stale at a row");
+        }
+        if !stale && from == (State::At, true) {
+            seen.note("deleted state");
+        }
+        let leaves = if stale { [None, None] } else { c.leaf_bounds_for_test(&rw) };
+        let held = at.as_deref().filter(|_| !stale).map(|key| Held { key, leaves: &leaves });
+        let seek = seek_near(rng, rows, at.as_deref());
+        let mut probe = rw.dup_cursor_detached(d).expect("probe");
+        let has_key =
+            outer_target(&seek).is_some_and(|k| probe.seek_key(&rw, k).expect("p").is_some());
+        let empty = probe.first(&rw).expect("probe").is_none();
+        let context = format!(
+            "txn round {round}: {seek:02x?} from {at:02x?} {from:?}, stale {stale}, {leaves:02x?}"
+        );
+        let mine = measured(|| on_txn(&mut c, &rw, &seek));
+        let mut f = rw.dup_cursor_detached(d).expect("fresh");
+        let theirs = measured(|| on_txn(&mut f, &rw, &seek));
+        let class =
+            check_seek(&seek, held.as_ref(), &mine, &theirs, (has_key, empty), &context, &mut seen);
+        if class == REFUSED {
+            assert_eq!(c.state(), from, "{context}");
+            continue;
+        }
+        assert_eq!(c.state(), f.state(), "{context}");
+        for _ in 0..2 {
+            let step = if rng.below(2) == 0 { Op::Next } else { Op::Prev };
+            let (got, want) = (on_txn(&mut c, &rw, &step), on_txn(&mut f, &rw, &step));
+            assert_eq!(got, want, "{context}, then {step:?}");
+            assert_eq!(c.state(), f.state(), "{context}, then {step:?}");
+        }
+    }
+    rw.commit().expect("commit");
+    env.check().expect("check");
+    seen.assert_has(&SEEK_CLASSES, "txn");
+    seen.assert_has(&["stale at a row", "deleted state"], "txn");
+}
+
+/// [`ro_positions`] and [`txn_positions`] over `seeds` twin tables of `shape`.
+fn seeks_from_positions(shape: &Shape, seeds: std::ops::Range<u64>, rounds: usize) {
+    for seed in seeds {
+        let seed = 0x5EE4_D000_0000 + seed;
+        let _report = ReportSeed(seed);
+        let mut rng = Rng(seed);
+        let (_dir, path) = temp("tndb_b_dup_seek_positions");
+        let env = open(&path, SyncMode::NoSync);
+        let (d, _, rows) = twins(&env, shape, &mut rng);
+        let rows: Vec<Kv> = rows.into_iter().collect();
+        let ro = Arc::new(env.begin_ro().expect("ro"));
+        assert!(ro.table_stat(&d).expect("stat").height >= 2);
+        ro_positions(&ro, &d, &rows, &mut rng, rounds);
+        drop(ro);
+        txn_positions(&env, &d, &rows, &mut rng, rounds);
+        assert!(env.failure().is_none(), "no call latched: {:?}", env.failure());
+    }
+}
+
+/// Seeks of every kind (`seek`, `seek_exact`, `seek_with_key_tail`, `seek_key`, `seek_dup`,
+/// `seek_dup_with_key_tail`) from random positions equal a new cursor's seek, and the two steps
+/// after it: on a [`DupRoCursor`], and on a [`DupTxnCursor`] up to date, stale after the
+/// transaction's own writes near its row (a put, deletes, its key emptied or `delete_prefix`ed),
+/// and in the deleted state. In debug builds each seek's root descents at both levels are its
+/// class's exactly ([`expected`]): a seek inside the cursor's key never descends the outer root
+/// (0 inside the nested leaf, else 1), a seek to another key inside the outer leaf descends the
+/// new key's nested root only (1), one outside it both roots (2), as does a stale cursor's; every
+/// class is met by both cursor kinds.
+#[test]
+fn dup_seeks_from_random_positions_match_a_fresh_seek() {
+    let shape = Shape { keys: 400, big_keys: 3, big_rows: 300, run_pct: 2, nested_height: 2 };
+    seeks_from_positions(&shape, 0..2, 800);
+}
+
+/// [`dup_seeks_from_random_positions_match_a_fresh_seek`] over more seeds and rounds and larger
+/// tables: more outer keys, and nested trees of three levels.
+#[test]
+#[ignore = "heavy: run with --release"]
+fn dup_seeks_from_random_positions_match_a_fresh_seek_heavy() {
+    let shape = Shape { keys: 3000, big_keys: 2, big_rows: 40_000, run_pct: 2, nested_height: 3 };
+    seeks_from_positions(&shape, 0..12, 12_000);
 }

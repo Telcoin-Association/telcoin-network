@@ -1870,7 +1870,7 @@ fn txn_cursor_size_unchanged() {
 
 /// The root descents so far on this thread ([`ROOT_DESCENTS`]); zero in a release test build,
 /// where the counter does not exist.
-fn root_descents() -> u64 {
+pub(crate) fn root_descents() -> u64 {
     #[cfg(debug_assertions)]
     return ROOT_DESCENTS.with(std::cell::Cell::get);
     #[cfg(not(debug_assertions))]

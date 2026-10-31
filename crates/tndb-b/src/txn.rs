@@ -1138,6 +1138,12 @@ impl DupRoCursor {
         self.walk.state()
     }
 
+    /// Test-only: the first and last keys of the outer and the nested leaf the cursor is at.
+    #[cfg(test)]
+    pub(crate) fn leaf_bounds_for_test(&self) -> [crate::tree::dup_cursor::LeafBounds; 2] {
+        self.walk.leaf_bounds_for_test(&*self.txn.snapshot)
+    }
+
     /// Run a walker move over the snapshot, latching damage it finds, and pair the value it
     /// returns with the logical key. `op` takes the walker, the snapshot, the outer root and the
     /// root source.
@@ -3135,6 +3141,16 @@ impl DupTxnCursor {
     #[cfg(test)]
     pub(crate) fn key_for_test(&self) -> Option<&[u8]> {
         (self.walk.state() == State::At).then(|| self.walk.key())
+    }
+
+    /// Test-only: the first and last keys of the outer and the nested leaf the cursor is at, read
+    /// from `txn`'s pages (meaningful only while the cursor is up to date with `txn`).
+    #[cfg(test)]
+    pub(crate) fn leaf_bounds_for_test(
+        &self,
+        txn: &RwTxn,
+    ) -> [crate::tree::dup_cursor::LeafBounds; 2] {
+        self.walk.leaf_bounds_for_test(txn.work.writer())
     }
 
     /// Bring the cursor up to date with `work` (see the type docs).

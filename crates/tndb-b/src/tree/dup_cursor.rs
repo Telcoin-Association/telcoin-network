@@ -642,7 +642,27 @@ impl DupWalk {
             tail => tail,
         }))
     }
+
+    /// Test-only: the first and last keys of the outer leaf and of the nested leaf the walker is
+    /// at, read from `store` (each `None` unless it is at a row and the page reads): where a seek
+    /// from the row may start without a root descent.
+    #[cfg(test)]
+    pub(crate) fn leaf_bounds_for_test<S: PageRead + ?Sized>(&self, store: &S) -> [LeafBounds; 2] {
+        let bounds = |tree: &TreeCursor| {
+            let leaf = page::LeafView::new(store.page(tree.leaf_pgno()?).ok()?).ok()?;
+            let last = leaf.nkeys().checked_sub(1)?;
+            Some((leaf.key(0).ok()?.to_vec(), leaf.key(last).ok()?.to_vec()))
+        };
+        if self.state() != State::At {
+            return [None, None];
+        }
+        [bounds(&self.outer), bounds(&self.inner)]
+    }
 }
+
+/// Test-only: a leaf's first and last keys ([`DupWalk::leaf_bounds_for_test`]).
+#[cfg(test)]
+pub(crate) type LeafBounds = Option<(Vec<u8>, Vec<u8>)>;
 
 #[cfg(test)]
 mod tests {
