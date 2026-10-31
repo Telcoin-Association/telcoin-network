@@ -4,8 +4,9 @@ Research behind ROADMAP.md. Regenerate it before relying on it after large chang
 `file:line` references drift. Paths are relative to the TN repository root; a bare path such as
 `env/mod.rs:188` is under `crates/tn-reth/src/`.
 
-Vendored: 63 reth crates plus the dev-only `reth-testing-utils` (`vendor/reth/tn/crates.txt`),
-down from 101 (TN-0005, TN-0009, TN-0011, TN-0012). RocksDB is gone (TN-0014). `cargo tree`
+Vendored: 57 reth crates plus the dev-only `reth-testing-utils` (`vendor/reth/tn/crates.txt`),
+down from 101 (TN-0005, TN-0009, TN-0011, TN-0012, and TN-0028 to TN-0032 in the second pass).
+RocksDB is gone (TN-0014). `cargo tree`
 still prints v1.11.3: upstream did not bump the workspace version for v1.11.4 either.
 
 `crates/tn-reth` is the boundary. Outside it, TN touches reth in only a few places:
@@ -63,7 +64,7 @@ names another crate.
 | reth-primitives-traits / reth-ethereum-primitives | Core TN types, re-exported by `crates/types/src/lib.rs:88-94`: `SealedHeader`, `Recovered(Block)`, `TransactionSigned`, `Receipt`, `Account`, `EthPrimitives`, ... (about 225 lines name `SealedHeader`). tn-types' `SealedBlock` alias wraps reth-primitives-traits'. | heavy across TN |
 | reth-errors | `ProviderError`, `RethError`, `BlockExecutionError`, `BlockValidationError` | moderate |
 | reth-stages-types / reth-prune-types | Checkpoint types written by snapshot restore | light |
-| reth-network-api / -network-peers / reth-eth-wire-types | **Type-only.** `WorkerNetwork` stub impls of `NetworkInfo`, `PeersInfo` and `Peers` (`worker.rs:275-396`) for the `EthApi` and `net_` bounds; `Enr`, `NodeRecord`, `PeerId`; `DisconnectReason`; `BlockHashNumber` (`env/epoch.rs:80`); `NoopNetwork` in tests | light |
+| reth-network-api / -network-peers / reth-eth-wire-types | **Type-only.** `WorkerNetwork` stub impls of `NetworkInfo` and `PeersInfo` (`worker.rs:269-332`) for the `EthApi`, `web3_` and `net_` bounds (the only two network traits left, TN-0031); `Enr`, `NodeRecord`, `PeerId`; `BlockHashNumber` (`env/epoch.rs:80`); `NoopNetwork` in tests | light |
 | reth-tasks, -db-common, -cli-util, -tokio-util, -tracing | `TaskSpawner` (implemented in tn-types), `Runtime`; `init_genesis`; 3 parsers; `EventSender`; `Layers` | light |
 | reth-trie-sparse | No items: a dependency only to set its `std` and `metrics` features (`lib.rs:77`) | features only |
 | reth-metrics | `Metrics` derive in 9 TN crates: tn-reth, tn-node, tn-engine, tn-network-libp2p, tn-batch-builder, state-sync, tn-executor, tn-worker, tn-primary | light |
@@ -93,18 +94,16 @@ through the vendored crates listed (`cargo tree --offline --locked -e normal,bui
 
 | Crate | Pulled in by |
 |---|---|
-| reth-config | reth-node-core, reth-db-common |
-| reth-ethereum-forks | reth-chainspec, reth-evm-ethereum, reth-network-api, reth-node-core |
+| reth-config | reth-node-core (`PruneConfig`, `StaticFilesConfig`) |
+| reth-ethereum-forks | reth-chainspec, reth-evm-ethereum, reth-node-core |
 | reth-execution-errors | reth-errors, reth-evm, reth-trie, reth-trie-db, reth-trie-sparse, reth-db-common |
 | reth-storage-api, reth-db-models | storage-api: reth-provider, reth-chain-state, reth-evm, reth-revm, the RPC crates, reth-transaction-pool, reth-trie-db, reth-node-core. db-models: reth-db-api, reth-storage-api |
 | reth-codecs, -codecs-derive, -zstd-compressors | codecs: reth-primitives-traits, reth-ethereum-primitives, reth-db-api, reth-trie-common, reth-provider, the stage/prune types. derive: reth-codecs, reth-eth-wire-types. zstd: reth-codecs, reth-ethereum-primitives |
 | reth-static-file-types, reth-nippy-jar | static-file-types: reth-db, reth-provider, reth-storage-errors, reth-db-common, reth-config. nippy-jar: reth-db, reth-provider |
-| reth-fs-util | reth-db, reth-provider, reth-transaction-pool, reth-cli-util, reth-nippy-jar, reth-db-common |
-| reth-etl, reth-mdbx-sys | reth-db-common; reth-libmdbx |
-| reth-network-types, reth-net-banlist, reth-network-p2p | network-types: reth-network-api, reth-network-p2p, reth-rpc, reth-config. banlist: reth-network-types. p2p: reth-network-api |
-| reth-ipc, reth-rpc-layer; reth-payload-builder-primitives | reth-rpc-builder; reth-engine-primitives |
+| reth-fs-util | reth-db, reth-provider, reth-transaction-pool, reth-cli-util, reth-nippy-jar |
+| reth-mdbx-sys | reth-libmdbx |
+| reth-ipc, reth-rpc-layer | reth-rpc-builder |
 | reth-rpc-convert, reth-rpc-server-types | reth-rpc, reth-rpc-eth-api, reth-rpc-eth-types, reth-node-core (server-types also reth-rpc-builder) |
-| reth-tracing-otlp | reth-tracing, reth-node-core |
 | reth-testing-utils | dev-dependency of vendored crates' tests only; not in the normal/build graph |
 
 `reth-node-core` (no devp2p stack since TN-0008) is reached from tn-reth and from
@@ -114,8 +113,10 @@ through the vendored crates listed (`cargo tree --offline --locked -e normal,bui
 
 `crates/tn-reth/Cargo.toml` now sets what reth-node-ethereum, reth-engine-tree and the `reth`
 umbrella used to (TN-0005). Consensus-relevant: revm's `secp256k1`, `blst`, `c-kzg` and
-`asm-keccak` (the ecrecover, BLS12-381, KZG and keccak backends; line 57, with `memory_limit`).
-Also trie-sparse `std`/`metrics` (`:58`), chain-state `rayon` (`:46`), reth-revm
-`optional-balance-check` (`:51`), and the node-core features (`:38-44`) that forward `asm-keccak`
-and `keccak-cache-global` to alloy-primitives. Before removing a crate or an edge, run
-`python3 -I vendor/reth/tn/graph.py snapshot|diff` (ROADMAP ground rules).
+`asm-keccak` (the ecrecover, BLS12-381, KZG and keccak backends; line 55, with `memory_limit`).
+Also trie-sparse `std`/`metrics` (`:56`), chain-state `rayon` (`:44`), reth-revm
+`optional-balance-check` (`:49`), and the node-core features (`:38-42`) that forward `asm-keccak`
+and `keccak-cache-global` to alloy-primitives. The root `Cargo.toml` enables alloy's `rand`, which
+reth-network-types used to set (TN-0031): it gives alloy's maps a randomly seeded hasher. Before
+removing a crate or an edge, run `python3 -I vendor/reth/tn/graph.py snapshot|diff` (ROADMAP
+ground rules).
