@@ -20,7 +20,6 @@ members = [
     "crates/ethereum/engine-primitives/",
     "crates/ethereum/evm",
     "crates/ethereum/primitives/",
-    "crates/etl/",
     "crates/evm/evm",
     "crates/evm/execution-errors",
     "crates/evm/execution-types",
@@ -252,7 +251,6 @@ reth-eth-wire-types = { path = "crates/net/eth-wire-types" }
 reth-ethereum-engine-primitives = { path = "crates/ethereum/engine-primitives", default-features = false }
 reth-ethereum-forks = { path = "crates/ethereum/hardforks", default-features = false }
 reth-ethereum-primitives = { path = "crates/ethereum/primitives", default-features = false }
-reth-etl = { path = "crates/etl" }
 reth-evm = { path = "crates/evm/evm", default-features = false }
 reth-evm-ethereum = { path = "crates/ethereum/evm", default-features = false }
 reth-execution-errors = { path = "crates/evm/execution-errors", default-features = false }
