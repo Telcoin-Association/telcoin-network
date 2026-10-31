@@ -530,6 +530,47 @@ fn dup_cursors_on_a_plain_table_are_table_kind() {
     assert!(env.failure().is_none());
 }
 
+/// A dup cursor finds its table's handle in the snapshot's slot that remembers it, the first of
+/// its probe or one past it, and keeps a copy of the handle only when every slot holds another:
+/// each cursor moves and names its table, and the plain table in the dup table's first slot is
+/// still `TableKind` to a dup cursor.
+#[test]
+fn a_dup_cursor_names_its_table_from_any_slot_or_its_own_copy() {
+    let (_dir, path) = temp("tndb_b_dup_cursor_handle");
+    let env = open(&path, SyncMode::NoSync);
+    let mut txn = env.begin_rw().expect("rw");
+    let d0 = txn.create_dup_table("d0", OPTIONS).expect("d0");
+    let plain: Vec<Table> =
+        (0..40).map(|i| txn.create_table(&format!("p{i:02}")).expect("plain")).collect();
+    let d1 = txn.create_dup_table("d1", OPTIONS).expect("d1");
+    for d in [&d0, &d1] {
+        txn.put(d, &dup_key(7, b"s"), d.name().as_bytes()).expect("put");
+    }
+    txn.commit().expect("commit");
+
+    let ro = Arc::new(env.begin_ro().expect("ro"));
+    let first = |t: &Table| t.id() as usize % 32;
+    let rival = plain.iter().find(|p| first(p) == first(&d0)).expect("a table sharing d0's slot");
+    ro.cursor_owned(rival).expect("the rival takes d0's first slot");
+    let mut c0 = ro.dup_cursor_owned(&d0).expect("d0");
+    for p in &plain {
+        ro.cursor_owned(p).expect("plain");
+    }
+    let mut c1 = ro.dup_cursor_owned(&d1).expect("d1, every slot taken");
+    assert_eq!(c0.handle_slot_for_test(), Some((first(&d0) + 1) % 32), "one past its first");
+    assert_eq!(c1.handle_slot_for_test(), None, "its own copy");
+    let mut again = ro.dup_cursor_owned(&d0).expect("d0 again");
+    assert_eq!(again.handle_slot_for_test(), c0.handle_slot_for_test());
+    for (c, d) in [(&mut c0, &d0), (&mut c1, &d1), (&mut again, &d0)] {
+        let row = c.seek_key(&7u32.to_be_bytes()).expect("seek").expect("the row");
+        assert_eq!(row, (&dup_key(7, b"s")[..], d.name().as_bytes()));
+        assert!(format!("{c:?}").contains(&format!("{:?}", d.name())), "{c:?}");
+    }
+    let refused = ro.dup_cursor_owned(rival);
+    assert!(matches!(&refused, Err(Error::TableKind(n)) if n == rival.name()), "{refused:?}");
+    assert!(env.failure().is_none());
+}
+
 /// Zero page `pgno` of the file at `path`, its CRC trailer and header included: any fetch of it
 /// is `Corrupt`.
 fn garble(path: &std::path::Path, pgno: u32) {

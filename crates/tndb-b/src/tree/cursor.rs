@@ -536,7 +536,23 @@ impl TreeCursor {
         leaf: Option<&'s [u8]>,
         key: &[u8],
     ) -> Result<Option<R::Out<'s>>> {
-        Ok(self.guarded(|c| c.find_near::<R, S>(store, root, leaf, key))?.map(|(value, _)| value))
+        self.seek_exact_beside_in::<R, S>(store, root, leaf, key, &|_, _| Ok(()))
+    }
+
+    /// [`Self::seek_exact_in`], a miss handing `beside` the leaf it searched and the slot the key
+    /// would take there, for the caller's checks of the keys beside it; its error is the seek's,
+    /// the cursor unset.
+    #[inline]
+    pub(crate) fn seek_exact_beside_in<'s, R: CellRead, S: PageRead + ?Sized>(
+        &mut self,
+        store: &'s S,
+        root: &TreeRoot,
+        leaf: Option<&'s [u8]>,
+        key: &[u8],
+        beside: &impl Fn(&LeafView<'s>, usize) -> Result<()>,
+    ) -> Result<Option<R::Out<'s>>> {
+        let found = self.guarded(|c| c.find_near::<R, S>(store, root, leaf, key, beside))?;
+        Ok(found.map(|(value, _)| value))
     }
 
     /// Move one entry forward (`forward`) or backward only if the entry there shares the first
@@ -695,12 +711,15 @@ impl TreeCursor {
     }
 
     /// [`Self::seek_exact`]: land on the entry `key` and return its value with the page of its
-    /// leaf, or leave the cursor unset. The value is the one the descent's search found.
+    /// leaf, or leave the cursor unset. The value is the one the descent's search found. A miss
+    /// in a leaf passes `beside` the leaf and the key's slot there
+    /// ([`Self::seek_exact_beside_in`]).
     fn find<'s, R: CellRead, S: PageRead + ?Sized>(
         &mut self,
         store: &'s S,
         root: &TreeRoot,
         key: &[u8],
+        beside: &impl Fn(&LeafView<'s>, usize) -> Result<()>,
     ) -> Result<Option<(R::Out<'s>, &'s [u8])>> {
         self.reset(State::Unset);
         root.check()?;
@@ -714,8 +733,10 @@ impl TreeCursor {
                 self.state = State::At;
                 Ok(Some((R::read(store, value)?, leaf.page())))
             }
-            (_, None) => {
+            (leaf, None) => {
+                let slot = self.top().1;
                 self.reset(State::Unset);
+                beside(&leaf, slot)?;
                 Ok(None)
             }
         }
@@ -795,7 +816,7 @@ impl TreeCursor {
 
     /// [`Self::seek_exact`]'s move, [`Self::start_near`]'s rules: from the leaf the cursor is at,
     /// as [`Self::find_from_leaf`] settles it; else, or when that leaf does not settle it, find
-    /// the key from the root ([`Self::find`]).
+    /// the key from the root ([`Self::find`]). Either one passes a miss to `beside`.
     #[inline]
     fn find_near<'s, R: CellRead, S: PageRead + ?Sized>(
         &mut self,
@@ -803,13 +824,14 @@ impl TreeCursor {
         root: &TreeRoot,
         leaf: Option<&'s [u8]>,
         key: &[u8],
+        beside: &impl Fn(&LeafView<'s>, usize) -> Result<()>,
     ) -> Result<Option<(R::Out<'s>, &'s [u8])>> {
         if let (State::At, Some(page)) = (self.state, leaf) {
-            if let Some(found) = self.find_from_leaf::<R, S>(store, page, key)? {
+            if let Some(found) = self.find_from_leaf::<R, S>(store, page, key, beside)? {
                 return Ok(found);
             }
         }
-        self.find::<R, S>(store, root, key)
+        self.find::<R, S>(store, root, key, beside)
     }
 
     /// [`Self::start_near`] from `page`, the page of the leaf the cursor is at: settle in that
@@ -845,11 +867,16 @@ impl TreeCursor {
         store: &'s S,
         page: &'s [u8],
         key: &[u8],
+        beside: &impl Fn(&LeafView<'s>, usize) -> Result<()>,
     ) -> Result<FromLeaf<'s, R::Out<'s>>> {
         let Some(view) = self.near(page, key)? else { return Ok(None) };
-        let Find::Found { index, value } = view.find(key)? else {
-            self.reset(State::Unset);
-            return Ok(Some(None));
+        let (index, value) = match view.find(key)? {
+            Find::Found { index, value } => (index, value),
+            Find::NotFound { index, .. } => {
+                self.reset(State::Unset);
+                beside(&view, index)?;
+                return Ok(Some(None));
+            }
         };
         self.set_top_slot(index);
         Ok(Some(Some((R::read(store, value)?, page))))
@@ -1217,7 +1244,8 @@ impl<'t> Cursor<'t> {
     /// The seek starts from the remembered leaf, as [`Self::seek`] does.
     pub fn seek_exact(&mut self, key: &[u8]) -> Result<Option<&'t [u8]>> {
         let (store, root, leaf) = (self.store, &self.root, self.leaf);
-        let moved = self.tree.guarded(|c| c.find_near::<Values, _>(store, root, leaf, key));
+        let moved =
+            self.tree.guarded(|c| c.find_near::<Values, _>(store, root, leaf, key, &|_, _| Ok(())));
         self.track(moved)
     }
 

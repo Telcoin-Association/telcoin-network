@@ -729,6 +729,20 @@ impl TableRoots {
         }
     }
 
+    /// The slot of `table`'s probe that remembers it, if one does.
+    fn position(&self, table: &Table) -> Option<usize> {
+        let home = Self::home(table);
+        (0..SNAPSHOT_TABLES)
+            .map(|i| (home + i) % SNAPSHOT_TABLES)
+            .find(|&at| matches!(self.0[at].get(), Some((known, _, _)) if known.is(table)))
+    }
+
+    /// The handle slot `at` remembers ([`DupHandle::Slot`]: a slot once set stays set).
+    #[inline]
+    fn handle(&self, at: usize) -> Option<&Table> {
+        self.0[at].get().map(|(table, _, _)| table)
+    }
+
     /// `table`'s resolution, or else the first empty slot of its probe (`None`: every slot holds
     /// another handle).
     fn find(&self, table: &Table) -> std::result::Result<Resolved, Option<usize>> {
@@ -864,21 +878,46 @@ impl RoTxn {
     /// A new, unset cursor over the dup table `table` that owns a share of this transaction, as
     /// [`Self::cursor_owned`]'s does (see [`DupRoCursor`]). [`Error::TableKind`] for a plain
     /// table.
+    ///
+    /// The cursor keeps no copy of the handle when the snapshot's [`TableRoots`] remembers it
+    /// (its first slot read here, as [`Self::root`] reads it), only the slot's index.
+    #[inline]
     pub fn dup_cursor_owned(self: &Arc<Self>, table: &Table) -> Result<DupRoCursor> {
-        let (outer_root, dup) = self.read(|_| self.resolved(table))?;
-        let Some(dup) = dup else {
-            return Err(Error::TableKind(table.name().to_string()));
+        let (handle, outer_root, key_len) = match self.snapshot.tables.at_home(table) {
+            Some((_, root, Some(dup))) => {
+                (DupHandle::Slot(TableRoots::home(table)), *root, dup.key_len)
+            }
+            _ => self.dup_resolve(table)?,
         };
         Ok(DupRoCursor {
             txn: Arc::clone(self),
             outer_root,
-            table: table.clone(),
-            walk: DupWalk::new(
-                dup.key_len,
-                self.snapshot.geometry.max_subkey(usize::from(dup.key_len)),
-            ),
+            handle,
+            walk: DupWalk::new(key_len, self.snapshot.geometry.max_subkey(usize::from(key_len))),
         })
     }
+
+    /// [`Self::dup_cursor_owned`] past its hit path: [`Self::resolve_table`], the kind, and the
+    /// slot that remembers the handle, else a copy of it.
+    #[inline(never)]
+    fn dup_resolve(&self, table: &Table) -> Result<(DupHandle, TreeRoot, u16)> {
+        let (outer_root, dup) = self.read(|_| self.resolve_table(table))?;
+        let Some(dup) = dup else {
+            return Err(Error::TableKind(table.name().to_string()));
+        };
+        let handle = match self.snapshot.tables.position(table) {
+            Some(at) => DupHandle::Slot(at),
+            None => DupHandle::Own(table.clone()),
+        };
+        Ok((handle, outer_root, dup.key_len))
+    }
+}
+
+/// Where a [`DupRoCursor`] finds its table's handle (for the messages of damage): the slot of its
+/// snapshot's [`TableRoots`] that remembers it, else its own copy (every slot held another).
+enum DupHandle {
+    Slot(usize),
+    Own(Table),
 }
 
 /// A cursor over one table of a read-only transaction that owns a share of the transaction
@@ -1114,7 +1153,7 @@ pub struct DupRoCursor {
     txn: Arc<RoTxn>,
     /// The table's outer tree in the transaction's snapshot.
     outer_root: TreeRoot,
-    table: Table,
+    handle: DupHandle,
     walk: DupWalk,
 }
 
@@ -1122,9 +1161,18 @@ impl std::fmt::Debug for DupRoCursor {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DupRoCursor")
             .field("txn", &self.txn.snapshot.meta.txn)
-            .field("table", &self.table.name())
+            .field("table", &table_of(&self.txn, &self.handle).name())
             .field("state", &self.walk.state())
             .finish_non_exhaustive()
+    }
+}
+
+/// The table handle `handle` names in `txn`'s snapshot.
+#[inline]
+fn table_of<'t>(txn: &'t RoTxn, handle: &'t DupHandle) -> &'t Table {
+    match handle {
+        DupHandle::Slot(at) => txn.snapshot.tables.handle(*at).expect("a slot once set stays set"),
+        DupHandle::Own(table) => table,
     }
 }
 
@@ -1144,6 +1192,16 @@ impl DupRoCursor {
         self.walk.leaf_bounds_for_test(&*self.txn.snapshot)
     }
 
+    /// Test-only: the slot of the snapshot's [`TableRoots`] that names the cursor's table, `None`
+    /// when the cursor keeps its own copy of the handle.
+    #[cfg(test)]
+    pub(crate) fn handle_slot_for_test(&self) -> Option<usize> {
+        match self.handle {
+            DupHandle::Slot(at) => Some(at),
+            DupHandle::Own(_) => None,
+        }
+    }
+
     /// Run a walker move over the snapshot, latching damage it finds, and pair the value it
     /// returns with the logical key. `op` takes the walker, the snapshot, the outer root and the
     /// root source.
@@ -1152,9 +1210,9 @@ impl DupRoCursor {
         &'c mut self,
         op: impl FnOnce(&mut DupWalk, &'c Snapshot, &TreeRoot, &mut SnapshotRoots<'_>) -> Walked<'c>,
     ) -> Result<Option<(&'c [u8], &'c [u8])>> {
-        let Self { txn, outer_root, table, walk } = self;
+        let Self { txn, outer_root, handle, walk } = self;
         let txn: &'c RoTxn = txn;
-        let mut roots = SnapshotRoots { table };
+        let mut roots = SnapshotRoots { table: table_of(txn, handle) };
         let value = op(walk, &txn.snapshot, outer_root, &mut roots)
             .inspect_err(|e| txn.inner.latch.latch_error(e))?;
         let walk: &'c DupWalk = walk;

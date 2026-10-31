@@ -23,7 +23,7 @@ use super::{
 };
 use crate::{
     error::{Error, Result},
-    page::{self, Val},
+    page::{self, LeafView, Val},
 };
 
 /// Where a dup walker gets the nested root of each outer key it lands on.
@@ -53,6 +53,15 @@ pub(crate) fn nested_cell<'s>(
             "dup table {name}: an overflow cell in a dup table's outer tree (key {k:02x?})"
         ))),
     }
+}
+
+/// The error of an outer key of `len` bytes in the dup table `name` of key width `kl`: a damaged
+/// record or tree, since no write makes a key of another width.
+#[cold]
+fn width_error(name: &str, len: usize, kl: usize) -> Error {
+    Error::Corrupt(format!(
+        "dup table {name}: an outer key of {len} bytes, not the table's width {kl}"
+    ))
 }
 
 /// The page of the leaf `tree` is at, from `again` (a shell's fetch of a page its cursor entered
@@ -201,12 +210,7 @@ impl DupWalk {
         if k.len() == self.kl() {
             return Ok(());
         }
-        Err(Error::Corrupt(format!(
-            "dup table {}: an outer key of {} bytes, not the table's width {}",
-            roots.name(),
-            k.len(),
-            self.kl()
-        )))
+        Err(width_error(roots.name(), k.len(), self.kl()))
     }
 
     /// Land the nested path on the first (`forward`) or last row of the nested tree just entered
@@ -429,9 +433,10 @@ impl DupWalk {
 
     /// A seek bounded to the outer key `k` (of the key width): onto `k`'s nested tree, the outer
     /// path unmoved when the walker is at a row of `k`, else found from the outer leaf the walker
-    /// is at or the root; then `inner(walker, store, nested leaf held)` settles the nested path,
-    /// a miss leaving both paths unset. An outer seek that lands on another key reads only that
-    /// key (its width, no cell) and leaves the walker unset.
+    /// is at or the root (an exact search, as a plain `seek_exact`'s); then `inner(walker, store,
+    /// nested leaf held)` settles the nested path, a miss leaving both paths unset. An outer
+    /// search that misses `k` reads one key beside it, the leaf's key after `k` (its last when
+    /// `k` is past it), only for its width, and leaves the walker unset.
     fn bounded<'s, S: PageRead + ?Sized, N: NestedRoots>(
         &mut self,
         store: &'s S,
@@ -453,25 +458,29 @@ impl DupWalk {
             }
             let leaf = if at { held(&w.outer, again)? } else { None };
             w.inner.unset();
-            match w.outer.seek_in::<Cells, S>(store, outer_root, leaf, k)? {
-                Some((found, val)) if found == k => {
-                    w.enter(roots, found, val)?;
-                    let found = inner(w, store, None)?;
-                    if found.is_none() {
-                        w.unset();
-                    }
-                    Ok(found)
+            let (kl, name) = (w.kl(), roots.name());
+            // The key after `k` in the leaf searched, else its last (`k` past it).
+            let beside = |leaf: &LeafView<'s>, slot: usize| {
+                let n = leaf.nkeys();
+                let Some(i) = (slot < n).then_some(slot).or(n.checked_sub(1)) else {
+                    return Ok(());
+                };
+                match leaf.key(i)?.len() {
+                    len if len == kl => Ok(()),
+                    len => Err(width_error(name, len, kl)),
                 }
-                Some((other, _)) => {
-                    w.check_width(roots, other)?;
-                    w.unset();
-                    Ok(None)
-                }
-                None => {
-                    w.unset();
-                    Ok(None)
-                }
+            };
+            let Some(val) =
+                w.outer.seek_exact_beside_in::<Cells, S>(store, outer_root, leaf, k, &beside)?
+            else {
+                return Ok(None);
+            };
+            w.enter(roots, k, val)?;
+            let found = inner(w, store, None)?;
+            if found.is_none() {
+                w.unset();
             }
+            Ok(found)
         })
     }
 

@@ -800,8 +800,9 @@ fn cell_error(page: &[u8], h: &Hdr, i: usize) -> Error {
 /// refused. Always inlined: every leaf read runs it, and with this many callers a plain
 /// `#[inline]` left it a call in hot paths such as [`crate::RoCursor::current_with_key_tail`] as
 /// the adapter crate compiles it. A nested cell fails the inline and overflow tests and is
-/// accepted on the cold path ([`leaf_cell_other`]), so an inline or overflow cell runs only the
-/// compares it ran before the nested form existed.
+/// accepted after them, still inline (every probe of a dup table's outer leaves reads one: an
+/// out-of-line call there cost each outer search about 10 ns), so an inline or overflow cell runs
+/// only the compares it ran before the nested form existed.
 #[inline(always)]
 fn leaf_cell(page: &[u8], h: &Hdr, i: usize) -> Result<(usize, usize, usize)> {
     let off = cell_off(page, h, i)?;
@@ -813,33 +814,17 @@ fn leaf_cell(page: &[u8], h: &Hdr, i: usize) -> Result<(usize, usize, usize)> {
         || vlen > room
         || klen > room - vlen
     {
-        return leaf_cell_other(page, i, off, room, (klen, vlen, cell_flags));
+        if nested_shape(cell_flags, vlen) && vlen <= room && klen <= room - vlen {
+            return Ok((off, klen, vlen));
+        }
+        return Err(leaf_cell_error(page, i, off, (klen, vlen, cell_flags)));
     }
     Ok((off, klen, vlen))
 }
 
-/// [`leaf_cell`]'s cold path for cell `i` at `off`, read as `(klen, vlen, flags)` with `room`
-/// bytes after its header: a nested cell ([`nested_shape`]) that ends inside the cell area is
-/// `(off, klen, vlen)`; any other cell is [`leaf_cell_error`]'s [`Error::Corrupt`].
-#[cold]
-#[inline(never)]
-fn leaf_cell_other(
-    page: &[u8],
-    i: usize,
-    off: usize,
-    room: usize,
-    (klen, vlen, flags): (usize, usize, usize),
-) -> Result<(usize, usize, usize)> {
-    if nested_shape(flags, vlen) && vlen <= room && klen <= room - vlen {
-        return Ok((off, klen, vlen));
-    }
-    Err(leaf_cell_error(page, i, off, (klen, vlen, flags)))
-}
-
 /// Whether a cell of flags `flags` (neither 0 nor a 12-byte overflow cell's) with a `vlen`-byte
-/// value is a nested cell: [`CELL_NESTED`] with [`NESTED_CELL`] bytes. Asked only on the cold
-/// paths ([`leaf_cell_other`], [`leaf_cell_error`]): only a dup table's outer leaves hold
-/// nested cells, and no hot read path reads one.
+/// value is a nested cell: [`CELL_NESTED`] with [`NESTED_CELL`] bytes. Asked once a cell failed
+/// the inline and overflow tests ([`leaf_cell`], [`leaf_cell_error`]).
 #[inline]
 fn nested_shape(flags: usize, vlen: usize) -> bool {
     flags == CELL_NESTED && vlen == NESTED_CELL
