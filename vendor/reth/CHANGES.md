@@ -235,3 +235,7 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
     relies on the workspace enabling tokio `macros`, as upstream does.
   - 1f94488d1: `eth_getLogs` range scans take a blocking-IO permit and hold it inside the task
     (`rpc/src/eth/filter.rs`, with upstream's test adapted to TN's `TokioTaskExecutor`).
+  - e63ec720a: `eth_simulateV1`, `eth_callMany` and `eth_call` (`transact_call_at`) hold their
+    permit inside the blocking task, so a client that disconnects no longer frees it while the work
+    runs on. Conflict in `eth_simulateV1`, whose body predates upstream's refactor: TN's body kept,
+    permit moved into its closure. Upstream's `bal.rs` change does not apply (no such file).
