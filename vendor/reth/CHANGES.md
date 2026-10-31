@@ -228,3 +228,4 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   unauthenticated requests pin an unbounded number of pool threads and delay block execution.
   Applied in upstream order, one commit each:
   - b7a7a8a72: `eth_callMany` takes a blocking-IO permit (`rpc-eth-api/src/helpers/call.rs`).
+  - f2d2bd233: `eth_simulateV1` takes a blocking-IO permit (same file).
