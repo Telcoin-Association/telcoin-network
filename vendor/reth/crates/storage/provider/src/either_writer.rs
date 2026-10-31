@@ -61,7 +61,7 @@ type EitherWriterTy<'a, P, T> = EitherWriter<
 
 /// Helper type for `RocksDB` batch argument in writer constructors.
 ///
-/// TN(TN-0014): RocksDB is removed, so this is always `()` (kept so the API keeps its shape).
+/// TN(TN-0014): `RocksDB` is removed, so this is always `()` (kept so the API keeps its shape).
 pub type RocksBatchArg<'a> = ();
 
 /// The raw `RocksDB` batch type returned by [`EitherWriter::into_raw_rocksdb_batch`].
@@ -69,7 +69,7 @@ pub type RawRocksDBBatch = ();
 
 /// Helper type for `RocksDB` transaction reference argument in reader constructors.
 ///
-/// TN(TN-0014): RocksDB is removed, so this is always `()` (kept so the API keeps its shape).
+/// TN(TN-0014): `RocksDB` is removed, so this is always `()` (kept so the API keeps its shape).
 pub type RocksTxRefArg<'a> = ();
 
 /// Represents a destination for writing data, either to database, static files, or `RocksDB`.
@@ -259,7 +259,7 @@ impl<'a> EitherWriter<'a, (), ()> {
 impl<'a, CURSOR, N: NodePrimitives> EitherWriter<'a, CURSOR, N> {
     /// Extracts the raw `RocksDB` write batch from this writer, if it contains one.
     ///
-    /// TN(TN-0014): RocksDB is removed, so this always returns `None`.
+    /// TN(TN-0014): `RocksDB` is removed, so this always returns `None`.
     pub fn into_raw_rocksdb_batch(self) -> Option<RawRocksDBBatch> {
         match self {
             Self::Database(_) | Self::StaticFile(_) => None,

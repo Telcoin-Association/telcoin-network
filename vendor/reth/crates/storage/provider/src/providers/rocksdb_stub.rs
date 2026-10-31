@@ -1,9 +1,9 @@
 //! Stub implementation of `RocksDB` provider.
 //!
-//! TN(TN-0014): TN removed RocksDB, so these zero-size placeholder types are the only
+//! TN(TN-0014): TN removed `RocksDB`, so these zero-size placeholder types are the only
 //! `RocksDBProvider` there is. They remain only because the provider API (factory constructors,
 //! `EitherWriter`/`EitherReader` arguments, `check_consistency`) is typed against them. Removing
-//! them is "RocksDB step B" in vendor/reth/ROADMAP.md.
+//! them is "`RocksDB` step B" in vendor/reth/ROADMAP.md.
 
 use alloy_primitives::BlockNumber;
 use metrics::Label;
