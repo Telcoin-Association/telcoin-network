@@ -8,10 +8,13 @@ markers: **[done]**, **[next]**, **[later]**.
 
 - 101 reth crates were vendored at v1.11.3; 63 remain after reduction Phases 1, 2, 4a, 6a and 6b.
   Synced to v1.11.4. RocksDB is gone (TN-0014); its zero-size stubs stay until the tndb-b work
-  (D15). The ledger runs TN-0001 to TN-0021.
+  (D15). The ledger runs TN-0001 to TN-0023.
 - Security backports applied (TN-0015 to TN-0019, D17): WebSocket origin check, JS-tracer
   timeout/interrupt (ported to revm-inspectors 0.34, D16), txpool sender-id growth, and RPC
   blocking-work limits. Everything else upstream is tracked in `tn/notes/upstream-backports.md`.
+- Correctness backports: txpool nonce order (TN-0022) and six static-file fixes (TN-0023: jar
+  cache races, empty-genesis recovery, nippy-jar torn tails, read errors). Upstream fixes to MDBX
+  code are tracked for the tndb-b work.
 - Build cost: reth-node-core no longer rebuilds on every TN commit and libgit2 is no longer
   compiled (TN-0020); jemalloc, which no TN binary installs, is no longer compiled (D19). Three
   native C builds left the graph.
@@ -21,7 +24,10 @@ markers: **[done]**, **[next]**, **[later]**.
   `make test-restarts` 8/8; `make test-epochs` 11/11. Final head `c8a527384`: the same counts,
   plus the nested workspace check, both clippy lanes, fmt and the RocksDB gate. nextest's LEAK
   flags differ from run to run (5 tests on one run, 1 on another, none twice); each flagged test
-  reran clean.
+  reran clean. TN-0022/23 head `1af59b607`: nextest 3719 passed (and 3744 with
+  `tn-reth/tndb-b`), restarts 8/8, epochs 11/11, `make test-sigkill` 7/7, CI-flags check
+  (default and tndb-b), clippy, fmt, the RocksDB gate, and the nested tests for nippy-jar,
+  provider, txpool and db (db with two threads; see README).
 - Out of scope here: Phase 3 and RocksDB step B belong to the tndb-b work, which happens
   elsewhere.
 - Next, roughly by value: Phase 5 (txpool, needs TN design input), Phase 4 (alloy/revm
