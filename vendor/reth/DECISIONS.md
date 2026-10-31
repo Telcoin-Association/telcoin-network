@@ -161,3 +161,45 @@ keep decoding), and `check_consistency`. That is the code the tndb-b work owns (
 there, or as its own reviewed change with the full test and e2e suites. Until then, a v2
 database is impossible for TN because `tn-reth` pins `StorageArgs { v2: false }` and does not
 expose the flag.
+
+## D16. The JS-tracer interrupt is ported, not upgraded or removed
+
+Upstream fixed the JS-tracer DoS (57825d41d) with `JsInspectorInterrupt` from revm-inspectors
+0.44.2, which needs revm 43; TN is on revm 34 with revm-inspectors 0.34. Options, 2026-10-31:
+bump revm (the "Phase 4"-sized revm 34 → 43 move, far beyond a security fix), vendor and patch
+revm-inspectors (another crate to carry), drop `js-tracer` (removes a geth-compatible feature
+operators may rely on), or port the mechanism. The mechanism is small: a shared `AtomicBool`
+checked at every inspector hook, which halts the EVM and sets the context error. It needs no
+Boa change, because Boa's loop and recursion limits, already set by revm-inspectors 0.34, bound
+the work inside one callback. So TN-0017 ports it as a wrapper around `DebugInspector` in a
+TN-owned file, and keeps `debug.rs` shaped like upstream's version so the next sync swaps the
+wrapper for `JsInspector::with_interrupt`.
+
+## D17. Security backports: apply what is High for TN, track the rest
+
+Maintainer direction, 2026-10-31: apply High and Critical security fixes, track everything else
+in `tn/notes/upstream-backports.md`. Severity is judged against TN, not taken from upstream or
+from the first survey. Two items were raised and two lowered:
+
+- Raised to High: upstream's RPC blocking-work limits (TN-0019, six commits; first rated Medium).
+  TN's execution engine and certificate validation share tokio's blocking pool with RPC, so
+  unbounded RPC blocking work delays block execution.
+- Lowered to Medium: 6e4009eed (log-subscription panic), because TN's `TaskManager` ignores
+  non-critical task panics, so only the lagging client's subscription ends; and d3d7fb31d
+  (replacement price-bump rounding), which matters only below 10 wei, where replacements are
+  nearly free anyway.
+
+Non-security High items (txpool nonce order, storage fixes) are tracked with a recommendation,
+not applied, because they are outside the direction given. The storage ones also wait for the
+tndb-b work.
+
+## D18. Per-crate standalone builds are not a goal
+
+Several vendored crates do not build alone (`tn/cargo.sh check -p reth-rpc-eth-api` fails): they
+rely on features that other workspace members enable. Some of this is upstream's convention
+(reth-rpc and rpc-eth-api use tokio's `time`/`rt`/`macros` without declaring them), and some
+comes from TN's removals (TN-0006 took away the path through which rpc-eth-api got
+`reth-primitives-traits/serde`). Fixing one exposes the next (declaring that serde feature then
+breaks reth-ethereum-primitives). D13 still applies when a change breaks TN's build or
+`tn/cargo.sh check --workspace`, the two configurations that matter. Per-crate standalone
+breakage is left alone. Check vendored changes with `--workspace`.

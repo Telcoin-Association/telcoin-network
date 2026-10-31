@@ -4,23 +4,25 @@ Where the vendored reth goes next, in the order that makes each step cheap and s
 `tn/notes/usage-map.md` first: it records what TN actually uses from each crate and where. Status
 markers: **[done]**, **[next]**, **[later]**.
 
-## Status (2026-10-30)
+## Status (2026-10-31)
 
 - 101 reth crates were vendored at v1.11.3; 63 remain after reduction Phases 1, 2, 4a and 6a.
-  Synced to v1.11.4. RocksDB is gone (TN-0014). The ledger runs TN-0001 to TN-0014.
-- Verified:
+  Synced to v1.11.4. RocksDB is gone (TN-0014); its zero-size stubs stay until the tndb-b work
+  (D15). The ledger runs TN-0001 to TN-0019.
+- Security backports applied (TN-0015 to TN-0019, D17): WebSocket origin check, JS-tracer
+  timeout/interrupt (ported to revm-inspectors 0.34, D16), txpool sender-id growth, and RPC
+  blocking-work limits. Everything else upstream is tracked in `tn/notes/upstream-backports.md`.
+- Verified at the reduction's end (before the backports):
   - `cargo nextest run --workspace` on the 63-crate tree (7d2aa76c8): 3719 passed / 0 failed,
     90 skipped by design. The later commits don't change compiled code: the v1.11.4 sync
     touched nothing in scope (TN-0013), and TN-0014's expanded source is identical.
-  - On the final head: `make test-restarts` 8/8 and `make test-epochs` 11/11. Also clean
-    there: clippy (nightly, CI RUSTFLAGS) with default and all features, `ci-lanes.sh fmt`,
-    `etc/rocksdb-gate.sh`, and the nested workspace built with `--all-targets`.
-- Waiting on a maintainer decision:
-  - The backports in `tn/notes/upstream-backports.md`, above all the `--ws.origins` fix
-    (ff2657600) and the JS-tracer DoS (needs a newer revm-inspectors).
-  - RocksDB step B (D15).
-- Next reductions: Phase 3 (MDBX optional, with the tndb-b work), Phase 4 (alloy/revm
-  directly), Phase 5 (txpool), Phase 6b (unserved RPC namespaces, code only).
+  - `make test-restarts` 8/8 and `make test-epochs` 11/11 on c7489bf12; clippy (nightly, CI
+    RUSTFLAGS) with default and all features, `ci-lanes.sh fmt`, `etc/rocksdb-gate.sh`, and the
+    nested workspace built with `--all-targets`.
+- Out of scope here: Phase 3 and RocksDB step B belong to the tndb-b work, which happens
+  elsewhere.
+- Next reductions: Phase 4 (alloy/revm directly), Phase 5 (txpool), Phase 6b (unserved RPC
+  namespaces, code only), and the Phase 2 follow-up (a TN-owned config instead of `NodeConfig`).
 
 ## Ground rules for every step
 
@@ -214,11 +216,9 @@ module, then `vendor.py remove` what leaves. `RethRpcModule` itself lives in
 
 ## Taking upstream changes as the code diverges
 
-- **Pending decision:** `tn/notes/upstream-backports.md` lists upstream fixes since v1.11.4 that
-  matter to TN, each with a trial-pick result. The High ones include a WebSocket origin check that
-  `--ws.origins` never enforces (ff2657600), transaction-pool memory growth (792ee9245) and a
-  log-subscription panic (6e4009eed). There is also a JS-tracer DoS that needs a newer
-  revm-inspectors. None are applied yet.
+- `tn/notes/upstream-backports.md` is the tracker: what has been applied (with TN ids) and every
+  open upstream fix that matters to TN, ranked by severity for TN. Re-survey before each sync
+  and after upstream security releases.
 
 - While a crate is only lightly changed, `vendor.py sync` and `pick` keep working. Watch reth
   releases for fixes in the crates TN still carries close to upstream: rpc, transaction-pool,
