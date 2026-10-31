@@ -43,6 +43,24 @@
 //!   table's tree (tndb-b's `Env::check`, MDBX's table stat), the file's used span (pages times the
 //!   page size, from the engine's stat) and its `st_size`.
 //!
+//! The `changesets` rows (tndb-b columns only; the MDBX columns print `-`) ask whether reth's
+//! changeset tables, composite keys in this crate (`DUP_LAYOUTS`), would do better as packed dup
+//! tables. Each of two shapes of reth's widths is loaded in two forms: **composite**, a plain
+//! table keyed `k ‖ s`, and **packed**, a dup table of `DupOptions::packed(K)` (the state tables'
+//! form). StorageChangeSets (K 28 = block ‖ address, s 32, values of 1..=32 bytes) changes
+//! `CS_ADDRESSES` (200) addresses a block, each 1..=4 slots, so every key packs;
+//! AccountChangeSets (K 8 = block, s 20, values of 0..=100 bytes) changes 200 accounts a block,
+//! so every key nests at any bound. Each shape takes about N rows (the blocks are N divided by
+//! its mean rows a block), seeded, appended in ascending order with a commit every
+//! `CS_COMMIT_BLOCKS` (10) blocks. Per form, the rows are the load's time per row (commits
+//! included), a `walk_range` as reth's walker takes it (a seek to a block's first row, then steps
+//! across keys to the last row of the 100th block; `CS_WALKS` of them spread over the blocks)
+//! per row read, point gets of every logical key in a scrambled order per get, the file's used
+//! span and the table's pages (its `TableStat`'s branch, leaf and overflow pages, nested trees
+//! included), each times the page size. A column runs each shape's forms in ABBA order (composite,
+//! packed, packed, composite), each pass in a fresh environment removed after it, and reports a
+//! cell as the mean of its form's two passes.
+//!
 //! tndb-b is a plain dependency of this crate, built without its test-only code, so these rows
 //! time the engine as a release build of the node would. The rows that need the engine's
 //! test-only switches (step 4 forced to one `fdatasync`, deletes with merging off) are the
@@ -50,7 +68,8 @@
 //!
 //! ## Selecting what runs
 //!
-//! - `TNDB_B_BENCH_N` scales the bulk tables (default 1,000,000 entries each).
+//! - `TNDB_B_BENCH_N` scales the bulk tables (default 1,000,000 entries each) and the rows of each
+//!   `changesets` shape.
 //! - `TNDB_B_BENCH_ENGINES` picks the columns, comma-separated (default all; printed in this
 //!   order): `t4d` (tndb-b 4K Durable), `t16d` (16K Durable), `t4n` (4K NoSync), `md` (MDBX
 //!   Durable), `md4` (MDBX Durable with 4 KiB pages), `mn` (MDBX SafeNoSync).
@@ -58,14 +77,16 @@
 //!   `get-hit`, `get-miss`, `scan-fwd`, `scan-rev`, `seek`, `seek-fwd` (the seek row's targets
 //!   sorted ascending, so each seek lands at or a little past the last one, often in the same leaf
 //!   or the next), `small`, `mixed`, `clear`, `append`, `delete` (the delete rows), `big` (the
-//!   large-value rows), and the aliases `bulk` (`seq,rand`), `get` (both gets) and `scan` (both
-//!   scans). The file size rows come with `seq` or `rand`. A group that needs a bulk table (`clear`
-//!   the sequential one; the gets, scans, both seeks and `mixed` the random one) builds it untimed
-//!   when its own group is not selected. Only rows with a measured cell are printed.
+//!   large-value rows), `changesets` (the changeset forms' rows above, tndb-b columns only), and
+//!   the aliases `bulk` (`seq,rand`), `get` (both gets) and `scan` (both scans). The file size rows
+//!   come with `seq` or `rand`. A group that needs a bulk table (`clear` the sequential one; the
+//!   gets, scans, both seeks and `mixed` the random one) builds it untimed when its own group is
+//!   not selected. Only rows with a measured cell are printed.
 //! - `TNDB_B_BENCH_REPEAT=k` (default 1) runs each selected read row (the gets, the scans and both
-//!   seeks) k times back to back and reports the median, so one read row can dominate a profile:
-//!   for example `TNDB_B_BENCH_ENGINES=t16d TNDB_B_BENCH_ROWS=get-hit TNDB_B_BENCH_REPEAT=20`. To
-//!   profile a put loop or a commit, select `seq` or `rand` and raise `TNDB_B_BENCH_N` instead.
+//!   seeks, and the `changesets` walks and gets) k times back to back and reports the median, so
+//!   one read row can dominate a profile: for example `TNDB_B_BENCH_ENGINES=t16d
+//!   TNDB_B_BENCH_ROWS=get-hit TNDB_B_BENCH_REPEAT=20`. To profile a put loop or a commit, select
+//!   `seq` or `rand` and raise `TNDB_B_BENCH_N` instead.
 //!
 //! ## Caveats (printed with the results too)
 //!
@@ -105,6 +126,7 @@ use std::{
     collections::VecDeque,
     hint::black_box,
     path::Path,
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -113,7 +135,9 @@ use reth_libmdbx::{
     WriteFlags,
 };
 
-use tndb_b::{Env, EnvOptions, ReadTxn as _, SyncMode, Table};
+use tndb_b::{
+    DupOptions, DupRoCursor, Env, EnvOptions, ReadTxn as _, RoCursor, RoTxn, SyncMode, Table,
+};
 
 use crate::bench::{announce_temp_dir, page_size};
 
@@ -168,6 +192,342 @@ const BIG: [(usize, usize, [Row; 3]); 3] = [
 const BIG_KEYS: usize = 20_000;
 /// The large values are windows of one buffer at this many different offsets.
 const BIG_SHIFTS: usize = 64;
+
+/// The addresses a block of the `changesets` rows changes (StorageChangeSets), and the accounts
+/// it changes (AccountChangeSets).
+const CS_ADDRESSES: usize = 200;
+/// The `changesets` rows commit their load once per this many blocks.
+const CS_COMMIT_BLOCKS: usize = 10;
+/// The blocks one `walk_range` of the `changesets` rows reads.
+const CS_WALK_BLOCKS: usize = 100;
+/// The `walk_range`s of a `changesets` row, at starts spread evenly over the blocks.
+const CS_WALKS: usize = 10;
+/// The point gets of a `changesets` row (fewer when the table holds fewer rows).
+const CS_GETS: usize = 100_000;
+
+/// A changeset table's shape for the `changesets` rows: reth's widths, as `DUP_LAYOUTS` holds
+/// them, and how many rows a block writes.
+struct CsShape {
+    /// The table, as reth names it.
+    name: &'static str,
+    /// The key width K: the 8-byte block number, then (StorageChangeSets) the 20-byte address.
+    key_len: usize,
+    /// The subkey width W: a storage slot (32) or an account's address (20).
+    sub_len: usize,
+    /// The keys a block writes: its changed addresses, or the block alone.
+    keys_per_block: usize,
+    /// The rows a key holds, inclusive: an address's slots, or a block's accounts.
+    rows_per_key: (usize, usize),
+    /// The length of a row's value after its subkey, inclusive: a slot's value, or an account's
+    /// encoding (0 for an account the block created).
+    value_len: (usize, usize),
+    /// The rows of each form ([`CsForm::ALL`]'s order): append, walk, get, file used, table pages.
+    rows: [[Row; 5]; 2],
+}
+
+impl CsShape {
+    /// The blocks that hold about `n` rows (at least one).
+    const fn blocks(&self, n: usize) -> usize {
+        let per_block = self.keys_per_block * (self.rows_per_key.0 + self.rows_per_key.1) / 2;
+        let blocks = n / per_block;
+        if blocks == 0 {
+            1
+        } else {
+            blocks
+        }
+    }
+}
+
+/// The `changesets` rows' shapes: StorageChangeSets (few slots per address, so every key's rows
+/// fit a packed set) and AccountChangeSets (hundreds of accounts per block, so every key nests at
+/// any bound).
+const CS_SHAPES: [CsShape; 2] = [
+    CsShape {
+        name: "StorageChangeSets",
+        key_len: 28,
+        sub_len: 32,
+        keys_per_block: CS_ADDRESSES,
+        rows_per_key: (1, 4),
+        value_len: (1, 32),
+        rows: [
+            [
+                Row::CsStoreCompAppend,
+                Row::CsStoreCompWalk,
+                Row::CsStoreCompGet,
+                Row::CsStoreCompUsed,
+                Row::CsStoreCompTable,
+            ],
+            [
+                Row::CsStorePackAppend,
+                Row::CsStorePackWalk,
+                Row::CsStorePackGet,
+                Row::CsStorePackUsed,
+                Row::CsStorePackTable,
+            ],
+        ],
+    },
+    CsShape {
+        name: "AccountChangeSets",
+        key_len: 8,
+        sub_len: 20,
+        keys_per_block: 1,
+        rows_per_key: (CS_ADDRESSES, CS_ADDRESSES),
+        value_len: (0, 100),
+        rows: [
+            [
+                Row::CsAcctCompAppend,
+                Row::CsAcctCompWalk,
+                Row::CsAcctCompGet,
+                Row::CsAcctCompUsed,
+                Row::CsAcctCompTable,
+            ],
+            [
+                Row::CsAcctPackAppend,
+                Row::CsAcctPackWalk,
+                Row::CsAcctPackGet,
+                Row::CsAcctPackUsed,
+                Row::CsAcctPackTable,
+            ],
+        ],
+    },
+];
+
+/// The form a changeset table takes in the `changesets` rows.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum CsForm {
+    /// A plain table keyed `k ‖ s`, as the adapter stores the changesets.
+    Composite,
+    /// A dup table of `DupOptions::packed(K)`, as the adapter stores the state tables.
+    Packed,
+}
+
+impl CsForm {
+    /// The forms, in the order of [`CsShape::rows`].
+    const ALL: [Self; 2] = [Self::Composite, Self::Packed];
+    /// The order a column runs them in, so a drift over the run weighs on both forms alike.
+    const ABBA: [Self; 4] = [Self::Composite, Self::Packed, Self::Packed, Self::Composite];
+
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Composite => "composite",
+            Self::Packed => "packed",
+        }
+    }
+}
+
+/// One shape's seeded rows for the `changesets` rows, in ascending order of their logical keys.
+struct CsData {
+    /// The logical key width, K + W.
+    stride: usize,
+    /// Every row's logical key `block ‖ (address) ‖ subkey`, `stride` bytes each.
+    keys: Vec<u8>,
+    /// Every row's value: row `i`'s ends at `value_ends[i]` and starts where row `i - 1`'s ends.
+    values: Vec<u8>,
+    value_ends: Vec<u32>,
+    /// The first row of each block, then the row count.
+    block_starts: Vec<usize>,
+    /// The first block of each `walk_range`, and the blocks each reads.
+    walk_starts: Vec<usize>,
+    walk_blocks: usize,
+    /// The rows the point gets read, in a scrambled order.
+    gets: Vec<u32>,
+}
+
+/// `len` bytes from `rng`.
+fn random_bytes(rng: &mut Rng, out: &mut Vec<u8>, len: usize) {
+    let start = out.len();
+    out.resize(start + len, 0);
+    for chunk in out[start..].chunks_mut(8) {
+        chunk.copy_from_slice(&rng.next().to_le_bytes()[..chunk.len()]);
+    }
+}
+
+impl CsData {
+    /// About `n` rows of `shape`: block `b`'s keys start with `b` big-endian, its keys (random
+    /// addresses) and each key's subkeys (random) sorted and distinct; each `walk_range` reads
+    /// `walk_blocks` blocks (all of them if fewer).
+    fn new(shape: &CsShape, n: usize, walk_blocks: usize) -> Self {
+        let mut rng = Rng(0x9e37_79b9_7f4a_7c15 ^ shape.key_len as u64);
+        let blocks = shape.blocks(n);
+        let stride = shape.key_len + shape.sub_len;
+        let pick =
+            |rng: &mut Rng, (lo, hi): (usize, usize)| lo + rng.below((hi - lo + 1) as u64) as usize;
+        let (mut keys, mut values, mut value_ends) = (Vec::new(), Vec::new(), Vec::new());
+        let mut block_starts = Vec::with_capacity(blocks + 1);
+        let random_set = |rng: &mut Rng, count: usize, len: usize| {
+            let mut set: Vec<Vec<u8>> = (0..count)
+                .map(|_| {
+                    let mut v = Vec::with_capacity(len);
+                    random_bytes(rng, &mut v, len);
+                    v
+                })
+                .collect();
+            set.sort_unstable();
+            set.dedup();
+            set
+        };
+        for b in 0..blocks as u64 {
+            block_starts.push(value_ends.len());
+            for k in random_set(&mut rng, shape.keys_per_block, shape.key_len - 8) {
+                let rows = pick(&mut rng, shape.rows_per_key);
+                for s in random_set(&mut rng, rows, shape.sub_len) {
+                    keys.extend_from_slice(&b.to_be_bytes());
+                    keys.extend_from_slice(&k);
+                    keys.extend_from_slice(&s);
+                    let len = pick(&mut rng, shape.value_len);
+                    random_bytes(&mut rng, &mut values, len);
+                    value_ends.push(u32::try_from(values.len()).expect("values within u32"));
+                }
+            }
+        }
+        let rows = value_ends.len();
+        block_starts.push(rows);
+        let walk_blocks = blocks.min(walk_blocks);
+        let last = blocks - walk_blocks;
+        let walk_starts = (0..CS_WALKS).map(|i| last * i / (CS_WALKS - 1)).collect();
+        let gets = (0..CS_GETS.min(rows)).map(|_| rng.below(rows as u64) as u32).collect();
+        Self { stride, keys, values, value_ends, block_starts, walk_starts, walk_blocks, gets }
+    }
+
+    fn rows(&self) -> usize {
+        self.value_ends.len()
+    }
+
+    fn blocks(&self) -> usize {
+        self.block_starts.len() - 1
+    }
+
+    fn key(&self, i: usize) -> &[u8] {
+        &self.keys[i * self.stride..(i + 1) * self.stride]
+    }
+
+    fn value(&self, i: usize) -> &[u8] {
+        let start = if i == 0 { 0 } else { self.value_ends[i - 1] as usize };
+        &self.values[start..self.value_ends[i] as usize]
+    }
+
+    /// The rows of the `walk_range` from block `first`.
+    fn walk_rows(&self, first: usize) -> usize {
+        self.block_starts[first + self.walk_blocks] - self.block_starts[first]
+    }
+}
+
+/// The cursor moves the `changesets` rows take, on a plain table's cursor and on a dup table's.
+trait CsCursor {
+    fn first_row(&mut self) -> tndb_b::Result<Option<(&[u8], &[u8])>>;
+    fn seek_row(&mut self, key: &[u8]) -> tndb_b::Result<Option<(&[u8], &[u8])>>;
+    fn next_row(&mut self) -> tndb_b::Result<Option<(&[u8], &[u8])>>;
+}
+
+impl CsCursor for RoCursor {
+    fn first_row(&mut self) -> tndb_b::Result<Option<(&[u8], &[u8])>> {
+        self.first()
+    }
+    fn seek_row(&mut self, key: &[u8]) -> tndb_b::Result<Option<(&[u8], &[u8])>> {
+        self.seek(key)
+    }
+    fn next_row(&mut self) -> tndb_b::Result<Option<(&[u8], &[u8])>> {
+        self.next()
+    }
+}
+
+impl CsCursor for DupRoCursor {
+    fn first_row(&mut self) -> tndb_b::Result<Option<(&[u8], &[u8])>> {
+        self.first()
+    }
+    fn seek_row(&mut self, key: &[u8]) -> tndb_b::Result<Option<(&[u8], &[u8])>> {
+        self.seek(key)
+    }
+    fn next_row(&mut self) -> tndb_b::Result<Option<(&[u8], &[u8])>> {
+        self.next()
+    }
+}
+
+/// Create `shape`'s table in `form` (committed, untimed), then append every row of `data` in
+/// order, committing once per [`CS_COMMIT_BLOCKS`] blocks: the table and the load's wall time.
+fn cs_load(env: &Env, shape: &CsShape, data: &CsData, form: CsForm) -> (Table, Duration) {
+    let mut txn = env.begin_rw().expect("begin");
+    let table = match form {
+        CsForm::Composite => txn.create_table(shape.name),
+        CsForm::Packed => {
+            let key_len = u16::try_from(shape.key_len).expect("a narrow key");
+            txn.create_dup_table(shape.name, DupOptions::packed(key_len))
+        }
+    }
+    .expect("create the table");
+    txn.commit().expect("commit");
+    let start = Instant::now();
+    for first in (0..data.blocks()).step_by(CS_COMMIT_BLOCKS) {
+        let last = (first + CS_COMMIT_BLOCKS).min(data.blocks());
+        let mut txn = env.begin_rw().expect("begin");
+        for i in data.block_starts[first]..data.block_starts[last] {
+            txn.append(&table, data.key(i), data.value(i)).expect("append");
+        }
+        txn.commit().expect("commit");
+    }
+    (table, start.elapsed())
+}
+
+/// One `walk_range` as reth's walker takes it: a seek to block `first`'s first row, then steps
+/// to the last row before block `first + walk_blocks`, across keys. The rows read.
+fn cs_walk(cursor: &mut impl CsCursor, data: &CsData, first: usize) -> usize {
+    let end = ((first + data.walk_blocks) as u64).to_be_bytes();
+    let (mut rows, mut bytes) = (0, 0);
+    let mut row = cursor.seek_row(data.key(data.block_starts[first])).expect("seek");
+    while let Some((k, v)) = row {
+        if k[..8] >= end[..] {
+            break;
+        }
+        rows += 1;
+        bytes += v.len();
+        row = cursor.next_row().expect("next");
+    }
+    black_box(bytes);
+    rows
+}
+
+/// Every `walk_range` of `data` over `table` in `form`, each through a new cursor: the wall time.
+fn cs_walks(txn: &Arc<RoTxn>, table: &Table, form: CsForm, data: &CsData) -> Duration {
+    let start = Instant::now();
+    for &first in &data.walk_starts {
+        let rows = match form {
+            CsForm::Composite => {
+                cs_walk(&mut txn.cursor_owned(table).expect("cursor"), data, first)
+            }
+            CsForm::Packed => {
+                cs_walk(&mut txn.dup_cursor_owned(table).expect("cursor"), data, first)
+            }
+        };
+        assert_eq!(rows, data.walk_rows(first), "a walk_range reads its blocks' rows");
+    }
+    start.elapsed()
+}
+
+/// Every point get of `data` over `table`: the wall time.
+fn cs_gets(txn: &RoTxn, table: &Table, data: &CsData) -> Duration {
+    let start = Instant::now();
+    for &i in &data.gets {
+        black_box(txn.get(table, data.key(i as usize)).expect("get").expect("a hit"));
+    }
+    start.elapsed()
+}
+
+/// Every row of `table` in `form`, by a cursor from the first.
+fn cs_scan(txn: &Arc<RoTxn>, table: &Table, form: CsForm) -> Vec<(Vec<u8>, Vec<u8>)> {
+    fn scan(cursor: &mut impl CsCursor) -> Vec<(Vec<u8>, Vec<u8>)> {
+        let mut out = Vec::new();
+        let mut row = cursor.first_row().expect("first");
+        while let Some((k, v)) = row {
+            out.push((k.to_vec(), v.to_vec()));
+            row = cursor.next_row().expect("next");
+        }
+        out
+    }
+    match form {
+        CsForm::Composite => scan(&mut txn.cursor_owned(table).expect("cursor")),
+        CsForm::Packed => scan(&mut txn.dup_cursor_owned(table).expect("cursor")),
+    }
+}
 
 /// The seeded inputs every column replays.
 struct Data {
@@ -334,10 +694,11 @@ enum Group {
     Append,
     Delete,
     Big,
+    ChangeSets,
 }
 
 /// The names `TNDB_B_BENCH_ROWS` accepts, each with the groups it selects.
-const GROUP_NAMES: [(&str, &[Group]); 17] = [
+const GROUP_NAMES: [(&str, &[Group]); 18] = [
     ("seq", &[Group::Seq]),
     ("rand", &[Group::Rand]),
     ("bulk", &[Group::Seq, Group::Rand]),
@@ -355,6 +716,7 @@ const GROUP_NAMES: [(&str, &[Group]); 17] = [
     ("append", &[Group::Append]),
     ("delete", &[Group::Delete]),
     ("big", &[Group::Big]),
+    ("changesets", &[Group::ChangeSets]),
 ];
 
 /// The column a bench run measures.
@@ -541,6 +903,26 @@ enum Row {
     BigPuts32,
     BigCommit32,
     BigGet32,
+    CsStoreCompAppend,
+    CsStoreCompWalk,
+    CsStoreCompGet,
+    CsStoreCompUsed,
+    CsStoreCompTable,
+    CsStorePackAppend,
+    CsStorePackWalk,
+    CsStorePackGet,
+    CsStorePackUsed,
+    CsStorePackTable,
+    CsAcctCompAppend,
+    CsAcctCompWalk,
+    CsAcctCompGet,
+    CsAcctCompUsed,
+    CsAcctCompTable,
+    CsAcctPackAppend,
+    CsAcctPackWalk,
+    CsAcctPackGet,
+    CsAcctPackUsed,
+    CsAcctPackTable,
 }
 
 impl Row {
@@ -588,6 +970,26 @@ impl Row {
         Row::BigPuts32,
         Row::BigCommit32,
         Row::BigGet32,
+        Row::CsStoreCompAppend,
+        Row::CsStoreCompWalk,
+        Row::CsStoreCompGet,
+        Row::CsStoreCompUsed,
+        Row::CsStoreCompTable,
+        Row::CsStorePackAppend,
+        Row::CsStorePackWalk,
+        Row::CsStorePackGet,
+        Row::CsStorePackUsed,
+        Row::CsStorePackTable,
+        Row::CsAcctCompAppend,
+        Row::CsAcctCompWalk,
+        Row::CsAcctCompGet,
+        Row::CsAcctCompUsed,
+        Row::CsAcctCompTable,
+        Row::CsAcctPackAppend,
+        Row::CsAcctPackWalk,
+        Row::CsAcctPackGet,
+        Row::CsAcctPackUsed,
+        Row::CsAcctPackTable,
     ];
 
     fn label(self, n: usize) -> String {
@@ -638,11 +1040,54 @@ impl Row {
                     BIG.into_iter().find(|b| b.2[2] as usize == self as usize).expect("a big row");
                 format!("get {} KiB (per op)", len >> 10)
             }
+            Row::CsStoreCompAppend
+            | Row::CsStoreCompWalk
+            | Row::CsStoreCompGet
+            | Row::CsStoreCompUsed
+            | Row::CsStoreCompTable
+            | Row::CsStorePackAppend
+            | Row::CsStorePackWalk
+            | Row::CsStorePackGet
+            | Row::CsStorePackUsed
+            | Row::CsStorePackTable
+            | Row::CsAcctCompAppend
+            | Row::CsAcctCompWalk
+            | Row::CsAcctCompGet
+            | Row::CsAcctCompUsed
+            | Row::CsAcctCompTable
+            | Row::CsAcctPackAppend
+            | Row::CsAcctPackWalk
+            | Row::CsAcctPackGet
+            | Row::CsAcctPackUsed
+            | Row::CsAcctPackTable => {
+                let (shape, form, measure) = CS_SHAPES
+                    .iter()
+                    .find_map(|shape| {
+                        shape.rows.iter().enumerate().find_map(|(form, rows)| {
+                            let at = rows.iter().position(|&r| r as usize == self as usize)?;
+                            Some((shape, CsForm::ALL[form], at))
+                        })
+                    })
+                    .expect("a changesets row");
+                let walk = shape.blocks(n).min(CS_WALK_BLOCKS);
+                match measure {
+                    0 => format!(
+                        "{} {} blocks, {}: append (per row)",
+                        shape.name,
+                        shape.blocks(n),
+                        form.name()
+                    ),
+                    1 => format!("  walk_range {walk} blocks (per row)"),
+                    2 => "  get (per op)".to_string(),
+                    3 => "  file used (pages x P)".to_string(),
+                    _ => "  table pages x P".to_string(),
+                }
+            }
         }
     }
 }
 
-const ROWS: usize = Row::BigGet32 as usize + 1;
+const ROWS: usize = Row::CsAcctPackTable as usize + 1;
 
 /// One column of results.
 struct Column {
@@ -688,6 +1133,7 @@ fn run_tndb(
     page_size: u32,
     sync: SyncMode,
     data: &Data,
+    cs: &[CsData],
     sel: &Selection,
 ) -> Column {
     let mut col = Column::new(name);
@@ -789,7 +1235,57 @@ fn run_tndb(
     if sel.has(Group::Big) {
         tndb_big(dir, options, data, sel, &mut col);
     }
+
+    if sel.has(Group::ChangeSets) {
+        tndb_changesets(dir, options, cs, sel, &mut col);
+    }
     col
+}
+
+/// The `changesets` rows: each shape's rows loaded into each form in [`CsForm::ABBA`]'s order,
+/// each pass in a fresh environment in `dir`, removed after it; a cell is the mean of its form's
+/// two passes (the file and table pages are the same in both).
+fn tndb_changesets(
+    dir: &Path,
+    options: EnvOptions,
+    cs: &[CsData],
+    sel: &Selection,
+    col: &mut Column,
+) {
+    for (shape, data) in CS_SHAPES.iter().zip(cs) {
+        // Per form: load, walk and get times, and the file's and the table's pages.
+        let mut times = [[Duration::ZERO; 3]; 2];
+        let mut pages = [[0u64; 2]; 2];
+        for (pass, form) in CsForm::ABBA.into_iter().enumerate() {
+            let at = form as usize;
+            let path = dir.join(format!("{}-{pass}.tndb-b", shape.name));
+            let env = Env::open(&path, options).expect("open tndb-b");
+            let (table, load) = cs_load(&env, shape, data, form);
+            let txn = Arc::new(env.begin_ro().expect("begin"));
+            let walk = sel.median(|| cs_walks(&txn, &table, form, data));
+            let get = sel.median(|| cs_gets(&txn, &table, data));
+            let stat = txn.table_stat(&table).expect("table stat");
+            drop(txn);
+            let t = &mut times[at];
+            t[0] += load;
+            t[1] += walk;
+            t[2] += get;
+            let tree = stat.branch_pages + stat.leaf_pages + stat.overflow_pages;
+            pages[at] = [u64::from(env.stat().page_count), u64::from(tree)];
+            drop(env);
+            std::fs::remove_file(&path).expect("remove the pass's file");
+        }
+        let walked: usize = data.walk_starts.iter().map(|&w| data.walk_rows(w)).sum();
+        let page = u64::from(options.page_size);
+        for (at, rows) in shape.rows.iter().enumerate() {
+            let [load, walk, get] = times[at];
+            col.set(rows[0], Cell::PerOp(load, 2 * data.rows()));
+            col.set(rows[1], Cell::PerOp(walk, 2 * walked));
+            col.set(rows[2], Cell::PerOp(get, 2 * data.gets.len()));
+            col.set(rows[3], Cell::Bytes(pages[at][0] * page));
+            col.set(rows[4], Cell::Bytes(pages[at][1] * page));
+        }
+    }
 }
 
 /// The large-value rows, each size into a fresh table of its own fresh environment in `dir`.
@@ -1569,6 +2065,11 @@ fn tndb_b_vs_mdbx() {
     let tmp = tempfile::tempdir().expect("temp dir");
     announce_temp_dir(tmp.path());
     let data = Data::new(n);
+    let cs: Vec<CsData> = if sel.has(Group::ChangeSets) {
+        CS_SHAPES.iter().map(|shape| CsData::new(shape, n, CS_WALK_BLOCKS)).collect()
+    } else {
+        Vec::new()
+    };
     let columns: Vec<Column> = sel
         .engines
         .iter()
@@ -1578,7 +2079,7 @@ fn tndb_b_vs_mdbx() {
             std::fs::create_dir(&dir).expect("column dir");
             match engine {
                 Engine::Tndb(page_size, sync) => {
-                    run_tndb(&dir, title, page_size, sync, &data, &sel)
+                    run_tndb(&dir, title, page_size, sync, &data, &cs, &sel)
                 }
                 Engine::Mdbx(sync, page) => {
                     run_mdbx(&dir, title, sync, page.unwrap_or_else(mdbx_os_page_size), &data, &sel)
@@ -1606,4 +2107,39 @@ fn tndb_b_vs_mdbx() {
          with the OS page size; md4 opens it with 4 KiB pages, the like-for-like column for t4d \
          (on x86_64 the OS page is 4 KiB, so md and md4 are the same configuration there)."
     );
+}
+
+/// The `changesets` rows' builders hold the same rows in both forms: a full scan of each form's
+/// table is the shape's seeded rows, the packed form is a dup table of key width K whose keys
+/// pack (StorageChangeSets) or all nest (AccountChangeSets), and every walk and get finds its rows.
+#[test]
+fn changesets_forms_hold_the_same_rows() {
+    let _open = crate::tests::SPAWN_LOCK.read();
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let options = EnvOptions { sync: SyncMode::NoSync, ..EnvOptions::default() };
+    for (s, shape) in CS_SHAPES.iter().enumerate() {
+        let data = CsData::new(shape, 3000, 2);
+        let expected: Vec<(Vec<u8>, Vec<u8>)> =
+            (0..data.rows()).map(|i| (data.key(i).to_vec(), data.value(i).to_vec())).collect();
+        assert!(data.blocks() > 1 && data.walk_starts.iter().any(|&w| w > 0), "walks cross blocks");
+        for form in CsForm::ALL {
+            let env = Env::open(tmp.path().join(format!("{s}-{}", form.name())), options)
+                .expect("open tndb-b");
+            let (table, _) = cs_load(&env, shape, &data, form);
+            let txn = Arc::new(env.begin_ro().expect("begin"));
+            assert!(cs_scan(&txn, &table, form) == expected, "{} {}", shape.name, form.name());
+            let stat = txn.table_stat(&table).expect("table stat");
+            assert_eq!(stat.entries, data.rows() as u64);
+            match form {
+                CsForm::Composite => assert_eq!(stat.dup, None),
+                CsForm::Packed => {
+                    assert_eq!(stat.dup.map(|d| usize::from(d.key_len)), Some(shape.key_len));
+                    let nested = if shape.key_len == 8 { data.blocks() } else { 0 };
+                    assert_eq!(stat.nested_trees as usize, nested, "{}", shape.name);
+                }
+            }
+            cs_walks(&txn, &table, form, &data);
+            cs_gets(&txn, &table, &data);
+        }
+    }
 }

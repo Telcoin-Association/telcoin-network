@@ -31,14 +31,16 @@ same run.
 
 Environment variables select what runs (the `src/engine_bench.rs` module docs have the details):
 
-- `TNDB_B_BENCH_N`: entries per bulk table (default 1,000,000).
+- `TNDB_B_BENCH_N`: entries per bulk table, and rows per `changesets` shape (default 1,000,000).
 - `TNDB_B_BENCH_ENGINES`: the columns, comma-separated (default all): `t4d`, `t16d`, `t4n`,
   `md`, `md4`, `mn`.
 - `TNDB_B_BENCH_ROWS`: the row groups, comma-separated (default all): `seq`, `rand`, `get-hit`,
   `get-miss`, `scan-fwd`, `scan-rev`, `seek`, `seek-fwd` (the seek row's targets sorted
   ascending), `small`, `mixed`, `clear`, `append` (the API rows),
   `big` (the large-value rows, see [Large values](#large-values-overflow-runs)), `delete` (the
-  delete rows, see [Deletes](#deletes)), and the aliases `bulk`, `get` and `scan`.
+  delete rows, see [Deletes](#deletes)), `changesets` (tndb-b columns only, see
+  [Changesets: composite or packed](#changesets-composite-or-packed)), and the aliases `bulk`,
+  `get` and `scan`.
 - `TNDB_B_BENCH_REPEAT=k`: each selected read row runs k times and reports the median.
 
 ## The columns and rows
@@ -387,3 +389,52 @@ What the rows show:
   state that reaches it (the reuse gate). So each fill grows the file instead of reusing the pages
   the delete just freed. The gate is deliberate: it keeps the previous state recoverable if the
   newest meta is lost.
+
+## Changesets: composite or packed
+
+The `changesets` rows (`TNDB_B_BENCH_ROWS=changesets`, tndb-b columns only) ask whether reth's
+changeset tables, composite keys here (`DUP_LAYOUTS`), would do better as dup tables of
+`DupOptions::packed(K)`, the state tables' form. Each shape has reth's widths and about N rows,
+appended in ascending order with a commit every 10 blocks:
+
+- **StorageChangeSets:** K 28 (block ‖ address), subkey 32, values of 1..=32 bytes; 200 addresses
+  a block, 1..=4 slots each (2000 blocks at N = 1M), so every key's rows fit a packed set.
+- **AccountChangeSets:** K 8 (block), subkey 20, values of 0..=100 bytes; 200 accounts a block
+  (5000 blocks), so every key nests at any bound.
+
+Per form, the rows are the load per row (commits included), a `walk_range` per row read (a seek to
+a block's first row, then steps across keys through 100 blocks; ten such walks spread over the
+blocks), a point get per op, the file's used span and the table's pages. Each column runs the forms
+in ABBA order (composite, packed, packed, composite), each pass in a fresh environment, and a cell
+is the mean of its form's two passes.
+
+**Run:** Apple M1 Max, macOS, 2026-10-31, N = 1M, code: the packed dup sets (23e55c6f6). Times are
+the median of three runs, with the spread (max − min) in brackets; the pages were the same in every
+run.
+
+| | `t4d` composite | `t4d` packed | `t4n` composite | `t4n` packed |
+|---|--:|--:|--:|--:|
+| StorageChangeSets: append (per row) | 396 ns (22) | 561 ns (31) | 60 ns (1) | 293 ns (19) |
+| walk_range (per row) | 29 ns (1) | 46 ns (4) | 20 ns (1) | 38 ns (2) |
+| get (per op) | 714 ns (92) | 751 ns (139) | 723 ns (51) | 685 ns (44) |
+| file used | 85.6 MiB | 68.1 MiB | 90.5 MiB | 72.7 MiB |
+| table pages × P | 85.5 MiB | 68.1 MiB | 85.5 MiB | 68.1 MiB |
+| AccountChangeSets: append (per row) | 542 ns (17) | 637 ns (34) | 60 ns (4) | 145 ns (6) |
+| walk_range (per row) | 31 ns (4) | 35 ns (0) | 20 ns (1) | 27 ns (3) |
+| get (per op) | 683 ns (25) | 745 ns (107) | 684 ns (81) | 736 ns (132) |
+| file used | 86.4 MiB | 105.3 MiB | 98.8 MiB | 114.6 MiB |
+| table pages × P | 86.4 MiB | 105.2 MiB | 86.4 MiB | 105.2 MiB |
+
+The rule: a changeset table switches to a packed dup table only if its append and `walk_range`
+rows are within their spread of composite and its file shrinks by 15% or more. Both stay
+composite:
+
+- **StorageChangeSets:** packing shrinks the table by 20.4% (a key's 28 bytes are stored once for
+  its set, not once a row), but the append is 42% slower at `t4d` and 4.9× at `t4n` (each row
+  appended to a packed key rewrites the key's set), and the walk 1.6× and 1.9×, all far past their
+  spread.
+- **AccountChangeSets:** every key nests (a nested tree a block), the table grows by 22%, and the
+  append and walk are slower than composite by more than their spread.
+
+The point gets are level within their spread in both shapes. `t4n`'s used span is larger than
+`t4d`'s at the same table pages: with no sync a freed page is never reused (the reuse gate).

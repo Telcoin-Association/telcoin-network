@@ -24,7 +24,7 @@ mod mdbx_port;
 /// with them the open file description by which the open's `create` locked the new file, so the
 /// open's own lock of that file fails though no handle has it. Opens share the lock; a spawn takes
 /// it alone, and once `spawn` returns the child has exec'd, which closed its copies.
-static SPAWN_LOCK: RwLock<()> = RwLock::new(());
+pub(crate) static SPAWN_LOCK: RwLock<()> = RwLock::new(());
 
 /// A form of the nested dup layouts' tables (`PlainStorageState`, `HashedStorages`,
 /// `StoragesTrie`) a test runs on.
