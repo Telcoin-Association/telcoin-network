@@ -233,3 +233,5 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
     dropped (`blocking_task.rs`, `rpc/src/eth/filter.rs`). Conflicts only from TN's tree wrapping
     the tasks in `Box::pin` (v1.11's `TaskSpawner` takes a `BoxFuture`). `tokio::select!`
     relies on the workspace enabling tokio `macros`, as upstream does.
+  - 1f94488d1: `eth_getLogs` range scans take a blocking-IO permit and hold it inside the task
+    (`rpc/src/eth/filter.rs`, with upstream's test adapted to TN's `TokioTaskExecutor`).
