@@ -13,7 +13,6 @@ workspace = true
 
 [dependencies]
 # reth
-reth-tracing-otlp = { workspace = true, optional = true }
 
 # obs
 tracing.workspace = true
@@ -31,7 +30,5 @@ eyre.workspace = true
 rolling-file.workspace = true
 
 [features]
-default = ["otlp"]
-otlp = ["reth-tracing-otlp"]
-otlp-logs = ["reth-tracing-otlp/otlp-logs"]
+# TN(TN-0029): no `otlp`/`otlp-logs` features and no reth-tracing-otlp; see layers.rs.
 tracy = ["tracing-tracy", "tracy-client"]

@@ -52,7 +52,6 @@ shellexpand.workspace = true
 
 # obs
 tracing.workspace = true
-reth-tracing-otlp.workspace = true
 
 # crypto
 
@@ -69,8 +68,6 @@ tokio.workspace = true
 jemalloc = ["reth-cli-util/jemalloc"]
 asm-keccak = ["alloy-primitives/asm-keccak"]
 keccak-cache-global = ["alloy-primitives/keccak-cache-global"]
-otlp = ["reth-tracing/otlp", "reth-tracing-otlp/otlp"]
-otlp-logs = ["reth-tracing/otlp-logs", "reth-tracing-otlp/otlp-logs"]
 tracy = ["reth-tracing/tracy"]
 
 min-error-logs = ["tracing/release_max_level_error"]
