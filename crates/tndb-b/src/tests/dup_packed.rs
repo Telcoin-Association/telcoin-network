@@ -1,7 +1,8 @@
 //! Dup tables with packed sets through the public API: the packed-set limit a table is created
 //! with and the number its record holds; the gets, puts and deletes of packed keys, their
 //! promotion to nested trees past the limit, `delete_prefix`, and the free walks of a drop and a
-//! clear over packed sets.
+//! clear over packed sets; `Env::check` after every commit and reopen, and its refusal of
+//! damaged packed sets and totals.
 
 use std::{collections::BTreeMap, path::Path};
 
@@ -10,15 +11,15 @@ use tempfile::TempDir;
 use super::{
     check,
     damage::tree,
-    dup::{copy_of, restamp_cell, restamp_record},
+    dup::{assert_dup_figures, copy_of, restamp_cell, restamp_record},
     open, temp,
 };
 use crate::{
     env::SyncMode,
     packed,
-    page::{self, Find, Val},
+    page::{self, Find, Search, Val},
     tree::PageRead as _,
-    DupOptions, Env, EnvOptions, Error, ReadTxn, RoTxn, RwTxn, Table,
+    CheckReport, DupOptions, Env, EnvOptions, Error, ReadTxn, RoTxn, RwTxn, Table,
 };
 
 /// `create_dup_table` resolves `packed_max` at the file's page size before it records it: 0, 7 and
@@ -138,6 +139,17 @@ fn assert_rows(txn: &impl Walked, t: &Table, model: &Model, trees: u32, what: &s
     assert_eq!(stat.nested_trees, trees, "{what}: nested trees");
 }
 
+/// `Env::check` of `env`, which must pass (packed sets included), with table `d`'s figures those
+/// of its `table_stat` ([`assert_dup_figures`]) and its rows `model`'s.
+#[track_caller]
+fn check_d(env: &Env, model: &Model) -> CheckReport {
+    let report = check(env);
+    let ro = env.begin_ro().expect("ro");
+    assert_dup_figures(&report, &ro, "d");
+    assert_eq!(report.tables["d"].entries, model.len() as u64, "check's rows");
+    report
+}
+
 /// A put into `t` and `model`.
 fn put(txn: &mut RwTxn, t: &Table, model: &mut Model, key: Vec<u8>, value: Vec<u8>) {
     txn.put(t, &key, &value).expect("put");
@@ -215,6 +227,7 @@ fn a_set_at_the_bound_stays_packed_and_one_byte_more_promotes() {
         put(&mut txn, &t, &mut model, lkey(9, &[0]), val(2, 9));
         assert_rows(&txn, &t, &model, trees, &what("two rows below the limit"));
         txn.commit().expect("commit");
+        check_d(&env, &model);
 
         let txn = env.begin_rw().expect("rw");
         assert_rows(&txn, &t, &model, trees, &what("after the commit"));
@@ -226,6 +239,7 @@ fn a_set_at_the_bound_stays_packed_and_one_byte_more_promotes() {
         let ro = env.begin_ro().expect("ro");
         let t = ro.open_table("d").expect("open").expect("d");
         assert_rows(&ro, &t, &model, trees, &what("after a reopen"));
+        check_d(&env, &model);
         assert!(env.failure().is_none(), "{p}: no latch");
     }
 }
@@ -253,12 +267,14 @@ fn an_upsert_that_grows_a_value_past_the_bound_promotes() {
     put(&mut txn, &t, &mut model, lkey(1, &[2]), val(4, 2));
     assert_rows(&txn, &t, &model, 1, "shrunk, still nested");
     txn.commit().expect("commit");
+    check_d(&env, &model);
     let txn = env.begin_rw().expect("rw");
     assert_rows(&txn, &t, &model, 1, "after the commit");
     drop(txn);
     drop(env);
 
     let env = Env::open(&path, env_options).expect("reopen");
+    check_d(&env, &model);
     let mut txn = env.begin_rw().expect("rw");
     let t = txn.open_table("d").expect("open").expect("d");
     assert_rows(&txn, &t, &model, 1, "after a reopen");
@@ -266,6 +282,7 @@ fn an_upsert_that_grows_a_value_past_the_bound_promotes() {
     put(&mut txn, &t, &mut model, lkey(2, &[2]), val(2, 2));
     assert_rows(&txn, &t, &model, 1, "a nested and a packed key written again");
     txn.commit().expect("commit");
+    check_d(&env, &model);
     assert!(env.failure().is_none(), "no latch");
 }
 
@@ -295,17 +312,18 @@ fn a_nested_key_never_demotes() {
     let txn = env.begin_rw().expect("rw");
     assert_rows(&txn, &t, &model, 1, "one row, after the commit");
     drop(txn);
-    check(&env);
+    check_d(&env, &model);
     drop(env);
 
     let env = Env::open(&path, env_options).expect("reopen");
+    check_d(&env, &model);
     let mut txn = env.begin_rw().expect("rw");
     let t = txn.open_table("d").expect("open").expect("d");
     assert_rows(&txn, &t, &model, 1, "one row, after a reopen");
     put(&mut txn, &t, &mut model, lkey(1, &[9]), val(1, 9));
     assert_rows(&txn, &t, &model, 1, "a row into the one-row tree");
     txn.commit().expect("commit");
-    check(&env);
+    check_d(&env, &model);
     assert!(env.failure().is_none(), "no latch");
 }
 
@@ -347,6 +365,7 @@ fn packed_writes_move_the_table_stamp() {
     moved(&txn, "a promotion", true);
     assert_rows(&txn, &t, &model, 1, "promoted");
     txn.commit().expect("commit");
+    check_d(&env, &model);
 
     let mut txn = env.begin_rw().expect("rw");
     let mut writes = txn.table_writes(&t);
@@ -357,6 +376,7 @@ fn packed_writes_move_the_table_stamp() {
     assert!(txn.table_writes(&t) > writes, "a rewrite in a leaf this transaction copied");
     assert_rows(&txn, &t, &model, 1, "the second transaction");
     txn.commit().expect("commit");
+    check_d(&env, &model);
 
     // The deletes: a row of a set of more, a set's last row (its cell removed) and a packed
     // key's `delete_prefix` move the stamp; a miss in a set, of an absent key and of an absent
@@ -389,6 +409,7 @@ fn packed_writes_move_the_table_stamp() {
     moved(&txn, "an absent delete_prefix", false);
     assert_rows(&txn, &t, &model, 1, "the deletes");
     txn.commit().expect("commit");
+    check_d(&env, &model);
     assert!(env.failure().is_none(), "no latch");
 }
 
@@ -424,8 +445,8 @@ fn forget(model: &mut Model, tag: u8) -> u64 {
 /// row and by `delete_prefix`, then put again in the same transaction, are packed sets: new
 /// keys, not demotions (`nested_trees` falls to 0). A drop of the table in that transaction
 /// frees cleanly (every working entry met, none for a packed key) and `check` finds no leak;
-/// otherwise the rows read back after the commit and a reopen, and `check` passes once the
-/// packed rows are gone.
+/// otherwise the rows read back after the commit and a reopen. `check` passes after every
+/// commit and the reopen.
 #[test]
 fn a_nested_key_emptied_then_recreated_is_packed_in_one_txn() {
     for dropping in [false, true] {
@@ -436,6 +457,7 @@ fn a_nested_key_emptied_then_recreated_is_packed_in_one_txn() {
         rows(&mut txn, &t, &mut model, 2, 5);
         assert_rows(&txn, &t, &model, 2, "two committed nested keys");
         txn.commit().expect("commit");
+        check_d(&env, &model);
 
         let mut txn = env.begin_rw().expect("rw");
         rows(&mut txn, &t, &mut model, 3, 5);
@@ -467,9 +489,11 @@ fn a_nested_key_emptied_then_recreated_is_packed_in_one_txn() {
             continue;
         }
         txn.commit().expect("commit");
+        check_d(&env, &model);
         drop(env);
 
         let env = open(&path, SyncMode::Durable);
+        check_d(&env, &model);
         let mut txn = env.begin_rw().expect("rw");
         let t = txn.open_table("d").expect("open").expect("d");
         assert_rows(&txn, &t, &model, 0, "after a reopen");
@@ -479,7 +503,7 @@ fn a_nested_key_emptied_then_recreated_is_packed_in_one_txn() {
         }
         assert_rows(&txn, &t, &model, 0, "every packed key removed");
         txn.commit().expect("commit");
-        assert_eq!(check(&env).tables["d"].entries, 0);
+        check_d(&env, &model);
         assert!(env.failure().is_none(), "no latch");
     }
 }
@@ -506,8 +530,8 @@ fn bulk_key(k: u32, s: u32) -> Vec<u8> {
 /// rows before it) and which promotes after it; small keys up to row 2,100; key B of 2,500 rows,
 /// which promotes in its first transaction and goes on nested in the next two; then keys of 1 to
 /// 15 rows. After every append `nested_trees` counts the keys past 15 rows (none at
-/// `packed_max` 0: every key nested); at every commit the walk gives the rows and, for a table
-/// that never packs, `check` passes. Returns the final page count.
+/// `packed_max` 0: every key nested); at every commit the walk gives the rows and `check` passes.
+/// Returns the final page count.
 fn bulk_load(packed_max: u16) -> u32 {
     let (_dir, path) = temp("tndb_b_dup_packed_bulk");
     let (env, txn, t) = fresh(&path, packed_max);
@@ -546,13 +570,11 @@ fn bulk_load(packed_max: u16) -> u32 {
         assert_eq!(txn.table_stat(&t).expect("stat").nested_trees, 2, "only S and B nested");
     }
     txn.commit().expect("commit");
+    check_d(&env, &model);
     let ro = env.begin_ro().expect("ro");
     let rows: Vec<_> = model.into_iter().collect();
     assert_eq!(ro.dup_rows_for_test(&t), rows, "{packed_max}: the committed rows");
     drop(ro);
-    if packed_max == 0 {
-        check(&env);
-    }
     assert!(env.failure().is_none(), "no latch");
     page_count(&env)
 }
@@ -599,9 +621,7 @@ impl Bulk {
             assert_eq!(txn.dup_rows_for_test(&t), rows, "{packed_max}: at {}", self.appended);
             self.txn.take().expect("a live transaction").commit().expect("commit");
             self.commits += 1;
-            if packed_max == 0 {
-                check(&self.env);
-            }
+            check_d(&self.env, &self.model);
             self.txn = Some(self.env.begin_rw().expect("rw"));
         }
     }
@@ -631,6 +651,7 @@ fn drop_clear_and_delete_prefix_with_packed_and_nested_keys() {
     }
     assert_rows(&txn, &t, &model, 3, "committed: tags 2, 4, 6 nested");
     txn.commit().expect("commit");
+    check_d(&env, &model);
 
     let mut txn = env.begin_rw().expect("rw");
     let pages = |txn: &RwTxn| {
@@ -652,15 +673,18 @@ fn drop_clear_and_delete_prefix_with_packed_and_nested_keys() {
     assert_eq!(pages(&txn), before, "its leaf freed");
     assert_rows(&txn, &t, &model, 2, "after the prefixes");
     txn.commit().expect("commit");
+    check_d(&env, &model);
 
     let mut flat = 0;
     for cycle in 0..50 {
         let mut txn = env.begin_rw().expect("rw");
         rows(&mut txn, &t, &mut model, 9, 3);
         txn.commit().expect("commit");
+        check_d(&env, &model);
         let mut txn = env.begin_rw().expect("rw");
         assert_eq!(txn.delete_prefix(&t, &[9; K as usize]).expect("cycle"), forget(&mut model, 9));
         txn.commit().expect("commit");
+        check_d(&env, &model);
         match cycle {
             0..3 => flat = page_count(&env),
             _ => assert_eq!(page_count(&env), flat, "cycle {cycle}: the file grew"),
@@ -670,6 +694,7 @@ fn drop_clear_and_delete_prefix_with_packed_and_nested_keys() {
 
     for dropping in [false, true] {
         let (_copy, env) = copy_of(&path);
+        check_d(&env, &model);
         let mut txn = env.begin_rw().expect("rw");
         let t = txn.open_table("d").expect("open").expect("d");
         let mut model = model.clone();
@@ -689,7 +714,7 @@ fn drop_clear_and_delete_prefix_with_packed_and_nested_keys() {
         assert_eq!((stat.entries, stat.nested_trees), (0, 0), "cleared");
         assert_eq!(stat.dup, Some(DupOptions { key_len: K, packed_max: P }), "the limit kept");
         txn.commit().expect("commit");
-        assert_eq!(check(&env).tables["d"].entries, 0, "no leak");
+        check_d(&env, &Model::new());
         let mut txn = env.begin_rw().expect("rw");
         let mut model = Model::new();
         rows(&mut txn, &t, &mut model, 1, 2);
@@ -710,6 +735,7 @@ fn packed_fixture(dir: &Path) -> (std::path::PathBuf, u32) {
     }
     assert_rows(&txn, &t, &model, 1, "the fixture");
     txn.commit().expect("commit");
+    check_d(&env, &model);
     let outer = tree(&env, "d");
     assert_eq!((outer.height, outer.entries), (1, 4), "one outer leaf");
     (path, outer.root)
@@ -781,5 +807,64 @@ fn a_free_walk_refuses_packed_totals_that_miss_its_sets() {
             let alloc = &txn.writer_mut().alloc;
             assert!(alloc.freed().is_empty(), "{case}, drop {dropping}: nothing freed");
         }
+    }
+}
+
+/// `Env::check` holds a table that packs to its packed sets: [`packed_fixture`]'s table of a
+/// nested and three packed keys passes, its `TableCheck` rows the table's entries (the nested
+/// rows plus the packed ones). Forged (each CRC stamped again), it is `Corrupt`, naming the
+/// table, the key and the problem, and latches: key 2's set with its first two subkeys swapped
+/// (each row's length kept, so only the whole validation sees it), that set one byte over the
+/// table's limit (its last value grown), and the record's `packed_rows` one more (keeping every
+/// record rule).
+#[test]
+fn check_counts_packed_sets_and_refuses_their_damage() {
+    let dir = TempDir::with_prefix("tndb_b_dup_packed_check").expect("temp dir");
+    {
+        let sound = dir.path().join("sound");
+        std::fs::create_dir(&sound).expect("case dir");
+        let (path, _) = packed_fixture(&sound);
+        let env = open(&path, SyncMode::Durable);
+        let found = check(&env).tables["d"];
+        let ro = env.begin_ro().expect("ro");
+        let t = ro.open_table("d").expect("open").expect("d");
+        let stat = ro.table_stat(&t).expect("stat");
+        assert_eq!((found.entries, stat.entries), (11, 11), "5 nested rows and 6 packed");
+        assert_eq!((found.pages, found.height), (2, 1), "the outer leaf and key 1's leaf");
+    }
+    let key = "key 02020202: ";
+    let over = format!("{key}a packed set of {} bytes, not 7 to {P}", P + 1);
+    let cases: [(&str, &str); 3] = [
+        ("misordered", "key 02020202: packed rows 0 and 1: subkeys not strictly ascending"),
+        ("over the limit", &over),
+        ("record rows", "packed_rows 6 in its trees, not the 7 its record counts"),
+    ];
+    for (case, message) in cases {
+        let case_dir = dir.path().join(case.replace(' ', "_"));
+        std::fs::create_dir(&case_dir).expect("case dir");
+        let (path, leaf) = packed_fixture(&case_dir);
+        if case == "record rows" {
+            restamp_record(&path, |r| r.dup.as_mut().expect("dup").packed_rows += 1);
+        } else {
+            let blob = packed_set_of_key_2(&path, leaf);
+            let view = packed::validate(&blob, usize::from(P), 64).expect("a valid set");
+            let mut forged = blob.clone();
+            if case == "misordered" {
+                let row = |s: u8| [s].into_iter().chain(val(8, s ^ 2)).collect::<Vec<_>>();
+                let at = |row: &[u8]| blob.windows(row.len()).position(|w| w == row).expect("row");
+                forged.swap(at(&row(1)), at(&row(2)));
+            } else {
+                let base = packed::encoded_len_with(&view, Search::Found(2), &[3], &[]);
+                let grown = val(usize::from(P) + 1 - base, 3);
+                packed::build_with(&view, Search::Found(2), &[3], &grown, &mut forged);
+                assert_eq!(forged.len(), usize::from(P) + 1, "one byte over the limit");
+            }
+            restamp_cell(&path, leaf, &[2; K as usize], &forged[..]);
+        }
+        let (_copy, env) = copy_of(&path);
+        let result = env.check();
+        let named = |m: &str| m.starts_with("check: table \"d\": ") && m.contains(message);
+        assert!(matches!(&result, Err(Error::Corrupt(m)) if named(m)), "{case}: {result:?}");
+        assert!(env.failure().is_some(), "{case}: latched");
     }
 }

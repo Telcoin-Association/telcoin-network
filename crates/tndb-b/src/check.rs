@@ -4,9 +4,10 @@
 //! free list. Each tree's root must count the entries and the pages of each kind the walk finds.
 //! Every overflow run a leaf names is checked as a read checks it, plus the full CRC of every run
 //! (a 1-page one too) and its zero pad, and its pages count as its table's. A dup table's outer
-//! tree holds one nested cell per outer key of the table's width; each nested tree is walked as
-//! a plain one, under the table's name, and the record's nested totals must be the sums of the
-//! nested roots' counters (`Checker::walk_dup`).
+//! tree holds one cell per outer key of the table's width: a nested cell, whose tree is walked as
+//! a plain one, under the table's name, or, in a table that packs, a packed set, validated whole.
+//! The record's nested totals must be the sums of the nested roots' counters, and its
+//! `packed_rows` the rows of the packed sets (`Checker::walk_dup`).
 
 use std::collections::BTreeMap;
 
@@ -17,6 +18,7 @@ use crate::{
     error::{Error, Result},
     freelist::{decode_pages, RecordKey},
     overflow::{self, Ovf, RunCrc},
+    packed,
     page::{self, Kind, Val},
     tree::{PageRead, TreeRoot},
 };
@@ -62,8 +64,9 @@ enum Leaves {
     /// Inline values and overflow runs: a nested cell is [`Error::Corrupt`]. The catalog, the
     /// free tree, a plain table's tree and a dup table's nested trees.
     Plain,
-    /// A dup table's outer tree: nested cells, which the entry callback checks (an inline cell
-    /// is its refusal), and no overflow cell.
+    /// A dup table's outer tree: nested cells and, in a table that packs, packed sets (inline
+    /// cells), which the entry callback checks (an inline cell of a table that never packs is
+    /// its refusal), and no overflow cell.
     DupOuter,
 }
 
@@ -219,17 +222,27 @@ impl Checker<'_> {
 
     /// Walk a dup table's outer tree `root` and every nested tree its cells name, all for `owner`
     /// (so a page any two of them name is claimed twice), then hold the record `dup` to the
-    /// trees found. Each outer key is `dup.key_len` bytes and each cell nested; each nested tree
-    /// passes the walk of a plain tree (its pages, its counters against them, its runs), with
-    /// subkeys of 1 byte up to the table's widest. Unless a page was claimed twice (the page
-    /// accounting reports that), the record's nested totals are the sums of the nested roots'
-    /// counters, there is one nested tree per outer entry and no packed row; any other figure is
-    /// [`Error::Corrupt`], naming the field.
+    /// trees and sets found. Each outer key is `dup.key_len` bytes. Each cell is nested, or, when
+    /// `dup.packed_max` is not 0, a packed set that passes the whole [`packed::validate`] (at most
+    /// `packed_max` bytes, subkeys of 1 byte up to the table's widest, strictly ascending); each
+    /// nested tree passes the walk of a plain tree (its pages, its counters against them, its
+    /// runs), with subkeys of 1 byte up to the table's widest. Unless a page was claimed twice
+    /// (the page accounting reports that), the record's nested totals are the sums of the nested
+    /// roots' counters, its `packed_rows` the rows of the packed sets, and the outer entries the
+    /// nested trees plus the packed sets; any other figure is [`Error::Corrupt`], naming the
+    /// field.
     fn walk_dup(&mut self, root: &TreeRoot, dup: &DupRecord, owner: Owner) -> Result<TableCheck> {
+        // The refusal of an inline cell in a table that never packs (an overflow cell is the
+        // walk's).
+        const NOT_NESTED: &str =
+            "a cell that is not nested in a dup table's outer tree, which nests every key";
         let width = usize::from(dup.key_len);
         let max_subkey = self.snapshot.geometry.max_subkey(width);
+        let packed_max = usize::from(dup.packed_max);
         // The nested roots' counters, summed: [trees, entries, branch, leaf, overflow pages].
         let mut sums = [0_u64; 5];
+        // The packed sets and their rows.
+        let (mut sets, mut packed_rows) = (0_u64, 0_u64);
         let mut nested_pages = 0;
         let outer_pages = self.walk(root, owner, Leaves::DupOuter, |checker, k, v| {
             if k.len() != width {
@@ -238,15 +251,19 @@ impl Checker<'_> {
                     k.len()
                 )));
             }
-            let Val::Nested(cell) = v else {
-                return Err(Error::Corrupt(
-                    "a cell that is not nested in a dup table's outer tree, which nests every key"
-                        .to_string(),
-                ));
-            };
             let in_key = |e: Error| match e {
                 Error::Corrupt(m) => Error::Corrupt(format!("key {}: {m}", hex(k))),
                 other => other,
+            };
+            let cell = match v {
+                Val::Nested(cell) => cell,
+                Val::Inline(blob) if packed_max != 0 => {
+                    let set = packed::validate(blob, packed_max, max_subkey).map_err(in_key)?;
+                    sets = sets.saturating_add(1);
+                    packed_rows = packed_rows.saturating_add(set.rows() as u64);
+                    return Ok(());
+                }
+                _ => return Err(Error::Corrupt(NOT_NESTED.to_string())),
             };
             let nested = TreeRoot::decode(cell).map_err(in_key)?;
             nested_pages += checker
@@ -281,8 +298,8 @@ impl Checker<'_> {
                 ("nested_branch_pages", branches, u64::from(dup.nested_branch_pages)),
                 ("nested_leaf_pages", leaves, u64::from(dup.nested_leaf_pages)),
                 ("nested_overflow_pages", overflows, u64::from(dup.nested_overflow_pages)),
-                ("packed_rows", 0, dup.packed_rows),
-                ("outer entries", trees, root.entries),
+                ("packed_rows", packed_rows, dup.packed_rows),
+                ("outer entries", trees.saturating_add(sets), root.entries),
             ];
             for (field, found, recorded) in fields {
                 if found != recorded {
