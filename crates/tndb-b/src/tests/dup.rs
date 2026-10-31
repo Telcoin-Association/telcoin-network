@@ -2,7 +2,7 @@
 //! options a dup table is created with, and the records this build refuses.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs,
     path::{Path, PathBuf},
     sync::Arc,
@@ -22,7 +22,7 @@ use crate::{
     page::{self, Find, Val},
     tree::{
         read::descend,
-        test_harness::{walk_outer_tree, ReportSeed, Rng},
+        test_harness::{walk_outer_tree, walk_packing_tree, ReportSeed, Rng},
         PageRead as _, TreeRoot,
     },
     CheckReport, DupOptions, Env, EnvOptions, Error, ReadTxn, Result, TableStat,
@@ -1806,7 +1806,6 @@ fn a_free_walk_refuses_a_damaged_outer_tree() {
         }
     }
 }
-
 /// The steps of one stretch of an [`Oracle`] run: even stretches fill (a draw of a delete, a
 /// `delete_prefix`, an abort, a clear or a drop is a put), odd ones run the whole mix, so the
 /// tables grow nested and outer trees of two levels between the mix's shrinking steps.
@@ -1815,14 +1814,104 @@ const STRETCH: u32 = 250;
 /// The subkey alphabet of [`Oracle::subkey`]: small, so short subkeys hit present rows.
 const ALPHABET: &[u8] = b"abcd";
 
-/// What an [`Oracle`] run met (its coverage gate): the tallest trees, and how many times each
-/// kind of step happened.
+/// Oracle 1's dup tables, one per bound of [`Bound::ALL`], in its order.
+const SUBJECTS: [&str; 3] = ["d0", "ds", "dd"];
+
+/// What an [`Oracle`] run met in one subject (its coverage gate at that bound): the tallest
+/// trees, and how many times each transition of [`Forms::change`] happened.
+#[derive(Clone, Copy, Debug, Default)]
+pub(super) struct FormSeen {
+    /// The tallest nested tree (at a commit) and outer tree (at any step).
+    pub(super) nested_height: u32,
+    pub(super) outer_height: u32,
+    /// Keys created packed.
+    pub(super) packed_creates: u32,
+    /// Packed keys promoted in the transaction that created them, and in a later one.
+    pub(super) promotions_mid_txn: u32,
+    pub(super) promotions_across_commits: u32,
+    /// Promotions by a new value of a present row.
+    pub(super) upsert_promotions: u32,
+    /// Steps that left a packed set exactly at the limit, so still packed, and of those the
+    /// creates (a one-row set at the limit).
+    pub(super) at_bound: u32,
+    pub(super) created_at_bound: u32,
+    /// Deletes of a packed key's one row, and `delete_prefix` calls that removed a packed key.
+    pub(super) packed_emptied: u32,
+    pub(super) packed_prefix_hits: u32,
+    /// Deletes that left a nested key one row, still nested.
+    pub(super) nested_shrunk_to_one: u32,
+    /// Keys created packed in the transaction that emptied their nested tree.
+    pub(super) recreated_packed: u32,
+}
+
+impl FormSeen {
+    fn figures(&self) -> [u32; 12] {
+        [
+            self.nested_height,
+            self.outer_height,
+            self.packed_creates,
+            self.promotions_mid_txn,
+            self.promotions_across_commits,
+            self.upsert_promotions,
+            self.at_bound,
+            self.created_at_bound,
+            self.packed_emptied,
+            self.packed_prefix_hits,
+            self.nested_shrunk_to_one,
+            self.recreated_packed,
+        ]
+    }
+
+    fn figures_mut(&mut self) -> [&mut u32; 12] {
+        [
+            &mut self.nested_height,
+            &mut self.outer_height,
+            &mut self.packed_creates,
+            &mut self.promotions_mid_txn,
+            &mut self.promotions_across_commits,
+            &mut self.upsert_promotions,
+            &mut self.at_bound,
+            &mut self.created_at_bound,
+            &mut self.packed_emptied,
+            &mut self.packed_prefix_hits,
+            &mut self.nested_shrunk_to_one,
+            &mut self.recreated_packed,
+        ]
+    }
+
+    /// `other` added: the heights (the first two figures) as the larger, the counts summed.
+    fn add(&mut self, other: &Self) {
+        for (i, (a, b)) in self.figures_mut().into_iter().zip(other.figures()).enumerate() {
+            *a = if i < 2 { (*a).max(b) } else { *a + b };
+        }
+    }
+
+    /// True if every figure reaches `min`'s.
+    fn meets(&self, min: &Self) -> bool {
+        self.figures().iter().zip(min.figures()).all(|(&a, b)| a >= b)
+    }
+
+    /// The counts of packed forms (every count but `nested_shrunk_to_one`).
+    pub(super) fn packed(&self) -> [u32; 9] {
+        [
+            self.packed_creates,
+            self.promotions_mid_txn,
+            self.promotions_across_commits,
+            self.upsert_promotions,
+            self.at_bound,
+            self.created_at_bound,
+            self.packed_emptied,
+            self.packed_prefix_hits,
+            self.recreated_packed,
+        ]
+    }
+}
+
+/// What an [`Oracle`] run met (its coverage gate): how many times each kind of step happened,
+/// and each subject's forms ([`FormSeen`], in [`SUBJECTS`]' order).
 #[derive(Clone, Copy, Debug, Default)]
 struct Coverage {
-    /// The tallest nested tree (at a commit) and outer tree (at any step).
-    nested_height: u32,
-    outer_height: u32,
-    /// Deletes that emptied an outer key, so its tree and cell went.
+    /// Deletes that emptied an outer key, so its tree or set and its cell went.
     emptied_cells: u32,
     /// `delete_prefix` calls that removed rows, and those of a tree too large for one leaf.
     prefix_hits: u32,
@@ -1841,15 +1930,17 @@ struct Coverage {
     clears: u32,
     drops: u32,
     readers_checked: u32,
+    forms: [FormSeen; 3],
 }
 
 impl Coverage {
-    /// `other` added: the heights as the larger, the counts summed.
+    /// `other` added: the counts summed, each subject's forms by [`FormSeen::add`].
     fn add(&mut self, o: &Self) {
-        self.nested_height = self.nested_height.max(o.nested_height);
-        self.outer_height = self.outer_height.max(o.outer_height);
         for (a, b) in self.counts_mut().into_iter().zip(o.counts()) {
             *a += b;
+        }
+        for (a, b) in self.forms.iter_mut().zip(&o.forms) {
+            a.add(b);
         }
     }
 
@@ -1891,11 +1982,149 @@ impl Coverage {
         ]
     }
 
-    /// True if every figure reaches `min`'s.
-    fn meets(&self, min: &Self) -> bool {
-        self.nested_height >= min.nested_height
-            && self.outer_height >= min.outer_height
-            && self.counts().iter().zip(min.counts()).all(|(&a, b)| a >= b)
+    /// Every figure reaches `min`'s, each subject's forms too, and the subject that never packs
+    /// met no packed form at all.
+    #[track_caller]
+    fn assert_meets(&self, min: &Self, what: &str) {
+        assert!(self.counts().iter().zip(min.counts()).all(|(&a, b)| a >= b), "{what}: {self:?}");
+        for ((name, seen), min) in SUBJECTS.iter().zip(&self.forms).zip(&min.forms) {
+            assert!(seen.meets(min), "{what}: {name}: {seen:?}, at least {min:?}");
+        }
+        assert_eq!(self.forms[0].packed(), [0; 9], "{what}: {} never packs", SUBJECTS[0]);
+    }
+}
+
+/// The bytes of a packed set's encoding of `rows` rows whose subkeys and values take `bytes`
+/// together: the row count (2 bytes), a slot per row (its end and its subkey's length, 2 bytes
+/// each), then the rows.
+pub(super) const fn packed_len(rows: usize, bytes: usize) -> usize {
+    2 + 4 * rows + bytes
+}
+
+/// The outer key number of logical key `key` (of a 4-byte outer key).
+fn outer_of(key: &[u8]) -> u32 {
+    u32::from_be_bytes(key[..4].try_into().expect("4 bytes"))
+}
+
+/// Each outer key `model` holds rows under, with their count and their set's [`packed_len`].
+fn sets(model: &Rows) -> BTreeMap<u32, (usize, usize)> {
+    let mut sets = BTreeMap::<u32, (usize, usize)>::new();
+    for (key, value) in model {
+        let set = sets.entry(outer_of(key)).or_default();
+        set.0 += 1;
+        set.1 += key.len() - 4 + value.len();
+    }
+    sets.into_iter().map(|(k, (rows, bytes))| (k, (rows, packed_len(rows, bytes)))).collect()
+}
+
+/// A step that changed an outer key's rows ([`Forms::change`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Change {
+    /// A put, insert or append that added a row or (`upsert`) gave a present row a new value.
+    Grow { upsert: bool },
+    /// A delete that removed a row.
+    Delete,
+    /// A `delete_prefix` that removed every row.
+    Prefix,
+}
+
+/// One subject's outer keys by form, by the size rules of a packed set (this test's own
+/// statement of them, sharing no code with the engine): a set takes [`packed_len`] bytes; an
+/// absent key is created packed if the table packs and its one row's set is within the limit,
+/// else nested; a packed key is promoted to a nested tree by a step that leaves its set past the
+/// limit, and stays packed otherwise; a nested key stays nested until it is emptied (its last row
+/// deleted, `delete_prefix`, a clear or a drop).
+#[derive(Debug)]
+pub(super) struct Forms {
+    /// The table's options as its `table_stat` reports them (the limit resolved).
+    options: DupOptions,
+    /// The nested outer keys: in the write transaction, and at the last commit.
+    pub(super) nested: BTreeSet<u32>,
+    committed: BTreeSet<u32>,
+    /// The keys the write transaction created packed, and the nested keys it emptied.
+    created: BTreeSet<u32>,
+    emptied: BTreeSet<u32>,
+    pub(super) seen: FormSeen,
+}
+
+impl Forms {
+    /// The forms of an empty table of `options` at `page_size`-byte pages.
+    pub(super) fn new(options: DupOptions, page_size: u32) -> Self {
+        Self {
+            options: options.resolved(page_size).expect("resolves"),
+            nested: BTreeSet::new(),
+            committed: BTreeSet::new(),
+            created: BTreeSet::new(),
+            emptied: BTreeSet::new(),
+            seen: FormSeen::default(),
+        }
+    }
+
+    /// A step `change` took outer key `k` from `was` rows to `rows` rows whose set takes `len`
+    /// bytes.
+    pub(super) fn change(
+        &mut self,
+        k: u32,
+        was: usize,
+        (rows, len): (usize, usize),
+        change: Change,
+    ) {
+        let max = usize::from(self.options.packed_max);
+        let seen = &mut self.seen;
+        if rows == 0 {
+            if self.nested.remove(&k) {
+                self.emptied.insert(k);
+            } else if change == Change::Prefix {
+                seen.packed_prefix_hits += 1;
+            } else {
+                seen.packed_emptied += 1;
+            }
+        } else if was == 0 {
+            if max != 0 && len <= max {
+                seen.packed_creates += 1;
+                seen.at_bound += u32::from(len == max);
+                seen.created_at_bound += u32::from(len == max);
+                seen.recreated_packed += u32::from(self.emptied.contains(&k));
+                self.created.insert(k);
+            } else {
+                self.nested.insert(k);
+            }
+        } else if self.nested.contains(&k) {
+            seen.nested_shrunk_to_one += u32::from(rows == 1 && was > 1);
+        } else if len > max {
+            self.nested.insert(k);
+            if self.created.contains(&k) {
+                seen.promotions_mid_txn += 1;
+            } else {
+                seen.promotions_across_commits += 1;
+            }
+            seen.upsert_promotions += u32::from(change == Change::Grow { upsert: true });
+        } else {
+            seen.at_bound += u32::from(len == max);
+        }
+    }
+
+    /// A write transaction from a committed state whose nested keys are `nested` (the latest
+    /// commit's, or a reopen's, which a crash may have taken back past later commits).
+    pub(super) fn restart(&mut self, nested: &BTreeSet<u32>) {
+        self.nested.clone_from(nested);
+        self.end(true);
+    }
+
+    /// A clear or a drop: every key gone.
+    pub(super) fn empty(&mut self) {
+        self.emptied.append(&mut self.nested);
+    }
+
+    /// The write transaction ended: committed, or aborted (the last commit's forms back).
+    pub(super) fn end(&mut self, commit: bool) {
+        if commit {
+            self.committed.clone_from(&self.nested);
+        } else {
+            self.nested.clone_from(&self.committed);
+        }
+        self.created.clear();
+        self.emptied.clear();
     }
 }
 
@@ -1903,14 +2132,35 @@ impl Coverage {
 /// snapshot.
 struct Reader {
     ro: crate::RoTxn,
-    d: crate::Table,
+    d: [crate::Table; 3],
     p: crate::Table,
     rows: Rows,
 }
 
-/// Oracle 1: dup table `d` (of [`OPTIONS`]) and its plain twin `p`, keyed by the logical key
-/// `k ‖ s`, driven by the same steps in one write transaction at a time, against the model
-/// `work` (the transaction's rows) and `committed`.
+/// `got` (a call on a subject `name`) is `want` (the same call on `p`): one value, or the same
+/// `Err` variant.
+#[track_caller]
+fn agree<T: PartialEq + std::fmt::Debug>(
+    what: &str,
+    name: &str,
+    got: &Result<T>,
+    want: &Result<T>,
+) {
+    match (got, want) {
+        (Ok(x), Ok(y)) => assert_eq!(x, y, "{what}: {name} and p"),
+        (Err(x), Err(y)) => assert_eq!(
+            std::mem::discriminant(x),
+            std::mem::discriminant(y),
+            "{what}: {name} {x:?}, p {y:?}"
+        ),
+        _ => panic!("{what}: {name} {got:?}, p {want:?}"),
+    }
+}
+
+/// Oracle 1: three dup tables, the subjects [`SUBJECTS`] (one per [`Bound`]), and their plain
+/// twin `p`, keyed by the logical key `k ‖ s`, driven by the same steps in one write transaction
+/// at a time, against the model `work` (the transaction's rows) and `committed`, and each
+/// subject's [`Forms`].
 struct Oracle {
     path: PathBuf,
     page_size: u32,
@@ -1919,48 +2169,22 @@ struct Oracle {
     /// The outer keys `0..prefixes`, and the three hot ones that take about 60% of the picks.
     prefixes: u32,
     hot: [u32; 3],
-    /// The longest value inline under every nested key: a value no longer is in `d`'s leaf.
+    /// The longest value inline under every nested key: a value no longer is in a nested leaf.
     inline_max: usize,
     rng: Rng,
     env: Option<Env>,
     txn: Option<crate::RwTxn>,
-    d: crate::Table,
+    d: [crate::Table; 3],
     p: crate::Table,
     work: Rows,
     committed: Rows,
+    forms: [Forms; 3],
     readers: Vec<Reader>,
     ops: u32,
-    /// The tables showed an outer and a nested tree of two levels at a commit since the last
+    /// Every subject showed an outer and a nested tree of two levels at a commit since the last
     /// clear or drop: a clear or drop drawn before that is a stat.
     grown: bool,
     seen: Coverage,
-}
-
-/// The number of outer keys `model` holds rows under (its keys are sorted).
-fn prefix_count(model: &Rows) -> u32 {
-    let mut last: Option<&[u8]> = None;
-    let mut n = 0;
-    for key in model.keys() {
-        if last != Some(&key[..4]) {
-            n += 1;
-            last = Some(&key[..4]);
-        }
-    }
-    n
-}
-
-/// `a` and `b` (the same call on `d` and `p`) both `Ok` with one value, or both the same `Err`
-/// variant; returns `a`.
-#[track_caller]
-fn same<T: PartialEq + std::fmt::Debug>(what: &str, a: Result<T>, b: Result<T>) -> Result<T> {
-    match (&a, &b) {
-        (Ok(x), Ok(y)) => assert_eq!(x, y, "{what}: d and p"),
-        (Err(x), Err(y)) => {
-            assert_eq!(std::mem::discriminant(x), std::mem::discriminant(y), "{what}: {x:?} {y:?}")
-        }
-        _ => panic!("{what}: d {a:?}, p {b:?}"),
-    }
-    a
 }
 
 impl Oracle {
@@ -1969,7 +2193,7 @@ impl Oracle {
         let env =
             Env::open(&path, EnvOptions { page_size, ..EnvOptions::default() }).expect("open");
         let mut txn = env.begin_rw().expect("rw");
-        let d = txn.create_dup_table("d", OPTIONS).expect("d");
+        let d = Self::create(&mut txn);
         let p = txn.create_table("p").expect("p");
         txn.commit().expect("commit");
         let geometry = page::Geometry::new(page_size).expect("geometry");
@@ -1987,6 +2211,7 @@ impl Oracle {
             p,
             work: Rows::new(),
             committed: Rows::new(),
+            forms: Bound::ALL.map(|bound| Forms::new(bound.options(4), page_size)),
             readers: Vec::new(),
             ops: 0,
             grown: false,
@@ -1994,6 +2219,21 @@ impl Oracle {
         };
         oracle.begin();
         (dir, oracle)
+    }
+
+    /// The subjects, created in `txn`.
+    fn create(txn: &mut crate::RwTxn) -> [crate::Table; 3] {
+        let mut bounds = Bound::ALL.into_iter();
+        SUBJECTS.map(|name| {
+            let options = bounds.next().expect("a bound per subject").options(4);
+            txn.create_dup_table(name, options).expect("a subject")
+        })
+    }
+
+    /// The subjects' and `p`'s handles in `txn`.
+    fn open(txn: &impl ReadTxn) -> ([crate::Table; 3], crate::Table) {
+        let d = SUBJECTS.map(|name| txn.open_table(name).expect("open").expect("a subject"));
+        (d, txn.open_table("p").expect("open").expect("p"))
     }
 
     fn env(&self) -> &Env {
@@ -2007,9 +2247,23 @@ impl Oracle {
     /// A new write transaction, the handles resolved in it.
     fn begin(&mut self) {
         let txn = self.env().begin_rw().expect("rw");
-        self.d = txn.open_table("d").expect("open").expect("d");
-        self.p = txn.open_table("p").expect("open").expect("p");
+        (self.d, self.p) = Self::open(&txn);
         self.txn = Some(txn);
+    }
+
+    /// `call` on `p`, then on each subject, whose result must be `p`'s ([`agree`]); returns
+    /// `p`'s.
+    fn all<T: PartialEq + std::fmt::Debug>(
+        &mut self,
+        what: &str,
+        call: impl Fn(&mut crate::RwTxn, &crate::Table) -> Result<T>,
+    ) -> Result<T> {
+        let txn = self.txn.as_mut().expect("a write transaction");
+        let want = call(txn, &self.p);
+        for (name, d) in SUBJECTS.iter().zip(&self.d) {
+            agree(what, name, &call(txn, d), &want);
+        }
+        want
     }
 
     fn prefix(&mut self) -> u32 {
@@ -2037,65 +2291,99 @@ impl Oracle {
         found.map_or(probe, |(key, _)| key.clone())
     }
 
-    /// A value for logical key `key`: 0 to 64 bytes, or in a `large` run about one in ten from
-    /// one byte past `p`'s inline limit to three pages.
+    /// A value for logical key `key`: 0 to 64 bytes; in a `large` run about one in ten from one
+    /// byte past `p`'s inline limit to three pages; else one in 16 the length that makes `key`'s
+    /// row alone a set at the limit of a subject that packs, or one byte past it.
     fn value(&mut self, key: &[u8]) -> Vec<u8> {
         let len = if self.large && self.rng.below(10) == 0 {
             let low =
                 page::Geometry::new(self.page_size).expect("geometry").max_value(key.len()) + 1;
             low + self.rng.below((3 * self.page_size as usize - low + 1) as u64) as usize
+        } else if self.rng.below(16) == 0 {
+            let limit = usize::from(self.forms[1 + self.rng.below(2) as usize].options.packed_max);
+            limit - packed_len(1, key.len() - 4) + self.rng.below(2) as usize
         } else {
             self.rng.below(65) as usize
         };
         super::value(self.rng.next() as u32, self.ops, len)
     }
 
-    /// The checks after every step: the entries of both tables and `d`'s trees against `work`,
-    /// and every 16 steps the rows of both by walks.
+    /// Outer key `k`'s rows in `work`, and their set's [`packed_len`].
+    fn set_of(&self, k: u32) -> (usize, usize) {
+        let (mut rows, mut bytes) = (0, 0);
+        for (key, value) in
+            self.work.range(dup_key(k, &[])..).take_while(|(key, _)| outer_of(key) == k)
+        {
+            rows += 1;
+            bytes += key.len() - 4 + value.len();
+        }
+        (rows, packed_len(rows, bytes))
+    }
+
+    /// Every subject's forms after step `change` took outer key `k` from `was` rows to those
+    /// `work` now holds.
+    fn changed(&mut self, k: u32, was: usize, change: Change) {
+        let now = self.set_of(k);
+        for forms in &mut self.forms {
+            forms.change(k, was, now, change);
+        }
+    }
+
+    /// The checks after every step: the entries of every table and each subject's nested trees
+    /// against `work` and its [`Forms`], and every 16 steps the rows of all by walks.
     fn after_op(&mut self) {
         let txn = self.txn.as_ref().expect("a write transaction");
-        let (sd, sp) =
-            (txn.table_stat(&self.d).expect("stat"), txn.table_stat(&self.p).expect("stat"));
         let n = self.work.len() as u64;
-        assert_eq!((sd.entries, sp.entries), (n, n), "step {}: entries", self.ops);
-        assert_eq!(sd.nested_trees, prefix_count(&self.work), "step {}: nested trees", self.ops);
-        self.seen.outer_height = self.seen.outer_height.max(sd.height);
+        let stat = txn.table_stat(&self.p).expect("stat");
+        assert_eq!(stat.entries, n, "step {}: p's entries", self.ops);
+        for ((name, d), forms) in SUBJECTS.iter().zip(&self.d).zip(&mut self.forms) {
+            let stat = txn.table_stat(d).expect("stat");
+            let (entries, trees) = (stat.entries, stat.nested_trees as usize);
+            let want = (n, forms.nested.len());
+            assert_eq!((entries, trees), want, "step {}: {name}'s entries, trees", self.ops);
+            forms.seen.outer_height = forms.seen.outer_height.max(stat.height);
+        }
         self.ops += 1;
         if self.ops.is_multiple_of(16) {
             self.compare();
         }
     }
 
-    /// The rows of `d` (the overlay walker) and of `p` (both scans) against `work`.
+    /// The rows of each subject (the overlay walker) and of `p` (both scans) against `work`.
     fn compare(&self) {
         let txn = self.txn.as_ref().expect("a write transaction");
         let expected: Vec<_> = self.work.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
-        let walked = txn.dup_rows_for_test(&self.d);
-        assert!(
-            walked == expected,
-            "step {}: d's rows {}, the model {}",
-            self.ops,
-            walked.len(),
-            expected.len()
-        );
+        for (name, d) in SUBJECTS.iter().zip(&self.d) {
+            let walked = txn.dup_rows_for_test(d);
+            assert!(
+                walked == expected,
+                "step {}: {name}'s rows {}, the model {}",
+                self.ops,
+                walked.len(),
+                expected.len()
+            );
+        }
         assert!(super::rows(txn, &self.p) == self.work, "step {}: p's rows", self.ops);
     }
 
+    /// A put: one in four a new value of a present row, so packed sets grow past the limit by
+    /// an upsert too.
     fn put(&mut self) {
-        let key = self.key();
+        let key = if self.rng.below(4) == 0 { self.present() } else { self.key() };
         let value = self.value(&key);
-        let (d, p) = (self.d.clone(), self.p.clone());
-        let txn = self.txn();
-        same("put", txn.put(&d, &key, &value), txn.put(&p, &key, &value)).expect("put");
+        let (k, upsert) = (outer_of(&key), self.work.contains_key(&key));
+        let was = self.set_of(k).0;
+        self.all("put", |txn, t| txn.put(t, &key, &value)).expect("put");
         self.work.insert(key, value);
+        self.changed(k, was, Change::Grow { upsert });
     }
 
     fn insert(&mut self) {
         let key = if self.rng.below(2) == 0 { self.present() } else { self.key() };
         let value = self.value(&key);
-        let (d, p) = (self.d.clone(), self.p.clone());
-        let txn = self.txn();
-        let got = same("insert", txn.insert(&d, &key, &value), txn.insert(&p, &key, &value));
+        let k = outer_of(&key);
+        let was = self.set_of(k).0;
+        let got = self.all("insert", |txn, t| txn.insert(t, &key, &value));
         match self.work.entry(key) {
             std::collections::btree_map::Entry::Occupied(_) => {
                 assert!(matches!(got, Err(Error::KeyExists)), "insert of a present key: {got:?}");
@@ -2104,6 +2392,7 @@ impl Oracle {
             std::collections::btree_map::Entry::Vacant(slot) => {
                 got.expect("insert");
                 slot.insert(value);
+                self.changed(k, was, Change::Grow { upsert: false });
             }
         }
     }
@@ -2114,8 +2403,7 @@ impl Oracle {
         let (key, kind) = match last {
             None => (self.key(), 3),
             Some(last) => {
-                let (k, s) =
-                    (u32::from_be_bytes(last[..4].try_into().expect("4 bytes")), &last[4..]);
+                let (k, s) = (outer_of(&last), &last[4..]);
                 if valid && s.len() < 12 && self.rng.below(2) == 0 {
                     let c = ALPHABET[self.rng.below(ALPHABET.len() as u64) as usize];
                     ([&last[..], &[c]].concat(), 2)
@@ -2132,14 +2420,15 @@ impl Oracle {
             }
         };
         let value = self.value(&key);
-        let (d, p) = (self.d.clone(), self.p.clone());
-        let txn = self.txn();
-        let got = same("append", txn.append(&d, &key, &value), txn.append(&p, &key, &value));
+        let k = outer_of(&key);
+        let was = self.set_of(k).0;
+        let got = self.all("append", |txn, t| txn.append(t, &key, &value));
         let past = self.work.keys().next_back().is_none_or(|last| key > *last);
         assert_eq!(past, kind >= 2, "the generator's kind {kind}");
         if past {
             got.expect("append past the last key");
             self.work.insert(key, value);
+            self.changed(k, was, Change::Grow { upsert: false });
         } else {
             assert!(matches!(got, Err(Error::AppendOutOfOrder)), "append: {got:?}");
         }
@@ -2153,13 +2442,13 @@ impl Oracle {
 
     fn delete(&mut self) {
         let key = if self.rng.below(3) < 2 { self.present() } else { self.key() };
-        let (d, p) = (self.d.clone(), self.p.clone());
-        let txn = self.txn();
-        let found = same("delete", txn.delete(&d, &key), txn.delete(&p, &key)).expect("delete");
+        let k = outer_of(&key);
+        let was = self.set_of(k).0;
+        let found = self.all("delete", |txn, t| txn.delete(t, &key)).expect("delete");
         assert_eq!(found, self.work.remove(&key).is_some(), "delete {key:02x?}");
-        let k = &key[..4];
-        if found && self.work.range(k.to_vec()..).next().is_none_or(|(next, _)| &next[..4] != k) {
-            self.seen.emptied_cells += 1;
+        if found {
+            self.changed(k, was, Change::Delete);
+            self.seen.emptied_cells += u32::from(was == 1);
         }
     }
 
@@ -2195,20 +2484,23 @@ impl Oracle {
                 // often than another).
                 let probe = dup_key(self.rng.below(u64::from(self.prefixes)) as u32, &[]);
                 let found = self.work.range(probe..).next().or_else(|| self.work.iter().next());
-                let key = &found.expect("a row").0[..4];
-                u32::from_be_bytes(key.try_into().expect("4 bytes"))
+                outer_of(&found.expect("a row").0[..])
             }
             _ => self.rng.below(u64::from(self.prefixes + self.prefixes / 8)) as u32,
         };
         let (rows, two_levels) = self.rows_of(k);
-        let (d, p) = (self.d.clone(), self.p.clone());
-        let txn = self.txn();
-        let removed = txn.delete_prefix(&d, &k.to_be_bytes()).expect("delete_prefix");
+        let txn = self.txn.as_mut().expect("a write transaction");
+        let removed = self
+            .d
+            .each_ref()
+            .map(|d| txn.delete_prefix(d, &k.to_be_bytes()).expect("delete_prefix"));
         for key in &rows {
-            assert!(txn.delete(&p, key).expect("delete"), "p's twin of {key:02x?}");
+            assert!(txn.delete(&self.p, key).expect("delete"), "p's twin of {key:02x?}");
         }
-        assert_eq!(removed, remove_prefix(&mut self.work, k), "delete_prefix {k}");
-        if removed > 0 {
+        let want = remove_prefix(&mut self.work, k);
+        assert_eq!(removed, [want; 3], "delete_prefix {k}: {SUBJECTS:?}");
+        if want > 0 {
+            self.changed(k, rows.len(), Change::Prefix);
             self.seen.prefix_hits += 1;
             self.seen.tall_prefix_hits += u32::from(two_levels);
         }
@@ -2225,13 +2517,17 @@ impl Oracle {
         };
         let txn = self.txn.as_ref().expect("a write transaction");
         let want = self.work.get(&key).map(Vec::as_slice);
-        assert_eq!(txn.get(&self.d, &key).expect("get"), want, "d's get {key:02x?}");
+        for (name, d) in SUBJECTS.iter().zip(&self.d) {
+            assert_eq!(txn.get(d, &key).expect("get"), want, "{name}'s get {key:02x?}");
+        }
         assert_eq!(txn.get(&self.p, &key).expect("get"), want, "p's get {key:02x?}");
     }
 
     fn stat(&mut self) {
         let txn = self.txn.as_ref().expect("a write transaction");
-        assert_eq!(txn.table_stat(&self.d).expect("stat").dup, Some(OPTIONS));
+        for ((name, d), forms) in SUBJECTS.iter().zip(&self.d).zip(&self.forms) {
+            assert_eq!(txn.table_stat(d).expect("stat").dup, Some(forms.options), "{name}");
+        }
         assert_eq!(txn.table_stat(&self.p).expect("stat").dup, None);
     }
 
@@ -2242,64 +2538,96 @@ impl Oracle {
             self.txn.take().expect("a write transaction").commit().expect("commit");
             self.committed = self.work.clone();
             self.seen.commits += 1;
-            self.after_commit();
         } else {
             self.txn.take().expect("a write transaction").abort();
             self.work = self.committed.clone();
             self.seen.aborts += 1;
         }
+        for forms in &mut self.forms {
+            forms.end(commit);
+        }
+        if commit {
+            self.after_commit();
+        }
     }
 
-    /// `Env::check` with both tables' entries, the tallest nested tree, and every held reader
-    /// against its snapshot's rows.
+    /// `Env::check` with every table's entries, each subject's cells by its [`Forms`], and every
+    /// held reader against its snapshot's rows.
     fn after_commit(&mut self) {
         let n = self.committed.len() as u64;
         let env = self.env.as_ref().expect("open");
-        let report = check_dup(env, "d");
-        assert_eq!((report.tables["d"].entries, report.tables["p"].entries), (n, n), "check");
-        let snapshot = env.inner().current();
-        let outer = tree(env, "d");
-        let tallest = walk_outer_tree(&*snapshot, &outer)
-            .entries
-            .iter()
-            .map(|(_, cell)| {
-                let root = TreeRoot::decode(cell.as_slice().try_into().expect("32 bytes"));
-                root.expect("a nested root").height
-            })
-            .max()
-            .unwrap_or(0);
-        self.seen.nested_height = self.seen.nested_height.max(tallest);
-        self.grown |= outer.height >= 2 && tallest >= 2;
+        let report = check_subjects(env);
+        assert_eq!(report.tables["p"].entries, n, "check: p");
+        for name in SUBJECTS {
+            assert_eq!(report.tables[name].entries, n, "check: {name}");
+        }
+        self.check_cells();
         for reader in &self.readers {
             self.seen.readers_checked += 1;
             Self::verify(reader, &mut self.rng);
         }
     }
 
-    /// `reader`'s rows by the walker, a sample of gets on both tables and their entries,
-    /// against its snapshot's.
+    /// Each subject's outer cells at the last commit, by its [`Forms`]: a nested root under every
+    /// key they hold nested (the tallest's height into its gate) and under every other a packed
+    /// set of the committed rows (its row count and its encoding's length, by [`packed_len`]).
+    fn check_cells(&mut self) {
+        let env = self.env.as_ref().expect("open");
+        let snapshot = env.inner().current();
+        let sets = sets(&self.committed);
+        let mut grown = true;
+        for (name, forms) in SUBJECTS.iter().zip(&mut self.forms) {
+            let outer = tree(env, name);
+            let walk = if forms.options.packed_max == 0 {
+                walk_outer_tree(&*snapshot, &outer)
+            } else {
+                walk_packing_tree(&*snapshot, &outer)
+            };
+            assert_eq!(walk.entries.len(), sets.len(), "{name}: outer keys");
+            let mut tallest = 0;
+            for ((key, cell), (&k, &(rows, len))) in walk.entries.iter().zip(&sets) {
+                assert_eq!(outer_of(key), k, "{name}: outer keys");
+                if forms.committed.contains(&k) {
+                    let root = TreeRoot::decode(cell.as_slice().try_into().expect("a nested cell"));
+                    tallest = tallest.max(root.expect("a nested root").height);
+                } else {
+                    let n = cell.get(..2).map(|n| usize::from(u16::from_le_bytes([n[0], n[1]])));
+                    assert_eq!((cell.len(), n), (len, Some(rows)), "{name}: key {k}'s packed set");
+                }
+            }
+            forms.seen.nested_height = forms.seen.nested_height.max(tallest);
+            grown &= outer.height >= 2 && tallest >= 2;
+        }
+        self.grown |= grown;
+    }
+
+    /// `reader`'s rows by the walker, a sample of gets on every table and their entries, against
+    /// its snapshot's.
     fn verify(reader: &Reader, rng: &mut Rng) {
         let Reader { ro, d, p, rows } = reader;
         let expected: Vec<_> = rows.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
-        assert!(ro.dup_rows_for_test(d) == expected, "reader {}: rows", ro.txn_id());
         let n = rows.len() as u64;
-        let stats =
-            (ro.table_stat(d).expect("stat").entries, ro.table_stat(p).expect("stat").entries);
-        assert_eq!(stats, (n, n), "reader {}: entries", ro.txn_id());
+        let id = ro.txn_id();
+        for (name, d) in SUBJECTS.iter().zip(d) {
+            assert!(ro.dup_rows_for_test(d) == expected, "reader {id}: {name}'s rows");
+            assert_eq!(ro.table_stat(d).expect("stat").entries, n, "reader {id}: {name}");
+        }
+        assert_eq!(ro.table_stat(p).expect("stat").entries, n, "reader {id}: p");
         for _ in 0..8 {
             let probe = dup_key(rng.below(1 << 10) as u32, &[ALPHABET[rng.below(4) as usize]]);
             let key = rows.range(probe.clone()..).next().map_or(probe, |(k, _)| k.clone());
             let want = rows.get(&key).map(Vec::as_slice);
-            assert_eq!(ro.get(d, &key).expect("get"), want, "reader {}: d", ro.txn_id());
-            assert_eq!(ro.get(p, &key).expect("get"), want, "reader {}: p", ro.txn_id());
+            for (name, d) in SUBJECTS.iter().zip(d) {
+                assert_eq!(ro.get(d, &key).expect("get"), want, "reader {id}: {name}");
+            }
+            assert_eq!(ro.get(p, &key).expect("get"), want, "reader {id}: p");
         }
     }
 
     fn hold(&mut self) {
         if self.readers.len() < 4 {
             let ro = self.env().begin_ro().expect("ro");
-            let d = ro.open_table("d").expect("open").expect("d");
-            let p = ro.open_table("p").expect("open").expect("p");
+            let (d, p) = Self::open(&ro);
             self.readers.push(Reader { ro, d, p, rows: self.committed.clone() });
         }
     }
@@ -2313,7 +2641,7 @@ impl Oracle {
     }
 
     /// Commit or abort, drop the readers, close and reopen; then `Env::check` and the committed
-    /// rows of `d` (walker and gets) and of `p`.
+    /// rows of every subject (walker and gets) and of `p`.
     fn reopen(&mut self) {
         let commit = self.rng.below(2) == 0;
         self.end(commit);
@@ -2323,25 +2651,29 @@ impl Oracle {
         self.env = Some(Env::open(&self.path, options).expect("reopen"));
         self.seen.reopens += 1;
         let env = self.env();
-        let report = check_dup(env, "d");
+        let report = check_subjects(env);
         let n = self.committed.len() as u64;
-        assert_eq!((report.tables["d"].entries, report.tables["p"].entries), (n, n), "reopen");
+        assert_eq!(report.tables["p"].entries, n, "reopen: p");
         let ro = env.begin_ro().expect("ro");
-        let d = ro.open_table("d").expect("open").expect("d");
-        let p = ro.open_table("p").expect("open").expect("p");
-        let get = |key: &[u8]| ro.get(&d, key).map(|v| v.map(<[u8]>::to_vec));
-        assert_rows("reopen", ro.dup_rows_for_test(&d), get, &self.committed);
+        let (d, p) = Self::open(&ro);
+        for (name, d) in SUBJECTS.iter().zip(&d) {
+            assert_eq!(report.tables[*name].entries, n, "reopen: {name}");
+            let get = |key: &[u8]| ro.get(d, key).map(|v| v.map(<[u8]>::to_vec));
+            assert_rows(&format!("reopen: {name}"), ro.dup_rows_for_test(d), get, &self.committed);
+        }
         assert!(super::rows(&ro, &p) == self.committed, "reopen: p's rows");
         drop(ro);
         self.begin();
     }
 
     fn clear(&mut self) {
-        let (d, p) = (self.d.clone(), self.p.clone());
-        let txn = self.txn();
-        txn.clear_table(&d).expect("clear d");
-        txn.clear_table(&p).expect("clear p");
+        let txn = self.txn.as_mut().expect("a write transaction");
+        for d in &self.d {
+            txn.clear_table(d).expect("clear a subject");
+        }
+        txn.clear_table(&self.p).expect("clear p");
         self.work.clear();
+        self.forms.iter_mut().for_each(Forms::empty);
         self.seen.clears += 1;
         self.grown = false;
     }
@@ -2349,11 +2681,14 @@ impl Oracle {
     fn drop_and_create(&mut self) {
         let (d, p) = (self.d.clone(), self.p.clone());
         let txn = self.txn();
-        txn.drop_table(d).expect("drop d");
+        for d in d {
+            txn.drop_table(d).expect("drop a subject");
+        }
         txn.drop_table(p).expect("drop p");
-        self.d = txn.create_dup_table("d", OPTIONS).expect("d");
+        self.d = Self::create(txn);
         self.p = self.txn().create_table("p").expect("p");
         self.work.clear();
+        self.forms.iter_mut().for_each(Forms::empty);
         self.seen.drops += 1;
         self.grown = false;
     }
@@ -2381,12 +2716,24 @@ impl Oracle {
             960..980 => self.hold(),
             980..990 => self.release(),
             990..995 => self.reopen(),
-            995..999 if self.grown => self.clear(),
-            999 if self.grown => self.drop_and_create(),
+            995..998 if self.grown => self.clear(),
+            998..1000 if self.grown => self.drop_and_create(),
             _ => self.stat(),
         }
         self.after_op();
     }
+}
+
+/// `Env::check` of `env`, which must pass, with each subject's figures those of its
+/// `table_stat` ([`assert_dup_figures`]).
+#[track_caller]
+fn check_subjects(env: &Env) -> CheckReport {
+    let report = check(env);
+    let ro = env.begin_ro().expect("ro");
+    for name in SUBJECTS {
+        assert_dup_figures(&report, &ro, name);
+    }
+    report
 }
 
 /// Run `steps` steps of Oracle 1 from `seed` at `page_size` over `prefixes` outer keys, with
@@ -2399,28 +2746,66 @@ fn oracle_run(seed: u64, steps: u32, page_size: u32, large: bool, prefixes: u32)
     }
     oracle.end(true);
     oracle.readers.clear();
-    oracle.seen
+    let mut seen = oracle.seen;
+    seen.forms = oracle.forms.each_ref().map(|forms| forms.seen);
+    seen
 }
 
-/// Oracle 1: a dup table and a plain table keyed by its logical keys (`k ‖ s`) take the same
-/// random puts, inserts (present keys `KeyExists`), appends (past the last logical key under the
-/// last outer key or a new one; refused below the last outer key and under it not past its last
+/// The forms gate of each subject ([`SUBJECTS`]): nested and outer trees of two levels at every
+/// bound; at [`Bound::Small`] (most keys created packed, promoted at the second or third row)
+/// every packed transition, `at_bound` of them at least `at_bound` times; at [`Bound::Default`]
+/// (the cold keys packed, the hot ones promoted) creates, a create at the limit, promotions of
+/// each kind and `delete_prefix` of packed keys.
+fn forms_gate(at_bound: u32) -> [FormSeen; 3] {
+    let trees = FormSeen { nested_height: 2, outer_height: 2, ..FormSeen::default() };
+    [
+        trees,
+        FormSeen {
+            packed_creates: 50,
+            promotions_mid_txn: 20,
+            promotions_across_commits: 10,
+            upsert_promotions: 3,
+            at_bound,
+            created_at_bound: 3,
+            packed_emptied: 5,
+            packed_prefix_hits: 5,
+            nested_shrunk_to_one: 3,
+            recreated_packed: 2,
+            ..trees
+        },
+        FormSeen {
+            packed_creates: 50,
+            promotions_mid_txn: 1,
+            promotions_across_commits: 1,
+            upsert_promotions: 1,
+            created_at_bound: 1,
+            packed_prefix_hits: 3,
+            ..trees
+        },
+    ]
+}
+
+/// Oracle 1: three dup tables, one per [`Bound`] (never packing, a small packed-set limit and the
+/// default one), and a plain table keyed by their logical keys (`k ‖ s`) take the same random
+/// puts, inserts (present keys `KeyExists`), appends (past the last logical key under the last
+/// outer key or a new one; refused below the last outer key and under it not past its last
 /// subkey: `AppendOutOfOrder`), deletes, `delete_prefix` calls (the plain twin deleting the
 /// model's rows of the outer key one by one), gets, stats, commits, aborts, held readers, reopens,
-/// clears and drops, against a model: both answer alike and as the model says; after every step
-/// both hold the model's entry count and `d` its outer keys' trees, every 16 steps and before
-/// each commit the rows of both by walks; after every commit `Env::check` passes and every held
-/// reader reads its snapshot; after every reopen the committed rows read back. Three hot outer
-/// keys grow nested trees of two levels, and enough outer keys an outer tree of two levels.
+/// clears and drops, against a model: all answer alike and as the model says; after every step
+/// each holds the model's entry count and each dup table the nested trees of its [`Forms`] (the
+/// size rules of a packed set, so every promotion, every set left at the limit and no demotion
+/// are the engine's totals); every 16 steps and before each commit the rows of all by walks;
+/// after every commit `Env::check` passes, every dup table's cells are its forms' (a packed set's
+/// row count and length) and every held reader reads its snapshot; after every reopen the
+/// committed rows read back. Three hot outer keys grow nested trees of two levels, and enough
+/// outer keys an outer tree of two levels, in every dup table.
 #[test]
 fn dup_tables_match_a_composite_model() {
     let mut seen = Coverage::default();
     for (seed, large) in [(0xD0B1_0001, false), (0xD0B1_0002, false), (0xD0B1_0003, true)] {
-        seen.add(&oracle_run(seed, 3000, 4096, large, 120));
+        seen.add(&oracle_run(seed, 2000, 4096, large, 120));
     }
     let min = Coverage {
-        nested_height: 2,
-        outer_height: 2,
         emptied_cells: 5,
         prefix_hits: 5,
         tall_prefix_hits: 1,
@@ -2435,8 +2820,9 @@ fn dup_tables_match_a_composite_model() {
         clears: 1,
         drops: 1,
         readers_checked: 10,
+        forms: forms_gate(1),
     };
-    assert!(seen.meets(&min), "{seen:?}");
+    seen.assert_meets(&min, "the runs");
 }
 
 #[test]
@@ -2459,8 +2845,6 @@ fn dup_tables_match_a_composite_model_heavy() {
     // The trees of three levels are out of reach: a nested one takes some ten thousand rows
     // under one outer key at 4 KiB, an outer one some ten thousand outer keys.
     let min = Coverage {
-        nested_height: 2,
-        outer_height: 2,
         emptied_cells: 200,
         prefix_hits: 200,
         tall_prefix_hits: 1,
@@ -2475,8 +2859,15 @@ fn dup_tables_match_a_composite_model_heavy() {
         clears: 1,
         drops: 1,
         readers_checked: 1000,
+        forms: forms_gate(20),
     };
-    for (page_size, run) in runs {
-        assert!(run.meets(&min), "{page_size}: {run:?}");
+    // Each page size's four runs together: a drop needs a grown table at a one-in-a-thousand
+    // draw, and a promotion inside one transaction at the default bound a large value.
+    for page_size in [4096, 16384] {
+        let mut seen = Coverage::default();
+        for (_, run) in runs.iter().filter(|(size, _)| *size == page_size) {
+            seen.add(run);
+        }
+        seen.assert_meets(&min, &format!("{page_size}"));
     }
 }

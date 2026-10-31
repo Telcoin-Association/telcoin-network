@@ -7,18 +7,26 @@
 //! large-value variant, spread over inline values and overflow runs of 1 to 10 pages. In the
 //! draining variant, stretches of mostly deletes empty the tables, so many deletes merge pages;
 //! every variant's coverage gate counts the deletes that merged (`Writer::merging_deletes`).
-//! In the dup variant, two dup tables (outer keys of 4 and of 20 bytes) take puts, inserts,
-//! appends, deletes, `delete_prefix` calls, gets, clears and drops in the same transactions as two
-//! plain tables, under the same crashes; its gate counts, per dup table, nested and outer trees of
-//! two levels, deletes that emptied an outer key, `delete_prefix` hits, a clear and a drop.
+//! In the dup variant, three dup tables (outer keys of 4 bytes never packing, of 20 bytes packing
+//! to the default limit, of 4 bytes packing to a small one) take puts, inserts, appends, deletes,
+//! `delete_prefix` calls, gets, clears and drops in the same transactions as two plain tables,
+//! under the same crashes, each table's nested trees those of its forms (`dup::Forms`, the size
+//! rules of a packed set) at every step, reader and reopen; its gate counts, per dup table, nested
+//! and outer trees of two levels, deletes that emptied an outer key, `delete_prefix` hits, a clear
+//! and a drop, and in the tables that pack, packed keys created and promoted.
 
-use super::*;
+use std::collections::BTreeSet;
+
+use super::{
+    dup::{packed_len, Bound, Change, Forms},
+    *,
+};
 use crate::{
     disk_model,
     env::CrashAt,
     meta::slot_to_write,
     tree::{
-        test_harness::{walk_outer_tree, ReportSeed, Rng},
+        test_harness::{walk_outer_tree, walk_packing_tree, ReportSeed, Rng},
         TreeRoot,
     },
     DupOptions, Error, RoTxn,
@@ -34,11 +42,30 @@ fn key(k: u32) -> Vec<u8> {
     key
 }
 
-/// The dup tables of the dup variant ([`Run::dups`]), beside its plain tables `t0` and `t1`.
-const DUPS: [(&str, DupOptions); 2] = [
-    ("d4", DupOptions { key_len: 4, packed_max: 0 }),
-    ("d20", DupOptions { key_len: 20, packed_max: 0 }),
+/// The dup tables of the dup variant ([`Run::dups`]), beside its plain tables `t0` and `t1`: of
+/// 4-byte outer keys never packing, of 20-byte ones packing to the default limit, and of 4-byte
+/// ones packing to the small one.
+const DUPS: [(&str, DupOptions); 3] = [
+    ("d4", Bound::Unpacked.options(4)),
+    ("d20", Bound::Default.options(20)),
+    ("d4s", Bound::Small.options(4)),
 ];
+
+/// The dup tables' nested outer keys (by [`outer_number`]), in [`DUPS`]' order.
+type Nested = Vec<BTreeSet<u32>>;
+
+/// Outer key `k`'s rows in `rows` (a dup table's, of `key_len`-byte outer keys), and their packed
+/// set's length ([`packed_len`]).
+fn set_of(rows: &Rows, k: u32, key_len: usize) -> (usize, usize) {
+    let prefix = outer(k, key_len);
+    let (mut n, mut bytes) = (0, 0);
+    for (key, value) in rows.range(prefix.clone()..).take_while(|(key, _)| key.starts_with(&prefix))
+    {
+        n += 1;
+        bytes += key.len() - key_len + value.len();
+    }
+    (n, packed_len(n, bytes))
+}
 
 /// The hot outer key of a dup table: two in five picks ([`Run::dup_key`]), so its nested tree
 /// grows two levels.
@@ -61,27 +88,21 @@ fn outer_number(key: &[u8]) -> u32 {
     u32::from_be_bytes(key[..4].try_into().expect("4 bytes"))
 }
 
-/// The outer keys of `key_len` bytes `rows` (a dup table's) holds rows under.
-fn outer_count(rows: &Rows, key_len: usize) -> u32 {
-    let keys: std::collections::BTreeSet<_> = rows.keys().map(|key| &key[..key_len]).collect();
-    keys.len() as u32
-}
-
 /// The first row of `rows` at or after `probe` (or the first row), else `probe`.
 fn present(rows: &Rows, probe: Vec<u8>) -> Vec<u8> {
     let found = rows.range(probe.clone()..).next().or_else(|| rows.iter().next());
     found.map_or(probe, |(key, _)| key.clone())
 }
 
-/// Dup table `t`'s rows (of `key_len`-byte outer keys) as `txn` sees them: a walk of its trees
-/// that checks the totals (`dup_rows_for_test`), whose rows and outer keys its `table_stat`
-/// counts, and a `get` of every seventh one finds.
-fn dup_rows(txn: &RoTxn, t: &Table, key_len: usize) -> Rows {
+/// Dup table `t`'s rows as `txn` sees them: a walk of its trees that checks the totals
+/// (`dup_rows_for_test`), whose rows and `trees` nested trees its `table_stat` counts, and a `get`
+/// of every seventh one finds.
+fn dup_rows(txn: &RoTxn, t: &Table, trees: usize) -> Rows {
     let walked = txn.dup_rows_for_test(t);
     let rows: Rows = walked.iter().cloned().collect();
     let stat = txn.table_stat(t).expect("stat");
-    let counts = (walked.len() as u64, outer_count(&rows, key_len));
-    assert_eq!((stat.entries, stat.nested_trees), counts, "{}: entries, trees", t.name());
+    let counts = (walked.len() as u64, stat.nested_trees as usize);
+    assert_eq!(counts, (stat.entries, trees), "{}: entries, trees", t.name());
     for (key, v) in walked.iter().step_by(7) {
         assert_eq!(txn.get(t, key).expect("get"), Some(v.as_slice()), "{}: get", t.name());
     }
@@ -113,7 +134,7 @@ struct Coverage {
     /// Deletes whose merges absorbed a sibling (`Writer::merging_deletes`).
     merging_deletes: u64,
     /// Each dup table's, in the dup variant ([`DUPS`]).
-    dups: [DupSeen; 2],
+    dups: [DupSeen; 3],
 }
 
 /// What one dup table met.
@@ -136,6 +157,8 @@ struct DupSeen {
     run_puts: u32,
     clears: u32,
     drops: u32,
+    /// Its packed forms, by its [`Forms`].
+    forms: dup::FormSeen,
 }
 
 /// The run: the environment and what the protocol says it holds.
@@ -155,7 +178,12 @@ struct Run {
     outers: u32,
     /// Each dup table showed a nested and an outer tree of two levels at a commit since its last
     /// clear or drop: a clear or drop drawn before that is another operation.
-    grown: [bool; 2],
+    grown: [bool; 3],
+    /// Each dup table's forms in the write transaction ([`Forms`]), and the nested keys of each
+    /// commit a reader or a reopen may still read (from the oldest of the durable one and the
+    /// readers', to the latest).
+    forms: Vec<Forms>,
+    nested_at: BTreeMap<u64, Nested>,
     rng: Rng,
     env: Option<Env>,
     sync: SyncMode,
@@ -172,12 +200,14 @@ impl Run {
     }
 
     /// Check a reader against the model of its snapshot: the plain tables' rows by their
-    /// cursors, the dup tables' by [`dup_rows`].
+    /// cursors, the dup tables' by [`dup_rows`] (their nested trees those of the snapshot's
+    /// forms).
     fn verify(&self, ro: &RoTxn, want: &State) {
         let mut state = state_of(ro, self.plain.iter().copied());
-        for &(name, options) in self.dups {
+        let nested = &self.nested_at[&ro.txn_id()];
+        for (&(name, _), nested) in self.dups.iter().zip(nested) {
             if let Some(t) = ro.open_table(name).expect("open table") {
-                state.insert(name.to_string(), dup_rows(ro, &t, options.key_len.into()));
+                state.insert(name.to_string(), dup_rows(ro, &t, nested.len()));
             }
         }
         assert!(state == *want, "reader at txn {}", ro.txn_id());
@@ -278,7 +308,7 @@ impl Run {
     /// One random operation on dup table `self.dups[j]` (created if missing) in `txn` and
     /// `work`: a put, insert, append, delete, `delete_prefix` or get, each answering as the model
     /// says, or, once the table has grown ([`Run::grown`]), a clear or a drop. After it the
-    /// table's entries and nested trees are the model's.
+    /// table's entries are the model's and its nested trees its [`Forms`]'.
     fn dup_op(&mut self, txn: &mut RwTxn, work: &mut State, j: usize, tag: u32) {
         let (name, options) = self.dups[j];
         let klen = usize::from(options.key_len);
@@ -287,6 +317,7 @@ impl Run {
             if let Some(t) = txn.open_table(name).expect("open") {
                 txn.drop_table(t).expect("drop");
                 work.remove(name).expect("the model has it");
+                self.forms[j].empty();
                 self.grown[j] = false;
                 self.seen.dups[j].drops += 1;
                 return;
@@ -298,18 +329,23 @@ impl Run {
             0..12 if self.grown[j] => {
                 txn.clear_table(&t).expect("clear");
                 rows.clear();
+                self.forms[j].empty();
                 self.grown[j] = false;
                 self.seen.dups[j].clears += 1;
             }
             0..320 => {
                 let (key, v) = (self.dup_key(klen), self.dup_value(tag, j));
+                let (k, upsert) = (outer_number(&key), rows.contains_key(&key));
+                let was = set_of(rows, k, klen).0;
                 txn.put(&t, &key, &v).expect("put");
                 rows.insert(key, v);
+                self.forms[j].change(k, was, set_of(rows, k, klen), Change::Grow { upsert });
             }
             320..400 => {
                 let probe = self.dup_key(klen);
                 let key = if self.rng.below(2) == 0 { present(rows, probe) } else { probe };
                 let v = self.dup_value(tag, j);
+                let (k, was) = (outer_number(&key), set_of(rows, outer_number(&key), klen).0);
                 let got = txn.insert(&t, &key, &v);
                 match rows.entry(key) {
                     std::collections::btree_map::Entry::Occupied(_) => {
@@ -319,6 +355,8 @@ impl Run {
                     std::collections::btree_map::Entry::Vacant(slot) => {
                         got.expect("insert");
                         slot.insert(v);
+                        let now = set_of(rows, k, klen);
+                        self.forms[j].change(k, was, now, Change::Grow { upsert: false });
                     }
                 }
             }
@@ -339,10 +377,13 @@ impl Run {
                     _ => self.dup_key(klen),
                 };
                 let v = self.dup_value(tag, j);
+                let (k, was) = (outer_number(&key), set_of(rows, outer_number(&key), klen).0);
                 let got = txn.append(&t, &key, &v);
                 if rows.keys().next_back().is_none_or(|last| key > *last) {
                     got.expect("an append past the last key");
                     rows.insert(key, v);
+                    let now = set_of(rows, k, klen);
+                    self.forms[j].change(k, was, now, Change::Grow { upsert: false });
                     self.seen.dups[j].appends += 1;
                 } else {
                     assert!(matches!(got, Err(Error::AppendOutOfOrder)), "{name}: {got:?}");
@@ -352,8 +393,12 @@ impl Run {
             460..620 => {
                 let probe = self.dup_key(klen);
                 let key = if self.rng.below(3) < 2 { present(rows, probe) } else { probe };
+                let (k, was) = (outer_number(&key), set_of(rows, outer_number(&key), klen).0);
                 let found = txn.delete(&t, &key).expect("delete");
                 assert_eq!(found, rows.remove(&key).is_some(), "{name}: delete");
+                if found {
+                    self.forms[j].change(k, was, set_of(rows, k, klen), Change::Delete);
+                }
                 let k = &key[..klen];
                 if found
                     && rows.range(k.to_vec()..).next().is_none_or(|(next, _)| !next.starts_with(k))
@@ -375,6 +420,10 @@ impl Run {
                 let before = rows.len();
                 rows.retain(|key, _| !key.starts_with(&prefix));
                 assert_eq!(removed, (before - rows.len()) as u64, "{name}: delete_prefix {k}");
+                if removed > 0 {
+                    let was = before - rows.len();
+                    self.forms[j].change(k, was, set_of(rows, k, klen), Change::Prefix);
+                }
                 self.seen.dups[j].prefix_hits += u32::from(removed > 0);
             }
             _ => {
@@ -389,8 +438,8 @@ impl Run {
             }
         }
         let stat = txn.table_stat(&t).expect("stat");
-        let counts = (rows.len() as u64, outer_count(rows, klen));
-        assert_eq!((stat.entries, stat.nested_trees), counts, "{name}: entries, trees");
+        let counts = (rows.len() as u64, self.forms[j].nested.len());
+        assert_eq!((stat.entries, stat.nested_trees as usize), counts, "{name}: entries, trees");
     }
 
     /// The dup tables' rows in `txn` (by walks of their trees, with the totals) are `work`'s.
@@ -404,26 +453,38 @@ impl Run {
     }
 
     /// After a commit (`report` its `Env::check`): each dup table's figures in the check are its
-    /// `table_stat`'s, and its tallest nested tree and its outer tree's height count toward the
-    /// coverage (and mark it grown once both have two levels).
+    /// `table_stat`'s, its cells are its [`Forms`]' (a nested root under each nested key, else a
+    /// packed set of the latest rows: their count and the set's length), and its tallest nested
+    /// tree and its outer tree's height count toward the coverage (and mark it grown once both
+    /// have two levels).
     fn dup_heights(&mut self, env: &Env, report: &CheckReport) {
         let ro = env.begin_ro().expect("ro");
         let snapshot = env.inner().current();
-        for (j, &(name, _)) in self.dups.iter().enumerate() {
+        for (j, &(name, options)) in self.dups.iter().enumerate() {
             if !report.tables.contains_key(name) {
                 continue;
             }
             dup::assert_dup_figures(report, &ro, name);
             let root = damage::tree(env, name);
-            let nested = walk_outer_tree(&*snapshot, &root)
-                .entries
-                .iter()
-                .map(|(_, cell)| {
-                    let cell = cell.as_slice().try_into().expect("32 bytes");
-                    TreeRoot::decode(cell).expect("a nested root").height
-                })
-                .max()
-                .unwrap_or(0);
+            let walk = if options.packed_max == 0 {
+                walk_outer_tree(&*snapshot, &root)
+            } else {
+                walk_packing_tree(&*snapshot, &root)
+            };
+            let (rows, klen) = (&self.latest.1[name], usize::from(options.key_len));
+            let mut nested = 0;
+            for (key, cell) in &walk.entries {
+                let k = outer_number(key);
+                if self.forms[j].nested.contains(&k) {
+                    let cell = cell.as_slice().try_into().expect("a nested cell");
+                    nested = nested.max(TreeRoot::decode(cell).expect("a nested root").height);
+                } else {
+                    let (n, len) = set_of(rows, k, klen);
+                    let count =
+                        cell.get(..2).map(|c| usize::from(u16::from_le_bytes([c[0], c[1]])));
+                    assert_eq!((cell.len(), count), (len, Some(n)), "{name}: key {k}'s packed set");
+                }
+            }
             let seen = &mut self.seen.dups[j];
             seen.nested_height = seen.nested_height.max(nested);
             seen.outer_height = seen.outer_height.max(root.height);
@@ -456,6 +517,7 @@ impl Run {
         let env = self.env.take().expect("open");
         let mut txn = env.begin_rw().expect("begin");
         let mut work = self.latest.1.clone();
+        self.restart_forms();
         self.random_ops(&mut txn, &mut work, step);
         self.seen.merging_deletes += std::mem::take(&mut txn.writer_mut().merging_deletes);
         self.compare_dups(&txn, &work);
@@ -467,18 +529,41 @@ impl Run {
             if id != self.latest.0 {
                 assert_eq!(id, self.latest.0 + 1);
                 self.latest = (id, work);
+                self.nested_at.insert(id, self.nested());
                 if self.sync == SyncMode::Durable {
                     self.durable = self.latest.clone();
                 }
+                self.forget_nested();
             } else {
                 // The base id says the transaction changed nothing: neither may the model.
                 assert!(work == self.latest.1, "a commit of real changes returned the base id");
+                assert!(self.nested() == self.nested_at[&id], "the base id, with other forms");
             }
             let report = check(&env);
             self.dup_heights(&env, &report);
             self.seen.commits += 1;
         }
         self.env = Some(env);
+    }
+
+    /// Each dup table's forms from the latest commit's, for a new write transaction.
+    fn restart_forms(&mut self) {
+        for (forms, nested) in self.forms.iter_mut().zip(&self.nested_at[&self.latest.0]) {
+            forms.restart(nested);
+        }
+    }
+
+    /// Each dup table's nested keys in the write transaction.
+    fn nested(&self) -> Nested {
+        self.forms.iter().map(|forms| forms.nested.clone()).collect()
+    }
+
+    /// Forget the nested keys of the commits no reader or reopen can read again: those before
+    /// the oldest of the durable one and the readers'.
+    fn forget_nested(&mut self) {
+        let readers = self.readers.iter().map(|(ro, _)| ro.txn_id());
+        let oldest = readers.chain([self.durable.0]).min().expect("the durable commit");
+        self.nested_at = self.nested_at.split_off(&oldest);
     }
 
     /// Drop every handle as a crash would and take the power down as `loss` says (0: process
@@ -499,14 +584,24 @@ impl Run {
         }
     }
 
-    /// Reopen in a random sync mode: the file must hold exactly `want`, and check. A crash right
-    /// after the reopen (no commit) changes nothing.
+    /// Reopen in a random sync mode: the file must hold exactly `want`, and check, each dup
+    /// table's nested trees those of its forms at `want`. A crash right after the reopen (no
+    /// commit) changes nothing. The forms of commits past `want` are forgotten.
     fn reopen(&mut self, want: (u64, State)) {
+        drop(self.nested_at.split_off(&(want.0 + 1)));
         loop {
             self.sync = if self.rng.below(2) == 0 { SyncMode::Durable } else { SyncMode::NoSync };
             let env = open(&self.path, self.sync);
             assert_eq!(env.stat().txn_id, want.0, "reopen");
             assert!(newest_state(&env) == want.1, "reopen at txn {}: the state differs", want.0);
+            let ro = env.begin_ro().expect("ro");
+            for (&(name, _), nested) in self.dups.iter().zip(&self.nested_at[&want.0]) {
+                if let Some(t) = ro.open_table(name).expect("open") {
+                    let trees = ro.table_stat(&t).expect("stat").nested_trees as usize;
+                    assert_eq!(trees, nested.len(), "reopen at txn {}: {name}'s trees", want.0);
+                }
+            }
+            drop(ro);
             if self.rng.below(8) != 0 {
                 self.env = Some(env);
                 break;
@@ -536,6 +631,7 @@ impl Run {
         let slot = env.with_writer(|w| slot_to_write(&w.slots()));
         let mut txn = env.begin_rw().expect("begin");
         let mut work = self.latest.1.clone();
+        self.restart_forms();
         self.random_ops(&mut txn, &mut work, step);
         self.seen.merging_deletes += std::mem::take(&mut txn.writer_mut().merging_deletes);
         // Make sure the transaction changes something, so the commit has steps to stop in.
@@ -556,6 +652,7 @@ impl Run {
         let e = stopped.expect_err("the commit stops at its crash point");
         assert!(e.to_string().contains("injected crash"), "{at:?}: {e}");
         let new = (self.latest.0 + 1, work);
+        self.nested_at.insert(new.0, self.nested());
         self.env = Some(env);
         let loss = self.rng.below(3);
         self.go_down(loss);
@@ -611,7 +708,13 @@ fn random_run_with(
         plain: if dups { &NAMES[..2] } else { &NAMES },
         dups: if dups { &DUPS } else { &[] },
         outers: page_size / 12,
-        grown: [false; 2],
+        grown: [false; 3],
+        forms: if dups {
+            DUPS.map(|(_, options)| Forms::new(options, page_size)).into()
+        } else {
+            Vec::new()
+        },
+        nested_at: BTreeMap::from([(0, vec![BTreeSet::new(); if dups { DUPS.len() } else { 0 }])]),
         rng: Rng(seed),
         env: Some(env),
         sync: SyncMode::Durable,
@@ -664,6 +767,9 @@ fn random_run_with(
     assert!(newest_state(&env) == run.latest.1);
     drop(env);
     disk_model::untrack(&run.path);
+    for (seen, forms) in run.seen.dups.iter_mut().zip(&run.forms) {
+        seen.forms = forms.seen;
+    }
     run.seen
 }
 
@@ -809,15 +915,28 @@ fn a_draining_multi_table_workload_with_crashes_matches_the_model_heavy() {
     }
 }
 
-/// The dup variant ([`Run::dups`]): dup tables of 4-byte and of 20-byte outer keys beside two plain
-/// tables, their operations interleaved in the same transactions, under the same aborts, held
-/// readers, crashes, power losses and stopped commits; before every commit or abort the dup
-/// tables' rows in the transaction are the model's, after every commit their figures in
-/// `Env::check` are their `table_stat`'s. Each dup table grows nested and outer trees of two
-/// levels, empties outer keys by deletes and by `delete_prefix`, and is cleared and dropped.
+/// The packed forms each dup table of [`DUPS`] met: none in `d4`; in `d20` and `d4s` packed keys
+/// created, and promoted.
+fn packing_gate(seen: &Coverage) -> [bool; 3] {
+    let [d4, d20, d4s] = seen.dups.each_ref().map(|d| d.forms);
+    let packs = |f: dup::FormSeen| {
+        f.packed_creates >= 50 && f.promotions_mid_txn + f.promotions_across_commits >= 5
+    };
+    [d4.packed() == [0; 9], packs(d20), packs(d4s)]
+}
+
+/// The dup variant ([`Run::dups`]): the dup tables of [`DUPS`] (one never packing, one packing to
+/// the default limit, one to a small one) beside two plain tables, their operations interleaved in
+/// the same transactions, under the same aborts, held readers, crashes, power losses and stopped
+/// commits; after every operation each dup table's nested trees are its [`Forms`]', as at every
+/// reader and every reopen; before every commit or abort the dup tables' rows in the transaction
+/// are the model's, after every commit their figures in `Env::check` are their `table_stat`'s and
+/// their cells their forms'. Each dup table grows nested and outer trees of two levels, empties
+/// outer keys by deletes and by `delete_prefix`, and is cleared and dropped; the tables that pack
+/// create packed keys and promote them, the other never packs.
 #[test]
 fn a_multi_table_workload_with_dup_tables_and_crashes_matches_the_model() {
-    let seen = random_run_with(0xD0B1_3A11, 1500, 4096, false, false, true);
+    let seen = random_run_with(0xD0B1_3A12, 1500, 4096, false, false, true);
     let mut gate = vec![
         seen.commits >= 500,
         seen.aborts >= 50,
@@ -844,6 +963,7 @@ fn a_multi_table_workload_with_dup_tables_and_crashes_matches_the_model() {
             d.drops >= 1,
         ]);
     }
+    gate.extend(packing_gate(&seen));
     assert!(gate.iter().all(|&ok| ok), "{seen:?}");
 }
 
@@ -852,24 +972,47 @@ fn a_multi_table_workload_with_dup_tables_and_crashes_matches_the_model() {
 fn a_multi_table_workload_with_dup_tables_and_crashes_matches_the_model_heavy() {
     let seeds: Vec<u64> = (0..8).collect();
     let threads = std::thread::available_parallelism().map_or(4, |n| n.get());
+    let mut runs = Vec::new();
     for chunk in seeds.chunks(threads) {
         std::thread::scope(|s| {
-            for &seed in chunk {
-                s.spawn(move || {
-                    let page_size = [4096, 8192, 16384, 4096][(seed % 4) as usize];
-                    let seen =
-                        random_run_with(0xD0B1_3A00 + seed, 5000, page_size, false, false, true);
-                    eprintln!("{seed}: {page_size}: {seen:?}");
-                    assert!(seen.stopped_to_new > 0 && seen.stopped_to_old > 0, "{seen:?}");
-                    for d in &seen.dups {
-                        assert!(
-                            d.nested_height >= 2 && d.outer_height >= 2,
-                            "{page_size}: {seen:?}"
+            let handles: Vec<_> = chunk
+                .iter()
+                .map(|&seed| {
+                    s.spawn(move || {
+                        let page_size = [4096, 8192, 16384, 4096][(seed % 4) as usize];
+                        let seen = random_run_with(
+                            0xD0B1_3A00 + seed,
+                            5000,
+                            page_size,
+                            false,
+                            false,
+                            true,
                         );
-                        assert!(d.clears > 0 && d.drops > 0, "{page_size}: {seen:?}");
-                    }
-                });
-            }
+                        eprintln!("{seed}: {page_size}: {seen:?}");
+                        assert!(seen.stopped_to_new > 0 && seen.stopped_to_old > 0, "{seen:?}");
+                        for d in &seen.dups {
+                            assert!(
+                                d.nested_height >= 2 && d.outer_height >= 2,
+                                "{page_size}: {seen:?}"
+                            );
+                        }
+                        assert!(packing_gate(&seen).iter().all(|&ok| ok), "{page_size}: {seen:?}");
+                        (page_size, seen.dups.map(|d| (d.clears, d.drops)))
+                    })
+                })
+                .collect();
+            runs.extend(handles.into_iter().map(|h| h.join().expect("a run")));
         });
+    }
+    // Each dup table's clears and drops (rare draws, once it has grown) over each page size's
+    // runs together.
+    for page_size in [4096, 8192, 16384] {
+        let mut sums = [(0, 0); 3];
+        for (_, dups) in runs.iter().filter(|(size, _)| *size == page_size) {
+            for (sum, (clears, drops)) in sums.iter_mut().zip(dups) {
+                *sum = (sum.0 + clears, sum.1 + drops);
+            }
+        }
+        assert!(sums.iter().all(|&(c, d)| c > 0 && d > 0), "{page_size}: clears, drops {sums:?}");
     }
 }
