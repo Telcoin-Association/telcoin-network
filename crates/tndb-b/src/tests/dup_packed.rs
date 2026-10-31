@@ -15,10 +15,11 @@ use super::{
     open, temp,
 };
 use crate::{
+    catalog,
     env::SyncMode,
     packed,
     page::{self, Find, Search, Val},
-    tree::PageRead as _,
+    tree::{test_harness::Rng, PageRead as _},
     CheckReport, DupOptions, Env, EnvOptions, Error, ReadTxn, RoTxn, RwTxn, Table,
 };
 
@@ -867,4 +868,222 @@ fn check_counts_packed_sets_and_refuses_their_damage() {
         assert!(matches!(&result, Err(Error::Corrupt(m)) if named(m)), "{case}: {result:?}");
         assert!(env.failure().is_some(), "{case}: latched");
     }
+}
+
+/// One state shape of [`packed_sets_file_size_by_bound`]: the outer key's width, the subkey's
+/// width and the values' lengths.
+struct SizeShape {
+    k: u16,
+    s: usize,
+    v: std::ops::RangeInclusive<usize>,
+}
+
+/// How [`packed_sets_file_size_by_bound`] stores a state: a plain table keyed `k ‖ s`, or a dup
+/// table that never packs, packs at half the longest inline value of its outer key, or packs at
+/// [`DupOptions::PACKED_DEFAULT`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SizeForm {
+    Composite,
+    Unpacked,
+    Half,
+    Default,
+}
+
+/// One measured state: the table's pages by tree and kind (branch, leaf, overflow) after the last
+/// commit, and the file's pages.
+struct Size {
+    packed_max: u16,
+    nested_trees: u32,
+    outer: [u32; 3],
+    nested: [u32; 3],
+    page_count: u32,
+    free_pages: u64,
+}
+
+impl Size {
+    /// The table's pages: its outer (or only) tree's and its nested trees'.
+    fn table(&self) -> u64 {
+        self.outer.iter().chain(&self.nested).map(|&p| u64::from(p)).sum()
+    }
+
+    /// The file's pages in use: every page but the free list's.
+    fn used(&self) -> u64 {
+        u64::from(self.page_count) - self.free_pages
+    }
+}
+
+/// `len` bytes from `rng`.
+fn noise(rng: &mut Rng, len: usize) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(len + 8);
+    while bytes.len() < len {
+        bytes.extend_from_slice(&rng.next().to_le_bytes());
+    }
+    bytes.truncate(len);
+    bytes
+}
+
+/// The rows `k ‖ s -> v` of `n` contracts of `shape`: each a random outer key holding `m(rng)`
+/// rows of random subkeys and values of a random length in `shape.v`.
+fn contracts(
+    shape: &SizeShape,
+    n: usize,
+    rng: &mut Rng,
+    mut m: impl FnMut(&mut Rng) -> usize,
+) -> Vec<(Vec<u8>, Vec<u8>)> {
+    let (lo, hi) = (*shape.v.start(), *shape.v.end());
+    let mut rows = Vec::new();
+    for _ in 0..n {
+        let k = noise(rng, usize::from(shape.k));
+        for _ in 0..m(rng) {
+            let key = [k.clone(), noise(rng, shape.s)].concat();
+            let len = lo + rng.below((hi - lo + 1) as u64) as usize;
+            rows.push((key, noise(rng, len)));
+        }
+    }
+    rows
+}
+
+/// `rows` written in their order (by `append` if `append`, else by `put`) to a fresh file of 4
+/// KiB pages holding one table of `form`, with a durable commit every 10,000 rows (a page a
+/// commit frees is reused by the next); the state after the last commit, checked.
+fn measure(shape: &SizeShape, form: SizeForm, rows: &[(Vec<u8>, Vec<u8>)], append: bool) -> Size {
+    let (_dir, path) = temp("tndb_b_dup_packed_size");
+    let env_options =
+        EnvOptions { page_size: 4096, sync: SyncMode::Durable, ..EnvOptions::default() };
+    let env = Env::open(&path, env_options).expect("open");
+    let most = DupOptions::packed(shape.k).resolved(4096).expect("resolved").packed_max;
+    let options = |packed_max| DupOptions { key_len: shape.k, packed_max };
+    let mut txn = env.begin_rw().expect("rw");
+    let t = match form {
+        SizeForm::Composite => txn.create_table("t"),
+        SizeForm::Unpacked => txn.create_dup_table("t", options(0)),
+        SizeForm::Half => txn.create_dup_table("t", options(most / 2)),
+        SizeForm::Default => txn.create_dup_table("t", DupOptions::packed(shape.k)),
+    }
+    .expect("create");
+    txn.commit().expect("commit");
+    for chunk in rows.chunks(10_000) {
+        let mut txn = env.begin_rw().expect("rw");
+        for (key, value) in chunk {
+            if append { txn.append(&t, key, value) } else { txn.put(&t, key, value) }
+                .expect("write");
+        }
+        txn.commit().expect("commit");
+    }
+    let ro = env.begin_ro().expect("ro");
+    let stat = ro.table_stat(&t).expect("stat");
+    assert_eq!(stat.entries, rows.len() as u64, "{form:?}: every row (no key repeats)");
+    drop(ro);
+    let report = check(&env);
+    let snapshot = env.inner().current();
+    let record = catalog::get(&*snapshot, &snapshot.meta.catalog, "t").expect("get").expect("t");
+    let root = record.root;
+    let dup = record.dup.unwrap_or_default();
+    let size = Size {
+        packed_max: dup.packed_max,
+        nested_trees: dup.nested_trees,
+        outer: [root.branch_pages, root.leaf_pages, root.overflow_pages],
+        nested: [dup.nested_branch_pages, dup.nested_leaf_pages, dup.nested_overflow_pages],
+        page_count: snapshot.meta.page_count,
+        free_pages: env.free_pages().expect("free pages"),
+    };
+    assert_eq!(report.tables["t"].pages, size.table(), "{form:?}: the walk's pages");
+    assert!(env.failure().is_none(), "no latch");
+    size
+}
+
+/// File size by packed-set bound: a state of many small contracts, each an outer key with a few
+/// rows, stored as a composite plain table, a dup table that never packs, and dup tables packing at
+/// half the longest inline value of the outer key and at the default (that value). Three shapes
+/// (PlainStorageState's widths and short values, HashedStorages', StoragesTrie's longer values),
+/// 20,000 contracts of 1 to 20 rows, written by random puts and by ascending appends; then, for the
+/// first shape, 5,000 contracts of a fixed row count at the counts where a bound changes the form.
+/// Prints each state's pages by tree and kind, and the file's; guards, at random order for the
+/// first shape, that the default stays within 1.2x composite and that never packing costs at least
+/// 2.5x.
+#[test]
+#[ignore = "measurement: run with --release --nocapture"]
+fn packed_sets_file_size_by_bound() {
+    const FORMS: [SizeForm; 4] =
+        [SizeForm::Composite, SizeForm::Unpacked, SizeForm::Half, SizeForm::Default];
+    let shapes = [
+        SizeShape { k: 20, s: 32, v: 1..=32 },
+        SizeShape { k: 32, s: 32, v: 1..=32 },
+        SizeShape { k: 32, s: 65, v: 60..=140 },
+    ];
+    let began = std::time::Instant::now();
+    let mut runs = Vec::new();
+    for (i, shape) in shapes.iter().enumerate() {
+        runs.push((
+            i,
+            None,
+            20_000,
+            contracts(shape, 20_000, &mut Rng(0x51e_0001 + i as u64), |r| 1 + r.below(20) as usize),
+        ));
+    }
+    for m in [1, 8, 9, 17, 18, 20] {
+        runs.push((
+            0,
+            Some(m),
+            5_000,
+            contracts(&shapes[0], 5_000, &mut Rng(0x51e_1000 + m as u64), |_| m),
+        ));
+    }
+    // A blank line first: the harness prints the test's name on the line this output begins.
+    println!();
+    println!(
+        "| shape (K, s, v) | m | order | form | packed_max | nested trees | outer b/l/o \
+         | nested b/l/o | table pages | pages/contract | x composite | file used | file pages \
+         | used/contract |"
+    );
+    println!("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|");
+    let mut guard = BTreeMap::new();
+    for (i, m, n, rows) in &mut runs {
+        let shape = &shapes[*i];
+        for append in [false, true] {
+            if append {
+                rows.sort_unstable();
+            } else {
+                let mut rng = Rng(0x5eed_0000 + rows.len() as u64);
+                for j in (1..rows.len()).rev() {
+                    rows.swap(j, rng.below(j as u64 + 1) as usize);
+                }
+            }
+            let mut composite = 0;
+            for form in FORMS {
+                let size = measure(shape, form, rows, append);
+                let table = size.table();
+                if form == SizeForm::Composite {
+                    composite = table;
+                }
+                if *i == 0 && m.is_none() && !append {
+                    guard.insert(format!("{form:?}"), table);
+                }
+                let [ob, ol, oo] = size.outer;
+                let [nb, nl, no] = size.nested;
+                let per = |pages: u64| pages as f64 / *n as f64;
+                println!(
+                    "| ({}, {}, {}..={}) | {} | {} | {form:?} | {} | {} | {ob}/{ol}/{oo} \
+                     | {nb}/{nl}/{no} | {table} | {:.3} | {:.2} | {} | {} | {:.3} |",
+                    shape.k,
+                    shape.s,
+                    shape.v.start(),
+                    shape.v.end(),
+                    m.map_or("1..=20".to_string(), |m| m.to_string()),
+                    if append { "append" } else { "random" },
+                    size.packed_max,
+                    size.nested_trees,
+                    per(table),
+                    table as f64 / composite as f64,
+                    size.used(),
+                    size.page_count,
+                    per(size.used()),
+                );
+            }
+        }
+    }
+    println!("runtime: {:.1} s", began.elapsed().as_secs_f64());
+    let (composite, unpacked, default) = (guard["Composite"], guard["Unpacked"], guard["Default"]);
+    assert!(default * 10 <= composite * 12, "default {default} vs composite {composite} pages");
+    assert!(unpacked * 10 >= composite * 25, "unpacked {unpacked} vs composite {composite} pages");
 }
