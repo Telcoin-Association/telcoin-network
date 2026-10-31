@@ -6,23 +6,23 @@ markers: **[done]**, **[next]**, **[later]**.
 
 ## Status (2026-10-31)
 
-- 101 reth crates were vendored at v1.11.3; 63 remain after reduction Phases 1, 2, 4a and 6a.
+- 101 reth crates were vendored at v1.11.3; 63 remain after reduction Phases 1, 2, 4a, 6a and 6b.
   Synced to v1.11.4. RocksDB is gone (TN-0014); its zero-size stubs stay until the tndb-b work
-  (D15). The ledger runs TN-0001 to TN-0019.
+  (D15). The ledger runs TN-0001 to TN-0021.
 - Security backports applied (TN-0015 to TN-0019, D17): WebSocket origin check, JS-tracer
   timeout/interrupt (ported to revm-inspectors 0.34, D16), txpool sender-id growth, and RPC
   blocking-work limits. Everything else upstream is tracked in `tn/notes/upstream-backports.md`.
-- Verified at the reduction's end (before the backports):
-  - `cargo nextest run --workspace` on the 63-crate tree (7d2aa76c8): 3719 passed / 0 failed,
-    90 skipped by design. The later commits don't change compiled code: the v1.11.4 sync
-    touched nothing in scope (TN-0013), and TN-0014's expanded source is identical.
-  - `make test-restarts` 8/8 and `make test-epochs` 11/11 on c7489bf12; clippy (nightly, CI
-    RUSTFLAGS) with default and all features, `ci-lanes.sh fmt`, `etc/rocksdb-gate.sh`, and the
-    nested workspace built with `--all-targets`.
+- Build cost: reth-node-core no longer rebuilds on every TN commit and libgit2 is no longer
+  compiled (TN-0020); jemalloc, which no TN binary installs, is no longer compiled (D19). Three
+  native C builds left the graph.
+- Phase 6b done (TN-0021): about 2.3k lines of unreachable RPC code removed.
+- `tn/notes/usage-map.md` was regenerated for the 63-crate tree on 2026-10-31.
 - Out of scope here: Phase 3 and RocksDB step B belong to the tndb-b work, which happens
   elsewhere.
-- Next reductions: Phase 4 (alloy/revm directly), Phase 5 (txpool), and the Phase 2 follow-up
-  (a TN-owned config instead of `NodeConfig`).
+- Next, roughly by value: Phase 5 (txpool, needs TN design input), Phase 4 (alloy/revm
+  directly; touches consensus-critical execution code, so coordinate with whoever is changing
+  `tn-reth/src/env` and `evm`), the Phase 2 follow-up (now worth little for build cost, see
+  Phase 2).
 
 ## Ground rules for every step
 
@@ -111,6 +111,12 @@ Keep `reth-network-api` (small, and the `EthApi` bounds need its traits) and
 `reth-network-p2p`/`reth-eth-wire-types` (the pool and network-api use them). A TN-owned config
 struct replacing `NodeConfig` altogether is the follow-up. It would also let `reth-rpc-builder`
 take its server arguments from a small struct instead of `reth-node-core`.
+
+Measured 2026-10-31 after TN-0020: dropping reth-node-core would take out only nine small
+pure-Rust packages (derive_builder and its two helper crates, dirs, dirs-sys, option-ext,
+shellexpand, vergen-lib, and node-core itself). That is little build cost against a rewrite of
+the CLI wiring operators depend on (`tn-reth/src/cli.rs`). Do the follow-up only when TN wants
+to own its configuration for its own sake.
 
 ## Phase 3: tndb-b as the reth database [next; owned by the tndb-b work]
 
