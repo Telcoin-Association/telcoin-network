@@ -29,7 +29,6 @@ members = [
     "crates/net/peers/",
     "crates/node/core/",
     "crates/node/types",
-    "crates/payload/builder-primitives/",
     "crates/payload/primitives/",
     "crates/primitives-traits/",
     "crates/prune/types",
@@ -261,7 +260,6 @@ reth-network-peers = { path = "crates/net/peers", default-features = false }
 reth-nippy-jar = { path = "crates/storage/nippy-jar" }
 reth-node-core = { path = "crates/node/core" }
 reth-node-types = { path = "crates/node/types" }
-reth-payload-builder-primitives = { path = "crates/payload/builder-primitives" }
 reth-payload-primitives = { path = "crates/payload/primitives" }
 reth-primitives-traits = { path = "crates/primitives-traits", default-features = false }
 reth-provider = { path = "crates/storage/provider" }
