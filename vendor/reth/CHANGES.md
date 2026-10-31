@@ -301,3 +301,8 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   - 01d039b1f: re-initializing the index (after a heal, prune or unwind) bumps a cache
     generation, and an in-flight load re-checks it under the entry's shard lock, so a jar loaded
     before the invalidation cannot repopulate the cache (same file, with upstream's two tests).
+  - 1e17affd3: startup recovery of the transaction-based segments removes row 0 when the
+    database checkpoint is an empty genesis block. `last_tx_num()` saturated to 0 there, so the
+    first block's first transaction survived the heal and the next append failed. TN's genesis
+    is empty, so a crash between the static-file and MDBX commits of block 1 hit this. Same
+    file; upstream's test fails without the fix.
