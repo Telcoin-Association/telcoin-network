@@ -272,10 +272,19 @@ impl Durability {
         *self.durable_now.lock()
     }
 
-    /// Advance the watermark to `durable` (never back, and never after a failure).
+    /// Advance the watermark to `durable` (never back, and never after a failure). The blocking
+    /// copy moves first: a `persist` the watch wakes then reads [`Self::durable`] at or past its
+    /// target, never the value before its sync.
     fn advance(&self, durable: u64) {
         if self.is_failed() {
             return;
+        }
+        {
+            let mut now = self.durable_now.lock();
+            if durable > *now {
+                *now = durable;
+                self.durable_changed.notify_all();
+            }
         }
         self.durable.send_if_modified(|current| {
             let advanced = durable > *current;
@@ -284,11 +293,6 @@ impl Durability {
             }
             advanced
         });
-        let mut now = self.durable_now.lock();
-        if durable > *now {
-            *now = durable;
-            self.durable_changed.notify_all();
-        }
     }
 
     /// The durability barrier: wait until every batch up to `target` (the last one written when
