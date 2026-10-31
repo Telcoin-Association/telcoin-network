@@ -84,6 +84,12 @@ Some crates' test code needs their own `test-utils` feature, which upstream's CI
 workspace-wide `--all-features`. If `--all-targets` fails on a missing optional dependency, add
 `--all-features`. (At import this hit `reth-downloaders`, which is no longer carried.)
 
+Check and lint with `--workspace`. `cargo.sh check -p <crate>` on its own fails for several
+crates that rely on features other members enable (DECISIONS.md D18), and so does `-p` with
+`clippy`. Clippy does run on the vendored crates here, unlike in TN's build, where path
+dependencies never get clippy, so run it after editing vendored code:
+`vendor/reth/tn/cargo.sh clippy --workspace --lib --tests -- -D warnings`.
+
 `cargo.sh` seeds `vendor/reth/Cargo.lock` from TN's lockfile (the nested lockfile is
 git-ignored) and builds into `target/vendor-reth`. When one of reth's dev-dependencies needs a
 newer version of a crate TN also uses, cargo bumps it in the nested lockfile only. At v1.11.3 that
