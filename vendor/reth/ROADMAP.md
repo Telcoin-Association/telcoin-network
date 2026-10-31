@@ -6,20 +6,26 @@ markers: **[done]**, **[next]**, **[later]**.
 
 ## Status (2026-10-31)
 
-- 101 reth crates were vendored at v1.11.3; 63 remain after reduction Phases 1, 2, 4a, 6a and 6b.
-  Synced to v1.11.4. RocksDB is gone (TN-0014); its zero-size stubs stay until the tndb-b work
-  (D15). The ledger runs TN-0001 to TN-0023.
+- 101 reth crates were vendored at v1.11.3; 57 remain after reduction Phases 1, 2, 4a, 6a, 6b
+  and the second pass (TN-0025 to TN-0033, tag `reth-reduction-2-start`). Synced to v1.11.4.
+  RocksDB is gone (TN-0014); its zero-size stubs stay until the tndb-b work (D15). The ledger
+  runs TN-0001 to TN-0033.
 - Security backports applied (TN-0015 to TN-0019, D17): WebSocket origin check, JS-tracer
   timeout/interrupt (ported to revm-inspectors 0.34, D16), txpool sender-id growth, and RPC
   blocking-work limits. Everything else upstream is tracked in `tn/notes/upstream-backports.md`.
 - Correctness backports: txpool nonce order (TN-0022) and six static-file fixes (TN-0023: jar
   cache races, empty-genesis recovery, nippy-jar torn tails, read errors). Upstream fixes to MDBX
-  code are tracked for the tndb-b work.
+  code are tracked for the tndb-b work. The replacement price bump rounds up (TN-0024; pool
+  admission only, so no fork risk against nodes without it).
+- Second reduction pass done (TN-0025 to TN-0033, D20): 6 reth crates and 19 third-party packages
+  left the node graph (890 to 865 packages, the same in the tndb-b build), with no behavior change.
+  See "Reduction pass 2" below for what was cut, what was left and why.
 - Build cost: reth-node-core no longer rebuilds on every TN commit and libgit2 is no longer
   compiled (TN-0020); jemalloc, which no TN binary installs, is no longer compiled (D19). Three
   native C builds left the graph.
 - Phase 6b done (TN-0021): about 2.3k lines of unreachable RPC code removed.
-- `tn/notes/usage-map.md` was regenerated for the 63-crate tree on 2026-10-31.
+- `tn/notes/usage-map.md` was regenerated for the 63-crate tree on 2026-10-31 and updated for the
+  57-crate tree after the second pass.
 - Verified 2026-10-31. Backport head `f093532ca`: nextest 3719 passed, 0 failed, 90 skipped;
   `make test-restarts` 8/8; `make test-epochs` 11/11. Final head `c8a527384`: the same counts,
   plus the nested workspace check, both clippy lanes, fmt and the RocksDB gate. nextest's LEAK
@@ -30,6 +36,7 @@ markers: **[done]**, **[next]**, **[later]**.
   provider, txpool and db (db with two threads; see README).
 - Out of scope here: Phase 3 and RocksDB step B belong to the tndb-b work, which happens
   elsewhere.
+- Open decision: drop `js-tracer` (see "Reduction pass 2"). It is the largest single cut left.
 - Next, roughly by value: Phase 5 (txpool, needs TN design input), Phase 4 (alloy/revm
   directly; touches consensus-critical execution code, so coordinate with whoever is changing
   `tn-reth/src/env` and `evm`), the Phase 2 follow-up (now worth little for build cost, see
@@ -232,6 +239,42 @@ module, then `vendor.py remove` what leaves. `RethRpcModule` itself lives in
 `reth-rpc-server-types`. Shrink it only if nothing parses the removed names, because operators'
 `--http.api` lists are validated against it (`validate_rpc_modules`). Verify with
 `tn-reth`'s `env/rpc/tests` (namespace tests) and the e2e RPC tests.
+
+## Reduction pass 2 [done]
+
+Done 2026-10-31 (tag `reth-reduction-2-start` before it; DECISIONS.md D20). Method: list the
+third-party packages reachable only through vendored crates (74 at the start), then, per
+vendored crate and per dependency edge, what would leave the graph if it went. Cut, one commit
+each, each with an empty third-party `graph.py diff` or an explained one:
+
+- TN-0025: node-core's build script without vergen (7 build-time packages).
+- TN-0026/27: tracing-futures and the docs-only aquamarine proc macro (5).
+- TN-0028: db-common keeps `init_genesis`; the state-dump import and `DbTool` go, and with them
+  reth-etl, boyer-moore-magiclen and debug-helper.
+- TN-0029: reth's own OTLP exporters and `TraceArgs`; reth-tracing-otlp and the OTel log
+  appender. TN wires its own OpenTelemetry layers.
+- TN-0030: the reth.toml loaders; toml and three helpers.
+- TN-0031: network-api keeps `NetworkInfo`/`PeersInfo`; reth-network-p2p, reth-network-types and
+  reth-net-banlist go. TN now enables alloy `rand` itself (it was coming from network-types).
+- TN-0032: engine-primitives without the engine-API message types; reth-payload-builder-primitives.
+- TN-0033: the unreachable `mev` namespace server.
+
+Left, with the reason:
+
+- **`js-tracer` (decision needed).** It compiles boa, a JavaScript engine: 30 packages and the
+  largest single cut left. It only serves JS tracer strings in `debug_trace*`, and `debug` is
+  opt-in and off by default. Turning it off is one line in `crates/tn-reth/Cargo.toml` (drop
+  `js-tracer` from reth-rpc, reth-rpc-eth-api and reth-rpc-eth-types). Native tracers
+  (`callTracer`, `prestateTracer`, ...) keep working, a JS tracer request gets an error, and the
+  JS-tracer DoS surface that TN-0017 hardened goes away. This changes RPC behavior for operators
+  who enable `debug`, so it is the maintainers' call.
+- After the tndb-b work: notify and its helpers (5 packages; the read-only static-file watcher,
+  whose switch runs through the MDBX `ProviderFactoryBuilder`), sysinfo (reth-db's storage-lock
+  liveness check), and parity-scale-codec and modular-bitfield (on-disk encodings).
+- Not worth it: shellexpand and dirs (path expansion in operator-facing flags), reth-tracing's
+  stdout/file/journald stack (TN's logging), node-core's argument types (TN builds `NodeConfig`
+  from them; the Phase 2 follow-up), lz4_flex and fixed-map (static-file format), reth-trie's two
+  feature-forwarding dependencies (no package leaves; consensus-sensitive crate).
 
 ## Taking upstream changes as the code diverges
 

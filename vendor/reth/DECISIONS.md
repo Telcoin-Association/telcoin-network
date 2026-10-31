@@ -215,3 +215,25 @@ runtime change. If the team wants jemalloc (reth recommends it for memory fragme
 re-enable the feature and install it in `bin/telcoin-network`
 (`#[global_allocator] static ALLOC: reth_cli_util::allocator::Allocator =
 reth_cli_util::allocator::new_allocator();`). That is a behavior change to benchmark first.
+
+## D20. The second reduction pass cuts only what changes no behavior
+
+Decided 2026-10-31, when the maintainer asked for another pass over the vendored crates. A cut
+qualified when TN behaves the same afterwards: unused code, unreachable RPC namespaces, build
+tooling, and dependencies that only that code needed (TN-0025 to TN-0033). Three kinds of cut
+were left for a deliberate decision instead:
+
+- **Behavior that operators can see.** Dropping `js-tracer` would remove the boa JavaScript
+  engine, the largest cut left, but `debug_trace*` would then refuse JS tracers. Path expansion
+  in flags (shellexpand) and reth's logging stack also stay for this reason.
+- **MDBX and RocksDB code, and on-disk encodings.** The tndb-b work owns these (D15, Phase 3):
+  the static-file watcher's switch in the MDBX provider builder, reth-db's storage lock,
+  parity-scale-codec and modular-bitfield.
+- **Consensus-sensitive code.** reth-trie, the EVM and execution crates (Phase 4).
+
+Every cut ran `graph.py diff`, and it mattered once: reth-network-types was the crate that
+enabled alloy-primitives' `rand` feature, which seeds alloy's map hashers randomly. Removing it
+dropped that feature from the whole graph. The only visible symptom was a TN test builder that
+stopped compiling. TN now requests the feature itself (root `Cargo.toml`). When a crate leaves,
+check every third-party feature it was turning on; a build that still compiles proves nothing
+about features that change behavior but not APIs.
