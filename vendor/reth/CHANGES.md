@@ -214,6 +214,17 @@ newest last.
   (`#[cfg_attr(doc, ...)]`), yet it was compiled in every build, with `include_dir` and an old
   `itertools`. The diagram source stays in the doc comment as a code block. *Upstream*: no.
 
+- **TN-0028** — reth-db-common keeps genesis initialization only. *Kind*: removal.
+  *Files*: `crates/storage/db-common/src/{init.rs, lib.rs}`, `Cargo.toml`; deleted
+  `src/db_tool/`; `crates/etl` removed from the vendored set.
+  *Why*: TN calls only `init_genesis`. The state-dump import (`init_from_state_dump`, its JSONL
+  parsers, `dump_state` and the two dump constants) and `DbTool` (the `reth db` CLI helper) were
+  unused, and they were the only users of `reth-etl`, `boyer-moore-magiclen` (and its
+  `debug-helper`), and of db-common's `reth-config`, `reth-fs-util`, `reth-node-types`, `eyre`,
+  `serde` and `serde_json` dependencies. `compute_state_root`, which `init_genesis` uses, is
+  unchanged. TN's snapshot restore never used this path (`tn-reth/src/snapshot.rs` explains
+  why). *Upstream*: no.
+
 ## Upstream syncs
 
 - **TN-0013** — Sync to upstream v1.11.4 (`2ac58a25f561`). *Kind*: sync.
