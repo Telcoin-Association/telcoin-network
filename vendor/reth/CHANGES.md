@@ -210,3 +210,12 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   take upstream's `attach` (`js.with_interrupt(...)`). Block-level traces and `debug_traceCallMany`
   still stop only between transactions, as upstream.
   *Upstream*: n/a (port of an upstream commit).
+
+- **TN-0018** — Backport 792ee9245: no sender-id allocation on read-only pool lookups. *Kind*:
+  backport (security).
+  *Files*: `crates/transaction-pool/src/{lib.rs, pool/mod.rs}` (with upstream's test).
+  *Why*: the pool's sender-id map is never pruned, and read-only queries allocated an entry for
+  every unknown address. `eth_getTransactionCount(addr, "pending")` reaches
+  `get_highest_transaction_by_sender`, so unauthenticated RPC calls with random addresses grew
+  node memory without bound. Lookups now use a non-allocating `sender_id`. *Upstream*: n/a
+  (upstream commit).
