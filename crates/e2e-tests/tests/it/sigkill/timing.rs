@@ -78,10 +78,12 @@ mod tests {
         assert!(required.is_some_and(|secs| secs < TEST_TIMEOUT_SECS));
     }
 
+    /// The short-run kill lands inside the first half of its epoch.
+    const _: () = assert!(SHORT_RUN_BEFORE_CLOSE_SECS < SHORT_RUN_EPOCH_SECS / 2);
+
     /// The short-run defaults restart both cases inside the second epoch after the kill.
     #[test]
     fn short_run_defaults_restart_two_epochs_after_the_kill() {
-        assert!(SHORT_RUN_BEFORE_CLOSE_SECS < SHORT_RUN_EPOCH_SECS / 2);
         assert_eq!(
             restarts_land_two_epochs_after_kill(
                 SHORT_RUN_EPOCH_SECS,
