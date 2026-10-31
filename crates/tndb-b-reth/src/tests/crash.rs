@@ -10,8 +10,10 @@
 //! `CanonicalHeaders` through the transaction and appends rows past them through a cursor; puts
 //! (reth's way: `seek_by_key_subkey`, `delete_current`, `upsert`), appends (`append_dup`) and
 //! deletes rows of `PlainStorageState` through a dup cursor (`delete_current`,
-//! `delete_current_duplicates`) and the transaction, and every 13th round first clears that table;
-//! puts and deletes `Bytecodes` values of 1.5 KiB to 70 KiB (overflow runs); and writes the
+//! `delete_current_duplicates`, a key's rows then put again) and the transaction, and every 13th
+//! round first clears that table; puts rows of one account of [`BIG_SLOTS`] slots, whose rows span
+//! several of the engine's nested leaves, and every 11th round first wipes it; puts and deletes
+//! `Bytecodes` values of 1.5 KiB to 70 KiB (overflow runs); and writes the
 //! progress row. The puts and deletes take keys of a fixed set, so later rounds replace and delete
 //! earlier rounds' rows; the appends take keys (and subkeys) from the round, so each sorts after
 //! every earlier round's.
@@ -27,11 +29,17 @@
 //!
 //! The next child must start from the round after that progress.
 //!
+//! The tests run on both forms of the nested dup layouts' tables (`PlainStorageState` among
+//! them): engine dup tables (production), and composite keys in plain tables (the `_composite`
+//! twin, [`TndbArgs::composite_dup_tables`](crate::TndbArgs::composite_dup_tables); the child is
+//! told by [`COMPOSITE_ENV`]).
+//!
 //! A `SIGKILL` stops the process but keeps the page cache, so this tests the adapter and the
 //! engine's commit as a whole under process death, not power loss: the engine's crash matrix
 //! (`tndb-b`'s `tests::crash`) covers lost and torn writes with a disk model.
 
-use crate::{TndbArgs, TndbEnv, TndbEnvKind};
+use super::adapter::form_args;
+use crate::{TndbEnv, TndbEnvKind};
 use alloy::primitives::{Address, Bytes, B256, U256};
 use reth_db_api::{
     cursor::{DbCursorRO, DbCursorRW, DbDupCursorRO, DbDupCursorRW},
@@ -56,6 +64,10 @@ use std::{
 /// Set in the child's environment to the directory of the environment it writes.
 const CHILD_ENV: &str = "TNDB_B_RETH_CRASH_CHILD";
 
+/// Set in the child's environment when its environment's nested layouts' tables are in the
+/// composite form.
+const COMPOSITE_ENV: &str = "TNDB_B_RETH_CRASH_COMPOSITE";
+
 /// The child's entry point: its test name in this binary.
 const CHILD_TEST: &str = "tests::crash::crash_cycle_child";
 
@@ -71,6 +83,10 @@ const HEADER_KEYS: u64 = 400;
 const ACCOUNTS: u64 = 12;
 const SLOTS: u64 = 40;
 const CODE_KEYS: u64 = 20;
+
+/// The slots of the big account ([`big_account`]), of which a round puts [`BIG_PUTS`].
+const BIG_SLOTS: u64 = 600;
+const BIG_PUTS: u64 = 60;
 
 /// The lengths of `Bytecodes` values: all past a 4 KiB page's inline limit, up to runs of 18
 /// pages.
@@ -112,6 +128,15 @@ fn account(i: u64) -> Address {
 
 fn slot(i: u64) -> B256 {
     B256::with_last_byte(i as u8)
+}
+
+/// An account outside the [`ACCOUNTS`], of up to [`BIG_SLOTS`] rows ([`big_slot`]).
+fn big_account() -> Address {
+    account(ACCOUNTS)
+}
+
+fn big_slot(i: u64) -> B256 {
+    B256::left_padding_from(&(i as u16).to_be_bytes())
 }
 
 fn code_key(i: u64) -> B256 {
@@ -192,7 +217,27 @@ fn round_ops(round: u64) -> Vec<Op> {
         ops.push(Op::DelStorageKey(account(r % ACCOUNTS)));
     }
     if r % 5 == 2 {
-        ops.push(Op::DelStorageDups(account((r * 2 + 1) % ACCOUNTS)));
+        // A wipe through the cursor, then some of the key's rows put again.
+        let address = account((r * 2 + 1) % ACCOUNTS);
+        ops.push(Op::DelStorageDups(address));
+        for i in 0..3 {
+            let entry = StorageEntry {
+                key: slot((r * 3 + i * 13) % SLOTS),
+                value: U256::from((r << 8) | (8 + i)),
+            };
+            ops.push(Op::PutStorage(address, entry));
+        }
+    }
+    // The big account: a wipe (its rows over several nested leaves), then this round's puts.
+    if r.is_multiple_of(11) {
+        ops.push(Op::DelStorageDups(big_account()));
+    }
+    for i in 0..BIG_PUTS {
+        let entry = StorageEntry {
+            key: big_slot((r * BIG_PUTS + i * 7) % BIG_SLOTS),
+            value: U256::from((r << 16) | (i << 1) | 1),
+        };
+        ops.push(Op::PutStorage(big_account(), entry));
     }
     ops.push(Op::DelCode(code_key((r * 7) % CODE_KEYS)));
     ops.push(Op::Progress(r));
@@ -258,7 +303,8 @@ fn say(line: &str) {
 #[test]
 fn crash_cycle_child() {
     let Some(dir) = std::env::var_os(CHILD_ENV) else { return };
-    let mut db = super::open_env(Path::new(&dir), TndbEnvKind::RW, TndbArgs::default()).unwrap();
+    let args = form_args(std::env::var_os(COMPOSITE_ENV).is_none());
+    let mut db = super::open_env(Path::new(&dir), TndbEnvKind::RW, args).unwrap();
     db.create_tables().unwrap();
     let start = progress(&db.tx().unwrap()) + 1;
     say(&format!("start {start}"));
@@ -436,9 +482,9 @@ struct Landed {
     commit_kept: u32,
 }
 
-/// Run `cycles` crash cycles in a fresh directory. Returns the final progress and where the
-/// kills landed.
-fn crash_cycles(cycles: u32) -> (u64, Landed) {
+/// Run `cycles` crash cycles in a fresh directory, its nested layouts' tables in one form
+/// (`nested`, else composite). Returns the final progress and where the kills landed.
+fn crash_cycles(cycles: u32, nested: bool) -> (u64, Landed) {
     let seed = std::env::var(SEED_ENV)
         .ok()
         .and_then(|s| s.parse().ok())
@@ -449,7 +495,7 @@ fn crash_cycles(cycles: u32) -> (u64, Landed) {
     let mut rng = Rng(seed);
     let dir = tempfile::tempdir().unwrap();
     // The tables exist before the first child, so a lost commit shows as lost progress.
-    super::open_env(dir.path(), TndbEnvKind::RW, TndbArgs::default())
+    super::open_env(dir.path(), TndbEnvKind::RW, form_args(nested))
         .and_then(|mut db| db.create_tables())
         .unwrap();
     let exe = std::env::current_exe().unwrap();
@@ -468,17 +514,19 @@ fn crash_cycles(cycles: u32) -> (u64, Landed) {
                 round_time.mul_f64(1.5 * rng.below(1_000) as f64 / 1_000.0),
             ),
         };
-        let mut child = ChildGuard(
-            super::spawn(
-                Command::new(&exe)
-                    .args([CHILD_TEST, "--exact", "--nocapture", "--test-threads", "1"])
-                    .env(CHILD_ENV, dir.path())
-                    .stdin(Stdio::null())
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::inherit()),
-            )
-            .unwrap(),
-        );
+        let mut command = Command::new(&exe);
+        command
+            .args([CHILD_TEST, "--exact", "--nocapture", "--test-threads", "1"])
+            .env(CHILD_ENV, dir.path())
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit());
+        if nested {
+            command.env_remove(COMPOSITE_ENV);
+        } else {
+            command.env(COMPOSITE_ENV, "1");
+        }
+        let mut child = ChildGuard(super::spawn(&mut command).unwrap());
         let stdout = child.0.stdout.take().unwrap();
         let (send, lines) = mpsc::channel();
         let reader = thread::spawn(move || {
@@ -533,7 +581,7 @@ fn crash_cycles(cycles: u32) -> (u64, Landed) {
             Some(Line::Commit(n)) => n - 1..=*n,
         };
 
-        let db = super::open_env(dir.path(), TndbEnvKind::RW, TndbArgs::default())
+        let db = super::open_env(dir.path(), TndbEnvKind::RW, form_args(nested))
             .unwrap_or_else(|e| panic!("cycle {cycle} ({kill_at:?}): reopen failed: {e:?}"));
         assert_eq!(db.failure(), None, "cycle {cycle}: a failure latched at reopen");
         let got = progress(&db.tx().unwrap());
@@ -559,10 +607,14 @@ fn crash_cycles(cycles: u32) -> (u64, Landed) {
 /// in a commit (the child's last line `commit <round>`), so that a change in how long commits take
 /// against the rest of a round cannot leave the commit untested; without it (too few cycles for
 /// that to be sure) only warn.
-fn run_crash_cycles(cycles: u32, in_commit: bool) {
+fn run_crash_cycles(cycles: u32, in_commit: bool, nested: bool) {
     let started = Instant::now();
-    let (progress, landed) = crash_cycles(cycles);
-    eprintln!("{cycles} cycles: progress {progress}, kills {landed:?}, {:?}", started.elapsed());
+    let (progress, landed) = crash_cycles(cycles, nested);
+    let form = if nested { "nested" } else { "composite" };
+    eprintln!(
+        "{cycles} cycles ({form}): progress {progress}, kills {landed:?}, {:?}",
+        started.elapsed()
+    );
     assert!(progress > 0, "no round committed");
     let commit_kills = landed.commit_lost + landed.commit_kept;
     if in_commit {
@@ -574,11 +626,17 @@ fn run_crash_cycles(cycles: u32, in_commit: bool) {
 
 #[test]
 fn killed_child_reopens_to_its_last_commit() {
-    run_crash_cycles(5, false);
+    run_crash_cycles(5, false, true);
+}
+
+/// [`killed_child_reopens_to_its_last_commit`] on the composite form.
+#[test]
+fn killed_child_reopens_to_its_last_commit_composite() {
+    run_crash_cycles(5, false, false);
 }
 
 #[test]
 #[ignore = "heavy: run with --release"]
 fn killed_child_reopens_to_its_last_commit_heavy() {
-    run_crash_cycles(200, true);
+    run_crash_cycles(200, true, true);
 }

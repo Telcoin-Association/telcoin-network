@@ -378,7 +378,7 @@ fn a_table_in_another_form_than_its_layout_is_refused() {
 
 /// `args` for one form of the nested layouts' tables: engine dup tables (`nested`), or composite
 /// keys in plain tables.
-fn form_args(nested: bool) -> TndbArgs {
+pub(super) fn form_args(nested: bool) -> TndbArgs {
     let args = TndbArgs::default();
     if nested {
         args
