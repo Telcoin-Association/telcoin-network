@@ -178,6 +178,16 @@ const MISSING_CERTS_RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
 /// backpressure and stops reading, cannot hold an admission slot indefinitely.
 const SYNC_REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Deadline for writing and flushing the opening request frame of an outbound sync stream on
+/// every primary client path (epoch pack, consensus output, missing certificates). The
+/// responder reads that frame under [`SYNC_REQUEST_READ_TIMEOUT`] and drops the stream when it
+/// does not arrive in time, so a write still pending after the same window can no longer be
+/// served and is cut here instead. Without this bound a peer that completes stream negotiation
+/// and then grants no further receive credit holds the request write pending for the life of
+/// the connection, the serial probe walk never reaches the next peer, and the state-sync
+/// fetcher that drives the walk stalls until restart.
+const SYNC_REQUEST_WRITE_TIMEOUT: Duration = SYNC_REQUEST_READ_TIMEOUT;
+
 /// Bound on the opening `Req` frame of an inbound sync stream (and on the tiny
 /// best-effort control writes that follow). The `EpochPack` request is a few bytes,
 /// but a `MissingCertificates` request carries one skip-round bitmap per committee
@@ -698,7 +708,8 @@ impl PrimaryNetworkHandle {
     /// there, so a peer that did not answer the sync protocol last epoch is
     /// re-probed for it this epoch. The last peer that served a sync request stays
     /// preferred: a peer that served the previous epoch very likely serves this one,
-    /// and a wrong guess costs one probe.
+    /// and a wrong guess costs one probe, after which the preference is dropped
+    /// (see `forget_sync_server`).
     pub fn clear_sync_capability(&self) {
         self.sync_capability.lock().clear();
         self.epoch_sync_failed.lock().clear();
@@ -708,11 +719,21 @@ impl PrimaryNetworkHandle {
     ///
     /// The peer is cached sync-capable, any failure it recorded this epoch is cleared so a peer
     /// that recovered is no longer de-prioritised, and it becomes the peer the next probe walk
-    /// tries first.
+    /// tries first. The preference lasts until another peer serves or until `peer` fails a
+    /// probe (`forget_sync_server`), so a peer that served once and then stalls does not stay
+    /// at the front of every later walk.
     fn record_sync_served(&self, peer: BlsPublicKey) {
         self.sync_capability.lock().insert(peer, true);
         self.epoch_sync_failed.lock().remove(&peer);
         *self.last_sync_server.lock() = Some(peer);
+    }
+
+    /// Forget `peer` as the preferred sync server when it is the one on record. Every probe of
+    /// `peer` that does not serve calls this, so a peer that served once and then stalls or fails
+    /// does not stay at the front of every later walk.
+    fn forget_sync_server(&self, peer: BlsPublicKey) {
+        let mut preferred = self.last_sync_server.lock();
+        *preferred = (*preferred).filter(|recorded| *recorded != peer);
     }
 
     /// Return a reference to the inner handle.
@@ -830,26 +851,20 @@ impl PrimaryNetworkHandle {
         // fallback it is simply a failed peer and the fan-out moves on.
         let mut stream = self.handle.open_stream(peer).await.and_then(|s| s)?;
 
-        // write the request in the opening frame
+        // write the request in the opening frame, bounded by `SYNC_REQUEST_WRITE_TIMEOUT` so a
+        // peer that grants no receive credit cannot hold this fetch pending for the life of
+        // the connection (a cut write is a failed peer and the fan-out moves on)
         let request_frame = SyncFrame::Req(PrimarySyncRequest::MissingCertificates {
             exclusive_lower_bound: request.exclusive_lower_bound,
             skip_rounds: request.skip_rounds.clone(),
         });
-        let (mut encode_buffer, mut compressed_buffer) = (Vec::new(), Vec::new());
-        write_frame(
-            &mut stream,
-            &request_frame,
-            &mut encode_buffer,
-            &mut compressed_buffer,
-            MAX_SYNC_REQUEST_FRAME_SIZE,
-        )
-        .await
-        .and(stream.flush().await)
-        .map_err(|e| {
-            NetworkError::RPCRetryable(format!(
-                "failed to write missing certificates sync request frame: {e}"
-            ))
-        })?;
+        write_sync_request(&mut stream, &request_frame, MAX_SYNC_REQUEST_FRAME_SIZE)
+            .await
+            .map_err(|e| {
+                NetworkError::RPCRetryable(format!(
+                    "failed to write missing certificates sync request frame: {e}"
+                ))
+            })?;
 
         // read the responder's first frame, bounded by the ack timeout
         let (mut decode_buffer, mut decompress_buffer) = (Vec::new(), Vec::new());
@@ -943,7 +958,10 @@ impl PrimaryNetworkHandle {
         // carries the chain and the verified hash needed to stream-decode + verify in place.
         let request = ConsensusOutputSyncRequest { number, epoch, expected_hash, consensus_chain };
         // Shuffle, put the last peer that served first, and de-prioritise peers that already
-        // failed a probe for this epoch (same ordering as the full-pack path). The preference is
+        // failed a probe for this epoch (same ordering as the full-pack path). A preferred peer
+        // that does not serve a probe loses the preference (`forget_sync_server`), and every
+        // probe's opening write is bounded by `SYNC_REQUEST_WRITE_TIMEOUT`, so a peer that
+        // served once and then stalls costs one bounded probe, not the walk. The preference is
         // read in its own statement so its lock guard never overlaps the failure map's.
         let preferred = *self.last_sync_server.lock();
         let peers = order_probe_peers(
@@ -979,7 +997,9 @@ impl PrimaryNetworkHandle {
                     ConsensusOutputAttempt::Unsupported => {
                         // Ambiguous: the peer may serve full epoch packs but not decode
                         // this newer `ConsensusOutput` variant, so do NOT cache `false`
-                        // and hide it from the full-pack path.
+                        // and hide it from the full-pack path. It did not serve, so it
+                        // loses the probe-first preference if it held it.
+                        self.forget_sync_server(peer);
                         debug!(
                             target: "primary::network",
                             %peer,
@@ -990,9 +1010,11 @@ impl PrimaryNetworkHandle {
                     }
                     ConsensusOutputAttempt::Failed(e) => {
                         // the peer speaks sync but this exchange failed; keep it
-                        // sync-capable and try the next peer
+                        // sync-capable, drop its probe-first preference, and try the
+                        // next peer
                         self.sync_capability.lock().insert(peer, true);
                         self.epoch_sync_failed.lock().insert(peer, epoch);
+                        self.forget_sync_server(peer);
                         warn!(
                             target: "primary::network",
                             %peer,
@@ -1057,20 +1079,17 @@ impl PrimaryNetworkHandle {
                 () => ConsensusOutputAttempt::Failed(e),
             })?;
 
-        // write the request in the opening frame. Negotiation already succeeded, so a
-        // write failure is transient -> try next.
+        // write the request in the opening frame, bounded by `SYNC_REQUEST_WRITE_TIMEOUT`.
+        // Negotiation already succeeded, so a write failure or a write still pending at the
+        // deadline (a peer that grants no receive credit) is transient -> try next.
         let max_frame = sync_codec::MAX_SYNC_PACK_FRAME_SIZE;
         let req_frame =
             SyncFrame::Req(PrimarySyncRequest::ConsensusOutput { number: request.number });
-        let (mut encode_buffer, mut compressed_buffer) = (Vec::new(), Vec::new());
-        write_frame(&mut stream, &req_frame, &mut encode_buffer, &mut compressed_buffer, max_frame)
-            .await
-            .and(stream.flush().await)
-            .map_err(|e| {
-                ConsensusOutputAttempt::Failed(NetworkError::RPCRetryable(format!(
-                    "failed to write consensus output sync request frame: {e}"
-                )))
-            })?;
+        write_sync_request(&mut stream, &req_frame, max_frame).await.map_err(|e| {
+            ConsensusOutputAttempt::Failed(NetworkError::RPCRetryable(format!(
+                "failed to write consensus output sync request frame: {e}"
+            )))
+        })?;
 
         // read the responder's first frame. A timeout (outer `Err`) means no `Ack` -> a
         // peer that negotiated sync but does not serve this variant, so try the next
@@ -1279,7 +1298,11 @@ impl PrimaryNetworkHandle {
     /// a full-pack request is cached unsyncable (skipping its probe next time); a
     /// partial-pack `Unsupported` is ambiguous and is not cached. A probe that never
     /// reaches `Ack` is penalty-exempt; an import fault after `Ack` that is attributable
-    /// to the peer's bytes is penalised.
+    /// to the peer's bytes is penalised. Every phase of a probe is bounded (stream open,
+    /// the opening request write under `SYNC_REQUEST_WRITE_TIMEOUT`, the `Ack` read, and
+    /// the reader's per-frame timeout plus throughput floor after it), and the last peer
+    /// that served is probed first only until it fails a probe, so one stalled peer costs
+    /// one bounded probe per walk rather than the walk.
     async fn request_epoch_pack_sync(&self, sync: EpochPackSyncRequest<'_>) -> NetworkResult<()> {
         let EpochPackSyncRequest { epoch, last_consensus_number, .. } = sync;
         let peers = self.handle.connected_peers().await?;
@@ -1287,8 +1310,10 @@ impl PrimaryNetworkHandle {
         // failed a probe for this epoch: a peer that failed once for this epoch is probed after
         // every fresh peer, so a Byzantine peer fixed in stable `HashMap` order cannot stall the
         // front of every one of state-sync's retries for the same epoch (see
-        // `order_probe_peers`). The preference is read in its own statement so its lock guard
-        // never overlaps the failure map's.
+        // `order_probe_peers`). A preferred peer that does not serve a probe loses the
+        // preference (`forget_sync_server`), and every probe's opening write is bounded by
+        // `SYNC_REQUEST_WRITE_TIMEOUT`. The preference is read in its own statement so its
+        // lock guard never overlaps the failure map's.
         let preferred = *self.last_sync_server.lock();
         let peers = order_probe_peers(
             peers,
@@ -1331,6 +1356,8 @@ impl PrimaryNetworkHandle {
                         if last_consensus_number.is_none() {
                             self.sync_capability.lock().insert(peer, false);
                         }
+                        // it did not serve, so it loses the probe-first preference if it held it
+                        self.forget_sync_server(peer);
                         debug!(
                             target: "primary::network",
                             %peer,
@@ -1341,11 +1368,13 @@ impl PrimaryNetworkHandle {
                     }
                     EpochPackAttempt::Failed(e) => {
                         // the peer speaks sync but this exchange failed; keep it
-                        // sync-capable and try the next peer
+                        // sync-capable, drop its probe-first preference, and try the
+                        // next peer
                         self.sync_capability.lock().insert(peer, true);
                         // Remember it failed THIS epoch so the retries for the same epoch probe it
                         // last (a drip/slow peer no longer starves every attempt).
                         self.epoch_sync_failed.lock().insert(peer, epoch);
+                        self.forget_sync_server(peer);
                         warn!(
                             target: "primary::network",
                             %peer,
@@ -1421,8 +1450,10 @@ impl PrimaryNetworkHandle {
                 () => EpochPackAttempt::Failed(e),
             })?;
 
-        // write the request in the opening frame. Negotiation already succeeded, so
-        // the peer is sync-capable; a write failure is transient -> try next.
+        // write the request in the opening frame, bounded by `SYNC_REQUEST_WRITE_TIMEOUT`.
+        // Negotiation already succeeded, so the peer is sync-capable; a write failure or a
+        // write still pending at the deadline (a peer that grants no receive credit) is
+        // transient -> try next.
         let max_frame = sync_codec::MAX_SYNC_PACK_FRAME_SIZE;
         // full pack vs a verifiable partial prefix: select the request variant through
         // the `Option`'s combinator (no Some/None branch).
@@ -1431,15 +1462,11 @@ impl PrimaryNetworkHandle {
                 PrimarySyncRequest::EpochPackPartial { epoch, last_consensus_number: number }
             }),
         );
-        let (mut encode_buffer, mut compressed_buffer) = (Vec::new(), Vec::new());
-        write_frame(&mut stream, &request, &mut encode_buffer, &mut compressed_buffer, max_frame)
-            .await
-            .and(stream.flush().await)
-            .map_err(|e| {
-                EpochPackAttempt::Failed(NetworkError::RPCRetryable(format!(
-                    "failed to write epoch pack sync request frame: {e}"
-                )))
-            })?;
+        write_sync_request(&mut stream, &request, max_frame).await.map_err(|e| {
+            EpochPackAttempt::Failed(NetworkError::RPCRetryable(format!(
+                "failed to write epoch pack sync request frame: {e}"
+            )))
+        })?;
 
         // read the responder's first frame. Negotiation already succeeded, so the
         // peer IS sync-capable: a missing `Ack` (timeout) or any read error is a
@@ -1508,8 +1535,8 @@ impl PrimaryNetworkHandle {
                 // honest pack finishes at any sustained rate at/above the floor
                 // while a drip/stalled peer is cut quickly. On such an error the
                 // future resolves `Err`, which unwinds `stream_import` so its
-                // `ImportPath` guard clears the `.inproc` sentinel and the epoch is
-                // retryable against another peer.
+                // `ImportPath` guard removes the import dir, releases the epoch's claim, and the
+                // epoch is retryable against another peer.
                 match import.await {
                     Ok(()) => Ok(()),
                     Err(e) => {
@@ -1587,6 +1614,8 @@ impl PrimaryNetworkHandle {
                 | PackError::ReadOnly
                 | PackError::ReadError(_)
                 | PackError::MissingAuthority
+                // The caller's committee or previous record is for another epoch: local state.
+                | PackError::LocalEpochMismatch { .. }
                 | PackError::SendFailed
                 | PackError::ReceiveFailed
                 | PackError::PersistError(_)
@@ -1599,14 +1628,12 @@ impl PrimaryNetworkHandle {
             ConsensusChainError::EpochMismatch
             | ConsensusChainError::PrevCommitteeEpochMismatch
             | ConsensusChainError::CrcError => Some(Penalty::Mild),
-            ConsensusChainError::EmptyImport | ConsensusChainError::InvalidImport => {
-                Some(Penalty::Severe)
-            }
             ConsensusChainError::StreamUnavailable
             | ConsensusChainError::NoCurrentEpoch
             | ConsensusChainError::EpochDbError(_)
             | ConsensusChainError::InvalidPackEpoch(_, _)
             | ConsensusChainError::CantSaveAndNotAvailable(_)
+            | ConsensusChainError::LiveEpochImport(_)
             // The documented cause is LOCAL state (a resume that collapsed this node's
             // "latest"), not peer misbehavior, so no penalty is charged to the peer.
             | ConsensusChainError::NonMonotonicConsensusNumber { .. }
@@ -1662,6 +1689,8 @@ impl PrimaryNetworkHandle {
                 | PackError::ReadOnly
                 | PackError::ReadError(_)
                 | PackError::MissingAuthority
+                // The caller's committee or previous record is for another epoch: local state.
+                | PackError::LocalEpochMismatch { .. }
                 | PackError::SendFailed
                 | PackError::ReceiveFailed
                 | PackError::PersistError(_)
@@ -1671,8 +1700,6 @@ impl PrimaryNetworkHandle {
                 | PackError::InvalidVersion(_, _)
                 | PackError::ConsensusNumberTooHigh => false,
             },
-            // The imported stream had no / an invalid final output: the peer served a bad pack.
-            ConsensusChainError::EmptyImport | ConsensusChainError::InvalidImport => true,
             // Local chain state, our own storage, or a benign mismatch: never charge the peer.
             ConsensusChainError::EpochMismatch
             | ConsensusChainError::PrevCommitteeEpochMismatch
@@ -1682,10 +1709,51 @@ impl PrimaryNetworkHandle {
             | ConsensusChainError::EpochDbError(_)
             | ConsensusChainError::InvalidPackEpoch(_, _)
             | ConsensusChainError::CantSaveAndNotAvailable(_)
+            | ConsensusChainError::LiveEpochImport(_)
             | ConsensusChainError::NonMonotonicConsensusNumber { .. }
             | ConsensusChainError::IO(_) => false,
         }
     }
+}
+
+/// Why the opening request frame of an outbound sync stream was not delivered.
+#[derive(Debug)]
+enum SyncRequestWriteError {
+    /// The write or the flush did not finish within [`SYNC_REQUEST_WRITE_TIMEOUT`].
+    TimedOut,
+    /// The write or the flush failed.
+    Io(std::io::Error),
+}
+
+impl std::fmt::Display for SyncRequestWriteError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TimedOut => write!(f, "timed out after {SYNC_REQUEST_WRITE_TIMEOUT:?}"),
+            Self::Io(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+/// Write and flush `frame` as the opening request of an outbound sync stream, bounded by
+/// [`SYNC_REQUEST_WRITE_TIMEOUT`]. A timeout drops the in-flight write; the caller drops the
+/// stream, which resets it, and treats the peer as a failed probe.
+async fn write_sync_request<S, R>(
+    stream: &mut S,
+    frame: &SyncFrame<R>,
+    max_frame: usize,
+) -> Result<(), SyncRequestWriteError>
+where
+    S: AsyncWrite + Unpin + Send,
+    R: serde::Serialize + Sync,
+{
+    let (mut encode_buffer, mut compressed_buffer) = (Vec::new(), Vec::new());
+    tokio::time::timeout(SYNC_REQUEST_WRITE_TIMEOUT, async {
+        write_frame(stream, frame, &mut encode_buffer, &mut compressed_buffer, max_frame).await?;
+        stream.flush().await
+    })
+    .await
+    .map_err(|_elapsed| SyncRequestWriteError::TimedOut)
+    .and_then(|written| written.map_err(SyncRequestWriteError::Io))
 }
 
 /// Order the candidate peers for a sync probe: shuffle for an unbiased base order, then stably
@@ -2494,5 +2562,162 @@ mod sync_admission_tests {
         let reports = std::iter::from_fn(|| commands.try_recv().ok());
         let charged: Vec<_> = reports.map(mild_penalty_peer).collect();
         assert_eq!(charged, vec![Some(first), Some(second), Some(third)]);
+    }
+}
+
+/// Tests of the outbound sync request write deadline (GHSA-qf73-5cfc-3jgc): the opening request
+/// frame of every client path is written under [`SYNC_REQUEST_WRITE_TIMEOUT`].
+#[cfg(test)]
+mod sync_request_write_tests {
+    use super::{
+        read_frame, write_sync_request, PrimarySyncRequest, SyncFrame, SyncRequestWriteError,
+        SYNC_REQUEST_WRITE_TIMEOUT,
+    };
+    use futures::AsyncWrite;
+    use std::{
+        io,
+        pin::Pin,
+        task::{Context, Poll},
+    };
+
+    /// A responder that negotiated the stream and then grants no receive credit: every write
+    /// and every flush stays pending forever.
+    #[derive(Debug)]
+    struct StalledStream;
+
+    impl AsyncWrite for StalledStream {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Pending
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Pending
+        }
+
+        fn poll_close(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    /// The request frame every test writes.
+    fn request() -> SyncFrame<PrimarySyncRequest> {
+        SyncFrame::Req(PrimarySyncRequest::EpochPack { epoch: 1 })
+    }
+
+    /// A write that never completes is cut after exactly [`SYNC_REQUEST_WRITE_TIMEOUT`] and
+    /// reported as a timeout, so the probe walk moves on instead of waiting on the connection.
+    #[tokio::test(start_paused = true)]
+    async fn stalled_stream_times_out_the_request_write() {
+        let start = tokio::time::Instant::now();
+        let mut stream = StalledStream;
+        let written = write_sync_request(
+            &mut stream,
+            &request(),
+            super::sync_codec::MAX_SYNC_PACK_FRAME_SIZE,
+        )
+        .await;
+        assert!(matches!(written, Err(SyncRequestWriteError::TimedOut)));
+        assert_eq!(start.elapsed(), SYNC_REQUEST_WRITE_TIMEOUT);
+    }
+
+    /// A ready writer receives the frame inside the deadline, and the bytes decode back to the
+    /// same request.
+    #[tokio::test]
+    async fn ready_stream_delivers_the_request_frame() {
+        let mut stream = futures::io::Cursor::new(Vec::new());
+        let written = write_sync_request(
+            &mut stream,
+            &request(),
+            super::sync_codec::MAX_SYNC_PACK_FRAME_SIZE,
+        )
+        .await;
+        assert!(written.is_ok());
+        let bytes = stream.into_inner();
+        assert!(!bytes.is_empty());
+
+        let mut reader = futures::io::Cursor::new(bytes);
+        let (mut decode_buffer, mut compressed_buffer) = (Vec::new(), Vec::new());
+        let decoded = read_frame::<_, PrimarySyncRequest>(
+            &mut reader,
+            &mut decode_buffer,
+            &mut compressed_buffer,
+            super::sync_codec::MAX_SYNC_PACK_FRAME_SIZE,
+        )
+        .await
+        .expect("frame decodes");
+        assert_eq!(decoded, request());
+    }
+}
+
+/// Tests of the preferred sync server bookkeeping (GHSA-qf73-5cfc-3jgc): the last peer that
+/// served is probed first only until it fails a probe.
+#[cfg(test)]
+mod sync_server_preference_tests {
+    use super::{order_probe_peers, PrimaryNetworkHandle};
+    use rand::{rngs::StdRng, SeedableRng as _};
+    use std::collections::HashMap;
+    use tn_types::{BlsKeypair, BlsPublicKey};
+    use tokio::sync::mpsc;
+
+    /// A deterministic BLS public key for `seed`.
+    fn key(seed: u64) -> BlsPublicKey {
+        *BlsKeypair::generate(&mut StdRng::seed_from_u64(seed)).public()
+    }
+
+    /// A handle whose command channel is never read; these tests only touch its caches.
+    fn handle() -> PrimaryNetworkHandle {
+        let (sender, _receiver) = mpsc::channel(1);
+        PrimaryNetworkHandle::new_for_test(sender)
+    }
+
+    /// Forgetting a peer other than the recorded one keeps the preference; forgetting the
+    /// recorded one clears it, and forgetting with nothing on record stays empty.
+    #[test]
+    fn forget_sync_server_drops_only_the_recorded_peer() {
+        let handle = handle();
+        let (served, other) = (key(1), key(2));
+        handle.record_sync_served(served);
+        assert_eq!(*handle.last_sync_server.lock(), Some(served));
+
+        handle.forget_sync_server(other);
+        assert_eq!(*handle.last_sync_server.lock(), Some(served));
+
+        handle.forget_sync_server(served);
+        assert_eq!(*handle.last_sync_server.lock(), None);
+
+        handle.forget_sync_server(served);
+        assert_eq!(*handle.last_sync_server.lock(), None);
+    }
+
+    /// With a preference the preferred peer leads the walk; without one the walk is the seeded
+    /// shuffle alone, so no peer is pinned to the front.
+    #[test]
+    fn order_probe_peers_puts_no_peer_first_without_a_preference() {
+        let peers: Vec<BlsPublicKey> = (0..6).map(key).collect();
+        let preferred = key(3);
+        let failed = HashMap::new();
+
+        let with_preference = order_probe_peers(
+            peers.clone(),
+            &failed,
+            0,
+            Some(preferred),
+            &mut StdRng::seed_from_u64(7),
+        );
+        assert_eq!(with_preference.first(), Some(&preferred));
+        assert_eq!(with_preference.len(), peers.len());
+        assert!(peers.iter().all(|p| with_preference.contains(p)));
+
+        let without =
+            order_probe_peers(peers.clone(), &failed, 0, None, &mut StdRng::seed_from_u64(7));
+        let shuffle_only =
+            order_probe_peers(peers.clone(), &failed, 0, None, &mut StdRng::seed_from_u64(7));
+        assert_eq!(without, shuffle_only);
+        assert_eq!(without.len(), peers.len());
+        assert!(peers.iter().all(|p| without.contains(p)));
     }
 }

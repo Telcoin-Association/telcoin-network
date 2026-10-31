@@ -45,6 +45,8 @@ The score thresholds remain -20.0 for disconnection and -50.0 for a ban. From a 
 
 Crossing the ban threshold delays score decay for 30 minutes. Epoch rotation, identity discovery, and repeated hub installation preserve the protocol penalties and bans of a hub outside the committee. Committee admission at each epoch unbans every committee member and resets its score.
 
+A node that replays a historical epoch does not charge an unauthorized gossip author. Its publisher allowlists belong to the replayed epoch, and the live committee of a later epoch publishes on the same topics. The message is still dropped. The node reads its position from its certified epoch records at each epoch entry. A certificate that verifies exists only after the epoch closed. An epoch without a certified record counts as live, and the author penalty applies.
+
 ## What makes a peer important
 
 A peer's identity is either `Confirmed`, carrying its BLS public key, or `Unidentified`, carrying its libp2p PeerId. Transport authentication proves the remote network key, and signed node records prove their advertised BLS binding. Configuration supplies expected identities and address hints; it does not replace either verification.

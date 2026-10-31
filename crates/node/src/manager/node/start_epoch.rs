@@ -43,7 +43,7 @@ use std::{
 use tn_config::{
     Config, ConfigFmt, ConfigTrait as _, ConsensusConfig, NetworkConfig, PriorEpoch, TelcoinDirs,
 };
-use tn_network_libp2p::{error::NetworkError, types::NetworkHandle, TNMessage};
+use tn_network_libp2p::{error::NetworkError, types::NetworkHandle, EpochPosition, TNMessage};
 use tn_primary::{
     network::{PrimaryNetwork, PrimaryNetworkHandle},
     ConsensusBus, ConsensusBusApp, NodeMode, StateSynchronizer,
@@ -399,20 +399,32 @@ where
             PriorEpoch { record: prior_epoch_record, close: prior_epoch_close },
         )?;
 
-        // a missing record, a missing certificate and a storage error all mean "not known to be
-        // closed", so only a verified certificate relaxes the check
-        let closed = self.consensus_chain.epochs().certified_record_by_epoch(epoch).await.is_ok();
-        if closed {
-            info!(
+        match self.epoch_position(epoch).await {
+            EpochPosition::Historical => info!(
                 target: "epoch-manager",
                 epoch,
                 "epoch already closed by its committee; replaying it without the vote-window check"
-            );
-        } else {
-            consensus_config.validate_epoch_timing()?;
+            ),
+            EpochPosition::Live => consensus_config.validate_epoch_timing()?,
         }
 
         Ok(consensus_config)
+    }
+
+    /// Whether `epoch` is a historical replay or the live epoch, from the node's own records.
+    ///
+    /// A certificate that verifies exists only after the epoch closed, so `Historical` is
+    /// trustworthy. `Live` only means "not known to be closed": a node whose startup record sync
+    /// failed enters a replayed epoch as `Live`, and the next epoch entry re-reads the record the
+    /// collector stores in the meantime.
+    async fn epoch_position(&self, epoch: tn_types::Epoch) -> EpochPosition {
+        // a missing record, a missing certificate and a storage error all mean "not known to be
+        // closed", so only a verified certificate marks the epoch as historical
+        self.consensus_chain
+            .epochs()
+            .certified_record_by_epoch(epoch)
+            .await
+            .map_or(EpochPosition::Live, |_| EpochPosition::Historical)
     }
 
     /// Resolve the [`Committee`] for `epoch`, the first step of configuring consensus.
@@ -919,6 +931,13 @@ where
         )
         .await?;
 
+        // The allowlists set below belong to the epoch the node enters. The position tells the
+        // reject path whether a resolved author outside them may be charged: only at the live
+        // tip. A replaying node drops such gossip without a penalty, because the author is most
+        // likely a live committee member of a later epoch.
+        let position = self.epoch_position(consensus_config.committee().epoch()).await;
+        network_handle.inner_handle().set_epoch_position(position).await?;
+
         // Update the authorized publishers for gossip every epoch. `primary_topic`,
         // `epoch_vote_topic` and `consensus_output_topic` are all committee-only publish topics:
         // restricting the publisher set makes the network layer (`verify_gossip`) drop messages
@@ -1095,6 +1114,11 @@ where
             consensus_config.network_config().admission().refresh_interval(),
         )
         .await?;
+
+        // the batch topic allowlist below belongs to the entered epoch: only a node at the live
+        // tip may charge a resolved author outside it (see the primary network for the reason)
+        let position = self.epoch_position(consensus_config.committee().epoch()).await;
+        network_handle.inner_handle().set_epoch_position(position).await?;
 
         let worker_address = consensus_config.worker_address(*worker_id);
 
@@ -2203,6 +2227,16 @@ mod tests {
         assert!(
             epochs.certified_record_by_epoch(1).await.is_ok(),
             "epoch 1's stored record must verify against its certificate"
+        );
+        assert_eq!(
+            manager.epoch_position(1).await,
+            EpochPosition::Historical,
+            "a certified record marks the epoch as a historical replay"
+        );
+        assert_eq!(
+            manager.epoch_position(2).await,
+            EpochPosition::Live,
+            "an epoch without a certified record stays live"
         );
         manager
             .configure_consensus(

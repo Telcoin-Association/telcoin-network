@@ -1,6 +1,7 @@
 # Validator production operations
 
-This page defines the production controls that sit around the node software. The node does not configure the host firewall, distribute releases, or provide an HSM or remote BLS signer.
+This page defines the production controls that sit around the node software.
+The node does not configure the host firewall, update itself, or provide an HSM or remote BLS signer.
 
 ## Network topology
 
@@ -77,17 +78,23 @@ BLS identity rotation affects committee registration and peer identity. Treat it
 
 ## Release and network update process
 
-There is no automatic binary release or node update channel in this repository. Operators currently build from source. Before a mainnet rollout, define one signed release manifest containing:
+Releases are published as signed git tags.
+Each release has a Linux x86_64 tarball on its GitHub release page and a `linux/amd64` image at `ghcr.io/telcoin-association/telcoin-network`.
+There is no automatic update: operators decide when to install a release.
+[Installing a release](installing-a-release.md) shows how to download and verify one, and [Release notes](release-notes.md) lists what changed in each.
 
-- the release version, source commit, and every first-party submodule commit;
-- a SHA-256 digest for each immutable artifact and container image;
-- build provenance and an SBOM;
-- supported network and configuration schema versions;
-- any fork epoch or activation condition;
-- rollback compatibility and the final safe rollback point;
-- signatures from the required release owners.
+A release provides:
 
-Verify the manifest and artifact digest on the target host before installation. Record the installed digest and node version in operator inventory.
+- a git tag signed with a maintainer key from `.github/maintainer-gpg-keys/`;
+- a `SHA256SUMS` file covering the tarball and the `IMAGE_DIGEST` file, with detached maintainer signatures in `SHA256SUMS.asc`;
+- the image digest in `IMAGE_DIGEST`, so the image can be pulled by digest instead of by tag;
+- the changelog section for that tag, also shown on the release notes page.
+
+A release does not yet provide an SBOM, third-party build provenance, reproducible builds, or machine-readable activation data.
+Activation conditions and the final safe rollback point arrive through the authenticated operator channel and the release notes.
+
+Verify the signature and the digests on the target host before installation.
+Record the installed tarball checksum or image digest and the `--version` output in operator inventory.
 
 Use this rollout order:
 
@@ -95,10 +102,20 @@ Use this rollout order:
 2. Upgrade an observer or sentry canary and check sync, RPC, metrics, and peer behavior.
 3. Upgrade one validator and observe at least one normal consensus cycle.
 4. Continue in stake-weighted batches without taking enough stake offline to break quorum.
-5. Compare every node's running version, configuration digest, peer set, and chain progress with the release manifest.
+5. Compare every node's running version, configuration digest, peer set, and chain progress with the release's signed checksums and release notes.
 6. Stop before the rollback cutoff if acceptance checks fail, restore the prior artifact and configuration, and verify recovery.
 
-For an emergency patch, name an incident owner, a release owner, and an independent verifier. Freeze unrelated rollout changes, state the affected versions and activation deadline, use the same signed manifest and digest checks, and record each validator's completion. A protocol fork needs a separately approved activation plan and explicit readiness evidence from enough validator stake.
+The release that moves the consensus database to tndb makes a one-way change.
+On its first start the node copies its consensus database from MDBX into `<datadir>/consensus-db/tndb`, makes the copy durable, and then deletes the MDBX files.
+
+Once a node has started this release, rolling it back to an earlier (MDBX) release is not supported.
+The earlier release would find no MDBX data and start with no record of the votes and proposals this validator has made, so it could sign conflicting messages.
+The last rollback point for each node is before it first starts this release.
+Fix any problem found after that forward, with a later release.
+
+For an emergency patch, name an incident owner, a release owner, and an independent verifier.
+Freeze unrelated rollout changes, state the affected versions and activation deadline, use the same signature and digest checks, and record each validator's completion.
+A protocol fork needs a separately approved activation plan and explicit readiness evidence from enough validator stake.
 
 ## Capacity monitoring
 
@@ -113,24 +130,26 @@ The alert levels are starting points; tune them after a week of baseline data.
 | Memory pressure | `/proc/pressure/memory`, `full avg60` | Above 1 | The kernel is reclaiming pages the node needs, so all its threads stall | Add RAM. On RPC nodes, lower `--rpc-cache.max-blocks`. Do not add swap. |
 | IO pressure | `/proc/pressure/io`, `full avg60` | Above 10 | Execution is waiting on disk | Move to faster storage or raise the volume's provisioned IOPS, then check for throttling. |
 | Disk throttling | The provider's volume metrics (GCP reports throttled read and write operations and bytes per disk); `iostat -x` queue size and await | Any sustained throttling | The volume has reached its provisioned IOPS or throughput | Raise the volume limits or move to local NVMe. |
-| Batch cache occupancy | Live data in `<datadir>/consensus-db/cache` from an MDBX statistic, for example `mdbx_stat -ef` from the libmdbx tools (pages used minus free pages, times the page size), against the 1 GiB maximum. Not the file size (see below) | 768 MiB of live data | Batches are not leaving the cache: consensus is not committing them, or their eviction is failing (see the next row) | Tell the Telcoin Association network team. Hardware does not raise this limit. |
-| Batch cache full | `tn_storage_write_failures_total{env="cache"}`, which counts failed write operations by `op`: `insert` (a bare insert), `begin` (a transaction that could not start, whose writes then go out one at a time, so it loses no write), `txn_insert` (an insert inside a transaction), `commit` (a transaction commit, which loses every write in it), `remove` and `clear`. Or the node log: an error from target `layered_db_runner` that starts `DB Insert` or `DB TXN Insert` and names a cache table, for example `DB Insert node_batches_cache` or `DB Insert our_node_batches_cache` followed by the MDBX error | Any occurrence | The cache reached its 1 GiB maximum. The node keeps running but holds each batch it could not write in memory until the batch is evicted or the epoch closes, so resident memory climbs. A rising `remove` or `commit` count means deletes, including evictions, are not freeing space in the file | Alert. Expect resident memory to grow while failures continue, and tell the Telcoin Association network team. |
+| Free disk space | Free space on the filesystem that holds the datadir (`df`, or node_exporter's `node_filesystem_avail_bytes`) | Below 20% of the volume, or less than a week of growth at the current rate | Every node is an archive node, so disk use only grows. The batch cache also has no fixed maximum: batches consensus has not committed take disk until they are committed or the epoch closes | Grow the volume or move to a larger one before it fills: a full disk stops the node. If free space falls faster than the chain grows, check the batch cache size row. |
+| Consensus database stopped | `tn_storage_tndb_failed`, one series per database (`env` is `epoch`, `kad` or `cache`); the node exiting with an error that names the database | 1 on any `env`, or the node exiting non-zero | A sync or write of that database failed (a full disk, an I/O error), or a read found damage on disk. The database refuses every write, and the node stops itself rather than run on storage it cannot write. Any other storage failure of the node's own (a consensus pack, the epoch records, the certificate archive) stops it the same way | Page. Read the exit error and the node log (target `tndb`), check free space and the disk, fix the cause, and restart the node. If the error names damage, or the restart refuses to open the database, run `telcoin-network db tndb-stat` and tell the Telcoin Association network team before you delete anything. |
+| Batch cache size | `tn_storage_tndb_log_bytes{env="cache"}`, the length of the cache's log under `<datadir>/consensus-db/tndb/cache`. It grows with each batch written and removed, and drops at each compaction (`tn_storage_tndb_compactions_total{env="cache",outcome="switched"}`) | Above 768 MiB for 10 minutes | Batches are not leaving the cache (consensus is not committing them), or its compactions are failing (see the next row) | Check the next row. If compactions succeed and the log still grows, tell the Telcoin Association network team. |
+| Consensus database compactions failing | `tn_storage_tndb_compaction_abandons_total`, by `env` and `cause`, beside `tn_storage_tndb_compactions_total{outcome="switched"}` | 2 or more abandons in 3 hours for one `env`, with no switched compaction in those 3 hours. Retries slow to one an hour, so a plain count such as 3 in an hour goes quiet about 75 minutes into a failure that persists; this one keeps firing until a compaction succeeds | The log is not being compacted, so its disk use keeps growing. `cause` says why: `disk_full` (not enough free space for the copy: the database's current size plus 384 MiB to start one, 256 MiB while it runs), `writer_outran` (writes faster than a compaction can catch up, an extreme burst), `corruption`, `panic` or `error` | `disk_full`: free disk space. `corruption`: stop the node, run `telcoin-network db tndb-stat`, and tell the Telcoin Association network team. Otherwise tell the network team. |
+| Consensus database syncs | p99 of `tn_storage_tndb_sync_seconds` per `env`, over 5 minutes | Above 100 ms | Votes and proposals wait for these syncs before they leave the node | Check IO pressure and disk throttling. |
 | Engine backlog | `tn_engine_queued_outputs`, 0 to 8 | 4 or more for 5 minutes | Execution is falling behind consensus | At 8 the engine queue is full and outputs back up into the 64-slot channel in front of it. Check CPU and IO pressure and `tn_engine_execution_duration_seconds`. |
 | Resident memory | `reth_process_resident_memory_bytes` | Above 70% of RAM | Queued outputs, RPC caches or the transaction pool are growing | Compare with the engine backlog and the RPC request rate. A climb right after a restart is replay and should fall once the node catches up. |
 
 Pressure stall information needs a kernel built with PSI support, which mainline Linux added in 4.20.
 If `/proc/pressure` is missing, the running kernel lacks it or has it disabled.
 
-The batch cache is an MDBX file that never shrinks.
-Committed batches are evicted when their consensus output, already saved to the epoch pack, is forwarded to execution, and the rest are removed at each epoch close.
-The file keeps its size either way, so `du` shows the highest level the file has reached on that datadir, a high-water mark, not how full the cache is now.
-In the 2026-09 benchmark the file reached its 1 GiB maximum on every c3 validator and on four of ten e2 validators (the rest stopped at 960 MiB) while each 20-minute epoch carried only about 0.5 GB of batch data.
-The cache now holds batches that are not yet committed, not an epoch's committed batch data (see [Per-epoch batch-cache ceiling](hardware-requirements.md#per-epoch-batch-cache-ceiling)).
-Read live occupancy from MDBX instead.
-The release exports no metric for it.
+The consensus database is tndb: one log per database under `<datadir>/consensus-db/tndb/` (`epoch`, `kad` and `cache`), each with an index per table.
+Removed and overwritten rows stay in a log until a background compaction rewrites its live rows into a new generation (`gen-N`) and deletes the old one.
+The cache log compacts once it is at least 256 MiB and twice its size after the last compaction, so its size rises and falls instead of only growing; it can briefly hold two generations while a compaction runs.
+The epoch log resets when each epoch closes.
+Committed batches are evicted when their consensus output, already saved to the epoch pack, is forwarded to execution, and the rest are removed at each epoch close, so the cache's live data is the batches not yet committed (see [Per-epoch batch-cache ceiling](hardware-requirements.md#per-epoch-batch-cache-ceiling)).
+With the node stopped, `telcoin-network db tndb-stat` reports each database's live and dead bytes, its generation and the state of its indexes.
 Summed over all validators since the epoch started, `tn_worker_batch_size_bytes` gives a rough estimate of the batch data a node has written to its cache, and on a node that stayed in sync the estimate runs low.
 The histogram records each batch once, when its worker reports it to the primary, but a node writes each of its own batches to the cache twice and also writes every peer batch it validates, including ones that failed quorum.
-It is not live occupancy, because committed batches are evicted.
+It is not the cache's live data, because committed batches are evicted.
 
 Resident memory includes pages of the memory-mapped databases that the process has touched, so it rises slowly as the database working set grows.
 Alert on how fast it climbs during load and after restarts, not only on the level.
@@ -140,7 +159,7 @@ Alert on how fast it climbs during load and after restarts, not only on the leve
 - firewall policy tested from allowed and denied source networks;
 - signed address manifest distribution and rollback rehearsal;
 - BLS backup and isolated recovery rehearsal;
-- signed artifact verification on every target platform;
+- release signature and digest verification on every target host;
 - canary, phased rollout, and rollback rehearsal;
 - quorum dashboard based on validator stake and running version;
 - incident contacts and an out-of-band coordination channel.
