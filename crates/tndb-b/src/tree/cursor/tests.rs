@@ -1704,6 +1704,56 @@ fn owned_cursor_moves_match_a_model_and_the_borrowed_cursor() {
     }
 }
 
+/// An owned cursor that [`RoCursor::reset`] forgets the position of moves as a new cursor of the
+/// same snapshot and table: after random moves leave it anywhere (at an entry, past either end,
+/// unset), a reset and then a random script of moves give what a new cursor's script gives,
+/// call by call, with the same state after each call.
+#[test]
+fn a_reset_cursor_moves_as_a_fresh_one() {
+    let _report = ReportSeed(7);
+    let mut rng = Rng(7 * 0x0051_7CC1);
+    let dir = TempDir::with_prefix("tndb_b_reset").expect("temp dir");
+    let env = Env::open(dir.path().join("db"), EnvOptions::default()).expect("open");
+    let shape =
+        Shape { page_size: 4096, n: 600, keys: (0, 40), vmax: 80, delete_pct: 0, groups: 12 };
+    let mut map = BTreeMap::new();
+    let mut rw = env.begin_rw().expect("begin");
+    let t = rw.create_table("t").expect("t");
+    for i in 0..shape.n {
+        let key = shape_key(&mut rng, &shape);
+        let value: Vec<u8> = (0..rng.len_upto(shape.vmax)).map(|j| (i + j) as u8).collect();
+        rw.put(&t, &key, &value).expect("put");
+        map.insert(key, value);
+    }
+    rw.commit().expect("commit");
+    let ro = Arc::new(env.begin_ro().expect("ro"));
+    assert!(ro.table_stat(&t).expect("stat").height >= 2);
+    let mut model = Model::new(&map);
+    let mut reused = ro.cursor_owned(&t).expect("cursor");
+    let mut held = 0;
+    for round in 0..400 {
+        for _ in 0..rng.below(12) {
+            let op = Op::pick(&mut rng, &model);
+            model.apply(&op);
+            apply_owned(&mut reused, &op);
+        }
+        held += usize::from(reused.state() != State::Unset);
+        reused.reset();
+        model.pos = Pos::Unset;
+        let mut fresh = ro.cursor_owned(&t).expect("cursor");
+        assert_eq!(reused.state(), fresh.state(), "round {round}");
+        for step in 0..1 + rng.below(6) {
+            let op = Op::pick(&mut rng, &model);
+            model.apply(&op);
+            let want = apply_owned(&mut fresh, &op);
+            assert_eq!(apply_owned(&mut reused, &op), want, "round {round} step {step} {op:?}");
+            assert_eq!(reused.state(), fresh.state(), "round {round} step {step} {op:?}");
+        }
+    }
+    assert!(held > 200, "the moves left the cursor positioned in {held} of 400 rounds");
+    assert!(env.failure().is_none(), "{:?}", env.failure());
+}
+
 /// An owned cursor whose transaction handle has dropped keeps the snapshot: while later commits
 /// rewrite, clear and refill its table (freeing every page the cursor's tree used, and reusing
 /// the pages they may), it reads the old values, overflow runs included, from another thread.

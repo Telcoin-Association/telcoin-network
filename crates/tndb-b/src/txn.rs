@@ -63,9 +63,12 @@ impl Table {
         self.id == other.id && (Arc::ptr_eq(&self.name, &other.name) || self.name == other.name)
     }
 
-    /// Test-only: the table's id.
-    #[cfg(test)]
-    pub(crate) fn id(&self) -> u32 {
+    /// The table's id. A committed table's id is never given to another table over the file's
+    /// life, so among the handles that open cursors in one transaction (each names a table of
+    /// its state) the id tells the tables apart; across files, or for a handle of a table whose
+    /// creation aborted, it does not (see [`Table`]).
+    #[inline]
+    pub fn id(&self) -> u32 {
         self.id
     }
 }
@@ -879,8 +882,8 @@ impl RoTxn {
     /// [`Self::cursor_owned`]'s does (see [`DupRoCursor`]). [`Error::TableKind`] for a plain
     /// table.
     ///
-    /// The cursor keeps no copy of the handle when the snapshot's [`TableRoots`] remembers it
-    /// (its first slot read here, as [`Self::root`] reads it), only the slot's index.
+    /// The cursor keeps no copy of the handle when the snapshot's `TableRoots` remembers it
+    /// (its first slot read here, as `RoTxn::root` reads it), only the slot's index.
     #[inline]
     pub fn dup_cursor_owned(self: &Arc<Self>, table: &Table) -> Result<DupRoCursor> {
         let (handle, outer_root, key_len) = match self.snapshot.tables.at_home(table) {
@@ -953,6 +956,14 @@ impl RoCursor {
     #[cfg(test)]
     pub(crate) fn state(&self) -> cursor::State {
         self.tree.state()
+    }
+
+    /// Forget the position: after `reset` the cursor behaves exactly as a new cursor from
+    /// [`RoTxn::cursor_owned`] on the same snapshot and table, unset, with no descent or
+    /// allocation spent on it (a pool of cursors reuses one this way).
+    #[inline]
+    pub fn reset(&mut self) {
+        self.tree.unset();
     }
 
     /// Run a move over the snapshot, latching damage it finds.
@@ -1184,6 +1195,15 @@ impl DupRoCursor {
     #[cfg(test)]
     pub(crate) fn state(&self) -> cursor::State {
         self.walk.state()
+    }
+
+    /// Forget the position, keeping the walker's buffers: after `reset` the cursor behaves
+    /// exactly as a new cursor from [`RoTxn::dup_cursor_owned`] on the same snapshot and table,
+    /// unset, with no descent spent on it and the logical key's buffer kept for its next row (a
+    /// pool of cursors reuses one this way).
+    #[inline]
+    pub fn reset(&mut self) {
+        self.walk.unset();
     }
 
     /// Test-only: the first and last keys of the outer and the nested leaf the cursor is at.

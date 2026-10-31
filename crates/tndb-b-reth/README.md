@@ -37,6 +37,12 @@ tx.commit()?;
 - **`TndbArgs`:** 4 KiB pages by default (any power of two from 4 to 64 KiB, fixed when the file
   is created), the engine's map reserve, and `SyncMode::Durable` (or `NoSync`, made durable by
   `TndbEnv::sync` or the drop).
+- **Read cursors are pooled per transaction:** a `TndbTx` keeps the engine cursors its dropped
+  cursors give back, up to four a table, and its next `cursor_read` or `cursor_dup_read` of that
+  table takes one and resets it (the engine's `reset`: the cursor then behaves exactly as a new
+  one) instead of opening one, which saves the open on every cursor after a table's first. A
+  cursor may still outlive its transaction: it then gives its engine cursor to a pool nobody
+  takes from, freed with the last cursor. Write cursors are not pooled.
 - **`TndbEnvKind::RO`** opens through the engine's read-only open: an existing file no writer
   holds (the node stopped), a shared lock, never written or synced; `tx_mut` is `MDBX_EACCESS`.
 - **Table stats:** `table_stats` gives the figures of each of reth's tables the file has, in the

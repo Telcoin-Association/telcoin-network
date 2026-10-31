@@ -1,7 +1,7 @@
 //! reth's transactions: [`TndbTx`] (read-only) and [`TndbTxMut`] (read-write).
 
 use crate::{
-    cursor::{last_is_row_of, ReadCursor, TndbCursor, TndbCursorMut, WriteCursor},
+    cursor::{last_is_row_of, ReadCursor, ReadPool, TndbCursor, TndbCursorMut, WriteCursor},
     dup::DupLayout,
     env::{resolve, ReaderWatch, TableMap},
     error::{self, Mdbx},
@@ -133,16 +133,31 @@ impl DupLookup for RwTxn {
 }
 
 /// A read-only transaction: one committed state, unaffected by later commits. Its cursors
-/// ([`TndbCursor`]) own a share of it, so they live on after it drops.
+/// ([`TndbCursor`]) own a share of it, so they live on after it drops. A dropped cursor gives its
+/// engine cursor back to the transaction's pool (`ReadPool`, up to four a table), and a new
+/// cursor on the same table takes it, reset, in place of a new one.
 #[derive(Debug)]
 pub struct TndbTx {
     txn: Arc<RoTxn>,
     tables: Arc<TableMap>,
+    pool: Arc<ReadPool>,
 }
 
 impl TndbTx {
     pub(crate) fn new(txn: RoTxn, tables: Arc<TableMap>) -> Self {
-        Self { txn: Arc::new(txn), tables }
+        Self { txn: Arc::new(txn), tables, pool: Arc::default() }
+    }
+
+    /// Test-only: the engine cursors the transaction's pool holds.
+    #[cfg(test)]
+    pub(crate) fn pooled_cursors(&self) -> usize {
+        self.pool.len()
+    }
+
+    /// Test-only: a weak handle on the transaction's pool, to see when it is freed.
+    #[cfg(test)]
+    pub(crate) fn pool_weak(&self) -> std::sync::Weak<ReadPool> {
+        Arc::downgrade(&self.pool)
     }
 }
 
@@ -172,9 +187,15 @@ impl DbTx for TndbTx {
     fn cursor_read<T: Table>(&self) -> Result<Self::Cursor<T>, DatabaseError> {
         let entry = resolve::<T>(&self.tables, &*self.txn)?;
         let (table, dup) = entry.check::<T>()?;
-        let cursor = ReadCursor::open(&self.txn, table, dup)
-            .map_err(|e| DatabaseError::InitCursor(error::info(&e)))?;
-        Ok(TndbCursor::new(cursor, dup))
+        let id = table.id();
+        let cursor = match self.pool.take(id) {
+            Some(cursor) => cursor,
+            None => Box::new(
+                ReadCursor::open(&self.txn, table, dup)
+                    .map_err(|e| DatabaseError::InitCursor(error::info(&e)))?,
+            ),
+        };
+        Ok(TndbCursor::new(cursor, dup, Arc::clone(&self.pool), id))
     }
 
     fn cursor_dup_read<T: DupSort>(&self) -> Result<Self::DupCursor<T>, DatabaseError> {

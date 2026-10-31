@@ -516,6 +516,44 @@ fn dup_cursor_moves_match_the_composite_twin_heavy() {
     twin_moves(&shape, 0..16, 60_000);
 }
 
+/// A dup cursor that [`DupRoCursor::reset`] forgets the position of moves as a new dup cursor of
+/// the same snapshot and table: after random calls leave it anywhere (on a row of a nested tree,
+/// past either end, unset), a reset and then a random script of calls give what a new cursor's
+/// script gives, call by call, with the same state after each call.
+#[test]
+fn a_reset_cursor_moves_as_a_fresh_one() {
+    let seed = 0x2a2a_7e5e;
+    let _report = ReportSeed(seed);
+    let mut rng = Rng(seed);
+    let (_dir, path) = temp("tndb_b_dup_cursor_reset");
+    let env = open(&path, SyncMode::NoSync);
+    let shape = Shape { keys: 200, big_keys: 2, big_rows: 300, run_pct: 2, nested_height: 2 };
+    let (d, _, rows) = twins(&env, &shape, &mut rng);
+    let rows: Vec<Kv> = rows.into_iter().collect();
+    let ro = Arc::new(env.begin_ro().expect("ro"));
+    let at = |c: &DupRoCursor| c.current().expect("current").map(|(k, _)| k.to_vec());
+    let mut reused = ro.dup_cursor_owned(&d).expect("dup cursor");
+    let mut held = 0;
+    for round in 0..400 {
+        for _ in 0..rng.below(12) {
+            let op = Op::pick(&mut rng, &rows, at(&reused).as_deref());
+            let _ = on_dup(&mut reused, &op);
+        }
+        held += usize::from(reused.state() != State::Unset);
+        reused.reset();
+        let mut fresh = ro.dup_cursor_owned(&d).expect("dup cursor");
+        assert_eq!(reused.state(), fresh.state(), "round {round}");
+        for step in 0..1 + rng.below(6) {
+            let op = Op::pick(&mut rng, &rows, at(&fresh).as_deref());
+            let want = on_dup(&mut fresh, &op);
+            assert_eq!(on_dup(&mut reused, &op), want, "round {round} step {step} {op:?}");
+            assert_eq!(reused.state(), fresh.state(), "round {round} step {step} {op:?}");
+        }
+    }
+    assert!(held > 200, "the calls left the cursor positioned in {held} of 400 rounds");
+    assert!(env.failure().is_none(), "no call latched: {:?}", env.failure());
+}
+
 /// A dup cursor of a plain table is refused with `TableKind`, with no latch.
 #[test]
 fn dup_cursors_on_a_plain_table_are_table_kind() {

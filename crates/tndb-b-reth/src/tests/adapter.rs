@@ -5,7 +5,7 @@
 
 use super::{dup::error_name, mdbx_port::create_test_db};
 use crate::{
-    cursor::{ReadCursor, WriteCursor},
+    cursor::{ReadCursor, ReadPool, WriteCursor},
     env::{warning_due, NEVER_WARNED},
     error, TndbArgs, TndbCursor, TndbCursorMut, TndbEnv, TndbEnvKind,
 };
@@ -1149,10 +1149,11 @@ fn name_hasher_separates_reths_tables() {
     assert_eq!(hashes.len(), Tables::ALL.len());
 }
 
-/// The reth cursors hold their engine cursor inline ([`ReadCursor`], [`WriteCursor`]), as large
-/// as its larger arm plus at most a tag word (neither arm boxed, never both held), and beside it
-/// only the adapter's own fields: 80 bytes for a read cursor (its `Rows`), 160 for a write cursor
-/// (`Rows`, the shared transaction, the table handle and two buffers).
+/// The engine cursor of a reth cursor ([`ReadCursor`], [`WriteCursor`]) is as large as its larger
+/// arm plus at most a tag word (neither arm boxed, never both held). A write cursor holds it
+/// inline, beside 160 bytes of its own (`Rows`, the shared transaction, the table handle and two
+/// buffers); a read cursor holds it boxed, so its pool takes it back without a move of the
+/// engine cursor, beside 96 bytes of its own (its `Rows`, the pool's share and the table's id).
 #[cfg(target_pointer_width = "64")]
 #[test]
 fn tndb_cursors_stay_small() {
@@ -1162,8 +1163,197 @@ fn tndb_cursors_stay_small() {
     let write = size_of::<TxnCursor>().max(size_of::<DupTxnCursor>());
     assert!(size_of::<ReadCursor>() <= read + 8, "{}", size_of::<ReadCursor>());
     assert!(size_of::<WriteCursor>() <= write + 8, "{}", size_of::<WriteCursor>());
+    assert_eq!(size_of::<Option<Box<ReadCursor>>>(), 8);
     let cursor = size_of::<TndbCursor<PlainStorageState>>();
-    assert!(cursor <= read + 8 + 80, "{cursor} over {read}");
+    assert!(cursor <= 8 + 96, "{cursor}");
     let cursor = size_of::<TndbCursorMut<PlainStorageState>>();
     assert!(cursor <= write + 8 + 160, "{cursor} over {write}");
+}
+
+/// Rows of a plain table (`CanonicalHeaders`), a nested dup table (`PlainStorageState`) and a
+/// composite dup table (`StorageChangeSets`), with the keys a script seeks (present and absent).
+struct PoolRows {
+    headers: Vec<u64>,
+    addresses: Vec<Address>,
+    changes: Vec<reth_db_api::models::BlockNumberAddress>,
+    slots: Vec<B256>,
+}
+
+fn pool_rows(db: &TndbEnv) -> PoolRows {
+    use reth_db_api::models::BlockNumberAddress;
+    db.update(|tx| {
+        for k in (0..120_u64).step_by(3) {
+            tx.put::<CanonicalHeaders>(k, B256::with_last_byte(k as u8))?;
+        }
+        for a in (0..40_u8).step_by(2) {
+            for s in 0..1 + a % 5 {
+                let entry =
+                    StorageEntry { key: B256::with_last_byte(2 * s + 1), value: U256::from(a + s) };
+                tx.put::<PlainStorageState>(Address::with_last_byte(a), entry)?;
+                tx.put::<StorageChangeSets>(
+                    BlockNumberAddress((u64::from(a % 7), Address::with_last_byte(a))),
+                    entry,
+                )?;
+            }
+        }
+        Ok::<_, DatabaseError>(())
+    })
+    .unwrap()
+    .unwrap();
+    PoolRows {
+        headers: (0..125).collect(),
+        addresses: (0..42).map(Address::with_last_byte).collect(),
+        changes: (0..42)
+            .map(|a| BlockNumberAddress((u64::from(a % 7), Address::with_last_byte(a))))
+            .collect(),
+        slots: (0..12).map(B256::with_last_byte).collect(),
+    }
+}
+
+/// Call `op` (kinds 0 to 7) of a read cursor's script on `c`: first, last, next (twice the
+/// odds), prev, current, and a seek or a `seek_exact` of one of `keys`; the outcome as text.
+fn plain_step<T: Table>(c: &mut TndbCursor<T>, (op, i): (u8, usize), keys: &[T::Key]) -> String {
+    let key = keys[i % keys.len()].clone();
+    match op {
+        0 => format!("{:?}", c.first()),
+        1 => format!("{:?}", c.last()),
+        2 | 3 => format!("{:?}", c.next()),
+        4 => format!("{:?}", c.prev()),
+        5 => format!("{:?}", c.current()),
+        6 => format!("{:?}", c.seek(key)),
+        _ => format!("{:?}", c.seek_exact(key)),
+    }
+}
+
+/// [`plain_step`] with the dup calls too (kinds 8 to 13): `next_dup`, `prev_dup`, `next_no_dup`,
+/// `next_dup_val`, `last_dup`, and a `seek_by_key_subkey` of one of `keys` and `subkeys`.
+fn dup_step<T: reth_db_api::table::DupSort>(
+    c: &mut TndbCursor<T>,
+    (op, i): (u8, usize),
+    keys: &[T::Key],
+    subkeys: &[T::SubKey],
+) -> String {
+    use reth_db_api::cursor::DbDupCursorRO;
+    let key = keys[i % keys.len()].clone();
+    let subkey = subkeys[(i / keys.len()) % subkeys.len()].clone();
+    match op {
+        8 => format!("{:?}", c.next_dup()),
+        9 => format!("{:?}", c.prev_dup()),
+        10 => format!("{:?}", c.next_no_dup()),
+        11 => format!("{:?}", c.next_dup_val()),
+        12 => format!("{:?}", c.last_dup()),
+        13 => format!("{:?}", c.seek_by_key_subkey(key, subkey)),
+        _ => plain_step(c, (op, i), keys),
+    }
+}
+
+/// Rounds over table `T` of one read-only transaction: a cursor moved by a random script of
+/// `kinds` kinds of call (`step`) and dropped, then a cursor of table `O` moved and dropped, so
+/// the pool holds one engine cursor of each; then a new cursor of `T`, which takes the pooled
+/// one, and a new cursor of another transaction on the same state run one more script, and each
+/// call's outcome is the same on both.
+fn pooled_reads_as_fresh<T: Table, O: Table>(
+    db: &TndbEnv,
+    kinds: u8,
+    step: impl Fn(&mut TndbCursor<T>, (u8, usize)) -> String,
+) {
+    let mut seed = 0x9e37_79b9_7f4a_7c15_u64 ^ u64::from(kinds);
+    let mut rng = move || {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed
+    };
+    let tx = db.tx().unwrap();
+    let mut differed = 0;
+    for round in 0..300 {
+        let mut used = tx.cursor_read::<T>().unwrap();
+        for _ in 0..rng() % 8 {
+            let r = rng();
+            step(&mut used, ((r % u64::from(kinds)) as u8, (r >> 8) as usize));
+        }
+        drop(used);
+        let mut other = tx.cursor_read::<O>().unwrap();
+        other.last().unwrap();
+        drop(other);
+        assert_eq!(tx.pooled_cursors(), 2, "round {round}");
+        let mut pooled = tx.cursor_read::<T>().unwrap();
+        assert_eq!(tx.pooled_cursors(), 1, "round {round}");
+        let fresh_tx = db.tx().unwrap();
+        let mut fresh = fresh_tx.cursor_read::<T>().unwrap();
+        for s in 0..1 + rng() % 6 {
+            let r = rng();
+            let op = ((r % u64::from(kinds)) as u8, (r >> 8) as usize);
+            let want = step(&mut fresh, op);
+            differed += usize::from(want.contains("Some"));
+            assert_eq!(step(&mut pooled, op), want, "round {round} step {s} {op:?}");
+        }
+    }
+    assert!(differed > 300, "only {differed} calls found a row");
+}
+
+/// A read-only transaction's cursor that takes a pooled engine cursor (one a dropped cursor of
+/// the same table gave back, after any moves) reads as a new cursor does, call for call: plain
+/// moves and seeks on a plain table, and the dup calls too on a nested and on a composite dup
+/// table. Another table's cursor in the pool is never taken.
+#[test]
+fn a_pooled_cursor_reads_as_a_fresh_one() {
+    let (_dir, db) = create_test_db(TndbEnvKind::RW);
+    let rows = pool_rows(&db);
+    pooled_reads_as_fresh::<CanonicalHeaders, PlainStorageState>(&db, 8, |c, op| {
+        plain_step(c, op, &rows.headers)
+    });
+    pooled_reads_as_fresh::<PlainStorageState, CanonicalHeaders>(&db, 14, |c, op| {
+        dup_step(c, op, &rows.addresses, &rows.slots)
+    });
+    pooled_reads_as_fresh::<StorageChangeSets, PlainStorageState>(&db, 14, |c, op| {
+        dup_step(c, op, &rows.changes, &rows.slots)
+    });
+}
+
+/// A read-only cursor outlives its transaction: it reads the transaction's state after the
+/// handle drops, on another thread too, and its engine cursor goes back to the pool, which is
+/// freed with the last cursor.
+#[test]
+fn a_cursor_may_outlive_its_tx() {
+    let (_dir, db) = create_test_db(TndbEnvKind::RW);
+    pool_rows(&db);
+    let tx = db.tx().unwrap();
+    let pool = tx.pool_weak();
+    let mut kept = tx.cursor_read::<PlainStorageState>().unwrap();
+    drop(tx.cursor_read::<CanonicalHeaders>().unwrap());
+    drop(tx);
+    db.update(|tx| tx.clear::<PlainStorageState>()).unwrap().unwrap();
+    assert!(pool.upgrade().is_some(), "the cursor holds the pool");
+    let first = kept.first().unwrap().map(|(k, v)| (k, v.key));
+    assert_eq!(first, Some((Address::with_last_byte(0), B256::with_last_byte(1))));
+    let handle = thread::spawn(move || {
+        let rows = kept.walk(None).unwrap().count();
+        drop(kept);
+        rows
+    });
+    let rows: usize = (0..40_u8).step_by(2).map(|a| 1 + usize::from(a % 5)).sum();
+    assert_eq!(handle.join().unwrap(), rows);
+    assert!(pool.upgrade().is_none(), "the last cursor freed the pool");
+}
+
+/// The pool keeps at most [`ReadPool::PER_TABLE`] engine cursors a table: six cursors of one
+/// table dropped together leave four, six of another four more, and a cursor taken from the
+/// pool leaves it.
+#[test]
+fn the_cursor_pool_is_capped() {
+    let (_dir, db) = create_test_db(TndbEnvKind::RW);
+    pool_rows(&db);
+    let tx = db.tx().unwrap();
+    let headers: Vec<_> = (0..6).map(|_| tx.cursor_read::<CanonicalHeaders>().unwrap()).collect();
+    assert_eq!(tx.pooled_cursors(), 0);
+    drop(headers);
+    assert_eq!(tx.pooled_cursors(), ReadPool::PER_TABLE);
+    let slots: Vec<_> = (0..6).map(|_| tx.cursor_read::<PlainStorageState>().unwrap()).collect();
+    drop(slots);
+    assert_eq!(tx.pooled_cursors(), 2 * ReadPool::PER_TABLE);
+    let held: Vec<_> = (0..3).map(|_| tx.cursor_read::<CanonicalHeaders>().unwrap()).collect();
+    assert_eq!(tx.pooled_cursors(), 2 * ReadPool::PER_TABLE - 3);
+    drop(held);
+    assert_eq!(tx.pooled_cursors(), 2 * ReadPool::PER_TABLE);
 }

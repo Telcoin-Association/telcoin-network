@@ -15,6 +15,11 @@
 //! | none (MDBX's sync and check are its own tools) | [`TndbEnv::sync`], [`TndbEnv::check`] ([`CheckReport`]) | [`tndb_b::Env::sync`], [`tndb_b::Env::check`] |
 //! | none (MDBX's `page_ops` in its environment info are the nearest) | [`TndbEnv::io_stats`] ([`IoStats`]) | [`tndb_b::Env::io_stats`] |
 //!
+//! A [`TndbTx`] pools the engine cursors of its dropped cursors, up to four a table: a new read
+//! cursor of a table takes one and resets it (`RoCursor::reset`, `DupRoCursor::reset`, after
+//! which it behaves exactly as a new one) in place of an open, and a cursor that outlives its
+//! transaction gives its engine cursor to a pool nobody takes from, freed with the last cursor.
+//!
 //! Each of reth's tables is an engine table of the same name; the environment maps each name to
 //! its engine handle. Keys are stored encoded (`Encode`) and values compressed (`Compress`), as
 //! MDBX stores them.

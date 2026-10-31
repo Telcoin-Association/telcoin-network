@@ -38,6 +38,7 @@ use crate::{
     error::{self, Mdbx},
     tx::{compressed, no_data, SharedTxn},
 };
+use parking_lot::Mutex;
 use reth_db_api::{
     common::{IterPairResult, PairResult, ValueOnlyResult},
     cursor::{
@@ -138,6 +139,74 @@ impl ReadCursor {
         } else {
             Self::Flat(txn.cursor_owned(table)?)
         })
+    }
+
+    /// Forget the position: the cursor is then as [`Self::open`] made it (the engine's `reset`).
+    #[inline]
+    fn reset(&mut self) {
+        on_cursor!(ReadCursor, self, c => c.reset());
+    }
+}
+
+/// The engine read cursors that a read-only transaction's dropped [`TndbCursor`]s gave back, for
+/// its next cursors on the same tables: [`crate::TndbTx`]'s `cursor_read` takes one of its table
+/// and resets it before it opens a new one, which saves the open (the table's lookup in the
+/// snapshot, the transaction's share, and the copies of a new engine cursor's bytes) on every
+/// cursor after a table's first. The pool keeps [`Self::PER_TABLE`] cursors a table and drops the
+/// others.
+///
+/// It is shared by the transaction and its cursors, which may outlive it: a cursor dropped after
+/// its transaction gives its engine cursor to a pool nobody takes from, freed with the pool's
+/// last share. A cursor is keyed by its table's id ([`EngineTable::id`]): every handle that
+/// opens a cursor in one transaction names a committed table of its snapshot, and a committed
+/// table's id is never another table's, so within a transaction the id is the table. The lock is
+/// held for a scan of the pool and a push or a removal; a cursor the pool refuses drops after the
+/// lock is released.
+#[derive(Default)]
+pub(crate) struct ReadPool(Mutex<Vec<(u32, Box<ReadCursor>)>>);
+
+impl std::fmt::Debug for ReadPool {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ReadPool").finish_non_exhaustive()
+    }
+}
+
+impl ReadPool {
+    /// The most cursors of one table the pool keeps: as many as reth's code holds open at once on
+    /// one table of a read-only transaction, about.
+    pub(crate) const PER_TABLE: usize = 4;
+
+    /// A cursor of table `id` the pool holds, reset, or `None`.
+    #[inline]
+    pub(crate) fn take(&self, id: u32) -> Option<Box<ReadCursor>> {
+        let mut cursor = {
+            let mut pool = self.0.lock();
+            let at = pool.iter().rposition(|(table, _)| *table == id)?;
+            pool.swap_remove(at).1
+        };
+        cursor.reset();
+        Some(cursor)
+    }
+
+    /// Keep `cursor`, of table `id`, unless the pool holds [`Self::PER_TABLE`] of that table.
+    #[inline]
+    fn give_back(&self, id: u32, cursor: Box<ReadCursor>) {
+        let refused = {
+            let mut pool = self.0.lock();
+            if pool.iter().filter(|(table, _)| *table == id).count() < Self::PER_TABLE {
+                pool.push((id, cursor));
+                None
+            } else {
+                Some(cursor)
+            }
+        };
+        drop(refused);
+    }
+
+    /// Test-only: the cursors the pool holds.
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.0.lock().len()
     }
 }
 
@@ -985,22 +1054,42 @@ macro_rules! dup_reads {
 /// of the transaction.
 #[derive(Debug)]
 pub struct TndbCursor<T: Table> {
-    cursor: ReadCursor,
+    /// The engine cursor, held until the cursor drops and gives it back to `pool`.
+    cursor: Option<Box<ReadCursor>>,
     rows: Rows,
+    /// The transaction's pool, which takes the engine cursor back on drop.
+    pool: Arc<ReadPool>,
+    /// The engine table's id, the cursor's key in `pool`.
+    table: u32,
     _table: PhantomData<T>,
 }
 
 impl<T: Table> TndbCursor<T> {
-    pub(crate) const fn new(cursor: ReadCursor, dup: Option<DupLayout>) -> Self {
-        Self { cursor, rows: Rows::new(dup), _table: PhantomData }
+    pub(crate) const fn new(
+        cursor: Box<ReadCursor>,
+        dup: Option<DupLayout>,
+        pool: Arc<ReadPool>,
+        table: u32,
+    ) -> Self {
+        Self { cursor: Some(cursor), rows: Rows::new(dup), pool, table, _table: PhantomData }
     }
 
     /// Run `f` on the cursor's rows and its engine cursor.
+    #[inline]
     fn with<R>(
         &mut self,
         f: impl FnOnce(&mut Rows, &mut ReadCursor) -> Result<R, DatabaseError>,
     ) -> Result<R, DatabaseError> {
-        f(&mut self.rows, &mut self.cursor)
+        let cursor = self.cursor.as_deref_mut().expect("the engine cursor is held until drop");
+        f(&mut self.rows, cursor)
+    }
+}
+
+impl<T: Table> Drop for TndbCursor<T> {
+    fn drop(&mut self) {
+        if let Some(cursor) = self.cursor.take() {
+            self.pool.give_back(self.table, cursor);
+        }
     }
 }
 
