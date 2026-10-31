@@ -306,3 +306,7 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
     first block's first transaction survived the heal and the next append failed. TN's genesis
     is empty, so a crash between the static-file and MDBX commits of block 1 hit this. Same
     file; upstream's test fails without the fix.
+  - 0d1324f14: `prune_rows` on a writer holding uncommitted rows now commits the surviving rows'
+    offsets before writing the config (or drops the stale in-memory offset when all were
+    pruned), so a crash cannot leave a config that claims rows whose offsets are not on disk
+    (`nippy-jar/src/{writer.rs, lib.rs}`; upstream's two tests fail without the fix).
