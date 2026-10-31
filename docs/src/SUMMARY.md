@@ -12,6 +12,7 @@
   * [Established connection calibration](network/resource-budget.md)
   * [Vote latency during catch-up](network/catch-up-vote-latency.md)
   * [Handshake-start accounting](network/handshake-starts.md)
+  * [Inbound capacity qualification](network/inbound-capacity-qualification.md)
   * [Early Identity Refusal](network/early-identity-refusal.md)
   * [Gossip](network/gossip.md)
   * [Discovery](network/discovery.md)

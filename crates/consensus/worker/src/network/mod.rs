@@ -39,16 +39,21 @@ pub(crate) type Res = WorkerResponse;
 ///
 /// A permit is taken after the opening request frame is read and held until the
 /// serve ends, so this bounds the count of concurrent serves for public peers.
-/// Committee peers (the current and the next committee) draw first on a separate
-/// reserve of `COMMITTEE_RESERVED_BATCH_STREAMS` permits that public peers cannot
+/// Each committee key (the current and the next committee) draws first on its own
+/// reserve of `COMMITTEE_RESERVED_BATCH_STREAMS` permits that no other key can
 /// take, so public peers that fill this share cannot block a committee request.
 pub const MAX_CONCURRENT_BATCH_STREAMS: usize = 5;
 
-/// Batch-serve permits reserved for committee peers.
+/// Batch-serve permits reserved for each committee key.
 ///
-/// A committee peer takes a permit from this reserve first and then from the
-/// [`MAX_CONCURRENT_BATCH_STREAMS`] public share. A public peer never takes one.
-pub(crate) const COMMITTEE_RESERVED_BATCH_STREAMS: usize = 4;
+/// Each key of the current or the next committee has its own reserve of this many
+/// permits. That key takes a permit from its reserve first and then from the
+/// [`MAX_CONCURRENT_BATCH_STREAMS`] public share. A public peer never takes one,
+/// and no other committee key can take from this reserve. So committee keys that
+/// hold streams without progress cannot stop a different committee key from
+/// catching up (issue #1750). The per-peer cap ([`MAX_PENDING_REQUESTS_PER_PEER`],
+/// 2) lets a committee key open one more stream from the public share.
+pub(crate) const COMMITTEE_RESERVED_BATCH_STREAMS: usize = 1;
 
 /// Public share of the opening-read pool for inbound sync streams.
 ///
@@ -58,11 +63,16 @@ pub(crate) const COMMITTEE_RESERVED_BATCH_STREAMS: usize = 4;
 /// keeps it only for its bounded refusal or error write and close.
 pub(crate) const MAX_CONCURRENT_OPENING_READS: usize = 8;
 
-/// Opening-read permits reserved for committee peers.
+/// Opening-read permits reserved for each committee key.
 ///
-/// A committee peer takes a permit from this reserve first and then from the
-/// [`MAX_CONCURRENT_OPENING_READS`] public share. A public peer never takes one.
-pub(crate) const COMMITTEE_RESERVED_OPENING_READS: usize = 4;
+/// Each key of the current or the next committee has its own reserve of this many
+/// permits. That key takes a permit from its reserve first and then from the
+/// [`MAX_CONCURRENT_OPENING_READS`] public share. A public peer never takes one,
+/// and no other committee key can take from this reserve. So committee keys that
+/// hold streams without progress cannot stop a different committee key from
+/// catching up (issue #1750). The per-peer cap ([`MAX_PENDING_REQUESTS_PER_PEER`],
+/// 2) lets a committee key open one more stream from the public share.
+pub(crate) const COMMITTEE_RESERVED_OPENING_READS: usize = 1;
 
 /// Maximum batch digests allowed per sync batch request (`WorkerSyncRequest::Batches`).
 ///
@@ -184,8 +194,8 @@ struct SyncAdmission {
 ///
 /// Takes a per-peer slot first, so a peer at [`MAX_PENDING_REQUESTS_PER_PEER`]
 /// never holds a pool permit, then an opening-read permit for `tier`. A committee
-/// peer draws on the reserve before the public share; a public peer draws only on
-/// the public share. Returns `None` when either budget is full, and a slot taken
+/// peer draws on its own reserve before the public share; a public peer draws
+/// only on the public share. Returns `None` when either budget is full, and a slot taken
 /// before a refusal is released on drop.
 fn try_admit_opening(
     slots: &PeerSlots,
@@ -194,7 +204,12 @@ fn try_admit_opening(
     tier: PeerTier,
 ) -> Option<SyncAdmission> {
     slots.try_take(peer).and_then(|slot| {
-        opening.try_acquire(tier).map(|permit| SyncAdmission { peer, tier, slot, opening: permit })
+        opening.try_acquire(&peer, tier).map(|permit| SyncAdmission {
+            peer,
+            tier,
+            slot,
+            opening: permit,
+        })
     })
 }
 
@@ -216,17 +231,19 @@ enum OpeningRead {
 impl OpeningRead {
     /// Classify a decoded opening frame.
     ///
-    /// A request takes a permit from `batch_serve` for `tier` here, before the
-    /// caller releases the opening-read permit, so the stream always holds one of
-    /// the two.
+    /// A request takes a permit from `batch_serve` for `peer`, a peer of `tier`,
+    /// here, before the caller releases the opening-read permit, so the stream
+    /// always holds one of the two. A committee-tier `peer` takes the permit from
+    /// its own reserve first and then from the public share.
     fn from_frame(
         frame: SyncFrame<WorkerSyncRequest>,
         batch_serve: &ReservedPool,
+        peer: &BlsPublicKey,
         tier: PeerTier,
     ) -> Self {
         match frame {
             SyncFrame::Req(request) => batch_serve
-                .try_acquire(tier)
+                .try_acquire(peer, tier)
                 .map_or(Self::AtCapacity, |permit| Self::Admitted(request, permit)),
             SyncFrame::Ack
             | SyncFrame::Deny(_)
@@ -279,7 +296,7 @@ async fn admit_and_serve_sync_stream<S, F, Fut>(
     .await
     .map_or(OpeningRead::Silent, |frame| {
         frame.map_or_else(OpeningRead::Unreadable, |frame| {
-            OpeningRead::from_frame(frame, &batch_serve, tier)
+            OpeningRead::from_frame(frame, &batch_serve, &peer, tier)
         })
     });
 
@@ -589,13 +606,15 @@ pub struct WorkerNetwork<DB, Events> {
     ///
     /// A stream holds a permit while its opening request frame is read, which
     /// [`SYNC_REQUEST_READ_TIMEOUT`] bounds: [`MAX_CONCURRENT_OPENING_READS`] public
-    /// permits plus [`COMMITTEE_RESERVED_OPENING_READS`] for committee peers only.
+    /// permits plus [`COMMITTEE_RESERVED_OPENING_READS`] for each committee key,
+    /// which only that key may take.
     sync_opening: ReservedPool,
     /// Batch-serve pool for inbound sync streams.
     ///
     /// A stream takes a permit after its request frame is read and holds it until
     /// the serve ends: [`MAX_CONCURRENT_BATCH_STREAMS`] public permits plus
-    /// [`COMMITTEE_RESERVED_BATCH_STREAMS`] for committee peers only.
+    /// [`COMMITTEE_RESERVED_BATCH_STREAMS`] for each committee key, which only that
+    /// key may take.
     batch_serve: ReservedPool,
     /// Per-peer in-flight sync streams, capped at [`MAX_PENDING_REQUESTS_PER_PEER`].
     ///
@@ -1169,7 +1188,8 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn deny_unserved_sync_epoch_is_bounded_and_frees_permit() {
         let (_slots, _opening, batch_serve) = admission_budgets();
-        let permit = batch_serve.try_acquire(PeerTier::Public).expect("admit below the caps");
+        let permit =
+            batch_serve.try_acquire(&key(1), PeerTier::Public).expect("admit below the caps");
 
         // hold the permit on a task blocked on the pending deny write
         let task = tokio::spawn(async move {
@@ -1356,11 +1376,13 @@ mod tests {
     }
 
     /// Public peers can fill only the public share of the opening-read pool: past
-    /// it a new public peer is refused, while committee peers are still admitted
-    /// from their reserve until it is full too.
+    /// it a new public peer is refused. A committee key is still admitted from its
+    /// own reserve until that reserve is empty, and then it is refused. A second
+    /// committee key keeps its whole reserve and is still admitted (issue #1750).
     #[test]
     fn public_opening_reads_cannot_exhaust_the_committee_reserve() {
         let (slots, opening, _batch_serve) = admission_budgets();
+        let (committee, other) = (key(200), key(201));
 
         // one opening read each from as many public peers as the public share holds
         let public: Vec<_> = (0_u64..)
@@ -1375,39 +1397,49 @@ mod tests {
             try_admit_opening(&slots, &opening, key(100), PeerTier::Public).is_none(),
             "a new public peer is refused once the public share is full"
         );
-        assert_eq!(opening.available_reserved(), COMMITTEE_RESERVED_OPENING_READS);
+        assert_eq!(opening.available_reserved(&committee), COMMITTEE_RESERVED_OPENING_READS);
 
-        // committee peers still open streams, drawing on the reserve
-        let committee: Vec<_> = (200_u64..)
-            .take(COMMITTEE_RESERVED_OPENING_READS)
-            .map(|seed| {
-                try_admit_opening(&slots, &opening, key(seed), PeerTier::Committee)
-                    .expect("committee opening read from the reserve")
-            })
-            .collect();
-        assert_eq!(opening.available_reserved(), 0);
+        // one committee key opens streams from its own reserve until it is empty
+        let drained: Vec<_> = std::iter::repeat_with(|| {
+            try_admit_opening(&slots, &opening, committee, PeerTier::Committee)
+                .expect("committee opening read from its own reserve")
+        })
+        .take(COMMITTEE_RESERVED_OPENING_READS)
+        .collect();
+        assert_eq!(opening.available_reserved(&committee), 0);
         assert!(
-            try_admit_opening(&slots, &opening, key(300), PeerTier::Committee).is_none(),
-            "a committee peer is refused once both the reserve and the public share are full"
+            try_admit_opening(&slots, &opening, committee, PeerTier::Committee).is_none(),
+            "a committee key is refused once its own reserve and the public share are full"
         );
 
-        drop((public, committee));
+        // a second committee key keeps its whole reserve and is still admitted
+        assert_eq!(opening.available_reserved(&other), COMMITTEE_RESERVED_OPENING_READS);
+        let admitted = try_admit_opening(&slots, &opening, other, PeerTier::Committee)
+            .expect("a second committee key opens from its own reserve");
+        assert_eq!(
+            opening.available_reserved(&other),
+            COMMITTEE_RESERVED_OPENING_READS.saturating_sub(1)
+        );
+
+        drop((public, drained, admitted));
         assert_eq!(opening.available_public(), MAX_CONCURRENT_OPENING_READS);
-        assert_eq!(opening.available_reserved(), COMMITTEE_RESERVED_OPENING_READS);
+        assert_eq!(opening.available_reserved(&committee), COMMITTEE_RESERVED_OPENING_READS);
+        assert_eq!(opening.available_reserved(&other), COMMITTEE_RESERVED_OPENING_READS);
     }
 
     /// Three public identities, each at the per-peer cap, open six streams with
     /// readable requests while every serve stays pending. Five streams fill the
     /// public share of the batch-serve pool and the sixth is refused, but none of
-    /// them can take the committee reserve, so a committee request is still
-    /// admitted and served.
+    /// them can take a committee reserve, so a committee request is still
+    /// admitted and served from the reserve of its key. A second committee key
+    /// keeps its whole reserve, and its request is served too (issue #1750).
     #[tokio::test(start_paused = true)]
     async fn three_public_identities_cannot_block_a_committee_batches_request() {
         let task_manager = TaskManager::default();
         let (handle, mut commands) = observed_handle(&task_manager);
         let (slots, opening, batch_serve) = admission_budgets();
-        let committee = key(0);
-        let reserved = ReservedPeers::new([committee]);
+        let (committee, other) = (key(0), key(4));
+        let reserved = ReservedPeers::new([committee, other]);
         let served = Arc::new(AtomicUsize::new(0));
         let max_frame = max_sync_frame_size(0);
         let request = encoded_request(BTreeSet::from([B256::default()])).await;
@@ -1438,9 +1470,9 @@ mod tests {
         );
         assert_eq!(batch_serve.available_public(), 0, "the public share is full");
         assert_eq!(
-            batch_serve.available_reserved(),
+            batch_serve.available_reserved(&committee),
             COMMITTEE_RESERVED_BATCH_STREAMS,
-            "public peers never take the committee reserve"
+            "public peers never take a committee reserve"
         );
         assert_eq!(
             tasks.iter().filter(|task| task.is_finished()).count(),
@@ -1457,7 +1489,7 @@ mod tests {
         let admission = try_admit_opening(&slots, &opening, committee, reserved.tier(&committee))
             .expect("committee opening read admitted");
         let committee_task = tokio::spawn(admit_and_serve_sync_stream(
-            RequestStream::new(request, WriteCredit::Granted),
+            RequestStream::new(request.clone(), WriteCredit::Granted),
             admission,
             batch_serve.clone(),
             handle.clone(),
@@ -1472,11 +1504,41 @@ mod tests {
             "the committee request is served"
         );
         assert_eq!(
-            batch_serve.available_reserved(),
+            batch_serve.available_reserved(&committee),
             COMMITTEE_RESERVED_BATCH_STREAMS.saturating_sub(1),
-            "the committee serve holds a reserved permit"
+            "the committee serve holds a permit from the reserve of its key"
         );
         assert!(!committee_task.is_finished(), "the committee serve is still in flight");
+
+        // a second committee key keeps its whole reserve, so its request is served too
+        assert_eq!(
+            batch_serve.available_reserved(&other),
+            COMMITTEE_RESERVED_BATCH_STREAMS,
+            "one committee key never takes the reserve of another"
+        );
+        let admission = try_admit_opening(&slots, &opening, other, reserved.tier(&other))
+            .expect("second committee opening read admitted");
+        let other_task = tokio::spawn(admit_and_serve_sync_stream(
+            RequestStream::new(request, WriteCredit::Granted),
+            admission,
+            batch_serve.clone(),
+            handle.clone(),
+            max_frame,
+            pending_serve(served.clone()),
+        ));
+        tokio::time::sleep(Duration::from_millis(1)).await;
+
+        assert_eq!(
+            served.load(Ordering::SeqCst),
+            MAX_CONCURRENT_BATCH_STREAMS.saturating_add(2),
+            "the second committee request is served"
+        );
+        assert_eq!(
+            batch_serve.available_reserved(&other),
+            COMMITTEE_RESERVED_BATCH_STREAMS.saturating_sub(1),
+            "the second committee serve holds a permit from the reserve of its key"
+        );
+        assert!(!other_task.is_finished(), "the second committee serve is still in flight");
         assert!(drain_mild_penalties(&mut commands).is_empty(), "no stream was charged");
     }
 

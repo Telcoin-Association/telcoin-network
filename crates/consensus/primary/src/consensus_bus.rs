@@ -75,6 +75,183 @@ const EXEX_CONSENSUS_OUTPUT_CHANNEL_CAPACITY: usize = 100;
 /// the consumption that would make room (see [`ConsensusBusApp::try_requeue_epoch_pack_file`]).
 pub const EPOCH_REQUEST_QUEUE_CAPACITY: usize = 1024;
 
+/// What an always-subscribed [`QueChannel`] holds while no consumer holds its receiver.
+///
+/// A live consumer drains the channel as messages arrive, so the channel can fill only in the gap
+/// between two consumers and before the first one. The policy names the messages worth holding in
+/// that gap and caps them. The channel drops every other message that arrives in the gap.
+pub(crate) struct GapPolicy<T> {
+    /// The channel name for the log.
+    name: &'static str,
+    /// The byte weight of a message to hold, or `None` for a message to drop.
+    hold: fn(&T) -> Option<usize>,
+    /// The most messages that the channel holds in one gap.
+    max_items: usize,
+    /// The most bytes that the channel holds in one gap.
+    max_bytes: usize,
+}
+
+impl<T> GapPolicy<T> {
+    /// Hold the messages that `hold` weighs, at most `max_items` of them and `max_bytes` bytes in
+    /// one gap.
+    pub(crate) fn new(
+        name: &'static str,
+        hold: fn(&T) -> Option<usize>,
+        max_items: usize,
+        max_bytes: usize,
+    ) -> Self {
+        Self { name, hold, max_items, max_bytes }
+    }
+
+    /// The most messages that the channel holds in one gap.
+    #[cfg(test)]
+    pub(crate) fn max_items(&self) -> usize {
+        self.max_items
+    }
+}
+
+impl<T> std::fmt::Debug for GapPolicy<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GapPolicy")
+            .field("name", &self.name)
+            .field("max_items", &self.max_items)
+            .field("max_bytes", &self.max_bytes)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Whether a consumer holds the receiver of a held [`QueChannel`], and what the channel held and
+/// dropped since the last consumer left.
+#[derive(Debug, Default)]
+struct GapState {
+    /// A consumer holds the receiver. Subscribe sets it and the receiver's drop clears it.
+    present: bool,
+    /// Messages held in this gap.
+    items: usize,
+    /// Bytes held in this gap.
+    bytes: usize,
+    /// Messages dropped in this gap because the policy does not hold them.
+    dropped: usize,
+    /// Messages that the policy holds, dropped in this gap at the item cap or the byte cap.
+    over_budget: usize,
+}
+
+impl GapState {
+    /// The state when a consumer subscribes: present, with the gap counters at zero.
+    fn with_consumer() -> Self {
+        Self { present: true, ..Self::default() }
+    }
+
+    /// Hold a message that weighs `bytes` when it fits the caps of `policy`, else count it over
+    /// budget.
+    fn hold<T>(&mut self, bytes: usize, policy: &GapPolicy<T>) -> GapAdmit {
+        let total = self.bytes.saturating_add(bytes);
+        if self.items < policy.max_items && total <= policy.max_bytes {
+            self.items = self.items.saturating_add(1);
+            self.bytes = total;
+            GapAdmit::Held(bytes)
+        } else {
+            self.over_budget = self.over_budget.saturating_add(1);
+            GapAdmit::OverBudget
+        }
+    }
+
+    /// Count a message that the policy does not hold as dropped.
+    fn drop_unheld(&mut self) -> GapAdmit {
+        self.dropped = self.dropped.saturating_add(1);
+        GapAdmit::Unheld
+    }
+}
+
+/// The gap policy of a [`QueChannel`] and its state, shared by its clones and its receiver.
+#[derive(Debug)]
+struct GapHold<T> {
+    /// What the channel holds in a gap.
+    policy: GapPolicy<T>,
+    /// The consumer presence and the gap counters.
+    state: Mutex<GapState>,
+}
+
+impl<T> GapHold<T> {
+    /// Start in a gap: no consumer has subscribed yet.
+    fn new(policy: GapPolicy<T>) -> Self {
+        Self { policy, state: Mutex::new(GapState::default()) }
+    }
+
+    /// Decide what the channel does with `value`. With a consumer present, it queues every
+    /// message.
+    fn admit(&self, value: &T) -> GapAdmit {
+        let mut state = self.state.lock();
+        if state.present {
+            GapAdmit::Open
+        } else {
+            (self.policy.hold)(value)
+                .map(|bytes| state.hold(bytes, &self.policy))
+                .unwrap_or_else(|| state.drop_unheld())
+        }
+    }
+
+    /// Release `bytes` that a held message no longer takes, saturating at zero.
+    fn release(&self, bytes: usize) {
+        let mut state = self.state.lock();
+        state.items = state.items.saturating_sub(1);
+        state.bytes = state.bytes.saturating_sub(bytes);
+    }
+
+    /// Start the turn of a new consumer.
+    ///
+    /// Discard the queued messages that the policy does not hold: the requests, errors and
+    /// streams that the previous consumer left. Put the held ones back in order, mark the
+    /// consumer present and reset the gap counters. Write one log with what the gap dropped and
+    /// what this discards. A message sent while this runs can land ahead of the held ones.
+    fn enter(&self, rx: &mut mpsc::Receiver<T>, tx: &mpsc::Sender<T>) {
+        let queued: Vec<T> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        let (kept, discarded) =
+            queued.into_iter().fold((0_usize, 0_usize), |(kept, discarded), value| {
+                if (self.policy.hold)(&value).is_some() {
+                    // The queue was just drained, so it has room for the held messages. Count
+                    // one that it still refuses as discarded.
+                    tx.try_send(value).map_or((kept, discarded.saturating_add(1)), |()| {
+                        (kept.saturating_add(1), discarded)
+                    })
+                } else {
+                    (kept, discarded.saturating_add(1))
+                }
+            });
+        let gap = std::mem::replace(&mut *self.state.lock(), GapState::with_consumer());
+        let shed = gap.dropped.saturating_add(gap.over_budget).saturating_add(discarded);
+        if shed > 0 {
+            warn!(
+                target: "primary",
+                queue = self.policy.name,
+                kept,
+                dropped = gap.dropped,
+                over_budget = gap.over_budget,
+                discarded,
+                "queue dropped messages while no consumer was subscribed"
+            );
+        }
+    }
+
+    /// End the turn of the consumer: the next gap starts.
+    fn leave(&self) {
+        self.state.lock().present = false;
+    }
+}
+
+/// What the gap policy of a [`QueChannel`] decided for one message.
+#[derive(Clone, Copy, Debug)]
+enum GapAdmit {
+    /// The channel has no gap policy, or a consumer holds the receiver: queue the message.
+    Open,
+    /// The policy holds the message, which weighs this many bytes: queue it.
+    Held(usize),
+    /// The policy does not hold the message: drop it.
+    Unheld,
+    /// The gap already holds the item cap or the byte cap: drop the message.
+    OverBudget,
+}
+
 /// Wrapper around a receiver and a subs count to make sure only one of these exists at a time.
 /// Note this does NOT implement Clone on purpose, do not implement it else managing subscriptions
 /// will break.
@@ -86,6 +263,8 @@ struct QueChanReceiver<T> {
     subscribed: Arc<AtomicBool>,
     /// If true then never set subscribed to false.
     always_subscribed: bool,
+    /// The gap policy of the channel, if any. Dropping the receiver starts a gap.
+    gap: Option<Arc<GapHold<T>>>,
 }
 
 /// Use the Drop to decrement subs and signal unsubscribed.
@@ -94,6 +273,7 @@ impl<T> Drop for QueChanReceiver<T> {
         if !self.always_subscribed {
             self.subscribed.store(false, Ordering::Release);
         }
+        self.gap.iter().for_each(|gap| gap.leave());
         (*self.container.lock()) = self.receiver.take();
     }
 }
@@ -112,17 +292,32 @@ pub struct QueChannel<T> {
     /// If true then set subscribed to false which will que messages even when no subscribers
     /// active.
     always_subscribed: bool,
+    /// The gap policy, if any: what the channel holds while no consumer holds its receiver.
+    gap: Option<Arc<GapHold<T>>>,
 }
 
 impl<T> QueChannel<T> {
     /// Create a new QueChannel.
     pub fn new() -> Self {
-        Self::build(CHANNEL_CAPACITY, false)
+        Self::build(CHANNEL_CAPACITY, false, None)
     }
 
     /// Create a new QueChannel that will que messages even when no subscribers.
     pub fn new_always_subscribed() -> Self {
-        Self::build(CHANNEL_CAPACITY, true)
+        Self::build(CHANNEL_CAPACITY, true, None)
+    }
+
+    /// Create a QueChannel like [`Self::new_always_subscribed`] that applies `policy` while no
+    /// consumer holds its receiver.
+    ///
+    /// In the gap between two consumers, and before the first one, the channel queues only the
+    /// messages that `policy` holds, up to its item cap and byte cap. `try_send_outcome` reports
+    /// any other message as [`tn_types::TrySendOutcome::Unsubscribed`] and a held message past
+    /// either cap as [`tn_types::TrySendOutcome::OverBudget`]. While a consumer holds the
+    /// receiver, the channel queues every message with no extra cap. Each subscribe discards the
+    /// queued messages that `policy` does not hold and keeps the held ones in order.
+    pub(crate) fn new_always_subscribed_held(policy: GapPolicy<T>) -> Self {
+        Self::build(CHANNEL_CAPACITY, true, Some(Arc::new(GapHold::new(policy))))
     }
 
     /// Create a new QueChannel that queues at most `capacity` messages.
@@ -135,35 +330,38 @@ impl<T> QueChannel<T> {
     ///
     /// Panics if `capacity` is 0, like [`tokio::sync::mpsc::channel`].
     pub fn with_capacity(capacity: usize) -> Self {
-        Self::build(capacity, false)
+        Self::build(capacity, false, None)
     }
 
     /// Build the channel. With `always_subscribed` it queues messages even with no subscriber.
-    fn build(capacity: usize, always_subscribed: bool) -> Self {
+    /// With a `gap` policy it holds only some messages while no consumer holds the receiver.
+    fn build(capacity: usize, always_subscribed: bool, gap: Option<Arc<GapHold<T>>>) -> Self {
         let (tx, rx) = mpsc::channel(capacity);
         let receiver = Arc::new(Mutex::new(Some(rx)));
         let subscribed = Arc::new(AtomicBool::new(always_subscribed));
-        Self { channel: tx, receiver, subscribed, always_subscribed }
+        Self { channel: tx, receiver, subscribed, always_subscribed, gap }
     }
 
     /// Subscribe to receive messages on this channel.
     ///
     /// Must be called in synchronous `spawn()` methods, BEFORE spawning async tasks.
     /// Can only be called once at a time (returned receiver restores on Drop).
+    /// On a channel with a gap policy, this first discards the queued messages that the policy
+    /// does not hold (see [`Self::new_always_subscribed_held`]).
     pub fn subscribe(&self) -> impl TnReceiver<T> + 'static
     where
         T: Send + 'static,
     {
-        let receiver = self.receiver.lock().take();
-        if receiver.is_none() {
-            panic!("Another subscription is already in use!")
-        }
+        let mut receiver = self.receiver.lock().take();
+        let Some(rx) = receiver.as_mut() else { panic!("Another subscription is already in use!") };
+        self.gap.iter().for_each(|gap| gap.enter(rx, &self.channel));
         self.subscribed.store(true, Ordering::Release);
         QueChanReceiver {
             receiver,
             container: self.receiver.clone(),
             subscribed: self.subscribed.clone(),
             always_subscribed: self.always_subscribed,
+            gap: self.gap.clone(),
         }
     }
 
@@ -190,12 +388,27 @@ impl<T> QueChannel<T> {
         if discarded > 0 {
             warn!(target: "primary", discarded, "discarded messages a previous subscriber left queued");
         }
+        self.gap.iter().for_each(|gap| gap.enter(rx, &self.channel));
         self.subscribed.store(true, Ordering::Release);
         QueChanReceiver {
             receiver,
             container: self.receiver.clone(),
             subscribed: self.subscribed.clone(),
             always_subscribed: self.always_subscribed,
+            gap: self.gap.clone(),
+        }
+    }
+
+    /// What the gap policy, if any, decides for `value`.
+    fn admit(&self, value: &T) -> GapAdmit {
+        self.gap.as_deref().map_or(GapAdmit::Open, |gap| gap.admit(value))
+    }
+
+    /// Release the hold of a message that the underlying queue did not take.
+    fn refund(&self, admit: GapAdmit) {
+        match admit {
+            GapAdmit::Held(bytes) => self.gap.iter().for_each(|gap| gap.release(bytes)),
+            GapAdmit::Open | GapAdmit::Unheld | GapAdmit::OverBudget => {}
         }
     }
 }
@@ -213,6 +426,7 @@ impl<T> Clone for QueChannel<T> {
             receiver: self.receiver.clone(),
             subscribed: self.subscribed.clone(),
             always_subscribed: self.always_subscribed,
+            gap: self.gap.clone(),
         }
     }
 }
@@ -222,17 +436,27 @@ impl<T: Send + 'static> TnSender<T> for QueChannel<T> {
         if !self.subscribed.load(Ordering::Acquire) {
             return Ok(());
         }
-        Ok(self.channel.send(value).await?)
+        let admit = self.admit(&value);
+        match admit {
+            // Drop a message that the gap policy drops, as for a channel with no subscriber.
+            GapAdmit::Unheld | GapAdmit::OverBudget => Ok(()),
+            GapAdmit::Open | GapAdmit::Held(_) => {
+                Ok(self.channel.send(value).await.inspect_err(|_| self.refund(admit))?)
+            }
+        }
     }
 
-    /// Queue `value` without waiting, or drop it while no receiver is subscribed.
+    /// Queue `value` without waiting, or drop it while no receiver is subscribed or while the
+    /// gap policy drops it.
     fn try_send(&self, value: T) -> Result<(), tn_types::TrySendError<T>> {
         self.try_send_outcome(value).map(|_outcome| ())
     }
 
     /// Queue `value` like [`TnSender::try_send`], and report
-    /// [`tn_types::TrySendOutcome::Unsubscribed`] when no receiver is subscribed, so the network
-    /// layer counts the drop as shed instead of as forwarded.
+    /// [`tn_types::TrySendOutcome::Unsubscribed`] when no receiver is subscribed or the gap
+    /// policy does not hold `value`, and [`tn_types::TrySendOutcome::OverBudget`] when the gap
+    /// already holds its item cap or byte cap, so the network layer counts the drop as shed
+    /// instead of as forwarded.
     fn try_send_outcome(
         &self,
         value: T,
@@ -240,7 +464,16 @@ impl<T: Send + 'static> TnSender<T> for QueChannel<T> {
         if !self.subscribed.load(Ordering::Acquire) {
             return Ok(tn_types::TrySendOutcome::Unsubscribed);
         }
-        Ok(self.channel.try_send(value).map(|()| tn_types::TrySendOutcome::Queued)?)
+        let admit = self.admit(&value);
+        match admit {
+            GapAdmit::Unheld => Ok(tn_types::TrySendOutcome::Unsubscribed),
+            GapAdmit::OverBudget => Ok(tn_types::TrySendOutcome::OverBudget),
+            GapAdmit::Open | GapAdmit::Held(_) => Ok(self
+                .channel
+                .try_send(value)
+                .map(|()| tn_types::TrySendOutcome::Queued)
+                .inspect_err(|_| self.refund(admit))?),
+        }
     }
 }
 
@@ -589,7 +822,9 @@ impl ConsensusBusApp {
                 tx_sync_status,
                 new_epoch_votes: QueChannel::new(),
                 tx_epoch_record,
-                primary_network_events: QueChannel::new_always_subscribed(),
+                primary_network_events: QueChannel::new_always_subscribed_held(
+                    crate::network::gap_policy::primary_event_gap_policy(),
+                ),
                 epoch_request_queue_tx,
                 epoch_request_queue_rx,
                 epoch_pack_claims: EpochPackClaims::default(),
@@ -832,6 +1067,10 @@ impl ConsensusBusApp {
     }
 
     /// Provide a subscriber (Receiver) for primary network events.
+    ///
+    /// First discard the events that the previous epoch's event loop left queued and that the gap
+    /// policy does not hold (see [`crate::network::gap_policy`]). The held gossip, including the
+    /// epoch votes that arrive between two epochs, stays queued in order.
     pub fn subscribe_primary_network_events(
         &self,
     ) -> impl TnReceiver<NetworkEvent<crate::network::Req, crate::network::Res>> {
@@ -1461,14 +1700,16 @@ mod exex_receiver_count_tests {
 #[cfg(test)]
 mod tests {
     use super::{
-        ConsensusBusApp, EpochPackRequest, QueChannel, CONSENSUS_OUTPUT_CHANNEL_CAPACITY,
-        EPOCH_REQUEST_QUEUE_CAPACITY, SYNC_OUTPUT_CHANNEL_CAPACITY,
+        ConsensusBusApp, EpochPackRequest, GapPolicy, QueChannel,
+        CONSENSUS_OUTPUT_CHANNEL_CAPACITY, EPOCH_REQUEST_QUEUE_CAPACITY,
+        SYNC_OUTPUT_CHANNEL_CAPACITY,
     };
     use metrics_util::debugging::{DebugValue, DebuggingRecorder};
     use std::{collections::VecDeque, task::Poll, time::Duration};
     use tn_types::{
         CommittedSubDag, ConsensusHeaderDigest, ConsensusNumHash, ConsensusOutput, Epoch,
-        EpochRecord, TnReceiver as _, TnSender as _, TryRecvError, TrySendError,
+        EpochRecord, TnReceiver as _, TnSender as _, TryRecvError, TrySendError, TrySendOutcome,
+        CHANNEL_CAPACITY,
     };
 
     /// The smallest output that can sit in `sync_output` or `consensus_output`; only its number
@@ -1867,5 +2108,104 @@ mod tests {
         assert_eq!(rx.try_recv(), Ok(1));
         assert_eq!(rx.try_recv(), Ok(2));
         assert_eq!(rx.try_recv(), Err(TryRecvError::Empty));
+    }
+
+    /// A gap test message: whether the test policy holds it, and its byte weight.
+    type Gap = (bool, usize);
+
+    /// Hold the messages marked held, at their byte weight.
+    fn gap_hold(message: &Gap) -> Option<usize> {
+        message.0.then_some(message.1)
+    }
+
+    /// An always-subscribed channel that holds at most two messages and 100 bytes in a gap.
+    fn gap_channel() -> QueChannel<Gap> {
+        QueChannel::new_always_subscribed_held(GapPolicy::new("test", gap_hold, 2, 100))
+    }
+
+    /// What `try_send_outcome` reported for `message`, or `None` for an error.
+    fn outcome(channel: &QueChannel<Gap>, message: Gap) -> Option<TrySendOutcome> {
+        channel.try_send_outcome(message).ok()
+    }
+
+    /// With no consumer, the channel queues the messages that the policy holds and drops the
+    /// rest as unsubscribed.
+    #[test]
+    fn gap_queues_only_held_messages() {
+        let channel = gap_channel();
+        assert_eq!(outcome(&channel, (true, 10)), Some(TrySendOutcome::Queued));
+        assert_eq!(outcome(&channel, (false, 10)), Some(TrySendOutcome::Unsubscribed));
+
+        let mut rx = channel.subscribe();
+        assert_eq!(rx.try_recv(), Ok((true, 10)));
+        assert_eq!(rx.try_recv(), Err(TryRecvError::Empty));
+    }
+
+    /// With no consumer, a held message past the item cap or the byte cap reports over budget.
+    #[test]
+    fn gap_caps_held_messages_by_items_and_bytes() {
+        let channel = gap_channel();
+        let queued = Some(TrySendOutcome::Queued);
+        let over = Some(TrySendOutcome::OverBudget);
+
+        // The byte cap: 60 + 60 passes 100, 60 + 40 does not.
+        assert_eq!(outcome(&channel, (true, 60)), queued);
+        assert_eq!(outcome(&channel, (true, 60)), over);
+        assert_eq!(outcome(&channel, (true, 40)), queued);
+        // The item cap: two messages are held, so a third with no bytes is over budget.
+        assert_eq!(outcome(&channel, (true, 0)), over);
+        // A message that the policy does not hold is still unsubscribed.
+        assert_eq!(outcome(&channel, (false, 0)), Some(TrySendOutcome::Unsubscribed));
+    }
+
+    /// With a consumer subscribed, the channel queues every message with no cap.
+    #[test]
+    fn consumer_present_queues_every_message() {
+        let channel = gap_channel();
+        let mut rx = channel.subscribe();
+        (0..5).for_each(|_| {
+            assert_eq!(outcome(&channel, (false, 60)), Some(TrySendOutcome::Queued));
+            assert_eq!(outcome(&channel, (true, 60)), Some(TrySendOutcome::Queued));
+        });
+        assert_eq!(std::iter::from_fn(|| rx.try_recv().ok()).count(), 10);
+    }
+
+    /// Subscribe discards the leftovers that the policy does not hold, keeps the held ones in
+    /// order and resets the gap counters. Dropping the receiver starts a new gap.
+    #[test]
+    fn subscribe_discards_unheld_leftovers_and_resets_the_gap() {
+        let channel = gap_channel();
+        let queued = Some(TrySendOutcome::Queued);
+        let over = Some(TrySendOutcome::OverBudget);
+
+        // The consumer leaves these two queued.
+        let rx = channel.subscribe();
+        assert_eq!(outcome(&channel, (false, 1)), queued);
+        assert_eq!(outcome(&channel, (true, 2)), queued);
+        drop(rx);
+
+        // In the gap, held messages queue up to the caps and the rest drop.
+        assert_eq!(outcome(&channel, (true, 3)), queued);
+        assert_eq!(outcome(&channel, (false, 4)), Some(TrySendOutcome::Unsubscribed));
+        assert_eq!(outcome(&channel, (true, 5)), queued);
+        assert_eq!(outcome(&channel, (true, 6)), over);
+
+        let mut rx = channel.subscribe();
+        let kept: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert_eq!(kept, [(true, 2), (true, 3), (true, 5)]);
+        drop(rx);
+
+        // The next gap starts with its counters at zero, so it holds two more.
+        assert_eq!(outcome(&channel, (true, 7)), queued);
+        assert_eq!(outcome(&channel, (true, 8)), queued);
+        assert_eq!(outcome(&channel, (true, 9)), over);
+    }
+
+    /// The gap item cap of the primary network event queue is at most the channel capacity, so
+    /// the held gossip alone never fills the queue.
+    #[test]
+    fn primary_gap_item_cap_fits_the_channel() {
+        let items = crate::network::gap_policy::primary_event_gap_policy().max_items();
+        assert!(items <= CHANNEL_CAPACITY, "{items}");
     }
 }

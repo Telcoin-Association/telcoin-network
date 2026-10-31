@@ -49,6 +49,17 @@ The new code is in `src/incoming.rs`. `src/transport.rs` gets `Listener::poll_ac
 bounded `try_fold` over the accept future. The fold form (not a `loop`) keeps the diff small
 and matches the house rules of the node repository.
 
+`Config::inbound_accept_task` (default `None`) is an opt-in measurement prototype for
+telcoin-network issue #1741. With `None` the listener decides on attempts and accepts them
+inline, inside `Transport::poll` on the swarm task, exactly as before. With `Some(capacity)`
+each listener spawns one task on the provider runtime (`Provider::spawn`) that waits for
+attempts, applies the same Retry policy and per-poll outcome cap (it yields to the executor
+at the cap), runs `Incoming::accept`, and queues the accepted handshakes in a bounded channel
+of `capacity` entries until the swarm takes them. The bound is explicit: at most `capacity`
+accepted handshakes wait for the swarm, and `max_incoming` bounds the attempts ahead of them.
+The task ends when the listener closes or is dropped. The node sets the field from
+`quic_config.inbound_accept_task` (`mode: inline`, or `mode: spawned` with a `capacity`).
+
 Public tracking: telcoin-network issues #1431 (maintenance and advisory coverage of carried
 transport patches) and #1432 (QUIC listener and cross-release interoperability coverage).
 

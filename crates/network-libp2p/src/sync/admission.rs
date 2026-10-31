@@ -12,10 +12,11 @@
 //!    one request class cannot starve another.
 //!
 //! Each [`ReservedPool`] splits its permits into a public share, which any peer may take, and a
-//! committee reserve, which only a [`PeerTier::Committee`] peer may take. A committee peer takes
-//! the reserve first and falls back to the public share. Thus peers outside the committee that
-//! fill the public share cannot block committee members from catching up. [`ReservedPeers`]
-//! classifies a peer's BLS key into its [`PeerTier`].
+//! reserve for each committee key, which only that [`PeerTier::Committee`] key may take. A
+//! committee peer takes its own reserve first and falls back to the public share. Thus peers
+//! outside the committee that fill the public share cannot block committee members from catching
+//! up, and committee keys that hold their own reserves cannot block a different committee key.
+//! [`ReservedPeers`] classifies a peer's BLS key into its [`PeerTier`].
 //!
 //! Across both phases and every class, [`PeerSlots`] caps the number of streams that one BLS key
 //! has in flight. A [`PeerSlot`] is held for the whole life of a stream and frees its count when
@@ -66,38 +67,52 @@ impl ReservedPeers {
     }
 }
 
-/// A concurrency budget split into a public share and a committee reserve.
+/// A concurrency budget split into a public share and a committee reserve for each committee key.
 ///
 /// A [`PeerTier::Public`] peer takes permits only from the public share. A
-/// [`PeerTier::Committee`] peer takes from the reserve first and then from the public share, so
-/// the public share can be full while a committee peer is still admitted. A clone shares the same
-/// permits.
+/// [`PeerTier::Committee`] peer takes from its own reserve first and then from the public share, so
+/// the public share can be full while a committee peer is still admitted.
+///
+/// The committee reserve is not one budget that all committee keys share. Each committee key has
+/// its own reserve of `reserved_per_key` permits, and no other key can take from it. Thus a few
+/// committee keys that hold their streams open without progress hold only their own reserves and
+/// the public share. They cannot stop a different committee key from catching up. See issue #1750.
+///
+/// A key gets its reserve when it first asks for a committee-tier permit. A public-tier peer never
+/// adds a reserve, so the number of reserves is at most the number of keys that
+/// [`ReservedPeers`] classifies as committee. A clone shares the same permits.
 #[derive(Clone, Debug)]
 pub struct ReservedPool {
     /// The permits that any peer may take.
     public: Arc<Semaphore>,
-    /// The permits that only a committee-tier peer may take.
-    reserved: Arc<Semaphore>,
+    /// The reserve of each committee key that has asked for a permit. Only that key may take
+    /// permits from its reserve.
+    reserved: Arc<Mutex<HashMap<BlsPublicKey, Arc<Semaphore>>>>,
+    /// The number of permits in the reserve of each committee key.
+    reserved_per_key: usize,
 }
 
 impl ReservedPool {
-    /// Create a pool with `public` permits in the public share and `reserved` permits in the
-    /// committee reserve.
-    pub fn new(public: usize, reserved: usize) -> Self {
+    /// Create a pool with `public` permits in the public share and `reserved_per_key` permits in
+    /// the reserve of each committee key.
+    pub fn new(public: usize, reserved_per_key: usize) -> Self {
         Self {
             public: Arc::new(Semaphore::new(public)),
-            reserved: Arc::new(Semaphore::new(reserved)),
+            reserved: Arc::default(),
+            reserved_per_key,
         }
     }
 
-    /// Try to take one permit for a peer of `tier`, without waiting.
+    /// Try to take one permit for `peer` of `tier`, without waiting.
     ///
-    /// A committee-tier peer takes from the reserve first and falls back to the public share. A
-    /// public-tier peer takes from the public share only. Returns `None` when no permit that the
-    /// tier may take is free. The permit returns to the share it came from when it drops.
-    pub fn try_acquire(&self, tier: PeerTier) -> Option<OwnedSemaphorePermit> {
+    /// A committee-tier peer takes from its own reserve first and falls back to the public share.
+    /// A public-tier peer takes from the public share only. Returns `None` when no permit that the
+    /// peer may take is free. The permit returns to the share it came from when it drops.
+    pub fn try_acquire(&self, peer: &BlsPublicKey, tier: PeerTier) -> Option<OwnedSemaphorePermit> {
         match tier {
-            PeerTier::Committee => Self::take(&self.reserved).or_else(|| Self::take(&self.public)),
+            PeerTier::Committee => {
+                Self::take(&self.reserve_of(peer)).or_else(|| Self::take(&self.public))
+            }
             PeerTier::Public => Self::take(&self.public),
         }
     }
@@ -107,9 +122,22 @@ impl ReservedPool {
         self.public.available_permits()
     }
 
-    /// The number of free permits in the committee reserve.
-    pub fn available_reserved(&self) -> usize {
-        self.reserved.available_permits()
+    /// The number of free permits in the reserve of committee key `peer`. A key that has not
+    /// asked for a permit yet has its full reserve free.
+    pub fn available_reserved(&self, peer: &BlsPublicKey) -> usize {
+        self.reserved
+            .lock()
+            .get(peer)
+            .map_or(self.reserved_per_key, |reserve| reserve.available_permits())
+    }
+
+    /// The reserve of committee key `peer`, created with `reserved_per_key` permits on first use.
+    fn reserve_of(&self, peer: &BlsPublicKey) -> Arc<Semaphore> {
+        self.reserved
+            .lock()
+            .entry(*peer)
+            .or_insert_with(|| Arc::new(Semaphore::new(self.reserved_per_key)))
+            .clone()
     }
 
     /// Take one permit from `share` without waiting, or `None` when it is empty.
@@ -191,38 +219,77 @@ mod tests {
     }
 
     /// A public-tier peer never takes a reserved permit: when the public share is empty it is
-    /// refused, although the whole committee reserve is free.
+    /// refused, and no reserve is created for its key.
     #[test]
     fn public_tier_cannot_touch_the_reserve() {
-        let pool = ReservedPool::new(2, 3);
+        let pool = ReservedPool::new(2, 1);
+        let outsider = key(1);
         let held: Vec<Option<OwnedSemaphorePermit>> =
-            (0..2).map(|_| pool.try_acquire(PeerTier::Public)).collect();
+            (0..2).map(|_| pool.try_acquire(&outsider, PeerTier::Public)).collect();
         assert!(held.iter().all(Option::is_some));
-        assert!(pool.try_acquire(PeerTier::Public).is_none());
-        assert_eq!((pool.available_public(), pool.available_reserved()), (0, 3));
+        assert!(pool.try_acquire(&outsider, PeerTier::Public).is_none());
+        assert_eq!((pool.available_public(), pool.available_reserved(&outsider)), (0, 1));
+        assert!(pool.reserved.lock().is_empty());
         drop(held);
-        assert_eq!((pool.available_public(), pool.available_reserved()), (2, 3));
+        assert_eq!(pool.available_public(), 2);
     }
 
-    /// A committee-tier peer empties the reserve first, then falls back to the public share, and
-    /// is refused only when both are empty. Each permit returns to its own share on drop.
+    /// A committee-tier peer empties its own reserve first, then falls back to the public share,
+    /// and is refused only when both are empty. Each permit returns to its own share on drop.
     #[test]
     fn committee_tier_takes_the_reserve_first_then_the_public_share() {
         let pool = ReservedPool::new(1, 2);
-        let first = pool.try_acquire(PeerTier::Committee);
+        let committee = key(1);
+        let free = || (pool.available_public(), pool.available_reserved(&committee));
+        let first = pool.try_acquire(&committee, PeerTier::Committee);
         assert!(first.is_some());
-        assert_eq!((pool.available_public(), pool.available_reserved()), (1, 1));
-        let second = pool.try_acquire(PeerTier::Committee);
+        assert_eq!(free(), (1, 1));
+        let second = pool.try_acquire(&committee, PeerTier::Committee);
         assert!(second.is_some());
-        assert_eq!((pool.available_public(), pool.available_reserved()), (1, 0));
-        let third = pool.try_acquire(PeerTier::Committee);
+        assert_eq!(free(), (1, 0));
+        let third = pool.try_acquire(&committee, PeerTier::Committee);
         assert!(third.is_some());
-        assert_eq!((pool.available_public(), pool.available_reserved()), (0, 0));
-        assert!(pool.try_acquire(PeerTier::Committee).is_none());
+        assert_eq!(free(), (0, 0));
+        assert!(pool.try_acquire(&committee, PeerTier::Committee).is_none());
         drop(third);
-        assert_eq!((pool.available_public(), pool.available_reserved()), (1, 0));
+        assert_eq!(free(), (1, 0));
         drop((first, second));
-        assert_eq!((pool.available_public(), pool.available_reserved()), (1, 2));
+        assert_eq!(free(), (1, 2));
+    }
+
+    /// Byzantine committee keys at the per-peer cap, with public keys that fill the public share,
+    /// cannot take the reserve of an honest committee key. Each Byzantine key holds only its own
+    /// reserved permit, and the honest key is still admitted from its own reserve. With one
+    /// reserve that all committee keys shared, three keys at two streams each held the whole
+    /// reserve and the honest key was refused. This is the starvation that issue #1750 describes.
+    #[test]
+    fn committee_keys_cannot_hold_the_reserve_of_another_committee_key() {
+        let byzantine = [key(1), key(2), key(3)];
+        let honest = key(4);
+        let reserved = ReservedPeers::new(byzantine.into_iter().chain([honest]));
+        let slots = PeerSlots::new(2);
+        let pool = ReservedPool::new(8, 1);
+        let opens: Vec<BlsPublicKey> = (10..14)
+            .map(key)
+            .chain(byzantine)
+            .flat_map(|peer| std::iter::repeat_n(peer, 2))
+            .collect();
+        let held: Vec<(PeerSlot, OwnedSemaphorePermit)> = opens
+            .iter()
+            .filter_map(|peer| {
+                slots.try_take(*peer).zip(pool.try_acquire(peer, reserved.tier(peer)))
+            })
+            .collect();
+        assert_eq!(held.len(), 8 + byzantine.len());
+        assert_eq!(pool.available_public(), 0);
+        assert!(byzantine.iter().all(|peer| pool.available_reserved(peer) == 0));
+
+        assert_eq!(pool.available_reserved(&honest), 1);
+        let honest_slot = slots.try_take(honest);
+        let honest_permit = pool.try_acquire(&honest, reserved.tier(&honest));
+        assert!(honest_slot.is_some());
+        assert!(honest_permit.is_some());
+        assert_eq!(pool.available_reserved(&honest), 0);
     }
 
     /// Three public keys, each within the per-peer cap of two, fill a public share of five
@@ -240,7 +307,9 @@ mod tests {
             .collect();
         let held: Vec<(PeerSlot, OwnedSemaphorePermit)> = opens
             .iter()
-            .filter_map(|peer| slots.try_take(*peer).zip(pool.try_acquire(reserved.tier(peer))))
+            .filter_map(|peer| {
+                slots.try_take(*peer).zip(pool.try_acquire(peer, reserved.tier(peer)))
+            })
             .collect();
         assert_eq!(held.len(), 5);
         assert_eq!(pool.available_public(), 0);
@@ -248,14 +317,14 @@ mod tests {
         let late = key(13);
         assert_eq!(reserved.tier(&late), PeerTier::Public);
         assert!(slots.try_take(late).is_some());
-        assert!(pool.try_acquire(reserved.tier(&late)).is_none());
+        assert!(pool.try_acquire(&late, reserved.tier(&late)).is_none());
 
         assert_eq!(reserved.tier(&committee), PeerTier::Committee);
         let committee_slot = slots.try_take(committee);
-        let committee_permit = pool.try_acquire(reserved.tier(&committee));
+        let committee_permit = pool.try_acquire(&committee, reserved.tier(&committee));
         assert!(committee_slot.is_some());
         assert!(committee_permit.is_some());
-        assert_eq!(pool.available_reserved(), 3);
+        assert_eq!(pool.available_reserved(&committee), 3);
     }
 
     /// Peer slots cap at `cap` for each key, are independent across keys, and free on drop. An
