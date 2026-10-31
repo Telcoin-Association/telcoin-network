@@ -21,8 +21,6 @@ reth-static-file-types.workspace = true
 serde = { workspace = true, optional = true }
 humantime-serde = { workspace = true, optional = true }
 
-# toml
-toml = { workspace = true, optional = true }
 eyre.workspace = true
 
 # value objects
@@ -31,7 +29,6 @@ url.workspace = true
 [features]
 serde = [
     "dep:serde",
-    "dep:toml",
     "dep:humantime-serde",
     "reth-network-types/serde",
     "reth-prune-types/serde",
@@ -41,6 +38,7 @@ serde = [
 ]
 
 [dev-dependencies]
-tempfile.workspace = true
+# TN(TN-0030): toml only parses configs in the backwards-compatibility tests.
+toml.workspace = true
 reth-network-peers.workspace = true
 alloy-primitives = { workspace = true, features = ["getrandom"] }
