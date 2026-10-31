@@ -923,7 +923,8 @@ mod test {
             assert!(pack.contains(cert.digest()).await, "should still contain cert after reopen");
         }
 
-        drop(pack);
+        // Drop returns before the seal on a multi-thread runtime, so await the shutdown first.
+        pack.shutdown().await.expect("shutdown before the read-only open");
 
         // Open read-only.
         let pack = CertificatePack::open_static(temp_dir.path(), 0);

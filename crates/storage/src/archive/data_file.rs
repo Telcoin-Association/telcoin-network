@@ -1074,13 +1074,22 @@ impl MmapDataFile {
             // clean-close sentinel, validated above; `opened_unclean` flags a file that was not)
             // and has no live writer. A writer that later shrinks the file under this
             // mapping would make a touch of a page past the new EOF deliver SIGBUS, which no Rust
-            // error path catches. The pack upholds this: `get_static` serves the live epoch from
-            // the writer handle (never a read-only map of it), and `open_static` runs
-            // only on sealed epochs and is gated by `files_consistent`. As
-            // defense-in-depth, the read bound (`end`) is additionally clamped to the
-            // index-attested length via `set_read_bound`, so reads never touch bytes a
-            // writer truncation could remove even if that discipline slipped.
+            // error path catches. `get_static` serves the live epoch from the writer handle (never
+            // a read-only map of it), but `open_static` is not gated by `files_consistent` before
+            // this map (it checks the files after the open), so a writer still sealing the file
+            // can shrink it between the `metadata()` above and this map. Two guards keep reads
+            // inside the file: the length check below refuses a mapping shorter than `orig_len`,
+            // so at open the mapping covers every offset below `end` (mapping `orig_len`
+            // explicitly instead would turn the shrink into SIGBUS); and `set_read_bound` clamps
+            // `end` afterward to the index-attested length, so reads never touch bytes a later
+            // writer truncation could remove.
             let map = unsafe { Mmap::map(&file)? };
+            if (map.len() as u64) < orig_len {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    format!("{} shrank while being opened read-only", path.display()),
+                ));
+            }
             (Backing::Ro(map), orig_len, 0)
         } else {
             // SAFETY: single-writer pack model — we hold the file open for writing for this
@@ -1321,7 +1330,8 @@ impl MmapDataFile {
     /// block for zero-copy record reads (no `memcpy`, no allocation).
     ///
     /// Returns `None` if the range falls outside the logical data `[0, len())` (so the transient
-    /// capacity padding past `end` is never exposed) or the file is currently unmapped. The
+    /// capacity padding past `end` is never exposed), the file is currently unmapped, or the
+    /// mapping does not cover the range (a file that shrank under a read-only open). The
     /// returned slice borrows `&self`, so no concurrent write/remap (which needs `&mut self`)
     /// can invalidate it while it is held. A caller that does not know a record's length up
     /// front takes [`Self::tail`] and parses the prefix from it.
@@ -1332,16 +1342,16 @@ impl MmapDataFile {
         }
         let start = offset as usize;
         match &self.backing {
-            Backing::Rw(map) => Some(&map[start..start + len]),
-            Backing::Ro(map) => Some(&map[start..start + len]),
+            Backing::Rw(map) => map.get(start..start + len),
+            Backing::Ro(map) => map.get(start..start + len),
             // Only a zero-length borrow (necessarily at offset 0) is valid with no mapping.
             Backing::Empty if len == 0 => Some(&[]),
             Backing::Empty => None,
         }
     }
 
-    /// Borrow the logical data from `offset` to the end (`None` past the end): see
-    /// [`Self::slice`].
+    /// Borrow the logical data from `offset` to the end (`None` past the end, or where the
+    /// mapping does not reach the end): see [`Self::slice`].
     pub fn tail(&self, offset: u64) -> Option<&[u8]> {
         self.slice(offset, usize::try_from(self.end.checked_sub(offset)?).ok()?)
     }
@@ -1350,9 +1360,9 @@ impl MmapDataFile {
     /// block for zero-copy record reads (no `memcpy`, no allocation).
     ///
     /// Returns `None` if the range falls outside the logical data `[0, len())` (so the transient
-    /// capacity padding past `end` is never exposed) or the file is currently unmapped. The
-    /// returned slice borrows `&mut self`, so no concurrent write/remap (which needs `&mut self`)
-    /// can invalidate it while it is held.
+    /// capacity padding past `end` is never exposed), the file is currently unmapped, or the
+    /// mapping does not cover the range. The returned slice borrows `&mut self`, so no
+    /// concurrent write/remap (which needs `&mut self`) can invalidate it while it is held.
     pub fn slice_mut(&mut self, offset: u64, len: usize) -> Option<&mut [u8]> {
         debug_assert!(!self.seal_pending, "a sealed file changes only through `write`");
         let range_end = offset.checked_add(len as u64)?;
@@ -1361,7 +1371,14 @@ impl MmapDataFile {
         }
         let start = offset as usize;
         match &mut self.backing {
-            Backing::Rw(map) => Some(map_range_mut(map, start, len)),
+            Backing::Rw(map) => {
+                // Bounded here, not with `get_mut` (which would borrow the whole mapping; see
+                // `map_range_mut`), so a short mapping is `None` rather than its assert.
+                if start + len > map.len() {
+                    return None;
+                }
+                Some(map_range_mut(map, start, len))
+            }
             Backing::Ro(_map) => None,
             Backing::Empty => None,
         }
@@ -2061,9 +2078,19 @@ impl MmapDataFile {
                     // (a cleanly-closed writer, physical == logical + sentinel,
                     // no live writer). Following a mid-append writer would
                     // adopt its padded physical size and SIGBUS on a later
-                    // truncation; pair with `set_read_bound` (see the read-only branch of
-                    // `open_with`).
-                    Backing::Ro(unsafe { Mmap::map(&self.file)? })
+                    // truncation; pair with `set_read_bound`. A mapping shorter than `disk_len`
+                    // is refused, as in the read-only branch of `open_with`.
+                    let map = unsafe { Mmap::map(&self.file)? };
+                    if (map.len() as u64) < disk_len {
+                        return Err(io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            format!(
+                                "{} shrank while being refreshed read-only",
+                                self.path.display()
+                            ),
+                        ));
+                    }
+                    Backing::Ro(map)
                 } else {
                     // SAFETY: single-writer model — this handle is the sole writer for its
                     // lifetime.
@@ -2134,7 +2161,9 @@ impl MmapDataFile {
 
 impl Read for MmapDataFile {
     /// Read from the logical `[0, end)` region at the current seek position. Never reads capacity
-    /// padding. An empty target buffer reads nothing.
+    /// padding. An empty target buffer reads nothing. Fails with `UnexpectedEof` if the mapping
+    /// does not cover the range (a file that shrank under a read-only open), as a file read past
+    /// its end would.
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         if buf.is_empty() || self.seek_pos >= self.end {
             return Ok(0);
@@ -2142,11 +2171,18 @@ impl Read for MmapDataFile {
         let start = self.seek_pos as usize;
         let avail = (self.end - self.seek_pos) as usize;
         let n = avail.min(buf.len());
-        match &self.backing {
-            Backing::Rw(map) => buf[..n].copy_from_slice(&map[start..start + n]),
-            Backing::Ro(map) => buf[..n].copy_from_slice(&map[start..start + n]),
+        let src = match &self.backing {
+            Backing::Rw(map) => map.get(start..start + n),
+            Backing::Ro(map) => map.get(start..start + n),
             Backing::Empty => return Ok(0),
-        }
+        };
+        let src = src.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                format!("{} is shorter than its logical end", self.path.display()),
+            )
+        })?;
+        buf[..n].copy_from_slice(src);
         self.seek_pos += n as u64;
         Ok(n)
     }
@@ -3039,6 +3075,50 @@ mod tests {
         let empty = MmapDataFile::open(tmp.path().join("empty"), false).expect("open empty");
         assert!(empty.slice(0, 0).expect("empty zero-len").is_empty());
         assert!(empty.slice(0, 1).is_none());
+    }
+
+    /// A mapping shorter than the logical end (a file that shrank under a read-only open) makes the
+    /// borrows and reads report the gap instead of panicking, while in-range borrows still succeed.
+    #[test]
+    fn borrows_past_the_mapping_fail_without_panicking() {
+        let tmp = TempDir::with_prefix("mmap_df_short_map").expect("temp dir");
+        let path = tmp.path().join("data");
+        let data = pattern(20);
+        {
+            let mut df = MmapDataFile::open_with(&path, false, tiny_opts()).expect("open");
+            df.write_all(&data).expect("write");
+        } // clean close: the file is the data plus the sentinel
+
+        let mut ro = MmapDataFile::open_with(&path, true, tiny_opts()).expect("open ro");
+        let Backing::Ro(map) = &ro.backing else { panic!("a read-only open maps the file") };
+        let mapped = map.len() as u64;
+        assert_eq!(mapped, 20 + SENTINEL_LEN);
+        // Leave `end` past the mapping, as a file that shrank between the open's length read and
+        // its map would without the open-time check.
+        ro.end = mapped + 8;
+        let len = ro.end as usize;
+        assert!(ro.slice(0, len).is_none(), "a slice past the mapping is None");
+        assert!(ro.tail(0).is_none(), "a tail past the mapping is None");
+        assert!(!ro.is_unwritten(), "an unreadable range is not classified as unwritten");
+        assert_eq!(ro.slice(0, 20).expect("in-range slice"), &data[..]);
+        let mut buf = vec![0u8; len];
+        let err = ro.read(&mut buf).expect_err("a read past the mapping fails");
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+
+        // The same on a writable handle, whose mapping is exactly its capacity.
+        let mut rw =
+            MmapDataFile::open_with(tmp.path().join("rw"), false, tiny_opts()).expect("open rw");
+        rw.write_all(&data).expect("write");
+        let Backing::Rw(map) = &rw.backing else { panic!("a written file is mapped") };
+        let mapped = map.len() as u64;
+        let end = rw.end;
+        rw.end = mapped + 8;
+        let len = rw.end as usize;
+        assert!(rw.slice(0, len).is_none(), "a slice past the mapping is None");
+        assert!(rw.slice_mut(0, len).is_none(), "a mutable slice past the mapping is None");
+        assert!(rw.slice_mut(0, 20).is_some(), "an in-range mutable slice");
+        // Restore the real end before the clean close.
+        rw.end = end;
     }
 
     #[test]
