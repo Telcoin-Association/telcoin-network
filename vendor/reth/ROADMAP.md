@@ -119,7 +119,7 @@ Steps, once tndb-b is the default backend:
 4. Keep the `reth_db_*` metric names, or change them together with the e2e tests and
    `tn-metrics` that assert on them.
 
-## RocksDB step B: remove the stub and the storage-v2 plumbing [next]
+## RocksDB step B: remove the stub and the storage-v2 plumbing [deferred: DECISIONS.md D15]
 
 Step A (TN-0014) removed RocksDB itself. What remains compiles in every build but never does
 RocksDB work:
