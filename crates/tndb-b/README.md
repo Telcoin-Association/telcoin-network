@@ -634,6 +634,11 @@ walked trees' counts, entries and pages equal the record's totals, with `nested_
 outer tree's entries. A table's `TableCheck` reports its rows, its outer and nested pages (runs
 included) and its outer height, so `entries` equals `table_stat`'s for both kinds.
 
+**A subkey of another length** (0 bytes, or past `max_key − key_len`) is only ever forged: a get
+that misses beside one (`read::find_nested`) and a dup cursor that lands on one are `Corrupt` at
+first use, but a write beside one is left to `Env::check` (an empty key is legal in a plain table,
+so `page::validate` holds no leaf key to a minimum).
+
 ---
 
 ## Commit protocol

@@ -85,19 +85,29 @@ pub(crate) struct DupWalk {
     /// `k ‖ s` while at a row.
     key: Vec<u8>,
     /// The table's key width `K`: every outer key's length.
-    key_len: usize,
+    key_len: u16,
+    /// The longest subkey a row of the table has ([`crate::page::Geometry::max_subkey`]).
+    max_subkey: u16,
 }
 
 impl DupWalk {
-    /// An unset walker over a dup table of outer keys of `key_len` bytes.
-    pub(crate) fn new(key_len: usize) -> Self {
+    /// An unset walker over a dup table of outer keys of `key_len` bytes whose rows' subkeys have
+    /// 1 to `max_subkey` bytes (a page's limit, held to `u16`: no page size has a longer key).
+    pub(crate) fn new(key_len: u16, max_subkey: usize) -> Self {
         Self {
             outer: TreeCursor::default(),
             inner: TreeCursor::default(),
             nested: TreeRoot::EMPTY,
             key: Vec::new(),
             key_len,
+            max_subkey: u16::try_from(max_subkey).unwrap_or(u16::MAX),
         }
+    }
+
+    /// The key width `K`.
+    #[inline]
+    fn kl(&self) -> usize {
+        usize::from(self.key_len)
     }
 
     /// Where the walker is.
@@ -132,11 +142,27 @@ impl DupWalk {
         self.inner.unset();
     }
 
-    /// Rewrite the logical key's subkey.
+    /// Rewrite the logical key's subkey with the key of the nested row just landed on: 1 to
+    /// `max_subkey` bytes, else [`Error::Corrupt`] (a damaged leaf: no write stores another
+    /// length).
     #[inline]
-    fn set_sub(&mut self, s: &[u8]) {
-        self.key.truncate(self.key_len);
+    fn set_sub(&mut self, s: &[u8]) -> Result<()> {
+        if !(1..=usize::from(self.max_subkey)).contains(&s.len()) {
+            return Err(self.bad_subkey(s.len()));
+        }
+        self.key.truncate(self.kl());
         self.key.extend_from_slice(s);
+        Ok(())
+    }
+
+    /// The error of a nested row whose subkey has `len` bytes, outside 1 to `max_subkey`.
+    #[cold]
+    fn bad_subkey(&self, len: usize) -> Error {
+        Error::Corrupt(format!(
+            "a subkey of {len} bytes under outer key {:02x?}, not 1 to {}",
+            &self.key[..self.kl().min(self.key.len())],
+            self.max_subkey
+        ))
     }
 
     /// The outer path just landed on key `k` with cell `val`: check the key's width and its cell,
@@ -147,7 +173,7 @@ impl DupWalk {
         let cell = nested_cell(roots.name(), k, val)?;
         self.nested = roots.root(k, cell)?;
         if self.key.capacity() == 0 {
-            self.key.reserve(self.key_len + 64);
+            self.key.reserve(self.kl() + 64);
         }
         self.key.clear();
         self.key.extend_from_slice(k);
@@ -158,14 +184,14 @@ impl DupWalk {
     /// damaged record or tree: no write makes a key of another width).
     #[inline]
     fn check_width<N: NestedRoots>(&self, roots: &N, k: &[u8]) -> Result<()> {
-        if k.len() == self.key_len {
+        if k.len() == self.kl() {
             return Ok(());
         }
         Err(Error::Corrupt(format!(
             "dup table {}: an outer key of {} bytes, not the table's width {}",
             roots.name(),
             k.len(),
-            self.key_len
+            self.kl()
         )))
     }
 
@@ -186,10 +212,10 @@ impl DupWalk {
             return Err(Error::Corrupt(format!(
                 "a nested tree of {} entries under outer key {:02x?} holds no row",
                 self.nested.entries,
-                &self.key[..self.key_len]
+                &self.key[..self.kl()]
             )));
         };
-        self.set_sub(s);
+        self.set_sub(s)?;
         Ok(v)
     }
 
@@ -259,7 +285,7 @@ impl DupWalk {
                     None => w.inner.prev(store, &w.nested)?,
                 };
                 if let Some((s, v)) = stepped {
-                    w.set_sub(s);
+                    w.set_sub(s)?;
                     return Ok(Some(v));
                 }
                 w.cross_key(store, outer_root, roots, again, forward)
@@ -299,7 +325,7 @@ impl DupWalk {
         again: &impl Fn(u32) -> Result<Option<&'s [u8]>>,
         x: &[u8],
     ) -> Result<Option<&'s [u8]>> {
-        let kl = self.key_len;
+        let kl = self.kl();
         let (xk, xs) = x.split_at(kl.min(x.len()));
         self.guarded(|w| {
             let at = w.state() == State::At;
@@ -307,7 +333,7 @@ impl DupWalk {
                 let leaf = held(&w.inner, again)?;
                 return match w.inner.seek(store, &w.nested, leaf, xs)? {
                     Some((s, v)) => {
-                        w.set_sub(s);
+                        w.set_sub(s)?;
                         Ok(Some(v))
                     }
                     None => w.cross_key(store, outer_root, roots, again, true),
@@ -325,7 +351,7 @@ impl DupWalk {
             }
             match w.inner.seek(store, &w.nested, None, xs)? {
                 Some((s, v)) => {
-                    w.set_sub(s);
+                    w.set_sub(s)?;
                     Ok(Some(v))
                 }
                 None => w.cross_key(store, outer_root, roots, again, true),
@@ -343,15 +369,15 @@ impl DupWalk {
         again: &impl Fn(u32) -> Result<Option<&'s [u8]>>,
         x: &[u8],
     ) -> Result<Option<&'s [u8]>> {
-        if x.len() <= self.key_len {
+        if x.len() <= self.kl() {
             self.unset();
             return Ok(None);
         }
-        let (xk, xs) = x.split_at(self.key_len);
+        let (xk, xs) = x.split_at(self.kl());
         self.bounded(store, outer_root, roots, again, xk, |w, store, leaf| {
             let found = w.inner.seek_exact(store, &w.nested, leaf, xs)?;
             if found.is_some() {
-                w.set_sub(xs);
+                w.set_sub(xs)?;
             }
             Ok(found)
         })
@@ -370,7 +396,7 @@ impl DupWalk {
         k: &[u8],
         s: &[u8],
     ) -> Result<Option<&'s [u8]>> {
-        let kl = self.key_len;
+        let kl = self.kl();
         if k.len() < kl {
             return Err(Error::KeyTooShort { len: k.len(), min: kl });
         }
@@ -383,10 +409,13 @@ impl DupWalk {
             } else {
                 w.inner.seek(store, &w.nested, leaf, s)?
             };
-            Ok(landed.map(|(s, v)| {
-                w.set_sub(s);
-                v
-            }))
+            match landed {
+                Some((s, v)) => {
+                    w.set_sub(s)?;
+                    Ok(Some(v))
+                }
+                None => Ok(None),
+            }
         })
     }
 
@@ -406,7 +435,7 @@ impl DupWalk {
     ) -> Result<Option<&'s [u8]>> {
         self.guarded(|w| {
             let at = w.state() == State::At;
-            if at && w.key[..w.key_len] == *k {
+            if at && w.key[..w.kl()] == *k {
                 let leaf = held(&w.inner, again)?;
                 let found = inner(w, store, leaf)?;
                 if found.is_none() {
@@ -454,14 +483,14 @@ impl DupWalk {
         if self.state() != State::At || n > self.key.len() {
             return Ok(None);
         }
-        let kl = self.key_len;
+        let kl = self.kl();
         self.guarded(|w| {
             let leaf = held(&w.inner, again)?;
             let within = n.saturating_sub(kl);
             if let Some(((s, v), _)) =
                 w.inner.step_in_prefix(store, &w.nested, leaf, within, forward)?
             {
-                w.set_sub(s);
+                w.set_sub(s)?;
                 return Ok(Some(v));
             }
             if n >= kl {
@@ -503,7 +532,7 @@ impl DupWalk {
             return Ok(None);
         }
         let leaf = held(&self.inner, again)?;
-        let sub = self.key.len() - self.key_len;
+        let sub = self.key.len() - self.kl();
         let Some((_, tail)) = self.inner.current_with_key_tail(store, leaf, t.min(sub))? else {
             return Ok(None);
         };

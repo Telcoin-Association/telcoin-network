@@ -356,6 +356,12 @@ impl Geometry {
         self.max_entry - LEAF_CELL_HEADER - SLOT - NESTED_CELL
     }
 
+    /// The longest subkey in a dup table of `key_len`-byte outer keys: a row's logical key
+    /// `k ‖ s` stays within [`Self::max_key`]. Every row's subkey has 1 to this many bytes.
+    pub(crate) fn max_subkey(&self, key_len: usize) -> usize {
+        self.max_key().saturating_sub(key_len)
+    }
+
     /// The longest value stored with a `klen`-byte key, or 0 for a key over [`max_key`], which
     /// is refused with any value. A key within the limit always takes at least 2 bytes, so 0 is
     /// never a limit for an accepted key.

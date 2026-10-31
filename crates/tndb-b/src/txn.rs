@@ -434,7 +434,8 @@ fn dup_delete(work: &mut Work, i: usize, key: &[u8]) -> Result<write::Removed> {
 }
 
 /// The get of the logical `key` from the dup table `table` whose outer tree is `outer` in a
-/// published state (`store`): the key's nested tree, through its outer cell.
+/// published state (`store`): the key's nested tree, through its outer cell, whose subkeys have
+/// 1 to `max_subkey` bytes ([`nested_get`]).
 #[inline(never)]
 fn dup_get<'s, S: PageRead + ?Sized>(
     store: &'s S,
@@ -442,12 +443,24 @@ fn dup_get<'s, S: PageRead + ?Sized>(
     outer: &TreeRoot,
     dup: &DupRecord,
     key: &[u8],
+    max_subkey: usize,
 ) -> Result<Option<&'s [u8]>> {
     let (k, s) = split_dup_key(key, dup.key_len)?;
     match outer_cell(store, table, outer, k)? {
         None => Ok(None),
-        Some(b) => read::get(store, &cell_root(table, k, b)?, s),
+        Some(b) => nested_get(store, &cell_root(table, k, b)?, s, max_subkey),
     }
+}
+
+/// The get of subkey `s` from the nested tree `root`, a miss beside a subkey of another length
+/// than 1 to `max_subkey` bytes [`Error::Corrupt`] ([`read::find_nested`]).
+fn nested_get<'s, S: PageRead + ?Sized>(
+    store: &'s S,
+    root: &TreeRoot,
+    s: &[u8],
+    max_subkey: usize,
+) -> Result<Option<&'s [u8]>> {
+    read::find_nested(store, root, s, max_subkey)?.map(|v| store.value(v)).transpose()
 }
 
 /// [`dup_get`] in the write transaction: the key's nested root from the working map, else from
@@ -463,7 +476,10 @@ fn dup_get_in_txn<'t>(
     let (k, s) = split_dup_key(key, dup.key_len)?;
     match work.nested_root(table, outer, k)? {
         None => Ok(None),
-        Some(root) => read::get(work.writer(), &root, s),
+        Some(root) => {
+            let writer = work.writer();
+            nested_get(writer, &root, s, writer.geometry.max_subkey(usize::from(dup.key_len)))
+        }
     }
 }
 
@@ -773,7 +789,10 @@ impl RoTxn {
     fn get_past_home<'t>(&'t self, table: &Table, key: &[u8]) -> Result<Option<&'t [u8]>> {
         match self.resolved(table)? {
             (root, None) => read::get(&*self.snapshot, &root, key),
-            (outer, Some(dup)) => dup_get(&*self.snapshot, table, &outer, &dup, key),
+            (outer, Some(dup)) => {
+                let max_subkey = self.snapshot.geometry.max_subkey(usize::from(dup.key_len));
+                dup_get(&*self.snapshot, table, &outer, &dup, key, max_subkey)
+            }
         }
     }
 
@@ -805,7 +824,10 @@ impl RoTxn {
             txn: Arc::clone(self),
             outer_root,
             table: table.clone(),
-            walk: DupWalk::new(usize::from(dup.key_len)),
+            walk: DupWalk::new(
+                dup.key_len,
+                self.snapshot.geometry.max_subkey(usize::from(dup.key_len)),
+            ),
         })
     }
 }

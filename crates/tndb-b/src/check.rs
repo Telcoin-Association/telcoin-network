@@ -227,7 +227,7 @@ impl Checker<'_> {
     /// [`Error::Corrupt`], naming the field.
     fn walk_dup(&mut self, root: &TreeRoot, dup: &DupRecord, owner: Owner) -> Result<TableCheck> {
         let width = usize::from(dup.key_len);
-        let max_subkey = self.snapshot.geometry.max_key().saturating_sub(width);
+        let max_subkey = self.snapshot.geometry.max_subkey(width);
         // The nested roots' counters, summed: [trees, entries, branch, leaf, overflow pages].
         let mut sums = [0_u64; 5];
         let mut nested_pages = 0;

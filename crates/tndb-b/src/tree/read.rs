@@ -193,7 +193,7 @@ pub(crate) fn find<'s, S: PageRead + ?Sized>(
     root: &TreeRoot,
     key: &[u8],
 ) -> Result<Option<Val<'s>>> {
-    find_in(store, root, key, None)
+    find_in(store, root, key, |_, _| Ok(()))
 }
 
 /// [`find`] in a dup table's outer tree, every key of which has the table's width, `key.len()`
@@ -205,15 +205,47 @@ pub(crate) fn find_outer<'s, S: PageRead + ?Sized>(
     root: &TreeRoot,
     key: &[u8],
 ) -> Result<Option<Val<'s>>> {
-    find_in(store, root, key, Some(key.len()))
+    find_in(store, root, key, |pgno, k| {
+        if k.len() == key.len() {
+            return Ok(());
+        }
+        Err(Error::Corrupt(format!(
+            "page {pgno}: an outer key of {} bytes in a dup table of width {}",
+            k.len(),
+            key.len()
+        )))
+    })
 }
 
-/// [`find`], a miss's neighbours in the leaf held to `width` bytes when it is given.
+/// [`find`] of the subkey `s` in a dup table's nested tree, every key of which is a subkey of 1
+/// to `max_subkey` bytes ([`Geometry::max_subkey`]): the keys either side of a miss must be too,
+/// else [`Error::Corrupt`] naming the leaf. An empty subkey forged into the leaf is then refused
+/// at first use, not a wrong `None`.
+///
+/// [`Geometry::max_subkey`]: crate::page::Geometry::max_subkey
+pub(crate) fn find_nested<'s, S: PageRead + ?Sized>(
+    store: &'s S,
+    root: &TreeRoot,
+    s: &[u8],
+    max_subkey: usize,
+) -> Result<Option<Val<'s>>> {
+    find_in(store, root, s, |pgno, k| {
+        if (1..=max_subkey).contains(&k.len()) {
+            return Ok(());
+        }
+        Err(Error::Corrupt(format!(
+            "page {pgno}: a subkey of {} bytes, not 1 to {max_subkey}",
+            k.len()
+        )))
+    })
+}
+
+/// [`find`], each of a miss's neighbours in the leaf held to `beside(leaf, key)`.
 fn find_in<'s, S: PageRead + ?Sized>(
     store: &'s S,
     root: &TreeRoot,
     key: &[u8],
-    width: Option<usize>,
+    beside: impl Fn(u32, &[u8]) -> Result<()>,
 ) -> Result<Option<Val<'s>>> {
     let Some(leaf) = descend(store, root, key, |_, _, _, _| Ok(()), None)? else {
         return Ok(None);
@@ -224,14 +256,8 @@ fn find_in<'s, S: PageRead + ?Sized>(
         Find::Found { value, .. } => Ok(Some(value)),
         Find::NotFound { before, after, .. } => {
             check_miss(leaf.pgno, before, after, leaf.lo, leaf.hi)?;
-            let wide = |k: &&[u8]| width.is_some_and(|n| k.len() != n);
-            if let Some(k) = [before, after].into_iter().flatten().find(wide) {
-                return Err(Error::Corrupt(format!(
-                    "page {}: an outer key of {} bytes in a dup table of width {}",
-                    leaf.pgno,
-                    k.len(),
-                    key.len()
-                )));
+            for k in [before, after].into_iter().flatten() {
+                beside(leaf.pgno, k)?;
             }
             Ok(None)
         }

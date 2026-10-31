@@ -1,19 +1,20 @@
 //! Dup cursors against the composite twin: a dup table `d` (key width 4) and a plain table `p`
 //! keyed `k ‖ s` holding the same rows, a [`DupRoCursor`] over `d` and a [`RoCursor`] over `p`
 //! side by side, every call compared (Oracle 2a); the bounded seeks' reach, the key tail's two
-//! forms, the outer key width met by every landing, and the kind refusal.
+//! forms, the outer key width and the subkey length met by every landing, and the kind refusal.
 
 use std::{collections::BTreeMap, sync::Arc};
 
 use tempfile::TempDir;
 
 use super::{
-    damage::{read_page, write_page},
+    damage::{read_page, restamped, write_page},
     dup::{copy_of, damaged, dup_key, restamp_record, COLD, HOT, OPTIONS},
     open, temp, Rows,
 };
 use crate::{
     env::SyncMode,
+    page,
     tree::{
         cursor::{
             tests::{owned, owned_tail, Kv},
@@ -623,4 +624,71 @@ fn a_dup_cursor_meets_an_outer_key_of_another_width_as_corrupt() {
         assert_eq!(c.state(), State::Unset, "{op}");
         assert!(env.failure().is_some(), "{op}: latched");
     }
+}
+
+/// A subkey of 0 bytes forged into [`COLD`]'s one nested leaf (its subkey 0 replaced by the empty
+/// subkey, the CRC stamped again) is `Corrupt` at first use, the environment latched: a get that
+/// misses beside it in a read-only and in a write transaction (`read::find_nested`),
+/// and a dup cursor that lands on it, by a seek, a bounded seek or a step from either side;
+/// `Env::check` names it.
+#[test]
+fn an_empty_subkey_is_corrupt_at_first_use() {
+    let dir = TempDir::with_prefix("tndb_b_dup_empty_subkey").expect("temp dir");
+    let (path, _) = damaged(dir.path(), |path, cells| {
+        restamped(path, cells[&COLD].1.root, |page| {
+            let (s, value) = page::leaf_inline_entry(page, 0).expect("row 0");
+            assert_eq!(s, [0], "COLD's first subkey");
+            let value = value.to_vec();
+            page::LeafMut::new(page).expect("a leaf").delete(0).expect("delete");
+            let fit = page::LeafMut::new(page).expect("a leaf").insert(0, &[], &value[..]);
+            assert_eq!(fit.expect("inserted"), page::Fit::Done);
+        });
+    });
+    let message = "a subkey of 0 bytes";
+    let miss = dup_key(COLD, &[0]);
+    for rw in [false, true] {
+        let (_dir, env) = copy_of(&path);
+        let result = if rw {
+            let txn = env.begin_rw().expect("rw");
+            let d = txn.open_table("d").expect("open").expect("d");
+            txn.get(&d, &miss).map(drop)
+        } else {
+            let ro = env.begin_ro().expect("ro");
+            let d = ro.open_table("d").expect("open").expect("d");
+            ro.get(&d, &miss).map(drop)
+        };
+        let corrupt = matches!(&result, Err(Error::Corrupt(m)) if m.contains(message));
+        assert!(corrupt, "get (rw {rw}): {result:?}");
+        assert!(env.failure().is_some(), "get (rw {rw}): latched");
+    }
+    let cold = COLD.to_be_bytes();
+    for op in ["seek", "seek_key", "seek_dup", "next", "prev"] {
+        let (_dir, env) = copy_of(&path);
+        let ro = Arc::new(env.begin_ro().expect("ro"));
+        let d = ro.open_table("d").expect("open").expect("d");
+        let mut c = ro.dup_cursor_owned(&d).expect("cursor");
+        let result = match op {
+            "seek" => c.seek(&cold).map(drop),
+            "seek_key" => c.seek_key(&cold).map(drop),
+            "seek_dup" => c.seek_dup(&cold, &[]).map(drop),
+            "next" => {
+                // HOT's last row is `big` (its other subkeys are 4 bytes from 0): the next is
+                // COLD's first.
+                assert!(c.seek_exact(&dup_key(HOT, b"big")).expect("HOT's last").is_some());
+                c.next().map(drop)
+            }
+            _ => {
+                assert!(c.seek_exact(&dup_key(COLD, &[1])).expect("COLD's row 1").is_some());
+                c.prev().map(drop)
+            }
+        };
+        let corrupt = matches!(&result, Err(Error::Corrupt(m)) if m.contains(message));
+        assert!(corrupt, "{op}: {result:?}");
+        assert_eq!(c.state(), State::Unset, "{op}");
+        assert!(env.failure().is_some(), "{op}: latched");
+    }
+    let (_dir, env) = copy_of(&path);
+    let result = env.check();
+    let corrupt = matches!(&result, Err(Error::Corrupt(m)) if m.contains("subkey of 0 bytes"));
+    assert!(corrupt, "check: {result:?}");
 }
