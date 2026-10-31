@@ -9,11 +9,11 @@ catch-up, and the recovery transaction on both chains at the same height. Both n
 then advance beyond that transaction, and their latest shared block hash must match.
 The kill primitive verifies SIGKILL (signal 9) directly.
 
-The defaults are 30-second epochs, a 2-second late-kill offset, at least 45 seconds down,
-and a 180-second recovery deadline. To use fleet B's epoch duration and kill offset:
+The defaults are 10-second epochs, a 2-second late-kill offset, at least 18 seconds down,
+and a 180-second recovery deadline, so each case takes about 60 to 75 seconds. To use fleet
+B's epoch duration and kill offset:
 
 ```sh
-TN_TEST_MDBX_SYNC=safe-no-sync \
 TN_SIGKILL_EPOCH_SECS=1200 \
 TN_SIGKILL_BEFORE_CLOSE_SECS=59 \
 TN_SIGKILL_DOWNTIME_SECS=300 \
@@ -28,6 +28,16 @@ and a peer crossing the boundary. These tests use four local validators and mode
 transaction traffic. A passing run does not establish the cause of the larger fleet's
 historical freeze in
 [issue #1510](https://github.com/Telcoin-Association/telcoin-network/issues/1510).
+
+Both cases restart inside the second epoch after the killed one when
+`1.5 * epoch < downtime < 2 * epoch + before_close`, with the kill offset under half an epoch.
+The node then finds an epoch record newer than its local epoch, starts as `CvvInactive`, and
+rejoins through catch-up. The short-run defaults sit inside that window: the before-close
+restart lands 16 seconds after the killed epoch's close and the mid-epoch restart 13 seconds
+after it, both inside the 10 to 20 second span of the second epoch. Unit tests in
+`sigkill/timing.rs` check the defaults against the window. Fleet B restarts in the epoch
+right after the kill and starts as `CvvActive`; the window is logged, not enforced, so fleet
+settings still run.
 
 The `SIGKILL recovery` workflow runs one scenario and sync regime per matrix job, covering
 both scenarios in Durable and SafeNoSync by default. Manual inputs select timing and either

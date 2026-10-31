@@ -1402,9 +1402,9 @@ async fn test_epoch_vote_already_certified_epoch_dropped_before_verify() -> eyre
 
 /// The epoch-scoped [`PrimaryNetwork`] event loop is torn down and re-spawned every epoch, but it
 /// consumes from the application-scoped `primary_network_events` channel on the [`ConsensusBus`].
-/// That channel is a `QueChannel::new_always_subscribed()`, so events that arrive while no
-/// `PrimaryNetwork` is running are queued (not dropped) and delivered to the next epoch's network.
-/// Stream commands and epoch-record voting depend on this; enforce it going forward.
+/// That channel is an always-subscribed `QueChannel` with a gap policy, so gossip that arrives
+/// while no `PrimaryNetwork` is running is queued (not dropped) and delivered to the next epoch's
+/// network. Epoch-record voting depends on this; enforce it going forward.
 ///
 /// This drives the guarantee end-to-end through the real event loop. `NetworkEvent::Gossip` is the
 /// only variant constructible from this crate (`Request`/`Error` carry a `pub(crate)` libp2p
@@ -1527,6 +1527,8 @@ async fn test_primary_network_events_queue_across_epoch_restart() -> eyre::Resul
     let spawner_b = epoch_b.get_spawner();
     // A non-panicking re-subscribe is itself proof epoch A's loop released the shared receiver
     // (`subscribe()` panics if a receiver is still checked out).
+    // Re-subscribe as the epoch manager does: the gap policy keeps the epoch-vote gossip sent in
+    // the gap.
     PrimaryNetwork::new(
         app.subscribe_primary_network_events(),
         network_handle.clone(),
@@ -3569,7 +3571,7 @@ async fn test_consensus_certs_large_committee_flood_survives() -> eyre::Result<(
     Ok(())
 }
 
-/// F16: `order_probe_peers` shuffles candidates and moves peers that already failed a probe for
+/// `order_probe_peers` shuffles candidates and moves peers that already failed a probe for
 /// THIS epoch to the back, so a Byzantine/drip peer fixed in stable `HashMap` order can no longer
 /// starve every retry. A failure recorded for a DIFFERENT epoch does not de-prioritise a peer.
 #[test]
@@ -3775,16 +3777,16 @@ fn test_order_probe_peers_puts_last_server_first() {
     );
 }
 
-/// Both probe loops open the last peer that served first, failed and unsupported probes leave the
-/// preference in place, and a preferred peer that already failed this epoch is opened after every
-/// fresh peer.
+/// Both probe loops open the last peer that served first, a preferred peer that does not serve
+/// its probe loses the preference (`forget_sync_server`), and a preferred peer that already
+/// failed this epoch is opened after every fresh peer.
 #[tokio::test]
 async fn test_probe_loops_open_last_server_first() {
     let (peers, chain, _temp_dir) = sync_probe_peers_and_chain().await;
     let record = EpochRecord::default();
 
-    // four peers refuse the protocol (`Unsupported`) and the rest time out (`Failed`); neither
-    // outcome may move the preference
+    // four peers refuse the protocol (`Unsupported`) and the rest time out (`Failed`); the
+    // preferred peer is among the failed ones, so it loses the preference
     let unsupported: HashSet<_> = peers[..4].iter().copied().collect();
     let (handle, opened) = spawn_scripted_swarm(peers.clone(), unsupported);
     handle.record_sync_served(peers[9]);
@@ -3795,12 +3797,14 @@ async fn test_probe_loops_open_last_server_first() {
     assert_eq!(opens[0], peers[9], "the pack fetch must open the last server first");
     assert_eq!(
         *handle.last_sync_server.lock(),
-        Some(peers[9]),
-        "failed and unsupported probes must not move the preference"
+        None,
+        "a preferred peer that failed its probe must lose the preference"
     );
 
     // the four unsupported peers are now cached unsyncable and skipped; every other peer failed
-    // epoch 0 above, and the preferred peer leads that group
+    // epoch 0 above. Serving again restores the preference (and clears the peer's failure), so
+    // the preferred peer leads that group until it fails once more
+    handle.record_sync_served(peers[9]);
     let result = handle.request_consensus_output(1, &chain, ConsensusHeaderDigest::default()).await;
     assert!(result.is_err(), "no peer serves, so the output fetch must fail");
     let opens = std::mem::take(&mut *opened.lock());
@@ -3808,8 +3812,8 @@ async fn test_probe_loops_open_last_server_first() {
     assert_eq!(opens[0], peers[9], "the output fetch must open the last server first");
     assert_eq!(
         *handle.last_sync_server.lock(),
-        Some(peers[9]),
-        "failed probes must not move the preference"
+        None,
+        "a preferred peer that failed its probe must lose the preference"
     );
 
     // a preferred peer that already failed this epoch goes behind every fresh peer
@@ -3821,6 +3825,7 @@ async fn test_probe_loops_open_last_server_first() {
     let opens = std::mem::take(&mut *opened.lock());
     assert_eq!(opens.len(), 16, "the pack fetch must open one stream to every peer");
     assert_eq!(opens.last(), Some(&peers[9]), "a failed preferred peer must be opened last");
+    assert_eq!(*handle.last_sync_server.lock(), None, "and it loses the preference as well");
 }
 
 /// `clear_sync_capability` empties the per-epoch caches but keeps the last peer that served.
@@ -3847,7 +3852,7 @@ fn test_clear_sync_capability_keeps_last_server() {
     assert_eq!(*handle.last_sync_server.lock(), Some(peer), "the preference must survive");
 }
 
-/// F40 + F2 (penalty half): `import_fault_is_peer_caused` admits ONLY faults attributable solely to
+/// `import_fault_is_peer_caused` admits ONLY faults attributable solely to
 /// the peer's streamed bytes (which then carry the severity `consensus_chain_error_to_penalty`
 /// assigns), and excludes every local/ambiguous error so an honest peer is never banned for this
 /// node's own storage/IO failure.
@@ -3866,8 +3871,6 @@ fn test_import_fault_is_peer_caused_whitelist() {
     assert!(peer_caused(cc(PackError::OutputTooLarge { size: 2, max: 1 })));
     assert!(peer_caused(cc(PackError::TooManyBatches(9))));
     assert!(peer_caused(cc(PackError::MissingBatch)));
-    assert!(peer_caused(ConsensusChainError::EmptyImport));
-    assert!(peer_caused(ConsensusChainError::InvalidImport));
     // A record out of place / not what the header declares, or one that fails its CRC/decode, is
     // the sender's bytes: charged at Medium (an honest peer's at-rest pack damage looks the
     // same).
@@ -3896,10 +3899,27 @@ fn test_import_fault_is_peer_caused_whitelist() {
     assert!(!peer_caused(cc(PackError::PersistError("disk full".into()))));
     assert!(!peer_caused(cc(PackError::Append("io".into()))));
     assert!(!peer_caused(cc(PackError::ReadOnly)));
+    // Local IO (a leftover import dir we could not remove, a full disk) is never the peer's.
+    let io = || std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+    assert!(!peer_caused(ConsensusChainError::IO(io())));
+    assert!(!peer_caused(cc(PackError::IO(Arc::new(io())))));
+    assert!(PrimaryNetworkHandle::consensus_chain_error_to_penalty(&ConsensusChainError::IO(io()))
+        .is_none());
     // A transport failure or timeout says nothing about the sender's bytes.
     assert!(!peer_caused(cc(PackError::ReadError("timeout".into()))));
     assert!(!peer_caused(ConsensusChainError::EpochMismatch));
     assert!(!peer_caused(ConsensusChainError::PrevCommitteeEpochMismatch));
     assert!(!peer_caused(ConsensusChainError::CrcError));
     assert!(!peer_caused(ConsensusChainError::NoCurrentEpoch));
+    // The caller's own state for the wrong epoch, or a refused in-place import of the live epoch.
+    for error in [
+        cc(PackError::LocalEpochMismatch { local: 1, found: 2 }),
+        ConsensusChainError::LiveEpochImport(3),
+    ] {
+        assert!(!peer_caused(error));
+    }
+    assert!(PrimaryNetworkHandle::consensus_chain_error_to_penalty(&cc(
+        PackError::LocalEpochMismatch { local: 1, found: 2 }
+    ))
+    .is_none());
 }

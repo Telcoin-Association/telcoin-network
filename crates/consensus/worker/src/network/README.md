@@ -165,30 +165,33 @@ the request cannot hold the requester.
 
 ### Concurrency Limiting
 
-Admission of an inbound sync stream has two phases. Each phase has a pool (`ReservedPool`) with
-a public share and a committee reserve. Committee peers are the keys of the current and the next
-committee (`ReservedPeers`). A committee peer takes a permit from the reserve first and then from
-the public share. A public peer takes a permit only from the public share. Thus public peers
-cannot use the capacity that a committee request needs.
+Admission of an inbound sync stream has two phases. Each phase has a pool (`ReservedPool`) with a
+public share and a reserve for each committee key. Committee peers are the keys of the current and
+the next committee (`ReservedPeers`). A committee peer takes a permit from its own reserve first and
+then from the public share. A public peer takes a permit only from the public share. No committee
+key can take the reserve of another. Thus public peers, and committee keys that hold streams without
+progress, cannot use the capacity that a different committee key needs to catch up (issue #1750).
+The per-peer cap of 2 lets a committee key open one more stream from the public share.
 
 #### Opening-Read Pool (`MAX_CONCURRENT_OPENING_READS`)
 
-The opening-read pool has 8 public permits (`MAX_CONCURRENT_OPENING_READS`) and 4 committee
-permits (`COMMITTEE_RESERVED_OPENING_READS`). `try_admit_opening()` takes a permit *before* the
-serving task is spawned. The task holds the permit while it reads the opening `Req` frame, for a
-maximum of `SYNC_REQUEST_READ_TIMEOUT` (5 s). A served stream releases the permit before the serve
-starts. A stream that is not served keeps it only for its bounded refusal or error write. If a
-public peer sends no frame in time, the worker charges the peer `Penalty::Mild`.
+The opening-read pool has 8 public permits (`MAX_CONCURRENT_OPENING_READS`) and 1 permit for each
+committee key (`COMMITTEE_RESERVED_OPENING_READS`), which only that key can take.
+`try_admit_opening()` takes a permit *before* the serving task is spawned. The task holds the permit
+while it reads the opening `Req` frame, for a maximum of `SYNC_REQUEST_READ_TIMEOUT` (5 s). A served
+stream releases the permit before the serve starts. A stream that is not served keeps it only for
+its bounded refusal or error write. If a public peer sends no frame in time, the worker charges the
+peer `Penalty::Mild`.
 
 If no permit is available, the responder writes `Deny(DenyReason::AtCapacity)` on a budgeted shed
 task, and the requesting peer tries another node.
 
 #### Batch Serve Pool (`MAX_CONCURRENT_BATCH_STREAMS`)
 
-The batch serve pool has 5 public permits (`MAX_CONCURRENT_BATCH_STREAMS`) and 4 committee permits
-(`COMMITTEE_RESERVED_BATCH_STREAMS`). The task takes a permit after it reads the request frame and
-holds it until the serve ends. If no permit is available, the responder writes
-`Deny(DenyReason::AtCapacity)` and closes the stream.
+The batch serve pool has 5 public permits (`MAX_CONCURRENT_BATCH_STREAMS`) and 1 permit for each
+committee key (`COMMITTEE_RESERVED_BATCH_STREAMS`), which only that key can take. The task takes a
+permit after it reads the request frame and holds it until the serve ends. If no permit is
+available, the responder writes `Deny(DenyReason::AtCapacity)` and closes the stream.
 
 Time limits release the permit when a peer stops reading:
 - `SYNC_REQUEST_READ_TIMEOUT` (5 s) for the `Ack` write and flush.
@@ -310,7 +313,8 @@ Integration tests in `tests/it/network_tests.rs` verify end-to-end batch synchro
 Concurrency tests cover:
 - Exhaustion of the public share of the batch serve pool sheds with `Deny(AtCapacity)`
 - Release of the peer slot and the pool permits when an admission is dropped
-- Public peers cannot use the committee reserve of the opening-read or the batch serve pool
+- Public peers cannot use a committee reserve of the opening-read or the batch serve pool, and one
+  committee key cannot use the reserve of another
 - Silent public streams release their opening-read permits at `SYNC_REQUEST_READ_TIMEOUT` and get
   one `Penalty::Mild` each
 - Stalled `Ack` and `Data` writes fail with `TimedOut` at their limits and release the batch serve

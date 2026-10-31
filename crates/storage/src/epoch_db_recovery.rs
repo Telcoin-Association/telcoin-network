@@ -2,10 +2,13 @@
 //!
 //! The epoch database holds the working consensus state of the epoch in progress (the
 //! `TableHint::Epoch` tables in [`crate::tables`]), and the node clears it at every epoch
-//! boundary. Opening it loads every row into memory through the panicking `decode` that all typed
-//! read paths use. `Header` is the only fork-gated type these tables store, directly in
-//! `LastProposed` and inside a `Certificate` in `Certificates` and `ProposedCertificates`, so the
-//! check here decodes those three tables with a fallible decode before that load.
+//! boundary. Opening tndb decodes nothing, but the node's first reads of these tables as it
+//! enters the epoch use the panicking `decode` that all typed read paths use, and so does the
+//! migration's copy from MDBX (`migrate_from_mdbx`). `Header` is the only fork-gated type these
+//! tables store, directly in `LastProposed` and inside a `Certificate` in `Certificates` and
+//! `ProposedCertificates`, so `open_db` decodes those three tables with a fallible decode on every
+//! startup, before anything reads them: in tndb after the migration, and in the MDBX source before
+//! the migration copies it.
 //!
 //! Exactly one kind of undecodable row is removed: the header a validator proposed for a
 //! sub-second fork epoch while it still ran a binary without the sub-second layout, found when it
@@ -14,33 +17,37 @@
 //! certifier stop the node for rather than run without.
 //!
 //! That stop is final for the database as it stands: retrying the start finds the same rows, so
-//! the error names the way out. The epoch database, `consensus-db/epoch` under the datadir, holds
-//! only the working state of the epoch in progress, including the `Votes` and `LastProposed` rows
-//! that keep this node from voting twice in a round or proposing two headers for one. Remove that
-//! directory (the committed chain in `consensus-db/epochs` and the execution `db` stay) and start
-//! the node again once the network has closed the epoch in progress, so those guards are no
-//! longer needed; a node that then still cannot follow the network is restored into a fresh
-//! datadir from a state export bundle with `db load-state`. One case reaches the stop by design
-//! rather than through corruption: when a quorum of validators ran past a fork epoch on the old
-//! binary, they certified each other's old-layout headers, and each of them refuses here on
-//! upgrade because the chain they built is not the upgraded chain.
+//! the error names the way out. The epoch database, `consensus-db/tndb/epoch` under the datadir
+//! (`consensus-db/epoch` for the MDBX one a migration reads), holds only the working state of the
+//! epoch in progress, including the `Votes` and `LastProposed` rows that keep this node from
+//! voting twice in a round or proposing two headers for one. Remove that directory (the committed
+//! chain in `consensus-db/epochs` and the execution `db` stay) and start the node again once the
+//! network has closed the epoch in progress, so those guards are no longer needed; a node that
+//! then still cannot follow the network is restored into a fresh datadir from a state export
+//! bundle with `db load-state`. One case reaches the stop by design rather than through
+//! corruption: when a quorum of validators ran past a fork epoch on the old binary, they certified
+//! each other's old-layout headers, and each of them refuses here on upgrade because the chain
+//! they built is not the upgraded chain.
 
 use tn_types::{
     encoded_size, forks::subsecond_timestamp_active, try_decode, try_decode_key,
     AuthorityIdentifier, Database, DbTxMut as _, Epoch, Header, Round, Table,
 };
 
-use crate::tables::{Certificates, LastProposed, ProposedCertificates};
+use crate::{
+    tables::{Certificates, LastProposed, ProposedCertificates},
+    tndb::SplitDatabase,
+};
 
 /// Remove the seconds-only header this node proposed for a sub-second fork epoch from
 /// `LastProposed`, and fail on any other row of a header-bearing epoch table that this binary
 /// cannot decode.
 ///
-/// Must run on the raw backend before it is wrapped in a
-/// [`LayeredDatabase`](crate::layered_db::LayeredDatabase), whose full-memory load panics on the
-/// first undecodable row. All three tables are checked before anything is removed, so an error
-/// leaves the database as it was. Returns the removed rows, logged at error level, or `None` when
-/// nothing was removed.
+/// Must run before anything reads these tables with the typed decode, which panics on the first
+/// undecodable row: `open_db` runs it on every open, on tndb after the migration and on the MDBX
+/// source before the migration's copy. All three tables are checked before anything is removed,
+/// so an error leaves the database as it was. Returns the removed rows, logged at error level, or
+/// `None` when nothing was removed.
 ///
 /// # Errors
 ///
@@ -55,8 +62,9 @@ pub(crate) fn discard_seconds_only_proposal<DB: RawRows>(
     // theirs do not decode on it), so nothing here is removed. with a quorum or more still on it
     // they certify among themselves, and each of them refuses below on upgrade: the right outcome,
     // since the chain they built is not the upgraded chain, and the error names the way out. an
-    // undecodable row here would stop the full-memory load as well; checking first names the row
-    // in the error and keeps the `LastProposed` removal from happening before that stop
+    // undecodable row here would stop the node at its first typed read of the table as well (a
+    // panic); checking first names the row in the error and keeps the `LastProposed` removal from
+    // happening before that stop
     scan_table::<Certificates, _>(epoch_db, |_| false)?;
     scan_table::<ProposedCertificates, _>(epoch_db, |_| false)?;
     let Some(Discard { report, keys }) = stale else {
@@ -116,12 +124,30 @@ pub(crate) struct UndecodableTable {
 
 /// Access to a backend's stored row bytes, so rows can be checked without the panicking decode.
 pub(crate) trait RawRows: Database {
+    /// The epoch database's directory under the datadir, which a refusal names as the way out.
+    const EPOCH_DIR: &'static str;
+
     /// Call `visit` with the stored key and value bytes of every row of `T`, in key order.
     fn for_each_raw_row<T: Table>(&self, visit: impl FnMut(&[u8], &[u8])) -> eyre::Result<()>;
 
     /// Store `value` under `key` in `T` verbatim, as another binary may have written them.
     #[cfg(test)]
     fn insert_raw_row<T: Table>(&self, key: &[u8], value: &[u8]) -> eyre::Result<()>;
+}
+
+impl RawRows for SplitDatabase {
+    const EPOCH_DIR: &'static str = "consensus-db/tndb/epoch";
+
+    fn for_each_raw_row<T: Table>(&self, visit: impl FnMut(&[u8], &[u8])) -> eyre::Result<()> {
+        self.scan_raw::<T>(visit)
+    }
+
+    #[cfg(test)]
+    fn insert_raw_row<T: Table>(&self, key: &[u8], value: &[u8]) -> eyre::Result<()> {
+        use tests::{Verbatim, VerbatimTable};
+
+        self.insert::<VerbatimTable<T>>(&Verbatim(key.to_vec()), &Verbatim(value.to_vec()))
+    }
 }
 
 /// Undecodable rows of a table that may be removed.
@@ -185,16 +211,17 @@ fn scan_table<T: Table, DB: RawRows>(
              the node stops instead of running without it (the epoch database may be corrupt, or \
              this validator certified fork-epoch headers on the old binary as one of a quorum \
              still running it). Retrying the start finds the same rows. Remove the epoch database \
-             directory `consensus-db/epoch` under the datadir, which holds only the epoch in \
-             progress (keep `consensus-db/epochs` and `db`), and start again once the network has \
-             closed that epoch, since the directory also held this node's guards against voting \
-             or proposing twice in it; or restore the node into a fresh datadir from a state \
-             export bundle with `db load-state`",
+             directory `{}` under the datadir, which holds only the epoch in progress (keep \
+             `consensus-db/epochs` and `db`), and start again once the network has closed that \
+             epoch, since the directory also held this node's guards against voting or proposing \
+             twice in it; or restore the node into a fresh datadir from a state export bundle \
+             with `db load-state`",
             row.table,
             row.rows,
             row.key,
             epoch,
-            row.error
+            row.error,
+            DB::EPOCH_DIR
         );
     }
     Ok(discard)
@@ -232,14 +259,50 @@ mod tests {
     use super::*;
     use crate::{
         tables::{CertificateDigestByOrigin, CertificateDigestByRound, Votes},
-        ReDB, LAST_PROPOSAL_KEY,
+        tndb::{CommitMode, TnDbOptions, MDBX_MIGRATED, TNDB_DIR},
+        LAST_PROPOSAL_KEY,
     };
     use rand::{rngs::StdRng, SeedableRng as _};
     use tempfile::TempDir;
     use tn_types::{
         encode, encode_key, BlsKeypair, Certificate, HeaderBuilder, HeaderDigest, Signer as _,
-        TimestampMs, VoteDigest, VoteInfo,
+        TableHint, TimestampMs, VoteDigest, VoteInfo,
     };
+
+    /// Bytes stored as they are: encoded as a tuple of bytes, which neither the key nor the value
+    /// codec prefixes with a length. Write-only.
+    #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+    pub(super) struct Verbatim(pub(super) Vec<u8>);
+
+    impl serde::Serialize for Verbatim {
+        fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+            use serde::ser::SerializeTuple as _;
+
+            let mut tuple = serializer.serialize_tuple(self.0.len())?;
+            for byte in &self.0 {
+                tuple.serialize_element(byte)?;
+            }
+            tuple.end()
+        }
+    }
+
+    impl<'de> serde::Deserialize<'de> for Verbatim {
+        fn deserialize<D: serde::Deserializer<'de>>(_: D) -> Result<Self, D::Error> {
+            Err(serde::de::Error::custom("verbatim rows are write-only"))
+        }
+    }
+
+    /// Table `T` with its rows written verbatim, to store what another binary wrote in it.
+    #[derive(Debug)]
+    pub(super) struct VerbatimTable<T>(std::marker::PhantomData<T>);
+
+    impl<T: Table> Table for VerbatimTable<T> {
+        type Key = Verbatim;
+        type Value = Verbatim;
+
+        const NAME: &'static str = T::NAME;
+        const HINT: TableHint = T::HINT;
+    }
 
     /// An epoch whose headers carry the sub-second layout in this build: 10 where the fork is
     /// live from genesis, the dormant adiri fork point otherwise.
@@ -480,10 +543,6 @@ mod tests {
         crate::mdbx::MdbxDatabase::open(path, 8, 16 * MEGABYTE, 4 * MEGABYTE).unwrap()
     }
 
-    fn open_raw_redb(dir: &TempDir) -> ReDB {
-        ReDB::open(dir.path().join("epoch")).unwrap()
-    }
-
     #[cfg(feature = "reth-libmdbx")]
     #[test]
     fn test_mdbx_discards_pre_fork_header() {
@@ -526,71 +585,22 @@ mod tests {
         assert_keeps_decodable_rows(&open_raw_mdbx(dir.path()));
     }
 
-    #[cfg(all(feature = "reth-libmdbx", feature = "adiri"))]
+    #[cfg(all(feature = "adiri", feature = "reth-libmdbx"))]
     #[test]
     fn test_mdbx_refuses_truncated_pre_fork_epoch_header() {
         let dir = TempDir::new().unwrap();
         assert_refuses_truncated_pre_fork_epoch_header(&open_raw_mdbx(dir.path()));
     }
 
-    #[test]
-    fn test_redb_discards_pre_fork_header() {
-        let dir = TempDir::new().unwrap();
-        assert_discards_pre_fork_header(&open_raw_redb(&dir));
-    }
-
-    #[test]
-    fn test_redb_refuses_pre_fork_certificate() {
-        let dir = TempDir::new().unwrap();
-        assert_refuses_pre_fork_certificate::<Certificates, _>(&open_raw_redb(&dir));
-    }
-
-    #[test]
-    fn test_redb_refuses_pre_fork_proposed_certificate() {
-        let dir = TempDir::new().unwrap();
-        assert_refuses_pre_fork_certificate::<ProposedCertificates, _>(&open_raw_redb(&dir));
-    }
-
-    #[test]
-    fn test_redb_refuses_undecodable_last_proposed() {
-        let dir = TempDir::new().unwrap();
-        assert_refuses_undecodable_last_proposed(&open_raw_redb(&dir));
-    }
-
-    #[test]
-    fn test_redb_refuses_before_removing() {
-        let dir = TempDir::new().unwrap();
-        assert_refuses_before_removing(&open_raw_redb(&dir));
-    }
-
-    #[test]
-    fn test_redb_keeps_decodable_rows() {
-        let dir = TempDir::new().unwrap();
-        assert_keeps_decodable_rows(&open_raw_redb(&dir));
-    }
-
-    #[cfg(feature = "adiri")]
-    #[test]
-    fn test_redb_refuses_truncated_pre_fork_epoch_header() {
-        let dir = TempDir::new().unwrap();
-        assert_refuses_truncated_pre_fork_epoch_header(&open_raw_redb(&dir));
-    }
-
-    /// The raw epoch database [`crate::open_db`] opens in this build.
-    #[cfg(all(feature = "reth-libmdbx", not(feature = "redb")))]
+    /// The MDBX epoch environment [`crate::open_db`] migrates from.
+    #[cfg(feature = "reth-libmdbx")]
     fn open_raw_epoch_db(store: &std::path::Path) -> crate::mdbx::MdbxDatabase {
         open_raw_mdbx(&store.join("epoch"))
     }
 
-    /// The raw epoch database [`crate::open_db`] opens in this build.
-    #[cfg(feature = "redb")]
-    fn open_raw_epoch_db(store: &std::path::Path) -> ReDB {
-        ReDB::open(store.join("epoch")).unwrap()
-    }
-
-    /// The node's startup path: a pre-fork `LastProposed` header in the epoch database opens
-    /// without a panic, the header is gone, and the `Votes` guards survive.
-    #[cfg(any(feature = "reth-libmdbx", feature = "redb"))]
+    /// The node's startup path: a pre-fork `LastProposed` header in the MDBX epoch database
+    /// migrates without a panic, the header is gone, and the `Votes` guards survive in tndb.
+    #[cfg(feature = "reth-libmdbx")]
     #[test]
     fn test_open_db_discards_pre_fork_last_proposed() {
         let dir = TempDir::new().unwrap();
@@ -613,16 +623,16 @@ mod tests {
 
         assert!(db.is_empty::<LastProposed>());
         assert_eq!(db.get::<Votes>(&author).unwrap(), Some(vote_info(epoch)));
-        // the removal is durable, so the next start finds nothing to discard
+        // the migrated database starts again without the header (and without MDBX)
         drop(db);
-        let raw = open_raw_epoch_db(dir.path());
-        assert!(discard_seconds_only_proposal(&raw).unwrap().is_none());
-        assert!(raw_rows::<LastProposed, _>(&raw).is_empty());
+        let db = crate::open_db(dir.path());
+        assert!(db.is_empty::<LastProposed>());
+        assert_eq!(db.get::<Votes>(&author).unwrap(), Some(vote_info(epoch)));
     }
 
     /// The node's startup path stops on an undecodable `LastProposed` row that is not a
-    /// seconds-only fork-epoch header, names the table, and leaves the row in place.
-    #[cfg(any(feature = "reth-libmdbx", feature = "redb"))]
+    /// seconds-only fork-epoch header, names the table, and leaves the row (and MDBX) in place.
+    #[cfg(feature = "reth-libmdbx")]
     #[test]
     fn test_open_db_refuses_undecodable_last_proposed() {
         let dir = TempDir::new().unwrap();
@@ -639,9 +649,135 @@ mod tests {
             std::panic::catch_unwind(|| crate::open_db(store)).expect_err("open_db must stop");
 
         let message = panic.downcast_ref::<String>().expect("a formatted panic message");
-        assert!(message.starts_with("Cannot check database (epoch)"), "{message}");
+        assert!(message.starts_with("Cannot migrate the consensus DB from MDBX"), "{message}");
+        assert!(message.contains("Cannot check database (epoch)"), "{message}");
         assert!(message.contains("epoch table last_proposed holds 1 row(s)"), "{message}");
+        assert!(message.contains("`consensus-db/epoch`"), "{message}");
         let raw = open_raw_epoch_db(dir.path());
         assert_eq!(raw_rows::<LastProposed, _>(&raw), vec![(key, bytes)]);
+    }
+
+    /// tndb under the store path `store`, opened as [`crate::open_db`] opens it but with no
+    /// migration or check.
+    fn open_tndb(store: &std::path::Path) -> SplitDatabase {
+        let options = TnDbOptions { commit: CommitMode::Group, ..Default::default() };
+        SplitDatabase::open_with(store.join(TNDB_DIR), options).unwrap()
+    }
+
+    #[test]
+    fn test_tndb_discards_pre_fork_header() {
+        let dir = TempDir::new().unwrap();
+        assert_discards_pre_fork_header(&open_tndb(dir.path()));
+    }
+
+    #[test]
+    fn test_tndb_refuses_pre_fork_certificate() {
+        let dir = TempDir::new().unwrap();
+        assert_refuses_pre_fork_certificate::<Certificates, _>(&open_tndb(dir.path()));
+    }
+
+    #[test]
+    fn test_tndb_refuses_pre_fork_proposed_certificate() {
+        let dir = TempDir::new().unwrap();
+        assert_refuses_pre_fork_certificate::<ProposedCertificates, _>(&open_tndb(dir.path()));
+    }
+
+    #[test]
+    fn test_tndb_refuses_undecodable_last_proposed() {
+        let dir = TempDir::new().unwrap();
+        assert_refuses_undecodable_last_proposed(&open_tndb(dir.path()));
+    }
+
+    #[test]
+    fn test_tndb_refuses_before_removing() {
+        let dir = TempDir::new().unwrap();
+        assert_refuses_before_removing(&open_tndb(dir.path()));
+    }
+
+    #[test]
+    fn test_tndb_keeps_decodable_rows() {
+        let dir = TempDir::new().unwrap();
+        assert_keeps_decodable_rows(&open_tndb(dir.path()));
+    }
+
+    #[cfg(feature = "adiri")]
+    #[test]
+    fn test_tndb_refuses_truncated_pre_fork_epoch_header() {
+        let dir = TempDir::new().unwrap();
+        assert_refuses_truncated_pre_fork_epoch_header(&open_tndb(dir.path()));
+    }
+
+    /// The node's startup path on a datadir already moved to tndb: a pre-fork `LastProposed`
+    /// header an older binary wrote there is removed on the next open, with the `Votes` guards
+    /// kept, and the open after that finds nothing to remove.
+    #[test]
+    fn test_open_db_discards_pre_fork_last_proposed_on_tndb() {
+        use crate::consensus_pack::test::warnings_and_errors;
+        use tracing::Level;
+
+        let dir = TempDir::new().unwrap();
+        let epoch = subsecond_epoch();
+        let header = header(epoch);
+        let author = AuthorityIdentifier::from_bytes([4; 32]);
+        let key = encode_key(&LAST_PROPOSAL_KEY);
+        {
+            let db = crate::open_db(dir.path());
+            assert!(dir.path().join(TNDB_DIR).join(MDBX_MIGRATED).exists(), "migrated before");
+            db.insert::<Votes>(&author, &vote_info(epoch)).unwrap();
+            db.insert_raw_row::<LastProposed>(&key, &pre_fork_bytes(&header, &header)).unwrap();
+            db.wait_durable_blocking().unwrap();
+        }
+
+        let (db, logged) = warnings_and_errors(|| crate::open_db(dir.path()));
+
+        assert!(raw_rows::<LastProposed, _>(&db).is_empty(), "the header is removed");
+        assert_eq!(db.get::<Votes>(&author).unwrap(), Some(vote_info(epoch)));
+        assert_eq!(logged, [Level::ERROR, Level::WARN], "the removal is reported");
+        drop(db);
+        let (db, logged) = warnings_and_errors(|| crate::open_db(dir.path()));
+        assert!(logged.is_empty(), "nothing left to remove: {logged:?}");
+        assert_eq!(db.get::<Votes>(&author).unwrap(), Some(vote_info(epoch)));
+    }
+
+    /// The node's startup path on tndb stops on an undecodable `LastProposed` row that is not a
+    /// seconds-only fork-epoch header, names the table and the tndb epoch directory, and leaves
+    /// the row in place.
+    #[test]
+    fn test_open_db_refuses_undecodable_last_proposed_on_tndb() {
+        let dir = TempDir::new().unwrap();
+        let key = encode_key(&LAST_PROPOSAL_KEY);
+        let bytes = fork_epoch_garbage();
+        {
+            let db = crate::open_db(dir.path());
+            db.insert_raw_row::<LastProposed>(&key, &bytes).unwrap();
+            db.wait_durable_blocking().unwrap();
+        }
+
+        let store = dir.path();
+        let panic =
+            std::panic::catch_unwind(|| crate::open_db(store)).expect_err("open_db must stop");
+
+        let message = panic.downcast_ref::<String>().expect("a formatted panic message");
+        assert!(message.starts_with("Cannot check database (epoch)"), "{message}");
+        assert!(message.contains("epoch table last_proposed holds 1 row(s)"), "{message}");
+        assert!(message.contains("`consensus-db/tndb/epoch`"), "{message}");
+        let db = open_tndb(dir.path());
+        db.open_table::<LastProposed>().unwrap();
+        assert_eq!(raw_rows::<LastProposed, _>(&db), vec![(key, bytes)]);
+    }
+
+    /// A tndb raw scan fails once its database has latched a failure, as the damage that cuts a
+    /// scan short latches one: a short scan is an error, never a shorter table, so the check
+    /// never passes on rows it did not see.
+    #[test]
+    fn test_tndb_check_fails_on_a_latched_database() {
+        let dir = TempDir::new().unwrap();
+        let db = open_tndb(dir.path());
+        db.open_table::<LastProposed>().unwrap();
+        db.insert::<LastProposed>(&LAST_PROPOSAL_KEY, &header(subsecond_epoch())).unwrap();
+        db.fail_durability_for_test::<LastProposed>();
+
+        assert!(db.for_each_raw_row::<LastProposed>(|_, _| {}).is_err());
+        assert!(discard_seconds_only_proposal(&db).is_err());
     }
 }

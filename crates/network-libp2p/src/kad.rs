@@ -606,6 +606,11 @@ impl<DB: Database> KadStore<DB> {
             .and_then(|stored| stored.timestamp)
             .or(timestamp);
         let encoded = encode(&StoredKadRecord { record: kr, timestamp });
+        // An unchanged row is not worth a durable write. The inbound path only gets here when
+        // the value or the expiry moved; a local republish may carry neither.
+        if stored.as_ref().is_some_and(|raw| *raw == encoded) {
+            return Ok(());
+        }
         match self.kad_type {
             NetworkType::Primary => self.db.insert::<KadRecords>(&key, &encoded),
             NetworkType::Worker(_) => self.db.insert::<KadWorkerRecords>(&key, &encoded),
@@ -1130,6 +1135,48 @@ impl<'de> DeserializeAs<'de, RecordKey> for RecordKeySerde {
             deserializer.deserialize_bytes(RKVisitor)
         }
     }
+}
+
+/// Outcome of weighing a byte-identical inbound copy against the stored row.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct IdenticalRefresh {
+    expires: Option<std::time::Instant>,
+    store: bool,
+}
+
+impl IdenticalRefresh {
+    /// Expiry to keep: never earlier than the one already stored. None means no expiry.
+    pub(crate) fn expires(&self) -> Option<std::time::Instant> {
+        self.expires
+    }
+
+    /// Whether the row is worth one more durable write.
+    pub(crate) fn store(&self) -> bool {
+        self.store
+    }
+}
+
+/// Decide whether a byte-identical republish is worth another durable write.
+///
+/// libp2p-kad fills a fresh `now + ttl` into every inbound copy, so each relayed copy carries a
+/// later expiry than the stored row. Persisting the row on every move lets any publisher force
+/// one MDBX commit per copy with no BLS work (GHSA-4947-9xvx-pv2m). The row is rewritten only
+/// when it has lapsed or when the copy extends its expiry by more than half the configured TTL,
+/// so one key costs at most two commits per TTL however many copies arrive. The kept expiry
+/// never shrinks.
+pub(crate) fn identical_refresh(
+    existing: Option<std::time::Instant>,
+    incoming: Option<std::time::Instant>,
+    now: std::time::Instant,
+    ttl: std::time::Duration,
+) -> IdenticalRefresh {
+    let refresh_after = ttl.checked_div(2).unwrap_or(std::time::Duration::ZERO);
+    let expires = existing.zip(incoming).map(|(old, new)| old.max(new));
+    let lapsed = existing.is_some_and(|old| old <= now);
+    let extended = existing
+        .zip(incoming)
+        .is_some_and(|(old, new)| new.saturating_duration_since(old) > refresh_after);
+    IdenticalRefresh { expires, store: lapsed || extended }
 }
 
 #[cfg(test)]
@@ -2655,5 +2702,83 @@ mod test {
         assert!(store.get(&own.key).is_some(), "own record must land at capacity");
         assert_eq!(store.num_records, 3);
         Ok(())
+    }
+
+    /// A relayed identical copy that moves the expiry by less than half the TTL keeps the longer
+    /// lifetime but is not worth a durable write (GHSA-4947-9xvx-pv2m).
+    #[test]
+    fn test_identical_refresh_skips_small_extension() {
+        let now = std::time::Instant::now();
+        let ttl = Duration::from_secs(3600);
+        let stored = now + Duration::from_secs(1800);
+        let incoming = now + Duration::from_secs(2400);
+        let refresh = identical_refresh(Some(stored), Some(incoming), now, ttl);
+        assert_eq!(refresh.expires(), Some(incoming), "the kept expiry must not shrink");
+        assert!(!refresh.store(), "a 10 minute extension must not cost a commit");
+    }
+
+    /// An extension of more than half the TTL refreshes the row.
+    #[test]
+    fn test_identical_refresh_stores_half_ttl_extension() {
+        let now = std::time::Instant::now();
+        let ttl = Duration::from_secs(3600);
+        let stored = now + Duration::from_secs(600);
+        let incoming = now + Duration::from_secs(3600);
+        let refresh = identical_refresh(Some(stored), Some(incoming), now, ttl);
+        assert_eq!(refresh.expires(), Some(incoming));
+        assert!(refresh.store(), "a 50 minute extension refreshes the row");
+    }
+
+    /// A copy with an earlier expiry never shortens the stored lifetime and never writes.
+    #[test]
+    fn test_identical_refresh_never_shortens() {
+        let now = std::time::Instant::now();
+        let ttl = Duration::from_secs(3600);
+        let stored = now + Duration::from_secs(3000);
+        let incoming = now + Duration::from_secs(10);
+        let refresh = identical_refresh(Some(stored), Some(incoming), now, ttl);
+        assert_eq!(refresh.expires(), Some(stored), "the kept expiry must not shrink");
+        assert!(!refresh.store(), "a shorter copy must not cost a commit");
+    }
+
+    /// A lapsed row is rewritten by the next copy, whatever the extension.
+    #[test]
+    fn test_identical_refresh_rewrites_lapsed_row() {
+        let now = std::time::Instant::now() + Duration::from_secs(60);
+        let ttl = Duration::from_secs(3600);
+        let stored = now.checked_sub(Duration::from_secs(1));
+        let incoming = now + Duration::from_secs(5);
+        let refresh = identical_refresh(stored, Some(incoming), now, ttl);
+        assert_eq!(refresh.expires(), Some(incoming));
+        assert!(refresh.store(), "a lapsed row must be rewritten");
+    }
+
+    /// A stored row without an expiry is never rewritten by an identical copy.
+    #[test]
+    fn test_identical_refresh_keeps_unbounded_row() {
+        let now = std::time::Instant::now();
+        let ttl = Duration::from_secs(3600);
+        let refresh = identical_refresh(None, Some(now + Duration::from_secs(5)), now, ttl);
+        assert_eq!(refresh.expires(), None);
+        assert!(!refresh.store(), "a row without expiry must not be rewritten");
+    }
+
+    /// One copy per second for a whole TTL costs one write, not one per copy: the bound the
+    /// advisory needs (at most two durable commits per key per TTL).
+    #[test]
+    fn test_identical_refresh_bounds_writes_per_ttl() {
+        let now = std::time::Instant::now();
+        let ttl = Duration::from_secs(3600);
+        let (writes, _) =
+            (1..=3600u64).fold((0usize, Some(now + ttl)), |(writes, stored), second| {
+                let copy_now = now + Duration::from_secs(second);
+                let refresh = identical_refresh(stored, Some(copy_now + ttl), copy_now, ttl);
+                if refresh.store() {
+                    (writes + 1, refresh.expires())
+                } else {
+                    (writes, stored)
+                }
+            });
+        assert_eq!(writes, 1, "3600 copies within one TTL must cost one write");
     }
 }
