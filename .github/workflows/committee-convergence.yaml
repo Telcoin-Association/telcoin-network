@@ -37,7 +37,7 @@ jobs:
           submodules: true
       - name: Install pinned Rust toolchain
         run: rustup show active-toolchain || rustup toolchain install
-      - uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
+      - uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2.87.31
         with:
           tool: cargo-nextest
       # The runner image's own stable Rust would be hashed into the cache key, so it goes
@@ -77,7 +77,7 @@ jobs:
           submodules: true
       - name: Install pinned Rust toolchain
         run: rustup show active-toolchain || rustup toolchain install
-      - uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
+      - uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2.87.31
         with:
           tool: cargo-nextest
       # The runner image's own stable Rust would be hashed into the cache key, so it goes
