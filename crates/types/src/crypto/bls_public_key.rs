@@ -331,7 +331,7 @@ mod tests {
         // a bcs byte string of the compressed length that is not a point
         let junk: Vec<u8> =
             std::iter::once(u8::try_from(BlsPublicKey::COMPRESSED_BYTES).expect("fits u8"))
-                .chain(std::iter::repeat(7u8).take(BlsPublicKey::COMPRESSED_BYTES))
+                .chain(std::iter::repeat_n(7u8, BlsPublicKey::COMPRESSED_BYTES))
                 .collect();
         assert!(bcs::from_bytes::<BlsPublicKey>(&junk).is_err());
         assert!(bcs::from_bytes::<BlsPublicKeyBytes>(&junk).is_err());
