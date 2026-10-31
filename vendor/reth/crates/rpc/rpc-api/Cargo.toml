@@ -27,7 +27,6 @@ alloy-rpc-types-eth.workspace = true
 alloy-rpc-types.workspace = true
 alloy-rpc-types-debug.workspace = true
 alloy-rpc-types-trace.workspace = true
-alloy-rpc-types-mev.workspace = true
 alloy-genesis.workspace = true
 
 # misc

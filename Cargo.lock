@@ -7771,7 +7771,6 @@ dependencies = [
  "alloy-rpc-types",
  "alloy-rpc-types-debug",
  "alloy-rpc-types-eth",
- "alloy-rpc-types-mev",
  "alloy-rpc-types-trace",
  "jsonrpsee",
  "reth-rpc-eth-api",

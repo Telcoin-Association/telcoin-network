@@ -274,6 +274,15 @@ newest last.
   `TreeConfig`, `EngineTypes`, `PayloadValidator` and `ConsensusEngineEvent` that TN, node-core
   and the RPC crates use stay. *Upstream*: no.
 
+- **TN-0033** — Remove the `mev` namespace server (`mev_simBundle`). *Kind*: removal.
+  *Files*: deleted `crates/rpc/rpc/src/eth/sim_bundle.rs` and `crates/rpc/rpc-api/src/mev.rs`;
+  `crates/rpc/rpc/src/eth/mod.rs`, `crates/rpc/rpc-api/{src/lib.rs, Cargo.toml}` (no
+  alloy-rpc-types-mev), `crates/rpc/rpc-builder/src/lib.rs` (the `Mev` arm joins the empty arms).
+  *Why*: the same reasoning as TN-0021. TN's allowlist never selects `mev`, so `EthSimBundle` and
+  the `MevSimApi`/`MevFullApi` traits were unreachable. `eth_callBundle` is unaffected: it is
+  `EthBundle`, registered with `eth` and wrapped by TN's epoch-fee adapter. `RethRpcModule::Mev`
+  stays, so operators' module lists still parse. *Upstream*: no.
+
 ## Upstream syncs
 
 - **TN-0013** — Sync to upstream v1.11.4 (`2ac58a25f561`). *Kind*: sync.

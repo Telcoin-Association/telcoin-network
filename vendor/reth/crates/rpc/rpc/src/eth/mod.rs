@@ -6,7 +6,7 @@ pub mod core;
 pub mod filter;
 pub mod helpers;
 pub mod pubsub;
-pub mod sim_bundle;
+// TN(TN-0033): upstream's `sim_bundle` (`mev_simBundle`) is removed; TN never serves `mev`.
 
 /// Implementation of `eth` namespace API.
 pub use builder::EthApiBuilder;

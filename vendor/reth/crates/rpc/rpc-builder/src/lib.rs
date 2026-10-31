@@ -102,7 +102,6 @@ pub use metrics::{MeteredBatchRequestsFuture, MeteredRequestFuture, RpcRequestMe
 use reth_chain_state::{
     CanonStateSubscriptions, ForkChoiceSubscriptions, PersistedBlockSubscriptions,
 };
-use reth_rpc::eth::sim_bundle::EthSimBundle;
 
 // Rpc rate limiter
 pub mod rate_limiter;
@@ -870,17 +869,13 @@ where
                         )
                         .into_rpc()
                         .into(),
-                        RethRpcModule::Mev => {
-                            EthSimBundle::new(eth_api.clone(), self.blocking_pool_guard.clone())
-                                .into_rpc()
-                                .into()
-                        }
                         // these are implementation specific and need to be handled during
                         // initialization and should be registered via extend_rpc_modules in the
                         // nodebuilder rpc addon stack
-                        // TN(TN-0021): admin, txpool, ots, reth and miner have no implementation
-                        // here any more; TN's allowlist never selects them.
+                        // TN(TN-0021, TN-0033): admin, txpool, ots, reth, miner and mev have no
+                        // implementation here any more; TN's allowlist never selects them.
                         RethRpcModule::Flashbots |
+                        RethRpcModule::Mev |
                         RethRpcModule::Testing |
                         RethRpcModule::Admin |
                         RethRpcModule::Txpool |
