@@ -291,7 +291,7 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   was already right. *Upstream*: n/a (upstream commit).
 
 - **TN-0023** — Backport upstream's static-file fixes. *Kind*: backport.
-  *Why*: TN stores headers, transactions and receipts in reth's static files, heals them with
+  *Why*: TN (storage v1) keeps headers and transactions in reth's static files, heals them with
   `check_consistency` at every startup, and reads them while persistence appends. These fixes
   cover cache races, recovery and torn tails in that code. Static files are outside the tndb-b
   work, which replaces MDBX and RocksDB. Applied in upstream order, one commit each:
