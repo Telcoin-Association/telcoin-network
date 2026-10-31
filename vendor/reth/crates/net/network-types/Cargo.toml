@@ -32,4 +32,3 @@ serde = [
     "dep:humantime-serde",
     "alloy-eip2124/serde",
 ]
-test-utils = []

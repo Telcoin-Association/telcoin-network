@@ -1,3 +1,5 @@
+// Vendored reth code. TN's lint levels do not apply here; see vendor/reth/VENDOR.md.
+#![allow(warnings, unused_extern_crates)]
 //! Implementation of [EIP-1459](https://eips.ethereum.org/EIPS/eip-1459) Node Discovery via DNS.
 //!
 //! ## Feature Flags

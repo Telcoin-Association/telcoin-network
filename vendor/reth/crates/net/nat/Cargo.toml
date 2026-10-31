@@ -20,10 +20,6 @@ tokio = { workspace = true, features = ["time"] }
 if-addrs.workspace = true
 tracing.workspace = true
 
-[dev-dependencies]
-reth-tracing.workspace = true
-tokio = { workspace = true, features = ["macros"] }
-
 [features]
 default = ["serde"]
 serde = ["dep:serde_with"]

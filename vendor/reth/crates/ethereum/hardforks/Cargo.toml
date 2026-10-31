@@ -21,20 +21,9 @@ alloy-primitives = { workspace = true, features = ["serde", "rlp"] }
 once_cell.workspace = true
 rustc-hash = { workspace = true, optional = true }
 
-# arbitrary utils
-arbitrary = { workspace = true, features = ["derive"], optional = true }
 auto_impl.workspace = true
 
-[dev-dependencies]
-arbitrary = { workspace = true, features = ["derive"] }
-
 [features]
-default = ["std", "serde", "rustc-hash"]
-arbitrary = [
-    "dep:arbitrary",
-    "alloy-primitives/arbitrary",
-    "alloy-eip2124/arbitrary",
-]
 serde = [
     "alloy-primitives/serde",
     "alloy-eip2124/serde",

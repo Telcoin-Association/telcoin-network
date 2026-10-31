@@ -46,30 +46,8 @@ thiserror.workspace = true
 modular-bitfield = { workspace = true, optional = true }
 serde = { workspace = true, optional = true }
 
-# arbitrary utils
-arbitrary = { workspace = true, features = ["derive"], optional = true }
-proptest = { workspace = true, optional = true }
-proptest-arbitrary-interop = { workspace = true, optional = true }
 rayon = { workspace = true, optional = true }
 alloy-rpc-types-eth = { workspace = true, optional = true }
-
-[dev-dependencies]
-reth-codecs.workspace = true
-reth-chainspec = { workspace = true, features = ["arbitrary"] }
-
-alloy-primitives = { workspace = true, features = ["arbitrary", "serde"] }
-alloy-consensus = { workspace = true, features = ["arbitrary", "serde"] }
-
-arbitrary = { workspace = true, features = ["derive"] }
-secp256k1 = { workspace = true, features = ["recovery", "global-context", "rand"] }
-bincode.workspace = true
-byteorder.workspace = true
-proptest-arbitrary-interop.workspace = true
-proptest.workspace = true
-rand.workspace = true
-rand_08.workspace = true
-serde.workspace = true
-serde_json.workspace = true
 
 [features]
 default = ["std"]
@@ -89,36 +67,11 @@ std = [
     "thiserror/std",
     "alloy-trie/std",
     "op-alloy-consensus?/std",
-    "serde_json/std",
-    "reth-chainspec/std",
     "revm-bytecode/std",
     "revm-state/std",
     "alloy-rpc-types-eth?/std",
 ]
 secp256k1 = ["alloy-consensus/secp256k1"]
-test-utils = [
-    "arbitrary",
-    "reth-codecs?/test-utils",
-    "reth-chainspec/test-utils",
-]
-arbitrary = [
-    "std",
-    "alloy-consensus/arbitrary",
-    "alloy-primitives/arbitrary",
-    "dep:arbitrary",
-    "dep:proptest",
-    "dep:proptest-arbitrary-interop",
-    "alloy-eips/arbitrary",
-    "revm-primitives/arbitrary",
-    "reth-codecs?/arbitrary",
-    "secp256k1?/global-context",
-    "secp256k1?/rand",
-    "op-alloy-consensus?/arbitrary",
-    "alloy-trie/arbitrary",
-    "reth-chainspec/arbitrary",
-    "alloy-rpc-types-eth?/arbitrary",
-    "dashmap?/arbitrary",
-]
 serde-bincode-compat = [
     "serde",
     "serde_with",
@@ -135,7 +88,6 @@ serde = [
     "alloy-eips/serde",
     "alloy-primitives/serde",
     "bytes/serde",
-    "rand/serde",
     "reth-codecs?/serde",
     "revm-primitives/serde",
     "revm-primitives/serde",
@@ -144,7 +96,6 @@ serde = [
     "alloy-trie/serde",
     "revm-bytecode/serde",
     "revm-state/serde",
-    "rand_08/serde",
     "alloy-rpc-types-eth?/serde",
     "dashmap?/serde",
 ]
@@ -152,10 +103,6 @@ reth-codec = [
     "dep:reth-codecs",
     "dep:modular-bitfield",
     "dep:byteorder",
-]
-op = [
-    "dep:op-alloy-consensus",
-    "reth-codecs?/op",
 ]
 rayon = [
     "dep:rayon",

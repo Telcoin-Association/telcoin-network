@@ -1,3 +1,5 @@
+// Vendored reth code. TN's lint levels do not apply here; see vendor/reth/VENDOR.md.
+#![allow(warnings, unused_extern_crates)]
 //! Network Types and Utilities.
 //!
 //! This crate manages and converts Ethereum network entities such as node records, peer IDs, and

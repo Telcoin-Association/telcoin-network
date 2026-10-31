@@ -28,24 +28,14 @@ alloy-evm.workspace = true
 alloy-consensus.workspace = true
 alloy-rpc-types-engine.workspace = true
 
-# Misc
-parking_lot = { workspace = true, optional = true }
 derive_more = { workspace = true, optional = true }
-
-[dev-dependencies]
-reth-testing-utils.workspace = true
-reth-evm = { workspace = true, features = ["test-utils"] }
-secp256k1.workspace = true
-alloy-genesis.workspace = true
 
 [features]
 default = ["std"]
 std = [
     "alloy-consensus/std",
     "alloy-eips/std",
-    "alloy-genesis/std",
     "alloy-primitives/std",
-    "secp256k1/std",
     "reth-ethereum-forks/std",
     "reth-chainspec/std",
     "alloy-evm/std",
@@ -57,13 +47,4 @@ std = [
     "derive_more?/std",
     "alloy-rpc-types-engine/std",
     "reth-storage-errors/std",
-]
-test-utils = [
-    "std",
-    "dep:parking_lot",
-    "dep:derive_more",
-    "reth-chainspec/test-utils",
-    "reth-ethereum-primitives/test-utils",
-    "reth-evm/test-utils",
-    "reth-primitives-traits/test-utils",
 ]

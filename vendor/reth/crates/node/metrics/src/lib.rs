@@ -1,3 +1,5 @@
+// Vendored reth code. TN's lint levels do not apply here; see vendor/reth/VENDOR.md.
+#![allow(warnings, unused_extern_crates)]
 //! Metrics utilities for the node.
 #![doc(
     html_logo_url = "https://raw.githubusercontent.com/paradigmxyz/reth/main/assets/reth-docs.png",

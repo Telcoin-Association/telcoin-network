@@ -1,3 +1,5 @@
+// Vendored reth code. TN's lint levels do not apply here; see vendor/reth/VENDOR.md.
+#![allow(warnings, unused_extern_crates)]
 //! MDBX implementation for reth's database abstraction layer.
 //!
 //! This crate is an implementation of `reth-db-api` for MDBX, as well as a few other common

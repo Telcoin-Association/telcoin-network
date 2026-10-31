@@ -1,3 +1,5 @@
+// Vendored reth code. TN's lint levels do not apply here; see vendor/reth/VENDOR.md.
+#![allow(warnings, unused_extern_crates)]
 //! Utilities to store history from downloaded ERA files with storage-api
 //!  and export it to recreate era1 files.
 //!

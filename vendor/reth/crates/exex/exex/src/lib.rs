@@ -1,3 +1,5 @@
+// Vendored reth code. TN's lint levels do not apply here; see vendor/reth/VENDOR.md.
+#![allow(warnings, unused_extern_crates)]
 //! Execution extensions (`ExEx`).
 //!
 //! An execution extension is a task that listens to state changes of the node.

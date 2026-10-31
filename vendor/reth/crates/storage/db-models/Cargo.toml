@@ -27,22 +27,7 @@ serde = { workspace = true, optional = true }
 # misc
 bytes = { workspace = true, optional = true }
 
-# arbitrary utils
-arbitrary = { workspace = true, features = ["derive"], optional = true }
-
-[dev-dependencies]
-# reth
-reth-primitives-traits = { workspace = true, features = ["arbitrary", "reth-codec"] }
-reth-codecs.workspace = true
-
-bytes.workspace = true
-arbitrary = { workspace = true, features = ["derive"] }
-
-proptest.workspace = true
-proptest-arbitrary-interop.workspace = true
-
 [features]
-default = ["std"]
 std = [
     "alloy-eips/std",
     "alloy-primitives/std",
@@ -57,19 +42,6 @@ serde = [
     "bytes?/serde",
     "reth-codecs?/serde",
     "reth-primitives-traits/serde",
-]
-test-utils = [
-    "reth-primitives-traits/test-utils",
-    "arbitrary",
-    "reth-codecs?/test-utils",
-]
-arbitrary = [
-    "std",
-    "reth-primitives-traits/arbitrary",
-    "dep:arbitrary",
-    "alloy-primitives/arbitrary",
-    "alloy-eips/arbitrary",
-    "reth-codecs?/arbitrary",
 ]
 reth-codec = [
     "dep:reth-codecs",

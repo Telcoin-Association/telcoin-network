@@ -1,3 +1,5 @@
+// Vendored reth code. TN's lint levels do not apply here; see vendor/reth/VENDOR.md.
+#![allow(warnings, unused_extern_crates)]
 //! Reth interface definitions and commonly used types for the reth-network crate.
 //!
 //! Provides abstractions for the reth-network crate.

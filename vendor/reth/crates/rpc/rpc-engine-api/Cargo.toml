@@ -44,14 +44,3 @@ jsonrpsee-types.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
-
-[dev-dependencies]
-reth-ethereum-engine-primitives.workspace = true
-reth-provider = { workspace = true, features = ["test-utils"] }
-reth-ethereum-primitives.workspace = true
-reth-payload-builder = { workspace = true, features = ["test-utils"] }
-reth-testing-utils.workspace = true
-alloy-rlp.workspace = true
-reth-node-ethereum.workspace = true
-
-assert_matches.workspace = true

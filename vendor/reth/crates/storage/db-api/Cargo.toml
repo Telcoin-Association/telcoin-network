@@ -27,9 +27,6 @@ alloy-primitives.workspace = true
 alloy-genesis.workspace = true
 alloy-consensus.workspace = true
 
-# op
-op-alloy-consensus = { workspace = true, optional = true }
-
 # codecs
 modular-bitfield.workspace = true
 roaring.workspace = true
@@ -44,55 +41,4 @@ arrayvec.workspace = true
 derive_more.workspace = true
 bytes.workspace = true
 
-# arbitrary utils
-arbitrary = { workspace = true, features = ["derive"], optional = true }
-proptest = { workspace = true, optional = true }
-
-[dev-dependencies]
-# reth libs with arbitrary
-reth-codecs = { workspace = true, features = ["test-utils"] }
-reth-db-models = { workspace = true, features = ["arbitrary"] }
-
-alloy-primitives = { workspace = true, features = ["rand"] }
-rand.workspace = true
-
-test-fuzz.workspace = true
-
-arbitrary = { workspace = true, features = ["derive"] }
-proptest.workspace = true
-proptest-arbitrary-interop.workspace = true
-
 [features]
-test-utils = [
-    "arbitrary",
-    "reth-primitives-traits/test-utils",
-    "reth-codecs/test-utils",
-    "reth-db-models/test-utils",
-    "reth-trie-common/test-utils",
-    "reth-prune-types/test-utils",
-    "reth-stages-types/test-utils",
-    "reth-ethereum-primitives/test-utils",
-]
-arbitrary = [
-    "reth-db-models/arbitrary",
-    "dep:arbitrary",
-    "dep:proptest",
-    "reth-primitives-traits/arbitrary",
-    "reth-trie-common/arbitrary",
-    "alloy-primitives/arbitrary",
-    "parity-scale-codec/arbitrary",
-    "reth-codecs/arbitrary",
-    "reth-prune-types/arbitrary",
-    "reth-stages-types/arbitrary",
-    "alloy-consensus/arbitrary",
-    "op-alloy-consensus?/arbitrary",
-    "reth-ethereum-primitives/arbitrary",
-]
-op = [
-    "dep:op-alloy-consensus",
-    "reth-codecs/op",
-    "reth-primitives-traits/op",
-]
-bench = []
-rocksdb = []
-edge = ["rocksdb"]

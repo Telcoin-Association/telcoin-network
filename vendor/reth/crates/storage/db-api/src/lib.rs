@@ -1,3 +1,5 @@
+// Vendored reth code. TN's lint levels do not apply here; see vendor/reth/VENDOR.md.
+#![allow(warnings, unused_extern_crates)]
 //! reth's database abstraction layer.
 //!
 //! The database abstraction assumes that the underlying store is a KV store subdivided into tables.

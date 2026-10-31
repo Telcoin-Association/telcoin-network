@@ -1,3 +1,5 @@
+// Vendored reth code. TN's lint levels do not apply here; see vendor/reth/VENDOR.md.
+#![allow(warnings, unused_extern_crates)]
 //! Immutable data store format.
 //!
 //! *Warning*: The `NippyJar` encoding format and its implementations are

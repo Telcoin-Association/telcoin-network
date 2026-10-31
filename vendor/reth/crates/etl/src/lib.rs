@@ -1,3 +1,5 @@
+// Vendored reth code. TN's lint levels do not apply here; see vendor/reth/VENDOR.md.
+#![allow(warnings, unused_extern_crates)]
 //! ETL data collector.
 //!
 //! This crate is useful for dumping unsorted data into temporary files and iterating on their

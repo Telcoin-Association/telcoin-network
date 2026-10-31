@@ -1,3 +1,5 @@
+// Vendored reth code. TN's lint levels do not apply here; see vendor/reth/VENDOR.md.
+#![allow(warnings, unused_extern_crates)]
 //! Era and Era1 files support for Ethereum history expiry.
 //!
 //! Era1 files use the same e2store foundation but are specialized for

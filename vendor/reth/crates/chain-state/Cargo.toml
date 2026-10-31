@@ -44,19 +44,7 @@ pin-project.workspace = true
 rayon = { workspace = true, optional = true }
 serde = { workspace = true, optional = true }
 
-# optional deps for test-utils
-alloy-signer = { workspace = true, optional = true }
-alloy-signer-local = { workspace = true, optional = true }
 rand = { workspace = true, optional = true }
-
-[dev-dependencies]
-reth-primitives-traits = { workspace = true, features = ["test-utils"] }
-reth-testing-utils.workspace = true
-alloy-signer.workspace = true
-alloy-signer-local.workspace = true
-rand.workspace = true
-revm-state.workspace = true
-criterion.workspace = true
 
 [features]
 serde = [
@@ -74,20 +62,4 @@ serde = [
     "revm-state?/serde",
     "reth-storage-api/serde",
 ]
-test-utils = [
-    "alloy-primitives/getrandom",
-    "alloy-signer",
-    "alloy-signer-local",
-    "rand",
-    "revm-state",
-    "reth-chainspec/test-utils",
-    "reth-primitives-traits/test-utils",
-    "reth-trie/test-utils",
-    "reth-ethereum-primitives/test-utils",
-]
 rayon = ["dep:rayon"]
-
-[[bench]]
-name = "canonical_hashes_range"
-harness = false
-required-features = ["test-utils"]

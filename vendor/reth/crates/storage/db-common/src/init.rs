@@ -1032,36 +1032,6 @@ mod tests {
             )
         };
 
-        #[cfg(feature = "rocksdb")]
-        {
-            let settings = factory.cached_storage_settings();
-            let rocksdb = factory.rocksdb_provider();
-
-            let collect_rocksdb = |rocksdb: &reth_provider::providers::RocksDBProvider| {
-                (
-                    rocksdb
-                        .iter::<tables::AccountsHistory>()
-                        .unwrap()
-                        .collect::<Result<Vec<_>, _>>()
-                        .unwrap(),
-                    rocksdb
-                        .iter::<tables::StoragesHistory>()
-                        .unwrap()
-                        .collect::<Result<Vec<_>, _>>()
-                        .unwrap(),
-                )
-            };
-
-            let (accounts, storages) = if settings.storage_v2 {
-                collect_rocksdb(&rocksdb)
-            } else {
-                collect_from_mdbx(&factory)
-            };
-            assert_eq!(accounts, expected_accounts);
-            assert_eq!(storages, expected_storages);
-        }
-
-        #[cfg(not(feature = "rocksdb"))]
         {
             let (accounts, storages) = collect_from_mdbx(&factory);
             assert_eq!(accounts, expected_accounts);

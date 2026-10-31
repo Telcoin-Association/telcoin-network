@@ -75,10 +75,6 @@ where
         let range_end = *range.end();
 
         // Check where storage history indices are stored
-        #[cfg(all(unix, feature = "rocksdb"))]
-        if provider.cached_storage_settings().storage_v2 {
-            return self.prune_rocksdb(provider, input, range, range_end);
-        }
 
         // Check where storage changesets are stored (MDBX path)
         if EitherWriter::storage_changesets_destination(provider).is_static_file() {
@@ -230,108 +226,6 @@ impl StorageHistory {
             |a, b| a.address == b.address && a.sharded_key.key == b.sharded_key.key,
         )
         .map_err(Into::into)
-    }
-
-    /// Prunes storage history when indices are stored in `RocksDB`.
-    ///
-    /// Reads storage changesets from static files and prunes the corresponding
-    /// `RocksDB` history shards.
-    #[cfg(all(unix, feature = "rocksdb"))]
-    fn prune_rocksdb<Provider>(
-        &self,
-        provider: &Provider,
-        input: PruneInput,
-        range: std::ops::RangeInclusive<BlockNumber>,
-        range_end: BlockNumber,
-    ) -> Result<SegmentOutput, PrunerError>
-    where
-        Provider: DBProvider + StaticFileProviderFactory + RocksDBProviderFactory,
-    {
-        let mut limiter = input.limiter;
-
-        if limiter.is_limit_reached() {
-            return Ok(SegmentOutput::not_done(
-                limiter.interrupt_reason(),
-                input.previous_checkpoint.map(SegmentOutputCheckpoint::from_prune_checkpoint),
-            ))
-        }
-
-        let mut highest_deleted_storages: FxHashMap<_, _> = FxHashMap::default();
-        let mut last_changeset_pruned_block = None;
-        let mut changesets_processed = 0usize;
-        let mut done = true;
-
-        // Walk storage changesets from static files using a streaming iterator.
-        // For each changeset, track the highest block number seen for each (address, storage_key)
-        // pair to determine which history shard entries need pruning.
-        let walker = provider.static_file_provider().walk_storage_changeset_range(range);
-        for result in walker {
-            if limiter.is_limit_reached() {
-                done = false;
-                break;
-            }
-            let (block_address, entry) = result?;
-            let block_number = block_address.block_number();
-            let address = block_address.address();
-            highest_deleted_storages.insert((address, entry.key.as_b256()), block_number);
-            last_changeset_pruned_block = Some(block_number);
-            changesets_processed += 1;
-            limiter.increment_deleted_entries_count();
-        }
-
-        trace!(target: "pruner", processed = %changesets_processed, %done, "Scanned storage changesets from static files");
-
-        let last_changeset_pruned_block = last_changeset_pruned_block
-            .map(|block_number| if done { block_number } else { block_number.saturating_sub(1) })
-            .unwrap_or(range_end);
-
-        // Prune RocksDB history shards for affected storage slots
-        let mut deleted_shards = 0usize;
-        let mut updated_shards = 0usize;
-
-        // Sort by (address, storage_key) for better RocksDB cache locality
-        let mut sorted_storages: Vec<_> = highest_deleted_storages.into_iter().collect();
-        sorted_storages.sort_unstable_by_key(|((addr, key), _)| (*addr, *key));
-
-        provider.with_rocksdb_batch(|mut batch| {
-            let targets: Vec<_> = sorted_storages
-                .iter()
-                .map(|((addr, key), highest)| {
-                    ((*addr, *key), (*highest).min(last_changeset_pruned_block))
-                })
-                .collect();
-
-            let outcomes = batch.prune_storage_history_batch(&targets)?;
-            deleted_shards = outcomes.deleted;
-            updated_shards = outcomes.updated;
-
-            Ok(((), Some(batch.into_inner())))
-        })?;
-
-        trace!(target: "pruner", deleted = deleted_shards, updated = updated_shards, %done, "Pruned storage history (RocksDB indices)");
-
-        // Delete static file jars only when fully processed. During provider.commit(), RocksDB
-        // batch is committed before the MDBX checkpoint. If crash occurs after RocksDB commit
-        // but before MDBX commit, on restart the pruner checkpoint indicates data needs
-        // re-pruning, but the RocksDB shards are already pruned - this is safe because pruning
-        // is idempotent (re-pruning already-pruned shards is a no-op).
-        if done {
-            provider.static_file_provider().delete_segment_below_block(
-                StaticFileSegment::StorageChangeSets,
-                last_changeset_pruned_block + 1,
-            )?;
-        }
-
-        let progress = limiter.progress(done);
-
-        Ok(SegmentOutput {
-            progress,
-            pruned: changesets_processed + deleted_shards + updated_shards,
-            checkpoint: Some(SegmentOutputCheckpoint {
-                block_number: Some(last_changeset_pruned_block),
-                tx_number: None,
-            }),
-        })
     }
 }
 
@@ -522,7 +416,6 @@ mod tests {
     /// routes to `prune_rocksdb` instead, so this test only runs without rocksdb (the
     /// `prune_rocksdb_path` test covers that configuration).
     #[test]
-    #[cfg(not(all(unix, feature = "rocksdb")))]
     fn prune_static_file() {
         let db = TestStageDB::default();
         let mut rng = generators::rng();
@@ -819,113 +712,5 @@ mod tests {
         // All changesets should be pruned
         let final_changesets = db.table::<tables::StorageChangeSets>().unwrap();
         assert!(final_changesets.is_empty(), "All changesets up to block 10 should be pruned");
-    }
-
-    #[cfg(all(unix, feature = "rocksdb"))]
-    #[test]
-    fn prune_rocksdb() {
-        use reth_db_api::models::storage_sharded_key::StorageShardedKey;
-        use reth_provider::RocksDBProviderFactory;
-        use reth_storage_api::StorageSettings;
-
-        let db = TestStageDB::default();
-        let mut rng = generators::rng();
-
-        let blocks = random_block_range(
-            &mut rng,
-            0..=100,
-            BlockRangeParams { parent: Some(B256::ZERO), tx_count: 0..1, ..Default::default() },
-        );
-        db.insert_blocks(blocks.iter(), StorageKind::Database(None)).expect("insert blocks");
-
-        let accounts = random_eoa_accounts(&mut rng, 2).into_iter().collect::<BTreeMap<_, _>>();
-
-        let (changesets, _) = random_changeset_range(
-            &mut rng,
-            blocks.iter(),
-            accounts.into_iter().map(|(addr, acc)| (addr, (acc, Vec::new()))),
-            1..2,
-            1..2,
-        );
-
-        db.insert_changesets_to_static_files(changesets.clone(), None)
-            .expect("insert changesets to static files");
-
-        let mut storage_indices: BTreeMap<(alloy_primitives::Address, B256), Vec<u64>> =
-            BTreeMap::new();
-        for (block, changeset) in changesets.iter().enumerate() {
-            for (address, _, storage_entries) in changeset {
-                for entry in storage_entries {
-                    storage_indices.entry((*address, entry.key)).or_default().push(block as u64);
-                }
-            }
-        }
-
-        {
-            let rocksdb = db.factory.rocksdb_provider();
-            let mut batch = rocksdb.batch();
-            for ((address, storage_key), block_numbers) in &storage_indices {
-                let shard = BlockNumberList::new_pre_sorted(block_numbers.clone());
-                batch
-                    .put::<tables::StoragesHistory>(
-                        StorageShardedKey::last(*address, *storage_key),
-                        &shard,
-                    )
-                    .expect("insert storage history shard");
-            }
-            batch.commit().expect("commit rocksdb batch");
-        }
-
-        {
-            let rocksdb = db.factory.rocksdb_provider();
-            for (address, storage_key) in storage_indices.keys() {
-                let shards = rocksdb.storage_history_shards(*address, *storage_key).unwrap();
-                assert!(!shards.is_empty(), "RocksDB should contain storage history before prune");
-            }
-        }
-
-        let to_block = 50u64;
-        let prune_mode = PruneMode::Before(to_block);
-        let input =
-            PruneInput { previous_checkpoint: None, to_block, limiter: PruneLimiter::default() };
-        let segment = StorageHistory::new(prune_mode);
-
-        let provider = db.factory.database_provider_rw().unwrap();
-        provider.set_storage_settings_cache(StorageSettings::v2());
-        let result = segment.prune(&provider, input).unwrap();
-        provider.commit().expect("commit");
-
-        assert_matches!(
-            result,
-            SegmentOutput { progress: PruneProgress::Finished, checkpoint: Some(_), .. }
-        );
-
-        {
-            let rocksdb = db.factory.rocksdb_provider();
-            for ((address, storage_key), block_numbers) in &storage_indices {
-                let shards = rocksdb.storage_history_shards(*address, *storage_key).unwrap();
-
-                let remaining_blocks: Vec<u64> =
-                    block_numbers.iter().copied().filter(|&b| b > to_block).collect();
-
-                if remaining_blocks.is_empty() {
-                    assert!(
-                        shards.is_empty(),
-                        "Shard for {:?}/{:?} should be deleted when all blocks pruned",
-                        address,
-                        storage_key
-                    );
-                } else {
-                    assert!(!shards.is_empty(), "Shard should exist with remaining blocks");
-                    let actual_blocks: Vec<u64> =
-                        shards.iter().flat_map(|(_, list)| list.iter()).collect();
-                    assert_eq!(
-                        actual_blocks, remaining_blocks,
-                        "RocksDB shard should only contain blocks > {}",
-                        to_block
-                    );
-                }
-            }
-        }
     }
 }

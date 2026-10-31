@@ -33,6 +33,3 @@ std = [
     "reth-execution-types/std",
     "thiserror/std",
 ]
-test-utils = [
-    "reth-primitives-traits/test-utils",
-]

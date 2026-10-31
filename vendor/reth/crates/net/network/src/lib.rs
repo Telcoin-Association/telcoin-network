@@ -1,3 +1,5 @@
+// Vendored reth code. TN's lint levels do not apply here; see vendor/reth/VENDOR.md.
+#![allow(warnings, unused_extern_crates)]
 //! reth P2P networking.
 //!
 //! Ethereum's networking protocol is specified in [devp2p](https://github.com/ethereum/devp2p).

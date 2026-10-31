@@ -1,3 +1,5 @@
+// Vendored reth code. TN's lint levels do not apply here; see vendor/reth/VENDOR.md.
+#![allow(warnings, unused_extern_crates)]
 //! Abstractions for working with execution payloads.
 //!
 //! This crate provides types and traits for execution and building payloads.

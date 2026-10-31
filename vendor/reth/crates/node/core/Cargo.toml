@@ -70,11 +70,6 @@ secp256k1 = { workspace = true, features = ["global-context", "std", "recovery"]
 # async
 futures.workspace = true
 
-[dev-dependencies]
-# test vectors generation
-proptest.workspace = true
-tokio.workspace = true
-
 [features]
 # Features for vergen to generate correct env vars
 jemalloc = ["reth-cli-util/jemalloc"]
@@ -82,19 +77,8 @@ asm-keccak = ["alloy-primitives/asm-keccak"]
 keccak-cache-global = ["alloy-primitives/keccak-cache-global"]
 otlp = ["reth-tracing/otlp", "reth-tracing-otlp/otlp"]
 otlp-logs = ["reth-tracing/otlp-logs", "reth-tracing-otlp/otlp-logs"]
-tracy = ["reth-tracing/tracy"]
 
-min-error-logs = ["tracing/release_max_level_error"]
-min-warn-logs = ["tracing/release_max_level_warn"]
-min-info-logs = ["tracing/release_max_level_info"]
 min-debug-logs = ["tracing/release_max_level_debug"]
-min-trace-logs = ["tracing/release_max_level_trace"]
-
-# Route supported tables to RocksDB instead of MDBX
-rocksdb = ["reth-storage-api/rocksdb"]
-
-# Marker feature for edge/unstable builds - enables rocksdb and sets v2 defaults
-edge = ["rocksdb"]
 
 [build-dependencies]
 vergen = { workspace = true, features = ["build", "cargo", "emit_and_set"] }

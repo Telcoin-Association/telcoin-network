@@ -1,3 +1,5 @@
+// Vendored reth code. TN's lint levels do not apply here; see vendor/reth/VENDOR.md.
+#![allow(warnings, unused_extern_crates)]
 //! Compact codec.
 //!
 //! *Warning*: The `Compact` encoding format and its implementations are

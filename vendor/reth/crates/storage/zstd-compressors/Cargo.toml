@@ -15,5 +15,4 @@ workspace = true
 zstd = { workspace = true, features = ["experimental"] }
 
 [features]
-default = ["std"]
 std = []

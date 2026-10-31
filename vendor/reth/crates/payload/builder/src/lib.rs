@@ -1,3 +1,5 @@
+// Vendored reth code. TN's lint levels do not apply here; see vendor/reth/VENDOR.md.
+#![allow(warnings, unused_extern_crates)]
 //! This crate defines abstractions to create and update payloads (blocks):
 //! - [`PayloadJobGenerator`]: a type that knows how to create new jobs for creating payloads based
 //!   on [`PayloadAttributes`](alloy_rpc_types::engine::PayloadAttributes).

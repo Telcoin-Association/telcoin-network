@@ -34,9 +34,6 @@ futures-util.workspace = true
 metrics = { workspace = true, optional = true }
 rayon = { workspace = true, optional = true }
 
-[dev-dependencies]
-reth-ethereum-primitives.workspace = true
-
 [features]
 default = ["std"]
 std = [
@@ -54,12 +51,5 @@ std = [
     "derive_more/std",
     "reth-storage-api/std",
     "reth-trie-common/std",
-    "reth-ethereum-primitives/std",
 ]
 metrics = ["std", "dep:metrics", "dep:reth-metrics"]
-test-utils = [
-    "reth-primitives-traits/test-utils",
-    "reth-trie-common/test-utils",
-    "reth-ethereum-primitives/test-utils",
-]
-op = ["alloy-evm/op", "reth-primitives-traits/op"]

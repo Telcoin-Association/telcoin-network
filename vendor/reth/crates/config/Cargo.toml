@@ -36,11 +36,5 @@ serde = [
     "reth-network-types/serde",
     "reth-prune-types/serde",
     "reth-stages-types/serde",
-    "alloy-primitives/serde",
     "url/serde",
 ]
-
-[dev-dependencies]
-tempfile.workspace = true
-reth-network-peers.workspace = true
-alloy-primitives = { workspace = true, features = ["getrandom"] }

@@ -86,46 +86,9 @@ serde_json.workspace = true
 # tracing
 tracing.workspace = true
 
-[dev-dependencies]
-tempfile.workspace = true
-reth-ethereum-engine-primitives.workspace = true
-reth-payload-builder = { workspace = true, features = ["test-utils"] }
-reth-node-ethereum.workspace = true
-reth-provider = { workspace = true, features = ["test-utils"] }
-reth-evm-ethereum = { workspace = true, features = ["test-utils"] }
-
 [features]
 default = []
 js-tracer = [
     "reth-rpc/js-tracer",
-    "reth-node-ethereum/js-tracer",
     "reth-rpc-eth-types/js-tracer",
-]
-test-utils = [
-    "reth-db/test-utils",
-    "reth-chain-state/test-utils",
-    "reth-chainspec/test-utils",
-    "reth-consensus/test-utils",
-    "reth-engine-tree/test-utils",
-    "reth-evm/test-utils",
-    "reth-downloaders/test-utils",
-    "reth-network/test-utils",
-    "reth-network-p2p/test-utils",
-    "reth-payload-builder/test-utils",
-    "reth-stages/test-utils",
-    "reth-db-api/test-utils",
-    "reth-provider/test-utils",
-    "reth-transaction-pool/test-utils",
-    "reth-trie-db/test-utils",
-    "reth-evm-ethereum/test-utils",
-    "reth-node-ethereum/test-utils",
-    "reth-primitives-traits/test-utils",
-    "reth-tasks/test-utils",
-]
-op = [
-    "reth-db/op",
-    "reth-db-api/op",
-    "reth-engine-local/op",
-    "reth-evm/op",
-    "reth-primitives-traits/op",
 ]

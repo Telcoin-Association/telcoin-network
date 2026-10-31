@@ -1,3 +1,5 @@
+// Vendored reth code. TN's lint levels do not apply here; see vendor/reth/VENDOR.md.
+#![allow(warnings, unused_extern_crates)]
 //! The core of the Ethereum node. Collection of utilities and libraries that are used by the node.
 
 #![doc(

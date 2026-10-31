@@ -34,24 +34,9 @@ tokio = { workspace = true, features = ["sync"] }
 auto_impl.workspace = true
 tracing.workspace = true
 derive_more.workspace = true
-parking_lot = { workspace = true, optional = true }
-
-[dev-dependencies]
-reth-consensus = { workspace = true, features = ["test-utils"] }
-
-parking_lot.workspace = true
-tokio = { workspace = true, features = ["full"] }
 
 [features]
 default = ["std"]
-test-utils = [
-    "reth-consensus/test-utils",
-    "parking_lot",
-    "reth-network-types/test-utils",
-    "reth-ethereum-primitives/test-utils",
-    "reth-primitives-traits/test-utils",
-    "alloy-primitives/rand",
-]
 std = [
     "reth-consensus/std",
     "reth-ethereum-primitives/std",

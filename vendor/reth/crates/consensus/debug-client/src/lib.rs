@@ -1,3 +1,5 @@
+// Vendored reth code. TN's lint levels do not apply here; see vendor/reth/VENDOR.md.
+#![allow(warnings, unused_extern_crates)]
 //! Debug consensus client.
 //!
 //! This is a worker that sends FCUs and new payloads by fetching recent blocks from an external

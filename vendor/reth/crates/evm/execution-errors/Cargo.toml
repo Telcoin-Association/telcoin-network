@@ -22,7 +22,6 @@ nybbles.workspace = true
 thiserror.workspace = true
 
 [features]
-default = ["std"]
 std = [
     "alloy-primitives/std",
     "alloy-rlp/std",

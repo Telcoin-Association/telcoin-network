@@ -28,9 +28,3 @@ bytes.workspace = true
 thiserror.workspace = true
 futures-util.workspace = true
 interprocess = { workspace = true, features = ["tokio"] }
-
-[dev-dependencies]
-tokio-stream = { workspace = true, features = ["sync"] }
-serde.workspace = true
-reth-tracing.workspace = true
-rand.workspace = true

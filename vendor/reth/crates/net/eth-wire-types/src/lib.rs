@@ -1,3 +1,5 @@
+// Vendored reth code. TN's lint levels do not apply here; see vendor/reth/VENDOR.md.
+#![allow(warnings, unused_extern_crates)]
 //! Types for the eth wire protocol: <https://github.com/ethereum/devp2p/blob/master/caps/eth.md>
 
 #![doc(

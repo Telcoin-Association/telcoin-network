@@ -1,3 +1,5 @@
+// Vendored reth code. TN's lint levels do not apply here; see vendor/reth/VENDOR.md.
+#![allow(warnings, unused_extern_crates)]
 //! The implementation of Merkle Patricia Trie, a cryptographically
 //! authenticated radix trie that is used to store key-value bindings.
 //! <https://ethereum.org/en/developers/docs/data-structures-and-encoding/patricia-merkle-trie/>

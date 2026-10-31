@@ -14,7 +14,6 @@ workspace = true
 [dependencies]
 # reth
 reth-chainspec.workspace = true
-reth-evm-ethereum = { workspace = true, optional = true }
 reth-fs-util.workspace = true
 reth-primitives-traits.workspace = true
 reth-net-banlist.workspace = true
@@ -76,30 +75,6 @@ schnellru.workspace = true
 itertools.workspace = true
 smallvec.workspace = true
 
-[dev-dependencies]
-# reth
-reth-discv4 = { workspace = true, features = ["test-utils"] }
-
-# we need to enable the test-utils feature in our own crate to use utils in
-# integration tests
-reth-network = { workspace = true, features = ["test-utils"] }
-reth-network-p2p = { workspace = true, features = ["test-utils"] }
-reth-network-types = { workspace = true, features = ["test-utils"] }
-
-reth-provider = { workspace = true, features = ["test-utils"] }
-reth-tracing.workspace = true
-reth-transaction-pool = { workspace = true, features = ["test-utils"] }
-
-# alloy deps for testing against nodes
-alloy-genesis.workspace = true
-
-# misc
-url.workspace = true
-secp256k1 = { workspace = true, features = ["rand"] }
-
-## Benchmarks
-criterion = { workspace = true, features = ["async_tokio", "html_reports"] }
-
 [features]
 serde = [
     "dep:serde",
@@ -116,38 +91,11 @@ serde = [
     "parking_lot/serde",
     "rand/serde",
     "smallvec/serde",
-    "url/serde",
     "reth-primitives-traits/serde",
     "reth-ethereum-forks/serde",
-    "reth-network/serde",
     "reth-transaction-pool/serde",
     "reth-ethereum-primitives/serde",
     "reth-network-api/serde",
     "rand_08/serde",
     "reth-storage-api/serde",
 ]
-test-utils = [
-    "reth-transaction-pool/test-utils",
-    "reth-network-types/test-utils",
-    "reth-chainspec/test-utils",
-    "reth-consensus/test-utils",
-    "reth-discv4/test-utils",
-    "reth-network/test-utils",
-    "reth-network-p2p/test-utils",
-    "reth-primitives-traits/test-utils",
-    "reth-provider/test-utils",
-    "reth-ethereum-primitives/test-utils",
-    "dep:reth-evm-ethereum",
-    "reth-evm-ethereum?/test-utils",
-    "reth-tasks/test-utils",
-]
-
-[[bench]]
-name = "broadcast"
-required-features = ["test-utils"]
-harness = false
-
-[[bench]]
-name = "tx_manager_hash_fetching"
-required-features = ["test-utils"]
-harness = false

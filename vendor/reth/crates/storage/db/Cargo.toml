@@ -35,34 +35,12 @@ metrics = { workspace = true, optional = true }
 # misc
 page_size = { workspace = true, optional = true }
 thiserror.workspace = true
-tempfile = { workspace = true, optional = true }
 derive_more.workspace = true
 rustc-hash = { workspace = true, optional = true, features = ["std"] }
 sysinfo = { workspace = true, features = ["system"] }
-parking_lot = { workspace = true, optional = true }
 
 # arbitrary utils
 strum = { workspace = true, features = ["derive"], optional = true }
-
-[dev-dependencies]
-# reth libs with arbitrary
-reth-primitives-traits = { workspace = true, features = ["reth-codec"] }
-reth-prune-types.workspace = true
-
-alloy-primitives = { workspace = true, features = ["getrandom"] }
-alloy-consensus.workspace = true
-
-serde_json.workspace = true
-tempfile.workspace = true
-parking_lot.workspace = true
-
-serde.workspace = true
-criterion.workspace = true
-
-arbitrary = { workspace = true, features = ["derive"] }
-proptest.workspace = true
-
-assert_matches.workspace = true
 
 [features]
 default = ["mdbx"]
@@ -75,46 +53,3 @@ mdbx = [
     "dep:strum",
     "dep:rustc-hash",
 ]
-test-utils = [
-    "dep:tempfile",
-    "mdbx",
-    "arbitrary",
-    "parking_lot",
-    "reth-db-api/test-utils",
-    "reth-nippy-jar/test-utils",
-    "reth-primitives-traits/test-utils",
-    "reth-prune-types/test-utils",
-]
-bench = ["reth-db-api/bench"]
-arbitrary = [
-    "reth-db-api/arbitrary",
-    "alloy-primitives/arbitrary",
-    "alloy-consensus/arbitrary",
-    "reth-primitives-traits/arbitrary",
-    "reth-prune-types/arbitrary",
-]
-op = [
-    "reth-db-api/op",
-    "reth-primitives-traits/op",
-]
-disable-lock = []
-
-[[bench]]
-name = "hash_keys"
-required-features = ["test-utils"]
-harness = false
-
-[[bench]]
-name = "criterion"
-required-features = ["test-utils"]
-harness = false
-
-[[bench]]
-name = "get"
-required-features = ["test-utils"]
-harness = false
-
-[[bench]]
-name = "put"
-required-features = ["test-utils"]
-harness = false

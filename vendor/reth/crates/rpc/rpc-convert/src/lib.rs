@@ -1,3 +1,5 @@
+// Vendored reth code. TN's lint levels do not apply here; see vendor/reth/VENDOR.md.
+#![allow(warnings, unused_extern_crates)]
 //! Reth compatibility and utils for RPC types
 //!
 //! This crate various helper functions to convert between reth primitive types and rpc types.

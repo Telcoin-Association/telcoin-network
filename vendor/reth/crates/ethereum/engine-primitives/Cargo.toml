@@ -28,21 +28,4 @@ serde.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
 
-[dev-dependencies]
-serde_json.workspace = true
-
 [features]
-default = ["std"]
-std = [
-    "reth-ethereum-primitives/std",
-    "alloy-primitives/std",
-    "alloy-eips/std",
-    "alloy-rpc-types-engine/std",
-    "alloy-rlp/std",
-    "serde/std",
-    "sha2/std",
-    "serde_json/std",
-    "thiserror/std",
-    "reth-engine-primitives/std",
-    "reth-primitives-traits/std",
-]
