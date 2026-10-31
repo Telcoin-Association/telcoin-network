@@ -315,3 +315,9 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
     extra bytes; offsets read through a stale mmap during a prune return `InconsistentState`
     instead of panicking on a bad slice (`nippy-jar/src/{cursor.rs, lib.rs}`,
     `provider/src/providers/static_file/mod.rs`; upstream's three tests fail without the fix).
+  - 95679ace2: static-file read and decompression failures are returned as errors instead of
+    `Ok(None)`, so a corrupt row no longer looks like a missing block
+    (`db/src/static_file/cursor.rs`, `provider/src/providers/static_file/mod.rs`). The conflict
+    was TN's older spelling of the same expression (`map_or(None, |v| v)`); upstream's line
+    taken. Upstream's test adapted to v1.11's `read_only(path, watch_directory)`; it fails
+    without the fix.
