@@ -1022,10 +1022,22 @@ impl ConsensusBusApp {
         &self,
         consensus_chain: &ConsensusChain,
     ) -> Result<Option<ConsensusHeader>, ConsensusChainError> {
+        self.with_last_consensus_block(consensus_chain, ConsensusHeader::clone).await
+    }
+
+    /// `f` of the ConsensusHeader that was processed (see [`Self::last_consensus_block`], whose
+    /// absence and errors this shares), without copying the header out: for a caller that needs
+    /// a few of its fields on a hot path, such as the check for falling behind on every gossiped
+    /// certificate.
+    pub async fn with_last_consensus_block<R>(
+        &self,
+        consensus_chain: &ConsensusChain,
+        f: impl FnOnce(&ConsensusHeader) -> R,
+    ) -> Result<Option<R>, ConsensusChainError> {
         let latest_consensus = self.recent_blocks().borrow().latest_consensus_block_num_hash();
         let epoch = consensus_chain.epochs().number_to_epoch(latest_consensus.number);
         consensus_chain
-            .consensus_header_by_digest(epoch, latest_consensus.hash)
+            .with_consensus_header_by_digest(epoch, latest_consensus.hash, f)
             .await
             .inspect_err(|e| {
                 error!(target: "primary", "failed to load the last processed consensus header from storage: {e}");

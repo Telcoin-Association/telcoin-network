@@ -1,7 +1,14 @@
 //! Pack file for storing Certificates, indexed by certificate digest (header hash).
+//!
+//! One exception to the crate's rule that an absent file beside an index that attests data counts
+//! as corrupt, never new: a writable open whose data log (`cert_data`) is missing starts a new log
+//! and discards a leftover digest index (`cert_hash/`), with a warning naming both files when that
+//! index attests certificates. Nothing in production reads a certificate pack (it is written for
+//! the current epoch and sealed; past epochs' packs are not reopened), and refusing would stop the
+//! node over an archive. `EpochRecordDb` refuses the same shape (`CorruptLog`).
 
 use std::{
-    error::Error, fmt::Display, hash::BuildHasherDefault, io, path::Path, sync::Arc,
+    error::Error, fmt::Display, fs::File, hash::BuildHasherDefault, io, path::Path, sync::Arc,
     thread::JoinHandle,
 };
 
@@ -15,6 +22,7 @@ use tracing::{error, info, warn};
 
 use crate::{
     archive::{
+        data_file::create_dir_synced,
         digest_index::HdxIndex,
         error::{fetch::FetchError, open::OpenError},
         fxhasher::FxHasher,
@@ -40,7 +48,8 @@ enum PackMessage {
 /// Saves run on a background thread. A failed save latches into an error slot that
 /// [`get_error`](Self::get_error) reads without clearing. [`persist`](Self::persist) and
 /// [`shutdown`](Self::shutdown) are the durability barriers: a latched save failure reaches
-/// their return value, even when that save was still queued at the time of the call.
+/// their return value, even when that save was still queued at the time of the call. A dropped
+/// pack (no `shutdown`) can only log its final flush's failure.
 #[derive(Debug)]
 pub struct CertificatePack {
     tx: Sender<PackMessage>,
@@ -93,8 +102,16 @@ fn run_pack_loop(
                 let _ = tx.send(pending.map_or(flushed, Err));
             }
             PackMessage::Shutdown => {
-                let _ = inner.persist();
-                info!(target: "certificate_pack", "certificate pack for epoch {} persisted", epoch);
+                // The fire-and-forget close from `Drop`: nobody waits for a reply, so the log is
+                // the only place a failed final flush shows.
+                match inner.persist() {
+                    Ok(()) => {
+                        info!(target: "certificate_pack", "certificate pack for epoch {} persisted", epoch)
+                    }
+                    Err(e) => {
+                        error!(target: "certificate_pack", %e, epoch, "certificate pack final persist failed")
+                    }
+                }
                 break;
             }
             PackMessage::ShutdownAsync(tx) => {
@@ -114,18 +131,22 @@ fn run_pack_loop(
 impl Drop for CertificatePack {
     fn drop(&mut self) {
         if Arc::strong_count(&self.handle) == 1 {
-            // Reaching this with a live handle means shutdown() was NOT used: a correct
-            // shutdown().await already took the handle, so the block below is skipped. Drop is the
-            // safety net; the proper async path is shutdown().await. Mirrors ConsensusPack /
+            // Reaching this with a live handle means shutdown() was not used: a shutdown().await
+            // already took the handle, so the block below is skipped. The node's epoch owner
+            // (`run_epoch`) holds an `Arc` of the pack and seals it in `finish_epoch` with
+            // shutdown().await, the path that reports a failed save or final flush
+            // (`seal_certificate_pack`). This covers only a pack whose last handle drops
+            // elsewhere (a test, or a task that outlived that seal). Mirrors ConsensusPack /
             // EpochRecordDb / LatestConsensus so all four actors seal consistently on a dropped
-            // last reference.
+            // last reference. A reopen of this epoch waits on the epoch lock until this pack has
+            // sealed, however the close is joined.
             if let Some(handle) = self.handle.lock().take() {
                 warn!(target: "certificate_pack", "CertificatePack for epoch {} dropped without calling shutdown(); persisting as a fallback", self.epoch);
                 if self.tx.try_send(PackMessage::Shutdown).is_err() {
                     // Full bounded channel -- detach. The actor still persists when the last Sender
                     // drops (Inner's Drop clean-closes); only the synchronous "persisted on return"
-                    // wait is lost, and only on this misuse path.
-                    error!(target: "certificate_pack", "Failed to send shutdown message to CertificatePack (should be using shutdown())");
+                    // wait is lost.
+                    error!(target: "certificate_pack", "Failed to send shutdown message to CertificatePack; it closes when its channel drops");
                     return;
                 }
                 let epoch = self.epoch;
@@ -138,7 +159,7 @@ impl Drop for CertificatePack {
                 // join to the blocking pool. On a current-thread runtime (nothing
                 // else to starve) or no runtime, a synchronous join keeps
                 // "persisted on return" for callers/tests that drop
-                // then immediately reopen. `shutdown().await` is still the intended path.
+                // then immediately reopen. `shutdown().await` reports the flush's result.
                 match tokio::runtime::Handle::try_current() {
                     Ok(rt) if rt.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
                         rt.spawn_blocking(join);
@@ -208,6 +229,14 @@ impl CertificatePack {
     /// Save a certificate into the pack file. The write is backgrounded; any error
     /// from this call (or a prior one) is surfaced via [`get_error`](Self::get_error).
     /// If the channel to send to the background thread is full will return an error.
+    ///
+    /// Only [`PackError::SendFull`] is transient: backpressure, this certificate was not queued.
+    /// Any other error means the pack has failed for good, and it is this node's own storage
+    /// failing: a write, sync or open failure the background thread latched (every later call,
+    /// [`persist`](Self::persist) and [`shutdown`](Self::shutdown) return it too), or a thread
+    /// that is gone (`SendFailed`). The owner must stop the node then, not carry on without the
+    /// pack. A failure in the last saves before the owner stops calling this is reported by
+    /// [`shutdown`](Self::shutdown).
     pub fn try_save(&self, cert: Certificate) -> Result<(), PackError> {
         self.get_error()?;
         if let Err(e) = self.tx.try_send(PackMessage::Save(cert)) {
@@ -251,10 +280,16 @@ impl CertificatePack {
         self.get_error()?;
         let (tx, rx) = oneshot::channel();
         let _ = self.tx.send(PackMessage::Persist(tx)).await;
-        rx.await.map_err(|_| match &*self.error.borrow() {
+        rx.await.map_err(|_| self.dropped_reply_error())?
+    }
+
+    /// What a request whose reply the background thread dropped reports: the error it latched
+    /// (the pack failed to open, or a write failed), else [`PackError::ReceiveFailed`].
+    fn dropped_reply_error(&self) -> PackError {
+        match &*self.error.borrow() {
             Some(e) => e.clone(),
             None => PackError::ReceiveFailed,
-        })?
+        }
     }
 
     /// Consume and shutdown the pack if this is the last instance (if not the last instance then is
@@ -262,32 +297,45 @@ impl CertificatePack {
     ///
     /// Returns `Err` if the final flush fails or if any earlier background save failed: the
     /// shutdown reply folds in the latched error slot, so a save failure from this epoch is
-    /// reported here even though this method never samples the slot itself.
+    /// reported here even though this method never samples the slot itself. A pack that failed to
+    /// open sends no reply; this returns its latched open error, as [`Self::persist`] does.
     pub async fn shutdown(self) -> Result<(), PackError> {
         if Arc::strong_count(&self.handle) == 1 {
             let handle = self.handle.lock().take();
             if let Some(handle) = handle {
                 let (tx, rx) = oneshot::channel();
                 let _ = self.tx.send(PackMessage::ShutdownAsync(tx)).await;
-                rx.await.map_err(|_| PackError::ReceiveFailed)??;
-                // The thread should be over or ending after the ShutdownAsync but don't block tokio
+                let reply = rx.await.unwrap_or_else(|_| Err(self.dropped_reply_error()));
+                // Join even when the reply is an error: the thread still seals the pack after it
+                // replies, and a caller that reopens this epoch next must find it sealed. The
+                // thread should be over or ending after the ShutdownAsync but don't block tokio
                 // just in case.
-                let join_result = tokio::task::spawn_blocking(|| handle.join()).await;
-                match join_result {
+                let joined = match tokio::task::spawn_blocking(|| handle.join()).await {
                     Err(e) => {
                         error!(target: "certificate_pack", ?e, "Failed to join certificate pack thread (tokio");
-                        return Err(PackError::JoinFailed);
+                        Err(PackError::JoinFailed)
                     }
                     Ok(Err(e)) => {
                         error!(target: "certificate_pack", ?e, "Failed to join certificate pack thread");
-                        return Err(PackError::JoinFailed);
+                        Err(PackError::JoinFailed)
                     }
-                    _ => {}
-                }
+                    Ok(Ok(())) => Ok(()),
+                };
+                // The reply's error is the root cause; a join failure is reported only without one.
+                return reply.and(joined);
             }
         }
         Ok(())
     }
+}
+
+/// The error for a read of the certificate log at `pos` that the disk failed (see
+/// [`FetchError::is_read_failure`]): the log is left as it is, for a retry once the disk reads
+/// again.
+fn read_failure(pos: u64, source: FetchError) -> PackError {
+    PackError::ReadError(format!(
+        "the certificate log at offset {pos} (a read error, not a torn tail): {source}"
+    ))
 }
 
 /// Base filename of the certificate pack's data file (`"cert_data"`) within an epoch directory.
@@ -299,16 +347,77 @@ pub const HASH_NAME: &str = Inner::HASH_NAME;
 struct Inner {
     data: Pack<Certificate>,
     digest_idx: HdxIndex,
+    /// Set by a failed save, which invalidates the index's data-length marker; holds the marker
+    /// at `0` for the rest of this handle's life, so the next open rebuilds the index from the
+    /// log instead of trusting it.
+    index_invalidated: bool,
     /// Test-only: when set, the next digest-index save fails right after the data append so tests
     /// can exercise the atomic rollback in [`Self::save`]. Consumed once. (Mirrors
     /// `EpochRecordDb`'s `fail_index_save_after_append`.)
     #[cfg(test)]
     fail_index_save_after_append: bool,
+    /// The epoch directory's writer lock, held by a writable open for the handle's whole life
+    /// (see [`Self::lock_epoch_dir`]); `None` on a read-only open. Declared LAST: fields drop in
+    /// declaration order, so it is released only after `data` and `digest_idx` have sealed.
+    _epoch_lock: Option<File>,
 }
 
 impl Inner {
     const DATA_NAME: &str = "cert_data";
     const HASH_NAME: &str = "cert_hash";
+    const LOCK_NAME: &str = "cert_lock";
+
+    /// Take the epoch directory's exclusive writer lock, waiting while a previous writable handle
+    /// on this epoch still holds it.
+    ///
+    /// A same-epoch reopen can start while the previous handle's thread is still running its
+    /// final persist and seal: that thread is detached when its owner is aborted during the
+    /// epoch-exit grace, drops the pack (`Drop` joins on the blocking pool), or gets an error from
+    /// `shutdown`. Opening the log then would map the old, still capacity-padded file; the old
+    /// seal truncates it under that mapping, and the new handle's next append touches a page past
+    /// EOF (SIGBUS). The old thread's last certs would also race the new handle's rebuild.
+    ///
+    /// The lock is `flock(LOCK_EX)` (what [`File::lock`] is on Linux and macOS) on a file of its
+    /// own. It belongs to the open file description, so two opens in one process exclude each
+    /// other, and the kernel drops it when the holder's file closes, crash included, so a stale
+    /// lock file never blocks. The wait runs on the pack's own thread, logged with a warning when
+    /// the lock is not free at once; meanwhile saves queue, and `try_save` reports `SendFull` once
+    /// the channel fills.
+    fn lock_epoch_dir(base_dir: &Path) -> Result<File, PackError> {
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(base_dir.join(Self::LOCK_NAME))?;
+        // Say so when a previous writer holds it: the wait has no bound, and saves queue meanwhile.
+        match file.try_lock() {
+            Ok(()) => return Ok(file),
+            Err(std::fs::TryLockError::WouldBlock) => warn!(
+                target: "cert-pack",
+                dir = %base_dir.display(),
+                "waiting for the previous writer of this epoch's certificate pack to finish its seal"
+            ),
+            Err(std::fs::TryLockError::Error(e)) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(std::fs::TryLockError::Error(e)) => return Err(e.into()),
+        }
+        let started = std::time::Instant::now();
+        loop {
+            match file.lock() {
+                Ok(()) => {
+                    info!(
+                        target: "cert-pack",
+                        dir = %base_dir.display(),
+                        waited_ms = started.elapsed().as_millis() as u64,
+                        "took the certificate pack's writer lock"
+                    );
+                    return Ok(file);
+                }
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
+    }
 
     /// Open the certificate digest index. Factored out so [`Self::reset_index`] can reopen a fresh
     /// copy after wiping the sidecar directory.
@@ -327,6 +436,36 @@ impl Inner {
         .map_err(Into::into)
     }
 
+    /// Before a writable open of a missing data log discards a leftover digest index: warn, naming
+    /// both files, if that index attests certificates (or cannot be read to tell), since their log
+    /// is gone. Logging only; an index that attests nothing past a header is discarded quietly.
+    fn warn_of_a_lost_log(base_dir: &Path, data: &Pack<Certificate>) {
+        let index = base_dir.join(Self::HASH_NAME);
+        // A stat error counts as present: the open below then reports what it is.
+        if !index.try_exists().unwrap_or(true) {
+            return;
+        }
+        let log = base_dir.join(Self::DATA_NAME);
+        match Self::try_open_index(base_dir, data, true).map(|idx| idx.data_file_length()) {
+            Ok(attested) if attested <= data.file_len() => {}
+            Ok(attested) => warn!(
+                target: "cert-pack",
+                log = %log.display(),
+                index = %index.display(),
+                attested,
+                "the certificate log is missing beside an index that attests {attested} bytes of \
+                 it; those certificates are lost, and a new log and index start in their place"
+            ),
+            Err(e) => warn!(
+                target: "cert-pack",
+                log = %log.display(),
+                index = %index.display(),
+                "the certificate log is missing beside an index that could not be read ({e}); \
+                 a new log and index start in their place"
+            ),
+        }
+    }
+
     /// Discard the digest index sidecar directory and reopen a fresh (empty) copy for rebuild. A
     /// missing directory is tolerated. Mirrors `ConsensusPack`'s index reset
     /// (`open_indexes_for_append`).
@@ -343,8 +482,10 @@ impl Inner {
     /// `ConsensusPack::recover_pack`). Capture `logical_position()` before each `next()` as the
     /// cert's stored offset, advance the consistent end only past a fully-decoded cert, and stop at
     /// the first torn/short cert so an incomplete tail is dropped; then roll the log back to that
-    /// end and reconcile the digest marker. Keyed by `Certificate::digest`, matching
-    /// [`Self::save`].
+    /// end whenever bytes remain past it (a tail too short for a size prefix included), flush the
+    /// zeros written over the cut, and reconcile the digest marker. Keyed by
+    /// `Certificate::digest`, matching [`Self::save`]. A read the disk fails is an error, never a
+    /// tear: the log is left as it is for a retry.
     fn rebuild_index(
         data: &mut Pack<Certificate>,
         digest_idx: &mut HdxIndex,
@@ -369,6 +510,7 @@ impl Inner {
                         .map_err(|e| PackError::IndexAppend(e.to_string()))?;
                     consistent_end = iter.logical_position();
                 }
+                Some(Err(e)) if e.is_read_failure() => return Err(read_failure(pos, e)),
                 Some(Err(_)) => {
                     torn = true;
                     break;
@@ -378,7 +520,10 @@ impl Inner {
         // `iter` owns a cloned file handle, but drop it before `rewind_to` for clarity.
         drop(iter);
         let file_len = data.file_len();
-        if torn && consistent_end < file_len {
+        // Any bytes past the last whole record are a tail to cut: a record that failed to decode,
+        // or 1-3 bytes too short for a size prefix, on which the walk ends without an error.
+        // Kept, they would be sealed as data and misframe every record appended after them.
+        if consistent_end < file_len {
             let dropped = file_len - consistent_end;
             if sealed {
                 // Fail closed rather than zeroing committed, durably-acked certificates (INV4).
@@ -394,19 +539,84 @@ impl Inner {
                 consistent_end,
                 file_len,
                 dropped_bytes = dropped,
+                torn,
                 "certificate log has a torn tail; truncating the unacked bytes and rebuilding the index"
             );
-            data.rewind_to(consistent_end);
+            if let Some(cut) = data.rewind_to(consistent_end) {
+                // The unclean open's sync made the torn tail durable, and its zeros are only in
+                // the mapping: flush them now, or a power loss before writeback could bring stale
+                // certificates back behind the ones written next (mirrors tndb's `recover`).
+                data.view().msync(cut.start, cut.end)?;
+            }
         }
         digest_idx.set_data_file_length(data.file_len());
+        Ok(())
+    }
+
+    /// Before an UNCLEAN log's index is discarded and rebuilt, refuse (`CorruptLog`, nothing
+    /// changed) if the rebuild would drop an ACKED cert. The rebuild truncates at the first
+    /// undecodable record, which is right for an unacked torn tail but zeroes acked certs when
+    /// the damage lies below the acked end. Either of these proves a record past the tear was
+    /// acked (mirrors `EpochRecordDb::refuse_dropping_acked` and `ConsensusPack`'s recovery):
+    /// - a cert after the tear decodes and ends within `attested_end`, the index's durably synced
+    ///   data length. The walk skips undecodable frames while it makes forward progress. Records
+    ///   past `attested_end` were never acked (a crash can persist unacked ones out of order), so
+    ///   they do not count;
+    /// - the log's tail commit marker (stamped by [`Self::persist`]) lies past the end the rebuild
+    ///   would keep. This holds even with nothing decodable after the damage and no readable index.
+    ///
+    /// `attested_end` must be read before the index is reset, so a retry refuses the same way. A
+    /// `0` (invalidated or unreadable index) attests nothing; the commit marker still does. A read
+    /// the disk fails is an error, never a tear: the walk cannot tell what lies behind it.
+    fn refuse_dropping_acked(data: &Pack<Certificate>, attested_end: u64) -> Result<(), PackError> {
+        let mut iter = data.raw_iter().map_err(OpenError::DataFileOpen)?;
+        let mut tear: Option<u64> = None;
+        let mut last_pos = iter.logical_position();
+        let mut acked_after_tear = false;
+        loop {
+            match iter.next() {
+                None => break,
+                Some(Ok(_)) => {
+                    let end = iter.logical_position();
+                    if tear.is_some() && end <= attested_end {
+                        acked_after_tear = true;
+                        break;
+                    }
+                    last_pos = end;
+                }
+                Some(Err(e)) if e.is_read_failure() => {
+                    return Err(read_failure(iter.logical_position(), e));
+                }
+                Some(Err(_)) => {
+                    tear.get_or_insert(last_pos);
+                    let pos = iter.logical_position();
+                    if pos <= last_pos {
+                        break; // no forward progress: the walk cannot see past here
+                    }
+                    last_pos = pos;
+                }
+            }
+        }
+        // The rebuild keeps the log up to its first undecodable record (or all of it).
+        let kept_end = tear.unwrap_or(last_pos);
+        let committed = data.committed_end();
+        if acked_after_tear || committed.is_some_and(|committed| kept_end < committed) {
+            return Err(PackError::CorruptLog(format!(
+                "an unclean certificate log stops decoding at offset {kept_end}, below acked data \
+                 (index attests {attested_end}, commit marker {committed:?}); at-rest corruption \
+                 of acked certificates, refusing to truncate"
+            )));
+        }
         Ok(())
     }
 
     fn open<P: AsRef<Path>>(path: P, read_only: bool) -> Result<Self, PackError> {
         let base_dir = path.as_ref();
         if !read_only {
-            let _ = std::fs::create_dir_all(base_dir);
+            create_dir_synced(base_dir)?;
         }
+        // Before touching any pack file: wait out a previous writer of this epoch.
+        let epoch_lock = if read_only { None } else { Some(Self::lock_epoch_dir(base_dir)?) };
         let fresh = !base_dir.join(Self::DATA_NAME).exists();
         let mut data: Pack<Certificate> = Pack::open(
             base_dir.join(Self::DATA_NAME),
@@ -420,17 +630,27 @@ impl Inner {
         // from the data log below rather than latching (a corrupt sidecar index must not
         // silently disable cert archiving -- the data log is authoritative). A read-only
         // open surfaces the error as before (it cannot mutate to repair).
-        let mut digest_idx = match Self::try_open_index(base_dir, &data, read_only) {
-            Ok(idx) => idx,
-            Err(e) if !read_only => {
-                warn!(
-                    target: "cert-pack",
-                    "certificate index failed to open ({e}); discarding and rebuilding from the \
-                     data log"
-                );
-                Self::reset_index(base_dir, &data)?
+        let mut digest_idx = if fresh && !read_only {
+            // A new log starts with a new index. A leftover `cert_hash/` (only the data file was
+            // deleted) opens fine, as its header matches any cert log, but its entries point
+            // into a log that no longer exists. Discarding it is this pack's exception to the
+            // crate's rule that an absent file beside an index that attests data counts as
+            // corrupt (see the module docs), so say what is discarded.
+            Self::warn_of_a_lost_log(base_dir, &data);
+            Self::reset_index(base_dir, &data)?
+        } else {
+            match Self::try_open_index(base_dir, &data, read_only) {
+                Ok(idx) => idx,
+                Err(e) if !read_only => {
+                    warn!(
+                        target: "cert-pack",
+                        "certificate index failed to open ({e}); discarding and rebuilding from \
+                         the data log"
+                    );
+                    Self::reset_index(base_dir, &data)?
+                }
+                Err(e) => return Err(e),
             }
-            Err(e) => return Err(e),
         };
 
         if !read_only {
@@ -451,6 +671,10 @@ impl Inner {
                 || digest_idx.opened_unclean()
                 || digest_idx.data_file_length() != data.file_len();
             if unclean {
+                // Validate before mutating: the index's attested length is gone once it is reset.
+                if data.opened_unclean() {
+                    Self::refuse_dropping_acked(&data, digest_idx.data_file_length())?;
+                }
                 digest_idx = Self::reset_index(base_dir, &data)?;
                 Self::rebuild_index(&mut data, &mut digest_idx)?;
                 // Recovery made the log + rebuilt index self-consistent; clear their unclean flags
@@ -464,15 +688,19 @@ impl Inner {
         Ok(Self {
             data,
             digest_idx,
+            index_invalidated: false,
             #[cfg(test)]
             fail_index_save_after_append: false,
+            _epoch_lock: epoch_lock,
         })
     }
 
     fn save(&mut self, cert: &Certificate) -> Result<(), PackError> {
         let digest = B256::from_slice(cert.digest().as_ref());
-        // Idempotent: skip if already present.
-        if self.digest_idx.load(digest).is_ok() {
+        // Idempotent: skip if already stored. `get` bounds the entry's offset by the log's end
+        // and checks the stored cert's digest, so a stale entry (one whose append was rolled back
+        // after its index write landed) does not turn a real save into a no-op.
+        if self.get(cert.digest()).is_some() {
             return Ok(());
         }
         // Atomic append+index (same rollback discipline as `EpochRecordDb::save_cert_atomic`): if
@@ -484,12 +712,30 @@ impl Inner {
         // above misses).
         let data_start = self.data.file_len();
         if let Err(e) = self.append_and_index(digest, cert) {
-            self.data.rewind_to(data_start);
+            Self::rewind_after_failed_save(&mut self.data, data_start);
+            self.index_invalidated = true;
             self.digest_idx.set_data_file_length(0);
             return Err(e);
         }
-        self.digest_idx.set_data_file_length(self.data.file_len());
+        // Once invalidated, the marker stays at `0` until a reopen rebuilds the index: a later
+        // successful save must not make a possibly damaged index look trusted again.
+        if !self.index_invalidated {
+            self.digest_idx.set_data_file_length(self.data.file_len());
+        }
         Ok(())
+    }
+
+    /// Roll `data` back to `to` after a failed save (see [`Pack::rewind_to`]) and flush the zeros
+    /// written over the abandoned bytes: they may already be on disk (the system's writeback), and
+    /// a power loss could otherwise bring the failed save back. A failed flush poisons the log, so
+    /// it refuses later saves and is not sealed: the next open recovers it.
+    fn rewind_after_failed_save(data: &mut Pack<Certificate>, to: u64) {
+        if let Some(cut) = data.rewind_to(to) {
+            if let Err(e) = data.view().msync(cut.start, cut.end) {
+                error!(target: "certificate_pack", %e, "failed to flush a failed save's rollback; the log refuses saves until reopened");
+                data.poison();
+            }
+        }
     }
 
     /// Append `cert` to the data log and index it by `digest`. Split out from [`Self::save`] so the
@@ -533,6 +779,10 @@ impl Inner {
     fn persist(&mut self) -> Result<(), PackError> {
         if !self.data.read_only() {
             self.data.commit().map_err(|e| PackError::PersistError(e.to_string()))?;
+            // Stamp the log's tail commit marker AFTER its msync, so it can never point past
+            // durable data. Best-effort and sync-free: an index-free record of the acked end that
+            // a rebuild refuses to truncate below (see `refuse_dropping_acked`).
+            self.data.stamp_commit_marker();
             self.digest_idx.sync().map_err(|e| PackError::PersistError(e.to_string()))?;
         }
         Ok(())
@@ -566,9 +816,9 @@ pub enum PackError {
     PersistError(String),
     /// The pack file was detected to be corrupt.
     CorruptPack,
-    /// A cleanly-sealed data log stopped decoding partway through: at-rest corruption of committed
-    /// certificates that must not be silently truncated (INV4). Holds an operator-facing
-    /// description.
+    /// The data log stopped decoding partway through committed certificates: in a cleanly-sealed
+    /// log, or in an unclean one below its acked end. At-rest corruption that must not be silently
+    /// truncated (INV4). Holds an operator-facing description.
     CorruptLog(String),
     /// The background pack thread failed to join on shutdown.
     JoinFailed,
@@ -615,12 +865,17 @@ impl From<io::Error> for PackError {
 
 #[cfg(test)]
 mod test {
+    use std::{sync::Arc, time::Duration};
+
+    use parking_lot::Mutex;
     use tempfile::TempDir;
     use tn_test_utils::CommitteeFixture;
-    use tn_types::{Certificate, Hash, HeaderDigest};
+    use tn_types::{Certificate, Hash, HeaderDigest, B256};
 
     use crate::{
-        archive::error::insert::AppendError, certificate_pack::CertificatePack, mem_db::MemDatabase,
+        archive::{error::insert::AppendError, index::Index as _},
+        certificate_pack::CertificatePack,
+        mem_db::MemDatabase,
     };
 
     fn make_test_cert(fixture: &CommitteeFixture<MemDatabase>, index: usize) -> Certificate {
@@ -736,8 +991,8 @@ mod test {
         let fixture = CommitteeFixture::builder(MemDatabase::default).build();
         let dir = temp_dir.path().join("epoch-0");
 
-        // Populate + persist (durable log + synced marker), then `mem::forget` to skip the clean
-        // close: models a crash -- durable log, no sentinel.
+        // Populate + persist (durable log + synced marker), then skip the clean close: models a
+        // crash -- durable log, no sentinel.
         let mut certs = Vec::new();
         {
             let mut inner = super::Inner::open(&dir, false).expect("open pack");
@@ -747,7 +1002,7 @@ mod test {
                 certs.push(cert);
             }
             inner.persist().expect("persist");
-            std::mem::forget(inner);
+            simulate_crash(inner);
         }
 
         // Reopen: unclean (no sentinel) -> index rebuilt from the log; every cert reachable.
@@ -899,6 +1154,250 @@ mod test {
         );
     }
 
+    /// An UNCLEAN cert log ending in 1-3 bytes past its last record (too short for a size prefix,
+    /// so the rebuild's walk ends there without an error) is cut back to that record: kept, the
+    /// bytes would be sealed as data, and the next cert appended after them would misframe.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_cert_rebuild_cuts_a_tail_shorter_than_a_size_prefix() {
+        let temp_dir = TempDir::with_prefix("cert_short_tail").expect("temp dir");
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let dir = temp_dir.path().join("epoch-0");
+
+        let mut certs = Vec::new();
+        {
+            let mut inner = super::Inner::open(&dir, false).expect("open pack");
+            for i in 0..4usize {
+                let cert = make_unique_cert(&fixture, i);
+                inner.save(&cert).expect("save cert");
+                certs.push(cert);
+            }
+            inner.persist().expect("persist");
+            // A clean close leaves no padding: the file is the records, then the sentinel.
+        }
+
+        // Unclean, with 2 bytes past the last record: the sentinel stripped and 2 bytes written.
+        let data_path = dir.join(super::Inner::DATA_NAME);
+        let end = {
+            let f = std::fs::OpenOptions::new().write(true).open(&data_path).expect("open data");
+            let end = f.metadata().expect("meta").len() - crate::archive::data_file::SENTINEL_LEN;
+            f.set_len(end).expect("strip the sentinel");
+            std::os::unix::fs::FileExt::write_all_at(&f, &[0xab, 0xcd], end).expect("short tail");
+            end
+        };
+
+        let mut inner = super::Inner::open(&dir, false).expect("reopen cuts the short tail");
+        assert_eq!(inner.data.file_len(), end, "the log ends at its last record");
+        for cert in &certs {
+            assert!(inner.contains(cert.digest()), "every cert is kept");
+        }
+        let next = make_unique_cert(&fixture, 4);
+        inner.save(&next).expect("save after the cut");
+        inner.persist().expect("persist");
+        simulate_crash(inner);
+        let mut inner =
+            super::Inner::open(&dir, false).expect("the next rebuild frames every record");
+        assert!(inner.contains(next.digest()), "the cert appended after the cut is found");
+        assert!(inner.contains(certs[3].digest()), "and the ones before it");
+    }
+
+    /// Model a crash: skip `inner`'s clean close, so neither the log nor the index is sealed, but
+    /// release the epoch lock as the dying process's closed descriptors would.
+    fn simulate_crash(mut inner: super::Inner) {
+        drop(inner._epoch_lock.take());
+        std::mem::forget(inner);
+    }
+
+    /// An undecodable record below the acked end of an UNCLEAN log is at-rest damage, not a torn
+    /// tail: the rebuild must refuse (`CorruptLog`) rather than truncate the acked certs after it,
+    /// and must leave the log untouched so a retry sees the same evidence.
+    ///
+    /// Each piece of evidence must refuse on its own: the index's attested length (with the log's
+    /// commit marker wiped), and the commit marker (with the index unreadable).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn unclean_rebuild_refuses_to_drop_acked_certs() {
+        use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
+
+        /// Which evidence of the ack the reopen is left with.
+        #[derive(Debug, Clone, Copy)]
+        enum Evidence {
+            Both,
+            IndexOnly,
+            MarkerOnly,
+        }
+
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        for evidence in [Evidence::Both, Evidence::IndexOnly, Evidence::MarkerOnly] {
+            let temp_dir = TempDir::with_prefix("cert_unclean_acked_damage").expect("temp dir");
+            let dir = temp_dir.path().join("epoch-0");
+
+            // Persist (ack) every cert, then crash before the clean close. Note where the 9th
+            // cert's record lies, to damage its body (not its length prefix, so a walk past the
+            // damage still finds the acked certs after it).
+            let (damaged_from, damaged_to) = {
+                let mut inner = super::Inner::open(&dir, false).expect("open pack");
+                let mut positions = Vec::new();
+                for i in 0..16usize {
+                    let cert = make_unique_cert(&fixture, i);
+                    inner.save(&cert).expect("save cert");
+                    let digest = B256::from_slice(cert.digest().as_ref());
+                    positions.push(inner.digest_idx.load(digest).expect("indexed"));
+                }
+                inner.persist().expect("persist");
+                simulate_crash(inner);
+                (positions[8], positions[9])
+            };
+
+            let data_path = dir.join(super::Inner::DATA_NAME);
+            let mut f = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&data_path)
+                .expect("open data");
+            let at = SeekFrom::Start((damaged_from + damaged_to) / 2);
+            let mut byte = [0_u8; 1];
+            f.seek(at).expect("seek");
+            f.read_exact(&mut byte).expect("read byte");
+            f.seek(at).expect("seek");
+            f.write_all(&[byte[0] ^ 0xFF]).expect("write damaged byte");
+            match evidence {
+                Evidence::Both => {}
+                Evidence::IndexOnly => {
+                    // The commit marker sits in the last bytes of the padded, unsealed file.
+                    let len = f.metadata().expect("meta").len();
+                    f.seek(SeekFrom::Start(len - crate::archive::data_file::COMMIT_MARKER_LEN))
+                        .expect("seek");
+                    f.write_all(&[0_u8; crate::archive::data_file::COMMIT_MARKER_LEN as usize])
+                        .expect("wipe the commit marker");
+                }
+                Evidence::MarkerOnly => {
+                    let hdx = dir.join(super::Inner::HASH_NAME).join("index.hdx");
+                    let idx = std::fs::OpenOptions::new().write(true).open(&hdx).expect("hdx");
+                    idx.set_len(4).expect("truncate the hdx header");
+                }
+            }
+            drop(f);
+            let before = std::fs::read(&data_path).expect("read data");
+
+            match super::Inner::open(&dir, false) {
+                Err(super::PackError::CorruptLog(_)) => {}
+                other => {
+                    panic!("{evidence:?}: damage below the acked end must refuse, got {other:?}")
+                }
+            }
+            assert_eq!(
+                std::fs::read(&data_path).expect("reread data"),
+                before,
+                "{evidence:?}: a refused rebuild must not touch the log"
+            );
+        }
+    }
+
+    /// A failed save invalidates the index's data-length marker, and a later successful save in
+    /// the same session must not restore it: the index stays untrusted until a reopen rebuilds it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn failed_save_keeps_the_index_invalidated_until_reopen() {
+        let temp_dir = TempDir::with_prefix("cert_sticky_invalidation").expect("temp dir");
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let dir = temp_dir.path().join("epoch-0");
+
+        let mut certs = Vec::new();
+        {
+            let mut inner = super::Inner::open(&dir, false).expect("open pack");
+            for i in 0..4usize {
+                let cert = make_unique_cert(&fixture, i);
+                inner.save(&cert).expect("save");
+                certs.push(cert);
+            }
+            inner.fail_index_save_after_append = true;
+            inner.save(&make_unique_cert(&fixture, 4)).expect_err("index save must fail");
+            // The next queued save succeeds.
+            let cert = make_unique_cert(&fixture, 5);
+            inner.save(&cert).expect("save after the failure");
+            certs.push(cert);
+            inner.persist().expect("persist");
+            // Clean close.
+        }
+
+        // The index still carries the invalidated marker, so it is not trusted on reopen.
+        let inner = super::Inner::open(&dir, true).expect("read-only open");
+        assert_eq!(inner.digest_idx.data_file_length(), 0, "the index must stay invalidated");
+        drop(inner);
+
+        // A writable reopen rebuilds the index from the log.
+        let mut inner = super::Inner::open(&dir, false).expect("reopen");
+        for cert in &certs {
+            assert!(inner.get(cert.digest()).is_some(), "cert missing after the rebuild");
+        }
+    }
+
+    /// The idempotency check in `save` must not trust a bare index hit: an entry whose offset holds
+    /// a different cert (or lies past the log's end) does not mean the cert is stored.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn save_does_not_trust_a_stale_index_entry() {
+        let temp_dir = TempDir::with_prefix("cert_stale_index_entry").expect("temp dir");
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let mut inner =
+            super::Inner::open(temp_dir.path().join("epoch-0"), false).expect("open pack");
+        let first = make_unique_cert(&fixture, 0);
+        inner.save(&first).expect("save");
+        let first_pos = inner
+            .digest_idx
+            .load(B256::from_slice(first.digest().as_ref()))
+            .expect("first cert indexed");
+
+        // An entry for a cert the log does not hold, pointing at another cert's record.
+        let cert = make_unique_cert(&fixture, 1);
+        inner
+            .digest_idx
+            .save(B256::from_slice(cert.digest().as_ref()), first_pos)
+            .expect("plant a stale entry");
+
+        inner.save(&cert).expect("save");
+        assert_eq!(
+            inner.get(cert.digest()).map(|c| c.digest()),
+            Some(cert.digest()),
+            "a stale index entry must not make the save a no-op"
+        );
+    }
+
+    /// A new data file paired with a leftover `cert_hash/` (only the data file was deleted) must
+    /// not inherit the old index: its entries point into a log that no longer exists. The open
+    /// keeps going (nothing reads past certificate packs) but warns that the attested
+    /// certificates are lost; a brand-new pack opens quietly.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn fresh_data_file_discards_a_leftover_index() {
+        use crate::consensus_pack::test::warnings_and_errors;
+        let temp_dir = TempDir::with_prefix("cert_leftover_index").expect("temp dir");
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let dir = temp_dir.path().join("epoch-0");
+
+        // A populated pack, cleanly closed.
+        {
+            let (inner, levels) = warnings_and_errors(|| super::Inner::open(&dir, false));
+            assert!(levels.is_empty(), "a brand-new pack opens quietly: {levels:?}");
+            let mut inner = inner.expect("open pack");
+            for i in 0..8usize {
+                inner.save(&make_unique_cert(&fixture, i)).expect("save cert");
+            }
+            inner.persist().expect("persist");
+        }
+        std::fs::remove_file(dir.join(super::Inner::DATA_NAME)).expect("remove the data file");
+
+        // A new log, filled past where the old certs sat.
+        let (inner, levels) = warnings_and_errors(|| super::Inner::open(&dir, false));
+        let mut inner = inner.expect("open over a leftover index");
+        assert_eq!(levels, vec![tracing::Level::WARN], "the lost log is reported");
+        for i in 100..116usize {
+            inner.save(&make_unique_cert(&fixture, i)).expect("save cert");
+        }
+        for i in 0..8usize {
+            assert!(
+                !inner.contains(make_unique_cert(&fixture, i).digest()),
+                "cert {i} was never written to this log"
+            );
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn queued_saves_after_a_failed_write_keep_the_root_cause() {
         // Regression test for #1148: a real write failure poisons the pack, and every save
@@ -1004,6 +1503,157 @@ mod test {
         pack.get_error().expect_err("error stays latched after the persist reply");
     }
 
+    /// Set by [`same_epoch_reopen_waits_for_the_old_seal`] in the child process it spawns; turns
+    /// [`same_epoch_reopen_child`] from a no-op into the reopen body, run against the directory
+    /// this names.
+    const REOPEN_CHILD_DIR: &str = "TN_CERT_PACK_REOPEN_CHILD_DIR";
+
+    /// A same-epoch reopen while the previous pack's thread is still alive (an epoch re-entered
+    /// while the old consensus task's pack thread was detached mid persist/seal) must wait for
+    /// the old seal. Otherwise the new handle maps the old pack's capacity-padded file, the old
+    /// seal truncates it under that mapping, and the new handle's next append faults (SIGBUS).
+    /// The body runs in a child process so that fault cannot kill the test runner.
+    #[test]
+    fn same_epoch_reopen_waits_for_the_old_seal() {
+        let temp_dir = TempDir::with_prefix("cert_same_epoch_reopen").expect("temp dir");
+        let exe = std::env::current_exe().expect("test binary path");
+        let out = std::process::Command::new(exe)
+            .args([
+                "--exact",
+                "certificate_pack::test::same_epoch_reopen_child",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(REOPEN_CHILD_DIR, temp_dir.path())
+            .output()
+            .expect("spawn the child test");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success() && stdout.contains("1 passed"),
+            "the reopen child failed ({:?})\nstdout:\n{stdout}\nstderr:\n{}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// Taking the epoch's writer lock logs nothing when it is free, and a warning when a previous
+    /// writer holds it (the wait has no bound), then takes it once that writer lets go.
+    #[test]
+    fn lock_epoch_dir_warns_while_a_previous_writer_holds_it() {
+        use crate::consensus_pack::test::warnings_and_errors;
+        let temp_dir = TempDir::with_prefix("cert_lock_wait").expect("temp dir");
+        let dir = temp_dir.path().to_path_buf();
+        let (held, levels) = warnings_and_errors(|| super::Inner::lock_epoch_dir(&dir));
+        let held = held.expect("a free lock");
+        assert!(levels.is_empty(), "a free lock is taken quietly: {levels:?}");
+
+        let started = Arc::new(std::sync::Barrier::new(2));
+        let waiter = std::thread::spawn({
+            let started = Arc::clone(&started);
+            move || {
+                started.wait();
+                warnings_and_errors(|| super::Inner::lock_epoch_dir(&dir).map(drop))
+            }
+        });
+        // The waiter is running; give it ample time to reach the lock (an open and a try-lock).
+        started.wait();
+        std::thread::sleep(Duration::from_millis(200));
+        drop(held);
+        let (taken, levels) = waiter.join().expect("the waiter");
+        taken.expect("taken once the previous writer lets go");
+        assert_eq!(levels, vec![tracing::Level::WARN], "the wait is logged once");
+    }
+
+    /// The body of [`same_epoch_reopen_waits_for_the_old_seal`]; a no-op unless that test runs it
+    /// in a child process.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn same_epoch_reopen_child() {
+        let Some(dir) = std::env::var_os(REOPEN_CHILD_DIR) else { return };
+        let dir = std::path::PathBuf::from(dir);
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+
+        // The old epoch's pack: flushed but not sealed, so its data file is still padded.
+        let old = CertificatePack::open(&dir, 0);
+        for i in 0..50 {
+            old.save(make_unique_cert(&fixture, i)).await.expect("save to the old pack");
+        }
+        old.persist().await.expect("persist the old pack");
+
+        // The same epoch reopened while the old pack's thread is still alive.
+        let new = CertificatePack::open(&dir, 0);
+        let probe = make_unique_cert(&fixture, 0).digest();
+        let waited =
+            tokio::time::timeout(Duration::from_millis(300), new.contains(probe)).await.is_err();
+
+        // The old thread finishes: its final persist, then the seal truncates the file to its end.
+        old.shutdown().await.expect("shut down the old pack");
+
+        // The new pack keeps archiving into the same file.
+        for i in 50..2_000 {
+            new.save(make_unique_cert(&fixture, i)).await.expect("save to the new pack");
+        }
+        new.persist().await.expect("persist the new pack");
+        for i in 0..2_000 {
+            assert!(new.contains(make_unique_cert(&fixture, i).digest()).await, "cert {i} lost");
+        }
+        new.shutdown().await.expect("shut down the new pack");
+        assert!(waited, "the reopen must wait for the old pack's seal");
+
+        // The new pack sealed a consistent log that holds every cert.
+        let mut inner = super::Inner::open(dir.join("epoch-0"), false).expect("reopen");
+        assert!(!inner.data.opened_unclean(), "the new pack must seal the log");
+        for i in 0..2_000 {
+            assert!(inner.get(make_unique_cert(&fixture, i).digest()).is_some(), "cert {i} lost");
+        }
+    }
+
+    /// `shutdown` joins the pack thread before it returns, even when the reply carries a save
+    /// failure: a caller that reopens the epoch right after must not race the old seal.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn shutdown_joins_the_thread_before_reporting_a_save_error() {
+        let temp_dir = TempDir::with_prefix("cert_shutdown_join").expect("temp dir");
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let mut inner =
+            super::Inner::open(temp_dir.path().join("epoch-0"), false).expect("open pack inner");
+        inner.data.fail_next_append_for_test();
+        let (tx, rx) = tokio::sync::mpsc::channel(16);
+        let (tx_error, error) = tokio::sync::watch::channel(None);
+        // Held by the thread until it has fully exited, after a delay standing in for a slow seal.
+        let alive = Arc::new(());
+        let thread_alive = alive.clone();
+        let handle = std::thread::spawn(move || {
+            super::run_pack_loop(inner, rx, tx_error, 0);
+            std::thread::sleep(Duration::from_millis(300));
+            drop(thread_alive);
+        });
+        let pack =
+            CertificatePack { tx, handle: Arc::new(Mutex::new(Some(handle))), error, epoch: 0 };
+
+        pack.tx
+            .send(super::PackMessage::Save(make_test_cert(&fixture, 0)))
+            .await
+            .expect("queue failing save");
+        let err = pack.shutdown().await.expect_err("shutdown reports the failed save");
+        assert!(matches!(err, super::PackError::Append(_)), "unexpected error: {err:?}");
+        assert_eq!(Arc::strong_count(&alive), 1, "shutdown returned before the thread exited");
+    }
+
+    /// A pack whose open failed reports that open's error from `shutdown`, as `persist` does,
+    /// not a bare `ReceiveFailed`: the latched error is the only record of why the pack failed.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn shutdown_reports_the_open_failure() {
+        let temp_dir = TempDir::with_prefix("cert_shutdown_open_failure").expect("temp dir");
+        // A file where the epoch's directory belongs: every open fails.
+        std::fs::write(temp_dir.path().join("epoch-0"), b"not a directory").expect("write");
+        let opened = CertificatePack::open(temp_dir.path(), 0);
+        let open_error = opened.persist().await.expect_err("persist reports the open failure");
+        assert!(!matches!(open_error, super::PackError::ReceiveFailed), "{open_error:?}");
+
+        let pack = CertificatePack::open(temp_dir.path(), 0);
+        let err = pack.shutdown().await.expect_err("shutdown reports the open failure");
+        assert_eq!(err.to_string(), open_error.to_string(), "the latched open error");
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn shutdown_reports_a_save_that_failed_while_the_shutdown_was_queued() {
         // Regression test for #1138, end-of-epoch path: `shutdown()` never samples the error
@@ -1022,5 +1672,169 @@ mod test {
             .await
             .expect_err("shutdown must report the save that failed while it was queued");
         assert!(matches!(err, super::PackError::Append(_)), "unexpected error: {err:?}");
+    }
+
+    /// A failed write reaches the owner through `try_save` as that write's error, never as the
+    /// `SendFull` backpressure the owner may ride out, on every later call, and `shutdown`
+    /// reports it too: the contract an owner that stops the node on a failed pack relies on.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn try_save_reports_a_failed_write_as_a_failure() {
+        let temp_dir = TempDir::with_prefix("cert_try_save_failure").expect("temp dir");
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let mut inner =
+            super::Inner::open(temp_dir.path().join("epoch-0"), false).expect("open pack inner");
+        inner.data.fail_next_append_for_test();
+        let (tx, rx) = tokio::sync::mpsc::channel(16);
+        let (tx_error, error) = tokio::sync::watch::channel(None);
+        let handle = std::thread::spawn(move || super::run_pack_loop(inner, rx, tx_error, 0));
+        let pack =
+            CertificatePack { tx, handle: Arc::new(Mutex::new(Some(handle))), error, epoch: 0 };
+
+        pack.try_save(make_test_cert(&fixture, 0)).expect("the failing save is queued");
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while pack.get_error().is_ok() {
+            assert!(std::time::Instant::now() < deadline, "the failed write never latched");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        for i in 1..3usize {
+            let err =
+                pack.try_save(make_test_cert(&fixture, i)).expect_err("a failed pack refuses");
+            assert!(matches!(err, super::PackError::Append(_)), "the write's error: {err:?}");
+        }
+        let err = pack.shutdown().await.expect_err("shutdown reports the failed write");
+        assert!(matches!(err, super::PackError::Append(_)), "the write's error: {err:?}");
+    }
+
+    /// Flip every bit of the byte at `at` in the file at `path`.
+    fn toggle_byte(path: &std::path::Path, at: u64) {
+        use std::os::unix::fs::FileExt as _;
+        let file = std::fs::OpenOptions::new().read(true).write(true).open(path).expect("open");
+        let mut byte = [0_u8];
+        file.read_exact_at(&mut byte, at).expect("read a byte");
+        file.write_all_at(&[byte[0] ^ 0xFF], at).expect("write a byte");
+    }
+
+    /// Whether the bytes `[start, end)` of the file at `path` all read zero.
+    fn zeros_at(path: &std::path::Path, start: u64, end: u64) -> bool {
+        use std::os::unix::fs::FileExt as _;
+        let mut bytes = vec![0_u8; (end - start) as usize];
+        std::fs::File::open(path).expect("open").read_exact_at(&mut bytes, start).expect("read");
+        bytes.iter().all(|&b| b == 0)
+    }
+
+    /// A rebuild that cuts an unclean log's torn tail flushes the zeros it writes there. The
+    /// unclean open's sync made the old tail durable (here a damaged cert and a whole one after
+    /// it), and zeros only in the mapping would leave it on disk past the cut after a power loss,
+    /// for a later rebuild to reach behind newer certificates.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rebuild_flushes_the_tail_it_cuts() {
+        use crate::archive::data_file::disk_model;
+        let temp_dir = TempDir::with_prefix("cert_rebuild_flush").expect("temp dir");
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let dir = temp_dir.path().join("epoch-0");
+        let data_path = dir.join(super::Inner::DATA_NAME);
+        let mut inner = super::Inner::open(&dir, false).expect("open pack");
+        for i in 0..4usize {
+            inner.save(&make_unique_cert(&fixture, i)).expect("save cert");
+        }
+        inner.persist().expect("persist");
+        let cut = inner.data.file_len();
+        for i in 4..6usize {
+            inner.save(&make_unique_cert(&fixture, i)).expect("save cert, never persisted");
+        }
+        let stale_end = inner.data.file_len();
+        simulate_crash(inner);
+        // Damage the first unpersisted cert: the rebuild keeps the log up to `cut`.
+        toggle_byte(&data_path, cut + 8);
+
+        disk_model::track(&data_path);
+        let inner = super::Inner::open(&dir, false).expect("the rebuild cuts the torn tail");
+        assert_eq!(inner.data.file_len(), cut, "cut at the damaged cert");
+        simulate_crash(inner); // crash again, before any writeback
+        disk_model::power_loss(&data_path);
+        assert!(zeros_at(&data_path, cut, stale_end), "the cut tail's zeros reached the disk");
+        disk_model::untrack(&data_path);
+    }
+
+    /// A failed save whose bytes reached the disk before its rollback (the system's writeback)
+    /// does not come back after a power loss: the rollback's zeros are flushed over it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn power_loss_never_brings_back_a_rolled_back_save() {
+        use crate::archive::data_file::disk_model;
+        let temp_dir = TempDir::with_prefix("cert_rollback_flush").expect("temp dir");
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let dir = temp_dir.path().join("epoch-0");
+        let data_path = dir.join(super::Inner::DATA_NAME);
+        let mut inner = super::Inner::open(&dir, false).expect("open pack");
+        inner.save(&make_unique_cert(&fixture, 0)).expect("save cert");
+        inner.persist().expect("persist");
+        disk_model::track(&data_path);
+        let start = inner.data.file_len();
+        inner.data.append(&make_unique_cert(&fixture, 1)).expect("append");
+        let end = inner.data.file_len();
+        inner.data.view().msync(start, end).expect("writeback before the rollback");
+        super::Inner::rewind_after_failed_save(&mut inner.data, start);
+        simulate_crash(inner);
+        disk_model::power_loss(&data_path);
+        assert!(zeros_at(&data_path, start, end), "the rolled-back save stays gone");
+        disk_model::untrack(&data_path);
+    }
+
+    /// A read the disk fails while an open walks the log is an error, never a torn tail: the open
+    /// fails with the read error and cuts nothing, and once the disk reads again the next open
+    /// keeps every certificate. In an unclean log the acked-damage walk reads first; in a clean
+    /// log whose index will not open, the rebuild's replay does.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn read_error_during_the_rebuild_fails_the_open() {
+        use crate::archive::pack_iter::FAIL_READ_AT;
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        for unclean in [true, false] {
+            let temp_dir = TempDir::with_prefix("cert_read_error").expect("temp dir");
+            let dir = temp_dir.path().join("epoch-0");
+            let at = {
+                let mut inner = super::Inner::open(&dir, false).expect("open pack");
+                let mut positions = Vec::new();
+                for i in 0..8usize {
+                    let cert = make_unique_cert(&fixture, i);
+                    inner.save(&cert).expect("save cert");
+                    let digest = B256::from_slice(cert.digest().as_ref());
+                    positions.push(inner.digest_idx.load(digest).expect("indexed"));
+                }
+                inner.persist().expect("persist");
+                if unclean {
+                    simulate_crash(inner);
+                } else {
+                    drop(inner);
+                }
+                positions[if unclean { 7 } else { 3 }]
+            };
+            if !unclean {
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(dir.join(super::Inner::HASH_NAME).join("index.hdx"))
+                    .expect("open the index")
+                    .set_len(16)
+                    .expect("tear the index header");
+            }
+            let data_path = dir.join(super::Inner::DATA_NAME);
+            let before = std::fs::read(&data_path).expect("read the log");
+            FAIL_READ_AT.with(|fail| fail.set(Some(at)));
+            let opened = super::Inner::open(&dir, false);
+            FAIL_READ_AT.with(|fail| fail.set(None));
+            let Err(err) = opened else {
+                panic!("(unclean: {unclean}) a read error must fail the open");
+            };
+            assert!(
+                matches!(&err, super::PackError::ReadError(e) if e.contains("not a torn tail")),
+                "(unclean: {unclean}) {err:?}"
+            );
+            assert!(std::fs::read(&data_path).expect("read") == before, "the failed open cut");
+
+            let mut inner = super::Inner::open(&dir, false).expect("the disk reads again");
+            for i in 0..8usize {
+                let digest = make_unique_cert(&fixture, i).digest();
+                assert!(inner.contains(digest), "(unclean: {unclean}) cert {i} kept");
+            }
+        }
     }
 }

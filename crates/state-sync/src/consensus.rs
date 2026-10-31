@@ -921,7 +921,7 @@ pub async fn request_missing_packs(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::{BTreeSet, VecDeque};
+    use std::collections::VecDeque;
     use tempfile::TempDir;
     use tn_network_libp2p::types::NetworkCommand;
     use tn_primary::{
@@ -974,8 +974,9 @@ mod tests {
         count: u64,
     ) -> ConsensusHeaderDigest {
         let committee = fixture.committee();
-        let genesis: BTreeSet<_> = fixture.genesis().collect();
-        let (_, headers) = fixture.headers_round(0, &genesis);
+        // Round-1 headers with no payload: these outputs carry no batches, so their sub-dags may
+        // declare none (a saved output carries every batch its sub-dag declares).
+        let headers = fixture.headers();
         let certificates: Vec<_> = headers.iter().map(|h| fixture.certificate(h)).collect();
         let leader = certificates.last().cloned().expect("a leader certificate");
         let mut parent_hash = ConsensusHeaderDigest::default();

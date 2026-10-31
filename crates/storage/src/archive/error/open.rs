@@ -19,6 +19,10 @@ pub enum OpenError {
     InvalidFiles,
     /// DB was not closed cleanly (data file length and index record mismatch).
     InvalidShutdown,
+    /// A compressed pack's record cap is above what its reads decompress
+    /// ([`MAX_RECORD_SIZE`](crate::archive::pack_iter::MAX_RECORD_SIZE)), so a record it took
+    /// could not be read back.
+    RecordCapTooLarge(u32),
 }
 
 impl Error for OpenError {}
@@ -32,6 +36,11 @@ impl fmt::Display for OpenError {
             Self::Seek(e) => write!(f, "seek: {e}"),
             Self::InvalidFiles => write!(f, "invalid files"),
             Self::InvalidShutdown => write!(f, "invalid shutdown"),
+            Self::RecordCapTooLarge(max) => write!(
+                f,
+                "a compressed pack's record cap {max} is above the {} its reads decompress",
+                crate::archive::pack_iter::MAX_RECORD_SIZE
+            ),
         }
     }
 }

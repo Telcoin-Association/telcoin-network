@@ -20,14 +20,6 @@ on:
       recovery_secs:
         description: "Catch-up deadline after restart, with capture every minute"
         default: "180"
-      sync_mode:
-        description: "MDBX sync regime inherited by every node"
-        type: choice
-        options:
-          - both
-          - durable
-          - safe-no-sync
-        default: both
 
 permissions:
   contents: read
@@ -39,7 +31,6 @@ env:
   RUST_BACKTRACE: 1
   CARGO_PROFILE_DEV_DEBUG: 0
   CARGO_PROFILE_TEST_DEBUG: 0
-  TN_TEST_MDBX_SYNC: durable
   TN_SIGKILL_EPOCH_SECS: ${{ inputs.epoch_secs || '30' }}
   TN_SIGKILL_BEFORE_CLOSE_SECS: ${{ inputs.before_close_secs || '2' }}
   TN_SIGKILL_DOWNTIME_SECS: ${{ inputs.downtime_secs || '45' }}
@@ -47,17 +38,15 @@ env:
 
 jobs:
   reproduce:
-    name: ${{ matrix.sync_mode }} / ${{ matrix.scenario }}
+    name: ${{ matrix.scenario }}
     runs-on: ubuntu-latest
     # One fleet-timed case per job: the five-hour test budget leaves an hour for the build.
     timeout-minutes: 360
     strategy:
       fail-fast: false
       matrix:
-        sync_mode: ${{ fromJSON(inputs.sync_mode == 'durable' && '["durable"]' || inputs.sync_mode == 'safe-no-sync' && '["safe-no-sync"]' || '["durable","safe-no-sync"]') }}
         scenario: [before_epoch_close, mid_epoch]
     env:
-      TN_TEST_MDBX_SYNC: ${{ matrix.sync_mode }}
       SIGKILL_FILTER: test(sigkill::test_sigkill_${{ matrix.scenario }}_recovers)
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -89,8 +78,8 @@ jobs:
         run: |
           cargo fetch --locked
           make test-sigkill
-          mkdir -p "validation-logs/$TN_TEST_MDBX_SYNC"
-          cp -R crates/e2e-tests/test_logs/sigkill* "validation-logs/$TN_TEST_MDBX_SYNC/"
+          mkdir -p "validation-logs/${{ matrix.scenario }}"
+          cp -R crates/e2e-tests/test_logs/sigkill* "validation-logs/${{ matrix.scenario }}/"
 
       - name: Reject timing settings beyond the per-case watchdog budget
         env:
@@ -197,7 +186,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: sigkill-recovery-${{ matrix.sync_mode }}-${{ matrix.scenario }}-${{ github.run_id }}-${{ github.run_attempt }}
+          name: sigkill-recovery-${{ matrix.scenario }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
             crates/e2e-tests/test_logs/sigkill*
             validation-logs

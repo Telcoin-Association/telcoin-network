@@ -9,7 +9,7 @@ use std::{
 
 use crate::archive::{
     crc::{add_crc32, check_crc},
-    data_file::{fsync_directory, sentinel_matches, MmapDataFile, SENTINEL_LEN},
+    data_file::{fsync_directory, sentinel_matches, MmapDataFile, MmapFileOptions, SENTINEL_LEN},
     error::{
         commit::CommitError, fetch::FetchError, insert::AppendError, load_header::LoadHeaderError,
     },
@@ -19,6 +19,18 @@ use crate::archive::{
 
 /// Size of a header.
 pub const PDX_HEADER_SIZE: usize = 26;
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only: this thread's next [`PositionIndex::raw_entries`] fails as a disk read can
+    /// (`EIO`).
+    pub(crate) static FAIL_NEXT_PDX_READ: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+    /// Test-only: this thread's next [`PositionIndex::open_pdx_file`] fails as a disk read of the
+    /// file can (`EIO`).
+    pub(crate) static FAIL_NEXT_PDX_OPEN: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
 
 /// Header for an pdx (index) file.  This contains file positions at fixed locations for
 /// looking up records by incrementing integer.
@@ -122,6 +134,19 @@ pub struct PositionIndex<T> {
 }
 
 impl<T: PosIndexValue> PositionIndex<T> {
+    /// Seal the index file now and report the outcome (see
+    /// [`MmapDataFile::seal`](crate::archive::data_file::MmapDataFile::seal)); dropping the index
+    /// seals it too, but can only log a failure.
+    pub(crate) fn seal(mut self) -> io::Result<()> {
+        self.pdx_file.seal()
+    }
+
+    /// Test-only: the index file's next seal reports a failed final fsync.
+    #[cfg(test)]
+    pub(crate) fn fail_next_seal_sync_for_test(&mut self) {
+        self.pdx_file.fail_next_seal_sync_for_test();
+    }
+
     /// True if the pdx file at dir and filename exists.
     pub fn pdx_file_exists<P: AsRef<Path>>(dir: P, file_name: &str) -> bool {
         let dir = dir.as_ref();
@@ -141,6 +166,10 @@ impl<T: PosIndexValue> PositionIndex<T> {
             T::buffer_len() <= VALUE_MAX_BYTES,
             "PosIndexValue::buffer_len() exceeds VALUE_MAX_BYTES"
         );
+        #[cfg(test)]
+        if FAIL_NEXT_PDX_OPEN.with(|fail| fail.replace(false)) {
+            return Err(LoadHeaderError::IO(io::Error::from_raw_os_error(libc::EIO)));
+        }
         let dir = dir.as_ref();
         // A read-only open must not create the sidecar directory (see `HdxIndex::open_hdx_file`);
         // an absent dir still fails `NotFound` below.
@@ -151,7 +180,10 @@ impl<T: PosIndexValue> PositionIndex<T> {
                 let _ = fsync_directory(parent);
             }
         }
-        let mut pdx_file = MmapDataFile::open(dir.join(file_name), read_only)?;
+        // Derived from the data log (rebuilt after any unclean open), so its size waits for the
+        // seal.
+        let opts = MmapFileOptions { derived: true, ..Default::default() };
+        let mut pdx_file = MmapDataFile::open_with(dir.join(file_name), read_only, opts)?;
 
         let was_empty = pdx_file.is_empty();
         let header = if was_empty {
@@ -208,7 +240,8 @@ impl<T: PosIndexValue> PositionIndex<T> {
     /// opening the index: empty if the file is absent, shorter than its header, not a pdx (type
     /// tag / header CRC), or not the index of the data file whose header is `data_header` (the
     /// version/appnum/uid identity [`Self::open_pdx_file`] checks). Entries that fail to decode
-    /// are skipped.
+    /// are skipped. A read that fails for any reason but an absent file is an `Err`: it says
+    /// nothing about what the index attests, so a caller must not read it as "no entries".
     ///
     /// For attesting record offsets from an index that a read-only open would refuse — an
     /// unsealed file whose mmap capacity padding leaves its tail unaligned — while a writable
@@ -217,8 +250,18 @@ impl<T: PosIndexValue> PositionIndex<T> {
     /// unsealed index's logical end decodes as zero entries; a caller treating entries as record
     /// offsets must ignore those (a real offset lies past the data file's header). A sealed index's
     /// trailing clean-close sentinel is not read as an entry.
-    pub fn raw_entries(path: &Path, data_header: &DataHeader) -> Vec<T> {
-        let Ok(bytes) = fs::read(path) else { return Vec::new() };
+    pub fn raw_entries(path: &Path, data_header: &DataHeader) -> io::Result<Vec<T>> {
+        let read = fs::read(path);
+        #[cfg(test)]
+        let read = match FAIL_NEXT_PDX_READ.with(|fail| fail.replace(false)) {
+            true => Err(io::Error::from_raw_os_error(libc::EIO)),
+            false => read,
+        };
+        let bytes = match read {
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(e),
+        };
         let header = bytes
             .first_chunk::<PDX_HEADER_SIZE>()
             .and_then(|header| PdxHeader::decode(header).ok());
@@ -227,7 +270,7 @@ impl<T: PosIndexValue> PositionIndex<T> {
                 && header.uid() == data_header.uid()
                 && header.appnum() == data_header.appnum()
         }) {
-            return Vec::new();
+            return Ok(Vec::new());
         }
         // A cleanly closed index ends in its clean-close sentinel, which is not an entry.
         let end = bytes
@@ -240,10 +283,10 @@ impl<T: PosIndexValue> PositionIndex<T> {
                     .is_some_and(|tail| sentinel_matches(tail, at as u64))
             })
             .unwrap_or(bytes.len());
-        bytes[PDX_HEADER_SIZE..end]
+        Ok(bytes[PDX_HEADER_SIZE..end]
             .chunks_exact(T::buffer_len())
             .filter_map(|chunk| T::decode(chunk).ok())
-            .collect()
+            .collect())
     }
 
     /// Return the number of values in this index.
@@ -287,6 +330,34 @@ impl<T: PosIndexValue> PositionIndex<T> {
         Ok(PositionIter::new(data))
     }
 
+    /// The value at `key`, read straight from the mapping through a shared reference (the
+    /// cursor-free sibling of [`Index::load`]): for readers that share the index with its writer
+    /// behind a read lock.
+    pub fn get(&self, key: u64) -> Result<T, FetchError> {
+        if key as usize >= self.len() {
+            return Err(FetchError::NotFound);
+        }
+        let buffer_len = T::buffer_len();
+        let pos = PDX_HEADER_SIZE as u64 + key * buffer_len as u64;
+        let bytes = self.pdx_file.slice(pos, buffer_len).ok_or_else(|| {
+            FetchError::IO(std::io::Error::other("a position index entry is not mapped"))
+        })?;
+        T::decode(bytes)
+    }
+
+    /// [`Self::rev_iter`] through a shared reference, reading the mapping (see [`Self::get`]).
+    pub fn rev_iter_shared(&self, len: usize) -> Result<PositionIter<T>, std::io::Error> {
+        let count = len.min(self.len());
+        let buffer_len = T::buffer_len();
+        let start = PDX_HEADER_SIZE as u64 + ((self.len() - count) * buffer_len) as u64;
+        let data = self
+            .pdx_file
+            .slice(start, count * buffer_len)
+            .ok_or_else(|| std::io::Error::other("the position index is not mapped"))?
+            .to_vec();
+        Ok(PositionIter::new_rev(data))
+    }
+
     /// Return a reverse iterator over file positions with up to len items.
     pub fn rev_iter(&mut self, len: usize) -> Result<PositionIter<T>, std::io::Error> {
         let data_len = if len < self.len() { len } else { self.len() };
@@ -312,13 +383,6 @@ impl<T: PosIndexValue> PositionIndex<T> {
         }
         let buffer_len = T::buffer_len() as u64;
         let pos = PDX_HEADER_SIZE as u64 + (key * buffer_len) + buffer_len;
-        self.pdx_file.truncate(pos)
-    }
-
-    /// Truncate the index to just the header. Same read-only-mmap SIGBUS precondition as
-    /// [`Self::truncate_to_index`] (physical shrink; no live read-only map of this pdx).
-    pub fn truncate_all(&mut self) -> Result<(), io::Error> {
-        let pos = PDX_HEADER_SIZE as u64;
         self.pdx_file.truncate(pos)
     }
 
@@ -766,8 +830,38 @@ mod tests {
                 idx.save(i, 100 + i).expect("add to index");
             }
         }
-        let entries =
-            PositionIndex::<u64>::raw_entries(&tmp_path.path().join("raw.pdx"), &data_header);
+        let path = tmp_path.path().join("raw.pdx");
+        let entries = PositionIndex::<u64>::raw_entries(&path, &data_header).expect("read");
         assert_eq!(entries, vec![100, 101, 102], "the sealed tail is not an entry");
+    }
+
+    /// Only an absent file reads as "no entries": any other failed read is an error, so a caller
+    /// attesting offsets from the index cannot mistake an unreadable index for an empty one.
+    #[test]
+    fn test_raw_entries_fail_on_a_failed_read() {
+        let tmp_path = TempDir::with_prefix("test_raw_entries_read_error").expect("temp dir");
+        let data_header = DataHeader::new(0, PackCompression::ZStd, 0);
+        let path = tmp_path.path().join("raw.pdx");
+        let absent = PositionIndex::<u64>::raw_entries(&path, &data_header).expect("absent file");
+        assert!(absent.is_empty(), "an absent index attests nothing");
+        {
+            let mut idx: PositionIndex<u64> =
+                PositionIndex::open_pdx_file(tmp_path.path(), &data_header, "raw.pdx", false)
+                    .expect("pdx file");
+            idx.save(0, 100).expect("add to index");
+        }
+        FAIL_NEXT_PDX_READ.with(|fail| fail.set(true));
+        let err = PositionIndex::<u64>::raw_entries(&path, &data_header)
+            .expect_err("a failed read is not an empty index");
+        assert_eq!(err.raw_os_error(), Some(libc::EIO));
+        // A directory where the file should be fails its read for real (EISDIR), no hook.
+        let dir_path = tmp_path.path().join("dir.pdx");
+        fs::create_dir(&dir_path).expect("dir");
+        assert!(PositionIndex::<u64>::raw_entries(&dir_path, &data_header).is_err());
+        assert_eq!(
+            PositionIndex::<u64>::raw_entries(&path, &data_header).expect("read"),
+            vec![100],
+            "the hook fails one read only"
+        );
     }
 }

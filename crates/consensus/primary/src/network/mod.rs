@@ -1643,8 +1643,8 @@ impl PrimaryNetworkHandle {
                 // honest pack finishes at any sustained rate at/above the floor
                 // while a drip/stalled peer is cut quickly. On such an error the
                 // future resolves `Err`, which unwinds `stream_import` so its
-                // `ImportPath` guard clears the `.inproc` sentinel and the epoch is
-                // retryable against another peer. The responder applies
+                // `ImportPath` guard removes the import dir, releases the epoch's claim, and the
+                // epoch is retryable against another peer. The responder applies
                 // `PUBLIC_EPOCH_PACK_SERVE_TIMEOUT` to a public requester's serve, so a pack cut
                 // there ends the stream before its `End` frame (the reader reports an early EOF as
                 // `ConnectionAborted`), and the requester retries from the next peer.
@@ -1725,6 +1725,8 @@ impl PrimaryNetworkHandle {
                 | PackError::ReadOnly
                 | PackError::ReadError(_)
                 | PackError::MissingAuthority
+                // The caller's committee or previous record is for another epoch: local state.
+                | PackError::LocalEpochMismatch { .. }
                 | PackError::SendFailed
                 | PackError::ReceiveFailed
                 | PackError::PersistError(_)
@@ -1737,14 +1739,12 @@ impl PrimaryNetworkHandle {
             ConsensusChainError::EpochMismatch
             | ConsensusChainError::PrevCommitteeEpochMismatch
             | ConsensusChainError::CrcError => Some(Penalty::Mild),
-            ConsensusChainError::EmptyImport | ConsensusChainError::InvalidImport => {
-                Some(Penalty::Severe)
-            }
             ConsensusChainError::StreamUnavailable
             | ConsensusChainError::NoCurrentEpoch
             | ConsensusChainError::EpochDbError(_)
             | ConsensusChainError::InvalidPackEpoch(_, _)
             | ConsensusChainError::CantSaveAndNotAvailable(_)
+            | ConsensusChainError::LiveEpochImport(_)
             // The documented cause is LOCAL state (a resume that collapsed this node's
             // "latest"), not peer misbehavior, so no penalty is charged to the peer.
             | ConsensusChainError::NonMonotonicConsensusNumber { .. }
@@ -1800,6 +1800,8 @@ impl PrimaryNetworkHandle {
                 | PackError::ReadOnly
                 | PackError::ReadError(_)
                 | PackError::MissingAuthority
+                // The caller's committee or previous record is for another epoch: local state.
+                | PackError::LocalEpochMismatch { .. }
                 | PackError::SendFailed
                 | PackError::ReceiveFailed
                 | PackError::PersistError(_)
@@ -1809,8 +1811,6 @@ impl PrimaryNetworkHandle {
                 | PackError::InvalidVersion(_, _)
                 | PackError::ConsensusNumberTooHigh => false,
             },
-            // The imported stream had no / an invalid final output: the peer served a bad pack.
-            ConsensusChainError::EmptyImport | ConsensusChainError::InvalidImport => true,
             // Local chain state, our own storage, or a benign mismatch: never charge the peer.
             ConsensusChainError::EpochMismatch
             | ConsensusChainError::PrevCommitteeEpochMismatch
@@ -1820,6 +1820,7 @@ impl PrimaryNetworkHandle {
             | ConsensusChainError::EpochDbError(_)
             | ConsensusChainError::InvalidPackEpoch(_, _)
             | ConsensusChainError::CantSaveAndNotAvailable(_)
+            | ConsensusChainError::LiveEpochImport(_)
             | ConsensusChainError::NonMonotonicConsensusNumber { .. }
             | ConsensusChainError::IO(_) => false,
         }

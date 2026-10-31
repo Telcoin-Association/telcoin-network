@@ -29,3 +29,7 @@ test_logs/
 
 # mdBook build output
 docs/book/
+
+# reports written to the repo root by etc/storage-ab-bench.sh and etc/storage-baseline-bench.sh
+/storage-ab-*.txt
+/storage-baseline-*.txt
