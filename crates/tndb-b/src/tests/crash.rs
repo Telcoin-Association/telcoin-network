@@ -7,8 +7,19 @@
 
 use std::{fs, os::unix::fs::FileExt as _};
 
-use super::*;
-use crate::{alloc::RunStats, disk_model, env::CrashAt, meta::slot_to_write};
+use super::{
+    damage::tree,
+    dup::{dup_key, OPTIONS},
+    *,
+};
+use crate::{
+    alloc::RunStats,
+    disk_model,
+    env::CrashAt,
+    meta::slot_to_write,
+    page::{self, Find, Val},
+    tree::{read::descend, PageRead as _, TreeRoot},
+};
 
 /// How the machine went down once the process stopped.
 #[derive(Clone, Copy, Debug)]
@@ -56,6 +67,11 @@ pub(super) fn slack(env: &Env) -> u64 {
 /// table `f`, sized to leave the file only a few pages of slack, dropped by the last commit, so
 /// its pages are free but not yet reusable: a modest commit must grow the file.
 pub(super) fn base(page_size: u32) -> Base {
+    base_with(page_size, |_, _, _| {})
+}
+
+/// [`base`] with the tables `extra` writes (given the page size) in its first commit, after `h`.
+fn base_with(page_size: u32, extra: fn(&mut RwTxn, &mut State, u32)) -> Base {
     let (dir, path) = temp("tndb_b_crash");
     let env = Env::open(&path, EnvOptions { page_size, ..EnvOptions::default() }).expect("open");
     let mut state = State::new();
@@ -77,6 +93,7 @@ pub(super) fn base(page_size: u32) -> Base {
     for i in 0..72 * page_size / 1000 {
         put(&mut txn, &mut state, "h", &key(i), &value(8, i, 900));
     }
+    extra(&mut txn, &mut state, page_size);
     txn.commit().expect("commit");
     let mut txn = env.begin_rw().expect("begin");
     for i in (0..400).step_by(2) {
@@ -337,9 +354,13 @@ fn every_crash_point_recovers_the_state_the_protocol_allows_heavy() {
 /// does, before the meta naming it.
 #[test]
 fn a_commit_that_grew_the_file_survives_a_power_loss() {
-    let base = base(4096);
+    grown_commit_survives_a_power_loss(&base(4096));
+}
+
+/// [`a_commit_that_grew_the_file_survives_a_power_loss`] on `base`.
+fn grown_commit_survives_a_power_loss(base: &Base) {
     for by_msync in [false, true] {
-        let Case { path, latest, .. } = run_case(&base, SyncMode::Durable, by_msync, None);
+        let Case { path, latest, .. } = run_case(base, SyncMode::Durable, by_msync, None);
         disk_model::power_loss(&path);
         disk_model::untrack(&path);
         let env = open(&path, SyncMode::Durable);
@@ -356,9 +377,13 @@ fn a_commit_that_grew_the_file_survives_a_power_loss() {
 /// falls back to the older state intact.
 #[test]
 fn the_older_state_stays_recoverable_until_its_meta_is_overwritten() {
-    let base = base(4096);
+    older_state_stays_recoverable(&base(4096));
+}
+
+/// [`the_older_state_stays_recoverable_until_its_meta_is_overwritten`] on `base`.
+fn older_state_stays_recoverable(base: &Base) {
     let Case { path, slot, reused, .. } =
-        run_case(&base, SyncMode::Durable, false, Some(CrashAt::AfterSizeSync));
+        run_case(base, SyncMode::Durable, false, Some(CrashAt::AfterSizeSync));
     assert!(reused > 0, "the commit reused pages");
     disk_model::power_loss(&path);
     disk_model::untrack(&path);
@@ -371,4 +396,199 @@ fn the_older_state_stays_recoverable_until_its_meta_is_overwritten() {
     let env = open(&path, SyncMode::Durable);
     assert_eq!(env.stat().txn_id, base.txn - 1);
     assert_eq!(newest_state(&env), base.prev);
+}
+
+/// The dup table of [`dup_base`].
+const DUP: &str = "u";
+
+/// [`DUP`]'s outer keys per 4 KiB of page size: enough for an outer tree of two levels.
+const OUTER: u32 = 400;
+
+/// An outer key of [`DUP`] with a nested tree of two levels and a value in a run, whose rows the
+/// crash commit rewrites and adds to.
+const HOT: u32 = 7;
+
+/// An outer key like [`HOT`], whose nested tree the crash commit removes by a `delete_prefix`.
+const GONE: u32 = 9;
+
+/// An outer key of [`DUP`] with three rows, which the crash commit deletes one by one.
+const EMPTIED: u32 = 20;
+
+/// [`DUP`]'s outer keys at `page_size`.
+fn outer_keys(page_size: u32) -> u32 {
+    OUTER * page_size / 4096
+}
+
+/// The rows of [`HOT`] and [`GONE`] at `page_size`: enough for a nested tree of two levels.
+fn big_rows(page_size: u32) -> u32 {
+    300 * page_size / 4096
+}
+
+/// The outer key the crash commit creates, past every other.
+fn new_key(page_size: u32) -> u32 {
+    outer_keys(page_size) + 5
+}
+
+/// Store `value` under subkey `sub` of outer key `k` in [`DUP`] (created if missing), in the
+/// transaction and in the model.
+fn dup_put(txn: &mut RwTxn, state: &mut State, k: u32, sub: &[u8], value: &[u8]) {
+    let table = txn.create_dup_table(DUP, OPTIONS).expect("the dup table");
+    let key = dup_key(k, sub);
+    txn.put(&table, &key, value).expect("put");
+    state.entry(DUP.to_string()).or_default().insert(key, value.to_vec());
+}
+
+/// The model's rows of outer key `k` in [`DUP`].
+fn dup_keys_of(state: &State, k: u32) -> Vec<Vec<u8>> {
+    let prefix = k.to_be_bytes();
+    state[DUP].keys().filter(|key| key.starts_with(&prefix)).cloned().collect()
+}
+
+/// [`DUP`] in the base's first commit: outer keys 0 to [`outer_keys`], 1 to 3 rows of 1-byte
+/// subkeys each, but [`HOT`] and [`GONE`]: [`big_rows`] rows of 2-byte subkeys and a value in a
+/// run each.
+fn dup_table(txn: &mut RwTxn, state: &mut State, page_size: u32) {
+    for k in 0..outer_keys(page_size) {
+        if k == HOT || k == GONE {
+            for s in 0..big_rows(page_size) {
+                dup_put(txn, state, k, &(s as u16).to_be_bytes(), &value(40 + k, s, 40));
+            }
+            dup_put(txn, state, k, b"run", &value(50 + k, 0, 3 * page_size as usize));
+        } else {
+            for s in 0..1 + k % 3 {
+                dup_put(txn, state, k, &[s as u8], &value(41, 3 * k + s, 40));
+            }
+        }
+    }
+}
+
+/// [`unsynced_changes`], and a rewrite of one row of every 17th outer key of [`DUP`].
+fn dup_unsynced(txn: &mut RwTxn, state: &mut State, round: u32) {
+    unsynced_changes(txn, state, round);
+    for k in (round..OUTER).step_by(17) {
+        dup_put(txn, state, k, &[0], &value(70 + round, k, 40));
+    }
+}
+
+/// The dup crash commit, then [`crash_changes`] (which grows the file): nested-only changes to
+/// committed outer keys ([`HOT`]: every fifth row rewritten, rows added after the others and its
+/// run replaced; one row of every 13th small key rewritten), so the flush rewrites their outer
+/// cells; a new outer key; [`EMPTIED`]'s rows deleted one by one, which removes its cell; and
+/// [`GONE`]'s nested tree (two levels and a run) removed by a `delete_prefix`.
+fn dup_crash(txn: &mut RwTxn, state: &mut State) {
+    let page_size = txn.writer_mut().geometry.page_size() as u32;
+    let rows = big_rows(page_size);
+    for s in (0..rows).step_by(5) {
+        dup_put(txn, state, HOT, &(s as u16).to_be_bytes(), &value(60, s, 44));
+    }
+    for s in rows..rows + 40 {
+        dup_put(txn, state, HOT, &(s as u16).to_be_bytes(), &value(61, s, 40));
+    }
+    dup_put(txn, state, HOT, b"run", &value(62, 0, 2 * page_size as usize + 100));
+    for k in (0..OUTER).step_by(13) {
+        dup_put(txn, state, k, &[0], &value(63, k, 40));
+    }
+    for s in 0..3 {
+        dup_put(txn, state, new_key(page_size), &[s], &value(64, u32::from(s), 40));
+    }
+    let emptied = dup_keys_of(state, EMPTIED);
+    assert_eq!(emptied.len(), 3, "the rows of {EMPTIED}");
+    for key in emptied {
+        delete(txn, state, DUP, &key);
+    }
+    let gone = dup_keys_of(state, GONE);
+    let table = txn.open_table(DUP).expect("open").expect("the dup table");
+    let removed = txn.delete_prefix(&table, &GONE.to_be_bytes()).expect("delete_prefix");
+    assert_eq!(removed, gone.len() as u64, "the rows of {GONE}");
+    let rows = state.get_mut(DUP).expect("the model has the dup table");
+    gone.iter().for_each(|key| assert!(rows.remove(key).is_some()));
+    crash_changes(txn, state);
+}
+
+/// The nested root that outer key `k`'s cell in [`DUP`] names in the newest state of `env`
+/// (`None`: no cell).
+fn nested_root(env: &Env, k: u32) -> Option<TreeRoot> {
+    let snapshot = env.inner().current();
+    let key = k.to_be_bytes();
+    let leaf = descend(&*snapshot, &tree(env, DUP), &key, |_, _, _, _| Ok(()), None)
+        .expect("descend")
+        .expect("a leaf");
+    match page::leaf_find(snapshot.page(leaf.pgno).expect("the outer leaf"), &key).expect("find") {
+        Find::Found { value: Val::Nested(root), .. } => {
+            Some(TreeRoot::decode(root).expect("a nested root"))
+        }
+        Find::Found { value, .. } => panic!("outer key {k}: {value:?}"),
+        Find::NotFound { .. } => None,
+    }
+}
+
+/// The dup shape the matrix relies on, in the state the crash commit made: [`DUP`]'s outer tree
+/// and [`HOT`]'s nested tree of two levels or more, [`HOT`]'s run, no outer cell left for
+/// [`EMPTIED`] or [`GONE`], and one for the new key.
+fn dup_layout(env: &Env) {
+    let outer = tree(env, DUP);
+    assert!(outer.height >= 2, "{outer:?}");
+    let hot = nested_root(env, HOT).expect("hot's cell");
+    assert!(hot.height >= 2 && hot.overflow_pages > 0, "{hot:?}");
+    assert_eq!(nested_root(env, EMPTIED), None, "the emptied key's cell is removed");
+    assert_eq!(nested_root(env, GONE), None, "the delete_prefix removes the cell");
+    let page_size = env.with_writer(|w| w.geometry.page_size() as u32);
+    assert!(nested_root(env, new_key(page_size)).is_some(), "the new key's cell");
+}
+
+/// [`base`] with dup table [`DUP`] ([`dup_table`]) beside the plain tables, its unsynced commits
+/// ([`dup_unsynced`]) and crash commit ([`dup_crash`]) writing it too, checked (on a copy) to hold
+/// the shape the crash commit changes: an outer tree of two levels or more, [`HOT`]'s and
+/// [`GONE`]'s nested trees of two levels or more with a run, and [`EMPTIED`]'s cell.
+fn dup_base(page_size: u32) -> Base {
+    let base = Base {
+        unsynced: dup_unsynced,
+        crash: dup_crash,
+        layout: dup_layout,
+        ..base_with(page_size, dup_table)
+    };
+    let path = base.dir.path().join("shape");
+    fs::copy(&base.path, &path).expect("copy");
+    let env = open(&path, SyncMode::Durable);
+    assert!(newest_state(&env) == base.state, "the base holds its model");
+    assert!(tree(&env, DUP).height >= 2, "{:?}", tree(&env, DUP));
+    for k in [HOT, GONE] {
+        let root = nested_root(&env, k).expect("a cell");
+        assert!(root.height >= 2 && root.overflow_pages > 0, "{k}: {root:?}");
+    }
+    assert!(nested_root(&env, EMPTIED).is_some_and(|root| root.height == 1));
+    drop(env);
+    fs::remove_file(&path).expect("remove");
+    base
+}
+
+/// The matrix over a dup table beside plain ones: a crash commit of nested-only changes (outer
+/// cells rewritten by the flush), a new outer key, a key emptied and a `delete_prefix` reopens at
+/// every crash point to exactly `L` or `M`, every row read back by a get and by a walk of every
+/// tree (with the totals and the check's figures), and passes `Env::check`.
+#[test]
+fn every_crash_point_recovers_a_dup_table() {
+    matrix(&dup_base(4096), 3);
+}
+
+/// The dup matrix at two page sizes, with many random power losses.
+#[test]
+#[ignore = "heavy: run with --release"]
+fn every_crash_point_recovers_a_dup_table_heavy() {
+    for page_size in [4096, 16384] {
+        matrix(&dup_base(page_size), 40);
+    }
+}
+
+/// [`a_commit_that_grew_the_file_survives_a_power_loss`] with the dup crash commit.
+#[test]
+fn a_commit_that_grew_the_file_survives_a_power_loss_with_a_dup_table() {
+    grown_commit_survives_a_power_loss(&dup_base(4096));
+}
+
+/// [`the_older_state_stays_recoverable_until_its_meta_is_overwritten`] with the dup crash commit:
+/// the pages it reused hold none of the older state's nested trees either.
+#[test]
+fn the_older_state_with_a_dup_table_stays_recoverable_until_its_meta_is_overwritten() {
+    older_state_stays_recoverable(&dup_base(4096));
 }

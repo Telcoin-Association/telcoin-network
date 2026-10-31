@@ -2,7 +2,7 @@
 //! a dup table's cells, trees and record is `Corrupt` at the first use that meets it, and latches.
 //! This build has no dup cursor (a cursor over a dup table is `TableKind`), so the scan stage
 //! scans the plain table beside it only. Beside the sweeps: two outer cells naming one nested
-//! root, written in one transaction and in two.
+//! root, written in one transaction (`Corrupt` at commit) and in two (found by `Env::check`).
 
 use std::{collections::BTreeMap, fs};
 
@@ -406,22 +406,25 @@ fn a_shared_nested_root_written_once_per_cell_in_one_transaction_is_corrupt() {
 }
 
 /// Two outer cells naming one committed nested root, written in two transactions (either key
-/// first): the second copies a root the first freed, which should be `Corrupt` at that write or
-/// its commit. Today both commit and the root is listed free twice, which only `Env::check`
-/// sees ("used twice ... free list and free list").
+/// first): the engine's documented limit, as for a forged shared pointer in a plain tree (README
+/// "Free list and page reuse"). The first commit frees the root; the second copies the published
+/// page and frees it again, which its free cannot tell, so both commit and nothing latches.
+/// `Env::check` afterwards reports the root used twice (both free records list it) and the
+/// nested root the forged cell no longer names leaked.
 #[test]
-#[ignore = "fail-closed gap: a nested root a committed txn freed is copied and freed again"]
-fn a_shared_nested_root_written_across_two_transactions_is_corrupt() {
+fn a_shared_nested_root_across_transactions_is_found_by_check() {
     let fx = dup_fixture();
+    let (shared, orphan) = (fx.cells[&11].1.root, fx.cells[&COLD].1.root);
+    let want = format!("leaked [{orphan}]; used twice [{shared} (free list and free list)]");
     for (name, order) in [("ab", [0, 1]), ("ba", [1, 0])] {
         let (keys, env) = shared_root(&fx, name);
-        rewrite(&env, &[keys[order[0]]]).expect("the first write meets no damage");
-        let second = rewrite(&env, &[keys[order[1]]]);
-        let latched = env.failure().is_some();
+        rewrite(&env, &[keys[order[0]]]).expect("the first commit");
+        rewrite(&env, &[keys[order[1]]]).expect("the second commit cannot tell");
+        assert!(env.failure().is_none(), "{name}: nothing latched");
         let check = env.check();
         assert!(
-            matches!(&second, Err(Error::Corrupt(_))) && latched,
-            "{name}: {second:?}, latched {latched}; check after: {check:?}"
+            matches!(&check, Err(Error::Corrupt(m)) if m.ends_with(&want)),
+            "{name}: {check:?}"
         );
     }
 }

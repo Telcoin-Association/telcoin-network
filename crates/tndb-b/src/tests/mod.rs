@@ -111,13 +111,24 @@ fn state_of<'n>(txn: &impl ReadTxn, names: impl IntoIterator<Item = &'n str>) ->
 }
 
 /// The newest committed state of `env`, every table of it (the check names them), once
-/// `Env::check` passes.
+/// `Env::check` passes: a plain table's rows by its cursors ([`rows`]), a dup table's (which has
+/// no cursor) by a walk of its trees that checks the totals (`dup_rows_for_test`), with its
+/// figures in the check those of its `table_stat`.
 fn newest_state(env: &Env) -> State {
     let report = check(env);
     let ro = env.begin_ro().expect("ro");
     assert_eq!(ro.txn_id(), report.txn_id);
-    let state = state_of(&ro, report.tables.keys().map(String::as_str));
-    assert_eq!(state.len(), report.tables.len());
+    let mut state = State::new();
+    for name in report.tables.keys() {
+        let table = ro.open_table(name).expect("open table").expect("the check names it");
+        let rows = if ro.table_stat(&table).expect("stat").dup.is_some() {
+            dup::assert_dup_figures(&report, &ro, name);
+            ro.dup_rows_for_test(&table).into_iter().collect()
+        } else {
+            rows(&ro, &table)
+        };
+        state.insert(name.clone(), rows);
+    }
     state
 }
 

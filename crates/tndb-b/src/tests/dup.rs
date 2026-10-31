@@ -26,26 +26,33 @@ use crate::{
         test_harness::{walk_outer_tree, ReportSeed, Rng},
         PageRead as _, TreeRoot,
     },
-    CheckReport, DupOptions, Env, EnvOptions, Error, ReadTxn as _, Result, TableStat,
+    CheckReport, DupOptions, Env, EnvOptions, Error, ReadTxn, Result, TableStat,
 };
 
 /// The options of the dup tables these tests create.
 pub(super) const OPTIONS: DupOptions = DupOptions { key_len: 4, packed_max: 0 };
 
 /// `Env::check` of `env`, which must pass, with dup table `name`'s figures those of its
-/// `table_stat`: its rows, its outer and nested pages (runs included) and its outer tree's height.
+/// `table_stat` ([`assert_dup_figures`]).
 #[track_caller]
 fn check_dup(env: &Env, name: &str) -> CheckReport {
     let report = check(env);
     let ro = env.begin_ro().expect("ro");
-    let table = ro.open_table(name).expect("open").expect("the table");
-    let stat = ro.table_stat(&table).expect("stat");
+    assert_dup_figures(&report, &ro, name);
+    report
+}
+
+/// Dup table `name`'s figures in `report` (an `Env::check` of `txn`'s state) are those of its
+/// `table_stat`: its rows, its outer and nested pages (runs included) and its outer tree's height.
+#[track_caller]
+pub(super) fn assert_dup_figures(report: &CheckReport, txn: &impl ReadTxn, name: &str) {
+    let table = txn.open_table(name).expect("open").expect("the table");
+    let stat = txn.table_stat(&table).expect("stat");
     assert!(stat.dup.is_some(), "{name} is a dup table");
     let pages =
         u64::from(stat.branch_pages) + u64::from(stat.leaf_pages) + u64::from(stat.overflow_pages);
     let found = report.tables[name];
     assert_eq!((found.entries, found.pages, found.height), (stat.entries, pages, stat.height));
-    report
 }
 
 /// A copy of the file at `path`, opened.

@@ -765,9 +765,10 @@ of the tree that holds the page, after a write in the same transaction handed it
 private under a page the transaction did not write (`tree_pages`), `Corrupt`. In a later
 transaction, the page now published, a free of a tree without runs cannot tell (it does not read
 the leaf) and frees the page again; once a write reuses it, a read through either pointer fails
-its txn identity, `Corrupt`. A page freed twice in one transaction (two pointers naming it, such
-as two cells naming one run) is `Corrupt` at commit (`Allocator::reusable`). `Env::check` reports
-the page as used twice.
+its txn identity, `Corrupt`. A forged nested root named by two outer cells of a dup table, each
+cell written in its own transaction, is the same case. A page freed twice in one transaction (two
+pointers naming it, such as two cells naming one run) is `Corrupt` at commit
+(`Allocator::reusable`). `Env::check` reports the page as used twice.
 
 **Reuse timing.** A record's txn is the reuse gate its pages wait for: once the gate reaches it,
 no durable meta and no live reader reaches them. A page freed by txn N is listed under N, since
