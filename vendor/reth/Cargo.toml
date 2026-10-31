@@ -1,0 +1,450 @@
+[workspace.package]
+version = "1.11.3"
+edition = "2024"
+rust-version = "1.88"
+license = "MIT OR Apache-2.0"
+homepage = "https://paradigmxyz.github.io/reth"
+repository = "https://github.com/paradigmxyz/reth"
+exclude = [".github/"]
+
+[workspace]
+members = [
+    "crates/chain-state",
+    "crates/chainspec",
+    "crates/cli/util",
+    "crates/config",
+    "crates/consensus/common",
+    "crates/consensus/consensus",
+    "crates/consensus/debug-client",
+    "crates/engine/invalid-block-hooks",
+    "crates/engine/local",
+    "crates/engine/primitives",
+    "crates/engine/service",
+    "crates/engine/tree",
+    "crates/engine/util",
+    "crates/era",
+    "crates/era-downloader",
+    "crates/era-utils",
+    "crates/errors",
+    "crates/ethereum/consensus",
+    "crates/ethereum/engine-primitives",
+    "crates/ethereum/evm",
+    "crates/ethereum/hardforks",
+    "crates/ethereum/node",
+    "crates/ethereum/payload",
+    "crates/ethereum/primitives",
+    "crates/etl",
+    "crates/evm/evm",
+    "crates/evm/execution-errors",
+    "crates/evm/execution-types",
+    "crates/exex/exex",
+    "crates/exex/types",
+    "crates/fs-util",
+    "crates/metrics",
+    "crates/net/banlist",
+    "crates/net/discv4",
+    "crates/net/discv5",
+    "crates/net/dns",
+    "crates/net/downloaders",
+    "crates/net/ecies",
+    "crates/net/eth-wire",
+    "crates/net/eth-wire-types",
+    "crates/net/nat",
+    "crates/net/network",
+    "crates/net/network-api",
+    "crates/net/network-types",
+    "crates/net/p2p",
+    "crates/net/peers",
+    "crates/node/api",
+    "crates/node/builder",
+    "crates/node/core",
+    "crates/node/ethstats",
+    "crates/node/events",
+    "crates/node/metrics",
+    "crates/node/types",
+    "crates/payload/basic",
+    "crates/payload/builder",
+    "crates/payload/builder-primitives",
+    "crates/payload/primitives",
+    "crates/payload/validator",
+    "crates/primitives",
+    "crates/primitives-traits",
+    "crates/prune/prune",
+    "crates/prune/types",
+    "crates/revm",
+    "crates/rpc/ipc",
+    "crates/rpc/rpc",
+    "crates/rpc/rpc-api",
+    "crates/rpc/rpc-builder",
+    "crates/rpc/rpc-convert",
+    "crates/rpc/rpc-engine-api",
+    "crates/rpc/rpc-eth-api",
+    "crates/rpc/rpc-eth-types",
+    "crates/rpc/rpc-layer",
+    "crates/rpc/rpc-server-types",
+    "crates/stages/api",
+    "crates/stages/stages",
+    "crates/stages/types",
+    "crates/static-file/static-file",
+    "crates/static-file/types",
+    "crates/storage/codecs",
+    "crates/storage/codecs/derive",
+    "crates/storage/db",
+    "crates/storage/db-api",
+    "crates/storage/db-common",
+    "crates/storage/db-models",
+    "crates/storage/errors",
+    "crates/storage/libmdbx-rs",
+    "crates/storage/libmdbx-rs/mdbx-sys",
+    "crates/storage/nippy-jar",
+    "crates/storage/provider",
+    "crates/storage/storage-api",
+    "crates/storage/zstd-compressors",
+    "crates/tasks",
+    "crates/tokio-util",
+    "crates/tracing",
+    "crates/tracing-otlp",
+    "crates/transaction-pool",
+    "crates/trie/common",
+    "crates/trie/db",
+    "crates/trie/parallel",
+    "crates/trie/sparse",
+    "crates/trie/trie",
+]
+resolver = "2"
+
+# Vendored third-party code is linted like a registry dependency. Cargo caps the lints of
+# registry and git dependencies at `allow`; a path dependency is not capped, so without this
+# table upstream's own lint levels (including its `deny` entries) would apply under TN's
+# feature subset. Every vendored manifest inherits this table through `[lints] workspace = true`.
+# Crate roots additionally carry `#![allow(warnings, unused_extern_crates)]` because RUSTFLAGS
+# (`-D warnings` in CI) are appended after these flags.
+[workspace.lints.rust]
+warnings = "allow"
+
+[workspace.dependencies]
+reth-basic-payload-builder = { path = "crates/payload/basic" }
+reth-chain-state = { path = "crates/chain-state" }
+reth-chainspec = { path = "crates/chainspec", default-features = false }
+reth-cli-util = { path = "crates/cli/util" }
+reth-codecs = { path = "crates/storage/codecs" }
+reth-codecs-derive = { path = "crates/storage/codecs/derive" }
+reth-config = { path = "crates/config", default-features = false }
+reth-consensus = { path = "crates/consensus/consensus", default-features = false }
+reth-consensus-common = { path = "crates/consensus/common", default-features = false }
+reth-consensus-debug-client = { path = "crates/consensus/debug-client" }
+reth-db = { path = "crates/storage/db", default-features = false }
+reth-db-api = { path = "crates/storage/db-api" }
+reth-db-common = { path = "crates/storage/db-common" }
+reth-db-models = { path = "crates/storage/db-models", default-features = false }
+reth-discv4 = { path = "crates/net/discv4" }
+reth-discv5 = { path = "crates/net/discv5" }
+reth-dns-discovery = { path = "crates/net/dns" }
+reth-downloaders = { path = "crates/net/downloaders" }
+reth-ecies = { path = "crates/net/ecies" }
+reth-engine-local = { path = "crates/engine/local" }
+reth-engine-primitives = { path = "crates/engine/primitives", default-features = false }
+reth-engine-tree = { path = "crates/engine/tree" }
+reth-engine-service = { path = "crates/engine/service" }
+reth-engine-util = { path = "crates/engine/util" }
+reth-era = { path = "crates/era" }
+reth-era-downloader = { path = "crates/era-downloader" }
+reth-era-utils = { path = "crates/era-utils" }
+reth-errors = { path = "crates/errors" }
+reth-eth-wire = { path = "crates/net/eth-wire" }
+reth-eth-wire-types = { path = "crates/net/eth-wire-types" }
+reth-ethereum-payload-builder = { path = "crates/ethereum/payload" }
+reth-ethereum-consensus = { path = "crates/ethereum/consensus", default-features = false }
+reth-ethereum-engine-primitives = { path = "crates/ethereum/engine-primitives", default-features = false }
+reth-ethereum-forks = { path = "crates/ethereum/hardforks", default-features = false }
+reth-ethereum-primitives = { path = "crates/ethereum/primitives", default-features = false }
+reth-etl = { path = "crates/etl" }
+reth-evm = { path = "crates/evm/evm", default-features = false }
+reth-evm-ethereum = { path = "crates/ethereum/evm", default-features = false }
+reth-execution-errors = { path = "crates/evm/execution-errors", default-features = false }
+reth-execution-types = { path = "crates/evm/execution-types", default-features = false }
+reth-exex = { path = "crates/exex/exex" }
+reth-exex-types = { path = "crates/exex/types" }
+reth-fs-util = { path = "crates/fs-util" }
+reth-invalid-block-hooks = { path = "crates/engine/invalid-block-hooks" }
+reth-ipc = { path = "crates/rpc/ipc" }
+reth-libmdbx = { path = "crates/storage/libmdbx-rs" }
+reth-mdbx-sys = { path = "crates/storage/libmdbx-rs/mdbx-sys" }
+reth-metrics = { path = "crates/metrics" }
+reth-net-banlist = { path = "crates/net/banlist" }
+reth-net-nat = { path = "crates/net/nat" }
+reth-network = { path = "crates/net/network" }
+reth-network-api = { path = "crates/net/network-api" }
+reth-network-p2p = { path = "crates/net/p2p" }
+reth-network-peers = { path = "crates/net/peers", default-features = false }
+reth-network-types = { path = "crates/net/network-types" }
+reth-nippy-jar = { path = "crates/storage/nippy-jar" }
+reth-node-api = { path = "crates/node/api" }
+reth-node-builder = { path = "crates/node/builder" }
+reth-node-core = { path = "crates/node/core" }
+reth-node-ethstats = { path = "crates/node/ethstats" }
+reth-node-events = { path = "crates/node/events" }
+reth-node-metrics = { path = "crates/node/metrics" }
+reth-node-types = { path = "crates/node/types" }
+reth-payload-builder = { path = "crates/payload/builder" }
+reth-payload-builder-primitives = { path = "crates/payload/builder-primitives" }
+reth-payload-primitives = { path = "crates/payload/primitives" }
+reth-payload-validator = { path = "crates/payload/validator" }
+reth-primitives-traits = { path = "crates/primitives-traits", default-features = false }
+reth-provider = { path = "crates/storage/provider" }
+reth-prune = { path = "crates/prune/prune" }
+reth-prune-types = { path = "crates/prune/types", default-features = false }
+reth-revm = { path = "crates/revm", default-features = false }
+reth-rpc = { path = "crates/rpc/rpc" }
+reth-rpc-api = { path = "crates/rpc/rpc-api" }
+reth-rpc-builder = { path = "crates/rpc/rpc-builder" }
+reth-rpc-engine-api = { path = "crates/rpc/rpc-engine-api" }
+reth-rpc-eth-api = { path = "crates/rpc/rpc-eth-api" }
+reth-rpc-eth-types = { path = "crates/rpc/rpc-eth-types", default-features = false }
+reth-rpc-layer = { path = "crates/rpc/rpc-layer" }
+reth-rpc-server-types = { path = "crates/rpc/rpc-server-types" }
+reth-rpc-convert = { path = "crates/rpc/rpc-convert" }
+reth-stages = { path = "crates/stages/stages" }
+reth-stages-api = { path = "crates/stages/api" }
+reth-stages-types = { path = "crates/stages/types", default-features = false }
+reth-static-file = { path = "crates/static-file/static-file" }
+reth-static-file-types = { path = "crates/static-file/types", default-features = false }
+reth-storage-api = { path = "crates/storage/storage-api", default-features = false }
+reth-storage-errors = { path = "crates/storage/errors", default-features = false }
+reth-tasks = { path = "crates/tasks" }
+reth-tokio-util = { path = "crates/tokio-util" }
+reth-tracing = { path = "crates/tracing", default-features = false }
+reth-tracing-otlp = { path = "crates/tracing-otlp" }
+reth-transaction-pool = { path = "crates/transaction-pool" }
+reth-trie = { path = "crates/trie/trie" }
+reth-trie-common = { path = "crates/trie/common", default-features = false }
+reth-trie-db = { path = "crates/trie/db" }
+reth-trie-parallel = { path = "crates/trie/parallel" }
+reth-trie-sparse = { path = "crates/trie/sparse", default-features = false }
+reth-zstd-compressors = { path = "crates/storage/zstd-compressors", default-features = false }
+
+# revm
+revm = { version = "34.0.0", default-features = false }
+revm-bytecode = { version = "8.0.0", default-features = false }
+revm-database = { version = "10.0.0", default-features = false }
+revm-state = { version = "9.0.0", default-features = false }
+revm-primitives = { version = "22.0.0", default-features = false }
+revm-interpreter = { version = "32.0.0", default-features = false }
+revm-database-interface = { version = "9.0.0", default-features = false }
+revm-inspectors = "0.34.2"
+
+# eth
+alloy-dyn-abi = "1.5.6"
+alloy-primitives = { version = "1.5.6", default-features = false, features = [
+    "map-foldhash",
+] }
+alloy-sol-types = { version = "1.5.6", default-features = false }
+
+alloy-chains = { version = "0.2.5", default-features = false }
+alloy-eip2124 = { version = "0.2.0", default-features = false }
+alloy-eip7928 = { version = "0.3.0", default-features = false }
+alloy-evm = { version = "0.27.2", default-features = false }
+alloy-rlp = { version = "0.3.13", default-features = false, features = [
+    "core-net",
+] }
+alloy-trie = { version = "0.9.4", default-features = false }
+
+alloy-hardforks = "0.4.5"
+
+alloy-consensus = { version = "1.6.3", default-features = false }
+alloy-eips = { version = "1.6.3", default-features = false }
+alloy-genesis = { version = "1.6.3", default-features = false }
+alloy-json-rpc = { version = "1.6.3", default-features = false }
+alloy-network = { version = "1.6.3", default-features = false }
+alloy-provider = { version = "1.6.3", features = [
+    "reqwest",
+    "debug-api",
+], default-features = false }
+alloy-rpc-client = { version = "1.6.3", default-features = false }
+alloy-rpc-types = { version = "1.6.3", features = [
+    "eth",
+], default-features = false }
+alloy-rpc-types-admin = { version = "1.6.3", default-features = false }
+alloy-rpc-types-anvil = { version = "1.6.3", default-features = false }
+alloy-rpc-types-beacon = { version = "1.6.3", default-features = false }
+alloy-rpc-types-debug = { version = "1.6.3", default-features = false }
+alloy-rpc-types-engine = { version = "1.6.3", default-features = false }
+alloy-rpc-types-eth = { version = "1.6.3", default-features = false }
+alloy-rpc-types-mev = { version = "1.6.3", default-features = false }
+alloy-rpc-types-trace = { version = "1.6.3", default-features = false }
+alloy-rpc-types-txpool = { version = "1.6.3", default-features = false }
+alloy-serde = { version = "1.6.3", default-features = false }
+alloy-signer = { version = "1.6.3", default-features = false }
+alloy-signer-local = { version = "1.6.3", default-features = false }
+alloy-transport = { version = "1.6.3" }
+
+op-alloy-rpc-types-engine = { version = "0.23.1", default-features = false }
+op-alloy-consensus = { version = "0.23.1", default-features = false }
+
+# misc
+either = { version = "1.15.0", default-features = false }
+arrayvec = { version = "0.7.6", default-features = false }
+aquamarine = "0.6"
+auto_impl = "1"
+bincode = "1.3"
+bitflags = "2.4"
+boyer-moore-magiclen = "0.2.16"
+bytes = { version = "1.11.1", default-features = false }
+cfg-if = "1.0"
+clap = "4"
+dashmap = "6.0"
+derive_more = { version = "2", default-features = false, features = ["full"] }
+dirs-next = "2.0.0"
+dyn-clone = "1.0.17"
+eyre = "0.6"
+fdlimit = "0.3.0"
+fixed-map = { version = "0.9", default-features = false }
+humantime = "2.1"
+humantime-serde = "1.1"
+itertools = { version = "0.14", default-features = false }
+linked_hash_set = "0.1"
+modular-bitfield = "0.13.1"
+notify = { version = "8.0.0", default-features = false, features = [
+    "macos_fsevent",
+] }
+nybbles = { version = "0.4.8", default-features = false }
+once_cell = { version = "1.19", default-features = false, features = [
+    "critical-section",
+] }
+parking_lot = "0.12"
+rand = "0.9"
+rayon = "1.7"
+rustc-hash = { version = "2.0", default-features = false }
+schnellru = "0.2"
+serde = { version = "1.0", default-features = false }
+serde_json = { version = "1.0", default-features = false, features = ["alloc"] }
+serde_with = { version = "3", default-features = false, features = ["macros"] }
+sha2 = { version = "0.10", default-features = false }
+shellexpand = "3.0.0"
+smallvec = "1"
+strum = { version = "0.27", default-features = false }
+syn = "2.0"
+thiserror = { version = "2.0.0", default-features = false }
+tracing = { version = "0.1.0", default-features = false, features = [
+    "attributes",
+] }
+tracing-appender = "0.2"
+url = { version = "2.3", default-features = false }
+zstd = "0.13"
+byteorder = "1"
+fixed-cache = { version = "0.1.7", features = ["stats"] }
+moka = "0.12"
+chrono = "0.4.41"
+
+# metrics
+metrics = "0.24.0"
+metrics-derive = "0.1.1"
+metrics-exporter-prometheus = { version = "0.18.0", default-features = false }
+metrics-process = "2.1.0"
+metrics-util = { default-features = false, version = "0.20.0" }
+
+# proc-macros
+proc-macro2 = "1.0"
+quote = "1.0"
+
+# tokio
+tokio = { version = "1.44.2", default-features = false }
+tokio-stream = "0.1.11"
+tokio-tungstenite = "0.28.0"
+tokio-util = { version = "0.7.4", features = ["codec"] }
+
+async-trait = "0.1.68"
+futures = "0.3"
+futures-core = "0.3"
+futures-util = { version = "0.3", default-features = false }
+pin-project = "1.0.12"
+reqwest = { version = "0.12", default-features = false, features = [
+    "rustls-tls",
+    "rustls-tls-native-roots",
+    "stream",
+] }
+tracing-futures = "0.2"
+tower = "0.5"
+tower-http = "0.6"
+
+# p2p
+discv5 = "0.10"
+if-addrs = "0.14"
+
+# rpc
+jsonrpsee = "0.26.0"
+jsonrpsee-core = "0.26.0"
+jsonrpsee-server = "0.26.0"
+jsonrpsee-http-client = "0.26.0"
+jsonrpsee-types = "0.26.0"
+
+# http
+http = "1.0"
+http-body-util = "0.1.2"
+
+# crypto
+enr = { version = "0.13", default-features = false }
+secp256k1 = { version = "0.30", default-features = false, features = [
+    "global-context",
+    "recovery",
+] }
+# rand 8 for secp256k1
+rand_08 = { package = "rand", version = "0.8" }
+
+# for eip-4844
+c-kzg = "2.1.5"
+
+# config
+toml = "0.9"
+
+# otlp obs
+opentelemetry_sdk = "0.31"
+opentelemetry = "0.31"
+opentelemetry-otlp = "0.31"
+opentelemetry-semantic-conventions = "0.31"
+opentelemetry-appender-tracing = "0.31"
+tracing-opentelemetry = "0.32"
+
+tempfile = "3.20"
+
+# ssz encoding
+ethereum_ssz = "0.10.1"
+ethereum_ssz_derive = "0.10.1"
+
+tikv-jemallocator = "0.6"
+
+aes = "0.8.1"
+anyhow = "1.0"
+bindgen = { version = "0.72", default-features = false }
+block-padding = "0.3"
+cc = "1.2.15"
+cipher = "0.4.3"
+concat-kdf = "0.1.0"
+crossbeam-channel = "0.5.13"
+ctr = "0.9.2"
+data-encoding = "2"
+digest = "0.10.5"
+hickory-resolver = "0.25.0"
+hmac = "0.12.1"
+interprocess = "2.2.0"
+lz4_flex = { version = "0.12", default-features = false }
+memmap2 = "0.9.4"
+num-traits = "0.2.15"
+page_size = "0.6.0"
+parity-scale-codec = "3.2.1"
+pretty_assertions = "1.4"
+ringbuffer = "0.16.0"
+rmp-serde = "1.3"
+roaring = "0.11.3"
+rolling-file = "0.2.0"
+snap = "1.1.1"
+sysinfo = { version = "0.38", default-features = false }
+tracing-journald = "0.3"
+tracing-logfmt = "=0.3.5"
+tracing-samply = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false }
+vergen = "9.1.0"
+vergen-git2 = "9.1.0"
+
+# networking
+ipnet = "2.11"

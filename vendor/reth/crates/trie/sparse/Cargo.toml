@@ -1,0 +1,47 @@
+[package]
+name = "reth-trie-sparse"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+description = "Sparse MPT implementation"
+
+[lints]
+workspace = true
+
+[dependencies]
+# reth
+reth-primitives-traits.workspace = true
+reth-execution-errors.workspace = true
+reth-trie-common.workspace = true
+tracing = { workspace = true, features = ["attributes"] }
+alloy-trie.workspace = true
+
+# alloy
+alloy-primitives.workspace = true
+alloy-rlp.workspace = true
+
+# misc
+auto_impl.workspace = true
+rayon = { workspace = true, optional = true }
+smallvec.workspace = true
+
+# metrics
+reth-metrics = { workspace = true, optional = true }
+metrics = { workspace = true, optional = true }
+
+[features]
+std = [
+    "dep:rayon",
+    "alloy-primitives/std",
+    "alloy-rlp/std",
+    "alloy-trie/std",
+    "reth-execution-errors/std",
+    "reth-primitives-traits/std",
+    "reth-primitives-traits/rayon",
+    "reth-trie-common/std",
+    "tracing/std",
+]
+metrics = ["dep:reth-metrics", "dep:metrics", "std"]

@@ -1,0 +1,51 @@
+[package]
+name = "reth-network-p2p"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+description = "traits and commonly used types for p2p and network communication"
+
+[lints]
+workspace = true
+
+[dependencies]
+# reth
+reth-ethereum-primitives.workspace = true
+reth-primitives-traits.workspace = true
+reth-eth-wire-types.workspace = true
+reth-consensus.workspace = true
+reth-network-peers.workspace = true
+reth-network-types.workspace = true
+reth-storage-errors.workspace = true
+
+# ethereum
+alloy-consensus.workspace = true
+alloy-eips.workspace = true
+alloy-primitives = { workspace = true, features = ["rand"] }
+
+# async
+futures.workspace = true
+tokio = { workspace = true, features = ["sync"] }
+
+# misc
+auto_impl.workspace = true
+tracing.workspace = true
+derive_more.workspace = true
+
+[features]
+default = ["std"]
+std = [
+    "reth-consensus/std",
+    "reth-ethereum-primitives/std",
+    "alloy-eips/std",
+    "alloy-primitives/std",
+    "reth-primitives-traits/std",
+    "alloy-consensus/std",
+    "derive_more/std",
+    "reth-network-peers/std",
+    "reth-storage-errors/std",
+    "tracing/std",
+]

@@ -1,0 +1,51 @@
+[package]
+name = "reth-db-models"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+description = "Database models used in storage module."
+
+[lints]
+workspace = true
+
+[dependencies]
+# reth
+reth-codecs = { workspace = true, optional = true }
+reth-primitives-traits.workspace = true
+
+# ethereum
+alloy-primitives.workspace = true
+alloy-eips.workspace = true
+
+# codecs
+modular-bitfield = { workspace = true, optional = true }
+serde = { workspace = true, optional = true }
+
+# misc
+bytes = { workspace = true, optional = true }
+
+[features]
+std = [
+    "alloy-eips/std",
+    "alloy-primitives/std",
+    "reth-primitives-traits/std",
+    "bytes?/std",
+    "serde?/std",
+]
+serde = [
+    "dep:serde",
+    "alloy-eips/serde",
+    "alloy-primitives/serde",
+    "bytes?/serde",
+    "reth-codecs?/serde",
+    "reth-primitives-traits/serde",
+]
+reth-codec = [
+    "dep:reth-codecs",
+    "dep:modular-bitfield",
+    "dep:bytes",
+    "reth-primitives-traits/reth-codec",
+]

@@ -1,0 +1,44 @@
+[package]
+name = "reth-db-api"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+description = "Database abstraction used in reth."
+
+[lints]
+workspace = true
+
+[dependencies]
+# reth
+reth-codecs.workspace = true
+reth-db-models = { workspace = true, features = ["serde", "reth-codec"] }
+reth-ethereum-primitives = { workspace = true, features = ["serde", "reth-codec"] }
+reth-primitives-traits = { workspace = true, features = ["serde", "reth-codec"] }
+reth-stages-types = { workspace = true, features = ["serde", "reth-codec"] }
+reth-prune-types = { workspace = true, features = ["serde", "reth-codec"] }
+reth-storage-errors.workspace = true
+reth-trie-common.workspace = true
+
+# ethereum
+alloy-primitives.workspace = true
+alloy-genesis.workspace = true
+alloy-consensus.workspace = true
+
+# codecs
+modular-bitfield.workspace = true
+roaring.workspace = true
+parity-scale-codec = { workspace = true, features = ["bytes"] }
+serde = { workspace = true, default-features = false }
+
+# metrics
+metrics.workspace = true
+
+# misc
+arrayvec.workspace = true
+derive_more.workspace = true
+bytes.workspace = true
+
+[features]
