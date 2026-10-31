@@ -310,3 +310,8 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
     offsets before writing the config (or drops the stale in-memory offset when all were
     pruned), so a crash cannot leave a config that claims rows whose offsets are not on disk
     (`nippy-jar/src/{writer.rs, lib.rs}`; upstream's two tests fail without the fix).
+  - 22e3708b2: the last value of a jar ends at its final offset, not at the end of the data
+    file, so reading the tip row while persistence appends uncommitted rows no longer returns
+    extra bytes; offsets read through a stale mmap during a prune return `InconsistentState`
+    instead of panicking on a bad slice (`nippy-jar/src/{cursor.rs, lib.rs}`,
+    `provider/src/providers/static_file/mod.rs`; upstream's three tests fail without the fix).
