@@ -703,13 +703,14 @@ fn every_crash_point_recovers_a_dup_table() {
     }
 }
 
-/// The dup matrix at every bound and two page sizes, with many random power losses.
+/// The dup matrix at every bound and two page sizes, with many random power losses (20 seeds a
+/// bound: three bounds at 40 took about 12 minutes, past the heavy suite's budget).
 #[test]
 #[ignore = "heavy: run with --release"]
 fn every_crash_point_recovers_a_dup_table_heavy() {
     for page_size in [4096, 16384] {
         for bound in Bound::ALL {
-            matrix(&dup_base(page_size, bound), 40);
+            matrix(&dup_base(page_size, bound), 20);
         }
     }
 }
