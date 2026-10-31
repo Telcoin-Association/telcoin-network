@@ -56,4 +56,6 @@ pub use env::{Env, EnvOptions, EnvStat, SyncMode};
 pub use error::{Error, Result};
 pub use stats::IoStats;
 pub use tree::cursor::{Cursor, KeyTail};
-pub use txn::{ReadTxn, RoCursor, RoTxn, RwCursor, RwTxn, Table, TableStat, TxnCursor};
+pub use txn::{
+    DupRoCursor, ReadTxn, RoCursor, RoTxn, RwCursor, RwTxn, Table, TableStat, TxnCursor,
+};

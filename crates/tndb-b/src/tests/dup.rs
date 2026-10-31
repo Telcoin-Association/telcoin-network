@@ -49,7 +49,7 @@ fn check_dup(env: &Env, name: &str) -> CheckReport {
 }
 
 /// A copy of the file at `path`, opened.
-fn copy_of(path: &Path) -> (TempDir, Env) {
+pub(super) fn copy_of(path: &Path) -> (TempDir, Env) {
     let (dir, copy) = temp("tndb_b_dup_case");
     fs::copy(path, &copy).expect("copy");
     let env = open(&copy, SyncMode::Durable);
@@ -1100,16 +1100,16 @@ fn dup_totals_follow_every_change() {
 }
 
 /// The outer key of [`damaged`]'s large nested tree, of two levels with a value in a run.
-const HOT: u32 = 7;
+pub(super) const HOT: u32 = 7;
 
 /// An outer key of [`damaged`]'s with a nested tree of one leaf.
-const COLD: u32 = 8;
+pub(super) const COLD: u32 = 8;
 
 /// A cleanly closed file `dir/db` holding dup table `d` (of [`OPTIONS`]): outer keys 0 to 39 with
 /// 1 to 3 rows of 1-byte subkeys each, but [`HOT`] with 300 rows and a value in a run; then
 /// `forge` damaged it, given the path and the committed outer cells (each key's outer leaf and
 /// the nested root its cell names). Returns the path and the rows.
-fn damaged(
+pub(super) fn damaged(
     dir: &Path,
     forge: impl FnOnce(&Path, &BTreeMap<u32, (u32, TreeRoot)>),
 ) -> (PathBuf, Rows) {

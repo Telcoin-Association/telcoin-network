@@ -19,6 +19,7 @@ use crate::{
 };
 
 pub(crate) mod cursor;
+pub(crate) mod dup_cursor;
 pub(crate) mod read;
 #[cfg(test)]
 pub(crate) mod test_harness;

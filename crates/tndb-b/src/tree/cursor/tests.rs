@@ -17,20 +17,20 @@ use crate::{
     Env, EnvOptions, ReadTxn, RoCursor, Table,
 };
 
-type Kv = (Vec<u8>, Vec<u8>);
+pub(crate) type Kv = (Vec<u8>, Vec<u8>);
 
-fn owned(entry: Option<(&[u8], &[u8])>) -> Option<Kv> {
+pub(crate) fn owned(entry: Option<(&[u8], &[u8])>) -> Option<Kv> {
     entry.map(|(k, v)| (k.to_vec(), v.to_vec()))
 }
 
 /// An entry as a `current_with_key_tail(t)` gives it, in the model's form: the key, and the key's
 /// last `t` bytes followed by the value.
-fn joined(key: &[u8], t: usize, value: &[u8]) -> Kv {
+pub(crate) fn joined(key: &[u8], t: usize, value: &[u8]) -> Kv {
     (key.to_vec(), [&key[key.len() - t.min(key.len())..], value].concat())
 }
 
 /// A cursor's [`KeyTail`] entry in the model's form ([`joined`]; an overflow value joined here).
-fn owned_tail(entry: Option<(&[u8], KeyTail<'_>)>, t: usize) -> Option<Kv> {
+pub(crate) fn owned_tail(entry: Option<(&[u8], KeyTail<'_>)>, t: usize) -> Option<Kv> {
     entry.map(|(key, tail)| match tail {
         KeyTail::Joined(slice) => (key.to_vec(), slice.to_vec()),
         KeyTail::Apart(value) => joined(key, t, value),

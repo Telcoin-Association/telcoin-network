@@ -22,10 +22,11 @@ use crate::{
     freelist,
     latch::UnwindLatch,
     meta::Meta,
-    page::{self, Val},
+    page,
     stats::elapsed_ns,
     tree::{
         cursor::{self, Cursor, Entry, KeyTail, State, TreeCursor},
+        dup_cursor::{nested_cell, DupWalk, NestedRoots},
         read,
         write::{self, PutKind},
         PageRead, PageWrite, TreeRoot,
@@ -220,18 +221,7 @@ fn outer_cell<'s, S: PageRead + ?Sized>(
     outer: &TreeRoot,
     k: &[u8],
 ) -> Result<Option<&'s [u8; page::NESTED_CELL]>> {
-    match read::find_outer(store, outer, k)? {
-        None => Ok(None),
-        Some(Val::Nested(b)) => Ok(Some(b)),
-        Some(Val::Inline(_)) => Err(Error::Corrupt(format!(
-            "dup table {}: the outer cell of key {k:02x?} holds no nested tree",
-            table.name()
-        ))),
-        Some(Val::Overflow(_)) => Err(Error::Corrupt(format!(
-            "dup table {}: an overflow cell in a dup table's outer tree (key {k:02x?})",
-            table.name()
-        ))),
-    }
+    read::find_outer(store, outer, k)?.map(|val| nested_cell(table.name(), k, val)).transpose()
 }
 
 /// The nested root an outer cell of key `k` holds (`b`), decoded and checked: a cell names a
@@ -802,6 +792,22 @@ impl RoTxn {
         let root = self.read(|_| self.root(table))?;
         Ok(RoCursor { txn: Arc::clone(self), root, tree: TreeCursor::default() })
     }
+
+    /// A new, unset cursor over the dup table `table` that owns a share of this transaction, as
+    /// [`Self::cursor_owned`]'s does (see [`DupRoCursor`]). [`Error::TableKind`] for a plain
+    /// table.
+    pub fn dup_cursor_owned(self: &Arc<Self>, table: &Table) -> Result<DupRoCursor> {
+        let (outer_root, dup) = self.read(|_| self.resolved(table))?;
+        let Some(dup) = dup else {
+            return Err(Error::TableKind(table.name().to_string()));
+        };
+        Ok(DupRoCursor {
+            txn: Arc::clone(self),
+            outer_root,
+            table: table.clone(),
+            walk: DupWalk::new(usize::from(dup.key_len)),
+        })
+    }
 }
 
 /// A cursor over one table of a read-only transaction that owns a share of the transaction
@@ -992,6 +998,266 @@ impl RoCursor {
             c.step_in_prefix(store, root, None, n, false).map(cursor::entry)
         })
     }
+}
+
+/// A reader's nested roots: each outer cell's own ([`cell_root`]), a snapshot's cells being its
+/// truth.
+struct SnapshotRoots<'a> {
+    table: &'a Table,
+}
+
+impl NestedRoots for SnapshotRoots<'_> {
+    fn name(&self) -> &str {
+        self.table.name()
+    }
+
+    #[inline]
+    fn root(&mut self, k: &[u8], cell: &[u8; page::NESTED_CELL]) -> Result<TreeRoot> {
+        cell_root(self.table, k, cell)
+    }
+}
+
+/// A cursor over one dup table of a read-only transaction that owns a share of the transaction
+/// (created by [`RoTxn::dup_cursor_owned`] on an `Arc<RoTxn>`), as a [`RoCursor`] does.
+///
+/// It walks the table's rows as the logical keys `k ‖ s` in order, the rows of the composite
+/// twin (a plain table keyed `k ‖ s` holding the same rows), and every call gives what the same
+/// call of a [`RoCursor`] gives on the twin: the same states, edge rules and prefix steps (a
+/// prefix of at least the key width `K` never leaves the outer key, since no other outer key
+/// shares its `K` bytes), and [`Self::seek_exact`] of a key of at most `K` bytes misses. Two
+/// calls differ by design: [`Self::current_with_key_tail`] with a tail longer than the subkey
+/// gives the value apart, and the bounded seeks ([`Self::seek_key`], [`Self::seek_dup`],
+/// [`Self::seek_dup_with_key_tail`]) stay inside one outer key and leave the cursor unset when
+/// it has no such row, reading no other key's nested tree.
+///
+/// The key a call returns is the cursor's copy of the logical key (no page holds `k ‖ s` in one
+/// piece); the value borrows the snapshot. Both borrow the cursor until its next call. A move
+/// inside an outer key starts from the nested leaf the cursor is at, a move to another key from
+/// the outer leaf, each fetched again without the per-fetch checks it passed when the cursor
+/// entered it, as [`RoCursor`]'s moves fetch their leaf.
+///
+/// Damage a move finds is [`Error::Corrupt`], leaves the cursor unset and latches the environment
+/// (later writes fail; reads continue): a cell that is not a nested cell, an empty or damaged
+/// nested root, an outer key of another width than the table's, and every check of a descent.
+pub struct DupRoCursor {
+    txn: Arc<RoTxn>,
+    /// The table's outer tree in the transaction's snapshot.
+    outer_root: TreeRoot,
+    table: Table,
+    walk: DupWalk,
+}
+
+impl std::fmt::Debug for DupRoCursor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DupRoCursor")
+            .field("txn", &self.txn.snapshot.meta.txn)
+            .field("table", &self.table.name())
+            .field("state", &self.walk.state())
+            .finish_non_exhaustive()
+    }
+}
+
+/// What a walker's move gives a dup cursor shell: the value of the row it landed on.
+type Walked<'s> = Result<Option<&'s [u8]>>;
+
+impl DupRoCursor {
+    /// Test-only: where the cursor is.
+    #[cfg(test)]
+    pub(crate) fn state(&self) -> cursor::State {
+        self.walk.state()
+    }
+
+    /// Run a walker move over the snapshot, latching damage it finds, and pair the value it
+    /// returns with the logical key. `op` takes the walker, the snapshot, the outer root and the
+    /// root source.
+    #[inline]
+    fn walked<'c>(
+        &'c mut self,
+        op: impl FnOnce(&mut DupWalk, &'c Snapshot, &TreeRoot, &mut SnapshotRoots<'_>) -> Walked<'c>,
+    ) -> Result<Option<(&'c [u8], &'c [u8])>> {
+        let Self { txn, outer_root, table, walk } = self;
+        let txn: &'c RoTxn = txn;
+        let mut roots = SnapshotRoots { table };
+        let value = op(walk, &txn.snapshot, outer_root, &mut roots)
+            .inspect_err(|e| txn.inner.latch.latch_error(e))?;
+        let walk: &'c DupWalk = walk;
+        Ok(value.map(|v| (walk.key(), v)))
+    }
+
+    /// Move to the first row and return it (`None` for an empty table).
+    pub fn first(&mut self) -> Result<Option<(&[u8], &[u8])>> {
+        self.walked(|w, store, root, roots| w.start(store, root, roots, true))
+    }
+
+    /// Move to the last row and return it (`None` for an empty table).
+    pub fn last(&mut self) -> Result<Option<(&[u8], &[u8])>> {
+        self.walked(|w, store, root, roots| w.start(store, root, roots, false))
+    }
+
+    /// Move to the next row and return it; see [`Cursor::next`].
+    // A cursor's moves are fallible and go both ways: it is not an `Iterator`.
+    #[allow(clippy::should_implement_trait)]
+    pub fn next(&mut self) -> Result<Option<(&[u8], &[u8])>> {
+        self.walked(|w, store, root, roots| w.step(store, root, roots, &again(store), true))
+    }
+
+    /// Move to the previous row and return it; see [`Cursor::prev`].
+    pub fn prev(&mut self) -> Result<Option<(&[u8], &[u8])>> {
+        self.walked(|w, store, root, roots| w.step(store, root, roots, &again(store), false))
+    }
+
+    /// The row the cursor is at, if it is at one. The cursor does not move.
+    pub fn current(&self) -> Result<Option<(&[u8], &[u8])>> {
+        let snapshot = &*self.txn.snapshot;
+        let value = self
+            .walk
+            .current(snapshot, &again(snapshot))
+            .inspect_err(|e| self.txn.inner.latch.latch_error(e))?;
+        Ok(value.map(|v| (self.walk.key(), v)))
+    }
+
+    /// The row the cursor is at, if it is at one, as its logical key and its value with the key's
+    /// last `t` bytes before it ([`KeyTail`]). A tail inside the subkey (`t <= |s|`) and an inline
+    /// value come [`KeyTail::Joined`], one slice of the nested leaf; a value in a run, and any
+    /// `t > |s|`, come [`KeyTail::Apart`], for the caller to join `key[key.len() - min(t,
+    /// key.len())..]`. Either way the bytes are those [`RoCursor::current_with_key_tail`] gives on
+    /// the twin. The cursor does not move.
+    pub fn current_with_key_tail(&self, t: usize) -> Result<Option<(&[u8], KeyTail<'_>)>> {
+        let snapshot = &*self.txn.snapshot;
+        let tail = self
+            .walk
+            .current_with_key_tail(snapshot, &again(snapshot), t)
+            .inspect_err(|e| self.txn.inner.latch.latch_error(e))?;
+        Ok(tail.map(|tail| (self.walk.key(), tail)))
+    }
+
+    /// Move to the first row whose logical key is `>= key` (of any length) and return it; `None`
+    /// (the cursor after the end) if there is none. From a row of the outer key `key` starts
+    /// with, the outer tree is not read again and the nested seek starts from the nested leaf
+    /// the cursor is at; from a row of another key the outer seek starts from the outer leaf it
+    /// is at (see [`Cursor::seek`]).
+    //
+    // A cursor not at a row seeks from the roots with no leaf, as `RoCursor::seek` does; a
+    // cursor at a row makes one call, `seek_at_row`. The other seeks are built the same way.
+    #[inline]
+    pub fn seek(&mut self, key: &[u8]) -> Result<Option<(&[u8], &[u8])>> {
+        if self.walk.state() == State::At {
+            self.seek_at_row(key)
+        } else {
+            self.walked(|w, store, root, roots| w.seek(store, root, roots, &no_leaf, key))
+        }
+    }
+
+    /// [`Self::seek`] from a row: from the leaves the cursor is at. Never inlined, as
+    /// [`RoCursor::seek`]'s seek from an entry is not.
+    #[inline(never)]
+    fn seek_at_row(&mut self, key: &[u8]) -> Result<Option<(&[u8], &[u8])>> {
+        self.walked(|w, store, root, roots| w.seek(store, root, roots, &again(store), key))
+    }
+
+    /// [`Self::seek`] followed by [`Self::current_with_key_tail`]: move to the first row whose
+    /// logical key is `>= key` and return it as its key and its value with the key's last `t`
+    /// bytes ([`KeyTail`]); `None` (the cursor after the end) if there is none.
+    #[inline]
+    pub fn seek_with_key_tail(
+        &mut self,
+        key: &[u8],
+        t: usize,
+    ) -> Result<Option<(&[u8], KeyTail<'_>)>> {
+        self.seek(key)?;
+        self.current_with_key_tail(t)
+    }
+
+    /// Move to the row `key` and return its value; `None` (the cursor unset) if there is none. A
+    /// key of at most the key width is no row's and misses with no read. The seek starts as
+    /// [`Self::seek`]'s does.
+    #[inline]
+    pub fn seek_exact(&mut self, key: &[u8]) -> Result<Option<&[u8]>> {
+        let found = if self.walk.state() == State::At {
+            self.seek_exact_at_row(key)
+        } else {
+            self.walked(|w, store, root, roots| w.seek_exact(store, root, roots, &no_leaf, key))
+        };
+        Ok(found?.map(|(_, v)| v))
+    }
+
+    /// [`Self::seek_exact`] from a row, never inlined as [`Self::seek_at_row`] is not.
+    #[inline(never)]
+    fn seek_exact_at_row(&mut self, key: &[u8]) -> Result<Option<(&[u8], &[u8])>> {
+        self.walked(|w, store, root, roots| w.seek_exact(store, root, roots, &again(store), key))
+    }
+
+    /// Move to the first row of the outer key `k` and return it; `None` (the cursor unset) if `k`
+    /// has no row. No other key's nested tree is read (a miss reads only the neighbouring outer
+    /// key). A `k` of another length than the table's key width is [`Error::KeyTooShort`] or
+    /// [`Error::KeyTooLarge`], the cursor unmoved.
+    pub fn seek_key(&mut self, k: &[u8]) -> Result<Option<(&[u8], &[u8])>> {
+        self.seek_dup(k, &[])
+    }
+
+    /// Move to the first row `k ‖ s'` of the outer key `k` with `s' >= s` and return it; `None`
+    /// (the cursor unset) if `k` has none, never a row of the next key. [`Self::seek_key`]'s rules;
+    /// an empty `s` is [`Self::seek_key`]. From a row of `k` the outer tree is not read again and
+    /// the nested seek starts from the nested leaf the cursor is at.
+    #[inline]
+    pub fn seek_dup(&mut self, k: &[u8], s: &[u8]) -> Result<Option<(&[u8], &[u8])>> {
+        if self.walk.state() == State::At {
+            self.seek_dup_at_row(k, s)
+        } else {
+            self.walked(|w, store, root, roots| w.seek_dup(store, root, roots, &no_leaf, k, s))
+        }
+    }
+
+    /// [`Self::seek_dup`] from a row, never inlined as [`Self::seek_at_row`] is not.
+    #[inline(never)]
+    fn seek_dup_at_row(&mut self, k: &[u8], s: &[u8]) -> Result<Option<(&[u8], &[u8])>> {
+        self.walked(|w, store, root, roots| w.seek_dup(store, root, roots, &again(store), k, s))
+    }
+
+    /// [`Self::seek_dup`] followed by [`Self::current_with_key_tail`]: move to the first row `k ‖
+    /// s'` of `k` with `s' >= s` and return it as its key and its value with the key's last `t`
+    /// bytes ([`KeyTail`]); `None` (the cursor unset) if `k` has none.
+    #[inline]
+    pub fn seek_dup_with_key_tail(
+        &mut self,
+        k: &[u8],
+        s: &[u8],
+        t: usize,
+    ) -> Result<Option<(&[u8], KeyTail<'_>)>> {
+        self.seek_dup(k, s)?;
+        self.current_with_key_tail(t)
+    }
+
+    /// Move to the next row only if its logical key shares the first `n` bytes of the current
+    /// row's, and return it; else return `None` and stay at the current row. The edge rules are
+    /// [`Cursor::next_in_prefix`]'s.
+    pub fn next_in_prefix(&mut self, n: usize) -> Result<Option<(&[u8], &[u8])>> {
+        self.walked(|w, store, root, roots| {
+            w.step_in_prefix(store, root, roots, &again(store), n, true)
+        })
+    }
+
+    /// Move to the previous row only if its logical key shares the first `n` bytes of the current
+    /// row's, and return it; else return `None` and stay at the current row. The edge rules are
+    /// [`Cursor::prev_in_prefix`]'s.
+    pub fn prev_in_prefix(&mut self, n: usize) -> Result<Option<(&[u8], &[u8])>> {
+        self.walked(|w, store, root, roots| {
+            w.step_in_prefix(store, root, roots, &again(store), n, false)
+        })
+    }
+}
+
+/// A snapshot's fetch of a leaf a dup cursor is at, for a move from it: the page again, without
+/// the per-fetch checks it passed when the cursor entered it ([`Snapshot::page_again`]).
+#[inline(always)]
+fn again<'s>(snapshot: &'s Snapshot) -> impl Fn(u32) -> Result<Option<&'s [u8]>> + 's {
+    move |pgno| Ok(snapshot.page_again(pgno))
+}
+
+/// The leaf fetch of a cursor not at a row: no leaf, so a move descends from the roots.
+#[inline(always)]
+fn no_leaf<'s>(_: u32) -> Result<Option<&'s [u8]>> {
+    Ok(None)
 }
 
 impl ReadTxn for RoTxn {
