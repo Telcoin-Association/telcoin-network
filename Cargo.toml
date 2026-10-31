@@ -42,7 +42,14 @@ members = [
 # Carried libp2p patches are wired in through `[patch.crates-io]` below and kept out of
 # the workspace so that upstream code is not held to the house lints. Each patch has a PATCH.md
 # maintenance record.
-exclude = ["patches/libp2p-quic", "patches/libp2p-connection-limits", "patches/quinn-proto"]
+# `vendor/reth` holds reth v1.11.3 as path dependencies (see vendor/reth/VENDOR.md) and is
+# excluded for the same reason: its crates are built, not linted or tested, by this workspace.
+exclude = [
+    "patches/libp2p-quic",
+    "patches/libp2p-connection-limits",
+    "patches/quinn-proto",
+    "vendor/reth",
+]
 
 # Explicitly set the resolver to version 2, which is the default for packages with edition >= 2021
 # https://doc.rust-lang.org/edition-guide/rust-2021/default-cargo-resolver.html
@@ -117,55 +124,54 @@ rpassword = "7.4.0"
 # The off-by-default `tndb-b` feature on tn-reth / tn-node / telcoin-network-cli /
 # telcoin-network swaps TN's reth database from MDBX to the tndb-b engine (`tndb-b-reth`);
 # MDBX stays compiled either way.
-reth-primitives = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
-reth-primitives-traits = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
-reth-chainspec = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
-reth-chain-state = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
-reth-config = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
-reth-db = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
-reth-db-api = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
-reth-db-common = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
-reth-engine-primitives = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
+reth-primitives = { path = "vendor/reth/crates/primitives" }
+reth-primitives-traits = { path = "vendor/reth/crates/primitives-traits" }
+reth-chainspec = { path = "vendor/reth/crates/chainspec" }
+reth-chain-state = { path = "vendor/reth/crates/chain-state" }
+reth-config = { path = "vendor/reth/crates/config" }
+reth-db = { path = "vendor/reth/crates/storage/db" }
+reth-db-api = { path = "vendor/reth/crates/storage/db-api" }
+reth-db-common = { path = "vendor/reth/crates/storage/db-common" }
+reth-engine-primitives = { path = "vendor/reth/crates/engine/primitives" }
 # Without `std`, as every reth crate takes it: tn-reth only names its payload types.
-reth-ethereum-engine-primitives = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3", default-features = false }
-reth-ethereum-primitives = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
-reth-evm-ethereum = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
-reth-evm-config = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
-reth-network = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
-reth-network-api = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
-reth-network-peers = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
-reth-evm = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
-reth-execution-types = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
+reth-ethereum-engine-primitives = { path = "vendor/reth/crates/ethereum/engine-primitives", default-features = false }
+reth-ethereum-primitives = { path = "vendor/reth/crates/ethereum/primitives" }
+reth-evm-ethereum = { path = "vendor/reth/crates/ethereum/evm" }
+reth-network = { path = "vendor/reth/crates/net/network" }
+reth-network-api = { path = "vendor/reth/crates/net/network-api" }
+reth-network-peers = { path = "vendor/reth/crates/net/peers" }
+reth-evm = { path = "vendor/reth/crates/evm/evm" }
+reth-execution-types = { path = "vendor/reth/crates/evm/execution-types" }
 # `portable` is one of the `reth` umbrella's default features (`reth-revm/portable`);
 # unification applies it to every reth crate's copy of reth-revm.
-reth-revm = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3", features = ["portable"] }
-reth-rpc = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
-reth-rpc-api = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
-reth-rpc-builder = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
-reth-rpc-eth-api = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
-reth-rpc-eth-types = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
-reth-tracing = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
-reth-provider = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
-reth-prune = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
-reth-prune-types = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
-reth-stages = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
-reth-stages-types = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
-reth-trie = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
-reth-trie-db = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
-reth-tasks = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
-reth-tokio-util = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
-reth-transaction-pool = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
-reth-consensus = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
-reth-node-builder = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
-reth-node-core = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
-reth-node-ethereum = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
-reth-discv4 = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
-reth-eth-wire = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
-reth-cli-util = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
-reth-errors = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
-reth-storage-errors = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
-reth-libmdbx = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
-reth-metrics = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
+reth-revm = { path = "vendor/reth/crates/revm", features = ["portable"] }
+reth-rpc = { path = "vendor/reth/crates/rpc/rpc" }
+reth-rpc-api = { path = "vendor/reth/crates/rpc/rpc-api" }
+reth-rpc-builder = { path = "vendor/reth/crates/rpc/rpc-builder" }
+reth-rpc-eth-api = { path = "vendor/reth/crates/rpc/rpc-eth-api" }
+reth-rpc-eth-types = { path = "vendor/reth/crates/rpc/rpc-eth-types" }
+reth-tracing = { path = "vendor/reth/crates/tracing" }
+reth-provider = { path = "vendor/reth/crates/storage/provider" }
+reth-prune = { path = "vendor/reth/crates/prune/prune" }
+reth-prune-types = { path = "vendor/reth/crates/prune/types" }
+reth-stages = { path = "vendor/reth/crates/stages/stages" }
+reth-stages-types = { path = "vendor/reth/crates/stages/types" }
+reth-trie = { path = "vendor/reth/crates/trie/trie" }
+reth-trie-db = { path = "vendor/reth/crates/trie/db" }
+reth-tasks = { path = "vendor/reth/crates/tasks" }
+reth-tokio-util = { path = "vendor/reth/crates/tokio-util" }
+reth-transaction-pool = { path = "vendor/reth/crates/transaction-pool" }
+reth-consensus = { path = "vendor/reth/crates/consensus/consensus" }
+reth-node-builder = { path = "vendor/reth/crates/node/builder" }
+reth-node-core = { path = "vendor/reth/crates/node/core" }
+reth-node-ethereum = { path = "vendor/reth/crates/ethereum/node" }
+reth-discv4 = { path = "vendor/reth/crates/net/discv4" }
+reth-eth-wire = { path = "vendor/reth/crates/net/eth-wire" }
+reth-cli-util = { path = "vendor/reth/crates/cli/util" }
+reth-errors = { path = "vendor/reth/crates/errors" }
+reth-storage-errors = { path = "vendor/reth/crates/storage/errors" }
+reth-libmdbx = { path = "vendor/reth/crates/storage/libmdbx-rs" }
+reth-metrics = { path = "vendor/reth/crates/metrics" }
 
 # eth
 alloy = { version = "1.6.3", features = ["full"] }
