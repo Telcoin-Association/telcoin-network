@@ -465,6 +465,8 @@ pub(crate) struct Walk {
     pub(crate) leaves: Vec<u32>,
     /// The pages of the overflow runs the leaves name.
     pub(crate) overflow_pages: usize,
+    /// The keys of a packing walk's inline cells (packed sets), each also in `entries`.
+    pub(crate) packed: std::collections::BTreeSet<Vec<u8>>,
 }
 
 /// A walk of one tree, checking its structure (see [`walk_tree`]).
@@ -516,6 +518,7 @@ impl<'s, S: PageRead + ?Sized> Walker<'s, S> {
                         continue;
                     }
                     Val::Inline(set) if self.packing => {
+                        self.walk.packed.insert(k.to_vec());
                         self.walk.entries.push((k.to_vec(), set.to_vec()));
                         continue;
                     }

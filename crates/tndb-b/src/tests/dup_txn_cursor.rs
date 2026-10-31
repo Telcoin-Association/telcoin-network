@@ -13,7 +13,7 @@ use tempfile::TempDir;
 
 use super::{
     damage::{restamped, P},
-    dup::{copy_of, damaged, dup_key, restamp_cell, COLD, HOT, OPTIONS},
+    dup::{copy_of, damaged, dup_key, restamp_cell, Bound, COLD, HOT, OPTIONS},
     open, temp, Rows,
 };
 use crate::{
@@ -491,6 +491,11 @@ struct Seen {
     shares: [u32; 2],
     /// Steps that left the dup cursor at a row of a nested key, and of a packed key.
     at_rows: [u32; 2],
+    /// Another writer's change to the packed key a cursor was in: a rewrite in place (the key
+    /// still packed), a promotion, the key emptied, its `delete_prefix`.
+    packed_under: [u32; 4],
+    /// A cursor's next call after a packed rewrite in place under it that reseeked.
+    reseeks_after_packed_rewrite: u32,
 }
 
 impl Seen {
@@ -533,8 +538,19 @@ impl Seen {
             ("shares false", self.shares[0]),
             ("shares true", self.shares[1]),
         ];
+        let packed = [
+            ("at a packed row", self.at_rows[1]),
+            ("packed rewrites under a cursor", self.packed_under[0]),
+            ("promotions under a cursor", self.packed_under[1]),
+            ("packed keys emptied under a cursor", self.packed_under[2]),
+            ("delete_prefix of a packed key under a cursor", self.packed_under[3]),
+            ("reseeks after a packed rewrite", self.reseeks_after_packed_rewrite),
+        ];
         if packing {
-            gates.push(("at a packed row", self.at_rows[1]));
+            gates.extend(packed);
+        } else {
+            let seen: Vec<_> = packed.iter().filter(|(_, n)| *n > 0).collect();
+            assert!(seen.is_empty(), "packed cases in a table that never packs: {seen:?}");
         }
         let classes = [
             ("n<K across", 1),
@@ -563,11 +579,12 @@ fn leak(name: String) -> &'static str {
 }
 
 /// Oracle 2b over `seeds`: twins of [`OUTER`]'s keys (the third with `big` rows, the others a
-/// few) and `fillers` [`filler`] keys of one row, `d` created with `options`; `rounds` write
-/// transactions, each with `pairs` cursor pairs taking `steps` random steps between them, a pair
-/// now and then replaced by a new one; each round commits (the file then checks) or aborts. Each
-/// step's results and the stepped pair's states are compared, and half the time its
-/// `follower_shares_prefix` around `K`; the coverage gates must all be reached.
+/// few; in a table that packs, the last three [`at_the_bound`], so a put promotes them) and
+/// `fillers` [`filler`] keys of one row, `d` created with `options`; `rounds` write transactions,
+/// each with `pairs` cursor pairs taking `steps` random steps between them, a pair now and then
+/// replaced by a new one; each round commits (the file then checks) or aborts. Each step's results
+/// and the stepped pair's states are compared, and half the time its `follower_shares_prefix`
+/// around `K`; the coverage gates must all be reached.
 fn lockstep(
     options: DupOptions,
     seeds: std::ops::Range<u64>,
@@ -587,7 +604,11 @@ fn lockstep(
         let mut keys: Vec<(u32, u16)> = OUTER
             .iter()
             .enumerate()
-            .map(|(i, &k)| (k, if i == 2 { big } else { 1 + i as u16 * 3 }))
+            .map(|(i, &k)| match i {
+                2 => (k, big),
+                5.. if options.packed_max != 0 => (k, at_the_bound(k, options)),
+                _ => (k, 1 + i as u16 * 3),
+            })
             .collect();
         keys.extend((0..fillers).map(|i| (filler(i), 1)));
         keys.sort_unstable();
@@ -608,16 +629,24 @@ fn lockstep(
             let mut txn = env.begin_rw().expect("rw");
             let mut round_model = model.clone();
             let mut pairs: Vec<_> = (0..pairs).map(|_| pair(&txn, &d, &p)).collect();
+            // A pair's dup cursor's reseeks when a packed rewrite in place went under it.
+            let mut rewritten: Vec<Option<u32>> = vec![None; pairs.len()];
             for step in 0..steps {
                 let j = rng.below(pairs.len() as u64) as usize;
                 if rng.below(400) == 0 {
                     pairs[j] = pair(&txn, &d, &p);
+                    rewritten[j] = None;
                 }
                 let op = Step::pick(&mut rng, &round_model, fillers);
-                let before: Vec<(Option<Vec<u8>>, bool)> = match op.is_direct_write() {
+                let before: Vec<(Option<Vec<u8>>, bool, Option<bool>)> = match op.is_direct_write()
+                {
                     true => pairs
                         .iter()
-                        .map(|(c, _)| (c.key_for_test().map(<[u8]>::to_vec), c.state().1))
+                        .map(|(c, _)| {
+                            let key = c.key_for_test().map(<[u8]>::to_vec);
+                            let form = key.as_ref().and_then(|k| packed_form(&txn, &d, &k[..K]));
+                            (key, c.state().1, form)
+                        })
                         .collect(),
                     false => Vec::new(),
                 };
@@ -635,6 +664,9 @@ fn lockstep(
                 let at = format!("round {round} step {step} pair {j} {op:?} from {from:?}");
                 assert_eq!(a, b, "{at}");
                 assert_eq!(dup.state(), twin.state(), "{at}");
+                if let Some(reseeks) = rewritten[j].take() {
+                    seen.reseeks_after_packed_rewrite += u32::from(dup.reseeks > reseeks);
+                }
                 if rng.below(2) == 0 {
                     for n in [K - 1, K, K + 1] {
                         let x = flag(dup.follower_shares_prefix(&txn, n));
@@ -680,7 +712,34 @@ fn lockstep(
                     Step::Clear => seen.clears += 1,
                     _ => {}
                 }
-                for (key, deleted) in &before {
+                for (i, (key, _, form)) in before.iter().enumerate() {
+                    let Some(key) = key.as_deref().filter(|_| *form == Some(true)) else {
+                        continue;
+                    };
+                    let touched = match &op {
+                        Step::Put(x, _)
+                        | Step::Insert(x, _)
+                        | Step::Append(x, _)
+                        | Step::Delete(x) => x[..K] == key[..K],
+                        Step::DeletePrefix(k) | Step::Wipe(k) => key.starts_with(k),
+                        _ => false,
+                    };
+                    if !touched {
+                        continue;
+                    }
+                    if matches!(op, Step::DeletePrefix(_)) {
+                        seen.packed_under[3] += 1;
+                    }
+                    match packed_form(&txn, &d, &key[..K]) {
+                        Some(true) => {
+                            seen.packed_under[0] += 1;
+                            rewritten[i] = Some(pairs[i].0.reseeks);
+                        }
+                        Some(false) => seen.packed_under[1] += 1,
+                        None => seen.packed_under[2] += 1,
+                    }
+                }
+                for (key, deleted, _) in &before {
                     let Some(key) = key else { continue };
                     match &op {
                         Step::Delete(x) if x == key => match deleted {
@@ -720,6 +779,27 @@ fn lockstep(
     seen.assert_complete(options.packed_max != 0);
 }
 
+/// The most rows `(k, 0..n)` of [`row_value`] that still pack under `options` (4 KiB pages): a
+/// key the next new row (or a longer value) promotes.
+fn at_the_bound(k: u32, options: DupOptions) -> u16 {
+    let most = usize::from(options.resolved(4096).expect("resolves").packed_max);
+    let mut len = 2;
+    (0..)
+        .take_while(|&s| {
+            len += 4 + row_key(k, s).len() - K + row_value(k, s, 0).len();
+            len <= most
+        })
+        .count() as u16
+}
+
+/// Whether outer key `k` of `d` holds a packed set in `txn` (false: a nested tree; `None`: no
+/// rows), from a new cursor's place at the key's first row.
+fn packed_form(txn: &RwTxn, d: &Table, k: &[u8]) -> Option<bool> {
+    let mut c = txn.dup_cursor_detached(d).expect("probe");
+    c.seek_key(txn, k).expect("probe")?;
+    Some(matches!(in_key(&c, txn), Some(InKey::Packed { .. })))
+}
+
 /// Whether `rows` holds a row under outer key `k`.
 fn has_key(rows: &Rows, k: &[u8]) -> bool {
     rows.range(k.to_vec()..).next().is_some_and(|(key, _)| key.starts_with(k))
@@ -734,26 +814,49 @@ fn has_key(rows: &Rows, k: &[u8]) -> bool {
 /// cursor (its row, its follower, emptying its key, `delete_prefix` of it), the cursor's own
 /// deletes into the next key and of the table's last row, refused and key-creating cursor
 /// writes, prefix steps of every class both ways, `prev_in_prefix(K)` after a key's last row is
-/// deleted, and a cursor at a nested key's row (in a table that packs, at a packed key's too).
+/// deleted, and a cursor at a nested key's row. At [`Bound::Default`] the small keys are packed
+/// sets beside the nested `big` key, rewritten in place, promoted as they grow and emptied, under
+/// cursors and through them; the packing gates: a cursor at a packed key's row, another writer's
+/// packed rewrite in place, promotion, emptying and `delete_prefix` under a cursor, and a reseek
+/// after a packed rewrite.
 #[test]
 fn dup_txn_cursors_and_direct_writes_match_the_composite_twin() {
-    lockstep(OPTIONS, 0..6, 300, 300, 5, 3000, 3);
+    lockstep(Bound::Default.options(OPTIONS.key_len), 0..6, 300, 300, 5, 3000, 3);
 }
 
-/// [`dup_txn_cursors_and_direct_writes_match_the_composite_twin`] over a table that packs
-/// ([`PACKING`]): the small keys are packed sets, rewritten in place, promoted as they grow and
-/// emptied, under cursors and through them, beside the nested `big` key.
+/// [`dup_txn_cursors_and_direct_writes_match_the_composite_twin`] over a table that never packs:
+/// no packed case seen.
 #[test]
-fn dup_txn_cursors_and_direct_writes_match_the_composite_twin_packed() {
-    lockstep(PACKING, 0..6, 300, 300, 5, 3000, 3);
+fn dup_txn_cursors_and_direct_writes_match_the_composite_twin_unpacked() {
+    lockstep(Bound::Unpacked.options(OPTIONS.key_len), 0..6, 300, 300, 5, 3000, 3);
 }
 
-/// [`dup_txn_cursors_and_direct_writes_match_the_composite_twin`] over more seeds, rounds and
-/// steps, a larger nested tree and more cursor pairs.
+/// [`dup_txn_cursors_and_direct_writes_match_the_composite_twin`] at [`Bound::Small`]: most keys
+/// promote within a few rows.
+#[test]
+fn dup_txn_cursors_and_direct_writes_match_the_composite_twin_packed_small() {
+    lockstep(Bound::Small.options(OPTIONS.key_len), 0..6, 300, 300, 5, 3000, 3);
+}
+
+/// [`dup_txn_cursors_and_direct_writes_match_the_composite_twin`] at every bound over more seeds,
+/// rounds and steps, a larger nested tree and more cursor pairs: a thread per bound and eight
+/// seeds, each reaching its gates.
 #[test]
 #[ignore = "heavy: run with --release"]
 fn dup_txn_cursors_and_direct_writes_match_the_composite_twin_heavy() {
-    lockstep(OPTIONS, 0..64, 1500, 600, 6, 6000, 5);
+    std::thread::scope(|scope| {
+        let runs: Vec<_> = (Bound::ALL.iter())
+            .flat_map(|&b| (0..8).map(move |i| (b, i * 8..i * 8 + 8)))
+            .map(|(b, seeds)| {
+                scope.spawn(move || {
+                    lockstep(b.options(OPTIONS.key_len), seeds, 1500, 600, 6, 6000, 5)
+                })
+            })
+            .collect();
+        for run in runs {
+            run.join().unwrap_or_else(|e| std::panic::resume_unwind(e));
+        }
+    });
 }
 
 /// A fresh environment with `d` and `p` over `keys`, and a write transaction on it.
@@ -1298,6 +1401,58 @@ fn damage_under_a_dup_cursor_is_corrupt() {
             };
             let corrupt = matches!(&result, Err(Error::Corrupt(m))
                 if messages.iter().any(|message| m.contains(message)));
+            assert!(corrupt, "{what} {op}: {result:?}");
+            assert_eq!(c.state(), (State::Unset, false), "{what} {op}");
+            assert!(env.failure().is_some(), "{what} {op}: latched");
+        }
+    }
+}
+
+/// Damage forged into a packed set ([`packed_fixture`]'s [`PK`], 6 rows, the outer leaf's CRC
+/// stamped again) met by a write transaction's dup cursor, on a fresh copy each: row 3's subkey
+/// of 0 bytes (the first probe of every search in the set) by the cursor's seek into the set, its
+/// step to row 3 from row 2 (reached by steps from the key before, as a search would meet the
+/// damage) and `delete_current` of row 2 (the set's rewrite validates it whole); rows 1 and 2
+/// swapped by the second step forward from row 0 and by `delete_current` of row 0. Each is
+/// `Corrupt`, the cursor unset and out of the deleted state, the environment latched.
+#[test]
+fn packed_damage_under_a_dup_cursor_is_corrupt() {
+    use super::packed_damage::{in_set, packed_fixture, set16, slen_at, sub, swap_1_2, PK};
+    let fx = packed_fixture();
+    type Forge = fn(&mut [u8]);
+    // A case: its forge, the row a seek targets, the row the steps start from and how many
+    // steps meet the damage, and how many reach the row `delete_current` deletes.
+    type Case = (&'static str, Forge, Option<u32>, Vec<u8>, usize, usize);
+    let cases: [Case; 2] = [
+        ("an empty subkey", |b| set16(b, slen_at(3), 0), Some(3), dup_key(PK - 1, &[1]), 4, 3),
+        ("misordered", swap_1_2, None, dup_key(PK, &sub(0)), 2, 0),
+    ];
+    for (what, forge, seek, from, steps, to_delete) in cases {
+        let path = fx.dir.path().join(what.replace(' ', "_"));
+        std::fs::copy(&fx.path, &path).expect("copy");
+        in_set(&path, fx.leaves[&PK], PK, forge);
+        let ops = seek.map(|_| "seek").into_iter().chain(["next", "delete_current"]);
+        for op in ops {
+            let (_dir, env) = copy_of(&path);
+            let mut txn = env.begin_rw().expect("rw");
+            let d = txn.open_table("d").expect("open").expect("d");
+            let mut c = txn.dup_cursor_detached(&d).expect("cursor");
+            let result = match (op, seek) {
+                ("seek", Some(s)) => c.seek(&txn, &dup_key(PK, &sub(s))).map(drop),
+                _ => {
+                    assert!(c.seek_exact(&txn, &from).expect("the first row").is_some(), "{what}");
+                    let before = if op == "next" { steps - 1 } else { to_delete };
+                    for _ in 0..before {
+                        assert!(c.next(&txn).expect("an undamaged step").is_some(), "{what}");
+                    }
+                    if op == "next" {
+                        c.next(&txn).map(drop)
+                    } else {
+                        c.delete_current(&mut txn).map(drop)
+                    }
+                }
+            };
+            let corrupt = matches!(&result, Err(Error::Corrupt(m)) if m.contains("dup table d"));
             assert!(corrupt, "{what} {op}: {result:?}");
             assert_eq!(c.state(), (State::Unset, false), "{what} {op}");
             assert!(env.failure().is_some(), "{what} {op}: latched");

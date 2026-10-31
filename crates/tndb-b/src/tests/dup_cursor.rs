@@ -3,13 +3,16 @@
 //! side by side, every call compared (Oracle 2a); the bounded seeks' reach, the key tail's two
 //! forms, the outer key width and the subkey length met by every landing, and the kind refusal.
 
-use std::{collections::BTreeMap, sync::Arc};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+};
 
 use tempfile::TempDir;
 
 use super::{
     damage::{read_page, restamped, tree, write_page},
-    dup::{copy_of, damaged, dup_key, restamp_record, COLD, HOT, OPTIONS},
+    dup::{copy_of, damaged, dup_key, restamp_record, Bound, COLD, HOT, OPTIONS},
     open, temp, Rows,
 };
 use crate::{
@@ -20,7 +23,7 @@ use crate::{
             tests::{owned, owned_tail, root_descents, Kv},
             KeyTail, State,
         },
-        dup_cursor::LeafBounds,
+        dup_cursor::{InKey, LeafBounds},
         test_harness::{walk_outer_tree, walk_packing_tree, ReportSeed, Rng},
         TreeRoot,
     },
@@ -31,8 +34,10 @@ use crate::{
 const K: usize = OPTIONS.key_len as usize;
 
 /// The shape of a twin pair's rows: `keys` outer keys, the first `big_keys` of them with about
-/// `big_rows` rows each (nested trees of `nested_height` levels or more), the others with 1 to
-/// 5; `run_pct` percent of the values in overflow runs.
+/// `big_rows` rows each (nested trees of `nested_height` levels or more), every third of the
+/// others with 10 to 20 rows (packed at [`Bound::Default`], nested at [`Bound::Small`]) and the
+/// rest with 1 to 3 (packed at both), the outer keys random, so neighbouring keys differ in form;
+/// `run_pct` percent of the values in overflow runs (a key with one is nested at every bound).
 struct Shape {
     keys: usize,
     big_keys: usize,
@@ -69,18 +74,23 @@ fn value(rng: &mut Rng, run_pct: u64) -> Vec<u8> {
     (0..rng.below(41)).map(|_| rng.next() as u8).collect()
 }
 
-/// Dup table `d` and its composite twin `p` in `env`, committed with the same rows of `shape`.
-fn twins(env: &Env, shape: &Shape, rng: &mut Rng) -> (Table, Table, Rows) {
+/// Dup table `d` at `bound` and its composite twin `p` in `env`, committed with the same rows of
+/// `shape`.
+fn twins(env: &Env, shape: &Shape, rng: &mut Rng, bound: Bound) -> (Table, Table, Rows) {
     let mut rows = Rows::new();
     for i in 0..shape.keys {
         let k = outer_key(rng);
-        let n = if i < shape.big_keys { shape.big_rows } else { 1 + rng.len_upto(4) };
+        let n = match i {
+            _ if i < shape.big_keys => shape.big_rows,
+            _ if i % 3 == 1 => 10 + rng.len_upto(10),
+            _ => 1 + rng.len_upto(2),
+        };
         for _ in 0..n {
             rows.insert([&k[..], &subkey(rng)].concat(), value(rng, shape.run_pct));
         }
     }
     let mut txn = env.begin_rw().expect("rw");
-    let d = txn.create_dup_table("d", OPTIONS).expect("d");
+    let d = txn.create_dup_table("d", bound.options(OPTIONS.key_len)).expect("d");
     let p = txn.create_table("p").expect("p");
     for (key, value) in &rows {
         txn.put(&d, key, value).expect("put d");
@@ -314,13 +324,21 @@ impl Coverage {
 
     /// Count the case of `op`, made from the row `from` (the cursor's logical key before it), that
     /// gave `got`; `tail` is the dup cursor's [`KeyTail`] form after a tail call and its `t`.
-    fn count(&mut self, op: &Op, from: Option<&[u8]>, got: &Got, tail: Option<(bool, usize)>) {
+    /// Returns a prefix step's class.
+    fn count(
+        &mut self,
+        op: &Op,
+        from: Option<&[u8]>,
+        got: &Got,
+        tail: Option<(bool, usize)>,
+    ) -> Option<&'static str> {
         let to = got.as_ref().ok().and_then(|g| g.as_ref()).map(|(k, _)| k.as_slice());
         let crossed = |from: &[u8], to: &[u8]| from[..K] != to[..K];
+        let mut prefix = None;
         match (op, from) {
             (Op::NextInPrefix(n) | Op::PrevInPrefix(n), Some(from)) => {
                 let n = *n;
-                self.note(match (n, to) {
+                let case = match (n, to) {
                     _ if n > from.len() => "prefix n > L",
                     (_, Some(_)) if n >= K => "prefix K <= n <= L moved",
                     (_, None) if n == K => "prefix n = K at a key's edge",
@@ -328,7 +346,9 @@ impl Coverage {
                     (_, Some(to)) if crossed(from, to) => "prefix n < K crossing keys",
                     (_, Some(_)) => "prefix n < K inside a key",
                     (_, None) => "prefix n < K stayed",
-                });
+                };
+                self.note(case);
+                prefix = Some(case);
             }
             (Op::Next, Some(from)) if to.is_some_and(|to| crossed(from, to)) => {
                 self.note("next crossing keys")
@@ -364,6 +384,106 @@ impl Coverage {
                 (true, false) => "tail apart: a run",
                 (true, true) => "tail apart: t > |s|",
             });
+        }
+        prefix
+    }
+
+    /// Count the forms `op` met (`packed`: whether an outer key's rows are a packed set), made
+    /// from the row `from`, that gave `got`; `prefix` is [`Coverage::count`]'s class of a prefix
+    /// step, `tail` the dup cursor's tail form after a tail call.
+    fn count_forms(
+        &mut self,
+        (op, from, got): (&Op, Option<&[u8]>, &Got),
+        prefix: Option<&'static str>,
+        tail: Option<(bool, usize)>,
+        packed: &dyn Fn(&[u8]) -> bool,
+    ) {
+        let Ok(to) = got.as_ref().map(|g| g.as_ref().map(|(k, _)| k.as_slice())) else {
+            return;
+        };
+        let form = |key: &[u8]| if packed(&key[..K]) { 'p' } else { 'n' };
+        if let Some(to) = to {
+            self.note(if packed(&to[..K]) { "landing packed" } else { "landing nested" });
+        }
+        let forward = match op {
+            Op::Next | Op::NextInPrefix(_) => Some(true),
+            Op::Prev | Op::PrevInPrefix(_) => Some(false),
+            _ => None,
+        };
+        if let (Some(forward), Some(from), Some(to)) = (forward, from, to) {
+            if from[..K] != to[..K] {
+                self.note(match (forward, form(from), form(to)) {
+                    (true, 'p', 'n') => "forward packed -> nested",
+                    (true, 'n', 'p') => "forward nested -> packed",
+                    (true, 'p', _) => "forward packed -> packed",
+                    (false, 'p', 'n') => "backward packed -> nested",
+                    (false, 'n', 'p') => "backward nested -> packed",
+                    (false, 'p', _) => "backward packed -> packed",
+                    _ => "a crossing nested -> nested",
+                });
+            }
+        }
+        let beside = from.is_some_and(packed_key(packed)) || to.is_some_and(packed_key(packed));
+        if let Some(case) = prefix.filter(|_| beside) {
+            self.note(
+                PREFIX_BESIDE_PACKED
+                    [PREFIX_CASES.iter().position(|c| *c == case).expect("a class")],
+            );
+        }
+        match op {
+            Op::SeekKey(k) | Op::SeekDup(k, _) | Op::SeekDupWithKeyTail(k, _, _)
+                if k.len() == K && packed(k) =>
+            {
+                let s: &[u8] = match op {
+                    Op::SeekDup(_, s) | Op::SeekDupWithKeyTail(_, s, _) => s,
+                    _ => &[],
+                };
+                self.note(match to {
+                    Some(to) if to[K..] == *s => "bounded hit in a packed key",
+                    Some(_) => "bounded miss in a packed key, at the next row",
+                    None => "bounded seek past a packed key's last row",
+                });
+            }
+            _ => {}
+        }
+        if let (Some((false, _)), Some(to)) = (tail, to) {
+            if packed(&to[..K]) {
+                self.note("tail joined from a packed row");
+            }
+        }
+    }
+
+    /// The packing gates at `bound` ([`FORM_CASES`]): every case seen when it packs, none (and no
+    /// packed seek class) when it does not.
+    #[track_caller]
+    fn assert_forms(&self, bound: Bound, what: &str) {
+        if bound == Bound::Unpacked {
+            let packed = |c: &&str| c.contains("packed") && self.0.get(c).is_some_and(|&n| n > 0);
+            let cases = FORM_CASES.iter().chain(&PACKED_SEEK_CLASSES).copied();
+            let seen: Vec<&str> = cases.filter(packed).collect();
+            assert!(seen.is_empty(), "{what}: packed cases at {bound:?}: {seen:?}");
+            assert!(self.0.get("landing nested").is_some_and(|&n| n > 0), "{what}: no landing");
+        } else {
+            self.assert_has(&FORM_CASES, &format!("{what} at {bound:?}"));
+        }
+    }
+
+    /// [`PACKED_SEEK_CLASSES`] all seen at a packing `bound`, none at [`Bound::Unpacked`].
+    #[track_caller]
+    fn assert_packed_classes(&self, bound: Bound, what: &str) {
+        if bound == Bound::Unpacked {
+            let seen = |c: &&str| self.0.get(c).is_some_and(|&n| n > 0);
+            let seen: Vec<&str> = PACKED_SEEK_CLASSES.iter().copied().filter(seen).collect();
+            assert!(seen.is_empty(), "{what}: packed classes at {bound:?}: {seen:?}");
+        } else {
+            self.assert_has(&PACKED_SEEK_CLASSES, &format!("{what} at {bound:?}"));
+        }
+    }
+
+    /// Add `other`'s counts.
+    fn merge(&mut self, other: Self) {
+        for (case, n) in other.0 {
+            *self.0.entry(case).or_default() += n;
         }
     }
 
@@ -412,6 +532,58 @@ impl Coverage {
     }
 }
 
+/// Whether a logical key's outer key is packed, by `packed`.
+fn packed_key(packed: &dyn Fn(&[u8]) -> bool) -> impl Fn(&[u8]) -> bool + '_ {
+    move |key: &[u8]| packed(&key[..K])
+}
+
+/// The prefix step classes of [`Coverage::count`].
+const PREFIX_CASES: [&str; 7] = [
+    "prefix n > L",
+    "prefix K <= n <= L moved",
+    "prefix n = K at a key's edge",
+    "prefix K < n <= L stayed",
+    "prefix n < K crossing keys",
+    "prefix n < K inside a key",
+    "prefix n < K stayed",
+];
+
+/// Each of [`PREFIX_CASES`] from or onto a packed key.
+const PREFIX_BESIDE_PACKED: [&str; 7] = [
+    "prefix n > L beside a packed key",
+    "prefix K <= n <= L moved beside a packed key",
+    "prefix n = K at a key's edge beside a packed key",
+    "prefix K < n <= L stayed beside a packed key",
+    "prefix n < K crossing keys beside a packed key",
+    "prefix n < K inside a key beside a packed key",
+    "prefix n < K stayed beside a packed key",
+];
+
+/// The cases of [`Coverage::count_forms`] a packing bound must meet: landings on both forms,
+/// crossings between them both ways, every prefix class beside a packed key, bounded seeks inside
+/// a packed key, and a joined tail from a packed row.
+const FORM_CASES: [&str; 19] = [
+    "landing packed",
+    "landing nested",
+    "forward packed -> nested",
+    "forward nested -> packed",
+    "forward packed -> packed",
+    "backward packed -> nested",
+    "backward nested -> packed",
+    "backward packed -> packed",
+    PREFIX_BESIDE_PACKED[0],
+    PREFIX_BESIDE_PACKED[1],
+    PREFIX_BESIDE_PACKED[2],
+    PREFIX_BESIDE_PACKED[3],
+    PREFIX_BESIDE_PACKED[4],
+    PREFIX_BESIDE_PACKED[5],
+    PREFIX_BESIDE_PACKED[6],
+    "bounded hit in a packed key",
+    "bounded miss in a packed key, at the next row",
+    "bounded seek past a packed key's last row",
+    "tail joined from a packed row",
+];
+
 /// The dup cursor's tail form after a tail call: `(apart, t)`.
 fn tail_form(c: &DupRoCursor, op: &Op) -> Option<(bool, usize)> {
     let t = match op {
@@ -424,30 +596,55 @@ fn tail_form(c: &DupRoCursor, op: &Op) -> Option<(bool, usize)> {
     Some((matches!(tail, KeyTail::Apart(_)), t))
 }
 
-/// Oracle 2a over `seeds` twin pairs of `shape`, `ops` calls each.
-fn twin_moves(shape: &Shape, seeds: std::ops::Range<u64>, ops: usize) {
+/// The outer keys of `env`'s dup table `d` whose rows are a packed set, read from each outer
+/// cell's form (a nested cell or an inline one), with the nested trees' greatest height: the
+/// walk of an outer tree that packs ([`walk_packing_tree`]) at a packing `bound`, else of one
+/// whose every cell is nested ([`walk_outer_tree`]). The nested count is `d`'s `nested_trees`.
+fn forms(env: &Env, d: &Table, bound: Bound) -> (BTreeSet<Vec<u8>>, Option<u32>) {
+    let snapshot = env.inner().current();
+    let outer = tree(env, "d");
+    let walk = match bound {
+        Bound::Unpacked => walk_outer_tree(&*snapshot, &outer),
+        Bound::Small | Bound::Default => walk_packing_tree(&*snapshot, &outer),
+    };
+    let nested: Vec<u32> = (walk.entries.iter())
+        .filter(|(k, _)| !walk.packed.contains(k))
+        .map(|(_, cell)| {
+            let root = TreeRoot::decode(cell.as_slice().try_into().expect("a nested cell"));
+            root.expect("a nested root").height
+        })
+        .collect();
+    let stat = env.begin_ro().expect("ro").table_stat(d).expect("stat");
+    assert_eq!(stat.nested_trees as usize, nested.len(), "{stat:?}");
+    (walk.packed, nested.into_iter().max())
+}
+
+/// Oracle 2a over `seeds` twin pairs of `shape` at `bound`, `ops` calls each.
+fn twin_moves(shape: &Shape, bound: Bound, seeds: std::ops::Range<u64>, ops: usize) {
     let mut coverage = Coverage::default();
     for seed in seeds {
+        coverage.merge(twin_run(shape, bound, seed, ops));
+    }
+    coverage.assert_complete();
+    coverage.assert_forms(bound, "Oracle 2a");
+}
+
+/// One twin pair of [`twin_moves`], its coverage counts.
+fn twin_run(shape: &Shape, bound: Bound, seed: u64, ops: usize) -> Coverage {
+    let mut coverage = Coverage::default();
+    {
         let seed = 0x2a2a_0000_0000 + seed;
         let _report = ReportSeed(seed);
         let mut rng = Rng(seed);
         let (_dir, path) = temp("tndb_b_dup_cursor_twins");
         let env = open(&path, SyncMode::NoSync);
-        let (d, p, rows) = twins(&env, shape, &mut rng);
+        let (d, p, rows) = twins(&env, shape, &mut rng, bound);
         let ro = Arc::new(env.begin_ro().expect("ro"));
         let stat = ro.table_stat(&d).expect("stat");
         assert!(stat.height >= 2 && stat.overflow_pages > 0, "{stat:?}");
-        let snapshot = env.inner().current();
-        let tallest = walk_outer_tree(&*snapshot, &tree(&env, "d"))
-            .entries
-            .iter()
-            .map(|(_, cell)| {
-                let root = TreeRoot::decode(cell.as_slice().try_into().expect("32 bytes"));
-                root.expect("a nested root").height
-            })
-            .max();
+        let (packed, tallest) = forms(&env, &d, bound);
         assert!(tallest >= Some(shape.nested_height), "the tallest nested tree: {tallest:?}");
-        drop(snapshot);
+        let packed = |k: &[u8]| packed.contains(k);
         let rows: Vec<Kv> = rows.into_iter().collect();
         let (mut dup, mut twin) = fresh(&ro, &d, &p);
         for step in 0..ops {
@@ -466,11 +663,41 @@ fn twin_moves(shape: &Shape, seeds: std::ops::Range<u64>, ops: usize) {
             if matches!(op, Op::Last) {
                 coverage.note("last");
             }
-            coverage.count(&op, from.as_deref(), &got, tail_form(&dup, &op));
+            let tail = tail_form(&dup, &op);
+            let prefix = coverage.count(&op, from.as_deref(), &got, tail);
+            coverage.count_forms((&op, from.as_deref(), &got), prefix, tail, &packed);
         }
         assert!(env.failure().is_none(), "no call latched: {:?}", env.failure());
     }
-    coverage.assert_complete();
+    coverage
+}
+
+/// `run` for every seed of `seeds` at every bound, a thread each; each bound's coverage merged.
+fn every_bound(
+    seeds: std::ops::Range<u64>,
+    run: impl Fn(Bound, u64) -> Coverage + Sync,
+) -> Vec<(Bound, Coverage)> {
+    std::thread::scope(|scope| {
+        let runs: Vec<_> = (Bound::ALL.iter())
+            .flat_map(|&b| seeds.clone().map(move |seed| (b, seed)))
+            .map(|(b, seed)| {
+                (
+                    b,
+                    scope.spawn({
+                        let run = &run;
+                        move || run(b, seed)
+                    }),
+                )
+            })
+            .collect();
+        let mut merged: Vec<(Bound, Coverage)> =
+            Bound::ALL.iter().map(|&b| (b, Coverage::default())).collect();
+        for (b, run) in runs {
+            let coverage = run.join().unwrap_or_else(|e| std::panic::resume_unwind(e));
+            merged.iter_mut().find(|(m, _)| *m == b).expect("a bound").1.merge(coverage);
+        }
+        merged
+    })
 }
 
 /// A new dup cursor over `d` and a new plain cursor over its twin `p`.
@@ -478,15 +705,24 @@ fn fresh(ro: &Arc<crate::RoTxn>, d: &Table, p: &Table) -> (DupRoCursor, RoCursor
     (ro.dup_cursor_owned(d).expect("dup cursor"), ro.cursor_owned(p).expect("twin cursor"))
 }
 
+/// The twin shape of the default tier's cursor oracles.
+const SMALL_SHAPE: Shape =
+    Shape { keys: 400, big_keys: 3, big_rows: 300, run_pct: 2, nested_height: 2 };
+
+/// The twin shape of the heavy tier's cursor oracles: more outer keys, nested trees of three
+/// levels.
+const HEAVY_SHAPE: Shape =
+    Shape { keys: 3000, big_keys: 2, big_rows: 40_000, run_pct: 2, nested_height: 3 };
+
 /// Oracle 2a: random calls on a [`DupRoCursor`] and on a [`RoCursor`] over the composite twin give
 /// the same rows and leave the same states, call for call, over outer and nested trees of two
 /// levels or more, values inline and in runs, and outer keys sharing 0 to K-1 leading bytes
-/// with their neighbours; every case of the coverage counts is seen. An empty dup table's ends
-/// are the plain rules'.
+/// with their neighbours; every case of the coverage counts is seen. At [`Bound::Default`] most
+/// keys are packed sets beside nested ones (the packing gates of [`Coverage::assert_forms`]). An
+/// empty dup table's ends are the plain rules'.
 #[test]
 fn dup_cursor_moves_match_the_composite_twin() {
-    let shape = Shape { keys: 400, big_keys: 3, big_rows: 300, run_pct: 2, nested_height: 2 };
-    twin_moves(&shape, 0..3, 3000);
+    twin_moves(&SMALL_SHAPE, Bound::Default, 0..3, 3000);
 
     let (_dir, path) = temp("tndb_b_dup_cursor_empty");
     let env = open(&path, SyncMode::NoSync);
@@ -507,13 +743,29 @@ fn dup_cursor_moves_match_the_composite_twin() {
     assert_eq!(c.state(), State::Unset);
 }
 
-/// [`dup_cursor_moves_match_the_composite_twin`] over more seeds and calls and larger shapes:
-/// more outer keys, and nested trees of three levels.
+/// [`dup_cursor_moves_match_the_composite_twin`] over a table that never packs: every key nested,
+/// and no packed case seen.
+#[test]
+fn dup_cursor_moves_match_the_composite_twin_unpacked() {
+    twin_moves(&SMALL_SHAPE, Bound::Unpacked, 0..3, 3000);
+}
+
+/// [`dup_cursor_moves_match_the_composite_twin`] at [`Bound::Small`]: keys of 1 to 3 rows packed,
+/// the others nested.
+#[test]
+fn dup_cursor_moves_match_the_composite_twin_packed_small() {
+    twin_moves(&SMALL_SHAPE, Bound::Small, 0..3, 3000);
+}
+
+/// [`dup_cursor_moves_match_the_composite_twin`] at every bound over more seeds and calls and
+/// larger shapes ([`HEAVY_SHAPE`]), a thread per seed and bound.
 #[test]
 #[ignore = "heavy: run with --release"]
 fn dup_cursor_moves_match_the_composite_twin_heavy() {
-    let shape = Shape { keys: 3000, big_keys: 2, big_rows: 40_000, run_pct: 2, nested_height: 3 };
-    twin_moves(&shape, 0..16, 60_000);
+    for (bound, coverage) in every_bound(0..16, |b, seed| twin_run(&HEAVY_SHAPE, b, seed, 60_000)) {
+        coverage.assert_complete();
+        coverage.assert_forms(bound, "Oracle 2a heavy");
+    }
 }
 
 /// A dup cursor that [`DupRoCursor::reset`] forgets the position of moves as a new dup cursor of
@@ -528,7 +780,7 @@ fn a_reset_cursor_moves_as_a_fresh_one() {
     let (_dir, path) = temp("tndb_b_dup_cursor_reset");
     let env = open(&path, SyncMode::NoSync);
     let shape = Shape { keys: 200, big_keys: 2, big_rows: 300, run_pct: 2, nested_height: 2 };
-    let (d, _, rows) = twins(&env, &shape, &mut rng);
+    let (d, _, rows) = twins(&env, &shape, &mut rng, Bound::Unpacked);
     let rows: Vec<Kv> = rows.into_iter().collect();
     let ro = Arc::new(env.begin_ro().expect("ro"));
     let at = |c: &DupRoCursor| c.current().expect("current").map(|(k, _)| k.to_vec());
@@ -881,19 +1133,26 @@ fn inside(bounds: &LeafBounds, key: &[u8]) -> bool {
 /// key's last subkey then steps the outer path from its leaf and descends the next key's nested
 /// root); a seek to another key starts from the outer leaf when the key lies in it (else 1) and
 /// descends the new key's nested root (1, and 1 more when it misses there and crosses to the next
-/// key); from the roots the outer descent is 1 (0 on an empty table).
+/// key); from the roots the outer descent is 1 (0 on an empty table). A key whose rows are a
+/// packed set (`packed`) has no nested root to descend: a seek inside it makes none, and landing
+/// on it none; its classes are [`PACKED_SEEK_CLASSES`].
 fn expected(
     op: &Op,
     held: Option<&Held<'_>>,
-    landed: Option<&[u8]>,
-    has_key: bool,
-    empty: bool,
+    (landed, has_key, empty): (Option<&[u8]>, bool, bool),
+    packed: &dyn Fn(&[u8]) -> bool,
 ) -> (&'static str, u64) {
     let left = |xk: &[u8]| landed.is_none_or(|to| to[..K] != *xk);
     let crossed = |xk: &[u8]| landed.is_some_and(|to| to[..K] != *xk);
+    let into = |k: &[u8]| u64::from(!packed(k));
+    let landed_into = || landed.map_or(0, |to| into(&to[..K]));
+    let crossed_into = |xk: &[u8]| if crossed(xk) { landed_into() } else { 0 };
+    let landed_packed = || landed.is_some_and(|to| packed(&to[..K]));
     let same = |xk: &[u8]| held.filter(|h| xk.len() == K && h.key[..K] == *xk);
     let nested = |h: &Held<'_>, s: &[u8]| {
-        if inside(&h.leaves[1], s) {
+        if packed(&h.key[..K]) {
+            ("same key packed", 0)
+        } else if inside(&h.leaves[1], s) {
             ("same key inside the nested leaf", 0)
         } else {
             ("same key outside the nested leaf", 1)
@@ -910,15 +1169,16 @@ fn expected(
             if let Some(h) = same(xk) {
                 let (class, d) = nested(h, xs);
                 if left(xk) {
-                    return ("same key past its last subkey", d + u64::from(crossed(xk)));
+                    let class = packed_class("same key past its last subkey", packed(xk));
+                    return (class, d + crossed_into(xk));
                 }
                 return (class, d);
             }
             let (class, d) = other(xk);
             match (x.len() >= K && has_key, x.len() == K) {
-                (false, _) => (class, d + u64::from(landed.is_some())),
-                (true, true) => (class, d + 1),
-                (true, false) => (class, d + 1 + u64::from(crossed(xk))),
+                (false, _) => (packed_class(class, landed_packed()), d + landed_into()),
+                (true, true) => (packed_class(class, packed(xk)), d + into(xk)),
+                (true, false) => (packed_class(class, packed(xk)), d + into(xk) + crossed_into(xk)),
             }
         }
         Op::SeekExact(x) if x.len() <= K => ("seek_exact of at most K bytes", 0),
@@ -928,7 +1188,8 @@ fn expected(
                 Some(h) => nested(h, xs),
                 None => {
                     let (class, d) = other(xk);
-                    (class, d + u64::from(has_key))
+                    let packed = has_key && packed(xk);
+                    (packed_class(class, packed), d + if has_key { into(xk) } else { 0 })
                 }
             }
         }
@@ -941,17 +1202,47 @@ fn expected(
                 _ => &[],
             };
             match same(k) {
+                Some(_) if s.is_empty() && packed(k) => ("same key, its first row, packed", 0),
                 Some(_) if s.is_empty() => ("same key, its first row", 1),
                 Some(h) => nested(h, s),
                 None => {
                     let (class, d) = other(k);
-                    (class, d + u64::from(has_key))
+                    let packed = has_key && packed(k);
+                    (packed_class(class, packed), d + if has_key { into(k) } else { 0 })
                 }
             }
         }
         other => panic!("not a seek: {other:?}"),
     }
 }
+
+/// Whether an outer key's rows are a packed set.
+type Forms<'a> = dyn Fn(&[u8]) -> bool + 'a;
+
+/// `class`'s twin landing on (or seeking inside) a packed key when `packed`, else `class`.
+fn packed_class(class: &'static str, packed: bool) -> &'static str {
+    match (class, packed) {
+        (_, false) => class,
+        ("same key past its last subkey", true) => "same key past its last subkey, packed",
+        ("another key inside the outer leaf", true) => "another key inside the outer leaf, packed",
+        ("another key outside the outer leaf", true) => {
+            "another key outside the outer leaf, packed"
+        }
+        ("from the roots", true) => "from the roots, packed",
+        (class, true) => panic!("no packed twin of {class}"),
+    }
+}
+
+/// The seek classes of a packed key ([`expected`]), which each cursor kind meets at a packing
+/// bound and never at [`Bound::Unpacked`].
+const PACKED_SEEK_CLASSES: [&str; 6] = [
+    "same key packed",
+    "same key, its first row, packed",
+    "same key past its last subkey, packed",
+    "another key inside the outer leaf, packed",
+    "another key outside the outer leaf, packed",
+    "from the roots, packed",
+];
 
 /// `f`'s result and the root descents it made.
 fn measured(f: impl FnOnce() -> Got) -> (Got, u64) {
@@ -970,13 +1261,13 @@ fn check_seek(
     (got, made): &(Got, u64),
     (want, fresh_made): &(Got, u64),
     (has_key, empty): (bool, bool),
-    context: &str,
+    (context, packed): (&str, &Forms<'_>),
     seen: &mut Coverage,
 ) -> &'static str {
     assert_eq!(got, want, "{context}");
     let landed = |g: &Got| g.as_ref().ok().and_then(Option::as_ref).map(|(k, _)| k.to_vec());
-    let (class, descents) = expected(seek, held, landed(got).as_deref(), has_key, empty);
-    let (_, fresh) = expected(seek, None, landed(want).as_deref(), has_key, empty);
+    let (class, descents) = expected(seek, held, (landed(got).as_deref(), has_key, empty), packed);
+    let (_, fresh) = expected(seek, None, (landed(want).as_deref(), has_key, empty), packed);
     if cfg!(debug_assertions) {
         assert_eq!(*made, descents, "{context}: {class}");
         assert_eq!(*fresh_made, fresh, "{context}: the new cursor's");
@@ -1021,7 +1312,15 @@ const SEEK_CLASSES: [&str; 9] = [
 
 /// `rounds` seeks of a [`DupRoCursor`] over `d` from the positions its random calls leave it at,
 /// each with two steps after it, against a new cursor's.
-fn ro_positions(ro: &Arc<crate::RoTxn>, d: &Table, rows: &[Kv], rng: &mut Rng, rounds: usize) {
+/// `packed` names the keys of `d` whose rows are a packed set; `bound` is `d`'s.
+fn ro_positions(
+    ro: &Arc<crate::RoTxn>,
+    (d, bound, packed): (&Table, Bound, &BTreeSet<Vec<u8>>),
+    rows: &[Kv],
+    rng: &mut Rng,
+    rounds: usize,
+) {
+    let packed = |k: &[u8]| packed.contains(k);
     let mut seen = Coverage::default();
     let mut c = ro.dup_cursor_owned(d).expect("cursor");
     for round in 0..rounds {
@@ -1041,8 +1340,8 @@ fn ro_positions(ro: &Arc<crate::RoTxn>, d: &Table, rows: &[Kv], rng: &mut Rng, r
         let mine = measured(|| on_dup(&mut c, &seek));
         let mut f = ro.dup_cursor_owned(d).expect("fresh");
         let theirs = measured(|| on_dup(&mut f, &seek));
-        let class =
-            check_seek(&seek, held.as_ref(), &mine, &theirs, (has_key, empty), &context, &mut seen);
+        let (keys, how) = ((has_key, empty), (context.as_str(), &packed as _));
+        let class = check_seek(&seek, held.as_ref(), &mine, &theirs, keys, how, &mut seen);
         if class == REFUSED {
             assert_eq!(c.state(), from, "{context}");
             continue;
@@ -1055,6 +1354,7 @@ fn ro_positions(ro: &Arc<crate::RoTxn>, d: &Table, rows: &[Kv], rng: &mut Rng, r
         }
     }
     seen.assert_has(&SEEK_CLASSES, "ro");
+    seen.assert_packed_classes(bound, "ro");
 }
 
 /// `op` on the write cursor.
@@ -1135,7 +1435,15 @@ fn disturb(rw: &mut RwTxn, d: &Table, c: &mut DupTxnCursor, rows: &[Kv], rng: &m
 /// rounds, committed one time in four, else aborted; a new cursor opened), from the positions
 /// random calls leave them at, disturbed between ([`disturb`]): up to date, stale, in the deleted
 /// state; each with two steps after it, against a new cursor's.
-fn txn_positions(env: &Env, d: &Table, rows: &[Kv], rng: &mut Rng, rounds: usize) {
+/// The forms come from the engine at each seek (a probe cursor's place in its key, which Oracle 1
+/// checks against a model); `bound` is `d`'s.
+fn txn_positions(
+    env: &Env,
+    (d, bound): (&Table, Bound),
+    rows: &[Kv],
+    rng: &mut Rng,
+    rounds: usize,
+) {
     let mut seen = Coverage::default();
     let mut rw = env.begin_rw().expect("rw");
     let mut c = rw.dup_cursor_detached(d).expect("cursor");
@@ -1175,8 +1483,13 @@ fn txn_positions(env: &Env, d: &Table, rows: &[Kv], rng: &mut Rng, rounds: usize
         let mine = measured(|| on_txn(&mut c, &rw, &seek));
         let mut f = rw.dup_cursor_detached(d).expect("fresh");
         let theirs = measured(|| on_txn(&mut f, &rw, &seek));
-        let class =
-            check_seek(&seek, held.as_ref(), &mine, &theirs, (has_key, empty), &context, &mut seen);
+        let packed = |k: &[u8]| {
+            let mut probe = rw.dup_cursor_detached(d).expect("probe");
+            probe.seek_key(&rw, k).expect("probe").is_some()
+                && matches!(probe.position(&rw).1, Some((_, InKey::Packed { .. })))
+        };
+        let (keys, how) = ((has_key, empty), (context.as_str(), &packed as _));
+        let class = check_seek(&seek, held.as_ref(), &mine, &theirs, keys, how, &mut seen);
         if class == REFUSED {
             assert_eq!(c.state(), from, "{context}");
             continue;
@@ -1193,25 +1506,33 @@ fn txn_positions(env: &Env, d: &Table, rows: &[Kv], rng: &mut Rng, rounds: usize
     env.check().expect("check");
     seen.assert_has(&SEEK_CLASSES, "txn");
     seen.assert_has(&["stale at a row", "deleted state"], "txn");
+    seen.assert_packed_classes(bound, "txn");
 }
 
-/// [`ro_positions`] and [`txn_positions`] over `seeds` twin tables of `shape`.
-fn seeks_from_positions(shape: &Shape, seeds: std::ops::Range<u64>, rounds: usize) {
+/// [`ro_positions`] and [`txn_positions`] over `seeds` twin tables of `shape` at `bound`.
+fn seeks_from_positions(shape: &Shape, bound: Bound, seeds: std::ops::Range<u64>, rounds: usize) {
     for seed in seeds {
-        let seed = 0x5EE4_D000_0000 + seed;
-        let _report = ReportSeed(seed);
-        let mut rng = Rng(seed);
-        let (_dir, path) = temp("tndb_b_dup_seek_positions");
-        let env = open(&path, SyncMode::NoSync);
-        let (d, _, rows) = twins(&env, shape, &mut rng);
-        let rows: Vec<Kv> = rows.into_iter().collect();
-        let ro = Arc::new(env.begin_ro().expect("ro"));
-        assert!(ro.table_stat(&d).expect("stat").height >= 2);
-        ro_positions(&ro, &d, &rows, &mut rng, rounds);
-        drop(ro);
-        txn_positions(&env, &d, &rows, &mut rng, rounds);
-        assert!(env.failure().is_none(), "no call latched: {:?}", env.failure());
+        seek_positions(shape, bound, seed, rounds);
     }
+}
+
+/// One twin table of [`seeks_from_positions`].
+fn seek_positions(shape: &Shape, bound: Bound, seed: u64, rounds: usize) -> Coverage {
+    let seed = 0x5EE4_D000_0000 + seed;
+    let _report = ReportSeed(seed);
+    let mut rng = Rng(seed);
+    let (_dir, path) = temp("tndb_b_dup_seek_positions");
+    let env = open(&path, SyncMode::NoSync);
+    let (d, _, rows) = twins(&env, shape, &mut rng, bound);
+    let rows: Vec<Kv> = rows.into_iter().collect();
+    let (packed, _) = forms(&env, &d, bound);
+    let ro = Arc::new(env.begin_ro().expect("ro"));
+    assert!(ro.table_stat(&d).expect("stat").height >= 2);
+    ro_positions(&ro, (&d, bound, &packed), &rows, &mut rng, rounds);
+    drop(ro);
+    txn_positions(&env, (&d, bound), &rows, &mut rng, rounds);
+    assert!(env.failure().is_none(), "no call latched: {:?}", env.failure());
+    Coverage::default()
 }
 
 /// Seeks of every kind (`seek`, `seek_exact`, `seek_with_key_tail`, `seek_key`, `seek_dup`,
@@ -1222,20 +1543,31 @@ fn seeks_from_positions(shape: &Shape, seeds: std::ops::Range<u64>, rounds: usiz
 /// class's exactly ([`expected`]): a seek inside the cursor's key never descends the outer root
 /// (0 inside the nested leaf, else 1), a seek to another key inside the outer leaf descends the
 /// new key's nested root only (1), one outside it both roots (2), as does a stale cursor's; every
-/// class is met by both cursor kinds.
+/// class is met by both cursor kinds. At [`Bound::Default`] most keys are packed sets, which have
+/// no nested root to descend ([`PACKED_SEEK_CLASSES`], each met by both cursor kinds).
 #[test]
 fn dup_seeks_from_random_positions_match_a_fresh_seek() {
-    let shape = Shape { keys: 400, big_keys: 3, big_rows: 300, run_pct: 2, nested_height: 2 };
-    seeks_from_positions(&shape, 0..2, 800);
+    seeks_from_positions(&SMALL_SHAPE, Bound::Default, 0..2, 800);
 }
 
-/// [`dup_seeks_from_random_positions_match_a_fresh_seek`] over more seeds and rounds and larger
-/// tables: more outer keys, and nested trees of three levels.
+/// [`dup_seeks_from_random_positions_match_a_fresh_seek`] over a table that never packs.
+#[test]
+fn dup_seeks_from_random_positions_match_a_fresh_seek_unpacked() {
+    seeks_from_positions(&SMALL_SHAPE, Bound::Unpacked, 0..2, 800);
+}
+
+/// [`dup_seeks_from_random_positions_match_a_fresh_seek`] at [`Bound::Small`].
+#[test]
+fn dup_seeks_from_random_positions_match_a_fresh_seek_packed_small() {
+    seeks_from_positions(&SMALL_SHAPE, Bound::Small, 0..2, 800);
+}
+
+/// [`dup_seeks_from_random_positions_match_a_fresh_seek`] at every bound over more seeds and
+/// rounds and larger tables ([`HEAVY_SHAPE`]), a thread per seed and bound.
 #[test]
 #[ignore = "heavy: run with --release"]
 fn dup_seeks_from_random_positions_match_a_fresh_seek_heavy() {
-    let shape = Shape { keys: 3000, big_keys: 2, big_rows: 40_000, run_pct: 2, nested_height: 3 };
-    seeks_from_positions(&shape, 0..12, 12_000);
+    every_bound(0..12, |b, seed| seek_positions(&HEAVY_SHAPE, b, seed, 12_000));
 }
 
 /// A dup table of [`OPTIONS`]' key width that packs: a key's rows stay in its outer cell while

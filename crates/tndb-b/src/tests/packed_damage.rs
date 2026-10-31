@@ -23,7 +23,7 @@ use crate::{
 };
 
 /// The fixture's packed set whose row 3 the row-local cases damage.
-const PK: u32 = 20;
+pub(super) const PK: u32 = 20;
 
 /// The fixture's other 6-row packed set: the hidden key of the unread cases.
 const PCOLD: u32 = 30;
@@ -48,23 +48,23 @@ const BLOB: usize = 2 + 4 * 6 + 12 * 6;
 /// A cleanly closed file holding dup table `d` (of [`PACKING`]: outer keys 0 to [`OUTER`] but
 /// `PK + 1` and `PK + 2`, packed sets of 1 to 3 rows but [`HOT`]'s and [`COLD`]'s nested trees and
 /// the 6-row sets of [`PK`] and [`PCOLD`]) and plain table `p` beside it.
-struct PackedFixture {
-    dir: TempDir,
-    path: PathBuf,
+pub(super) struct PackedFixture {
+    pub(super) dir: TempDir,
+    pub(super) path: PathBuf,
     plain: Rows,
     dup: Rows,
     /// The outer leaf of each outer key.
-    leaves: BTreeMap<u32, u32>,
+    pub(super) leaves: BTreeMap<u32, u32>,
     /// The packed sets of `d`.
     sets: u64,
 }
 
 /// The subkey of row `s` of [`PK`] and [`PCOLD`].
-fn sub(s: u32) -> [u8; 4] {
+pub(super) fn sub(s: u32) -> [u8; 4] {
     s.to_be_bytes()
 }
 
-fn packed_fixture() -> PackedFixture {
+pub(super) fn packed_fixture() -> PackedFixture {
     let (dir, path) = temp("tndb_b_packed_damage");
     let (mut plain, mut dup) = (Rows::new(), Rows::new());
     let env = open(&path, SyncMode::Durable);
@@ -161,7 +161,7 @@ fn encode(rows: &[(Vec<u8>, Vec<u8>)]) -> Vec<u8> {
 
 /// Edit, in place, outer key `k`'s packed set in leaf `leaf` of the file at `path`, the leaf's
 /// CRC stamped again.
-fn in_set(path: &Path, leaf: u32, k: u32, edit: impl FnOnce(&mut [u8])) {
+pub(super) fn in_set(path: &Path, leaf: u32, k: u32, edit: impl FnOnce(&mut [u8])) {
     raw_cell(path, leaf, &k.to_be_bytes(), |page, off| {
         let len = u32::from_le_bytes(page[off..off + 4].try_into().expect("4 bytes")) as usize;
         assert_eq!(page[off + 4..off + 8], [K as u8, 0, 0, 0], "key {k}: an inline cell");
@@ -171,7 +171,7 @@ fn in_set(path: &Path, leaf: u32, k: u32, edit: impl FnOnce(&mut [u8])) {
 }
 
 /// Set the `u16` at `at` of `blob`.
-fn set16(blob: &mut [u8], at: usize, v: u16) {
+pub(super) fn set16(blob: &mut [u8], at: usize, v: u16) {
     blob[at..at + 2].copy_from_slice(&v.to_le_bytes());
 }
 
@@ -186,7 +186,7 @@ fn end_at(i: usize) -> usize {
 }
 
 /// The offset of row `i`'s subkey length in a set's slot table.
-fn slen_at(i: usize) -> usize {
+pub(super) fn slen_at(i: usize) -> usize {
     4 + 4 * i
 }
 
@@ -199,7 +199,7 @@ fn row_at(i: usize) -> usize {
 type SetEdit = fn(&mut [u8]);
 
 /// Swap rows 1 and 2's subkeys of a 6-row set.
-fn swap_1_2(b: &mut [u8]) {
+pub(super) fn swap_1_2(b: &mut [u8]) {
     let (one, two) = (row_at(1), row_at(2));
     let s1: [u8; 4] = b[one..one + 4].try_into().expect("4 bytes");
     b.copy_within(two..two + 4, one);
