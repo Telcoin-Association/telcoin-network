@@ -31,6 +31,45 @@ use crate::{
 /// The options of the dup tables these tests create.
 pub(super) const OPTIONS: DupOptions = DupOptions { key_len: 4, packed_max: 0 };
 
+/// The packed-set limits the dup oracles run at: none (every key a nested tree), a small one (most
+/// keys are created packed and promote within a few rows) and the default (the most an inline entry
+/// takes).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Bound {
+    Unpacked,
+    Small,
+    Default,
+}
+
+/// [`Bound::Small`]'s limit, in bytes of a packed set's encoding.
+pub(super) const PACKED_SMALL: u16 = 96;
+
+impl Bound {
+    /// Every bound, in the order the oracles run them.
+    pub(super) const ALL: [Self; 3] = [Self::Unpacked, Self::Small, Self::Default];
+
+    /// The options of a dup table of `key_len`-byte outer keys at this bound.
+    pub(super) const fn options(self, key_len: u16) -> DupOptions {
+        let packed_max = match self {
+            Self::Unpacked => 0,
+            Self::Small => PACKED_SMALL,
+            Self::Default => DupOptions::PACKED_DEFAULT,
+        };
+        DupOptions { key_len, packed_max }
+    }
+}
+
+#[test]
+fn every_bound_resolves_to_its_limit() {
+    let most = DupOptions::packed(OPTIONS.key_len).resolved(4096).expect("default").packed_max;
+    let limits: Vec<u16> = Bound::ALL
+        .iter()
+        .map(|b| b.options(OPTIONS.key_len).resolved(4096).expect("resolves").packed_max)
+        .collect();
+    assert_eq!(limits, [0, PACKED_SMALL, most]);
+    assert!(PACKED_SMALL < most, "the small bound is below the default");
+}
+
 /// `Env::check` of `env`, which must pass, with dup table `name`'s figures those of its
 /// `table_stat` ([`assert_dup_figures`]).
 #[track_caller]
