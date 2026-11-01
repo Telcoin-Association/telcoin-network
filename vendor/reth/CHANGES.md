@@ -335,7 +335,9 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   running on another thread: it stops within milliseconds, but runs over 60 s to gas exhaustion with
   the interrupt disabled. When revm-inspectors reaches 0.44.2, delete `js_tracer_interrupt.rs` and
   take upstream's `attach` (`js.with_interrupt(...)`). Block-level traces and `debug_traceCallMany`
-  still stop only between transactions, as upstream.
+  are unchanged, as upstream: they ignore `timeout`, and a request dropped after the trace has
+  started does not stop it. (Upstream's commit message says they "stop only between
+  transactions"; the code checks for a dropped request only before the blocking task starts.)
   *Upstream*: n/a (port of an upstream commit).
 
 - **TN-0018** — Backport 792ee9245: no sender-id allocation on read-only pool lookups. *Kind*:

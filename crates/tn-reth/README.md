@@ -906,15 +906,16 @@ From `crates/tn-reth/Cargo.toml`:
 | `adiri` | Adiri-testnet build: forwards `tn-types/adiri`, which compiles the adiri fork gates in `tn-types` `forks.rs`, and **implies `faucet`**. Each gate names the first adiri epoch on the new behaviour: 383 seed signatures (epoch seed chain replaces the leader-aggregate shuffle seed), 407 `ConsensusRegistry` and `WorkerConfigs` swap, 554 governance Safe onto the canonical v1.4.1 suite, 567 leader-seeded intra-round certificate order, 570 multi-worker `Committee` encoding, 574 seed-chain `PREVRANDAO`. This crate applies the two state-swap forks (407 and 554) itself, in the closing block of the epoch before (steps 1 and 2 of "Epoch close"). Non-adiri builds compile none of these constants and run the post-fork behaviour from genesis. |
 | `test-utils` | Test factories and payload helpers. |
 | `tndb-b` | Run the reth execution database on the tndb-b engine (`tndb_b_reth::TndbEnv`) instead of MDBX. Off by default; see "Database backend". |
+| `js-tracer` | Serve JavaScript tracers in `debug_trace*` (geth's custom tracers). Off by default: it compiles boa, a JavaScript engine (35 packages). Without it a JS tracer request gets error `-32603` `JS Tracer is not enabled`, and the built-in tracers work as before. Forwarded by `tn-node` and the `telcoin-network` binary. See [js-tracer.md](js-tracer.md). |
 
 The crate takes reth's individual crates, never the `reth` umbrella crate (which only re-exports
-them and pulls reth's CLI, `reth-ethereum-cli` and `reth-cli-commands`, into the graph). The
-umbrella's default features are always on, enabled on the crates it forwarded them to: `jemalloc`
-(`reth-cli-util`, `reth-node-core`; not `reth-node-metrics`, whose jemalloc stats feed only
-reth's own metrics server, which TN never starts), `otlp` and `otlp-logs` (`reth-node-core`), `js-tracer`
-(`reth-rpc`, `reth-rpc-eth-api`, `reth-rpc-eth-types`), `keccak-cache-global` (`reth-node-core`),
-`asm-keccak` (`reth-node-core`, `revm`) and `min-debug-logs` (`reth-node-core`,
-which caps `tracing` at debug in release builds).
+them and pulls reth's CLI, `reth-ethereum-cli` and `reth-cli-commands`, into the graph). Three of
+the umbrella's default features are always on, enabled on the crates it forwarded them to:
+`keccak-cache-global` (`reth-node-core`), `asm-keccak` (`reth-node-core`, `revm`) and
+`min-debug-logs` (`reth-node-core`, which caps `tracing` at debug in release builds). `js-tracer`
+is this crate's opt-in feature above. `jemalloc` is off because no TN binary installs jemalloc as
+its global allocator, and `otlp`/`otlp-logs` because they only fed reth's own OTLP exporters,
+which are removed (vendor/reth CHANGES.md TN-0029).
 
 reth's node builder is not a dependency: this crate wires the provider, EVM, pool and RPC itself.
 `revm` is a direct dependency only to keep the precompile backends (`secp256k1`, `blst`, `c-kzg`)

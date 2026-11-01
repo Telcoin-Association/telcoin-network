@@ -56,6 +56,9 @@ adiri = [
 ]
 # Run the reth execution database on tndb-b; tn-node has no backend code of its own.
 tndb-b = ["tn-reth/tndb-b"]
+# Serve JavaScript tracers in `debug_trace*`; tn-node has no RPC code of its own. See
+# crates/tn-reth/js-tracer.md.
+js-tracer = ["tn-reth/js-tracer"]
 
 # Propagate the faucet feature to tn-reth, the only crate with faucet-gated code (the
 # devnet/testnet unrestricted `mint` precompile). tn-node has no faucet code of its own.

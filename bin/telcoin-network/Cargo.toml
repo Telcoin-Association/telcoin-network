@@ -23,6 +23,9 @@ adiri = ["telcoin-network-cli/adiri", "tn-node/adiri"]
 # Run the reth execution database on the tndb-b engine instead of MDBX. Off by default.
 # MDBX stays compiled either way. See crates/tn-reth/README.md, "Database backend".
 tndb-b = ["telcoin-network-cli/tndb-b", "tn-node/tndb-b"]
+# Serve JavaScript tracers in `debug_trace*` (geth's custom tracers). Off by default: it compiles
+# the boa JavaScript engine into the node. See crates/tn-reth/js-tracer.md.
+js-tracer = ["tn-node/js-tracer"]
 
 # Faucet build (devnet). Propagates `faucet` down to `tn-reth`, the only crate with faucet-gated
 # code (the unrestricted `mint` precompile used by faucets). Enabled for the `docker-devnet` image
