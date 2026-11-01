@@ -20,6 +20,11 @@
 //! order of every row it passes; a landing (an edge row, a seek's) needs no compare. A nested
 //! key's moves pay one compare of the row count for this mode, an absent key none.
 //!
+//! A write through a dup cursor at a row of the written key passes the walker's paths to the
+//! write ([`DupWalk::hints`]): both paths' slots as routing hints, each followed only where the
+//! write's descent finds it holds, and the outer leaf, where the write reads the key's cell when
+//! the transaction's working map holds no root for the key.
+//!
 //! The logical key is not contiguous in any page (`k` sits in an outer leaf, `s` in a nested
 //! leaf), so the walker keeps it in a buffer, rewritten past `k` on each move inside a key and
 //! whole on a move to another key; its capacity is reused, so a move allocates nothing once the
@@ -27,7 +32,7 @@
 
 use super::{
     cursor::{Cells, KeyTail, State, TreeCursor},
-    PageRead, TreeRoot,
+    write, PageRead, TreeRoot,
 };
 use crate::{
     error::{Error, Result},
@@ -110,6 +115,34 @@ fn held<'s>(
     }
 }
 
+/// A dup write's routing hints from a walker at a row of the written outer key
+/// ([`DupWalk::hints`]): the outer path's slots for the write's outer descents, the nested path's
+/// for its nested ones (each a [`write::Hint`]: slots only, each checked where it is followed),
+/// and the outer leaf the walker is at, whose cell of the key the write may read there (the
+/// working map first, always). [`NO_DUP_HINT`] for none.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct DupHint<'h> {
+    /// The outer path's slots, root first, the key's cell's slot last.
+    pub(crate) outer: write::Hint<'h>,
+    /// The page of the outer leaf the walker is at: the leaf of the outer tree holding the key's
+    /// cell, entered with a descent's checks.
+    pub(crate) outer_leaf: Option<u32>,
+    /// The nested path's slots, root first; none at a packed key.
+    pub(crate) nested: write::Hint<'h>,
+}
+
+/// No hints: every descent of a dup write searches, and its outer cell is found from the root.
+pub(crate) const NO_DUP_HINT: DupHint<'static> =
+    DupHint { outer: write::NO_HINT, outer_leaf: None, nested: write::NO_HINT };
+
+impl DupHint<'_> {
+    /// The outer leaf the walker is at and the slot of the key's cell in it, if it holds one.
+    #[inline]
+    pub(crate) fn held(&self) -> Option<(u32, usize)> {
+        self.outer_leaf.zip(self.outer.last().map(|&slot| usize::from(slot)))
+    }
+}
+
 /// A position in a dup table: the outer tree's path, the current outer key's nested tree and its
 /// path, and the logical key `k ‖ s` of the row it is at (see the module docs).
 ///
@@ -187,6 +220,23 @@ impl DupWalk {
     #[inline]
     pub(crate) fn key(&self) -> &[u8] {
         &self.key
+    }
+
+    /// The routing hints of a write into outer key `k` of the outer tree `outer` (the walker's,
+    /// up to date): while the walker is at a row of `k`, the outer path's slots and leaf, and at
+    /// a nested key the nested path's slots ([`TreeCursor::hint`]); else none. The caller vouches
+    /// only that the paths may be the trees': the write's descents check every slot they follow.
+    #[inline]
+    pub(crate) fn hints(&self, k: &[u8], outer: &TreeRoot) -> DupHint<'_> {
+        if self.state() != State::At || self.key.get(..self.kl()) != Some(k) {
+            return NO_DUP_HINT;
+        }
+        let nested = if self.packed_rows == 0 {
+            self.inner.hint(self.nested.height)
+        } else {
+            write::NO_HINT
+        };
+        DupHint { outer: self.outer.hint(outer.height), outer_leaf: self.outer.leaf_pgno(), nested }
     }
 
     /// Run a move; an error leaves both paths unset.

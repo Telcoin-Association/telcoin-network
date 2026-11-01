@@ -27,7 +27,7 @@ use crate::{
     stats::elapsed_ns,
     tree::{
         cursor::{self, Cursor, Entry, KeyTail, State, TreeCursor},
-        dup_cursor::{nested_cell, DupWalk, NestedRoots},
+        dup_cursor::{nested_cell, DupHint, DupWalk, NestedRoots, NO_DUP_HINT},
         read,
         write::{self, PutKind},
         PageRead, PageWrite, TreeRoot,
@@ -326,10 +326,12 @@ enum DupRows<'t> {
 }
 
 /// The rows of outer key `k` for a write in the dup table `table` (outer tree `outer`, working
-/// map `map`, its record's packed-set limit `packed_max`): the map's entry, else the key's cell.
-/// A nested cell's root is loaded into the map ([`load_cell`]); a packed set is copied into
-/// `packed_in` and validated whole there ([`load_packed`]), before the write changes anything.
-/// Every dup write takes its key's rows here.
+/// map `map`, its record's packed-set limit `packed_max`): the map's entry, else the key's cell,
+/// read in `held` (a dup cursor's outer leaf, [`held_cell`]) when it holds it, else found from
+/// the root. A nested cell's root is loaded into the map ([`load_cell`]); a packed set is copied
+/// into `packed_in` and validated whole there ([`load_packed`]), before the write changes
+/// anything. Every dup write takes its key's rows here.
+#[allow(clippy::too_many_arguments)]
 fn dup_entry<'m>(
     writer: &Writer,
     table: &Table,
@@ -338,9 +340,19 @@ fn dup_entry<'m>(
     map: &'m mut NestedMap,
     packed_in: &mut Vec<u8>,
     k: &[u8],
+    held: Option<(u32, usize)>,
 ) -> Result<DupEntry<'m>> {
+    // The map first: a key it holds has its working root there, never in a cell.
     if !map.contains_key(k) {
-        let b = match outer_cell(writer, table, packed_max, outer, k)? {
+        let cell = match held_cell(writer, table, packed_max, held, k)? {
+            Some(cell) => Some(cell),
+            None => {
+                #[cfg(all(test, debug_assertions))]
+                OUTER_FINDS.with(|n| n.set(n.get() + 1));
+                outer_cell(writer, table, packed_max, outer, k)?
+            }
+        };
+        let b = match cell {
             None => return Ok(DupEntry::Absent),
             Some(OuterVal::Nested(b)) => b,
             Some(OuterVal::Packed(blob)) => {
@@ -365,6 +377,39 @@ fn dup_entry<'m>(
         Some(n) => DupEntry::Nested(n),
         None => DupEntry::Absent,
     })
+}
+
+/// Outer key `k`'s cell in `held`, the outer leaf a dup cursor is at and its slot there
+/// ([`DupHint::held`]), read by the record's packed-set limit `packed_max` ([`outer_val`]); `None`
+/// for no leaf or a leaf without the key, so the caller finds the cell from the root. The cursor
+/// is up to date at a row of `k`, so the leaf is the working outer tree's leaf for `k`, entered
+/// with a descent's checks: a cell of `k` there is the one a descent from the root finds. The
+/// page is fetched with the per-fetch checks, as the cursor's moves fetch it ([`checked`]); the
+/// slot's key first, else a search of the leaf when `k` lies between its first and last keys.
+fn held_cell<'s>(
+    writer: &'s Writer,
+    table: &Table,
+    packed_max: u16,
+    held: Option<(u32, usize)>,
+    k: &[u8],
+) -> Result<Option<OuterVal<'s>>> {
+    let Some((pgno, slot)) = held else { return Ok(None) };
+    let view = page::LeafView::new(PageRead::page(writer, pgno)?)?;
+    let n = view.nkeys();
+    let val = match (slot < n).then(|| view.entry(slot)).transpose()? {
+        Some((at, val)) if at == k => Some(val),
+        _ if n > 0
+            && page::cmp_keys(view.key(0)?, k).is_le()
+            && page::cmp_keys(k, view.key(n - 1)?).is_le() =>
+        {
+            match view.find(k)? {
+                page::Find::Found { value, .. } => Some(value),
+                page::Find::NotFound { .. } => None,
+            }
+        }
+        _ => None,
+    };
+    val.map(|val| outer_val(table.name(), k, val, packed_max)).transpose()
 }
 
 /// Outer key `k`'s packed set `blob` in the dup table `table` (its record's limit `packed_max`),
@@ -466,7 +511,8 @@ pub(crate) struct DupRemoved {
 /// new key a packed set when its first row fits the table's packed-set limit
 /// ([`packed_create`]), else a new tree and its outer cell. An append's order rule is the plain
 /// table's over the logical key: the outer key must not sort before the table's last outer key,
-/// and with that key the subkey must sort after its last subkey.
+/// and with that key the subkey must sort after its last subkey. The writes into the key's tree
+/// and cell route by `hints` (a dup cursor's at a row of `k`, [`DupHint`]); a new key's by none.
 #[inline(never)]
 fn dup_put(
     work: &mut Work,
@@ -474,6 +520,7 @@ fn dup_put(
     key: &[u8],
     value: &[u8],
     kind: PutKind,
+    hints: DupHint<'_>,
 ) -> Result<DupPlaced> {
     let dup = dup_mut(&mut work.tables[i].record.dup);
     let (key_len, packed_max) = (dup.key_len, dup.packed_max);
@@ -485,6 +532,9 @@ fn dup_put(
         w.cache.forget();
         w.nested.values_mut().for_each(|n| n.cache.forget());
     }
+    // Test-only: every write searches and finds its cell from the root, as before the hints.
+    #[cfg(test)]
+    let hints = if writer.no_write_hint { NO_DUP_HINT } else { hints };
     let new_key = match kind {
         PutKind::Append => match read::last_key(&*writer, &w.record.root)? {
             // Every outer key has the table's width (as `outer_cell`'s lookups hold it).
@@ -506,7 +556,8 @@ fn dup_put(
     let entry = if new_key {
         DupEntry::Absent
     } else {
-        dup_entry(writer, &w.table, packed_max, &outer, &mut w.nested, &mut w.packed_in, k)?
+        let held = hints.held();
+        dup_entry(writer, &w.table, packed_max, &outer, &mut w.nested, &mut w.packed_in, k, held)?
     };
     match entry {
         DupEntry::Nested(n) => {
@@ -519,14 +570,14 @@ fn dup_put(
                 s,
                 value,
                 kind,
-                write::NO_HINT,
+                hints.nested,
             )?;
             n.changed = true;
             apply_delta(dup_mut(&mut w.record.dup), &w.table, k, &before, &n.root)?;
             work.set_dup_record(i, outer, trusted);
             return Ok(DupPlaced { created: false, slot: placed.slot });
         }
-        DupEntry::Packed => return packed_put(work, i, k, s, value, kind),
+        DupEntry::Packed => return packed_put(work, i, k, s, value, kind, hints.outer),
         DupEntry::Absent
             if packed_max != 0 && packed::encoded_len_one(s, value) <= usize::from(packed_max) =>
         {
@@ -625,6 +676,7 @@ fn packed_create(
 /// set with the row (`s`, `v`) is rebuilt into [`Working::packed_out`] and rewrites the cell
 /// (a new row counts in `packed_rows`, a new value of a row does not), or, when the rebuilt set
 /// would pass the table's packed-set limit, the set is promoted to a nested tree ([`promote`]).
+/// The cell's write routes by `hint`, a dup cursor's outer path at `k` ([`DupHint::outer`]).
 #[inline(never)]
 fn packed_put(
     work: &mut Work,
@@ -633,6 +685,7 @@ fn packed_put(
     s: &[u8],
     v: &[u8],
     kind: PutKind,
+    hint: write::Hint<'_>,
 ) -> Result<DupPlaced> {
     let (writer, w) = work.writer_and_table(i);
     let packed_max = usize::from(dup_mut(&mut w.record.dup).packed_max);
@@ -648,7 +701,7 @@ fn packed_put(
         _ => {}
     }
     if packed::encoded_len_with(&view, at, s, v) > packed_max {
-        return promote(work, i, k, s, v, at);
+        return promote(work, i, k, s, v, at, hint);
     }
     let dup = dup_mut(&mut w.record.dup);
     let rows = match at {
@@ -668,7 +721,7 @@ fn packed_put(
         write::OuterCell::Packed(&w.packed_out),
         write::Cells::Packing,
         PutKind::Upsert,
-        write::NO_HINT,
+        hint,
     )?;
     if !placed.replaced {
         return Err(Error::Failed(format!(
@@ -688,7 +741,8 @@ fn packed_put(
 /// packed-set limit. The totals first, in a copy, so a record that cannot count them changes
 /// nothing; then the tree, by appending the rows in order to an empty tree through its own path
 /// cache (O(1) each); then the cell's packed set replaced by the tree's root, and a working map
-/// entry, trusted as a created tree's. A nested key never goes back to a packed set.
+/// entry, trusted as a created tree's. A nested key never goes back to a packed set. The cell's
+/// write routes by `hint` ([`packed_put`]'s); the new tree's appends need none.
 #[inline(never)]
 fn promote(
     work: &mut Work,
@@ -697,6 +751,7 @@ fn promote(
     s: &[u8],
     v: &[u8],
     at: Search,
+    hint: write::Hint<'_>,
 ) -> Result<DupPlaced> {
     let (writer, w) = work.writer_and_table(i);
     let mut totals = *dup_mut(&mut w.record.dup);
@@ -752,7 +807,7 @@ fn promote(
         write::OuterCell::Nested(&root),
         write::Cells::Packing,
         PutKind::Upsert,
-        write::NO_HINT,
+        hint,
     )?;
     if !placed.replaced {
         return Err(Error::Failed(format!(
@@ -768,9 +823,10 @@ fn promote(
 
 /// The delete of the logical `key` from the dup table at `i` in [`Work::tables`]: from the key's
 /// nested tree, and the tree's outer cell with it when the delete empties the tree, or from its
-/// packed set ([`packed_delete`]). A nested key stays nested at any row count.
+/// packed set ([`packed_delete`]). A nested key stays nested at any row count. The writes into
+/// the key's tree and cell route by `hints` (a dup cursor's at the row, [`DupHint`]).
 #[inline(never)]
-fn dup_delete(work: &mut Work, i: usize, key: &[u8]) -> Result<DupRemoved> {
+fn dup_delete(work: &mut Work, i: usize, key: &[u8], hints: DupHint<'_>) -> Result<DupRemoved> {
     let missed = DupRemoved { found: false, emptied: false, slot: None };
     let dup = dup_mut(&mut work.tables[i].record.dup);
     let (key_len, packed_max) = (dup.key_len, dup.packed_max);
@@ -785,6 +841,9 @@ fn dup_delete(work: &mut Work, i: usize, key: &[u8]) -> Result<DupRemoved> {
         w.cache.forget();
         w.nested.values_mut().for_each(|n| n.cache.forget());
     }
+    // Test-only: every delete searches and finds its cell from the root, as before the hints.
+    #[cfg(test)]
+    let hints = if writer.no_write_hint { NO_DUP_HINT } else { hints };
     let (mut outer, mut trusted) = (w.record.root, w.trusted);
     let n = match dup_entry(
         writer,
@@ -794,11 +853,12 @@ fn dup_delete(work: &mut Work, i: usize, key: &[u8]) -> Result<DupRemoved> {
         &mut w.nested,
         &mut w.packed_in,
         k,
+        hints.held(),
     )? {
         DupEntry::Nested(n) => n,
         DupEntry::Absent => return Ok(missed),
         DupEntry::Packed => {
-            let removed = packed_delete(work, i, k, s)?;
+            let removed = packed_delete(work, i, k, s, hints.outer)?;
             #[cfg(test)]
             let removed = DupRemoved { slot: removed.slot.filter(|_| !uncached), ..removed };
             return Ok(removed);
@@ -806,7 +866,7 @@ fn dup_delete(work: &mut Work, i: usize, key: &[u8]) -> Result<DupRemoved> {
     };
     let before = n.root;
     let removed =
-        write::delete_cached(writer, &mut n.root, &mut n.trusted, &mut n.cache, s, write::NO_HINT)?;
+        write::delete_cached(writer, &mut n.root, &mut n.trusted, &mut n.cache, s, hints.nested)?;
     if !removed.found {
         return Ok(missed);
     }
@@ -824,7 +884,7 @@ fn dup_delete(work: &mut Work, i: usize, key: &[u8]) -> Result<DupRemoved> {
             &mut w.cache,
             k,
             cells(packed_max),
-            write::NO_HINT,
+            hints.outer,
         )?;
         if !removed.found {
             return Err(no_cell(&w.table, k));
@@ -845,9 +905,16 @@ fn dup_delete(work: &mut Work, i: usize, key: &[u8]) -> Result<DupRemoved> {
 /// without the row into [`Working::packed_out`], which rewrites the cell (no slot: the outer path
 /// cache names no row); the delete of a set's last row removes the cell instead (a set never
 /// empties), with the outer delete's slot, as an emptied nested tree's. The new `packed_rows`
-/// is counted first, so a record that cannot count the row changes nothing.
+/// is counted first, so a record that cannot count the row changes nothing. The cell's write
+/// routes by `hint`, a dup cursor's outer path at `k` ([`DupHint::outer`]).
 #[inline(never)]
-fn packed_delete(work: &mut Work, i: usize, k: &[u8], s: &[u8]) -> Result<DupRemoved> {
+fn packed_delete(
+    work: &mut Work,
+    i: usize,
+    k: &[u8],
+    s: &[u8],
+    hint: write::Hint<'_>,
+) -> Result<DupRemoved> {
     let (writer, w) = work.writer_and_table(i);
     let packed_max = usize::from(dup_mut(&mut w.record.dup).packed_max);
     let max_subkey = writer.geometry.max_subkey(k.len());
@@ -869,7 +936,7 @@ fn packed_delete(work: &mut Work, i: usize, k: &[u8], s: &[u8]) -> Result<DupRem
             &mut w.cache,
             k,
             write::Cells::Packing,
-            write::NO_HINT,
+            hint,
         )?;
         if !removed.found {
             return Err(no_cell(&w.table, k));
@@ -886,7 +953,7 @@ fn packed_delete(work: &mut Work, i: usize, k: &[u8], s: &[u8]) -> Result<DupRem
             write::OuterCell::Packed(&w.packed_out),
             write::Cells::Packing,
             PutKind::Upsert,
-            write::NO_HINT,
+            hint,
         )?;
         if !placed.replaced {
             return Err(Error::Failed(format!(
@@ -1061,8 +1128,16 @@ fn dup_delete_prefix(work: &mut Work, i: usize, key: &[u8]) -> Result<u64> {
         w.nested.values_mut().for_each(|n| n.cache.forget());
     }
     let (mut outer, mut trusted) = (w.record.root, w.trusted);
-    let entry =
-        dup_entry(writer, &w.table, packed_max, &outer, &mut w.nested, &mut w.packed_in, key)?;
+    let entry = dup_entry(
+        writer,
+        &w.table,
+        packed_max,
+        &outer,
+        &mut w.nested,
+        &mut w.packed_in,
+        key,
+        None,
+    )?;
     let n = match entry {
         DupEntry::Nested(n) => n,
         DupEntry::Absent => return Ok(0),
@@ -1215,6 +1290,9 @@ fn free_dup_table(
 thread_local! {
     /// Test-only: how many times a [`RoTxn`] resolved a handle through the catalog.
     pub(crate) static CATALOG_RESOLVES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// Test-only: how many outer cells a dup write looked up from the outer root ([`dup_entry`]'s
+    /// [`read::find_outer`]), not in a dup cursor's held outer leaf.
+    pub(crate) static OUTER_FINDS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 /// How many tables a snapshot's [`TableRoots`] remembers.
@@ -2521,7 +2599,7 @@ impl RwTxn {
                 if cursor.is_some() {
                     return Err(Error::TableKind(table.name().to_string()));
                 }
-                return dup_put(work, i, key, value, kind).map(|_| false);
+                return dup_put(work, i, key, value, kind, NO_DUP_HINT).map(|_| false);
             }
             let (writer, w) = work.writer_and_table(i);
             let (mut root, mut trusted) = (w.record.root, w.trusted);
@@ -2554,13 +2632,16 @@ impl RwTxn {
     }
 
     /// [`Self::put_entry`] into the dup table `table` for a [`DupTxnCursor`]: where the row went
-    /// ([`DupPlaced`]). [`Error::TableKind`] for a plain table (no dup cursor exists on one).
+    /// ([`DupPlaced`]). [`Error::TableKind`] for a plain table (no dup cursor exists on one). The
+    /// writes route by `hints`, the cursor's when it is up to date at a row of the key
+    /// ([`DupWalk::hints`]), else [`NO_DUP_HINT`].
     fn dup_put_entry(
         &mut self,
         table: &Table,
         key: &[u8],
         value: &[u8],
         kind: PutKind,
+        hints: DupHint<'_>,
     ) -> Result<DupPlaced> {
         self.inner.geometry.place(key.len(), value.len())?;
         self.write(|work| {
@@ -2568,19 +2649,25 @@ impl RwTxn {
             if work.tables[i].record.dup.is_none() {
                 return Err(Error::TableKind(table.name().to_string()));
             }
-            dup_put(work, i, key, value, kind)
+            dup_put(work, i, key, value, kind, hints)
         })
     }
 
     /// [`Self::delete_entry`] from the dup table `table` for a [`DupTxnCursor`]: what the delete
-    /// did ([`DupRemoved`]). [`Error::TableKind`] for a plain table.
-    fn dup_delete_entry(&mut self, table: &Table, key: &[u8]) -> Result<DupRemoved> {
+    /// did ([`DupRemoved`]). [`Error::TableKind`] for a plain table. The writes route by `hints`,
+    /// the cursor's at the row ([`DupWalk::hints`]).
+    fn dup_delete_entry(
+        &mut self,
+        table: &Table,
+        key: &[u8],
+        hints: DupHint<'_>,
+    ) -> Result<DupRemoved> {
         self.write(|work| {
             let i = work.working(table)?;
             if work.tables[i].record.dup.is_none() {
                 return Err(Error::TableKind(table.name().to_string()));
             }
-            dup_delete(work, i, key)
+            dup_delete(work, i, key, hints)
         })
     }
 
@@ -2608,7 +2695,7 @@ impl RwTxn {
         self.write(|work| {
             let i = work.working(table)?;
             if work.tables[i].record.dup.is_some() {
-                return dup_delete(work, i, key)
+                return dup_delete(work, i, key, NO_DUP_HINT)
                     .map(|r| write::Removed { found: r.found, slot: None });
             }
             let (writer, w) = work.writer_and_table(i);
@@ -4280,7 +4367,12 @@ impl DupTxnCursor {
     ) -> Result<()> {
         self.track.check(&txn.work).inspect_err(|e| txn.inner.latch.latch_error(e))?;
         let was_current = self.track.up_to_date(&txn.work);
-        let placed = txn.dup_put_entry(&self.track.table, key, value, kind)?;
+        // Up to date at a row of the key, the paths are the trees': the writes route by them.
+        let hints = match key.get(..self.walk.kl()) {
+            Some(k) if was_current => self.walk.hints(k, &self.outer_root),
+            _ => NO_DUP_HINT,
+        };
+        let placed = txn.dup_put_entry(&self.track.table, key, value, kind, hints)?;
         self.deleted = false;
         self.track.writes = self.track.table_writes(&txn.work);
         let work = &txn.work;
@@ -4333,7 +4425,10 @@ impl DupTxnCursor {
         // The row the cursor is at (while `deleted`, the follower) becomes the deleted row.
         self.deleted_key.clear();
         self.deleted_key.extend_from_slice(self.walk.key());
-        let removed = match txn.dup_delete_entry(&self.track.table, &self.deleted_key) {
+        // Synced and at the row: the delete routes by the cursor's paths.
+        let k = &self.deleted_key[..self.walk.kl()];
+        let hints = self.walk.hints(k, &self.outer_root);
+        let removed = match txn.dup_delete_entry(&self.track.table, &self.deleted_key, hints) {
             Ok(removed) if removed.found => removed,
             Ok(_) => {
                 let cause = format!(
