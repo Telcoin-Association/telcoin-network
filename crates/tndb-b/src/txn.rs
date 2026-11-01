@@ -519,6 +519,7 @@ fn dup_put(
                 s,
                 value,
                 kind,
+                write::NO_HINT,
             )?;
             n.changed = true;
             apply_delta(dup_mut(&mut w.record.dup), &w.table, k, &before, &n.root)?;
@@ -544,6 +545,7 @@ fn dup_put(
         s,
         value,
         PutKind::Upsert,
+        write::NO_HINT,
     )?;
     let outer_kind = if kind == PutKind::Append { PutKind::Append } else { PutKind::Insert };
     match write::put_outer_cell(
@@ -555,6 +557,7 @@ fn dup_put(
         write::OuterCell::Nested(&root),
         cells(packed_max),
         outer_kind,
+        write::NO_HINT,
     ) {
         Ok(_) => {}
         Err(Error::KeyExists | Error::AppendOutOfOrder) => {
@@ -600,6 +603,7 @@ fn packed_create(
         write::OuterCell::Packed(&w.packed_out),
         write::Cells::Packing,
         outer_kind,
+        write::NO_HINT,
     ) {
         Ok(_) => {}
         Err(Error::KeyExists | Error::AppendOutOfOrder) => {
@@ -664,6 +668,7 @@ fn packed_put(
         write::OuterCell::Packed(&w.packed_out),
         write::Cells::Packing,
         PutKind::Upsert,
+        write::NO_HINT,
     )?;
     if !placed.replaced {
         return Err(Error::Failed(format!(
@@ -714,6 +719,7 @@ fn promote(
         sj,
         vj,
         PutKind::Append,
+        write::NO_HINT,
     ) {
         Ok(_) => Ok(()),
         Err(Error::KeyExists | Error::AppendOutOfOrder) => Err(Error::Failed(format!(
@@ -746,6 +752,7 @@ fn promote(
         write::OuterCell::Nested(&root),
         write::Cells::Packing,
         PutKind::Upsert,
+        write::NO_HINT,
     )?;
     if !placed.replaced {
         return Err(Error::Failed(format!(
@@ -798,7 +805,8 @@ fn dup_delete(work: &mut Work, i: usize, key: &[u8]) -> Result<DupRemoved> {
         }
     };
     let before = n.root;
-    let removed = write::delete_cached(writer, &mut n.root, &mut n.trusted, &mut n.cache, s)?;
+    let removed =
+        write::delete_cached(writer, &mut n.root, &mut n.trusted, &mut n.cache, s, write::NO_HINT)?;
     if !removed.found {
         return Ok(missed);
     }
@@ -816,6 +824,7 @@ fn dup_delete(work: &mut Work, i: usize, key: &[u8]) -> Result<DupRemoved> {
             &mut w.cache,
             k,
             cells(packed_max),
+            write::NO_HINT,
         )?;
         if !removed.found {
             return Err(no_cell(&w.table, k));
@@ -860,6 +869,7 @@ fn packed_delete(work: &mut Work, i: usize, k: &[u8], s: &[u8]) -> Result<DupRem
             &mut w.cache,
             k,
             write::Cells::Packing,
+            write::NO_HINT,
         )?;
         if !removed.found {
             return Err(no_cell(&w.table, k));
@@ -876,6 +886,7 @@ fn packed_delete(work: &mut Work, i: usize, k: &[u8], s: &[u8]) -> Result<DupRem
             write::OuterCell::Packed(&w.packed_out),
             write::Cells::Packing,
             PutKind::Upsert,
+            write::NO_HINT,
         )?;
         if !placed.replaced {
             return Err(Error::Failed(format!(
@@ -1070,6 +1081,7 @@ fn dup_delete_prefix(work: &mut Work, i: usize, key: &[u8]) -> Result<u64> {
                 &mut w.cache,
                 key,
                 write::Cells::Packing,
+                write::NO_HINT,
             )?;
             if !removed.found {
                 return Err(no_cell(&w.table, key));
@@ -1093,6 +1105,7 @@ fn dup_delete_prefix(work: &mut Work, i: usize, key: &[u8]) -> Result<u64> {
         &mut w.cache,
         key,
         cells(packed_max),
+        write::NO_HINT,
     )?;
     if !removed.found {
         return Err(no_cell(&w.table, key));
@@ -2243,6 +2256,7 @@ impl Work {
                 write::OuterCell::Nested(&n.root),
                 cells(packed_max),
                 PutKind::Upsert,
+                write::NO_HINT,
             )?;
             if !placed.replaced {
                 return Err(Error::Failed(format!(
@@ -2454,7 +2468,7 @@ impl RwTxn {
     /// table keyed `k ‖ s` refuses, and a key with no subkey (at most `key_len` bytes) is then
     /// [`Error::KeyTooShort`]. The row goes into `k`'s nested tree, which a new `k` creates.
     pub fn put(&mut self, table: &Table, key: &[u8], value: &[u8]) -> Result<()> {
-        self.put_entry(table, key, value, PutKind::Upsert, None).map(drop)
+        self.put_entry(table, key, value, PutKind::Upsert, None, false).map(drop)
     }
 
     /// Store `value` under `key` in `table` as its new last entry: `key` must sort strictly after
@@ -2471,7 +2485,7 @@ impl RwTxn {
     /// nested tree (a subkey not past that tree's last is refused), and a later one starts a new
     /// nested tree. A key with no subkey is [`Error::KeyTooShort`].
     pub fn append(&mut self, table: &Table, key: &[u8], value: &[u8]) -> Result<()> {
-        self.put_entry(table, key, value, PutKind::Append, None).map(drop)
+        self.put_entry(table, key, value, PutKind::Append, None, false).map(drop)
     }
 
     /// Store `value` under `key` in `table` only if the table does not hold `key`: a present key is
@@ -2480,13 +2494,15 @@ impl RwTxn {
     /// as [`Self::put`] stores it. In a dup table `key` is the logical key `k ‖ s`: a present
     /// subkey under `k` is [`Error::KeyExists`], and a key with no subkey [`Error::KeyTooShort`].
     pub fn insert(&mut self, table: &Table, key: &[u8], value: &[u8]) -> Result<()> {
-        self.put_entry(table, key, value, PutKind::Insert, None).map(drop)
+        self.put_entry(table, key, value, PutKind::Insert, None, false).map(drop)
     }
 
     /// [`Self::put`], [`Self::append`] or [`Self::insert`] (`kind`). With a `cursor` (an
-    /// [`RwCursor`]'s path and root), the root becomes the table's new one, and when the put
-    /// leaves the table's path cache naming the entry's leaf ([`write::Placed::slot`]), the
-    /// path is placed at the entry. Returns whether it was placed.
+    /// [`RwCursor`]'s or a [`TxnCursor`]'s path and root), the root becomes the table's new one,
+    /// and when the put leaves the table's path cache naming the entry's leaf
+    /// ([`write::Placed::slot`]), the path is placed at the entry. Returns whether it was placed.
+    /// `fresh` says the cursor is up to date with the table: a put that descends then routes by
+    /// the cursor's path ([`TreeCursor::hint`]).
     fn put_entry(
         &mut self,
         table: &Table,
@@ -2494,6 +2510,7 @@ impl RwTxn {
         value: &[u8],
         kind: PutKind,
         cursor: Option<(&mut TreeCursor, &mut TreeRoot)>,
+        fresh: bool,
     ) -> Result<bool> {
         self.inner.geometry.place(key.len(), value.len())?;
         self.write(|work| {
@@ -2514,8 +2531,15 @@ impl RwTxn {
                 w.cache.forget();
             }
             let cache = &mut w.cache;
+            let hint = match &cursor {
+                Some((tree, _)) if fresh => tree.hint(root.height),
+                _ => write::NO_HINT,
+            };
+            // Test-only: every write searches, as before the hint.
+            #[cfg(test)]
+            let hint = if writer.no_write_hint { write::NO_HINT } else { hint };
             let placed =
-                write::put_cached(writer, &mut root, &mut trusted, cache, key, value, kind)?;
+                write::put_cached(writer, &mut root, &mut trusted, cache, key, value, kind, hint)?;
             let mut at = false;
             if let Some((tree, cursor_root)) = cursor {
                 *cursor_root = root;
@@ -2568,13 +2592,19 @@ impl RwTxn {
     /// [`Error::KeyTooShort`] (use [`Self::delete_prefix`] for every row of `k`), and a delete
     /// that empties `k`'s nested tree removes `k` from the outer tree.
     pub fn delete(&mut self, table: &Table, key: &[u8]) -> Result<bool> {
-        Ok(self.delete_entry(table, key)?.found)
+        Ok(self.delete_entry(table, key, write::NO_HINT)?.found)
     }
 
     /// [`Self::delete`] through the table's path cache ([`write::delete_cached`]), returning where
     /// the delete left the cache ([`write::Removed::slot`]: the leaf it names holds the deleted
-    /// entry's follower at that slot).
-    fn delete_entry(&mut self, table: &Table, key: &[u8]) -> Result<write::Removed> {
+    /// entry's follower at that slot). A delete that descends routes by `hint`, the path of an up
+    /// to date cursor at the entry ([`TreeCursor::hint`]), or [`write::NO_HINT`].
+    fn delete_entry(
+        &mut self,
+        table: &Table,
+        key: &[u8],
+        hint: write::Hint<'_>,
+    ) -> Result<write::Removed> {
         self.write(|work| {
             let i = work.working(table)?;
             if work.tables[i].record.dup.is_some() {
@@ -2591,7 +2621,11 @@ impl RwTxn {
             if uncached {
                 w.cache.forget();
             }
-            let removed = write::delete_cached(writer, &mut root, &mut trusted, &mut w.cache, key)?;
+            // Test-only: every delete searches, as before the hint.
+            #[cfg(test)]
+            let hint = if writer.no_write_hint { write::NO_HINT } else { hint };
+            let removed =
+                write::delete_cached(writer, &mut root, &mut trusted, &mut w.cache, key, hint)?;
             #[cfg(test)]
             let removed = write::Removed { slot: removed.slot.filter(|_| !uncached), ..removed };
             if removed.found {
@@ -2942,7 +2976,7 @@ impl RwCursor<'_> {
     /// left in the table's path cache, else found again by key.
     fn put_entry(&mut self, key: &[u8], value: &[u8], kind: PutKind) -> Result<()> {
         let Self { txn, table, root, tree, deleted, .. } = self;
-        if txn.put_entry(table, key, value, kind, Some((tree, root)))? {
+        if txn.put_entry(table, key, value, kind, Some((tree, root)), false)? {
             *deleted = false;
             return Ok(());
         }
@@ -3568,8 +3602,10 @@ impl TxnCursor {
         kind: PutKind,
     ) -> Result<()> {
         self.track.check(&txn.work).inspect_err(|e| txn.inner.latch.latch_error(e))?;
+        // Up to date, the path is the table's: the put's descent routes by it.
+        let fresh = self.track.up_to_date(&txn.work);
         let Self { track, root, tree, .. } = self;
-        let placed = txn.put_entry(&track.table, key, value, kind, Some((tree, root)))?;
+        let placed = txn.put_entry(&track.table, key, value, kind, Some((tree, root)), fresh)?;
         self.deleted = false;
         save_key(&mut self.key, key);
         self.track.writes = self.track.table_writes(&txn.work);
@@ -3615,11 +3651,14 @@ impl TxnCursor {
         })
     }
 
-    /// [`Self::delete_current`] of the entry `key`, which must be there. The cursor lands on the
-    /// deleted entry's follower (or after the end): placed from the table's path cache when the
-    /// delete left it naming the entry's leaf ([`write::Removed::slot`]), else found again by key.
+    /// [`Self::delete_current`] of the entry `key`, which must be there, by a cursor brought up to
+    /// date and at that entry, so the delete's descent routes by its path ([`TreeCursor::hint`]).
+    /// The cursor lands on the deleted entry's follower (or after the end): placed from the
+    /// table's path cache when the delete left it naming the entry's leaf
+    /// ([`write::Removed::slot`]), else found again by key.
     fn delete_key(&mut self, txn: &mut RwTxn, key: &[u8]) -> Result<()> {
-        let removed = txn.delete_entry(&self.track.table, key)?;
+        let hint = self.tree.hint(self.root.height);
+        let removed = txn.delete_entry(&self.track.table, key, hint)?;
         if !removed.found {
             let cause = format!(
                 "the entry under a cursor of table {:?} is missing",

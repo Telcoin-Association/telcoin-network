@@ -44,7 +44,28 @@ thread_local! {
     pub(crate) static CACHED_PUTS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     /// Test-only: how many deletes [`delete_cached`] did in the cached leaf.
     pub(crate) static CACHED_DELETES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// Test-only: how many levels a write descent routed by its [`Hint`]: each branch whose
+    /// hinted child held the key, and each leaf whose hinted slot held it ([`find_at`]).
+    pub(crate) static HINTED_LEVELS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// Test-only: how many hints a write descent dropped: one of another length than the tree's
+    /// height, or at the level where the hinted child or slot did not hold the key.
+    pub(crate) static HINT_REFUSALS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// Test-only: how many searches a write descent and its plan made: each branch routed by
+    /// [`page::BranchView::route`] and each leaf searched by [`page::LeafView::find`] in
+    /// [`find_at`].
+    pub(crate) static WRITE_SEARCHES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
+
+/// A write's routing hint: the slots of a cursor's path to the entry it is at, root first and the
+/// leaf's last, as [`super::cursor::TreeCursor::hint`] gives them; empty for none ([`NO_HINT`]).
+/// [`descend_write`] takes a branch's hinted child only when the key lies in that child's range,
+/// and [`find_at`] a leaf's hinted slot only when it holds the key; anything else is searched, as
+/// without a hint, and the levels below it too. It holds slots only, no page: every page still
+/// comes from the write's own root, through the cells the descent reads, with every check.
+pub(crate) type Hint<'h> = &'h [u16];
+
+/// No hint: the write descent searches every level.
+pub(crate) const NO_HINT: Hint<'static> = &[];
 
 /// What a put does to the leaf it reaches.
 #[derive(Clone, Copy, Debug)]
@@ -244,7 +265,7 @@ pub(crate) fn put_sized<S: PageWrite + ?Sized>(
     key: &[u8],
     value: &[u8],
 ) -> Result<bool> {
-    Ok(put_from_root(store, root, trusted, None, key, value, PutKind::Upsert)?.replaced)
+    Ok(put_from_root(store, root, trusted, None, key, value, PutKind::Upsert, NO_HINT)?.replaced)
 }
 
 /// [`put_sized`], or an append or an insert (`kind`), through a table's write-path `cache`
@@ -256,7 +277,9 @@ pub(crate) fn put_sized<S: PageWrite + ?Sized>(
 /// does not sort after the tree's last key. An insert of a present key is refused where it is
 /// found: in the cached leaf (the cache kept), else by the descent's plan (the cache left empty). A
 /// value stored in an overflow run, and a replace of one, always descend: the run is allocated, or
-/// the old one freed, with the tree's other pages.
+/// the old one freed, with the tree's other pages. A descent routes by `hint` where it holds
+/// ([`Hint`]): the cache first, the hint second, the search last.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn put_cached<S: PageWrite + ?Sized>(
     store: &mut S,
     root: &mut TreeRoot,
@@ -265,6 +288,7 @@ pub(crate) fn put_cached<S: PageWrite + ?Sized>(
     key: &[u8],
     value: &[u8],
     kind: PutKind,
+    hint: Hint<'_>,
 ) -> Result<Placed> {
     if *trusted
         && cache.epoch == store.epoch()
@@ -274,7 +298,7 @@ pub(crate) fn put_cached<S: PageWrite + ?Sized>(
             return Ok(placed);
         }
     }
-    put_from_root(store, root, trusted, Some(cache), key, value, kind)
+    put_from_root(store, root, trusted, Some(cache), key, value, kind, hint)
 }
 
 /// What an outer cell of a dup table holds ([`put_outer_cell`]): the root of the key's nested
@@ -299,7 +323,8 @@ pub(crate) enum OuterCell<'a> {
 /// limits ([`Geometry::check_entry`]); an empty `nested` is a broken invariant (an outer cell
 /// names a non-empty tree, which [`page::validate`] requires of every nested cell). A packed set
 /// is a broken invariant when empty, under `Outer`, or past the inline limits (the dup layer
-/// bounds it by the table's `packed_max`, at most [`Geometry::max_value`] of the key).
+/// bounds it by the table's `packed_max`, at most [`Geometry::max_value`] of the key). A descent
+/// routes by `hint` where it holds ([`Hint`]).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn put_outer_cell<S: PageWrite + ?Sized>(
     store: &mut S,
@@ -310,6 +335,7 @@ pub(crate) fn put_outer_cell<S: PageWrite + ?Sized>(
     cell: OuterCell<'_>,
     cells: Cells,
     kind: PutKind,
+    hint: Hint<'_>,
 ) -> Result<Placed> {
     let encoded;
     let value = match (cell, cells) {
@@ -342,7 +368,7 @@ pub(crate) fn put_outer_cell<S: PageWrite + ?Sized>(
             return Ok(placed);
         }
     }
-    put_from_root(store, root, trusted, Some(cache), key, value, kind)
+    put_from_root(store, root, trusted, Some(cache), key, value, kind, hint)
 }
 
 /// [`put_sized`], or an append or an insert (`kind`): descend from the root, plan, reserve,
@@ -350,7 +376,9 @@ pub(crate) fn put_outer_cell<S: PageWrite + ?Sized>(
 /// is done) when the put did not split, or did an append split. After an append split whose
 /// separator the leaf's parent took, the most common one, the new path is the descent's with the
 /// parent's step moved to its new last cell and the new right leaf, which holds only the entry;
-/// after one that split a branch or grew a new root, a second, trusted descent finds it.
+/// after one that split a branch or grew a new root, a second, trusted descent finds it. The
+/// first descent routes by `hint` where it holds ([`Hint`]); the second searches.
+#[allow(clippy::too_many_arguments)]
 fn put_from_root<'v, S: PageWrite + ?Sized>(
     store: &mut S,
     root: &mut TreeRoot,
@@ -359,6 +387,7 @@ fn put_from_root<'v, S: PageWrite + ?Sized>(
     key: &[u8],
     value: impl Into<NewVal<'v>>,
     kind: PutKind,
+    hint: Hint<'_>,
 ) -> Result<Placed> {
     let value: NewVal<'v> = value.into();
     root.check()?;
@@ -416,7 +445,7 @@ fn put_from_root<'v, S: PageWrite + ?Sized>(
         None => (own_path.insert(Path::new()), None),
     };
     let vlen = if run_pages.is_some() { OVF_CELL } else { value.cell_len() };
-    let planned = plan(&*store, root, *trusted, key, vlen, kind, value.cells(), path)?;
+    let planned = plan(&*store, root, *trusted, key, vlen, kind, value.cells(), path, hint)?;
     let Planned { leaf, change, needed, range, old_run } = planned;
     if let Some(tail) = tail.as_mut() {
         tail.set_range(range);
@@ -481,8 +510,9 @@ fn put_from_root<'v, S: PageWrite + ?Sized>(
             // non-emptiness).
             None => {
                 path.len = 0;
+                let cells = value.cells();
                 let (found, _) =
-                    descend_write(&*store, root, true, key, Verify::Now, value.cells(), path)?;
+                    descend_write(&*store, root, true, key, Verify::Now, cells, path, NO_HINT)?;
                 let Find::Found { index, .. } = found.view.find(key)? else {
                     return Err(bug("a split lost the entry it put"));
                 };
@@ -511,7 +541,7 @@ fn assert_found_again<S: PageWrite + ?Sized>(
     right: u32,
 ) {
     let mut again = Path::new();
-    let found = descend_write(store, root, true, key, Verify::Now, cells, &mut again)
+    let found = descend_write(store, root, true, key, Verify::Now, cells, &mut again, NO_HINT)
         .and_then(|(found, _)| Ok((found.pgno, found.range, found.view.find(key)?)));
     let same = match found {
         Ok((pgno, (Some(lo), None), Find::Found { index: 0, .. })) => {
@@ -764,20 +794,22 @@ fn change_cached_leaf(
 /// hold is a miss with no descent. Any other delete descends ([`delete_from_root`]) and refills the
 /// cache after a delete that only took the entry out of its leaf (or a miss on a path of this
 /// transaction's own pages). The returned slot places a cursor at the deleted entry's follower
-/// ([`Removed::slot`]).
+/// ([`Removed::slot`]). A descent routes by `hint` where it holds ([`Hint`]): the cache first, the
+/// hint second, the search last.
 pub(crate) fn delete_cached<S: PageWrite + ?Sized>(
     store: &mut S,
     root: &mut TreeRoot,
     trusted: &mut bool,
     cache: &mut PathCache,
     key: &[u8],
+    hint: Hint<'_>,
 ) -> Result<Removed> {
     if *trusted && cache.epoch == store.epoch() {
         if let Some(removed) = delete_in_cached_leaf(store, root, cache, key, Cells::Plain)? {
             return Ok(removed);
         }
     }
-    delete_from_root(store, root, trusted, Some(cache), key, Cells::Plain)
+    delete_from_root(store, root, trusted, Some(cache), key, Cells::Plain, hint)
 }
 
 /// Delete the cell of `key` from a dup table's outer tree `root`, whose cells `cells` names
@@ -785,7 +817,8 @@ pub(crate) fn delete_cached<S: PageWrite + ?Sized>(
 /// cached leaf when the delete changes only that leaf, else by a descent that copies, unlinks,
 /// merges or collapses as a table delete does. The cell must be one `cells` holds (any other is
 /// [`Error::Corrupt`]); the tree a nested cell named is not freed here: the nested writes own it
-/// (and emptied it, or free it themselves). `Cells::Plain` is a broken invariant.
+/// (and emptied it, or free it themselves). `Cells::Plain` is a broken invariant. A descent routes
+/// by `hint` where it holds ([`Hint`]).
 pub(crate) fn delete_outer_cell<S: PageWrite + ?Sized>(
     store: &mut S,
     root: &mut TreeRoot,
@@ -793,6 +826,7 @@ pub(crate) fn delete_outer_cell<S: PageWrite + ?Sized>(
     cache: &mut PathCache,
     key: &[u8],
     cells: Cells,
+    hint: Hint<'_>,
 ) -> Result<Removed> {
     if cells == Cells::Plain {
         return Err(bug("an outer cell delete under the Plain policy"));
@@ -802,7 +836,7 @@ pub(crate) fn delete_outer_cell<S: PageWrite + ?Sized>(
             return Ok(removed);
         }
     }
-    delete_from_root(store, root, trusted, Some(cache), key, cells)
+    delete_from_root(store, root, trusted, Some(cache), key, cells, hint)
 }
 
 /// [`delete_cached`]'s delete in the cached leaf, which the caller found valid in this epoch for a
@@ -986,6 +1020,9 @@ struct WriteLeaf<'s> {
     /// [`Verify::Later`] skipped a published page on the path that this writer did not stamp:
     /// [`verify_path`] verifies it before the write trusts or copies it.
     unverified: bool,
+    /// The leaf's slot in the descent's [`Hint`] when every branch above followed it, for
+    /// [`find_at`]; `None` when there was no hint or a level refused it.
+    hint_slot: Option<usize>,
 }
 
 /// When [`descend_write`] verifies the published pages on its path that this writer did not
@@ -1021,6 +1058,18 @@ enum Verify {
 /// not needed. A page [`verify_published`] checks also gets [`check_cells_naming_this_txn`], so
 /// its private copy names no page or run by this transaction's id that the copy-time trust would
 /// not vouch for; `cells` is the tree's policy for the leaf it checks ([`Cells`]).
+///
+/// **The hint.** With a [`Hint`] of the tree's height, each branch takes the hinted child when
+/// `key` lies in that child's range ([`route_by_hint`]: the child's `[lo, hi)` read from the cells,
+/// the bounds a search gives), else it searches, and so does every level below; the leaf's hinted
+/// slot goes to the caller's search ([`WriteLeaf::hint_slot`], [`find_at`]). The hint is read only
+/// where the search runs, after every check of the page, and the child comes from the page's own
+/// cell, so a hinted descent checks what a search's does, in the same order. On a page a write
+/// accepts (a private page, built from checked ones; a published page verified, or stamped by this
+/// writer) the keys ascend, so the one child whose range holds the key is the search's, and the
+/// descent returns what a search returns. Only an unverified page ([`Verify::Later`]) may route
+/// another way than its search would; [`verify_path`] then refuses it on a hit, before any change.
+#[allow(clippy::too_many_arguments)]
 fn descend_write<'s, S: PageWrite + ?Sized>(
     store: &'s S,
     root: &TreeRoot,
@@ -1029,6 +1078,7 @@ fn descend_write<'s, S: PageWrite + ?Sized>(
     verify: Verify,
     cells: Cells,
     path: &mut Path,
+    hint: Hint<'_>,
 ) -> Result<(WriteLeaf<'s>, usize)> {
     let geometry = store.geometry();
     let (mut pgno, mut want_txn) = (root.root, root.root_txn);
@@ -1037,6 +1087,13 @@ fn descend_write<'s, S: PageWrite + ?Sized>(
     // The intersected separators, once an untrusted page needed them.
     let mut bounds: Option<Bounds<'s>> = None;
     let mut range: Bounds<'s> = (None, None);
+    // The hint while every level so far followed it; a slot per level, the leaf's last.
+    let mut hint = hint;
+    if !hint.is_empty() && hint.len() != root.height as usize {
+        #[cfg(all(test, debug_assertions))]
+        HINT_REFUSALS.with(|n| n.set(n.get() + 1));
+        hint = NO_HINT;
+    }
     for depth in 1..=root.height {
         let trusted = store.is_private(pgno);
         if trusted && !parent_trusted {
@@ -1094,10 +1151,26 @@ fn descend_write<'s, S: PageWrite + ?Sized>(
                     return Err(Error::Corrupt(format!("non-root leaf {pgno} is empty")));
                 }
                 let range = bounds.unwrap_or(range);
-                return Ok((WriteLeaf { pgno, page, view, range, unverified }, copies));
+                let hint_slot = hint.last().map(|&slot| usize::from(slot));
+                return Ok((WriteLeaf { pgno, page, view, range, unverified, hint_slot }, copies));
             }
             page::View::Branch(view) => {
-                let route = view.route(key)?;
+                let hinted = match hint.split_first() {
+                    Some((&slot, below)) => {
+                        let route = route_by_hint(&view, usize::from(slot), key);
+                        hint = if route.is_some() { below } else { NO_HINT };
+                        route
+                    }
+                    None => None,
+                };
+                let route = match hinted {
+                    Some(route) => route,
+                    None => {
+                        #[cfg(all(test, debug_assertions))]
+                        WRITE_SEARCHES.with(|n| n.set(n.get() + 1));
+                        view.route(key)?
+                    }
+                };
                 if let Some((lo, hi)) = bounds.as_mut() {
                     tighten(&route, lo, hi);
                 }
@@ -1110,6 +1183,51 @@ fn descend_write<'s, S: PageWrite + ?Sized>(
     }
     // The loop returns at depth == height (checked to be >= 1 by `root.check`).
     Err(Error::Corrupt(format!("descent of a tree of height {} found no leaf", root.height)))
+}
+
+/// The [`page::Route`] to child `slot` of `view` if `key` lies in that child's range `[lo, hi)`
+/// (its cell's key and the next cell's, [`page::BranchView::route_at`]): the route
+/// [`page::BranchView::route`] gives on a branch whose keys ascend. `None`, a refusal, for a slot
+/// past the cells, a cell the route cannot read (the search then meets the damage as it would) or
+/// a key outside the range.
+#[inline]
+fn route_by_hint<'s>(
+    view: &page::BranchView<'s>,
+    slot: usize,
+    key: &[u8],
+) -> Option<page::Route<'s>> {
+    let route = (slot < view.nkeys()).then(|| view.route_at(slot).ok()).flatten();
+    let held = route.filter(|route| {
+        route.lo.is_none_or(|lo| page::cmp_keys(lo, key).is_le())
+            && route.hi.is_none_or(|hi| page::cmp_keys(key, hi).is_lt())
+    });
+    #[cfg(all(test, debug_assertions))]
+    if held.is_some() {
+        HINTED_LEVELS.with(|n| n.set(n.get() + 1));
+    } else {
+        HINT_REFUSALS.with(|n| n.set(n.get() + 1));
+    }
+    held
+}
+
+/// [`page::LeafView::find`] of `key`, which a [`Hint`]'s leaf slot `slot` answers with no search
+/// when the entry there holds `key` (one compare); any other slot, or a cell there that does not
+/// read, searches. On a leaf whose keys ascend the answer is the search's.
+#[inline]
+fn find_at<'s>(view: &page::LeafView<'s>, slot: Option<usize>, key: &[u8]) -> Result<Find<'s>> {
+    if let Some(index) = slot {
+        let entry = (index < view.nkeys()).then(|| view.entry(index).ok()).flatten();
+        if let Some((_, value)) = entry.filter(|&(at, _)| page::cmp_keys(at, key).is_eq()) {
+            #[cfg(all(test, debug_assertions))]
+            HINTED_LEVELS.with(|n| n.set(n.get() + 1));
+            return Ok(Find::Found { index, value });
+        }
+        #[cfg(all(test, debug_assertions))]
+        HINT_REFUSALS.with(|n| n.set(n.get() + 1));
+    }
+    #[cfg(all(test, debug_assertions))]
+    WRITE_SEARCHES.with(|n| n.set(n.get() + 1));
+    view.find(key)
 }
 
 /// A published branch the write will copy must not name a child by this transaction's `child_txn`
@@ -1274,7 +1392,8 @@ struct Planned<'s> {
 /// A replaced value the tree may not hold (`cells`) is [`Error::Corrupt`]; an outer cell's
 /// nested tree is not this put's to free. Always inlined: [`put_from_root`], its one caller, is
 /// monomorphized per value source and passes `cells` as a constant, so a table put's match folds
-/// to the plain arms.
+/// to the plain arms. The descent and the leaf's search route by `hint` where it holds ([`Hint`]);
+/// an append keeps its compare with the leaf's last key.
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]
 fn plan<'s, S: PageWrite + ?Sized>(
@@ -1286,12 +1405,14 @@ fn plan<'s, S: PageWrite + ?Sized>(
     kind: PutKind,
     cells: Cells,
     path: &mut Path,
+    hint: Hint<'_>,
 ) -> Result<Planned<'s>> {
-    let (leaf, copies) = descend_write(store, root, root_trusted, key, Verify::Now, cells, path)?;
+    let (leaf, copies) =
+        descend_write(store, root, root_trusted, key, Verify::Now, cells, path, hint)?;
     let view = leaf.view;
     let found = match kind {
-        PutKind::Upsert => view.find(key)?,
-        PutKind::Insert => match view.find(key)? {
+        PutKind::Upsert => find_at(&view, leaf.hint_slot, key)?,
+        PutKind::Insert => match find_at(&view, leaf.hint_slot, key)? {
             Find::Found { .. } => return Err(Error::KeyExists),
             missing => missing,
         },
@@ -1840,7 +1961,7 @@ pub(crate) fn delete<S: PageWrite + ?Sized>(
     trusted: &mut bool,
     key: &[u8],
 ) -> Result<bool> {
-    Ok(delete_from_root(store, root, trusted, None, key, Cells::Plain)?.found)
+    Ok(delete_from_root(store, root, trusted, None, key, Cells::Plain, NO_HINT)?.found)
 }
 
 /// [`delete`], with a table's `cache` if given: the descent records its path straight into the
@@ -1849,7 +1970,8 @@ pub(crate) fn delete<S: PageWrite + ?Sized>(
 /// after a [`DeleteShape::Leaf`] delete that merged nothing, with the epoch its copies left; a
 /// miss fills it when every page on its path is this transaction's own (nothing copied, nothing
 /// verified, the epoch unchanged). Any other delete (an unlink, a collapse, an empty tree, a
-/// merge) frees pages and leaves the cache empty. `cells` is the tree's policy ([`Cells`]).
+/// merge) frees pages and leaves the cache empty. `cells` is the tree's policy ([`Cells`]); the
+/// descent routes by `hint` where it holds ([`Hint`]).
 fn delete_from_root<S: PageWrite + ?Sized>(
     store: &mut S,
     root: &mut TreeRoot,
@@ -1857,6 +1979,7 @@ fn delete_from_root<S: PageWrite + ?Sized>(
     cache: Option<&mut PathCache>,
     key: &[u8],
     cells: Cells,
+    hint: Hint<'_>,
 ) -> Result<Removed> {
     const MISS: Removed = Removed { found: false, slot: None };
     root.check()?;
@@ -1871,7 +1994,8 @@ fn delete_from_root<S: PageWrite + ?Sized>(
         }
         None => (own_path.insert(Path::new()), None),
     };
-    let Some(plan) = plan_delete(&*store, root, *trusted, key, cells, path, tail.as_mut())? else {
+    let Some(plan) = plan_delete(&*store, root, *trusted, key, cells, path, tail.as_mut(), hint)?
+    else {
         return Ok(MISS);
     };
     let buffers = plan.copies != 0 || !plan.merges.is_empty();
@@ -1926,7 +2050,9 @@ fn delete_from_root<S: PageWrite + ?Sized>(
 /// (the path a put's descent caches), since a miss changes nothing.
 ///
 /// A deleted value the tree may not hold (`cells`) is [`Error::Corrupt`]; an outer cell's nested
-/// tree is not this delete's to free.
+/// tree is not this delete's to free. The descent and the leaf's search route by `hint` where it
+/// holds ([`Hint`]); everything after them reads only the path.
+#[allow(clippy::too_many_arguments)]
 fn plan_delete<S: PageWrite + ?Sized>(
     store: &S,
     root: &TreeRoot,
@@ -1935,14 +2061,15 @@ fn plan_delete<S: PageWrite + ?Sized>(
     cells: Cells,
     path: &mut Path,
     mut tail: Option<&mut CacheTail<'_>>,
+    hint: Hint<'_>,
 ) -> Result<Option<DeletePlan>> {
     let geometry = store.geometry();
     let (leaf, published) =
-        descend_write(store, root, root_trusted, key, Verify::Later, cells, path)?;
+        descend_write(store, root, root_trusted, key, Verify::Later, cells, path, hint)?;
     if let Some(tail) = &mut tail {
         tail.set_range(leaf.range);
     }
-    let (at, value) = match leaf.view.find(key)? {
+    let (at, value) = match find_at(&leaf.view, leaf.hint_slot, key)? {
         Find::Found { index, value } => (index, value),
         Find::NotFound { before, after, .. } => {
             check_miss(leaf.pgno, before, after, leaf.range.0, leaf.range.1)?;
@@ -2998,7 +3125,8 @@ mod tests {
         let Some(cache) = cache else { return put(store, root, key, value) };
         store.geometry().place(key.len(), value.len())?;
         let mut trusted = !root.is_empty() && store.is_private(root.root);
-        Ok(put_cached(store, root, &mut trusted, cache, key, value, PutKind::Upsert)?.replaced)
+        Ok(put_cached(store, root, &mut trusted, cache, key, value, PutKind::Upsert, NO_HINT)?
+            .replaced)
     }
 
     /// [`delete`], through a table's path cache when given ([`delete_cached`]).
@@ -3010,7 +3138,7 @@ mod tests {
     ) -> Result<bool> {
         let Some(cache) = cache else { return delete(store, root, key) };
         let mut trusted = !root.is_empty() && store.is_private(root.root);
-        Ok(delete_cached(store, root, &mut trusted, cache, key)?.found)
+        Ok(delete_cached(store, root, &mut trusted, cache, key, NO_HINT)?.found)
     }
 
     /// A random entry: a fresh key (mostly short, sometimes up to the key limit) or, a third of the
@@ -3540,6 +3668,383 @@ mod tests {
         assert_eq!(get(&store, &root, b"o").expect("get"), Some(&b"new"[..]));
     }
 
+    /// The levels write descents routed by a hint on this thread so far ([`HINTED_LEVELS`]); 0 in
+    /// a release build, whose callers then check nothing.
+    fn hinted_levels() -> u64 {
+        #[cfg(debug_assertions)]
+        return HINTED_LEVELS.with(std::cell::Cell::get);
+        #[cfg(not(debug_assertions))]
+        0
+    }
+
+    /// The slots a search takes to `key` from `root`, read from the raw pages with no check (so
+    /// through damage too), then the leaf's slot of the key or of its insertion point: the hint a
+    /// cursor at `key` passes ([`Hint`]).
+    fn searched_slots(store: &MemStore, root: &TreeRoot, key: &[u8]) -> Vec<u16> {
+        let mut slots = Vec::new();
+        let mut p = root.root;
+        for _ in 1..root.height {
+            let route = page::BranchView::new(store.raw(p)).and_then(|b| b.route(key));
+            let route = route.expect("route");
+            slots.push(route.index as u16);
+            p = route.child;
+        }
+        let found = page::LeafView::new(store.raw(p)).and_then(|leaf| leaf.find(key));
+        let (Find::Found { index, .. } | Find::NotFound { index, .. }) = found.expect("find");
+        slots.push(index as u16);
+        slots
+    }
+
+    /// What [`descend_write`] returns for `key` along `hint` (the leaf, the path, the range,
+    /// `unverified`, the copies, and the leaf's answer through [`find_at`]) as text, or its error;
+    /// and whether every branch followed the hint.
+    fn hinted_descent(
+        store: &MemStore,
+        root: &TreeRoot,
+        key: &[u8],
+        verify: Verify,
+        hint: Hint<'_>,
+    ) -> (std::result::Result<String, String>, bool) {
+        let trusted = store.is_private(root.root);
+        let mut path = Path::new();
+        match descend_write(store, root, trusted, key, verify, Cells::Plain, &mut path, hint) {
+            Ok((leaf, copies)) => {
+                let found = find_at(&leaf.view, leaf.hint_slot, key);
+                let text = format!(
+                    "leaf {} path {:?} range {:?} unverified {} copies {copies} found {found:?}",
+                    leaf.pgno, &*path, leaf.range, leaf.unverified
+                );
+                (Ok(text), leaf.hint_slot.is_some())
+            }
+            Err(e) => (Err(e.to_string()), false),
+        }
+    }
+
+    /// [`a_hinted_descent_matches_the_search`] on one tree of `n` random `klen`-byte keys, in
+    /// `state` 0 (private), 1 (stamped by this writer), 2 (published, read from disk) or 3
+    /// (published, with private paths through it), probing about `probed` keys spread over it.
+    /// Returns the tree's height and how many hints a branch refused.
+    fn hinted_descents_match(
+        seed: u64,
+        n: usize,
+        klen: usize,
+        state: u64,
+        probed: usize,
+    ) -> (u32, usize) {
+        let _report = ReportSeed(seed);
+        let mut rng = Rng(seed);
+        let mut store = MemStore::new(4096);
+        let (mut root, mut other) = (TreeRoot::EMPTY, TreeRoot::EMPTY);
+        let random_key = |rng: &mut Rng| (0..klen).map(|_| rng.next() as u8).collect::<Vec<u8>>();
+        let mut keys = Vec::new();
+        for i in 0..n {
+            let (k, v) = (random_key(&mut rng), vec![i as u8; rng.len_upto(16)]);
+            put(&mut store, &mut root, &k, &v).expect("put");
+            put(&mut store, &mut other, &random_key(&mut rng), b"o").expect("put");
+            keys.push(k);
+        }
+        match state {
+            0 => {}
+            1 => store.commit_like(),
+            _ => store.reopen(),
+        }
+        if state == 3 {
+            for _ in 0..n.div_ceil(10) {
+                let k = keys[rng.below(n as u64) as usize].clone();
+                put(&mut store, &mut root, &k, b"again").expect("put");
+            }
+        }
+        keys.sort();
+        keys.dedup();
+        // Every key, a key just after each (between it and the next), one before all and one
+        // after all.
+        let mut probes = vec![vec![0], vec![0xFF; klen + 1]];
+        for k in &keys {
+            probes.extend([k.clone(), [&k[..], &[0]].concat()]);
+        }
+        let height = root.height as usize;
+        let mut refused = 0;
+        let stride = probes.len().div_ceil(probed).max(1);
+        for (j, key) in probes.iter().enumerate().step_by(stride) {
+            let own = searched_slots(&store, &root, key);
+            let mut moved = own.clone();
+            let level = rng.below(height as u64) as usize;
+            moved[level] =
+                if rng.below(2) == 0 { moved[level].wrapping_sub(1) } else { moved[level] + 1 };
+            let hints = [
+                ("neighbour", searched_slots(&store, &root, &probes[(j + 1) % probes.len()])),
+                ("random", (0..height).map(|_| rng.below(48) as u16).collect()),
+                ("moved", moved),
+                ("short", own[..height - 1].to_vec()),
+                ("long", [&own[..], &[0]].concat()),
+                ("other tree", searched_slots(&store, &other, key)),
+            ];
+            for verify in [Verify::Now, Verify::Later] {
+                let (searched, _) = hinted_descent(&store, &root, key, verify, NO_HINT);
+                assert!(searched.is_ok(), "seed {seed}: {searched:?}");
+                let (hinted, followed) = hinted_descent(&store, &root, key, verify, &own);
+                assert_eq!(hinted, searched, "seed {seed}: the own path of {key:?}");
+                assert!(followed, "seed {seed}: the own path of {key:?} routes every level");
+                for (what, hint) in &hints {
+                    let (hinted, followed) = hinted_descent(&store, &root, key, verify, hint);
+                    assert_eq!(hinted, searched, "seed {seed}: a {what} hint {hint:?} for {key:?}");
+                    refused += usize::from(!followed && hint.len() == height && height > 1);
+                }
+            }
+        }
+        (root.height, refused)
+    }
+
+    /// A write descent routed by a hint returns what the search returns ([`descend_write`]: the
+    /// leaf, the path, the range, `unverified`, the copies; the leaf's answer through
+    /// [`find_at`]) for every key of trees of height 1 to 4, and the keys between them, with the
+    /// tree private, stamped by this writer, published, and published with private paths through
+    /// it; with every kind of hint: the key's own path (which routes every level), a neighbour's,
+    /// random slots, the own path with one slot moved by one, one level too short or too long,
+    /// and another tree's. A coverage gate: branches refused hints in every tree of two levels or
+    /// more. About 300 keys a tree; the heavy twin probes every key, over more seeds.
+    #[test]
+    fn a_hinted_descent_matches_the_search() {
+        hinted_descents_match_the_search(1, 300);
+    }
+
+    #[test]
+    #[ignore = "heavy: run with --release"]
+    fn a_hinted_descent_matches_the_search_heavy() {
+        hinted_descents_match_the_search(4, usize::MAX);
+    }
+
+    /// [`a_hinted_descent_matches_the_search`] over `seeds` seeds of each tree shape, with about
+    /// `probes` keys probed a tree.
+    fn hinted_descents_match_the_search(seeds: u64, probes: usize) {
+        let mut heights = HashSet::new();
+        for (shape, n, klen) in [(1, 6, 8), (2, 300, 16), (3, 900, 120), (4, 1_500, 300)] {
+            for seed in (0..seeds).map(|s| shape * 100 + s * 10) {
+                for state in 0..4 {
+                    let (height, refused) =
+                        hinted_descents_match(seed + state, n, klen, state, probes);
+                    assert!(height == 1 || refused > 0, "seed {seed}: no branch refused a hint");
+                    heights.insert(height);
+                }
+            }
+        }
+        assert_eq!(heights, HashSet::from([1, 2, 3, 4]), "every height");
+    }
+
+    /// A tree damaged for [`a_hinted_write_meets_damage_as_a_descent_does`]: the store, the
+    /// handle and its trust, a key whose put and one whose delete reach the damage, the depth of
+    /// the damaged page, and a phrase of the message.
+    struct Damaged {
+        store: MemStore,
+        root: TreeRoot,
+        trusted: bool,
+        put: Vec<u8>,
+        delete: Vec<u8>,
+        depth: u64,
+        msg: &'static str,
+    }
+
+    /// The cases of [`damaged`].
+    const DAMAGE_CASES: [&str; 7] = [
+        "a private page under a published parent",
+        "an untrusted root naming a private page",
+        "a stale child txn",
+        "a CRC flip on a published leaf",
+        "a CRC flip on a published branch",
+        "keys outside the separators",
+        "a published cell naming this txn's page",
+    ];
+
+    /// A published tree of height 3: [`wide_tree`] of 200-byte keys.
+    fn tall_tree() -> (MemStore, TreeRoot) {
+        let (store, root, _) = wide_tree(1_000, 200);
+        assert_eq!(root.height, 3, "a branch below the root");
+        (store, root)
+    }
+
+    /// The damage `case` ([`DAMAGE_CASES`]), built afresh: the fixtures of the provenance,
+    /// copy-time and range tests above, and CRC flips.
+    fn damaged(case: &str) -> Damaged {
+        let word = |s: &[u8]| s.to_vec();
+        match case {
+            "a private page under a published parent"
+            | "an untrusted root naming a private page" => {
+                // A stamped root whose cell 1 is forged to name another tree's private page X
+                // (`a_published_cell_naming_a_private_page_is_refused`).
+                let mut store = MemStore::new(4096);
+                let left = leaf_page(&mut store, &[b"a"]);
+                let right = leaf_page(&mut store, &[b"m", b"n"]);
+                let r = branch_page(&mut store, &[(Vec::new(), left), (b"m".to_vec(), right)]);
+                let root = TreeRoot {
+                    root: r,
+                    root_txn: store.txn() as u32,
+                    height: 2,
+                    entries: 3,
+                    branch_pages: 1,
+                    leaf_pages: 2,
+                    overflow_pages: 0,
+                };
+                store.commit_like();
+                let (mut other, mut other_trusted) = (TreeRoot::EMPTY, false);
+                super::put(&mut store, &mut other, &mut other_trusted, b"other", b"t")
+                    .expect("put");
+                let txn32 = store.txn() as u32;
+                page::branch_set_child(store.raw_mut(r), 1, other.root, txn32).expect("redirect");
+                store.restamp(r);
+                let msg = "named by a page it did not write";
+                if case == DAMAGE_CASES[0] {
+                    let (put, delete) = (word(b"z"), word(b"m"));
+                    Damaged { store, root, trusted: false, put, delete, depth: 2, msg }
+                } else {
+                    let (put, delete) = (word(b"z"), word(b"other"));
+                    Damaged { store, root: other, trusted: false, put, delete, depth: 1, msg }
+                }
+            }
+            "a stale child txn" => {
+                let (mut store, root) = reopened_tree(2_000);
+                let (child, txn) = page::branch_child(store.raw(root.root), 1).expect("child");
+                set_child_restamped(&mut store, root.root, 1, child, txn ^ 0x4000_0000);
+                let key = page::LeafView::new(store.raw(child)).and_then(|l| l.key(0));
+                let key = key.expect("key").to_vec();
+                let msg = "is not the copy its parent names";
+                Damaged {
+                    store,
+                    root,
+                    trusted: false,
+                    put: key.clone(),
+                    delete: key,
+                    depth: 2,
+                    msg,
+                }
+            }
+            "a CRC flip on a published leaf" => {
+                let (mut store, root) = reopened_tree(2_000);
+                let leaf = walk_tree(&store, &root).leaves[0];
+                let p = store.geometry().page_size();
+                store.raw_mut(leaf)[p - 5] ^= 0x01;
+                let key = 0_u64.to_be_bytes().to_vec();
+                let msg = "fails its CRC";
+                Damaged {
+                    store,
+                    root,
+                    trusted: false,
+                    put: key.clone(),
+                    delete: key,
+                    depth: 2,
+                    msg,
+                }
+            }
+            "a CRC flip on a published branch" => {
+                // A byte of the free gap of the branch below the root.
+                let (mut store, root) = tall_tree();
+                let (branch, _) = page::branch_child(store.raw(root.root), 0).expect("child");
+                let page = store.raw(branch);
+                let gap = (24 + 2 * page::nkeys(page) + page::upper(page)) / 2;
+                store.raw_mut(branch)[gap] ^= 0x01;
+                let key = id_key(0, 200);
+                let msg = "fails its CRC";
+                Damaged {
+                    store,
+                    root,
+                    trusted: false,
+                    put: key.clone(),
+                    delete: key,
+                    depth: 2,
+                    msg,
+                }
+            }
+            "keys outside the separators" => {
+                // A published root's cell 1 redirected to cell 2's leaf, then copied by a put
+                // under its last cell (`a_redirect_below_a_copied_parent_is_refused`).
+                let (mut store, mut root) = reopened_tree(2_000);
+                let r = root.root;
+                let (sibling, sibling_txn) = page::branch_child(store.raw(r), 2).expect("child");
+                let k1 = page::branch_key(store.raw(r), 1).expect("key").to_vec();
+                page::branch_set_child(store.raw_mut(r), 1, sibling, sibling_txn).expect("set");
+                store.restamp(r);
+                let mut trusted = false;
+                let last = u64::MAX.to_be_bytes();
+                super::put(&mut store, &mut root, &mut trusted, &last, b"a").expect("put");
+                assert!(trusted, "a private root copy");
+                let msg = "holds keys outside its parents' separators";
+                Damaged { store, root, trusted, put: k1.clone(), delete: k1, depth: 2, msg }
+            }
+            "a published cell naming this txn's page" => {
+                // The branch below the root forged to name another tree's private page X with
+                // this txn's id (the copy-time rule, `check_cells_naming_this_txn`).
+                let (mut store, root) = tall_tree();
+                let (branch, _) = page::branch_child(store.raw(root.root), 0).expect("child");
+                let (mut other, mut other_trusted) = (TreeRoot::EMPTY, false);
+                super::put(&mut store, &mut other, &mut other_trusted, b"other", b"t")
+                    .expect("put");
+                let txn32 = store.txn() as u32;
+                set_child_restamped(&mut store, branch, 1, other.root, txn32);
+                let key = id_key(0, 200);
+                let msg = "with this txn's id";
+                Damaged {
+                    store,
+                    root,
+                    trusted: false,
+                    put: key.clone(),
+                    delete: key,
+                    depth: 2,
+                    msg,
+                }
+            }
+            _ => unreachable!("{case}"),
+        }
+    }
+
+    /// A write routed by a hint along a damaged path meets the damage as the search's write does
+    /// ([`descend_write`]'s checks run on every page it enters, followed or searched): the
+    /// provenance rule, the identity check, the CRC and `validate` of a published page, the
+    /// copy-time rule of its cells and the separator range. A put is `Corrupt` with the
+    /// search's own message; a delete (its verification left to the hit, `Verify::Later`) is
+    /// `Corrupt` too; neither changes the handle or a byte of any page. Debug builds check the
+    /// hint was followed down to the damaged page.
+    #[test]
+    fn a_hinted_write_meets_damage_as_a_descent_does() {
+        let pages = |store: &MemStore| -> Vec<Vec<u8>> {
+            (2..store.alloc.page_count()).map(|p| store.raw(p).to_vec()).collect()
+        };
+        for case in DAMAGE_CASES {
+            for op in ["put", "delete"] {
+                let mut messages = Vec::new();
+                for hinted in [false, true] {
+                    let Damaged { mut store, mut root, mut trusted, put, delete, depth, msg } =
+                        damaged(case);
+                    let key = if op == "put" { put } else { delete };
+                    let hint =
+                        if hinted { searched_slots(&store, &root, &key) } else { Vec::new() };
+                    let before = (root, trusted, pages(&store));
+                    let levels = hinted_levels();
+                    let (r, t) = (&mut root, &mut trusted);
+                    let result = match op {
+                        "put" => {
+                            let v = &b"new"[..];
+                            put_from_root(&mut store, r, t, None, &key, v, PutKind::Upsert, &hint)
+                                .map(drop)
+                        }
+                        _ => delete_from_root(&mut store, r, t, None, &key, Cells::Plain, &hint)
+                            .map(drop),
+                    };
+                    let what = format!("{case}, {op}, hinted {hinted}");
+                    let Err(Error::Corrupt(message)) = result else { panic!("{what}: {result:?}") };
+                    assert!(message.contains(msg), "{what}: {message}");
+                    assert!((root, trusted, pages(&store)) == before, "{what}: something changed");
+                    let followed = hinted_levels() - levels;
+                    if hinted && cfg!(debug_assertions) {
+                        assert!(followed + 1 >= depth, "{what}: the hint stopped above the damage");
+                    }
+                    messages.push(message);
+                }
+                if op == "put" {
+                    assert_eq!(messages[0], messages[1], "{case}: the search's message");
+                }
+            }
+        }
+    }
+
     /// A one-leaf tree of keys `a`, `b`, `c` whose cell `b` is forged, CRC-valid, to name `x`
     /// with the run counter to match: the leaf as the tree's handle sees it.
     fn forge_run_cell(store: &mut MemStore, root: &mut TreeRoot, x: Ovf) {
@@ -3650,7 +4155,8 @@ mod tests {
         let g = store.geometry();
         let (mut root, mut trusted, mut cache) = (TreeRoot::EMPTY, false, PathCache::default());
         let mut put_via_cache = |store: &mut MemStore, root: &mut TreeRoot, k: &[u8], v: &[u8]| {
-            put_cached(store, root, &mut trusted, &mut cache, k, v, PutKind::Upsert).expect("put")
+            put_cached(store, root, &mut trusted, &mut cache, k, v, PutKind::Upsert, NO_HINT)
+                .expect("put")
         };
         put_via_cache(&mut store, &mut root, b"k1", b"small");
         #[cfg(debug_assertions)]
@@ -3686,8 +4192,9 @@ mod tests {
         }
         assert!(root.height == 2 && root.leaf_pages >= 4, "a root over several leaves");
         let (mut trusted, mut cache) = (store.is_private(root.root), PathCache::default());
-        let removed = delete_cached(&mut store, &mut root, &mut trusted, &mut cache, &key(30))
-            .expect("delete");
+        let removed =
+            delete_cached(&mut store, &mut root, &mut trusted, &mut cache, &key(30), NO_HINT)
+                .expect("delete");
         assert!(removed.found && removed.slot.is_some(), "the delete filled the cache");
         let in_leaf = |k: &[u8]| {
             cache.lo.get().is_none_or(|lo| page::cmp_keys(k, lo).is_ge())
@@ -3711,8 +4218,17 @@ mod tests {
     fn a_path_cache_of_another_epoch_is_never_used() {
         let (mut store, mut root, mut trusted, mut cache, k) = stale_cache_over_an_unlinked_leaf();
         let entries = root.entries;
-        put_cached(&mut store, &mut root, &mut trusted, &mut cache, &k, b"back", PutKind::Upsert)
-            .expect("put");
+        put_cached(
+            &mut store,
+            &mut root,
+            &mut trusted,
+            &mut cache,
+            &k,
+            b"back",
+            PutKind::Upsert,
+            NO_HINT,
+        )
+        .expect("put");
         assert_eq!(get(&store, &root, &k).expect("get"), Some(&b"back"[..]));
         assert_eq!(root.entries, entries + 1);
         store.commit_like();
@@ -3720,8 +4236,8 @@ mod tests {
 
         let (mut store, mut root, mut trusted, mut cache, k) = stale_cache_over_an_unlinked_leaf();
         put(&mut store, &mut root, &k, b"back").expect("put");
-        let removed =
-            delete_cached(&mut store, &mut root, &mut trusted, &mut cache, &k).expect("delete");
+        let removed = delete_cached(&mut store, &mut root, &mut trusted, &mut cache, &k, NO_HINT)
+            .expect("delete");
         assert!(removed.found, "the key was found where it lives");
         assert_eq!(get(&store, &root, &k).expect("get"), None);
         assert_eq!(root.entries, entries);
@@ -3835,7 +4351,7 @@ mod tests {
         };
         let mut path = Path::new();
         let (found, _) =
-            descend_write(store, root, true, key, Verify::Now, Cells::Plain, &mut path)
+            descend_write(store, root, true, key, Verify::Now, Cells::Plain, &mut path, NO_HINT)
                 .expect("descent");
         assert_eq!(cache.epoch, store.epoch(), "{what}: the cache holds");
         assert_eq!(cache.branches(), &*path, "{what}: the branches");
@@ -3891,8 +4407,9 @@ mod tests {
             // The last key's values grow further, so its replaces split its leaf too.
             let v = vec![op as u8; 40 + rng.below(if is_last { 480 } else { 160 }) as usize];
             let (before, copied) = (root, !trusted);
-            let placed = put_cached(&mut store, &mut root, &mut trusted, &mut cache, &k, &v, kind)
-                .expect("put");
+            let placed =
+                put_cached(&mut store, &mut root, &mut trusted, &mut cache, &k, &v, kind, NO_HINT)
+                    .expect("put");
             assert_eq!(placed.replaced, model.insert(k.clone(), v).is_some(), "op {op}");
             // A put into the empty tree adds the first leaf: no split.
             if before.height > 0 && root.leaf_pages > before.leaf_pages {
@@ -3964,6 +4481,7 @@ mod tests {
                         &k,
                         &v,
                         PutKind::Append,
+                        NO_HINT,
                     )
                     .expect("append");
                     model.insert(k, v);
@@ -3983,9 +4501,17 @@ mod tests {
                     grown == 0,
                     |store, root, cache, step| {
                         let v = vec![step as u8; 60 + 24 * (step + 1)];
-                        let placed =
-                            put_cached(store, root, &mut trusted, cache, &key, &v, PutKind::Upsert)
-                                .expect("replace");
+                        let placed = put_cached(
+                            store,
+                            root,
+                            &mut trusted,
+                            cache,
+                            &key,
+                            &v,
+                            PutKind::Upsert,
+                            NO_HINT,
+                        )
+                        .expect("replace");
                         model.insert(key.clone(), v.clone());
                         (placed, v)
                     },
@@ -4026,6 +4552,7 @@ mod tests {
                     cell,
                     Cells::Packing,
                     PutKind::Append,
+                    NO_HINT,
                 )
                 .expect("append");
                 model.insert(k, want);
@@ -4050,6 +4577,7 @@ mod tests {
                         OuterCell::Packed(&set),
                         Cells::Packing,
                         PutKind::Upsert,
+                        NO_HINT,
                     )
                     .expect("replace");
                     model.insert(last.clone(), PackingCell::Packed(set.clone()));
@@ -4087,7 +4615,7 @@ mod tests {
     fn last_key_of_leaf(store: &MemStore, root: &TreeRoot, key: &[u8]) -> Vec<u8> {
         let mut path = Path::new();
         let (found, _) =
-            descend_write(store, root, true, key, Verify::Now, Cells::Plain, &mut path)
+            descend_write(store, root, true, key, Verify::Now, Cells::Plain, &mut path, NO_HINT)
                 .expect("descent");
         found.view.key(found.view.nkeys() - 1).expect("a key").to_vec()
     }
@@ -4113,8 +4641,9 @@ mod tests {
     ) -> (u32, u32) {
         for step in 0..64 {
             let mut path = Path::new();
-            let (found, _) = descend_write(&*store, root, true, key, Verify::Now, cells, &mut path)
-                .expect("descent");
+            let (found, _) =
+                descend_write(&*store, root, true, key, Verify::Now, cells, &mut path, NO_HINT)
+                    .expect("descent");
             let (leaf, n, before) = (found.pgno, found.view.nkeys(), found.page.to_vec());
             let at = found.view.find(key).expect("find");
             let Find::Found { index, .. } = at else { panic!("step {step}: {at:?}") };
@@ -4139,8 +4668,9 @@ mod tests {
             let cell = page::cell_size_leaf(key.len(), value.len());
             assert!(!page::fits(&left, cell).expect("a leaf"), "the left leaf had room");
             let mut path = Path::new();
-            let (found, _) = descend_write(&*store, root, true, key, Verify::Now, cells, &mut path)
-                .expect("descent");
+            let (found, _) =
+                descend_write(&*store, root, true, key, Verify::Now, cells, &mut path, NO_HINT)
+                    .expect("descent");
             assert!(found.pgno != leaf && found.view.nkeys() == 1, "the entry starts a new leaf");
             assert_eq!(found.range, (Some(key), None), "the new leaf's range");
             let at = found.view.find(key).expect("find");
@@ -6097,6 +6627,7 @@ mod tests {
                     OuterCell::Nested(&nested),
                     Cells::Outer,
                     kind,
+                    NO_HINT,
                 );
                 let exists = model.contains_key(&key);
                 match kind {
@@ -6124,6 +6655,7 @@ mod tests {
                     &mut cache,
                     &key,
                     Cells::Outer,
+                    NO_HINT,
                 )
                 .unwrap_or_else(|e| panic!("op {op} delete: {e}"));
                 assert_eq!(removed.found, model.remove(&key).is_some(), "op {op}");
@@ -6176,6 +6708,7 @@ mod tests {
                 OuterCell::Nested(&nested),
                 Cells::Outer,
                 PutKind::Insert,
+                NO_HINT,
             )
             .expect("insert");
             model.insert(k, nested.encode());
@@ -6192,6 +6725,7 @@ mod tests {
             OuterCell::Nested(&nested),
             Cells::Outer,
             PutKind::Upsert,
+            NO_HINT,
         )
         .expect("upsert");
         model.insert(key.to_vec(), nested.encode());
@@ -6226,11 +6760,12 @@ mod tests {
             &key,
             b"v",
             PutKind::Upsert,
+            NO_HINT,
         );
         assert_nested_refused("cached put", r);
         assert_nested_refused(
             "cached delete",
-            delete_cached(&mut store, &mut root, &mut trusted, &mut cache, &key),
+            delete_cached(&mut store, &mut root, &mut trusted, &mut cache, &key, NO_HINT),
         );
         assert_nested_refused("delete", super::delete(&mut store, &mut root, &mut trusted, &key));
         assert_eq!(root, before, "a refused table write changed the handle");
@@ -6280,6 +6815,7 @@ mod tests {
                             &mut cache,
                             &key,
                             Cells::Outer,
+                            NO_HINT,
                         )
                         .map(|_| ())
                     } else {
@@ -6292,6 +6828,7 @@ mod tests {
                             OuterCell::Nested(&nested),
                             Cells::Outer,
                             PutKind::Upsert,
+                            NO_HINT,
                         )
                         .map(|_| ())
                     };
@@ -6443,6 +6980,7 @@ mod tests {
                     cell,
                     Cells::Packing,
                     kind,
+                    NO_HINT,
                 );
                 let old = model.get(&key).cloned();
                 match kind {
@@ -6474,6 +7012,7 @@ mod tests {
                     &mut cache,
                     &key,
                     Cells::Packing,
+                    NO_HINT,
                 )
                 .unwrap_or_else(|e| panic!("op {op} delete: {e}"));
                 assert_eq!(removed.found, model.remove(&key).is_some(), "op {op}");
@@ -6534,6 +7073,7 @@ mod tests {
                 cell,
                 Cells::Packing,
                 PutKind::Insert,
+                NO_HINT,
             )
             .expect("insert");
             model.insert(k, want);
@@ -6550,6 +7090,7 @@ mod tests {
                 OuterCell::Nested(&nested),
                 Cells::Packing,
                 PutKind::Upsert,
+                NO_HINT,
             )
             .expect("forge");
             model.insert(key.to_vec(), PackingCell::Nested(nested.encode()));
@@ -6626,6 +7167,7 @@ mod tests {
                         OuterCell::Packed(&set),
                         Cells::Packing,
                         PutKind::Upsert,
+                        NO_HINT,
                     )
                     .expect("upsert");
                     if let Some(forged) = forged {
@@ -6651,6 +7193,7 @@ mod tests {
                             &mut cache,
                             &key,
                             cells,
+                            NO_HINT,
                         )
                         .map(|_| ()),
                         _ => {
@@ -6668,6 +7211,7 @@ mod tests {
                                 cell,
                                 cells,
                                 PutKind::Upsert,
+                                NO_HINT,
                             )
                             .map(|_| ())
                         }
@@ -6701,11 +7245,19 @@ mod tests {
                 cell,
                 cells,
                 PutKind::Upsert,
+                NO_HINT,
             );
             assert!(matches!(r, Err(Error::Failed(_))), "{cell:?} {cells:?}: {r:?}");
         }
-        let r =
-            delete_outer_cell(&mut store, &mut root, &mut trusted, &mut cache, &key, Cells::Plain);
+        let r = delete_outer_cell(
+            &mut store,
+            &mut root,
+            &mut trusted,
+            &mut cache,
+            &key,
+            Cells::Plain,
+            NO_HINT,
+        );
         assert!(matches!(r, Err(Error::Failed(_))), "{r:?}");
         assert_eq!(root, before);
 
@@ -6757,6 +7309,7 @@ mod tests {
                 OuterCell::Nested(&nested),
                 cells,
                 PutKind::Insert,
+                NO_HINT,
             )
         };
         let r = put(&mut store, &mut root, Cells::Outer);
@@ -6796,6 +7349,7 @@ mod tests {
                         cell,
                         Cells::Packing,
                         PutKind::Append,
+                        NO_HINT,
                     )
                     .expect("nested cell");
                     roots.insert(k, nested);
@@ -6813,6 +7367,7 @@ mod tests {
                         cell,
                         Cells::Packing,
                         PutKind::Append,
+                        NO_HINT,
                     )
                     .expect("packed cell");
                 }
@@ -6827,6 +7382,7 @@ mod tests {
                     OuterCell::Packed(set),
                     Cells::Packing,
                     PutKind::Upsert,
+                    NO_HINT,
                 )
                 .expect("extra cell");
             }
@@ -6909,6 +7465,7 @@ mod tests {
                     OuterCell::Nested(&nested),
                     Cells::Outer,
                     PutKind::Insert,
+                    NO_HINT,
                 )
                 .expect("insert");
             }
@@ -6962,6 +7519,7 @@ mod tests {
                 OuterCell::Nested(&nested),
                 Cells::Outer,
                 PutKind::Upsert,
+                NO_HINT,
             );
             if case == "older" {
                 assert!(r.is_ok_and(|p| p.replaced), "{case}");

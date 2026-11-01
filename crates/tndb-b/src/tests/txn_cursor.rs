@@ -957,3 +957,128 @@ fn follower_shares_prefix_answers_for_the_deleted_entrys_follower() {
     rw.commit().expect("commit");
     check(&env);
 }
+
+/// The write descents' routing counters on this thread so far: the levels a hint routed, the
+/// hints refused and the searches ([`crate::tree::write::HINTED_LEVELS`], `HINT_REFUSALS`,
+/// `WRITE_SEARCHES`).
+#[cfg(debug_assertions)]
+fn write_routing() -> [u64; 3] {
+    use crate::tree::write::{HINTED_LEVELS, HINT_REFUSALS, WRITE_SEARCHES};
+    [&HINTED_LEVELS, &HINT_REFUSALS, &WRITE_SEARCHES].map(|c| c.with(std::cell::Cell::get))
+}
+
+/// `write`'s result, and what it added to each of [`write_routing`]'s counters.
+#[cfg(debug_assertions)]
+fn routed<T>(write: impl FnOnce() -> T) -> ([u64; 3], T) {
+    let before = write_routing();
+    let out = write();
+    let after = write_routing();
+    (std::array::from_fn(|i| after[i] - before[i]), out)
+}
+
+/// A committed table `a` of the entries `key(0..2000)` with 300-byte values: three levels or more
+/// at 4 KiB pages.
+#[cfg(debug_assertions)]
+fn tall(env: &Env) -> Table {
+    let mut rw = env.begin_rw().expect("begin");
+    let a = rw.create_table("a").expect("table");
+    for i in 0..2_000 {
+        rw.put(&a, &key(i), &[i as u8; 300]).expect("put");
+    }
+    rw.commit().expect("commit");
+    a
+}
+
+/// A write at an up-to-date cursor's entry, on a leaf other than the table's cached one, routes
+/// every level by the cursor's path, with no search and no refusal: a `put` after `seek_exact`
+/// and a `delete_current` after `seek`, each on a published leaf, on another, then on the first
+/// one again (private by then, while the cache names the other). The cursor then stands where a
+/// fresh seek puts it. Under `Writer::no_write_hint` the same writes search every level.
+#[test]
+#[cfg(debug_assertions)]
+fn a_write_at_the_cursor_routes_by_its_path() {
+    for hinted in [true, false] {
+        let (_dir, path) = temp("tndb_b_txn_cursor_hint");
+        let env = open(&path, SyncMode::NoSync);
+        let a = tall(&env);
+        env.with_writer(|w| w.no_write_hint = !hinted);
+        let mut rw = env.begin_rw().expect("begin");
+        let mut c = rw.cursor_detached(&a).expect("cursor");
+        let mut fresh = rw.cursor_detached(&a).expect("cursor");
+        let leaf = |c: &TxnCursor, rw: &RwTxn| c.position(rw).1.last().map(|&(page, _)| page);
+        assert!(c.seek_exact(&rw, &key(0)).expect("seek").is_some());
+        let height = c.position(&rw).1.len() as u64;
+        assert!(height >= 3, "a tree of three levels or more: {height}");
+        let expected = if hinted { [height, 0, 0] } else { [0, 0, height] };
+        for (write, keys) in [("put", [100, 1_500, 101]), ("delete", [200, 1_700, 201])] {
+            let mut first_leaf = None;
+            for (i, k) in keys.into_iter().enumerate() {
+                assert_eq!(key_of(c.seek(&rw, &key(k)).expect("seek")), k);
+                if i == 2 {
+                    assert_eq!(leaf(&c, &rw), first_leaf, "{write} {k}: the first leaf again");
+                }
+                let (delta, done) = routed(|| match write {
+                    "put" => c.put(&mut rw, &key(k), b"new"),
+                    _ => c.delete_current(&mut rw).map(|found| assert!(found)),
+                });
+                done.expect("write");
+                assert_eq!(delta, expected, "hinted {hinted}: the {write} of {k}");
+                if i == 0 {
+                    first_leaf = leaf(&c, &rw);
+                }
+                let landed = if write == "put" { k } else { k + 1 };
+                assert_eq!(key_of(fresh.seek(&rw, &key(k)).expect("seek")), landed);
+                assert_eq!(c.position(&rw), fresh.position(&rw), "hinted {hinted}: {write} {k}");
+            }
+        }
+        rw.commit().expect("commit");
+        check(&env);
+    }
+}
+
+/// A cursor that is stale, unset or after the end passes no hint, so its put searches: after
+/// another writer's put to the table (the cursor's slots would still route the key), after a
+/// `seek_exact` miss, and after the end. Each put lands as a model's: the rows, and the cursor
+/// where a fresh seek puts it.
+#[test]
+#[cfg(debug_assertions)]
+fn a_stale_or_unplaced_cursor_passes_no_hint() {
+    let (_dir, path) = temp("tndb_b_txn_cursor_no_hint");
+    let env = open(&path, SyncMode::NoSync);
+    let a = tall(&env);
+    let mut rw = env.begin_rw().expect("begin");
+    let mut model = rows(&rw, &a);
+    let mut c = rw.cursor_detached(&a).expect("cursor");
+    let mut fresh = rw.cursor_detached(&a).expect("cursor");
+    for case in ["stale", "unset", "after the end"] {
+        let k = match case {
+            "stale" => {
+                assert!(c.seek_exact(&rw, &key(100)).expect("seek").is_some());
+                rw.put(&a, &key(1_000), b"other").expect("put");
+                model.insert(key(1_000), b"other".to_vec());
+                key(100)
+            }
+            "unset" => {
+                let missing = [key(300), vec![0]].concat();
+                assert!(c.seek_exact(&rw, &missing).expect("seek").is_none());
+                missing
+            }
+            _ => {
+                c.last(&rw).expect("last");
+                assert!(c.next(&rw).expect("next").is_none());
+                assert_eq!(c.state(), (State::AfterEnd, false));
+                key(5_000)
+            }
+        };
+        let (delta, put) = routed(|| c.put(&mut rw, &k, b"v"));
+        put.expect("put");
+        model.insert(k.clone(), b"v".to_vec());
+        assert_eq!(delta[0], 0, "{case}: no level routed by a hint");
+        assert!(delta[2] > 0, "{case}: the put descended");
+        assert_eq!(rows(&rw, &a), model, "{case}");
+        fresh.seek(&rw, &k).expect("seek");
+        assert_eq!(c.position(&rw), fresh.position(&rw), "{case}: the cursor at the entry");
+    }
+    rw.commit().expect("commit");
+    check(&env);
+}
