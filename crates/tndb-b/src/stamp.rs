@@ -7,9 +7,9 @@
 //! ([`crate::file::PageFile::pages`]), each thread computes the CRCs of a contiguous share of
 //! about equal bytes, and once every thread is done the writer stores each CRC into its unit's
 //! trailer itself, in unit order, through `PageFile::pages_mut` ([`put_crc`]). The threads only
-//! read: no page changes while they run, and they need no `unsafe`. A large durable commit runs
-//! this once per slice of its units (`Writer::stamp_sliced`), the caller's thread starting the
-//! previous slice's writeback while the others compute ([`crcs`]' `meanwhile`).
+//! read: no page changes while they run, and they need no `unsafe`. The same split and threads
+//! ([`spread`]) start a large durable commit's writeback once it is stamped
+//! (`Writer::start_writebacks`).
 //!
 //! The result is the serial loop's (`crc::add_crc32_nonzero` on each unit): the same bytes,
 //! stored in the same order, with the same errors, which only the stores can raise. A failed
@@ -39,77 +39,85 @@ pub(crate) fn threads(bytes: usize) -> usize {
     (bytes / BYTES_PER_THREAD).clamp(1, max_threads())
 }
 
-/// [`MAX_THREADS`] capped by `std::thread::available_parallelism`, which reads the CPU affinity
-/// and, on Linux, the cgroup quota files: read once, at the first large commit.
+/// [`MAX_THREADS`] capped by [`cpus`].
 fn max_threads() -> usize {
-    static MAX: OnceLock<usize> = OnceLock::new();
-    *MAX.get_or_init(|| {
-        thread::available_parallelism().map_or(1, NonZeroUsize::get).min(MAX_THREADS)
-    })
+    cpus().min(MAX_THREADS)
+}
+
+/// The CPUs this process may use, `std::thread::available_parallelism`, which reads the CPU
+/// affinity and, on Linux, the cgroup quota files: read once, at the first large commit.
+pub(crate) fn cpus() -> usize {
+    static CPUS: OnceLock<usize> = OnceLock::new();
+    *CPUS.get_or_init(|| thread::available_parallelism().map_or(1, NonZeroUsize::get))
 }
 
 /// The CRC [`crc::add_crc32_nonzero`] stamps on each of `units` (a whole unit: its payload and
 /// its 4-byte trailer), in their order, computed on up to `threads` threads: the current one and
-/// up to `threads - 1` scoped ones, each over a contiguous share of [`shares`].
-///
-/// `meanwhile` runs on the current thread once the other threads are spawned, before it computes
-/// its own share (a sliced step 3 starts the previous slice's writeback there,
-/// `Writer::stamp_sliced`); its result is returned beside the CRCs.
-pub(crate) fn crcs<R>(
-    units: &[&[u8]],
+/// up to `threads - 1` scoped ones, each over a contiguous share of [`shares`] ([`spread`]).
+pub(crate) fn crcs(units: &[&[u8]], threads: usize) -> Vec<u32> {
+    let crcs = |share: &[&[u8]]| share.iter().map(|u| unit_crc(u)).collect::<Vec<_>>();
+    spread(units, threads, |u| u.len(), crcs).concat()
+}
+
+/// `work` over each of the contiguous shares of about equal `weight` that [`shares`] splits
+/// `items` into for `threads` threads: the first share on the current thread, each other on a
+/// scoped thread of its own, or on the current thread after its own share when that thread could
+/// not be spawned. Returns `work`'s results in share order, once every thread is joined; a
+/// panic on a thread resumes on the current one, as `work` there would have raised it.
+pub(crate) fn spread<T: Sync, R: Send>(
+    items: &[T],
     threads: usize,
-    meanwhile: impl FnOnce() -> R,
-) -> (Vec<u32>, R) {
+    weight: impl Fn(&T) -> usize,
+    work: impl Fn(&[T]) -> R + Sync,
+) -> Vec<R> {
     /// A share left to another thread, or to this one if that thread could not be spawned.
-    enum Share<'s, 'u> {
-        Spawned(ScopedJoinHandle<'s, Vec<u32>>),
-        Here(&'u [&'u [u8]]),
+    enum Share<'s, 't, T, R> {
+        Spawned(ScopedJoinHandle<'s, R>),
+        Here(&'t [T]),
     }
-    let mut shares = shares(units, threads).into_iter();
-    let mut out = Vec::with_capacity(units.len());
-    let done = thread::scope(|s| {
+    let mut shares = shares(items, threads, weight).into_iter();
+    let work = &work;
+    thread::scope(|s| {
         let first = shares.next().unwrap_or_default();
-        let rest: Vec<Share<'_, '_>> = shares
+        let rest: Vec<Share<'_, '_, T, R>> = shares
             .map(|share| {
                 thread::Builder::new()
                     .name("tndb-b-stamp".into())
-                    .spawn_scoped(s, move || share.iter().map(|u| unit_crc(u)).collect())
+                    .spawn_scoped(s, move || work(share))
                     .map_or(Share::Here(share), Share::Spawned)
             })
             .collect();
-        let done = meanwhile();
-        out.extend(first.iter().map(|u| unit_crc(u)));
+        let mut out = Vec::with_capacity(rest.len() + 1);
+        out.push(work(first));
         for share in rest {
-            match share {
-                Share::Spawned(handle) => {
-                    out.extend(handle.join().unwrap_or_else(|p| panic::resume_unwind(p)));
-                }
-                Share::Here(share) => out.extend(share.iter().map(|u| unit_crc(u))),
-            }
+            out.push(match share {
+                Share::Spawned(handle) => handle.join().unwrap_or_else(|p| panic::resume_unwind(p)),
+                Share::Here(share) => work(share),
+            });
         }
-        done
-    });
-    (out, done)
+        out
+    })
 }
 
-/// `units` split into at most `threads` contiguous, non-empty shares of about equal bytes: share
-/// `k` ends at the first unit at which the running total reaches `(k + 1) / threads` of the
-/// whole, and the last share takes the rest.
-fn shares<'u>(units: &'u [&'u [u8]], threads: usize) -> Vec<&'u [&'u [u8]]> {
+/// `items` split into at most `threads` contiguous, non-empty shares of about equal weight (the
+/// sum of each item's `weight`: a unit's bytes, a slice's pages): share `k` ends at the first
+/// item at which the running total reaches `(k + 1) / threads` of the whole, and the last share
+/// takes the rest.
+fn shares<T>(items: &[T], threads: usize, weight: impl Fn(&T) -> usize) -> Vec<&[T]> {
     let threads = threads.max(1) as u128;
-    let total: u128 = units.iter().map(|u| u.len() as u128).sum();
+    let total: u128 = items.iter().map(|t| weight(t) as u128).sum();
     let mut shares = Vec::new();
-    let (mut start, mut bytes) = (0, 0u128);
-    for (i, unit) in units.iter().enumerate() {
-        bytes += unit.len() as u128;
+    let (mut start, mut sum) = (0, 0u128);
+    for (i, item) in items.iter().enumerate() {
+        sum += weight(item) as u128;
         let closed = shares.len() as u128 + 1;
-        if closed < threads && bytes * threads >= total * closed {
-            shares.push(&units[start..=i]);
+        if closed < threads && sum * threads >= total * closed {
+            shares.push(&items[start..=i]);
             start = i + 1;
         }
     }
-    if start < units.len() {
-        shares.push(&units[start..]);
+    if start < items.len() {
+        shares.push(&items[start..]);
     }
     shares
 }
@@ -169,8 +177,7 @@ mod tests {
     /// `bytes` stamped by the serial loop, `crc::add_crc32_nonzero` on each unit, and by [`crcs`]
     /// on `threads` threads then [`put_crc`] on each unit.
     fn both_stamps(mut bytes: Vec<u8>, lens: &[usize], threads: usize) -> (Vec<u8>, Vec<u8>) {
-        let (crcs, ran) = crcs(&units(&bytes, lens), threads, || true);
-        assert!(ran, "meanwhile ran once, its result returned");
+        let crcs = crcs(&units(&bytes, lens), threads);
         assert_eq!(crcs.len(), lens.len(), "one CRC per unit");
         let mut serial = bytes.clone();
         let mut rest = &mut serial[..];
@@ -245,7 +252,7 @@ mod tests {
             let lens = vec![4096; n];
             let units = units(&bytes, &lens);
             for threads in 1..=9 {
-                let shares = shares(&units, threads);
+                let shares = shares(&units, threads, |u| u.len());
                 let flat: Vec<*const u8> =
                     shares.iter().flat_map(|s| s.iter()).map(|u| u.as_ptr()).collect();
                 let all: Vec<*const u8> = units.iter().map(|u| u.as_ptr()).collect();
@@ -260,12 +267,41 @@ mod tests {
         }
         let (bytes, lens) = buffer(&[1, 1, 30, 1, 1], 3);
         let units = units(&bytes, &lens);
-        let lens: Vec<usize> = shares(&units, 4).iter().map(|s| s.len()).collect();
+        let lens: Vec<usize> = shares(&units, 4, |u| u.len()).iter().map(|s| s.len()).collect();
         assert_eq!(
             lens,
             [3, 1, 1],
             "the large unit closes the first share; one unit per share after"
         );
+    }
+
+    #[test]
+    fn spread_runs_each_share_once_the_first_here_and_returns_them_in_order() {
+        // Nine items of weight 1 on 3 threads: three shares of three, the first on this thread and
+        // each other on a thread of its own, their results in share order; a panic on another
+        // thread resumes here.
+        let items: Vec<u32> = (0..9).collect();
+        let here = thread::current().id();
+        let runs = spread(&items, 3, |_| 1, |share| (share.to_vec(), thread::current().id()));
+        let shares: Vec<Vec<u32>> = runs.iter().map(|(share, _)| share.clone()).collect();
+        assert_eq!(shares, [vec![0, 1, 2], vec![3, 4, 5], vec![6, 7, 8]]);
+        let ids: Vec<_> = runs.iter().map(|&(_, id)| id).collect();
+        assert_eq!(ids[0], here, "the first share on the current thread");
+        assert!(ids[1] != here && ids[2] != here && ids[1] != ids[2], "{ids:?}");
+        let boom = panic::catch_unwind(|| {
+            spread(
+                &items,
+                3,
+                |_| 1,
+                |share| {
+                    if share[0] == 6 {
+                        panic::panic_any("boom");
+                    }
+                },
+            );
+        });
+        let payload = boom.expect_err("the panic resumed");
+        assert_eq!(payload.downcast_ref::<&str>(), Some(&"boom"));
     }
 
     #[test]

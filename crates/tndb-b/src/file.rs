@@ -170,7 +170,8 @@ pub(crate) struct PageFile {
     size_unsynced: AtomicBool,
     /// The bytes the growths added since this file was mapped ([`Self::bytes_grown`]).
     bytes_grown: u64,
-    /// Sticky latch set by any failed sync or growth (see the module docs). Never cleared.
+    /// Sticky latch set by any failed sync, writeback start or growth (see the module docs).
+    /// Never cleared.
     poisoned: AtomicBool,
     /// Test-only: the file's inode, for the disk model.
     #[cfg(test)]
@@ -178,9 +179,10 @@ pub(crate) struct PageFile {
     /// Test-only: fail the next msync (see [`Self::fail_next_msync`]).
     #[cfg(test)]
     fail_next_msync: AtomicBool,
-    /// Test-only: fail the next writeback start (see [`Self::fail_next_writeback`]).
+    /// Test-only: the byte offset whose writeback start fails, `u64::MAX` for none (see
+    /// [`Self::fail_writeback_at`]).
     #[cfg(test)]
-    fail_next_writeback: AtomicBool,
+    fail_writeback_at: AtomicU64,
 }
 
 impl PageFile {
@@ -221,7 +223,7 @@ impl PageFile {
             #[cfg(test)]
             fail_next_msync: AtomicBool::new(false),
             #[cfg(test)]
-            fail_next_writeback: AtomicBool::new(false),
+            fail_writeback_at: AtomicU64::new(u64::MAX),
         })
     }
 
@@ -455,13 +457,18 @@ impl PageFile {
     /// Start the writeback of the dirty pages in the byte range `range` (non-empty, inside the
     /// file), waiting for none of it ([`start_writeback`]): `Ok(true)` when started, `Ok(false)` on
     /// a target without the call. Not a sync: the pages are durable only after a later `msync` or
-    /// `fdatasync`. A failure poisons the file, as a failed sync does.
+    /// `fdatasync`. A failure poisons the file, as a failed sync does. Several threads may start
+    /// ranges at once: it reads the file and the poison flag (an atomic) and sets only the flag.
     pub(crate) fn start_writeback(&self, range: Range<u64>) -> Result<bool> {
         self.check_poison()?;
         #[cfg(test)]
-        if self.fail_next_writeback.swap(false, Ordering::Relaxed) {
-            self.poison();
-            return Err(io::Error::other("injected writeback failure").into());
+        {
+            // The ranges started at once are disjoint, so one start at most holds the offset.
+            if range.contains(&self.fail_writeback_at.load(Ordering::Relaxed)) {
+                self.fail_writeback_at.store(u64::MAX, Ordering::Relaxed);
+                self.poison();
+                return Err(io::Error::other("injected writeback failure").into());
+            }
         }
         let started = start_writeback(&self.file, range.start, range.end - range.start)
             .inspect_err(|_| self.poison())?;
@@ -474,10 +481,11 @@ impl PageFile {
         self.fail_next_msync.store(true, Ordering::Relaxed);
     }
 
-    /// Test-only: make the next writeback start fail as if the kernel had refused it.
+    /// Test-only: make the writeback start of the range holding byte `offset` fail, once, as if
+    /// the kernel had refused it (a test picks the start of one slice, whichever thread makes it).
     #[cfg(test)]
-    pub(crate) fn fail_next_writeback(&self) {
-        self.fail_next_writeback.store(true, Ordering::Relaxed);
+    pub(crate) fn fail_writeback_at(&self, offset: u64) {
+        self.fail_writeback_at.store(offset, Ordering::Relaxed);
     }
 }
 

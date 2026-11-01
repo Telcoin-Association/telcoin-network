@@ -246,9 +246,10 @@ fn a_read_only_open_counts_nothing() {
     assert_eq!(env.io_stats(), IoStats::default());
 }
 
-/// A sliced step 3 (`Writer::writeback_slice`, every durable commit sliced) counts one writeback
-/// start per slice where the target has the call (Linux) and none elsewhere, its time inside the
-/// stamp's; `NoSync` commits and their sync start none, with the knob set too.
+/// Durable commits whose writeback starts in small slices (`Writer::writeback_slice`) count one
+/// start per slice where the target has the call (Linux) and none elsewhere, the starts' wall
+/// time inside the stamp's and only when a start was made; `NoSync` commits and their sync start
+/// none, with the knob set too.
 #[test]
 fn sliced_commits_count_their_writeback_starts() {
     for sync in [SyncMode::Durable, SyncMode::NoSync] {

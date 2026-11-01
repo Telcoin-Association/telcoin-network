@@ -342,9 +342,9 @@ fn every_crash_point_recovers_the_state_the_protocol_allows() {
     matrix(&base(4096), 3);
 }
 
-/// The matrix with every durable commit's step 3 sliced at three pages
-/// (`env::with_writeback_slice`), so each slice's writeback is started before the next is
-/// stamped: the same states recover, with one random power loss per crash point.
+/// The matrix with every durable commit's writeback started in slices of three pages once it is
+/// stamped (`env::with_writeback_slice`), from several threads: the same states recover, with
+/// one random power loss per crash point.
 #[test]
 fn every_crash_point_recovers_the_state_the_protocol_allows_with_a_sliced_stamp() {
     env::with_writeback_slice(3 * 4096, || matrix(&base(4096), 1));

@@ -843,10 +843,10 @@ fn a_random_multi_table_workload_of_large_values_with_crashes_matches_the_model(
     assert!(gate.iter().all(|&ok| ok), "{seen:?}");
 }
 
-/// The large-value variant with every durable commit's step 3 sliced at three pages
-/// (`env::with_writeback_slice`): tree pages and runs in slices, each slice's writeback started
-/// before the next is stamped. The stamped bytes are those of the unsliced run, so the same seed
-/// makes the same run and meets the same gate.
+/// The large-value variant with every durable commit's writeback started in slices of three
+/// pages once it is stamped (`env::with_writeback_slice`), tree pages and runs, from several
+/// threads. The stamped bytes are those of a run without starts, so the same seed makes the same
+/// run and meets the same gate.
 #[test]
 fn a_random_multi_table_workload_of_large_values_with_a_sliced_stamp_matches_the_model() {
     let seen =

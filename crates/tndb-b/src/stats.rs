@@ -59,12 +59,14 @@ pub struct IoStats {
     /// Time in step 3: the CRCs of every page written, one per tree page and one per run
     /// ([`Self::writeback_ns`] included).
     pub stamp_ns: u64,
-    /// Writebacks step 3 started: a [`crate::SyncMode::Durable`] commit of many pages stamps them
-    /// in slices and starts each slice's writeback (Linux `sync_file_range`) as soon as its CRCs
-    /// are stored, so the drive writes during the rest of the stamp; one per slice. Zero on
-    /// targets without the call, for smaller commits and for [`crate::SyncMode::NoSync`] ones.
+    /// Writebacks step 3 started: a [`crate::SyncMode::Durable`] commit of many pages, once
+    /// stamped, starts their writeback (Linux `sync_file_range`) in slices from several threads,
+    /// so step 4's sync finds less to write; one per slice. Zero on targets without the call, for
+    /// smaller commits and for [`crate::SyncMode::NoSync`] ones.
     pub writeback_starts: u64,
-    /// Time in the calls of [`Self::writeback_starts`], inside [`Self::stamp_ns`].
+    /// Wall time of the starts of [`Self::writeback_starts`], from the slices' cut to the last
+    /// thread's join (the threads' calls overlap, so not their sum), inside [`Self::stamp_ns`];
+    /// zero when no start was made.
     pub writeback_ns: u64,
     /// Time in step 4: the one `msync` or the one `fdatasync` of the data pages.
     pub data_sync_ns: u64,
