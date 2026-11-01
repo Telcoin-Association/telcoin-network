@@ -22,9 +22,12 @@
 //! them durable (one `msync` when they form one range, else one `fdatasync` of the file; see
 //! [`data_sync`]), then the file's size if it grew and that sync did not already cover it, and
 //! only then writes the new meta over the slot holding the lower txn and syncs that one page. A
-//! crash before the meta's sync recovers the previous state; after it, the new one. In
-//! [`SyncMode::NoSync`] a commit only stamps and publishes in memory; [`Env::sync`] (or the
-//! environment's drop) runs the durable steps for the newest state.
+//! crash before the meta's sync recovers the previous state; after it, the new one. A durable
+//! commit of many pages stamps them in slices and starts each slice's writeback once its CRCs
+//! are stored ([`Writer::stamp_sliced`]), so the drive writes while the rest is stamped; the
+//! data's durability is still that one sync's. In [`SyncMode::NoSync`] a commit only stamps and
+//! publishes in memory; [`Env::sync`] (or the environment's drop) runs the durable steps for the
+//! newest state.
 //!
 //! ## Readers
 //!
@@ -98,6 +101,50 @@ const MERGE_GAP: u32 = 64;
 /// A commit whose dirty pages form more runs of adjacent pages than this makes them durable with
 /// one `fdatasync` of the file even when the runs merge into one range ([`data_sync`]).
 const MAX_RUNS: usize = 16;
+
+/// The bytes of units each slice of a sliced step 3 takes ([`Writer::stamp_sliced`]): a slice
+/// closes at the first unit boundary from this many bytes.
+const WRITEBACK_SLICE: usize = 16 << 20;
+
+/// The bytes of units from which a [`SyncMode::Durable`] commit's step 3 is sliced
+/// ([`Writer::slicing`]): two slices, as one alone would leave its writeback nothing to overlap.
+const WRITEBACK_MIN: usize = 2 * WRITEBACK_SLICE;
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only: the [`Writer::writeback_slice`] each writer opened on this thread starts with
+    /// (see [`with_writeback_slice`]).
+    static WRITEBACK_SLICE_ON_OPEN: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Test-only: run `f` with every environment it opens on this thread slicing each durable
+/// commit's step 3 at `slice` bytes ([`Writer::writeback_slice`]), so a suite that opens its own
+/// environments (the crash matrix, the multi-table model) runs the sliced path.
+#[cfg(test)]
+pub(crate) fn with_writeback_slice<T>(slice: usize, f: impl FnOnce() -> T) -> T {
+    /// Puts the thread's previous choice back, also when `f` panics.
+    struct Reset(Option<usize>);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            WRITEBACK_SLICE_ON_OPEN.set(self.0);
+        }
+    }
+    let _reset = Reset(WRITEBACK_SLICE_ON_OPEN.replace(Some(slice)));
+    f()
+}
+
+/// Test-only: one writeback start of a sliced step 3, as [`Writer::writeback_log`] records it.
+#[cfg(test)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct WritebackSpan {
+    /// The bytes of the file it started.
+    pub(crate) bytes: Range<u64>,
+    /// The slice's units, `(first page, pages)`, ascending.
+    pub(crate) units: Vec<(u32, u32)>,
+    /// Every unit of the slice held its CRC when the start was made (`crc::crc_state` valid).
+    pub(crate) stamped: bool,
+}
 
 /// How step 4 makes a commit's dirty pages durable ([`data_sync`]).
 #[derive(Debug, PartialEq, Eq)]
@@ -482,10 +529,20 @@ pub(crate) struct Writer {
     /// [`stamp::threads`]' choice (1: the serial loop), so a small commit can take either path.
     #[cfg(test)]
     pub(crate) stamp_threads: Option<usize>,
-    /// Test-only: the threads the latest commit's step 3 computed its CRCs on (1: the serial
-    /// loop).
+    /// Test-only: the most threads one CRC computation of the latest commit's step 3 took (1:
+    /// the serial loop): the whole commit's, or each slice's of a sliced step 3.
     #[cfg(test)]
     pub(crate) stamped_on: usize,
+    /// Test-only: step 3 of every [`SyncMode::Durable`] commit is sliced
+    /// ([`Self::stamp_sliced`]) at this many bytes, in place of [`Self::slicing`]'s choice, so a
+    /// small commit takes many slices.
+    #[cfg(test)]
+    pub(crate) writeback_slice: Option<usize>,
+    /// Test-only: when `Some`, every writeback start of a sliced step 3, in order. A test sets it
+    /// to `Some(Vec::new())` to record; the starts run while other threads read the file, so a
+    /// lock.
+    #[cfg(test)]
+    pub(crate) writeback_log: Mutex<Option<Vec<WritebackSpan>>>,
 }
 
 /// Test-only: a point of the commit protocol (see the env module docs) at which
@@ -515,51 +572,181 @@ impl Writer {
     /// over each overflow run ([`crate::alloc::PrivatePages::units`]). Returns every page written,
     /// ascending, for the data sync; the tree pages then count as stamped by this writer.
     ///
-    /// Units of many bytes have their CRCs computed on several threads first ([`Self::unit_crcs`]),
-    /// which this stores in unit order; else each unit is stamped in turn. Both write the same
-    /// bytes in the same order, and fail at the same unit with the same error.
-    pub(crate) fn stamp_private(&mut self) -> Result<Vec<u32>> {
+    /// Units of many bytes have their CRCs computed on several threads first, which this stores
+    /// in unit order; else each unit is stamped in turn ([`Self::stamp_units`]). A `durable`
+    /// commit of many bytes is stamped in slices, each slice's writeback started once it is
+    /// stamped ([`Self::stamp_sliced`]). Every way writes the same bytes in the same order, and
+    /// fails at the same unit with the same error.
+    pub(crate) fn stamp_private(&mut self, durable: bool) -> Result<Vec<u32>> {
         let started = Instant::now();
         let size = self.geometry.page_size();
         let private = self.alloc.stamp_private();
-        let threads = stamp::threads(private.pages.len() * size);
-        #[cfg(test)]
-        let threads = self.stamp_threads.unwrap_or(threads);
-        let crcs = self.unit_crcs(&private, threads);
+        let bytes = private.pages.len() * size;
         #[cfg(test)]
         {
-            self.stamped_on = if crcs.is_some() { threads } else { 1 };
+            self.stamped_on = 0;
         }
-        match crcs {
-            Some(crcs) => {
-                for ((p, n), crc) in private.units().zip(crcs) {
-                    stamp::put_crc(self.file.pages_mut(p, size, n as usize * size)?, crc);
-                }
-            }
-            None => {
-                for (p, n) in private.units() {
-                    crc::add_crc32_nonzero(self.file.pages_mut(p, size, n as usize * size)?);
-                }
-            }
+        match self.slicing(durable, bytes) {
+            None => self.stamp_units(private.units(), bytes, &[])?,
+            Some(slice) => self.stamp_sliced(&private, slice)?,
         }
         self.stats.stamp_ns += elapsed_ns(started);
         Ok(private.pages)
     }
 
-    /// The CRC of each of `private`'s units, in unit order, computed on `threads` threads (the
-    /// count [`stamp::threads`] gives the units' bytes) from read-only slices of the units
-    /// ([`PageFile::pages`]). `None` for one thread, which leaves the units to the serial loop,
-    /// and when a unit lies past the end of the file, whose error the serial loop then raises.
-    fn unit_crcs(&self, private: &PrivatePages, threads: usize) -> Option<Vec<u32>> {
+    /// The slice size step 3 cuts a commit of `bytes` bytes of units into
+    /// ([`Self::stamp_sliced`]): [`WRITEBACK_SLICE`] for a `durable` commit of at least
+    /// [`WRITEBACK_MIN`], else `None`, the units in one piece and no writeback started. A
+    /// [`SyncMode::NoSync`] commit leaves its pages to a later sync, so it starts no I/O; a
+    /// smaller commit has too little to overlap. In tests [`Self::writeback_slice`], when set,
+    /// slices every durable commit.
+    fn slicing(&self, durable: bool, bytes: usize) -> Option<usize> {
+        #[cfg(test)]
+        if let (true, Some(slice)) = (durable, self.writeback_slice) {
+            return Some(slice);
+        }
+        (durable && bytes >= WRITEBACK_MIN).then_some(WRITEBACK_SLICE)
+    }
+
+    /// Stamp `units` (`(first page, pages)`, ascending; `bytes` their size), as step 3 stamps a
+    /// commit's units: from [`stamp::threads`]' threshold, their CRCs computed on several threads
+    /// ([`Self::unit_crcs`]) and then stored in unit order ([`stamp::put_crc`]); else, or when a
+    /// unit lies past the end of the file, each unit stamped in turn, the serial loop, which then
+    /// raises that unit's error. Meanwhile the writeback of `prev`, the slice stamped just before
+    /// (empty: none), is started ([`Self::start_writeback`]): on this thread while the others
+    /// compute, else before the serial loop. A failed start returns before any unit is stamped.
+    fn stamp_units(
+        &mut self,
+        units: impl Iterator<Item = (u32, u32)> + Clone,
+        bytes: usize,
+        prev: &[(u32, u32)],
+    ) -> Result<()> {
+        let size = self.geometry.page_size();
+        let threads = stamp::threads(bytes);
+        #[cfg(test)]
+        let threads = self.stamp_threads.unwrap_or(threads);
+        let (crcs, started) =
+            match self.unit_crcs(units.clone(), threads, || self.start_writeback(prev)) {
+                Some((crcs, started)) => (Some(crcs), started),
+                None => (None, self.start_writeback(prev)),
+            };
+        #[cfg(test)]
+        {
+            self.stamped_on = self.stamped_on.max(if crcs.is_some() { threads } else { 1 });
+        }
+        self.count_writeback(started?);
+        match crcs {
+            Some(crcs) => {
+                for ((p, n), crc) in units.zip(crcs) {
+                    stamp::put_crc(self.file.pages_mut(p, size, n as usize * size)?, crc);
+                }
+            }
+            None => {
+                for (p, n) in units {
+                    crc::add_crc32_nonzero(self.file.pages_mut(p, size, n as usize * size)?);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The CRC of each of `units`, in unit order, computed on `threads` threads (the count
+    /// [`stamp::threads`] gives the units' bytes) from read-only slices of the units
+    /// ([`PageFile::pages`]), with `meanwhile`'s result: [`stamp::crcs`] runs it on this thread
+    /// as the others compute. `None`, `meanwhile` not run, for one thread, which leaves the units
+    /// to the serial loop, and when a unit lies past the end of the file, whose error the serial
+    /// loop then raises.
+    fn unit_crcs<R>(
+        &self,
+        units: impl Iterator<Item = (u32, u32)>,
+        threads: usize,
+        meanwhile: impl FnOnce() -> R,
+    ) -> Option<(Vec<u32>, R)> {
         let size = self.geometry.page_size();
         if threads < 2 {
             return None;
         }
-        let units: Vec<&[u8]> = private
-            .units()
+        let units: Vec<&[u8]> = units
             .map(|(p, n)| self.file.pages(p, size, n as usize * size))
             .collect::<Option<_>>()?;
-        Some(stamp::crcs(&units, threads))
+        Some(stamp::crcs(&units, threads, meanwhile))
+    }
+
+    /// Step 3 of a durable commit of many bytes, in slices: `private`'s units in page order, cut
+    /// into slices that close at the first unit boundary from `slice` bytes, each stamped as a
+    /// whole commit's units are ([`Self::stamp_units`]) and then its pages' writeback started
+    /// ([`Self::start_writeback`]), so the drive writes the stamped slices while the rest is
+    /// stamped: a slice's start runs while the next slice's CRCs are computed, the last slice's
+    /// once it is stamped. The bytes stamped, their order and the errors are those of the units
+    /// stamped in one piece; the starts make nothing durable, which stays step 4's. No page is
+    /// written in this commit after its slice's start, so no store waits on that writeback.
+    fn stamp_sliced(&mut self, private: &PrivatePages, slice: usize) -> Result<()> {
+        let size = self.geometry.page_size();
+        let mut units = private.units();
+        let (mut prev, mut next) = (Vec::new(), Vec::new());
+        loop {
+            let mut bytes = 0;
+            for (p, n) in units.by_ref() {
+                next.push((p, n));
+                bytes += n as usize * size;
+                if bytes >= slice {
+                    break;
+                }
+            }
+            if next.is_empty() {
+                break;
+            }
+            self.stamp_units(next.iter().copied(), bytes, &prev)?;
+            std::mem::swap(&mut prev, &mut next);
+            next.clear();
+        }
+        let started = self.start_writeback(&prev)?;
+        self.count_writeback(started);
+        Ok(())
+    }
+
+    /// Start the writeback of `slice`'s pages (units `(first page, pages)`, ascending, each one
+    /// stamped): one [`PageFile::start_writeback`] of the bytes from its first page to the end of
+    /// its last, the clean pages between included (the kernel writes only dirty pages; in a
+    /// durable environment those are this commit's, or free pages an aborted transaction wrote).
+    /// Returns the call's time when it started a writeback; `None` for an empty slice and on a
+    /// target without the call. A failure poisons the file.
+    fn start_writeback(&self, slice: &[(u32, u32)]) -> Result<Option<u64>> {
+        let (Some(&(first, _)), Some(&(last, n))) = (slice.first(), slice.last()) else {
+            return Ok(None);
+        };
+        let size = self.geometry.page_size() as u64;
+        let span = u64::from(first) * size..(u64::from(last) + u64::from(n)) * size;
+        #[cfg(test)]
+        self.log_writeback(slice, &span);
+        let started = Instant::now();
+        Ok(self.file.start_writeback(span)?.then(|| elapsed_ns(started)))
+    }
+
+    /// Count a writeback start [`Self::start_writeback`] made in `ns` nanoseconds (`None`: none).
+    fn count_writeback(&mut self, ns: Option<u64>) {
+        if let Some(ns) = ns {
+            self.stats.writeback_starts += 1;
+            self.stats.writeback_ns += ns;
+        }
+    }
+
+    /// Test-only: record the start of `slice`'s writeback over the bytes `span` in
+    /// [`Self::writeback_log`], if a test asked for the log, with whether every unit of the slice
+    /// held its CRC then.
+    #[cfg(test)]
+    fn log_writeback(&self, slice: &[(u32, u32)], span: &Range<u64>) {
+        let mut log = self.writeback_log.lock();
+        let Some(log) = log.as_mut() else {
+            return;
+        };
+        let size = self.geometry.page_size();
+        let stamped = slice.iter().all(|&(p, n)| {
+            self.file
+                .pages(p, size, n as usize * size)
+                .is_some_and(|unit| crc::crc_state(unit) == CrcState::Valid)
+        });
+        log.push(WritebackSpan { bytes: span.clone(), units: slice.to_vec(), stamped });
     }
 
     /// Record pages stamped by a [`SyncMode::NoSync`] commit, for the next sync.
@@ -1088,6 +1275,10 @@ impl Env {
             stamp_threads: None,
             #[cfg(test)]
             stamped_on: 0,
+            #[cfg(test)]
+            writeback_slice: WRITEBACK_SLICE_ON_OPEN.get(),
+            #[cfg(test)]
+            writeback_log: Mutex::new(None),
         };
         let inner = EnvInner::new(geometry, options.sync, snapshot, Some(Box::new(writer)), None);
         Ok(Env { inner: Arc::new(inner) })

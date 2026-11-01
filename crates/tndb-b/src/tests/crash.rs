@@ -16,7 +16,7 @@ use crate::{
     alloc::RunStats,
     catalog::{self, DupRecord},
     disk_model,
-    env::CrashAt,
+    env::{self, CrashAt},
     meta::slot_to_write,
     packed::PackedView,
     page::{self, Find, Val},
@@ -340,6 +340,14 @@ pub(super) fn matrix(base: &Base, seeds: u64) {
 #[test]
 fn every_crash_point_recovers_the_state_the_protocol_allows() {
     matrix(&base(4096), 3);
+}
+
+/// The matrix with every durable commit's step 3 sliced at three pages
+/// (`env::with_writeback_slice`), so each slice's writeback is started before the next is
+/// stamped: the same states recover, with one random power loss per crash point.
+#[test]
+fn every_crash_point_recovers_the_state_the_protocol_allows_with_a_sliced_stamp() {
+    env::with_writeback_slice(3 * 4096, || matrix(&base(4096), 1));
 }
 
 /// The matrix at two page sizes, with many random power losses.

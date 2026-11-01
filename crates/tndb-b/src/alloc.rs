@@ -517,12 +517,12 @@ pub(crate) struct PrivatePages {
 impl PrivatePages {
     /// What gets one CRC each, ascending, as `(first page, pages)`: a tree page alone, and a run
     /// as one unit (its CRC covers all its pages; its interior is never stamped page by page).
-    pub(crate) fn units(&self) -> impl Iterator<Item = (u32, u32)> + '_ {
+    pub(crate) fn units(&self) -> impl Iterator<Item = (u32, u32)> + Clone + '_ {
         self.walk().map(|(p, n, _)| (p, n))
     }
 
     /// [`Self::units`], each with whether it is a run.
-    fn walk(&self) -> impl Iterator<Item = (u32, u32, bool)> + '_ {
+    fn walk(&self) -> impl Iterator<Item = (u32, u32, bool)> + Clone + '_ {
         let mut runs = self.runs.iter().peekable();
         let mut i = 0;
         std::iter::from_fn(move || {

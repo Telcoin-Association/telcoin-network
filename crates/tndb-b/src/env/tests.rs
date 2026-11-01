@@ -1299,16 +1299,49 @@ fn stamp_value(i: u32, len: usize) -> Vec<u8> {
     (0..len).map(|j| (j as u32).wrapping_mul(31).wrapping_add(i.wrapping_mul(7)) as u8).collect()
 }
 
+/// What one commit of [`stamp_workload`] did in step 3.
+#[derive(Debug)]
+struct Stamped {
+    /// The most threads one of its CRC computations took (`Writer::stamped_on`).
+    on: usize,
+    /// Its writeback starts (`Writer::writeback_log`), in order.
+    spans: Vec<WritebackSpan>,
+    /// Its counters (`IoStats::since` the commit before).
+    stats: IoStats,
+}
+
+/// Commit `txn`, a transaction of `env`, whose writer logs its writeback starts, and return what
+/// its step 3 did.
+fn commit_stamped(env: &Env, txn: RwTxn) -> Stamped {
+    let before = env.io_stats();
+    txn.commit().expect("commit");
+    let (on, spans) = env.with_writer(|w| {
+        let spans = w.writeback_log.get_mut().replace(Vec::new()).expect("the log is on");
+        (w.stamped_on, spans)
+    });
+    Stamped { on, spans, stats: env.io_stats().since(&before) }
+}
+
 /// Run the stamp tests' commits on a new file at `path`, with commit step 3's CRCs computed on
-/// `threads` threads (`Writer::stamp_threads`; `None`: `stamp::threads`' choice), then reopen
-/// it, check it and read every value back. The commits stamp tree pages and overflow runs of 1 to
-/// 10 pages, replace values in both directions and delete some; `big` adds a commit of 3 MiB of
-/// runs, past `stamp::threads`' threshold. Returns the threads each commit's CRCs took
-/// (`Writer::stamped_on`).
-fn stamp_workload(path: &Path, threads: Option<usize>, big: bool) -> Vec<usize> {
+/// `threads` threads (`Writer::stamp_threads`; `None`: `stamp::threads`' choice) and each
+/// commit's step 3 sliced at `slice` bytes (`Writer::writeback_slice`; `None`: `Writer::slicing`'s
+/// choice), then reopen it, check it and read every value back. The commits stamp tree pages
+/// and overflow runs of 1 to 10 pages, replace values in both directions and delete some; `big`
+/// adds a commit of 3 MiB of runs, past `stamp::threads`' threshold. Returns what each commit's
+/// step 3 did.
+fn stamp_workload(
+    path: &Path,
+    threads: Option<usize>,
+    slice: Option<usize>,
+    big: bool,
+) -> Vec<Stamped> {
     const LENS: [usize; 6] = [100, 3000, 5000, 9000, 20_000, 37_000];
     let env = open(path);
-    env.with_writer(|w| w.stamp_threads = threads);
+    env.with_writer(|w| {
+        w.stamp_threads = threads;
+        w.writeback_slice = slice;
+        *w.writeback_log.get_mut() = Some(Vec::new());
+    });
     let mut model = BTreeMap::new();
     let mut txn = env.begin_rw().expect("begin");
     let t = txn.create_table("s").expect("table");
@@ -1317,8 +1350,7 @@ fn stamp_workload(path: &Path, threads: Option<usize>, big: bool) -> Vec<usize> 
         txn.put(&t, &i.to_be_bytes(), &v).expect("put");
         model.insert(i, v);
     }
-    txn.commit().expect("commit");
-    let mut on = vec![env.with_writer(|w| w.stamped_on)];
+    let mut stamped = vec![commit_stamped(&env, txn)];
     let mut txn = env.begin_rw().expect("begin");
     for i in 0u32..60 {
         if i % 5 == 0 {
@@ -1330,8 +1362,7 @@ fn stamp_workload(path: &Path, threads: Option<usize>, big: bool) -> Vec<usize> 
             model.insert(i, v);
         }
     }
-    txn.commit().expect("commit");
-    on.push(env.with_writer(|w| w.stamped_on));
+    stamped.push(commit_stamped(&env, txn));
     if big {
         let mut txn = env.begin_rw().expect("begin");
         for i in 100u32..148 {
@@ -1339,8 +1370,7 @@ fn stamp_workload(path: &Path, threads: Option<usize>, big: bool) -> Vec<usize> 
             txn.put(&t, &i.to_be_bytes(), &v).expect("put");
             model.insert(i, v);
         }
-        txn.commit().expect("commit");
-        on.push(env.with_writer(|w| w.stamped_on));
+        stamped.push(commit_stamped(&env, txn));
     }
     env.check().expect("check");
     drop(env);
@@ -1351,7 +1381,15 @@ fn stamp_workload(path: &Path, threads: Option<usize>, big: bool) -> Vec<usize> 
     for (i, v) in &model {
         assert_eq!(val(&txn, &t, &i.to_be_bytes()).as_ref(), Some(v), "key {i}");
     }
-    on
+    stamped
+}
+
+/// The threads each of `stamped`'s commits took, asserting that none started a writeback.
+fn unsliced(stamped: &[Stamped]) -> Vec<usize> {
+    for s in stamped {
+        assert!(s.spans.is_empty() && s.stats.writeback_starts == 0, "no writeback start: {s:?}");
+    }
+    stamped.iter().map(|s| s.on).collect()
 }
 
 #[test]
@@ -1359,11 +1397,12 @@ fn a_parallel_stamp_writes_the_serial_stamps_bytes() {
     // The same commits, their CRCs computed on 2, 3 and 5 threads, leave the file the serial
     // loop leaves, byte for byte, which reopens, checks and reads back.
     let (_serial_dir, serial) = temp();
-    assert_eq!(stamp_workload(&serial, Some(1), false), [1, 1]);
+    assert_eq!(unsliced(&stamp_workload(&serial, Some(1), None, false)), [1, 1]);
     let serial = fs::read(&serial).expect("read");
     for threads in [2, 3, 5] {
         let (_dir, path) = temp();
-        assert_eq!(stamp_workload(&path, Some(threads), false), [threads, threads]);
+        let on = unsliced(&stamp_workload(&path, Some(threads), None, false));
+        assert_eq!(on, [threads, threads]);
         assert!(fs::read(&path).expect("read") == serial, "{threads} threads");
     }
 }
@@ -1374,10 +1413,179 @@ fn a_commit_past_the_stamp_threshold_writes_the_serial_stamps_bytes() {
     // the process may use one CPU only, and leaves the file the serial loop leaves.
     let cpus = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
     let (_serial_dir, serial) = temp();
-    assert_eq!(stamp_workload(&serial, Some(1), true), [1, 1, 1]);
+    assert_eq!(unsliced(&stamp_workload(&serial, Some(1), None, true)), [1, 1, 1]);
     let (_dir, path) = temp();
-    let on = stamp_workload(&path, None, true);
+    let on = unsliced(&stamp_workload(&path, None, None, true));
     assert_eq!(on[..2], [1, 1], "the small commits stamp serially");
     assert!(cpus == 1 || on[2] > 1, "the 3 MiB commit takes several threads: {on:?}");
     assert!(fs::read(&path).expect("read") == fs::read(&serial).expect("read"));
+}
+
+#[test]
+fn a_sliced_stamp_writes_the_serial_stamps_bytes() {
+    // The same commits, step 3 sliced at one page, at a little over three pages, at 64 KiB and
+    // at 1 MiB, each slice's CRCs on 1 and on 3 threads, leave the file the serial loop leaves,
+    // byte for byte; every commit took slices.
+    let (_serial_dir, serial) = temp();
+    assert_eq!(unsliced(&stamp_workload(&serial, Some(1), None, true)), [1, 1, 1]);
+    let serial = fs::read(&serial).expect("read");
+    for slice in [4096, 3 * 4096 + 1, 64 << 10, 1 << 20] {
+        for threads in [1, 3] {
+            let (_dir, path) = temp();
+            let stamped = stamp_workload(&path, Some(threads), Some(slice), true);
+            for s in &stamped {
+                assert_eq!(s.on, threads, "slice {slice}, {threads} threads");
+                assert!(!s.spans.is_empty(), "slice {slice}, {threads} threads: sliced");
+            }
+            let spans = stamped[2].spans.len();
+            assert!(slice > 64 << 10 || spans > 10, "slice {slice}: {spans} slices");
+            assert!(fs::read(&path).expect("read") == serial, "slice {slice}, {threads} threads");
+        }
+    }
+}
+
+/// Check the writeback starts of one sliced commit cut at `slice` bytes: each covers exactly its
+/// slice, from its first unit's first page to its last unit's end, and was made once every unit
+/// of the slice held its CRC; the slices follow one another in page order, each closing at the
+/// first unit boundary from `slice` bytes (the last at the end), and their units' pages are
+/// distinct and as many as the commit synced, so every page the commit stamped lies in exactly
+/// one started span. On Linux each start is counted, elsewhere none.
+fn assert_spans(stamped: &Stamped, slice: usize, page_size: u64) {
+    let Stamped { spans, stats, .. } = stamped;
+    assert!(!spans.is_empty(), "the commit took slices");
+    let mut pages = std::collections::BTreeSet::new();
+    let mut end = 0;
+    for (i, span) in spans.iter().enumerate() {
+        assert!(span.stamped, "span {i} started before its slice's CRCs were stored: {span:?}");
+        let (first, _) = span.units[0];
+        let (last, n) = span.units[span.units.len() - 1];
+        let bytes = u64::from(first) * page_size..u64::from(last + n) * page_size;
+        assert_eq!(span.bytes, bytes, "span {i} covers its slice");
+        assert!(span.bytes.start >= end, "span {i} follows the one before");
+        end = span.bytes.end;
+        let sizes: Vec<usize> =
+            span.units.iter().map(|&(_, n)| n as usize * page_size as usize).collect();
+        let total: usize = sizes.iter().sum();
+        let closed = total - sizes[sizes.len() - 1];
+        assert!(closed < slice, "span {i}: the slice closes at the first boundary from {slice}");
+        assert!(i + 1 == spans.len() || total >= slice, "span {i}: only the last is short");
+        for &(p, n) in &span.units {
+            for q in p..p + n {
+                assert!(pages.insert(q), "page {q} in two spans");
+            }
+        }
+    }
+    assert_eq!(pages.len() as u64, stats.pages_synced, "every page stamped is in a span");
+    let counted = if cfg!(target_os = "linux") { spans.len() as u64 } else { 0 };
+    assert_eq!(stats.writeback_starts, counted, "{stats:?}");
+    assert!(stats.writeback_ns <= stats.stamp_ns, "{stats:?}");
+}
+
+#[test]
+fn every_stamped_page_is_in_exactly_one_started_span() {
+    // Each commit of the stamp workload, sliced at one page, at a little over three pages and at
+    // 64 KiB, its CRCs on 1 and on 3 threads, started one writeback per slice, each over its
+    // slice alone and only after its CRCs were stored, every page it stamped in one of them.
+    for slice in [4096, 3 * 4096 + 1, 64 << 10] {
+        for threads in [1, 3] {
+            let (_dir, path) = temp();
+            for stamped in stamp_workload(&path, Some(threads), Some(slice), true) {
+                assert_spans(&stamped, slice, 4096);
+            }
+        }
+    }
+}
+
+#[test]
+fn nosync_and_small_commits_start_no_writeback() {
+    // Step 3 is sliced only for a durable commit of `WRITEBACK_MIN` bytes of units or more, in
+    // slices of `WRITEBACK_SLICE`; the test knob slices every durable commit, never a `NoSync`
+    // one. A `NoSync` environment with the knob set starts no writeback, at its commits or at
+    // the sync that makes them durable; the stamp workload's durable commits, all below the
+    // threshold, start none either (`unsliced`, in the tests above).
+    let (_dir, path) = temp();
+    let env = open(&path);
+    env.with_writer(|w| {
+        assert_eq!(w.slicing(true, WRITEBACK_MIN - 1), None, "below the threshold");
+        assert_eq!(w.slicing(true, WRITEBACK_MIN), Some(WRITEBACK_SLICE), "from the threshold");
+        assert_eq!(w.slicing(false, usize::MAX), None, "a NoSync commit");
+        w.writeback_slice = Some(4096);
+        assert_eq!(w.slicing(true, 0), Some(4096), "the knob, durable");
+        assert_eq!(w.slicing(false, usize::MAX), None, "the knob, NoSync");
+    });
+    drop(env);
+    let (_dir, path) = temp();
+    let env = Env::open(&path, options(4096, SyncMode::NoSync)).expect("open");
+    env.with_writer(|w| {
+        w.writeback_slice = Some(4096);
+        *w.writeback_log.get_mut() = Some(Vec::new());
+    });
+    let before = env.io_stats();
+    for round in 0u32..3 {
+        let mut txn = env.begin_rw().expect("begin");
+        let t = txn.create_table("s").expect("table");
+        for i in 0u32..40 {
+            txn.put(&t, &(round * 100 + i).to_be_bytes(), &stamp_value(i, 9000)).expect("put");
+        }
+        txn.commit().expect("commit");
+    }
+    env.sync().expect("sync");
+    let d = env.io_stats().since(&before);
+    assert_eq!((d.nosync_commits, d.commits), (3, 1), "{d:?}");
+    assert_eq!((d.writeback_starts, d.writeback_ns), (0, 0), "{d:?}");
+    let log = env.with_writer(|w| w.writeback_log.get_mut().take().expect("the log is on"));
+    assert!(log.is_empty(), "{log:?}");
+}
+
+#[test]
+fn a_durable_commit_past_the_threshold_starts_each_slices_writeback() {
+    // A durable commit of 33 MiB of runs, past `WRITEBACK_MIN` with no knob set, is stamped in
+    // slices of `WRITEBACK_SLICE`, each started once stamped, and reads back after a reopen.
+    let (_dir, path) = temp();
+    let env = open(&path);
+    env.with_writer(|w| *w.writeback_log.get_mut() = Some(Vec::new()));
+    let mut txn = env.begin_rw().expect("begin");
+    let t = txn.create_table("s").expect("table");
+    for i in 0u32..33 {
+        txn.put(&t, &i.to_be_bytes(), &stamp_value(i, 1 << 20)).expect("put");
+    }
+    let stamped = commit_stamped(&env, txn);
+    assert!(stamped.spans.len() >= 2, "{} slices", stamped.spans.len());
+    assert_spans(&stamped, WRITEBACK_SLICE, 4096);
+    drop(env);
+    let env = open(&path);
+    env.check().expect("check");
+    let txn = env.begin_ro().expect("begin");
+    let t = table(&txn, "s");
+    for i in 0u32..33 {
+        assert!(val(&txn, &t, &i.to_be_bytes()) == Some(stamp_value(i, 1 << 20)), "key {i}");
+    }
+}
+
+/// A failed writeback start fails the commit with an I/O error and latches, as a failed sync
+/// does; a reopen finds the state before it.
+#[test]
+fn a_failed_writeback_start_latches() {
+    let (_dir, path) = temp();
+    let env = open(&path);
+    put_all(&env, "a", &[(b"k", b"1")]);
+    env.with_writer(|w| {
+        w.writeback_slice = Some(4096);
+        w.file.fail_next_writeback();
+    });
+    let mut txn = env.begin_rw().expect("begin");
+    let a = txn.create_table("a").expect("a");
+    for i in 0u32..40 {
+        txn.put(&a, &i.to_be_bytes(), &stamp_value(i, 3000)).expect("put");
+    }
+    assert!(matches!(txn.commit(), Err(Error::Io(_))));
+    assert!(env.failure().is_some_and(|c| c.contains("injected writeback failure")));
+    assert!(matches!(env.begin_rw(), Err(Error::Failed(_))));
+    assert!(matches!(env.sync(), Err(Error::Failed(_))));
+    assert_eq!(env.stat().txn_id, 1);
+    drop(env);
+    let env = open(&path);
+    assert_eq!(env.failure(), None, "a reopen clears the latch");
+    assert_eq!(env.stat().txn_id, 1);
+    env.check().expect("check");
 }

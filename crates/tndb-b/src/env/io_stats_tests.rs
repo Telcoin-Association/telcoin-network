@@ -245,3 +245,44 @@ fn a_read_only_open_counts_nothing() {
     env.sync().expect("a read-only sync does nothing");
     assert_eq!(env.io_stats(), IoStats::default());
 }
+
+/// A sliced step 3 (`Writer::writeback_slice`, every durable commit sliced) counts one writeback
+/// start per slice where the target has the call (Linux) and none elsewhere, its time inside the
+/// stamp's; `NoSync` commits and their sync start none, with the knob set too.
+#[test]
+fn sliced_commits_count_their_writeback_starts() {
+    for sync in [SyncMode::Durable, SyncMode::NoSync] {
+        let (_dir, path) = temp();
+        let env = open(&path, sync);
+        env.with_writer(|w| {
+            w.writeback_slice = Some(2 * 4096);
+            *w.writeback_log.get_mut() = Some(Vec::new());
+        });
+        let before = env.io_stats();
+        put_keys(&env, 0..200, 1, 300);
+        env.sync().expect("sync");
+        let d = env.io_stats().since(&before);
+        let spans = env.with_writer(|w| w.writeback_log.get_mut().take().expect("log").len());
+        assert_eq!(spans > 1, sync == SyncMode::Durable, "{sync:?}: {spans} slices");
+        let counted = if cfg!(target_os = "linux") { spans as u64 } else { 0 };
+        assert_eq!(d.writeback_starts, counted, "{sync:?}: {d:?}");
+        assert!(d.writeback_ns <= d.stamp_ns, "{sync:?}: {d:?}");
+        assert_eq!(d.writeback_ns > 0, d.writeback_starts > 0, "{sync:?}: {d:?}");
+    }
+}
+
+/// On Linux a durable commit of 40 MiB of runs, past the slicing threshold with no knob set,
+/// reaches `sync_file_range` once per slice: the counter moves, the calls succeed, and their time
+/// lies inside the stamp's.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_big_durable_commit_starts_its_writeback_on_linux() {
+    let (_dir, path) = temp();
+    let env = open(&path, SyncMode::Durable);
+    let before = env.io_stats();
+    put_keys(&env, 0..40, 1, 1 << 20);
+    let d = env.io_stats().since(&before);
+    assert!(d.writeback_starts >= 2, "{d:?}");
+    assert!(d.writeback_ns > 0 && d.writeback_ns <= d.stamp_ns, "{d:?}");
+    assert_eq!(env.failure(), None);
+}

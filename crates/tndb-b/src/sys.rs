@@ -1,6 +1,6 @@
-//! Thin wrappers over the system calls the page file needs: file and directory syncs, block
-//! preallocation, the OS page size and the open locks (exclusive for a writer, shared for a
-//! read-only open).
+//! Thin wrappers over the system calls the page file needs: file and directory syncs, the start
+//! of a range's writeback, block preallocation, the OS page size and the open locks (exclusive
+//! for a writer, shared for a read-only open).
 //!
 //! **macOS.** Neither `msync` nor `fsync` is a full power-loss barrier there (that needs
 //! `F_FULLFSYNC`, a flush of the whole drive's write cache). Commits are `msync`, so every other
@@ -68,6 +68,37 @@ pub(crate) fn fdatasync_file(file: &File) -> io::Result<()> {
         }
         synced
     }
+}
+
+/// Start writing back the dirty pages of the `len` bytes of `file` from `offset` (`len > 0`),
+/// waiting for none of it: on Linux one `sync_file_range(SYNC_FILE_RANGE_WRITE)`, which queues
+/// the range's dirty pages for writeback and returns `Ok(true)`. It makes nothing durable (no
+/// wait, no metadata, no drive cache flush), so it is not a sync and reports nothing to the disk
+/// model: a later `msync` or `fdatasync` still makes the pages durable, and finds less to write.
+/// `Ok(false)` on other targets, where it does nothing.
+#[cfg(target_os = "linux")]
+pub(crate) fn start_writeback(file: &File, offset: u64, len: u64) -> io::Result<bool> {
+    debug_assert!(len > 0, "a length of 0 would mean to the end of the file");
+    // SAFETY: a plain syscall on a file descriptor `file` owns and keeps open for the call; it
+    // touches no Rust memory, and the kernel range-checks the offsets.
+    let rc = unsafe {
+        libc::sync_file_range(
+            file.as_raw_fd(),
+            offset as libc::off64_t,
+            len as libc::off64_t,
+            libc::SYNC_FILE_RANGE_WRITE,
+        )
+    };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(true)
+}
+
+/// See the Linux variant: nothing to start on this target, so `Ok(false)`.
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn start_writeback(_file: &File, _offset: u64, _len: u64) -> io::Result<bool> {
+    Ok(false)
 }
 
 /// Reserve real disk blocks for `[from, to)` of `file` and grow it to `to` bytes, so a later

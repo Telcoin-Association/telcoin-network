@@ -23,7 +23,7 @@ use super::{
 };
 use crate::{
     disk_model,
-    env::CrashAt,
+    env::{self, CrashAt},
     meta::slot_to_write,
     tree::{
         test_harness::{walk_outer_tree, walk_packing_tree, ReportSeed, Rng},
@@ -839,6 +839,26 @@ fn a_random_multi_table_workload_of_large_values_with_crashes_matches_the_model(
         seen.stopped_to_new >= 3,
         seen.stopped_to_old >= 10,
         seen.merging_deletes >= 10,
+    ];
+    assert!(gate.iter().all(|&ok| ok), "{seen:?}");
+}
+
+/// The large-value variant with every durable commit's step 3 sliced at three pages
+/// (`env::with_writeback_slice`): tree pages and runs in slices, each slice's writeback started
+/// before the next is stamped. The stamped bytes are those of the unsliced run, so the same seed
+/// makes the same run and meets the same gate.
+#[test]
+fn a_random_multi_table_workload_of_large_values_with_a_sliced_stamp_matches_the_model() {
+    let seen =
+        env::with_writeback_slice(3 * 4096, || random_run(0x7A11_0B16, 300, 4096, true, false));
+    let gate = [
+        seen.run_puts >= 1000,
+        seen.commits >= 120,
+        seen.process_crashes >= 5,
+        seen.strict_losses >= 5,
+        seen.random_losses >= 5,
+        seen.stopped_to_new >= 3,
+        seen.stopped_to_old >= 10,
     ];
     assert!(gate.iter().all(|&ok| ok), "{seen:?}");
 }

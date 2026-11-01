@@ -2308,7 +2308,7 @@ impl Work {
             catalog: *catalog,
             free,
         };
-        let pages = writer.stamp_private()?;
+        let pages = writer.stamp_private(inner.sync_mode == SyncMode::Durable)?;
         #[cfg(test)]
         writer.crash_point(CrashAt::AfterStamp)?;
         match inner.sync_mode {

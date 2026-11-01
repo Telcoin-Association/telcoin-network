@@ -47,7 +47,9 @@
 //! persist a size extension, so a growth marks the size unsynced and
 //! [`PageFile::sync_size_if_grown`] fdatasyncs it once. [`PageFile::fdatasync_all`] writes every
 //! dirty page of the mapping and the size in one call, so after it the size sync has nothing left
-//! to do. Any failed sync or growth poisons the file:
+//! to do. [`PageFile::start_writeback`] only starts a range's writeback (Linux
+//! `sync_file_range`), so a commit's later sync finds less to write; it makes nothing durable.
+//! Any failed sync, writeback start or growth poisons the file:
 //! every later write or sync returns [`Error::Failed`] and is never retried (a retried `msync`
 //! after a writeback error can spuriously succeed on Linux errseq, laundering lost data). Reads
 //! continue.
@@ -71,7 +73,7 @@ use memmap2::{Advice, Mmap, MmapOptions, MmapRaw};
 
 use crate::{
     error::{Error, Result},
-    sys::{allocate_range, fdatasync_file, os_page_size},
+    sys::{allocate_range, fdatasync_file, os_page_size, start_writeback},
 };
 
 /// Address space a page file reserves for its mapping by default (1 GiB).
@@ -176,6 +178,9 @@ pub(crate) struct PageFile {
     /// Test-only: fail the next msync (see [`Self::fail_next_msync`]).
     #[cfg(test)]
     fail_next_msync: AtomicBool,
+    /// Test-only: fail the next writeback start (see [`Self::fail_next_writeback`]).
+    #[cfg(test)]
+    fail_next_writeback: AtomicBool,
 }
 
 impl PageFile {
@@ -215,6 +220,8 @@ impl PageFile {
             poisoned: AtomicBool::new(false),
             #[cfg(test)]
             fail_next_msync: AtomicBool::new(false),
+            #[cfg(test)]
+            fail_next_writeback: AtomicBool::new(false),
         })
     }
 
@@ -445,10 +452,32 @@ impl PageFile {
         Ok(())
     }
 
+    /// Start the writeback of the dirty pages in the byte range `range` (non-empty, inside the
+    /// file), waiting for none of it ([`start_writeback`]): `Ok(true)` when started, `Ok(false)` on
+    /// a target without the call. Not a sync: the pages are durable only after a later `msync` or
+    /// `fdatasync`. A failure poisons the file, as a failed sync does.
+    pub(crate) fn start_writeback(&self, range: Range<u64>) -> Result<bool> {
+        self.check_poison()?;
+        #[cfg(test)]
+        if self.fail_next_writeback.swap(false, Ordering::Relaxed) {
+            self.poison();
+            return Err(io::Error::other("injected writeback failure").into());
+        }
+        let started = start_writeback(&self.file, range.start, range.end - range.start)
+            .inspect_err(|_| self.poison())?;
+        Ok(started)
+    }
+
     /// Test-only: make the next msync fail as if the kernel had reported a writeback error.
     #[cfg(test)]
     pub(crate) fn fail_next_msync(&self) {
         self.fail_next_msync.store(true, Ordering::Relaxed);
+    }
+
+    /// Test-only: make the next writeback start fail as if the kernel had refused it.
+    #[cfg(test)]
+    pub(crate) fn fail_next_writeback(&self) {
+        self.fail_next_writeback.store(true, Ordering::Relaxed);
     }
 }
 

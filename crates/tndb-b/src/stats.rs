@@ -56,8 +56,16 @@ pub struct IoStats {
     pub free_list_save_rounds: u64,
     /// Time in step 1: the changed tables' roots into the catalog, then the free list's save.
     pub save_ns: u64,
-    /// Time in step 3: the CRCs of every page written, one per tree page and one per run.
+    /// Time in step 3: the CRCs of every page written, one per tree page and one per run
+    /// ([`Self::writeback_ns`] included).
     pub stamp_ns: u64,
+    /// Writebacks step 3 started: a [`crate::SyncMode::Durable`] commit of many pages stamps them
+    /// in slices and starts each slice's writeback (Linux `sync_file_range`) as soon as its CRCs
+    /// are stored, so the drive writes during the rest of the stamp; one per slice. Zero on
+    /// targets without the call, for smaller commits and for [`crate::SyncMode::NoSync`] ones.
+    pub writeback_starts: u64,
+    /// Time in the calls of [`Self::writeback_starts`], inside [`Self::stamp_ns`].
+    pub writeback_ns: u64,
     /// Time in step 4: the one `msync` or the one `fdatasync` of the data pages.
     pub data_sync_ns: u64,
     /// Time in step 5: the file's size sync (`fdatasync`) when it grew and step 4 did not already
@@ -122,6 +130,8 @@ impl IoStats {
             free_list_save_rounds,
             save_ns,
             stamp_ns,
+            writeback_starts,
+            writeback_ns,
             data_sync_ns,
             size_sync_ns,
             meta_sync_ns,
@@ -149,6 +159,8 @@ impl IoStats {
             free_list_save_rounds: d(free_list_save_rounds, earlier.free_list_save_rounds),
             save_ns: d(save_ns, earlier.save_ns),
             stamp_ns: d(stamp_ns, earlier.stamp_ns),
+            writeback_starts: d(writeback_starts, earlier.writeback_starts),
+            writeback_ns: d(writeback_ns, earlier.writeback_ns),
             data_sync_ns: d(data_sync_ns, earlier.data_sync_ns),
             size_sync_ns: d(size_sync_ns, earlier.size_sync_ns),
             meta_sync_ns: d(meta_sync_ns, earlier.meta_sync_ns),
@@ -193,6 +205,8 @@ mod tests {
         let earlier = IoStats {
             commits: 1,
             pages_synced: 10,
+            writeback_starts: 2,
+            writeback_ns: 30,
             runs_by_step: [1, 2, 3, 4],
             max_gate_lag: 7,
             ..IoStats::default()
@@ -200,6 +214,8 @@ mod tests {
         let later = IoStats {
             commits: 3,
             pages_synced: 25,
+            writeback_starts: 7,
+            writeback_ns: 80,
             runs_by_step: [2, 2, 5, 9],
             max_gate_lag: 9,
             verify_ns: 4,
@@ -211,6 +227,8 @@ mod tests {
             IoStats {
                 commits: 2,
                 pages_synced: 15,
+                writeback_starts: 5,
+                writeback_ns: 50,
                 runs_by_step: [1, 0, 2, 5],
                 max_gate_lag: 9,
                 verify_ns: 4,

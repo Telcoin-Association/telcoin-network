@@ -7,7 +7,9 @@
 //! ([`crate::file::PageFile::pages`]), each thread computes the CRCs of a contiguous share of
 //! about equal bytes, and once every thread is done the writer stores each CRC into its unit's
 //! trailer itself, in unit order, through `PageFile::pages_mut` ([`put_crc`]). The threads only
-//! read: no page changes while they run, and they need no `unsafe`.
+//! read: no page changes while they run, and they need no `unsafe`. A large durable commit runs
+//! this once per slice of its units (`Writer::stamp_sliced`), the caller's thread starting the
+//! previous slice's writeback while the others compute ([`crcs`]' `meanwhile`).
 //!
 //! The result is the serial loop's (`crc::add_crc32_nonzero` on each unit): the same bytes,
 //! stored in the same order, with the same errors, which only the stores can raise. A failed
@@ -49,7 +51,15 @@ fn max_threads() -> usize {
 /// The CRC [`crc::add_crc32_nonzero`] stamps on each of `units` (a whole unit: its payload and
 /// its 4-byte trailer), in their order, computed on up to `threads` threads: the current one and
 /// up to `threads - 1` scoped ones, each over a contiguous share of [`shares`].
-pub(crate) fn crcs(units: &[&[u8]], threads: usize) -> Vec<u32> {
+///
+/// `meanwhile` runs on the current thread once the other threads are spawned, before it computes
+/// its own share (a sliced step 3 starts the previous slice's writeback there,
+/// `Writer::stamp_sliced`); its result is returned beside the CRCs.
+pub(crate) fn crcs<R>(
+    units: &[&[u8]],
+    threads: usize,
+    meanwhile: impl FnOnce() -> R,
+) -> (Vec<u32>, R) {
     /// A share left to another thread, or to this one if that thread could not be spawned.
     enum Share<'s, 'u> {
         Spawned(ScopedJoinHandle<'s, Vec<u32>>),
@@ -57,7 +67,7 @@ pub(crate) fn crcs(units: &[&[u8]], threads: usize) -> Vec<u32> {
     }
     let mut shares = shares(units, threads).into_iter();
     let mut out = Vec::with_capacity(units.len());
-    thread::scope(|s| {
+    let done = thread::scope(|s| {
         let first = shares.next().unwrap_or_default();
         let rest: Vec<Share<'_, '_>> = shares
             .map(|share| {
@@ -67,6 +77,7 @@ pub(crate) fn crcs(units: &[&[u8]], threads: usize) -> Vec<u32> {
                     .map_or(Share::Here(share), Share::Spawned)
             })
             .collect();
+        let done = meanwhile();
         out.extend(first.iter().map(|u| unit_crc(u)));
         for share in rest {
             match share {
@@ -76,8 +87,9 @@ pub(crate) fn crcs(units: &[&[u8]], threads: usize) -> Vec<u32> {
                 Share::Here(share) => out.extend(share.iter().map(|u| unit_crc(u))),
             }
         }
+        done
     });
-    out
+    (out, done)
 }
 
 /// `units` split into at most `threads` contiguous, non-empty shares of about equal bytes: share
@@ -157,7 +169,8 @@ mod tests {
     /// `bytes` stamped by the serial loop, `crc::add_crc32_nonzero` on each unit, and by [`crcs`]
     /// on `threads` threads then [`put_crc`] on each unit.
     fn both_stamps(mut bytes: Vec<u8>, lens: &[usize], threads: usize) -> (Vec<u8>, Vec<u8>) {
-        let crcs = crcs(&units(&bytes, lens), threads);
+        let (crcs, ran) = crcs(&units(&bytes, lens), threads, || true);
+        assert!(ran, "meanwhile ran once, its result returned");
         assert_eq!(crcs.len(), lens.len(), "one CRC per unit");
         let mut serial = bytes.clone();
         let mut rest = &mut serial[..];
