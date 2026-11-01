@@ -33,7 +33,11 @@ markers: **[done]**, **[next]**, **[later]**.
   reran clean. TN-0022/23 head `1af59b607`: nextest 3719 passed (and 3744 with
   `tn-reth/tndb-b`), restarts 8/8, epochs 11/11, `make test-sigkill` 7/7, CI-flags check
   (default and tndb-b), clippy, fmt, the RocksDB gate, and the nested tests for nippy-jar,
-  provider, txpool and db (db with two threads; see README).
+  provider, txpool and db (db with two threads; see README). Second-pass head `95614334f`:
+  nextest 3719 passed (and 3744 with `tn-reth/tndb-b`), no LEAK flags on either run, restarts
+  8/8, epochs 11/11, `make test-sigkill` 7/7, CI-flags check (default and tndb-b), clippy (both
+  lanes), fmt, the RocksDB gate, the archive-mode guard, and the nested tests for every changed
+  crate (485 passed).
 - Out of scope here: Phase 3 and RocksDB step B belong to the tndb-b work, which happens
   elsewhere.
 - Open decision: drop `js-tracer` (see "Reduction pass 2"). It is the largest single cut left.
