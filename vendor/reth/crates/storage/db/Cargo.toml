@@ -1,0 +1,55 @@
+[package]
+name = "reth-db"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+description = "Database primitives used in reth."
+
+[lints]
+workspace = true
+
+[dependencies]
+# reth
+reth-db-api.workspace = true
+reth-fs-util.workspace = true
+reth-storage-errors.workspace = true
+reth-nippy-jar.workspace = true
+reth-tracing.workspace = true
+tracing.workspace = true
+reth-static-file-types.workspace = true
+
+# ethereum
+alloy-primitives.workspace = true
+
+# mdbx
+reth-libmdbx = { workspace = true, optional = true, features = ["return-borrowed", "read-tx-timeouts"] }
+eyre = { workspace = true, optional = true }
+
+# metrics
+reth-metrics = { workspace = true, optional = true }
+metrics = { workspace = true, optional = true }
+
+# misc
+page_size = { workspace = true, optional = true }
+thiserror.workspace = true
+derive_more.workspace = true
+rustc-hash = { workspace = true, optional = true, features = ["std"] }
+sysinfo = { workspace = true, features = ["system"] }
+
+# arbitrary utils
+strum = { workspace = true, features = ["derive"], optional = true }
+
+[features]
+default = ["mdbx"]
+mdbx = [
+    "dep:reth-libmdbx",
+    "dep:eyre",
+    "dep:page_size",
+    "reth-metrics",
+    "dep:metrics",
+    "dep:strum",
+    "dep:rustc-hash",
+]

@@ -1,0 +1,62 @@
+[package]
+name = "reth-stages"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+description = "Staged syncing primitives used in reth."
+
+[lints]
+workspace = true
+
+[dependencies]
+reth-codecs.workspace = true
+reth-config.workspace = true
+reth-consensus.workspace = true
+reth-db.workspace = true
+reth-db-api.workspace = true
+reth-etl.workspace = true
+reth-evm = { workspace = true, features = ["metrics"] }
+reth-era-downloader.workspace = true
+reth-era-utils.workspace = true
+reth-era.workspace = true
+reth-exex.workspace = true
+reth-fs-util.workspace = true
+reth-network-p2p.workspace = true
+reth-primitives-traits = { workspace = true, features = ["serde-bincode-compat"] }
+reth-provider.workspace = true
+reth-execution-types.workspace = true
+reth-prune.workspace = true
+reth-prune-types.workspace = true
+reth-storage-api.workspace = true
+reth-storage-errors.workspace = true
+reth-revm.workspace = true
+reth-stages-api.workspace = true
+reth-static-file-types.workspace = true
+reth-tasks.workspace = true
+reth-trie = { workspace = true, features = ["metrics"] }
+reth-trie-db = { workspace = true, features = ["metrics"] }
+
+alloy-eips.workspace = true
+alloy-primitives.workspace = true
+alloy-consensus.workspace = true
+
+# async
+tokio = { workspace = true, features = ["sync"] }
+futures-util.workspace = true
+
+# observability
+tracing.workspace = true
+
+# misc
+thiserror.workspace = true
+itertools.workspace = true
+rayon.workspace = true
+num-traits.workspace = true
+bincode.workspace = true
+reqwest.workspace = true
+eyre.workspace = true
+
+[features]

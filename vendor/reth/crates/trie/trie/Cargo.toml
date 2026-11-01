@@ -1,0 +1,62 @@
+[package]
+name = "reth-trie"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+description = "Merkle trie implementation"
+
+[lints]
+workspace = true
+
+[dependencies]
+# reth
+reth-execution-errors.workspace = true
+reth-primitives-traits.workspace = true
+reth-stages-types.workspace = true
+reth-storage-errors.workspace = true
+reth-trie-sparse.workspace = true
+reth-trie-common = { workspace = true, features = ["rayon"] }
+
+revm-database.workspace = true
+
+# alloy
+alloy-eips.workspace = true
+alloy-rlp.workspace = true
+alloy-primitives.workspace = true
+alloy-consensus.workspace = true
+alloy-trie.workspace = true
+
+# tracing
+tracing = { workspace = true, features = ["attributes"] }
+
+# misc
+auto_impl.workspace = true
+itertools.workspace = true
+
+# `metrics` feature
+reth-metrics = { workspace = true, optional = true }
+metrics = { workspace = true, optional = true }
+
+parking_lot = { workspace = true, optional = true }
+
+[features]
+metrics = ["reth-metrics", "dep:metrics"]
+serde = [
+    "alloy-primitives/serde",
+    "alloy-consensus/serde",
+    "alloy-trie/serde",
+    "alloy-eips/serde",
+    "reth-trie-common/serde",
+    "reth-primitives-traits/serde",
+    "alloy-primitives/serde",
+    "alloy-consensus/serde",
+    "alloy-trie/serde",
+    "alloy-eips/serde",
+    "reth-trie-common/serde",
+    "revm-database/serde",
+    "reth-stages-types/serde",
+    "parking_lot/serde",
+]

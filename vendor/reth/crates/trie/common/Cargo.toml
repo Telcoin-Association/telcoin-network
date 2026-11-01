@@ -1,0 +1,83 @@
+[package]
+name = "reth-trie-common"
+version.workspace = true
+edition.workspace = true
+homepage.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Commonly used types for trie usage in reth."
+
+[lints]
+workspace = true
+
+[dependencies]
+# alloy
+alloy-primitives.workspace = true
+alloy-rlp = { workspace = true, features = ["arrayvec"] }
+alloy-trie = { workspace = true, features = ["ethereum"] }
+alloy-consensus.workspace = true
+reth-primitives-traits.workspace = true
+reth-codecs = { workspace = true, optional = true }
+
+alloy-rpc-types-eth = { workspace = true, optional = true }
+alloy-serde = { workspace = true, optional = true }
+
+arrayvec = { workspace = true, optional = true }
+bytes = { workspace = true, optional = true }
+derive_more.workspace = true
+itertools = { workspace = true, features = ["use_alloc"] }
+nybbles = { workspace = true, features = ["rlp"] }
+
+# reth
+revm-database.workspace = true
+
+# `serde` feature
+serde = { workspace = true, optional = true }
+
+serde_with = { workspace = true, optional = true }
+
+# misc
+rayon = { workspace = true, optional = true }
+
+[features]
+default = ["std"]
+std = [
+    "alloy-consensus/std",
+    "alloy-primitives/std",
+    "alloy-rlp/std",
+    "alloy-rpc-types-eth?/std",
+    "alloy-serde?/std",
+    "alloy-trie/std",
+    "arrayvec?/std",
+    "bytes?/std",
+    "derive_more/std",
+    "nybbles/std",
+    "reth-primitives-traits/std",
+    "serde?/std",
+    "serde_with?/std",
+    "revm-database/std",
+]
+eip1186 = ["alloy-rpc-types-eth/serde", "dep:alloy-serde"]
+serde = [
+    "dep:serde",
+    "arrayvec?/serde",
+    "bytes?/serde",
+    "nybbles/serde",
+    "alloy-primitives/serde",
+    "alloy-consensus/serde",
+    "alloy-trie/serde",
+    "alloy-rpc-types-eth?/serde",
+    "reth-primitives-traits/serde",
+    "reth-codecs?/serde",
+    "revm-database/serde",
+]
+reth-codec = ["dep:reth-codecs", "dep:bytes", "dep:arrayvec"]
+serde-bincode-compat = [
+    "serde",
+    "reth-primitives-traits/serde-bincode-compat",
+    "alloy-consensus/serde-bincode-compat",
+    "dep:serde_with",
+    "alloy-rpc-types-eth?/serde-bincode-compat",
+]
+rayon = ["dep:rayon"]
