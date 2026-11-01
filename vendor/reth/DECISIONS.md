@@ -257,4 +257,6 @@ effect is accepting signed years beyond four digits; the remaining users parse A
 format log timestamps, which use four-digit years). The test
 `js_tracer_follows_the_build_feature` (`crates/tn-reth/src/env/rpc/tests/namespaces.rs`) pins both
 builds. `crates/tn-reth/js-tracer.md` covers what the feature does, why it is off, how to turn it
-on, and the steps for removing it entirely.
+on, and the steps for removing it entirely. Measured on macOS arm64, a stripped release binary
+is 7.9 MB smaller without the feature (54.8 MB against 62.7 MB), and a clean release build takes
+about as long (1m50s against 1m54s on 16 cores).
