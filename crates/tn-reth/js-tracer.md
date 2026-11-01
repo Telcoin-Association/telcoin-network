@@ -37,6 +37,11 @@ boa and its helpers are 35 of the 865 packages the node compiled before this cha
 its parser, garbage collector, string interner, regex engine and their helpers. That is the largest
 single cut left after the reth reduction. Without it the default build has 830 packages.
 
+They are also about an eighth of the node binary. Measured on macOS arm64, a stripped release
+build of `telcoin-network` (the profile the Docker image uses) is 54.8 MB without the feature and
+62.7 MB with it. Build time barely changes: a clean release build took 1m50s without it and 1m54s
+with it on 16 cores, because boa compiles in parallel with the rest of the graph.
+
 A JavaScript tracer is code the RPC caller supplies, and the node runs it on its blocking pool at
 every EVM step of the traced transaction. What bounds it:
 
