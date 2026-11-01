@@ -470,7 +470,9 @@ fn run_steps(
 /// cursors. `follower_shares_prefix` matches the model after each delete at every prefix length
 /// (a follower in the next leaf and a delete of the table's last entry among them), and in any
 /// position, stale included. Each round commits; a cursor of an earlier round is `WrongTxn` in a
-/// later one; the file then reopens with exact accounting.
+/// later one; the file then reopens with exact accounting. Every other round writes under
+/// `Writer::no_write_hint`; the others route their cursor writes by the cursors' paths, some
+/// hints held to the leaf and some refused at a level (counted in debug builds).
 #[test]
 fn txn_cursors_and_direct_writes_match_a_model() {
     model_test(&[(1, 4096, 700), (2, 16384, 2500), (3, 4096, 60)], 3, 2500);
@@ -495,7 +497,13 @@ fn model_test(seeds: &[(u64, u32, u64)], rounds: usize, steps: usize) {
         let mut cov = Coverage::default();
         let mut reseeks = 0;
         let mut old: Option<TxnCursor> = None;
+        // The levels routed by a cursor's hint and the hints refused, over the hinted rounds.
+        let mut hint = [0; 2];
         for round in 0..rounds {
+            // Every other round writes with the cursors' hints off.
+            let hinted = (seed + round as u64).is_multiple_of(2);
+            env.with_writer(|w| w.no_write_hint = !hinted);
+            let routed = hint_routing();
             let mut rw = env.begin_rw().expect("begin");
             if let Some(mut c) = old.take() {
                 assert!(
@@ -537,6 +545,12 @@ fn model_test(seeds: &[(u64, u32, u64)], rounds: usize, steps: usize) {
             old = cursors.pop();
             rw.commit().expect("commit");
             check(&env);
+            let now = hint_routing();
+            let delta: [u64; 2] = std::array::from_fn(|i| now[i] - routed[i]);
+            match hinted {
+                true => hint = std::array::from_fn(|i| hint[i] + delta[i]),
+                false => assert_eq!(delta, [0, 0], "seed {seed} round {round}: hints off"),
+            }
         }
         assert!(env.failure().is_none(), "nothing latched");
         drop(env);
@@ -558,6 +572,9 @@ fn model_test(seeds: &[(u64, u32, u64)], rounds: usize, steps: usize) {
         assert!(cov.next_leaf_followers > 0 && cov.end_deletes > 10, "seed {seed}: {cov:?}");
         assert!(cov.stale_shares > 5, "seed {seed}: {cov:?}");
         assert!(reseeks as usize > steps / 4, "seed {seed}: {reseeks} reseeks");
+        if cfg!(debug_assertions) {
+            assert!(hint[0] > 0 && hint[1] > 0, "seed {seed}: levels hinted, refused: {hint:?}");
+        }
     }
 }
 
@@ -965,6 +982,15 @@ fn follower_shares_prefix_answers_for_the_deleted_entrys_follower() {
 fn write_routing() -> [u64; 3] {
     use crate::tree::write::{HINTED_LEVELS, HINT_REFUSALS, WRITE_SEARCHES};
     [&HINTED_LEVELS, &HINT_REFUSALS, &WRITE_SEARCHES].map(|c| c.with(std::cell::Cell::get))
+}
+
+/// [`write_routing`]'s levels routed by a hint and hints refused; none in a release build, which
+/// does not count them.
+fn hint_routing() -> [u64; 2] {
+    #[cfg(debug_assertions)]
+    return [write_routing()[0], write_routing()[1]];
+    #[cfg(not(debug_assertions))]
+    [0, 0]
 }
 
 /// `write`'s result, and what it added to each of [`write_routing`]'s counters.

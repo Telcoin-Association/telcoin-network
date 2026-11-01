@@ -41,6 +41,8 @@ pub(crate) struct DupFixture {
     pub(crate) cells: BTreeMap<u32, (u32, TreeRoot)>,
     /// A leaf of `p` and a key it holds.
     plain_leaf: (u32, Vec<u8>),
+    /// The leaf of [`HOT`]'s nested tree that holds its first rows.
+    hot_leaf: u32,
     /// The catalog, one leaf.
     catalog_leaf: u32,
     /// The free tree, one leaf, and its first record's key.
@@ -112,6 +114,7 @@ pub(crate) fn dup_fixture() -> DupFixture {
     let plain_leaf = (leaf_of(&tree(&env, "p"), &key), key);
     let next_txn = u32::try_from(snapshot.meta.txn + 1).expect("a u32 txn");
     let (hot, cold) = (cells[&HOT].1, cells[&COLD].1);
+    let hot_leaf = leaf_of(&hot, &[0, 0x5a]);
     assert!(outer.height >= 2 && tree(&env, "p").height >= 2, "{outer:?}");
     assert!(hot.height >= 2 && hot.overflow_pages > 0 && cold.height == 1, "{hot:?} {cold:?}");
     drop(snapshot);
@@ -123,6 +126,7 @@ pub(crate) fn dup_fixture() -> DupFixture {
         dup,
         cells,
         plain_leaf,
+        hot_leaf,
         catalog_leaf: catalog.root,
         free_leaf,
         next_txn,
@@ -154,8 +158,9 @@ fn empty_subkey(path: &Path, pgno: u32) {
 /// Use a damaged environment as `damage.rs`'s sweep does, over plain table `p` and dup table `d`:
 /// get every row of `plain` and `dup`, scan `d` (every outer key but `hide`, whose rows `dup`
 /// leaves out too: the dup cursor steps inside each key, crosses to the next key with `next`, and
-/// seeks the key after `hide` past it) and `p`, then (unless `read_only`) put to every fifth row
-/// of each and fill a new table, commit, and check. The first error must be `Corrupt` from `stage`
+/// seeks the key after `hide` past it) and `p`, then (unless `read_only`) rewrite every fifth row
+/// of each through a detached cursor (as [`rewrite_through_cursors`]) and put to it, fill a new
+/// table, commit, and check. The first error must be `Corrupt` from `stage`
 /// and the environment latched (read-only: by the operation that returned it); writes fail.
 pub(crate) fn sweep_dup(
     env: &Env,
@@ -229,6 +234,7 @@ pub(crate) fn sweep_dup_writing(
             // Opened, not created: a record of other options would be `TableKind`.
             let d = txn.open_table("d")?.expect("d");
             let p = txn.create_table("p")?;
+            rewrite_through_cursors(&mut txn, (&d, written), (&p, plain))?;
             for (table, rows) in [(&d, written), (&p, plain)] {
                 for k in rows.keys().step_by(5) {
                     txn.put(table, k, b"rewritten")?;
@@ -259,6 +265,31 @@ pub(crate) fn sweep_dup_writing(
         true => assert!(matches!(rw, Err(Error::ReadOnly)), "{what}: {rw:?}"),
         false => assert!(matches!(rw, Err(Error::Failed(_))), "{what}: writes fail"),
     }
+}
+
+/// Rewrite every fifth row of `d`'s `dup` and of `p`'s `plain` through a detached cursor, as
+/// rewrites of rows are done: a dup row's seek, `delete_current` and `insert`, a plain row's
+/// `seek_exact` and put. These are the write stage's first writes into each page, so its damage
+/// meets writes that route by a cursor's paths (`write::Hint`); a row the seek does not land on
+/// is left to the puts after.
+fn rewrite_through_cursors(
+    txn: &mut RwTxn,
+    (d, dup): (&Table, &Rows),
+    (p, plain): (&Table, &Rows),
+) -> crate::Result<()> {
+    let mut c = txn.dup_cursor_detached(d)?;
+    for k in dup.keys().step_by(5) {
+        if c.seek(txn, k)?.is_some_and(|(at, _)| at == &k[..]) && c.delete_current(txn)? {
+            c.insert(txn, k, b"rewritten")?;
+        }
+    }
+    let mut c = txn.cursor_detached(p)?;
+    for k in plain.keys().step_by(5) {
+        if c.seek_exact(txn, k)?.is_some() {
+            c.put(txn, k, b"rewritten")?;
+        }
+    }
+    Ok(())
 }
 
 /// One damage case: its name, the stage of the write-side sweep and of the read-only sweep that
@@ -371,6 +402,24 @@ fn cases(fx: &DupFixture) -> Vec<Case<'_>> {
             }),
         ),
         ("empty subkey", Get, Get, None, Box::new(move |p| empty_subkey(p, cold.root))),
+        // A byte of a row's value in a leaf of the nested tree and of the plain table (reads do
+        // not recompute CRCs), each met by the cursor rewrite's first write there, routed by the
+        // cursor's paths: the nested delete verifies the leaf on its hit (`verify_path`), the
+        // plain put as it copies the leaf (`verify_published`).
+        (
+            "nested leaf bytes",
+            Write,
+            Check,
+            None,
+            Box::new(move |p| crate::env::tests::flip(p, u64::from(fx.hot_leaf) * P + P - 16)),
+        ),
+        (
+            "plain leaf bytes",
+            Write,
+            Check,
+            None,
+            Box::new(move |p| crate::env::tests::flip(p, u64::from(fx.plain_leaf.0) * P + P - 16)),
+        ),
         (
             "counters off",
             Check,

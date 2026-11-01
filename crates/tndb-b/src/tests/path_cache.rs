@@ -1,7 +1,9 @@
 //! The write-path cache (`write::PathCache`) against the descent: the same operations on two
 //! environments, one with the cache and one without (`Writer::no_path_cache`, under which a
 //! delete also leaves a detached cursor to find its place again by key), give the same results
-//! and byte-identical files; and a cache never outlives the pages it names.
+//! and byte-identical files; and a cache never outlives the pages it names. Beside them, the
+//! same pairing for a cursor's write hint (`write::Hint`): writes routed by the cursors' paths
+//! against the same writes under `Writer::no_write_hint`.
 
 use std::{collections::BTreeMap, fs, path::Path};
 
@@ -10,7 +12,8 @@ use proptest::prelude::*;
 use super::{check, newest_state, temp, value};
 use crate::{
     env::{Env, EnvOptions, SyncMode},
-    ReadTxn, RoTxn, RwTxn,
+    tree::test_harness::{ReportSeed, Rng},
+    ReadTxn, RoTxn, RwTxn, Table, TxnCursor,
 };
 
 /// The puts done in a cached leaf on this thread so far (`write::CACHED_PUTS`). Only debug
@@ -481,4 +484,224 @@ fn slot_rewrites_over_sorted_keys_delete_in_the_cached_leaf() {
         assert_eq!((k, v), (&seq_key(i as u32), &value(1, i as u32, 40)), "entry {i}");
     }
     check(&env);
+}
+
+/// The levels write descents routed by a cursor's hint, and the hints they refused, on this
+/// thread so far (`write::HINTED_LEVELS`, `write::HINT_REFUSALS`), as [`cached_puts`] counts.
+fn hint_routing() -> [u64; 2] {
+    #[cfg(debug_assertions)]
+    return [&crate::tree::write::HINTED_LEVELS, &crate::tree::write::HINT_REFUSALS]
+        .map(|c| c.with(std::cell::Cell::get));
+    #[cfg(not(debug_assertions))]
+    [0, 0]
+}
+
+/// Key `i` of the hint pair's table: 100 bytes, so a few thousand entries reach three levels at
+/// 4 KiB pages.
+fn hint_key(i: u32) -> Vec<u8> {
+    let mut k = i.to_be_bytes().to_vec();
+    k.resize(100, i as u8);
+    k
+}
+
+/// One step of a hint pair's script, on cursor `c` of the side's two or on the transaction.
+#[derive(Clone, Copy, Debug)]
+enum HintOp {
+    Seek(usize, u32),
+    SeekExact(usize, u32),
+    /// A slot rewrite: put the key the cursor is at (`current`) with a new value.
+    PutAt(usize, usize),
+    /// A put through the cursor of any key: its hint holds while the key lies on its path.
+    Put(usize, u32, usize),
+    /// Up to `n` `delete_current`s as a walk does, each deleting the follower the last one left.
+    DeleteRun(usize, u8),
+    Next(usize, u8),
+    /// The transaction's own put and delete, which use the path cache the cursors' writes left.
+    TxnPut(u32, usize),
+    TxnDelete(u32),
+    Commit,
+}
+
+impl HintOp {
+    fn pick(rng: &mut Rng, keys: u32) -> Self {
+        let c = rng.below(2) as usize;
+        let k = rng.below(u64::from(keys)) as u32;
+        // Mostly small values; some that split a leaf, and a few in an overflow run.
+        let len = match rng.below(20) {
+            0 => 3000,
+            1..=3 => 600 + rng.len_upto(600),
+            _ => rng.len_upto(200),
+        };
+        match rng.below(100) {
+            0..=14 => Self::Seek(c, k),
+            15..=29 => Self::SeekExact(c, k),
+            30..=44 => Self::PutAt(c, len),
+            45..=54 => Self::Put(c, k, len),
+            55..=69 => Self::DeleteRun(c, 1 + rng.below(30) as u8),
+            70..=79 => Self::Next(c, 1 + rng.below(4) as u8),
+            80..=91 => Self::TxnPut(k, len),
+            92..=97 => Self::TxnDelete(k),
+            _ => Self::Commit,
+        }
+    }
+}
+
+/// One environment of the hint pair: its open transaction, the table and two detached cursors.
+struct HintSide {
+    env: Env,
+    /// Always open: a commit begins the next transaction.
+    txn: Option<RwTxn>,
+    table: Table,
+    cursors: [TxnCursor; 2],
+}
+
+impl HintSide {
+    /// A fresh environment at `path` with entries `0, 2, 4, ..` below `keys` committed; `hinted`
+    /// false sets `Writer::no_write_hint`.
+    fn open(path: &Path, hinted: bool, keys: u32) -> Self {
+        let options = EnvOptions { sync: SyncMode::NoSync, ..EnvOptions::default() };
+        let env = Env::open(path, options).expect("open");
+        env.with_writer(|w| w.no_write_hint = !hinted);
+        let mut txn = env.begin_rw().expect("begin");
+        let table = txn.create_table("t").expect("create");
+        for i in (0..keys).step_by(2) {
+            txn.put(&table, &hint_key(i), &value(0, i, 60)).expect("put");
+        }
+        txn.commit().expect("commit");
+        let txn = env.begin_rw().expect("begin");
+        let cursors = [(); 2].map(|()| txn.cursor_detached(&table).expect("cursor"));
+        Self { env, txn: Some(txn), table, cursors }
+    }
+
+    /// Run `op` and describe its outcome, then where both cursors are.
+    fn run(&mut self, op: HintOp, val: &[u8]) -> String {
+        if matches!(op, HintOp::Commit) {
+            let done = self.txn.take().map(RwTxn::commit);
+            let txn = self.txn.insert(self.env.begin_rw().expect("begin"));
+            self.cursors = [(); 2].map(|()| txn.cursor_detached(&self.table).expect("cursor"));
+            return format!("{done:?}");
+        }
+        let Self { txn, table, cursors, .. } = self;
+        let txn = txn.as_mut().expect("open");
+        let out = match op {
+            HintOp::Seek(c, k) => {
+                format!(
+                    "{:?}",
+                    cursors[c].seek(txn, &hint_key(k)).map(|e| e.map(|(k, _)| k[..4].to_vec()))
+                )
+            }
+            HintOp::SeekExact(c, k) => {
+                format!(
+                    "{:?}",
+                    cursors[c].seek_exact(txn, &hint_key(k)).map(|v| v.map(<[u8]>::len))
+                )
+            }
+            HintOp::PutAt(c, _) => {
+                match cursors[c].current(txn).map(|e| e.map(|(k, _)| k.to_vec())) {
+                    Ok(Some(key)) => format!("{:?}", cursors[c].put(txn, &key, val)),
+                    other => format!("{other:?}"),
+                }
+            }
+            HintOp::Put(c, k, _) => format!("{:?}", cursors[c].put(txn, &hint_key(k), val)),
+            HintOp::DeleteRun(c, n) => {
+                let mut out = String::new();
+                for _ in 0..n {
+                    let deleted = cursors[c].delete_current(txn);
+                    out += &format!(" {deleted:?} {:?}", cursors[c].state());
+                    if !matches!(deleted, Ok(true)) {
+                        break;
+                    }
+                }
+                out
+            }
+            HintOp::Next(c, n) => {
+                let steps: Vec<_> = (0..n)
+                    .map(|_| {
+                        cursors[c].next(txn).map(|e| e.map(|(k, v)| (k[..4].to_vec(), v.len())))
+                    })
+                    .collect();
+                format!("{steps:?}")
+            }
+            HintOp::TxnPut(k, _) => format!("{:?}", txn.put(table, &hint_key(k), val)),
+            HintOp::TxnDelete(k) => format!("{:?}", txn.delete(table, &hint_key(k))),
+            HintOp::Commit => unreachable!("done above"),
+        };
+        let at = cursors.iter().map(|c| c.position(txn)).collect::<Vec<_>>();
+        format!("{out} at {at:?}")
+    }
+}
+
+/// Seeded scripts of seeks, slot rewrites, puts of any key and runs of deletes through two
+/// detached cursors, with the transaction's own puts and deletes, on an environment whose cursor
+/// writes route by the cursors' paths and on one under `Writer::no_write_hint`: every outcome and
+/// cursor position match, and after every commit the files are byte-identical. Returns the hinted
+/// side's routed levels, refusals and merging deletes.
+fn hinted_matches_unhinted(seed: u64, ops: usize, keys: u32) -> [u64; 3] {
+    let _report = ReportSeed(seed);
+    let mut rng = Rng(seed * 0x9E37_79B9 + 11);
+    let (_dir_a, path_a) = temp("tndb-b-hint-on");
+    let (_dir_b, path_b) = temp("tndb-b-hint-off");
+    let mut on = HintSide::open(&path_a, true, keys);
+    let mut off = HintSide::open(&path_b, false, keys);
+    let merging =
+        |side: &mut HintSide| side.txn.as_mut().expect("open").writer_mut().merging_deletes;
+    let height = on.txn.as_ref().expect("open").table_stat(&on.table).expect("stat").height;
+    assert!(height >= 3, "three levels: {height}");
+    let merges = merging(&mut on);
+    let mut routed = [0; 2];
+    for i in 0..ops {
+        let op = HintOp::pick(&mut rng, keys);
+        let val = match op {
+            HintOp::PutAt(_, len) | HintOp::Put(_, _, len) | HintOp::TxnPut(_, len) => {
+                value(i as u32, seed as u32, len)
+            }
+            _ => Vec::new(),
+        };
+        let before = hint_routing();
+        let a = on.run(op, &val);
+        let after = hint_routing();
+        let b = off.run(op, &val);
+        assert_eq!(hint_routing(), after, "op {i} {op:?}: the unhinted side routed by a hint");
+        routed = std::array::from_fn(|j| routed[j] + after[j] - before[j]);
+        assert_eq!(a, b, "op {i} {op:?}: the hinted and the unhinted outcomes differ");
+        if matches!(op, HintOp::Commit) {
+            let (fa, fb) = (fs::read(&path_a).expect("read"), fs::read(&path_b).expect("read"));
+            assert!(fa == fb, "op {i}: the files differ after the commit");
+        }
+    }
+    let merges = merging(&mut on) - merges;
+    for side in [on, off] {
+        side.txn.expect("open").commit().expect("commit");
+        check(&side.env);
+    }
+    assert!(fs::read(&path_a).expect("read") == fs::read(&path_b).expect("read"), "final files");
+    [routed[0], routed[1], merges]
+}
+
+fn hint_vs_search(seeds: std::ops::Range<u64>, ops: usize) {
+    let mut seen = [0; 3];
+    for seed in seeds {
+        let got = hinted_matches_unhinted(seed, ops, 3000);
+        seen = std::array::from_fn(|j| seen[j] + got[j]);
+    }
+    let [hinted, refused, merges] = seen;
+    assert!(merges > 0, "no delete merged");
+    if cfg!(debug_assertions) {
+        assert!(hinted > 0 && refused > 0, "{hinted} levels hinted, {refused} hints refused");
+    }
+}
+
+/// A cursor's writes routed by its path ([`crate::tree::write::Hint`]) leave what the search
+/// leaves: over three-level trees at 4 KiB pages with merging on, the slot rewrites, puts of any
+/// key and delete runs of two detached cursors (splits, overflow runs, merges and unlinks among
+/// them) give the same outcomes, cursor positions and file bytes as under `Writer::no_write_hint`.
+#[test]
+fn hinted_writes_leave_the_bytes_of_unhinted_ones() {
+    hint_vs_search(1..4, 1500);
+}
+
+#[test]
+#[ignore = "heavy: run with --release"]
+fn hinted_writes_leave_the_bytes_of_unhinted_ones_heavy() {
+    hint_vs_search(10..26, 6000);
 }

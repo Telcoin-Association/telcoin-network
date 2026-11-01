@@ -496,6 +496,9 @@ struct Seen {
     packed_under: [u32; 4],
     /// A cursor's next call after a packed rewrite in place under it that reseeked.
     reseeks_after_packed_rewrite: u32,
+    /// The levels write descents routed by a cursor's hint, and the hints refused, in the rounds
+    /// with the hints on (debug builds count them, [`hint_routing`]).
+    hint: [u32; 2],
 }
 
 impl Seen {
@@ -546,6 +549,12 @@ impl Seen {
             ("delete_prefix of a packed key under a cursor", self.packed_under[3]),
             ("reseeks after a packed rewrite", self.reseeks_after_packed_rewrite),
         ];
+        if cfg!(debug_assertions) {
+            gates.extend([
+                ("levels routed by a hint", self.hint[0]),
+                ("hints refused", self.hint[1]),
+            ]);
+        }
         if packing {
             gates.extend(packed);
         } else {
@@ -617,6 +626,10 @@ fn lockstep(
         let stat = env.begin_ro().expect("ro").table_stat(&d).expect("stat");
         assert!(fillers == 0 || stat.height >= 2, "the outer tree's height: {stat:?}");
         for round in 0..rounds {
+            // Every other round writes with the cursors' hints off.
+            let hinted = (seed + u64::from(round)).is_multiple_of(2);
+            env.with_writer(|w| w.no_write_hint = !hinted);
+            let routed = hint_routing();
             if model.len() < initial.len() / 2 {
                 let mut txn = env.begin_rw().expect("rw");
                 for (key, v) in &initial {
@@ -773,6 +786,12 @@ fn lockstep(
             } else {
                 txn.abort();
             }
+            let now = hint_routing();
+            for (i, seen) in seen.hint.iter_mut().enumerate() {
+                let delta = now[i] - routed[i];
+                assert!(hinted || delta == 0, "round {round}: {delta} with the hints off");
+                *seen += delta as u32;
+            }
         }
         assert!(env.failure().is_none(), "no call latched: {:?}", env.failure());
     }
@@ -818,7 +837,9 @@ fn has_key(rows: &Rows, k: &[u8]) -> bool {
 /// sets beside the nested `big` key, rewritten in place, promoted as they grow and emptied, under
 /// cursors and through them; the packing gates: a cursor at a packed key's row, another writer's
 /// packed rewrite in place, promotion, emptying and `delete_prefix` under a cursor, and a reseek
-/// after a packed rewrite.
+/// after a packed rewrite. Every other round writes under `Writer::no_write_hint`; the others
+/// route the cursors' writes by their paths, with a gate (debug builds) on levels routed by a hint
+/// and on hints refused.
 #[test]
 fn dup_txn_cursors_and_direct_writes_match_the_composite_twin() {
     lockstep(Bound::Default.options(OPTIONS.key_len), 0..6, 300, 300, 5, 3000, 3);
@@ -1177,6 +1198,15 @@ fn a_held_outer_leaf_never_overrides_the_map() {
             assert_eq!(ro.get(&d, &row_key(2, s)).expect("get"), value, "{bound:?}: row {s}");
         }
     }
+}
+
+/// [`dup_routing`]'s levels routed by a hint and hints refused; none in a release build, which
+/// does not count them.
+fn hint_routing() -> [u64; 2] {
+    #[cfg(debug_assertions)]
+    return [dup_routing()[0], dup_routing()[1]];
+    #[cfg(not(debug_assertions))]
+    [0, 0]
 }
 
 /// The write descents' routing counters on this thread so far, then the outer cells dup writes
