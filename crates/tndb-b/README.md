@@ -1774,21 +1774,31 @@ These limits and non-goals are known:
       A B B A: large-value puts 1.13–1.32x, sequential put loops 1.05–1.07x, small-transaction
       p99 1.5–1.7x; reads, scans and commits within the spread). Clear `readahead` to get the
       advice there.
-17. **A new page is not zero-filled, so its free gap holds old bytes** (`PageWrite::alloc`,
+17. **A new page is not zero-filled, and copy-on-write copies a page outside its free gap, so
+    the gap holds old bytes** (`PageWrite::alloc`, `tree::write::copy_page`,
     [Tree pages](#tree-pages-pagers)). A free gap, and an empty page's unwritten bytes (all of it
     past the header up to the trailer), hold whatever the page held before. That can be bytes of
-    a freed page, including data since deleted.
+    a freed page, including data since deleted. A copy-on-write copy writes the source's header
+    and slots, then its cells and trailer; the gap between them keeps the destination's old
+    bytes.
     - The bytes are covered by the page CRC, are the same for the same history of operations (two
       files driven through the same writes stay byte-identical), and are never read: no read,
       `page::validate` or `Env::check` looks between the slot array and `upper`.
     - Why: zero-filling cost a page-sized `memset` per allocation, about 4.7% of a busy output in
-      a macOS profile, and copy-on-write, the commonest allocation, overwrote the page whole
-      anyway. A fresh layout writes every byte it relies on itself (`page::init_header` writes
-      the header and the trailer, then the cells and slots follow; `overflow::encode_run` writes
-      a run whole).
+      a macOS profile. A fresh layout writes every byte it relies on itself (`page::init_header`
+      writes the header and the trailer, then the cells and slots follow; `overflow::encode_run`
+      writes a run whole). Copying the gap too cost 3.4% and 1.8% per call on two Linux rewrite
+      benchmarks (history-shaped and dup-shaped rewrites of existing pages).
+    - The copy's source passed the fetch checks and, unless this writer stamped it, its CRC and
+      `page::validate`, so its slots end at or below `upper` and `upper` at or below the trailer
+      (`page::hdr`'s check); a header outside those bounds, which no caller passes, is copied
+      whole, so the checks after the copy see the source's bytes. The leaf and branch mutators
+      that grow into the gap (`reserve`, `shift_front`) write every byte they hand out before it
+      is read.
     - Debug builds fill every page and run that `PageWrite::alloc` and `alloc_run` hand out with
-      `tree::POISON` (0xA5), so the whole test suite runs every layout over garbage and a
-      reliance on zeros fails it.
+      `tree::POISON` (0xA5), so the whole test suite runs every layout, and every copy (both
+      stores copy through `copy_page`), over garbage, and a reliance on zeros or on a copied gap
+      fails it.
     - A page taken from the file end still gets one byte written when it is allocated, so pages
       are first written in allocation order (see the macOS note in
       [Platform notes](#platform-notes)). That store is not a fill and promises nothing.

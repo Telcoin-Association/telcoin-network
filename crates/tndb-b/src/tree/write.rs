@@ -1557,13 +1557,17 @@ fn writable<S: PageWrite + ?Sized>(store: &mut S, p: u32, scratch: &mut Scratch)
 
 /// Copy page `src` into private page `to`'s bytes `dst` ([`PageWrite::copy_published`]): both
 /// are one page, else a broken invariant ([`Error::Failed`]), never a panic.
+///
+/// The header and slots, then the cells and the trailer: the free gap between the end of the
+/// slots and `upper` keeps `dst`'s old bytes, which nothing reads and the commit's CRC covers
+/// as they are (README do-not-flag 17). Every caller's `src` is a tree page that passed the
+/// fetch checks and, before its first change, [`page::validate`]; a header whose slots pass
+/// `upper`, or whose `upper` passes the trailer, is no such page and is copied whole, so the
+/// checks after the copy see `src`'s bytes.
 pub(crate) fn copy_page(src: &[u8], to: u32, dst: &mut [u8]) -> Result<()> {
     if dst.len() != src.len() {
         return Err(bug(format!("page {to} of {} bytes, not {}", dst.len(), src.len())));
     }
-    // The header and slots, then the cells and the trailer; the free gap between them is left
-    // as the destination's bytes, which nothing reads (README do-not-flag 17). A header whose
-    // slots and cells overlap, or run past the trailer, is copied whole, for the checks after.
     let len = src.len();
     let (lower, upper) = (page::HEADER + page::SLOT * page::nkeys(src), page::upper(src));
     if lower <= upper && upper <= len - page::TRAILER {
@@ -7011,11 +7015,15 @@ mod tests {
 
     /// Copy-on-write of published page `p` through [`writable`], against the two-step copy it
     /// replaced (the page into a buffer, the buffer into the reserved page, then the stamp): the
-    /// same bytes, the new page number and this txn in the header, the trailer zeroed.
+    /// same bytes but the free gap, which keeps the reserved page's ([`copy_page`]), the new page
+    /// number and this txn in the header, the trailer zeroed.
     fn assert_one_copy_is_the_two_step_copy<S: PageWrite + ?Sized>(store: &mut S, p: u32) {
         let txn = store.txn();
         let q = store.alloc().expect("alloc");
         let mut want = store.page(p).expect("a published page").to_vec();
+        let gap = page::HEADER + page::SLOT * page::nkeys(&want)..page::upper(&want);
+        let old = store.private_page(q).expect("the reserved page")[gap.clone()].to_vec();
+        want[gap].copy_from_slice(&old);
         page::set_pgno_txn(&mut want, q, txn);
         crc::zero_crc(&mut want);
         let mut scratch = Scratch::default();
@@ -7112,8 +7120,9 @@ mod tests {
     }
 
     /// Copy-on-write takes one copy, through [`PageWrite::copy_published`], and gives the bytes
-    /// the two-step copy gave, on a [`MemStore`] (`copy_within`) and on the environment's writer
-    /// (a published page through the readers' view into a private page).
+    /// the two-step copy gave outside the free gap, on a [`MemStore`] (within its one buffer) and
+    /// on the environment's writer (a published page through the readers' view into a private
+    /// page).
     #[test]
     fn copy_on_write_is_the_two_step_copy() {
         let (mut store, root) = committed_mem_store();

@@ -282,10 +282,10 @@ pub(crate) trait PageWrite: PageRead {
     fn epoch(&self) -> u64;
 
     /// A new private page. Its bytes are not zeroed (debug builds fill it with [`POISON`]): the
-    /// caller overwrites it whole ([`Self::copy_published`]) or lays it out as a fresh page
-    /// (`page::init_header` and the cells after it), which writes every byte but the free gap of
-    /// the page it lays out, bytes that nothing reads. A failure (e.g. the file cannot grow)
-    /// changes nothing.
+    /// caller copies a page into it ([`Self::copy_published`]) or lays it out as a fresh page
+    /// (`page::init_header` and the cells after it), and either writes every byte but the free
+    /// gap of the page it copies or lays out, bytes that nothing reads. A failure (e.g. the file
+    /// cannot grow) changes nothing.
     fn alloc(&mut self) -> Result<u32>;
 
     /// The bytes of private page `pgno`, to change in place. A page that is not private is
@@ -294,9 +294,10 @@ pub(crate) trait PageWrite: PageRead {
 
     /// Copy page `from`, fetched with exactly [`PageRead::page`]'s checks (whose
     /// [`Error::Corrupt`] it returns as is), into private page `to`, and return `to`'s bytes:
-    /// copy-on-write in one copy, the store lending the source and the destination at once. A
-    /// private `from` is refused ([`Error::Failed`]), so the two never overlap; so is a `to` that
-    /// is not private, as [`Self::page_mut`] refuses it.
+    /// copy-on-write in one copy ([`write::copy_page`]: every byte but the free gap), the store
+    /// lending the source and the destination at once. A private `from` is refused
+    /// ([`Error::Failed`]), so the two never overlap; so is a `to` that is not private, as
+    /// [`Self::page_mut`] refuses it.
     fn copy_published(&mut self, from: u32, to: u32) -> Result<&mut [u8]>;
 
     /// Page `pgno` left the tree: a published page is freed once no reader or durable meta can

@@ -5,7 +5,7 @@ use std::collections::HashSet;
 
 use super::{
     read::{checked_child, checked_page},
-    write::{MergeReport, Scratch},
+    write::{copy_page, MergeReport, Scratch},
     PageRead, PageWrite, TreeRoot,
 };
 use crate::{
@@ -356,7 +356,8 @@ impl PageWrite for MemStore {
         Ok(self.raw_mut(pgno))
     }
 
-    /// One `copy_within` of the page's range: the buffer has no readers to alias.
+    /// The writer's copy, [`copy_page`], from the buffer split at the later of the two pages:
+    /// the buffer has no readers to alias, and the private `to` is never the published `from`.
     fn copy_published(&mut self, from: u32, to: u32) -> Result<&mut [u8]> {
         if self.alloc.is_private(from) {
             return Err(Error::Failed(format!("page {from} is private: it needs no copy")));
@@ -364,8 +365,14 @@ impl PageWrite for MemStore {
         self.page(from)?;
         self.page_mut(to)?;
         let size = self.geometry.page_size();
-        let start = from as usize * size;
-        self.data.copy_within(start..start + size, to as usize * size);
+        let (src, dst) = (from as usize * size, to as usize * size);
+        let (low, high) = self.data.split_at_mut(src.max(dst));
+        let (src, dst) = if src < dst {
+            (&low[src..src + size], &mut high[..size])
+        } else {
+            (&high[..size], &mut low[dst..dst + size])
+        };
+        copy_page(src, to, dst)?;
         Ok(self.raw_mut(to))
     }
 

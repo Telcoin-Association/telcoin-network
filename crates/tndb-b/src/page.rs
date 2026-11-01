@@ -3958,4 +3958,154 @@ mod tests {
             }
         }
     }
+
+    /// Bytes from a seed ([`splitmix`]), for a page whose bytes nothing should read.
+    fn noise(seed: u64, size: usize) -> Vec<u8> {
+        let mut s = seed;
+        let mut bytes = vec![0_u8; size];
+        for chunk in bytes.chunks_mut(8) {
+            chunk.copy_from_slice(&splitmix(&mut s).to_le_bytes()[..chunk.len()]);
+        }
+        bytes
+    }
+
+    /// Grow valid `page`, whose keys sort below `[0xff]`, to a free gap of 0 with cells keyed
+    /// `[0xff, t, ...]`, ascending in `t`: each as large as the entry limits allow while leaving
+    /// room for the next, the last exactly the rest. Its free space must be 0 or at least
+    /// [`TOP_UP_ROOM`].
+    fn top_up(g: &Geometry, page: &mut [u8]) {
+        let branch = kind(page).unwrap() == Kind::Branch;
+        let (fixed, max) = match branch {
+            true => (SLOT + cell_size_branch(2), g.max_key() - 2),
+            false => (SLOT + cell_size_leaf(2, 0), g.max_value(2)),
+        };
+        for t in 0_u8.. {
+            let free = free_space(page).unwrap();
+            if free == 0 {
+                return;
+            }
+            let room = free - fixed;
+            let extra = if room <= max { room } else { max.min(room - TOP_UP_ROOM) };
+            let i = nkeys(page);
+            let fit = if branch {
+                let mut key = vec![0xff, t];
+                key.resize(2 + extra, t);
+                branch_insert(page, i, &key, 1, 1)
+            } else {
+                leaf_insert(page, i, &[0xff, t], &vec![t; extra])
+            };
+            assert_eq!(fit.unwrap(), Fit::Done, "top-up cell {t}");
+        }
+    }
+
+    /// The bytes [`top_up`] needs for a cell with a 2-byte key: a branch cell's, the larger.
+    const TOP_UP_ROOM: usize = SLOT + cell_size_branch(2);
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(128))]
+
+        /// [`copy_page`](crate::tree::write::copy_page) of random valid pages (leaves with inline,
+        /// overflow and nested cells, and branches; empty, part full, or full with no gap) whose
+        /// gap holds bytes of their own, into a page of random bytes: the copy is the source
+        /// outside the free gap (from the end of the slots to `upper`), keeps the destination's
+        /// bytes inside it, passes [`validate`] and reads back the source's cells.
+        #[test]
+        fn copy_page_copies_every_byte_outside_the_free_gap(
+            size in select(&SIZES[..]),
+            branch in any::<bool>(),
+            specs in vec((spec(), any::<u8>()), 0..80),
+            full in any::<bool>(),
+            seed in any::<u64>(),
+        ) {
+            let g = geometry(size);
+            let mut page = fresh(&g, if branch { Kind::Branch } else { Kind::Leaf });
+            if branch {
+                prop_assert_eq!(branch_insert(&mut page, 0, &[], 7, 9).unwrap(), Fit::Done);
+            }
+            for (n, (s, sel)) in specs.iter().enumerate() {
+                let key = ranked_key(2 * n as u32 + 1, s.klen(&g));
+                let free = free_space(&page).unwrap();
+                if branch {
+                    if cell_size_branch(key.len()) + SLOT + TOP_UP_ROOM > free {
+                        break;
+                    }
+                    let fit = branch_insert(&mut page, n + 1, &key, n as u32, u32::from(*sel));
+                    prop_assert_eq!(fit.unwrap(), Fit::Done);
+                    continue;
+                }
+                let value = s.value(&g, key.len());
+                let root = TreeRoot { root: 9, root_txn: 3, height: 1, entries: 1, leaf_pages: 1,
+                    ..TreeRoot::EMPTY }.encode();
+                let ovf = Ovf { pgno: 9, txn: 3, len: (g.max_value(key.len()) + 1) as u32 };
+                let val = match sel % 4 {
+                    0 if g.overflow_fits(key.len()) => Val::Overflow(ovf),
+                    1 if g.max_value(key.len()) >= NESTED_CELL => Val::Nested(&root),
+                    _ => Val::Inline(&value),
+                };
+                if cell_size_leaf(key.len(), val.cell_len()) + SLOT + TOP_UP_ROOM > free {
+                    break;
+                }
+                prop_assert_eq!(LeafMut::new(&mut page).unwrap().insert(n, &key, val).unwrap(),
+                    Fit::Done);
+            }
+            if full {
+                top_up(&g, &mut page);
+                prop_assert_eq!(free_space(&page).unwrap(), 0);
+            }
+            validate(&page, &g).unwrap();
+            let (lower, upper) = (HEADER + SLOT * nkeys(&page), upper(&page));
+            page[lower..upper].fill(0x5a);
+
+            let old = noise(seed, page.len());
+            let mut copy = old.clone();
+            crate::tree::write::copy_page(&page, 3, &mut copy).unwrap();
+            prop_assert!(copy[..lower] == page[..lower], "the header and slots");
+            prop_assert!(copy[upper..] == page[upper..], "the cells and the trailer");
+            prop_assert!(copy[lower..upper] == old[lower..upper], "the gap");
+            validate(&copy, &g).unwrap();
+            prop_assert_eq!(View::new(&copy).unwrap().used(), View::new(&page).unwrap().used());
+            for i in 0..nkeys(&page) {
+                if branch {
+                    prop_assert_eq!(branch_key(&copy, i).unwrap(), branch_key(&page, i).unwrap());
+                    prop_assert_eq!(branch_child(&copy, i).unwrap(), branch_child(&page, i).unwrap());
+                } else {
+                    prop_assert_eq!(leaf_entry(&copy, i).unwrap(), leaf_entry(&page, i).unwrap());
+                }
+            }
+        }
+    }
+
+    /// A header whose slots and cells overlap (the slots end past `upper`, or past the page) or
+    /// whose `upper` runs past the trailer (into it, or past the page) is no page of a tree:
+    /// [`copy_page`](crate::tree::write::copy_page) copies it whole, so the checks after the copy
+    /// see the source's bytes and fail as they fail on the source.
+    #[test]
+    fn copy_page_copies_a_page_with_overlapping_slots_and_cells_whole() {
+        for size in [4096_usize, 65536] {
+            let end = size - TRAILER;
+            for (nkeys, upper) in [
+                (40, HEADER + SLOT * 40 - 1),
+                (0xffff, 100),
+                (0, end + 1),
+                (3, end + TRAILER - 1),
+                (0, 0xffff),
+            ] {
+                let mut page = noise(size as u64, size);
+                page[KIND_OFF] = KIND_LEAF;
+                page[FLAGS_OFF] = 0;
+                put_u16(&mut page, NKEYS_OFF, nkeys);
+                put_u16(&mut page, UPPER_OFF, upper);
+                let mut copy = noise(!(size as u64), size);
+                let copied = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    crate::tree::write::copy_page(&page, 3, &mut copy)
+                }));
+                assert!(matches!(copied, Ok(Ok(()))), "{size}, ({nkeys}, {upper}): {copied:?}");
+                assert!(copy == page, "{size}, ({nkeys}, {upper}): not copied whole");
+                let g = geometry(size as u32);
+                let (want, got) = (validate(&page, &g), validate(&copy, &g));
+                assert!(want.is_err(), "{size}, ({nkeys}, {upper})");
+                assert_eq!(got.map_err(|e| e.to_string()), want.map_err(|e| e.to_string()));
+            }
+        }
+    }
 }
