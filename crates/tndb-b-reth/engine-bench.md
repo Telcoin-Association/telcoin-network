@@ -39,8 +39,9 @@ Environment variables select what runs (the `src/engine_bench.rs` module docs ha
   ascending), `small`, `mixed`, `clear`, `append` (the API rows),
   `big` (the large-value rows, see [Large values](#large-values-overflow-runs)), `delete` (the
   delete rows, see [Deletes](#deletes)), `changesets` (tndb-b columns only, see
-  [Changesets: composite or packed](#changesets-composite-or-packed)), and the aliases `bulk`,
-  `get` and `scan`.
+  [Changesets: composite or packed](#changesets-composite-or-packed)), `rewrite` (`t4d` and
+  `md4` only, see [Rewrites (reth's write stages)](#rewrites-reths-write-stages)), and the
+  aliases `bulk`, `get` and `scan`.
 - `TNDB_B_BENCH_REPEAT=k`: each selected read row runs k times and reports the median.
 
 ## The columns and rows
@@ -438,3 +439,57 @@ composite:
 
 The point gets are level within their spread in both shapes. `t4n`'s used span is larger than
 `t4d`'s at the same table pages: with no sync a freed page is never reused (the reuse gate).
+
+## Rewrites (reth's write stages)
+
+The `rewrite` rows (`TNDB_B_BENCH_ROWS=rewrite`, columns `t4d` and `md4` only) price reth's write
+stages per call: a positioning seek through a write cursor, then a write at its row, in ascending
+key order, as reth writes. Each table is N rows, loaded in a random order (untimed), then
+rewritten by 20 transactions of 10k present rows each, picked at random (no row twice) and sorted,
+through one write cursor a transaction:
+
+- **history** (reth's `append_history_index`, the open shard): a plain table of 28-byte keys (20
+  random bytes ‖ `u64::MAX`) and values of 16..=160 bytes. Per key the adapter's calls for
+  `seek_exact` and `upsert`: `TxnCursor::seek_exact`, then `TxnCursor::put` of the value grown by
+  8 bytes. MDBX as reth-db calls it: `Cursor::set_key`, `Cursor::put` with `WriteFlags::UPSERT`.
+- **dup** (reth's `write_hashed_state`, the storage loop): a dup table as this crate stores
+  HashedStorages (32-byte keys, subkeys and values), all N rows under 3 keys, so each key is a
+  nested tree of N/3 rows (as on TN, where two stablecoins and a router hold all the slots). Per
+  pair the adapter's engine calls for `seek_by_key_subkey`, `delete_current` and `upsert`:
+  `DupTxnCursor::seek_dup_with_key_tail`, then `delete_current`, `follower_shares_prefix` and
+  `insert` of key ‖ subkey with a new value. MDBX, a `DUP_SORT` table of subkey ‖ value:
+  `get_both_range`, `del` with `WriteFlags::CURRENT`, `put` with `WriteFlags::UPSERT`.
+
+Each table also runs **seek only**, the same transactions' seeks without the writes (aborted), so
+a write's own cost is the rewrite's loop less the seek-only loop. Each pass is a fresh environment.
+A loop cell is the median transaction's loop per key; a commit cell the median commit.
+
+**Run:** Apple M1 Max, macOS 15.8, 2026-11-01, N = 1M, code 08a4c3ee3 plus these rows, the median
+of three runs (1-minute load average 2.6-3.3, no build running). Per key (per pair):
+
+| | `t4d` | `md4` | ratio |
+|---|--:|--:|--:|
+| history: `seek_exact` + `upsert` | 2984 ns | 1894 ns | 1.58 |
+| commit (median transaction) | 104.2 ms | 90.4 ms | 1.15 |
+| `seek_exact` only | 601 ns | 523 ns | 1.15 |
+| the write's own (rewrite − seek only) | 2383 ns | 1371 ns | 1.74 |
+| dup: `seek_by_key_subkey` + `delete_current` + `upsert` | 2773 ns | 1805 ns | 1.54 |
+| commit (median transaction) | 73.1 ms | 56.0 ms | 1.31 |
+| `seek_by_key_subkey` only | 587 ns | 517 ns | 1.14 |
+| the write's own (rewrite − seek only) | 2186 ns | 1288 ns | 1.70 |
+
+What it shows (macOS `sample` of the `t4d` rewrite loops, `tndb_hist_txn` and `tndb_dup_txn`):
+
+- The writes, not the seeks, carry the gap: a seek alone is within 15% of MDBX's, the write after
+  it 1.7× MDBX's.
+- Every history `put` after a seek descends from the root (`put_cached` -> `put_from_root`, no
+  cache hit), and almost every dup delete does (`delete_cached` -> `delete_from_root`); the dup
+  insert that follows hits the path cache the delete left. The re-descent itself
+  (`descend_write` and its leaf search) is about 9% of the history loop and 6% of the dup loop.
+- The larger cost is the copy-on-write of the path (`make_path_writable`, almost all of it the
+  page copies' `memmove`, and the pages' `Writer::alloc`): 52% of the history loop and 45% of the
+  dup loop. MDBX's copy-on-write (`page_touch_unmodifable`) takes about 0.7 of tndb-b's samples
+  per write.
+- A seek inside a transaction that has written costs more than a seek alone (about 900 ns against
+  601 in the history loop), a quarter of it in `Writer::child`.
+

@@ -61,6 +61,34 @@
 //! packed, packed, composite), each pass in a fresh environment removed after it, and reports a
 //! cell as the mean of its form's two passes.
 //!
+//! The `rewrite` rows (columns `t4d` and `md4` only, `RW_ENGINES`; the others print `-`) price
+//! reth's write stages per call: a positioning seek through a write cursor, then a write at its
+//! row, in ascending key order, as reth writes. Each table is N rows, seeded, loaded in a random
+//! order in one transaction (untimed), then rewritten by `RW_TXNS` (20) transactions of
+//! `RW_KEYS` (10k) present rows each, picked at random (no row twice while N is at least 200k)
+//! and sorted, through one write cursor a transaction:
+//!
+//! - **history** (reth's `append_history_index`, the open shard): a plain table of 28-byte keys (20
+//!   random bytes ‖ `u64::MAX` big-endian) and values of 16..=160 random bytes. Per key the
+//!   adapter's calls for `seek_exact` and `upsert`, `TxnCursor::seek_exact` and `TxnCursor::put` of
+//!   the value grown by 8 bytes; MDBX as reth-db's cursor: `Cursor::set_key`, `Cursor::put` with
+//!   `WriteFlags::UPSERT`.
+//! - **dup** (reth's `write_hashed_state`, the storage loop): a dup table as this crate stores
+//!   HashedStorages (its `DupLayout`'s `DupOptions`; 32-byte keys, subkeys and values), all its
+//!   rows under `RW_DUP_KEYS` (3) keys, so each key holds a nested tree of N/3 rows (TN's state:
+//!   two stablecoins and a router hold all the slots); MDBX: a `DUP_SORT` table of 64-byte values
+//!   (subkey ‖ value). Per pair the adapter's engine calls for `seek_by_key_subkey`,
+//!   `delete_current` and `upsert`: `DupTxnCursor::seek_dup_with_key_tail`, then at the exact row
+//!   `delete_current`, `follower_shares_prefix` (and `prev_in_prefix` when that is false) and
+//!   `insert` of key ‖ subkey with a new value; MDBX: `get_both_range`, `del` with
+//!   `WriteFlags::CURRENT`, `put` with `WriteFlags::UPSERT`.
+//!
+//! Each table also runs **seek only**: the same transactions' seeks without the writes, aborted,
+//! so a write's own cost is the rewrite's loop less the seek-only loop. Every pass (rewrite or
+//! seek only, per table) is a fresh environment, removed after it. A loop cell is the median of
+//! the 20 transactions' loops (from `begin` to just before `commit`) per key, in whole
+//! nanoseconds; the commit cell is the median commit. `TNDB_B_BENCH_REPEAT` does not apply.
+//!
 //! tndb-b is a plain dependency of this crate, built without its test-only code, so these rows
 //! time the engine as a release build of the node would. The rows that need the engine's
 //! test-only switches (step 4 forced to one `fdatasync`, deletes with merging off) are the
@@ -77,11 +105,12 @@
 //!   `get-hit`, `get-miss`, `scan-fwd`, `scan-rev`, `seek`, `seek-fwd` (the seek row's targets
 //!   sorted ascending, so each seek lands at or a little past the last one, often in the same leaf
 //!   or the next), `small`, `mixed`, `clear`, `append`, `delete` (the delete rows), `big` (the
-//!   large-value rows), `changesets` (the changeset forms' rows above, tndb-b columns only), and
-//!   the aliases `bulk` (`seq,rand`), `get` (both gets) and `scan` (both scans). The file size rows
-//!   come with `seq` or `rand`. A group that needs a bulk table (`clear` the sequential one; the
-//!   gets, scans, both seeks and `mixed` the random one) builds it untimed when its own group is
-//!   not selected. Only rows with a measured cell are printed.
+//!   large-value rows), `changesets` (the changeset forms' rows above, tndb-b columns only),
+//!   `rewrite` (the rewrite rows above, `t4d` and `md4` only), and the aliases `bulk` (`seq,rand`),
+//!   `get` (both gets) and `scan` (both scans). The file size rows come with `seq` or `rand`. A
+//!   group that needs a bulk table (`clear` the sequential one; the gets, scans, both seeks and
+//!   `mixed` the random one) builds it untimed when its own group is not selected. Only rows with a
+//!   measured cell are printed.
 //! - `TNDB_B_BENCH_REPEAT=k` (default 1) runs each selected read row (the gets, the scans and both
 //!   seeks, and the `changesets` walks and gets) k times back to back and reports the median, so
 //!   one read row can dominate a profile: for example `TNDB_B_BENCH_ENGINES=t16d
@@ -130,16 +159,20 @@ use std::{
     time::{Duration, Instant},
 };
 
+use reth_db_api::{table::Table as _, tables::HashedStorages};
 use reth_libmdbx::{
     DatabaseFlags, Environment, EnvironmentFlags, Geometry, Mode, PageSize, SyncMode as MdbxSync,
-    WriteFlags,
+    Transaction, WriteFlags, RW,
 };
 
 use tndb_b::{
-    DupOptions, DupRoCursor, Env, EnvOptions, ReadTxn as _, RoCursor, RoTxn, SyncMode, Table,
+    DupOptions, DupRoCursor, Env, EnvOptions, ReadTxn as _, RoCursor, RoTxn, RwTxn, SyncMode, Table,
 };
 
-use crate::bench::{announce_temp_dir, page_size};
+use crate::{
+    bench::{announce_temp_dir, page_size},
+    dup::dup_layout,
+};
 
 /// xorshift64: the seeded streams every column replays (the generator the engine's tests use, so
 /// the data is the data the runs in `engine-bench.md` used).
@@ -204,6 +237,28 @@ const CS_WALK_BLOCKS: usize = 100;
 const CS_WALKS: usize = 10;
 /// The point gets of a `changesets` row (fewer when the table holds fewer rows).
 const CS_GETS: usize = 100_000;
+
+/// The columns the `rewrite` rows run in (the others print `-`).
+const RW_ENGINES: [&str; 2] = ["t4d", "md4"];
+/// The transactions of a `rewrite` row.
+const RW_TXNS: usize = 20;
+/// The keys (pairs, in the dup row) a `rewrite` transaction rewrites, at most the table's rows.
+const RW_KEYS: usize = 10_000;
+/// The history row's key width: a 20-byte address ‖ the open shard's 8-byte `u64::MAX`.
+const RW_HIST_KEY: usize = 28;
+/// The history row's value lengths: `RW_HIST_MIN..=RW_HIST_MAX` bytes.
+const RW_HIST_MIN: usize = 16;
+const RW_HIST_MAX: usize = 160;
+/// The bytes a history rewrite grows a value by (one block number more).
+const RW_GROW: usize = 8;
+/// The dup row's keys, which hold all its subkeys (TN's state: two stablecoins and a router hold
+/// all the slots).
+const RW_DUP_KEYS: usize = 3;
+/// The dup row's key, subkey and value width (HashedStorages': a hashed address, a hashed slot, a
+/// 32-byte value).
+const RW_DUP_WIDTH: usize = 32;
+/// The `rewrite` rows' values are windows of one random buffer at this many shifts.
+const RW_SHIFTS: usize = 4096;
 
 /// A changeset table's shape for the `changesets` rows: reth's widths, as `DUP_LAYOUTS` holds
 /// them, and how many rows a block writes.
@@ -529,6 +584,124 @@ fn cs_scan(txn: &Arc<RoTxn>, table: &Table, form: CsForm) -> Vec<(Vec<u8>, Vec<u
     }
 }
 
+/// The `rewrite` rows' seeded inputs (see the module docs).
+struct RwData {
+    /// The history table's keys (`RW_HIST_KEY` bytes each), in load order.
+    hist_keys: Vec<u8>,
+    /// The history table's value lengths, in load order.
+    hist_lens: Vec<u8>,
+    /// The dup table's keys (`RW_DUP_WIDTH` bytes each): row `i` is under key `i % RW_DUP_KEYS`.
+    dup_keys: Vec<u8>,
+    /// The dup table's subkeys (`RW_DUP_WIDTH` bytes each), in load order.
+    dup_subkeys: Vec<u8>,
+    /// The values: windows of this random buffer.
+    buf: Vec<u8>,
+    /// Per transaction of the history row, the rows it rewrites, sorted by key.
+    hist_txns: Vec<Vec<u32>>,
+    /// Per transaction of the dup row, the rows it rewrites, sorted by key ‖ subkey.
+    dup_txns: Vec<Vec<u32>>,
+}
+
+impl RwData {
+    /// `n` rows a table. A row's transactions draw distinct rows from a permutation of them, in
+    /// turn (wrapping when 20 transactions take more than `n`), so no two rewrite one row while
+    /// `n` is at least `RW_TXNS * RW_KEYS`.
+    fn new(n: usize) -> Self {
+        let mut rng = Rng(0x5eed_0000_0000_0010);
+        let mut hist_keys = Vec::with_capacity(n * RW_HIST_KEY);
+        let mut hist_lens = Vec::with_capacity(n);
+        for _ in 0..n {
+            random_bytes(&mut rng, &mut hist_keys, RW_HIST_KEY - 8);
+            hist_keys.extend_from_slice(&u64::MAX.to_be_bytes());
+            let spread = (RW_HIST_MAX - RW_HIST_MIN + 1) as u64;
+            hist_lens.push((RW_HIST_MIN as u64 + rng.below(spread)) as u8);
+        }
+        let mut dup_keys = Vec::new();
+        random_bytes(&mut rng, &mut dup_keys, RW_DUP_KEYS * RW_DUP_WIDTH);
+        let mut dup_subkeys = Vec::with_capacity(n * RW_DUP_WIDTH);
+        random_bytes(&mut rng, &mut dup_subkeys, n * RW_DUP_WIDTH);
+        let mut buf = Vec::new();
+        random_bytes(&mut rng, &mut buf, RW_SHIFTS + RW_HIST_MAX + RW_GROW);
+        let this = Self {
+            hist_keys,
+            hist_lens,
+            dup_keys,
+            dup_subkeys,
+            buf,
+            hist_txns: Vec::new(),
+            dup_txns: Vec::new(),
+        };
+        let mut hist_txns = rw_txns(&mut rng, n);
+        for picks in &mut hist_txns {
+            picks.sort_unstable_by(|&a, &b| this.hist_key(a).cmp(this.hist_key(b)));
+        }
+        let mut dup_txns = rw_txns(&mut rng, n);
+        for picks in &mut dup_txns {
+            picks.sort_unstable_by(|&a, &b| this.dup_row(a).cmp(&this.dup_row(b)));
+        }
+        Self { hist_txns, dup_txns, ..this }
+    }
+
+    fn rows(&self) -> usize {
+        self.hist_lens.len()
+    }
+
+    fn hist_key(&self, i: u32) -> &[u8] {
+        &self.hist_keys[i as usize * RW_HIST_KEY..][..RW_HIST_KEY]
+    }
+
+    /// History row `i`'s value as loaded, grown by `grow` bytes.
+    fn hist_value(&self, i: u32, grow: usize) -> &[u8] {
+        let at = i as usize % RW_SHIFTS;
+        &self.buf[at..][..usize::from(self.hist_lens[i as usize]) + grow]
+    }
+
+    /// Dup row `i`'s key and subkey.
+    fn dup_row(&self, i: u32) -> (&[u8], &[u8]) {
+        let key = i as usize % RW_DUP_KEYS;
+        (
+            &self.dup_keys[key * RW_DUP_WIDTH..][..RW_DUP_WIDTH],
+            &self.dup_subkeys[i as usize * RW_DUP_WIDTH..][..RW_DUP_WIDTH],
+        )
+    }
+
+    /// Dup row `i`'s key ‖ subkey, an engine dup table's logical key.
+    fn dup_stored(&self, i: u32) -> [u8; 2 * RW_DUP_WIDTH] {
+        let (key, subkey) = self.dup_row(i);
+        let mut stored = [0; 2 * RW_DUP_WIDTH];
+        stored[..RW_DUP_WIDTH].copy_from_slice(key);
+        stored[RW_DUP_WIDTH..].copy_from_slice(subkey);
+        stored
+    }
+
+    /// Dup row `i`'s value as loaded (`round` 0) or as rewritten (1).
+    fn dup_value(&self, i: u32, round: usize) -> &[u8] {
+        &self.buf[(i as usize + round) % RW_SHIFTS..][..RW_DUP_WIDTH]
+    }
+
+    /// Dup row `i`'s subkey ‖ value (`round` as [`Self::dup_value`]'s), an MDBX dup value.
+    fn dup_mdbx_value(&self, i: u32, round: usize) -> [u8; 2 * RW_DUP_WIDTH] {
+        let mut value = [0; 2 * RW_DUP_WIDTH];
+        value[..RW_DUP_WIDTH].copy_from_slice(self.dup_row(i).1);
+        value[RW_DUP_WIDTH..].copy_from_slice(self.dup_value(i, round));
+        value
+    }
+}
+
+/// A `rewrite` row's transactions: `RW_TXNS` runs of `RW_KEYS` (at most `n`) rows of `0..n`,
+/// taken in turn from a seeded permutation, unsorted.
+fn rw_txns(rng: &mut Rng, n: usize) -> Vec<Vec<u32>> {
+    let order = shuffled(rng, n);
+    let keys = RW_KEYS.min(n);
+    (0..RW_TXNS).map(|r| (0..keys).map(|j| order[(r * keys + j) % n]).collect()).collect()
+}
+
+/// The median of `times`.
+fn median_time(mut times: Vec<Duration>) -> Duration {
+    times.sort_unstable();
+    times[times.len() / 2]
+}
+
 /// The seeded inputs every column replays.
 struct Data {
     /// Entries in each bulk table.
@@ -695,10 +868,11 @@ enum Group {
     Delete,
     Big,
     ChangeSets,
+    Rewrite,
 }
 
 /// The names `TNDB_B_BENCH_ROWS` accepts, each with the groups it selects.
-const GROUP_NAMES: [(&str, &[Group]); 18] = [
+const GROUP_NAMES: [(&str, &[Group]); 19] = [
     ("seq", &[Group::Seq]),
     ("rand", &[Group::Rand]),
     ("bulk", &[Group::Seq, Group::Rand]),
@@ -717,6 +891,7 @@ const GROUP_NAMES: [(&str, &[Group]); 18] = [
     ("delete", &[Group::Delete]),
     ("big", &[Group::Big]),
     ("changesets", &[Group::ChangeSets]),
+    ("rewrite", &[Group::Rewrite]),
 ];
 
 /// The column a bench run measures.
@@ -830,6 +1005,8 @@ enum Cell {
     Total(Duration),
     /// Wall time of the row divided by its operations.
     PerOp(Duration, usize),
+    /// [`Cell::PerOp`] in whole nanoseconds, for the per-call rows that 0.1 us would round.
+    Nanos(Duration, usize),
     /// A byte count.
     Bytes(u64),
 }
@@ -840,6 +1017,7 @@ impl Cell {
             Cell::None => "-".to_string(),
             Cell::Total(d) => fmt_duration(d),
             Cell::PerOp(d, ops) => fmt_duration(d / ops.max(1) as u32),
+            Cell::Nanos(d, ops) => format!("{} ns", d.as_nanos() / ops.max(1) as u128),
             Cell::Bytes(b) => format!("{:.1} MiB", b as f64 / (1024.0 * 1024.0)),
         }
     }
@@ -923,6 +1101,12 @@ enum Row {
     CsAcctPackGet,
     CsAcctPackUsed,
     CsAcctPackTable,
+    RwHist,
+    RwHistCommit,
+    RwHistSeek,
+    RwDup,
+    RwDupCommit,
+    RwDupSeek,
 }
 
 impl Row {
@@ -990,6 +1174,12 @@ impl Row {
         Row::CsAcctPackGet,
         Row::CsAcctPackUsed,
         Row::CsAcctPackTable,
+        Row::RwHist,
+        Row::RwHistCommit,
+        Row::RwHistSeek,
+        Row::RwDup,
+        Row::RwDupCommit,
+        Row::RwDupSeek,
     ];
 
     fn label(self, n: usize) -> String {
@@ -1083,11 +1273,23 @@ impl Row {
                     _ => "  table pages x P".to_string(),
                 }
             }
+            Row::RwHist => format!(
+                "history {k}k, {RW_TXNS} txns x {}k: seek_exact + upsert (per key)",
+                RW_KEYS.min(n) / 1000
+            ),
+            Row::RwDup => format!(
+                "dup {k}k in {RW_DUP_KEYS} keys, {RW_TXNS} txns x {}k: seek_by_key_subkey + \
+                 delete + upsert (per pair)",
+                RW_KEYS.min(n) / 1000
+            ),
+            Row::RwHistCommit | Row::RwDupCommit => "  commit (median txn)".to_string(),
+            Row::RwHistSeek => "  seek_exact only (per key)".to_string(),
+            Row::RwDupSeek => "  seek_by_key_subkey only (per pair)".to_string(),
         }
     }
 }
 
-const ROWS: usize = Row::CsAcctPackTable as usize + 1;
+const ROWS: usize = Row::RwDupSeek as usize + 1;
 
 /// One column of results.
 struct Column {
@@ -1126,6 +1328,11 @@ fn file_size(path: &Path) -> u64 {
     std::fs::metadata(path).expect("stat the data file").len()
 }
 
+/// The options every tndb-b environment of a column opens with.
+fn tndb_options(page_size: u32, sync: SyncMode) -> EnvOptions {
+    EnvOptions { page_size, map_reserve: 8 << 30, sync, ..EnvOptions::default() }
+}
+
 /// Run the selected rows on a fresh tndb-b file.
 fn run_tndb(
     dir: &Path,
@@ -1138,7 +1345,7 @@ fn run_tndb(
 ) -> Column {
     let mut col = Column::new(name);
     let path = dir.join("data.tndb-b");
-    let options = EnvOptions { page_size, map_reserve: 8 << 30, sync, ..EnvOptions::default() };
+    let options = tndb_options(page_size, sync);
     let env = Env::open(&path, options).expect("open tndb-b");
     let n = data.n;
 
@@ -1284,6 +1491,133 @@ fn tndb_changesets(
             col.set(rows[2], Cell::PerOp(get, 2 * data.gets.len()));
             col.set(rows[3], Cell::Bytes(pages[at][0] * page));
             col.set(rows[4], Cell::Bytes(pages[at][1] * page));
+        }
+    }
+}
+
+/// The `rewrite` rows (see the module docs): per table a rewrite pass and a seek-only pass, each
+/// in a fresh environment in `dir`.
+fn tndb_rewrite(dir: &Path, options: EnvOptions, data: &RwData, col: &mut Column) {
+    let layout = dup_layout(HashedStorages::NAME).expect("HashedStorages' layout");
+    assert_eq!((layout.key, layout.subkey), (RW_DUP_WIDTH, RW_DUP_WIDTH), "HashedStorages' widths");
+    let dup = layout.options().expect("HashedStorages is an engine dup table");
+    let rows = data.rows() as u32;
+    for (write, looped) in [(true, Row::RwHist), (false, Row::RwHistSeek)] {
+        let (time, commit_time) = tndb_rw_pass(
+            &dir.join(format!("history-{write}.tndb-b")),
+            options,
+            write,
+            |txn| {
+                let table = txn.create_table("history").expect("create");
+                for i in 0..rows {
+                    txn.put(&table, data.hist_key(i), data.hist_value(i, 0)).expect("put");
+                }
+                table
+            },
+            |txn, table, t| tndb_hist_txn(txn, table, data, &data.hist_txns[t], write),
+        );
+        col.set(looped, Cell::Nanos(time, data.hist_txns[0].len()));
+        if let Some(commit_time) = commit_time {
+            col.set(Row::RwHistCommit, Cell::Total(commit_time));
+        }
+    }
+    for (write, looped) in [(true, Row::RwDup), (false, Row::RwDupSeek)] {
+        let (time, commit_time) = tndb_rw_pass(
+            &dir.join(format!("dup-{write}.tndb-b")),
+            options,
+            write,
+            |txn| {
+                let table = txn.create_dup_table("dup", dup).expect("create");
+                for i in 0..rows {
+                    txn.put(&table, &data.dup_stored(i), data.dup_value(i, 0)).expect("put");
+                }
+                table
+            },
+            |txn, table, t| tndb_dup_txn(txn, table, data, &data.dup_txns[t], write),
+        );
+        col.set(looped, Cell::Nanos(time, data.dup_txns[0].len()));
+        if let Some(commit_time) = commit_time {
+            col.set(Row::RwDupCommit, Cell::Total(commit_time));
+        }
+    }
+}
+
+/// One `rewrite` pass in a fresh environment at `path`, removed after it: `load` fills a table in
+/// one transaction (untimed), then each of `RW_TXNS` transactions runs `txn_loop` (given the
+/// transaction's index) and commits if `write`, else aborts. The median loop, from `begin` to
+/// just before the commit, and the median commit (`None` if aborted).
+fn tndb_rw_pass(
+    path: &Path,
+    options: EnvOptions,
+    write: bool,
+    load: impl FnOnce(&mut RwTxn) -> Table,
+    mut txn_loop: impl FnMut(&mut RwTxn, &Table, usize),
+) -> (Duration, Option<Duration>) {
+    let env = Env::open(path, options).expect("open tndb-b");
+    let mut txn = env.begin_rw().expect("begin");
+    let table = load(&mut txn);
+    txn.commit().expect("commit");
+    let (mut loops, mut commits) = (Vec::with_capacity(RW_TXNS), Vec::with_capacity(RW_TXNS));
+    for t in 0..RW_TXNS {
+        let start = Instant::now();
+        let mut txn = env.begin_rw().expect("begin");
+        txn_loop(&mut txn, &table, t);
+        let looped = start.elapsed();
+        loops.push(looped);
+        if write {
+            txn.commit().expect("commit");
+            commits.push(start.elapsed() - looped);
+        } else {
+            txn.abort();
+        }
+    }
+    drop(env);
+    std::fs::remove_file(path).expect("remove the pass's file");
+    (median_time(loops), write.then(|| median_time(commits)))
+}
+
+/// A history `rewrite` transaction's loop through one write cursor, as the adapter runs reth's
+/// `seek_exact` and `upsert` on a plain table: `TxnCursor::seek_exact`, then (if `write`)
+/// `TxnCursor::put` of the value grown by `RW_GROW` bytes. Not inlined, so a profile names it.
+#[inline(never)]
+fn tndb_hist_txn(txn: &mut RwTxn, table: &Table, data: &RwData, picks: &[u32], write: bool) {
+    let mut cursor = txn.cursor_detached(table).expect("cursor");
+    for &i in picks {
+        let key = data.hist_key(i);
+        let found = cursor.seek_exact(txn, key).expect("seek_exact").map(<[u8]>::len);
+        black_box(found.expect("a present key"));
+        if write {
+            cursor.put(txn, key, data.hist_value(i, RW_GROW)).expect("upsert");
+        }
+    }
+}
+
+/// A dup `rewrite` transaction's loop through one dup write cursor: the adapter's engine calls
+/// for reth's `seek_by_key_subkey`, `delete_current` and `upsert` on a nested dup table.
+/// `DupTxnCursor::seek_dup_with_key_tail`, then (if `write`) on the exact row
+/// `DupTxnCursor::delete_current`, `follower_shares_prefix` and, only if that is false,
+/// `prev_in_prefix`, and `DupTxnCursor::insert` of key ‖ subkey with the new value. Not inlined,
+/// so a profile names it.
+#[inline(never)]
+fn tndb_dup_txn(txn: &mut RwTxn, table: &Table, data: &RwData, picks: &[u32], write: bool) {
+    let mut cursor = txn.dup_cursor_detached(table).expect("cursor");
+    for &i in picks {
+        let (key, subkey) = data.dup_row(i);
+        let stored = data.dup_stored(i);
+        let hit = cursor
+            .seek_dup_with_key_tail(txn, key, subkey, RW_DUP_WIDTH)
+            .expect("seek_by_key_subkey")
+            .is_some_and(|(found, tail)| {
+                black_box(tail);
+                found == &stored[..]
+            });
+        assert!(hit, "a present pair");
+        if write {
+            assert!(cursor.delete_current(txn).expect("delete_current"), "at a row");
+            if !cursor.follower_shares_prefix(txn, RW_DUP_WIDTH).expect("follower") {
+                cursor.prev_in_prefix(txn, RW_DUP_WIDTH).expect("prev_in_prefix");
+            }
+            cursor.insert(txn, &stored, data.dup_value(i, 1)).expect("upsert");
         }
     }
 }
@@ -1776,6 +2110,124 @@ fn mdbx_big(
     }
 }
 
+/// The `rewrite` rows (see the module docs) through MDBX's cursor as reth-db's calls it: per table
+/// a rewrite pass and a seek-only pass, each in a fresh environment under `dir`.
+fn mdbx_rewrite(
+    dir: &Path,
+    sync_mode: MdbxSync,
+    page_size: usize,
+    data: &RwData,
+    col: &mut Column,
+) {
+    let rows = data.rows() as u32;
+    for (write, looped) in [(true, Row::RwHist), (false, Row::RwHistSeek)] {
+        let (time, commit_time) = mdbx_rw_pass(
+            &dir.join(format!("history-{write}")),
+            (sync_mode, page_size),
+            write,
+            DatabaseFlags::default(),
+            |txn, db| {
+                for i in 0..rows {
+                    let value = data.hist_value(i, 0);
+                    txn.put(db, data.hist_key(i), value, WriteFlags::empty()).expect("put");
+                }
+            },
+            |txn, db, t| mdbx_hist_txn(txn, db, data, &data.hist_txns[t], write),
+        );
+        col.set(looped, Cell::Nanos(time, data.hist_txns[0].len()));
+        if let Some(commit_time) = commit_time {
+            col.set(Row::RwHistCommit, Cell::Total(commit_time));
+        }
+    }
+    for (write, looped) in [(true, Row::RwDup), (false, Row::RwDupSeek)] {
+        let (time, commit_time) = mdbx_rw_pass(
+            &dir.join(format!("dup-{write}")),
+            (sync_mode, page_size),
+            write,
+            DatabaseFlags::DUP_SORT,
+            |txn, db| {
+                for i in 0..rows {
+                    let value = data.dup_mdbx_value(i, 0);
+                    txn.put(db, data.dup_row(i).0, value, WriteFlags::empty()).expect("put");
+                }
+            },
+            |txn, db, t| mdbx_dup_txn(txn, db, data, &data.dup_txns[t], write),
+        );
+        col.set(looped, Cell::Nanos(time, data.dup_txns[0].len()));
+        if let Some(commit_time) = commit_time {
+            col.set(Row::RwDupCommit, Cell::Total(commit_time));
+        }
+    }
+}
+
+/// [`tndb_rw_pass`] on MDBX (opened with `open`'s sync mode and page size, the table created
+/// with `flags`) in the new directory `dir`, removed after it; a read pass's transactions are
+/// dropped, which aborts them.
+fn mdbx_rw_pass(
+    dir: &Path,
+    open: (MdbxSync, usize),
+    write: bool,
+    flags: DatabaseFlags,
+    load: impl FnOnce(&Transaction<RW>, u32),
+    mut txn_loop: impl FnMut(&Transaction<RW>, u32, usize),
+) -> (Duration, Option<Duration>) {
+    std::fs::create_dir(dir).expect("rewrite pass dir");
+    let env = open_mdbx(dir, open.0, open.1);
+    let txn = env.begin_rw_txn().expect("begin");
+    let db = txn.create_db(Some("rewrite"), flags).expect("create").dbi();
+    load(&txn, db);
+    txn.commit().expect("commit");
+    let (mut loops, mut commits) = (Vec::with_capacity(RW_TXNS), Vec::with_capacity(RW_TXNS));
+    for t in 0..RW_TXNS {
+        let start = Instant::now();
+        let txn = env.begin_rw_txn().expect("begin");
+        txn_loop(&txn, db, t);
+        let looped = start.elapsed();
+        loops.push(looped);
+        if write {
+            txn.commit().expect("commit");
+            commits.push(start.elapsed() - looped);
+        }
+    }
+    drop(env);
+    std::fs::remove_dir_all(dir).expect("remove the pass's dir");
+    (median_time(loops), write.then(|| median_time(commits)))
+}
+
+/// [`tndb_hist_txn`] on MDBX, as reth-db's cursor runs `seek_exact` and `upsert`: `Cursor::set_key`
+/// (`MDBX_SET_KEY`), then (if `write`) `Cursor::put` with `WriteFlags::UPSERT`.
+#[inline(never)]
+fn mdbx_hist_txn(txn: &Transaction<RW>, db: u32, data: &RwData, picks: &[u32], write: bool) {
+    type Kv<'a> = Option<(Cow<'a, [u8]>, Cow<'a, [u8]>)>;
+    let mut cursor = txn.cursor(db).expect("cursor");
+    for &i in picks {
+        let key = data.hist_key(i);
+        let found: Kv<'_> = cursor.set_key(key).expect("seek_exact");
+        black_box(found.expect("a present key").1.len());
+        if write {
+            cursor.put(key, data.hist_value(i, RW_GROW), WriteFlags::UPSERT).expect("upsert");
+        }
+    }
+}
+
+/// [`tndb_dup_txn`] on MDBX, as reth-db's cursor runs `seek_by_key_subkey`, `delete_current` and
+/// `upsert`: `Cursor::get_both_range`, then (if `write`) on the exact row `Cursor::del` with
+/// `WriteFlags::CURRENT`, and `Cursor::put` of subkey ‖ the new value with `WriteFlags::UPSERT`.
+#[inline(never)]
+fn mdbx_dup_txn(txn: &Transaction<RW>, db: u32, data: &RwData, picks: &[u32], write: bool) {
+    let mut cursor = txn.cursor(db).expect("cursor");
+    for &i in picks {
+        let (key, subkey) = data.dup_row(i);
+        let found: Option<Cow<'_, [u8]>> =
+            cursor.get_both_range(key, subkey).expect("seek_by_key_subkey");
+        assert!(found.is_some_and(|value| value.starts_with(subkey)), "a present pair");
+        if write {
+            cursor.del(WriteFlags::CURRENT).expect("delete_current");
+            cursor.put(key, &data.dup_mdbx_value(i, 1), WriteFlags::UPSERT).expect("upsert");
+        }
+    }
+}
+
 /// A fresh environment in the new directory `dir` holding the random table: all N entries, put
 /// in one transaction (untimed).
 fn mdbx_rand_env(
@@ -2070,6 +2522,7 @@ fn tndb_b_vs_mdbx() {
     } else {
         Vec::new()
     };
+    let rw = sel.has(Group::Rewrite).then(|| RwData::new(n));
     let columns: Vec<Column> = sel
         .engines
         .iter()
@@ -2077,12 +2530,22 @@ fn tndb_b_vs_mdbx() {
             let (dir_name, title, engine) = ENGINES[e];
             let dir = tmp.path().join(dir_name);
             std::fs::create_dir(&dir).expect("column dir");
+            let rw = rw.as_ref().filter(|_| RW_ENGINES.contains(&dir_name));
             match engine {
                 Engine::Tndb(page_size, sync) => {
-                    run_tndb(&dir, title, page_size, sync, &data, &cs, &sel)
+                    let mut col = run_tndb(&dir, title, page_size, sync, &data, &cs, &sel);
+                    if let Some(rw) = rw {
+                        tndb_rewrite(&dir, tndb_options(page_size, sync), rw, &mut col);
+                    }
+                    col
                 }
                 Engine::Mdbx(sync, page) => {
-                    run_mdbx(&dir, title, sync, page.unwrap_or_else(mdbx_os_page_size), &data, &sel)
+                    let page = page.unwrap_or_else(mdbx_os_page_size);
+                    let mut col = run_mdbx(&dir, title, sync, page, &data, &sel);
+                    if let Some(rw) = rw {
+                        mdbx_rewrite(&dir, sync, page, rw, &mut col);
+                    }
+                    col
                 }
             }
         })
