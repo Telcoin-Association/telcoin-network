@@ -1561,7 +1561,17 @@ pub(crate) fn copy_page(src: &[u8], to: u32, dst: &mut [u8]) -> Result<()> {
     if dst.len() != src.len() {
         return Err(bug(format!("page {to} of {} bytes, not {}", dst.len(), src.len())));
     }
-    dst.copy_from_slice(src);
+    // The header and slots, then the cells and the trailer; the free gap between them is left
+    // as the destination's bytes, which nothing reads (README do-not-flag 17). A header whose
+    // slots and cells overlap, or run past the trailer, is copied whole, for the checks after.
+    let len = src.len();
+    let (lower, upper) = (page::HEADER + page::SLOT * page::nkeys(src), page::upper(src));
+    if lower <= upper && upper <= len - page::TRAILER {
+        dst[..lower].copy_from_slice(&src[..lower]);
+        dst[upper..].copy_from_slice(&src[upper..]);
+    } else {
+        dst.copy_from_slice(src);
+    }
     Ok(())
 }
 
