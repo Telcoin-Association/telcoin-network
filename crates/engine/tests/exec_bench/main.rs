@@ -35,11 +35,13 @@
 //!    untimed, then all `OUTPUTS` outputs are built and signed up front, then the timed loop
 //!    executes them. Each output runs on a blocking task, as `ExecutorEngine` runs it, while a task
 //!    drains the engine-update channel. Just before and just after each output's call, outside its
-//!    wall time, the bench reads the database's own counters ([`db_counters`]) and the process's
-//!    disk bytes written ([`disk_bytes_written`]), and after it the data file's length (one `stat`,
-//!    [`db_file_bytes`]): the database commit completes inside the call on both backends
-//!    (`persist_executed_output` commits in line, and neither backend defers its sync to another
-//!    thread), and nothing else writes the database, so the differences are the output's.
+//!    wall time, the bench reads the database's own counters ([`db_counters`]), the process's disk
+//!    bytes written ([`disk_bytes_written`]) and its page faults ([`page_faults`]: a write into a
+//!    mapped page the page cache dropped waits for a read, a major fault), and after it the data
+//!    file's length (one `stat`, [`db_file_bytes`]): the database commit completes inside the call
+//!    on both backends (`persist_executed_output` commits in line, and neither backend defers its
+//!    sync to another thread), and nothing else writes the database, so the differences are the
+//!    output's.
 //!
 //!    With `EPOCH_EVERY`, every `EPOCH_EVERY`-th timed output closes its epoch
 //!    ([`OutputFactory::next_output_closing`]) and is timed like any other. No output can be built
@@ -181,7 +183,9 @@
 //! `epoch_close`, `export_active`, each stage as `<key>_ms`, `db_counters` (an object of each
 //! database counter's name, `mdbx_*` or `tndb_*`, and its difference over the output),
 //! `disk_bytes_written` (null when a read failed or the target has no
-//! source) and `db_file_len_bytes` (after the output)); `stats`, per
+//! source), `major_faults` and `minor_faults` (the process's, every thread's, over the output's
+//! call, [`page_faults`]; null when a read failed) and `db_file_len_bytes` (after the output));
+//! `stats`, per
 //! stage key (`mean_ms`, `p50_ms`, `p90_ms`, `p99_ms`, `max_ms`, `share_pct`); `throughput`;
 //! `thirds` (null for fewer than 3 outputs: `outputs_per_third` and per stage key `first_mean_ms`,
 //! `first_p50_ms`, `last_mean_ms`, `last_p50_ms`, `mean_ratio`, `p50_ratio`); `sizes` (`open`,
@@ -1264,6 +1268,9 @@ struct OutputRow {
     /// The bytes the process wrote to disk over the output's call ([`disk_bytes_written`] just
     /// before and just after it), or `None` when a read failed or the target has no source.
     disk_bytes: Option<u64>,
+    /// The process's page faults over the output's call ([`page_faults`] just before and just
+    /// after it), or `None` when a read failed.
+    faults: Option<PageFaults>,
     /// The database data file's length after the output, in bytes ([`db_file_bytes`]).
     db_file_len: u64,
 }
@@ -1739,6 +1746,45 @@ fn proc_io_write_bytes(io: &str) -> Result<u64, String> {
     value.trim().parse().map_err(|e| format!("/proc/self/io write_bytes {value:?}: {e}"))
 }
 
+/// The page faults a process has taken: a major fault waited for a read from disk, a minor one
+/// was met from memory (on a file mapping, say, a write to a page the last sync made clean).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct PageFaults {
+    /// Faults that read from disk (`ru_majflt`).
+    major: u64,
+    /// Faults met without a read (`ru_minflt`).
+    minor: u64,
+}
+
+impl PageFaults {
+    /// The faults taken since `before`, an earlier read.
+    fn since(self, before: Self) -> Self {
+        Self {
+            major: self.major.saturating_sub(before.major),
+            minor: self.minor.saturating_sub(before.minor),
+        }
+    }
+}
+
+/// This process's page faults since it started, every thread's (`getrusage(RUSAGE_SELF)`), or
+/// `None` when the call fails. Only a difference of two reads means anything.
+fn page_faults() -> Option<PageFaults> {
+    let mut usage = std::mem::MaybeUninit::<libc::rusage>::zeroed();
+    // SAFETY: `usage` is a writable `rusage` that outlives the call, the struct `getrusage`
+    // fills.
+    let status = unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) };
+    if status != 0 {
+        return None;
+    }
+    // SAFETY: every field of `rusage` is an integer or a struct of them, so the zeroed buffer
+    // was already a valid value, and the call succeeded in filling it.
+    let usage = unsafe { usage.assume_init() };
+    Some(PageFaults {
+        major: u64::try_from(usage.ru_majflt).unwrap_or(0),
+        minor: u64::try_from(usage.ru_minflt).unwrap_or(0),
+    })
+}
+
 /// What the timed loop carries across its segments' [`run_outputs`] calls: the next output's
 /// index, the pacing, the side load, the export and the first disk-bytes read failure. The warm-up
 /// runs with the default: no pacing, side load or export.
@@ -1842,12 +1888,14 @@ async fn run_outputs(
         // time: the commit completes inside the call, so the difference is this output's
         let counters_before = db_counters(&node.db)?;
         let disk_before = timed.disk_bytes();
+        let faults_before = page_faults();
         let started = Instant::now();
         let (tip, wall) = node.execute_timed(load.output, &updates.tx).await?;
         let export_active = timed
             .export
             .as_ref()
             .is_some_and(|export| export.active_during(started, Instant::now()));
+        let faults_after = page_faults();
         let disk_after = timed.disk_bytes();
         let counters = db_counters(&node.db)?.since(&counters_before);
         let (db_file_len, _) = db_file_bytes(&node.db_dir)?;
@@ -1873,6 +1921,7 @@ async fn run_outputs(
             disk_bytes: disk_before
                 .zip(disk_after)
                 .map(|(before, after)| after.saturating_sub(before)),
+            faults: faults_before.zip(faults_after).map(|(before, after)| after.since(before)),
             db_file_len,
             ..OutputRow::default()
         });
@@ -2909,6 +2958,8 @@ fn json_report(
                 .collect();
             fields.insert("db_counters".to_owned(), counters.into());
             fields.insert("disk_bytes_written".to_owned(), json!(row.disk_bytes));
+            fields.insert("major_faults".to_owned(), json!(row.faults.map(|f| f.major)));
+            fields.insert("minor_faults".to_owned(), json!(row.faults.map(|f| f.minor)));
             fields.insert("db_file_len_bytes".to_owned(), row.db_file_len.into());
             Value::Object(fields)
         })
@@ -4480,6 +4531,7 @@ mod tests {
         for (i, row) in (0_u64..).zip(rows.iter_mut()) {
             row.db_counters = vec![("tndb_pages_synced", 10 * i), ("tndb_commits", 1)];
             row.disk_bytes = (i != 2).then_some(4096 * i);
+            row.faults = (i != 2).then_some(PageFaults { major: 3 * i, minor: 100 + i });
             row.db_file_len = (4 << 30) + (1 << 20) * i;
         }
         let text = serde_json::to_string(&json_report(&header, &rows, &footprint(), None)).unwrap();
@@ -4524,6 +4576,12 @@ mod tests {
         assert_eq!(at("/rows/1/db_counters").as_object().unwrap().len(), 2);
         assert_eq!(at("/rows/1/disk_bytes_written"), 4096);
         assert_eq!(at("/rows/2/disk_bytes_written"), serde_json::Value::Null, "a failed read");
+        assert_eq!(
+            (at("/rows/1/major_faults"), at("/rows/1/minor_faults")),
+            (3.into(), 101.into())
+        );
+        assert_eq!(at("/rows/2/major_faults"), serde_json::Value::Null, "a failed read");
+        assert_eq!(at("/rows/2/minor_faults"), serde_json::Value::Null, "a failed read");
         assert_eq!(at("/rows/2/db_file_len_bytes"), (4_u64 << 30) + (2 << 20));
         assert_eq!(at("/db_writes/counters_mean_per_output/tndb_commits"), 1.0);
         assert_eq!(at("/db_writes/counters_mean_per_output/tndb_pages_synced"), 10.0);
@@ -4805,6 +4863,29 @@ mod tests {
         assert_eq!(proc_io_write_bytes(io), Ok(323_932_160));
         assert!(proc_io_write_bytes("read_bytes: 1\n").is_err());
         assert!(proc_io_write_bytes("write_bytes: lots\n").is_err());
+    }
+
+    /// The process's page faults read, never go down, and count the minor faults of first
+    /// writes into a new anonymous mapping (one a page, or one a huge page where transparent huge
+    /// pages back it); `since` is the difference, saturating.
+    #[test]
+    fn test_page_faults() {
+        let before = page_faults().expect("getrusage");
+        // fresh zero pages, each written once: 64 MiB is 32 huge pages of 2 MiB at the fewest
+        let mut pages = vec![0_u8; 64 << 20];
+        for page in pages.chunks_mut(4096) {
+            page[0] = 1;
+        }
+        std::hint::black_box(&pages);
+        let after = page_faults().expect("a second read");
+        let taken = after.since(before);
+        assert!(after.major >= before.major, "{after:?} after {before:?}");
+        assert!(taken.minor >= 32, "64 MiB first written took {taken:?}");
+        let less = PageFaults { major: 5, minor: 5 };
+        assert_eq!(
+            less.since(PageFaults { major: 7, minor: 2 }),
+            PageFaults { major: 0, minor: 3 }
+        );
     }
 
     /// The report path splits into an existing dir and a file name; a missing dir or no file

@@ -36,8 +36,11 @@
 #                    time, the run log's size, /proc/meminfo's Dirty and Writeback, the drive's
 #                    temperature (hwmon temp1_input, when readable) and the /proc/diskstats line
 #                    of the whole disk under the bench dir (writes, sectors written, ms writing,
-#                    ms doing I/O, and from Linux 5.5 flushes and ms flushing), and the file
-#                    system's own line when that is a partition or a mapped device. To
+#                    ms doing I/O, from Linux 5.5 flushes and ms flushing, then reads, sectors
+#                    read and ms reading), and the file system's own line when that is a
+#                    partition or a mapped device, each line ending with /proc/meminfo's
+#                    AnonPages, Cached and MemAvailable and /proc/vmstat's pgmajfault and
+#                    workingset_refault_file (a dropped file page read again). To
 #                    reports/<run>.frag.tsv it writes filefrag's extent count of the run's data
 #                    file (tndb.dat or mdbx.dat under the run's TMPDIR) as soon as the file exists
 #                    and then every 30 s, when filefrag is installed.
@@ -491,7 +494,10 @@ def print_counters(docs, rounds):
 
 
 SAMPLE_FIELDS = ("t", "log", "dirty", "writeback", "temp", "dev", "writes", "sectors",
-                 "ms_writing", "ms_io", "flushes", "ms_flushing")
+                 "ms_writing", "ms_io", "flushes", "ms_flushing", "reads", "sectors_read",
+                 "ms_reading", "anon", "cached", "available", "majflt", "refault_file")
+# a sampler before the read and memory columns wrote the first 12 fields only
+OLD_SAMPLE_FIELDS = 12
 
 
 def number(text):
@@ -514,14 +520,14 @@ def read_samples(path):
                 if len(fields) >= 3 and fields[1] == "disk":
                     disk = fields[2]
                 continue
-            if len(fields) != len(SAMPLE_FIELDS):
+            if len(fields) not in (OLD_SAMPLE_FIELDS, len(SAMPLE_FIELDS)):
                 continue
             sample = dict(zip(SAMPLE_FIELDS, fields))
             if disk is not None and sample["dev"] != disk:
                 continue
             for key in SAMPLE_FIELDS:
                 if key != "dev":
-                    sample[key] = number(sample[key])
+                    sample[key] = number(sample[key]) if key in sample else None
             if sample["t"] is not None:
                 samples.append(sample)
     return samples
@@ -579,6 +585,13 @@ def sample_stats(samples, start, end):
                           else delta("ms_io") / (dt * 1000) * 100)
     out["disk flushes/s"] = None if flushes is None or not dt else flushes / dt
     out["disk ms per flush"] = ratio(delta("ms_flushing"), flushes)
+    reads, sectors_read = delta("reads"), delta("sectors_read")
+    out["disk read MiB/s"] = (None if sectors_read is None or not dt
+                              else sectors_read * 512 / 2**20 / dt)
+    out["disk ms per read"] = ratio(delta("ms_reading"), reads)
+    majflt, refaults = delta("majflt"), delta("refault_file")
+    out["major faults/s"] = None if majflt is None or not dt else majflt / dt
+    out["file refaults/s"] = None if refaults is None or not dt else refaults / dt
 
     def series(key):
         return [s[key] for s in inside if s[key] is not None]
@@ -588,11 +601,17 @@ def sample_stats(samples, start, end):
     out["Dirty mean MiB"] = mean(dirty) / 1024 if dirty else None
     out["Writeback max MiB"] = max(writeback) / 1024 if writeback else None
     out["temperature max C"] = max(temp) / 1000 if temp else None
+    anon, cached, available = series("anon"), series("cached"), series("available")
+    out["AnonPages max MiB"] = max(anon) / 1024 if anon else None
+    out["Cached min MiB"] = min(cached) / 1024 if cached else None
+    out["MemAvailable min MiB"] = min(available) / 1024 if available else None
     return out
 
 
 SAMPLE_ROWS = ("disk write MiB/s", "disk ms per write", "disk busy %", "disk flushes/s",
-               "disk ms per flush", "Dirty max MiB", "Dirty mean MiB", "Writeback max MiB",
+               "disk ms per flush", "disk read MiB/s", "disk ms per read", "major faults/s",
+               "file refaults/s", "Dirty max MiB", "Dirty mean MiB", "Writeback max MiB",
+               "AnonPages max MiB", "Cached min MiB", "MemAvailable min MiB",
                "temperature max C")
 
 
@@ -1019,7 +1038,7 @@ fi
 if [ "$sys_sample" = 1 ]; then
     disk_text="$sys_disk"
     [ "$sys_dev" = "$sys_disk" ] || disk_text="$sys_disk (the bench dir's file system: $sys_dev)"
-    kv "sys sample" "EXEC_SYS_SAMPLE=1: every 1 s /proc/meminfo Dirty, Writeback and /proc/diskstats $disk_text, flush fields ${sys_flush:-no}; temperature ${sys_temp:-not readable}; every 30 s ${sys_frag:-no filefrag (not installed): no extent samples}; reports/<run>.sys.tsv and .frag.tsv; the whole disk: other writers on it show up"
+    kv "sys sample" "EXEC_SYS_SAMPLE=1: every 1 s /proc/meminfo Dirty, Writeback, AnonPages, Cached, MemAvailable, /proc/vmstat pgmajfault, workingset_refault_file and /proc/diskstats $disk_text (writes and reads), flush fields ${sys_flush:-no}; temperature ${sys_temp:-not readable}; every 30 s ${sys_frag:-no filefrag (not installed): no extent samples}; reports/<run>.sys.tsv and .frag.tsv; the whole disk: other writers on it show up"
 fi
 
 build() { # <label> <source tree> <target dir> <cargo flags>: prints the test binary's path
@@ -1085,7 +1104,8 @@ manifest="$bench_dir/reports/runs.tsv" # kept for --report-only
 rm -f "$bench_dir/reports/head.txt" # rewritten just before the report renders
 # EXEC_SYS_SAMPLE=1, in the background beside one run until killed: every second the time, the
 # run log's size (the report places the timed loop by it), /proc/meminfo's Dirty and Writeback,
-# the drive's temperature and the disk's (and the file system's) /proc/diskstats line; filefrag's
+# the drive's temperature, the disk's (and the file system's) /proc/diskstats line, then
+# /proc/meminfo's AnonPages, Cached and MemAvailable and /proc/vmstat's two fault counters; filefrag's
 # extent count of the run's data file as soon as it exists, then every 30 s. No python here: one
 # awk per sample.
 sampler() { # <samples file> <extents file> <run log>
@@ -1096,29 +1116,43 @@ sampler() { # <samples file> <extents file> <run log>
     {
         echo "# disk $sys_disk"
         echo "# fs $sys_dev"
-        echo "# t log_bytes dirty_kib writeback_kib temp_mc dev writes sectors_written ms_writing ms_io flushes ms_flushing"
+        echo "# t log_bytes dirty_kib writeback_kib temp_mc dev writes sectors_written ms_writing ms_io flushes ms_flushing reads sectors_read ms_reading anon_kib cached_kib available_kib pgmajfault workingset_refault_file"
     } >"$1"
     [ -z "$sys_frag" ] || echo "# t extents file" >"$2"
     while :; do
         now="${EPOCHREALTIME:-$(date +%s.%N)}"
         awk -v t="$now" -v log_bytes="$(stat -c %s "$3" 2>/dev/null || echo -)" \
             -v devs=" $devs " -v temp_file="$sys_temp" '
-            BEGIN { dirty = "-"; writeback = "-" }
+            BEGIN {
+                dirty = "-"; writeback = "-"; anon = "-"; cached = "-"; available = "-"
+                majflt = "-"; refault = "-"
+            }
             FILENAME == "/proc/meminfo" {
                 if ($1 == "Dirty:") dirty = $2
                 else if ($1 == "Writeback:") writeback = $2
+                else if ($1 == "AnonPages:") anon = $2
+                else if ($1 == "Cached:") cached = $2
+                else if ($1 == "MemAvailable:") available = $2
+                next
+            }
+            FILENAME == "/proc/vmstat" {
+                if ($1 == "pgmajfault") majflt = $2
+                else if ($1 == "workingset_refault_file") refault = $2
                 next
             }
             index(devs, " " $3 " ") {
-                line[$3] = $8 " " $10 " " $11 " " $13 " " (NF >= 20 ? $19 " " $20 : "- -")
+                line[$3] = $8 " " $10 " " $11 " " $13 " " (NF >= 20 ? $19 " " $20 : "- -") \
+                    " " $4 " " $6 " " $7
             }
             END {
                 temp = "-"
                 if (temp_file != "" && (getline value < temp_file) > 0) temp = value
                 n = split(devs, dev, " ")
                 for (i = 1; i <= n; i++)
-                    if (dev[i] in line) print t, log_bytes, dirty, writeback, temp, dev[i], line[dev[i]]
-            }' /proc/meminfo /proc/diskstats >>"$1" 2>/dev/null
+                    if (dev[i] in line)
+                        print t, log_bytes, dirty, writeback, temp, dev[i], line[dev[i]], anon,
+                            cached, available, majflt, refault
+            }' /proc/meminfo /proc/vmstat /proc/diskstats >>"$1" 2>/dev/null
         if [ -n "$sys_frag" ] && [ "$tick" -ge "$next_frag" ]; then
             file="$(find "$tmp_dir" -maxdepth 4 -type f \( -name tndb.dat -o -name mdbx.dat \) \
                 -print -quit 2>/dev/null)"
