@@ -25,8 +25,12 @@
 //! last keys is searched in that leaf alone, and any other key descends from the root
 //! ([`TreeCursor::near`]). Such a key's entry is the one a descent from the root finds; the leaf
 //! the cursor already holds is not checked again, as a step does not check it again.
+//!
+//! A write through a cursor at an entry passes the cursor's slots to the write's descent as a
+//! routing hint ([`TreeCursor::hint`], [`write::Hint`]): slots only, each one followed only where
+//! the key lies in the hinted child's range, with every check of the write's descent kept.
 
-use super::{read::tighten, PageRead, TreeRoot, MAX_HEIGHT};
+use super::{read::tighten, write, PageRead, TreeRoot, MAX_HEIGHT};
 use crate::{
     error::{Error, Result},
     latch::Latch,
@@ -253,6 +257,18 @@ impl TreeCursor {
     #[cfg(test)]
     pub(crate) fn path(&self) -> Vec<(u32, u16)> {
         self.pages.iter().copied().zip(self.slots.iter().copied()).take(self.depth).collect()
+    }
+
+    /// The path's slots as a write's routing hint ([`write::Hint`]): root first, the leaf's last,
+    /// while the cursor is at an entry of a tree of `height` levels; else none. The caller vouches
+    /// only that the path may be the tree's: the write's descent checks every slot it follows.
+    #[inline]
+    pub(crate) fn hint(&self, height: u32) -> write::Hint<'_> {
+        if self.state == State::At && self.depth == height as usize {
+            &self.slots[..self.depth]
+        } else {
+            write::NO_HINT
+        }
     }
 
     /// The last step of the path: the leaf and the entry while the cursor is at one.

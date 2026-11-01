@@ -496,6 +496,9 @@ struct Seen {
     packed_under: [u32; 4],
     /// A cursor's next call after a packed rewrite in place under it that reseeked.
     reseeks_after_packed_rewrite: u32,
+    /// The levels write descents routed by a cursor's hint, and the hints refused, in the rounds
+    /// with the hints on (debug builds count them, [`hint_routing`]).
+    hint: [u32; 2],
 }
 
 impl Seen {
@@ -546,6 +549,12 @@ impl Seen {
             ("delete_prefix of a packed key under a cursor", self.packed_under[3]),
             ("reseeks after a packed rewrite", self.reseeks_after_packed_rewrite),
         ];
+        if cfg!(debug_assertions) {
+            gates.extend([
+                ("levels routed by a hint", self.hint[0]),
+                ("hints refused", self.hint[1]),
+            ]);
+        }
         if packing {
             gates.extend(packed);
         } else {
@@ -617,6 +626,10 @@ fn lockstep(
         let stat = env.begin_ro().expect("ro").table_stat(&d).expect("stat");
         assert!(fillers == 0 || stat.height >= 2, "the outer tree's height: {stat:?}");
         for round in 0..rounds {
+            // Every other round writes with the cursors' hints off.
+            let hinted = (seed + u64::from(round)).is_multiple_of(2);
+            env.with_writer(|w| w.no_write_hint = !hinted);
+            let routed = hint_routing();
             if model.len() < initial.len() / 2 {
                 let mut txn = env.begin_rw().expect("rw");
                 for (key, v) in &initial {
@@ -773,6 +786,12 @@ fn lockstep(
             } else {
                 txn.abort();
             }
+            let now = hint_routing();
+            for (i, seen) in seen.hint.iter_mut().enumerate() {
+                let delta = now[i] - routed[i];
+                assert!(hinted || delta == 0, "round {round}: {delta} with the hints off");
+                *seen += delta as u32;
+            }
         }
         assert!(env.failure().is_none(), "no call latched: {:?}", env.failure());
     }
@@ -818,7 +837,9 @@ fn has_key(rows: &Rows, k: &[u8]) -> bool {
 /// sets beside the nested `big` key, rewritten in place, promoted as they grow and emptied, under
 /// cursors and through them; the packing gates: a cursor at a packed key's row, another writer's
 /// packed rewrite in place, promotion, emptying and `delete_prefix` under a cursor, and a reseek
-/// after a packed rewrite.
+/// after a packed rewrite. Every other round writes under `Writer::no_write_hint`; the others
+/// route the cursors' writes by their paths, with a gate (debug builds) on levels routed by a hint
+/// and on hints refused.
 #[test]
 fn dup_txn_cursors_and_direct_writes_match_the_composite_twin() {
     lockstep(Bound::Default.options(OPTIONS.key_len), 0..6, 300, 300, 5, 3000, 3);
@@ -1146,6 +1167,131 @@ fn a_cursor_reads_the_map_root_not_the_cell() {
     assert_eq!(c.reseeks, 0, "its own write is no reseek");
     txn.commit().expect("commit");
     env.check().expect("check");
+}
+
+/// A dup cursor's writes into a key whose working root supersedes its cell take the key's rows
+/// from the transaction's working map, never from the cell in the cursor's outer leaf: the
+/// working tree changes and keeps the transaction's earlier rows of the key.
+#[test]
+fn a_held_outer_leaf_never_overrides_the_map() {
+    for bound in [Bound::Unpacked, Bound::Default] {
+        let keys = [(1, 3), (2, 40), (3, 3)];
+        let (_dir, env, d, _p, _) =
+            setup_with("tndb_b_dup_txn_held", &keys, bound.options(OPTIONS.key_len));
+        let mut txn = env.begin_rw().expect("rw");
+        for s in 40..400 {
+            txn.put(&d, &row_key(2, s), b"new").expect("put");
+        }
+        let mut c = txn.dup_cursor_detached(&d).expect("cursor");
+        assert!(c.seek_exact(&txn, &row_key(2, 7)).expect("seek").is_some());
+        c.put(&mut txn, &row_key(2, 8), b"again").expect("put");
+        assert!(c.seek_exact(&txn, &row_key(2, 9)).expect("seek").is_some());
+        assert!(c.delete_current(&mut txn).expect("delete"));
+        let want = [(8, Some(&b"again"[..])), (9, None), (40, Some(b"new")), (399, Some(b"new"))];
+        for (s, value) in want {
+            assert_eq!(txn.get(&d, &row_key(2, s)).expect("get"), value, "{bound:?}: row {s}");
+        }
+        txn.commit().expect("commit");
+        env.check().expect("check");
+        let ro = env.begin_ro().expect("ro");
+        for (s, value) in want {
+            assert_eq!(ro.get(&d, &row_key(2, s)).expect("get"), value, "{bound:?}: row {s}");
+        }
+    }
+}
+
+/// [`dup_routing`]'s levels routed by a hint and hints refused; none in a release build, which
+/// does not count them.
+fn hint_routing() -> [u64; 2] {
+    #[cfg(debug_assertions)]
+    return [dup_routing()[0], dup_routing()[1]];
+    #[cfg(not(debug_assertions))]
+    [0, 0]
+}
+
+/// The write descents' routing counters on this thread so far, then the outer cells dup writes
+/// looked up from the root: [`crate::tree::write::HINTED_LEVELS`], `HINT_REFUSALS`,
+/// `WRITE_SEARCHES`, and [`crate::txn::OUTER_FINDS`].
+#[cfg(debug_assertions)]
+fn dup_routing() -> [u64; 4] {
+    use crate::{
+        tree::write::{HINTED_LEVELS, HINT_REFUSALS, WRITE_SEARCHES},
+        txn::OUTER_FINDS,
+    };
+    [&HINTED_LEVELS, &HINT_REFUSALS, &WRITE_SEARCHES, &OUTER_FINDS]
+        .map(|c| c.with(std::cell::Cell::get))
+}
+
+/// A dup cursor's delete of the row it is at, then its insert of that row again, route both
+/// levels by the cursor's paths: the nested descent by the nested path with no search, a packed
+/// key's cell rewrite by the outer path, and the key's cell read in the cursor's outer leaf, not
+/// looked up from the root. With the hints off (`no_write_hint`) every level searches and the
+/// cell is looked up; the rows and the cursor's place are the same either way.
+#[cfg(debug_assertions)]
+#[test]
+fn a_dup_write_at_the_cursor_routes_both_levels() {
+    let routed = |write: &mut dyn FnMut() -> Result<()>| {
+        let before = dup_routing();
+        write().expect("write");
+        let after = dup_routing();
+        std::array::from_fn::<u64, 4, _>(|i| after[i] - before[i])
+    };
+    let keys: Vec<(u32, u16)> = (0..600)
+        .map(|k| {
+            (
+                k,
+                match k {
+                    300 => 600,
+                    301 => 5,
+                    _ => 2,
+                },
+            )
+        })
+        .collect();
+    for bound in [Bound::Unpacked, Bound::Default] {
+        for hinted in [true, false] {
+            let options = bound.options(OPTIONS.key_len);
+            let (_dir, env, d, _p, _) = setup_with("tndb_b_dup_txn_hint", &keys, options);
+            env.with_writer(|w| w.no_write_hint = !hinted);
+            let mut txn = env.begin_rw().expect("rw");
+            let mut c = txn.dup_cursor_detached(&d).expect("cursor");
+            // A nested key of two levels or more, then a key of a few rows: a packed set when the
+            // table packs, else a nested tree of one leaf.
+            for (k, s) in [(300u32, 400u16), (301, 2)] {
+                let (row, at) = (row_key(k, s), format!("{bound:?} hinted {hinted}: ({k}, {s})"));
+                let found = c.seek_dup(&txn, &k.to_be_bytes(), &s.to_be_bytes());
+                assert_eq!(key_of(found), Some(row.clone()), "{at}");
+                let Some((outer, inside)) = c.position(&txn).1 else { panic!("{at}: at a row") };
+                assert!(outer.len() >= 2, "{at}: an outer tree of two levels or more");
+                let (levels, packed) = match inside {
+                    InKey::Nested(_, path) => (path.len() as u64, false),
+                    InKey::Packed { .. } => (outer.len() as u64, true),
+                };
+                assert!(k != 300 || levels >= 2, "{at}: a nested tree of two levels or more");
+                assert_eq!(packed, k == 301 && bound == Bound::Default, "{at}: packed");
+                let delta = routed(&mut || c.delete_current(&mut txn).map(|found| assert!(found)));
+                let finds = u64::from(!hinted);
+                let want = if hinted { [levels, 0, 0, finds] } else { [0, 0, levels, finds] };
+                assert_eq!(delta, want, "{at}: the delete");
+                let delta = routed(&mut || c.insert(&mut txn, &row, b"again"));
+                // The insert lands in the leaf the delete left cached; a nested key is the map's
+                // now, so only a packed key's cell is read again: in the cursor's outer leaf.
+                let finds = u64::from(packed && !hinted);
+                assert_eq!([delta[1], delta[3]], [0, finds], "{at}: the insert");
+                assert!(!hinted || delta[2] == 0, "{at}: the insert searched");
+                let current = c.current(&txn).expect("current");
+                assert_eq!(current, Some((&row[..], &b"again"[..])), "{at}");
+            }
+            txn.commit().expect("commit");
+            env.check().expect("check");
+            let ro = env.begin_ro().expect("ro");
+            for (k, s) in [(300, 400), (301, 2), (300, 401), (301, 3)] {
+                let value = if s == 400 || s == 2 { b"again".to_vec() } else { row_value(k, s, 0) };
+                let got = ro.get(&d, &row_key(k, s)).expect("get");
+                assert_eq!(got, Some(&value[..]), "{bound:?} hinted {hinted}: ({k}, {s})");
+            }
+        }
+    }
 }
 
 /// A cell naming a page private to the transaction with no working entry (the entry forgotten

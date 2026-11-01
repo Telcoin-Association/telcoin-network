@@ -468,6 +468,10 @@ pub(crate) struct Writer {
     /// write-path cache (`write::PathCache`) first, so none is used.
     #[cfg(test)]
     pub(crate) no_path_cache: bool,
+    /// Test-only: a cursor's writes pass no routing hint (`write::Hint`), so every write's
+    /// descent searches each level, as before the hint.
+    #[cfg(test)]
+    pub(crate) no_write_hint: bool,
     /// Test-only: deletes do not merge under-full pages (`PageWrite::no_merge`).
     #[cfg(test)]
     pub(crate) no_merge: bool,
@@ -1078,6 +1082,8 @@ impl Env {
             data_by_msync: false,
             #[cfg(test)]
             no_path_cache: false,
+            #[cfg(test)]
+            no_write_hint: false,
             #[cfg(test)]
             no_merge: false,
             #[cfg(test)]
