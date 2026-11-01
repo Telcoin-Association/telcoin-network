@@ -105,6 +105,8 @@ impl DbCounters {
             gate_lag_sum,
             gate_lag_samples,
             max_gate_lag,
+            writeback_starts,
+            writeback_ns,
         } = self.io;
         vec![
             ("tndb_commits", commits),
@@ -135,6 +137,8 @@ impl DbCounters {
             ("tndb_gate_lag_sum", gate_lag_sum),
             ("tndb_gate_lag_samples", gate_lag_samples),
             ("tndb_max_gate_lag", max_gate_lag),
+            ("tndb_writeback_starts", writeback_starts),
+            ("tndb_writeback_ns", writeback_ns),
         ]
     }
 
