@@ -40,7 +40,9 @@ markers: **[done]**, **[next]**, **[later]**.
   crate (485 passed).
 - Out of scope here: Phase 3 and RocksDB step B belong to the tndb-b work, which happens
   elsewhere.
-- Open decision: drop `js-tracer` (see "Reduction pass 2"). It is the largest single cut left.
+- `js-tracer` is opt-in at build time (D21): the default build no longer compiles boa (35
+  packages; 830 left, 832 with tndb-b). Whether to remove it entirely is up to a team review;
+  `crates/tn-reth/js-tracer.md` covers both.
 - Next, roughly by value: Phase 5 (txpool, needs TN design input), Phase 4 (alloy/revm
   directly; touches consensus-critical execution code, so coordinate with whoever is changing
   `tn-reth/src/env` and `evm`), the Phase 2 follow-up (now worth little for build cost, see
@@ -265,13 +267,11 @@ each, each with an empty third-party `graph.py diff` or an explained one:
 
 Left, with the reason:
 
-- **`js-tracer` (decision needed).** It compiles boa, a JavaScript engine: 30 packages and the
-  largest single cut left. It only serves JS tracer strings in `debug_trace*`, and `debug` is
-  opt-in and off by default. Turning it off is one line in `crates/tn-reth/Cargo.toml` (drop
-  `js-tracer` from reth-rpc, reth-rpc-eth-api and reth-rpc-eth-types). Native tracers
-  (`callTracer`, `prestateTracer`, ...) keep working, a JS tracer request gets an error, and the
-  JS-tracer DoS surface that TN-0017 hardened goes away. This changes RPC behavior for operators
-  who enable `debug`, so it is the maintainers' call.
+- **`js-tracer`: opt-in since D21.** It compiles boa, a JavaScript engine: 35 packages, the
+  largest single cut. The maintainers chose a build-time feature (`tn-reth/js-tracer`, off by
+  default) over removal for now; removal is up to a team review, and
+  `crates/tn-reth/js-tracer.md` lists its steps. Native tracers (`callTracer`, `prestateTracer`,
+  ...) work in both builds.
 - After the tndb-b work: notify and its helpers (5 packages; the read-only static-file watcher,
   whose switch runs through the MDBX `ProviderFactoryBuilder`), sysinfo (reth-db's storage-lock
   liveness check), and parity-scale-codec and modular-bitfield (on-disk encodings).

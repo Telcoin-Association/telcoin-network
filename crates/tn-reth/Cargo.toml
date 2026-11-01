@@ -25,12 +25,13 @@ parking_lot = { workspace = true }
 
 # TN takes reth's individual crates, not the `reth` umbrella crate (see the root
 # `Cargo.toml`). The umbrella's default features are enabled here on the crates it forwarded
-# them to, with two exceptions. jemalloc only matters to a binary that installs jemalloc as its
+# them to, with three exceptions. jemalloc only matters to a binary that installs jemalloc as its
 # `#[global_allocator]`, which the umbrella's `reth` binary does and TN's binaries do not.
 # otlp and otlp-logs only fed reth's own OTLP exporters, which are removed (vendor/reth
-# CHANGES.md TN-0029); TN wires its own. Enabled: js-tracer (reth-rpc, reth-rpc-eth-api,
-# reth-rpc-eth-types); keccak-cache-global (reth-node-core); asm-keccak (reth-node-core, revm);
-# min-debug-logs (reth-node-core, which caps `tracing` at debug in release builds).
+# CHANGES.md TN-0029); TN wires its own. js-tracer is this crate's opt-in `js-tracer` feature
+# (see `[features]` and js-tracer.md). Enabled: keccak-cache-global (reth-node-core); asm-keccak
+# (reth-node-core, revm); min-debug-logs (reth-node-core, which caps `tracing` at debug in
+# release builds).
 # TN does not use reth's node builder (it wires provider, EVM, pool and RPC itself), so neither
 # reth-node-builder nor reth-node-ethereum is a dependency; see vendor/reth/ROADMAP.md.
 reth-db = { workspace = true }
@@ -67,11 +68,11 @@ reth-transaction-pool = { workspace = true }
 reth-ethereum-engine-primitives = { workspace = true }
 
 reth-errors = { workspace = true }
-reth-rpc = { workspace = true, features = ["js-tracer"] }
+reth-rpc = { workspace = true }
 reth-rpc-api = { workspace = true }
 reth-rpc-builder = { workspace = true }
-reth-rpc-eth-api = { workspace = true, features = ["js-tracer"] }
-reth-rpc-eth-types = { workspace = true, features = ["js-tracer"] }
+reth-rpc-eth-api = { workspace = true }
+reth-rpc-eth-types = { workspace = true }
 # `secp256k1` provides `Enr` and `NodeRecord::from_secret_key` for the worker's network stub;
 # reth-rpc enabled it before its admin module went (vendor/reth CHANGES.md TN-0021).
 reth-network-peers = { workspace = true, features = ["secp256k1"] }
@@ -138,6 +139,11 @@ test-utils = ["dep:secp256k1"]
 # Expose the production sorted-run accumulator to the allocation benchmark.
 bench-internals = []
 adiri = ["faucet", "tn-types/adiri"]
+# Serve JavaScript tracers in `debug_trace*` (geth's custom tracers). Off by default: it compiles
+# boa, a JavaScript engine, and lets a debug-namespace caller run scripts on the node. Without
+# it, a JS tracer request gets "JS Tracer is not enabled" and the built-in tracers still work.
+# reth-rpc forwards it to reth-rpc-eth-api and reth-rpc-eth-types. See js-tracer.md.
+js-tracer = ["reth-rpc/js-tracer"]
 
 [[bench]]
 name = "output_overlay"

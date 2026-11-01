@@ -224,7 +224,8 @@ tooling, and dependencies that only that code needed (TN-0025 to TN-0033). Three
 were left for a deliberate decision instead:
 
 - **Behavior that operators can see.** Dropping `js-tracer` would remove the boa JavaScript
-  engine, the largest cut left, but `debug_trace*` would then refuse JS tracers. Path expansion
+  engine, the largest cut left, but `debug_trace*` would then refuse JS tracers (D21 later made
+  it opt-in at build time). Path expansion
   in flags (shellexpand) and reth's logging stack also stay for this reason.
 - **MDBX and RocksDB code, and on-disk encodings.** The tndb-b work owns these (D15, Phase 3):
   the static-file watcher's switch in the MDBX provider builder, reth-db's storage lock,
@@ -237,3 +238,23 @@ dropped that feature from the whole graph. The only visible symptom was a TN tes
 stopped compiling. TN now requests the feature itself (root `Cargo.toml`). When a crate leaves,
 check every third-party feature it was turning on; a build that still compiles proves nothing
 about features that change behavior but not APIs.
+
+## D21. JavaScript tracers are opt-in at build time
+
+Maintainer direction, 2026-10-31: put `js-tracer` behind a feature flag for now, so the boa
+dependency is compiled only when someone needs it; full removal goes to a team review. TN's
+`tn-reth` crate owns the `js-tracer` feature (off by default), and `tn-node` and the
+`telcoin-network` binary forward it. No vendored file changed: reth already gates the JS-tracer
+code, including TN-0017's interrupt, on its own `js-tracer` features, and TN simply stopped
+turning them on. The default build loses 35 packages (865 to 830, and 867 to 832 with tndb-b),
+and a JS tracer request gets `-32603` `JS Tracer is not enabled`; a build with the feature has
+exactly the old graph. The feature changes on surviving packages are all compile-time or
+unreachable on TN's targets: mostly `default` markers whose real features stay on, `serde` on
+num-bigint, `derive` on bytemuck, UTF-16 helpers in icu_normalizer, futures-lite's features
+(only async-io uses it, on targets other than Linux, macOS, Windows and iOS, and asks for none),
+siphasher's `std` (a no-op: the crate is always `no_std`), and time's `large-dates` (its only
+effect is accepting signed years beyond four digits; the remaining users parse ASN.1 times and
+format log timestamps, which use four-digit years). The test
+`js_tracer_follows_the_build_feature` (`crates/tn-reth/src/env/rpc/tests/namespaces.rs`) pins both
+builds. `crates/tn-reth/js-tracer.md` covers what the feature does, why it is off, how to turn it
+on, and the steps for removing it entirely.
