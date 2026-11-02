@@ -541,6 +541,10 @@ struct StampRounds {
     pages: (u64, u64, u64),
     /// The table's tree pages after the last commit, and the bytes of their free gaps.
     gaps: (u64, u64),
+    /// Each measured commit's step 1 free-list save time (`IoStats::save_ns`).
+    save_ns: Vec<u64>,
+    /// Each measured commit's free-list save rounds.
+    save_rounds: Vec<u64>,
 }
 
 /// [`PROBE_POOL`] distinct values of `len` bytes from `rng`.
@@ -598,7 +602,9 @@ fn stamp_rounds(rng: &mut Rng, value: usize) -> StampRounds {
     // One commit replacing every value with step 3 on `threads` threads: its stamp time and the
     // pages it wrote.
     let mut shift = 0;
-    let mut replace_all = |threads: usize| -> (u64, u64) {
+    let mut save_ns = Vec::with_capacity(PROBE_ROUNDS * PROBE_THREADS.len());
+    let mut save_rounds = Vec::with_capacity(PROBE_ROUNDS * PROBE_THREADS.len());
+    let mut replace_all = |threads: usize| -> (u64, u64, u64, u64) {
         shift += 1;
         env.with_writer(|w| w.stamp_threads = Some(threads));
         let mut txn = env.begin_rw().expect("begin");
@@ -610,7 +616,7 @@ fn stamp_rounds(rng: &mut Rng, value: usize) -> StampRounds {
         txn.commit().expect("commit");
         let d = env.io_stats().since(&before);
         assert_eq!(env.with_writer(|w| w.stamped_on), threads, "step 3's threads");
-        (d.stamp_ns, d.pages_synced)
+        (d.stamp_ns, d.pages_synced, d.save_ns, d.free_list_save_rounds)
     };
     for _ in 0..PROBE_WARMUP {
         replace_all(1);
@@ -620,9 +626,11 @@ fn stamp_rounds(rng: &mut Rng, value: usize) -> StampRounds {
     for round in 0..PROBE_ROUNDS {
         for i in 0..PROBE_THREADS.len() {
             let at = (i + round) % PROBE_THREADS.len();
-            let (stamp, written) = replace_all(PROBE_THREADS[at]);
+            let (stamp, written, save, rounds) = replace_all(PROBE_THREADS[at]);
             ns[at].push(stamp);
             pages.push(written);
+            save_ns.push(save);
+            save_rounds.push(rounds);
         }
     }
     env.with_writer(|w| w.stamp_threads = None);
@@ -631,7 +639,22 @@ fn stamp_rounds(rng: &mut Rng, value: usize) -> StampRounds {
         ns,
         pages: (median, pages[0], pages[pages.len() - 1]),
         gaps: tree_gaps(&env, "stamp"),
+        save_ns,
+        save_rounds,
     }
+}
+
+/// Print a [`StampRounds`]' commit step 1 free-list save times (`IoStats::save_ns`), apart
+/// from the step 3 table.
+fn print_save_line(rounds: &mut StampRounds) {
+    let (median, min) = median_min(&mut rounds.save_ns);
+    let (round_median, _) = median_min(&mut rounds.save_rounds);
+    println!(
+        "\ncommit step 1's free-list save (IoStats::save_ns): median {:.2} ms, min {:.2} ms, \
+         {round_median} rounds a commit (median)",
+        median as f64 / 1e6,
+        min as f64 / 1e6,
+    );
 }
 
 /// Print a [`StampRounds`]' table: each thread count's median and least step 3 time, for `bytes`
@@ -681,6 +704,7 @@ fn stamp_probe() {
         crate::stamp::threads(bytes as usize),
     );
     print_stamp_table(&mut full, bytes);
+    print_save_line(&mut full);
     let mut big = vec![0u8; 400 << 20];
     for chunk in big.chunks_exact_mut(8) {
         chunk.copy_from_slice(&rng.next().to_le_bytes());
@@ -707,4 +731,5 @@ fn stamp_probe() {
         crate::stamp::threads(bytes as usize),
     );
     print_stamp_table(&mut gapped, bytes);
+    print_save_line(&mut gapped);
 }

@@ -32,6 +32,7 @@
 //! a later round must list.
 
 use crate::{
+    alloc::merge_sorted,
     crc::CrcState,
     env::Writer,
     error::{Error, Result},
@@ -205,8 +206,17 @@ pub(crate) fn save(writer: &mut Writer, free: &mut TreeRoot) -> Result<u32> {
         // the file and freed again) wait under the committing txn.
         let room = taken.len() * capacity;
         if pool.len() > room {
-            freed.extend(pool.drain(room..));
-            freed.sort_unstable();
+            #[cfg(test)]
+            let reference = writer.alloc.reference_save;
+            #[cfg(not(test))]
+            let reference = false;
+            if reference {
+                freed.extend(pool.drain(room..));
+                freed.sort_unstable();
+            } else {
+                freed = merge_sorted(&freed, &pool[room..]);
+                pool.truncate(room);
+            }
         }
         let want = [records(&pool, capacity, &written[0]), records(&freed, capacity, &written[1])];
         if want == written {
