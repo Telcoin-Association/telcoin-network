@@ -1073,6 +1073,12 @@ impl TreeCursor {
             }
             // The kind byte passed above, so the view is a leaf's exactly at the leaf level.
             let view = View::new(page)?;
+            // The range check's cells and the search's first probe, loading at once.
+            view.prefetch_level(match edge {
+                Edge::First => 0,
+                Edge::Last => view.nkeys().saturating_sub(1),
+                Edge::Key(_) | Edge::Exact(_) => view.first_probe(),
+            });
             if !view.keys_in_range(lo, hi)? {
                 return Err(Error::Corrupt(format!(
                     "page {pgno} holds keys outside its parents' separators (a misrouted pointer)"

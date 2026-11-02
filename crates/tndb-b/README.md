@@ -1099,11 +1099,15 @@ says why the cache is safe.
 
 The cursor's descent (`TreeCursor::descend`) parses each page's header once (`page::View::new`),
 after the fetch, identity and kind checks; the separator-range check, the empty-page checks and
-the search then read through that one view, in that order. The leaf's view goes to the move that
-settles there (`Reached`), which reads its entry through it: `seek_exact`'s hit is the search's
-own `Find::Found` value, not a second read of the cell. A crossing to the next or previous leaf
-climbs the path to the nearest branch with a child beyond it (`climb`) and descends from that
-child (`land_beyond`).
+the search then read through that one view, in that order. Right after the parse, the view
+prefetches the cells the level reads first (`View::prefetch_level`): the first and the last key's,
+which the range check reads, and the cell of the search's first probe (`View::first_probe`; slot 0
+or the last slot for a move to the first or the last entry). Those cache misses then overlap
+instead of following one another; a prefetch is only a hint, so every check, its order and its
+message stay. The leaf's view goes to the move that settles there (`Reached`), which reads its
+entry through it: `seek_exact`'s hit is the search's own `Find::Found` value, not a second read of
+the cell. A crossing to the next or previous leaf climbs the path to the nearest branch with a
+child beyond it (`climb`) and descends from that child (`land_beyond`).
 
 **A seek starts from the leaf the cursor is at** when the cursor is at an entry and its path is
 still the tree's: always for `Cursor` and `RoCursor` (a transaction's or a snapshot's tree does
@@ -1132,7 +1136,9 @@ holder's flag says the writer wrote it, and below a trusted page every private c
 page gets only the identity, kind and non-empty-leaf checks, which read the header line that is
 loaded anyway. The per-fetch checks and the separator-range check run on the untrusted
 (published) pages, the only ones damage at rest or a redirected pointer can reach, and so does
-`verify_published` unless this writer stamped the page. See
+`verify_published` unless this writer stamped the page. On such a page the descent first
+prefetches the range check's two cells and the cell of the level's first probe (the hinted slot,
+else the search's), as the cursor's descent does. See
 item 11 of the [do-not-flag list](#intentional-design-decisions-please-do-not-flag-these).
 
 **Every overflow value read** (`PageRead::overflow`, `overflow::checked_run`) checks the run
@@ -1651,7 +1657,8 @@ These limits and non-goals are known:
    - `crc.rs`: the aarch64 PMULL kernel (`pmull::update`, a copy of `tn-storage`'s), called only
      after the CPU feature is detected at runtime.
    - `page::prefetch`: a one-instruction prefetch hint (`prfm` or `prefetcht0`) that the binary
-     searches issue for the cells of their next probe. A hint never faults or changes memory, and
+     searches issue for the cells of their next probe, and the descents for a level's first
+     cells (`View::prefetch_level`). A hint never faults or changes memory, and
      its address is a byte of the page.
    - the test-only `disk_model.rs`: a copy out of a live mapping into the model's own buffer.
 3. **Reads do not recompute tree pages' CRCs, nor a 1-page overflow run's.** The CRC is checked

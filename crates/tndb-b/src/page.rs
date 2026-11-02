@@ -1173,6 +1173,59 @@ impl<'a> View<'a> {
             Self::Branch(v) => v.keys_in_range(lo, hi),
         }
     }
+
+    /// The number of cells.
+    #[inline]
+    pub(crate) fn nkeys(&self) -> usize {
+        self.hdr().nkeys
+    }
+
+    /// The slot a search's first probe reads: the midpoint of `[0, nkeys)` for a leaf's
+    /// ([`LeafView::search`], [`LeafView::find`]), of `[1, nkeys)` for a branch's
+    /// ([`BranchView::route`]; no slot, `nkeys`, for a single-child branch, whose route reads
+    /// cell 0, a cell no search probes).
+    #[inline]
+    pub(crate) fn first_probe(&self) -> usize {
+        let n = self.nkeys();
+        match self {
+            Self::Leaf(_) => n / 2,
+            Self::Branch(_) if n > 1 => 1 + (n - 1) / 2,
+            Self::Branch(_) => n,
+        }
+    }
+
+    /// Start loading into the CPU cache the cells a descent reads first at this level, so their
+    /// cache misses overlap instead of following one another: the first key's cell (cell 0 of a
+    /// leaf, cell 1 of a branch) and the last key's, which the range check
+    /// ([`Self::keys_in_range`]) reads, and cell `probe`, the one the level's search or route
+    /// reads first ([`Self::first_probe`], or a hinted slot). Only a hint, as
+    /// [`prefetch_next_probes`]: it reads slots below `nkeys` only ([`hdr`] passed, so they lie
+    /// below `upper`), a `probe` past them reads nothing, it touches no byte past the page, and it
+    /// changes no result.
+    #[inline(always)]
+    pub(crate) fn prefetch_level(&self, probe: usize) {
+        let (page, h) = match self {
+            Self::Leaf(v) => (v.page, &v.h),
+            Self::Branch(v) => (v.page, &v.h),
+        };
+        let first = usize::from(h.kind == Kind::Branch);
+        if h.nkeys > first {
+            prefetch_cell(page, first);
+            prefetch_cell(page, h.nkeys - 1);
+        }
+        if probe < h.nkeys {
+            prefetch_cell(page, probe);
+        }
+    }
+
+    /// The header [`hdr`] parsed.
+    #[inline(always)]
+    fn hdr(&self) -> &Hdr {
+        match self {
+            Self::Leaf(v) => &v.h,
+            Self::Branch(v) => &v.h,
+        }
+    }
 }
 
 /// A leaf page whose header passed the O(1) checks of [`hdr`] once (see [`View`]).
@@ -3398,6 +3451,65 @@ mod tests {
             sel in any::<usize>(),
         ) {
             exercise(&damaged_page(seed, size, flips), &key, sel);
+        }
+
+        #[test]
+        fn level_prefetch_never_panics_on_damaged_pages(
+            seed in any::<u64>(),
+            size in select(&SIZES[..]),
+            flips in 1_usize..6,
+            shaped in any::<bool>(),
+        ) {
+            prefetch_every_probe(&damaged_page(seed, size, flips));
+            prefetch_every_probe(&noise_page(seed, size as usize, shaped));
+        }
+    }
+
+    /// [`View::prefetch_level`] on `page`, if its header parses, with every class of probe: the
+    /// first slots, the search's first probe, the last slot, one and two past it, and slots past
+    /// the slot array and the page. It only hints, so what this shows is that it never panics.
+    fn prefetch_every_probe(page: &[u8]) {
+        let Ok(view) = View::new(page) else { return };
+        let n = view.nkeys();
+        for probe in
+            [0, 1, view.first_probe(), n.saturating_sub(1), n, n + 1, page.len(), usize::MAX]
+        {
+            view.prefetch_level(probe);
+        }
+    }
+
+    /// A level's prefetch reads only slots below `nkeys` and cells inside the page: a leaf and a
+    /// branch of every page size, at every key count from empty to full, as built and with every
+    /// slot pointing past the page or at its last byte.
+    #[test]
+    fn level_prefetch_stays_inside_the_page_from_empty_to_full() {
+        for size in SIZES {
+            let g = geometry(size);
+            for kind in [Kind::Leaf, Kind::Branch] {
+                let mut page = fresh(&g, kind);
+                if kind == Kind::Branch {
+                    assert_eq!(branch_insert(&mut page, 0, &[], 1, 1).unwrap(), Fit::Done);
+                }
+                for i in 1_u32.. {
+                    prefetch_every_probe(&page);
+                    let n = nkeys(&page);
+                    for bad in [usize::from(u16::MAX), page.len() - 1] {
+                        let mut damaged = page.clone();
+                        for s in 0..n {
+                            put_u16(&mut damaged, HEADER + SLOT * s, bad);
+                        }
+                        prefetch_every_probe(&damaged);
+                    }
+                    let key = ranked_key(i, 16);
+                    let fit = match kind {
+                        Kind::Leaf => leaf_insert(&mut page, i as usize - 1, &key, b"v"),
+                        Kind::Branch => branch_insert(&mut page, i as usize, &key, i, i),
+                    };
+                    if fit.unwrap() == Fit::Full {
+                        break;
+                    }
+                }
+            }
         }
     }
 

@@ -1124,6 +1124,9 @@ fn descend_write<'s, S: PageWrite + ?Sized>(
             )));
         }
         if !trusted {
+            // The range check's cells and the first probe (the level's hinted slot, else the
+            // search's), loading at once.
+            view.prefetch_level(hint.first().map_or_else(|| view.first_probe(), |&s| s.into()));
             if !store.is_stamped(pgno) {
                 match verify {
                     Verify::Now => {
