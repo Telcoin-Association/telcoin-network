@@ -1572,8 +1572,11 @@ it lands on, a multi-page overflow value in full).
   4 KiB units took 16.9 ms on one thread, 5.9 ms on 4 and 4.5 ms on 8, and 2 MiB 84 us on one
   against 66 us on 2, the threshold. Whole commits of ~100k tree pages (the stamp probe, medians)
   stamped in 17.5 ms on one thread, 8.4 ms on 4, 6.7 ms on 6 and on 8, and 6.8 ms on 12: no
-  gain past about 6 to 8 threads there. The commit shares the machine with the node's other
-  work, so it takes no more.
+  gain past about 6 to 8 threads there. On an Intel i7-1360P under Linux (4 performance cores
+  with two threads each and 8 efficiency cores), the same commits took 22.6 ms on one thread,
+  15.8 ms on 4, 12.0 ms on 8 and 10.9 ms on 12, and one thread's CRC ran at 39.9 GB/s over a
+  cache-resident buffer against 20.8 GB/s over a DRAM-resident one: bound by memory. The commit
+  shares the machine with the node's other work, so it takes no more.
 
 ---
 
