@@ -35,14 +35,12 @@ use clap::{
     builder::{PossibleValue, RangedU64ValueParser, TypedValueParser},
     Arg, Args, Command,
 };
-use reth::{
-    args::{
-        types::{MaxOr, MaxU32, ZeroAsNoneU64},
-        RpcStateCacheArgs,
-    },
-    rpc::builder::{constants, RpcModuleSelection},
-};
 use reth_cli_util::parse_ether_value;
+use reth_node_core::args::{
+    types::{MaxOr, MaxU32, ZeroAsNoneU64},
+    RpcStateCacheArgs,
+};
+use reth_rpc_builder::{constants, RpcModuleSelection};
 use reth_rpc_eth_types::builder::config::PendingBlockKind;
 
 use crate::cli::SELECTABLE_MODULE_NAMES;
@@ -276,9 +274,9 @@ impl Default for RpcServerArgs {
     }
 }
 
-impl From<RpcServerArgs> for reth::args::RpcServerArgs {
+impl From<RpcServerArgs> for reth_node_core::args::RpcServerArgs {
     fn from(v: RpcServerArgs) -> Self {
-        reth::args::RpcServerArgs {
+        reth_node_core::args::RpcServerArgs {
             http: v.http,
             http_addr: v.http_addr,
             http_port: v.http_port,
@@ -350,7 +348,7 @@ mod tests {
     use super::*;
     use crate::cli::RethCommand;
     use clap::Parser;
-    use reth::rpc::builder::config::RethRpcServerConfig as _;
+    use reth_rpc_builder::config::RethRpcServerConfig as _;
 
     /// The manual `Default` impl and the clap CLI default must agree on TN's own
     /// IPC endpoint, not reth's `/tmp/reth.ipc`.
@@ -395,7 +393,7 @@ mod tests {
 
         let full = RethCommand::try_parse_from(["tn-reth", "--rpc.pending-block", "full"])?;
         assert_eq!(full.rpc.rpc_pending_block, PendingBlockKind::Full);
-        let config = reth::args::RpcServerArgs::from(full.rpc).eth_config();
+        let config = reth_node_core::args::RpcServerArgs::from(full.rpc).eth_config();
         assert_eq!(config.pending_block_kind, PendingBlockKind::Full);
         Ok(())
     }

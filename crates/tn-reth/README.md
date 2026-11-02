@@ -450,4 +450,14 @@ From `crates/tn-reth/Cargo.toml`:
 | `faucet` | Instant role-gated TEL mint replacing the timelocked mint. **Never on mainnet.** |
 | `adiri` | Adiri-testnet build: forwards `tn-types/adiri`, which compiles the adiri fork gates in `tn-types` `forks.rs`, and **implies `faucet`**. Each gate names the first adiri epoch on the new behaviour: 383 seed signatures (epoch seed chain replaces the leader-aggregate shuffle seed), 407 `ConsensusRegistry` and `WorkerConfigs` swap, 554 governance Safe onto the canonical v1.4.1 suite, 567 leader-seeded intra-round certificate order, 570 multi-worker `Committee` encoding, 574 seed-chain `PREVRANDAO`. This crate applies the two state-swap forks (407 and 554) itself, in the closing block of the epoch before (steps 1 and 2 of "Epoch close"). Non-adiri builds compile none of these constants and run the post-fork behaviour from genesis. |
 | `test-utils` | Test factories and payload helpers. |
-| `rocksdb` | Opt back in to reth's RocksDB backend (storage is MDBX-only today). |
+| `rocksdb` | Opt back in to reth's RocksDB backend (storage is MDBX-only today). Turns on the `rocksdb` features of `reth-node-core`, `reth-provider`, `reth-db-common`, `reth-stages` and `reth-prune`. |
+
+The crate takes reth's individual crates, never the `reth` umbrella crate (which only re-exports
+them and pulls reth's CLI, `reth-ethereum-cli` and `reth-cli-commands`, into the graph). The
+umbrella's default features are always on, enabled on the crates it forwarded them to: `jemalloc`
+(`reth-cli-util`, `reth-node-core`; not `reth-node-metrics`, whose jemalloc stats feed only
+reth's own metrics server, which TN never starts), `otlp` and `otlp-logs` (`reth-node-core`), `js-tracer`
+(`reth-node-builder`, `reth-node-ethereum`, `reth-rpc`, `reth-rpc-eth-types`),
+`keccak-cache-global` (`reth-node-core`, `reth-node-ethereum`), `asm-keccak` (`reth-node-core`,
+`reth-node-ethereum`, `reth-primitives`) and `min-debug-logs` (`reth-node-core`, which caps
+`tracing` at debug in release builds).

@@ -7,8 +7,8 @@
 
 use std::sync::Arc;
 
-use reth::rpc::builder::TransportRpcModules;
 use reth_db::DatabaseEnv;
+use reth_rpc_builder::TransportRpcModules;
 use reth_transaction_pool::{
     identifier::TransactionId, EthPooledTransaction, ValidPoolTransaction,
 };

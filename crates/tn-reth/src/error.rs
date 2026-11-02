@@ -1,9 +1,10 @@
 //! Error type to wrap various Reth errors.
 
 use alloy::primitives::Bytes;
-use reth::rpc::{builder::error::RpcError, server_types::eth::EthApiError};
 use reth_errors::BlockExecutionError;
 use reth_provider::ProviderError;
+use reth_rpc_builder::error::RpcError;
+use reth_rpc_eth_types::EthApiError;
 use tn_types::WorkerId;
 
 /// Result alias for [`TnRethError`].

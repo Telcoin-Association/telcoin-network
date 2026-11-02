@@ -39,25 +39,25 @@ use std::{
 };
 
 use clap::Parser;
-use reth::{
-    args::{
-        DatabaseArgs, DebugArgs, DefaultRpcServerArgs, DefaultTxPoolValues, DevArgs, DiscoveryArgs,
-        EngineArgs, EraArgs, EraSourceArgs, MetricArgs, NetworkArgs, PayloadBuilderArgs,
-        PruningArgs, StaticFilesArgs, StorageArgs, TxPoolArgs,
-    },
-    network::transactions::{
-        config::TransactionPropagationKind, TransactionIngressPolicy, TransactionPropagationMode,
-    },
-    rpc::builder::{RethRpcModule, RpcModuleSelection},
-};
 use reth_chainspec::ChainSpec as RethChainSpec;
 use reth_discv4::NatResolver;
+use reth_network::transactions::{
+    config::TransactionPropagationKind, TransactionIngressPolicy, TransactionPropagationMode,
+};
 use reth_node_builder::{
     NodeConfig, DEFAULT_MEMORY_BLOCK_BUFFER_TARGET, DEFAULT_PERSISTENCE_THRESHOLD,
     DEFAULT_RESERVED_CPU_CORES, DEFAULT_SPARSE_TRIE_MAX_STORAGE_TRIES,
     DEFAULT_SPARSE_TRIE_PRUNE_DEPTH,
 };
-use reth_node_core::node_config::DEFAULT_CROSS_BLOCK_CACHE_SIZE_MB;
+use reth_node_core::{
+    args::{
+        DatabaseArgs, DebugArgs, DefaultRpcServerArgs, DefaultTxPoolValues, DevArgs, DiscoveryArgs,
+        EngineArgs, EraArgs, EraSourceArgs, MetricArgs, NetworkArgs, PayloadBuilderArgs,
+        PruningArgs, StaticFilesArgs, StorageArgs, TxPoolArgs,
+    },
+    node_config::DEFAULT_CROSS_BLOCK_CACHE_SIZE_MB,
+};
+use reth_rpc_builder::{RethRpcModule, RpcModuleSelection};
 use tn_types::ETHEREUM_BLOCK_GAS_LIMIT_30M;
 use tracing::{info, warn};
 
@@ -199,7 +199,7 @@ pub fn init_reth_defaults() {
         .is_err()
     {
         // The lock is already taken, so reading it back cannot change the outcome.
-        let effective = reth::args::RpcServerArgs::default().ipcpath;
+        let effective = reth_node_core::args::RpcServerArgs::default().ipcpath;
         if effective != DEFAULT_IPC_ENDPOINT {
             warn!(
                 target: "tn::reth",
@@ -579,7 +579,7 @@ fn is_allowed(module: &RethRpcModule) -> bool {
 mod tests {
     use super::*;
     use clap::CommandFactory as _;
-    use reth::rpc::builder::RpcModuleSelection;
+    use reth_rpc_builder::RpcModuleSelection;
     use tempfile::TempDir;
     use tn_types::test_genesis;
 

@@ -75,6 +75,12 @@ mod clippy {
     use tn_reth as _;
 }
 
+// Dependencies only for their own `rocksdb` features (see the `rocksdb` feature in Cargo.toml).
+#[cfg(feature = "rocksdb")]
+use reth_prune as _;
+#[cfg(feature = "rocksdb")]
+use reth_stages as _;
+
 use alloy::primitives::ChainId;
 use reth_chainspec::EthChainSpec;
 use std::sync::{Arc, OnceLock};
@@ -84,10 +90,6 @@ use tn_types::{Address, BlockBody, Genesis, SealedBlock, SealedHeader};
 
 // Reth stuff we are just re-exporting.  Need to reduce this over time.
 pub use alloy::primitives::FixedBytes;
-pub use reth::{
-    chainspec::chain_value_parser, dirs::MaybePlatformPath, payload::BlobSidecars,
-    rpc::builder::RpcServerHandle,
-};
 pub use reth_chain_state::{CanonicalInMemoryState, ExecutedBlock, NewCanonicalChain};
 pub use reth_chainspec::ChainSpec as RethChainSpec;
 pub use reth_cli_util::{parse_duration_from_secs, parse_socket_address};
@@ -97,8 +99,10 @@ pub use reth_db::{
     Database as RethDatabaseT, DatabaseEnv, Tables,
 };
 pub use reth_errors::{ProviderError, RethError};
+pub use reth_ethereum_engine_primitives::BlobSidecars;
 pub use reth_node_core::{
     args::{ColorMode, LogArgs},
+    dirs::MaybePlatformPath,
     node_config::DEFAULT_PERSISTENCE_THRESHOLD,
 };
 pub use reth_primitives_traits::crypto::secp256k1::sign_message;
@@ -108,6 +112,7 @@ pub use reth_provider::StaticFileSegment;
 pub use reth_provider::{
     providers::StaticFileProvider, CanonStateNotificationStream, ChangedAccount,
 };
+pub use reth_rpc_builder::RpcServerHandle;
 pub use reth_rpc_eth_types::EthApiError;
 pub use reth_tracing::{FileWorkerGuard, Layers};
 pub use reth_transaction_pool::{

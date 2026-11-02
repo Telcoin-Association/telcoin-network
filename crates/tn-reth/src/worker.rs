@@ -16,15 +16,16 @@ use crate::{ChainSpec, RethEnv, WorkerTxPool};
 use futures::{FutureExt as _, StreamExt as _};
 use jsonrpsee::{core::RpcResult, types::ErrorObjectOwned};
 use parking_lot::RwLock;
-use reth::{network::config::SecretKey, rpc::builder::RpcServerHandle};
 use reth_chainspec::ChainSpec as RethChainSpec;
 use reth_discv4::DEFAULT_DISCOVERY_PORT;
 use reth_eth_wire::DisconnectReason;
+use reth_network::config::SecretKey;
 use reth_network_api::{
     EthProtocolInfo, NetworkError, NetworkInfo, NetworkStatus, PeerInfo, PeerKind, Peers,
     PeersInfo, Reputation, ReputationChangeKind,
 };
 use reth_network_peers::{Enr, NodeRecord, PeerId as RethPeerId};
+use reth_rpc_builder::RpcServerHandle;
 use std::{
     net::{IpAddr, SocketAddr},
     sync::Arc,
