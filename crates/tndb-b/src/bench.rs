@@ -36,13 +36,25 @@
 //! - `TNDB_B_BENCH_ENGINES` picks the columns, comma-separated (default all; printed in this
 //!   order): `t4d` (4 KiB pages, `Durable`), `t16d` (16 KiB, `Durable`), `t4n` (4 KiB, `NoSync`).
 //! - `TNDB_B_BENCH_ROWS` picks the row groups, comma-separated (default both): `small`, `churn`.
+//!
+//! ## The stamp probe
+//!
+//! `stamp_probe`, also `#[ignore]`d, prices commit step 3 against its thread count: the
+//! `IoStats::stamp_ns` of durable commits that each replace every value of a table, so step 3
+//! stamps about 100k private 4 KiB tree pages, at 1 to 12 threads (`Writer::stamp_threads`), and
+//! one thread's `crc::crc32` rate over a cache-resident and a DRAM-resident buffer (see the test's
+//! docs):
+//!
+//! ```text
+//! cargo test --release -p tndb-b stamp_probe -- --ignored --nocapture --test-threads 1
+//! ```
 
 use std::{
     path::Path,
     time::{Duration, Instant},
 };
 
-use crate::{tree::test_harness::Rng, Env, EnvOptions, SyncMode};
+use crate::{crc, tree::test_harness::Rng, Env, EnvOptions, SyncMode};
 
 /// N unless `TNDB_B_BENCH_N` says otherwise.
 const DEFAULT_N: usize = 1_000_000;
@@ -467,4 +479,151 @@ fn tndb_b_sync_and_merge() {
          test-only switch). On macOS msync and fdatasync do not flush the drive cache, so durable \
          rows cost far less than on Linux."
     );
+}
+
+/// The stamp probe's keys: 8-byte, sequential, each with a [`PROBE_VALUE`]-byte value, four to a
+/// 4 KiB leaf, so a commit that replaces every value writes about 100k tree pages (~392 MiB).
+const PROBE_KEYS: u64 = 400_000;
+/// The largest inline value of an 8-byte key on 4 KiB pages: one maximal entry, a quarter leaf.
+const PROBE_VALUE: usize = 999;
+/// Distinct values the probe cycles through, shifted by one at each commit, so every commit
+/// changes every value.
+const PROBE_POOL: usize = 61;
+/// The thread counts the probe stamps on (`Writer::stamp_threads`; 1 is the serial loop).
+const PROBE_THREADS: [usize; 7] = [1, 2, 3, 4, 6, 8, 12];
+/// Rounds of one commit per thread count, each round's order the previous one's rotated by one.
+const PROBE_ROUNDS: usize = PROBE_THREADS.len();
+/// Commits before the rounds, so the measured ones reuse freed pages as a steady writer does.
+const PROBE_WARMUP: usize = 2;
+
+/// The median and the least of `v`.
+fn median_min(v: &mut [u64]) -> (u64, u64) {
+    v.sort_unstable();
+    (v[v.len() / 2], v[0])
+}
+
+/// Decimal GB a second for `bytes` in `ns`.
+fn gb_s(bytes: u64, ns: u64) -> f64 {
+    bytes as f64 / ns.max(1) as f64
+}
+
+/// Single-thread `crc::crc32` over `buf`, `reps` times a pass, best and median of 7 passes, in
+/// GB/s.
+fn crc_rate(buf: &[u8], reps: usize) -> (f64, f64) {
+    let mut ns: Vec<u64> = (0..8)
+        .map(|_| {
+            let start = Instant::now();
+            for _ in 0..reps {
+                std::hint::black_box(crc::crc32(std::hint::black_box(buf)));
+            }
+            start.elapsed().as_nanos() as u64
+        })
+        .skip(1)
+        .collect();
+    let (median, min) = median_min(&mut ns);
+    let bytes = (buf.len() * reps) as u64;
+    (gb_s(bytes, min), gb_s(bytes, median))
+}
+
+/// Commit step 3's time against its thread count, and one thread's CRC rate in and out of the
+/// caches, and print both tables.
+///
+/// (a) A durable environment of 4 KiB pages holds [`PROBE_KEYS`] keys; each measured commit
+/// replaces every value, so step 3 stamps about 100k private tree pages, written just before by
+/// copy-on-write (DRAM-resident on a machine whose last-level cache is smaller). Each commit's
+/// `IoStats::stamp_ns` is read at a thread count set by `Writer::stamp_threads`, every count once a
+/// round in an order rotated each round. (b) `crc::crc32` on one thread over a 1 MiB buffer,
+/// repeated (cache-resident), and over a 400 MiB one (DRAM-resident).
+///
+/// On-demand probe (kept out of the default suite). Run with:
+/// `cargo test --release -p tndb-b stamp_probe -- --ignored --nocapture --test-threads 1`.
+#[test]
+#[ignore = "on-demand probe; run with --release --ignored --nocapture --test-threads 1"]
+fn stamp_probe() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    announce_temp_dir(tmp.path());
+    let options = EnvOptions {
+        page_size: 4096,
+        map_reserve: 8 << 30,
+        sync: SyncMode::Durable,
+        ..EnvOptions::default()
+    };
+    let env = Env::open(tmp.path().join("stamp.tndb-b"), options).expect("open tndb-b");
+    let mut rng = Rng(0x57a3_b000_0000_0001);
+    let values: Vec<Vec<u8>> =
+        (0..PROBE_POOL).map(|_| (0..PROBE_VALUE).map(|_| rng.next() as u8).collect()).collect();
+    let mut txn = env.begin_rw().expect("begin");
+    let table = txn.create_table("stamp").expect("create stamp");
+    for k in 0..PROBE_KEYS {
+        txn.append(&table, &k.to_be_bytes(), &values[k as usize % PROBE_POOL]).expect("append");
+    }
+    txn.commit().expect("commit");
+    // One commit replacing every value with step 3 on `threads` threads: its stamp time and the
+    // pages it wrote.
+    let mut shift = 0;
+    let mut replace_all = |threads: usize| -> (u64, u64) {
+        shift += 1;
+        env.with_writer(|w| w.stamp_threads = Some(threads));
+        let mut txn = env.begin_rw().expect("begin");
+        for k in 0..PROBE_KEYS {
+            let value = &values[(k as usize + shift) % PROBE_POOL];
+            txn.put(&table, &k.to_be_bytes(), value).expect("put");
+        }
+        let before = env.io_stats();
+        txn.commit().expect("commit");
+        let d = env.io_stats().since(&before);
+        assert_eq!(env.with_writer(|w| w.stamped_on), threads, "step 3's threads");
+        (d.stamp_ns, d.pages_synced)
+    };
+    for _ in 0..PROBE_WARMUP {
+        replace_all(1);
+    }
+    let mut ns = [(); PROBE_THREADS.len()].map(|()| Vec::with_capacity(PROBE_ROUNDS));
+    let mut pages = Vec::with_capacity(PROBE_ROUNDS * PROBE_THREADS.len());
+    for round in 0..PROBE_ROUNDS {
+        for i in 0..PROBE_THREADS.len() {
+            let at = (i + round) % PROBE_THREADS.len();
+            let (stamp, written) = replace_all(PROBE_THREADS[at]);
+            ns[at].push(stamp);
+            pages.push(written);
+        }
+    }
+    env.with_writer(|w| w.stamp_threads = None);
+    let (page_median, _) = median_min(&mut pages);
+    let (lo, hi) = (pages[0], pages[pages.len() - 1]);
+    let bytes = page_median * 4096;
+    let cpus = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
+    println!(
+        "\nstamp probe (a): commit step 3 (IoStats::stamp_ns) of commits replacing every value of \
+         {PROBE_KEYS} keys: {page_median} pages a commit ({lo}..{hi}), {}, {PROBE_ROUNDS} rounds; \
+         {cpus} CPUs available, stamp::threads picks {} for these bytes\n",
+        fmt_bytes(bytes),
+        crate::stamp::threads(bytes as usize),
+    );
+    println!("| threads | median | min | GB/s (median) | GB/s (min) | median vs 1 thread |");
+    println!("|---:|---:|---:|---:|---:|---:|");
+    let serial = median_min(&mut ns[0]).0;
+    for (threads, ns) in PROBE_THREADS.iter().zip(&mut ns) {
+        let (median, min) = median_min(ns);
+        println!(
+            "| {threads} | {} | {} | {:.2} | {:.2} | {:.2}x |",
+            fmt_duration(Duration::from_nanos(median)),
+            fmt_duration(Duration::from_nanos(min)),
+            gb_s(bytes, median),
+            gb_s(bytes, min),
+            serial as f64 / median.max(1) as f64,
+        );
+    }
+    drop(env);
+    let mut big = vec![0u8; 400 << 20];
+    for chunk in big.chunks_exact_mut(8) {
+        chunk.copy_from_slice(&rng.next().to_le_bytes());
+    }
+    let (cached_best, cached_median) = crc_rate(&big[..1 << 20], 64);
+    let (dram_best, dram_median) = crc_rate(&big, 1);
+    println!("\nstamp probe (b): crc::crc32 on one thread, 7 passes\n");
+    println!("| buffer | GB/s (best) | GB/s (median) |");
+    println!("|---|---:|---:|");
+    println!("| 1 MiB, 64 times a pass (cache-resident) | {cached_best:.2} | {cached_median:.2} |");
+    println!("| 400 MiB, once a pass (DRAM-resident) | {dram_best:.2} | {dram_median:.2} |");
 }

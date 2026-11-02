@@ -49,7 +49,7 @@ about half tests. Grep for the symbol and read with an offset.
 | `page_set.rs` | a copy of `crates/storage/src/archive/page_set.rs` plus a touched-word list, so `clear` and `drain` cost the words an insert touched, not the file; keep the rest a copy |
 | `disk_model.rs` | test-only: the page cache and power-loss model |
 | `tree/test_harness.rs` | test-only: `MemStore` (one flat byte buffer, so runs span pages; its `copy_published` is the writer's `copy_page` from the buffer split at the later page, as the buffer has no readers), `walk_tree` (counts run pages against `overflow_pages`), `assert_accounting` (claims runs), the seeded `Rng`, `ReportSeed`; `walk_outer_tree` walks a dup table's outer tree (values = the cells' bytes); the other walkers panic on a nested cell |
-| `bench.rs` | the `#[ignore]`d benchmark `tndb_b_sync_and_merge`: two engine choices against their test-only switches, the small-commit rows with step 4's own choice against a forced `fdatasync` (`Writer::data_by_fdatasync`, A B B A blocks of `SMALL_BLOCK`) and the churn with merging on and off (`Writer::no_merge`), each in a fresh environment; the comparison benchmark of this engine is the adapter's (`crates/tndb-b-reth/src/engine_bench.rs`, results in its `engine-bench.md`) |
+| `bench.rs` | the `#[ignore]`d benchmark `tndb_b_sync_and_merge`: two engine choices against their test-only switches, the small-commit rows with step 4's own choice against a forced `fdatasync` (`Writer::data_by_fdatasync`, A B B A blocks of `SMALL_BLOCK`) and the churn with merging on and off (`Writer::no_merge`), each in a fresh environment; the `#[ignore]`d probe `stamp_probe`: commit step 3's `IoStats::stamp_ns` against `Writer::stamp_threads` (1 to 12, each once a round in a rotated order, 7 rounds) on durable commits replacing every value of 400k keys (~100k private tree pages), and one thread's `crc::crc32` rate over a cache-resident and a DRAM-resident buffer; the comparison benchmark of this engine is the adapter's (`crates/tndb-b-reth/src/engine_bench.rs`, results in its `engine-bench.md`) |
 
 ## Rules of the crate
 
@@ -158,7 +158,7 @@ cargo +nightly-2026-03-20 clippy -p tndb-b --all-targets -- -D warnings
 cargo +nightly-2026-03-20 clippy -p tndb-b --all-targets --all-features -- -D warnings
 cargo +nightly-2026-03-20 fmt --all && cargo +nightly-2026-03-20 fmt --all -- --check
 RUSTDOCFLAGS="-D warnings" cargo doc -p tndb-b --no-deps
-cargo test --release -p tndb-b -- --ignored --skip tndb_b_sync_and_merge   # heavy variants, about 4–5 min
+cargo test --release -p tndb-b -- --ignored --skip tndb_b_sync_and_merge --skip stamp_probe   # heavy variants, about 4–5 min
 ./etc/ci-lanes.sh clippy                                            # the workspace lane, as CI runs it
 ```
 
@@ -166,8 +166,9 @@ A change to the public API or to cursor behaviour also runs `crates/tndb-b-reth`
 
 The benchmark runs on demand:
 `cargo test --release -p tndb-b tndb_b_sync_and_merge -- --ignored --nocapture --test-threads 1`.
-Set `TNDB_B_BENCH_N` for a quick run. If you set `TMPDIR`, scope it to the one command, and never
-point it at a tmpfs. The comparison benchmark of this engine runs from the adapter crate
+Set `TNDB_B_BENCH_N` for a quick run. The stamp probe runs the same way, by its name
+(`stamp_probe`). If you set `TMPDIR`, scope it to the one command, and never point it at a
+tmpfs. The comparison benchmark of this engine runs from the adapter crate
 (`crates/tndb-b-reth/src/engine_bench.rs`, results in its `engine-bench.md`), on the public API
 only.
 
