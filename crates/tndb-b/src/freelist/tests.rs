@@ -1584,3 +1584,88 @@ fn merges_feed_the_save_which_still_settles() {
     assert!(merges > 50, "{merges} deletes merged");
     assert!((1..=3).contains(&rounds), "a save took {rounds} rounds");
 }
+
+/// The save writes the free records the old code wrote, byte for byte: two environments run one
+/// workload of large commits (every value replaced, a table dropped, small records so the pool
+/// spills past the keys taken), one listing its pages the old way (`reference_save`: a combined
+/// sort to find duplicates, and a sort for the spilled pages), and after each commit both hold
+/// the same records and page count.
+#[test]
+fn the_save_writes_the_records_the_reference_writes() {
+    let dirs = [temp(), temp()];
+    let envs = dirs.each_ref().map(|(_, path)| open(path, SyncMode::Durable));
+    envs[1].with_writer(|w| w.alloc.reference_save = true);
+    for (commit, record_pages) in
+        [None, Some(7), None, Some(3), Some(50), None].into_iter().enumerate()
+    {
+        let commit = commit as u32;
+        for env in &envs {
+            env.with_writer(|w| w.record_pages = record_pages);
+            churn(env, "a", 3_000, commit, 700);
+            churn(env, "b", 1_000 + 500 * commit, commit, 300);
+            if commit == 3 {
+                let mut txn = env.begin_rw().expect("begin");
+                let b = txn.create_table("b").expect("b");
+                txn.drop_table(b).expect("drop");
+                txn.commit().expect("commit");
+            }
+        }
+        assert_eq!(free_records(&envs[0]), free_records(&envs[1]), "commit {commit}");
+        assert_eq!(page_count(&envs[0]), page_count(&envs[1]), "commit {commit}");
+    }
+    assert!(envs[1].with_writer(|w| w.alloc.reference_save), "the reference ran throughout");
+}
+
+/// A save whose pool spills past the keys taken into pages below those it freed: a transaction
+/// takes a full record of a dropped table's (low) pages, uses a few, and copies some of a later
+/// table's (high) pages, and its record size (`Writer::record_pages`) is cut below what the
+/// record taken was written with, so the highest pool pages left over wait under the committing
+/// txn below the freed ones. Its records list them in order, merged with the pages it freed, and
+/// match the reference's (`reference_save`) byte for byte.
+#[test]
+fn a_spill_below_the_freed_pages_is_merged_into_them() {
+    const RECORD_PAGES: usize = 16;
+    let dirs = [temp(), temp()];
+    let envs = dirs.each_ref().map(|(_, path)| open(path, SyncMode::Durable));
+    envs[1].with_writer(|w| w.alloc.reference_save = true);
+    for env in &envs {
+        churn(env, "low", 3_000, 0, 700);
+        churn(env, "high", 3_000, 0, 700);
+        let mut txn = env.begin_rw().expect("begin");
+        let low = txn.create_table("low").expect("low");
+        txn.drop_table(low).expect("drop");
+        txn.commit().expect("commit");
+        // Two small commits pass the reuse gate on the dropped table's pages.
+        for generation in 1..3 {
+            churn(env, "high", 1, generation, 700);
+        }
+        let mut txn = env.begin_rw().expect("begin");
+        let high = txn.create_table("high").expect("high");
+        for i in (0..3_000).step_by(100) {
+            txn.put(&high, &key(i), &value(i, 3, 700)).expect("put");
+        }
+        let writer = txn.writer_mut();
+        let (pool, freed) = writer.alloc.reusable().expect("reusable");
+        writer.record_pages = Some(RECORD_PAGES);
+        let txn_id = txn.commit().expect("commit");
+        // The committing txn's records hold pool pages that spilled and, above some of them,
+        // pages it freed: what an append of the spill would have put out of order.
+        let own: Vec<u32> = free_records(env)
+            .into_iter()
+            .filter(|(k, _)| k.txn == txn_id)
+            .flat_map(|(_, pages)| pages)
+            .collect();
+        let spilled = own.iter().filter(|p| pool.binary_search(p).is_ok()).min();
+        let freed_max = own.iter().filter(|p| freed.binary_search(p).is_ok()).max();
+        assert!(
+            spilled.zip(freed_max).is_some_and(|(s, f)| s < f),
+            "a spilled pool page below a freed one: {spilled:?}, {freed_max:?} of {} pool \
+             pages, {} freed",
+            pool.len(),
+            freed.len()
+        );
+        check(env);
+    }
+    assert_eq!(free_records(&envs[0]), free_records(&envs[1]));
+    assert_eq!(page_count(&envs[0]), page_count(&envs[1]));
+}
