@@ -57,9 +57,10 @@
 //! the per-cell checks. The free readers ([`leaf_find`], [`branch_route`], [`keys_in_range`], ...)
 //! are the views' methods behind a fresh header check.
 
-use std::{cmp::Ordering, fmt::Display};
+use std::{cmp::Ordering, fmt::Display, ops::Range};
 
 use crate::{
+    crc::{self, CrcState},
     error::{Error, Result},
     overflow::{self, Ovf, MAX_VALUE, OVF_CELL},
     tree::TreeRoot,
@@ -595,6 +596,65 @@ pub(crate) fn init_branch(page: &mut [u8], pgno: u32, txn: u64) {
 pub(crate) fn set_pgno_txn(page: &mut [u8], pgno: u32, txn: u64) {
     put_u32(page, PGNO_OFF, pgno);
     put_u64(page, TXN_OFF, txn);
+}
+
+// ---- the page CRC ----
+//
+// A tree page's trailer holds the CRC-32 of the page outside its free gap: the header and the
+// slots, then the cells. Nothing reads the gap, so its bytes need not be hashed. Overflow runs
+// keep the whole-run CRC (`crc::add_crc32_nonzero`), and meta pages their own codec.
+
+/// The free gap of tree page `page`, `HEADER + SLOT·nkeys .. upper` (empty on a full page), as
+/// its header gives it; `None` when that header gives no gap, its slots passing `upper` or its
+/// `upper` passing the trailer. The one rule both [`crc`] and copy-on-write
+/// (`tree::write::copy_page`) follow: a page with no gap is hashed and copied whole.
+pub(crate) fn free_gap(page: &[u8]) -> Option<Range<usize>> {
+    let (lower, upper) = (HEADER + SLOT * nkeys(page), upper(page));
+    (lower <= upper && upper <= page.len().checked_sub(TRAILER)?).then_some(lower..upper)
+}
+
+/// The CRC tree page `page`'s trailer holds once stamped: the CRC-32 of `page[..lower]` followed
+/// by `page[upper..P − 4]` around its [`free_gap`], else of the whole `page[..P − 4]`. A CRC of 0
+/// becomes the all-ones sentinel, as `crc::add_crc32_nonzero` maps it, so a stamped trailer never
+/// reads as the all-zero dirty marker.
+///
+/// A header damaged after its stamp gives a different span or different bytes in it, so the
+/// page fails its check: `nkeys` and `upper` are covered bytes themselves.
+pub(crate) fn crc(page: &[u8]) -> u32 {
+    let end = page.len().saturating_sub(TRAILER);
+    let crc = match free_gap(page) {
+        Some(gap) => crc::crc32_update(crc::crc32(&page[..gap.start]), &page[gap.end..end]),
+        None => crc::crc32(&page[..end]),
+    };
+    if crc == 0 { u32::MAX } else { crc }
+}
+
+/// Stamp tree page `page`'s trailer with its [`crc`]: a no-op on fewer than 5 bytes, like
+/// `crc::add_crc32_nonzero`.
+pub(crate) fn stamp(page: &mut [u8]) {
+    let len = page.len();
+    debug_assert!(len >= 5, "a page CRC needs at least 5 bytes (>=1 payload byte + 4 crc bytes)");
+    if len >= 5 {
+        let crc = crc(page);
+        page[len - TRAILER..].copy_from_slice(&crc.to_le_bytes());
+    }
+}
+
+/// Classify tree page `page` by its trailer: all zero is [`CrcState::Dirty`], its [`crc`] is
+/// [`CrcState::Valid`], anything else (or fewer than 5 bytes) is [`CrcState::Corrupt`]. It
+/// computes the CRC unless the page is dirty; `crc::crc_is_zero` is the check that computes
+/// nothing.
+pub(crate) fn crc_state(page: &[u8]) -> CrcState {
+    let len = page.len();
+    if len < 5 {
+        CrcState::Corrupt
+    } else if page[len - TRAILER..] == [0; TRAILER] {
+        CrcState::Dirty
+    } else if page[len - TRAILER..] == crc(page).to_le_bytes() {
+        CrcState::Valid
+    } else {
+        CrcState::Corrupt
+    }
 }
 
 #[inline]

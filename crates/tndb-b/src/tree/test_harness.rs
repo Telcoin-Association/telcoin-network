@@ -10,10 +10,11 @@ use super::{
 };
 use crate::{
     alloc::Allocator,
-    crc::{self, CrcState},
+    crc::CrcState,
     error::{Error, Result},
     overflow::{checked_run, run_pages, Ovf, RunCrc},
     page::{self, Geometry, Kind, Val},
+    stamp,
 };
 
 /// xorshift64: a seeded, reproducible stream for the randomized tests.
@@ -100,8 +101,8 @@ impl MemStore {
     /// run, set the freed pages aside (intact, not reused), and start the next transaction.
     pub(crate) fn commit_like(&mut self) {
         let size = self.geometry.page_size();
-        for (p, n) in self.alloc.stamp_private().units() {
-            crc::add_crc32_nonzero(self.raw_span_mut(p, n as usize * size));
+        for (p, n, run) in self.alloc.stamp_private().units() {
+            stamp::stamp(self.raw_span_mut(p, n as usize * size), run);
         }
         let txn = self.alloc.txn();
         self.retired.extend(self.alloc.take_freed().into_iter().map(|p| (txn, p)));
@@ -190,7 +191,7 @@ impl MemStore {
 
     /// Re-stamp page `p`'s CRC (to make injected damage CRC-valid).
     pub(crate) fn restamp(&mut self, p: u32) {
-        crc::add_crc32_nonzero(self.raw_mut(p));
+        page::stamp(self.raw_mut(p));
     }
 
     /// Check the page accounting after a commit (no private or freed pages pending): the pages
@@ -505,7 +506,7 @@ impl<'s, S: PageRead + ?Sized> Walker<'s, S> {
         let buf = self.store.page(p).unwrap_or_else(|e| panic!("page {p} is unreadable: {e}"));
         page::validate(buf, &self.geometry).unwrap_or_else(|e| panic!("page {p}: {e}"));
         assert_eq!(page::txn(buf) as u32, want_txn, "page {p}: txn is not its parent's child_txn");
-        let state = crc::crc_state(buf);
+        let state = page::crc_state(buf);
         assert!(state != CrcState::Corrupt, "page {p} has a wrong CRC");
         let in_range = |k: &[u8]| lo.is_none_or(|lo| k >= lo) && hi.is_none_or(|hi| k < hi);
         let n = page::nkeys(buf);

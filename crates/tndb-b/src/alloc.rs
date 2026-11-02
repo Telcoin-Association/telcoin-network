@@ -402,7 +402,7 @@ impl Allocator {
         let pages: Vec<u32> = self.private.drain().map(|p| p as u32).collect();
         let runs: Vec<(u32, u32)> = std::mem::take(&mut self.private_runs).into_iter().collect();
         let private = PrivatePages { pages, runs };
-        for (p, _, run) in private.walk() {
+        for (p, _, run) in private.units() {
             if !run {
                 self.stamped.insert(p);
             }
@@ -515,14 +515,10 @@ pub(crate) struct PrivatePages {
 }
 
 impl PrivatePages {
-    /// What gets one CRC each, ascending, as `(first page, pages)`: a tree page alone, and a run
-    /// as one unit (its CRC covers all its pages; its interior is never stamped page by page).
-    pub(crate) fn units(&self) -> impl Iterator<Item = (u32, u32)> + '_ {
-        self.walk().map(|(p, n, _)| (p, n))
-    }
-
-    /// [`Self::units`], each with whether it is a run.
-    fn walk(&self) -> impl Iterator<Item = (u32, u32, bool)> + '_ {
+    /// What gets one CRC each, ascending, as `(first page, pages, run)`: a tree page alone
+    /// (`run` false: the page CRC, `page::crc`), and a run as one unit (`run` true: its CRC
+    /// covers all its pages; its interior is never stamped page by page).
+    pub(crate) fn units(&self) -> impl Iterator<Item = (u32, u32, bool)> + '_ {
         let mut runs = self.runs.iter().peekable();
         let mut i = 0;
         std::iter::from_fn(move || {
@@ -735,7 +731,10 @@ mod tests {
         let private = a.stamp_private();
         assert_eq!(private.pages, (2..10).collect::<Vec<_>>(), "every page, for the data sync");
         let units: Vec<_> = private.units().collect();
-        assert_eq!(units, [(p, 1), (r, 3), (q, 1), (one, 1), (r2, 2)]);
+        assert_eq!(
+            units,
+            [(p, 1, false), (r, 3, true), (q, 1, false), (one, 1, true), (r2, 2, true)]
+        );
         assert!(a.is_stamped(p) && a.is_stamped(q));
         assert!((r..r + 3).chain([one, r2, r2 + 1]).all(|x| !a.is_stamped(x)), "run pages");
         assert!(!a.is_private_run(r) && !a.is_private(r));

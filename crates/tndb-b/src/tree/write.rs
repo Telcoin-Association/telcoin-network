@@ -1522,7 +1522,7 @@ fn verify_published<S: PageWrite + ?Sized>(
 fn check_published(page: &[u8], geometry: &Geometry) -> Result<()> {
     #[cfg(all(test, debug_assertions))]
     COW_VERIFIES.with(|n| n.set(n.get() + 1));
-    if crc::crc_state(page) != CrcState::Valid {
+    if page::crc_state(page) != CrcState::Valid {
         return Err(Error::Corrupt(format!(
             "page {} fails its CRC (at-rest corruption); refusing to copy it",
             page::pgno(page)
@@ -1680,22 +1680,21 @@ fn writable<S: PageWrite + ?Sized>(store: &mut S, p: u32, scratch: &mut Scratch)
 /// are one page, else a broken invariant ([`Error::Failed`]), never a panic.
 ///
 /// The header and slots, then the cells and the trailer: the free gap between the end of the
-/// slots and `upper` keeps `dst`'s old bytes, which nothing reads and the commit's CRC covers
-/// as they are (README do-not-flag 17). Every caller's `src` is a tree page that passed the
-/// fetch checks and, before its first change, [`page::validate`]; a header whose slots pass
-/// `upper`, or whose `upper` passes the trailer, is no such page and is copied whole, so the
-/// checks after the copy see `src`'s bytes.
+/// slots and `upper` ([`page::free_gap`]) keeps `dst`'s old bytes, which nothing reads and the
+/// page CRC does not cover ([`page::crc`]; README do-not-flag 17). Every caller's `src` is a
+/// tree page that passed the fetch checks and, before its first change, [`page::validate`]; a
+/// header whose slots pass `upper`, or whose `upper` passes the trailer, is no such page and is
+/// copied whole, so the checks after the copy see `src`'s bytes.
 pub(crate) fn copy_page(src: &[u8], to: u32, dst: &mut [u8]) -> Result<()> {
     if dst.len() != src.len() {
         return Err(bug(format!("page {to} of {} bytes, not {}", dst.len(), src.len())));
     }
-    let len = src.len();
-    let (lower, upper) = (page::HEADER + page::SLOT * page::nkeys(src), page::upper(src));
-    if lower <= upper && upper <= len - page::TRAILER {
-        dst[..lower].copy_from_slice(&src[..lower]);
-        dst[upper..].copy_from_slice(&src[upper..]);
-    } else {
-        dst.copy_from_slice(src);
+    match page::free_gap(src) {
+        Some(gap) => {
+            dst[..gap.start].copy_from_slice(&src[..gap.start]);
+            dst[gap.end..].copy_from_slice(&src[gap.end..]);
+        }
+        None => dst.copy_from_slice(src),
     }
     Ok(())
 }
@@ -3949,12 +3948,14 @@ mod tests {
                 }
             }
             "a CRC flip on a published branch" => {
-                // A byte of the free gap of the branch below the root.
+                // A reserved header byte of the branch below the root (byte 23): the page CRC
+                // covers it, and only `page::validate` reads it, after the CRC, so the CRC is
+                // what fails. A free-gap byte would not do: the CRC skips the gap, so a flip
+                // there leaves the page valid. Nor would a cell byte: the route or the child's
+                // identity check reads it before the CRC.
                 let (mut store, root) = tall_tree();
                 let (branch, _) = page::branch_child(store.raw(root.root), 0).expect("child");
-                let page = store.raw(branch);
-                let gap = (24 + 2 * page::nkeys(page) + page::upper(page)) / 2;
-                store.raw_mut(branch)[gap] ^= 0x01;
+                store.raw_mut(branch)[23] ^= 0x01;
                 let key = id_key(0, 200);
                 let msg = "fails its CRC";
                 Damaged {
@@ -7755,7 +7756,7 @@ mod tests {
         let (txn_id, page) = (w.txn(), raw(w, freed));
         page.copy_from_slice(&src);
         page::set_pgno_txn(page, freed, txn_id);
-        crc::add_crc32_nonzero(page);
+        page::stamp(page);
         let q = w.alloc().expect("alloc");
         w.free(freed);
         assert!(w.view.slice(u64::from(freed) * size as u64, size).is_none(), "past the view");

@@ -71,7 +71,7 @@ use parking_lot::{Condvar, Mutex, RwLock};
 use crate::{
     alloc::{Allocator, PrivatePages, RUN_LOAD_RECORDS},
     check::{self, CheckReport},
-    crc::{self, CrcState},
+    crc::CrcState,
     error::{Error, Result},
     file::{MapView, PageFile, ReadOnlyFile, DEFAULT_RESERVE},
     freelist,
@@ -515,8 +515,9 @@ pub(crate) enum CrashAt {
 }
 
 impl Writer {
-    /// Stamp the CRCs of what the transaction wrote (commit step 3): each tree page's, and one
-    /// over each overflow run ([`crate::alloc::PrivatePages::units`]). Returns every page written,
+    /// Stamp the CRCs of what the transaction wrote (commit step 3): each tree page's, outside its
+    /// free gap ([`page::crc`]), and one over each overflow run
+    /// ([`crate::alloc::PrivatePages::units`]). Returns every page written,
     /// ascending, for the data sync; the tree pages then count as stamped by this writer.
     ///
     /// Units of many bytes have their CRCs computed on several threads first ([`Self::unit_crcs`]),
@@ -536,13 +537,13 @@ impl Writer {
         }
         match crcs {
             Some(crcs) => {
-                for ((p, n), crc) in private.units().zip(crcs) {
+                for ((p, n, _), crc) in private.units().zip(crcs) {
                     stamp::put_crc(self.file.pages_mut(p, size, n as usize * size)?, crc);
                 }
             }
             None => {
-                for (p, n) in private.units() {
-                    crc::add_crc32_nonzero(self.file.pages_mut(p, size, n as usize * size)?);
+                for (p, n, run) in private.units() {
+                    stamp::stamp(self.file.pages_mut(p, size, n as usize * size)?, run);
                 }
             }
         }
@@ -559,9 +560,12 @@ impl Writer {
         if threads < 2 {
             return None;
         }
-        let units: Vec<&[u8]> = private
+        let units: Vec<stamp::Unit<'_>> = private
             .units()
-            .map(|(p, n)| self.file.pages(p, size, n as usize * size))
+            .map(|(p, n, run)| {
+                let unit = self.file.pages(p, size, n as usize * size)?;
+                Some(if run { stamp::Unit::Run(unit) } else { stamp::Unit::Page(unit) })
+            })
             .collect::<Option<_>>()?;
         Some(stamp::crcs(&units, threads))
     }
@@ -1442,7 +1446,7 @@ fn check_root(snapshot: &Snapshot, root: &TreeRoot, what: &str) -> Result<()> {
     }
     let corrupt = |why: String| Error::Corrupt(format!("open: the {what} root: {why}"));
     let page = snapshot.page(root.root).map_err(|e| corrupt(e.to_string()))?;
-    if crc::crc_state(page) != CrcState::Valid {
+    if page::crc_state(page) != CrcState::Valid {
         return Err(corrupt(format!("page {} fails its CRC", root.root)));
     }
     page::validate(page, &snapshot.geometry).map_err(|e| corrupt(e.to_string()))?;

@@ -14,7 +14,7 @@ use tempfile::TempDir;
 
 use super::*;
 use crate::{
-    catalog, disk_model,
+    catalog, crc, disk_model,
     env::{Env, EnvOptions, SyncMode},
     meta::{Meta, PAGE_SIZES},
     tree::{
@@ -639,7 +639,7 @@ fn patch(path: &Path, offset: u64, p: u32) {
     let start = offset / 4096 * 4096;
     let mut page = vec![0; 4096];
     file.read_exact_at(&mut page, start).expect("read");
-    crc::add_crc32_nonzero(&mut page);
+    page::stamp(&mut page);
     file.write_all_at(&page, start).expect("write");
 }
 
@@ -821,7 +821,7 @@ fn check_reports_damage_leaks_and_double_uses() {
             page::leaf_replace_value(&mut page, 0, &encode_pages(&more)).expect("fits")
                 == page::Fit::Done
         );
-        crc::add_crc32_nonzero(&mut page);
+        page::stamp(&mut page);
         file.write_all_at(&page, start).expect("write");
     });
     assert!(extra.contains(&format!("leaked []; used twice [{tree_page} (")), "{extra}");
@@ -860,7 +860,7 @@ fn check_refuses_a_root_branch_with_one_child() {
     for i in (1..page::nkeys(&page)).rev() {
         page::branch_delete(&mut page, i).expect("delete");
     }
-    crc::add_crc32_nonzero(&mut page);
+    page::stamp(&mut page);
     file.write_all_at(&page, u64::from(r) * 4096).expect("write");
     let env = open(&path, SyncMode::Durable);
     let err = env.check().expect_err("one child").to_string();
@@ -1109,7 +1109,9 @@ fn a_damaged_run_or_counter_refuses_clear_and_drop() {
     let header: Damage<'_> = &|p| patch_run(p, first, n, 0, &(first + 1).to_le_bytes(), true);
     let leaf: Damage<'_> = &|p| {
         let file = fs::OpenOptions::new().read(true).write(true).open(p).expect("open");
-        let at = u64::from(last_leaf) * 4096 + 2000;
+        // The leaf's last cell byte (`P - 5`), a value byte the page CRC covers; a byte of its
+        // free gap would leave the leaf valid, as the CRC skips the gap.
+        let at = u64::from(last_leaf) * 4096 + 4091;
         let mut b = [0];
         file.read_exact_at(&mut b, at).expect("read");
         file.write_all_at(&[b[0] ^ 1], at).expect("write");
@@ -1199,7 +1201,7 @@ fn check_reports_damaged_runs_and_double_claims() {
         listed.sort_unstable();
         let fit = page::leaf_replace_value(&mut page, 0, &encode_pages(&listed)).expect("fits");
         assert!(fit == page::Fit::Done);
-        crc::add_crc32_nonzero(&mut page);
+        page::stamp(&mut page);
         file.write_all_at(&page, start).expect("write");
     });
     let want = format!("leaked []; used twice [{middle} (table \"t\" and free list)]");

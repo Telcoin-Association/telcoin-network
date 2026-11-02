@@ -32,7 +32,7 @@
 //! a later round must list.
 
 use crate::{
-    crc::{self, CrcState},
+    crc::CrcState,
     env::Writer,
     error::{Error, Result},
     page::{self, Geometry, Search},
@@ -115,7 +115,7 @@ pub(crate) fn next_record<'s, S: PageRead + ?Sized>(
     let mut probe = start.encode().to_vec();
     loop {
         let verify = |pgno: u32, page: &[u8], lo: Option<&[u8]>, hi: Option<&[u8]>| {
-            if crc::crc_state(page) != CrcState::Valid {
+            if page::crc_state(page) != CrcState::Valid {
                 return Err(Error::Corrupt(format!("free list: page {pgno} fails its CRC")));
             }
             page::validate(page, &geometry)?;

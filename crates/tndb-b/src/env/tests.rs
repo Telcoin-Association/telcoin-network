@@ -13,7 +13,7 @@ use std::{
 use tempfile::TempDir;
 
 use super::*;
-use crate::{catalog, disk_model, meta::PAGE_SIZES, ReadTxn, Table, TableStat};
+use crate::{catalog, crc, disk_model, meta::PAGE_SIZES, ReadTxn, Table, TableStat};
 
 fn temp() -> (TempDir, PathBuf) {
     let dir = TempDir::with_prefix("tndb_b_env").expect("temp dir");
@@ -347,7 +347,7 @@ fn damaged_metas_and_roots_fail_closed() {
     file.read_exact_at(&mut page, u64::from(catalog_root.root) * 4096).expect("read");
     let original = page.clone();
     page[8] ^= 0x02; // header txn 2 -> 0: no later than the meta's, but not the root's
-    crc::add_crc32_nonzero(&mut page);
+    page::stamp(&mut page);
     file.write_all_at(&page, u64::from(catalog_root.root) * 4096).expect("write");
     assert_fails_closed(&path, |e| matches!(e, Error::Corrupt(m) if m.contains("catalog root")));
     file.write_all_at(&original, u64::from(catalog_root.root) * 4096).expect("restore");
