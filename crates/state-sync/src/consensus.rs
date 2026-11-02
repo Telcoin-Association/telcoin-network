@@ -493,13 +493,30 @@ pub async fn spawn_fetch_consensus(
                 // taking this request freed a slot for a held one
                 requeue_deferred(&consensus_bus, &mut deferred);
                 let epoch = request.epoch();
+                let complete = consensus_chain.is_epoch_complete(request.epoch_record()).await;
                 let already_streaming = consensus_chain.already_streaming_epoch(epoch);
-                if already_streaming || consensus_chain.is_epoch_complete(request.epoch_record()).await {
-                    // skip a pack we already have or are streaming in. the queue refuses a second
-                    // request for an epoch while one is queued or fetched, but the pack can still
-                    // finish or start importing another way while this request waits in the queue
-                    info!(target: "state-sync", "epoch consensus fetcher {task_index} skipping epoch {epoch} we are streaming {already_streaming} or already have");
-                    continue;
+                match pack_request_action(complete, already_streaming) {
+                    PackRequestAction::RaiseTarget => {
+                        // the pack finished another way while this request waited in the queue.
+                        // the stream task drains a pack only after its target is raised, so raise
+                        // it here exactly as a download does
+                        info!(target: "state-sync", "epoch consensus fetcher {task_index} skipping epoch {epoch} we already have");
+                        let final_number = request.epoch_record().final_consensus.number;
+                        signal_pack_complete(&consensus_chain, &consensus_bus, epoch, final_number)
+                            .await;
+                        continue;
+                    }
+                    PackRequestAction::Hold => {
+                        // another import is streaming this pack. the queue refuses a second request
+                        // for an epoch while one is queued or fetched, and `request_epochs` never
+                        // revisits an epoch it has walked, so dropping the request here leaves the
+                        // epoch with no fetch at all if that import stalls. hold it and look again
+                        // after the retry interval
+                        info!(target: "state-sync", "epoch consensus fetcher {task_index} holding epoch {epoch} while another import streams it");
+                        deferred.push(request);
+                        continue;
+                    }
+                    PackRequestAction::Fetch => {}
                 }
                 info!(target: "state-sync", "epoch consensus fetcher {task_index} retrieving epoch {epoch}");
                 crate::STATE_SYNC_METRICS.epoch_pack_fetches_total.increment(1);
@@ -512,26 +529,9 @@ pub async fn spawn_fetch_consensus(
                                     // After a successful pack download, signal spawn_stream_consensus_headers
                                     // that locally-available blocks are ready. This unblocks streaming even
                                     // when the gossip/network path (request_consensus) is slow or unresponsive.
-                                    match consensus_chain
-                                        .consensus_header_by_number(request.epoch_record().final_consensus.number)
-                                        .await {
-                                        Ok(Some(final_header)) => {
-                                            let number = final_header.number;
-                                            if consensus_bus.send_last_consensus_header_if_newer(final_header) {
-                                                info!(target: "state-sync",
-                                                    epoch,
-                                                    final_header_number = number,
-                                                    "epoch pack downloaded, signaling stream to process locally available blocks");
-                                            }
-                                            break;
-                                        }
-                                        Ok(None) => error!(target: "state-sync",
-                                            epoch,
-                                            "Unable to find header by number for new pack file"),
-                                        Err(e) => error!(target: "state-sync",
-                                            epoch,
-                                            ?e,
-                                            "Unable to find header by number for new pack file"),
+                                    let final_number = request.epoch_record().final_consensus.number;
+                                    if signal_pack_complete(&consensus_chain, &consensus_bus, epoch, final_number).await {
+                                        break;
                                     }
                                 }
                                 Err(e) => error!(target: "state-sync",
@@ -610,6 +610,63 @@ fn requeue_deferred(consensus_bus: &ConsensusBusApp, deferred: &mut Vec<EpochPac
             deferred.push(request);
         }
     }
+}
+
+/// What a fetch worker does with a request it has just taken from the epoch pack queue.
+#[derive(Debug, PartialEq, Eq)]
+enum PackRequestAction {
+    /// The pack is complete on disk: raise the stream target and drop the request.
+    RaiseTarget,
+    /// Another import is streaming this pack: hold the request and look again later.
+    Hold,
+    /// No local copy is on the way: download the pack from a peer.
+    Fetch,
+}
+
+/// Decide what to do with a taken request from the pack's state on disk.
+///
+/// A complete pack wins over a live import marker, so a finished import is raised, never held on.
+fn pack_request_action(complete: bool, already_streaming: bool) -> PackRequestAction {
+    if complete {
+        PackRequestAction::RaiseTarget
+    } else if already_streaming {
+        PackRequestAction::Hold
+    } else {
+        PackRequestAction::Fetch
+    }
+}
+
+/// Raise the header stream target to an epoch's final header once its pack is complete on disk,
+/// whether this worker downloaded it or another import landed it first.
+///
+/// Returns `true` when the final header was found. A missing header is logged and leaves the
+/// caller to retry: until the target is raised the stream task never drains the pack.
+async fn signal_pack_complete(
+    consensus_chain: &ConsensusChain,
+    consensus_bus: &ConsensusBusApp,
+    epoch: Epoch,
+    final_number: u64,
+) -> bool {
+    consensus_chain
+        .consensus_header_by_number(final_number)
+        .await
+        .map_err(|e| format!("{e:?}"))
+        .and_then(|header| header.ok_or_else(|| "no header stored".to_string()))
+        .map_or_else(
+            |reason| {
+                error!(target: "state-sync", epoch, final_number, reason = %reason,
+                    "Unable to find header by number for new pack file");
+                false
+            },
+            |final_header| {
+                let number = final_header.number;
+                if consensus_bus.send_last_consensus_header_if_newer(final_header) {
+                    info!(target: "state-sync", epoch, final_header_number = number,
+                        "epoch pack downloaded, signaling stream to process locally available blocks");
+                }
+                true
+            },
+        )
 }
 
 /// Retrieve a consensus headers from a peer.
@@ -1145,6 +1202,26 @@ mod tests {
             .is_err(),
             "a complete local pack is not requested"
         );
+    }
+
+    /// A taken request is held, not dropped, while another import streams its pack, and a pack
+    /// that completed another way raises the stream target instead of being fetched again.
+    #[test]
+    fn pack_request_action_holds_streaming_and_raises_complete() {
+        [
+            (false, false, PackRequestAction::Fetch),
+            (false, true, PackRequestAction::Hold),
+            (true, false, PackRequestAction::RaiseTarget),
+            (true, true, PackRequestAction::RaiseTarget),
+        ]
+        .into_iter()
+        .for_each(|(complete, streaming, expected)| {
+            assert_eq!(
+                pack_request_action(complete, streaming),
+                expected,
+                "complete {complete} streaming {streaming}"
+            );
+        });
     }
 
     /// An epoch whose local pack stops short of its final header is queued for download and does
