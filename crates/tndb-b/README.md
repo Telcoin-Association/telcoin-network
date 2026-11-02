@@ -1590,12 +1590,12 @@ it lands on, a multi-page overflow value in full).
   on pages with room left. The stamp probe's table (c) has leaves 34.9% free; there, on the
   Apple M1 Max (medians, two runs each), one thread stamped a commit in 14.2 ms against 15.9 ms
   with the whole-page CRC, and 8 threads in 5.4 ms either way. The full leaves of table (a), with
-  no gap, took 16.8 ms against 15.7 ms on one thread (two CRC calls a page and the header read)
-  and 5.4 ms against 5.2 ms on 8. One thread's CRC there runs at 25.8 GB/s over cache-resident
-  and DRAM-resident bytes alike, so it is bound by the CPU, and 8 threads meet a floor near 5.3
-  ms that does not follow the bytes hashed. Where one thread's CRC is bound by memory, as on the
-  i7-1360P above, the stamp's time follows the bytes it reads; that machine's numbers for table
-  (c) are not measured yet.
+  no gap, took 16.8 ms against 15.7 ms on one thread (likely the two CRC calls a page and the
+  header read) and 5.4 ms against 5.2 ms on 8. One thread's CRC there runs at 25.8 GB/s over
+  cache-resident bytes and 25.6 GB/s over DRAM-resident ones, so it is bound by the CPU, and 8
+  threads meet a floor near 5.3 ms that does not follow the bytes hashed. Where one thread's CRC
+  is bound by memory, as on the i7-1360P above, the stamp's time follows the bytes it reads; that
+  machine's numbers for table (c) are not measured yet.
 
 ---
 
