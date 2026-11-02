@@ -1,0 +1,213 @@
+# Compiles main after every push the merge queue did not make: a tripwire for commits that
+# reached main without the queue.
+#
+# The queue (pr.yaml on `merge_group`) is what keeps main compiling, and a security
+# advisory merge goes around it. The fix for a GitHub security advisory is developed in a
+# temporary private fork and merged from the advisory. GitHub runs no status checks on
+# that fork and enforces no branch protection when the advisory is merged, so neither
+# `pull_request` nor `merge_group` fires and the ruleset never asks for its required
+# check. On 2026-10-29, between 02:26 and 02:32 UTC, four advisory merges landed that way
+# (GHSA-qf73 as 87180d74f, GHSA-86x7 as 5f912b1dd, GHSA-4947 as ed092164d, GHSA-f64w as
+# b68ce0c78). Each had been forked from main on its own; they met for the first time on
+# main, and main's test targets stopped compiling. Only the push-triggered workflows ran:
+# CodeQL, and cache-deps.yaml, whose warm failed on the errors but is a cache warmer that
+# nobody reads as a verdict. The nightly durable-e2e run failed the same way. From then on
+# every queued PR failed its `test` lane on main + PR, whatever it changed.
+#
+# This is a tripwire, not a gate. Nothing can gate an advisory merge, so no job here is a
+# required check, and none could stop the commit it reports on. A failed run shows as a
+# red mark on main's commit list and emails the account that pushed, and only that
+# account. An admin push that bypasses the ruleset is caught the same way.
+#
+# Every job is skipped on a push the merge queue made (`github.actor` is
+# github-merge-queue[bot]). The queue pushes the very `merge_group` commit, same sha, that
+# pr.yaml has just compiled and tested, so a run here would only repeat that one. The
+# commit cannot tell the routes apart (queue, advisory and admin merges are all committed
+# by web-flow with one parent), but the actor can: of the last 40 pushes to main as of
+# 2026-10-29, every queue merge ran as github-merge-queue[bot], and the advisory and admin
+# merges as the person who merged. A renamed bot makes the jobs run, which is the safe
+# direction, and a `workflow_dispatch` always runs, since its actor is whoever dispatched
+# it. The skip trusts the queue's run, so it holds only while `CI Success` is required: if
+# an admin removes the required check (.github/ACTIONS.md, the escape hatch) and a PR still
+# goes through the queue, its push is skipped here although its `merge_group` run may have
+# failed.
+#
+# It is a file of its own because pr.yaml must never gain a third trigger: GitHub matches
+# a required check by name on the head sha, so a `push` run there would stand in for the
+# two events that gate the branch (pr.yaml's header has the rest). Nothing here may be
+# named `CI Success`, for the same reason.
+#
+# The jobs compile what the queue compiles, through etc/ci-lanes.sh:
+#
+#   fmt-clippy       fmt and both clippy passes, the release graph and every target under
+#                    --all-features, under the nightly pin
+#   build-tests      the rocksdb guard, then both test lanes with `--build-only`, under the
+#                    stable pin that builds releases: the same build of the workspace test
+#                    binaries that failed in cache-deps.yaml and durable-e2e.yaml on
+#                    2026-10-29
+#   carried-patches  the library tests of the two carried patch crates, which sit outside
+#                    the workspace and which an advisory fix can touch too
+#
+# The workspace tests are compiled, not run. A test that fails on main therefore still
+# surfaces only in the next queued PR's `test` lane; two of the 2026-10-29 defects were of
+# that kind, and arrived together with the compile errors this catches.
+#
+# Every cache step restores and never saves (`save-if: "false"`). cache-deps.yaml stays the
+# single writer on main: this workflow is not in its `cache-deps` concurrency group, and on
+# a Cargo.lock push outside the queue the two would race to save the same key. For a
+# restore to hit, the env block and every step up to and including each cache step must
+# match cache-deps.yaml and pr.yaml (cache-deps.yaml's header says why): `fmt-clippy`
+# mirrors pr.yaml's `clippy` job and `build-tests` mirrors pr.yaml's `test` job. Change
+# them in all three files in one pull request.
+#
+# No concurrency block: every push this workflow compiles gets its own verdict, and a later
+# push must not cancel the run that reports on an earlier one.
+name: Main compiles
+
+on:
+  push:
+    branches: [main]
+  # By hand, for instance to confirm that a fix on main compiles.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Identical to pr.yaml and cache-deps.yaml on purpose: every variable here is hashed into
+# the cache key.
+env:
+  CARGO_INCREMENTAL: 0
+  RUSTFLAGS: "-D warnings -D unused_extern_crates"
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  CARGO_PROFILE_DEV_DEBUG: 0
+  CARGO_PROFILE_TEST_DEBUG: 0
+
+jobs:
+  # Steps up to and including the cache step are pr.yaml's `clippy` job, byte for byte.
+  # 90 minutes because the first run after a clippy-cache prefix-key bump finds no entry
+  # and compiles both passes cold.
+  fmt-clippy:
+    if: github.actor != 'github-merge-queue[bot]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: true
+          fetch-depth: 1
+
+      # Before the cache step: RUST_NIGHTLY is part of the cache key (rust-cache hashes
+      # every CARGO*/RUST* variable in the environment), and cache-deps.yaml sets it at
+      # the same point.
+      - name: Read nightly version
+        run: echo "RUST_NIGHTLY=$(cat rust-nightly)" >> "$GITHUB_ENV"
+
+      - name: Install nightly toolchain
+        run: rustup toolchain install "$RUST_NIGHTLY" -c clippy,rust-src --profile minimal
+
+      # rust-cache's `rustc -vV` probe runs in the repository, where rust-toolchain.toml
+      # makes rustup install the stable pin if it is missing, so the pin is hashed either
+      # way. Installing it here makes the hashed set the two pins by construction.
+      - name: Install Rust toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+
+      # The runner image's own stable Rust would be hashed into the cache key, so it goes
+      # after the last toolchain install and before the cache step (cache-deps.yaml's
+      # header says why). The list that follows is the set the key hashes.
+      - name: Remove the runner image's Rust
+        run: |
+          rustup toolchain uninstall stable
+          rustup toolchain list
+
+      # Restore only; cache-deps.yaml writes the v2-rust entries on main.
+      - name: Cache dependencies
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          prefix-key: v2-rust
+          shared-key: clippy-cache
+          save-if: "false"
+
+      # After the cache step, so that the steps before it stay the warm's. A component
+      # does not change `rustc -vV`, so the key would be the same either way.
+      - name: Add rustfmt
+        run: rustup component add rustfmt --toolchain "$RUST_NIGHTLY"
+
+      - name: Check formatting
+        run: ./etc/ci-lanes.sh fmt
+
+      # Runs even when fmt failed, so a formatting slip cannot hide a compile error.
+      - name: Run clippy
+        if: ${{ !cancelled() }}
+        run: ./etc/ci-lanes.sh clippy
+
+  # Steps up to and including the cache step are pr.yaml's `test` job, comments aside, and
+  # cache-deps.yaml's `warm-test-cache` apart from `save-if`.
+  build-tests:
+    if: github.actor != 'github-merge-queue[bot]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: true
+          fetch-depth: 1
+
+      - name: Install Rust toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
+        with:
+          tool: cargo-nextest
+
+      # The runner image's own stable Rust would be hashed into the cache key, so it goes
+      # after the last toolchain install and before the cache step (cache-deps.yaml's
+      # header says why). The list that follows is the set the key hashes.
+      - name: Remove the runner image's Rust
+        run: |
+          rustup toolchain uninstall stable
+          rustup toolchain list
+
+      # Restore only; see the fmt-clippy job.
+      - name: Cache dependencies
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          prefix-key: v1-rust
+          shared-key: test-cache
+          save-if: "false"
+
+      # pr.yaml's `test` job and etc/test-and-attest.sh run this guard before they build; a
+      # bump that pulls librocksdb-sys back into the default graph through a push the queue
+      # did not make is the class of gap this workflow exists to catch. It only resolves
+      # metadata: seconds with the restored cargo home.
+      - name: Assert rocksdb absent from the default feature graph
+        run: ./etc/rocksdb-gate.sh
+
+      - name: Build the default lane's test binaries
+        run: ./etc/ci-lanes.sh test-default --build-only
+
+      # Runs even when the default lane failed, so both lanes report.
+      - name: Build the adiri lane's test binaries
+        if: ${{ !cancelled() }}
+        run: ./etc/ci-lanes.sh test-adiri --build-only
+
+  # The commands of pr.yaml's `connection-limits-patch` and `quinn-proto-patch` jobs, in
+  # one job. No cache step, as there: main warms no entry for these crates.
+  carried-patches:
+    if: github.actor != 'github-merge-queue[bot]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install pinned toolchain
+        run: rustup toolchain install 1.94 --profile minimal
+
+      - name: Test connection accounting
+        run: cargo +1.94 test --locked -p libp2p-connection-limits --lib
+
+      # Runs even when the step above failed, so both crates report.
+      - name: Test the carried protocol observations
+        if: ${{ !cancelled() }}
+        run: cargo +1.94 test --locked --manifest-path patches/quinn-proto/Cargo.toml --lib
