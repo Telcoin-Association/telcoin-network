@@ -21,6 +21,9 @@ on:
 permissions:
   contents: read
 
+# sigkill-recovery.yaml restores this job's durable-e2e-cache entry, so its env block and
+# its steps up to the cache step match these: rust-cache hashes both into the key. Change
+# them together.
 env:
   CARGO_INCREMENTAL: 0
   RUSTFLAGS: "-D warnings -D unused_extern_crates"
@@ -49,20 +52,34 @@ jobs:
         with:
           tool: cargo-nextest
 
+      # The runner image's own stable Rust would be hashed into the cache key, so it goes
+      # after the last toolchain install and before the cache step (cache-deps.yaml's
+      # header says why). The list that follows is the set the key hashes.
+      - name: Remove the runner image's Rust
+        run: |
+          rustup toolchain uninstall stable
+          rustup toolchain list
+
       - name: Cache dependencies
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           shared-key: durable-e2e-cache
           cache-on-failure: "true"
 
-      # Untimed: absorbs the node-binary build and every workspace test-binary compile, and
-      # validates the committed lockfile (`fetch --locked` fails on drift, matching the
-      # `--locked` discipline of pr.yaml), so the timed suite steps below are compile-free.
+      # Untimed: absorbs the node-binary build and the test-binary compiles of both package
+      # selections the suites use, and validates the committed lockfile (`fetch --locked`
+      # fails on drift, matching the `--locked` discipline of pr.yaml), so the timed suite
+      # steps below are compile-free. There are two selections because `make test-restarts`
+      # runs an unscoped `cargo nextest run`, which the `--workspace` build covers, while
+      # `make test-epochs` and `make test-sigkill` run `-p e2e-tests --test it`, which
+      # resolves features for e2e-tests alone and compiles a set of its own. Without the
+      # second build, those two suites compiled inside their timed steps.
       - name: Build node binary and test binaries (untimed)
         run: |
           cargo fetch --locked
           make build-e2e-bin
           cargo nextest run --no-run --locked --workspace
+          cargo nextest run --no-run --locked -p e2e-tests --test it
 
       - name: Run restart e2e tests
         run: make test-restarts

@@ -39,7 +39,7 @@ aes = { version = "0.8.4", features = ["zeroize"] }
 pbkdf2 = "0.12.2"
 sha2 = "0.10.8"
 # Clears derived key material and decrypt buffers on drop.
-zeroize = "1.8.2"
+zeroize = { workspace = true }
 
 [dev-dependencies]
 hex = { workspace = true }

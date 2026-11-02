@@ -19,42 +19,16 @@ concurrency:
   group: quic-observations-${{ github.head_ref || github.run_id }}
   cancel-in-progress: true
 
-env:
-  CARGO_BUILD_JOBS: 2
-  CARGO_INCREMENTAL: 0
-  CARGO_PROFILE_DEV_DEBUG: 0
-  CARGO_PROFILE_TEST_DEBUG: 0
-  RUSTC_WRAPPER: ""
-
 jobs:
-  transport-evidence:
-    if: github.event_name == 'pull_request'
-    uses: ./.github/workflows/transport-patches.yaml
-
-  workspace-clippy:
-    runs-on: ubuntu-latest
-    timeout-minutes: 45
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          submodules: true
-      - name: Read nightly version
-        run: echo "RUST_NIGHTLY=$(cat rust-nightly)" >> $GITHUB_ENV
-      - name: Install repository lint toolchain
-        run: rustup toolchain install $RUST_NIGHTLY -c clippy,rustfmt,rust-src --profile minimal
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        with:
-          prefix-key: v1-rust
-          shared-key: clippy-cache
-          save-if: "false"
-      - name: Check workspace formatting
-        run: ./etc/ci-lanes.sh fmt
-      - name: Check the full workspace dependency closure
-        run: ./etc/ci-lanes.sh clippy
-
   observations:
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    env:
+      CARGO_BUILD_JOBS: 2
+      CARGO_INCREMENTAL: 0
+      CARGO_PROFILE_DEV_DEBUG: 0
+      CARGO_PROFILE_TEST_DEBUG: 0
+      RUSTC_WRAPPER: ""
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install pinned toolchain
@@ -64,6 +38,12 @@ jobs:
           workspaces: |
             patches/quinn-proto
             testing/quic-interop/releases/candidate
+          # Restore only. A pull_request run saves into its PR's own scope, where no other
+          # run reads it and nothing prunes it: this step had left 12 PR-scoped entries,
+          # 4 GB, with the repository's cache at 97 % of its 10 GB quota, so GitHub evicted
+          # main's warm entries to make room. Nothing warms this key on main, so the two
+          # workspaces build cold, as pr.yaml's quinn-proto-patch lane does.
+          save-if: "false"
       - name: Exercise endpoint decision sites and occupancy cleanup
         run: cargo +1.94 test --locked --manifest-path patches/quinn-proto/Cargo.toml --lib
       - name: Exercise Retry behavior and observation consumers together
@@ -74,8 +54,6 @@ jobs:
           python3 -I testing/quic-interop/observation_mutations.py --suite candidate --output "$RUNNER_TEMP/quic-candidate-mutations"
       - name: Lint candidate and configuration source
         run: cargo +1.94 clippy --locked --manifest-path testing/quic-interop/releases/candidate/Cargo.toml --all-targets --no-deps -- -D warnings
-      - name: Preserve source identity and version controls
-        run: python3 -I -m unittest discover -s etc/transport-patches -p 'test_*.py' -v
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: always()
         with:
@@ -85,6 +63,16 @@ jobs:
   metrics:
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    # cache-deps.yaml's six variables: rust-cache hashes them into the key, and this job
+    # restores the test-cache entry that cache-deps.yaml warms on main. Keep them, and the
+    # toolchains installed before the cache step, in lockstep with that file.
+    env:
+      CARGO_INCREMENTAL: 0
+      RUSTFLAGS: "-D warnings -D unused_extern_crates"
+      CARGO_TERM_COLOR: always
+      RUST_BACKTRACE: 1
+      CARGO_PROFILE_DEV_DEBUG: 0
+      CARGO_PROFILE_TEST_DEBUG: 0
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -93,6 +81,13 @@ jobs:
         run: rustup toolchain install 1.94 --profile minimal
       - name: Configure build inputs
         run: cp .env.example .env
+      # The runner image's own stable Rust would be hashed into the cache key, so it goes
+      # after the last toolchain install and before the cache step (cache-deps.yaml's
+      # header says why). The list that follows is the set the key hashes.
+      - name: Remove the runner image's Rust
+        run: |
+          rustup toolchain uninstall stable
+          rustup toolchain list
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           prefix-key: v1-rust

@@ -20,7 +20,8 @@
 # as a clean graph.
 #
 # Runs in the `test` job of .github/workflows/pr.yaml and in etc/test-and-attest.sh, so the
-# queue enforces what the maintainer's attested run checked.
+# queue enforces what the maintainer's attested run checked, and in the `build-tests` job
+# of .github/workflows/main-compiles.yaml, which checks pushes the queue did not make.
 
 set -euo pipefail
 

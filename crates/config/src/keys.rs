@@ -335,9 +335,12 @@ impl KeyConfig {
     }
 
     /// Read a key config file that contains the primary BLS key in Base 58 format.
+    ///
+    /// The passphrase is taken by value so it is cleared from memory as soon as the key is
+    /// unwrapped, rather than living as long as the caller's stack frame.
     pub fn read_config<TND: TelcoinDirs>(
         tn_datadir: &TND,
-        passphrase: Option<String>,
+        passphrase: Option<Zeroizing<String>>,
     ) -> eyre::Result<Self> {
         let keys_dir = tn_datadir.node_keys_path();
         // If we don't have a wrapped file then try an unencrypted file before failure.
@@ -399,7 +402,7 @@ impl KeyConfig {
     /// Note, this is not very secure in that it is writing the private key to a file...
     pub fn generate_and_save<TND: TelcoinDirs>(
         tn_datadir: &TND,
-        passphrase: Option<String>,
+        passphrase: Option<Zeroizing<String>>,
     ) -> eyre::Result<Self> {
         Self::generate_and_save_with_rounds(tn_datadir, passphrase, PBKDF2_HMAC_ROUNDS)
     }
@@ -413,7 +416,7 @@ impl KeyConfig {
     #[cfg(feature = "test-utils")]
     pub fn generate_and_save_insecure<TND: TelcoinDirs>(
         tn_datadir: &TND,
-        passphrase: Option<String>,
+        passphrase: Option<Zeroizing<String>>,
         rounds: u32,
     ) -> eyre::Result<Self> {
         if rounds == 0 {
@@ -431,7 +434,7 @@ impl KeyConfig {
     /// at `rounds` when a passphrase is given.
     fn generate_and_save_with_rounds<TND: TelcoinDirs>(
         tn_datadir: &TND,
-        passphrase: Option<String>,
+        passphrase: Option<Zeroizing<String>>,
         rounds: u32,
     ) -> eyre::Result<Self> {
         // note: StdRng uses ChaCha12
@@ -688,7 +691,7 @@ mod tests {
             // without depending on the `test-utils` feature being enabled.
             KeyConfig::generate_and_save_with_rounds(
                 &datadir,
-                Some("passphrase".to_string()),
+                Some(Zeroizing::new("passphrase".to_string())),
                 TEST_ONLY_INSECURE_ROUNDS,
             )
             .expect("generate keys");
@@ -887,7 +890,7 @@ mod tests {
     fn test_bls_passphrase() {
         let tmp_dir = TempDir::new().expect("tmp dir");
         let datadir = tmp_dir.path().to_path_buf();
-        let pp = Some("test_bls_passphrase".to_string());
+        let pp = Some(Zeroizing::new("test_bls_passphrase".to_string()));
         // fast rounds: this test covers the wrap/unwrap plumbing, not the work factor
         // (the production round count is pinned by `test_bls_passphrase_production_rounds`)
         let kc = KeyConfig::generate_and_save_with_rounds(&datadir, pp.clone(), 1)
@@ -895,7 +898,11 @@ mod tests {
         let kc2 = KeyConfig::read_config(&datadir, pp).expect("load config");
         assert_eq!(kc.inner.primary_keypair.to_bytes(), kc2.inner.primary_keypair.to_bytes());
         assert!(KeyConfig::read_config(&datadir, None).is_err());
-        assert!(KeyConfig::read_config(&datadir, Some("not_passphrase".to_string())).is_err());
+        assert!(KeyConfig::read_config(
+            &datadir,
+            Some(Zeroizing::new("not_passphrase".to_string()))
+        )
+        .is_err());
     }
 
     /// The true production write path: `generate_and_save` must emit the headerless layout,
@@ -905,7 +912,8 @@ mod tests {
         let tmp_dir = TempDir::new().expect("tmp dir");
         let datadir = tmp_dir.path().to_path_buf();
         let pp = "production_rounds";
-        let kc = KeyConfig::generate_and_save(&datadir, Some(pp.to_string())).expect("key config");
+        let kc = KeyConfig::generate_and_save(&datadir, Some(Zeroizing::new(pp.to_string())))
+            .expect("key config");
 
         // decode the on-disk file and pin the headerless layout: salt | nonce | ct (+16-byte tag)
         let contents = std::fs::read_to_string(datadir.node_keys_path().join(BLS_WRAPPED_KEYFILE))
@@ -928,7 +936,8 @@ mod tests {
             "production keyfile must open at PBKDF2_HMAC_ROUNDS"
         );
 
-        let kc2 = KeyConfig::read_config(&datadir, Some(pp.to_string())).expect("load config");
+        let kc2 = KeyConfig::read_config(&datadir, Some(Zeroizing::new(pp.to_string())))
+            .expect("load config");
         assert_eq!(kc.inner.primary_keypair.to_bytes(), kc2.inner.primary_keypair.to_bytes());
     }
 
@@ -942,8 +951,9 @@ mod tests {
         let expected = keypair.to_bytes();
         let wrapped = wrap_test_only(&keypair, "test_only_weak", TEST_ONLY_INSECURE_ROUNDS);
         let datadir = install_wrapped(&tmp_dir, &wrapped);
-        let kc = KeyConfig::read_config(&datadir, Some("test_only_weak".to_string()))
-            .expect("read test_only weak file");
+        let kc =
+            KeyConfig::read_config(&datadir, Some(Zeroizing::new("test_only_weak".to_string())))
+                .expect("read test_only weak file");
         assert_eq!(kc.inner.primary_keypair.to_bytes(), expected);
     }
 
@@ -955,8 +965,9 @@ mod tests {
         let expected = keypair.to_bytes();
         let wrapped = wrap_test_only(&keypair, "test_only_strong", PBKDF2_HMAC_ROUNDS);
         let datadir = install_wrapped(&tmp_dir, &wrapped);
-        let kc = KeyConfig::read_config(&datadir, Some("test_only_strong".to_string()))
-            .expect("read test_only strong file");
+        let kc =
+            KeyConfig::read_config(&datadir, Some(Zeroizing::new("test_only_strong".to_string())))
+                .expect("read test_only strong file");
         assert_eq!(kc.inner.primary_keypair.to_bytes(), expected);
     }
 
@@ -966,7 +977,7 @@ mod tests {
     fn test_truncated_wrapped_file_errors() {
         let tmp_dir = TempDir::new().expect("tmp dir");
         let datadir = install_wrapped(&tmp_dir, &bs58::encode([0_u8; 10]).into_string());
-        assert!(KeyConfig::read_config(&datadir, Some("any".to_string())).is_err());
+        assert!(KeyConfig::read_config(&datadir, Some(Zeroizing::new("any".to_string()))).is_err());
     }
 
     /// The test-utils-gated insecure writer rejects a zero round count and round-trips.
@@ -975,7 +986,7 @@ mod tests {
     fn test_generate_and_save_insecure() {
         let tmp_dir = TempDir::new().expect("tmp dir");
         let datadir = tmp_dir.path().to_path_buf();
-        let pp = Some("insecure".to_string());
+        let pp = Some(Zeroizing::new("insecure".to_string()));
         assert!(KeyConfig::generate_and_save_insecure(&datadir, pp.clone(), 0).is_err());
         let kc = KeyConfig::generate_and_save_insecure(&datadir, pp.clone(), 1)
             .expect("insecure BLS key config");
@@ -996,7 +1007,7 @@ mod tests {
         // just ignored.
         assert!(KeyConfig::read_config(
             &tmp_dir.path().to_path_buf(),
-            Some("not_passphrase".to_string())
+            Some(Zeroizing::new("not_passphrase".to_string()))
         )
         .is_ok());
     }
