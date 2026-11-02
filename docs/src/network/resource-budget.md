@@ -3,7 +3,9 @@
 The optional `process_budget` in the YAML `network-config` file allocates established QUIC resources across the
 primary and every configured worker swarm. Production limits and deployment qualification remain
 pending [issue #1433](https://github.com/Telcoin-Association/telcoin-network/issues/1433).
-Omitting this section preserves the existing eight connections per peer and existing QUIC settings.
+Omitting this section applies the built-in swarm bound: 128 established connections per swarm,
+eight per peer, and the `quic_config` defaults of 256 incoming streams, 2 MiB of stream credit and
+4 MiB of connection credit per connection.
 
 ## Allocation
 

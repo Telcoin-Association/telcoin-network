@@ -1914,8 +1914,21 @@ hostname: "my-validator"
         assert_eq!(lower.max_stream_data, 100);
         let legacy: NetworkConfig = serde_json::from_str("{}")?;
         assert_eq!(legacy.swarm_budget(), Ok(None));
-        assert_eq!(legacy.quic_config().with_budget(None).max_connection_data, 100 * 1024 * 1024);
+        assert_eq!(legacy.quic_config().with_budget(None).max_connection_data, 4 * 1024 * 1024);
         Ok(())
+    }
+
+    /// The built-in QUIC credit holds one full request-response message per stream with the same
+    /// headroom, two stream windows per connection, and at most the libp2p stream ceiling.
+    #[test]
+    fn default_quic_credit_is_bounded_by_the_message_size() {
+        let quic = super::QuicConfig::default();
+        let rpc_message =
+            u32::try_from(super::LibP2pConfig::default().max_rpc_message_size).unwrap_or(u32::MAX);
+        assert_eq!(quic.max_stream_data, rpc_message.saturating_mul(2));
+        assert_eq!(quic.max_connection_data, quic.max_stream_data.saturating_mul(2));
+        assert_eq!(quic.max_concurrent_stream_limit, 256);
+        assert_eq!(quic.with_budget(None).max_connection_data, 4 * 1024 * 1024);
     }
 
     #[test]
