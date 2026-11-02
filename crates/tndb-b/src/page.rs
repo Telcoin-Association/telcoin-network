@@ -1209,7 +1209,8 @@ impl<'a> View<'a> {
             Self::Branch(v) => (v.page, &v.h),
         };
         let first = usize::from(h.kind == Kind::Branch);
-        if h.nkeys > first {
+        // MEASUREMENT ONLY: no range check, so no prefetch of its cells.
+        if cfg!(test) && h.nkeys > first {
             prefetch_cell(page, first);
             prefetch_cell(page, h.nkeys - 1);
         }
@@ -1577,6 +1578,10 @@ pub(crate) fn keys_in_range(page: &[u8], lo: Option<&[u8]>, hi: Option<&[u8]>) -
 
 /// The range check of [`keys_in_range`] on a parsed header.
 fn keys_within(page: &[u8], h: &Hdr, lo: Option<&[u8]>, hi: Option<&[u8]>) -> Result<bool> {
+    // MEASUREMENT ONLY (the ceiling of narrowing the range check): never merge.
+    if !cfg!(test) {
+        return Ok(true);
+    }
     let first = usize::from(h.kind == Kind::Branch);
     if h.nkeys <= first {
         return Ok(true);
