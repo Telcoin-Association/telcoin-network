@@ -1955,8 +1955,10 @@ fn check_restore_consistency(
 ///
 /// A record closes its epoch, so `next_committee` belongs to the following epoch. A record at or
 /// ahead of the local committee can veto validator status; an older record cannot veto a later
-/// admission. An eligible validator whose local epoch precedes the record must catch up before
-/// voting. Records never promote a local observer or overwrite an inactive validator.
+/// admission. An eligible validator whose local epoch precedes the record, or whose local epoch
+/// the record has already closed, must catch up before voting; the unsigned epoch-0 anchor carries
+/// no final consensus and closes nothing. Records never promote a local observer or overwrite an
+/// inactive validator.
 fn node_mode_from_epoch_record(
     initial_mode: NodeMode,
     local_epoch: Epoch,
@@ -1972,7 +1974,10 @@ fn node_mode_from_epoch_record(
             });
             if !eligible {
                 NodeMode::Observer
-            } else if record.is_some_and(|record| record.epoch > local_epoch) {
+            } else if record.is_some_and(|record| {
+                record.epoch > local_epoch
+                    || (record.epoch == local_epoch && record.final_consensus.number > 0)
+            }) {
                 NodeMode::CvvInactive
             } else {
                 NodeMode::CvvActive
@@ -2112,6 +2117,43 @@ mod tests {
             (NodeMode::CvvActive, 0, &genesis, NodeMode::CvvActive),
             (NodeMode::Observer, 3, &record, NodeMode::Observer),
             (NodeMode::CvvInactive, 3, &record, NodeMode::CvvInactive),
+        ]
+        .into_iter()
+        .for_each(|(initial, epoch, record, expected)| {
+            let mode = node_mode_from_epoch_record(initial, epoch, &public_key, Some(record));
+            assert_eq!(
+                std::mem::discriminant(&mode),
+                std::mem::discriminant(&expected),
+                "local epoch {epoch}: {mode:?}"
+            );
+        });
+    }
+
+    /// A certified record for the local epoch proves that epoch already closed, so a retained
+    /// validator catches up instead of joining a finished epoch; the unsigned epoch-0 anchor does
+    /// not close its epoch.
+    #[test]
+    fn epoch_record_mode_demotes_retained_validator_whose_epoch_closed() {
+        let public_key = worker_key_config().primary_public_key();
+        let closed = EpochRecord {
+            epoch: 9,
+            next_committee: vec![public_key],
+            final_consensus: tn_types::ConsensusNumHash::new(90, Default::default()),
+            ..Default::default()
+        };
+        let closed_genesis = EpochRecord {
+            next_committee: vec![public_key],
+            final_consensus: tn_types::ConsensusNumHash::new(7, Default::default()),
+            ..Default::default()
+        };
+        let anchor = EpochRecord { next_committee: vec![public_key], ..Default::default() };
+        [
+            (NodeMode::CvvActive, 9, &closed, NodeMode::CvvInactive),
+            (NodeMode::CvvActive, 10, &closed, NodeMode::CvvActive),
+            (NodeMode::CvvActive, 0, &closed_genesis, NodeMode::CvvInactive),
+            (NodeMode::CvvActive, 0, &anchor, NodeMode::CvvActive),
+            (NodeMode::Observer, 9, &closed, NodeMode::Observer),
+            (NodeMode::CvvInactive, 9, &closed, NodeMode::CvvInactive),
         ]
         .into_iter()
         .for_each(|(initial, epoch, record, expected)| {
