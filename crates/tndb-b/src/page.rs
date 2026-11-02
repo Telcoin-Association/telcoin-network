@@ -628,11 +628,16 @@ pub(crate) fn free_gap(page: &[u8]) -> Option<Range<usize>> {
 ///
 /// A header damaged after its stamp gives a different span or different bytes in it, so the
 /// page fails its check: `nkeys` and `upper` are covered bytes themselves.
+///
+/// A full page (an empty gap) is hashed in one pass over `page[..P − 4]`, the same bytes in the
+/// same order, so the same CRC, without the second call.
 pub(crate) fn crc(page: &[u8]) -> u32 {
     let end = page.len().saturating_sub(TRAILER);
     let crc = match free_gap(page) {
-        Some(gap) => crc::crc32_update(crc::crc32(&page[..gap.start]), &page[gap.end..end]),
-        None => crc::crc32(&page[..end]),
+        Some(gap) if !gap.is_empty() => {
+            crc::crc32_update(crc::crc32(&page[..gap.start]), &page[gap.end..end])
+        }
+        _ => crc::crc32(&page[..end]),
     };
     if crc == 0 {
         u32::MAX
