@@ -273,9 +273,20 @@ impl Durability {
     }
 
     /// Advance the watermark to `durable` (never back, and never after a failure).
+    ///
+    /// The mutex [`Self::durable`] reads moves before the watch a group-mode [`Self::persist`]
+    /// waits on, so a `persist` that returns finds `durable()` already at its batch
+    /// (`test_tndb_durable_only_after_the_sync` reads it right after one).
     fn advance(&self, durable: u64) {
         if self.is_failed() {
             return;
+        }
+        {
+            let mut now = self.durable_now.lock();
+            if durable > *now {
+                *now = durable;
+                self.durable_changed.notify_all();
+            }
         }
         self.durable.send_if_modified(|current| {
             let advanced = durable > *current;
@@ -284,11 +295,6 @@ impl Durability {
             }
             advanced
         });
-        let mut now = self.durable_now.lock();
-        if durable > *now {
-            *now = durable;
-            self.durable_changed.notify_all();
-        }
     }
 
     /// The durability barrier: wait until every batch up to `target` (the last one written when
