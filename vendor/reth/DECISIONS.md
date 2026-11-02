@@ -95,6 +95,14 @@ Tags:
 - `reth-reduction-start`: the last commit before code reduction (removing crates and features,
   replacing reth layers) begins.
 
+2026-11-02: so the vendored reth can be reviewed and merged on its own, its commits were carried
+onto `sls_reth_vendor`, branched from `main`, without the tndb-b work they sat on. One commit comes
+first there: the move from reth's `reth` umbrella crate to its individual crates, taken from the
+tndb-b integration commit (9905e5468) without its database backend. The tags still name the
+commits on `sls_tndb_b_vendor`. At each one the `vendor/reth` tree is identical to the matching
+commit on `sls_reth_vendor`, so `git diff <tag> -- vendor/reth` gives the same result on both
+branches.
+
 ## D9. Keep MDBX compiled for now
 
 The tndb-b work (`tndb-b-reth`, the `tndb-b` feature) is replacing MDBX as TN's reth database,
