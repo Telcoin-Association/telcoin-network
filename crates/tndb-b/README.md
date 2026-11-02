@@ -40,7 +40,7 @@ does not depend on `tn-storage` or reth. reth's database API on top of it is a s
 | `crc.rs`, `page_set.rs` | copied from `crates/storage/src/archive/` (`page_set.rs` adds a touched-word list, so `clear` and `drain` cost the words touched, not the file) |
 | `disk_model.rs` | test-only page-cache and power-loss model |
 | `tests/`, `*/tests.rs` | crash, damage (nested cells and dup records included), dup tables against a composite-key model, multi-table model, merging, path cache, append, detached cursor, key tail, concurrency and read-only suites, per-module tests |
-| `bench.rs` | the on-demand benchmark of step 4's data sync and of merging, each against its test-only switch |
+| `bench.rs` | the on-demand benchmark of step 4's data sync and of merging, each against its test-only switch, and the on-demand probe of step 3's thread count (`stamp_probe`) |
 
 ## Milestones
 
@@ -1566,11 +1566,16 @@ it lands on, a multi-page overflow value in full).
     with it, and the comparison benchmark's 32 KiB puts at 16 KiB pages 1.45x as long, on an
     Apple M1 Max. With the store, both matched the old zero-filled pages. The store moves the
     page's first fault earlier and adds none, as the layout writes the page anyway.
-- **A large commit stamps its CRCs on up to 4 threads** (commit step 3, `stamp::threads`). The
+- **A large commit stamps its CRCs on up to 8 threads** (commit step 3, `stamp::threads`). The
   cap is also the CPUs the process may use (`std::thread::available_parallelism`, which on Linux
-  reads the cgroup quota; read once, at the first large commit). The CRC is memory-bound past
-  about 4 threads: on an Apple M1 Max, 400 MiB of 4 KiB units took 16.9 ms on one thread, 5.9 ms
-  on 4 and 4.5 ms on 8, and 2 MiB 84 us on one against 66 us on 2, the threshold. The commit
+  reads the cgroup quota; read once, at the first large commit). On an Apple M1 Max, 400 MiB of
+  4 KiB units took 16.9 ms on one thread, 5.9 ms on 4 and 4.5 ms on 8, and 2 MiB 84 us on one
+  against 66 us on 2, the threshold. Whole commits of ~100k tree pages (the stamp probe, medians)
+  stamped in 17.5 ms on one thread, 8.4 ms on 4, 6.7 ms on 6 and on 8, and 6.8 ms on 12: no
+  gain past about 6 to 8 threads there. On an Intel i7-1360P under Linux (4 performance cores
+  with two threads each and 8 efficiency cores), the same commits took 22.6 ms on one thread,
+  15.8 ms on 4, 12.0 ms on 8 and 10.9 ms on 12, and one thread's CRC ran at 39.9 GB/s over a
+  cache-resident buffer against 20.8 GB/s over a DRAM-resident one: bound by memory. The commit
   shares the machine with the node's other work, so it takes no more.
 
 ---
@@ -2015,8 +2020,9 @@ The default tests are small and fast, because CI runs nextest in debug. The heav
 
 ```text
 cargo nextest run -p tndb-b                                    # default suite (debug)
-cargo test --release -p tndb-b -- --ignored --skip tndb_b_sync_and_merge  # heavy variants (about 4–5 min)
+cargo test --release -p tndb-b -- --ignored --skip tndb_b_sync_and_merge --skip stamp_probe  # heavy variants (about 4–5 min)
 cargo test --release -p tndb-b tndb_b_sync_and_merge -- --ignored --nocapture --test-threads 1  # benchmark
+cargo test --release -p tndb-b stamp_probe -- --ignored --nocapture --test-threads 1  # step 3's probe
 ```
 
 ### Benchmark: step 4 and merging
@@ -2042,6 +2048,15 @@ cargo test --release -p tndb-b tndb_b_sync_and_merge -- --ignored --nocapture --
 `Durable` with 4 and 16 KiB pages; `t4n`, 4 KiB `NoSync`, which has no step 4 and runs only the
 first mode), and `TNDB_B_BENCH_ROWS` the groups (`small`, `churn`). Put the temp dir on a real disk
 (`TMPDIR`, scoped to the one command): on a tmpfs syncs cost nothing, and on Linux the run stops.
+
+**The stamp probe** (`stamp_probe`, also `#[ignore]`d) prices commit step 3 against its thread
+count. A durable environment of 4 KiB pages holds 400k keys with 999-byte values, four to a leaf;
+each measured commit replaces every value, so step 3 stamps about 100k private tree pages (~393
+MiB), written just before by copy-on-write. Each commit's `IoStats::stamp_ns` is read at 1, 2, 3,
+4, 6, 8 and 12 threads (`Writer::stamp_threads`), every count once a round in an order rotated
+each round, over 7 rounds: the median and least time per count, and GB/s. A second table gives one
+thread's `crc::crc32` rate over a 1 MiB buffer, repeated (cache-resident), and over a 400 MiB one
+(DRAM-resident): whether one thread's CRC is bound by its compute or by memory.
 
 **Merging** (Apple M1 Max, macOS, 2026-10-21, N = 300k, medians of three runs, at 4 KiB pages; code
 before the owned and detached cursors): after the churn the table took 2.3 MiB of pages, against
