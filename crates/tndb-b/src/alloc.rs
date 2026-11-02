@@ -83,6 +83,11 @@ pub(crate) struct Allocator {
     /// Test-only: fail the allocation after this many more succeed.
     #[cfg(test)]
     pub(crate) fail_allocs_after: Option<u64>,
+    /// Test-only: the commit's free-list save lists the pages the way it did before each list
+    /// was sorted once ([`Self::reusable_reference`], and a sort for the pool pages that spill
+    /// to `freed`), so a test can hold the records a commit writes to the old code's.
+    #[cfg(test)]
+    pub(crate) reference_save: bool,
     /// Test-only: `(txn, page)` for every page a transaction loaded from the free list.
     #[cfg(test)]
     pub(crate) load_log: Vec<(u64, u32)>,
@@ -124,6 +129,8 @@ impl Allocator {
             epoch: 1,
             #[cfg(test)]
             fail_allocs_after: None,
+            #[cfg(test)]
+            reference_save: false,
             #[cfg(test)]
             load_log: Vec::new(),
             #[cfg(test)]
@@ -261,7 +268,42 @@ impl Allocator {
     ///   still holds, and the transaction then took that page out of the tree.
     ///
     /// Any other duplicate (a page twice in the pool) is a broken invariant ([`Error::Failed`]).
+    /// The smallest duplicate page is the one reported.
+    ///
+    /// Each list is sorted once ([`sort_pages`]); [`first_duplicate`] then finds the smallest
+    /// duplicate in one linear pass over the two sorted lists.
     pub(crate) fn reusable(&self) -> Result<(Vec<u32>, Vec<u32>)> {
+        #[cfg(test)]
+        if self.reference_save {
+            return self.reusable_reference();
+        }
+        let mut pool = self.pool.clone();
+        sort_pages(&mut pool);
+        let mut freed = self.freed.clone();
+        sort_pages(&mut freed);
+        if let Some(p) = first_duplicate(&pool, &freed) {
+            let start = freed.partition_point(|&q| q < p);
+            let freed_count = freed[start..].partition_point(|&q| q == p);
+            if freed_count > 1 {
+                return Err(Error::Corrupt(format!(
+                    "page {p} left the published trees {freed_count} times: more than one \
+                     pointer names it"
+                )));
+            }
+            if self.loaded.contains(p) && pool.binary_search(&p).is_ok() && freed_count == 1 {
+                return Err(Error::Corrupt(format!(
+                    "free list: page {p} is listed free, yet a published tree held it"
+                )));
+            }
+            return Err(Error::Failed(format!("page {p} is free twice")));
+        }
+        Ok((pool, freed))
+    }
+
+    /// Test-only: [`Self::reusable`] as it was, one sort of both lists together to find the
+    /// duplicates and one more of each: the reference the oracle tests hold it to.
+    #[cfg(test)]
+    pub(crate) fn reusable_reference(&self) -> Result<(Vec<u32>, Vec<u32>)> {
         let mut pages: Vec<u32> = self.freed.iter().chain(&self.pool).copied().collect();
         pages.sort_unstable();
         if let Some(w) = pages.windows(2).find(|w| w[0] == w[1]) {
@@ -402,7 +444,7 @@ impl Allocator {
         let pages: Vec<u32> = self.private.drain().map(|p| p as u32).collect();
         let runs: Vec<(u32, u32)> = std::mem::take(&mut self.private_runs).into_iter().collect();
         let private = PrivatePages { pages, runs };
-        for (p, _, run) in private.walk() {
+        for (p, _, run) in private.units() {
             if !run {
                 self.stamped.insert(p);
             }
@@ -515,14 +557,10 @@ pub(crate) struct PrivatePages {
 }
 
 impl PrivatePages {
-    /// What gets one CRC each, ascending, as `(first page, pages)`: a tree page alone, and a run
-    /// as one unit (its CRC covers all its pages; its interior is never stamped page by page).
-    pub(crate) fn units(&self) -> impl Iterator<Item = (u32, u32)> + '_ {
-        self.walk().map(|(p, n, _)| (p, n))
-    }
-
-    /// [`Self::units`], each with whether it is a run.
-    fn walk(&self) -> impl Iterator<Item = (u32, u32, bool)> + '_ {
+    /// What gets one CRC each, ascending, as `(first page, pages, run)`: a tree page alone
+    /// (`run` false: the page CRC, `page::crc`), and a run as one unit (`run` true: its CRC
+    /// covers all its pages; its interior is never stamped page by page).
+    pub(crate) fn units(&self) -> impl Iterator<Item = (u32, u32, bool)> + '_ {
         let mut runs = self.runs.iter().peekable();
         let mut i = 0;
         std::iter::from_fn(move || {
@@ -542,6 +580,88 @@ impl PrivatePages {
             Some((p, n, run))
         })
     }
+}
+
+/// The bits of a page number one [`sort_pages`] pass orders by.
+const RADIX_BITS: u32 = 11;
+
+/// Lists shorter than this are sorted by comparison: a radix pass costs its counters too.
+const RADIX_MIN: usize = 1024;
+
+/// Sort page numbers ascending: an LSD radix sort, [`RADIX_BITS`] of the number a pass, which
+/// skips a pass whose digit every page shares (the high bits of a file's page numbers mostly
+/// are). A commit's lists hold about as many pages as it wrote, so a comparison sort's
+/// `log n` factor is what this saves.
+pub(crate) fn sort_pages(pages: &mut Vec<u32>) {
+    const DIGITS: usize = 1 << RADIX_BITS;
+    const PASSES: usize = 32_usize.div_ceil(RADIX_BITS as usize);
+    let n = pages.len();
+    if n < RADIX_MIN {
+        pages.sort_unstable();
+        return;
+    }
+    let digit = |p: u32, pass: usize| (p >> (pass as u32 * RADIX_BITS)) as usize & (DIGITS - 1);
+    let mut counts = vec![[0usize; DIGITS]; PASSES];
+    for &p in pages.iter() {
+        for (pass, count) in counts.iter_mut().enumerate() {
+            count[digit(p, pass)] += 1;
+        }
+    }
+    let mut scratch = vec![0u32; n];
+    for (pass, count) in counts.iter_mut().enumerate() {
+        if count.contains(&n) {
+            continue;
+        }
+        let mut next = 0;
+        for c in count.iter_mut() {
+            let here = *c;
+            *c = next;
+            next += here;
+        }
+        for &p in pages.iter() {
+            let d = digit(p, pass);
+            scratch[count[d]] = p;
+            count[d] += 1;
+        }
+        std::mem::swap(pages, &mut scratch);
+    }
+}
+
+/// The smallest page listed more than once in `a` and `b` together (each ascending): the least
+/// of the first repeat inside `a`, the first inside `b`, and the first page in both. One linear
+/// pass each; the cross check steps both lists without a data-dependent branch.
+fn first_duplicate(a: &[u32], b: &[u32]) -> Option<u32> {
+    let repeat = |l: &[u32]| l.windows(2).find(|w| w[0] == w[1]).map(|w| w[0]);
+    let (mut i, mut j) = (0, 0);
+    let mut both = None;
+    while i < a.len() && j < b.len() {
+        let (x, y) = (a[i], b[j]);
+        if x == y {
+            both = Some(x);
+            break;
+        }
+        i += usize::from(x < y);
+        j += usize::from(y < x);
+    }
+    [repeat(a), repeat(b), both].into_iter().flatten().min()
+}
+
+/// `a` and `b` (each ascending) as one ascending list: what sorting their concatenation gives.
+pub(crate) fn merge_sorted(a: &[u32], b: &[u32]) -> Vec<u32> {
+    let mut out = Vec::with_capacity(a.len() + b.len());
+    let (mut i, mut j) = (0, 0);
+    while i < a.len() && j < b.len() {
+        if a[i] <= b[j] {
+            out.push(a[i]);
+            i += 1;
+        } else {
+            out.push(b[j]);
+            j += 1;
+        }
+    }
+    out.extend_from_slice(&a[i..]);
+    out.extend_from_slice(&b[j..]);
+    out
 }
 
 #[cfg(test)]
@@ -735,7 +855,10 @@ mod tests {
         let private = a.stamp_private();
         assert_eq!(private.pages, (2..10).collect::<Vec<_>>(), "every page, for the data sync");
         let units: Vec<_> = private.units().collect();
-        assert_eq!(units, [(p, 1), (r, 3), (q, 1), (one, 1), (r2, 2)]);
+        assert_eq!(
+            units,
+            [(p, 1, false), (r, 3, true), (q, 1, false), (one, 1, true), (r2, 2, true)]
+        );
         assert!(a.is_stamped(p) && a.is_stamped(q));
         assert!((r..r + 3).chain([one, r2, r2 + 1]).all(|x| !a.is_stamped(x)), "run pages");
         assert!(!a.is_private_run(r) && !a.is_private(r));
@@ -838,5 +961,233 @@ mod tests {
         assert_eq!(a.allocate(|_| Ok(())).expect("last"), NULL_PGNO - 1);
         assert!(matches!(a.allocate(|_| Ok(())), Err(Error::Failed(_))));
         assert_eq!(a.page_count(), NULL_PGNO);
+    }
+
+    /// A random allocator state for the [`Allocator::reusable`] oracle: `pool` and `freed` of
+    /// up to `max` distinct pages each, drawn from a span of 64 pages up to `top` pages,
+    /// some pool pages loaded, then, by the case's bits, a duplicate of each kind: a page twice
+    /// in `freed`, a loaded pool page also freed, an unloaded page in both, a page twice in the
+    /// pool, and a page twice freed and in the pool.
+    fn random_state(rng: &mut crate::tree::test_harness::Rng, max: usize, top: u64) -> Allocator {
+        let span = match rng.below(4) {
+            0 => 64,
+            1 => 1 << 16,
+            2 => 1 << 24,
+            _ => top,
+        };
+        let cap = usize::try_from(span / 4).unwrap_or(usize::MAX).min(max);
+        let mut seen = std::collections::HashSet::new();
+        let mut draw = |rng: &mut crate::tree::test_harness::Rng, n: usize| -> Vec<u32> {
+            let mut out = Vec::with_capacity(n);
+            while out.len() < n {
+                let p = 2 + rng.below(span) as u32;
+                if seen.insert(p) {
+                    out.push(p);
+                }
+            }
+            out
+        };
+        let mut a = Allocator::new(1, u32::MAX);
+        let n = rng.len_upto(cap);
+        a.pool = draw(rng, n);
+        let n = rng.len_upto(cap);
+        a.freed = draw(rng, n);
+        for &p in &a.pool {
+            if rng.below(3) == 0 {
+                a.loaded.insert(p);
+            }
+        }
+        let bits = rng.below(64);
+        let pick = |rng: &mut crate::tree::test_harness::Rng, v: &[u32]| {
+            (!v.is_empty()).then(|| v[rng.below(v.len() as u64) as usize])
+        };
+        let at = |rng: &mut crate::tree::test_harness::Rng, v: &mut Vec<u32>, p: u32| {
+            let i = rng.below(v.len() as u64 + 1) as usize;
+            v.insert(i, p);
+        };
+        if bits & 1 != 0 {
+            if let Some(p) = pick(rng, &a.freed) {
+                at(rng, &mut a.freed, p);
+            }
+        }
+        if bits & 2 != 0 {
+            if let Some(p) = pick(rng, &a.pool) {
+                a.loaded.insert(p);
+                at(rng, &mut a.freed, p);
+            }
+        }
+        if bits & 4 != 0 {
+            if let Some(p) = pick(rng, &a.freed) {
+                at(rng, &mut a.pool, p);
+            }
+        }
+        if bits & 8 != 0 {
+            if let Some(p) = pick(rng, &a.pool) {
+                at(rng, &mut a.pool, p);
+            }
+        }
+        if bits & 16 != 0 {
+            if let Some(p) = pick(rng, &a.freed) {
+                at(rng, &mut a.freed, p);
+                at(rng, &mut a.pool, p);
+                if bits & 32 != 0 {
+                    a.loaded.insert(p);
+                }
+            }
+        }
+        a
+    }
+
+    /// The oracle: [`Allocator::reusable`] gives what [`Allocator::reusable_reference`] (the
+    /// combined sort it replaced) gives, the same `(pool, freed)` or the same error, by variant
+    /// and message, over `cases` random states with and without each kind of duplicate, of up to
+    /// `sizes[0]` pages a list in one case of 50, `sizes[1]` in five, `sizes[2]` in the rest,
+    /// drawn from up to `top` page numbers; every outcome occurs.
+    fn reusable_oracle(seed: u64, cases: u32, sizes: [usize; 3], top: u64) {
+        let mut rng = crate::tree::test_harness::Rng(seed);
+        let mut seen = [0_u32; 4];
+        for case in 0..cases {
+            let max = match case % 50 {
+                0 => sizes[0],
+                1..=5 => sizes[1],
+                _ => sizes[2],
+            };
+            let a = random_state(&mut rng, max, top);
+            let (got, want) = (a.reusable(), a.reusable_reference());
+            let outcome = match (&got, &want) {
+                (Ok(got), Ok(want)) => {
+                    assert_eq!(got, want, "case {case}");
+                    0
+                }
+                (Err(g), Err(w)) => {
+                    assert_eq!(format!("{g:?}"), format!("{w:?}"), "case {case}");
+                    let m = format!("{w:?}");
+                    if m.contains("left the published trees") {
+                        1
+                    } else if m.contains("listed free, yet") {
+                        2
+                    } else {
+                        3
+                    }
+                }
+                _ => panic!("case {case}: {got:?} against the reference's {want:?}"),
+            };
+            seen[outcome] += 1;
+        }
+        assert!(seen.iter().all(|&n| n > 0), "every outcome: {seen:?}");
+    }
+
+    /// [`reusable_oracle`] on lists of up to 20K pages of up to 2^26 page numbers (`loaded`, a
+    /// bit set, stays small).
+    #[test]
+    fn reusable_matches_the_reference() {
+        reusable_oracle(0x0a11_0c5a_7e00_0001, 300, [20_000, 5_000, 1_000], 1 << 26);
+    }
+
+    /// [`reusable_oracle`] on lists of up to 200K pages, a peak commit's, of every page number.
+    #[test]
+    #[ignore = "heavy: run with --release"]
+    fn reusable_matches_the_reference_heavy() {
+        let top = u64::from(u32::MAX) - 2;
+        reusable_oracle(0x0a11_0c5a_7e00_0002, 400, [200_000, 20_000, 2_000], top);
+    }
+
+    /// [`sort_pages`] sorts as a comparison sort does over `cases` lists: either side of
+    /// [`RADIX_MIN`] or up to `max` pages, with duplicates, and page numbers whose high digits
+    /// vary or are shared.
+    fn sort_oracle(seed: u64, cases: usize, max: usize) {
+        let mut rng = crate::tree::test_harness::Rng(seed);
+        for case in 0..cases {
+            let n = match case % 4 {
+                0 => rng.len_upto(RADIX_MIN * 2),
+                1 => RADIX_MIN - 1 + rng.below(3) as usize,
+                _ => rng.len_upto(max),
+            };
+            let span = [16_u64, 1 << 11, 1 << 22, 1 << 32][case % 4];
+            let span = if case % 8 >= 4 { 1 << 32 } else { span };
+            let base = if case % 16 >= 8 { u32::MAX - span.min(1 << 31) as u32 } else { 0 };
+            let mut v: Vec<u32> =
+                (0..n).map(|_| base.wrapping_add(rng.below(span) as u32)).collect();
+            let mut want = v.clone();
+            want.sort_unstable();
+            sort_pages(&mut v);
+            assert_eq!(v, want, "case {case}: {n} pages");
+        }
+    }
+
+    /// [`sort_oracle`] on lists of up to 20K pages.
+    #[test]
+    fn sort_pages_matches_a_comparison_sort() {
+        sort_oracle(0x50a7_0000_0000_0001, 200, 20_000);
+    }
+
+    /// [`sort_oracle`] on lists of up to 400K pages, a peak commit's two lists together.
+    #[test]
+    #[ignore = "heavy: run with --release"]
+    fn sort_pages_matches_a_comparison_sort_heavy() {
+        sort_oracle(0x50a7_0000_0000_0002, 400, 400_000);
+    }
+
+    /// [`merge_sorted`] gives what sorting the two lists' concatenation gives.
+    #[test]
+    fn merge_sorted_matches_a_sort() {
+        let mut rng = crate::tree::test_harness::Rng(0x3e26_0000_0000_0001);
+        for case in 0..200 {
+            let list = |rng: &mut crate::tree::test_harness::Rng| {
+                let n = rng.len_upto(3_000);
+                let mut v: Vec<u32> = (0..n).map(|_| rng.below(5_000) as u32).collect();
+                v.sort_unstable();
+                v
+            };
+            let (a, b) = (list(&mut rng), list(&mut rng));
+            let mut want = [a.clone(), b.clone()].concat();
+            want.sort_unstable();
+            assert_eq!(merge_sorted(&a, &b), want, "case {case}");
+        }
+    }
+
+    /// On-demand probe: [`Allocator::reusable`] against [`Allocator::reusable_reference`], and
+    /// [`sort_pages`] against `sort_unstable`, on a peak commit's lists (100K freed pages, 100K
+    /// pool pages, distinct, of a 4M-page file). Run with
+    /// `cargo test --release -p tndb-b reusable_probe -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "on-demand probe; run with --release --ignored --nocapture"]
+    fn reusable_probe() {
+        let mut rng = crate::tree::test_harness::Rng(0x9e0b_0000_0000_0001);
+        let mut a = Allocator::new(1, u32::MAX);
+        let mut pages: Vec<u32> = (2..4_000_002).collect();
+        for i in (1..pages.len()).rev() {
+            pages.swap(i, rng.below(i as u64 + 1) as usize);
+        }
+        a.pool = pages[..100_000].to_vec();
+        a.freed = pages[100_000..200_000].to_vec();
+        let time = |f: &mut dyn FnMut()| {
+            let mut ns: Vec<u128> = (0..21)
+                .map(|_| {
+                    let t = std::time::Instant::now();
+                    f();
+                    t.elapsed().as_nanos()
+                })
+                .collect();
+            ns.sort_unstable();
+            ns[ns.len() / 2] as f64 / 1e6
+        };
+        let reference = time(&mut || drop(std::hint::black_box(a.reusable_reference())));
+        let new = time(&mut || drop(std::hint::black_box(a.reusable())));
+        let comparison = time(&mut || {
+            let mut v = a.pool.clone();
+            v.sort_unstable();
+            std::hint::black_box(v);
+        });
+        let radix = time(&mut || {
+            let mut v = a.pool.clone();
+            sort_pages(&mut v);
+            std::hint::black_box(v);
+        });
+        println!(
+            "\nreusable probe, 100K + 100K pages (medians of 21): reference {reference:.3} ms, \
+             reusable {new:.3} ms; one 100K list: sort_unstable {comparison:.3} ms, sort_pages \
+             {radix:.3} ms"
+        );
     }
 }

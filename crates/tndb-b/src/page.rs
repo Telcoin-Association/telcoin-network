@@ -8,7 +8,7 @@
 //! slots:        nkeys × u16 cell offsets from byte 24; slot i addresses cell i (key order)
 //! free space:   from the end of the slot array up to `upper`
 //! cells:        packed from `upper` up to P − 4, in no particular order
-//! trailer (4):  CRC32, stamped at commit (all zeros = dirty); this codec only zeroes it
+//! trailer (4):  CRC32 of the page outside its free gap, stamped at commit (all zeros = dirty)
 //!
 //! leaf cell:    vlen u32 | klen u16 | flags u16 | key | value
 //! branch cell:  child u32 | child_txn u32 | klen u16 | key
@@ -27,6 +27,14 @@
 //! `free + used == U` always holds, where `U = P − 28` (header and trailer). Nothing reads the
 //! gap, so it need not be zero: [`init_header`] lays out a page over whatever bytes it holds,
 //! writing the header and zeroing the trailer (dirty), and the gap keeps the old bytes.
+//!
+//! **The CRC.** The trailer holds the CRC-32 of `page[..24 + 2·nkeys]` followed by
+//! `page[upper..P − 4]`: the header and the slots, then the cells, every byte a reader
+//! interprets ([`crc`], [`stamp`], [`crc_state`]). The gap is not hashed. The span comes from the
+//! header ([`free_gap`]): a header whose slots pass `upper`, or whose `upper` passes the trailer,
+//! gives no gap, and its page is hashed whole before the trailer. `nkeys` and `upper` are covered
+//! bytes, so a header damaged after the stamp fails the check. This codec only zeroes the trailer
+//! (dirty); commit stamps it.
 //!
 //! **Branches** hold one cell per child (each a key and a child): cell i's key is the lower bound
 //! of child i's key range, and cell 0's key is empty and stands for −∞, so the child for a key is
@@ -57,9 +65,10 @@
 //! the per-cell checks. The free readers ([`leaf_find`], [`branch_route`], [`keys_in_range`], ...)
 //! are the views' methods behind a fresh header check.
 
-use std::{cmp::Ordering, fmt::Display};
+use std::{cmp::Ordering, fmt::Display, ops::Range};
 
 use crate::{
+    crc::{self, CrcState},
     error::{Error, Result},
     overflow::{self, Ovf, MAX_VALUE, OVF_CELL},
     tree::TreeRoot,
@@ -559,7 +568,7 @@ fn init(page: &mut [u8], kind: Kind, pgno: u32, txn: u64) {
 /// page the writer just allocated (`PageWrite::alloc`, whose bytes are not zeroed). It writes
 /// every byte a reader of an empty page interprets, the whole header (its flags and reserved
 /// bytes zero) and the trailer (zero: dirty), and leaves the rest, the empty page's free gap, as
-/// it is: nothing reads the gap, and the CRC covers it as it is.
+/// it is: nothing reads the gap, and the CRC skips it ([`crc`]).
 fn init_header(page: &mut [u8], kind: Kind, pgno: u32, txn: u64) {
     debug_assert!(valid_len(page.len()), "page buffer of {} bytes", page.len());
     let trailer = page.len() - TRAILER;
@@ -595,6 +604,95 @@ pub(crate) fn init_branch(page: &mut [u8], pgno: u32, txn: u64) {
 pub(crate) fn set_pgno_txn(page: &mut [u8], pgno: u32, txn: u64) {
     put_u32(page, PGNO_OFF, pgno);
     put_u64(page, TXN_OFF, txn);
+}
+
+// ---- the page CRC ----
+//
+// A tree page's trailer holds the CRC-32 of the page outside its free gap: the header and the
+// slots, then the cells. Nothing reads the gap, so its bytes need not be hashed. Overflow runs
+// keep the whole-run CRC (`crc::add_crc32_nonzero`), and meta pages their own codec.
+
+/// The free gap of tree page `page`, `HEADER + SLOT·nkeys .. upper` (empty on a full page), as
+/// its header gives it; `None` when that header gives no gap, its slots passing `upper` or its
+/// `upper` passing the trailer. The one rule both [`crc`] and copy-on-write
+/// (`tree::write::copy_page`) follow: a page with no gap is hashed and copied whole.
+pub(crate) fn free_gap(page: &[u8]) -> Option<Range<usize>> {
+    let (lower, upper) = (HEADER + SLOT * nkeys(page), upper(page));
+    (lower <= upper && upper <= page.len().checked_sub(TRAILER)?).then_some(lower..upper)
+}
+
+/// The CRC tree page `page`'s trailer holds once stamped: the CRC-32 of `page[..lower]` followed
+/// by `page[upper..P − 4]` around its [`free_gap`], else of the whole `page[..P − 4]`. A CRC of 0
+/// becomes the all-ones sentinel, as `crc::add_crc32_nonzero` maps it, so a stamped trailer never
+/// reads as the all-zero dirty marker.
+///
+/// A header damaged after its stamp gives a different span or different bytes in it, so the
+/// page fails its check: `nkeys` and `upper` are covered bytes themselves.
+///
+/// A full page (an empty gap) is hashed in one pass over `page[..P − 4]`, the same bytes in the
+/// same order, so the same CRC, without the second call.
+pub(crate) fn crc(page: &[u8]) -> u32 {
+    let end = page.len().saturating_sub(TRAILER);
+    let crc = match free_gap(page) {
+        Some(gap) if !gap.is_empty() => {
+            crc::crc32_update(crc::crc32(&page[..gap.start]), &page[gap.end..end])
+        }
+        _ => crc::crc32(&page[..end]),
+    };
+    if crc == 0 {
+        u32::MAX
+    } else {
+        crc
+    }
+}
+
+/// Stamp tree page `page`'s trailer with its [`crc`]: a no-op on fewer than 5 bytes, like
+/// `crc::add_crc32_nonzero`.
+pub(crate) fn stamp(page: &mut [u8]) {
+    let len = page.len();
+    debug_assert!(len >= 5, "a page CRC needs at least 5 bytes (>=1 payload byte + 4 crc bytes)");
+    if len >= 5 {
+        let crc = crc(page);
+        page[len - TRAILER..].copy_from_slice(&crc.to_le_bytes());
+    }
+}
+
+/// Classify tree page `page` by its trailer: all zero is [`CrcState::Dirty`], its [`crc`] is
+/// [`CrcState::Valid`], anything else (or fewer than 5 bytes) is [`CrcState::Corrupt`]. It
+/// computes the CRC unless the page is dirty; `crc::crc_is_zero` is the check that computes
+/// nothing.
+pub(crate) fn crc_state(page: &[u8]) -> CrcState {
+    let len = page.len();
+    if len < 5 {
+        CrcState::Corrupt
+    } else if page[len - TRAILER..] == [0; TRAILER] {
+        CrcState::Dirty
+    } else if page[len - TRAILER..] == crc(page).to_le_bytes() {
+        CrcState::Valid
+    } else {
+        CrcState::Corrupt
+    }
+}
+
+/// Byte offsets of tree page `page` in every region its [`crc`] covers, for the damage tests:
+/// the header (`pgno`, `nkeys` both bytes, `txn`, `upper` both bytes), slot 0, the first and
+/// the last cell byte, and the trailer's first and last byte.
+#[cfg(test)]
+pub(crate) fn covered_offsets(page: &[u8]) -> [usize; 11] {
+    let len = page.len();
+    [
+        PGNO_OFF,
+        NKEYS_OFF,
+        NKEYS_OFF + 1,
+        TXN_OFF,
+        UPPER_OFF,
+        UPPER_OFF + 1,
+        HEADER,
+        upper(page),
+        len - TRAILER - 1,
+        len - TRAILER,
+        len - 1,
+    ]
 }
 
 #[inline]
@@ -1073,6 +1171,59 @@ impl<'a> View<'a> {
         match self {
             Self::Leaf(v) => v.keys_in_range(lo, hi),
             Self::Branch(v) => v.keys_in_range(lo, hi),
+        }
+    }
+
+    /// The number of cells.
+    #[inline]
+    pub(crate) fn nkeys(&self) -> usize {
+        self.hdr().nkeys
+    }
+
+    /// The slot a search's first probe reads: the midpoint of `[0, nkeys)` for a leaf's
+    /// ([`LeafView::search`], [`LeafView::find`]), of `[1, nkeys)` for a branch's
+    /// ([`BranchView::route`]; no slot, `nkeys`, for a single-child branch, whose route reads
+    /// cell 0, a cell no search probes).
+    #[inline]
+    pub(crate) fn first_probe(&self) -> usize {
+        let n = self.nkeys();
+        match self {
+            Self::Leaf(_) => n / 2,
+            Self::Branch(_) if n > 1 => 1 + (n - 1) / 2,
+            Self::Branch(_) => n,
+        }
+    }
+
+    /// Start loading into the CPU cache the cells a descent reads first at this level, so their
+    /// cache misses overlap instead of following one another: the first key's cell (cell 0 of a
+    /// leaf, cell 1 of a branch) and the last key's, which the range check
+    /// ([`Self::keys_in_range`]) reads, and cell `probe`, the one the level's search or route
+    /// reads first ([`Self::first_probe`], or a hinted slot). Only a hint, as
+    /// [`prefetch_next_probes`]: it reads slots below `nkeys` only ([`hdr`] passed, so they lie
+    /// below `upper`), a `probe` past them reads nothing, it touches no byte past the page, and it
+    /// changes no result.
+    #[inline(always)]
+    pub(crate) fn prefetch_level(&self, probe: usize) {
+        let (page, h) = match self {
+            Self::Leaf(v) => (v.page, &v.h),
+            Self::Branch(v) => (v.page, &v.h),
+        };
+        let first = usize::from(h.kind == Kind::Branch);
+        if h.nkeys > first {
+            prefetch_cell(page, first);
+            prefetch_cell(page, h.nkeys - 1);
+        }
+        if probe < h.nkeys {
+            prefetch_cell(page, probe);
+        }
+    }
+
+    /// The header [`hdr`] parsed.
+    #[inline(always)]
+    fn hdr(&self) -> &Hdr {
+        match self {
+            Self::Leaf(v) => &v.h,
+            Self::Branch(v) => &v.h,
         }
     }
 }
@@ -2390,6 +2541,74 @@ mod tests {
         unreachable!("specs is never empty")
     }
 
+    /// The page CRC of valid page `page` against its model: with noise in its free gap, [`crc`]
+    /// is the CRC-32 of `page[..lower]` followed by `page[upper..P − 4]` (0 mapped to the
+    /// sentinel), and the stamped page reads `Valid`. Then two copies whose headers give no gap,
+    /// slots past `upper` and `upper` past the trailer, have the whole-page CRC.
+    fn assert_page_crc_model(page: &mut [u8], at: &str) {
+        let nonzero = |crc: u32| if crc == 0 { u32::MAX } else { crc };
+        let (len, lower, upper) = (page.len(), HEADER + SLOT * nkeys(page), upper(page));
+        assert_eq!(free_gap(page), Some(lower..upper), "{at}");
+        for (i, b) in page[lower..upper].iter_mut().enumerate() {
+            *b ^= 0x5A ^ i as u8;
+        }
+        let model = [&page[..lower], &page[upper..len - TRAILER]].concat();
+        assert_eq!(crc(page), nonzero(crc::crc32(&model)), "{at}: the bytes outside the gap");
+        stamp(page);
+        assert!(crc_state(page) == CrcState::Valid, "{at}: stamped");
+        let whole = |page: &[u8]| nonzero(crc::crc32(&page[..len - TRAILER]));
+        let mut slots_past = page.to_vec();
+        put_u16(&mut slots_past, NKEYS_OFF, (upper - HEADER) / SLOT + 1);
+        assert_eq!(free_gap(&slots_past), None, "{at}: slots past upper");
+        assert_eq!(crc(&slots_past), whole(&slots_past), "{at}: slots past upper, whole");
+        let mut upper_past = page.to_vec();
+        put_u16(&mut upper_past, UPPER_OFF, len - TRAILER + 1);
+        assert_eq!(free_gap(&upper_past), None, "{at}: upper past the trailer");
+        assert_eq!(crc(&upper_past), whole(&upper_past), "{at}: upper past the trailer, whole");
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(64))]
+
+        /// A leaf or a branch, at every page size, from empty to full (an empty gap, through
+        /// [`top_up`]): after each insert, the page CRC is the model's
+        /// ([`assert_page_crc_model`]).
+        #[test]
+        fn the_page_crc_covers_the_page_outside_its_gap(
+            size in select(&SIZES[..]),
+            branch in any::<bool>(),
+            specs in vec(spec(), 0..40),
+        ) {
+            let g = geometry(size);
+            let mut page = fresh(&g, if branch { Kind::Branch } else { Kind::Leaf });
+            if branch {
+                prop_assert_eq!(branch_insert(&mut page, 0, &[], 7, 9).unwrap(), Fit::Done);
+            }
+            assert_page_crc_model(&mut page, "empty");
+            for (n, s) in specs.iter().enumerate() {
+                let key = ranked_key(2 * n as u32 + 1, s.klen(&g));
+                let free = free_space(&page).unwrap();
+                let fit = if branch {
+                    if cell_size_branch(key.len()) + SLOT + TOP_UP_ROOM > free {
+                        break;
+                    }
+                    branch_insert(&mut page, n + 1, &key, n as u32, 3)
+                } else {
+                    let value = s.value(&g, key.len());
+                    if cell_size_leaf(key.len(), value.len()) + SLOT + TOP_UP_ROOM > free {
+                        break;
+                    }
+                    leaf_insert(&mut page, n, &key, &value)
+                };
+                prop_assert_eq!(fit.unwrap(), Fit::Done);
+                assert_page_crc_model(&mut page, &format!("{} keys", n + 1));
+            }
+            top_up(&g, &mut page);
+            prop_assert_eq!(free_space(&page).unwrap(), 0);
+            assert_page_crc_model(&mut page, "full");
+        }
+    }
+
     #[test]
     fn entry_limits_are_exact() {
         for size in SIZES {
@@ -3232,6 +3451,65 @@ mod tests {
             sel in any::<usize>(),
         ) {
             exercise(&damaged_page(seed, size, flips), &key, sel);
+        }
+
+        #[test]
+        fn level_prefetch_never_panics_on_damaged_pages(
+            seed in any::<u64>(),
+            size in select(&SIZES[..]),
+            flips in 1_usize..6,
+            shaped in any::<bool>(),
+        ) {
+            prefetch_every_probe(&damaged_page(seed, size, flips));
+            prefetch_every_probe(&noise_page(seed, size as usize, shaped));
+        }
+    }
+
+    /// [`View::prefetch_level`] on `page`, if its header parses, with every class of probe: the
+    /// first slots, the search's first probe, the last slot, one and two past it, and slots past
+    /// the slot array and the page. It only hints, so what this shows is that it never panics.
+    fn prefetch_every_probe(page: &[u8]) {
+        let Ok(view) = View::new(page) else { return };
+        let n = view.nkeys();
+        for probe in
+            [0, 1, view.first_probe(), n.saturating_sub(1), n, n + 1, page.len(), usize::MAX]
+        {
+            view.prefetch_level(probe);
+        }
+    }
+
+    /// A level's prefetch reads only slots below `nkeys` and cells inside the page: a leaf and a
+    /// branch of every page size, at every key count from empty to full, as built and with every
+    /// slot pointing past the page or at its last byte.
+    #[test]
+    fn level_prefetch_stays_inside_the_page_from_empty_to_full() {
+        for size in SIZES {
+            let g = geometry(size);
+            for kind in [Kind::Leaf, Kind::Branch] {
+                let mut page = fresh(&g, kind);
+                if kind == Kind::Branch {
+                    assert_eq!(branch_insert(&mut page, 0, &[], 1, 1).unwrap(), Fit::Done);
+                }
+                for i in 1_u32.. {
+                    prefetch_every_probe(&page);
+                    let n = nkeys(&page);
+                    for bad in [usize::from(u16::MAX), page.len() - 1] {
+                        let mut damaged = page.clone();
+                        for s in 0..n {
+                            put_u16(&mut damaged, HEADER + SLOT * s, bad);
+                        }
+                        prefetch_every_probe(&damaged);
+                    }
+                    let key = ranked_key(i, 16);
+                    let fit = match kind {
+                        Kind::Leaf => leaf_insert(&mut page, i as usize - 1, &key, b"v"),
+                        Kind::Branch => branch_insert(&mut page, i as usize, &key, i, i),
+                    };
+                    if fit.unwrap() == Fit::Full {
+                        break;
+                    }
+                }
+            }
         }
     }
 

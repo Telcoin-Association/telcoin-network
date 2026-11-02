@@ -32,8 +32,10 @@ use crate::{
 /// The first 8 bytes of every meta record.
 pub(crate) const MAGIC: [u8; 8] = *b"tndb-b\0\0";
 
-/// The on-disk format version this build reads and writes.
-pub(crate) const FORMAT_VERSION: u32 = 3;
+/// The on-disk format version this build reads and writes: 4, whose tree pages' CRCs skip their
+/// free gaps (`page::crc`). Version 3's pages carry whole-page CRCs, and it is refused as
+/// [`Error::UnsupportedVersion`], as are 2 and 1: the format is pre-release, with no migration.
+pub(crate) const FORMAT_VERSION: u32 = 4;
 
 /// The size of a meta record (at offset 0 of its page).
 pub(crate) const META_LEN: usize = 128;
@@ -47,7 +49,7 @@ const CATALOG: std::ops::Range<usize> = 32..32 + TreeRoot::ENCODED_LEN;
 /// Where the free tree's [`TreeRoot`] lies.
 const FREE: std::ops::Range<usize> = CATALOG.end..CATALOG.end + TreeRoot::ENCODED_LEN;
 
-/// The bytes the format reserves (zero in version 3).
+/// The bytes the format reserves (zero in version 4).
 const RESERVED: std::ops::Range<usize> = FREE.end..CRC_AT;
 
 /// Every page size a file can have, smallest first: where meta 1 may lie when meta 0 cannot be
@@ -460,21 +462,43 @@ mod tests {
         assert!(refused(choose(&image(4096, None, Some(newer)))));
     }
 
+    /// A record of format `version` is refused before its CRC, stamped or not, by `decode` and
+    /// by `choose_meta`.
+    fn assert_version_refused(version: u32) {
+        for stamp in [false, true] {
+            let mut rec = meta(4096, 5).encode();
+            rec[8..12].copy_from_slice(&version.to_le_bytes());
+            if stamp {
+                restamp(&mut rec);
+            }
+            let decoded = Meta::decode(&rec);
+            assert!(
+                matches!(decoded, Err(Error::UnsupportedVersion(v)) if v == version),
+                "version {version}, stamped {stamp}"
+            );
+            let chosen = choose(&image(4096, Some(rec), Some(rec)));
+            assert!(
+                matches!(chosen, Err(Error::UnsupportedVersion(v)) if v == version),
+                "version {version}, stamped {stamp}"
+            );
+        }
+    }
+
     /// A version-2 record (a 56-byte table record, no nested cells) is refused before its CRC,
     /// stamped or not: the format is pre-release, with no migration.
     #[test]
     fn a_version_2_record_is_refused() {
-        assert_eq!(FORMAT_VERSION, 3);
-        for stamp in [false, true] {
-            let mut rec = meta(4096, 5).encode();
-            rec[8..12].copy_from_slice(&2_u32.to_le_bytes());
-            if stamp {
-                restamp(&mut rec);
-            }
-            assert!(matches!(Meta::decode(&rec), Err(Error::UnsupportedVersion(2))), "{stamp}");
-            let file = image(4096, Some(rec), Some(rec));
-            assert!(matches!(choose(&file), Err(Error::UnsupportedVersion(2))), "{stamp}");
-        }
+        assert_eq!(FORMAT_VERSION, 4);
+        assert_version_refused(2);
+    }
+
+    /// A version-3 record (tree pages CRC'd whole, their free gaps included) is refused before
+    /// its CRC, stamped or not, never read as damage: the format is pre-release, with no
+    /// migration.
+    #[test]
+    fn a_version_3_record_is_refused() {
+        assert_eq!(FORMAT_VERSION, 4);
+        assert_version_refused(3);
     }
 
     /// The commit writes over the lower txn, an invalid slot first, slot 1 on a tie.

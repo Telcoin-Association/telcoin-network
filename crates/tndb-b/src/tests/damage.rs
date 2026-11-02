@@ -160,7 +160,7 @@ pub(super) fn write_page(path: &Path, pgno: u32, page: &[u8]) {
 pub(super) fn restamped(path: &Path, pgno: u32, edit: impl FnOnce(&mut [u8])) {
     let mut page = read_page(path, pgno);
     edit(&mut page);
-    crc::add_crc32_nonzero(&mut page);
+    page::stamp(&mut page);
     write_page(path, pgno, &page);
 }
 
@@ -268,7 +268,7 @@ fn damage_at_rest_fails_closed_or_latches() {
     let fx = fixture();
     let at = places(&fx.path);
     let stale = read_page(&fx.path, fx.stale);
-    assert!(crc::crc_state(&stale) == crc::CrcState::Valid, "the stale copy is intact");
+    assert!(page::crc_state(&stale) == crc::CrcState::Valid, "the stale copy is intact");
     assert_eq!(page::pgno(&stale), fx.stale);
     let current = read_page(&fx.path, at.t_leaf);
     assert!(page::txn(&stale) < page::txn(&current), "{at:?}");

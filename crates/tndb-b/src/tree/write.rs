@@ -1124,6 +1124,9 @@ fn descend_write<'s, S: PageWrite + ?Sized>(
             )));
         }
         if !trusted {
+            // The range check's cells and the first probe (the level's hinted slot, else the
+            // search's), loading at once.
+            view.prefetch_level(hint.first().map_or_else(|| view.first_probe(), |&s| s.into()));
             if !store.is_stamped(pgno) {
                 match verify {
                     Verify::Now => {
@@ -1522,7 +1525,7 @@ fn verify_published<S: PageWrite + ?Sized>(
 fn check_published(page: &[u8], geometry: &Geometry) -> Result<()> {
     #[cfg(all(test, debug_assertions))]
     COW_VERIFIES.with(|n| n.set(n.get() + 1));
-    if crc::crc_state(page) != CrcState::Valid {
+    if page::crc_state(page) != CrcState::Valid {
         return Err(Error::Corrupt(format!(
             "page {} fails its CRC (at-rest corruption); refusing to copy it",
             page::pgno(page)
@@ -1680,22 +1683,21 @@ fn writable<S: PageWrite + ?Sized>(store: &mut S, p: u32, scratch: &mut Scratch)
 /// are one page, else a broken invariant ([`Error::Failed`]), never a panic.
 ///
 /// The header and slots, then the cells and the trailer: the free gap between the end of the
-/// slots and `upper` keeps `dst`'s old bytes, which nothing reads and the commit's CRC covers
-/// as they are (README do-not-flag 17). Every caller's `src` is a tree page that passed the
-/// fetch checks and, before its first change, [`page::validate`]; a header whose slots pass
-/// `upper`, or whose `upper` passes the trailer, is no such page and is copied whole, so the
-/// checks after the copy see `src`'s bytes.
+/// slots and `upper` ([`page::free_gap`]) keeps `dst`'s old bytes, which nothing reads and the
+/// page CRC does not cover ([`page::crc`]; README do-not-flag 17). Every caller's `src` is a
+/// tree page that passed the fetch checks and, before its first change, [`page::validate`]; a
+/// header whose slots pass `upper`, or whose `upper` passes the trailer, is no such page and is
+/// copied whole, so the checks after the copy see `src`'s bytes.
 pub(crate) fn copy_page(src: &[u8], to: u32, dst: &mut [u8]) -> Result<()> {
     if dst.len() != src.len() {
         return Err(bug(format!("page {to} of {} bytes, not {}", dst.len(), src.len())));
     }
-    let len = src.len();
-    let (lower, upper) = (page::HEADER + page::SLOT * page::nkeys(src), page::upper(src));
-    if lower <= upper && upper <= len - page::TRAILER {
-        dst[..lower].copy_from_slice(&src[..lower]);
-        dst[upper..].copy_from_slice(&src[upper..]);
-    } else {
-        dst.copy_from_slice(src);
+    match page::free_gap(src) {
+        Some(gap) => {
+            dst[..gap.start].copy_from_slice(&src[..gap.start]);
+            dst[gap.end..].copy_from_slice(&src[gap.end..]);
+        }
+        None => dst.copy_from_slice(src),
     }
     Ok(())
 }
@@ -3949,12 +3951,14 @@ mod tests {
                 }
             }
             "a CRC flip on a published branch" => {
-                // A byte of the free gap of the branch below the root.
+                // A reserved header byte of the branch below the root (byte 23): the page CRC
+                // covers it, and only `page::validate` reads it, after the CRC, so the CRC is
+                // what fails. A free-gap byte would not do: the CRC skips the gap, so a flip
+                // there leaves the page valid. Nor would a cell byte: the route or the child's
+                // identity check reads it before the CRC.
                 let (mut store, root) = tall_tree();
                 let (branch, _) = page::branch_child(store.raw(root.root), 0).expect("child");
-                let page = store.raw(branch);
-                let gap = (24 + 2 * page::nkeys(page) + page::upper(page)) / 2;
-                store.raw_mut(branch)[gap] ^= 0x01;
+                store.raw_mut(branch)[23] ^= 0x01;
                 let key = id_key(0, 200);
                 let msg = "fails its CRC";
                 Damaged {
@@ -7571,6 +7575,69 @@ mod tests {
         }
     }
 
+    /// A published leaf whose free gap changes after its stamp still reads `Valid`, as the page
+    /// CRC skips the gap ([`page::crc`]), and passes the copy-on-write verify; its copy
+    /// ([`writable`]) holds its bytes outside the gap, and a put through it commits a tree that
+    /// holds the model.
+    #[test]
+    fn a_gap_edit_after_the_stamp_leaves_the_page_valid() {
+        for copy in [false, true] {
+            let (mut store, mut root, mut model) = wide_tree(300, 200);
+            let mut leaf = root.root;
+            while page::kind(store.raw(leaf)).expect("kind") == page::Kind::Branch {
+                leaf = page::branch_child(store.raw(leaf), 0).expect("child").0;
+            }
+            let gap = page::free_gap(store.raw(leaf)).expect("a valid header");
+            assert!(gap.len() >= 64, "leaf {leaf}: a gap of {} bytes", gap.len());
+            for (i, b) in store.raw_mut(leaf)[gap.clone()].iter_mut().enumerate() {
+                *b ^= 0xA5 ^ i as u8;
+            }
+            let src = store.raw(leaf).to_vec();
+            assert!(page::crc_state(&src) == CrcState::Valid, "leaf {leaf}: its gap edited");
+            check_published(&src, &store.geometry()).expect("the copy-on-write verify");
+            if copy {
+                let txn = store.txn();
+                let q = store.alloc().expect("alloc");
+                let mut scratch = Scratch::default();
+                scratch.reserved.push(q);
+                assert_eq!(writable(&mut store, leaf, &mut scratch).expect("copy"), q);
+                let mut want = src.clone();
+                page::set_pgno_txn(&mut want, q, txn);
+                crc::zero_crc(&mut want);
+                let got = store.private_page(q).expect("the copy");
+                assert!(got[..gap.start] == want[..gap.start], "leaf {leaf}: header and slots");
+                assert!(got[gap.end..] == want[gap.end..], "leaf {leaf}: cells and trailer");
+            } else {
+                let (k, v) = (id_key(0, 200), vec![0xEE; 100]);
+                put(&mut store, &mut root, &k, &v).expect("a put through the edited leaf");
+                model.insert(k, v);
+                store.reopen();
+                assert_holds(&store, &root, &model);
+            }
+        }
+    }
+
+    /// A flip in each region the page CRC covers ([`page::covered_offsets`]: the header with
+    /// `nkeys` and `upper`, a slot, a cell, the trailer) of a published root, branch and leaf:
+    /// the copy-on-write verify ([`check_published`]) refuses each for its CRC.
+    #[test]
+    fn a_flip_the_page_crc_covers_fails_the_copy_on_write_verify() {
+        let (store, root) = tall_tree();
+        let branch = page::branch_child(store.raw(root.root), 0).expect("child").0;
+        let leaf = page::branch_child(store.raw(branch), 0).expect("child").0;
+        let geometry = store.geometry();
+        for p in [root.root, branch, leaf] {
+            let page = store.raw(p);
+            check_published(page, &geometry).expect("intact");
+            for at in page::covered_offsets(page) {
+                let mut bad = page.to_vec();
+                bad[at] ^= 0x10;
+                let err = check_published(&bad, &geometry).expect_err("a covered flip");
+                assert!(err.to_string().contains("fails its CRC"), "page {p} byte {at}: {err}");
+            }
+        }
+    }
+
     /// Copy-on-write of published page `p` through [`writable`], against the two-step copy it
     /// replaced (the page into a buffer, the buffer into the reserved page, then the stamp): the
     /// same bytes but the free gap, which keeps the reserved page's ([`copy_page`]), the new page
@@ -7755,7 +7822,7 @@ mod tests {
         let (txn_id, page) = (w.txn(), raw(w, freed));
         page.copy_from_slice(&src);
         page::set_pgno_txn(page, freed, txn_id);
-        crc::add_crc32_nonzero(page);
+        page::stamp(page);
         let q = w.alloc().expect("alloc");
         w.free(freed);
         assert!(w.view.slice(u64::from(freed) * size as u64, size).is_none(), "past the view");

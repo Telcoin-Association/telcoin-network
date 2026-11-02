@@ -13,7 +13,7 @@ use std::collections::BTreeMap;
 
 use crate::{
     catalog::{self, DupRecord, TableRecord},
-    crc::{self, CrcState},
+    crc::CrcState,
     env::Snapshot,
     error::{Error, Result},
     freelist::{decode_pages, RecordKey},
@@ -128,7 +128,7 @@ impl Checker<'_> {
                 continue;
             }
             let page = snapshot.page(p).map_err(|e| corrupt(p, e.to_string()))?;
-            if crc::crc_state(page) != CrcState::Valid {
+            if page::crc_state(page) != CrcState::Valid {
                 return Err(corrupt(p, "fails its CRC".to_string()));
             }
             page::validate(page, &geometry).map_err(|e| corrupt(p, e.to_string()))?;

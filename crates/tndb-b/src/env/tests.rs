@@ -13,7 +13,7 @@ use std::{
 use tempfile::TempDir;
 
 use super::*;
-use crate::{catalog, disk_model, meta::PAGE_SIZES, ReadTxn, Table, TableStat};
+use crate::{catalog, crc, disk_model, meta::PAGE_SIZES, ReadTxn, Table, TableStat};
 
 fn temp() -> (TempDir, PathBuf) {
     let dir = TempDir::with_prefix("tndb_b_env").expect("temp dir");
@@ -347,7 +347,7 @@ fn damaged_metas_and_roots_fail_closed() {
     file.read_exact_at(&mut page, u64::from(catalog_root.root) * 4096).expect("read");
     let original = page.clone();
     page[8] ^= 0x02; // header txn 2 -> 0: no later than the meta's, but not the root's
-    crc::add_crc32_nonzero(&mut page);
+    page::stamp(&mut page);
     file.write_all_at(&page, u64::from(catalog_root.root) * 4096).expect("write");
     assert_fails_closed(&path, |e| matches!(e, Error::Corrupt(m) if m.contains("catalog root")));
     file.write_all_at(&original, u64::from(catalog_root.root) * 4096).expect("restore");
@@ -371,6 +371,74 @@ fn damaged_metas_and_roots_fail_closed() {
     flip(&path, 20);
     flip(&path, 4096 + 20);
     assert_fails_closed(&path, |e| matches!(e, Error::Corrupt(_)));
+}
+
+/// A flip in each region the page CRC covers ([`page::covered_offsets`]: the header with
+/// `nkeys` and `upper`, a slot, a cell, the trailer) fails its CRC at open's root check, on the
+/// catalog root, and at `Env::check`, on a table's leaf; a flip of the header's page number or
+/// txn is refused first by the fetch checks (`read::checked_page`), which name the page.
+/// Restored, the file opens and checks.
+#[test]
+fn a_flip_the_page_crc_covers_fails_open_and_check() {
+    let (_dir, path) = temp();
+    let env = open(&path);
+    let entries: Vec<(Vec<u8>, Vec<u8>)> =
+        (0..200_u32).map(|i| (i.to_be_bytes().to_vec(), vec![i as u8; 100])).collect();
+    let refs: Vec<(&[u8], &[u8])> = entries.iter().map(|(k, v)| (&k[..], &v[..])).collect();
+    put_all(&env, "t", &refs);
+    let snapshot = env.inner().current();
+    let catalog_root = snapshot.meta.catalog.root;
+    let record = catalog::get(&*snapshot, &snapshot.meta.catalog, "t").expect("get").expect("t");
+    assert!(record.root.height >= 2, "a branch root");
+    let root = snapshot.page(record.root.root).expect("root");
+    let leaf = page::branch_child(root, 0).expect("child").0;
+    drop(snapshot);
+    env.check().expect("intact");
+    drop(env);
+    let file = fs::OpenOptions::new().read(true).write(true).open(&path).expect("open");
+    for (p, at_open) in [(catalog_root, true), (leaf, false)] {
+        let mut original = vec![0; 4096];
+        file.read_exact_at(&mut original, u64::from(p) * 4096).expect("read");
+        assert!(page::free_gap(&original).is_some_and(|gap| !gap.is_empty()), "page {p}");
+        for at in page::covered_offsets(&original) {
+            let mut bad = original.clone();
+            bad[at] ^= 0x10;
+            file.write_all_at(&bad, u64::from(p) * 4096).expect("write");
+            let want = match at {
+                0 | 8 => format!("page {p} "),
+                _ => format!("page {p} fails its CRC"),
+            };
+            if at_open {
+                assert_fails_closed(
+                    &path,
+                    |e| matches!(e, Error::Corrupt(m) if m.contains("catalog root") && m.contains(&want)),
+                );
+            } else {
+                let err = open(&path).check().expect_err("a covered flip").to_string();
+                assert!(err.contains(&want), "page {p} byte {at}: {err}");
+            }
+        }
+        file.write_all_at(&original, u64::from(p) * 4096).expect("restore");
+    }
+    open(&path).check().expect("restored");
+}
+
+/// A version-3 file (its tree pages CRC'd whole, their free gaps included) is refused at open
+/// as `UnsupportedVersion(3)`, never read as damage, and left as it was.
+#[test]
+fn a_version_3_file_is_refused_at_open() {
+    let (_dir, path) = temp();
+    put_all(&open(&path), "a", &[(b"k", b"1")]);
+    let file = fs::OpenOptions::new().read(true).write(true).open(&path).expect("open");
+    for slot in [0_u64, 1] {
+        let mut record = [0; META_LEN];
+        file.read_exact_at(&mut record, slot * 4096).expect("read");
+        record[8..12].copy_from_slice(&3_u32.to_le_bytes());
+        let crc = crc::crc32(&record[..124]);
+        record[124..].copy_from_slice(&crc.to_le_bytes());
+        file.write_all_at(&record, slot * 4096).expect("write");
+    }
+    assert_fails_closed(&path, |e| matches!(e, Error::UnsupportedVersion(3)));
 }
 
 /// A file shorter than its meta's page count, or one that is not a tndb-b file, fails closed

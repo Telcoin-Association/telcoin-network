@@ -41,9 +41,10 @@
 //!
 //! `stamp_probe`, also `#[ignore]`d, prices commit step 3 against its thread count: the
 //! `IoStats::stamp_ns` of durable commits that each replace every value of a table, so step 3
-//! stamps about 100k private 4 KiB tree pages, at 1 to 12 threads (`Writer::stamp_threads`), and
-//! one thread's `crc::crc32` rate over a cache-resident and a DRAM-resident buffer (see the test's
-//! docs):
+//! stamps about 100k private 4 KiB tree pages, at 1 to 12 threads (`Writer::stamp_threads`), for
+//! full leaves (a) and for leaves about a third free (c), whose free gap the page CRC skips; and
+//! one thread's `crc::crc32` rate over a cache-resident and a DRAM-resident buffer (b) (see the
+//! test's docs):
 //!
 //! ```text
 //! cargo test --release -p tndb-b stamp_probe -- --ignored --nocapture --test-threads 1
@@ -54,7 +55,11 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::{crc, tree::test_harness::Rng, Env, EnvOptions, SyncMode};
+use crate::{
+    crc, page,
+    tree::{test_harness::Rng, PageRead as _},
+    Env, EnvOptions, SyncMode,
+};
 
 /// N unless `TNDB_B_BENCH_N` says otherwise.
 const DEFAULT_N: usize = 1_000_000;
@@ -486,6 +491,9 @@ fn tndb_b_sync_and_merge() {
 const PROBE_KEYS: u64 = 400_000;
 /// The largest inline value of an 8-byte key on 4 KiB pages: one maximal entry, a quarter leaf.
 const PROBE_VALUE: usize = 999;
+/// The gapped shape's values: four to a leaf leave 1436 bytes (35.1%) of each 4 KiB leaf a free
+/// gap, about the gap of a long-running writer's pages.
+const PROBE_GAPPED_VALUE: usize = 640;
 /// Distinct values the probe cycles through, shifted by one at each commit, so every commit
 /// changes every value.
 const PROBE_POOL: usize = 61;
@@ -525,21 +533,55 @@ fn crc_rate(buf: &[u8], reps: usize) -> (f64, f64) {
     (gb_s(bytes, min), gb_s(bytes, median))
 }
 
-/// Commit step 3's time against its thread count, and one thread's CRC rate in and out of the
-/// caches, and print both tables.
-///
-/// (a) A durable environment of 4 KiB pages holds [`PROBE_KEYS`] keys; each measured commit
-/// replaces every value, so step 3 stamps about 100k private tree pages, written just before by
-/// copy-on-write (DRAM-resident on a machine whose last-level cache is smaller). Each commit's
-/// `IoStats::stamp_ns` is read at a thread count set by `Writer::stamp_threads`, every count once a
-/// round in an order rotated each round. (b) `crc::crc32` on one thread over a 1 MiB buffer,
-/// repeated (cache-resident), and over a 400 MiB one (DRAM-resident).
-///
-/// On-demand probe (kept out of the default suite). Run with:
-/// `cargo test --release -p tndb-b stamp_probe -- --ignored --nocapture --test-threads 1`.
-#[test]
-#[ignore = "on-demand probe; run with --release --ignored --nocapture --test-threads 1"]
-fn stamp_probe() {
+/// What one shape of the stamp probe measured ([`stamp_rounds`]).
+struct StampRounds {
+    /// Each thread count's step 3 times, in [`PROBE_THREADS`] order.
+    ns: [Vec<u64>; PROBE_THREADS.len()],
+    /// The median, least and most pages a measured commit wrote.
+    pages: (u64, u64, u64),
+    /// The table's tree pages after the last commit, and the bytes of their free gaps.
+    gaps: (u64, u64),
+    /// Each measured commit's step 1 free-list save time (`IoStats::save_ns`).
+    save_ns: Vec<u64>,
+    /// Each measured commit's free-list save rounds.
+    save_rounds: Vec<u64>,
+}
+
+/// [`PROBE_POOL`] distinct values of `len` bytes from `rng`.
+fn probe_values(rng: &mut Rng, len: usize) -> Vec<Vec<u8>> {
+    (0..PROBE_POOL).map(|_| (0..len).map(|_| rng.next() as u8).collect()).collect()
+}
+
+/// The tree pages of table `name` in `env`'s newest state, and the bytes of their free gaps
+/// (`page::free_gap`).
+fn tree_gaps(env: &Env, name: &str) -> (u64, u64) {
+    let snapshot = env.inner().current();
+    let record = crate::catalog::get(&*snapshot, &snapshot.meta.catalog, name)
+        .expect("get")
+        .expect("the table");
+    let (mut pages, mut gaps) = (0, 0);
+    let mut stack = vec![record.root.root];
+    while let Some(pgno) = stack.pop() {
+        let page = snapshot.page(pgno).expect("a tree page");
+        pages += 1;
+        gaps += page::free_gap(page).map_or(0, |gap| gap.len()) as u64;
+        if page::kind(page).expect("kind") == page::Kind::Branch {
+            for i in 0..page::nkeys(page) {
+                stack.push(page::branch_child(page, i).expect("child").0);
+            }
+        }
+    }
+    (pages, gaps)
+}
+
+/// Commit step 3's times against the thread count, for one shape of tree pages: a durable
+/// environment of 4 KiB pages loads [`PROBE_KEYS`] keys with [`PROBE_VALUE`]-byte values (four to
+/// a leaf), then each commit replaces every value with one of `value` bytes, so step 3 stamps
+/// about 100k private tree pages, written just before by copy-on-write. The [`PROBE_WARMUP`]
+/// commits come first (the first of them shrinks every value when `value` is smaller); each
+/// measured commit's `IoStats::stamp_ns` is read at a thread count set by `Writer::stamp_threads`,
+/// every count once a round in an order rotated each round.
+fn stamp_rounds(rng: &mut Rng, value: usize) -> StampRounds {
     let tmp = tempfile::tempdir().expect("temp dir");
     announce_temp_dir(tmp.path());
     let options = EnvOptions {
@@ -549,19 +591,20 @@ fn stamp_probe() {
         ..EnvOptions::default()
     };
     let env = Env::open(tmp.path().join("stamp.tndb-b"), options).expect("open tndb-b");
-    let mut rng = Rng(0x57a3_b000_0000_0001);
-    let values: Vec<Vec<u8>> =
-        (0..PROBE_POOL).map(|_| (0..PROBE_VALUE).map(|_| rng.next() as u8).collect()).collect();
+    let load = probe_values(rng, PROBE_VALUE);
+    let values = if value == PROBE_VALUE { load.clone() } else { probe_values(rng, value) };
     let mut txn = env.begin_rw().expect("begin");
     let table = txn.create_table("stamp").expect("create stamp");
     for k in 0..PROBE_KEYS {
-        txn.append(&table, &k.to_be_bytes(), &values[k as usize % PROBE_POOL]).expect("append");
+        txn.append(&table, &k.to_be_bytes(), &load[k as usize % PROBE_POOL]).expect("append");
     }
     txn.commit().expect("commit");
     // One commit replacing every value with step 3 on `threads` threads: its stamp time and the
     // pages it wrote.
     let mut shift = 0;
-    let mut replace_all = |threads: usize| -> (u64, u64) {
+    let mut save_ns = Vec::with_capacity(PROBE_ROUNDS * PROBE_THREADS.len());
+    let mut save_rounds = Vec::with_capacity(PROBE_ROUNDS * PROBE_THREADS.len());
+    let mut replace_all = |threads: usize| -> (u64, u64, u64, u64) {
         shift += 1;
         env.with_writer(|w| w.stamp_threads = Some(threads));
         let mut txn = env.begin_rw().expect("begin");
@@ -573,7 +616,7 @@ fn stamp_probe() {
         txn.commit().expect("commit");
         let d = env.io_stats().since(&before);
         assert_eq!(env.with_writer(|w| w.stamped_on), threads, "step 3's threads");
-        (d.stamp_ns, d.pages_synced)
+        (d.stamp_ns, d.pages_synced, d.save_ns, d.free_list_save_rounds)
     };
     for _ in 0..PROBE_WARMUP {
         replace_all(1);
@@ -583,27 +626,44 @@ fn stamp_probe() {
     for round in 0..PROBE_ROUNDS {
         for i in 0..PROBE_THREADS.len() {
             let at = (i + round) % PROBE_THREADS.len();
-            let (stamp, written) = replace_all(PROBE_THREADS[at]);
+            let (stamp, written, save, rounds) = replace_all(PROBE_THREADS[at]);
             ns[at].push(stamp);
             pages.push(written);
+            save_ns.push(save);
+            save_rounds.push(rounds);
         }
     }
     env.with_writer(|w| w.stamp_threads = None);
-    let (page_median, _) = median_min(&mut pages);
-    let (lo, hi) = (pages[0], pages[pages.len() - 1]);
-    let bytes = page_median * 4096;
-    let cpus = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
+    let (median, _) = median_min(&mut pages);
+    StampRounds {
+        ns,
+        pages: (median, pages[0], pages[pages.len() - 1]),
+        gaps: tree_gaps(&env, "stamp"),
+        save_ns,
+        save_rounds,
+    }
+}
+
+/// Print a [`StampRounds`]' commit step 1 free-list save times (`IoStats::save_ns`), apart
+/// from the step 3 table.
+fn print_save_line(rounds: &mut StampRounds) {
+    let (median, min) = median_min(&mut rounds.save_ns);
+    let (round_median, _) = median_min(&mut rounds.save_rounds);
     println!(
-        "\nstamp probe (a): commit step 3 (IoStats::stamp_ns) of commits replacing every value of \
-         {PROBE_KEYS} keys: {page_median} pages a commit ({lo}..{hi}), {}, {PROBE_ROUNDS} rounds; \
-         {cpus} CPUs available, stamp::threads picks {} for these bytes\n",
-        fmt_bytes(bytes),
-        crate::stamp::threads(bytes as usize),
+        "\ncommit step 1's free-list save (IoStats::save_ns): median {:.2} ms, min {:.2} ms, \
+         {round_median} rounds a commit (median)",
+        median as f64 / 1e6,
+        min as f64 / 1e6,
     );
+}
+
+/// Print a [`StampRounds`]' table: each thread count's median and least step 3 time, for `bytes`
+/// a commit.
+fn print_stamp_table(rounds: &mut StampRounds, bytes: u64) {
     println!("| threads | median | min | GB/s (median) | GB/s (min) | median vs 1 thread |");
     println!("|---:|---:|---:|---:|---:|---:|");
-    let serial = median_min(&mut ns[0]).0;
-    for (threads, ns) in PROBE_THREADS.iter().zip(&mut ns) {
+    let serial = median_min(&mut rounds.ns[0]).0;
+    for (threads, ns) in PROBE_THREADS.iter().zip(&mut rounds.ns) {
         let (median, min) = median_min(ns);
         println!(
             "| {threads} | {} | {} | {:.2} | {:.2} | {:.2}x |",
@@ -614,16 +674,62 @@ fn stamp_probe() {
             serial as f64 / median.max(1) as f64,
         );
     }
-    drop(env);
+}
+
+/// Commit step 3's time against its thread count for two shapes of tree pages, and one thread's
+/// CRC rate in and out of the caches, and print the three tables.
+///
+/// (a) Full leaves ([`stamp_rounds`] with [`PROBE_VALUE`]-byte values, four to a leaf): a page's
+/// free gap is about 0, so its CRC covers the whole page. (c) Leaves about a third free
+/// ([`PROBE_GAPPED_VALUE`]-byte values, four to a leaf), the gap no page CRC reads. Each commit
+/// stamps about 100k private tree pages, written just before by copy-on-write (DRAM-resident on a
+/// machine whose last-level cache is smaller). (b) `crc::crc32` on one thread over a 1 MiB
+/// buffer, repeated (cache-resident), and over a 400 MiB one (DRAM-resident).
+///
+/// On-demand probe (kept out of the default suite). Run with:
+/// `cargo test --release -p tndb-b stamp_probe -- --ignored --nocapture --test-threads 1`.
+#[test]
+#[ignore = "on-demand probe; run with --release --ignored --nocapture --test-threads 1"]
+fn stamp_probe() {
+    let cpus = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
+    let mut rng = Rng(0x57a3_b000_0000_0001);
+    let mut full = stamp_rounds(&mut rng, PROBE_VALUE);
+    let (page_median, lo, hi) = full.pages;
+    let bytes = page_median * 4096;
+    println!(
+        "\nstamp probe (a): commit step 3 (IoStats::stamp_ns) of commits replacing every value of \
+         {PROBE_KEYS} keys: {page_median} pages a commit ({lo}..{hi}), {}, {PROBE_ROUNDS} rounds; \
+         {cpus} CPUs available, stamp::threads picks {} for these bytes\n",
+        fmt_bytes(bytes),
+        crate::stamp::threads(bytes as usize),
+    );
+    print_stamp_table(&mut full, bytes);
+    print_save_line(&mut full);
     let mut big = vec![0u8; 400 << 20];
     for chunk in big.chunks_exact_mut(8) {
         chunk.copy_from_slice(&rng.next().to_le_bytes());
     }
     let (cached_best, cached_median) = crc_rate(&big[..1 << 20], 64);
     let (dram_best, dram_median) = crc_rate(&big, 1);
+    drop(big);
     println!("\nstamp probe (b): crc::crc32 on one thread, 7 passes\n");
     println!("| buffer | GB/s (best) | GB/s (median) |");
     println!("|---|---:|---:|");
     println!("| 1 MiB, 64 times a pass (cache-resident) | {cached_best:.2} | {cached_median:.2} |");
     println!("| 400 MiB, once a pass (DRAM-resident) | {dram_best:.2} | {dram_median:.2} |");
+    let mut gapped = stamp_rounds(&mut rng, PROBE_GAPPED_VALUE);
+    let (page_median, lo, hi) = gapped.pages;
+    let (tree_pages, gap_bytes) = gapped.gaps;
+    let bytes = page_median * 4096;
+    println!(
+        "\nstamp probe (c): as (a) with {PROBE_GAPPED_VALUE}-byte values, four to a leaf: the \
+         table's {tree_pages} tree pages average a free gap of {:.1}% of a page; {page_median} \
+         pages a commit ({lo}..{hi}), {}, {PROBE_ROUNDS} rounds; stamp::threads picks {} for \
+         these bytes\n",
+        gap_bytes as f64 * 100.0 / (tree_pages * 4096) as f64,
+        fmt_bytes(bytes),
+        crate::stamp::threads(bytes as usize),
+    );
+    print_stamp_table(&mut gapped, bytes);
+    print_save_line(&mut gapped);
 }
