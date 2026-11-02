@@ -1566,12 +1566,14 @@ it lands on, a multi-page overflow value in full).
     with it, and the comparison benchmark's 32 KiB puts at 16 KiB pages 1.45x as long, on an
     Apple M1 Max. With the store, both matched the old zero-filled pages. The store moves the
     page's first fault earlier and adds none, as the layout writes the page anyway.
-- **A large commit stamps its CRCs on up to 4 threads** (commit step 3, `stamp::threads`). The
+- **A large commit stamps its CRCs on up to 8 threads** (commit step 3, `stamp::threads`). The
   cap is also the CPUs the process may use (`std::thread::available_parallelism`, which on Linux
-  reads the cgroup quota; read once, at the first large commit). The CRC is memory-bound past
-  about 4 threads: on an Apple M1 Max, 400 MiB of 4 KiB units took 16.9 ms on one thread, 5.9 ms
-  on 4 and 4.5 ms on 8, and 2 MiB 84 us on one against 66 us on 2, the threshold. The commit
-  shares the machine with the node's other work, so it takes no more.
+  reads the cgroup quota; read once, at the first large commit). On an Apple M1 Max, 400 MiB of
+  4 KiB units took 16.9 ms on one thread, 5.9 ms on 4 and 4.5 ms on 8, and 2 MiB 84 us on one
+  against 66 us on 2, the threshold. Whole commits of ~100k tree pages (the stamp probe, medians)
+  stamped in 17.5 ms on one thread, 8.4 ms on 4, 6.7 ms on 6 and on 8, and 6.8 ms on 12: no
+  gain past about 6 to 8 threads there. The commit shares the machine with the node's other
+  work, so it takes no more.
 
 ---
 

@@ -27,8 +27,10 @@ use crate::crc;
 /// and one more per this many bytes after that.
 const BYTES_PER_THREAD: usize = 1 << 20;
 
-/// The most threads a commit's CRCs use, the writer's own included.
-const MAX_THREADS: usize = 4;
+/// The most threads a commit's CRCs use, the writer's own included. A commit of ~100k 4 KiB tree
+/// pages stamps no faster past about 6 to 8 threads (the `stamp_probe` bench), and the commit
+/// shares the machine with the node's other work, so it takes no more.
+const MAX_THREADS: usize = 8;
 
 /// How many threads should compute the CRCs of `bytes` bytes of units: 1 (the serial loop) below
 /// twice [`BYTES_PER_THREAD`], else one per [`BYTES_PER_THREAD`], at most [`MAX_THREADS`] and the
