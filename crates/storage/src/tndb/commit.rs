@@ -102,6 +102,10 @@ pub(super) struct Durability {
     /// channel and waits for a message (or the sender's drop) on the second.
     #[cfg(test)]
     sync_gate: Mutex<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>,
+    /// Test-only: the next [`Self::advance`] stops between moving the mutex and the watch, reports
+    /// it on the first channel and waits for a message (or the sender's drop) on the second.
+    #[cfg(test)]
+    advance_gate: Mutex<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>,
 }
 
 impl Durability {
@@ -132,6 +136,8 @@ impl Durability {
             max_unsynced: AtomicU64::new(0),
             #[cfg(test)]
             sync_gate: Mutex::new(None),
+            #[cfg(test)]
+            advance_gate: Mutex::new(None),
         })
     }
 
@@ -267,14 +273,27 @@ impl Durability {
         (arrivals, release)
     }
 
+    /// Test-only: pause the next [`Self::advance`] between its two steps (see `advance_gate`).
+    #[cfg(test)]
+    pub(super) fn gate_next_advance(
+        &self,
+    ) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+        let (arrived, arrivals) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        *self.advance_gate.lock() = Some((arrived, released));
+        (arrivals, release)
+    }
+
     /// The durable watermark.
     pub(super) fn durable(&self) -> u64 {
         *self.durable_now.lock()
     }
 
-    /// Advance the watermark to `durable` (never back, and never after a failure). The blocking
-    /// copy moves first: a `persist` the watch wakes then reads [`Self::durable`] at or past its
-    /// target, never the value before its sync.
+    /// Advance the watermark to `durable` (never back, and never after a failure).
+    ///
+    /// The mutex [`Self::durable`] reads moves before the watch a group-mode [`Self::persist`]
+    /// waits on, so a `persist` that returns finds `durable()` already at its batch
+    /// (`test_tndb_durable_only_after_the_sync` reads it right after one).
     fn advance(&self, durable: u64) {
         if self.is_failed() {
             return;
@@ -284,6 +303,14 @@ impl Durability {
             if durable > *now {
                 *now = durable;
                 self.durable_changed.notify_all();
+            }
+        }
+        #[cfg(test)]
+        {
+            let gate = self.advance_gate.lock().take();
+            if let Some((arrived, release)) = gate {
+                let _ = arrived.send(());
+                let _ = release.recv_timeout(std::time::Duration::from_secs(30));
             }
         }
         self.durable.send_if_modified(|current| {

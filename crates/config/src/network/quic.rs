@@ -55,18 +55,41 @@ pub struct QuicConfig {
     pub inbound_accept_task: InboundAcceptTask,
 }
 
+/// Default ceiling on concurrent incoming bidirectional streams per connection.
+///
+/// This is the libp2p QUIC default. A peer opens one stream per request, gossip frame or sync
+/// session, and the serve budgets hold far fewer than this in flight, so the value is headroom for
+/// a well-behaved peer and a bound for a hostile one. quinn buffers data for every opened stream
+/// until the swarm accepts it in index order, and every empty stream ahead of the data costs one
+/// inbound upgrade timeout, so the stream ceiling also bounds how long buffered data can wait.
+pub(crate) const DEFAULT_MAX_CONCURRENT_STREAM_LIMIT: u32 = 256;
+
+/// Default receive credit per stream, in bytes: 2 MiB.
+///
+/// A request-response message is at most `max_rpc_message_size` (1 MiB by default), a gossip frame
+/// stays under 2 MiB, and a sync frame is read in bounded chunks, so one stream window holds the
+/// largest message a protocol reads in one step with the same amount of headroom. A larger message
+/// still arrives: quinn re-issues stream credit as the handler reads.
+pub(crate) const DEFAULT_MAX_STREAM_DATA: u32 = 2 * 1024 * 1024;
+
+/// Default receive credit per connection, in bytes: 4 MiB, two full stream windows.
+///
+/// This is the most data one connection can make the node buffer before the application reads it.
+/// With the per-peer and per-swarm connection ceilings of the consensus network, a free peer id
+/// pins at most 32 MiB and a whole swarm at most 512 MiB. The previous 100 MiB window allowed
+/// 800 MiB per peer id and had no swarm bound. Throughput per connection stays at the window over
+/// the round-trip time: 40 MiB/s at 100 ms.
+pub(crate) const DEFAULT_MAX_CONNECTION_DATA: u32 = 4 * 1024 * 1024;
+
 impl Default for QuicConfig {
     fn default() -> Self {
         Self {
             handshake_timeout: Duration::from_secs(10),
             max_idle_timeout: 30 * 1_000, // 30s
             keep_alive_interval: Duration::from_secs(5),
-            max_concurrent_stream_limit: 10_000,
-            // may need to increase these based on RTT
-            //
-            // maximum throughput = (buffer size / round-trip time)
-            max_stream_data: 50 * 1024 * 1024,      // 50MiB
-            max_connection_data: 100 * 1024 * 1024, // 100MiB
+            max_concurrent_stream_limit: DEFAULT_MAX_CONCURRENT_STREAM_LIMIT,
+            max_stream_data: DEFAULT_MAX_STREAM_DATA,
+            max_connection_data: DEFAULT_MAX_CONNECTION_DATA,
             retry_unvalidated_incoming: true,
             inbound_accept_task: InboundAcceptTask::Inline,
         }
