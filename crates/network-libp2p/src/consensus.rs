@@ -53,8 +53,8 @@ use tn_config::{
     KeyConfig, LibP2pConfig, NetworkConfig, PeerConfig, SwarmNetworkBudget, MAX_GOSSIP_MESSAGE_SIZE,
 };
 use tn_types::{
-    encode, now, BlsPublicKey, BlsSigner, Database, NetworkKeypair, NetworkPublicKey, TaskSpawner,
-    TnSender, TrySendOutcome, WorkerId,
+    encode, now, BlsPublicKey, BlsSigner, Database, NetworkKeypair, TaskSpawner, TnSender,
+    TrySendOutcome, WorkerId,
 };
 use tokio::sync::{
     mpsc::{Receiver, Sender},
@@ -554,6 +554,11 @@ where
     connected_peers: VecDeque<PeerId>,
     /// Key manager, provide the BLS public key and sign peer records published to kademlia.
     key_config: KeyConfig,
+    /// This node's transport identity.
+    ///
+    /// It co-signs our [NodeRecord] so peers can verify that our network key agreed to be bound
+    /// to our BLS key (issue #1751).
+    network_keypair: NetworkKeypair,
     /// The type to spawn tasks.
     task_spawner: TaskSpawner,
     /// The signed [NodeRecord].
@@ -861,7 +866,7 @@ where
             info!(target: "network-kad", restored, "restored persisted kad records into the local peer cache");
         }
 
-        let network_pubkey = keypair.public().into();
+        let network_keypair = keypair.clone();
 
         // QUIC listener hardening: Retry for unvalidated addresses and bounded incoming queues.
         let quic_incoming = std::sync::Arc::new(libp2p::quic::IncomingStats::default());
@@ -905,9 +910,9 @@ where
             record_domain,
             external_addr.clone(),
             &key_config,
-            network_pubkey,
+            &network_keypair,
             rpc,
-        );
+        )?;
 
         Ok(Self {
             swarm,
@@ -925,6 +930,7 @@ where
             pending_px_disconnects,
             pending_goodbyes,
             key_config,
+            network_keypair,
             task_spawner,
             node_record,
             record_domain,
@@ -975,7 +981,8 @@ where
     pub fn with_advertised_addresses(mut self, addresses: Vec<Multiaddr>) -> NetworkResult<Self> {
         let record = NodeRecord::build_multi(
             self.record_domain,
-            self.node_record.info.pubkey.clone(),
+            &self.key_config.primary_public_key(),
+            &self.network_keypair,
             addresses,
             self.node_record.info.rpc.clone(),
             |data| self.key_config.request_signature_direct(data),
@@ -991,16 +998,25 @@ where
     }
 
     /// Create and sign this node's [NodeRecord].
+    ///
+    /// The BLS key in `key_config` signs the record and `network_keypair` co-signs the binding of
+    /// our network key to that BLS key (issue #1751).
     fn create_node_record(
         domain: RecordDomain,
         external_addr: Multiaddr,
         key_config: &KeyConfig,
-        network_pubkey: NetworkPublicKey,
+        network_keypair: &NetworkKeypair,
         rpc: Option<RpcInfo>,
-    ) -> NodeRecord {
-        NodeRecord::build(domain, network_pubkey, external_addr, rpc, |data| {
-            key_config.request_signature_direct(data)
-        })
+    ) -> NetworkResult<NodeRecord> {
+        NodeRecord::build(
+            domain,
+            &key_config.primary_public_key(),
+            network_keypair,
+            external_addr,
+            rpc,
+            |data| key_config.request_signature_direct(data),
+        )
+        .map_err(NetworkError::from)
     }
 
     /// Re-sign our configured network information and publish it with a fresh timestamp.
@@ -1009,10 +1025,23 @@ where
     /// direct pushes and record lookups use the new signed value. Our local copy keeps
     /// `expires: None`; Kademlia assigns the configured TTL to outbound copies. The libp2p-kad
     /// record job is disabled (see [`configure_record_jobs`]), so this is the only periodic
-    /// republication of our record.
+    /// republication of our record. If the network key cannot co-sign, the previous signed copy
+    /// is published unchanged.
     fn refresh_own_record(&mut self) {
         self.node_record
-            .refresh(self.record_domain, |data| self.key_config.request_signature_direct(data));
+            .refresh(
+                self.record_domain,
+                &self.key_config.primary_public_key(),
+                &self.network_keypair,
+                |data| self.key_config.request_signature_direct(data),
+            )
+            .unwrap_or_else(|err| {
+                bounded_error!(Record,
+                    target: "network-kad",
+                    ?err,
+                    "could not re-sign our node record; republishing the previous signed copy"
+                );
+            });
         self.provide_our_data();
     }
 
@@ -1032,12 +1061,13 @@ where
         }
     }
 
-    /// Verify the address list in Record was signed by the key and the kad record's publisher
+    /// Verify the address list in Record was signed by the key, that the network key named in the
+    /// record co-signed its binding to that key (issue #1751), and that the kad record's publisher
     /// matches the network key.
     fn peer_record_valid(&self, record: &kad::Record) -> Option<(BlsPublicKey, NodeRecord)> {
         let key = BlsPublicKey::from_literal_bytes(record.key.as_ref()).ok()?;
 
-        // decode the domain-scoped record (no legacy fallback) and verify bls signature
+        // decode the domain-scoped record (no legacy fallback) and verify both signatures
         let cached = self
             .verified_peer_records
             .peek(&record.key)
