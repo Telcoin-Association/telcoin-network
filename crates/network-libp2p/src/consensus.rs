@@ -215,6 +215,17 @@ enum RecordFreshness {
 /// of connections instead of an unbounded fan-out.
 const MAX_ESTABLISHED_CONNECTIONS_PER_PEER: u32 = 8;
 
+/// Maximum number of concurrent established connections in one swarm, both directions and every
+/// peer class, when the operator sets no `process_budget`.
+///
+/// Without this bound the swarm admits connections up to the OS limits, and each one holds the
+/// receive credit of the QUIC config, so free peer ids could pin memory without limit. The value
+/// is two connections (one inbound, one outbound) for each of the 39 default `max_peers` plus a
+/// committee of 25, and it never takes room from the per-peer bound. Committee members have no
+/// bypass, by design: hostile peers can hold slots, and the admission policy, not this memory
+/// bound, decides who gets them. An operator `process_budget` replaces it.
+pub(crate) const MAX_ESTABLISHED_CONNECTIONS: u32 = 128;
+
 /// Memory-only ceiling on pending inbound connections (accepted handshakes that are not yet
 /// established) for one swarm.
 ///
@@ -303,7 +314,8 @@ impl ListenerErrorLog {
 /// It sets the following bounds:
 /// - at most the process allocation's per-peer ceiling, or [`MAX_ESTABLISHED_CONNECTIONS_PER_PEER`]
 ///   without an allocation, concurrent established connections per peer (issue #1010);
-/// - at most the process allocation's established connections in total, when configured;
+/// - at most the process allocation's established connections in total, or
+///   [`MAX_ESTABLISHED_CONNECTIONS`] without an allocation;
 /// - at most `max_pending_incoming` concurrent pending inbound connections in total (production
 ///   passes [`MAX_PENDING_INCOMING_CONNECTIONS`]).
 ///
@@ -343,7 +355,9 @@ fn connection_limits_behaviour(
                     budget.connections_per_peer()
                 }),
             ))
-            .with_max_established(budget.map(|budget| budget.connections()))
+            .with_max_established(Some(
+                budget.map_or(MAX_ESTABLISHED_CONNECTIONS, |budget| budget.connections()),
+            ))
             .with_max_pending_incoming(Some(max_pending_incoming)),
     )
 }
