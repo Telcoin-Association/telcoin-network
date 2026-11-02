@@ -626,7 +626,11 @@ pub(crate) fn crc(page: &[u8]) -> u32 {
         Some(gap) => crc::crc32_update(crc::crc32(&page[..gap.start]), &page[gap.end..end]),
         None => crc::crc32(&page[..end]),
     };
-    if crc == 0 { u32::MAX } else { crc }
+    if crc == 0 {
+        u32::MAX
+    } else {
+        crc
+    }
 }
 
 /// Stamp tree page `page`'s trailer with its [`crc`]: a no-op on fewer than 5 bytes, like
@@ -655,6 +659,27 @@ pub(crate) fn crc_state(page: &[u8]) -> CrcState {
     } else {
         CrcState::Corrupt
     }
+}
+
+/// Byte offsets of tree page `page` in every region its [`crc`] covers, for the damage tests:
+/// the header (`pgno`, `nkeys` both bytes, `txn`, `upper` both bytes), slot 0, the first and
+/// the last cell byte, and the trailer's first and last byte.
+#[cfg(test)]
+pub(crate) fn covered_offsets(page: &[u8]) -> [usize; 11] {
+    let len = page.len();
+    [
+        PGNO_OFF,
+        NKEYS_OFF,
+        NKEYS_OFF + 1,
+        TXN_OFF,
+        UPPER_OFF,
+        UPPER_OFF + 1,
+        HEADER,
+        upper(page),
+        len - TRAILER - 1,
+        len - TRAILER,
+        len - 1,
+    ]
 }
 
 #[inline]
@@ -2448,6 +2473,74 @@ mod tests {
             }
         }
         unreachable!("specs is never empty")
+    }
+
+    /// The page CRC of valid page `page` against its model: with noise in its free gap, [`crc`]
+    /// is the CRC-32 of `page[..lower]` followed by `page[upper..P − 4]` (0 mapped to the
+    /// sentinel), and the stamped page reads `Valid`. Then two copies whose headers give no gap,
+    /// slots past `upper` and `upper` past the trailer, have the whole-page CRC.
+    fn assert_page_crc_model(page: &mut [u8], at: &str) {
+        let nonzero = |crc: u32| if crc == 0 { u32::MAX } else { crc };
+        let (len, lower, upper) = (page.len(), HEADER + SLOT * nkeys(page), upper(page));
+        assert_eq!(free_gap(page), Some(lower..upper), "{at}");
+        for (i, b) in page[lower..upper].iter_mut().enumerate() {
+            *b ^= 0x5A ^ i as u8;
+        }
+        let model = [&page[..lower], &page[upper..len - TRAILER]].concat();
+        assert_eq!(crc(page), nonzero(crc::crc32(&model)), "{at}: the bytes outside the gap");
+        stamp(page);
+        assert!(crc_state(page) == CrcState::Valid, "{at}: stamped");
+        let whole = |page: &[u8]| nonzero(crc::crc32(&page[..len - TRAILER]));
+        let mut slots_past = page.to_vec();
+        put_u16(&mut slots_past, NKEYS_OFF, (upper - HEADER) / SLOT + 1);
+        assert_eq!(free_gap(&slots_past), None, "{at}: slots past upper");
+        assert_eq!(crc(&slots_past), whole(&slots_past), "{at}: slots past upper, whole");
+        let mut upper_past = page.to_vec();
+        put_u16(&mut upper_past, UPPER_OFF, len - TRAILER + 1);
+        assert_eq!(free_gap(&upper_past), None, "{at}: upper past the trailer");
+        assert_eq!(crc(&upper_past), whole(&upper_past), "{at}: upper past the trailer, whole");
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(64))]
+
+        /// A leaf or a branch, at every page size, from empty to full (an empty gap, through
+        /// [`top_up`]): after each insert, the page CRC is the model's
+        /// ([`assert_page_crc_model`]).
+        #[test]
+        fn the_page_crc_covers_the_page_outside_its_gap(
+            size in select(&SIZES[..]),
+            branch in any::<bool>(),
+            specs in vec(spec(), 0..40),
+        ) {
+            let g = geometry(size);
+            let mut page = fresh(&g, if branch { Kind::Branch } else { Kind::Leaf });
+            if branch {
+                prop_assert_eq!(branch_insert(&mut page, 0, &[], 7, 9).unwrap(), Fit::Done);
+            }
+            assert_page_crc_model(&mut page, "empty");
+            for (n, s) in specs.iter().enumerate() {
+                let key = ranked_key(2 * n as u32 + 1, s.klen(&g));
+                let free = free_space(&page).unwrap();
+                let fit = if branch {
+                    if cell_size_branch(key.len()) + SLOT + TOP_UP_ROOM > free {
+                        break;
+                    }
+                    branch_insert(&mut page, n + 1, &key, n as u32, 3)
+                } else {
+                    let value = s.value(&g, key.len());
+                    if cell_size_leaf(key.len(), value.len()) + SLOT + TOP_UP_ROOM > free {
+                        break;
+                    }
+                    leaf_insert(&mut page, n, &key, &value)
+                };
+                prop_assert_eq!(fit.unwrap(), Fit::Done);
+                assert_page_crc_model(&mut page, &format!("{} keys", n + 1));
+            }
+            top_up(&g, &mut page);
+            prop_assert_eq!(free_space(&page).unwrap(), 0);
+            assert_page_crc_model(&mut page, "full");
+        }
     }
 
     #[test]

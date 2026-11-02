@@ -220,7 +220,11 @@ mod tests {
             .map(|&(len, run)| {
                 let (unit, tail) = rest.split_at(len);
                 rest = tail;
-                if run { Unit::Run(unit) } else { Unit::Page(unit) }
+                if run {
+                    Unit::Run(unit)
+                } else {
+                    Unit::Page(unit)
+                }
             })
             .collect()
     }

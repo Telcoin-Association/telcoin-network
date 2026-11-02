@@ -7572,6 +7572,69 @@ mod tests {
         }
     }
 
+    /// A published leaf whose free gap changes after its stamp still reads `Valid`, as the page
+    /// CRC skips the gap ([`page::crc`]), and passes the copy-on-write verify; its copy
+    /// ([`writable`]) holds its bytes outside the gap, and a put through it commits a tree that
+    /// holds the model.
+    #[test]
+    fn a_gap_edit_after_the_stamp_leaves_the_page_valid() {
+        for copy in [false, true] {
+            let (mut store, mut root, mut model) = wide_tree(300, 200);
+            let mut leaf = root.root;
+            while page::kind(store.raw(leaf)).expect("kind") == page::Kind::Branch {
+                leaf = page::branch_child(store.raw(leaf), 0).expect("child").0;
+            }
+            let gap = page::free_gap(store.raw(leaf)).expect("a valid header");
+            assert!(gap.len() >= 64, "leaf {leaf}: a gap of {} bytes", gap.len());
+            for (i, b) in store.raw_mut(leaf)[gap.clone()].iter_mut().enumerate() {
+                *b ^= 0xA5 ^ i as u8;
+            }
+            let src = store.raw(leaf).to_vec();
+            assert!(page::crc_state(&src) == CrcState::Valid, "leaf {leaf}: its gap edited");
+            check_published(&src, &store.geometry()).expect("the copy-on-write verify");
+            if copy {
+                let txn = store.txn();
+                let q = store.alloc().expect("alloc");
+                let mut scratch = Scratch::default();
+                scratch.reserved.push(q);
+                assert_eq!(writable(&mut store, leaf, &mut scratch).expect("copy"), q);
+                let mut want = src.clone();
+                page::set_pgno_txn(&mut want, q, txn);
+                crc::zero_crc(&mut want);
+                let got = store.private_page(q).expect("the copy");
+                assert!(got[..gap.start] == want[..gap.start], "leaf {leaf}: header and slots");
+                assert!(got[gap.end..] == want[gap.end..], "leaf {leaf}: cells and trailer");
+            } else {
+                let (k, v) = (id_key(0, 200), vec![0xEE; 100]);
+                put(&mut store, &mut root, &k, &v).expect("a put through the edited leaf");
+                model.insert(k, v);
+                store.reopen();
+                assert_holds(&store, &root, &model);
+            }
+        }
+    }
+
+    /// A flip in each region the page CRC covers ([`page::covered_offsets`]: the header with
+    /// `nkeys` and `upper`, a slot, a cell, the trailer) of a published root, branch and leaf:
+    /// the copy-on-write verify ([`check_published`]) refuses each for its CRC.
+    #[test]
+    fn a_flip_the_page_crc_covers_fails_the_copy_on_write_verify() {
+        let (store, root) = tall_tree();
+        let branch = page::branch_child(store.raw(root.root), 0).expect("child").0;
+        let leaf = page::branch_child(store.raw(branch), 0).expect("child").0;
+        let geometry = store.geometry();
+        for p in [root.root, branch, leaf] {
+            let page = store.raw(p);
+            check_published(page, &geometry).expect("intact");
+            for at in page::covered_offsets(page) {
+                let mut bad = page.to_vec();
+                bad[at] ^= 0x10;
+                let err = check_published(&bad, &geometry).expect_err("a covered flip");
+                assert!(err.to_string().contains("fails its CRC"), "page {p} byte {at}: {err}");
+            }
+        }
+    }
+
     /// Copy-on-write of published page `p` through [`writable`], against the two-step copy it
     /// replaced (the page into a buffer, the buffer into the reserved page, then the stamp): the
     /// same bytes but the free gap, which keeps the reserved page's ([`copy_page`]), the new page
