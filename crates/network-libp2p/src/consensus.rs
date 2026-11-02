@@ -6,7 +6,7 @@ use crate::{
     codec::{PeerExchangeCodec, TNCodec, TNMessage},
     diagnostics::{bounded_error, bounded_reply_error as error, bounded_warn},
     error::NetworkError,
-    gossip_config::gossipsub_config,
+    gossip_config::{gossipsub_config, GossipBehaviour, RejectGossipKey},
     kad::{identical_refresh, node_record_key, KadStore},
     metrics::{
         ConnectionLimitReason, HandshakeDirection, InboundFailureOutcome, InboundRejection,
@@ -389,8 +389,9 @@ where
     /// remaining behaviors so an over-cap connection is denied before `req_res` / `gossipsub` /
     /// `kademlia` register any per-peer state for it.
     pub(crate) connection_limits: connection_limits::Behaviour,
-    /// The gossipsub network behavior.
-    pub(crate) gossipsub: gossipsub::Behaviour,
+    /// The gossipsub network behavior. It drops every message that carries the unsigned `key`
+    /// field (see [`RejectGossipKey`]).
+    pub(crate) gossipsub: GossipBehaviour,
     /// The request-response network behavior.
     pub(crate) req_res: request_response::Behaviour<C>,
     /// Dedicated request-response behavior for the peer-exchange goodbye.
@@ -418,7 +419,7 @@ where
     /// The request-response behaviours are consensus RPCs, goodbyes and record retrieval.
     pub(crate) fn new(
         local_peer_id: PeerId,
-        gossipsub: gossipsub::Behaviour,
+        gossipsub: GossipBehaviour,
         req_res: (
             request_response::Behaviour<C>,
             request_response::Behaviour<PeerExchangeCodec>,
@@ -689,11 +690,14 @@ where
         let record_domain = RecordDomain::new(chain_id, network_type);
 
         // Explicit frame limits and the order the library applies them: see
-        // `gossipsub_config` (issue #1655).
+        // `gossipsub_config` (issue #1655). The `RejectGossipKey` transform drops
+        // every message that carries the unsigned `key` field, so a forwarder
+        // cannot grow a valid message past those limits (issue #1699).
         let gossipsub_config = gossipsub_config(chain_id)?;
-        let gossipsub = gossipsub::Behaviour::new(
+        let gossipsub = GossipBehaviour::new_with_transform(
             gossipsub::MessageAuthenticity::Signed(keypair.clone()),
             gossipsub_config,
+            RejectGossipKey,
         )
         .map_err(NetworkError::GossipBehavior)?;
 
