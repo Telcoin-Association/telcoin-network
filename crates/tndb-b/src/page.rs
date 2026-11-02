@@ -8,7 +8,7 @@
 //! slots:        nkeys × u16 cell offsets from byte 24; slot i addresses cell i (key order)
 //! free space:   from the end of the slot array up to `upper`
 //! cells:        packed from `upper` up to P − 4, in no particular order
-//! trailer (4):  CRC32, stamped at commit (all zeros = dirty); this codec only zeroes it
+//! trailer (4):  CRC32 of the page outside its free gap, stamped at commit (all zeros = dirty)
 //!
 //! leaf cell:    vlen u32 | klen u16 | flags u16 | key | value
 //! branch cell:  child u32 | child_txn u32 | klen u16 | key
@@ -27,6 +27,14 @@
 //! `free + used == U` always holds, where `U = P − 28` (header and trailer). Nothing reads the
 //! gap, so it need not be zero: [`init_header`] lays out a page over whatever bytes it holds,
 //! writing the header and zeroing the trailer (dirty), and the gap keeps the old bytes.
+//!
+//! **The CRC.** The trailer holds the CRC-32 of `page[..24 + 2·nkeys]` followed by
+//! `page[upper..P − 4]`: the header and the slots, then the cells, every byte a reader
+//! interprets ([`crc`], [`stamp`], [`crc_state`]). The gap is not hashed. The span comes from the
+//! header ([`free_gap`]): a header whose slots pass `upper`, or whose `upper` passes the trailer,
+//! gives no gap, and its page is hashed whole before the trailer. `nkeys` and `upper` are covered
+//! bytes, so a header damaged after the stamp fails the check. This codec only zeroes the trailer
+//! (dirty); commit stamps it.
 //!
 //! **Branches** hold one cell per child (each a key and a child): cell i's key is the lower bound
 //! of child i's key range, and cell 0's key is empty and stands for −∞, so the child for a key is
@@ -560,7 +568,7 @@ fn init(page: &mut [u8], kind: Kind, pgno: u32, txn: u64) {
 /// page the writer just allocated (`PageWrite::alloc`, whose bytes are not zeroed). It writes
 /// every byte a reader of an empty page interprets, the whole header (its flags and reserved
 /// bytes zero) and the trailer (zero: dirty), and leaves the rest, the empty page's free gap, as
-/// it is: nothing reads the gap, and the CRC covers it as it is.
+/// it is: nothing reads the gap, and the CRC skips it ([`crc`]).
 fn init_header(page: &mut [u8], kind: Kind, pgno: u32, txn: u64) {
     debug_assert!(valid_len(page.len()), "page buffer of {} bytes", page.len());
     let trailer = page.len() - TRAILER;

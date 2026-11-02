@@ -49,7 +49,7 @@ const CATALOG: std::ops::Range<usize> = 32..32 + TreeRoot::ENCODED_LEN;
 /// Where the free tree's [`TreeRoot`] lies.
 const FREE: std::ops::Range<usize> = CATALOG.end..CATALOG.end + TreeRoot::ENCODED_LEN;
 
-/// The bytes the format reserves (zero in version 3).
+/// The bytes the format reserves (zero in version 4).
 const RESERVED: std::ops::Range<usize> = FREE.end..CRC_AT;
 
 /// Every page size a file can have, smallest first: where meta 1 may lie when meta 0 cannot be
