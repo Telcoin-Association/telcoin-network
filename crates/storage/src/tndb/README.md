@@ -308,6 +308,8 @@ an ordinary crash only the padding's zeros and the marker do.
 - a failed sync latching, and a failed manifest rewrite or index creation for a table's first row
   or registration latching (the log still sealed);
 - durability only after the sync (a gate pauses the round);
+- a group `persist` returning only once `durable()` shows its batch (a gate pauses `advance`
+  between its two watermarks);
 - `Sync` writers syncing themselves with the commit thread stopped (durably: a power loss keeps
   every write);
 - group syncs on demand (2,000 unpersisted writes made durable within the delay by a few syncs);
