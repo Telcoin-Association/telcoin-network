@@ -15,6 +15,9 @@ spec:
   selector:
     matchLabels:
       app: worker-gateway
+      # Only the worker-gateway-metrics Service (service.yaml) carries this
+      # label; the client Service does not publish the metrics port.
+      app.kubernetes.io/component: metrics
   endpoints:
     - port: metrics
       path: /metrics
