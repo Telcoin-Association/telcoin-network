@@ -33,10 +33,5 @@ eyre.workspace = true
 sha2.workspace = true
 sha2.features = ["std"]
 
-[dev-dependencies]
-tempfile.workspace = true
-test-case.workspace = true
-futures.workspace = true
-
 [lints]
 workspace = true

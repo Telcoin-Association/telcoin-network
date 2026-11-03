@@ -20,11 +20,6 @@ reth-primitives-traits.workspace = true
 alloy-consensus.workspace = true
 alloy-eips.workspace = true
 
-[dev-dependencies]
-alloy-primitives = { workspace = true, features = ["rand"] }
-reth-ethereum-primitives.workspace = true
-rand.workspace = true
-
 [features]
 default = ["std"]
 std = [
@@ -33,6 +28,4 @@ std = [
     "reth-chainspec/std",
     "reth-consensus/std",
     "reth-primitives-traits/std",
-    "reth-ethereum-primitives/std",
-    "alloy-primitives/std",
 ]

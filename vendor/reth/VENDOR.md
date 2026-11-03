@@ -42,6 +42,20 @@ vendored.
 
 ## Local changes
 
-None in the crate directories. `Cargo.toml` here is new: it is upstream's root
-manifest cut to the vendored members, `[workspace.package]`, the workspace lints,
-and the `[workspace.dependencies]` entries that the vendored crates reference.
+`Cargo.toml` here is new: it is upstream's root manifest cut to the vendored
+members, `[workspace.package]`, the workspace lints, and the
+`[workspace.dependencies]` entries that the vendored crates reference.
+
+Changes in the crate directories, in the order they were made:
+
+1. Test-only parts removed. Telcoin-network never builds the vendored crates in
+   test mode, so these parts do not change the build. They pointed at crates
+   that are not vendored, and `cargo fmt --all` loads this workspace, so they
+   had to go.
+   - Every `[dev-dependencies]` and `[target.*.dev-dependencies]` table, every
+     `[[test]]`, `[[bench]]` and `[[example]]` table, and the `tests/`,
+     `benches/` and `examples/` directories.
+   - Each `[features]` entry that named a dependency that was dev-only.
+   - The optional `reth-testing-utils` dependency of `reth-downloaders` and
+     `reth-stages`, and the `test-utils` feature entries that enabled it.
+   - The `[workspace.dependencies]` entries that no vendored crate inherits now.

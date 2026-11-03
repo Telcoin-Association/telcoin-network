@@ -25,9 +25,6 @@ rustc-hash = { workspace = true, optional = true }
 arbitrary = { workspace = true, features = ["derive"], optional = true }
 auto_impl.workspace = true
 
-[dev-dependencies]
-arbitrary = { workspace = true, features = ["derive"] }
-
 [features]
 default = ["std", "serde", "rustc-hash"]
 arbitrary = [

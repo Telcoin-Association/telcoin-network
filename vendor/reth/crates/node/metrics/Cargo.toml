@@ -39,10 +39,6 @@ tikv-jemalloc-ctl = { workspace = true, optional = true, features = ["stats"] }
 [target.'cfg(target_os = "linux")'.dependencies]
 procfs = "0.18.0"
 
-[dev-dependencies]
-reqwest.workspace = true
-socket2.workspace = true
-
 [lints]
 workspace = true
 

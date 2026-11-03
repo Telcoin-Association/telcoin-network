@@ -39,5 +39,3 @@ hmac.workspace = true
 block-padding.workspace = true
 cipher = { workspace = true, features = ["block-padding"] }
 
-[dev-dependencies]
-tokio = { workspace = true, features = ["net", "rt", "macros"] }

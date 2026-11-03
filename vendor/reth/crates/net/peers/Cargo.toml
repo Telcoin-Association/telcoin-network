@@ -26,15 +26,6 @@ thiserror.workspace = true
 url.workspace = true
 tokio = { workspace = true, optional = true }
 
-[dev-dependencies]
-alloy-primitives = { workspace = true, features = ["rand"] }
-rand.workspace = true
-secp256k1 = { workspace = true, features = ["rand"] }
-serde_json.workspace = true
-enr.workspace = true
-tokio = { workspace = true, features = ["net", "macros", "rt"] }
-rand_08.workspace = true
-
 [features]
 default = ["std"]
 std = [
@@ -44,7 +35,6 @@ std = [
     "serde_with/std",
     "thiserror/std",
     "url/std",
-    "serde_json/std",
 ]
 secp256k1 = ["dep:secp256k1", "enr/secp256k1"]
 net = ["std", "dep:tokio", "tokio?/net"]

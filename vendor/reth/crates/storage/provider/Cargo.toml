@@ -67,25 +67,6 @@ rayon.workspace = true
 # rocksdb: jemalloc is recommended production workload
 rocksdb = { workspace = true, features = ["jemalloc"], optional = true }
 
-[dev-dependencies]
-reth-db = { workspace = true, features = ["test-utils"] }
-reth-primitives-traits = { workspace = true, features = ["arbitrary", "test-utils"] }
-reth-chain-state = { workspace = true, features = ["test-utils"] }
-reth-trie = { workspace = true, features = ["test-utils"] }
-reth-testing-utils.workspace = true
-reth-ethereum-engine-primitives.workspace = true
-reth-ethereum-primitives.workspace = true
-reth-tracing.workspace = true
-
-revm-database-interface.workspace = true
-revm-state.workspace = true
-
-tempfile.workspace = true
-assert_matches.workspace = true
-rand.workspace = true
-
-tokio = { workspace = true, features = ["sync", "macros", "rt-multi-thread"] }
-
 [features]
 rocksdb = ["reth-storage-api/rocksdb", "dep:rocksdb"]
 edge = ["rocksdb"]

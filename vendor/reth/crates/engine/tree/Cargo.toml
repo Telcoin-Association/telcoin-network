@@ -74,46 +74,6 @@ reth-stages = { workspace = true, optional = true }
 reth-static-file = { workspace = true, optional = true }
 reth-tracing = { workspace = true, optional = true }
 
-[dev-dependencies]
-# reth
-reth-evm-ethereum = { workspace = true, features = ["test-utils"] }
-reth-chain-state = { workspace = true, features = ["test-utils"] }
-reth-chainspec.workspace = true
-reth-db-common.workspace = true
-reth-ethereum-consensus.workspace = true
-metrics-util = { workspace = true, features = ["debugging"] }
-reth-ethereum-engine-primitives.workspace = true
-reth-evm = { workspace = true, features = ["test-utils"] }
-reth-exex-types.workspace = true
-reth-network-p2p = { workspace = true, features = ["test-utils"] }
-reth-prune-types.workspace = true
-reth-stages = { workspace = true, features = ["test-utils"] }
-reth-static-file.workspace = true
-reth-testing-utils.workspace = true
-reth-tracing.workspace = true
-reth-node-ethereum.workspace = true
-reth-e2e-test-utils.workspace = true
-
-# revm
-revm-state.workspace = true
-
-assert_matches.workspace = true
-criterion.workspace = true
-eyre.workspace = true
-serde_json.workspace = true
-crossbeam-channel.workspace = true
-proptest.workspace = true
-rand.workspace = true
-rand_08.workspace = true
-
-[[bench]]
-name = "channel_perf"
-harness = false
-
-[[bench]]
-name = "state_root_task"
-harness = false
-
 [features]
 test-utils = [
     "reth-chain-state/test-utils",
@@ -139,18 +99,12 @@ test-utils = [
     "reth-prune-types?/test-utils",
     "reth-trie-parallel/test-utils",
     "reth-ethereum-primitives/test-utils",
-    "reth-node-ethereum/test-utils",
-    "reth-evm-ethereum/test-utils",
     "reth-tasks/test-utils",
 ]
 rocksdb = [
     "reth-provider/rocksdb",
     "reth-prune/rocksdb",
     "reth-stages?/rocksdb",
-    "reth-e2e-test-utils/rocksdb",
 ]
 edge = ["rocksdb"]
 
-[[test]]
-name = "e2e_testsuite"
-path = "tests/e2e-testsuite/main.rs"

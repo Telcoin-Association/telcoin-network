@@ -33,21 +33,5 @@ futures-util.workspace = true
 eyre.workspace = true
 tracing.workspace = true
 
-[dev-dependencies]
-# reth
-reth-provider.workspace = true
-reth-provider.features = ["test-utils"]
-reth-db-common.workspace = true
-
-# async
-tokio-util.workspace = true
-bytes.workspace = true
-
-# http
-reqwest.workspace = true
-
-# file system
-tempfile.workspace = true
-
 [lints]
 workspace = true

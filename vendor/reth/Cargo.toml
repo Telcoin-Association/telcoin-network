@@ -239,7 +239,6 @@ reth-discv4 = { path = "crates/net/discv4" }
 reth-discv5 = { path = "crates/net/discv5" }
 reth-dns-discovery = { path = "crates/net/dns" }
 reth-downloaders = { path = "crates/net/downloaders" }
-reth-e2e-test-utils = { path = "crates/e2e-test-utils" }
 reth-ecies = { path = "crates/net/ecies" }
 reth-engine-local = { path = "crates/engine/local" }
 reth-engine-primitives = { path = "crates/engine/primitives", default-features = false }
@@ -281,7 +280,6 @@ reth-nippy-jar = { path = "crates/storage/nippy-jar" }
 reth-node-api = { path = "crates/node/api" }
 reth-node-builder = { path = "crates/node/builder" }
 reth-node-core = { path = "crates/node/core" }
-reth-node-ethereum = { path = "crates/ethereum/node" }
 reth-node-ethstats = { path = "crates/node/ethstats" }
 reth-node-events = { path = "crates/node/events" }
 reth-node-metrics = { path = "crates/node/metrics" }
@@ -312,7 +310,6 @@ reth-static-file-types = { path = "crates/static-file/types", default-features =
 reth-storage-api = { path = "crates/storage/storage-api", default-features = false }
 reth-storage-errors = { path = "crates/storage/errors", default-features = false }
 reth-tasks = { path = "crates/tasks" }
-reth-testing-utils = { path = "testing/testing-utils" }
 reth-tokio-util = { path = "crates/tokio-util" }
 reth-tracing = { path = "crates/tracing", default-features = false }
 reth-tracing-otlp = { path = "crates/tracing-otlp" }
@@ -346,7 +343,6 @@ alloy-rlp = { version = "0.3.13", default-features = false, features = [
 alloy-trie = { version = "0.9.4", default-features = false }
 alloy-hardforks = "0.4.5"
 alloy-consensus = { version = "1.6.3", default-features = false }
-alloy-contract = { version = "1.6.3", default-features = false }
 alloy-eips = { version = "1.6.3", default-features = false }
 alloy-genesis = { version = "1.6.3", default-features = false }
 alloy-json-rpc = { version = "1.6.3", default-features = false }
@@ -442,7 +438,6 @@ tokio-stream = "0.1.11"
 tokio-tungstenite = "0.28.0"
 tokio-util = { version = "0.7.4", features = ["codec"] }
 async-compression = { version = "0.4", default-features = false }
-async-stream = "0.3"
 async-trait = "0.1.68"
 futures = "0.3"
 futures-core = "0.3"
@@ -482,15 +477,8 @@ opentelemetry-semantic-conventions = "0.31"
 opentelemetry-appender-tracing = "0.31"
 tracing-opentelemetry = "0.32"
 arbitrary = "1.3"
-assert_matches = "1.5.0"
-criterion = { package = "codspeed-criterion-compat", version = "4.3" }
-insta = "1.41"
 proptest = "1.7"
-similar-asserts = { version = "1.5.0", features = ["serde"] }
 tempfile = "3.20"
-test-fuzz = "7"
-rstest = "0.26.1"
-test-case = "3"
 ethereum_ssz = "0.10.1"
 ethereum_ssz_derive = "0.10.1"
 jemalloc_pprof = { version = "0.8", default-features = false }
@@ -525,7 +513,6 @@ rmp-serde = "1.3"
 roaring = "0.11.3"
 rolling-file = "0.2.0"
 snap = "1.1.1"
-socket2 = { version = "0.6", default-features = false }
 sysinfo = { version = "0.38", default-features = false }
 tracing-journald = "0.3"
 tracing-logfmt = "=0.3.5"

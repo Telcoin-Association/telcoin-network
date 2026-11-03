@@ -42,7 +42,6 @@ reth-tasks.workspace = true
 reth-trie = { workspace = true, features = ["metrics"] }
 reth-trie-db = { workspace = true, features = ["metrics"] }
 
-reth-testing-utils = { workspace = true, optional = true }
 
 alloy-eips.workspace = true
 alloy-primitives.workspace = true
@@ -65,39 +64,6 @@ bincode.workspace = true
 reqwest.workspace = true
 eyre.workspace = true
 
-[dev-dependencies]
-# reth
-reth-chainspec.workspace = true
-reth-db = { workspace = true, features = ["test-utils", "mdbx"] }
-reth-ethereum-primitives = { workspace = true, features = ["test-utils"] }
-reth-ethereum-consensus.workspace = true
-reth-evm-ethereum.workspace = true
-reth-consensus = { workspace = true, features = ["test-utils"] }
-reth-network-p2p = { workspace = true, features = ["test-utils"] }
-reth-downloaders = { workspace = true, features = ["file-client"] }
-reth-static-file.workspace = true
-reth-stages-api = { workspace = true, features = ["test-utils"] }
-reth-storage-api.workspace = true
-reth-testing-utils.workspace = true
-reth-trie = { workspace = true, features = ["test-utils"] }
-reth-provider = { workspace = true, features = ["test-utils"] }
-reth-network-peers.workspace = true
-
-alloy-genesis.workspace = true
-alloy-primitives = { workspace = true, features = ["getrandom", "rand"] }
-alloy-rlp.workspace = true
-reth-db-common.workspace = true
-reth-tracing.workspace = true
-
-tokio = { workspace = true, features = ["rt", "sync", "macros"] }
-assert_matches.workspace = true
-rand.workspace = true
-paste.workspace = true
-tempfile.workspace = true
-
-# Stage benchmarks
-criterion = { workspace = true, features = ["async_tokio"] }
-
 [features]
 test-utils = [
     "dep:reth-chainspec",
@@ -105,12 +71,10 @@ test-utils = [
     "reth-db/test-utils",
     "reth-provider/test-utils",
     "reth-stages-api/test-utils",
-    "dep:reth-testing-utils",
     "dep:tempfile",
     "reth-chainspec?/test-utils",
     "reth-consensus/test-utils",
     "reth-evm/test-utils",
-    "reth-downloaders/test-utils",
     "reth-primitives-traits/test-utils",
     "reth-revm/test-utils",
     "reth-codecs/test-utils",
@@ -120,13 +84,8 @@ test-utils = [
     "reth-prune-types/test-utils",
     "dep:reth-ethereum-primitives",
     "reth-ethereum-primitives?/test-utils",
-    "reth-evm-ethereum/test-utils",
     "reth-tasks/test-utils",
 ]
-rocksdb = ["reth-provider/rocksdb", "reth-db-common/rocksdb"]
+rocksdb = ["reth-provider/rocksdb", ]
 edge = ["rocksdb"]
 
-[[bench]]
-name = "criterion"
-harness = false
-required-features = ["test-utils"]

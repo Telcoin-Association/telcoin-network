@@ -36,9 +36,6 @@ metrics.workspace = true
 # misc
 tracing.workspace = true
 
-[dev-dependencies]
-tokio = { workspace = true, features = ["sync", "rt"] }
-
 [features]
 test-utils = [
     "reth-chain-state/test-utils",

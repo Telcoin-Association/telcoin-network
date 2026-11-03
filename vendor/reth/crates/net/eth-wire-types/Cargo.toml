@@ -36,25 +36,12 @@ proptest = { workspace = true, optional = true }
 proptest-arbitrary-interop = { workspace = true, optional = true }
 alloy-hardforks.workspace = true
 
-[dev-dependencies]
-reth-ethereum-primitives = { workspace = true, features = ["arbitrary"] }
-alloy-primitives = { workspace = true, features = ["arbitrary", "rand"] }
-alloy-consensus = { workspace = true, features = ["arbitrary"] }
-alloy-eips = { workspace = true, features = ["arbitrary"] }
-alloy-genesis.workspace = true
-alloy-chains = { workspace = true, features = ["arbitrary"] }
-arbitrary = { workspace = true, features = ["derive"] }
-proptest.workspace = true
-proptest-arbitrary-interop.workspace = true
-rand.workspace = true
-
 [features]
 default = ["std"]
 std = [
     "alloy-chains/std",
     "alloy-consensus/std",
     "alloy-eips/std",
-    "alloy-genesis/std",
     "alloy-primitives/std",
     "alloy-rlp/std",
     "bytes/std",
@@ -84,7 +71,6 @@ serde = [
     "alloy-eips/serde",
     "alloy-primitives/serde",
     "bytes/serde",
-    "rand/serde",
     "reth-primitives-traits/serde",
     "reth-ethereum-primitives/serde",
     "alloy-hardforks/serde",

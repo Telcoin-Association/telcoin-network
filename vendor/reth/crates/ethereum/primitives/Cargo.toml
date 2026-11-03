@@ -31,20 +31,6 @@ modular-bitfield = { workspace = true, optional = true }
 serde = { workspace = true, optional = true }
 serde_with = { workspace = true, optional = true }
 
-[dev-dependencies]
-derive_more.workspace = true
-arbitrary.workspace = true
-bincode.workspace = true
-proptest.workspace = true
-proptest-arbitrary-interop.workspace = true
-rand_08.workspace = true
-rand.workspace = true
-reth-codecs = { workspace = true, features = ["test-utils"] }
-reth-zstd-compressors.workspace = true
-secp256k1 = { workspace = true, features = ["rand"] }
-alloy-consensus = { workspace = true, features = ["serde", "arbitrary"] }
-serde_json.workspace = true
-
 [features]
 default = ["std"]
 test-utils = [
@@ -59,12 +45,9 @@ std = [
     "reth-zstd-compressors?/std",
     "serde?/std",
     "alloy-eips/std",
-    "derive_more/std",
     "serde_with?/std",
-    "secp256k1/std",
     "alloy-rpc-types-eth?/std",
     "alloy-serde?/std",
-    "serde_json/std",
 ]
 reth-codec = [
     "std",
@@ -99,9 +82,6 @@ serde = [
     "alloy-primitives/serde",
     "reth-codecs?/serde",
     "reth-primitives-traits/serde",
-    "rand/serde",
-    "rand_08/serde",
-    "secp256k1/serde",
     "alloy-rpc-types-eth?/serde",
 ]
 rpc = ["dep:alloy-rpc-types-eth"]

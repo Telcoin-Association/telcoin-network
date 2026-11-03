@@ -36,12 +36,6 @@ tracing.workspace = true
 derive_more.workspace = true
 parking_lot = { workspace = true, optional = true }
 
-[dev-dependencies]
-reth-consensus = { workspace = true, features = ["test-utils"] }
-
-parking_lot.workspace = true
-tokio = { workspace = true, features = ["full"] }
-
 [features]
 default = ["std"]
 test-utils = [
