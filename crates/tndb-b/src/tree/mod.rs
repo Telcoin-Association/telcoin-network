@@ -323,11 +323,14 @@ pub(crate) trait PageWrite: PageRead {
     fn free_run(&mut self, pgno: u32, npages: u32);
 
     /// The writer's reused buffers ([`write::Scratch`]), taken for one write that copies or splits
-    /// pages and handed back with [`Self::put_scratch`].
-    fn take_scratch(&mut self) -> write::Scratch;
+    /// pages and handed back with [`Self::put_scratch`]. Boxed, so the hand-off moves one pointer:
+    /// moved whole, the buffers went through a stack copy whose 16-byte loads spanned the 8-byte
+    /// length stores the write had just made, which store forwarding cannot serve, so each load
+    /// waited for every older store, a page copy's among them.
+    fn take_scratch(&mut self) -> Box<write::Scratch>;
 
     /// Hand back the buffers [`Self::take_scratch`] took.
-    fn put_scratch(&mut self, scratch: write::Scratch);
+    fn put_scratch(&mut self, scratch: Box<write::Scratch>);
 
     /// Count one check of a published page ([`write::verify_published`]) that took `ns`
     /// nanoseconds, for the writer's I/O counters (`IoStats::verifies`, `IoStats::verify_ns`).

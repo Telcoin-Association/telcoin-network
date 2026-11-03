@@ -1693,8 +1693,10 @@ pub(crate) struct LeafMut<'a> {
 
 impl<'a> LeafMut<'a> {
     /// Parse `page`'s header: [`Error::Corrupt`] unless it passes [`hdr`]'s checks and is a
-    /// leaf's.
-    #[inline]
+    /// leaf's. Forced inline: out of line, its `Result<Self>` came back through memory as 8-byte
+    /// stores that the caller reloaded 16 bytes at a time, which store forwarding cannot serve, so
+    /// the reload waited for every older store (in a put, right after copy-on-write's page copy).
+    #[inline(always)]
     pub(crate) fn new(page: &'a mut [u8]) -> Result<Self> {
         let h = hdr_of(page, Kind::Leaf)?;
         Ok(Self { page, h })
@@ -1706,8 +1708,10 @@ impl<'a> LeafMut<'a> {
         LeafView { page: self.page, h: self.h }
     }
 
-    /// [`leaf_insert`] of an inline value or an overflow reference ([`CellVal`]).
-    #[inline]
+    /// [`leaf_insert`] of an inline value or an overflow reference ([`CellVal`]). Forced inline,
+    /// as [`Self::new`] is: out of line, `self` went through memory and came back 16 bytes at a
+    /// time over the caller's 8-byte stores.
+    #[inline(always)]
     pub(crate) fn insert(self, i: usize, key: &[u8], value: impl CellVal) -> Result<Fit> {
         let Self { page, h } = self;
         let size = cell_size_leaf(key.len(), value.cell_len());
@@ -1719,8 +1723,8 @@ impl<'a> LeafMut<'a> {
     }
 
     /// [`leaf_replace_value`] with an inline value or an overflow reference (either may replace
-    /// either, [`CellVal`]).
-    #[inline]
+    /// either, [`CellVal`]). Forced inline, as [`Self::insert`] is.
+    #[inline(always)]
     pub(crate) fn replace_value(self, i: usize, value: impl CellVal) -> Result<Fit> {
         let Self { page, h } = self;
         let (off, klen, vlen) = leaf_cell(page, &h, i)?;
@@ -1746,8 +1750,9 @@ impl<'a> LeafMut<'a> {
         Ok(Fit::Done)
     }
 
-    /// [`leaf_delete`] of entry `i` through the parsed header.
-    #[inline]
+    /// [`leaf_delete`] of entry `i` through the parsed header. Forced inline, as [`Self::insert`]
+    /// is.
+    #[inline(always)]
     pub(crate) fn delete(self, i: usize) -> Result<()> {
         let Self { page, h } = self;
         remove_cell(page, &h, i)

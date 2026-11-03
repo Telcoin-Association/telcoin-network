@@ -433,8 +433,9 @@ pub(crate) struct Writer {
     readers: VecDeque<Published>,
     /// The queue's length after its last full pass (see [`Self::prune_readers`]).
     readers_kept: usize,
-    /// The tree writes' reused buffers ([`PageWrite::take_scratch`]).
-    scratch: Scratch,
+    /// The tree writes' reused buffers ([`PageWrite::take_scratch`]), boxed at the first write
+    /// that takes them.
+    scratch: Option<Box<Scratch>>,
     /// The running totals of the I/O and allocation counters, but for those [`Self::io_stats`]
     /// takes from elsewhere ([`Self::verifies`], [`Self::verify_ns`], the file's growth).
     pub(crate) stats: IoStats,
@@ -956,12 +957,12 @@ impl PageWrite for Writer {
         self.alloc.free_run(pgno, npages);
     }
 
-    fn take_scratch(&mut self) -> Scratch {
-        std::mem::take(&mut self.scratch)
+    fn take_scratch(&mut self) -> Box<Scratch> {
+        self.scratch.take().unwrap_or_default()
     }
 
-    fn put_scratch(&mut self, scratch: Scratch) {
-        self.scratch = scratch;
+    fn put_scratch(&mut self, scratch: Box<Scratch>) {
+        self.scratch = Some(scratch);
     }
 
     fn count_verify(&self, ns: u64) {
@@ -1070,7 +1071,7 @@ impl Env {
             unsynced: PageSet::default(),
             readers: VecDeque::from([Published::current(&snapshot)]),
             readers_kept: 1,
-            scratch: Scratch::default(),
+            scratch: None,
             stats: IoStats::default(),
             verifies: AtomicU64::new(0),
             verify_ns: AtomicU64::new(0),

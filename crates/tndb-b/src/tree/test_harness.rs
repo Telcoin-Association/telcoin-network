@@ -71,8 +71,9 @@ pub(crate) struct MemStore {
     /// The pool and page count at the start of the writing transaction, which
     /// [`Self::abort_like`] returns to.
     base: (Vec<u32>, u32),
-    /// The writer's reused buffers ([`PageWrite::take_scratch`]).
-    scratch: Scratch,
+    /// The writer's reused buffers ([`PageWrite::take_scratch`]), boxed at the first write that
+    /// takes them.
+    scratch: Option<Box<Scratch>>,
     /// Deletes do not merge under-full pages ([`PageWrite::no_merge`]).
     pub(crate) no_merge: bool,
     /// What the last delete that merged, or read a sibling that did not fit, reported
@@ -91,7 +92,7 @@ impl MemStore {
             alloc: Allocator::new(1, 2),
             retired: Vec::new(),
             base: (Vec::new(), 2),
-            scratch: Scratch::default(),
+            scratch: None,
             no_merge: false,
             merge_report: MergeReport::default(),
         }
@@ -409,12 +410,12 @@ impl PageWrite for MemStore {
         self.alloc.free_run(pgno, npages);
     }
 
-    fn take_scratch(&mut self) -> Scratch {
-        std::mem::take(&mut self.scratch)
+    fn take_scratch(&mut self) -> Box<Scratch> {
+        self.scratch.take().unwrap_or_default()
     }
 
-    fn put_scratch(&mut self, scratch: Scratch) {
-        self.scratch = scratch;
+    fn put_scratch(&mut self, scratch: Box<Scratch>) {
+        self.scratch = Some(scratch);
     }
 
     fn no_merge(&self) -> bool {
