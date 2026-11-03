@@ -169,6 +169,11 @@ Gossipsub's own peer scoring is deliberately left disabled.
 The peer manager is the authoritative reputation system, and running gossipsub scoring alongside it would double-count the same misbehavior — once as a gossipsub score decay and again as a peer-manager penalty — with two sets of thresholds that could disagree about when to disconnect.
 Two gossipsub events do feed the peer manager directly: a peer that does not support gossipsub is fatally penalized, and a peer that persistently fails to keep up with the mesh takes a mild one.
 
+Keeping scoring off has two consequences inside the library.
+Upstream gossipsub removes an expired `IWANT` promise only from the scoring branch of its heartbeat, so a peer that advertises ids with `IHAVE` and never delivers would grow the promise map without bound.
+Upstream also skips an advertised id while any peer holds a pending promise for it, so one peer's unanswered promise, renewed with each `IHAVE` at no cost, would suppress the `IWANT` to every other advertiser of that id.
+The node therefore carries `patches/libp2p-gossipsub`, which expires promises on every heartbeat, applies the broken-promise penalty only while scoring is active, and skips an advertised id only when the advertising peer itself already holds a pending promise for it; `patches/libp2p-gossipsub/PATCH.md` records the patch and its retirement criteria.
+
 ## Topic re-validation in the application layer
 
 Passing network-layer verification is not the end of the check.
