@@ -1779,8 +1779,25 @@ mod tests {
         }
     }
 
+    /// A client builder for a test's own hop to the gateway or to a mock,
+    /// and for the plain-`http` upstream clients of [`test_state`], with the
+    /// OS trust store left out. Every such hop is plain `http` to `127.0.0.1`,
+    /// and reqwest loads the trust store on each build otherwise
+    /// (`rustls-tls-native-roots`), which takes long enough on some hosts
+    /// (macOS reads it through Security.framework, hundreds of milliseconds a
+    /// load) that a test building a client per request runs out its
+    /// real-time budget on the builds alone.
+    fn test_client_builder() -> reqwest::ClientBuilder {
+        Client::builder().tls_built_in_root_certs(false)
+    }
+
+    /// [`test_client_builder`], built.
+    fn test_client() -> Client {
+        test_client_builder().build().expect("client")
+    }
+
     fn test_state(upstreams: &[UpstreamWorker]) -> AppState {
-        test_state_with_client(upstreams, Client::builder().build().expect("build client"))
+        test_state_with_client(upstreams, test_client())
     }
 
     /// The CLI's default readiness thresholds.
@@ -1935,7 +1952,7 @@ mod tests {
         let (addr, _shutdown) = spawn(test_router(state)).await;
 
         let response =
-            Client::new().get(format!("http://{addr}/health")).send().await.expect("send");
+            test_client().get(format!("http://{addr}/health")).send().await.expect("send");
         assert_eq!(response.status(), StatusCode::OK);
     }
 
@@ -1944,7 +1961,7 @@ mod tests {
         let state = test_state(&[upstream("127.0.0.1:1".parse().expect("addr"))]);
         let readiness = Arc::clone(&state.readiness);
         let (addr, _shutdown) = spawn(test_router(state)).await;
-        let client = Client::new();
+        let client = test_client();
 
         let not_ready = client.get(format!("http://{addr}/ready")).send().await.expect("send");
         assert_eq!(not_ready.status(), StatusCode::SERVICE_UNAVAILABLE);
@@ -1968,7 +1985,7 @@ mod tests {
         // the gateway does not forward the path, so the mock's `/` route
         // answers a POST to any path
         for path in ["/", "/anything"] {
-            let response = Client::new()
+            let response = test_client()
                 .post(format!("http://{gateway_addr}{path}"))
                 .header("content-type", "application/json")
                 .body(r#"{"jsonrpc":"2.0","method":"eth_chainId","id":1}"#)
@@ -2008,7 +2025,7 @@ mod tests {
         state.readiness.set_ready(0, true);
         let (gateway_addr, _shutdown) = spawn(test_router(state)).await;
 
-        let response = Client::new()
+        let response = test_client()
             .post(format!("http://{gateway_addr}/"))
             .body("{}")
             .send()
@@ -2022,7 +2039,7 @@ mod tests {
         let state = test_state(&[upstream("127.0.0.1:1".parse().expect("addr"))]);
         let (gateway_addr, _shutdown) = spawn(test_router(state)).await;
 
-        let response = Client::new()
+        let response = test_client()
             .post(format!("http://{gateway_addr}/"))
             .body(r#"{"jsonrpc":"2.0","method":"eth_chainId","id":42}"#)
             .send()
@@ -2042,7 +2059,7 @@ mod tests {
         state.readiness.set_ready(0, true);
         let (gateway_addr, _shutdown) = spawn(test_router(state)).await;
 
-        let response = Client::new()
+        let response = test_client()
             .post(format!("http://{gateway_addr}/"))
             .body(r#"{"jsonrpc":"2.0","method":"eth_chainId","id":7}"#)
             .send()
@@ -2078,7 +2095,7 @@ mod tests {
         state.readiness.set_ready(0, true);
         let (gateway_addr, _shutdown) = spawn(test_router(state)).await;
 
-        let response = Client::new()
+        let response = test_client()
             .post(format!("http://{gateway_addr}/"))
             .body(r#"{"jsonrpc":"2.0","method":"eth_chainId","id":8}"#)
             .send()
@@ -2097,7 +2114,7 @@ mod tests {
         state.readiness.set_ready(0, true);
         let (gateway_addr, _shutdown) = spawn(test_router(state)).await;
 
-        let response = Client::new()
+        let response = test_client()
             .post(format!("http://{gateway_addr}/"))
             .header("x-tn-gateway", "1")
             .body(r#"{"jsonrpc":"2.0","method":"eth_chainId","id":5}"#)
@@ -2121,7 +2138,7 @@ mod tests {
         state.readiness.set_ready(0, true);
         let (gateway_addr, _shutdown) = spawn(test_router(state)).await;
 
-        let response = Client::new()
+        let response = test_client()
             .post(format!("http://{gateway_addr}/"))
             .body(
                 r#"{"jsonrpc":"2.0","method":"eth_sendRawTransaction","params":["0xdeadbeef"],"id":"tx-77"}"#,
@@ -2151,7 +2168,7 @@ mod tests {
         ))
         .await;
 
-        let response = Client::new()
+        let response = test_client()
             .post(format!("http://{addr}/"))
             .body("this body is definitely longer than eight bytes")
             .send()
@@ -2195,7 +2212,7 @@ mod tests {
         ))
         .await;
 
-        let client = Client::new();
+        let client = test_client();
         let first = client
             .post(format!("http://{addr}/"))
             .body(r#"{"jsonrpc":"2.0","method":"eth_chainId","id":1}"#)
@@ -2239,7 +2256,7 @@ mod tests {
         ))
         .await;
 
-        let client = Client::new();
+        let client = test_client();
         for _ in 0..5 {
             let response = client.get(format!("http://{addr}/health")).send().await.expect("send");
             assert_eq!(response.status(), StatusCode::OK);
@@ -2408,7 +2425,7 @@ mod tests {
         // response: the second only succeeds if the first connection's permit
         // is released, so a permit leak would hang (and time out) this test.
         for id in [1, 2] {
-            let response = Client::new()
+            let response = test_client()
                 .post(format!("http://{gateway_addr}/"))
                 .header("connection", "close")
                 .body(format!(r#"{{"jsonrpc":"2.0","method":"eth_chainId","id":{id}}}"#))
@@ -2610,7 +2627,7 @@ mod tests {
         ));
 
         let request = tokio::spawn(
-            Client::new().post(format!("http://{addr}/")).body(call("eth_chainId", 1)).send(),
+            test_client().post(format!("http://{addr}/")).body(call("eth_chainId", 1)).send(),
         );
         tokio::time::sleep(Duration::from_millis(100)).await;
         shutdown.notify();
@@ -2847,7 +2864,7 @@ mod tests {
         extra_header: Option<&'static str>,
         body: String,
     ) -> (StatusCode, String) {
-        let request = Client::new().post(format!("http://{gateway}/")).body(body);
+        let request = test_client().post(format!("http://{gateway}/")).body(body);
         let request = match extra_header {
             Some(name) => request.header(name, "1"),
             None => request,
@@ -3147,7 +3164,7 @@ mod tests {
         assert_eq!(error_code_and_id(&text), (-32000, serde_json::json!(2)));
 
         let ready =
-            Client::new().get(format!("http://{gateway}/ready")).send().await.expect("send");
+            test_client().get(format!("http://{gateway}/ready")).send().await.expect("send");
         assert_eq!(ready.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(worker_seen.hits(), 0);
         assert_eq!(query_seen.hits(), 1);
@@ -3170,7 +3187,7 @@ mod tests {
         let (status, text) = post_rpc(gateway, None, call("eth_sendRawTransaction", 1)).await;
         assert_eq!((status, text.as_str()), (StatusCode::OK, "worker"));
         let ready =
-            Client::new().get(format!("http://{gateway}/ready")).send().await.expect("send");
+            test_client().get(format!("http://{gateway}/ready")).send().await.expect("send");
         assert_eq!(ready.status(), StatusCode::OK);
     }
 
@@ -3254,7 +3271,7 @@ mod tests {
         let (gateway, _shutdown) = spawn(test_router(state)).await;
 
         let started = tokio::time::Instant::now();
-        let response = Client::new()
+        let response = test_client()
             .post(format!("http://{gateway}/"))
             .body(call("eth_getLogs", 1))
             .send()
@@ -3294,7 +3311,7 @@ mod tests {
         let (gateway, _shutdown) = spawn(test_router(state)).await;
 
         let started = tokio::time::Instant::now();
-        let response = Client::new()
+        let response = test_client()
             .post(format!("http://{gateway}/"))
             .body(call("eth_getLogs", 1))
             .send()
@@ -3774,7 +3791,7 @@ mod tests {
 
             // a client that follows nothing either, so any worker hit could
             // only have come from the gateway
-            let client = Client::builder().redirect(Policy::none()).build().expect("client");
+            let client = test_client_builder().redirect(Policy::none()).build().expect("client");
             let response = client
                 .post(format!("http://{gateway}/"))
                 .body(call("eth_call", 1))
@@ -3825,7 +3842,7 @@ mod tests {
             }),
         );
         let (bouncer, _bouncer) = spawn(bouncer).await;
-        let client = Client::builder().redirect(Policy::none()).build().expect("client");
+        let client = test_client_builder().redirect(Policy::none()).build().expect("client");
         for (route, state) in [
             ("worker", redirect_state(bouncer, None)),
             ("query", redirect_state(worker, Some(bouncer))),
@@ -3890,7 +3907,7 @@ mod tests {
     /// POST a JSON-RPC call to the gateway carrying `headers`.
     async fn post_with(gateway: SocketAddr, headers: &[(&str, &str)]) -> (StatusCode, String) {
         let request = headers.iter().fold(
-            Client::new().post(format!("http://{gateway}/")).body(call("eth_chainId", 1)),
+            test_client().post(format!("http://{gateway}/")).body(call("eth_chainId", 1)),
             |request, (name, value)| request.header(*name, *value),
         );
         let response = request.send().await.expect("send");
@@ -3969,7 +3986,7 @@ mod tests {
         );
         let (gateway, _shutdown) = spawn(identity_router(state, limiters, "127.0.0.1/32")).await;
         let post = |client: &'static str, body: String| async move {
-            let response = Client::new()
+            let response = test_client()
                 .post(format!("http://{gateway}/"))
                 .header("x-forwarded-for", client)
                 .body(body)
@@ -4387,9 +4404,18 @@ mod tests {
             "closed before the header read timeout: {before:?}"
         );
         tokio::time::sleep_until(started + header_read_timeout + Duration::from_millis(500)).await;
-        tokio::task::yield_now().await;
-        let after = stalled.try_read(&mut [0_u8; 1]);
-        assert!(matches!(after, Ok(0)), "still open 500ms past the header read timeout: {after:?}");
+        // the timeout has fired by now and nothing later could close the
+        // connection (no lifetime cap, hyper never took it over), so this
+        // read may wait: the runtime takes in the close as the kernel
+        // delivers it, which on some hosts is after the yield, and the clock
+        // runs again so the wait is bounded in real time
+        tokio::time::resume();
+        let after =
+            tokio::time::timeout(Duration::from_secs(1), stalled.read(&mut [0_u8; 1])).await;
+        assert!(
+            matches!(after, Ok(Ok(0))),
+            "still open 500ms past the header read timeout: {after:?}"
+        );
     }
 
     /// The accept loop for the probe-only `/health` router with PROXY protocol
@@ -4566,7 +4592,7 @@ mod tests {
     }
 
     async fn ready_status(gateway: SocketAddr) -> StatusCode {
-        Client::new().get(format!("http://{gateway}/ready")).send().await.expect("send").status()
+        test_client().get(format!("http://{gateway}/ready")).send().await.expect("send").status()
     }
 
     #[tokio::test]
@@ -4680,7 +4706,7 @@ mod tests {
             .expect("local addr");
         // no idle connections, so every forward opens a new one and the third
         // is refused rather than sent on the second's connection
-        let client = Client::builder()
+        let client = test_client_builder()
             .pool_max_idle_per_host(0)
             .connect_timeout(Duration::from_secs(2))
             .timeout(Duration::from_secs(5))
@@ -4873,7 +4899,7 @@ mod tests {
         let query_slots = Arc::clone(&state.query_slots);
         let (gateway, _gateway_server) = spawn(test_router(state)).await;
 
-        let mut response = Client::new()
+        let mut response = test_client()
             .post(format!("http://{gateway}/"))
             .body(call("eth_getLogs", 1))
             .send()
@@ -4910,7 +4936,7 @@ mod tests {
 
         // a read over the cap is answered at once; waiting for a slot would
         // take until the upstream request timeout (5s) frees one
-        let client = Client::new();
+        let client = test_client();
         let started = tokio::time::Instant::now();
         let response = client
             .post(format!("http://{}/", saturated.gateway))
@@ -5028,7 +5054,7 @@ mod tests {
 
         // ten concurrent submissions, each reporting its outcome as it lands
         let (done, mut outcomes) = tokio::sync::mpsc::unbounded_channel();
-        let client = Client::new();
+        let client = test_client();
         for id in 1..=10_u64 {
             let request =
                 client.post(format!("http://{gateway}/")).body(call("eth_sendRawTransaction", id));
@@ -5102,7 +5128,7 @@ mod tests {
 
         // without the query deadline the read would get the late answer after
         // 1s; with it the read times out after about 200ms
-        let client = Client::new();
+        let client = test_client();
         let started = tokio::time::Instant::now();
         let response = client
             .post(format!("http://{gateway}/"))
@@ -5288,7 +5314,7 @@ mod tests {
         state.readiness.set_ready(0, true);
         let (gateway, _shutdown) = spawn(test_router(state)).await;
 
-        let response = Client::new()
+        let response = test_client()
             .post(format!("http://{gateway}/"))
             .body(call("eth_chainId", 21))
             .send()
@@ -5321,7 +5347,7 @@ mod tests {
             state.readiness.set_ready(0, true);
             let (gateway, _shutdown) = spawn(test_router(state)).await;
 
-            let response = Client::new()
+            let response = test_client()
                 .post(format!("http://{gateway}/"))
                 .body(call("eth_chainId", 1))
                 .send()
@@ -5455,7 +5481,7 @@ mod tests {
         state.readiness.set_ready(0, true);
         let (gateway, _shutdown) = spawn(test_router(state)).await;
 
-        let response = Client::new()
+        let response = test_client()
             .post(format!("http://{gateway}/"))
             .body(call("eth_chainId", 1))
             .send()
@@ -5537,7 +5563,7 @@ mod tests {
         state.readiness.set_ready(0, true);
         let (gateway, _shutdown) = spawn(test_router(state)).await;
 
-        let response = Client::new()
+        let response = test_client()
             .post(format!("http://{gateway}/"))
             .body(call("eth_getLogs", 1))
             .send()
@@ -5569,7 +5595,7 @@ mod tests {
         state.readiness.set_ready(0, true);
         let (gateway, _shutdown) = spawn(test_router(state)).await;
 
-        let response = Client::new()
+        let response = test_client()
             .post(format!("http://{gateway}/"))
             .body(call("eth_getLogs", 1))
             .send()
@@ -5622,7 +5648,7 @@ mod tests {
         state.readiness.set_ready(0, true);
         let (gateway, _shutdown) = spawn(test_router(state)).await;
 
-        let mut response = Client::new()
+        let mut response = test_client()
             .post(format!("http://{gateway}/"))
             .body(call("eth_chainId", 1))
             .send()
@@ -5948,7 +5974,7 @@ mod tests {
         for _ in 0..4 {
             held.push(TcpStream::connect(gateway_addr).await.expect("connect"));
         }
-        let client = Client::builder().timeout(Duration::from_secs(1)).build().expect("client");
+        let client = test_client_builder().timeout(Duration::from_secs(1)).build().expect("client");
 
         // the client listener's cap is full, so a probe sent there waits in
         // the accept backlog
@@ -5975,7 +6001,7 @@ mod tests {
 
         for path in [READY_PATH, "/not-a-probe"] {
             let response =
-                Client::new().get(format!("http://{probe_addr}{path}")).send().await.expect("send");
+                test_client().get(format!("http://{probe_addr}{path}")).send().await.expect("send");
             assert_eq!(
                 response.headers().get(header::X_CONTENT_TYPE_OPTIONS),
                 Some(&HeaderValue::from_static("nosniff")),
@@ -6060,7 +6086,7 @@ mod tests {
 
         // the probe listener, from the same address, still answers every probe
         // no limiter by construction; the global bucket and /ready/any would catch one being added
-        let client = Client::new();
+        let client = test_client();
         for _ in 0..3 {
             for path in [HEALTH_PATH, READY_PATH, READY_ANY_PATH] {
                 let response =
@@ -6097,7 +6123,7 @@ mod tests {
         });
         tokio::spawn(run_poller(
             Arc::clone(&state.readiness),
-            Client::new(),
+            test_client(),
             query_probe,
             Duration::from_millis(50),
             Duration::from_secs(1),
@@ -6109,7 +6135,7 @@ mod tests {
     /// GET a probe path, returning its status and JSON body.
     async fn get_probe(addr: SocketAddr, path: &str) -> (StatusCode, serde_json::Value) {
         let response =
-            Client::new().get(format!("http://{addr}{path}")).send().await.expect("send");
+            test_client().get(format!("http://{addr}{path}")).send().await.expect("send");
         (response.status(), response.json().await.expect("json body"))
     }
 
@@ -6320,7 +6346,7 @@ mod tests {
         let app = identity_router(state, one_request_per_ip(), "127.0.0.1/32");
         let (gateway, _shutdown) = spawn(app).await;
         let url = format!("http://{gateway}{READY_ANY_PATH}");
-        let client = Client::new();
+        let client = test_client();
         let status = |method: Method| {
             let request = client.request(method, &url).body(call("eth_chainId", 1));
             async move { request.send().await.expect("send").status() }
@@ -6890,7 +6916,7 @@ mod tests {
         };
         let (gateway, _shutdown) = spawn_with_limits(test_router(state), limits).await;
 
-        let client = Client::new();
+        let client = test_client();
         let mut ready = false;
         for _ in 0..50 {
             let response =
@@ -6904,7 +6930,7 @@ mod tests {
         assert!(ready, "the poller should mark the worker ready");
         let start = thread_count();
 
-        let reader = Client::new();
+        let reader = test_client();
         let reads = tokio::spawn(async move {
             let mut ticker = tokio::time::interval(Duration::from_millis(10));
             let mut sent = Vec::with_capacity(300);
@@ -7024,7 +7050,7 @@ mod tests {
         ));
         let (gateway, _shutdown) = spawn(test_router(state)).await;
 
-        let client = Client::new();
+        let client = test_client();
         let mut ready = false;
         for _ in 0..100 {
             let response =
@@ -7651,7 +7677,7 @@ mod tests {
         // `/ready/any` is added after every layer, so it never reserves bytes
         for path in [HEALTH_PATH, READY_PATH, READY_ANY_PATH] {
             for body in [Vec::new(), vec![b' '; 16]] {
-                let response = Client::new()
+                let response = test_client()
                     .get(format!("http://{gateway}{path}"))
                     .body(body)
                     .send()
@@ -7750,7 +7776,7 @@ mod tests {
         let (gateway, _shutdown) = spawn_with_limits(app, wide).await;
 
         let body = axum::body::Bytes::from(padded_call(1, MAX_REQUEST_BYTES));
-        let client = Client::new();
+        let client = test_client();
         let before = peak_rss_kb();
         let requests = (0..PARALLEL).map(|_| {
             let request = client.post(format!("http://{gateway}/")).body(body.clone()).send();
@@ -8051,7 +8077,7 @@ mod tests {
         let recent = state.recent_submissions.clone().expect("hash routing on");
         let (gateway, _shutdown) = spawn(test_router(state)).await;
 
-        let response = Client::new()
+        let response = test_client()
             .post(format!("http://{gateway}/"))
             .body(submission(1))
             .send()
@@ -8220,7 +8246,7 @@ mod tests {
         state.readiness.set_ready(0, true);
         let (gateway, _shutdown) = spawn(test_router(state)).await;
 
-        let response = Client::new()
+        let response = test_client()
             .post(format!("http://{gateway}/"))
             .body(submission(1))
             .send()
@@ -8743,7 +8769,7 @@ mod tests {
         ))
         .await;
 
-        let client = Client::new();
+        let client = test_client();
         // a POST to a probe path is refused too: the probe routes refuse it
         // before the proxy
         const NON_POST: &str = "only POST is accepted";
@@ -8797,7 +8823,7 @@ mod tests {
         ))
         .await;
 
-        let client = Client::new();
+        let client = test_client();
         for path in [HEALTH_PATH, READY_PATH, READY_ANY_PATH] {
             for method in [Method::POST, Method::DELETE] {
                 let response = client
@@ -8871,7 +8897,7 @@ mod tests {
         let (worker, _worker_seen, _worker) = named_mock("worker").await;
         let (query, _query) = labelled_query_mock(content_type).await;
         let (gateway, _shutdown) = spawn(test_router(redirect_state(worker, Some(query)))).await;
-        Client::new()
+        test_client()
             .post(format!("http://{gateway}/"))
             .body(call("eth_call", 1))
             .send()
@@ -8963,7 +8989,7 @@ mod tests {
         ))
         .await;
 
-        let client = Client::new();
+        let client = test_client();
         let url = |path: &str| format!("http://{gateway}{path}");
         let cases = [
             ("method refused", client.put(url("/health")), StatusCode::METHOD_NOT_ALLOWED),
@@ -9003,12 +9029,12 @@ mod tests {
                 == Some(&HeaderValue::from_static("nosniff"))
         };
 
-        let response = Client::new().get(&url).send().await.expect("send");
+        let response = test_client().get(&url).send().await.expect("send");
         assert_eq!(response.status(), StatusCode::OK);
         assert!(nosniff(&response), "GET");
 
         for method in [Method::POST, Method::PUT] {
-            let response = Client::new()
+            let response = test_client()
                 .request(method.clone(), &url)
                 .body(call("eth_chainId", 1))
                 .send()
@@ -9553,7 +9579,7 @@ mod tests {
         let (status, body) = get_probe(probes, READY_ANY_PATH).await;
         assert!(draining(status, body.clone()), "{status} {body}");
         let health =
-            Client::new().get(format!("http://{probes}{HEALTH_PATH}")).send().await.expect("send");
+            test_client().get(format!("http://{probes}{HEALTH_PATH}")).send().await.expect("send");
         assert_eq!(health.status(), StatusCode::OK);
         assert!(notice.elapsed() < shutdown_delay, "the probes above must run inside the delay");
 
@@ -9592,7 +9618,7 @@ mod tests {
 
     /// The browser's preflight for a JSON-RPC `POST` from `origin`.
     async fn preflight(gateway: SocketAddr, origin: &str) -> reqwest::Response {
-        Client::new()
+        test_client()
             .request(Method::OPTIONS, format!("http://{gateway}/"))
             .header(header::ORIGIN, origin)
             .header(header::ACCESS_CONTROL_REQUEST_METHOD, "POST")
@@ -9605,7 +9631,7 @@ mod tests {
     /// A JSON-RPC `POST` from `origin`, as a browser sends it after the
     /// preflight.
     async fn post_from(gateway: SocketAddr, origin: &str) -> reqwest::Response {
-        Client::new()
+        test_client()
             .post(format!("http://{gateway}/"))
             .header(header::ORIGIN, origin)
             .header(header::CONTENT_TYPE, "application/json")
@@ -9833,7 +9859,7 @@ mod tests {
     async fn options_with_cors_is_answered_before_the_post_only_rule() {
         let origin = "https://app.example";
         let (gateway, worker_seen, _guards) = cors_gateway(cors_list(&[origin])).await;
-        let client = Client::new();
+        let client = test_client();
 
         // the proxy's refusal would say `Allow: POST`; on the probe paths axum
         // adds the routes' own `Allow: GET,HEAD` to the preflight answer
@@ -10160,7 +10186,7 @@ mod tests {
         let submission = format!(
             r#"{{"jsonrpc":"2.0","method":"eth_sendRawTransactionSync","params":["{SIGNED_TX}"],"id":"submission-id"}}"#
         );
-        let client = Client::new();
+        let client = test_client();
         for body in [read.to_string(), submission.clone()] {
             let response = client
                 .post(format!("http://{gateway}/private/path?api_key=SECRET"))
@@ -10208,7 +10234,7 @@ mod tests {
         // proxied request is logged
         let (gateway, _shutdown) = spawn(access_router(ready_state(worker), 0.5, None)).await;
 
-        let client = Client::new();
+        let client = test_client();
         for path in [HEALTH_PATH, READY_PATH, READY_ANY_PATH, HEALTH_PATH] {
             let response =
                 client.get(format!("http://{gateway}{path}")).send().await.expect("send");
@@ -10374,7 +10400,7 @@ mod tests {
         // the proxy client's own timeout, so the deadline fires mid-forward
         let (worker, worker_seen, _worker) = counted_slow_mock(Duration::from_secs(1)).await;
         let proxy_client =
-            Client::builder().timeout(Duration::from_secs(5)).build().expect("build client");
+            test_client_builder().timeout(Duration::from_secs(5)).build().expect("build client");
         let state = test_state_with_client(&[upstream(worker)], proxy_client);
         state.readiness.set_ready(0, true);
         let access_log = AccessLog::new(1.0, None, PrefixPolicy::default());
@@ -10450,7 +10476,7 @@ mod tests {
 
         let preflight_status = preflight(gateway, origin).await.status();
         assert!(preflight_status.is_success(), "{preflight_status}");
-        let put = Client::new().put(format!("http://{gateway}/")).send().await.expect("send");
+        let put = test_client().put(format!("http://{gateway}/")).send().await.expect("send");
         assert_eq!(put.status(), StatusCode::METHOD_NOT_ALLOWED);
         assert_eq!(worker_seen.hits(), 0);
 
@@ -10677,7 +10703,7 @@ mod tests {
         let (gateway, _shutdown) = spawn(test_router(state)).await;
 
         // the test's own client must not use the proxy either
-        let client = Client::builder().no_proxy().build().expect("client");
+        let client = test_client_builder().no_proxy().build().expect("client");
         // with a redirect a read goes to the query upstream, so the call that
         // must reach the worker is a submission
         let response = client

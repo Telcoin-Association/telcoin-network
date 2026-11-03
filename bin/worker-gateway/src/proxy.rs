@@ -1472,10 +1472,17 @@ pub(crate) struct UpstreamClientBuilder(ClientBuilder);
 impl UpstreamClientBuilder {
     /// A builder with [`client_builder`]'s rustls backend, no-proxy policy and
     /// `connect_timeout`, but no `Settings`: no extra CA, no client
-    /// certificate and the default resolver. For tests whose upstreams are
-    /// plain-`http` IP literals.
+    /// certificate, the default resolver, and no OS trust store either (a
+    /// load reqwest repeats on every build, slow on some hosts). For tests
+    /// whose upstreams are plain-`http` IP literals.
     pub(crate) fn for_test(connect_timeout: Duration) -> Self {
-        Self(Client::builder().use_rustls_tls().no_proxy().connect_timeout(connect_timeout))
+        Self(
+            Client::builder()
+                .use_rustls_tls()
+                .tls_built_in_root_certs(false)
+                .no_proxy()
+                .connect_timeout(connect_timeout),
+        )
     }
 }
 
