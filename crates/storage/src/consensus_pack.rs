@@ -698,7 +698,11 @@ impl ConsensusPack {
             }
             // A read the disk failed is no verdict on the pack either (only a short header is
             // its contents): a read error, which the back-off remembers, so a failing disk is
-            // not read again by every reader, nor reported corrupt.
+            // not read again by every reader, nor reported corrupt. `UnexpectedEof` is also what
+            // `MmapDataFile::open_with` returns for a file that shrank under a read-only open,
+            // which is a writer still sealing it; the arm below reads that kind as an unsealed
+            // log only because this runs after `get_static`'s locked retry, when the handoff's
+            // seal is complete. A caller that opened unlocked would have to tell the two apart.
             Err(DataFileOpen(LoadHeaderError::IO(e)))
                 if e.kind() != io::ErrorKind::UnexpectedEof =>
             {
