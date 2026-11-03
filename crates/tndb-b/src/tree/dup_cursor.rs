@@ -127,19 +127,29 @@ pub(crate) struct DupHint<'h> {
     /// The page of the outer leaf the walker is at: the leaf of the outer tree holding the key's
     /// cell, entered with a descent's checks.
     pub(crate) outer_leaf: Option<u32>,
+    /// Whether that leaf had the full range check of a descent ([`TreeCursor::leaf_checked`]):
+    /// a leaf a seek landed in and nothing read past its landing entry has had only the checks
+    /// of the keys its search compared, the key's cell among them.
+    pub(crate) outer_checked: bool,
     /// The nested path's slots, root first; none at a packed key.
     pub(crate) nested: write::Hint<'h>,
 }
 
 /// No hints: every descent of a dup write searches, and its outer cell is found from the root.
-pub(crate) const NO_DUP_HINT: DupHint<'static> =
-    DupHint { outer: write::NO_HINT, outer_leaf: None, nested: write::NO_HINT };
+pub(crate) const NO_DUP_HINT: DupHint<'static> = DupHint {
+    outer: write::NO_HINT,
+    outer_leaf: None,
+    outer_checked: false,
+    nested: write::NO_HINT,
+};
 
 impl DupHint<'_> {
-    /// The outer leaf the walker is at and the slot of the key's cell in it, if it holds one.
+    /// The outer leaf the walker is at, the slot of the key's cell in it and whether the leaf had
+    /// the full range check ([`Self::outer_checked`]), if it holds one.
     #[inline]
-    pub(crate) fn held(&self) -> Option<(u32, usize)> {
-        self.outer_leaf.zip(self.outer.last().map(|&slot| usize::from(slot)))
+    pub(crate) fn held(&self) -> Option<(u32, usize, bool)> {
+        let slot = self.outer.last().map(|&slot| usize::from(slot));
+        self.outer_leaf.zip(slot).map(|(pgno, slot)| (pgno, slot, self.outer_checked))
     }
 }
 
@@ -236,7 +246,12 @@ impl DupWalk {
         } else {
             write::NO_HINT
         };
-        DupHint { outer: self.outer.hint(outer.height), outer_leaf: self.outer.leaf_pgno(), nested }
+        DupHint {
+            outer: self.outer.hint(outer.height),
+            outer_leaf: self.outer.leaf_pgno(),
+            outer_checked: self.outer.leaf_checked(),
+            nested,
+        }
     }
 
     /// Run a move; an error leaves both paths unset.

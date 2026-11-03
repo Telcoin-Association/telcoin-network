@@ -340,7 +340,7 @@ fn dup_entry<'m>(
     map: &'m mut NestedMap,
     packed_in: &mut Vec<u8>,
     k: &[u8],
-    held: Option<(u32, usize)>,
+    held: Option<(u32, usize, bool)>,
 ) -> Result<DupEntry<'m>> {
     // The map first: a key it holds has its working root there, never in a cell.
     if !map.contains_key(k) {
@@ -379,26 +379,31 @@ fn dup_entry<'m>(
     })
 }
 
-/// Outer key `k`'s cell in `held`, the outer leaf a dup cursor is at and its slot there
-/// ([`DupHint::held`]), read by the record's packed-set limit `packed_max` ([`outer_val`]); `None`
-/// for no leaf or a leaf without the key, so the caller finds the cell from the root. The cursor
-/// is up to date at a row of `k`, so the leaf is the working outer tree's leaf for `k`, entered
-/// with a descent's checks: a cell of `k` there is the one a descent from the root finds. The
-/// page is fetched with the per-fetch checks, as the cursor's moves fetch it ([`checked`]); the
-/// slot's key first, else a search of the leaf when `k` lies between its first and last keys.
+/// Outer key `k`'s cell in `held`, the outer leaf a dup cursor is at, its slot there and whether
+/// the leaf had the full range check ([`DupHint::held`]), read by the record's packed-set limit
+/// `packed_max` ([`outer_val`]); `None` for no leaf or a leaf without the key, so the caller
+/// finds the cell from the root. The cursor is up to date at a row of `k`, so the leaf is the
+/// working outer tree's leaf for `k`, entered with a descent's checks: a cell of `k` there is the
+/// one a descent from the root finds. The page is fetched with the per-fetch checks, as the
+/// cursor's moves fetch it ([`checked`]); the slot's key first (the cursor's landing entry, or
+/// an entry of a leaf checked in full), else, in a leaf checked in full only, a search of the
+/// leaf when `k` lies between its first and last keys: a leaf a seek entered may hold keys
+/// outside its range ([`TreeCursor::leaf_checked`]), and its search could find a cell a descent
+/// from the root does not.
 fn held_cell<'s>(
     writer: &'s Writer,
     table: &Table,
     packed_max: u16,
-    held: Option<(u32, usize)>,
+    held: Option<(u32, usize, bool)>,
     k: &[u8],
 ) -> Result<Option<OuterVal<'s>>> {
-    let Some((pgno, slot)) = held else { return Ok(None) };
+    let Some((pgno, slot, checked)) = held else { return Ok(None) };
     let view = page::LeafView::new(PageRead::page(writer, pgno)?)?;
     let n = view.nkeys();
     let val = match (slot < n).then(|| view.entry(slot)).transpose()? {
         Some((at, val)) if at == k => Some(val),
-        _ if n > 0
+        _ if checked
+            && n > 0
             && page::cmp_keys(view.key(0)?, k).is_le()
             && page::cmp_keys(k, view.key(n - 1)?).is_le() =>
         {
@@ -2849,6 +2854,21 @@ impl RwTxn {
         self.work.tables.iter().find(|w| w.table == *table).map_or(0, |w| w.writes)
     }
 
+    /// Test-only: whether outer key `k`'s cell of the dup table `table` is read in `held` (an
+    /// outer leaf, a slot there and whether the leaf had the full range check, as
+    /// [`DupHint::held`] gives them) rather than left to a lookup from the root ([`held_cell`]).
+    #[cfg(test)]
+    pub(crate) fn held_cell_for_test(
+        &self,
+        table: &Table,
+        held: (u32, usize, bool),
+        k: &[u8],
+    ) -> Result<bool> {
+        let record = self.work.record(table).expect("the table resolves");
+        let packed_max = record.dup.expect("a dup table").packed_max;
+        held_cell(self.work.writer(), table, packed_max, Some(held), k).map(|cell| cell.is_some())
+    }
+
     /// Test-only: drop outer key `k`'s entry from the dup table `table`'s working map, changing
     /// nothing else (so its cell may name a superseded root, or a page private to this
     /// transaction); true if there was one.
@@ -3937,6 +3957,15 @@ impl DupTxnCursor {
     #[cfg(test)]
     pub(crate) fn key_for_test(&self) -> Option<&[u8]> {
         (self.walk.state() == State::At).then(|| self.walk.key())
+    }
+
+    /// Test-only: the outer leaf a write into the key of the row the cursor is at would read
+    /// that key's cell in, its slot and whether the leaf had the full range check, as the
+    /// write's hints give them ([`DupWalk::hints`], [`DupHint::held`]); `None` when not at a row.
+    #[cfg(test)]
+    pub(crate) fn held_for_test(&self) -> Option<(u32, usize, bool)> {
+        let k = self.key_for_test()?.get(..self.walk.kl())?;
+        self.walk.hints(k, &self.outer_root).held()
     }
 
     /// Test-only: what places the cursor, as a seek leaves it: its state, where it is in the

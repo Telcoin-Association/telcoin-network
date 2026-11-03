@@ -1200,6 +1200,39 @@ fn a_held_outer_leaf_never_overrides_the_map() {
     }
 }
 
+/// A dup write reads its key's cell in the cursor's outer leaf ([`DupHint::held`]) at the
+/// cursor's slot in any leaf, but by a search of the leaf only in a leaf checked in full: a seek
+/// checks only the keys its search compared, so the outer leaf it lands in may hold keys outside
+/// its range, and a search there could find a cell a descent from the root does not; the write
+/// then looks the cell up from the root. A step on to the next key gives the outer leaf, or the
+/// next one, the full check.
+///
+/// [`DupHint::held`]: crate::tree::dup_cursor::DupHint::held
+#[test]
+fn a_held_outer_leaf_is_searched_only_once_checked_in_full() {
+    let keys: Vec<(u32, u16)> = (0..600).map(|k| (k, 2)).collect();
+    for bound in [Bound::Unpacked, Bound::Default] {
+        let (_dir, env, d, _p, _) =
+            setup_with("tndb_b_dup_txn_held_search", &keys, bound.options(OPTIONS.key_len));
+        let txn = env.begin_rw().expect("rw");
+        let mut c = txn.dup_cursor_detached(&d).expect("cursor");
+        let k = 300u32.to_be_bytes();
+        assert!(c.seek_exact(&txn, &row_key(300, 1)).expect("seek").is_some(), "{bound:?}");
+        let Some((leaf, slot, checked)) = c.held_for_test() else { panic!("{bound:?}: at a row") };
+        assert!(!checked, "{bound:?}: a seek's outer leaf");
+        let held = |slot, checked| {
+            txn.held_cell_for_test(&d, (leaf, slot, checked), &k).expect("the held cell")
+        };
+        let beside = slot.checked_sub(1).unwrap_or(slot + 1);
+        assert!(held(slot, false), "{bound:?}: the cursor's slot");
+        assert!(held(beside, true), "{bound:?}: a search of a leaf checked in full");
+        assert!(!held(beside, false), "{bound:?}: no search of a seek's leaf");
+        assert_eq!(key_of(c.next(&txn)), Some(row_key(301, 0)), "{bound:?}: the next key");
+        let checked = c.held_for_test().map(|(_, _, checked)| checked);
+        assert_eq!(checked, Some(true), "{bound:?}: after a step to the next key");
+    }
+}
+
 /// [`dup_routing`]'s levels routed by a hint and hints refused; none in a release build, which
 /// does not count them.
 fn hint_routing() -> [u64; 2] {

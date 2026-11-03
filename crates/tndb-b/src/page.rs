@@ -1223,6 +1223,18 @@ impl<'a> View<'a> {
             prefetch_cell(page, first);
             prefetch_cell(page, h.nkeys - 1);
         }
+        self.prefetch_probe(probe);
+    }
+
+    /// [`Self::prefetch_level`]'s hint for cell `probe` alone, for a descent whose range check
+    /// reads only cells its search compares (a cursor's seek): a `probe` past the cells reads
+    /// nothing.
+    #[inline(always)]
+    pub(crate) fn prefetch_probe(&self, probe: usize) {
+        let (page, h) = match self {
+            Self::Leaf(v) => (v.page, &v.h),
+            Self::Branch(v) => (v.page, &v.h),
+        };
         if probe < h.nkeys {
             prefetch_cell(page, probe);
         }

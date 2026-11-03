@@ -2509,8 +2509,11 @@ fn a_txn_cursor_seeks_from_its_leaf_after_a_schema_change() {
 /// A seek of a cursor at an entry meets damage in a page it enters with a descent's exact
 /// message, the one a new cursor's seek meets: the next leaf, sought from the leaf's end (a key
 /// past the leaf descends from the root), with its kind byte changed (and its CRC restamped).
-/// Damage on the path the cursor already holds is not met again: with the root's kind changed, a
-/// new cursor's seek fails at the root, and a seek inside the cursor's leaf does not.
+/// Damage on the path the cursor already holds is met again only by the full range check a
+/// seek's leaf gets before its first read past the landing entry ([`TreeCursor::check_leaf`]),
+/// which fetches the path's branches again: with the root's kind changed, a new cursor's seek
+/// fails at the root, and so does a seek inside the leaf of a cursor a seek put there; a cursor a
+/// step inside the leaf or a crossing into it put there serves that seek.
 #[test]
 fn a_seek_from_the_leaf_meets_damage_as_a_descent_does() {
     /// The kind byte of a page header (`page.rs`).
@@ -2548,17 +2551,274 @@ fn a_seek_from_the_leaf_meets_damage_as_a_descent_does() {
     store.raw_mut(next).copy_from_slice(&saved);
     store.restamp(next);
 
+    let (_, first, _) = a_middle_leaf(&store, &root);
+    assert!(last >= first + 4, "a leaf of three entries or more");
     let s = &store.reader();
-    let mut c = TreeCursor::default();
-    c.seek(s, &root, None, &key_of(last)).expect("seek");
+    let mut sought = TreeCursor::default();
+    sought.seek(s, &root, None, &key_of(last)).expect("seek");
+    let mut stepped = TreeCursor::default();
+    stepped.seek(s, &root, None, &key_of(last - 4)).expect("seek");
+    stepped.next(s, &root).expect("a step inside the leaf");
+    // The previous leaf's last entry, then across into the leaf along its first edge.
+    let mut crossed = TreeCursor::default();
+    crossed.seek(s, &root, None, &key_of(first - 2)).expect("seek");
+    crossed.next(s, &root).expect("a crossing");
+    for c in [&sought, &stepped, &crossed] {
+        assert_eq!(c.leaf_pgno(), Some(leaf), "at the leaf");
+    }
     let saved = store.raw(root.root).to_vec();
     store.raw_mut(root.root)[KIND] = saved[KIND] ^ 0x03;
     store.restamp(root.root);
     let s = &store.reader();
-    assert!(message(TreeCursor::default().seek(s, &root, None, &key_of(last)))
-        .starts_with(&format!("page {}", root.root)));
-    let page = c.leaf_page(s).expect("leaf");
-    let got = c.seek(s, &root, page, &key_of(last - 2)).expect("inside the leaf");
-    assert_eq!(got.map(|(k, _)| k.to_vec()), Some(key_of(last - 2)));
+    let at_root = format!("page {}", root.root);
+    assert!(
+        message(TreeCursor::default().seek(s, &root, None, &key_of(last))).starts_with(&at_root)
+    );
+    let page = sought.leaf_page(s).expect("leaf");
+    let met = message(sought.seek(s, &root, page, &key_of(last - 2)));
+    assert!(met.starts_with(&at_root), "a seek's leaf: {met}");
+    for (what, c) in [("a step", &mut stepped), ("a crossing", &mut crossed)] {
+        let page = c.leaf_page(s).expect("leaf");
+        let got = c.seek(s, &root, page, &key_of(last - 2)).expect("inside the leaf");
+        assert_eq!(got.map(|(k, _)| k.to_vec()), Some(key_of(last - 2)), "{what}");
+    }
     store.raw_mut(root.root).copy_from_slice(&saved);
+}
+
+/// The message of a `Corrupt` result.
+fn corrupt_message<T: std::fmt::Debug>(r: Result<T>) -> String {
+    match r {
+        Err(Error::Corrupt(m)) => m,
+        other => panic!("not Corrupt: {other:?}"),
+    }
+}
+
+/// The descent's error of page `pgno`, which holds keys outside its parents' separators.
+fn misrouted_message(pgno: u32) -> String {
+    format!("page {pgno} holds keys outside its parents' separators (a misrouted pointer)")
+}
+
+/// Write `key_of(i)` over the separator of cell `ci` of branch `pgno` (a whole key of the same
+/// length), and restamp the page's CRC.
+fn set_separator(store: &mut MemStore, pgno: u32, ci: usize, i: u64) {
+    let page = store.raw(pgno);
+    let separator = page::branch_key(page, ci).expect("separator");
+    let (at, len) = (separator.as_ptr() as usize - page.as_ptr() as usize, separator.len());
+    assert_eq!(len, key_of(i).len(), "a whole key");
+    store.raw_mut(pgno)[at..at + len].copy_from_slice(&key_of(i));
+    store.restamp(pgno);
+}
+
+/// The path a seek of `key_of(i)` takes: `(page, slot)` per level from the root.
+fn path_to(store: &MemStore, root: &TreeRoot, i: u64) -> Vec<(u32, u16)> {
+    let mut c = TreeCursor::default();
+    c.seek(&store.reader(), root, None, &key_of(i)).expect("seek");
+    c.path()
+}
+
+/// A middle leaf of `even_tree(1_000)` whose separator after it in its parent was moved inside
+/// it, to `key_of(first + 5)` (CRC restamped), so the leaf only partly overlaps the range its
+/// parents give it: the store, the root, the leaf, and its first and last keys' `i`. The leaf's
+/// entries `first`, `first + 2` and `first + 4` lie inside that range, the rest past it.
+fn a_partly_misrouted_leaf() -> (MemStore, TreeRoot, u32, u64, u64) {
+    let (mut store, root) = even_tree(1_000);
+    let (leaf, first, last) = a_middle_leaf(&store, &root);
+    assert!(last >= first + 8, "a leaf of five entries or more");
+    let path = path_to(&store, &root, first);
+    let (parent, ci) = path[path.len() - 2];
+    set_separator(&mut store, parent, usize::from(ci) + 1, first + 5);
+    (store, root, leaf, first, last)
+}
+
+/// A seek checks only the keys its search compared, so it lands in a leaf that only partly
+/// overlaps the range its parents' separators give it when those keys lie inside it: a hit, a
+/// miss and an exact hit there land, an exact miss there misses, and the landing entry is the
+/// cursor's current one. Every read of the leaf past that entry gives it the full check first and
+/// is `Corrupt` with the descent's message, the cursor unset: a step either way, a prefix step,
+/// and a seek from the leaf for a key inside it (`seek` and `seek_exact`), on the detached and
+/// the public cursor. A seek from the leaf for a key past it descends from the root and lands as
+/// a new cursor's seek does.
+#[test]
+fn a_seek_lands_in_a_leaf_partly_outside_its_range_and_reading_on_refuses_it() {
+    let (store, root, leaf, first, last) = a_partly_misrouted_leaf();
+    let want = misrouted_message(leaf);
+    let s = &store.reader();
+    let at = |i: u64| Some((key_of(i), (i / 2).to_le_bytes().to_vec()));
+    let landed = || {
+        let mut c = TreeCursor::default();
+        assert_eq!(
+            owned(c.seek(s, &root, None, &key_of(first + 2)).expect("a hit")),
+            at(first + 2)
+        );
+        c
+    };
+    let mut c = TreeCursor::default();
+    assert_eq!(owned(c.seek(s, &root, None, &key_of(first + 3)).expect("a miss")), at(first + 4));
+    let exact = c.seek_exact(s, &root, None, &key_of(first + 4)).expect("an exact hit");
+    assert_eq!(exact, Some(&(first / 2 + 2).to_le_bytes()[..]));
+    assert_eq!(c.seek_exact(s, &root, None, &key_of(first + 3)).expect("an exact miss"), None);
+
+    type Read<'a, C> = &'a dyn Fn(&mut C) -> Result<()>;
+    let inside = key_of(first + 6);
+    let reads: [(&str, Read<'_, TreeCursor>); 5] = [
+        ("next", &|c| c.next(s, &root).map(drop)),
+        ("prev", &|c| c.prev(s, &root).map(drop)),
+        ("next_in_prefix", &|c| c.step_in_prefix(s, &root, None, 0, true).map(drop)),
+        ("seek inside the leaf", &|c| {
+            let page = c.leaf_page(s)?;
+            c.seek(s, &root, page, &inside).map(drop)
+        }),
+        ("seek_exact inside the leaf", &|c| {
+            let page = c.leaf_page(s)?;
+            c.seek_exact(s, &root, page, &inside).map(drop)
+        }),
+    ];
+    for (what, read) in reads {
+        let mut c = landed();
+        assert_eq!(owned(c.current(s).expect("current")), at(first + 2), "{what}: current");
+        assert_eq!(corrupt_message(read(&mut c)), want, "{what}");
+        assert_eq!(c.state(), State::Unset, "{what}: an error leaves the cursor unset");
+    }
+    let mut c = landed();
+    let page = c.leaf_page(s).expect("leaf");
+    let past = owned(c.seek(s, &root, page, &key_of(last + 1)).expect("from the root"));
+    let fresh = TreeCursor::default().seek(s, &root, None, &key_of(last + 1)).expect("seek");
+    assert_eq!(past, owned(fresh), "a key past the leaf");
+
+    let latch = Latch::default();
+    let reads: [(&str, Read<'_, Cursor<'_>>); 5] = [
+        ("next", &|c| c.next().map(drop)),
+        ("prev", &|c| c.prev().map(drop)),
+        ("next_in_prefix", &|c| c.next_in_prefix(0).map(drop)),
+        ("seek inside the leaf", &|c| c.seek(&inside).map(drop)),
+        ("seek_exact inside the leaf", &|c| c.seek_exact(&inside).map(drop)),
+    ];
+    for (what, read) in reads {
+        let mut c = Cursor::new(s, root, &latch);
+        assert_eq!(owned(c.seek(&key_of(first + 2)).expect("a hit")), at(first + 2), "{what}");
+        assert_eq!(owned(c.current().expect("current")), at(first + 2), "{what}: current");
+        assert_eq!(corrupt_message(read(&mut c)), want, "the public cursor's {what}");
+    }
+}
+
+/// A seek into a page wholly outside the range its parents' separators give it is `Corrupt` at
+/// that page with the descent's message, though it checks only the keys its search compared,
+/// for `seek` and `seek_exact`: a root cell pointed at the other subtree's branch (both cell
+/// fields copied), each way, is refused at that branch by the bounds of the route its search
+/// took; a cell one level down pointed at a sibling leaf, each way, at that leaf by the keys
+/// either side of the miss.
+#[test]
+fn a_seek_into_a_page_wholly_outside_its_range_is_corrupt_at_that_page() {
+    let (mut store, root) = even_tree(1_000);
+    assert_eq!(root.height, 3, "the root's children are branches");
+    let (branch, _) = page::branch_child(store.raw(root.root), 1).expect("child");
+    assert!(page::nkeys(store.raw(branch)) >= 3);
+    for (pgno, from, to) in [(root.root, 0, 1), (root.root, 1, 0), (branch, 2, 1), (branch, 1, 2)] {
+        let saved = store.raw(pgno).to_vec();
+        let target = page::branch_child(&saved, to).expect("child");
+        page::branch_set_child(store.raw_mut(pgno), from, target.0, target.1).expect("set");
+        store.restamp(pgno);
+        // A key of the lost range: the first key of the cell's range.
+        let lost = match from {
+            0 => key_of(0),
+            _ => page::branch_key(&saved, from).expect("separator").to_vec(),
+        };
+        let (s, want) = (&store.reader(), misrouted_message(target.0));
+        let what = format!("page {pgno}'s cell {from} -> {to}");
+        let sought = TreeCursor::default().seek(s, &root, None, &lost);
+        assert_eq!(corrupt_message(sought), want, "{what}: seek");
+        let found = TreeCursor::default().seek_exact(s, &root, None, &lost);
+        assert_eq!(corrupt_message(found), want, "{what}: seek_exact");
+        store.raw_mut(pgno).copy_from_slice(&saved);
+        store.restamp(pgno);
+    }
+    assert_eq!(scan(&store.reader(), &root, true).expect("scan"), 1_000);
+}
+
+/// A descent along an edge keeps the full range check, so `first`, `last` and a crossing into a
+/// leaf that only partly overlaps its range are `Corrupt` with the descent's message: the first
+/// leaf with the separator after it moved inside it, the last leaf with the separator before it
+/// moved inside it, and the middle leaf of [`a_partly_misrouted_leaf`], entered forward from the
+/// leaf before it and backward from the leaf after it.
+#[test]
+fn first_last_and_crossings_check_a_leaf_partly_outside_its_range_in_full() {
+    let (mut store, root) = even_tree(1_000);
+    let path = path_to(&store, &root, 0);
+    let (parent, first_leaf) = (path[1].0, path[2].0);
+    assert!(page::nkeys(store.raw(first_leaf)) >= 3, "a first leaf of three entries or more");
+    let saved = store.raw(parent).to_vec();
+    set_separator(&mut store, parent, 1, 3);
+    let first = corrupt_message(TreeCursor::default().first(&store.reader(), &root));
+    assert_eq!(first, misrouted_message(first_leaf), "first");
+    store.raw_mut(parent).copy_from_slice(&saved);
+    store.restamp(parent);
+
+    let path = path_to(&store, &root, 1_998);
+    let ((parent, ci), last_leaf) = (path[1], path[2].0);
+    assert!(ci >= 1 && page::nkeys(store.raw(last_leaf)) >= 2, "a last leaf with a separator");
+    let low = LeafView::new(store.raw(last_leaf)).expect("leaf").key(0).expect("key").to_vec();
+    let low = u64::from_be_bytes(low[..8].try_into().expect("8 bytes"));
+    set_separator(&mut store, parent, usize::from(ci), low + 1);
+    let last = corrupt_message(TreeCursor::default().last(&store.reader(), &root));
+    assert_eq!(last, misrouted_message(last_leaf), "last");
+
+    let (store, root, leaf, first, last) = a_partly_misrouted_leaf();
+    let s = &store.reader();
+    for (from, forward) in [(first - 2, true), (last + 2, false)] {
+        let mut c = TreeCursor::default();
+        assert_eq!(
+            owned(c.seek(s, &root, None, &key_of(from)).expect("seek")).map(|e| e.0),
+            Some(key_of(from))
+        );
+        let crossed = if forward { c.next(s, &root) } else { c.prev(s, &root) };
+        assert_eq!(corrupt_message(crossed), misrouted_message(leaf), "forward {forward}");
+    }
+}
+
+/// A seek's descent leaves its leaf unchecked ([`TreeCursor::leaf_checked`]) until the first read
+/// past its landing entry checks it in full, and only then: reading the landing entry leaves it
+/// unchecked, a step inside the leaf checks it. A descent along an edge (`first`, `last`, a
+/// crossing), the writer's placement ([`TreeCursor::place`]) and every reset (an exact miss, a
+/// seek past the end) leave the cursor checked.
+#[test]
+fn a_seeks_leaf_stays_unchecked_until_a_read_past_its_landing() {
+    let (store, root) = even_tree(1_000);
+    let (_, first, last) = a_middle_leaf(&store, &root);
+    let s = &store.reader();
+    let mut c = TreeCursor::default();
+    assert!(c.leaf_checked(), "a new cursor");
+    let unchecked = |c: &mut TreeCursor, what: &str| {
+        c.seek(s, &root, None, &key_of(first)).expect("seek");
+        assert!(!c.leaf_checked(), "{what}: a seek's leaf");
+    };
+    unchecked(&mut c, "current");
+    c.current(s).expect("current");
+    assert!(!c.leaf_checked(), "the landing entry read");
+    c.next(s, &root).expect("next");
+    assert!(c.leaf_checked(), "a step inside the leaf");
+    c.seek(s, &root, None, &key_of(first + 1)).expect("a miss");
+    assert!(!c.leaf_checked(), "a seek's miss");
+    c.seek_exact(s, &root, None, &key_of(first)).expect("an exact hit");
+    assert!(!c.leaf_checked(), "an exact hit");
+    c.seek_exact(s, &root, None, &key_of(first + 1)).expect("an exact miss");
+    assert!(c.leaf_checked(), "an exact miss");
+    unchecked(&mut c, "first");
+    c.first(s, &root).expect("first");
+    assert!(c.leaf_checked(), "first");
+    unchecked(&mut c, "last");
+    c.last(s, &root).expect("last");
+    assert!(c.leaf_checked(), "last");
+    c.seek(s, &root, None, &key_of(last)).expect("seek");
+    c.next(s, &root).expect("a crossing");
+    assert!(c.leaf_checked(), "a crossing");
+    unchecked(&mut c, "place");
+    let path = c.path();
+    let (leaf, slot) = path[path.len() - 1];
+    let branches: Vec<_> =
+        path[..path.len() - 1].iter().map(|&(p, i)| (p, usize::from(i))).collect();
+    c.place(&branches, leaf, usize::from(slot));
+    assert!(c.leaf_checked(), "place");
+    unchecked(&mut c, "past the end");
+    assert_eq!(c.seek(s, &root, None, &key_of(1_999)).expect("seek"), None);
+    assert!(c.leaf_checked(), "past the end");
 }
