@@ -1151,7 +1151,8 @@ argument of do-not-flag items 11 and 12): a key between its first and last keys 
 too, and its descent takes the cursor's own path. A leaf a seek's descent entered has had only the
 checks of the keys its search compared (item 29), so the seek from it first gives it the full
 range check, as a step does before reading past the landing entry (`TreeCursor::check_leaf`: the
-path's branches fetched again for the range, then the leaf's first and last keys); a leaf already
+path's branches fetched again for the range, which the routes of the two levels the descent
+recorded give, then the leaf's first and last keys; item 29); a leaf already
 checked in full, or entered along an edge, is not checked again. A key outside the leaf trusts
 nothing of it and needs no check. The leaf is the page `Cursor` holds, `RoCursor`'s
 `Snapshot::page_again` (unchecked, item 14) and a `TxnCursor`'s `Writer::page` (checked). A seek
@@ -2062,10 +2063,21 @@ These limits and non-goals are known:
     the range, is deferred: the leaf a seek lands in stays unchecked (`TreeCursor::leaf_checked`)
     until a read of it past the landing entry (a step, a prefix step, a seek from the leaf) gives it
     that check first, once (`TreeCursor::check_leaf`: the path's branches fetched again for the
-    range, the descent's message). A dup write reads its key's cell in a held outer leaf that is
-    still unchecked only at the cursor's slot, its landing entry, and finds any other cell from the
-    root (`held_cell`). A descent along an edge (to the first or last entry, every crossing) keeps
-    the full check of every page.
+    range, the descent's message). That range is read from two levels only
+    (`TreeCursor::seek_bounds`): the descent checked each route against the range above it
+    (`route.lo >= lo`, `route.hi < hi`), so the deepest route with a lower bound gives the
+    intersection's `lo`, and the deepest with an upper bound its `hi`. The slots name those two
+    levels with no cell read (a route has a lower bound exactly when its slot is not the branch's
+    first, an upper one when it is not the last; `TreeCursor::bound_levels`), so the descent
+    records nothing, and the check reads only their routes, every branch still fetched again with
+    the per-fetch checks and parsed as a branch, in the path's order, before any route (the routes
+    of the other levels are cells the descent's search read with the same cell checks). Debug
+    builds assert that range equals, by content, the one built from every level's route
+    (`TreeCursor::bounds`; `a_seeks_leaf_check_reads_the_range_of_its_deepest_bounded_levels`).
+    A dup write reads its key's cell in a held outer leaf that is still unchecked only at the
+    cursor's slot, its landing entry, and finds any other cell from the root (`held_cell`). A
+    descent along an edge (to the first or last entry, every crossing) keeps the full check of
+    every page.
     - What is given up: a seek that lands and moves no further accepts a page that only partly
       overlaps its range (a damaged separator or pointer whose page straddles a bound), its landing
       entry, which the search compared, inside the range. A page wholly outside its range is still
