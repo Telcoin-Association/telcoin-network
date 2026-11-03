@@ -10,21 +10,36 @@
 //!
 //! Every page a cursor enters gets the checks of a descent ([`super::read::descend`]): the
 //! checked fetch, the copy its parent names (header page number and txn), a branch above the
-//! tree's height and a leaf at it, no empty non-root leaf, and every key inside the intersection
-//! of the ranges its ancestors' separators give it. A child pointer damaged at rest that leads to
-//! another page of the tree is then [`Error::Corrupt`], not a scan that skips or repeats entries.
+//! tree's height and a leaf at it, no empty non-root leaf, and a range check against the
+//! intersection of the ranges its ancestors' separators give it. A descent along an edge (to the
+//! first or last entry, and every crossing to the next or previous leaf) checks every key of the
+//! page against that range, by its first and last keys. A seek's descent checks only the keys its
+//! search compared, the rule of a point read ([`super::read::check_miss`]): at a branch the
+//! bounds of the route taken (the separators either side of the child), at the leaf for a miss
+//! the keys either side of the insertion point (a hit is the sought key itself, which the routes
+//! kept inside every range). The leaf a seek lands in gets the full check before any read of it
+//! past its landing entry ([`TreeCursor::check_leaf`]: a step, a prefix step, a seek from the
+//! leaf). A child pointer damaged at rest that leads to another page of the tree is then
+//! [`Error::Corrupt`], not a scan that skips or repeats entries: a page wholly outside its range
+//! at the descent, a leaf that only partly overlaps it at the first read past the landing entry.
+//! Every entry a cursor returns past its landing comes from a leaf checked in full; a seek that
+//! lands and moves no further accepts a leaf that only partly overlaps its range, its landing
+//! entry inside it (README do-not-flag 29).
 //!
 //! The descent parses each page's header once ([`page::View`]), after the fetch checks and the
-//! kind check, and makes the range check, the empty-page checks and the search through that one
-//! view, in that order. It hands the leaf's view to the move that settles there, which reads the
-//! entry through it: an exact seek's hit is the search's own result ([`Find::Found`]), not a
-//! second read of the cell.
+//! kind check, and makes the other checks and the search through that one view: along an edge
+//! the range check, the empty-page checks and the move to the first or last slot, in that order;
+//! for a key the empty-page checks, the search, then the range check of the keys it compared. It
+//! hands the leaf's view to the move that settles there, which reads the entry through it: an
+//! exact seek's hit is the search's own result ([`Find::Found`]), not a second read of the cell.
 //!
 //! A seek starts from the leaf the cursor is at when its caller holds that leaf's page and vouches
 //! that the path is still the tree's ([`TreeCursor::seek`]): a key between the leaf's first and
 //! last keys is searched in that leaf alone, and any other key descends from the root
-//! ([`TreeCursor::near`]). Such a key's entry is the one a descent from the root finds; the leaf
-//! the cursor already holds is not checked again, as a step does not check it again.
+//! ([`TreeCursor::near`]). Such a key's entry is the one a descent from the root finds once the
+//! leaf has had the full range check: a leaf a seek entered gets it first, which fetches the
+//! path's branches again; a leaf already checked in full is not checked again, as a step does
+//! not check it again.
 //!
 //! A write through a cursor at an entry passes the cursor's slots to the write's descent as a
 //! routing hint ([`TreeCursor::hint`], [`write::Hint`]): slots only, each one followed only where
@@ -34,7 +49,7 @@ use super::{read::tighten, write, PageRead, TreeRoot, MAX_HEIGHT};
 use crate::{
     error::{Error, Result},
     latch::Latch,
-    page::{self, Find, Kind, LeafView, Search, Val, View},
+    page::{self, BranchView, Find, Kind, LeafView, Search, Val, View},
 };
 
 // Test-only, in debug test builds only: the release benchmark is compiled with the test
@@ -164,6 +179,16 @@ fn key_tail<'s, S: PageRead + ?Sized>(
 /// A key range `[lo, hi)` borrowed from a page store (`None`: unbounded).
 type Bounds<'s> = (Option<&'s [u8]>, Option<&'s [u8]>);
 
+/// The deepest branch level of a path whose route has a lower (or an upper) bound, an index into
+/// `pages` and `slots`, with that branch's page (`None`: no level has the bound;
+/// [`TreeCursor::bound_levels`]).
+type BoundLevel<'s> = Option<(usize, &'s [u8])>;
+
+/// Test-only: the levels a seek's leaf check reads its bounds from, `(lo, hi)` (`None`: no level
+/// has the bound; [`TreeCursor::seek_bounds_for_test`]).
+#[cfg(test)]
+type BoundLevels = (Option<usize>, Option<usize>);
+
 /// Where a move landed: the entry the cursor is now at, with the page of the leaf holding it
 /// (`None`: not at an entry).
 pub(crate) type Landing<'s> = Option<(Entry<'s>, &'s [u8])>;
@@ -227,6 +252,12 @@ pub(crate) struct TreeCursor {
     /// Levels of the path in use (the tree's height while [`State::At`]).
     depth: usize,
     state: State,
+    /// Whether the leaf of the path was entered by a seek's descent, which checks only the keys
+    /// its search compared ([`Self::descend`]), and has not had the full range check since: set
+    /// by that descent, cleared by the check ([`Self::check_leaf`]) that every read of the leaf
+    /// past its landing entry makes first, by a descent along an edge, by [`Self::place`] and
+    /// by every reset.
+    leaf_unchecked: bool,
 }
 
 impl Default for TreeCursor {
@@ -236,6 +267,7 @@ impl Default for TreeCursor {
             slots: [0; MAX_HEIGHT as usize],
             depth: 0,
             state: State::Unset,
+            leaf_unchecked: false,
         }
     }
 }
@@ -245,6 +277,41 @@ impl Default for TreeCursor {
 fn narrow(slot: usize) -> u16 {
     debug_assert!(u16::try_from(slot).is_ok(), "slot {slot}");
     slot as u16
+}
+
+/// Whether the keys a seek's search compared at a page lie inside the range `[lo, hi)` the
+/// separators above give the page (`None`: unbounded): `below`, the nearest compared key below
+/// the sought key (a route's lower bound, the key before a miss's insertion point), at or above
+/// `lo`, and `above`, the nearest above it (a route's upper bound, the key at the insertion
+/// point), below `hi`; each checked when both sides are given. [`read::check_miss`]'s rule.
+///
+/// [`read::check_miss`]: super::read::check_miss
+#[inline(always)]
+fn compared_in_range(
+    below: Option<&[u8]>,
+    above: Option<&[u8]>,
+    lo: Option<&[u8]>,
+    hi: Option<&[u8]>,
+) -> bool {
+    let below_ok = match (below, lo) {
+        (Some(k), Some(lo)) => page::cmp_keys(k, lo).is_ge(),
+        _ => true,
+    };
+    let above_ok = match (above, hi) {
+        (Some(k), Some(hi)) => page::cmp_keys(k, hi).is_lt(),
+        _ => true,
+    };
+    below_ok && above_ok
+}
+
+/// The error of page `pgno`, which holds keys outside the range its ancestors' separators give
+/// it: every range check of a cursor's, the full and the narrowed ones.
+#[cold]
+#[inline(never)]
+fn misrouted(pgno: u32) -> Error {
+    Error::Corrupt(format!(
+        "page {pgno} holds keys outside its parents' separators (a misrouted pointer)"
+    ))
 }
 
 impl TreeCursor {
@@ -285,8 +352,9 @@ impl TreeCursor {
     }
 
     /// Move one entry forward or backward inside `leaf`, the page of the leaf the cursor is at
-    /// (fetched and checked when the cursor entered it). `None`, the cursor unmoved, when the
-    /// move would leave the leaf or the cursor is not at an entry.
+    /// (fetched and checked when the cursor entered it, and given the full range check before
+    /// the entry is read if a seek entered it: [`Self::check_leaf`]). `None`, the cursor
+    /// unmoved, when the move would leave the leaf or the cursor is not at an entry.
     #[inline]
     pub(crate) fn step_in_leaf<'s, S: PageRead + ?Sized>(
         &mut self,
@@ -316,6 +384,7 @@ impl TreeCursor {
         };
         let Some(to) = to else { return Ok(None) };
         self.guarded(|c| {
+            c.check_leaf(store, leaf)?;
             c.set_top_slot(to);
             Ok(Some(leaf_entry::<R, S>(store, leaf, to)?))
         })
@@ -324,7 +393,7 @@ impl TreeCursor {
     /// Place the cursor at entry `slot` of `leaf`, below `branches` (root first, as `(pgno, child
     /// index taken)`), without reading a page: the caller is the writer that just put that entry
     /// there, on that path of its own pages, so a descent for the entry's key would take exactly
-    /// this path.
+    /// this path, and the write's descent made the range checks of its rules.
     pub(crate) fn place(&mut self, branches: &[(u32, usize)], leaf: u32, slot: usize) {
         let depth = branches.len() + 1;
         let steps = self.pages.iter_mut().zip(&mut self.slots);
@@ -334,6 +403,7 @@ impl TreeCursor {
         (self.pages[branches.len()], self.slots[branches.len()]) = (leaf, narrow(slot));
         self.depth = depth;
         self.state = State::At;
+        self.leaf_unchecked = false;
     }
 
     /// Place the cursor where a seek of a key just deleted from entry `slot` of `leaf`, below
@@ -633,6 +703,7 @@ impl TreeCursor {
             };
             match to {
                 Some(to) => {
+                    c.check_leaf(store, leaf)?;
                     let (k, v) = page::leaf_entry(leaf, to)?;
                     if !k.starts_with(prefix) {
                         return Ok(None);
@@ -679,6 +750,14 @@ impl TreeCursor {
     /// The page number of the leaf the cursor is at, if it is at an entry.
     pub(crate) fn leaf_pgno(&self) -> Option<u32> {
         (self.state == State::At).then(|| self.pages[self.depth - 1])
+    }
+
+    /// Whether the leaf the cursor is at had the full range check of a descent: false while a
+    /// seek's descent entered it and nothing read past its landing entry since
+    /// ([`Self::check_leaf`]).
+    #[inline]
+    pub(crate) fn leaf_checked(&self) -> bool {
+        !self.leaf_unchecked
     }
 
     /// The page of the leaf the cursor is at, fetched with the per-fetch checks
@@ -739,6 +818,112 @@ impl TreeCursor {
     fn reset(&mut self, state: State) {
         self.depth = 0;
         self.state = state;
+        self.leaf_unchecked = false;
+    }
+
+    /// Give `leaf`, the page of the leaf the cursor is at, the full range check of a descent if a
+    /// seek's descent entered it and it has not had that check since: every move that reads the
+    /// leaf past its landing entry calls this first. A sound leaf is then checked once, however
+    /// many entries are read from it.
+    #[inline(always)]
+    fn check_leaf<S: PageRead + ?Sized>(&mut self, store: &S, leaf: &[u8]) -> Result<()> {
+        if self.leaf_unchecked {
+            self.check_leaf_slow(store, leaf)?;
+        }
+        Ok(())
+    }
+
+    /// [`Self::check_leaf`]'s check: the range the path's branches give the leaf, read from the
+    /// routes of at most two levels ([`Self::seek_bounds`], every branch fetched again with the
+    /// per-fetch checks and its header parsed), and every key of `leaf` inside it, else
+    /// the descent's error; then the mark is cleared. Never inlined: a step of a checked leaf
+    /// pays one branch on a field.
+    ///
+    /// Debug builds assert that the range equals, by content, the one [`Self::bounds`] builds
+    /// from every level's route, whenever that succeeds: it can fail only at a route this check
+    /// does not read, whose cells the descent's search read with the same checks, so only on a
+    /// page changed since the descent.
+    #[inline(never)]
+    fn check_leaf_slow<S: PageRead + ?Sized>(&mut self, store: &S, leaf: &[u8]) -> Result<()> {
+        let (lo, hi) = self.seek_bounds(store)?;
+        #[cfg(debug_assertions)]
+        if let Ok(full) = self.bounds(store, self.depth - 1) {
+            assert_eq!((lo, hi), full, "the deepest bounded levels' range is the path's");
+        }
+        if !LeafView::new(leaf)?.keys_in_range(lo, hi)? {
+            return Err(misrouted(self.pages[self.depth - 1]));
+        }
+        self.leaf_unchecked = false;
+        Ok(())
+    }
+
+    /// The range `[lo, hi)` the path's branches give the leaf a seek's descent entered (`None`:
+    /// unbounded), what [`Self::bounds`] builds from every level, read from the routes of the two
+    /// levels [`Self::bound_levels`] names: `lo` from the deepest route with a lower bound, `hi`
+    /// from the deepest with an upper bound (one level may give both).
+    ///
+    /// The descent checked each branch's route against the range above it
+    /// ([`compared_in_range`]: `route.lo >= lo`, `route.hi < hi`), so each bound a route has
+    /// narrows the range to itself: the deepest route with a lower bound gives the
+    /// intersection's `lo`, and the deepest with an upper bound its `hi`. The routes of the
+    /// other levels are not read.
+    #[inline(always)]
+    fn seek_bounds<'s, S: PageRead + ?Sized>(&self, store: &'s S) -> Result<Bounds<'s>> {
+        let (lo_at, hi_at) = self.bound_levels(store)?;
+        let route = |(level, page): (usize, &'s [u8])| {
+            page::branch_route_at(page, usize::from(self.slots[level]))
+        };
+        let lo = match lo_at {
+            Some(at) => route(at)?.lo,
+            None => None,
+        };
+        let hi = match hi_at {
+            Some(at) => route(at)?.hi,
+            None => None,
+        };
+        Ok((lo, hi))
+    }
+
+    /// The deepest branch levels of the path whose routes have a lower and an upper bound, each
+    /// with its page, from the slots and the branches' headers alone: a route has a lower bound
+    /// exactly when its slot is not the branch's first, and an upper one when it is not the last
+    /// ([`page::BranchView::route_at`]), so the descent records nothing. Every level is fetched
+    /// again with the per-fetch checks and parsed as a branch, the checks and messages of
+    /// [`Self::bounds`] in its order, before any route is read.
+    #[inline(always)]
+    fn bound_levels<'s, S: PageRead + ?Sized>(
+        &self,
+        store: &'s S,
+    ) -> Result<(BoundLevel<'s>, BoundLevel<'s>)> {
+        let (mut lo_at, mut hi_at): (BoundLevel<'s>, BoundLevel<'s>) = (None, None);
+        let levels = self.depth - 1;
+        let path = self.pages[..levels].iter().zip(&self.slots[..levels]);
+        for (level, (&pgno, &ci)) in path.enumerate() {
+            let page = store.page(pgno)?;
+            let n = BranchView::new(page)?.nkeys();
+            let ci = usize::from(ci);
+            if ci > 0 {
+                lo_at = Some((level, page));
+            }
+            if ci + 1 < n {
+                hi_at = Some((level, page));
+            }
+        }
+        Ok((lo_at, hi_at))
+    }
+
+    /// Test-only: while a seek's leaf is unchecked, the levels its check reads the bounds from
+    /// ([`Self::bound_levels`]), the range read from them ([`Self::seek_bounds`]) and the range
+    /// [`Self::bounds`] builds from every level.
+    #[cfg(test)]
+    pub(crate) fn seek_bounds_for_test<'s, S: PageRead + ?Sized>(
+        &self,
+        store: &'s S,
+    ) -> Result<(BoundLevels, Bounds<'s>, Bounds<'s>)> {
+        assert!(self.leaf_unchecked, "a seek's unchecked leaf");
+        let (lo_at, hi_at) = self.bound_levels(store)?;
+        let levels = (lo_at.map(|(level, _)| level), hi_at.map(|(level, _)| level));
+        Ok((levels, self.seek_bounds(store)?, self.bounds(store, self.depth - 1)?))
     }
 
     /// [`Self::seek_exact`]: land on the entry `key` and return its value with the page of its
@@ -882,6 +1067,7 @@ impl TreeCursor {
         read: impl Fn(&LeafView<'s>, usize) -> Result<T>,
     ) -> Result<FromLeaf<'s, T>> {
         let Some(view) = self.near(page, key)? else { return Ok(None) };
+        self.check_leaf(store, page)?;
         let (Search::Found(slot) | Search::NotFound(slot)) = view.search(key)?;
         self.set_top_slot(slot);
         self.land(store, root, view, true, read).map(Some)
@@ -901,6 +1087,7 @@ impl TreeCursor {
         beside: &impl Fn(&LeafView<'s>, usize) -> Result<()>,
     ) -> Result<FromLeaf<'s, R::Out<'s>>> {
         let Some(view) = self.near(page, key)? else { return Ok(None) };
+        self.check_leaf(store, page)?;
         let (index, value) = match view.find(key)? {
             Find::Found { index, value } => (index, value),
             Find::NotFound { index, .. } => {
@@ -916,12 +1103,13 @@ impl TreeCursor {
     /// The view of `page`, the page of the leaf the cursor is at, when `key` lies between the
     /// leaf's first and last keys; `None` for any other key, which descends from the root.
     ///
-    /// The cursor entered the leaf with a descent's checks, so its keys lie in the range the
-    /// separators of all its ancestors give it, and a key between its first and last keys lies
-    /// there too: a descent from the root takes the cursor's own path and searches this leaf.
-    /// A key outside the leaf is not placed from the parent's separators: a seek that misses the
-    /// leaf would pay that fetch and its compares before descending anyway, and seeks that go on
-    /// forward mostly land in the leaf they are at.
+    /// Once the leaf has had the full range check (a descent along an edge made it, else its
+    /// caller makes it next, [`Self::check_leaf`]), its keys lie in the range the separators of
+    /// all its ancestors give it, and a key between its first and last keys lies there too: a
+    /// descent from the root takes the cursor's own path and searches this leaf. A key outside
+    /// the leaf trusts nothing of it, so it needs no check. It is not placed from the parent's
+    /// separators: a seek that misses the leaf would pay that fetch and its compares before
+    /// descending anyway, and seeks that go on forward mostly land in the leaf they are at.
     ///
     /// Inlined into its two callers, [`Self::seek_from_leaf`] and [`Self::find_from_leaf`], which
     /// are never inlined themselves, so a seek from the leaf makes one call.
@@ -1040,11 +1228,16 @@ impl TreeCursor {
     /// is empty, else the child the path's last branch names — to a leaf, taking the child `edge`
     /// picks at each branch and pushing every page entered with its slot. Each page gets the
     /// checks of the module docs; damage is [`Error::Corrupt`]. Returns the leaf's view, with the
-    /// value an [`Edge::Exact`] search found.
+    /// value an [`Edge::Exact`] search found. A descent for a key leaves the leaf marked for the
+    /// full range check ([`Self::check_leaf`]); one along an edge leaves it checked.
     ///
     /// Per page, in this order: the fetch checks and the identity check ([`PageRead::child`]),
-    /// the kind its level asks for, the one header parse ([`View::new`]), the separator range,
-    /// the empty-page checks, and the search, each read after the parse going through its view.
+    /// the kind its level asks for, the one header parse ([`View::new`]), then along an edge the
+    /// separator range of every key, the empty-page checks and the move to the first or last
+    /// slot, and for a key the empty-page checks, the search ([`page::BranchView::route`],
+    /// [`LeafView::find`]) and the separator range of the keys it compared
+    /// ([`compared_in_range`]: the route's bounds, a miss's keys either side), each read after
+    /// the parse going through its view.
     fn descend<'s, S: PageRead + ?Sized>(
         &mut self,
         store: &'s S,
@@ -1053,7 +1246,8 @@ impl TreeCursor {
         mut want_txn: u32,
         edge: Edge<'_>,
     ) -> Result<Reached<'s>> {
-        let (mut lo, mut hi) = self.bounds(store)?;
+        let (mut lo, mut hi) = self.bounds(store, self.depth)?;
+        let keyed = matches!(edge, Edge::Key(_) | Edge::Exact(_));
         loop {
             let depth = self.depth + 1;
             if depth > self.pages.len() || depth as u32 > root.height {
@@ -1073,16 +1267,15 @@ impl TreeCursor {
             }
             // The kind byte passed above, so the view is a leaf's exactly at the leaf level.
             let view = View::new(page)?;
-            // The range check's cells and the search's first probe, loading at once.
-            view.prefetch_level(match edge {
-                Edge::First => 0,
-                Edge::Last => view.nkeys().saturating_sub(1),
-                Edge::Key(_) | Edge::Exact(_) => view.first_probe(),
-            });
-            if !view.keys_in_range(lo, hi)? {
-                return Err(Error::Corrupt(format!(
-                    "page {pgno} holds keys outside its parents' separators (a misrouted pointer)"
-                )));
+            // Along an edge, the range check's cells and the first cell read, loading at once;
+            // for a key, the search's first probe (its range check reads only cells it compares).
+            match edge {
+                Edge::First => view.prefetch_level(0),
+                Edge::Last => view.prefetch_level(view.nkeys().saturating_sub(1)),
+                Edge::Key(_) | Edge::Exact(_) => view.prefetch_probe(view.first_probe()),
+            }
+            if !keyed && !view.keys_in_range(lo, hi)? {
+                return Err(misrouted(pgno));
             }
             let branch = match view {
                 View::Leaf(leaf) => {
@@ -1093,15 +1286,21 @@ impl TreeCursor {
                     let (slot, hit) = match edge {
                         Edge::First => (0, None),
                         Edge::Last => (n.saturating_sub(1), None),
-                        Edge::Key(key) => match leaf.search(key)? {
-                            Search::Found(i) | Search::NotFound(i) => (i, None),
-                        },
-                        Edge::Exact(key) => match leaf.find(key)? {
-                            Find::Found { index, value } => (index, Some(value)),
-                            Find::NotFound { index, .. } => (index, None),
+                        Edge::Key(key) | Edge::Exact(key) => match leaf.find(key)? {
+                            // The key itself: the routes above kept it inside every range.
+                            Find::Found { index, value } => {
+                                (index, matches!(edge, Edge::Exact(_)).then_some(value))
+                            }
+                            Find::NotFound { index, before, after } => {
+                                if !compared_in_range(before, after, lo, hi) {
+                                    return Err(misrouted(pgno));
+                                }
+                                (index, None)
+                            }
                         },
                     };
                     self.push(pgno, slot);
+                    self.leaf_unchecked = keyed;
                     return Ok((leaf, hit));
                 }
                 View::Branch(branch) => branch,
@@ -1113,7 +1312,13 @@ impl TreeCursor {
             let route = match edge {
                 Edge::First => branch.route_at(0)?,
                 Edge::Last => branch.route_at(n - 1)?,
-                Edge::Key(key) | Edge::Exact(key) => branch.route(key)?,
+                Edge::Key(key) | Edge::Exact(key) => {
+                    let route = branch.route(key)?;
+                    if !compared_in_range(route.lo, route.hi, lo, hi) {
+                        return Err(misrouted(pgno));
+                    }
+                    route
+                }
             };
             tighten(&route, &mut lo, &mut hi);
             self.push(pgno, route.index);
@@ -1121,13 +1326,13 @@ impl TreeCursor {
         }
     }
 
-    /// The range `[lo, hi)` the path's branches give the page below them (`None`: unbounded):
-    /// the intersection of each branch's range for the child taken. In a sound tree the nearest
-    /// branch's range is the tightest, but a pointer misrouted to another branch brings that
-    /// branch's separators, which can be wider.
-    fn bounds<'s, S: PageRead + ?Sized>(&self, store: &'s S) -> Result<Bounds<'s>> {
+    /// The range `[lo, hi)` the path's first `levels` branches give the page below them (`None`:
+    /// unbounded): the intersection of each branch's range for the child taken. In a sound tree
+    /// the nearest branch's range is the tightest, but a pointer misrouted to another branch
+    /// brings that branch's separators, which can be wider.
+    fn bounds<'s, S: PageRead + ?Sized>(&self, store: &'s S, levels: usize) -> Result<Bounds<'s>> {
         let (mut lo, mut hi): Bounds<'s> = (None, None);
-        for (&pgno, &ci) in self.pages[..self.depth].iter().zip(&self.slots[..self.depth]) {
+        for (&pgno, &ci) in self.pages[..levels].iter().zip(&self.slots[..levels]) {
             let route = page::branch_route_at(store.page(pgno)?, usize::from(ci))?;
             tighten(&route, &mut lo, &mut hi);
         }
@@ -1165,8 +1370,9 @@ pub struct Cursor<'t> {
     latch: &'t Latch,
     tree: TreeCursor,
     /// The page of the leaf `tree` is at, while it is at an entry: a step inside that leaf skips
-    /// the fetch. The page passed every check when the cursor entered it, and the transaction's
-    /// pages cannot change while the cursor borrows it.
+    /// the fetch. The page passed the per-fetch checks when the cursor entered it (and gets the
+    /// full range check before a read past a seek's landing entry, [`TreeCursor::check_leaf`]),
+    /// and the transaction's pages cannot change while the cursor borrows it.
     leaf: Option<&'t [u8]>,
 }
 

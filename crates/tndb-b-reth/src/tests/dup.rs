@@ -1619,3 +1619,331 @@ fn a_second_value_refusal_is_a_write_error_and_plain_tables_still_overwrite() {
         assert_eq!(stored, [(a(1), e(1, 1)), (a(1), e(2, 2)), (a(1), e(3, 3)), (a(2), e(1, 1))]);
     });
 }
+
+/// A row of `PlainStorageState` as `key/subkey=value` (their last bytes, and the value), `none`, or
+/// an error by its MDBX name.
+fn row_value(result: PairResult<PlainStorageState>) -> String {
+    match result {
+        Ok(Some((key, value))) => format!("{}/{}={}", key.0[19], value.key.0[31], value.value),
+        Ok(None) => "none".into(),
+        Err(e) => error_name(e),
+    }
+}
+
+/// Every row of `PlainStorageState` in `tx`, as [`row_value`], through a new cursor.
+fn every_row(tx: &impl DbTx) -> String {
+    let mut c = tx.cursor_dup_read::<PlainStorageState>().unwrap();
+    let rows = c.walk(None).unwrap().map(|row| row_value(row.map(Some))).collect::<Vec<_>>();
+    rows.join(" ")
+}
+
+/// reth's dup rewrite (`write_state_changes`, `write_hashed_state`,
+/// `write_storage_trie_updates_sorted`): for each row, `seek_by_key_subkey` to it,
+/// `delete_current`, then `upsert` of the same subkey with a new value, through one cursor, over a
+/// key of one row, one of four and one of 80 (a nested tree on every nested form). After each
+/// rewrite the cursor's `current`, `next_dup` and `prev_dup` are logged, and at the end every row.
+fn dup_rewrite_loop<TX: DbTx + DbTxMut>(tx: &TX) -> Vec<String> {
+    for (k, rows) in [(1, 1), (2, 4), (3, 80)] {
+        for i in 0..rows {
+            tx.put::<PlainStorageState>(a(k), e(2 * i + 1, u64::from(i))).unwrap();
+        }
+    }
+    let mut c = tx.cursor_dup_write::<PlainStorageState>().unwrap();
+    let mut log = Vec::new();
+    let rewrites = [(1, 1), (2, 1), (2, 5), (2, 7), (2, 3), (3, 1), (3, 79), (3, 159), (3, 81)];
+    for (i, (k, sk)) in (1000..).zip(rewrites) {
+        let seek = val(c.seek_by_key_subkey(a(k), s(sk)));
+        let delete = done(c.delete_current());
+        let upsert = done(c.upsert(a(k), &e(sk, i)));
+        let current = row_value(c.current());
+        let next = row_value(c.next_dup());
+        let prev = row_value(c.prev_dup());
+        log.push(format!("{k}/{sk}: {seek} {delete} {upsert} {current} {next} {prev}"));
+    }
+    log.push(every_row(tx));
+    log
+}
+
+/// reth's dup rewrite matches MDBX's, the cursor's places included, and each row's delete and
+/// upsert are one engine put: the counts are of the transaction's rewrites made as one put and of
+/// its held deletes run as deletes.
+#[test]
+fn the_dup_rewrite_matches_mdbx_and_is_one_engine_put() {
+    on_every_form(|db| {
+        let (_mdbx_dir, mdbx) = create_mdbx_db();
+        let want = dup_rewrite_loop(&mdbx.tx_mut().unwrap());
+        let tx = db.tx_mut().unwrap();
+        assert_eq!(dup_rewrite_loop(&tx), want);
+        assert_eq!(tx.deferred_counts(), [9, 0, 0]);
+    });
+}
+
+/// Runs `steps` (space-separated) on `tx`, which holds `PlainStorageState` rows of key/subkey 1/1,
+/// 1/3, 1/5, 2/2, 4/1 and 4/2 (each holding its subkey), through a write cursor A and a second one
+/// B, and returns each step with its outcome as [`row_value`] (a value as its subkey's last byte,
+/// `ok`, or an error), then `|` and every row. A's steps: `sk:K/S` `seek_by_key_subkey`, `c`
+/// `current`, `n` `next`, `p` `prev`, `f` `first`, `nd` `next_dup`, `pd` `prev_dup`, `nnd`
+/// `next_no_dup`, `d` `delete_current`, `dd` `delete_current_duplicates`, `u:K/S` `upsert` (the
+/// value 50 + S); `drop` drops A and `na` makes a new one. `nb` makes B; B's steps: `bsk:K/S`,
+/// `bc`, `bn`, `bd`, `bu:K/S` (the value 70 + S). The transaction's: `get:K` (the key's first
+/// value), `put:K/S` (the value S) and `en` (`entries`).
+fn held_steps<TX: DbTx + DbTxMut>(tx: &TX, steps: &str) -> String {
+    for (k, sk) in [(1, 1), (1, 3), (1, 5), (2, 2), (4, 1), (4, 2)] {
+        tx.put::<PlainStorageState>(a(k), e(sk, u64::from(sk))).unwrap();
+    }
+    fn cursor<C>(c: &mut Option<C>) -> &mut C {
+        c.as_mut().expect("the cursor is made")
+    }
+    type Cursor<TX> = <TX as DbTxMut>::DupCursorMut<PlainStorageState>;
+    let mut c: Option<Cursor<TX>> = Some(tx.cursor_dup_write::<PlainStorageState>().unwrap());
+    let mut b: Option<Cursor<TX>> = None;
+    let mut out = Vec::new();
+    for step in steps.split_whitespace() {
+        let (op, arg) = step.split_once(':').unwrap_or((step, ""));
+        let (k, sk) = arg.split_once('/').unwrap_or((arg, "0"));
+        let (k, sk): (u8, u8) = (k.parse().unwrap_or(0), sk.parse().unwrap_or(0));
+        let outcome = match op {
+            "sk" => val(cursor(&mut c).seek_by_key_subkey(a(k), s(sk))),
+            "c" => row_value(cursor(&mut c).current()),
+            "n" => row_value(cursor(&mut c).next()),
+            "p" => row_value(cursor(&mut c).prev()),
+            "f" => row_value(cursor(&mut c).first()),
+            "nd" => row_value(cursor(&mut c).next_dup()),
+            "pd" => row_value(cursor(&mut c).prev_dup()),
+            "nnd" => row_value(cursor(&mut c).next_no_dup()),
+            "d" => done(cursor(&mut c).delete_current()),
+            "dd" => done(cursor(&mut c).delete_current_duplicates()),
+            "u" => done(cursor(&mut c).upsert(a(k), &e(sk, 50 + u64::from(sk)))),
+            "drop" => {
+                c = None;
+                "ok".into()
+            }
+            "na" => done(tx.cursor_dup_write::<PlainStorageState>().map(|new| c = Some(new))),
+            "nb" => done(tx.cursor_dup_write::<PlainStorageState>().map(|new| b = Some(new))),
+            "bsk" => val(cursor(&mut b).seek_by_key_subkey(a(k), s(sk))),
+            "bc" => row_value(cursor(&mut b).current()),
+            "bn" => row_value(cursor(&mut b).next()),
+            "bd" => done(cursor(&mut b).delete_current()),
+            "bu" => done(cursor(&mut b).upsert(a(k), &e(sk, 70 + u64::from(sk)))),
+            "get" => tx.get::<PlainStorageState>(a(k)).map_or_else(error_name, |v| {
+                v.map_or_else(|| "none".into(), |v| format!("{}={}", v.key.0[31], v.value))
+            }),
+            "put" => done(tx.put::<PlainStorageState>(a(k), e(sk, u64::from(sk)))),
+            "en" => tx.entries::<PlainStorageState>().map_or_else(error_name, |n| n.to_string()),
+            _ => panic!("unknown step {op}"),
+        };
+        out.push(format!("{step}={outcome}"));
+    }
+    drop((c, b));
+    out.push("|".into());
+    out.push(every_row(tx));
+    out.join(" ")
+}
+
+/// [`held_steps`] scripts, each with the rewrites it makes as one engine put and the held deletes
+/// it runs as deletes, by their cursors (a call or a drop; the cursors drop before the closing
+/// read of every row) and by other accessors: a `delete_current` with another call between it and
+/// the `upsert` of its
+/// row, each as on MDBX. Between them: another cursor's read of the table and the transaction's
+/// `get` (neither sees the row), another cursor's write and the transaction's `put` (also of a key
+/// between the deleted row and its follower, after which the cursor is still on the follower), the
+/// cursor's own moves (from where the delete left it: on the follower, ending the key's rows, or
+/// on the next key's first row), an `upsert` of another subkey, and the cursor dropped. Then a
+/// delete with no `upsert` (a slot set to zero), and a delete followed by another (of the
+/// follower, or `MDBX_ENODATA` once the cursor ends the key's rows).
+const HELD_STEPS: &[(&str, [u64; 3])] = &[
+    ("sk:1/3 d u:1/3 c nd pd", [1, 0, 0]),
+    ("sk:1/3 d nb bsk:1/3 bc u:1/3 c", [0, 0, 1]),
+    ("nb sk:1/3 d bsk:1/3 bc u:1/3 c", [0, 0, 1]),
+    ("sk:1/1 d get:1 u:1/1 c pd", [0, 0, 1]),
+    ("sk:1/3 d nb bu:4/3 c n u:1/3 c", [0, 0, 1]),
+    ("sk:1/3 d put:2/5 c nd u:1/3 c", [0, 0, 1]),
+    ("sk:2/2 d put:3/1 c n p", [0, 0, 1]),
+    ("sk:2/2 d nb bu:3/1 c pd nnd", [0, 0, 1]),
+    ("sk:1/5 d get:1 c nd pd d", [0, 1, 1]),
+    ("sk:1/5 d en c pd", [0, 0, 1]),
+    ("sk:1/3 d nd u:1/3 c", [0, 1, 0]),
+    ("sk:1/3 d c u:1/3 c", [0, 1, 0]),
+    ("sk:1/3 d u:1/4 c pd nd", [0, 1, 0]),
+    ("sk:1/3 d nb bu:1/3 bc", [0, 0, 1]),
+    ("sk:4/1 d nb bsk:1/3 bd c nd bc bn", [0, 0, 2]),
+    ("sk:1/3 d drop na f n n", [0, 1, 0]),
+    ("sk:1/3 d dd c", [0, 1, 0]),
+    ("sk:1/3 d", [0, 1, 0]),
+    ("sk:1/3 d d c nd pd", [0, 2, 0]),
+    ("sk:1/5 d d c", [0, 1, 0]),
+    ("sk:2/2 d d c", [0, 2, 0]),
+];
+
+#[test]
+fn a_held_delete_runs_before_any_other_call_as_on_mdbx() {
+    on_every_form(|db| {
+        let (_mdbx_dir, mdbx) = create_mdbx_db();
+        for &(steps, counts) in HELD_STEPS {
+            let want = held_steps(&mdbx.tx_mut().unwrap(), steps);
+            let tx = db.tx_mut().unwrap();
+            assert_eq!(held_steps(&tx, steps), want, "{steps}");
+            assert_eq!(tx.deferred_counts(), counts, "{steps}");
+        }
+    });
+}
+
+/// [`held_steps`] scripts, then a cursor's delete of row 4/2 held while the transaction commits:
+/// a new transaction reads the rows MDBX's does (the script's held deletes run as its cursors
+/// dropped, the last one by the commit).
+#[test]
+fn a_commit_runs_a_held_delete_as_on_mdbx() {
+    const COMMITTED: &[&str] = &["sk:1/3 d", "sk:1/3 d drop", "sk:1/3 d u:1/3", "sk:2/2 d d", ""];
+    fn committed<D: Database>(db: &D, steps: &str) -> String {
+        let tx = db.tx_mut().unwrap();
+        let out = held_steps(&tx, steps);
+        let held = out.split(" | ").next().unwrap().to_owned();
+        let mut c = tx.cursor_dup_write::<PlainStorageState>().unwrap();
+        assert_eq!(val(c.seek_by_key_subkey(a(4), s(2))), "2");
+        c.delete_current().unwrap();
+        tx.commit().unwrap();
+        drop(c);
+        format!("{held} | {}", every_row(&db.tx().unwrap()))
+    }
+    for form in Form::ALL {
+        for steps in COMMITTED {
+            let (_mdbx_dir, mdbx) = create_mdbx_db();
+            let (_dir, db) = create_test_db_with(TndbEnvKind::RW, form);
+            assert_eq!(committed(&db, steps), committed(&mdbx, steps), "{}: {steps}", form.name());
+        }
+    }
+}
+
+/// An `upsert` of the row whose delete the cursor holds, refused for its size (17 MiB, as
+/// [`big_write_steps`] writes it), leaves the row deleted, as the delete then the refused upsert
+/// do: every other step is MDBX's run without the refused writes (the oracle of
+/// `a_dup_write_refused_for_its_size_leaves_the_cursor_where_it_was`).
+#[test]
+fn a_rewrite_refused_for_its_size_still_deletes_the_row() {
+    const SEQS: &[&str] =
+        &["sk:1/5 d bu:1/5 c d en", "sk:1/3 d bu:1/3 c nd pd en", "sk:2/2 d bu:2/2 c n p en"];
+    on_every_form(|db| {
+        let (_mdbx_dir, mdbx) = create_mdbx_db();
+        for seq in SEQS {
+            let outcomes = big_write_steps(&db, seq);
+            let big = |step: &str| step.starts_with('b');
+            let (refused, rest): (Vec<&str>, Vec<&str>) = outcomes.split(' ').partition(|s| big(s));
+            assert_eq!(refused.len(), 1, "{seq}: {outcomes}");
+            assert!(refused[0].ends_with("=badvalsize"), "{seq}: {refused:?}");
+            let without: Vec<&str> = seq.split(' ').filter(|step| !big(step)).collect();
+            assert_eq!(rest.join(" "), big_write_steps(&mdbx, &without.join(" ")), "{seq}");
+        }
+    });
+}
+
+/// A held delete whose row's leaf is damaged (a byte of the row flipped on disk, as
+/// `check_reports_the_tables_and_damage_latches_the_environment` damages a page; a read does not
+/// recompute a page's checksum, the copy a write makes of it does): `delete_current` reports
+/// success, and the call that runs the delete fails with `MDBX_CORRUPTED`, as its error: the
+/// `upsert` of the row (a write error), the transaction's `get` or the cursor's `current` (a delete
+/// error), or the commit. The transaction then cannot commit, and the environment has latched.
+#[test]
+fn a_held_delete_that_meets_damage_fails_the_call_that_runs_it() {
+    const MARK: [u8; 32] = [0xA5; 32];
+    let corrupted = DatabaseErrorInfo::from(Error::Corrupted);
+    for form in Form::ALL {
+        for runner in ["upsert", "get", "current", "commit"] {
+            let (dir, db) = create_test_db_with(TndbEnvKind::RW, form);
+            // Keys enough for leaves under a branch root (the open checks each tree's root).
+            db.update(|tx| {
+                for k in 0..200 {
+                    tx.put::<PlainStorageState>(a(k), e(1, u64::from(k)))?;
+                }
+                let marked = StorageEntry { key: s(9), value: U256::from_be_bytes(MARK) };
+                tx.put::<PlainStorageState>(a(100), marked)
+            })
+            .unwrap()
+            .unwrap();
+            drop(db);
+            let path = dir.path().join(crate::DATA_FILE);
+            let mut bytes = std::fs::read(&path).unwrap();
+            let marks: Vec<usize> = (0..bytes.len() - MARK.len())
+                .filter(|&at| bytes[at..at + MARK.len()] == MARK)
+                .collect();
+            assert!(!marks.is_empty(), "the row is on disk");
+            for at in marks {
+                bytes[at] ^= 0xFF;
+            }
+            std::fs::write(&path, bytes).unwrap();
+            let db = super::open_env(dir.path(), TndbEnvKind::RW, form.args()).unwrap();
+
+            let tx = db.tx_mut().unwrap();
+            let mut c = tx.cursor_dup_write::<PlainStorageState>().unwrap();
+            assert_eq!(val(c.seek_by_key_subkey(a(100), s(9))), "9");
+            assert_eq!(done(c.delete_current()), "ok", "{runner}: the delete is held");
+
+            let failed = match runner {
+                "upsert" => match c.upsert(a(100), &e(9, 1)).unwrap_err() {
+                    DatabaseError::Write(write) => write.info,
+                    other => panic!("{runner}: {other:?}"),
+                },
+                "get" => match tx.get::<PlainStorageState>(a(1)).unwrap_err() {
+                    DatabaseError::Delete(info) => info,
+                    other => panic!("{runner}: {other:?}"),
+                },
+                "current" => match c.current().unwrap_err() {
+                    DatabaseError::Delete(info) => info,
+                    other => panic!("{runner}: {other:?}"),
+                },
+                _ => {
+                    drop(c);
+                    match tx.commit().unwrap_err() {
+                        DatabaseError::Commit(info) => {
+                            assert_eq!(info, corrupted, "{}: {runner}", form.name());
+                            assert!(db.failure().is_some(), "{runner}: latched");
+                            continue;
+                        }
+                        other => panic!("{runner}: {other:?}"),
+                    }
+                }
+            };
+            assert_eq!(failed, corrupted, "{}: {runner}", form.name());
+            drop(c);
+            assert!(
+                matches!(tx.commit(), Err(DatabaseError::Commit(_))),
+                "{}: {runner}: the transaction cannot commit",
+                form.name()
+            );
+            assert!(db.failure().is_some(), "{runner}: latched");
+        }
+    }
+}
+
+/// A held delete that fails with an error that does not latch the environment (the test-only
+/// `TndbTxMut::fail_next_held_delete`; the engine's `StaleTable`, which the adapter's own
+/// transaction cannot meet) is the error of the call that runs it, and the commit refuses the
+/// transaction with it: the environment stays open, and the row is still there.
+#[test]
+fn a_held_delete_that_fails_unlatched_still_fails_the_commit() {
+    on_every_form(|db| {
+        db.update(|tx| {
+            for sk in [1, 3, 5] {
+                tx.put::<PlainStorageState>(a(1), e(sk, u64::from(sk)))?;
+            }
+            Ok::<_, DatabaseError>(())
+        })
+        .unwrap()
+        .unwrap();
+        let tx = db.tx_mut().unwrap();
+        let mut c = tx.cursor_dup_write::<PlainStorageState>().unwrap();
+        assert_eq!(val(c.seek_by_key_subkey(a(1), s(3))), "3");
+        tx.fail_next_held_delete();
+        assert_eq!(done(c.delete_current()), "ok");
+        let failed = match tx.get::<PlainStorageState>(a(1)).unwrap_err() {
+            DatabaseError::Delete(info) => info,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(failed.code, Error::NotFound.to_err_code());
+        assert_eq!(row_value(c.current()), "1/3=3", "the row is still there, and the cursor on it");
+        drop(c);
+        assert_eq!(dbg(tx.commit().unwrap_err()), dbg(DatabaseError::Commit(failed)));
+        assert_eq!(db.failure(), None);
+        assert_eq!(every_row(&db.tx().unwrap()), "1/1=1 1/3=3 1/5=5");
+        db.update(|tx| tx.put::<PlainStorageState>(a(2), e(1, 1))).unwrap().unwrap();
+    });
+}

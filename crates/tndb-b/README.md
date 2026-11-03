@@ -97,7 +97,11 @@ does not depend on `tn-storage` or reth. reth's database API on top of it is a s
   committed transactions freed. The meta names both.
 - **Copy-on-write.** The writer never changes a page a published tree can reach. It copies the
   page into a page private to the transaction. Readers therefore read published pages with no
-  lock.
+  lock. A put or delete that changes only a published leaf copies it with the change made in
+  the same pass, reading only the source (`page::copy_insert`, `copy_replace`, `copy_delete`):
+  the source holds the copy's bytes outside the free gap, so every check sees the same bytes,
+  and nothing in the write reads the copy, whose stores are still draining when a change made
+  after the copy would first load them. Branches, splits and merges copy, then change the copy.
 - **Single writer, many readers.** One `RwTxn` at a time (others wait). `RoTxn`s clone the
   current snapshot and see one consistent state of every table for as long as they live.
 - **Atomic commit through two metas.** A commit syncs its pages, then writes its meta over the
@@ -855,8 +859,9 @@ from a cell the map supersedes, and from the cell otherwise.
   map's while the map holds the key; the cursor's nested slots only route, and are refused per
   level where the map's tree differs. The key's outer cell, when the map does not hold the key,
   is read from the outer leaf the cursor holds (`held_cell`: the page fetched with the per-fetch
-  checks, the slot's key first, else a search of the leaf when the key lies within its first and
-  last keys), and from the outer root (`read::find_outer`) when that leaf lacks it.
+  checks, the slot's key first, else, once the leaf has had the full range check, a search of the
+  leaf when the key lies within its first and last keys; do-not-flag item 29), and from the outer
+  root (`read::find_outer`) when that leaf lacks it.
 - A write to a packed key, a promotion included, rewrites the outer cell, so the cursor finds its
   row again by key (the write reports no slot, `DupPlaced::slot` `None`); `delete_current` of a
   set's row places by key on the follower, and of a set's only row (the cell removed) from the
@@ -1107,19 +1112,26 @@ says why the cache is safe.
   (`PageRead::child`, `tree::read::checked_child`).
 - a branch sits above the tree's height and a leaf at it;
 - only the root leaf may be empty;
-- keys lie within the intersection of every ancestor's separator range (the cursor checks each
-  page entered; a point miss checks the leaf's neighbours of the key).
+- keys lie within the intersection of every ancestor's separator range. A cursor's descent along
+  an edge (to the first or last entry, and every crossing) checks each page's first and last keys
+  against it; a cursor's seek, as a point read, checks only the keys its search compared: at a
+  branch the route's bounds (the separators either side of the child taken), at the leaf a miss's
+  neighbours of the key (a hit is the key itself, which the routes kept inside every range). The
+  leaf a seek lands in gets the full check before any read past its landing entry (do-not-flag
+  item 29).
 
 The cursor's descent (`TreeCursor::descend`) parses each page's header once (`page::View::new`),
-after the fetch, identity and kind checks; the separator-range check, the empty-page checks and
-the search then read through that one view, in that order. Right after the parse, the view
-prefetches the cells the level reads first (`View::prefetch_level`): the first and the last key's,
-which the range check reads, and the cell of the search's first probe (`View::first_probe`; slot 0
-or the last slot for a move to the first or the last entry). Those cache misses then overlap
-instead of following one another; a prefetch is only a hint, so every check, its order and its
-message stay. The leaf's view goes to the move that settles there (`Reached`), which reads its
-entry through it: `seek_exact`'s hit is the search's own `Find::Found` value, not a second read of
-the cell. A crossing to the next or previous leaf climbs the path to the nearest branch with a
+after the fetch, identity and kind checks; the other checks and the search then read through that
+one view: along an edge the separator-range check, the empty-page checks and the move to slot 0 or
+the last slot, in that order; for a key the empty-page checks, the search, then the range check of
+the keys it compared. Right after the parse, the view prefetches the cells the level reads first:
+along an edge the first and the last key's, which the range check reads, and the slot the move
+takes (`View::prefetch_level`); for a key the cell of the search's first probe alone
+(`View::prefetch_probe` of `View::first_probe`), since its range check reads only cells the search
+compared. Those cache misses then overlap instead of following one another; a prefetch is only a
+hint, so every check, its order and its message stay. The leaf's view goes to the move that
+settles there (`Reached`), which reads its entry through it: `seek_exact`'s hit is the search's own
+`Find::Found` value, not a second read of the cell. A crossing to the next or previous leaf climbs the path to the nearest branch with a
 child beyond it (`climb`) and descends from that child (`land_beyond`).
 
 **A seek starts from the leaf the cursor is at** when the cursor is at an entry and its path is
@@ -1133,15 +1145,21 @@ and its compares before descending anyway, and a run of forward seeks mostly lan
 is at, so that tier bought forward seeks nothing measurable and cost random ones.
 
 `seek`, `seek_exact` and `seek_with_key_tail` all start this way; an exact seek's key in a gap of
-the leaf is a miss, the cursor unset. These are the entries a descent from the root finds: the
-cursor entered the leaf with a descent's checks, so its keys lie inside the range all its
-ancestors' separators give it (the argument of do-not-flag items 11 and 12), and so does a key
-between its first and last keys, whose descent takes the cursor's own path. The leaf is the page
-`Cursor` holds, `RoCursor`'s `Snapshot::page_again` (unchecked, item 14) and a `TxnCursor`'s
-`Writer::page` (checked). A seek that descends meets damage with the descent's exact message;
-damage in the leaf the cursor already holds is met only by those re-fetches, as for a step (item
-14). `RwCursor`'s seeks, and the re-seeks a write cursor makes after a change to its tree, descend
-from the root.
+the leaf is a miss, the cursor unset. These are the entries a descent from the root finds once
+the leaf's keys are known to lie inside the range all its ancestors' separators give it (the
+argument of do-not-flag items 11 and 12): a key between its first and last keys then lies there
+too, and its descent takes the cursor's own path. A leaf a seek's descent entered has had only the
+checks of the keys its search compared (item 29), so the seek from it first gives it the full
+range check, as a step does before reading past the landing entry (`TreeCursor::check_leaf`: the
+path's branches fetched again for the range, which the routes of the two levels the descent
+recorded give, then the leaf's first and last keys; item 29); a leaf already
+checked in full, or entered along an edge, is not checked again. A key outside the leaf trusts
+nothing of it and needs no check. The leaf is the page `Cursor` holds, `RoCursor`'s
+`Snapshot::page_again` (unchecked, item 14) and a `TxnCursor`'s `Writer::page` (checked). A seek
+that descends meets damage with the descent's exact message; damage in the leaf the cursor
+already holds, or on its path, is met only by those re-fetches and that one full check, as for a
+step (item 14). `RwCursor`'s seeks, and the re-seeks a write cursor makes after a change to its
+tree, descend from the root.
 
 **The writer skips them on pages it built.** Its descent (`write::descend_write`) trusts a page
 this transaction's writer built from checked pages and still holds private: the root when its
@@ -1189,8 +1207,9 @@ each time. The CRC is verified in these places instead:
 - by `Env::check`, for every page and every run.
 
 The public `Cursor` remembers the leaf it is at. A step inside that leaf skips the fetch: the page
-passed every check when the cursor entered it, and the transaction's pages cannot change while
-the cursor borrows it. Entering a leaf always runs the full descent checks.
+passed the per-fetch checks when the cursor entered it, and the transaction's pages cannot change
+while the cursor borrows it. Entering a leaf always runs the descent's checks, and the first read
+past a seek's landing entry the full range check (item 29).
 
 The owned `RoCursor` cannot hold a borrowed page between calls, so each `next` and `prev` fetches
 the page of the leaf it stands on again, by page number, through `Snapshot::page_again`: a plain
@@ -1808,14 +1827,16 @@ These limits and non-goals are known:
 14. **An owned cursor's step and seek re-fetch its leaf without the per-fetch checks**
     (`Snapshot::page_again`, used by `RoCursor::next`, `prev`, `current_with_key_tail`, `seek`,
     `seek_exact` and `seek_with_key_tail`). The page number is the one the
-    cursor's descent entered with every check, and a snapshot's published pages never change while
-    an `Arc` of it lives (the reuse gate holds them), so the checks would see the same bytes and
-    pass again. `Cursor` relies on the same fact when it keeps the page slice itself, for its steps
-    and its seeks. A seek settles in that leaf only for a key between its first and last keys;
-    any other seek descends from the root with every check, so damage in the leaf the cursor holds
-    meets a later seek only if the seek descends ([Readers and snapshots](#readers-and-snapshots)).
-    Leaves the cursor enters, and every other move, run the full checks. A safe slice re-derived from the mapping
-    replaces a cached raw pointer, so the owned cursor adds no `unsafe`.
+    cursor's descent entered with the per-fetch checks, and a snapshot's published pages never
+    change while an `Arc` of it lives (the reuse gate holds them), so the checks would see the same
+    bytes and pass again. `Cursor` relies on the same fact when it keeps the page slice itself, for
+    its steps and its seeks. A seek settles in that leaf only for a key between its first and last
+    keys, after the leaf's full range check if a seek's descent entered it (item 29); any other
+    seek descends from the root with every check, so damage in the leaf the cursor holds meets a
+    later seek only if the seek descends or makes that check ([Readers and
+    snapshots](#readers-and-snapshots)). Leaves the cursor enters, and every other move, run the
+    descent's checks. A safe slice re-derived from the mapping replaces a cached raw pointer, so the
+    owned cursor adds no `unsafe`.
 15. **A snapshot resolves each table handle once** (`TableRoots`, see [Readers and
     snapshots](#readers-and-snapshots)). Later transactions on the snapshot take the remembered root
     without reading the catalog again. A snapshot's catalog never changes while an `Arc` of it lives
@@ -2031,6 +2052,47 @@ These limits and non-goals are known:
       verify, open's root check, `Env::check`) read the bytes they hash, and on a long-running
       writer's pages the gap is about a third of a page. Hashing it pulled stale bytes from memory
       only to hash them (see the stamp note in [Platform notes](#platform-notes)).
+29. **A cursor seek checks only the keys its search compared** (`TreeCursor::descend` for a key:
+    `seek`, `seek_exact`, `seek_with_key_tail`, and the dup walker's seeks and finds, in outer and
+    nested trees; see [Readers and snapshots](#readers-and-snapshots)). At a branch it checks the
+    route's bounds, the separators either side of the child taken, against the range the levels
+    above give the page (`route.lo >= lo`, `route.hi < hi`); at the leaf a hit needs nothing (the
+    sought key itself, which the routes kept inside every range), and a miss checks the keys
+    either side of the insertion point, `read::check_miss`'s rule, which point reads
+    (`read::get`) have always followed. The check of every key, the page's first and last against
+    the range, is deferred: the leaf a seek lands in stays unchecked (`TreeCursor::leaf_checked`)
+    until a read of it past the landing entry (a step, a prefix step, a seek from the leaf) gives it
+    that check first, once (`TreeCursor::check_leaf`: the path's branches fetched again for the
+    range, the descent's message). That range is read from two levels only
+    (`TreeCursor::seek_bounds`): the descent checked each route against the range above it
+    (`route.lo >= lo`, `route.hi < hi`), so the deepest route with a lower bound gives the
+    intersection's `lo`, and the deepest with an upper bound its `hi`. The slots name those two
+    levels with no cell read (a route has a lower bound exactly when its slot is not the branch's
+    first, an upper one when it is not the last; `TreeCursor::bound_levels`), so the descent
+    records nothing, and the check reads only their routes, every branch still fetched again with
+    the per-fetch checks and parsed as a branch, in the path's order, before any route (the routes
+    of the other levels are cells the descent's search read with the same cell checks). Debug
+    builds assert that range equals, by content, the one built from every level's route
+    (`TreeCursor::bounds`; `a_seeks_leaf_check_reads_the_range_of_its_deepest_bounded_levels`).
+    A dup write reads its key's cell in a held outer leaf that is still unchecked only at the
+    cursor's slot, its landing entry, and finds any other cell from the root (`held_cell`). A
+    descent along an edge (to the first or last entry, every crossing) keeps the full check of
+    every page.
+    - What is given up: a seek that lands and moves no further accepts a page that only partly
+      overlaps its range (a damaged separator or pointer whose page straddles a bound), its landing
+      entry, which the search compared, inside the range. A page wholly outside its range is still
+      refused at the seek with the same message (every damage sweep's expectation holds
+      unchanged), and every entry a cursor returns past its landing comes from a leaf checked in
+      full (`a_seek_lands_in_a_leaf_partly_outside_its_range_and_reading_on_refuses_it`,
+      `a_seek_into_a_page_wholly_outside_its_range_is_corrupt_at_that_page`).
+    - What it adds: the deferred check fetches the path's branches again, so a seek inside a leaf a
+      seek entered meets damage on the path that the cursor's landing did not
+      (`a_seek_from_the_leaf_meets_damage_as_a_descent_does`).
+    - Why: the full check reads the first and last keys of every page a seek enters, cells its
+      search mostly never touches, on every seek, though most seeks never read past their landing
+      (a point read through a cursor, an exact seek). In TN's reth exec bench on Linux it cost about
+      16 ms of a ~1.5 s peak output, 11.7 ms of it in the state root, nearly all in the cursor's
+      descent. A seek that steps on pays the full check once, for its leaf alone.
 
 ---
 

@@ -298,7 +298,20 @@ pub(crate) trait PageWrite: PageRead {
     /// lending the source and the destination at once. A private `from` is refused
     /// ([`Error::Failed`]), so the two never overlap; so is a `to` that is not private, as
     /// [`Self::page_mut`] refuses it.
-    fn copy_published(&mut self, from: u32, to: u32) -> Result<&mut [u8]>;
+    #[inline]
+    fn copy_published(&mut self, from: u32, to: u32) -> Result<&mut [u8]> {
+        self.copy_published_with(from, to, |src, dst| write::copy_page(src, to, dst))
+    }
+
+    /// [`Self::copy_published`] with `f(src, dst)` in place of [`write::copy_page`]: every check
+    /// in its order, then `f` given the source page and `to`'s bytes, which it writes from the
+    /// source alone (the copy of a leaf with its change made, `page::copy_insert` and its
+    /// siblings), never reading `dst`. `f`'s error is returned as is, and `dst` then holds no
+    /// copy. A source past the bytes the store lends in place is first copied into a buffer,
+    /// which `f` then reads.
+    fn copy_published_with<F>(&mut self, from: u32, to: u32, f: F) -> Result<&mut [u8]>
+    where
+        F: FnOnce(&[u8], &mut [u8]) -> Result<()>;
 
     /// Page `pgno` left the tree: a published page is freed once no reader or durable meta can
     /// reach it; a private one is reusable at once.
@@ -323,11 +336,14 @@ pub(crate) trait PageWrite: PageRead {
     fn free_run(&mut self, pgno: u32, npages: u32);
 
     /// The writer's reused buffers ([`write::Scratch`]), taken for one write that copies or splits
-    /// pages and handed back with [`Self::put_scratch`].
-    fn take_scratch(&mut self) -> write::Scratch;
+    /// pages and handed back with [`Self::put_scratch`]. Boxed, so the hand-off moves one pointer:
+    /// moved whole, the buffers went through a stack copy whose 16-byte loads spanned the 8-byte
+    /// length stores the write had just made, which store forwarding cannot serve, so each load
+    /// waited for every older store, a page copy's among them.
+    fn take_scratch(&mut self) -> Box<write::Scratch>;
 
     /// Hand back the buffers [`Self::take_scratch`] took.
-    fn put_scratch(&mut self, scratch: write::Scratch);
+    fn put_scratch(&mut self, scratch: Box<write::Scratch>);
 
     /// Count one check of a published page ([`write::verify_published`]) that took `ns`
     /// nanoseconds, for the writer's I/O counters (`IoStats::verifies`, `IoStats::verify_ns`).
@@ -338,6 +354,14 @@ pub(crate) trait PageWrite: PageRead {
     /// test can build the shapes a tree without merging has.
     #[cfg(test)]
     fn no_merge(&self) -> bool {
+        false
+    }
+
+    /// Test-only: true when copy-on-write of a leaf for a put's or a delete's change takes the
+    /// two-step path, the copy ([`write::copy_page`]) and then the change in the copy, in place of
+    /// one pass from the source ([`Self::copy_published_with`]): the twin a test compares with.
+    #[cfg(test)]
+    fn no_fused_copy(&self) -> bool {
         false
     }
 

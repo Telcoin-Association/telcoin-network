@@ -10,6 +10,12 @@
 //! tree exactly as it was: the same root handle and every reachable page byte for byte. A delete
 //! plans and reserves the same way ([`delete`]).
 //!
+//! **A leaf's change in its copy.** A replace or an insert that fits its leaf, and a delete that
+//! changes only its leaf, copy a published leaf with the change made in the same pass, reading
+//! only the source ([`change_path_writable`]): a change made after the copy would first load the
+//! copy's bytes while its stores still drain, and wait for them. Branches, splits and merges copy
+//! the page, then change the copy.
+//!
 //! **Overflow runs.** A value too large for its leaf ([`Geometry::place`]) goes to a run of
 //! contiguous pages ([`crate::overflow`]), which the put allocates with its tree pages and writes
 //! before any leaf names it; the leaf holds a 12-byte reference. A run is immutable: a copy of
@@ -95,27 +101,100 @@ pub(crate) enum PutKind {
     Insert,
 }
 
-/// Where a put left its entry.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct Placed {
+/// Where a put left its entry: whether it replaced a present key's value ([`Self::replaced`]), and
+/// the entry's slot in the leaf the table's [`PathCache`] then names ([`Self::slot`]; `None` after
+/// a split that left the cache empty: every split but an append split through a cache, which fills
+/// it with the new path, see [`put_from_root`]).
+///
+/// One word, built and read whole, as [`Removed`] is: a write's `Result` comes back through memory
+/// right after copy-on-write's page copies, and a payload of several fields went in as narrow
+/// stores that the caller reloaded wider, which store forwarding cannot serve, so the reload
+/// waited for every older store, the copies' among them.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Placed(u64);
+
+impl Placed {
+    /// [`Self::replaced`]'s bit; the bits below it hold the slot plus one (0: no slot).
+    const REPLACED: u64 = 1 << 63;
+
+    /// The put's outcome.
+    #[inline(always)]
+    pub(crate) const fn new(replaced: bool, slot: Option<usize>) -> Self {
+        let slot = match slot {
+            Some(s) => s as u64 + 1,
+            None => 0,
+        };
+        Self(slot | if replaced { Self::REPLACED } else { 0 })
+    }
+
     /// True if it replaced a present key's value.
-    pub(crate) replaced: bool,
-    /// The entry's slot in the leaf the table's [`PathCache`] then names; `None` after a split
-    /// that left the cache empty (every split but an append split through a cache, which fills
-    /// it with the new path: see [`put_from_root`]).
-    pub(crate) slot: Option<usize>,
+    #[inline(always)]
+    pub(crate) const fn replaced(self) -> bool {
+        self.0 & Self::REPLACED != 0
+    }
+
+    /// The entry's slot in the leaf the table's [`PathCache`] then names, if the cache names one.
+    #[inline(always)]
+    pub(crate) const fn slot(self) -> Option<usize> {
+        match self.0 & !Self::REPLACED {
+            0 => None,
+            s => Some((s - 1) as usize),
+        }
+    }
 }
 
-/// What a delete through a table's [`PathCache`] did ([`delete_cached`]).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct Removed {
+impl std::fmt::Debug for Placed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Placed")
+            .field("replaced", &self.replaced())
+            .field("slot", &self.slot())
+            .finish()
+    }
+}
+
+/// What a delete through a table's [`PathCache`] did ([`delete_cached`]): whether the key was there
+/// and is now gone ([`Self::found`]), and the deleted entry's old slot in the leaf the cache then
+/// names, now its follower's slot (the leaf's entry count if it was the last; [`Self::slot`]),
+/// `None` when the cache is empty after the delete (a miss, or a delete that unlinked, collapsed,
+/// emptied or merged). One word, as [`Placed`] is.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Removed(u64);
+
+impl Removed {
+    /// [`Self::found`]'s bit; the bits below it hold the slot plus one (0: no slot).
+    const FOUND: u64 = 1 << 63;
+
+    /// The delete's outcome.
+    #[inline(always)]
+    pub(crate) const fn new(found: bool, slot: Option<usize>) -> Self {
+        let slot = match slot {
+            Some(s) => s as u64 + 1,
+            None => 0,
+        };
+        Self(slot | if found { Self::FOUND } else { 0 })
+    }
+
     /// True if the key was there (and is now gone).
-    pub(crate) found: bool,
-    /// The deleted entry's old slot in the leaf the table's [`PathCache`] then names, which is
-    /// now its follower's slot (the leaf's entry count if it was the last); `None` when the cache
-    /// is empty after the delete (a miss, or a delete that unlinked, collapsed, emptied or
-    /// merged).
-    pub(crate) slot: Option<usize>,
+    #[inline(always)]
+    pub(crate) const fn found(self) -> bool {
+        self.0 & Self::FOUND != 0
+    }
+
+    /// The deleted entry's old slot in the leaf the table's [`PathCache`] then names, if the cache
+    /// names one.
+    #[inline(always)]
+    pub(crate) const fn slot(self) -> Option<usize> {
+        match self.0 & !Self::FOUND {
+            0 => None,
+            s => Some((s - 1) as usize),
+        }
+    }
+}
+
+impl std::fmt::Debug for Removed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Removed").field("found", &self.found()).field("slot", &self.slot()).finish()
+    }
 }
 
 /// A broken invariant of this module (not damage on disk): the writer must stop.
@@ -265,7 +344,7 @@ pub(crate) fn put_sized<S: PageWrite + ?Sized>(
     key: &[u8],
     value: &[u8],
 ) -> Result<bool> {
-    Ok(put_from_root(store, root, trusted, None, key, value, PutKind::Upsert, NO_HINT)?.replaced)
+    Ok(put_from_root(store, root, trusted, None, key, value, PutKind::Upsert, NO_HINT)?.replaced())
 }
 
 /// [`put_sized`], or an append or an insert (`kind`), through a table's write-path `cache`
@@ -433,7 +512,7 @@ fn put_from_root<'v, S: PageWrite + ?Sized>(
             tail.set_range((None, None));
             tail.fill(store, p, path)?;
         }
-        return Ok(Placed { replaced: false, slot: Some(0) });
+        return Ok(Placed::new(false, Some(0)));
     }
     // With a cache, the descent records its path straight into the cache's buffer.
     let mut own_path = None;
@@ -459,28 +538,79 @@ fn put_from_root<'v, S: PageWrite + ?Sized>(
         counted.add_run(n)?;
     }
     // A put that needs no page (a private path, no split) needs no scratch either.
-    let mut scratch = if needed == 0 { Scratch::default() } else { store.take_scratch() };
+    let mut taken = (needed != 0).then(|| store.take_scratch());
+    let mut empty;
+    let scratch = match taken.as_deref_mut() {
+        Some(scratch) => scratch,
+        None => {
+            empty = Scratch::default();
+            &mut empty
+        }
+    };
     let val = match reserve_put(store, needed, &mut scratch.reserved, run_pages, value.bytes()) {
         Ok(ovf) => ovf.map_or(value.inline(), Val::Overflow),
         Err(e) => {
-            if needed != 0 {
-                store.put_scratch(scratch);
+            if let Some(taken) = taken {
+                store.put_scratch(taken);
             }
             return Err(e);
         }
     };
-    let result = make_path_writable(store, root, path, leaf, &mut scratch).and_then(|leaf| {
-        let applied = apply(store, root, path, leaf, key, val, change, &mut scratch)?;
-        Ok((leaf, applied))
-    });
-    // The split's worst case may not have happened: the pages it did not use are reusable.
-    for p in scratch.reserved.drain(..) {
-        store.free(p);
-    }
-    if needed != 0 {
-        store.put_scratch(scratch);
-    }
-    let (leaf, Applied { replaced, right_leaf }) = result?;
+    // The change runs right after copy-on-write's page copies, whose stores are still draining,
+    // so its outcome never goes through memory: a value stored narrow and reloaded wider is one
+    // store forwarding cannot serve, and the reload waits for every older store, the copies'
+    // among them. A replace or an insert takes no page, so the unused ones go back first and the
+    // change is checked through a `Result<()>`; a split, out of line, keeps them until it is done.
+    // A replace or an insert into a published leaf is made as the leaf is copied, from the source
+    // ([`change_path_writable`]); into a private one, in place after the unused pages went back.
+    let made = match change {
+        LeafChange::Split { .. } => {
+            make_path_writable(store, root, path, leaf, scratch).map(|l| (l, false))
+        }
+        LeafChange::Replace(i) | LeafChange::Insert(i) => {
+            let replace = matches!(change, LeafChange::Replace(_));
+            change_path_writable(store, root, path, leaf, scratch, |src, dst| {
+                copy_change_leaf(src, dst, key, val, i, replace)
+            })
+        }
+    };
+    let (leaf, changed) = match made {
+        Ok(made) => made,
+        Err(e) => {
+            give_back(store, &mut scratch.reserved);
+            if let Some(taken) = taken {
+                store.put_scratch(taken);
+            }
+            return Err(e);
+        }
+    };
+    let (replaced, right_leaf) = match change {
+        LeafChange::Split { at, replace, append } => {
+            let split =
+                apply_split(store, root, path, leaf, key, val, (at, replace, append), scratch);
+            // The split's worst case may not have happened: the pages it did not use are reusable.
+            give_back(store, &mut scratch.reserved);
+            if let Some(taken) = taken {
+                store.put_scratch(taken);
+            }
+            let Applied { replaced, right_leaf } = split?;
+            (replaced, right_leaf)
+        }
+        LeafChange::Replace(i) | LeafChange::Insert(i) => {
+            give_back(store, &mut scratch.reserved);
+            if let Some(taken) = taken {
+                store.put_scratch(taken);
+            }
+            let replace = matches!(change, LeafChange::Replace(_));
+            if !changed {
+                change_leaf(store, leaf, key, val, i, replace)?;
+            }
+            if !replace {
+                root.entries += 1;
+            }
+            (replace, None)
+        }
+    };
     // The leaf no longer names the old run: it leaves the tree.
     if let Some((p, n)) = old_run {
         store.free_run(p, n);
@@ -525,7 +655,7 @@ fn put_from_root<'v, S: PageWrite + ?Sized>(
     if let (Some(mut tail), Some(_)) = (tail, slot) {
         tail.fill(store, leaf, path)?;
     }
-    Ok(Placed { replaced, slot })
+    Ok(Placed::new(replaced, slot))
 }
 
 /// Debug builds: the path [`put_from_root`] caches after an append split without a descent is
@@ -766,7 +896,7 @@ fn put_in_cached_leaf<'v, S: PageWrite + ?Sized>(
     }
     #[cfg(all(test, debug_assertions))]
     CACHED_PUTS.with(|n| n.set(n.get() + 1));
-    Ok(Some(Placed { replaced, slot: Some(slot) }))
+    Ok(Some(Placed::new(replaced, Some(slot))))
 }
 
 /// [`put_in_cached_leaf`]'s change to its leaf, with the value in the form the leaf mutators
@@ -884,7 +1014,7 @@ fn delete_in_cached_leaf<S: PageWrite + ?Sized>(
         let (index, value) = match view.find(key)? {
             Find::Found { index, value } => (index, value),
             // The key routes to this leaf only, and the leaf does not hold it.
-            Find::NotFound { .. } => return Ok(Some(Removed { found: false, slot: None })),
+            Find::NotFound { .. } => return Ok(Some(Removed::new(false, None))),
         };
         match (cells, value) {
             (Cells::Plain | Cells::Packing, Val::Inline(_))
@@ -905,7 +1035,7 @@ fn delete_in_cached_leaf<S: PageWrite + ?Sized>(
     root.entries -= 1;
     #[cfg(all(test, debug_assertions))]
     CACHED_DELETES.with(|n| n.set(n.get() + 1));
-    Ok(Some(Removed { found: true, slot: Some(index) }))
+    Ok(Some(Removed::new(true, Some(index))))
 }
 
 /// Test-only forms of [`put`] and [`delete`] for trees whose holder is not tracked: the root is
@@ -1602,6 +1732,15 @@ pub(crate) struct Scratch {
     split: page::SplitBuf,
 }
 
+/// Free the pages a write reserved and did not use: a split's worst case that did not happen, or
+/// what a failed write had left (private pages, so straight to the pool).
+#[inline]
+fn give_back<S: PageWrite + ?Sized>(store: &mut S, reserved: &mut Vec<u32>) {
+    for p in reserved.drain(..) {
+        store.free(p);
+    }
+}
+
 /// Allocate `n` pages for a put into `pages` (empty), or none: on a failure the pages taken so
 /// far go back (they are private, so straight to the pool) and nothing else has changed.
 fn reserve<S: PageWrite + ?Sized>(store: &mut S, n: usize, pages: &mut Vec<u32>) -> Result<()> {
@@ -1712,27 +1851,97 @@ fn make_path_writable<S: PageWrite + ?Sized>(
     leaf: u32,
     scratch: &mut Scratch,
 ) -> Result<u32> {
-    let txn = store.txn() as u32;
-    let mut parent: Option<(u32, usize)> = None;
-    let mut current = leaf;
-    for depth in 0..=path.len() {
-        let old = path.get(depth).map_or(leaf, |&(p, _)| p);
-        current = writable(store, old, scratch)?;
-        if current != old {
-            match parent {
-                None => (root.root, root.root_txn) = (current, txn),
-                Some((p, ci)) => page::branch_set_child(store.page_mut(p)?, ci, current, txn)?,
-            }
-        }
-        if let Some(step) = path.get_mut(depth) {
-            step.0 = current;
-            parent = Some(*step);
-        }
+    let parent = make_branches_writable(store, root, path, scratch)?;
+    let current = writable(store, leaf, scratch)?;
+    if current != leaf {
+        set_child(store, root, parent, current)?;
     }
     Ok(current)
 }
 
-/// What [`apply`] did.
+/// The branches of [`make_path_writable`], top-down, with `path` updated to them: returns the
+/// leaf's writable parent step, `None` for a leaf that is the root (an empty `path`).
+#[inline(always)]
+fn make_branches_writable<S: PageWrite + ?Sized>(
+    store: &mut S,
+    root: &mut TreeRoot,
+    path: &mut [(u32, usize)],
+    scratch: &mut Scratch,
+) -> Result<Option<(u32, usize)>> {
+    let mut parent: Option<(u32, usize)> = None;
+    for step in path.iter_mut() {
+        let current = writable(store, step.0, scratch)?;
+        if current != step.0 {
+            set_child(store, root, parent, current)?;
+        }
+        step.0 = current;
+        parent = Some(*step);
+    }
+    Ok(parent)
+}
+
+/// Point `parent`'s step (writable), or the tree's root when `None`, at the private copy
+/// `child`, with this transaction's `child_txn`.
+#[inline(always)]
+fn set_child<S: PageWrite + ?Sized>(
+    store: &mut S,
+    root: &mut TreeRoot,
+    parent: Option<(u32, usize)>,
+    child: u32,
+) -> Result<()> {
+    let txn = store.txn() as u32;
+    match parent {
+        None => (root.root, root.root_txn) = (child, txn),
+        Some((p, ci)) => page::branch_set_child(store.page_mut(p)?, ci, child, txn)?,
+    }
+    Ok(())
+}
+
+/// [`make_path_writable`] for a change of the leaf alone, made in its copy: the branches as
+/// there; a published leaf copied into a reserved page with `change(src, dst)` made in the same
+/// pass ([`PageWrite::copy_published_with`]), then [`writable`]'s steps after its copy, in their
+/// order, and re-pointed in its parent or as the root. Returns the writable leaf and whether the
+/// change is made: not for a private leaf, which the caller changes in place.
+///
+/// The change reads only the source, a published page this transaction only frees, so its bytes
+/// stay until the commit and its reuse gate; and it only writes the copy. Nothing in the write
+/// reads the copy after it, so the copy's stores drain while the next operation runs: changed
+/// after the copy, the leaf's first loads waited for them. Every check runs on the source's
+/// bytes, those the copy holds outside the free gap.
+#[inline(always)]
+fn change_path_writable<S, F>(
+    store: &mut S,
+    root: &mut TreeRoot,
+    path: &mut [(u32, usize)],
+    leaf: u32,
+    scratch: &mut Scratch,
+    change: F,
+) -> Result<(u32, bool)>
+where
+    S: PageWrite + ?Sized,
+    F: FnOnce(&[u8], &mut [u8]) -> Result<()>,
+{
+    let parent = make_branches_writable(store, root, path, scratch)?;
+    if store.is_private(leaf) {
+        return Ok((leaf, false));
+    }
+    #[cfg(test)]
+    if store.no_fused_copy() {
+        let copy = writable(store, leaf, scratch)?;
+        set_child(store, root, parent, copy)?;
+        return Ok((copy, false));
+    }
+    let q = scratch.reserved.pop().ok_or_else(|| bug("copy-on-write ran out of reserved pages"))?;
+    let txn = store.txn();
+    let copy = store.copy_published_with(leaf, q, change)?;
+    page::set_pgno_txn(copy, q, txn);
+    crc::zero_crc(copy);
+    store.free(leaf);
+    set_child(store, root, parent, q)?;
+    Ok((q, true))
+}
+
+/// What [`apply_split`] did.
 struct Applied {
     /// It replaced a present key's value.
     replaced: bool,
@@ -1742,36 +1951,72 @@ struct Applied {
     right_leaf: Option<u32>,
 }
 
-/// Apply the planned change to the writable `leaf` with the cell value `value` (the value, or the
-/// reference to its run), splitting up the writable `path` with pages from `scratch.reserved`,
-/// and count each split's new page and a new root in `root`.
+/// A leaf change the plan said fits (`what`): [`Fit::Full`] there is a bug.
+#[inline(always)]
+fn fit(fit: Fit, what: &str) -> Result<()> {
+    match fit {
+        Fit::Done => Ok(()),
+        Fit::Full => Err(bug(format!("{what} did not fit as planned"))),
+    }
+}
+
+/// The planned change of a put that fits its leaf, made in the private `leaf` with the cell value
+/// `value` (the value, or the reference to its run): entry `i`'s value replaced (`replace`), else
+/// `(key, value)` inserted as entry `i`. Forced inline into [`put_from_root`] (see the comment at
+/// its call).
+#[inline(always)]
+fn change_leaf<S: PageWrite + ?Sized>(
+    store: &mut S,
+    leaf: u32,
+    key: &[u8],
+    value: Val<'_>,
+    i: usize,
+    replace: bool,
+) -> Result<()> {
+    let page = page::LeafMut::new(store.page_mut(leaf)?)?;
+    if replace {
+        fit(page.replace_value(i, value)?, "a value")
+    } else {
+        fit(page.insert(i, key, value)?, "an entry")
+    }
+}
+
+/// [`change_leaf`] made in the copy `dst` of the published leaf `src` as it is copied
+/// ([`change_path_writable`]): `page::copy_replace` or `page::copy_insert`, with the same
+/// checks and errors.
+#[inline(always)]
+fn copy_change_leaf(
+    src: &[u8],
+    dst: &mut [u8],
+    key: &[u8],
+    value: Val<'_>,
+    i: usize,
+    replace: bool,
+) -> Result<()> {
+    if replace {
+        fit(page::copy_replace(src, dst, i, value)?, "a value")
+    } else {
+        fit(page::copy_insert(src, dst, i, key, value)?, "an entry")
+    }
+}
+
+/// The planned split of a put: the writable `leaf`'s entry `at` replaced (`replace`) or the entry
+/// `(key, value)` inserted there (the cell value `value`: the value, or the reference to its run),
+/// split as an append (`append`) or by the plan, with pages from `scratch.reserved`, and the
+/// separators inserted up the writable `path`, splitting each branch they do not fit; each new
+/// page and a new root counted in `root`.
 #[allow(clippy::too_many_arguments)]
-fn apply<S: PageWrite + ?Sized>(
+#[inline(never)]
+fn apply_split<S: PageWrite + ?Sized>(
     store: &mut S,
     root: &mut TreeRoot,
     path: &mut Path,
     leaf: u32,
     key: &[u8],
     value: Val<'_>,
-    change: LeafChange,
+    (at, replace, append): (usize, bool, bool),
     scratch: &mut Scratch,
 ) -> Result<Applied> {
-    let fit = |fit: Fit, what: &str| match fit {
-        Fit::Done => Ok(()),
-        Fit::Full => Err(bug(format!("{what} did not fit as planned"))),
-    };
-    let (at, replace, append) = match change {
-        LeafChange::Replace(i) => {
-            fit(page::LeafMut::new(store.page_mut(leaf)?)?.replace_value(i, value)?, "a value")?;
-            return Ok(Applied { replaced: true, right_leaf: None });
-        }
-        LeafChange::Insert(i) => {
-            fit(page::LeafMut::new(store.page_mut(leaf)?)?.insert(i, key, value)?, "an entry")?;
-            root.entries += 1;
-            return Ok(Applied { replaced: false, right_leaf: None });
-        }
-        LeafChange::Split { at, replace, append } => (at, replace, append),
-    };
     if replace {
         page::leaf_delete(store.page_mut(leaf)?, at)?;
     }
@@ -1977,7 +2222,7 @@ pub(crate) fn delete<S: PageWrite + ?Sized>(
     trusted: &mut bool,
     key: &[u8],
 ) -> Result<bool> {
-    Ok(delete_from_root(store, root, trusted, None, key, Cells::Plain, NO_HINT)?.found)
+    Ok(delete_from_root(store, root, trusted, None, key, Cells::Plain, NO_HINT)?.found())
 }
 
 /// [`delete`], with a table's `cache` if given: the descent records its path straight into the
@@ -1997,7 +2242,7 @@ fn delete_from_root<S: PageWrite + ?Sized>(
     cells: Cells,
     hint: Hint<'_>,
 ) -> Result<Removed> {
-    const MISS: Removed = Removed { found: false, slot: None };
+    const MISS: Removed = Removed::new(false, None);
     root.check()?;
     if root.is_empty() {
         return Ok(MISS);
@@ -2015,16 +2260,24 @@ fn delete_from_root<S: PageWrite + ?Sized>(
         return Ok(MISS);
     };
     let buffers = plan.copies != 0 || !plan.merges.is_empty();
-    let mut scratch = if buffers { store.take_scratch() } else { Scratch::default() };
+    let mut taken = buffers.then(|| store.take_scratch());
+    let mut empty;
+    let scratch = match taken.as_deref_mut() {
+        Some(scratch) => scratch,
+        None => {
+            empty = Scratch::default();
+            &mut empty
+        }
+    };
     // A failed reservation gives its pages back itself; the buffers go back either way.
     let result = reserve(store, plan.copies, &mut scratch.reserved)
-        .and_then(|()| apply_delete(store, root, path, &plan, &mut scratch));
+        .and_then(|()| apply_delete(store, root, path, &plan, &mut *scratch));
     // Every reserved page is used, so this frees nothing unless the apply failed part way.
     for p in scratch.reserved.drain(..) {
         store.free(p);
     }
-    if buffers {
-        store.put_scratch(scratch);
+    if let Some(taken) = taken {
+        store.put_scratch(taken);
     }
     let changed = result?;
     // Only a delete that merged or read a sibling reports: on the release benchmark's timed path
@@ -2050,7 +2303,7 @@ fn delete_from_root<S: PageWrite + ?Sized>(
         }
         _ => None,
     };
-    Ok(Removed { found: true, slot })
+    Ok(Removed::new(true, slot))
 }
 
 /// The read-only first half of a delete of `key` from a non-empty tree: descend to its leaf with
@@ -2632,8 +2885,14 @@ fn apply_delete<S: PageWrite + ?Sized>(
     let top = usize::from(plan.merged_root);
     let changed = match plan.shape {
         DeleteShape::Leaf => {
-            let leaf = make_path_writable(store, root, &mut path[top..], plan.leaf, scratch)?;
-            page::leaf_delete(store.page_mut(leaf)?, plan.at)?;
+            let at = plan.at;
+            let (leaf, deleted) =
+                change_path_writable(store, root, &mut path[top..], plan.leaf, scratch, |s, d| {
+                    page::copy_delete(s, d, at)
+                })?;
+            if !deleted {
+                page::leaf_delete(store.page_mut(leaf)?, at)?;
+            }
             Some(leaf)
         }
         DeleteShape::Unlink(d) => {
@@ -3142,7 +3401,7 @@ mod tests {
         store.geometry().place(key.len(), value.len())?;
         let mut trusted = !root.is_empty() && store.is_private(root.root);
         Ok(put_cached(store, root, &mut trusted, cache, key, value, PutKind::Upsert, NO_HINT)?
-            .replaced)
+            .replaced())
     }
 
     /// [`delete`], through a table's path cache when given ([`delete_cached`]).
@@ -3154,7 +3413,7 @@ mod tests {
     ) -> Result<bool> {
         let Some(cache) = cache else { return delete(store, root, key) };
         let mut trusted = !root.is_empty() && store.is_private(root.root);
-        Ok(delete_cached(store, root, &mut trusted, cache, key, NO_HINT)?.found)
+        Ok(delete_cached(store, root, &mut trusted, cache, key, NO_HINT)?.found())
     }
 
     /// A random entry: a fresh key (mostly short, sometimes up to the key limit) or, a third of the
@@ -4213,7 +4472,7 @@ mod tests {
         let removed =
             delete_cached(&mut store, &mut root, &mut trusted, &mut cache, &key(30), NO_HINT)
                 .expect("delete");
-        assert!(removed.found && removed.slot.is_some(), "the delete filled the cache");
+        assert!(removed.found() && removed.slot().is_some(), "the delete filled the cache");
         let in_leaf = |k: &[u8]| {
             cache.lo.get().is_none_or(|lo| page::cmp_keys(k, lo).is_ge())
                 && cache.hi.get().is_none_or(|hi| page::cmp_keys(k, hi).is_lt())
@@ -4256,7 +4515,7 @@ mod tests {
         put(&mut store, &mut root, &k, b"back").expect("put");
         let removed = delete_cached(&mut store, &mut root, &mut trusted, &mut cache, &k, NO_HINT)
             .expect("delete");
-        assert!(removed.found, "the key was found where it lives");
+        assert!(removed.found(), "the key was found where it lives");
         assert_eq!(get(&store, &root, &k).expect("get"), None);
         assert_eq!(root.entries, entries);
         store.commit_like();
@@ -4428,12 +4687,12 @@ mod tests {
             let placed =
                 put_cached(&mut store, &mut root, &mut trusted, &mut cache, &k, &v, kind, NO_HINT)
                     .expect("put");
-            assert_eq!(placed.replaced, model.insert(k.clone(), v).is_some(), "op {op}");
+            assert_eq!(placed.replaced(), model.insert(k.clone(), v).is_some(), "op {op}");
             // A put into the empty tree adds the first leaf: no split.
             if before.height > 0 && root.leaf_pages > before.leaf_pages {
                 let grew = root.height > before.height || root.branch_pages > before.branch_pages;
                 let shape = if is_last {
-                    assert_eq!(placed.slot, Some(0), "op {op}: a grown last key's append split");
+                    assert_eq!(placed.slot(), Some(0), "op {op}: a grown last key's append split");
                     if grew {
                         6
                     } else {
@@ -4453,7 +4712,7 @@ mod tests {
                     splits[4] += 1;
                 }
             }
-            assert_cache_found(&store, &root, &cache, &k, placed.slot, &format!("op {op}"));
+            assert_cache_found(&store, &root, &cache, &k, placed.slot(), &format!("op {op}"));
             if op % 23 == 22 {
                 store.commit_like();
                 trusted = false;
@@ -4669,7 +4928,7 @@ mod tests {
             assert!(n >= 2 && rightmost_last == append, "step {step}: {index} of {n}");
             let (leaf_pages, height) = (root.leaf_pages, root.height);
             let (placed, value) = put(store, root, cache, step);
-            assert!(placed.replaced, "step {step}: the put replaced");
+            assert!(placed.replaced(), "step {step}: the put replaced");
             if root.leaf_pages == leaf_pages {
                 continue;
             }
@@ -4679,7 +4938,7 @@ mod tests {
             let kept = store.page(leaf).expect("left") == &left[..];
             if !append {
                 assert!(!kept, "a middle split kept the leaf's other cells as they were");
-                assert_eq!((placed.slot, cache.epoch), (None, 0), "a middle split left a cache");
+                assert_eq!((placed.slot(), cache.epoch), (None, 0), "a middle split left a cache");
                 return (height, root.height);
             }
             assert!(kept, "the leaf's other cells moved");
@@ -4696,7 +4955,7 @@ mod tests {
                 matches!(at, Find::Found { index: 0, value: Val::Inline(v) } if v == &value[..]),
                 "the new leaf's entry: {at:?}"
             );
-            assert_eq!(placed.slot, Some(0), "the entry's slot");
+            assert_eq!(placed.slot(), Some(0), "the entry's slot");
             assert_eq!(cache.epoch, store.epoch(), "the cache holds");
             assert_eq!((cache.branches(), cache.leaf()), (&*path, found.pgno), "the cached path");
             assert_eq!((cache.lo.get(), cache.hi.get()), found.range, "the cached range");
@@ -6657,7 +6916,7 @@ mod tests {
                     }
                     _ => {
                         let placed = r.unwrap_or_else(|e| panic!("op {op} {kind:?}: {e}"));
-                        assert_eq!(placed.replaced, exists, "op {op}");
+                        assert_eq!(placed.replaced(), exists, "op {op}");
                         model.insert(key.clone(), nested.encode());
                     }
                 }
@@ -6676,7 +6935,7 @@ mod tests {
                     NO_HINT,
                 )
                 .unwrap_or_else(|e| panic!("op {op} delete: {e}"));
-                assert_eq!(removed.found, model.remove(&key).is_some(), "op {op}");
+                assert_eq!(removed.found(), model.remove(&key).is_some(), "op {op}");
                 let r = &store.merge_report;
                 merges += usize::from(r.leaf_left + r.leaf_right + r.branches > 0);
             }
@@ -7010,7 +7269,7 @@ mod tests {
                     }
                     _ => {
                         let placed = r.unwrap_or_else(|e| panic!("op {op} {kind:?}: {e}"));
-                        assert_eq!(placed.replaced, old.is_some(), "op {op}");
+                        assert_eq!(placed.replaced(), old.is_some(), "op {op}");
                         flips += usize::from(old.is_some_and(|o| {
                             matches!(o, PackingCell::Nested(_))
                                 != matches!(want, PackingCell::Nested(_))
@@ -7033,7 +7292,7 @@ mod tests {
                     NO_HINT,
                 )
                 .unwrap_or_else(|e| panic!("op {op} delete: {e}"));
-                assert_eq!(removed.found, model.remove(&key).is_some(), "op {op}");
+                assert_eq!(removed.found(), model.remove(&key).is_some(), "op {op}");
                 let r = &store.merge_report;
                 merges += usize::from(r.leaf_left + r.leaf_right + r.branches > 0);
             }
@@ -7540,7 +7799,7 @@ mod tests {
                 NO_HINT,
             );
             if case == "older" {
-                assert!(r.is_ok_and(|p| p.replaced), "{case}");
+                assert!(r.is_ok_and(|p| p.replaced()), "{case}");
             } else {
                 assert!(
                     matches!(&r, Err(Error::Corrupt(m)) if m.contains(&format!("nested root page {named}"))),
@@ -7830,5 +8089,289 @@ mod tests {
         assert_copy_fails_as_page_fails(w, freed, q);
         crc::zero_crc(raw(w, freed));
         assert_copy_fails_as_page_fails(w, freed, q);
+    }
+
+    /// `got` and `want` equal outside the free gap of `got` ([`page::free_gap`]; whole when it
+    /// gives none), which `want`'s equals.
+    fn assert_equal_outside_the_gap(got: &[u8], want: &[u8], what: &str) {
+        let gap = page::free_gap(got);
+        assert_eq!(gap, page::free_gap(want), "{what}: the free gap");
+        let gap = gap.unwrap_or(0..0);
+        assert_eq!(got.len(), want.len(), "{what}: the lengths");
+        if got[..gap.start] != want[..gap.start] || got[gap.end..] != want[gap.end..] {
+            let at = (0..got.len()).find(|&j| !gap.contains(&j) && got[j] != want[j]);
+            panic!("{what}: differs at {at:?}");
+        }
+    }
+
+    /// The store twins of [`fused_copies_match_the_copy_then_the_change`] hold the same pages
+    /// outside each one's free gap, the same freed list and pool and the same page count.
+    fn assert_twins_match(fused: &MemStore, twin: &MemStore, what: &str) {
+        assert_eq!(fused.alloc.page_count(), twin.alloc.page_count(), "{what}: page count");
+        assert_eq!(fused.alloc.freed(), twin.alloc.freed(), "{what}: freed pages");
+        assert_eq!(fused.alloc.pool(), twin.alloc.pool(), "{what}: pool");
+        for p in 2..fused.alloc.page_count() {
+            assert_equal_outside_the_gap(fused.raw(p), twin.raw(p), &format!("{what}, page {p}"));
+        }
+    }
+
+    /// What [`fused_copies`] saw: each kind of leaf change into a published leaf (the root
+    /// published, so its whole path is, and the tree's shape unchanged).
+    #[derive(Debug, Default)]
+    struct FusedCoverage {
+        inserts: usize,
+        grows: usize,
+        equals: usize,
+        shrinks: usize,
+        deletes: usize,
+        cached: usize,
+    }
+
+    /// The same random puts (inserts, replaces growing, equal and shrinking, inline and overflow
+    /// values) and deletes on two [`MemStore`]s, one with [`MemStore::no_fused_copy`] (the copy,
+    /// then the change in it): after every op the results and the roots are equal, and every page
+    /// outside its free gap, the freed list and the pool. Commits (and reuse of the freed pages)
+    /// come every few ops, so the writes meet published leaves; odd rounds go through a
+    /// [`PathCache`], even ones without.
+    fn fused_copies(page_size: u32, seed: u64, rounds: usize, merge: bool) -> FusedCoverage {
+        let _report = ReportSeed(seed);
+        let mut rng = Rng(seed);
+        let [mut fused, mut twin] = [MemStore::new(page_size), MemStore::new(page_size)];
+        twin.no_fused_copy = true;
+        for store in [&mut fused, &mut twin] {
+            store.no_merge = !merge;
+        }
+        let (mut root, mut twin_root) = (TreeRoot::EMPTY, TreeRoot::EMPTY);
+        let mut model: BTreeMap<Vec<u8>, usize> = BTreeMap::new();
+        let mut seen = FusedCoverage::default();
+        let max = fused.geometry().max_value(16);
+        let key = |id: u64| {
+            let mut k = format!("{id:06}").into_bytes();
+            k.resize(6 + (id % 11) as usize, b'k');
+            k
+        };
+        for round in 0..rounds {
+            let mut cache = (round % 2 == 1).then(PathCache::default);
+            let mut twin_cache = (round % 2 == 1).then(PathCache::default);
+            for op in 0..1 + rng.below(6) {
+                let what = format!("round {round} op {op}");
+                let k = key(rng.below(400));
+                let published = !root.is_empty() && !fused.is_private(root.root);
+                let shape = (root.height, root.leaf_pages);
+                let old = model.get(&k).copied();
+                let deleting = old.is_some() && rng.below(3) == 0;
+                let (got, want) = if deleting {
+                    let got = delete_through(&mut fused, &mut root, cache.as_mut(), &k);
+                    let want = delete_through(&mut twin, &mut twin_root, twin_cache.as_mut(), &k);
+                    model.remove(&k);
+                    (got, want)
+                } else {
+                    let vlen = match (old, rng.below(8)) {
+                        (Some(len), 0 | 1) => len,
+                        (_, 2) => max - rng.len_upto(16),
+                        (_, 3) => page_size as usize + rng.len_upto(page_size as usize),
+                        (_, 4) => rng.len_upto(page_size as usize / 8),
+                        _ => rng.len_upto(48),
+                    };
+                    let v = vec![rng.next() as u8; vlen];
+                    let got = put_through(&mut fused, &mut root, cache.as_mut(), &k, &v);
+                    let want = put_through(&mut twin, &mut twin_root, twin_cache.as_mut(), &k, &v);
+                    model.insert(k.clone(), vlen);
+                    if published && shape == (root.height, root.leaf_pages) {
+                        match old.map(|len| len.cmp(&vlen)) {
+                            None => seen.inserts += 1,
+                            Some(std::cmp::Ordering::Less) => seen.grows += 1,
+                            Some(std::cmp::Ordering::Equal) => seen.equals += 1,
+                            Some(std::cmp::Ordering::Greater) => seen.shrinks += 1,
+                        }
+                        seen.cached += usize::from(cache.is_some());
+                    }
+                    (got, want)
+                };
+                if deleting && published && shape == (root.height, root.leaf_pages) {
+                    seen.deletes += 1;
+                }
+                let (got, want) = (got.map_err(|e| e.to_string()), want.map_err(|e| e.to_string()));
+                assert_eq!(got, want, "{what}: the results");
+                assert_eq!(root, twin_root, "{what}: the roots");
+                assert_twins_match(&fused, &twin, &what);
+            }
+            for store in [&mut fused, &mut twin] {
+                store.commit_like();
+                if round % 3 == 2 {
+                    store.recycle();
+                }
+            }
+            assert_twins_match(&fused, &twin, &format!("round {round}: the commit"));
+        }
+        let walked = walk_tree(&fused, &root).entries.into_iter().map(|(k, v)| (k, v.len()));
+        assert!(walked.eq(model), "the model's keys and value lengths");
+        fused.assert_accounting(&[root]);
+        seen
+    }
+
+    /// [`fused_copies`] on a small page and a large one, with merging on and off: every kind of
+    /// change into a published leaf ran, with and without a path cache.
+    #[test]
+    fn fused_copies_match_the_copy_then_the_change() {
+        for (page_size, merge) in [(4096, true), (4096, false), (16384, true)] {
+            let seen = fused_copies(
+                page_size,
+                0x6A09_E667_F3BC_C908 ^ u64::from(page_size) ^ u64::from(merge),
+                300,
+                merge,
+            );
+            let FusedCoverage { inserts, grows, equals, shrinks, deletes, cached } = seen;
+            assert!(
+                [inserts, grows, equals, shrinks, deletes, cached].iter().all(|&n| n > 0),
+                "page size {page_size}, merge {merge}: {seen:?}"
+            );
+        }
+    }
+
+    /// The heavy twin of [`fused_copies_match_the_copy_then_the_change`]: more seeds, rounds and
+    /// page sizes.
+    #[test]
+    #[ignore = "heavy: run with --ignored in release"]
+    fn fused_copies_match_the_copy_then_the_change_heavy() {
+        for seed in 1..=8_u64 {
+            let seed = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+            for page_size in [4096, 8192, 16384, 65536] {
+                for merge in [false, true] {
+                    fused_copies(page_size, seed, 500, merge);
+                }
+            }
+        }
+    }
+
+    /// [`PageWrite::copy_published_with`] with a leaf's change is [`copy_page`] then the change in
+    /// the copy, outside the result's free gap: on a [`MemStore`], on the environment's writer (a
+    /// published leaf through the readers' view), and on a freed page past the published bytes,
+    /// which the writer copies from a buffer of its own (`copy_unpublished`).
+    #[test]
+    fn a_copy_with_its_change_is_the_copy_then_the_change() {
+        fn assert_changes<S: PageWrite + ?Sized>(store: &mut S, p: u32, q: u32) {
+            let src = store.page(p).expect("a published leaf").to_vec();
+            let n = page::nkeys(&src);
+            for change in 0..3 {
+                let at = [0, n / 2, n - 1][change];
+                let mut want = store.private_page(q).expect("q").to_vec();
+                copy_page(&src, q, &mut want).expect("copy");
+                let got = store
+                    .copy_published_with(p, q, |s, d| match change {
+                        0 => page::copy_delete(s, d, at),
+                        1 => fit(page::copy_replace(s, d, at, Val::Inline(b"rv"))?, "a value"),
+                        _ => {
+                            fit(page::copy_insert(s, d, at, b"\0", Val::Inline(b"iv"))?, "an entry")
+                        }
+                    })
+                    .expect("the copy with its change")
+                    .to_vec();
+                let leaf = page::LeafMut::new(&mut want).expect("a leaf");
+                match change {
+                    0 => leaf.delete(at).expect("delete"),
+                    1 => assert_eq!(
+                        leaf.replace_value(at, Val::Inline(b"rv")).expect("rv"),
+                        Fit::Done
+                    ),
+                    _ => assert_eq!(
+                        leaf.insert(at, b"\0", Val::Inline(b"iv")).expect("iv"),
+                        Fit::Done
+                    ),
+                }
+                assert_equal_outside_the_gap(&got, &want, &format!("page {p}, change {change}"));
+            }
+        }
+        let leaf_of = |pages: &[u32], kind: &dyn Fn(u32) -> page::Kind| {
+            *pages.iter().rev().find(|&&p| kind(p) == page::Kind::Leaf).expect("a leaf")
+        };
+
+        let (mut store, root) = committed_mem_store();
+        let pages = store.reachable_pgnos(&root);
+        let leaf = leaf_of(&pages, &|p| page::kind(store.raw(p)).expect("kind"));
+        let q = store.alloc().expect("alloc");
+        assert_changes(&mut store, leaf, q);
+
+        fn raw(w: &mut crate::env::Writer, p: u32) -> &mut [u8] {
+            let size = w.geometry.page_size();
+            w.file.page_mut(p, size).expect("in the file")
+        }
+        let (_dir, env) = committed_env();
+        let mut txn = env.begin_rw().expect("begin");
+        let w = txn.writer_mut();
+        let size = w.geometry.page_size();
+        let pages = published_tree_pages(w);
+        let leaf = leaf_of(&pages, &|p| page::kind(w.page(p).expect("page")).expect("kind"));
+        let q = w.alloc().expect("alloc");
+        assert_changes(w, leaf, q);
+
+        // A freed page past the published bytes, forged to pass the fetch checks.
+        let src = w.page(leaf).expect("leaf").to_vec();
+        let freed = loop {
+            let p = w.alloc().expect("alloc");
+            if p >= w.last.page_count {
+                break p;
+            }
+        };
+        let (txn_id, page) = (w.txn(), raw(w, freed));
+        page.copy_from_slice(&src);
+        page::set_pgno_txn(page, freed, txn_id);
+        page::stamp(page);
+        let q = w.alloc().expect("alloc");
+        w.free(freed);
+        assert!(w.view.slice(u64::from(freed) * size as u64, size).is_none(), "past the view");
+        assert_changes(w, freed, q);
+    }
+
+    /// The same transactions on two environments, one whose writer copies a leaf then changes it
+    /// (`Writer::no_fused_copy`): after each commit the files hold the same pages outside each
+    /// one's free gap, the meta pages included.
+    #[test]
+    fn a_commit_writes_the_pages_of_the_copy_then_the_change() {
+        let open = || {
+            let dir = tempfile::TempDir::with_prefix("tndb_b_fused").expect("temp dir");
+            let options = crate::EnvOptions { map_reserve: 16 << 10, ..Default::default() };
+            let env = crate::Env::open(dir.path().join("db"), options).expect("open");
+            (dir, env)
+        };
+        let [(dir, env), (twin_dir, twin)] = [open(), open()];
+        let mut rng = Rng(0xBB67_AE85_84CA_A73B);
+        for round in 0..12 {
+            let ops: Vec<(u32, usize, bool)> = (0..40)
+                .map(|_| {
+                    let len = match rng.below(6) {
+                        0 => 3000 + rng.len_upto(6000),
+                        1 => rng.len_upto(400),
+                        _ => rng.len_upto(40),
+                    };
+                    (rng.below(500) as u32, len, round > 0 && rng.below(4) == 0)
+                })
+                .collect();
+            for (env, knob) in [(&env, false), (&twin, true)] {
+                let mut txn = env.begin_rw().expect("begin");
+                txn.writer_mut().no_fused_copy = knob;
+                let t = txn.create_table("t").expect("table");
+                for &(id, len, delete) in &ops {
+                    let key = id.to_be_bytes();
+                    if delete {
+                        txn.delete(&t, &key).expect("delete");
+                    } else {
+                        txn.put(&t, &key, &vec![(id + round) as u8; len]).expect("put");
+                    }
+                }
+                txn.commit().expect("commit");
+            }
+            let files =
+                [&dir, &twin_dir].map(|d| std::fs::read(d.path().join("db")).expect("read"));
+            assert_eq!(files[0].len(), files[1].len(), "round {round}: the file lengths");
+            let size = env.stat().page_size as usize;
+            for (p, (a, b)) in files[0].chunks(size).zip(files[1].chunks(size)).enumerate() {
+                if p < 2 {
+                    assert!(a == b, "round {round}: meta page {p}");
+                } else {
+                    assert_equal_outside_the_gap(a, b, &format!("round {round}, page {p}"));
+                }
+            }
+        }
     }
 }

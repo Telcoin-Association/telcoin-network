@@ -5,7 +5,7 @@ use std::collections::HashSet;
 
 use super::{
     read::{checked_child, checked_page},
-    write::{copy_page, MergeReport, Scratch},
+    write::{MergeReport, Scratch},
     PageRead, PageWrite, TreeRoot,
 };
 use crate::{
@@ -71,10 +71,14 @@ pub(crate) struct MemStore {
     /// The pool and page count at the start of the writing transaction, which
     /// [`Self::abort_like`] returns to.
     base: (Vec<u32>, u32),
-    /// The writer's reused buffers ([`PageWrite::take_scratch`]).
-    scratch: Scratch,
+    /// The writer's reused buffers ([`PageWrite::take_scratch`]), boxed at the first write that
+    /// takes them.
+    scratch: Option<Box<Scratch>>,
     /// Deletes do not merge under-full pages ([`PageWrite::no_merge`]).
     pub(crate) no_merge: bool,
+    /// Copy-on-write of a leaf for its change takes the two-step path
+    /// ([`PageWrite::no_fused_copy`]).
+    pub(crate) no_fused_copy: bool,
     /// What the last delete that merged, or read a sibling that did not fit, reported
     /// ([`PageWrite::merges_applied`]); any other delete leaves it as it was, so a test reading
     /// it for one delete resets it first.
@@ -91,8 +95,9 @@ impl MemStore {
             alloc: Allocator::new(1, 2),
             retired: Vec::new(),
             base: (Vec::new(), 2),
-            scratch: Scratch::default(),
+            scratch: None,
             no_merge: false,
+            no_fused_copy: false,
             merge_report: MergeReport::default(),
         }
     }
@@ -357,9 +362,13 @@ impl PageWrite for MemStore {
         Ok(self.raw_mut(pgno))
     }
 
-    /// The writer's copy, [`copy_page`], from the buffer split at the later of the two pages:
-    /// the buffer has no readers to alias, and the private `to` is never the published `from`.
-    fn copy_published(&mut self, from: u32, to: u32) -> Result<&mut [u8]> {
+    /// The writer's copy, `f` (for [`PageWrite::copy_published`], [`super::write::copy_page`]),
+    /// from the buffer split at the later of the two pages: the buffer has no readers to alias,
+    /// and the private `to` is never the published `from`.
+    fn copy_published_with<F>(&mut self, from: u32, to: u32, f: F) -> Result<&mut [u8]>
+    where
+        F: FnOnce(&[u8], &mut [u8]) -> Result<()>,
+    {
         if self.alloc.is_private(from) {
             return Err(Error::Failed(format!("page {from} is private: it needs no copy")));
         }
@@ -373,7 +382,7 @@ impl PageWrite for MemStore {
         } else {
             (&high[..size], &mut low[dst..dst + size])
         };
-        copy_page(src, to, dst)?;
+        f(src, dst)?;
         Ok(self.raw_mut(to))
     }
 
@@ -409,16 +418,20 @@ impl PageWrite for MemStore {
         self.alloc.free_run(pgno, npages);
     }
 
-    fn take_scratch(&mut self) -> Scratch {
-        std::mem::take(&mut self.scratch)
+    fn take_scratch(&mut self) -> Box<Scratch> {
+        self.scratch.take().unwrap_or_default()
     }
 
-    fn put_scratch(&mut self, scratch: Scratch) {
-        self.scratch = scratch;
+    fn put_scratch(&mut self, scratch: Box<Scratch>) {
+        self.scratch = Some(scratch);
     }
 
     fn no_merge(&self) -> bool {
         self.no_merge
+    }
+
+    fn no_fused_copy(&self) -> bool {
+        self.no_fused_copy
     }
 
     fn merges_applied(&mut self, report: MergeReport) {
