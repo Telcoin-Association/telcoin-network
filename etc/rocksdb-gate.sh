@@ -1,24 +1,18 @@
 #!/bin/bash
 #
-# RocksDB guard: fail if rocksdb enters the default feature graph.
+# RocksDB guard: fail if RocksDB comes back into the workspace.
 #
 # librocksdb-sys is the entire RocksDB C++ engine (332 translation units) and the single
-# largest native compile in the tree. Storage here is MDBX-only, so the workspace takes reth's
-# individual crates (never the `reth` umbrella, whose defaults include it) and leaves `rocksdb`
-# off; see the note above the reth entries in Cargo.toml, including the warning that reth's
-# `edge` features imply it.
-# This guard catches the bump that re-introduces it through some other default set: the
-# cost would land on every build, and the cache warm on main would absorb it without a
-# word.
+# largest native compile reth can bring in. Storage here is MDBX (or tndb-b), so the
+# workspace has no `rocksdb` feature, and the vendored reth under vendor/reth has its RocksDB
+# backend and `rocksdb` features removed (`RocksDBProvider` is the zero-size stub). See the
+# note above the reth entries in Cargo.toml and vendor/reth/VENDOR.md.
 #
-# Structured check: count rocksdb packages in the feature-resolved metadata graph instead
-# of scraping cargo's error wording. Resolves the graph only and compiles nothing; with the
-# registry index already present (a restored cargo home in CI, any earlier build locally)
-# it takes seconds.
-#
-# Fails closed: `set -euo pipefail` turns a cargo or jq failure into a failed assignment
-# instead of a "zero hits" pass, and a missing jq is refused up front rather than reported
-# as a clean graph.
+# Two static checks. They resolve nothing and compile nothing:
+# 1. Cargo.lock has no `rocksdb` or `librocksdb-sys` package. The lock is resolved with every
+#    feature of every workspace member, so this covers all feature combinations.
+# 2. No Cargo.toml in the repo (TN or vendored reth) names rocksdb outside a comment: no
+#    feature, no dependency, no feature forward.
 #
 # Runs in the `test` job of .github/workflows/pr.yaml and in etc/test-and-attest.sh, so the
 # queue enforces what the maintainer's attested run checked.
@@ -28,27 +22,27 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
-if ! command -v jq > /dev/null; then
-    echo "rocksdb guard FAILED: jq is required and was not found on PATH."
-    exit 1
-fi
+lock_hits=$(awk '/^name = "(rocksdb|librocksdb-sys)"$/ { print "Cargo.lock:" FNR ": " $0 }' Cargo.lock)
 
-hits=$(cargo metadata --locked --format-version 1 |
-    jq '[.resolve.nodes[].id | select(test("[/#]rocksdb@"))] | length')
+manifest_hits=$(find . \( -path ./target -o -path ./.git \) -prune -o -name Cargo.toml -print0 |
+    xargs -0 awk '{
+        line = $0
+        sub(/#.*/, "", line)
+        if (line ~ /(^|[^A-Za-z0-9_-])(lib)?rocksdb([^A-Za-z0-9_]|$)/) print FILENAME ":" FNR ": " $0
+    }')
 
-if [[ "$hits" -ne 0 ]]; then
-    echo "rocksdb guard FAILED: librocksdb-sys re-entered the default dependency graph (${hits} rocksdb package(s) resolved)."
+if [[ -n "$lock_hits" || -n "$manifest_hits" ]]; then
+    echo "rocksdb guard FAILED: rocksdb is back in the workspace."
     echo
-    cargo tree --locked -e features -i rocksdb || true
+    [[ -n "$lock_hits" ]] && echo "$lock_hits"
+    [[ -n "$manifest_hits" ]] && echo "$manifest_hits"
     echo
     cat <<'EOF'
-rocksdb is gated behind an off-by-default feature so that no build in this workspace pays
-for the RocksDB C++ engine. A dependency change has pulled it back into the default graph.
-Find the edge in the tree above and cut it (turn the feature off on that dependency, or
-take it without default features and re-enable the ones needed). The note above the reth
-entries in Cargo.toml has the background.
+RocksDB is not part of this workspace: no build may pay for the RocksDB C++ engine.
+Remove the feature or dependency named above. If it came from vendored reth, cut it there
+and record the change in vendor/reth/VENDOR.md.
 EOF
     exit 1
 fi
 
-echo "rocksdb guard passed: rocksdb absent from the default feature graph"
+echo "rocksdb guard passed: rocksdb absent from Cargo.lock and from every Cargo.toml"

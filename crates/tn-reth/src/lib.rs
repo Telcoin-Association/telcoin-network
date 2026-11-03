@@ -44,8 +44,6 @@
 //!   in-protocol ConsensusRegistry fork (registry code swap plus validator-set migration at the
 //!   configured fork epoch; see `apply_consensus_registry_fork` in `evm/block.rs`).
 //! - `test-utils` — test helpers (pulls in `secp256k1`).
-//! - `rocksdb` — opt back in to reth's RocksDB storage backend; storage is MDBX-only today, so this
-//!   is off by default (see the feature comment in `Cargo.toml`).
 //!
 //! # Re-exports
 //!
@@ -74,12 +72,6 @@ mod clippy {
     use proptest as _;
     use tn_reth as _;
 }
-
-// Dependencies only for their own `rocksdb` features (see the `rocksdb` feature in Cargo.toml).
-#[cfg(feature = "rocksdb")]
-use reth_prune as _;
-#[cfg(feature = "rocksdb")]
-use reth_stages as _;
 
 use alloy::primitives::ChainId;
 use reth_chainspec::EthChainSpec;
