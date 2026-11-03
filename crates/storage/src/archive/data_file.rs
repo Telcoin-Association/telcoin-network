@@ -1074,15 +1074,21 @@ impl MmapDataFile {
             // clean-close sentinel, validated above; `opened_unclean` flags a file that was not)
             // and has no live writer. A writer that later shrinks the file under this
             // mapping would make a touch of a page past the new EOF deliver SIGBUS, which no Rust
-            // error path catches. `get_static` serves the live epoch from the writer handle (never
-            // a read-only map of it), but `open_static` is not gated by `files_consistent` before
-            // this map (it checks the files after the open), so a writer still sealing the file
-            // can shrink it between the `metadata()` above and this map. Two guards keep reads
-            // inside the file: the length check below refuses a mapping shorter than `orig_len`,
-            // so at open the mapping covers every offset below `end` (mapping `orig_len`
-            // explicitly instead would turn the shrink into SIGBUS); and `set_read_bound` clamps
-            // `end` afterward to the index-attested length, so reads never touch bytes a later
-            // writer truncation could remove.
+            // error path catches. What keeps a read-only map off a file a writer is still
+            // sealing is the pack's serving discipline, outside this file: `get_static` serves
+            // the live epoch from the writer handle (never a read-only map of it), the epoch
+            // handoff seals the previous pack under `pack_install`, and an open that fails
+            // retries under that lock, after the seal. The first open in `get_static` runs
+            // unlocked, and `open_static` checks `files_consistent` only after this map, so that
+            // open can still reach a file the handoff is sealing. Three guards keep it inside
+            // the file. The length check below refuses a mapping shorter than `orig_len`, so at
+            // the map the mapping covers every offset below `end` (mapping `orig_len` explicitly
+            // instead would turn the shrink into SIGBUS). Between the map and the clamp the open
+            // touches only the header page and the first record, both below the logical end a
+            // seal keeps (`is_unwritten` stops at the header's first non-zero byte), and
+            // `files_consistent` refuses an unclean handle before any further read.
+            // `set_read_bound` then clamps `end` to the index-attested length, so no later read
+            // touches bytes a truncation could remove.
             let map = unsafe { Mmap::map(&file)? };
             if (map.len() as u64) < orig_len {
                 return Err(io::Error::new(
