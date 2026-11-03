@@ -2062,6 +2062,11 @@ impl MmapDataFile {
     /// returns to the padded physical size and the caller must re-clamp before reading. (No
     /// production path currently refreshes a clamped handle — the only caller is a test — so this
     /// is a documented precondition, not a live hazard.)
+    ///
+    /// An error after the old mapping was released (a failed map, or a read-only mapping shorter
+    /// than the length just read) leaves the handle unmapped with `end`, `capacity` and
+    /// `opened_unclean` unchanged: `slice` returns `None` while `len()` still reports the old
+    /// end. The caller drops the handle or refreshes again.
     pub fn refresh_data_file_end(&mut self) -> io::Result<()> {
         let disk_len = self.file.metadata()?.len();
         // A cleanly-closed writer leaves a sentinel past its logical data; strip it so `end` is the
