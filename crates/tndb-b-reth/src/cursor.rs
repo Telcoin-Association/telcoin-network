@@ -32,11 +32,16 @@
 //! is `MDBX_ENODATA`, as MDBX's do. Right after a delete that leaves a key no rows
 //! (`Pos::KeyDeleted`) the cursor is on the next key's first row, where `prev_dup` finds nothing,
 //! as MDBX's does.
+//!
+//! A write cursor's `delete_current` on a dup-sort table is held ([`Deferred`], the crate docs' dup
+//! rewrite): the cursor's next call runs it first, or with an `upsert` of the same row makes the
+//! two one engine `put` through the cursor; any other accessor of the transaction runs it before
+//! its own call, and leaves the cursor the engine cursor and [`Pos`] the delete left ([`Parked`]).
 
 use crate::{
     dup::{DupLayout, DUP_LAYOUTS},
     error::{self, Mdbx},
-    tx::{compressed, no_data, SharedTxn},
+    tx::{compressed, no_data, SharedTxn, TxnState},
 };
 use parking_lot::Mutex;
 use reth_db_api::{
@@ -48,9 +53,10 @@ use reth_db_api::{
     table::{Decode, Decompress, DupSort, Encode, Table},
     DatabaseError,
 };
-use reth_storage_errors::db::DatabaseWriteOperation;
+use reth_storage_errors::db::{DatabaseErrorInfo, DatabaseWriteOperation};
 use std::{
     marker::PhantomData,
+    num::NonZeroU64,
     ops::{Bound, RangeBounds},
     sync::Arc,
 };
@@ -1101,14 +1107,259 @@ impl<T: DupSort> DbDupCursorRO<T> for TndbCursor<T> {
     dup_reads!();
 }
 
+/// A dup-sort cursor's `delete_current` held back from the engine, in the write transaction's
+/// shared state ([`TxnState`]). reth rewrites a dup row as `seek_by_key_subkey`, `delete_current`,
+/// then `upsert` of the same subkey; held back, the delete and the upsert become one engine `put`
+/// through the cursor, a replace of the row. Any other call runs the delete first, so no call sees
+/// the row and every cursor is where the delete would have left it:
+/// - the cursor's own next call, through its engine cursor, which is still on the row (no accessor
+///   came between), with the steps the delete takes on a dup-sort table ([`after_delete`]);
+/// - any other accessor's call ([`Self::flush`]), through an engine cursor of its own placed on the
+///   row, which then equals the cursor's: it deletes the row and takes those steps at once, and
+///   leaves itself and the [`Pos`] it found for the cursor ([`Parked`]), which takes them in place
+///   of its own at its next call. The delete's steps so happen before any later write, as the
+///   delete's own would (an engine cursor finds its place again only at its next call, so the
+///   cursor's own, left on the row, would land on whatever a later write put after the row).
+///
+/// A failure of a held delete is the error of the call that runs it (the commit's, if that runs
+/// it), and is kept ([`Self::failure`]): the transaction's commit refuses it, since the cursor's
+/// `delete_current` reported the delete done.
+#[derive(Debug, Default)]
+pub(crate) struct Deferred {
+    /// The held delete, if any (at most one a transaction).
+    pending: Option<Pending>,
+    /// The held row's stored key, `k ‖ s` (reused).
+    key: Vec<u8>,
+    /// The engine cursors and positions other accessors left after running a cursor's held delete.
+    parked: Vec<Parked>,
+    /// The first failure of a held delete: the commit refuses it.
+    failed: Option<DatabaseErrorInfo>,
+    /// The last held delete's number; each cursor knows its own by it.
+    last: u64,
+    /// Test-only: the rewrites made as one engine put ([`FUSED`]), and the held deletes run as
+    /// deletes by their cursors ([`BY_OWNER`]) and by other accessors ([`BY_OTHER`]).
+    #[cfg(test)]
+    counts: [u64; 3],
+    /// Test-only: the next held delete to run fails, with an error that does not latch the
+    /// environment ([`Self::fail_next`]).
+    #[cfg(test)]
+    fail_next: bool,
+}
+
+/// The test-only counts of [`Deferred`]: the rewrites made as one engine put, the held deletes
+/// run by their cursors (a call of the cursor, its drop, or its refused rewrite), and those run by
+/// other accessors ([`Deferred::flush`]).
+const FUSED: usize = 0;
+const BY_OWNER: usize = 1;
+const BY_OTHER: usize = 2;
+
+/// A held delete: its number, the cursor's table and layout.
+#[derive(Debug)]
+struct Pending {
+    number: NonZeroU64,
+    table: EngineTable,
+    dup: DupLayout,
+}
+
+/// What another accessor that ran a held delete leaves for its cursor: the engine cursor it ran it
+/// with, on the deleted row's follower, and the cursor's [`Pos`] after it.
+#[derive(Debug)]
+struct Parked {
+    number: NonZeroU64,
+    cursor: WriteCursor,
+    pos: Pos,
+}
+
+impl Deferred {
+    /// Hold the delete of the row of stored key `key` in `table` (of layout `dup`), the row a
+    /// cursor is on, and return its number: the cursor's own name for it.
+    fn hold(&mut self, table: &EngineTable, dup: DupLayout, key: &[u8]) -> NonZeroU64 {
+        debug_assert!(self.pending.is_none(), "a held delete runs before another is held");
+        self.last += 1;
+        let number = NonZeroU64::new(self.last).expect("numbered from 1");
+        self.key.clear();
+        self.key.extend_from_slice(key);
+        self.pending = Some(Pending { number, table: table.clone(), dup });
+        number
+    }
+
+    /// The held delete `number`, taken, if it is still held (no other accessor ran it).
+    fn take(&mut self, number: NonZeroU64) -> Option<Pending> {
+        self.pending.take_if(|p| p.number == number)
+    }
+
+    /// The held delete `number`, taken, if it is still held and of the row of stored key `key`.
+    fn take_rewrite(&mut self, number: NonZeroU64, key: &[u8]) -> Option<Pending> {
+        let held = &self.key;
+        self.pending.take_if(|p| p.number == number && held.as_slice() == key)
+    }
+
+    /// What another accessor left for the cursor of held delete `number`, taken.
+    fn unpark(&mut self, number: NonZeroU64) -> Option<Parked> {
+        let at = self.parked.iter().position(|p| p.number == number)?;
+        Some(self.parked.swap_remove(at))
+    }
+
+    /// Run the held delete, if any, as every accessor but its cursor does before its call: through
+    /// an engine cursor of its own, left for the cursor ([`Parked`]). A failure is kept
+    /// ([`Self::failure`]) and returned.
+    #[inline]
+    pub(crate) fn flush(&mut self, txn: &mut RwTxn) -> tndb_b::Result<()> {
+        if self.pending.is_none() {
+            return Ok(());
+        }
+        self.flush_held(txn)
+    }
+
+    #[inline(never)]
+    fn flush_held(&mut self, txn: &mut RwTxn) -> tndb_b::Result<()> {
+        let Some(Pending { number, table, dup }) = self.pending.take() else { return Ok(()) };
+        let placed = WriteCursor::open(txn, &table, Some(dup)).and_then(|mut cursor| {
+            let on_row = cursor.seek_exact(txn, &self.key)?.is_some();
+            if on_row {
+                Ok(cursor)
+            } else {
+                Err(held_row_missing(&table))
+            }
+        });
+        let mut cursor = placed.map_err(|e| self.fail(e))?;
+        self.count(BY_OTHER);
+        let pos = self.run(&mut cursor, txn, &table, dup)?;
+        self.parked.push(Parked { number, cursor, pos });
+        Ok(())
+    }
+
+    /// Run a held delete in `table` (of layout `dup`) through `cursor`, an engine cursor on its
+    /// row, and return where the reth cursor then is ([`after_delete`]); a failure is kept
+    /// ([`Self::failure`]).
+    fn run(
+        &mut self,
+        cursor: &mut WriteCursor,
+        txn: &mut RwTxn,
+        table: &EngineTable,
+        dup: DupLayout,
+    ) -> tndb_b::Result<Pos> {
+        #[cfg(test)]
+        if std::mem::take(&mut self.fail_next) {
+            return Err(self.fail(tndb_b::Error::StaleTable(table.name().into())));
+        }
+        let ran = match cursor.delete_current(txn) {
+            Ok(true) => after_delete(cursor, txn, dup),
+            Ok(false) => Err(held_row_missing(table)),
+            Err(e) => Err(e),
+        };
+        ran.map_err(|e| self.fail(e))
+    }
+
+    /// Keep the failure `e` of a held delete (the first one), for the commit to refuse.
+    fn fail(&mut self, e: tndb_b::Error) -> tndb_b::Error {
+        if self.failed.is_none() {
+            self.failed = Some(error::info(&e));
+        }
+        e
+    }
+
+    /// The first held delete's failure, if one failed: the transaction must not commit.
+    pub(crate) fn failure(&self) -> Option<DatabaseErrorInfo> {
+        self.failed.clone()
+    }
+
+    /// Drop the held delete, as the transaction aborts.
+    pub(crate) fn discard(&mut self) {
+        self.pending = None;
+    }
+
+    /// Count `what` ([`FUSED`], [`BY_OWNER`] or [`BY_OTHER`]) in the test-only counts.
+    #[inline(always)]
+    fn count(&mut self, what: usize) {
+        #[cfg(test)]
+        {
+            self.counts[what] += 1;
+        }
+        #[cfg(not(test))]
+        let _ = what;
+    }
+
+    /// Test-only: the rewrites made as one engine put, and the held deletes run as deletes by
+    /// their cursors and by other accessors.
+    #[cfg(test)]
+    pub(crate) const fn counts(&self) -> [u64; 3] {
+        self.counts
+    }
+
+    /// Test-only: make the next held delete to run fail, as an engine error that does not latch
+    /// the environment would.
+    #[cfg(test)]
+    pub(crate) fn fail_next(&mut self) {
+        self.fail_next = true;
+    }
+}
+
+/// A held delete's row was not where its cursor found it: no accessor writes before running it,
+/// so the table is damaged or the adapter wrong.
+fn held_row_missing(table: &EngineTable) -> tndb_b::Error {
+    tndb_b::Error::Failed(format!(
+        "the row of a held delete in table {:?} is missing",
+        table.name()
+    ))
+}
+
+/// Where a cursor over a dup-sort table of layout `dup` is right after its engine cursor deleted
+/// a row: the key keeps later rows if the follower is the key's (the engine tells from the keys it
+/// kept, without a step: [`Pos::Engine`]), else earlier ones if a step back finds one (the cursor
+/// then on it, ending the key's rows: [`Pos::DupEnd`]), else none ([`Pos::KeyDeleted`]).
+fn after_delete(cursor: &mut WriteCursor, txn: &RwTxn, dup: DupLayout) -> tndb_b::Result<Pos> {
+    Ok(if cursor.follower_shares_prefix(txn, dup.key)? {
+        Pos::Engine
+    } else if cursor.prev_in_prefix(txn, dup.key)?.is_some() {
+        Pos::DupEnd { soft: false }
+    } else {
+        Pos::KeyDeleted
+    })
+}
+
+/// Before a call of a cursor with the transaction locked (`state`): its held delete `held`, if
+/// any, run through its engine cursor `cursor` (still on the row) with its [`Pos`] set in `rows`,
+/// or, once another accessor ran it, the engine cursor and `Pos` that accessor left taken in place
+/// of its own; then another cursor's held delete run ([`Deferred::flush`]). A failure is the
+/// call's, as a delete error.
+#[inline]
+fn settle(
+    state: &mut TxnState,
+    held: &mut Option<NonZeroU64>,
+    cursor: &mut WriteCursor,
+    rows: &mut Rows,
+) -> Result<(), DatabaseError> {
+    let TxnState { txn, deferred } = state;
+    if let Some(number) = held.take() {
+        match (deferred.take(number), txn.as_mut()) {
+            (Some(Pending { table, dup, .. }), Some(txn)) => {
+                deferred.count(BY_OWNER);
+                rows.pos = deferred.run(cursor, txn, &table, dup).map_err(error::delete)?;
+            }
+            _ => {
+                if let Some(parked) = deferred.unpark(number) {
+                    *cursor = parked.cursor;
+                    rows.pos = parked.pos;
+                }
+            }
+        }
+    }
+    match txn {
+        Some(txn) => deferred.flush(txn).map_err(error::delete),
+        None => Ok(()),
+    }
+}
+
 /// A cursor over one table of a read-write transaction ([`crate::TndbTxMut`]): the engine's
 /// detached [`TxnCursor`] or, on an engine dup table, [`DupTxnCursor`] (`WriteCursor`), with a
-/// share of the transaction. Each call locks the transaction,
-/// moves or writes, decodes, and unlocks. Several cursors and the transaction's own writes see
-/// each other's changes: a cursor whose row another one deleted is on the row's follower, as if it
-/// had deleted the row itself, as an MDBX cursor is (the crate docs list the two cases where it is
-/// not: another writer's change between the row and its follower before the cursor's next call,
-/// and, on a dup-sort table, another writer's delete of a key's last row).
+/// share of the transaction. Each call locks the transaction, runs a held `delete_current` (its
+/// own or another cursor's, `Deferred`), moves or writes, decodes, and unlocks. Several cursors and
+/// the transaction's own writes see each other's changes: a cursor whose row another one deleted is
+/// on the row's follower, as if it had deleted the row itself, as an MDBX cursor is (the crate docs
+/// list the two cases where it is not: another writer's change between the row and its follower
+/// before the cursor's next call, and, on a dup-sort table, another writer's delete of a key's last
+/// row).
 #[derive(Debug)]
 pub struct TndbCursorMut<T: Table> {
     txn: SharedTxn,
@@ -1120,6 +1371,9 @@ pub struct TndbCursorMut<T: Table> {
     buf: Vec<u8>,
     /// The stored key of the last write to a dup-sort table (reused).
     stored: Vec<u8>,
+    /// The number of the cursor's held `delete_current` ([`Deferred`]), until a call of the
+    /// cursor runs it (or makes it part of a rewrite) or finds that another accessor ran it.
+    held: Option<NonZeroU64>,
     _table: PhantomData<T>,
 }
 
@@ -1137,19 +1391,41 @@ impl<T: Table> TndbCursorMut<T> {
             rows: Rows::new(dup),
             buf: Vec::new(),
             stored: Vec::new(),
+            held: None,
             _table: PhantomData,
         }
     }
 
-    /// Run `f` on the cursor's rows and its engine cursor, with the transaction locked; a
-    /// finished transaction is `MDBX_BAD_TXN`.
+    /// Run `f` on the cursor's rows and its engine cursor, with the transaction locked and a held
+    /// delete run ([`settle`]); a finished transaction is `MDBX_BAD_TXN`.
     fn with<R>(
         &mut self,
         f: impl FnOnce(&mut Rows, &mut Locked<'_, '_>) -> Result<R, DatabaseError>,
     ) -> Result<R, DatabaseError> {
+        let Self { txn, cursor, rows, held, .. } = self;
+        let mut guard = txn.lock();
+        let state = &mut *guard;
+        settle(state, held, cursor, rows)?;
+        let txn = live(&mut state.txn, error::read)?;
+        f(rows, &mut Locked { cursor, txn })
+    }
+}
+
+/// A cursor dropped with its delete held runs it, as its next call would; it cannot report a
+/// failure, which is kept for the commit to refuse (`Deferred::failure`).
+impl<T: Table> Drop for TndbCursorMut<T> {
+    fn drop(&mut self) {
+        let Some(number) = self.held.take() else { return };
         let mut guard = self.txn.lock();
-        let txn = live(&mut guard, error::read)?;
-        f(&mut self.rows, &mut Locked { cursor: &mut self.cursor, txn })
+        let TxnState { txn, deferred } = &mut *guard;
+        match (deferred.take(number), txn.as_mut()) {
+            (Some(Pending { table, dup, .. }), Some(txn)) => {
+                // A failure is kept by `run`.
+                deferred.count(BY_OWNER);
+                drop(deferred.run(&mut self.cursor, txn, &table, dup));
+            }
+            _ => drop(deferred.unpark(number)),
+        }
     }
 }
 
@@ -1169,20 +1445,47 @@ impl<T: Table> DbCursorRO<T> for TndbCursorMut<T> {
 impl<T: Table> TndbCursorMut<T> {
     /// A write through the cursor of `key` and `value` by `operation`; see [`Rows::wrote`] for
     /// where it leaves the cursor. A second value for a dup-sort row's subkey is refused before
-    /// that ([`insert_dup_at`]), so it leaves the cursor as it was.
+    /// that ([`insert_dup_at`]), so it leaves the cursor as it was. An `upsert` of the row whose
+    /// delete the cursor holds ([`Deferred`]) is one engine `put` through the cursor, a replace of
+    /// the row, which leaves the cursor on it as the insert after the delete would.
     fn write(
         &mut self,
         key: T::Key,
         value: &T::Value,
         operation: DatabaseWriteOperation,
     ) -> Result<(), DatabaseError> {
-        let Self { txn, table, cursor, rows, buf, stored, .. } = self;
+        let Self { txn, table, cursor, rows, buf, stored, held, .. } = self;
         let key = key.encode();
         let key = key.as_ref();
         let value = compressed(value, buf);
         let fail = |e: tndb_b::Error| error::write(&e, operation, T::NAME, key);
         let mut guard = txn.lock();
-        let txn = live(&mut guard, fail)?;
+        let state = &mut *guard;
+        // On a dup-sort table, the row's stored value (its stored key in `stored`); `None` for a
+        // value shorter than the subkey, refused below.
+        let rest = rows.dup.and_then(|dup| dup.join(key, value, stored));
+        if let (Some(number), Some(rest), Some(txn), DatabaseWriteOperation::CursorUpsert) =
+            (*held, rest, state.txn.as_mut(), operation)
+        {
+            if let Some(Pending { table, dup, .. }) = state.deferred.take_rewrite(number, stored) {
+                *held = None;
+                let put = cursor.put(txn, stored, rest);
+                if put.is_ok() {
+                    state.deferred.count(FUSED);
+                } else {
+                    // A refused put changes nothing, the cursor included: the delete runs as it
+                    // would have before the upsert (a failure of it is kept for the commit).
+                    state.deferred.count(BY_OWNER);
+                    if let Ok(pos) = state.deferred.run(cursor, txn, &table, dup) {
+                        rows.pos = pos;
+                    }
+                }
+                rows.wrote(&put);
+                return put.map_err(fail);
+            }
+        }
+        settle(state, held, cursor, rows)?;
+        let txn = live(&mut state.txn, fail)?;
         let Some(dup) = rows.dup else {
             // Where an append that met the table's last key leaves the cursor ([`Pos::End`]).
             let mut ends = None;
@@ -1221,8 +1524,7 @@ impl<T: Table> TndbCursorMut<T> {
             }
             return result.map_err(fail);
         };
-        let rest =
-            dup.join(key, value, stored).ok_or_else(|| error::bad_size(operation, T::NAME, key))?;
+        let rest = rest.ok_or_else(|| error::bad_size(operation, T::NAME, key))?;
         let stored = stored.as_slice();
         // `Ok(false)`: a second value for a subkey the key holds, refused ([`insert_dup_at`]).
         let result = match operation {
@@ -1371,14 +1673,22 @@ impl<T: Table> DbCursorRW<T> for TndbCursorMut<T> {
     /// row (fresh, unset, past either end) this is MDBX's `MDBX_ENODATA`, and on a dup-sort table
     /// it is right after a delete of a key's last row that left the key earlier rows (the cursor
     /// then ends the key's rows, on the row before, as MDBX's does).
+    ///
+    /// On a dup-sort table the delete of a row the cursor is on is held (the crate docs' dup
+    /// rewrite): the cursor's next call runs it first, or, if it is an `upsert` of the same row,
+    /// makes the two one engine `put`; any other accessor runs it before its own call. A failure
+    /// of the delete is so the error of the call that runs it, not this one's, and the commit
+    /// refuses it.
     fn delete_current(&mut self) -> Result<(), DatabaseError> {
-        let Self { txn, cursor, rows, .. } = self;
+        let Self { txn, table, cursor, rows, held, .. } = self;
+        let mut guard = txn.lock();
+        let state = &mut *guard;
+        settle(state, held, cursor, rows)?;
         let dup = match (rows.pos, rows.dup) {
             (Pos::Missed | Pos::DupEnd { soft: false }, _) => return Err(no_data()),
             (_, dup) => dup,
         };
-        let mut guard = txn.lock();
-        let txn = live(&mut guard, error::delete)?;
+        let txn = live(&mut state.txn, error::delete)?;
         // At a dup key's end after `last`, the row is found again by key first, which ends the
         // engine cursor's end.
         if rows.pos == (Pos::DupEnd { soft: true }) {
@@ -1387,21 +1697,20 @@ impl<T: Table> DbCursorRW<T> for TndbCursorMut<T> {
             };
             let stored = stored.to_vec();
             cursor.seek_exact(txn, &stored).map_err(error::delete)?;
+        } else if let Some(dup) = dup {
+            // The row the cursor is on, held; none is `MDBX_ENODATA` now, as the engine's delete
+            // would find none.
+            let Some((stored, _)) = cursor.current(txn).map_err(error::delete)? else {
+                return Err(no_data());
+            };
+            *held = Some(state.deferred.hold(table, dup, stored));
+            return Ok(());
         }
         if !cursor.delete_current(txn).map_err(error::delete)? {
             return Err(no_data());
         }
-        // On a dup-sort table the key keeps later rows if the follower is the key's (the engine
-        // tells from the keys it kept, without a step), else earlier ones if a step back finds
-        // one.
         let Some(dup) = dup else { return Ok(()) };
-        rows.pos = if cursor.follower_shares_prefix(txn, dup.key).map_err(error::delete)? {
-            Pos::Engine
-        } else if cursor.prev_in_prefix(txn, dup.key).map_err(error::delete)?.is_some() {
-            Pos::DupEnd { soft: false }
-        } else {
-            Pos::KeyDeleted
-        };
+        rows.pos = after_delete(cursor, txn, dup).map_err(error::delete)?;
         Ok(())
     }
 }
@@ -1417,12 +1726,14 @@ impl<T: DupSort> DbDupCursorRW<T> for TndbCursorMut<T> {
     /// (fresh, unset, past either end) this is MDBX's `MDBX_ENODATA`.
     fn delete_current_duplicates(&mut self) -> Result<(), DatabaseError> {
         let dup = self.rows.layout::<T>()?;
+        let mut guard = self.txn.lock();
+        let state = &mut *guard;
+        settle(state, &mut self.held, &mut self.cursor, &mut self.rows)?;
         if matches!(self.rows.pos, Pos::Fresh | Pos::Missed) {
             return Err(no_data());
         }
         self.rows.pos = Pos::Engine;
-        let mut guard = self.txn.lock();
-        let txn = live(&mut guard, error::delete)?;
+        let txn = live(&mut state.txn, error::delete)?;
         let key = match self.cursor.current(txn).map_err(error::delete)? {
             Some((stored, _)) => dup.split(stored).ok_or(DatabaseError::Decode)?.0.to_vec(),
             None => return Err(no_data()),

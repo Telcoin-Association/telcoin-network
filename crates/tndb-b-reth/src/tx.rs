@@ -1,7 +1,11 @@
-//! reth's transactions: [`TndbTx`] (read-only) and [`TndbTxMut`] (read-write).
+//! reth's transactions: [`TndbTx`] (read-only) and [`TndbTxMut`] (read-write), whose engine
+//! transaction its cursors share ([`TxnState`]) with a dup cursor's held delete
+//! ([`Deferred`]), which every call runs before its own work.
 
 use crate::{
-    cursor::{last_is_row_of, ReadCursor, ReadPool, TndbCursor, TndbCursorMut, WriteCursor},
+    cursor::{
+        last_is_row_of, Deferred, ReadCursor, ReadPool, TndbCursor, TndbCursorMut, WriteCursor,
+    },
     dup::DupLayout,
     env::{resolve, ReaderWatch, TableMap},
     error::{self, Mdbx},
@@ -16,9 +20,30 @@ use reth_storage_errors::db::DatabaseWriteOperation;
 use std::sync::Arc;
 use tndb_b::{KeyTail, ReadTxn, RoTxn, RwTxn, Table as EngineTable};
 
-/// A write transaction shared by its handle and its cursors. `None` once it committed or
-/// aborted: a cursor that outlives it then gets `MDBX_BAD_TXN`.
-pub(crate) type SharedTxn = Arc<Mutex<Option<RwTxn>>>;
+/// A write transaction shared by its handle and its cursors ([`TxnState`]).
+pub(crate) type SharedTxn = Arc<Mutex<TxnState>>;
+
+/// What a write transaction's handle and cursors share, behind one mutex.
+#[derive(Debug)]
+pub(crate) struct TxnState {
+    /// The transaction; `None` once it committed or aborted: a cursor that outlives it then gets
+    /// `MDBX_BAD_TXN`.
+    pub(crate) txn: Option<RwTxn>,
+    /// A dup-sort cursor's `delete_current` not run yet ([`Deferred`]): every accessor but that
+    /// cursor runs it before its own call ([`Deferred::flush`]), and the commit before the
+    /// engine's, refusing a transaction one of whose held deletes failed.
+    pub(crate) deferred: Deferred,
+}
+
+impl TxnState {
+    /// Abort: a held delete is dropped with the transaction.
+    fn abort(&mut self) {
+        self.deferred.discard();
+        if let Some(txn) = self.txn.take() {
+            txn.abort();
+        }
+    }
+}
 
 /// `value` as stored: its bytes when it has an uncompressed form, else compressed into `buf`.
 pub(crate) fn compressed<'b, V: Compress>(value: &'b V, buf: &'b mut Vec<u8>) -> &'b [u8] {
@@ -217,8 +242,9 @@ impl DbTx for TndbTx {
 
 /// A read-write transaction. It and its cursors ([`TndbCursorMut`]) share the engine's
 /// transaction behind a mutex, which each call holds while it runs (entries are decoded before
-/// it is released). Its reads see its own uncommitted writes. Dropping it without
-/// [`DbTx::commit`] aborts it, and its cursors then fail with `MDBX_BAD_TXN`.
+/// it is released), after running a cursor's held `delete_current` (`Deferred`). Its reads see
+/// its own uncommitted writes. Dropping it without [`DbTx::commit`] aborts it, and its cursors
+/// then fail with `MDBX_BAD_TXN`.
 #[derive(Debug)]
 pub struct TndbTxMut {
     txn: SharedTxn,
@@ -229,19 +255,38 @@ pub struct TndbTxMut {
 
 impl TndbTxMut {
     pub(crate) fn new(txn: RwTxn, tables: Arc<TableMap>, watch: Arc<ReaderWatch>) -> Self {
-        Self { txn: Arc::new(Mutex::new(Some(txn))), tables, watch }
+        let state = TxnState { txn: Some(txn), deferred: Deferred::default() };
+        Self { txn: Arc::new(Mutex::new(state)), tables, watch }
     }
 
-    /// Run `f` on the transaction; `on_finished` makes the error for one already finished
-    /// (a handle cannot see that, since commit and abort consume it, but its cursors can).
+    /// Run `f` on the transaction, once a cursor's held delete has run ([`Deferred::flush`]; its
+    /// failure is the call's, as a delete error); `on_finished` makes the error for one already
+    /// finished (a handle cannot see that, since commit and abort consume it, but its cursors
+    /// can).
     fn with<R>(
         &self,
         on_finished: impl FnOnce(tndb_b::Error) -> DatabaseError,
         f: impl FnOnce(&mut RwTxn) -> Result<R, DatabaseError>,
     ) -> Result<R, DatabaseError> {
         let mut guard = self.txn.lock();
-        let txn = guard.as_mut().ok_or_else(|| on_finished(error::finished()))?;
+        let TxnState { txn, deferred } = &mut *guard;
+        let txn = txn.as_mut().ok_or_else(|| on_finished(error::finished()))?;
+        deferred.flush(txn).map_err(error::delete)?;
         f(txn)
+    }
+
+    /// Test-only: the dup rewrites the transaction's cursors made as one engine put, and the
+    /// held deletes ([`Deferred`]) that ran as deletes, by their cursors and by other accessors.
+    #[cfg(test)]
+    pub(crate) fn deferred_counts(&self) -> [u64; 3] {
+        self.txn.lock().deferred.counts()
+    }
+
+    /// Test-only: make the transaction's next held delete to run fail ([`Deferred`]), with an
+    /// error that does not latch the environment.
+    #[cfg(test)]
+    pub(crate) fn fail_next_held_delete(&self) {
+        self.txn.lock().deferred.fail_next();
     }
 
     /// `tx.put` or `tx.append` (`append`) of `key` and `value` into `T`. An append follows
@@ -327,9 +372,7 @@ pub(crate) fn insert_dup(
 
 impl Drop for TndbTxMut {
     fn drop(&mut self) {
-        if let Some(txn) = self.txn.lock().take() {
-            txn.abort();
-        }
+        self.txn.lock().abort();
     }
 }
 
@@ -351,18 +394,32 @@ impl DbTx for TndbTxMut {
         })
     }
 
+    /// A cursor's held delete runs first; its failure, or an earlier held delete's (one its
+    /// cursor's `delete_current` had reported done), fails the commit and aborts the transaction.
     fn commit(self) -> Result<(), DatabaseError> {
         let commit_error = |e: tndb_b::Error| DatabaseError::Commit(error::info(&e));
-        let txn = self.txn.lock().take().ok_or_else(|| commit_error(error::finished()))?;
+        let txn = {
+            let mut guard = self.txn.lock();
+            let TxnState { txn, deferred } = &mut *guard;
+            let mut txn = txn.take().ok_or_else(|| commit_error(error::finished()))?;
+            let refused = match deferred.flush(&mut txn) {
+                Ok(()) => deferred.failure().map(DatabaseError::Commit),
+                Err(e) => Some(commit_error(e)),
+            };
+            if let Some(refused) = refused {
+                deferred.discard();
+                txn.abort();
+                return Err(refused);
+            }
+            txn
+        };
         txn.commit().map_err(commit_error)?;
         self.watch.after_commit();
         Ok(())
     }
 
     fn abort(self) {
-        if let Some(txn) = self.txn.lock().take() {
-            txn.abort();
-        }
+        self.txn.lock().abort();
     }
 
     fn cursor_read<T: Table>(&self) -> Result<Self::Cursor<T>, DatabaseError> {
