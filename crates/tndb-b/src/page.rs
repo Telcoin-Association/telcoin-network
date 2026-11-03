@@ -740,6 +740,16 @@ impl Hdr {
 /// bounds.
 #[inline]
 fn hdr(page: &[u8]) -> Result<Hdr> {
+    parse_hdr(page, None)
+}
+
+/// [`hdr`]'s checks, then, for `Some(want)`, the kind's ([`hdr_of`]), with the header built
+/// once, in the one `Ok`. Unpacked from one `Result` and repacked into another, the header
+/// went through a stack copy whose 16-byte reload of narrower stores store forwarding cannot
+/// serve: the reload waits until every older store has reached the cache, which right after a
+/// page copy ([`branch_set_child`] in copy-on-write) means the copy's stores and their misses.
+#[inline(always)]
+fn parse_hdr(page: &[u8], want: Option<Kind>) -> Result<Hdr> {
     let len = page.len();
     let kind = match page.get(KIND_OFF) {
         Some(&KIND_LEAF) => Kind::Leaf,
@@ -750,6 +760,10 @@ fn hdr(page: &[u8]) -> Result<Hdr> {
     if !valid_len(len) || flags(page) != 0 || upper > len - TRAILER || HEADER + SLOT * nkeys > upper
     {
         return Err(hdr_error(page));
+    }
+    match want {
+        Some(want) if kind != want => return Err(kind_error(page, want, kind)),
+        _ => {}
     }
     Ok(Hdr { kind, nkeys, upper, end: len - TRAILER })
 }
@@ -776,11 +790,7 @@ fn hdr_error(page: &[u8]) -> Error {
 /// [`hdr`] for a page that must be of kind `want`.
 #[inline]
 fn hdr_of(page: &[u8], want: Kind) -> Result<Hdr> {
-    let h = hdr(page)?;
-    if h.kind != want {
-        return Err(kind_error(page, want, h.kind));
-    }
-    Ok(h)
+    parse_hdr(page, Some(want))
 }
 
 /// [`hdr_of`]'s [`Error::Corrupt`] for a page of the wrong kind.
