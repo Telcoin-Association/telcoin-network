@@ -85,7 +85,7 @@ use crate::{
     sys,
     tree::{
         read::{checked_child, checked_page},
-        write::{copy_page, Scratch},
+        write::Scratch,
         PageRead, PageWrite, TreeRoot,
     },
     txn::{RoTxn, RwTxn, TableRoots},
@@ -476,6 +476,10 @@ pub(crate) struct Writer {
     /// Test-only: deletes do not merge under-full pages (`PageWrite::no_merge`).
     #[cfg(test)]
     pub(crate) no_merge: bool,
+    /// Test-only: copy-on-write of a leaf for its change takes the two-step path
+    /// (`PageWrite::no_fused_copy`).
+    #[cfg(test)]
+    pub(crate) no_fused_copy: bool,
     /// Test-only: the deletes whose merges absorbed a sibling (`PageWrite::merges_applied`).
     #[cfg(test)]
     pub(crate) merging_deletes: u64,
@@ -880,16 +884,20 @@ impl PageWrite for Writer {
     /// page, and they are disjoint because `from` is not private and `to` is. A page past the
     /// published bytes, where the view ends, is no page of a committed tree, only one this
     /// transaction freed: [`copy_unpublished`] copies it as the two-step copy did, so its checks
-    /// stay exactly [`PageRead::page`]'s.
-    #[inline]
-    fn copy_published(&mut self, from: u32, to: u32) -> Result<&mut [u8]> {
+    /// stay exactly [`PageRead::page`]'s. Forced inline: `f` is a leaf's change on the write path,
+    /// whose outcome stays in registers (`page::LeafMut`'s docs).
+    #[inline(always)]
+    fn copy_published_with<F>(&mut self, from: u32, to: u32, f: F) -> Result<&mut [u8]>
+    where
+        F: FnOnce(&[u8], &mut [u8]) -> Result<()>,
+    {
         if self.alloc.is_private(from) {
             return Err(private_source(from));
         }
         self.stats.cow_copies += 1;
         let size = self.geometry.page_size();
         let Some(src) = self.view.slice(u64::from(from) * size as u64, size) else {
-            return copy_unpublished(self, from, to);
+            return copy_unpublished(self, from, to, f);
         };
         let src =
             checked_page(from, self.alloc.page_count(), self.alloc.txn(), false, |_| Some(src))?;
@@ -897,8 +905,13 @@ impl PageWrite for Writer {
             return Err(not_private(to));
         }
         let dst = self.file.page_mut(to, size)?;
-        copy_page(src, to, dst)?;
+        f(src, dst)?;
         Ok(dst)
+    }
+
+    #[cfg(test)]
+    fn no_fused_copy(&self) -> bool {
+        self.no_fused_copy
     }
 
     fn free(&mut self, pgno: u32) {
@@ -992,22 +1005,25 @@ fn not_private(pgno: u32) -> Error {
     Error::Failed(format!("page {pgno} is not private: copy it first"))
 }
 
-/// [`Writer::copy_published`]'s error for a source page that is private.
+/// [`Writer::copy_published_with`]'s error for a source page that is private.
 #[cold]
 #[inline(never)]
 fn private_source(pgno: u32) -> Error {
     Error::Failed(format!("page {pgno} is private: it needs no copy"))
 }
 
-/// [`Writer::copy_published`] for a page past the published bytes (see there): fetched through
-/// the file with [`PageRead::page`]'s checks and copied through a buffer of its own. No sound
-/// tree reaches it.
+/// [`Writer::copy_published_with`] for a page past the published bytes (see there): fetched
+/// through the file with [`PageRead::page`]'s checks into a buffer of its own, which `f` then
+/// copies from. No sound tree reaches it.
 #[cold]
 #[inline(never)]
-fn copy_unpublished(writer: &mut Writer, from: u32, to: u32) -> Result<&mut [u8]> {
+fn copy_unpublished<F>(writer: &mut Writer, from: u32, to: u32, f: F) -> Result<&mut [u8]>
+where
+    F: FnOnce(&[u8], &mut [u8]) -> Result<()>,
+{
     let src = writer.page(from)?.to_vec();
     let dst = writer.page_mut(to)?;
-    copy_page(&src, to, dst)?;
+    f(&src, dst)?;
     Ok(dst)
 }
 
@@ -1091,6 +1107,8 @@ impl Env {
             no_write_hint: false,
             #[cfg(test)]
             no_merge: false,
+            #[cfg(test)]
+            no_fused_copy: false,
             #[cfg(test)]
             merging_deletes: 0,
             #[cfg(test)]

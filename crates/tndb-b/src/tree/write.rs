@@ -10,6 +10,12 @@
 //! tree exactly as it was: the same root handle and every reachable page byte for byte. A delete
 //! plans and reserves the same way ([`delete`]).
 //!
+//! **A leaf's change in its copy.** A replace or an insert that fits its leaf, and a delete that
+//! changes only its leaf, copy a published leaf with the change made in the same pass, reading
+//! only the source ([`change_path_writable`]): a change made after the copy would first load the
+//! copy's bytes while its stores still drain, and wait for them. Branches, splits and merges copy
+//! the page, then change the copy.
+//!
 //! **Overflow runs.** A value too large for its leaf ([`Geometry::place`]) goes to a run of
 //! contiguous pages ([`crate::overflow`]), which the put allocates with its tree pages and writes
 //! before any leaf names it; the leaf holds a 12-byte reference. A run is immutable: a copy of
@@ -555,8 +561,21 @@ fn put_from_root<'v, S: PageWrite + ?Sized>(
     // store forwarding cannot serve, and the reload waits for every older store, the copies'
     // among them. A replace or an insert takes no page, so the unused ones go back first and the
     // change is checked through a `Result<()>`; a split, out of line, keeps them until it is done.
-    let leaf = match make_path_writable(store, root, path, leaf, scratch) {
-        Ok(leaf) => leaf,
+    // A replace or an insert into a published leaf is made as the leaf is copied, from the source
+    // ([`change_path_writable`]); into a private one, in place after the unused pages went back.
+    let made = match change {
+        LeafChange::Split { .. } => {
+            make_path_writable(store, root, path, leaf, scratch).map(|l| (l, false))
+        }
+        LeafChange::Replace(i) | LeafChange::Insert(i) => {
+            let replace = matches!(change, LeafChange::Replace(_));
+            change_path_writable(store, root, path, leaf, scratch, |src, dst| {
+                copy_change_leaf(src, dst, key, val, i, replace)
+            })
+        }
+    };
+    let (leaf, changed) = match made {
+        Ok(made) => made,
         Err(e) => {
             give_back(store, &mut scratch.reserved);
             if let Some(taken) = taken {
@@ -583,7 +602,12 @@ fn put_from_root<'v, S: PageWrite + ?Sized>(
                 store.put_scratch(taken);
             }
             let replace = matches!(change, LeafChange::Replace(_));
-            change_leaf(store, root, leaf, key, val, i, replace)?;
+            if !changed {
+                change_leaf(store, leaf, key, val, i, replace)?;
+            }
+            if !replace {
+                root.entries += 1;
+            }
             (replace, None)
         }
     };
@@ -1827,24 +1851,94 @@ fn make_path_writable<S: PageWrite + ?Sized>(
     leaf: u32,
     scratch: &mut Scratch,
 ) -> Result<u32> {
-    let txn = store.txn() as u32;
-    let mut parent: Option<(u32, usize)> = None;
-    let mut current = leaf;
-    for depth in 0..=path.len() {
-        let old = path.get(depth).map_or(leaf, |&(p, _)| p);
-        current = writable(store, old, scratch)?;
-        if current != old {
-            match parent {
-                None => (root.root, root.root_txn) = (current, txn),
-                Some((p, ci)) => page::branch_set_child(store.page_mut(p)?, ci, current, txn)?,
-            }
-        }
-        if let Some(step) = path.get_mut(depth) {
-            step.0 = current;
-            parent = Some(*step);
-        }
+    let parent = make_branches_writable(store, root, path, scratch)?;
+    let current = writable(store, leaf, scratch)?;
+    if current != leaf {
+        set_child(store, root, parent, current)?;
     }
     Ok(current)
+}
+
+/// The branches of [`make_path_writable`], top-down, with `path` updated to them: returns the
+/// leaf's writable parent step, `None` for a leaf that is the root (an empty `path`).
+#[inline(always)]
+fn make_branches_writable<S: PageWrite + ?Sized>(
+    store: &mut S,
+    root: &mut TreeRoot,
+    path: &mut [(u32, usize)],
+    scratch: &mut Scratch,
+) -> Result<Option<(u32, usize)>> {
+    let mut parent: Option<(u32, usize)> = None;
+    for step in path.iter_mut() {
+        let current = writable(store, step.0, scratch)?;
+        if current != step.0 {
+            set_child(store, root, parent, current)?;
+        }
+        step.0 = current;
+        parent = Some(*step);
+    }
+    Ok(parent)
+}
+
+/// Point `parent`'s step (writable), or the tree's root when `None`, at the private copy
+/// `child`, with this transaction's `child_txn`.
+#[inline(always)]
+fn set_child<S: PageWrite + ?Sized>(
+    store: &mut S,
+    root: &mut TreeRoot,
+    parent: Option<(u32, usize)>,
+    child: u32,
+) -> Result<()> {
+    let txn = store.txn() as u32;
+    match parent {
+        None => (root.root, root.root_txn) = (child, txn),
+        Some((p, ci)) => page::branch_set_child(store.page_mut(p)?, ci, child, txn)?,
+    }
+    Ok(())
+}
+
+/// [`make_path_writable`] for a change of the leaf alone, made in its copy: the branches as
+/// there; a published leaf copied into a reserved page with `change(src, dst)` made in the same
+/// pass ([`PageWrite::copy_published_with`]), then [`writable`]'s steps after its copy, in their
+/// order, and re-pointed in its parent or as the root. Returns the writable leaf and whether the
+/// change is made: not for a private leaf, which the caller changes in place.
+///
+/// The change reads only the source, a published page this transaction only frees, so its bytes
+/// stay until the commit and its reuse gate; and it only writes the copy. Nothing in the write
+/// reads the copy after it, so the copy's stores drain while the next operation runs: changed
+/// after the copy, the leaf's first loads waited for them. Every check runs on the source's
+/// bytes, those the copy holds outside the free gap.
+#[inline(always)]
+fn change_path_writable<S, F>(
+    store: &mut S,
+    root: &mut TreeRoot,
+    path: &mut [(u32, usize)],
+    leaf: u32,
+    scratch: &mut Scratch,
+    change: F,
+) -> Result<(u32, bool)>
+where
+    S: PageWrite + ?Sized,
+    F: FnOnce(&[u8], &mut [u8]) -> Result<()>,
+{
+    let parent = make_branches_writable(store, root, path, scratch)?;
+    if store.is_private(leaf) {
+        return Ok((leaf, false));
+    }
+    #[cfg(test)]
+    if store.no_fused_copy() {
+        let copy = writable(store, leaf, scratch)?;
+        set_child(store, root, parent, copy)?;
+        return Ok((copy, false));
+    }
+    let q = scratch.reserved.pop().ok_or_else(|| bug("copy-on-write ran out of reserved pages"))?;
+    let txn = store.txn();
+    let copy = store.copy_published_with(leaf, q, change)?;
+    page::set_pgno_txn(copy, q, txn);
+    crc::zero_crc(copy);
+    store.free(leaf);
+    set_child(store, root, parent, q)?;
+    Ok((q, true))
 }
 
 /// What [`apply_split`] did.
@@ -1866,14 +1960,13 @@ fn fit(fit: Fit, what: &str) -> Result<()> {
     }
 }
 
-/// The planned change of a put that fits its leaf, made in the writable `leaf` with the cell value
+/// The planned change of a put that fits its leaf, made in the private `leaf` with the cell value
 /// `value` (the value, or the reference to its run): entry `i`'s value replaced (`replace`), else
-/// `(key, value)` inserted as entry `i` and counted in `root`. Forced inline into
-/// [`put_from_root`] (see the comment at its call).
+/// `(key, value)` inserted as entry `i`. Forced inline into [`put_from_root`] (see the comment at
+/// its call).
 #[inline(always)]
 fn change_leaf<S: PageWrite + ?Sized>(
     store: &mut S,
-    root: &mut TreeRoot,
     leaf: u32,
     key: &[u8],
     value: Val<'_>,
@@ -1884,9 +1977,26 @@ fn change_leaf<S: PageWrite + ?Sized>(
     if replace {
         fit(page.replace_value(i, value)?, "a value")
     } else {
-        fit(page.insert(i, key, value)?, "an entry")?;
-        root.entries += 1;
-        Ok(())
+        fit(page.insert(i, key, value)?, "an entry")
+    }
+}
+
+/// [`change_leaf`] made in the copy `dst` of the published leaf `src` as it is copied
+/// ([`change_path_writable`]): `page::copy_replace` or `page::copy_insert`, with the same
+/// checks and errors.
+#[inline(always)]
+fn copy_change_leaf(
+    src: &[u8],
+    dst: &mut [u8],
+    key: &[u8],
+    value: Val<'_>,
+    i: usize,
+    replace: bool,
+) -> Result<()> {
+    if replace {
+        fit(page::copy_replace(src, dst, i, value)?, "a value")
+    } else {
+        fit(page::copy_insert(src, dst, i, key, value)?, "an entry")
     }
 }
 
@@ -2775,8 +2885,14 @@ fn apply_delete<S: PageWrite + ?Sized>(
     let top = usize::from(plan.merged_root);
     let changed = match plan.shape {
         DeleteShape::Leaf => {
-            let leaf = make_path_writable(store, root, &mut path[top..], plan.leaf, scratch)?;
-            page::leaf_delete(store.page_mut(leaf)?, plan.at)?;
+            let at = plan.at;
+            let (leaf, deleted) =
+                change_path_writable(store, root, &mut path[top..], plan.leaf, scratch, |s, d| {
+                    page::copy_delete(s, d, at)
+                })?;
+            if !deleted {
+                page::leaf_delete(store.page_mut(leaf)?, at)?;
+            }
             Some(leaf)
         }
         DeleteShape::Unlink(d) => {
@@ -7973,5 +8089,289 @@ mod tests {
         assert_copy_fails_as_page_fails(w, freed, q);
         crc::zero_crc(raw(w, freed));
         assert_copy_fails_as_page_fails(w, freed, q);
+    }
+
+    /// `got` and `want` equal outside the free gap of `got` ([`page::free_gap`]; whole when it
+    /// gives none), which `want`'s equals.
+    fn assert_equal_outside_the_gap(got: &[u8], want: &[u8], what: &str) {
+        let gap = page::free_gap(got);
+        assert_eq!(gap, page::free_gap(want), "{what}: the free gap");
+        let gap = gap.unwrap_or(0..0);
+        assert_eq!(got.len(), want.len(), "{what}: the lengths");
+        if got[..gap.start] != want[..gap.start] || got[gap.end..] != want[gap.end..] {
+            let at = (0..got.len()).find(|&j| !gap.contains(&j) && got[j] != want[j]);
+            panic!("{what}: differs at {at:?}");
+        }
+    }
+
+    /// The store twins of [`fused_copies_match_the_copy_then_the_change`] hold the same pages
+    /// outside each one's free gap, the same freed list and pool and the same page count.
+    fn assert_twins_match(fused: &MemStore, twin: &MemStore, what: &str) {
+        assert_eq!(fused.alloc.page_count(), twin.alloc.page_count(), "{what}: page count");
+        assert_eq!(fused.alloc.freed(), twin.alloc.freed(), "{what}: freed pages");
+        assert_eq!(fused.alloc.pool(), twin.alloc.pool(), "{what}: pool");
+        for p in 2..fused.alloc.page_count() {
+            assert_equal_outside_the_gap(fused.raw(p), twin.raw(p), &format!("{what}, page {p}"));
+        }
+    }
+
+    /// What [`fused_copies`] saw: each kind of leaf change into a published leaf (the root
+    /// published, so its whole path is, and the tree's shape unchanged).
+    #[derive(Debug, Default)]
+    struct FusedCoverage {
+        inserts: usize,
+        grows: usize,
+        equals: usize,
+        shrinks: usize,
+        deletes: usize,
+        cached: usize,
+    }
+
+    /// The same random puts (inserts, replaces growing, equal and shrinking, inline and overflow
+    /// values) and deletes on two [`MemStore`]s, one with [`MemStore::no_fused_copy`] (the copy,
+    /// then the change in it): after every op the results and the roots are equal, and every page
+    /// outside its free gap, the freed list and the pool. Commits (and reuse of the freed pages)
+    /// come every few ops, so the writes meet published leaves; odd rounds go through a
+    /// [`PathCache`], even ones without.
+    fn fused_copies(page_size: u32, seed: u64, rounds: usize, merge: bool) -> FusedCoverage {
+        let _report = ReportSeed(seed);
+        let mut rng = Rng(seed);
+        let [mut fused, mut twin] = [MemStore::new(page_size), MemStore::new(page_size)];
+        twin.no_fused_copy = true;
+        for store in [&mut fused, &mut twin] {
+            store.no_merge = !merge;
+        }
+        let (mut root, mut twin_root) = (TreeRoot::EMPTY, TreeRoot::EMPTY);
+        let mut model: BTreeMap<Vec<u8>, usize> = BTreeMap::new();
+        let mut seen = FusedCoverage::default();
+        let max = fused.geometry().max_value(16);
+        let key = |id: u64| {
+            let mut k = format!("{id:06}").into_bytes();
+            k.resize(6 + (id % 11) as usize, b'k');
+            k
+        };
+        for round in 0..rounds {
+            let mut cache = (round % 2 == 1).then(PathCache::default);
+            let mut twin_cache = (round % 2 == 1).then(PathCache::default);
+            for op in 0..1 + rng.below(6) {
+                let what = format!("round {round} op {op}");
+                let k = key(rng.below(400));
+                let published = !root.is_empty() && !fused.is_private(root.root);
+                let shape = (root.height, root.leaf_pages);
+                let old = model.get(&k).copied();
+                let deleting = old.is_some() && rng.below(3) == 0;
+                let (got, want) = if deleting {
+                    let got = delete_through(&mut fused, &mut root, cache.as_mut(), &k);
+                    let want = delete_through(&mut twin, &mut twin_root, twin_cache.as_mut(), &k);
+                    model.remove(&k);
+                    (got, want)
+                } else {
+                    let vlen = match (old, rng.below(8)) {
+                        (Some(len), 0 | 1) => len,
+                        (_, 2) => max - rng.len_upto(16),
+                        (_, 3) => page_size as usize + rng.len_upto(page_size as usize),
+                        (_, 4) => rng.len_upto(page_size as usize / 8),
+                        _ => rng.len_upto(48),
+                    };
+                    let v = vec![rng.next() as u8; vlen];
+                    let got = put_through(&mut fused, &mut root, cache.as_mut(), &k, &v);
+                    let want = put_through(&mut twin, &mut twin_root, twin_cache.as_mut(), &k, &v);
+                    model.insert(k.clone(), vlen);
+                    if published && shape == (root.height, root.leaf_pages) {
+                        match old.map(|len| len.cmp(&vlen)) {
+                            None => seen.inserts += 1,
+                            Some(std::cmp::Ordering::Less) => seen.grows += 1,
+                            Some(std::cmp::Ordering::Equal) => seen.equals += 1,
+                            Some(std::cmp::Ordering::Greater) => seen.shrinks += 1,
+                        }
+                        seen.cached += usize::from(cache.is_some());
+                    }
+                    (got, want)
+                };
+                if deleting && published && shape == (root.height, root.leaf_pages) {
+                    seen.deletes += 1;
+                }
+                let (got, want) = (got.map_err(|e| e.to_string()), want.map_err(|e| e.to_string()));
+                assert_eq!(got, want, "{what}: the results");
+                assert_eq!(root, twin_root, "{what}: the roots");
+                assert_twins_match(&fused, &twin, &what);
+            }
+            for store in [&mut fused, &mut twin] {
+                store.commit_like();
+                if round % 3 == 2 {
+                    store.recycle();
+                }
+            }
+            assert_twins_match(&fused, &twin, &format!("round {round}: the commit"));
+        }
+        let walked = walk_tree(&fused, &root).entries.into_iter().map(|(k, v)| (k, v.len()));
+        assert!(walked.eq(model), "the model's keys and value lengths");
+        fused.assert_accounting(&[root]);
+        seen
+    }
+
+    /// [`fused_copies`] on a small page and a large one, with merging on and off: every kind of
+    /// change into a published leaf ran, with and without a path cache.
+    #[test]
+    fn fused_copies_match_the_copy_then_the_change() {
+        for (page_size, merge) in [(4096, true), (4096, false), (16384, true)] {
+            let seen = fused_copies(
+                page_size,
+                0x6A09_E667_F3BC_C908 ^ u64::from(page_size) ^ u64::from(merge),
+                300,
+                merge,
+            );
+            let FusedCoverage { inserts, grows, equals, shrinks, deletes, cached } = seen;
+            assert!(
+                [inserts, grows, equals, shrinks, deletes, cached].iter().all(|&n| n > 0),
+                "page size {page_size}, merge {merge}: {seen:?}"
+            );
+        }
+    }
+
+    /// The heavy twin of [`fused_copies_match_the_copy_then_the_change`]: more seeds, rounds and
+    /// page sizes.
+    #[test]
+    #[ignore = "heavy: run with --ignored in release"]
+    fn fused_copies_match_the_copy_then_the_change_heavy() {
+        for seed in 1..=8_u64 {
+            let seed = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+            for page_size in [4096, 8192, 16384, 65536] {
+                for merge in [false, true] {
+                    fused_copies(page_size, seed, 500, merge);
+                }
+            }
+        }
+    }
+
+    /// [`PageWrite::copy_published_with`] with a leaf's change is [`copy_page`] then the change in
+    /// the copy, outside the result's free gap: on a [`MemStore`], on the environment's writer (a
+    /// published leaf through the readers' view), and on a freed page past the published bytes,
+    /// which the writer copies from a buffer of its own (`copy_unpublished`).
+    #[test]
+    fn a_copy_with_its_change_is_the_copy_then_the_change() {
+        fn assert_changes<S: PageWrite + ?Sized>(store: &mut S, p: u32, q: u32) {
+            let src = store.page(p).expect("a published leaf").to_vec();
+            let n = page::nkeys(&src);
+            for change in 0..3 {
+                let at = [0, n / 2, n - 1][change];
+                let mut want = store.private_page(q).expect("q").to_vec();
+                copy_page(&src, q, &mut want).expect("copy");
+                let got = store
+                    .copy_published_with(p, q, |s, d| match change {
+                        0 => page::copy_delete(s, d, at),
+                        1 => fit(page::copy_replace(s, d, at, Val::Inline(b"rv"))?, "a value"),
+                        _ => {
+                            fit(page::copy_insert(s, d, at, b"\0", Val::Inline(b"iv"))?, "an entry")
+                        }
+                    })
+                    .expect("the copy with its change")
+                    .to_vec();
+                let leaf = page::LeafMut::new(&mut want).expect("a leaf");
+                match change {
+                    0 => leaf.delete(at).expect("delete"),
+                    1 => assert_eq!(
+                        leaf.replace_value(at, Val::Inline(b"rv")).expect("rv"),
+                        Fit::Done
+                    ),
+                    _ => assert_eq!(
+                        leaf.insert(at, b"\0", Val::Inline(b"iv")).expect("iv"),
+                        Fit::Done
+                    ),
+                }
+                assert_equal_outside_the_gap(&got, &want, &format!("page {p}, change {change}"));
+            }
+        }
+        let leaf_of = |pages: &[u32], kind: &dyn Fn(u32) -> page::Kind| {
+            *pages.iter().rev().find(|&&p| kind(p) == page::Kind::Leaf).expect("a leaf")
+        };
+
+        let (mut store, root) = committed_mem_store();
+        let pages = store.reachable_pgnos(&root);
+        let leaf = leaf_of(&pages, &|p| page::kind(store.raw(p)).expect("kind"));
+        let q = store.alloc().expect("alloc");
+        assert_changes(&mut store, leaf, q);
+
+        fn raw(w: &mut crate::env::Writer, p: u32) -> &mut [u8] {
+            let size = w.geometry.page_size();
+            w.file.page_mut(p, size).expect("in the file")
+        }
+        let (_dir, env) = committed_env();
+        let mut txn = env.begin_rw().expect("begin");
+        let w = txn.writer_mut();
+        let size = w.geometry.page_size();
+        let pages = published_tree_pages(w);
+        let leaf = leaf_of(&pages, &|p| page::kind(w.page(p).expect("page")).expect("kind"));
+        let q = w.alloc().expect("alloc");
+        assert_changes(w, leaf, q);
+
+        // A freed page past the published bytes, forged to pass the fetch checks.
+        let src = w.page(leaf).expect("leaf").to_vec();
+        let freed = loop {
+            let p = w.alloc().expect("alloc");
+            if p >= w.last.page_count {
+                break p;
+            }
+        };
+        let (txn_id, page) = (w.txn(), raw(w, freed));
+        page.copy_from_slice(&src);
+        page::set_pgno_txn(page, freed, txn_id);
+        page::stamp(page);
+        let q = w.alloc().expect("alloc");
+        w.free(freed);
+        assert!(w.view.slice(u64::from(freed) * size as u64, size).is_none(), "past the view");
+        assert_changes(w, freed, q);
+    }
+
+    /// The same transactions on two environments, one whose writer copies a leaf then changes it
+    /// (`Writer::no_fused_copy`): after each commit the files hold the same pages outside each
+    /// one's free gap, the meta pages included.
+    #[test]
+    fn a_commit_writes_the_pages_of_the_copy_then_the_change() {
+        let open = || {
+            let dir = tempfile::TempDir::with_prefix("tndb_b_fused").expect("temp dir");
+            let options = crate::EnvOptions { map_reserve: 16 << 10, ..Default::default() };
+            let env = crate::Env::open(dir.path().join("db"), options).expect("open");
+            (dir, env)
+        };
+        let [(dir, env), (twin_dir, twin)] = [open(), open()];
+        let mut rng = Rng(0xBB67_AE85_84CA_A73B);
+        for round in 0..12 {
+            let ops: Vec<(u32, usize, bool)> = (0..40)
+                .map(|_| {
+                    let len = match rng.below(6) {
+                        0 => 3000 + rng.len_upto(6000),
+                        1 => rng.len_upto(400),
+                        _ => rng.len_upto(40),
+                    };
+                    (rng.below(500) as u32, len, round > 0 && rng.below(4) == 0)
+                })
+                .collect();
+            for (env, knob) in [(&env, false), (&twin, true)] {
+                let mut txn = env.begin_rw().expect("begin");
+                txn.writer_mut().no_fused_copy = knob;
+                let t = txn.create_table("t").expect("table");
+                for &(id, len, delete) in &ops {
+                    let key = id.to_be_bytes();
+                    if delete {
+                        txn.delete(&t, &key).expect("delete");
+                    } else {
+                        txn.put(&t, &key, &vec![(id + round) as u8; len]).expect("put");
+                    }
+                }
+                txn.commit().expect("commit");
+            }
+            let files =
+                [&dir, &twin_dir].map(|d| std::fs::read(d.path().join("db")).expect("read"));
+            assert_eq!(files[0].len(), files[1].len(), "round {round}: the file lengths");
+            let size = env.stat().page_size as usize;
+            for (p, (a, b)) in files[0].chunks(size).zip(files[1].chunks(size)).enumerate() {
+                if p < 2 {
+                    assert!(a == b, "round {round}: meta page {p}");
+                } else {
+                    assert_equal_outside_the_gap(a, b, &format!("round {round}, page {p}"));
+                }
+            }
+        }
     }
 }

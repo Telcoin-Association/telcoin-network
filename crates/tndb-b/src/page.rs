@@ -1765,6 +1765,153 @@ pub(crate) fn leaf_delete(page: &mut [u8], i: usize) -> Result<()> {
     remove_cell(page, &h, i)
 }
 
+// ---- copy-on-write of a leaf with its change ----
+//
+// A put or a delete into a published leaf copies it, then changes the copy. Changing the copy
+// reads it back while the copy's stores still drain, and that first read waits for them. These
+// functions make the copy and the change in one pass instead: they read only the source (the
+// header, the slots, the cells) and only write the destination, never reading it, so nothing in
+// the put waits on the copy. Each leaves in `dst` what `tree::write::copy_page` followed by the
+// same [`LeafMut`] change leaves, byte for byte outside the result's [`free_gap`], with the same
+// [`Fit`] and the same errors; every check runs on the source's bytes, which the copy would have
+// copied. A header that gives no free gap (a page `copy_page` copies whole) fails the header
+// check, as it fails on the copy. Unlike the two steps, a [`Fit::Full`] or an error leaves `dst`
+// untouched.
+
+/// [`LeafMut::insert`] of `key` and `value` at `i` into a copy of leaf `src` in `dst`, made in
+/// one pass that reads only `src` (see the section's notes). `dst` must be `src.len()` bytes,
+/// else [`Error::Failed`]. Forced inline, as [`LeafMut::insert`] is: the `Result<Fit>` stays in
+/// registers.
+#[inline(always)]
+pub(crate) fn copy_insert(
+    src: &[u8],
+    dst: &mut [u8],
+    i: usize,
+    key: &[u8],
+    value: impl CellVal,
+) -> Result<Fit> {
+    if dst.len() != src.len() {
+        return Err(copy_len_error(src, dst.len()));
+    }
+    let h = hdr_of(src, Kind::Leaf)?;
+    let size = cell_size_leaf(key.len(), value.cell_len());
+    if i > h.nkeys {
+        return Err(reserve_error(src, &h, i));
+    }
+    if size.saturating_add(SLOT) > h.free() {
+        return Ok(Fit::Full);
+    }
+    let (off, at, slots_end) = (h.upper - size, HEADER + SLOT * i, h.slots_end());
+    dst[..at].copy_from_slice(&src[..at]);
+    put_u16(dst, NKEYS_OFF, h.nkeys + 1);
+    put_u16(dst, UPPER_OFF, off);
+    put_u16(dst, at, off);
+    dst[at + SLOT..slots_end + SLOT].copy_from_slice(&src[at..slots_end]);
+    write_leaf_cell(&mut dst[off..h.upper], key, value);
+    dst[h.upper..].copy_from_slice(&src[h.upper..]);
+    Ok(Fit::Done)
+}
+
+/// [`LeafMut::replace_value`] of entry `i` with `value` into a copy of leaf `src` in `dst`, made
+/// in one pass that reads only `src` (see the section's notes): the cells below the entry's move
+/// with it by the change in its size, their slots following, and the entry is rewritten with its
+/// old key. `dst` must be `src.len()` bytes, else [`Error::Failed`]. Forced inline, as
+/// [`LeafMut::replace_value`] is.
+#[inline(always)]
+pub(crate) fn copy_replace(
+    src: &[u8],
+    dst: &mut [u8],
+    i: usize,
+    value: impl CellVal,
+) -> Result<Fit> {
+    if dst.len() != src.len() {
+        return Err(copy_len_error(src, dst.len()));
+    }
+    let h = hdr_of(src, Kind::Leaf)?;
+    let (off, klen, vlen) = leaf_cell(src, &h, i)?;
+    let keep = LEAF_CELL_HEADER + klen;
+    let new_len = value.cell_len();
+    let new_upper = match new_len.cmp(&vlen) {
+        Ordering::Equal => h.upper,
+        Ordering::Greater => {
+            let grow = new_len - vlen;
+            if grow > h.free() {
+                return Ok(Fit::Full);
+            }
+            h.upper - grow
+        }
+        Ordering::Less => h.upper + (vlen - new_len),
+    };
+    // The entry's cell ends where it ended: it moves by the change in its size, as do the cells
+    // below it (`shift_front`).
+    let (cell_end, new_off) = (off + keep + vlen, new_upper + (off - h.upper));
+    dst[..HEADER].copy_from_slice(&src[..HEADER]);
+    if new_upper == h.upper {
+        dst[HEADER..h.slots_end()].copy_from_slice(&src[HEADER..h.slots_end()]);
+    } else {
+        put_u16(dst, UPPER_OFF, new_upper);
+        copy_slots(src, dst, (0, 0, h.nkeys), h.upper..off + 1, new_upper);
+    }
+    dst[new_upper..new_off].copy_from_slice(&src[h.upper..off]);
+    write_leaf_cell(&mut dst[new_off..cell_end], &src[off + LEAF_CELL_HEADER..off + keep], value);
+    dst[cell_end..].copy_from_slice(&src[cell_end..]);
+    Ok(Fit::Done)
+}
+
+/// [`LeafMut::delete`] ([`leaf_delete`]) of entry `i` into a copy of leaf `src` in `dst`, made in
+/// one pass that reads only `src` (see the section's notes): the cells below the entry's move up
+/// over its bytes, and each slot past `i` comes from the next slot of `src`, adjusted as its cell
+/// moved. `dst` must be `src.len()` bytes, else [`Error::Failed`]. Forced inline, as
+/// [`LeafMut::delete`] is.
+#[inline(always)]
+pub(crate) fn copy_delete(src: &[u8], dst: &mut [u8], i: usize) -> Result<()> {
+    if dst.len() != src.len() {
+        return Err(copy_len_error(src, dst.len()));
+    }
+    let h = hdr_of(src, Kind::Leaf)?;
+    let (off, klen, vlen) = leaf_cell(src, &h, i)?;
+    let size = LEAF_CELL_HEADER + klen + vlen;
+    let new_upper = h.upper + size;
+    dst[..HEADER].copy_from_slice(&src[..HEADER]);
+    put_u16(dst, NKEYS_OFF, h.nkeys - 1);
+    put_u16(dst, UPPER_OFF, new_upper);
+    copy_slots(src, dst, (0, 0, i), h.upper..off, new_upper);
+    copy_slots(src, dst, (i + 1, i, h.nkeys - 1 - i), h.upper..off, new_upper);
+    dst[new_upper..off + size].copy_from_slice(&src[h.upper..off]);
+    dst[off + size..].copy_from_slice(&src[off + size..]);
+    Ok(())
+}
+
+/// Copy `n` slots of `src` from slot `from` into `dst` from slot `to`, as `(from, to, n)`, each
+/// offset in `moved` (cells that moved) rebased to start at `base`, every other offset as it is:
+/// the slot pass of [`remove_cell`] and [`shift_front`], reading the slots from `src`.
+#[inline(always)]
+fn copy_slots(
+    src: &[u8],
+    dst: &mut [u8],
+    (from, to, n): (usize, usize, usize),
+    moved: Range<usize>,
+    base: usize,
+) {
+    for k in 0..n {
+        let o = slot(src, from + k);
+        let o = if moved.contains(&o) { base + (o - moved.start) } else { o };
+        put_u16(dst, HEADER + SLOT * (to + k), o);
+    }
+}
+
+/// The [`Error::Failed`] of a copy into a destination that is not one page of the source's
+/// length (`tree::write::copy_page`'s invariant): a writer bug, never damage.
+#[cold]
+#[inline(never)]
+fn copy_len_error(src: &[u8], dst_len: usize) -> Error {
+    Error::Failed(format!(
+        "b+tree write invariant broken: a copy of page {} into {dst_len} bytes, not {}",
+        pgno(src),
+        src.len()
+    ))
+}
+
 // ---- branch ----
 
 fn write_branch_cell(cell: &mut [u8], key: &[u8], child: u32, child_txn: u32) {
@@ -4411,6 +4558,312 @@ mod tests {
                 assert!(want.is_err(), "{size}, ({nkeys}, {upper})");
                 assert_eq!(got.map_err(|e| e.to_string()), want.map_err(|e| e.to_string()));
             }
+        }
+    }
+
+    /// A random valid leaf for the copy edits' oracles: inline, overflow and nested cells (the
+    /// generator of `copy_page_copies_every_byte_outside_the_free_gap`) keyed by odd ranks, with
+    /// `full` topped up to a free gap of 0 ([`top_up`]), its gap holding bytes of its own.
+    fn copy_edit_leaf(g: &Geometry, specs: &[(Spec, u8)], full: bool) -> Vec<u8> {
+        let mut page = fresh(g, Kind::Leaf);
+        let root = TreeRoot {
+            root: 9,
+            root_txn: 3,
+            height: 1,
+            entries: 1,
+            leaf_pages: 1,
+            ..TreeRoot::EMPTY
+        }
+        .encode();
+        for (n, (s, sel)) in specs.iter().enumerate() {
+            let key = ranked_key(2 * n as u32 + 1, s.klen(g));
+            let value = s.value(g, key.len());
+            let ovf = Ovf { pgno: 9, txn: 3, len: (g.max_value(key.len()) + 1) as u32 };
+            let val = match sel % 4 {
+                0 if g.overflow_fits(key.len()) => Val::Overflow(ovf),
+                1 if g.max_value(key.len()) >= NESTED_CELL => Val::Nested(&root),
+                _ => Val::Inline(&value),
+            };
+            if cell_size_leaf(key.len(), val.cell_len()) + SLOT + TOP_UP_ROOM
+                > free_space(&page).unwrap()
+            {
+                break;
+            }
+            assert_eq!(LeafMut::new(&mut page).unwrap().insert(n, &key, val).unwrap(), Fit::Done);
+        }
+        if full {
+            top_up(g, &mut page);
+        }
+        validate(&page, g).unwrap();
+        let (lower, upper) = (HEADER + SLOT * nkeys(&page), upper(&page));
+        page[lower..upper].fill(0x5a);
+        page
+    }
+
+    /// Break one byte of `page` that a copy edit at `i` checks: `damage` 1 makes its header a
+    /// branch's, 2 gives cell `i` (when there is one) flags no cell has; any other leaves it.
+    fn damage_copy_edit_leaf(page: &mut [u8], damage: u8, i: usize) {
+        match damage {
+            1 => page[KIND_OFF] = KIND_BRANCH,
+            2 if i < nkeys(page) => {
+                let off = slot(page, i);
+                put_u16(page, off + 6, 3);
+            }
+            _ => {}
+        }
+    }
+
+    /// The destination's bytes before a copy: random, or [`POISON`](crate::tree::POISON) as a
+    /// debug build's `alloc` leaves them.
+    fn copy_edit_dst(seed: u64, size: usize, poison: bool) -> Vec<u8> {
+        match poison {
+            true => vec![crate::tree::POISON; size],
+            false => noise(seed, size),
+        }
+    }
+
+    /// Hold the one-pass copy edit `fused` of `src` to its two steps, `copy_page` then `change`
+    /// on the copy, each into a copy of `dst`: the same result, or error by message; on `done`
+    /// the same page outside its free gap (and the same gap); otherwise `fused` left `dst`
+    /// untouched.
+    fn assert_copy_edit<R: Copy + PartialEq + std::fmt::Debug>(
+        src: &[u8],
+        dst: &[u8],
+        done: R,
+        fused: impl FnOnce(&[u8], &mut [u8]) -> Result<R>,
+        change: impl FnOnce(&mut [u8]) -> Result<R>,
+    ) -> std::result::Result<Option<R>, TestCaseError> {
+        let mut want = dst.to_vec();
+        let want_r =
+            crate::tree::write::copy_page(src, 3, &mut want).and_then(|()| change(&mut want));
+        let mut got = dst.to_vec();
+        let got_r = fused(src, &mut got);
+        let msg = |r: &Result<R>| r.as_ref().map(|r| *r).map_err(ToString::to_string);
+        prop_assert_eq!(msg(&got_r), msg(&want_r));
+        if got_r.as_ref().is_ok_and(|r| *r == done) {
+            prop_assert_eq!(free_gap(&got), free_gap(&want));
+            let (got, want) = (outside_gap(&got), outside_gap(&want));
+            let at = got.iter().zip(&want).position(|(a, b)| a != b);
+            prop_assert!(at.is_none() && got.len() == want.len(), "differs at {:?}", at);
+        } else {
+            prop_assert!(got == dst, "dst written on {:?}", msg(&got_r));
+        }
+        Ok(got_r.ok())
+    }
+
+    /// The index an edit of a page of `n` entries is tried at: the first, the last (`last` past
+    /// the entries: an insert's append), one in between, and past the end, the errors.
+    fn copy_edit_index(isel: u8, r: u16, n: usize, last: usize) -> usize {
+        match isel % 5 {
+            0 => 0,
+            1 => last,
+            2 => usize::from(r) % (last + 1),
+            3 => last + 1,
+            _ => last + 1 + usize::from(r) % 3,
+        }
+        .min(n + 4)
+    }
+
+    /// A new value for a copy edit, in each form [`CellVal`] has: bytes, or a [`Val`].
+    #[derive(Clone, Copy, Debug)]
+    enum EditVal<'a> {
+        Bytes(&'a [u8]),
+        Val(Val<'a>),
+    }
+
+    impl<'a> EditVal<'a> {
+        /// Form `form` of the new value: `bytes`, inline or as [`Val::Inline`], else an overflow
+        /// reference or a nested root.
+        fn pick(form: u8, bytes: &'a [u8], root: &'a [u8; NESTED_CELL]) -> Self {
+            let ovf = Ovf { pgno: 11, txn: 2, len: 70_000 };
+            match form % 6 {
+                0..=2 => EditVal::Bytes(bytes),
+                3 => EditVal::Val(Val::Inline(bytes)),
+                4 => EditVal::Val(Val::Overflow(ovf)),
+                _ => EditVal::Val(Val::Nested(root)),
+            }
+        }
+    }
+
+    const EDIT_ROOT: [u8; NESTED_CELL] = [0x3c; NESTED_CELL];
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(128))]
+
+        /// [`copy_insert`] against `copy_page` then [`LeafMut::insert`]: random valid leaves from
+        /// empty to full (inline, overflow and nested cells), the first, last and a middle index
+        /// and past the end, entries that fit, exactly fill the gap or do not fit, in every value
+        /// form, into random or poisoned bytes; a damaged header refused as the two steps refuse
+        /// it.
+        #[test]
+        fn copy_insert_matches_a_copy_then_insert(
+            size in select(&SIZES[..]),
+            specs in vec((spec(), any::<u8>()), 0..80),
+            (full, poison, damage) in (any::<bool>(), any::<bool>(), 0..8_u8),
+            (isel, r, s) in (any::<u8>(), any::<u16>(), spec()),
+            (form, vsel) in (any::<u8>(), any::<u8>()),
+            seed in any::<u64>(),
+        ) {
+            let g = geometry(size);
+            let mut src = copy_edit_leaf(&g, &specs, full);
+            let n = nkeys(&src);
+            let i = copy_edit_index(isel, r, n, n);
+            damage_copy_edit_leaf(&mut src, damage, i);
+            let key = ranked_key(2 * i as u32, s.klen(&g));
+            let free = free_space(&src).unwrap();
+            let exact = free.checked_sub(SLOT + cell_size_leaf(key.len(), 0));
+            let vlen = match (vsel % 4, exact) {
+                (0, Some(exact)) => exact,
+                (1, Some(exact)) => exact + 1,
+                (2, Some(exact)) => usize::from(r) % (exact + 1),
+                _ => usize::from(r) % 17,
+            };
+            let bytes = vec![s.vfill; vlen];
+            let dst = copy_edit_dst(seed, src.len(), poison);
+            let done = match EditVal::pick(form, &bytes, &EDIT_ROOT) {
+                EditVal::Bytes(v) => assert_copy_edit(&src, &dst, Fit::Done,
+                    |s, d| copy_insert(s, d, i, &key, v),
+                    |p| LeafMut::new(p)?.insert(i, &key, v))?,
+                EditVal::Val(v) => assert_copy_edit(&src, &dst, Fit::Done,
+                    |s, d| copy_insert(s, d, i, &key, v),
+                    |p| LeafMut::new(p)?.insert(i, &key, v))?,
+            };
+            if done.is_none() {
+                prop_assert!(damage == 1 || i > n, "an error at {} of {}", i, n);
+            }
+        }
+
+        /// [`copy_replace`] against `copy_page` then [`LeafMut::replace_value`]: random valid
+        /// leaves from empty to full, the first, last and a middle entry and past the end, values
+        /// that shrink, keep their size, grow within the gap, grow to fill it exactly or grow past
+        /// it, in every value form over inline, overflow and nested cells, into random or poisoned
+        /// bytes; damaged headers and cells refused as the two steps refuse them.
+        #[test]
+        fn copy_replace_matches_a_copy_then_replace(
+            size in select(&SIZES[..]),
+            specs in vec((spec(), any::<u8>()), 0..80),
+            (full, poison, damage) in (any::<bool>(), any::<bool>(), 0..8_u8),
+            (isel, r, fill) in (any::<u8>(), any::<u16>(), any::<u8>()),
+            (form, vsel) in (any::<u8>(), any::<u8>()),
+            seed in any::<u64>(),
+        ) {
+            let g = geometry(size);
+            let mut src = copy_edit_leaf(&g, &specs, full);
+            let n = nkeys(&src);
+            let i = copy_edit_index(isel, r, n, n.saturating_sub(1));
+            damage_copy_edit_leaf(&mut src, damage, i);
+            let vlen = match i < n {
+                true => leaf_cell(&src, &hdr(&src).unwrap(), i).map_or(0, |(_, _, vlen)| vlen),
+                false => 0,
+            };
+            let free = free_space(&src).unwrap();
+            let new_len = match vsel % 5 {
+                0 => vlen,
+                1 => usize::from(r) % (vlen + 1),
+                2 => vlen + 1 + usize::from(r) % free.max(1),
+                3 => vlen + free,
+                _ => vlen + free + 1,
+            };
+            let bytes = vec![fill; new_len];
+            let dst = copy_edit_dst(seed, src.len(), poison);
+            let done = match EditVal::pick(form, &bytes, &EDIT_ROOT) {
+                EditVal::Bytes(v) => assert_copy_edit(&src, &dst, Fit::Done,
+                    |s, d| copy_replace(s, d, i, v),
+                    |p| LeafMut::new(p)?.replace_value(i, v))?,
+                EditVal::Val(v) => assert_copy_edit(&src, &dst, Fit::Done,
+                    |s, d| copy_replace(s, d, i, v),
+                    |p| LeafMut::new(p)?.replace_value(i, v))?,
+            };
+            if done.is_none() {
+                prop_assert!(damage == 1 || damage == 2 || i >= n, "an error at {} of {}", i, n);
+            }
+        }
+
+        /// [`copy_delete`] against `copy_page` then [`leaf_delete`]: random valid leaves from
+        /// empty to full, the first, last and a middle entry (inline, overflow and nested cells)
+        /// and past the end, into random or poisoned bytes; damaged headers and cells refused as
+        /// the two steps refuse them.
+        #[test]
+        fn copy_delete_matches_a_copy_then_delete(
+            size in select(&SIZES[..]),
+            specs in vec((spec(), any::<u8>()), 0..80),
+            (full, poison, damage) in (any::<bool>(), any::<bool>(), 0..8_u8),
+            (isel, r) in (any::<u8>(), any::<u16>()),
+            seed in any::<u64>(),
+        ) {
+            let g = geometry(size);
+            let mut src = copy_edit_leaf(&g, &specs, full);
+            let n = nkeys(&src);
+            let i = copy_edit_index(isel, r, n, n.saturating_sub(1));
+            damage_copy_edit_leaf(&mut src, damage, i);
+            let dst = copy_edit_dst(seed, src.len(), poison);
+            let done = assert_copy_edit(&src, &dst, (), |s, d| copy_delete(s, d, i),
+                |p| leaf_delete(p, i))?;
+            if done.is_none() {
+                prop_assert!(damage == 1 || damage == 2 || i >= n, "an error at {} of {}", i, n);
+            }
+        }
+    }
+
+    /// A header that gives no free gap (the five of
+    /// `copy_page_copies_a_page_with_overlapping_slots_and_cells_whole`) fails each copy edit's
+    /// header check with the message the two steps give, and a destination of another length
+    /// is a writer bug ([`Error::Failed`]); either way `dst` is left untouched.
+    #[test]
+    fn copy_edits_refuse_a_page_with_no_gap_and_a_wrong_length() {
+        for size in [4096_usize, 65536] {
+            let end = size - TRAILER;
+            for (nkeys, upper) in [
+                (40, HEADER + SLOT * 40 - 1),
+                (0xffff, 100),
+                (0, end + 1),
+                (3, end + TRAILER - 1),
+                (0, 0xffff),
+            ] {
+                let mut src = noise(size as u64, size);
+                src[KIND_OFF] = KIND_LEAF;
+                src[FLAGS_OFF] = 0;
+                put_u16(&mut src, NKEYS_OFF, nkeys);
+                put_u16(&mut src, UPPER_OFF, upper);
+                assert_eq!(free_gap(&src), None);
+                let dst = noise(!(size as u64), size);
+                let what = format!("{size}, ({nkeys}, {upper})");
+                let check = |r: std::result::Result<Option<()>, TestCaseError>| {
+                    assert_eq!(r.unwrap(), None, "{what}");
+                };
+                check(assert_copy_edit(
+                    &src,
+                    &dst,
+                    (),
+                    |s, d| copy_insert(s, d, 0, b"k", &b"v"[..]).map(|_| ()),
+                    |p| LeafMut::new(p)?.insert(0, b"k", &b"v"[..]).map(|_| ()),
+                ));
+                check(assert_copy_edit(
+                    &src,
+                    &dst,
+                    (),
+                    |s, d| copy_replace(s, d, 0, &b"v"[..]).map(|_| ()),
+                    |p| LeafMut::new(p)?.replace_value(0, &b"v"[..]).map(|_| ()),
+                ));
+                check(assert_copy_edit(
+                    &src,
+                    &dst,
+                    (),
+                    |s, d| copy_delete(s, d, 0),
+                    |p| leaf_delete(p, 0),
+                ));
+            }
+        }
+        let g = geometry(4096);
+        let src = fresh(&g, Kind::Leaf);
+        for len in [4095, 8192] {
+            let mut dst = vec![0x77; len];
+            let failed =
+                |r: Result<()>| assert!(matches!(r, Err(Error::Failed(_))), "{len}: {r:?}");
+            failed(copy_insert(&src, &mut dst, 0, b"k", &b"v"[..]).map(|_| ()));
+            failed(copy_replace(&src, &mut dst, 0, &b"v"[..]).map(|_| ()));
+            failed(copy_delete(&src, &mut dst, 0));
+            assert!(dst.iter().all(|&b| b == 0x77), "{len}: dst written");
         }
     }
 }

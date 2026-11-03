@@ -97,7 +97,11 @@ does not depend on `tn-storage` or reth. reth's database API on top of it is a s
   committed transactions freed. The meta names both.
 - **Copy-on-write.** The writer never changes a page a published tree can reach. It copies the
   page into a page private to the transaction. Readers therefore read published pages with no
-  lock.
+  lock. A put or delete that changes only a published leaf copies it with the change made in
+  the same pass, reading only the source (`page::copy_insert`, `copy_replace`, `copy_delete`):
+  the source holds the copy's bytes outside the free gap, so every check sees the same bytes,
+  and nothing in the write reads the copy, whose stores are still draining when a change made
+  after the copy would first load them. Branches, splits and merges copy, then change the copy.
 - **Single writer, many readers.** One `RwTxn` at a time (others wait). `RoTxn`s clone the
   current snapshot and see one consistent state of every table for as long as they live.
 - **Atomic commit through two metas.** A commit syncs its pages, then writes its meta over the
