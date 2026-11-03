@@ -84,8 +84,23 @@
 //! | `append_dup` | the value must sort after the key's last (by subkey), else `MDBX_EKEYMISMATCH` with the cursor on the key's last row (on its first when the value is exactly the first's); a key without rows takes any value, wherever the key sorts | the same |
 //! | `delete(k, Some(v))` | deletes the row of `v`'s subkey if it holds exactly the rest of `v` | the same, the engine's dup point calls |
 //! | `delete(k, None)`, `delete_current_duplicates` | delete every row of the key, a row at a time | `delete_prefix(k)`: one walk frees the key's tree, or removes its packed set; the cursor ends on the next key's first row, as after the composite loop |
-//! | `delete_current` | the engine's `delete_current`, then its `follower_shares_prefix` over the key's width, with no step: a follower of the key's leaves the cursor on it, else `prev_in_prefix` finds whether the key keeps an earlier row (the cursor then ends the key's rows, on it) or none (the cursor on the next key's first row) | the same |
+//! | `delete_current` | held (below), then the engine's `delete_current`, then its `follower_shares_prefix` over the key's width, with no step: a follower of the key's leaves the cursor on it, else `prev_in_prefix` finds whether the key keeps an earlier row (the cursor then ends the key's rows, on it) or none (the cursor on the next key's first row) | the same |
+//! | `delete_current`, then the same cursor's `upsert` of that row (reth's dup rewrite) | one engine `put` through the cursor, a replace of the row, which leaves the cursor on it as the insert after the delete would | the same, the engine's dup put |
 //! | `entries` | the rows: MDBX's count of key/value pairs | the same (the engine's dup totals count rows, not keys) |
+//!
+//! **The dup rewrite.** reth rewrites a dup row as `seek_by_key_subkey`, `delete_current`, then
+//! `upsert` of the same subkey (`write_state_changes`, `write_hashed_state`,
+//! `write_storage_trie_updates_sorted`), which as calls are two engine writes, each a descent and,
+//! for a packed key, a rewrite of its set. So a dup cursor's `delete_current` of the row it is on
+//! is held in the transaction's shared state (the cursor's `current` finds the row: none is
+//! `MDBX_ENODATA` at once) and runs when anything else happens: the cursor's next call runs it
+//! first, unless that call is the `upsert` of the row, which makes the two one engine `put`; any
+//! other call of the transaction or its cursors, a new cursor and the commit run it before their
+//! own work (through an engine cursor placed on the row, whose place and state the deleting cursor
+//! then takes, so it is where its own delete would have left it whatever writes come before its
+//! next call); a dropped cursor runs its own; an abort drops it. No call sees the row once
+//! `delete_current` returned, and every result and cursor place is as without the hold, but for
+//! the error timing (the differences below). A cursor at a key's end after `last` deletes at once.
 //!
 //! As on MDBX, a fresh cursor's `next_dup`, `next_no_dup` and `next_dup_val` start at the first
 //! row and its `prev_dup` at the last, a missed `seek_exact` or `seek_by_key_subkey` leaves the
@@ -136,6 +151,16 @@
 //!   another handle holds is `MDBX_BUSY`;
 //! - the table stats ([`TndbEnv::table_stats`]) and the metrics skip a table the file lacks (MDBX's
 //!   metrics stop at it).
+//!
+//! The errors:
+//! - a dup cursor's `delete_current` is held (the dup rewrite, above), so a failure of the delete
+//!   itself (damage met in its copy of the row's page, an I/O error) is the error of the call that
+//!   runs it, not `delete_current`'s: the `upsert` of the row (`DatabaseError::Write` for
+//!   `CursorUpsert`), any other call (`DatabaseError::Delete`, whatever the call), or the commit
+//!   (`DatabaseError::Commit`); a dropped cursor cannot report it. It is never lost: the
+//!   transaction keeps it and its commit refuses it (the transaction aborts), and the errors that
+//!   damage and I/O give fail the environment as they would have. reth meets this only on such a
+//!   failure.
 //!
 //! The data:
 //! - a dup-sort table holds one value per subkey: a put, `upsert` or `append` of a second value for
