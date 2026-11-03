@@ -49,7 +49,7 @@ use super::{read::tighten, write, PageRead, TreeRoot, MAX_HEIGHT};
 use crate::{
     error::{Error, Result},
     latch::Latch,
-    page::{self, Find, Kind, LeafView, Search, Val, View},
+    page::{self, BranchView, Find, Kind, LeafView, Search, Val, View},
 };
 
 // Test-only, in debug test builds only: the release benchmark is compiled with the test
@@ -178,6 +178,16 @@ fn key_tail<'s, S: PageRead + ?Sized>(
 
 /// A key range `[lo, hi)` borrowed from a page store (`None`: unbounded).
 type Bounds<'s> = (Option<&'s [u8]>, Option<&'s [u8]>);
+
+/// The deepest branch level of a path whose route has a lower (or an upper) bound, an index into
+/// `pages` and `slots`, with that branch's page (`None`: no level has the bound;
+/// [`TreeCursor::bound_levels`]).
+type BoundLevel<'s> = Option<(usize, &'s [u8])>;
+
+/// Test-only: the levels a seek's leaf check reads its bounds from, `(lo, hi)` (`None`: no level
+/// has the bound; [`TreeCursor::seek_bounds_for_test`]).
+#[cfg(test)]
+type BoundLevels = (Option<usize>, Option<usize>);
 
 /// Where a move landed: the entry the cursor is now at, with the page of the leaf holding it
 /// (`None`: not at an entry).
@@ -823,18 +833,97 @@ impl TreeCursor {
         Ok(())
     }
 
-    /// [`Self::check_leaf`]'s check: the range the path's branches give the leaf, as a descent
-    /// along an edge builds it ([`Self::bounds`], each branch fetched again with the per-fetch
-    /// checks), and every key of `leaf` inside it, else the descent's error; then the mark is
-    /// cleared. Never inlined: a step of a checked leaf pays one branch on a field.
+    /// [`Self::check_leaf`]'s check: the range the path's branches give the leaf, read from the
+    /// routes of at most two levels ([`Self::seek_bounds`], every branch fetched again with the
+    /// per-fetch checks and its header parsed), and every key of `leaf` inside it, else
+    /// the descent's error; then the mark is cleared. Never inlined: a step of a checked leaf
+    /// pays one branch on a field.
+    ///
+    /// Debug builds assert that the range equals, by content, the one [`Self::bounds`] builds
+    /// from every level's route, whenever that succeeds: it can fail only at a route this check
+    /// does not read, whose cells the descent's search read with the same checks, so only on a
+    /// page changed since the descent.
     #[inline(never)]
     fn check_leaf_slow<S: PageRead + ?Sized>(&mut self, store: &S, leaf: &[u8]) -> Result<()> {
-        let (lo, hi) = self.bounds(store, self.depth - 1)?;
+        let (lo, hi) = self.seek_bounds(store)?;
+        #[cfg(debug_assertions)]
+        if let Ok(full) = self.bounds(store, self.depth - 1) {
+            assert_eq!((lo, hi), full, "the deepest bounded levels' range is the path's");
+        }
         if !LeafView::new(leaf)?.keys_in_range(lo, hi)? {
             return Err(misrouted(self.pages[self.depth - 1]));
         }
         self.leaf_unchecked = false;
         Ok(())
+    }
+
+    /// The range `[lo, hi)` the path's branches give the leaf a seek's descent entered (`None`:
+    /// unbounded), what [`Self::bounds`] builds from every level, read from the routes of the two
+    /// levels [`Self::bound_levels`] names: `lo` from the deepest route with a lower bound, `hi`
+    /// from the deepest with an upper bound (one level may give both).
+    ///
+    /// The descent checked each branch's route against the range above it
+    /// ([`compared_in_range`]: `route.lo >= lo`, `route.hi < hi`), so each bound a route has
+    /// narrows the range to itself: the deepest route with a lower bound gives the
+    /// intersection's `lo`, and the deepest with an upper bound its `hi`. The routes of the
+    /// other levels are not read.
+    #[inline(always)]
+    fn seek_bounds<'s, S: PageRead + ?Sized>(&self, store: &'s S) -> Result<Bounds<'s>> {
+        let (lo_at, hi_at) = self.bound_levels(store)?;
+        let route = |(level, page): (usize, &'s [u8])| {
+            page::branch_route_at(page, usize::from(self.slots[level]))
+        };
+        let lo = match lo_at {
+            Some(at) => route(at)?.lo,
+            None => None,
+        };
+        let hi = match hi_at {
+            Some(at) => route(at)?.hi,
+            None => None,
+        };
+        Ok((lo, hi))
+    }
+
+    /// The deepest branch levels of the path whose routes have a lower and an upper bound, each
+    /// with its page, from the slots and the branches' headers alone: a route has a lower bound
+    /// exactly when its slot is not the branch's first, and an upper one when it is not the last
+    /// ([`page::BranchView::route_at`]), so the descent records nothing. Every level is fetched
+    /// again with the per-fetch checks and parsed as a branch, the checks and messages of
+    /// [`Self::bounds`] in its order, before any route is read.
+    #[inline(always)]
+    fn bound_levels<'s, S: PageRead + ?Sized>(
+        &self,
+        store: &'s S,
+    ) -> Result<(BoundLevel<'s>, BoundLevel<'s>)> {
+        let (mut lo_at, mut hi_at): (BoundLevel<'s>, BoundLevel<'s>) = (None, None);
+        let levels = self.depth - 1;
+        let path = self.pages[..levels].iter().zip(&self.slots[..levels]);
+        for (level, (&pgno, &ci)) in path.enumerate() {
+            let page = store.page(pgno)?;
+            let n = BranchView::new(page)?.nkeys();
+            let ci = usize::from(ci);
+            if ci > 0 {
+                lo_at = Some((level, page));
+            }
+            if ci + 1 < n {
+                hi_at = Some((level, page));
+            }
+        }
+        Ok((lo_at, hi_at))
+    }
+
+    /// Test-only: while a seek's leaf is unchecked, the levels its check reads the bounds from
+    /// ([`Self::bound_levels`]), the range read from them ([`Self::seek_bounds`]) and the range
+    /// [`Self::bounds`] builds from every level.
+    #[cfg(test)]
+    pub(crate) fn seek_bounds_for_test<'s, S: PageRead + ?Sized>(
+        &self,
+        store: &'s S,
+    ) -> Result<(BoundLevels, Bounds<'s>, Bounds<'s>)> {
+        assert!(self.leaf_unchecked, "a seek's unchecked leaf");
+        let (lo_at, hi_at) = self.bound_levels(store)?;
+        let levels = (lo_at.map(|(level, _)| level), hi_at.map(|(level, _)| level));
+        Ok((levels, self.seek_bounds(store)?, self.bounds(store, self.depth - 1)?))
     }
 
     /// [`Self::seek_exact`]: land on the entry `key` and return its value with the page of its

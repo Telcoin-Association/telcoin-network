@@ -2822,3 +2822,109 @@ fn a_seeks_leaf_stays_unchecked_until_a_read_past_its_landing() {
     assert_eq!(c.seek(s, &root, None, &key_of(1_999)).expect("seek"), None);
     assert!(c.leaf_checked(), "past the end");
 }
+
+/// What the leaf checks of seeks into trees of one height saw: the levels they read bounds from.
+#[derive(Debug, Default)]
+struct LevelsRead {
+    /// Leaf checks made.
+    checks: u64,
+    /// No lower or no upper bound on the path (the leftmost or the rightmost path).
+    unbounded: u64,
+    /// Both bounds from one level.
+    one_level: u64,
+    /// The lower bound from a deeper level than the upper.
+    lo_deeper: u64,
+    /// The upper bound from a deeper level than the lower.
+    hi_deeper: u64,
+}
+
+/// The deepest branch levels of `path` (root first, the leaf last) whose routes have a lower and
+/// an upper bound, read from the pages themselves (`None`: no route has one).
+fn deepest_bounds(store: &MemStore, path: &[(u32, u16)]) -> (Option<usize>, Option<usize>) {
+    let (mut lo, mut hi) = (None, None);
+    for (level, &(pgno, ci)) in path[..path.len() - 1].iter().enumerate() {
+        let branch = BranchView::new(store.raw(pgno)).expect("a branch");
+        let route = branch.route_at(usize::from(ci)).expect("a route");
+        if route.lo.is_some() {
+            lo = Some(level);
+        }
+        if route.hi.is_some() {
+            hi = Some(level);
+        }
+    }
+    (lo, hi)
+}
+
+/// For `c` at a leaf a seek's descent entered: the levels its check reads are the path's deepest
+/// with each bound, as the routes on its pages say, and the range read from them equals by
+/// content the one built from every level's route; counted into `seen`.
+fn assert_levels_read(store: &MemStore, c: &TreeCursor, seen: &mut LevelsRead, what: &str) {
+    let reader = store.reader();
+    let (levels, read, full) = c.seek_bounds_for_test(&reader).expect("the range");
+    assert_eq!(levels, deepest_bounds(store, &c.path()), "{what}: the levels read");
+    assert_eq!(read, full, "{what}: the range read from them");
+    seen.checks += 1;
+    match levels {
+        (Some(lo), Some(hi)) if lo == hi => seen.one_level += 1,
+        (Some(lo), Some(hi)) if lo > hi => seen.lo_deeper += 1,
+        (Some(_), Some(_)) => seen.hi_deeper += 1,
+        _ => seen.unbounded += 1,
+    }
+}
+
+/// A seek's leaf gets its deferred full check from the routes of the two deepest bounded levels
+/// ([`TreeCursor::seek_bounds`]): over seeded trees of height 1 to 4, after a seek and an exact
+/// seek of every key and gap class on one reused cursor, between an edge descent and the next
+/// probe, the levels the check names from the slots ([`TreeCursor::bound_levels`]) are the
+/// deepest branch levels whose routes have a lower and an upper bound (as read from the routes on
+/// the path's pages), the range read from them equals by content the one
+/// [`TreeCursor::bounds`] builds from every level, and a step from there lands on the model's
+/// neighbour. Coverage: on trees of three levels or more, the two bounds from different levels
+/// both ways; from one level; and a path missing one.
+#[test]
+fn a_seeks_leaf_check_reads_the_range_of_its_deepest_bounded_levels() {
+    let mut seen: BTreeMap<u32, LevelsRead> = BTreeMap::new();
+    for (i, &shape) in SEEK_SHAPES.iter().enumerate() {
+        let seed = 0x5EE4_0000 + 100 * i as u64;
+        let _report = ReportSeed(seed);
+        let (store, root, map) = build(shape, &mut Rng(seed));
+        let entries: Vec<Kv> = map.into_iter().collect();
+        let s = &store.reader();
+        let seen = seen.entry(root.height).or_default();
+        let key = |i: usize| entries.get(i).map(|(k, _)| &k[..]);
+        let mut c = TreeCursor::default();
+        for (n, probe) in every_key_and_gap(&entries).iter().enumerate() {
+            let at = entries.partition_point(|(k, _)| k < probe);
+            let got = c.seek(s, &root, None, probe).expect("seek");
+            assert_eq!(got.map(|(k, _)| k), key(at), "seek {probe:?}");
+            if !c.leaf_checked() {
+                assert_levels_read(&store, &c, seen, "seek");
+            }
+            let got = c.next(s, &root).expect("next");
+            assert_eq!(got.map(|(k, _)| k), key(at + 1), "a step after seek {probe:?}");
+            if c.seek_exact(s, &root, None, probe).expect("seek_exact").is_some() {
+                assert_levels_read(&store, &c, seen, "seek_exact");
+                let got = c.prev(s, &root).expect("prev");
+                assert_eq!(got.map(|(k, _)| k), at.checked_sub(1).and_then(key), "prev {probe:?}");
+            }
+            // An edge descent between the probes, so the next one starts from its path.
+            if n % 2 == 0 {
+                c.first(s, &root).expect("first");
+            } else {
+                c.last(s, &root).expect("last");
+            }
+        }
+    }
+    for height in 1..=4 {
+        let seen = &seen[&height];
+        assert!(seen.checks > 0, "height {height}: {seen:?}");
+        if height == 1 {
+            assert_eq!(seen.unbounded, seen.checks, "a leaf root has no bound: {seen:?}");
+        } else {
+            assert!(seen.one_level > 0 && seen.unbounded > 0, "height {height}: {seen:?}");
+        }
+        if height >= 3 {
+            assert!(seen.lo_deeper > 0 && seen.hi_deeper > 0, "height {height}: {seen:?}");
+        }
+    }
+}
