@@ -42,7 +42,6 @@ reth-tasks.workspace = true
 reth-trie = { workspace = true, features = ["metrics"] }
 reth-trie-db = { workspace = true, features = ["metrics"] }
 
-
 alloy-eips.workspace = true
 alloy-primitives.workspace = true
 alloy-consensus.workspace = true
@@ -86,6 +85,4 @@ test-utils = [
     "reth-ethereum-primitives?/test-utils",
     "reth-tasks/test-utils",
 ]
-rocksdb = ["reth-provider/rocksdb", ]
-edge = ["rocksdb"]
-
+edge = []

@@ -183,16 +183,6 @@ impl<N: ProviderNodeTypes> RocksDBProviderFactory for BlockchainProvider<N> {
     fn rocksdb_provider(&self) -> RocksDBProvider {
         self.database.rocksdb_provider()
     }
-
-    #[cfg(all(unix, feature = "rocksdb"))]
-    fn set_pending_rocksdb_batch(&self, _batch: rocksdb::WriteBatchWithTransaction<true>) {
-        unimplemented!("BlockchainProvider wraps ProviderFactory - use DatabaseProvider::set_pending_rocksdb_batch instead")
-    }
-
-    #[cfg(all(unix, feature = "rocksdb"))]
-    fn commit_pending_rocksdb_batches(&self) -> ProviderResult<()> {
-        unimplemented!("BlockchainProvider wraps ProviderFactory - use DatabaseProvider::commit_pending_rocksdb_batches instead")
-    }
 }
 
 impl<N: ProviderNodeTypes> HeaderProvider for BlockchainProvider<N> {
@@ -1998,7 +1988,6 @@ mod tests {
 
     macro_rules! test_by_tx_range {
         ([$(($method:ident, $data_extractor:expr)),* $(,)?]) => {{
-
             // Get the number methods being tested.
             // Since each method tested will move a block from memory to storage, this ensures we have enough.
             let extra_blocks = [$(stringify!($method)),*].len();
@@ -2151,7 +2140,6 @@ mod tests {
 
                 // Test range that spans database and in-memory
                 {
-
                     // This block will be persisted to disk and removed from memory AFTER the first database query. This ensures that we query the in-memory state before the database avoiding any race condition.
                     persist_block_after_db_tx_creation(provider.clone(), in_memory_blocks[0].number);
 
@@ -2238,7 +2226,6 @@ mod tests {
     /// `INVALID_ARGUMENTS`)
     macro_rules! test_non_range {
     ([$(($arg_count:ident, $method:ident, $item_extractor:expr, $invalid_args:expr)),* $(,)?]) => {{
-
         // Get the number methods being tested.
         // Since each method tested will move a block from memory to storage, this ensures we have enough.
         let extra_blocks = [$(stringify!($arg_count)),*].len();

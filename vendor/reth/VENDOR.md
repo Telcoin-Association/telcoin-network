@@ -59,3 +59,15 @@ Changes in the crate directories, in the order they were made:
    - The optional `reth-testing-utils` dependency of `reth-downloaders` and
      `reth-stages`, and the `test-utils` feature entries that enabled it.
    - The `[workspace.dependencies]` entries that no vendored crate inherits now.
+2. RocksDB removed. Telcoin-network does not use RocksDB, and the `rocksdb`
+   features were always off in its build.
+   - The `rocksdb` features, the optional `rocksdb` dependency of
+     `reth-provider`, and the `rocksdb` workspace dependency. The `edge`
+     features stay, but they do not enable `rocksdb` now.
+   - The RocksDB backend, `crates/storage/provider/src/providers/rocksdb/`.
+     `RocksDBProvider` is always the zero-size stub in
+     `providers/rocksdb_stub.rs`.
+   - All code under `#[cfg(... feature = "rocksdb")]`. The code under
+     `#[cfg(not(... feature = "rocksdb"))]` is unconditional now. This is the
+     code that the compiler used before, because the feature was off.
+   - The `impl TransactionLookup` block in `reth-prune`, which became empty.

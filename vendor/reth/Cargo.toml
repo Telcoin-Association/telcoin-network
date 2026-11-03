@@ -469,7 +469,6 @@ secp256k1 = { version = "0.30", default-features = false, features = [
 rand_08 = { package = "rand", version = "0.8" }
 c-kzg = "2.1.5"
 toml = "0.9"
-rocksdb = { version = "0.24" }
 opentelemetry_sdk = "0.31"
 opentelemetry = "0.31"
 opentelemetry-otlp = "0.31"

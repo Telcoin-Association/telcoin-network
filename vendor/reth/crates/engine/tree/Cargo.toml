@@ -101,10 +101,4 @@ test-utils = [
     "reth-ethereum-primitives/test-utils",
     "reth-tasks/test-utils",
 ]
-rocksdb = [
-    "reth-provider/rocksdb",
-    "reth-prune/rocksdb",
-    "reth-stages?/rocksdb",
-]
-edge = ["rocksdb"]
-
+edge = []

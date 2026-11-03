@@ -116,9 +116,10 @@ rpassword = "7.4.0"
 # graph. tn-reth's manifest enables the umbrella's default features (jemalloc, otlp, otlp-logs,
 # js-tracer, keccak-cache-global, asm-keccak, min-debug-logs) on the crates they forward to.
 #
-# RocksDB is not part of the build: storage is MDBX (or tndb-b), and `RocksDBProvider` is
-# reth's zero-size stub. etc/rocksdb-gate.sh fails if rocksdb returns to Cargo.lock or to
-# any manifest. reth's `edge` features imply `rocksdb`; do not enable them.
+# RocksDB is not part of the build: storage is MDBX (or tndb-b). The vendored reth has no
+# RocksDB backend and no `rocksdb` features, and `RocksDBProvider` is its zero-size stub
+# (vendor/reth/VENDOR.md). etc/rocksdb-gate.sh fails if rocksdb returns to Cargo.lock or to
+# any manifest.
 # The off-by-default `tndb-b` feature on tn-reth / tn-node / telcoin-network-cli /
 # telcoin-network swaps TN's reth database from MDBX to the tndb-b engine (`tndb-b-reth`);
 # MDBX stays compiled either way.

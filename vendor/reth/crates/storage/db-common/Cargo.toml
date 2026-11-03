@@ -42,8 +42,7 @@ serde_json.workspace = true
 tracing.workspace = true
 
 [features]
-rocksdb = ["reth-db-api/rocksdb", "reth-provider/rocksdb"]
-edge = ["rocksdb"]
+edge = []
 
 [lints]
 workspace = true
