@@ -191,6 +191,14 @@ impl Allocator {
         self.stamped.contains(p)
     }
 
+    /// True if page `p` is this writer's own: private to this transaction, or stamped by this
+    /// writer at one of its commits and not reused since. A fetch of an own page skips the
+    /// zero-CRC test of its trailer ([`crate::tree::read::checked_page`]).
+    #[inline]
+    pub(crate) fn is_own(&self, p: u32) -> bool {
+        self.private.contains(p) || self.stamped.contains(p)
+    }
+
     /// Test-only: the published pages this transaction freed.
     #[cfg(test)]
     pub(crate) fn freed(&self) -> &[u32] {

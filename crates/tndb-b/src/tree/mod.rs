@@ -218,9 +218,9 @@ pub(crate) trait PageRead {
     fn page_count(&self) -> u32;
 
     /// Page `pgno`, after the checks of [`read::checked_page`]: in range, not a meta page, a
-    /// non-zero CRC trailer unless the page is private to the writer, the header's page number
-    /// `pgno`, and the header's txn no later than the reading snapshot. Damage is
-    /// [`Error::Corrupt`].
+    /// non-zero CRC trailer unless the page is the writer's own (private, or stamped by it), the
+    /// header's page number `pgno`, and the header's txn no later than the reading snapshot.
+    /// Damage is [`Error::Corrupt`].
     fn page(&self, pgno: u32) -> Result<&[u8]>;
 
     /// Page `pgno` reached through a pointer that names it with `want_txn` (a branch cell's

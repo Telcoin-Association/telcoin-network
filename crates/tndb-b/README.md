@@ -1095,7 +1095,8 @@ says why the cache is safe.
 **Every page fetch** (`tree::read::checked_page`) checks:
 
 - `2 <= pgno < page_count` (the snapshot's), and the page is mapped;
-- a non-zero CRC trailer, unless the page is private to the writer;
+- a non-zero CRC trailer, unless the page is the writer's own: private to it, or stamped by it
+  at one of its commits (`Allocator::is_own`; do-not-flag item 11);
 - the header's `pgno` equals the requested one;
 - the header's `txn` is no later than the reading snapshot's txn, so a page reused too early
   surfaces as `Corrupt` instead of wrong data.
@@ -1754,6 +1755,12 @@ These limits and non-goals are known:
     holder's flag says this txn's writer wrote it. Trusted pages skip the per-fetch checks,
     `verify_published` and the separator-range check. `is_private` alone is not enough, and the
     rules that close the gap are deliberate:
+    - the writer's fetches skip the zero-CRC test of the trailer on its own pages, private or
+      stamped by it at one of its commits (`Allocator::is_own`, through `Writer::page`,
+      `Writer::child` and `copy_published`), as copy-on-write skips their verify: the stamp
+      wrote that trailer, and reading it costs a cache line a fetch (the header's is read
+      anyway). Readers keep the test, and so does a writer for every page it did not stamp, as
+      after a reopen (`a_zeroed_trailer_is_trusted_only_on_a_page_this_writer_stamped`);
     - an untrusted parent (or root handle) naming a private page is `Corrupt`: a sound tree never
       has that edge. The descents (`descend_write`, `collapse_to`), a merge's sibling reads
       (`sibling_view`, `check_sibling_chain`) and the free walk of `clear` and `drop`

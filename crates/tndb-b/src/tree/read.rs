@@ -11,10 +11,16 @@ use crate::{
 /// The checks every page fetch makes, shared by every [`PageRead`] store. `slice` maps a page
 /// number (already checked to be below `page_count`) to its bytes. The page must be a tree page
 /// (`2 <= pgno < page_count`: pages 0 and 1 are the metas), carry a non-zero CRC trailer unless
-/// it is `private` to the writer (a published page was stamped when it was committed; only the
-/// writer's own pages are dirty), name `pgno` in its header, and have been written no later than
+/// it is the writer's `own` page, name `pgno` in its header, and have been written no later than
 /// the reading snapshot's `snapshot_txn` (so a page reused too early surfaces as damage). Any
 /// failure is [`Error::Corrupt`].
+///
+/// A published page was stamped when it was committed, so only the writer's private pages are
+/// dirty. The writer passes `own` for those and for the pages it stamped itself at its commits
+/// ([`crate::alloc::Allocator::is_own`]): it trusts its own pages by provenance, as copy-on-write
+/// skips their verify (README do-not-flag 11), so its fetches skip their trailer's line too.
+/// Readers pass `false`, and so does a writer for every page it did not stamp, as after a
+/// reopen.
 ///
 /// The CRC itself is not recomputed here (that costs a pass over the page on every read):
 /// copy-on-write verifies a page before copying it, and the root of each tree is verified when
@@ -23,10 +29,10 @@ pub(crate) fn checked_page<'a>(
     pgno: u32,
     page_count: u32,
     snapshot_txn: u64,
-    private: bool,
+    own: bool,
     slice: impl FnOnce(u32) -> Option<&'a [u8]>,
 ) -> Result<&'a [u8]> {
-    checked(pgno, None, page_count, snapshot_txn, private, slice)
+    checked(pgno, None, page_count, snapshot_txn, own, slice)
 }
 
 /// [`checked_page`] for a page reached through a pointer that names it as `(pgno, want_txn)` (a
@@ -38,10 +44,10 @@ pub(crate) fn checked_child<'a>(
     want_txn: u32,
     page_count: u32,
     snapshot_txn: u64,
-    private: bool,
+    own: bool,
     slice: impl FnOnce(u32) -> Option<&'a [u8]>,
 ) -> Result<&'a [u8]> {
-    checked(pgno, Some(want_txn), page_count, snapshot_txn, private, slice)
+    checked(pgno, Some(want_txn), page_count, snapshot_txn, own, slice)
 }
 
 /// The checks of [`checked_page`] and, with `want_txn`, [`checked_child`], in that order.
@@ -51,7 +57,7 @@ fn checked<'a>(
     want_txn: Option<u32>,
     page_count: u32,
     snapshot_txn: u64,
-    private: bool,
+    own: bool,
     slice: impl FnOnce(u32) -> Option<&'a [u8]>,
 ) -> Result<&'a [u8]> {
     if pgno < 2 || pgno >= page_count {
@@ -61,7 +67,7 @@ fn checked<'a>(
     }
     let page = slice(pgno)
         .ok_or_else(|| Error::Corrupt(format!("page {pgno} is not mapped ({page_count} pages)")))?;
-    if !private && crc::crc_is_zero(page) {
+    if !own && crc::crc_is_zero(page) {
         return Err(Error::Corrupt(format!("published page {pgno} was never stamped (zero CRC)")));
     }
     let (header, txn) = (page::pgno(page), page::txn(page));

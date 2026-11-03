@@ -713,6 +713,44 @@ fn damage_found_by_a_read_latches() {
     assert!(matches!(env.begin_rw(), Err(Error::Failed(_))));
 }
 
+/// A writer trusts the pages it stamped itself, as copy-on-write does: its fetch of a committed
+/// leaf whose CRC trailer was zeroed since reads it, while a reader's fetch of it is `Corrupt`,
+/// and after a reopen, where the writer stamped nothing, so is the writer's.
+#[test]
+fn a_zeroed_trailer_is_trusted_only_on_a_page_this_writer_stamped() {
+    let (_dir, path) = temp();
+    let leaf = {
+        let env = open(&path);
+        put_all(&env, "a", &[(b"k", b"v")]);
+        put_all(&env, "b", &[(b"k", b"v")]);
+        let snapshot = env.inner().current();
+        let root = catalog::get(&*snapshot, &snapshot.meta.catalog, "a").expect("get").expect("a");
+        drop(snapshot);
+        let leaf = root.root.root;
+        assert!(env.with_writer(|w| w.alloc.is_stamped(leaf)), "this writer stamped the leaf");
+        // Zero the leaf's CRC trailer through another descriptor: the mapping sees it.
+        let file = fs::OpenOptions::new().write(true).open(&path).expect("open");
+        file.write_all_at(&[0; 4], u64::from(leaf + 1) * 4096 - 4).expect("write");
+
+        let rw = env.begin_rw().expect("rw");
+        let a = table(&rw, "a");
+        assert_eq!(val(&rw, &a, b"k").as_deref(), Some(&b"v"[..]), "the writer's own page");
+        drop(rw);
+        assert!(env.failure().is_none());
+        let ro = env.begin_ro().expect("ro");
+        let a = table(&ro, "a");
+        assert!(matches!(ro.get(&a, b"k"), Err(Error::Corrupt(_))), "a reader keeps the test");
+        assert!(env.failure().is_some_and(|c| c.contains("zero CRC")));
+        leaf
+    };
+    let env = open(&path);
+    assert!(!env.with_writer(|w| w.alloc.is_stamped(leaf)), "a reopened writer stamped nothing");
+    let rw = env.begin_rw().expect("rw");
+    let a = table(&rw, "a");
+    assert!(matches!(rw.get(&a, b"k"), Err(Error::Corrupt(_))), "nor is it the reopened writer's");
+    assert!(env.failure().is_some_and(|c| c.contains("zero CRC")));
+}
+
 /// `begin_rw` waits while another write transaction is open (on any thread), and a write
 /// transaction can move to another thread.
 #[test]

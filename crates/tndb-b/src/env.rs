@@ -790,7 +790,7 @@ impl PageRead for Writer {
             pgno,
             self.alloc.page_count(),
             self.alloc.txn(),
-            self.alloc.is_private(pgno),
+            self.alloc.is_own(pgno),
             |p| self.file.page(p, size),
         )
     }
@@ -802,7 +802,7 @@ impl PageRead for Writer {
             want_txn,
             self.alloc.page_count(),
             self.alloc.txn(),
-            self.alloc.is_private(pgno),
+            self.alloc.is_own(pgno),
             |p| self.file.page(p, size),
         )
     }
@@ -891,8 +891,9 @@ impl PageWrite for Writer {
         let Some(src) = self.view.slice(u64::from(from) * size as u64, size) else {
             return copy_unpublished(self, from, to);
         };
+        let own = self.alloc.is_stamped(from);
         let src =
-            checked_page(from, self.alloc.page_count(), self.alloc.txn(), false, |_| Some(src))?;
+            checked_page(from, self.alloc.page_count(), self.alloc.txn(), own, |_| Some(src))?;
         if !self.alloc.is_private(to) {
             return Err(not_private(to));
         }

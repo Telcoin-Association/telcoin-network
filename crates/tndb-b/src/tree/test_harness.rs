@@ -287,7 +287,7 @@ impl PageRead for MemStore {
             pgno,
             self.alloc.page_count(),
             self.alloc.txn(),
-            self.alloc.is_private(pgno),
+            self.alloc.is_own(pgno),
             |p| self.span(p, self.geometry.page_size()),
         )
     }
@@ -298,7 +298,7 @@ impl PageRead for MemStore {
             want_txn,
             self.alloc.page_count(),
             self.alloc.txn(),
-            self.alloc.is_private(pgno),
+            self.alloc.is_own(pgno),
             |p| self.span(p, self.geometry.page_size()),
         )
     }
