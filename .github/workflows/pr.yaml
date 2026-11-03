@@ -272,6 +272,22 @@ jobs:
       - name: Test connection accounting
         run: cargo +1.94 test --locked -p libp2p-connection-limits --lib
 
+  # Same shape for the carried gossipsub crate. `patches/libp2p-gossipsub` is excluded from
+  # the workspace, so no lane above builds its library tests, and the promise-expiry
+  # regression in src/behaviour/tests/gossip.rs is the safety net its maintenance record
+  # relies on. See patches/libp2p-gossipsub/PATCH.md.
+  gossipsub-patch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install pinned toolchain
+        run: rustup toolchain install 1.94 --profile minimal
+
+      - name: Test promise expiry and the carried gossipsub unit tests
+        run: cargo +1.94 test --locked -p libp2p-gossipsub --lib
+
   # Same shape for the carried QUIC protocol crate. `patches/quinn-proto` is excluded from
   # the workspace, so no lane above builds its library tests, and the protocol observation
   # regressions (src/tests/incoming_observations.rs) are the safety net its maintenance
@@ -504,7 +520,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     if: always()
-    needs: [ci-scope, attest, fmt, clippy, test, adiri-test, archive-mode-gate, connection-limits-patch, quinn-proto-patch, transport-evidence, quic-profile-pins]
+    needs: [ci-scope, attest, fmt, clippy, test, adiri-test, archive-mode-gate, connection-limits-patch, quinn-proto-patch, gossipsub-patch, transport-evidence, quic-profile-pins]
     steps:
       - name: Check all jobs passed
         env:
@@ -532,7 +548,7 @@ jobs:
           # `needs` would otherwise leave this check silently. Every job has its own arm
           # below and there is no catch-all for success, so a job added to `needs`
           # without an arm fails at `*)`.
-          expected="adiri-test archive-mode-gate attest ci-scope clippy connection-limits-patch fmt quic-profile-pins quinn-proto-patch test transport-evidence"
+          expected="adiri-test archive-mode-gate attest ci-scope clippy connection-limits-patch fmt gossipsub-patch quic-profile-pins quinn-proto-patch test transport-evidence"
           actual=$(jq -r 'keys | join(" ")' <<<"${RESULTS}")
           if [[ "${actual}" != "${expected}" ]]; then
             echo "::error::needs mismatch: expected [${expected}], got [${actual}]. Update 'expected' in this step together with 'needs'."
@@ -568,6 +584,11 @@ jobs:
               *:quinn-proto-patch:success) echo "  ok       ${job}" ;;
               *:quinn-proto-patch:*)
                 echo "::error::quinn-proto-patch: ${result}"
+                failed=1
+                ;;
+              *:gossipsub-patch:success) echo "  ok       ${job}" ;;
+              *:gossipsub-patch:*)
+                echo "::error::gossipsub-patch: ${result}"
                 failed=1
                 ;;
               *:transport-evidence:success) echo "  ok       ${job}" ;;

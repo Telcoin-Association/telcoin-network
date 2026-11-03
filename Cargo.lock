@@ -5480,8 +5480,6 @@ dependencies = [
 [[package]]
 name = "libp2p-gossipsub"
 version = "0.50.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1b625461b45e5b36facf07ff3585b831bcaf26cab8907ac8f47d1e8e999999e0"
 dependencies = [
  "async-channel",
  "asynchronous-codec",
