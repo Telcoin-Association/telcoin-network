@@ -12,6 +12,7 @@ use generate::GenerateKeys;
 use std::path::{Path, PathBuf};
 use tn_config::{create_keys_dir, TelcoinDirs as _};
 use tracing::warn;
+use zeroize::Zeroizing;
 
 /// Generate keypairs and node info to go with them and save them to a file.
 #[derive(Debug, Args)]
@@ -43,7 +44,11 @@ pub enum KeySubcommand {
 
 impl KeyArgs {
     /// Execute command
-    pub fn execute(&self, datadir: PathBuf, passphrase: Option<String>) -> eyre::Result<()> {
+    pub fn execute(
+        &self,
+        datadir: PathBuf,
+        passphrase: Option<Zeroizing<String>>,
+    ) -> eyre::Result<()> {
         match &self.command {
             // generate keys
             KeySubcommand::Generate(args) => match &args.node_type {
@@ -76,7 +81,7 @@ impl KeyArgs {
     pub fn execute_insecure(
         &self,
         datadir: PathBuf,
-        passphrase: Option<String>,
+        passphrase: Option<Zeroizing<String>>,
         rounds: u32,
     ) -> eyre::Result<()> {
         if let KeySubcommand::Generate(args) = &self.command {
@@ -147,6 +152,7 @@ mod tests {
         hex, verify_proof_of_possession_bls, Address, BlsPublicKey, RpcInfo, DEFAULT_WORKER_ID,
     };
     use url::Url;
+    use zeroize::Zeroizing;
 
     /// Test that generate keys command works.
     /// This test also ensures that confy is able to
@@ -171,8 +177,10 @@ mod tests {
         ])
         .expect("cli parsed");
 
-        tn.run(Some("gen_keys_test".to_string()), |_, _, _, _, _| tokio::spawn(async { Ok(()) }))
-            .expect("generate keys command");
+        tn.run(Some(Zeroizing::new("gen_keys_test".to_string())), |_, _, _, _, _| {
+            tokio::spawn(async { Ok(()) })
+        })
+        .expect("generate keys command");
 
         Config::load_from_path_or_default::<NodeInfo>(
             temp_path.join("node-info.yaml").as_path(),
@@ -216,7 +224,7 @@ mod tests {
             "ftp://127.0.0.1:8545",
         ])
         .expect("cli parsed");
-        let run = tn.run(Some("abort_mode_test".to_string()), |_, _, _, _, _| {
+        let run = tn.run(Some(Zeroizing::new("abort_mode_test".to_string())), |_, _, _, _, _| {
             tokio::spawn(async { Ok(()) })
         });
         assert!(run.is_err(), "an invalid worker RPC scheme must abort key generation");
@@ -270,7 +278,7 @@ mod tests {
                 "0",
             ])
             .expect("cli parsed");
-            tn.run(Some("key_dir_mode_test".to_string()), |_, _, _, _, _| {
+            tn.run(Some(Zeroizing::new("key_dir_mode_test".to_string())), |_, _, _, _, _| {
                 tokio::spawn(async { Ok(()) })
             })
             .expect("generate keys command");
@@ -305,8 +313,10 @@ mod tests {
             "0",
         ])
         .expect("cli parsed");
-        tn.run(Some("export_test".to_string()), |_, _, _, _, _| tokio::spawn(async { Ok(()) }))
-            .expect("generate keys command");
+        tn.run(Some(Zeroizing::new("export_test".to_string())), |_, _, _, _, _| {
+            tokio::spawn(async { Ok(()) })
+        })
+        .expect("generate keys command");
 
         // load node info and verify byte lengths directly
         let node_info = Config::load_from_path::<NodeInfo>(
@@ -367,8 +377,10 @@ mod tests {
             "0",
         ])
         .expect("cli parsed");
-        tn.run(Some("calldata_test".to_string()), |_, _, _, _, _| tokio::spawn(async { Ok(()) }))
-            .expect("generate keys command");
+        tn.run(Some(Zeroizing::new("calldata_test".to_string())), |_, _, _, _, _| {
+            tokio::spawn(async { Ok(()) })
+        })
+        .expect("generate keys command");
 
         let args =
             ExportStakingArgs { node_info: temp_path.to_path_buf(), json: false, calldata: true };
@@ -908,11 +920,11 @@ mod tests {
         let dir = tempfile::TempDir::new().expect("tempdir created");
         let path = dir.path().to_path_buf();
         keygen_args(None)
-            .execute(&path, Some("correct".to_string()))
+            .execute(&path, Some(Zeroizing::new("correct".to_string())))
             .expect("generate keys with passphrase");
 
         let err = PopArgs { address: new_test_address() }
-            .execute(&path, Some("wrong".to_string()))
+            .execute(&path, Some(Zeroizing::new("wrong".to_string())))
             .expect_err("generate pop must error on a wrong passphrase");
         let msg = format!("{err:#}");
         assert!(msg.contains("passphrase"), "hint should mention the passphrase, got: {msg}");

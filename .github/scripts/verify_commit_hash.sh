@@ -66,7 +66,7 @@ for sha in "${hashes[@]}"; do
     if [[ "${result: -1}" == "1" ]]; then
         echo "attested:     ${sha}"
     else
-        echo "::error::${sha} is not attested. A maintainer must run 'make attest' on this commit, then request a review to re-run this check."
+        echo "::error::${sha} is not attested. A maintainer must run 'make attest' on this commit, then re-run the failed jobs from the Actions tab."
         missing=1
     fi
 done

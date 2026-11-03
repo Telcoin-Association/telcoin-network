@@ -12,6 +12,7 @@ use tn_types::{
 };
 use tracing::info;
 use url::Url;
+use zeroize::Zeroizing;
 
 /// Sign the proof of possession for `address` from `key_config` and write the
 /// PoP-derived fields (`bls_public_key`, `proof_of_possession`, `execution_address`)
@@ -290,7 +291,7 @@ impl KeygenArgs {
     pub fn execute<TND: TelcoinDirs>(
         &self,
         tn_datadir: &TND,
-        passphrase: Option<String>,
+        passphrase: Option<Zeroizing<String>>,
     ) -> eyre::Result<()> {
         info!(target: "tn::generate_keys", "generating keys for full validator node");
         self.validate()?;
@@ -308,7 +309,7 @@ impl KeygenArgs {
     pub fn execute_insecure<TND: TelcoinDirs>(
         &self,
         tn_datadir: &TND,
-        passphrase: Option<String>,
+        passphrase: Option<Zeroizing<String>>,
         rounds: u32,
     ) -> eyre::Result<()> {
         info!(target: "tn::generate_keys", "generating keys for node with INSECURE test KDF");

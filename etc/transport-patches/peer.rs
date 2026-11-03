@@ -57,9 +57,9 @@ fn transport(key: &Keypair) -> libp2p_quic::tokio::Transport {
         config.handshake_timeout = Duration::from_secs(65);
         config.max_idle_timeout = 30_000;
         config.keep_alive_interval = Duration::from_secs(5);
-        config.max_concurrent_stream_limit = 10_000;
-        config.max_stream_data = 50 * 1024 * 1024;
-        config.max_connection_data = 100 * 1024 * 1024;
+        config.max_concurrent_stream_limit = 256;
+        config.max_stream_data = 2 * 1024 * 1024;
+        config.max_connection_data = 4 * 1024 * 1024;
         config.retry_unvalidated_incoming = true;
         config.max_incoming = Some(720);
         config.incoming_buffer_size = Some(5888);

@@ -176,9 +176,14 @@ cannot use the capacity that a committee request needs.
 The opening-read pool has 8 public permits (`MAX_CONCURRENT_OPENING_READS`) and 4 committee
 permits (`COMMITTEE_RESERVED_OPENING_READS`). `try_admit_opening()` takes a permit *before* the
 serving task is spawned. The task holds the permit while it reads the opening `Req` frame, for a
-maximum of `SYNC_REQUEST_READ_TIMEOUT` (5 s). A served stream releases the permit before the serve
-starts. A stream that is not served keeps it only for its bounded refusal or error write. If a
-public peer sends no frame in time, the worker charges the peer `Penalty::Mild`.
+maximum of `PUBLIC_SYNC_REQUEST_READ_TIMEOUT` (1 s) for a public peer and
+`SYNC_REQUEST_READ_TIMEOUT` (5 s) for a committee peer. The task releases the permit as soon as
+the opening read ends, whatever its result, so no serve, control write or close holds it. The
+worker charges a public peer `Penalty::Mild` if it sends no frame in time, a frame that cannot be
+read, or a frame that is not a `Req`. It also charges a public peer `Penalty::Mild` for a valid
+`Req` that arrives after more than half of the 1 s bound, whether the worker then serves or
+refuses it. A prompt `Deny(AtCapacity)` answer is not charged, because an honest peer gets it when
+the batch serve pool is full.
 
 If no permit is available, the responder writes `Deny(DenyReason::AtCapacity)` on a budgeted shed
 task, and the requesting peer tries another node.
@@ -188,15 +193,18 @@ task, and the requesting peer tries another node.
 The batch serve pool has 5 public permits (`MAX_CONCURRENT_BATCH_STREAMS`) and 4 committee permits
 (`COMMITTEE_RESERVED_BATCH_STREAMS`). The task takes a permit after it reads the request frame and
 holds it until the serve ends. If no permit is available, the responder writes
-`Deny(DenyReason::AtCapacity)` and closes the stream.
+`Deny(DenyReason::AtCapacity)` and closes the stream. It does not charge the peer.
 
 Time limits release the permit when a peer stops reading:
 - `SYNC_REQUEST_READ_TIMEOUT` (5 s) for the `Ack` write and flush.
 - `SEND_STREAM_FRAME_TIMEOUT` (30 s) for each `Data` write, each chunk flush, and the `End` write.
 - `SEND_STREAM_TIMEOUT` (200 s) for the whole serve.
 
-The serve returns a `SyncServeOutcome`. A `Stalled` serve (a time limit expired) charges a public
-peer `Penalty::Mild`. A `Failed` serve (for example, a storage error) charges no penalty.
+The serve returns a `SyncServeOutcome`. A `Stalled` serve charges a public peer `Penalty::Mild`. A
+serve is `Stalled` when a time limit expired, or when the requester stopped or closed the stream
+after the `Ack` (QUIC then reports a write error of kind `ConnectionReset` or `NotConnected`). An
+honest requester does not do this, because its read tolerance is at or above `SEND_STREAM_TIMEOUT`.
+A `Failed` serve (for example, a storage error) charges no penalty.
 
 #### Per-Peer Rate Limiting (`MAX_PENDING_REQUESTS_PER_PEER`)
 
@@ -311,8 +319,14 @@ Concurrency tests cover:
 - Exhaustion of the public share of the batch serve pool sheds with `Deny(AtCapacity)`
 - Release of the peer slot and the pool permits when an admission is dropped
 - Public peers cannot use the committee reserve of the opening-read or the batch serve pool
-- Silent public streams release their opening-read permits at `SYNC_REQUEST_READ_TIMEOUT` and get
-  one `Penalty::Mild` each
+- Silent public streams release their opening-read permits at `PUBLIC_SYNC_REQUEST_READ_TIMEOUT`
+  and get one `Penalty::Mild` each
+- `late_valid_public_openings_are_charged`: four public identities open two streams each, and
+  each request arrives 1 ms before the bound: all eight are served, each gets one `Penalty::Mild`,
+  and the pools are whole afterwards
+- Unreadable and unexpected public openings release the opening-read permit as soon as the read
+  ends and get one `Penalty::Mild`; a prompt `AtCapacity` refusal releases it and gets no penalty
+- A stop or close of the stream after the `Ack` (`ConnectionReset`, `NotConnected`) is a stall
 - Stalled `Ack` and `Data` writes fail with `TimedOut` at their limits and release the batch serve
   permit
 - Per-peer limit enforcement across distinct peers

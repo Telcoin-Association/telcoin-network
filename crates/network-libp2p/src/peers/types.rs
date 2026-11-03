@@ -467,7 +467,7 @@ mod tests {
         // only the compressed length is accepted
         let short_len = BlsPublicKey::COMPRESSED_BYTES - 1;
         let short: Vec<u8> = std::iter::once(u8::try_from(short_len).expect("fits u8"))
-            .chain(std::iter::repeat(7u8).take(short_len))
+            .chain(std::iter::repeat_n(7u8, short_len))
             .collect();
         assert!(bcs::from_bytes::<PeerExchangeKey>(&short).is_err());
     }
