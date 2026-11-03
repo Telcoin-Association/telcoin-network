@@ -26,7 +26,7 @@ reth-db = { workspace = true }
 reth-libmdbx = { workspace = true, features = ["return-borrowed", "read-tx-timeouts"] }
 reth-primitives-traits = { workspace = true }
 # `StorageTrieEntry` and its parts, for the dup-sort layout tests (the version reth-db-api uses).
-reth-trie-common = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
+reth-trie-common = { path = "../../vendor/reth/crates/trie/common" }
 tempfile = { workspace = true }
 
 [lints]
