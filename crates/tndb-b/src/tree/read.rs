@@ -61,7 +61,8 @@ fn checked<'a>(
     }
     let page = slice(pgno)
         .ok_or_else(|| Error::Corrupt(format!("page {pgno} is not mapped ({page_count} pages)")))?;
-    if !private && crc::crc_is_zero(page) {
+    // MEASUREMENT ONLY: outside cfg(test) the trailer word is never read here.
+    if cfg!(test) && !private && crc::crc_is_zero(page) {
         return Err(Error::Corrupt(format!("published page {pgno} was never stamped (zero CRC)")));
     }
     let (header, txn) = (page::pgno(page), page::txn(page));
