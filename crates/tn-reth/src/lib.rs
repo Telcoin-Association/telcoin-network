@@ -66,6 +66,9 @@
 #![deny(unused_must_use, rust_2018_idioms)]
 #![cfg_attr(docsrs, feature(doc_cfg, doc_auto_cfg))]
 
+// revm is a dependency only for its features (see Cargo.toml).
+use revm as _;
+
 // Used in tests
 #[cfg(test)]
 mod clippy {

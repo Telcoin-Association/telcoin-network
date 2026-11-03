@@ -8,7 +8,7 @@ use reth_db::{
     transaction::{DbTx as _, DbTxMut as _},
     Database as _,
 };
-use reth_node_builder::NodeConfig;
+use reth_node_core::node_config::NodeConfig;
 use reth_primitives_traits::{Bytecode, StorageEntry};
 use std::sync::Arc;
 use tempfile::TempDir;

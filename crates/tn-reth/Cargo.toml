@@ -27,9 +27,8 @@ parking_lot = { workspace = true }
 # `Cargo.toml`). The umbrella's default features are enabled here on the crates it forwarded
 # them to: jemalloc (reth-cli-util, reth-node-core; not reth-node-metrics, whose jemalloc
 # stats feed only reth's own metrics server, which TN never starts); otlp and otlp-logs
-# (reth-node-core); js-tracer (reth-node-builder, reth-node-ethereum, reth-rpc,
-# reth-rpc-eth-types); keccak-cache-global (reth-node-core, reth-node-ethereum); asm-keccak
-# (reth-node-core, reth-node-ethereum, reth-primitives); min-debug-logs (reth-node-core, which
+# (reth-node-core); js-tracer (reth-rpc, reth-rpc-eth-types); keccak-cache-global
+# (reth-node-core); asm-keccak (reth-node-core, revm); min-debug-logs (reth-node-core, which
 # caps `tracing` at debug in release builds).
 reth-db = { workspace = true }
 reth-db-common = { workspace = true }
@@ -41,21 +40,16 @@ reth-node-core = { workspace = true, features = [
     "asm-keccak",
     "min-debug-logs",
 ] }
-reth-node-ethereum = { workspace = true, features = [
-    "js-tracer",
-    "keccak-cache-global",
-    "asm-keccak",
-] }
 reth-chainspec = { workspace = true }
 reth-chain-state = { workspace = true }
 reth-cli-util = { workspace = true, features = ["jemalloc"] }
-reth-primitives = { workspace = true, features = ["asm-keccak"] }
 reth-consensus = { workspace = true }
 reth-evm-ethereum = { workspace = true }
 reth-engine-primitives = { workspace = true }
+reth-node-types = { workspace = true }
+reth-payload-primitives = { workspace = true }
 reth-revm = { workspace = true }
 reth-evm = { workspace = true }
-reth-node-builder = { workspace = true, features = ["js-tracer"] }
 reth-provider = { workspace = true }
 reth-prune-types = { workspace = true }
 reth-primitives-traits = { workspace = true }
@@ -94,6 +88,9 @@ eyre = { workspace = true }
 # `rpc-types-mev` exposes the signed-bundle request and response types used by the epoch-fee adapter.
 alloy = { workspace = true, features = ["genesis", "json-rpc", "rpc-types-mev"] }
 alloy-evm = { workspace = true }
+# reth-node-ethereum turned these revm features on before TN dropped it: the native precompile
+# backends (secp256k1, blst, c-kzg), the EVM memory limit and asm-keccak.
+revm = { workspace = true, features = ["secp256k1", "blst", "c-kzg", "memory_limit", "asm-keccak"] }
 tempfile = { workspace = true }
 serde_json = { workspace = true }
 url = { workspace = true }

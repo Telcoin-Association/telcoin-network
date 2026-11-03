@@ -71,3 +71,16 @@ Changes in the crate directories, in the order they were made:
      `#[cfg(not(... feature = "rocksdb"))]` is unconditional now. This is the
      code that the compiler used before, because the feature was off.
    - The `impl TransactionLookup` block in `reth-prune`, which became empty.
+
+3. Crates that left the graph removed. Telcoin-network does not depend on
+   reth-node-builder, reth-node-ethereum and reth-primitives. It takes the same
+   items from the crates that define them. The crates below are not in the
+   dependency graph of telcoin-network after this change, so their directories and
+   their entries in `Cargo.toml` are removed: reth-consensus-debug-client,
+   reth-downloaders, reth-engine-service, reth-engine-tree, reth-engine-util,
+   reth-era, reth-era-downloader, reth-era-utils, reth-ethereum-consensus,
+   reth-ethereum-payload-builder, reth-exex, reth-exex-types,
+   reth-invalid-block-hooks, reth-node-builder, reth-node-ethereum,
+   reth-node-ethstats, reth-node-events, reth-node-metrics, reth-payload-validator,
+   reth-primitives, reth-prune, reth-stages, reth-stages-api, reth-static-file,
+   reth-trie-parallel.

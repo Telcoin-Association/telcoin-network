@@ -123,7 +123,6 @@ rpassword = "7.4.0"
 # The off-by-default `tndb-b` feature on tn-reth / tn-node / telcoin-network-cli /
 # telcoin-network swaps TN's reth database from MDBX to the tndb-b engine (`tndb-b-reth`);
 # MDBX stays compiled either way.
-reth-primitives = { path = "vendor/reth/crates/primitives" }
 reth-primitives-traits = { path = "vendor/reth/crates/primitives-traits" }
 reth-chainspec = { path = "vendor/reth/crates/chainspec" }
 reth-chain-state = { path = "vendor/reth/crates/chain-state" }
@@ -132,6 +131,8 @@ reth-db = { path = "vendor/reth/crates/storage/db" }
 reth-db-api = { path = "vendor/reth/crates/storage/db-api" }
 reth-db-common = { path = "vendor/reth/crates/storage/db-common" }
 reth-engine-primitives = { path = "vendor/reth/crates/engine/primitives" }
+reth-node-types = { path = "vendor/reth/crates/node/types" }
+reth-payload-primitives = { path = "vendor/reth/crates/payload/primitives" }
 # Without `std`, as every reth crate takes it: tn-reth only names its payload types.
 reth-ethereum-engine-primitives = { path = "vendor/reth/crates/ethereum/engine-primitives", default-features = false }
 reth-ethereum-primitives = { path = "vendor/reth/crates/ethereum/primitives" }
@@ -161,9 +162,7 @@ reth-tasks = { path = "vendor/reth/crates/tasks" }
 reth-tokio-util = { path = "vendor/reth/crates/tokio-util" }
 reth-transaction-pool = { path = "vendor/reth/crates/transaction-pool" }
 reth-consensus = { path = "vendor/reth/crates/consensus/consensus" }
-reth-node-builder = { path = "vendor/reth/crates/node/builder" }
 reth-node-core = { path = "vendor/reth/crates/node/core" }
-reth-node-ethereum = { path = "vendor/reth/crates/ethereum/node" }
 reth-discv4 = { path = "vendor/reth/crates/net/discv4" }
 reth-eth-wire = { path = "vendor/reth/crates/net/eth-wire" }
 reth-cli-util = { path = "vendor/reth/crates/cli/util" }
@@ -176,6 +175,7 @@ reth-metrics = { path = "vendor/reth/crates/metrics" }
 alloy = { version = "1.6.3", features = ["full"] }
 alloy-rlp = "0.3.13"
 alloy-evm = { version = "0.27.2" }
+revm = { version = "34.0.0", default-features = false }
 
 tn-batch-validator = { path = "crates/batch-validator" }
 tn-engine = { path = "crates/engine" }
@@ -234,7 +234,9 @@ async-trait = "0.1.61"
 arc-swap = "1"
 foldhash = "0.2"
 dashmap = "6.0.1"
-parking_lot = "0.12.3"
+# send_guard: reth-engine-tree and the other removed reth crates turned it on. Keep it on so
+# that lock guards stay `Send`.
+parking_lot = { version = "0.12.3", features = ["send_guard"] }
 scopeguard = "1.1"
 uuid = { version = "1.1.2", features = ["v4", "fast-rng"] }
 quinn-proto = "0.11.8"

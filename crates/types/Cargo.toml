@@ -15,7 +15,8 @@ publish = false
 bcs = { workspace = true }
 bincode = { workspace = true }
 # direct reth currently for circular deps
-reth-primitives = { workspace = true }
+reth-primitives-traits = { workspace = true }
+reth-ethereum-primitives = { workspace = true, features = ["serde"] }
 reth-chainspec = { workspace = true }
 reth-tasks = { workspace = true }
 futures = { workspace = true }

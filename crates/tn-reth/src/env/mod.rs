@@ -25,7 +25,7 @@ use std::{
 
 use reth_chainspec::ChainSpec as RethChainSpec;
 use reth_db_common::init::init_genesis;
-use reth_node_builder::NodeConfig;
+use reth_node_core::node_config::NodeConfig;
 use reth_provider::{
     providers::{BlockchainProvider, StaticFileProvider},
     ProviderError, ProviderFactory, ProviderResult, StateProviderBox, StateProviderFactory as _,

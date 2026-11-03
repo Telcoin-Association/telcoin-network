@@ -41,13 +41,12 @@ use std::{
 use clap::Parser;
 use reth_chainspec::ChainSpec as RethChainSpec;
 use reth_discv4::NatResolver;
+use reth_engine_primitives::{
+    DEFAULT_MEMORY_BLOCK_BUFFER_TARGET, DEFAULT_PERSISTENCE_THRESHOLD, DEFAULT_RESERVED_CPU_CORES,
+    DEFAULT_SPARSE_TRIE_MAX_STORAGE_TRIES, DEFAULT_SPARSE_TRIE_PRUNE_DEPTH,
+};
 use reth_network::transactions::{
     config::TransactionPropagationKind, TransactionIngressPolicy, TransactionPropagationMode,
-};
-use reth_node_builder::{
-    NodeConfig, DEFAULT_MEMORY_BLOCK_BUFFER_TARGET, DEFAULT_PERSISTENCE_THRESHOLD,
-    DEFAULT_RESERVED_CPU_CORES, DEFAULT_SPARSE_TRIE_MAX_STORAGE_TRIES,
-    DEFAULT_SPARSE_TRIE_PRUNE_DEPTH,
 };
 use reth_node_core::{
     args::{
@@ -55,7 +54,7 @@ use reth_node_core::{
         EngineArgs, EraArgs, EraSourceArgs, MetricArgs, NetworkArgs, PayloadBuilderArgs,
         PruningArgs, StaticFilesArgs, StorageArgs, TxPoolArgs,
     },
-    node_config::DEFAULT_CROSS_BLOCK_CACHE_SIZE_MB,
+    node_config::{NodeConfig, DEFAULT_CROSS_BLOCK_CACHE_SIZE_MB},
 };
 use reth_rpc_builder::{RethRpcModule, RpcModuleSelection};
 use tn_types::ETHEREUM_BLOCK_GAS_LIMIT_30M;
