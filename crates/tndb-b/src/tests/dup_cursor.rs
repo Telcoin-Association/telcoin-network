@@ -38,7 +38,7 @@ const K: usize = OPTIONS.key_len as usize;
 /// others with 10 to 20 rows (packed at [`Bound::Default`], nested at [`Bound::Small`]) and the
 /// rest with 1 to 3 (packed at both), the outer keys random, so neighbouring keys differ in form;
 /// `run_pct` percent of the values in overflow runs (a key with one is nested at every bound).
-struct Shape {
+pub(super) struct Shape {
     keys: usize,
     big_keys: usize,
     big_rows: usize,
@@ -62,12 +62,12 @@ fn outer_key(rng: &mut Rng) -> Vec<u8> {
 }
 
 /// A subkey of 1 to 12 bytes.
-fn subkey(rng: &mut Rng) -> Vec<u8> {
+pub(super) fn subkey(rng: &mut Rng) -> Vec<u8> {
     (0..1 + rng.below(12)).map(|_| clustered(rng)).collect()
 }
 
 /// A value of up to 40 bytes, or a run's (5000 bytes) `run_pct` percent of the time.
-fn value(rng: &mut Rng, run_pct: u64) -> Vec<u8> {
+pub(super) fn value(rng: &mut Rng, run_pct: u64) -> Vec<u8> {
     if rng.below(100) < run_pct {
         return vec![rng.next() as u8; 5000];
     }
@@ -76,7 +76,7 @@ fn value(rng: &mut Rng, run_pct: u64) -> Vec<u8> {
 
 /// Dup table `d` at `bound` and its composite twin `p` in `env`, committed with the same rows of
 /// `shape`.
-fn twins(env: &Env, shape: &Shape, rng: &mut Rng, bound: Bound) -> (Table, Table, Rows) {
+pub(super) fn twins(env: &Env, shape: &Shape, rng: &mut Rng, bound: Bound) -> (Table, Table, Rows) {
     let mut rows = Rows::new();
     for i in 0..shape.keys {
         let k = outer_key(rng);
@@ -120,14 +120,14 @@ enum Op {
 }
 
 /// A random row's logical key.
-fn pick_row<'r>(rng: &mut Rng, rows: &'r [Kv]) -> &'r [u8] {
+pub(super) fn pick_row<'r>(rng: &mut Rng, rows: &'r [Kv]) -> &'r [u8] {
     &rows[rng.below(rows.len() as u64) as usize].0
 }
 
 /// A seek target of every length class: a row's key, cut short of the key width, cut to it, cut
 /// inside the subkey, just after or just before a row's key, the empty key, a key after every
 /// key, or a random one.
-fn target(rng: &mut Rng, rows: &[Kv]) -> Vec<u8> {
+pub(super) fn target(rng: &mut Rng, rows: &[Kv]) -> Vec<u8> {
     let r = pick_row(rng, rows).to_vec();
     shaped(rng, r)
 }
@@ -162,7 +162,7 @@ fn shaped(rng: &mut Rng, r: Vec<u8>) -> Vec<u8> {
 /// A bounded seek's outer key and subkey: mostly a row's own (or the current row's), sometimes a
 /// neighbour of one, a random key, or a key of another width; the subkey the row's, just after
 /// it, past every subkey, empty or random.
-fn bounded_target(rng: &mut Rng, rows: &[Kv], at: Option<&[u8]>) -> (Vec<u8>, Vec<u8>) {
+pub(super) fn bounded_target(rng: &mut Rng, rows: &[Kv], at: Option<&[u8]>) -> (Vec<u8>, Vec<u8>) {
     let r = match at {
         Some(at) if rng.below(2) == 0 => at,
         _ => pick_row(rng, rows),
@@ -600,7 +600,7 @@ fn tail_form(c: &DupRoCursor, op: &Op) -> Option<(bool, usize)> {
 /// cell's form (a nested cell or an inline one), with the nested trees' greatest height: the
 /// walk of an outer tree that packs ([`walk_packing_tree`]) at a packing `bound`, else of one
 /// whose every cell is nested ([`walk_outer_tree`]). The nested count is `d`'s `nested_trees`.
-fn forms(env: &Env, d: &Table, bound: Bound) -> (BTreeSet<Vec<u8>>, Option<u32>) {
+pub(super) fn forms(env: &Env, d: &Table, bound: Bound) -> (BTreeSet<Vec<u8>>, Option<u32>) {
     let snapshot = env.inner().current();
     let outer = tree(env, "d");
     let walk = match bound {
@@ -706,12 +706,12 @@ fn fresh(ro: &Arc<crate::RoTxn>, d: &Table, p: &Table) -> (DupRoCursor, RoCursor
 }
 
 /// The twin shape of the default tier's cursor oracles.
-const SMALL_SHAPE: Shape =
+pub(super) const SMALL_SHAPE: Shape =
     Shape { keys: 400, big_keys: 3, big_rows: 300, run_pct: 2, nested_height: 2 };
 
 /// The twin shape of the heavy tier's cursor oracles: more outer keys, nested trees of three
 /// levels.
-const HEAVY_SHAPE: Shape =
+pub(super) const HEAVY_SHAPE: Shape =
     Shape { keys: 3000, big_keys: 2, big_rows: 40_000, run_pct: 2, nested_height: 3 };
 
 /// Oracle 2a: random calls on a [`DupRoCursor`] and on a [`RoCursor`] over the composite twin give

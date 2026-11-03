@@ -58,16 +58,17 @@
 //! forms: packed, packed-small and composite (the changesets' path).
 //!
 //! A leaf cell holds its value right after its key, so a read takes the value, the subkey then
-//! the rest, as one slice of the page (the engine's `current_with_key_tail`), with no copy; only
-//! a value in an overflow run is joined in a buffer of the cursor's. A cursor's `seek_exact` and
-//! `seek_by_key_subkey` read their row in the seek itself, from the leaf the seek fetched (the
-//! engine's `seek_with_key_tail`, and `seek_dup_with_key_tail` on a nested table, which takes the
-//! key and the subkey apart). A row this layout cannot hold (a value shorter than W, or a key of
-//! another width) is refused with `MDBX_BAD_VALSIZE`. Another dup-sort table (reth has none) is
-//! created, counted and cleared, but every other access to its rows is refused with a
-//! [`DatabaseError::Other`](reth_db_api::DatabaseError), as is a dup cursor call on a table without
-//! duplicates. reth's calls map onto the engine's ordered rows, the same engine calls on both
-//! forms but where the nested column says otherwise:
+//! the rest, as one slice of the page (read by the move itself, the engine's tail moves such as
+//! `next_with_key_tail`, on a nested table; on a composite one by `current_with_key_tail` after
+//! the move), with no copy; only a value in an overflow run is joined in a buffer of the cursor's.
+//! A cursor's `seek_exact` and `seek_by_key_subkey` read their row in the seek itself, from the
+//! leaf the seek fetched (the engine's `seek_with_key_tail`, and `seek_dup_with_key_tail` on a
+//! nested table, which takes the key and the subkey apart). A row this layout cannot hold (a value
+//! shorter than W, or a key of another width) is refused with `MDBX_BAD_VALSIZE`. Another dup-sort
+//! table (reth has none) is created, counted and cleared, but every other access to its rows is
+//! refused with a [`DatabaseError::Other`](reth_db_api::DatabaseError), as is a dup cursor call on
+//! a table without duplicates. reth's calls map onto the engine's ordered rows, the same engine
+//! calls on both forms but where the nested column says otherwise:
 //!
 //! | reth | composite | nested |
 //! |---|---|---|

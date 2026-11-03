@@ -235,7 +235,7 @@ const FREE_WALK_CASES: [&str; 14] = [
 ];
 
 /// The cases over `fx`, all but the one on a table that never packs ([`never_packs`]).
-fn cases(fx: &PackedFixture) -> Vec<Case<'_>> {
+pub(super) fn cases(fx: &PackedFixture) -> Vec<Case<'_>> {
     let (pk, pcold, hot) = (fx.leaves[&PK], fx.leaves[&PCOLD], fx.leaves[&HOT]);
     let row3 = move |edit: fn(&mut [u8])| {
         Box::new(move |p: &Path| in_set(p, pk, PK, edit)) as Box<dyn Fn(&Path)>

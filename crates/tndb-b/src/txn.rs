@@ -27,7 +27,9 @@ use crate::{
     stats::elapsed_ns,
     tree::{
         cursor::{self, Cursor, Entry, KeyTail, State, TreeCursor},
-        dup_cursor::{nested_cell, DupHint, DupWalk, NestedRoots, NO_DUP_HINT},
+        dup_cursor::{
+            nested_cell, DupHint, DupWalk, NestedRoots, Pick, PickTail, PickValue, Row, NO_DUP_HINT,
+        },
         read,
         write::{self, PutKind},
         PageRead, PageWrite, TreeRoot,
@@ -1809,8 +1811,13 @@ fn table_of<'t>(txn: &'t RoTxn, handle: &'t DupHandle) -> &'t Table {
     }
 }
 
-/// What a walker's move gives a dup cursor shell: the value of the row it landed on.
-type Walked<'s> = Result<Option<&'s [u8]>>;
+/// What a walker's move gives a dup cursor shell: the row it landed on ([`Row`]), which the shell
+/// projects with a [`Pick`]: the value for a value move, the value with the key's tail for a tail
+/// move.
+type Walked<'s> = Result<Option<Row<'s>>>;
+
+/// What a dup cursor's move returns: the logical key and `P`'s projection of the row.
+type Picked<'c, P> = Result<Option<(&'c [u8], <P as Pick>::Out<'c>)>>;
 
 impl DupRoCursor {
     /// Test-only: where the cursor is.
@@ -1850,43 +1857,81 @@ impl DupRoCursor {
         SnapshotRoots { table: table_of(&self.txn, &self.handle), packed_max: self.packed_max }
     }
 
-    /// Run a walker move over the snapshot, latching damage it finds, and pair the value it
-    /// returns with the logical key. `op` takes the walker, the snapshot, the outer root and the
-    /// root source.
+    /// Run a walker move over the snapshot, latching damage it finds, and pair `pick`'s
+    /// projection of the row it lands on with the logical key. `op` takes the walker, the
+    /// snapshot, the outer root and the root source.
     #[inline]
-    fn walked<'c>(
+    fn walked<'c, P: Pick>(
         &'c mut self,
+        pick: P,
         op: impl FnOnce(&mut DupWalk, &'c Snapshot, &TreeRoot, &mut SnapshotRoots<'_>) -> Walked<'c>,
-    ) -> Result<Option<(&'c [u8], &'c [u8])>> {
+    ) -> Picked<'c, P> {
         let Self { txn, outer_root, handle, packed_max, walk } = self;
         let txn: &'c RoTxn = txn;
         let mut roots = SnapshotRoots { table: table_of(txn, handle), packed_max: *packed_max };
-        let value = op(walk, &txn.snapshot, outer_root, &mut roots)
+        let row = op(walk, &txn.snapshot, outer_root, &mut roots)
             .inspect_err(|e| txn.inner.latch.latch_error(e))?;
         let walk: &'c DupWalk = walk;
-        Ok(value.map(|v| (walk.key(), v)))
+        Ok(row.map(|row| (walk.key(), pick.row(walk, row))))
+    }
+
+    /// [`Self::first`] (`forward`) or [`Self::last`], the row given by `pick`.
+    #[inline]
+    fn edge_row<P: Pick>(&mut self, pick: P, forward: bool) -> Picked<'_, P> {
+        self.walked(pick, |w, store, root, roots| w.start(store, root, roots, forward))
+    }
+
+    /// [`Self::next`] (`forward`) or [`Self::prev`], the row given by `pick`.
+    #[inline]
+    fn step_row<P: Pick>(&mut self, pick: P, forward: bool) -> Picked<'_, P> {
+        self.walked(pick, |w, store, root, roots| {
+            w.step(store, root, roots, &again(store), forward)
+        })
     }
 
     /// Move to the first row and return it (`None` for an empty table).
     pub fn first(&mut self) -> Result<Option<(&[u8], &[u8])>> {
-        self.walked(|w, store, root, roots| w.start(store, root, roots, true))
+        self.edge_row(PickValue, true)
+    }
+
+    /// [`Self::first`], the row given as its logical key and its value with the key's last `t`
+    /// bytes ([`KeyTail`]): what [`Self::current_with_key_tail`] gives after the move, taken from
+    /// the move's own read of the leaf, so the row is read once. The other tail moves give their
+    /// rows the same way.
+    pub fn first_with_key_tail(&mut self, t: usize) -> Result<Option<(&[u8], KeyTail<'_>)>> {
+        self.edge_row(PickTail(t), true)
     }
 
     /// Move to the last row and return it (`None` for an empty table).
     pub fn last(&mut self) -> Result<Option<(&[u8], &[u8])>> {
-        self.walked(|w, store, root, roots| w.start(store, root, roots, false))
+        self.edge_row(PickValue, false)
+    }
+
+    /// [`Self::last`], the row given as [`Self::first_with_key_tail`] gives it.
+    pub fn last_with_key_tail(&mut self, t: usize) -> Result<Option<(&[u8], KeyTail<'_>)>> {
+        self.edge_row(PickTail(t), false)
     }
 
     /// Move to the next row and return it; see [`Cursor::next`].
     // A cursor's moves are fallible and go both ways: it is not an `Iterator`.
     #[allow(clippy::should_implement_trait)]
     pub fn next(&mut self) -> Result<Option<(&[u8], &[u8])>> {
-        self.walked(|w, store, root, roots| w.step(store, root, roots, &again(store), true))
+        self.step_row(PickValue, true)
+    }
+
+    /// [`Self::next`], the row given as [`Self::first_with_key_tail`] gives it.
+    pub fn next_with_key_tail(&mut self, t: usize) -> Result<Option<(&[u8], KeyTail<'_>)>> {
+        self.step_row(PickTail(t), true)
     }
 
     /// Move to the previous row and return it; see [`Cursor::prev`].
     pub fn prev(&mut self) -> Result<Option<(&[u8], &[u8])>> {
-        self.walked(|w, store, root, roots| w.step(store, root, roots, &again(store), false))
+        self.step_row(PickValue, false)
+    }
+
+    /// [`Self::prev`], the row given as [`Self::first_with_key_tail`] gives it.
+    pub fn prev_with_key_tail(&mut self, t: usize) -> Result<Option<(&[u8], KeyTail<'_>)>> {
+        self.step_row(PickTail(t), false)
     }
 
     /// The row the cursor is at, if it is at one. The cursor does not move.
@@ -1927,7 +1972,9 @@ impl DupRoCursor {
         if self.walk.state() == State::At {
             self.seek_at_row(key)
         } else {
-            self.walked(|w, store, root, roots| w.seek(store, root, roots, &no_leaf, key))
+            self.walked(PickValue, |w, store, root, roots| {
+                w.seek(store, root, roots, &no_leaf, key)
+            })
         }
     }
 
@@ -1935,20 +1982,40 @@ impl DupRoCursor {
     /// [`RoCursor::seek`]'s seek from an entry is not.
     #[inline(never)]
     fn seek_at_row(&mut self, key: &[u8]) -> Result<Option<(&[u8], &[u8])>> {
-        self.walked(|w, store, root, roots| w.seek(store, root, roots, &again(store), key))
+        self.walked(PickValue, |w, store, root, roots| {
+            w.seek(store, root, roots, &again(store), key)
+        })
     }
 
-    /// [`Self::seek`] followed by [`Self::current_with_key_tail`]: move to the first row whose
-    /// logical key is `>= key` and return it as its key and its value with the key's last `t`
-    /// bytes ([`KeyTail`]); `None` (the cursor after the end) if there is none.
+    /// [`Self::seek`], the row given as [`Self::first_with_key_tail`] gives it: move to the first
+    /// row whose logical key is `>= key` and return it as its key and its value with the key's
+    /// last `t` bytes ([`KeyTail`]); `None` (the cursor after the end) if there is none. One
+    /// move, which starts as [`Self::seek`]'s does.
     #[inline]
     pub fn seek_with_key_tail(
         &mut self,
         key: &[u8],
         t: usize,
     ) -> Result<Option<(&[u8], KeyTail<'_>)>> {
-        self.seek(key)?;
-        self.current_with_key_tail(t)
+        if self.walk.state() == State::At {
+            self.seek_with_key_tail_at_row(key, t)
+        } else {
+            self.walked(PickTail(t), |w, store, root, roots| {
+                w.seek(store, root, roots, &no_leaf, key)
+            })
+        }
+    }
+
+    /// [`Self::seek_with_key_tail`] from a row, never inlined as [`Self::seek_at_row`] is not.
+    #[inline(never)]
+    fn seek_with_key_tail_at_row(
+        &mut self,
+        key: &[u8],
+        t: usize,
+    ) -> Result<Option<(&[u8], KeyTail<'_>)>> {
+        self.walked(PickTail(t), |w, store, root, roots| {
+            w.seek(store, root, roots, &again(store), key)
+        })
     }
 
     /// Move to the row `key` and return its value; `None` (the cursor unset) if there is none. A
@@ -1959,7 +2026,9 @@ impl DupRoCursor {
         let found = if self.walk.state() == State::At {
             self.seek_exact_at_row(key)
         } else {
-            self.walked(|w, store, root, roots| w.seek_exact(store, root, roots, &no_leaf, key))
+            self.walked(PickValue, |w, store, root, roots| {
+                w.seek_exact(store, root, roots, &no_leaf, key)
+            })
         };
         Ok(found?.map(|(_, v)| v))
     }
@@ -1967,7 +2036,9 @@ impl DupRoCursor {
     /// [`Self::seek_exact`] from a row, never inlined as [`Self::seek_at_row`] is not.
     #[inline(never)]
     fn seek_exact_at_row(&mut self, key: &[u8]) -> Result<Option<(&[u8], &[u8])>> {
-        self.walked(|w, store, root, roots| w.seek_exact(store, root, roots, &again(store), key))
+        self.walked(PickValue, |w, store, root, roots| {
+            w.seek_exact(store, root, roots, &again(store), key)
+        })
     }
 
     /// Move to the first row of the outer key `k` and return it; `None` (the cursor unset) if `k`
@@ -1987,19 +2058,24 @@ impl DupRoCursor {
         if self.walk.state() == State::At {
             self.seek_dup_at_row(k, s)
         } else {
-            self.walked(|w, store, root, roots| w.seek_dup(store, root, roots, &no_leaf, k, s))
+            self.walked(PickValue, |w, store, root, roots| {
+                w.seek_dup(store, root, roots, &no_leaf, k, s)
+            })
         }
     }
 
     /// [`Self::seek_dup`] from a row, never inlined as [`Self::seek_at_row`] is not.
     #[inline(never)]
     fn seek_dup_at_row(&mut self, k: &[u8], s: &[u8]) -> Result<Option<(&[u8], &[u8])>> {
-        self.walked(|w, store, root, roots| w.seek_dup(store, root, roots, &again(store), k, s))
+        self.walked(PickValue, |w, store, root, roots| {
+            w.seek_dup(store, root, roots, &again(store), k, s)
+        })
     }
 
-    /// [`Self::seek_dup`] followed by [`Self::current_with_key_tail`]: move to the first row `k ‖
-    /// s'` of `k` with `s' >= s` and return it as its key and its value with the key's last `t`
-    /// bytes ([`KeyTail`]); `None` (the cursor unset) if `k` has none.
+    /// [`Self::seek_dup`], the row given as [`Self::first_with_key_tail`] gives it: move to the
+    /// first row `k ‖ s'` of `k` with `s' >= s` and return it as its key and its value with the
+    /// key's last `t` bytes ([`KeyTail`]); `None` (the cursor unset) if `k` has none. One move,
+    /// which starts as [`Self::seek_dup`]'s does.
     #[inline]
     pub fn seek_dup_with_key_tail(
         &mut self,
@@ -2007,26 +2083,69 @@ impl DupRoCursor {
         s: &[u8],
         t: usize,
     ) -> Result<Option<(&[u8], KeyTail<'_>)>> {
-        self.seek_dup(k, s)?;
-        self.current_with_key_tail(t)
+        if self.walk.state() == State::At {
+            self.seek_dup_with_key_tail_at_row(k, s, t)
+        } else {
+            self.walked(PickTail(t), |w, store, root, roots| {
+                w.seek_dup(store, root, roots, &no_leaf, k, s)
+            })
+        }
+    }
+
+    /// [`Self::seek_dup_with_key_tail`] from a row, never inlined as [`Self::seek_at_row`] is
+    /// not.
+    #[inline(never)]
+    fn seek_dup_with_key_tail_at_row(
+        &mut self,
+        k: &[u8],
+        s: &[u8],
+        t: usize,
+    ) -> Result<Option<(&[u8], KeyTail<'_>)>> {
+        self.walked(PickTail(t), |w, store, root, roots| {
+            w.seek_dup(store, root, roots, &again(store), k, s)
+        })
+    }
+
+    /// [`Self::next_in_prefix`] (`forward`) or [`Self::prev_in_prefix`], the row given by `pick`.
+    #[inline]
+    fn step_in_prefix<P: Pick>(&mut self, pick: P, n: usize, forward: bool) -> Picked<'_, P> {
+        self.walked(pick, |w, store, root, roots| {
+            w.step_in_prefix(store, root, roots, &again(store), n, forward)
+        })
     }
 
     /// Move to the next row only if its logical key shares the first `n` bytes of the current
     /// row's, and return it; else return `None` and stay at the current row. The edge rules are
     /// [`Cursor::next_in_prefix`]'s.
     pub fn next_in_prefix(&mut self, n: usize) -> Result<Option<(&[u8], &[u8])>> {
-        self.walked(|w, store, root, roots| {
-            w.step_in_prefix(store, root, roots, &again(store), n, true)
-        })
+        self.step_in_prefix(PickValue, n, true)
+    }
+
+    /// [`Self::next_in_prefix`], the row given as [`Self::first_with_key_tail`] gives it; `None`
+    /// when the step does not move (the cursor stays at its row).
+    pub fn next_in_prefix_with_key_tail(
+        &mut self,
+        n: usize,
+        t: usize,
+    ) -> Result<Option<(&[u8], KeyTail<'_>)>> {
+        self.step_in_prefix(PickTail(t), n, true)
     }
 
     /// Move to the previous row only if its logical key shares the first `n` bytes of the current
     /// row's, and return it; else return `None` and stay at the current row. The edge rules are
     /// [`Cursor::prev_in_prefix`]'s.
     pub fn prev_in_prefix(&mut self, n: usize) -> Result<Option<(&[u8], &[u8])>> {
-        self.walked(|w, store, root, roots| {
-            w.step_in_prefix(store, root, roots, &again(store), n, false)
-        })
+        self.step_in_prefix(PickValue, n, false)
+    }
+
+    /// [`Self::prev_in_prefix`], the row given as [`Self::first_with_key_tail`] gives it; `None`
+    /// when the step does not move (the cursor stays at its row).
+    pub fn prev_in_prefix_with_key_tail(
+        &mut self,
+        n: usize,
+        t: usize,
+    ) -> Result<Option<(&[u8], KeyTail<'_>)>> {
+        self.step_in_prefix(PickTail(t), n, false)
     }
 }
 
@@ -4127,34 +4246,86 @@ impl DupTxnCursor {
         op(walk, work.writer(), outer_root, &mut roots)
     }
 
-    /// Pair the value a move returned with the logical key of the row it landed on.
+    /// Pair what a call returned of a row with the logical key of the row it landed on.
     #[inline(always)]
-    fn row<'c>(&'c self, value: Option<&'c [u8]>) -> Option<(&'c [u8], &'c [u8])> {
-        value.map(|v| (self.walk.key(), v))
+    fn row<T>(&self, out: Option<T>) -> Option<(&[u8], T)> {
+        out.map(|out| (self.walk.key(), out))
     }
 
-    /// Run a plain move (it leaves the deleted state).
+    /// Run a plain move (it leaves the deleted state), the row given by `pick`.
     #[inline]
-    fn moved<'c>(
+    fn moved<'c, P: Pick>(
         &'c mut self,
         txn: &'c RwTxn,
+        pick: P,
         op: impl FnOnce(&mut DupWalk, &'c Writer, &TreeRoot, &mut WorkRoots<'_>) -> Walked<'c>,
-    ) -> Result<Option<(&'c [u8], &'c [u8])>> {
-        let value = self.call(txn, |c, work| {
+    ) -> Picked<'c, P> {
+        let out = self.call(txn, |c, work| {
             c.deleted = false;
-            c.walk_op(work, op)
+            let row = c.walk_op(work, op)?;
+            Ok(row.map(|row| pick.row(&c.walk, row)))
         })?;
-        Ok(self.row(value))
+        Ok(self.row(out))
+    }
+
+    /// [`Self::first`] (`forward`) or [`Self::last`], the row given by `pick`.
+    #[inline]
+    fn edge_row<'c, P: Pick>(
+        &'c mut self,
+        txn: &'c RwTxn,
+        pick: P,
+        forward: bool,
+    ) -> Picked<'c, P> {
+        self.moved(txn, pick, |w, store, root, roots| w.start(store, root, roots, forward))
     }
 
     /// Move to the first row and return it (`None` for an empty table).
     pub fn first<'c>(&'c mut self, txn: &'c RwTxn) -> Result<Option<(&'c [u8], &'c [u8])>> {
-        self.moved(txn, |w, store, root, roots| w.start(store, root, roots, true))
+        self.edge_row(txn, PickValue, true)
+    }
+
+    /// [`Self::first`], the row given as its logical key and its value with the key's last `t`
+    /// bytes ([`KeyTail`]): what [`Self::current_with_key_tail`] gives after the move, taken from
+    /// the move's own read of the leaf, so the row is read once; see
+    /// [`DupRoCursor::first_with_key_tail`]. The other tail moves give their rows the same way,
+    /// each running its value move's code, staleness and deleted state included.
+    pub fn first_with_key_tail<'c>(
+        &'c mut self,
+        txn: &'c RwTxn,
+        t: usize,
+    ) -> Result<Option<(&'c [u8], KeyTail<'c>)>> {
+        self.edge_row(txn, PickTail(t), true)
     }
 
     /// Move to the last row and return it (`None` for an empty table); see [`TxnCursor::last`].
     pub fn last<'c>(&'c mut self, txn: &'c RwTxn) -> Result<Option<(&'c [u8], &'c [u8])>> {
-        self.moved(txn, |w, store, root, roots| w.start(store, root, roots, false))
+        self.edge_row(txn, PickValue, false)
+    }
+
+    /// [`Self::last`], the row given as [`Self::first_with_key_tail`] gives it.
+    pub fn last_with_key_tail<'c>(
+        &'c mut self,
+        txn: &'c RwTxn,
+        t: usize,
+    ) -> Result<Option<(&'c [u8], KeyTail<'c>)>> {
+        self.edge_row(txn, PickTail(t), false)
+    }
+
+    /// [`Self::next`], the row given by `pick`: in the deleted state the follower, read again
+    /// where the cursor is ([`Pick::current`]), else the step's row.
+    #[inline]
+    fn next_row<'c, P: Pick>(&'c mut self, txn: &'c RwTxn, pick: P) -> Picked<'c, P> {
+        let out = self.call(txn, |c, work| {
+            if std::mem::take(&mut c.deleted) {
+                let store = work.writer();
+                return pick.current(&c.walk, store, &c.roots(work), &checked(store));
+            }
+            let row = c.walk_op(work, |w, store, root, roots| {
+                w.step(store, root, roots, &checked(store), true)
+            })?;
+            Ok(row.map(|row| pick.row(&c.walk, row)))
+        })?;
+        Ok(self.row(out))
     }
 
     /// Move to the next row and return it (after the cursor's row was deleted, by this cursor or
@@ -4162,22 +4333,40 @@ impl DupTxnCursor {
     // A cursor's moves are fallible and go both ways: it is not an `Iterator`.
     #[allow(clippy::should_implement_trait)]
     pub fn next<'c>(&'c mut self, txn: &'c RwTxn) -> Result<Option<(&'c [u8], &'c [u8])>> {
-        let value = self.call(txn, |c, work| {
-            if std::mem::take(&mut c.deleted) {
-                let store = work.writer();
-                return c.walk.current(store, &c.roots(work), &checked(store));
-            }
-            c.walk_op(work, |w, store, root, roots| {
-                w.step(store, root, roots, &checked(store), true)
-            })
-        })?;
-        Ok(self.row(value))
+        self.next_row(txn, PickValue)
+    }
+
+    /// [`Self::next`], the row given as [`Self::first_with_key_tail`] gives it (after the cursor's
+    /// row was deleted: the follower, read again where the cursor is).
+    pub fn next_with_key_tail<'c>(
+        &'c mut self,
+        txn: &'c RwTxn,
+        t: usize,
+    ) -> Result<Option<(&'c [u8], KeyTail<'c>)>> {
+        self.next_row(txn, PickTail(t))
+    }
+
+    /// [`Self::prev`], the row given by `pick`.
+    #[inline]
+    fn prev_row<'c, P: Pick>(&'c mut self, txn: &'c RwTxn, pick: P) -> Picked<'c, P> {
+        self.moved(txn, pick, |w, store, root, roots| {
+            w.step(store, root, roots, &checked(store), false)
+        })
     }
 
     /// Move to the previous row and return it (after the cursor's row was deleted: the row before
     /// the deleted row's follower); see [`TxnCursor::prev`].
     pub fn prev<'c>(&'c mut self, txn: &'c RwTxn) -> Result<Option<(&'c [u8], &'c [u8])>> {
-        self.moved(txn, |w, store, root, roots| w.step(store, root, roots, &checked(store), false))
+        self.prev_row(txn, PickValue)
+    }
+
+    /// [`Self::prev`], the row given as [`Self::first_with_key_tail`] gives it.
+    pub fn prev_with_key_tail<'c>(
+        &'c mut self,
+        txn: &'c RwTxn,
+        t: usize,
+    ) -> Result<Option<(&'c [u8], KeyTail<'c>)>> {
+        self.prev_row(txn, PickTail(t))
     }
 
     /// The row the cursor is at, if it is at one (after its row was deleted: the follower); see
@@ -4206,6 +4395,18 @@ impl DupTxnCursor {
         Ok(tail.map(|tail| (self.walk.key(), tail)))
     }
 
+    /// [`Self::seek`], the row given by `pick`.
+    #[inline]
+    fn seek_row<'c, P: Pick>(&'c mut self, txn: &'c RwTxn, pick: P, key: &[u8]) -> Picked<'c, P> {
+        let out = self.seek_call(txn, |c, work| {
+            let row = c.walk_op(work, |w, store, root, roots| {
+                w.seek(store, root, roots, &checked(store), key)
+            })?;
+            Ok(row.map(|row| pick.row(&c.walk, row)))
+        })?;
+        Ok(self.row(out))
+    }
+
     /// Move to the first row whose logical key is `>= key` (of any length) and return it; `None`
     /// (the cursor after the end) if there is none. While the table is unchanged since the
     /// cursor's last call, the seek starts from the leaves the cursor is at, as
@@ -4215,42 +4416,29 @@ impl DupTxnCursor {
         txn: &'c RwTxn,
         key: &[u8],
     ) -> Result<Option<(&'c [u8], &'c [u8])>> {
-        let value = self.seek_call(txn, |c, work| {
-            c.walk_op(work, |w, store, root, roots| {
-                w.seek(store, root, roots, &checked(store), key)
-            })
-        })?;
-        Ok(self.row(value))
+        self.seek_row(txn, PickValue, key)
     }
 
-    /// [`Self::seek`] followed by [`Self::current_with_key_tail`]; `None` (the cursor after the
-    /// end) if there is no row `>= key`.
+    /// [`Self::seek`], the row given as [`Self::first_with_key_tail`] gives it; `None` (the cursor
+    /// after the end) if there is no row `>= key`. One move, which starts as [`Self::seek`]'s
+    /// does.
     pub fn seek_with_key_tail<'c>(
         &'c mut self,
         txn: &'c RwTxn,
         key: &[u8],
         t: usize,
     ) -> Result<Option<(&'c [u8], KeyTail<'c>)>> {
-        let tail = self.seek_call(txn, |c, work| {
-            let store = work.writer();
-            let found = c.walk_op(work, |w, store, root, roots| {
-                w.seek(store, root, roots, &checked(store), key)
-            })?;
-            if found.is_none() {
-                return Ok(None);
-            }
-            c.walk.current_with_key_tail(store, &c.roots(work), &checked(store), t)
-        })?;
-        Ok(tail.map(|tail| (self.walk.key(), tail)))
+        self.seek_row(txn, PickTail(t), key)
     }
 
     /// Move to the row `key` and return its value; `None` (the cursor unset) if there is none. A
     /// key of at most the key width is no row's. The seek starts as [`Self::seek`]'s does.
     pub fn seek_exact<'c>(&'c mut self, txn: &'c RwTxn, key: &[u8]) -> Result<Option<&'c [u8]>> {
         self.seek_call(txn, |c, work| {
-            c.walk_op(work, |w, store, root, roots| {
+            let row = c.walk_op(work, |w, store, root, roots| {
                 w.seek_exact(store, root, roots, &checked(store), key)
-            })
+            })?;
+            Ok(row.map(|row| c.walk.value_of(row)))
         })
     }
 
@@ -4265,6 +4453,25 @@ impl DupTxnCursor {
         self.seek_dup(txn, k, &[])
     }
 
+    /// [`Self::seek_dup`], the row given by `pick`.
+    #[inline]
+    fn seek_dup_row<'c, P: Pick>(
+        &'c mut self,
+        txn: &'c RwTxn,
+        pick: P,
+        k: &[u8],
+        s: &[u8],
+    ) -> Picked<'c, P> {
+        self.walk.check_key(k)?;
+        let out = self.seek_call(txn, |c, work| {
+            let row = c.walk_op(work, |w, store, root, roots| {
+                w.seek_dup(store, root, roots, &checked(store), k, s)
+            })?;
+            Ok(row.map(|row| pick.row(&c.walk, row)))
+        })?;
+        Ok(self.row(out))
+    }
+
     /// Move to the first row `k ‖ s'` of the outer key `k` with `s' >= s` and return it; `None`
     /// (the cursor unset) if `k` has none, never a row of the next key; see
     /// [`DupRoCursor::seek_dup`] and [`Self::seek_key`]'s refusals.
@@ -4274,17 +4481,11 @@ impl DupTxnCursor {
         k: &[u8],
         s: &[u8],
     ) -> Result<Option<(&'c [u8], &'c [u8])>> {
-        self.walk.check_key(k)?;
-        let value = self.seek_call(txn, |c, work| {
-            c.walk_op(work, |w, store, root, roots| {
-                w.seek_dup(store, root, roots, &checked(store), k, s)
-            })
-        })?;
-        Ok(self.row(value))
+        self.seek_dup_row(txn, PickValue, k, s)
     }
 
-    /// [`Self::seek_dup`] followed by [`Self::current_with_key_tail`]; `None` (the cursor unset)
-    /// if `k` has no such row.
+    /// [`Self::seek_dup`], the row given as [`Self::first_with_key_tail`] gives it; `None` (the
+    /// cursor unset) if `k` has no such row. One move, which starts as [`Self::seek_dup`]'s does.
     pub fn seek_dup_with_key_tail<'c>(
         &'c mut self,
         txn: &'c RwTxn,
@@ -4292,18 +4493,7 @@ impl DupTxnCursor {
         s: &[u8],
         t: usize,
     ) -> Result<Option<(&'c [u8], KeyTail<'c>)>> {
-        self.walk.check_key(k)?;
-        let tail = self.seek_call(txn, |c, work| {
-            let store = work.writer();
-            let found = c.walk_op(work, |w, store, root, roots| {
-                w.seek_dup(store, root, roots, &checked(store), k, s)
-            })?;
-            if found.is_none() {
-                return Ok(None);
-            }
-            c.walk.current_with_key_tail(store, &c.roots(work), &checked(store), t)
-        })?;
-        Ok(tail.map(|tail| (self.walk.key(), tail)))
+        self.seek_dup_row(txn, PickTail(t), k, s)
     }
 
     /// Move to the next row only if its logical key shares the first `n` bytes of the current
@@ -4314,7 +4504,18 @@ impl DupTxnCursor {
         txn: &'c RwTxn,
         n: usize,
     ) -> Result<Option<(&'c [u8], &'c [u8])>> {
-        self.step_in_prefix(txn, n, true)
+        self.step_in_prefix(txn, PickValue, n, true)
+    }
+
+    /// [`Self::next_in_prefix`], the row given as [`Self::first_with_key_tail`] gives it; `None`
+    /// when the step does not move (the cursor stays).
+    pub fn next_in_prefix_with_key_tail<'c>(
+        &'c mut self,
+        txn: &'c RwTxn,
+        n: usize,
+        t: usize,
+    ) -> Result<Option<(&'c [u8], KeyTail<'c>)>> {
+        self.step_in_prefix(txn, PickTail(t), n, true)
     }
 
     /// Move to the previous row only if its logical key shares the first `n` bytes of the current
@@ -4326,38 +4527,52 @@ impl DupTxnCursor {
         txn: &'c RwTxn,
         n: usize,
     ) -> Result<Option<(&'c [u8], &'c [u8])>> {
-        self.step_in_prefix(txn, n, false)
+        self.step_in_prefix(txn, PickValue, n, false)
     }
 
-    /// [`Self::next_in_prefix`] (`forward`) or [`Self::prev_in_prefix`].
-    fn step_in_prefix<'c>(
+    /// [`Self::prev_in_prefix`], the row given as [`Self::first_with_key_tail`] gives it; `None`
+    /// when the step does not move (the cursor stays).
+    pub fn prev_in_prefix_with_key_tail<'c>(
         &'c mut self,
         txn: &'c RwTxn,
         n: usize,
+        t: usize,
+    ) -> Result<Option<(&'c [u8], KeyTail<'c>)>> {
+        self.step_in_prefix(txn, PickTail(t), n, false)
+    }
+
+    /// [`Self::next_in_prefix`] (`forward`) or [`Self::prev_in_prefix`], the row given by `pick`.
+    fn step_in_prefix<'c, P: Pick>(
+        &'c mut self,
+        txn: &'c RwTxn,
+        pick: P,
+        n: usize,
         forward: bool,
-    ) -> Result<Option<(&'c [u8], &'c [u8])>> {
-        let value = self.call(txn, |c, work| {
+    ) -> Picked<'c, P> {
+        let out = self.call(txn, |c, work| {
             let Self { track, outer_root, walk, packed_max, deleted, deleted_key, target, .. } = c;
             let store = work.writer();
             let again = checked(store);
             let mut roots = WorkRoots::new(work, track, *packed_max);
             if !*deleted {
-                return walk.step_in_prefix(store, outer_root, &mut roots, &again, n, forward);
+                let row = walk.step_in_prefix(store, outer_root, &mut roots, &again, n, forward)?;
+                return Ok(row.map(|row| pick.row(walk, row)));
             }
             let Some(prefix) = deleted_key.get(..n) else { return Ok(None) };
             // The position is the deleted row's follower (or after the end).
             let landed = if forward {
-                walk.current(store, &roots, &again)
-                    .map(|v| v.filter(|_| walk.key().starts_with(prefix)))
+                pick.current(walk, store, &roots, &again)
+                    .map(|out| out.filter(|_| walk.key().starts_with(prefix)))
             } else {
                 walk.step_if(store, outer_root, &mut roots, &again, prefix, false, target)
+                    .map(|row| row.map(|row| pick.row(walk, row)))
             };
             if matches!(landed, Ok(Some(_)) | Err(_)) {
                 *deleted = false;
             }
             landed
         })?;
-        Ok(self.row(value))
+        Ok(self.row(out))
     }
 
     /// Store `value` under the logical `key` (as [`RwTxn::put`] does) and move to that row. A

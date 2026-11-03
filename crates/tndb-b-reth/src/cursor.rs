@@ -18,11 +18,16 @@
 //! On a dup-sort table (an engine dup table or composite keys, see [`crate::dup`]) a row's value
 //! (subkey, then the rest) is read as one slice of the page, since a leaf cell holds its value
 //! right after its key: no copy, unless the value is in an overflow run, whose rest is joined to
-//! the subkey in a buffer of the cursor's. A move reads its row again once the move is done,
-//! through the engine's `current_with_key_tail`; `seek_exact`, `seek_by_key_subkey`, and a
-//! `walk_dup` started from a key or a subkey, read it in the seek itself, from the leaf the seek
-//! fetched ([`Moves::seek_dup_with_key_tail`]). The dup
-//! moves are the engine's prefix steps over the key's width: `next_dup` and `prev_dup` stay within
+//! the subkey in a buffer of the cursor's. A move reads the row it lands on in the move itself,
+//! by its tail form ([`Moves::first_with_key_tail`] and the others, chosen by [`PickTail`]): on an
+//! engine dup table the engine's own tail move, one call that reads the row from the leaf the
+//! move fetched; on composite keys the plain engine cursor's move, then its
+//! `current_with_key_tail`. `current` is `current_with_key_tail`; `seek_exact`,
+//! `seek_by_key_subkey`, and a `walk_dup` started from a key or a subkey, read the row in the seek
+//! itself ([`Moves::seek_dup_with_key_tail`]). The moves on the way, whose rows are not returned
+//! (the read of the key a seek past its rows starts from, that seek before a step back, the probe
+//! step of `next_no_dup` and `last_dup`), stay plain ones. The dup moves are the engine's prefix
+//! steps over the key's width: `next_dup` and `prev_dup` stay within
 //! the current key's rows, from a fresh cursor `next_dup`, `next_no_dup` and `next_dup_val` go to
 //! the first row and `prev_dup` to the last, as MDBX's do. Where MDBX's cursor ends a key's rows,
 //! the cursor does too (its `Pos::DupEnd` state): after `last`, and after a delete of a key's last
@@ -82,8 +87,28 @@ trait Moves {
     fn seek(&mut self, key: &[u8]) -> tndb_b::Result<Option<Entry<'_>>>;
     fn seek_exact(&mut self, key: &[u8]) -> tndb_b::Result<Option<&[u8]>>;
     fn next_in_prefix(&mut self, n: usize) -> tndb_b::Result<Option<Entry<'_>>>;
-    fn prev_in_prefix(&mut self, n: usize) -> tndb_b::Result<Option<Entry<'_>>>;
     fn current_with_key_tail(&mut self, t: usize) -> tndb_b::Result<Option<Tailed<'_>>>;
+    /// The tail forms of the moves: the move, and the row it lands on with its value joined to
+    /// the stored key's last `t` bytes ([`KeyTail`]), as `current_with_key_tail(t)` would read it
+    /// right after. On a dup engine cursor this is the engine's own tail move, the row read from
+    /// the move's leaf access (one engine call); on a plain one the move, then
+    /// `current_with_key_tail(t)` once the move landed on a row. A prefix step that does not move
+    /// is `None`, as the plain one is.
+    fn first_with_key_tail(&mut self, t: usize) -> tndb_b::Result<Option<Tailed<'_>>>;
+    fn last_with_key_tail(&mut self, t: usize) -> tndb_b::Result<Option<Tailed<'_>>>;
+    fn next_with_key_tail(&mut self, t: usize) -> tndb_b::Result<Option<Tailed<'_>>>;
+    fn prev_with_key_tail(&mut self, t: usize) -> tndb_b::Result<Option<Tailed<'_>>>;
+    fn seek_with_key_tail(&mut self, key: &[u8], t: usize) -> tndb_b::Result<Option<Tailed<'_>>>;
+    fn next_in_prefix_with_key_tail(
+        &mut self,
+        n: usize,
+        t: usize,
+    ) -> tndb_b::Result<Option<Tailed<'_>>>;
+    fn prev_in_prefix_with_key_tail(
+        &mut self,
+        n: usize,
+        t: usize,
+    ) -> tndb_b::Result<Option<Tailed<'_>>>;
     /// The first row of `key` whose subkey is at or after `subkey`, with its value joined to the
     /// stored key's last `t` bytes, from the seek's own leaf access; never a row of another key on
     /// a dup cursor. `key` is the table's key width (the caller checks). On a plain engine cursor
@@ -128,6 +153,24 @@ macro_rules! on_cursor {
         match $cursor {
             $kind::Flat($c) => $call,
             $kind::Dup($c) => $call,
+        }
+    };
+}
+
+/// A tail move ([`Moves::first_with_key_tail`] and the others) on the engine cursor `$c` of the
+/// [`ReadCursor`] or [`WriteCursor`] `$cursor` (named by its type, `$kind`): on a dup one its own
+/// tail move `$tail`; on a plain one the move `$plain`, then `current_with_key_tail($at)` once the
+/// move landed on a row.
+macro_rules! tail_move {
+    ($kind:ident, $cursor:expr, $c:ident => $plain:expr, $tail:expr, current($($at:expr),+)) => {
+        match $cursor {
+            $kind::Flat($c) => {
+                if $plain?.is_none() {
+                    return Ok(None);
+                }
+                $c.current_with_key_tail($($at),+)
+            }
+            $kind::Dup($c) => $tail,
         }
     };
 }
@@ -241,11 +284,43 @@ impl Moves for ReadCursor {
     fn next_in_prefix(&mut self, n: usize) -> tndb_b::Result<Option<Entry<'_>>> {
         on_cursor!(ReadCursor, self, c => c.next_in_prefix(n))
     }
-    fn prev_in_prefix(&mut self, n: usize) -> tndb_b::Result<Option<Entry<'_>>> {
-        on_cursor!(ReadCursor, self, c => c.prev_in_prefix(n))
-    }
     fn current_with_key_tail(&mut self, t: usize) -> tndb_b::Result<Option<Tailed<'_>>> {
         on_cursor!(ReadCursor, self, c => c.current_with_key_tail(t))
+    }
+    fn first_with_key_tail(&mut self, t: usize) -> tndb_b::Result<Option<Tailed<'_>>> {
+        tail_move!(ReadCursor, self, c => c.first(), c.first_with_key_tail(t), current(t))
+    }
+    fn last_with_key_tail(&mut self, t: usize) -> tndb_b::Result<Option<Tailed<'_>>> {
+        tail_move!(ReadCursor, self, c => c.last(), c.last_with_key_tail(t), current(t))
+    }
+    fn next_with_key_tail(&mut self, t: usize) -> tndb_b::Result<Option<Tailed<'_>>> {
+        tail_move!(ReadCursor, self, c => c.next(), c.next_with_key_tail(t), current(t))
+    }
+    fn prev_with_key_tail(&mut self, t: usize) -> tndb_b::Result<Option<Tailed<'_>>> {
+        tail_move!(ReadCursor, self, c => c.prev(), c.prev_with_key_tail(t), current(t))
+    }
+    fn seek_with_key_tail(&mut self, key: &[u8], t: usize) -> tndb_b::Result<Option<Tailed<'_>>> {
+        tail_move!(ReadCursor, self, c => c.seek(key), c.seek_with_key_tail(key, t), current(t))
+    }
+    fn next_in_prefix_with_key_tail(
+        &mut self,
+        n: usize,
+        t: usize,
+    ) -> tndb_b::Result<Option<Tailed<'_>>> {
+        tail_move!(
+            ReadCursor, self,
+            c => c.next_in_prefix(n), c.next_in_prefix_with_key_tail(n, t), current(t)
+        )
+    }
+    fn prev_in_prefix_with_key_tail(
+        &mut self,
+        n: usize,
+        t: usize,
+    ) -> tndb_b::Result<Option<Tailed<'_>>> {
+        tail_move!(
+            ReadCursor, self,
+            c => c.prev_in_prefix(n), c.prev_in_prefix_with_key_tail(n, t), current(t)
+        )
     }
     fn seek_dup_with_key_tail(
         &mut self,
@@ -349,6 +424,80 @@ impl WriteCursor {
     ) -> tndb_b::Result<Option<Tailed<'c>>> {
         on_cursor!(WriteCursor, self, c => c.current_with_key_tail(txn, t))
     }
+    /// The tail moves: see [`Moves::first_with_key_tail`].
+    fn first_with_key_tail<'c>(
+        &'c mut self,
+        txn: &'c RwTxn,
+        t: usize,
+    ) -> tndb_b::Result<Option<Tailed<'c>>> {
+        tail_move!(
+            WriteCursor, self,
+            c => c.first(txn), c.first_with_key_tail(txn, t), current(txn, t)
+        )
+    }
+    fn last_with_key_tail<'c>(
+        &'c mut self,
+        txn: &'c RwTxn,
+        t: usize,
+    ) -> tndb_b::Result<Option<Tailed<'c>>> {
+        tail_move!(
+            WriteCursor, self,
+            c => c.last(txn), c.last_with_key_tail(txn, t), current(txn, t)
+        )
+    }
+    fn next_with_key_tail<'c>(
+        &'c mut self,
+        txn: &'c RwTxn,
+        t: usize,
+    ) -> tndb_b::Result<Option<Tailed<'c>>> {
+        tail_move!(
+            WriteCursor, self,
+            c => c.next(txn), c.next_with_key_tail(txn, t), current(txn, t)
+        )
+    }
+    fn prev_with_key_tail<'c>(
+        &'c mut self,
+        txn: &'c RwTxn,
+        t: usize,
+    ) -> tndb_b::Result<Option<Tailed<'c>>> {
+        tail_move!(
+            WriteCursor, self,
+            c => c.prev(txn), c.prev_with_key_tail(txn, t), current(txn, t)
+        )
+    }
+    fn seek_with_key_tail<'c>(
+        &'c mut self,
+        txn: &'c RwTxn,
+        key: &[u8],
+        t: usize,
+    ) -> tndb_b::Result<Option<Tailed<'c>>> {
+        tail_move!(
+            WriteCursor, self,
+            c => c.seek(txn, key), c.seek_with_key_tail(txn, key, t), current(txn, t)
+        )
+    }
+    fn next_in_prefix_with_key_tail<'c>(
+        &'c mut self,
+        txn: &'c RwTxn,
+        n: usize,
+        t: usize,
+    ) -> tndb_b::Result<Option<Tailed<'c>>> {
+        tail_move!(
+            WriteCursor, self, c => c.next_in_prefix(txn, n),
+            c.next_in_prefix_with_key_tail(txn, n, t), current(txn, t)
+        )
+    }
+    fn prev_in_prefix_with_key_tail<'c>(
+        &'c mut self,
+        txn: &'c RwTxn,
+        n: usize,
+        t: usize,
+    ) -> tndb_b::Result<Option<Tailed<'c>>> {
+        tail_move!(
+            WriteCursor, self, c => c.prev_in_prefix(txn, n),
+            c.prev_in_prefix_with_key_tail(txn, n, t), current(txn, t)
+        )
+    }
     /// See [`Moves::seek_dup_with_key_tail`].
     fn seek_dup_with_key_tail<'c>(
         &'c mut self,
@@ -415,11 +564,37 @@ impl Moves for Locked<'_, '_> {
     fn next_in_prefix(&mut self, n: usize) -> tndb_b::Result<Option<Entry<'_>>> {
         self.cursor.next_in_prefix(self.txn, n)
     }
-    fn prev_in_prefix(&mut self, n: usize) -> tndb_b::Result<Option<Entry<'_>>> {
-        self.cursor.prev_in_prefix(self.txn, n)
-    }
     fn current_with_key_tail(&mut self, t: usize) -> tndb_b::Result<Option<Tailed<'_>>> {
         self.cursor.current_with_key_tail(self.txn, t)
+    }
+    fn first_with_key_tail(&mut self, t: usize) -> tndb_b::Result<Option<Tailed<'_>>> {
+        self.cursor.first_with_key_tail(self.txn, t)
+    }
+    fn last_with_key_tail(&mut self, t: usize) -> tndb_b::Result<Option<Tailed<'_>>> {
+        self.cursor.last_with_key_tail(self.txn, t)
+    }
+    fn next_with_key_tail(&mut self, t: usize) -> tndb_b::Result<Option<Tailed<'_>>> {
+        self.cursor.next_with_key_tail(self.txn, t)
+    }
+    fn prev_with_key_tail(&mut self, t: usize) -> tndb_b::Result<Option<Tailed<'_>>> {
+        self.cursor.prev_with_key_tail(self.txn, t)
+    }
+    fn seek_with_key_tail(&mut self, key: &[u8], t: usize) -> tndb_b::Result<Option<Tailed<'_>>> {
+        self.cursor.seek_with_key_tail(self.txn, key, t)
+    }
+    fn next_in_prefix_with_key_tail(
+        &mut self,
+        n: usize,
+        t: usize,
+    ) -> tndb_b::Result<Option<Tailed<'_>>> {
+        self.cursor.next_in_prefix_with_key_tail(self.txn, n, t)
+    }
+    fn prev_in_prefix_with_key_tail(
+        &mut self,
+        n: usize,
+        t: usize,
+    ) -> tndb_b::Result<Option<Tailed<'_>>> {
+        self.cursor.prev_in_prefix_with_key_tail(self.txn, n, t)
     }
     fn seek_dup_with_key_tail(
         &mut self,
@@ -501,17 +676,104 @@ const _: () = {
     }
 };
 
-/// The row of table `T` that a move of the engine cursor `$m` landed on, `$entry` (its stored
-/// form, which borrows `$m`), decoded: from the entry on a table without duplicates ([`plain`]);
-/// on a dup-sort table read again from `$m` ([`Rows::dup_pair`]) once the entry, so the borrow,
-/// is done with.
+/// How the moves [`Rows`] makes on both kinds of table give the row they land on: as its stored
+/// entry ([`PickEntry`], a table without duplicates), or with its value joined to the stored
+/// key's last `t` bytes by the move itself ([`PickTail`], a dup-sort table, `t` the subkey's
+/// width: [`Rows::dup_row`]). Such a move is written once, over a pick ([`pair!`]).
+trait Pick: Copy {
+    /// A row's value as the pick gives it.
+    type Value<'a>;
+    fn first<'m>(self, m: &'m mut impl Moves) -> Picked<'m, Self>;
+    fn last<'m>(self, m: &'m mut impl Moves) -> Picked<'m, Self>;
+    fn next<'m>(self, m: &'m mut impl Moves) -> Picked<'m, Self>;
+    fn prev<'m>(self, m: &'m mut impl Moves) -> Picked<'m, Self>;
+    fn current<'m>(self, m: &'m mut impl Moves) -> Picked<'m, Self>;
+    fn seek<'m>(self, m: &'m mut impl Moves, key: &[u8]) -> Picked<'m, Self>;
+}
+
+/// The row a [`Pick`]'s move landed on, if any: its stored key and its value as `P` gives it.
+type Picked<'m, P> = tndb_b::Result<Option<(&'m [u8], <P as Pick>::Value<'m>)>>;
+
+/// The plain moves: a row as its stored entry.
+#[derive(Clone, Copy)]
+struct PickEntry;
+
+/// The tail moves of `t` bytes: a row with its value joined to the stored key's last `t` bytes.
+#[derive(Clone, Copy)]
+struct PickTail(usize);
+
+impl Pick for PickEntry {
+    type Value<'a> = &'a [u8];
+    #[inline(always)]
+    fn first<'m>(self, m: &'m mut impl Moves) -> tndb_b::Result<Option<Entry<'m>>> {
+        m.first()
+    }
+    #[inline(always)]
+    fn last<'m>(self, m: &'m mut impl Moves) -> tndb_b::Result<Option<Entry<'m>>> {
+        m.last()
+    }
+    #[inline(always)]
+    fn next<'m>(self, m: &'m mut impl Moves) -> tndb_b::Result<Option<Entry<'m>>> {
+        m.next()
+    }
+    #[inline(always)]
+    fn prev<'m>(self, m: &'m mut impl Moves) -> tndb_b::Result<Option<Entry<'m>>> {
+        m.prev()
+    }
+    #[inline(always)]
+    fn current<'m>(self, m: &'m mut impl Moves) -> tndb_b::Result<Option<Entry<'m>>> {
+        m.current()
+    }
+    #[inline(always)]
+    fn seek<'m>(self, m: &'m mut impl Moves, key: &[u8]) -> tndb_b::Result<Option<Entry<'m>>> {
+        m.seek(key)
+    }
+}
+
+impl Pick for PickTail {
+    type Value<'a> = KeyTail<'a>;
+    #[inline(always)]
+    fn first<'m>(self, m: &'m mut impl Moves) -> tndb_b::Result<Option<Tailed<'m>>> {
+        m.first_with_key_tail(self.0)
+    }
+    #[inline(always)]
+    fn last<'m>(self, m: &'m mut impl Moves) -> tndb_b::Result<Option<Tailed<'m>>> {
+        m.last_with_key_tail(self.0)
+    }
+    #[inline(always)]
+    fn next<'m>(self, m: &'m mut impl Moves) -> tndb_b::Result<Option<Tailed<'m>>> {
+        m.next_with_key_tail(self.0)
+    }
+    #[inline(always)]
+    fn prev<'m>(self, m: &'m mut impl Moves) -> tndb_b::Result<Option<Tailed<'m>>> {
+        m.prev_with_key_tail(self.0)
+    }
+    #[inline(always)]
+    fn current<'m>(self, m: &'m mut impl Moves) -> tndb_b::Result<Option<Tailed<'m>>> {
+        m.current_with_key_tail(self.0)
+    }
+    #[inline(always)]
+    fn seek<'m>(self, m: &'m mut impl Moves, key: &[u8]) -> tndb_b::Result<Option<Tailed<'m>>> {
+        m.seek_with_key_tail(key, self.0)
+    }
+}
+
+/// The row of table `T` that the move `$moved` lands on, decoded. `$moved` is written once over
+/// the [`Pick`] `$pick` and gives the row it landed on (borrowing the engine cursor), if any: on a
+/// table without duplicates it runs with [`PickEntry`] and the row is the entry ([`plain`]); on a
+/// dup-sort table with [`PickTail`] of the subkey's width, so the move itself reads the row's
+/// whole value ([`Rows::dup_pair`]).
 macro_rules! pair {
-    ($rows:ident, $m:ident, $entry:ident) => {
+    ($rows:ident, $pick:ident => $moved:expr) => {
         match $rows.dup {
-            None => plain::<T>($entry),
+            None => {
+                let $pick = PickEntry;
+                plain::<T>($moved)
+            }
             Some(dup) => {
-                let found = $entry.is_some();
-                $rows.dup_pair::<T>($m, dup, found)
+                let $pick = PickTail(dup.subkey);
+                let row = $moved;
+                $rows.dup_pair::<T>(dup, row)
             }
         }
     };
@@ -565,59 +827,46 @@ impl Rows {
         self.dup.ok_or_else(|| error::dup_sort_unsupported(T::NAME))
     }
 
-    /// The row of the dup-sort table the engine cursor `m` is at, if a move just `found` it, as
-    /// its stored key and its full value: the stored key's subkey and the stored value read as one
-    /// slice of the page, or for a value in an overflow run joined in the cursor's buffer
-    /// ([`DupLayout::joined`]).
+    /// The row of the dup-sort table a move landed on, `row` as the move's tail form gave it
+    /// ([`PickTail`] of the subkey's width: the engine call that moved), as its stored key and its
+    /// full value: the stored key's subkey and the stored value read as one slice of the page, or
+    /// for a value in an overflow run joined in the cursor's buffer ([`DupLayout::joined`]).
     #[inline(always)]
     fn dup_row<'a>(
         &'a mut self,
-        m: &'a mut impl Moves,
         dup: DupLayout,
-        found: bool,
+        row: Option<Tailed<'a>>,
     ) -> Result<Option<Entry<'a>>, DatabaseError> {
-        if !found {
-            return Ok(None);
-        }
-        let Some((key, tail)) = m.current_with_key_tail(dup.subkey).map_err(error::read)? else {
-            return Ok(None);
-        };
+        let Some((key, tail)) = row else { return Ok(None) };
         let value = dup.joined(key, tail, &mut self.value).ok_or(DatabaseError::Decode)?;
         Ok(Some((key, value)))
     }
 
-    /// The row of dup-sort table `T` the engine cursor `m` is at, if a move just `found` it
-    /// ([`Rows::dup_row`]).
-    fn dup_pair<T: Table>(
-        &mut self,
-        m: &mut impl Moves,
-        dup: DupLayout,
-        found: bool,
-    ) -> PairResult<T> {
-        dup_decoded::<T>(dup, self.dup_row(m, dup, found)?)
+    /// The row of dup-sort table `T` a move landed on, `row` ([`Rows::dup_row`]).
+    fn dup_pair<T: Table>(&mut self, dup: DupLayout, row: Option<Tailed<'_>>) -> PairResult<T> {
+        dup_decoded::<T>(dup, self.dup_row(dup, row)?)
     }
 
-    /// The value of the row of dup-sort table `T` the engine cursor `m` is at, if a move just
-    /// `found` it ([`Rows::dup_row`]).
+    /// The value of the row of dup-sort table `T` a move landed on, `row` ([`Rows::dup_row`]).
     fn dup_value<T: Table>(
         &mut self,
-        m: &mut impl Moves,
         dup: DupLayout,
-        found: bool,
+        row: Option<Tailed<'_>>,
     ) -> ValueOnlyResult<T> {
-        dup_value_of::<T>(self.dup_row(m, dup, found)?)
+        dup_value_of::<T>(self.dup_row(dup, row)?)
     }
 
     fn first<T: Table>(&mut self, m: &mut impl Moves) -> PairResult<T> {
         self.pos = Pos::Engine;
-        let entry = m.first().map_err(error::read)?;
-        pair!(self, m, entry)
+        pair!(self, pick => pick.first(m).map_err(error::read)?)
     }
 
     fn last<T: Table>(&mut self, m: &mut impl Moves) -> PairResult<T> {
-        let entry = m.last().map_err(error::read)?;
-        self.pos = self.ended(entry.map(|(key, _)| key));
-        pair!(self, m, entry)
+        pair!(self, pick => {
+            let row = pick.last(m).map_err(error::read)?;
+            self.pos = self.ended(row.as_ref().map(|&(key, _)| key));
+            row
+        })
     }
 
     /// The position after a move that took the table's last row as MDBX's `last` does, the row
@@ -635,16 +884,15 @@ impl Rows {
         }
     }
 
-    /// Whether `entry`, the engine cursor's current row as a [`Pos::End`] cursor's call found it,
+    /// Whether `row`, the engine cursor's current row as a [`Pos::End`] cursor's call found it,
     /// is still the row the cursor ends the table at: else another writer deleted it.
-    fn on_end_row(&self, entry: Option<Entry<'_>>) -> bool {
-        entry.is_some_and(|(key, _)| key == self.end_key)
+    fn on_end_row<V>(&self, row: &Option<(&[u8], V)>) -> bool {
+        row.as_ref().is_some_and(|&(key, _)| key == self.end_key)
     }
 
     fn seek<T: Table>(&mut self, m: &mut impl Moves, key: &[u8]) -> PairResult<T> {
         self.pos = Pos::Engine;
-        let entry = m.seek(key).map_err(error::read)?;
-        pair!(self, m, entry)
+        pair!(self, pick => pick.seek(m, key).map_err(error::read)?)
     }
 
     /// The row `key` (on a dup-sort table, its first: [`Rows::seek_by_key_subkey_row`] with an
@@ -660,56 +908,62 @@ impl Rows {
     }
 
     fn next<T: Table>(&mut self, m: &mut impl Moves) -> PairResult<T> {
-        let entry = match std::mem::replace(&mut self.pos, Pos::Engine) {
-            Pos::Missed => {
-                self.pos = Pos::Missed;
-                return Ok(None);
-            }
-            Pos::DupEnd { .. } => past_dup_end(m, self.layout::<T>()?, false),
-            // Nothing, the cursor staying on the row; once another writer has deleted it, the
-            // follower, which `current` returns as `next` would.
-            Pos::End => {
-                let entry = m.current().map_err(error::read)?;
-                if self.on_end_row(entry) {
-                    self.pos = Pos::End;
+        pair!(self, pick => {
+            let row = match std::mem::replace(&mut self.pos, Pos::Engine) {
+                Pos::Missed => {
+                    self.pos = Pos::Missed;
                     return Ok(None);
                 }
-                Ok(entry)
-            }
-            Pos::Fresh | Pos::Engine | Pos::KeyDeleted => m.next(),
-        };
-        let entry = entry.map_err(error::read)?;
-        pair!(self, m, entry)
+                Pos::DupEnd { .. } => past_dup_end(pick, m, self.layout::<T>()?, false),
+                // Nothing, the cursor staying on the row; once another writer has deleted it,
+                // the follower, which `current` returns as `next` would.
+                Pos::End => {
+                    let row = pick.current(m).map_err(error::read)?;
+                    if self.on_end_row(&row) {
+                        self.pos = Pos::End;
+                        return Ok(None);
+                    }
+                    Ok(row)
+                }
+                Pos::Fresh | Pos::Engine | Pos::KeyDeleted => pick.next(m),
+            };
+            row.map_err(error::read)?
+        })
     }
 
     fn prev<T: Table>(&mut self, m: &mut impl Moves) -> PairResult<T> {
-        let entry = match std::mem::replace(&mut self.pos, Pos::Engine) {
-            Pos::Missed => {
-                self.pos = Pos::Missed;
-                return Ok(None);
-            }
-            Pos::DupEnd { soft: false } => past_dup_end(m, self.layout::<T>()?, true),
-            // From a fresh cursor the last row, which MDBX takes by its `last`.
-            Pos::Fresh => {
-                let entry = m.prev();
-                self.pos = self.ended(landed(&entry));
-                entry
-            }
-            Pos::DupEnd { soft: true } | Pos::Engine | Pos::End | Pos::KeyDeleted => m.prev(),
-        };
-        let entry = entry.map_err(error::read)?;
-        pair!(self, m, entry)
+        pair!(self, pick => {
+            let row = match std::mem::replace(&mut self.pos, Pos::Engine) {
+                Pos::Missed => {
+                    self.pos = Pos::Missed;
+                    return Ok(None);
+                }
+                Pos::DupEnd { soft: false } => past_dup_end(pick, m, self.layout::<T>()?, true),
+                // From a fresh cursor the last row, which MDBX takes by its `last`.
+                Pos::Fresh => {
+                    let row = pick.prev(m);
+                    self.pos = self.ended(landed(&row));
+                    row
+                }
+                Pos::DupEnd { soft: true } | Pos::Engine | Pos::End | Pos::KeyDeleted => {
+                    pick.prev(m)
+                }
+            };
+            row.map_err(error::read)?
+        })
     }
 
     fn current<T: Table>(&mut self, m: &mut impl Moves) -> PairResult<T> {
         if self.pos == Pos::Missed {
             return Ok(None);
         }
-        let entry = m.current().map_err(error::read)?;
-        if self.pos == Pos::End && !self.on_end_row(entry) {
-            self.pos = Pos::Engine;
-        }
-        pair!(self, m, entry)
+        pair!(self, pick => {
+            let row = pick.current(m).map_err(error::read)?;
+            if self.pos == Pos::End && !self.on_end_row(&row) {
+                self.pos = Pos::Engine;
+            }
+            row
+        })
     }
 
     /// Move to the first row of `key` whose subkey is at or after `subkey` (MDBX's
@@ -733,80 +987,80 @@ impl Rows {
             .map_err(error::read)?
             .filter(|&(stored, _)| dup.is_row_of(stored, key));
         self.pos = if row.is_some() { Pos::Engine } else { Pos::Missed };
-        let Some((stored, tail)) = row else { return Ok(None) };
-        let value = dup.joined(stored, tail, &mut self.value).ok_or(DatabaseError::Decode)?;
-        Ok(Some((stored, value)))
+        self.dup_row(dup, row)
     }
 
-    /// The next row of the current key.
+    /// The next row of the current key, from its move's tail form ([`Rows::dup_row`]).
     fn next_dup_row<'m>(
         &mut self,
         m: &'m mut impl Moves,
         dup: DupLayout,
-    ) -> tndb_b::Result<Option<Entry<'m>>> {
+    ) -> tndb_b::Result<Option<Tailed<'m>>> {
         match self.pos {
             Pos::Fresh => {
                 self.pos = Pos::Engine;
-                m.first()
+                m.first_with_key_tail(dup.subkey)
             }
             Pos::Missed => Ok(None),
             Pos::DupEnd { .. } => {
                 self.pos = Pos::DupEnd { soft: true };
                 Ok(None)
             }
-            Pos::Engine | Pos::End => m.next_in_prefix(dup.key),
+            Pos::Engine | Pos::End => m.next_in_prefix_with_key_tail(dup.key, dup.subkey),
             Pos::KeyDeleted => {
-                let entry = m.next_in_prefix(dup.key);
-                if matches!(entry, Ok(Some(_))) {
+                let row = m.next_in_prefix_with_key_tail(dup.key, dup.subkey);
+                if matches!(row, Ok(Some(_))) {
                     self.pos = Pos::Engine;
                 }
-                entry
+                row
             }
         }
     }
 
-    /// The previous row of the current key.
+    /// The previous row of the current key, from its move's tail form ([`Rows::dup_row`]).
     fn prev_dup_row<'m>(
         &mut self,
         m: &'m mut impl Moves,
         dup: DupLayout,
-    ) -> tndb_b::Result<Option<Entry<'m>>> {
+    ) -> tndb_b::Result<Option<Tailed<'m>>> {
         match std::mem::replace(&mut self.pos, Pos::Engine) {
             Pos::Fresh => {
-                let entry = m.last();
-                self.pos = self.ended(landed(&entry));
-                entry
+                let row = m.last_with_key_tail(dup.subkey);
+                self.pos = self.ended(landed(&row));
+                row
             }
             pos @ (Pos::Missed | Pos::KeyDeleted) => {
                 self.pos = pos;
                 Ok(None)
             }
-            Pos::DupEnd { soft: false } => past_dup_end(m, dup, true),
-            Pos::DupEnd { soft: true } | Pos::Engine | Pos::End => m.prev_in_prefix(dup.key),
+            Pos::DupEnd { soft: false } => past_dup_end(PickTail(dup.subkey), m, dup, true),
+            Pos::DupEnd { soft: true } | Pos::Engine | Pos::End => {
+                m.prev_in_prefix_with_key_tail(dup.key, dup.subkey)
+            }
         }
     }
 
     /// The first row of the next key: past the current key's rows by a `seek` of
     /// [`DupLayout::past`] when another row of the key follows, else the next row (which is also
     /// right after a delete, past either end, and before the first row); from a fresh cursor, the
-    /// first row.
+    /// first row. The last move is a tail form ([`Rows::dup_row`]).
     fn next_no_dup_row<'m>(
         &mut self,
         m: &'m mut impl Moves,
         dup: DupLayout,
-    ) -> tndb_b::Result<Option<Entry<'m>>> {
+    ) -> tndb_b::Result<Option<Tailed<'m>>> {
         match std::mem::replace(&mut self.pos, Pos::Engine) {
-            Pos::Fresh => return m.first(),
+            Pos::Fresh => return m.first_with_key_tail(dup.subkey),
             Pos::Missed => {
                 self.pos = Pos::Missed;
                 return Ok(None);
             }
-            Pos::DupEnd { .. } => return past_dup_end(m, dup, false),
+            Pos::DupEnd { .. } => return past_dup_end(PickTail(dup.subkey), m, dup, false),
             Pos::Engine | Pos::End | Pos::KeyDeleted => {}
         }
         match m.next_in_prefix(dup.key)?.map(|(stored, _)| dup.past(stored)) {
-            Some(past) => m.seek(&past),
-            None => m.next(),
+            Some(past) => m.seek_with_key_tail(&past, dup.subkey),
+            None => m.next_with_key_tail(dup.subkey),
         }
     }
 
@@ -814,15 +1068,16 @@ impl Rows {
     /// key follows, else the current row. Right after a delete the current row is the follower,
     /// whose key MDBX takes too. The cursor then ends the key's rows, as MDBX's `last_dup` does
     /// ([`Pos::DupEnd`], soft): `next_dup` finds nothing, even after another writer put a row
-    /// after it in the key.
+    /// after it in the key. The last move is a tail form, or `current_with_key_tail`
+    /// ([`Rows::dup_row`]).
     fn last_dup_row<'m>(
         &mut self,
         m: &'m mut impl Moves,
         dup: DupLayout,
-    ) -> tndb_b::Result<Option<Entry<'m>>> {
-        let entry = match self.pos {
+    ) -> tndb_b::Result<Option<Tailed<'m>>> {
+        let row = match self.pos {
             Pos::Fresh | Pos::Missed => return Ok(None),
-            Pos::DupEnd { .. } => past_dup_end(m, dup, true)?,
+            Pos::DupEnd { .. } => past_dup_end(PickTail(dup.subkey), m, dup, true)?,
             Pos::Engine | Pos::End | Pos::KeyDeleted => {
                 if m.current()?.is_none() {
                     return Ok(None);
@@ -830,66 +1085,62 @@ impl Rows {
                 match m.next_in_prefix(dup.key)?.map(|(stored, _)| dup.past(stored)) {
                     Some(past) => {
                         m.seek(&past)?;
-                        m.prev()?
+                        m.prev_with_key_tail(dup.subkey)?
                     }
-                    None => m.current()?,
+                    None => m.current_with_key_tail(dup.subkey)?,
                 }
             }
         };
-        self.pos = if entry.is_some() { Pos::DupEnd { soft: true } } else { Pos::Engine };
-        Ok(entry)
+        self.pos = if row.is_some() { Pos::DupEnd { soft: true } } else { Pos::Engine };
+        Ok(row)
     }
 
     fn next_dup<T: Table>(&mut self, m: &mut impl Moves) -> PairResult<T> {
         let dup = self.layout::<T>()?;
-        let found = self.next_dup_row(m, dup).map_err(error::read)?.is_some();
-        self.dup_pair::<T>(m, dup, found)
+        let row = self.next_dup_row(m, dup).map_err(error::read)?;
+        self.dup_pair::<T>(dup, row)
     }
 
     fn prev_dup<T: Table>(&mut self, m: &mut impl Moves) -> PairResult<T> {
         let dup = self.layout::<T>()?;
-        let found = self.prev_dup_row(m, dup).map_err(error::read)?.is_some();
-        self.dup_pair::<T>(m, dup, found)
+        let row = self.prev_dup_row(m, dup).map_err(error::read)?;
+        self.dup_pair::<T>(dup, row)
     }
 
     fn next_no_dup<T: Table>(&mut self, m: &mut impl Moves) -> PairResult<T> {
         let dup = self.layout::<T>()?;
-        let found = self.next_no_dup_row(m, dup).map_err(error::read)?.is_some();
-        self.dup_pair::<T>(m, dup, found)
+        let row = self.next_no_dup_row(m, dup).map_err(error::read)?;
+        self.dup_pair::<T>(dup, row)
     }
 
     fn last_dup<T: Table>(&mut self, m: &mut impl Moves) -> ValueOnlyResult<T> {
         let dup = self.layout::<T>()?;
-        let found = self.last_dup_row(m, dup).map_err(error::read)?.is_some();
-        self.dup_value::<T>(m, dup, found)
+        let row = self.last_dup_row(m, dup).map_err(error::read)?;
+        self.dup_value::<T>(dup, row)
     }
 
     fn next_dup_val<T: Table>(&mut self, m: &mut impl Moves) -> ValueOnlyResult<T> {
         let dup = self.layout::<T>()?;
-        let found = self.next_dup_row(m, dup).map_err(error::read)?.is_some();
-        self.dup_value::<T>(m, dup, found)
+        let row = self.next_dup_row(m, dup).map_err(error::read)?;
+        self.dup_value::<T>(dup, row)
     }
 }
 
 /// From a [`Pos::DupEnd`] row, past its key's rows by a `seek` of [`DupLayout::past`] (which also
 /// steps past the end an engine cursor's `last` sets): the next key's first row, or with `back`
-/// the key's last row.
-fn past_dup_end(
-    m: &mut impl Moves,
-    dup: DupLayout,
-    back: bool,
-) -> tndb_b::Result<Option<Entry<'_>>> {
+/// the key's last row, its last move `pick`'s.
+fn past_dup_end<P: Pick>(pick: P, m: &mut impl Moves, dup: DupLayout, back: bool) -> Picked<'_, P> {
     let Some(past) = m.current()?.map(|(stored, _)| dup.past(stored)) else { return Ok(None) };
     if back {
         m.seek(&past)?;
-        m.prev()
+        pick.prev(m)
     } else {
-        m.seek(&past)
+        pick.seek(m, &past)
     }
 }
 
 /// The stored key of the row a move landed on, if it landed on one.
-fn landed<'a>(moved: &tndb_b::Result<Option<Entry<'a>>>) -> Option<&'a [u8]> {
+fn landed<'a, V>(moved: &tndb_b::Result<Option<(&'a [u8], V)>>) -> Option<&'a [u8]> {
     match moved {
         Ok(Some((key, _))) => Some(key),
         _ => None,
