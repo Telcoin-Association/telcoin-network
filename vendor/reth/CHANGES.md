@@ -437,3 +437,20 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   top and uses the newer `reth_tasks::Runtime`; TN's tree has v1.11's `TokioTaskExecutor`. Both
   tests fail without the fix (50 tasks outlive the connection; the second subscription is
   refused). *Upstream*: n/a (upstream commit).
+
+- **TN-0035** — Port the chunk permits from 055fafc72: parallel `eth_getLogs` receipt fetches
+  take their own blocking-IO permit. *Kind*: backport (security), partial.
+  *Files*: `crates/rpc/rpc/src/eth/filter.rs` (`spawn_parallel_tasks`, new
+  `fetch_chunk_receipts`, two tests).
+  *Why*: TN-0019 gave the outer range scan a permit, but once 1,000 or more bloom-matching
+  headers remained, the scan started its receipt chunks with bare `spawn_blocking` while its own
+  thread waited, so one permitted scan could occupy five blocking threads (the chunk size
+  rounded down, so the remainder became a fifth chunk). Each chunk now takes a permit with
+  `try_acquire_owned` and runs on the scanning task when none is free (an awaited acquire could
+  deadlock while outer scans hold every permit), and the chunk size rounds up, so a scan uses at
+  most `DEFAULT_PARALLEL_CONCURRENCY` extra threads, each paid for. Only the permit and chunk
+  sizing are ported. The rest of 055fafc72 rewrites the range scan to go window by window, a
+  performance change built on helper signatures newer than v1.11.4; it conflicts in three
+  places and is left out. The permit test fails without the fix (five chunks, no permits
+  taken); the other pins the no-permit path, which would hang with an awaited acquire.
+  *Upstream*: n/a (upstream commit). A later sync takes upstream's version of the function.

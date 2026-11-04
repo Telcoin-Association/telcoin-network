@@ -1269,7 +1269,7 @@ impl<
         range_headers: Vec<SealedHeader<<Eth::Provider as HeaderProvider>::Header>>,
     ) {
         // Split headers into chunks
-        let chunk_size = std::cmp::max(range_headers.len() / DEFAULT_PARALLEL_CONCURRENCY, 1);
+        let chunk_size = range_headers.len().div_ceil(DEFAULT_PARALLEL_CONCURRENCY).max(1);
         let header_chunks = range_headers
             .into_iter()
             .chunks(chunk_size)
@@ -1280,46 +1280,62 @@ impl<
         // Spawn each chunk as a separate task directly into the FuturesOrdered stream
         for chunk_headers in header_chunks {
             let filter_inner = self.filter_inner.clone();
-            let chunk_task = Box::pin(async move {
-                let chunk_task = tokio::task::spawn_blocking(move || {
-                    let mut chunk_results = Vec::with_capacity(chunk_headers.len());
+            let fetch = move || Self::fetch_chunk_receipts(&filter_inner, chunk_headers);
 
-                    for header in chunk_headers {
-                        // Fetch directly from provider - RangeMode is used for older blocks
-                        // unlikely to be cached
-                        let receipts = match filter_inner
-                            .provider()
-                            .receipts_by_block(header.hash().into())?
-                        {
-                            Some(receipts) => Arc::new(receipts),
-                            None => continue, // No receipts found
-                        };
+            // TN(TN-0035): the permit and the chunk sizing come from upstream 055fafc72; its
+            // window-by-window range scan is not ported.
+            // A parallel task occupies an additional blocking thread, so it needs its own share
+            // of the blocking IO budget. Without one the chunk is fetched on this task instead.
+            let chunk_task: ReceiptFetchFuture<Eth::Provider> = match self
+                .filter_inner
+                .eth_api
+                .blocking_io_task_guard()
+                .clone()
+                .try_acquire_owned()
+            {
+                Ok(permit) => Box::pin(async move {
+                    let chunk_task = tokio::task::spawn_blocking(move || {
+                        let _permit = permit;
+                        fetch()
+                    });
 
-                        if !receipts.is_empty() {
-                            chunk_results.push(ReceiptBlockResult {
-                                receipts,
-                                recovered_block: None,
-                                header,
-                            });
+                    // Await the blocking task and handle the result
+                    match chunk_task.await {
+                        Ok(chunk_results) => chunk_results,
+                        Err(join_err) => {
+                            trace!(target: "rpc::eth::filter", error = ?join_err, "Task join error");
+                            Err(EthFilterError::InternalError)
                         }
                     }
-
-                    Ok(chunk_results)
-                });
-
-                // Await the blocking task and handle the result
-                match chunk_task.await {
-                    Ok(Ok(chunk_results)) => Ok(chunk_results),
-                    Ok(Err(e)) => Err(e),
-                    Err(join_err) => {
-                        trace!(target: "rpc::eth::filter", error = ?join_err, "Task join error");
-                        Err(EthFilterError::InternalError)
-                    }
-                }
-            });
+                }),
+                Err(_) => Box::pin(async move { fetch() }),
+            };
 
             self.pending_tasks.push_back(chunk_task);
         }
+    }
+
+    /// Fetches the receipts of the given blocks from the provider.
+    fn fetch_chunk_receipts(
+        filter_inner: &EthFilterInner<Eth>,
+        chunk_headers: Vec<SealedHeader<<Eth::Provider as HeaderProvider>::Header>>,
+    ) -> Result<Vec<ReceiptBlockResult<Eth::Provider>>, EthFilterError> {
+        let mut chunk_results = Vec::with_capacity(chunk_headers.len());
+
+        for header in chunk_headers {
+            // Fetch directly from provider - RangeMode is used for older blocks
+            // unlikely to be cached
+            let receipts = match filter_inner.provider().receipts_by_block(header.hash().into())? {
+                Some(receipts) => Arc::new(receipts),
+                None => continue, // No receipts found
+            };
+
+            if !receipts.is_empty() {
+                chunk_results.push(ReceiptBlockResult { receipts, recovered_block: None, header });
+            }
+        }
+
+        Ok(chunk_results)
     }
 }
 
@@ -1960,5 +1976,94 @@ mod tests {
 
         drop(permits);
         assert!(scan.await.unwrap().is_empty());
+    }
+
+    /// A range mode over `count` consecutive blocks starting at 100, each with one receipt.
+    // TN(TN-0035): tests for the ported chunk permits.
+    #[expect(clippy::type_complexity)]
+    fn parallel_range_mode(
+        count: u64,
+    ) -> (
+        RangeBlockMode<
+            EthApi<
+                RpcNodeCoreAdapter<MockEthProvider, TestPool, NoopNetwork, EthEvmConfig>,
+                RpcConverter<Ethereum, EthEvmConfig, EthReceiptConverter<ChainSpec>>,
+            >,
+        >,
+        Vec<SealedHeader>,
+    ) {
+        let provider = MockEthProvider::default();
+        let mut headers = Vec::new();
+        for number in 100..100 + count {
+            let header = alloy_consensus::Header { number, ..Default::default() };
+            let hash = FixedBytes::random();
+            provider.add_header(hash, header.clone());
+            provider.add_receipts(
+                number,
+                vec![reth_ethereum_primitives::Receipt {
+                    tx_type: TxType::Legacy,
+                    cumulative_gas_used: number,
+                    logs: vec![],
+                    success: true,
+                }],
+            );
+            headers.push(SealedHeader::new(header, hash));
+        }
+        let eth_filter = super::EthFilter::new(
+            build_test_eth_api(provider),
+            EthFilterConfig::default(),
+            Box::new(TokioTaskExecutor::default()),
+        );
+        let range_mode = RangeBlockMode {
+            filter_inner: eth_filter.inner,
+            iter: Vec::new().into_iter().peekable(),
+            next: VecDeque::new(),
+            max_range: 100,
+            pending_tasks: FuturesOrdered::new(),
+        };
+        (range_mode, headers)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_parallel_chunks_take_blocking_io_permits() {
+        use reth_rpc_eth_api::helpers::SpawnBlocking;
+
+        let (mut range_mode, headers) = parallel_range_mode(10);
+        let guard = range_mode.filter_inner.eth_api.blocking_io_task_guard().clone();
+        let available = guard.available_permits();
+
+        // ten blocks make DEFAULT_PARALLEL_CONCURRENCY chunks (rounding the chunk size down made
+        // five), and each chunk holds a permit while it runs
+        range_mode.spawn_parallel_tasks(headers);
+        assert_eq!(range_mode.pending_tasks.len(), DEFAULT_PARALLEL_CONCURRENCY);
+        assert_eq!(guard.available_permits(), available - DEFAULT_PARALLEL_CONCURRENCY);
+
+        let mut numbers = Vec::new();
+        while let Some(result) = range_mode.next().await.unwrap() {
+            numbers.push(result.header.number);
+        }
+        assert_eq!(numbers, (100..110).collect::<Vec<_>>());
+        assert_eq!(guard.available_permits(), available);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_parallel_chunks_fetch_inline_without_permits() {
+        use reth_rpc_eth_api::helpers::SpawnBlocking;
+
+        let (mut range_mode, headers) = parallel_range_mode(10);
+        let guard = range_mode.filter_inner.eth_api.blocking_io_task_guard().clone();
+        let permits =
+            guard.clone().acquire_many_owned(guard.available_permits() as u32).await.unwrap();
+
+        // with every permit taken the chunks are fetched on the scanning task, not on new
+        // blocking threads, and the scan neither waits nor loses blocks
+        range_mode.spawn_parallel_tasks(headers);
+        let mut numbers = Vec::new();
+        while let Some(result) = range_mode.next().await.unwrap() {
+            numbers.push(result.header.number);
+        }
+        assert_eq!(numbers, (100..110).collect::<Vec<_>>());
+        assert_eq!(guard.available_permits(), 0);
+        drop(permits);
     }
 }
