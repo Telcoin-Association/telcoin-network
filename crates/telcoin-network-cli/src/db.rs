@@ -717,6 +717,12 @@ pub struct DbLoadStateArgs {
 impl DbLoadStateArgs {
     /// Resolve the genesis chain spec, then restore the pack into a fresh reth DB under `datadir`.
     fn execute(&self, datadir: PathBuf) -> eyre::Result<()> {
+        self.execute_with(datadir, tn_reth::FAUCET_ENABLED)
+    }
+
+    /// [`Self::execute`] with the faucet guard's input explicit, so a test can exercise the
+    /// guard's refusal in a build that does not carry the faucet.
+    fn execute_with(&self, datadir: PathBuf, faucet_enabled: bool) -> eyre::Result<()> {
         // This writes chain data into the datadir: refuse to run while a live node holds the
         // datadir PID lock, and take it for our own run so a node cannot start mid-import;
         // released when this returns. Every config load below needs the datadir to exist, and so
@@ -735,11 +741,7 @@ impl DbLoadStateArgs {
 
         // A faucet-compiled binary must not prepare mainnet chain data either: same guard as
         // the node command, refused before any datadir mutation.
-        validate_faucet_build(
-            tn_reth::FAUCET_ENABLED,
-            tn_config.genesis(),
-            self.allow_faucet_on_chain,
-        )?;
+        validate_faucet_build(faucet_enabled, tn_config.genesis(), self.allow_faucet_on_chain)?;
 
         // Reject a non-resumable bundle BEFORE `restore_pack` mutates the datadir, so a refusal
         // leaves the target untouched.
@@ -2565,9 +2567,10 @@ mod tests {
         assert!(persisting.is_err(), "the persisting path must refuse the same bundle");
     }
 
-    /// `db load-state --chain mainnet` writes the bundled committee only after its checks pass:
-    /// a bundle refused as non-resumable (or a faucet build refused on mainnet) leaves no
-    /// `genesis/` directory behind.
+    /// `db load-state --chain mainnet` writes the bundled committee only after the faucet guard
+    /// and the bundle-shape check pass: a faucet build refused on mainnet, or a bundle refused as
+    /// non-resumable, leaves no `genesis/` directory behind. Both refusals run here whatever the
+    /// build's features, through the guard's explicit `faucet_enabled` input.
     #[test]
     fn load_state_refusal_writes_no_committee() {
         use tn_config::{Config, ConfigFmt, ConfigTrait as _, NodeInfo, TelcoinDirs as _};
@@ -2582,12 +2585,15 @@ mod tests {
             chain: Some(super::NamedChain::Mainnet),
             allow_faucet_on_chain: false,
         };
-        let err = args.execute(datadir_path.clone()).expect_err("an empty bundle must be refused");
-        let msg = format!("{err:#}");
         // a faucet build stops at the mainnet refusal, any other build at the bundle check
-        let expected = if tn_reth::FAUCET_ENABLED { "refuses mainnet" } else { "state-only pack" };
-        assert!(msg.contains(expected), "{msg}");
-        assert!(!datadir_path.genesis_path().exists(), "a refused load-state wrote genesis/");
+        for (faucet_enabled, expected) in [(true, "refuses mainnet"), (false, "state-only pack")] {
+            let err = args
+                .execute_with(datadir_path.clone(), faucet_enabled)
+                .expect_err("an empty bundle on mainnet must be refused");
+            let msg = format!("{err:#}");
+            assert!(msg.contains(expected), "faucet_enabled={faucet_enabled}: {msg}");
+            assert!(!datadir_path.genesis_path().exists(), "a refused load-state wrote genesis/");
+        }
     }
 
     /// The ordering, end to end: `db load-state` refuses a bundle whose record chain does not
