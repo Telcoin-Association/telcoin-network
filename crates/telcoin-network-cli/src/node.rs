@@ -205,16 +205,6 @@ pub struct NodeCommand<Ext: clap::Args + fmt::Debug = NoArgs> {
     )]
     pub allow_faucet_on_chain: bool,
 
-    /// Let the node start on chain id 487 with a cleartext BLS key. Testing only.
-    ///
-    /// On chain id 487, the mainnet chain id, the node refuses a BLS key read from the
-    /// cleartext `node-keys/bls.key` without a passphrase (for example with
-    /// `--bls-passphrase-source no-passphrase`) and requires the passphrase-encrypted `bls.kw`.
-    /// This flag lifts that refusal. It is read from the command line only, never from the
-    /// environment.
-    #[arg(long, hide_short_help = true)]
-    pub allow_cleartext_bls_key: bool,
-
     /// Additional cli arguments
     #[clap(flatten)]
     pub ext: Ext,
@@ -333,11 +323,7 @@ impl<Ext: clap::Args + fmt::Debug> NodeCommand<Ext> {
                 "Must NOT compile with adiri feature flag when connecting to non-adiri (testnet) networks!"
             ));
         }
-        validate_bls_key_protection(
-            chain_id,
-            key_config.bls_key_is_cleartext(),
-            self.allow_cleartext_bls_key,
-        )?;
+        validate_bls_key_protection(chain_id, key_config.bls_key_is_cleartext())?;
         warn_stale_cleartext_bls_key(
             chain_id,
             key_config.bls_key_is_cleartext(),
@@ -365,8 +351,7 @@ impl<Ext: clap::Args + fmt::Debug> NodeCommand<Ext> {
             ext,
             node_name: _,
             tracing_url: _,
-            allow_faucet_on_chain: _,   // Used above
-            allow_cleartext_bls_key: _, // Used above
+            allow_faucet_on_chain: _, // Used above
         } = self;
 
         // set up reth node config for engine components
@@ -479,38 +464,26 @@ pub(crate) fn validate_faucet_build(
     ))
 }
 
-/// Refuse a cleartext BLS key on chain id [`MAINNET_CHAIN_ID`] unless the operator opted in.
+/// Refuse a cleartext BLS key on mainnet (chain id [`MAINNET_CHAIN_ID`]).
 ///
 /// `cleartext_key` is [`KeyConfig::bls_key_is_cleartext`]: the key was read from `bls.key`
 /// without a passphrase. That covers `--bls-passphrase-source no-passphrase`, the only source
 /// that reaches the node without a passphrase, and any caller that loads keys without one.
-/// Other chain ids are unaffected. With `allow_cleartext` set the node starts and logs a warning.
-pub(crate) fn validate_bls_key_protection(
-    chain_id: u64,
-    cleartext_key: bool,
-    allow_cleartext: bool,
-) -> eyre::Result<()> {
-    if chain_id != MAINNET_CHAIN_ID || !cleartext_key {
-        return Ok(());
+/// Nothing lifts the refusal. Other chain ids are unaffected.
+pub(crate) fn validate_bls_key_protection(chain_id: u64, cleartext_key: bool) -> eyre::Result<()> {
+    if chain_id == MAINNET_CHAIN_ID && cleartext_key {
+        return Err(eyre::eyre!(
+            "refusing to start on mainnet (chain id {MAINNET_CHAIN_ID}) with a cleartext BLS key: \
+             the key was read from node-keys/bls.key without a passphrase (for example with \
+             --bls-passphrase-source no-passphrase); mainnet requires a passphrase-encrypted key \
+             (bls.kw) and a passphrase source"
+        ));
     }
-    if allow_cleartext {
-        warn!(
-            target: "cli",
-            "starting on chain id {MAINNET_CHAIN_ID} with a cleartext BLS key (bls.key) because \
-             --allow-cleartext-bls-key is set"
-        );
-        return Ok(());
-    }
-    Err(eyre::eyre!(
-        "refusing to start on chain id {MAINNET_CHAIN_ID} with a cleartext BLS key: the key was \
-         read from node-keys/bls.key without a passphrase (for example with \
-         --bls-passphrase-source no-passphrase). Use a passphrase-encrypted key (bls.kw) and a \
-         passphrase source, or pass --allow-cleartext-bls-key on a test network"
-    ))
+    Ok(())
 }
 
-/// Warn about a cleartext `bls.key` left beside the encrypted key on chain id
-/// [`MAINNET_CHAIN_ID`].
+/// Warn about a cleartext `bls.key` left beside the encrypted key on mainnet (chain id
+/// [`MAINNET_CHAIN_ID`]).
 ///
 /// When the node loaded its key from `bls.kw` (`cleartext_key` false), a `bls.key` in the same
 /// directory is a cleartext copy of a BLS private key that the node never reads. The node still
@@ -529,8 +502,8 @@ pub(crate) fn warn_stale_cleartext_bls_key(
         Ok(true) => {
             warn!(
                 target: "cli",
-                "cleartext BLS key file {} lies beside the encrypted key on chain id \
-                 {MAINNET_CHAIN_ID}; the node loaded bls.kw and does not read it, but it holds a \
+                "cleartext BLS key file {} lies beside the encrypted key on mainnet (chain id \
+                 {MAINNET_CHAIN_ID}); the node loaded bls.kw and does not read it, but it holds a \
                  BLS private key in cleartext. Delete it",
                 stale.display()
             );
@@ -1059,33 +1032,32 @@ mod tests {
         std::env::remove_var(VAR);
     }
 
-    /// A cleartext key on chain id 487 is refused without the opt-in and the error names it;
-    /// the opt-in lifts the refusal.
+    /// A cleartext key on mainnet is refused, and the error names the source that loads one and
+    /// the encrypted key file it wants instead; no flag is offered.
     #[test]
-    fn cleartext_bls_key_refused_on_chain_487_without_opt_in() {
-        let err = validate_bls_key_protection(MAINNET_CHAIN_ID, true, false)
-            .expect_err("cleartext key on chain 487");
+    fn cleartext_bls_key_refused_on_mainnet() {
+        let err = validate_bls_key_protection(MAINNET_CHAIN_ID, true)
+            .expect_err("cleartext key on mainnet");
         let msg = err.to_string();
-        assert!(msg.contains("--allow-cleartext-bls-key"), "{msg}");
         assert!(msg.contains("no-passphrase"), "{msg}");
-        assert!(validate_bls_key_protection(MAINNET_CHAIN_ID, true, true).is_ok());
+        assert!(msg.contains("bls.kw"), "{msg}");
+        assert!(!msg.contains("allow-cleartext"), "{msg}");
     }
 
-    /// An encrypted key passes on chain id 487, and other chain ids accept a cleartext key with
-    /// no opt-in.
+    /// An encrypted key passes on mainnet, and other chain ids accept a cleartext key.
     #[test]
     fn bls_key_protection_accepts_encrypted_keys_and_other_chains() {
-        assert!(validate_bls_key_protection(MAINNET_CHAIN_ID, false, false).is_ok());
-        for chain_id in [ADIRI_CHAIN_ID, 911_329] {
-            assert!(validate_bls_key_protection(chain_id, true, false).is_ok());
+        assert!(validate_bls_key_protection(MAINNET_CHAIN_ID, false).is_ok());
+        for chain_id in [ADIRI_CHAIN_ID, DEVNET_CHAIN_ID, 911_329] {
+            assert!(validate_bls_key_protection(chain_id, true).is_ok());
         }
     }
 
-    /// On chain id 487 a `bls.key` beside the `bls.kw` the node loaded is reported; without the
-    /// file, with a cleartext-loaded key (the refusal covers that) or on another chain id nothing
-    /// is reported.
+    /// On mainnet a `bls.key` beside the `bls.kw` the node loaded is reported; without the file,
+    /// with a cleartext-loaded key (the refusal covers that) or on another chain id nothing is
+    /// reported.
     #[test]
-    fn stale_cleartext_bls_key_is_reported_on_chain_487() -> eyre::Result<()> {
+    fn stale_cleartext_bls_key_is_reported_on_mainnet() -> eyre::Result<()> {
         let dir = tempfile::tempdir()?;
         let keys_dir = dir.path();
         assert_eq!(warn_stale_cleartext_bls_key(MAINNET_CHAIN_ID, false, keys_dir), None);
@@ -1097,62 +1069,71 @@ mod tests {
         Ok(())
     }
 
-    /// `--allow-cleartext-bls-key` defaults off, parses as a bare flag, has no environment
-    /// variable, and stays out of the short help.
+    /// The removed `--allow-cleartext-bls-key` flag is rejected and absent from both help views:
+    /// nothing lifts the mainnet cleartext key refusal.
     #[test]
-    fn allow_cleartext_flag_parses_and_is_hidden_from_short_help() -> eyre::Result<()> {
+    fn removed_cleartext_key_flag_is_rejected() -> eyre::Result<()> {
         use clap::CommandFactory as _;
 
-        assert!(!parse_node_without_env(&["node"])?.allow_cleartext_bls_key);
-        let set = parse_node_without_env(&["node", "--allow-cleartext-bls-key"])?;
-        assert!(set.allow_cleartext_bls_key);
+        parse_node_without_env(&["node"])?;
+        let legacy = parse_node_without_env(&["node", "--allow-cleartext-bls-key"]);
+        assert_eq!(legacy.err().map(|error| error.kind()), Some(ErrorKind::UnknownArgument));
         let mut command = NodeCommand::<NoArgs>::command();
-        let arg = command
-            .get_arguments()
-            .find(|arg| arg.get_id() == "allow_cleartext_bls_key")
-            .ok_or_else(|| eyre::eyre!("flag registered"))?;
-        assert_eq!(arg.get_env(), None, "the cleartext opt-in is command-line only");
         assert!(!command.render_help().to_string().contains("--allow-cleartext-bls-key"));
-        assert!(command.render_long_help().to_string().contains("--allow-cleartext-bls-key"));
+        assert!(!command.render_long_help().to_string().contains("--allow-cleartext-bls-key"));
         Ok(())
     }
 
-    /// Generate cleartext validator keys in `datadir`, as `keytool generate validator
-    /// --bls-passphrase-source no-passphrase` does.
+    /// The passphrase source arguments for `passphrase`: `no-passphrase` for `None`, otherwise
+    /// the default `env` source, which [`Cli::resolve_bls_passphrase`] serves from its preloaded
+    /// value, so the test never touches the process environment.
     #[cfg(not(feature = "adiri"))]
-    fn generate_cleartext_keys(datadir: &str) -> eyre::Result<()> {
+    fn passphrase_source_args(
+        passphrase: &Option<zeroize::Zeroizing<String>>,
+    ) -> &'static [&'static str] {
+        if passphrase.is_none() {
+            &["--bls-passphrase-source", "no-passphrase"]
+        } else {
+            &[]
+        }
+    }
+
+    /// Generate validator keys in `datadir` as `keytool generate validator` does: a cleartext
+    /// `bls.key` with `None`, a passphrase-encrypted `bls.kw` with `Some`.
+    #[cfg(not(feature = "adiri"))]
+    fn generate_keys(
+        datadir: &str,
+        passphrase: Option<zeroize::Zeroizing<String>>,
+    ) -> eyre::Result<()> {
         use crate::cli::Cli;
 
-        let keygen = Cli::<NoArgs>::try_parse_args_from([
-            "tn",
-            "--bls-passphrase-source",
-            "no-passphrase",
-            "keytool",
-            "generate",
-            "validator",
-            "--workers",
-            "1",
-            "--datadir",
-            datadir,
-            "--address",
-            "0",
-        ])?;
-        let passphrase = keygen.resolve_bls_passphrase(None)?;
+        let args = ["tn"]
+            .into_iter()
+            .chain(passphrase_source_args(&passphrase).iter().copied())
+            .chain(["keytool", "generate", "validator", "--workers", "1"])
+            .chain(["--datadir", datadir, "--address", "0"]);
+        let keygen = Cli::<NoArgs>::try_parse_args_from(args)?;
+        let passphrase = keygen.resolve_bls_passphrase(passphrase)?;
         keygen.run(passphrase, |_, _, _, _, _| tokio::spawn(async { Ok(()) }))
     }
 
-    /// Run `node --chain mainnet` with `--bls-passphrase-source no-passphrase`
-    /// plus `extra` node arguments on `datadir`, through the same passphrase resolution and
-    /// launcher plumbing as the binary. The faucet opt-in's environment binding is removed, so
-    /// the developer's shell cannot change the outcome.
+    /// Run `node --chain mainnet` plus `extra` node arguments on `datadir`, through the same
+    /// passphrase resolution and launcher plumbing as the binary: a cleartext key with `None`,
+    /// the encrypted key decrypted with `Some`. The faucet opt-in's environment binding is
+    /// removed, so the developer's shell cannot change the outcome.
     #[cfg(not(feature = "adiri"))]
-    fn run_mainnet_node_with_cleartext_key(datadir: &str, extra: &[&str]) -> eyre::Result<()> {
+    fn run_mainnet_node(
+        datadir: &str,
+        passphrase: Option<zeroize::Zeroizing<String>>,
+        extra: &[&str],
+    ) -> eyre::Result<()> {
         use crate::cli::Cli;
         use clap::{CommandFactory as _, FromArgMatches as _};
 
-        let args = ["tn", "node", "--bls-passphrase-source", "no-passphrase", "--chain", "mainnet"]
+        let args = ["tn"]
             .into_iter()
-            .chain(["--datadir", datadir])
+            .chain(passphrase_source_args(&passphrase).iter().copied())
+            .chain(["node", "--chain", "mainnet", "--datadir", datadir])
             .chain(extra.iter().copied());
         // seeded before the command is built, as `Cli::try_parse_args_from` does
         tn_reth::init_reth_defaults();
@@ -1160,7 +1141,7 @@ mod tests {
             node.mut_arg(FAUCET_OPT_IN, |arg| arg.env(None::<&'static str>))
         });
         let node = Cli::<NoArgs>::from_arg_matches(&command.try_get_matches_from(args)?)?;
-        let passphrase = node.resolve_bls_passphrase(None)?;
+        let passphrase = node.resolve_bls_passphrase(passphrase)?;
         node.run(passphrase, |_, _, _, _, _| tokio::spawn(async { Ok(()) }))
     }
 
@@ -1182,20 +1163,21 @@ mod tests {
         Ok(listing)
     }
 
-    /// `node --bls-passphrase-source no-passphrase` on chain id 487 loads the cleartext key and
-    /// is refused before it changes the datadir: no database and no `genesis/` committee file.
+    /// `node --bls-passphrase-source no-passphrase` on mainnet loads the cleartext key and is
+    /// refused, in every build (the key check runs before the faucet check), before it changes
+    /// the datadir: no database and no `genesis/` committee file.
     #[cfg(not(feature = "adiri"))]
     #[test]
-    fn node_refuses_no_passphrase_on_chain_487() -> eyre::Result<()> {
+    fn node_refuses_cleartext_key_on_mainnet() -> eyre::Result<()> {
         let dir = tempfile::tempdir()?;
         let datadir = dir.path().to_str().ok_or_else(|| eyre::eyre!("utf-8 temp path"))?;
-        generate_cleartext_keys(datadir)?;
+        generate_keys(datadir, None)?;
         let before = datadir_listing(dir.path())?;
-        let err = run_mainnet_node_with_cleartext_key(datadir, &[])
-            .expect_err("no-passphrase on chain 487 must be refused");
+        let err = run_mainnet_node(datadir, None, &[])
+            .expect_err("a cleartext key on mainnet must be refused");
         let msg = format!("{err:#}");
         assert!(
-            msg.contains(&format!("refusing to start on chain id {MAINNET_CHAIN_ID}")),
+            msg.contains(&format!("refusing to start on mainnet (chain id {MAINNET_CHAIN_ID})")),
             "{msg}"
         );
         assert!(!dir.path().to_path_buf().reth_db_path().exists());
@@ -1204,23 +1186,23 @@ mod tests {
         Ok(())
     }
 
-    /// With `--allow-cleartext-bls-key` the same node passes the cleartext key check. A default
-    /// build then starts and reaches the launcher. A build that carries the faucet mint is
-    /// refused on mainnet with and without `--allow-faucet-on-chain`; neither refusal changes
-    /// the datadir.
+    /// With a passphrase-encrypted key the same node passes the key check. A default build then
+    /// starts and reaches the launcher. A build that carries the faucet mint is refused on
+    /// mainnet with and without `--allow-faucet-on-chain`; neither refusal changes the datadir.
     #[cfg(not(feature = "adiri"))]
     #[test]
-    fn node_on_chain_487_with_cleartext_opt_in() -> eyre::Result<()> {
+    fn node_on_mainnet_with_encrypted_key() -> eyre::Result<()> {
         let dir = tempfile::tempdir()?;
         let datadir = dir.path().to_str().ok_or_else(|| eyre::eyre!("utf-8 temp path"))?;
-        generate_cleartext_keys(datadir)?;
+        let passphrase = || Some(zeroize::Zeroizing::new("mainnet test passphrase".to_owned()));
+        generate_keys(datadir, passphrase())?;
+        let keys_dir = dir.path().to_path_buf().node_keys_path();
+        assert!(keys_dir.join(tn_config::BLS_WRAPPED_KEYFILE).exists());
+        assert!(!keys_dir.join(BLS_KEYFILE).exists());
         if FAUCET_ENABLED {
             let before = datadir_listing(dir.path())?;
-            for extra in [
-                &["--allow-cleartext-bls-key"][..],
-                &["--allow-cleartext-bls-key", "--allow-faucet-on-chain"],
-            ] {
-                let err = run_mainnet_node_with_cleartext_key(datadir, extra)
+            for extra in [&[][..], &["--allow-faucet-on-chain"]] {
+                let err = run_mainnet_node(datadir, passphrase(), extra)
                     .expect_err("a faucet build is refused on mainnet");
                 let msg = format!("{err:#}");
                 assert!(msg.contains("refuses mainnet"), "{msg}");
@@ -1228,7 +1210,7 @@ mod tests {
             assert_eq!(datadir_listing(dir.path())?, before);
             return Ok(());
         }
-        run_mainnet_node_with_cleartext_key(datadir, &["--allow-cleartext-bls-key"])?;
+        run_mainnet_node(datadir, passphrase(), &[])?;
         // past every startup guard: the bundled committee and the execution database were
         // written for the launcher
         assert!(dir.path().to_path_buf().committee_path().exists());

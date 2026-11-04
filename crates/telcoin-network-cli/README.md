@@ -110,7 +110,7 @@ Encrypted keys use AES-256-GCM-SIV with PBKDF2-HMAC-SHA256 key derivation (1,000
 
 The current binary decrypts the BLS key into node process memory and does not provide an HSM or remote signer interface. See [Validator production operations](../../docs/src/getting-started/validator-operations.md#bls-key-custody) for production custody, backup, and isolation guidance.
 
-When a passphrase is supplied but `node-keys/bls.kw` does not exist, `node` and `keytool generate pop` stop with an error instead of reading a cleartext `bls.key`. To use a cleartext key on purpose, pass `--bls-passphrase-source no-passphrase`. On mainnet the node also needs `--allow-cleartext-bls-key`; see [Mainnet checks](#mainnet-checks).
+When a passphrase is supplied but `node-keys/bls.kw` does not exist, `node` and `keytool generate pop` stop with an error instead of reading a cleartext `bls.key`. To use a cleartext key on purpose, pass `--bls-passphrase-source no-passphrase`. Mainnet refuses a cleartext key; see [Mainnet checks](#mainnet-checks).
 
 ### Generated files
 
@@ -353,21 +353,20 @@ telcoin-network node \
 
 ### Mainnet checks
 
-Mainnet uses chain id 731. On that chain id the node refuses to start in two cases:
+Mainnet uses chain id 731. On that chain id the node refuses to start in two cases, and no flag lifts either:
 
-- The BLS key was read from the cleartext `node-keys/bls.key` without a passphrase, for example with `--bls-passphrase-source no-passphrase`, and `--allow-cleartext-bls-key` is not set. Use a passphrase-encrypted key (`bls.kw`) instead.
-- The binary was built with the `faucet` feature. Nothing lifts this refusal. A faucet build also refuses the embedded mainnet genesis, whatever chain id its config carries.
+- The BLS key was read from the cleartext `node-keys/bls.key` without a passphrase, for example with `--bls-passphrase-source no-passphrase`. Use a passphrase-encrypted key (`bls.kw`) and a passphrase source instead.
+- The binary was built with the `faucet` feature. A faucet build also refuses the embedded mainnet genesis, whatever chain id its config carries.
 
 When the node loads its key from `bls.kw` and a cleartext `bls.key` is still in `node-keys/`, it starts on mainnet but logs a WARN naming that file. The node never reads it, but it is a cleartext copy of a BLS private key, so delete it.
 
-A faucet build starts on any other chain only with `--allow-faucet-on-chain` set, except adiri (chain id 2017), which needs no flag. Test networks such as the devnet from `etc/genesis.sh` (chain id 487) set it.
+A faucet build starts on any other chain only with `--allow-faucet-on-chain` set, except adiri (chain id 2017), which needs no flag. The in-tree devnets (`etc/compose.yaml`, `etc/local-testnet.sh`) build without the faucet and need nothing; a `make docker-devnet` faucet image on the chain id 487 genesis from `etc/genesis.sh` must set `TN_ALLOW_FAUCET_ON_CHAIN=true` where it is deployed.
 
-| Flag                        | Default | Description                                                                                      |
-| --------------------------- | ------- | ------------------------------------------------------------------------------------------------ |
-| `--allow-cleartext-bls-key` | `false` | Start on mainnet with a cleartext `bls.key`. Command line only, no env variable                  |
-| `--allow-faucet-on-chain`   | `false` | Let a faucet build start on a chain other than adiri or mainnet. Env: `TN_ALLOW_FAUCET_ON_CHAIN` |
+| Flag                      | Default | Description                                                                                      |
+| ------------------------- | ------- | ------------------------------------------------------------------------------------------------ |
+| `--allow-faucet-on-chain` | `false` | Let a faucet build start on a chain other than adiri or mainnet. Env: `TN_ALLOW_FAUCET_ON_CHAIN` |
 
-Both flags show in `node --help` but not in `node -h`. `--allow-cleartext-bls-key` is read from the command line only, so an environment file cannot lift the cleartext key refusal. `TN_ALLOW_FAUCET_ON_CHAIN` accepts `1`/`0`, `true`/`false`, `yes`/`no`, `on`/`off`, `t`/`f` and `y`/`n`, in any case. An empty value leaves the flag off. Any other value is an argument error, and `node` or `db load-state` exits without starting. `db load-state` takes `--allow-faucet-on-chain` as well.
+The flag shows in `node --help` but not in `node -h`. `TN_ALLOW_FAUCET_ON_CHAIN` accepts `1`/`0`, `true`/`false`, `yes`/`no`, `on`/`off`, `t`/`f` and `y`/`n`, in any case. An empty value leaves the flag off. Any other value is an argument error, and `node` or `db load-state` exits without starting. `db load-state` takes `--allow-faucet-on-chain` as well.
 
 At startup, before these checks, the node logs one INFO line with the build features and the loaded chain:
 
@@ -402,18 +401,19 @@ Default data directory by platform:
 
 ### Environment variables
 
-| Variable                       | Used by          | Description                                                                                                                                                     |
-| ------------------------------ | ---------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `TN_BLS_PASSPHRASE`            | keytool, node    | BLS key passphrase (removed from env after read; on Linux the value bytes of every entry are zeroed, so the name and one zero byte per value byte stay visible) |
-| `TN_BLS_PASSPHRASE_CREDENTIAL` | keytool, node    | Credential name for `--bls-passphrase-source credential`                                                                                                        |
-| `CREDENTIALS_DIRECTORY`        | keytool, node    | Set by systemd; where the `credential` source looks                                                                                                             |
-| `EXECUTION_ADDRESS`            | keytool generate | Fee recipient address                                                                                                                                           |
-| `TN_EXTERNAL_PRIMARY_ADDR`     | keytool generate | External multiaddr for primary P2P                                                                                                                              |
-| `TN_EXTERNAL_WORKER_ADDRS`     | keytool generate | External multiaddrs for worker P2P (comma-separated)                                                                                                            |
-| `TN_TRACING_URL`               | node             | OpenTelemetry collector endpoint                                                                                                                                |
-| `HEALTHCHECK_TCP_PORT`         | node             | Health listener bind: port or socket address (same as `--healthcheck`)                                                                                          |
-| `TN_FORWARD_TXS`               | node             | Target list for `--forward-txs`, kept off the command line                                                                                                      |
-| `RUST_LOG`                     | all              | Standard Rust log filter directive (e.g. `info,evm=debug`)                                                                                                      |
+| Variable                       | Used by             | Description                                                                                                                                                     |
+| ------------------------------ | ------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `TN_BLS_PASSPHRASE`            | keytool, node       | BLS key passphrase (removed from env after read; on Linux the value bytes of every entry are zeroed, so the name and one zero byte per value byte stay visible) |
+| `TN_BLS_PASSPHRASE_CREDENTIAL` | keytool, node       | Credential name for `--bls-passphrase-source credential`                                                                                                        |
+| `CREDENTIALS_DIRECTORY`        | keytool, node       | Set by systemd; where the `credential` source looks                                                                                                             |
+| `EXECUTION_ADDRESS`            | keytool generate    | Fee recipient address                                                                                                                                           |
+| `TN_EXTERNAL_PRIMARY_ADDR`     | keytool generate    | External multiaddr for primary P2P                                                                                                                              |
+| `TN_EXTERNAL_WORKER_ADDRS`     | keytool generate    | External multiaddrs for worker P2P (comma-separated)                                                                                                            |
+| `TN_TRACING_URL`               | node                | OpenTelemetry collector endpoint                                                                                                                                |
+| `HEALTHCHECK_TCP_PORT`         | node                | Health listener bind: port or socket address (same as `--healthcheck`)                                                                                          |
+| `TN_FORWARD_TXS`               | node                | Target list for `--forward-txs`, kept off the command line                                                                                                      |
+| `TN_ALLOW_FAUCET_ON_CHAIN`     | node, db load-state | Faucet-build opt-in for a chain other than adiri or mainnet, same as `--allow-faucet-on-chain`; see [Mainnet checks](#mainnet-checks)                           |
+| `RUST_LOG`                     | all                 | Standard Rust log filter directive (e.g. `info,evm=debug`)                                                                                                      |
 
 ## Data directory layout
 
