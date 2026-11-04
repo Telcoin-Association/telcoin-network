@@ -74,6 +74,11 @@ serves `sync` (move to a new upstream point), `pick` (backport one upstream comm
 The pin lives in `tn/upstream.toml`, and `vendor.py status` must report only the changes recorded
 in CHANGES.md. That invariant is what keeps future syncs mechanical.
 
+2026-11-04 (vendor review, T4-2): per-file merges had no notion of renames. When upstream
+renamed a file TN had changed, the new path got upstream's version and TN's change stayed in an
+orphan at the old path. `vendor.py` now runs git's rename detection between the two upstream
+trees and merges a renamed file at its new path against the old one, as `git merge` would.
+
 ## D7. The nested lockfile is generated, not committed
 
 `vendor/reth/Cargo.lock` is git-ignored and re-seeded from the root `Cargo.lock` by `tn/cargo.sh`

@@ -14,7 +14,9 @@ never show up as changes or conflicts.
 Every operation that brings upstream content in (sync, pick, add, remove) is a per-file 3-way
 merge: base = upstream at the old point, theirs = upstream at the new point, ours = the file in
 vendor/reth. A file TN never touched is replaced outright; a file TN changed goes through
-`git merge-file`, which leaves conflict markers when both sides touched the same lines.
+`git merge-file`, which leaves conflict markers when both sides touched the same lines. A file
+upstream renamed (git's rename detection between the two upstream trees) is merged at its new
+path against the old one, so TN's changes move with it.
 
 Commands (run from anywhere; python3 -I vendor/reth/tn/vendor.py <cmd>):
   status            list files that differ from the pinned upstream (modified/added/deleted)
@@ -264,53 +266,142 @@ def is_binary(*blobs):
 # 3-way engine
 
 
+def upstream_renames(base_root, theirs_root):
+    """{old: new} for the files upstream renamed between two exported trees.
+
+    Uses git's rename detection (`git diff --no-index -M`, 50% similarity), the rule `git merge`
+    applies. Only renames count; a file git reports as a copy keeps its own history.
+    """
+    base_root, theirs_root = Path(base_root).resolve(), Path(theirs_root).resolve()
+    top = Path(os.path.commonpath([base_root, theirs_root]))
+    b, t = base_root.relative_to(top).as_posix(), theirs_root.relative_to(top).as_posix()
+    r = run(["git", "diff", "--no-index", "--no-ext-diff", "-M", "-l0", "--name-status", "-z",
+             "--", b, t], cwd=top, check=False)
+    if r.returncode not in (0, 1):
+        die(f"git diff --no-index {base_root} {theirs_root} failed: "
+            f"{r.stderr.decode(errors='replace')}")
+    fields = r.stdout.decode(errors="surrogateescape").split("\0")
+    renames, i = {}, 0
+    while i + 1 < len(fields):
+        status = fields[i]
+        if status[:1] in ("R", "C"):
+            old, new = fields[i + 1], fields[i + 2]
+            if status[0] == "R" and old.startswith(b + "/") and new.startswith(t + "/"):
+                renames[old[len(b) + 1:]] = new[len(t) + 1:]
+            i += 3
+        else:
+            i += 2
+    return renames
+
+
 def three_way(base_root, theirs_root, crate_paths, label_base, label_theirs, keep=()):
     """Merge upstream's base->theirs change into vendor/reth. Returns (changes, conflicts).
 
     Files under the paths in `keep` are left alone: a vendored crate whose directory vanished
     upstream (moved to its own repository, or deleted) stays TN's until someone decides.
+
+    A file upstream renamed is merged at its new path, against the old path as base, so TN's
+    changes follow the rename (`follow_rename`) instead of staying behind in a file the crate no
+    longer compiles.
     """
-    files = (scope_files(base_root, crate_paths) | scope_files(theirs_root, crate_paths)
-             | scope_files(VENDOR, crate_paths))
-    changes, conflicts = [], []
-    for rel in sorted(files):
+    base_files = scope_files(base_root, crate_paths)
+    theirs_files = scope_files(theirs_root, crate_paths)
+    files = base_files | theirs_files | scope_files(VENDOR, crate_paths)
+    changes, conflicts, done = [], [], set()
+    for old, new in sorted(upstream_renames(base_root, theirs_root).items()):
+        if old not in base_files or new not in theirs_files:
+            continue
+        if any(old.startswith(k + "/") for k in keep):
+            o = read(VENDOR, old)
+            if o is not None and o != read(base_root, old):
+                conflicts.append((f"changed by TN in a path gone upstream; upstream moved the "
+                                  f"file to {new}, which gets upstream's version without TN's "
+                                  "change", old))
+            continue  # `new` is merged below as an ordinary file
+        follow_rename(old, new, base_root, theirs_root, label_base, label_theirs, changes,
+                      conflicts)
+        done |= {old, new}
+    for rel in sorted(files - done):
         if any(rel.startswith(k + "/") for k in keep):
             continue
-        b, t, o = read(base_root, rel), read(theirs_root, rel), read(VENDOR, rel)
-        if b == t or o == t:
-            continue  # upstream did not touch it, or TN already has upstream's result
-        dest = VENDOR / rel
-        if o == b:  # TN never touched it: take upstream's version outright
-            if t is None:
-                dest.unlink()
-                changes.append(("deleted", rel))
-            else:
-                dest.parent.mkdir(parents=True, exist_ok=True)
-                dest.write_bytes(t)
-                changes.append(("added" if b is None else "updated", rel))
-            continue
-        if o is None:  # TN deleted it; upstream changed it
-            conflicts.append(("deleted by TN, changed upstream (left deleted)", rel))
-            continue
-        if t is None:  # upstream deleted it; TN changed it
-            conflicts.append(("changed by TN, deleted upstream (left in place)", rel))
-            continue
-        if is_binary(b, t, o):
-            conflicts.append(("binary changed on both sides (kept TN's)", rel))
-            continue
-        with tempfile.TemporaryDirectory() as td:
-            bp, tp = Path(td) / "base", Path(td) / "theirs"
-            bp.write_bytes(b or b"")
-            tp.write_bytes(t)
-            r = run(["git", "merge-file", "--diff3", "-L", "TN", "-L", label_base, "-L", label_theirs,
-                     str(dest), str(bp), str(tp)], check=False)
-        if r.returncode < 0 or r.returncode > 127:
-            die(f"git merge-file failed on {rel}: {r.stderr.decode(errors='replace')}")
-        if r.returncode == 0:
-            changes.append(("merged", rel))
-        else:
-            conflicts.append((f"{r.returncode} conflict(s), markers left in file", rel))
+        kind, conflict = merge_one(rel, read(base_root, rel), read(theirs_root, rel),
+                                   read(VENDOR, rel), label_base, label_theirs)
+        if kind:
+            changes.append((kind, rel))
+        if conflict:
+            conflicts.append((conflict, rel))
     return changes, conflicts
+
+
+def merge_one(rel, b, t, o, label_base, label_theirs):
+    """3-way merge of one file into vendor/reth/`rel`, given its base, theirs and ours bytes
+    (None = absent). Returns (change kind, None), (None, conflict) or (None, None)."""
+    if b == t or o == t:
+        return None, None  # upstream did not touch it, or TN already has upstream's result
+    dest = VENDOR / rel
+    if o == b:  # TN never touched it: take upstream's version outright
+        if t is None:
+            dest.unlink()
+            return "deleted", None
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(t)
+        return ("added" if b is None else "updated"), None
+    if o is None:  # TN deleted it; upstream changed it
+        return None, "deleted by TN, changed upstream (left deleted)"
+    if t is None:  # upstream deleted it; TN changed it
+        return None, "changed by TN, deleted upstream (left in place)"
+    if is_binary(b, t, o):
+        return None, "binary changed on both sides (kept TN's)"
+    with tempfile.TemporaryDirectory() as td:
+        bp, tp = Path(td) / "base", Path(td) / "theirs"
+        bp.write_bytes(b or b"")
+        tp.write_bytes(t)
+        r = run(["git", "merge-file", "--diff3", "-L", "TN", "-L", label_base, "-L", label_theirs,
+                 str(dest), str(bp), str(tp)], check=False)
+    if r.returncode < 0 or r.returncode > 127:
+        die(f"git merge-file failed on {rel}: {r.stderr.decode(errors='replace')}")
+    if r.returncode == 0:
+        return "merged", None
+    return None, f"{r.returncode} conflict(s), markers left in file"
+
+
+def follow_rename(old, new, base_root, theirs_root, label_base, label_theirs, changes, conflicts):
+    """Upstream renamed `old` to `new`: merge with base = upstream's `old`, theirs = upstream's
+    `new`, ours = TN's file at whichever of the two paths it has."""
+    b, t = read(base_root, old), read(theirs_root, new)
+    o_old, o_new = read(VENDOR, old), read(VENDOR, new)
+    moved = f"renamed upstream from {old}"
+    if o_old is not None and o_new is not None:
+        conflicts.append((f"renamed upstream to {new}, where TN has a file too (both left as "
+                          "they are)", old))
+        return
+    if o_old is None and o_new is None:  # TN deleted it
+        if b != t:
+            conflicts.append((f"deleted by TN, renamed upstream to {new} and changed (left "
+                              "deleted)", old))
+        return
+    if o_new is not None:  # TN already has it at the new path (an earlier pick of the rename)
+        kind, conflict = merge_one(new, b, t, o_new, label_base, label_theirs)
+        if kind:
+            changes.append((kind, new))
+        if conflict:
+            conflicts.append((f"{conflict}; {moved}", new))
+        return
+    dest = VENDOR / new
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    if o_old == b:  # TN never touched it
+        dest.write_bytes(t)
+        (VENDOR / old).unlink()
+        changes.append(("renamed", f"{old} -> {new}"))
+        return
+    # TN changed it: move TN's version to the new path, then merge upstream's change into it.
+    dest.write_bytes(o_old)
+    (VENDOR / old).unlink()
+    kind, conflict = merge_one(new, b, t, o_old, label_base, label_theirs)
+    if conflict:
+        conflicts.append((f"{conflict}; {moved}, TN's version moved here", new))
+    else:
+        changes.append(("merged", f"{new} ({moved})"))
 
 
 def report(changes, conflicts):

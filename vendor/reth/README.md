@@ -25,7 +25,8 @@ vendor/reth/
   LICENSE-*         upstream's (MIT OR Apache-2.0)
   crates/...        upstream paths, e.g. crates/storage/db is upstream's crates/storage/db
   testing/...       testing/testing-utils (dev-only)
-  tn/               TN tooling: vendor.py, cargo.sh, crates.txt, upstream.toml
+  tn/               TN tooling: vendor.py, cargo.sh, crates.txt, upstream.toml, and
+                    the tools' tests (test_*.py)
   README.md CHANGES.md DECISIONS.md ROADMAP.md   (TN's docs; upstream's README is not carried)
 ```
 
@@ -113,9 +114,11 @@ The engine is the same for all of them. For every file in scope it runs a 3-way 
 base = upstream at the old point, theirs = upstream at the new point, ours = the file here.
 A file TN never touched simply becomes upstream's new version. A file TN changed is merged with
 `git merge-file`; where both sides changed the same lines, it leaves diff3-style conflict
-markers (`<<<<<<< TN`, `||||||| upstream <old>`, `>>>>>>> upstream <new>`). The workspace
-manifest is merged in its filtered form, so upstream churn in crates TN does not carry never
-shows up.
+markers (`<<<<<<< TN`, `||||||| upstream <old>`, `>>>>>>> upstream <new>`). A file upstream
+renamed is merged at its new path against the old one (git's rename detection between the two
+upstream trees, the rule `git merge` uses), so TN's change moves with it, and the merged or
+conflicting line names both paths. The workspace manifest is merged in its filtered form, so
+upstream churn in crates TN does not carry never shows up.
 
 ### Backport one upstream fix
 
@@ -171,3 +174,11 @@ entry from the root `Cargo.toml` if TN named the crate, and refresh `Cargo.lock`
   workspace does not define.
 - `vendor.py status` also warns about files a `.gitignore` rule hides from git, which would
   otherwise drop out of the committed copy without anyone noticing.
+
+## Testing the tools
+
+```
+python3 -B -I -m unittest discover -s vendor/reth/tn -p 'test_*.py' -v   # vendor.py
+```
+
+The tests work in throwaway directories and never touch this tree or the upstream clone.
