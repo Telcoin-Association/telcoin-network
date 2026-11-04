@@ -1,5 +1,5 @@
 # Lockfile and build output of the nested reth workspace, created when cargo runs inside
-# vendor/reth (tn/test.sh seeds the lockfile from the TN root Cargo.lock each run).
+# vendor/reth (tn/cargo.sh seeds the lockfile from the TN root Cargo.lock each run).
 /Cargo.lock
 /target/
 

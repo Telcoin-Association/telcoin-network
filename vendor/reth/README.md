@@ -9,8 +9,8 @@ possible but optional.
 - Tags: `reth-vendor-import-v1.11.3` (verbatim import), `reth-vendor-v1.11.3` (vendoring done
   and verified), `reth-reduction-start` (last commit before reduction). `git diff
   reth-reduction-start` shows everything the reduction changed.
-- Carried: the reth crates in TN's dependency graph (63 after reduction Phases 1, 2, 4a and 6a;
-  101 at import), plus the test-only `reth-testing-utils`. The list is in `tn/crates.txt`.
+- Carried: the reth crates in TN's dependency graph (57 after both reduction passes; 101 at
+  import), plus the test-only `reth-testing-utils`. The list is in `tn/crates.txt`.
 - TN's changes against upstream: CHANGES.md, the ledger.
 - Why it is built this way: DECISIONS.md.
 - What comes next (tndb-b, trimming Ethereum-only code, alloy/revm directly): ROADMAP.md.

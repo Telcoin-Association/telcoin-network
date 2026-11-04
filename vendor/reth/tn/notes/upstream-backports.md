@@ -22,8 +22,11 @@ Severity below is for TN, which differs from upstream's in places. Relevant TN f
 - non-critical task panics are ignored by TN's `TaskManager`, and `panic` is the default
   `unwind`;
 - TN's base fee never goes below `MIN_PROTOCOL_BASE_FEE` (7 wei);
-- TN runs storage v1 (`StorageSettings::base()`): only headers and transactions are in static
-  files; receipts, senders and changesets are in MDBX;
+- TN runs storage v1 (`StorageSettings::base()`) and never prunes: headers, transactions and
+  receipts are in static files; senders, change sets and history indices are in MDBX
+  (`provider/src/either_writer.rs`). Until 2026-11-04 this line said receipts were in MDBX; the
+  verdicts below that rest on it (1b20c9bfc, 6bd6bf28a) were rechecked by the 2026-11-01 review
+  and still hold;
 - the tndb-b work replaces MDBX and RocksDB, so fixes to those paths are tracked for its owners.
   Static-file fixes are in scope here.
 
@@ -42,8 +45,17 @@ Severity below is for TN, which differs from upstream's in places. Relevant TN f
 | 0d1324f14, 22e3708b2 | TN-0023 | nippy-jar: `prune_rows` with uncommitted rows; the last value ends at its offset (tip reads during appends, no panic on a stale mmap) | upstream tests fail without the fixes |
 | 95679ace2 | TN-0023 | static-file read errors are errors, not `Ok(None)` ("missing block") | upstream test (adapted) fails without the fix |
 | d3d7fb31d | TN-0024 | the replacement price bump rounds up, so below 10 wei an equal-price replacement is refused. Pool admission only; no batch or block validity change | upstream test fails without the fix |
+| d85d9deae | TN-0034 | a `syncing` subscription ends when its client leaves (two leaked tasks per abandoned subscription, woken on every block; WS and IPC). Missed by the 2026-10-30 survey, found by the 2026-11-01 review | upstream tests (adapted); both fail without the fix |
+| 055fafc72 (partial) | TN-0035 | **security**: parallel `eth_getLogs` receipt chunks take their own blocking-IO permit, else run inline; one scan no longer occupies five blocking threads. The window-by-window scan rewrite in the same commit is not ported. Found by the review | 2 TN tests; the permit test fails without the fix |
+| revm-inspectors a5638ca (#548) | `patches/revm-inspectors` | **security**: Boa's recursion limit 10,000 → 128, so a recursive getter or setter in a JS tracer cannot overflow a blocking thread's stack and abort the node (`js-tracer` builds only). Carried as a patched crate, not a vendored file; see its PATCH.md. Found by the review | 3 tests; getter and setter abort the process without the fix |
 
 ## Open
+
+### Deferred to its own change
+
+| sha | subject | crate | why it matters to TN | status |
+|---|---|---|---|---|
+| 75d587208 | `enforce_tracked_nonce` | transaction-pool | The pool re-admits a nonce from a batch that reached quorum, so a sender gets free skipped transactions (review finding T2-1; also on the reth git dependency). Enabling it needs the batch builder's repool, requeue and orphan paths reconciled first. Pool admission only: no batch or block validity change | tracked in `tasks/issue-pool-quorum-nonce-readmission.md` |
 
 ### High (correctness, not security)
 

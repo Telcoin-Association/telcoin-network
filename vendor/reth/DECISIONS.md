@@ -225,9 +225,15 @@ from the first survey. Two items were raised and two lowered:
   (replacement price-bump rounding), which matters only below 10 wei, where replacements are
   nearly free anyway.
 
-Non-security High items (txpool nonce order, storage fixes) are tracked with a recommendation,
-not applied, because they are outside the direction given. The storage ones also wait for the
-tndb-b work.
+Non-security High items (txpool nonce order, storage fixes) were first tracked with a
+recommendation, not applied, because they were outside the direction given. They were applied
+later, the pool nonce order as TN-0022 and the static-file fixes as TN-0023, along with
+d3d7fb31d (lowered to Medium above) as TN-0024. The MDBX fixes still wait for the tndb-b work.
+
+2026-11-04: the review of 2026-11-01 found four upstream fixes the survey missed. Three are
+applied: d85d9deae (TN-0034), the permit part of 055fafc72 (TN-0035) and revm-inspectors
+a5638ca (`patches/revm-inspectors`). The fourth, 75d587208, changes pool admission and needs
+the batch builder's repool paths reconciled first, so it is tracked for its own change.
 
 ## D18. Per-crate standalone builds are not a goal
 

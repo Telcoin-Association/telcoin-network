@@ -116,7 +116,8 @@ zeroize = "1.8.2"
 
 # execution
 #
-# reth is vendored: the crates below are TN's copy of reth v1.11.3 under vendor/reth, a nested
+# reth is vendored: the crates below are TN's copy of reth under vendor/reth (pinned in
+# vendor/reth/tn/upstream.toml, v1.11.4 today), a nested
 # cargo workspace kept out of this one (see `exclude`). vendor/reth/README.md covers layout,
 # upstream sync and the ledger of TN changes; vendor/reth/tn/crates.txt lists what is carried.
 #
