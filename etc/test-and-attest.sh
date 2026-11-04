@@ -113,7 +113,7 @@ fi
 # check the attested run had never made.
 ./etc/rocksdb-gate.sh
 
-# fmt, clippy and both unit-test lanes. These live in etc/ci-lanes.sh because
+# fmt, clippy and the three unit-test lanes. These live in etc/ci-lanes.sh because
 # .github/workflows/pr.yaml runs the very same file, on `pull_request` and again on
 # `merge_group` against main + this PR. One definition, so the queue cannot end up
 # enforcing something narrower than what gets attested here.
@@ -121,6 +121,7 @@ fi
 ./etc/ci-lanes.sh clippy
 ./etc/ci-lanes.sh test-default
 ./etc/ci-lanes.sh test-adiri
+./etc/ci-lanes.sh test-vendor-reth
 
 # The e2e suites: the part CI does not run, and the reason this script attests anything at
 # all. They are split into two invocations to avoid any port/node confusion.

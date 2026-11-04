@@ -10,9 +10,9 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[2]
 
-# ci-scope gates only the two test lanes; the compile lanes run for every author on both events.
+# ci-scope gates only the test lanes; the compile lanes run for every author on both events.
 ALWAYS_RUN = ("archive-mode-gate", "clippy", "fmt")
-GATED = ("adiri-test", "test")
+GATED = ("adiri-test", "test", "vendor-reth-test")
 EVERY_PAIR = (("pull_request", False), ("pull_request", True), ("merge_group", True))
 
 
@@ -22,18 +22,20 @@ def gate_script():
 
 
 def execute(event, run_tests, transport, script=None, connection_limits="success", pins="success",
-            quinn_proto="success", fmt=None, clippy=None, archive_mode_gate=None, test=None, adiri_test=None):
+            quinn_proto="success", revm_inspectors="success", fmt=None, clippy=None,
+            archive_mode_gate=None, test=None, adiri_test=None, vendor_reth_test=None):
     """Run the gate on the fixture; a lane keyword left as None keeps the fixture's result for that lane."""
     results = {name: {"result": "success"} for name in ALWAYS_RUN}
     results.update({name: {"result": "success" if run_tests else "skipped"} for name in GATED})
     overrides = {"fmt": fmt, "clippy": clippy, "archive-mode-gate": archive_mode_gate, "test": test,
-                 "adiri-test": adiri_test}
+                 "adiri-test": adiri_test, "vendor-reth-test": vendor_reth_test}
     results.update({name: {"result": outcome} for name, outcome in overrides.items() if outcome is not None})
     results.update({"ci-scope": {"result": "success", "outputs": {"run_tests": str(run_tests).lower()}},
                     "attest": {"result": "success" if event == "pull_request" else "skipped"},
                     "transport-evidence": {"result": transport},
                     "connection-limits-patch": {"result": connection_limits},
                     "quinn-proto-patch": {"result": quinn_proto},
+                    "revm-inspectors-patch": {"result": revm_inspectors},
                     "quic-profile-pins": {"result": pins}})
     return subprocess.run(["bash", "-c", gate_script() if script is None else script],
                           env={"PATH": os.environ["PATH"], "EVENT_NAME": event, "RESULTS": json.dumps(results)},
@@ -79,6 +81,16 @@ class QuinnProtoGate(unittest.TestCase):
                     self.assertNotEqual(execute(event, run_tests, "success", quinn_proto=outcome).returncode, 0)
 
 
+class RevmInspectorsGate(unittest.TestCase):
+    def test_every_author_and_event_requires_success(self):
+        for event, run_tests in EVERY_PAIR:
+            self.assertEqual(execute(event, run_tests, "success").returncode, 0)
+            for outcome in ("skipped", "cancelled", "failure"):
+                with self.subTest(event=event, run_tests=run_tests, outcome=outcome):
+                    result = execute(event, run_tests, "success", revm_inspectors=outcome)
+                    self.assertNotEqual(result.returncode, 0)
+
+
 class QuicProfilePinsGate(unittest.TestCase):
     def test_every_author_and_event_requires_success(self):
         for event, run_tests in EVERY_PAIR:
@@ -99,7 +111,8 @@ class CompileGate(unittest.TestCase):
                         self.assertNotEqual(result.returncode, 0)
 
     def test_test_lanes_skip_only_when_ci_scope_says_so(self):
-        self.assertEqual(execute("pull_request", False, "success", test="skipped", adiri_test="skipped").returncode, 0)
+        self.assertEqual(execute("pull_request", False, "success", test="skipped", adiri_test="skipped",
+                                 vendor_reth_test="skipped").returncode, 0)
         for lane in GATED:
             with self.subTest(lane=lane):
                 result = execute("pull_request", True, "success", **{lane_keyword(lane): "skipped"})
@@ -107,16 +120,15 @@ class CompileGate(unittest.TestCase):
 
     def test_merge_queue_skips_nothing(self):
         # run_tests=False cannot come out of ci-scope on merge_group; it is here to show the
-        # queue's refusal does not depend on what ci-scope said. The fixture marks both test
+        # queue's refusal does not depend on what ci-scope said. The fixture marks the test
         # lanes skipped when run_tests is False, which the queue refuses on its own, so each
         # subtest sets them to success and skips only the lane under test.
+        passing = {lane_keyword(lane): "success" for lane in GATED}
         for run_tests in (True, False):
-            self.assertEqual(
-                execute("merge_group", run_tests, "success", test="success", adiri_test="success").returncode, 0
-            )
+            self.assertEqual(execute("merge_group", run_tests, "success", **passing).returncode, 0)
             for lane in ALWAYS_RUN + GATED:
                 with self.subTest(run_tests=run_tests, lane=lane):
-                    lanes = {"test": "success", "adiri_test": "success", lane_keyword(lane): "skipped"}
+                    lanes = {**passing, lane_keyword(lane): "skipped"}
                     result = execute("merge_group", run_tests, "success", **lanes)
                     self.assertNotEqual(result.returncode, 0)
 

@@ -213,10 +213,13 @@ jobs:
       # per selected package), so its dependency artifacts are distinct from the default
       # lane's; the two sets coexist in target/, and rust-cache keeps every variant of a
       # dependency it finds there. One entry keeps the quota predictable.
-      - name: Build the test binaries of both test lanes
+      # The vendored reth lane builds the nested vendor/reth workspace into target/vendor-reth,
+      # inside the same target dir, so its dependencies land in the same entry.
+      - name: Build the test binaries of the test lanes
         run: |
           ./etc/ci-lanes.sh test-default --build-only
           ./etc/ci-lanes.sh test-adiri --build-only
+          ./etc/ci-lanes.sh test-vendor-reth --build-only
 
   # Deletes the superseded cache generations, through .github/scripts/prune_caches.sh,
   # whose header has the rule in full. A family is every entry on refs/heads/main whose

@@ -192,6 +192,11 @@ jobs:
         if: ${{ !cancelled() }}
         run: ./etc/ci-lanes.sh test-adiri --build-only
 
+      # The nested vendor/reth workspace's tests and the js-tracer build, likewise.
+      - name: Build the vendored reth lane's test binaries
+        if: ${{ !cancelled() }}
+        run: ./etc/ci-lanes.sh test-vendor-reth --build-only
+
   # The commands of pr.yaml's `connection-limits-patch` and `quinn-proto-patch` jobs, in
   # one job. No cache step, as there: main warms no entry for these crates.
   carried-patches:
@@ -207,7 +212,11 @@ jobs:
       - name: Test connection accounting
         run: cargo +1.94 test --locked -p libp2p-connection-limits --lib
 
-      # Runs even when the step above failed, so both crates report.
+      # Runs even when the step above failed, so every crate reports.
       - name: Test the carried protocol observations
         if: ${{ !cancelled() }}
         run: cargo +1.94 test --locked --manifest-path patches/quinn-proto/Cargo.toml --lib
+
+      - name: Test the carried JavaScript tracer limits
+        if: ${{ !cancelled() }}
+        run: cargo +1.94 test --locked --manifest-path patches/revm-inspectors/Cargo.toml --features js-tracer --lib
