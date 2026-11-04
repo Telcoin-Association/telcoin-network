@@ -317,10 +317,57 @@ where
     Req: TNMessage,
     Res: TNMessage,
 {
-    /// The held message id, its relaying peer and the command channel to the swarm.
+    /// The held message and the command channel to the swarm.
     ///
     /// `None` once a verdict is reported, and for a detached ticket.
-    pending: Option<(MessageId, PeerId, mpsc::Sender<NetworkCommand<Req, Res>>)>,
+    pending: Option<PendingVerdict<Req, Res>>,
+}
+
+/// The message a [`GossipValidation`] ticket holds and the channel its verdict goes to.
+struct PendingVerdict<Req, Res>
+where
+    Req: TNMessage,
+    Res: TNMessage,
+{
+    /// The held message id.
+    message_id: MessageId,
+    /// The peer that relayed the message.
+    propagation_source: PeerId,
+    /// The command channel to the swarm.
+    sender: mpsc::Sender<NetworkCommand<Req, Res>>,
+}
+
+impl<Req, Res> PendingVerdict<Req, Res>
+where
+    Req: TNMessage,
+    Res: TNMessage,
+{
+    /// Report `verdict` for the held message and wait for channel capacity.
+    ///
+    /// A closed channel is tolerated: the message then ages out of the gossipsub cache.
+    async fn send(self, verdict: GossipVerdict) {
+        let Self { message_id, propagation_source, sender } = self;
+        let _ = sender
+            .send(NetworkCommand::ReportGossipValidation {
+                message_id,
+                propagation_source,
+                verdict,
+            })
+            .await;
+    }
+
+    /// Report `verdict` for the held message without waiting.
+    ///
+    /// A full or closed channel is tolerated: the message then ages out of the gossipsub cache
+    /// and is never forwarded.
+    fn try_send(self, verdict: GossipVerdict) {
+        let Self { message_id, propagation_source, sender } = self;
+        let _ = sender.try_send(NetworkCommand::ReportGossipValidation {
+            message_id,
+            propagation_source,
+            verdict,
+        });
+    }
 }
 
 impl<Req, Res> GossipValidation<Req, Res>
@@ -336,7 +383,7 @@ where
         propagation_source: PeerId,
         sender: mpsc::Sender<NetworkCommand<Req, Res>>,
     ) -> Self {
-        Self { pending: Some((message_id, propagation_source, sender)) }
+        Self { pending: Some(PendingVerdict { message_id, propagation_source, sender }) }
     }
 
     /// A ticket with nothing to report (tests, direct injection).
@@ -363,15 +410,7 @@ where
     ///
     /// A closed channel is tolerated: the message then ages out of the gossipsub cache.
     async fn report(&mut self, verdict: GossipVerdict) {
-        let send = self.pending.take().map(|(message_id, propagation_source, sender)| async move {
-            let _ = sender
-                .send(NetworkCommand::ReportGossipValidation {
-                    message_id,
-                    propagation_source,
-                    verdict,
-                })
-                .await;
-        });
+        let send = self.pending.take().map(|pending| pending.send(verdict));
         futures::future::OptionFuture::from(send).await;
     }
 }
@@ -385,7 +424,7 @@ where
     /// Format the ticket with the id of the message it holds.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("GossipValidation")
-            .field("message_id", &self.pending.as_ref().map(|(id, ..)| id))
+            .field("message_id", &self.pending.as_ref().map(|pending| &pending.message_id))
             .finish_non_exhaustive()
     }
 }
@@ -401,13 +440,7 @@ where
     /// A full or closed channel is tolerated: the message then ages out of the gossipsub
     /// cache and is never forwarded.
     fn drop(&mut self) {
-        let _ = self.pending.take().map(|(message_id, propagation_source, sender)| {
-            sender.try_send(NetworkCommand::ReportGossipValidation {
-                message_id,
-                propagation_source,
-                verdict: GossipVerdict::Ignore,
-            })
-        });
+        self.pending.take().into_iter().for_each(|pending| pending.try_send(GossipVerdict::Ignore));
     }
 }
 

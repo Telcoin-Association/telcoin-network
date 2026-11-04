@@ -25,7 +25,7 @@ use tn_network_libp2p::{
         GossipPayload, GossipValidation, IntoResponse as _, NetworkCommand, NetworkEvent,
         NetworkHandle, NetworkResponseMessage, NetworkResult,
     },
-    write_frame, AdmissionShed, DenyReason, GossipMessage, PeerSlot, PeerSlots, PeerTier, Penalty,
+    write_frame, AdmissionShed, DenyReason, PeerSlot, PeerSlots, PeerTier, Penalty,
     PrimarySyncRequest, ReservedPeers, ReservedPool, ResponseChannel, ServiceClass, Stream,
     StreamError, SyncFrame, SyncFrameError,
 };
