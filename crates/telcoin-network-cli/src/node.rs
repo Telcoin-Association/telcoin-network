@@ -1005,6 +1005,9 @@ mod tests {
     fn faucet_opt_in_env_value_parses_on_node_and_load_state() {
         use clap::{Args as _, CommandFactory as _};
 
+        // held to the end: `set_var` below changes the process environment, which the passphrase
+        // tests read without std's lock
+        let _env = crate::passphrase::env_lock();
         // a variable no other test reads, bound onto the flag in place of the real one so the
         // test runs clap's env path without depending on the developer's shell
         const VAR: &str = "TN_TEST_FAUCET_OPT_IN_ENV_VALUE";
