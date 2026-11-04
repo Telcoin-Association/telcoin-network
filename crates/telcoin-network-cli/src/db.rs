@@ -55,10 +55,10 @@ pub struct DbCommand {
 #[derive(Debug, Subcommand)]
 enum DbSubcommand {
     /// Print execution database statistics: the static files and each table of the reth
-    /// database. The default build reads while the node runs. A build with the `tndb-b` feature
+    /// database. The default build reads while the node runs. A build with the `tn-lmdb` feature
     /// needs the node stopped: it refuses while a node holds the datadir, and holds the datadir
     /// while it runs, so a node started meanwhile is refused until the report finishes. It
-    /// refuses an MDBX database not yet migrated to tndb-b: the node's first start migrates it.
+    /// refuses an MDBX database not yet migrated to tn-lmdb: the node's first start migrates it.
     Stats,
 
     /// Validate a consensus epoch pack file: walk the `data` stream and report integrity issues.

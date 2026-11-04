@@ -24,8 +24,8 @@
 # cannot afford them. A lane added to this file lands in the merge queue too, so anything
 # that takes hours does not belong in it.
 #
-# Usage: etc/ci-lanes.sh <fmt|clippy|test-default|test-adiri|test-tndb|all>
-#        etc/ci-lanes.sh <test-default|test-adiri|test-tndb> --build-only
+# Usage: etc/ci-lanes.sh <fmt|clippy|test-default|test-adiri|test-tn-lmdb|all>
+#        etc/ci-lanes.sh <test-default|test-adiri|test-tn-lmdb> --build-only
 #
 # `--build-only` compiles a test lane's binaries without running them. It is accepted for
 # the test lanes and nothing else, and it is the only option there is: no flag passes
@@ -58,8 +58,8 @@ export CARGO_PROFILE_TEST_DEBUG=0
 NIGHTLY=$(cat rust-nightly)
 
 usage() {
-    echo "usage: $0 <fmt|clippy|test-default|test-adiri|test-tndb|all>" >&2
-    echo "       $0 <test-default|test-adiri|test-tndb> --build-only" >&2
+    echo "usage: $0 <fmt|clippy|test-default|test-adiri|test-tn-lmdb|all>" >&2
+    echo "       $0 <test-default|test-adiri|test-tn-lmdb> --build-only" >&2
     exit 2
 }
 
@@ -122,13 +122,13 @@ lane_test_adiri() {
         "${run_mode[@]}"
 }
 
-lane_test_tndb() {
+lane_test_tn_lmdb() {
     # lane_test_default runs every reth database on MDBX, the default backend, so it never
-    # runs reth on tndb-b. This is the same workspace run with tn-reth's `tndb-b` feature:
+    # runs reth on tn-lmdb. This is the same workspace run with tn-reth's `tn-lmdb` feature:
     # feature unification switches every crate that opens a reth database (tn-reth, tn-node,
-    # the CLI and every test built on them) to tndb-b, so between the two lanes each of those
+    # the CLI and every test built on them) to tn-lmdb, so between the two lanes each of those
     # tests runs once against each engine.
-    run cargo nextest run --locked --workspace --features tn-reth/tndb-b "${run_mode[@]}"
+    run cargo nextest run --locked --workspace --features tn-reth/tn-lmdb "${run_mode[@]}"
 }
 
 (($# <= 2)) || usage
@@ -136,7 +136,7 @@ case "${2:-}" in
 "") ;;
 --build-only)
     case "${1:-}" in
-    test-default | test-adiri | test-tndb) run_mode=(--no-run) ;;
+    test-default | test-adiri | test-tn-lmdb) run_mode=(--no-run) ;;
     *) usage ;;
     esac
     ;;
@@ -148,13 +148,13 @@ fmt) lane_fmt ;;
 clippy) lane_clippy ;;
 test-default) lane_test_default ;;
 test-adiri) lane_test_adiri ;;
-test-tndb) lane_test_tndb ;;
+test-tn-lmdb) lane_test_tn_lmdb ;;
 all)
     lane_fmt
     lane_clippy
     lane_test_default
     lane_test_adiri
-    lane_test_tndb
+    lane_test_tn_lmdb
     ;;
 *) usage ;;
 esac

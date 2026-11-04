@@ -1,5 +1,5 @@
 //! Tests for the backend switch: the backend guard, the table stats of `db stats`, and on the
-//! tndb build the `--db.*` mapping, the database version file and the client version record.
+//! tn-lmdb build the `--db.*` mapping, the database version file and the client version record.
 
 use super::*;
 use reth_db::{
@@ -27,13 +27,13 @@ fn config(db: DatabaseArgs) -> RethConfig {
 }
 
 /// This build's data file, and the other build's.
-#[cfg(not(feature = "tndb-b"))]
-const OWN_AND_OTHER_DATA_FILE: (&str, &str) = ("mdbx.dat", TNDB_DATA_FILE);
-#[cfg(feature = "tndb-b")]
-const OWN_AND_OTHER_DATA_FILE: (&str, &str) = (tndb_b_reth::DATA_FILE, MDBX_DATA_FILE);
+#[cfg(not(feature = "tn-lmdb"))]
+const OWN_AND_OTHER_DATA_FILE: (&str, &str) = ("mdbx.dat", TN_LMDB_DATA_FILE);
+#[cfg(feature = "tn-lmdb")]
+const OWN_AND_OTHER_DATA_FILE: (&str, &str) = (tn_lmdb_reth::DATA_FILE, MDBX_DATA_FILE);
 
 /// A database directory holding the other engine's data file is refused before anything is
-/// created in it, and the error names the directory and both engines. On the tndb build the
+/// created in it, and the error names the directory and both engines. On the tn-lmdb build the
 /// planted `mdbx.dat` goes to the migration, which fails to open it as MDBX and leaves it as it
 /// was, with no temp directory left behind.
 #[test]
@@ -47,10 +47,10 @@ fn open_rw_refuses_the_other_engines_database() {
     let err = open_rw(&config(test_db_args()), &path).expect_err("the other engine's file");
     let msg = format!("{err:#}");
     assert!(msg.contains(&path.display().to_string()), "names the directory: {msg}");
-    assert!(msg.contains("MDBX") && msg.contains("tndb-b"), "names both engines: {msg}");
-    #[cfg(not(feature = "tndb-b"))]
+    assert!(msg.contains("MDBX") && msg.contains("tn-lmdb"), "names both engines: {msg}");
+    #[cfg(not(feature = "tn-lmdb"))]
     assert!(msg.contains("fresh datadir"), "says what the operator can do: {msg}");
-    #[cfg(feature = "tndb-b")]
+    #[cfg(feature = "tn-lmdb")]
     {
         assert!(msg.contains("migration") && msg.contains("unchanged"), "says why: {msg}");
         assert_eq!(std::fs::read(path.join(other)).expect("read"), b"planted", "MDBX unchanged");
@@ -73,10 +73,10 @@ fn check_backend_fails_on_a_stat_error() {
     std::fs::write(&file, b"not a directory").expect("file");
     let path = file.join("db");
 
-    #[cfg(not(feature = "tndb-b"))]
+    #[cfg(not(feature = "tn-lmdb"))]
     let checked = check_backend(&path);
-    #[cfg(feature = "tndb-b")]
-    let checked = check_backend(&path, tndb_b_reth::TndbArgs::default());
+    #[cfg(feature = "tn-lmdb")]
+    let checked = check_backend(&path, tn_lmdb_reth::TnLmdbArgs::default());
     let err = checked.expect_err("a stat error fails the guard");
     let msg = format!("{err:#}");
     assert!(msg.contains("failed to check for"), "the guard's own error: {msg}");
@@ -163,14 +163,14 @@ fn db_table_stats_lists_populated_tables() {
 fn db_table_stats_skips_tables_the_database_lacks() {
     let tmp = TempDir::new().expect("tempdir");
     let path = tmp.path().join("db");
-    #[cfg(not(feature = "tndb-b"))]
+    #[cfg(not(feature = "tn-lmdb"))]
     drop(reth_db::create_db(&path, test_db_args().database_args()).expect("create"));
-    #[cfg(feature = "tndb-b")]
+    #[cfg(feature = "tn-lmdb")]
     drop(
-        tndb_b_reth::TndbEnv::open(
+        tn_lmdb_reth::TnLmdbEnv::open(
             &path,
-            tndb_b_reth::TndbEnvKind::RW,
-            tndb_b_reth::TndbArgs::default(),
+            tn_lmdb_reth::TnLmdbEnvKind::RW,
+            tn_lmdb_reth::TnLmdbArgs::default(),
         )
         .expect("create"),
     );
@@ -180,25 +180,25 @@ fn db_table_stats_skips_tables_the_database_lacks() {
 
 /// The stats refuse a database directory holding only the other engine's database, naming the
 /// directory and both engines. On the MDBX build the directory also holds a readable MDBX
-/// database, which the guard must not read. On the tndb build an MDBX database is one whose
+/// database, which the guard must not read. On the tn-lmdb build an MDBX database is one whose
 /// migration has not run, which the stats never start.
 #[test]
 fn db_table_stats_refuses_the_other_engines_database() {
     let tmp = TempDir::new().expect("tempdir");
     let path = tmp.path().join("db");
-    #[cfg(not(feature = "tndb-b"))]
+    #[cfg(not(feature = "tn-lmdb"))]
     write_stats_rows(&path);
-    #[cfg(feature = "tndb-b")]
+    #[cfg(feature = "tn-lmdb")]
     std::fs::create_dir(&path).expect("db dir");
     std::fs::write(path.join(OWN_AND_OTHER_DATA_FILE.1), b"planted").expect("plant");
 
     let err = db_table_stats(&path).expect_err("the other engine's file");
     let msg = format!("{err:#}");
     assert!(msg.contains(&path.display().to_string()), "names the directory: {msg}");
-    assert!(msg.contains("MDBX") && msg.contains("tndb-b"), "names both engines: {msg}");
-    #[cfg(feature = "tndb-b")]
+    assert!(msg.contains("MDBX") && msg.contains("tn-lmdb"), "names both engines: {msg}");
+    #[cfg(feature = "tn-lmdb")]
     assert!(msg.contains("pending or unfinished") && msg.contains("start the node"), "{msg}");
-    #[cfg(feature = "tndb-b")]
+    #[cfg(feature = "tn-lmdb")]
     assert!(!path.join(OWN_AND_OTHER_DATA_FILE.0).try_exists().expect("stat"), "nothing made");
 }
 
@@ -214,16 +214,16 @@ fn db_table_stats_fails_on_a_stat_error() {
     assert!(format!("{err:#}").contains("failed to check for"), "the check's own error: {err:#}");
 }
 
-#[cfg(feature = "tndb-b")]
-mod tndb {
+#[cfg(feature = "tn-lmdb")]
+mod tn_lmdb {
     use super::*;
     use reth_db::{cursor::DbCursorRO as _, mdbx::SyncMode as MdbxSyncMode, ClientVersion};
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
-    use tndb_b_reth::{SyncMode, TndbArgs, MIN_GROWTH};
+    use tn_lmdb_reth::{SyncMode, TnLmdbArgs, MIN_GROWTH};
 
-    /// Each flag tndb-b cannot honour is refused, and the error names it.
+    /// Each flag tn-lmdb cannot honour is refused, and the error names it.
     #[test]
-    fn tndb_args_refuses_unsupported_flags() {
+    fn tn_lmdb_args_refuses_unsupported_flags() {
         let cases = [
             ("--db.exclusive", DatabaseArgs { exclusive: Some(false), ..Default::default() }),
             (
@@ -253,12 +253,12 @@ mod tndb {
         ];
         let accepted: Vec<_> = cases
             .iter()
-            .filter(|(flag, args)| match tndb_args(args) {
+            .filter(|(flag, args)| match tn_lmdb_args(args) {
                 Ok(_) => true,
                 Err(e) => {
                     let msg = e.to_string();
                     assert!(
-                        msg.contains(flag) && msg.contains("not supported by the tndb-b backend"),
+                        msg.contains(flag) && msg.contains("not supported by the tn-lmdb backend"),
                         "the error names {flag}: {msg}"
                     );
                     false
@@ -270,7 +270,7 @@ mod tndb {
 
         // The no-sync refusals also say why, and what to use instead.
         for mode in [MdbxSyncMode::SafeNoSync, MdbxSyncMode::UtterlyNoSync] {
-            let msg = tndb_args(&DatabaseArgs { sync_mode: Some(mode), ..Default::default() })
+            let msg = tn_lmdb_args(&DatabaseArgs { sync_mode: Some(mode), ..Default::default() })
                 .expect_err("a no-sync mode is refused")
                 .to_string();
             assert!(
@@ -280,10 +280,10 @@ mod tndb {
         }
     }
 
-    /// The flags tndb-b honours map onto the adapter's settings; unset flags keep its defaults.
+    /// The flags tn-lmdb honours map onto the adapter's settings; unset flags keep its defaults.
     #[test]
-    fn tndb_args_maps_supported_flags() {
-        let default = TndbArgs::default();
+    fn tn_lmdb_args_maps_supported_flags() {
+        let default = TnLmdbArgs::default();
         let cases = [
             ("no flags", DatabaseArgs::default(), default),
             (
@@ -317,18 +317,18 @@ mod tndb {
         ];
         let wrong: Vec<_> = cases
             .iter()
-            .filter(|(_, args, expected)| tndb_args(args).ok().as_ref() != Some(expected))
-            .map(|(flag, args, _)| (*flag, tndb_args(args).map_err(|e| e.to_string())))
+            .filter(|(_, args, expected)| tn_lmdb_args(args).ok().as_ref() != Some(expected))
+            .map(|(flag, args, _)| (*flag, tn_lmdb_args(args).map_err(|e| e.to_string())))
             .collect();
         assert!(wrong.is_empty(), "mapped wrongly: {wrong:?}");
 
         let too_large = usize::try_from(u64::from(u32::MAX) + 1).expect("64-bit usize");
-        let err = tndb_args(&DatabaseArgs { page_size: Some(too_large), ..Default::default() })
+        let err = tn_lmdb_args(&DatabaseArgs { page_size: Some(too_large), ..Default::default() })
             .expect_err("a page size past u32");
         assert!(err.to_string().contains("--db.page-size"), "names the flag: {err}");
 
         let under = usize::try_from(MIN_GROWTH - 1).expect("64-bit usize");
-        let err = tndb_args(&DatabaseArgs { growth_step: Some(under), ..Default::default() })
+        let err = tn_lmdb_args(&DatabaseArgs { growth_step: Some(under), ..Default::default() })
             .expect_err("a growth step under the engine's minimum");
         assert!(
             err.to_string().contains("--db.growth-step") && err.to_string().contains("minimum"),
@@ -380,7 +380,7 @@ mod tndb {
         let tmp = TempDir::new().expect("tempdir");
         let path = tmp.path().join("db");
         let db_args = test_db_args();
-        let open = |v: ClientVersion| open_tndb(&path, &db_args, v).expect("open");
+        let open = |v: ClientVersion| open_tn_lmdb(&path, &db_args, v).expect("open");
 
         let db = open(ClientVersion::default());
         assert!(version_history(&db).is_empty(), "an empty version records nothing");
@@ -415,13 +415,13 @@ mod tndb {
         let db_args = test_db_args();
         let hash = B256::repeat_byte(0xab);
 
-        let db = open_tndb(&path, &db_args, version("1.0.0")).expect("fresh open");
+        let db = open_tn_lmdb(&path, &db_args, version("1.0.0")).expect("fresh open");
         let tx = db.tx_mut().expect("tx_mut");
         tx.put::<tables::CanonicalHeaders>(7, hash).expect("put");
         tx.commit().expect("commit");
         drop(db);
 
-        let mut db = open_tndb(&path, &db_args, version("1.0.0")).expect("reopen");
+        let mut db = open_tn_lmdb(&path, &db_args, version("1.0.0")).expect("reopen");
         Arc::get_mut(&mut db).expect("sole handle").create_tables().expect("create_tables again");
         let tx = db.tx().expect("tx");
         assert_eq!(tx.get::<tables::CanonicalHeaders>(7).expect("get"), Some(hash));
@@ -455,8 +455,8 @@ mod tndb {
         let err = db_table_stats(&path).expect_err("no database");
         let msg = format!("{err:#}");
         assert!(msg.contains("no reth database at"), "says there is none: {msg}");
-        assert!(msg.contains(tndb_b_reth::DATA_FILE) && msg.contains(MDBX_DATA_FILE), "{msg}");
-        assert!(!path.join(tndb_b_reth::DATA_FILE).try_exists().expect("stat"), "nothing made");
+        assert!(msg.contains(tn_lmdb_reth::DATA_FILE) && msg.contains(MDBX_DATA_FILE), "{msg}");
+        assert!(!path.join(tn_lmdb_reth::DATA_FILE).try_exists().expect("stat"), "nothing made");
     }
 
     /// reth's database version file is checked on reopen: a missing one is written, another
@@ -468,13 +468,13 @@ mod tndb {
         let db_args = test_db_args();
         let version_file = reth_db::version::db_version_file_path(&path);
 
-        drop(open_tndb(&path, &db_args, version("1.0.0")).expect("fresh open"));
+        drop(open_tn_lmdb(&path, &db_args, version("1.0.0")).expect("fresh open"));
         std::fs::remove_file(&version_file).expect("remove the version file");
-        drop(open_tndb(&path, &db_args, version("1.0.0")).expect("reopen without it"));
+        drop(open_tn_lmdb(&path, &db_args, version("1.0.0")).expect("reopen without it"));
         reth_db::version::check_db_version_file(&path).expect("written again");
 
         std::fs::write(&version_file, "1").expect("another version");
-        let err = open_tndb(&path, &db_args, version("1.0.0")).expect_err("another version");
+        let err = open_tn_lmdb(&path, &db_args, version("1.0.0")).expect_err("another version");
         assert!(format!("{err:#}").contains("version"), "a version error: {err:#}");
     }
 }

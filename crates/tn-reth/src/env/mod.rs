@@ -214,7 +214,7 @@ impl RethEnv {
     /// Break this out so this can be created upfront and used even on a
     /// restart (when catching up for instance).
     ///
-    /// Opens on this build's engine, MDBX or tndb-b, and refuses a directory holding the other
+    /// Opens on this build's engine, MDBX or tn-lmdb, and refuses a directory holding the other
     /// engine's database (`database::open_rw`).
     pub fn new_database<P: AsRef<Path>>(
         reth_config: &RethConfig,

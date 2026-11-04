@@ -121,7 +121,7 @@ fi
 ./etc/ci-lanes.sh clippy
 ./etc/ci-lanes.sh test-default
 ./etc/ci-lanes.sh test-adiri
-./etc/ci-lanes.sh test-tndb
+./etc/ci-lanes.sh test-tn-lmdb
 
 # The e2e suites: the part CI does not run, and the reason this script attests anything at
 # all. They are split into two invocations to avoid any port/node confusion.

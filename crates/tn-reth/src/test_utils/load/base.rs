@@ -61,22 +61,22 @@ pub const META_FILE: &str = "bench-base.json";
 /// matches what this code would build for the same spec and the genesis check cannot tell
 /// ([`BaseMeta::slim_genesis_hash`]): a reth table layout, say.
 ///
-/// Version 2: on the tndb-b backend, `tndb-b-reth` stores reth's state tables
+/// Version 2: on the tn-lmdb backend, `tn-lmdb-reth` stores reth's state tables
 /// (`PlainStorageState`, `HashedStorages`, `StoragesTrie`) as the engine's dup tables, no longer
 /// as composite keys in plain tables, and refuses at open a file that holds them in the other
 /// form. Every base is renamed, so none built in the old form is ever opened; the MDBX bases,
 /// whose layout did not change, rebuild once with them (the version is one for both backends).
 ///
-/// Version 3: on the tndb-b backend, the state tables' engine dup tables keep a key of few rows in
+/// Version 3: on the tn-lmdb backend, the state tables' engine dup tables keep a key of few rows in
 /// its outer cell (a packed set) instead of a nested tree of its own; every base rebuilds once,
 /// the MDBX ones with them.
 ///
-/// Version 4: the tndb-b engine's file format 5 keeps leaf values inline up to half a page and
+/// Version 4: the tn-lmdb engine's file format 5 keeps leaf values inline up to half a page and
 /// refuses a format-4 file at open, so every base rebuilds once, the MDBX ones with them.
 pub const LAYOUT_VERSION: u32 = 4;
 
 /// This build's database backend, as [`BaseMeta::backend`] records it.
-pub const BACKEND: &str = if cfg!(feature = "tndb-b") { "tndb-b" } else { "mdbx" };
+pub const BACKEND: &str = if cfg!(feature = "tn-lmdb") { "tn-lmdb" } else { "mdbx" };
 
 /// The `--db.*` flags a base is built with: production defaults, durable sync, and a new file of
 /// `page_size` (a number of bytes) pages.

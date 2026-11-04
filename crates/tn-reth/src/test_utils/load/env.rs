@@ -14,12 +14,12 @@ use tn_storage::disk::{drop_cached_pages, fsync_file};
 use tn_types::{gas_accumulator::GasAccumulator, TaskManager};
 
 /// This build's database data file inside the database directory.
-#[cfg(not(feature = "tndb-b"))]
+#[cfg(not(feature = "tn-lmdb"))]
 const DATA_FILE: &str = "mdbx.dat";
 
 /// This build's database data file inside the database directory.
-#[cfg(feature = "tndb-b")]
-const DATA_FILE: &str = tndb_b_reth::DATA_FILE;
+#[cfg(feature = "tn-lmdb")]
+const DATA_FILE: &str = tn_lmdb_reth::DATA_FILE;
 
 /// Open the reth env in `datadir` (database in `datadir/db`) as the node opens it: the `--db.*`
 /// flags in `db_flags` parsed by the node's CLI (`RethCommand`), resolved through
@@ -35,7 +35,7 @@ const DATA_FILE: &str = tndb_b_reth::DATA_FILE;
 ///   effects.
 ///
 /// The database stays open until the env, its clones and `task_manager`'s tasks holding it are
-/// dropped; the tndb build holds a lock on it until then, so a second open of the same datadir
+/// dropped; the tn-lmdb build holds a lock on it until then, so a second open of the same datadir
 /// fails meanwhile. [`open_production_env_with_db`] also returns the database handle.
 pub fn open_production_env(
     datadir: &Path,
@@ -49,7 +49,7 @@ pub fn open_production_env(
 /// [`open_production_env`], returning the env's database handle beside it, for reads the env does
 /// not offer ([`db_counters`](fn@super::db_counters), [`db_page_size`](super::db_page_size)).
 ///
-/// The handle is one more owner of the database: it stays open (and, on tndb-b, locked) until the
+/// The handle is one more owner of the database: it stays open (and, on tn-lmdb, locked) until the
 /// handle drops too, so drop it with the env before reopening the datadir.
 pub fn open_production_env_with_db(
     datadir: &Path,
@@ -204,7 +204,7 @@ fn announce_dir_on(dir: &Path, fs: Option<String>) {
 }
 
 /// The length and the allocated bytes of this build's database data file (`mdbx.dat` or
-/// `tndb.dat`) in the database directory `db_dir`.
+/// `tn-lmdb.dat`) in the database directory `db_dir`.
 pub fn db_file_bytes(db_dir: &Path) -> eyre::Result<(u64, u64)> {
     let meta = std::fs::metadata(db_dir.join(DATA_FILE))?;
     Ok((meta.len(), meta.blocks() * 512))

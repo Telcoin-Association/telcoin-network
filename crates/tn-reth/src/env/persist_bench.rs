@@ -1,5 +1,5 @@
 //! On-demand benchmark of TN's per-block persist on the reth database: the time of
-//! [`RethEnv::persist_executed_output`] on this build's engine, MDBX or tndb-b.
+//! [`RethEnv::persist_executed_output`] on this build's engine, MDBX or tn-lmdb.
 //!
 //! Run it once per build (it is `#[ignore]`d out of the default suite), each build in its own
 //! target directory so neither rebuild overwrites the other's binary:
@@ -9,8 +9,8 @@
 //! TMPDIR=$PWD/target/persist-bench-tmp CARGO_TARGET_DIR=target/persist-mdbx \
 //!     cargo test --release -p tn-reth --lib env::persist_bench::per_block_persist -- \
 //!     --ignored --exact --nocapture
-//! TMPDIR=$PWD/target/persist-bench-tmp CARGO_TARGET_DIR=target/persist-tndb \
-//!     cargo test --release -p tn-reth --features tndb-b --lib \
+//! TMPDIR=$PWD/target/persist-bench-tmp CARGO_TARGET_DIR=target/persist-tn-lmdb \
+//!     cargo test --release -p tn-reth --features tn-lmdb --lib \
 //!     env::persist_bench::per_block_persist -- --ignored --exact --nocapture
 //! ```
 //!
@@ -32,12 +32,12 @@
 //! consensus output holding one block per batch. Each mode prints one line,
 //!
 //! ```text
-//! persist_bench backend=tndb-b sync=nosync per_commit=1 n=400 blocks=400 txs=200 median_us=..
+//! persist_bench backend=tn-lmdb sync=nosync per_commit=1 n=400 blocks=400 txs=200 median_us=..
 //! ```
 //!
 //! with the per-commit median, p90, p99 (nearest rank) and max, the total, blocks per second of
 //! persist time, and the database file's length and allocated bytes at the end (`mdbx.dat` or
-//! `tndb.dat`). The `db_*` and `sf_*` fields are reth's own split of each persist, from the
+//! `tn-lmdb.dat`). The `db_*` and `sf_*` fields are reth's own split of each persist, from the
 //! timings `DatabaseProvider` records in its metrics: `db_write` is the database writes of
 //! `save_blocks` (the static-file writes, `sf_write`, run beside them on another thread),
 //! `sf_commit` the static files' commit and sync, and `db_commit` the database commit after it;
@@ -55,15 +55,15 @@
 //! - `TN_PERSIST_BENCH_ACCOUNTS` (10000): prefilled accounts, and as many prefilled slots in the
 //!   writer contract.
 //! - `TN_PERSIST_BENCH_SYNC` (`nosync`): `nosync` or `durable` (`--db.sync-mode durable`). On MDBX
-//!   `nosync` is `--db.sync-mode safe-no-sync`. tndb-b refuses that flag (`tndb_args`: its `NoSync`
-//!   reuses freed pages only after a sync, so the file grows until one), so the tndb build opens
-//!   its database with the engine's `SyncMode::NoSync` through the test-only
+//!   `nosync` is `--db.sync-mode safe-no-sync`. tn-lmdb refuses that flag (`tn_lmdb_args`: its
+//!   `NoSync` reuses freed pages only after a sync, so the file grows until one), so the tn-lmdb
+//!   build opens its database with the engine's `SyncMode::NoSync` through the test-only
 //!   `database::TEST_NO_SYNC`, on otherwise default `--db.*` settings.
 //!
 //! **Caveats.**
 //!
 //! - On macOS reth's bundled libmdbx makes each durable commit with `fcntl(F_FULLFSYNC)`, which
-//!   flushes the drive's cache, while tndb-b syncs with a plain `fsync`, which does not. A durable
+//!   flushes the drive's cache, while tn-lmdb syncs with a plain `fsync`, which does not. A durable
 //!   run on macOS therefore compares unequal syncs; judge the engines there by `nosync`, where
 //!   neither waits for the disk, and leave the durable verdict to Linux.
 //! - reth's static-file writes (`save_blocks` appends, and the commit syncs them with
@@ -391,11 +391,11 @@ fn run_mode(
 ) -> ModeRun {
     init_reth_defaults();
     let chain = chain(knobs.accounts);
-    #[cfg(not(feature = "tndb-b"))]
+    #[cfg(not(feature = "tn-lmdb"))]
     let sync_mode = Some(if knobs.durable { SyncMode::Durable } else { SyncMode::SafeNoSync });
-    // The tndb build refuses `--db.sync-mode safe-no-sync`, so `nosync` reaches the engine's
+    // The tn-lmdb build refuses `--db.sync-mode safe-no-sync`, so `nosync` reaches the engine's
     // `NoSync` through the test-only `TEST_NO_SYNC`, read by the open on this thread.
-    #[cfg(feature = "tndb-b")]
+    #[cfg(feature = "tn-lmdb")]
     let sync_mode = {
         super::database::TEST_NO_SYNC.set(!knobs.durable);
         knobs.durable.then_some(SyncMode::Durable)
@@ -409,7 +409,7 @@ fn run_mode(
     let db_dir = datadir.join("db");
     let task_manager = TaskManager::new("persist bench");
     let database = RethEnv::new_database(&reth_config, &db_dir).expect("open the database");
-    #[cfg(feature = "tndb-b")]
+    #[cfg(feature = "tn-lmdb")]
     super::database::TEST_NO_SYNC.set(false);
     let reth_env =
         RethEnv::new(&reth_config, &task_manager, database, None, GasAccumulator::default())
@@ -513,7 +513,7 @@ fn sorted(durations: impl Iterator<Item = Duration>) -> Vec<Duration> {
 
 /// Print one parseable line for a mode.
 fn report(knobs: &Knobs, per_commit: usize, run: &ModeRun) {
-    let backend = if cfg!(feature = "tndb-b") { "tndb-b" } else { "mdbx" };
+    let backend = if cfg!(feature = "tn-lmdb") { "tn-lmdb" } else { "mdbx" };
     let persist = sorted(run.commits.iter().copied());
     let db = sorted(run.splits.iter().map(|s| s.db()));
     let db_write = sorted(run.splits.iter().map(|s| s.db_write));

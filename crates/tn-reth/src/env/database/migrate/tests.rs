@@ -1,9 +1,9 @@
-//! Tests for the MDBX to tndb-b migration: a round trip of every table, the directory states, a
+//! Tests for the MDBX to tn-lmdb migration: a round trip of every table, the directory states, a
 //! stop at each step, the verification before the commit point, the refusals, and an on-demand
 //! migration of a copy of a real database.
 
 use super::*;
-use crate::env::database::{db_table_stats, open_tndb, temp_chain_db_args, RethDb};
+use crate::env::database::{db_table_stats, open_tn_lmdb, temp_chain_db_args, RethDb};
 use reth_db::{
     cursor::DbDupCursorRO as _,
     mdbx::DatabaseFlags,
@@ -23,9 +23,9 @@ type Rows = Vec<(Vec<u8>, Vec<u8>)>;
 /// 16 KiB pages take the dup values below on every platform.
 const MDBX_PAGE_SIZE: usize = 16384;
 
-/// The page size the migrated file is asked for (not tndb-b's default 4096), so the tests see the
+/// The page size the migrated file is asked for (not tn-lmdb's default 4096), so the tests see the
 /// migration take the node's `--db.page-size`.
-const TNDB_PAGE_SIZE: usize = 8192;
+const TN_LMDB_PAGE_SIZE: usize = 8192;
 
 /// A table the test's MDBX database never creates, as one whose schema predates the table.
 const MISSING: &str = tables::PruneCheckpoints::NAME;
@@ -44,8 +44,8 @@ const DUP_TABLES: [(&str, usize, usize); 5] = [
 ];
 
 /// The `--db.*` settings the node opens the migrated database with.
-fn tndb_db_args() -> DatabaseArgs {
-    DatabaseArgs { page_size: Some(TNDB_PAGE_SIZE), ..temp_chain_db_args() }
+fn tn_lmdb_db_args() -> DatabaseArgs {
+    DatabaseArgs { page_size: Some(TN_LMDB_PAGE_SIZE), ..temp_chain_db_args() }
 }
 
 /// A client version for the `VersionHistory` rows.
@@ -60,9 +60,9 @@ fn version(version: &str) -> ClientVersion {
 /// The raw rows the test's MDBX database holds, by table:
 /// - `CanonicalHeaders`: 3000 rows, so its copy takes several of the tests' write transactions;
 /// - `Bytecodes`: three values in overflow runs on both engines;
-/// - `PlainAccountState`: values of 2500 bytes, past tndb-b's inline limit at its page size;
+/// - `PlainAccountState`: values of 2500 bytes, past tn-lmdb's inline limit at its page size;
 /// - every dup-sort table: three keys of four values each, distinct subkeys written out of order,
-///   one value per key of 2500 bytes (an overflow run on tndb-b);
+///   one value per key of 2500 bytes (an overflow run on tn-lmdb);
 /// - `VersionHistory`: two client versions;
 /// - [`EMPTY`] none, and [`MISSING`] is not created.
 fn mdbx_rows() -> BTreeMap<&'static str, Rows> {
@@ -125,10 +125,11 @@ const CROSSING_VALUE_LEN: usize = 71;
 const SMALL_ROWS: u64 = 3;
 
 /// The least packed bound of a nested table at any page size: 975 bytes, a 32-byte key's at 4 KiB
-/// pages (tndb-b's `DupOptions::resolved`).
+/// pages (tn-lmdb's `DupOptions::resolved`).
 const LEAST_PACKED_MAX: usize = 975;
 
-/// The greatest packed bound of a nested table at [`TNDB_PAGE_SIZE`]: 2011 bytes, a 20-byte key's.
+/// The greatest packed bound of a nested table at [`TN_LMDB_PAGE_SIZE`]: 2011 bytes, a 20-byte
+/// key's.
 const MOST_PACKED_MAX: usize = 2011;
 
 /// The big key of a dup-sort table whose keys are `key_len` bytes: between [`mdbx_rows`]'s second
@@ -186,7 +187,7 @@ fn added_value(subkey_len: usize, n: u64, len: usize) -> Vec<u8> {
     value
 }
 
-/// The bytes of a packed set of `rows` (tndb-b's `packed` codec): a 2-byte row count, then per row
+/// The bytes of a packed set of `rows` (tn-lmdb's `packed` codec): a 2-byte row count, then per row
 /// a 4-byte slot and the row's subkey and value, which is reth's compressed value.
 fn packed_len(rows: &[(Vec<u8>, Vec<u8>)]) -> usize {
     2 + rows.iter().map(|(_, value)| 4 + value.len()).sum::<usize>()
@@ -360,7 +361,7 @@ fn exists(file: &Path) -> bool {
 /// from the copied `VersionHistory` rows (so the first open adds a row, which the tests drop
 /// before comparing).
 fn open(path: &Path) -> eyre::Result<RethDb> {
-    open_tndb(path, &tndb_db_args(), version("2.0.0"))
+    open_tn_lmdb(path, &tn_lmdb_db_args(), version("2.0.0"))
 }
 
 /// The test covers every dup-sort table reth has: a new one needs a row in [`DUP_TABLES`] (and a
@@ -373,7 +374,7 @@ fn the_tests_cover_every_dup_sort_table() {
     assert_eq!(dup_sort, covered);
 }
 
-/// An MDBX database moves onto tndb-b at the first open: every table's raw rows are the same, row
+/// An MDBX database moves onto tn-lmdb at the first open: every table's raw rows are the same, row
 /// for row (a table MDBX lacks is empty), the file has the configured page size, MDBX's files and
 /// the temp directory are gone, the marker lists the rows copied, and reth's version file is
 /// kept. The client version is recorded after the copied `VersionHistory` rows. A second open is
@@ -387,7 +388,7 @@ fn an_mdbx_database_migrates_row_for_row() {
     let version_bytes = std::fs::read(&version_file).expect("reth's version file");
 
     let db = open(&path).expect("the open migrates");
-    assert_eq!(db.page_size(), TNDB_PAGE_SIZE as u32, "the configured page size");
+    assert_eq!(db.page_size(), TN_LMDB_PAGE_SIZE as u32, "the configured page size");
     let mut migrated = raw_rows(&*db);
     let history = migrated.get_mut(tables::VersionHistory::NAME).expect("history");
     let (_, recorded) = history.pop().expect("the client version is recorded");
@@ -408,7 +409,7 @@ fn an_mdbx_database_migrates_row_for_row() {
     let marker = std::fs::read_to_string(path.join(MIGRATED_MARKER)).expect("the marker");
     let total: usize = expected.values().map(Vec::len).sum();
     assert!(
-        marker.starts_with(&format!("migrated from MDBX to tndb-b: {total} rows\n")),
+        marker.starts_with(&format!("migrated from MDBX to tn-lmdb: {total} rows\n")),
         "{marker}"
     );
     assert!(marker.contains(&format!("{} 3000\n", tables::CanonicalHeaders::NAME)), "{marker}");
@@ -541,11 +542,13 @@ fn stop_then_reopen_with(
 /// The rows of every one of reth's tables in a stopped migration's temp file in `path`.
 fn temp_rows(path: &Path) -> BTreeMap<&'static str, Rows> {
     let temp = path.join(MIGRATING_DIR);
-    raw_rows(&TndbEnv::open(&temp, TndbEnvKind::RO, TndbArgs::default()).expect("the temp file"))
+    raw_rows(
+        &TnLmdbEnv::open(&temp, TnLmdbEnvKind::RO, TnLmdbArgs::default()).expect("the temp file"),
+    )
 }
 
 /// Assert the files a stop before the commit point leaves in `path`: MDBX's, the temp directory's
-/// `tndb.dat`, and no `tndb.dat` or marker beside MDBX's.
+/// `tn-lmdb.dat`, and no `tn-lmdb.dat` or marker beside MDBX's.
 fn assert_stopped_before_the_commit_point(path: &Path) {
     assert!(exists(&path.join(MDBX_DATA_FILE)), "mdbx.dat is left");
     assert!(exists(&path.join(MIGRATING_DIR).join(DATA_FILE)), "the temp file is left");
@@ -603,7 +606,7 @@ fn a_migration_stopped_before_its_commit_point_migrates_again_at_the_next_open()
     stop_then_reopen(Step::BeforeRename, 0, assert_stopped_before_the_commit_point);
 }
 
-/// A migration stopped after its commit point (`tndb.dat` in place beside MDBX's files, no
+/// A migration stopped after its commit point (`tn-lmdb.dat` in place beside MDBX's files, no
 /// marker) is finished by the next open: MDBX's files and the temp directory are removed, the
 /// marker is written, and the migrated rows are intact.
 #[test]
@@ -618,12 +621,12 @@ fn a_migration_stopped_after_its_commit_point_is_finished() {
 }
 
 /// A migration stopped after it removed MDBX's files, before it wrote the marker, is finished by
-/// the next open, which writes the marker: the emptied temp directory beside `tndb.dat` says the
+/// the next open, which writes the marker: the emptied temp directory beside `tn-lmdb.dat` says the
 /// migration is unfinished.
 #[test]
 fn a_migration_stopped_before_its_marker_is_finished() {
     let marker = stop_then_reopen(Step::BeforeMarker, 0, |path| {
-        assert!(exists(&path.join(DATA_FILE)), "tndb.dat is in place");
+        assert!(exists(&path.join(DATA_FILE)), "tn-lmdb.dat is in place");
         assert!(exists(&path.join(MIGRATING_DIR)), "the temp directory is kept");
         assert!(!exists(&path.join(MIGRATING_DIR).join(DATA_FILE)), "emptied by the rename");
         for absent in [MDBX_DATA_FILE, MDBX_LOCK_FILE, MIGRATED_MARKER] {
@@ -643,7 +646,7 @@ fn mdbx_written_after_a_migration_is_refused() {
     drop(open(&path).expect("migrate"));
     std::fs::write(path.join(MDBX_DATA_FILE), b"written by an older binary").expect("plant");
     let marker = std::fs::read(path.join(MIGRATED_MARKER)).expect("marker");
-    let tndb = std::fs::read(path.join(DATA_FILE)).expect("tndb.dat");
+    let tn_lmdb = std::fs::read(path.join(DATA_FILE)).expect("tn-lmdb.dat");
 
     let refused = |err: eyre::Report| {
         let msg = format!("{err:#}");
@@ -657,14 +660,18 @@ fn mdbx_written_after_a_migration_is_refused() {
     let mdbx = std::fs::read(path.join(MDBX_DATA_FILE)).expect("mdbx.dat");
     assert_eq!(mdbx, b"written by an older binary", "mdbx.dat unchanged");
     assert_eq!(std::fs::read(path.join(MIGRATED_MARKER)).expect("marker"), marker);
-    assert_eq!(std::fs::read(path.join(DATA_FILE)).expect("tndb.dat"), tndb, "tndb.dat unchanged");
+    assert_eq!(
+        std::fs::read(path.join(DATA_FILE)).expect("tn-lmdb.dat"),
+        tn_lmdb,
+        "tn-lmdb.dat unchanged"
+    );
     std::fs::remove_file(path.join(MDBX_DATA_FILE)).expect("resolved by hand");
     let mut rows = raw_rows(&*open(&path).expect("open once resolved"));
     rows.get_mut(tables::VersionHistory::NAME).expect("history").pop();
     assert_eq!(rows, expected);
 }
 
-/// A migrated database whose `tndb.dat` is missing (the marker alone) is refused, and nothing is
+/// A migrated database whose `tn-lmdb.dat` is missing (the marker alone) is refused, and nothing is
 /// created in its place beside the static files.
 #[test]
 fn a_migrated_database_without_its_file_is_refused() {
@@ -679,11 +686,11 @@ fn a_migrated_database_without_its_file_is_refused() {
     assert!(!exists(&path.join(DATA_FILE)), "no database is created in its place");
 }
 
-/// A stopped migration's temp directory found beside a tndb-b database, still holding a copy (so
+/// A stopped migration's temp directory found beside a tn-lmdb database, still holding a copy (so
 /// not one emptied by a migration's rename), is removed by its open, which keeps the database's
 /// rows and writes no marker.
 #[test]
-fn a_stale_temp_directory_beside_tndb_is_removed() {
+fn a_stale_temp_directory_beside_tn_lmdb_is_removed() {
     let tmp = TempDir::new().expect("tempdir");
     let path = tmp.path().join("db");
     let db = open(&path).expect("a new database");
@@ -702,7 +709,7 @@ fn a_stale_temp_directory_beside_tndb_is_removed() {
 }
 
 /// A stopped migration's temp directory found before a migration is replaced: the migration
-/// builds its file afresh, so a stale `tndb.dat` there (here not a tndb-b file at all) is never
+/// builds its file afresh, so a stale `tn-lmdb.dat` there (here not a tn-lmdb file at all) is never
 /// opened.
 #[test]
 fn a_stale_temp_directory_before_a_migration_is_replaced() {
@@ -754,7 +761,7 @@ fn the_copy_is_verified_before_the_commit_point() {
 }
 
 /// Assert that a refused migration left the database in `path` as it found it: `mdbx.dat` holds
-/// `mdbx`, and there is no `tndb.dat`, temp directory or marker.
+/// `mdbx`, and there is no `tn-lmdb.dat`, temp directory or marker.
 fn assert_untouched(path: &Path, mdbx: &[u8], case: &str) {
     let now = std::fs::read(path.join(MDBX_DATA_FILE)).expect("mdbx.dat");
     assert!(now == mdbx, "{case}: mdbx.dat unchanged");
@@ -869,7 +876,7 @@ fn a_table_that_is_not_reths_is_listed_and_not_copied() {
 }
 
 /// MDBX keeps any distinct values of a dup-sort key, so it can hold two that share a subkey (the
-/// value's first W bytes; here `PlainStorageState`'s 32-byte slot). tndb-b-reth stores one value
+/// value's first W bytes; here `PlainStorageState`'s 32-byte slot). tn-lmdb-reth stores one value
 /// per subkey, and refuses the second with `MDBX_KEYEXIST`: the migration fails with that refusal,
 /// and leaves MDBX untouched.
 #[test]
@@ -895,10 +902,10 @@ fn a_second_value_for_a_dup_subkey_fails_the_migration() {
     assert_untouched(&path, &mdbx, "a second value for a subkey");
 }
 
-/// A value larger than tndb-b takes (16 MiB with a short key, the engine's limit; MDBX takes
+/// A value larger than tn-lmdb takes (16 MiB with a short key, the engine's limit; MDBX takes
 /// larger) fails the migration with the adapter's `MDBX_BAD_VALSIZE`, and leaves MDBX untouched.
 #[test]
-fn a_value_too_large_for_tndb_fails_the_migration() {
+fn a_value_too_large_for_tn_lmdb_fails_the_migration() {
     let tmp = TempDir::new().expect("tempdir");
     let path = tmp.path().join("db");
     let mut rows = mdbx_rows();
@@ -957,7 +964,7 @@ impl<TX: DbTx> TableViewer<Digest> for DigestTable<'_, TX> {
 /// On demand: migrate a copy of a real reth database through `open_rw` with the default `--db.*`
 /// settings, and check every table's rows and their hash against the copy's MDBX. It prints the
 /// live bytes of the copy's tables and the free space the migration needs ([`needed_bytes`]), then
-/// the time, the sizes of `mdbx.dat` and `tndb.dat`, and each table's rows.
+/// the time, the sizes of `mdbx.dat` and `tn-lmdb.dat`, and each table's rows.
 ///
 /// `TN_RETH_MIGRATE_SRC` names a reth database directory holding `mdbx.dat` (a stopped node's
 /// `<datadir>/db`). The test copies its `mdbx.dat` and `database.version` into a temp dir and
@@ -967,7 +974,7 @@ impl<TX: DbTx> TableViewer<Digest> for DigestTable<'_, TX> {
 ///
 /// ```text
 /// TN_RETH_MIGRATE_SRC=/path/to/datadir/db TMPDIR=/path/on/a/real/disk \
-///   cargo nextest run -p tn-reth --features tndb-b --run-ignored only --no-capture \
+///   cargo nextest run -p tn-reth --features tn-lmdb --run-ignored only --no-capture \
 ///   -E 'test(migrates_a_copy_of_a_real_database)'
 /// ```
 ///
@@ -1026,15 +1033,15 @@ fn migrates_a_copy_of_a_real_database() {
             assert!((mdbx.rows..=mdbx.rows + 1).contains(&rows), "VersionHistory: {rows} rows");
             limit = Some(mdbx.rows);
         }
-        let tndb = table.view(&DigestTable { tx: &tx, limit }).expect("digest");
-        assert_eq!(&tndb, mdbx, "table {}: the migrated rows", table.name());
+        let tn_lmdb = table.view(&DigestTable { tx: &tx, limit }).expect("digest");
+        assert_eq!(&tn_lmdb, mdbx, "table {}: the migrated rows", table.name());
         println!("{:<32} {:>14} rows", table.name(), mdbx.rows);
     }
     drop(tx);
     assert!(exists(&path.join(MIGRATED_MARKER)) && !exists(&path.join(MDBX_DATA_FILE)));
-    let tndb_len = std::fs::metadata(path.join(DATA_FILE)).expect("tndb.dat").len();
+    let tn_lmdb_len = std::fs::metadata(path.join(DATA_FILE)).expect("tn-lmdb.dat").len();
     let rows: u64 = before.iter().map(|digest| digest.rows).sum();
     println!(
-        "migrated {rows} rows in {elapsed:?}: mdbx.dat {mdbx_len} bytes, tndb.dat {tndb_len} bytes"
+        "migrated {rows} rows in {elapsed:?}: mdbx.dat {mdbx_len} bytes, tn-lmdb.dat {tn_lmdb_len} bytes"
     );
 }

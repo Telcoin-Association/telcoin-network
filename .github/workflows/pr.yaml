@@ -408,11 +408,11 @@ jobs:
           NEXTEST_PROFILE: ci
         run: ./etc/ci-lanes.sh test-adiri
 
-  # tndb feature lane: the default-feature test job above runs every reth database on MDBX,
-  # so it never runs reth on tndb-b. This lane reruns the workspace with tn-reth's `tndb-b`
+  # tn-lmdb feature lane: the default-feature test job above runs every reth database on MDBX,
+  # so it never runs reth on tn-lmdb. This lane reruns the workspace with tn-reth's `tn-lmdb`
   # feature; the reason it is a whole-workspace run lives in etc/ci-lanes.sh. Same 45-minute
   # ceiling as `test`, for the same reasons.
-  tndb-test:
+  tn-lmdb-test:
     needs: ci-scope
     if: needs.ci-scope.outputs.run_lanes == 'true'
     runs-on: ubuntu-latest
@@ -432,7 +432,7 @@ jobs:
           tool: cargo-nextest
 
       # Restore only (see the clippy job), from the same entry as `test`: cache-deps builds
-      # all three test lanes into one target dir, where the tndb-b variants of the shared
+      # all three test lanes into one target dir, where the tn-lmdb variants of the shared
       # dependencies coexist with the default ones.
       - name: Cache dependencies
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
@@ -441,10 +441,10 @@ jobs:
           shared-key: test-cache
           save-if: "false"
 
-      - name: Run tests on tndb-b
+      - name: Run tests on tn-lmdb
         env:
           NEXTEST_PROFILE: ci
-        run: ./etc/ci-lanes.sh test-tndb
+        run: ./etc/ci-lanes.sh test-tn-lmdb
 
   # Guard: pinned consensus-registry reads (committee membership, epoch records, epoch state,
   # worker fee configs) resolve historical state through `state_by_block_hash`, which reth fails
@@ -494,7 +494,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     if: always()
-    needs: [ci-scope, attest, fmt, clippy, test, adiri-test, tndb-test, archive-mode-gate, connection-limits-patch, quinn-proto-patch, transport-evidence, quic-profile-pins]
+    needs: [ci-scope, attest, fmt, clippy, test, adiri-test, tn-lmdb-test, archive-mode-gate, connection-limits-patch, quinn-proto-patch, transport-evidence, quic-profile-pins]
     steps:
       - name: Check all jobs passed
         env:
@@ -521,7 +521,7 @@ jobs:
           # The job list is asserted, not discovered: a job renamed or dropped from
           # `needs` would otherwise leave this check silently, or turn up as an unnamed
           # lane whose `skipped` the pull_request branch below accepts.
-          expected="adiri-test archive-mode-gate attest ci-scope clippy connection-limits-patch fmt quic-profile-pins quinn-proto-patch test tndb-test transport-evidence"
+          expected="adiri-test archive-mode-gate attest ci-scope clippy connection-limits-patch fmt quic-profile-pins quinn-proto-patch test tn-lmdb-test transport-evidence"
           actual=$(jq -r 'keys | join(" ")' <<<"${RESULTS}")
           if [[ "${actual}" != "${expected}" ]]; then
             echo "::error::needs mismatch: expected [${expected}], got [${actual}]. Update 'expected' in this step together with 'needs'."

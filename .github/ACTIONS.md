@@ -19,7 +19,7 @@ Two PRs that each pass alone can still break each other, and no amount of attest
 
 So the two gates cover different things and neither replaces the other:
 
-| | attestation (`verify-on-chain`) | merge queue (`fmt`, `clippy`, `test`, `adiri-test`, `tndb-test`, the guards) |
+| | attestation (`verify-on-chain`) | merge queue (`fmt`, `clippy`, `test`, `adiri-test`, `tn-lmdb-test`, the guards) |
 |---|---|---|
 | commit tested | the PR head | main + this PR + every PR ahead of it in the batch |
 | suite | everything, e2e included | everything CI can afford; no e2e |
@@ -147,7 +147,7 @@ The bypass mode is *Always allow*, which also lets an admin push to `main` with 
 ## Caches
 
 `main` is the only writer of the cache entries the lanes restore.
-`.github/workflows/cache-deps.yaml` runs there and saves two entries: `clippy-cache` (dependencies for both clippy passes under the nightly pin) and `test-cache` (dependencies for the three test lanes, default, adiri and tndb-b features, under the stable pin). `Swatinem/rust-cache` does not save the workspace crates or their test binaries, so each PR still builds those from its own source.
+`.github/workflows/cache-deps.yaml` runs there and saves two entries: `clippy-cache` (dependencies for both clippy passes under the nightly pin) and `test-cache` (dependencies for the three test lanes, default, adiri and tn-lmdb features, under the stable pin). `Swatinem/rust-cache` does not save the workspace crates or their test binaries, so each PR still builds those from its own source.
 The lanes in `pr.yaml` restore those and never save (`save-if: "false"`): a cache saved by a `pull_request` run is scoped to that PR's branch and one saved by a `merge_group` run lands on the queue's throwaway branch, so nothing else could ever read them, while the upload adds minutes to the critical path and eats quota that evicts the entries the queue does read.
 The rust-cache step in `quic-interop.yaml` keys its own `quic-<release>` entries and saves them only on `main` (`save-if: ${{ github.ref == 'refs/heads/main' }}`, so the weekly schedule or a dispatch there), for the same reason.
 

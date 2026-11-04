@@ -9,7 +9,7 @@
 //!   [`dir_bytes`] measure the database and the static files on disk.
 //! - The open database's own reads, the same on either backend: [`db_counters`](fn@db_counters)
 //!   reads its cumulative page and write counters as [`DbCounters`] (MDBX's page operations or
-//!   tndb-b's I/O counters, by name; [`DbCounters::since`] gives what happened between two reads),
+//!   tn-lmdb's I/O counters, by name; [`DbCounters::since`] gives what happened between two reads),
 //!   and [`db_page_size`] the page size its file was created with.
 //! - [`state`]: the prefilled genesis, [`PrefillSpec`]: keyed senders, funded accounts, two ERC20
 //!   tokens with prefilled balances and allowances, and a swap router with prefilled pools.

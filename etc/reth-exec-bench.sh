@@ -15,12 +15,12 @@
 #                    counts as a completed run, a stale one from an earlier invocation included,
 #                    and a failed run is not known.
 #   Backend mode (no commit): this checkout (uncommitted changes included) built twice, MDBX (the
-#                    default features) against tndb-b (`--features tn-reth/tndb-b`).
+#                    default features) against tn-lmdb (`--features tn-reth/tn-lmdb`).
 #   Commit mode (a before-commit): one backend, the commit against this checkout. The commit must
 #                    have the bench (`crates/engine/tests/exec_bench/main.rs`).
-#   EXEC_BACKEND=tndb-b  commit mode's backend: `mdbx` or `tndb-b` (the default)
+#   EXEC_BACKEND=tn-lmdb  commit mode's backend: `mdbx` or `tn-lmdb` (the default)
 #   EXEC_ROUNDS=2    pairs per profile; round 1 runs A then B, round 2 B then A, and so on (the
-#                    default 2 is A B B A, 1 is A B), where A is mdbx or before and B tndb-b or after
+#                    default 2 is A B B A, 1 is A B), where A is mdbx or before and B tn-lmdb or after
 #   EXEC_PROFILES="busy busy-readers peak busy-metrics"  the profiles to run, in order:
 #                    busy          the bench's defaults
 #                    busy-readers  TN_EXEC_BENCH_READERS=4
@@ -42,15 +42,15 @@
 #                    AnonPages, Cached and MemAvailable and /proc/vmstat's pgmajfault and
 #                    workingset_refault_file (a dropped file page read again). To
 #                    reports/<run>.frag.tsv it writes filefrag's extent count of the run's data
-#                    file (tndb.dat or mdbx.dat under the run's TMPDIR) as soon as the file exists
+#                    file (tn-lmdb.dat or mdbx.dat under the run's TMPDIR) as soon as the file exists
 #                    and then every 30 s, when filefrag is installed.
 #                    The devices, the temperature file and filefrag are found once, before the
 #                    builds, and named in CONFIG. The disk is sampled whole: any other writer on
 #                    it shows up in the rows.
-#   EXEC_PAGE_SIZE_MDBX=<bytes>, EXEC_PAGE_SIZE_TNDB=<bytes>  the database page size of every run
+#   EXEC_PAGE_SIZE_MDBX=<bytes>, EXEC_PAGE_SIZE_TN_LMDB=<bytes>  the database page size of every run
 #                    on that backend (TN_EXEC_BENCH_PAGE_SIZE on its command line: a power of two
 #                    from 4096 to 65536); unset, a backend's runs take TN_EXEC_BENCH_PAGE_SIZE from
-#                    the environment, else its own default (MDBX the OS page size, tndb-b 4096).
+#                    the environment, else its own default (MDBX the OS page size, tn-lmdb 4096).
 #                    Each page size has its own cached bases. In commit mode both sides run
 #                    EXEC_BACKEND, so both take its variable, and the before commit's bench must
 #                    read TN_EXEC_BENCH_PAGE_SIZE (an older bench refuses it as an unknown knob)
@@ -77,7 +77,7 @@
 # epoch closes, the closing and normal outputs' total means; with an export, its duration, the
 # database growth while it held its read and the writer's total mean beside it over without; each
 # pair's B/A ratio of those; and the median ratio with its spread (min..max). On macOS a durable commit is
-# `F_FULLFSYNC` for libmdbx but a plain fsync for tndb-b, so backend-mode durable commit times
+# `F_FULLFSYNC` for libmdbx but a plain fsync for tn-lmdb, so backend-mode durable commit times
 # there are not like-for-like; the report says so.
 #
 # From each run's per-output rows the table also has the gate's rows: the total's p90, p95 and
@@ -89,9 +89,9 @@
 # one line per run of the commit's mean in s over 10 consecutive equal groups of the timed
 # outputs (its drift over the run). Report v4 adds a block per side of the database's writes per
 # output: the commit's ms, the process's disk MiB written, the data file's growth in KiB and each
-# of the backend's counters that moved (mdbx_* or tndb_*, in the bench's order; `_ns` shown as
-# ms, a maximum as its max), then the commit's ms per page written (tndb-b: per
-# tndb_pages_synced; MDBX: per mdbx_newly + mdbx_cow + mdbx_split), which tells a commit that
+# of the backend's counters that moved (mdbx_* or tn_lmdb_*, in the bench's order; `_ns` shown as
+# ms, a maximum as its max), then the commit's ms per page written (tn-lmdb: per
+# tn_lmdb_pages_synced; MDBX: per mdbx_newly + mdbx_cow + mdbx_split), which tells a commit that
 # writes more pages from one that writes the same pages slower. Each row there is a run's mean
 # over its timed outputs, its first third and its last third (and last/first), the median over a
 # side's rounds; a v3 report has no counters and says n/a. With EXEC_SYS_SAMPLE=1 a block per side
@@ -108,7 +108,7 @@
 # bench's cached bases (--report-only needs only git and python3); EXEC_SYS_SAMPLE=1 also needs
 # awk, stat, and findmnt or df, and uses lsblk and filefrag when installed (it installs nothing).
 # In the bench dir the script writes only:
-#   target-mdbx/, target-tndb-b/           this checkout's builds (commit mode's after side too)
+#   target-mdbx/, target-tn-lmdb/           this checkout's builds (commit mode's after side too)
 #   target-before-<commit>-<backend>/      commit mode's before build
 #   build-<label>.log                      each build's output
 #   cache/ (backend mode), cache-before-<commit>/ and cache-after/ (commit mode)
@@ -149,9 +149,9 @@ STAGES = {
     "write_state": 3, "write_hashed_state": 3, "write_trie_updates": 3,
     "update_history_indices": 3, "save_blocks_sf": 2, "commit_sf": 1, "commit_mdbx": 1, "other": 1,
 }
-SIDE_PAIRS = (("mdbx", "tndb-b"), ("before", "after"))
+SIDE_PAIRS = (("mdbx", "tn-lmdb"), ("before", "after"))
 REPORT_NAME = re.compile(
-    r"^(?P<profile>.+)-(?P<side>mdbx|tndb-b|before|after)-(?P<round>[1-9][0-9]*)\.json$")
+    r"^(?P<profile>.+)-(?P<side>mdbx|tn-lmdb|before|after)-(?P<round>[1-9][0-9]*)\.json$")
 
 
 def read_manifest(path, bench=None):
@@ -221,7 +221,7 @@ def metrics(doc):
     throughput = doc.get("throughput", {})
     out += [("Mgas/s", throughput.get("mgas_per_s")), ("tx/s", throughput.get("tx_per_s"))]
     sizes = doc.get("sizes", {})
-    # Allocated growth moves in a backend's own steps (tndb-b's segments, MDBX's geometry); the
+    # Allocated growth moves in a backend's own steps (tn-lmdb's segments, MDBX's geometry); the
     # logical growth (table bytes, report v2) compares the backends
     out += [("db growth/output KiB", kib(sizes.get("db_growth_per_output_bytes"))),
             ("db logical growth/output KiB", kib(sizes.get("db_logical_growth_per_output_bytes")))]
@@ -430,8 +430,8 @@ def counter_runs(doc):
         else:
             out.append(row(name, values))
     # the engine-versus-device discriminator: commit time per page the commit wrote
-    if "tndb_pages_synced" in names:
-        label, pages = "commit ms per page synced", ("tndb_pages_synced",)
+    if "tn_lmdb_pages_synced" in names:
+        label, pages = "commit ms per page synced", ("tn_lmdb_pages_synced",)
     elif "mdbx_newly" in names:
         label, pages = "commit ms per page (newly+cow+split)", ("mdbx_newly", "mdbx_cow",
                                                                "mdbx_split")
@@ -801,10 +801,10 @@ bench_file="crates/engine/tests/exec_bench/main.rs"
 page_size_of() { # <backend>: prints EXEC_PAGE_SIZE_<backend>, or nothing when unset
     case "$1" in
         mdbx) echo "${EXEC_PAGE_SIZE_MDBX:-}" ;;
-        tndb-b) echo "${EXEC_PAGE_SIZE_TNDB:-}" ;;
+        tn-lmdb) echo "${EXEC_PAGE_SIZE_TN_LMDB:-}" ;;
     esac
 }
-for var in EXEC_PAGE_SIZE_MDBX EXEC_PAGE_SIZE_TNDB; do # the bench checks the range
+for var in EXEC_PAGE_SIZE_MDBX EXEC_PAGE_SIZE_TN_LMDB; do # the bench checks the range
     case "${!var:-}" in
         '') ;;
         *[!0-9]* | 0*) die "$var must be a page size in bytes, not '${!var}'" ;;
@@ -894,24 +894,24 @@ done
 if [ -z "$before" ]; then
     mode="backend"
     side_a="mdbx"
-    side_b="tndb-b"
+    side_b="tn-lmdb"
     tree_a="$repo"
     tree_b="$repo"
     flags_a=""
-    flags_b="--features tn-reth/tndb-b"
+    flags_b="--features tn-reth/tn-lmdb"
     page_a="$(page_size_of mdbx)"
-    page_b="$(page_size_of tndb-b)"
+    page_b="$(page_size_of tn-lmdb)"
     target_a="$bench_dir/target-mdbx"
-    target_b="$bench_dir/target-tndb-b"
+    target_b="$bench_dir/target-tn-lmdb"
     cache_a="$bench_dir/cache"
     cache_b="$bench_dir/cache"
 else
     mode="commit"
-    backend="${EXEC_BACKEND:-tndb-b}"
+    backend="${EXEC_BACKEND:-tn-lmdb}"
     case "$backend" in
         mdbx) flags_a="" ;;
-        tndb-b) flags_a="--features tn-reth/tndb-b" ;;
-        *) die "EXEC_BACKEND must be mdbx or tndb-b, not '$backend'" ;;
+        tn-lmdb) flags_a="--features tn-reth/tn-lmdb" ;;
+        *) die "EXEC_BACKEND must be mdbx or tn-lmdb, not '$backend'" ;;
     esac
     git -C "$repo" cat-file -e "$before^{commit}" 2>/dev/null || die "no commit $before"
     git -C "$repo" cat-file -e "$before:$bench_file" 2>/dev/null \
@@ -1002,7 +1002,7 @@ kv "bench dir" "$bench_dir"
     echo "### CONFIG"
 } >>"$report"
 if [ "$mode" = backend ]; then
-    kv mode "backend: mdbx (A, default features) against tndb-b (B, --features tn-reth/tndb-b)"
+    kv mode "backend: mdbx (A, default features) against tn-lmdb (B, --features tn-reth/tn-lmdb)"
     kv checkout "$(describe_checkout)"
 else
     kv mode "commit: before (A) against after (B), backend $backend"
@@ -1033,7 +1033,7 @@ kv "cache dirs" "$side_a $cache_a, $side_b $cache_b"
 unset_page="(TN_EXEC_BENCH_PAGE_SIZE or the default)"
 kv "page sizes" "$side_a ${page_a:-$unset_page}, $side_b ${page_b:-$unset_page}"
 if [ "$(uname -s)" = "Darwin" ]; then
-    kv "sync note" "macOS: libmdbx's durable commit is F_FULLFSYNC, tndb-b's a plain fsync; durable commit times are not like-for-like between the backends"
+    kv "sync note" "macOS: libmdbx's durable commit is F_FULLFSYNC, tn-lmdb's a plain fsync; durable commit times are not like-for-like between the backends"
 fi
 if [ "$sys_sample" = 1 ]; then
     disk_text="$sys_disk"
@@ -1058,7 +1058,7 @@ build() { # <label> <source tree> <target dir> <cargo flags>: prints the test bi
 }
 if [ "$mode" = backend ]; then
     label_a="mdbx"
-    label_b="tndb-b"
+    label_b="tn-lmdb"
 else
     label_a="before-$before_key-$backend"
     label_b="after-$backend"
@@ -1154,7 +1154,7 @@ sampler() { # <samples file> <extents file> <run log>
                             cached, available, majflt, refault
             }' /proc/meminfo /proc/vmstat /proc/diskstats >>"$1" 2>/dev/null
         if [ -n "$sys_frag" ] && [ "$tick" -ge "$next_frag" ]; then
-            file="$(find "$tmp_dir" -maxdepth 4 -type f \( -name tndb.dat -o -name mdbx.dat \) \
+            file="$(find "$tmp_dir" -maxdepth 4 -type f \( -name tn-lmdb.dat -o -name mdbx.dat \) \
                 -print -quit 2>/dev/null)"
             next_frag=$((tick + 1))
             if [ -n "$file" ]; then # "<file>: <n> extents found"

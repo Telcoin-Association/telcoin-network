@@ -117,11 +117,11 @@ a stray package-local `target` tree.
 If `TN_BIN_PATH` is left unset the suite still runs; add `--no-capture` to watch the one-time build
 instead of waiting on a silent first test.
 
-`reth_db_migration::test_restart_migrates_reth_db_to_tndb` needs two binaries and skips (with a
+`reth_db_migration::test_restart_migrates_reth_db_to_tn_lmdb` needs two binaries and skips (with a
 warning) in the run above. `make test-e2e-reth-migration` builds both and runs it: the committee
 starts on the default binary (`TN_BIN_PATH_PREV`, reth database on MDBX), and each validator
-restarts on the `tndb-b` binary (`TN_BIN_PATH`), migrates its reth database and follows the chain.
-The target also sets `TN_E2E_TNDB_BIN=1`, the marker that says `TN_BIN_PATH` is the `tndb-b` build.
+restarts on the `tn-lmdb` binary (`TN_BIN_PATH`), migrates its reth database and follows the chain.
+The target also sets `TN_E2E_TN_LMDB_BIN=1`, the marker that says `TN_BIN_PATH` is the `tn-lmdb` build.
 
 ## Test Log Output
 

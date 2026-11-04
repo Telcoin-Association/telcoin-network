@@ -8,7 +8,7 @@
 //!     --ignored --exact exec_bench --nocapture
 //! ```
 //!
-//! Add `--features tn-reth/tndb-b` to run the tndb-b backend. Run it with `--exact`: it installs
+//! Add `--features tn-reth/tn-lmdb` to run the tn-lmdb backend. Run it with `--exact`: it installs
 //! the process's global metrics recorder, and a test that opened a reth env first in the same
 //! process would leave reth's metric handles bound to no recorder.
 //!
@@ -91,9 +91,9 @@
 //!   `t0 + i * PACE_MS`, and the report counts the outputs that started late.
 //! - `TN_EXEC_BENCH_METRICS` (`off`): `off`, or `prom` for a `--metrics` node's recorder.
 //! - `TN_EXEC_BENCH_SYNC` (`durable`): `durable` (`--db.sync-mode durable`) or `nosync`
-//!   (`--db.sync-mode safe-no-sync`, MDBX only: the tndb-b build refuses that flag).
+//!   (`--db.sync-mode safe-no-sync`, MDBX only: the tn-lmdb build refuses that flag).
 //! - `TN_EXEC_BENCH_PAGE_SIZE` (the backend's default, [`default_page_size`]: MDBX the OS page
-//!   size, 16384 on Apple Silicon and 4096 on x86 Linux; tndb-b 4096): the database page size in
+//!   size, 16384 on Apple Silicon and 4096 on x86 Linux; tn-lmdb 4096): the database page size in
 //!   bytes, a power of two from 4096 to 65536, passed as `--db.page-size` to the base's build and
 //!   every open. Each page size has its own base and aged base.
 //! - `TN_EXEC_BENCH_READERS` (0): reader threads, plus the balance poller when above 0; 0 runs no
@@ -126,11 +126,11 @@
 //!   env has opened on it, before and after the timed loop (the env open), and once the env has
 //!   closed; then the allocated bytes the timed loop added per output, from before to after; then
 //!   the logical growth, the tables' total size added per executed output (warm-up and timed), from
-//!   the clone before the env opened to the closed clone ([`Footprint`]). tndb-b's data file grows
+//!   the clone before the env opened to the closed clone ([`Footprint`]). tn-lmdb's data file grows
 //!   in preallocated steps, so over a short run its allocated growth reads 0.
 //! - `database writes per output`, after the sizes: what each timed output's call wrote
 //!   ([`DbWrites`]): each database counter that moved, as its mean per output (`_ns` counters in
-//!   ms; `tndb_max_gate_lag`, a maximum since the open, as its largest, [`MAXIMA`]), leaving out
+//!   ms; `tn_lmdb_max_gate_lag`, a maximum since the open, as its largest, [`MAXIMA`]), leaving out
 //!   the counters that never moved; the disk MiB per output; the data file's growth per output and
 //!   over the run, from its length before the first timed output; then the deciles: the timed
 //!   outputs in ten consecutive groups (group `k` from `k * n / 10` to `(k + 1) * n / 10`), each
@@ -181,7 +181,7 @@
 //! the backend's default);
 //! `rows`, one per timed output (`first_block`, `last_block`, `gas`, `txs`, `late`, `side_load`,
 //! `epoch_close`, `export_active`, each stage as `<key>_ms`, `db_counters` (an object of each
-//! database counter's name, `mdbx_*` or `tndb_*`, and its difference over the output),
+//! database counter's name, `mdbx_*` or `tn_lmdb_*`, and its difference over the output),
 //! `disk_bytes_written` (null when a read failed or the target has no
 //! source), `major_faults` and `minor_faults` (the process's, every thread's, over the output's
 //! call, [`page_faults`]; null when a read failed) and `db_file_len_bytes` (after the output));
@@ -216,7 +216,7 @@
 //! (per key `idle` and `active`, with the ratios active over idle). The stage keys are
 //! [`STAGES`]'s. It is written to a temp file, synced and renamed into place.
 //!
-//! **Durable sync on macOS.** libmdbx's durable commit uses `F_FULLFSYNC` and tndb-b's a plain
+//! **Durable sync on macOS.** libmdbx's durable commit uses `F_FULLFSYNC` and tn-lmdb's a plain
 //! fsync, so Mac durable commit times are not like-for-like between the backends.
 //!
 //! **Reading the database writes.** The disk bytes are only an approximation: Linux's
@@ -712,7 +712,7 @@ impl Knobs {
     /// The knobs from the `TN_EXEC_BENCH_*` variables in `vars` (others are ignored), the
     /// defaults for those absent, for the database backend `backend`. Refuses an unknown knob, a
     /// malformed value, a `PAGE_SIZE` that is not a power of two from 4096 to 65536,
-    /// `SYNC=nosync` on tndb-b, and `EPOCH_EVERY` without `REGISTRY=1`.
+    /// `SYNC=nosync` on tn-lmdb, and `EPOCH_EVERY` without `REGISTRY=1`.
     fn parse(
         vars: impl IntoIterator<Item = (String, String)>,
         backend: &str,
@@ -758,9 +758,9 @@ impl Knobs {
             SyncMode::NoSync
         };
         eyre::ensure!(
-            !(sync == SyncMode::NoSync && backend == "tndb-b"),
-            "{KNOB_PREFIX}SYNC=nosync is --db.sync-mode safe-no-sync, which the tndb-b build \
-             refuses: run tndb-b with SYNC=durable"
+            !(sync == SyncMode::NoSync && backend == "tn-lmdb"),
+            "{KNOB_PREFIX}SYNC=nosync is --db.sync-mode safe-no-sync, which the tn-lmdb build \
+             refuses: run tn-lmdb with SYNC=durable"
         );
         let page_size = match get("PAGE_SIZE") {
             None => None,
@@ -2268,7 +2268,7 @@ struct Footprint {
 impl Footprint {
     /// The bytes the tables' total size grew per executed output, from the baseline to the
     /// closed clone, or `None` when the closed tables could not be read. Unlike the allocated
-    /// growth it does not depend on how the data file grows: tndb-b's grows in preallocated
+    /// growth it does not depend on how the data file grows: tn-lmdb's grows in preallocated
     /// steps, so over a short run its allocated growth reads 0.
     fn logical_growth_per_output(&self) -> Option<f64> {
         let tables = self.tables.as_ref().ok()?;
@@ -2280,7 +2280,7 @@ impl Footprint {
 /// The database counters whose [`OutputRow::db_counters`] value is not a difference but a maximum
 /// since the open (`DbCounters::since` keeps the later read's): their summary is the largest, not
 /// the mean.
-const MAXIMA: [&str; 1] = ["tndb_max_gate_lag"];
+const MAXIMA: [&str; 1] = ["tn_lmdb_max_gate_lag"];
 
 /// How many equal consecutive groups [`DbWrites::of`] splits the timed outputs into.
 const DECILES: usize = 10;
@@ -2631,7 +2631,7 @@ fn report(
     out += &disk_bytes_line(DISK_BYTES_SOURCE, header.disk_error.as_deref());
     out += &format!("  host: {}  date: {}\n", header.host, header.date);
     if cfg!(target_os = "macos") && knobs.sync == SyncMode::Durable {
-        out += "  note: on macOS libmdbx's durable commit uses F_FULLFSYNC and tndb-b's a plain \
+        out += "  note: on macOS libmdbx's durable commit uses F_FULLFSYNC and tn-lmdb's a plain \
                 fsync: durable commit times are not like-for-like between the backends\n";
     }
     out += &format!("  base: {}\n  aged: {}\n", header.base, header.aged);
@@ -3417,7 +3417,7 @@ async fn exec_bench() -> eyre::Result<()> {
         upkeep.abort();
     }
     sizes.closed = Sizes::of(&datadir)?;
-    // the database is closed: the tndb-b build's table stats refuse an open one. A failure is
+    // the database is closed: the tn-lmdb build's table stats refuse an open one. A failure is
     // reported, then returned, so the run's figures are not lost
     let closed_stats = match closed {
         Ok(()) => closed_table_stats(&datadir.join("db")).await,
@@ -3533,7 +3533,7 @@ mod tests {
         }
         for value in ["2048", "131072", "12288", "16k", "", "-4096", "0"] {
             let err =
-                Knobs::parse(vars(&[("PAGE_SIZE", value)]), "tndb-b").unwrap_err().to_string();
+                Knobs::parse(vars(&[("PAGE_SIZE", value)]), "tn-lmdb").unwrap_err().to_string();
             let needle = format!(
                 "TN_EXEC_BENCH_PAGE_SIZE={value:?} is not a page size: a power of two from 4096 \
                  to 65536 bytes"
@@ -3609,7 +3609,7 @@ mod tests {
         );
     }
 
-    /// A malformed value, an unknown knob and `SYNC=nosync` on tndb-b are refused, each by name.
+    /// A malformed value, an unknown knob and `SYNC=nosync` on tn-lmdb are refused, each by name.
     #[test]
     fn test_knobs_refused() {
         let cases: [(&str, &str, &str, &str); 20] = [
@@ -3621,7 +3621,7 @@ mod tests {
             ("REGISTRY", "true", "mdbx", "REGISTRY=\"true\" is not one of 1, 0"),
             ("METRICS", "on", "mdbx", "METRICS=\"on\" is not one of off, prom"),
             ("SYNC", "fast", "mdbx", "SYNC=\"fast\" is not one of durable, nosync"),
-            ("SYNC", "nosync", "tndb-b", "the tndb-b build refuses"),
+            ("SYNC", "nosync", "tn-lmdb", "the tn-lmdb build refuses"),
             ("CACHE_DIR", "", "mdbx", "CACHE_DIR is empty"),
             ("REPORT", "", "mdbx", "REPORT is empty"),
             ("READERS", "-1", "mdbx", "READERS=\"-1\" is not a whole number"),
@@ -3638,14 +3638,15 @@ mod tests {
             let err = Knobs::parse(vars(&[(knob, value)]), backend).unwrap_err().to_string();
             assert!(err.contains(needle), "{knob}={value:?} on {backend}: {err}");
         }
-        assert_eq!(Knobs::parse(vars(&[("SYNC", "durable")]), "tndb-b").unwrap(), defaults());
+        assert_eq!(Knobs::parse(vars(&[("SYNC", "durable")]), "tn-lmdb").unwrap(), defaults());
     }
 
     /// `EPOCH_EVERY` and `EXPORT` are read and shown in the knob line; `EPOCH_EVERY` above 0 needs
     /// the registry.
     #[test]
     fn test_knobs_epoch_every_and_export() {
-        let knobs = Knobs::parse(vars(&[("EPOCH_EVERY", "3"), ("EXPORT", "1")]), "tndb-b").unwrap();
+        let knobs =
+            Knobs::parse(vars(&[("EPOCH_EVERY", "3"), ("EXPORT", "1")]), "tn-lmdb").unwrap();
         assert_eq!((knobs.epoch_every, knobs.export), (3, true));
         assert!(
             knobs.line().contains(" window=20 epoch_every=3 export=1 cache_dir="),
@@ -4157,7 +4158,7 @@ mod tests {
         std::fs::create_dir_all(static_files.join("sub")).unwrap();
         std::fs::create_dir(&db).unwrap();
         // the data file under both backends' names, so either build measures it
-        for name in ["mdbx.dat", "tndb.dat"] {
+        for name in ["mdbx.dat", "tn-lmdb.dat"] {
             std::fs::write(db.join(name), vec![1; 10_000]).unwrap();
         }
         std::fs::write(static_files.join("headers"), vec![1; 3_000]).unwrap();
@@ -4529,7 +4530,7 @@ mod tests {
             row.stages[0] = execute;
         }
         for (i, row) in (0_u64..).zip(rows.iter_mut()) {
-            row.db_counters = vec![("tndb_pages_synced", 10 * i), ("tndb_commits", 1)];
+            row.db_counters = vec![("tn_lmdb_pages_synced", 10 * i), ("tn_lmdb_commits", 1)];
             row.disk_bytes = (i != 2).then_some(4096 * i);
             row.faults = (i != 2).then_some(PageFaults { major: 3 * i, minor: 100 + i });
             row.db_file_len = (4 << 30) + (1 << 20) * i;
@@ -4545,7 +4546,7 @@ mod tests {
         assert_eq!(at("/header/page_size_bytes"), 16_384);
         assert_eq!(at("/header/disk_bytes_source"), serde_json::json!(DISK_BYTES_SOURCE));
         assert_eq!(at("/header/disk_bytes_error"), serde_json::Value::Null);
-        let names = serde_json::json!(["tndb_pages_synced", "tndb_commits"]);
+        let names = serde_json::json!(["tn_lmdb_pages_synced", "tn_lmdb_commits"]);
         assert_eq!(at("/header/db_counter_names"), names, "in the rows' order");
         let failed = Header { disk_error: Some("no io".to_owned()), ..self::header(defaults()) };
         let failed = json_report(&failed, &rows, &footprint(), None);
@@ -4571,8 +4572,8 @@ mod tests {
         assert_eq!(at("/rows/1/execute_ms"), 200.0);
         assert_eq!(at("/rows/1/gas"), 40);
         assert_eq!(at("/rows/1/late"), false);
-        assert_eq!(at("/rows/1/db_counters/tndb_commits"), 1);
-        assert_eq!(at("/rows/1/db_counters/tndb_pages_synced"), 10);
+        assert_eq!(at("/rows/1/db_counters/tn_lmdb_commits"), 1);
+        assert_eq!(at("/rows/1/db_counters/tn_lmdb_pages_synced"), 10);
         assert_eq!(at("/rows/1/db_counters").as_object().unwrap().len(), 2);
         assert_eq!(at("/rows/1/disk_bytes_written"), 4096);
         assert_eq!(at("/rows/2/disk_bytes_written"), serde_json::Value::Null, "a failed read");
@@ -4583,8 +4584,8 @@ mod tests {
         assert_eq!(at("/rows/2/major_faults"), serde_json::Value::Null, "a failed read");
         assert_eq!(at("/rows/2/minor_faults"), serde_json::Value::Null, "a failed read");
         assert_eq!(at("/rows/2/db_file_len_bytes"), (4_u64 << 30) + (2 << 20));
-        assert_eq!(at("/db_writes/counters_mean_per_output/tndb_commits"), 1.0);
-        assert_eq!(at("/db_writes/counters_mean_per_output/tndb_pages_synced"), 10.0);
+        assert_eq!(at("/db_writes/counters_mean_per_output/tn_lmdb_commits"), 1.0);
+        assert_eq!(at("/db_writes/counters_mean_per_output/tn_lmdb_pages_synced"), 10.0);
         assert_eq!(at("/db_writes/counters_max"), serde_json::json!({}));
         assert_eq!(at("/db_writes/disk_bytes_mean_per_output"), 2048.0);
         assert_eq!(at("/db_writes/disk_bytes_outputs"), 2);
@@ -4718,7 +4719,7 @@ mod tests {
         let rows: Vec<OutputRow> = (0_u64..25)
             .map(|i| {
                 db_row(
-                    vec![("pages", i + 1), ("tndb_max_gate_lag", i % 7), ("never", 0)],
+                    vec![("pages", i + 1), ("tn_lmdb_max_gate_lag", i % 7), ("never", 0)],
                     (i != 3).then_some((i + 1) * 1000),
                     1000 + 10 * i,
                     (i + 1) as f64,
@@ -4731,7 +4732,7 @@ mod tests {
         assert_eq!(writes.counters.len(), 3, "every counter, moved or not");
         let pages = summary("pages");
         assert_eq!((pages.value, pages.maximum, pages.moved), (13.0, false, true), "325 / 25");
-        let lag = summary("tndb_max_gate_lag");
+        let lag = summary("tn_lmdb_max_gate_lag");
         assert_eq!((lag.value, lag.maximum, lag.moved), (6.0, true, true), "the largest");
         let never = summary("never");
         assert_eq!((never.value, never.moved), (0.0, false));
@@ -4785,10 +4786,10 @@ mod tests {
     fn test_db_writes_report() {
         let counters = |commits| {
             vec![
-                ("tndb_commits", commits),
-                ("tndb_save_ns", 2_500_000),
-                ("tndb_verifies", 0),
-                ("tndb_max_gate_lag", 3),
+                ("tn_lmdb_commits", commits),
+                ("tn_lmdb_save_ns", 2_500_000),
+                ("tn_lmdb_verifies", 0),
+                ("tn_lmdb_max_gate_lag", 3),
             ]
         };
         let rows: Vec<OutputRow> = (0_u64..3)
@@ -4797,10 +4798,10 @@ mod tests {
         let text = db_writes_report(&DbWrites::of(&rows, (1 << 30) - (1 << 20)), rows.len());
         assert!(text.starts_with("database writes per output: "), "{text}");
         let line = |name: &str| text.lines().find(|line| line.trim_start().starts_with(name));
-        assert!(line("tndb_commits").unwrap().ends_with(" 1.000"), "{text}");
-        assert!(line("tndb_save_ns").unwrap().ends_with(" 2.500 ms"), "{text}");
-        assert!(line("tndb_max_gate_lag").unwrap().ends_with(" 3 (max)"), "{text}");
-        assert_eq!(line("tndb_verifies"), None, "never moved\n{text}");
+        assert!(line("tn_lmdb_commits").unwrap().ends_with(" 1.000"), "{text}");
+        assert!(line("tn_lmdb_save_ns").unwrap().ends_with(" 2.500 ms"), "{text}");
+        assert!(line("tn_lmdb_max_gate_lag").unwrap().ends_with(" 3 (max)"), "{text}");
+        assert_eq!(line("tn_lmdb_verifies"), None, "never moved\n{text}");
         assert!(
             line("disk written").unwrap().contains(" 1.000 MiB per output (3 outputs read)"),
             "{text}"
