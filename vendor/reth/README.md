@@ -98,7 +98,9 @@ dependencies never get clippy, so run it after editing vendored code:
 `cargo.sh` seeds `vendor/reth/Cargo.lock` from TN's lockfile (the nested lockfile is
 git-ignored) and builds into `target/vendor-reth`. When one of reth's dev-dependencies needs a
 newer version of a crate TN also uses, cargo bumps it in the nested lockfile only. At v1.11.3 that
-happens for `libc` and `cargo_metadata`. TN's own lockfile is never touched.
+happens for `libc` and `cargo_metadata`. TN's own lockfile is never touched. TN's root manifest
+patches revm-inspectors (`patches/revm-inspectors/PATCH.md`), and `cargo.sh` passes the same patch
+with `--config`, so reth's tests run against the code TN ships.
 
 ## Taking changes from upstream
 

@@ -37,7 +37,7 @@ members = [
     "crates/batch-validator",
     "crates/execution/tn-rpc",
 ]
-# Carried libp2p patches are wired in through `[patch.crates-io]` below and kept out of
+# Carried crate patches are wired in through `[patch.crates-io]` below and kept out of
 # the workspace so that upstream code is not held to the house lints. Each patch has a PATCH.md
 # maintenance record.
 #
@@ -47,6 +47,7 @@ exclude = [
     "patches/libp2p-quic",
     "patches/libp2p-connection-limits",
     "patches/quinn-proto",
+    "patches/revm-inspectors",
     "vendor/reth",
 ]
 
@@ -311,3 +312,6 @@ libp2p-quic = { path = "patches/libp2p-quic" }
 # Release per-peer connection accounting after the last connection closes.
 # See patches/libp2p-connection-limits/PATCH.md for provenance and retirement criteria.
 libp2p-connection-limits = { path = "patches/libp2p-connection-limits" }
+# JavaScript tracers: Boa's recursion limit lowered to 128 so a recursive accessor cannot overflow
+# a blocking thread's stack (upstream #548). See patches/revm-inspectors/PATCH.md.
+revm-inspectors = { path = "patches/revm-inspectors" }

@@ -15,6 +15,9 @@
 # dependencies the two workspaces share resolve to the versions TN ships; cargo adds what only
 # reth's tests need. Output goes to target/vendor-reth so the two workspaces' feature sets do
 # not evict each other's artifacts.
+#
+# TN's root manifest patches revm-inspectors (patches/revm-inspectors). The nested manifest does
+# not, so the same patch is passed with --config, and reth's tests run against the code TN ships.
 
 set -euo pipefail
 
@@ -24,4 +27,11 @@ ROOT="$(cd "$VENDOR/../.." && pwd)"
 cp "$ROOT/Cargo.lock" "$VENDOR/Cargo.lock"
 cd "$VENDOR"
 export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$ROOT/target}/vendor-reth"
-exec cargo "$@"
+patch=(--config "patch.crates-io.revm-inspectors.path=\"$ROOT/patches/revm-inspectors\"")
+# a +toolchain argument has to stay first
+if [[ "${1:-}" == +* ]]; then
+    toolchain=$1
+    shift
+    exec cargo "$toolchain" "${patch[@]}" "$@"
+fi
+exec cargo "${patch[@]}" "$@"
