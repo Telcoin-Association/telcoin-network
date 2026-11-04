@@ -12,8 +12,9 @@ publish = false
 
 [dependencies]
 # `server` + `macros` back the TN eth-method overrides (`rpc_fee_history` and the
-# `--rpc.txfeecap` guard's `rpc_fee_cap`).
-jsonrpsee = { workspace = true, features = ["server", "macros"] }
+# `--rpc.txfeecap` guard's `rpc_fee_cap`). `http-client` backs the `--forward-txs` relay
+# (`rpc_tx_forward`); the client crate is already in the graph through reth's IPC transport.
+jsonrpsee = { workspace = true, features = ["server", "macros", "http-client"] }
 async-trait = { workspace = true }
 clap = { workspace = true, features = ["derive", "env"] }
 tn-config = { workspace = true }
