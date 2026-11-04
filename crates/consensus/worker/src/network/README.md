@@ -127,9 +127,13 @@ When a worker needs batches it doesn't have locally, `request_batches()` tries c
 one at a time. If a peer is unavailable (it sheds with `Deny`, or a transient stream error occurs),
 the next peer is tried.
 
-Peer order: `connected_peers()` returns current-committee members first. When the caller names a
-preferred authority (the vote-path `synchronize` passes the header author), that peer is tried
-first, because it is the peer most likely to hold the batches.
+Peer order: `connected_peers()` returns current-committee members first, with each tier shuffled
+per request so no peer keeps a fixed early place. When the caller names a preferred authority
+(the vote-path `synchronize` passes the header author), that peer is tried first, because it is
+the peer most likely to hold the batches. Peers whose last exchange this epoch stalled, failed
+after negotiation, or served none of the requested batches (`stalled_peers`) are tried last; a
+complete exchange that serves a requested batch clears the mark, and the epoch boundary resets
+the record (#1773).
 
 If **all** peers fail a single pass, the method retries up to `MAX_BATCH_REQUEST_RETRIES` (3)
 times through the full peer list, with a `BATCH_REQUEST_RETRY_DELAY` (500ms) pause between
@@ -144,11 +148,16 @@ Attempt 2: peer_a → Ack → batches received → return Ok
 Key behaviors:
 - **Re-fetches peers** each attempt to pick up newly connected nodes.
 - **Skips failed peers**: a peer that answers `Deny` stays eligible for later passes. A peer that
-  fails in any other way (open error, unsupported protocol, write or read timeout, protocol error)
-  is not tried again in the same call.
+  fails in any other way (open error, unsupported protocol, write or read timeout, protocol error,
+  or `Ack` then `End` with none of the requested batches) is not tried again in the same call, and
+  is tried last on later calls this epoch.
+- **Keeps a partial stream**: the batches validated before a stream deadline are kept, so a
+  stalling peer does not waste the frames it did deliver.
 - **Returns immediately** on any partial success (at least one batch received).
 - **Accumulates batches** across retries — digests fulfilled on earlier attempts are removed.
-- **Bounded in total**: the whole call runs under `BATCH_REQUEST_TOTAL_TIMEOUT` (480s). On expiry
+- **Bounded in total**: the whole call runs under `BATCH_REQUEST_TOTAL_TIMEOUT` (480s, four
+  `BATCH_REQUEST_PEER_BUDGET` shares of 120s, so three peers that run their exchange to its
+  deadline still leave the fourth a full share). On expiry
   it returns the batches fetched so far, or `NetworkError::Timeout` if none were fetched.
 - **Returns `RPCError`** only after all retries are exhausted with zero batches.
 
@@ -158,8 +167,9 @@ for the rest of the epoch.
 
 Each exchange is bounded step by step: the request write and flush by `SYNC_REQUEST_WRITE_TIMEOUT`
 (5s), the `Ack`/`Deny` read by `SYNC_ACK_TIMEOUT` (5s), and the data read by
-`BATCH_STREAM_TOTAL_TIMEOUT` (210s). A peer that negotiates the sync protocol and then never reads
-the request cannot hold the requester.
+`BATCH_STREAM_TOTAL_TIMEOUT` (95s). With the swarm's 15s stream-open deadline the four add up to
+`BATCH_REQUEST_PEER_BUDGET` (120s), the most one peer can use in one call. A peer that negotiates
+the sync protocol and then never reads the request cannot hold the requester.
 
 ## Security Measures
 

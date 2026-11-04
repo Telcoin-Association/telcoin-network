@@ -816,3 +816,33 @@ async fn test_semaphore_exhaustion_denies_admission() {
         "semaphore should be exhausted after {MAX_CONCURRENT_BATCH_STREAMS} acquires"
     );
 }
+
+/// `request_batches` tries the peers whose last exchange stalled after every unmarked peer,
+/// whatever order the swarm reports them in, and a failed exchange marks the peer for later
+/// calls. Regression test for issue #1773.
+#[tokio::test]
+async fn test_request_batches_tries_stalled_peers_last() {
+    let committee = CommitteeFixture::builder(MemDatabase::default).randomize_ports(true).build();
+    let unknown = BlsPublicKey::default();
+    let other = committee.first_authority().primary_public_key();
+    let author = committee.last_authority().primary_public_key();
+    let (tx, rx) = mpsc::channel(10);
+    let (opened_tx, mut opened_rx) = mpsc::unbounded_channel();
+    tokio::spawn(failing_open_swarm(rx, vec![unknown, other, author], opened_tx));
+    let task_manager = TaskManager::default();
+    let handle =
+        WorkerNetworkHandle::new(NetworkHandle::new(tx), task_manager.get_spawner(), 0, 0, 0);
+
+    // the first reported peer stalled on an earlier call: it moves behind the others
+    handle.mark_stalled_for_test(unknown);
+    let mut digests = BTreeSet::from([B256::random()]);
+    let result = handle.pub_request_batches(&mut digests, None).await;
+    assert!(result.is_err(), "every open fails, so nothing is fetched");
+
+    let opened: Vec<BlsPublicKey> = std::iter::from_fn(|| opened_rx.try_recv().ok()).collect();
+    assert_eq!(opened, vec![other, author, unknown]);
+
+    // every open failed after the swarm answered, so every peer is now marked
+    let stalled = handle.stalled_peers_for_test();
+    assert!([unknown, other, author].iter().all(|peer| stalled.contains(peer)));
+}
