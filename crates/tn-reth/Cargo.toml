@@ -56,6 +56,9 @@ reth-primitives-traits = { workspace = true }
 reth-stages-types = { workspace = true }
 reth-trie = { workspace = true }
 reth-trie-db = { workspace = true }
+# reth-engine-tree (std, metrics) and reth-trie-parallel (std) turned on these default features
+# before TN dropped them. Without std the crate has dead code and the `-D warnings` build fails.
+reth-trie-sparse = { workspace = true }
 reth-transaction-pool = { workspace = true }
 reth-ethereum-engine-primitives = { workspace = true }
 

@@ -66,7 +66,8 @@
 #![deny(unused_must_use, rust_2018_idioms)]
 #![cfg_attr(docsrs, feature(doc_cfg, doc_auto_cfg))]
 
-// revm is a dependency only for its features (see Cargo.toml).
+// reth-trie-sparse and revm are dependencies only for their features (see Cargo.toml).
+use reth_trie_sparse as _;
 use revm as _;
 
 // Used in tests
