@@ -700,17 +700,18 @@ pub struct DbLoadStateArgs {
     #[arg(long)]
     pub chain: Option<NamedChain>,
 
-    /// Let a faucet build load state for a chain id 487 genesis. Devnet only.
+    /// Let a faucet build load state for the loaded chain. Test networks only.
     ///
-    /// The same opt-in as `node --allow-faucet-on-chain-487`: a faucet build refuses chain id 487
-    /// without it and refuses the embedded mainnet genesis even with it.
+    /// The same opt-in as `node --allow-faucet-on-chain`: a faucet build refuses every chain but
+    /// adiri without it, and refuses mainnet (chain id 731) and the embedded mainnet genesis
+    /// with or without it.
     #[arg(
         long,
-        env = "TN_ALLOW_FAUCET_ON_CHAIN_487",
+        env = "TN_ALLOW_FAUCET_ON_CHAIN",
         value_parser = OptInValueParser::default(),
         hide_short_help = true
     )]
-    pub allow_faucet_on_chain_487: bool,
+    pub allow_faucet_on_chain: bool,
 }
 
 impl DbLoadStateArgs {
@@ -737,7 +738,7 @@ impl DbLoadStateArgs {
         validate_faucet_build(
             tn_reth::FAUCET_ENABLED,
             tn_config.genesis(),
-            self.allow_faucet_on_chain_487,
+            self.allow_faucet_on_chain,
         )?;
 
         // Reject a non-resumable bundle BEFORE `restore_pack` mutates the datadir, so a refusal
@@ -1733,7 +1734,7 @@ mod tests {
         let err = super::DbLoadStateArgs {
             pack: dir.path().join("bundle"),
             chain: None,
-            allow_faucet_on_chain_487: false,
+            allow_faucet_on_chain: false,
         }
         .execute(datadir)
         .expect_err("load-state must refuse while a node holds the lock");
@@ -2565,7 +2566,7 @@ mod tests {
     }
 
     /// `db load-state --chain mainnet` writes the bundled committee only after its checks pass:
-    /// a bundle refused as non-resumable (or a faucet build refused on chain id 487) leaves no
+    /// a bundle refused as non-resumable (or a faucet build refused on mainnet) leaves no
     /// `genesis/` directory behind.
     #[test]
     fn load_state_refusal_writes_no_committee() {
@@ -2579,13 +2580,12 @@ mod tests {
         let args = super::DbLoadStateArgs {
             pack: bundle.path().to_path_buf(),
             chain: Some(super::NamedChain::Mainnet),
-            allow_faucet_on_chain_487: false,
+            allow_faucet_on_chain: false,
         };
         let err = args.execute(datadir_path.clone()).expect_err("an empty bundle must be refused");
         let msg = format!("{err:#}");
-        // a faucet build stops at the chain id check, any other build at the bundle check
-        let expected =
-            if tn_reth::FAUCET_ENABLED { "--allow-faucet-on-chain-487" } else { "state-only pack" };
+        // a faucet build stops at the mainnet refusal, any other build at the bundle check
+        let expected = if tn_reth::FAUCET_ENABLED { "refuses mainnet" } else { "state-only pack" };
         assert!(msg.contains(expected), "{msg}");
         assert!(!datadir_path.genesis_path().exists(), "a refused load-state wrote genesis/");
     }
@@ -2643,7 +2643,7 @@ mod tests {
         let args = super::DbLoadStateArgs {
             pack: bundle.path().to_path_buf(),
             chain: Some(super::NamedChain::Adiri),
-            allow_faucet_on_chain_487: false,
+            allow_faucet_on_chain: false,
         };
         let err = args
             .execute(datadir_path.clone())

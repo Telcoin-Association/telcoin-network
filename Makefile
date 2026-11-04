@@ -452,8 +452,9 @@ docker-adiri:
 	docker buildx build -f ./etc/Dockerfile --build-arg CARGO_FEATURES=adiri --build-arg "GIT_SHA=$(GIT_SHA)" --platform linux/amd64,linux/arm64 --no-cache -t "$(GHCR_IMAGE):dev-adiri-$(TAG)" . --push ;
 
 # build and push an ad-hoc devnet image for amd64 and arm64 as dev-devnet-$(TAG)
-# CARGO_FEATURES=faucet compiles in the faucet support only. A faucet build refuses chain id 487
-# unless the node runs with --allow-faucet-on-chain-487 (TN_ALLOW_FAUCET_ON_CHAIN_487=true).
+# CARGO_FEATURES=faucet compiles in the faucet support only. A faucet build refuses mainnet
+# (chain id 731) and starts on any other chain but adiri only with --allow-faucet-on-chain
+# (TN_ALLOW_FAUCET_ON_CHAIN=true).
 docker-devnet:
 	docker buildx build -f ./etc/Dockerfile --build-arg CARGO_FEATURES=faucet --build-arg "GIT_SHA=$(GIT_SHA)" --platform linux/amd64,linux/arm64 --no-cache -t "$(GHCR_IMAGE):dev-devnet-$(TAG)" . --push ;
 
