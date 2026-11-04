@@ -148,7 +148,9 @@ pub(crate) enum GossipSlot {
     /// A slot keyed by the author, or by the relayer when the author is unresolved.
     Peer {
         /// The per-peer slot. It frees on drop.
-        _slot: PeerSlot,
+        ///
+        /// Boxed: the slot is far larger than the shared permit (clippy `large_enum_variant`).
+        _slot: Box<PeerSlot>,
     },
     /// A permit from the shared bucket for gossip with no resolved author or relayer.
     Shared {
@@ -190,7 +192,7 @@ impl GossipSlots {
                     .ok()
                     .map(|permit| GossipSlot::Shared { _permit: permit })
             },
-            |peer| self.peers.try_take(peer).map(|slot| GossipSlot::Peer { _slot: slot }),
+            |peer| self.peers.try_take(peer).map(|slot| GossipSlot::Peer { _slot: Box::new(slot) }),
         )
     }
 
