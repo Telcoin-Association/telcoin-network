@@ -564,8 +564,9 @@ registry_digest() {
 
 # build, after ghcr refused an anonymous read of IMAGE: the digest of IMAGE:TAG as the docker
 # login sees it, or nothing (with the answer on stderr) when the registry answers that the tag
-# is not found or access is denied. Any other failure, such as DNS, a timeout or an expired
-# login, is retried and then stops with 3, so it never reads as "the login does not see TAG".
+# is not found or access is denied (403 Forbidden included: ghcr answers that for a package
+# never pushed). Any other failure, such as DNS, a timeout or an expired login, is retried and
+# then stops with 3, so it never reads as "the login does not see TAG".
 login_digest() {
     local out digest last attempt=1
     while :; do
@@ -579,7 +580,7 @@ login_digest() {
         last=$(printf '%s\n' "$out" | awk 'NF { l = $0 } END { print l }')
         case "$(printf '%s\n' "$out" | tr '[:upper:]' '[:lower:]')" in
             *"permission denied"*) ;;
-            *"not found"* | *"manifest unknown"* | *"name unknown"* | *denied*)
+            *"not found"* | *"manifest unknown"* | *"name unknown"* | *denied* | *"403 forbidden"*)
                 info "with the docker login, $IMAGE:$TAG does not resolve: $last"
                 return 0
                 ;;
