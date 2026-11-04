@@ -1276,6 +1276,73 @@ async fn lazy_negotiation_sync_stream_to_wrong_role_fails_at_open() -> eyre::Res
     Ok(())
 }
 
+/// A peer that does not speak gossipsub is still banned under the swarm's lazy negotiation.
+///
+/// Gossipsub proposes `/tn-meshsub-{chain}/1.1.0` and then `/1.0.0`, and `V1Lazy` applies only
+/// to a dialer's last proposal: once the peer rejects `/1.1.0`, the `/1.0.0` fallback is
+/// proposed lazily and the outbound substream is handed back before the rejection arrives. The
+/// vendored gossipsub's outbound upgrade finishes the negotiation with a zero-length read, so
+/// the rejection still disables the handler as `ProtocolUnsupported`, the behaviour reports
+/// `GossipsubNotSupported`, and the node applies the fatal penalty.
+///
+/// The raw swarm carries only the target's req-res protocol, like the legacy peer in
+/// `test_goodbye_falls_back_to_embedded_exchange_for_legacy_peer`, so every other protocol the
+/// target tries on it fails as unsupported, which is penalty-exempt. The target subscribes to a
+/// topic before the raw swarm dials: gossipsub only opens an outbound substream to a new peer
+/// to send it the node's subscriptions.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_peer_without_gossipsub_is_banned_under_lazy_negotiation() -> eyre::Result<()> {
+    let TestTypes { peer1, _task_manager, .. } =
+        create_test_types::<TestWorkerRequest, TestWorkerResponse>();
+    let NetworkPeer { config, network_events: _target_events, network_handle: target, network } =
+        peer1;
+    tokio::spawn(async move {
+        let res = network.run().await;
+        debug!(target: "network", ?res, "target network shutdown");
+    });
+    let target_addr = config.primary_address();
+    target.start_listening(target_addr.clone()).await?;
+    target.subscribe(TEST_TOPIC.into()).await?;
+
+    let libp2p_config = config.network_config().libp2p_config();
+    let raw_keypair = NetworkKeypair::generate_ed25519();
+    let raw_peer_id: PeerId = raw_keypair.public().into();
+    let raw_req_res = request_response::Behaviour::with_codec(
+        TNCodec::<TestWorkerRequest, TestWorkerResponse>::new(libp2p_config.max_rpc_message_size),
+        vec![(
+            NetworkType::Primary.req_res_protocol(libp2p_config.chain_id)?,
+            ProtocolSupport::Full,
+        )],
+        request_response::Config::default(),
+    );
+    let mut raw_swarm = SwarmBuilder::with_existing_identity(raw_keypair)
+        .with_tokio()
+        .with_quic()
+        .with_behaviour(|_| raw_req_res)
+        .map_err(|e| eyre!("raw swarm behaviour: {e:?}"))?
+        .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(30)))
+        .build();
+    raw_swarm.dial(target_addr)?;
+    let raw_task = tokio::spawn(async move {
+        loop {
+            let _ = raw_swarm.select_next_some().await;
+        }
+    });
+
+    let ban_threshold = config.network_config().peer_config().score_config.min_score_before_ban;
+    let target = &target;
+    let banned = wait_until(
+        Duration::from_secs(10),
+        "target bans the peer without gossipsub",
+        move || async move {
+            Ok(target.peer_score(raw_peer_id).await?.is_some_and(|score| score <= ban_threshold))
+        },
+    )
+    .await;
+    raw_task.abort();
+    banned
+}
+
 #[tokio::test]
 async fn test_publish_to_one_peer() -> eyre::Result<()> {
     // start honest cvv network
@@ -5576,6 +5643,45 @@ async fn test_record_retrieval_legacy_fallback_is_deduplicated() -> eyre::Result
     assert_eq!(network.kad_record_queries.len(), 1);
     network.request_legacy_record(peer);
     assert_eq!(network.kad_record_queries.len(), 1);
+    Ok(())
+}
+
+/// A lazily negotiated rejection of record retrieval takes the legacy fallback.
+///
+/// Under the swarm's `V1Lazy` negotiation a peer without the record-exchange protocol is
+/// reported on the first read as `OutboundFailure::Io` wrapping `NegotiationError::Failed`, not
+/// as `UnsupportedProtocols`. The handler normalizes it, so the failure stays penalty-exempt and
+/// starts the legacy Kademlia query instead of deferring the request as a transport failure.
+#[tokio::test]
+async fn test_record_retrieval_lazy_rejection_takes_legacy_fallback() -> eyre::Result<()> {
+    use libp2p::core::upgrade::NegotiationError;
+    use std::io;
+
+    let TestTypes { peer1, peer2, .. } =
+        create_test_types::<TestWorkerRequest, TestWorkerResponse>();
+    let mut network = peer1.network;
+    let peer = *peer2.network.swarm.local_peer_id();
+    network.swarm.behaviour_mut().peer_manager.update_committees(
+        Default::default(),
+        [peer2.config.key_config().primary_public_key()].into_iter().collect(),
+        Default::default(),
+    );
+    network.process_kad_put_request(peer, peer2.network.get_peer_record())?;
+    let request = network.swarm.behaviour_mut().record_exchange.send_request(&peer, ());
+    assert!(network.record_exchange.allow_request(peer));
+    network.record_exchange.track(peer, request);
+    network.process_record_exchange_event(ReqResEvent::OutboundFailure {
+        peer,
+        connection_id: libp2p::swarm::ConnectionId::new_unchecked(1),
+        request_id: request,
+        error: ReqResOutboundFailure::Io(io::Error::from(NegotiationError::Failed)),
+    })?;
+    assert!(!network.swarm.behaviour().peer_manager.peer_banned(&peer));
+    assert_eq!(
+        network.kad_record_queries.len(),
+        1,
+        "a lazy rejection must take the legacy fallback, not the deferred retry"
+    );
     Ok(())
 }
 
