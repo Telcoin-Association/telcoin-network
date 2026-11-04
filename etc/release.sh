@@ -40,7 +40,7 @@
 # repository in lower case. `parse` prints the package as PACKAGE. build, sign, verify,
 # publish and draft refuse an IMAGE_DIGEST that names an image anywhere else, and the channel
 # alias (latest, adiri) moves only inside the package. A package comes into existence with its
-# first push; build asks before it makes that push.
+# first push, which build makes only with RELEASE_FIRST_PUSH set to the package.
 #
 # Environment (all optional):
 #   RELEASE_REPO                   owner/repo of the GitHub repository; default
@@ -51,6 +51,10 @@
 #   RELEASE_SIG_THRESHOLD          maintainer signatures required; never below MIN_SIGNATURES
 #   RELEASE_BUILDER                build: buildx builder, default "default" (driver docker)
 #   RELEASE_REBUILD=1              build: rebuild a tag the registry already has
+#   RELEASE_FIRST_PUSH=PACKAGE     build: push the first image of a package that refuses
+#                                  anonymous reads and whose TAG the docker login cannot see
+#                                  either; the value must be the tag's PACKAGE, and
+#                                  RELEASE_YES never stands in for it
 #   RELEASE_ALLOW_LOCAL_SCRIPTS=1  build, publish: allow this script or verify_commit_hash.sh
 #                                  to differ from main
 #   RELEASE_SUMS_SHA256            sign: the SHA256SUMS sha256 that build printed last; asked for
@@ -556,6 +560,20 @@ registry_digest() {
         attempt=$((attempt + 1))
         sleep 5
     done
+}
+
+# build, after ghcr refused an anonymous read of IMAGE: the digest of IMAGE:TAG as the docker
+# login sees it, or nothing (with the reason on stderr) when the tag does not resolve that way.
+login_digest() {
+    local out digest
+    if out=$(docker buildx imagetools inspect "$IMAGE:$TAG" --format '{{println .Manifest.Digest}}' 2>&1); then
+        digest=$(printf '%s\n' "$out" | awk 'NF { d = $1 } END { print d }')
+        [[ "$digest" =~ $DIGEST_RE ]] ||
+            die 1 "docker buildx imagetools inspect $IMAGE:$TAG answered without a digest: $out"
+        printf '%s\n' "$digest"
+        return 0
+    fi
+    info "with the docker login, $IMAGE:$TAG does not resolve: $(printf '%s\n' "$out" | awk 'NF { l = $0 } END { print l }')"
 }
 
 # ---------------------------------------------------------------------------------------------
@@ -1844,9 +1862,20 @@ cmd_build() {
     fi
     existing=$(registry_digest "$TAG" first-push)
     if [ "$existing" = denied ]; then
-        warn "$IMAGE does not answer an anonymous read: the package is private, or this is its first push"
-        confirm "Push $IMAGE:$TAG as the first image of the package $PACKAGE? build stops after the push until the package is public."
-        existing=
+        # ghcr refuses anonymous reads of a private package and of one never pushed alike, so
+        # the docker login looks again. When it sees TAG, the package is private and the
+        # rebuild rule below applies; only when it does not is this a first push, which needs
+        # RELEASE_FIRST_PUSH set to the package.
+        existing=$(login_digest) || exit
+        if [ -n "$existing" ]; then
+            warn "$IMAGE is private, not new: it refuses anonymous reads, but the docker login sees $IMAGE:$TAG at $existing; make the package public as the maintainer guide's one-time setup says"
+        elif [ -z "${RELEASE_FIRST_PUSH:-}" ]; then
+            die 2 "$IMAGE refuses anonymous reads and the docker login does not see $IMAGE:$TAG: if this is the first release image of the package $PACKAGE, run again with RELEASE_FIRST_PUSH=$PACKAGE; otherwise make the package public (maintainer guide, one-time setup)"
+        elif [ "$RELEASE_FIRST_PUSH" != "$PACKAGE" ]; then
+            die 2 "RELEASE_FIRST_PUSH is $RELEASE_FIRST_PUSH, but $TAG is on the $CHANNEL channel, whose package is $PACKAGE"
+        else
+            warn "RELEASE_FIRST_PUSH=$PACKAGE: pushing $IMAGE:$TAG as the first image of the package; build stops after the push until the package is public"
+        fi
     fi
     if [ -n "$existing" ]; then
         [ "${RELEASE_REBUILD:-}" = 1 ] || die 1 "$IMAGE:$TAG already exists ($existing); set RELEASE_REBUILD=1 to rebuild it"
