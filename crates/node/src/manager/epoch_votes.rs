@@ -2,6 +2,7 @@
 
 use std::{
     collections::{HashMap, HashSet, VecDeque},
+    fmt,
     time::Duration,
 };
 
@@ -10,8 +11,9 @@ use tn_config::KeyConfig;
 use tn_primary::{network::PrimaryNetworkHandle, ConsensusBusApp};
 use tn_storage::{consensus::ConsensusChain, epoch_records::EpochRecordDb};
 use tn_types::{
-    BlsAggregateSignature, BlsPublicKey, BlsSignature, Epoch, EpochCertificate, EpochRecord,
-    EpochVote, ShutdownNotifier, TaskError, TaskSpawner, TnReceiver as _, TnSender as _,
+    AuthorityIdentifier, BlsAggregateSignature, BlsPublicKey, BlsSignature, Epoch,
+    EpochCertificate, EpochRecord, EpochVote, ShutdownNotifier, TaskError, TaskSpawner,
+    TnReceiver as _, TnSender as _,
 };
 use tokio::sync::{
     mpsc::{self, Receiver, Sender},
@@ -163,12 +165,23 @@ async fn manage_epoch_votes(
         }
     }
 
+    // signers when the round ended; members still in `committee_keys` had not voted by then
+    let signers = signed_authorities.len();
+    let missing = missing_signers(&epoch_rec.committee, &committee_keys);
+
     // Aggregate signatures and save the cert
     if reached_quorum {
         info!(
             target: "epoch-manager",
-            "reached quorum on epoch close for {}/{epoch_hash}", epoch_rec.epoch
+            epoch = epoch_rec.epoch,
+            signers,
+            committee = committee_size,
+            timeouts,
+            missing = %SignerList(&missing),
+            %epoch_hash,
+            "epoch record quorum"
         );
+        record_epoch_record_quorum(&epoch_rec.committee, &committee_keys, signers);
         match BlsAggregateSignature::aggregate(&sigs[..], true) {
             Ok(aggregated_signature) => {
                 let signature: BlsSignature = aggregated_signature.to_signature();
@@ -217,6 +230,9 @@ async fn manage_epoch_votes(
     } else {
         error!(
             target: "epoch-manager",
+            signers,
+            timeouts,
+            missing = %SignerList(&missing),
             "failed to reach quorum on epoch close for {epoch_hash} {epoch_rec:?}",
         );
         let db = consensus_chain.epochs().clone();
@@ -557,6 +573,61 @@ pub(crate) async fn revote_uncertified_epoch_record_on_startup(
             );
             epoch_record_watch.send_replace(Some(record));
         }
+    }
+}
+
+/// Log rendering of a list of authority ids: `[id1,id2]`, or `[]` when empty.
+///
+/// Comma-separated with no spaces and no quotes, so a `key=value` log parser that reads the value
+/// up to the next whitespace captures the whole list. `Debug` of a `Vec<String>` would quote each
+/// id and put a space after every comma.
+struct SignerList<'a>(&'a [AuthorityIdentifier]);
+
+impl fmt::Display for SignerList<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("[")?;
+        for (i, id) in self.0.iter().enumerate() {
+            if i > 0 {
+                f.write_str(",")?;
+            }
+            write!(f, "{id}")?;
+        }
+        f.write_str("]")
+    }
+}
+
+/// Committee members whose vote was not counted in this round, as authority ids in committee
+/// order.
+///
+/// `remaining` is the set of committee keys that have not voted yet. The walk follows the
+/// committee `Vec`, never the set, so the order is the same on every node and every run.
+fn missing_signers(
+    committee: &[BlsPublicKey],
+    remaining: &HashSet<BlsPublicKey>,
+) -> Vec<AuthorityIdentifier> {
+    committee
+        .iter()
+        .filter(|key| remaining.contains(*key))
+        .map(|key| AuthorityIdentifier::from(*key))
+        .collect()
+}
+
+/// Record a vote round that reached quorum: the signer count, and one missed vote per committee
+/// member that did not sign.
+///
+/// Every member's `signer` series is touched (by 0 when it signed), so the series exists before
+/// its first miss and that miss shows up in a Prometheus `increase()`. Runs once per epoch, so the
+/// unresolved macro handles are fine here.
+fn record_epoch_record_quorum(
+    committee: &[BlsPublicKey],
+    remaining: &HashSet<BlsPublicKey>,
+    signers: u64,
+) {
+    metrics::gauge!("tn_node.epoch_record_signers").set(signers as f64);
+    for key in committee {
+        let signer = AuthorityIdentifier::from(*key).to_string();
+        metrics::counter!("tn_node.epoch_record_missing_signers_total", "signer" => signer)
+            .increment(u64::from(remaining.contains(key)));
     }
 }
 
@@ -2023,5 +2094,94 @@ mod epoch_vote_collector_tests {
         .await;
 
         assert!(result.is_ok(), "shutdown must cancel recovery so manage_epoch_votes returns");
+    }
+
+    /// Four deterministic committee keys, in committee order.
+    fn committee_of_four() -> Vec<BlsPublicKey> {
+        let mut rng = StdRng::seed_from_u64(7);
+        (0..4).map(|_| *BlsKeypair::generate(&mut rng).public()).collect()
+    }
+
+    /// `missing_signers` walks the committee, not the set: the result is in committee order no
+    /// matter how `remaining` was filled, and members that voted are left out.
+    #[test]
+    fn test_missing_signers_follow_committee_order() {
+        let committee = committee_of_four();
+        let id = |i: usize| AuthorityIdentifier::from(committee[i]);
+
+        // insert out of committee order
+        let remaining: HashSet<BlsPublicKey> = [committee[3], committee[1]].into_iter().collect();
+        assert_eq!(missing_signers(&committee, &remaining), vec![id(1), id(3)]);
+
+        let everyone: HashSet<BlsPublicKey> = committee.iter().rev().copied().collect();
+        assert_eq!(missing_signers(&committee, &everyone), vec![id(0), id(1), id(2), id(3)]);
+
+        assert!(missing_signers(&committee, &HashSet::new()).is_empty());
+    }
+
+    /// The `missing=` field renders as `[id,id]`: brackets, bs58 ids, comma with no space, no
+    /// quotes; `[]` when nobody is missing.
+    #[test]
+    fn test_signer_list_renders_bracketed_ids() {
+        assert_eq!(SignerList(&[]).to_string(), "[]");
+
+        let one = AuthorityIdentifier::from_bytes([1; 32]);
+        assert_eq!(
+            SignerList(std::slice::from_ref(&one)).to_string(),
+            "[4vJ9JU1bJJE96FWSJKvHsmmFADCg4gpZQff4P3bkLKi]"
+        );
+
+        let two = AuthorityIdentifier::from_bytes([2; 32]);
+        assert_eq!(
+            SignerList(&[one, two]).to_string(),
+            "[4vJ9JU1bJJE96FWSJKvHsmmFADCg4gpZQff4P3bkLKi,8qbHbw2BbbTHBW1sbeqakYXVKRQM8Ne7pLK7m6CVfeR]"
+        );
+    }
+
+    /// A quorum round sets the signer gauge and counts one miss for each member that did not sign;
+    /// members that signed get a zero-valued series under the same name and label.
+    #[test]
+    fn test_epoch_record_quorum_metrics() {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
+        let committee = committee_of_four();
+        let remaining: HashSet<BlsPublicKey> = [committee[2]].into_iter().collect();
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        metrics::with_local_recorder(&recorder, || {
+            record_epoch_record_quorum(&committee, &remaining, 3);
+        });
+        let snapshot = snapshotter.snapshot().into_vec();
+
+        let (_, _, _, gauge) = snapshot
+            .iter()
+            .find(|(key, ..)| key.key().name() == "tn_node.epoch_record_signers")
+            .expect("signer gauge registered");
+        assert!(matches!(gauge, DebugValue::Gauge(g) if g.0 == 3.0), "got {gauge:?}");
+
+        let mut misses: Vec<(String, u64)> = snapshot
+            .iter()
+            .filter(|(key, ..)| key.key().name() == "tn_node.epoch_record_missing_signers_total")
+            .map(|(key, _, _, value)| {
+                let labels: Vec<_> = key.key().labels().collect();
+                assert_eq!(labels.len(), 1, "only the signer label");
+                assert_eq!(labels[0].key(), "signer");
+                let DebugValue::Counter(n) = value else {
+                    panic!("counter expected, got {value:?}")
+                };
+                (labels[0].value().to_string(), *n)
+            })
+            .collect();
+        misses.sort();
+
+        let mut expected: Vec<(String, u64)> = committee
+            .iter()
+            .map(|key| {
+                (AuthorityIdentifier::from(*key).to_string(), u64::from(*key == committee[2]))
+            })
+            .collect();
+        expected.sort();
+        assert_eq!(misses, expected);
     }
 }
