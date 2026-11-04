@@ -182,6 +182,7 @@ entry from the root `Cargo.toml` if TN named the crate, and refresh `Cargo.lock`
 
 ```
 python3 -B -I -m unittest discover -s vendor/reth/tn -p 'test_*.py' -v   # vendor.py
+python3 -B -I -m unittest discover -s etc -p 'test_rocksdb_gate.py' -v   # etc/rocksdb-gate.sh
 ```
 
 The tests work in throwaway directories and never touch this tree or the upstream clone.

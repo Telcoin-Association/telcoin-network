@@ -163,6 +163,10 @@ it, changes compiled code and is planned in ROADMAP.md. `etc/rocksdb-gate.sh` no
 `Cargo.lock` or any manifest (comments aside) mentions rocksdb, so an upstream sync cannot
 quietly bring it back.
 
+2026-11-04 (vendor review, T4-4): the lockfile check matched only the names `rocksdb` and
+`librocksdb-sys`, so a renamed fork such as `rust-librocksdb-sys` passed. It now fails on any
+package whose name contains rocksdb, and the manifest scan covers the `patches/` crates too.
+
 ## D15. RocksDB step B waits for the storage work
 
 Step B (removing the zero-size `RocksDBProvider` stub, the `RocksBatchArg`/`RocksTxRefArg`
