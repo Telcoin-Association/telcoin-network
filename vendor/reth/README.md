@@ -144,9 +144,11 @@ Then:
 3. Act on "paths gone upstream" (crates upstream moved to another repository or deleted). The
    tool leaves those files alone. Either `vendor.py remove` the crate and depend on its new home,
    or keep it as a TN-owned fork (ROADMAP.md, "Forking a crate off").
-4. Update the root `Cargo.lock` (`cargo update -p <crate>` for the third-party bumps the new
+4. Act on "files in the vendored scope are git-ignored", if printed: add a negation to
+   `vendor/reth/.gitignore`, or `git add` leaves those files out of the commit.
+5. Update the root `Cargo.lock` (`cargo update -p <crate>` for the third-party bumps the new
    manifest asks for), then build and test as for any vendored change.
-5. Add a CHANGES.md entry for the sync and commit. `tn/upstream.toml` already names the new pin.
+6. Add a CHANGES.md entry for the sync and commit. `tn/upstream.toml` already names the new pin.
 
 A trial run of `sync v2.0.0` (2026-10-30) gives an idea of a major step. 454 files changed. Six
 vendored crates left the reth repository: `reth-primitives-traits`, `reth-codecs`,
@@ -173,7 +175,8 @@ entry from the root `Cargo.toml` if TN named the crate, and refresh `Cargo.lock`
 - `vendor.py check` reports workspace dependencies the vendored manifests use but the nested
   workspace does not define.
 - `vendor.py status` also warns about files a `.gitignore` rule hides from git, which would
-  otherwise drop out of the committed copy without anyone noticing.
+  otherwise drop out of the committed copy without anyone noticing. `sync`, `pick`, `add` and
+  `remove` end with the same warning, and exit 1 when it lists files.
 
 ## Testing the tools
 

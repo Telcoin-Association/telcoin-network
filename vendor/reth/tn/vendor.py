@@ -16,7 +16,8 @@ merge: base = upstream at the old point, theirs = upstream at the new point, our
 vendor/reth. A file TN never touched is replaced outright; a file TN changed goes through
 `git merge-file`, which leaves conflict markers when both sides touched the same lines. A file
 upstream renamed (git's rename detection between the two upstream trees) is merged at its new
-path against the old one, so TN's changes move with it.
+path against the old one, so TN's changes move with it. Each of these commands ends with the
+same warning as `status` when a .gitignore rule hides files in the vendored scope.
 
 Commands (run from anywhere; python3 -I vendor/reth/tn/vendor.py <cmd>):
   status            list files that differ from the pinned upstream (modified/added/deleted)
@@ -592,6 +593,8 @@ def cmd_sync(args):
     manifest = up.git("show", f"{new}:{MANIFEST}").stdout.decode()
     if print_missing(*missing_deps(crates, manifest)):
         rc = 1
+    if warn_ignored(crates):
+        rc = 1
     print("\nnext: resolve anything above, build and test (see vendor/reth/README.md), add a "
           "CHANGES.md entry for the sync, commit.")
     return rc
@@ -613,6 +616,8 @@ def cmd_pick(args):
     rc = report(changes, conflicts)
     if not changes and not conflicts:
         print("(the commit touches nothing in the vendored scope)")
+    if warn_ignored(crates):
+        rc = 1
     print("\nnext: build and test, record the backport in CHANGES.md, commit.")
     return rc
 
@@ -631,7 +636,8 @@ def reshape(args, new_crates, verb):
             shutil.rmtree(VENDOR / p, ignore_errors=True)
         changes, conflicts = three_way(base, theirs, sorted(set(old_crates) | set(new_crates)),
                                        f"upstream {pin['tag']}", f"upstream {pin['tag']} ({verb})")
-    return report(changes, conflicts)
+    rc = report(changes, conflicts)
+    return 1 if warn_ignored(new_crates) else rc
 
 
 def cmd_add(args):

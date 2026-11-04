@@ -1,5 +1,5 @@
-"""vendor.py against throwaway upstream and TN repositories: upstream renames (T4-2). Needs git;
-no network, no cargo."""
+"""vendor.py against throwaway upstream and TN repositories: upstream renames (T4-2) and
+git-ignored files (T4-3). Needs git; no network, no cargo."""
 
 import importlib.util
 import os
@@ -188,6 +188,23 @@ class Renames(Fixture):
                           "changed (left deleted)", out.stdout)
             self.assertIsNone(r.read(SUB_LIMITS_SRC))
         self.each_command(v2, check)
+
+
+class IgnoredFiles(Fixture):
+    def test_sync_and_pick_warn(self):
+        r = self.repos
+        v2 = r.commit_upstream({"crates/foo/src/debug/mod.rs": "//! debug\n"}, "v2")
+
+        def check(out):
+            self.assertEqual(out.returncode, 1)
+            self.assertIn("warning: 1 file(s) in the vendored scope are git-ignored", out.stdout)
+            self.assertIn("vendor/reth/crates/foo/src/debug/mod.rs", out.stdout)
+        self.each_command(v2, check)
+
+    def test_add_warns(self):
+        out = self.repos.vendor("add", "crates/bar")
+        self.assertEqual(out.returncode, 1)
+        self.assertIn("vendor/reth/crates/bar/data/fixture.json", out.stdout)
 
 
 if __name__ == "__main__":
