@@ -47,6 +47,15 @@ pub(crate) struct EngineMetrics {
     /// epoch 0 has no commit floor, so they are clamped when validator clocks lag the genesis
     /// timestamp.
     pub(crate) evm_timestamp_clamped_total: Counter,
+    /// Time a consensus output waited in the engine's queue, from being received off the
+    /// consensus stream to its execution task being spawned.
+    pub(crate) queue_wait_seconds: Histogram,
+    /// Time to durably persist one executed consensus output (the whole bounded retry,
+    /// including any retry backoff), recorded whether or not the persist succeeded.
+    pub(crate) persist_duration_seconds: Histogram,
+    /// Wall-clock milliseconds the engine spent running execution tasks. The busy fraction of
+    /// the engine is `rate(tn_engine_busy_milliseconds_total[1m]) / 1000`.
+    pub(crate) busy_milliseconds_total: Counter,
 }
 
 #[cfg(test)]
@@ -73,6 +82,9 @@ mod tests {
             metrics.persist_failures_total.increment(1);
             metrics.cross_producer_repacked_txs_total.increment(4);
             metrics.evm_timestamp_clamped_total.increment(5);
+            metrics.queue_wait_seconds.record(0.25);
+            metrics.persist_duration_seconds.record(0.5);
+            metrics.busy_milliseconds_total.increment(750);
         });
 
         let snapshot = snapshotter.snapshot().into_vec();
@@ -100,5 +112,11 @@ mod tests {
         assert!(matches!(value, DebugValue::Counter(4)));
         let (_, _, _, value) = find("tn_engine.evm_timestamp_clamped_total");
         assert!(matches!(value, DebugValue::Counter(5)));
+        let (_, _, _, value) = find("tn_engine.queue_wait_seconds");
+        assert!(matches!(value, DebugValue::Histogram(h) if h.len() == 1 && h[0].0 == 0.25));
+        let (_, _, _, value) = find("tn_engine.persist_duration_seconds");
+        assert!(matches!(value, DebugValue::Histogram(h) if h.len() == 1 && h[0].0 == 0.5));
+        let (_, _, _, value) = find("tn_engine.busy_milliseconds_total");
+        assert!(matches!(value, DebugValue::Counter(750)));
     }
 }
