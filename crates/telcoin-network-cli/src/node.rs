@@ -49,12 +49,12 @@ fn parse_bootstrap_peers_file(
 /// These will have embedded config files and can be joined after gereating keys.
 #[derive(Debug, Copy, Clone, clap::ValueEnum)]
 pub enum NamedChain {
-    /// Adiri- alias for TestNet
+    /// The adiri testnet (alias of `test-net`).
     Adiri,
-    /// TestNet or Adiri
+    /// The adiri testnet.
     TestNet,
-    /// MainNet
-    MainNet,
+    /// Mainnet.
+    Mainnet,
 }
 
 impl NamedChain {
@@ -66,7 +66,7 @@ impl NamedChain {
     ) -> eyre::Result<Config> {
         match self {
             Self::Adiri | Self::TestNet => Config::load_adiri(tn_datadir, version),
-            Self::MainNet => Config::load_mainnet(tn_datadir, version),
+            Self::Mainnet => Config::load_mainnet(tn_datadir, version),
         }
     }
 
@@ -77,7 +77,7 @@ impl NamedChain {
     pub(crate) fn write_committee<P: TelcoinDirs>(self, tn_datadir: &P) -> eyre::Result<()> {
         match self {
             Self::Adiri | Self::TestNet => Config::write_adiri_committee(tn_datadir),
-            Self::MainNet => Config::write_mainnet_committee(tn_datadir),
+            Self::Mainnet => Config::write_mainnet_committee(tn_datadir),
         }
     }
 }
@@ -1110,7 +1110,7 @@ mod tests {
         keygen.run(passphrase, |_, _, _, _, _| tokio::spawn(async { Ok(()) }))
     }
 
-    /// Run `node --chain main-net` (chain id 487) with `--bls-passphrase-source no-passphrase`
+    /// Run `node --chain mainnet` with `--bls-passphrase-source no-passphrase`
     /// plus `extra` node arguments on `datadir`, through the same passphrase resolution and
     /// launcher plumbing as the binary. The faucet opt-in's environment binding is removed, so
     /// the developer's shell cannot change the outcome.
@@ -1119,11 +1119,10 @@ mod tests {
         use crate::cli::Cli;
         use clap::{CommandFactory as _, FromArgMatches as _};
 
-        let args =
-            ["tn", "node", "--bls-passphrase-source", "no-passphrase", "--chain", "main-net"]
-                .into_iter()
-                .chain(["--datadir", datadir])
-                .chain(extra.iter().copied());
+        let args = ["tn", "node", "--bls-passphrase-source", "no-passphrase", "--chain", "mainnet"]
+            .into_iter()
+            .chain(["--datadir", datadir])
+            .chain(extra.iter().copied());
         // seeded before the command is built, as `Cli::try_parse_args_from` does
         tn_reth::init_reth_defaults();
         let command = Cli::<NoArgs>::command().mut_subcommand("node", |node| {

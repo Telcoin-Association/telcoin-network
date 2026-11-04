@@ -2564,7 +2564,7 @@ mod tests {
         assert!(persisting.is_err(), "the persisting path must refuse the same bundle");
     }
 
-    /// `db load-state --chain main-net` writes the bundled committee only after its checks pass:
+    /// `db load-state --chain mainnet` writes the bundled committee only after its checks pass:
     /// a bundle refused as non-resumable (or a faucet build refused on chain id 487) leaves no
     /// `genesis/` directory behind.
     #[test]
@@ -2578,7 +2578,7 @@ mod tests {
         let bundle = tempfile::tempdir().expect("empty bundle");
         let args = super::DbLoadStateArgs {
             pack: bundle.path().to_path_buf(),
-            chain: Some(super::NamedChain::MainNet),
+            chain: Some(super::NamedChain::Mainnet),
             allow_faucet_on_chain_487: false,
         };
         let err = args.execute(datadir_path.clone()).expect_err("an empty bundle must be refused");
