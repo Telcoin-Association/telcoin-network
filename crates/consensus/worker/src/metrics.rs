@@ -1,12 +1,14 @@
 //! Prometheus metrics for the worker.
 
 use crate::quorum_waiter::QuorumWaiterError;
+use parking_lot::Mutex;
 use reth_metrics::{
     metrics::{Counter, Histogram},
     Metrics,
 };
-use std::time::Duration;
-use tn_types::WorkerId;
+use std::{collections::BTreeMap, sync::Arc, time::Duration};
+use tn_network_libp2p::PeerTier;
+use tn_types::{BlsPublicKey, WorkerId};
 
 /// Why the worker refused a sealed batch's transactions instead of handing them to the
 /// transaction forwarder.
@@ -92,14 +94,38 @@ pub struct WorkerMetrics {
     handles: WorkerMetricHandles,
     /// The worker id, kept for per-event labeled counters recorded via the `metrics!` macros.
     worker_id: WorkerId,
+    /// `tn_worker.sync_serves_denied_total` for [`PeerTier::Committee`], resolved once here
+    /// because a starved batch-serve pool refuses streams many times per second.
+    sync_serves_denied_committee: Counter,
+    /// `tn_worker.sync_serves_denied_total` for [`PeerTier::Public`], resolved once like
+    /// [`Self::sync_serves_denied_committee`].
+    sync_serves_denied_public: Counter,
+    /// Requester-side batch request counters per peer, resolved on the first denied or
+    /// failed request to that peer.
+    ///
+    /// Shared by clones. The map holds one entry per peer that ever denied or failed a
+    /// request, which is the set of series the exporter keeps anyway, so it never outgrows
+    /// the registry.
+    batch_requests: Arc<Mutex<BTreeMap<BlsPublicKey, BatchRequestCounters>>>,
 }
 
 impl WorkerMetrics {
     /// Create the metric handles for `worker_id`.
     pub fn new_for_worker(worker_id: WorkerId) -> Self {
+        let worker = worker_id.to_string();
+        let sync_serves_denied = |tier: PeerTier| {
+            metrics::counter!(
+                "tn_worker.sync_serves_denied_total",
+                "worker" => worker.clone(),
+                "tier" => tier_label(&tier),
+            )
+        };
         Self {
-            handles: WorkerMetricHandles::new_with_labels(&[("worker", worker_id.to_string())]),
+            sync_serves_denied_committee: sync_serves_denied(PeerTier::Committee),
+            sync_serves_denied_public: sync_serves_denied(PeerTier::Public),
+            handles: WorkerMetricHandles::new_with_labels(&[("worker", worker)]),
             worker_id,
+            batch_requests: Arc::default(),
         }
     }
 
@@ -195,12 +221,85 @@ impl WorkerMetrics {
         )
         .increment(1);
     }
+
+    /// Record an inbound sync request refused because the batch-serve pool is full for the
+    /// peer's `tier` (the `AtCapacity` arm of `admit_and_serve_sync_stream`).
+    ///
+    /// Unlike [`Self::record_sync_stream_shed`], the stream passed the opening phase: the
+    /// request frame was read, and only the serve permit was missing. The requester sees
+    /// `Deny(AtCapacity)` and records [`Self::record_batch_request_denied`] on its side.
+    pub(crate) fn record_sync_serve_denied(&self, tier: PeerTier) {
+        match tier {
+            PeerTier::Committee => self.sync_serves_denied_committee.increment(1),
+            PeerTier::Public => self.sync_serves_denied_public.increment(1),
+        }
+    }
+
+    /// Record a batch request that `peer` answered with `Deny`; the peer stays eligible for
+    /// a later pass of the same `request_batches` call.
+    pub(crate) fn record_batch_request_denied(&self, peer: &BlsPublicKey) {
+        self.batch_request_counters(peer).denied.increment(1);
+    }
+
+    /// Record a batch request to `peer` that failed for any reason other than `Deny`
+    /// (open error, unsupported protocol, timeout, protocol error); the peer is skipped for
+    /// the rest of the `request_batches` call.
+    pub(crate) fn record_batch_request_failed(&self, peer: &BlsPublicKey) {
+        self.batch_request_counters(peer).failed.increment(1);
+    }
+
+    /// The requester-side counters for `peer`, resolved and cached on first use.
+    fn batch_request_counters(&self, peer: &BlsPublicKey) -> BatchRequestCounters {
+        self.batch_requests
+            .lock()
+            .entry(*peer)
+            .or_insert_with(|| BatchRequestCounters::new(self.worker_id, peer))
+            .clone()
+    }
+}
+
+/// Pre-resolved requester-side counters for batch requests sent to one peer.
+#[derive(Clone, Debug)]
+struct BatchRequestCounters {
+    /// `tn_worker.batch_requests_denied_total` for the peer.
+    denied: Counter,
+    /// `tn_worker.batch_requests_failed_total` for the peer.
+    failed: Counter,
+}
+
+impl BatchRequestCounters {
+    /// Resolve both counters for `peer` under `worker_id`; the `peer` label is the bs58 key.
+    fn new(worker_id: WorkerId, peer: &BlsPublicKey) -> Self {
+        let (worker, peer) = (worker_id.to_string(), peer.to_string());
+        Self {
+            denied: metrics::counter!(
+                "tn_worker.batch_requests_denied_total",
+                "worker" => worker.clone(),
+                "peer" => peer.clone(),
+            ),
+            failed: metrics::counter!(
+                "tn_worker.batch_requests_failed_total",
+                "worker" => worker,
+                "peer" => peer,
+            ),
+        }
+    }
+}
+
+/// The `tier` label value for a sync admission [`PeerTier`].
+pub(crate) const fn tier_label(tier: &PeerTier) -> &'static str {
+    match tier {
+        PeerTier::Committee => "committee",
+        PeerTier::Public => "public",
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+    use rand::{rngs::StdRng, SeedableRng as _};
+    use tn_types::BlsKeypair;
 
     #[test]
     fn test_metrics_register_and_update() {
@@ -293,5 +392,60 @@ mod tests {
                 .is_some_and(|(.., value)| matches!(value, DebugValue::Counter(1))),
             "budget-exhausted shed series should count the dropped stream"
         );
+    }
+
+    /// The `tier` label of each admission tier.
+    #[test]
+    fn tier_label_maps_each_tier() {
+        assert_eq!(tier_label(&PeerTier::Committee), "committee");
+        assert_eq!(tier_label(&PeerTier::Public), "public");
+    }
+
+    /// The batch-starvation series: serve denials per tier on the responder side, and denied
+    /// and failed batch requests per peer on the requester side.
+    #[test]
+    fn test_batch_starvation_counters() {
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let key = |seed| *BlsKeypair::generate(&mut StdRng::seed_from_u64(seed)).public();
+        let (denier, failer) = (key(1), key(2));
+
+        metrics::with_local_recorder(&recorder, || {
+            let metrics = WorkerMetrics::new_for_worker(3);
+            metrics.record_sync_serve_denied(PeerTier::Public);
+            metrics.record_sync_serve_denied(PeerTier::Public);
+            metrics.record_batch_request_denied(&denier);
+            // a clone shares the per-peer cache and records into the same series
+            metrics.clone().record_batch_request_denied(&denier);
+            metrics.record_batch_request_failed(&failer);
+        });
+
+        let snapshot = snapshotter.snapshot().into_vec();
+        let count = |name: &str, label: (&str, &str)| {
+            let series: Vec<_> = snapshot
+                .iter()
+                .filter(|(key, ..)| {
+                    key.key().name() == name
+                        && key.key().labels().any(|l| l.key() == "worker" && l.value() == "3")
+                        && key.key().labels().any(|l| l.key() == label.0 && l.value() == label.1)
+                })
+                .collect();
+            match series.as_slice() {
+                [] => None,
+                [(.., DebugValue::Counter(n))] => Some(*n),
+                other => panic!("{name} {label:?}: expected one counter series, got {other:?}"),
+            }
+        };
+
+        assert_eq!(count("tn_worker.sync_serves_denied_total", ("tier", "public")), Some(2));
+        // resolved eagerly, so the committee series exists at zero before any denial
+        assert_eq!(count("tn_worker.sync_serves_denied_total", ("tier", "committee")), Some(0));
+
+        let (denier, failer) = (denier.to_string(), failer.to_string());
+        assert_eq!(count("tn_worker.batch_requests_denied_total", ("peer", &denier)), Some(2));
+        assert_eq!(count("tn_worker.batch_requests_failed_total", ("peer", &failer)), Some(1));
+        // each peer's counters resolve together on its first event
+        assert_eq!(count("tn_worker.batch_requests_failed_total", ("peer", &denier)), Some(0));
+        assert_eq!(count("tn_worker.batch_requests_denied_total", ("peer", &failer)), Some(0));
     }
 }
