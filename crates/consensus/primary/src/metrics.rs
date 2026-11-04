@@ -5,7 +5,10 @@ use reth_metrics::{
     metrics::{Counter, Gauge, Histogram},
     Metrics,
 };
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::{
+    sync::atomic::{AtomicU64, Ordering},
+    time::Duration,
+};
 use tn_types::{Noticer, TaskSpawner};
 use tracing::debug;
 
@@ -97,6 +100,142 @@ impl PrimaryMetrics {
         self.consensus_output_bytes.set(bytes as f64);
         let prev = MAX_CONSENSUS_OUTPUT_BYTES.fetch_max(bytes, Ordering::Relaxed);
         self.max_consensus_output_bytes.set(prev.max(bytes) as f64);
+    }
+}
+
+/// A stage of the voter's vote path, in the order `RequestHandler::vote_inner` runs them.
+///
+/// [`Self::as_str`] is the `stage` label of `tn_primary_vote_stage_seconds` and
+/// `tn_primary_vote_timeouts_total`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum VoteStage {
+    /// Header checks, the drift tier decision and the seed signature verify.
+    Validate,
+    /// The wait for local execution to reach the header's latest execution block.
+    ExecWait,
+    /// The missing-parent check, parent acceptance, the wait for the parents and their checks.
+    Parents,
+    /// The wait for a header lead within the drift tolerance to pass.
+    LeadSleep,
+    /// Synchronizing the header's batches from the workers.
+    SyncBatches,
+    /// Reading the previous vote, signing the vote and writing it to the `Votes` table.
+    VoteStore,
+    /// The durability barrier on the `Votes` table before a vote is returned.
+    Persist,
+}
+
+impl VoteStage {
+    /// The number of stages.
+    pub(crate) const COUNT: usize = 7;
+
+    /// Every stage, in vote path order. A stage's position here is its [`Self::index`].
+    pub(crate) const ALL: [Self; Self::COUNT] = [
+        Self::Validate,
+        Self::ExecWait,
+        Self::Parents,
+        Self::LeadSleep,
+        Self::SyncBatches,
+        Self::VoteStore,
+        Self::Persist,
+    ];
+
+    /// The static metric label for this stage.
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Validate => "validate",
+            Self::ExecWait => "exec_wait",
+            Self::Parents => "parents",
+            Self::LeadSleep => "lead_sleep",
+            Self::SyncBatches => "sync_batches",
+            Self::VoteStore => "vote_store",
+            Self::Persist => "persist",
+        }
+    }
+
+    /// The position of this stage in [`Self::ALL`], for per-stage arrays.
+    pub(crate) const fn index(self) -> usize {
+        self as usize
+    }
+}
+
+/// Vote path metric handles, resolved once when an epoch's request handler is built.
+///
+/// Every committee peer sends vote requests several times a second, so the handles are resolved
+/// up front and no `metrics` macro runs on the vote path. The handles are `Arc`-backed.
+#[derive(Clone, Debug)]
+pub(crate) struct VoteStageHandles {
+    /// Vote requests received (`tn_primary_vote_requests_total`).
+    requests: Counter,
+    /// New votes signed, made durable and returned (`tn_primary_votes_created_total`).
+    created: Counter,
+    /// Votes signed earlier and returned again (`tn_primary_votes_recast_total`).
+    recast: Counter,
+    /// Requests refused because the header round is beyond the committed round plus the gc
+    /// depth (`tn_primary_vote_requests_too_new_total`).
+    too_new: Counter,
+    /// The wait for the author's vote lock (`tn_primary_vote_stage_seconds{stage="lock"}`).
+    ///
+    /// The lock is taken before the vote timeout starts, so it has no [`VoteStage`].
+    lock_wait: Histogram,
+    /// Time per stage, indexed by [`VoteStage::index`] (`tn_primary_vote_stage_seconds{stage}`).
+    stage_seconds: [Histogram; VoteStage::COUNT],
+    /// Vote timeouts by the stage in progress when the timeout fired, indexed by
+    /// [`VoteStage::index`] (`tn_primary_vote_timeouts_total{stage}`).
+    timeouts: [Counter; VoteStage::COUNT],
+}
+
+impl VoteStageHandles {
+    /// Resolve every vote path handle against the installed recorder.
+    pub(crate) fn new() -> Self {
+        Self {
+            requests: metrics::counter!("tn_primary.vote_requests_total"),
+            created: metrics::counter!("tn_primary.votes_created_total"),
+            recast: metrics::counter!("tn_primary.votes_recast_total"),
+            too_new: metrics::counter!("tn_primary.vote_requests_too_new_total"),
+            lock_wait: metrics::histogram!("tn_primary.vote_stage_seconds", "stage" => "lock"),
+            stage_seconds: VoteStage::ALL.map(|stage| {
+                metrics::histogram!("tn_primary.vote_stage_seconds", "stage" => stage.as_str())
+            }),
+            timeouts: VoteStage::ALL.map(|stage| {
+                metrics::counter!("tn_primary.vote_timeouts_total", "stage" => stage.as_str())
+            }),
+        }
+    }
+
+    /// Count a vote request.
+    pub(crate) fn record_request(&self) {
+        self.requests.increment(1);
+    }
+
+    /// Count a new vote returned to its author.
+    pub(crate) fn record_created(&self) {
+        self.created.increment(1);
+    }
+
+    /// Count a vote signed earlier and returned again.
+    pub(crate) fn record_recast(&self) {
+        self.recast.increment(1);
+    }
+
+    /// Count a request refused because its header round is too far ahead.
+    pub(crate) fn record_too_new(&self) {
+        self.too_new.increment(1);
+    }
+
+    /// Record the wait for the author's vote lock.
+    pub(crate) fn record_lock_wait(&self, waited: Duration) {
+        self.lock_wait.record(waited.as_secs_f64());
+    }
+
+    /// Record the time a request spent in `stage`.
+    pub(crate) fn record_stage(&self, stage: VoteStage, spent: Duration) {
+        self.stage_seconds[stage.index()].record(spent.as_secs_f64());
+    }
+
+    /// Count a vote timeout that fired while `stage` was in progress.
+    pub(crate) fn record_timeout(&self, stage: VoteStage) {
+        self.timeouts[stage.index()].increment(1);
     }
 }
 
@@ -255,6 +394,73 @@ mod tests {
         assert!(matches!(value, DebugValue::Gauge(g) if g.0 == 123.0));
         let (_, _, _, value) = find("tn_primary.max_consensus_output_bytes");
         assert!(matches!(value, DebugValue::Gauge(g) if g.0 == 123.0));
+    }
+
+    /// The vote path handles register every series and label the bench analysis reads: the four
+    /// counters, a timeout counter and a stage histogram per stage, and the `lock` histogram.
+    #[test]
+    fn test_vote_stage_handles_register_labelled_series() {
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+
+        metrics::with_local_recorder(&recorder, || {
+            let handles = VoteStageHandles::new();
+            handles.record_request();
+            handles.record_request();
+            handles.record_created();
+            handles.record_recast();
+            handles.record_too_new();
+            handles.record_lock_wait(Duration::from_millis(4));
+            handles.record_stage(VoteStage::SyncBatches, Duration::from_millis(250));
+            handles.record_timeout(VoteStage::ExecWait);
+        });
+
+        let snapshot = snapshotter.snapshot().into_vec();
+        let find = |name: &str, stage: Option<&str>| {
+            snapshot
+                .iter()
+                .find(|(key, ..)| {
+                    let key = key.key();
+                    key.name() == name
+                        && key.labels().find(|label| label.key() == "stage").map(|l| l.value())
+                            == stage
+                })
+                .map(|(.., value)| value)
+                .unwrap_or_else(|| panic!("metric {name} stage={stage:?} not registered"))
+        };
+
+        assert_eq!(find("tn_primary.vote_requests_total", None), &DebugValue::Counter(2));
+        assert_eq!(find("tn_primary.votes_created_total", None), &DebugValue::Counter(1));
+        assert_eq!(find("tn_primary.votes_recast_total", None), &DebugValue::Counter(1));
+        assert_eq!(find("tn_primary.vote_requests_too_new_total", None), &DebugValue::Counter(1));
+        let labels = [
+            "validate",
+            "exec_wait",
+            "parents",
+            "lead_sleep",
+            "sync_batches",
+            "vote_store",
+            "persist",
+        ];
+        assert_eq!(VoteStage::ALL.map(VoteStage::as_str), labels);
+        for (index, stage) in VoteStage::ALL.into_iter().enumerate() {
+            assert_eq!(stage.index(), index);
+            let timeouts = find("tn_primary.vote_timeouts_total", Some(stage.as_str()));
+            let fired = u64::from(stage == VoteStage::ExecWait);
+            assert_eq!(timeouts, &DebugValue::Counter(fired), "{} timeouts", stage.as_str());
+            let DebugValue::Histogram(samples) =
+                find("tn_primary.vote_stage_seconds", Some(stage.as_str()))
+            else {
+                panic!("{} stage series is not a histogram", stage.as_str());
+            };
+            let expected = if stage == VoteStage::SyncBatches { vec![0.25] } else { Vec::new() };
+            assert_eq!(samples.iter().map(|s| s.0).collect::<Vec<_>>(), expected);
+        }
+        let DebugValue::Histogram(lock) = find("tn_primary.vote_stage_seconds", Some("lock"))
+        else {
+            panic!("lock stage series is not a histogram");
+        };
+        assert_eq!(lock.iter().map(|s| s.0).collect::<Vec<_>>(), vec![0.004]);
     }
 
     /// The mirror task must keep the round gauges in sync with the watch channels, and
