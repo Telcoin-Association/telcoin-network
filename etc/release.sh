@@ -1208,7 +1208,7 @@ check_digest_package() {
     esac
     repo=${line%%@*}
     [ "$repo" = "$IMAGE" ] ||
-        die 1 "IMAGE_DIGEST names an image in $repo, but $TAG is a $CHANNEL tag and its image is published only in $IMAGE; $advice"
+        die 1 "IMAGE_DIGEST names an image in $repo, but $TAG is on the $CHANNEL channel, whose images are published only in $IMAGE; $advice"
 }
 
 # sign before it signs, verify before it counts signatures: SHA256SUMS in $1 lists exactly one
