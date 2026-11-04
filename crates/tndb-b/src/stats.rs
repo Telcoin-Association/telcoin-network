@@ -23,7 +23,8 @@ use std::time::Instant;
 /// free list, 3 stamps the CRCs, 4 syncs the data pages, 5 syncs the file's size if it grew, 6
 /// writes and syncs the meta. A [`crate::SyncMode::NoSync`] commit runs steps 1 and 3 (and
 /// counts in `save_ns`, `stamp_ns` and `free_list_save_rounds`); the [`crate::Env::sync`] that
-/// makes its state durable runs steps 4 to 6.
+/// makes its state durable runs steps 4 to 6. A [`Self::submitted_syncs`] commit runs steps 3 and
+/// 4 at once, step 4 on a thread of its own; the writer's times still add up to the commit's.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct IoStats {
     /// States made durable: each run of steps 4 to 6, by a [`crate::SyncMode::Durable`] commit
@@ -42,7 +43,7 @@ pub struct IoStats {
     /// Step 4s done by one `msync` of the one range the dirty pages form.
     pub msync_syncs: u64,
     /// Step 4s done by one `fdatasync` of the file (dirty pages in more than one range, or in too
-    /// many runs).
+    /// many runs, and every one of [`Self::submitted_syncs`]).
     pub fdatasync_syncs: u64,
     /// The pages the `msync`s of [`Self::msync_syncs`] spanned, from each range's first dirty page
     /// to its last, the clean pages between included.
@@ -58,8 +59,23 @@ pub struct IoStats {
     pub save_ns: u64,
     /// Time in step 3: the CRCs of every page written, one per tree page and one per run.
     pub stamp_ns: u64,
-    /// Time in step 4: the one `msync` or the one `fdatasync` of the data pages.
+    /// Time in step 4: the one `msync` or the one `fdatasync` of the data pages. For a
+    /// [`Self::submitted_syncs`] commit, the writer's wait for that thread after its last slice
+    /// was stamped: the part of the writeback and the `fdatasync` the stamp did not overlap
+    /// ([`Self::writeback_ns`] and [`Self::submitted_sync_ns`] time that thread itself).
     pub data_sync_ns: u64,
+    /// Of [`Self::fdatasync_syncs`], the step 4s run on a thread of their own while step 3 ran: a
+    /// durable commit of many pages, on Linux, stamps them in slices and hands each slice's bytes
+    /// to that thread as soon as their CRCs are stored; it starts each slice's writeback, then
+    /// runs the commit's one `fdatasync`.
+    pub submitted_syncs: u64,
+    /// The writebacks the threads of [`Self::submitted_syncs`] started (Linux `sync_file_range`),
+    /// one per slice.
+    pub writeback_starts: u64,
+    /// Time in the calls of [`Self::writeback_starts`], on their threads.
+    pub writeback_ns: u64,
+    /// Time in the `fdatasync`s of [`Self::submitted_syncs`], on their threads.
+    pub submitted_sync_ns: u64,
     /// Time in step 5: the file's size sync (`fdatasync`) when it grew and step 4 did not already
     /// sync it; a check of a flag otherwise.
     pub size_sync_ns: u64,
@@ -123,6 +139,10 @@ impl IoStats {
             save_ns,
             stamp_ns,
             data_sync_ns,
+            submitted_syncs,
+            writeback_starts,
+            writeback_ns,
+            submitted_sync_ns,
             size_sync_ns,
             meta_sync_ns,
             cow_copies,
@@ -150,6 +170,10 @@ impl IoStats {
             save_ns: d(save_ns, earlier.save_ns),
             stamp_ns: d(stamp_ns, earlier.stamp_ns),
             data_sync_ns: d(data_sync_ns, earlier.data_sync_ns),
+            submitted_syncs: d(submitted_syncs, earlier.submitted_syncs),
+            writeback_starts: d(writeback_starts, earlier.writeback_starts),
+            writeback_ns: d(writeback_ns, earlier.writeback_ns),
+            submitted_sync_ns: d(submitted_sync_ns, earlier.submitted_sync_ns),
             size_sync_ns: d(size_sync_ns, earlier.size_sync_ns),
             meta_sync_ns: d(meta_sync_ns, earlier.meta_sync_ns),
             cow_copies: d(cow_copies, earlier.cow_copies),
@@ -193,6 +217,10 @@ mod tests {
         let earlier = IoStats {
             commits: 1,
             pages_synced: 10,
+            submitted_syncs: 1,
+            writeback_starts: 2,
+            writeback_ns: 30,
+            submitted_sync_ns: 5,
             runs_by_step: [1, 2, 3, 4],
             max_gate_lag: 7,
             ..IoStats::default()
@@ -200,6 +228,10 @@ mod tests {
         let later = IoStats {
             commits: 3,
             pages_synced: 25,
+            submitted_syncs: 2,
+            writeback_starts: 7,
+            writeback_ns: 80,
+            submitted_sync_ns: 9,
             runs_by_step: [2, 2, 5, 9],
             max_gate_lag: 9,
             verify_ns: 4,
@@ -211,6 +243,10 @@ mod tests {
             IoStats {
                 commits: 2,
                 pages_synced: 15,
+                submitted_syncs: 1,
+                writeback_starts: 5,
+                writeback_ns: 50,
+                submitted_sync_ns: 4,
                 runs_by_step: [1, 0, 2, 5],
                 max_gate_lag: 9,
                 verify_ns: 4,

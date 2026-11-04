@@ -11,7 +11,7 @@
 use std::fs;
 
 use super::{
-    crash::{assert_gets, matrix, run_case, slack, Base, Case},
+    crash::{assert_gets, matrix, run_case, slack, submitted_matrix, Base, Case},
     damage::tree,
     *,
 };
@@ -206,6 +206,22 @@ fn every_crash_point_recovers_a_workload_of_overflow_runs() {
 fn every_crash_point_recovers_a_workload_of_overflow_runs_heavy() {
     for page_size in [4096, 16384] {
         matrix(&runs_base(page_size), 40);
+    }
+}
+
+/// The submitted matrix ([`submitted_matrix`]) on the run workload, whose slices close at the
+/// boundaries of units many pages long, reopens to exactly the allowed state at every crash point.
+#[test]
+fn every_crash_point_of_a_submitted_commit_recovers_a_workload_of_overflow_runs() {
+    submitted_matrix(&runs_base(4096), 2);
+}
+
+/// The submitted run matrix at two page sizes, with many random power losses.
+#[test]
+#[ignore = "heavy: run with --release"]
+fn every_crash_point_of_a_submitted_commit_recovers_a_workload_of_overflow_runs_heavy() {
+    for page_size in [4096, 16384] {
+        submitted_matrix(&runs_base(page_size), 40);
     }
 }
 

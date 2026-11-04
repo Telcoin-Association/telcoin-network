@@ -3,7 +3,9 @@
 //! must reopen to exactly the state the protocol allows — the last durable state `L` until the
 //! new meta is written, the new state `M` once its msync completed, and in between `M` exactly
 //! when the slot holds `M`'s intact record — pass `Env::check`, and reopen to the same state again
-//! after a crash right after that reopen.
+//! after a crash right after that reopen. [`submitted_matrix`] runs the crash commit on the
+//! submitted path (`Writer::stamp_submitted`), with the two crash points inside its overlapped
+//! stamp and data sync.
 
 use std::{fs, os::unix::fs::FileExt as _};
 
@@ -16,7 +18,7 @@ use crate::{
     alloc::RunStats,
     catalog::{self, DupRecord},
     disk_model,
-    env::CrashAt,
+    env::{with_submit_every, CrashAt, SubmitLog},
     meta::slot_to_write,
     packed::PackedView,
     page::{self, Find, Val},
@@ -174,6 +176,25 @@ const POINTS: [CrashAt; 7] = [
     CrashAt::AfterMetaMsync,
 ];
 
+/// The crash points of a commit on the submitted path (`Writer::stamp_submitted`), in protocol
+/// order: [`POINTS`], with the two inside its overlapped steps 3 and 4 between the free list's
+/// save and the joined data sync. Neither syncs anything: a writeback start only queues writes.
+const SUBMITTED_POINTS: [CrashAt; 9] = [
+    CrashAt::BeforeSave,
+    CrashAt::AfterSave,
+    CrashAt::AfterWritebackStart,
+    CrashAt::BeforeSubmittedSync,
+    CrashAt::AfterStamp,
+    CrashAt::AfterDataSync,
+    CrashAt::AfterSizeSync,
+    CrashAt::AfterMetaCopy,
+    CrashAt::AfterMetaMsync,
+];
+
+/// The pages each slice of a [`submitted_matrix`] commit takes (`with_submit_every`): few enough
+/// that the crash commit sends several slices, so its first writeback start comes mid-stamp.
+const SUBMIT_PAGES: usize = 16;
+
 /// True if `at` stops a commit in `sync` mode (else it stops the following sync).
 fn stops_the_commit(sync: SyncMode, at: CrashAt) -> bool {
     sync == SyncMode::Durable
@@ -184,14 +205,17 @@ fn stops_the_commit(sync: SyncMode, at: CrashAt) -> bool {
 /// ones first in `SyncMode::NoSync`) and stop at `at` (`None`: run to the end, with a sync).
 /// With `by_msync`, step 4 syncs the data by one `msync` (`Writer::data_by_msync`), else by the
 /// sync `data_sync` picks. Returns the case's path, the state `M` its last commit made, the slot
-/// `M`'s meta goes to, how the durable steps synced the data, and what the writer reused and
-/// how it placed its runs. The environment is crashed.
+/// `M`'s meta goes to, how the durable steps synced the data, what the writer reused and how it
+/// placed its runs, and what its submitted commits did. The environment is crashed.
 pub(super) fn run_case(base: &Base, sync: SyncMode, by_msync: bool, at: Option<CrashAt>) -> Case {
     let path = base.dir.path().join("case");
     fs::copy(&base.path, &path).expect("copy");
     disk_model::track(&path);
     let env = open(&path, sync);
-    env.with_writer(|w| w.data_by_msync = by_msync);
+    env.with_writer(|w| {
+        w.data_by_msync = by_msync;
+        w.submit_log = w.submit_every.map(|_| SubmitLog::default());
+    });
     let mut latest = base.state.clone();
     if sync == SyncMode::NoSync {
         for round in 0..2 {
@@ -222,10 +246,11 @@ pub(super) fn run_case(base: &Base, sync: SyncMode, by_msync: bool, at: Option<C
         (None, None) => {}
         (at, e) => panic!("{at:?}: {e:?}"),
     }
-    let (by_file, reused, runs) =
-        env.with_writer(|w| (w.data_by_file, w.alloc.load_log.len(), w.alloc.run_stats));
+    let (by_file, reused, runs, submitted) = env.with_writer(|w| {
+        (w.data_by_file, w.alloc.load_log.len(), w.alloc.run_stats, w.submit_log.take())
+    });
     env.crash();
-    Case { path, latest, slot, by_file, reused, runs }
+    Case { path, latest, slot, by_file, reused, runs, submitted }
 }
 
 /// What [`run_case`] left.
@@ -242,6 +267,9 @@ pub(super) struct Case {
     pub(super) reused: usize,
     /// How the writer placed the overflow runs of the case's commits.
     pub(super) runs: RunStats,
+    /// What the case's submitted commits did, when its environment submits every durable commit
+    /// (`with_submit_every`).
+    pub(super) submitted: Option<SubmitLog>,
 }
 
 /// Every key of `want` reads back through a get (a point read, not the cursor `newest_state`
@@ -334,6 +362,41 @@ pub(super) fn matrix(base: &Base, seeds: u64) {
     }
 }
 
+/// [`dry_run`] of the submitted matrix's `Durable` crash commit, checked to take the submitted
+/// path in several slices, each stamped when sent, every one of which the submitter started.
+fn submitted_dry_run(base: &Base) {
+    dry_run(base, SyncMode::Durable, false);
+    let Case { path, submitted, .. } = run_case(base, SyncMode::Durable, false, None);
+    let log = submitted.expect("the environment submits every durable commit");
+    assert!(log.sent.len() > 1, "several slices: {log:?}");
+    assert!(log.sent.iter().all(|slice| slice.stamped), "stamped when sent: {log:?}");
+    let sent: Vec<_> = log.sent.iter().map(|slice| slice.bytes.clone()).collect();
+    assert_eq!(log.received, sent, "the submitter received every slice in order");
+    disk_model::untrack(&path);
+    fs::remove_file(&path).expect("remove");
+}
+
+/// The matrix with the crash commit on the submitted path (`with_submit_every`, in slices of
+/// [`SUBMIT_PAGES`] pages: its stamp overlapped with the writeback of the slices already stamped,
+/// its data synced by the submitter thread's `fdatasync`): every point of [`SUBMITTED_POINTS`] x
+/// {process crash, strict power loss, `seeds` random power losses}, in `SyncMode::Durable` with
+/// that `fdatasync` (a `NoSync` commit never takes the path, which ignores `data_by_msync`). A
+/// crash after a writeback start, which syncs nothing, recovers the last durable state.
+pub(super) fn submitted_matrix(base: &Base, seeds: u64) {
+    with_submit_every(SUBMIT_PAGES * base.page_size as usize, || {
+        submitted_dry_run(base);
+        for (n, at) in SUBMITTED_POINTS.into_iter().enumerate() {
+            for loss in [Loss::Process, Loss::Strict] {
+                crash_case(base, SyncMode::Durable, false, at, loss);
+            }
+            for seed in 0..seeds {
+                let loss = Loss::Random(seed * 64 + n as u64);
+                crash_case(base, SyncMode::Durable, false, at, loss);
+            }
+        }
+    });
+}
+
 /// The matrix: every crash point x {process crash, strict power loss, random power loss with
 /// three seeds} x {`Durable`, `NoSync`} x {data synced by `fdatasync`, by one `msync`} reopens
 /// to exactly the allowed state, which checks and survives a crash right after the reopen.
@@ -348,6 +411,24 @@ fn every_crash_point_recovers_the_state_the_protocol_allows() {
 fn every_crash_point_recovers_the_state_the_protocol_allows_heavy() {
     for page_size in [4096, 16384] {
         matrix(&base(page_size), 40);
+    }
+}
+
+/// The submitted matrix: every crash point of a commit on the submitted path, two of them inside
+/// its overlapped stamp and data sync, x {process crash, strict power loss, random power loss
+/// with three seeds} reopens to exactly the allowed state, which checks and survives a crash
+/// right after the reopen.
+#[test]
+fn every_crash_point_of_a_submitted_commit_recovers_the_state_the_protocol_allows() {
+    submitted_matrix(&base(4096), 3);
+}
+
+/// The submitted matrix at two page sizes, with many random power losses.
+#[test]
+#[ignore = "heavy: run with --release"]
+fn every_crash_point_of_a_submitted_commit_recovers_the_state_the_protocol_allows_heavy() {
+    for page_size in [4096, 16384] {
+        submitted_matrix(&base(page_size), 40);
     }
 }
 
@@ -711,6 +792,24 @@ fn every_crash_point_recovers_a_dup_table_heavy() {
     for page_size in [4096, 16384] {
         for bound in Bound::ALL {
             matrix(&dup_base(page_size, bound), 20);
+        }
+    }
+}
+
+/// The submitted matrix ([`submitted_matrix`]) with the dup crash commit; the `_heavy` twin adds
+/// the other bounds and a page size.
+#[test]
+fn every_crash_point_of_a_submitted_commit_recovers_a_dup_table() {
+    submitted_matrix(&dup_base(4096, Bound::Default), 3);
+}
+
+/// The submitted dup matrix at every bound and two page sizes, with many random power losses.
+#[test]
+#[ignore = "heavy: run with --release"]
+fn every_crash_point_of_a_submitted_commit_recovers_a_dup_table_heavy() {
+    for page_size in [4096, 16384] {
+        for bound in Bound::ALL {
+            submitted_matrix(&dup_base(page_size, bound), 20);
         }
     }
 }

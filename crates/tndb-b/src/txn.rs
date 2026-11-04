@@ -2524,12 +2524,12 @@ impl Work {
             catalog: *catalog,
             free,
         };
-        let pages = writer.stamp_private()?;
+        let stamped = writer.stamp_private(inner.sync_mode == SyncMode::Durable)?;
         #[cfg(test)]
         writer.crash_point(CrashAt::AfterStamp)?;
         match inner.sync_mode {
-            SyncMode::Durable => writer.make_durable(&pages, &meta)?,
-            SyncMode::NoSync => writer.defer_sync(&pages),
+            SyncMode::Durable => writer.make_durable(&stamped.pages, stamped.submitted, &meta)?,
+            SyncMode::NoSync => writer.defer_sync(&stamped.pages),
         }
         writer.publish(inner, meta);
         writer.alloc.begin_txn(txn + 1);

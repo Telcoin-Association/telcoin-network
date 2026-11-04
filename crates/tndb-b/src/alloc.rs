@@ -560,7 +560,7 @@ impl PrivatePages {
     /// What gets one CRC each, ascending, as `(first page, pages, run)`: a tree page alone
     /// (`run` false: the page CRC, `page::crc`), and a run as one unit (`run` true: its CRC
     /// covers all its pages; its interior is never stamped page by page).
-    pub(crate) fn units(&self) -> impl Iterator<Item = (u32, u32, bool)> + '_ {
+    pub(crate) fn units(&self) -> impl Iterator<Item = (u32, u32, bool)> + Clone + '_ {
         let mut runs = self.runs.iter().peekable();
         let mut i = 0;
         std::iter::from_fn(move || {

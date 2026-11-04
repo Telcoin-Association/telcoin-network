@@ -2,12 +2,14 @@
 //! it), an image of the bytes that reached the disk, whose length is the file's *durable length*.
 //! Every real flush updates it: an msync copies the OS pages it covers (whole pages, as the kernel
 //! flushes them) but only within the durable length, and an fsync or fdatasync takes the whole
-//! file, its length included. Growing or truncating the file changes only its live length: as
-//! POSIX allows, a size change no fsync made durable can be lost, and with it every byte past the
-//! durable length, msync'd or not. [`power_loss`] gives the file back its durable length and
-//! writes the image over it: bytes never flushed are gone. [`power_loss_random`] models a harsher
-//! crash in which some unflushed pages (and perhaps the size change) had already been written back,
-//! some pages only in part. Untracked files cost one atomic load per flush.
+//! file as it was when the call began, its length included (a store another thread makes during
+//! the call may miss it, so the model never counts one as flushed). Growing or truncating the
+//! file changes only its live length: as POSIX allows, a size change no fsync made durable can be
+//! lost, and with it every byte past the durable length, msync'd or not. [`power_loss`] gives the
+//! file back its durable length and writes the image over it: bytes never flushed are gone.
+//! [`power_loss_random`] models a harsher crash in which some unflushed pages (and perhaps the
+//! size change) had already been written back, some pages only in part. Untracked files cost one
+//! atomic load per flush.
 
 use std::{
     collections::HashMap,
@@ -90,19 +92,27 @@ pub(crate) fn ino_if_tracking(file: &File) -> u64 {
     file.metadata().map(|meta| meta.ino()).unwrap_or(0)
 }
 
-/// An fsync (or fdatasync) of `file`: every byte of it is on disk, and so is its length.
-pub(crate) fn flushed_all(file: &File) {
+/// The bytes an fsync (or fdatasync) of `file` about to begin makes durable: the file's, and its
+/// length, as they are now, before the call. `None` if `file` is not tracked (or cannot be read).
+/// Hand it to [`flushed_all`] once the call succeeded.
+pub(crate) fn before_flush_all(file: &File) -> Option<(u64, Vec<u8>)> {
     let ino = ino_if_tracking(file);
-    if ino == 0 {
-        return;
+    if ino == 0 || !images().as_ref().is_some_and(|images| images.contains_key(&ino)) {
+        return None;
     }
-    let mut images = images();
-    let Some(image) = images.as_mut().and_then(|images| images.get_mut(&ino)) else {
-        return;
-    };
     let len = file.metadata().map(|meta| meta.len()).unwrap_or(0) as usize;
     let mut bytes = vec![0_u8; len];
-    if file.read_exact_at(&mut bytes, 0).is_ok() {
+    file.read_exact_at(&mut bytes, 0).ok()?;
+    Some((ino, bytes))
+}
+
+/// An fsync (or fdatasync) succeeded: the bytes [`before_flush_all`] took when it began are on
+/// disk, and so is their length.
+pub(crate) fn flushed_all(before: Option<(u64, Vec<u8>)>) {
+    let Some((ino, bytes)) = before else {
+        return;
+    };
+    if let Some(image) = images().as_mut().and_then(|images| images.get_mut(&ino)) {
         *image = bytes;
     }
 }

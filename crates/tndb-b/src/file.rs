@@ -47,7 +47,10 @@
 //! persist a size extension, so a growth marks the size unsynced and
 //! [`PageFile::sync_size_if_grown`] fdatasyncs it once. [`PageFile::fdatasync_all`] writes every
 //! dirty page of the mapping and the size in one call, so after it the size sync has nothing left
-//! to do. Any failed sync or growth poisons the file:
+//! to do. A [`Writeback`] ([`PageFile::writeback`]) is a duplicate of the file's descriptor for
+//! a thread that starts ranges' writeback and then runs that same `fdatasync` while the writer
+//! keeps stamping pages; the writer hands its outcome back to [`PageFile::written_back`]. Any
+//! failed sync or growth, or a writeback that failed, poisons the file:
 //! every later write or sync returns [`Error::Failed`] and is never retried (a retried `msync`
 //! after a writeback error can spuriously succeed on Linux errseq, laundering lost data). Reads
 //! continue.
@@ -71,7 +74,7 @@ use memmap2::{Advice, Mmap, MmapOptions, MmapRaw};
 
 use crate::{
     error::{Error, Result},
-    sys::{allocate_range, fdatasync_file, os_page_size},
+    sys::{allocate_range, fdatasync_file, os_page_size, start_writeback},
 };
 
 /// Address space a page file reserves for its mapping by default (1 GiB).
@@ -176,6 +179,13 @@ pub(crate) struct PageFile {
     /// Test-only: fail the next msync (see [`Self::fail_next_msync`]).
     #[cfg(test)]
     fail_next_msync: AtomicBool,
+    /// Test-only: the next [`Writeback`] fails its first start (see
+    /// [`Self::fail_next_writeback_start`]).
+    #[cfg(test)]
+    fail_next_writeback_start: AtomicBool,
+    /// Test-only: the next [`Writeback`] fails its sync (see [`Self::fail_next_writeback_sync`]).
+    #[cfg(test)]
+    fail_next_writeback_sync: AtomicBool,
 }
 
 impl PageFile {
@@ -215,6 +225,10 @@ impl PageFile {
             poisoned: AtomicBool::new(false),
             #[cfg(test)]
             fail_next_msync: AtomicBool::new(false),
+            #[cfg(test)]
+            fail_next_writeback_start: AtomicBool::new(false),
+            #[cfg(test)]
+            fail_next_writeback_sync: AtomicBool::new(false),
         })
     }
 
@@ -445,10 +459,89 @@ impl PageFile {
         Ok(())
     }
 
+    /// A [`Writeback`] of this file: its descriptor duplicated (`dup`), so a thread can start the
+    /// writeback of written pages and sync the file without a borrow of this file or its mapping.
+    /// `Err(Failed)` once poisoned; a failed `dup` is an I/O error, which poisons nothing.
+    pub(crate) fn writeback(&self) -> Result<Writeback> {
+        self.check_poison()?;
+        Ok(Writeback {
+            file: self.file.try_clone()?,
+            #[cfg(test)]
+            fail_start: self.fail_next_writeback_start.swap(false, Ordering::Relaxed),
+            #[cfg(test)]
+            fail_sync: self.fail_next_writeback_sync.swap(false, Ordering::Relaxed),
+        })
+    }
+
+    /// Take the outcome of a [`Writeback`] of this file whose last call was its
+    /// [`Writeback::sync`]: once it succeeded the size counts as synced, as after
+    /// [`Self::fdatasync_all`]; an error (the thread's, or one about the thread) poisons the file,
+    /// as a failed sync does, and is returned ahead of an earlier poison's generic `Failed`.
+    pub(crate) fn written_back(&self, outcome: Result<()>) -> Result<()> {
+        outcome.inspect_err(|_| self.poison())?;
+        self.check_poison()?;
+        self.size_unsynced.store(false, Ordering::Relaxed);
+        Ok(())
+    }
+
     /// Test-only: make the next msync fail as if the kernel had reported a writeback error.
     #[cfg(test)]
     pub(crate) fn fail_next_msync(&self) {
         self.fail_next_msync.store(true, Ordering::Relaxed);
+    }
+
+    /// Test-only: the next [`Self::writeback`] fails its first [`Writeback::start`], as if the
+    /// kernel had refused it.
+    #[cfg(test)]
+    pub(crate) fn fail_next_writeback_start(&self) {
+        self.fail_next_writeback_start.store(true, Ordering::Relaxed);
+    }
+
+    /// Test-only: the next [`Self::writeback`] fails its [`Writeback::sync`], as if the kernel had
+    /// reported a writeback error.
+    #[cfg(test)]
+    pub(crate) fn fail_next_writeback_sync(&self) {
+        self.fail_next_writeback_sync.store(true, Ordering::Relaxed);
+    }
+}
+
+/// A duplicate of a [`PageFile`]'s descriptor ([`PageFile::writeback`]), for a thread that writes
+/// the file back while the writer keeps stamping pages. It holds no borrow of the page file or its
+/// mapping, so the writer keeps its `&mut` access to the pages; it only starts writeback and syncs.
+/// The duplicate shares the original's open file description, so its `fdatasync` reports the
+/// writeback errors (Linux errseq) one of the original would. Its calls neither check nor set the
+/// page file's poison: the writer hands their outcome to [`PageFile::written_back`].
+#[derive(Debug)]
+pub(crate) struct Writeback {
+    file: File,
+    /// Test-only: fail the first [`Self::start`] (see [`PageFile::fail_next_writeback_start`]).
+    #[cfg(test)]
+    fail_start: bool,
+    /// Test-only: fail [`Self::sync`] (see [`PageFile::fail_next_writeback_sync`]).
+    #[cfg(test)]
+    fail_sync: bool,
+}
+
+impl Writeback {
+    /// Start the writeback of the dirty pages in the byte range `range` (non-empty) without
+    /// waiting for its writes ([`start_writeback`]): `Ok(true)` when started, `Ok(false)` on a
+    /// target without the call. Not a sync: only [`Self::sync`] makes the pages durable.
+    pub(crate) fn start(&mut self, range: Range<u64>) -> io::Result<bool> {
+        #[cfg(test)]
+        if std::mem::take(&mut self.fail_start) {
+            return Err(io::Error::other("injected writeback start failure"));
+        }
+        start_writeback(&self.file, range.start, range.end - range.start)
+    }
+
+    /// `fdatasync` the file ([`fdatasync_file`], the call of [`PageFile::fdatasync_all`]): every
+    /// page written through the mapping, and the file's size, durable.
+    pub(crate) fn sync(&mut self) -> io::Result<()> {
+        #[cfg(test)]
+        if std::mem::take(&mut self.fail_sync) {
+            return Err(io::Error::other("injected writeback sync failure"));
+        }
+        fdatasync_file(&self.file)
     }
 }
 

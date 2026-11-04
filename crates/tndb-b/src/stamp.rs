@@ -8,7 +8,9 @@
 //! ([`crate::file::PageFile::pages`]), each thread computes the CRCs of a contiguous share of
 //! about equal unit bytes, and once every thread is done the writer stores each CRC into its
 //! unit's trailer itself, in unit order, through `PageFile::pages_mut` ([`put_crc`]). The threads
-//! only read: no page changes while they run, and they need no `unsafe`.
+//! only read: no page changes while they run, and they need no `unsafe`. A large durable commit
+//! on Linux runs this once per slice of its units (`Writer::stamp_submitted`), so each slice's
+//! CRCs are stored before its writeback starts.
 //!
 //! The shares are balanced by the units' bytes, not by the bytes hashed, which a page's gap
 //! makes fewer: weighing by those would read every page's header on the writer's thread before

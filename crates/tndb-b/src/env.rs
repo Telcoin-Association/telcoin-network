@@ -22,9 +22,13 @@
 //! them durable (one `msync` when they form one range, else one `fdatasync` of the file; see
 //! [`data_sync`]), then the file's size if it grew and that sync did not already cover it, and
 //! only then writes the new meta over the slot holding the lower txn and syncs that one page. A
-//! crash before the meta's sync recovers the previous state; after it, the new one. In
-//! [`SyncMode::NoSync`] a commit only stamps and publishes in memory; [`Env::sync`] (or the
-//! environment's drop) runs the durable steps for the newest state.
+//! crash before the meta's sync recovers the previous state; after it, the new one. On Linux a
+//! durable commit of many pages runs the stamp and the data sync at once
+//! ([`Writer::stamp_submitted`]): it stamps its pages in slices and hands each stamped slice to a
+//! thread of its own, which starts that slice's writeback and, after the last, runs the commit's
+//! one `fdatasync`; the meta's write waits for that thread. In [`SyncMode::NoSync`] a commit only
+//! stamps and publishes in memory; [`Env::sync`] (or the environment's drop) runs the durable
+//! steps for the newest state.
 //!
 //! ## Readers
 //!
@@ -58,11 +62,13 @@ use std::{
     io,
     ops::Range,
     os::unix::fs::{FileExt as _, MetadataExt as _},
+    panic,
     path::{Path, PathBuf},
     sync::{
         atomic::{fence, AtomicU64, Ordering},
-        Arc, Weak,
+        mpsc, Arc, Weak,
     },
+    thread,
     time::{Duration, Instant},
 };
 
@@ -73,7 +79,7 @@ use crate::{
     check::{self, CheckReport},
     crc::CrcState,
     error::{Error, Result},
-    file::{MapView, PageFile, ReadOnlyFile, DEFAULT_RESERVE},
+    file::{MapView, PageFile, ReadOnlyFile, Writeback, DEFAULT_RESERVE},
     freelist,
     latch::{Latch, UnwindLatch},
     meta::{choose_meta, slot_to_write, Chosen, Meta, META_LEN},
@@ -99,6 +105,75 @@ const MERGE_GAP: u32 = 64;
 /// one `fdatasync` of the file even when the runs merge into one range ([`data_sync`]).
 const MAX_RUNS: usize = 16;
 
+/// The bytes of private pages from which a durable commit runs its stamp and its data sync at
+/// once, on a target where [`SUBMITS`] ([`submit_slice`]).
+const SUBMIT_MIN: usize = 32 << 20;
+
+/// The bytes of units each slice of a [`Writer::stamp_submitted`] commit takes: a slice closes at
+/// the first unit boundary from this many bytes.
+const SUBMIT_SLICE: usize = 32 << 20;
+
+/// Whether this target overlaps a large commit's stamp with its data's writeback
+/// ([`Writer::stamp_submitted`]): Linux only, whose `sync_file_range` starts a range's writeback
+/// before the final sync. Elsewhere nothing would start before that sync, so a thread of its own
+/// would only add a hop.
+const SUBMITS: bool = cfg!(target_os = "linux");
+
+/// The slice size a durable commit of `bytes` bytes of private pages is stamped in when
+/// [`SUBMITS`] ([`Writer::stamp_submitted`]): [`SUBMIT_SLICE`] from [`SUBMIT_MIN`], else `None`,
+/// today's steps 3 then 4 on the writer's thread.
+fn submit_slice(bytes: usize) -> Option<usize> {
+    (bytes >= SUBMIT_MIN).then_some(SUBMIT_SLICE)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only: the [`Writer::submit_every`] each writer opened on this thread starts with (see
+    /// [`with_submit_every`]).
+    static SUBMIT_EVERY_ON_OPEN: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Test-only: run `f` with every environment it opens on this thread taking the submitted path
+/// for each durable commit, in slices of `slice` bytes ([`Writer::submit_every`]), so a suite that
+/// opens its own environments runs that path.
+#[cfg(test)]
+pub(crate) fn with_submit_every<T>(slice: usize, f: impl FnOnce() -> T) -> T {
+    /// Puts the thread's previous choice back, also when `f` panics.
+    struct Reset(Option<usize>);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            SUBMIT_EVERY_ON_OPEN.set(self.0);
+        }
+    }
+    let _reset = Reset(SUBMIT_EVERY_ON_OPEN.replace(Some(slice)));
+    f()
+}
+
+/// Test-only: one slice a [`Writer::stamp_submitted`] commit handed its submitter thread.
+#[cfg(test)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SentSlice {
+    /// The bytes of the file handed over.
+    pub(crate) bytes: Range<u64>,
+    /// The slice's units, `(first page, pages)`, ascending.
+    pub(crate) units: Vec<(u32, u32)>,
+    /// Every unit of the slice held its valid CRC when it was handed over.
+    pub(crate) stamped: bool,
+}
+
+/// Test-only: what the [`Writer::stamp_submitted`] commits did, while a test asks for it
+/// ([`Writer::submit_log`]).
+#[cfg(test)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct SubmitLog {
+    /// The slices the writer handed over, in order.
+    pub(crate) sent: Vec<SentSlice>,
+    /// The byte ranges the submitter threads received, in order, of every commit whose thread
+    /// returned its report.
+    pub(crate) received: Vec<Range<u64>>,
+}
+
 /// How step 4 makes a commit's dirty pages durable ([`data_sync`]).
 #[derive(Debug, PartialEq, Eq)]
 enum DataSync {
@@ -108,6 +183,111 @@ enum DataSync {
     Range(Range<u64>),
     /// One `fdatasync` of the whole file.
     File,
+    /// Done already: step 3's submitter thread ran the one `fdatasync` ([`Submitted`]).
+    Submitted,
+}
+
+/// What commit step 3 hands on ([`Writer::stamp_private`]).
+#[derive(Debug)]
+pub(crate) struct Stamped {
+    /// Every page written, ascending, for the data sync.
+    pub(crate) pages: Vec<u32>,
+    /// `Some` when step 3 ran step 4 too ([`Writer::stamp_submitted`]).
+    pub(crate) submitted: Option<Submitted>,
+}
+
+/// A step 4 that step 3 already ran: its submitter thread's `fdatasync` made the commit's pages,
+/// and the file's size, durable ([`Writer::stamp_submitted`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Submitted {
+    /// The file had grown since its previous size sync ([`IoStats::grown_commits`]).
+    grown: bool,
+}
+
+/// What a submitter thread did ([`submit`]), handed back through its join.
+#[derive(Debug, Default)]
+struct WrittenBack {
+    /// The writebacks it started (`IoStats::writeback_starts`).
+    starts: u64,
+    /// Its time in those starts.
+    start_ns: u64,
+    /// Its time in the `fdatasync`.
+    sync_ns: u64,
+    /// Test-only: the byte ranges it received, in order.
+    #[cfg(test)]
+    received: Vec<Range<u64>>,
+}
+
+/// The submitter thread of a [`Writer::stamp_submitted`] commit. It starts the writeback of each
+/// byte range received, in order, and once the writer closes the channel it `fdatasync`s the
+/// file, the commit data's one durability barrier and the call that reports its writeback errors.
+/// It holds only `file`, a duplicate descriptor, never a borrow of the mapping. Its first error
+/// ends it at once: dropping `ranges` then fails the writer's next send, so the writer stops
+/// stamping and joins it. In tests `crash`, one of the commit's crash points inside steps 3 and
+/// 4 ([`CrashAt::AfterWritebackStart`], [`CrashAt::BeforeSubmittedSync`]), ends it as a process
+/// death there would: after its starts, with an error and without the `fdatasync`; and `turns`
+/// ([`Writer::submit_in_turns`]) lets the writer stamp each slice only once this thread has done
+/// all it can ([`next_range`]). `turns` lives until this returns, after the `fdatasync`.
+fn submit(
+    mut file: Writeback,
+    ranges: mpsc::Receiver<Range<u64>>,
+    #[cfg(test)] crash: Option<CrashAt>,
+    #[cfg(test)] turns: Option<mpsc::SyncSender<()>>,
+) -> io::Result<WrittenBack> {
+    let mut done = WrittenBack::default();
+    while let Some(range) = next_range(
+        &ranges,
+        #[cfg(test)]
+        turns.as_ref(),
+    ) {
+        #[cfg(test)]
+        done.received.push(range.clone());
+        let started = Instant::now();
+        if file.start(range)? {
+            done.starts += 1;
+            done.start_ns += elapsed_ns(started);
+        }
+    }
+    #[cfg(test)]
+    if let Some(at) = crash {
+        return Err(io::Error::other(format!("injected crash at {at:?}")));
+    }
+    let started = Instant::now();
+    file.sync()?;
+    done.sync_ns = elapsed_ns(started);
+    Ok(done)
+}
+
+/// The submitter's next byte range from the writer ([`submit`]), `None` once the writer has
+/// closed the channel.
+///
+/// In tests, `turns` ([`Writer::submit_in_turns`], a rendezvous channel) fixes the order of the
+/// two threads: the writer waits for two turns before it stamps each slice
+/// ([`Writer::stamp_slices`]). This thread gives the first once it has finished with every range
+/// received; then it looks at the channel, which the writer cannot change while it waits for the
+/// second turn: open and empty, it gives the second turn and blocks for the next range; closed,
+/// it ends its loop, so the writer's second wait lasts until this thread has returned, its
+/// `fdatasync` done. So whatever this thread does before its loop ends, or after a range it
+/// received, comes before the writer's next stamp: a sync started too early always misses a
+/// later slice's CRCs. A writer that has stopped waiting (its end of `turns` dropped) leaves the
+/// plain `recv`.
+fn next_range(
+    ranges: &mpsc::Receiver<Range<u64>>,
+    #[cfg(test)] turns: Option<&mpsc::SyncSender<()>>,
+) -> Option<Range<u64>> {
+    #[cfg(test)]
+    if let Some(turns) = turns {
+        if turns.send(()).is_ok() {
+            match ranges.try_recv() {
+                Ok(range) => return Some(range),
+                Err(mpsc::TryRecvError::Disconnected) => return None,
+                Err(mpsc::TryRecvError::Empty) => {
+                    let _ = turns.send(());
+                }
+            }
+        }
+    }
+    ranges.recv().ok()
 }
 
 /// When a commit becomes durable.
@@ -491,10 +671,27 @@ pub(crate) struct Writer {
     /// [`stamp::threads`]' choice (1: the serial loop), so a small commit can take either path.
     #[cfg(test)]
     pub(crate) stamp_threads: Option<usize>,
-    /// Test-only: the threads the latest commit's step 3 computed its CRCs on (1: the serial
-    /// loop).
+    /// Test-only: the most threads one CRC computation of the latest commit's step 3 took (1: the
+    /// serial loop): the whole commit's, or each slice's of a [`Self::stamp_submitted`] one.
     #[cfg(test)]
     pub(crate) stamped_on: usize,
+    /// Test-only: every durable commit runs [`Self::stamp_submitted`] in slices of this many
+    /// bytes, whatever its size and the target ([`Self::submitting`]).
+    #[cfg(test)]
+    pub(crate) submit_every: Option<usize>,
+    /// Test-only: a [`Self::stamp_submitted`] commit fails before it stamps its slice of this
+    /// index (0: the first), as a failed store would.
+    #[cfg(test)]
+    pub(crate) fail_stamp_slice: Option<usize>,
+    /// Test-only: a [`Self::stamp_submitted`] commit stamps each slice only once its submitter
+    /// thread has done all it can with the slices sent before ([`next_range`]), so a submitter
+    /// that syncs too early always does so before a later slice's CRCs are stored.
+    #[cfg(test)]
+    pub(crate) submit_in_turns: bool,
+    /// Test-only: when `Some`, what the [`Self::stamp_submitted`] commits did; a test sets it to
+    /// `Some(SubmitLog::default())` to record.
+    #[cfg(test)]
+    pub(crate) submit_log: Option<SubmitLog>,
 }
 
 /// Test-only: a point of the commit protocol (see the env module docs) at which
@@ -507,7 +704,15 @@ pub(crate) enum CrashAt {
     BeforeSave,
     /// After the free list's save.
     AfterSave,
-    /// After step 3 (the pages' CRCs stamped): the last point of a `SyncMode::NoSync` commit.
+    /// Inside steps 3 and 4 of a [`Writer::stamp_submitted`] commit: its first slice stamped and
+    /// its writeback started, the rest unstamped, nothing synced. The writer stops after the
+    /// slice's send and the submitter thread after its start, without its `fdatasync`.
+    AfterWritebackStart,
+    /// Inside steps 3 and 4 of a [`Writer::stamp_submitted`] commit: every slice stamped and its
+    /// writeback started, before the submitter thread's `fdatasync`, which it skips.
+    BeforeSubmittedSync,
+    /// After step 3 (the pages' CRCs stamped; step 4 too for a [`Writer::stamp_submitted`]
+    /// commit): the last point of a `SyncMode::NoSync` commit.
     AfterStamp,
     /// After step 4 (the data sync: the one `msync`, the one `fdatasync`, or nothing).
     AfterDataSync,
@@ -522,57 +727,289 @@ pub(crate) enum CrashAt {
 impl Writer {
     /// Stamp the CRCs of what the transaction wrote (commit step 3): each tree page's, outside its
     /// free gap ([`page::crc`]), and one over each overflow run
-    /// ([`crate::alloc::PrivatePages::units`]). Returns every page written,
-    /// ascending, for the data sync; the tree pages then count as stamped by this writer.
+    /// ([`crate::alloc::PrivatePages::units`]). Returns every page written, ascending, for the data
+    /// sync; the tree pages then count as stamped by this writer.
     ///
-    /// Units of many bytes have their CRCs computed on several threads first ([`Self::unit_crcs`]),
-    /// which this stores in unit order; else each unit is stamped in turn. Both write the same
-    /// bytes in the same order, and fail at the same unit with the same error.
-    pub(crate) fn stamp_private(&mut self) -> Result<Vec<u32>> {
+    /// Units of many bytes have their CRCs computed on several threads first, which this stores in
+    /// unit order; else each unit is stamped in turn ([`Self::stamp_units`]). A `durable` commit of
+    /// many bytes, on Linux, runs step 4 too, overlapped with its stamp
+    /// ([`Self::stamp_submitted`]). Every way writes the same bytes in the same order, and fails at
+    /// the same unit with the same error.
+    pub(crate) fn stamp_private(&mut self, durable: bool) -> Result<Stamped> {
         let started = Instant::now();
         let size = self.geometry.page_size();
         let private = self.alloc.stamp_private();
-        let threads = stamp::threads(private.pages.len() * size);
-        #[cfg(test)]
-        let threads = self.stamp_threads.unwrap_or(threads);
-        let crcs = self.unit_crcs(&private, threads);
+        let bytes = private.pages.len() * size;
         #[cfg(test)]
         {
-            self.stamped_on = if crcs.is_some() { threads } else { 1 };
+            self.stamped_on = 0;
+        }
+        let submitted = match self.submitting(durable, bytes) {
+            Some(slice) => self.stamp_submitted(&private, slice, started)?,
+            None => None,
+        };
+        if submitted.is_none() {
+            self.stamp_units(private.units(), bytes)?;
+            self.stats.stamp_ns += elapsed_ns(started);
+        }
+        Ok(Stamped { pages: private.pages, submitted })
+    }
+
+    /// The slice size a commit of `bytes` bytes of private pages runs [`Self::stamp_submitted`]
+    /// in: [`submit_slice`]'s for a `durable` commit where [`SUBMITS`], else `None`. A
+    /// [`SyncMode::NoSync`] commit leaves its pages to a later sync, so it starts no I/O. In tests
+    /// `Writer::submit_every`, when set, takes every durable commit there.
+    fn submitting(&self, durable: bool, bytes: usize) -> Option<usize> {
+        if !durable {
+            return None;
+        }
+        #[cfg(test)]
+        if let Some(slice) = self.submit_every {
+            return Some(slice);
+        }
+        SUBMITS.then(|| submit_slice(bytes)).flatten()
+    }
+
+    /// Stamp `units` (`(first page, pages, run)`, ascending; `bytes` their size), as step 3 stamps
+    /// a commit's units: from [`stamp::threads`]' threshold, their CRCs computed on several threads
+    /// ([`Self::unit_crcs`]) and then stored in unit order ([`stamp::put_crc`]); else, or when a
+    /// unit lies past the end of the file, each unit stamped in turn, the serial loop, which then
+    /// raises that unit's error.
+    fn stamp_units(
+        &mut self,
+        units: impl Iterator<Item = (u32, u32, bool)> + Clone,
+        bytes: usize,
+    ) -> Result<()> {
+        let size = self.geometry.page_size();
+        let threads = stamp::threads(bytes);
+        #[cfg(test)]
+        let threads = self.stamp_threads.unwrap_or(threads);
+        let crcs = self.unit_crcs(units.clone(), threads);
+        #[cfg(test)]
+        {
+            self.stamped_on = self.stamped_on.max(if crcs.is_some() { threads } else { 1 });
         }
         match crcs {
             Some(crcs) => {
-                for ((p, n, _), crc) in private.units().zip(crcs) {
+                for ((p, n, _), crc) in units.zip(crcs) {
                     stamp::put_crc(self.file.pages_mut(p, size, n as usize * size)?, crc);
                 }
             }
             None => {
-                for (p, n, run) in private.units() {
+                for (p, n, run) in units {
                     stamp::stamp(self.file.pages_mut(p, size, n as usize * size)?, run);
                 }
             }
         }
-        self.stats.stamp_ns += elapsed_ns(started);
-        Ok(private.pages)
+        Ok(())
     }
 
-    /// The CRC of each of `private`'s units, in unit order, computed on `threads` threads (the
-    /// count [`stamp::threads`] gives the units' bytes) from read-only slices of the units
+    /// The CRC of each of `units`, in unit order, computed on `threads` threads (the count
+    /// [`stamp::threads`] gives the units' bytes) from read-only slices of the units
     /// ([`PageFile::pages`]). `None` for one thread, which leaves the units to the serial loop,
     /// and when a unit lies past the end of the file, whose error the serial loop then raises.
-    fn unit_crcs(&self, private: &PrivatePages, threads: usize) -> Option<Vec<u32>> {
+    fn unit_crcs(
+        &self,
+        units: impl Iterator<Item = (u32, u32, bool)>,
+        threads: usize,
+    ) -> Option<Vec<u32>> {
         let size = self.geometry.page_size();
         if threads < 2 {
             return None;
         }
-        let units: Vec<stamp::Unit<'_>> = private
-            .units()
+        let units: Vec<stamp::Unit<'_>> = units
             .map(|(p, n, run)| {
                 let unit = self.file.pages(p, size, n as usize * size)?;
                 Some(if run { stamp::Unit::Run(unit) } else { stamp::Unit::Page(unit) })
             })
             .collect::<Option<_>>()?;
         Some(stamp::crcs(&units, threads))
+    }
+
+    /// Steps 3 and 4 of a durable commit of many bytes, at once. A submitter thread of its own
+    /// ([`submit`]) gets a duplicate of the file's descriptor ([`PageFile::writeback`]) and a
+    /// channel; this thread stamps `private`'s units slice by slice ([`Self::stamp_slices`]),
+    /// sending each slice's bytes once its CRCs are stored, and the submitter starts each one's
+    /// writeback, so the drive writes the stamped slices while the rest is stamped. Then this
+    /// closes the channel, and the submitter runs the commit's one `fdatasync` (step 4) while this
+    /// waits at the join. The bytes stamped, their order and the writer's errors are those of the
+    /// units stamped in one piece. `started` is step 3's start, for [`IoStats::stamp_ns`].
+    ///
+    /// Any error poisons the file: the submitter's (a failed start or `fdatasync`, returned ahead
+    /// of the writer's own, which a failed start can cause) or the writer's, which closes the
+    /// channel and joins before it returns. A panic of the submitter poisons the file and resumes
+    /// on this thread; a panic here unwinds through the scope, which joins the submitter first.
+    /// Either way the commit is never published. `Ok(None)`, nothing stamped, when the thread
+    /// cannot be spawned: the caller then takes the steps one after the other.
+    fn stamp_submitted(
+        &mut self,
+        private: &PrivatePages,
+        slice: usize,
+        started: Instant,
+    ) -> Result<Option<Submitted>> {
+        let grown = self.file.size_unsynced();
+        let writeback = self.file.writeback()?;
+        // Test-only: a crash point inside steps 3 and 4 stops the submitter too (see `submit`);
+        // the writer itself stops at `AfterWritebackStart` (`Self::stamp_slices`).
+        #[cfg(test)]
+        let crash = self
+            .crash_at
+            .filter(|at| matches!(at, CrashAt::AfterWritebackStart | CrashAt::BeforeSubmittedSync));
+        // Test-only: the two ends of `Self::submit_in_turns`' turns (see `next_range`).
+        #[cfg(test)]
+        let (turn, turns) = self.submit_in_turns.then(|| mpsc::sync_channel(0)).unzip();
+        let scoped = thread::scope(|s| {
+            // The sender lives in this closure, so an unwind out of it drops the sender, which
+            // ends the submitter's loop: the scope's own join of the submitter cannot hang. (In
+            // tests the writer's end of the turns drops with `stamp_slices`' frame, which frees a
+            // submitter waiting to give a turn.)
+            let (tx, rx) = mpsc::channel();
+            let submitter = thread::Builder::new()
+                .name("tndb-b-submit".into())
+                .spawn_scoped(s, move || {
+                    submit(
+                        writeback,
+                        rx,
+                        #[cfg(test)]
+                        crash,
+                        #[cfg(test)]
+                        turn,
+                    )
+                })
+                .ok()?;
+            let stamped = self.stamp_slices(
+                private,
+                slice,
+                &tx,
+                #[cfg(test)]
+                turns,
+            );
+            drop(tx);
+            let closed = Instant::now();
+            Some((stamped, submitter.join(), closed))
+        });
+        let Some((stamped, joined, closed)) = scoped else {
+            return Ok(None);
+        };
+        #[cfg(test)]
+        if crash == Some(CrashAt::BeforeSubmittedSync) {
+            self.crash_at = None;
+        }
+        let stamping = closed.saturating_duration_since(started).as_nanos();
+        self.stats.stamp_ns += u64::try_from(stamping).unwrap_or(u64::MAX);
+        self.stats.data_sync_ns += elapsed_ns(closed);
+        let done = match joined {
+            Ok(done) => done,
+            Err(payload) => {
+                let failed = Error::Failed("page file: the writeback thread panicked".to_string());
+                let _ = self.file.written_back(Err(failed));
+                panic::resume_unwind(payload)
+            }
+        };
+        #[cfg(test)]
+        if let (Some(log), Ok(done)) = (self.submit_log.as_mut(), &done) {
+            log.received.extend(done.received.iter().cloned());
+        }
+        let done = match (done, stamped) {
+            // `written_back` poisons the file and returns the error it is given.
+            (Err(e), _) => return self.file.written_back(Err(e.into())).map(|()| None),
+            (Ok(_), Err(e)) => return self.file.written_back(Err(e)).map(|()| None),
+            (Ok(done), Ok(())) => done,
+        };
+        self.file.written_back(Ok(()))?;
+        self.stats.fdatasync_syncs += 1;
+        self.stats.submitted_syncs += 1;
+        self.stats.writeback_starts += done.starts;
+        self.stats.writeback_ns += done.start_ns;
+        self.stats.submitted_sync_ns += done.sync_ns;
+        Ok(Some(Submitted { grown }))
+    }
+
+    /// Stamp `private`'s units in page order, in slices that close at the first unit boundary
+    /// from `slice` bytes, each as a whole commit's units are stamped ([`Self::stamp_units`]),
+    /// and send each slice's bytes, from its first page to the end of its last, to the submitter
+    /// on `tx` once the slice's CRCs are stored. The clean pages between a slice's units are sent
+    /// too (the kernel writes only dirty pages; in a durable environment those are this commit's,
+    /// or free pages an aborted transaction wrote). A failed send means the submitter has ended,
+    /// so this stops: the join then returns the submitter's error. In tests `turns`
+    /// ([`Self::submit_in_turns`]) holds each slice's stamp until the submitter has given its two
+    /// turns ([`next_range`]), or has ended; it drops when this returns.
+    fn stamp_slices(
+        &mut self,
+        private: &PrivatePages,
+        slice: usize,
+        tx: &mpsc::Sender<Range<u64>>,
+        #[cfg(test)] turns: Option<mpsc::Receiver<()>>,
+    ) -> Result<()> {
+        let size = self.geometry.page_size();
+        let mut units = private.units().peekable();
+        let mut next = Vec::new();
+        #[cfg(test)]
+        let mut index = 0;
+        while units.peek().is_some() {
+            next.clear();
+            let mut bytes = 0;
+            for unit in units.by_ref() {
+                next.push(unit);
+                bytes += unit.1 as usize * size;
+                if bytes >= slice {
+                    break;
+                }
+            }
+            #[cfg(test)]
+            {
+                if self.fail_stamp_slice == Some(index) {
+                    return Err(Error::Failed(format!("injected stamp failure at slice {index}")));
+                }
+                index += 1;
+                // The submitter's two turns; a failed wait means it has ended.
+                if let Some(turns) = &turns {
+                    let _ = turns.recv().and_then(|()| turns.recv());
+                }
+            }
+            self.stamp_units(next.iter().copied(), bytes)?;
+            let (first, _, _) = next[0];
+            let (last, n, _) = next[next.len() - 1];
+            let span =
+                u64::from(first) * size as u64..(u64::from(last) + u64::from(n)) * size as u64;
+            #[cfg(test)]
+            self.log_sent(&next, &span);
+            // The order the overlap needs: no page of this span is written after this send. Every
+            // other page write of the commit came before step 3 (the catalog's roots and the free
+            // list's save, `RwTxn::commit`; the stamp only stores into private pages); the later
+            // slices' units lie past this span's last page (`private.units()` is ascending and
+            // its units are disjoint); and the meta's write, in a slot below every private page,
+            // waits for the join. So no store waits on this writeback and none dirties a page it
+            // already took. (Where an OS page holds more than one of these pages, the next slice's
+            // first store may share an OS page with this span's last: it re-dirties that OS page,
+            // and the final `fdatasync` writes it.)
+            if tx.send(span).is_err() {
+                return Err(Error::Failed(
+                    "page file: the writeback thread ended early".to_string(),
+                ));
+            }
+            #[cfg(test)]
+            self.crash_point(CrashAt::AfterWritebackStart)?;
+        }
+        Ok(())
+    }
+
+    /// Test-only: record the hand-over of `units` (`(first page, pages, run)`) as the bytes
+    /// `span` in [`Self::submit_log`], if a test asked for the log, with whether every unit held
+    /// its valid CRC then.
+    #[cfg(test)]
+    fn log_sent(&mut self, units: &[(u32, u32, bool)], span: &Range<u64>) {
+        let size = self.geometry.page_size();
+        let stamped = units.iter().all(|&(p, n, run)| {
+            self.file.pages(p, size, n as usize * size).is_some_and(|unit| {
+                let state = if run { crate::crc::crc_state(unit) } else { page::crc_state(unit) };
+                state == CrcState::Valid
+            })
+        });
+        if let Some(log) = self.submit_log.as_mut() {
+            let units = units.iter().map(|&(p, n, _)| (p, n)).collect();
+            log.sent.push(SentSlice { bytes: span.clone(), units, stamped });
+        }
     }
 
     /// Record pages stamped by a [`SyncMode::NoSync`] commit, for the next sync.
@@ -584,14 +1021,23 @@ impl Writer {
     }
 
     /// The durable steps of a commit (4–6): sync `pages` (ascending) by the one `msync` or the
-    /// one `fdatasync` [`data_sync`] picks, then the file's size if it grew (a no-op after the
-    /// `fdatasync`, which syncs the size too), then write `meta` over the slot holding the lower
-    /// txn and sync that page.
-    pub(crate) fn make_durable(&mut self, pages: &[u32], meta: &Meta) -> Result<()> {
+    /// one `fdatasync` [`data_sync`] picks, unless step 3 already ran step 4 (`submitted`), then
+    /// the file's size if it grew (a no-op after the `fdatasync`, which syncs the size too), then
+    /// write `meta` over the slot holding the lower txn and sync that page.
+    pub(crate) fn make_durable(
+        &mut self,
+        pages: &[u32],
+        submitted: Option<Submitted>,
+        meta: &Meta,
+    ) -> Result<()> {
         let size = self.geometry.page_size();
-        let plan = data_sync(pages, size as u64);
+        let plan = match submitted {
+            Some(_) => DataSync::Submitted,
+            None => data_sync(pages, size as u64),
+        };
         #[cfg(test)]
         let plan = match (pages.first(), pages.last()) {
+            _ if plan == DataSync::Submitted => plan,
             _ if self.data_by_fdatasync => DataSync::File,
             (Some(&first), Some(&last)) if self.data_by_msync => {
                 DataSync::Range(u64::from(first) * size as u64..(u64::from(last) + 1) * size as u64)
@@ -600,9 +1046,9 @@ impl Writer {
         };
         #[cfg(test)]
         {
-            self.data_by_file = plan == DataSync::File;
+            self.data_by_file = matches!(plan, DataSync::File | DataSync::Submitted);
         }
-        let grown = self.file.size_unsynced();
+        let grown = submitted.map_or_else(|| self.file.size_unsynced(), |s| s.grown);
         let mut clock = Instant::now();
         match plan {
             DataSync::Nothing => {}
@@ -616,6 +1062,8 @@ impl Writer {
                 self.file.fdatasync_all()?;
                 self.stats.fdatasync_syncs += 1;
             }
+            // Counted by `stamp_submitted`, which ran it.
+            DataSync::Submitted => {}
         }
         self.stats.pages_synced += pages.len() as u64;
         self.stats.data_sync_ns += lap(&mut clock);
@@ -671,7 +1119,7 @@ impl Writer {
         let _guard = UnwindLatch(latch, "a sync panicked");
         let pages: Vec<u32> = self.unsynced.drain().map(|p| p as u32).collect();
         let last = self.last;
-        self.make_durable(&pages, &last).inspect_err(|e| latch.fail(format!("sync: {e}")))
+        self.make_durable(&pages, None, &last).inspect_err(|e| latch.fail(format!("sync: {e}")))
     }
 
     /// Publish `meta` as the newest committed state (commit step 7): readers that begin from
@@ -1117,6 +1565,14 @@ impl Env {
             stamp_threads: None,
             #[cfg(test)]
             stamped_on: 0,
+            #[cfg(test)]
+            submit_every: SUBMIT_EVERY_ON_OPEN.get(),
+            #[cfg(test)]
+            fail_stamp_slice: None,
+            #[cfg(test)]
+            submit_in_turns: false,
+            #[cfg(test)]
+            submit_log: None,
         };
         let inner = EnvInner::new(geometry, options.sync, snapshot, Some(Box::new(writer)), None);
         Ok(Env { inner: Arc::new(inner) })

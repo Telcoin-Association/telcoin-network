@@ -13,7 +13,9 @@
 //! under the same crashes, each table's nested trees those of its forms (`dup::Forms`, the size
 //! rules of a packed set) at every step, reader and reopen; its gate counts, per dup table, nested
 //! and outer trees of two levels, deletes that emptied an outer key, `delete_prefix` hits, a clear
-//! and a drop, and in the tables that pack, packed keys created and promoted.
+//! and a drop, and in the tables that pack, packed keys created and promoted. In the submitted
+//! variant every durable commit takes the submitted path (`with_submit_every`), and a stopped
+//! commit may also stop inside its overlapped stamp and data sync.
 
 use std::collections::BTreeSet;
 
@@ -23,7 +25,7 @@ use super::{
 };
 use crate::{
     disk_model,
-    env::CrashAt,
+    env::{with_submit_every, CrashAt},
     meta::slot_to_write,
     tree::{
         test_harness::{walk_outer_tree, walk_packing_tree, ReportSeed, Rng},
@@ -131,6 +133,9 @@ struct Coverage {
     stopped_commits: u32,
     stopped_to_new: u32,
     stopped_to_old: u32,
+    /// Commits stopped inside the overlapped stamp and data sync of the submitted path
+    /// (`CrashAt::AfterWritebackStart`, `CrashAt::BeforeSubmittedSync`).
+    stopped_mid_submit: u32,
     /// Deletes whose merges absorbed a sibling (`Writer::merging_deletes`).
     merging_deletes: u64,
     /// Each dup table's, in the dup variant ([`DUPS`]).
@@ -616,8 +621,10 @@ impl Run {
 
     /// A commit (or, in `SyncMode::NoSync`, the sync after it) stopped at a random point of the
     /// commit protocol, a random way down, and a reopen to the state the protocol allows.
+    /// A durable commit of an environment that submits every durable commit
+    /// (`with_submit_every`) may also stop inside its overlapped stamp and data sync.
     fn stopped_commit(&mut self, step: u32) {
-        let points = [
+        let mut points = vec![
             CrashAt::BeforeSave,
             CrashAt::AfterSave,
             CrashAt::AfterStamp,
@@ -626,8 +633,14 @@ impl Run {
             CrashAt::AfterMetaCopy,
             CrashAt::AfterMetaMsync,
         ];
-        let at = points[self.rng.below(points.len() as u64) as usize];
         let env = self.env.take().expect("open");
+        if self.sync == SyncMode::Durable && env.with_writer(|w| w.submit_every.is_some()) {
+            points.extend([CrashAt::AfterWritebackStart, CrashAt::BeforeSubmittedSync]);
+        }
+        let at = points[self.rng.below(points.len() as u64) as usize];
+        if matches!(at, CrashAt::AfterWritebackStart | CrashAt::BeforeSubmittedSync) {
+            self.seen.stopped_mid_submit += 1;
+        }
         let slot = env.with_writer(|w| slot_to_write(&w.slots()));
         let mut txn = env.begin_rw().expect("begin");
         let mut work = self.latest.1.clone();
@@ -816,6 +829,45 @@ fn a_random_multi_table_workload_with_crashes_matches_the_model_heavy() {
             }
         });
     }
+}
+
+/// The large-value variant with every durable commit on the submitted path, in slices of four
+/// pages (`with_submit_every`), so most commits send several slices and the units of overflow
+/// runs close them; its stopped commits also stop inside the overlapped stamp and data sync.
+#[test]
+fn a_random_multi_table_workload_of_submitted_commits_with_crashes_matches_the_model() {
+    let seen = with_submit_every(4 * 4096, || random_run(0x5B17_0001, 300, 4096, true, false));
+    let gate = [
+        seen.run_puts >= 1000,
+        seen.commits >= 120,
+        seen.syncs >= 10,
+        seen.clean_reopens >= 5,
+        seen.process_crashes >= 5,
+        seen.strict_losses >= 5,
+        seen.random_losses >= 5,
+        seen.stopped_to_new >= 3,
+        seen.stopped_to_old >= 10,
+        seen.stopped_mid_submit >= 3,
+    ];
+    assert!(gate.iter().all(|&ok| ok), "{seen:?}");
+}
+
+/// The submitted variant at two page sizes, inline values and large ones, with more steps.
+#[test]
+#[ignore = "heavy: run with --release"]
+fn a_random_multi_table_workload_of_submitted_commits_with_crashes_matches_the_model_heavy() {
+    let mut mid_submit = 0;
+    for (seed, (page_size, large, steps)) in
+        [(4096, true, 1500), (16384, true, 600), (4096, false, 1500)].into_iter().enumerate()
+    {
+        let slice = 4 * page_size as usize;
+        let seen = with_submit_every(slice, || {
+            random_run(0x5B17_0100 + seed as u64, steps, page_size, large, false)
+        });
+        assert!(seen.stopped_mid_submit >= 1, "{seen:?}");
+        mid_submit += seen.stopped_mid_submit;
+    }
+    assert!(mid_submit >= 10, "{mid_submit} commits stopped inside the overlap");
 }
 
 /// The large-value variant: values inline and in overflow runs of 1 to 10 pages, with drops and
