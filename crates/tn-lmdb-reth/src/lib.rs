@@ -50,9 +50,10 @@
 //! The form, and a dup table's options as the engine records them (resolved at the file's page
 //! size), are part of the file's format: `create_tables` creates each table in its layout's form,
 //! and the open (and a table resolved later) refuses a table the file holds in the other form, or
-//! a dup table with another key width or `packed_max`, as `create_tables` does:
-//! `DatabaseError::Open` (`DatabaseError::CreateTable`) with `MDBX_INCOMPATIBLE` and a message
-//! naming the table and both forms. Test-only knobs, `TnLmdbArgs::composite_dup_tables` and
+//! a dup table with another key width or `packed_max`: `DatabaseError::Open` with
+//! `MDBX_INCOMPATIBLE` and a message naming the table and both forms (`create_tables` meeting one
+//! gives the engine's `TableKind`: `DatabaseError::CreateTable` with MDBX's own
+//! `MDBX_INCOMPATIBLE` message). Test-only knobs, `TnLmdbArgs::composite_dup_tables` and
 //! `TnLmdbArgs::packed_dup_max`, open the nested layouts' tables composite or with a small bound
 //! (128 bytes: a key promotes at its second or third row), so the tests run every call on three
 //! forms: packed, packed-small and composite (the changesets' path).
@@ -134,7 +135,10 @@
 //! environment latched an earlier failure: writes and commits fail until it is reopened) is
 //! `MDBX_PANIC`, MDBX's "fatal environment error"; `Io` carries the OS error number when there is
 //! one, else `EIO`; `NotTnLmdb` is `MDBX_INVALID`; and `UnsupportedVersion` is
-//! `MDBX_VERSION_MISMATCH`.
+//! `MDBX_VERSION_MISMATCH`. `Failed` is also this crate's refusal of a write transaction whose held
+//! delete (the dup rewrite) broke the adapter's invariant: its row missing (damage the engine did
+//! not detect), or a second delete held before the first ran (an adapter bug). Its message says
+//! the environment did not latch: the commit refuses that transaction, and later ones carry on.
 //!
 //! **Differences from MDBX.** reth's code reaches none of them. Each cursor difference is pinned
 //! beside MDBX's result by `known_cursor_deviations_from_mdbx` or
@@ -151,7 +155,11 @@
 //! - one file, `<dir>/tn-lmdb.dat`, with the engine's `flock` as the lock: a second open of a file
 //!   another handle holds is `MDBX_BUSY`;
 //! - the table stats ([`TnLmdbEnv::table_stats`]) and the metrics skip a table the file lacks
-//!   (MDBX's metrics stop at it).
+//!   (MDBX's metrics stop at it);
+//! - a write transaction dropped without a commit aborts at once, though a cursor of it lives: the
+//!   cursor's calls are then `MDBX_BAD_TXN`, and the writer is free. An MDBX cursor holds its
+//!   transaction open (readable and writable through the cursor, the write lock held) until the
+//!   cursor drops. `operations_report_mdbx_errors_in_reths_variants` pins this crate's side.
 //!
 //! The errors:
 //! - a dup cursor's `delete_current` is held (the dup rewrite, above), so a failure of the delete
@@ -301,8 +309,8 @@
 //! give the command, the selectors and a table) runs the workloads of reth's database benches
 //! (`criterion.rs`, `hash_keys.rs`, `get.rs`, `put.rs`) on a [`TnLmdbEnv`] and on reth's MDBX
 //! `DatabaseEnv` with the same seeded data, and prints the time per operation of each with the
-//! ratio. A second one, `tn_lmdb_vs_mdbx` (the `engine_bench` module; its runs are in
-//! `engine-bench.md`), runs the engine itself, through its own API, against `reth-libmdbx`.
+//! ratio. A second one, `tn_lmdb_vs_mdbx` (the `engine_bench` module; its how-to and earlier runs
+//! are in `engine-bench.md`), runs the engine itself, through its own API, against `reth-libmdbx`.
 
 mod cursor;
 mod dup;
@@ -321,8 +329,3 @@ pub use cursor::{TnLmdbCursor, TnLmdbCursorMut};
 pub use env::{RethTableStat, TnLmdbArgs, TnLmdbEnv, TnLmdbEnvKind, DATA_FILE};
 pub use tn_lmdb::{CheckReport, IoStats, SyncMode, TableCheck, MIN_GROWTH};
 pub use tx::{TnLmdbTx, TnLmdbTxMut};
-
-#[cfg(test)]
-use proptest as _;
-#[cfg(test)]
-use reth_db as _;

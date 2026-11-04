@@ -1914,6 +1914,43 @@ fn a_held_delete_that_meets_damage_fails_the_call_that_runs_it() {
     }
 }
 
+/// A second held delete while one is held (a call that did not run the first: the test-only
+/// `TnLmdbTxMut::skip_next_held_delete_run`) is refused, `MDBX_PANIC` with the adapter's message,
+/// rather than dropping the first: the commit refuses the transaction, the environment does not
+/// latch, and every row is still there.
+#[test]
+fn a_second_held_delete_is_refused_and_fails_the_commit() {
+    on_every_form(|db| {
+        db.update(|tx| {
+            for sk in [1, 3, 5] {
+                tx.put::<PlainStorageState>(a(1), e(sk, u64::from(sk)))?;
+            }
+            Ok::<_, DatabaseError>(())
+        })
+        .unwrap()
+        .unwrap();
+        let tx = db.tx_mut().unwrap();
+        let mut first = tx.cursor_dup_write::<PlainStorageState>().unwrap();
+        let mut second = tx.cursor_dup_write::<PlainStorageState>().unwrap();
+        assert_eq!(val(first.seek_by_key_subkey(a(1), s(3))), "3");
+        assert_eq!(val(second.seek_by_key_subkey(a(1), s(5))), "5");
+        assert_eq!(done(first.delete_current()), "ok");
+        tx.skip_next_held_delete_run();
+        let refused = match second.delete_current().unwrap_err() {
+            DatabaseError::Delete(info) => info,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(refused.code, Error::Panic.to_err_code());
+        assert!(refused.message.contains("a second delete was held"), "{}", refused.message);
+        assert!(refused.message.contains("did not latch"), "{}", refused.message);
+        drop((first, second));
+        assert_eq!(dbg(tx.commit().unwrap_err()), dbg(DatabaseError::Commit(refused)));
+        assert_eq!(db.failure(), None);
+        assert_eq!(every_row(&db.tx().unwrap()), "1/1=1 1/3=3 1/5=5");
+        db.update(|tx| tx.put::<PlainStorageState>(a(2), e(1, 1))).unwrap().unwrap();
+    });
+}
+
 /// A held delete that fails with an error that does not latch the environment (the test-only
 /// `TnLmdbTxMut::fail_next_held_delete`; the engine's `StaleTable`, which the adapter's own
 /// transaction cannot meet) is the error of the call that runs it, and the commit refuses the

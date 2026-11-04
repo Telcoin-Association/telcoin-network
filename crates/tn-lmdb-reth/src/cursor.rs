@@ -128,7 +128,8 @@ trait Moves {
 #[derive(Debug)]
 #[expect(
     clippy::large_enum_variant,
-    reason = "the dup arm is the hot one; boxing it would allocate for every fresh cursor"
+    reason = "the dup arm is the hot one, and the cursor is already boxed: boxing the arm would \
+              add a second allocation per new dup cursor and an indirection per call"
 )]
 pub(crate) enum ReadCursor {
     Flat(RoCursor),
@@ -1395,6 +1396,10 @@ pub(crate) struct Deferred {
     /// environment ([`Self::fail_next`]).
     #[cfg(test)]
     fail_next: bool,
+    /// Test-only: the next [`Self::flush`] does not run the held delete, as a call that broke the
+    /// ordering would ([`Self::skip_next_flush`]).
+    #[cfg(test)]
+    skip_next_flush: bool,
 }
 
 /// The test-only counts of [`Deferred`]: the rewrites made as one engine put, the held deletes
@@ -1423,15 +1428,26 @@ struct Parked {
 
 impl Deferred {
     /// Hold the delete of the row of stored key `key` in `table` (of layout `dup`), the row a
-    /// cursor is on, and return its number: the cursor's own name for it.
-    fn hold(&mut self, table: &EngineTable, dup: DupLayout, key: &[u8]) -> NonZeroU64 {
-        debug_assert!(self.pending.is_none(), "a held delete runs before another is held");
+    /// cursor is on, and return its number: the cursor's own name for it. Every call runs a held
+    /// delete before its own work ([`settle`]), so none is held here; if one were, holding a second
+    /// would drop it and a row reth deleted would survive the commit, so this refuses, and the
+    /// commit refuses the transaction ([`Self::fail`]).
+    fn hold(
+        &mut self,
+        table: &EngineTable,
+        dup: DupLayout,
+        key: &[u8],
+    ) -> tn_lmdb::Result<NonZeroU64> {
+        if self.pending.is_some() {
+            let what = "a second delete was held before the first ran";
+            return Err(self.fail(held_delete_broken(table, what)));
+        }
         self.last += 1;
         let number = NonZeroU64::new(self.last).expect("numbered from 1");
         self.key.clear();
         self.key.extend_from_slice(key);
         self.pending = Some(Pending { number, table: table.clone(), dup });
-        number
+        Ok(number)
     }
 
     /// The held delete `number`, taken, if it is still held (no other accessor ran it).
@@ -1456,6 +1472,10 @@ impl Deferred {
     /// ([`Self::failure`]) and returned.
     #[inline]
     pub(crate) fn flush(&mut self, txn: &mut RwTxn) -> tn_lmdb::Result<()> {
+        #[cfg(test)]
+        if std::mem::take(&mut self.skip_next_flush) {
+            return Ok(());
+        }
         if self.pending.is_none() {
             return Ok(());
         }
@@ -1544,13 +1564,29 @@ impl Deferred {
     pub(crate) fn fail_next(&mut self) {
         self.fail_next = true;
     }
+
+    /// Test-only: make the next [`Self::flush`] leave the held delete held, as a call that broke
+    /// the ordering would.
+    #[cfg(test)]
+    pub(crate) fn skip_next_flush(&mut self) {
+        self.skip_next_flush = true;
+    }
 }
 
 /// A held delete's row was not where its cursor found it: no accessor writes before running it,
 /// so the table is damaged or the adapter wrong.
 fn held_row_missing(table: &EngineTable) -> tn_lmdb::Error {
+    held_delete_broken(table, "the row of a held delete is missing")
+}
+
+/// The error for a held delete that broke the adapter's invariant (`what` happened in `table`):
+/// the engine's `Failed` (`MDBX_PANIC`), with a message saying what it is, since nothing latched:
+/// the commit refuses this write transaction ([`Deferred::fail`]), and the environment and later
+/// transactions carry on.
+fn held_delete_broken(table: &EngineTable, what: &str) -> tn_lmdb::Error {
     tn_lmdb::Error::Failed(format!(
-        "the row of a held delete in table {:?} is missing",
+        "tn-lmdb-reth refuses this write transaction (the environment did not latch): {what} in \
+         table {:?}, damage or an adapter bug",
         table.name()
     ))
 }
@@ -1607,10 +1643,10 @@ fn settle(
 /// share of the transaction. Each call locks the transaction, runs a held `delete_current` (its
 /// own or another cursor's, `Deferred`), moves or writes, decodes, and unlocks. Several cursors and
 /// the transaction's own writes see each other's changes: a cursor whose row another one deleted is
-/// on the row's follower, as if it had deleted the row itself, as an MDBX cursor is (the crate docs
-/// list the two cases where it is not: another writer's change between the row and its follower
-/// before the cursor's next call, and, on a dup-sort table, another writer's delete of a key's last
-/// row).
+/// on the row's follower, as if it had deleted the row itself, as an MDBX cursor is (the crate
+/// docs' cursor positions list where it is not: another writer's delete of the cursor's row, then a
+/// put between the row and its follower or of the row's key, before the cursor's next call; and, on
+/// a dup-sort table, another writer's put or delete of a row of the cursor's dup key).
 #[derive(Debug)]
 pub struct TnLmdbCursorMut<T: Table> {
     txn: SharedTxn,
@@ -1954,7 +1990,7 @@ impl<T: Table> DbCursorRW<T> for TnLmdbCursorMut<T> {
             let Some((stored, _)) = cursor.current(txn).map_err(error::delete)? else {
                 return Err(no_data());
             };
-            *held = Some(state.deferred.hold(table, dup, stored));
+            *held = Some(state.deferred.hold(table, dup, stored).map_err(error::delete)?);
             return Ok(());
         }
         if !cursor.delete_current(txn).map_err(error::delete)? {

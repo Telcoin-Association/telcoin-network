@@ -3,8 +3,9 @@
 reth's database API (`reth-db-api`, reth v1.11.3) on the [`tn-lmdb`](../tn-lmdb/README.md) engine.
 `TnLmdbEnv` is a reth `Database` whose transactions and cursors behave as reth's MDBX ones do and
 report MDBX's error codes, so reth's code and reth's MDBX tests run on it unchanged. Of reth's
-five dup-sort tables, the state tables are the engine's dup tables (each key's rows in a nested
-tree) and the changesets composite keys in plain engine tables.
+five dup-sort tables, the state tables are the engine's dup tables (each key's few rows packed in
+its outer cell, more in a nested tree of their own) and the changesets composite keys in plain
+engine tables.
 
 **Status: pre-production.** TN uses it behind the off-by-default `tn-lmdb` feature of `tn-reth`
 (forwarded by `tn-node`, `telcoin-network-cli` and `telcoin-network`), which runs TN's reth
@@ -12,7 +13,9 @@ execution database on `TnLmdbEnv` instead of MDBX; the default build is still MD
 build migrates an MDBX reth database onto `TnLmdbEnv` at its first open (every table copied raw by
 appends and verified, with `TnLmdbEnv::sync` and `TnLmdbEnv::check`, before MDBX's files are removed).
 `tn-reth`'s README ("Database backend") covers the open path, the backend guard, the migration
-and how reth's `--db.*` flags map onto `TnLmdbArgs`. The benchmark below passed its Linux gate on 2026-10-26. On a reth upgrade
+and how reth's `--db.*` flags map onto `TnLmdbArgs`. The adapter's comparison against MDBX on
+reth's database benches (below) passed its Linux gate on 2026-10-26, on an earlier engine format
+with every dup-sort table composite; it has not been rerun on the current layout. On a reth upgrade
 (storage v2 included), follow the checklist in `CLAUDE.md` ("On a reth upgrade").
 
 The crate docs (`src/lib.rs`) are the reference: the type mapping, the dup layout and the mapping
@@ -79,9 +82,9 @@ sort by key, then by subkey, as MDBX sorts a key's values. Each table has one of
 
 - **Nested** (the state tables): an engine dup table, each key one cell of an outer tree holding
   the key's rows packed when they encode within the page size's most (`DupOptions::packed`, 987
-  bytes for a 20-byte key at 4 KiB pages), else naming a nested tree of them. A seek bounded to a key (`seek_exact`, `seek_by_key_subkey`, a
-  dup `get`) never reads the next key's cell, and a key's wipe (`delete_current_duplicates`,
-  `delete(k, None)`) frees its tree in one walk.
+  bytes for a 20-byte key at 4 KiB pages), else naming a nested tree of them. A seek bounded to a
+  key (`seek_exact`, `seek_by_key_subkey`, a dup `get`) never reads the next key's cell, and a
+  key's wipe (`delete_current_duplicates`, `delete(k, None)`) frees its tree in one walk.
 - **Composite** (the changesets, appended by block and read by range): a plain engine table keyed
   `key ‖ subkey`, a block range's rows one leaf chain.
 
@@ -94,6 +97,41 @@ others) and by `current_with_key_tail` after the move on a composite one.
 `seek_with_key_tail`, with `key ‖ subkey` built on the stack; `seek_dup_with_key_tail` on a nested
 table, the subkey given apart). A row this layout cannot hold is `MDBX_BAD_VALSIZE`.
 
+### Why the changesets stay composite
+
+A changeset table switches to a packed dup table (`DupOptions::packed(K)`, the state tables' form)
+only if its append and `walk_range` rows are within their spread of composite and its file shrinks
+by 15% or more. The engine bench's `changesets` rows measure both forms at reth's widths
+([`engine-bench.md`](engine-bench.md#changesets-composite-or-packed) gives the shapes and the
+command); rerun them before changing either table's form. Their last run kept both composite.
+
+**Run:** Apple M1 Max, macOS, 2026-10-31, N = 1M, code 23e55c6f6 (engine format 3, the packed dup
+sets); `t4d` and `t4n` are tn-lmdb at 4 KiB pages, `Durable` and `NoSync`. Times are the median of
+three runs, with the spread (max − min) in brackets; the pages were the same in every run.
+
+| | `t4d` composite | `t4d` packed | `t4n` composite | `t4n` packed |
+|---|--:|--:|--:|--:|
+| StorageChangeSets: append (per row) | 396 ns (22) | 561 ns (31) | 60 ns (1) | 293 ns (19) |
+| walk_range (per row) | 29 ns (1) | 46 ns (4) | 20 ns (1) | 38 ns (2) |
+| get (per op) | 714 ns (92) | 751 ns (139) | 723 ns (51) | 685 ns (44) |
+| file used | 85.6 MiB | 68.1 MiB | 90.5 MiB | 72.7 MiB |
+| table pages × P | 85.5 MiB | 68.1 MiB | 85.5 MiB | 68.1 MiB |
+| AccountChangeSets: append (per row) | 542 ns (17) | 637 ns (34) | 60 ns (4) | 145 ns (6) |
+| walk_range (per row) | 31 ns (4) | 35 ns (0) | 20 ns (1) | 27 ns (3) |
+| get (per op) | 683 ns (25) | 745 ns (107) | 684 ns (81) | 736 ns (132) |
+| file used | 86.4 MiB | 105.3 MiB | 98.8 MiB | 114.6 MiB |
+| table pages × P | 86.4 MiB | 105.2 MiB | 86.4 MiB | 105.2 MiB |
+
+- **StorageChangeSets:** packing shrinks the table by 20.4% (a key's 28 bytes are stored once for
+  its set, not once a row), but the append is 42% slower at `t4d` and 4.9× at `t4n` (each row
+  appended to a packed key rewrites the key's set), and the walk 1.6× and 1.9×, all far past their
+  spread.
+- **AccountChangeSets:** every key nests (a nested tree a block), the table grows by 22%, and the
+  append and walk are slower than composite by more than their spread.
+
+The point gets are level within their spread in both shapes. `t4n`'s used span is larger than
+`t4d`'s at the same table pages: with no sync a freed page is never reused (the reuse gate).
+
 ## Differences from MDBX, in brief
 
 `lib.rs` lists each one. reth's code reaches none of them.
@@ -103,7 +141,9 @@ table, the subkey given apart). A row this layout cannot hold is `MDBX_BAD_VALSI
   held a superseded snapshot for over 60 s logs a `warn!` with its age, at most once a minute
   (from the engine's lock-free `Env::oldest_reader_age`: readers pay nothing, a commit one atomic
   load while no reader holds a superseded snapshot, plus a clock read while one does); one file
-  with an `flock`; the table stats and the metrics skip a table the file lacks.
+  with an `flock`; the table stats and the metrics skip a table the file lacks; a write
+  transaction dropped without a commit aborts at once though a cursor of it lives (the cursor's
+  calls are then `MDBX_BAD_TXN`), where an MDBX cursor holds its transaction open.
 - **Data:** a dup-sort subkey holds one value: a second value for an existing (key, subkey) is
   refused with `MDBX_KEYEXIST` and a message saying so, changing nothing, where MDBX stores both
   (writing the value the row holds again succeeds, as on MDBX; reth deletes before it writes, so
@@ -177,10 +217,10 @@ MDBX `UtterlyNoSync`), so the write rows time the CPU alone: the table's own hea
 `bench (nosync: CPU only, not the gate)`, so the mark survives the gate loop's `grep '^|'`. The
 module docs give each workload, the data, the timing and where they differ from reth's.
 
-**The Linux gate** decides: each bench at most 1.10× MDBX, with at most one explained row up to
-1.25×. Run it three times at reth's sizes, on performance cores with the temp dir on a real disk
-(see the [run tip](engine-bench.md#run-tip-linux); the run stops if the temp dir is on a tmpfs),
-and take each cell's median. Pin the power settings first: the drive's autonomous power states off,
+**The Linux gate**, the rule for a change on a hot path: each bench at most 1.10× MDBX, with at
+most one explained row up to 1.25×. Run it three times at reth's sizes, on performance cores with
+the temp dir on a real disk (see the [run tip](engine-bench.md#run-tip-linux); the run stops if the
+temp dir is on a tmpfs), and take each cell's median. Pin the power settings first: the drive's autonomous power states off,
 and the CPU governor and energy preference at `performance` (all three reset on a reboot or a
 sleep). From the repository root, with the performance cores in `taskset` (`lscpu -e` shows which
 CPUs they are):
@@ -201,14 +241,20 @@ a row lands on. A durable write row over 1.10× is the engine's only if it stays
 drive at its fast speed (the runs where MDBX's time for that row is lowest) or with
 `TN_LMDB_RETH_BENCH_SYNC=nosync`.
 
+**The two runs below measured an earlier engine and dup layout:** engine format 2, with all five
+dup-sort tables composite (`key ‖ subkey` in one plain tree). They predate the state tables' engine
+dup tables (2026-10-30) and their packed sets (2026-10-31), format 5's half-page inline limit
+(2026-11-03) and the engine's later read- and write-path work. The `PlainStorageState` rows and
+their explanations describe that layout. A rerun is needed for current figures.
+
 ### Linux run (the gate)
 
 **Run:** Linux x86_64 laptop (i7-1360P, NVMe, ext4), 2026-10-22, the gate command above (three full
 runs at reth's sizes, the temp dir on the NVMe drive, the power settings pinned, the performance
 cores in `taskset`). Each cell is the median of its three runs, so a ratio need not be the quotient
-of the two times beside it. **Code:** `87f7c81fc`, after the gate's tuning round and the append
-tuning (below); "before tuning" is the same command on `26cfa37cc`. **Verdict (2026-10-26):
-passed.** The one row over 1.10× that is the engine's is the explained dup read; the six durable
+of the two times beside it. **Code:** `87f7c81fc` (format 2, every dup-sort table composite),
+after the gate's tuning round and the append tuning (below); "before tuning" is the same command
+on `26cfa37cc`. **Verdict (2026-10-26): passed.** The one row over 1.10× that is the engine's is the explained dup read; the six durable
 write rows over 1.10× are the drive's (see "Over 1.10× on Linux").
 
 | bench | ops | tn-lmdb | MDBX | tn-lmdb/MDBX | before tuning |
@@ -292,9 +338,11 @@ same path does less work than before; it is not explained.
 
 **Over 1.10× on Linux:**
 
-- `PlainStorageState.RandomRead` (1.12): reth's storage-slot read, `seek_by_key_subkey`. tn-lmdb seeks
-  a 52-byte composite key (`address ‖ slot`) in one tree, where MDBX seeks the 20-byte key, then the
-  slot in the key's own sub-tree.
+- `PlainStorageState.RandomRead` (1.12): reth's storage-slot read, `seek_by_key_subkey`. In this
+  run's composite layout tn-lmdb sought a 52-byte key (`address ‖ slot`) in one tree, where MDBX
+  seeks the 20-byte key, then the slot in the key's own sub-tree. The table is now an engine dup
+  table, which seeks as MDBX does (the key's cell, then the slot in its packed set or nested tree);
+  not re-measured.
 - Six durable write rows (1.13 to 1.20): `BlockBodyIndices.SeqWrite`,
   `TransactionHashNumbers.SeqWrite`, `hash insert_unsorted`, `insert_sorted` and `put_unsorted` at
   10K, and `hash append_all` at 2M. These are the drive's two commit speeds (see "Durable write rows
@@ -313,12 +361,12 @@ others are under MDBX: `insert_unsorted` 0.79, `insert_sorted` 0.92, `put_unsort
 ### Mac run
 
 **Run:** Apple M1 Max, macOS, 2026-10-21, MDBX with 4 KiB pages, the median of 3 full runs (each
-cell itself the median of its samples). **Code:** after the two tuning changes below and the
-zero-copy dup reads, before the gate's tuning round (see the Linux run); "before tuning" is the
-ratio before the two tuning changes. The last fixes (a write cursor's state after a refused write,
-the engine's free walk and merge checks, a dup `insert`'s presence check) came after these runs and
-are not re-measured; of them only the write cursor's state update is on a timed path, one branch per
-write. Neither are four later changes:
+cell itself the median of its samples). **Code:** format 2, every dup-sort table composite, after
+the two tuning changes below and the zero-copy dup reads, before the gate's tuning round (see the
+Linux run); "before tuning" is the ratio before the two tuning changes. The last fixes (a write
+cursor's state after a refused write, the engine's free walk and merge checks, a dup `insert`'s
+presence check) came after these runs and are not re-measured; of them only the write cursor's
+state update is on a timed path, one branch per write. Neither are four later changes:
 - the cursor end after `last` now lives in this crate's cursor state, not the engine's;
 - read-only cursors end the table too;
 - dup-sort writes refuse a second value for a subkey;
@@ -417,28 +465,31 @@ hashes with `NameHasher` (FxHash's step), which halved `Get.get` (an empty table
 alone) and took 17 ns off each `Put` row operation.
 
 **Zero-copy dup reads:** a dup-sort row's value used to be rebuilt, subkey then rest, in the
-cursor's buffer. The cursors now read the row again once a move is done through the engine's
-`current_with_key_tail` (see [Dup-sort tables](#dup-sort-tables)); only a value in an overflow run,
-which no reth dup table's values reach, is still joined in the buffer. The two `PlainStorageState`
+cursor's buffer. The cursors then read the row again once a move was done, through the engine's
+`current_with_key_tail`; only a value in an overflow run, which no reth dup table's values reach,
+was still joined in the buffer. Today only a composite table reads its row so; a nested table's
+move reads the row itself (see [Dup-sort tables](#dup-sort-tables)). The two `PlainStorageState`
 rows above are from targeted runs (`TN_LMDB_RETH_BENCH_ROWS=PlainStorageState`,
 `TN_LMDB_RETH_BENCH_REPEAT=20`, the median of 3, alternating with a build without the change):
 `RandomRead` went from 366 to 333 ns, as a fresh cursor no longer allocates its buffer on its first
 row, and `SeqRead` from 73 to 75 ns (under the noise, though in each pair): re-reading the cell
-after each step costs about what the copy did.
+after each step cost about what the copy did.
 
 **Over 1.10× on the Mac, and why:**
 - `RandomRead` of the small-value tables (1.12 to 1.22): the descent itself. tn-lmdb's `seek_exact` on a
-  two-level tree costs about twice MDBX's, in the per-page checks every fetch makes (the separator
+  two-level tree cost about twice MDBX's, in the per-page checks every fetch makes (the separator
   range, the page kind and the child's txn: the engine's damage rules) and a binary search whose
-  every probe bounds-checks its cell; what is left of the cursor's creation is about MDBX's (its
+  every probe bounds-checks its cell; what was left of the cursor's creation was about MDBX's (its
   cursor is `malloc`ed and freed). Rows with larger values (`Headers`, `Transactions`, `BlockOmmers`)
-  are at 0.98 to 1.03, as the shared decode dominates.
-- `PlainStorageState` `SeqRead` (1.43) and `RandomRead` (1.36): the copy that a profile showed as a
-  fifth of `SeqRead`'s time is mostly reth's `StorageEntry` decode (`U256::from_compact` copies
-  1 to 32 bytes and mispredicts on the length), which MDBX's side runs too. tn-lmdb's step through a
-  key's rows reads each row's cell up to three times (the prefix step's key comparison, its entry,
-  then the zero-copy re-read above); `RandomRead` seeks a 52-byte composite key where MDBX seeks
-  the 20-byte key, then the subkey in the key's own sub-tree.
+  were at 0.98 to 1.03, as the shared decode dominates.
+- `PlainStorageState` `SeqRead` (1.43) and `RandomRead` (1.36), in this run's composite layout: the
+  copy that a profile showed as a fifth of `SeqRead`'s time was mostly reth's `StorageEntry` decode
+  (`U256::from_compact` copies 1 to 32 bytes and mispredicts on the length), which MDBX's side runs
+  too. tn-lmdb's step through a key's rows read each row's cell up to three times (the prefix step's
+  key comparison, its entry, then the zero-copy re-read above), and `RandomRead` sought a 52-byte
+  composite key where MDBX seeks the 20-byte key, then the subkey in the key's own sub-tree. On
+  today's engine dup table a step reads its row in the move itself, and a seek finds the key, then
+  the slot; not re-measured.
 - `hash append_all` at 100k (1.12; 0.95 at 10k and 0.97 at 1M): not profiled.
 
 ## Benchmark: the engine against MDBX
@@ -446,7 +497,8 @@ after each step costs about what the copy did.
 `tn_lmdb_vs_mdbx` (`src/engine_bench.rs`, `#[ignore]`d) runs the `tn-lmdb` engine through its own API
 (`Env`, not the adapter) against MDBX (`reth-libmdbx`, opened as `tn-storage` opens it): bulk
 inserts, gets, scans, seeks, small commits, deletes and large values, on the same seeded data.
-[`engine-bench.md`](engine-bench.md) gives the command, the selectors, the runs and what they show.
+[`engine-bench.md`](engine-bench.md) gives the command, the selectors and the rows, and its
+historical runs (engine formats 1 to 3, 2026-10-20 to 2026-11-01) with what they showed.
 
 ```text
 cargo test --release -p tn-lmdb-reth tn_lmdb_vs_mdbx -- --ignored --nocapture --test-threads 1

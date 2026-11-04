@@ -153,6 +153,7 @@ reth-prune-types = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3
 reth-stages = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
 reth-stages-types = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
 reth-trie = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
+reth-trie-common = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
 reth-trie-db = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
 reth-tasks = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
 reth-tokio-util = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }

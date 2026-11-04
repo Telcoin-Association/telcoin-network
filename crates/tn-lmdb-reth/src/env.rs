@@ -116,13 +116,6 @@ pub enum TnLmdbEnvKind {
     RW,
 }
 
-impl TnLmdbEnvKind {
-    /// `true` for [`Self::RW`].
-    pub const fn is_rw(&self) -> bool {
-        matches!(self, Self::RW)
-    }
-}
-
 /// Settings for [`TnLmdbEnv::open`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TnLmdbArgs {
@@ -424,7 +417,6 @@ impl RethTableStat {
 pub struct TnLmdbEnv {
     env: Env,
     tables: Arc<TableMap>,
-    kind: TnLmdbEnvKind,
     /// The long-reader warning, which each write transaction runs after its commit.
     watch: Arc<ReaderWatch>,
 }
@@ -458,7 +450,7 @@ impl TnLmdbEnv {
         }
         let watch =
             ReaderWatch::new(env.clone(), LONG_READER_WARN_AFTER, LONG_READER_WARN_INTERVAL);
-        Ok(Self { env, tables: Arc::new(tables), kind, watch: Arc::new(watch) })
+        Ok(Self { env, tables: Arc::new(tables), watch: Arc::new(watch) })
     }
 
     /// Test-only: warn about a reader older than `warn_after`, at most once per `interval`.
@@ -501,11 +493,6 @@ impl TnLmdbEnv {
     /// The engine environment.
     pub const fn env(&self) -> &Env {
         &self.env
-    }
-
-    /// How the environment was opened.
-    pub const fn kind(&self) -> TnLmdbEnvKind {
-        self.kind
     }
 
     /// The first failure the environment latched, with the engine's detail (a `Corrupt` error's

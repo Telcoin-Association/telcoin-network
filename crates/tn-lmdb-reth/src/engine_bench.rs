@@ -7,7 +7,8 @@
 //! cargo test --release -p tn-lmdb-reth tn_lmdb_vs_mdbx -- --ignored --nocapture --test-threads 1
 //! ```
 //!
-//! `engine-bench.md` beside this crate's README holds the runs, the tables and what they show.
+//! `engine-bench.md` beside this crate's README is the bench's how-to; its runs are historical,
+//! taken on earlier engines and not rerun on the current one.
 //!
 //! Every column gets a fresh temp dir and the same seeded key and value streams: 8-byte big-endian
 //! sequential keys and 32-byte random keys, each with a 100-byte value. One column runs, in order:
@@ -43,9 +44,10 @@
 //!   table's tree (tn-lmdb's `Env::check`, MDBX's table stat), the file's used span (pages times
 //!   the page size, from the engine's stat) and its `st_size`.
 //!
-//! The `changesets` rows (tn-lmdb columns only; the MDBX columns print `-`) ask whether reth's
-//! changeset tables, composite keys in this crate (`DUP_LAYOUTS`), would do better as packed dup
-//! tables. Each of two shapes of reth's widths is loaded in two forms: **composite**, a plain
+//! The `changesets` rows (tn-lmdb columns only; the MDBX columns print `-`) re-check the rule
+//! that keeps reth's changeset tables composite keys in this crate (`DUP_LAYOUTS`) rather than
+//! packed dup tables (the rule and its last run: the README's "Why the changesets stay
+//! composite"). Each of two shapes of reth's widths is loaded in two forms: **composite**, a plain
 //! table keyed `k ‖ s`, and **packed**, a dup table of `DupOptions::packed(K)` (the state tables'
 //! form). StorageChangeSets (K 28 = block ‖ address, s 32, values of 1..=32 bytes) changes
 //! `CS_ADDRESSES` (200) addresses a block, each 1..=4 slots, so every key packs;
@@ -77,11 +79,14 @@
 //!   HashedStorages (its `DupLayout`'s `DupOptions`; 32-byte keys, subkeys and values), all its
 //!   rows under `RW_DUP_KEYS` (3) keys, so each key holds a nested tree of N/3 rows (TN's state:
 //!   two stablecoins and a router hold all the slots); MDBX: a `DUP_SORT` table of 64-byte values
-//!   (subkey ‖ value). Per pair the adapter's engine calls for `seek_by_key_subkey`,
-//!   `delete_current` and `upsert`: `DupTxnCursor::seek_dup_with_key_tail`, then at the exact row
+//!   (subkey ‖ value). Per pair the engine calls for `seek_by_key_subkey`, `delete_current` and
+//!   `upsert` taken one by one: `DupTxnCursor::seek_dup_with_key_tail`, then at the exact row
 //!   `delete_current`, `follower_shares_prefix` (and `prev_in_prefix` when that is false) and
 //!   `insert` of key ‖ subkey with a new value; MDBX: `get_both_range`, `del` with
-//!   `WriteFlags::CURRENT`, `put` with `WriteFlags::UPSERT`.
+//!   `WriteFlags::CURRENT`, `put` with `WriteFlags::UPSERT`. The adapter no longer issues this
+//!   sequence: it holds the `delete_current` and makes it and the `upsert` one `DupTxnCursor::put`
+//!   (`Deferred` in `cursor.rs`), so the row prices the engine-level sequence, not reth's dup write
+//!   stage on the adapter.
 //!
 //! Each table also runs **seek only**: the same transactions' seeks without the writes, aborted,
 //! so a write's own cost is the rewrite's loop less the seek-only loop. Every pass (rewrite or
@@ -1592,8 +1597,9 @@ fn tn_lmdb_hist_txn(txn: &mut RwTxn, table: &Table, data: &RwData, picks: &[u32]
     }
 }
 
-/// A dup `rewrite` transaction's loop through one dup write cursor: the adapter's engine calls
-/// for reth's `seek_by_key_subkey`, `delete_current` and `upsert` on a nested dup table.
+/// A dup `rewrite` transaction's loop through one dup write cursor: the engine calls for reth's
+/// `seek_by_key_subkey`, `delete_current` and `upsert` on a nested dup table, taken one by one
+/// (the adapter makes the last two one `DupTxnCursor::put`).
 /// `DupTxnCursor::seek_dup_with_key_tail`, then (if `write`) on the exact row
 /// `DupTxnCursor::delete_current`, `follower_shares_prefix` and, only if that is false,
 /// `prev_in_prefix`, and `DupTxnCursor::insert` of key ‖ subkey with the new value. Not inlined,

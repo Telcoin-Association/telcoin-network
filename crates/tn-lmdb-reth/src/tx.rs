@@ -70,12 +70,13 @@ fn get_value<T: Table>(
     let Some(dup) = dup else {
         return decompress::<T>(txn.reads().get(table, key).map_err(error::read)?);
     };
+    // A key of another width is no row's: a miss with no seek (a nested table's engine would
+    // refuse it).
+    if key.len() != dup.key {
+        return Ok(None);
+    }
     let mut value = Vec::new();
     if dup.nested {
-        // A key of another width is no row's (the engine would refuse it).
-        if key.len() != dup.key {
-            return Ok(None);
-        }
         return txn
             .first_row_of(table, key, dup.subkey, |row| {
                 let Some((stored, tail)) = row.filter(|&(stored, _)| dup.is_row_of(stored, key))
@@ -287,6 +288,13 @@ impl TnLmdbTxMut {
     #[cfg(test)]
     pub(crate) fn fail_next_held_delete(&self) {
         self.txn.lock().deferred.fail_next();
+    }
+
+    /// Test-only: make the next call that would run a cursor's held delete ([`Deferred`]) before
+    /// its own work leave it held, as a call that broke that ordering would.
+    #[cfg(test)]
+    pub(crate) fn skip_next_held_delete_run(&self) {
+        self.txn.lock().deferred.skip_next_flush();
     }
 
     /// `tx.put` or `tx.append` (`append`) of `key` and `value` into `T`. An append follows

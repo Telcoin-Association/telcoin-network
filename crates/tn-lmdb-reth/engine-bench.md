@@ -5,7 +5,12 @@ engine through its own API (`Env`, not this crate's adapter) against MDBX (`reth
 column in a fresh temp dir on the same seeded streams: 1M entries per bulk table, 8-byte BE
 sequential keys and 32-byte random keys, 100-byte values. This crate's
 [README](README.md#benchmark-reths-db-benches-against-mdbx) has the other bench, reth's database
-benches through the adapter.
+benches through the adapter, and TN's reth execution bench (`crates/tn-reth`'s README, "Execution
+benchmark") is the engine's current performance reference.
+
+This file is the bench's how-to. Every run in it is [historical](#historical-runs): taken on an
+earlier engine (formats 1 to 3, 2026-10-20 to 2026-11-01) and not rerun on the current one
+(format 5). For current figures, rerun the bench.
 
 ```text
 cargo test --release -p tn-lmdb-reth tn_lmdb_vs_mdbx -- --ignored --nocapture --test-threads 1
@@ -54,8 +59,8 @@ Environment variables select what runs (the `src/engine_bench.rs` module docs ha
 
 **Like-for-like pairs:** `t4d` with `md4` everywhere, and `t16d` with `md` on Apple Silicon,
 where the OS page is 16 KiB. On x86_64 `t16d` has no MDBX twin. `t4n` has none either: a
-`SafeNoSync` commit costs far more than a tn-lmdb NoSync commit on both platforms (see
-[NoSync against SafeNoSync](#nosync-against-safenosync)).
+`SafeNoSync` commit cost far more than a tn-lmdb NoSync commit on both platforms in the runs below
+(see [NoSync against SafeNoSync](#nosync-against-safenosync)).
 
 A bulk row's "put loop" runs from `begin` to just before `commit`, and its "commit" is the rest.
 The API rows time the put loop into a fresh environment: tn-lmdb's `RwTxn::append`,
@@ -64,41 +69,65 @@ The API rows time the put loop into a fresh environment: tn-lmdb's `RwTxn::appen
 puts through `TxnCursor::put` and `TxnCursor::append` (tn-lmdb only): the cost of a cursor that
 shares its transaction, against the `RwCursor` rows.
 
-The "fdatasync" rows in the tables below reran the small-commit workload with commit step 4
-forced to one `fdatasync` of the whole file for every commit (a test-only switch,
-`Writer::data_by_fdatasync`). Step 4 picks the `fdatasync` itself whenever the dirty pages form two
-or more ranges or more than 16 runs, so the two modes differ only on one-range commits, which step
-4 syncs by one `msync`. The two modes alternated in blocks of 100 transactions (A B B A order) on
-the same table, so neither gained from running second.
+## Changesets: composite or packed
 
-**Where these tables ran.** Every table here was taken while this bench lived in the engine crate
-(`cargo test -p tn-lmdb`), built with the engine's test configuration. It moved here unchanged but
-for the rows that need the engine's test-only switches: the "fdatasync" rows and the churn with
-merging off are now the engine's own bench, `tn_lmdb_sync_and_merge` (the engine README's
+The `changesets` rows (`TN_LMDB_BENCH_ROWS=changesets`, tn-lmdb columns only) re-check the rule
+that keeps reth's changeset tables composite keys (`DUP_LAYOUTS`) rather than dup tables of
+`DupOptions::packed(K)`, the state tables' form. Each shape has reth's widths and about N rows,
+appended in ascending order with a commit every 10 blocks:
+
+- **StorageChangeSets:** K 28 (block ‖ address), subkey 32, values of 1..=32 bytes; 200 addresses
+  a block, 1..=4 slots each (2000 blocks at N = 1M), so every key's rows fit a packed set.
+- **AccountChangeSets:** K 8 (block), subkey 20, values of 0..=100 bytes; 200 accounts a block
+  (5000 blocks), so every key nests at any bound.
+
+Per form, the rows are the load per row (commits included), a `walk_range` per row read (a seek to
+a block's first row, then steps across keys through 100 blocks; ten such walks spread over the
+blocks), a point get per op, the file's used span and the table's pages. Each column runs the forms
+in ABBA order (composite, packed, packed, composite), each pass in a fresh environment, and a cell
+is the mean of its form's two passes.
+
+The rule, the last run (2026-10-31) and what it showed are in this crate's README,
+[Why the changesets stay composite](README.md#why-the-changesets-stay-composite).
+
+## Historical runs
+
+Each run below measured an earlier engine, named in its first line, and none has been rerun on the
+current one (format 5), so none is comparable with it. Every one predates the CRCs that skip a
+page's free gap (format 4), leaf values inline up to half a page (format 5) and the later read- and
+write-path work; all but the rewrite run predate the engine's dup tables too. They stay as the
+record of what each change measured and why it was made.
+
+**Where these runs ran.** The macOS, Linux, large-value and delete tables were taken while this
+bench lived in the engine crate (`cargo test -p tn-lmdb`), built with the engine's test
+configuration; it moved here on 2026-10-26 unchanged but for the rows that need the engine's
+test-only switches. The "fdatasync" rows and the churn with merging off are now the engine's own
+bench, `tn_lmdb_sync_and_merge` (the engine README's
 [Step 4](../tn-lmdb/README.md#step-4-one-msync-or-one-fdatasync) has its numbers), and the durable
 small-commit rows here no longer alternate with a forced `fdatasync`. Those rows stay in the tables
-below as measured. The engine is now a plain dependency of the bench, without its test-only code.
+below as measured. The rewrite run was taken here.
 
-**Which code the tables measured.** The macOS and Linux tables below were both taken on
-2026-10-20 with M1 and its performance work, before step 4 became one sync: each dirty range was
-synced by its own `msync` (one `fdatasync` past 16 runs), and there the "fdatasync" rows replaced
-those msyncs on every commit. They also predate every M2 change (format v2 and its page counters,
-overflow runs, merging, the one-descent delete, the owned and detached cursors). The large-value
-and delete tables further down were taken during M2, each with its code state given. None has
-been rerun on the final M2 code; this crate's Linux gate ran reth's benches
-(`tn_lmdb_reth_vs_mdbx`), not these.
+**The "fdatasync" rows** reran the small-commit workload with commit step 4 forced to one
+`fdatasync` of the whole file for every commit (the engine's test-only `Writer::data_by_fdatasync`).
+In the code of the macOS and Linux tables, each dirty range was synced by its own `msync` (one
+`fdatasync` past 16 runs), so these rows replaced those msyncs on every commit. Step 4 now picks the
+`fdatasync` itself whenever the dirty pages form two or more ranges or more than 16 runs, so the two
+modes differ only on one-range commits, which step 4 syncs by one `msync`. The two modes alternated
+in blocks of 100 transactions (A B B A order) on the same table, so neither gained from running
+second.
 
-## macOS run
+### macOS run
 
-**Run:** Apple M1 Max, 64 GiB RAM, internal SSD (APFS), macOS (Darwin 24.6), 2026-10-20; code: M1
-with its performance work, per-range msyncs at step 4, before M2. Each cell is the median of
-three full runs (each about 45 s). The Mac had background load, and the
-MDBX cells moved by up to 20% between runs (`md` random insert: 779–894 ms), so a difference
-under about 10% is noise. How step 4 syncs matters mainly to the small-commit rows: a bulk
-commit is one range, synced by one `msync` before and after, and nearly every mixed-row commit
-already took the `fdatasync` past 16 runs. Since step 4 became one sync, the Mac's small-commit
-median is 73 us at 4K and 90 us at 16K, against 114 and 130 us here (see
-[Step 4](../tn-lmdb/README.md#step-4-one-msync-or-one-fdatasync)).
+**Code:** 29545f015 (2026-10-20, format 1): the engine's first performance work, each dirty range
+synced by its own `msync` at step 4, before overflow runs, merging, the one-descent delete and the
+owned and detached cursors. **Run:** Apple M1 Max, 64 GiB RAM, internal SSD (APFS), macOS (Darwin
+24.6), 2026-10-20. Each cell is the median of three full runs (each about 45 s). The Mac had
+background load, and the MDBX cells moved by up to 20% between runs (`md` random insert: 779–894
+ms), so a difference under about 10% is noise. How step 4 syncs matters mainly to the small-commit
+rows: a bulk commit is one range, synced by one `msync` before and after, and nearly every
+mixed-row commit already took the `fdatasync` past 16 runs. Once step 4 became one sync
+(52c25de9a, the same day), the Mac's small-commit median was 73 us at 4K and 90 us at 16K, against
+114 and 130 us here (see [Step 4](../tn-lmdb/README.md#step-4-one-msync-or-one-fdatasync)).
 
 | | `t4d` | `t16d` | `t4n` | `md` | `md4` | `mn` |
 |---|--:|--:|--:|--:|--:|--:|
@@ -127,8 +156,9 @@ median is 73 us at 4K and 90 us at 16K, against 114 and 130 us here (see
 | cursor put 1M (put loop) | 58.5 ms | 52.3 ms | 61.4 ms | 50.1 ms | 51.2 ms | 50.7 ms |
 | cursor put APPEND 1M (put loop) | 57.8 ms | 51.5 ms | 60.2 ms | 57.9 ms | 61.6 ms | 59.2 ms |
 
-**What M1's performance work changed** (this table replaced a run of the first M1 code). Every
-guarantee and damage check is kept; the checks moved to where they are needed.
+**What 29545f015's performance work changed** (this table replaced a run of the engine's first
+commit, 24ec382c7). Every guarantee and damage check is kept; the checks moved to where they are
+needed.
 
 - **Provenance trust.** The writer's descent skips the per-fetch and separator-range checks on
   pages this transaction built, and computes the separator bounds only when it first meets a
@@ -150,11 +180,11 @@ put loop from about 367 to 47 ms), the random insert from 1097 to 830 ms, the fo
 38.8 to 27.1 ms, and a seek from 1.3 to 1.1 us. Small commits, the mixed workload and
 `clear_table` stayed level in back-to-back comparisons.
 
-## Linux run
+### Linux run
 
-**Run:** Linux x86_64 laptop (i7-1360P, NVMe, ext4), 2026-10-20, three full runs; code: M1 with
-its performance work, per-range msyncs at step 4 (before the one-range rule), before M2. Each run
-took 132–163 s.
+**Code:** 29545f015 (2026-10-20, format 1), as the macOS run: per-range msyncs at step 4, before
+the one-range rule. **Run:** Linux x86_64 laptop (i7-1360P, NVMe, ext4), 2026-10-20, three full
+runs, each 132–163 s.
 
 **CPU-bound rows.** Each cell is the median of the three runs. tn-lmdb's cells repeated within a
 few percent, and the median drops a few one-run outliers in `mn`. The NoSync bulk totals are
@@ -206,12 +236,12 @@ sequential commit 32.7 ms (`t4d`) vs 33.0 ms (`md`), random commit 51.9 vs 50.2 
 **The small-commit A/B rows do not drift with the drive,** because the two modes alternate on one
 table. They are why step 4 changed (see
 [Step 4](../tn-lmdb/README.md#step-4-one-msync-or-one-fdatasync)). Under the one-range rule, about
-3 in 4 small commits have two or more ranges and take the `fdatasync` path, so the next Linux run
-should show a small-commit median near the "fdatasync" rows. That is not yet measured.
+3 in 4 small commits have two or more ranges and take the `fdatasync` path, so a Linux run since
+should show a small-commit median near the "fdatasync" rows. This bench has not measured it.
 
-## Where tn-lmdb wins and loses
+### Where tn-lmdb wins and loses
 
-From the macOS and Linux tables above, so for the code before M2.
+From the macOS and Linux tables above, so for code 29545f015 (format 1).
 
 **On Apple Silicon, where tn-lmdb loses, and why** (the macOS table):
 
@@ -239,7 +269,7 @@ From the macOS and Linux tables above, so for the code before M2.
   MDBX's `APPEND` put (65–69 ms). `RwTxn::append` takes 48–54 ms, and `RwCursor::append` is a
   little faster than MDBX's cursor `APPEND` (51.5 vs 57.9 ms at 16K, 57.8 vs 61.6 ms at 4K).
 - **Small durable commits are about 10× cheaper** in the table (130 us vs 1.3 ms median at 16K,
-  114 us vs 1.3 ms at 4K), and more since step 4 became one sync (90 and 73 us; see
+  114 us vs 1.3 ms at 4K), and more once step 4 became one sync (90 and 73 us; see
   [Step 4](../tn-lmdb/README.md#step-4-one-msync-or-one-fdatasync)). tn-lmdb syncs only the pages
   the commit dirtied, by one `msync` or one `fdatasync`, plus one meta page. MDBX msyncs the whole
   used span of the map on every commit (about 312 MB here), and on macOS that walk is the cost.
@@ -271,7 +301,9 @@ same configuration there):
   reads (+5%) both beat MDBX at 4K, and tn-lmdb's random put loop is faster at 4K than at 16K, so
   the per-page explanation above is an Apple Silicon finding.
 
-## NoSync against SafeNoSync
+### NoSync against SafeNoSync
+
+From the macOS and Linux runs above (code 29545f015, format 1).
 
 **On macOS**, MDBX under `SafeNoSync` still issues an `MS_ASYNC` msync of the whole span every
 commit (`MDBX_MMAP_NEEDS_JOLT` is set off Linux). That makes its small commits slower than its
@@ -283,7 +315,7 @@ the mixed row (`t4n` 0.25 s). The cause was not investigated.
 
 On both platforms, a tn-lmdb NoSync commit does no I/O, and its deferred `Env::sync` is not timed.
 
-## Large values (overflow runs)
+### Large values (overflow runs)
 
 The `big` rows (`TN_LMDB_BENCH_ROWS=big`) put values of 2, 8 and 32 KiB: 20k, 10k and 4k entries
 under 8-byte keys in a scrambled order, in one transaction. They time the put loop (per put),
@@ -292,12 +324,13 @@ the values take runs of 1, 3 and 9 pages; at 16 KiB the 2 KiB value is inline an
 runs of 1 and 3 pages. Each value size runs in its own fresh environment, so no row writes into
 file space another row grew and synced (see the macOS note in the engine README's
 [Platform notes](../tn-lmdb/README.md#platform-notes); MDBX grows its file sparse on macOS, so it
-does not pay that cost). The engine's inline limit is about 1 KB at 4 KiB pages, against MDBX's
-about 2 KB. `TN_LMDB_BENCH_N` does not scale these rows.
+does not pay that cost). The engine's inline limit at 4 KiB pages is 2016 bytes with an 8-byte key
+(half a page, since format 5), against MDBX's 2020; in the run below it was about 1 KB.
+`TN_LMDB_BENCH_N` does not scale these rows.
 
-**Run:** the Mac above, 2026-10-20, medians of three runs; code: M2 with overflow runs and the
-one-sync step 4, before run allocation loaded records for a fit, merging and the later M2
-changes. Not rerun since.
+**Code:** format 2, the work published in 6334a73f7 (2026-10-21) as it stood on 2026-10-20:
+overflow runs and the one-sync step 4, before run allocation loaded records for a fit, merging and
+the rest of that commit. **Run:** the Mac above, 2026-10-20, medians of three runs.
 
 | | `t4d` | `t16d` | `md` | `md4` |
 |---|--:|--:|--:|--:|
@@ -311,7 +344,7 @@ changes. Not rerun since.
 | commit | 57.9 ms | 65.0 ms | 46.3 ms | 36.5 ms |
 | get 32 KiB (per op) | 2.20 us | 2.60 us | 282 ns | 274 ns |
 
-¹ A 1-page run, read with its header checks only (the engine README's do-not-flag item 13). These
+¹ A 1-page run, read with its header checks only (the engine README's do-not-flag item 3). These
 two cells come from a later set of three interleaved runs, after that change; before it the same
 gets took 724 ns and 1.30 us, and the multi-page gets did not move.
 
@@ -325,7 +358,7 @@ gets took 724 ns and 1.30 us, and the multi-page gets did not move.
   as MDBX's do, but faster: at 32 KiB, 57.9 ms for `t4d` against 36.5 ms for `md4`. The cause is
   not investigated.
 
-## Deletes
+### Deletes
 
 The `delete` rows (`TN_LMDB_BENCH_ROWS=delete`) time deletes, which merge pages in tn-lmdb (see
 [Deletes and merging](../tn-lmdb/README.md#deletes-and-merging)) and rebalance them in MDBX. Each
@@ -346,10 +379,11 @@ runs in a fresh environment, so it changes no table another row reads:
   and without (the "churn (no merge)" rows, through the test-only `Writer::no_merge`), to show what
   merging saves; that run is now the engine's `tn_lmdb_sync_and_merge`.
 
-**Run:** Apple M1 Max, macOS, 2026-10-21, N = 300k, medians of three runs; code: M2 with merging
-and the one-descent delete, before the owned and detached cursors, the MDBX-aligned state after a
-delete and the adapter. Not rerun since. The "merging off" column reruns tn-lmdb's rows with
-merging turned off; MDBX's two columns are `md` (16 KiB pages here) and `md4`.
+**Code:** format 2, the work published in 6334a73f7 (2026-10-21) as it stood that day: merging and
+the one-descent delete, before the owned and detached cursors, the MDBX-aligned state after a
+delete and the adapter. **Run:** Apple M1 Max, macOS, 2026-10-21, N = 300k, medians of three runs.
+The "merging off" column reruns tn-lmdb's rows with merging turned off; MDBX's two columns are
+`md` (16 KiB pages here) and `md4`.
 
 | | `t4d` | `t16d` | `t4d`, merging off | `md` | `md4` |
 |---|--:|--:|--:|--:|--:|
@@ -391,56 +425,7 @@ What the rows show:
   the delete just freed. The gate is deliberate: it keeps the previous state recoverable if the
   newest meta is lost.
 
-## Changesets: composite or packed
-
-The `changesets` rows (`TN_LMDB_BENCH_ROWS=changesets`, tn-lmdb columns only) ask whether reth's
-changeset tables, composite keys here (`DUP_LAYOUTS`), would do better as dup tables of
-`DupOptions::packed(K)`, the state tables' form. Each shape has reth's widths and about N rows,
-appended in ascending order with a commit every 10 blocks:
-
-- **StorageChangeSets:** K 28 (block ‖ address), subkey 32, values of 1..=32 bytes; 200 addresses
-  a block, 1..=4 slots each (2000 blocks at N = 1M), so every key's rows fit a packed set.
-- **AccountChangeSets:** K 8 (block), subkey 20, values of 0..=100 bytes; 200 accounts a block
-  (5000 blocks), so every key nests at any bound.
-
-Per form, the rows are the load per row (commits included), a `walk_range` per row read (a seek to
-a block's first row, then steps across keys through 100 blocks; ten such walks spread over the
-blocks), a point get per op, the file's used span and the table's pages. Each column runs the forms
-in ABBA order (composite, packed, packed, composite), each pass in a fresh environment, and a cell
-is the mean of its form's two passes.
-
-**Run:** Apple M1 Max, macOS, 2026-10-31, N = 1M, code: the packed dup sets (23e55c6f6). Times are
-the median of three runs, with the spread (max − min) in brackets; the pages were the same in every
-run.
-
-| | `t4d` composite | `t4d` packed | `t4n` composite | `t4n` packed |
-|---|--:|--:|--:|--:|
-| StorageChangeSets: append (per row) | 396 ns (22) | 561 ns (31) | 60 ns (1) | 293 ns (19) |
-| walk_range (per row) | 29 ns (1) | 46 ns (4) | 20 ns (1) | 38 ns (2) |
-| get (per op) | 714 ns (92) | 751 ns (139) | 723 ns (51) | 685 ns (44) |
-| file used | 85.6 MiB | 68.1 MiB | 90.5 MiB | 72.7 MiB |
-| table pages × P | 85.5 MiB | 68.1 MiB | 85.5 MiB | 68.1 MiB |
-| AccountChangeSets: append (per row) | 542 ns (17) | 637 ns (34) | 60 ns (4) | 145 ns (6) |
-| walk_range (per row) | 31 ns (4) | 35 ns (0) | 20 ns (1) | 27 ns (3) |
-| get (per op) | 683 ns (25) | 745 ns (107) | 684 ns (81) | 736 ns (132) |
-| file used | 86.4 MiB | 105.3 MiB | 98.8 MiB | 114.6 MiB |
-| table pages × P | 86.4 MiB | 105.2 MiB | 86.4 MiB | 105.2 MiB |
-
-The rule: a changeset table switches to a packed dup table only if its append and `walk_range`
-rows are within their spread of composite and its file shrinks by 15% or more. Both stay
-composite:
-
-- **StorageChangeSets:** packing shrinks the table by 20.4% (a key's 28 bytes are stored once for
-  its set, not once a row), but the append is 42% slower at `t4d` and 4.9× at `t4n` (each row
-  appended to a packed key rewrites the key's set), and the walk 1.6× and 1.9×, all far past their
-  spread.
-- **AccountChangeSets:** every key nests (a nested tree a block), the table grows by 22%, and the
-  append and walk are slower than composite by more than their spread.
-
-The point gets are level within their spread in both shapes. `t4n`'s used span is larger than
-`t4d`'s at the same table pages: with no sync a freed page is never reused (the reuse gate).
-
-## Rewrites (reth's write stages)
+### Rewrites (reth's write stages)
 
 The `rewrite` rows (`TN_LMDB_BENCH_ROWS=rewrite`, columns `t4d` and `md4` only) price reth's write
 stages per call: a positioning seek through a write cursor, then a write at its row, in ascending
@@ -455,17 +440,28 @@ through one write cursor a transaction:
 - **dup** (reth's `write_hashed_state`, the storage loop): a dup table as this crate stores
   HashedStorages (32-byte keys, subkeys and values), all N rows under 3 keys, so each key is a
   nested tree of N/3 rows (as on TN, where two stablecoins and a router hold all the slots). Per
-  pair the adapter's engine calls for `seek_by_key_subkey`, `delete_current` and `upsert`:
-  `DupTxnCursor::seek_dup_with_key_tail`, then `delete_current`, `follower_shares_prefix` and
-  `insert` of key ‖ subkey with a new value. MDBX, a `DUP_SORT` table of subkey ‖ value:
-  `get_both_range`, `del` with `WriteFlags::CURRENT`, `put` with `WriteFlags::UPSERT`.
+  pair the engine calls the adapter made for `seek_by_key_subkey`, `delete_current` and `upsert`
+  before c788a18a3: `DupTxnCursor::seek_dup_with_key_tail`, then `delete_current`,
+  `follower_shares_prefix` and `insert` of key ‖ subkey with a new value. MDBX, a `DUP_SORT` table
+  of subkey ‖ value: `get_both_range`, `del` with `WriteFlags::CURRENT`, `put` with
+  `WriteFlags::UPSERT`.
+
+**The dup row is not the adapter's path.** Since c788a18a3 (2026-11-03) the adapter makes reth's
+dup rewrite one engine `put` (`DupTxnCursor::put` of key ‖ subkey, the `delete_current` held until
+the cursor's `upsert`: `Deferred` in `cursor.rs`), so the row prices the delete, follower check and
+insert sequence the adapter no longer issues, not the cost of reth's dup write stage on tn-lmdb
+today.
 
 Each table also runs **seek only**, the same transactions' seeks without the writes (aborted), so
 a write's own cost is the rewrite's loop less the seek-only loop. Each pass is a fresh environment.
 A loop cell is the median transaction's loop per key; a commit cell the median commit.
 
-**Run:** Apple M1 Max, macOS 15.8, 2026-11-01, N = 1M, code 08a4c3ee3 plus these rows, the median
-of three runs (1-minute load average 2.6-3.3, no build running). Per key (per pair):
+**Code:** 08a4c3ee3 (2026-11-01, format 3) plus these rows: before a txn cursor's write routed by
+the cursor's slots (0e5900579, do-not-flag item 27), the copy of a published leaf with its change
+in one pass (ca6e0c440, `PageWrite::copy_published_with`) and the adapter's one-put dup rewrite
+(c788a18a3). The profile below is the measurement that led to the first two. **Run:** Apple M1
+Max, macOS 15.8, 2026-11-01, N = 1M, the median of three runs (1-minute load average 2.6-3.3, no
+build running). Per key (per pair):
 
 | | `t4d` | `md4` | ratio |
 |---|--:|--:|--:|
@@ -478,18 +474,18 @@ of three runs (1-minute load average 2.6-3.3, no build running). Per key (per pa
 | `seek_by_key_subkey` only | 587 ns | 517 ns | 1.14 |
 | the write's own (rewrite − seek only) | 2186 ns | 1288 ns | 1.70 |
 
-What it shows (macOS `sample` of the `t4d` rewrite loops, `tn_lmdb_hist_txn` and `tn_lmdb_dup_txn`):
+What it showed (macOS `sample` of the `t4d` rewrite loops, `tn_lmdb_hist_txn` and
+`tn_lmdb_dup_txn`):
 
-- The writes, not the seeks, carry the gap: a seek alone is within 15% of MDBX's, the write after
-  it 1.7× MDBX's.
-- Every history `put` after a seek descends from the root (`put_cached` -> `put_from_root`, no
-  cache hit), and almost every dup delete does (`delete_cached` -> `delete_from_root`); the dup
-  insert that follows hits the path cache the delete left. The re-descent itself
-  (`descend_write` and its leaf search) is about 9% of the history loop and 6% of the dup loop.
-- The larger cost is the copy-on-write of the path (`make_path_writable`, almost all of it the
+- The writes, not the seeks, carried the gap: a seek alone was within 15% of MDBX's, the write
+  after it 1.7× MDBX's.
+- Every history `put` after a seek descended from the root (`put_cached` -> `put_from_root`, no
+  cache hit), and almost every dup delete did (`delete_cached` -> `delete_from_root`); the dup
+  insert that followed hit the path cache the delete left. The re-descent itself
+  (`descend_write` and its leaf search) was about 9% of the history loop and 6% of the dup loop.
+- The larger cost was the copy-on-write of the path (`make_path_writable`, almost all of it the
   page copies' `memmove`, and the pages' `Writer::alloc`): 52% of the history loop and 45% of the
-  dup loop. MDBX's copy-on-write (`page_touch_unmodifable`) takes about 0.7 of tn-lmdb's samples
+  dup loop. MDBX's copy-on-write (`page_touch_unmodifable`) took about 0.7 of tn-lmdb's samples
   per write.
-- A seek inside a transaction that has written costs more than a seek alone (about 900 ns against
+- A seek inside a transaction that has written cost more than a seek alone (about 900 ns against
   601 in the history loop), a quarter of it in `Writer::child`.
-
