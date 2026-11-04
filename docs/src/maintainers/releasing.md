@@ -14,22 +14,28 @@ The examples use `v0.17.0-adiri`.
 | 1. Release PR | build server | `make release-prep TAG=v0.17.0-adiri`, a PR merged alone, then `ALLOW_STALE_BASE=1 make attest` on the release commit | The attested `release: v0.17.0-adiri` commit on `main` |
 | 2. Tag | laptop | `make release-tag TAG=v0.17.0-adiri` | A signed tag on GitHub |
 | 3. Validate and draft | CI | runs when the tag is pushed | A draft release with generated notes |
-| 4. Build | build server | `make release-build TAG=v0.17.0-adiri` | The image pushed as `:v0.17.0-adiri`; the tarball, `IMAGE_DIGEST` and `SHA256SUMS` on the draft |
+| 4. Build | build server | `make release-build TAG=v0.17.0-adiri` | The image pushed to `tn-testnet` as `:v0.17.0-adiri`; the tarball, `IMAGE_DIGEST` and `SHA256SUMS` on the draft |
 | 5. Sign | laptop | `make release-sign TAG=v0.17.0-adiri` | `SHA256SUMS.asc` on the draft |
 | 6. Verify and publish | build server | `make release-verify TAG=v0.17.0-adiri`, then `make release-publish TAG=v0.17.0-adiri` | The published release, and the channel alias moved if it is the newest release |
 | 7. Post-publish check | CI | runs when the release is published | The same verification, repeated on a GitHub runner |
 
 ## Release channels
 
-| Tag | Network | Build features | Image tags | GitHub release |
-| --- | --- | --- | --- | --- |
-| `vX.Y.Z` | mainnet | none | `:vX.Y.Z`, `:latest` | Latest, or a normal release if a higher mainnet version, tagged after it, was published first |
-| `vX.Y.Z-rcN` | mainnet release candidate | none | `:vX.Y.Z-rcN` only | Pre-release |
-| `vX.Y.Z-adiri` | Adiri testnet | `adiri` | `:vX.Y.Z-adiri`, `:adiri` | Pre-release |
-| `vX.Y.Z-adiri-rcN` | Adiri release candidate | `adiri` | `:vX.Y.Z-adiri-rcN` only | Pre-release |
+| Tag | Network | Build features | Image package | Image tags | GitHub release |
+| --- | --- | --- | --- | --- | --- |
+| `vX.Y.Z` | mainnet | none | `tn-mainnet` | `:vX.Y.Z`, `:latest` | Latest, or a normal release if a higher mainnet version, tagged after it, was published first |
+| `vX.Y.Z-rcN` | mainnet release candidate | none | `tn-mainnet` | `:vX.Y.Z-rcN` only | Pre-release |
+| `vX.Y.Z-adiri` | Adiri testnet | `adiri` | `tn-testnet` | `:vX.Y.Z-adiri`, `:adiri` | Pre-release |
+| `vX.Y.Z-adiri-rcN` | Adiri release candidate | `adiri` | `tn-testnet` | `:vX.Y.Z-adiri-rcN` only | Pre-release |
 
-`release-build` pushes the image under the tag name.
-`release-publish` moves `:latest` or `:adiri` only when the release is the highest published final version in its channel, so publishing a lower version after a higher one does not move the alias back.
+Each network has its own image package: `ghcr.io/telcoin-association/tn-mainnet` for mainnet tags and `ghcr.io/telcoin-association/tn-testnet` for Adiri tags.
+`etc/release.sh` takes the package from the tag alone, and `./etc/release.sh parse <TAG>` prints it as `PACKAGE`; `RELEASE_REPO` changes only the repository owner in it.
+Every step that reads or writes `IMAGE_DIGEST` refuses an image in another package: `release-build`'s own check of the draft, `release-sign`, which checks again right before it signs, `release-verify`, `release-publish`, and in CI `draft-release` and `verify-release`.
+The refusal names the image found, the tag's network and the package the image belongs in, as in `IMAGE_DIGEST names an image in ghcr.io/telcoin-association/tn-mainnet, but v0.17.0-adiri is on the adiri channel, whose images are published only in ghcr.io/telcoin-association/tn-testnet`.
+`make docker-adiri` and `make docker-devnet` push their ad-hoc `dev-<flavor>-<TAG>` images to `ghcr.io/telcoin-association/tn-dev`, never to a release package; the earlier package `ghcr.io/telcoin-association/telcoin-network` never held a release and is no longer used.
+
+`release-build` pushes the image to the tag's package under the tag name.
+`release-publish` moves `:latest` or `:adiri`, inside the same package, only when the release is the highest published final version in its channel, so publishing a lower version after a higher one does not move the alias back.
 It marks a release Latest only when it is a mainnet final release with the highest published mainnet version, and every release candidate and Adiri release a pre-release.
 The version rules below refuse a final version that is not higher than every final version already tagged in its channel, so a patch to an earlier minor version, such as `v1.1.1` once `v1.2.0` exists, cannot be released.
 A mainnet final is published as a normal release that is not Latest only when a higher version, tagged after it, was published first.
@@ -82,9 +88,16 @@ The YubiKey never goes to the build server, and the registry token never goes on
 - A repository admin sets up the tag ruleset on `v*`, as [Settings the release workflow requires](https://github.com/Telcoin-Association/telcoin-network/blob/main/.github/ACTIONS.md#settings-the-release-workflow-requires) describes: only maintainers can create a `v*` tag, and it must be signed; nobody, maintainers included, can update or delete one.
   The scripts cannot see the ruleset, and the signatures do not depend on it: every step that reads a tag requires exactly one signature on it, made by a key in the allowlist on `main`, and publishing requires at least `MIN_SIGNATURES` maintainer signatures over `SHA256SUMS`.
   The ruleset covers what signatures cannot: GitHub runs `release.yaml` from the tagged commit, so the ruleset decides who can start the workflow for a release tag, and it keeps a tag from being moved or deleted after it was validated.
-- The ghcr package must be public, because the release scripts and operators read it without credentials.
-  Push any image to it first (for example with `make docker-adiri`), then set its visibility to public at `https://github.com/orgs/Telcoin-Association/packages/container/telcoin-network/settings`.
-  Until then, `release-build` stops with `package is not public`.
+- Each release package must be public, because the release scripts and operators read it without credentials, and only the release maintainer account may write to it.
+  A ghcr package exists only after its first push, and only `release-build` pushes to the release packages, so this setup happens at the first release of each network, `tn-testnet` at the first Adiri tag and `tn-mainnet` at the first mainnet tag:
+  1. Run step 4 for that tag.
+     Before the push, ghcr answers 403 for the package, as it does for a private one, so `release-build` warns, asks whether to push the package's first image (`RELEASE_YES=1` answers yes), pushes it, and then stops with `package is not public`.
+  2. Open the package's settings, `https://github.com/orgs/Telcoin-Association/packages/container/tn-testnet/settings` or `.../tn-mainnet/settings`.
+     Under "Danger Zone", change the visibility to public.
+     Under "Manage access", turn off the access inherited from the repository and give write access to the release maintainer account only.
+     Under "Manage Actions access", leave this repository out or give it the Read role: no workflow asks for `packages` permission, so the Actions token cannot write to the package, and this keeps a workflow added on a branch from doing so.
+     [Settings the release workflow requires](https://github.com/Telcoin-Association/telcoin-network/blob/main/.github/ACTIONS.md#settings-the-release-workflow-requires) explains each list.
+  3. Run step 4 again with `RELEASE_REBUILD=1`, because the first image is now in the registry.
 
 ## Cut a release
 
@@ -185,9 +198,10 @@ git switch main && git pull --ff-only
 make release-build TAG=v0.17.0-adiri
 ```
 
-`release-build` checks the host, the ghcr login, that the release scripts match `origin/main`, every tag check from step 3, that the draft exists and has no signature yet, and that `:v0.17.0-adiri` is not in the registry yet.
+`release-build` checks the host, the ghcr login, that the release scripts match `origin/main`, every tag check from step 3, that the draft exists and has no signature yet, and that `ghcr.io/telcoin-association/tn-testnet:v0.17.0-adiri` is not in the registry yet.
+On the first release of a network, that package does not exist yet; [One-time setup](#one-time-setup) says what `release-build` does then.
 It builds the `linux/amd64` image from a temporary worktree of the tag, without the build cache, and copies the binary out of the image.
-It runs `--version` in the image as a smoke test, packs the tarball, and pushes the image as `ghcr.io/telcoin-association/telcoin-network:v0.17.0-adiri`.
+It runs `--version` in the image as a smoke test, packs the tarball, and pushes the image as `ghcr.io/telcoin-association/tn-testnet:v0.17.0-adiri`; a mainnet tag's image goes to `ghcr.io/telcoin-association/tn-mainnet`.
 It writes `IMAGE_DIGEST` and `SHA256SUMS` next to the tarball in `target/release-artifacts/v0.17.0-adiri/`, uploads the three files to the draft, and rewrites the draft's notes to include the image digest.
 `SHA256SUMS` lists `IMAGE_DIGEST`, the tarball, and the network's `committee.yaml`, `genesis.yaml` and `parameters.yaml` by their repository path (`chain-configs/testnet/` for an Adiri tag, `chain-configs/mainnet/` otherwise), hashed as committed at the tag.
 It then runs every check from step 6 except the signature count.
@@ -213,6 +227,7 @@ It then runs the file checks of `release-verify` in step 6 before anything is si
 It checks that your key is allowlisted and has not signed this release yet, and that every signature already in `SHA256SUMS.asc` is a good one by an allowlisted key, and shows the tag, the commit, the image, the content of `SHA256SUMS` and its SHA-256.
 It asks for the SHA-256 that `release-build` printed in step 4 (paste the value or the whole line), or reads it from `RELEASE_SUMS_SHA256`, and stops without signing when it differs.
 `RELEASE_YES=1` answers only the `yes` prompt that follows, never this one, so a run without a terminal needs `RELEASE_SUMS_SHA256`.
+Right before it signs, it checks once more that `SHA256SUMS` lists the `IMAGE_DIGEST` beside it and that this names an image in the tag's package, `tn-testnet` here, and stops without signing when it names any other package, `tn-mainnet` included.
 It signs `SHA256SUMS` with the key `release-tag` would use, adds the signature to `SHA256SUMS.asc`, uploads it, then downloads it again and checks that it is the file it uploaded and that it carries your signature.
 Sign one at a time: two maintainers uploading at once replace each other's file, and `release-sign` stops with an error for the one whose signature was lost.
 Expect one touch; [PIN and touch during signing](yubikey-setup.md#pin-and-touch-during-signing) covers the prompts and retries.
@@ -232,7 +247,7 @@ docker logout ghcr.io
 - `SHA256SUMS` names exactly `IMAGE_DIGEST`, the tarball and the network's three chain-config files, and every hash matches, the chain-config ones against the tagged commit;
 - enough distinct allowlisted maintainers signed: `RELEASE_SIG_THRESHOLD` if set, otherwise `MIN_SIGNATURES`, which is 1;
 - every signature in `SHA256SUMS.asc` is a `GOODSIG` with a `VALIDSIG` by an allowlisted key: one that is bad, unverifiable, expired or revoked, or by a key that is not on the allowlist, refuses the release even next to good ones, which is the rule of the operator check on the install page;
-- `IMAGE_DIGEST` matches the registry;
+- `IMAGE_DIGEST` names an image in the tag's package, `tn-testnet` for an Adiri tag and `tn-mainnet` for a mainnet tag, and matches what that package serves for the tag, and `SHA256SUMS` lists that `IMAGE_DIGEST` before any signature is counted;
 - the tarball holds exactly the four expected files in its directory;
 - the binary in the tarball is byte-identical to the one in the image pulled by digest;
 - `--version` in the image shows the version and the tagged commit, and its `Build Features` line is empty for a mainnet tag and, for an Adiri tag, lists `adiri` and at most `faucet` besides, which `adiri` implies; `release-build` runs the same check before it pushes the image.
@@ -243,13 +258,13 @@ It ends with a line like `verified v0.17.0-adiri commit=... signatures=1/1 image
 While the release is a draft, it checks that the release body ends with the notes generated for the tagged commit and the image digest, line for line, and shows the operator notes above them for you to review.
 After you type `yes`, it checks that the draft's files are still the ones it verified, by name, asset id and digest, and that the body has not changed, and publishes the draft as Latest, as a normal release or as a pre-release, following the channel table.
 It checks the files and the body once more after publishing, before it moves the alias.
-If the release is the highest published final version in its channel, it points the channel alias at the image digest and confirms that the registry agrees.
+If the release is the highest published final version in its channel, it checks that the package still serves the tag at the verified digest, points the channel alias in the same package at that digest, and confirms that the registry agrees.
 It skips work that is already done, so it is safe to run again: when a run stopped after publishing, run `make release-publish` again, and on the release that is now public it keeps the body as it is, without comparing it with the generated notes, and moves the alias.
 `docker logout ghcr.io` removes the registry credential from the build server until the next release.
 
 ### 7. CI verifies the published release
 
-Publishing with your own `gh` login, as `release-publish` does, starts the `verify-release` job, which runs `etc/release.sh verify` on a GitHub runner with the scripts and the allowlist from `main` and without registry credentials.
+Publishing with your own `gh` login, as `release-publish` does, starts the `verify-release` job, which runs `etc/release.sh verify` on a GitHub runner with the scripts and the allowlist from `main` and without registry credentials, so it also fails when `IMAGE_DIGEST` names an image outside the tag's package.
 The check is detective only: the release is already public when it runs, so a failure means following [After publish](#after-publish).
 GitHub starts no workflow for a publish made with a `GITHUB_TOKEN`, so a release that someone publishes from a workflow is never checked by this job.
 After every publish, check that a `verify-release` run exists for the tag:
@@ -312,7 +327,9 @@ If `release-sign` had already uploaded the signature, the second run stops becau
 | 2, 3 | The commit is not attested | On the build server, run `git switch --detach <commit> && ALLOW_STALE_BASE=1 make attest`, then `git switch main`. If CI failed on it, also run `gh run rerun <run-id>`. |
 | 3 | The tag is wrong | The tag stays: only maintainers can create a `v*` tag, and it must be signed; nobody, maintainers included, can update or delete one. Follow [Before publish](#before-publish) and release the next version. |
 | 4, 6 | `run make docker-login` | Run `make docker-login` on the build server. |
-| 4 | `package is not public` | Do the [one-time setup](#one-time-setup). |
+| 4 | `package is not public` | On a network's first release, after the push: do the [one-time setup](#one-time-setup) and run step 4 again with `RELEASE_REBUILD=1`. Otherwise someone made the package private: make it public again. |
+| 4 | `release-build` asks whether to push the first image of the package | Answer `yes` only on the first release of that network; on any later release the package was made private, so answer no and make it public. |
+| 4 to 7 | `IMAGE_DIGEST names an image in ..., but <TAG> is on the ... channel` | The draft's `IMAGE_DIGEST` names an image in another package, such as the other network's, so it is not the file `release-build` wrote for this tag. Do not sign or publish; rebuild the draft as for a failed `release-verify` below. If the release is public, follow [After publish](#after-publish). |
 | 4 | The image `:<TAG>` is already in the registry | An earlier build pushed it. Rebuild with `RELEASE_REBUILD=1 make release-build TAG=<TAG>`; the new image has a different digest, because builds are not reproducible. |
 | 4 | The release scripts differ from `origin/main` | Run `git switch main && git pull --ff-only`, then the build again. |
 | 5 | `release-sign` stops because the SHA-256 differs from what `release-build` printed | Nothing was signed. Find out what changed the draft's files before going further. |
@@ -330,16 +347,19 @@ If `release-sign` had already uploaded the signature, the second run stops becau
 
 ### Before publish
 
-Until the release is published, the public parts are the tag, the `:<TAG>` image, and the release commit on `main`, whose `CHANGELOG.md` section is already on the docs site's [Release notes](../getting-started/release-notes.md) page.
+Until the release is published, the public parts are the tag, the `:<TAG>` image in the tag's package, and the release commit on `main`, whose `CHANGELOG.md` section is already on the docs site's [Release notes](../getting-started/release-notes.md) page.
 The tag stays: only maintainers can create a `v*` tag, and it must be signed; nobody, maintainers included, can update or delete one.
 Delete the draft, if CI created one, and the image version, if `release-build` pushed one, running the `gh` commands on the build server, where the package scopes belong:
 
 ```sh
 gh release delete v0.17.0-adiri --yes
-ID=$(GH_TOKEN="$PACKAGES_PAT" gh api --paginate /orgs/Telcoin-Association/packages/container/telcoin-network/versions \
+PACKAGE=tn-testnet
+ID=$(GH_TOKEN="$PACKAGES_PAT" gh api --paginate "/orgs/Telcoin-Association/packages/container/$PACKAGE/versions" \
   --jq '.[] | select(.metadata.container.tags | any(. == "v0.17.0-adiri")) | .id')
-GH_TOKEN="$PACKAGES_PAT" gh api -X DELETE "/orgs/Telcoin-Association/packages/container/telcoin-network/versions/$ID"
+GH_TOKEN="$PACKAGES_PAT" gh api -X DELETE "/orgs/Telcoin-Association/packages/container/$PACKAGE/versions/$ID"
 ```
+
+Set `PACKAGE` to `tn-mainnet` for a mainnet tag.
 
 The packages API accepts only a classic personal access token with the `read:packages` and `delete:packages` scopes, so put one in `PACKAGES_PAT` for those two calls and revoke it afterwards; the package's Versions page on GitHub can delete the version instead.
 
@@ -360,15 +380,17 @@ Instead:
 
    ```sh
    PREV=vX.Y.Z-adiri
+   ALIAS=ghcr.io/telcoin-association/tn-testnet:adiri
    make release-verify TAG="$PREV" &&
    REF=$(curl -fsSL "https://github.com/Telcoin-Association/telcoin-network/releases/download/$PREV/IMAGE_DIGEST") &&
-   docker buildx imagetools create --prefer-index=false --tag ghcr.io/telcoin-association/telcoin-network:adiri "$REF" &&
-   docker buildx imagetools inspect ghcr.io/telcoin-association/telcoin-network:adiri --format '{{println .Manifest.Digest}}'
+   case "$REF" in "${ALIAS%:*}@sha256:"*) true ;; *) echo "not an image in ${ALIAS%:*}: $REF" >&2; false ;; esac &&
+   docker buildx imagetools create --prefer-index=false --tag "$ALIAS" "$REF" &&
+   docker buildx imagetools inspect "$ALIAS" --format '{{println .Manifest.Digest}}'
    ```
 
    Set `PREV` to the previous good release.
+   For a mainnet release, set `ALIAS` to `ghcr.io/telcoin-association/tn-mainnet:latest`; the `case` line stops when `$REF` is not in the alias's package, so the alias never points at the other network's image.
    `--prefer-index=false` copies the image manifest as it is, as `release-publish` does, so the last command prints the digest after the `@` in `$REF`.
-   For a mainnet release, the alias is `:latest`.
 4. Ship a fixed patch release through all seven steps; publishing it moves the alias forward again.
 5. Tell operators the affected version and the version to roll back to, following the [release and network update process](../getting-started/validator-operations.md#release-and-network-update-process).
 
