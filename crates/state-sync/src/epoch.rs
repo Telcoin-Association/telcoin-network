@@ -170,7 +170,9 @@ async fn collect_epoch_records(
             let hash = rec.final_consensus.hash;
             // Don't know the output bytes so use 0.  If we could get them (already have the output)
             // we won't need them...
-            if consensus_bus.publish_consensus_num_hash_if_newer(epoch, number, hash) {
+            // A certified record may also replace a gossip pin the record proves impossible
+            // (issue #1771).
+            if consensus_bus.publish_certified_consensus_num_hash(epoch, number, hash) {
                 debug!(
                     target: "epoch-manager",
                     "epoch record sync downloaded up to epoch {result_epoch}, final consensus at block {number} ({hash}) - notifying state sync",
@@ -259,10 +261,12 @@ async fn collect_epoch_records(
     // This unblocks nodes that missed a ConsensusResult gossip message due to a timing
     // gap (e.g. gossip arrived before the epoch record was available). We do this once
     // at the end rather than per-epoch to avoid flooding peers with concurrent requests.
+    // The certified publish also replaces a gossip pin that the certified record proves
+    // impossible, so a node pinned by bogus f+1 signatures heals here (issue #1771).
     if let Some((epoch, number, hash)) = best_final_consensus {
         // Don't know the output bytes so use 0.  If we could get them (already have the output) we
         // won't need them...
-        if consensus_bus.publish_consensus_num_hash_if_newer(epoch, number, hash) {
+        if consensus_bus.publish_certified_consensus_num_hash(epoch, number, hash) {
             info!(
                 target: "epoch-manager",
                 "updating last published consensus num hash up to epoch {result_epoch}, final consensus at block {number} ({hash}) - notifying state sync",
