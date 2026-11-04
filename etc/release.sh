@@ -563,17 +563,32 @@ registry_digest() {
 }
 
 # build, after ghcr refused an anonymous read of IMAGE: the digest of IMAGE:TAG as the docker
-# login sees it, or nothing (with the reason on stderr) when the tag does not resolve that way.
+# login sees it, or nothing (with the answer on stderr) when the registry answers that the tag
+# is not found or access is denied. Any other failure, such as DNS, a timeout or an expired
+# login, is retried and then stops with 3, so it never reads as "the login does not see TAG".
 login_digest() {
-    local out digest
-    if out=$(docker buildx imagetools inspect "$IMAGE:$TAG" --format '{{println .Manifest.Digest}}' 2>&1); then
-        digest=$(printf '%s\n' "$out" | awk 'NF { d = $1 } END { print d }')
-        [[ "$digest" =~ $DIGEST_RE ]] ||
-            die 1 "docker buildx imagetools inspect $IMAGE:$TAG answered without a digest: $out"
-        printf '%s\n' "$digest"
-        return 0
-    fi
-    info "with the docker login, $IMAGE:$TAG does not resolve: $(printf '%s\n' "$out" | awk 'NF { l = $0 } END { print l }')"
+    local out digest last attempt=1
+    while :; do
+        if out=$(docker buildx imagetools inspect "$IMAGE:$TAG" --format '{{println .Manifest.Digest}}' 2>&1); then
+            digest=$(printf '%s\n' "$out" | awk 'NF { d = $1 } END { print d }')
+            [[ "$digest" =~ $DIGEST_RE ]] ||
+                die 1 "docker buildx imagetools inspect $IMAGE:$TAG answered without a digest: $out"
+            printf '%s\n' "$digest"
+            return 0
+        fi
+        last=$(printf '%s\n' "$out" | awk 'NF { l = $0 } END { print l }')
+        case "$(printf '%s\n' "$out" | tr '[:upper:]' '[:lower:]')" in
+            *"permission denied"*) ;;
+            *"not found"* | *"manifest unknown"* | *"name unknown"* | *denied*)
+                info "with the docker login, $IMAGE:$TAG does not resolve: $last"
+                return 0
+                ;;
+        esac
+        [ "$attempt" -lt 3 ] ||
+            die 3 "cannot ask the registry for $IMAGE:$TAG with the docker login after 3 attempts: $last (check the network, and run make docker-login if the login expired)"
+        attempt=$((attempt + 1))
+        sleep 5
+    done
 }
 
 # ---------------------------------------------------------------------------------------------
@@ -1863,12 +1878,13 @@ cmd_build() {
     existing=$(registry_digest "$TAG" first-push)
     if [ "$existing" = denied ]; then
         # ghcr refuses anonymous reads of a private package and of one never pushed alike, so
-        # the docker login looks again. When it sees TAG, the package is private and the
-        # rebuild rule below applies; only when it does not is this a first push, which needs
-        # RELEASE_FIRST_PUSH set to the package.
+        # the docker login looks again. When it sees TAG, the package is private and not new,
+        # and a rebuild now would only stop again after its push: the setup comes first. Only
+        # when the registry answers that TAG is not found (or denied) is this a first push,
+        # which needs RELEASE_FIRST_PUSH set to the package.
         existing=$(login_digest) || exit
         if [ -n "$existing" ]; then
-            warn "$IMAGE is private, not new: it refuses anonymous reads, but the docker login sees $IMAGE:$TAG at $existing; make the package public as the maintainer guide's one-time setup says"
+            die 2 "$IMAGE is private, not new, and already holds $IMAGE:$TAG ($existing): do the one-time setup first (make the package public and set its access list, as the maintainer guide says), then run make release-build TAG=$TAG again, with RELEASE_REBUILD=1 if the tag must be rebuilt"
         elif [ -z "${RELEASE_FIRST_PUSH:-}" ]; then
             die 2 "$IMAGE refuses anonymous reads and the docker login does not see $IMAGE:$TAG: if this is the first release image of the package $PACKAGE, run again with RELEASE_FIRST_PUSH=$PACKAGE; otherwise make the package public (maintainer guide, one-time setup)"
         elif [ "$RELEASE_FIRST_PUSH" != "$PACKAGE" ]; then
