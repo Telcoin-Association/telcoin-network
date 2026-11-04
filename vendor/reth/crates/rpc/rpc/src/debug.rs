@@ -117,15 +117,26 @@ where
         self.inner.blocking_task_guard.clone().acquire_owned().await
     }
 
+    /// Acquires the tracing permit a trace moves into its blocking task.
+    ///
+    /// TN(TN-0036): upstream's RPC handlers hold the permit only while the request is open, so a
+    /// trace that times out or loses its client frees it while its thread runs on. Each trace
+    /// method takes the permit here, once, and its blocking task drops it when the work ends.
+    async fn trace_task_permit(&self) -> Result<OwnedSemaphorePermit, Eth::Error> {
+        self.acquire_trace_permit().await.map_err(|_| EthApiError::InternalEthError.into())
+    }
+
     /// Trace the entire block asynchronously
     async fn trace_block(
         &self,
         block: Arc<RecoveredBlock<ProviderBlock<Eth::Provider>>>,
         evm_env: EvmEnvFor<Eth::Evm>,
         opts: GethDebugTracingOptions,
+        permit: OwnedSemaphorePermit,
     ) -> Result<Vec<TraceResult>, Eth::Error> {
         self.eth_api()
             .spawn_with_state_at_block(block.parent_hash(), move |eth_api, mut db| {
+                let _permit = permit;
                 let mut results = Vec::with_capacity(block.body().transactions().len());
 
                 eth_api.apply_pre_execution_changes(&block, &mut db, &evm_env)?;
@@ -180,6 +191,7 @@ where
         rlp_block: Bytes,
         opts: GethDebugTracingOptions,
     ) -> Result<Vec<TraceResult>, Eth::Error> {
+        let permit = self.trace_task_permit().await?;
         let block: ProviderBlock<Eth::Provider> = Decodable::decode(&mut rlp_block.as_ref())
             .map_err(BlockError::RlpDecodeRawBlock)
             .map_err(Eth::Error::from_eth_err)?;
@@ -200,7 +212,13 @@ where
             }
             .map_err(Eth::Error::from_eth_err)?;
 
-        self.trace_block(Arc::new(block.into_recovered_with_signers(senders)), evm_env, opts).await
+        self.trace_block(
+            Arc::new(block.into_recovered_with_signers(senders)),
+            evm_env,
+            opts,
+            permit,
+        )
+        .await
     }
 
     /// Replays a block and returns the trace of each transaction.
@@ -209,6 +227,7 @@ where
         block_id: BlockId,
         opts: GethDebugTracingOptions,
     ) -> Result<Vec<TraceResult>, Eth::Error> {
+        let permit = self.trace_task_permit().await?;
         let block_hash = self
             .provider()
             .block_hash_for_id(block_id)
@@ -222,7 +241,7 @@ where
 
         let block = block.ok_or(EthApiError::HeaderNotFound(block_id))?;
 
-        self.trace_block(block, evm_env, opts).await
+        self.trace_block(block, evm_env, opts, permit).await
     }
 
     /// Trace the transaction according to the provided options.
@@ -233,6 +252,7 @@ where
         tx_hash: B256,
         opts: GethDebugTracingOptions,
     ) -> Result<GethTrace, Eth::Error> {
+        let permit = self.trace_task_permit().await?;
         let (transaction, block) = match self.eth_api().transaction_and_block(tx_hash).await? {
             None => return Err(EthApiError::TransactionNotFound.into()),
             Some(res) => res,
@@ -247,6 +267,7 @@ where
         let interrupt = JsTraceInterrupt::new(&opts)?;
         let tracer_interrupt = interrupt.clone();
         let trace = self.eth_api().spawn_with_state_at_block(state_at, move |eth_api, mut db| {
+            let _permit = permit;
             let block_txs = block.transactions_recovered();
 
             // configure env for the target transaction
@@ -301,6 +322,7 @@ where
         block_id: Option<BlockId>,
         opts: GethDebugTracingCallOptions,
     ) -> Result<GethTrace, Eth::Error> {
+        let permit = self.trace_task_permit().await?;
         let at = block_id.unwrap_or_default();
         let GethDebugTracingCallOptions {
             tracing_options,
@@ -313,7 +335,14 @@ where
         // Check if we need to replay transactions for a specific tx_index
         if let Some(tx_idx) = tx_index {
             return self
-                .debug_trace_call_at_tx_index(call, at, tx_idx as usize, tracing_options, overrides)
+                .debug_trace_call_at_tx_index(
+                    call,
+                    at,
+                    tx_idx as usize,
+                    tracing_options,
+                    overrides,
+                    permit,
+                )
                 .await;
         }
 
@@ -322,6 +351,7 @@ where
         let this = self.clone();
         let trace =
             self.eth_api().spawn_with_call_at(call, at, overrides, move |db, evm_env, tx_env| {
+                let _permit = permit;
                 let mut inspector = tracer_interrupt.attach(
                     DebugInspector::new(tracing_options).map_err(Eth::Error::from_eth_err)?,
                 );
@@ -349,6 +379,7 @@ where
         tx_index: usize,
         tracing_options: GethDebugTracingOptions,
         overrides: EvmOverrides,
+        permit: OwnedSemaphorePermit,
     ) -> Result<GethTrace, Eth::Error> {
         // Get the target block to check transaction count
         let block = self
@@ -375,6 +406,7 @@ where
         let interrupt = JsTraceInterrupt::new(&tracing_options)?;
         let tracer_interrupt = interrupt.clone();
         let trace = self.eth_api().spawn_with_state_at_block(state_at, move |eth_api, mut db| {
+            let _permit = permit;
             // 1. apply pre-execution changes
             eth_api.apply_pre_execution_changes(&block, &mut db, &evm_env)?;
 
@@ -413,6 +445,7 @@ where
             return Err(EthApiError::InvalidParams(String::from("bundles are empty.")).into())
         }
 
+        let permit = self.trace_task_permit().await?;
         let StateContext { transaction_index, block_number } = state_context.unwrap_or_default();
         let transaction_index = transaction_index.unwrap_or_default();
 
@@ -444,6 +477,7 @@ where
 
         self.eth_api()
             .spawn_with_state_at_block(at, move |eth_api, mut db| {
+                let _permit = permit;
                 // the outer vec for the bundles
                 let mut all_bundles = Vec::with_capacity(bundles.len());
 
@@ -759,7 +793,7 @@ where
         rlp_block: Bytes,
         opts: Option<GethDebugTracingOptions>,
     ) -> RpcResult<Vec<TraceResult>> {
-        let _permit = self.acquire_trace_permit().await;
+        // TN(TN-0036): the trace takes its permit itself and holds it in its blocking task.
         Self::debug_trace_raw_block(self, rlp_block, opts.unwrap_or_default())
             .await
             .map_err(Into::into)
@@ -771,7 +805,7 @@ where
         block: B256,
         opts: Option<GethDebugTracingOptions>,
     ) -> RpcResult<Vec<TraceResult>> {
-        let _permit = self.acquire_trace_permit().await;
+        // TN(TN-0036): the trace takes its permit itself and holds it in its blocking task.
         Self::debug_trace_block(self, block.into(), opts.unwrap_or_default())
             .await
             .map_err(Into::into)
@@ -783,7 +817,7 @@ where
         block: BlockNumberOrTag,
         opts: Option<GethDebugTracingOptions>,
     ) -> RpcResult<Vec<TraceResult>> {
-        let _permit = self.acquire_trace_permit().await;
+        // TN(TN-0036): the trace takes its permit itself and holds it in its blocking task.
         Self::debug_trace_block(self, block.into(), opts.unwrap_or_default())
             .await
             .map_err(Into::into)
@@ -795,7 +829,7 @@ where
         tx_hash: B256,
         opts: Option<GethDebugTracingOptions>,
     ) -> RpcResult<GethTrace> {
-        let _permit = self.acquire_trace_permit().await;
+        // TN(TN-0036): the trace takes its permit itself and holds it in its blocking task.
         Self::debug_trace_transaction(self, tx_hash, opts.unwrap_or_default())
             .await
             .map_err(Into::into)
@@ -808,7 +842,7 @@ where
         block_id: Option<BlockId>,
         opts: Option<GethDebugTracingCallOptions>,
     ) -> RpcResult<GethTrace> {
-        let _permit = self.acquire_trace_permit().await;
+        // TN(TN-0036): the trace takes its permit itself and holds it in its blocking task.
         Self::debug_trace_call(self, request, block_id, opts.unwrap_or_default())
             .await
             .map_err(Into::into)
@@ -820,7 +854,7 @@ where
         state_context: Option<StateContext>,
         opts: Option<GethDebugTracingCallOptions>,
     ) -> RpcResult<Vec<Vec<GethTrace>>> {
-        let _permit = self.acquire_trace_permit().await;
+        // TN(TN-0036): the trace takes its permit itself and holds it in its blocking task.
         Self::debug_trace_call_many(self, bundles, state_context, opts).await.map_err(Into::into)
     }
 
@@ -1379,5 +1413,338 @@ mod tests {
         assert!(!tracer_interrupt.is_interrupted());
         drop(trace);
         assert!(tracer_interrupt.is_interrupted());
+    }
+}
+
+/// TN(TN-0036): a trace holds its tracing permit until its blocking task ends.
+///
+/// Outside the `js-tracer` test module so the default build runs it too.
+#[cfg(test)]
+mod trace_permit_tests {
+    use super::*;
+    use crate::{eth::EthApi, EthApiBuilder};
+    use alloy_consensus::{Header, TxLegacy};
+    use alloy_network::Ethereum;
+    use alloy_primitives::TxKind;
+    use alloy_rpc_types_eth::TransactionRequest;
+    use futures::TryFutureExt;
+    use reth_chainspec::ChainSpec;
+    use reth_ethereum_primitives::{Block, BlockBody, Transaction};
+    use reth_evm_ethereum::EthEvmConfig;
+    use reth_network_api::noop::NoopNetwork;
+    use reth_primitives_traits::SealedBlock;
+    use reth_provider::test_utils::MockEthProvider;
+    use reth_rpc_convert::RpcConverter;
+    use reth_rpc_eth_api::node::RpcNodeCoreAdapter;
+    use reth_rpc_eth_types::receipt::EthReceiptConverter;
+    use reth_tasks::TokioTaskExecutor;
+    use reth_testing_utils::generators;
+    use reth_transaction_pool::test_utils::{testing_pool, TestPool};
+    use std::{future::Future, pin::Pin, sync::mpsc, time::Duration};
+    use tokio::time::{timeout, Instant};
+
+    type TestDebugApi = DebugApi<
+        EthApi<
+            RpcNodeCoreAdapter<MockEthProvider, TestPool, NoopNetwork, EthEvmConfig>,
+            RpcConverter<Ethereum, EthEvmConfig, EthReceiptConverter<ChainSpec>>,
+        >,
+    >;
+
+    type TraceFuture<'a> = Pin<Box<dyn Future<Output = RpcResult<()>> + Send + 'a>>;
+
+    /// Time for spawned work to start: `EthApi`'s startup tasks, or a second trace that wrongly
+    /// got a permit.
+    const SETTLE: Duration = Duration::from_millis(200);
+
+    /// Bounds every wait, so a regression fails instead of hanging.
+    const DEADLINE: Duration = Duration::from_secs(20);
+
+    /// The trace methods that take a tracing permit.
+    #[derive(Clone, Copy, Debug)]
+    enum TraceMethod {
+        Block,
+        BlockByHash,
+        BlockByNumber,
+        Transaction,
+        Call,
+        CallAtTxIndex,
+        CallMany,
+    }
+
+    const ALL_METHODS: [TraceMethod; 7] = [
+        TraceMethod::Block,
+        TraceMethod::BlockByHash,
+        TraceMethod::BlockByNumber,
+        TraceMethod::Transaction,
+        TraceMethod::Call,
+        TraceMethod::CallAtTxIndex,
+        TraceMethod::CallMany,
+    ];
+
+    /// A debug API limited to one tracing permit, over a mock chain whose block 1 holds one
+    /// legacy transaction. Every method replays or simulates a transaction, so it reads an account
+    /// inside its blocking task.
+    struct Fixture {
+        provider: MockEthProvider,
+        api: TestDebugApi,
+        block: SealedBlock<Block>,
+    }
+
+    impl Fixture {
+        fn new() -> Self {
+            let provider = MockEthProvider::default();
+            let tx = generators::sign_tx_with_random_key_pair(
+                &mut generators::rng(),
+                Transaction::Legacy(TxLegacy {
+                    gas_limit: 21_000,
+                    to: TxKind::Call(Address::with_last_byte(1)),
+                    ..Default::default()
+                }),
+            );
+            let block = Block {
+                header: Header { number: 1, gas_limit: 30_000_000, ..Default::default() },
+                body: BlockBody { transactions: vec![tx], ..Default::default() },
+            }
+            .seal_slow();
+            provider.add_block(block.hash(), block.clone().into_block());
+            let eth_api = EthApiBuilder::new(
+                provider.clone(),
+                testing_pool(),
+                NoopNetwork::default(),
+                EthEvmConfig::new(provider.chain_spec()),
+            )
+            .build();
+            let api = DebugApi::new(
+                eth_api,
+                BlockingTaskGuard::new(1),
+                TokioTaskExecutor::default(),
+                futures::stream::empty(),
+            );
+            Self { provider, api, block }
+        }
+
+        /// Starts `method` with `tracing` as its tracer options.
+        fn start(&self, method: TraceMethod, tracing: &GethDebugTracingOptions) -> TraceFuture<'_> {
+            let api = &self.api;
+            let tracing = tracing.clone();
+            let call = || TransactionRequest {
+                to: Some(TxKind::Call(Address::with_last_byte(2))),
+                ..Default::default()
+            };
+            let call_opts = |tx_index| GethDebugTracingCallOptions {
+                tracing_options: tracing.clone(),
+                tx_index,
+                ..Default::default()
+            };
+            let block_1 = || BlockId::Number(1.into());
+            match method {
+                TraceMethod::Block => Box::pin(
+                    DebugApiServer::debug_trace_block(
+                        api,
+                        alloy_rlp::encode(self.block.clone().into_block()).into(),
+                        Some(tracing),
+                    )
+                    .map_ok(drop),
+                ),
+                TraceMethod::BlockByHash => Box::pin(
+                    DebugApiServer::debug_trace_block_by_hash(
+                        api,
+                        self.block.hash(),
+                        Some(tracing),
+                    )
+                    .map_ok(drop),
+                ),
+                TraceMethod::BlockByNumber => Box::pin(
+                    DebugApiServer::debug_trace_block_by_number(api, 1.into(), Some(tracing))
+                        .map_ok(drop),
+                ),
+                TraceMethod::Transaction => Box::pin(
+                    DebugApiServer::debug_trace_transaction(
+                        api,
+                        *self.block.body().transactions[0].tx_hash(),
+                        Some(tracing),
+                    )
+                    .map_ok(drop),
+                ),
+                TraceMethod::Call => Box::pin(
+                    DebugApiServer::debug_trace_call(api, call(), None, Some(call_opts(None)))
+                        .map_ok(drop),
+                ),
+                TraceMethod::CallAtTxIndex => Box::pin(
+                    DebugApiServer::debug_trace_call(
+                        api,
+                        call(),
+                        Some(block_1()),
+                        Some(call_opts(Some(0))),
+                    )
+                    .map_ok(drop),
+                ),
+                TraceMethod::CallMany => Box::pin(
+                    DebugApiServer::debug_trace_call_many(
+                        api,
+                        vec![Bundle { transactions: vec![call()], block_override: None }],
+                        Some(StateContext {
+                            block_number: Some(block_1()),
+                            transaction_index: None,
+                        }),
+                        Some(call_opts(None)),
+                    )
+                    .map_ok(drop),
+                ),
+            }
+        }
+
+        /// Clones of the mock provider alive: a trace's blocking task holds one for its state.
+        fn provider_clones(&self) -> usize {
+            Arc::strong_count(&self.provider.accounts)
+        }
+
+        /// Waits until the trace tasks and the block cache's loads have dropped their clones.
+        async fn settle_at(&self, clones: usize) {
+            let deadline = Instant::now() + DEADLINE;
+            while self.provider_clones() != clones {
+                assert!(
+                    Instant::now() < deadline,
+                    "provider clones stuck at {}",
+                    self.provider_clones()
+                );
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }
+    }
+
+    /// Locks the mock's account store from a thread of its own until dropped, so the first
+    /// account read of a trace blocks inside its blocking task.
+    struct AccountGate {
+        release: Option<mpsc::Sender<()>>,
+        holder: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl AccountGate {
+        fn close(provider: &MockEthProvider) -> Self {
+            let accounts = Arc::clone(&provider.accounts);
+            let (locked_tx, locked_rx) = mpsc::channel();
+            let (release, released) = mpsc::channel::<()>();
+            let holder = std::thread::spawn(move || {
+                let _locked = accounts.lock();
+                locked_tx.send(()).unwrap();
+                let _ = released.recv();
+            });
+            locked_rx.recv().unwrap();
+            Self { release: Some(release), holder: Some(holder) }
+        }
+    }
+
+    impl Drop for AccountGate {
+        fn drop(&mut self) {
+            drop(self.release.take());
+            if let Some(holder) = self.holder.take() {
+                let _ = holder.join();
+            }
+        }
+    }
+
+    /// How the first trace's request ends while its blocking task is still running.
+    #[derive(Clone, Copy, Debug)]
+    enum Abandon {
+        /// The client goes away: the request future is dropped.
+        Drop,
+        /// The JS tracer's `timeout` expires and the request returns an error.
+        #[cfg(feature = "js-tracer")]
+        Timeout,
+    }
+
+    /// With one tracing permit, a trace whose request ends while its blocking task still runs
+    /// keeps the permit, so a second trace does not start a blocking task until the first ends.
+    async fn assert_abandoned_trace_keeps_its_permit(
+        method: TraceMethod,
+        tracing: GethDebugTracingOptions,
+        abandon: Abandon,
+    ) {
+        let fx = Fixture::new();
+        // Let `EthApi`'s startup tasks run: the fee-history task holds a clone until the mock's
+        // canonical-state stream ends.
+        tokio::time::sleep(SETTLE).await;
+        let idle = fx.provider_clones();
+        // Warm the block cache, so the only clone a trace makes below is its own state's.
+        timeout(DEADLINE, fx.start(method, &tracing))
+            .await
+            .expect("warm-up trace hangs")
+            .unwrap_or_else(|err| panic!("{method:?}: warm-up trace failed: {err:?}"));
+        fx.settle_at(idle).await;
+
+        let gate = AccountGate::close(&fx.provider);
+        let gated = idle + 1;
+        let mut first = fx.start(method, &tracing);
+        // Drive the first trace until its blocking task has opened state, then end its request.
+        let deadline = Instant::now() + DEADLINE;
+        while fx.provider_clones() == gated {
+            assert!(Instant::now() < deadline, "{method:?}: the first trace never started");
+            assert!(
+                timeout(Duration::from_millis(5), &mut first).await.is_err(),
+                "{method:?}: the first trace ended while the account store was locked"
+            );
+        }
+        match abandon {
+            Abandon::Drop => drop(first),
+            #[cfg(feature = "js-tracer")]
+            Abandon::Timeout => {
+                let err = timeout(DEADLINE, first).await.expect("timeout never fired").unwrap_err();
+                assert!(err.message().contains("timeout"), "{method:?}: {err:?}");
+            }
+        }
+        assert_eq!(fx.provider_clones(), gated + 1, "{method:?}: the first trace's task ended");
+
+        let mut second = fx.start(method, &tracing);
+        assert!(
+            timeout(SETTLE, &mut second).await.is_err(),
+            "{method:?}: the second trace ran while the first one's task held the account store"
+        );
+        assert_eq!(
+            fx.provider_clones(),
+            gated + 1,
+            "{method:?}: the second trace started a blocking task while the first one's still runs"
+        );
+
+        // The first trace's task ends and returns the permit; the second trace then runs.
+        drop(gate);
+        timeout(DEADLINE, second)
+            .await
+            .expect("the second trace never got the permit")
+            .unwrap_or_else(|err| panic!("{method:?}: second trace failed: {err:?}"));
+        fx.settle_at(idle).await;
+    }
+
+    #[tokio::test]
+    async fn dropped_trace_keeps_its_permit_until_its_task_ends() {
+        for method in ALL_METHODS {
+            assert_abandoned_trace_keeps_its_permit(
+                method,
+                GethDebugTracingOptions::default(),
+                Abandon::Drop,
+            )
+            .await;
+        }
+    }
+
+    /// The JS-tracer case of T1-2: the request times out while its trace's task still runs.
+    #[cfg(feature = "js-tracer")]
+    #[tokio::test]
+    async fn timed_out_js_trace_keeps_its_permit_until_its_task_ends() {
+        use alloy_rpc_types_trace::geth::GethDebugTracerType;
+
+        let tracing = GethDebugTracingOptions {
+            tracer: Some(GethDebugTracerType::JsTracer(
+                "{ step: function() {}, fault: function() {}, result: function() { return null; } }"
+                    .into(),
+            )),
+            timeout: Some("1s".into()),
+            ..Default::default()
+        };
+        // Only these methods apply the JS `timeout` (TN-0017).
+        for method in [TraceMethod::Transaction, TraceMethod::Call, TraceMethod::CallAtTxIndex] {
+            assert_abandoned_trace_keeps_its_permit(method, tracing.clone(), Abandon::Timeout)
+                .await;
+        }
     }
 }

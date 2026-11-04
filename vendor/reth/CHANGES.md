@@ -454,3 +454,31 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   places and is left out. The permit test fails without the fix (five chunks, no permits
   taken); the other pins the no-permit path, which would hang with an awaited acquire.
   *Upstream*: n/a (upstream commit). A later sync takes upstream's version of the function.
+
+## TN fixes (not from an upstream commit)
+
+- **TN-0036** — Debug traces hold their tracing permit until their blocking task ends. *Kind*:
+  fix (security).
+  *Files*: `crates/rpc/rpc/src/debug.rs` (the six `debug_trace*` handlers, the methods behind
+  them, and `trace_permit_tests`), `crates/rpc/rpc/src/js_tracer_interrupt.rs` (module comment
+  only), `crates/storage/provider/src/test_utils/mock.rs` (test support: the mock hunk of upstream
+  dfcb10454, so `MockEthProvider::recovered_block` returns the blocks it stores).
+  *Why*: the RPC handlers held the permit only while the request was open. A trace that timed out
+  (a JS tracer's `timeout`, TN-0017) or lost its client returned its permit while its blocking
+  thread ran on, and the TN-0017 interrupt cannot stop a JS callback, `setup` or `result` mid-run
+  (review finding T1-2). Repeated requests could therefore occupy any number of tokio's blocking
+  threads, which block execution and certificate validation also use. Each trace method now takes
+  the permit once, where the handler used to (before its block and transaction lookups), and moves
+  it into its blocking closure, as e63ec720a does for `eth_call` (TN-0019). At most
+  `--rpc.max-tracing-requests` threads run debug traces, in builds with and without `js-tracer`.
+  The handlers no longer acquire, so no request takes a second permit, which would wait forever
+  with a limit of 1. A request dropped before its task starts still frees the permit, when the task
+  sees the closed channel. Callers of the public trace methods must not hold a tracing permit.
+  Unchanged, as upstream: `debug_executionWitness*` (not a trace) and the `trace_*` namespace hold
+  their permit only while the request is open.
+  *Tests*: `trace_permit_tests` locks the mock's account store so a trace's thread stays inside
+  its closure, with one permit. For each of the seven trace paths it drops the request mid-trace,
+  and with `js-tracer` it lets a JS tracer time out; a second trace must not start a blocking task
+  until the first one ends. Both tests fail before the change ("the second trace started a
+  blocking task while the first one's still runs"). *Upstream*: yes; upstream main still releases
+  these permits on timeout and disconnect.

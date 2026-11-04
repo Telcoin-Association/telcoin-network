@@ -4,9 +4,11 @@
 //! `JsInspectorInterrupt` added in revm-inspectors 0.44.2 (paradigmxyz/revm-inspectors#536). That
 //! release needs revm 43, and TN is on revm 34 with revm-inspectors 0.34, so this module ports the
 //! same mechanism as a wrapper around the inspector: a shared flag, checked at every inspector
-//! hook, that halts the EVM with `"JavaScript tracing interrupted"` once set. Script evaluation
-//! inside a single callback is bounded by the Boa loop and recursion limits revm-inspectors
-//! already sets.
+//! hook, that halts the EVM with `"JavaScript tracing interrupted"` once set. The flag is read
+//! between hooks, so a callback that is running when it is set runs to its end, and `setup` and
+//! `result` are never interrupted. Boa's limits don't bound a callback either: its loop limit
+//! counts per call frame, and Boa 0.21 has no time limit. What is bounded is the number of threads:
+//! a trace's blocking task holds its tracing permit until it ends (TN-0036).
 //!
 //! Delete this module when revm-inspectors reaches 0.44.2 and use
 //! `revm_inspectors::tracing::js::JsInspectorInterrupt` with `JsInspector::with_interrupt`, as

@@ -205,11 +205,20 @@ Upstream fixed the JS-tracer DoS (57825d41d) with `JsInspectorInterrupt` from re
 bump revm (the "Phase 4"-sized revm 34 → 43 move, far beyond a security fix), vendor and patch
 revm-inspectors (another crate to carry), drop `js-tracer` (removes a geth-compatible feature
 operators may rely on), or port the mechanism. The mechanism is small: a shared `AtomicBool`
-checked at every inspector hook, which halts the EVM and sets the context error. It needs no
-Boa change, because Boa's loop and recursion limits, already set by revm-inspectors 0.34, bound
-the work inside one callback. So TN-0017 ports it as a wrapper around `DebugInspector` in a
-TN-owned file, and keeps `debug.rs` shaped like upstream's version so the next sync swaps the
-wrapper for `JsInspector::with_interrupt`.
+checked at every inspector hook, which halts the EVM and sets the context error. So TN-0017 ports
+it as a wrapper around `DebugInspector` in a TN-owned file, and keeps `debug.rs` shaped like
+upstream's version so the next sync swaps the wrapper for `JsInspector::with_interrupt`.
+
+Correction, 2026-11-04: the port first claimed it needed no Boa change because Boa's loop and
+recursion limits bound the work inside one callback. They don't (review finding T1-2). Boa counts
+loop iterations per call frame, 200,000 each, so a callback that calls a looping function from a
+loop runs as long as its script says, and Boa 0.21 has no time limit. The interrupt is read only
+between hooks: it stops a trace after the running callback returns, and never stops `setup` or
+`result`. Upstream's interrupt has the same gap. What bounds the cost is the tracing permit, which
+each `debug_trace*` request holds until its blocking task ends (TN-0036), so at most
+`--rpc.max-tracing-requests` threads run debug traces however long a callback takes. The recursion
+limit is now 128 (`patches/revm-inspectors/PATCH.md`), so a recursive accessor fails in `setup`
+instead of overflowing the thread's stack (T1-1).
 
 ## D17. Security backports: apply what is High for TN, track the rest
 
