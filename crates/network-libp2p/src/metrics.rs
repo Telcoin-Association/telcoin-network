@@ -563,7 +563,7 @@ impl<T> PerHandshakeDirection<T> {
 }
 
 /// The outcome label of the outbound request round-trip histogram (issue #1741 measurement
-/// companion).
+/// companion). The histogram also carries the request's [`ServiceClass`] label.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum OutboundRequestOutcome {
     /// The peer answered; the sample is the send-to-response round trip.
@@ -945,8 +945,9 @@ struct LabeledHandles {
     outbound_failed: PerOutboundFailure,
     /// `connection_established_seconds` per direction (issue #1741 measurement companion).
     connection_established: PerHandshakeDirection<Histogram>,
-    /// `outbound_request_duration_seconds` per outcome (issue #1741 measurement companion).
-    outbound_request_duration: PerOutboundRequestOutcome<Histogram>,
+    /// `outbound_request_duration_seconds` per outcome and service class (issue #1741
+    /// measurement companion).
+    outbound_request_duration: PerOutboundRequestOutcome<PerClass<Histogram>>,
 }
 
 impl fmt::Debug for LabeledHandles {
@@ -1025,11 +1026,14 @@ impl LabeledHandles {
                 )
             }),
             outbound_request_duration: PerOutboundRequestOutcome::new(|outcome| {
-                metrics::histogram!(
-                    "tn_network.outbound_request_duration_seconds",
-                    "network" => network.to_owned(),
-                    "outcome" => outcome.label(),
-                )
+                PerClass::new(|class| {
+                    metrics::histogram!(
+                        "tn_network.outbound_request_duration_seconds",
+                        "network" => network.to_owned(),
+                        "outcome" => outcome.label(),
+                        "class" => class.label(),
+                    )
+                })
             }),
         }
         .registered()
@@ -1379,13 +1383,21 @@ impl SwarmMetrics {
     }
 
     /// Record the client-side round trip of an outbound consensus request, from the send to
-    /// its response or to its failure, under the fixed `outcome` label.
+    /// its response or to its failure, under the fixed `outcome` and `class` labels.
+    ///
+    /// `class` is the service class that the peer serves the request under, so a vote round
+    /// trip is separable from catch-up and epoch-record traffic on the same swarm.
     pub(crate) fn record_outbound_request_duration(
         &self,
         outcome: OutboundRequestOutcome,
+        class: ServiceClass,
         elapsed: Duration,
     ) {
-        self.labeled.outbound_request_duration.get(outcome).record(elapsed.as_secs_f64());
+        self.labeled
+            .outbound_request_duration
+            .get(outcome)
+            .get(class)
+            .record(elapsed.as_secs_f64());
     }
 
     /// Count a forwarded inbound request of `class` that ended without a response.
@@ -2499,26 +2511,68 @@ mod tests {
         assert_eq!(series, HandshakeDirection::ALL.len());
     }
 
-    /// `outbound_request_duration_seconds` moves the sample count of the observed outcome only
-    /// and exposes exactly one series per outcome label.
+    /// `outbound_request_duration_seconds` keeps every outcome and class pair in its own series
+    /// and exposes exactly one series per pair.
     #[test]
-    fn outbound_request_duration_seconds_records_by_outcome() {
+    fn outbound_request_duration_seconds_records_by_outcome_and_class() {
+        let pairs = || {
+            OutboundRequestOutcome::ALL.into_iter().enumerate().flat_map(
+                |(outcome_index, outcome)| {
+                    ServiceClass::ALL.into_iter().enumerate().map(move |(class_index, class)| {
+                        // a distinct sample count per pair catches a crossed label
+                        (outcome, class, 1 + outcome_index * ServiceClass::ALL.len() + class_index)
+                    })
+                },
+            )
+        };
         let recorder = DebuggingRecorder::new();
         metrics::with_local_recorder(&recorder, || {
             let swarm = SwarmMetrics::new_for(&NetworkType::Primary);
-            let response = OutboundRequestOutcome::Response;
-            swarm.record_outbound_request_duration(response, Duration::from_millis(12));
-            swarm.record_outbound_request_duration(response, Duration::from_millis(18));
-            let failure = OutboundRequestOutcome::Failure;
-            swarm.record_outbound_request_duration(failure, Duration::from_secs(10));
+            pairs().for_each(|(outcome, class, count)| {
+                (0..count).for_each(|_| {
+                    swarm.record_outbound_request_duration(
+                        outcome,
+                        class,
+                        Duration::from_millis(12),
+                    );
+                });
+            });
         });
         let histograms = histograms(&recorder);
         let name = "tn_network.outbound_request_duration_seconds";
         let primary = ("network", "primary");
-        assert_eq!(samples(&histograms, name, &[primary, ("outcome", "response")]), Some(2));
-        assert_eq!(samples(&histograms, name, &[primary, ("outcome", "failure")]), Some(1));
+        pairs().for_each(|(outcome, class, count)| {
+            let labels = [primary, ("outcome", outcome.label()), ("class", class.label())];
+            assert_eq!(
+                samples(&histograms, name, &labels),
+                Some(count),
+                "{outcome:?}/{class:?} must keep its own sample count"
+            );
+        });
         let series = histograms.iter().filter(|(key, _)| key.name() == name).count();
-        assert_eq!(series, OutboundRequestOutcome::ALL.len());
+        assert_eq!(series, OutboundRequestOutcome::ALL.len() * ServiceClass::ALL.len());
+    }
+
+    /// A vote request that the peer answered lands in the `{outcome="response", class="vote"}`
+    /// series of `tn_network_outbound_request_duration_seconds` and in no other series.
+    #[test]
+    fn outbound_vote_response_lands_in_the_vote_response_series() {
+        let recorder = DebuggingRecorder::new();
+        metrics::with_local_recorder(&recorder, || {
+            let swarm = SwarmMetrics::new_for(&NetworkType::Primary);
+            swarm.record_outbound_request_duration(
+                OutboundRequestOutcome::Response,
+                ServiceClass::Vote,
+                Duration::from_millis(350),
+            );
+        });
+        let histograms = histograms(&recorder);
+        let name = "tn_network.outbound_request_duration_seconds";
+        let vote_response = [("network", "primary"), ("outcome", "response"), ("class", "vote")];
+        assert_eq!(samples(&histograms, name, &vote_response), Some(1));
+        let total: usize =
+            histograms.iter().filter(|(key, _)| key.name() == name).map(|(_, count)| *count).sum();
+        assert_eq!(total, 1, "the vote response must not land in any other series");
     }
 
     /// The two measurement histograms keep one worker's samples out of another worker's series.
@@ -2536,6 +2590,7 @@ mod tests {
                         );
                         swarm.record_outbound_request_duration(
                             OutboundRequestOutcome::Response,
+                            ServiceClass::Vote,
                             Duration::from_millis(1),
                         );
                     });
@@ -2546,13 +2601,17 @@ mod tests {
         [("worker-0", 3), ("worker-1", 7)].into_iter().for_each(|(network, expected)| {
             let labels = ("network", network);
             [
-                ("tn_network.connection_established_seconds", ("direction", "outbound")),
-                ("tn_network.outbound_request_duration_seconds", ("outcome", "response")),
+                ("tn_network.connection_established_seconds", vec![("direction", "outbound")]),
+                (
+                    "tn_network.outbound_request_duration_seconds",
+                    vec![("outcome", "response"), ("class", "vote")],
+                ),
             ]
             .into_iter()
             .for_each(|(name, label)| {
+                let selector: Vec<_> = std::iter::once(labels).chain(label).collect();
                 assert_eq!(
-                    samples(&histograms, name, &[labels, label]),
+                    samples(&histograms, name, &selector),
                     Some(expected),
                     "{name} must retain {network}'s sample count"
                 );
