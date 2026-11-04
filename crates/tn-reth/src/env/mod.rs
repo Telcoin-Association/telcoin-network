@@ -609,4 +609,31 @@ mod tests {
 
         Ok(())
     }
+
+    /// A new datadir is written with reth's storage v1 layout, and a restart keeps it.
+    ///
+    /// The layout decides where receipts, change sets and history indices live, and historical
+    /// reads (including consensus-registry reads at past blocks) depend on the history indices.
+    /// A node on v2 would write no MDBX history indices and disagree with v1 nodes on those
+    /// reads. TN pins v1 through one vendored line, `StorageSettings::base()` (TN-0014), which
+    /// `init_genesis` writes into a new datadir; upstream main returns v2 there, so an upstream
+    /// sync that takes that line would silently switch new nodes. This test fails instead.
+    #[tokio::test]
+    async fn test_new_datadir_uses_storage_v1() -> eyre::Result<()> {
+        use reth_provider::{MetadataProvider as _, StorageSettings, StorageSettingsCache as _};
+
+        assert_eq!(StorageSettings::base(), StorageSettings::v1());
+
+        let genesis = test_genesis_with_consensus_registry(4);
+        let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+        let tmp = TempDir::new().expect("create temp dir");
+        for run in ["new datadir", "reopened datadir"] {
+            let tm = TaskManager::new(run);
+            let env = RethEnv::new_for_temp_chain(chain.clone(), tmp.path(), &tm, None)?;
+            let provider = env.blockchain_provider().database_provider_ro()?;
+            assert_eq!(provider.storage_settings()?, Some(StorageSettings::v1()), "{run}");
+            assert_eq!(provider.cached_storage_settings(), StorageSettings::v1(), "{run}");
+        }
+        Ok(())
+    }
 }

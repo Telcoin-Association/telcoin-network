@@ -167,8 +167,12 @@ rewrites live storage code: the history and changeset write routing in `EitherWr
 persisted `StorageSettings` (whose `storage_v2` flag is part of the on-disk metadata and has to
 keep decoding), and `check_consistency`. That is the code the tndb-b work owns (Phase 3). Do it
 there, or as its own reviewed change with the full test and e2e suites. Until then, a v2
-database is impossible for TN because `tn-reth` pins `StorageArgs { v2: false }` and does not
-expose the flag.
+database is impossible for TN because `init_genesis` writes `StorageSettings::base()` into a new
+datadir and TN-0014 makes that v1, and an existing datadir keeps the settings it stored. (`tn-reth`
+also pins `StorageArgs { v2: false }` and does not expose the flag, but `init_genesis` never reads
+it.) Upstream main returns v2 from `base()`, so a sync conflicts on that line; resolving it toward
+upstream would make new nodes write no history indices and disagree with v1 nodes on historical
+reads. `tn-reth`'s `test_new_datadir_uses_storage_v1` fails if that happens.
 
 ## D16. The JS-tracer interrupt is ported, not upgraded or removed
 
