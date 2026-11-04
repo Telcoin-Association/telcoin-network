@@ -30,8 +30,8 @@ The examples use `v0.17.0-adiri`.
 
 Each network has its own image package: `ghcr.io/telcoin-association/tn-mainnet` for mainnet tags and `ghcr.io/telcoin-association/tn-testnet` for Adiri tags.
 `etc/release.sh` takes the package from the tag alone, and `./etc/release.sh parse <TAG>` prints it as `PACKAGE`; `RELEASE_REPO` changes only the repository owner in it.
-Every step that reads or writes `IMAGE_DIGEST` refuses an image in another package: `release-build`'s own check of the draft, `release-sign`, which checks again right before it signs, `release-verify`, `release-publish`, and in CI `draft-release` and `verify-release`.
-The refusal names the image found, the tag's network and the package the image belongs in, as in `IMAGE_DIGEST names an image in ghcr.io/telcoin-association/tn-mainnet, but v0.17.0-adiri is on the adiri channel, whose images are published only in ghcr.io/telcoin-association/tn-testnet`.
+Every step that reads or writes `IMAGE_DIGEST` requires exactly one line, `<package image>@sha256:<64 hex>`, naming the tag's package: `release-build`'s own check of the draft, `release-sign`, which checks again right before it signs, `release-verify`, `release-publish`, and in CI `draft-release` and `verify-release`.
+Each refuses an image in another package, several lines, a line without a digest and a malformed digest alike, and the refusal says what the file holds, the tag's channel, its package and the line expected, as in `IMAGE_DIGEST names an image in ghcr.io/telcoin-association/tn-mainnet, but v0.17.0-adiri is on the adiri channel, whose images are published only in ghcr.io/telcoin-association/tn-testnet (expected the one line ghcr.io/telcoin-association/tn-testnet@sha256:<64 hex>)`.
 `make docker-adiri` and `make docker-devnet` push their ad-hoc `dev-<flavor>-<TAG>` images to `ghcr.io/telcoin-association/tn-dev`, never to a release package; the earlier package `ghcr.io/telcoin-association/telcoin-network` never held a release and is no longer used.
 
 `release-build` pushes the image to the tag's package under the tag name.
@@ -91,13 +91,16 @@ The YubiKey never goes to the build server, and the registry token never goes on
 - Each release package must be public, because the release scripts and operators read it without credentials, and only the release maintainer account may write to it.
   A ghcr package exists only after its first push, and only `release-build` pushes to the release packages, so this setup happens at the first release of each network, `tn-testnet` at the first Adiri tag and `tn-mainnet` at the first mainnet tag:
   1. Run step 4 for that tag.
-     Before the push, ghcr answers 403 for the package, as it does for a private one, so `release-build` warns, asks whether to push the package's first image (`RELEASE_YES=1` answers yes), pushes it, and then stops with `package is not public`.
+     Before the push, ghcr answers 403 for the package, as it does for a private one, so `release-build` asks the registry again with your Docker login.
+     The login does not see the tag in a package that does not exist yet, and `release-build` then stops and asks for `RELEASE_FIRST_PUSH`: run `RELEASE_FIRST_PUSH=tn-testnet make release-build TAG=<tag>` (`tn-mainnet` for a mainnet tag; the value must be the tag's package, and `RELEASE_YES=1` never stands in for it).
+     It pushes the package's first image and then stops with `package is not public`.
   2. Open the package's settings, `https://github.com/orgs/Telcoin-Association/packages/container/tn-testnet/settings` or `.../tn-mainnet/settings`.
      Under "Danger Zone", change the visibility to public.
      Under "Manage access", turn off the access inherited from the repository and give write access to the release maintainer account only.
      Under "Manage Actions access", leave this repository out or give it the Read role: no workflow asks for `packages` permission, so the Actions token cannot write to the package, and this keeps a workflow added on a branch from doing so.
      [Settings the release workflow requires](https://github.com/Telcoin-Association/telcoin-network/blob/main/.github/ACTIONS.md#settings-the-release-workflow-requires) explains each list.
-  3. Run step 4 again with `RELEASE_REBUILD=1`, because the first image is now in the registry.
+  3. Run step 4 again with `RELEASE_REBUILD=1`, because the first image is now in the registry, and without `RELEASE_FIRST_PUSH`.
+     This is a full rebuild, so the first release of each network builds twice; the image it pushes replaces the first one under the tag before anything is signed.
 
 ## Cut a release
 
@@ -328,8 +331,9 @@ If `release-sign` had already uploaded the signature, the second run stops becau
 | 3 | The tag is wrong | The tag stays: only maintainers can create a `v*` tag, and it must be signed; nobody, maintainers included, can update or delete one. Follow [Before publish](#before-publish) and release the next version. |
 | 4, 6 | `run make docker-login` | Run `make docker-login` on the build server. |
 | 4 | `package is not public` | On a network's first release, after the push: do the [one-time setup](#one-time-setup) and run step 4 again with `RELEASE_REBUILD=1`. Otherwise someone made the package private: make it public again. |
-| 4 | `release-build` asks whether to push the first image of the package | Answer `yes` only on the first release of that network; on any later release the package was made private, so answer no and make it public. |
-| 4 to 7 | `IMAGE_DIGEST names an image in ..., but <TAG> is on the ... channel` | The draft's `IMAGE_DIGEST` names an image in another package, such as the other network's, so it is not the file `release-build` wrote for this tag. Do not sign or publish; rebuild the draft as for a failed `release-verify` below. If the release is public, follow [After publish](#after-publish). |
+| 4 | `release-build` stops and asks for `RELEASE_FIRST_PUSH` | On the first release of that network, run it again with `RELEASE_FIRST_PUSH=<package>` as the [one-time setup](#one-time-setup) says. On any later release the package was made private, or your Docker login cannot read it: make the package public and check `make docker-login`; do not set `RELEASE_FIRST_PUSH`. |
+| 4 | `release-build` warns that the package is private, not new | The package refuses anonymous reads but your Docker login sees the tag in it: make the package public, then run step 4 again, with `RELEASE_REBUILD=1` if the tag must be rebuilt. |
+| 4 to 7 | `IMAGE_DIGEST ..., but <TAG> is on the ... channel, whose images are published only in ...` | The draft's `IMAGE_DIGEST` names an image in another package, such as the other network's, or is not one well-formed line, so it is not the file `release-build` wrote for this tag. Do not sign or publish; rebuild the draft as for a failed `release-verify` below. If the release is public, follow [After publish](#after-publish). |
 | 4 | The image `:<TAG>` is already in the registry | An earlier build pushed it. Rebuild with `RELEASE_REBUILD=1 make release-build TAG=<TAG>`; the new image has a different digest, because builds are not reproducible. |
 | 4 | The release scripts differ from `origin/main` | Run `git switch main && git pull --ff-only`, then the build again. |
 | 5 | `release-sign` stops because the SHA-256 differs from what `release-build` printed | Nothing was signed. Find out what changed the draft's files before going further. |
