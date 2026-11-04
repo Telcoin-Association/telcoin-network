@@ -70,7 +70,10 @@ pub const META_FILE: &str = "bench-base.json";
 /// Version 3: on the tndb-b backend, the state tables' engine dup tables keep a key of few rows in
 /// its outer cell (a packed set) instead of a nested tree of its own; every base rebuilds once,
 /// the MDBX ones with them.
-pub const LAYOUT_VERSION: u32 = 3;
+///
+/// Version 103: a control build that rebuilds its bases with this code, beside a layout change's
+/// own (never merged).
+pub const LAYOUT_VERSION: u32 = 103;
 
 /// This build's database backend, as [`BaseMeta::backend`] records it.
 pub const BACKEND: &str = if cfg!(feature = "tndb-b") { "tndb-b" } else { "mdbx" };
