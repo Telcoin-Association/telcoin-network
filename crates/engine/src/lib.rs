@@ -28,7 +28,10 @@ use error::EngineResult;
 pub use error::TnEngineError;
 use futures::{future::OptionFuture, StreamExt};
 pub use payload_builder::{execute_consensus_output, PERSIST_OUTPUT_ATTEMPTS};
-use std::collections::VecDeque;
+use std::{
+    collections::VecDeque,
+    time::{Duration, Instant},
+};
 use tn_reth::{payload::BuildArguments, RethEnv};
 use tn_types::{
     gas_accumulator::GasAccumulator, repack_monitor::RepackMonitor, ConsensusOutput, EngineUpdate,
@@ -61,8 +64,11 @@ pub const MAX_QUEUED_OUTPUTS: usize = 8;
 /// remaining output that is queued up before shutting itself down gracefully. If the maximum round
 /// is reached, the engine shuts down immediately.
 pub struct ExecutorEngine {
-    /// The backlog of output from consensus that's ready to be executed.
-    queued: VecDeque<ConsensusOutput>,
+    /// The backlog of output from consensus that's ready to be executed, each stamped with the
+    /// instant it was queued so the time it waits for execution is measurable
+    /// (`tn_engine_queue_wait_seconds`). The stamp is observability only: order and capacity
+    /// are unaffected.
+    queued: VecDeque<(Instant, ConsensusOutput)>,
     /// Single active future that executes consensus output on a blocking thread and then returns
     /// the result through a oneshot channel.
     pending_task: Option<PendingExecutionTask>,
@@ -146,7 +152,9 @@ impl ExecutorEngine {
         let (tx, rx) = oneshot::channel();
 
         // pop next output in queue and execute
-        if let Some(output) = self.queued.pop_front() {
+        if let Some((output, queue_wait)) = take_next_queued(&mut self.queued, Instant::now()) {
+            ENGINE_METRICS.queue_wait_seconds.record(queue_wait);
+            let consensus_number = output.number();
             let reth_env = self.reth_env.clone();
             let parent = self.parent_header.clone();
             let task_name = format!("execution-output-{}", output.consensus_header_hash());
@@ -157,7 +165,7 @@ impl ExecutorEngine {
             let engine_update_tx = self.engine_update_tx.clone();
             // spawn blocking task and return future
             self.task_spawner.spawn_blocking_task(task_name, move || {
-                let execution_start = std::time::Instant::now();
+                let execution_start = Instant::now();
                 // this is safe to call on blocking thread without a semaphore bc it's held in
                 // Self::pending_tesk as a single `Option`
                 let result =
@@ -165,7 +173,16 @@ impl ExecutorEngine {
                         .inspect_err(|e| {
                             error!(target: "engine", ?e, "error executing consensus output");
                         });
-                ENGINE_METRICS.execution_duration_seconds.record(execution_start.elapsed());
+                let task_elapsed = execution_start.elapsed();
+                ENGINE_METRICS.execution_duration_seconds.record(task_elapsed);
+                ENGINE_METRICS.busy_milliseconds_total.increment(duration_ms(task_elapsed));
+                debug!(
+                    target: "engine",
+                    consensus_number,
+                    queue_wait_ms = duration_ms(queue_wait),
+                    task_ms = duration_ms(task_elapsed),
+                    "output execution task finished"
+                );
                 if let Err(e) = tx.send(result) {
                     warn!(target: "engine", ?e, "error sending result from execute_consensus_output")
                 }
@@ -204,7 +221,7 @@ impl ExecutorEngine {
     /// Push a consensus output to the back of `Self::queued`.
     #[cfg(any(test, feature = "test-utils"))]
     pub fn push_back_queued_for_test(&mut self, output: ConsensusOutput) {
-        self.queued.push_back(output)
+        self.queued.push_back((Instant::now(), output))
     }
 }
 
@@ -271,8 +288,9 @@ impl ExecutorEngine {
                 output = self.consensus_output_stream.next(), if !consensus_closed && self.queued.len() < MAX_QUEUED_OUTPUTS => {
                     output
                         .map(|output| {
-                            // queue the output for local execution
-                            self.queued.push_back(output);
+                            // queue the output for local execution, stamped for the queue-wait
+                            // histogram
+                            self.queued.push_back((Instant::now(), output));
                             // backlog growth means execution is falling behind consensus
                             ENGINE_METRICS.queued_outputs.set(self.queued.len() as f64);
                         })
@@ -320,5 +338,80 @@ impl std::fmt::Debug for ExecutorEngine {
             .field("max_round", &self.max_round)
             .field("parent_header", &self.parent_header)
             .finish_non_exhaustive()
+    }
+}
+
+/// Pop the oldest queued consensus output and return it with the time it spent in the queue.
+///
+/// FIFO exactly like the plain `pop_front` it wraps; `now` is the dispatch instant the wait is
+/// measured to. A stamp later than `now` (impossible with a monotonic clock) reads as zero.
+fn take_next_queued(
+    queued: &mut VecDeque<(Instant, ConsensusOutput)>,
+    now: Instant,
+) -> Option<(ConsensusOutput, Duration)> {
+    queued.pop_front().map(|(queued_at, output)| (output, now.saturating_duration_since(queued_at)))
+}
+
+/// Whole milliseconds in `elapsed`, saturating at `u64::MAX`, for log fields and the busy-time
+/// counter.
+pub(crate) fn duration_ms(elapsed: Duration) -> u64 {
+    u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a distinguishable output: only the consensus number matters to the queue.
+    fn output(number: u64) -> ConsensusOutput {
+        ConsensusOutput::new_with_subdag(Default::default(), Default::default(), number)
+    }
+
+    /// The stamped queue pops in arrival order and reports each output's wait up to the
+    /// dispatch instant.
+    #[test]
+    fn test_take_next_queued_is_fifo_and_measures_queue_wait() {
+        let base = Instant::now();
+        let at = |ms: u64| base + Duration::from_millis(ms);
+        let mut queued = VecDeque::new();
+        queued.push_back((at(0), output(1)));
+        queued.push_back((at(10), output(2)));
+        queued.push_back((at(30), output(3)));
+
+        let now = at(50);
+        let popped: Vec<(u64, Duration)> =
+            std::iter::from_fn(|| take_next_queued(&mut queued, now))
+                .map(|(output, wait)| (output.number(), wait))
+                .collect();
+
+        assert_eq!(
+            popped,
+            vec![
+                (1, Duration::from_millis(50)),
+                (2, Duration::from_millis(40)),
+                (3, Duration::from_millis(20)),
+            ]
+        );
+        assert!(queued.is_empty());
+        assert!(take_next_queued(&mut queued, now).is_none());
+    }
+
+    /// A stamp after the dispatch instant saturates to a zero wait instead of panicking.
+    #[test]
+    fn test_take_next_queued_saturates_future_stamp() {
+        let base = Instant::now();
+        let mut queued = VecDeque::new();
+        queued.push_back((base + Duration::from_millis(5), output(7)));
+
+        let (output, wait) = take_next_queued(&mut queued, base).expect("one queued output");
+        assert_eq!(output.number(), 7);
+        assert_eq!(wait, Duration::ZERO);
+    }
+
+    /// Millisecond conversion truncates sub-millisecond remainders.
+    #[test]
+    fn test_duration_ms_truncates() {
+        assert_eq!(duration_ms(Duration::from_micros(1_999)), 1);
+        assert_eq!(duration_ms(Duration::ZERO), 0);
     }
 }

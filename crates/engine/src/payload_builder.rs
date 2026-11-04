@@ -2,7 +2,11 @@
 //!
 //! This approach heavily inspired by reth's `default_ethereum_payload_builder`.
 
-use crate::error::{EngineResult, TnEngineError};
+use crate::{
+    duration_ms,
+    error::{EngineResult, TnEngineError},
+};
+use std::time::Instant;
 use tn_reth::{
     error::TnRethError,
     payload::{BuildArguments, TNPayload},
@@ -22,12 +26,19 @@ use tracing::{debug, error, field, info, info_span, warn};
 /// If the output contains no batches and the epoch is not closing, execution is skipped
 /// entirely and the current canonical header is returned unchanged. The leader count is
 /// still incremented for rewards tracking.
+///
+/// Every output that produces blocks ends with one `output executed` debug line (target
+/// `engine`) splitting its wall time into `execute_ms` (entry to the end of the block loop),
+/// `persist_ms` (the bounded durable persist, retries included) and `announce_ms` (the
+/// post-commit announce plus the in-memory finalize). The skipped empty path does not log it.
 pub fn execute_consensus_output(
     args: BuildArguments,
     gas_accumulator: GasAccumulator,
     repack_monitor: RepackMonitor,
     engine_update_tx: mpsc::Sender<EngineUpdate>,
 ) -> EngineResult<SealedHeader> {
+    // observability only: start of the `execute_ms` span in the `output executed` line
+    let execute_start = Instant::now();
     // rename canonical header for clarity
     let BuildArguments { reth_env, output, parent_header } = args;
     // Last canonical header executed.
@@ -48,6 +59,7 @@ pub fn execute_consensus_output(
     let leader_round = output.leader_round();
     let consensus_num_hash = output.num_hash();
     let batches = output.flatten_batches();
+    let batch_count = batches.len();
 
     let span = info_span!(target: "telcoin", "execute-consensus", epoch,
         consensus_number = output.number(),
@@ -290,6 +302,8 @@ pub fn execute_consensus_output(
     } // end block execution for round
 
     span.record("executed_blocks", executed_blocks.len().to_string());
+    let execute_elapsed = execute_start.elapsed();
+    let block_count = executed_blocks.len();
 
     // Durably commit the output, then announce it. The two halves are called separately
     // (rather than through `finish_executing_output`) because their failure contracts
@@ -299,7 +313,11 @@ pub fn execute_consensus_output(
     // error is post-commit: the blocks are canonical for real and must NOT be rolled back. The
     // reward accounting stays in place on every path; see the note at the top of this
     // function.
-    persist_output_with_retry(&reth_env, &executed_blocks).inspect_err(|e| {
+    let persist_start = Instant::now();
+    let persisted = persist_output_with_retry(&reth_env, &executed_blocks);
+    let persist_elapsed = persist_start.elapsed();
+    crate::metrics::ENGINE_METRICS.persist_duration_seconds.record(persist_elapsed);
+    persisted.inspect_err(|e| {
         error!(
             target: "engine",
             ?e,
@@ -309,6 +327,7 @@ pub fn execute_consensus_output(
         crate::metrics::ENGINE_METRICS.persist_failures_total.increment(1);
         rollback_in_memory_output(&canonical_in_memory_state, &anchor_header, &executed_blocks)
     })?;
+    let announce_start = Instant::now();
     reth_env.announce_executed_output(
         executed_blocks,
         Some((leader_round, consensus_num_hash, engine_update_tx)),
@@ -316,6 +335,19 @@ pub fn execute_consensus_output(
     // update the in-memory finalized/safe watches and prune persisted blocks from memory
     // (the database markers committed atomically with the blocks above)
     reth_env.finalize_block(canonical_header.clone())?;
+    let announce_elapsed = announce_start.elapsed();
+
+    debug!(
+        target: "engine",
+        consensus_number = output.number(),
+        leader_round,
+        blocks = block_count,
+        batches = batch_count,
+        execute_ms = duration_ms(execute_elapsed),
+        persist_ms = duration_ms(persist_elapsed),
+        announce_ms = duration_ms(announce_elapsed),
+        "output executed"
+    );
 
     // return new canonical header for next engine task
     Ok(canonical_header)
