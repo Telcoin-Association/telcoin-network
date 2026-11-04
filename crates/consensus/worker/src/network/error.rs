@@ -1,6 +1,6 @@
 //! Worker's network-related errors.
 use tn_network_libp2p::{error::NetworkError, Penalty};
-use tn_types::{BatchValidationError, BcsError, BlockHash, Epoch};
+use tn_types::{BatchValidationError, BcsError, BlockHash, Epoch, B256};
 use tokio::time::error::Elapsed;
 
 /// Result alias for results that possibly return [`WorkerNetworkError`].
@@ -71,6 +71,11 @@ pub enum WorkerNetworkError {
     /// Invalid batch epoch.
     #[error("Got batch from epoch {0} expected {1}")]
     BatchEpochMismatch(Epoch, Epoch),
+    /// A peer reported a batch whose digest already failed validation in this epoch.
+    ///
+    /// The worker refuses the repeat without validating it again (issue #1774).
+    #[error("batch {0} was already rejected in this epoch")]
+    RejectedBatchRepeat(B256),
 }
 
 impl WorkerNetworkError {
@@ -124,7 +129,8 @@ impl WorkerNetworkError {
             | WorkerNetworkError::TooManyBatches { .. }
             | WorkerNetworkError::UnexpectedBatch(_)
             | WorkerNetworkError::DuplicateBatch(_)
-            | WorkerNetworkError::RequestHashMismatch => Some(Penalty::Fatal),
+            | WorkerNetworkError::RequestHashMismatch
+            | WorkerNetworkError::RejectedBatchRepeat(_) => Some(Penalty::Fatal),
             // ignore
             WorkerNetworkError::Timeout(_)
             | WorkerNetworkError::DBInsert(_)
@@ -150,7 +156,9 @@ impl WorkerNetworkError {
     /// [`Penalty::Fatal`] (faults in a message's encoding, declared topic, identity, or
     /// count). [`Self::BatchValidation`] is also `Fatal` for some subvariants but is
     /// deliberately excluded: it arises only on the request/response path, where the
-    /// peer *is* the originator and penalizing it is correct. Of this set, only
+    /// peer *is* the originator and penalizing it is correct. [`Self::RejectedBatchRepeat`]
+    /// is also `Fatal` and is excluded for the same reason: it arises only on the request
+    /// path, which charges the peer that sent the repeat, not the batch author. Of this set, only
     /// [`Self::Bcs`] and [`Self::InvalidTopic`] are currently reachable from the gossip
     /// handler; the rest are classified for forward-safety.
     pub fn is_author_content_fault(&self) -> bool {
@@ -168,9 +176,12 @@ impl WorkerNetworkError {
             // Not author-content faults on any current path. `BatchValidation` is
             // content-determined, but only arises on the request/response path (where
             // the peer is the originator, so its own penalty is correct) and never
-            // reaches the gossip handler; the rest are transport-peer behavior,
-            // timeouts, or faults local to this node.
+            // reaches the gossip handler. `RejectedBatchRepeat` also arises only on the
+            // request path: the sender of the repeat is charged, not the batch author, who
+            // can be a different peer. The rest are transport-peer behavior, timeouts, or
+            // faults local to this node.
             WorkerNetworkError::BatchValidation(_)
+            | WorkerNetworkError::RejectedBatchRepeat(_)
             | WorkerNetworkError::NonCommitteeBatch
             | WorkerNetworkError::Internal(_)
             | WorkerNetworkError::Timeout(_)

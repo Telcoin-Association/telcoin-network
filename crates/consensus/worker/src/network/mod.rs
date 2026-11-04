@@ -75,7 +75,8 @@ pub const MAX_BATCH_DIGESTS_PER_REQUEST: usize = 500;
 ///
 /// A peer holds one slot per sync stream through both admission phases (the
 /// opening read and the batch serve), so no single peer can fill either pool
-/// and starve its peers.
+/// and starve its peers. The same cap bounds the batch reports that one peer
+/// has in validation at a time (see `WorkerNetwork::process_report_batch`).
 pub const MAX_PENDING_REQUESTS_PER_PEER: usize = 2;
 
 /// Maximum number of concurrent gossip-triggered batch prefetches.
@@ -176,6 +177,7 @@ impl SyncServeOutcome {
             | WorkerNetworkError::Bcs(_)
             | WorkerNetworkError::BatchValidation(_)
             | WorkerNetworkError::NonCommitteeBatch
+            | WorkerNetworkError::RejectedBatchRepeat(_)
             | WorkerNetworkError::Internal(_)
             | WorkerNetworkError::Network(_)
             | WorkerNetworkError::InvalidRequest(_)
@@ -552,6 +554,34 @@ fn admit_shed_and_record(
     permit
 }
 
+/// Resolve the shed counter for batch reports that `worker_id` drops at the per-peer cap.
+///
+/// The series is `tn_worker.batch_reports_shed_total` with reason `peer_cap`. It is resolved
+/// once, so a shed adds to it without a registry lookup.
+fn report_shed_counter(worker_id: WorkerId) -> metrics::Counter {
+    metrics::counter!(
+        "tn_worker.batch_reports_shed_total",
+        "worker" => worker_id.to_string(),
+        "reason" => "peer_cap",
+    )
+}
+
+/// Try to admit one inbound batch report from `peer` under the per-peer report cap.
+///
+/// Takes a slot from `slots`, which caps each peer at [`MAX_PENDING_REQUESTS_PER_PEER`]
+/// reports in validation. A refusal adds one to `shed` at the decision, in the style of
+/// [`admit_shed_and_record`]. The returned slot frees its count on drop.
+fn admit_report_and_record(
+    slots: &PeerSlots,
+    shed: &metrics::Counter,
+    peer: BlsPublicKey,
+) -> Option<PeerSlot> {
+    slots.try_take(peer).or_else(|| {
+        shed.increment(1);
+        None
+    })
+}
+
 /// Shed a denied inbound sync stream on a budgeted task.
 ///
 /// Spawns a short-lived task that writes [`DenyReason::AtCapacity`] and closes,
@@ -676,6 +706,19 @@ pub struct WorkerNetwork<DB, Events> {
     /// A stream holds its slot through both admission phases, so one peer cannot
     /// fill either pool.
     sync_peer_slots: PeerSlots,
+    /// Per-peer in-flight batch report validations, capped at
+    /// [`MAX_PENDING_REQUESTS_PER_PEER`].
+    ///
+    /// A report holds its slot for the life of its validation task. The cap is a per-peer
+    /// slot, not a shared class budget: a shared pool lets k colluding committee keys hold
+    /// 2k permits and starve honest reporters, while a per-peer slot bounds each key at 2
+    /// concurrent validations and other peers cannot exhaust it. The cap applies whatever
+    /// the value of `serve_budget.batch` (#1774).
+    report_peer_slots: PeerSlots,
+    /// The `tn_worker.batch_reports_shed_total` series of this worker, resolved once.
+    ///
+    /// A report refused at [`Self::report_peer_slots`] adds one.
+    report_shed: metrics::Counter,
     /// The committee keys (current and next committee) that admission treats as
     /// [`PeerTier::Committee`]; every other peer is [`PeerTier::Public`].
     reserved_peers: ReservedPeers,
@@ -728,6 +771,8 @@ where
                 COMMITTEE_RESERVED_BATCH_STREAMS,
             ),
             sync_peer_slots: PeerSlots::new(MAX_PENDING_REQUESTS_PER_PEER),
+            report_peer_slots: PeerSlots::new(MAX_PENDING_REQUESTS_PER_PEER),
+            report_shed: report_shed_counter(id),
             reserved_peers,
             shed_task_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_SHED_TASKS)),
             metrics: WorkerMetrics::new_for_worker(id),
@@ -788,6 +833,16 @@ where
     /// Process a new reported batch.
     ///
     /// Spawn a task to evaluate a peer's proposed header and return a response.
+    ///
+    /// Each report costs a full batch validation, so admission runs before the spawn, and
+    /// the cheaper check runs first. A per-peer slot in [`Self::report_peer_slots`] bounds
+    /// each key at [`MAX_PENDING_REQUESTS_PER_PEER`] concurrent validations, whatever the
+    /// value of `serve_budget.batch`. The cap is a per-peer slot, not a shared class budget:
+    /// a shared pool lets k colluding committee keys hold 2k permits and starve honest
+    /// reporters, while a per-peer slot cannot be exhausted by other peers. The batch serve
+    /// permit is then offered as before (see [`Self::serve_report_batch`]). A report refused
+    /// at either check gets no reply, so the quorum waiter of the reporter retries after its
+    /// backoff (#1774).
     fn process_report_batch(
         &self,
         peer: BlsPublicKey,
@@ -795,11 +850,38 @@ where
         channel: ResponseChannel<WorkerResponse>,
         cancel: oneshot::Receiver<()>,
     ) {
+        // Per-peer cap: admit the report before any other work for it. The shed is counted at
+        // the decision under `tn_worker.batch_reports_shed_total`. A shed drops the response
+        // channel and the cancel receiver with no reply, so the reporter retries after its
+        // backoff.
+        let digest = sealed_batch.digest();
+        admit_report_and_record(&self.report_peer_slots, &self.report_shed, peer).map_or_else(
+            || {
+                debug!(target: "worker::network", %peer, %digest, "dropping batch report: peer at its report cap");
+            },
+            |report_slot| self.serve_report_batch(peer, sealed_batch, channel, cancel, report_slot),
+        )
+    }
+
+    /// Offer an admitted batch report to the batch serve class and spawn its validation.
+    ///
+    /// `report_slot` is the per-peer slot that [`Self::process_report_batch`] took. It moves
+    /// into the spawned task with the serve permit, so every exit of the task frees both. A
+    /// refused offer drops the slot here.
+    fn serve_report_batch(
+        &self,
+        peer: BlsPublicKey,
+        sealed_batch: SealedBatch,
+        channel: ResponseChannel<WorkerResponse>,
+        cancel: oneshot::Receiver<()>,
+        report_slot: PeerSlot,
+    ) {
         // Serve budget: offer the request to the batch class before any work for it. `None`
         // means the class has no free permit; the shed is already counted under `serve_budget`.
         // Dropping the response channel and the cancel receiver sends no reply, so the swarm
         // also counts the request as an `omitted` failure. The default budget is unbounded, so
-        // this only observes until an operator sets `serve_budget.batch`.
+        // the class only observes until an operator sets `serve_budget.batch`. The per-peer cap
+        // in `process_report_batch` bounds reports regardless of `serve_budget.batch`.
         if let Some(serve_permit) = self
             .network_handle
             .inner_handle()
@@ -811,7 +893,9 @@ where
             let network_handle = self.network_handle.clone();
             let task_name = format!("process-report-batch-{}", sealed_batch.digest());
             self.network_handle.get_task_spawner().spawn_task(task_name, async move {
-                // hold the serve permit for the task's lifetime, so every exit releases it
+                // hold the per-peer report slot and the serve permit for the task's lifetime,
+                // so every exit releases both
+                let _report_slot = report_slot;
                 let _serve_permit = serve_permit;
                 tokio::select! {
                     res = request_handler.process_report_batch(&peer, sealed_batch) => {
@@ -1002,6 +1086,57 @@ mod tests {
         drop(admissions);
         assert_eq!(opening.available_public(), MAX_CONCURRENT_OPENING_READS);
         assert_eq!(slots.in_flight(&p), 0);
+    }
+
+    /// Report admission up to the per-peer cap succeeds; the next report from the same peer
+    /// sheds and counts once, a second peer is unaffected, and dropping a slot frees it for
+    /// the next report. The slots are built as `WorkerNetwork::new` builds the report cap.
+    #[test]
+    fn report_admit_enforces_per_peer_cap_and_frees_on_drop() {
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        metrics::with_local_recorder(&recorder, || {
+            let (p, other) = (key(1), key(2));
+            let slots = PeerSlots::new(MAX_PENDING_REQUESTS_PER_PEER);
+            let shed = report_shed_counter(0);
+
+            // admit up to the per-peer cap
+            let held: Vec<_> = (0..MAX_PENDING_REQUESTS_PER_PEER)
+                .map(|_| {
+                    admit_report_and_record(&slots, &shed, p).expect("admit below the per-peer cap")
+                })
+                .collect();
+            assert_eq!(slots.in_flight(&p), MAX_PENDING_REQUESTS_PER_PEER);
+
+            // at the cap: the next report from the same peer sheds and holds no slot
+            assert!(admit_report_and_record(&slots, &shed, p).is_none());
+            assert_eq!(slots.in_flight(&p), MAX_PENDING_REQUESTS_PER_PEER);
+
+            // a second peer is unaffected by the full slots of the first
+            let other_slot =
+                admit_report_and_record(&slots, &shed, other).expect("second peer admitted");
+            assert_eq!(slots.in_flight(&other), 1);
+
+            // dropping one guard frees one slot, and the next report from the peer is admitted
+            let rest: Vec<_> = held.into_iter().skip(1).collect();
+            assert_eq!(slots.in_flight(&p), MAX_PENDING_REQUESTS_PER_PEER.saturating_sub(1));
+            let reclaimed =
+                admit_report_and_record(&slots, &shed, p).expect("freed slot admits a report");
+            assert_eq!(slots.in_flight(&p), MAX_PENDING_REQUESTS_PER_PEER);
+
+            // dropping every guard frees every slot
+            drop((rest, reclaimed, other_slot));
+            assert_eq!(slots.in_flight(&p), 0);
+            assert_eq!(slots.in_flight(&other), 0);
+        });
+
+        // only the refusal at the cap counts as a shed
+        let snapshot = snapshotter.snapshot().into_vec();
+        let shed_total = snapshot
+            .iter()
+            .find(|(k, ..)| k.key().name() == "tn_worker.batch_reports_shed_total")
+            .map(|(_, _, _, value)| value);
+        assert!(matches!(shed_total, Some(DebugValue::Counter(1))), "one shed is counted");
     }
 
     // The shed budget admits exactly MAX_CONCURRENT_SHED_TASKS concurrent shed
