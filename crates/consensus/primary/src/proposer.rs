@@ -845,7 +845,24 @@ impl<DB: Database> Proposer<DB> {
         match possible_header_to_repropose {
             // resend header
             Some(header) => {
-                warn!(target: "primary::proposer", authority=?self.authority_id, current_round, current_epoch, header=?header, "reproposing header");
+                let app = self.consensus_bus.app();
+                warn!(
+                    target: "primary::proposer",
+                    authority=?self.authority_id,
+                    current_round,
+                    current_epoch,
+                    header_round = header.round(),
+                    // the round watch before this proposal advanced it to the header round
+                    primary_round = updated_round.saturating_sub(1),
+                    committed_round = app.committed_round(),
+                    newest_round = app
+                        .last_consensus_header()
+                        .borrow()
+                        .as_ref()
+                        .map_or(0, |newest| newest.sub_dag.leader_round()),
+                    header=?header,
+                    "reproposing header"
+                );
                 // clear parents if reproposing after restart
                 self.last_parents.clear();
 

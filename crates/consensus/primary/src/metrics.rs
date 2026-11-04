@@ -101,6 +101,16 @@ impl PrimaryMetrics {
         let prev = MAX_CONSENSUS_OUTPUT_BYTES.fetch_max(bytes, Ordering::Relaxed);
         self.max_consensus_output_bytes.set(prev.max(bytes) as f64);
     }
+
+    /// Count a catching-up CVV's promotion back to an active CVV in
+    /// `tn_node_mode_transitions_total{to="cvv_active", reason="rejoin"}`.
+    ///
+    /// `previous` is the mode the watch held before the promotion, the value `send_replace`
+    /// returns. The promotion happens in the executor's subscriber, outside this crate, so this
+    /// method is its route to [`record_mode_transition`].
+    pub fn record_rejoin_transition(&self, previous: NodeMode) {
+        record_mode_transition(previous, NodeMode::CvvActive, ModeTransitionReason::Rejoin);
+    }
 }
 
 /// A stage of the voter's vote path, in the order `RequestHandler::vote_inner` runs them.
@@ -239,6 +249,59 @@ impl VoteStageHandles {
     }
 }
 
+/// Why this node changed its mode: the `reason` label of `tn_node_mode_transitions_total`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ModeTransitionReason {
+    /// An active CVV saw a certificate or consensus result, in the epoch it has executed, more
+    /// than the gc activity window of rounds ahead of the round it has executed.
+    OutsideGcWindow,
+    /// An active CVV saw a certificate or consensus result from an epoch ahead of the one it has
+    /// executed.
+    EpochBehind,
+    /// Bullshark committed a sub-dag whose leader references an execution block this node could
+    /// not wait for.
+    BogusSubdag,
+    /// The committed round disagreed with the highest header round just sequenced.
+    CommitAccounting,
+    /// A catching-up CVV came within the rejoin window of the network head.
+    Rejoin,
+}
+
+impl ModeTransitionReason {
+    /// The static metric label for this reason.
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::OutsideGcWindow => "outside_gc_window",
+            Self::EpochBehind => "epoch_behind",
+            Self::BogusSubdag => "bogus_subdag",
+            Self::CommitAccounting => "commit_accounting",
+            Self::Rejoin => "rejoin",
+        }
+    }
+}
+
+/// Count a node mode change in `tn_node_mode_transitions_total{to, reason}`.
+///
+/// `previous` is the mode the watch held before the change, the value `send_replace` returns. A
+/// change to the mode the node already holds is not counted, so two tasks that decide on the same
+/// demotion at once count it once. Mode changes are rare, so the handle is resolved per call.
+pub(crate) fn record_mode_transition(
+    previous: NodeMode,
+    to: NodeMode,
+    reason: ModeTransitionReason,
+) {
+    // `NodeMode` has no `PartialEq`; its variants carry no data, so the discriminant is the mode
+    if std::mem::discriminant(&previous) == std::mem::discriminant(&to) {
+        return;
+    }
+    metrics::counter!(
+        "tn_node.mode_transitions_total",
+        "to" => node_mode_label(to),
+        "reason" => reason.as_str(),
+    )
+    .increment(1);
+}
+
 /// Spawn a node-lifetime task that mirrors consensus watch channels into gauges.
 ///
 /// The watch senders are mutated from several crates via `send_replace`/`send_modify`;
@@ -335,6 +398,16 @@ fn set_node_mode_gauges(mode: &NodeMode) {
     ];
     for (label, active) in states {
         metrics::gauge!("tn_node.mode", "mode" => label).set(if active { 1.0 } else { 0.0 });
+    }
+}
+
+/// The `to` label of `tn_node_mode_transitions_total`, spelled as the `tn_node_mode` gauge's
+/// `mode` label.
+const fn node_mode_label(mode: NodeMode) -> &'static str {
+    match mode {
+        NodeMode::CvvActive => "cvv_active",
+        NodeMode::CvvInactive => "cvv_inactive",
+        NodeMode::Observer => "observer",
     }
 }
 
@@ -461,6 +534,64 @@ mod tests {
             panic!("lock stage series is not a histogram");
         };
         assert_eq!(lock.iter().map(|s| s.0).collect::<Vec<_>>(), vec![0.004]);
+    }
+
+    /// Every mode change counts once under its `to` and `reason` labels, and a change to the mode
+    /// the node already holds is not counted.
+    #[test]
+    fn test_mode_transitions_register_labelled_series() {
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+
+        metrics::with_local_recorder(&recorder, || {
+            let metrics = PrimaryMetrics::new_with_labels(Vec::<metrics::Label>::new());
+            let demote =
+                |reason| record_mode_transition(NodeMode::CvvActive, NodeMode::CvvInactive, reason);
+            demote(ModeTransitionReason::OutsideGcWindow);
+            demote(ModeTransitionReason::OutsideGcWindow);
+            demote(ModeTransitionReason::EpochBehind);
+            demote(ModeTransitionReason::BogusSubdag);
+            demote(ModeTransitionReason::CommitAccounting);
+            // a second demotion racing the first finds the node inactive already
+            record_mode_transition(
+                NodeMode::CvvInactive,
+                NodeMode::CvvInactive,
+                ModeTransitionReason::CommitAccounting,
+            );
+            metrics.record_rejoin_transition(NodeMode::CvvInactive);
+            metrics.record_rejoin_transition(NodeMode::CvvActive);
+        });
+
+        let snapshot = snapshotter.snapshot().into_vec();
+        let mut series: Vec<(String, String, DebugValue)> = snapshot
+            .into_iter()
+            .filter(|(key, ..)| key.key().name() == "tn_node.mode_transitions_total")
+            .map(|(key, _, _, value)| {
+                let label = |name: &str| {
+                    key.key()
+                        .labels()
+                        .find(|label| label.key() == name)
+                        .map(|label| label.value().to_string())
+                        .unwrap_or_else(|| panic!("missing {name} label"))
+                };
+                assert_eq!(key.key().labels().count(), 2, "only the to and reason labels");
+                (label("to"), label("reason"), value)
+            })
+            .collect();
+        series.sort_by(|a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)));
+        let expected = [
+            ("cvv_active", "rejoin", 1),
+            ("cvv_inactive", "bogus_subdag", 1),
+            ("cvv_inactive", "commit_accounting", 1),
+            ("cvv_inactive", "epoch_behind", 1),
+            ("cvv_inactive", "outside_gc_window", 2),
+        ]
+        .map(|(to, reason, count)| {
+            (to.to_string(), reason.to_string(), DebugValue::Counter(count))
+        });
+        assert_eq!(series, expected);
+
+        assert_eq!(node_mode_label(NodeMode::Observer), "observer");
     }
 
     /// The mirror task must keep the round gauges in sync with the watch channels, and

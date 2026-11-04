@@ -3,7 +3,7 @@
 use super::{PrimaryResponse, SyncServeOutcome};
 use crate::{
     error::{CertManagerError, PrimaryNetworkError, PrimaryNetworkResult},
-    metrics::{VoteStage, VoteStageHandles},
+    metrics::{record_mode_transition, ModeTransitionReason, VoteStage, VoteStageHandles},
     network::message::{PrimaryGossip, PrimaryRPCError},
     state_sync::{CertificateCollector, StateSynchronizer},
     ConsensusBusApp, NodeMode,
@@ -236,6 +236,13 @@ where
         if outside_gc_window || epoch_behind {
             // We seem to be too far behind to be an active CVV, try to go
             // inactive to catch up.
+            // the two tests exclude each other: the gc window test needs the executed epoch and
+            // the epoch test a later one
+            let reason = if outside_gc_window {
+                ModeTransitionReason::OutsideGcWindow
+            } else {
+                ModeTransitionReason::EpochBehind
+            };
             warn!(
                 target: "primary",
                 epoch,
@@ -245,10 +252,14 @@ where
                 exec_round,
                 processed_consensus_round,
                 committed_round,
+                round,
                 effective_exec_round,
+                gc_window = gc_depth,
+                reason = reason.as_str(),
                 "we are behind, go to catchup mode!"
             );
-            self.consensus_bus.node_mode().send_replace(NodeMode::CvvInactive);
+            let previous = self.consensus_bus.node_mode().send_replace(NodeMode::CvvInactive);
+            record_mode_transition(previous, NodeMode::CvvInactive, reason);
             self.consensus_config.shutdown().notify();
             true
         } else {
