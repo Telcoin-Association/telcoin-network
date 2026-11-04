@@ -73,11 +73,11 @@ fn create_and_reopen_at_every_page_size() {
         let (_dir, path) = temp();
         let env = Env::open(&path, options(p, SyncMode::Durable)).expect("create");
         let geometry = Geometry::new(p).expect("geometry");
-        // A short key takes a value up to 16 MiB (in an overflow run); a key too long for an
-        // overflow cell takes its leaf's limit.
+        // A short key and the longest take a value up to 16 MiB (in an overflow run): every key
+        // within the limit has room for an overflow cell.
         assert_eq!((env.max_key_len(), env.max_value_len(8)), (geometry.max_key(), 16 << 20));
         let longest = env.max_key_len();
-        assert_eq!(env.max_value_len(longest), geometry.max_value(longest));
+        assert_eq!(env.max_value_len(longest), 16 << 20);
         // A key over the limit has no value limit: it is refused even with an empty value.
         assert_eq!(env.max_value_len(env.max_key_len() + 1), 0);
         assert!(env.max_value_len(env.max_key_len()) > 0);
@@ -439,6 +439,25 @@ fn a_version_3_file_is_refused_at_open() {
         file.write_all_at(&record, slot * 4096).expect("write");
     }
     assert_fails_closed(&path, |e| matches!(e, Error::UnsupportedVersion(3)));
+}
+
+/// A version-4 file (leaves holding inline values only to `U / 4`, every larger one in an
+/// overflow run) is refused at open as `UnsupportedVersion(4)`, never read as damage at a later
+/// write, and left as it was.
+#[test]
+fn a_version_4_file_is_refused_at_open() {
+    let (_dir, path) = temp();
+    put_all(&open(&path), "a", &[(b"k", &[7; 1500])]);
+    let file = fs::OpenOptions::new().read(true).write(true).open(&path).expect("open");
+    for slot in [0_u64, 1] {
+        let mut record = [0; META_LEN];
+        file.read_exact_at(&mut record, slot * 4096).expect("read");
+        record[8..12].copy_from_slice(&4_u32.to_le_bytes());
+        let crc = crc::crc32(&record[..124]);
+        record[124..].copy_from_slice(&crc.to_le_bytes());
+        file.write_all_at(&record, slot * 4096).expect("write");
+    }
+    assert_fails_closed(&path, |e| matches!(e, Error::UnsupportedVersion(4)));
 }
 
 /// A file shorter than its meta's page count, or one that is not a tndb-b file, fails closed

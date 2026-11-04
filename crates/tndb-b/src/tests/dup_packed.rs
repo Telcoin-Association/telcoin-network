@@ -24,11 +24,12 @@ use crate::{
 };
 
 /// `create_dup_table` resolves `packed_max` at the file's page size before it records it: 0, 7 and
-/// the longest inline value of the outer key are kept, [`DupOptions::PACKED_DEFAULT`] becomes that
-/// longest value (as [`DupOptions::resolved`] says), and 1..=6 or one past the longest value is
-/// `InvalidDupOptions`, creating nothing and with no latch. Asking again for the default or for
-/// its number gives the same handle and changes nothing; another number is `TableKind`. The table
-/// stat, in the creating transaction, after its commit and after a reopen, reports the number.
+/// the outer key's quarter-page bound ([`page::Geometry::max_entry_value`]) are kept,
+/// [`DupOptions::PACKED_DEFAULT`] becomes that bound (as [`DupOptions::resolved`] says), and
+/// 1..=6 or one past the bound is `InvalidDupOptions`, creating nothing and with no latch. Asking
+/// again for the default or for its number gives the same handle and changes nothing; another
+/// number is `TableKind`. The table stat, in the creating transaction, after its commit and after a
+/// reopen, reports the number.
 #[test]
 fn packed_dup_options_resolve() {
     const K: u16 = 20;
@@ -37,7 +38,7 @@ fn packed_dup_options_resolve() {
         let (_dir, path) = temp("tndb_b_dup_packed_options");
         let env_options = EnvOptions { page_size, ..EnvOptions::default() };
         let env = Env::open(&path, env_options).expect("open");
-        let most = env.inner().geometry.max_value(usize::from(K));
+        let most = env.inner().geometry.max_entry_value(usize::from(K));
         let most = u16::try_from(most).expect("a u16 limit");
         assert_eq!(most, if page_size == 4096 { 987 } else { 4059 }, "{page_size}");
         let resolved = shape(most);
@@ -87,6 +88,68 @@ fn packed_dup_options_resolve() {
         assert_eq!(ro.table_stat(&d).expect("stat").dup, Some(resolved), "after a reopen");
         assert_eq!(check(&env).tables["d"].entries, 0);
     }
+}
+
+/// A dup table's default `packed_max` keeps the quarter-page bound
+/// [`page::Geometry::max_entry_value`]`(key_len)` (987 bytes at `key_len` 20 and 4 KiB pages,
+/// 4059 at 16 KiB), below the leaf limit [`page::Geometry::max_value`] that inline values take,
+/// and the range a table may set ends there: one byte more is `InvalidDupOptions` for the options
+/// and `Corrupt` in a record, at every page size. At the default, a one-row set of exactly that
+/// many bytes stays packed and one byte more promotes, in the writing transaction, after its
+/// commit and after a reopen.
+#[test]
+fn the_default_packed_max_keeps_the_quarter_page_bound() {
+    for page_size in crate::meta::PAGE_SIZES {
+        let g = page::Geometry::new(page_size).expect("geometry");
+        for key_len in [1, K, 20, g.max_dup_key_len() as u16] {
+            let most = g.max_entry_value(usize::from(key_len));
+            assert!(most < g.max_value(usize::from(key_len)), "{page_size} {key_len}");
+            let shape = |packed_max: usize| DupOptions {
+                key_len,
+                packed_max: u16::try_from(packed_max).expect("a u16"),
+            };
+            let default = DupOptions::packed(key_len).resolved(page_size).expect("the default");
+            assert_eq!(default, shape(most), "{page_size} {key_len}");
+            assert_eq!(shape(most).resolved(page_size).expect("at the bound"), shape(most));
+            let what = format!("packed_max {} outside 7..={most} for", most + 1);
+            let past = shape(most + 1).resolved(page_size);
+            assert!(
+                matches!(&past, Err(Error::InvalidDupOptions(m)) if m.contains(&what)),
+                "{page_size} {key_len}: {past:?}"
+            );
+            let record = catalog::TableRecord::new_dup(7, 3, shape(most + 1));
+            assert!(
+                matches!(record.usable(&g), Err(Error::Corrupt(m)) if m.contains(&what)),
+                "{page_size} {key_len}: a record past the bound"
+            );
+            let record = catalog::TableRecord::new_dup(7, 3, shape(most));
+            assert_eq!(record.usable(&g).expect("usable"), &record, "{page_size} {key_len}");
+        }
+    }
+    let resolved = |page_size| DupOptions::packed(20).resolved(page_size).expect("the default");
+    assert_eq!([4096, 16384].map(|p| resolved(p).packed_max), [987, 4059]);
+
+    let (_dir, path) = temp("tndb_b_dup_packed_default");
+    let env_options = EnvOptions { page_size: 4096, ..EnvOptions::default() };
+    let env = Env::open(&path, env_options).expect("open");
+    let p = env.inner().geometry.max_entry_value(usize::from(K));
+    let mut txn = env.begin_rw().expect("rw");
+    let t = txn.create_dup_table("d", DupOptions::packed(K)).expect("create");
+    let mut model = Model::new();
+    // One row of 2 + 4 + 1 + (p - 7) == p bytes, then one byte more.
+    put(&mut txn, &t, &mut model, lkey(1, &[1]), val(p - 7, 1));
+    assert_rows(&txn, &t, &model, 0, "a set at the bound");
+    put(&mut txn, &t, &mut model, lkey(2, &[1]), val(p - 6, 2));
+    assert_rows(&txn, &t, &model, 1, "a set past the bound");
+    txn.commit().expect("commit");
+    assert_rows(&env.begin_ro().expect("ro"), &t, &model, 1, "committed");
+    check_d(&env, &model);
+    drop(env);
+    let env = Env::open(&path, env_options).expect("reopen");
+    let ro = env.begin_ro().expect("ro");
+    let t = ro.open_table("d").expect("open").expect("d");
+    assert_rows(&ro, &t, &model, 1, "after a reopen");
+    check_d(&env, &model);
 }
 
 /// The outer key width of the tests below.
@@ -169,7 +232,7 @@ fn a_set_at_the_bound_stays_packed_and_one_byte_more_promotes() {
     for small in [true, false] {
         let (_dir, path) = temp("tndb_b_dup_packed_bound");
         let env = Env::open(&path, env_options).expect("open");
-        let most = env.inner().geometry.max_value(usize::from(K));
+        let most = env.inner().geometry.max_entry_value(usize::from(K));
         let p = if small { 64 } else { most };
         let options = DupOptions { key_len: K, packed_max: u16::try_from(p).expect("a u16") };
         let mut txn = env.begin_rw().expect("rw");
@@ -879,7 +942,7 @@ struct SizeShape {
 }
 
 /// How [`packed_sets_file_size_by_bound`] stores a state: a plain table keyed `k ‖ s`, or a dup
-/// table that never packs, packs at half the longest inline value of its outer key, or packs at
+/// table that never packs, packs at half the default bound of its outer key, or packs at
 /// [`DupOptions::PACKED_DEFAULT`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SizeForm {
@@ -994,13 +1057,13 @@ fn measure(shape: &SizeShape, form: SizeForm, rows: &[(Vec<u8>, Vec<u8>)], appen
 
 /// File size by packed-set bound: a state of many small contracts, each an outer key with a few
 /// rows, stored as a composite plain table, a dup table that never packs, and dup tables packing at
-/// half the longest inline value of the outer key and at the default (that value). Three shapes
-/// (PlainStorageState's widths and short values, HashedStorages', StoragesTrie's longer values),
-/// 20,000 contracts of 1 to 20 rows, written by random puts and by ascending appends; then, for the
-/// first shape, 5,000 contracts of a fixed row count at the counts where a bound changes the form.
-/// Prints each state's pages by tree and kind, and the file's; guards, at random order for the
-/// first shape, that the default stays within 1.2x composite and that never packing costs at least
-/// 2.5x.
+/// half the default bound of the outer key and at the default ([`DupOptions::PACKED_DEFAULT`]).
+/// Three shapes (PlainStorageState's widths and short values, HashedStorages', StoragesTrie's
+/// longer values), 20,000 contracts of 1 to 20 rows, written by random puts and by ascending
+/// appends; then, for the first shape, 5,000 contracts of a fixed row count at the counts where a
+/// bound changes the form. Prints each state's pages by tree and kind, and the file's; guards, at
+/// random order for the first shape, that the default stays within 1.2x composite and that never
+/// packing costs at least 2.5x.
 #[test]
 #[ignore = "measurement: run with --release --nocapture"]
 fn packed_sets_file_size_by_bound() {

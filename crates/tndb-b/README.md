@@ -58,7 +58,7 @@ does not depend on `tn-storage` or reth. reth's database API on top of it is a s
   [`engine-bench.md`](../tndb-b-reth/engine-bench.md), predate M2; the adapter's benches passed
   their Linux gate on 2026-10-26, see its README); TN integration behind a feature; and the open
   performance items: the descent of a small random read, dup-table reads, the commit of overflow
-  runs, the one-range `msync` at 16 KiB on macOS, and 1–4 KB values taking a run page at 4 KiB
+  runs, the one-range `msync` at 16 KiB on macOS, and 2–4 KB values taking a run page at 4 KiB
   pages (see [`engine-bench.md`](../tndb-b-reth/engine-bench.md),
   [Step 4](#step-4-one-msync-or-one-fdatasync) and the adapter's README).
 
@@ -144,7 +144,7 @@ Each meta page holds a 128-byte record at offset 0, and the rest of the page is 
 | off | size | field |
 |---|---|---|
 | 0 | 8 | magic `b"tndb-b\0\0"` |
-| 8 | 4 | format version = 4 |
+| 8 | 4 | format version = 5 |
 | 12 | 4 | page size P |
 | 16 | 8 | txn id |
 | 24 | 4 | page count (pages `0..page_count` are allocated) |
@@ -157,13 +157,15 @@ Each meta page holds a 128-byte record at offset 0, and the rest of the page is 
 Decoding (`Meta::decode`) runs its checks in this order:
 
 1. The magic must match, else `NotTndbB`.
-2. The version must be 4, else `UnsupportedVersion`. This runs before the CRC check, because
+2. The version must be 5, else `UnsupportedVersion`. This runs before the CRC check, because
    another version may lay the record out differently. The format is pre-release: a file of
-   version 1, 2 or 3 is refused (`UnsupportedVersion(1)` to `UnsupportedVersion(3)`), with no
+   version 1 to 4 is refused (`UnsupportedVersion(1)` to `UnsupportedVersion(4)`), with no
    migration and never as damage. Version 3 added the nested cell (leaf cell flags 2) and the
    96-byte catalog record. Version 4 changed the tree page's CRC to skip the page's free gap
-   ([Tree pages](#tree-pages-pagers)), so a version-3 page's whole-page CRC would not check. The
-   meta record's layout is unchanged.
+   ([Tree pages](#tree-pages-pagers)), so a version-3 page's whole-page CRC would not check.
+   Version 5 raised the leaf entry limit from `U / 4` to `U / 2` ([Limits](#limits)), so values
+   that version 4 kept in overflow runs are inline: a version-4 overflow cell of such a value
+   would fail `page::validate`'s canonical-length rule. The meta record's layout is unchanged.
 3. The CRC must match, else `Corrupt`.
 4. The remaining fields must be possible, else `Corrupt`: a valid page size, no non-zero reserved
    byte, well-formed tree roots, a `page_count` of at least 2, and a next table id of at least 1.
@@ -281,30 +283,39 @@ run (n·P bytes, n = ceil((28 + len) / P)):
 
 ### Limits
 
-`U = P − 28` (the header plus the trailer), and `MAX_ENTRY = U / 4` (a cell plus its slot). The
-derived limits are `max_key = MAX_ENTRY − 12`, so any key fits a branch cell as a separator, and
-the inline limit `max_value(klen) = MAX_ENTRY − 10 − klen` for `klen <= max_key` (0 for a longer
-key, which is refused with any value). `page::validate` holds every stored page to both: a leaf
-entry within `MAX_ENTRY` can still carry a key up to 2 bytes over `max_key`, so its key is
-checked too.
+`U = P − 28` (the header plus the trailer). An entry is a cell plus its slot, and each page kind
+has its own entry limit (`page::entry_limit`): a leaf entry is at most `U / 2` bytes and a branch
+entry at most `U / 4`. The derived limits are `max_key = U / 4 − 12`, so any key fits a branch
+cell as a separator, and the inline limit `max_value(klen) = U / 2 − 10 − klen` for
+`klen <= max_key` (0 for a longer key, which is refused with any value). `page::validate` holds
+each page's entries to its kind's limit and every key to `max_key`: a leaf entry within `U / 2`
+can carry a key far over `max_key`, so its key is checked too.
 
-**Where a table value goes** (`Geometry::place`): inline when it fits `max_value(klen)`, so every
-inline layout is the one it was before overflow runs; else in an overflow run, when the key leaves
-room for the 12-byte overflow cell in a maximal entry, which every key up to `max_key − 10` bytes
-does. A table therefore takes values up to `MAX_VALUE` = 16 MiB with such a key
-(`Geometry::max_table_value`). A key of `max_key − 9` to `max_key` bytes keeps the inline limit.
-The catalog and the free tree hold inline values only (`Geometry::check_entry`); an overflow or
-nested cell in either is `Corrupt` (`Val::inline`).
+Some inline records keep the quarter-page bound `max_entry_value(klen) = U / 4 − 10 − klen`: the
+catalog's and the free list's records (`Geometry::check_entry`), and a dup table's packed sets
+(`packed_max` at most `max_entry_value(key_len)`) and outer cells (`max_dup_key_len`, the widest
+key whose cell with a 32-byte nested root stays within `U / 4`).
 
-| P | U | MAX_ENTRY | max key | inline value (8-byte key) | inline value (32-byte key) | overflow value (key up to) | a 1-page run holds | a 16 MiB value takes |
-|---|---|---|---|---|---|---|---|---|
-| 4 KiB | 4068 | 1017 | 1005 | 999 | 975 | 16 MiB (995 B) | 4068 B | 4097 pages |
-| 16 KiB | 16356 | 4089 | 4077 | 4071 | 4047 | 16 MiB (4067 B) | 16356 B | 1025 pages |
-| 64 KiB | 65508 | 16377 | 16365 | 16359 | 16335 | 16 MiB (16355 B) | 65508 B | 257 pages |
+**Where a table value goes** (`Geometry::place`): inline when it fits `max_value(klen)`, else in
+an overflow run: every key up to `max_key` leaves room for the 12-byte overflow cell in a maximal
+leaf entry, so a table takes values up to `MAX_VALUE` = 16 MiB with any key it accepts
+(`Geometry::max_table_value`). The catalog and the free tree hold inline values only
+(`Geometry::check_entry`); an overflow or nested cell in either is `Corrupt` (`Val::inline`).
 
-**One split always suffices.** An overflowing page holds at most `U + MAX_ENTRY` bytes. Cutting
-it at the first entry where the left part reaches half leaves both parts within U. An overflow
-cell is an ordinary inline cell of `8 + klen + 12` bytes, so this holds with runs too.
+| P | U | leaf entry (U/2) | branch entry (U/4) | max key | inline value (8-byte key) | inline value (32-byte key) | quarter-page value (32-byte key) | overflow value | a 1-page run holds | a 16 MiB value takes |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 4 KiB | 4068 | 2034 | 1017 | 1005 | 2016 | 1992 | 975 | 16 MiB | 4068 B | 4097 pages |
+| 16 KiB | 16356 | 8178 | 4089 | 4077 | 8160 | 8136 | 4047 | 16 MiB | 16356 B | 1025 pages |
+| 64 KiB | 65508 | 32754 | 16377 | 16365 | 32736 | 32712 | 16335 | 16 MiB | 65508 B | 257 pages |
+
+**One split always suffices.** An overflowing page holds at most `U` bytes plus the pending
+entry. A split cuts it at the first entry where the left part reaches half of the total. A
+branch's entries are at most `U / 4`, so both parts are then within `U`. A leaf's entries reach
+`U / 2`, so that left part may pass `U`, or leave a right part under `U / 4`, merge-due at once:
+then the leaf keeps one entry less (`SplitBuf::plan`), and both leaves end within `U` and at least
+`U / 4` (the proof is in `SplitBuf::split_leaf`'s doc). With every entry at most `U / 4` the cut
+never moves. An overflow cell is an ordinary inline cell of `8 + klen + 12` bytes, so this holds
+with runs too.
 
 **Append splits.** A leaf split usually cuts in the middle. When the overflowing leaf is the
 rightmost of its tree and the change is at its end, the split is an append instead: the leaf keeps
@@ -318,7 +329,7 @@ leaves are the old leaf less one cell and a leaf of one entry, each within U.
 
 Larger entries are refused up front with `KeyTooLarge` or `ValueTooLarge`, before anything
 changes. `Env::max_key_len` and `Env::max_value_len` report the limits; `max_value_len` reports
-the table limit (16 MiB for a key that qualifies).
+the table limit (16 MiB for every key up to `max_key`).
 
 ### Catalog
 
@@ -370,9 +381,9 @@ broken rule:
 A record that decodes is then held to this build's limits at every use (`TableRecord::usable`,
 behind `catalog::get`, the engine's one read of a record, and `Env::check`'s catalog walk): a dup
 record whose `key_len` is past this page size's `max_dup_key_len` (below) is `Corrupt`, and so is
-one whose `packed_max` is neither 0 nor in `7..=max_value(key_len)` ("packed_max {n} outside
-7..={max} for this page size": no build writes one, since a set past that would not be an inline
-entry). A plain record always passes.
+one whose `packed_max` is neither 0 nor in `7..=max_entry_value(key_len)` ("packed_max {n}
+outside 7..={max} for this page size": no build writes one, as `create_dup_table` refuses a larger
+`packed_max`). A plain record always passes.
 
 Table ids are unique over the file's life, so a dropped and re-created table gets a new id.
 
@@ -387,7 +398,7 @@ outer-cell rule, which every read, write, free walk and `Env::check` holds an ou
 - every outer value is a nested cell, or a packed set when `packed_max` is above 0: an inline
   outer cell with `packed_max` 0 is `Corrupt` ("the outer cell of key .. holds no nested tree"),
   and an overflow cell is `Corrupt` in every dup table (a packed set is at most
-  `max_value(key_len)` bytes, so it is always inline);
+  `max_entry_value(key_len)` bytes, so it is always inline);
 - a nested cell is legal in both modes and at any row count (a nested key never demotes);
 - a packed set is held to its codec's checks (below), at the first use of the rows it touches;
 - a nested cell decodes to a non-empty root (an emptied nested tree leaves with its cell);
@@ -432,7 +443,7 @@ first `slen[i]` bytes and its value the rest (possibly empty, always inline). A 
 search over the slot pairs, and `s ‖ v` is contiguous, as a nested leaf's cell is. A set costs 2
 bytes plus 4 per row (a nested leaf spends 10 per row). The smallest set, `PACKED_MIN`, is 7 bytes
 (one row, a 1-byte subkey, an empty value); the largest is the table's `packed_max`, at most
-`max_value(key_len)`, so every offset fits a `u16`.
+`max_entry_value(key_len)`, so every offset fits a `u16`.
 
 The checks, and when each runs:
 
@@ -460,7 +471,7 @@ page validation or copy-on-write (do-not-flag item 25).
   transaction for the pages it freed, or the key of a record it took for the pages it took and
   left unused (see [Free list and page reuse](#free-list-and-page-reuse)).
 - **Value:** page numbers as `u32` LE, strictly ascending. A value holds at most
-  `record_capacity = max_value(12) / 4` page numbers (248 at 4 KiB). Empty values are allowed.
+  `record_capacity = max_entry_value(12) / 4` page numbers (248 at 4 KiB). Empty values are allowed.
 
 ---
 
@@ -626,11 +637,11 @@ re-created table is refused by id, never by a cached kind. A call that needs the
 | `dup_cursor_owned`, `dup_cursor_detached` | `TableKind` | a dup cursor ([Dup cursors](#dup-cursors)) |
 
 **Options and limits.** `create_dup_table` refuses a `key_len` of 0 or past
-`max_dup_key_len = MAX_ENTRY − 42` with `InvalidDupOptions`: the outer cell, the key and a
-32-byte nested root, must be an inline entry (975 bytes at 4 KiB pages, 4047 at 16 KiB, 16335 at
-64 KiB). `packed_max` is 0 (never pack), or 7 (`PACKED_MIN`, the smallest set) to
-`max_value(key_len)`, the longest value an inline entry of the key takes (987 bytes at a 20-byte
-key and 4 KiB pages), or `DupOptions::PACKED_DEFAULT` (`u16::MAX`, never a limit itself), which
+`max_dup_key_len = U / 4 − 42` with `InvalidDupOptions`: the outer cell, the key and a
+32-byte nested root, must fit a quarter-page entry (975 bytes at 4 KiB pages, 4047 at 16 KiB,
+16335 at 64 KiB). `packed_max` is 0 (never pack), or 7 (`PACKED_MIN`, the smallest set) to
+`max_entry_value(key_len)`, the longest value a quarter-page entry of the key takes (987 bytes at
+a 20-byte key and 4 KiB pages), or `DupOptions::PACKED_DEFAULT` (`u16::MAX`, never a limit itself), which
 asks for that most; anything else is `InvalidDupOptions`, with nothing changed and no latch.
 `DupOptions::packed(key_len)` asks for the default. `create_dup_table` records the resolved number
 (`DupOptions::resolved(page_size)` computes it without a file), and `table_stat`'s `dup` reports
@@ -1373,11 +1384,11 @@ A latched NoSync environment skips its final sync on drop.
 | `Env::io_stats() -> IoStats` | the writer's I/O and allocation counters (see [I/O counters](#io-counters) below): in memory only, cumulative since this open, all zero in a read-only environment; published at the end of every commit, abort and `Env::sync`, read with one short lock of that copy (never a wait for an open write transaction) |
 | `IoStats::since(&earlier) -> IoStats` | the difference of two reads: each counter's, saturating, but `max_gate_lag`, a maximum since the open, which is the later read's |
 | `Env::failure()` | the latched cause, if any |
-| `Env::max_key_len() / max_value_len(klen)` | the entry limits of this page size. `max_value_len` is the table limit: 16 MiB for a key up to `max_key_len − 10` bytes, else the inline limit. A value over the inline limit is stored in an overflow run transparently: `put`, `get` and the cursors take and return its bytes as for any value. |
+| `Env::max_key_len() / max_value_len(klen)` | the entry limits of this page size. `max_value_len` is the table limit: 16 MiB for every key up to `max_key_len`, else 0 (such a key is refused). A value over the inline limit is stored in an overflow run transparently: `put`, `get` and the cursors take and return its bytes as for any value. |
 | `Table::name() / id()` | a handle's name and id. A committed table's id is never another table's over the file's life, so the id tells apart the tables whose handles open cursors in one transaction; it alone does not name a table (an aborted creation's id goes to the next table created) |
 | `ReadTxn` (both txn kinds) | `open_table(name) -> Option<Table>` (either kind), `get` (a dup table's by the logical key `k ‖ s`), `cursor` (`TableKind` on a dup table), `txn_id`, `table_stat -> TableStat { entries, height, branch_pages, leaf_pages, overflow_pages, nested_trees, dup }` (O(1), from the table's record; a dup table's figures in [Dup tables](#dup-tables)) |
 | `RwTxn::create_table(name)` | open or create a plain table (`TableKind` on a dup table) |
-| `RwTxn::create_dup_table(name, DupOptions { key_len, packed_max })` | open or create a dup table: rows keyed `k ‖ s`, `k` of exactly `key_len` bytes (1 to `max_dup_key_len`, 975 at 4 KiB pages), `packed_max` 0 (never pack), 7 to `max_value(key_len)` bytes, or `DupOptions::PACKED_DEFAULT` for that most (`DupOptions::packed(key_len)`), else `InvalidDupOptions`; the table records the resolved number; an existing table of the other kind or other resolved options is `TableKind` |
+| `RwTxn::create_dup_table(name, DupOptions { key_len, packed_max })` | open or create a dup table: rows keyed `k ‖ s`, `k` of exactly `key_len` bytes (1 to `max_dup_key_len`, 975 at 4 KiB pages), `packed_max` 0 (never pack), 7 to `max_entry_value(key_len)` bytes, or `DupOptions::PACKED_DEFAULT` for that most (`DupOptions::packed(key_len)`), else `InvalidDupOptions`; the table records the resolved number; an existing table of the other kind or other resolved options is `TableKind` |
 | `RwTxn::drop_table(Table) / clear_table(&Table)` | free the table's pages, a dup table's nested trees included (both are copy-on-write: readers keep the old tree) |
 | `RwTxn::put / delete -> bool` | point writes; on a dup table by the logical key `k ‖ s` (a key with no subkey is `KeyTooShort`) |
 | `RwTxn::delete_prefix(&Table, k) -> u64` | a dup table's rows under the outer key `k` (exactly `key_len` bytes) removed, its nested tree freed in one walk; returns the rows removed (`TableKind` on a plain table) |
@@ -1553,7 +1564,7 @@ it lands on, a multi-page overflow value in full).
 | `KeyExists` | an insert (`RwTxn::insert`, `RwCursor::insert`, `TxnCursor::insert`) of a key the table holds (no latch) |
 | `TableNotFound(String)` / `StaleTable(String)` / `InvalidTableName` | table errors (no latch) |
 | `TableKind(String)` | a call that needs the other kind of table: `create_table` on a dup table, `create_dup_table` on a plain table or a dup table of other options, a plain cursor on a dup table, `delete_prefix` on a plain table (no latch) |
-| `InvalidDupOptions(String)` | `create_dup_table` with a `packed_max` neither 0, `PACKED_DEFAULT` nor in `7..=max_value(key_len)`, or a `key_len` of 0 or past `max_dup_key_len` (no latch) |
+| `InvalidDupOptions(String)` | `create_dup_table` with a `packed_max` neither 0, `PACKED_DEFAULT` nor in `7..=max_entry_value(key_len)`, or a `key_len` of 0 or past `max_dup_key_len` (no latch) |
 | `NotTndbB` | a non-empty file without the magic in either meta slot |
 | `UnsupportedVersion(u32)` | another format version in a meta slot |
 | `InvalidPageSize(u32)` | `EnvOptions::page_size` is not a power of two in 4K..=64K |
@@ -1642,15 +1653,16 @@ it lands on, a multi-page overflow value in full).
 The entry limits are in [Limits](#limits): a table takes values up to 16 MiB, in overflow runs.
 These limits and non-goals are known:
 
-- **Dup tables have owned and detached cursors only, and pack only what fits an inline entry.**
+- **Dup tables have owned and detached cursors only, and pack only what fits a quarter-page entry.**
   A dup table's cursors are `DupRoCursor` and `DupTxnCursor`, and the borrowed `ReadTxn::cursor`
   and `RwTxn::cursor_mut` are `TableKind` on it ([Dup tables](#dup-tables)). A packed set is at
-  most `max_value(key_len)` bytes, so a key past that holds a nested tree of at least one page
+  most `max_entry_value(key_len)` bytes, so a key past that holds a nested tree of at least one page
   (do-not-flag item 26), and one in a table with `packed_max` 0 always does. Leaf cell flags other than 0, 1 (overflow) and 2 (nested) are
   refused.
-- **The inline limit is about a quarter of a page** (`MAX_ENTRY = U / 4`, kept for its one-split
-  proof): about 1 KB at 4 KiB pages. A value of 1–4 KB at 4 KiB pages
-  therefore takes a run page of its own. Raising it needs a new split proof and a format change.
+- **The inline limit is about half a page** (a leaf entry of `U / 2`): about 2 KB at 4 KiB
+  pages. A value of 2–4 KB at 4 KiB pages therefore takes a run page of its own. Raising it
+  further needs a new split proof (one split keeps both halves within `U` only for entries of at
+  most `U / 2`) and a format change.
 - **No multi-process access** alongside a live writer: there is no shared reader table. A
   read-only open takes the lock shared, so it and a writer exclude each other.
 - Merging is local and merge-only. A delete merges only the pages it changes, siblings never
@@ -2009,12 +2021,15 @@ These limits and non-goals are known:
       its own first use (item 23).
 26. **Keys of 18 to ~34 rows are left nested** (PlainStorageState's shape: 20-byte keys, 32-byte
     subkeys, 4 KiB pages).
-    - A packed set must be an inline entry (`packed_max` at most `max_value(key_len)`, 987 bytes
-      at a 20-byte key), since an outer tree holds no overflow cell. A key past ~17 such rows
+    - A packed set is held to a quarter-page entry (`packed_max` at most
+      `max_entry_value(key_len)`, 987 bytes at a 20-byte key), and an outer tree holds no
+      overflow cell. A key past ~17 such rows
       therefore nests and spends a leaf page, where a composite table (rows keyed `k ‖ s` in a
       plain table) spends 0.52-0.99 pages: up to ~2x the composite file for that band.
-    - Closing it would need sets past the inline limit, so overflow runs in an outer tree. Over a
-      whole state the band costs little: a random state of 1 to 20 rows per contract takes 0.286
+    - Closing it would need a larger bound. Sets up to the inline limit (`max_value(key_len)`,
+      about 2 KB at 4 KiB pages) would stay inline, but each row change would rebuild up to that
+      many bytes, a trade not yet measured; past it they would need overflow runs in an outer
+      tree. Over a whole state the band costs little: a random state of 1 to 20 rows per contract takes 0.286
       pages per contract at the default bound against composite's 0.298
       (`packed_sets_file_size_by_bound`, an ignored measurement).
 27. **A write through a positioned cursor routes by the cursor's slots** (`write::Hint`,
@@ -2108,9 +2123,9 @@ The default tests are small and fast, because CI runs nextest in debug. The heav
 | `tree/write.rs`, `tree/read.rs` | a gap edit after the stamp leaves the page `Valid`, its copy equal to it outside the gap and a write through it sound (`a_gap_edit_after_the_stamp_leaves_the_page_valid`); a flip in each region the page CRC covers (header with `nkeys` and `upper`, a slot, a cell, the trailer) of a root, a branch and a leaf fails the copy-on-write verify (`a_flip_the_page_crc_covers_fails_the_copy_on_write_verify`); copy-on-write put and delete against a `BTreeMap` model over random batches (with a coverage gate on split and delete shapes), which also put large values (inline, 1-page and 2–10-page runs) and check the overflow counter and the run pages; a failed allocation leaves the tree identical, also when the put takes a run; a put into a run or a replace of one takes the descent, not the path cache; a published leaf naming a private run, and a copied leaf naming a run this txn allocates later, are refused; a delete refuses a handle miscounting its pages; after every put of appends, inserts and replaces through each split shape (a leaf split its parent takes, a branch split, a new root), the path cache equals a fresh descent (`an_append_split_caches_the_path_a_descent_finds`); a replace that grows the rightmost leaf's last value past its free space splits as an append, the leaf's other cells left byte for byte, in a table's tree and an outer tree that packs, while a grown key before the last or in another leaf splits in the middle (`a_growing_last_value_in_the_rightmost_leaf_splits_as_an_append`); a put or delete through a cache whose leaf was unlinked since, by deletes that bypassed it, descends and lands where the key lives (`a_path_cache_of_another_epoch_is_never_used`); with merging off, cached deletes leave a leaf's last entry to the descent, which unlinks the leaf (`a_cached_delete_leaves_a_leafs_last_entry_to_the_descent`); a delete's miss over a published leaf leaves the cache empty, so a put there copies the leaf (`a_delete_miss_over_a_published_leaf_leaves_the_path_cache_empty`); both against the same writes without the cache; split reservation for long separators; append fill; collapse and unlink; `clear` and the free walk refuse damaged or stale pointers, and a page private to the transaction for another tree (its leaf or a run's page) named by a published cell, an untrusted root handle or a forged cell a private copy kept (`the_free_walk_refuses_a_page_private_to_another_tree`); fetch checks, stale copies, redirected children and misrouted pointers are `Corrupt`; copy-on-write's one copy gives the two-step copy's bytes, on `MemStore` and the environment's writer (`copy_on_write_is_the_two_step_copy`), reads a page published before a remap from the new mapping (`copy_on_write_reads_a_page_published_before_a_remap`), and fails exactly as `PageRead::page` fails, a page past the published bytes included (`copy_on_write_fails_as_the_page_fetch_fails`); provenance trust: a trusted path skips the range checks, a private page named by a page this writer did not write (a stamped forged cell, an untrusted root handle, a collapse) is refused, as is a copied cell naming a page this txn allocates later, while a child whose txn wrapped stays live; a nested cell in a private leaf is `Corrupt` at a put, a cached put, a cached delete, a delete, `clear` and `free_subtree`, the handle unchanged (`a_nested_cell_in_a_private_leaf_is_corrupt_at_every_write`); an outer tree of nested cells against a model through every write shape, and the refusals of each cell policy (`outer_trees_of_nested_cells_match_a_model`); a published outer cell naming this txn's id refused at copy (`a_published_outer_cell_naming_this_txn_is_refused_at_copy`); `read::last_key` against a model (`last_key_is_the_trees_last_key`); an outer tree of `Cells::Packing` cells (packed sets and nested roots) through `put_outer_cell` and `delete_outer_cell` with splits and merges against a model, `Cells::Outer` still refusing an inline cell and `check_cells_naming_this_txn` skipping sets (`outer_trees_of_packing_cells_match_a_model`) A write descent routed by a cursor's hint against the search: every key of seeded trees of height 1 to 4, private and published pages, with its own path, a neighbour's, random slots, a hint of another length and another tree's, gives the search's leaf, path, range, copies or error (`a_hinted_descent_matches_the_search`, heavy twin), and a hint along a damaged path meets the damage as the search does, a put with the same `Corrupt`, a delete before any change (`a_hinted_write_meets_damage_as_a_descent_does`). |
 | `tree/write.rs` merging | the random batches with merging on, against the same model (`random_batches_with_merging_match_a_btreemap_model`): odd rounds put and delete through a `PathCache` (`put_cached`, `delete_cached`; debug builds require cached deletes among them), and after every delete, cached or not, the pages it changed are merge-closed and the accounting holds, and the coverage gate adds leaves merged from the left and from the right, branch merges, a cascade over two levels or more, a root giving way and a refused merge; the fill bound (`deleting_90_percent_leaves_no_page_merge_open`: after 90% of a random fill is deleted at random, no page under a quarter fits with a neighbour, and the leaves stay 0.40–0.47 full against about 0.08 without merging); a merge refuses a damaged sibling from either side before anything changes (`a_merge_refuses_a_damaged_leaf_sibling`, `a_merge_refuses_a_damaged_branch_sibling`: a flipped byte under a stale CRC, a stale txn in the parent's cell, an older retired copy, a redirect outside the separators, a private sibling, a cell or overflow cell naming this txn, and for branches a key out of order across the seam); a refused neighbour gets only the cheap checks, and damage only its CRC finds waits for its first use (`a_refused_neighbour_gets_only_the_cheap_checks`); a failed allocation during a merging delete leaves the tree identical (`a_failed_allocation_during_a_merging_delete_leaves_the_tree_identical`); an absorbed branch sibling's child-0 chain is descended to the leaves, so a single-child branch outside the cell's separators, a branch of another level and one branch named by two cells are refused (`a_merge_refuses_a_single_child_branch_outside_the_cell`, `a_merge_refuses_a_branch_sibling_of_another_level`, `a_merge_refuses_a_branch_named_by_two_cells`). `a_collapse_checks_the_page_it_promotes` and `a_delete_refuses_a_handle_miscounting_its_pages` turn merging off (`no_merge`) to reach their shapes |
 | `tree/cursor/tests.rs` | random moves and prefix steps against a sorted model on the detached cursor and the public `Cursor`, over many tree shapes (grouped keys among them) and page sizes, committed and uncommitted; the ends of empty and single-entry trees; leaf crossings; seeks; prefix steps from every entry of a grouped tree, across leaf boundaries both ways (`prefix_steps_from_every_entry_match_a_model`); every key and every gap of many tree shapes through `seek`, `seek_exact` and `seek_with_key_tail`, each followed by a few steps, against the model on both cursors (`seeks_of_every_key_and_gap_match_a_model`, `_heavy`); `seek_with_key_tail` meets damage (a misrouted cell, an emptied leaf, a root of the wrong height, a flipped run byte) with the error a `seek` then `current_with_key_tail` meets (`a_seek_with_key_tail_meets_damage_as_a_seek_does`); two damages on one page met in the descent's order, the error the first check's exact message: the kind check before the header parse and before the range check (`the_descent_names_the_first_check_a_page_fails`); the path stays 6 bytes a level (`tree_cursor_stays_small`); seeks from random positions (after seeks, steps, `first` and `last`, past either end, after a `seek_exact` miss) equal a new cursor's seek and the steps after it, on the detached and public cursors and on `RoCursor` and `TxnCursor` (from the deleted state, and stale after another writer's put or delete), over every key and gap, every separator and the keys around it (`seeks_from_random_positions_match_a_fresh_seek`, `_heavy`); a seek inside the cursor's leaf (its keys and gaps, `seek_exact` misses there) makes no root descent and any other one does, even next to the leaf, a stale `TxnCursor`'s seek one descent and no reseek, and one after only a table created or dropped none (`a_seek_near_the_cursor_starts_from_its_leaf`, `owned_and_txn_cursors_seek_from_their_leaf`, `a_txn_cursor_seeks_from_its_leaf_after_a_schema_change`, debug builds); damage in the next leaf, sought from the leaf's end, is met with the descent's message, damage on the held path is not met again (`a_seek_from_the_leaf_meets_damage_as_a_descent_does`); damage under a cursor latches; `RwCursor` writes and prefix steps against a model (`current` and a second delete right after `delete_current` act on the follower), and prefix steps after `delete_current`; the owned `RoCursor` against the model and `Cursor` on one snapshot with overflow values (the random moves include `seek_with_key_tail`), outliving its transaction handle on another thread while commits free its pages, and latching damage |
-| `meta.rs`, `catalog.rs`, `latch.rs`, `alloc.rs`, `file.rs`, `sys.rs`, `crc.rs`, `page_set.rs`, `disk_model.rs` | codecs (the 96-byte catalog record: its layout, a plain record's zero dup fields and each damaged byte, `table_record_encoding`; a dup record's round trip and each broken rule, the page and row-sum rules included, `dup_records_round_trip_and_refuse_damage`; a dup record held to this build's limits, a `packed_max` out of range and a key past `max_dup_key_len`, `dup_records_are_usable_within_this_builds_limits`; version-2 and version-3 metas refused, `a_version_2_record_is_refused`, `a_version_3_record_is_refused`), slot choice, the latch's first-cause rule (`ReadOnly` does not latch), allocator abort, overflow runs in the allocator (the first fit in the pool, else the file end; one CRC per run, its pages never trusted as stamped; a freed run comes back as single pages), growth and remap, a read-only mapping of a mode-0444 file that maps nothing once dropped (`a_read_only_file_maps_its_bytes_until_dropped`), sync wrappers, the exclusive and shared locks (`flock_shared_coexists_and_excludes_an_exclusive_lock`), the power-loss model |
+| `meta.rs`, `catalog.rs`, `latch.rs`, `alloc.rs`, `file.rs`, `sys.rs`, `crc.rs`, `page_set.rs`, `disk_model.rs` | codecs (the 96-byte catalog record: its layout, a plain record's zero dup fields and each damaged byte, `table_record_encoding`; a dup record's round trip and each broken rule, the page and row-sum rules included, `dup_records_round_trip_and_refuse_damage`; a dup record held to this build's limits, a `packed_max` out of range and a key past `max_dup_key_len`, `dup_records_are_usable_within_this_builds_limits`; version-2, version-3 and version-4 metas refused, `a_version_2_record_is_refused`, `a_version_3_record_is_refused`, `a_version_4_record_is_refused`), slot choice, the latch's first-cause rule (`ReadOnly` does not latch), allocator abort, overflow runs in the allocator (the first fit in the pool, else the file end; one CRC per run, its pages never trusted as stamped; a freed run comes back as single pages), growth and remap, a read-only mapping of a mode-0444 file that maps nothing once dropped (`a_read_only_file_maps_its_bytes_until_dropped`), sync wrappers, the exclusive and shared locks (`flock_shared_coexists_and_excludes_an_exclusive_lock`), the power-loss model |
 | `stamp.rs`, `env/tests.rs` (the stamp) | the parallel stamp against the serial loop (`stamp::stamp` on each unit: `page::stamp` on a tree page, `crc::add_crc32_nonzero` on a run), byte for byte: tree pages (with a gap, full, and with each header that gives no gap) and runs of up to 9 pages, from no unit to more units than threads, on 1 to 9 threads (`crcs_stamp_the_bytes_of_the_serial_loop`); a payload whose CRC is 0 stamped with the all-ones sentinel (`a_zero_crc_payload_gets_the_serial_loops_sentinel`); the shares cover every unit once, in order, in balanced parts (`shares_cover_the_units_in_order_in_balanced_parts`); the thread count's threshold and cap (`threads_grow_with_the_bytes_to_the_cap`); whole commits stamped on 2, 3 and 5 threads leave the serial stamp's file, which reopens, checks and reads back (`a_parallel_stamp_writes_the_serial_stamps_bytes`), as does a 3 MiB commit of runs on `stamp::threads`' own choice (`a_commit_past_the_stamp_threshold_writes_the_serial_stamps_bytes`) |
-| `env/tests.rs` | a flip the page CRC covers fails open's root check (the catalog root) and `Env::check` (a table leaf) (`a_flip_the_page_crc_covers_fails_open_and_check`); a version-3 file is refused at open as `UnsupportedVersion(3)`, the file unchanged (`a_version_3_file_is_refused_at_open`); open steps (create at every page size, leftovers, the lock, a damaged newest meta, damaged roots, short and foreign files, the open fsync), commit and NoSync durability under power loss, a commit of no change, abort, the writer hand-off, readers across commits, step 4's sync choice (`data_sync`: one range or one `fdatasync`), a scattered commit and a two-range commit under power loss, the latch (failed msync, damage, oversized entries do not latch), table handles, a multi-page value read back after a commit and a reopen, `max_value_len` at every page size; the per-snapshot table roots: one catalog resolve per handle per snapshot, whichever read uses it (`a_snapshot_resolves_each_handle_once`), a dropped table's handle stale only in later snapshots (`a_dropped_tables_handle_is_stale_only_in_later_snapshots`), a hit needing the handle's name as well as its id, for another file's handle with the same id and for an aborted create's handle, whose id the next table created takes (`a_remembered_root_needs_the_handles_name_too`), and 40 tables, past the 32 slots, each resolving to its own table (`more_tables_than_a_snapshot_remembers_still_resolve`) |
+| `env/tests.rs` | a flip the page CRC covers fails open's root check (the catalog root) and `Env::check` (a table leaf) (`a_flip_the_page_crc_covers_fails_open_and_check`); a version-3 or version-4 file is refused at open as `UnsupportedVersion(3)` or `UnsupportedVersion(4)`, the file unchanged (`a_version_3_file_is_refused_at_open`, `a_version_4_file_is_refused_at_open`); open steps (create at every page size, leftovers, the lock, a damaged newest meta, damaged roots, short and foreign files, the open fsync), commit and NoSync durability under power loss, a commit of no change, abort, the writer hand-off, readers across commits, step 4's sync choice (`data_sync`: one range or one `fdatasync`), a scattered commit and a two-range commit under power loss, the latch (failed msync, damage, oversized entries do not latch), table handles, a multi-page value read back after a commit and a reopen, `max_value_len` at every page size; the per-snapshot table roots: one catalog resolve per handle per snapshot, whichever read uses it (`a_snapshot_resolves_each_handle_once`), a dropped table's handle stale only in later snapshots (`a_dropped_tables_handle_is_stale_only_in_later_snapshots`), a hit needing the handle's name as well as its id, for another file's handle with the same id and for an aborted create's handle, whose id the next table created takes (`a_remembered_root_needs_the_handles_name_too`), and 40 tables, past the 32 slots, each resolving to its own table (`more_tables_than_a_snapshot_remembers_still_resolve`) |
 | `freelist/tests.rs` | the record codec; reuse after two durable commits or two NoSync syncs, held back by a live reader; damaged records never handed out; abort returns the records taken; dropped and cleared tables' pages reused; steady churn keeps the file bounded; the save settles within three rounds, including a record count that shrinks mid-save; `check` reports damage, leaks and double uses, and compares each root's page counters, and refuses a root branch with one child (`check_refuses_a_root_branch_with_one_child`); exact accounting in a random workload. Overflow runs at the environment level: the runs of cleared and dropped tables are freed and reused; a damaged run (header, leaf, counter) refuses `clear_table` and `drop_table` and changes nothing, the file included; `check` reports a damaged run (a CRC flip, a header or pad byte, a wrong counter) and a run page also on the free list; `check` finds a flip inside a 1-page run that a get does not; a get refuses a 1-page run reused as another page and a flip in a middle page of a run. Run allocation: a run takes a fit from records loaded for it, loads at most `RUN_LOAD_RECORDS` records, and an abort returns the records it loaded; leftover pages of a consumed record are listed under the keys consumed and reused by the next transaction; churn of 4–20 KB values keeps the file bounded (`run_churn_keeps_the_file_bounded`; with held readers, `run_churn_with_readers_keeps_the_file_bounded`, at most 1.75 times the live pages, and both heavy twins, 1.5 times over 50K commits and 1.75 over 20K). Merges free the siblings they absorb, which the save lists like any freed page, and it still settles within three rounds (`merges_feed_the_save_which_still_settles`). The save writes the records the old code wrote, byte for byte, over large commits, a drop and small records that spill the pool (`the_save_writes_the_records_the_reference_writes`), and a spill below the freed pages merged into them (`a_spill_below_the_freed_pages_is_merged_into_them`) |
 | `tests/crash.rs` | every crash point (`CrashAt`) × {process crash, strict power loss, random power loss with three seeds} × {`Durable`, `NoSync`} × {step 4 by `fdatasync`, by one `msync`}: the reopen recovers exactly the allowed state, which passes `check`, reads back through gets and both cursor scans, and survives a crash right after the reopen; a commit that grew the file survives a power loss by either data sync; the older state stays recoverable until its meta is overwritten. The dup matrix runs the same over a dup table beside the plain ones (`every_crash_point_recovers_a_dup_table`, `_heavy`): a crash commit of nested-only changes (outer cells rewritten by the flush), a new outer key, a key emptied row by row and a `delete_prefix` reopens to exactly `L` or `M`, every row read back by a get and by a walk of every tree, with the totals and `check`'s figures; the grown-file and older-state cases with that commit (`a_commit_that_grew_the_file_survives_a_power_loss_with_a_dup_table`, `the_older_state_with_a_dup_table_stays_recoverable_until_its_meta_is_overwritten`) |
 | `tests/crash_runs.rs` | the same matrix (two seeds; the heavy twin 40 at 4 and 16 KiB pages) on a workload of overflow runs: puts of 1–10-page runs, replaces inline to run, run to inline, run to a larger and a smaller run, deletes, a drop of a table with runs; the commit does not grow the file and ends with a run at the top of its pages, so the one `msync` of step 4 alone must cover the run's interior pages (a growth's size sync is an `fsync` of every page), and the dry run asserts that layout: the last run ends at the state's page count (`last_run_ends_the_file`); a commit that grows the file through a run allocation survives a power loss by either data sync |

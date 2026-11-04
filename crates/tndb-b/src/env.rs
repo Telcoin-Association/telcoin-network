@@ -1274,11 +1274,10 @@ impl Env {
     }
 
     /// The longest value a table accepts with a `klen`-byte key: 16 MiB (stored in an overflow
-    /// run) when the key leaves room for the run's 12-byte reference in its leaf, which every key
-    /// up to 10 bytes short of [`max_key_len`](Self::max_key_len) does; else the longest value its
-    /// leaf holds; 0 when `klen` is over [`max_key_len`](Self::max_key_len): such a key is refused
-    /// with any value. Every accepted key leaves room for at least 2 bytes, so 0 always means the
-    /// key is refused.
+    /// run when it is longer than its leaf holds inline) for every key up to
+    /// [`max_key_len`](Self::max_key_len), whose leaf entry always leaves room for the run's
+    /// 12-byte reference; 0 when `klen` is over [`max_key_len`](Self::max_key_len): such a key is
+    /// refused with any value.
     pub fn max_value_len(&self, klen: usize) -> usize {
         self.inner.geometry.max_table_value(klen)
     }

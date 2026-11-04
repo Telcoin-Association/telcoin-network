@@ -2473,12 +2473,12 @@ impl RwTxn {
     /// ([`DupOptions::resolved`]: [`DupOptions::PACKED_DEFAULT`] becomes the number it stands
     /// for), and an existing table is compared on those, so asking for `PACKED_DEFAULT` or for
     /// its number gives the same table. [`Error::InvalidTableName`] unless the name is 1..=255
-    /// bytes; [`Error::InvalidDupOptions`] unless `options.key_len` is at least 1 and leaves the
-    /// outer cell (the key and a 32-byte nested root) an inline entry with room for a 1-byte
-    /// subkey (975 bytes at 4 KiB pages), and `options.packed_max` is 0, `PACKED_DEFAULT` or in
-    /// `7..=` the longest value an inline entry of a `key_len`-byte key takes;
-    /// [`Error::TableKind`] if `name` is a plain table or a dup table of other resolved options.
-    /// Each refusal changes nothing and does not latch.
+    /// bytes; [`Error::InvalidDupOptions`] unless `options.key_len` is at least 1 and keeps the
+    /// outer cell (the key and a 32-byte nested root) within a quarter-page entry with room for a
+    /// 1-byte subkey (975 bytes at 4 KiB pages), and `options.packed_max` is 0, `PACKED_DEFAULT` or
+    /// in `7..=` the longest value of a quarter-page entry with a `key_len`-byte key (987 bytes
+    /// at `key_len` 20 and 4 KiB pages); [`Error::TableKind`] if `name` is a plain table or a dup
+    /// table of other resolved options. Each refusal changes nothing and does not latch.
     pub fn create_dup_table(&mut self, name: &str, options: DupOptions) -> Result<Table> {
         catalog::check_name(name)?;
         let options = options.resolve(&self.inner.geometry)?;

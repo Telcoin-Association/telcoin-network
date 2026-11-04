@@ -398,12 +398,12 @@ pub(crate) enum OuterCell<'a> {
 /// cell of a key with none, `Upsert` replaces the cell of a key whose nested root or packed set
 /// changed, `Append` creates one past the last key. The cell it replaces must be one `cells`
 /// holds (any other is [`Error::Corrupt`]); the tree a replaced nested cell named is not freed
-/// here: the nested writes own it. For a nested root the outer key's length is held to the inline
-/// limits ([`Geometry::check_entry`]); an empty `nested` is a broken invariant (an outer cell
-/// names a non-empty tree, which [`page::validate`] requires of every nested cell). A packed set
-/// is a broken invariant when empty, under `Outer`, or past the inline limits (the dup layer
-/// bounds it by the table's `packed_max`, at most [`Geometry::max_value`] of the key). A descent
-/// routes by `hint` where it holds ([`Hint`]).
+/// here: the nested writes own it. For a nested root the outer key's length is held to the
+/// quarter-page entry limits ([`Geometry::check_entry`]); an empty `nested` is a broken invariant
+/// (an outer cell names a non-empty tree, which [`page::validate`] requires of every nested cell).
+/// A packed set is a broken invariant when empty, under `Outer`, or past those limits (the dup
+/// layer bounds it by the table's `packed_max`, at most [`Geometry::max_entry_value`] of the key).
+/// A descent routes by `hint` where it holds ([`Hint`]).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn put_outer_cell<S: PageWrite + ?Sized>(
     store: &mut S,
@@ -4964,7 +4964,9 @@ mod tests {
         panic!("the value never split its leaf");
     }
 
-    /// Over-limit entries are refused before anything changes.
+    /// Over-limit entries are refused before anything changes. A table's value limit is 16 MiB
+    /// for every key up to the longest, whose overflow cell fits a leaf entry: a value one byte
+    /// past the inline limit with the longest key goes to a run.
     #[test]
     fn over_limit_entries_are_refused() {
         let mut store = MemStore::new(4096);
@@ -4972,20 +4974,30 @@ mod tests {
         let mut root = TreeRoot::EMPTY;
         let key = vec![1; g.max_key() + 1];
         assert!(matches!(put(&mut store, &mut root, &key, b""), Err(Error::KeyTooLarge { .. })));
-        // A table's limits: 16 MiB, or the inline limit for a key too long for an overflow cell.
+        // A table's limit: 16 MiB.
         let value = vec![1; overflow::MAX_VALUE + 1];
         let put_value = put(&mut store, &mut root, b"four", &value);
         assert!(matches!(put_value, Err(Error::ValueTooLarge { .. })));
-        let long = vec![2; g.max_key() - OVF_CELL + 3];
-        let put_value = put(&mut store, &mut root, &long, &vec![1; g.max_value(long.len()) + 1]);
+        let long = vec![2; g.max_key()];
+        let put_value = put(&mut store, &mut root, &long, &vec![1; overflow::MAX_VALUE + 1]);
         assert!(matches!(put_value, Err(Error::ValueTooLarge { .. })));
-        // The catalog's and the free list's entry point takes inline values only.
-        let value = vec![1; g.max_value(4) + 1];
+        // The catalog's and the free list's entry point takes values up to the `U / 4` entry
+        // bound, inline only.
+        let value = vec![1; g.max_entry_value(4) + 1];
         let mut trusted = false;
         let put_value = super::put(&mut store, &mut root, &mut trusted, b"four", &value);
         assert!(matches!(put_value, Err(Error::ValueTooLarge { .. })));
         assert_eq!(root, TreeRoot::EMPTY);
         assert_eq!(store.alloc.page_count(), 2, "nothing allocated");
+
+        // The longest key takes a value past the inline limit into a one-page run.
+        assert_eq!(g.max_table_value(long.len()), overflow::MAX_VALUE);
+        let big = vec![3; g.max_value(long.len()) + 1];
+        put(&mut store, &mut root, &long, &big).expect("the longest key's overflow put");
+        assert_eq!((root.entries, root.leaf_pages, root.overflow_pages), (1, 1, 1));
+        assert_eq!(walk_tree(&store, &root).entries, vec![(long, big)]);
+        store.commit_like();
+        store.assert_accounting(&[root]);
     }
 
     /// A `klen`-byte key that sorts by `id`.
@@ -5263,7 +5275,7 @@ mod tests {
         assert_holds(&store, &root, &model);
     }
 
-    /// Delete wide entries (four per leaf, so emptied leaves unlink and roots collapse often)
+    /// Delete wide entries (two per leaf, so emptied leaves unlink and roots collapse often)
     /// from a deep published tree, failing each allocation of each delete in turn: a failed delete
     /// leaves the root handle, every reachable page (byte for byte) and the freed list exactly as
     /// they were, and gives back every page it took.
@@ -6044,12 +6056,13 @@ mod tests {
     /// at its first real use, a delete that copies it.
     #[test]
     fn a_refused_neighbour_gets_only_the_cheap_checks() {
-        // Four entries of the largest inline value fill a leaf: nothing fits beside it.
+        // Four entries of a quarter of the leaf's room each (`U / 4`, the branch entry limit)
+        // fill a leaf: nothing fits beside it.
         let full: Vec<(&[u8], usize)> =
             [b"a", b"b", b"c", b"d"].iter().map(|k| (&k[..], 1006)).collect();
         for case in ["flipped byte", "stale txn", "empty", "private"] {
             let mut store = MemStore::new(4096);
-            assert_eq!(store.geometry().max_value(1), 1006);
+            assert_eq!(store.geometry().max_entry_value(1), 1006);
             let a = leaf_with(&mut store, &full);
             let m = leaf_of(&mut store, &[b"m", b"n"]);
             let r = branch_page(&mut store, &[(Vec::new(), a), (b"m".to_vec(), m)]);
@@ -6701,7 +6714,7 @@ mod tests {
         // seed reaches its height and every change of the coverage gate. Merging is off: the
         // shapes of a tree without it (unlinks of emptied leaves, single-child branches).
         for (page_size, key_space, rounds, seed, min_height) in [
-            (4096, 2_000, 400, 0x2545_F491_4F6C_DD21, 3),
+            (4096, 2_000, 400, 0x1234_5678_9ABC_DEF2, 3),
             (8192, 2_000, 400, 0x2545_F491_4F6C_DD21, 3),
             (65536, 2_000, 160, 0x1234_5678_9ABC_DEF2, 2),
         ] {
@@ -7201,7 +7214,7 @@ mod tests {
         let _report = ReportSeed(seed);
         let mut rng = Rng(seed);
         let mut store = MemStore::new(4096);
-        let most = store.geometry().max_value(klen);
+        let most = store.geometry().max_entry_value(klen);
         let (mut root, mut trusted, mut cache) = (TreeRoot::EMPTY, false, PathCache::default());
         let mut model: BTreeMap<Vec<u8>, PackingCell> = BTreeMap::new();
         let ids = 4 * ops as u64;
@@ -7328,7 +7341,7 @@ mod tests {
     ) -> (MemStore, TreeRoot, PathCache, BTreeMap<Vec<u8>, PackingCell>) {
         let mut rng = Rng(0x9AC4_ED5E);
         let mut store = MemStore::new(4096);
-        let most = store.geometry().max_value(klen);
+        let most = store.geometry().max_entry_value(klen);
         let (mut root, mut trusted, mut cache) = (TreeRoot::EMPTY, false, PathCache::default());
         let mut model = BTreeMap::new();
         for i in 0..n {
@@ -7599,7 +7612,7 @@ mod tests {
         let free_walk = |extra: Option<(Vec<u8>, Vec<u8>)>, packed: Option<PackedLimits>| {
             let mut rng = Rng(0xF8EE);
             let mut store = MemStore::new(4096);
-            let most = store.geometry().max_value(8);
+            let most = store.geometry().max_entry_value(8);
             let (mut root, mut trusted, mut cache) = (TreeRoot::EMPTY, false, PathCache::default());
             let (mut roots, mut want) = (BTreeMap::new(), NestedSums::default());
             let mut pages = 0_u64;

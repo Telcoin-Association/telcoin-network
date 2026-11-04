@@ -89,10 +89,10 @@ impl RecordKey {
     }
 }
 
-/// The most pages one record lists at this page size (its value fills an entry with a
-/// [`KEY_LEN`]-byte key, rounded down to whole page numbers).
+/// The most pages one record lists at this page size (its value fills a branch-limit entry with
+/// a [`KEY_LEN`]-byte key, [`Geometry::max_entry_value`], rounded down to whole page numbers).
 pub(crate) fn record_capacity(geometry: &Geometry) -> usize {
-    geometry.max_value(KEY_LEN) / 4
+    geometry.max_entry_value(KEY_LEN) / 4
 }
 
 /// The first record of the free tree `root` names after the key `after` (from the smallest

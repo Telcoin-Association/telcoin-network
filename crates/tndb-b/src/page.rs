@@ -40,16 +40,21 @@
 //! of child i's key range, and cell 0's key is empty and stands for −∞, so the child for a key is
 //! the last cell whose key is `<=` it.
 //!
-//! **Limits.** An entry (cell plus slot) is at most `MAX_ENTRY = U / 4` bytes:
-//! `max_key = MAX_ENTRY − 12` (so any key fits a branch cell as a separator) and
-//! `max_value(klen) = MAX_ENTRY − 10 − klen` (0 for a key over `max_key`, which [`validate`]
-//! refuses in a leaf too), the inline limit. A table's larger value goes to an overflow run
-//! ([`Geometry::place`]), up to 16 MiB for a key that leaves room for the 12-byte overflow cell
-//! ([`Geometry::max_table_value`]); the cell itself is an ordinary entry within the limits. A page
-//! that overflows holds at most `U + MAX_ENTRY` bytes counting the pending entry, so cutting it
-//! at the first entry where the left part reaches half leaves a left part under
-//! `half + MAX_ENTRY ≤ 5U/8 + U/4` and a right part of at most half: one split always suffices
-//! ([`split_leaf`], [`split_branch`]). A delete's merge of two siblings ([`SplitBuf::merge`]) is
+//! **Limits.** A leaf entry (cell plus slot) is at most `U / 2` bytes and a branch entry at most
+//! `U / 4` ([`entry_limit`]). Every key is held to the branch limit: `max_key = U / 4 − 12`, so
+//! any key fits a branch cell as a separator, and [`validate`] refuses a longer key in a leaf too.
+//! The inline limit is `max_value(klen) = U / 2 − 10 − klen` (0 for a key over `max_key`). The
+//! catalog's and the free list's records and a dup table's packed sets keep the quarter-page
+//! bound `max_entry_value(klen) = U / 4 − 10 − klen` ([`Geometry::max_entry_value`]). A table's
+//! larger value goes to an overflow run ([`Geometry::place`]), up to 16 MiB for every key up to
+//! `max_key` ([`Geometry::max_table_value`]); the cell itself is an ordinary entry within the
+//! limits. A page that overflows holds at most `U` bytes plus the pending entry. A split cuts it
+//! at the first entry where the left part reaches half: a branch's left part is then under
+//! `half + U / 4 ≤ 5U/8 + U/4` and its right part at most half. A leaf's entries reach `U / 2`,
+//! so a leaf keeps one entry less when that left part passes `U` or leaves the right part under
+//! `U / 4`; both leaves then end within `U` and at least `U / 4`, and with every entry at most
+//! `U / 4` the cut never moves. One split always suffices ([`SplitBuf::split_leaf`],
+//! [`SplitBuf::split_branch`]). A delete's merge of two siblings ([`SplitBuf::merge`]) is
 //! sized to fit before it is planned: the two pages' cells and slots ([`View::used`]), plus for
 //! branches the parent's key coming down as the right page's cell-0 key, within `U`.
 //!
@@ -316,12 +321,28 @@ pub(crate) enum Fit {
     Full,
 }
 
+/// The largest entry (cell plus slot) a `kind` page of `page_len` bytes holds: `U / 2` for a
+/// leaf, `U / 4` for a branch, with `U = page_len − 28`. The one source of both limits, for
+/// [`Geometry::new`] and for a split's pending entry ([`check_split_entry`]), which has only the
+/// page: the split proof ([`SplitBuf::split_leaf`]) needs a leaf entry of at most `U / 2`, and a
+/// branch entry stays `U / 4` because a key is held to it ([`Geometry::max_key`]).
+const fn entry_limit(kind: Kind, page_len: usize) -> usize {
+    let usable = page_len.saturating_sub(HEADER + TRAILER);
+    match kind {
+        Kind::Leaf => usable / 2,
+        Kind::Branch => usable / 4,
+    }
+}
+
 /// Page size and the limits derived from it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Geometry {
     page_size: usize,
     usable: usize,
+    /// `U / 4`: the largest branch entry, which bounds every key.
     max_entry: usize,
+    /// `U / 2`: the largest leaf entry, which bounds an inline value.
+    max_leaf_entry: usize,
 }
 
 impl Geometry {
@@ -332,8 +353,12 @@ impl Geometry {
         if !p.is_power_of_two() || !(MIN_PAGE_SIZE..=MAX_PAGE_SIZE).contains(&p) {
             return Err(Error::InvalidPageSize(page_size));
         }
-        let usable = p - HEADER - TRAILER;
-        Ok(Self { page_size: p, usable, max_entry: usable / 4 })
+        Ok(Self {
+            page_size: p,
+            usable: p - HEADER - TRAILER,
+            max_entry: entry_limit(Kind::Branch, p),
+            max_leaf_entry: entry_limit(Kind::Leaf, p),
+        })
     }
 
     /// The page size P in bytes.
@@ -346,21 +371,38 @@ impl Geometry {
         self.usable
     }
 
-    /// `U / 4`: the largest entry (cell plus slot) a page accepts.
+    /// `U / 4`: the largest branch entry (cell plus slot), the one [`Self::max_key`] and
+    /// [`Self::max_entry_value`] are written from.
     #[cfg(test)]
     pub(crate) fn max_entry(&self) -> usize {
         self.max_entry
     }
 
-    /// The longest key: one whose branch cell (as a separator) is a maximal entry.
+    /// `U / 2`: the largest leaf entry (cell plus slot), the one [`Self::max_value`] is written
+    /// from.
+    #[cfg(test)]
+    pub(crate) fn max_leaf_entry(&self) -> usize {
+        self.max_leaf_entry
+    }
+
+    /// The largest entry (cell plus slot) a `kind` page holds ([`entry_limit`]).
+    fn max_entry_of(&self, kind: Kind) -> usize {
+        match kind {
+            Kind::Leaf => self.max_leaf_entry,
+            Kind::Branch => self.max_entry,
+        }
+    }
+
+    /// The longest key: one whose branch cell (as a separator) is a maximal branch entry.
     pub(crate) fn max_key(&self) -> usize {
         self.max_entry - BRANCH_CELL_HEADER - SLOT
     }
 
     /// The widest outer key a dup table takes: the largest `K` whose outer cell, the key with a
-    /// [`NESTED_CELL`]-byte nested root, is an inline entry (`max_value(K) >= NESTED_CELL`). It is
-    /// below [`Self::max_key`] by more than a byte, so a logical key `k ‖ s` with a 1-byte subkey
-    /// is within the key limit.
+    /// [`NESTED_CELL`]-byte nested root, fits the branch entry limit
+    /// (`max_entry_value(K) >= NESTED_CELL`, [`Self::max_entry_value`]). It is below
+    /// [`Self::max_key`] by more than a byte, so a logical key `k ‖ s` with a 1-byte subkey is
+    /// within the key limit.
     pub(crate) fn max_dup_key_len(&self) -> usize {
         self.max_entry - LEAF_CELL_HEADER - SLOT - NESTED_CELL
     }
@@ -371,12 +413,26 @@ impl Geometry {
         self.max_key().saturating_sub(key_len)
     }
 
-    /// The longest value stored with a `klen`-byte key, or 0 for a key over [`max_key`], which
-    /// is refused with any value. A key within the limit always takes at least 2 bytes, so 0 is
-    /// never a limit for an accepted key.
+    /// The longest value stored inline with a `klen`-byte key, `U / 2 − 10 − klen` (its leaf
+    /// entry a maximal one), or 0 for a key over [`max_key`], which is refused with any value. A
+    /// key within the limit always leaves more than an overflow cell's 12 bytes, so 0 is never a
+    /// limit for an accepted key.
     ///
     /// [`max_key`]: Self::max_key
     pub(crate) fn max_value(&self, klen: usize) -> usize {
+        if klen > self.max_key() {
+            return 0;
+        }
+        self.max_leaf_entry - LEAF_CELL_HEADER - SLOT - klen
+    }
+
+    /// The longest value with a `klen`-byte key whose leaf entry stays within the branch entry
+    /// limit (`U / 4 − 10 − klen`), or 0 for a key over [`max_key`]: the bound of the inline
+    /// records that keep that size ([`Self::check_entry`]). A key within the limit always takes
+    /// at least 2 bytes, so 0 is never a limit for an accepted key.
+    ///
+    /// [`max_key`]: Self::max_key
+    pub(crate) fn max_entry_value(&self, klen: usize) -> usize {
         if klen > self.max_key() {
             return 0;
         }
@@ -384,8 +440,8 @@ impl Geometry {
     }
 
     /// The longest value a table stores with a `klen`-byte key: [`MAX_VALUE`] when the key leaves
-    /// room for an overflow cell (`klen <= max_key − 10`), else [`Self::max_value`] (0 for a key
-    /// over [`Self::max_key`]).
+    /// room for an overflow cell (every key up to [`Self::max_key`]), else [`Self::max_value`]
+    /// (0 for a key over [`Self::max_key`]).
     pub(crate) fn max_table_value(&self, klen: usize) -> usize {
         if self.overflow_fits(klen) {
             MAX_VALUE
@@ -394,7 +450,8 @@ impl Geometry {
         }
     }
 
-    /// True if a `klen`-byte key leaves room for an overflow cell's 12 bytes in a maximal entry.
+    /// True if a `klen`-byte key leaves room for an overflow cell's 12 bytes in a maximal leaf
+    /// entry.
     fn overflow_fits(&self, klen: usize) -> bool {
         klen <= self.max_key() && OVF_CELL <= self.max_value(klen)
     }
@@ -419,15 +476,16 @@ impl Geometry {
         Ok(Place::Overflow { npages: overflow::run_pages(vlen, self.page_size) })
     }
 
-    /// Check an entry's sizes against the inline limits: [`Error::KeyTooLarge`] or
-    /// [`Error::ValueTooLarge`], before anything is changed. The catalog and the free list, which
-    /// hold only inline values, write through it; a table's put asks [`Self::place`].
+    /// Check an entry's sizes against [`Self::max_key`] and [`Self::max_entry_value`]:
+    /// [`Error::KeyTooLarge`] or [`Error::ValueTooLarge`], before anything is changed. The
+    /// catalog and the free list, which hold only inline values, write through it; a table's put
+    /// asks [`Self::place`].
     pub(crate) fn check_entry(&self, klen: usize, vlen: usize) -> Result<()> {
         let max = self.max_key();
         if klen > max {
             return Err(Error::KeyTooLarge { len: klen, max });
         }
-        let max = self.max_value(klen);
+        let max = self.max_entry_value(klen);
         if vlen > max {
             return Err(Error::ValueTooLarge { len: vlen, max });
         }
@@ -1509,10 +1567,10 @@ impl<'a> BranchView<'a> {
 /// 12 bytes naming a length past the inline limit ([`Geometry::max_value`]) and within
 /// [`MAX_VALUE`], or 2 for a nested cell, whose 32 bytes decode to a non-empty root that passes
 /// [`TreeRoot::check`] (its pages are its use's to check); the cells tiling `upper..P − 4` exactly
-/// (no overlap, no gap); every entry within the geometry's maximal entry (`U / 4`) and every key
-/// within its `max_key` (for a branch cell the entry limit is that, for a leaf cell it is not);
-/// keys strictly ascending; and for a branch at least one child, with cell 0's key empty. The page
-/// number, transaction id and CRC are the caller's to check.
+/// (no overlap, no gap); every entry within its kind's limit ([`entry_limit`]: `U / 2` in a leaf,
+/// `U / 4` in a branch) and every key within its `max_key` (for a branch cell the entry limit is
+/// that, for a leaf cell it is not); keys strictly ascending; and for a branch at least one child,
+/// with cell 0's key empty. The page number, transaction id and CRC are the caller's to check.
 pub(crate) fn validate(page: &[u8], geometry: &Geometry) -> Result<()> {
     if page.len() != geometry.page_size {
         return Err(corrupt(
@@ -1530,11 +1588,12 @@ pub(crate) fn validate(page: &[u8], geometry: &Geometry) -> Result<()> {
     if h.kind == Kind::Branch && h.nkeys == 0 {
         return Err(corrupt(page, "branch page without children"));
     }
+    let max_entry = geometry.max_entry_of(h.kind);
     let mut extents = Vec::with_capacity(h.nkeys);
     let mut prev: Option<&[u8]> = None;
     for i in 0..h.nkeys {
         let (off, size) = cell_extent(page, &h, i)?;
-        if size + SLOT > geometry.max_entry {
+        if size + SLOT > max_entry {
             return Err(corrupt(page, format_args!("cell {i} of {size} bytes exceeds the limit")));
         }
         let key = key_at(page, &h, i)?;
@@ -2090,11 +2149,19 @@ impl SplitBuf {
     /// at sorted position `at` on whichever side it lands (see [`SplitBuf`] for the steps).
     ///
     /// The cut is by bytes, not entries: `src` keeps the entries before the first one at which
-    /// its share (cells plus slots) reaches half of the total, so both halves end within `U` and
-    /// neither is empty. With `append` and `at == nkeys` (the key goes past the end of the tree's
-    /// rightmost leaf), `src` keeps every old entry and the right leaf gets only the new one, so
-    /// ascending inserts fill leaves instead of leaving each half empty behind them; otherwise
-    /// `append` is ignored.
+    /// its share (cells plus slots) reaches half of the total `T`, unless that share passes `U` or
+    /// leaves the right leaf under `U / 4` (merge-due at once); then it keeps one entry less. As
+    /// every entry is at most `U / 2` ([`entry_limit`]) and `U < T <= 3U / 2`, both leaves end
+    /// within `U` and at least `U / 4`, and neither is empty. Kept, the left share is in
+    /// `T / 2 ..= U` and the right one in `U / 4 ..= T / 2`. Moved back by an entry `e`, the left
+    /// share is under `T / 2` and the right one over it: from past `U`, the left is over
+    /// `U − e >= U / 2` and the right under `(T − U) + e <= U`; from a right part under `U / 4`,
+    /// the right is under `U / 4 + e <= 3U / 4`, so the left is over `U / 4`. With every entry at
+    /// most `U / 4` the cut never moves.
+    ///
+    /// With `append` and `at == nkeys` (the key goes past the end of the tree's rightmost leaf),
+    /// `src` keeps every old entry and the right leaf gets only the new one, so ascending inserts
+    /// fill leaves instead of leaving each half empty behind them; otherwise `append` is ignored.
     pub(crate) fn split_leaf(
         &mut self,
         src: &[u8],
@@ -2104,7 +2171,7 @@ impl SplitBuf {
         append: bool,
     ) -> Result<()> {
         let size = cell_size_leaf(key.len(), value.cell_len());
-        check_split_entry(src, size)?;
+        check_split_entry(src, Kind::Leaf, size)?;
         let h = hdr_of(src, Kind::Leaf)?;
         check_split_at(src, &h, at)?;
         if append && at == h.nkeys {
@@ -2132,10 +2199,11 @@ impl SplitBuf {
     /// climbs. The new separator moves up to the parent: `src` keeps the cells below it, and the
     /// right branch's cell 0 is the separator's own child with an empty key.
     ///
-    /// The cut is by bytes as in [`Self::split_leaf`]; both halves end within `U` with at least
-    /// one child each. With `append` and `at == nkeys` (the child goes last, on the tree's
-    /// rightmost path), `src` keeps all but its last old child, which the right branch takes
-    /// with the new one; otherwise `append` is ignored.
+    /// The cut is by bytes as in [`Self::split_leaf`], never moved back: every branch entry is at
+    /// most `U / 4` ([`entry_limit`]), so both halves end within `U` with at least one child each.
+    /// With `append` and `at == nkeys` (the child goes last, on the tree's rightmost path),
+    /// `src` keeps all but its last old child, which the right branch takes with the new one;
+    /// otherwise `append` is ignored.
     pub(crate) fn split_branch(
         &mut self,
         src: &[u8],
@@ -2145,7 +2213,7 @@ impl SplitBuf {
         append: bool,
     ) -> Result<()> {
         let size = cell_size_branch(self.sep.len());
-        check_split_entry(src, size)?;
+        check_split_entry(src, Kind::Branch, size)?;
         let h = hdr_of(src, Kind::Branch)?;
         check_split_at(src, &h, at)?;
         self.copy_with_cell(src, size);
@@ -2179,6 +2247,7 @@ impl SplitBuf {
         }
         let bytes = |cells: &[(usize, usize)]| cells.iter().map(|c| c.1 + SLOT).sum::<usize>();
         let total = bytes(&self.cells);
+        let usable = len - HEADER - TRAILER;
 
         // `m` = the number of cells `src` keeps (1..=n); cell `m` is the first of the right half.
         let m = if append && at == n {
@@ -2188,14 +2257,24 @@ impl SplitBuf {
             }
         } else {
             let mut cum = 0;
-            self.cells
+            let m = self
+                .cells
                 .iter()
                 .position(|c| {
                     let reached = 2 * cum >= total;
                     cum += c.1 + SLOT;
                     reached
                 })
-                .unwrap_or(n)
+                .unwrap_or(n);
+            // A leaf entry may reach `U / 2`, so the left part can pass `U` or leave a right part
+            // under `U / 4`, merge-due at once: then the cut moves back one entry (see
+            // `split_leaf`). With every entry at most `U / 4` neither happens.
+            let kept = bytes(&self.cells[..m]);
+            if h.kind == Kind::Leaf && (kept > usable || 4 * (total - kept) < usable) {
+                m.saturating_sub(1)
+            } else {
+                m
+            }
         }
         .clamp(1, n);
 
@@ -2207,7 +2286,6 @@ impl SplitBuf {
         let left = bytes(&self.cells[..m]);
         // A branch's separator moves up: its cell stays in the right half without the key.
         let right = total - left - if h.kind == Kind::Branch { klen } else { 0 };
-        let usable = len - HEADER - TRAILER;
         if left > usable || right > usable {
             return Err(corrupt(
                 old,
@@ -2306,10 +2384,10 @@ impl SplitBuf {
     }
 }
 
-/// The pending entry of a split must respect the entry limit (the split guarantee rests on it).
-fn check_split_entry(src: &[u8], cell_size: usize) -> Result<()> {
-    let max_entry = src.len().saturating_sub(HEADER + TRAILER) / 4;
-    if cell_size.saturating_add(SLOT) > max_entry {
+/// The pending entry of a split must respect its kind's entry limit ([`entry_limit`]): the split
+/// guarantee rests on it.
+fn check_split_entry(src: &[u8], kind: Kind, cell_size: usize) -> Result<()> {
+    if cell_size.saturating_add(SLOT) > entry_limit(kind, src.len()) {
         return Err(corrupt(src, format_args!("split entry of {cell_size} bytes over the limit")));
     }
     Ok(())
@@ -2401,7 +2479,9 @@ mod tests {
     use proptest::{collection::vec, prelude::*, sample::select};
 
     /// The split as it was built before [`SplitBuf`]: the right half in a separate empty page, the
-    /// left half rebuilt from a copy of the page by appending its cells one by one. The reference
+    /// left half rebuilt from a copy of the page by appending its cells one by one, with the
+    /// per-kind entry limit (a leaf's `U / 2`, a branch's `U / 4`) and a leaf's cut moved back an
+    /// entry when the kept part passes `U` or leaves the right part under `U / 4`. The reference
     /// for `splits_match_the_reference_split`.
     mod reference {
         use super::super::*;
@@ -2415,7 +2495,7 @@ mod tests {
             append: bool,
         ) -> Result<Vec<u8>> {
             let size = cell_size_leaf(key.len(), value.len());
-            check_split_entry(src, size)?;
+            check_split_entry(src, Kind::Leaf, size)?;
             let mut cell = vec![0; size];
             write_leaf_cell(&mut cell, key, Val::Inline(value));
             split(src, dst, Kind::Leaf, at, &cell, append)
@@ -2431,14 +2511,18 @@ mod tests {
             append: bool,
         ) -> Result<Vec<u8>> {
             let size = cell_size_branch(key.len());
-            check_split_entry(src, size)?;
+            check_split_entry(src, Kind::Branch, size)?;
             let mut cell = vec![0; size];
             write_branch_cell(&mut cell, key, child, child_txn);
             split(src, dst, Kind::Branch, at, &cell, append)
         }
 
-        fn check_split_entry(src: &[u8], cell_size: usize) -> Result<()> {
-            let max_entry = src.len().saturating_sub(HEADER + TRAILER) / 4;
+        fn check_split_entry(src: &[u8], kind: Kind, cell_size: usize) -> Result<()> {
+            let usable = src.len().saturating_sub(HEADER + TRAILER);
+            let max_entry = match kind {
+                Kind::Leaf => usable / 2,
+                Kind::Branch => usable / 4,
+            };
             if cell_size.saturating_add(SLOT) > max_entry {
                 return Err(corrupt(
                     src,
@@ -2490,6 +2574,8 @@ mod tests {
             let bytes = |cells: &[&[u8]]| cells.iter().map(|c| c.len() + SLOT).sum::<usize>();
             let total = bytes(&cells);
 
+            let usable = src.len() - HEADER - TRAILER;
+
             // `m` = the number of cells `src` keeps (1..=n); cell `m` is the first of `dst`.
             let m = if append && at == n {
                 match kind {
@@ -2498,14 +2584,21 @@ mod tests {
                 }
             } else {
                 let mut cum = 0;
-                cells
+                let half = cells
                     .iter()
                     .position(|c| {
                         let reached = 2 * cum >= total;
                         cum += c.len() + SLOT;
                         reached
                     })
-                    .unwrap_or(n)
+                    .unwrap_or(n);
+                let kept = bytes(&cells[..half]);
+                let step_back = kept > usable || 4 * (total - kept) < usable;
+                if kind == Kind::Leaf && step_back {
+                    half.saturating_sub(1)
+                } else {
+                    half
+                }
             }
             .clamp(1, n);
 
@@ -2516,7 +2609,6 @@ mod tests {
             let left = bytes(&cells[..m]);
             // A branch's separator moves up: its cell stays in `dst` without the key.
             let right = total - left - if kind == Kind::Branch { klen } else { 0 };
-            let usable = src.len() - HEADER - TRAILER;
             if left > usable || right > usable {
                 return Err(corrupt(
                     src,
@@ -2783,12 +2875,17 @@ mod tests {
         }
     }
 
+    /// The limits at every page size: entries of `U / 4` (branch entries, the longest key's
+    /// separator, and the records [`Geometry::check_entry`] holds to [`Geometry::max_entry_value`])
+    /// and leaf entries of `U / 2` ([`Geometry::max_value`], the inline limit), each exact to the
+    /// byte, with the 4 KiB numbers pinned.
     #[test]
     fn entry_limits_are_exact() {
         for size in SIZES {
             let g = geometry(size);
             let u = size as usize - HEADER - TRAILER;
             assert_eq!((g.page_size(), g.usable(), g.max_entry()), (size as usize, u, u / 4));
+            assert_eq!(g.max_leaf_entry(), u / 2);
             let mk = g.max_key();
             assert!(g.check_entry(mk, 0).is_ok());
             assert!(matches!(
@@ -2798,40 +2895,136 @@ mod tests {
             // A maximal key is a maximal separator entry.
             assert_eq!(cell_size_branch(mk) + SLOT, g.max_entry());
             for klen in [0, 1, 32, mk] {
-                let mv = g.max_value(klen);
-                assert!(g.check_entry(klen, mv).is_ok());
+                let ev = g.max_entry_value(klen);
+                assert!(g.check_entry(klen, ev).is_ok());
                 assert!(matches!(
-                    g.check_entry(klen, mv + 1),
-                    Err(Error::ValueTooLarge { len, max }) if len == mv + 1 && max == mv
+                    g.check_entry(klen, ev + 1),
+                    Err(Error::ValueTooLarge { len, max }) if len == ev + 1 && max == ev
                 ));
-                assert_eq!(cell_size_leaf(klen, mv) + SLOT, g.max_entry());
+                assert_eq!(cell_size_leaf(klen, ev) + SLOT, g.max_entry());
+                assert_eq!(cell_size_leaf(klen, g.max_value(klen)) + SLOT, g.max_leaf_entry());
             }
-            // Four maximal entries fill a leaf without overflowing it.
-            let mut page = fresh(&g, Kind::Leaf);
-            for i in 0..4_u8 {
-                let value = vec![i; g.max_value(32)];
-                let fit = leaf_insert(&mut page, i.into(), &[i; 32], &value).unwrap();
-                assert_eq!(fit, Fit::Done);
+            // Four maximal `U / 4` entries fill a leaf without overflowing it, and so do two
+            // maximal leaf entries.
+            for (n, value_len) in [(4_u8, g.max_entry_value(32)), (2, g.max_value(32))] {
+                let mut page = fresh(&g, Kind::Leaf);
+                for i in 0..n {
+                    let value = vec![i; value_len];
+                    let fit = leaf_insert(&mut page, i.into(), &[i; 32], &value).unwrap();
+                    assert_eq!(fit, Fit::Done, "{size}: {n} entries of {value_len}");
+                }
+                assert!(free_space(&page).unwrap() < g.max_entry(), "{size}: {n} of {value_len}");
+                validate(&page, &g).unwrap();
             }
-            assert!(free_space(&page).unwrap() < g.max_entry());
-            validate(&page, &g).unwrap();
         }
         for size in SIZES {
-            // The widest dup outer key: its cell inline, a 1-byte subkey within the key limit.
+            // The widest dup outer key: its cell a `U / 4` entry, a 1-byte subkey within the key
+            // limit.
             let g = geometry(size);
             let k = g.max_dup_key_len();
-            assert!(k < g.max_key() && g.max_value(k) >= NESTED_CELL, "{size}");
-            assert!(g.max_value(k + 1) < NESTED_CELL, "{size}: the largest");
+            assert!(k < g.max_key() && g.max_entry_value(k) >= NESTED_CELL, "{size}");
+            assert!(g.max_entry_value(k + 1) < NESTED_CELL, "{size}: the largest");
         }
         let g = geometry(4096);
-        assert_eq!((g.max_key(), g.max_value(32)), (1005, 975));
+        assert_eq!((g.max_key(), g.max_value(32), g.max_entry_value(32)), (1005, 1992, 975));
         assert_eq!(g.max_dup_key_len(), 975);
         // A refused key has no value limit, not the 1 or 0 bytes its entry would leave.
-        assert_eq!((g.max_value(1005), g.max_value(1006), g.max_value(1007)), (2, 0, 0));
-        assert_eq!(g.max_value(usize::MAX), 0);
+        assert_eq!((g.max_value(1005), g.max_value(1006), g.max_value(1007)), (1019, 0, 0));
+        let refused = (g.max_entry_value(1005), g.max_entry_value(1006), g.max_entry_value(1007));
+        assert_eq!(refused, (2, 0, 0));
+        assert_eq!((g.max_value(usize::MAX), g.max_entry_value(usize::MAX)), (0, 0));
         for bad in [0, 2048, 4095, 4097, 6144, 131_072, u32::MAX] {
             assert!(matches!(Geometry::new(bad), Err(Error::InvalidPageSize(b)) if b == bad));
         }
+    }
+
+    /// [`validate`] holds each kind to its own entry limit ([`entry_limit`]): a leaf entry of
+    /// `U / 2` passes and one of a byte more is refused, with keys from empty to the longest; a
+    /// branch entry of `U / 4` (the longest key's separator) passes and one of a byte more is
+    /// refused by the entry check, which runs before the key check that would refuse its key too.
+    #[test]
+    fn validate_holds_each_kind_to_its_entry_limit() {
+        for size in SIZES {
+            let g = geometry(size);
+            let u = g.usable();
+            assert_eq!((g.max_leaf_entry(), g.max_entry()), (u / 2, u / 4), "{size}");
+            for klen in [0, 1, 28, 32, 60, g.max_key()] {
+                let mv = g.max_value(klen);
+                assert_eq!(cell_size_leaf(klen, mv) + SLOT, g.max_leaf_entry(), "{size}/{klen}");
+                for (vlen, ok) in [(mv, true), (mv + 1, false)] {
+                    // `leaf_insert` does not enforce the limits.
+                    let mut page = fresh(&g, Kind::Leaf);
+                    let fit = leaf_insert(&mut page, 0, &vec![7; klen], &vec![1; vlen]).unwrap();
+                    assert_eq!(fit, Fit::Done);
+                    let checked = validate(&page, &g);
+                    if ok {
+                        checked.unwrap_or_else(|e| panic!("{size}/{klen}: {e}"));
+                    } else {
+                        assert!(corrupt_with(checked, "exceeds the limit"), "{size}/{klen}");
+                    }
+                }
+            }
+            for (klen, ok) in [(g.max_key(), true), (g.max_key() + 1, false)] {
+                assert_eq!(cell_size_branch(klen) + SLOT, g.max_entry() + usize::from(!ok));
+                let mut page = fresh(&g, Kind::Branch);
+                assert_eq!(branch_insert(&mut page, 0, &[], 1, 1).unwrap(), Fit::Done);
+                assert_eq!(branch_insert(&mut page, 1, &vec![7; klen], 2, 2).unwrap(), Fit::Done);
+                let checked = validate(&page, &g);
+                if ok {
+                    checked.unwrap_or_else(|e| panic!("{size}/{klen}: {e}"));
+                } else {
+                    assert!(corrupt_with(checked, "cell 1 of"), "{size}/{klen}");
+                }
+            }
+        }
+    }
+
+    /// A value of [`Geometry::max_value`] bytes, a leaf entry of `U / 2`, is placed inline and
+    /// one of a byte more in a run, for every key up to [`Geometry::max_key`] (each leaves room
+    /// for the overflow cell, so each takes a 16 MiB value) at every page size; [`validate`]
+    /// accepts the run's overflow cell and refuses one naming a value that fits inline. The
+    /// branch-sized bound [`Geometry::max_entry_value`] is the old `U / 4` one, which
+    /// [`Geometry::check_entry`] keeps.
+    #[test]
+    fn a_value_at_the_leaf_limit_is_inline_and_a_byte_more_is_a_run() {
+        for size in SIZES {
+            let g = geometry(size);
+            let p = g.page_size();
+            let mk = g.max_key();
+            for klen in [0, 1, 20, 28, 32, 60, mk - OVF_CELL + 3, mk] {
+                let mv = g.max_value(klen);
+                assert_eq!(mv, g.max_leaf_entry() - LEAF_CELL_HEADER - SLOT - klen, "{size}");
+                assert_eq!(g.max_entry_value(klen), g.max_entry() - LEAF_CELL_HEADER - SLOT - klen);
+                assert_eq!(g.place(klen, mv).unwrap(), Place::Inline, "{size}/{klen}");
+                let npages = overflow::run_pages(mv + 1, p);
+                assert_eq!(npages, 1, "{size}/{klen}: a value of under a page is a one-page run");
+                assert_eq!(g.place(klen, mv + 1).unwrap(), Place::Overflow { npages });
+                assert_eq!(g.max_table_value(klen), MAX_VALUE, "{size}/{klen}");
+                assert!(g.check_entry(klen, g.max_entry_value(klen)).is_ok());
+                assert!(matches!(
+                    g.check_entry(klen, g.max_entry_value(klen) + 1),
+                    Err(Error::ValueTooLarge { max, .. }) if max == g.max_entry_value(klen)
+                ));
+                // A run's cell is canonical for `mv + 1` bytes, not for `mv`.
+                let key = vec![7; klen];
+                for (len, ok) in [(mv + 1, true), (mv, false)] {
+                    let ovf = Ovf { pgno: 9, txn: 3, len: len as u32 };
+                    let mut page = fresh(&g, Kind::Leaf);
+                    let fit = LeafMut::new(&mut page).unwrap().insert(0, &key, Val::Overflow(ovf));
+                    assert_eq!(fit.unwrap(), Fit::Done);
+                    let checked = validate(&page, &g);
+                    assert_eq!(checked.is_ok(), ok, "{size}/{klen}: an overflow cell of {len}");
+                }
+            }
+            for klen in [mk + 1, usize::MAX] {
+                assert_eq!((g.max_value(klen), g.max_entry_value(klen)), (0, 0));
+                assert!(matches!(g.place(klen, 0), Err(Error::KeyTooLarge { .. })));
+            }
+        }
+        // reth's keys at 4 KiB: account history (28), bytecodes (32), storage history (60).
+        let g = geometry(4096);
+        assert_eq!([20, 28, 32, 60].map(|k| g.max_value(k)), [2004, 1996, 1992, 1964]);
+        assert_eq!([20, 28, 32, 60].map(|k| g.max_entry_value(k)), [987, 979, 975, 947]);
     }
 
     proptest! {
@@ -2851,7 +3044,7 @@ mod tests {
                     LeafOp::Put(s) => {
                         let key = s.key(&g);
                         let value = s.value(&g, key.len());
-                        prop_assert!(g.check_entry(key.len(), value.len()).is_ok());
+                        prop_assert_eq!(g.place(key.len(), value.len()).unwrap(), Place::Inline);
                         let (fit, need) = match leaf_search(&page, &key).unwrap() {
                             Search::Found(i) => {
                                 prop_assert_eq!(&model[i].0, &key);
@@ -2968,7 +3161,7 @@ mod tests {
                 let (left, right) = (entries(&src), entries(&dst));
                 prop_assert!(!left.is_empty() && !right.is_empty());
                 prop_assert_eq!(sep.unwrap(), right[0].0.clone());
-                prop_assert_eq!(&[left.clone(), right].concat(), &model);
+                prop_assert_eq!(&[left.clone(), right.clone()].concat(), &model);
                 prop_assert_eq!((pgno(&src), txn(&src)), (7, 3));
                 let left_used = g.usable() - free_space(&src).unwrap();
                 let right_used = g.usable() - free_space(&dst).unwrap();
@@ -2977,9 +3170,20 @@ mod tests {
                 if append && at == n {
                     prop_assert_eq!(left.len(), n);
                 } else {
-                    // Cut by bytes: the left reaches half, overshooting by less than one entry.
-                    prop_assert!(2 * right_used <= total, "{left_used} | {right_used}");
-                    prop_assert!(2 * left_used < total + 2 * g.max_entry());
+                    // Cut by bytes: the left reaches half, overshooting by less than its last
+                    // entry, unless that share passes `U` or leaves the right under `U / 4`; then
+                    // the cut is one entry back, and the right reaches half instead.
+                    let u = g.usable();
+                    let last = leaf_used(&left[left.len() - 1..]);
+                    let kept = left_used + leaf_used(&right[..1]);
+                    let sizes = format!("{left_used} | {right_used}");
+                    if 2 * right_used <= total {
+                        prop_assert!(2 * (left_used - last) < total, "{}", sizes);
+                        prop_assert!(left_used <= u && 4 * right_used >= u, "{}", sizes);
+                    } else {
+                        prop_assert!(2 * kept >= total, "{}", sizes);
+                        prop_assert!(kept > u || 4 * (total - kept) < u, "{}", sizes);
+                    }
                 }
             }
         }
@@ -4074,10 +4278,181 @@ mod tests {
         }
     }
 
+    /// A full leaf of random entries (page 7, txn 3, as [`fresh`]), inserted in random key order
+    /// so its cells lie out of slot order, each value at most `cap(klen)` bytes, and the entry
+    /// that did not fit, keyed to sort at a random place `at`: `(page, entries, at, entry)`.
+    fn random_full_leaf(
+        g: &Geometry,
+        rng: &mut crate::tree::test_harness::Rng,
+        cap: fn(&Geometry, usize) -> usize,
+    ) -> (Vec<u8>, Vec<Entry>, usize, Entry) {
+        let mut page = fresh(g, Kind::Leaf);
+        let (mut ranks, mut model): (Vec<u32>, Vec<Entry>) = (Vec::new(), Vec::new());
+        loop {
+            let klen = match rng.below(4) {
+                0 => g.max_key(),
+                1 => 4 + rng.len_upto(g.max_key() - 4),
+                _ => 4 + rng.len_upto(60),
+            };
+            let max = cap(g, klen);
+            let vlen = match rng.below(4) {
+                0 => max,
+                1 => rng.len_upto(max),
+                _ => rng.len_upto(16.min(max)),
+            };
+            let value = vec![rng.next() as u8; vlen];
+            // Odd ranks, so an even one sorts between any two neighbours.
+            let rank = rng.below(1 << 24) as u32 * 2 + 1;
+            let Err(pos) = ranks.binary_search(&rank) else { continue };
+            let key = ranked_key(rank, klen);
+            if leaf_insert(&mut page, pos, &key, &value).unwrap() == Fit::Full {
+                let at = rng.len_upto(model.len());
+                let below = at.checked_sub(1).map_or(0, |i| ranks[i] + 1);
+                return (page, model, at, (ranked_key(below, klen), value));
+            }
+            ranks.insert(pos, rank);
+            model.insert(pos, (key, value));
+        }
+    }
+
+    /// The leaf cut with entries up to the leaf limit `U / 2`, over `rounds` random full leaves
+    /// a page size: see `leaf_splits_with_entries_up_to_the_leaf_limit_keep_both_halves_in_range`.
+    fn check_leaf_splits_up_to_the_leaf_limit(rounds: usize) {
+        use crate::tree::test_harness::{ReportSeed, Rng};
+
+        let mut buf = SplitBuf::default();
+        for size in SIZES {
+            let g = geometry(size);
+            let u = g.usable();
+            let seed = 0x9E37_79B9_7F4A_7C15 ^ u64::from(size);
+            let (_seed, mut rng) = (ReportSeed(seed), Rng(seed));
+            // Splits whose cut moved back from a left part past `U`, from a right part under
+            // `U / 4`, and splits of entries up to `U / 4` checked against the reference.
+            let (mut past, mut under, mut small) = (0, 0, 0);
+            for round in 0..2 * rounds {
+                let big = round % 2 == 0;
+                let cap = if big { Geometry::max_value } else { Geometry::max_entry_value };
+                let (src, model, at, (key, value)) = random_full_leaf(&g, &mut rng, cap);
+                let append = rng.below(4) == 0;
+                let n = model.len();
+                let mut all = model.clone();
+                all.insert(at, (key.clone(), value.clone()));
+
+                let (mut got_src, mut got_dst) =
+                    (src.clone(), vec![crate::tree::POISON; size as usize]);
+                buf.split_leaf(&got_src, at, &key, Val::Inline(&value), append)
+                    .unwrap_or_else(|e| panic!("{size} round {round}: {e}"));
+                buf.write_right(&mut got_dst, 7, 3).unwrap();
+                buf.write_left(&mut got_src).unwrap();
+                validate(&got_src, &g).unwrap();
+                validate(&got_dst, &g).unwrap();
+                let (left, right) = (entries(&got_src), entries(&got_dst));
+                assert_eq!([left.clone(), right.clone()].concat(), all, "{size} round {round}");
+                assert_eq!(buf.sep(), &right[0].0[..], "{size} round {round}: separator");
+                if append && at == n {
+                    // An append split leaves `src` as it was and moves only the new entry.
+                    assert_eq!((got_src == src, right.len()), (true, 1), "{size} round {round}");
+                    continue;
+                }
+
+                // The rule, restated: the first cut where the left part reaches half, moved back
+                // one entry when the left part passes `U` or the right one is under `U / 4`.
+                let sizes: Vec<usize> =
+                    all.iter().map(|(k, v)| cell_size_leaf(k.len(), v.len()) + SLOT).collect();
+                let total: usize = sizes.iter().sum();
+                assert!(total > u && sizes.iter().all(|&e| e <= g.max_leaf_entry()));
+                let prefix = |j: usize| sizes[..j].iter().sum::<usize>();
+                let half = (1..=n).find(|&j| 2 * prefix(j) >= total).unwrap_or(n);
+                let (moved_past, moved_under) = (prefix(half) > u, 4 * (total - prefix(half)) < u);
+                let want = if moved_past || moved_under { half - 1 } else { half };
+                assert_eq!(left.len(), want, "{size} round {round}: the cut");
+                past += usize::from(moved_past);
+                under += usize::from(!moved_past && moved_under);
+
+                // Both halves fit, and neither is merge-due (`4 · used < U`) at once.
+                let (left_used, right_used) = (prefix(want), total - prefix(want));
+                assert_eq!(left_used, u - free_space(&got_src).unwrap());
+                assert_eq!(right_used, u - free_space(&got_dst).unwrap());
+                assert!(left_used <= u && right_used <= u, "{size} round {round}");
+                assert!(4 * left_used >= u && 4 * right_used >= u, "{size} round {round}");
+
+                if !big {
+                    // Entries of at most `U / 4`: the cut never moves, and the split is the
+                    // reference split byte for byte.
+                    assert!(!moved_past && !moved_under, "{size} round {round}");
+                    let (mut want_src, mut want_dst) = (src.clone(), fresh(&g, Kind::Leaf));
+                    let sep = reference::split_leaf(
+                        &mut want_src,
+                        &mut want_dst,
+                        at,
+                        &key,
+                        &value,
+                        append,
+                    )
+                    .unwrap();
+                    assert_eq!(buf.sep(), &sep[..], "{size} round {round}");
+                    assert!(got_src == want_src, "{size} round {round}: left halves differ");
+                    let right_same = outside_gap(&got_dst) == outside_gap(&want_dst);
+                    assert!(right_same, "{size} round {round}: right halves differ");
+                    small += 1;
+                }
+            }
+            assert!(past > 0 && under > 0 && small > 0, "{size}: {past} {under} {small}");
+        }
+
+        // The pending entry of a split is held to its kind's limit: `U / 2` for a leaf, `U / 4`
+        // for a branch.
+        for size in SIZES {
+            let g = geometry(size);
+            let mut rng = Rng(u64::from(size) | 1);
+            let (src, _, at, (key, _)) = random_full_leaf(&g, &mut rng, Geometry::max_value);
+            let mv = g.max_value(key.len());
+            assert!(buf.split_leaf(&src, at, &key, Val::Inline(&vec![1; mv]), false).is_ok());
+            let over = buf.split_leaf(&src, at, &key, Val::Inline(&vec![1; mv + 1]), false);
+            assert!(corrupt_with(over, "split entry"), "{size}");
+
+            let mut branch = fresh(&g, Kind::Branch);
+            assert_eq!(branch_insert(&mut branch, 0, &[], 1, 1).unwrap(), Fit::Done);
+            let mut i = 1;
+            while branch_insert(&mut branch, i, &ranked_key(2 * i as u32 + 1, 40), 2, 2).unwrap()
+                == Fit::Done
+            {
+                i += 1;
+            }
+            for (klen, ok) in [(g.max_key(), true), (g.max_key() + 1, false)] {
+                buf.sep = ranked_key(2 * i as u32 + 1, klen);
+                let split = buf.split_branch(&branch, i, 5, 5, false);
+                assert_eq!(split.is_ok(), ok, "{size}/{klen}");
+                assert!(ok || corrupt_with(split, "split entry"), "{size}/{klen}");
+            }
+        }
+    }
+
+    /// Leaf splits with entries up to the leaf limit `U / 2` ([`entry_limit`]), over random full
+    /// leaves at every page size, the pending entry anywhere and up to the limit too: both halves
+    /// fit `U` and hold at least `U / 4` (neither merge-due at once), every entry is kept in key
+    /// order, the separator is the right half's first key, and the cut is the first one where the
+    /// left part reaches half, moved back one entry exactly when the left part passes `U` or the
+    /// right one is under `U / 4` (both seen at every size). With every entry at most `U / 4` the
+    /// cut never moves and the split is the reference split's byte for byte. A pending entry is
+    /// held to its kind's limit: a leaf's of `U / 2` splits and one of a byte more is refused, a
+    /// branch's of `U / 4` splits and one of a byte more is refused.
+    #[test]
+    fn leaf_splits_with_entries_up_to_the_leaf_limit_keep_both_halves_in_range() {
+        check_leaf_splits_up_to_the_leaf_limit(150);
+    }
+
+    #[test]
+    #[ignore = "heavy: run with --release"]
+    fn leaf_splits_with_entries_up_to_the_leaf_limit_keep_both_halves_in_range_heavy() {
+        check_leaf_splits_up_to_the_leaf_limit(20_000);
+    }
+
     /// [`Geometry::place`]: a value up to [`Geometry::max_value`] stays inline (M1's rule, so
     /// every inline layout is unchanged); a larger one goes to a run of `ceil((28 + len) / P)`
-    /// pages when its key leaves room for the 12-byte cell and it is at most [`MAX_VALUE`];
-    /// anything else is refused with the error and limit `Env::max_value_len` reports.
+    /// pages when its key leaves room for the 12-byte cell (every key up to
+    /// [`Geometry::max_key`]) and it is at most [`MAX_VALUE`]; anything else is refused with the
+    /// error and limit `Env::max_value_len` reports.
     #[test]
     fn place_keeps_m1_values_inline_and_sends_larger_ones_to_runs() {
         for size in SIZES {
@@ -4087,34 +4462,24 @@ mod tests {
             let want = |r: Result<Place>| format!("{r:?}");
             let place = |klen: usize, vlen: usize| want(g.place(klen, vlen));
             let runs = |len: usize| want(Ok(Place::Overflow { npages: (28 + len).div_ceil(p) }));
-            for klen in [0, 1, 24, mk - OVF_CELL + 2, mk - OVF_CELL + 3] {
+            for klen in [0, 1, 24, mk - OVF_CELL + 2, mk - OVF_CELL + 3, mk] {
                 let max = g.max_value(klen);
                 assert_eq!(place(klen, 0), want(Ok(Place::Inline)), "{size}: klen {klen}");
                 assert_eq!(place(klen, max), want(Ok(Place::Inline)), "{size}: klen {klen}");
-                if klen + OVF_CELL <= mk + 2 {
-                    assert_eq!(g.max_table_value(klen), MAX_VALUE);
-                    assert_eq!(place(klen, max + 1), runs(max + 1), "{size}: klen {klen}");
-                    assert_eq!(place(klen, p - 28), runs(p - 28), "one full page");
-                    assert_eq!(place(klen, p - 27), runs(p - 27), "two pages");
-                    assert_eq!(place(klen, MAX_VALUE), runs(MAX_VALUE), "the largest value");
-                    assert_eq!(
-                        place(klen, MAX_VALUE + 1),
-                        want(Err(Error::ValueTooLarge { len: MAX_VALUE + 1, max: MAX_VALUE }))
-                    );
-                } else {
-                    // The 12-byte cell would not fit a maximal entry: inline values only.
-                    assert_eq!(g.max_table_value(klen), max);
-                    assert_eq!(
-                        place(klen, max + 1),
-                        want(Err(Error::ValueTooLarge { len: max + 1, max })),
-                        "{size}: klen {klen}"
-                    );
-                }
+                assert_eq!(g.max_table_value(klen), MAX_VALUE);
+                assert_eq!(place(klen, max + 1), runs(max + 1), "{size}: klen {klen}");
+                assert_eq!(place(klen, p - 28), runs(p - 28), "one full page");
+                assert_eq!(place(klen, p - 27), runs(p - 27), "two pages");
+                assert_eq!(place(klen, MAX_VALUE), runs(MAX_VALUE), "the largest value");
+                assert_eq!(
+                    place(klen, MAX_VALUE + 1),
+                    want(Err(Error::ValueTooLarge { len: MAX_VALUE + 1, max: MAX_VALUE }))
+                );
             }
             assert_eq!(place(mk + 1, 0), want(Err(Error::KeyTooLarge { len: mk + 1, max: mk })));
-            // The longest key with a run: its overflow cell is exactly a maximal entry.
-            let klen = mk - OVF_CELL + 2;
-            assert_eq!(cell_size_leaf(klen, OVF_CELL) + SLOT, g.max_entry());
+            // Even the longest key's overflow cell fits a maximal leaf entry (`U / 2`), so every
+            // key up to `max_key` has a run: none is limited to inline values.
+            assert!(cell_size_leaf(mk, OVF_CELL) + SLOT <= g.max_leaf_entry(), "{size}");
         }
     }
 

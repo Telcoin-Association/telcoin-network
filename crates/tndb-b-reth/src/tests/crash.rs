@@ -102,9 +102,9 @@ const SMALL_SLOTS: u64 = 3;
 const GROWING_SLOTS: u64 = 64;
 const GROWING_PUTS: u64 = 3;
 
-/// The lengths of `Bytecodes` values: all past a 4 KiB page's inline limit, up to runs of 18
-/// pages.
-const CODE_SIZES: [usize; 6] = [1_500, 4_100, 9_000, 17_000, 40_000, 70_000];
+/// The lengths of `Bytecodes` values: the first inline at 4 KiB pages, the rest past the inline
+/// limit, in runs of 1 to 18 pages.
+const CODE_SIZES: [usize; 7] = [1_500, 3_000, 4_100, 9_000, 17_000, 40_000, 70_000];
 
 /// The most rounds a child runs, should no kill come (it also stops once its stdout is closed).
 const MAX_ROUNDS: u64 = 1_000_000;

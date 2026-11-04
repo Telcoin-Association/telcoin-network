@@ -36,9 +36,8 @@ pub enum Error {
         /// The shortest key the call accepts for this table.
         min: usize,
     },
-    /// A value longer than a table accepts with its key: 16 MiB (in an overflow run) for a key
-    /// that leaves room for the run's reference in its leaf, else what the leaf holds
-    /// ([`crate::Env::max_value_len`]).
+    /// A value longer than a table accepts with its key: 16 MiB (in an overflow run) for every key
+    /// within the key limit ([`crate::Env::max_value_len`]).
     #[error("tndb-b: value of {len} bytes exceeds the maximum of {max} for its key")]
     ValueTooLarge {
         /// The value's length.

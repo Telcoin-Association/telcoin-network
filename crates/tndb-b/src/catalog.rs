@@ -58,23 +58,25 @@ const RESERVED: [std::ops::Range<usize>; 2] = [76..80, CREATED.end..RECORD_LEN];
 /// else the root of a nested B+tree of its own.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct DupOptions {
-    /// The width of every outer key, in bytes: at least 1, and at most what leaves the outer cell
-    /// (the key and a 32-byte nested root) an inline entry, `MAX_ENTRY − 42` (975 bytes at 4 KiB
-    /// pages, 4047 at 16 KiB, 16335 at 64 KiB). A logical key `k ‖ s` is still held to the page
-    /// size's `max_key`, so the subkey takes at most `max_key − key_len` bytes.
+    /// The width of every outer key, in bytes: at least 1, and at most what keeps the outer cell
+    /// (the key and a 32-byte nested root) within a quarter-page entry, `U / 4 − 42` (975 bytes
+    /// at 4 KiB pages, 4047 at 16 KiB, 16335 at 64 KiB). A logical key `k ‖ s` is still held to
+    /// the page size's `max_key`, so the subkey takes at most `max_key − key_len` bytes.
     pub key_len: u16,
     /// The largest packed set, in bytes of its encoding: a key whose rows encode within it keeps
-    /// them in its outer cell; 0: every key holds a nested tree. Else at least 7 and at most the
-    /// longest value an inline entry of a `key_len`-byte key takes (987 bytes at `key_len` 20 and
-    /// 4 KiB pages), or [`Self::PACKED_DEFAULT`] for that most; see [`Self::resolved`]. A key
-    /// whose rows outgrow it moves them to a nested tree and stays nested.
+    /// them in its outer cell; 0: every key holds a nested tree. Else at least 7 and at most
+    /// `U / 4 − 10 − key_len`, the longest value of a quarter-page entry with a `key_len`-byte
+    /// key (987 bytes at `key_len` 20 and 4 KiB pages), or [`Self::PACKED_DEFAULT`] for that most;
+    /// see [`Self::resolved`]. A key whose rows outgrow it moves them to a nested tree and stays
+    /// nested.
     pub packed_max: u16,
 }
 
 impl DupOptions {
-    /// The request for the largest `packed_max` the page size allows, the longest value an inline
-    /// entry of a `key_len`-byte key takes. Never a limit itself (no page size allows a value this
-    /// long inline): [`Self::resolved`] and `RwTxn::create_dup_table` replace it with that number.
+    /// The request for the largest `packed_max` the page size allows, the longest value of a
+    /// quarter-page entry with a `key_len`-byte key. Never a limit itself (no page size allows a
+    /// value this long inline): [`Self::resolved`] and `RwTxn::create_dup_table` replace it with
+    /// that number.
     pub const PACKED_DEFAULT: u16 = u16::MAX;
 
     /// Options of `key_len`-byte outer keys whose packed sets take the most the page size allows
@@ -85,8 +87,8 @@ impl DupOptions {
 
     /// The options a dup table created with these at `page_size`-byte pages records, which its
     /// `TableStat::dup` reports and `RwTxn::create_dup_table` compares on an existing table:
-    /// these with [`Self::PACKED_DEFAULT`] replaced by the longest value an inline entry of a
-    /// `key_len`-byte key takes. [`Error::InvalidPageSize`] for a page size `Env::open` refuses;
+    /// these with [`Self::PACKED_DEFAULT`] replaced by the longest value of a quarter-page entry
+    /// with a `key_len`-byte key. [`Error::InvalidPageSize`] for a page size `Env::open` refuses;
     /// [`Error::InvalidDupOptions`] for options `create_dup_table` refuses: `key_len` 0 or too
     /// wide for the page size, or `packed_max` neither 0 nor in `7..=` that longest value.
     pub fn resolved(&self, page_size: u32) -> Result<Self> {
@@ -95,7 +97,7 @@ impl DupOptions {
 
     /// [`Self::resolved`] at the page size `geometry`: `key_len` in
     /// `1..=`[`Geometry::max_dup_key_len`] and `packed_max` 0, [`Self::PACKED_DEFAULT`] (which
-    /// resolves to [`Geometry::max_value`]`(key_len)`) or in [`PACKED_MIN`]`..=` that, else
+    /// resolves to [`Geometry::max_entry_value`]`(key_len)`) or in [`PACKED_MIN`]`..=` that, else
     /// [`Error::InvalidDupOptions`].
     pub(crate) fn resolve(&self, geometry: &Geometry) -> Result<Self> {
         let max = geometry.max_dup_key_len();
@@ -105,7 +107,7 @@ impl DupOptions {
                 self.key_len
             )));
         }
-        let most = geometry.max_value(usize::from(self.key_len));
+        let most = geometry.max_entry_value(usize::from(self.key_len));
         let packed_max = match self.packed_max {
             Self::PACKED_DEFAULT => u16::try_from(most).expect("a value limit below u16::MAX"),
             n if n == 0 || (PACKED_MIN..=most).contains(&usize::from(n)) => n,
@@ -228,14 +230,14 @@ impl TableRecord {
 
     /// The record, if this build serves its table at the page size `geometry`: every plain
     /// record, and a dup record whose outer key has at most [`Geometry::max_dup_key_len`] bytes
-    /// and whose `packed_max` is 0 or at most [`Geometry::max_value`]`(key_len)` (decode already
-    /// holds a nonzero one to [`PACKED_MIN`]). Every use of a record (a table's resolution,
-    /// `Env::check`) takes this. Neither refusal is a record this build writes, so each is damage
-    /// (or a newer format): [`Error::Corrupt`].
+    /// and whose `packed_max` is 0 or at most [`Geometry::max_entry_value`]`(key_len)` (decode
+    /// already holds a nonzero one to [`PACKED_MIN`]). Every use of a record (a table's
+    /// resolution, `Env::check`) takes this. Neither refusal is a record this build writes, so each
+    /// is damage (or a newer format): [`Error::Corrupt`].
     pub(crate) fn usable(&self, geometry: &Geometry) -> Result<&Self> {
         let Some(d) = &self.dup else { return Ok(self) };
         let (id, max) = (self.id, geometry.max_dup_key_len());
-        let most = geometry.max_value(usize::from(d.key_len));
+        let most = geometry.max_entry_value(usize::from(d.key_len));
         if usize::from(d.key_len) > max {
             Err(Error::Corrupt(format!(
                 "catalog record: dup table {id}: key_len {} past this page size's {max}",
@@ -565,10 +567,11 @@ mod tests {
     }
 
     /// A dup record is served when its outer key fits the page size's
-    /// [`Geometry::max_dup_key_len`] and its `packed_max` is 0 or in `7..=max_value(key_len)`; a
-    /// wider key or a limit outside that is `Corrupt` at every use. The options a new dup table is
-    /// given obey the same limits ([`DupOptions::resolve`]), with [`DupOptions::PACKED_DEFAULT`]
-    /// resolving to `max_value(key_len)`, at every page size and through the public
+    /// [`Geometry::max_dup_key_len`] and its `packed_max` is 0 or in
+    /// `7..=max_entry_value(key_len)`; a wider key or a limit outside that is `Corrupt` at
+    /// every use. The options a new dup table is given obey the same limits
+    /// ([`DupOptions::resolve`]), with [`DupOptions::PACKED_DEFAULT`] resolving to
+    /// `max_entry_value(key_len)`, at every page size and through the public
     /// [`DupOptions::resolved`].
     #[test]
     fn dup_records_are_usable_within_this_builds_limits() {
@@ -577,7 +580,7 @@ mod tests {
             let max = g.max_dup_key_len() as u16;
             let options = |key_len, packed_max| DupOptions { key_len, packed_max };
             for key_len in [1, 4, 20, max] {
-                let most = g.max_value(usize::from(key_len)) as u16;
+                let most = g.max_entry_value(usize::from(key_len)) as u16;
                 assert!(usize::from(most) >= PACKED_MIN, "{size} {key_len}");
                 for packed_max in [0, 7, 8, most - 1, most] {
                     let shape = options(key_len, packed_max);

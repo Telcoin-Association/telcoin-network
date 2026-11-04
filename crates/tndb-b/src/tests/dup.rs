@@ -157,13 +157,13 @@ fn table_kinds_are_checked() {
 }
 
 /// `create_dup_table` refuses an empty outer key, one past [`Geometry::max_dup_key_len`] and a
-/// `packed_max` outside `7..=`[`Geometry::max_value`]`(key_len)` (but 0) with `InvalidDupOptions`,
-/// creating nothing and with no latch (on a new name and on an existing one), at 4 KiB and 16 KiB
-/// pages; the widest key is accepted, and its table takes rows of a 1-byte subkey, enough of them
-/// for an outer tree of two levels.
+/// `packed_max` outside `7..=`[`Geometry::max_entry_value`]`(key_len)` (but 0) with
+/// `InvalidDupOptions`, creating nothing and with no latch (on a new name and on an existing one),
+/// at 4 KiB and 16 KiB pages; the widest key is accepted, and its table takes rows of a 1-byte
+/// subkey, enough of them for an outer tree of two levels.
 ///
 /// [`Geometry::max_dup_key_len`]: crate::page::Geometry::max_dup_key_len
-/// [`Geometry::max_value`]: crate::page::Geometry::max_value
+/// [`Geometry::max_entry_value`]: crate::page::Geometry::max_entry_value
 #[test]
 fn dup_options_are_validated() {
     for page_size in [4096, 16384] {
@@ -177,8 +177,8 @@ fn dup_options_are_validated() {
         let widest = DupOptions { key_len: max, packed_max: 0 };
         let w = txn.create_dup_table("widest", widest).expect("the widest outer key");
         assert_eq!(txn.table_stat(&w).expect("stat").dup, Some(widest));
-        let most = env.inner().geometry.max_value(usize::from(OPTIONS.key_len));
-        let widest_most = env.inner().geometry.max_value(usize::from(max));
+        let most = env.inner().geometry.max_entry_value(usize::from(OPTIONS.key_len));
+        let widest_most = env.inner().geometry.max_entry_value(usize::from(max));
         let range = |n: usize, most: usize| format!("packed_max {n} outside 7..={most} for this");
         for (name, options, what) in [
             ("bad", DupOptions { key_len: 0, ..OPTIONS }, "key_len 0 outside".to_string()),
@@ -314,7 +314,7 @@ pub(super) fn restamp_encoded(
 /// A dup record whose `packed_max` is out of range is `Corrupt` wherever the table is resolved:
 /// either transaction's `open_table`, `create_table` of its name, a get and a table stat through a
 /// handle taken before, and `Env::check`. A limit of 1..=6 breaks a record rule (decode refuses
-/// it); one past the longest inline value of the outer key, or the request
+/// it); one past the outer key's quarter-page bound (`max_entry_value`), or the request
 /// [`DupOptions::PACKED_DEFAULT`] itself, keeps every rule but is a record this build does not
 /// serve, as is an outer key one byte past the page size's widest. Each latches; the plain table
 /// beside it reads on.
@@ -322,7 +322,7 @@ pub(super) fn restamp_encoded(
 fn a_dup_record_with_packed_max_out_of_range_is_refused() {
     let geometry = crate::page::Geometry::new(4096).expect("4 KiB");
     let wide = 1 + geometry.max_dup_key_len() as u16;
-    let most = geometry.max_value(usize::from(OPTIONS.key_len)) as u16;
+    let most = geometry.max_entry_value(usize::from(OPTIONS.key_len)) as u16;
     let past = format!("packed_max {} outside 7..={most} for this page size", most + 1);
     let request = format!("packed_max {} outside 7..={most}", DupOptions::PACKED_DEFAULT);
     for (case, message) in [
@@ -554,10 +554,13 @@ fn outcome<T>(result: Result<T>) -> Outcome {
 /// of at most [`OPTIONS`]' `key_len` bytes (no subkey) is `KeyTooShort` for either transaction's
 /// get and for put, insert, append and delete, over an outer key with rows too; a key one byte
 /// past [`Env::max_key_len`] is `KeyTooLarge` for each write, and its get and delete answer as
-/// `p`'s do; a value at [`Env::max_value_len`] of its logical key (on either side of the overflow
-/// limit) is stored, and one byte more is `ValueTooLarge`, as in `p`. Nothing refused latches or
-/// changes a row. An outer key for `delete_prefix` of one byte less than `key_len` is
-/// `KeyTooShort`, of one byte more `KeyTooLarge`.
+/// `p`'s do. Values straddle the inline limit of the tree that holds the row (`p`'s is
+/// [`page::Geometry::max_value`] of the logical key, the nested tree's of the subkey, 4 bytes
+/// longer): at it a value is inline, one byte past it a one-page run, with the longest keys too;
+/// a value at [`Env::max_value_len`] of the longest key (16 MiB, as at every key length) is stored,
+/// and one byte more is `ValueTooLarge`, as in `p`. Nothing refused latches or changes a row. An
+/// outer key for `delete_prefix` of one byte less than `key_len` is `KeyTooShort`, of one byte more
+/// `KeyTooLarge`.
 #[test]
 fn dup_keys_are_validated() {
     let (_dir, path) = temp("tndb_b_dup_keys");
@@ -613,13 +616,15 @@ fn dup_keys_are_validated() {
     ] {
         assert_eq!(twins[0], twins[1], "{what} of a long key, d and p");
     }
-    // At the overflow limit (max_key - 10), past it, and at the widest key.
+    // The value limit is 16 MiB at every key length, the longest included.
+    let limit = 16 << 20;
+    let past = vec![0xef; limit + 1];
+    let geometry = env.inner().geometry;
+    let page_size = geometry.page_size();
     for len in [max_key - 10, max_key - 9, max_key] {
+        assert_eq!(env.max_value_len(len), limit, "{len}");
         let writes = txn.table_writes(&d);
-        let limit = env.max_value_len(len);
-        assert!(limit > 1, "{len}");
         let key = [&2u32.to_be_bytes()[..], &vec![0xcd; len - 4]].concat();
-        let past = vec![0xef; limit + 1];
         for table in [&d, &p] {
             let result = outcome(txn.put(table, &key, &past));
             assert_eq!(
@@ -629,13 +634,31 @@ fn dup_keys_are_validated() {
             );
         }
         assert_eq!(txn.table_writes(&d), writes, "{len}: a refused put moves no stamp");
-        let value = vec![len as u8; limit];
-        for table in [&d, &p] {
-            txn.put(table, &key, &value).expect("a value at the limit");
-            assert_eq!(txn.get(table, &key).expect("get"), Some(&value[..]), "{len}");
+        // Either side of each table's inline limit: `p`'s, then the nested tree's.
+        let (plain, nested) = (geometry.max_value(len), geometry.max_value(len - 4));
+        assert_eq!(nested, plain + 4, "{len}");
+        for (fill, vlen) in [(0xc0, plain), (0xc1, plain + 1), (0xc2, nested), (0xc3, nested + 1)] {
+            let key = [&2u32.to_be_bytes()[..], &vec![fill; len - 4]].concat();
+            let value = vec![len as u8; vlen];
+            assert_eq!(overflow::run_pages(vlen, page_size), 1, "{len} {vlen}: a one-page run");
+            for (table, inline) in [(&d, nested), (&p, plain)] {
+                let before = txn.table_stat(table).expect("stat").overflow_pages;
+                txn.put(table, &key, &value).expect("a value by the inline limit");
+                assert_eq!(txn.get(table, &key).expect("get"), Some(&value[..]), "{len}");
+                let after = txn.table_stat(table).expect("stat").overflow_pages;
+                assert_eq!(after - before, u32::from(vlen > inline), "{len} {vlen} {inline}");
+            }
+            model.insert(key, value);
         }
-        model.insert(key, value);
     }
+    // A value at the limit with the longest key, in an overflow run in both tables.
+    let key = [&2u32.to_be_bytes()[..], &vec![0xcd; max_key - 4]].concat();
+    let value = vec![0x5e; limit];
+    for table in [&d, &p] {
+        txn.put(table, &key, &value).expect("a value at the limit");
+        assert_eq!(txn.get(table, &key).expect("get"), Some(&value[..]), "the longest key");
+    }
+    model.insert(key, value);
     let writes = txn.table_writes(&d);
     let short = txn.delete_prefix(&d, &[0; 3]);
     assert!(matches!(short, Err(Error::KeyTooShort { len: 3, min: 4 })), "{short:?}");
@@ -652,6 +675,97 @@ fn dup_keys_are_validated() {
     assert_rows("committed", ro.dup_rows_for_test(&d), get, &model);
     for (key, value) in &model {
         assert_eq!(ro.get(&p, key).expect("get"), Some(&value[..]), "the plain twin");
+    }
+}
+
+/// Values longer than a quarter-page entry holds ([`page::Geometry::max_entry_value`]) and up to
+/// the leaf limit ([`page::Geometry::max_value`], a half-page entry) are stored inline at every
+/// page size: in a plain table `p` under 8-byte keys, and in [`OPTIONS`]' dup table `d` beside
+/// 8-byte subkeys (a row of a nested tree is its subkey and value). Neither table has an overflow
+/// page in its `table_stat` or in `Env::check`, in the writing transaction, after its commit and
+/// after a reopen, and every row reads back. A replace of a value at the leaf limit is done in
+/// `p`'s cached leaf (debug builds count it). One byte more goes to a one-page run in each table.
+#[test]
+fn values_up_to_the_leaf_limit_are_inline_and_a_byte_more_is_a_run() {
+    const KEY: usize = 8;
+    /// The figures of `p` and `d` in `txn`, and of each in a passing `Env::check` of `env`, are
+    /// those of `overflow` run pages, and every row of `plain` and `dup` reads back.
+    #[track_caller]
+    fn assert_tables(env: &Env, txn: &impl ReadTxn, plain: &Rows, dup: &Rows, overflow: u32) {
+        let report = check_dup(env, "d");
+        for (name, rows) in [("p", plain), ("d", dup)] {
+            let table = txn.open_table(name).expect("open").expect("the table");
+            for (k, v) in rows {
+                assert_eq!(txn.get(&table, k).expect("get"), Some(v.as_slice()), "{name} {k:02x?}");
+            }
+            let stat = txn.table_stat(&table).expect("stat");
+            assert_eq!(
+                (stat.entries, stat.overflow_pages),
+                (rows.len() as u64, overflow),
+                "{name}"
+            );
+            let pages = u64::from(stat.branch_pages + stat.leaf_pages + stat.overflow_pages);
+            assert_eq!(report.tables[name].pages, pages, "{name}: check's pages");
+        }
+    }
+    for page_size in crate::meta::PAGE_SIZES {
+        let g = page::Geometry::new(page_size).expect("geometry");
+        let (low, high) = (g.max_entry_value(KEY) + 1, g.max_value(KEY));
+        assert!(low + 1 < high, "{page_size}: a window between the two limits");
+        let (_dir, path) = temp("tndb_b_dup_leaf_limit");
+        let env_options = EnvOptions { page_size, ..EnvOptions::default() };
+        let env = Env::open(&path, env_options).expect("open");
+        let mut txn = env.begin_rw().expect("rw");
+        let d = txn.create_dup_table("d", OPTIONS).expect("d");
+        let p = txn.create_table("p").expect("p");
+        let (mut plain, mut dup) = (Rows::new(), Rows::new());
+        // Out of key order, so the big entries split leaves in the middle as well as at the end.
+        for i in 0..24u32 {
+            let value = vec![i as u8; [low, (low + high) / 2, high][i as usize % 3]];
+            let key = (u64::from(i * 7 % 24) << 8).to_be_bytes().to_vec();
+            txn.put(&p, &key, &value).expect("put p");
+            plain.insert(key.clone(), value.clone());
+            let row = dup_key(i % 4, &key);
+            txn.put(&d, &row, &value).expect("put d");
+            dup.insert(row, value);
+        }
+        assert_eq!(txn.table_stat(&p).expect("stat").overflow_pages, 0, "{page_size}");
+        assert_eq!(txn.table_stat(&d).expect("stat").overflow_pages, 0, "{page_size}");
+        assert_eq!(txn.table_stat(&p).expect("stat").height, 2, "{page_size}: p's leaves split");
+        #[cfg(debug_assertions)]
+        {
+            let cached = || crate::tree::write::CACHED_PUTS.with(std::cell::Cell::get);
+            let key = plain.keys().next().cloned().expect("a key");
+            let value = vec![0xa5; high];
+            // The first put may split (a longer value); the second refills the cache.
+            txn.put(&p, &key, &value).expect("put");
+            txn.put(&p, &key, &value).expect("put");
+            let before = cached();
+            txn.put(&p, &key, &value).expect("put");
+            assert_eq!(cached(), before + 1, "{page_size}: a replace in the cached leaf");
+            plain.insert(key, value);
+        }
+        txn.commit().expect("commit");
+        assert_tables(&env, &env.begin_ro().expect("ro"), &plain, &dup, 0);
+        drop(env);
+
+        let env = Env::open(&path, env_options).expect("reopen");
+        assert_tables(&env, &env.begin_ro().expect("ro"), &plain, &dup, 0);
+        let mut txn = env.begin_rw().expect("rw");
+        let (p, d) = (txn.open_table("p").expect("open"), txn.open_table("d").expect("open"));
+        let (p, d) = (p.expect("p"), d.expect("d"));
+        let (key, value) = (u64::MAX.to_be_bytes().to_vec(), vec![0x5a; high + 1]);
+        txn.put(&p, &key, &value).expect("put p");
+        plain.insert(key.clone(), value.clone());
+        let row = dup_key(1, &key);
+        txn.put(&d, &row, &value).expect("put d");
+        dup.insert(row, value);
+        assert_eq!(overflow::run_pages(high + 1, page_size as usize), 1, "{page_size}");
+        txn.commit().expect("commit");
+        assert_tables(&env, &env.begin_ro().expect("ro"), &plain, &dup, 1);
+        drop(env);
+        let env = Env::open(&path, env_options).expect("reopen");
+        assert_tables(&env, &env.begin_ro().expect("ro"), &plain, &dup, 1);
     }
 }
 

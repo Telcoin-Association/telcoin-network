@@ -13,8 +13,9 @@
 //! Row i spans `start_i..end[i]`, with `start_0 = 2 + 4n` and `start_i = end[i − 1]`; its first
 //! `slen[i]` bytes are the subkey and the rest (possibly none) the value. A row is two slot reads
 //! away, so a seek is a binary search and a cursor steps by index; a row's subkey and value are
-//! contiguous. The offsets are u16: a blob is at most the inline value limit of its outer key
-//! (16366 bytes at 64 KiB pages), so every offset fits. The smallest blob is [`PACKED_MIN`] bytes.
+//! contiguous. The offsets are u16: a blob is at most the longest value of a quarter-page entry
+//! with its outer key (16366 bytes at 64 KiB pages), so every offset fits. The smallest blob is
+//! [`PACKED_MIN`] bytes.
 //!
 //! **Checks.** The dup layer knows a cell is a packed set only by its table's bound, so every
 //! rule is checked here, in three tiers, and broken as [`Error::Corrupt`] (the caller adds the
@@ -407,7 +408,7 @@ mod tests {
     /// The bound and the subkey limit of a table of 20-byte outer keys at 4 KiB pages.
     fn limits() -> (usize, usize) {
         let g = Geometry::new(4096).unwrap();
-        (g.max_value(20), g.max_subkey(20))
+        (g.max_entry_value(20), g.max_subkey(20))
     }
 
     fn is_corrupt<T: fmt::Debug>(r: Result<T>) -> bool {
@@ -706,7 +707,7 @@ mod tests {
         // The largest blob, at 64 KiB pages with a 1-byte outer key: 1000 short rows and a
         // last one filling the bound, every offset in u16.
         let g = Geometry::new(MAX_PAGE_SIZE as u32).unwrap();
-        let (max, max_subkey) = (g.max_value(1), g.max_subkey(1));
+        let (max, max_subkey) = (g.max_entry_value(1), g.max_subkey(1));
         assert_eq!(max, 16366);
         assert!(max <= usize::from(u16::MAX));
         let (mut out, mut ends) = (Vec::new(), Vec::new());

@@ -31,8 +31,8 @@ fn b_key(i: u32) -> Vec<u8> {
     key
 }
 
-/// The largest inline value for a 180-byte key at 4 KiB pages: its entry (cell and slot) is a
-/// quarter of the page's usable bytes.
+/// The value for a 180-byte key at 4 KiB pages whose entry (cell and slot) is a quarter of the
+/// page's usable bytes.
 const B_VALUE: usize = 827;
 
 /// The children `(pgno, txn)` of branch page `p` in the newest state of `env`.

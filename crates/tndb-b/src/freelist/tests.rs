@@ -926,7 +926,7 @@ fn tree_pages(env: &Env) -> Vec<u32> {
 /// 25th key, 100 inline bytes for the rest.
 fn run_value_len(i: u32) -> usize {
     if i.is_multiple_of(25) {
-        (i / 25 % 6) as usize * 4096 + 2000
+        (i / 25 % 6) as usize * 4096 + 3000
     } else {
         100
     }

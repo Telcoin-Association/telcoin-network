@@ -489,7 +489,8 @@ fn tndb_b_sync_and_merge() {
 /// The stamp probe's keys: 8-byte, sequential, each with a [`PROBE_VALUE`]-byte value, four to a
 /// 4 KiB leaf, so a commit that replaces every value writes about 100k tree pages (~392 MiB).
 const PROBE_KEYS: u64 = 400_000;
-/// The largest inline value of an 8-byte key on 4 KiB pages: one maximal entry, a quarter leaf.
+/// The longest value of an 8-byte key whose entry is a quarter of a 4 KiB leaf
+/// (`Geometry::max_entry_value`), so four fill a leaf.
 const PROBE_VALUE: usize = 999;
 /// The gapped shape's values: four to a leaf leave 1436 bytes (35.1%) of each 4 KiB leaf a free
 /// gap, about the gap of a long-running writer's pages.

@@ -56,9 +56,9 @@ tx.commit()?;
   damage is `DatabaseError::Read` with `MDBX_CORRUPTED`, latches the environment, and its detail
   is in `failure`. TN's MDBX to tndb-b migration (`tn-reth`) copies with `NoSync`, then syncs and
   checks before it moves the file into place.
-- **Limits:** a value up to 16 MiB. One up to the inline limit (about a quarter page: 999 bytes
-  with an 8-byte key at 4 KiB pages, where MDBX keeps about 2 KB in the leaf) stays in its leaf;
-  a larger one goes to an overflow run of contiguous pages, transparently.
+- **Limits:** a value up to 16 MiB. One up to the inline limit (about half a page: 2016 bytes
+  with an 8-byte key at 4 KiB pages, where MDBX keeps 2020 in the leaf) stays in its leaf; a
+  larger one goes to an overflow run of contiguous pages, transparently.
 
 ## Dup-sort tables
 
@@ -400,9 +400,10 @@ MDBX's at every size):
 | PlainStorageState | 0.09 MiB | 0.10 MiB | 0.88 |
 | PlainAccountState | 0.05 MiB | 0.05 MiB | 0.93 |
 
-`BlockOmmers` holds values of 0 to 2 headers (about 0.6 KB each): a 2-header value is past tndb's
-inline limit at 4 KiB pages (about 1 KB) and takes a 1-page overflow run, where MDBX keeps values up
-to about 2 KB in the leaf. TN blocks carry no ommers.
+`BlockOmmers` holds values of 0 to 2 headers (about 0.6 KB each): in this run a 2-header value was
+past tndb's inline limit at 4 KiB pages (then about 1 KB) and took a 1-page overflow run, where
+MDBX keeps values up to about 2 KB in the leaf. The inline limit is now about 2 KB as well, so such
+a value stays in its leaf. TN blocks carry no ommers.
 
 **The tuning:** two changes, from samply profiles of the `RandomRead` rows (a read transaction, then
 10 times a new cursor and its `seek_exact`). A new engine cursor zeroed and moved a 784-byte path

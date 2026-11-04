@@ -948,9 +948,22 @@ fn a_seek_with_key_tail_meets_damage_as_a_seek_does() {
     let (mut store, root, map) = build(shape, &mut rng);
     let probes = every_key_and_gap(&Model::new(&map).entries);
     assert_eq!(fused_seek_matches_seek_then_current(&store.reader(), &root, &probes), 0);
-    let runs = store.run_pgnos(&root);
-    assert!(runs.len() > 2, "multi-page runs: {runs:?}");
-    store.raw_mut(runs[1])[100] ^= 0x40;
+    // The second page of the first run of more than one page (a 1-page run's CRC is not read).
+    let second = walk_tree(&store.reader(), &root)
+        .leaves
+        .iter()
+        .flat_map(|&leaf| {
+            let buf = store.raw(leaf);
+            (0..page::nkeys(buf)).filter_map(move |i| match page::leaf_entry(buf, i).unwrap().1 {
+                page::Val::Overflow(ovf) => {
+                    (crate::overflow::run_pages(ovf.len as usize, 4096) > 1).then_some(ovf.pgno + 1)
+                }
+                _ => None,
+            })
+        })
+        .next()
+        .expect("a multi-page run");
+    store.raw_mut(second)[100] ^= 0x40;
     check(&store, &root, "a damaged run");
 }
 

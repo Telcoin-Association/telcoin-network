@@ -10,7 +10,7 @@
 //! | off | size | field |
 //! |---|---|---|
 //! | 0 | 8 | magic `b"tndb-b\0\0"` |
-//! | 8 | 4 | format version (3) |
+//! | 8 | 4 | format version (5) |
 //! | 12 | 4 | page size |
 //! | 16 | 8 | txn id |
 //! | 24 | 4 | page count (pages `0..page_count` are allocated) |
@@ -32,10 +32,12 @@ use crate::{
 /// The first 8 bytes of every meta record.
 pub(crate) const MAGIC: [u8; 8] = *b"tndb-b\0\0";
 
-/// The on-disk format version this build reads and writes: 4, whose tree pages' CRCs skip their
-/// free gaps (`page::crc`). Version 3's pages carry whole-page CRCs, and it is refused as
+/// The on-disk format version this build reads and writes: 5, whose leaves hold inline values up
+/// to their entry limit of `U / 2` (`page::Geometry::max_value`) and whose tree pages' CRCs skip
+/// their free gaps (`page::crc`). Version 4's leaves held them only to `U / 4`, every larger value
+/// in an overflow run, and version 3's pages carry whole-page CRCs; each is refused as
 /// [`Error::UnsupportedVersion`], as are 2 and 1: the format is pre-release, with no migration.
-pub(crate) const FORMAT_VERSION: u32 = 4;
+pub(crate) const FORMAT_VERSION: u32 = 5;
 
 /// The size of a meta record (at offset 0 of its page).
 pub(crate) const META_LEN: usize = 128;
@@ -49,7 +51,7 @@ const CATALOG: std::ops::Range<usize> = 32..32 + TreeRoot::ENCODED_LEN;
 /// Where the free tree's [`TreeRoot`] lies.
 const FREE: std::ops::Range<usize> = CATALOG.end..CATALOG.end + TreeRoot::ENCODED_LEN;
 
-/// The bytes the format reserves (zero in version 4).
+/// The bytes the format reserves (zero in version 5).
 const RESERVED: std::ops::Range<usize> = FREE.end..CRC_AT;
 
 /// Every page size a file can have, smallest first: where meta 1 may lie when meta 0 cannot be
@@ -488,7 +490,7 @@ mod tests {
     /// stamped or not: the format is pre-release, with no migration.
     #[test]
     fn a_version_2_record_is_refused() {
-        assert_eq!(FORMAT_VERSION, 4);
+        assert_eq!(FORMAT_VERSION, 5);
         assert_version_refused(2);
     }
 
@@ -497,8 +499,17 @@ mod tests {
     /// migration.
     #[test]
     fn a_version_3_record_is_refused() {
-        assert_eq!(FORMAT_VERSION, 4);
+        assert_eq!(FORMAT_VERSION, 5);
         assert_version_refused(3);
+    }
+
+    /// A version-4 record (leaves holding inline values only to `U / 4`, so its overflow cells
+    /// for larger ones are not this build's canonical placement) is refused before its CRC,
+    /// stamped or not, never read as damage: the format is pre-release, with no migration.
+    #[test]
+    fn a_version_4_record_is_refused() {
+        assert_eq!(FORMAT_VERSION, 5);
+        assert_version_refused(4);
     }
 
     /// The commit writes over the lower txn, an invalid slot first, slot 1 on a tie.
