@@ -423,3 +423,17 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   batch validation and execution never apply replacement rules, so nodes with and without it
   agree on every batch and block. Upstream's test fails without the fix. *Upstream*: n/a
   (upstream commit).
+
+- **TN-0034** — Backport d85d9deae: end a `syncing` subscription when its client leaves.
+  *Kind*: backport.
+  *Files*: `crates/rpc/rpc/src/eth/pubsub.rs`, `crates/rpc/rpc-builder/tests/it/ws.rs`
+  (upstream's two tests).
+  *Why*: the `eth_subscribe("syncing")` task noticed a closed client only when a send failed, and
+  it sends only when the sync status changes. In TN that is never for an observer, and only on a
+  validator's active/inactive switch. Each abandoned subscription kept two tasks and a broadcast
+  receiver that woke on every executed block, and the connection's subscription slot was never
+  released after `eth_unsubscribe`. The task now also waits on the sink closing. Reachable over
+  WebSocket and IPC. Conflict only in the tests: upstream moved the test imports to the module
+  top and uses the newer `reth_tasks::Runtime`; TN's tree has v1.11's `TokioTaskExecutor`. Both
+  tests fail without the fix (50 tasks outlive the connection; the second subscription is
+  refused). *Upstream*: n/a (upstream commit).
