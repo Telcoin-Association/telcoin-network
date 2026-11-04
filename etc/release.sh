@@ -1195,20 +1195,29 @@ check_sums() {
     (cd "$dir" && sha256_check SHA256SUMS) >&2 || die 1 "SHA256SUMS does not match the files"
 }
 
-# $1 is the content of an IMAGE_DIGEST, one line "<repository>@sha256:<hex>". The repository
-# must be IMAGE, the package of the tag's channel (or the dry run's RELEASE_IMAGE): a mainnet
-# tag never names an image in tn-testnet, an adiri tag never one in tn-mainnet, and neither
-# names any other repository. $2, when given, replaces the advice at the end of the refusal.
+# $1 is an IMAGE_DIGEST file. It must hold exactly one line "IMAGE@sha256:<64 hex>", where IMAGE
+# is the package of the tag's channel (or the dry run's RELEASE_IMAGE): a mainnet tag never
+# names an image in tn-testnet, an adiri tag never one in tn-mainnet, neither names any other
+# repository, and the digest is well formed. Every refusal has one shape: what the file holds,
+# the tag's channel, its package and the expected line. $2, when given, replaces the advice at
+# the end of the refusal.
 check_digest_package() {
-    local line=$1 advice=${2:-rebuild the draft with make release-build TAG=$TAG, or report it if the release is published} repo
-    case "$line" in
-        *$'\n'*) die 1 "IMAGE_DIGEST must be a single line" ;;
-        *@*) ;;
-        *) die 1 "IMAGE_DIGEST names '$line', not an image by digest; expected $IMAGE@sha256:<hex>" ;;
-    esac
+    local file=$1 advice=${2:-rebuild the draft with make release-build TAG=$TAG, or report it if the release is published} lines line repo digest problem=
+    lines=$(awk 'END { print NR }' "$file") || die 1 "cannot read $file"
+    line=$(cat "$file") || die 1 "cannot read $file"
     repo=${line%%@*}
-    [ "$repo" = "$IMAGE" ] ||
-        die 1 "IMAGE_DIGEST names an image in $repo, but $TAG is on the $CHANNEL channel, whose images are published only in $IMAGE; $advice"
+    digest=${line#*@}
+    if [ "$lines" != 1 ]; then
+        problem="holds $lines lines"
+    elif [ "$repo" = "$line" ]; then
+        problem="names '$line', which is not an image by digest"
+    elif [ "$repo" != "$IMAGE" ]; then
+        problem="names an image in $repo"
+    elif ! [[ "$digest" =~ $DIGEST_RE ]]; then
+        problem="names $IMAGE with the malformed digest '$(printf '%s' "$digest" | tr -c '[:print:]' '?')'"
+    fi
+    [ -z "$problem" ] ||
+        die 1 "IMAGE_DIGEST $problem, but $TAG is on the $CHANNEL channel, whose images are published only in $IMAGE (expected the one line $IMAGE@sha256:<64 hex>); $advice"
 }
 
 # sign before it signs, verify before it counts signatures: SHA256SUMS in $1 lists exactly one
@@ -1216,27 +1225,23 @@ check_digest_package() {
 # the tag's package. A maintainer signature therefore never covers an image in the other
 # network's package. $2 is passed on to check_digest_package as its advice.
 check_sums_package() {
-    local dir=$1 advice=${2:-} listed have line
+    local dir=$1 advice=${2:-} listed have
     listed=$(awk '$2 == "IMAGE_DIGEST" { n++; h = $1 } END { if (n == 1) print h }' "$dir/SHA256SUMS") ||
         die 1 "cannot read $dir/SHA256SUMS"
     have=$(sha256_hex "$dir/IMAGE_DIGEST") || exit
     if [ -z "$listed" ] || [ "$listed" != "$have" ]; then
         die 1 "SHA256SUMS does not list the IMAGE_DIGEST beside it exactly once with its hash"
     fi
-    line=$(cat "$dir/IMAGE_DIGEST") || die 1 "cannot read $dir/IMAGE_DIGEST"
-    check_digest_package "$line" "$advice"
+    check_digest_package "$dir/IMAGE_DIGEST" "$advice"
 }
 
 # IMAGE_DIGEST is one line "IMAGE@sha256:<hex>" and the registry still serves IMAGE:TAG at that
 # digest. Sets D.
 check_image_digest_file() {
-    local file=$1/IMAGE_DIGEST line lines reg
-    lines=$(awk 'END { print NR }' "$file")
+    local file=$1/IMAGE_DIGEST line reg
+    check_digest_package "$file"
     line=$(cat "$file")
-    [ "$lines" = 1 ] || die 1 "IMAGE_DIGEST must be a single line"
-    check_digest_package "$line"
     D=${line#"$IMAGE@"}
-    [[ "$D" =~ $DIGEST_RE ]] || die 1 "IMAGE_DIGEST holds a malformed digest: $D"
     reg=$(registry_digest "$TAG")
     [ "$reg" = "$D" ] || die 1 "IMAGE_DIGEST says $D but the registry serves $IMAGE:$TAG as ${reg:-nothing}"
 }
@@ -1661,13 +1666,13 @@ cmd_draft() {
     if [ "$REL_EXISTS" = 1 ]; then
         [ "$REL_DRAFT" = true ] || die 1 "release $TAG is already published"
         [ "$REL_AUTHOR" = "$BOT_LOGIN" ] || die 1 "the draft for $TAG was created by $REL_AUTHOR, not $BOT_LOGIN"
-        # A re-run after the build keeps the digest the build put into the body.
+        # A re-run after the build keeps the digest the build put into the body, and stops on
+        # an IMAGE_DIGEST that is not one well-formed line in the tag's package.
         if has_asset IMAGE_DIGEST; then
             release_fetch "$WORK/draft" IMAGE_DIGEST
+            check_digest_package "$WORK/draft/IMAGE_DIGEST"
             line=$(cat "$WORK/draft/IMAGE_DIGEST")
-            check_digest_package "$line"
             digest=${line#"$IMAGE@"}
-            if ! [[ "$digest" =~ $DIGEST_RE ]]; then digest=; fi
         fi
     fi
     render_notes "$digest" >"$notes"
