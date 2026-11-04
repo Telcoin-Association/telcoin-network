@@ -73,7 +73,7 @@ use crate::{
     check::{self, CheckReport},
     crc::CrcState,
     error::{Error, Result},
-    file::{MapView, PageFile, ReadOnlyFile, DEFAULT_RESERVE},
+    file::{MapView, PageFile, ReadOnlyFile, DEFAULT_RESERVE, MAX_GROWTH, MIN_GROWTH},
     freelist,
     latch::{Latch, UnwindLatch},
     meta::{choose_meta, slot_to_write, Chosen, Meta, META_LEN},
@@ -144,6 +144,12 @@ pub struct EnvOptions {
     /// either way, and the advice measured slower first writes into new file space, so it is off
     /// there. `true` gives no advice, for a workload that scans whole tables cold.
     pub readahead: bool,
+    /// The largest growth step in bytes (default 1 GiB): the file grows by doubling up to it, then
+    /// linearly by it, each step preallocated. At least [`MIN_GROWTH`](crate::MIN_GROWTH), else
+    /// [`Env::open`] refuses it ([`Error::InvalidMaxGrowth`]). A smaller step bounds the
+    /// preallocated tail past the pages in use while the environment runs; a clean close gives
+    /// that tail back.
+    pub max_growth: u64,
 }
 
 impl Default for EnvOptions {
@@ -153,6 +159,7 @@ impl Default for EnvOptions {
             map_reserve: DEFAULT_RESERVE,
             sync: SyncMode::Durable,
             readahead: !cfg!(target_os = "linux"),
+            max_growth: MAX_GROWTH,
         }
     }
 }
@@ -364,21 +371,36 @@ impl EnvInner {
     }
 }
 
+/// The close: in [`SyncMode::NoSync`] the final sync, then the trim of the file's preallocated
+/// tail ([`Writer::trim_tail`]). A latched environment does neither (its newest state may not be
+/// durable, and the slots' bookkeeping may not match the disk), nor does a read-only one, which
+/// has no writer. A failed sync skips the trim; a failed trim is logged and changes nothing that
+/// matters: the file keeps its tail, which is slack.
 impl Drop for EnvInner {
     fn drop(&mut self) {
         #[cfg(test)]
         if self.crash_on_drop.load(Ordering::Relaxed) {
             return;
         }
-        if self.sync_mode != SyncMode::NoSync || self.latch.is_failed() {
+        if self.latch.is_failed() {
             return;
         }
         // Every transaction holds a reference to this, so the writer's state is home (a
-        // read-only environment has none, and is never `NoSync`).
-        if let Some(writer) = self.writer.get_mut().as_mut() {
+        // read-only environment has none).
+        let Some(writer) = self.writer.get_mut().as_mut() else {
+            return;
+        };
+        if self.sync_mode == SyncMode::NoSync {
             if let Err(e) = writer.sync(&self.latch) {
                 tracing::error!(target: "tndb_b", "the final sync failed: {e}");
+                return;
             }
+        }
+        if let Err(e) = writer.trim_tail() {
+            tracing::warn!(
+                target: "tndb_b",
+                "the close did not trim the file's preallocated tail: {e}; the file keeps it"
+            );
         }
     }
 }
@@ -772,6 +794,48 @@ impl Writer {
         Ok(())
     }
 
+    /// Give back the file's preallocated tail at a clean close ([`EnvInner::drop`], after the
+    /// final sync): truncate the file to [`Self::trim_len`] when that is shorter
+    /// ([`PageFile::trim_to`]). An error leaves the file as it was, or longer than its pages: never
+    /// shorter than a state a meta slot names.
+    fn trim_tail(&mut self) -> Result<()> {
+        let len = self.trim_len()?;
+        if len >= self.file.file_len() {
+            return Ok(());
+        }
+        self.file.trim_to(len)
+    }
+
+    /// The length a clean close may truncate the file to: the most pages any state a meta slot
+    /// holds on disk names, and never fewer than the newest state's ([`Self::last`]), times the
+    /// page size, rounded up to the OS page. A torn or invalid slot (`None`) names no state an
+    /// open can recover, so it is left out; a valid slot whose record in the file does not decode
+    /// to its txn is one this writer cannot account for, and refuses the trim
+    /// ([`Error::Failed`]).
+    ///
+    /// The page count never shrinks from one committed state to the next (the allocator's next
+    /// page number only grows within a transaction, and an abort puts it back), so the newest
+    /// state's count is the largest; the slots' are read anyway, which costs a close nothing.
+    fn trim_len(&self) -> Result<u64> {
+        let size = self.geometry.page_size();
+        let mut pages = self.last.page_count;
+        for (slot, txn) in self.slots.iter().enumerate() {
+            let Some(txn) = *txn else { continue };
+            let record = self.file.page(slot as u32, size).and_then(|page| page.first_chunk());
+            match record.map(Meta::decode) {
+                Some(Ok(meta)) if meta.txn == txn => pages = pages.max(meta.page_count),
+                _ => {
+                    return Err(Error::Failed(format!(
+                        "meta slot {slot} does not hold the state of txn {txn}"
+                    )))
+                }
+            }
+        }
+        (u64::from(pages) * size as u64)
+            .checked_next_multiple_of(sys::os_page_size())
+            .ok_or_else(|| Error::Failed(format!("no length holds {pages} pages")))
+    }
+
     /// Test-only: the txns the meta slots hold on disk.
     #[cfg(test)]
     pub(crate) fn slots(&self) -> [Option<u64>; 2] {
@@ -1065,17 +1129,23 @@ impl Env {
     /// newest committed state (see the module docs). Errors: [`Error::Locked`] if another handle
     /// holds it open; [`Error::NotTndbB`], [`Error::UnsupportedVersion`] or [`Error::Corrupt`]
     /// for a file that cannot be opened safely (left unchanged); [`Error::InvalidPageSize`] for
-    /// an invalid `options.page_size`; [`Error::Io`].
+    /// an invalid `options.page_size`; [`Error::InvalidMaxGrowth`] for an `options.max_growth`
+    /// under [`MIN_GROWTH`](crate::MIN_GROWTH) (both refused before the file is touched);
+    /// [`Error::Io`].
     pub fn open(path: impl AsRef<Path>, options: EnvOptions) -> Result<Env> {
         let path = path.as_ref();
         Geometry::new(options.page_size)?;
+        if options.max_growth < MIN_GROWTH {
+            return Err(Error::InvalidMaxGrowth(options.max_growth));
+        }
         let file = open_locked(path, options.page_size)?;
         let (chosen, geometry) = choose_state(&file)?;
         let meta = chosen.meta;
         // A crash may have left a meta in the page cache whose msync never finished: make what
         // this open reads durable before anything is built on it.
         sys::fsync_file(&file)?;
-        let file = PageFile::from_file(file, options.map_reserve, options.readahead)?;
+        let file =
+            PageFile::from_file(file, options.map_reserve, options.readahead, options.max_growth)?;
         let snapshot = checked_snapshot(meta, geometry, file.view())?;
         let writer = Writer {
             view: file.view(),

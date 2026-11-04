@@ -65,6 +65,7 @@ impl Latch {
             | Error::NotTndbB
             | Error::UnsupportedVersion(_)
             | Error::InvalidPageSize(_)
+            | Error::InvalidMaxGrowth(_)
             | Error::Locked
             | Error::ReadOnly
             | Error::WrongTxn => {}

@@ -169,6 +169,7 @@ fn engine_errors_carry_mdbx_codes_and_messages() {
         (E::StaleTable("t".into()), Error::NotFound),
         (E::InvalidTableName, Error::DecodeError),
         (E::InvalidPageSize(3), Error::DecodeError),
+        (E::InvalidMaxGrowth(4096), Error::DecodeError),
         (E::KeyTooShort { len: 4, min: 5 }, Error::BadValSize),
         (E::TableKind("t".into()), Error::Incompatible),
         (E::InvalidDupOptions("packed_max must be 0".into()), Error::DecodeError),
@@ -227,6 +228,21 @@ fn a_refused_insert_reports_damage_its_seek_meets() {
         }
         .into())
     );
+}
+
+/// `TndbArgs::with_max_growth` reaches the engine's `EnvOptions::max_growth`: a step under
+/// `MIN_GROWTH` is refused at a read-write open (`MDBX_EINVAL`) before the file is created, and
+/// `MIN_GROWTH` itself opens.
+#[test]
+fn with_max_growth_reaches_the_engine() {
+    let dir = tempfile::tempdir().unwrap();
+    let args = TndbArgs::default().with_max_growth(crate::MIN_GROWTH - 1);
+    assert!(matches!(
+        super::open_env(dir.path(), TndbEnvKind::RW, args).unwrap_err(),
+        DatabaseError::Open(err) if err == Error::DecodeError.into()));
+    assert!(!dir.path().join(crate::DATA_FILE).exists(), "the refused open created the file");
+    let args = TndbArgs::default().with_max_growth(crate::MIN_GROWTH);
+    super::open_env(dir.path(), TndbEnvKind::RW, args).unwrap();
 }
 
 #[test]

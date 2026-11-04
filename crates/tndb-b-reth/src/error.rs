@@ -91,9 +91,10 @@ pub(crate) fn info(error: &tndb_b::Error) -> DatabaseErrorInfo {
         E::ReadOnly => Mdbx::ACCESS.info(),
         E::WrongTxn => Mdbx::BAD_TXN.info(),
         E::TableNotFound(_) | E::StaleTable(_) => Mdbx::NOT_FOUND.info(),
-        E::InvalidTableName | E::InvalidPageSize(_) | E::InvalidDupOptions(_) => {
-            Mdbx::INVALID_PARAMETER.info()
-        }
+        E::InvalidTableName
+        | E::InvalidPageSize(_)
+        | E::InvalidMaxGrowth(_)
+        | E::InvalidDupOptions(_) => Mdbx::INVALID_PARAMETER.info(),
         E::Failed(_) => Mdbx::PANIC.with_message(error.to_string()),
         E::NotTndbB => Mdbx::INVALID.with_message(error.to_string()),
         E::UnsupportedVersion(_) => Mdbx::VERSION_MISMATCH.with_message(error.to_string()),

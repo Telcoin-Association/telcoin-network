@@ -131,6 +131,10 @@ pub struct TndbArgs {
     pub page_size: u32,
     /// Address space the mapping reserves, in bytes (default: the engine's).
     pub map_reserve: u64,
+    /// The largest growth step of the file, in bytes (default: the engine's, 1 GiB): the engine's
+    /// `EnvOptions::max_growth`. An open refuses one under [`tndb_b::MIN_GROWTH`]
+    /// (`MDBX_EINVAL`).
+    pub max_growth: u64,
     /// When commits become durable (default [`SyncMode::Durable`]).
     pub sync: SyncMode,
     /// Test-only: whether the dup-sort tables whose layout is an engine dup table are stored as
@@ -158,6 +162,7 @@ impl Default for TndbArgs {
         Self {
             page_size: 4096,
             map_reserve: engine.map_reserve,
+            max_growth: engine.max_growth,
             sync: SyncMode::Durable,
             #[cfg(test)]
             nested_dup: true,
@@ -183,6 +188,12 @@ impl TndbArgs {
     /// Set the address space the mapping reserves.
     pub const fn with_map_reserve(mut self, map_reserve: u64) -> Self {
         self.map_reserve = map_reserve;
+        self
+    }
+
+    /// Set the largest growth step of the file, at least [`tndb_b::MIN_GROWTH`].
+    pub const fn with_max_growth(mut self, max_growth: u64) -> Self {
+        self.max_growth = max_growth;
         self
     }
 
@@ -229,6 +240,7 @@ impl TndbArgs {
             page_size: self.page_size,
             map_reserve: self.map_reserve,
             sync: self.sync,
+            max_growth: self.max_growth,
             ..EnvOptions::default()
         }
     }

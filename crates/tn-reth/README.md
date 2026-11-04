@@ -431,9 +431,12 @@ every path TN uses, and MDBX stays compiled in both builds. Every backend differ
 - **`--db.*` flags on tndb-b** (`tndb_args`): `--db.max-size` is the mapping's address-space
   reservation (unset: the engine's default, 1 GiB); past it the engine remaps at double the size,
   so it is not a cap. `--db.page-size` sets a new file's page size (the engine accepts a power of
-  two in 4 KiB..=64 KiB). `--db.sync-mode durable` is durable commits. Refused at startup, naming
-  the flag: `--db.exclusive`, `--db.read-transaction-timeout`, `--db.max-readers`,
-  `--db.growth-step`, `--db.log-level`, `--db.sync-mode safe-no-sync`, and reth's `UtterlyNoSync`
+  two in 4 KiB..=64 KiB). `--db.growth-step` is the largest growth step (unset, the engine's 1
+  GiB): the file grows by doubling up to it, then by it, each step preallocated, and a clean close
+  gives back the unused tail; a step under the engine's minimum (`MIN_GROWTH`, 1 MiB) is refused.
+  `--db.sync-mode durable` is durable commits. Refused at startup, naming the flag:
+  `--db.exclusive`, `--db.read-transaction-timeout`, `--db.max-readers`, `--db.log-level`,
+  `--db.sync-mode safe-no-sync`, and reth's `UtterlyNoSync`
   and `NoMetaSync` sync modes (neither has a CLI value). The no-sync refusals say why and point at
   `durable`: the engine's `NoSync` reuses the pages a commit frees only after a sync, and nothing
   syncs a `NoSync` environment on its own, so the file would grow until one (see "Persist

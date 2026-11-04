@@ -70,6 +70,7 @@ pub use catalog::DupOptions;
 pub use check::{CheckReport, TableCheck};
 pub use env::{Env, EnvOptions, EnvStat, SyncMode};
 pub use error::{Error, Result};
+pub use file::MIN_GROWTH;
 pub use stats::IoStats;
 pub use tree::cursor::{Cursor, KeyTail};
 pub use txn::{

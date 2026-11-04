@@ -35,8 +35,10 @@ tx.commit()?;
 - **One file,** `<dir>/tndb.dat` (`DATA_FILE`), locked with the engine's `flock`: a second open of
   a file another handle holds is `MDBX_BUSY`.
 - **`TndbArgs`:** 4 KiB pages by default (any power of two from 4 to 64 KiB, fixed when the file
-  is created), the engine's map reserve, and `SyncMode::Durable` (or `NoSync`, made durable by
-  `TndbEnv::sync` or the drop).
+  is created), the engine's map reserve, the engine's largest growth step (1 GiB;
+  `with_max_growth`, at least `MIN_GROWTH`, 1 MiB, the engine's constant re-exported, else the
+  open is `MDBX_EINVAL`), and `SyncMode::Durable` (or `NoSync`, made durable by `TndbEnv::sync`
+  or the drop). A clean drop gives back the file's preallocated tail (the engine's close).
 - **Read cursors are pooled per transaction:** a `TndbTx` keeps the engine cursors its dropped
   cursors give back, up to four a table, and its next `cursor_read` or `cursor_dup_read` of that
   table takes one and resets it (the engine's `reset`: the cursor then behaves exactly as a new

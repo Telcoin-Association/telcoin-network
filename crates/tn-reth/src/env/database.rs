@@ -54,19 +54,17 @@ const TNDB_DATA_FILE: &str = "tndb.dat";
 /// and lets many envs coexist. On tndb-b the same 2 GiB is the mapping's reservation, past which
 /// the engine remaps rather than fails.
 ///
-/// The MDBX build also grows the file in 4 MiB steps, reth's `test()` step (reth pairs its 8 TB
-/// default with a 4 GiB step), so throwaway databases stay small on disk. tndb-b grows its file
-/// as pages are written and refuses `--db.growth-step`.
+/// The file also grows in 4 MiB steps, reth's `test()` step (reth pairs its 8 TB default with a
+/// 4 GiB step), so throwaway databases stay small on disk. On tndb-b it is the largest growth
+/// step: the file doubles from 1 MiB up to it, then grows by it.
 pub(crate) fn temp_chain_db_args() -> DatabaseArgs {
     /// The temp chain's map size.
     const TEMP_CHAIN_DB_MAX_SIZE: usize = 2 * 1024 * 1024 * 1024; // 2 GiB
-    /// The temp chain's MDBX growth step.
-    #[cfg(not(feature = "tndb-b"))]
+    /// The temp chain's growth step.
     const TEMP_CHAIN_DB_GROWTH_STEP: usize = 4 * 1024 * 1024; // 4 MiB
 
     DatabaseArgs {
         max_size: Some(TEMP_CHAIN_DB_MAX_SIZE),
-        #[cfg(not(feature = "tndb-b"))]
         growth_step: Some(TEMP_CHAIN_DB_GROWTH_STEP),
         ..Default::default()
     }
@@ -372,12 +370,15 @@ fn file_exists(file: &Path) -> eyre::Result<bool> {
 ///   CLI value) are refused: the engine's `NoSync` reuses the pages a commit frees only after a
 ///   sync, and nothing syncs a `NoSync` environment on its own, so the file would grow until one.
 ///   reth's `NoMetaSync` (no CLI value either) is refused.
-/// - `--db.exclusive`, `--db.read-transaction-timeout`, `--db.max-readers`, `--db.growth-step` and
-///   `--db.log-level` have no tndb-b equivalent and are refused when set.
+/// - `--db.growth-step` is the largest growth step (`max_growth`; unset, the engine's 1 GiB): the
+///   file grows by doubling up to it, then by it, each step preallocated. A step under the engine's
+///   minimum (`MIN_GROWTH`, 1 MiB) is refused here.
+/// - `--db.exclusive`, `--db.read-transaction-timeout`, `--db.max-readers` and `--db.log-level`
+///   have no tndb-b equivalent and are refused when set.
 #[cfg(feature = "tndb-b")]
 fn tndb_args(args: &DatabaseArgs) -> eyre::Result<tndb_b_reth::TndbArgs> {
     use reth_db::mdbx::SyncMode as MdbxSyncMode;
-    use tndb_b_reth::{SyncMode, TndbArgs};
+    use tndb_b_reth::{SyncMode, TndbArgs, MIN_GROWTH};
 
     let refuse = |flag: &str| eyre::eyre!("{flag} is not supported by the tndb-b backend");
     // Destructured whole, so a flag reth adds fails to compile here until it is mapped or refused.
@@ -400,9 +401,6 @@ fn tndb_args(args: &DatabaseArgs) -> eyre::Result<tndb_b_reth::TndbArgs> {
     if max_readers.is_some() {
         return Err(refuse("--db.max-readers"));
     }
-    if growth_step.is_some() {
-        return Err(refuse("--db.growth-step"));
-    }
     if log_level.is_some() {
         return Err(refuse("--db.log-level"));
     }
@@ -418,6 +416,17 @@ fn tndb_args(args: &DatabaseArgs) -> eyre::Result<tndb_b_reth::TndbArgs> {
             eyre::eyre!("--db.page-size {page_size} is too large for the tndb-b backend")
         })?;
         tndb = tndb.with_page_size(page_size);
+    }
+    if let Some(growth_step) = growth_step {
+        let step =
+            u64::try_from(growth_step).wrap_err("--db.growth-step does not fit in 64 bits")?;
+        if step < MIN_GROWTH {
+            return Err(eyre::eyre!(
+                "--db.growth-step {growth_step} is under the tndb-b backend's minimum of \
+                 {MIN_GROWTH} bytes"
+            ));
+        }
+        tndb = tndb.with_max_growth(step);
     }
     if let Some(sync_mode) = sync_mode {
         let refuse_no_sync = |mode: &str| {

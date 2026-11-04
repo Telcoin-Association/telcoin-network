@@ -219,7 +219,7 @@ mod tndb {
     use super::*;
     use reth_db::{cursor::DbCursorRO as _, mdbx::SyncMode as MdbxSyncMode, ClientVersion};
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
-    use tndb_b_reth::{SyncMode, TndbArgs};
+    use tndb_b_reth::{SyncMode, TndbArgs, MIN_GROWTH};
 
     /// Each flag tndb-b cannot honour is refused, and the error names it.
     #[test]
@@ -231,7 +231,6 @@ mod tndb {
                 DatabaseArgs { read_transaction_timeout: Some(0), ..Default::default() },
             ),
             ("--db.max-readers", DatabaseArgs { max_readers: Some(1), ..Default::default() }),
-            ("--db.growth-step", DatabaseArgs { growth_step: Some(4096), ..Default::default() }),
             (
                 "--db.log-level",
                 DatabaseArgs {
@@ -302,6 +301,19 @@ mod tndb {
                 DatabaseArgs { sync_mode: Some(MdbxSyncMode::Durable), ..Default::default() },
                 default.with_sync_mode(SyncMode::Durable),
             ),
+            (
+                "--db.growth-step",
+                DatabaseArgs { growth_step: Some(64 << 20), ..Default::default() },
+                default.with_max_growth(64 << 20),
+            ),
+            (
+                "--db.growth-step at the engine's minimum",
+                DatabaseArgs {
+                    growth_step: Some(usize::try_from(MIN_GROWTH).expect("64-bit usize")),
+                    ..Default::default()
+                },
+                default.with_max_growth(MIN_GROWTH),
+            ),
         ];
         let wrong: Vec<_> = cases
             .iter()
@@ -314,6 +326,14 @@ mod tndb {
         let err = tndb_args(&DatabaseArgs { page_size: Some(too_large), ..Default::default() })
             .expect_err("a page size past u32");
         assert!(err.to_string().contains("--db.page-size"), "names the flag: {err}");
+
+        let under = usize::try_from(MIN_GROWTH - 1).expect("64-bit usize");
+        let err = tndb_args(&DatabaseArgs { growth_step: Some(under), ..Default::default() })
+            .expect_err("a growth step under the engine's minimum");
+        assert!(
+            err.to_string().contains("--db.growth-step") && err.to_string().contains("minimum"),
+            "names the flag and the minimum: {err}"
+        );
     }
 
     /// A refused flag fails the open before anything is created.
@@ -321,10 +341,10 @@ mod tndb {
     fn open_rw_refuses_an_unsupported_flag_before_creating_anything() {
         let tmp = TempDir::new().expect("tempdir");
         let path = tmp.path().join("db");
-        let db = DatabaseArgs { growth_step: Some(4096), ..test_db_args() };
+        let db = DatabaseArgs { max_readers: Some(1), ..test_db_args() };
 
         let err = open_rw(&config(db), &path).expect_err("a refused flag");
-        assert!(err.to_string().contains("--db.growth-step"), "names the flag: {err}");
+        assert!(err.to_string().contains("--db.max-readers"), "names the flag: {err}");
         assert!(!path.try_exists().expect("stat"), "the directory is not created");
     }
 

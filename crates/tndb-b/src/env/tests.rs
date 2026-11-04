@@ -4,7 +4,7 @@
 use std::{
     collections::BTreeMap,
     fs,
-    os::unix::fs::FileExt as _,
+    os::unix::fs::{FileExt as _, MetadataExt as _},
     path::{Path, PathBuf},
     sync::mpsc,
     time::{Duration, Instant},
@@ -1467,4 +1467,316 @@ fn a_commit_past_the_stamp_threshold_writes_the_serial_stamps_bytes() {
     assert_eq!(on[..2], [1, 1], "the small commits stamp serially");
     assert!(cpus == 1 || on[2] > 1, "the 3 MiB commit takes several threads: {on:?}");
     assert!(fs::read(&path).expect("read") == fs::read(&serial).expect("read"));
+}
+
+/// Commit rows `start..start + n` into table `name` (created if missing) in one transaction,
+/// each value `len` bytes of the row's low byte; returns the commit's txn.
+fn commit_rows(env: &Env, name: &str, start: u32, n: u32, len: usize) -> u64 {
+    let mut txn = env.begin_rw().expect("begin");
+    let table = txn.create_table(name).expect("table");
+    for i in start..start + n {
+        txn.put(&table, &i.to_be_bytes(), &vec![i as u8; len]).expect("put");
+    }
+    txn.commit().expect("commit")
+}
+
+/// Every row `0..n` of table `name` reads back as [`commit_rows`] wrote it.
+fn assert_rows(env: &Env, name: &str, n: u32, len: usize) {
+    let ro = env.begin_ro().expect("ro");
+    let table = table(&ro, name);
+    for i in 0..n {
+        assert_eq!(val(&ro, &table, &i.to_be_bytes()), Some(vec![i as u8; len]), "row {i}");
+    }
+    assert_eq!(ro.table_stat(&table).expect("stat").entries, u64::from(n));
+}
+
+/// The file's length on disk.
+fn file_len(path: &Path) -> u64 {
+    fs::metadata(path).expect("metadata").len()
+}
+
+/// `EnvOptions::max_growth` defaults to 1 GiB; under `MIN_GROWTH` it is refused at open as
+/// `InvalidMaxGrowth`, before the file is touched: a missing file is not created, an existing
+/// one keeps every byte. `MIN_GROWTH` itself opens, and a read-only open ignores the field.
+#[test]
+fn max_growth_under_the_minimum_is_refused_at_open() {
+    assert_eq!(EnvOptions::default().max_growth, 1 << 30);
+    let (dir, path) = temp();
+    let small = EnvOptions { max_growth: crate::MIN_GROWTH - 1, ..EnvOptions::default() };
+    assert!(matches!(
+        Env::open(&path, small),
+        Err(Error::InvalidMaxGrowth(g)) if g == crate::MIN_GROWTH - 1
+    ));
+    assert_eq!(
+        fs::read_dir(dir.path()).expect("dir").count(),
+        0,
+        "the refused open created a file"
+    );
+    put_all(&open(&path), "a", &[(b"k", b"v")]);
+    let before = fs::read(&path).expect("read");
+    assert!(matches!(Env::open(&path, small), Err(Error::InvalidMaxGrowth(_))));
+    assert!(fs::read(&path).expect("read") == before, "the refused open changed the file");
+    let ro = Env::open_read_only(&path, small).expect("a read-only open ignores max_growth");
+    drop(ro);
+    let least = EnvOptions { max_growth: crate::MIN_GROWTH, ..EnvOptions::default() };
+    let env = Env::open(&path, least).expect("the minimum opens");
+    let ro = env.begin_ro().expect("ro");
+    assert_eq!(val(&ro, &table(&ro, "a"), b"k").as_deref(), Some(&b"v"[..]));
+}
+
+/// A growth cap of `MIN_GROWTH` bounds the file's tail past its pages while the environment
+/// runs: after every commit of a load that grows the file to several MiB, the length past
+/// `page_count` pages is at most the cap plus the OS-page rounding (doubling would leave up to
+/// the file's length).
+#[test]
+fn a_growth_cap_bounds_the_tail_past_the_pages() {
+    let (_dir, path) = temp();
+    let cap = crate::MIN_GROWTH;
+    let env =
+        Env::open(&path, EnvOptions { max_growth: cap, ..EnvOptions::default() }).expect("open");
+    for round in 0..16 {
+        // 100 values of 3000 bytes, each a one-page run: about 400 KiB a commit.
+        commit_rows(&env, "a", round * 100, 100, 3000);
+        let pages = u64::from(env.stat().page_count) * 4096;
+        let len = env.with_writer(|w| w.file.file_len());
+        assert!(len >= pages);
+        assert!(
+            len - pages <= cap + sys::os_page_size(),
+            "round {round}: {len} bytes for {pages} bytes of pages"
+        );
+    }
+    assert!(env.with_writer(|w| w.file.file_len()) > 5 * cap, "the load grew the file");
+}
+
+/// The page sizes the trim tests run at: 4 KiB, and the OS page when it is larger (one page is
+/// then one OS page, so the trim's rounding adds nothing and one page fewer is a shorter file).
+fn trim_page_sizes() -> Vec<u32> {
+    let os = sys::os_page_size() as u32;
+    if os > 4096 {
+        vec![4096, os]
+    } else {
+        vec![4096]
+    }
+}
+
+/// The length a clean close trims a file of `env`'s newest state to: its pages, rounded up to
+/// the OS page.
+fn trimmed_len(env: &Env) -> u64 {
+    let stat = env.stat();
+    (u64::from(stat.page_count) * u64::from(stat.page_size)).next_multiple_of(sys::os_page_size())
+}
+
+/// The file's allocated bytes (`st_blocks` × 512).
+fn allocated(path: &Path) -> u64 {
+    fs::metadata(path).expect("metadata").blocks() * 512
+}
+
+/// A clean close of an environment whose file grew past its pages truncates the file to its
+/// pages, rounded up to the OS page, in `Durable` and `NoSync` (whose final sync runs first, so
+/// the commits since the last sync are there after the reopen). The file reopens to the newest
+/// state, passes `check` and reads back every row. The allocated blocks never grow, and where
+/// the file system preallocated the tail (blocks for the whole length) they fall by about the
+/// bytes cut.
+#[test]
+fn a_clean_close_trims_the_file_to_its_pages() {
+    for page_size in trim_page_sizes() {
+        for sync in [SyncMode::Durable, SyncMode::NoSync] {
+            let (_dir, path) = temp();
+            let env = Env::open(&path, options(page_size, sync)).expect("open");
+            commit_rows(&env, "a", 0, 300, 150);
+            env.sync().expect("sync");
+            let txn = commit_rows(&env, "a", 300, 100, 150);
+            let want = trimmed_len(&env);
+            let before = env.with_writer(|w| w.file.file_len());
+            assert!(want < before, "{page_size} {sync:?}: the file grew past its pages");
+            let blocks = allocated(&path);
+            drop(env);
+            let ctx = format!("{page_size} {sync:?}");
+            let (trimmed, after) = (file_len(&path), allocated(&path));
+            let env = Env::open(&path, options(page_size, sync)).expect("reopen");
+            assert_eq!(env.stat().txn_id, txn, "{ctx}");
+            env.check().expect("check");
+            assert_rows(&env, "a", 400, 150);
+            assert_eq!(trimmed, want, "{ctx}: trimmed to the pages");
+            assert!(after <= blocks, "{ctx}: {after} allocated bytes, {blocks} before");
+            if blocks >= before {
+                let cut = before - want;
+                assert!(
+                    after + cut <= blocks + sys::os_page_size(),
+                    "{ctx}: {after} allocated bytes, {blocks} before the {cut}-byte cut"
+                );
+            }
+        }
+    }
+}
+
+/// A latched environment drops without a trim: its file keeps its length. The latch is a failed
+/// allocation's, which leaves the file unpoisoned, so only the latch stops the trim.
+#[test]
+fn a_latched_env_drops_without_a_trim() {
+    let (_dir, path) = temp();
+    let env = open(&path);
+    commit_rows(&env, "a", 0, 50, 150);
+    let mut txn = env.begin_rw().expect("begin");
+    let a = txn.create_table("a").expect("a");
+    txn.writer_mut().alloc.fail_allocs_after = Some(0);
+    assert!(matches!(txn.put(&a, b"k", &[1; 3000]), Err(Error::Io(_))));
+    drop(txn);
+    assert!(env.failure().is_some(), "latched");
+    assert!(!env.with_writer(|w| w.file.is_poisoned()), "the file is not poisoned");
+    let before = env.with_writer(|w| w.file.file_len());
+    assert!(trimmed_len(&env) < before, "a trim would shorten the file");
+    drop(env);
+    assert_eq!(file_len(&path), before, "a latched close trims nothing");
+}
+
+/// A crash (`Env::crash`) drops without a trim: the file keeps its length.
+#[test]
+fn a_crash_drops_without_a_trim() {
+    let (_dir, path) = temp();
+    let env = open(&path);
+    commit_rows(&env, "a", 0, 50, 150);
+    let before = env.with_writer(|w| w.file.file_len());
+    assert!(trimmed_len(&env) < before, "a trim would shorten the file");
+    env.crash();
+    assert_eq!(file_len(&path), before, "a crash trims nothing");
+}
+
+/// After a trim the file grows again from its trimmed length, the next step computed from it
+/// (`clamp(len, MIN_GROWTH, max_growth)` more), and a second clean close trims again.
+#[test]
+fn a_trimmed_file_grows_from_its_trimmed_length_and_trims_again() {
+    let (_dir, path) = temp();
+    let env = open(&path);
+    commit_rows(&env, "a", 0, 300, 150);
+    drop(env);
+    let trimmed = file_len(&path);
+    let env = open(&path);
+    assert_eq!(env.with_writer(|w| w.file.file_len()), trimmed);
+    let mut rows = 300;
+    while env.with_writer(|w| w.file.file_len()) == trimmed {
+        assert!(rows < 20_000, "the file never grew");
+        commit_rows(&env, "a", rows, 100, 150);
+        rows += 100;
+    }
+    let grown = env.with_writer(|w| w.file.file_len());
+    assert_eq!(grown, trimmed + trimmed.clamp(crate::MIN_GROWTH, 1 << 30), "one step from it");
+    let want = trimmed_len(&env);
+    assert!(want < grown);
+    drop(env);
+    assert_eq!(file_len(&path), want, "the second close trims again");
+    let env = open(&path);
+    env.check().expect("check");
+    assert_rows(&env, "a", rows, 150);
+}
+
+/// A trim never cuts a page the newest meta names: after a commit followed by an aborted
+/// transaction that grew the file, and after a commit whose new pages end the file (more than
+/// an OS page of them, so the older slot's state names fewer pages), the close leaves at least
+/// the newest state's pages, exactly its pages rounded to the OS page, and the file reopens to
+/// that state.
+#[test]
+fn a_trim_never_cuts_a_page_the_newest_meta_names() {
+    for page_size in trim_page_sizes() {
+        // An aborted transaction grew the file past the committed pages.
+        let (_dir, path) = temp();
+        let env = Env::open(&path, options(page_size, SyncMode::Durable)).expect("open");
+        commit_rows(&env, "a", 0, 100, 150);
+        let committed = env.with_writer(|w| w.file.file_len());
+        let mut txn = env.begin_rw().expect("begin");
+        let a = txn.create_table("a").expect("a");
+        let mut i = 100_u32;
+        while txn.writer_mut().file.file_len() == committed {
+            txn.put(&a, &i.to_be_bytes(), &[7; 3000]).expect("put");
+            i += 1;
+        }
+        drop(txn);
+        let pages = u64::from(env.stat().page_count) * u64::from(page_size);
+        let want = trimmed_len(&env);
+        drop(env);
+        assert_eq!(file_len(&path), want, "{page_size}: the aborted pages are cut");
+        assert!(want >= pages);
+        let env = Env::open(&path, options(page_size, SyncMode::Durable)).expect("reopen");
+        env.check().expect("check");
+        assert_rows(&env, "a", 100, 150);
+        drop(env);
+
+        // The newest commit's pages end the file, the older slot's state names fewer.
+        let (_dir, path) = temp();
+        let env = Env::open(&path, options(page_size, SyncMode::Durable)).expect("open");
+        commit_rows(&env, "a", 0, 100, 150);
+        let older = env.stat().page_count;
+        commit_rows(&env, "b", 0, 20, 3000);
+        let newest = env.stat().page_count;
+        let os_pages = (sys::os_page_size() / u64::from(page_size)) as u32;
+        assert!(newest >= older + 2 * os_pages.max(1), "{older} then {newest} pages");
+        let want = trimmed_len(&env);
+        drop(env);
+        assert_eq!(file_len(&path), want, "{page_size}: the newest state's pages are kept");
+        assert!(want >= u64::from(newest) * u64::from(page_size));
+        let env = Env::open(&path, options(page_size, SyncMode::Durable)).expect("reopen");
+        assert_eq!(env.stat().page_count, newest);
+        env.check().expect("check");
+        assert_rows(&env, "a", 100, 150);
+        assert_rows(&env, "b", 20, 3000);
+    }
+}
+
+/// A meta slot whose record in the file no longer decodes to the txn the writer holds for it
+/// is one the writer cannot account for: the close skips the trim, and the file keeps its
+/// length.
+#[test]
+fn a_meta_slot_the_writer_cannot_account_for_skips_the_trim() {
+    let (_dir, path) = temp();
+    let env = open(&path);
+    commit_rows(&env, "a", 0, 50, 150);
+    commit_rows(&env, "a", 50, 50, 150);
+    let before = env.with_writer(|w| {
+        let older = usize::from(w.slots[1] < w.slots[0]);
+        let page = w.geometry.page_size();
+        w.file.page_mut(older as u32, page).expect("meta page")[8] ^= 0x10;
+        w.file.file_len()
+    });
+    assert!(trimmed_len(&env) < before, "a trim would shorten the file");
+    drop(env);
+    assert_eq!(file_len(&path), before, "a slot in doubt trims nothing");
+}
+
+/// A power loss right after a clean close's trim, whose truncation no sync made durable,
+/// reopens to the last durable state with either length: a strict power loss brings the
+/// untrimmed length back, a random one keeps either.
+#[test]
+fn a_power_loss_after_a_trim_reopens_to_the_last_durable_state() {
+    let (dir, path) = temp();
+    let env = open(&path);
+    disk_model::track(&path);
+    commit_rows(&env, "a", 0, 300, 150);
+    let txn = commit_rows(&env, "a", 300, 100, 150);
+    let untrimmed = env.with_writer(|w| w.file.file_len());
+    let trimmed = trimmed_len(&env);
+    assert!(trimmed < untrimmed);
+    drop(env);
+    assert_eq!(file_len(&path), trimmed);
+    let reopen = |path: &Path| {
+        let env = open(path);
+        assert_eq!(env.stat().txn_id, txn);
+        env.check().expect("check");
+        assert_rows(&env, "a", 400, 150);
+    };
+    let mut lengths = std::collections::BTreeSet::new();
+    for seed in 0..16 {
+        let copy = dir.path().join(format!("copy{seed}"));
+        disk_model::copy_tracked(&path, &copy);
+        disk_model::power_loss_random(&copy, seed);
+        let len = file_len(&copy);
+        assert!(len == trimmed || len == untrimmed, "seed {seed}: {len} bytes");
+        lengths.insert(len);
+        disk_model::untrack(&copy);
+        reopen(&copy);
+    }
+    assert_eq!(lengths.len(), 2, "the truncation is sometimes kept, sometimes lost");
+    disk_model::power_loss(&path);
+    disk_model::untrack(&path);
+    assert_eq!(file_len(&path), untrimmed, "a strict power loss undoes the truncation");
+    reopen(&path);
 }

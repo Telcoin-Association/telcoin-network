@@ -35,11 +35,15 @@
 //! ## Growth
 //!
 //! [`PageFile::ensure_len`] grows geometrically: to at least the length asked for, and at least by
-//! the current length (doubling), with each step between [`MIN_GROWTH`] and [`MAX_GROWTH`], rounded
-//! up to whole OS pages. Every step **preallocates** its range ([`allocate_range`]) so a full disk
-//! is an `io::Error` at the growth, never a SIGBUS on the first store into an unbacked page. The
-//! slack past the data is harmless: the meta page's page count, not the file length, says which
-//! pages are allocated.
+//! the current length (doubling), with each step between [`MIN_GROWTH`] and the environment's
+//! `EnvOptions::max_growth` (default [`MAX_GROWTH`], 1 GiB), rounded up to whole OS pages. Every
+//! step **preallocates** its range ([`allocate_range`]) so a full disk is an `io::Error` at the
+//! growth, never a SIGBUS on the first store into an unbacked page. The slack past the data is
+//! harmless: the meta page's page count, not the file length, says which pages are allocated. A
+//! running file holds up to one step of it; a clean close gives it back ([`PageFile::trim_to`],
+//! from `EnvInner::drop` through `Writer::trim_tail`), truncating the file to its pages rounded up
+//! to the OS page, so a resting file holds no preallocated tail. A crash, a latched close or a
+//! failed trim keeps the slack.
 //!
 //! ## Durability
 //!
@@ -77,10 +81,12 @@ use crate::{
 /// Address space a page file reserves for its mapping by default (1 GiB).
 pub(crate) const DEFAULT_RESERVE: u64 = 1 << 30;
 
-/// The smallest growth step (1 MiB): a small file does not grow, and fdatasync, page by page.
-pub(crate) const MIN_GROWTH: u64 = 1 << 20;
+/// The smallest growth step of the page file (1 MiB), and the least `EnvOptions::max_growth`
+/// accepts: a small file does not grow, and fdatasync, page by page.
+pub const MIN_GROWTH: u64 = 1 << 20;
 
-/// The largest growth step (1 GiB): past it a large file grows linearly, not by doubling.
+/// The default largest growth step (1 GiB), `EnvOptions::max_growth`'s default: past it a large
+/// file grows linearly, not by doubling.
 pub(crate) const MAX_GROWTH: u64 = 1 << 30;
 
 /// A reader's view of a page file's mapping that needs no lock: the mapping's base address and
@@ -163,6 +169,9 @@ pub(crate) struct PageFile {
     /// Leave every mapping to the kernel's readahead instead of advising `MADV_RANDOM` (see the
     /// module docs' Access advice): `EnvOptions::readahead`, applied to each remap too.
     readahead: bool,
+    /// The largest growth step, `EnvOptions::max_growth` (at least [`MIN_GROWTH`]): read only by
+    /// [`Self::grow`].
+    max_growth: u64,
     /// Set when a growth extended the file since the last size sync (see
     /// [`Self::sync_size_if_grown`]).
     size_unsynced: AtomicBool,
@@ -180,23 +189,40 @@ pub(crate) struct PageFile {
 
 impl PageFile {
     /// Open (creating it if missing) the file at `path` read-write and map it with a reservation
-    /// of `reserve` bytes of address space, advised `MADV_RANDOM` (the default access advice).
+    /// of `reserve` bytes of address space, advised `MADV_RANDOM` (the default access advice),
+    /// growing by steps of at most [`MAX_GROWTH`] (the default).
     #[cfg(test)]
     pub(crate) fn open(path: &std::path::Path, reserve: u64) -> Result<Self> {
+        Self::open_with_max_growth(path, reserve, MAX_GROWTH)
+    }
+
+    /// [`Self::open`] with growth steps of at most `max_growth` bytes.
+    #[cfg(test)]
+    pub(crate) fn open_with_max_growth(
+        path: &std::path::Path,
+        reserve: u64,
+        max_growth: u64,
+    ) -> Result<Self> {
         let file = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
             .truncate(false)
             .open(path)?;
-        Self::from_file(file, reserve, false)
+        Self::from_file(file, reserve, false, max_growth)
     }
 
     /// Map `file`, opened read-write (the caller has locked and validated it), with a reservation
     /// of `reserve` bytes of address space (at least the file's length), advised `MADV_RANDOM`
-    /// unless `readahead` (see the module docs' Access advice). Fails if the address space cannot
-    /// be reserved.
-    pub(crate) fn from_file(file: File, reserve: u64, readahead: bool) -> Result<Self> {
+    /// unless `readahead` (see the module docs' Access advice), growing by steps of at most
+    /// `max_growth` bytes (`Env::open` refuses less than [`MIN_GROWTH`]; a smaller one is taken
+    /// as [`MIN_GROWTH`]). Fails if the address space cannot be reserved.
+    pub(crate) fn from_file(
+        file: File,
+        reserve: u64,
+        readahead: bool,
+        max_growth: u64,
+    ) -> Result<Self> {
         let len = file.metadata()?.len();
         let map = map_reservation(&file, reserve.max(len), readahead)?;
         let view = Arc::new(MapView::new());
@@ -210,6 +236,7 @@ impl PageFile {
             view,
             retired: Vec::new(),
             readahead,
+            max_growth: max_growth.max(MIN_GROWTH),
             size_unsynced: AtomicBool::new(false),
             bytes_grown: 0,
             poisoned: AtomicBool::new(false),
@@ -219,7 +246,6 @@ impl PageFile {
     }
 
     /// The physical file length in bytes.
-    #[cfg(test)]
     pub(crate) fn file_len(&self) -> u64 {
         self.len
     }
@@ -260,7 +286,7 @@ impl PageFile {
 
     /// The growth step of [`Self::ensure_len`].
     fn grow(&mut self, needed: u64) -> Result<()> {
-        let step = self.len.clamp(MIN_GROWTH, MAX_GROWTH);
+        let step = self.len.clamp(MIN_GROWTH, self.max_growth);
         let target = needed
             .max(self.len.saturating_add(step))
             .checked_next_multiple_of(os_page_size())
@@ -272,6 +298,31 @@ impl PageFile {
         }
         self.bytes_grown += target - self.len;
         self.len = target;
+        self.size_unsynced.store(true, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Truncate the file to `len` bytes, giving back the preallocated tail past the pages in use
+    /// (a clean close's last step, `Writer::trim_tail`). Refused, changing nothing, once poisoned
+    /// or when `len` does not shorten the file. No sync is made, and the size is marked unsynced as
+    /// a growth's is: the bytes below `len` are durable already and either length is a valid file
+    /// (an open accepts any length of at least its meta's pages), so a power loss that brings the
+    /// old length back leaves only slack. A failure poisons the file.
+    ///
+    /// The mapping stays as it is. No reader can reach a byte past `len`: every snapshot reads
+    /// through [`MapView::slice`], bounded by the published length, and each commit publishes its
+    /// own `page_count` pages, which the caller keeps at or below `len`; the writer's accessors
+    /// stop at the new length.
+    pub(crate) fn trim_to(&mut self, len: u64) -> Result<()> {
+        self.check_poison()?;
+        if len >= self.len {
+            return Err(Error::Failed(format!(
+                "page file: a trim to {len} bytes does not shorten the file ({} bytes)",
+                self.len
+            )));
+        }
+        self.file.set_len(len).inspect_err(|_| self.poison())?;
+        self.len = len;
         self.size_unsynced.store(true, Ordering::Relaxed);
         Ok(())
     }
@@ -598,6 +649,22 @@ mod tests {
         );
     }
 
+    /// A growth cap of 2 MiB (`EnvOptions::max_growth`) stops the doubling at the cap: the file
+    /// grows 1, 2, 4 MiB, then linearly by the cap, to 6 and 8 MiB.
+    #[test]
+    fn growth_steps_stop_doubling_at_the_cap() {
+        let tmp = TempDir::with_prefix("tndb_b_file_grow_cap").expect("temp dir");
+        let mut pf =
+            PageFile::open_with_max_growth(&tmp.path().join("db"), 64 << 20, 2 * MIN_GROWTH)
+                .expect("open");
+        let mut lengths = Vec::new();
+        for _ in 0..5 {
+            pf.ensure_len(pf.file_len() + 1).expect("grow");
+            lengths.push(pf.file_len() / MIN_GROWTH);
+        }
+        assert_eq!(lengths, [1, 2, 4, 6, 8], "MiB after each growth");
+    }
+
     /// Inside the reservation the mapping never moves while the file grows, and written pages
     /// keep their bytes.
     #[test]
@@ -718,7 +785,7 @@ mod tests {
                 .open(&path)
                 .expect("open");
             take_advice_log();
-            let mut pf = PageFile::from_file(file, MIN_GROWTH, readahead).expect("map");
+            let mut pf = PageFile::from_file(file, MIN_GROWTH, readahead, MAX_GROWTH).expect("map");
             let _reader = pf.view();
             pf.ensure_len(2 * MIN_GROWTH).expect("grow past the reservation");
             pf.ensure_len(8 * MIN_GROWTH).expect("grow past it again");

@@ -84,6 +84,10 @@ pub enum Error {
     /// A page size that is not a power of two in 4 KiB..=64 KiB.
     #[error("tndb-b: invalid page size {0}")]
     InvalidPageSize(u32),
+    /// An `EnvOptions::max_growth` under [`crate::MIN_GROWTH`] (1 MiB), refused by
+    /// [`crate::Env::open`] before it touches the file.
+    #[error("tndb-b: invalid max growth {0} (at least {} bytes)", crate::MIN_GROWTH)]
+    InvalidMaxGrowth(u64),
     /// Another handle (in this process or another) holds the database open: any handle, for
     /// [`crate::Env::open`]; one with a writer, for [`crate::Env::open_read_only`].
     #[error("tndb-b: database is locked by another handle")]
