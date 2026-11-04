@@ -25,7 +25,7 @@ vendor/reth/
   LICENSE-*         upstream's (MIT OR Apache-2.0)
   crates/...        upstream paths, e.g. crates/storage/db is upstream's crates/storage/db
   testing/...       testing/testing-utils (dev-only)
-  tn/               TN tooling: vendor.py, cargo.sh, crates.txt, upstream.toml, and
+  tn/               TN tooling: vendor.py, graph.py, cargo.sh, crates.txt, upstream.toml, and
                     the tools' tests (test_*.py)
   README.md CHANGES.md DECISIONS.md ROADMAP.md   (TN's docs; upstream's README is not carried)
 ```
@@ -178,11 +178,31 @@ entry from the root `Cargo.toml` if TN named the crate, and refresh `Cargo.lock`
   otherwise drop out of the committed copy without anyone noticing. `sync`, `pick`, `add` and
   `remove` end with the same warning, and exit 1 when it lists files.
 
+## Checking the feature graph
+
+Removing a crate or a dependency edge can switch off a feature another crate relied on
+(DECISIONS.md D10). Snapshot before and after, and diff:
+
+```
+python3 -I vendor/reth/tn/graph.py snapshot /tmp/before.txt [-- extra cargo tree args]
+python3 -I vendor/reth/tn/graph.py snapshot /tmp/after.txt
+python3 -I vendor/reth/tn/graph.py diff /tmp/before.txt /tmp/after.txt
+```
+
+A snapshot keeps each target's run-time units (what is linked into the binary) apart from its
+build-time units (build scripts' dependencies, proc macros and what they use), because cargo
+resolves features for the two separately. The targets default to x86_64-unknown-linux-gnu and
+aarch64-apple-darwin; `-- --target <triple>` replaces them. To snapshot another checkout, such as
+the commit before a change, with the current script, pass `-- --manifest-path
+<checkout>/Cargo.toml`. Snapshots from before these views (one merged line per package) diff only
+against each other.
+
 ## Testing the tools
 
 ```
-python3 -B -I -m unittest discover -s vendor/reth/tn -p 'test_*.py' -v   # vendor.py
+python3 -B -I -m unittest discover -s vendor/reth/tn -p 'test_*.py' -v   # vendor.py, graph.py
 python3 -B -I -m unittest discover -s etc -p 'test_rocksdb_gate.py' -v   # etc/rocksdb-gate.sh
 ```
 
 The tests work in throwaway directories and never touch this tree or the upstream clone.
+graph.py's test runs cargo on a small workspace of its own.

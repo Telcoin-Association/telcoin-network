@@ -127,6 +127,12 @@ why. Features that only gate APIs TN does not use (serde bincode compat, RPC cli
 `send_guard`, fixed-cache's allocating constructor) may go. The compiler proves they were
 unused. Each one is named in the commit message.
 
+2026-11-04 (vendor review, T4-5): `graph.py` used to merge each package's run-time and build-time
+units, on every target, into one feature set, so a feature lost only at run time could go unseen.
+A snapshot now keeps run-time and build-time units apart, per target (x86_64-unknown-linux-gnu and
+aarch64-apple-darwin by default), and `diff` reports each view on its own. On the tree at the
+time, 27 packages per target had run-time and build-time units with different features.
+
 ## D11. Tests that need a removed crate are dropped, not kept alive
 
 When a surviving crate's tests need a crate that reduction removed (TN-0004:
