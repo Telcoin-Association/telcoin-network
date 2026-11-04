@@ -23,6 +23,7 @@ use crate::{
 use std::{
     cmp::Ordering,
     collections::{BTreeMap, VecDeque},
+    time::Instant,
 };
 use tn_config::{ConsensusConfig, KeyConfig};
 use tn_storage::{tables::LastProposed, ProposerStore};
@@ -413,17 +414,23 @@ impl<DB: Database> Proposer<DB> {
     ) -> ProposerResult<()> {
         // A read error is fatal here: failing it open would fall through to the write and clobber
         // the very record this guard exists to preserve.
+        let read_start = Instant::now();
         let stored = proposer_store
             .get_last_proposed()
             .map_err(|e| ProposerError::StoreError(e.to_string()))?;
+        let read = read_start.elapsed();
         let supersedes_stored = stored
             .is_none_or(|last| last.epoch() != header.epoch() || header.round() >= last.round());
 
-        if supersedes_stored {
+        // a header that does not supersede the stored one skips the write and the barrier, so
+        // both phases read zero for it
+        let (write, persist) = if supersedes_stored {
             // Store the last header.
+            let write_start = Instant::now();
             proposer_store
                 .write_last_proposed(header)
                 .map_err(|e| ProposerError::StoreError(e.to_string()))?;
+            let write = write_start.elapsed();
 
             // Wait for the `LastProposed` record to be durable before broadcasting. The epoch DB
             // persists asynchronously, so `write_last_proposed` returns before the record hits
@@ -438,14 +445,31 @@ impl<DB: Database> Proposer<DB> {
             // critical task, so returning here stops the node rather than continuing on a lost
             // guard record (issue #975). When another task's failed barrier has already ended the
             // epoch, `run_epoch` stops the node instead, finding the store unable to write.
+            let persist_start = Instant::now();
             proposer_store
                 .persist::<LastProposed>()
                 .await
                 .map_err(|e| ProposerError::DurableBarrierFailed(e.to_string()))?;
-        }
+            (write, persist_start.elapsed())
+        } else {
+            (Duration::ZERO, Duration::ZERO)
+        };
 
         // Send the new header to the `Certifier` that will broadcast and certify it.
-        consensus_bus.headers().send(header.clone()).await.map_err(|e| Box::new(e).into())
+        let send_start = Instant::now();
+        consensus_bus.headers().send(header.clone()).await.map_err(Box::new)?;
+        debug!(
+            target: "primary::proposer",
+            round = header.round(),
+            epoch = header.epoch(),
+            stored = supersedes_stored,
+            read_ms = duration_ms(read),
+            write_ms = duration_ms(write),
+            persist_ms = duration_ms(persist),
+            send_ms = duration_ms(send_start.elapsed()),
+            "header stored and sent"
+        );
+        Ok(())
     }
 
     /// Calculate the max delay to use when resetting the max_delay_interval.
@@ -1081,5 +1105,27 @@ impl<DB: Database> Proposer<DB> {
                 }
             }
         }
+    }
+}
+
+/// Whole milliseconds in `duration`, saturating at `u64::MAX`, for the timing fields of the
+/// proposer's log lines.
+fn duration_ms(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::duration_ms;
+    use std::time::Duration;
+
+    /// Sub-millisecond remainders round down and a duration past `u64::MAX` milliseconds
+    /// saturates instead of wrapping.
+    #[test]
+    fn duration_ms_truncates_and_saturates() {
+        assert_eq!(duration_ms(Duration::ZERO), 0);
+        assert_eq!(duration_ms(Duration::from_micros(1_999)), 1);
+        assert_eq!(duration_ms(Duration::from_secs(10)), 10_000);
+        assert_eq!(duration_ms(Duration::MAX), u64::MAX);
     }
 }

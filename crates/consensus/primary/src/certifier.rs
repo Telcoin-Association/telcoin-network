@@ -6,7 +6,10 @@ use crate::{
     state_sync::StateSynchronizer,
     ConsensusBus,
 };
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 use tn_config::{ConsensusConfig, KeyConfig};
 use tn_network_libp2p::error::NetworkError;
 use tn_storage::{tables::ProposedCertificates, CertificateStore};
@@ -59,8 +62,9 @@ pub(crate) struct Certifier<DB> {
     /// Should not generally happen but can lead to leader cert equivocation
     /// if it does so be really sure.
     proposal_lock: Arc<Mutex<()>>,
-    /// The digest of the header whose proposal task is still running, if any, and the signal that
-    /// asks that proposal to re-issue the vote requests that ended in an error.
+    /// The digest of the header whose proposal task is still running, if any, the signal that
+    /// asks that proposal to re-issue the vote requests that ended in an error, and when
+    /// [`Self::run`] received that header.
     ///
     /// Set by [`Self::run`] before it spawns a proposal and cleared when that task ends, however
     /// it ends (see [`InFlightProposal`]).
@@ -146,6 +150,7 @@ impl<DB: Database> Certifier<DB> {
     ) -> DagResult<Vote> {
         let mut missing_parents: Option<Vec<HeaderDigest>> = None;
         let mut attempt: u32 = 0;
+        let round = header.round();
         debug!(target: "primary::certifier", ?authority, ?header, "requesting vote for header...");
 
         // loop until vote received
@@ -181,24 +186,55 @@ impl<DB: Database> Certifier<DB> {
                 Ok(parents)
             }).unwrap_or(Ok(vec![]))?;
 
+            // the round trip of this attempt alone: earlier attempts and the retry delays between
+            // them are on their own lines
+            let attempt_start = Instant::now();
+
             // listen for requests from peers
             tokio::select! {
                 vote_result = network.request_vote(peer_id, header.clone(), parents) => {
                     // process response from peer
                     match vote_result {
                         Ok(RequestVoteResult::Vote(vote)) => {
-                            debug!(target: "primary::certifier", ?authority, ?vote, "Ok response received after request vote");
+                            // logged for every vote, including the ones that arrive after the
+                            // proposal reached quorum
+                            debug!(
+                                target: "primary::certifier",
+                                ?authority,
+                                round,
+                                attempt,
+                                elapsed_ms = duration_ms(attempt_start.elapsed()),
+                                ?vote,
+                                "Ok response received after request vote"
+                            );
                             // happy path - vote recieved
                             break vote;
                         }
                         Ok(RequestVoteResult::MissingParents(parents)) => {
-                            debug!(target: "primary::certifier", ?authority, ?parents, "Ok missing parents response received after request vote");
+                            debug!(
+                                target: "primary::certifier",
+                                ?authority,
+                                round,
+                                attempt,
+                                elapsed_ms = duration_ms(attempt_start.elapsed()),
+                                ?parents,
+                                "Ok missing parents response received after request vote"
+                            );
                             // retrieve missing parents so peer can vote
                             missing_parents = Some(parents);
                         }
                         Err(error) => {
                             if let NetworkError::RPCError(error) = error {
-                                error!(target: "primary::certifier", ?authority, ?error, ?header, "fatal request for requested vote");
+                                error!(
+                                    target: "primary::certifier",
+                                    ?authority,
+                                    round,
+                                    attempt,
+                                    elapsed_ms = duration_ms(attempt_start.elapsed()),
+                                    ?error,
+                                    ?header,
+                                    "fatal request for requested vote"
+                                );
                                 return Err(DagError::NetworkError(format!(
                                     "irrecoverable error requesting vote for {header}: {error}"
                                 )));
@@ -209,18 +245,22 @@ impl<DB: Database> Certifier<DB> {
                                 warn!(
                                     target: "primary::certifier",
                                     ?authority,
-                                    ?error,
                                     header = %header.digest(),
+                                    round,
                                     attempt,
+                                    elapsed_ms = duration_ms(attempt_start.elapsed()),
+                                    ?error,
                                     "vote request still failing after the fast retries; retrying every 10s until the proposal is superseded"
                                 );
                             } else if attempt.is_power_of_two() {
                                 debug!(
                                     target: "primary::certifier",
                                     ?authority,
-                                    ?error,
                                     header = %header.digest(),
+                                    round,
                                     attempt,
+                                    elapsed_ms = duration_ms(attempt_start.elapsed()),
+                                    ?error,
                                     "retryable error requesting vote"
                                 );
                             }
@@ -296,7 +336,7 @@ impl<DB: Database> Certifier<DB> {
         reissue_failed: &Notify,
     ) -> DagResult<Certificate> {
         debug!(target: "primary::certifier", auth=?self.authority_id, "proposing header");
-        let proposal_start = std::time::Instant::now();
+        let proposal_start = Instant::now();
 
         // only propose headers in current epoch
         if header.epoch() != self.committee.epoch() {
@@ -329,6 +369,26 @@ impl<DB: Database> Certifier<DB> {
             self.spawn_vote_request(&header, name, target, &tx_votes);
             outstanding += 1;
         }
+
+        // the header carries only a whole-second creation time while the sub-second fork is
+        // inactive, so the age runs from when `run` marked it in flight instead: it covers the
+        // wait for the proposal lock and this proposal's setup. a header without that mark (one
+        // already superseded, or a proposal not started by `run`) is aged from this proposal's
+        // start
+        let received = self
+            .in_flight
+            .lock()
+            .as_ref()
+            .filter(|(digest, ..)| *digest == header.digest())
+            .map_or(proposal_start, |(.., received)| *received);
+        debug!(
+            target: "primary::certifier",
+            round = header.round(),
+            epoch = header.epoch(),
+            header_age_ms = duration_ms(received.elapsed()),
+            peers = outstanding,
+            "vote requests issued"
+        );
 
         // the peers whose vote request ended in an error since the last re-issue
         let mut failed = Vec::new();
@@ -486,7 +546,14 @@ impl<DB: Database> Certifier<DB> {
         // Make sure other proposal's are shutdown and done before we check if
         // this header is already certified.  Any existing proposals should have been cancelled
         // before this call.
+        let lock_start = Instant::now();
         let _guard = self.proposal_lock.lock().await;
+        debug!(
+            target: "primary::certifier",
+            round = header.round(),
+            lock_wait_ms = duration_ms(lock_start.elapsed()),
+            "proposal lock acquired"
+        );
         let header_digest = header.digest();
         // a later header superseded this one while it waited for the lock. the select below
         // polls its branches in random order, so without this check a superseded header could
@@ -733,13 +800,14 @@ impl InFlightProposal {
     /// re-issue signal of the proposal in flight.
     fn start(marker: &InFlightMarker, digest: HeaderDigest) -> Result<Self, Arc<Notify>> {
         let mut current = marker.lock();
-        if let Some((_, reissue_failed)) =
-            current.as_ref().filter(|(in_flight, _)| *in_flight == digest)
+        if let Some((_, reissue_failed, _)) =
+            current.as_ref().filter(|(in_flight, ..)| *in_flight == digest)
         {
             return Err(reissue_failed.clone());
         }
         let reissue_failed = Arc::new(Notify::new());
-        *current = Some((digest, reissue_failed.clone()));
+        // `run` marks a header right after receiving it, so this is its receive time
+        *current = Some((digest, reissue_failed.clone(), Instant::now()));
         Ok(Self { marker: marker.clone(), digest, reissue_failed })
     }
 }
@@ -748,12 +816,36 @@ impl Drop for InFlightProposal {
     fn drop(&mut self) {
         let mut current = self.marker.lock();
         // a different header may have replaced this one; its mark is not ours to clear
-        if current.as_ref().is_some_and(|(in_flight, _)| *in_flight == self.digest) {
+        if current.as_ref().is_some_and(|(in_flight, ..)| *in_flight == self.digest) {
             *current = None;
         }
     }
 }
 
-/// The certifier's record of its proposal in flight: the header's digest and the signal that asks
-/// that proposal to re-issue the vote requests that ended in an error.
-type InFlightMarker = Arc<parking_lot::Mutex<Option<(HeaderDigest, Arc<Notify>)>>>;
+/// The certifier's record of its proposal in flight: the header's digest, the signal that asks
+/// that proposal to re-issue the vote requests that ended in an error, and when [`Certifier::run`]
+/// received the header (the start of `header_age_ms` in the `vote requests issued` line).
+type InFlightMarker = Arc<parking_lot::Mutex<Option<(HeaderDigest, Arc<Notify>, Instant)>>>;
+
+/// Whole milliseconds in `duration`, saturating at `u64::MAX`, for the timing fields of the
+/// certifier's log lines.
+fn duration_ms(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::duration_ms;
+    use std::time::Duration;
+
+    /// Sub-millisecond remainders round down and a duration past `u64::MAX` milliseconds
+    /// saturates instead of wrapping.
+    #[test]
+    fn duration_ms_truncates_and_saturates() {
+        assert_eq!(duration_ms(Duration::ZERO), 0);
+        assert_eq!(duration_ms(Duration::from_micros(999)), 0);
+        assert_eq!(duration_ms(Duration::from_micros(1_999)), 1);
+        assert_eq!(duration_ms(Duration::from_secs(10)), 10_000);
+        assert_eq!(duration_ms(Duration::MAX), u64::MAX);
+    }
+}
