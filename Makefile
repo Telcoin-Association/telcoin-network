@@ -69,6 +69,10 @@ help:
 	@echo "    :::> Build the e2e node binary at TN_PREV_REF (default ba7654d8a) for the mixed-binary (rolling upgrade) e2e tests." ;
 	@echo "    :::> Export the path it prints as TN_BIN_PATH_PREV; the tests that need it skip without it." ;
 	@echo ;
+	@echo "make test-upgrade" ;
+	@echo "    :::> Run the rolling upgrade test: four validators upgraded in place from TN_BIN_PATH_PREV to this tree's binary." ;
+	@echo "    :::> TN_BIN_PATH_PREV defaults to the binary build-e2e-bin-prev leaves behind; run that first or export another path." ;
+	@echo ;
 	@echo "make coverage" ;
 	@echo "    :::> Run tests with coverage using cargo-llvm-cov + nextest." ;
 	@echo "    :::> Requires: cargo install cargo-llvm-cov" ;
@@ -364,6 +368,19 @@ test-sigkill: build-e2e-bin
 # consensus DB syncs for real at every durability barrier.
 test-epochs: build-e2e-bin
 	TN_BIN_PATH="$(E2E_BIN)" TN_SEED_SIGNATURE_FORK_EPOCH=$(TN_SEED_SIGNATURE_FORK_EPOCH) TN_MULTI_WORKERS_FORK_EPOCH=$(TN_MULTI_WORKERS_FORK_EPOCH) TN_PREVRANDAO_FORK_EPOCH=$(TN_PREVRANDAO_FORK_EPOCH) TN_LEADER_SEEDED_ORDERING_FORK_EPOCH=$(TN_LEADER_SEEDED_ORDERING_FORK_EPOCH) TN_SUBSECOND_TIMESTAMP_FORK_EPOCH=$(TN_SUBSECOND_TIMESTAMP_FORK_EPOCH) TN_GOVERNANCE_SAFE_FORK_EPOCH=$(TN_GOVERNANCE_SAFE_FORK_EPOCH) cargo nextest run -p e2e-tests --test it --run-ignored all test_epoch ;
+
+# The previous binary test-upgrade runs: an exported TN_BIN_PATH_PREV wins, otherwise the one
+# build-e2e-bin-prev leaves at E2E_BIN_PREV.
+TN_BIN_PATH_PREV ?= $(E2E_BIN_PREV)
+
+# run the mixed-binary (rolling upgrade) test: four validators start on TN_BIN_PATH_PREV and are
+# upgraded in place, one at a time, to this tree's binary (tests/it/upgrade.rs). Both binaries get
+# the same fork pins. The previous binary is not built here, because which ref to compare against
+# is the caller's choice; without one the target stops rather than letting the test skip.
+.PHONY: test-upgrade
+test-upgrade: build-e2e-bin
+	@test -x "$(TN_BIN_PATH_PREV)" || { echo "no previous node binary at $(TN_BIN_PATH_PREV): run make build-e2e-bin-prev or export TN_BIN_PATH_PREV" ; exit 1 ; }
+	TN_BIN_PATH="$(E2E_BIN)" TN_BIN_PATH_PREV="$(TN_BIN_PATH_PREV)" TN_SEED_SIGNATURE_FORK_EPOCH=$(TN_SEED_SIGNATURE_FORK_EPOCH) TN_MULTI_WORKERS_FORK_EPOCH=$(TN_MULTI_WORKERS_FORK_EPOCH) TN_PREVRANDAO_FORK_EPOCH=$(TN_PREVRANDAO_FORK_EPOCH) TN_LEADER_SEEDED_ORDERING_FORK_EPOCH=$(TN_LEADER_SEEDED_ORDERING_FORK_EPOCH) TN_SUBSECOND_TIMESTAMP_FORK_EPOCH=$(TN_SUBSECOND_TIMESTAMP_FORK_EPOCH) TN_GOVERNANCE_SAFE_FORK_EPOCH=$(TN_GOVERNANCE_SAFE_FORK_EPOCH) cargo nextest run -p e2e-tests --test it --run-ignored all test_upgrade ;
 
 # run e2e tests
 test-e2e: build-e2e-bin
