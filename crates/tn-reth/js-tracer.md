@@ -43,24 +43,35 @@ build of `telcoin-network` (the profile the Docker image uses) is 54.8 MB withou
 with it on 16 cores, because boa compiles in parallel with the rest of the graph.
 
 A JavaScript tracer is code the RPC caller supplies, and the node runs it on its blocking pool at
-every EVM step of the traced transaction. What bounds it:
+every EVM step of the traced transaction. Nothing limits how long one of its functions runs:
 
-- boa's loop and recursion limits, which revm-inspectors sets to 200,000 iterations per loop and
-  10,000 nested calls. They bound the work inside one callback, not the total across a trace.
-- The request's `timeout`, 5 s when unset (geth's default), for `debug_traceTransaction` and
+- boa's loop limit doesn't. revm-inspectors sets it to 200,000 iterations, but boa counts them per
+  call frame, so a function that calls a looping function from a loop gets a fresh 200,000 on
+  every call and can run for hours. boa 0.21 has no time limit. The recursion limit is 128 nested
+  calls, which TN's patched revm-inspectors sets so a recursive getter or setter fails instead of
+  overflowing the thread's stack ([`patches/revm-inspectors/PATCH.md`](../../patches/revm-inspectors/PATCH.md)).
+- The request's `timeout`, 5 s when unset (geth's default), applies to `debug_traceTransaction` and
   `debug_traceCall` only. Before TN-0017 these ignored the timeout and kept running after the
   client disconnected, until the trace finished or the node ran out of memory (upstream reth
-  #27543). Now an expired or abandoned trace stops at the next EVM step.
-- The tracing permits (`--rpc.max-tracing-requests`), which `trace_*` and `eth_callBundle` share.
+  #27543). Now an expired request returns an error at once, and an expired or abandoned trace
+  stops at the first EVM step after the running callback returns. `setup` and `result` run outside
+  the EVM steps, so nothing stops them.
+
+What bounds the cost is the number of threads. Each `debug_trace*` request holds a tracing permit
+(`--rpc.max-tracing-requests`) until its trace ends, even after it times out or the client leaves
+(TN-0036). So at most that many blocking threads run debug traces at once, however long one takes.
+The cost moves to other callers instead: a trace that runs for an hour keeps its permit for an hour,
+and the `debug_trace*`, `debug_executionWitness*` and `trace_*` requests that share the permits
+queue behind it.
 
 The block traces (`debug_traceBlock`, `debug_traceBlockByHash`, `debug_traceBlockByNumber`) and
-`debug_traceCallMany` did not get that fix, upstream or here. They ignore `timeout`, and once a
-trace starts it runs until every transaction in the block or bundle is traced, even if the client
+`debug_traceCallMany` did not get the TN-0017 fix, upstream or here. They ignore `timeout`, and once
+a trace starts it runs until every transaction in the block or bundle is traced, even if the client
 has disconnected. The node checks for a disconnect only before the trace starts.
 
-No limit applies to memory. A tracer can keep data across steps, so a long trace can collect a
-lot of it, bounded only by the timeout where one applies. JavaScript tracers are also much slower
-than the native ones, because the node calls into the interpreter on every EVM step.
+No limit applies to memory. A tracer can keep data across steps, and one callback can build large
+values, so a long trace can collect a lot of it. JavaScript tracers are also much slower than the
+native ones, because the node calls into the interpreter on every EVM step.
 
 The TN-0017 fix is carried code. Upstream fixed #27543 with an interrupt added in
 revm-inspectors 0.44.2, which needs revm 43, and TN is on revm-inspectors 0.34 with revm 34. So

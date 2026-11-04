@@ -55,7 +55,7 @@ Some `debug_*` methods are registered but do nothing; [debug](debug/README.md) l
 
 | Flag | Default | Effect |
 | --- | --- | --- |
-| `--rpc.max-tracing-requests` | CPU cores minus 2, at least 2 | Concurrent tracing requests, shared by `debug_trace*`, `debug_executionWitness*`, `trace_*` and `eth_callBundle`; further requests wait for a free slot |
+| `--rpc.max-tracing-requests` | CPU cores minus 2, at least 2 | Concurrent tracing requests, shared by `debug_trace*`, `debug_executionWitness*` and `trace_*`; further requests wait for a free slot. A `debug_trace*` request keeps its slot until its trace ends, even after a timeout or a disconnect |
 | `--rpc.max-trace-filter-blocks` | `100` | Largest block range one `trace_filter` request may cover |
 | `--rpc.max-blocks-per-filter` | `100000` (`0` = no limit) | Largest block range for `eth_getLogs` and log filters |
 | `--rpc.max-logs-per-response` | `20000` (`0` = no limit) | Most logs one `eth_getLogs` or filter response may return |
@@ -63,7 +63,7 @@ Some `debug_*` methods are registered but do nothing; [debug](debug/README.md) l
 | `--rpc.max-response-size` | `160` (MB) | Largest response the server sends |
 | `--rpc.max-connections` | `500` | Concurrent RPC connections |
 | `--http.corsdomain` | none | Origins allowed to call the HTTP server from a browser |
-| `--ws.origins` | none | Origins allowed to open a WebSocket connection |
+| `--ws.origins` | unset: any origin | Origins allowed to open a WebSocket connection. Unset, the node checks no origin, so any web page can connect. A request without an `Origin` header (a client that is not a browser) always passes |
 | `--rpc.jwtsecret` | none | Hex-encoded secret; when set, HTTP and WebSocket requests need a JWT bearer token |
 
 ## Examples
