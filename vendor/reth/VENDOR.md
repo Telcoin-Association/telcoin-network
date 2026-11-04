@@ -36,9 +36,10 @@ for m in $(find vendor/reth -name Cargo.toml ! -path vendor/reth/Cargo.toml); do
 done
 ```
 
-Expected output: only `Only in /tmp/reth-v1.11.3/...` lines for files that the
-local changes below remove, and for nested crate directories that are not
-vendored.
+Expected output: `Only in /tmp/reth-v1.11.3/...` lines for files that the
+local changes below remove and for nested crate directories that are not
+vendored, and `Files ... differ` lines for files that the local changes below
+edit.
 
 ## Local changes
 
@@ -84,3 +85,10 @@ Changes in the crate directories, in the order they were made:
    reth-node-ethstats, reth-node-events, reth-node-metrics, reth-payload-validator,
    reth-primitives, reth-prune, reth-stages, reth-stages-api, reth-static-file,
    reth-trie-parallel.
+
+4. Formatting only. `cargo fmt --all` in telcoin-network also formats the
+   vendored crates, with the rustfmt version that telcoin-network pins. That
+   version sorts one import list in a different order than upstream: the
+   `use reth_codecs::{...}` list in `mod compact` of
+   `crates/ethereum/primitives/src/receipt.rs`. Only the order of the imports
+   changed. There is no code change.
