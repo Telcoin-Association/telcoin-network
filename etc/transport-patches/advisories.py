@@ -15,6 +15,7 @@ import urllib.request
 
 ROOT = Path(__file__).resolve().parents[2]
 ADVISORY = "RUSTSEC-2024-0373"
+REGISTRY = "registry+https://github.com/rust-lang/crates.io-index"
 
 
 def sha256(path):
@@ -80,6 +81,43 @@ quinn-proto = {dependency}
                        "version": package["version"], "source": package["source"]}
 
 
+def registry_form(lockfile, identities):
+    """Copy a lockfile with the recorded path packages re-sourced to the registry.
+
+    Both pinned scanners skip a package without a registry source, so a path override hides
+    every advisory against the carried version itself. The copy keeps every other entry
+    verbatim, is audit input only, and never replaces the node lockfile.
+    """
+    def resource(block):
+        entry = tomllib.loads(block)["package"][0] if block.startswith("[[package]]") else {}
+        identity = (entry.get("name"), entry.get("version"))
+        if entry.get("source") is not None or identity not in identities:
+            return block, None
+        lines = block.split("\n")
+        index = lines.index(f'version = "{entry["version"]}"') + 1
+        return "\n".join(lines[:index] + [f'source = "{REGISTRY}"'] + lines[index:]), identity
+    blocks, resourced = zip(*(resource(block) for block in lockfile.split("\n\n")))
+    rewritten = sorted(identity for identity in resourced if identity is not None)
+    if rewritten != sorted(identities):
+        raise RuntimeError("registry-form copy did not re-source every recorded path package")
+    return "\n\n".join(blocks), [{"name": name, "version": version} for name, version in rewritten]
+
+
+def audit_copy(args, output, name, lockfile, identities, env):
+    """Audit a registry-form copy of `lockfile`; the copy lives under the evidence directory only."""
+    directory = output / name
+    directory.mkdir()
+    text, rewritten = registry_form(lockfile.read_text(), identities)
+    copy = directory / "Cargo.lock"
+    copy.write_text(text)
+    result, receipt = run([args.audit, "audit", "--no-fetch", "--db", str(args.database),
+                           "--file", str(copy), "--json"], directory, output, name, env)
+    if result.returncode not in (0, 1):
+        raise RuntimeError(f"{name}: scanner error cannot count as a registry-form result")
+    return result, {**receipt, "lockfile_sha256": sha256(lockfile), "copy_sha256": sha256(copy),
+                    "rewritten": rewritten}
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", required=True, type=Path)
@@ -115,8 +153,10 @@ def main():
         for tool, binary in (("cargo-audit", args.audit), ("cargo-deny", args.deny)):
             summary["scanners"][tool] = require([binary, "--version"], ROOT, output,
                                                f"{tool}-version", env).decode().strip()
+        fixtures = {}
         for name, path in (("registry", None), ("path", source)):
             directory, identity = fixture(name, path, output, env)
+            fixtures[name] = directory
             observations = {"resolved": identity, "results": {}}
             audit = [args.audit, "audit", "--no-fetch", "--db", str(args.database),
                      "--file", str(directory / "Cargo.lock"), "--json"]
@@ -131,6 +171,14 @@ def main():
                 if result.returncode != (1 if reported else 0):
                     raise RuntimeError(f"{name} {tool}: scanner error cannot count as a coverage gap")
             summary["controls"][name] = observations
+        # The path control shows what both scanners miss. The same lockfile in registry form
+        # must report the advisory, or the rewrite proves nothing about the node scan below.
+        result, control = audit_copy(args, output, "registry-form-control",
+                                     fixtures["path"] / "Cargo.lock", {("quinn-proto", "0.11.6")}, env)
+        control["known_advisory_reported"] = ADVISORY.encode() in result.stdout + result.stderr
+        summary["controls"]["registry-form"] = control
+        if result.returncode != 1 or not control["known_advisory_reported"]:
+            raise RuntimeError("registry-form control did not restore path advisory coverage")
         deny_databases = list((output / "deny-db").glob("advisory-db-*"))
         if len(deny_databases) != 1:
             raise RuntimeError("cannot identify cargo-deny's actual advisory database")
@@ -153,6 +201,7 @@ def main():
             raise RuntimeError("source evidence must pass before advisory qualification")
         closure = runpy.run_path(str(ROOT / "etc/transport-patches/sources.py"))["transport_closure"]
         identities = set()
+        paths = set()
         summary["transport_closure_counts"] = {}
         for mode in ("default", "adiri"):
             if source_summary["node"][mode]["lockfile_sha256"] != sha256(ROOT / "Cargo.lock"):
@@ -163,12 +212,23 @@ def main():
                 raise RuntimeError("resolved source evidence changed after capture")
             packages = closure(json.loads(raw.read_text()))
             identities.update((package["name"], package["version"]) for package in packages)
+            paths.update((package["name"], package["version"]) for package in packages
+                         if package["source"] is None)
             summary["transport_closure_counts"][mode] = len(packages)
         summary["carried_scan"] = {**receipt, "workspace_finding_count": len(findings),
             "transport_findings": [finding for finding in findings
                                    if (finding["package"]["name"], finding["package"]["version"]) in identities]}
         if summary["carried_scan"]["transport_findings"]:
             raise RuntimeError("carried transport has advisory findings requiring review")
+        # The scan above cannot see the path packages themselves. Scan the node lockfile again
+        # with those packages in registry form, filtered by the same closure identities.
+        result, carried = audit_copy(args, output, "registry-form-carried", ROOT / "Cargo.lock", paths, env)
+        findings = json.loads(result.stdout)["vulnerabilities"]["list"]
+        summary["carried_registry_form_scan"] = {**carried, "workspace_finding_count": len(findings),
+            "transport_findings": [finding for finding in findings
+                                   if (finding["package"]["name"], finding["package"]["version"]) in identities]}
+        if summary["carried_registry_form_scan"]["transport_findings"]:
+            raise RuntimeError("carried path packages have advisory findings requiring review")
         summary["status"] = "passed"
     finally:
         (output / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")

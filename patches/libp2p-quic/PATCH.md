@@ -42,17 +42,36 @@ shows that it can receive packets at its source address. The patch adds:
   event at once.
 - `IncomingStats` (shared atomic counters: retried, accepted, refused, ignored, budget
   yields) through `Config::incoming_stats`. `refused` counts both an attempt the listener
-  refuses and an attempt that fails in quinn `Incoming::accept` (quinn sends a close
-  response there; the listener still returns the upstream `ListenerError`).
+  refuses and an attempt that fails in quinn `Incoming::accept`. A stale Initial can be
+  discarded without a close response; the listener still returns the upstream `ListenerError`.
 
 The new code is in `src/incoming.rs`. `src/transport.rs` gets `Listener::poll_accept`, a
 bounded `try_fold` over the accept future. The fold form (not a `loop`) keeps the diff small
 and matches the house rules of the node repository.
 
+`Config::inbound_accept_task` (default `None`) is an opt-in measurement prototype for
+telcoin-network issue #1741. With `None` the listener decides on attempts and accepts them
+inline, inside `Transport::poll` on the swarm task, exactly as before. With `Some(capacity)`
+each listener spawns one task on the provider runtime (`Provider::spawn`) that waits for
+attempts, applies the same Retry policy and per-poll outcome cap (it yields to the executor
+at the cap), runs `Incoming::accept`, and queues the accepted handshakes in a bounded channel
+of `capacity` entries until the swarm takes them. The bound is explicit: at most `capacity`
+accepted handshakes wait for the swarm, and `max_incoming` bounds the attempts ahead of them.
+The task ends when the listener closes or is dropped. The node sets the field from
+`quic_config.inbound_accept_task` (`mode: inline`, or `mode: spawned` with a `capacity`).
+
 Public tracking: telcoin-network issues #1431 (maintenance and advisory coverage of carried
 transport patches) and #1432 (QUIC listener and cross-release interoperability coverage).
 
 ## Diff against upstream
+
+Issue #1680 extends `IncomingStats` with fixed stage/decision/reason outcomes and shares an
+optional observer from the pinned [quinn-proto companion](../quinn-proto/PATCH.md). This exposes
+token failures, actual incoming occupancy, effective ceilings and cap drops before the application
+hook. Accepted upgrades carry a guard until completion, timeout or cancellation. Legacy aggregate
+counters remain available. See [the observations contract](../../docs/quic-incoming-metrics.md)
+for the exact meanings and queries. Root and candidate manifests select both carried sources;
+independent interoperability peers retain their registry sources.
 
 `upstream.diff` is the unified diff against the registry copy, with relative paths and no
 file times. The upstream side uses `Cargo.toml.orig` as `Cargo.toml` and leaves out the
@@ -67,7 +86,7 @@ cp -R patches/libp2p-quic "$TMP/patched"
 mv "$TMP/upstream/Cargo.toml.orig" "$TMP/upstream/Cargo.toml"
 rm -f "$TMP/upstream/Cargo.lock" "$TMP/upstream/.cargo-ok" "$TMP/upstream/.cargo_vcs_info.json"
 rm -f "$TMP/patched/PATCH.md" "$TMP/patched/upstream.diff"
-(cd "$TMP" && git diff --no-index --no-color --no-ext-diff --no-prefix upstream patched) \
+(cd "$TMP" && git diff --no-index --full-index --no-color --no-ext-diff --no-prefix upstream patched) \
   > patches/libp2p-quic/upstream.diff
 rm -rf "$TMP"
 ```
@@ -83,8 +102,11 @@ Required transport CI runs cargo-audit 0.22.2 and cargo-deny 0.20.2 against a re
 published advisory control. Both detect vulnerable registry `quinn-proto` 0.11.6
 and miss the identical path source. The record documents that gap, a source-neutral
 advisory match, separate Dependabot observations and the owned monitoring procedure.
-Quinn and TLS remain registry crates. Extend the same record before carrying them
-from another source form. Passing a scanner alone does not qualify this copy.
+The gate also audits a registry-form copy of the lockfile, so advisories against the
+carried versions are still matched. `quinn-proto` is carried by path as well and has its
+own record (`patches/quinn-proto/PATCH.md`); `quinn`, `libp2p-tls` and the TLS crates
+remain registry crates. Extend the same record before carrying another crate from a
+different source form. Passing a scanner alone does not qualify this copy.
 
 ## Removal condition
 

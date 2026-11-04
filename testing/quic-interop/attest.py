@@ -134,7 +134,7 @@ def run(args):
              "--output", str(output / "isolated")], timeout=300)
         with tempfile.TemporaryDirectory(prefix="tn1432-mutation-") as temporary:
             copy = Path(temporary)
-            for relative in ("patches/libp2p-quic", "testing/quic-interop"):
+            for relative in ("patches/libp2p-quic", "patches/quinn-proto", "testing/quic-interop"):
                 shutil.copytree(ROOT / relative, copy / relative,
                                 ignore=shutil.ignore_patterns("target", "__pycache__"))
             for relative in ("crates/config/src/network/quic.rs",

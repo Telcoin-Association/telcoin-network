@@ -435,8 +435,9 @@ impl<DB: Database> Proposer<DB> {
             // If the barrier reports a failed commit (disk full, `EIO`, checksum), the record is
             // not on disk, so broadcasting would risk that same self-inflicted equivocation.
             // Refuse to broadcast and return a fatal error instead: the proposer runs as a
-            // critical task, so returning here fail-stops the node cleanly rather than continuing
-            // on a lost guard record (issue #975).
+            // critical task, so returning here stops the node rather than continuing on a lost
+            // guard record (issue #975). When another task's failed barrier has already ended the
+            // epoch, `run_epoch` stops the node instead, finding the store unable to write.
             proposer_store
                 .persist::<LastProposed>()
                 .await

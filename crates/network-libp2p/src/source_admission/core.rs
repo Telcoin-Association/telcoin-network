@@ -83,6 +83,19 @@ pub enum AdmissionError {
 }
 
 impl AdmissionError {
+    /// Every denial reason, in label order.
+    pub(crate) const ALL: [Self; 9] = [
+        Self::InvalidLimits,
+        Self::ProcessFull,
+        Self::PeerFull,
+        Self::AddressFull,
+        Self::PrefixFull,
+        Self::SourcesFull,
+        Self::UnsupportedAddress,
+        Self::DuplicateConnection,
+        Self::Poisoned,
+    ];
+
     /// Stable metric label for this denial reason.
     pub(crate) const fn label(&self) -> &'static str {
         match self {

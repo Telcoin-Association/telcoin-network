@@ -53,6 +53,31 @@ def run(argv, cwd, output, name):
     return result.stdout
 
 
+RECORDED_PATHS = {"libp2p-quic": "0.14.0", "quinn-proto": "0.11.18"}
+
+
+def validate_sources(packages, root, carried):
+    """Allow only checksum-recorded path overrides at their exact production paths and versions."""
+    for package in packages:
+        name = package["name"]
+        if carried and name in RECORDED_PATHS:
+            if (package["source"] is not None or package["version"] != RECORDED_PATHS[name]
+                    or Path(package["manifest_path"]).resolve() != root / "patches" / name / "Cargo.toml"):
+                raise RuntimeError(f"Cargo does not select the recorded {name} source")
+        elif not (package["source"] or "").startswith("registry+"):
+            raise RuntimeError("an unrecorded transport dependency is overridden")
+
+
+def normalized_packages(packages):
+    """Normalize only recorded source identities, retaining dependency edges and versions."""
+    identities = {package["id"]: f"{package['name']}-source-control" for package in packages
+                  if package["name"] in RECORDED_PATHS}
+    return [{**package, "source": "source-control" if package["id"] in identities else package["source"],
+             "id": identities.get(package["id"], package["id"]),
+             "dependencies": sorted(identities.get(dependency, dependency)
+                                    for dependency in package["dependencies"])} for package in packages]
+
+
 def node(root, output, label):
     """Capture default and Adiri release graphs for the production Linux target without building."""
     result = {}
@@ -71,17 +96,14 @@ def node(root, output, label):
             raise RuntimeError("comparison does not select the registry QUIC source")
         nodes = {item["id"]: item for item in metadata["resolve"]["nodes"]}
         closure = transport_closure(metadata)
-        if any(package["name"] != "libp2p-quic"
-               and not (package["source"] or "").startswith("registry+") for package in closure):
-            raise RuntimeError("a transitive transport dependency is overridden; extend its source record and controls")
+        validate_sources(closure, root, label == "node")
         packages = [{"name": package["name"], "version": package["version"], "source": package["source"],
                      "id": package["id"].replace(str(root), "$NODE"),
                      "dependencies": sorted(dependency["pkg"].replace(str(root), "$NODE")
                                             for dependency in nodes[package["id"]]["deps"])}
                     for package in metadata["packages"] if package["name"] in NAMES]
-        if any(package["name"] != "libp2p-quic"
-               and not (package["source"] or "").startswith("registry+") for package in packages):
-            raise RuntimeError("another transport/crypto source is overridden; extend its record and peer recipe")
+        validate_sources([package for package in metadata["packages"] if package["name"] in NAMES],
+                         root, label == "node")
         tree = run(["cargo", "+1.94", "tree", "--locked", "-p", "telcoin-network",
                     "--target", "x86_64-unknown-linux-gnu", "--edges", "normal,build",
                     "--prefix", "none", "--format", "{p}|{f}"] + features,
@@ -95,34 +117,38 @@ def node(root, output, label):
     return result
 
 
-def provenance(root, output):
+def provenance(root, output, name="libp2p-quic", version="0.14.0",
+               expected="4f78ca359466657b380e469fe8c04df2f4447d1430838e6c3cef4a1c51ccb2ee"):
     """Reproduce the committed diff from the checksum-identified registry archive."""
-    archive = next((Path.home() / ".cargo/registry/cache").glob("*/libp2p-quic-0.14.0.crate"))
+    output.mkdir(parents=True, exist_ok=True)
+    archive = next((Path.home() / ".cargo/registry/cache").glob(f"*/{name}-{version}.crate"))
     checksum = sha256(archive)
-    if checksum != "4f78ca359466657b380e469fe8c04df2f4447d1430838e6c3cef4a1c51ccb2ee":
+    if checksum != expected:
         raise RuntimeError("upstream registry checksum differs from the recorded base")
     extracted = output / "registry"
     with tarfile.open(archive) as source:
         source.extractall(extracted, filter="data")
-    original = extracted / "libp2p-quic-0.14.0"
+    original = extracted / f"{name}-{version}"
     revision = json.loads((original / ".cargo_vcs_info.json").read_text())["git"]["sha1"]
     upstream = output / "upstream"
     patched = output / "patched"
     shutil.copytree(original, upstream)
-    shutil.copytree(root / "patches/libp2p-quic", patched)
-    (upstream / "Cargo.toml.orig").replace(upstream / "Cargo.toml")
-    for name in ("Cargo.lock", ".cargo-ok", ".cargo_vcs_info.json"):
-        (upstream / name).unlink(missing_ok=True)
-    for name in ("PATCH.md", "upstream.diff"):
-        (patched / name).unlink()
-    diff = subprocess.run(["git", "diff", "--no-index", "--no-color", "--no-ext-diff",
+    shutil.copytree(root / "patches" / name, patched)
+    if name == "libp2p-quic":
+        (upstream / "Cargo.toml.orig").replace(upstream / "Cargo.toml")
+    for artifact in ("Cargo.lock", ".cargo-ok", ".cargo_vcs_info.json"):
+        (upstream / artifact).unlink(missing_ok=True)
+    (patched / "Cargo.lock").unlink(missing_ok=True)
+    for artifact in ("PATCH.md", "upstream.diff"):
+        (patched / artifact).unlink()
+    diff = subprocess.run(["git", "diff", "--no-index", "--full-index", "--no-color", "--no-ext-diff",
                            "--no-prefix", "upstream", "patched"], cwd=output, capture_output=True)
-    if diff.returncode != 1 or diff.stdout != (root / "patches/libp2p-quic/upstream.diff").read_bytes():
+    if diff.returncode != 1 or diff.stdout != (root / "patches" / name / "upstream.diff").read_bytes():
         (output / "observed.diff").write_bytes(diff.stdout)
         raise RuntimeError("committed upstream.diff does not reproduce from the registry archive")
     files = {str(path.relative_to(patched)): sha256(path) for path in sorted(patched.rglob("*")) if path.is_file()}
     return {"registry_archive_sha256": checksum, "upstream_base_revision": revision,
-            "upstream_diff_sha256": sha256(root / "patches/libp2p-quic/upstream.diff"),
+            "upstream_diff_sha256": sha256(root / "patches" / name / "upstream.diff"),
             "vendored_files": files,
             "vendored_tree_sha256": hashlib.sha256(json.dumps(files, sort_keys=True).encode()).hexdigest()}
 
@@ -143,16 +169,15 @@ def main():
             for mode in ("default", "adiri"):
                 carried = result["node"][mode]
                 stock = result["comparison"][mode]
-                def normalized_packages(packages):
-                    return [{**package, "source": "source-control", "id": "libp2p-quic-source-control"}
-                            if package["name"] == "libp2p-quic" else package for package in packages]
                 def normalized_features(lines):
-                    return [re.sub(r" \(\$NODE/patches/libp2p-quic\)", "", line) for line in lines]
+                    return [re.sub(r" \(\$NODE/patches/(?:libp2p-quic|quinn-proto)\)", "", line) for line in lines]
                 if (normalized_packages(carried["packages"]) != normalized_packages(stock["packages"])
                         or normalized_features(carried["release_feature_tree"]) != normalized_features(stock["release_feature_tree"])):
                     raise RuntimeError(f"{mode} graph differs beyond the intended QUIC source override")
-            result["source_override_comparison"] = "only libp2p-quic source identity differs"
+            result["source_override_comparison"] = "only recorded libp2p-quic and quinn-proto source identities differ"
         result["provenance"] = provenance(args.root.resolve(), output)
+        result["quinn_provenance"] = provenance(args.root.resolve(), output / "quinn-proto",
+            "quinn-proto", "0.11.18", "a9746dbde176634f4f2f1faf2404e30a31b2bc1e9cafb5329c95d8177a18c9fc")
         result["status"] = "passed"
     finally:
         (output / "summary.json").write_text(json.dumps(result, indent=2) + "\n")

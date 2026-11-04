@@ -9,6 +9,8 @@
 //! 2. [`start_metrics_server`] - a minimal HTTP endpoint that renders the registry for Prometheus
 //!    scrapes, with pre-scrape [`MetricsHooks`] for sampled metrics (process stats, db table
 //!    sizes).
+//! 3. [`report_listener_bound`] - the startup report every operator listener (health, metrics)
+//!    emits with its bound address and reach ([`ListenerExposure`]), issue #1689.
 //!
 //! # Naming convention
 //!
@@ -45,8 +47,10 @@
 //! counters merge across nodes. In production each node is its own process, so this is a
 //! test-only artifact.
 
+mod exposure;
 mod recorder;
 mod server;
 
+pub use exposure::{report_listener_bound, ListenerExposure};
 pub use recorder::install_recorder;
 pub use server::{start_metrics_server, MetricsHooks};

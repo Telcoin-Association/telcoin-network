@@ -20,10 +20,12 @@ use crate::{
     engine::ExecutionNode, manager::EpochManager, metrics::EpochMetrics,
     worker::worker_task_manager_name,
 };
+use eyre::WrapErr as _;
 use futures::{StreamExt as _, TryStreamExt as _};
 use std::{
     collections::{HashSet, VecDeque},
     future::{ready, Future},
+    sync::Arc,
     time::Duration,
 };
 use tn_config::{NetworkConfig, TelcoinDirs};
@@ -33,7 +35,7 @@ use tn_reth::{error::StateReadError, RethEnv};
 use tn_storage::{
     certificate_pack::CertificatePack,
     epoch_records::EpochRecordDb,
-    tables::{NodeBatchesCache, OurNodeBatchesCache},
+    tables::{KadRecords, NodeBatchesCache, OurNodeBatchesCache, Votes},
 };
 use tn_types::{
     gas_accumulator::{next_base_fee_for_config, GasAccumulator},
@@ -348,7 +350,6 @@ where
             .await?;
         // consensus config for shutdown subscribers
         let consensus_shutdown = primary.shutdown_signal().await;
-        let epoch_shutdown_rx = consensus_shutdown.subscribe();
 
         // This needs to be created early so required machinery for other tasks exists when needed.
         let mut workers = futures::stream::iter(&worker_nodes)
@@ -372,15 +373,17 @@ where
         // the batch builders below must decide from the same value
         let node_mode = self.consensus_bus.current_node_mode();
         let proposer_started = starts_proposer(node_mode);
+        // Shared with the consensus task, which saves into it; `finish_epoch` seals it once that
+        // task has ended.
         let certificate_pack = if proposer_started {
-            Some(CertificatePack::open(self.tn_datadir.epochs_db_path(), current_epoch))
+            Some(Arc::new(CertificatePack::open(self.tn_datadir.epochs_db_path(), current_epoch)))
         } else {
             None
         };
         if proposer_started {
             // start primary
             primary
-                .start(&epoch_task_manager, self.consensus_chain.clone(), certificate_pack)
+                .start(&epoch_task_manager, self.consensus_chain.clone(), certificate_pack.clone())
                 .await?;
         }
         // Spawn the subscriber.
@@ -443,19 +446,34 @@ where
         // this can also happen due to committee nodes re-syncing and errors
         let consensus_shutdown_clone = consensus_shutdown.clone();
 
-        // indicate if the node is restarting to join the committe or if the epoch is changed and
-        // tables should be cleared
-        let mut clear_tables_for_next_epoch = false;
+        // e2e fault injection, always false without `tn-types/test-utils`: fail the peer-record
+        // store, which no epoch task writes every round, so only the `store_failed` arm below stops
+        // the node before the boundary
+        if tn_types::test_hooks::fail_store_at_epoch::<KadRecords, _>(
+            &self.consensus_db,
+            current_epoch,
+        ) {
+            warn!(
+                target: "epoch-manager",
+                epoch = current_epoch,
+                "test hook: failed the peer-record store",
+            );
+        }
+
+        // Resolves once a consensus DB store latches a failure. Made before the select, which
+        // borrows `self` mutably for the boundary arm.
+        let store_failed = store_failure(&self.consensus_db);
 
         let mut epoch_boundary_reached = false;
         tokio::select! {
             _ = node_ended => {
                 info!(target: "epoch-manager", "node exiting, epoch ending");
             },
+            // a store that can no longer make writes durable stops the node now, not at the
+            // epoch's end (`ensure_stores_durable`)
+            err = store_failed => return Err(err),
             // wait for epoch boundary to transition
             res = self.wait_for_epoch_boundary(to_engine, &mut consensus_output) => {
-                // toggle bool to clear tables
-                clear_tables_for_next_epoch = true;
                 let target_hash = res.inspect_err(|e| {
                     error!(target: "epoch-manager", ?e, "failed to reach epoch boundary");
                 })?;
@@ -511,36 +529,16 @@ where
 
             // return any errors
             res = epoch_task_manager.until_task_ends(consensus_shutdown_clone) => {
-                match res {
-                    Ok(()) => info!(target: "epoch-manager", "epoch task manager exited - likely syncing with committee"),
-                    // There are times when the epoch task manager can exit with Ok...
-                    Err(TaskJoinError::CriticalExitOk(task)) => {
-                        // It is possible for the epoch to get a shutdown signal before the join.
-                        // In that case it will not reconize the Ok task exit so we double check it here
-                        // with a noticer that was aquired much earlier on epoch startup.
-                        if epoch_shutdown_rx.noticed() {
-                            info!(target: "epoch-manager", "epoch task manager exited - likely syncing with committee");
-                        } else {
-                            error!(target: "epoch-manager", ?task, "failed to reach epoch boundary");
-                            return Err(TaskJoinError::CriticalExitOk(task).into());
-                        }
-                    }
-                    Err(e) => {
-                        error!(target: "epoch-manager", ?e, "failed to reach epoch boundary");
-                        return Err(e.into());
-                    }
-                }
+                epoch_tasks_ended(res, &self.node_shutdown)?;
             },
         }
 
-        let mut res = RunEpochMode::NewEpoch;
         // If the select exitted because of a join() then do not join() again- we are already
         // shutting down.
         consensus_shutdown.notify();
         // Give the epoch's tasks a short window to exit on their own first, so their graceful
-        // exits run (the consensus task seals its certificate pack and reports a queued save
-        // failure; the subscriber saves the outputs it already holds). Then abort whatever is
-        // still running.
+        // exits run (the subscriber saves the outputs it already holds; `finish_epoch` seals the
+        // certificate pack once they are gone). Then abort whatever is still running.
         epoch_task_manager.wait_for_exit(EPOCH_TASK_EXIT_GRACE).await;
         epoch_task_manager.abort_all_tasks();
         // Expect complaints from join so swallow those errors...
@@ -551,30 +549,85 @@ where
             epoch_task_manager.wait_for_task_shutdown(),
         )
         .await?;
-        if epoch_boundary_reached {
+        self.finish_epoch(
+            engine,
+            &reth_env,
+            &gas_accumulator,
+            to_engine,
+            &mut consensus_output,
+            certificate_pack,
+            current_epoch,
+            epoch_boundary_reached,
+        )
+        .await
+    }
+
+    /// Finish an epoch whose tasks have ended and been joined, and return how it ended.
+    ///
+    /// 1. The epoch's packs must have made their writes durable: the certificate pack is sealed
+    ///    (`seal_certificate_pack`; the consensus task that saved into it is gone) and the
+    ///    consensus pack persisted. A failed save or sync latches in either, so this catches a
+    ///    failure that only a task masked by the epoch's shutdown saw. It runs before the leftover
+    ///    drain: a save advances `latest_consensus_number` before its persist, and the drain
+    ///    forwards every output up to that number, read back from the pack (reads ignore a failed
+    ///    sync), so without it an output whose persist failed could be executed.
+    /// 2. On an exit without the boundary, drain leftover output to the engine; if the drain
+    ///    reaches the boundary, close the epoch and write its [`EpochRecord`] here too.
+    /// 3. Clear the epoch-scoped DB tables when a boundary was crossed.
+    /// 4. Check the consensus DB's stores still make writes durable (`ensure_stores_durable`).
+    ///
+    /// Each failure is this node's own storage failing, so it is returned and stops the node.
+    #[allow(clippy::too_many_arguments)]
+    async fn finish_epoch(
+        &mut self,
+        engine: &ExecutionNode,
+        reth_env: &RethEnv,
+        gas_accumulator: &GasAccumulator,
+        to_engine: &mpsc::Sender<ConsensusOutput>,
+        consensus_output: &mut impl TnReceiver<ConsensusOutput>,
+        certificate_pack: Option<Arc<CertificatePack>>,
+        epoch: Epoch,
+        epoch_boundary_reached: bool,
+    ) -> eyre::Result<RunEpochMode> {
+        if let Some(pack) = certificate_pack {
+            seal_certificate_pack(pack).await?;
+        }
+        self.consensus_chain
+            .persist_current()
+            .await
+            .wrap_err("the consensus pack can no longer make writes durable; stopping the node")?;
+
+        // the epoch tables are cleared when a boundary was crossed, here or by the boundary arm
+        let mut clear_tables_for_next_epoch = epoch_boundary_reached;
+        let res = if epoch_boundary_reached {
             // The epoch is over now and consensus should be shutdown.
             // Do a sanity clear of the consensus_output channel.
             // Note we probably do not need this anymore but not harmful.
             while let Ok(_output) = consensus_output.try_recv() {}
+            RunEpochMode::NewEpoch
         } else if let Some(target_hash) =
-            self.send_leftover_consensus_output_to_engine(&mut consensus_output, to_engine).await
+            self.send_leftover_consensus_output_to_engine(consensus_output, to_engine).await
         {
             // If things go down at exactly the wrong time we might have reached the epoch end
             // so account for that.
-            self.close_epoch(None, &reth_env, &gas_accumulator, target_hash).await?;
+            self.close_epoch(None, reth_env, gas_accumulator, target_hash).await?;
             // this arm closed the epoch, so it writes the record too — otherwise the epoch has
             // no durable record and the next live close fails as out-of-order
-            self.write_epoch_record(current_epoch, engine).await?;
-            res = RunEpochMode::NewEpoch;
+            self.write_epoch_record(epoch, engine).await?;
             clear_tables_for_next_epoch = true;
+            RunEpochMode::NewEpoch
         } else {
-            res = RunEpochMode::ModeChange;
-        }
+            RunEpochMode::ModeChange
+        };
 
         // clear tables
         if clear_tables_for_next_epoch {
             self.clear_consensus_db_for_next_epoch()?;
         }
+        // An epoch task that saw a store refuse a write (a failed durability barrier) ends the
+        // epoch the way a mode change does. Running another epoch on a store the node can no
+        // longer write to would only defer the failure, so the node stops here instead.
+        ensure_stores_durable(&self.consensus_db).await?;
 
         Ok(res)
     }
@@ -1090,25 +1143,111 @@ async fn resolve_prior_epoch_record(
     Ok((rec, digest))
 }
 
+/// Check that every store of the consensus DB can still make writes durable, by a `persist` of one
+/// table in each (the epoch's working state, peer records, the batch cache). A store that failed a
+/// write or a sync refuses every later one until restart, and a node that can no longer write to
+/// its stores must stop: the error names the store.
+async fn ensure_stores_durable<DB: TNDatabase>(db: &DB) -> eyre::Result<()> {
+    db.persist::<Votes>().await.wrap_err(
+        "the epoch store (votes, certificates, proposals) can no longer make writes durable; \
+         stopping the node (a restart reopens it)",
+    )?;
+    db.persist::<KadRecords>().await.wrap_err(
+        "the peer-record store can no longer make writes durable; stopping the node (a restart \
+         reopens it)",
+    )?;
+    db.persist::<NodeBatchesCache>().await.wrap_err(
+        "the batch-cache store can no longer make writes durable; stopping the node (a restart \
+         reopens it)",
+    )?;
+    Ok(())
+}
+
+/// What `run_epoch` does when the epoch's task manager ends before the boundary
+/// (`until_task_ends`): `Ok` ends the epoch the way a mode change does, `Err` stops the node.
+///
+/// A critical task that ends before the epoch is told to is a failure even when it returns Ok (an
+/// epoch-ending notify makes its exit an `Ok(())`), unless the node itself is going down. A
+/// critical task's error, such as a store that refused a write or the consensus task's failed
+/// certificate pack, stops the node.
+fn epoch_tasks_ended(
+    res: Result<(), TaskJoinError>,
+    node_shutdown: &ShutdownNotifier,
+) -> eyre::Result<()> {
+    match res {
+        Ok(()) => {
+            info!(target: "epoch-manager", "epoch task manager exited - likely syncing with committee")
+        }
+        Err(TaskJoinError::CriticalExitOk(task)) if node_shutdown.is_notified() => {
+            info!(target: "epoch-manager", ?task, "epoch task exited while the node shuts down");
+        }
+        Err(e) => {
+            error!(target: "epoch-manager", ?e, "failed to reach epoch boundary");
+            return Err(e.into());
+        }
+    }
+    Ok(())
+}
+
+/// Resolve, with the error that stops the node, once any store behind `db` latches a failure (see
+/// [`TNDatabase::failed`], which names the store); never resolve otherwise. `'static`, so it
+/// holds no borrow of `db`.
+///
+/// A latch is this node's own storage failing (a failed write or sync, a stopped writer, or damage
+/// a read found on disk): a peer's bad record is refused before it is written and latches nothing.
+/// One known exception predates tndb and is tracked separately: a committee member can flood
+/// distinct valid batches into [`NodeBatchesCache`], which keeps them until they are committed or
+/// the epoch closes, so the flood can fill the disk and latch the cache store. Without this, a
+/// latched peer-record or batch-cache store would go unnoticed until the epoch ends (an observer's
+/// following stalls meanwhile).
+fn store_failure<DB: TNDatabase>(
+    db: &DB,
+) -> impl Future<Output = eyre::Report> + Send + 'static + use<DB> {
+    // boxed: the trait's future names `db`'s lifetime in its type, although it outlives it
+    let failed: std::pin::Pin<Box<dyn Future<Output = String> + Send>> = Box::pin(db.failed());
+    async move {
+        eyre::eyre!(failed.await)
+            .wrap_err("a consensus store can no longer make writes durable; stopping the node")
+    }
+}
+
+/// Seal this epoch's certificate pack once the consensus task that saved into it has ended.
+///
+/// The pack reports a certificate save that failed in the background, and a failed final flush,
+/// only here ([`CertificatePack::shutdown`]). Either is this node's own storage failing, never a
+/// peer's input: certificates are verified before consensus archives them, and nothing a peer
+/// sends can make the pack fail (short of filling the shared disk, the batch flood described at
+/// [`store_failure`]). So the error stops the node.
+async fn seal_certificate_pack(pack: Arc<CertificatePack>) -> eyre::Result<()> {
+    match Arc::try_unwrap(pack) {
+        Ok(pack) => pack.shutdown().await,
+        // a task that outlived the epoch's abort still holds it and seals it on drop: flush it,
+        // and report any failed save, now
+        Err(shared) => shared.persist().await,
+    }
+    .wrap_err(
+        "this epoch's certificate pack failed to save or flush certificates; stopping the node",
+    )
+}
+
 /// Remove a committed output's batches from [`NodeBatchesCache`] and [`OurNodeBatchesCache`].
 ///
 /// Every caller of `process_output` hands it an output that is already saved and persisted to the
 /// current epoch's pack. The three `consensus_output` senders await `save_consensus` first, and
 /// startup replay and epoch-close phase 2 read the output back from the pack. Every reader of
 /// [`NodeBatchesCache`] that can meet a committed digest falls back to that pack, so the cache
-/// copies are redundant. Keeping them until the epoch-close clear makes the fixed-size cache map
-/// hold a whole epoch of batches, which overflows it under sustained load (issue #1443).
+/// copies are redundant. Keeping them until the epoch-close clear would hold a whole epoch of
+/// batches in the cache: that overflowed the previous backend's fixed-size map under sustained
+/// load (issue #1443), and it would grow the cache's log for nothing.
 ///
 /// Our own batches have reached execution, so they no longer need rebroadcasting either.
 ///
-/// Nothing here waits on disk. In [`DatabaseType`](tn_storage::DatabaseType) both tables live in
-/// the cache env, a [`LayeredDatabase`](tn_storage::layered_db::LayeredDatabase): each remove
-/// drops the key from the memory layer and queues the delete to that env's writer thread, which
-/// runs the backend write txn and its commit (an fsync under MDBX `Durable`). The caller pays a
-/// map remove and a channel send per key. Sharing one txn makes the writer commit at most once
-/// per output where bare removes would each commit on their own. A failure here is only logged,
-/// and a backend failure is reported on the writer thread instead. A batch left in
-/// [`NodeBatchesCache`] holds space until the epoch-close clear; one left in
+/// Nothing here waits on disk. In [`DatabaseType`](tn_storage::DatabaseType) (a tndb
+/// `SplitDatabase`) both tables live in the cache environment, one shared log: the transaction's
+/// removes are appended to it as one batch at commit, and its commit thread makes them durable in
+/// the background (group commit; nothing here waits for it). Sharing one txn makes one batch per
+/// output where bare removes would each be their own. A failure here is only logged. A batch left
+/// in [`NodeBatchesCache`] holds space until the epoch-close clear; one left in
 /// [`OurNodeBatchesCache`] survives that clear and reaches `orphan_batches` as if it had never
 /// been committed.
 fn evict_committed_batches<DB: TNDatabase>(db: &DB, digests: &VecDeque<BlockHash>) {
@@ -1153,10 +1292,240 @@ mod tests {
         RethChainSpec,
     };
     use tn_types::{
-        gas_accumulator::WorkerFeeConfig, Address, Batch, Certificate, CertifiedBatch,
-        CommittedSubDag, ConsensusHeader, EpochSeedChainValue, ExecHeader, GenesisAccount,
-        HeaderBuilder, ReputationScores, SolCall as _, WorkerId, B256, MIN_PROTOCOL_BASE_FEE, U256,
+        gas_accumulator::WorkerFeeConfig, Address, AuthorityIdentifier, Batch, Certificate,
+        CertifiedBatch, CommittedSubDag, ConsensusHeader, EpochSeedChainValue, ExecHeader,
+        GenesisAccount, HeaderBuilder, ReputationScores, SolCall as _, WorkerId, B256,
+        MIN_PROTOCOL_BASE_FEE, U256,
     };
+
+    /// A node that can no longer write to one of its consensus stores stops rather than run
+    /// another epoch on it: the probe passes on healthy stores and fails, naming the store, once
+    /// any one of them has latched a failed write.
+    #[tokio::test]
+    async fn stores_that_cannot_write_stop_the_node() {
+        let healthy = TempDir::new().unwrap();
+        ensure_stores_durable(&tn_storage::open_db(healthy.path())).await.expect("healthy stores");
+
+        let epoch = TempDir::new().unwrap();
+        let db = tn_storage::open_db(epoch.path());
+        db.fail_durability_for_test::<Votes>();
+        let err = ensure_stores_durable(&db).await.expect_err("a failed epoch store");
+        assert!(format!("{err:#}").contains("the epoch store"), "{err:#}");
+
+        let kad = TempDir::new().unwrap();
+        let db = tn_storage::open_db(kad.path());
+        db.fail_durability_for_test::<KadRecords>();
+        let err = ensure_stores_durable(&db).await.expect_err("a failed peer-record store");
+        assert!(format!("{err:#}").contains("the peer-record store"), "{err:#}");
+
+        let cache = TempDir::new().unwrap();
+        let db = tn_storage::open_db(cache.path());
+        db.fail_durability_for_test::<NodeBatchesCache>();
+        let err = ensure_stores_durable(&db).await.expect_err("a failed batch-cache store");
+        assert!(format!("{err:#}").contains("the batch-cache store"), "{err:#}");
+    }
+
+    /// An [`EpochManager`] on a fresh datadir with an engine over its reth database, for the
+    /// `finish_epoch` tests, and its genesis committee. Nothing is started (no engine task, network
+    /// or epoch); the returned task manager holds the reth environment's tasks.
+    async fn manager_with_engine(
+        temp: &TempDir,
+    ) -> eyre::Result<(
+        EpochManager<std::path::PathBuf, tn_storage::DatabaseType>,
+        ExecutionNode,
+        RethEnv,
+        TaskManager,
+        Committee,
+    )> {
+        use crate::{engine::TnBuilder, manager::node::tests::reth_config_and_db};
+        use tn_config::{Config, KeyConfig};
+        use tn_storage::mem_db::MemDatabase;
+        use tn_test_utils::CommitteeFixture;
+        use tn_types::BlsKeypair;
+
+        let datadir = temp.path().to_path_buf();
+        let committee = CommitteeFixture::builder(MemDatabase::default).build().committee();
+        let config = Config::default_for_test();
+        let (node_config, reth_db) = reth_config_and_db(&config, &committee, &datadir)?;
+        let tasks = TaskManager::default();
+        let reth_env =
+            RethEnv::new(&node_config, &tasks, reth_db.clone(), None, GasAccumulator::new(1))?;
+        let builder = TnBuilder::new(node_config, config, reth_db);
+        let engine = ExecutionNode::new(&builder, reth_env.clone())?;
+        let keys =
+            KeyConfig::new_with_testing_key(BlsKeypair::generate(&mut StdRng::seed_from_u64(7)));
+        std::fs::create_dir_all(datadir.join("db"))?;
+        let db = tn_storage::open_db(datadir.join("db"));
+        let manager = EpochManager::new(builder, datadir, db, keys, "test").await?;
+        Ok((manager, engine, reth_env, tasks, committee))
+    }
+
+    /// An output at number 1, led by a member of `committee`, carrying one batch.
+    fn member_output(committee: &Committee) -> ConsensusOutput {
+        let author = committee.authorities().first().expect("a committee member").id();
+        committed_output_by(
+            author,
+            &[Batch { transactions: vec![vec![7; 32]], ..Default::default() }],
+        )
+    }
+
+    /// `finish_epoch` for an epoch that ended without reaching its boundary and without a
+    /// certificate pack, with `to_engine` as the engine's channel.
+    async fn finish_mode_change(
+        manager: &mut EpochManager<std::path::PathBuf, tn_storage::DatabaseType>,
+        engine: &ExecutionNode,
+        reth_env: &RethEnv,
+        to_engine: &mpsc::Sender<ConsensusOutput>,
+        certificate_pack: Option<Arc<CertificatePack>>,
+    ) -> eyre::Result<RunEpochMode> {
+        // a boundary no test output reaches, so the drain never closes the epoch
+        manager.epoch_boundary = u64::MAX;
+        let (_output_tx, mut consensus_output) = mpsc::channel::<ConsensusOutput>(1);
+        manager
+            .finish_epoch(
+                engine,
+                reth_env,
+                &GasAccumulator::new(1),
+                to_engine,
+                &mut consensus_output,
+                certificate_pack,
+                0,
+                false,
+            )
+            .await
+    }
+
+    /// The harness for the `finish_epoch` stop tests: on healthy stores an epoch that ended
+    /// without its boundary drains the saved output the engine has not seen and is a mode change.
+    #[tokio::test]
+    async fn finish_epoch_drains_leftover_output_on_healthy_stores() -> eyre::Result<()> {
+        let temp = TempDir::with_prefix("finish_epoch_healthy")?;
+        let (mut manager, engine, reth_env, _tasks, committee) = manager_with_engine(&temp).await?;
+        let output = member_output(&committee);
+        manager.consensus_chain.save_consensus_output(output.clone()).await?;
+
+        let (to_engine, mut engine_rx) = mpsc::channel(8);
+        let mode = finish_mode_change(&mut manager, &engine, &reth_env, &to_engine, None).await?;
+        assert!(matches!(mode, RunEpochMode::ModeChange), "{mode:?}");
+        assert_eq!(engine_rx.try_recv()?.number(), output.number(), "the drain forwards it");
+        Ok(())
+    }
+
+    /// A save advances `latest_consensus_number` before its persist, and the leftover drain
+    /// forwards every output up to it, reading each back from the pack (reads ignore a failed
+    /// sync). So the epoch end persists the pack first: a pack whose persist fails, with latest
+    /// ahead of the last forwarded output, stops the node and the engine receives nothing.
+    #[tokio::test]
+    async fn finish_epoch_stops_before_the_drain_when_the_pack_cannot_persist() -> eyre::Result<()>
+    {
+        let temp = TempDir::with_prefix("finish_epoch_poisoned_pack")?;
+        let (mut manager, engine, reth_env, _tasks, committee) = manager_with_engine(&temp).await?;
+        let output = member_output(&committee);
+        manager.consensus_chain.save_consensus_output(output).await?;
+        manager.consensus_chain.poison_current_pack_for_test();
+        assert!(
+            manager.consensus_chain.latest_consensus_number()
+                > manager.last_forwarded_consensus_number,
+            "the saved output is ahead of the last forwarded one"
+        );
+
+        let (to_engine, mut engine_rx) = mpsc::channel(8);
+        let Err(err) = finish_mode_change(&mut manager, &engine, &reth_env, &to_engine, None).await
+        else {
+            panic!("a pack that cannot persist must stop the node");
+        };
+        assert!(format!("{err:#}").contains("the consensus pack"), "{err:#}");
+        assert!(engine_rx.try_recv().is_err(), "nothing reaches the engine");
+        Ok(())
+    }
+
+    /// An epoch that ends while a store can no longer write stops the node: `finish_epoch` returns
+    /// the store's error, not a mode change that would re-enter the epoch on that store.
+    #[tokio::test]
+    async fn finish_epoch_stops_when_a_store_cannot_write() -> eyre::Result<()> {
+        let temp = TempDir::with_prefix("finish_epoch_failed_store")?;
+        let (mut manager, engine, reth_env, _tasks, _) = manager_with_engine(&temp).await?;
+        manager.consensus_db.fail_durability_for_test::<KadRecords>();
+
+        let (to_engine, _engine_rx) = mpsc::channel(8);
+        let Err(err) = finish_mode_change(&mut manager, &engine, &reth_env, &to_engine, None).await
+        else {
+            panic!("a store that cannot write must stop the node");
+        };
+        assert!(format!("{err:#}").contains("the peer-record store"), "{err:#}");
+        Ok(())
+    }
+
+    /// The epoch end seals the certificate pack once the consensus task has ended; a pack that
+    /// failed (here its open) stops the node instead of being dropped with a log line.
+    #[tokio::test]
+    async fn finish_epoch_stops_on_a_failed_certificate_pack() -> eyre::Result<()> {
+        let temp = TempDir::with_prefix("finish_epoch_failed_cert_pack")?;
+        let (mut manager, engine, reth_env, _tasks, _) = manager_with_engine(&temp).await?;
+        let blocked = TempDir::with_prefix("blocked_cert_pack")?;
+        std::fs::write(blocked.path().join("epoch-0"), b"not a directory")?;
+        let pack = Arc::new(CertificatePack::open(blocked.path(), 0));
+
+        let (to_engine, _engine_rx) = mpsc::channel(8);
+        let Err(err) =
+            finish_mode_change(&mut manager, &engine, &reth_env, &to_engine, Some(pack)).await
+        else {
+            panic!("a failed certificate pack must stop the node");
+        };
+        assert!(format!("{err:#}").contains("certificate pack"), "{err:#}");
+
+        let healthy = TempDir::with_prefix("healthy_cert_pack")?;
+        let pack = Arc::new(CertificatePack::open(healthy.path(), 0));
+        let mode =
+            finish_mode_change(&mut manager, &engine, &reth_env, &to_engine, Some(pack)).await?;
+        assert!(matches!(mode, RunEpochMode::ModeChange), "a healthy pack seals: {mode:?}");
+        Ok(())
+    }
+
+    /// The epoch's task manager ending before the boundary: a critical task's error stops the
+    /// node, and so does a critical task that returned Ok before the epoch told it to, unless the
+    /// node itself is shutting down.
+    #[test]
+    fn epoch_tasks_ended_stops_the_node_unless_it_is_shutting_down() {
+        let node_shutdown = ShutdownNotifier::new();
+        epoch_tasks_ended(Ok(()), &node_shutdown).expect("a resync ends the epoch");
+        let early = || Err(TaskJoinError::CriticalExitOk("consensus task".to_string()));
+        assert!(epoch_tasks_ended(early(), &node_shutdown).is_err(), "an early Ok exit stops it");
+        let failed = || {
+            Err(TaskJoinError::CriticalExitError(
+                "consensus task".to_string(),
+                tn_types::TaskError::from_message("certificate pack failed"),
+            ))
+        };
+        assert!(epoch_tasks_ended(failed(), &node_shutdown).is_err(), "a task error stops it");
+
+        node_shutdown.notify();
+        epoch_tasks_ended(early(), &node_shutdown).expect("an Ok exit while the node shuts down");
+        assert!(
+            epoch_tasks_ended(failed(), &node_shutdown).is_err(),
+            "a task error still stops it"
+        );
+    }
+
+    /// The mid-epoch store check: pending while every store is healthy, then, once one latches a
+    /// failure, an error that names it within a bound (`run_epoch` returns it at once).
+    #[tokio::test]
+    async fn store_failure_resolves_once_a_store_latches() {
+        let temp = TempDir::new().unwrap();
+        let db = tn_storage::open_db(temp.path());
+        let mut failed = std::pin::pin!(store_failure(&db));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), failed.as_mut()).await.is_err(),
+            "healthy stores never resolve it"
+        );
+        db.fail_durability_for_test::<KadRecords>();
+        let err = tokio::time::timeout(Duration::from_secs(5), failed)
+            .await
+            .expect("a latched store resolves it");
+        let message = format!("{err:#}");
+        assert!(message.contains("stopping the node"), "{message}");
+        assert!(message.contains("kad environment"), "names the store: {message}");
+    }
 
     /// Issue #1443: once an output is saved to the pack, eviction removes its batches from both
     /// batch caches while the pack keeps serving them.
@@ -1238,8 +1607,13 @@ mod tests {
 
     /// A committed output at number 1 whose only certificate declares and carries `batches`.
     fn committed_output(batches: &[Batch]) -> ConsensusOutput {
+        committed_output_by(Certificate::default().header().author().clone(), batches)
+    }
+
+    /// [`committed_output`] led by `author`: a pack whose committee holds `author` reads it back.
+    fn committed_output_by(author: AuthorityIdentifier, batches: &[Batch]) -> ConsensusOutput {
         let mut leader = Certificate::default();
-        let mut header = HeaderBuilder::from_header(leader.header());
+        let mut header = HeaderBuilder::from_header(leader.header()).author(author);
         for batch in batches {
             header = header.with_payload_batch(batch, 0);
         }

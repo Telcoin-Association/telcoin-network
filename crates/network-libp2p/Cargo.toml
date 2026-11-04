@@ -22,6 +22,7 @@ tn-types = { workspace = true }
 tn-config = { workspace = true }
 tn-node-record = { workspace = true }
 futures = { workspace = true }
+parking_lot = { workspace = true }
 tracing = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }

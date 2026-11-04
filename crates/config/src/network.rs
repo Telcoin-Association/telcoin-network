@@ -1,8 +1,8 @@
 //! Configuration for network variables.
 
 use crate::{
-    ConfigFmt, ConfigTrait, NetworkBudgetError, NetworkProcessBudget, SourceAdmissionConfig,
-    SwarmNetworkBudget, TelcoinDirs,
+    ConfigFmt, ConfigTrait, NetworkBudgetError, NetworkProcessBudget, ServeBudget,
+    SourceAdmissionConfig, SwarmNetworkBudget, TelcoinDirs,
 };
 use libp2p::{kad::K_VALUE, multiaddr::Protocol, PeerId};
 use serde::{
@@ -17,7 +17,21 @@ use tracing::{info, warn};
 pub use trusted::{TrustedNode, TrustedNodeConfigError};
 
 mod quic;
-pub use quic::QuicConfig;
+pub use quic::{InboundAcceptTask, QuicConfig};
+
+impl InboundAcceptTask {
+    /// The accepted-handshake queue capacity of the spawned mode; `None` keeps the inline path.
+    ///
+    /// The node writes this to the carried transport. The release fixtures compile `quic.rs` by
+    /// path against transports without such a field, so this node-only accessor lives here, where
+    /// their dead-code lint never sees it.
+    pub const fn spawned_capacity(self) -> Option<NonZeroUsize> {
+        match self {
+            Self::Inline => None,
+            Self::Spawned { capacity } => Some(capacity),
+        }
+    }
+}
 
 impl ConfigTrait for NetworkConfig {}
 
@@ -35,6 +49,8 @@ pub struct NetworkConfig {
     quic_config: QuicConfig,
     /// Optional process-wide allocation. Omission preserves the existing transport defaults.
     process_budget: Option<NetworkProcessBudget>,
+    /// Opt-in per-class serve permit budget. Omission leaves every class unbounded.
+    serve_budget: ServeBudget,
     /// The configuration for managing peers.
     peer_config: PeerConfig,
     /// Connection admission policy shared by the primary and every worker swarm.
@@ -285,6 +301,11 @@ impl NetworkConfig {
     /// Derive one swarm's resource allocation, or preserve legacy limits when not configured.
     pub fn swarm_budget(&self) -> Result<Option<SwarmNetworkBudget>, NetworkBudgetError> {
         self.process_budget.as_ref().map(NetworkProcessBudget::allocate).transpose()
+    }
+
+    /// The per-class serve permit budget. Every class is unbounded when not configured.
+    pub fn serve_budget(&self) -> ServeBudget {
+        self.serve_budget
     }
 
     /// Endpoint mappings for the primary and every independently keyed worker.
@@ -811,7 +832,8 @@ pub struct PeerConfig {
     pub heartbeat_interval: u64,
     /// The target number of connected peers.
     pub target_num_peers: usize,
-    /// The timeout for dialing a peer.
+    /// The requested timeout for dialing a peer.
+    /// The network raises this to cover all signed endpoints plus transport and delivery slack.
     pub dial_timeout: Duration,
     /// A fraction of `Self::target_num_peers` that is allowed to connect to this node in excess of
     /// `PeerManager::target_num_peers`.
@@ -1859,6 +1881,22 @@ hostname: "my-validator"
         assert!(config.validate().is_err(), "a negative score_halflife must be rejected");
     }
 
+    /// A network config without a serve budget leaves every class unbounded, and a partial budget
+    /// sets only the named class.
+    #[test]
+    fn serve_budget_is_optional_and_partial() -> Result<(), serde_json::Error> {
+        let absent: NetworkConfig = serde_json::from_value(serde_json::json!({}))?;
+        assert_eq!(absent.serve_budget(), ServeBudget::default());
+        let partial: NetworkConfig =
+            serde_json::from_value(serde_json::json!({ "serve_budget": { "vote": 8 } }))?;
+        assert_eq!(partial.serve_budget().vote(), 8);
+        assert_eq!(partial.serve_budget().epoch_record(), 0);
+        assert_eq!(partial.serve_budget().certificate_sync(), 0);
+        assert_eq!(partial.serve_budget().batch(), 0);
+        assert_eq!(partial.serve_budget().other(), 0);
+        Ok(())
+    }
+
     /// Process allocations cap transport values and preserve lower operator settings.
     #[test]
     fn process_budget_caps_quic_without_raising_lower_settings() -> Result<(), std::io::Error> {
@@ -1890,8 +1928,21 @@ hostname: "my-validator"
         assert_eq!(lower.max_stream_data, 100);
         let legacy: NetworkConfig = serde_json::from_str("{}")?;
         assert_eq!(legacy.swarm_budget(), Ok(None));
-        assert_eq!(legacy.quic_config().with_budget(None).max_connection_data, 100 * 1024 * 1024);
+        assert_eq!(legacy.quic_config().with_budget(None).max_connection_data, 4 * 1024 * 1024);
         Ok(())
+    }
+
+    /// The built-in QUIC credit holds one full request-response message per stream with the same
+    /// headroom, two stream windows per connection, and at most the libp2p stream ceiling.
+    #[test]
+    fn default_quic_credit_is_bounded_by_the_message_size() {
+        let quic = super::QuicConfig::default();
+        let rpc_message =
+            u32::try_from(super::LibP2pConfig::default().max_rpc_message_size).unwrap_or(u32::MAX);
+        assert_eq!(quic.max_stream_data, rpc_message.saturating_mul(2));
+        assert_eq!(quic.max_connection_data, quic.max_stream_data.saturating_mul(2));
+        assert_eq!(quic.max_concurrent_stream_limit, 256);
+        assert_eq!(quic.with_budget(None).max_connection_data, 4 * 1024 * 1024);
     }
 
     #[test]
@@ -1992,5 +2043,23 @@ hostname: "my-validator"
         // the remaining fields still load from the file rather than from the default
         assert_eq!(parsed.max_proposed_header_age_limit, config.max_proposed_header_age_limit);
         Ok(())
+    }
+
+    /// An empty `quic_config` section yields the inline accept task on the node configuration.
+    #[test]
+    fn empty_quic_section_keeps_the_inline_accept_task() -> Result<(), serde_yaml::Error> {
+        let node: NetworkConfig = serde_yaml::from_str("quic_config: {}")?;
+        assert_eq!(node.quic_config().inbound_accept_task, super::InboundAcceptTask::Inline);
+        Ok(())
+    }
+
+    /// The inline accept task maps to no spawned capacity, and the spawned mode maps to its
+    /// capacity, which the node writes to the carried transport.
+    #[test]
+    fn spawned_capacity_maps_the_accept_task() {
+        let capacity = std::num::NonZeroUsize::MIN.saturating_add(63);
+        assert_eq!(super::InboundAcceptTask::Inline.spawned_capacity(), None);
+        let spawned = super::InboundAcceptTask::Spawned { capacity };
+        assert_eq!(spawned.spawned_capacity(), Some(capacity));
     }
 }

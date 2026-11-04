@@ -145,7 +145,7 @@ A `Medium` penalty bans a peer after roughly ten occurrences; [Peers](peers.md) 
 Process startup initializes swarm listeners, registers bootstrap peers and starts bootstrap dials before the epoch loop.
 Epoch setup refreshes committee membership and starts committee dials without waiting for peers.
 A process-lifetime monitor samples the primary and every configured worker swarm every five seconds, with a one-second bound on each established-peer probe.
-When enabled with `--healthcheck`, `GET /health/network` returns a cached versioned JSON snapshot: `503` until every configured swarm has an established peer, then `200`.
+When enabled with `--healthcheck` (a port binds loopback; a socket address binds that interface), `GET /health/network` returns a cached versioned JSON snapshot: `503` until every configured swarm has an established peer, then `200`.
 Connectivity can recover while the node remains running; this route does not certify consensus, sync readiness or RPC transaction acceptance.
 
 Bootstrap and committee dials retry with backoff doubling to a cap of 120 seconds.

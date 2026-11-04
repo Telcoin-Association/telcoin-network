@@ -59,6 +59,11 @@ bs58 = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = { workspace = true }
 url = { workspace = true }
+zeroize = { workspace = true }
+
+# `strncmp`/`strlen` for scrubbing the BLS passphrase from the process environment block
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = { workspace = true }
 
 [dev-dependencies]
 tn-types = { workspace = true, features = ["test-utils"] }

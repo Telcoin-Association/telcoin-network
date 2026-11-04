@@ -27,6 +27,7 @@ mod network_dial;
 mod network_readiness;
 pub mod primary;
 pub mod worker;
+pub use health::{HealthcheckBind, HealthcheckBindError};
 pub use manager::{
     build_epoch_record, catchup_accumulator, read_base_fees_for_entered_epoch,
     sync_num_workers_from_chain, EpochBaseFees, ExecStateExporter, ExportOutcome,

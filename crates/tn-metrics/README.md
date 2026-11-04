@@ -17,6 +17,9 @@ both telcoin (`tn_*`) and reth (`reth_*`) metric namespaces in the Prometheus te
   node healthcheck pattern. No request parsing, no connection limits; every connection
   receives the rendered registry with `Content-Type: text/plain; version=0.0.4`. Runs as a
   critical task on the node's `TaskManager` and performs registry upkeep every 5 seconds.
+  Both this server and the node healthcheck server report their bound endpoint and reach
+  (`loopback`, `interface`, `all-interfaces`) at startup through `report_listener_bound`
+  (issue #1689).
 - **Hooks** (`MetricsHooks`): callbacks run before each scrape for sampled (rather than
   event-driven) metrics. The default set collects process stats; the node adds a hook for
   reth database table sizes.

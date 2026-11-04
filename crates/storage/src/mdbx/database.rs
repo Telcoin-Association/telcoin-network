@@ -104,6 +104,19 @@ pub const GIGABYTE: usize = MEGABYTE * 1024;
 /// Number of bytes in one terabyte, for expressing MDBX geometry sizes.
 pub const TERABYTE: usize = GIGABYTE * 1024;
 
+// The production geometry of the node's composite DB (`open_db`): each environment's size limit
+// and the step it grows by. Test builds open smaller environments.
+/// Production size limit of the epoch environment.
+pub const PROD_EPOCH_MAX: usize = 512 * MEGABYTE;
+/// Production size limit of the kad environment.
+pub const PROD_KAD_MAX: usize = 64 * MEGABYTE;
+/// Production size limit of the cache environment.
+pub const PROD_CACHE_MAX: usize = GIGABYTE;
+/// Production growth step of the epoch and kad environments.
+pub const PROD_GROWTH: usize = 8 * MEGABYTE;
+/// Production growth step of the cache environment.
+pub const PROD_CACHE_GROWTH: usize = 64 * MEGABYTE;
+
 /// Returns the default page size that can be used in this OS.
 fn default_page_size() -> usize {
     let os_page_size = page_size::get();
@@ -157,7 +170,52 @@ fn resolve_sync_mode(raw: Option<std::ffi::OsString>) -> eyre::Result<reth_libmd
     .map(|parsed| parsed.unwrap_or(BUILD_SYNC_MODE))
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Test-only: the next [`MdbxDatabase::try_for_each`] on this thread to reach this many rows
+    /// fails there.
+    static FAIL_WALK_AFTER: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+/// Test-only: the next [`MdbxDatabase::try_for_each`] on this thread to reach `rows` rows fails
+/// there, as a cursor error part way through a table would (a shorter walk leaves it armed).
+#[cfg(test)]
+pub(crate) fn fail_next_walk_after(rows: usize) {
+    FAIL_WALK_AFTER.with(|fail| fail.set(Some(rows)));
+}
+
 impl MdbxDatabase {
+    /// Hand every row of table `T` to `row`, in key order, returning how many there were. Unlike
+    /// [`Database::iter`], whose iterator ends at the first cursor error, a failed read is returned
+    /// as an error, and the walk must see as many rows as MDBX's own statistics count for the
+    /// table: for copying a table out (the move to tndb), where a walk cut short would lose rows
+    /// without a word.
+    pub(crate) fn try_for_each<T: Table>(
+        &self,
+        mut row: impl FnMut(T::Key, T::Value) -> eyre::Result<()>,
+    ) -> eyre::Result<usize> {
+        let txn = self.read_txn()?;
+        let dbi = txn.get_dbi::<T>()?;
+        let expected = txn.inner.db_stat(dbi)?.entries();
+        let mut cursor = txn.inner.cursor_with_dbi(dbi)?;
+        #[cfg(test)]
+        let fail_after = FAIL_WALK_AFTER.with(std::cell::Cell::get);
+        let mut rows = 0;
+        while let Some((key, value)) = cursor.next::<Vec<u8>, Vec<u8>>()? {
+            #[cfg(test)]
+            if fail_after == Some(rows) {
+                FAIL_WALK_AFTER.with(|fail| fail.set(None));
+                eyre::bail!("injected cursor error in table {} after {rows} rows", T::NAME);
+            }
+            row(decode_key::<T::Key>(&key), decode::<T::Value>(&value))?;
+            rows += 1;
+        }
+        if rows != expected {
+            eyre::bail!("table {}: read {rows} rows, but MDBX counts {expected}", T::NAME);
+        }
+        Ok(rows)
+    }
+
     /// Creates a new database at the specified path if it doesn't exist. Does NOT create tables.
     /// Check `init_db`.
     pub fn open<P: AsRef<Path>>(
@@ -361,6 +419,8 @@ impl Database for MdbxDatabase {
 }
 
 impl RawRows for MdbxDatabase {
+    const EPOCH_DIR: &'static str = "consensus-db/epoch";
+
     fn for_each_raw_row<T: Table>(&self, mut visit: impl FnMut(&[u8], &[u8])) -> eyre::Result<()> {
         let mut cursor = self.read_txn()?.cursor::<T>()?;
         while let Some((key, value)) = cursor.next::<Vec<u8>, Vec<u8>>()? {

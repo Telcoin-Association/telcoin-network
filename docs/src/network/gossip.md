@@ -117,12 +117,28 @@ That work runs before the duplicate cache and before the `MAX_GOSSIP_MESSAGE_SIZ
 A frame that breaks a limit closes the stream, and none of its messages are delivered.
 
 - **Frame size: 24,579 bytes.** One honest frame is at most 16,387 bytes: one 12,000-byte payload plus a 512-byte bound on its envelope, or one 16 KiB control field plus its length prefix.
+  The node's own `IHAVE` gossip fits in that control field because of the cap on message ids per `IHAVE` below.
   The codec reads in 8 KiB chunks and checks the size of its whole read buffer, not of one frame, so the limit adds one read chunk.
   Without that slack, two maximum frames sent back to back can close an honest stream.
+  The 16,387-byte bound covers the frames an author sends and the frames a node forwards, because the node rejects the one unsigned field that a forwarder could grow (see the `key` item below).
 - **Publish entries per frame: 8.** An honest peer sends one message per frame.
   The library default of 500 would let one frame force 500 signature checks.
   This is a per-frame bound, not a rate bound.
 - **Control bytes per frame: 16 KiB.** This equals the library default, set explicitly so that an upgrade cannot change it.
+- **Message ids per `IHAVE` sent: 198.** Each heartbeat, gossipsub sends one `IHAVE` per topic to subscribed peers outside the mesh, except explicit peers.
+  The `IHAVE` lists the validated message ids of the last three heartbeats, and gossipsub puts no byte cap on it.
+  A message id is 71 bytes today, so on a 15-byte topic an `IHAVE` of 225 ids passes the 16 KiB control limit, and the receiver closes the stream.
+  The library default allows 5000 ids.
+  The node caps the ids per `IHAVE` at 198, which fits the limit with an 80-byte id on a 64-byte topic.
+  Above the cap, each peer gets a different random subset of the ids, so gossip coverage drops but the stream stays open.
+  The same setting caps the ids that the node requests from one peer with `IWANT` in one heartbeat.
+  The cap changes only the frames that the node sends, so peers on other versions need no change.
+- **Unsigned `key` field: rejected.** The author signs `from`, `data`, `seqno` and `topic`, but not `key`.
+  A node forwards a message as it received it, so without this check a peer could add bytes in `key` to a valid message, and every honest node would forward the larger copy.
+  An ed25519 author never sends `key`, because its public key is inlined in its peer id, so the node drops every message that carries `key` (issue #1699).
+  This check drops the message only, and the stream stays open.
+  It runs before the duplicate cache, so a later clean copy of the same message is accepted.
+  The node does not penalize the peer, because a node on an older release forwards such a message without fault.
 
 No topic has its own size limit, because `MAX_GOSSIP_MESSAGE_SIZE` applies to every topic.
 The limits and the order in which the library applies them are recorded at `gossipsub_config`, with the resolved library versions.
@@ -153,6 +169,11 @@ Gossipsub's own peer scoring is deliberately left disabled.
 The peer manager is the authoritative reputation system, and running gossipsub scoring alongside it would double-count the same misbehavior — once as a gossipsub score decay and again as a peer-manager penalty — with two sets of thresholds that could disagree about when to disconnect.
 Two gossipsub events do feed the peer manager directly: a peer that does not support gossipsub is fatally penalized, and a peer that persistently fails to keep up with the mesh takes a mild one.
 
+Keeping scoring off has two consequences inside the library.
+Upstream gossipsub removes an expired `IWANT` promise only from the scoring branch of its heartbeat, so a peer that advertises ids with `IHAVE` and never delivers would grow the promise map without bound.
+Upstream also skips an advertised id while any peer holds a pending promise for it, so one peer's unanswered promise, renewed with each `IHAVE` at no cost, would suppress the `IWANT` to every other advertiser of that id.
+The node therefore carries `patches/libp2p-gossipsub`, which expires promises on every heartbeat, applies the broken-promise penalty only while scoring is active, and skips an advertised id only when the advertising peer itself already holds a pending promise for it; `patches/libp2p-gossipsub/PATCH.md` records the patch and its retirement criteria.
+
 ## Topic re-validation in the application layer
 
 Passing network-layer verification is not the end of the check.
@@ -178,7 +199,7 @@ See [Network architecture](../architecture/network.md) for the node roles this g
 |----------|------|
 | Topic names | `crates/config/src/network.rs` (`LibP2pConfig` topic constructors) |
 | Message size limit | `crates/config/src/network.rs` (`MAX_GOSSIP_MESSAGE_SIZE`) |
-| Gossipsub configuration and frame limits | `crates/network-libp2p/src/gossip_config.rs` (`gossipsub_config`), called from `ConsensusNetwork::new` |
+| Gossipsub configuration, frame limits, the `IHAVE` id cap and `key` rejection | `crates/network-libp2p/src/gossip_config.rs` (`gossipsub_config`, `RejectGossipKey`), called from `ConsensusNetwork::new` |
 | Allowlist check and subscribe/unsubscribe | `crates/network-libp2p/src/consensus.rs` (`verify_gossip`, `NetworkCommand::Subscribe`) |
 | Penalty attribution | `crates/network-libp2p/src/consensus.rs` (`RejectReason::penalty`) |
 | Per-epoch subscription and allowlists | `crates/node/src/manager/node/start_epoch.rs` (`spawn_primary_network_for_epoch`, `spawn_worker_network_for_epoch`) |

@@ -141,7 +141,11 @@ fn create_validator_info_with_workers(
         "--workers",
         &workers,
     ])?;
-    keys_command.args.execute_insecure(dir.to_path_buf(), passphrase, INSECURE_TEST_KDF_ROUNDS)
+    keys_command.args.execute_insecure(
+        dir.to_path_buf(),
+        passphrase.map(Into::into),
+        INSECURE_TEST_KDF_ROUNDS,
+    )
 }
 
 /// Execute observer config inside tempdir
@@ -161,7 +165,11 @@ fn create_observer_info(
         "--workers",
         &workers,
     ])?;
-    keys_command.args.execute_insecure(datadir, passphrase, INSECURE_TEST_KDF_ROUNDS)
+    keys_command.args.execute_insecure(
+        datadir,
+        passphrase.map(Into::into),
+        INSECURE_TEST_KDF_ROUNDS,
+    )
 }
 
 /// Create validator info, genesis ceremony, and configure local testnet.

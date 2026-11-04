@@ -42,9 +42,12 @@ use alloy_rlp::{Decodable, Encodable};
 use serde::{Deserialize, Serialize};
 use tn_types::{Address, Bytes, ExecHeader, GenesisAccount, B256, U256};
 
-use crate::archive::{
-    error::{fetch::FetchError, load_header::LoadHeaderError, open::OpenError},
-    pack::{Pack, PackCompression, RawIter},
+use crate::{
+    archive::{
+        error::{fetch::FetchError, load_header::LoadHeaderError, open::OpenError},
+        pack::{Pack, PackCompression, RawIter},
+    },
+    consensus_pack::PACK_VERSION,
 };
 
 /// Schema version stamped into the pack file's `DataHeader` (via [`Pack::open`]) and
@@ -54,6 +57,11 @@ use crate::archive::{
 /// [`ExecStateMeta`]. It must stay `<= PACK_VERSION`, the global container-framing
 /// version every read is gated on (guaranteed by the assertion below).
 pub const EXEC_STATE_PACK_VERSION: u16 = 1;
+
+const _: () = assert!(
+    EXEC_STATE_PACK_VERSION <= PACK_VERSION,
+    "EXEC_STATE_PACK_VERSION must not exceed the container framing version PACK_VERSION"
+);
 
 /// Name of the data file inside the pack directory.
 const DATA_NAME: &str = "state_data";
@@ -81,13 +89,20 @@ pub const STORAGE_CHUNK_SLOTS: usize = 64 * 1024;
 /// apart (issue #1174).
 pub const BLOCKHASH_ANCESTORS: u64 = 256;
 
-/// Upper bound on the header count a pack may declare, enforced before any allocation sized by the
-/// untrusted `header_count`. A genuine pack carries the snapshot header plus at most
-/// [`BLOCKHASH_ANCESTORS`] (256) ancestors (257 in all), so this generous cap never rejects a
-/// legitimate pack, while bounding the eager `Vec::with_capacity` in [`ExecStatePackReader::open`]
-/// against a crafted/corrupt count (which would otherwise request a multi-TB allocation before any
+/// Upper bound on the header count a pack may carry: the snapshot header plus its
+/// [`BLOCKHASH_ANCESTORS`] (256) ancestors, the most the exporter embeds (`gather_headers` in
+/// `tn-node`). Enforced at export ([`ExecStatePackWriter::create`]) and, on read, before any
+/// allocation sized by the untrusted `header_count` (a crafted/corrupt count would otherwise
+/// request a multi-TB `Vec::with_capacity` in [`ExecStatePackReader::open`] before any
 /// per-record CRC/size guard runs).
-const MAX_HEADER_COUNT: u32 = 4096;
+const MAX_HEADER_COUNT: u32 = BLOCKHASH_ANCESTORS as u32 + 1;
+
+/// Upper bound on one `Header` record's RLP length, enforced at export and on read before the
+/// record is decoded. A real header is under 1 KiB (`extra_data` is empty or 32 bytes), but a
+/// record may decompress to the container's 16 MiB limit and RLP has no size cap, while
+/// [`ExecStatePackReader::open`] keeps every header it decodes: without this bound a few-MB
+/// crafted pack could make `open` hold `MAX_HEADER_COUNT` x 16 MiB.
+const MAX_HEADER_RECORD_BYTES: usize = 64 * 1024;
 
 /// First record in the pack. Minimal and fixed: it carries the authoritative state
 /// root and describes the shape of the stream that follows.
@@ -201,8 +216,9 @@ pub enum StateEntry {
 enum ExecStateRecord {
     /// Snapshot metadata; always the first record.
     Meta(ExecStateMeta),
-    /// An RLP-encoded [`ExecHeader`] (canonical, lossless form).
-    Header(Vec<u8>),
+    /// An RLP-encoded [`ExecHeader`] (canonical, lossless form). Encoded as one byte string
+    /// (byte-identical to a sequence of `u8`), not byte by byte.
+    Header(#[serde(with = "tn_types::byte_vec")] Vec<u8>),
     /// An account header (address/nonce/balance/code); storage follows as `Storage` chunks.
     Account(AccountRecord),
     /// A chunk of the preceding account's storage slots (bounded by [`STORAGE_CHUNK_SLOTS`]).
@@ -216,6 +232,14 @@ fn encode_header(header: &ExecHeader) -> Vec<u8> {
     let mut buf = Vec::new();
     header.encode(&mut buf);
     buf
+}
+
+/// Enforce [`MAX_HEADER_RECORD_BYTES`] on one header record's RLP length. Checked at export and
+/// on read before [`decode_header`], so a crafted pack cannot drive an oversized decode.
+fn check_header_bound(len: usize) -> Result<(), ExecStatePackError> {
+    (len <= MAX_HEADER_RECORD_BYTES)
+        .then_some(())
+        .ok_or(ExecStatePackError::OversizedHeader { len, max: MAX_HEADER_RECORD_BYTES })
 }
 
 /// Decode a header from its stored RLP bytes.
@@ -250,16 +274,34 @@ pub struct VerifyReport {
 }
 
 /// Write-once builder for an exec-state pack.
+///
+/// Dropped before [`finish`](Self::finish) succeeds (an export that failed or was cancelled
+/// mid-way), it removes its data file instead of sealing it, so a torn export never looks like a
+/// cleanly closed pack and a retry can `create` afresh.
 #[derive(Debug)]
 pub struct ExecStatePackWriter {
     data: Pack<ExecStateRecord>,
     stats: ExecStateStats,
+    /// Set once `finish` has committed the footer; until then `Drop` removes the data file.
+    finished: bool,
+}
+
+impl Drop for ExecStatePackWriter {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.data.set_remove_on_drop();
+        }
+    }
 }
 
 impl ExecStatePackWriter {
     /// Create a new pack in directory `path` (created if missing) and write the
     /// [`ExecStateMeta`] followed by `headers`. The snapshot header must be first and
     /// its `state_root` must equal `state_root` (the invariant the reader re-checks).
+    ///
+    /// `headers` must also fit the reader's bounds (at most the snapshot header plus
+    /// [`BLOCKHASH_ANCESTORS`] ancestors, each a plausibly sized header), so an export the reader
+    /// would refuse fails here rather than at import.
     pub fn create<P: AsRef<Path>>(
         path: P,
         state_root: B256,
@@ -269,6 +311,14 @@ impl ExecStatePackWriter {
         if snapshot.state_root != state_root {
             return Err(ExecStatePackError::StateRootMismatch);
         }
+        if headers.len() > MAX_HEADER_COUNT as usize {
+            return Err(ExecStatePackError::TooManyHeaders {
+                declared: u32::try_from(headers.len()).unwrap_or(u32::MAX),
+                max: MAX_HEADER_COUNT,
+            });
+        }
+        let encoded: Vec<Vec<u8>> = headers.iter().map(encode_header).collect();
+        encoded.iter().try_for_each(|rlp| check_header_bound(rlp.len()))?;
 
         let base = path.as_ref();
         std::fs::create_dir_all(base)?;
@@ -282,8 +332,10 @@ impl ExecStatePackWriter {
                 format!("exec state pack already exists at {}", data_path.display()),
             )));
         }
-        let mut data: Pack<ExecStateRecord> =
+        let data: Pack<ExecStateRecord> =
             Pack::open(&data_path, 0, false, PackCompression::ZStd, EXEC_STATE_PACK_VERSION)?;
+        // Own the pack from here, so a failed append below removes the file (see `Drop`).
+        let mut writer = Self { data, stats: ExecStateStats::default(), finished: false };
 
         let meta = ExecStateMeta {
             state_root,
@@ -291,12 +343,12 @@ impl ExecStatePackWriter {
             block_hash: snapshot.hash_slow(),
             header_count: headers.len() as u32,
         };
-        Self::append(&mut data, &ExecStateRecord::Meta(meta))?;
-        for header in headers {
-            Self::append(&mut data, &ExecStateRecord::Header(encode_header(header)))?;
+        Self::append(&mut writer.data, &ExecStateRecord::Meta(meta))?;
+        for rlp in encoded {
+            Self::append(&mut writer.data, &ExecStateRecord::Header(rlp))?;
         }
 
-        Ok(Self { data, stats: ExecStateStats::default() })
+        Ok(writer)
     }
 
     /// Append one account (header + storage chunks) to the pack, updating the running tallies.
@@ -392,9 +444,11 @@ impl ExecStatePackWriter {
         self.data.commit().map_err(|e| ExecStatePackError::Persist(e.to_string()))?;
         // The write-once export is complete and committed; mark it consistent so the clean `Drop`
         // seals it. `create` only ever starts from an absent or empty data file, which opens
-        // clean, so this is defensive. A failed commit returns early above, and a `write_failed`
-        // poison would still block the seal, so a torn export is never sealed.
+        // clean, so this is defensive. A failed append or commit returns early above, before
+        // `finished` is set, so the writer's `Drop` removes the file: a torn export is never
+        // sealed.
         self.data.mark_consistent();
+        self.finished = true;
         Ok(self.stats)
     }
 
@@ -474,7 +528,10 @@ impl ExecStatePackReader {
         let mut headers = Vec::with_capacity(meta.header_count as usize);
         for _ in 0..meta.header_count {
             match iter.next() {
-                Some(Ok(ExecStateRecord::Header(bytes))) => headers.push(decode_header(&bytes)?),
+                Some(Ok(ExecStateRecord::Header(bytes))) => {
+                    check_header_bound(bytes.len())?;
+                    headers.push(decode_header(&bytes)?);
+                }
                 Some(Ok(_)) => return Err(ExecStatePackError::CorruptPack),
                 Some(Err(e)) => return Err(e.into()),
                 None => return Err(ExecStatePackError::MissingHeaders),
@@ -715,6 +772,14 @@ pub enum ExecStatePackError {
         /// Maximum accepted count (`MAX_HEADER_COUNT`).
         max: u32,
     },
+    /// A `Header` record is larger than any real header's RLP. Bounds what a crafted pack can make
+    /// the reader decode and keep.
+    OversizedHeader {
+        /// Byte length of the offending record's RLP.
+        len: usize,
+        /// Maximum accepted length (`MAX_HEADER_RECORD_BYTES`).
+        max: usize,
+    },
     /// The pack declares fewer headers than the `BLOCKHASH` lookback floor for its tip block. A
     /// genuine pack covers the full lookback (or reaches block 1); a shorter pack is truncated
     /// or corrupt, and restoring from it would scaffold zero-hash ancestors inside the lookback
@@ -770,6 +835,9 @@ impl fmt::Display for ExecStatePackError {
             Self::TooManyHeaders { declared, max } => {
                 write!(f, "pack declares {declared} headers, exceeding the maximum of {max}")
             }
+            Self::OversizedHeader { len, max } => {
+                write!(f, "header record is {len} bytes, exceeding the maximum of {max}")
+            }
             Self::InsufficientHeaders { declared, floor, block } => {
                 write!(
                     f,
@@ -822,6 +890,33 @@ impl From<FetchError> for ExecStatePackError {
 mod test {
     use super::*;
     use tempfile::TempDir;
+
+    /// The `Header` record is a byte string, byte-identical to the plain `Vec<u8>` it was before,
+    /// so existing exec-state packs read unchanged (and the mirror shows the variant indices
+    /// hold).
+    #[test]
+    fn header_record_encodes_as_before() {
+        #[derive(Serialize, Deserialize)]
+        enum OldRecord {
+            Meta(ExecStateMeta),
+            Header(Vec<u8>),
+        }
+        let meta = ExecStateMeta {
+            state_root: B256::from([1_u8; 32]),
+            block_number: 7,
+            block_hash: B256::from([2_u8; 32]),
+            header_count: 1,
+        };
+        let rlp = encode_header(&header(7, B256::from([3_u8; 32])));
+        let old_meta = tn_types::encode(&OldRecord::Meta(meta.clone()));
+        let old_header = tn_types::encode(&OldRecord::Header(rlp.clone()));
+        assert_eq!(tn_types::encode(&ExecStateRecord::Meta(meta)), old_meta);
+        assert_eq!(tn_types::encode(&ExecStateRecord::Header(rlp.clone())), old_header);
+        match tn_types::decode::<ExecStateRecord>(&old_header) {
+            ExecStateRecord::Header(bytes) => assert_eq!(bytes, rlp),
+            other => panic!("decoded {other:?}"),
+        }
+    }
 
     fn header(number: u64, state_root: B256) -> ExecHeader {
         ExecHeader { number, state_root, ..Default::default() }
@@ -1148,8 +1243,11 @@ mod test {
         let root2 = B256::from([2u8; 32]);
         let acct_b = account(0xBB, 1, false);
         let snapshot2 = header(1, root2);
-        let mut w2 =
-            ExecStatePackWriter { data: open_raw(dir.path()), stats: ExecStateStats::default() };
+        let mut w2 = ExecStatePackWriter {
+            data: open_raw(dir.path()),
+            stats: ExecStateStats::default(),
+            finished: false,
+        };
         let meta2 = ExecStateMeta {
             state_root: root2,
             block_number: snapshot2.number,
@@ -1351,5 +1449,141 @@ mod test {
         let none_bytes: Option<Bytes> = None;
         let none_vec: Option<Vec<u8>> = None;
         assert_eq!(tn_types::encode(&none_bytes), tn_types::encode(&none_vec));
+    }
+
+    /// A header whose RLP exceeds [`MAX_HEADER_RECORD_BYTES`]; a real one is under 1 KiB
+    /// (`extra_data` is empty or 32 bytes).
+    fn oversized_header(number: u64, state_root: B256) -> ExecHeader {
+        ExecHeader {
+            extra_data: Bytes::from(vec![0xAB; MAX_HEADER_RECORD_BYTES]),
+            ..header(number, state_root)
+        }
+    }
+
+    /// A raw pack at `dir`: a meta for tip `block` declaring `header_count`, then `headers` and a
+    /// footer (no accounts).
+    fn write_raw_headers(dir: &Path, block: u64, header_count: u32, headers: &[ExecHeader]) {
+        let root = headers[0].state_root;
+        let mut pack = open_raw(dir);
+        let meta = ExecStateMeta {
+            state_root: root,
+            block_number: block,
+            block_hash: headers[0].hash_slow(),
+            header_count,
+        };
+        pack.append(&ExecStateRecord::Meta(meta)).expect("append meta");
+        for header in headers {
+            pack.append(&ExecStateRecord::Header(encode_header(header))).expect("append header");
+        }
+        pack.append(&ExecStateRecord::End(ExecStateStats::default())).expect("append end");
+        pack.commit().expect("commit");
+    }
+
+    /// `count` headers for tip `block`, snapshot first then ancestors newest-first (the
+    /// exporter's shape).
+    fn header_window(block: u64, count: u64, root: B256) -> Vec<ExecHeader> {
+        ((block + 1 - count)..=block).rev().map(|number| header(number, root)).collect()
+    }
+
+    #[test]
+    fn open_rejects_an_oversized_header_record() {
+        // Each record may decompress to the container's 16 MiB limit, and the reader keeps every
+        // header it decodes, so an unbounded header record would let a few-MB crafted pack drive
+        // a multi-GiB allocation at `open`. The record is refused before it is decoded.
+        let dir = TempDir::with_prefix("exec_state_pack_big_header").expect("temp dir");
+        let root = B256::from([5u8; 32]);
+        write_raw_headers(dir.path(), 1, 1, &[oversized_header(1, root)]);
+
+        let err = ExecStatePackReader::open(dir.path())
+            .expect_err("an oversized header record must be refused");
+        assert!(
+            matches!(
+                err,
+                ExecStatePackError::OversizedHeader { len, max: MAX_HEADER_RECORD_BYTES }
+                    if len > MAX_HEADER_RECORD_BYTES
+            ),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn open_bounds_the_header_count_by_the_lookback_window() {
+        // A genuine pack holds the snapshot header plus at most BLOCKHASH_ANCESTORS ancestors.
+        let block = 300u64;
+        let root = B256::from([6u8; 32]);
+        let full = BLOCKHASH_ANCESTORS + 1;
+
+        let at_cap = TempDir::with_prefix("exec_state_pack_count_cap").expect("temp dir");
+        write_raw_headers(at_cap.path(), block, full as u32, &header_window(block, full, root));
+        let reader = ExecStatePackReader::open(at_cap.path()).expect("a full window must open");
+        assert_eq!(reader.headers().len() as u64, full);
+
+        let over = TempDir::with_prefix("exec_state_pack_count_over").expect("temp dir");
+        let declared = full as u32 + 1;
+        write_raw_headers(over.path(), block, declared, &header_window(block, full + 1, root));
+        let err = ExecStatePackReader::open(over.path())
+            .expect_err("more headers than the lookback window must be refused");
+        assert!(
+            matches!(
+                err,
+                ExecStatePackError::TooManyHeaders { declared: d, max } if d == declared && max == full as u32
+            ),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn create_enforces_the_reader_header_bounds() {
+        // An export the reader would refuse must fail at export, not later at import.
+        let block = 300u64;
+        let root = B256::from([7u8; 32]);
+        let full = BLOCKHASH_ANCESTORS + 1;
+
+        let over = TempDir::with_prefix("exec_state_create_count").expect("temp dir");
+        let err =
+            ExecStatePackWriter::create(over.path(), root, &header_window(block, full + 1, root))
+                .expect_err("too many headers must be refused at export");
+        assert!(
+            matches!(err, ExecStatePackError::TooManyHeaders { declared, max }
+                if u64::from(declared) == full + 1 && u64::from(max) == full),
+            "unexpected error: {err:?}"
+        );
+        assert!(!over.path().join(DATA_NAME).exists(), "a refused export must not leave a pack");
+
+        let big = TempDir::with_prefix("exec_state_create_big").expect("temp dir");
+        let err = ExecStatePackWriter::create(big.path(), root, &[oversized_header(1, root)])
+            .expect_err("an oversized header must be refused at export");
+        assert!(
+            matches!(err, ExecStatePackError::OversizedHeader { .. }),
+            "unexpected error: {err:?}"
+        );
+        assert!(!big.path().join(DATA_NAME).exists(), "a refused export must not leave a pack");
+
+        // A full window is exported and reads back.
+        let ok = TempDir::with_prefix("exec_state_create_full").expect("temp dir");
+        ExecStatePackWriter::create(ok.path(), root, &header_window(block, full, root))
+            .expect("a full window exports")
+            .finish()
+            .expect("finish");
+        ExecStatePackReader::verify(ok.path()).expect("the export verifies");
+    }
+
+    #[test]
+    fn abandoned_writer_leaves_no_pack() {
+        // A writer dropped before `finish` (an export that failed or was cancelled mid-way) must
+        // not leave a cleanly sealed partial pack behind; a retry can then create afresh.
+        let dir = TempDir::with_prefix("exec_state_abandoned").expect("temp dir");
+        let root = B256::from([8u8; 32]);
+        let mut writer =
+            ExecStatePackWriter::create(dir.path(), root, &[header(1, root)]).expect("create");
+        writer.append_account(&account(0xAA, 3, true)).expect("append");
+        drop(writer);
+        assert!(!dir.path().join(DATA_NAME).exists(), "an abandoned export must be removed");
+
+        let mut writer =
+            ExecStatePackWriter::create(dir.path(), root, &[header(1, root)]).expect("retry");
+        writer.append_account(&account(0xAA, 3, true)).expect("append");
+        writer.finish().expect("finish");
+        assert_eq!(ExecStatePackReader::verify(dir.path()).expect("verify").account_count, 1);
     }
 }

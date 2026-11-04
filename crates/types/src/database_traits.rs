@@ -122,21 +122,21 @@ pub trait Database: Send + Sync + Clone + Unpin + 'static {
         keys.into_iter().map(|key| tx.get::<T>(key.borrow())).collect()
     }
 
-    /// If the underlying DB needs to be manually compacted (looking at redb here) then this can be
-    /// overwritten to allow this.  No-op for most backends.
+    /// If the underlying DB needs to be manually compacted then this can be overwritten to allow
+    /// this.  No-op for most backends.
     fn compact(&self) -> eyre::Result<()> {
         Ok(())
     }
 
     /// Await until this caller's background writes are durably committed to the physical store.
     ///
-    /// Some backends persist in the background: an `insert` updates an in-memory layer and enqueues
-    /// the disk write, returning before it is durable. This barrier resolves only once every write
-    /// ordered before it is durably committed, including the subtle case where a concurrently-open
-    /// write txn has *absorbed* this caller's bare insert, in which case the ack is deferred until
-    /// that physical txn commits. Synchronously-durable backends (raw MDBX / redb, `MemDatabase`)
-    /// are already durable on return, so the default no-op is correct for them. Uses `Table` as a
-    /// hint so a composite backend only waits on the relevant physical store.
+    /// Some backends make writes durable in the background: tndb (in group mode) returns from an
+    /// `insert` or a transaction's commit once the write is readable, and a sync round makes it
+    /// durable later. This barrier resolves only once every write made before it, by any caller,
+    /// is durable. Writes still buffered in an open, uncommitted write transaction are not made
+    /// yet and are not waited for. Backends with nothing to wait for (`MemDatabase`, raw MDBX) keep
+    /// the default no-op. `Table` selects the store: a backend split by environment
+    /// (`SplitDatabase`) waits only on the environment that holds `T`.
     ///
     /// This is the single durability barrier: await it at externalization points (the proposer's
     /// header broadcast, the vote handler's vote return, and the certifier's proposed-certificate
@@ -147,9 +147,33 @@ pub trait Database: Send + Sync + Clone + Unpin + 'static {
     /// so a caller can refuse to externalize an artifact whose anti-equivocation record never
     /// reached disk and fail-stop instead of silently equivocating on restart (issue #975).
     /// Synchronously-durable backends never fail here.
+    ///
+    /// A failure is sticky: once a store has failed (a write, a sync, or damage a read found),
+    /// every later write and `persist` on it fails until the process restarts, so a `persist`
+    /// that resolves `Ok` proves its store has not failed (the node's epoch-end
+    /// `ensure_stores_durable` relies on this).
     fn persist<T: Table>(&self) -> impl Future<Output = eyre::Result<()>> + Send {
         std::future::ready(Ok::<(), eyre::Report>(()))
     }
+
+    /// Resolve, with a message naming the store and the cause, once any store behind this
+    /// database has failed; never resolve otherwise. A failure is sticky (see
+    /// [`Database::persist`]): the store keeps failing every write and `persist` until the process
+    /// restarts, so this resolves at once if it already has, and the node should stop when it
+    /// does rather than wait for its next write or `persist` to fail. The default never resolves:
+    /// a backend that keeps it reports each failure only on the calls that meet it.
+    fn failed(&self) -> impl Future<Output = String> + Send + 'static {
+        std::future::pending()
+    }
+
+    /// Test-only, for code generic over the backend (`test-utils`; reached through
+    /// [`crate::test_hooks::fail_store_at_epoch`]): latch a durability failure in the store that
+    /// holds `T`, as a failed sync does, so every later write and `persist` on it fails and
+    /// [`Database::failed`] resolves. The default does nothing: only a backend that can latch a
+    /// failure overrides it (tndb's `SplitDatabase`, with `tn-storage/test-utils`).
+    #[cfg(feature = "test-utils")]
+    fn fail_durability_for_test<T: Table>(&self) {}
+
     /// Synchronous, catch-up-only sibling of [`Database::persist`], for tests that cannot `await`.
     ///
     /// Unlike `persist` this deliberately does **not** provide the durability barrier: it must

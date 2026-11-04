@@ -38,7 +38,7 @@ impl<CDB: ConsensusDatabase> PrimaryNodeInner<CDB> {
         &mut self,
         task_manager: &TaskManager,
         consensus_chain: ConsensusChain,
-        certificate_pack: Option<CertificatePack>,
+        certificate_pack: Option<Arc<CertificatePack>>,
     ) -> eyre::Result<()> {
         // spawn primary and update `self`
         self.spawn_primary(task_manager, consensus_chain, certificate_pack).await?;
@@ -52,7 +52,7 @@ impl<CDB: ConsensusDatabase> PrimaryNodeInner<CDB> {
         &mut self,
         task_manager: &TaskManager,
         consensus_chain: ConsensusChain,
-        certificate_pack: Option<CertificatePack>,
+        certificate_pack: Option<Arc<CertificatePack>>,
     ) -> SubscriberResult<()> {
         let leader_schedule = self
             .spawn_consensus(&self.consensus_bus, task_manager, consensus_chain, certificate_pack)
@@ -75,7 +75,7 @@ impl<CDB: ConsensusDatabase> PrimaryNodeInner<CDB> {
         consensus_bus: &ConsensusBus,
         task_manager: &TaskManager,
         consensus_chain: ConsensusChain,
-        certificate_pack: Option<CertificatePack>,
+        certificate_pack: Option<Arc<CertificatePack>>,
     ) -> SubscriberResult<LeaderSchedule> {
         let leader_schedule = LeaderSchedule::from_store(
             self.consensus_config.committee().clone(),
@@ -128,7 +128,7 @@ impl<CDB: ConsensusDatabase> PrimaryNode<CDB> {
         &self,
         task_manager: &TaskManager,
         consensus_chain: ConsensusChain,
-        certificate_pack: Option<CertificatePack>,
+        certificate_pack: Option<Arc<CertificatePack>>,
     ) -> eyre::Result<()>
     where
         CDB: ConsensusDatabase,

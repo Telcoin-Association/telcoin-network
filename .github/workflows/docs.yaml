@@ -1,34 +1,30 @@
-# Documentation site (mdBook -> GitHub Pages), with versioning.
+# Documentation site (mdBook -> GitHub Pages).
 #
-# Every deploy assembles the full multi-version site from scratch:
-#   - main is built to the site root and served as "latest" (the default);
-#   - every v* tag whose tree contains docs/book.toml is built under /<tag>/;
-#   - versions.json at the site root lists the tags (newest first) and feeds
-#     the version picker in the book header (docs/theme/tn-custom.js).
-# Tags that predate the docs directory are skipped automatically.
+# Builds main with the pinned mdBook and publishes it at the site root. There
+# are no per-tag builds and no version picker (docs/ux.md, "Publishing").
 #
-# Triggers: merges into main that touch the book (docs/** or this workflow),
-# any v* tag push (GitHub does not apply path filters to tag pushes), or
-# workflow_dispatch. Rebuilding everything keeps the "GitHub Actions" Pages
-# source, which replaces the whole site on each deployment.
+# Triggers: merges into main that touch docs/**, CHANGELOG.md (included by
+# docs/src/getting-started/release-notes.md) or this workflow, and
+# workflow_dispatch. The "GitHub Actions" Pages source replaces the whole site
+# on each deployment.
 #
 # One-time repo setup: Settings -> Pages -> Source must be set to "GitHub
 # Actions" (not "Deploy from a branch"), and the github-pages environment's
-# deployment rules must allow deployments from main and from v* tags; without
-# both, the deploy job fails before actions/deploy-pages runs.
+# deployment rules must allow deployments from main, the only ref this
+# workflow deploys; without either setting, the deploy job fails before
+# actions/deploy-pages runs.
 #
 # Local preview: `make book` (build) or `make book-serve` (live-reload) -- both
 # require `cargo install mdbook --version 0.5.4 --locked` to match the version
-# pinned below. Local builds have no versions.json, so the picker only shows
-# the current version.
+# pinned below.
 name: Documentation
 
 on:
   push:
     branches: [main]
-    tags: ["v*"]
     paths:
       - "docs/**"
+      - "CHANGELOG.md"
       - ".github/workflows/docs.yaml"
   workflow_dispatch:
 
@@ -43,66 +39,45 @@ concurrency:
   group: pages
   cancel-in-progress: false
 
-env:
-  # Path prefix the site is served under: empty, because docs.telcoin.network
-  # (the Pages custom domain) serves the site at its root. If the site ever
-  # moves under a prefix again, set "/<prefix>" (no trailing slash) here and
-  # match site-url in docs/book.toml.
-  SITE_ROOT: ""
-
 jobs:
-  # Build latest + every tagged version with the pinned mdBook and hand the
-  # assembled site to the deploy job as a Pages artifact.
+  # Build main with the pinned mdBook and hand the site to the deploy job as a
+  # Pages artifact.
+  # A dispatch runs this file from the ref it was started on, so the `if:` only stops
+  # an accidental dispatch from another branch (and skips the deploy job through
+  # `needs`). The real control is the github-pages environment's deployment rule,
+  # which allows only main; keep it that way.
   build:
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      # Full-history checkout: version builds check out each v* tag in a
-      # worktree, and "latest" always builds from main even when the trigger
-      # is a tag push. The docs build never touches the tn-contracts submodule.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          fetch-depth: 0
+          persist-credentials: false
 
       - name: Install mdbook
         uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
         with:
           tool: mdbook@0.5.4
 
-      - name: Build the versioned site
+      - name: Build the site
+        run: mdbook build docs --dest-dir "$PWD/site"
+
+      # mdBook only logs a missing include and leaves the raw directive in the
+      # page, a missing anchor includes nothing, and a stray anchor line in the
+      # included text cuts the page short, so a broken Release notes page still
+      # builds. Fail here instead of publishing it: the anchor must be in
+      # CHANGELOG.md, the include directive must be gone from the page, and the
+      # page must show every CHANGELOG.md section. Commit text that quotes
+      # `{{#include` is fine, because only the exact directive is looked for.
+      - name: Check the release notes include
         run: |
-          set -euo pipefail
-          site="$PWD/site"
-          mkdir -p "$site"
-
-          # Latest: always main, regardless of which ref triggered the run.
-          # site-url is overridden per build (mdBook reads MDBOOK_* env vars)
-          # so asset paths and the 404 page resolve under each prefix.
-          git worktree add --detach wt-latest origin/main
-          MDBOOK_OUTPUT__HTML__SITE_URL="${SITE_ROOT}/" \
-            mdbook build wt-latest/docs --dest-dir "$site"
-
-          # One build per v* tag that has a book; older tags without docs/
-          # are skipped. Newest first so versions.json is already sorted.
-          versions=()
-          for tag in $(git tag -l 'v*' | sort -rV); do
-            if ! git cat-file -e "${tag}:docs/book.toml" 2>/dev/null; then
-              echo "skipping ${tag}: no docs/book.toml"
-              continue
-            fi
-            git worktree add --detach "wt-${tag}" "refs/tags/${tag}"
-            MDBOOK_OUTPUT__HTML__SITE_URL="${SITE_ROOT}/${tag}/" \
-              mdbook build "wt-${tag}/docs" --dest-dir "${site}/${tag}"
-            versions+=("$tag")
-          done
-
-          # Manifest for the header version picker ("latest" is implicit).
-          if [ "${#versions[@]}" -eq 0 ]; then
-            echo '{"versions":[]}' > "${site}/versions.json"
-          else
-            printf '%s\n' "${versions[@]}" | jq -R . | jq -s '{versions: .}' > "${site}/versions.json"
-          fi
-          cat "${site}/versions.json"
+          page=site/getting-started/release-notes.html
+          grep -q 'ANCHOR: releases' CHANGELOG.md || { echo "::error::CHANGELOG.md lacks the releases anchor"; exit 1; }
+          if grep -qF '{{#include ../../../CHANGELOG.md:releases}}' "$page"; then echo "::error::the CHANGELOG.md include did not resolve"; exit 1; fi
+          want=$(grep -c '^## \[' CHANGELOG.md || true)
+          got=$(grep -c '<h2 id="v' "$page" || true)
+          [ "$want" = "$got" ] || { echo "::error::the Release notes page shows $got of the $want CHANGELOG.md sections"; exit 1; }
 
       # Since v4 hidden files (any path component starting with `.`) stay out of the
       # artifact (v5 added `include-hidden-files: true` to keep them), so mdBook's

@@ -8,6 +8,7 @@ use super::{
     types::ConnectionDirection,
     Penalty,
 };
+use crate::diagnostics::{bounded_error, bounded_warn};
 use libp2p::{
     core::multiaddr::{Multiaddr, Protocol},
     PeerId,
@@ -15,7 +16,7 @@ use libp2p::{
 use std::{collections::HashSet, net::IpAddr, sync::Arc, time::Instant};
 use tn_config::ScoreConfig;
 use tn_types::{BlsPublicKey, NetworkPublicKey};
-use tracing::{debug, error, warn};
+use tracing::debug;
 
 /// Maximum number of distinct multiaddrs retained for a single peer.
 ///
@@ -327,7 +328,7 @@ impl Peer {
         } else if penalty.is_load() {
             debug!(target: "peer-manager", ?penalty, ?policy, "skipping load penalty for privileged peer");
         } else {
-            warn!(target: "peer-manager", ?penalty, ?policy, "skipping protocol penalty for committee peer");
+            bounded_warn!(PeerState, target: "peer-manager", ?penalty, ?policy, "skipping protocol penalty for committee peer");
         }
 
         // return new reputation
@@ -347,7 +348,7 @@ impl Peer {
             Reputation::Banned => {}
             Reputation::Trusted | Reputation::Disconnected => {
                 // if the score isn't low enough to ban, this function has been called incorrectly.
-                error!(target: "peer-manager", ?peer_id, "banning a peer with a good score");
+                bounded_error!(PeerState, target: "peer-manager", ?peer_id, "banning a peer with a good score");
                 // Normalize an already requested ban without inventing a protocol violation.
                 self.score.apply_penalty(Penalty::Fatal);
             }

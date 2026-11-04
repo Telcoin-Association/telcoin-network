@@ -1,0 +1,26 @@
+[
+  {
+    "source": "patches/quinn-proto/src/endpoint.rs",
+    "filter": "incoming_observations_release_every_disposition",
+    "exit_code": 101,
+    "assertion_failed": true
+  },
+  {
+    "source": "patches/quinn-proto/src/endpoint.rs",
+    "filter": "incoming_observations_release_every_disposition",
+    "exit_code": 101,
+    "assertion_failed": true
+  },
+  {
+    "source": "patches/quinn-proto/src/endpoint.rs",
+    "filter": "incoming_observations_effective_configuration",
+    "exit_code": 101,
+    "assertion_failed": true
+  },
+  {
+    "source": "patches/quinn-proto/src/incoming_stats.rs",
+    "filter": "incoming_observations",
+    "exit_code": 101,
+    "assertion_failed": true
+  }
+]
