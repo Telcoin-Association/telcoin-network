@@ -5,6 +5,7 @@ use crate::{
         bullshark::Bullshark, liveness::RoundQuorumObserver, utils::gc_round, ConsensusError,
         Outcome,
     },
+    metrics::{record_mode_transition, ModeTransitionReason},
     ConsensusBus, NodeMode,
 };
 use std::{
@@ -160,6 +161,15 @@ impl ConsensusState {
             }
         }
         info!("Dag is restored and contains {} certs for {} rounds", num_certs, dag.len());
+        debug!(
+            target: "primary::consensus_state",
+            num_certs,
+            rounds = dag.len(),
+            gc_round,
+            min_round = dag.first_key_value().map_or(0, |(round, _)| *round),
+            max_round = dag.last_key_value().map_or(0, |(round, _)| *round),
+            "dag restored"
+        );
 
         Ok(dag)
     }
@@ -614,10 +624,13 @@ impl<DB: Database> Consensus<DB> {
                     // This seems to be a bogus sub dag, we are out of sync...
                     tracing::error!(target: "telcoin::consensus_state", "Got a bogus sub dag from bullshark, we are out of sync and probably can not recover!");
                     // Going inactive will probably not help us at this point....
-                    self.consensus_bus
-                        .app()
-                        .node_mode()
-                        .send_modify(|v| *v = NodeMode::CvvInactive);
+                    let previous =
+                        self.consensus_bus.app().node_mode().send_replace(NodeMode::CvvInactive);
+                    record_mode_transition(
+                        previous,
+                        NodeMode::CvvInactive,
+                        ModeTransitionReason::BogusSubdag,
+                    );
                     self.consensus_config.shutdown().notify();
                     tracing::error!(target: "telcoin::consensus_state", ?base_execution_block, ?outcome, "commit {i} of {csd_len} subdags");
                     return Ok(());
@@ -675,10 +688,13 @@ impl<DB: Database> Consensus<DB> {
                         leader_commit_round,
                         "commit-accounting invariant violated: last committed round does not match leader commit round; going inactive and shutting down",
                     );
-                    self.consensus_bus
-                        .app()
-                        .node_mode()
-                        .send_modify(|v| *v = NodeMode::CvvInactive);
+                    let previous =
+                        self.consensus_bus.app().node_mode().send_replace(NodeMode::CvvInactive);
+                    record_mode_transition(
+                        previous,
+                        NodeMode::CvvInactive,
+                        ModeTransitionReason::CommitAccounting,
+                    );
                     self.consensus_config.shutdown().notify();
                 }
             }
