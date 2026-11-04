@@ -532,7 +532,11 @@ mod tests {
 
     /// A file name that is not valid UTF-8 is read like any other, and a missing file under
     /// such a name still fails at argument parsing.
+    ///
+    /// Ignored on macOS: APFS refuses to create a file whose name is not valid UTF-8 (EILSEQ,
+    /// os error 92), so the test cannot set up its file there.
     #[cfg(unix)]
+    #[cfg_attr(target_os = "macos", ignore = "APFS rejects non-UTF-8 file names (EILSEQ)")]
     #[test]
     fn bootstrap_peers_file_accepts_non_utf8_path() -> eyre::Result<()> {
         use std::{ffi::OsStr, os::unix::ffi::OsStrExt as _};
