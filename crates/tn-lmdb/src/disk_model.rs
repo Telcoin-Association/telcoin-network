@@ -83,7 +83,7 @@ pub(crate) fn flushed_range(ino: u64, base: *const u8, mapped: u64, start: u64, 
 }
 
 /// The inode of `file`, if any file is tracked (else 0, never a tracked one).
-pub(crate) fn ino_if_tracking(file: &File) -> u64 {
+fn ino_if_tracking(file: &File) -> u64 {
     if TRACKED.load(Ordering::Relaxed) == 0 {
         return 0;
     }

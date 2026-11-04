@@ -29,20 +29,12 @@ pub(crate) fn fsync_directory(path: &Path) -> io::Result<()> {
 /// `fsync(2)` `file`: [`File::sync_all`] everywhere but macOS, where that is `F_FULLFSYNC`
 /// (see the module docs) and this is a plain `fsync`.
 pub(crate) fn fsync_file(file: &File) -> io::Result<()> {
-    // Retried when a signal interrupts it, as `File::sync_all` does: every caller fail-stops on a
-    // sync error, and an interrupted call is not one.
     #[cfg(target_os = "macos")]
-    let synced = loop {
+    let synced = retry_interrupted(|| {
         // SAFETY: `fsync` on a file descriptor `file` owns and keeps open for the call; it touches
         // no Rust memory.
-        if unsafe { libc::fsync(file.as_raw_fd()) } == 0 {
-            break Ok(());
-        }
-        let error = io::Error::last_os_error();
-        if error.kind() != io::ErrorKind::Interrupted {
-            break Err(error);
-        }
-    };
+        os_result(unsafe { libc::fsync(file.as_raw_fd()) })
+    });
     #[cfg(not(target_os = "macos"))]
     let synced = file.sync_all();
     #[cfg(test)]
@@ -86,20 +78,23 @@ pub(crate) fn allocate_range(file: &File, from: u64, to: u64) -> io::Result<()> 
         return Ok(());
     }
     // fallocate(2) mode 0: allocate blocks for [from, from+len) and extend the size to cover it.
-    // SAFETY: a plain syscall on a file descriptor the caller owns and keeps open for the call; it
-    // touches no Rust memory, and the offsets are range-checked by the kernel.
-    let rc =
-        unsafe { libc::fallocate(file.as_raw_fd(), 0, from as libc::off_t, len as libc::off_t) };
-    if rc == 0 {
-        return Ok(());
+    // Reissuing it after an interruption is safe: mode 0 over the same range is idempotent.
+    let allocated = retry_interrupted(|| {
+        // SAFETY: a plain syscall on a file descriptor the caller owns and keeps open for the
+        // call; it touches no Rust memory, and the offsets are range-checked by the kernel.
+        os_result(unsafe {
+            libc::fallocate(file.as_raw_fd(), 0, from as libc::off_t, len as libc::off_t)
+        })
+    });
+    match allocated {
+        Ok(()) => Ok(()),
+        // Some filesystems (tmpfs, some network/older FS) don't implement fallocate; fall back to
+        // a plain resize (sparse) rather than failing an otherwise-serviceable growth.
+        Err(err) if matches!(err.raw_os_error(), Some(libc::EOPNOTSUPP) | Some(libc::ENOSYS)) => {
+            file.set_len(to)
+        }
+        Err(err) => Err(err), // ENOSPC / EDQUOT / EFBIG / EIO propagate as the growth's io::Error
     }
-    let err = io::Error::last_os_error();
-    // Some filesystems (tmpfs, some network/older FS) don't implement fallocate; fall back to a
-    // plain resize (sparse) rather than failing an otherwise-serviceable growth.
-    if matches!(err.raw_os_error(), Some(libc::EOPNOTSUPP) | Some(libc::ENOSYS)) {
-        return file.set_len(to);
-    }
-    Err(err) // ENOSPC / EDQUOT / EFBIG / EIO propagate as the growth's io::Error
 }
 
 /// See the Linux variant.
@@ -122,17 +117,20 @@ pub(crate) fn allocate_range(file: &File, from: u64, to: u64) -> io::Result<()> 
         fst_bytesalloc: 0,
     };
     let fd = file.as_raw_fd();
-    // SAFETY: `fd` belongs to a file the caller owns and keeps open for the call, and `store` is a
-    // live, properly initialized `fstore_t` that `F_PREALLOCATE` reads and updates
-    // (`fst_bytesalloc`) for the duration of the call only.
-    let mut rc = unsafe { libc::fcntl(fd, libc::F_PREALLOCATE, &mut store) };
-    if rc == -1 {
+    let preallocate = |store: &mut libc::fstore_t| {
+        retry_interrupted(|| {
+            // SAFETY: `fd` belongs to a file the caller owns and keeps open for the call, and
+            // `store` is a live, properly initialized `fstore_t` that `F_PREALLOCATE` reads and
+            // updates (`fst_bytesalloc`) for the duration of the call only.
+            os_result(unsafe { libc::fcntl(fd, libc::F_PREALLOCATE, &mut *store) })
+        })
+    };
+    let mut reserved = preallocate(&mut store);
+    if reserved.is_err() {
         store.fst_flags = libc::F_ALLOCATEALL;
-        // SAFETY: as above.
-        rc = unsafe { libc::fcntl(fd, libc::F_PREALLOCATE, &mut store) };
+        reserved = preallocate(&mut store);
     }
-    if rc == -1 {
-        let err = io::Error::last_os_error();
+    if let Err(err) = reserved {
         if err.raw_os_error() == Some(libc::ENOTSUP) {
             return file.set_len(to);
         }
@@ -149,6 +147,28 @@ pub(crate) fn allocate_range(file: &File, from: u64, to: u64) -> io::Result<()> 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 pub(crate) fn allocate_range(file: &File, _from: u64, to: u64) -> io::Result<()> {
     file.set_len(to)
+}
+
+/// Run `call` again while a signal interrupts it (`EINTR`), as std does inside `File::sync_all`
+/// and `set_len`: every caller fail-stops on the error, and an interrupted call is not one.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn retry_interrupted(mut call: impl FnMut() -> io::Result<()>) -> io::Result<()> {
+    loop {
+        match call() {
+            Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
+            done => return done,
+        }
+    }
+}
+
+/// A libc call's return code as a result: `-1` is the error in `errno`.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn os_result(rc: libc::c_int) -> io::Result<()> {
+    if rc == -1 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
 }
 
 /// The OS page size (cached): the unit `msync` addresses and the kernel writes back.
@@ -241,6 +261,30 @@ mod tests {
         assert!(meta.blocks() * 512 >= 1 << 20, "real blocks back the range ({})", meta.blocks());
         allocate_range(&file, 1 << 20, 1 << 20).expect("an empty range is a no-op");
         assert_eq!(file.metadata().expect("metadata").len(), 1 << 20);
+    }
+
+    /// An interrupted call is issued again until it completes; any other error ends it at once.
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn retry_interrupted_reissues_only_an_interrupted_call() {
+        let mut calls = 0;
+        let done = retry_interrupted(|| {
+            calls += 1;
+            if calls < 3 {
+                Err(io::ErrorKind::Interrupted.into())
+            } else {
+                Ok(())
+            }
+        });
+        assert!(done.is_ok(), "the third call completes: {done:?}");
+        assert_eq!(calls, 3, "both interrupted calls are reissued");
+        let mut calls = 0;
+        let failed = retry_interrupted(|| {
+            calls += 1;
+            Err(io::Error::from_raw_os_error(libc::ENOSPC))
+        });
+        assert_eq!(failed.expect_err("a full disk is an error").raw_os_error(), Some(libc::ENOSPC));
+        assert_eq!(calls, 1, "a real error is not retried");
     }
 
     #[test]

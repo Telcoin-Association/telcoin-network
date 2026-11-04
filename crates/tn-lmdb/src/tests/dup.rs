@@ -1337,7 +1337,7 @@ pub(super) fn damaged(
         let snapshot = env.inner().current();
         let outer = tree(&env, "d");
         let cell = |k: u32| {
-            let leaf = descend(&*snapshot, &outer, &k.to_be_bytes(), |_, _, _, _| Ok(()), None)
+            let leaf = descend(&*snapshot, &outer, &k.to_be_bytes(), |_, _, _, _| Ok(()))
                 .expect("descend")
                 .expect("an outer leaf")
                 .pgno;

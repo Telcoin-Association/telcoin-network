@@ -595,6 +595,7 @@ fn a_live_leaf_freed_by_a_later_drop_is_corrupt_once_reused() {
     let fx = fixture();
     let (path, leaf) = u_leaf_listed_free(&fx, "across");
     let env = open(&path, SyncMode::Durable);
+    env.with_writer(|w| w.alloc.log_pages = true);
     let mut txn = env.begin_rw().expect("begin");
     let w = txn.create_table("w").expect("w");
     let n = put_until_private(&mut txn, &w, leaf, 900);

@@ -14,76 +14,35 @@ crash safety. This is the difference from `tn-storage`'s
 [`btree_index`](../storage/src/archive/btree_index/README.md), the tree this crate's code is copied
 from. `btree_index` reuses pages before a sync, and its owner rebuilds it from a log after a crash.
 
+The design is LMDB-style: copy-on-write B+trees in one memory-mapped file, two meta pages, a
+single writer and snapshot readers. It is not LMDB and not a binding to it. It has its
+own on-disk format (the meta records start with the magic `tn-lmdb\0`) and reads neither LMDB nor
+MDBX files: such a file opens as `NotTnLmdb`.
+
 The crate is self-contained: it copies its primitives (CRC, page set, sync wrappers, mapping) and
 does not depend on `tn-storage` or reth. reth's database API on top of it is a separate crate,
 [`tn-lmdb-reth`](../tn-lmdb-reth/README.md).
-
-| file | contents |
-|---|---|
-| `lib.rs` | crate docs, `compile_error!` off unix, re-exports |
-| `error.rs` | `Error`, `Result` |
-| `env.rs` | `Env`, `EnvOptions`, `SyncMode`, `EnvStat`: open and recovery (and the read-only open), the writer hand-off, snapshots, the reader queue, the durable steps of a commit, `sync` |
-| `txn.rs` | `RoTxn`, `RwTxn`, `ReadTxn`, `Table`, `TableStat`, `RoCursor` (the owned read cursor), `RwCursor`, `TxnCursor` (the detached write cursor, with the transaction's write stamps, schema counter and serial); dup tables' point ops, `delete_prefix` and the per-transaction map of their nested trees, flushed at commit; commit steps 1–3 and 7 |
-| `meta.rs` | the 128-byte meta record, `choose_meta`, `slot_to_write` |
-| `page.rs` | the slotted page codec (inline, overflow and nested leaf cells, `Val`), `Geometry` (limits, `place`: inline or overflow), `validate` |
-| `packed.rs` | the packed-set codec of a dup table's outer cell: `PackedView` (the O(1) header and per-row checks, `find`), `validate` (the whole set), the rebuilds (`build_one`, `build_with`, `build_without`), `PACKED_MIN` |
-| `overflow.rs` | overflow runs: the 12-byte cell reference (`Ovf`), the run codec, `checked_run` (every check a run read makes), `MAX_VALUE` |
-| `tree/` | `TreeRoot`, the `PageRead`/`PageWrite` stores, checked descent and lookup (`read.rs`), copy-on-write put/delete/split/merge/free (`write.rs`), the bidirectional cursor (`cursor.rs`) |
-| `alloc.rs` | the writer's page allocator (`private`, `stamped`, `pool`, `freed`, `next_pgno`) and its overflow runs (`allocate_run`, `free_run`) |
-| `stamp.rs` | commit step 3's CRCs on several threads for a large commit (`threads`, `crcs`, `put_crc`) |
-| `freelist.rs` | free-record codec, gated loading, the fixed-point save |
-| `catalog.rs` | the table catalog (`TableRecord`, the 96-byte record of a plain or a dup table; `TableRecord::usable`, the limits of this build; `DupOptions`) |
-| `check.rs` | `Env::check`: the full structural check (every overflow run's CRC included, a dup table's nested trees, packed sets and totals) and exact page accounting |
-| `latch.rs` | the failure latch |
-| `file.rs` | `PageFile` (reserved mapping, preallocated growth capped by `EnvOptions::max_growth`, the close's tail trim `trim_to`, msync, poison), `ReadOnlyFile` (a read-only open's `PROT_READ` mapping) and `MapView` (the lock-free reader view of either) |
-| `sys.rs` | `fsync_file`, `fdatasync_file`, `fsync_directory`, `allocate_range`, `os_page_size`, `flock_exclusive`, `flock_shared` |
-| `crc.rs`, `page_set.rs` | copied from `crates/storage/src/archive/` (`page_set.rs` adds a touched-word list, so `clear` and `drain` cost the words touched, not the file) |
-| `disk_model.rs` | test-only page-cache and power-loss model |
-| `tests/`, `*/tests.rs` | crash, damage (nested cells and dup records included), dup tables against a composite-key model, multi-table model, merging, path cache, append, detached cursor, key tail, concurrency and read-only suites, per-module tests |
-| `bench.rs` | the on-demand benchmark of step 4's data sync and of merging, each against its test-only switch, and the on-demand probe of step 3's thread count (`stamp_probe`) |
-
-## Milestones
-
-- **M1, the crash-safe core:** copy-on-write B+trees in one page file, two metas, gated page
-  reuse, the persisted free list, the failure latch, `Env::check`, and the crash and damage
-  suites. Its performance work added provenance trust, the path cache, `append` and cursor puts;
-  step 4 then became one sync (an `msync` of one range, else one `fdatasync`).
-- **M2, what reth's tables need:** format v2 with page counters in every `TreeRoot`; overflow runs
-  for values up to 16 MiB, with run allocation (first fit, gated records loaded for a fit, tail
-  reuse) and a record's leftover pages listed again under the consumed keys; merging on delete;
-  a delete in one descent; the read-only open; owned (`RoCursor`) and detached (`TxnCursor`)
-  cursors; `insert` (`KeyExists`); prefix steps; a cursor that rests on the follower after a
-  delete, so a walk that deletes as it goes skips nothing; `KeyTail`; and the reth adapter, [`tn-lmdb-reth`](../tn-lmdb-reth/README.md).
-- **M3, TN's reth database:** TN runs its reth database on tn-lmdb behind the `tn-lmdb` feature,
-  migrating an MDBX one at its first open (`crates/tn-reth`'s README); dup tables as nested
-  trees with packed small sets ([Dup tables](#dup-tables)); leaf values inline up to half a page;
-  a growth cap (`EnvOptions::max_growth`) and a clean close that gives back the preallocated
-  tail ([Close](#close)). On 2026-11-04 TN's reth execution bench on Linux (six load profiles,
-  A B B A, commits judged where both engines' drive syncs ran fast) put tn-lmdb within 2% of MDBX
-  at peak and busy load and within 5% on the other four profiles, with its tables within 1–3% of
-  MDBX's size. Of the remaining peak cost, most is step 3's page CRCs, which MDBX does not have.
-- **Next:** a faster page checksum for step 3 (the checks stay); the reth storage changes that
-  move the changesets out of the database; and a bound on `NoSync`'s growth, which the reth
-  integration needs before it accepts `--db.sync-mode safe-no-sync`.
 
 ## Contents
 
 1. [Concepts at a glance](#concepts-at-a-glance)
 2. [On-disk format](#on-disk-format)
-3. [Deletes and merging](#deletes-and-merging)
-4. [Dup tables](#dup-tables)
-5. [Commit protocol](#commit-protocol)
-6. [Free list and page reuse](#free-list-and-page-reuse)
-7. [Readers and snapshots](#readers-and-snapshots)
-8. [Open and recovery](#open-and-recovery)
-9. [Failure latch](#failure-latch)
-10. [Concurrency rules](#concurrency-rules)
+3. [Commit protocol](#commit-protocol)
+4. [Free list and page reuse](#free-list-and-page-reuse)
+5. [Readers and snapshots](#readers-and-snapshots)
+6. [Open and recovery](#open-and-recovery), [read-only open](#read-only-open) and [close](#close)
+7. [Failure latch](#failure-latch)
+8. [Concurrency rules](#concurrency-rules)
+9. [Deletes and merging](#deletes-and-merging)
+10. [Dup tables](#dup-tables)
 11. [Public API reference](#public-api-reference)
 12. [Errors](#errors)
 13. [Platform notes](#platform-notes)
 14. [Limits and non-goals](#limits-and-non-goals)
 15. [Intentional design decisions: please do not flag these](#intentional-design-decisions-please-do-not-flag-these)
-16. [Tests and benchmarks](#tests-and-benchmarks)
+16. [Source files](#source-files)
+17. [Tests and benchmarks](#tests-and-benchmarks)
+18. [Milestones](#milestones)
 
 ---
 
@@ -120,7 +79,6 @@ does not depend on `tn-storage` or reth. reth's database API on top of it is a s
 - **Deletes merge.** A page a delete leaves under a quarter full absorbs same-parent siblings
   while they fit, up the tree. A merge allocates nothing and never splits. See
   [Deletes and merging](#deletes-and-merging).
-
 - **Dup tables.** A dup table (`RwTxn::create_dup_table`) keys every row `k ‖ s`, an outer key
   of a fixed width and a subkey. Its outer tree holds one cell per outer key: the key's few rows
   packed in the cell (a packed set), or the root of the key's own nested B+tree of subkeys and
@@ -224,8 +182,33 @@ trailer (4):  CRC32 over bytes 0..24+2·nkeys, then upper..P−4 (the page outsi
   laid out there (`page::init_header`, then its cells and slots) writes every byte but the gap,
   which keeps the page's previous bytes (debug builds fill a new page with `tree::POISON`). A
   delete or a shrinking replace leaves bytes in the gap too: the moved cells' old bytes and the
-  slot array's old last slot (`remove_cell`, `shift_front`). Nothing ever reads them, and the
-  CRC skips them (do-not-flag items 17 and 28).
+  slot array's old last slot (`remove_cell`, `shift_front`). Copy-on-write
+  (`tree::write::copy_page`) writes the source's header and slots, then its cells and trailer, so
+  the copy's gap keeps the destination's old bytes as well. Nothing ever reads them, and the CRC
+  skips them (do-not-flag items 17 and 28).
+  - The gap's bytes are the same for the same history of operations: two files driven
+    through the same writes stay byte-identical.
+  - Why: zero-filling cost a page-sized `memset` per allocation, about 4.7% of a busy output in
+    a macOS profile. A fresh layout writes every byte it relies on itself (`page::init_header`
+    writes the header and the trailer, then the cells and slots follow; `overflow::encode_run`
+    writes a run whole). Copying the gap too cost 3.4% and 1.8% per call on two Linux rewrite
+    benchmarks (history-shaped and dup-shaped rewrites of existing pages).
+  - The copy's source passed the fetch checks and, unless this writer stamped it, its CRC and
+    `page::validate`, so its slots end at or below `upper` and `upper` at or below the trailer
+    (`page::hdr`'s check); a header outside those bounds, which no caller passes, is copied
+    whole, so the checks after the copy see the source's bytes. The leaf and branch mutators
+    that grow into the gap (`reserve`, `shift_front`) write every byte they hand out before it
+    is read.
+  - Debug builds fill every page and run that `PageWrite::alloc` and `alloc_run` hand out with
+    `tree::POISON` (0xA5), so the whole test suite runs every layout, and every copy (both
+    stores copy through `copy_page`), over garbage, and a reliance on zeros or on a copied gap
+    fails it.
+  - A page taken from the file end still gets one byte written when it is allocated, so pages
+    are first written in allocation order (see the macOS note in
+    [Platform notes](#platform-notes)). That store is not a fill and promises nothing.
+  - Deleted values can stay on disk in gaps until those pages are rewritten, as they already
+    could in free pages and in the gap a delete leaves. The engine makes no secure-delete
+    promise.
 - **Leaf cell:** `vlen u32 | klen u16 | flags u16 | key | value`. The flags say what the value
   bytes are, and each flag has one exact shape (`page::leaf_cell`):
 
@@ -255,6 +238,12 @@ trailer (4):  CRC32 over bytes 0..24+2·nkeys, then upper..P−4 (the page outsi
   the all-ones value, as `add_crc32_nonzero` maps it for a run. **An all-zero trailer means
   "dirty"**: a page being built by the writer. A published page with a zero trailer is
   `Corrupt`.
+  Skipping the gap is deliberate (do-not-flag item 28): the stamp (commit step 3) and every check
+  of a published page's CRC (the copy-on-write verify, open's root check, `Env::check`) read the
+  bytes they hash, and on a long-running writer's pages the gap is about a third of a page, so
+  hashing it pulled stale bytes from memory only to hash them (see the stamp note in
+  [Platform notes](#platform-notes)). Overflow runs keep their whole-run CRC, and meta pages their
+  own codec.
 
 ### Overflow runs (`overflow.rs`)
 
@@ -466,6 +455,14 @@ run `validate` first, before anything changes. A failure is `Corrupt` ("dup tabl
 packed set of key {hex}: ..."), and latches as any damage does. A set's bytes are not checked at
 page validation or copy-on-write (do-not-flag item 25).
 
+Checking only the rows a read touches is deliberate (do-not-flag item 23): damage is `Corrupt` at
+first use, at the granularity of what the read touches, the rule pages and the subkey width checks
+follow. The whole check on every get would cost several times the lazy one on a full set
+(estimated ~150-250 ns against ~30-40 ns at a 2 KB set), up to half again a packed get's outer
+descent. The exposure: a misorder off a get's probe path passes that get
+(`the_lazy_checks_refuse_what_they_touch` pins it); a write to the key, a cursor's walk of it or
+`Env::check` refuses it.
+
 ### Free-list records
 
 - **Key** (12 bytes): `txn u64 BE | seq u32 BE`. The key holds a transaction and a sequence
@@ -474,6 +471,596 @@ page validation or copy-on-write (do-not-flag item 25).
   left unused (see [Free list and page reuse](#free-list-and-page-reuse)).
 - **Value:** page numbers as `u32` LE, strictly ascending. A value holds at most
   `record_capacity = max_entry_value(12) / 4` page numbers (248 at 4 KiB). Empty values are allowed.
+
+---
+
+## Commit protocol
+
+**Copy-on-write in one copy.** A commit publishes private pages: the first change a write
+transaction makes to a published page copies it into a page reserved for the write
+(`write::writable`), stamps the copy with its new page number and the transaction's id, zeroes its
+trailer (dirty) and frees the original. The copy is one copy (`PageWrite::copy_published`). The
+writer borrows the published source through its own clone of the readers' `MapView` (`Writer::view`:
+the one view the file updates in place when its mapping moves, so it is never refreshed by hand),
+with exactly `PageRead::page`'s checks (`checked_page`), and writes it into the private page through
+`PageFile::page_mut`. The two slices coexist: each is formed from the mapping's raw pointer
+(`MmapRaw`) and covers exactly its own page, and they are never the same page, because
+`copy_published` refuses a private source and the destination must be private
+(do-not-flag item 2). A source past the published bytes, where the view ends, is no page of a
+committed tree, only one this transaction freed, and only damage names it: the cold
+`copy_unpublished` copies it through a buffer of its own, so its checks and messages stay
+`PageRead::page`'s. The test store (`MemStore`) copies with one `copy_within`: it has no readers.
+
+`RwTxn::commit` with `SyncMode::Durable` (`txn.rs` `Work::commit`, `env.rs`
+`Writer::make_durable`) runs these steps:
+
+| step | what |
+|---|---|
+| 0 | Latched: return `Failed`. A transaction that changed nothing returns its base txn id with no I/O. |
+| 1 | Write each changed table's root into the catalog (in name order), then save the free list (see below). |
+| 2 | Build meta M in memory: txn L+1, both roots, the page count. |
+| 3 | Stamp the CRC of every page the transaction created (they become "stamped by this writer"). A tree page's CRC skips its free gap (`page::stamp`, [Tree pages](#tree-pages-pagers)); an overflow run gets one CRC over all its pages, never one per page (`stamp_private`, `PrivatePages::units`, `stamp::Unit`), and its pages never count as stamped. Below 2 MiB of units the writer stamps each unit in turn (`stamp::stamp`). From 2 MiB (`stamp::threads`: a second thread at 2 MiB, one more per MiB, at most 8 and the CPUs the process may use) it computes the CRCs on several threads first (`Writer::unit_crcs`, `stamp::crcs`): each thread reads a contiguous share of the units, balanced by the units' bytes (not by the bytes hashed), through `PageFile::pages` slices while the writer holds the file shared, so no page changes and no `unsafe` is added; then the writer stores each CRC in unit order through `PageFile::pages_mut` (`stamp::put_crc`). The bytes, their order and the errors are the serial loop's, and the crash points are unchanged. |
+| 4 | Sync the dirty pages (`data_sync`), every page of every new run included. Runs separated by at most 64 clean pages (`MERGE_GAP`) merge into one range. If the pages form exactly one range, in at most 16 runs of adjacent pages (`MAX_RUNS`), one `msync(MS_SYNC)` of that range; otherwise one `fdatasync` of the file (why: below and [Step 4](#step-4-one-msync-or-one-fdatasync); do-not-flag item 10). |
+| 5 | If the file grew since the last sync, run `fdatasync_file` so its size is durable. After step 4's `fdatasync` this has nothing left to do: that call made the size durable too. |
+| 6 | Copy meta M into the slot holding the lower txn (an invalid slot first; on a tie, slot 1), msync that one page, then record M's txn as the slot's. |
+| 7 | Publish: swap in the new snapshot, push `(M, Weak<Snapshot>)` on the reader queue. |
+
+**Step 4's one sync.** Why step 4 is one call, and the numbers behind its choice, are in
+[Step 4](#step-4-one-msync-or-one-fdatasync) (do-not-flag item 10). The `fdatasync` also writes any
+other dirty page of the file. At a commit that can only be a page of an aborted transaction, which
+is a free page, so writing it is harmless. A crash test cannot stop a commit between data ranges,
+because there is one sync; partial writeback of the dirty pages is still modelled by
+`power_loss_random`, and the crash matrix runs every point on both paths (`Writer::data_by_msync`,
+`Writer::data_by_fdatasync`).
+
+Crash outcomes (L = the last durable state, M = this commit):
+
+| crash during or after | Durable recovers | NoSync recovers |
+|---|---|---|
+| steps 1–3 (memory only) | L | the last synced state |
+| step 4 or 5 | L. M's meta was never written, and L's pages are untouched, because pages reachable from either slot are never reused. | not applicable |
+| step 6, before the meta's msync completes | M if its record reached the disk with a valid CRC, else L | not applicable |
+| after step 6 | M | not applicable |
+| any time after a NoSync commit, before `Env::sync` | not applicable | the last synced state. A process crash also rolls back. |
+
+**NoSync** runs steps 1–3 and 7 only. The stamped pages accumulate in an `unsynced` page set, and
+no meta is written, so the slots stay put. `Env::sync()` runs steps 4–6 for the newest state.
+Dropping the environment calls it unless the environment is latched. Because the reuse gate uses
+the slots' txns, the durable state's pages are never overwritten, and the file stays consistent
+whatever is lost.
+
+**Abort** means dropping the `RwTxn` (or calling `abort`). The free tree was never touched, the
+pool and `next_pgno` return to the transaction's base, and its private pages and runs are simply
+unreferenced. There is no I/O.
+
+**An `Err` from commit** latches the environment (`fail_damaged` for `Corrupt`, otherwise `fail`),
+and whether the commit survives is unknown until a reopen. Validation errors (`KeyTooLarge`,
+`KeyTooShort`, `ValueTooLarge`, `AppendOutOfOrder`, `KeyExists`, table errors, `TableKind`,
+`InvalidDupOptions`, `ReadOnly`, `WrongTxn`) happen in `put` and the other calls, before anything
+changes, and do not latch.
+
+---
+
+## Free list and page reuse
+
+**During a transaction** (`alloc.rs`):
+
+- A published page that leaves a tree goes to `freed`.
+- A page the transaction itself created that leaves a tree ("loose") goes straight back to
+  `pool`.
+- An allocation takes a page from `pool`, else the next page number at the end of the file,
+  growing the file.
+- An overflow run of `n` pages (`Writer::alloc_run`, `allocate_run`) tries, in order:
+  1. the first fit in `pool`: the lowest `n` consecutive page numbers it holds (`first_fit`, which
+     sorts the pool; `n = 1` takes a page as an allocation does);
+  2. more free records that pass the gate, loaded until the pool fits or 8 records
+     (`RUN_LOAD_RECORDS`) are loaded, then the first fit again;
+  3. tail reuse: pool pages that end the file start the run, and the file grows by the rest;
+  4. the next `n` page numbers at the end of the file, in one growth.
+
+  The budget counts records, not pages: a budget of `8 · n` pages stopped after the first record,
+  which lists far more, and left runs growing the file without bound under churn while later
+  records held fits (`run_churn_keeps_the_file_bounded_heavy`). Its pages are private, and the
+  allocator also records the run (`private_runs`) for the commit's one CRC.
+- A run that leaves a tree goes back as `n` single pages (`free_run`): to `freed` if published,
+  to `pool` if this transaction created it. Free records list single pages, so a freed run's
+  pages come back one by one, as tree pages or as parts of a later run.
+- `clear_table` and `drop_table` collect every page before freeing any (`tree_pages`). Each branch
+  is read with a descent's checks and verified unless private or stamped, and its child pointers
+  follow the provenance rules of a descent (do-not-flag item 11): a page private to the
+  transaction named by a page it did not write, or by an untrusted root handle, is `Corrupt`, and
+  a private child must be the page and txn its parent names. A freed private page goes back to
+  the pool at once, so a forged pointer to a page this transaction allocated for another tree
+  must not free it. A tree whose `overflow_pages` is 0 reads its branches, its first leaf and its
+  private leaves (in memory) only. A tree with runs reads every leaf, checks each run's header,
+  identity and provenance (`leaving_run`, without the CRC: the value is not read), and requires
+  the run pages to add up to `overflow_pages`. Damage refuses the free with `Corrupt`, before any
+  page is freed.
+- When `pool` is empty, the writer refills it (`Writer::refill`). It takes free records smallest
+  first, and only while their txn is at most the **reuse gate**:
+
+  ```text
+  gate = min( txn of each valid meta slot , txn of the oldest snapshot a reader may hold )
+  ```
+
+  `Writer::reuse_gate` computes it. The oldest reader comes from the reader queue, followed by
+  `fence(Acquire)`, which pairs with the `Release` drop of each snapshot's last `Arc`.
+
+Before a record's pages are handed out, `next_record` and `decode_pages` check them:
+
+- every page on the way to the record passes its full CRC and structure checks, within its
+  ancestors' separators;
+- each page number is in `[2, page_count)`;
+- the page numbers are strictly ascending;
+- no page was already taken by this transaction.
+
+Damage is `Corrupt`, and none of the record's pages is used. The free tree itself is not changed
+while the transaction runs.
+
+A record that lists a page a tree still holds passes these checks: telling would take a walk of
+every tree. A write that hands the page out overwrites it, and a read through the old pointer
+then fails its checks (a run of more than one page fails its CRC; a tree page or a 1-page run its
+header or txn identity), so the damage is met as `Corrupt`, never as wrong data. A write that
+instead takes the page out of its tree while the page waits in the pool finds it at commit both
+free and freed (`Allocator::reusable`), which is `Corrupt` too. A `clear_table` or `drop_table`
+of the tree that holds the page, after a write in the same transaction handed it out, finds it
+private under a page the transaction did not write (`tree_pages`), `Corrupt`. In a later
+transaction, the page now published, a free of a tree without runs cannot tell (it does not read
+the leaf) and frees the page again; once a write reuses it, a read through either pointer fails
+its txn identity, `Corrupt`. A forged nested root named by two outer cells of a dup table, each
+cell written in its own transaction, is the same case. A page freed twice in one transaction (two
+pointers naming it, such as two cells naming one run) is `Corrupt` at commit
+(`Allocator::reusable`). `Env::check` reports the page as used twice.
+
+**Reuse timing.** A record's txn is the reuse gate its pages wait for: once the gate reaches it,
+no durable meta and no live reader reaches them. A page freed by txn N is listed under N, since
+N's base state still holds it. In `Durable` mode, after commit N the slots hold N−1 and N. So a
+page freed by txn N becomes reusable at txn **N+2**, once N+1 has committed and the slots hold N
+and N+1. In `NoSync` mode the slots move only at a sync, so a freed page comes back once two syncs
+have made states from N on durable in both slots.
+
+**The save at commit** (`freelist::save`) runs with loading stopped, so pages come only from the
+pool or the end of the file:
+
+1. Delete the records the transaction consumed.
+2. Write the pool, sorted and chunked by `record_capacity`, under the keys of the records
+   consumed, in order. Every pool page is free in each state a durable meta or a reader holds (a
+   page taken from a record that passed the gate, or one this transaction added to the file), and
+   every key consumed has passed the gate, so the next transaction may take these pages at once.
+3. Write the freed pages, plus any pool pages past what the keys consumed hold (only pages this
+   transaction added to the file and freed again), as records `(M, 0..k)` of the committing txn
+   M.
+4. Writing can take pool pages and free pages of the free tree, which changes both lists. So
+   write again until the records list exactly them: a fixed point.
+
+Record keys are never deleted inside the loop. A record no longer needed is written empty, so a
+round never frees a page a later round must list. Three rounds suffice. More than 8 is a broken
+invariant, which returns `Failed` and latches.
+
+Each round takes the two lists from `Allocator::reusable`. A peak commit's lists hold about as
+many pages as it wrote, so the round sorts each list once, with `alloc::sort_pages` (an LSD radix
+sort, 11 bits a pass, which skips a pass whose digit every page shares). One linear pass over the
+two sorted lists (`first_duplicate`) then finds the smallest page listed twice: twice freed
+(`Corrupt`), a loaded pool page also freed (`Corrupt`), or any other repeat (`Failed`). The pool
+pages that spill to step 3 merge into the sorted freed pages (`merge_sorted`) instead of a sort.
+The records are those a combined sort of both lists wrote, byte for byte, with the same errors:
+`reusable_matches_the_reference` (and its `_heavy` twin, on a peak commit's list sizes) holds
+`reusable` to that combined sort, kept test-only as `Allocator::reusable_reference`;
+`the_save_writes_the_records_the_reference_writes` compares whole commits' free trees, and
+`a_spill_below_the_freed_pages_is_merged_into_them` a commit whose spilled pool pages fall below
+pages it freed (a record size cut below the one the record taken was written with).
+
+**Leftover pages are reusable at once.** When a transaction consumes a record but uses only some
+of its pages, the rest stay in `pool`, and step 2 lists them again under a consumed key. No two
+records list one page: the records consumed are deleted in step 1, and their keys are free for
+step 2. Listing them under M instead made them wait two more commits, longer
+under a held reader: each commit then took more records and left more over, and under churn of a
+tenth of the pages per commit with readers held the file reached 2.5 times its live pages, against
+1.6 now (`run_churn_with_readers_keeps_the_file_bounded`).
+A leftover page can then sit under a key older than the record that listed it (do-not-flag item 7).
+That is sound: a key's txn only has to be one the gate has passed, every key consumed had, and the
+gate never moves back, so no state a durable meta or a reader can hold reaches the page.
+
+**The accounting invariant** that `Env::check` enforces after every commit in the model tests is:
+
+```text
+(pages reachable from the catalog, every table and the free tree)  ⊎  (page numbers in free records)  =  [2, page_count)
+```
+
+A table's reachable pages include every page of the overflow runs its leaves name. The union is
+disjoint: every page is used by exactly one tree, once, or listed exactly once. Any leak or double
+use is `Corrupt` naming the pages, and it latches.
+
+---
+
+## Readers and snapshots
+
+A `Snapshot` holds `{ meta, geometry, view: Arc<MapView>, tables: TableRoots }`. It is published
+as an `Arc` under a `parking_lot::RwLock`. `begin_ro` clones the current one, so a reader sees one
+state of every table. The environment's own `Arc` to the current snapshot keeps the reader queue
+non-empty.
+
+**A long reader shows, at no cost to readers.** A reader holding a superseded snapshot keeps every
+page freed after it from reuse (the gate in [Free list and page reuse](#free-list-and-page-reuse)),
+so the file grows while it lives; the pages become reusable once it ends.
+`Env::oldest_reader_age() -> Option<Duration>` says how long the oldest live reader has held a
+superseded snapshot. Each entry of the writer's reader queue records when the next commit
+superseded its snapshot (one monotonic clock read per commit, in `Writer::publish`), and each
+commit, after pruning the queue, stores the oldest live entry's time in an atomic of the shared
+state. The call loads it and subtracts it from now, with no lock; `begin_ro` and a reader's drop
+do nothing for it. A reader of the current snapshot does not count, as it holds back no page a
+commit freed. The value is refreshed only at commits: between them, a reader that has ended still
+counts until the next commit. A read-only environment never commits, so it always returns `None`.
+
+**A snapshot resolves each table handle once.** `TableRoots` remembers the tree roots its
+readers resolved, in 32 slots (`OnceLock<(Table, TreeRoot)>`): a handle's slot is the first one
+from `id % 32` on, wrapping, that no other handle holds, and a hit is `Table::is`, the id and
+then the name (a handle of another file, or one of a table an aborted transaction created, whose
+id the next table created takes, may carry the same id). Every `RoTxn` on the snapshot shares
+them, so a table's catalog lookup runs once per snapshot, not once per transaction, and an
+`RoTxn` is two `Arc`s (`{ inner, snapshot }`). `RoTxn::root`, inline, checks the handle's home
+slot; `resolve_root`, out of line, probes on, then reads the catalog and remembers the root it
+resolved in the first free slot. Only a resolved handle is remembered: `StaleTable` and
+`TableNotFound` are checked again at each use. A slot is never emptied, and once every slot holds
+another handle a handle resolves through the catalog at each use, uncached. Each commit
+publishes a new snapshot with no table resolved; a read-only open has one snapshot for its life,
+so it resolves each handle once. `open_table` reads the catalog every time. The cache is safe (do-not-flag
+item 15): a snapshot's catalog never changes while an `Arc` of it lives (the reuse gate holds its
+pages), so a second lookup would read the same bytes, pass the same checks and give the same root.
+Damage in the catalog is met by the first resolve in each snapshot and by every `open_table`.
+
+**Every page fetch** (`tree::read::checked_page`) checks:
+
+- `2 <= pgno < page_count` (the snapshot's), and the page is mapped;
+- a non-zero CRC trailer, unless the page is private to the writer;
+- the header's `pgno` equals the requested one;
+- the header's `txn` is no later than the reading snapshot's txn, so a page reused too early
+  surfaces as `Corrupt` instead of wrong data.
+
+**Every descent** (`read::descend`, the cursor's `descend`) also checks:
+
+- each child is the copy its parent names: header `pgno == child` and `txn as u32 == child_txn`.
+  This catches a pointer redirected to a stale copy that still has a valid CRC. The fetch reads
+  the header's `pgno` and `txn` once for these and the per-fetch checks
+  (`PageRead::child`, `tree::read::checked_child`).
+- a branch at every level above the leaves and a leaf at the leaf level;
+- only the root leaf may be empty;
+- keys lie within the intersection of every ancestor's separator range. A cursor's descent along
+  an edge (to the first or last entry, and every crossing) checks each page's first and last keys
+  against it; a cursor's seek, as a point read, checks only the keys its search compared, and the
+  leaf it lands in gets the full check before any read past its landing entry (below).
+
+**A seek checks only the keys its search compared** (do-not-flag item 29; `TreeCursor::descend`
+for a key: `seek`, `seek_exact`, `seek_with_key_tail`, and the dup walker's seeks and finds, in
+outer and nested trees). At a branch it checks the route's bounds, the separators either side of the child taken, against the range the levels
+above give the page (`route.lo >= lo`, `route.hi < hi`); at the leaf a hit needs nothing (the
+sought key itself, which the routes kept inside every range), and a miss checks the keys
+either side of the insertion point, `read::check_miss`'s rule, which point reads
+(`read::get`) have always followed. The check of every key, the page's first and last against
+the range, is deferred: the leaf a seek lands in stays unchecked (`TreeCursor::leaf_checked`)
+until a read of it past the landing entry (a step, a prefix step, a seek from the leaf) gives it
+that check first, once (`TreeCursor::check_leaf`: the path's branches fetched again for the
+range, the descent's message). That range is read from two levels only
+(`TreeCursor::seek_bounds`): the descent checked each route against the range above it
+(`route.lo >= lo`, `route.hi < hi`), so the deepest route with a lower bound gives the
+intersection's `lo`, and the deepest with an upper bound its `hi`. The slots name those two
+levels with no cell read (a route has a lower bound exactly when its slot is not the branch's
+first, an upper one when it is not the last; `TreeCursor::bound_levels`), so the descent
+records nothing, and the check reads only their routes, every branch still fetched again with
+the per-fetch checks and parsed as a branch, in the path's order, before any route (the routes
+of the other levels are cells the descent's search read with the same cell checks). Debug
+builds assert that range equals, by content, the one built from every level's route
+(`TreeCursor::bounds`; `a_seeks_leaf_check_reads_the_range_of_its_deepest_bounded_levels`).
+A dup write reads its key's cell in a held outer leaf that is still unchecked only at the
+cursor's slot, its landing entry, and finds any other cell from the root (`held_cell`). A
+descent along an edge (to the first or last entry, every crossing) keeps the full check of
+every page.
+- What is given up: a seek that lands and moves no further accepts a page that only partly
+  overlaps its range (a damaged separator or pointer whose page straddles a bound), its landing
+  entry, which the search compared, inside the range. A page wholly outside its range is still
+  refused at the seek with the same message (every damage sweep's expectation holds
+  unchanged), and every entry a cursor returns past its landing comes from a leaf checked in
+  full (`a_seek_lands_in_a_leaf_partly_outside_its_range_and_reading_on_refuses_it`,
+  `a_seek_into_a_page_wholly_outside_its_range_is_corrupt_at_that_page`).
+- What it adds: the deferred check fetches the path's branches again, so a seek inside a leaf a
+  seek entered meets damage on the path that the cursor's landing did not
+  (`a_seek_from_the_leaf_meets_damage_as_a_descent_does`).
+- Why: the full check reads the first and last keys of every page a seek enters, cells its
+  search mostly never touches, on every seek, though most seeks never read past their landing
+  (a point read through a cursor, an exact seek). In TN's reth exec bench on Linux it cost about
+  16 ms of a ~1.5 s peak output, 11.7 ms of it in the state root, nearly all in the cursor's
+  descent. A seek that steps on pays the full check once, for its leaf alone.
+
+The cursor's descent (`TreeCursor::descend`) parses each page's header once (`page::View::new`),
+after the fetch, identity and kind checks; the other checks and the search then read through that
+one view: along an edge the separator-range check, the empty-page checks and the move to slot 0 or
+the last slot, in that order; for a key the empty-page checks, the search, then the range check of
+the keys it compared. Right after the parse, the view prefetches the cells the level reads first:
+along an edge the first and the last key's, which the range check reads, and the slot the move
+takes (`View::prefetch_level`); for a key the cell of the search's first probe alone
+(`View::prefetch_probe` of `View::first_probe`), since its range check reads only cells the search
+compared. Those cache misses then overlap instead of following one another; a prefetch is only a
+hint, so every check, its order and its message stay. The leaf's view goes to the move that
+settles there (`Reached`), which reads its entry through it: `seek_exact`'s hit is the search's own
+`Find::Found` value, not a second read of the cell. A crossing to the next or previous leaf climbs the path to the nearest branch with a
+child beyond it (`climb`) and descends from that child (`land_beyond`).
+
+**A seek starts from the leaf the cursor is at** when the cursor is at an entry and its path is
+still the tree's: always for `Cursor` and `RoCursor` (a transaction's or a snapshot's tree does
+not change under them), and for a `TxnCursor` while its table is unchanged since its last call
+(`TreeCursor::seek` with the leaf's page; `TreeCursor::near` decides): a key between the leaf's
+first and last keys is searched in that leaf alone. Any other key, even one next to the leaf, and
+any seek of a cursor not at an entry, descend from the root, as before. The leaf's parent is not
+read to place a key just outside the leaf: a seek that misses the leaf would pay that branch fetch
+and its compares before descending anyway, and a run of forward seeks mostly lands in the leaf it
+is at, so that tier bought forward seeks nothing measurable and cost random ones.
+
+`seek`, `seek_exact` and `seek_with_key_tail` all start this way; an exact seek's key in a gap of
+the leaf is a miss, the cursor unset. These are the entries a descent from the root finds once
+the leaf's keys are known to lie inside the range all its ancestors' separators give it (the
+argument of do-not-flag items 11 and 12): a key between its first and last keys then lies there
+too, and its descent takes the cursor's own path. A leaf a seek's descent entered has had only the
+checks of the keys its search compared (above), so the seek from it first gives it the full
+range check, as a step does before reading past the landing entry (`TreeCursor::check_leaf`); a
+leaf already
+checked in full, or entered along an edge, is not checked again. A key outside the leaf trusts
+nothing of it and needs no check. The leaf is the page `Cursor` holds, `RoCursor`'s
+`Snapshot::page_again` (unchecked, do-not-flag item 14) and a `TxnCursor`'s `Writer::page` (checked). A seek
+that descends meets damage with the descent's exact message; damage in the leaf the cursor
+already holds, or on its path, is met only by those re-fetches and that one full check, as for a
+step (do-not-flag item 14). `RwCursor`'s seeks, and the re-seeks a write cursor makes after a change to its
+tree, descend from the root.
+
+**The writer skips them on pages it built.** Its descent (`write::descend_write`) trusts a page
+this transaction's writer built from checked pages and still holds private: the root when its
+holder's flag says the writer wrote it, and below a trusted page every private child. A trusted
+page gets only the identity, kind and non-empty-leaf checks, which read the header line that is
+loaded anyway. The per-fetch checks and the separator-range check run on the untrusted
+(published) pages, the only ones damage at rest or a redirected pointer can reach, and so does
+`verify_published` unless this writer stamped the page. On such a page the descent first
+prefetches the range check's two cells and the cell of the level's first probe (the hinted slot,
+else the search's), as the cursor's descent does. The rule is
+`trusted(child) = trusted(parent) && is_private(child)`. `is_private` alone is not enough, and the
+rules that close the gap are deliberate (do-not-flag item 11):
+
+- an untrusted parent (or root handle) naming a private page is `Corrupt`: a sound tree never
+  has that edge. The descents (`descend_write`, `collapse_to`), a merge's sibling reads
+  (`sibling_view`, `check_sibling_chain`) and the free walk of `clear` and `drop`
+  (`tree_pages`, which also checks a private child's identity) all apply it;
+- when the writer copies a published branch it did not stamp (where `verify_published` runs),
+  every cell whose `child_txn` equals this txn's low 32 bits must name a page whose header
+  matches the cell and whose full txn is below this one (`check_cells_naming_this_txn`).
+  Otherwise a forged cell naming a free page that this txn later allocates for another tree
+  would pass the copy and let a later put write into that tree's page. A child whose txn
+  wrapped 2^32 back passes; a free page's stale bytes and a page already private fail.
+- overflow runs follow the same rules. A run private to this transaction may leave a tree
+  only through a leaf this transaction wrote: a private run named by a leaf that is not
+  private is `Corrupt`, as is a run that overlaps private pages without being one of this
+  transaction's runs (`leaving_run`, which a replace, a delete and `tree_pages` call before
+  freeing it). The copy-time rule covers overflow cells: when the writer copies a published
+  leaf it did not stamp, every overflow cell whose `ovf_txn` equals this txn's low 32 bits
+  must name a run whose header matches the cell and whose full txn is below this one
+  (`check_cells_naming_this_txn`). Otherwise a forged cell naming a run this txn wrote for
+  another entry would let a replace or delete through the copy free that run.
+
+The range check's bounds are lazy: the descent recomputes the trusted ancestors' separators
+with `BranchView::route_at` from its path when it first reaches an untrusted page, which gives
+exactly the bounds `route` gave on the way down. A descent routed by a cursor's hint
+([Detached cursors](#detached-cursors-txncursor))
+applies these rules unchanged on every page it enters.
+
+**Every overflow value read** (`PageRead::overflow`, `overflow::checked_run`) checks the run
+against its cell before returning a byte:
+
+- the run's `n` pages lie in `2..page_count` (a checked add) and are mapped;
+- its header names it: `pgno`, kind 3, flags 0 and zero reserved bytes;
+- its header `txn` is no later than the reading snapshot's, and its low 32 bits are the cell's
+  `ovf_txn`, so a redirected or stale reference is `Corrupt`;
+- its `len` and `npages` are the ones the cell implies;
+- unless the run is private to the writer, a non-zero trailer and, **for a run of more than one
+  page, the full CRC** (`RunCrc::MultiPage`). Pages 2..n carry no header, so only the run's CRC
+  ties them to it: without it a reused or redirected middle page would return wrong data.
+
+A 1-page run is all header-checked page, so a read checks it by its header, as it checks a leaf;
+damage at rest inside it is `Env::check`'s to find, as inside a leaf. `Env::check` verifies every
+run's full CRC and its zero pad (`RunCrc::Always`, `claim_run`). The walks that only free a run
+or check its txn (`leaving_run`, `tree_pages`, the copy-time rule) check its header and identity
+and skip the CRC (`RunCrc::Skip`), since they never read the value. The multi-page rule is never wrong
+data, so the CRC stays (do-not-flag item 13).
+It costs a pass over the value. In the comparison benchmark's `big` rows
+([`engine-bench.md`](../tn-lmdb-reth/engine-bench.md#large-values-overflow-runs); macOS,
+medians of three, each value size in a fresh environment) a get takes about 1.1 us at 8 KiB
+and 2.1 us at 32 KiB at 4 KiB pages (`t4d`, runs of 3 and 9 pages), and 1.4 and 2.6 us at
+16 KiB pages (`t16d`). With the CRC skipped in an experiment, the same `t4d` and `t16d` gets took 0.34–0.40 us. A 1-page run
+has no page without a header, so its read skips the CRC as a leaf's does (do-not-flag item 3): that took
+a `t4d` 2 KiB get from 724 to 302 ns and a `t16d` 8 KiB get from 1.30 us to 271 ns.
+
+**A nested cell is `Corrupt` at every value read** (`PageRead::value`) and every key-tail read
+(the cursors' `key_tail`, behind `current_with_key_tail` and `seek_with_key_tail`): no value a
+read returns is one. Only a dup table's outer tree holds nested cells, and its reads match the
+cell itself (see [Dup tables](#dup-tables)); a cursor over a dup table is `TableKind`.
+
+**CRCs are not recomputed on every read** of a tree page. That would cost a pass over the page
+each time. The CRC is verified in these places instead:
+
+- by copy-on-write, before a page is copied (unless this writer stamped it itself), together with
+  a full `page::validate`;
+- for the tree roots at open;
+- for free-list leaves before their pages are reused;
+- for an overflow run of more than one page, on every read of its value (above);
+- by `Env::check`, for every page and every run.
+
+The public `Cursor` remembers the leaf it is at. A step inside that leaf skips the fetch: the page
+passed the per-fetch checks when the cursor entered it, and the transaction's pages cannot change
+while the cursor borrows it. Entering a leaf always runs the descent's checks, and the first read
+past a seek's landing entry the full range check (above).
+
+The owned `RoCursor` cannot hold a borrowed page between calls, so each `next` and `prev` fetches
+the page of the leaf it stands on again, by page number, through `Snapshot::page_again`: a plain
+slice of the mapping without the per-fetch checks, which that page passed when the cursor entered
+it (a snapshot's pages do not change while it lives). A seek from an entry starts from that
+leaf, fetched the same way (above). Every other move, and every leaf it enters, runs the same
+checks as `Cursor`'s.
+
+---
+
+## Open and recovery
+
+`Env::open` (`env.rs`) runs these steps:
+
+1. **Validate the options.** `options.page_size` must be a valid page size, else
+   `InvalidPageSize`, and `options.max_growth` at least `MIN_GROWTH` (1 MiB), else
+   `InvalidMaxGrowth`, even for an existing file. Nothing is created or opened before.
+2. **Create the file if it is missing or empty.** Both metas (txn 0, page count 2, empty trees)
+   are written with `pwrite` to `<path>.creating`, which is locked and truncated first. Then
+   `fdatasync_file`, rename over the path, and `fsync_directory`. If another creator holds
+   `<path>.creating` locked, the open fails with `Locked` at once, without waiting: that creator
+   holds the database. If another handle created the file meanwhile, its file is kept, and the
+   unused `<path>.creating` is removed when the name still holds the empty file this open locked.
+3. **Lock.** `flock(LOCK_EX | LOCK_NB)`, else `Locked`. A second open in the same process fails
+   too. The locked file must be the one the path names, and non-empty. A creator may rename its
+   new file over the path between this open and its lock, so the open is retried up to three
+   times, then fails with `Locked`.
+4. **Choose a meta** (`choose_meta`):
+   - Meta 0 is read at offset 0. If it is valid, meta 1 is read at its page size.
+   - If meta 0 is invalid, each P in 4K..64K is probed for meta 1 at offset P, accepted only if its
+     own page size is P. A meta 1 valid at two page sizes is `Corrupt`.
+   - The valid meta with the higher txn wins. Both valid requires equal page sizes, and equal txns
+     must be byte-identical.
+   - An `UnsupportedVersion` record in either slot refuses the file.
+   - No valid meta is `Corrupt` if any slot carries the magic, else `NotTnLmdb`.
+5. **Txn check.** A meta txn of `u64::MAX` (no next txn) is `Corrupt`.
+6. **Length check.** A file shorter than `page_count × P` is `Corrupt`. Open never falls back to
+   the older meta.
+7. **`fsync_file` once.** A crash may have left a meta in the page cache whose msync never
+   finished. What open reads must be durable before anything is built on it.
+8. **Map** inside a reservation of `max(map_reserve, file length)`, advised `MADV_RANDOM` unless
+   `readahead` is set ([Platform notes](#platform-notes); do-not-flag item 16); a remap past the reservation is advised the same way.
+9. **Check both tree roots** (`check_root`). Each root must be a tree page in range that passes
+   its full CRC and `page::validate`. Its header must name it, with `txn as u32 == root_txn` and
+   txn no later than the meta's. It must be a leaf exactly when the height is 1. The height is
+   already capped at 48 by the decode.
+
+**Open never writes to an existing file.** Every failure above leaves the file unchanged.
+Recovery is choosing a meta: there is no repair, no reinitialisation of a non-empty file, and no
+fallback past a short file. A torn or invalid slot counts as the lowest and is the first one a
+later commit overwrites.
+
+**Known limit: open cannot see a meta writeback error reported earlier.** If a meta msync fails
+(say EIO), the environment latches. On Linux the page cache may keep the new meta in a page now
+marked clean while the disk holds the slot's old bytes, and the error is reported once, to the
+file already open, not to one opened later (the "fsyncgate" pattern, common to engines that
+rely on the page cache for writeback). A reopen
+in the same boot then reads the cached meta, and step 7's `fsync_file` succeeds without writing
+it, so later commits can build on a meta the disk does not hold. A read-only open
+(`Env::open_read_only`) in the same boot reads the same cached meta, so it can report a state the
+disk does not hold. After a write error the node stops; do not reopen the file in the same boot,
+for writing or for reading. Reboot first, or copy the file to a new one. `Env::check` reads the
+same cache and cannot tell.
+
+### Read-only open
+
+`Env::open_read_only(path, options)` opens a file no writer has open, for a process that only
+reads it (a tool run while the node is stopped). It shares the steps of `Env::open` that read,
+in the same code (`choose_state`, `checked_snapshot`), and skips every one that writes:
+
+1. **Validate the page size**, as `Env::open` does. Of the other fields of `EnvOptions` only
+   `readahead` applies (step 8).
+2. **Never create.** A missing file is `Io(NotFound)`. An empty file is `NotTnLmdb` (step 4 finds
+   no meta in it). No `<path>.creating` file is made.
+3. **Lock shared** (`open_shared`): `O_RDONLY`, then `flock(LOCK_SH | LOCK_NB)`
+   (`sys::flock_shared`), else `Locked`. Read-only opens coexist; a writer's `LOCK_EX` excludes
+   them, and they exclude it (its open is `Locked`). The locked file must be the one the path
+   names, retried up to three times as in step 3 above.
+4. **Choose a meta**, 5. **txn check**, 6. **length check**: exactly as above. A damaged newest
+   meta falls back to the other valid one.
+7. **No fsync.** Nothing is built on what this open reads. A meta that a crash left in the page
+   cache unsynced is the state it reads, and a power loss afterwards can still lose that state;
+   the next `Env::open` then makes durable whichever meta it reads.
+8. **Map read-only:** one `PROT_READ` shared mapping of the file's length (`ReadOnlyFile`), with
+   no reservation and no growth, advised as in `Env::open`'s step 8. Readers reach it through the
+   same `MapView`.
+9. **Check both tree roots**, as above.
+
+The environment has no writer. `begin_rw` and `try_begin_rw` return `ReadOnly`, which does not
+latch, whether or not the environment has latched. `sync` returns `Ok(())`, and the drop does
+nothing. Every reader sees the state opened at. Gets, cursors, overflow values, `table_stat`,
+`Env::check` and `stat` work as in any environment. Damage a read or `check` finds latches the
+environment as usual (`failure()` reports it). The file is never written or synced: its bytes
+and its modification time are unchanged after the handle drops, and a mode-0444 file opens.
+
+The file must keep its length while it is open. A foreign process truncating it (outside the
+crate's single-process model) makes the next read past the new end a `SIGBUS`, under the
+read-only mapping as under a writer's. A truncation before the mapping is safe: reads are bounded
+by both the published page count and the mapped length (`MapView::slice`), so they find
+`Corrupt`.
+
+### Close
+
+An environment closes when its last `Env` clone and transaction drop (`EnvInner::drop`), in
+this order:
+
+1. **A crash stops here** (the test-only `Env::crash`): no sync, no trim.
+2. **A latched environment stops here:** its newest state may not be durable and its view of the
+   meta slots may not match the disk, so it neither syncs nor trims.
+3. **A read-only environment stops here:** it has no writer, and never writes its file.
+4. **`NoSync`: the final sync** makes the newest state durable (`Env::sync`'s steps). A failure
+   is logged (`tracing::error!`) and latches, and the close stops: no trim.
+5. **The trim** (`Writer::trim_tail`): the file is truncated to the most pages any state a meta
+   slot holds names, never fewer than the newest state's, times P, rounded up to the OS page,
+   when that is shorter than the file (`PageFile::trim_to`, a `set_len`). Each valid slot's
+   record is read back and must decode to the txn the writer holds for it, else the trim is
+   skipped; a torn or invalid slot names no state and is left out. The page count never shrinks
+   from one state to the next, so the newest state's is the largest. No sync follows: the pages
+   kept are durable already, and a power loss that undoes the truncation brings back the longer
+   file, which opens as before (step 6 of the open accepts any length of at least the meta's
+   pages). A failure is logged (`tracing::warn!`, target `tn_lmdb`) and does not latch: the file
+   only keeps its tail. The mapping stays until the file drops: every snapshot reads at most its
+   own `page_count × P` bytes, all below the new length.
+
+---
+
+## Failure latch
+
+`latch.rs` keeps the first cause and never clears it, and only the first cause is logged
+(`tracing::error!`, target `tn_lmdb`).
+
+| latches (later writes and commits return `Failed`) | does not latch |
+|---|---|
+| any error inside `commit` or `sync` (`fail`; `fail_damaged` for `Corrupt`) | `KeyTooLarge`, `KeyTooShort`, `ValueTooLarge`, `AppendOutOfOrder`, `KeyExists`, `ReadOnly` |
+| an I/O or growth error in a write (`fail`); a failed msync also poisons the file, which is never retried | `TableNotFound`, `StaleTable`, `TableKind`, `InvalidTableName`, `InvalidDupOptions`, `WrongTxn` |
+| a panic part way through a write, commit or sync (`UnwindLatch` guard) | a miss (`Ok(None)`) |
+| `Corrupt` from any read, get or cursor move (`fail_damaged`) | errors from `Env::open` (there is no environment yet) |
+| a failed `Env::check` | |
+
+After a latch, `begin_rw` and `try_begin_rw` return `Failed` (`ReadOnly` in a read-only
+environment), and reads continue on the published snapshots. `Env::failure()` reports the cause.
+A latched environment skips its close: no final sync (NoSync) and no trim ([Close](#close)).
+
+---
+
+## Concurrency rules
+
+| type | thread safety |
+|---|---|
+| `Env` | `Clone + Send + Sync`. Clones share one environment, which closes when the last clone and the last transaction drop. |
+| `RoTxn` | `Send + Sync`. It holds an `Arc` of the environment and of its snapshot, so the mapping outlives it. |
+| `RwTxn` | `Send + Sync`. It owns the boxed writer state, taken through a `Mutex` + `Condvar` hand-off. |
+| `Cursor<'t>`, `RwCursor<'t>` | borrow their transaction (`Cursor` is `Send + Sync`). |
+| `RoCursor` | `Send + Sync`, no lifetime. It owns an `Arc<RoTxn>`, so the snapshot stays readable, and its pages unreused, until the last cursor and handle of that transaction drop. |
+| `TxnCursor` | `Send + Sync`, no lifetime, and no borrow of its `RwTxn`: each call takes the transaction (`&RwTxn` for a move, `&mut RwTxn` for a write), so any number of cursors share one write transaction. A caller that shares the transaction behind handles whose methods all take `&self` wraps the `RwTxn` in a `Mutex` and holds the guard for each call; the entries a move returns borrow the guard. |
+
+- `begin_rw` blocks while another write transaction is open, from any thread. `try_begin_rw`
+  returns `None` instead. The writer returns to the environment when the `RwTxn` drops (commit
+  consumes it).
+- **Deadlock note:** a thread that holds an `RwTxn` and calls `begin_rw`, or **`Env::sync`**,
+  waits forever. `sync` needs the writer state, as `begin_rw` does. Commit or drop the transaction
+  first.
+- Readers never block the writer and the writer never blocks readers. A long-lived reader only
+  holds back page reuse, so the file grows instead.
+- Multi-process access alongside a writer is out of scope. The `flock` makes a second process's
+  open fail with `Locked`. Read-only opens (`Env::open_read_only`) take the lock shared, so any
+  number of processes may read a file no writer holds.
 
 ---
 
@@ -555,7 +1142,26 @@ descends on every delete.
   child, the page on the path, becomes the root, and the height drops by one. The old root leaves
   the tree as it is, not copied (`DeletePlan::merged_root`).
 - **Merge only.** Siblings never borrow entries from each other, and nothing is redistributed
-  (do-not-flag item 9 says why).
+  (do-not-flag item 9). Pages no delete changes are not revisited, and pages are reused through
+  the free list, so there is no compaction pass either. Why:
+  - **A merge never grows a separator, so it never splits.** It only takes cells out of parents
+    (the right page's cell of each pair, after the left cell is pointed at the survivor when the
+    sibling was on the left) and brings an existing separator down as the right page's cell-0
+    key, whose own key was empty and unused. No new or longer key enters any parent, and the
+    merged page is sized to fit before anything changes. Borrowing would move a different key up
+    as the separator, which can be longer than the one it replaces, so a delete could overflow a
+    parent and split, and its reservation would need a split cascade's worst case. Merge-only
+    keeps it to the path's copies.
+  - **A quarter is the merge threshold.** It leaves a wide gap below the half-full pages a split
+    makes, so a page does not swing between splitting and merging, and it is enough in practice: after
+    90% of a random fill is deleted at random, the leaves stay 0.40–0.47 full, against about 0.08
+    without merging (`deleting_90_percent_leaves_no_page_merge_open`).
+  - **Single-child branches are still possible**, as they were before merging. A branch that an
+    unlink or a merge leaves with one child stays so when no sibling fits into it; it is a valid
+    page (`page::validate` asks a branch for one child or more) and reads route through it. Only
+    the root gives way to a single child: `Collapse` when an unlink leaves it so, and
+    `DeletePlan::merged_root` when merges do, so `Env::check` refuses a root branch with one
+    child.
 - **A merge allocates nothing.** The survivor is always the page on the path, which copy-on-write
   copies anyway (`make_path_writable`). The sibling's cells move into it (`SplitBuf::merge` plans
   the merged page from both, `SplitBuf::write_merged` lays it out over the survivor), and the
@@ -693,10 +1299,27 @@ the set and borrows the value from the mapping.
 - **No map entry (invariant P).** A packed key has no entry in the working map (below): its cell is
   rewritten at each write, so the cell is the truth for it, and only nested keys wait for the
   flush (do-not-flag item 22).
+  Debug builds assert it in `txn::dup_entry`, and a free walk's hit count enforces it in every
+  build.
 - **The write stamp.** Every packed change (a create, rewrite, row delete, cell removal or
   promotion) moves the table's write stamp, even an in-place rewrite that leaves the outer root's
   bytes as they were: it is the only sign a dup cursor gets of a change to a key with no map
   entry. A miss, a refused write and a get move nothing.
+
+**A packed write goes to the cell at once** (do-not-flag item 22):
+
+- Why: the copy is the same either way. A set is immutable and at most `packed_max` bytes,
+  so a set held in the map would still be rebuilt on every write; writing it at once adds
+  only the outer cell's replace, which after the transaction's first write to that leaf is an
+  in-place replace in a private leaf. Nested roots are deferred (the working map, below) because their cell
+  changes on every nested write of a big key; a packed key has few rows by definition.
+- Correctness: a set held in the map would leave a stale but valid-looking cell until the
+  flush, and nothing would catch a reader that forgot the map (a stale nested root names
+  private pages, a stale set names none). Written at once, the cell is the truth for every
+  packed key, so reads, the dup cursors, the free walks, `delete_prefix` and `Env::check`
+  need no packed overlay, and the commit's flush stays nested-only.
+- The cost: each write to a packed key copies its set (at most ~1 KB at 4 KiB pages), so a
+  key's whole packed phase in a bulk append copies at most ~17 KB before it promotes.
 
 **The working map and the flush at commit.** A write transaction keeps, per dup table, a map from
 each outer key whose nested tree it has loaded or written to that tree's working root, the root's
@@ -712,6 +1335,7 @@ every reader of an outer cell inside the transaction (`get`, the free walks) loo
 first. A map hit is always a nested key, by invariant P. An abort drops the map with the transaction; the flush does no I/O, so a process death
 anywhere before the meta's msync recovers to the previous state, as always. A flush error (damage
 on an outer path) fails the commit and latches.
+Debug builds assert after the flush that every entry's cell holds its root.
 
 **Trust.** The writer's provenance trust (do-not-flag item 11) extends to nested
 trees with these rules:
@@ -889,516 +1513,34 @@ from a cell the map supersedes, and from the cell otherwise.
   set's row places by key on the follower, and of a set's only row (the cell removed) from the
   outer path cache, as for an emptied nested key.
 
+**Design choices** (do-not-flag item 21):
+
+- A bounded seek's miss (`seek_key`, `seek_dup`, `seek_dup_with_key_tail`) leaves the cursor
+  unset, as a `seek_exact` miss does, not after the end or on the next key's first row: the
+  call asks about one key, landing on the next would read that key's rows.
+- Any change to the table's write stamp, a nested-only write to another key included, makes
+  every dup cursor of the table reseek, as every `TxnCursor` of a changed table does. A
+  separate outer stamp (a reseek of the nested level alone when the outer tree did not
+  move) waits for a profile that shows the reseeks.
+- A `DupTxnCursor`'s results borrow the cursor as well as the transaction: the logical key
+  is the cursor's copy (no page holds `k ‖ s` in one piece).
+- `current_with_key_tail(t)` with `t` past the subkey gives the value `Apart`, not joined
+  in a buffer: that would copy the value, and `Apart` keeps `KeyTail`'s
+  meaning.
+- There are no borrowed dup cursors (analogs of `ReadTxn::cursor` and `RwTxn::cursor_mut`)
+  and no `delete_prefix` on the cursor: no caller needs them, and the transaction's
+  `delete_prefix` plus the reseek leaves the wipe loop's state.
+- `DupTxnCursor` shares `TxnCursor`'s checks (`Tracker`) but keeps its own `sync`,
+  `refresh`, `retarget` and `seek_call`: they move the level-specific position, and a trait
+  over both positions would sit on the plain cursor's hot path. Oracle 2b
+  (`dup_txn_cursors_and_direct_writes_match_the_composite_twin`) holds the two copies to the
+  same behaviour.
+
 **Errors.** Damage a move meets (an outer key of another width, an outer cell that is not a nested
 cell or, in a table that packs, a packed set, an empty or damaged nested root, a packed set that
 fails a check, a subkey of another length, any check of a descent) is
 `Corrupt`, latches, and leaves the cursor unset (a `DupTxnCursor` out of the deleted state too).
 `WrongTxn`, `StaleTable`, the width refusals and refused writes change nothing and do not latch.
-
----
-
-## Commit protocol
-
-**Copy-on-write in one copy.** A commit publishes private pages: the first change a write
-transaction makes to a published page copies it into a page reserved for the write
-(`write::writable`), stamps the copy with its new page number and the transaction's id, zeroes its
-trailer (dirty) and frees the original. The copy is one copy (`PageWrite::copy_published`). The
-writer borrows the published source through its own clone of the readers' `MapView` (`Writer::view`:
-the one view the file updates in place when its mapping moves, so it is never refreshed by hand),
-with exactly `PageRead::page`'s checks (`checked_page`), and writes it into the private page through
-`PageFile::page_mut`. The two slices coexist: each is formed from the mapping's raw pointer
-(`MmapRaw`) and covers exactly its own page, and they are never the same page, because
-`copy_published` refuses a private source and the destination must be private
-(do-not-flag item 2). A source past the published bytes, where the view ends, is no page of a
-committed tree, only one this transaction freed, and only damage names it: the cold
-`copy_unpublished` copies it through a buffer of its own, so its checks and messages stay
-`PageRead::page`'s. The test store (`MemStore`) copies with one `copy_within`: it has no readers.
-
-`RwTxn::commit` with `SyncMode::Durable` (`txn.rs` `Work::commit`, `env.rs`
-`Writer::make_durable`) runs these steps:
-
-| step | what |
-|---|---|
-| 0 | Latched: return `Failed`. A transaction that changed nothing returns its base txn id with no I/O. |
-| 1 | Write each changed table's root into the catalog (in name order), then save the free list (see below). |
-| 2 | Build meta M in memory: txn L+1, both roots, the page count. |
-| 3 | Stamp the CRC of every page the transaction created (they become "stamped by this writer"). A tree page's CRC skips its free gap (`page::stamp`, [Tree pages](#tree-pages-pagers)); an overflow run gets one CRC over all its pages, never one per page (`stamp_private`, `PrivatePages::units`, `stamp::Unit`), and its pages never count as stamped. Below 2 MiB of units the writer stamps each unit in turn (`stamp::stamp`). From 2 MiB (`stamp::threads`: a second thread at 2 MiB, one more per MiB, at most 8 and the CPUs the process may use) it computes the CRCs on several threads first (`Writer::unit_crcs`, `stamp::crcs`): each thread reads a contiguous share of the units, balanced by the units' bytes (not by the bytes hashed), through `PageFile::pages` slices while the writer holds the file shared, so no page changes and no `unsafe` is added; then the writer stores each CRC in unit order through `PageFile::pages_mut` (`stamp::put_crc`). The bytes, their order and the errors are the serial loop's, and the crash points are unchanged. |
-| 4 | Sync the dirty pages (`data_sync`), every page of every new run included. Runs separated by at most 64 clean pages (`MERGE_GAP`) merge into one range. If the pages form exactly one range, in at most 16 runs of adjacent pages (`MAX_RUNS`), one `msync(MS_SYNC)` of that range; otherwise one `fdatasync` of the file (do-not-flag item 10 says why). |
-| 5 | If the file grew since the last sync, run `fdatasync_file` so its size is durable. After step 4's `fdatasync` this has nothing left to do: that call made the size durable too. |
-| 6 | Copy meta M into the slot holding the lower txn (an invalid slot first; on a tie, slot 1), msync that one page, then record M's txn as the slot's. |
-| 7 | Publish: swap in the new snapshot, push `(M, Weak<Snapshot>)` on the reader queue. |
-
-Crash outcomes (L = the last durable state, M = this commit):
-
-| crash during or after | Durable recovers | NoSync recovers |
-|---|---|---|
-| steps 1–3 (memory only) | L | the last synced state |
-| step 4 or 5 | L. M's meta was never written, and L's pages are untouched, because pages reachable from either slot are never reused. | not applicable |
-| step 6, before the meta's msync completes | M if its record reached the disk with a valid CRC, else L | not applicable |
-| after step 6 | M | not applicable |
-| any time after a NoSync commit, before `Env::sync` | not applicable | the last synced state. A process crash also rolls back. |
-
-**NoSync** runs steps 1–3 and 7 only. The stamped pages accumulate in an `unsynced` page set, and
-no meta is written, so the slots stay put. `Env::sync()` runs steps 4–6 for the newest state.
-Dropping the environment calls it unless the environment is latched. Because the reuse gate uses
-the slots' txns, the durable state's pages are never overwritten, and the file stays consistent
-whatever is lost.
-
-**Abort** means dropping the `RwTxn` (or calling `abort`). The free tree was never touched, the
-pool and `next_pgno` return to the transaction's base, and its private pages and runs are simply
-unreferenced. There is no I/O.
-
-**An `Err` from commit** latches the environment (`fail_damaged` for `Corrupt`, otherwise `fail`),
-and whether the commit survives is unknown until a reopen. Validation errors (`KeyTooLarge`,
-`ValueTooLarge`, `AppendOutOfOrder`, `KeyExists`, table errors, `ReadOnly`, `WrongTxn`) happen in
-`put` and the other calls, before anything changes, and do not latch.
-
----
-
-## Free list and page reuse
-
-**During a transaction** (`alloc.rs`):
-
-- A published page that leaves a tree goes to `freed`.
-- A page the transaction itself created that leaves a tree ("loose") goes straight back to
-  `pool`.
-- An allocation takes a page from `pool`, else the next page number at the end of the file,
-  growing the file.
-- An overflow run of `n` pages (`Writer::alloc_run`, `allocate_run`) tries, in order:
-  1. the first fit in `pool`: the lowest `n` consecutive page numbers it holds (`first_fit`, which
-     sorts the pool; `n = 1` takes a page as an allocation does);
-  2. more free records that pass the gate, loaded until the pool fits or 8 records
-     (`RUN_LOAD_RECORDS`) are loaded, then the first fit again;
-  3. tail reuse: pool pages that end the file start the run, and the file grows by the rest;
-  4. the next `n` page numbers at the end of the file, in one growth.
-
-  The budget counts records, not pages: a budget of `8 · n` pages stopped after the first record,
-  which lists far more, and left runs growing the file without bound under churn while later
-  records held fits (`run_churn_keeps_the_file_bounded_heavy`). Its pages are private, and the
-  allocator also records the run (`private_runs`) for the commit's one CRC.
-- A run that leaves a tree goes back as `n` single pages (`free_run`): to `freed` if published,
-  to `pool` if this transaction created it. Free records list single pages, so a freed run's
-  pages come back one by one, as tree pages or as parts of a later run.
-- `clear_table` and `drop_table` collect every page before freeing any (`tree_pages`). Each branch
-  is read with a descent's checks and verified unless private or stamped, and its child pointers
-  follow the provenance rules of a descent (do-not-flag item 11): a page private to the
-  transaction named by a page it did not write, or by an untrusted root handle, is `Corrupt`, and
-  a private child must be the page and txn its parent names. A freed private page goes back to
-  the pool at once, so a forged pointer to a page this transaction allocated for another tree
-  must not free it. A tree whose `overflow_pages` is 0 reads its branches, its first leaf and its
-  private leaves (in memory) only. A tree with runs reads every leaf, checks each run's header,
-  identity and provenance (`leaving_run`, without the CRC: the value is not read), and requires
-  the run pages to add up to `overflow_pages`. Damage refuses the free with `Corrupt`, before any
-  page is freed.
-- When `pool` is empty, the writer refills it (`Writer::refill`). It takes free records smallest
-  first, and only while their txn is at most the **reuse gate**:
-
-  ```text
-  gate = min( txn of each valid meta slot , txn of the oldest snapshot a reader may hold )
-  ```
-
-  `Writer::reuse_gate` computes it. The oldest reader comes from the reader queue, followed by
-  `fence(Acquire)`, which pairs with the `Release` drop of each snapshot's last `Arc`.
-
-Before a record's pages are handed out, `next_record` and `decode_pages` check them:
-
-- every page on the way to the record passes its full CRC and structure checks, within its
-  ancestors' separators;
-- each page number is in `[2, page_count)`;
-- the page numbers are strictly ascending;
-- no page was already taken by this transaction.
-
-Damage is `Corrupt`, and none of the record's pages is used. The free tree itself is not changed
-while the transaction runs.
-
-A record that lists a page a tree still holds passes these checks: telling would take a walk of
-every tree. A write that hands the page out overwrites it, and a read through the old pointer
-then fails its checks (a run of more than one page fails its CRC; a tree page or a 1-page run its
-header or txn identity), so the damage is met as `Corrupt`, never as wrong data. A write that
-instead takes the page out of its tree while the page waits in the pool finds it at commit both
-free and freed (`Allocator::reusable`), which is `Corrupt` too. A `clear_table` or `drop_table`
-of the tree that holds the page, after a write in the same transaction handed it out, finds it
-private under a page the transaction did not write (`tree_pages`), `Corrupt`. In a later
-transaction, the page now published, a free of a tree without runs cannot tell (it does not read
-the leaf) and frees the page again; once a write reuses it, a read through either pointer fails
-its txn identity, `Corrupt`. A forged nested root named by two outer cells of a dup table, each
-cell written in its own transaction, is the same case. A page freed twice in one transaction (two
-pointers naming it, such as two cells naming one run) is `Corrupt` at commit
-(`Allocator::reusable`). `Env::check` reports the page as used twice.
-
-**Reuse timing.** A record's txn is the reuse gate its pages wait for: once the gate reaches it,
-no durable meta and no live reader reaches them. A page freed by txn N is listed under N, since
-N's base state still holds it. In `Durable` mode, after commit N the slots hold N−1 and N. So a
-page freed by txn N becomes reusable at txn **N+2**, once N+1 has committed and the slots hold N
-and N+1. In `NoSync` mode the slots move only at a sync, so a freed page comes back once two syncs
-have made states from N on durable in both slots.
-
-**The save at commit** (`freelist::save`) runs with loading stopped, so pages come only from the
-pool or the end of the file:
-
-1. Delete the records the transaction consumed.
-2. Write the pool, sorted and chunked by `record_capacity`, under the keys of the records
-   consumed, in order. Every pool page is free in each state a durable meta or a reader holds (a
-   page taken from a record that passed the gate, or one this transaction added to the file), and
-   every key consumed has passed the gate, so the next transaction may take these pages at once.
-3. Write the freed pages, plus any pool pages past what the keys consumed hold (only pages this
-   transaction added to the file and freed again), as records `(M, 0..k)` of the committing txn
-   M.
-4. Writing can take pool pages and free pages of the free tree, which changes both lists. So
-   write again until the records list exactly them: a fixed point.
-
-Record keys are never deleted inside the loop. A record no longer needed is written empty, so a
-round never frees a page a later round must list. Three rounds suffice. More than 8 is a broken
-invariant, which returns `Failed` and latches.
-
-Each round takes the two lists from `Allocator::reusable`. A peak commit's lists hold about as
-many pages as it wrote, so the round sorts each list once, with `alloc::sort_pages` (an LSD radix
-sort, 11 bits a pass, which skips a pass whose digit every page shares). One linear pass over the
-two sorted lists (`first_duplicate`) then finds the smallest page listed twice: twice freed
-(`Corrupt`), a loaded pool page also freed (`Corrupt`), or any other repeat (`Failed`). The pool
-pages that spill to step 3 merge into the sorted freed pages (`merge_sorted`) instead of a sort.
-The records are those a combined sort of both lists wrote, byte for byte, with the same errors:
-`reusable_matches_the_reference` (and its `_heavy` twin, on a peak commit's list sizes) holds
-`reusable` to that combined sort, kept test-only as `Allocator::reusable_reference`;
-`the_save_writes_the_records_the_reference_writes` compares whole commits' free trees, and
-`a_spill_below_the_freed_pages_is_merged_into_them` a commit whose spilled pool pages fall below
-pages it freed (a record size cut below the one the record taken was written with).
-
-**Leftover pages are reusable at once.** When a transaction consumes a record but uses only some
-of its pages, the rest stay in `pool`, and step 2 lists them again under a consumed key. No two
-records list one page: the records consumed are deleted in step 1, and their keys are free for
-step 2. Listing them under M instead made them wait two more commits, longer
-under a held reader: each commit then took more records and left more over, and under churn of a
-tenth of the pages per commit with readers held the file reached 2.5 times its live pages, against
-1.6 now (`run_churn_with_readers_keeps_the_file_bounded`).
-
-**The accounting invariant** that `Env::check` enforces after every commit in the model tests is:
-
-```text
-(pages reachable from the catalog, every table and the free tree)  ⊎  (page numbers in free records)  =  [2, page_count)
-```
-
-A table's reachable pages include every page of the overflow runs its leaves name. The union is
-disjoint: every page is used by exactly one tree, once, or listed exactly once. Any leak or double
-use is `Corrupt` naming the pages, and it latches.
-
----
-
-## Readers and snapshots
-
-A `Snapshot` holds `{ meta, geometry, view: Arc<MapView>, tables: TableRoots }`. It is published
-as an `Arc` under a `parking_lot::RwLock`. `begin_ro` clones the current one, so a reader sees one
-state of every table. The environment's own `Arc` to the current snapshot keeps the reader queue
-non-empty.
-
-**A long reader shows, at no cost to readers.** A reader holding a superseded snapshot keeps every
-page freed after it from reuse (the gate in [Free list and page reuse](#free-list-and-page-reuse)),
-so the file grows while it lives; the pages become reusable once it ends.
-`Env::oldest_reader_age() -> Option<Duration>` says how long the oldest live reader has held a
-superseded snapshot. Each entry of the writer's reader queue records when the next commit
-superseded its snapshot (one monotonic clock read per commit, in `Writer::publish`), and each
-commit, after pruning the queue, stores the oldest live entry's time in an atomic of the shared
-state. The call loads it and subtracts it from now, with no lock; `begin_ro` and a reader's drop
-do nothing for it. A reader of the current snapshot does not count, as it holds back no page a
-commit freed. The value is refreshed only at commits: between them, a reader that has ended still
-counts until the next commit. A read-only environment never commits, so it always returns `None`.
-
-**A snapshot resolves each table handle once.** `TableRoots` remembers the tree roots its
-readers resolved, in 32 slots (`OnceLock<(Table, TreeRoot)>`): a handle's slot is the first one
-from `id % 32` on, wrapping, that no other handle holds, and a hit is `Table::is`, the id and
-then the name (a handle of another file, or one of a table an aborted transaction created, whose
-id the next table created takes, may carry the same id). Every `RoTxn` on the snapshot shares
-them, so a table's catalog lookup runs once per snapshot, not once per transaction, and an
-`RoTxn` is two `Arc`s (`{ inner, snapshot }`). `RoTxn::root`, inline, checks the handle's home
-slot; `resolve_root`, out of line, probes on, then reads the catalog and remembers the root it
-resolved in the first free slot. Only a resolved handle is remembered: `StaleTable` and
-`TableNotFound` are checked again at each use. A slot is never emptied, and once every slot holds
-another handle a handle resolves through the catalog at each use, uncached. Each commit
-publishes a new snapshot with no table resolved; a read-only open has one snapshot for its life,
-so it resolves each handle once. `open_table` reads the catalog every time. Do-not-flag item 15
-says why the cache is safe.
-
-**Every page fetch** (`tree::read::checked_page`) checks:
-
-- `2 <= pgno < page_count` (the snapshot's), and the page is mapped;
-- a non-zero CRC trailer, unless the page is private to the writer;
-- the header's `pgno` equals the requested one;
-- the header's `txn` is no later than the reading snapshot's txn, so a page reused too early
-  surfaces as `Corrupt` instead of wrong data.
-
-**Every descent** (`read::descend`, the cursor's `descend`) also checks:
-
-- each child is the copy its parent names: header `pgno == child` and `txn as u32 == child_txn`.
-  This catches a pointer redirected to a stale copy that still has a valid CRC. The fetch reads
-  the header's `pgno` and `txn` once for these and the per-fetch checks
-  (`PageRead::child`, `tree::read::checked_child`).
-- a branch sits above the tree's height and a leaf at it;
-- only the root leaf may be empty;
-- keys lie within the intersection of every ancestor's separator range. A cursor's descent along
-  an edge (to the first or last entry, and every crossing) checks each page's first and last keys
-  against it; a cursor's seek, as a point read, checks only the keys its search compared: at a
-  branch the route's bounds (the separators either side of the child taken), at the leaf a miss's
-  neighbours of the key (a hit is the key itself, which the routes kept inside every range). The
-  leaf a seek lands in gets the full check before any read past its landing entry (do-not-flag
-  item 29).
-
-The cursor's descent (`TreeCursor::descend`) parses each page's header once (`page::View::new`),
-after the fetch, identity and kind checks; the other checks and the search then read through that
-one view: along an edge the separator-range check, the empty-page checks and the move to slot 0 or
-the last slot, in that order; for a key the empty-page checks, the search, then the range check of
-the keys it compared. Right after the parse, the view prefetches the cells the level reads first:
-along an edge the first and the last key's, which the range check reads, and the slot the move
-takes (`View::prefetch_level`); for a key the cell of the search's first probe alone
-(`View::prefetch_probe` of `View::first_probe`), since its range check reads only cells the search
-compared. Those cache misses then overlap instead of following one another; a prefetch is only a
-hint, so every check, its order and its message stay. The leaf's view goes to the move that
-settles there (`Reached`), which reads its entry through it: `seek_exact`'s hit is the search's own
-`Find::Found` value, not a second read of the cell. A crossing to the next or previous leaf climbs the path to the nearest branch with a
-child beyond it (`climb`) and descends from that child (`land_beyond`).
-
-**A seek starts from the leaf the cursor is at** when the cursor is at an entry and its path is
-still the tree's: always for `Cursor` and `RoCursor` (a transaction's or a snapshot's tree does
-not change under them), and for a `TxnCursor` while its table is unchanged since its last call
-(`TreeCursor::seek` with the leaf's page; `TreeCursor::near` decides): a key between the leaf's
-first and last keys is searched in that leaf alone. Any other key, even one next to the leaf, and
-any seek of a cursor not at an entry, descend from the root, as before. The leaf's parent is not
-read to place a key just outside the leaf: a seek that misses the leaf would pay that branch fetch
-and its compares before descending anyway, and a run of forward seeks mostly lands in the leaf it
-is at, so that tier bought forward seeks nothing measurable and cost random ones.
-
-`seek`, `seek_exact` and `seek_with_key_tail` all start this way; an exact seek's key in a gap of
-the leaf is a miss, the cursor unset. These are the entries a descent from the root finds once
-the leaf's keys are known to lie inside the range all its ancestors' separators give it (the
-argument of do-not-flag items 11 and 12): a key between its first and last keys then lies there
-too, and its descent takes the cursor's own path. A leaf a seek's descent entered has had only the
-checks of the keys its search compared (item 29), so the seek from it first gives it the full
-range check, as a step does before reading past the landing entry (`TreeCursor::check_leaf`: the
-path's branches fetched again for the range, which the routes of the two levels the descent
-recorded give, then the leaf's first and last keys; item 29); a leaf already
-checked in full, or entered along an edge, is not checked again. A key outside the leaf trusts
-nothing of it and needs no check. The leaf is the page `Cursor` holds, `RoCursor`'s
-`Snapshot::page_again` (unchecked, item 14) and a `TxnCursor`'s `Writer::page` (checked). A seek
-that descends meets damage with the descent's exact message; damage in the leaf the cursor
-already holds, or on its path, is met only by those re-fetches and that one full check, as for a
-step (item 14). `RwCursor`'s seeks, and the re-seeks a write cursor makes after a change to its
-tree, descend from the root.
-
-**The writer skips them on pages it built.** Its descent (`write::descend_write`) trusts a page
-this transaction's writer built from checked pages and still holds private: the root when its
-holder's flag says the writer wrote it, and below a trusted page every private child. A trusted
-page gets only the identity, kind and non-empty-leaf checks, which read the header line that is
-loaded anyway. The per-fetch checks and the separator-range check run on the untrusted
-(published) pages, the only ones damage at rest or a redirected pointer can reach, and so does
-`verify_published` unless this writer stamped the page. On such a page the descent first
-prefetches the range check's two cells and the cell of the level's first probe (the hinted slot,
-else the search's), as the cursor's descent does. See
-item 11 of the [do-not-flag list](#intentional-design-decisions-please-do-not-flag-these).
-
-**Every overflow value read** (`PageRead::overflow`, `overflow::checked_run`) checks the run
-against its cell before returning a byte:
-
-- the run's `n` pages lie in `2..page_count` (a checked add) and are mapped;
-- its header names it: `pgno`, kind 3, flags 0 and zero reserved bytes;
-- its header `txn` is no later than the reading snapshot's, and its low 32 bits are the cell's
-  `ovf_txn`, so a redirected or stale reference is `Corrupt`;
-- its `len` and `npages` are the ones the cell implies;
-- unless the run is private to the writer, a non-zero trailer and, **for a run of more than one
-  page, the full CRC** (`RunCrc::MultiPage`). Pages 2..n carry no header, so only the run's CRC
-  ties them to it: without it a reused or redirected middle page would return wrong data.
-
-A 1-page run is all header-checked page, so a read checks it by its header, as it checks a leaf;
-damage at rest inside it is `Env::check`'s to find, as inside a leaf. `Env::check` verifies every
-run's full CRC and its zero pad (`RunCrc::Always`, `claim_run`). The walks that only free a run
-or check its txn (`leaving_run`, `tree_pages`, the copy-time rule) check its header and identity
-and skip the CRC (`RunCrc::Skip`), since they never read the value. Do-not-flag item 13 gives the
-cost.
-
-**A nested cell is `Corrupt` at every value read** (`PageRead::value`) and every key-tail read
-(the cursors' `key_tail`, behind `current_with_key_tail` and `seek_with_key_tail`): no value a
-read returns is one. Only a dup table's outer tree holds nested cells, and its reads match the
-cell itself (see [Dup tables](#dup-tables)); a cursor over a dup table is `TableKind`.
-
-**CRCs are not recomputed on every read** of a tree page. That would cost a pass over the page
-each time. The CRC is verified in these places instead:
-
-- by copy-on-write, before a page is copied (unless this writer stamped it itself), together with
-  a full `page::validate`;
-- for the tree roots at open;
-- for free-list leaves before their pages are reused;
-- for an overflow run of more than one page, on every read of its value (above);
-- by `Env::check`, for every page and every run.
-
-The public `Cursor` remembers the leaf it is at. A step inside that leaf skips the fetch: the page
-passed the per-fetch checks when the cursor entered it, and the transaction's pages cannot change
-while the cursor borrows it. Entering a leaf always runs the descent's checks, and the first read
-past a seek's landing entry the full range check (item 29).
-
-The owned `RoCursor` cannot hold a borrowed page between calls, so each `next` and `prev` fetches
-the page of the leaf it stands on again, by page number, through `Snapshot::page_again`: a plain
-slice of the mapping without the per-fetch checks, which that page passed when the cursor entered
-it (a snapshot's pages do not change while it lives). A seek from an entry starts from that
-leaf, fetched the same way (above). Every other move, and every leaf it enters, runs the same
-checks as `Cursor`'s.
-
----
-
-## Open and recovery
-
-`Env::open` (`env.rs`) runs these steps:
-
-1. **Validate the options.** `options.page_size` must be a valid page size, else
-   `InvalidPageSize`, and `options.max_growth` at least `MIN_GROWTH` (1 MiB), else
-   `InvalidMaxGrowth`, even for an existing file. Nothing is created or opened before.
-2. **Create the file if it is missing or empty.** Both metas (txn 0, page count 2, empty trees)
-   are written with `pwrite` to `<path>.creating`, which is locked and truncated first. Then
-   `fdatasync_file`, rename over the path, and `fsync_directory`. If another creator holds
-   `<path>.creating` locked, the open fails with `Locked` at once, without waiting: that creator
-   holds the database. If another handle created the file meanwhile, its file is kept, and the
-   unused `<path>.creating` is removed when the name still holds the empty file this open locked.
-3. **Lock.** `flock(LOCK_EX | LOCK_NB)`, else `Locked`. A second open in the same process fails
-   too. The locked file must be the one the path names, and non-empty. A creator may rename its
-   new file over the path between this open and its lock, so the open is retried up to three
-   times, then fails with `Locked`.
-4. **Choose a meta** (`choose_meta`):
-   - Meta 0 is read at offset 0. If it is valid, meta 1 is read at its page size.
-   - If meta 0 is invalid, each P in 4K..64K is probed for meta 1 at offset P, accepted only if its
-     own page size is P. A meta 1 valid at two page sizes is `Corrupt`.
-   - The valid meta with the higher txn wins. Both valid requires equal page sizes, and equal txns
-     must be byte-identical.
-   - An `UnsupportedVersion` record in either slot refuses the file.
-   - No valid meta is `Corrupt` if any slot carries the magic, else `NotTnLmdb`.
-5. **Txn check.** A meta txn of `u64::MAX` (no next txn) is `Corrupt`.
-6. **Length check.** A file shorter than `page_count × P` is `Corrupt`. Open never falls back to
-   the older meta.
-7. **`fsync_file` once.** A crash may have left a meta in the page cache whose msync never
-   finished. What open reads must be durable before anything is built on it.
-8. **Map** inside a reservation of `max(map_reserve, file length)`, advised `MADV_RANDOM` unless
-   `readahead` is set (do-not-flag item 16); a remap past the reservation is advised the same way.
-9. **Check both tree roots** (`check_root`). Each root must be a tree page in range that passes
-   its full CRC and `page::validate`. Its header must name it, with `txn as u32 == root_txn` and
-   txn no later than the meta's. It must be a leaf exactly when the height is 1. The height is
-   already capped at 48 by the decode.
-
-**Open never writes to an existing file.** Every failure above leaves the file unchanged.
-Recovery is choosing a meta: there is no repair, no reinitialisation of a non-empty file, and no
-fallback past a short file. A torn or invalid slot counts as the lowest and is the first one a
-later commit overwrites.
-
-**Known limit: open cannot see a meta writeback error reported earlier.** If a meta msync fails
-(say EIO), the environment latches. On Linux the page cache may keep the new meta in a page now
-marked clean while the disk holds the slot's old bytes, and the error is reported once, to the
-file already open, not to one opened later (the "fsyncgate" pattern, common to engines that
-rely on the page cache for writeback). A reopen
-in the same boot then reads the cached meta, and step 7's `fsync_file` succeeds without writing
-it, so later commits can build on a meta the disk does not hold. A read-only open
-(`Env::open_read_only`) in the same boot reads the same cached meta, so it can report a state the
-disk does not hold. After a write error the node stops; do not reopen the file in the same boot,
-for writing or for reading. Reboot first, or copy the file to a new one. `Env::check` reads the
-same cache and cannot tell.
-
-### Read-only open
-
-`Env::open_read_only(path, options)` opens a file no writer has open, for a process that only
-reads it (a tool run while the node is stopped). It shares the steps of `Env::open` that read,
-in the same code (`choose_state`, `checked_snapshot`), and skips every one that writes:
-
-1. **Validate the page size**, as `Env::open` does. Of the other fields of `EnvOptions` only
-   `readahead` applies (step 8).
-2. **Never create.** A missing file is `Io(NotFound)`. An empty file is `NotTnLmdb` (step 4 finds
-   no meta in it). No `<path>.creating` file is made.
-3. **Lock shared** (`open_shared`): `O_RDONLY`, then `flock(LOCK_SH | LOCK_NB)`
-   (`sys::flock_shared`), else `Locked`. Read-only opens coexist; a writer's `LOCK_EX` excludes
-   them, and they exclude it (its open is `Locked`). The locked file must be the one the path
-   names, retried up to three times as in step 3 above.
-4. **Choose a meta**, 5. **txn check**, 6. **length check**: exactly as above. A damaged newest
-   meta falls back to the other valid one.
-7. **No fsync.** Nothing is built on what this open reads. A meta that a crash left in the page
-   cache unsynced is the state it reads, and a power loss afterwards can still lose that state;
-   the next `Env::open` then makes durable whichever meta it reads.
-8. **Map read-only:** one `PROT_READ` shared mapping of the file's length (`ReadOnlyFile`), with
-   no reservation and no growth, advised as in `Env::open`'s step 8. Readers reach it through the
-   same `MapView`.
-9. **Check both tree roots**, as above.
-
-The environment has no writer. `begin_rw` and `try_begin_rw` return `ReadOnly`, which does not
-latch, whether or not the environment has latched. `sync` returns `Ok(())`, and the drop does
-nothing. Every reader sees the state opened at. Gets, cursors, overflow values, `table_stat`,
-`Env::check` and `stat` work as in any environment. Damage a read or `check` finds latches the
-environment as usual (`failure()` reports it). The file is never written or synced: its bytes
-and its modification time are unchanged after the handle drops, and a mode-0444 file opens.
-
-The file must keep its length while it is open. A foreign process truncating it (outside the
-crate's single-process model) makes the next read past the new end a `SIGBUS`, under the
-read-only mapping as under a writer's. A truncation before the mapping is safe: reads are bounded
-by both the published page count and the mapped length (`MapView::slice`), so they find
-`Corrupt`.
-
-### Close
-
-An environment closes when its last `Env` clone and transaction drop (`EnvInner::drop`), in
-this order:
-
-1. **A crash stops here** (the test-only `Env::crash`): no sync, no trim.
-2. **A latched environment stops here:** its newest state may not be durable and its view of the
-   meta slots may not match the disk, so it neither syncs nor trims.
-3. **A read-only environment stops here:** it has no writer, and never writes its file.
-4. **`NoSync`: the final sync** makes the newest state durable (`Env::sync`'s steps). A failure
-   is logged (`tracing::error!`) and latches, and the close stops: no trim.
-5. **The trim** (`Writer::trim_tail`): the file is truncated to the most pages any state a meta
-   slot holds names, never fewer than the newest state's, times P, rounded up to the OS page,
-   when that is shorter than the file (`PageFile::trim_to`, a `set_len`). Each valid slot's
-   record is read back and must decode to the txn the writer holds for it, else the trim is
-   skipped; a torn or invalid slot names no state and is left out. The page count never shrinks
-   from one state to the next, so the newest state's is the largest. No sync follows: the pages
-   kept are durable already, and a power loss that undoes the truncation brings back the longer
-   file, which opens as before (step 6 of the open accepts any length of at least the meta's
-   pages). A failure is logged (`tracing::warn!`, target `tn_lmdb`) and does not latch: the file
-   only keeps its tail. The mapping stays until the file drops: every snapshot reads at most its
-   own `page_count × P` bytes, all below the new length.
-
----
-
-## Failure latch
-
-`latch.rs` keeps the first cause and never clears it, and only the first cause is logged
-(`tracing::error!`, target `tn_lmdb`).
-
-| latches (later writes and commits return `Failed`) | does not latch |
-|---|---|
-| any error inside `commit` or `sync` (`fail`; `fail_damaged` for `Corrupt`) | `KeyTooLarge`, `ValueTooLarge`, `AppendOutOfOrder`, `KeyExists`, `ReadOnly` |
-| an I/O or growth error in a write (`fail`); a failed msync also poisons the file, which is never retried | `TableNotFound`, `StaleTable`, `InvalidTableName`, `WrongTxn` |
-| a panic part way through a write, commit or sync (`UnwindLatch` guard) | a miss (`Ok(None)`) |
-| `Corrupt` from any read, get or cursor move (`fail_damaged`) | errors from `Env::open` (there is no environment yet) |
-| a failed `Env::check` | |
-
-After a latch, `begin_rw` and `try_begin_rw` return `Failed` (`ReadOnly` in a read-only
-environment), and reads continue on the published snapshots. `Env::failure()` reports the cause.
-A latched environment skips its close: no final sync (NoSync) and no trim ([Close](#close)).
-
----
-
-## Concurrency rules
-
-| type | thread safety |
-|---|---|
-| `Env` | `Clone + Send + Sync`. Clones share one environment, which closes when the last clone and the last transaction drop. |
-| `RoTxn` | `Send + Sync`. It holds an `Arc` of the environment and of its snapshot, so the mapping outlives it. |
-| `RwTxn` | `Send + Sync`. It owns the boxed writer state, taken through a `Mutex` + `Condvar` hand-off. |
-| `Cursor<'t>`, `RwCursor<'t>` | borrow their transaction (`Cursor` is `Send + Sync`). |
-| `RoCursor` | `Send + Sync`, no lifetime. It owns an `Arc<RoTxn>`, so the snapshot stays readable, and its pages unreused, until the last cursor and handle of that transaction drop. |
-| `TxnCursor` | `Send + Sync`, no lifetime, and no borrow of its `RwTxn`: each call takes the transaction (`&RwTxn` for a move, `&mut RwTxn` for a write), so any number of cursors share one write transaction. A caller that shares the transaction between handles (reth's `DbTxMut`, whose methods take `&self`) wraps the `RwTxn` in a `Mutex` and holds the guard for each call; the entries a move returns borrow the guard. |
-
-- `begin_rw` blocks while another write transaction is open, from any thread. `try_begin_rw`
-  returns `None` instead. The writer returns to the environment when the `RwTxn` drops (commit
-  consumes it).
-- **Deadlock note:** a thread that holds an `RwTxn` and calls `begin_rw`, or **`Env::sync`**,
-  waits forever. `sync` needs the writer state, as `begin_rw` does. Commit or drop the transaction
-  first.
-- Readers never block the writer and the writer never blocks readers. A long-lived reader only
-  holds back page reuse, so the file grows instead.
-- Multi-process access alongside a writer is out of scope. The `flock` makes a second process's
-  open fail with `Locked`. Read-only opens (`Env::open_read_only`) take the lock shared, so any
-  number of processes may read a file no writer holds.
 
 ---
 
@@ -1427,7 +1569,7 @@ A latched environment skips its close: no final sync (NoSync) and no trim ([Clos
 | `RwTxn::create_dup_table(name, DupOptions { key_len, packed_max })` | open or create a dup table: rows keyed `k ‖ s`, `k` of exactly `key_len` bytes (1 to `max_dup_key_len`, 975 at 4 KiB pages), `packed_max` 0 (never pack), 7 to `max_entry_value(key_len)` bytes, or `DupOptions::PACKED_DEFAULT` for that most (`DupOptions::packed(key_len)`), else `InvalidDupOptions`; the table records the resolved number; an existing table of the other kind or other resolved options is `TableKind` |
 | `RwTxn::drop_table(Table) / clear_table(&Table)` | free the table's pages, a dup table's nested trees included (both are copy-on-write: readers keep the old tree) |
 | `RwTxn::put / delete -> bool` | point writes; on a dup table by the logical key `k ‖ s` (a key with no subkey is `KeyTooShort`) |
-| `RwTxn::delete_prefix(&Table, k) -> u64` | a dup table's rows under the outer key `k` (exactly `key_len` bytes) removed, its nested tree freed in one walk; returns the rows removed (`TableKind` on a plain table) |
+| `RwTxn::delete_prefix(&Table, k) -> u64` | a dup table's rows under the outer key `k` (exactly `key_len` bytes) removed, its nested tree, if it has one, freed in one walk (a packed key's cell owns no page); returns the rows removed (`TableKind` on a plain table) |
 | `RwTxn::insert(table, key, value)` | put only a key the table does not hold: a present key is `KeyExists`, found by the put's own search (in the table's cached leaf, else by the descent's plan) and refused before anything changes, with no latch; a new key is stored exactly as `put` stores it |
 | `RwTxn::append(table, key, value)` | put a new last entry: `key` must sort strictly after the table's last key (an empty table takes any key), else `AppendOutOfOrder`, refused before anything changes. An append into the table's cached rightmost leaf neither descends nor searches; the cache holds the leaf of the table's last put or append in this transaction (after an append split, the new right leaf) until a page is allocated or freed, and any other append descends. |
 | `RwTxn::cursor_mut -> RwCursor` | cursor moves and prefix steps plus `put`, `append` (as `RwTxn::append`), `insert` (as `RwTxn::insert`) and `delete_current`. A put, append or insert leaves the cursor at its entry: placed from the path it wrote (after an append split, from the new path the split refills the table's path cache with), or re-sought by key after any other split; a refused one leaves the cursor where it was. A delete re-seeks by key, so after any merges the cursor is on the deleted entry's follower in a deleted state, so a walk that deletes as it goes skips nothing: `next` returns the follower without stepping past it, `current` returns it too, `prev` returns the entry before it, and another `delete_current` deletes it. Right after a delete the prefix steps compare with the deleted key: the follower (`next_in_prefix`) or the entry before (`prev_in_prefix`) if it shares the prefix, else `None` with the cursor still on the follower in the deleted state. With no follower the cursor is after the end: `next`, `current` and `delete_current` find nothing and `prev` returns the new last entry. |
@@ -1486,6 +1628,39 @@ work.
 | step times | `save_ns` (step 1: the catalog's roots and the free list's save), `stamp_ns` (step 3), `data_sync_ns` (4), `size_sync_ns` (5), `meta_sync_ns` (6); `free_list_save_rounds` (write rounds of the fixed-point save) |
 | a transaction's pages | `cow_copies`, `verifies` and `verify_ns` (checks of published pages this writer did not stamp), `pages_from_pool`, `pages_from_end` (single and run pages) |
 | free list | `records_loaded`, `refill_ns`; `runs_by_step` (the run policy's four steps); `gate_lag_sum`, `gate_lag_samples` and `max_gate_lag` (at each load of records, the writing txn minus the reuse gate: 2 in `Durable` with no reader on an old snapshot, more under a held reader or `NoSync` commits not yet synced) |
+
+### The path cache
+
+A table put or delete can skip the descent (`write::PathCache`, `write::put_cached`,
+`write::delete_cached`; do-not-flag item 12). Each table's working record caches the leaf its last put or delete
+reached on a trusted path, the path above it, and the leaf's key range `[lo, hi)` as owned
+copies. A put that did not split fills it from its own descent; an append split refills it with the new path: from the split itself when the leaf's
+parent took the separator (the usual case: the descent's path with the parent's step at its new
+last cell, then the new right leaf, which holds only the entry, its range from the key, the
+separator, with no upper bound; debug builds check it against a real descent,
+`assert_found_again`), else (a branch split or a new root) by a second, trusted descent; any
+other split leaves it empty. While the table's root is trusted and the allocator's `epoch` is
+unchanged, a put whose key lies in the range and whose entry fits goes straight into that leaf
+(through `page_mut`, so the private and poison checks stay, plus the identity check), with the
+descent's exact change and bookkeeping. A delete uses it the same way: a key in the range
+whose delete changes only that leaf (an inline value, another entry left, no merge due by
+`merge_due`, the rule `plan_merges` follows) leaves the leaf in place, and a key in the range
+that the leaf lacks is a miss there. Any other delete descends, and refills the cache after a
+delete that only took the entry out of its leaf, or after a miss whose path held only this
+transaction's pages; an unlink, a collapse, a merge or an emptied tree leaves it empty, and so
+does a miss over published pages (the descent borrows the cache's buffer), which costs the
+next write one descent and nothing else ([Deletes and merging](#deletes-and-merging)). One
+writer-wide epoch is enough because every change to
+a tree's shape or separators allocates or frees a page: a copy allocates and frees, a split
+allocates, an unlink, merge, collapse, clear or drop frees; and the epoch also moves at commit
+(`stamp_private`), `begin_txn` and abort. An in-place insert, replace or delete (one that does
+not merge) changes only its leaf, never a separator, so it leaves the cache valid. A freed page
+is reusable at once by another table in the same txn, which is exactly the move the epoch
+catches. The range is the nearest separator either side on the path, which equals the
+intersection of all of them on any path the descent accepts (debug builds assert it). The
+catalog and the free list never use a cache. A put whose value goes to an overflow run, a
+replace of a value held in one, and a delete of one, always descend: the run is allocated, or
+the old one freed, with the tree's other pages.
 
 ### Detached cursors (`TxnCursor`)
 
@@ -1565,6 +1740,9 @@ what a write does; one message differs: a delete's descent defers verification (
 so on a damaged published branch the hinted descent reads two of its cells where the search reads
 several, and the damage is met by `verify_path` on the hit, `Corrupt` before any change as the
 search's is, with that check's message.
+The hint is only routing (do-not-flag item 27). The writer does not reuse the cursor's checks of the pages it entered (the cursor read them
+under the table stamp it saw): each write still pays the per-level checks, and the hint
+saves only each level's search (one `route_at` and two key compares in its place).
 
 In the deleted state the cursor holds both keys a prefix question needs: the follower's (its
 saved key) and the deleted one (`deleted_key`). `follower_shares_prefix(n)` answers from them
@@ -1644,6 +1822,35 @@ it lands on, a multi-page overflow value in full).
   file holds no preallocated tail; a failed or skipped trim (a crash, a latched close) leaves the
   slack. Past the reservation the mapping moves to a new reservation of at least twice the size.
   Retired mappings are kept until close while a reader may hold a view of them.
+- **Linux: every mapping of the file is advised `MADV_RANDOM`** (`file::advise_access`;
+  do-not-flag item 16), unless `EnvOptions::readahead` is set: the writer's mapping at open and
+  after each remap past the reservation, and a read-only environment's. Elsewhere `readahead`
+  defaults to `true`, so no advice is given unless it is cleared. Why:
+  - A B+tree's faults are random. A descent touches one page per level, far from its
+    neighbours, so readahead mostly reads pages nothing asks for.
+  - On Linux, readahead sizes what a commit writes. The page cache holds a file in folios, and
+    readahead builds large ones; a page dirtied through a shared mapping writes back its whole
+    folio. Measured on Linux 7.1, ext4, NVMe, as disk KiB written per 4 KiB page dirtied through
+    a shared mapping and synced (2000 random pages): 439 for a file written by `write(2)` and
+    still cached (what a copy leaves), 115 after a cold full sequential read with the default
+    readahead, 4.2 after cold random reads with it, 4.0 with `MADV_RANDOM`.
+  - The advice cannot help a file already cached in large folios by buffered writes (a copy, a
+    restore written with `write(2)`). Evict such a file from the page cache before opening it
+    (sync it, then `posix_fadvise(POSIX_FADV_DONTNEED)`): a commit on a copy left cached grew
+    from 82 to 583 ms over 300 commits in one measured workload, all in its one
+    `fdatasync`, as the disk wrote 199 to 532 MiB per commit.
+  - A failed `madvise` is not an error: the advice is a hint, so it is logged (`tracing::warn!`)
+    and the mapping is used without it. Mappings are made at open and at a growth past the
+    reservation, so the log is rare.
+  - The cost is a cold scan: with no readahead, each page of a sequential scan of uncached
+    pages is its own fault and read. Set `readahead` for a workload that scans whole tables
+    cold.
+  - Why not on macOS: a page dirtied through a shared mapping there writes back its whole VM page
+    (16 KiB on Apple silicon) with or without the advice, so it saves nothing at commit, and on
+    an Apple M1 Max it made first writes into new file space slower (the comparison benchmark,
+    A B B A: large-value puts 1.13–1.32x, sequential put loops 1.05–1.07x, small-transaction
+    p99 1.5–1.7x; reads, scans and commits within the spread). Clear `readahead` to get the
+    advice there.
 - **macOS (APFS): first writes into preallocated space after an `fsync` are slow.** Writing
   through the mapping into file space reserved with `F_PREALLOCATE` before an `fsync` takes slow
   first-touch page faults: 6–24 us per 12 KiB in a standalone C test, against 1.3 us when the
@@ -1700,6 +1907,19 @@ These limits and non-goals are known:
   most `max_entry_value(key_len)` bytes, so a key past that holds a nested tree of at least one page
   (do-not-flag item 26), and one in a table with `packed_max` 0 always does. Leaf cell flags other than 0, 1 (overflow) and 2 (nested) are
   refused.
+  - At 20-byte keys, 32-byte subkeys and 4 KiB pages, keys of 18 to ~34 rows are therefore
+    left nested (do-not-flag item 26).
+  - A packed set is held to a quarter-page entry (`packed_max` at most
+    `max_entry_value(key_len)`, 987 bytes at a 20-byte key), and an outer tree holds no
+    overflow cell. A key past ~17 such rows
+    therefore nests and spends a leaf page, where a composite table (rows keyed `k ‖ s` in a
+    plain table) spends 0.52-0.99 pages: up to ~2x the composite file for that band.
+  - Closing it would need a larger bound. Sets up to the inline limit (`max_value(key_len)`,
+    about 2 KB at 4 KiB pages) would stay inline, but each row change would rebuild up to that
+    many bytes, a trade not yet measured; past it they would need overflow runs in an outer
+    tree. Over a whole state the band costs little: a random state of 1 to 20 rows per contract takes 0.286
+    pages per contract at the default bound against composite's 0.298
+    (`packed_sets_file_size_by_bound`, an ignored measurement).
 - **The inline limit is about half a page** (a leaf entry of `U / 2`): about 2 KB at 4 KiB
   pages. A value of 2–4 KB at 4 KiB pages therefore takes a run page of its own. Raising it
   further needs a new split proof (one split keeps both halves within `U` only for entries of at
@@ -1722,481 +1942,200 @@ These limits and non-goals are known:
 
 ## Intentional design decisions: please do not flag these
 
-1. **No `F_FULLFSYNC` on macOS** (see [Platform notes](#platform-notes)). The commit path is
-   msync, which is no stronger. A full drive flush per sync would cost 10–20 ms and buy nothing
-   the commits keep.
-2. **`unsafe` in five places.** Each block carries a `SAFETY:` comment.
-   - `file.rs`: a read-only open's mapping (`map`), `msync`, and the `from_raw_parts` page
-     slices. The writer's reservation is mapped by the safe `map_raw` as an `MmapRaw`, which
-     hands out only raw pointers: every page slice, the writer's and the readers', is formed from
-     the mapping's base pointer over exactly its own bytes, so no reference to the whole mapping
-     ever exists. These are sound under the single-writer model: the base is stable inside the
-     reservation, readers see only published, immutable pages, retired mappings outlive every
-     view of them, and a read-only open's shared lock keeps every writer out.
-     Copy-on-write follows the readers' pattern (`Writer::copy_published`): the writer borrows
-     the published source through its clone of the readers' view (`MapView::slice`) while it
-     writes the private destination through `page_mut`. Each slice is exactly its own page, and
-     the two are never the same page, because a private source is refused. It adds no `unsafe`.
-   - `sys.rs`: the libc calls `fsync`, `fallocate`, `fcntl(F_PREALLOCATE)`, `sysconf` and
-     `flock`, each on a live file descriptor (`sysconf` takes none).
+Each item is a deliberate choice: the decision, the reason in brief, and the section that holds the
+argument and the measurements. Code and other docs cite the items by number, so the numbers stay.
+
+1. **No `F_FULLFSYNC` on macOS.** The commit path is msync, which is no stronger, and a full drive
+   flush per sync would cost 10–20 ms and buy nothing the commits keep. See
+   [Platform notes](#platform-notes).
+2. **`unsafe` in five places**, each block with a `SAFETY:` comment:
+   - `file.rs`: a read-only open's mapping (`map`), `msync`, and the `from_raw_parts` page slices.
+     The writer's reservation is an `MmapRaw` from the safe `map_raw`, so every page slice, the
+     writer's and the readers', is formed from the base pointer over exactly its own bytes, and no
+     reference to the whole mapping exists. Sound under the single-writer model: the base is
+     stable inside the reservation, readers see only published, immutable pages, retired mappings
+     outlive every view of them, and a read-only open's shared lock keeps every writer out.
+     Copy-on-write adds no `unsafe` ([Commit protocol](#commit-protocol)).
+   - `sys.rs`: the libc calls `fsync`, `fallocate`, `fcntl(F_PREALLOCATE)`, `sysconf` and `flock`,
+     each on a live file descriptor (`sysconf` takes none).
    - `crc.rs`: the aarch64 PMULL kernel (`pmull::update`, a copy of `tn-storage`'s), called only
      after the CPU feature is detected at runtime.
-   - `page::prefetch`: a one-instruction prefetch hint (`prfm` or `prefetcht0`) that the binary
-     searches issue for the cells of their next probe, and the descents for a level's first
-     cells (`View::prefetch_level`). A hint never faults or changes memory, and
-     its address is a byte of the page.
+   - `page::prefetch`: a one-instruction prefetch hint (`prfm` or `prefetcht0`) at a byte of the
+     page, for a search's next probes and a level's first cells; a hint never faults or changes
+     memory.
    - the test-only `disk_model.rs`: a copy out of a live mapping into the model's own buffer.
-3. **Reads do not recompute tree pages' CRCs, nor a 1-page overflow run's.** The CRC is checked
-   where it matters: before copy-on-write, on the roots at open, on free-list leaves before reuse,
-   and in `Env::check`, which verifies every page and every run. The per-fetch checks (range,
-   non-zero trailer, header pgno, txn) catch misdirected and reused pages, and a 1-page run's
-   header checks (pgno, kind, txn identity, length) do the same for it. The exception is a run of
-   more than one page, whose full CRC every read verifies (item 13).
-4. **`child_txn` and `root_txn` hold only the low 32 bits of a txn.** They are a damage detector:
-   a sound tree never points at a reused page (the reuse gate guarantees it), and a pointer
-   redirected to a stale copy goes unnoticed only if that copy's txn matches modulo 2^32.
-5. **The file is longer than `page_count × P`.** That is growth slack and harmless; the meta's
-   page count is authoritative. A clean close gives the slack back (see [Close](#close)); a
-   crash, a latched close, a failed final sync or a failed trim keeps it. That is deliberate: the
-   longer file is always a valid one, while a trim whose length rests on state the close cannot
-   trust (a latched writer's slots, a meta slot that does not decode to its txn) could cut a page
-   a meta names. Fail closed: in doubt, no trim.
-6. **A torn or invalid meta slot is not repaired at open.** Open never writes. The slot counts as
-   the lowest and is the next one a commit overwrites.
-7. **Leftover pages go back under the consumed keys in page order, not each under its own
-   record's key.** A page can then sit under a key older than the record that listed it. That is
-   sound: a key's txn only has to be one the gate has passed, every key consumed had, and the gate
-   never moves back, so no state a durable meta or a reader can hold reaches the page. Pool pages
-   past what the consumed keys hold (pages the transaction added to the file and freed again) wait
-   two commits under the committing txn, as freed pages do.
+3. **Reads do not recompute a tree page's CRC, nor a 1-page overflow run's.** The per-fetch checks
+   (and a 1-page run's header checks) catch misdirected and reused pages; the CRC is checked before
+   copy-on-write, on the roots at open, on free-list leaves before reuse, and in `Env::check`. A
+   run of more than one page is the exception (item 13). See
+   [Readers and snapshots](#readers-and-snapshots).
+4. **`child_txn` and `root_txn` hold only the low 32 bits of a txn.** They are a damage detector: a
+   sound tree never points at a reused page (the reuse gate guarantees it), and a pointer
+   redirected to a stale copy goes unnoticed only if that copy's txn matches modulo 2^32. See
+   [Tree pages](#tree-pages-pagers).
+5. **The file can be longer than `page_count × P`.** That is growth slack; the meta's page count is
+   authoritative. A clean close trims it; a crash, a latched close, a failed final sync or a failed
+   trim keeps it, because the longer file is always valid while a trim whose length rests on state
+   the close cannot trust could cut a page a meta names. In doubt, no trim. See [Close](#close).
+6. **A torn or invalid meta slot is not repaired at open.** Open never writes; the slot counts as
+   the lowest and is the next one a commit overwrites. See [Open and recovery](#open-and-recovery).
+7. **Leftover pages go back under the consumed keys in page order, not each under its own record's
+   key.** A key's txn only has to be one the gate has passed, and the gate never moves back. Pool
+   pages past what the consumed keys hold wait under the committing txn, as freed pages do. See
+   [Free list and page reuse](#free-list-and-page-reuse).
 8. **`Env::sync` blocks while a write transaction is open.** It needs the writer state, so calling
-   it while holding an `RwTxn` deadlocks. This is documented, not guarded.
-9. **Merging is merge-only, at a quarter, and local** (see
-   [Deletes and merging](#deletes-and-merging)). A page a delete changes absorbs a same-parent
-   sibling only while it holds under a quarter of `U`, and only when the pair fits one page.
-   Nothing is borrowed or redistributed between siblings, and pages no delete changes are not
-   revisited. Pages are reused through the free list, so there is no compaction pass either. Why:
-   - **A merge never grows a separator, so it never splits.** It only takes cells out of parents
-     (the right page's cell of each pair, after the left cell is pointed at the survivor when the
-     sibling was on the left) and brings an existing separator down as the right page's cell-0
-     key, whose own key was empty and unused. No new or longer key enters any parent, and the
-     merged page is sized to fit before anything changes. Borrowing would move a different key up
-     as the separator, which can be longer than the one it replaces, so a delete could overflow a
-     parent and split, and its reservation would need a split cascade's worst case. Merge-only
-     keeps it to the path's copies.
-   - **A quarter is the merge threshold.** It leaves a wide gap below the half-full pages a split
-     makes, so a page does not swing between splitting and merging, and it is enough in practice: after
-     90% of a random fill is deleted at random, the leaves stay 0.40–0.47 full, against about 0.08
-     without merging (`deleting_90_percent_leaves_no_page_merge_open`).
-   - **Single-child branches are still possible**, as they were before merging. A branch that an
-     unlink or a merge leaves with one child stays so when no sibling fits into it; it is a valid
-     page (`page::validate` asks a branch for one child or more) and reads route through it. Only
-     the root gives way to a single child: `Collapse` when an unlink leaves it so, and
-     `DeletePlan::merged_root` when merges do, so `Env::check` refuses a root branch with one
-     child.
-10. **Step 4 is one sync: an `msync` of one range, or one `fdatasync` of the file.** Dirty pages
-    that merge into one range (gaps of at most 64 clean pages, at most 16 runs) take one `msync`
-    of it; any other set takes one `fdatasync`. Why (the numbers are in
-    [Step 4](#step-4-one-msync-or-one-fdatasync)):
-    - On Linux every `msync(MS_SYNC)` runs the file system's fsync path, drive-cache flush
-      included, so a commit of k ranges synced range by range pays k flushes, and one `fdatasync`
-      pays one. One `fdatasync` beat the per-range msyncs in every small-commit cell measured.
-    - A one-range bulk commit keeps the `msync`: on macOS one `fdatasync` of it cost 15–26% more,
-      and on Linux the one `msync` is a single flush too.
-    - Past 16 runs, even runs that merge into one range take the `fdatasync`: on macOS an msync
-      of a scattered range is about three times slower.
-
-    `fdatasync` also writes any other dirty page of the file. At a commit, that can only be a page
-    of an aborted transaction, which is a free page, so writing it is harmless. A crash test can no
-    longer stop a commit between data ranges, because there is one sync; partial writeback of the
-    dirty pages is still modelled by `power_loss_random`, and the crash matrix runs every point
-    on both paths (`Writer::data_by_msync`).
-11. **The writer trusts its own pages by provenance** (`write::descend_write`):
-    `trusted(child) = trusted(parent) && is_private(child)`, and the root is trusted only when its
-    holder's flag says this txn's writer wrote it. Trusted pages skip the per-fetch checks,
-    `verify_published` and the separator-range check. `is_private` alone is not enough, and the
-    rules that close the gap are deliberate:
-    - an untrusted parent (or root handle) naming a private page is `Corrupt`: a sound tree never
-      has that edge. The descents (`descend_write`, `collapse_to`), a merge's sibling reads
-      (`sibling_view`, `check_sibling_chain`) and the free walk of `clear` and `drop`
-      (`tree_pages`, which also checks a private child's identity) all apply it;
-    - when the writer copies a published branch it did not stamp (where `verify_published` runs),
-      every cell whose `child_txn` equals this txn's low 32 bits must name a page whose header
-      matches the cell and whose full txn is below this one (`check_cells_naming_this_txn`).
-      Otherwise a forged cell naming a free page that this txn later allocates for another tree
-      would pass the copy and let a later put write into that tree's page. A child whose txn
-      wrapped 2^32 back passes; a free page's stale bytes and a page already private fail.
-    - overflow runs follow the same rules. A run private to this transaction may leave a tree
-      only through a leaf this transaction wrote: a private run named by a leaf that is not
-      private is `Corrupt`, as is a run that overlaps private pages without being one of this
-      transaction's runs (`leaving_run`, which a replace, a delete and `tree_pages` call before
-      freeing it). The copy-time rule covers overflow cells: when the writer copies a published
-      leaf it did not stamp, every overflow cell whose `ovf_txn` equals this txn's low 32 bits
-      must name a run whose header matches the cell and whose full txn is below this one
-      (`check_cells_naming_this_txn`). Otherwise a forged cell naming a run this txn wrote for
-      another entry would let a replace or delete through the copy free that run.
-
-    The range check's bounds are lazy: the descent recomputes the trusted ancestors' separators
-    with `BranchView::route_at` from its path when it first reaches an untrusted page, which gives
-    exactly the bounds `route` gave on the way down. A descent routed by a cursor's hint (item 27)
-    applies these rules unchanged on every page it enters.
-12. **A table put or delete can skip the descent** (`write::PathCache`, `write::put_cached`,
-    `write::delete_cached`). Each table's working record caches the leaf its last put or delete
-    reached on a trusted path, the path above it, and the leaf's key range `[lo, hi)` as owned
-    copies. A put that did not split fills it from its own descent; an append split refills it with the new path: from the split itself when the leaf's
-    parent took the separator (the usual case: the descent's path with the parent's step at its new
-    last cell, then the new right leaf, which holds only the entry, its range from the key, the
-    separator, with no upper bound; debug builds check it against a real descent,
-    `assert_found_again`), else (a branch split or a new root) by a second, trusted descent; any
-    other split leaves it empty. While the table's root is trusted and the allocator's `epoch` is
-    unchanged, a put whose key lies in the range and whose entry fits goes straight into that leaf
-    (through `page_mut`, so the private and poison checks stay, plus the identity check), with the
-    descent's exact change and bookkeeping. A delete uses it the same way: a key in the range
-    whose delete changes only that leaf (an inline value, another entry left, no merge due by
-    `merge_due`, the rule `plan_merges` follows) leaves the leaf in place, and a key in the range
-    that the leaf lacks is a miss there. Any other delete descends, and refills the cache after a
-    delete that only took the entry out of its leaf, or after a miss whose path held only this
-    transaction's pages; an unlink, a collapse, a merge or an emptied tree leaves it empty, and so
-    does a miss over published pages (the descent borrows the cache's buffer), which costs the
-    next write one descent and nothing else ([Deletes and merging](#deletes-and-merging)). One
-    writer-wide epoch is enough because every change to
-    a tree's shape or separators allocates or frees a page: a copy allocates and frees, a split
-    allocates, an unlink, merge, collapse, clear or drop frees; and the epoch also moves at commit
-    (`stamp_private`), `begin_txn` and abort. An in-place insert, replace or delete (one that does
-    not merge) changes only its leaf, never a separator, so it leaves the cache valid. A freed page
-    is reusable at once by another table in the same txn, which is exactly the move the epoch
-    catches. The range is the nearest separator either side on the path, which equals the
-    intersection of all of them on any path the descent accepts (debug builds assert it). The
-    catalog and the free list never use a cache. A put whose value goes to an overflow run, a
-    replace of a value held in one, and a delete of one, always descend: the run is allocated, or
-    the old one freed, with the tree's other pages.
-13. **Every read of an overflow value held in a run of more than one page verifies the run's full
-    CRC** (`RunCrc::MultiPage`), so a get of such a value reads all its bytes. Pages 2..n of a run
-    carry no header: a middle page reused or redirected by damage passes every header check of
-    the first page, and only the CRC catches it. The rule is never wrong data, so the CRC stays.
-    It costs a pass over the value. In the comparison benchmark's `big` rows
-    ([`engine-bench.md`](../tn-lmdb-reth/engine-bench.md#large-values-overflow-runs); macOS,
-    medians of three, each value size in a fresh environment) a get takes about 1.1 us at 8 KiB
-    and 2.1 us at 32 KiB at 4 KiB pages (`t4d`, runs of 3 and 9 pages), and 1.4 and 2.6 us at
-    16 KiB pages (`t16d`). With the CRC skipped in an experiment, the same `t4d` and `t16d` gets took 0.34–0.40 us. A 1-page run
-    has no page without a header, so its read skips the CRC as a leaf's does (item 3): that took
-    a `t4d` 2 KiB get from 724 to 302 ns and a `t16d` 8 KiB get from 1.30 us to 271 ns.
+   it while holding an `RwTxn` deadlocks. This is documented, not guarded. See
+   [Concurrency rules](#concurrency-rules).
+9. **Merging is merge-only, at a quarter, and local.** Nothing is borrowed or redistributed, pages
+   no delete changes are not revisited, and there is no compaction pass. A merge never grows a
+   separator, so a delete never splits and reserves only its path's copies; a quarter leaves a wide
+   gap below a split's half-full pages. See [Deletes and merging](#deletes-and-merging).
+10. **Step 4 is one sync:** one `msync` when the dirty pages merge into one range of at most 16
+    runs, else one `fdatasync` of the file. On Linux every msync takes the fsync path, drive-cache
+    flush included, so syncing k ranges one by one paid k flushes. See
+    [Commit protocol](#commit-protocol) and [Step 4](#step-4-one-msync-or-one-fdatasync).
+11. **The writer trusts its own pages by provenance** (`write::descend_write`): a trusted page skips
+    the per-fetch checks, `verify_published` and the separator-range check. `is_private` alone is
+    not enough; the rules that close the gap (an untrusted parent naming a private page is
+    `Corrupt`, the copy-time `check_cells_naming_this_txn`, the same for overflow runs) and the lazy
+    range bounds are in [Readers and snapshots](#readers-and-snapshots).
+12. **A table put or delete can skip the descent** (`write::PathCache`): each table's working record
+    caches the leaf its last write reached. One writer-wide epoch guards it, because every change to
+    a tree's shape or separators allocates or frees a page. See [The path cache](#the-path-cache).
+13. **Every read of a value in a run of more than one page verifies the run's full CRC**
+    (`RunCrc::MultiPage`). Pages 2..n carry no header, so only the CRC catches a reused or
+    redirected middle page, and the rule is never wrong data. The cost per read is in
+    [Readers and snapshots](#readers-and-snapshots).
 14. **An owned cursor's step and seek re-fetch its leaf without the per-fetch checks**
-    (`Snapshot::page_again`, used by `RoCursor::next`, `prev`, `current_with_key_tail`, `seek`,
-    `seek_exact` and `seek_with_key_tail`). The page number is the one the
-    cursor's descent entered with the per-fetch checks, and a snapshot's published pages never
-    change while an `Arc` of it lives (the reuse gate holds them), so the checks would see the same
-    bytes and pass again. `Cursor` relies on the same fact when it keeps the page slice itself, for
-    its steps and its seeks. A seek settles in that leaf only for a key between its first and last
-    keys, after the leaf's full range check if a seek's descent entered it (item 29); any other
-    seek descends from the root with every check, so damage in the leaf the cursor holds meets a
-    later seek only if the seek descends or makes that check ([Readers and
-    snapshots](#readers-and-snapshots)). Leaves the cursor enters, and every other move, run the
-    descent's checks. A safe slice re-derived from the mapping replaces a cached raw pointer, so the
-    owned cursor adds no `unsafe`.
-15. **A snapshot resolves each table handle once** (`TableRoots`, see [Readers and
-    snapshots](#readers-and-snapshots)). Later transactions on the snapshot take the remembered root
-    without reading the catalog again. A snapshot's catalog never changes while an `Arc` of it lives
-    (the reuse gate holds its pages), so a second lookup would read the same bytes, pass the same
-    checks and give the same root. Only a resolved handle is remembered, so a refused one
-    (`StaleTable`, `TableNotFound`) is checked again at each use, and a hit compares the name as
-    well as the id (`Table::is`), so a handle with the same id and another name misses: one of
-    another file, or one of a table an aborted transaction created (the next table created takes its
-    id). Each commit publishes a new snapshot with nothing remembered, so every handle is checked
-    against each new catalog. Damage in the catalog is met by the first resolve in each snapshot and
-    by every `open_table`, which never uses the cache.
-16. **On Linux every mapping of the file is advised `MADV_RANDOM`** (`file::advise_access`),
-    unless `EnvOptions::readahead` is set: the writer's mapping at open and after each remap past
-    the reservation, and a read-only environment's. Elsewhere `readahead` defaults to `true`, so no
-    advice is given unless it is cleared. Why:
-    - A B+tree's faults are random. A descent touches one page per level, far from its
-      neighbours, so readahead mostly reads pages nothing asks for.
-    - On Linux, readahead sizes what a commit writes. The page cache holds a file in folios, and
-      readahead builds large ones; a page dirtied through a shared mapping writes back its whole
-      folio. Measured on Linux 7.1, ext4, NVMe, as disk KiB written per 4 KiB page dirtied through
-      a shared mapping and synced (2000 random pages): 439 for a file written by `write(2)` and
-      still cached (what a copy leaves), 115 after a cold full sequential read with the default
-      readahead, 4.2 after cold random reads with it, 4.0 with `MADV_RANDOM`.
-    - The advice cannot help a file already cached in large folios by buffered writes (a copy, a
-      restore written with `write(2)`). Evict such a file from the page cache before opening it
-      (sync it, then `posix_fadvise(POSIX_FADV_DONTNEED)`): a commit on a copy left cached grew
-      from 82 to 583 ms over 300 commits in one measured workload, all in its one
-      `fdatasync`, as the disk wrote 199 to 532 MiB per commit.
-    - A failed `madvise` is not an error: the advice is a hint, so it is logged (`tracing::warn!`)
-      and the mapping is used without it. Mappings are made at open and at a growth past the
-      reservation, so the log is rare.
-    - The cost is a cold scan: with no readahead, each page of a sequential scan of uncached
-      pages is its own fault and read. Set `readahead` for a workload that scans whole tables
-      cold.
-    - Why not on macOS: a page dirtied through a shared mapping there writes back its whole VM page
-      (16 KiB on Apple silicon) with or without the advice, so it saves nothing at commit, and on
-      an Apple M1 Max it made first writes into new file space slower (the comparison benchmark,
-      A B B A: large-value puts 1.13–1.32x, sequential put loops 1.05–1.07x, small-transaction
-      p99 1.5–1.7x; reads, scans and commits within the spread). Clear `readahead` to get the
-      advice there.
-17. **A new page is not zero-filled, and copy-on-write copies a page outside its free gap, so
-    the gap holds old bytes** (`PageWrite::alloc`, `tree::write::copy_page`,
-    [Tree pages](#tree-pages-pagers)). A free gap, and an empty page's unwritten bytes (all of it
-    past the header up to the trailer), hold whatever the page held before. That can be bytes of
-    a freed page, including data since deleted. A copy-on-write copy writes the source's header
-    and slots, then its cells and trailer; the gap between them keeps the destination's old
-    bytes.
-    - The bytes are not covered by the page CRC (item 28), are the same for the same history of
-      operations (two files driven through the same writes stay byte-identical), and are never
-      read: no read, `page::validate` or `Env::check` looks between the slot array and `upper`.
-    - Why: zero-filling cost a page-sized `memset` per allocation, about 4.7% of a busy output in
-      a macOS profile. A fresh layout writes every byte it relies on itself (`page::init_header`
-      writes the header and the trailer, then the cells and slots follow; `overflow::encode_run`
-      writes a run whole). Copying the gap too cost 3.4% and 1.8% per call on two Linux rewrite
-      benchmarks (history-shaped and dup-shaped rewrites of existing pages).
-    - The copy's source passed the fetch checks and, unless this writer stamped it, its CRC and
-      `page::validate`, so its slots end at or below `upper` and `upper` at or below the trailer
-      (`page::hdr`'s check); a header outside those bounds, which no caller passes, is copied
-      whole, so the checks after the copy see the source's bytes. The leaf and branch mutators
-      that grow into the gap (`reserve`, `shift_front`) write every byte they hand out before it
-      is read.
-    - Debug builds fill every page and run that `PageWrite::alloc` and `alloc_run` hand out with
-      `tree::POISON` (0xA5), so the whole test suite runs every layout, and every copy (both
-      stores copy through `copy_page`), over garbage, and a reliance on zeros or on a copied gap
-      fails it.
-    - A page taken from the file end still gets one byte written when it is allocated, so pages
-      are first written in allocation order (see the macOS note in
-      [Platform notes](#platform-notes)). That store is not a fill and promises nothing.
-    - Deleted values can stay on disk in gaps until those pages are rewritten, as they already
-      could in free pages and in the gap a delete leaves. The engine makes no secure-delete
-      promise.
+    (`Snapshot::page_again`). The cursor's descent entered the page with them, and a snapshot's
+    published pages never change while an `Arc` of it lives, so the checks would pass again. See
+    [Readers and snapshots](#readers-and-snapshots).
+15. **A snapshot resolves each table handle once** (`TableRoots`). Its catalog cannot change while
+    it lives, so a second lookup would give the same root; only a resolved handle is remembered, and
+    a hit compares the name as well as the id. See [Readers and snapshots](#readers-and-snapshots).
+16. **On Linux every mapping of the file is advised `MADV_RANDOM`** (`file::advise_access`) unless
+    `EnvOptions::readahead` is set; elsewhere `readahead` defaults to `true`. A B+tree's faults are
+    random, and on Linux readahead's large folios multiply what a commit writes back. A failed
+    `madvise` is logged, not an error. See [Platform notes](#platform-notes).
+17. **A new page is not zero-filled, and copy-on-write copies a page outside its free gap, so the
+    gap holds old bytes** (`PageWrite::alloc`, `tree::write::copy_page`). Nothing reads the gap and
+    the CRC skips it (item 28); zero-filling cost a page-sized `memset` per allocation. Debug builds
+    poison new pages, so a reliance on zeros fails the tests. There is no secure-delete promise. See
+    [Tree pages](#tree-pages-pagers).
 18. **Inside a write transaction a dup table's outer cell can name a superseded nested root**
-    (`Work::flush_nested`, see [Dup tables](#dup-tables)).
-    - Why: a nested write changes only its nested tree and the transaction's map entry for the
-      key; the outer cell is rewritten once per changed key, at commit. Rewriting it on every
-      write would copy and rewrite the outer path per row.
-    - The map is the truth for its key until commit: every key whose tree the transaction
-      created or changed keeps its entry until commit or the key's removal, entries are never
-      evicted, and every reader of an outer cell inside the transaction looks in the map first.
-      A stale cell's root may even name pages since freed and reused; nothing follows it.
-    - A packed set is never stale: a packed key has no map entry and its cell is rewritten at
-      each write (item 22).
-    - Published outer pages never hold a stale cell: the flush runs before step 1, and a cell on
-      a published page is committed. Debug builds assert after the flush that every entry's cell
-      holds its root.
-19. **A dup table created with `packed_max` 0 holds every outer key in a nested tree of at least
-    one page.**
-    - Why: 0 asks for no packing, and such a table takes exactly the code and the messages it
-      took before packed sets existed (`Cells::Outer`, an inline outer cell `Corrupt`). A key
-      with one row costs a leaf page of its own. `DupOptions::packed` gives the bound that packs
-      most; the reth adapter creates every engine dup table with it.
+    (`Work::flush_nested`). The outer cell is rewritten once per changed key, at commit, not per
+    row; until then the working map is the truth for its key, and every reader of an outer cell in
+    the transaction looks there first. Published outer pages never hold a stale cell. See
+    [Dup tables](#dup-tables).
+19. **A dup table created with `packed_max` 0 holds every outer key in a nested tree of at least one
+    page.** 0 asks for no packing, and such a table runs exactly the code and the messages it ran
+    before packed sets existed (`Cells::Outer`). `DupOptions::packed` gives the bound that packs
+    most. See [Dup tables](#dup-tables).
 20. **A write transaction keeps one path cache per outer key it writes** (the boxed
-    `write::PathCache` of each map entry, about 1 KiB).
-    - Why: keys written in turn each keep their own cached leaf, so interleaved keys do not
-      evict each other's path; the map's entries are never evicted (item 18).
-    - The memory is bounded by the transaction's own work: every such key already owns at
-      least one private page (a new tree's leaf, or the copy of a committed tree's leaf), so the
-      map stays a fraction of the transaction's dirty pages, and it drops at commit or abort. A
-      packed key has no entry and no path cache of its own (item 22).
-21. **The dup cursors' shape** (`DupRoCursor`, `DupTxnCursor`, see [Dup cursors](#dup-cursors)).
-    - A bounded seek's miss (`seek_key`, `seek_dup`, `seek_dup_with_key_tail`) leaves the cursor
-      unset, as a `seek_exact` miss does, not after the end or on the next key's first row: the
-      call asks about one key, landing on the next would read that key's rows, and the reth
-      adapter treats a missed `seek_by_key_subkey` as a miss whatever the cursor's state.
-    - Any change to the table's write stamp, a nested-only write to another key included, makes
-      every dup cursor of the table reseek, as every `TxnCursor` of a changed table does. A
-      separate outer stamp (a reseek of the nested level alone when the outer tree did not
-      move) waits for a profile that shows the reseeks.
-    - A `DupTxnCursor`'s results borrow the cursor as well as the transaction: the logical key
-      is the cursor's copy (no page holds `k ‖ s` in one piece). The adapter's write cursor
-      reborrows both for each call.
-    - `current_with_key_tail(t)` with `t` past the subkey gives the value `Apart`, not joined
-      in a buffer: that would copy the value, `Apart` keeps `KeyTail`'s meaning, and the
-      adapter asks only `t = |s|`.
-    - There are no borrowed dup cursors (analogs of `ReadTxn::cursor` and `RwTxn::cursor_mut`)
-      and no `delete_prefix` on the cursor: no caller needs them, and the transaction's
-      `delete_prefix` plus the reseek leaves the wipe loop's state.
-    - `DupTxnCursor` shares `TxnCursor`'s checks (`Tracker`) but keeps its own `sync`,
-      `refresh`, `retarget` and `seek_call`: they move the level-specific position, and a trait
-      over both positions would sit on the plain cursor's hot path. Oracle 2b
-      (`dup_txn_cursors_and_direct_writes_match_the_composite_twin`) holds the two copies to the
-      same behaviour.
+    `write::PathCache` of each map entry, about 1 KiB), so keys written in turn do not evict each
+    other's path, and map entries are never evicted (item 18). The memory is bounded by the
+    transaction's own work: every such key already owns a private page, and the map drops at commit
+    or abort. A packed key has no entry and no path cache of its own (item 22).
+21. **The dup cursors' shape:** a bounded seek's miss leaves the cursor unset; any change to the
+    table's write stamp reseeks every dup cursor of it; a `DupTxnCursor`'s results borrow the cursor
+    too; a key tail past the subkey is `Apart`; there are no borrowed dup cursors and no cursor
+    `delete_prefix`; `DupTxnCursor` keeps its own sync and reseek code beside `TxnCursor`'s. The
+    reasons are in [Dup cursors](#dup-cursors).
 22. **A packed write rewrites the key's outer cell at once; packed sets never enter the
-    transaction's map** (`txn::dup_entry`, `write::put_outer_cell` with `OuterCell::Packed`).
-    - Why: the copy is the same either way. A set is immutable and at most `packed_max` bytes,
-      so a set held in the map would still be rebuilt on every write; writing it at once adds
-      only the outer cell's replace, which after the transaction's first write to that leaf is an
-      in-place replace in a private leaf. Nested roots are deferred (item 18) because their cell
-      changes on every nested write of a big key; a packed key has few rows by definition.
-    - Correctness: a set held in the map would leave a stale but valid-looking cell until the
-      flush, and nothing would catch a reader that forgot the map (a stale nested root names
-      private pages, a stale set names none). Written at once, the cell is the truth for every
-      packed key, so reads, the dup cursors, the free walks, `delete_prefix` and `Env::check`
-      need no packed overlay, and the commit's flush stays nested-only.
-    - Invariant P: a key whose outer cell is a packed set has no map entry. Entries come only
-      from a nested cell, a nested create and a promotion, and leave with their cell. Debug
-      builds assert it in `txn::dup_entry`; a free walk's hit count enforces it in every build.
-    - The cost: each write to a packed key copies its set (at most ~1 KB at 4 KiB pages), so a
-      key's whole packed phase in a bulk append copies at most ~17 KB before it promotes.
-23. **A read checks only the packed rows it touches** (see [Packed sets](#packed-sets)).
-    - `get` runs `PackedView::new` (O(1)) and the rows its binary search probes; a cursor checks
-      each row it steps to, and its order against the row before. Every write that decodes a
-      set, the free walks and `Env::check` validate the whole set first.
-    - Why: damage is `Corrupt` at first use, at the granularity of what the read touches, the
-      rule pages and the subkey width checks follow. The whole check on every get would cost
-      several times the lazy one on a full set (estimated ~150-250 ns against ~30-40 ns at a
-      2 KB set), up to half again a packed get's outer descent.
-    - The exposure: a misorder off a get's probe path passes that get
-      (`the_lazy_checks_refuse_what_they_touch` pins it); a write to the key, a cursor's walk of
-      it or `Env::check` refuses it.
-24. **A nested key never demotes.** A key past its table's bound moves its rows to a nested tree
-    and stays nested however few rows it keeps, one included (`a_nested_key_never_demotes`).
-    - Why: a key that shrinks under the bound and grows past it in turn would rebuild its rows
-      each time; a nested key with few rows costs one leaf, as every key did before packed sets.
-      A demotion would also need a path that turns a map entry back into a cell, against
-      invariant P (item 22).
-    - A key whose last row is deleted leaves with its cell; a later put creates it afresh,
-      packed if its first row fits, in the same transaction too
-      (`a_nested_key_emptied_then_recreated_is_packed_in_one_txn`). That is a new key, not a
-      demotion.
-25. **A packed set is not checked at page validation or copy-on-write.**
-    - `page::validate` cannot tell a dup table's outer leaf from any other leaf, so a flags-0
-      value is an ordinary inline value there. `check_cells_naming_this_txn` (copy-on-write and a
-      merge of a published outer leaf) skips a set under `Cells::Packing`: it names no page, so
-      the provenance check has nothing to look at, its bytes are under the page CRC
-      `verify_published` checks just before, and the page mutators never parse it, so a bad set
-      cannot make them write a bad page.
-    - Checking every set of a copied leaf would be cheap, but would make copy-on-write the first
-      use of keys the writer never touched, unlike every other cell kind. Each set is checked at
-      its own first use (item 23).
-26. **Keys of 18 to ~34 rows are left nested** (PlainStorageState's shape: 20-byte keys, 32-byte
-    subkeys, 4 KiB pages).
-    - A packed set is held to a quarter-page entry (`packed_max` at most
-      `max_entry_value(key_len)`, 987 bytes at a 20-byte key), and an outer tree holds no
-      overflow cell. A key past ~17 such rows
-      therefore nests and spends a leaf page, where a composite table (rows keyed `k ‖ s` in a
-      plain table) spends 0.52-0.99 pages: up to ~2x the composite file for that band.
-    - Closing it would need a larger bound. Sets up to the inline limit (`max_value(key_len)`,
-      about 2 KB at 4 KiB pages) would stay inline, but each row change would rebuild up to that
-      many bytes, a trade not yet measured; past it they would need overflow runs in an outer
-      tree. Over a whole state the band costs little: a random state of 1 to 20 rows per contract takes 0.286
-      pages per contract at the default bound against composite's 0.298
-      (`packed_sets_file_size_by_bound`, an ignored measurement).
-27. **A write through a positioned cursor routes by the cursor's slots** (`write::Hint`,
-    `write::descend_write`, `TxnCursor`, `DupTxnCursor`; see [Detached
-    cursors](#detached-cursors-txncursor) and [Dup cursors](#dup-cursors)). A reader's path is
-    used by a writer, and that is sound because the hint is only routing:
-    - it carries slots, no page number: every page is reached from the write's own root through
-      cells the descent read, so a hint from another tree, a stale one or a forged one can name no
-      page;
-    - a hinted cell is followed only when the key lies in that child's range (its cell's key and
-      the next cell's), the range a search's route gives on a branch whose keys ascend, and a
-      leaf's hinted slot only when it holds the key; anything else is a refusal, and the search
-      takes over from that level down;
-    - every check of the write descent runs on every page it enters, in the same order (the
-      provenance rule of item 11, the per-fetch checks, identity, kind, `verify_published`,
-      `check_cells_naming_this_txn`, `keys_in_range`), so the hint never trusts a page the
-      search would check. A hinted delete's damage on an unverified published branch is met by
-      `verify_path` on the hit, with that check's message, `Corrupt` before any change as the
-      search's is.
-    The writer does not reuse the cursor's checks of the pages it entered (the cursor read them
-    under the table stamp it saw): each write still pays the per-level checks, and the hint
-    saves only each level's search (one `route_at` and two key compares in its place).
-28. **A tree page's free gap is not covered by its CRC** (`page::crc`, `page::free_gap`,
-    [Tree pages](#tree-pages-pagers)). The trailer hashes the header and the slots, then the
-    cells. A changed byte inside the gap goes unnoticed, and that is harmless:
-    - nothing reads the gap: no read, `page::validate`, `Env::check` or copy-on-write
-      (`tree::write::copy_page` copies the page outside the same span) looks between the slot
-      array and `upper`, so a gap byte changes nothing a reader or writer sees (item 17);
-    - every byte a reader interprets stays covered: the header, the slots and the cells. `nkeys`
-      and `upper`, which bound the gap, are covered bytes themselves, so a header damaged after the
-      stamp fails its CRC. A header that gives no gap (its slots past `upper`, or `upper` past the
-      trailer) is hashed whole, as it is copied whole;
-    - overflow runs keep their whole-run CRC, and meta pages their own codec.
-    - Why: the stamp (commit step 3) and every check of a published page's CRC (the copy-on-write
-      verify, open's root check, `Env::check`) read the bytes they hash, and on a long-running
-      writer's pages the gap is about a third of a page. Hashing it pulled stale bytes from memory
-      only to hash them (see the stamp note in [Platform notes](#platform-notes)).
-29. **A cursor seek checks only the keys its search compared** (`TreeCursor::descend` for a key:
-    `seek`, `seek_exact`, `seek_with_key_tail`, and the dup walker's seeks and finds, in outer and
-    nested trees; see [Readers and snapshots](#readers-and-snapshots)). At a branch it checks the
-    route's bounds, the separators either side of the child taken, against the range the levels
-    above give the page (`route.lo >= lo`, `route.hi < hi`); at the leaf a hit needs nothing (the
-    sought key itself, which the routes kept inside every range), and a miss checks the keys
-    either side of the insertion point, `read::check_miss`'s rule, which point reads
-    (`read::get`) have always followed. The check of every key, the page's first and last against
-    the range, is deferred: the leaf a seek lands in stays unchecked (`TreeCursor::leaf_checked`)
-    until a read of it past the landing entry (a step, a prefix step, a seek from the leaf) gives it
-    that check first, once (`TreeCursor::check_leaf`: the path's branches fetched again for the
-    range, the descent's message). That range is read from two levels only
-    (`TreeCursor::seek_bounds`): the descent checked each route against the range above it
-    (`route.lo >= lo`, `route.hi < hi`), so the deepest route with a lower bound gives the
-    intersection's `lo`, and the deepest with an upper bound its `hi`. The slots name those two
-    levels with no cell read (a route has a lower bound exactly when its slot is not the branch's
-    first, an upper one when it is not the last; `TreeCursor::bound_levels`), so the descent
-    records nothing, and the check reads only their routes, every branch still fetched again with
-    the per-fetch checks and parsed as a branch, in the path's order, before any route (the routes
-    of the other levels are cells the descent's search read with the same cell checks). Debug
-    builds assert that range equals, by content, the one built from every level's route
-    (`TreeCursor::bounds`; `a_seeks_leaf_check_reads_the_range_of_its_deepest_bounded_levels`).
-    A dup write reads its key's cell in a held outer leaf that is still unchecked only at the
-    cursor's slot, its landing entry, and finds any other cell from the root (`held_cell`). A
-    descent along an edge (to the first or last entry, every crossing) keeps the full check of
-    every page.
-    - What is given up: a seek that lands and moves no further accepts a page that only partly
-      overlaps its range (a damaged separator or pointer whose page straddles a bound), its landing
-      entry, which the search compared, inside the range. A page wholly outside its range is still
-      refused at the seek with the same message (every damage sweep's expectation holds
-      unchanged), and every entry a cursor returns past its landing comes from a leaf checked in
-      full (`a_seek_lands_in_a_leaf_partly_outside_its_range_and_reading_on_refuses_it`,
-      `a_seek_into_a_page_wholly_outside_its_range_is_corrupt_at_that_page`).
-    - What it adds: the deferred check fetches the path's branches again, so a seek inside a leaf a
-      seek entered meets damage on the path that the cursor's landing did not
-      (`a_seek_from_the_leaf_meets_damage_as_a_descent_does`).
-    - Why: the full check reads the first and last keys of every page a seek enters, cells its
-      search mostly never touches, on every seek, though most seeks never read past their landing
-      (a point read through a cursor, an exact seek). In TN's reth exec bench on Linux it cost about
-      16 ms of a ~1.5 s peak output, 11.7 ms of it in the state root, nearly all in the cursor's
-      descent. A seek that steps on pays the full check once, for its leaf alone.
+    transaction's map** (`txn::dup_entry`, `write::put_outer_cell` with `OuterCell::Packed`). The
+    copy is the same either way, and written at once the cell is the truth for every packed key
+    (invariant P), so nothing needs a packed overlay. See [Dup tables](#dup-tables).
+23. **A read checks only the packed rows it touches.** Every write that decodes a set, the free
+    walks and `Env::check` validate it whole. Damage is `Corrupt` at first use, as for pages, and
+    the whole check on every get would cost several times the lazy one. See
+    [Packed sets](#packed-sets).
+24. **A nested key never demotes** (`a_nested_key_never_demotes`). A key crossing the bound in turn
+    would rebuild its rows each time, a nested key with few rows costs one leaf, and a demotion
+    would turn a map entry back into a cell, against invariant P (item 22). A key emptied and put
+    again is a new key, packed if its first row fits
+    (`a_nested_key_emptied_then_recreated_is_packed_in_one_txn`). See [Dup tables](#dup-tables).
+25. **A packed set is not checked at page validation or copy-on-write.** `page::validate` cannot
+    tell an outer leaf from any other, and `check_cells_naming_this_txn` skips a set under
+    `Cells::Packing`: it names no page, its bytes are under the CRC `verify_published` has just
+    checked, and the page mutators never parse it. Checking there would make copy-on-write the
+    first use of keys the writer never touched; each set is checked at its own first use (item 23).
+    See [Packed sets](#packed-sets).
+26. **Keys of 18 to ~34 rows are left nested** (at 20-byte keys, 32-byte subkeys and 4 KiB pages). A
+    packed set is held to a quarter-page entry and an outer tree holds no overflow cell, so such a
+    key spends a leaf page where a composite table spends part of one; over a whole state the band
+    costs little. See [Limits and non-goals](#limits-and-non-goals).
+27. **A write through a positioned cursor routes by the cursor's slots** (`write::Hint`). The hint
+    is only routing: it carries no page number, a hinted cell is followed only when the key lies in
+    that child's range, and every check of the write descent runs on every page it enters, in the
+    same order. See [Detached cursors](#detached-cursors-txncursor) and [Dup cursors](#dup-cursors).
+28. **A tree page's free gap is not covered by its CRC** (`page::crc`, `page::free_gap`). Nothing
+    reads the gap, every byte a reader interprets is covered (`nkeys` and `upper`, which bound the
+    gap, included), and hashing the gap pulled stale bytes from memory only to hash them. See
+    [Tree pages](#tree-pages-pagers).
+29. **A cursor seek checks only the keys its search compared** (`TreeCursor::descend` for a key).
+    The leaf a seek lands in gets the full range check before any read past its landing entry, so
+    every entry returned past the landing comes from a leaf checked in full; most seeks never read
+    past their landing, and the full check on every seek was a measurable share of the read path.
+    See [Readers and snapshots](#readers-and-snapshots).
+
+---
+
+## Source files
+
+One row per file of `src/`. `CLAUDE.md`'s crate map gives each file's entry points and the
+invariants a change must keep.
+
+| file | contents |
+|---|---|
+| `lib.rs` | crate docs, `compile_error!` off unix, re-exports |
+| `error.rs` | `Error`, `Result` |
+| `stats.rs` | `IoStats`, the writer's I/O and allocation counters (`Env::io_stats`) |
+| `env.rs` | `Env`, `EnvOptions`, `SyncMode`, `EnvStat`: open and recovery (and the read-only open), the writer hand-off, snapshots, the reader queue, the durable steps of a commit, `sync` |
+| `txn.rs` | `RoTxn`, `RwTxn`, `ReadTxn`, `Table`, `TableStat`, `RoCursor` (the owned read cursor), `RwCursor`, `TxnCursor` (the detached write cursor, with the transaction's write stamps, schema counter and serial); dup tables' point ops, `delete_prefix` and the per-transaction map of their nested trees, flushed at commit; commit steps 1–3 and 7 |
+| `meta.rs` | the 128-byte meta record, `choose_meta`, `slot_to_write` |
+| `page.rs` | the slotted page codec (inline, overflow and nested leaf cells, `Val`), `Geometry` (limits, `place`: inline or overflow), `validate` |
+| `packed.rs` | the packed-set codec of a dup table's outer cell: `PackedView` (the O(1) header and per-row checks, `find`), `validate` (the whole set), the rebuilds (`build_one`, `build_with`, `build_without`), `PACKED_MIN` |
+| `overflow.rs` | overflow runs: the 12-byte cell reference (`Ovf`), the run codec, `checked_run` (every check a run read makes), `MAX_VALUE` |
+| `tree/` | `TreeRoot`, the `PageRead`/`PageWrite` stores, checked descent and lookup (`read.rs`), copy-on-write put/delete/split/merge/free (`write.rs`), the bidirectional cursor (`cursor.rs`), the dup cursors' two-level walker (`dup_cursor.rs`), the test-only `MemStore` and tree walkers (`test_harness.rs`) |
+| `alloc.rs` | the writer's page allocator (`private`, `stamped`, `pool`, `freed`, `next_pgno`) and its overflow runs (`allocate_run`, `free_run`) |
+| `stamp.rs` | commit step 3's CRCs on several threads for a large commit (`threads`, `crcs`, `put_crc`) |
+| `freelist.rs` | free-record codec, gated loading, the fixed-point save |
+| `catalog.rs` | the table catalog (`TableRecord`, the 96-byte record of a plain or a dup table; `TableRecord::usable`, the limits of this build; `DupOptions`) |
+| `check.rs` | `Env::check`: the full structural check (every overflow run's CRC included, a dup table's nested trees, packed sets and totals) and exact page accounting |
+| `latch.rs` | the failure latch |
+| `file.rs` | `PageFile` (reserved mapping, preallocated growth capped by `EnvOptions::max_growth`, the close's tail trim `trim_to`, msync, poison), `ReadOnlyFile` (a read-only open's `PROT_READ` mapping) and `MapView` (the lock-free reader view of either) |
+| `sys.rs` | `fsync_file`, `fdatasync_file`, `fsync_directory`, `allocate_range`, `os_page_size`, `flock_exclusive`, `flock_shared` |
+| `crc.rs`, `page_set.rs` | copied from `crates/storage/src/archive/` (`page_set.rs` adds a touched-word list, so `clear` and `drain` cost the words touched, not the file) |
+| `disk_model.rs` | test-only page-cache and power-loss model |
+| `tests/`, `*/tests.rs` | crash, damage (nested cells and dup records included), dup tables against a composite-key model, multi-table model, merging, path cache, append, detached cursor, key tail, concurrency and read-only suites, per-module tests |
+| `bench.rs` | the on-demand benchmark of step 4's data sync and of merging, each against its test-only switch, and the on-demand probe of step 3's thread count (`stamp_probe`) |
 
 ---
 
 ## Tests and benchmarks
 
 The default tests are small and fast, because CI runs nextest in debug. The heavy variants are
-`#[ignore]`d and run with `--release`.
+`#[ignore]`d `_heavy` twins of small tests and run with `--release`.
 
-| suite | covers |
-|---|---|
-| `page.rs` tests | leaf and branch codecs against proptest models; the page CRC against its model, from an empty page to a full one, each with noise in its gap, and the whole-page CRC for a header that gives no gap (`the_page_crc_covers_the_page_outside_its_gap`); an insert at every index, the end included, against a model (`inserts_at_every_index_match_a_model`); `copy_short` against `copy_from_slice` at every length to 80, and its length-mismatch panic; the parsed views (`View`, `LeafView`, `BranchView`) against an independent model; splits at all five page sizes; `SplitBuf` splits byte-identical to a reference split (leaves and branches, the pending cell anywhere, a quarter of the cases at the append place); append fill; exact limits; a full page left byte-identical; 13 damage kinds; never panicking on fuzzed bytes; overflow cells are canonical references (flags 1 with a 12-byte value, a length past the inline limit and within 16 MiB), and the views model and damaged-page generator include them; nested cells are canonical roots (flags 2 with a 32-byte value that decodes to a non-empty, possible root; every other shape refused, by message: `nested_cells_are_canonical_roots`), and the views model, the damaged-page generator, the key-tail model and the insert-at-every-index model include them; `Geometry::place` keeps every value that fits inline and sends larger ones to runs of the right length (`place_keeps_m1_values_inline_and_sends_larger_ones_to_runs`) |
-| `overflow.rs` | the run codec: a run reads back its value; each kind of damage to a run is `Corrupt` under every `RunCrc` (each header field re-stamped, a zero trailer, a flipped middle page, a range past the end or over a meta page, a page-number overflow, an unmapped run, a txn after the snapshot or not the cell's, a length that disagrees with the run or is over 16 MiB), private runs too; the test store reads runs against its snapshot |
-| `tree/write.rs`, `tree/read.rs` | a gap edit after the stamp leaves the page `Valid`, its copy equal to it outside the gap and a write through it sound (`a_gap_edit_after_the_stamp_leaves_the_page_valid`); a flip in each region the page CRC covers (header with `nkeys` and `upper`, a slot, a cell, the trailer) of a root, a branch and a leaf fails the copy-on-write verify (`a_flip_the_page_crc_covers_fails_the_copy_on_write_verify`); copy-on-write put and delete against a `BTreeMap` model over random batches (with a coverage gate on split and delete shapes), which also put large values (inline, 1-page and 2–10-page runs) and check the overflow counter and the run pages; a failed allocation leaves the tree identical, also when the put takes a run; a put into a run or a replace of one takes the descent, not the path cache; a published leaf naming a private run, and a copied leaf naming a run this txn allocates later, are refused; a delete refuses a handle miscounting its pages; after every put of appends, inserts and replaces through each split shape (a leaf split its parent takes, a branch split, a new root), the path cache equals a fresh descent (`an_append_split_caches_the_path_a_descent_finds`); a replace that grows the rightmost leaf's last value past its free space splits as an append, the leaf's other cells left byte for byte, in a table's tree and an outer tree that packs, while a grown key before the last or in another leaf splits in the middle (`a_growing_last_value_in_the_rightmost_leaf_splits_as_an_append`); a put or delete through a cache whose leaf was unlinked since, by deletes that bypassed it, descends and lands where the key lives (`a_path_cache_of_another_epoch_is_never_used`); with merging off, cached deletes leave a leaf's last entry to the descent, which unlinks the leaf (`a_cached_delete_leaves_a_leafs_last_entry_to_the_descent`); a delete's miss over a published leaf leaves the cache empty, so a put there copies the leaf (`a_delete_miss_over_a_published_leaf_leaves_the_path_cache_empty`); both against the same writes without the cache; split reservation for long separators; append fill; collapse and unlink; `clear` and the free walk refuse damaged or stale pointers, and a page private to the transaction for another tree (its leaf or a run's page) named by a published cell, an untrusted root handle or a forged cell a private copy kept (`the_free_walk_refuses_a_page_private_to_another_tree`); fetch checks, stale copies, redirected children and misrouted pointers are `Corrupt`; copy-on-write's one copy gives the two-step copy's bytes, on `MemStore` and the environment's writer (`copy_on_write_is_the_two_step_copy`), reads a page published before a remap from the new mapping (`copy_on_write_reads_a_page_published_before_a_remap`), and fails exactly as `PageRead::page` fails, a page past the published bytes included (`copy_on_write_fails_as_the_page_fetch_fails`); provenance trust: a trusted path skips the range checks, a private page named by a page this writer did not write (a stamped forged cell, an untrusted root handle, a collapse) is refused, as is a copied cell naming a page this txn allocates later, while a child whose txn wrapped stays live; a nested cell in a private leaf is `Corrupt` at a put, a cached put, a cached delete, a delete, `clear` and `free_subtree`, the handle unchanged (`a_nested_cell_in_a_private_leaf_is_corrupt_at_every_write`); an outer tree of nested cells against a model through every write shape, and the refusals of each cell policy (`outer_trees_of_nested_cells_match_a_model`); a published outer cell naming this txn's id refused at copy (`a_published_outer_cell_naming_this_txn_is_refused_at_copy`); `read::last_key` against a model (`last_key_is_the_trees_last_key`); an outer tree of `Cells::Packing` cells (packed sets and nested roots) through `put_outer_cell` and `delete_outer_cell` with splits and merges against a model, `Cells::Outer` still refusing an inline cell and `check_cells_naming_this_txn` skipping sets (`outer_trees_of_packing_cells_match_a_model`) A write descent routed by a cursor's hint against the search: every key of seeded trees of height 1 to 4, private and published pages, with its own path, a neighbour's, random slots, a hint of another length and another tree's, gives the search's leaf, path, range, copies or error (`a_hinted_descent_matches_the_search`, heavy twin), and a hint along a damaged path meets the damage as the search does, a put with the same `Corrupt`, a delete before any change (`a_hinted_write_meets_damage_as_a_descent_does`). |
-| `tree/write.rs` merging | the random batches with merging on, against the same model (`random_batches_with_merging_match_a_btreemap_model`): odd rounds put and delete through a `PathCache` (`put_cached`, `delete_cached`; debug builds require cached deletes among them), and after every delete, cached or not, the pages it changed are merge-closed and the accounting holds, and the coverage gate adds leaves merged from the left and from the right, branch merges, a cascade over two levels or more, a root giving way and a refused merge; the fill bound (`deleting_90_percent_leaves_no_page_merge_open`: after 90% of a random fill is deleted at random, no page under a quarter fits with a neighbour, and the leaves stay 0.40–0.47 full against about 0.08 without merging); a merge refuses a damaged sibling from either side before anything changes (`a_merge_refuses_a_damaged_leaf_sibling`, `a_merge_refuses_a_damaged_branch_sibling`: a flipped byte under a stale CRC, a stale txn in the parent's cell, an older retired copy, a redirect outside the separators, a private sibling, a cell or overflow cell naming this txn, and for branches a key out of order across the seam); a refused neighbour gets only the cheap checks, and damage only its CRC finds waits for its first use (`a_refused_neighbour_gets_only_the_cheap_checks`); a failed allocation during a merging delete leaves the tree identical (`a_failed_allocation_during_a_merging_delete_leaves_the_tree_identical`); an absorbed branch sibling's child-0 chain is descended to the leaves, so a single-child branch outside the cell's separators, a branch of another level and one branch named by two cells are refused (`a_merge_refuses_a_single_child_branch_outside_the_cell`, `a_merge_refuses_a_branch_sibling_of_another_level`, `a_merge_refuses_a_branch_named_by_two_cells`). `a_collapse_checks_the_page_it_promotes` and `a_delete_refuses_a_handle_miscounting_its_pages` turn merging off (`no_merge`) to reach their shapes |
-| `tree/cursor/tests.rs` | random moves and prefix steps against a sorted model on the detached cursor and the public `Cursor`, over many tree shapes (grouped keys among them) and page sizes, committed and uncommitted; the ends of empty and single-entry trees; leaf crossings; seeks; prefix steps from every entry of a grouped tree, across leaf boundaries both ways (`prefix_steps_from_every_entry_match_a_model`); every key and every gap of many tree shapes through `seek`, `seek_exact` and `seek_with_key_tail`, each followed by a few steps, against the model on both cursors (`seeks_of_every_key_and_gap_match_a_model`, `_heavy`); `seek_with_key_tail` meets damage (a misrouted cell, an emptied leaf, a root of the wrong height, a flipped run byte) with the error a `seek` then `current_with_key_tail` meets (`a_seek_with_key_tail_meets_damage_as_a_seek_does`); two damages on one page met in the descent's order, the error the first check's exact message: the kind check before the header parse and before the range check (`the_descent_names_the_first_check_a_page_fails`); the path stays 6 bytes a level (`tree_cursor_stays_small`); seeks from random positions (after seeks, steps, `first` and `last`, past either end, after a `seek_exact` miss) equal a new cursor's seek and the steps after it, on the detached and public cursors and on `RoCursor` and `TxnCursor` (from the deleted state, and stale after another writer's put or delete), over every key and gap, every separator and the keys around it (`seeks_from_random_positions_match_a_fresh_seek`, `_heavy`); a seek inside the cursor's leaf (its keys and gaps, `seek_exact` misses there) makes no root descent and any other one does, even next to the leaf, a stale `TxnCursor`'s seek one descent and no reseek, and one after only a table created or dropped none (`a_seek_near_the_cursor_starts_from_its_leaf`, `owned_and_txn_cursors_seek_from_their_leaf`, `a_txn_cursor_seeks_from_its_leaf_after_a_schema_change`, debug builds); damage in the next leaf, sought from the leaf's end, is met with the descent's message, damage on the held path is not met again (`a_seek_from_the_leaf_meets_damage_as_a_descent_does`); damage under a cursor latches; `RwCursor` writes and prefix steps against a model (`current` and a second delete right after `delete_current` act on the follower), and prefix steps after `delete_current`; the owned `RoCursor` against the model and `Cursor` on one snapshot with overflow values (the random moves include `seek_with_key_tail`), outliving its transaction handle on another thread while commits free its pages, and latching damage |
-| `meta.rs`, `catalog.rs`, `latch.rs`, `alloc.rs`, `file.rs`, `sys.rs`, `crc.rs`, `page_set.rs`, `disk_model.rs` | codecs (the 96-byte catalog record: its layout, a plain record's zero dup fields and each damaged byte, `table_record_encoding`; a dup record's round trip and each broken rule, the page and row-sum rules included, `dup_records_round_trip_and_refuse_damage`; a dup record held to this build's limits, a `packed_max` out of range and a key past `max_dup_key_len`, `dup_records_are_usable_within_this_builds_limits`; version-2, version-3 and version-4 metas refused, `a_version_2_record_is_refused`, `a_version_3_record_is_refused`, `a_version_4_record_is_refused`), slot choice, the latch's first-cause rule (`ReadOnly` does not latch), allocator abort, overflow runs in the allocator (the first fit in the pool, else the file end; one CRC per run, its pages never trusted as stamped; a freed run comes back as single pages), growth and remap (a growth cap stops the doubling and grows linearly by it, `growth_steps_stop_doubling_at_the_cap`), a read-only mapping of a mode-0444 file that maps nothing once dropped (`a_read_only_file_maps_its_bytes_until_dropped`), sync wrappers, the exclusive and shared locks (`flock_shared_coexists_and_excludes_an_exclusive_lock`), the power-loss model |
-| `stamp.rs`, `env/tests.rs` (the stamp) | the parallel stamp against the serial loop (`stamp::stamp` on each unit: `page::stamp` on a tree page, `crc::add_crc32_nonzero` on a run), byte for byte: tree pages (with a gap, full, and with each header that gives no gap) and runs of up to 9 pages, from no unit to more units than threads, on 1 to 9 threads (`crcs_stamp_the_bytes_of_the_serial_loop`); a payload whose CRC is 0 stamped with the all-ones sentinel (`a_zero_crc_payload_gets_the_serial_loops_sentinel`); the shares cover every unit once, in order, in balanced parts (`shares_cover_the_units_in_order_in_balanced_parts`); the thread count's threshold and cap (`threads_grow_with_the_bytes_to_the_cap`); whole commits stamped on 2, 3 and 5 threads leave the serial stamp's file, which reopens, checks and reads back (`a_parallel_stamp_writes_the_serial_stamps_bytes`), as does a 3 MiB commit of runs on `stamp::threads`' own choice (`a_commit_past_the_stamp_threshold_writes_the_serial_stamps_bytes`) |
-| `env/tests.rs` | a flip the page CRC covers fails open's root check (the catalog root) and `Env::check` (a table leaf) (`a_flip_the_page_crc_covers_fails_open_and_check`); a version-3 or version-4 file is refused at open as `UnsupportedVersion(3)` or `UnsupportedVersion(4)`, the file unchanged (`a_version_3_file_is_refused_at_open`, `a_version_4_file_is_refused_at_open`); open steps (create at every page size, leftovers, the lock, a damaged newest meta, damaged roots, short and foreign files, the open fsync), commit and NoSync durability under power loss, a commit of no change, abort, the writer hand-off, readers across commits, step 4's sync choice (`data_sync`: one range or one `fdatasync`), a scattered commit and a two-range commit under power loss, the latch (failed msync, damage, oversized entries do not latch), table handles, a multi-page value read back after a commit and a reopen, `max_value_len` at every page size; the per-snapshot table roots: one catalog resolve per handle per snapshot, whichever read uses it (`a_snapshot_resolves_each_handle_once`), a dropped table's handle stale only in later snapshots (`a_dropped_tables_handle_is_stale_only_in_later_snapshots`), a hit needing the handle's name as well as its id, for another file's handle with the same id and for an aborted create's handle, whose id the next table created takes (`a_remembered_root_needs_the_handles_name_too`), and 40 tables, past the 32 slots, each resolving to its own table (`more_tables_than_a_snapshot_remembers_still_resolve`); the growth cap: `max_growth` under `MIN_GROWTH` refused at open with the file untouched, ignored by a read-only open, 1 GiB by default (`max_growth_under_the_minimum_is_refused_at_open`), and a 1 MiB cap bounding the tail past the pages after every commit of a growing load (`a_growth_cap_bounds_the_tail_past_the_pages`); the close's trim: a clean close truncates the file to its pages rounded to the OS page in `Durable` and `NoSync` (final sync first), the allocated blocks falling where the file system preallocated, and the file reopens, checks and reads back (`a_clean_close_trims_the_file_to_its_pages`, at 4 KiB and the OS page); a latched close (an unpoisoned latch) and a crash trim nothing (`a_latched_env_drops_without_a_trim`, `a_crash_drops_without_a_trim`); a trimmed file grows one step from its trimmed length and trims again (`a_trimmed_file_grows_from_its_trimmed_length_and_trims_again`); a trim never cuts a page the newest meta names, after an aborted transaction that grew the file and after a commit whose pages end the file (`a_trim_never_cuts_a_page_the_newest_meta_names`); a meta slot whose record does not decode to its txn skips the trim (`a_meta_slot_the_writer_cannot_account_for_skips_the_trim`); a power loss after the unsynced truncation reopens to the last durable state at either length (`a_power_loss_after_a_trim_reopens_to_the_last_durable_state`) |
-| `freelist/tests.rs` | the record codec; reuse after two durable commits or two NoSync syncs, held back by a live reader; damaged records never handed out; abort returns the records taken; dropped and cleared tables' pages reused; steady churn keeps the file bounded; the save settles within three rounds, including a record count that shrinks mid-save; `check` reports damage, leaks and double uses, and compares each root's page counters, and refuses a root branch with one child (`check_refuses_a_root_branch_with_one_child`); exact accounting in a random workload. Overflow runs at the environment level: the runs of cleared and dropped tables are freed and reused; a damaged run (header, leaf, counter) refuses `clear_table` and `drop_table` and changes nothing, the file included; `check` reports a damaged run (a CRC flip, a header or pad byte, a wrong counter) and a run page also on the free list; `check` finds a flip inside a 1-page run that a get does not; a get refuses a 1-page run reused as another page and a flip in a middle page of a run. Run allocation: a run takes a fit from records loaded for it, loads at most `RUN_LOAD_RECORDS` records, and an abort returns the records it loaded; leftover pages of a consumed record are listed under the keys consumed and reused by the next transaction; churn of 4–20 KB values keeps the file bounded (`run_churn_keeps_the_file_bounded`; with held readers, `run_churn_with_readers_keeps_the_file_bounded`, at most 1.75 times the live pages, and both heavy twins, 1.5 times over 50K commits and 1.75 over 20K). Merges free the siblings they absorb, which the save lists like any freed page, and it still settles within three rounds (`merges_feed_the_save_which_still_settles`). The save writes the records the old code wrote, byte for byte, over large commits, a drop and small records that spill the pool (`the_save_writes_the_records_the_reference_writes`), and a spill below the freed pages merged into them (`a_spill_below_the_freed_pages_is_merged_into_them`) |
-| `tests/crash.rs` | every crash point (`CrashAt`) × {process crash, strict power loss, random power loss with three seeds} × {`Durable`, `NoSync`} × {step 4 by `fdatasync`, by one `msync`}: the reopen recovers exactly the allowed state, which passes `check`, reads back through gets and both cursor scans, and survives a crash right after the reopen; a commit that grew the file survives a power loss by either data sync; the older state stays recoverable until its meta is overwritten. The dup matrix runs the same over a dup table beside the plain ones (`every_crash_point_recovers_a_dup_table`, `_heavy`): a crash commit of nested-only changes (outer cells rewritten by the flush), a new outer key, a key emptied row by row and a `delete_prefix` reopens to exactly `L` or `M`, every row read back by a get and by a walk of every tree, with the totals and `check`'s figures; the grown-file and older-state cases with that commit (`a_commit_that_grew_the_file_survives_a_power_loss_with_a_dup_table`, `the_older_state_with_a_dup_table_stays_recoverable_until_its_meta_is_overwritten`) |
-| `tests/crash_runs.rs` | the same matrix (two seeds; the heavy twin 40 at 4 and 16 KiB pages) on a workload of overflow runs: puts of 1–10-page runs, replaces inline to run, run to inline, run to a larger and a smaller run, deletes, a drop of a table with runs; the commit does not grow the file and ends with a run at the top of its pages, so the one `msync` of step 4 alone must cover the run's interior pages (a growth's size sync is an `fsync` of every page), and the dry run asserts that layout: the last run ends at the state's page count (`last_run_ends_the_file`); a commit that grows the file through a run allocation survives a power loss by either data sync |
-| `tests/damage.rs` | each kind of damage at rest fails the open closed (the file unchanged) or, once opened, is met by reads, copy-on-write, free-list loads and `check` as `Corrupt`, which latches; nothing panics. A free record listing a live leaf of a tree without runs: a `drop_table` or `clear_table` of that tree after a write handed the leaf out (as a tree page or a 1-page run) is `Corrupt`, frees nothing and leaves the other table readable (`a_free_of_a_tree_refuses_a_leaf_this_transaction_holds_for_another`); after the write committed, the drop frees the leaf again and, once it is reused, the other table's gets are `Corrupt` by txn identity (`a_live_leaf_freed_by_a_later_drop_is_corrupt_once_reused`) |
-| `tests/damage_runs.rs` | a table with inline values and runs of 1, 3 and 9 pages, damaged at rest: `Corrupt` at a get for a flipped byte or a zeroed page in the middle of a run, a zeroed last page (zero trailer), a cell redirected to another run of the same txn (of the same pages: only the length tells) or to its key's stale run of the same length (only the txn identity tells), a cell's length changed, a run's kind changed, a 1-page run's page number or kind changed; at `check` for a flipped byte inside a 1-page run and an overflow counter one too high, which `drop_table` and `clear_table` also refuse; a free record listing a live run's middle page is `Corrupt` at `check`, at the get after a write reused the page (every other value reads back), or at the commit of a write that freed the run while the page sat in the pool; two cells naming one run, both deleted in one transaction, are `Corrupt` at the commit, which latches as damage (`two_cells_naming_one_run_freed_together_are_corrupt_at_commit`) |
-| `tests/damage_merge.rs` | a file whose deletes merge leaves (table `l`) and, after an unlink, branches (table `b`), checked undamaged (`the_fixture_deletes_merge`); damage at rest to the sibling a merge absorbs, from either side (`a_merge_refuses_a_damaged_leaf_sibling`, `a_merge_refuses_a_damaged_branch_sibling`): a flipped byte (the CRC finds it), a stale txn in the parent's cell, a redirect outside the cell's separators, a cell naming a page or run by this transaction's id past the file's end, and for branches the parent's key coming down equal to the right page's key 1 (the seam check). Each is `Corrupt` at the delete, the environment latches, and the file is byte for byte as it was |
-| `tests/nested_damage.rs` | a nested cell forged into a committed table's published leaf, its CRC restamped so only the nested rule finds it: `Corrupt`, latched, at a get, a `Cursor` seek and a step onto it, a `RoCursor` seek, `seek_with_key_tail` on `RoCursor` and `TxnCursor`, a put over it, a put beside it (copy-on-write of its leaf), its delete, `drop_table`, `clear_table` and `Env::check` (`a_forged_nested_cell_is_corrupt_and_latches_at_every_use`); a dup record written over a plain table's inline cells: it opens, its stat and a same-options `create_dup_table` answer, `create_table` of its name is `TableKind` with no latch, a get of an absent outer key misses; then, each on a fresh copy, `Corrupt` and latched at a get (read and write transactions), a put, a delete, `delete_prefix`, a put of a new outer key (copy-on-write of the leaf), `drop_table`, `clear_table` and `Env::check` (`a_dup_record_over_inline_cells_is_corrupt_at_first_use`) |
-| `tests/dup.rs` | dup tables: the kinds and options (`table_kinds_are_checked`, `dup_options_are_validated` at 4 and 16 KiB, `a_dup_record_with_packed_max_out_of_range_is_refused`, `every_bound_resolves_to_its_limit`, `an_empty_dup_tables_stat_is_its_shape`), the logical key's limits (`dup_keys_are_validated`), append by the logical key (`dup_append_orders_by_the_logical_key`), the working map and the flush (`reads_inside_the_txn_see_unflushed_roots`, `the_flush_writes_every_changed_root`, `nested_writes_move_the_table_stamp`, round trips, abort), the totals after every change against `table_stat` and a walk (`dup_totals_follow_every_change`), `delete_prefix`, drop and clear freeing every page with a reader held (`delete_prefix_frees_the_tree_and_its_cell`, `dropping_or_clearing_a_dup_table_frees_every_page`); forged damage, each `Corrupt` at first use: a cell naming a private page with no working root, a published outer cell naming this txn's id at copy-on-write, a nested cell inside a nested tree, a shared nested root (a double claim; reached twice at drop, nothing freed), totals off by one, an outer key of another width, an inline or overflow outer cell (`check` and the free walks); and Oracle 1, `dup_tables_match_a_composite_model` (a dup table at each of the three bounds, `Bound::Unpacked` (`packed_max` 0), `Bound::Small` (`PACKED_SMALL`, 96 bytes: most keys created packed and promoted mid-script) and `Bound::Default` (cold keys packed, hot ones promoted), with coverage gates proving each bound made its forms, and a plain table keyed `k ‖ s` against one `BTreeMap` model: every op's result, reads, readers, commits, aborts, reopens, clears and drops, `check` after every commit, coverage gates on outer and nested height 2; its `_heavy` twin runs 8 seeds of 40k steps at 4 and 16 KiB) |
-| `tests/dup_cursor.rs` | `DupRoCursor` against the composite twin (a dup table of key width 4 and a plain table keyed `k ‖ s` with the same rows): Oracle 2a, `dup_cursor_moves_match_the_composite_twin`, random calls on a `DupRoCursor` and a `RoCursor` side by side, every result (tails compared as joined bytes) and state, with coverage gates on each prefix class (`n < K` across keys and inside one, `n = K` at a key's edge, `K < n <= L`, `n > L`), seek targets shorter than, as long as and longer than `K`, bounded-seek hits and misses, key crossings both ways and `Apart` tails of both causes; its `_heavy` twin (release) on 3000 keys, two of 40k rows, nested height 3; seeks from random positions against a fresh cursor's seek and two steps after, on both dup cursors, a `DupTxnCursor` stale after the transaction's writes near its row and in the deleted state among them, each seek's `ROOT_DESCENTS` at both levels its class's exactly in debug builds, every class met by both kinds (`dup_seeks_from_random_positions_match_a_fresh_seek`, `_heavy`); the bounded seeks read only their own key, the neighbours' nested roots garbled (`bounded_seeks_never_read_another_key`); the key tail joined inside the subkey, apart past it and for a run (`current_with_key_tail_joins_inside_the_subkey`); every landing checks the outer width (`a_dup_cursor_meets_an_outer_key_of_another_width_as_corrupt`); an empty subkey `Corrupt` at first use; `dup_cursors_on_a_plain_table_are_table_kind`; Oracle 2a and the random-position seeks run at the three bounds (the plain name the default, `_unpacked`, `_packed_small`), and the packed mode has its own cases: a walk across packed, nested and packed keys, prefix steps at a packed key's edges, seeks inside, between and past packed keys, `seek_dup` past a set's last row unset, key tails of a packed row and packed landings without a nested descent (`packed_landings_skip_the_nested_descent`) |
-| `tests/dup_txn_cursor.rs` | `DupTxnCursor` against the twin in one transaction: Oracle 2b, `dup_txn_cursors_and_direct_writes_match_the_composite_twin`, several dup cursors on the dup table and as many `TxnCursor`s on the twin in lockstep, with cursor writes and the transaction's own `put`, `insert`, `append`, `delete`, `delete_prefix` (on the twin the adapter's wipe loop, every call compared) and `clear_table` between the moves; each step's results, states and deleted flags, and `follower_shares_prefix` at `K − 1`, `K`, `K + 1`; rounds commit (then `check`) or abort; coverage gates on reseeks, each landing of a cursor's delete, another writer's deletes under a cursor (its row, its follower, emptying its key, `delete_prefix` of it), clears, deletes into the next key and of the table's last row, refused and key-creating cursor writes, and every prefix class both ways; its `_heavy` twin (release). Then one by one: staleness after another writer's put, delete, emptied key, `delete_prefix` and `clear_table` (`a_dup_txn_cursor_finds_its_row_again_after_another_writers_change`), the wipe loop's state (`delete_prefix_under_a_cursor_leaves_the_wipe_loops_state`), a delete of a key's last row and one that empties a key, from the path caches and by key (`a_delete_of_a_keys_last_row_lands_on_the_next_key`, `a_delete_that_empties_a_key_lands_on_the_next_key`), the working map before the cell (`a_cursor_reads_the_map_root_not_the_cell`), a private cell with no map entry (`a_private_cell_with_no_map_entry_is_corrupt_under_a_dup_cursor`), `WrongTxn` and `StaleTable` (`dup_txn_cursor_wrong_txn_and_stale_table`), refused writes and width refusals (`refused_writes_through_a_dup_cursor_change_nothing`), a cursor put after another writer moved the outer path (`a_cursor_put_after_another_writers_change_finds_its_row`); and `damage_under_a_dup_cursor_is_corrupt`: forged nested pages, CRC-stamped again (a nested cell in a nested leaf, an outer key of another width, an empty subkey, a misrouting nested separator), each met by a write cursor's seek, its step and a `delete_current` beside it: `Corrupt`, the cursor unset and out of the deleted state, latched, on a fresh copy each; Oracle 2b runs at the three bounds as Oracle 2a does; a cursor on a packed row sees an in-place rewrite, a promotion and a removal under it (`a_dup_txn_cursor_sees_an_in_place_packed_rewrite`, `a_txn_cursor_follows_its_packed_key_rewritten_promoted_and_emptied`, `another_writers_packed_rewrite_reseeks_the_cursor`), and packed damage under a cursor is `Corrupt` (`packed_damage_under_a_dup_cursor_is_corrupt`) Oracle 2b alternates rounds with the cursors' hints on and off, gated (debug) on levels routed by a hint and hints refused. A dup cursor's delete and insert of its row route both levels by its paths, the outer cell read from the leaf it holds (`a_dup_write_at_the_cursor_routes_both_levels`), and a key whose map root supersedes its cell is written in the map's tree, never the cell's (`a_held_outer_leaf_never_overrides_the_map`). |
-| `tests/dup_sweep.rs` | `damage.rs`'s and `read_only.rs`'s sweeps over a dup table (`damage_sweep_on_a_dup_table`, `read_only_sweep_on_a_dup_table`): every kind of damage to its cells, trees and record `Corrupt` at the first use that meets it, latched; the scan stage scans the dup table with a `DupRoCursor` (`first`, `next_in_prefix(K)` inside a key, `next` across keys, `seek_key` past a key it must not read), then the plain table; two outer cells naming one nested root, `Corrupt` at the commit that writes both and found by `check` across two (`a_shared_nested_root_written_once_per_cell_in_one_transaction_is_corrupt`, `a_shared_nested_root_across_transactions_is_found_by_check`); `an_empty_subkey_is_corrupt_at_first_use` The write stage rewrites every fifth row through detached cursors first (`rewrite_through_cursors`: a dup row's seek, `delete_current` and `insert`, a plain row's `seek_exact` and put), so its damage meets writes routed by a cursor's paths; a byte of a nested leaf and of a plain leaf (CRC only) are met there. |
-| `packed.rs` tests | the packed-set codec: random sequences of `build_one`, `build_with` and `build_without` against a `BTreeMap`, every set validated and decoded to the model, `find` on present, absent, before-first and past-last subkeys (`packed_sets_built_by_random_edits_match_a_model`, `_heavy` 64 seeds); every single-byte change refused or another valid set, never a panic (`every_single_byte_change_is_refused_or_another_valid_set`); each O(1) rule of `new` and `row`, and a misorder off the probe path passing `find` and failing `validate` (`the_lazy_checks_refuse_what_they_touch`); `PACKED_MIN` and `packed_max` exactly and one past, and the largest set at 64 KiB pages (`packed_codec_limits`) |
-| `tests/dup_packed.rs` | packed sets through the engine: `packed_dup_options_resolve` (0, the range, `PACKED_DEFAULT` at 4 and 16 KiB, the same handle twice, the resolved number reported after a reopen); a set exactly at the bound stays packed and one byte more promotes, by create, insert and upsert (`a_set_at_the_bound_stays_packed_and_one_byte_more_promotes`); an upsert that grows a value past the bound promotes (`an_upsert_that_grows_a_value_past_the_bound_promotes`); `a_nested_key_never_demotes`; `a_nested_key_emptied_then_recreated_is_packed_in_one_txn`; a bulk append crossing the bound inside a key larger than a commit (`a_bulk_append_crosses_the_bound_inside_a_key_larger_than_a_commit`); `drop_clear_and_delete_prefix_with_packed_and_nested_keys` (no page freed or leaked by a packed key); `packed_writes_move_the_table_stamp`; `a_free_walk_refuses_packed_totals_that_miss_its_sets` (nothing freed); `check_counts_packed_sets_and_refuses_their_damage`; and `packed_sets_file_size_by_bound`, an ignored measurement of the file per bound against composite |
-| `tests/packed_damage.rs` | `damage.rs`'s and `read_only.rs`'s sweeps over a packed dup table (`damage_sweep_on_a_packed_dup_table`, `read_only_sweep_on_a_packed_dup_table`): each kind of damage to a set `Corrupt` at the first use that touches it, under the lazy read rule; damage refusing drop and clear before any free (`packed_damage_refuses_drop_and_clear_before_any_free`) and met by a `DupRoCursor` (`packed_damage_met_by_a_dup_read_cursor_is_corrupt`) |
-| `tests/merge.rs` | environment-level merging: deletes that merge leaves, a branch and the root, committed, reopened and read back against the model, with `Env::check` and a twin that does not merge (`deletes_that_merge_commit_and_reopen_to_the_model`); `RwCursor::delete_current` sweeps across leaves, every other key and down to one leaf, `next` returning each follower (`delete_current_sweeps_return_each_follower_while_pages_merge`); a put after a merge that freed or kept the cached leaf descends instead of using the stale cache (`a_put_after_a_merge_never_uses_the_cache_of_a_freed_page`); the crash matrix on a commit whose deletes merge and make the root give way (`every_crash_point_of_a_merging_commit_recovers_the_state_the_protocol_allows`, `_heavy`) |
-| `tests/multi_model.rs` | a random multi-table workload with crashes against a model; its large-value variant spreads values over inline and 1–10-page runs, with drops and clears of tables holding runs; a draining variant (stretches of mostly deletes, `a_draining_multi_table_workload_with_crashes_matches_the_model`) makes pages merge, and every variant's coverage gate counts merging deletes; the dup variant (`a_multi_table_workload_with_dup_tables_and_crashes_matches_the_model`, `_heavy`) runs two dup tables, of 4- and 20-byte outer keys, beside the plain ones under the same crashes (puts, inserts, appends, deletes, `delete_prefix`, gets, clears and drops), its gate counting per dup table outer and nested trees of two levels, deletes that emptied a key, `delete_prefix` hits, a clear and a drop |
-| `tests/path_cache.rs` | random multi-table workloads (puts, deletes, a detached cursor's `delete_current` walks and its seek, delete and put of one key, clears, drops, commits, aborts, readers held) on a cached and an uncached environment (the test-only `no_path_cache`, which also drops a delete's slot, so a `TxnCursor` there finds its place by key after a delete): the same outcomes, the cursor's after each delete included, and byte-identical files after every commit, with puts and deletes in the cached leaf counted in debug builds (`CACHED_PUTS`, `CACHED_DELETES`); over 3000 sorted keys, a seek, `delete_current` and cursor put of each key make no root descent inside `delete_current` and delete in the cached leaf but for each leaf's first delete and the deletes in a leaf under a quarter, the cursor on each follower (`slot_rewrites_over_sorted_keys_delete_in_the_cached_leaf`, counted in debug builds); a cached leaf reused by another table in the same txn is not written; an aborted transaction's cache never reaches the next Beside them, a cursor's write hint against the search: seeded scripts of two detached cursors' seeks, slot rewrites, puts of any key and delete runs, with the transaction's own puts and deletes, on three-level trees with splits, runs and merges, give the same outcomes, cursor positions and file bytes as under `Writer::no_write_hint` (`hinted_writes_leave_the_bytes_of_unhinted_ones`, heavy twin). |
-| `tests/append.rs` | `RwTxn::append`, `RwCursor::put`/`append` and both inserts against `RwTxn::put`: byte-identical files and a model across splits, aborts, deletes and stale path caches; an append out of order, and an insert of a present key (in the cached leaf, on the descent, over an overflow value), is refused without a latch, a change or a moved epoch; a cursor put or insert lands on its entry (`current`, `next`, `prev`) |
-| `tests/txn_cursor.rs` | detached cursors sharing one write transaction: three `TxnCursor`s over two tables and the transaction's own puts, deletes and a `clear_table`, interleaved at random, against a model of each cursor (its entry, or the follower and the deleted key after a delete, over the table's rows) in every result and state, with writes next to where the cursors sit (before and after their slot, deleting their entry and its neighbours), overflow values and refused inserts and appends; after every `delete_current` that deleted, the cursor's position (the test-only `TxnCursor::position`: state, path, root, saved key, up to date) equals a new cursor's after a seek of the deleted key; each round commits and checks, a cursor of an earlier round is `WrongTxn`, and the file reopens to the model (`txn_cursors_and_direct_writes_match_a_model`, `_heavy`); another table's writes, a table created and the cursor's own writes cause no reseek, a write to its table one (`a_write_to_another_table_causes_no_reseek`); a dropped table is `StaleTable` for every call, touched in the transaction or not, and after a re-create (`drop_table_under_a_live_cursor_is_stale_table`); a later transaction, the successor of an aborted one with its txn id, and another environment's are `WrongTxn`, changing nothing, without a latch (`a_cursor_used_with_another_transaction_is_wrong_txn`); a refused insert changes nothing and keeps the cursor and its saved key, and after a delete a reseek finds the follower by its key (`a_refused_insert_through_a_txn_cursor_changes_nothing`); after `last` (or `prev` from unset) `next` and `next_in_prefix` move to an entry another writer put past it, and with none go past the end (`next_after_last_finds_entries_put_past_it`); prefix steps after another cursor's insert and delete and through a group split under the cursor (`prefix_steps_through_txn_cursors_follow_other_writes`); a `delete_current` that copies the published root places the cursor in the new tree, its `position` equal to a new cursor's seek before any step (`a_txn_cursor_delete_that_copies_the_root_places_the_cursor_in_the_new_tree`); `follower_shares_prefix` against the model after every delete at six prefix lengths (a follower in the next leaf and a delete of the table's last entry counted among them) and as a random call in any position, stale included (in `txn_cursors_and_direct_writes_match_a_model`), and in each state by hand: before a delete, after a move, past the key's length, a follower in the next leaf, after the end, after another writer's delete of the follower (`follower_shares_prefix_answers_for_the_deleted_entrys_follower`) Every other round of the model test writes with the cursors' hints off (`Writer::no_write_hint`), the others gated (debug) on levels routed by a hint and hints refused. A write at the cursor of a three-level tree routes every level by its path with no search, then places as a fresh seek (`a_write_at_the_cursor_routes_by_its_path`); a stale cursor, one after a `seek_exact` miss and one after the end pass no hint (`a_stale_or_unplaced_cursor_passes_no_hint`). |
-| `tests/key_tail.rs` | `current_with_key_tail` on `Cursor`, `RoCursor` and `TxnCursor` against `current`: inline, empty and overflow values, over walks, seeks, prefix steps, a reseek and a delete; `seek_with_key_tail` on `RoCursor` and `TxnCursor` against `seek` then `current_with_key_tail` (hits, misses, both ends, an empty table, and the moves after: `seek_with_key_tail_is_a_seek_then_current_with_key_tail`), and a `TxnCursor` taken out of the end that `last` (or `prev` from unset) sets, and out of the deleted state, as `seek` takes it (`seek_with_key_tail_clears_a_txn_cursors_end_and_deleted_states`); the page codec's span is tested in `page.rs` (`key_tail_joins_the_keys_last_bytes_to_an_inline_value`, and on damaged pages) |
-| `tests/concurrency.rs` | reader threads rescan pinned snapshots and take fresh ones while a writer replaces, deletes and clears (pages freed and reused): no read sees damage or a torn state |
-| `tests/read_only.rs` | `Env::open_read_only` on a file of several commits (inline values, runs of 1–18 pages, a dropped table): every key reads back through gets and both scans, `check` passes, and the file is byte-identical with its mtime unchanged after the open, the reads, the check, a sync and the drop; a mode-0444 file opens (`a_read_only_open_reads_every_table_and_changes_nothing`); an unsynced meta in the page cache is read and still lost to a power loss: the open synced nothing (`a_read_only_open_syncs_nothing`); read-only opens coexist and exclude a writer both ways (`read_only_opens_share_the_lock_and_exclude_a_writer`); `begin_rw` and `try_begin_rw` are `ReadOnly` without a latch; a missing, empty or foreign file is refused with nothing created; a damaged newest meta falls back one txn, unrepaired; a read-only damage sweep (`damage_at_rest_is_met_by_read_only_reads_and_check`, on `tests/damage.rs`'s fixture): damage to a leaf, a branch, the catalog or the free list is `Corrupt` from the first get or scan that reaches it, else from `check`, latched by that operation, and a damaged tree root fails the open closed, the file unchanged |
+- **Per-module tests** (a module's `mod tests`, or its `*/tests.rs`) hold each codec and component
+  to a model or a reference: the page, packed-set, overflow, meta and catalog codecs, the
+  allocator, the free list, the stamp, and the tree's copy-on-write, merging and cursors on the
+  in-memory store (`tree/test_harness.rs`'s `MemStore`); `env/tests.rs` and `env/io_stats_tests.rs`
+  cover open, commit, close, the latch and the I/O counters.
+- **Whole-engine suites** (`src/tests/`): the crash matrices (every `CrashAt` point under a
+  process crash, a strict power loss and random early writeback, through `disk_model`), the damage
+  sweeps (each damage refused at its first use, the environment latched), multi-table models with
+  crashes, dup tables and their cursors against a composite-key twin, the path cache, append,
+  detached cursors, key tails, concurrency and the read-only open.
+- **On-demand measurements**, `#[ignore]`d and skipped by the heavy run: the benchmark and the stamp
+  probe below.
+
+`CLAUDE.md`'s "Where tests live" maps each kind of change to the tests that cover it, test by test,
+and its "Adding a crash test" gives the crash-test recipe.
 
 ```text
 cargo nextest run -p tn-lmdb                                    # default suite (debug)
-cargo test --release -p tn-lmdb -- --ignored --skip tn_lmdb_sync_and_merge --skip stamp_probe --skip reusable_probe  # heavy variants (about 4–5 min)
+cargo test --release -p tn-lmdb -- --ignored --skip tn_lmdb_sync_and_merge --skip stamp_probe  # heavy variants (about 10 min)
 cargo test --release -p tn-lmdb tn_lmdb_sync_and_merge -- --ignored --nocapture --test-threads 1  # benchmark
 cargo test --release -p tn-lmdb stamp_probe -- --ignored --nocapture --test-threads 1  # step 3's probe
 ```
@@ -2272,7 +2211,7 @@ The Linux numbers are the A/B rows of three runs on a Linux x86_64 laptop (i7-13
 runs on the same code. They were taken when these rows ran in the comparison bench, whose runs are
 in [`engine-bench.md`](../tn-lmdb-reth/engine-bench.md).
 
-**After the change**, on the Mac (medians of three targeted runs, 2026-10-20, before M2), the
+**After the change**, on the Mac (medians of three targeted runs, 2026-10-20), the
 small-commit median is 73.2 us at 4K and 90.2 us at 16K (it was 114 and 130 us; the "fdatasync"
 rows read 72 and 81 us in the same runs), and the bulk commits, the mixed row and `clear_table`
 are level (sequential commit 34.5 vs 34.9 ms, random 85.5 vs 87.9 ms at 4K). On Linux the small
@@ -2281,3 +2220,29 @@ commits are not yet measured under the new rule (see
 
 **Open:** at 16K on the Mac, a one-range small commit synced by `msync` is still slower than by
 `fdatasync` (median 89–90 vs 81–82 us, p99 158–165 vs 96–97 us). At 4K the two match.
+
+---
+
+## Milestones
+
+- **M1, the crash-safe core:** copy-on-write B+trees in one page file, two metas, gated page
+  reuse, the persisted free list, the failure latch, `Env::check`, and the crash and damage
+  suites. Its performance work added provenance trust, the path cache, `append` and cursor puts;
+  step 4 then became one sync (an `msync` of one range, else one `fdatasync`).
+- **M2, what reth's tables need:** format v2 with page counters in every `TreeRoot`; overflow runs
+  for values up to 16 MiB, with run allocation (first fit, gated records loaded for a fit, tail
+  reuse) and a record's leftover pages listed again under the consumed keys; merging on delete;
+  a delete in one descent; the read-only open; owned (`RoCursor`) and detached (`TxnCursor`)
+  cursors; `insert` (`KeyExists`); prefix steps; a cursor that rests on the follower after a
+  delete, so a walk that deletes as it goes skips nothing; `KeyTail`; and the reth adapter, [`tn-lmdb-reth`](../tn-lmdb-reth/README.md).
+- **M3, TN's reth database:** TN runs its reth database on tn-lmdb behind the `tn-lmdb` feature,
+  migrating an MDBX one at its first open (`crates/tn-reth`'s README); dup tables as nested
+  trees with packed small sets ([Dup tables](#dup-tables)); leaf values inline up to half a page;
+  a growth cap (`EnvOptions::max_growth`) and a clean close that gives back the preallocated
+  tail ([Close](#close)). On 2026-11-04 TN's reth execution bench on Linux (six load profiles,
+  A B B A, commits judged where both engines' drive syncs ran fast) put tn-lmdb within 2% of MDBX
+  at peak and busy load and within 5% on the other four profiles, with its tables within 1–3% of
+  MDBX's size. Of the remaining peak cost, most is step 3's page CRCs, which MDBX does not have.
+- **Next:** a faster page checksum for step 3 (the checks stay); the reth storage changes that
+  move the changesets out of the database; and a bound on `NoSync`'s growth, which the reth
+  integration needs before it accepts `--db.sync-mode safe-no-sync`.

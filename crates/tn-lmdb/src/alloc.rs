@@ -88,10 +88,17 @@ pub(crate) struct Allocator {
     /// to `freed`), so a test can hold the records a commit writes to the old code's.
     #[cfg(test)]
     pub(crate) reference_save: bool,
-    /// Test-only: `(txn, page)` for every page a transaction loaded from the free list.
+    /// Test-only: fill [`Self::load_log`] and [`Self::free_log`]. Off at every open, so the
+    /// release benchmark and probes, compiled with the test configuration, do not grow them on
+    /// the commit path; a test that reads them sets it after each open.
+    #[cfg(test)]
+    pub(crate) log_pages: bool,
+    /// Test-only: `(txn, page)` for every page a transaction loaded from the free list, while
+    /// [`Self::log_pages`] is set.
     #[cfg(test)]
     pub(crate) load_log: Vec<(u64, u32)>,
-    /// Test-only: `(txn, page)` for every published page a committed transaction freed.
+    /// Test-only: `(txn, page)` for every published page a committed transaction freed, while
+    /// [`Self::log_pages`] is set.
     #[cfg(test)]
     pub(crate) free_log: Vec<(u64, u32)>,
     /// Test-only: what run allocation did (see [`RunStats`]).
@@ -131,6 +138,8 @@ impl Allocator {
             fail_allocs_after: None,
             #[cfg(test)]
             reference_save: false,
+            #[cfg(test)]
+            log_pages: false,
             #[cfg(test)]
             load_log: Vec::new(),
             #[cfg(test)]
@@ -235,11 +244,12 @@ impl Allocator {
         }
         for &p in &pages {
             self.loaded.insert(p);
-            #[cfg(test)]
-            self.load_log.push((self.txn, p));
         }
         #[cfg(test)]
         {
+            if self.log_pages {
+                self.load_log.extend(pages.iter().map(|&p| (self.txn, p)));
+            }
             self.run_stats.records += 1;
         }
         self.pool.extend(pages);
@@ -333,7 +343,9 @@ impl Allocator {
     /// emptied.
     pub(crate) fn saved(&mut self) {
         #[cfg(test)]
-        self.free_log.extend(self.freed.iter().map(|&p| (self.txn, p)));
+        if self.log_pages {
+            self.free_log.extend(self.freed.iter().map(|&p| (self.txn, p)));
+        }
         self.freed.clear();
         self.pool.clear();
     }
@@ -1144,50 +1156,5 @@ mod tests {
             want.sort_unstable();
             assert_eq!(merge_sorted(&a, &b), want, "case {case}");
         }
-    }
-
-    /// On-demand probe: [`Allocator::reusable`] against [`Allocator::reusable_reference`], and
-    /// [`sort_pages`] against `sort_unstable`, on a peak commit's lists (100K freed pages, 100K
-    /// pool pages, distinct, of a 4M-page file). Run with
-    /// `cargo test --release -p tn-lmdb reusable_probe -- --ignored --nocapture`.
-    #[test]
-    #[ignore = "on-demand probe; run with --release --ignored --nocapture"]
-    fn reusable_probe() {
-        let mut rng = crate::tree::test_harness::Rng(0x9e0b_0000_0000_0001);
-        let mut a = Allocator::new(1, u32::MAX);
-        let mut pages: Vec<u32> = (2..4_000_002).collect();
-        for i in (1..pages.len()).rev() {
-            pages.swap(i, rng.below(i as u64 + 1) as usize);
-        }
-        a.pool = pages[..100_000].to_vec();
-        a.freed = pages[100_000..200_000].to_vec();
-        let time = |f: &mut dyn FnMut()| {
-            let mut ns: Vec<u128> = (0..21)
-                .map(|_| {
-                    let t = std::time::Instant::now();
-                    f();
-                    t.elapsed().as_nanos()
-                })
-                .collect();
-            ns.sort_unstable();
-            ns[ns.len() / 2] as f64 / 1e6
-        };
-        let reference = time(&mut || drop(std::hint::black_box(a.reusable_reference())));
-        let new = time(&mut || drop(std::hint::black_box(a.reusable())));
-        let comparison = time(&mut || {
-            let mut v = a.pool.clone();
-            v.sort_unstable();
-            std::hint::black_box(v);
-        });
-        let radix = time(&mut || {
-            let mut v = a.pool.clone();
-            sort_pages(&mut v);
-            std::hint::black_box(v);
-        });
-        println!(
-            "\nreusable probe, 100K + 100K pages (medians of 21): reference {reference:.3} ms, \
-             reusable {new:.3} ms; one 100K list: sort_unstable {comparison:.3} ms, sort_pages \
-             {radix:.3} ms"
-        );
     }
 }

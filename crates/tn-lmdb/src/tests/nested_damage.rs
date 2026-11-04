@@ -64,7 +64,7 @@ fn forged() -> Forged {
         assert!(root.height >= 2 && root.overflow_pages > 0, "{root:?}");
         let snapshot = env.inner().current();
         let leaf_of = |i: u32| {
-            descend(&*snapshot, &root, &key(i), |_, _, _, _| Ok(()), None)
+            descend(&*snapshot, &root, &key(i), |_, _, _, _| Ok(()))
                 .expect("descend")
                 .expect("leaf")
                 .pgno

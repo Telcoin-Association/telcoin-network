@@ -69,7 +69,13 @@ fn page_count(env: &Env) -> u32 {
 /// `(txn, page)` events the writer logged.
 type Log = Vec<(u64, u32)>;
 
-/// The loads and frees the writer logged.
+/// Turn on the writer's page logs (`Allocator::log_pages`), which [`logs`] reads, until `env`
+/// closes.
+fn log_pages(env: &Env) {
+    env.with_writer(|w| w.alloc.log_pages = true);
+}
+
+/// The loads and frees the writer logged since [`log_pages`].
 fn logs(env: &Env) -> (Log, Log) {
     env.with_writer(|w| (w.alloc.load_log.clone(), w.alloc.free_log.clone()))
 }
@@ -140,6 +146,7 @@ fn record_codec_round_trips_and_refuses_damage() {
 fn a_held_reader_keeps_its_pages() {
     let (_dir, path) = temp();
     let env = open(&path, SyncMode::Durable);
+    log_pages(&env);
     for generation in 0..6 {
         churn(&env, "t", 300, generation, 100);
     }
@@ -175,6 +182,7 @@ fn a_held_reader_keeps_its_pages() {
 fn durable_reuse_waits_two_commits() {
     let (_dir, path) = temp();
     let env = open(&path, SyncMode::Durable);
+    log_pages(&env);
     for generation in 0..30 {
         churn(&env, "t", 200, generation, 120);
         check(&env);
@@ -185,6 +193,25 @@ fn durable_reuse_waits_two_commits() {
         assert!(t >= n + 2, "page {p} freed by txn {n} reused by txn {t}");
     }
     assert_eq!(reuses.iter().map(|&(t, n, _)| t - n).min(), Some(2), "and as soon as that");
+}
+
+/// The page logs stay empty until a test turns them on, though pages are freed and reused: the
+/// release benchmark and probes, compiled with the test configuration, never grow them.
+#[test]
+fn the_page_logs_stay_empty_until_a_test_turns_them_on() {
+    let (_dir, path) = temp();
+    let env = open(&path, SyncMode::Durable);
+    for generation in 0..8 {
+        churn(&env, "t", 200, generation, 120);
+    }
+    assert!(env.with_writer(|w| w.alloc.run_stats.records) > 0, "free records were loaded");
+    assert_eq!(logs(&env), (Vec::new(), Vec::new()), "nothing is logged by default");
+    log_pages(&env);
+    for generation in 8..16 {
+        churn(&env, "t", 200, generation, 120);
+    }
+    let (loads, frees) = logs(&env);
+    assert!(!loads.is_empty() && !frees.is_empty(), "turned on, both logs fill");
 }
 
 /// The free records of the newest state, in key order, with the pages each lists.
@@ -208,6 +235,7 @@ fn free_records(env: &Env) -> Vec<(RecordKey, Vec<u32>)> {
 fn leftover_pages_are_listed_under_the_keys_taken_and_reused_at_once() {
     let (_dir, path) = temp();
     let env = open(&path, SyncMode::Durable);
+    log_pages(&env);
     let mut txn = env.begin_rw().expect("begin");
     let a = txn.create_table("a").expect("a");
     for i in 0..300 {
@@ -255,6 +283,7 @@ fn leftover_pages_are_listed_under_the_keys_taken_and_reused_at_once() {
 fn nosync_reuse_waits_for_two_syncs() {
     let (_dir, path) = temp();
     let env = open(&path, SyncMode::NoSync);
+    log_pages(&env);
     let mut slot_floor: HashMap<u64, u64> = HashMap::new();
     let mut step = |env: &Env, generation: u32| {
         let floor = env.with_writer(|w| w.slots().iter().flatten().copied().min().expect("valid"));
@@ -344,6 +373,7 @@ fn dropped_and_cleared_tables_pages_are_reused() {
 fn an_abort_returns_the_records_it_took() {
     let (_dir, path) = temp();
     let env = open(&path, SyncMode::Durable);
+    log_pages(&env);
     for generation in 0..4 {
         churn(&env, "t", 300, generation, 100);
     }
@@ -457,6 +487,7 @@ fn random_workload(seed: u64, page_size: u32, sync: SyncMode, rounds: u32) {
     let (_dir, path) = temp();
     let options = EnvOptions { page_size, sync, ..EnvOptions::default() };
     let mut env = Env::open(&path, options).expect("open");
+    log_pages(&env);
     // The inline limit: the workload's values stay in their leaves.
     let max_value = crate::page::Geometry::new(page_size).expect("geometry").max_value(4);
     type Model = BTreeMap<String, BTreeMap<u32, Vec<u8>>>;
@@ -524,6 +555,7 @@ fn random_workload(seed: u64, page_size: u32, sync: SyncMode, rounds: u32) {
             reused += logs(&env).0.len();
             drop(env);
             env = Env::open(&path, options).expect("reopen");
+            log_pages(&env);
             check(&env);
         }
         if round % 16 == 0 {
@@ -677,6 +709,7 @@ fn damaged_free_records_are_never_handed_out() {
         fs::copy(&base, &path).expect("copy");
         damage(&path);
         let env = open(&path, SyncMode::Durable);
+        log_pages(&env);
         let mut txn = env.begin_rw().expect("begin");
         let t = txn.create_table("x").expect("x");
         let mut failed = None;
@@ -704,6 +737,7 @@ fn power_loss_after_reuse_recovers_a_committed_state() {
         for random in [None, Some(1_u64), Some(2), Some(3)] {
             let (_dir, path) = temp();
             let env = open(&path, sync);
+            log_pages(&env);
             disk_model::track(&path);
             let (mut latest, mut durable) = (BTreeMap::new(), BTreeMap::new());
             for generation in 0..24 {
@@ -1388,6 +1422,7 @@ fn a_run_loads_at_most_its_budget_of_records() {
 fn an_abort_returns_the_records_a_run_loaded() {
     let (_dir, path) = temp();
     let f = scattered_records(&path, None);
+    log_pages(&f.env);
     let free_root = f.env.inner().current().meta.free;
     let take = |commit: bool| -> (u32, Vec<u32>) {
         let before = logs(&f.env).0.len();
@@ -1467,10 +1502,6 @@ fn run_churn(keys: u32, rewrites: u32, commits: u32, readers: bool, max_ratio: f
             model[i as usize] = (c, len);
         }
         txn.commit().expect("commit");
-        env.with_writer(|w| {
-            w.alloc.load_log.clear();
-            w.alloc.free_log.clear();
-        });
         if c % every == 0 || c == commits {
             let r = check(&env);
             let live = r.catalog_pages + r.table_pages + r.free_tree_pages;

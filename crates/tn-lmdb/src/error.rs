@@ -8,8 +8,10 @@ pub enum Error {
     /// An I/O error from the page file or its directory.
     #[error("tn-lmdb: i/o error: {0}")]
     Io(#[from] io::Error),
-    /// Damage found in the file: a page or meta that fails its checks. The environment is
-    /// latched (later writes fail); reads continue.
+    /// Damage found in the file: a page or meta that fails its checks. Found by a read, a write
+    /// or [`crate::Env::check`], it latches the environment (later writes fail; reads continue);
+    /// from [`crate::Env::open`] or [`crate::Env::open_read_only`] there is no environment to
+    /// latch.
     #[error("tn-lmdb: corrupt database: {0}")]
     Corrupt(String),
     /// The environment is latched by an earlier failure (I/O, growth, commit or damage), or this

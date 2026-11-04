@@ -191,7 +191,10 @@ pub(super) fn run_case(base: &Base, sync: SyncMode, by_msync: bool, at: Option<C
     fs::copy(&base.path, &path).expect("copy");
     disk_model::track(&path);
     let env = open(&path, sync);
-    env.with_writer(|w| w.data_by_msync = by_msync);
+    env.with_writer(|w| {
+        w.data_by_msync = by_msync;
+        w.alloc.log_pages = true;
+    });
     let mut latest = base.state.clone();
     if sync == SyncMode::NoSync {
         for round in 0..2 {
@@ -590,7 +593,7 @@ fn cell(env: &Env, k: u32) -> Cell {
     let snapshot = env.inner().current();
     let packed_max = usize::from(dup_record(env).packed_max);
     let key = k.to_be_bytes();
-    let leaf = descend(&*snapshot, &tree(env, DUP), &key, |_, _, _, _| Ok(()), None)
+    let leaf = descend(&*snapshot, &tree(env, DUP), &key, |_, _, _, _| Ok(()))
         .expect("descend")
         .expect("a leaf");
     match page::leaf_find(snapshot.page(leaf.pgno).expect("the outer leaf"), &key).expect("find") {

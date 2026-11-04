@@ -1,5 +1,13 @@
-//! Test harness for the tree layer: an in-memory page store ([`MemStore`]), a structural walker
-//! ([`walk_tree`]), and a seeded random stream ([`Rng`], [`ReportSeed`]).
+//! Test harness for the tree layer:
+//! - an in-memory page store ([`MemStore`]), its readers' snapshots ([`ReadView`], from
+//!   [`MemStore::reader`] and [`MemStore::reader_at`]) and its page accounting
+//!   ([`MemStore::assert_accounting`], [`MemStore::counted`]);
+//! - structural walkers: [`walk_tree`] of a table's tree (a nested cell panics),
+//!   [`walk_outer_tree`] of a dup table's outer tree (every cell nested) and [`walk_packing_tree`]
+//!   of an outer tree that packs (nested or inline cells);
+//! - the merge-closed check ([`level_keys`] before a delete, [`merge_open_pages`] after) and the
+//!   fill measures ([`leaf_fill`], [`page_fill`]);
+//! - a seeded random stream ([`Rng`], [`ReportSeed`]).
 
 use std::collections::HashSet;
 

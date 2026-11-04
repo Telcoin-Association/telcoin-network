@@ -152,6 +152,38 @@ impl TreeRoot {
         Ok(())
     }
 
+    /// Count one more entry (a put's insert). Only a damaged handle counts `u64::MAX` entries:
+    /// [`Error::Corrupt`] naming it, the handle unchanged.
+    #[inline]
+    pub(crate) fn add_entry(&mut self) -> Result<()> {
+        match self.entries.checked_add(1) {
+            Some(entries) => {
+                self.entries = entries;
+                Ok(())
+            }
+            None => Err(self.entries_error("counts more entries than a tree holds")),
+        }
+    }
+
+    /// Count one entry fewer (a delete's). A handle that counts none is damaged:
+    /// [`Error::Corrupt`] naming it, the handle unchanged.
+    #[inline]
+    pub(crate) fn remove_entry(&mut self) -> Result<()> {
+        match self.entries.checked_sub(1) {
+            Some(entries) => {
+                self.entries = entries;
+                Ok(())
+            }
+            None => Err(self.entries_error("counts no entry for a delete to remove")),
+        }
+    }
+
+    /// [`Self::add_entry`]'s and [`Self::remove_entry`]'s refusal, built out of line.
+    #[cold]
+    fn entries_error(&self, what: &str) -> Error {
+        Error::Corrupt(format!("tree root {self:?} {what}"))
+    }
+
     /// Count a new overflow run of `n` pages (a put's). Only a damaged handle can count past
     /// [`MAX_TREE_PAGES`]: [`Error::Corrupt`], the handle unchanged.
     pub(crate) fn add_run(&mut self, n: u32) -> Result<()> {

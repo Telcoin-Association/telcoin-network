@@ -319,8 +319,8 @@ enum DupEntry<'m> {
     Packed,
 }
 
-/// The rows of an outer key for a read in the write transaction ([`Work::dup_rows`]).
-enum DupRows<'t> {
+/// The rows of an outer key for a read in the write transaction ([`Work::key_rows`]).
+enum KeyRows<'t> {
     /// The key's nested tree: its working root, else its cell's committed root.
     Nested(TreeRoot),
     /// The key's packed set as its cell holds it, unchecked.
@@ -484,7 +484,7 @@ fn apply_delta(
 
 /// Where a dup put left its row, for a [`DupTxnCursor`] to land on it ([`dup_put`]).
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct DupPlaced {
+struct DupPlaced {
     /// True if the put created its outer key (a new nested tree or packed set, and its cell):
     /// the outer tree changed.
     created: bool,
@@ -499,7 +499,7 @@ pub(crate) struct DupPlaced {
 /// What a dup delete did, for a [`DupTxnCursor`] to land on the deleted row's follower
 /// ([`dup_delete`]).
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct DupRemoved {
+struct DupRemoved {
     /// True if the row was there (and is now gone).
     found: bool,
     /// True if the delete emptied the key's nested tree or packed set, so the key's outer cell
@@ -536,8 +536,7 @@ fn dup_put(
     // Test-only: emptied caches per write, so every write descends.
     #[cfg(test)]
     if writer.no_path_cache {
-        w.cache.forget();
-        w.nested.values_mut().for_each(|n| n.cache.forget());
+        w.forget_caches();
     }
     // Test-only: every write searches and finds its cell from the root, as before the hints.
     #[cfg(test)]
@@ -595,7 +594,7 @@ fn dup_put(
     // A key with no cell: its nested tree first, then the cell naming it, current from the start.
     let (mut root, mut root_trusted) = (TreeRoot::EMPTY, false);
     let mut cache = Box::<write::PathCache>::default();
-    let placed = write::put_cached(
+    write::put_cached(
         writer,
         &mut root,
         &mut root_trusted,
@@ -631,7 +630,7 @@ fn dup_put(
     apply_delta(dup, &w.table, k, &TreeRoot::EMPTY, &root)?;
     w.nested.insert(k.into(), Nested { root, trusted: root_trusted, changed: false, cache });
     work.set_dup_record(i, outer, trusted);
-    Ok(DupPlaced { created: true, slot: placed.slot() })
+    Ok(DupPlaced { created: true, slot: None })
 }
 
 /// [`dup_put`] of the new outer key `k` whose first row (`s`, `v`) fits the dup table's
@@ -845,8 +844,7 @@ fn dup_delete(work: &mut Work, i: usize, key: &[u8], hints: DupHint<'_>) -> Resu
     let uncached = writer.no_path_cache;
     #[cfg(test)]
     if uncached {
-        w.cache.forget();
-        w.nested.values_mut().for_each(|n| n.cache.forget());
+        w.forget_caches();
     }
     // Test-only: every delete searches and finds its cell from the root, as before the hints.
     #[cfg(test)]
@@ -977,8 +975,9 @@ fn packed_delete(
 }
 
 /// The get of the logical `key` from the dup table `table` whose outer tree is `outer` in a
-/// published state (`store`): the key's nested tree, through its outer cell, whose subkeys have
-/// 1 to `max_subkey` bytes ([`nested_get`]).
+/// published state (`store`): through the key's outer cell, from its nested tree
+/// ([`nested_get`]) or, in a table that packs, its packed set ([`packed_get`]), whose subkeys
+/// have 1 to `max_subkey` bytes.
 #[inline(never)]
 fn dup_get<'s, S: PageRead + ?Sized>(
     store: &'s S,
@@ -1031,7 +1030,7 @@ fn nested_get<'s, S: PageRead + ?Sized>(
 }
 
 /// [`dup_get`] in the write transaction: the key's nested root from the working map, else its
-/// cell's nested root or packed set ([`Work::dup_rows`]).
+/// cell's nested root or packed set ([`Work::key_rows`]).
 #[inline(never)]
 fn dup_get_in_txn<'t>(
     work: &'t Work,
@@ -1041,13 +1040,13 @@ fn dup_get_in_txn<'t>(
     key: &[u8],
 ) -> Result<Option<&'t [u8]>> {
     let (k, s) = split_dup_key(key, dup.key_len)?;
-    match work.dup_rows(table, outer, dup.packed_max, k)? {
+    match work.key_rows(table, outer, dup.packed_max, k)? {
         None => Ok(None),
-        Some(DupRows::Nested(root)) => {
+        Some(KeyRows::Nested(root)) => {
             let writer = work.writer();
             nested_get(writer, &root, s, writer.geometry.max_subkey(usize::from(dup.key_len)))
         }
-        Some(DupRows::Packed(b)) => {
+        Some(KeyRows::Packed(b)) => {
             let max_subkey = work.writer().geometry.max_subkey(usize::from(dup.key_len));
             packed_get(table, k, b, dup.packed_max, s, max_subkey)
         }
@@ -1131,8 +1130,7 @@ fn dup_delete_prefix(work: &mut Work, i: usize, key: &[u8]) -> Result<u64> {
     let (writer, w) = work.writer_and_table(i);
     #[cfg(test)]
     if writer.no_path_cache {
-        w.cache.forget();
-        w.nested.values_mut().for_each(|n| n.cache.forget());
+        w.forget_caches();
     }
     let (mut outer, mut trusted) = (w.record.root, w.trusted);
     let entry = dup_entry(
@@ -1780,8 +1778,9 @@ impl NestedRoots for SnapshotRoots<'_> {
 /// entered it, as [`RoCursor`]'s moves fetch their leaf.
 ///
 /// Damage a move finds is [`Error::Corrupt`], leaves the cursor unset and latches the environment
-/// (later writes fail; reads continue): a cell that is not a nested cell, an empty or damaged
-/// nested root, an outer key of another width than the table's, and every check of a descent.
+/// (later writes fail; reads continue): an outer cell that is neither a nested cell nor, in a
+/// table that packs, a valid packed set, an empty or damaged nested root, an outer key of another
+/// width than the table's, and every check of a descent.
 pub struct DupRoCursor {
     txn: Arc<RoTxn>,
     /// The table's outer tree in the transaction's snapshot.
@@ -2290,6 +2289,14 @@ impl Working {
             packed_out: Vec::new(),
         }
     }
+
+    /// Test-only: forget the outer path cache and every nested tree's, so the next dup write
+    /// descends (the writer's `no_path_cache` knob).
+    #[cfg(test)]
+    fn forget_caches(&mut self) {
+        self.cache.forget();
+        self.nested.values_mut().for_each(|n| n.cache.forget());
+    }
 }
 
 impl Work {
@@ -2329,24 +2336,24 @@ impl Work {
     /// nested root ([`load_cell`]) or a packed set, unchecked (each read runs the codec's
     /// checks); `None` when the key has no cell. A table with no working record has no map: its
     /// cells are committed.
-    fn dup_rows(
+    fn key_rows(
         &self,
         table: &Table,
         outer: &TreeRoot,
         packed_max: u16,
         k: &[u8],
-    ) -> Result<Option<DupRows<'_>>> {
+    ) -> Result<Option<KeyRows<'_>>> {
         let working = self.tables.iter().find(|w| w.table == *table);
         if let Some(n) = working.and_then(|w| w.nested.get(k)) {
-            return Ok(Some(DupRows::Nested(n.root)));
+            return Ok(Some(KeyRows::Nested(n.root)));
         }
         let writer = self.writer();
         match outer_cell(writer, table, packed_max, outer, k)? {
             None => Ok(None),
             Some(OuterVal::Nested(b)) => {
-                load_cell(writer, table, k, b).map(|r| Some(DupRows::Nested(r)))
+                load_cell(writer, table, k, b).map(|r| Some(KeyRows::Nested(r)))
             }
-            Some(OuterVal::Packed(b)) => Ok(Some(DupRows::Packed(b))),
+            Some(OuterVal::Packed(b)) => Ok(Some(KeyRows::Packed(b))),
         }
     }
 
@@ -2606,8 +2613,9 @@ impl RwTxn {
 
     /// Drop `table`: its pages are freed and its name removed from the catalog. Every handle of
     /// it is stale from now on. A dup table's nested trees are freed with it, in one walk that
-    /// collects every page first: damage (a page reached twice, an outer cell that is not a
-    /// nested tree, totals that do not count the trees) is [`Error::Corrupt`] and frees nothing.
+    /// collects every page first and validates every packed set: damage (a page reached twice,
+    /// an outer cell that is neither a nested cell nor, in a table that packs, a valid packed set,
+    /// totals that do not count the trees and sets) is [`Error::Corrupt`] and frees nothing.
     pub fn drop_table(&mut self, table: Table) -> Result<()> {
         self.write(|work| {
             let record = work.record(&table)?;
@@ -2668,7 +2676,9 @@ impl RwTxn {
     /// In a dup table `key` is the logical key `k ‖ s` (see [`Self::create_dup_table`]): the
     /// limits above apply to the whole key, so a dup table refuses exactly the entries a plain
     /// table keyed `k ‖ s` refuses, and a key with no subkey (at most `key_len` bytes) is then
-    /// [`Error::KeyTooShort`]. The row goes into `k`'s nested tree, which a new `k` creates.
+    /// [`Error::KeyTooShort`]. The row goes into `k`'s rows, which a new `k` creates: in a table
+    /// that packs, its packed set while the set fits the table's `packed_max` (a set that
+    /// outgrows it becomes a nested tree, one for as long as it has rows), else its nested tree.
     pub fn put(&mut self, table: &Table, key: &[u8], value: &[u8]) -> Result<()> {
         self.put_entry(table, key, value, PutKind::Upsert, None, false).map(drop)
     }
@@ -2684,8 +2694,9 @@ impl RwTxn {
     ///
     /// In a dup table the order is the logical key's, `k ‖ s` (every outer key has the same
     /// width): a `k` before the table's last outer key is refused, the last one appends to its
-    /// nested tree (a subkey not past that tree's last is refused), and a later one starts a new
-    /// nested tree. A key with no subkey is [`Error::KeyTooShort`].
+    /// rows (a subkey not past its last is refused), and a later one starts new rows, as
+    /// [`Self::put`] places them (a packed set or a nested tree). A key with no subkey is
+    /// [`Error::KeyTooShort`].
     pub fn append(&mut self, table: &Table, key: &[u8], value: &[u8]) -> Result<()> {
         self.put_entry(table, key, value, PutKind::Append, None, false).map(drop)
     }
@@ -2801,7 +2812,8 @@ impl RwTxn {
     ///
     /// In a dup table `key` is the logical key `k ‖ s`: a key with no subkey is
     /// [`Error::KeyTooShort`] (use [`Self::delete_prefix`] for every row of `k`), and a delete
-    /// that empties `k`'s nested tree removes `k` from the outer tree.
+    /// that empties `k`'s rows (its packed set or its nested tree) removes `k` from the outer
+    /// tree.
     pub fn delete(&mut self, table: &Table, key: &[u8]) -> Result<bool> {
         Ok(self.delete_entry(table, key, write::NO_HINT)?.found())
     }
@@ -2849,10 +2861,11 @@ impl RwTxn {
 
     /// Remove every row of the dup table `table` whose key starts with the outer key `key`
     /// (exactly the table's `key_len` bytes), returning the rows removed (0: no such key, and
-    /// nothing changes). The key's nested tree is freed in one walk that collects every page and
-    /// run before any is freed, and its outer cell removed. [`Error::TableKind`] for a plain
-    /// table; [`Error::KeyTooShort`] for a key shorter than `key_len`, [`Error::KeyTooLarge`] for
-    /// a longer one; each refusal changes nothing and does not latch.
+    /// nothing changes). The key's outer cell is removed, and with it a packed set, or a nested
+    /// tree, which is freed in one walk that collects every page and run before any is freed.
+    /// [`Error::TableKind`] for a plain table; [`Error::KeyTooShort`] for a key shorter than
+    /// `key_len`, [`Error::KeyTooLarge`] for a longer one; each refusal changes nothing and
+    /// does not latch.
     pub fn delete_prefix(&mut self, table: &Table, key: &[u8]) -> Result<u64> {
         self.write(|work| {
             let i = work.working(table)?;
@@ -2996,6 +3009,24 @@ impl RwTxn {
     pub(crate) fn forget_nested(&mut self, table: &Table, k: &[u8]) -> bool {
         let working = self.work.tables.iter_mut().find(|w| w.table == *table);
         working.is_some_and(|w| w.nested.remove(k).is_some())
+    }
+
+    /// Test-only: give outer key `k` an entry in the dup table `table`'s working map, naming the
+    /// nested root of `like`'s entry and changing nothing else: when `k`'s cell is a packed set or
+    /// `k` has none, an entry no nested cell names, which the free walk must refuse
+    /// ([`WalkRoots`]). False if `like` has no entry or `k` has one.
+    #[cfg(test)]
+    pub(crate) fn plant_nested(&mut self, table: &Table, k: &[u8], like: &[u8]) -> bool {
+        let Some(w) = self.work.tables.iter_mut().find(|w| w.table == *table) else {
+            return false;
+        };
+        let Some(root) = w.nested.get(like).map(|n| n.root) else { return false };
+        if w.nested.contains_key(k) {
+            return false;
+        }
+        let cache = Box::default();
+        w.nested.insert(k.into(), Nested { root, trusted: false, changed: false, cache });
+        true
     }
 }
 
@@ -3214,7 +3245,7 @@ impl RwCursor<'_> {
     /// entry's follower, so repeated deletes remove the entries in order. `false` (nothing changes)
     /// if the cursor is not at an entry: unset, before the start, or after the end (a delete of the
     /// table's last entry leaves it there). The cursor is left on the deleted entry's follower in
-    /// the deleted state (see the type docs).
+    /// the deleted state (see the type docs). A failed delete leaves the cursor unset.
     pub fn delete_current(&mut self) -> Result<bool> {
         // The key goes into the deleted-key buffer, reused from the last delete.
         let Self { txn, tree, deleted_key, .. } = self;
@@ -3227,11 +3258,22 @@ impl RwCursor<'_> {
         deleted_key.clear();
         deleted_key.extend_from_slice(k);
         let key = std::mem::take(deleted_key);
-        if !self.txn.delete(&self.table, &key)? {
-            let cause =
-                format!("the entry under a cursor of table {:?} is missing", self.table.name());
-            self.txn.inner.latch.fail(cause.clone());
-            return Err(Error::Failed(cause));
+        let removed = match self.txn.delete(&self.table, &key) {
+            Ok(true) => Ok(()),
+            Ok(false) => {
+                let cause =
+                    format!("the entry under a cursor of table {:?} is missing", self.table.name());
+                self.txn.inner.latch.fail(cause.clone());
+                Err(Error::Failed(cause))
+            }
+            Err(e) => Err(e),
+        };
+        if let Err(e) = removed {
+            // As a `DupTxnCursor`'s failed delete leaves it: unset (the buffer kept).
+            self.tree.unset();
+            self.deleted = false;
+            self.deleted_key = key;
+            return Err(e);
         }
         self.reseek(&key, false)?;
         self.deleted_key = key;
@@ -3416,8 +3458,8 @@ impl Tracker {
 /// [`RwTxn::cursor_detached`]): each call takes the transaction, `&RwTxn` for a move (the entry
 /// returned borrows the transaction) and `&mut RwTxn` for a write. So several cursors, over one
 /// table or several, and the transaction's own writes can interleave, each seeing the others'
-/// writes: what a caller that shares the transaction behind a lock needs (reth's `DbTxMut`, whose
-/// methods all take `&self`). Its moves, states and prefix steps are a [`Cursor`]'s, and its writes
+/// writes: what a caller that shares the transaction behind a lock, whose methods all take
+/// `&self`, needs. Its moves, states and prefix steps are a [`Cursor`]'s, and its writes
 /// and the deleted state an [`RwCursor`]'s.
 ///
 /// **Staleness.** Every call first brings the cursor up to date with the transaction:
@@ -3508,7 +3550,7 @@ impl TxnCursor {
         (self.tree.state(), self.tree.path(), self.root, key, self.track.up_to_date(&txn.work))
     }
 
-    /// Bring the cursor up to date with `work` (see the type docs); [`Self::up_to_date`] is its
+    /// Bring the cursor up to date with `work` (see the type docs); [`Tracker::up_to_date`] is its
     /// fast path.
     #[inline(always)]
     fn sync(&mut self, work: &Work) -> Result<()> {
@@ -3848,13 +3890,15 @@ impl TxnCursor {
     /// another writer), the follower, as [`RwCursor::delete_current`] does. `false` (nothing
     /// changes) if the cursor is not at an entry: unset, before the start, or after the end. The
     /// cursor is left on the deleted entry's follower in the deleted state, as an [`RwCursor`] is.
+    /// A failed delete leaves the cursor unset, as a [`DupTxnCursor`]'s does.
     pub fn delete_current(&mut self, txn: &mut RwTxn) -> Result<bool> {
         self.sync(&txn.work).inspect_err(|e| txn.inner.latch.latch_error(e))?;
         if self.tree.state() != State::At {
             return Ok(false);
         }
         // The saved key is the current entry's (while `deleted`, the follower's); it becomes the
-        // deleted key.
+        // deleted key. A failed delete unsets the cursor, so neither key is read again before the
+        // next landing saves one.
         std::mem::swap(&mut self.key, &mut self.deleted_key);
         let key = std::mem::take(&mut self.deleted_key);
         let deleted = self.delete_key(txn, &key);
@@ -3882,18 +3926,27 @@ impl TxnCursor {
     /// date and at that entry, so the delete's descent routes by its path ([`TreeCursor::hint`]).
     /// The cursor lands on the deleted entry's follower (or after the end): placed from the
     /// table's path cache when the delete left it naming the entry's leaf
-    /// ([`write::Removed::slot`]), else found again by key.
+    /// ([`write::Removed::slot`]), else found again by key. A failed delete leaves it unset.
     fn delete_key(&mut self, txn: &mut RwTxn, key: &[u8]) -> Result<()> {
         let hint = self.tree.hint(self.root.height);
-        let removed = txn.delete_entry(&self.track.table, key, hint)?;
-        if !removed.found() {
-            let cause = format!(
-                "the entry under a cursor of table {:?} is missing",
-                self.track.table.name()
-            );
-            txn.inner.latch.fail(cause.clone());
-            return Err(Error::Failed(cause));
-        }
+        let removed = match txn.delete_entry(&self.track.table, key, hint) {
+            Ok(removed) if removed.found() => removed,
+            Ok(_) => {
+                let cause = format!(
+                    "the entry under a cursor of table {:?} is missing",
+                    self.track.table.name()
+                );
+                txn.inner.latch.fail(cause.clone());
+                self.tree.unset();
+                self.deleted = false;
+                return Err(Error::Failed(cause));
+            }
+            Err(e) => {
+                self.tree.unset();
+                self.deleted = false;
+                return Err(e);
+            }
+        };
         // Also leaves `slot` on the table's working record, which the delete created if needed.
         self.track.writes = self.track.table_writes(&txn.work);
         let Self { track, root, tree, .. } = self;

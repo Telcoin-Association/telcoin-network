@@ -139,12 +139,13 @@ pub(crate) fn run_txn(run: &[u8]) -> u64 {
 }
 
 /// The run `ovf` names, after every check a read makes, shared by every
-/// [`crate::tree::PageRead`] store: `slice(pgno, len)` maps the run's bytes (`None` if not
-/// mapped). The run must lie in `2..page_count` (a checked add), hold `ovf.pgno`, kind 3, flags 0
-/// and zero reserved bytes in its header, a txn no later than `snapshot_txn` whose low 32 bits are
-/// `ovf.txn`, and the length and page count `ovf` implies (`len <=` [`MAX_VALUE`]). A run that is
-/// not `private` to the writer must also carry a non-zero trailer and a valid CRC over the whole
-/// run when `verify` asks for it. Any failure is [`Error::Corrupt`].
+/// [`crate::tree::PageRead`] store: `slice(pgno, len)` maps the run's bytes, exactly `len` of
+/// them (`None` if not mapped). The run must lie in `2..page_count` (a checked add), hold
+/// `ovf.pgno`, kind 3, flags 0 and zero reserved bytes in its header, a txn no later than
+/// `snapshot_txn` whose low 32 bits are `ovf.txn`, and the length and page count `ovf` implies
+/// (`len <=` [`MAX_VALUE`]). A run that is not `private` to the writer must also carry a non-zero
+/// trailer and a valid CRC over the whole run when `verify` asks for it. Any failure is
+/// [`Error::Corrupt`].
 ///
 /// Every read of a value verifies the CRC of a run of more than one page ([`RunCrc::MultiPage`]):
 /// pages 2..n of a run carry no header, so a reused or redirected middle page is caught by the CRC
@@ -175,6 +176,8 @@ pub(crate) fn checked_run<'a>(
     }
     let run = slice(ovf.pgno, n * page_size)
         .ok_or_else(|| run_error(ovf, format_args!("{n} pages are not mapped")))?;
+    // The header reads below and the callers' `value` and `pad_is_zero` index on this length.
+    debug_assert_eq!(run.len(), n * page_size, "a store's slice is not the run's length");
     let u32_at = |off: usize| u32::from_le_bytes(run[off..off + 4].try_into().expect("4 bytes"));
     let txn = run_txn(run);
     if u32_at(PGNO_OFF) != ovf.pgno
@@ -282,6 +285,19 @@ mod tests {
         assert_eq!(run_pages(P - RUN_HEADER - TRAILER, P), 1);
         assert_eq!(run_pages(P - RUN_HEADER - TRAILER + 1, P), 2);
         assert_eq!(run_pages(MAX_VALUE, P), MAX_VALUE / P + 1);
+    }
+
+    /// A store whose slice is shorter than the run breaks [`checked_run`]'s contract: debug
+    /// builds stop at it, before any read past the slice.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "a store's slice is not the run's length")]
+    fn a_slice_shorter_than_the_run_fails_the_debug_assert() {
+        let (file, ovf, count) = image(&three_page_value());
+        let _ = checked_run(ovf, P, count, TXN, false, RunCrc::MultiPage, |p, len| {
+            let start = p as usize * P;
+            file.get(start..start + len - P)
+        });
     }
 
     /// The test page store reads runs through [`checked_run`] against its snapshot: the writer

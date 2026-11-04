@@ -429,10 +429,9 @@ fn run_moves_on<'s>(cursor: &mut impl Moves<'s>, model: &mut Model, rng: &mut Rn
         let got = cursor.apply(&op);
         assert_eq!(got, model.apply(&op), "step {step} {op:?} from {from:?}");
         assert_eq!(cursor.state(), model.state(), "step {step} {op:?} from {from:?}");
-        if matches!(op, Op::NextInPrefix(_) | Op::PrevInPrefix(_)) {
-            // A prefix step that returns nothing keeps the position.
-            assert_eq!(owned(cursor.current().expect("current")), model.current(), "step {step}");
-        }
+        // In every state a call leaves (a prefix step that returns nothing keeps the position):
+        // the public cursor reads its entry from the leaf it holds.
+        assert_eq!(owned(cursor.current().expect("current")), model.current(), "step {step}");
     }
 }
 
@@ -1911,7 +1910,8 @@ fn prefix_steps_after_delete_current_use_the_deleted_key() {
 }
 
 /// Every new cursor zeroes its path and its creation moves the whole cursor (an `RoCursor` per
-/// reth cursor), so the path's steps stay 6 bytes, a page number and a `u16` slot with no padding.
+/// read, as a caller that opens one per lookup makes), so the path's steps stay 6 bytes, a page
+/// number and a `u16` slot with no padding.
 #[test]
 fn tree_cursor_stays_small() {
     let path = 6 * MAX_HEIGHT as usize;

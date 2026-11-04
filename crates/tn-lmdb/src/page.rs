@@ -80,7 +80,7 @@ use crate::{
 };
 
 /// Smallest supported page size.
-pub(crate) const MIN_PAGE_SIZE: usize = 4096;
+const MIN_PAGE_SIZE: usize = 4096;
 /// Largest supported page size (the largest whose cell offsets fit a `u16` slot).
 pub(crate) const MAX_PAGE_SIZE: usize = 65536;
 /// Size of the page header.
@@ -92,7 +92,7 @@ pub(crate) const SLOT: usize = 2;
 /// Fixed part of a leaf cell: `vlen u32 | klen u16 | flags u16`.
 pub(crate) const LEAF_CELL_HEADER: usize = 8;
 /// Fixed part of a branch cell: `child u32 | child_txn u32 | klen u16`.
-pub(crate) const BRANCH_CELL_HEADER: usize = 10;
+const BRANCH_CELL_HEADER: usize = 10;
 
 // Header field offsets.
 const PGNO_OFF: usize = 0;
@@ -161,8 +161,8 @@ pub(crate) enum Val<'a> {
     /// The value's overflow run ([`crate::overflow`]).
     Overflow(Ovf),
     /// A nested tree's root as the cell holds it: the encoded [`TreeRoot`], undecoded and
-    /// unchecked, since a root read from a cell is untrusted until its use checks it. No table
-    /// holds one yet: every use refuses it ([`nested_error`]).
+    /// unchecked, since a root read from a cell is untrusted until its use checks it. Only a dup
+    /// table's outer tree holds one; every other tree's use refuses it ([`nested_error`]).
     Nested(&'a [u8; NESTED_CELL]),
 }
 
@@ -194,10 +194,10 @@ impl<'a> Val<'a> {
 }
 
 /// A value as the leaf mutators ([`LeafMut::insert`], [`LeafMut::replace_value`]) write it into
-/// a cell: inline bytes (`&[u8]`), or either form ([`Val`]). The mutators are generic over it so
-/// that a put of inline bytes, the hot path, compiles to code that never sees the overflow form:
-/// a [`Val`] passed to them through memory and matched there slowed every inline put by a few
-/// percent.
+/// a cell: inline bytes (`&[u8]`), or any [`Val`] (inline, an overflow reference, a nested root).
+/// The mutators are generic over it so that a put of inline bytes, the hot path, compiles to code
+/// that never sees the other forms: a [`Val`] passed to them through memory and matched there
+/// slowed every inline put by a few percent.
 pub(crate) trait CellVal: Copy {
     /// The bytes of the value in the cell ([`Val::cell_len`]).
     fn cell_len(&self) -> usize;
@@ -537,8 +537,9 @@ fn put_u64(buf: &mut [u8], off: usize, v: u64) {
 /// ([`copy_ends`]), so the compiler emits plain loads and stores where `copy_from_slice` of a
 /// length it cannot see calls `memcpy`. Longer slices go to `copy_from_slice`.
 ///
-/// `#[inline(always)]`: the reth adapter instantiates the generic write path ([`LeafMut::insert`])
-/// in its own crate, where a call to this helper would cost more than the `memcpy` it replaces.
+/// `#[inline(always)]`: every put runs it ([`write_leaf_cell`], `CellVal for &[u8]`), where a call
+/// would cost more than the `memcpy` it replaces, and `TxnCursor`'s key buffer (`save_key`) reaches
+/// it on paths the adapter crate compiles.
 #[inline(always)]
 pub(crate) fn copy_short(dst: &mut [u8], src: &[u8]) {
     let n = src.len();
@@ -574,6 +575,15 @@ fn copy_ends<const K: usize>(dst: &mut [u8], src: &[u8]) {
 #[cold]
 fn corrupt(page: &[u8], what: impl Display) -> Error {
     Error::Corrupt(format!("page {}: {what}", pgno(page)))
+}
+
+/// An [`Error::Failed`] naming the page: a write invariant broken, a writer bug, never damage.
+/// The splits' and a new root's checks return it: the page they lay out or split is private,
+/// built by the writer or copied from a page that passed [`validate`], and the pending entry
+/// passed its table's limits ([`Geometry::place`], [`Geometry::check_entry`]).
+#[cold]
+fn invariant(page: &[u8], what: impl Display) -> Error {
+    Error::Failed(format!("b+tree write invariant broken: page {}: {what}", pgno(page)))
 }
 
 // ---- header ----
@@ -1380,9 +1390,9 @@ impl<'a> LeafView<'a> {
 
     /// Entry `i` as its key and, for an inline value, the key's last `t` bytes followed by the
     /// value: `key[klen − t..] ‖ value`, one slice of the cell, since a cell holds its value right
-    /// after its key. An overflow value is its reference, as [`Self::entry`] gives it. A `t` past
-    /// the key's length is the key's length (the slice is then `key ‖ value`): the slice never
-    /// reaches into the cell's fixed part.
+    /// after its key. An overflow or nested value is returned as [`Self::entry`] gives it. A `t`
+    /// past the key's length is the key's length (the slice is then `key ‖ value`): the slice
+    /// never reaches into the cell's fixed part.
     #[inline(always)]
     pub(crate) fn entry_with_key_tail(&self, i: usize, t: usize) -> Result<(&'a [u8], Val<'a>)> {
         let page = self.page;
@@ -1767,9 +1777,9 @@ impl<'a> LeafMut<'a> {
         LeafView { page: self.page, h: self.h }
     }
 
-    /// [`leaf_insert`] of an inline value or an overflow reference ([`CellVal`]). Forced inline,
-    /// as [`Self::new`] is: out of line, `self` went through memory and came back 16 bytes at a
-    /// time over the caller's 8-byte stores.
+    /// `leaf_insert` (test-only) of inline bytes or any [`Val`] ([`CellVal`]). Forced inline, as
+    /// [`Self::new`] is: out of line, `self` went through memory and came back 16 bytes at a time
+    /// over the caller's 8-byte stores.
     #[inline(always)]
     pub(crate) fn insert(self, i: usize, key: &[u8], value: impl CellVal) -> Result<Fit> {
         let Self { page, h } = self;
@@ -1781,8 +1791,8 @@ impl<'a> LeafMut<'a> {
         Ok(Fit::Done)
     }
 
-    /// [`leaf_replace_value`] with an inline value or an overflow reference (either may replace
-    /// either, [`CellVal`]). Forced inline, as [`Self::insert`] is.
+    /// `leaf_replace_value` (test-only) with inline bytes or any [`Val`] (any form may replace any
+    /// other, [`CellVal`]). Forced inline, as [`Self::insert`] is.
     #[inline(always)]
     pub(crate) fn replace_value(self, i: usize, value: impl CellVal) -> Result<Fit> {
         let Self { page, h } = self;
@@ -2096,7 +2106,10 @@ pub(crate) fn init_root(
     if branch_insert(page, 0, &[], left.0, left.1)? == Fit::Full
         || branch_insert(page, 1, sep, right.0, right.1)? == Fit::Full
     {
-        return Err(corrupt(page, format_args!("a {}-byte separator overflows a root", sep.len())));
+        return Err(invariant(
+            page,
+            format_args!("a {}-byte separator overflows a root", sep.len()),
+        ));
     }
     Ok(())
 }
@@ -2287,7 +2300,7 @@ impl SplitBuf {
         // A branch's separator moves up: its cell stays in the right half without the key.
         let right = total - left - if h.kind == Kind::Branch { klen } else { 0 };
         if left > usable || right > usable {
-            return Err(corrupt(
+            return Err(invariant(
                 old,
                 format_args!("split halves of {left} and {right} bytes exceed {usable}"),
             ));
@@ -2303,7 +2316,7 @@ impl SplitBuf {
     /// and slot ([`place_cells`]), so only the free gap keeps `dst`'s old bytes.
     pub(crate) fn write_right(&self, dst: &mut [u8], pgno: u32, txn: u64) -> Result<()> {
         let Some(kind) = self.kind.filter(|_| dst.len() == self.page_size) else {
-            return Err(corrupt(dst, "split target is not a page of the planned source's size"));
+            return Err(invariant(dst, "split target is not a page of the planned source's size"));
         };
         init_header(dst, kind, pgno, txn);
         place_cells(dst, &self.copy, &self.cells[self.left..], kind == Kind::Branch);
@@ -2318,7 +2331,7 @@ impl SplitBuf {
         let old = &self.copy[..self.page_size];
         let Some(kind) = self.kind.filter(|_| src.len() == old.len() && pgno(src) == pgno(old))
         else {
-            return Err(corrupt(src, "split source is not the planned page"));
+            return Err(invariant(src, "split source is not the planned page"));
         };
         init(src, kind, pgno(old), txn(old));
         place_cells(src, &self.copy, &self.cells[..self.left], false);
@@ -2375,7 +2388,7 @@ impl SplitBuf {
     /// the writer), keeping its page number and txn. The other page is the caller's to free.
     pub(crate) fn write_merged(&self, dst: &mut [u8]) -> Result<()> {
         let Some(kind) = self.kind.filter(|_| dst.len() == self.page_size) else {
-            return Err(corrupt(dst, "merge target is not a page of the planned size"));
+            return Err(invariant(dst, "merge target is not a page of the planned size"));
         };
         let (p, t) = (pgno(dst), txn(dst));
         init(dst, kind, p, t);
@@ -2388,7 +2401,10 @@ impl SplitBuf {
 /// guarantee rests on it.
 fn check_split_entry(src: &[u8], kind: Kind, cell_size: usize) -> Result<()> {
     if cell_size.saturating_add(SLOT) > entry_limit(kind, src.len()) {
-        return Err(corrupt(src, format_args!("split entry of {cell_size} bytes over the limit")));
+        return Err(invariant(
+            src,
+            format_args!("split entry of {cell_size} bytes over the limit"),
+        ));
     }
     Ok(())
 }
@@ -2398,7 +2414,7 @@ fn check_split_at(src: &[u8], h: &Hdr, at: usize) -> Result<()> {
     let n = h.nkeys;
     let first = usize::from(h.kind == Kind::Branch);
     if n == 0 || at < first || at > n {
-        return Err(corrupt(src, format_args!("split inserting cell {at} into {n}")));
+        return Err(invariant(src, format_args!("split inserting cell {at} into {n}")));
     }
     Ok(())
 }
@@ -3021,7 +3037,7 @@ mod tests {
                 assert!(matches!(g.place(klen, 0), Err(Error::KeyTooLarge { .. })));
             }
         }
-        // reth's keys at 4 KiB: account history (28), bytecodes (32), storage history (60).
+        // Keys of 20, 28, 32 and 60 bytes at 4 KiB.
         let g = geometry(4096);
         assert_eq!([20, 28, 32, 60].map(|k| g.max_value(k)), [2004, 1996, 1992, 1964]);
         assert_eq!([20, 28, 32, 60].map(|k| g.max_entry_value(k)), [987, 979, 975, 947]);
@@ -4401,7 +4417,8 @@ mod tests {
         }
 
         // The pending entry of a split is held to its kind's limit: `U / 2` for a leaf, `U / 4`
-        // for a branch.
+        // for a branch. The writer holds every entry to its table's limits first, so one past
+        // them here is a writer bug (`Failed`), not damage.
         for size in SIZES {
             let g = geometry(size);
             let mut rng = Rng(u64::from(size) | 1);
@@ -4409,7 +4426,7 @@ mod tests {
             let mv = g.max_value(key.len());
             assert!(buf.split_leaf(&src, at, &key, Val::Inline(&vec![1; mv]), false).is_ok());
             let over = buf.split_leaf(&src, at, &key, Val::Inline(&vec![1; mv + 1]), false);
-            assert!(corrupt_with(over, "split entry"), "{size}");
+            assert!(failed_with(over, "split entry"), "{size}");
 
             let mut branch = fresh(&g, Kind::Branch);
             assert_eq!(branch_insert(&mut branch, 0, &[], 1, 1).unwrap(), Fit::Done);
@@ -4423,7 +4440,7 @@ mod tests {
                 buf.sep = ranked_key(2 * i as u32 + 1, klen);
                 let split = buf.split_branch(&branch, i, 5, 5, false);
                 assert_eq!(split.is_ok(), ok, "{size}/{klen}");
-                assert!(ok || corrupt_with(split, "split entry"), "{size}/{klen}");
+                assert!(ok || failed_with(split, "split entry"), "{size}/{klen}");
             }
         }
     }
@@ -4436,7 +4453,8 @@ mod tests {
     /// right one is under `U / 4` (both seen at every size). With every entry at most `U / 4` the
     /// cut never moves and the split is the reference split's byte for byte. A pending entry is
     /// held to its kind's limit: a leaf's of `U / 2` splits and one of a byte more is refused, a
-    /// branch's of `U / 4` splits and one of a byte more is refused.
+    /// branch's of `U / 4` splits and one of a byte more is refused, as a writer bug
+    /// ([`Error::Failed`]).
     #[test]
     fn leaf_splits_with_entries_up_to_the_leaf_limit_keep_both_halves_in_range() {
         check_leaf_splits_up_to_the_leaf_limit(150);
@@ -4554,9 +4572,49 @@ mod tests {
         }
     }
 
+    /// The splits' and a new root's invariants, which no page bytes from disk reach, fail as a
+    /// writer bug ([`Error::Failed`]), never as damage: a split cell past the page's cells, a
+    /// write of a half or a merge with no plan or into a page of another size, a left half over
+    /// another page than the one planned, a root whose separator does not fit it.
+    #[test]
+    fn split_and_root_invariants_fail_as_writer_bugs() {
+        for size in SIZES {
+            let g = geometry(size);
+            let mut rng = crate::tree::test_harness::Rng(u64::from(size) | 1);
+            let (src, _, at, (key, _)) = random_full_leaf(&g, &mut rng, Geometry::max_value);
+            let nkeys = hdr(&src).unwrap().nkeys;
+            let mut buf = SplitBuf::default();
+            let past = buf.split_leaf(&src, nkeys + 1, &key, Val::Inline(b"v"), false);
+            assert!(failed_with(past, "split inserting"), "{size}");
+
+            let mut page = fresh(&g, Kind::Leaf);
+            let unplanned = SplitBuf::default().write_right(&mut page, 7, 3);
+            assert!(failed_with(unplanned, "split target"), "{size}");
+            let unplanned = SplitBuf::default().write_merged(&mut page);
+            assert!(failed_with(unplanned, "merge target"), "{size}");
+
+            buf.split_leaf(&src, at, &key, Val::Inline(b"v"), false).unwrap();
+            let mut short = vec![0; size as usize / 2];
+            assert!(failed_with(buf.write_right(&mut short, 7, 3), "split target"), "{size}");
+            let mut other = src.clone();
+            set_pgno_txn(&mut other, 8, 3);
+            assert!(failed_with(buf.write_left(&mut other), "split source"), "{size}");
+
+            let sep = vec![1; size as usize];
+            let mut root = fresh(&g, Kind::Branch);
+            let overflow = init_root(&mut root, 9, 3, (1, 1), &sep, (2, 1));
+            assert!(failed_with(overflow, "overflows a root"), "{size}");
+        }
+    }
+
     /// Whether `r` is [`Error::Corrupt`] with a message containing `what`.
     fn corrupt_with<T>(r: Result<T>, what: &str) -> bool {
         matches!(&r, Err(Error::Corrupt(m)) if m.contains(what))
+    }
+
+    /// Whether `r` is [`Error::Failed`] (a writer bug) with a message containing `what`.
+    fn failed_with<T>(r: Result<T>, what: &str) -> bool {
+        matches!(&r, Err(Error::Failed(m)) if m.contains(what))
     }
 
     /// A nested cell (flags 2, 32 value bytes: an encoded [`TreeRoot`]) reads back as

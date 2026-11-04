@@ -60,6 +60,8 @@ thread_local! {
     /// [`page::BranchView::route`] and each leaf searched by [`page::LeafView::find`] in
     /// [`find_at`].
     pub(crate) static WRITE_SEARCHES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// Test-only: how many `keys_in_range` checks the writer's descent made.
+    pub(crate) static RANGE_CHECKS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 /// A write's routing hint: the slots of a cursor's path to the entry it is at, root first and the
@@ -154,9 +156,10 @@ impl std::fmt::Debug for Placed {
 
 /// What a delete through a table's [`PathCache`] did ([`delete_cached`]): whether the key was there
 /// and is now gone ([`Self::found`]), and the deleted entry's old slot in the leaf the cache then
-/// names, now its follower's slot (the leaf's entry count if it was the last; [`Self::slot`]),
-/// `None` when the cache is empty after the delete (a miss, or a delete that unlinked, collapsed,
-/// emptied or merged). One word, as [`Placed`] is.
+/// names, now its follower's slot (the leaf's entry count if it was the last; [`Self::slot`]).
+/// The slot is `None` on a miss (whatever the cache then holds: a miss in the cached leaf keeps
+/// it, a trusted miss from the root refills it) and after a delete that left the cache empty (an
+/// unlink, collapse, emptied tree or merge). One word, as [`Placed`] is.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Removed(u64);
 
@@ -180,8 +183,8 @@ impl Removed {
         self.0 & Self::FOUND != 0
     }
 
-    /// The deleted entry's old slot in the leaf the table's [`PathCache`] then names, if the cache
-    /// names one.
+    /// The deleted entry's old slot in the leaf the table's [`PathCache`] then names: `None` on a
+    /// miss, or when the cache names no leaf.
     #[inline(always)]
     pub(crate) const fn slot(self) -> Option<usize> {
         match self.0 & !Self::FOUND {
@@ -398,9 +401,10 @@ pub(crate) enum OuterCell<'a> {
 /// cell of a key with none, `Upsert` replaces the cell of a key whose nested root or packed set
 /// changed, `Append` creates one past the last key. The cell it replaces must be one `cells`
 /// holds (any other is [`Error::Corrupt`]); the tree a replaced nested cell named is not freed
-/// here: the nested writes own it. For a nested root the outer key's length is held to the
-/// quarter-page entry limits ([`Geometry::check_entry`]); an empty `nested` is a broken invariant
-/// (an outer cell names a non-empty tree, which [`page::validate`] requires of every nested cell).
+/// here: the nested writes own it. A nested root is a broken invariant when empty (an outer cell
+/// names a non-empty tree, which [`page::validate`] requires of every nested cell) or when the
+/// outer key is past the quarter-page entry limits ([`Geometry::check_entry`]; the catalog holds
+/// a dup table's key width to [`Geometry::max_dup_key_len`] at create).
 /// A packed set is a broken invariant when empty, under `Outer`, or past those limits (the dup
 /// layer bounds it by the table's `packed_max`, at most [`Geometry::max_entry_value`] of the key).
 /// A descent routes by `hint` where it holds ([`Hint`]).
@@ -422,7 +426,12 @@ pub(crate) fn put_outer_cell<S: PageWrite + ?Sized>(
             if nested.is_empty() {
                 return Err(bug("an outer cell naming an empty nested tree"));
             }
-            store.geometry().check_entry(key.len(), page::NESTED_CELL)?;
+            store.geometry().check_entry(key.len(), page::NESTED_CELL).map_err(|e| {
+                bug(format_args!(
+                    "an outer key of {} bytes past the nested-cell limits: {e}",
+                    key.len()
+                ))
+            })?;
             encoded = nested.encode();
             NewVal::Nested(&encoded, cells)
         }
@@ -606,7 +615,7 @@ fn put_from_root<'v, S: PageWrite + ?Sized>(
                 change_leaf(store, leaf, key, val, i, replace)?;
             }
             if !replace {
-                root.entries += 1;
+                root.add_entry()?;
             }
             (replace, None)
         }
@@ -722,9 +731,9 @@ impl CacheTail<'_> {
 
 /// A table's write-path cache: the leaf its latest write reached, the branches above it, and the
 /// key range `[lo, hi)` that routes to that leaf (the intersection of every ancestor's
-/// separators, as [`read::descend`] keeps it), so the next put or delete landing there skips the
-/// descent ([`put_cached`], [`delete_cached`]). The bounds are owned copies in buffers the cache
-/// reuses.
+/// separators, as [`read::descend`](super::read::descend) keeps it), so the next put or delete
+/// landing there skips the descent ([`put_cached`], [`delete_cached`]). The bounds are owned copies
+/// in buffers the cache reuses.
 ///
 /// It is filled after a put that ended on a trusted path (every page private, built here: see
 /// [`descend_write`]) without a split, or after an append split with the new path (from the split
@@ -892,7 +901,7 @@ fn put_in_cached_leaf<'v, S: PageWrite + ?Sized>(
         return Err(bug("an entry did not fit its cached leaf as planned"));
     }
     if !replaced {
-        root.entries += 1;
+        root.add_entry()?;
     }
     #[cfg(all(test, debug_assertions))]
     CACHED_PUTS.with(|n| n.set(n.get() + 1));
@@ -1032,7 +1041,7 @@ fn delete_in_cached_leaf<S: PageWrite + ?Sized>(
         index
     };
     page.delete(index)?;
-    root.entries -= 1;
+    root.remove_entry()?;
     #[cfg(all(test, debug_assertions))]
     CACHED_DELETES.with(|n| n.set(n.get() + 1));
     Ok(Some(Removed::new(true, Some(index))))
@@ -1074,9 +1083,9 @@ pub(crate) mod plain {
     }
 }
 
-/// The deepest path a write records: a step per branch of the tallest tree accepted. A branch
-/// has two children or more, so a file of at most 2^32 pages holds trees of height 33 or less;
-/// [`TreeRoot::check`] refuses a height over [`MAX_HEIGHT`].
+/// The deepest path a write records: a step per branch of the tallest tree accepted. A tree
+/// grows a level only when its full root splits, so no realistic file nears [`MAX_HEIGHT`];
+/// [`TreeRoot::check`] refuses a height over it, and a split refuses to grow a tree past it.
 const MAX_PATH: usize = MAX_HEIGHT as usize;
 
 /// The branches of a root-to-leaf path, root first, as `(pgno, child index taken)`: a fixed
@@ -1126,12 +1135,6 @@ impl std::ops::DerefMut for Path {
     }
 }
 
-#[cfg(all(test, debug_assertions))]
-thread_local! {
-    /// Test-only: how many `keys_in_range` checks the writer's descent made.
-    pub(crate) static RANGE_CHECKS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
-}
-
 /// A key range `[lo, hi)` from separators (`None`: unbounded).
 type Bounds<'s> = (Option<&'s [u8]>, Option<&'s [u8]>);
 
@@ -1142,10 +1145,10 @@ struct WriteLeaf<'s> {
     view: page::LeafView<'s>,
     /// The keys that route to the leaf, `[lo, hi)`: the intersection of every ancestor's
     /// separators. Once the descent reached an untrusted page it kept that intersection (as
-    /// [`read::descend`] does); on a path of trusted pages it is the nearest separator either
-    /// side, which a trusted page's keys lie within by construction. On a path the descent
-    /// accepts the two agree: an untrusted page's keys lie within its ancestors' intersection
-    /// (`keys_in_range`).
+    /// [`read::descend`](super::read::descend) does); on a path of trusted pages it is the nearest
+    /// separator either side, which a trusted page's keys lie within by construction. On a
+    /// path the descent accepts the two agree: an untrusted page's keys lie within its
+    /// ancestors' intersection (`keys_in_range`).
     range: Bounds<'s>,
     /// [`Verify::Later`] skipped a published page on the path that this writer did not stamp:
     /// [`verify_path`] verifies it before the write trusts or copies it.
@@ -1181,13 +1184,14 @@ enum Verify {
 ///
 /// Every page gets the identity check (header page number and txn equal to its parent's cell's
 /// `child` and `child_txn`, or the root's), kind-versus-depth, and non-root-leaf-not-empty. An
-/// untrusted page also gets [`read::checked_page`]'s checks, [`verify_published`] unless this
-/// writer stamped it (with [`Verify::Later`], [`verify_path`] does that), and `keys_in_range`
-/// against the intersection of every ancestor's separators (as [`read::descend`] keeps it),
-/// computed only once the descent first reaches an untrusted page: until then the separators are
-/// not needed. A page [`verify_published`] checks also gets [`check_cells_naming_this_txn`], so
-/// its private copy names no page or run by this transaction's id that the copy-time trust would
-/// not vouch for; `cells` is the tree's policy for the leaf it checks ([`Cells`]).
+/// untrusted page also gets [`read::checked_page`](super::read::checked_page)'s checks,
+/// [`verify_published`] unless this writer stamped it (with [`Verify::Later`], [`verify_path`] does
+/// that), and `keys_in_range` against the intersection of every ancestor's separators (as
+/// [`read::descend`](super::read::descend) keeps it), computed only once the descent first reaches
+/// an untrusted page: until then the separators are not needed. A page [`verify_published`] checks
+/// also gets [`check_cells_naming_this_txn`], so its private copy names no page or run by this
+/// transaction's id that the copy-time trust would not vouch for; `cells` is the tree's policy for
+/// the leaf it checks ([`Cells`]).
 ///
 /// **The hint.** With a [`Hint`] of the tree's height, each branch takes the hinted child when
 /// `key` lies in that child's range ([`route_by_hint`]: the child's `[lo, hi)` read from the cells,
@@ -1456,9 +1460,10 @@ fn check_cells_naming_this_txn<S: PageWrite + ?Sized>(
     Ok(())
 }
 
-/// The intersection of the separators of every step of `path`, as [`read::descend`] keeps it:
-/// each step's [`page::Route`] read again with [`page::BranchView::route_at`], which gives the
-/// bounds `route` gave. The steps are trusted pages (the first untrusted page asks for this).
+/// The intersection of the separators of every step of `path`, as
+/// [`read::descend`](super::read::descend) keeps it: each step's [`page::Route`] read again with
+/// [`page::BranchView::route_at`], which gives the bounds `route` gave. The steps are trusted pages
+/// (the first untrusted page asks for this).
 fn path_bounds<'s, S: PageWrite + ?Sized>(
     store: &'s S,
     path: &[(u32, usize)],
@@ -1697,7 +1702,7 @@ fn longest_key(page: &[u8]) -> Result<usize> {
 /// does not), and a new root if the root splits. Fullness is by bytes, so it depends on the
 /// separator's length, unknown until the split picks it; but a separator is a key of the page
 /// that splits or the entry it receives, so the longest of those bounds it at every level. An
-/// `append` split's leaf separator is the new key itself ([`page::split_leaf`]).
+/// `append` split's leaf separator is the new key itself ([`page::SplitBuf::split_leaf`]).
 fn split_pages<S: PageRead + ?Sized>(
     store: &S,
     root: &TreeRoot,
@@ -2071,7 +2076,7 @@ fn apply_split<S: PageWrite + ?Sized>(
         }
     };
     if !replace {
-        root.entries += 1;
+        root.add_entry()?;
     }
     Ok(Applied { replaced: replace, right_leaf })
 }
@@ -2119,7 +2124,7 @@ struct DeletePlan {
     /// height drops by one.
     merged_root: bool,
     /// A sibling was read for a merge and did not fit (the test-only [`MergeReport`]).
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     refused: bool,
 }
 
@@ -2196,8 +2201,8 @@ struct Merged {
 
 /// Delete `key` from the tree `root` names, returning whether it was present. One read-only
 /// descent ([`plan_delete`]) finds the key, each page on the path checked as a put checks it. A
-/// miss ends there, after the check a lookup makes of a miss ([`get`]): it verifies, copies,
-/// allocates and frees nothing.
+/// miss ends there, after the check a lookup makes of a miss ([`read::get`](super::read::get)): it
+/// verifies, copies, allocates and frees nothing.
 ///
 /// A hit verifies the published pages on the path before the delete trusts or copies them,
 /// plans the change, reserves the copies of the published pages that stay in the tree, and only
@@ -2415,9 +2420,10 @@ fn plan_delete<S: PageWrite + ?Sized>(
         }
         DeleteShape::Collapse { .. } | DeleteShape::Empty => None,
     };
-    let (mut merges, mut merged_root, mut refused) = (Vec::new(), false, false);
+    // Whether a sibling did not fit is read only by the test-only `MergeReport`.
+    let (mut merges, mut merged_root, mut _refused) = (Vec::new(), false, false);
     if let Some((k, used)) = changed.filter(|_| merging(store)) {
-        (merged_root, refused) = plan_merges(store, path, k, used, cells, &mut merges)?;
+        (merged_root, _refused) = plan_merges(store, path, k, used, cells, &mut merges)?;
     }
     let kept = match shape {
         DeleteShape::Leaf => path.len() + 1,
@@ -2448,7 +2454,8 @@ fn plan_delete<S: PageWrite + ?Sized>(
         after,
         merges,
         merged_root,
-        refused,
+        #[cfg(test)]
+        refused: _refused,
     }))
 }
 
@@ -2471,7 +2478,7 @@ fn merge_due(k: usize, used: usize, usable: usize) -> bool {
 }
 
 /// Whether deletes merge under-full pages: always, but for the test-only knob
-/// ([`PageWrite::no_merge`]).
+/// `PageWrite::no_merge`.
 #[inline]
 fn merging<S: PageWrite + ?Sized>(store: &S) -> bool {
     #[cfg(test)]
@@ -2506,7 +2513,7 @@ fn key1(page: &[u8]) -> Result<Option<&[u8]>> {
 /// Plan the merges of a delete whose change leaves the page at path index `k` (the leaf when `k
 /// == path.len()`, else a branch that lost a child) holding `used` bytes of cells and slots;
 /// returns whether the root gives way ([`DeletePlan::merged_root`]) and whether a sibling read
-/// did not fit ([`DeletePlan::refused`]).
+/// did not fit (`DeletePlan::refused`, which test builds keep).
 ///
 /// While that page is not the root and holds under a quarter of `U`, it absorbs a same-parent
 /// sibling that fits: the left neighbour first, while one fits, then the right one. A pair fits
@@ -2772,7 +2779,9 @@ fn handle_after(
     run_pages: u32,
     merged: Merged,
 ) -> Result<TreeRoot> {
-    let entries = root.entries - 1;
+    let mut counted = *root;
+    counted.remove_entry()?;
+    let entries = counted.entries;
     let overflow_pages = root.overflow_pages.checked_sub(run_pages);
     let unlinked = |root: &TreeRoot| -> Option<TreeRoot> {
         let branches = u32::try_from(dropped.checked_sub(1)?).ok()?;
@@ -5262,7 +5271,7 @@ mod tests {
         assert_holds(&store, &root, &model);
         // Below every key left: into the leaf that became the leftmost.
         let leaf_of = |store: &MemStore, root: &TreeRoot, k: &[u8]| {
-            descend(store, root, k, |_, _, _, _| Ok(()), None).expect("descend").expect("leaf").pgno
+            descend(store, root, k, |_, _, _, _| Ok(())).expect("descend").expect("leaf").pgno
         };
         let smallest = model.keys().next().expect("a key").clone();
         assert_eq!(leaf_of(&store, &root, &[0]), walk.leaves[0]);
@@ -6132,6 +6141,97 @@ mod tests {
         assert_eq!(handle, TreeRoot::EMPTY);
     }
 
+    /// An entry count past what any tree holds is `Corrupt` naming the root, never wrapped. Such a
+    /// handle decodes (`TreeRoot::check` has no rule on the count), so a CRC-valid record can carry
+    /// one: an insert under a count of `u64::MAX`, into a leaf with room, through a split and into
+    /// the path cache's leaf (each reached as the twin with the true count shows), and a delete
+    /// under a count of none (refused by the delete's count check before the count changes).
+    #[test]
+    fn an_entry_count_past_a_trees_bounds_is_corrupt() {
+        let refused = |what: &str, done: Result<bool>, handle: &TreeRoot| {
+            assert!(
+                matches!(&done, Err(Error::Corrupt(m))
+                    if m.contains("tree root") && m.contains("counts more entries")),
+                "{what}: {done:?}"
+            );
+            assert_eq!(handle.entries, u64::MAX, "{what}: the count is not wrapped");
+        };
+        // The right leaf's free space lies between the two values (the twins check it).
+        let max = MemStore::new(4096).geometry().max_value(200);
+        for (what, len, splits) in [("a leaf with room", 10, false), ("a split", max, true)] {
+            let (mut store, root, _) = two_leaf_tree(20);
+            let mut twin = root;
+            let replaced = put(&mut store, &mut twin, &id_key(100, 200), &vec![1; len]);
+            assert!(!replaced.expect("put"), "{what}: the twin inserts");
+            assert_eq!(twin.leaf_pages > root.leaf_pages, splits, "{what}: the twin's shape");
+            let (mut store, root, _) = two_leaf_tree(20);
+            let mut handle = TreeRoot { entries: u64::MAX, ..root };
+            assert_eq!(TreeRoot::decode(&handle.encode()).expect("decode"), handle, "it decodes");
+            let done = put(&mut store, &mut handle, &id_key(100, 200), &vec![1; len]);
+            refused(what, done, &handle);
+        }
+
+        // A private tree whose path cache holds its leaf: the next put lands there.
+        let cached_tree = || {
+            let (mut store, mut root) = (MemStore::new(4096), TreeRoot::EMPTY);
+            let (mut trusted, mut cache) = (false, PathCache::default());
+            for i in 0..5 {
+                put_cached(
+                    &mut store,
+                    &mut root,
+                    &mut trusted,
+                    &mut cache,
+                    &id_key(i, 16),
+                    b"v",
+                    PutKind::Upsert,
+                    NO_HINT,
+                )
+                .expect("put");
+            }
+            (store, root, trusted, cache)
+        };
+        let (mut store, mut twin, mut trusted, mut cache) = cached_tree();
+        #[cfg(debug_assertions)]
+        let cached = CACHED_PUTS.with(std::cell::Cell::get);
+        let key = id_key(9, 16);
+        put_cached(
+            &mut store,
+            &mut twin,
+            &mut trusted,
+            &mut cache,
+            &key,
+            b"v",
+            PutKind::Upsert,
+            NO_HINT,
+        )
+        .expect("put");
+        #[cfg(debug_assertions)]
+        assert_eq!(CACHED_PUTS.with(std::cell::Cell::get), cached + 1, "the twin's put is cached");
+        let (mut store, root, mut trusted, mut cache) = cached_tree();
+        let mut handle = TreeRoot { entries: u64::MAX, ..root };
+        let done = put_cached(
+            &mut store,
+            &mut handle,
+            &mut trusted,
+            &mut cache,
+            &key,
+            b"v",
+            PutKind::Upsert,
+            NO_HINT,
+        )
+        .map(Placed::replaced);
+        refused("the path cache's leaf", done, &handle);
+
+        let (mut store, root, _) = two_leaf_tree(20);
+        let mut handle = TreeRoot { entries: 0, ..root };
+        let deleted = delete(&mut store, &mut handle, &id_key(3, 200));
+        assert!(
+            matches!(&deleted, Err(Error::Corrupt(m)) if m.contains("tree root")),
+            "a delete under a count of none: {deleted:?}"
+        );
+        assert_eq!(handle.entries, 0);
+    }
+
     /// A delete checks the handle it leaves before changing anything: a two-leaf tree whose
     /// handle counts one leaf or one branch too many would collapse to a one-leaf tree counting
     /// two leaves, or a branch, which is `Corrupt`; the handle, the pages and the free lists stay
@@ -6766,7 +6866,7 @@ mod tests {
         assert!(root.height >= 2 && root.overflow_pages > 0, "{root:?}");
         put_through(&mut store, &mut root, Some(&mut cache), &NESTED_KEY, &[150; 32])
             .expect("fill");
-        let leaf = descend(&store, &root, &NESTED_KEY, |_, _, _, _| Ok(()), None)
+        let leaf = descend(&store, &root, &NESTED_KEY, |_, _, _, _| Ok(()))
             .expect("descend")
             .expect("leaf")
             .pgno;
@@ -7539,6 +7639,30 @@ mod tests {
             );
             assert!(matches!(r, Err(Error::Failed(_))), "{cell:?} {cells:?}: {r:?}");
         }
+        // An outer key past the nested-cell limits (wider than any key width the catalog lets a
+        // dup table have), for a nested root and a packed set alike.
+        let geometry = store.geometry();
+        for (klen, cell) in [
+            (geometry.max_dup_key_len() + 1, OuterCell::Nested(&nested)),
+            (geometry.max_key() + 1, OuterCell::Nested(&nested)),
+            (geometry.max_key() + 1, OuterCell::Packed(&[7; 40])),
+        ] {
+            let r = put_outer_cell(
+                &mut store,
+                &mut root,
+                &mut trusted,
+                &mut cache,
+                &vec![9; klen],
+                cell,
+                Cells::Packing,
+                PutKind::Insert,
+                NO_HINT,
+            );
+            assert!(
+                matches!(&r, Err(Error::Failed(m)) if m.contains("past the")),
+                "{klen}-byte key, {cell:?}: {r:?}"
+            );
+        }
         let r = delete_outer_cell(
             &mut store,
             &mut root,
@@ -7762,9 +7886,8 @@ mod tests {
             assert!(root.height >= 2, "{root:?}");
             store.reopen();
             let txn = store.txn();
-            let leaf = descend(&store, &root, &k1, |_, _, _, _| Ok(()), None)
-                .expect("descend")
-                .expect("leaf");
+            let leaf =
+                descend(&store, &root, &k1, |_, _, _, _| Ok(())).expect("descend").expect("leaf");
             assert!(
                 page::leaf_find(leaf.page, &k2).is_ok_and(|f| matches!(f, Find::Found { .. })),
                 "one leaf"
@@ -8245,7 +8368,7 @@ mod tests {
     /// The heavy twin of [`fused_copies_match_the_copy_then_the_change`]: more seeds, rounds and
     /// page sizes.
     #[test]
-    #[ignore = "heavy: run with --ignored in release"]
+    #[ignore = "heavy: run with --release"]
     fn fused_copies_match_the_copy_then_the_change_heavy() {
         for seed in 1..=8_u64 {
             let seed = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15);

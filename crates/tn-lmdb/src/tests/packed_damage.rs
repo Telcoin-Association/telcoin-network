@@ -114,7 +114,7 @@ pub(super) fn packed_fixture() -> PackedFixture {
     assert!(outer.height >= 2, "{outer:?}");
     let mut leaves = BTreeMap::new();
     for k in (0..OUTER).filter(|k| ![PK + 1, PK + 2].contains(k)) {
-        let leaf = descend(&*snapshot, &outer, &k.to_be_bytes(), |_, _, _, _| Ok(()), None)
+        let leaf = descend(&*snapshot, &outer, &k.to_be_bytes(), |_, _, _, _| Ok(()))
             .expect("descend")
             .expect("a leaf")
             .pgno;

@@ -241,7 +241,7 @@ pub(crate) fn encoded_len_with(view: &PackedView<'_>, at: Search, s: &[u8], v: &
 }
 
 /// The length [`build_without`] gives for the same arguments.
-pub(crate) fn encoded_len_without(view: &PackedView<'_>, i: usize) -> usize {
+fn encoded_len_without(view: &PackedView<'_>, i: usize) -> usize {
     let (start, end) = view.range(i);
     view.blob.len() - SLOT - (end - start)
 }

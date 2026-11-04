@@ -127,7 +127,7 @@ pub(crate) fn next_record<'s, S: PageRead + ?Sized>(
             }
             Ok(())
         };
-        let Some(leaf) = descend(store, root, &probe, verify, None)? else {
+        let Some(leaf) = descend(store, root, &probe, verify)? else {
             return Ok(None);
         };
         let (Search::Found(i) | Search::NotFound(i)) = page::leaf_search(leaf.page, &probe)?;

@@ -412,7 +412,7 @@ impl TreeCursor {
     /// the entry is read if a seek entered it: [`Self::check_leaf`]). `None`, the cursor
     /// unmoved, when the move would leave the leaf or the cursor is not at an entry.
     #[inline]
-    pub(crate) fn step_in_leaf<'s, S: PageRead + ?Sized>(
+    fn step_in_leaf<'s, S: PageRead + ?Sized>(
         &mut self,
         store: &'s S,
         leaf: &'s [u8],
@@ -423,7 +423,7 @@ impl TreeCursor {
 
     /// [`Self::step_in_leaf`], the entry read by `R`.
     #[inline]
-    pub(crate) fn step_in_leaf_in<'s, R: CellRead, S: PageRead + ?Sized>(
+    fn step_in_leaf_in<'s, R: CellRead, S: PageRead + ?Sized>(
         &mut self,
         store: &'s S,
         leaf: &'s [u8],
@@ -1517,7 +1517,7 @@ impl<'t> Cursor<'t> {
 
     /// The entry the cursor is at, if it is at one. The cursor does not move.
     pub fn current(&self) -> Result<Option<(&'t [u8], &'t [u8])>> {
-        self.latched(self.tree.current(self.store))
+        self.latched(self.tree.current_in::<Values, _>(self.store, self.leaf))
     }
 
     /// The entry the cursor is at, if it is at one, as its key and its value with the key's last

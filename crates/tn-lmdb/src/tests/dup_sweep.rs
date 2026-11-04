@@ -92,10 +92,7 @@ pub(crate) fn dup_fixture() -> DupFixture {
     let free_leaf =
         (free.root, page::leaf_inline_entry(free_leaf, 0).expect("a record").0.to_vec());
     let leaf_of = |root: &TreeRoot, key: &[u8]| {
-        descend(&*snapshot, root, key, |_, _, _, _| Ok(()), None)
-            .expect("descend")
-            .expect("a leaf")
-            .pgno
+        descend(&*snapshot, root, key, |_, _, _, _| Ok(())).expect("descend").expect("a leaf").pgno
     };
     let outer = tree(&env, "d");
     let cells = (0..OUTER)

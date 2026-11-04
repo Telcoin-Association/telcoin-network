@@ -1642,6 +1642,28 @@ fn a_crash_drops_without_a_trim() {
     assert_eq!(file_len(&path), before, "a crash trims nothing");
 }
 
+/// A `NoSync` close whose final sync fails drops without a trim: the file keeps its length and
+/// reopens to the last synced state. The failure is an injected crash after the data sync, which
+/// leaves the file unpoisoned, so only the failed sync stops the trim.
+#[test]
+fn a_failed_final_sync_skips_the_trim() {
+    let (_dir, path) = temp();
+    let env = Env::open(&path, options(4096, SyncMode::NoSync)).expect("open");
+    commit_rows(&env, "a", 0, 300, 150);
+    env.sync().expect("sync");
+    let synced = env.stat().txn_id;
+    commit_rows(&env, "a", 300, 100, 150);
+    let before = env.with_writer(|w| w.file.file_len());
+    assert!(trimmed_len(&env) < before, "a trim would shorten the file");
+    env.with_writer(|w| w.crash_at = Some(CrashAt::AfterDataSync));
+    drop(env);
+    assert_eq!(file_len(&path), before, "a failed final sync trims nothing");
+    let env = open(&path);
+    assert_eq!(env.stat().txn_id, synced, "the last synced state");
+    env.check().expect("check");
+    assert_rows(&env, "a", 300, 150);
+}
+
 /// After a trim the file grows again from its trimmed length, the next step computed from it
 /// (`clamp(len, MIN_GROWTH, max_growth)` more), and a second clean close trims again.
 #[test]

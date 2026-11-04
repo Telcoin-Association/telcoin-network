@@ -159,7 +159,8 @@ pub(crate) trait NestedRoots {
 }
 
 /// The nested root bytes of outer key `k`'s cell `val` in the dup table `name`: any other cell is
-/// [`Error::Corrupt`] (this build writes only nested cells into an outer tree).
+/// [`Error::Corrupt`] ([`refused_cell`]). A reader of a table that packs takes an inline cell as
+/// the key's packed set before it asks.
 pub(crate) fn nested_cell<'s>(
     name: &str,
     k: &[u8],

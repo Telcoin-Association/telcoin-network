@@ -874,6 +874,41 @@ fn a_free_walk_refuses_packed_totals_that_miss_its_sets() {
     }
 }
 
+/// The free walk's check of the working map, that it met every entry at a nested cell: a drop and
+/// a clear of a table whose map holds an entry no nested cell names (planted through the test
+/// hook with key 1's root, for packed key 2 and for key 9, which has no cell) fail as a broken
+/// invariant (`Error::Failed`), latch, and free nothing: the transaction's freed pages, pool and
+/// page count are as before the call.
+#[test]
+fn a_free_walk_refuses_a_working_entry_no_nested_cell_names() {
+    let dir = TempDir::with_prefix("tn_lmdb_dup_packed_planted").expect("temp dir");
+    let (path, _) = packed_fixture(dir.path());
+    let pages = |txn: &mut RwTxn| {
+        let alloc = &txn.writer_mut().alloc;
+        (alloc.freed().to_vec(), alloc.pool().to_vec(), alloc.page_count())
+    };
+    for planted in [2, 9] {
+        for dropping in [true, false] {
+            let what = format!("key {planted}, drop {dropping}");
+            let (_copy, env) = copy_of(&path);
+            let mut txn = env.begin_rw().expect("rw");
+            let t = txn.open_table("d").expect("open").expect("d");
+            // A write to key 1's nested tree gives it its working entry.
+            txn.put(&t, &lkey(1, &[6]), &val(8, 6)).expect("put");
+            assert!(txn.plant_nested(&t, &[planted; K as usize], &[1; K as usize]), "{what}");
+            let before = pages(&mut txn);
+            let result = if dropping { txn.drop_table(t) } else { txn.clear_table(&t) };
+            assert!(
+                matches!(&result, Err(Error::Failed(m))
+                    if m.contains("the free walk met 1 of its 2 working nested roots")),
+                "{what}: {result:?}"
+            );
+            assert!(env.failure().is_some(), "{what}: latched");
+            assert_eq!(pages(&mut txn), before, "{what}: nothing freed");
+        }
+    }
+}
+
 /// `Env::check` holds a table that packs to its packed sets: [`packed_fixture`]'s table of a
 /// nested and three packed keys passes, its `TableCheck` rows the table's entries (the nested
 /// rows plus the packed ones). Forged (each CRC stamped again), it is `Corrupt`, naming the

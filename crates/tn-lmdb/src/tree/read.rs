@@ -108,12 +108,12 @@ pub(crate) struct Leaf<'s> {
 
 /// Descend from `root` to the leaf whose range holds `key` (`None` for the empty tree). Every
 /// page on the way must be the one its parent names (header page number and txn equal to the
-/// branch cell's `child` and `child_txn`, or the root's), a branch above the tree's height and a
-/// leaf at it, and only the root leaf may be empty; else [`Error::Corrupt`].
+/// branch cell's `child` and `child_txn`, or the root's), a branch at every level above the
+/// leaves and a leaf at the leaf level, and only the root leaf may be empty; else
+/// [`Error::Corrupt`].
 ///
 /// `visit(pgno, page, lo, hi)` sees each page before the descent reads its cells, with the range
-/// its ancestors give it, and may refuse it. With `path`, each branch passed is pushed as
-/// `(pgno, child index taken)`, root first.
+/// its ancestors give it, and may refuse it.
 ///
 /// The range kept is the intersection of every ancestor's, not the nearest one's: in a sound tree
 /// the ranges nest, but a pointer misrouted to another branch brings that branch's separators,
@@ -123,7 +123,6 @@ pub(crate) fn descend<'s, S: PageRead + ?Sized>(
     root: &TreeRoot,
     key: &[u8],
     mut visit: impl FnMut(u32, &'s [u8], Option<&'s [u8]>, Option<&'s [u8]>) -> Result<()>,
-    mut path: Option<&mut Vec<(u32, usize)>>,
 ) -> Result<Option<Leaf<'s>>> {
     root.check()?;
     if root.is_empty() {
@@ -150,9 +149,6 @@ pub(crate) fn descend<'s, S: PageRead + ?Sized>(
         }
         let route = page::branch_route(page, key)?;
         tighten(&route, &mut lo, &mut hi);
-        if let Some(path) = path.as_deref_mut() {
-            path.push((pgno, route.index));
-        }
         (pgno, want_txn) = (route.child, route.child_txn);
     }
     // The loop returns at depth == height (checked to be >= 1 by `root.check`).
@@ -247,7 +243,7 @@ fn find_in<'s, S: PageRead + ?Sized>(
     key: &[u8],
     beside: impl Fn(u32, &[u8]) -> Result<()>,
 ) -> Result<Option<Val<'s>>> {
-    let Some(leaf) = descend(store, root, key, |_, _, _, _| Ok(()), None)? else {
+    let Some(leaf) = descend(store, root, key, |_, _, _, _| Ok(()))? else {
         return Ok(None);
     };
     match page::leaf_find(leaf.page, key)? {

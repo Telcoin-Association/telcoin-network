@@ -57,6 +57,7 @@ impl Drop for StopOnDrop<'_> {
 fn readers_under_churn(readers: usize, commits: u32, sync: SyncMode, seed: u64) {
     let (_dir, path) = temp("tn_lmdb_concurrency");
     let env = open(&path, sync);
+    env.with_writer(|w| w.alloc.log_pages = true);
     let mut model = Rows::new();
     let stop = AtomicBool::new(false);
     let (rescans, fresh, committed) = (AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0));

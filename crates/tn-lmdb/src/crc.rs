@@ -1,6 +1,11 @@
 //! CRC-32 helpers: the shared [`crc32`] / [`crc32_update`] (with an aarch64 PMULL fast path), and
 //! functions that add and check a CRC-32 trailer on byte buffers. The trailer is always the last
 //! four bytes, little endian.
+//!
+//! The code is a copy of `crates/storage/src/archive/crc.rs`; keep it one. Two things differ: the
+//! doc comments, which speak of this crate's B+tree pages where that file speaks of its digest
+//! index, and the `allow(dead_code)` outside tests on [`check_crc`] and [`add_crc32`], which only
+//! the unit tests call here. A sync from that file keeps both.
 
 /// A CRC of exactly zero is indistinguishable from the all-zero "dirty" sentinel [`zero_crc`]
 /// writes, so buffers whose validity is classified by [`crc_state`] (the B+tree pages) are

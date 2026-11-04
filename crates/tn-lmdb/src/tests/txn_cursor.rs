@@ -752,6 +752,85 @@ fn a_refused_insert_through_a_txn_cursor_changes_nothing() {
     check(&env);
 }
 
+/// A `delete_current` the transaction refuses, because the delete's own page allocation failed or
+/// the environment had latched since the cursor's last delete, leaves a write cursor (a
+/// `TxnCursor` or an `RwCursor`) unset, as a `DupTxnCursor`'s failed delete leaves it: its
+/// prefix steps and `follower_shares_prefix` never answer from the saved keys of a delete that
+/// did not happen. Reads continue: `next` from there returns the first entry.
+#[test]
+fn a_failed_delete_through_a_write_cursor_leaves_it_unset() {
+    // A table of 300 entries in a fresh environment (each case latches its own).
+    let fresh = |name: &str| {
+        let (dir, path) = temp(name);
+        let env = open(&path, SyncMode::NoSync);
+        let [a] = filled(&env, &["a"], 300).try_into().expect("one table");
+        (dir, env, a)
+    };
+    let unset = |c: &mut TxnCursor, rw: &RwTxn, what: &str| {
+        assert_eq!(c.state(), (State::Unset, false), "{what}");
+        assert_eq!(c.current(rw).expect("current"), None, "{what}");
+        for n in [0, 8, 32] {
+            assert!(!c.follower_shares_prefix(rw, n).expect("shares"), "{what}: {n}");
+            assert_eq!(c.next_in_prefix(rw, n).expect("step"), None, "{what}: {n}");
+        }
+        assert_eq!(key_of(c.next(rw).expect("next")), 0, "{what}: next from unset");
+    };
+
+    // A `TxnCursor` at an entry of a published leaf: the delete's copy of it fails.
+    let (_dir, env, a) = fresh("tn_lmdb_txn_cursor_failed_alloc");
+    let mut rw = env.begin_rw().expect("begin");
+    let mut c = rw.cursor_detached(&a).expect("cursor");
+    assert!(c.seek_exact(&rw, &key(200)).expect("seek").is_some());
+    rw.writer_mut().alloc.fail_allocs_after = Some(0);
+    assert!(matches!(c.delete_current(&mut rw), Err(Error::Io(_))));
+    rw.writer_mut().alloc.fail_allocs_after = None;
+    assert!(env.failure().is_some(), "the failed write latched");
+    unset(&mut c, &rw, "txn cursor, failed allocation");
+    drop(rw);
+
+    // A `TxnCursor` in the deleted state, on key 6 after deleting key 5: the saved keys there
+    // tell the follower (key 6) from the deleted key (key 5) in their first 8 bytes.
+    let (_dir, env, a) = fresh("tn_lmdb_txn_cursor_failed_latched");
+    let mut rw = env.begin_rw().expect("begin");
+    let mut c = rw.cursor_detached(&a).expect("cursor");
+    assert!(c.seek_exact(&rw, &key(5)).expect("seek").is_some());
+    assert!(c.delete_current(&mut rw).expect("delete"));
+    assert_eq!(c.state(), (State::At, true));
+    assert!(!c.follower_shares_prefix(&rw, 8).expect("shares"), "keys 5 and 6 differ in 8 bytes");
+    env.inner().latch.fail("latched by a test".into());
+    assert!(matches!(c.delete_current(&mut rw), Err(Error::Failed(_))));
+    unset(&mut c, &rw, "txn cursor, deleted state, latched");
+    drop(rw);
+
+    // An `RwCursor`, both ways.
+    let (_dir, env, a) = fresh("tn_lmdb_rw_cursor_failed_alloc");
+    let mut rw = env.begin_rw().expect("begin");
+    rw.writer_mut().alloc.fail_allocs_after = Some(0);
+    let mut c = rw.cursor_mut(&a).expect("cursor");
+    assert!(c.seek_exact(&key(200)).expect("seek").is_some());
+    assert!(matches!(c.delete_current(), Err(Error::Io(_))));
+    assert_eq!(c.state(), (State::Unset, false));
+    assert_eq!(c.current().expect("current"), None);
+    assert_eq!(c.next_in_prefix(0).expect("step"), None);
+    assert_eq!(key_of(c.next().expect("next")), 0);
+    drop(c);
+    drop(rw);
+
+    let (_dir, env, a) = fresh("tn_lmdb_rw_cursor_failed_latched");
+    let mut rw = env.begin_rw().expect("begin");
+    let mut c = rw.cursor_mut(&a).expect("cursor");
+    assert!(c.seek_exact(&key(5)).expect("seek").is_some());
+    assert!(c.delete_current().expect("delete"));
+    assert_eq!(c.state(), (State::At, true));
+    env.inner().latch.fail("latched by a test".into());
+    assert!(matches!(c.delete_current(), Err(Error::Failed(_))));
+    assert_eq!(c.state(), (State::Unset, false));
+    for n in [0, 8] {
+        assert_eq!(c.next_in_prefix(n).expect("step"), None, "{n}");
+    }
+    assert_eq!(key_of(c.next().expect("next")), 0);
+}
+
 /// After `last`, or `prev` from an unset cursor, the cursor is on the table's last entry as after
 /// any move: `next` and `next_in_prefix` move to an entry another cursor or the transaction has put
 /// past it since, and with none return nothing, the cursor then after the end (`current` finds
