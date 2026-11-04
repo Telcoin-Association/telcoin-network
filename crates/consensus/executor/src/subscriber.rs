@@ -972,6 +972,21 @@ impl RejoinBlocker {
     }
 }
 
+// compile-time check that `ALL` lists the blockers in declaration order, so every `index` in it is
+// a valid position in the per-blocker arrays. a blocker inserted without updating `COUNT` and
+// `ALL` fails the build here. stable rust cannot count variants, so a blocker appended after
+// `RoundGap` still needs `COUNT` and `ALL` updated by hand.
+const _: () = {
+    let mut position = 0;
+    while position < RejoinBlocker::COUNT {
+        assert!(
+            RejoinBlocker::ALL[position].index() == position,
+            "RejoinBlocker::ALL out of order"
+        );
+        position += 1;
+    }
+};
+
 /// Resolve the `tn_executor_rejoin_blocked_total{reason}` handles, indexed by
 /// [`RejoinBlocker::index`].
 fn rejoin_blocked_counters() -> [Counter; RejoinBlocker::COUNT] {

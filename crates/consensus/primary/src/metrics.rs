@@ -169,6 +169,18 @@ impl VoteStage {
     }
 }
 
+// compile-time check that `ALL` lists the stages in declaration order, so every `index` in it is
+// a valid position in the per-stage arrays. a stage inserted without updating `COUNT` and `ALL`
+// fails the build here. stable rust cannot count variants, so a stage appended after `Persist`
+// still needs `COUNT` and `ALL` updated by hand.
+const _: () = {
+    let mut position = 0;
+    while position < VoteStage::COUNT {
+        assert!(VoteStage::ALL[position].index() == position, "VoteStage::ALL out of order");
+        position += 1;
+    }
+};
+
 /// Vote path metric handles, resolved once when an epoch's request handler is built.
 ///
 /// Every committee peer sends vote requests several times a second, so the handles are resolved

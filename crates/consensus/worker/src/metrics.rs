@@ -238,23 +238,32 @@ impl WorkerMetrics {
     /// Record a batch request that `peer` answered with `Deny`; the peer stays eligible for
     /// a later pass of the same `request_batches` call.
     pub(crate) fn record_batch_request_denied(&self, peer: &BlsPublicKey) {
-        self.batch_request_counters(peer).denied.increment(1);
+        self.with_batch_request_counters(peer, |counters| counters.denied.increment(1));
     }
 
     /// Record a batch request to `peer` that failed for any reason other than `Deny`
     /// (open error, unsupported protocol, timeout, protocol error); the peer is skipped for
     /// the rest of the `request_batches` call.
     pub(crate) fn record_batch_request_failed(&self, peer: &BlsPublicKey) {
-        self.batch_request_counters(peer).failed.increment(1);
+        self.with_batch_request_counters(peer, |counters| counters.failed.increment(1));
     }
 
-    /// The requester-side counters for `peer`, resolved and cached on first use.
-    fn batch_request_counters(&self, peer: &BlsPublicKey) -> BatchRequestCounters {
-        self.batch_requests
-            .lock()
-            .entry(*peer)
-            .or_insert_with(|| BatchRequestCounters::new(self.worker_id, peer))
-            .clone()
+    /// Apply `record` to the requester-side counters for `peer`, resolving and caching them on
+    /// first use.
+    ///
+    /// `record` runs under the map's lock, so it must stay synchronous and short (one counter
+    /// increment); the lock is never held across an `.await`.
+    fn with_batch_request_counters(
+        &self,
+        peer: &BlsPublicKey,
+        record: impl FnOnce(&BatchRequestCounters),
+    ) {
+        let mut batch_requests = self.batch_requests.lock();
+        record(
+            batch_requests
+                .entry(*peer)
+                .or_insert_with(|| BatchRequestCounters::new(self.worker_id, peer)),
+        );
     }
 }
 
