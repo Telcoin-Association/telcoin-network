@@ -37,7 +37,10 @@
 # Images: one ghcr package per network, chosen by the tag alone. A mainnet tag (vX.Y.Z or
 # vX.Y.Z-rcN) is pushed to ghcr.io/<owner>/tn-mainnet and an adiri tag (vX.Y.Z-adiri or
 # vX.Y.Z-adiri-rcN) to ghcr.io/<owner>/tn-testnet, where <owner> is the owner of the GitHub
-# repository in lower case. `parse` prints the package as PACKAGE.
+# repository in lower case. `parse` prints the package as PACKAGE. build, sign, verify,
+# publish and draft refuse an IMAGE_DIGEST that names an image anywhere else, and the channel
+# alias (latest, adiri) moves only inside the package. A package comes into existence with its
+# first push; build asks before it makes that push.
 #
 # Environment (all optional):
 #   RELEASE_REPO                   owner/repo of the GitHub repository; default
@@ -506,11 +509,13 @@ manifest_head() {
     curl "$@" "$url"
 }
 
-# registry_digest REF: prints the digest the registry serves for IMAGE:REF, or nothing when
-# that tag does not exist. ghcr.io needs an anonymous pull token, which only works for a public
-# package; the dry-run localhost registry is plain http without a token.
+# registry_digest REF [first-push]: prints the digest the registry serves for IMAGE:REF, or
+# nothing when that tag does not exist. ghcr.io needs an anonymous pull token, which only works
+# for a public package; the dry-run localhost registry is plain http without a token. ghcr
+# answers 403 alike for a private package and for one that has never been pushed, so with
+# first-push an answer of 401 or 403 prints the word denied instead of stopping.
 registry_digest() {
-    local ref=$1 host path url token code digest attempt=1 out
+    local ref=$1 mode=${2:-} host path url token code digest attempt=1 out
     need curl
     host=${IMAGE%%/*}
     path=${IMAGE#*/}
@@ -540,7 +545,11 @@ registry_digest() {
                 ;;
             404) return 0 ;;
             401 | 403)
-                die 2 "$IMAGE: the registry answered HTTP $code: package is not public (one-time setup: make the ghcr package public)"
+                if [ "$mode" = first-push ]; then
+                    printf 'denied\n'
+                    return 0
+                fi
+                die 2 "$IMAGE: the registry answered HTTP $code: package is not public, or has never been pushed (one-time setup after its first push: make it public, as the maintainer guide says)"
                 ;;
         esac
         [ "$attempt" -lt 3 ] || die 3 "$IMAGE:$ref: registry unavailable after 3 attempts (last answer: $code)"
@@ -1186,6 +1195,38 @@ check_sums() {
     (cd "$dir" && sha256_check SHA256SUMS) >&2 || die 1 "SHA256SUMS does not match the files"
 }
 
+# $1 is the content of an IMAGE_DIGEST, one line "<repository>@sha256:<hex>". The repository
+# must be IMAGE, the package of the tag's channel (or the dry run's RELEASE_IMAGE): a mainnet
+# tag never names an image in tn-testnet, an adiri tag never one in tn-mainnet, and neither
+# names any other repository. $2, when given, replaces the advice at the end of the refusal.
+check_digest_package() {
+    local line=$1 advice=${2:-rebuild the draft with make release-build TAG=$TAG, or report it if the release is published} repo
+    case "$line" in
+        *$'\n'*) die 1 "IMAGE_DIGEST must be a single line" ;;
+        *@*) ;;
+        *) die 1 "IMAGE_DIGEST names '$line', not an image by digest; expected $IMAGE@sha256:<hex>" ;;
+    esac
+    repo=${line%%@*}
+    [ "$repo" = "$IMAGE" ] ||
+        die 1 "IMAGE_DIGEST names an image in $repo, but $TAG is a $CHANNEL tag and its image is published only in $IMAGE; $advice"
+}
+
+# sign before it signs, verify before it counts signatures: SHA256SUMS in $1 lists exactly one
+# IMAGE_DIGEST, that line hashes the IMAGE_DIGEST file beside it, and the file names an image in
+# the tag's package. A maintainer signature therefore never covers an image in the other
+# network's package. $2 is passed on to check_digest_package as its advice.
+check_sums_package() {
+    local dir=$1 advice=${2:-} listed have line
+    listed=$(awk '$2 == "IMAGE_DIGEST" { n++; h = $1 } END { if (n == 1) print h }' "$dir/SHA256SUMS") ||
+        die 1 "cannot read $dir/SHA256SUMS"
+    have=$(sha256_hex "$dir/IMAGE_DIGEST") || exit
+    if [ -z "$listed" ] || [ "$listed" != "$have" ]; then
+        die 1 "SHA256SUMS does not list the IMAGE_DIGEST beside it exactly once with its hash"
+    fi
+    line=$(cat "$dir/IMAGE_DIGEST") || die 1 "cannot read $dir/IMAGE_DIGEST"
+    check_digest_package "$line" "$advice"
+}
+
 # IMAGE_DIGEST is one line "IMAGE@sha256:<hex>" and the registry still serves IMAGE:TAG at that
 # digest. Sets D.
 check_image_digest_file() {
@@ -1193,10 +1234,7 @@ check_image_digest_file() {
     lines=$(awk 'END { print NR }' "$file")
     line=$(cat "$file")
     [ "$lines" = 1 ] || die 1 "IMAGE_DIGEST must be a single line"
-    case "$line" in
-        "$IMAGE@"*) ;;
-        *) die 1 "IMAGE_DIGEST names '$line'; expected $IMAGE@sha256:<hex>" ;;
-    esac
+    check_digest_package "$line"
     D=${line#"$IMAGE@"}
     [[ "$D" =~ $DIGEST_RE ]] || die 1 "IMAGE_DIGEST holds a malformed digest: $D"
     reg=$(registry_digest "$TAG")
@@ -1417,7 +1455,8 @@ EOF
     done <<EOF
 $ALLOW_LIST
 EOF
-    sed -e "s|@TAG@|$TAG|g" -e "s|@REPO@|$REPO|g" -e "s|@VERSION@|$VERSION|g" -e "s|@IMAGE@|$IMAGE|g" <<'EOF'
+    sed -e "s|@TAG@|$TAG|g" -e "s|@REPO@|$REPO|g" -e "s|@VERSION@|$VERSION|g" -e "s|@IMAGE@|$IMAGE|g" \
+        -e "s|@CHANNEL@|$CHANNEL|g" <<'EOF'
 
 Tarball, only after the last line was `Signature and hashes verified` and the fingerprints matched:
 
@@ -1449,13 +1488,13 @@ grep -v -F "  telcoin-network-$TAG-x86_64-unknown-linux-gnu.tar.gz" SHA256SUMS |
 echo "Signature and hashes verified"
 ```
 
-Only after its last line was `Signature and hashes verified` and the fingerprints matched, check the image. This refuses an `IMAGE_DIGEST` that does not name the release repository by digest:
+Only after its last line was `Signature and hashes verified` and the fingerprints matched, check the image. This refuses an `IMAGE_DIGEST` that does not name an image in `@IMAGE@` by digest; @CHANNEL@ images are published there and nowhere else:
 
 ```sh
 IMAGE_REF=$(cat IMAGE_DIGEST)
 case "$IMAGE_REF" in
   @IMAGE@@sha256:*) docker pull "$IMAGE_REF" && docker run --rm --network none --entrypoint /usr/local/bin/telcoin "$IMAGE_REF" --version ;;
-  *) echo "IMAGE_DIGEST does not name a telcoin-network image by digest: $IMAGE_REF" >&2 ;;
+  *) echo "IMAGE_DIGEST does not name an image in @IMAGE@ by digest: $IMAGE_REF" >&2 ;;
 esac
 ```
 
@@ -1474,7 +1513,7 @@ When a check fails, do not extract, install or run anything from this release:
 - `sha256sum` prints `FAILED`: a file differs from its signed hash. Check `TAG` and run the block again in a new, empty directory; if it fails again, report it.
 - `sha256sum` prints `FAILED open or read` for a `chain-configs/` file: `git archive` did not extract it. Check that the tag was fetched; if it was, report it.
 - A fingerprint is missing from `SECURITY.md` or GitHub, differs, or has the Status `revoked`. Report it.
-- `IMAGE_DIGEST does not name a telcoin-network image by digest`. Report it.
+- `IMAGE_DIGEST does not name an image in @IMAGE@ by digest`: it names another package, such as the other network's, or no digest. Report it.
 - `Commit SHA` is not the tag's commit, or `Build Features` does not match the tag. Report it.
 - `exec format error`, or Docker warns that the image platform does not match the host: the release is Linux x86_64 only. Use an x86_64 host, or build from source.
 - `docker pull` fails with `denied` or `unauthorized`: the image is not publicly readable. Tell the maintainers.
@@ -1574,7 +1613,13 @@ splice_changelog() {
 # ---------------------------------------------------------------------------------------------
 # Subcommands
 
-cmd_check_tag() { check_tag always; }
+# validate-tag in CI runs this. The parse goes to its log first, so the log shows the package
+# that the tag's image belongs in.
+cmd_check_tag() {
+    print_parse >&2
+    info "IMAGE=$IMAGE"
+    check_tag always
+}
 
 cmd_notes() {
     local digest=$1
@@ -1620,6 +1665,7 @@ cmd_draft() {
         if has_asset IMAGE_DIGEST; then
             release_fetch "$WORK/draft" IMAGE_DIGEST
             line=$(cat "$WORK/draft/IMAGE_DIGEST")
+            check_digest_package "$line"
             digest=${line#"$IMAGE@"}
             if ! [[ "$digest" =~ $DIGEST_RE ]]; then digest=; fi
         fi
@@ -1791,7 +1837,12 @@ cmd_build() {
     if has_asset SHA256SUMS.asc; then
         die 1 "the draft for $TAG already carries SHA256SUMS.asc; a rebuild would void those signatures"
     fi
-    existing=$(registry_digest "$TAG")
+    existing=$(registry_digest "$TAG" first-push)
+    if [ "$existing" = denied ]; then
+        warn "$IMAGE does not answer an anonymous read: the package is private, or this is its first push"
+        confirm "Push $IMAGE:$TAG as the first image of the package $PACKAGE? build stops after the push until the package is public."
+        existing=
+    fi
     if [ -n "$existing" ]; then
         [ "${RELEASE_REBUILD:-}" = 1 ] || die 1 "$IMAGE:$TAG already exists ($existing); set RELEASE_REBUILD=1 to rebuild it"
         warn "RELEASE_REBUILD=1: rebuilding $IMAGE:$TAG (the registry has $existing)"
@@ -1836,7 +1887,10 @@ cmd_build() {
 
     info "pushing $IMAGE:$TAG"
     docker push "$IMAGE:$TAG" >&2 || die 3 "docker push $IMAGE:$TAG failed"
-    D=$(registry_digest "$TAG")
+    D=$(registry_digest "$TAG" first-push)
+    if [ "$D" = denied ]; then
+        die 2 "$IMAGE:$TAG is pushed, but the package is not public: do its one-time setup (maintainer guide), then run make release-build TAG=$TAG again with RELEASE_REBUILD=1"
+    fi
     [ -n "$D" ] || die 1 "the registry has no $IMAGE:$TAG after the push"
     repo_digests=$(docker image inspect --format '{{json .RepoDigests}}' "$IMAGE:$TAG") ||
         die 1 "docker image inspect $IMAGE:$TAG failed"
@@ -1844,6 +1898,8 @@ cmd_build() {
         *"\"$IMAGE@$D\""*) ;;
         *) die 1 "the registry serves $D for $IMAGE:$TAG, which is not the image just built ($repo_digests)" ;;
     esac
+    # cmd_verify below reads IMAGE_DIGEST back from the draft and refuses it unless it names
+    # an image in IMAGE, the tag's package.
     printf '%s@%s\n' "$IMAGE" "$D" >"$rd/IMAGE_DIGEST"
     write_sums "$rd"
 
@@ -1909,6 +1965,7 @@ cmd_sign() {
     info "SHA256SUMS sha256: $sums_hex"
     info "$(cat "$rd/SHA256SUMS")"
     check_build_sums_hash "$sums_hex"
+    check_sums_package "$rd" "do not sign it; rebuild the draft with make release-build TAG=$TAG"
     confirm "Sign SHA256SUMS for $TAG?"
     gpg --armor --detach-sign --local-user "$SIGN_KEY" --output "$WORK/new.asc" "$rd/SHA256SUMS" ||
         die 2 "gpg could not sign SHA256SUMS: is the YubiKey that holds $SIGN_FPR plugged in, and does gpg --card-status show it?"
@@ -1973,6 +2030,7 @@ cmd_verify() {
         release_fetch "$dir" IMAGE_DIGEST SHA256SUMS "$TARBALL"
     fi
     check_release_files "$dir"
+    check_sums_package "$dir"
     if [ -f "$dir/SHA256SUMS.asc" ]; then
         handles=$(count_sigs "$dir/SHA256SUMS" "$dir/SHA256SUMS.asc") || exit
         n=$(printf '%s\n' "$handles" | count_lines)
@@ -2039,6 +2097,11 @@ cmd_publish() {
     # Catches a change between the check above and the edit, before the alias points at D.
     check_assets_unchanged "the release is public: follow After publish in the maintainer guide"
     if [ "$move_alias" = 1 ]; then
+        # The alias moves only inside IMAGE, the tag's package, and only to the digest that this
+        # package serves for TAG, so it never points at an image of the other network.
+        current=$(registry_digest "$TAG")
+        [ "$current" = "$D" ] ||
+            die 1 "$IMAGE:$TAG is ${current:-missing}, not $D; $IMAGE:$ALIAS moves only to the image this package serves for $TAG"
         current=$(registry_digest "$ALIAS")
         if [ "$current" = "$D" ]; then
             info "$IMAGE:$ALIAS already points at $D"
