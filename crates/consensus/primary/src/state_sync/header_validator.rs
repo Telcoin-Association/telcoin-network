@@ -12,7 +12,7 @@ use tn_types::{
     Certificate, Database, Header, HeaderDigest, Round, TnSender as _,
 };
 use tokio::sync::oneshot;
-use tracing::{debug, warn};
+use tracing::debug;
 
 #[cfg(test)]
 #[path = "../tests/header_validator_tests.rs"]
@@ -188,7 +188,9 @@ where
                             Ok(())
                         }
                         Err(e) => {
-                            warn!(
+                            // debug, not warn: this runs once per header or certificate whose
+                            // sync fails, unthrottled, so a degraded worker would flood an info log
+                            debug!(
                                 target: "primary::header_validator",
                                 author = %header.author(),
                                 round = header.round(),
@@ -223,7 +225,9 @@ where
 
                     if header.round() < committed_round.saturating_sub(max_age) {
                         if workers > 0 {
-                            warn!(
+                            // debug for the same reason as `sync_failed`: on the vote path
+                            // (max_age 0) every header whose sync a commit overtakes lands here
+                            debug!(
                                 target: "primary::header_validator",
                                 author = %header.author(),
                                 round = header.round(),

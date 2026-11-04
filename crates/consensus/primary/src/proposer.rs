@@ -846,6 +846,12 @@ impl<DB: Database> Proposer<DB> {
             // resend header
             Some(header) => {
                 let app = self.consensus_bus.app();
+                // copy out of the watch so its read guard is released before the log write
+                let newest_round = app
+                    .last_consensus_header()
+                    .borrow()
+                    .as_ref()
+                    .map_or(0, |newest| newest.sub_dag.leader_round());
                 warn!(
                     target: "primary::proposer",
                     authority=?self.authority_id,
@@ -855,11 +861,7 @@ impl<DB: Database> Proposer<DB> {
                     // the round watch before this proposal advanced it to the header round
                     primary_round = updated_round.saturating_sub(1),
                     committed_round = app.committed_round(),
-                    newest_round = app
-                        .last_consensus_header()
-                        .borrow()
-                        .as_ref()
-                        .map_or(0, |newest| newest.sub_dag.leader_round()),
+                    newest_round,
                     header=?header,
                     "reproposing header"
                 );
