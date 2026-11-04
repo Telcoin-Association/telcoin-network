@@ -5528,21 +5528,62 @@ fn accepted_gossip_carries_resolved_author_identity() -> eyre::Result<()> {
 }
 
 /// Finding 1 (#819): the network-layer reject path must never Fatal-ban the relaying peer for an
-/// author-attributable reject. An `UnauthorizedAuthor` reject charges the resolved author, and no
-/// one when the author is unresolved (anonymous message or this node's view lag) — but never the
-/// relayer, regardless of whether either identity has resolved.
+/// author-attributable reject. An `UnauthorizedAuthor` reject charges the resolved author that
+/// delivered its own frame, and no one when the author is unresolved (anonymous message or this
+/// node's view lag), but never the relayer, regardless of whether either identity has resolved.
 #[test]
 fn author_attributable_reject_charges_the_author_never_the_relayer() {
     [true, false].into_iter().for_each(|relayer_resolved| {
         assert_eq!(
-            RejectReason::UnauthorizedAuthor.penalty(relayer_resolved, true, EpochPosition::Live),
+            RejectReason::UnauthorizedAuthor.penalty(
+                relayer_resolved,
+                true,
+                GossipDelivery::ByAuthor,
+                EpochPosition::Live
+            ),
             RejectPenalty::FatalAuthor
         );
         assert_eq!(
-            RejectReason::UnauthorizedAuthor.penalty(relayer_resolved, false, EpochPosition::Live),
+            RejectReason::UnauthorizedAuthor.penalty(
+                relayer_resolved,
+                false,
+                GossipDelivery::ByAuthor,
+                EpochPosition::Live
+            ),
             RejectPenalty::Skip
         );
     });
+}
+
+/// GHSA-vw36-8f6c-vppp: a frame delivered by a peer other than its author never charges the
+/// author. The frame is static and gossipsub forgets its id after the duplicate-cache window, so
+/// any peer that once received it could otherwise ban the author after the author leaves the
+/// committee window. The relayer is not charged either (#801/#785).
+#[test]
+fn relayed_unauthorized_author_reject_charges_no_one() {
+    [true, false].into_iter().for_each(|relayer_resolved| {
+        [true, false].into_iter().for_each(|author_resolved| {
+            assert_eq!(
+                RejectReason::UnauthorizedAuthor.penalty(
+                    relayer_resolved,
+                    author_resolved,
+                    GossipDelivery::Relayed,
+                    EpochPosition::Live
+                ),
+                RejectPenalty::Skip
+            );
+        });
+    });
+}
+
+/// `GossipDelivery::of` names the author only when the propagation source is the author; a
+/// different source, or an anonymous message, is a relayed delivery.
+#[test]
+fn gossip_delivery_is_by_author_only_from_the_author_connection() {
+    let author = PeerId::random();
+    assert_eq!(GossipDelivery::of(Some(&author), &author), GossipDelivery::ByAuthor);
+    assert_eq!(GossipDelivery::of(Some(&author), &PeerId::random()), GossipDelivery::Relayed);
+    assert_eq!(GossipDelivery::of(None, &author), GossipDelivery::Relayed);
 }
 
 /// A replaying node never charges an unauthorized author: its allowlists belong to the
@@ -5552,25 +5593,37 @@ fn author_attributable_reject_charges_the_author_never_the_relayer() {
 fn historical_epoch_replay_never_charges_the_author() {
     [true, false].into_iter().for_each(|relayer_resolved| {
         [true, false].into_iter().for_each(|author_resolved| {
-            assert_eq!(
-                RejectReason::UnauthorizedAuthor.penalty(
-                    relayer_resolved,
-                    author_resolved,
-                    EpochPosition::Historical
-                ),
-                RejectPenalty::Skip
-            );
+            [GossipDelivery::ByAuthor, GossipDelivery::Relayed].into_iter().for_each(|delivery| {
+                assert_eq!(
+                    RejectReason::UnauthorizedAuthor.penalty(
+                        relayer_resolved,
+                        author_resolved,
+                        delivery,
+                        EpochPosition::Historical
+                    ),
+                    RejectPenalty::Skip
+                );
+            });
         });
         assert_eq!(
-            RejectReason::TooLarge.penalty(true, relayer_resolved, EpochPosition::Historical),
+            RejectReason::TooLarge.penalty(
+                true,
+                relayer_resolved,
+                GossipDelivery::Relayed,
+                EpochPosition::Historical
+            ),
             RejectPenalty::FatalRelayer
         );
     });
 }
 
 /// Drive the reject arm at `position` with a resolved author that no committee slot exempts, on
-/// a topic whose allowlist excludes it. Returns whether the author ended up banned.
-async fn unauthorized_author_banned_at(position: EpochPosition) -> eyre::Result<bool> {
+/// a topic whose allowlist excludes it, the frame delivered per `delivery`. Returns whether the
+/// author ended up banned.
+async fn unauthorized_author_banned_at(
+    position: EpochPosition,
+    delivery: GossipDelivery,
+) -> eyre::Result<bool> {
     let TestTypes { peer1, peer2, _task_manager } =
         create_test_types::<TestWorkerRequest, TestWorkerResponse>();
     let outsider = peer1.config.key_config().primary_public_key();
@@ -5599,31 +5652,59 @@ async fn unauthorized_author_banned_at(position: EpochPosition) -> eyre::Result<
         reply,
     })?;
     network.process_command(NetworkCommand::SetEpochPosition { position })?;
+    let propagation_source = match delivery {
+        GossipDelivery::ByAuthor => source,
+        GossipDelivery::Relayed => PeerId::random(),
+    };
     network.process_gossip_event(GossipEvent::Message {
-        propagation_source: PeerId::random(),
+        propagation_source,
         message_id: gossipsub::MessageId::from(b"unauthorized-author-gossip".to_vec()),
         message: GossipMessage { source: Some(source), ..test_gossip_message() },
     })?;
     Ok(network.swarm.behaviour().peer_manager.peer_banned(&source))
 }
 
-/// A replaying node rejects the message and leaves the resolved author unbanned.
+/// A replaying node rejects the message and leaves the resolved author unbanned, even when the
+/// author delivered the frame itself.
 #[tokio::test]
 async fn historical_replay_rejects_unauthorized_author_without_a_ban() -> eyre::Result<()> {
     assert!(
-        !unauthorized_author_banned_at(EpochPosition::Historical).await?,
+        !unauthorized_author_banned_at(EpochPosition::Historical, GossipDelivery::ByAuthor).await?,
         "a replaying node must not ban a resolved author outside the replayed allowlist"
     );
     Ok(())
 }
 
-/// The same reject at the live tip still charges the resolved author: the position guard spares
-/// only a replaying node.
+/// A replaying node leaves the resolved author of a relayed frame unbanned as well.
+#[tokio::test]
+async fn historical_replay_never_bans_a_relayed_unauthorized_author() -> eyre::Result<()> {
+    assert!(
+        !unauthorized_author_banned_at(EpochPosition::Historical, GossipDelivery::Relayed).await?,
+        "a replaying node must not ban the author of a relayed frame"
+    );
+    Ok(())
+}
+
+/// The same reject at the live tip still charges the resolved author when the author's own
+/// connection delivered the frame: the position guard spares only a replaying node, and the
+/// delivery guard spares only a frame someone else delivered.
 #[tokio::test]
 async fn live_epoch_still_bans_unauthorized_author() -> eyre::Result<()> {
     assert!(
-        unauthorized_author_banned_at(EpochPosition::Live).await?,
-        "a node at the tip still bans a resolved author outside the allowlist"
+        unauthorized_author_banned_at(EpochPosition::Live, GossipDelivery::ByAuthor).await?,
+        "a node at the tip still bans a resolved author that delivers its own unauthorized frame"
+    );
+    Ok(())
+}
+
+/// GHSA-vw36-8f6c-vppp: a resolved ex-member's old frame, re-sent by a different connected peer
+/// after the member left every committee slot, must not ban the member. Before the fix this
+/// delivery charged `Penalty::Fatal` to the author at the live tip.
+#[tokio::test]
+async fn live_epoch_relayed_replay_never_bans_the_author() -> eyre::Result<()> {
+    assert!(
+        !unauthorized_author_banned_at(EpochPosition::Live, GossipDelivery::Relayed).await?,
+        "a frame delivered by a peer other than its author must not ban the author"
     );
     Ok(())
 }
@@ -5638,11 +5719,21 @@ fn oversized_reject_penalizes_only_a_resolved_relayer() {
     for author_resolved in [true, false] {
         for position in [EpochPosition::Live, EpochPosition::Historical] {
             assert_eq!(
-                RejectReason::TooLarge.penalty(true, author_resolved, position),
+                RejectReason::TooLarge.penalty(
+                    true,
+                    author_resolved,
+                    GossipDelivery::Relayed,
+                    position
+                ),
                 RejectPenalty::FatalRelayer
             );
             assert_eq!(
-                RejectReason::TooLarge.penalty(false, author_resolved, position),
+                RejectReason::TooLarge.penalty(
+                    false,
+                    author_resolved,
+                    GossipDelivery::Relayed,
+                    position
+                ),
                 RejectPenalty::Skip
             );
         }
