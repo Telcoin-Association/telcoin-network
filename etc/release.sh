@@ -34,9 +34,15 @@
 #      with no TTY and no RELEASE_YES=1
 #   3  an external service (adiri RPC, GitHub API, registry) stayed unavailable after retries
 #
+# Images: one ghcr package per network, chosen by the tag alone. A mainnet tag (vX.Y.Z or
+# vX.Y.Z-rcN) is pushed to ghcr.io/<owner>/tn-mainnet and an adiri tag (vX.Y.Z-adiri or
+# vX.Y.Z-adiri-rcN) to ghcr.io/<owner>/tn-testnet, where <owner> is the owner of the GitHub
+# repository in lower case. `parse` prints the package as PACKAGE.
+#
 # Environment (all optional):
-#   RELEASE_REPO                   owner/repo; default Telcoin-Association/telcoin-network,
-#                                  GITHUB_REPOSITORY in CI
+#   RELEASE_REPO                   owner/repo of the GitHub repository; default
+#                                  Telcoin-Association/telcoin-network, GITHUB_REPOSITORY in
+#                                  CI. Of the image name it sets only the owner
 #   RELEASE_COMMIT                 tag: commit to tag instead of the origin/main tip
 #   RELEASE_GPG_KEY                tag, sign: signing key; default `git config user.signingkey`
 #   RELEASE_SIG_THRESHOLD          maintainer signatures required; never below MIN_SIGNATURES
@@ -52,7 +58,8 @@
 #
 # Dry run, for rehearsals (RELEASE_DRY_RUN=1). The variables below are refused without it.
 # A dry run never calls gh or git push and pushes images only to RELEASE_IMAGE.
-#   RELEASE_IMAGE                  image repository on localhost:PORT/ or 127.0.0.1:PORT/
+#   RELEASE_IMAGE                  image repository on localhost:PORT/ or 127.0.0.1:PORT/; it
+#                                  replaces the whole image name, package included
 #   RELEASE_ALLOWLIST_DIR          directory of *.asc used instead of main's allowlist
 #   RELEASE_MAIN_REF               ref used instead of refs/remotes/origin/main; no fetch
 #   RELEASE_ATTESTATION=skip       skip the on-chain attestation check
@@ -88,15 +95,15 @@ ATTEST_SCRIPT=.github/scripts/verify_commit_hash.sh
 ANCHOR='<!-- ANCHOR: releases -->'
 MANIFEST_TYPES='application/vnd.oci.image.index.v1+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.docker.distribution.manifest.v2+json'
 
-# State. parse_tag sets TAG VERSION CHANNEL RC BASE FEATURES PRERELEASE ALIAS TARBALL
+# State. parse_tag sets TAG VERSION CHANNEL PACKAGE RC BASE FEATURES PRERELEASE ALIAS TARBALL
 # CHAIN_CONFIGS; the functions named in the comments own the rest.
-TAG='' VERSION='' CHANNEL='' RC='' BASE='' FEATURES='' PRERELEASE='' ALIAS='' TARBALL='' CHAIN_CONFIGS=''
+TAG='' VERSION='' CHANNEL='' PACKAGE='' RC='' BASE='' FEATURES='' PRERELEASE='' ALIAS='' TARBALL='' CHAIN_CONFIGS=''
 WORK=            # setup: private temp dir, removed on exit
 ORIG_PWD=        # setup: directory the script was started from
 SELF=            # setup: absolute path of this script
 DRY_RUN=0        # init_env
 REPO=            # init_env: owner/repo on GitHub
-IMAGE=           # init_env: image repository, without tag
+IMAGE=           # init_env: ghcr.io/<owner>/PACKAGE, or RELEASE_IMAGE in a dry run; no tag
 THRESHOLD=$MIN_SIGNATURES
 ALLOW_GNUPGHOME= # load_allowlist: keyring holding only main's allowlisted keys
 ALLOW_LIST=      # load_allowlist: "handle<TAB>primary fingerprint" lines
@@ -264,12 +271,15 @@ parse_tag() {
     BASE=${TAG%"$rc_suffix"}
     # CHAIN_CONFIGS: the directory of the channel's genesis, committee and parameters files,
     # whose hashes SHA256SUMS carries. Adiri is chain-configs/testnet (chain-configs/README.md).
+    # PACKAGE: the ghcr package that holds the channel's images, and no other channel's.
     if [ -n "${BASH_REMATCH[4]}" ]; then
         CHANNEL=adiri
+        PACKAGE=tn-testnet
         FEATURES=adiri
         CHAIN_CONFIGS=chain-configs/testnet
     else
         CHANNEL=mainnet
+        PACKAGE=tn-mainnet
         FEATURES=
         CHAIN_CONFIGS=chain-configs/mainnet
     fi
@@ -288,8 +298,8 @@ parse_tag() {
 }
 
 print_parse() {
-    printf 'TAG=%s\nVERSION=%s\nCHANNEL=%s\nRC=%s\nBASE=%s\nFEATURES=%s\nPRERELEASE=%s\nALIAS=%s\nTARBALL=%s\nCHAIN_CONFIGS=%s\n' \
-        "$TAG" "$VERSION" "$CHANNEL" "$RC" "$BASE" "$FEATURES" "$PRERELEASE" "$ALIAS" "$TARBALL" "$CHAIN_CONFIGS"
+    printf 'TAG=%s\nVERSION=%s\nCHANNEL=%s\nPACKAGE=%s\nRC=%s\nBASE=%s\nFEATURES=%s\nPRERELEASE=%s\nALIAS=%s\nTARBALL=%s\nCHAIN_CONFIGS=%s\n' \
+        "$TAG" "$VERSION" "$CHANNEL" "$PACKAGE" "$RC" "$BASE" "$FEATURES" "$PRERELEASE" "$ALIAS" "$TARBALL" "$CHAIN_CONFIGS"
 }
 
 # X.Y.Z of the final (non-rc) tags among $1 (one per line) in TAG's channel, TAG excluded.
@@ -2050,7 +2060,8 @@ usage() {
     cat >&2 <<'EOF'
 usage: etc/release.sh <subcommand> <TAG> [options]
 
-  parse TAG                          print TAG's channel, features, alias and file names
+  parse TAG                          print TAG's channel, image package, features, alias and
+                                     file names
   check-tag TAG                      validate a pushed release tag (CI, build server, laptop)
   notes TAG [--image-digest D]       render the release body (CI, build server)
   draft TAG                          create or refresh the draft release (CI only)
@@ -2061,7 +2072,8 @@ usage: etc/release.sh <subcommand> <TAG> [options]
   verify TAG [--allow-unsigned]      check a release end to end (build server, CI, operators)
   publish TAG                        verify, publish the draft, move the alias (build server)
 
-TAG is vX.Y.Z, vX.Y.Z-rcN, vX.Y.Z-adiri or vX.Y.Z-adiri-rcN.
+TAG is vX.Y.Z, vX.Y.Z-rcN, vX.Y.Z-adiri or vX.Y.Z-adiri-rcN. A mainnet tag's image goes to
+the ghcr package tn-mainnet, an adiri tag's to tn-testnet.
 See the header of this file for the environment variables and exit codes.
 EOF
     exit 2
@@ -2099,12 +2111,15 @@ init_env() {
     [[ "$REPO" =~ $REPO_RE ]] || die 2 "RELEASE_REPO must look like owner/repo, got '$REPO'"
     if [ "$REPO" != "$DEFAULT_REPO" ]; then warn "using repository $REPO"; fi
 
+    # The image is the tag's package under the repository owner: RELEASE_REPO and
+    # GITHUB_REPOSITORY name the GitHub repository and give the image only their owner.
+    [ -n "$PACKAGE" ] || die 2 "internal error: init_env runs only after parse_tag"
     if [ -n "${RELEASE_IMAGE:-}" ]; then
         IMAGE=$RELEASE_IMAGE
         is_local_image ||
             die 2 "RELEASE_IMAGE must be localhost:PORT/ or 127.0.0.1:PORT/ and a lowercase repository path without a tag or digest, e.g. 127.0.0.1:5000/tn"
     else
-        IMAGE=ghcr.io/$(lower "$REPO")
+        IMAGE=ghcr.io/$(lower "${REPO%%/*}")/$PACKAGE
     fi
 
     if [ -n "${RELEASE_MAIN_REF:-}" ]; then MAIN_REF=$RELEASE_MAIN_REF; fi
