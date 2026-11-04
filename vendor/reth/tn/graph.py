@@ -93,8 +93,11 @@ def snapshot(out, extra):
     targets = targets or TARGETS
     rows = []
     for target in targets:
+        # --color never: a caller's CARGO_TERM_COLOR=always (CI sets it) would put escape codes
+        # into the lines units() parses
         r = subprocess.run(["cargo", "tree", "--locked", "-e", "normal,build", "--target", target,
-                            "--charset", "ascii", "-f", "{p}|{f}", *rest], cwd=REPO,
+                            "--charset", "ascii", "--color", "never", "-f", "{p}|{f}", *rest],
+                           cwd=REPO,
                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         if r.returncode != 0:
             sys.exit(f"cargo tree failed:\n{r.stderr}")
