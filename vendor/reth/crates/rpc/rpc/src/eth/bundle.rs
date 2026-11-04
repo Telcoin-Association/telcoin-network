@@ -77,6 +77,14 @@ where
             .into())
         }
 
+        // TN(TN-0037): upstream takes no permit here (the struct's tracing guard is unused). Hold
+        // a blocking-IO permit inside the blocking task, as `eth_callMany` does.
+        let permit = self
+            .eth_api()
+            .acquire_owned_blocking_io()
+            .await
+            .map_err(|_| EthApiError::InternalEthError)?;
+
         let transactions = txs
             .into_iter()
             .map(|tx| recover_raw_transaction::<PoolPooledTx<Eth::Pool>>(&tx))
@@ -143,6 +151,7 @@ where
 
         self.eth_api()
             .spawn_with_state_at_block(at, move |eth_api, db| {
+                let _permit = permit;
                 let coinbase = evm_env.block_env.beneficiary();
                 let basefee = evm_env.block_env.basefee();
 

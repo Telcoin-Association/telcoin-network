@@ -482,3 +482,20 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   until the first one ends. Both tests fail before the change ("the second trace started a
   blocking task while the first one's still runs"). *Upstream*: yes; upstream main still releases
   these permits on timeout and disconnect.
+
+- **TN-0037** — `eth_createAccessList` and `eth_callBundle` hold a blocking-IO permit inside
+  their blocking task. *Kind*: fix (security).
+  *Files*: `crates/rpc/rpc-eth-api/src/helpers/call.rs` (`create_access_list_with` takes the
+  permit; `create_access_list_at` calls it directly instead of from a second blocking task, as the
+  matching hunk of upstream 4630cc588 does), `crates/rpc/rpc/src/eth/bundle.rs`
+  (`EthBundle::call_bundle`).
+  *Why*: both ran the EVM on tokio's blocking pool with no permit (review finding T1-4), and
+  `EthBundle`'s tracing guard is unused upstream. TN's `eth_createAccessList` and `eth_callBundle`
+  wrappers delegate to these helpers, which own the blocking task, so the permit has to be taken
+  here to live inside it. It is the blocking-IO permit `eth_call` and `eth_callMany` take. Without
+  the `create_access_list_at` change, reth's own handler would hold a blocking thread while it
+  waits for the permit. TN's `eth_estimateGas` and `eth_fillTransaction` take theirs in `tn-reth`
+  (`estimate_gas_at_epoch`, which owns its task). Callers must not hold a blocking-IO permit.
+  *Tests*: in `tn-reth`, `test_rpc_simulation_waits_for_blocking_io_permit` (all four methods wait
+  with no permits; fails before the change) and `test_rpc_simulation_shares_one_blocking_io_permit`
+  (with one permit, concurrent requests all complete). *Upstream*: yes.
