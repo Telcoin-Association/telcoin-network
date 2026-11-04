@@ -610,8 +610,8 @@ impl WorkerNetworkHandle {
             .map_or_else(|attempt| attempt, SyncAttempt::Fetched)
     }
 
-    /// Run one sync exchange, yielding the fetched batches or the classified
-    /// non-fetch outcome.
+    /// Run one sync exchange, yielding the stream read (the batches that arrived
+    /// and how the stream ended) or the classified non-fetch outcome.
     ///
     /// `Err(SyncAttempt::Unsupported)` means the peer did not answer the protocol
     /// (negotiation failed, or it negotiated but never sent `Ack`), so the caller
@@ -625,7 +625,7 @@ impl WorkerNetworkHandle {
         &self,
         peer: BlsPublicKey,
         batch_digests: &BTreeSet<BlockHash>,
-    ) -> Result<Vec<(BlockHash, Batch)>, SyncAttempt> {
+    ) -> Result<SyncRead, SyncAttempt> {
         // open the sync stream, flattening the command-channel and stream-open
         // results. Only a genuine negotiation failure (`UpgradeFailed`) is a
         // pre-item-4 peer that does not advertise the protocol -> Unsupported
