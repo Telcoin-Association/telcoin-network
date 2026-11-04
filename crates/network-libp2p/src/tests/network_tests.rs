@@ -7,7 +7,7 @@ use crate::{
         TestWorkerResponse, TEST_HEARTBEAT_INTERVAL,
     },
     freshness::RecordTimestamp,
-    types::{EpochPosition, RecordDomain},
+    types::{EpochPosition, GossipValidation, GossipVerdict, RecordDomain},
 };
 use assert_matches::assert_matches;
 use eyre::eyre;
@@ -1702,6 +1702,11 @@ async fn test_peer_exchange_with_excess_peers() -> eyre::Result<()> {
             debug!(target: "network", ?peer_id, ?res, "peer network shutdown");
         });
 
+        // a committee peer can relay the target's gossip to nvv, so it must accept each
+        // message (#1772)
+        let (_, idle) = mpsc::channel(1);
+        spawn_gossip_relay(std::mem::replace(&mut peer._network_events, idle));
+
         peer.network_handle.start_listening(peer.config.primary_address()).await?;
 
         // add peers to each other's known peers
@@ -1758,8 +1763,11 @@ async fn test_peer_exchange_with_excess_peers() -> eyre::Result<()> {
         config: peer2_config,
         network_handle: peer2,
         network: peer2_network,
-        network_events: _,
+        network_events: peer2_events,
     } = peer2;
+
+    // peer2 relays the target's gossip to nvv, so it must accept each message (#1772)
+    spawn_gossip_relay(peer2_events);
 
     // connect peer2
     tokio::spawn(async move {
@@ -1877,6 +1885,21 @@ async fn test_peer_exchange_with_excess_peers() -> eyre::Result<()> {
     assert!(received, "nvv MUST receive gossip message through mesh propagation");
 
     Ok(())
+}
+
+/// Drain `events` and accept every gossip message, so the peer relays it to the mesh.
+///
+/// Gossipsub forwards a message only after the consumer accepts it (#1772). A test peer that
+/// only relays has no consumer, so this task stands in for one.
+fn spawn_gossip_relay(events: mpsc::Receiver<NetworkEvent<TestWorkerRequest, TestWorkerResponse>>) {
+    let incoming = futures::stream::unfold(events, |mut events| async move {
+        events.recv().await.map(|event| (event, events))
+    });
+    tokio::spawn(futures::StreamExt::for_each(incoming, |event| async move {
+        if let NetworkEvent::Gossip(mut gossip) = event {
+            gossip.validation.accept().await;
+        }
+    }));
 }
 
 /// A pruned peer that does not support the dedicated peer-exchange protocol still
@@ -5178,7 +5201,7 @@ fn test_gossip_message() -> GossipMessage {
 fn accepted_gossip_with_unresolved_relayer_is_delivered() -> eyre::Result<()> {
     let message = test_gossip_message();
     let event: NetworkEvent<TestWorkerRequest, TestWorkerResponse> =
-        accepted_gossip_event(message.clone(), None, None);
+        accepted_gossip_event(message.clone(), None, None, GossipValidation::detached());
     assert_matches!(
         event,
         NetworkEvent::Gossip(payload)
@@ -5195,7 +5218,7 @@ fn accepted_gossip_with_resolved_relayer_carries_identity() -> eyre::Result<()> 
     let bls = *BlsKeypair::generate(&mut StdRng::from_seed([9; 32])).public();
     let message = test_gossip_message();
     let event: NetworkEvent<TestWorkerRequest, TestWorkerResponse> =
-        accepted_gossip_event(message, Some(bls), None);
+        accepted_gossip_event(message, Some(bls), None, GossipValidation::detached());
     assert_matches!(event, NetworkEvent::Gossip(payload) if payload.relayer == Some(bls));
     Ok(())
 }
@@ -5425,7 +5448,7 @@ fn accepted_gossip_carries_resolved_author_identity() -> eyre::Result<()> {
     let author = *BlsKeypair::generate(&mut StdRng::from_seed([11; 32])).public();
     let message = test_gossip_message();
     let event: NetworkEvent<TestWorkerRequest, TestWorkerResponse> =
-        accepted_gossip_event(message, None, Some(author));
+        accepted_gossip_event(message, None, Some(author), GossipValidation::detached());
     assert_matches!(event, NetworkEvent::Gossip(payload) if payload.author == Some(author));
     Ok(())
 }
@@ -6084,4 +6107,87 @@ fn listener_error_log_suppresses_errors_inside_the_interval() {
         Some(1),
         "the next log carries only the errors suppressed since the last log"
     );
+}
+
+/// A gossip validation ticket reports one verdict at most, and a ticket dropped without a
+/// verdict reports `Ignore` (#1772).
+#[tokio::test]
+async fn gossip_validation_reports_each_verdict_once() -> eyre::Result<()> {
+    let (sender, mut commands) =
+        mpsc::channel::<NetworkCommand<TestWorkerRequest, TestWorkerResponse>>(4);
+    let source = PeerId::random();
+    let ticket = |id: &[u8]| {
+        GossipValidation::new(gossipsub::MessageId::from(id.to_vec()), source, sender.clone())
+    };
+
+    // a ticket dropped without a verdict reports `Ignore` for its message and relayer
+    drop(ticket(b"dropped"));
+    assert!(matches!(
+        commands.try_recv(),
+        Ok(NetworkCommand::ReportGossipValidation {
+            message_id,
+            propagation_source,
+            verdict: GossipVerdict::Ignore,
+        }) if message_id == gossipsub::MessageId::from(b"dropped".to_vec())
+            && propagation_source == source
+    ));
+
+    // `accept` reports `Accept`; a later `reject` and the drop report nothing
+    let mut accepted = ticket(b"accepted");
+    assert!(accepted.is_pending());
+    accepted.accept().await;
+    assert!(!accepted.is_pending());
+    assert!(matches!(
+        commands.try_recv(),
+        Ok(NetworkCommand::ReportGossipValidation { verdict: GossipVerdict::Accept, .. })
+    ));
+    accepted.reject().await;
+    drop(accepted);
+    assert!(commands.try_recv().is_err(), "a ticket reports one verdict at most");
+
+    // `reject` reports `Reject`; the drop after it reports nothing
+    let mut rejected = ticket(b"rejected");
+    rejected.reject().await;
+    assert!(matches!(
+        commands.try_recv(),
+        Ok(NetworkCommand::ReportGossipValidation { verdict: GossipVerdict::Reject, .. })
+    ));
+    drop(rejected);
+    assert!(commands.try_recv().is_err(), "a rejected ticket reports nothing on drop");
+
+    // a detached ticket reports nothing
+    drop(GossipValidation::<TestWorkerRequest, TestWorkerResponse>::detached());
+    assert!(commands.try_recv().is_err(), "a detached ticket reports nothing");
+    Ok(())
+}
+
+/// An accepted gossip event that never reaches the application drops its ticket, and the
+/// ticket reports `Ignore` for the held message. Gossipsub then never forwards a message this
+/// node did not verify (#1772). The swarm passes the reported verdict to gossipsub in the
+/// `ReportGossipValidation` command arm.
+#[tokio::test]
+async fn dropped_gossip_event_reports_ignore() -> eyre::Result<()> {
+    let (sender, mut commands) =
+        mpsc::channel::<NetworkCommand<TestWorkerRequest, TestWorkerResponse>>(1);
+    let message_id = gossipsub::MessageId::from(b"shed-gossip".to_vec());
+    let source = PeerId::random();
+    let event: NetworkEvent<TestWorkerRequest, TestWorkerResponse> = accepted_gossip_event(
+        test_gossip_message(),
+        None,
+        None,
+        GossipValidation::new(message_id.clone(), source, sender),
+    );
+    // the application side of the event stream is closed, as at an epoch boundary
+    let (events, closed) = mpsc::channel(1);
+    drop(closed);
+    assert!(events.try_send(event).is_err(), "a closed event stream refuses the event");
+    assert!(matches!(
+        commands.try_recv(),
+        Ok(NetworkCommand::ReportGossipValidation {
+            message_id: reported,
+            propagation_source,
+            verdict: GossipVerdict::Ignore,
+        }) if reported == message_id && propagation_source == source
+    ));
+    Ok(())
 }

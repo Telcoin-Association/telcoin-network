@@ -1,6 +1,6 @@
 //! Handle specific request types received from the network.
 
-use super::{PrimaryResponse, SyncServeOutcome};
+use super::{PendingGossip, PrimaryResponse, SyncServeOutcome};
 use crate::{
     error::{CertManagerError, PrimaryNetworkError, PrimaryNetworkResult},
     network::message::{PrimaryGossip, PrimaryRPCError},
@@ -294,12 +294,29 @@ where
         guard.insert(key, next_seq);
     }
 
+    /// Process gossip with no ticket to report, for direct handler calls in tests.
+    #[cfg(test)]
+    pub(crate) async fn process_gossip(&self, msg: &GossipMessage) -> PrimaryNetworkResult<()> {
+        let mut pending = PendingGossip::detached();
+        self.process_gossip_with(msg, &mut pending).await
+    }
+
     /// Process gossip from the committee.
     ///
     /// Peers gossip the HeaderDigest so peers can request the Certificate. This waits until
     /// the certificate can be retrieved and timesout after some time. It's important to give up
     /// after enough time to limit the DoS attack surface. Peers who timeout must lose reputation.
-    pub(super) async fn process_gossip(&self, msg: &GossipMessage) -> PrimaryNetworkResult<()> {
+    ///
+    /// The handler reports `Accept` on `pending` right after the signature check and before any
+    /// downstream work (#1772). A failed check returns an error and leaves the ticket pending, so
+    /// the caller settles it with `PendingGossip::settle_error`. Gossip that cannot be verified, or
+    /// that is a duplicate, returns `Ok(())` with the ticket pending, and dropping the ticket
+    /// reports `Ignore`.
+    pub(crate) async fn process_gossip_with(
+        &self,
+        msg: &GossipMessage,
+        pending: &mut PendingGossip,
+    ) -> PrimaryNetworkResult<()> {
         // deconstruct message
         let GossipMessage { data, topic, .. } = msg;
 
@@ -323,6 +340,10 @@ where
                 if let Some(committee) = self.get_committee(epoch).await {
                     match cert.verify_cert(&committee) {
                         Ok(()) => {
+                            // Report Accept right after the signature check and before downstream
+                            // work, so gossipsub forwards only verified
+                            // certificates (#1772).
+                            pending.accept().await;
                             if self.consensus_bus.is_cvv() {
                                 if self.behind_consensus(epoch, cert.header().round(), None).await {
                                     warn!(target: "primary", "certificate indicates we are behind, go to catchup mode!");
@@ -347,7 +368,12 @@ where
                                 self.consensus_bus.notify_exex_certificate(&cert);
                             }
                         }
-                        Err(e) => warn!(target: "primary", "Recieved invalid cert {e}"),
+                        Err(e) => {
+                            warn!(target: "primary", "Recieved invalid cert {e}");
+                            // A failed aggregate is the author's fault: the caller reports Reject
+                            // and charges the author (#1772).
+                            return Err(CertManagerError::from(e).into());
+                        }
                     }
                 } else {
                     // If we can't find this cert's committee then it's bogus or we are
@@ -391,16 +417,18 @@ where
                         // possible and don't want to do the cert verify if we can
                         // skip it.  So this seems like the place.  And of course
                         // close any windows to double counting a signature.
-                        let guard = self.consensus_certs.lock();
-                        if guard
+                        // Bind only the result so no lock guard is alive at the verdict await
+                        // below.
+                        let seen = self
+                            .consensus_certs
+                            .lock()
                             .get(&consensus_result_hash)
                             .and_then(|tally| tally.signers.get(&key))
-                            .is_some()
-                        {
+                            .is_some();
+                        if seen {
                             // We have already counted this signature so ignore.
                             return Ok(());
                         }
-                        drop(guard);
                         // Drop the lock for the expensive verify op. If a dup gets through the Set
                         // will still only count it once.
                         ensure!(
@@ -408,6 +436,8 @@ where
                                 .verify_secure(&to_intent_message(consensus_result_hash), &key),
                             PrimaryNetworkError::UnknownConsensusHeaderCert(hash)
                         );
+                        // The signature is valid: report Accept before downstream work (#1772).
+                        pending.accept().await;
                         // Once we have seen 1/3 + 1 committe members have signed this it should be
                         // valid.
                         enough_sigs = (committee.len() / 3) + 1;
@@ -550,6 +580,8 @@ where
                             vote.check_signature(),
                             PrimaryNetworkError::InvalidHeader(HeaderError::PeerNotAuthor)
                         );
+                        // The signature is valid: report Accept before downstream work (#1772).
+                        pending.accept().await;
                         // Record only AFTER a valid signature so a bad-signature vote cannot
                         // poison the dedup slot for the real author.
                         self.record_epoch_vote(vote.public_key, vote.epoch);

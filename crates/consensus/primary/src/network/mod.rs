@@ -22,8 +22,8 @@ use tn_network_libp2p::{
     error::NetworkError,
     read_frame,
     types::{
-        IntoResponse as _, NetworkCommand, NetworkEvent, NetworkHandle, NetworkResponseMessage,
-        NetworkResult,
+        GossipPayload, GossipValidation, IntoResponse as _, NetworkCommand, NetworkEvent,
+        NetworkHandle, NetworkResponseMessage, NetworkResult,
     },
     write_frame, AdmissionShed, DenyReason, GossipMessage, PeerSlot, PeerSlots, PeerTier, Penalty,
     PrimarySyncRequest, ReservedPeers, ReservedPool, ResponseChannel, ServiceClass, Stream,
@@ -132,6 +132,130 @@ pub(crate) const MAX_TALLIES_PER_SIGNER_PER_NUMBER: usize = 2;
 ///
 /// Prevents a single malicious peer from filling all global slots.
 pub const MAX_PENDING_REQUESTS_PER_PEER: usize = 2;
+
+/// Maximum number of gossip messages from a single peer in signature verification at once
+/// (#1772).
+///
+/// The honest peak per author is one certificate per round plus a consensus result and an
+/// epoch vote. Four leaves headroom for a burst after a reconnect.
+pub const MAX_PENDING_GOSSIP_PER_PEER: usize = 4;
+
+/// Guard for one gossip message in signature verification (#1772).
+///
+/// It holds a per-peer slot, or a permit from the shared bucket for gossip whose author and
+/// relayer are both unresolved. Dropping the guard frees the slot.
+pub(crate) enum GossipSlot {
+    /// A slot keyed by the author, or by the relayer when the author is unresolved.
+    Peer {
+        /// The per-peer slot. It frees on drop.
+        _slot: PeerSlot,
+    },
+    /// A permit from the shared bucket for gossip with no resolved author or relayer.
+    Shared {
+        /// The shared permit. It returns to the bucket on drop.
+        _permit: OwnedSemaphorePermit,
+    },
+}
+
+/// Per-peer bound on gossip in signature verification (#1772).
+///
+/// A message takes a slot keyed by its author when the author is resolved, else by its relayer.
+/// Gossip with neither identity resolved shares one bucket with the same cap.
+#[derive(Clone, Debug)]
+pub(crate) struct GossipSlots {
+    /// Slots keyed by the author or relayer BLS key.
+    peers: PeerSlots,
+    /// Shared bucket for gossip whose author and relayer are both unresolved.
+    unresolved: Arc<Semaphore>,
+}
+
+impl GossipSlots {
+    /// Create the slots with `cap` messages per peer and `cap` messages in the shared bucket.
+    pub(crate) fn new(cap: usize) -> Self {
+        Self { peers: PeerSlots::new(cap), unresolved: Arc::new(Semaphore::new(cap)) }
+    }
+
+    /// Take a slot for gossip from `author`, else `relayer`, else the shared bucket.
+    ///
+    /// Returns `None` when that peer or the shared bucket is at the cap.
+    pub(crate) fn take(
+        &self,
+        author: Option<BlsPublicKey>,
+        relayer: Option<BlsPublicKey>,
+    ) -> Option<GossipSlot> {
+        author.or(relayer).map_or_else(
+            || {
+                Arc::clone(&self.unresolved)
+                    .try_acquire_owned()
+                    .ok()
+                    .map(|permit| GossipSlot::Shared { _permit: permit })
+            },
+            |peer| self.peers.try_take(peer).map(|slot| GossipSlot::Peer { _slot: slot }),
+        )
+    }
+
+    /// Admit one gossip message for signature verification.
+    ///
+    /// Returns `None` when no slot is free. The ticket then drops and reports `Ignore`.
+    pub(crate) fn admit(
+        &self,
+        validation: GossipValidation<Req, Res>,
+        author: Option<BlsPublicKey>,
+        relayer: Option<BlsPublicKey>,
+    ) -> Option<PendingGossip> {
+        self.take(author, relayer).map(|slot| PendingGossip::new(validation, slot))
+    }
+}
+
+/// One gossip message in signature verification: its verdict ticket and its slot (#1772).
+pub(crate) struct PendingGossip {
+    /// The deferred verdict ticket for gossipsub.
+    validation: GossipValidation<Req, Res>,
+    /// The verification slot. The first verdict frees it, so downstream work does not hold it.
+    slot: Option<GossipSlot>,
+}
+
+impl PendingGossip {
+    /// Pair a ticket with the slot it was admitted under.
+    pub(crate) fn new(validation: GossipValidation<Req, Res>, slot: GossipSlot) -> Self {
+        Self { validation, slot: Some(slot) }
+    }
+
+    /// A message with no ticket to report and no slot, for direct handler calls in tests.
+    #[cfg(test)]
+    pub(crate) fn detached() -> Self {
+        Self { validation: GossipValidation::detached(), slot: None }
+    }
+
+    /// Free the slot and report `Accept`, so gossipsub forwards the message.
+    ///
+    /// Call it right after the signature check and before any downstream work.
+    pub(crate) async fn accept(&mut self) {
+        drop(self.slot.take());
+        self.validation.accept().await;
+    }
+
+    /// Free the slot and report `Reject`, so gossipsub drops the message as invalid.
+    pub(crate) async fn reject(&mut self) {
+        drop(self.slot.take());
+        self.validation.reject().await;
+    }
+
+    /// Whether the ticket still waits for a verdict.
+    pub(crate) fn is_pending(&self) -> bool {
+        self.validation.is_pending()
+    }
+
+    /// Settle the ticket after the handler failed with `e`.
+    ///
+    /// An author content fault reports `Reject` while the ticket is pending. Any other error
+    /// drops the ticket, which reports `Ignore`.
+    pub(crate) async fn settle_error(mut self, e: &crate::error::PrimaryNetworkError) {
+        if e.is_author_content_fault() && self.is_pending() {
+            self.reject().await;
+        }
+    }
+}
 
 /// Maximum number of concurrent shed tasks for denied inbound sync streams.
 ///
@@ -1918,6 +2042,9 @@ pub struct PrimaryNetwork<DB, Events> {
     /// Per-peer cap on in-flight inbound sync streams across every phase, at
     /// [`MAX_PENDING_REQUESTS_PER_PEER`]. A slot is held for the whole life of the stream task.
     sync_peer_slots: PeerSlots,
+    /// Per-peer cap on gossip in signature verification, at [`MAX_PENDING_GOSSIP_PER_PEER`]
+    /// (#1772). A slot is held from admission until the handler's verdict.
+    gossip_slots: GossipSlots,
     /// BLS keys of the current and the next committee, captured when the network is built for
     /// the epoch. A peer in this set may take the committee reserve of every sync budget.
     reserved_peers: ReservedPeers,
@@ -1979,6 +2106,7 @@ where
             ),
             sync_serve: SyncServePools::new(),
             sync_peer_slots: PeerSlots::new(MAX_PENDING_REQUESTS_PER_PEER),
+            gossip_slots: GossipSlots::new(MAX_PENDING_GOSSIP_PER_PEER),
             reserved_peers,
             shed_task_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_SHED_TASKS)),
             epoch_record_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_EPOCH_RECORD_REQUESTS)),
@@ -2030,7 +2158,7 @@ where
                 }
             },
             NetworkEvent::Gossip(gossip) => {
-                self.process_gossip(gossip.message, gossip.relayer, gossip.author);
+                self.process_gossip(*gossip);
             }
             NetworkEvent::Error(msg, channel) => {
                 let err = PrimaryResponse::Error(PrimaryRPCError(msg));
@@ -2171,38 +2299,61 @@ where
     }
 
     /// Process gossip from committee.
-    fn process_gossip(
-        &self,
-        msg: GossipMessage,
-        relayer: Option<BlsPublicKey>,
-        author: Option<BlsPublicKey>,
-    ) {
-        // clone for spawned tasks
-        let request_handler = self.request_handler.clone();
-        let network_handle = self.network_handle.clone();
-        let relayer_label =
-            relayer.as_ref().map_or_else(|| "unresolved".to_string(), |bls| bls.to_string());
-        let task_name = format!("ProcessGossip-{}-{relayer_label}", msg.topic);
-        // spawn task to process gossip
-        self.task_spawner.spawn_task(task_name, async move {
-            if let Err(e) = request_handler.process_gossip(&msg).await {
-                warn!(target: "primary::network", ?e, "process_gossip");
-                // Charge the accountable peer, and only once its BLS identity has resolved. A
-                // content-determined fault (malformed payload / mis-topic) is the message
-                // author's: the network layer forwarded it after a shallow check, so an honest
-                // relayer could not have screened it, and banning the relayer lets a Byzantine
-                // author partition the mesh (issues #801/#819). Every other fault is the relaying
-                // peer's, as before. `zip` skips the penalty when that peer is unresolved or the
-                // error carries no penalty.
-                let charged = if e.is_author_content_fault() { author } else { relayer };
-                if let Some((peer, penalty)) = charged.zip((&e).into()) {
-                    network_handle.report_penalty(peer, penalty).await;
-                }
-                Err(e.into())
-            } else {
-                Ok(())
-            }
-        });
+    ///
+    /// Each message first takes a verification slot keyed by its author, else its relayer, else
+    /// one shared bucket for gossip with neither identity resolved, at
+    /// [`MAX_PENDING_GOSSIP_PER_PEER`] per key (#1772). With no free slot the message is not
+    /// processed: its ticket drops and reports `Ignore`, and no peer is charged. The slot is held
+    /// only through decode, the committee lookup and the signature check, and the handler frees it
+    /// at the verdict. Downstream work on verified gossip is not bounded here. That is safe because
+    /// only signed messages from committee members, and certificates signed by a quorum of the
+    /// committee, reach it.
+    fn process_gossip(&self, gossip: GossipPayload<Req, Res>) {
+        let GossipPayload { message: msg, relayer, author, validation } = gossip;
+        self.gossip_slots.admit(validation, author, relayer).map_or_else(
+            || {
+                debug!(
+                    target: "primary::network",
+                    ?author,
+                    ?relayer,
+                    "gossip verification slots exhausted, ignoring"
+                );
+            },
+            |mut pending| {
+                // clone for spawned tasks
+                let request_handler = self.request_handler.clone();
+                let network_handle = self.network_handle.clone();
+                let relayer_label = relayer
+                    .as_ref()
+                    .map_or_else(|| "unresolved".to_string(), |bls| bls.to_string());
+                let task_name = format!("ProcessGossip-{}-{relayer_label}", msg.topic);
+                // spawn task to process gossip
+                self.task_spawner.spawn_task(task_name, async move {
+                    if let Err(e) = request_handler.process_gossip_with(&msg, &mut pending).await {
+                        warn!(target: "primary::network", ?e, "process_gossip");
+                        // Report Reject for an author content fault while the ticket is pending.
+                        // Any other error drops the ticket, which reports Ignore (#1772).
+                        pending.settle_error(&e).await;
+                        // Charge the accountable peer, and only once its BLS identity has resolved.
+                        // A content-determined fault (malformed payload /
+                        // mis-topic) is the message author's: the network
+                        // layer forwarded it after a shallow check, so an honest
+                        // relayer could not have screened it, and banning the relayer lets a
+                        // Byzantine author partition the mesh (issues
+                        // #801/#819). Every other fault is the relaying
+                        // peer's, as before. `zip` skips the penalty when that peer is unresolved
+                        // or the error carries no penalty.
+                        let charged = if e.is_author_content_fault() { author } else { relayer };
+                        if let Some((peer, penalty)) = charged.zip((&e).into()) {
+                            network_handle.report_penalty(peer, penalty).await;
+                        }
+                        Err(e.into())
+                    } else {
+                        Ok(())
+                    }
+                });
+            },
+        );
     }
 
     /// Process an inbound sync stream.

@@ -7,7 +7,7 @@ use crate::{
 pub use libp2p::gossipsub::MessageId;
 use libp2p::{
     core::transport::ListenerId,
-    gossipsub::{PublishError, SubscriptionError, TopicHash},
+    gossipsub::{MessageAcceptance, PublishError, SubscriptionError, TopicHash},
     request_response::ResponseChannel as Libp2pResponseChannel,
     Multiaddr, PeerId, Stream, StreamProtocol, TransportError,
 };
@@ -204,7 +204,11 @@ impl<Res> ResponseChannel<Res> {
 
 /// Events created from network activity.
 #[derive(Debug)]
-pub enum NetworkEvent<Req, Res> {
+pub enum NetworkEvent<Req, Res>
+where
+    Req: TNMessage,
+    Res: TNMessage,
+{
     /// Direct request from peer.
     Request {
         /// The peer that made the request.
@@ -231,7 +235,7 @@ pub enum NetworkEvent<Req, Res> {
     /// the two cannot be transposed.
     ///
     /// The payload is boxed as [`GossipPayload`] so this variant does not size the whole enum.
-    Gossip(Box<GossipPayload>),
+    Gossip(Box<GossipPayload<Req, Res>>),
     /// Send an error back the requester.
     Error(String, ResponseChannel<Res>),
     /// An inbound stream was established by a peer.
@@ -254,13 +258,157 @@ pub enum NetworkEvent<Req, Res> {
 /// `#[allow(clippy::large_enum_variant)]`. See [`NetworkEvent::Gossip`] for the relayer
 /// and author identity semantics.
 #[derive(Debug)]
-pub struct GossipPayload {
+pub struct GossipPayload<Req, Res>
+where
+    Req: TNMessage,
+    Res: TNMessage,
+{
     /// The gossip message payload.
     pub message: GossipMessage,
     /// BLS identity of the relaying peer (`propagation_source`), when resolved.
     pub relayer: Option<BlsPublicKey>,
     /// BLS identity of the message author (`GossipMessage::source`), when resolved.
     pub author: Option<BlsPublicKey>,
+    /// Deferred verdict ticket for gossipsub.
+    ///
+    /// Gossipsub holds the message until the consumer reports a verdict through this ticket
+    /// (#1772). See [`GossipValidation`] for the rule.
+    pub validation: GossipValidation<Req, Res>,
+}
+
+/// The verdict the consumer reports for a gossip message gossipsub holds for validation (#1772).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GossipVerdict {
+    /// Forward to the mesh.
+    Accept,
+    /// Drop and treat the message as invalid.
+    Reject,
+    /// Drop without a judgement.
+    Ignore,
+}
+
+/// Each verdict maps to the gossipsub acceptance of the same name.
+impl From<GossipVerdict> for MessageAcceptance {
+    /// Map the verdict to the gossipsub acceptance it reports.
+    fn from(value: GossipVerdict) -> Self {
+        match value {
+            GossipVerdict::Accept => MessageAcceptance::Accept,
+            GossipVerdict::Reject => MessageAcceptance::Reject,
+            GossipVerdict::Ignore => MessageAcceptance::Ignore,
+        }
+    }
+}
+
+/// Deferred validation ticket for one gossip message that gossipsub holds (#1772).
+///
+/// Gossipsub runs with `validate_messages()`, so it forwards a message only after this node
+/// reports a verdict. The message stays reportable for about 5 s (history length 5 at a 1 s
+/// heartbeat). The rule for the consumer:
+///
+/// - call [`accept`](Self::accept) right after the signature check and before any downstream work;
+/// - call [`reject`](Self::reject) on an author content fault;
+/// - drop the ticket in every other case. A ticket dropped without a verdict reports
+///   [`GossipVerdict::Ignore`].
+///
+/// The first verdict wins. A second verdict is a no-op, and the drop after a verdict reports
+/// nothing.
+pub struct GossipValidation<Req, Res>
+where
+    Req: TNMessage,
+    Res: TNMessage,
+{
+    /// The held message id, its relaying peer and the command channel to the swarm.
+    ///
+    /// `None` once a verdict is reported, and for a detached ticket.
+    pending: Option<(MessageId, PeerId, mpsc::Sender<NetworkCommand<Req, Res>>)>,
+}
+
+impl<Req, Res> GossipValidation<Req, Res>
+where
+    Req: TNMessage,
+    Res: TNMessage,
+{
+    /// Create a ticket for the message `message_id` that `propagation_source` relayed.
+    ///
+    /// The ticket sends its verdict to the swarm through `sender`.
+    pub fn new(
+        message_id: MessageId,
+        propagation_source: PeerId,
+        sender: mpsc::Sender<NetworkCommand<Req, Res>>,
+    ) -> Self {
+        Self { pending: Some((message_id, propagation_source, sender)) }
+    }
+
+    /// A ticket with nothing to report (tests, direct injection).
+    pub fn detached() -> Self {
+        Self { pending: None }
+    }
+
+    /// Return `true` while the ticket has a verdict to report.
+    pub fn is_pending(&self) -> bool {
+        self.pending.is_some()
+    }
+
+    /// Report [`GossipVerdict::Accept`]: gossipsub forwards the message to the mesh.
+    pub async fn accept(&mut self) {
+        self.report(GossipVerdict::Accept).await;
+    }
+
+    /// Report [`GossipVerdict::Reject`]: gossipsub drops the message as invalid.
+    pub async fn reject(&mut self) {
+        self.report(GossipVerdict::Reject).await;
+    }
+
+    /// Send `verdict` to the swarm once.
+    ///
+    /// A closed channel is tolerated: the message then ages out of the gossipsub cache.
+    async fn report(&mut self, verdict: GossipVerdict) {
+        let send = self.pending.take().map(|(message_id, propagation_source, sender)| async move {
+            let _ = sender
+                .send(NetworkCommand::ReportGossipValidation {
+                    message_id,
+                    propagation_source,
+                    verdict,
+                })
+                .await;
+        });
+        futures::future::OptionFuture::from(send).await;
+    }
+}
+
+/// Show the held message id only; the channel carries no useful state.
+impl<Req, Res> std::fmt::Debug for GossipValidation<Req, Res>
+where
+    Req: TNMessage,
+    Res: TNMessage,
+{
+    /// Format the ticket with the id of the message it holds.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GossipValidation")
+            .field("message_id", &self.pending.as_ref().map(|(id, ..)| id))
+            .finish_non_exhaustive()
+    }
+}
+
+/// A ticket dropped without a verdict reports [`GossipVerdict::Ignore`].
+impl<Req, Res> Drop for GossipValidation<Req, Res>
+where
+    Req: TNMessage,
+    Res: TNMessage,
+{
+    /// Report `Ignore` with a non-blocking send if no verdict was reported.
+    ///
+    /// A full or closed channel is tolerated: the message then ages out of the gossipsub
+    /// cache and is never forwarded.
+    fn drop(&mut self) {
+        let _ = self.pending.take().map(|(message_id, propagation_source, sender)| {
+            sender.try_send(NetworkCommand::ReportGossipValidation {
+                message_id,
+                propagation_source,
+                verdict: GossipVerdict::Ignore,
+            })
+        });
+    }
 }
 
 // ============================================================================
@@ -577,6 +725,17 @@ where
         key: BlsPublicKey,
         /// Reply with the record if one exists in the local store.
         reply: oneshot::Sender<Option<libp2p::kad::Record>>,
+    },
+    /// Report the deferred validation verdict for a held gossip message (#1772).
+    ///
+    /// A [`GossipValidation`] ticket sends it; the swarm passes the verdict to gossipsub.
+    ReportGossipValidation {
+        /// The gossipsub id of the held message.
+        message_id: MessageId,
+        /// The peer that relayed the message to this node.
+        propagation_source: PeerId,
+        /// The verdict to report.
+        verdict: GossipVerdict,
     },
 }
 
