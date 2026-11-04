@@ -1,5 +1,5 @@
-"""vendor.py against throwaway upstream and TN repositories: upstream renames (T4-2) and
-git-ignored files (T4-3). Needs git; no network, no cargo."""
+"""vendor.py against throwaway upstream and TN repositories: upstream renames (T4-2), git-ignored
+files (T4-3) and upstream [patch] entries (T4-6). Needs git; no network, no cargo."""
 
 import importlib.util
 import os
@@ -205,6 +205,58 @@ class IgnoredFiles(Fixture):
         out = self.repos.vendor("add", "crates/bar")
         self.assertEqual(out.returncode, 1)
         self.assertIn("vendor/reth/crates/bar/data/fixture.json", out.stdout)
+
+
+class Patches(Fixture):
+    def test_trim_manifest_drops_patch_entries(self):
+        upstream = MANIFEST + """inkwell = { git = "https://example.com/inkwell", rev = "1" }
+
+# evm2 is patched through its old URL.
+[patch."https://example.com/evm2"]
+evm2 = { git = "https://example.com/fork", rev = "2" }
+
+[patch.crates-io.qux]
+git = "https://example.com/qux"
+
+[profile.release]
+lto = true
+"""
+        dropped = []
+        self.assertEqual(vendor.trim_manifest(upstream, ["crates/foo"], dropped), """[workspace]
+members = [
+    "crates/foo",
+]
+resolver = "2"
+
+[workspace.dependencies]
+foo = { path = "crates/foo" }
+
+[patch.crates-io]
+# baz = { git = "https://example.com/baz" }
+
+# evm2 is patched through its old URL.
+[patch."https://example.com/evm2"]
+
+
+[profile.release]
+lto = true
+""")
+        self.assertEqual(dropped, [
+            '[patch.crates-io] inkwell = { git = "https://example.com/inkwell", rev = "1" }',
+            '[patch."https://example.com/evm2"] '
+            'evm2 = { git = "https://example.com/fork", rev = "2" }',
+            "[patch.crates-io.qux]",
+            '[patch.crates-io.qux] git = "https://example.com/qux"',
+        ])
+
+    def test_sync_lists_upstream_patch_entries_and_leaves_them_out(self):
+        r = self.repos
+        entry = 'inkwell = { git = "https://example.com/inkwell", rev = "1" }'
+        r.commit_upstream({"Cargo.toml": MANIFEST + entry + "\n"}, "v2")
+        out = r.vendor("sync", "v2")
+        self.assertEqual(out.returncode, 1)
+        self.assertIn(f"  + [patch.crates-io] {entry}", out.stdout)
+        self.assertNotIn("inkwell", r.read("Cargo.toml"))
 
 
 if __name__ == "__main__":

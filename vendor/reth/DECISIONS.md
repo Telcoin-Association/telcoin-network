@@ -87,6 +87,14 @@ on every run. A second committed lockfile would drift from the one TN ships. See
 tests on TN's dependency versions, and cargo only adds the packages that reth's dev-dependencies
 alone need.
 
+2026-11-04 (vendor review, T4-6): for the same reason, the filtered manifest drops the entries of
+upstream's `[patch]` sections (headers and comments stay, so the manifest at v1.11.4 is
+unchanged). Cargo applies `[patch]` only from the root manifest of the workspace it builds, so
+TN's build never sees them; kept, they would make reth's tests build, for example, reth-core
+crates from git revisions that TN ships from crates.io. `sync` and `pick` list upstream's changes
+to them, and TN mirrors one in both manifests only on purpose. Dropping was chosen over a warning
+alone: it is barely more code, and the safe state is the default.
+
 ## D8. Git workflow
 
 Decided with the maintainer, 2026-10-30: local commits and tags only, on `sls_tndb_b_vendor`;

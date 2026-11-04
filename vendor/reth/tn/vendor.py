@@ -7,9 +7,10 @@ files (ROOT_FILES) and the workspace manifest. `tn/upstream.toml` pins the upstr
 copy was taken from; that commit is the merge base for every update.
 
 The nested workspace manifest (`vendor/reth/Cargo.toml`) is upstream's root manifest with the
-members and path dependencies of non-vendored crates filtered out (`trim_manifest`). Its
-"upstream version" is always that filtered text, so upstream edits to crates TN does not vendor
-never show up as changes or conflicts.
+members and path dependencies of non-vendored crates filtered out, and the entries of its
+[patch] sections dropped (`trim_manifest`; Cargo would apply those to reth's tests but never to
+TN's build). Its "upstream version" is always that filtered text, so upstream edits to crates TN
+does not vendor never show up as changes or conflicts.
 
 Every operation that brings upstream content in (sync, pick, add, remove) is a per-file 3-way
 merge: base = upstream at the old point, theirs = upstream at the new point, ours = the file in
@@ -185,17 +186,26 @@ def upstream_from(args, pin):
 # Manifest filter
 
 
-def trim_manifest(text, keep_paths):
+# A first-level [patch.<source>] header. Anything deeper ([patch.<source>.<crate>]) is one entry.
+PATCH_TABLE = re.compile(r"""\[patch\.(?:"[^"]*"|'[^']*'|[A-Za-z0-9_-]+)\]""")
+
+
+def trim_manifest(text, keep_paths, dropped_patches=None):
     """Upstream root manifest restricted to `keep_paths`.
 
     Drops [workspace] members and default-members entries outside the list, and
     [workspace.dependencies] path entries pointing outside it. Line based on purpose: every
     kept line is byte-identical to upstream, so a diff between two filtered manifests is
     exactly upstream's change to the kept part.
+
+    Also drops every entry of the [patch.*] sections, keeping their headers and comments. Cargo
+    applies [patch] only from the root manifest of the workspace it builds, so TN's build never
+    sees upstream's patches; carried here, they would make reth's own tests (tn/cargo.sh) build
+    other sources than TN ships. The dropped lines go to `dropped_patches` when it is a list.
     """
     keep = {p.rstrip("/") for p in keep_paths}
     out = []
-    section = None
+    section = ""
     in_members = False
     for line in text.splitlines(keepends=True):
         s = line.strip()
@@ -211,6 +221,14 @@ def trim_manifest(text, keep_paths):
             continue
         if s.startswith("[") and not s.startswith("[["):
             section = s.split("#", 1)[0].strip()
+        if section.startswith("[patch."):
+            # A [patch.<source>] table keeps its header and comments and loses its entries; a
+            # [patch.<source>.<crate>] table goes entirely.
+            sub = not PATCH_TABLE.fullmatch(section)
+            if s and (sub or s[0] not in "#["):
+                if dropped_patches is not None and s[0] != "#":
+                    dropped_patches.append(s if s[0] == "[" else f"{section} {s}")
+                continue
         if section == "[workspace]":
             if re.match(r"members\s*=\s*\[\s*$", s):
                 in_members = True
@@ -228,6 +246,26 @@ def trim_manifest(text, keep_paths):
                 continue
         out.append(line)
     return "".join(out)
+
+
+def report_patches(old_manifest, new_manifest):
+    """List the [patch] entries upstream added or removed between two of its root manifests.
+    trim_manifest leaves them all out of vendor/reth/Cargo.toml; TN mirrors one only on purpose."""
+    old, new = [], []
+    trim_manifest(old_manifest, [], old)
+    trim_manifest(new_manifest, [], new)
+    added, removed = [e for e in new if e not in old], [e for e in old if e not in new]
+    if not added and not removed:
+        return 0
+    print("\nupstream changed its [patch] entries. vendor/reth/Cargo.toml leaves them out: Cargo "
+          "applies [patch] only from the root manifest, so TN's build never sees them, and reth's "
+          "tests (tn/cargo.sh) should build what TN ships. If TN needs one, add it to the root "
+          "Cargo.toml and to vendor/reth/Cargo.toml, with a CHANGES.md entry:")
+    for e in added:
+        print(f"  + {e}")
+    for e in removed:
+        print(f"  - {e}")
+    return 1
 
 
 # ---------------------------------------------------------------------------------------------
@@ -593,6 +631,8 @@ def cmd_sync(args):
     manifest = up.git("show", f"{new}:{MANIFEST}").stdout.decode()
     if print_missing(*missing_deps(crates, manifest)):
         rc = 1
+    if report_patches(up.git("show", f"{old}:{MANIFEST}").stdout.decode(), manifest):
+        rc = 1
     if warn_ignored(crates):
         rc = 1
     print("\nnext: resolve anything above, build and test (see vendor/reth/README.md), add a "
@@ -616,6 +656,9 @@ def cmd_pick(args):
     rc = report(changes, conflicts)
     if not changes and not conflicts:
         print("(the commit touches nothing in the vendored scope)")
+    if report_patches(up.git("show", f"{parent}:{MANIFEST}").stdout.decode(),
+                      up.git("show", f"{commit}:{MANIFEST}").stdout.decode()):
+        rc = 1
     if warn_ignored(crates):
         rc = 1
     print("\nnext: build and test, record the backport in CHANGES.md, commit.")

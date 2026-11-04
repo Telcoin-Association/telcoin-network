@@ -120,6 +120,12 @@ upstream trees, the rule `git merge` uses), so TN's change moves with it, and th
 conflicting line names both paths. The workspace manifest is merged in its filtered form, so
 upstream churn in crates TN does not carry never shows up.
 
+The filter also drops the entries of upstream's `[patch]` sections. Cargo applies `[patch]` only
+from the root manifest of the workspace it builds, so those entries never reach TN's build, and
+reth's tests (`tn/cargo.sh`) should build the same sources TN ships. `sync` and `pick` list the
+entries upstream added or removed. If TN needs one, add it to the root `Cargo.toml` and to
+`vendor/reth/Cargo.toml`, with a CHANGES.md entry.
+
 ### Backport one upstream fix
 
 ```
@@ -144,11 +150,12 @@ Then:
 3. Act on "paths gone upstream" (crates upstream moved to another repository or deleted). The
    tool leaves those files alone. Either `vendor.py remove` the crate and depend on its new home,
    or keep it as a TN-owned fork (ROADMAP.md, "Forking a crate off").
-4. Act on "files in the vendored scope are git-ignored", if printed: add a negation to
+4. Act on "upstream changed its [patch] entries", if printed (see above).
+5. Act on "files in the vendored scope are git-ignored", if printed: add a negation to
    `vendor/reth/.gitignore`, or `git add` leaves those files out of the commit.
-5. Update the root `Cargo.lock` (`cargo update -p <crate>` for the third-party bumps the new
+6. Update the root `Cargo.lock` (`cargo update -p <crate>` for the third-party bumps the new
    manifest asks for), then build and test as for any vendored change.
-6. Add a CHANGES.md entry for the sync and commit. `tn/upstream.toml` already names the new pin.
+7. Add a CHANGES.md entry for the sync and commit. `tn/upstream.toml` already names the new pin.
 
 A trial run of `sync v2.0.0` (2026-10-30) gives an idea of a major step. 454 files changed. Six
 vendored crates left the reth repository: `reth-primitives-traits`, `reth-codecs`,
