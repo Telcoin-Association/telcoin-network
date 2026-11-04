@@ -146,7 +146,9 @@ fn worker_shifted_port(
 ///
 /// - `http_port` shifted down by `200 * worker_id` when the http server is enabled;
 /// - `ws_port` shifted up by `400 * worker_id` when the ws server is enabled;
-/// - `ipcpath` suffixed with `-w{worker_id}` when the IPC server is enabled.
+/// - `ipcpath` suffixed with `-w{worker_id}` when the IPC server is enabled;
+/// - when http and ws share one port, `ws_allowed_origins` falling back to `http_corsdomain`, the
+///   list the shared server checks WebSocket origins against.
 ///
 /// When both http and ws are enabled on fixed (non-zero) ports, the derivation needs
 /// `ws_port >= http_port` (reth's own default layout; equality is the shared http+ws
@@ -195,7 +197,22 @@ fn worker_rpc_server_args(
             } else {
                 format!("{}-w{worker_id}", base.ipcpath)
             };
-            Ok(reth_node_core::args::RpcServerArgs { http_port, ws_port, ipcpath, ..base })
+            // On a shared http+ws port reth checks WebSocket origins against `--ws.origins`, or
+            // against `--http.corsdomain` when only that is set. The shift puts this worker's ws
+            // on its own server, which reads `--ws.origins` alone, so carry the list worker 0
+            // enforces instead of accepting every origin.
+            let ws_allowed_origins = if base.http && base.ws && base.http_port == base.ws_port {
+                base.ws_allowed_origins.clone().or_else(|| base.http_corsdomain.clone())
+            } else {
+                base.ws_allowed_origins.clone()
+            };
+            Ok(reth_node_core::args::RpcServerArgs {
+                http_port,
+                ws_port,
+                ipcpath,
+                ws_allowed_origins,
+                ..base
+            })
         }
     }
 }
@@ -1556,6 +1573,43 @@ mod tests {
         assert_eq!(worker_two.ws_port, base.ws_port + 800);
         assert_eq!(worker_one.ipcpath, format!("{}-w1", base.ipcpath));
         assert_eq!(worker_two.ipcpath, format!("{}-w2", base.ipcpath));
+    }
+
+    /// With http and ws on one port and only `--http.corsdomain` set, worker 0's shared server
+    /// checks WebSocket origins against that list. A worker above 0 gets its ws on a separate
+    /// server, which reads `--ws.origins` alone, so the derivation must carry the list there or
+    /// that worker accepts WebSocket upgrades from every origin.
+    #[test]
+    fn test_shared_port_origins_carry_to_shifted_ws_server() {
+        let base = reth_node_core::args::RpcServerArgs {
+            http: true,
+            ws: true,
+            http_port: 8545,
+            ws_port: 8545,
+            http_corsdomain: Some("https://observer.example".to_string()),
+            ws_allowed_origins: None,
+            ..Default::default()
+        };
+        let worker_zero = worker_rpc_server_args(&base, 0).expect("worker 0 derivation");
+        assert_eq!(worker_zero.ws_allowed_origins, None, "worker 0 keeps the config");
+
+        let worker_one = worker_rpc_server_args(&base, 1).expect("worker 1 derivation");
+        assert_ne!(worker_one.http_port, worker_one.ws_port, "the shift splits the servers");
+        assert_eq!(worker_one.ws_allowed_origins.as_deref(), Some("https://observer.example"));
+        assert_eq!(worker_one.http_corsdomain, base.http_corsdomain);
+
+        // an explicit ws list wins, as it does on the shared server
+        let both = reth_node_core::args::RpcServerArgs {
+            ws_allowed_origins: Some("https://ws.example".to_string()),
+            ..base.clone()
+        };
+        let worker_one = worker_rpc_server_args(&both, 1).expect("worker 1 derivation");
+        assert_eq!(worker_one.ws_allowed_origins.as_deref(), Some("https://ws.example"));
+
+        // separate base ports already give ws its own server, so nothing is carried
+        let separate = reth_node_core::args::RpcServerArgs { ws_port: 8546, ..base };
+        let worker_one = worker_rpc_server_args(&separate, 1).expect("worker 1 derivation");
+        assert_eq!(worker_one.ws_allowed_origins, None);
     }
 
     /// A worker band cannot collide with any `--instance` offset. Instance arithmetic
