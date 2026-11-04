@@ -926,7 +926,8 @@ mod tests {
         assert_eq!(
             line,
             format!(
-                "node build: faucet={FAUCET_ENABLED} adiri={} chain_id=487 genesis_hash={hash:#x}",
+                "node build: faucet={FAUCET_ENABLED} adiri={} chain_id={MAINNET_CHAIN_ID} \
+                 genesis_hash={hash:#x}",
                 cfg!(feature = "adiri")
             )
         );
@@ -1163,7 +1164,10 @@ mod tests {
         let err = run_mainnet_node_with_cleartext_key(datadir, &[])
             .expect_err("no-passphrase on chain 487 must be refused");
         let msg = format!("{err:#}");
-        assert!(msg.contains("refusing to start on chain id 487"), "{msg}");
+        assert!(
+            msg.contains(&format!("refusing to start on chain id {MAINNET_CHAIN_ID}")),
+            "{msg}"
+        );
         assert!(!dir.path().to_path_buf().reth_db_path().exists());
         assert!(!dir.path().to_path_buf().genesis_path().exists());
         assert_eq!(datadir_listing(dir.path())?, before);

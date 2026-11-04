@@ -111,11 +111,10 @@ fn _adiri_chain_spec_arc() -> Arc<ChainSpec> {
     Arc::new(_adiri_chain_spec())
 }
 
-/// Chain id of Telcoin Network mainnet (`0x1e7`).
+/// Chain id of Telcoin Network mainnet (`0x2db`).
 ///
-/// Devnet genesis files (`etc/genesis.sh`) reuse this id, so a chain id of 487 alone does not
-/// identify mainnet; the embedded [`MAINNET_GENESIS`] does.
-pub const MAINNET_CHAIN_ID: u64 = 487;
+/// Devnet genesis files (`etc/genesis.sh`) use 487, so the chain id alone identifies mainnet.
+pub const MAINNET_CHAIN_ID: u64 = 731;
 
 /// Chain id of the adiri testnet (`0x7e1`), the only chain an `adiri` build starts on.
 pub const ADIRI_CHAIN_ID: u64 = 2017;
