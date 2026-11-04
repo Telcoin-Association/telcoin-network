@@ -31,7 +31,8 @@
 //! the range check, the empty-page checks and the move to the first or last slot, in that order;
 //! for a key the empty-page checks, the search, then the range check of the keys it compared. It
 //! hands the leaf's view to the move that settles there, which reads the entry through it: an
-//! exact seek's hit is the search's own result ([`Find::Found`]), not a second read of the cell.
+//! exact seek's hit is the search's own result ([`Find::Found`]), not a second read of the cell
+//! (the dup walker's [`KeyJoined`] reads the hit's cell again through that view, for its key).
 //!
 //! A seek starts from the leaf the cursor is at when its caller holds that leaf's page and vouches
 //! that the path is still the tree's ([`TreeCursor::seek`]): a key between the leaf's first and
@@ -67,13 +68,36 @@ pub(crate) type Entry<'s> = (&'s [u8], &'s [u8]);
 /// How a cursor reads the value of the entry it settles on: the type parameter of the moves of
 /// [`TreeCursor`] whose names end in `_in`. A plain tree's cursor reads [`Values`] (the moves
 /// without the suffix); a dup table's walker reads its outer tree's [`Cells`] and maps each cell
-/// itself ([`super::dup_cursor`]).
+/// itself, and its nested trees' [`KeyJoined`] ([`super::dup_cursor`]).
+///
+/// The provided hooks read the cell a move settles on, before [`Self::read`]; their defaults are
+/// the plain reads, forced inline, so [`Values`] and [`Cells`] compile to the reads they had.
 pub(crate) trait CellRead {
     /// What the read gives for an entry's value.
     type Out<'s>;
 
     /// The value `val` of an entry of a leaf of `store`.
     fn read<'s, S: PageRead + ?Sized>(store: &'s S, val: Val<'s>) -> Result<Self::Out<'s>>;
+
+    /// Entry `i` of a leaf through the view a descent parsed ([`LeafView::entry`]).
+    #[inline(always)]
+    fn entry<'s>(leaf: &LeafView<'s>, i: usize) -> Result<(&'s [u8], Val<'s>)> {
+        leaf.entry(i)
+    }
+
+    /// Entry `i` of the leaf `page` ([`page::leaf_entry`]).
+    #[inline(always)]
+    fn page_entry(page: &[u8], i: usize) -> Result<(&[u8], Val<'_>)> {
+        page::leaf_entry(page, i)
+    }
+
+    /// The value of an exact search's hit at entry `i` of `leaf`, `val` the search's own read of
+    /// it ([`Find::Found`]): `val`.
+    #[inline(always)]
+    fn found<'s>(leaf: &LeafView<'s>, i: usize, val: Val<'s>) -> Result<Val<'s>> {
+        let _ = (leaf, i);
+        Ok(val)
+    }
 }
 
 /// A plain tree's value: the inline bytes, or the value its run holds; a nested cell is
@@ -101,6 +125,43 @@ impl CellRead for Cells {
     }
 }
 
+/// A nested tree's entry with its whole key before its value, for the dup walker's rows: an
+/// inline value is the cell's `key ‖ value`, one slice of the page ([`KeyTail::Joined`],
+/// [`LeafView::entry_with_key_tail`] with the whole key), a value in a run the value alone
+/// ([`KeyTail::Apart`]), a nested cell [`Error::Corrupt`] ([`page::nested_error`]). The cell is
+/// read with [`LeafView::entry`]'s checks, from the move's own leaf access.
+pub(crate) struct KeyJoined;
+
+impl CellRead for KeyJoined {
+    type Out<'s> = KeyTail<'s>;
+
+    #[inline(always)]
+    fn read<'s, S: PageRead + ?Sized>(store: &'s S, val: Val<'s>) -> Result<KeyTail<'s>> {
+        match val {
+            Val::Inline(joined) => Ok(KeyTail::Joined(joined)),
+            Val::Overflow(ovf) => Ok(KeyTail::Apart(store.overflow(ovf)?)),
+            Val::Nested(root) => Err(page::nested_error(root)),
+        }
+    }
+
+    #[inline(always)]
+    fn entry<'s>(leaf: &LeafView<'s>, i: usize) -> Result<(&'s [u8], Val<'s>)> {
+        leaf.entry_with_key_tail(i, usize::MAX)
+    }
+
+    #[inline(always)]
+    fn page_entry(page: &[u8], i: usize) -> Result<(&[u8], Val<'_>)> {
+        page::leaf_entry_with_key_tail(page, i, usize::MAX)
+    }
+
+    /// The hit's cell read again through the parsed view, with the key: the same checks on the
+    /// same bytes, no header parse.
+    #[inline(always)]
+    fn found<'s>(leaf: &LeafView<'s>, i: usize, _: Val<'s>) -> Result<Val<'s>> {
+        Ok(leaf.entry_with_key_tail(i, usize::MAX)?.1)
+    }
+}
+
 /// An entry as the reader `R` reads it: its key and `R`'s read of its value.
 pub(crate) type EntryOf<'s, R> = (&'s [u8], <R as CellRead>::Out<'s>);
 
@@ -119,7 +180,7 @@ fn leaf_entry<'s, R: CellRead, S: PageRead + ?Sized>(
     leaf: &'s [u8],
     i: usize,
 ) -> Result<EntryOf<'s, R>> {
-    let (k, v) = page::leaf_entry(leaf, i)?;
+    let (k, v) = R::page_entry(leaf, i)?;
     Ok((k, R::read(store, v)?))
 }
 
@@ -132,7 +193,7 @@ fn view_entry<'s, R: CellRead, S: PageRead + ?Sized>(
     leaf: &LeafView<'s>,
     i: usize,
 ) -> Result<EntryOf<'s, R>> {
-    let (k, v) = leaf.entry(i)?;
+    let (k, v) = R::entry(leaf, i)?;
     Ok((k, R::read(store, v)?))
 }
 
@@ -168,12 +229,7 @@ fn key_tail<'s, S: PageRead + ?Sized>(
     store: &'s S,
     (key, val): (&'s [u8], Val<'s>),
 ) -> Result<(&'s [u8], KeyTail<'s>)> {
-    let tail = match val {
-        Val::Inline(joined) => KeyTail::Joined(joined),
-        Val::Overflow(ovf) => KeyTail::Apart(store.overflow(ovf)?),
-        Val::Nested(root) => return Err(page::nested_error(root)),
-    };
-    Ok((key, tail))
+    Ok((key, KeyJoined::read(store, val)?))
 }
 
 /// A key range `[lo, hi)` borrowed from a page store (`None`: unbounded).
@@ -704,7 +760,7 @@ impl TreeCursor {
             match to {
                 Some(to) => {
                     c.check_leaf(store, leaf)?;
-                    let (k, v) = page::leaf_entry(leaf, to)?;
+                    let (k, v) = R::page_entry(leaf, to)?;
                     if !k.starts_with(prefix) {
                         return Ok(None);
                     }
@@ -947,6 +1003,7 @@ impl TreeCursor {
         match self.descend(store, root, root.root, root.root_txn, Edge::Exact(key))? {
             (leaf, Some(value)) => {
                 self.state = State::At;
+                let value = R::found(&leaf, self.top().1, value)?;
                 Ok(Some((R::read(store, value)?, leaf.page())))
             }
             (leaf, None) => {
@@ -1097,6 +1154,7 @@ impl TreeCursor {
             }
         };
         self.set_top_slot(index);
+        let value = R::found(&view, index, value)?;
         Ok(Some(Some((R::read(store, value)?, page))))
     }
 

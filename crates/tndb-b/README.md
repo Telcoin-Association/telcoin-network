@@ -797,7 +797,8 @@ cursor has no exact counterpart for:
   (the adapter's `next_dup`) and returns `None` at the key's edge.
 - **Bounded seeks.** `seek_key(k)` goes to `k`'s first row, `seek_dup(k, s)` to its first row
   `k ‖ s'` with `s' >= s` (an empty `s` is `seek_key`), and `seek_dup_with_key_tail(k, s, t)` is
-  `seek_dup` then `current_with_key_tail(t)` (the adapter's `seek_by_key_subkey`). A `k` of
+  `seek_dup` giving the row as `current_with_key_tail(t)` gives it (the adapter's
+  `seek_by_key_subkey`). A `k` of
   another width is `KeyTooShort` or `KeyTooLarge` and changes nothing. A miss returns `None` and
   leaves the cursor unset, as `seek_exact`'s miss does, never on the next key's row, and reads no
   other key's nested tree (only the outer key its outer seek lands beside, for its width). On the
@@ -806,7 +807,15 @@ cursor has no exact counterpart for:
   and, for `t <= |s|` and an inline value, `KeyTail::Joined(s[|s|−t..] ‖ v)`, one slice of the
   nested leaf (the adapter's `t = |s|` is the stored row `s ‖ rest`, with no copy); for a value
   in a run, or `t > |s|`, `KeyTail::Apart(v)`, the caller joining the key's last `t` bytes. Both
-  forms keep `KeyTail`'s meaning, so the joined bytes are the twin's.
+  forms keep `KeyTail`'s meaning, so the joined bytes are the twin's. Every move has a tail
+  twin that gives its row this way: `first_with_key_tail(t)`, `last_with_key_tail(t)`,
+  `next_with_key_tail(t)`, `prev_with_key_tail(t)`, `next_in_prefix_with_key_tail(n, t)`,
+  `prev_in_prefix_with_key_tail(n, t)` (`None` when the step does not move),
+  `seek_with_key_tail(x, t)` and `seek_dup_with_key_tail(k, s, t)` (a `DupTxnCursor`'s take the
+  transaction first). Each is its value move's code with the row's tail taken from the move's own
+  read of the leaf, so a row is read once (the nested cell or the packed row read as `s ‖ v`, the
+  value and every tail a slice of it); `current_with_key_tail(t)` reads the row the cursor is at
+  again.
 - **Borrows.** No page holds `k ‖ s` in one piece, so the key a call returns is the cursor's copy
   (rewritten past `k` on a move inside a key, its buffer reused); the value borrows the snapshot
   or the transaction. A `DupRoCursor`'s results borrow the cursor, as `RoCursor`'s do; a
@@ -1401,9 +1410,9 @@ A latched NoSync environment skips its final sync on drop.
 | `RoTxn::cursor_owned(self: &Arc<RoTxn>, &Table) -> RoCursor` | a read cursor that owns a share of its transaction: no lifetime, `Send + Sync`, the same moves, states and prefix steps as `Cursor`; the entries it returns, overflow values included, borrow the cursor until its next call. Each step fetches its leaf again by page number (see [Readers and snapshots](#readers-and-snapshots)), so a scan costs about 4–8% more per entry than `Cursor`'s (macOS). |
 | `current_with_key_tail(t) -> (key, KeyTail)` on `Cursor`, `RoCursor` and `TxnCursor` | the current entry with its value joined to its key's last `t` bytes (`t` clamped to the key's length): `KeyTail::Joined` for an inline value, the key's tail then the value as one slice of the page (a leaf cell holds its value right after its key), so with no copy; `KeyTail::Apart` for a value in an overflow run, the value alone. The reth adapter reads a dup row (subkey, then the rest) this way. |
 | `seek_with_key_tail(key, t) -> (key, KeyTail)` on `RoCursor` and `TxnCursor` | `seek(key)` then `current_with_key_tail(t)` from one leaf access: the entry is read through the leaf the descent fetched and parsed, an overflow value once; `None` (after the end) when no key is `>= key`. The cursor is left exactly as `seek` leaves it (a `TxnCursor` saves the landed key for its reseek). The reth adapter's `seek_by_key_subkey` reads its row this way. |
-| `RoTxn::dup_cursor_owned(self: &Arc<RoTxn>, &Table) -> DupRoCursor` | a read cursor over a dup table, owned as `RoCursor` is (`TableKind` on a plain table): `RoCursor`'s moves, prefix steps and key-tail calls on the logical keys `k ‖ s`, each giving what `RoCursor` gives on the composite twin, plus the bounded seeks `seek_key(k)`, `seek_dup(k, s)` and `seek_dup_with_key_tail(k, s, t)` (a miss unset, no other key's tree read); see [Dup cursors](#dup-cursors) |
+| `RoTxn::dup_cursor_owned(self: &Arc<RoTxn>, &Table) -> DupRoCursor` | a read cursor over a dup table, owned as `RoCursor` is (`TableKind` on a plain table): `RoCursor`'s moves, prefix steps and key-tail calls on the logical keys `k ‖ s`, each giving what `RoCursor` gives on the composite twin, plus the bounded seeks `seek_key(k)`, `seek_dup(k, s)` and `seek_dup_with_key_tail(k, s, t)` (a miss unset, no other key's tree read), and each move's tail twin `*_with_key_tail(.., t)` (`first`, `last`, `next`, `prev`, `seek`, `seek_dup`, `next_in_prefix`, `prev_in_prefix`: the move, its row as `current_with_key_tail(t)` gives it, from the move's own leaf access); see [Dup cursors](#dup-cursors) |
 | `reset()` on `RoCursor` and `DupRoCursor` | forget the position: the cursor then behaves exactly as a new one from `cursor_owned` / `dup_cursor_owned` on the same snapshot and table (unset), and keeps its allocations (a dup cursor's logical-key buffer), so a pool of cursors reuses one with no descent and no allocation |
-| `RwTxn::dup_cursor_detached(&self, &Table) -> DupTxnCursor` | a detached write cursor over a dup table (`TableKind` on a plain table): `TxnCursor`'s moves, writes (`put`, `insert`, `append` by the logical key, `delete_current`), deleted state, `follower_shares_prefix` and staleness on logical keys, plus `DupRoCursor`'s bounded seeks; its results borrow the cursor and the transaction; see [Dup cursors](#dup-cursors) |
+| `RwTxn::dup_cursor_detached(&self, &Table) -> DupTxnCursor` | a detached write cursor over a dup table (`TableKind` on a plain table): `TxnCursor`'s moves, writes (`put`, `insert`, `append` by the logical key, `delete_current`), deleted state, `follower_shares_prefix` and staleness on logical keys, plus `DupRoCursor`'s bounded seeks and tail twins (the transaction first); its results borrow the cursor and the transaction; see [Dup cursors](#dup-cursors) |
 | `Table` (`name()`) | a handle holding the table's id and name, checked against the catalog of the state it is used in: by a read transaction once per snapshot (the snapshot's `TableRoots` remembers the root it resolved; see [Readers and snapshots](#readers-and-snapshots)), by a write transaction on every use (against its tables' working records, then its catalog). A dropped or re-created table is `StaleTable`, and one created after the reading state is `TableNotFound` |
 | `Error`, `Result<T>` | see [Errors](#errors) |
 

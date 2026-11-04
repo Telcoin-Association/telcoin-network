@@ -115,9 +115,9 @@ impl DupLayout {
     }
 
     /// The full value of a row read with its stored key's last `subkey` bytes joined to its
-    /// stored value (the engine's `current_with_key_tail`), `subkey ‖ rest`: for an inline value
-    /// the slice of the page itself, no copy; for a value in an overflow run rebuilt into `value`
-    /// ([`Self::rebuild`]). `None` if `stored` is not a row of this layout.
+    /// stored value (a tail move's row, or `current_with_key_tail`'s), `subkey ‖ rest`: for an
+    /// inline value the slice of the page itself, no copy; for a value in an overflow run rebuilt
+    /// into `value` ([`Self::rebuild`]). `None` if `stored` is not a row of this layout.
     pub(crate) fn joined<'v>(
         &self,
         stored: &[u8],

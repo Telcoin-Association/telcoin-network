@@ -11,7 +11,15 @@
 //! walker checks every outer key it lands on before it reads the key's cell: the table's key
 //! width, then the cell, a nested cell ([`nested_cell`]) or, in a table that packs
 //! ([`NestedRoots::packed_max`] not 0), an inline cell holding the key's packed set
-//! ([`crate::packed`]). The nested trees are plain trees ([`super::cursor::Values`]).
+//! ([`crate::packed`]). The nested trees are plain trees, read through [`KeyJoined`] (a row's
+//! cell with its subkey).
+//!
+//! **Rows.** Every move returns the row it lands on from its own read of the leaf ([`Row`]): a
+//! nested row's `s ‖ v` (its cell), a packed row's `s ‖ v` (its span of the set), or a value in a
+//! run alone. The shells take the value or the logical key's tail from it ([`DupWalk::value_of`],
+//! [`DupWalk::tail_of`], through [`Pick`]), so a move that gives the tail reads its leaf once;
+//! [`DupWalk::current`] and [`DupWalk::current_with_key_tail`] read the row the walker is at
+//! again.
 //!
 //! **Packed mode.** At a row of a packed key the nested path is unset and the walker holds the
 //! set's row count and the row's index; each move re-reads the cell from the outer leaf it is at
@@ -31,7 +39,7 @@
 //! buffer has grown to the longest key.
 
 use super::{
-    cursor::{Cells, KeyTail, State, TreeCursor},
+    cursor::{Cells, KeyJoined, KeyTail, State, TreeCursor},
     write, PageRead, TreeRoot,
 };
 use crate::{
@@ -40,6 +48,99 @@ use crate::{
     page::{self, cmp_keys, LeafView, Search, Val},
 };
 use std::cmp::Ordering;
+
+/// The row a walker's move lands on, from that move's own leaf access: the row's subkey joined to
+/// its value, `s ‖ v`, one slice of a page ([`KeyTail::Joined`]: a nested leaf's inline cell, read
+/// through [`KeyJoined`], or a packed row of the outer leaf, [`PackedView::row_span`]), or the
+/// value alone ([`KeyTail::Apart`]: a nested value in an overflow run). The shells project it with
+/// [`DupWalk::value_of`] or [`DupWalk::tail_of`], so a move gives its row's key tail with no second
+/// read of the leaf.
+pub(crate) type Row<'s> = KeyTail<'s>;
+
+/// What a dup cursor's move gives of the row it lands on: [`PickValue`], the value alone, for the
+/// value moves, or [`PickTail`], the value with the logical key's last `t` bytes, for the tail
+/// moves; each the bytes [`DupWalk::current`] or [`DupWalk::current_with_key_tail`] gives at that
+/// row. One shell body runs both, so a tail move is its value move by construction.
+pub(crate) trait Pick: Copy {
+    /// What the move gives for the row's value.
+    type Out<'s>;
+
+    /// The projection of `row`, the row `walk` just landed on.
+    fn row<'s>(self, walk: &DupWalk, row: Row<'s>) -> Self::Out<'s>;
+
+    /// The row `walk` is at, read again, for a call that lands without moving the walker (a write
+    /// cursor's deleted state, at the follower).
+    fn current<'s, S, N, A>(
+        self,
+        walk: &DupWalk,
+        store: &'s S,
+        roots: &N,
+        again: &A,
+    ) -> Result<Option<Self::Out<'s>>>
+    where
+        S: PageRead + ?Sized,
+        N: NestedRoots,
+        A: Fn(u32) -> Result<Option<&'s [u8]>>;
+}
+
+/// The value moves' [`Pick`]: the row's value ([`DupWalk::value_of`]).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PickValue;
+
+impl Pick for PickValue {
+    type Out<'s> = &'s [u8];
+
+    #[inline(always)]
+    fn row<'s>(self, walk: &DupWalk, row: Row<'s>) -> &'s [u8] {
+        walk.value_of(row)
+    }
+
+    #[inline(always)]
+    fn current<'s, S, N, A>(
+        self,
+        walk: &DupWalk,
+        store: &'s S,
+        roots: &N,
+        again: &A,
+    ) -> Result<Option<&'s [u8]>>
+    where
+        S: PageRead + ?Sized,
+        N: NestedRoots,
+        A: Fn(u32) -> Result<Option<&'s [u8]>>,
+    {
+        walk.current(store, roots, again)
+    }
+}
+
+/// The tail moves' [`Pick`]: the row's value with the logical key's last `t` bytes, `PickTail(t)`
+/// ([`DupWalk::tail_of`]).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PickTail(pub(crate) usize);
+
+impl Pick for PickTail {
+    type Out<'s> = KeyTail<'s>;
+
+    #[inline(always)]
+    fn row<'s>(self, walk: &DupWalk, row: Row<'s>) -> KeyTail<'s> {
+        walk.tail_of(row, self.0)
+    }
+
+    #[inline(always)]
+    fn current<'s, S, N, A>(
+        self,
+        walk: &DupWalk,
+        store: &'s S,
+        roots: &N,
+        again: &A,
+    ) -> Result<Option<KeyTail<'s>>>
+    where
+        S: PageRead + ?Sized,
+        N: NestedRoots,
+        A: Fn(u32) -> Result<Option<&'s [u8]>>,
+    {
+        walk.current_with_key_tail(store, roots, again, self.0)
+    }
+}
 
 /// Where a dup walker gets the nested root of each outer key it lands on.
 pub(crate) trait NestedRoots {
@@ -342,7 +443,7 @@ impl DupWalk {
     }
 
     /// Land on the first (`forward`) or last row of the key just entered (`inside`) and return
-    /// its value.
+    /// it ([`Row`]).
     #[inline]
     fn land_edge_of<'s, S: PageRead + ?Sized, N: NestedRoots>(
         &mut self,
@@ -350,7 +451,7 @@ impl DupWalk {
         roots: &N,
         inside: Inside<'s>,
         forward: bool,
-    ) -> Result<&'s [u8]> {
+    ) -> Result<Row<'s>> {
         match inside {
             Inside::Nested(_) => self.land_edge(store, forward),
             Inside::Packed(view) => {
@@ -398,26 +499,29 @@ impl DupWalk {
         }
     }
 
-    /// Row `i` of the current key's set `view`: its subkey and value, with [`PackedView::row`]'s
-    /// checks.
+    /// Row `i` of the current key's set `view`: its subkey and the row `s ‖ v` ([`Row`], one slice
+    /// of the set), with [`PackedView::row`]'s checks ([`PackedView::row_span`]).
     #[inline]
     fn packed_row<'s>(
         &self,
         name: &str,
         view: &PackedView<'s>,
         i: usize,
-    ) -> Result<(&'s [u8], &'s [u8])> {
-        view.row(i, usize::from(self.max_subkey)).map_err(|e| self.packed_err(name, e))
+    ) -> Result<(&'s [u8], Row<'s>)> {
+        let (start, slen, end) =
+            view.row_span(i, usize::from(self.max_subkey)).map_err(|e| self.packed_err(name, e))?;
+        let row = &view.blob()[start..end];
+        Ok((&row[..slen], KeyTail::Joined(row)))
     }
 
-    /// Land on packed row `i` of the current key's set `view` and return its value: an edge row
-    /// or a search's, which needs no order compare (the next step compares against it).
-    fn land_packed<'s>(&mut self, name: &str, view: &PackedView<'s>, i: usize) -> Result<&'s [u8]> {
-        let (s, v) = self.packed_row(name, view, i)?;
+    /// Land on packed row `i` of the current key's set `view` and return it ([`Row`]): an edge
+    /// row or a search's, which needs no order compare (the next step compares against it).
+    fn land_packed<'s>(&mut self, name: &str, view: &PackedView<'s>, i: usize) -> Result<Row<'s>> {
+        let (s, row) = self.packed_row(name, view, i)?;
         self.set_sub(s)?;
         // Lossless: `i` is below the set's u16 row count.
         self.packed_at = i as u16;
-        Ok(v)
+        Ok(row)
     }
 
     /// Step to packed row `to`, the next (`forward`) or the previous of the one the walker is at,
@@ -453,12 +557,12 @@ impl DupWalk {
         roots: &mut N,
         again: &impl Fn(u32) -> Result<Option<&'s [u8]>>,
         forward: bool,
-    ) -> Result<Option<&'s [u8]>> {
+    ) -> Result<Option<Row<'s>>> {
         if let Some(to) = self.packed_neighbour(forward) {
             let view = self.packed(store, roots, again)?;
-            let (s, v) = self.packed_row(roots.name(), &view, to)?;
+            let (s, row) = self.packed_row(roots.name(), &view, to)?;
             self.packed_move(roots.name(), s, to, forward)?;
-            return Ok(Some(v));
+            return Ok(Some(row));
         }
         self.cross_key(store, outer_root, roots, again, forward)
     }
@@ -475,16 +579,16 @@ impl DupWalk {
         to: usize,
         n: usize,
         forward: bool,
-    ) -> Result<Option<&'s [u8]>> {
+    ) -> Result<Option<Row<'s>>> {
         let (kl, name) = (self.kl(), roots.name());
         let view = self.packed(store, roots, again)?;
-        let (s, v) = self.packed_row(name, &view, to)?;
+        let (s, row) = self.packed_row(name, &view, to)?;
         // The rows of one key share its `K` bytes, so only a prefix past them can differ.
         if n > kl && !s.starts_with(&self.key[kl..n]) {
             return Ok(None);
         }
         self.packed_move(name, s, to, forward)?;
-        Ok(Some(v))
+        Ok(Some(row))
     }
 
     /// Move to the first row `>= s` of the current key's set `view` (an empty `s`: its first),
@@ -498,7 +602,7 @@ impl DupWalk {
         again: &impl Fn(u32) -> Result<Option<&'s [u8]>>,
         view: &PackedView<'s>,
         s: &[u8],
-    ) -> Result<Option<&'s [u8]>> {
+    ) -> Result<Option<Row<'s>>> {
         match self.packed_find(roots.name(), view, s)? {
             Some(j) => self.land_packed(roots.name(), view, j).map(Some),
             None => self.cross_key(store, outer_root, roots, again, true),
@@ -556,19 +660,19 @@ impl DupWalk {
     }
 
     /// Land the nested path on the first (`forward`) or last row of the nested tree just entered
-    /// and return its value. A nested tree with no row there is [`Error::Corrupt`]: a cell names
-    /// a non-empty tree.
+    /// and return it ([`Row`]). A nested tree with no row there is [`Error::Corrupt`]: a cell
+    /// names a non-empty tree.
     fn land_edge<'s, S: PageRead + ?Sized>(
         &mut self,
         store: &'s S,
         forward: bool,
-    ) -> Result<&'s [u8]> {
+    ) -> Result<Row<'s>> {
         let landed = if forward {
-            self.inner.first(store, &self.nested)?
+            self.inner.first_in::<KeyJoined, S>(store, &self.nested)?
         } else {
-            self.inner.last(store, &self.nested)?
+            self.inner.last_in::<KeyJoined, S>(store, &self.nested)?
         };
-        let Some((s, v)) = landed else {
+        let Some((s, row)) = landed else {
             return Err(Error::Corrupt(format!(
                 "a nested tree of {} entries under outer key {:02x?} holds no row",
                 self.nested.entries,
@@ -576,7 +680,7 @@ impl DupWalk {
             )));
         };
         self.set_sub(s)?;
-        Ok(v)
+        Ok(row)
     }
 
     /// Settle on the outer path's landing: on a key, enter it and land on its first (`forward`)
@@ -587,7 +691,7 @@ impl DupWalk {
         roots: &mut N,
         landed: Option<(&'s [u8], Val<'s>)>,
         forward: bool,
-    ) -> Result<Option<&'s [u8]>> {
+    ) -> Result<Option<Row<'s>>> {
         match landed {
             Some((k, val)) => {
                 let inside = self.enter(roots, k, val)?;
@@ -600,15 +704,15 @@ impl DupWalk {
         }
     }
 
-    /// Move to the first (`forward`) or last row: after the end (before the start) of an empty
-    /// table.
+    /// Move to the first (`forward`) or last row and return it ([`Row`]): after the end (before
+    /// the start) of an empty table.
     pub(crate) fn start<'s, S: PageRead + ?Sized, N: NestedRoots>(
         &mut self,
         store: &'s S,
         outer_root: &TreeRoot,
         roots: &mut N,
         forward: bool,
-    ) -> Result<Option<&'s [u8]>> {
+    ) -> Result<Option<Row<'s>>> {
         self.guarded(|w| {
             w.inner.unset();
             let landed = if forward {
@@ -624,7 +728,7 @@ impl DupWalk {
     /// the twin: from a row, inside its key from the nested leaf the walker is at, else to the
     /// next key's first row (the previous key's last); from unset or before the start (after the
     /// end), the first (last) row; at the end it stays there. `again` gives the page of a leaf
-    /// the walker is at ([`held`]).
+    /// the walker is at ([`held`]). The row landed on is returned ([`Row`]), as by every move.
     pub(crate) fn step<'s, S: PageRead + ?Sized, N: NestedRoots>(
         &mut self,
         store: &'s S,
@@ -632,7 +736,7 @@ impl DupWalk {
         roots: &mut N,
         again: &impl Fn(u32) -> Result<Option<&'s [u8]>>,
         forward: bool,
-    ) -> Result<Option<&'s [u8]>> {
+    ) -> Result<Option<Row<'s>>> {
         match (self.state(), forward) {
             (State::Unset | State::BeforeStart, true) | (State::Unset | State::AfterEnd, false) => {
                 self.start(store, outer_root, roots, forward)
@@ -643,13 +747,15 @@ impl DupWalk {
                     return w.step_packed(store, outer_root, roots, again, forward);
                 }
                 let stepped = match held(&w.inner, again)? {
-                    Some(leaf) => w.inner.step_from(store, &w.nested, leaf, forward)?,
-                    None if forward => w.inner.next(store, &w.nested)?,
-                    None => w.inner.prev(store, &w.nested)?,
+                    Some(leaf) => {
+                        w.inner.step_from_in::<KeyJoined, S>(store, &w.nested, leaf, forward)?
+                    }
+                    None if forward => w.inner.next_in::<KeyJoined, S>(store, &w.nested)?,
+                    None => w.inner.prev_in::<KeyJoined, S>(store, &w.nested)?,
                 };
-                if let Some((s, v)) = stepped {
+                if let Some((s, row)) = stepped {
                     w.set_sub(s)?;
-                    return Ok(Some(v));
+                    return Ok(Some(row));
                 }
                 w.cross_key(store, outer_root, roots, again, forward)
             }),
@@ -666,7 +772,7 @@ impl DupWalk {
         roots: &mut N,
         again: &impl Fn(u32) -> Result<Option<&'s [u8]>>,
         forward: bool,
-    ) -> Result<Option<&'s [u8]>> {
+    ) -> Result<Option<Row<'s>>> {
         let landed = match held(&self.outer, again)? {
             Some(leaf) => self.outer.step_from_in::<Cells, S>(store, outer_root, leaf, forward)?,
             None if forward => self.outer.next_in::<Cells, S>(store, outer_root)?,
@@ -687,7 +793,7 @@ impl DupWalk {
         roots: &mut N,
         again: &impl Fn(u32) -> Result<Option<&'s [u8]>>,
         x: &[u8],
-    ) -> Result<Option<&'s [u8]>> {
+    ) -> Result<Option<Row<'s>>> {
         let kl = self.kl();
         let (xk, xs) = x.split_at(kl.min(x.len()));
         self.guarded(|w| {
@@ -698,10 +804,10 @@ impl DupWalk {
                     return w.seek_packed(store, outer_root, roots, again, &view, xs);
                 }
                 let leaf = held(&w.inner, again)?;
-                return match w.inner.seek(store, &w.nested, leaf, xs)? {
-                    Some((s, v)) => {
+                return match w.inner.seek_in::<KeyJoined, S>(store, &w.nested, leaf, xs)? {
+                    Some((s, row)) => {
                         w.set_sub(s)?;
-                        Ok(Some(v))
+                        Ok(Some(row))
                     }
                     None => w.cross_key(store, outer_root, roots, again, true),
                 };
@@ -719,17 +825,17 @@ impl DupWalk {
             if let Inside::Packed(view) = &inside {
                 return w.seek_packed(store, outer_root, roots, again, view, xs);
             }
-            match w.inner.seek(store, &w.nested, None, xs)? {
-                Some((s, v)) => {
+            match w.inner.seek_in::<KeyJoined, S>(store, &w.nested, None, xs)? {
+                Some((s, row)) => {
                     w.set_sub(s)?;
-                    Ok(Some(v))
+                    Ok(Some(row))
                 }
                 None => w.cross_key(store, outer_root, roots, again, true),
             }
         })
     }
 
-    /// Move to the row `x` and return its value; unset if there is none. A key of at most the
+    /// Move to the row `x` and return it ([`Row`]); unset if there is none. A key of at most the
     /// key width has no row and reads nothing. The seek starts as [`Self::seek`]'s does.
     pub(crate) fn seek_exact<'s, S: PageRead + ?Sized, N: NestedRoots>(
         &mut self,
@@ -738,7 +844,7 @@ impl DupWalk {
         roots: &mut N,
         again: &impl Fn(u32) -> Result<Option<&'s [u8]>>,
         x: &[u8],
-    ) -> Result<Option<&'s [u8]>> {
+    ) -> Result<Option<Row<'s>>> {
         if x.len() <= self.kl() {
             self.unset();
             return Ok(None);
@@ -746,7 +852,7 @@ impl DupWalk {
         let (xk, xs) = x.split_at(self.kl());
         self.bounded(store, outer_root, roots, again, xk, |w, store, name, inside| match inside {
             Inside::Nested(leaf) => {
-                let found = w.inner.seek_exact(store, &w.nested, leaf, xs)?;
+                let found = w.inner.seek_exact_in::<KeyJoined, S>(store, &w.nested, leaf, xs)?;
                 if found.is_some() {
                     w.set_sub(xs)?;
                 }
@@ -762,7 +868,7 @@ impl DupWalk {
     }
 
     /// Move to the first row `k ‖ s'` of the outer key `k` with `s' >= s` (an empty `s`: `k`'s
-    /// first row) and return its value; unset if there is none in `k`, never a row of the next
+    /// first row) and return it ([`Row`]); unset if there is none in `k`, never a row of the next
     /// key: no other key's cell or tree is read. `k` of another length than the key width is
     /// [`Error::KeyTooShort`] or [`Error::KeyTooLarge`], the walker unmoved.
     pub(crate) fn seek_dup<'s, S: PageRead + ?Sized, N: NestedRoots>(
@@ -773,7 +879,7 @@ impl DupWalk {
         again: &impl Fn(u32) -> Result<Option<&'s [u8]>>,
         k: &[u8],
         s: &[u8],
-    ) -> Result<Option<&'s [u8]>> {
+    ) -> Result<Option<Row<'s>>> {
         self.check_key(k)?;
         self.bounded(store, outer_root, roots, again, k, |w, store, name, inside| {
             let leaf = match inside {
@@ -784,14 +890,14 @@ impl DupWalk {
                 }
             };
             let landed = if s.is_empty() {
-                w.inner.first(store, &w.nested)?
+                w.inner.first_in::<KeyJoined, S>(store, &w.nested)?
             } else {
-                w.inner.seek(store, &w.nested, leaf, s)?
+                w.inner.seek_in::<KeyJoined, S>(store, &w.nested, leaf, s)?
             };
             match landed {
-                Some((s, v)) => {
+                Some((s, row)) => {
                     w.set_sub(s)?;
-                    Ok(Some(v))
+                    Ok(Some(row))
                 }
                 None => Ok(None),
             }
@@ -812,8 +918,8 @@ impl DupWalk {
         roots: &mut N,
         again: &impl Fn(u32) -> Result<Option<&'s [u8]>>,
         k: &[u8],
-        inner: impl FnOnce(&mut Self, &'s S, &str, Inside<'s>) -> Result<Option<&'s [u8]>>,
-    ) -> Result<Option<&'s [u8]>> {
+        inner: impl FnOnce(&mut Self, &'s S, &str, Inside<'s>) -> Result<Option<Row<'s>>>,
+    ) -> Result<Option<Row<'s>>> {
         self.guarded(|w| {
             let at = w.state() == State::At;
             if at && w.key[..w.kl()] == *k {
@@ -869,7 +975,7 @@ impl DupWalk {
         again: &impl Fn(u32) -> Result<Option<&'s [u8]>>,
         n: usize,
         forward: bool,
-    ) -> Result<Option<&'s [u8]>> {
+    ) -> Result<Option<Row<'s>>> {
         if self.state() != State::At || n > self.key.len() {
             return Ok(None);
         }
@@ -882,11 +988,12 @@ impl DupWalk {
             } else {
                 let leaf = held(&w.inner, again)?;
                 let within = n.saturating_sub(kl);
-                if let Some(((s, v), _)) =
-                    w.inner.step_in_prefix(store, &w.nested, leaf, within, forward)?
+                if let Some(((s, row), _)) = w
+                    .inner
+                    .step_in_prefix_in::<KeyJoined, S>(store, &w.nested, leaf, within, forward)?
                 {
                     w.set_sub(s)?;
-                    return Ok(Some(v));
+                    return Ok(Some(row));
                 }
             }
             if n >= kl {
@@ -916,13 +1023,13 @@ impl DupWalk {
         prefix: &[u8],
         forward: bool,
         spare: &mut Vec<u8>,
-    ) -> Result<Option<&'s [u8]>> {
+    ) -> Result<Option<Row<'s>>> {
         let (outer, inner, nested) = (self.outer.clone(), self.inner.clone(), self.nested);
         let packed = (self.packed_rows, self.packed_at);
         spare.clear();
         spare.extend_from_slice(&self.key);
         match self.step(store, outer_root, roots, again, forward)? {
-            Some(v) if self.key.starts_with(prefix) => Ok(Some(v)),
+            Some(row) if self.key.starts_with(prefix) => Ok(Some(row)),
             _ => {
                 (self.outer, self.inner, self.nested) = (outer, inner, nested);
                 (self.packed_rows, self.packed_at) = packed;
@@ -954,7 +1061,7 @@ impl DupWalk {
 
     /// Land on the follower of the row its writer just deleted from the current outer key's
     /// nested tree, which the delete kept, now `nested`, with the follower's slot `slot` in
-    /// `leaf` below `branches` ([`TreeCursor::place_after_delete`]), and return its value: that
+    /// `leaf` below `branches` ([`TreeCursor::place_after_delete`]), and return it ([`Row`]): that
     /// tree's next row, else the next key's first row, else after the end. The outer path must
     /// still be a path of the outer tree `outer_root` (a nested-only delete leaves it so).
     #[allow(clippy::too_many_arguments)]
@@ -966,14 +1073,17 @@ impl DupWalk {
         again: &impl Fn(u32) -> Result<Option<&'s [u8]>>,
         nested: TreeRoot,
         (branches, leaf, slot): (&[(u32, usize)], u32, usize),
-    ) -> Result<Option<&'s [u8]>> {
+    ) -> Result<Option<Row<'s>>> {
         self.guarded(|w| {
             w.nested = nested;
             w.packed_rows = 0;
-            match w.inner.place_after_delete(store, &w.nested, branches, leaf, slot)? {
-                Some((s, v)) => {
+            let placed = w
+                .inner
+                .place_after_delete_in::<KeyJoined, S>(store, &w.nested, branches, leaf, slot);
+            match placed? {
+                Some((s, row)) => {
                     w.set_sub(s)?;
-                    Ok(Some(v))
+                    Ok(Some(row))
                 }
                 None => w.cross_key(store, outer_root, roots, again, true),
             }
@@ -982,15 +1092,15 @@ impl DupWalk {
 
     /// Land on the follower of an outer key whose cell its writer just removed from the outer
     /// tree `outer_root` (the key's last row deleted), with the follower's slot `slot` in `leaf`
-    /// below `branches` (the outer tree's path cache), and return its value: the next key's first
-    /// row, else after the end.
+    /// below `branches` (the outer tree's path cache), and return it ([`Row`]): the next key's
+    /// first row, else after the end.
     pub(crate) fn place_after_outer_delete<'s, S: PageRead + ?Sized, N: NestedRoots>(
         &mut self,
         store: &'s S,
         outer_root: &TreeRoot,
         roots: &mut N,
         (branches, leaf, slot): (&[(u32, usize)], u32, usize),
-    ) -> Result<Option<&'s [u8]>> {
+    ) -> Result<Option<Row<'s>>> {
         self.guarded(|w| {
             w.inner.unset();
             let landed = w
@@ -998,6 +1108,30 @@ impl DupWalk {
                 .place_after_delete_in::<Cells, S>(store, outer_root, branches, leaf, slot)?;
             w.settle(store, roots, landed, true)
         })
+    }
+
+    /// The value of `row`, the row a move of the walker just returned ([`Row`]): past the subkey
+    /// of a joined row, else the value as it is.
+    #[inline]
+    pub(crate) fn value_of<'s>(&self, row: Row<'s>) -> &'s [u8] {
+        match row {
+            KeyTail::Joined(joined) => &joined[self.key.len() - self.kl()..],
+            KeyTail::Apart(v) => v,
+        }
+    }
+
+    /// `row`, the row a move of the walker just returned ([`Row`]), as the value with the logical
+    /// key's last `t` bytes: the bytes [`Self::current_with_key_tail`] gives at that row, sliced
+    /// from the move's own read. A tail inside the subkey (`t <= |s|`) of a joined row comes
+    /// joined; any other comes apart.
+    #[inline]
+    pub(crate) fn tail_of<'s>(&self, row: Row<'s>, t: usize) -> KeyTail<'s> {
+        let sub = self.key.len() - self.kl();
+        match row {
+            KeyTail::Joined(joined) if t <= sub => KeyTail::Joined(&joined[sub - t..]),
+            KeyTail::Joined(joined) => KeyTail::Apart(&joined[sub..]),
+            apart @ KeyTail::Apart(_) => apart,
+        }
     }
 
     /// The value of the row the walker is at, if it is at one.
@@ -1159,14 +1293,17 @@ mod tests {
         };
         let mut w = DupWalk::new(4, 64);
         let walk = &mut w;
-        assert_eq!(walk.start(&store, &root, &mut Packing, true).expect("row 0"), Some(&b"1"[..]));
+        let row = walk.start(&store, &root, &mut Packing, true).expect("row 0");
+        assert_eq!(row.map(|r| walk.value_of(r)), Some(&b"1"[..]));
         let step = walk.step(&store, &root, &mut Packing, &no_leaf, true).expect("row 1");
+        let step = step.map(|r| walk.value_of(r));
         assert_eq!((step, walk.key()), (Some(&b"3"[..]), &b"\0\0\0\x01c"[..]));
         let step = walk.step(&store, &root, &mut Packing, &no_leaf, true);
         assert!(matches!(&step, Err(Error::Corrupt(m)) if *m == refused(2)), "{step:?}");
         assert_eq!(walk.state(), State::Unset);
 
-        assert_eq!(walk.start(&store, &root, &mut Packing, false).expect("row 2"), Some(&b"2"[..]));
+        let row = walk.start(&store, &root, &mut Packing, false).expect("row 2");
+        assert_eq!(row.map(|r| walk.value_of(r)), Some(&b"2"[..]));
         let step = walk.step(&store, &root, &mut Packing, &no_leaf, false);
         assert!(matches!(&step, Err(Error::Corrupt(m)) if *m == refused(1)), "{step:?}");
         assert_eq!(walk.state(), State::Unset);

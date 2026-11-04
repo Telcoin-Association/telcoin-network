@@ -26,6 +26,7 @@ mod damage_merge;
 mod damage_runs;
 mod dup;
 mod dup_cursor;
+mod dup_key_tail;
 mod dup_packed;
 mod dup_sweep;
 mod dup_txn_cursor;

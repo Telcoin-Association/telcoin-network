@@ -85,8 +85,9 @@ sort by key, then by subkey, as MDBX sorts a key's values. Each table has one of
 
 The form is part of the file's format: the open refuses a table held in the other form, or a dup
 table with another key width or `packed_max` (`MDBX_INCOMPATIBLE`, naming the table and both
-forms). A read returns the value (subkey, then the
-rest) as one slice of the page, through the engine's `current_with_key_tail`, with no copy.
+forms). A read returns the value (subkey, then the rest) as one slice of the page, with no copy,
+read by the move itself on a nested table (the engine's tail moves, `next_with_key_tail` and the
+others) and by `current_with_key_tail` after the move on a composite one.
 `seek_by_key_subkey` reads its row in the seek itself, from the leaf the seek fetched (the engine's
 `seek_with_key_tail`, with `key ‖ subkey` built on the stack; `seek_dup_with_key_tail` on a nested
 table, the subkey given apart). A row this layout cannot hold is `MDBX_BAD_VALSIZE`.
