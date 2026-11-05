@@ -537,6 +537,17 @@ where
         /// The collection of bls public keys associated with authorities to find.
         bls_keys: Vec<BlsPublicKey>,
     },
+    /// Replace the validator keys this swarm resolves for export but never admits.
+    ///
+    /// The peer manager ignores an update for an epoch older than the one it holds.
+    UpdateTrackedKeys {
+        /// Epoch at which both sets were read.
+        epoch: u64,
+        /// Committee scheduled beyond the previous/current/next window.
+        scheduled: HashSet<BlsPublicKey>,
+        /// Registry validators eligible for committee selection.
+        eligible: HashSet<BlsPublicKey>,
+    },
     /// Open a raw stream to a peer for bulk data transfer.
     ///
     /// The open negotiates the per-role sync protocol and the caller writes a
@@ -988,6 +999,27 @@ where
     /// Return network information for authorities by bls pubkey on kad.
     pub async fn find_authorities(&self, bls_keys: Vec<BlsPublicKey>) -> NetworkResult<()> {
         self.sender.send(NetworkCommand::FindAuthorities { bls_keys }).await?;
+        Ok(())
+    }
+
+    /// Replace the scheduled and eligible validator keys this swarm tracks for export.
+    ///
+    /// `scheduled` is the committee beyond the previous/current/next window and `eligible` the
+    /// registry's pool of validators eligible for committee selection, both read at `epoch`. The
+    /// swarm resolves their signed node records through kad but never admits, scores, or pins
+    /// them; membership comes only from the committee updates. An update for an epoch older than
+    /// the one the swarm holds is ignored, and keys an applied update no longer lists are dropped
+    /// with their records and lookups.
+    ///
+    /// Like [`Self::find_authorities`], this returns once the command is queued, not once it has
+    /// been applied.
+    pub async fn update_tracked_keys(
+        &self,
+        epoch: u64,
+        scheduled: HashSet<BlsPublicKey>,
+        eligible: HashSet<BlsPublicKey>,
+    ) -> NetworkResult<()> {
+        self.sender.send(NetworkCommand::UpdateTrackedKeys { epoch, scheduled, eligible }).await?;
         Ok(())
     }
 

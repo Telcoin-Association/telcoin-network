@@ -12,7 +12,7 @@ use crate::{
         ConnectionLimitReason, HandshakeDirection, InboundFailureOutcome, InboundRejection,
         OutboundRequestOutcome, PeerManagerMetrics, SwarmMetrics,
     },
-    peers::{self, LoadPenalty, PeerEvent, PeerManager, Penalty, PutRecordRate},
+    peers::{self, LoadPenalty, LookupClass, PeerEvent, PeerManager, Penalty, PutRecordRate},
     quic_incoming::QuicIncomingLimits,
     record_exchange::{RecordCodec, RecordExchange, RecordResponse},
     send_or_log_error,
@@ -108,6 +108,10 @@ mod catch_up_contention;
 #[cfg(test)]
 #[path = "tests/loop_budget_tests.rs"]
 mod loop_budget_tests;
+
+#[cfg(test)]
+#[path = "tests/tracked_rearm.rs"]
+mod tracked_rearm;
 
 /// The unit of work that [`ConsensusNetwork::run`] services next, as chosen by
 /// [`next_loop_event`].
@@ -1734,6 +1738,12 @@ where
                 // Fetch signed records for unknown peers and unresolved configured dial hints.
                 self.swarm.behaviour_mut().peer_manager.find_authorities(bls_keys);
             }
+            NetworkCommand::UpdateTrackedKeys { epoch, scheduled, eligible } => {
+                self.swarm
+                    .behaviour_mut()
+                    .peer_manager
+                    .update_tracked_keys(epoch, scheduled, eligible);
+            }
             NetworkCommand::GetValidatorRpc { bls_key, reply } => {
                 let rpc = self.swarm.behaviour().peer_manager.get_rpc(&bls_key);
                 send_or_log_error!(reply, rpc, "GetValidatorRpc");
@@ -1854,7 +1864,7 @@ where
             .missing_required_records()
             .into_iter()
             .for_each(|key| {
-                if self.kad_record_queries.values().all(|query| query.query.request != key) {
+                if !self.join_record_query(&key, LookupClass::Committee) {
                     let id = self.swarm.behaviour_mut().kademlia.get_record(node_record_key(&key));
                     self.kad_record_queries.insert(id, key.into());
                 }
@@ -2755,26 +2765,9 @@ where
                 self.swarm.behaviour_mut().gossipsub.remove_blacklisted_peer(&peer_id);
             }
             PeerEvent::MissingAuthorities(missing) => {
-                // Polling callers such as `current_committee_rpcs` report a member as
-                // missing on every call until its signed metadata reaches `known_peers`, so the
-                // same key arrives here repeatedly while its lookup is still in flight.
-                // Issue at most one live `get_record` per key: skip keys already tracked
-                // in `kad_record_queries` (issue #1135). The map is safe as the dedupe
-                // source because every terminal query path removes its entry (see
-                // `close_kad_query`), so a skipped key becomes queryable again as soon
-                // as its current query ends. The removal there runs before any result
-                // filtering, so even a query whose record is dropped as stale or
-                // non-committee re-arms the key.
-                for bls_key in missing {
-                    if self.kad_record_queries.values().all(|q| q.query.request != bls_key) {
-                        let key = node_record_key(&bls_key);
-                        let query_id = self.swarm.behaviour_mut().kademlia.get_record(key);
-                        self.kad_record_queries.insert(query_id, bls_key.into());
-                    } else {
-                        trace!(target: "network-kad", ?bls_key, "kad record query already in flight");
-                    }
-                }
+                self.query_node_records(missing, LookupClass::Committee);
             }
+            PeerEvent::MissingRecords(missing, class) => self.query_node_records(missing, class),
             PeerEvent::Discovery => {
                 let peer_id = PeerId::random();
                 self.swarm.behaviour_mut().kademlia.get_closest_peers(peer_id);
@@ -2782,6 +2775,45 @@ where
         }
 
         Ok(())
+    }
+
+    /// Start one kad `get_record` per requested key that has no query in flight.
+    fn query_node_records(&mut self, missing: Vec<BlsPublicKey>, class: LookupClass) {
+        // Polling callers such as `current_committee_rpcs` report a member as
+        // missing on every call until its signed metadata reaches `known_peers`, so the
+        // same key arrives here repeatedly while its lookup is still in flight.
+        // Issue at most one live `get_record` per key: skip keys already tracked
+        // in `kad_record_queries` (issue #1135). The map is safe as the dedupe
+        // source because every terminal query path removes its entry (see
+        // `close_kad_query`), so a skipped key becomes queryable again as soon
+        // as its current query ends. The removal there runs before any result
+        // filtering, so even a query whose record is dropped as stale or
+        // non-committee re-arms the key. A committee lookup that joins a tracked
+        // query in flight is re-issued if that query closes without a record.
+        for bls_key in missing {
+            if self.join_record_query(&bls_key, class) {
+                trace!(target: "network-kad", ?bls_key, ?class, "kad record query already in flight");
+            } else {
+                let key = node_record_key(&bls_key);
+                let query_id = self.swarm.behaviour_mut().kademlia.get_record(key);
+                self.kad_record_queries.insert(query_id, PendingKadQuery::new(bls_key, class));
+            }
+        }
+    }
+
+    /// Join a lookup of `class` for `bls_key` to the record query already in flight for that key,
+    /// returning whether one was.
+    ///
+    /// A committee lookup that joins a tracked query is not lost: the tracked query re-issues it
+    /// if it closes without a record (see [`Self::close_kad_query`]).
+    fn join_record_query(&mut self, bls_key: &BlsPublicKey, class: LookupClass) -> bool {
+        let Some(query) =
+            self.kad_record_queries.values_mut().find(|query| query.query.request == *bls_key)
+        else {
+            return false;
+        };
+        query.join(class);
+        true
     }
 
     /// Process events from the stream behavior.
@@ -3380,15 +3412,18 @@ where
     /// matching results may also fill an independently owned committee or pinned store row in
     /// [`Self::process_kad_event`]. The query grants no persistent ownership, and third-party
     /// periodic replication is disabled by [`configure_record_jobs`].
+    ///
+    /// The result is routed by the key's membership at close, not by the query's class, so a
+    /// tracked query whose key has since entered the committee window resolves it like a
+    /// committee query. A tracked query that a committee lookup joined and that closes without a
+    /// record hands the key back to the peer manager, which queues a committee lookup for it if
+    /// its record is still unlearned.
     fn close_kad_query(&mut self, query_id: &QueryId) {
-        self.kad_record_queries
-            .remove(query_id)
-            .and_then(|query| {
-                let key = query.query.request;
-                query.into_result().map(|(record, timestamp)| (key, record, timestamp))
-            })
-            .into_iter()
-            .for_each(|(key, node_record, timestamp)| {
+        let Some(query) = self.kad_record_queries.remove(query_id) else { return };
+        let key = query.query.request;
+        let rearm_committee = query.rearm_committee;
+        match query.into_result() {
+            Some((node_record, timestamp)) => {
                 let peer: PeerId = node_record.info.pubkey.clone().into();
                 self.swarm.behaviour_mut().peer_manager.add_discovered_peer_with_timestamp(
                     key,
@@ -3396,7 +3431,13 @@ where
                     timestamp,
                 );
                 self.refresh_explicit_peer(&peer);
-            });
+            }
+            None if rearm_committee => {
+                trace!(target: "network-kad", ?key, "tracked kad record query closed empty, re-arming committee lookup");
+                self.swarm.behaviour_mut().peer_manager.find_authorities(vec![key]);
+            }
+            None => (),
+        }
     }
 }
 
@@ -3407,15 +3448,35 @@ pub(crate) struct PendingKadQuery {
     query: KadQuery,
     /// Admission ceiling of the winning result, retained until the query closes.
     timestamp: Option<crate::freshness::RecordTimestamp>,
+    /// Why the query was issued.
+    class: LookupClass,
+    /// Whether a committee lookup joined this tracked query, so closing it without a record must
+    /// re-issue that lookup.
+    rearm_committee: bool,
 }
 
+/// A query built from a bare key is a committee lookup.
 impl From<BlsPublicKey> for PendingKadQuery {
     fn from(key: BlsPublicKey) -> Self {
-        Self { query: key.into(), timestamp: None }
+        Self::new(key, LookupClass::Committee)
     }
 }
 
 impl PendingKadQuery {
+    /// Track a fresh query for `key` issued under `class`.
+    fn new(key: BlsPublicKey, class: LookupClass) -> Self {
+        Self { query: key.into(), timestamp: None, class, rearm_committee: false }
+    }
+
+    /// Attach a lookup of `class` for the same key instead of issuing a second query.
+    ///
+    /// Only a committee lookup joining a tracked query is remembered: a committee query already is
+    /// that lookup, and a tracked lookup is served by whatever the query resolves.
+    fn join(&mut self, class: LookupClass) {
+        self.rearm_committee |=
+            self.class == LookupClass::Tracked && class == LookupClass::Committee;
+    }
+
     /// Retain the freshest verified result under the shared local admission policy.
     #[cfg(test)]
     pub(crate) fn consider(&mut self, record: NodeRecord, observed: tn_types::TimestampSec) {

@@ -6,7 +6,8 @@ use super::{
     cache::BannedPeerCache,
     peer::MAX_MULTIADDRS_PER_PEER,
     status::NewConnectionStatus,
-    types::{ConnectionDirection, ConnectionType, DialRequest, PeerAction},
+    tracked::{TrackedKeys, MAX_TRACKED_KEYS},
+    types::{ConnectionDirection, ConnectionType, DialRequest, LookupClass, PeerAction},
     PeerEvent, PeerExchangeMap, Penalty,
 };
 use crate::{
@@ -47,12 +48,22 @@ mod admission_tests;
 #[path = "../tests/listen_failure.rs"]
 mod listen_failure_tests;
 
+#[cfg(test)]
+#[path = "../tests/tracked_keys.rs"]
+mod tracked_keys_tests;
+
 /// Initial delay and polling resolution for configured hub reconnects.
 const TRUSTED_RETRY_INITIAL: Duration = Duration::from_secs(1);
 /// Maximum delay during a hub outage, independent of unrelated connected peers.
 const TRUSTED_RETRY_MAX: Duration = Duration::from_secs(60);
 /// Maximum delay between kad lookups for one configured hub whose record stays unresolved.
 const TRUSTED_LOOKUP_MAX: Duration = Duration::from_secs(30 * 60);
+/// Initial delay between kad lookups for one tracked key whose record stays unresolved.
+const TRACKED_LOOKUP_INITIAL: Duration = Duration::from_secs(30);
+/// Maximum delay between kad lookups for one tracked key whose record stays unresolved.
+const TRACKED_LOOKUP_MAX: Duration = Duration::from_secs(30 * 60);
+/// Maximum tracked keys looked up per heartbeat, so a cold start spreads its queries over ticks.
+const TRACKED_LOOKUPS_PER_HEARTBEAT: usize = 16;
 
 /// One bounded reconnect schedule per configured hub in this swarm.
 #[derive(Debug)]
@@ -283,6 +294,22 @@ pub(crate) struct PeerManager {
     known_peers: HashMap<BlsPublicKey, NetworkInfo>,
     /// Admission metadata bounded to the same keys as the known-peer cache.
     known_timestamps: HashMap<BlsPublicKey, crate::freshness::RecordTimestamp>,
+    /// Scheduled and eligible validator keys, with records retained for export only.
+    ///
+    /// Kept apart from `known_peers` on purpose: a record there creates a peer-id binding that
+    /// decides request delivery and gossip attribution. A tracked record binds nothing and never
+    /// reaches the peer store, scoring, pruning, or the admission inputs. A key that leaves every
+    /// committee slot while still tracked moves its learned record here
+    /// ([`Self::prune_known_peers`]); nothing moves the other way.
+    tracked: TrackedKeys,
+    /// BLS keys configured as bootstrap peers, labelled for the admission snapshot.
+    ///
+    /// Bounded by node configuration and never cleared.
+    bootstrap_keys: HashSet<BlsPublicKey>,
+    /// BLS keys configured as trusted hubs or trusted peers, labelled for the admission snapshot.
+    ///
+    /// Bounded by node configuration and never cleared.
+    trusted_keys: HashSet<BlsPublicKey>,
     /// BLS keys whose `known_peers` entry is pinned and never evicted by committee rotation.
     ///
     /// Populated only by the operator-provisioned insertion paths — trusted/bootstrap/explicit
@@ -594,6 +621,9 @@ impl PeerManager {
             peers,
             known_peers: Default::default(),
             known_timestamps: Default::default(),
+            tracked: Default::default(),
+            bootstrap_keys: Default::default(),
+            trusted_keys: Default::default(),
             pinned_peers: Default::default(),
             stub_records: Default::default(),
             committee_peers: Default::default(),
@@ -632,6 +662,7 @@ impl PeerManager {
             }
             compatible
         }).for_each(|(bls, endpoint)| {
+            self.trusted_keys.insert(bls);
             self.trusted_dials.entry(bls).or_insert_with(|| {
                 let info = NetworkInfo {
                     pubkey: endpoint.network_key,
@@ -755,6 +786,7 @@ impl PeerManager {
         let peer_id: PeerId = info.pubkey.clone().into();
         let multiaddr = info.multiaddrs.clone();
         self.admission_operator_peers.insert(bls_key, peer_id);
+        self.trusted_keys.insert(bls_key);
         self.peers.add_trusted_peer(bls_key, info.pubkey.clone());
 
         // remove from temporary banned and warn if peer was banned
@@ -907,6 +939,7 @@ impl PeerManager {
             // Retry configured hubs whose record is still unresolved, inside each hub's lookup
             // backoff. Bootstrap entries are looked up only through committee discovery.
             self.trigger_trusted_lookups(None);
+            self.trigger_tracked_lookups();
         }
         ready
     }
@@ -1460,6 +1493,30 @@ impl PeerManager {
         self.apply_unban_actions(unban_actions);
     }
 
+    /// Replace the scheduled and eligible keys this swarm tracks for export.
+    ///
+    /// An update for an epoch older than the held one is ignored; a repeat of the held epoch
+    /// replaces it. Keys the update no longer lists lose their retained record and their lookup
+    /// schedule. Past [`MAX_TRACKED_KEYS`] distinct keys the excess is left out with a bounded
+    /// warning. Tracking admits nothing: membership, scoring, and the admission inputs come only
+    /// from the committee update. Lookups for newly tracked keys start on the next heartbeat.
+    pub(crate) fn update_tracked_keys(
+        &mut self,
+        epoch: u64,
+        scheduled: HashSet<BlsPublicKey>,
+        eligible: HashSet<BlsPublicKey>,
+    ) {
+        match self.tracked.update(epoch, scheduled, eligible) {
+            None => {
+                debug!(target: "peer-manager", epoch, "ignoring tracked keys for an older epoch")
+            }
+            Some(0) => trace!(target: "peer-manager", epoch, "tracked keys updated"),
+            Some(left_out) => {
+                bounded_warn!(Command, target: "peer-manager", epoch, left_out, max = MAX_TRACKED_KEYS, "tracked key limit reached, keys left out");
+            }
+        }
+    }
+
     /// Write the committee connectivity gauges from the current committee slot.
     ///
     /// A member expects every other member (`size - 1`); a non-member expects 0, so the committee
@@ -1479,7 +1536,28 @@ impl PeerManager {
     /// accumulate across epochs. `known_peers` is thereby bounded by the operator-configured set
     /// plus the three committee slots. Evicting a still-relevant peer only forces a fresh kad
     /// lookup if it becomes a committee member again, which is the intended discovery flow.
+    ///
+    /// An evicted key that is still tracked keeps its learned record in the tracked map, under
+    /// the same freshness rule as any other tracked record; a config stub is not a record and is
+    /// never moved. A tracked record is never promoted back into this cache.
     fn prune_known_peers(&mut self) {
+        let observed = now();
+        let demoted: Vec<_> = self
+            .known_peers
+            .iter()
+            .filter(|(bls_key, _)| {
+                !self.pinned_peers.contains(*bls_key)
+                    && !self.peers.is_committee_member(bls_key)
+                    && !self.stub_records.contains(*bls_key)
+                    && self.is_tracked_key(bls_key)
+            })
+            .map(|(bls_key, info)| {
+                let timestamp = self.known_timestamps.get(bls_key).copied().unwrap_or_else(|| {
+                    crate::freshness::RecordTimestamp::legacy(info.timestamp, observed)
+                });
+                (*bls_key, info.clone(), timestamp)
+            })
+            .collect();
         let pinned = &self.pinned_peers;
         let peers = &self.peers;
         self.known_peers
@@ -1488,6 +1566,9 @@ impl PeerManager {
         let known = &self.known_peers;
         self.stub_records.retain(|bls_key| known.contains_key(bls_key));
         self.known_timestamps.retain(|bls_key, _| known.contains_key(bls_key));
+        demoted.into_iter().for_each(|(bls_key, info, timestamp)| {
+            self.retain_tracked(bls_key, info, timestamp, observed);
+        });
     }
 
     /// Lift any already-known committee members out of the manager's temporary-ban cache.
@@ -1533,11 +1614,21 @@ impl PeerManager {
 
     /// Whether the cached record for `bls_key` was signed more than the record age limit ago.
     fn record_outdated(&self, bls_key: &BlsPublicKey, observed: tn_types::TimestampSec) -> bool {
-        self.record_max_age.is_some_and(|max_age| {
-            self.known_peers
-                .get(bls_key)
-                .is_some_and(|info| observed.saturating_sub(info.timestamp) > max_age.as_secs())
-        })
+        self.known_peers
+            .get(bls_key)
+            .is_some_and(|info| self.signed_past_max_age(info.timestamp, observed))
+    }
+
+    /// Whether a record signed at `signed` is older than the record age limit at `observed`.
+    ///
+    /// Without a configured limit no record ages.
+    fn signed_past_max_age(
+        &self,
+        signed: tn_types::TimestampSec,
+        observed: tn_types::TimestampSec,
+    ) -> bool {
+        self.record_max_age
+            .is_some_and(|max_age| observed.saturating_sub(signed) > max_age.as_secs())
     }
 
     /// Emit a [`PeerEvent::MissingAuthorities`] for configured hubs whose record is unresolved
@@ -1576,6 +1667,53 @@ impl PeerManager {
         if !missing.is_empty() {
             self.events.push_back(PeerEvent::MissingAuthorities(missing));
         }
+    }
+
+    /// Emit a [`PeerEvent::MissingRecords`] of [`LookupClass::Tracked`] for tracked keys whose
+    /// record is missing or outdated and whose lookup is due.
+    ///
+    /// At most [`TRACKED_LOOKUPS_PER_HEARTBEAT`] keys are queried per call. Each key backs off
+    /// from [`TRACKED_LOOKUP_INITIAL`], doubling up to [`TRACKED_LOOKUP_MAX`], while it stays
+    /// unresolved, so a key that never resolves costs at most one query per maximum delay. The
+    /// schedule resets once the key no longer needs a lookup.
+    fn trigger_tracked_lookups(&mut self) {
+        let observed = now();
+        let wanted: HashSet<BlsPublicKey> = self
+            .tracked
+            .keys()
+            .filter(|bls_key| self.tracked_lookup_wanted(bls_key, observed))
+            .copied()
+            .collect();
+        let due = self.tracked.due_lookups(
+            &wanted,
+            Instant::now(),
+            TRACKED_LOOKUPS_PER_HEARTBEAT,
+            TRACKED_LOOKUP_INITIAL,
+            TRACKED_LOOKUP_MAX,
+        );
+        if !due.is_empty() {
+            trace!(target: "peer-manager", ?due, "requesting tracked kad records");
+            self.events.push_back(PeerEvent::MissingRecords(due, LookupClass::Tracked));
+        }
+    }
+
+    /// Whether a tracked key needs a kad lookup: it has no retained record, or only one signed
+    /// longer ago than the record age limit that also governs window records.
+    ///
+    /// A key in a committee slot or pinned is resolved into `known_peers` by the committee and
+    /// hub lookups, so it is never queried as a tracked key.
+    fn tracked_lookup_wanted(
+        &self,
+        bls_key: &BlsPublicKey,
+        observed: tn_types::TimestampSec,
+    ) -> bool {
+        self.is_tracked_key(bls_key)
+            && !self.peers.is_committee_member(bls_key)
+            && !self.pinned_peers.contains(bls_key)
+            && self
+                .tracked
+                .record(bls_key)
+                .is_none_or(|info| self.signed_past_max_age(info.timestamp, observed))
     }
 
     /// Whether no network-learned record is cached for `bls_key` — either nothing is cached at
@@ -1656,6 +1794,7 @@ impl PeerManager {
     /// learned.
     pub(crate) fn add_bootstrap_peer(&mut self, bls_key: BlsPublicKey, info: NetworkInfo) {
         self.admission_operator_peers.insert(bls_key, info.pubkey.clone().into());
+        self.bootstrap_keys.insert(bls_key);
         self.pinned_peers.insert(bls_key);
         if !self.known_peers.contains_key(&bls_key) {
             self.cache_known_peer(bls_key, info);
@@ -1813,13 +1952,20 @@ impl PeerManager {
     }
 
     /// Promote a query winner while preserving the ceiling fixed when its result arrived.
+    ///
+    /// A key outside every committee slot and the pinned set is retained only when it is tracked,
+    /// through [`Self::retain_tracked`], which binds no identity.
     pub(crate) fn add_discovered_peer_with_timestamp(
         &mut self,
         bls_key: BlsPublicKey,
         info: NetworkInfo,
         timestamp: crate::freshness::RecordTimestamp,
     ) {
-        if !self.peers.is_committee_member(&bls_key) && !self.pinned_peers.contains(&bls_key) {
+        let cacheable =
+            self.peers.is_committee_member(&bls_key) || self.pinned_peers.contains(&bls_key);
+        if !cacheable && self.is_tracked_key(&bls_key) {
+            self.retain_tracked(bls_key, info, timestamp, now());
+        } else if !cacheable {
             trace!(
                 target: "peer-manager",
                 ?bls_key,
@@ -1939,6 +2085,10 @@ impl PeerManager {
     /// and keeps the issue #827 bound against unbounded record injection intact. A relayed record
     /// (`source` != the advertised identity) cannot confirm an identity the sender does not
     /// control and is dropped, so this never lets a peer displace another peer's identity.
+    ///
+    /// For a tracked key outside the committee cache, the record, own or relayed, is also offered
+    /// to [`Self::retain_tracked`]. That retention binds nothing, so the identity handling above
+    /// is the same whether or not the key is tracked.
     pub(crate) fn add_self_advertised_peer_with_timestamp(
         &mut self,
         source: PeerId,
@@ -1950,6 +2100,9 @@ impl PeerManager {
         let advertised: PeerId = info.pubkey.clone().into();
         let cacheable =
             self.peers.is_committee_member(&bls_key) || self.pinned_peers.contains(&bls_key);
+        if !cacheable && self.is_tracked_key(&bls_key) {
+            self.retain_tracked(bls_key, info.clone(), timestamp, observed);
+        }
         match () {
             () if cacheable && self.kad_timestamp_is_stale(&bls_key, timestamp, observed) => {
                 trace!(
@@ -2132,6 +2285,35 @@ impl PeerManager {
                 .committee_peers
                 .iter()
                 .any(|(key, peer)| *key != bls_key && peer.network_key == info.pubkey)
+    }
+
+    /// Whether `bls_key` is scheduled or eligible and is not this swarm's own key.
+    fn is_tracked_key(&self, bls_key: &BlsPublicKey) -> bool {
+        Some(*bls_key) != self.local_bls_key && self.tracked.contains(bls_key)
+    }
+
+    /// Retain a verified record of a tracked key for export, outside the committee cache.
+    ///
+    /// The caller has checked that the key is tracked. A record that contradicts a configured hub
+    /// or a launch binding, in either direction, is refused as on the committee cache path, and a
+    /// record that does not supersede the held one is dropped. Nothing here touches the peer
+    /// store, `known_peers`, or [`Self::peer_to_bls`].
+    fn retain_tracked(
+        &mut self,
+        bls_key: BlsPublicKey,
+        info: NetworkInfo,
+        timestamp: crate::freshness::RecordTimestamp,
+        observed: tn_types::TimestampSec,
+    ) {
+        if !self.trusted_binding_matches(bls_key, &info) {
+            bounded_warn!(PeerRecord, target: "peer-manager", ?bls_key, "ignoring tracked record that contradicts configured hub identity");
+        } else if !self.launch_binding_matches(bls_key, &info) {
+            bounded_warn!(PeerRecord, target: "peer-manager", ?bls_key, "ignoring tracked record that contradicts launch inventory");
+        } else if self.tracked.retain(bls_key, info, timestamp, observed) {
+            trace!(target: "peer-manager", ?bls_key, "retaining tracked peer record");
+        } else {
+            trace!(target: "peer-manager", ?bls_key, "dropping stale tracked peer record");
+        }
     }
 
     /// Cache a compatible binding together with its original local ordering metadata.
