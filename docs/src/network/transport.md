@@ -164,6 +164,7 @@ Worker `k` of one validator reaches only worker `k` of the others.
 
 The failure mode is quiet by design.
 There is no error message describing the mismatch, because there is nothing to reject — the two peers simply have no protocol in common.
+Outbound substreams negotiate optimistically (multistream-select `V1Lazy`), so a dialer that proposes one protocol sends its first request bytes in the same flight as the proposal, and a listener with no protocol in common answers `na` and drops the stream without any handler seeing those bytes.
 
 ## Source of truth
 
