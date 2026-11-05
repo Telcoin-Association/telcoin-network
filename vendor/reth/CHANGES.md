@@ -447,8 +447,8 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   `fetch_chunk_receipts`, two tests).
   *Why*: TN-0019 gave the outer range scan a permit, but once 1,000 or more bloom-matching
   headers remained, the scan started its receipt chunks with bare `spawn_blocking` while its own
-  thread waited, so one permitted scan could occupy five blocking threads (the chunk size
-  rounded down, so the remainder became a fifth chunk). Each chunk now takes a permit with
+  thread waited, so one permitted scan could occupy up to six blocking threads: its own and five
+  chunk threads (the chunk size rounded down, so a remainder became a fifth chunk). Each chunk now takes a permit with
   `try_acquire_owned` and runs on the scanning task when none is free (an awaited acquire could
   deadlock while outer scans hold every permit), and the chunk size rounds up, so a scan uses at
   most `DEFAULT_PARALLEL_CONCURRENCY` extra threads, each paid for. Only the permit and chunk
@@ -491,7 +491,7 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   *Files*: `crates/rpc/rpc-eth-api/src/helpers/call.rs` (`create_access_list_with` takes the
   permit; `create_access_list_at` calls it directly instead of from a second blocking task, as the
   matching hunk of upstream 4630cc588 does), `crates/rpc/rpc/src/eth/bundle.rs`
-  (`EthBundle::call_bundle`).
+  (`EthBundle::call_bundle`, and the TN-owned `blocking_io_permit_tests` module).
   *Why*: both ran the EVM on tokio's blocking pool with no permit (review finding T1-4), and
   `EthBundle`'s tracing guard is unused upstream. TN's `eth_createAccessList` and `eth_callBundle`
   wrappers delegate to these helpers, which own the blocking task, so the permit has to be taken
@@ -501,4 +501,7 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   (`estimate_gas_at_epoch`, which owns its task). Callers must not hold a blocking-IO permit.
   *Tests*: in `tn-reth`, `test_rpc_simulation_waits_for_blocking_io_permit` (all four methods wait
   with no permits; fails before the change) and `test_rpc_simulation_shares_one_blocking_io_permit`
-  (with one permit, concurrent requests all complete). *Upstream*: yes.
+  (with one permit, concurrent requests all complete). In reth-rpc, `bundle.rs`'s
+  `blocking_io_permit_tests` drop each request while its blocking task is stalled on the account
+  store and check that the permit stays taken until the task ends; both fail when the permit is
+  held by the request instead of the task. *Upstream*: yes.

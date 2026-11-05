@@ -313,3 +313,216 @@ pub enum EthBundleError {
     #[error("blob gas usage exceeds the limit of {0} gas per block.")]
     Eip4844BlobGasExceeded(u64),
 }
+
+/// TN(TN-0037): `eth_callBundle` and `eth_createAccessList` keep their blocking-IO permit until
+/// their blocking task ends, not until their request ends.
+#[cfg(test)]
+mod blocking_io_permit_tests {
+    use super::*;
+    use crate::{eth::helpers::types::EthRpcConverter, EthApi, EthApiBuilder};
+    use alloy_consensus::{Header, TxLegacy};
+    use alloy_eips::{eip2718::Encodable2718, BlockId, BlockNumberOrTag};
+    use alloy_primitives::{Address, TxKind};
+    use alloy_rpc_types_eth::TransactionRequest;
+    use reth_chainspec::{ChainSpec, ChainSpecBuilder};
+    use reth_ethereum_primitives::{Block, BlockBody, Transaction};
+    use reth_evm_ethereum::EthEvmConfig;
+    use reth_network_api::noop::NoopNetwork;
+    use reth_primitives_traits::Block as _;
+    use reth_provider::test_utils::MockEthProvider;
+    use reth_rpc_eth_api::{
+        helpers::{EthCall, SpawnBlocking},
+        node::RpcNodeCoreAdapter,
+    };
+    use reth_testing_utils::generators;
+    use reth_transaction_pool::test_utils::{testing_pool, TestPool};
+    use std::{future::Future, pin::Pin, sync::mpsc, time::Duration};
+    use tokio::time::{sleep, timeout, Instant};
+
+    type TestEthApi = EthApi<
+        RpcNodeCoreAdapter<MockEthProvider, TestPool, NoopNetwork, EthEvmConfig>,
+        EthRpcConverter<ChainSpec>,
+    >;
+
+    type Request<'a> = Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
+
+    /// Time for spawned work to start, or for a wrongly freed permit to show.
+    const SETTLE: Duration = Duration::from_millis(200);
+
+    /// Bounds every wait, so a regression fails instead of hanging.
+    const DEADLINE: Duration = Duration::from_secs(20);
+
+    /// An `EthApi` with one blocking-IO permit over a mock chain with an empty block 1 (Berlin, so
+    /// access lists exist), and a signed transaction for bundles.
+    struct Fixture {
+        provider: MockEthProvider,
+        api: TestEthApi,
+        bundle: EthBundle<TestEthApi>,
+        raw_tx: alloy_primitives::Bytes,
+    }
+
+    impl Fixture {
+        fn new() -> Self {
+            let provider = MockEthProvider::default()
+                .with_chain_spec(ChainSpecBuilder::mainnet().berlin_activated().build());
+            let block = Block {
+                header: Header { number: 1, gas_limit: 30_000_000, ..Default::default() },
+                body: BlockBody::default(),
+            }
+            .seal_slow();
+            provider.add_block(block.hash(), block.into_block());
+            let api = EthApiBuilder::new(
+                provider.clone(),
+                testing_pool(),
+                NoopNetwork::default(),
+                EthEvmConfig::new(provider.chain_spec()),
+            )
+            .max_blocking_io_requests(1)
+            .build();
+            let bundle = EthBundle::new(api.clone(), BlockingTaskGuard::new(1));
+            let tx = generators::sign_tx_with_random_key_pair(
+                &mut generators::rng(),
+                Transaction::Legacy(TxLegacy {
+                    gas_limit: 21_000,
+                    to: TxKind::Call(Address::with_last_byte(1)),
+                    ..Default::default()
+                }),
+            );
+            Self { provider, api, bundle, raw_tx: tx.encoded_2718().into() }
+        }
+
+        fn call_bundle(&self) -> Request<'_> {
+            let request = EthCallBundle {
+                txs: vec![self.raw_tx.clone()],
+                block_number: 2,
+                state_block_number: BlockNumberOrTag::Number(1),
+                ..Default::default()
+            };
+            Box::pin(async move {
+                self.bundle.call_bundle(request).await.expect("eth_callBundle");
+            })
+        }
+
+        fn create_access_list(&self) -> Request<'_> {
+            let request = TransactionRequest {
+                to: Some(TxKind::Call(Address::with_last_byte(2))),
+                ..Default::default()
+            };
+            Box::pin(async move {
+                EthCall::create_access_list_at(
+                    &self.api,
+                    request,
+                    Some(BlockId::Number(1.into())),
+                    None,
+                )
+                .await
+                .expect("eth_createAccessList");
+            })
+        }
+
+        /// Clones of the mock provider alive: a blocking task holds one for its state.
+        fn provider_clones(&self) -> usize {
+            Arc::strong_count(&self.provider.accounts)
+        }
+
+        async fn settle_at(&self, clones: usize) {
+            let deadline = Instant::now() + DEADLINE;
+            while self.provider_clones() != clones {
+                assert!(Instant::now() < deadline, "provider clones stuck at {clones}");
+                sleep(Duration::from_millis(5)).await;
+            }
+        }
+    }
+
+    /// Locks the mock's account store from a thread of its own until dropped, so the first
+    /// account read of a request blocks inside its blocking task.
+    struct AccountGate {
+        release: Option<mpsc::Sender<()>>,
+        holder: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl AccountGate {
+        fn close(provider: &MockEthProvider) -> Self {
+            let accounts = Arc::clone(&provider.accounts);
+            let (locked_tx, locked_rx) = mpsc::channel();
+            let (release, released) = mpsc::channel::<()>();
+            let holder = std::thread::spawn(move || {
+                let _locked = accounts.lock();
+                locked_tx.send(()).unwrap();
+                let _ = released.recv();
+            });
+            locked_rx.recv().unwrap();
+            Self { release: Some(release), holder: Some(holder) }
+        }
+    }
+
+    impl Drop for AccountGate {
+        fn drop(&mut self) {
+            drop(self.release.take());
+            if let Some(holder) = self.holder.take() {
+                let _ = holder.join();
+            }
+        }
+    }
+
+    /// Drops a request whose blocking task is still running and checks that the permit stays
+    /// taken until that task ends.
+    async fn assert_dropped_request_keeps_its_permit(
+        method: &str,
+        fx: &Fixture,
+        start: impl Fn(&Fixture) -> Request<'_>,
+    ) {
+        // Let `EthApi`'s startup tasks run, then warm the caches with one full request, so the
+        // only provider clone a request makes below is its blocking task's state.
+        sleep(SETTLE).await;
+        let idle = fx.provider_clones();
+        timeout(DEADLINE, start(fx)).await.unwrap_or_else(|_| panic!("{method}: warm-up hangs"));
+        fx.settle_at(idle).await;
+        let permits = fx.api.blocking_io_task_guard();
+        assert_eq!(permits.available_permits(), 1, "{method}: the warm-up kept its permit");
+
+        let gate = AccountGate::close(&fx.provider);
+        let gated = idle + 1;
+        let mut request = start(fx);
+        let deadline = Instant::now() + DEADLINE;
+        while fx.provider_clones() == gated {
+            assert!(Instant::now() < deadline, "{method}: the blocking task never started");
+            assert!(
+                timeout(Duration::from_millis(5), &mut request).await.is_err(),
+                "{method}: the request ended while the account store was locked"
+            );
+        }
+        drop(request);
+        sleep(SETTLE).await;
+        assert_eq!(fx.provider_clones(), gated + 1, "{method}: the blocking task ended");
+        assert_eq!(
+            permits.available_permits(),
+            0,
+            "{method}: the dropped request freed its permit"
+        );
+
+        drop(gate);
+        let deadline = Instant::now() + DEADLINE;
+        while permits.available_permits() == 0 {
+            assert!(Instant::now() < deadline, "{method}: the permit never came back");
+            sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_call_bundle_keeps_permit_after_client_leaves() {
+        let fx = Fixture::new();
+        assert_dropped_request_keeps_its_permit("eth_callBundle", &fx, Fixture::call_bundle).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_create_access_list_keeps_permit_after_client_leaves() {
+        let fx = Fixture::new();
+        assert_dropped_request_keeps_its_permit(
+            "eth_createAccessList",
+            &fx,
+            Fixture::create_access_list,
+        )
+        .await;
+    }
+}
