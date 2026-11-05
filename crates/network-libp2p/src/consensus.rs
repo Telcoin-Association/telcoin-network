@@ -117,6 +117,10 @@ mod tracked_rearm;
 #[path = "tests/tracked_store.rs"]
 mod tracked_store;
 
+#[cfg(test)]
+#[path = "tests/admission_snapshot.rs"]
+mod admission_snapshot;
+
 /// The unit of work that [`ConsensusNetwork::run`] services next, as chosen by
 /// [`next_loop_event`].
 #[derive(Debug)]
