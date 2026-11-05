@@ -173,6 +173,6 @@ mod tests {
     #[test]
     fn primary_gap_item_cap_fits_the_channel() {
         assert_eq!(primary_event_gap_policy().max_items(), PRIMARY_GAP_MAX_ITEMS);
-        assert!(PRIMARY_GAP_MAX_ITEMS <= CHANNEL_CAPACITY, "{PRIMARY_GAP_MAX_ITEMS}");
+        const { assert!(PRIMARY_GAP_MAX_ITEMS <= CHANNEL_CAPACITY) };
     }
 }
