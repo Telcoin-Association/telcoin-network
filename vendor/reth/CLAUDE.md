@@ -102,7 +102,8 @@ etc/rocksdb-gate.sh
 ```
 
 `cargo.sh` runs cargo inside the nested workspace with the revm-inspectors patch applied and
-builds into `target/vendor-reth`. TN's own `cargo` commands build the vendored crates as path
+builds into `target/vendor-reth`; never run a bare `cargo` in `vendor/reth`. nextest there reads
+`vendor/reth/.config/nextest.toml`, not the root's. TN's own `cargo` commands build the vendored crates as path
 dependencies but never run their tests, and TN's clippy lane skips them.
 
 ## Changing vendored code

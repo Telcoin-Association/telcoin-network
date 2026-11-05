@@ -35,11 +35,12 @@ vendor/reth/
   tn/               TN tooling: vendor.py, graph.py, cargo.sh, crates.txt, upstream.toml, and
                     the tools' tests (test_*.py)
   tn/notes/         the usage map, the upstream-backport tracker and the open issues
+  .config/          TN's nextest config for the nested workspace (upstream's is not carried)
   README.md CHANGES.md DECISIONS.md ROADMAP.md CLAUDE.md
                     TN's docs (upstream's README and CLAUDE.md are not carried)
 ```
 
-Everything outside `tn/` and the five TN docs mirrors an upstream path. Crate names are
+Everything outside `tn/`, `.config/` and the five TN docs mirrors an upstream path. Crate names are
 unchanged (`reth-db`, `reth-provider`, ...), so TN code imports `reth_db::...` exactly as before.
 
 ## How TN builds against it
@@ -109,12 +110,22 @@ crates that rely on features other members enable (DECISIONS.md D18), and so doe
 dependencies never get clippy, so run it after editing vendored code:
 `vendor/reth/tn/cargo.sh clippy --workspace --lib --tests -- -D warnings`.
 
+Run cargo in the nested workspace only through `cargo.sh`. A bare `cargo` there (or an editor's
+rust-analyzer opened on `vendor/reth`) resolves without TN's revm-inspectors patch and writes that
+into the nested lockfile; the next `cargo.sh` run overwrites it.
+
 `cargo.sh` seeds `vendor/reth/Cargo.lock` from TN's lockfile (the nested lockfile is
 git-ignored) and builds into `target/vendor-reth`. When one of reth's dev-dependencies needs a
 newer version of a crate TN also uses, cargo bumps it in the nested lockfile only. At v1.11.3 that
 happens for `libc` and `cargo_metadata`. TN's own lockfile is never touched. TN's root manifest
 patches revm-inspectors (`patches/revm-inspectors/PATCH.md`), and `cargo.sh` passes the same patch
 with `--config`, so reth's tests run against the code TN ships.
+
+The packages only reth's tests need are resolved against crates.io on each run, so they are not
+pinned. `cargo.sh` sets `resolver.incompatible-rust-versions = "fallback"`, so they stay at
+versions that support the nested workspace's `rust-version` (1.88), below TN's toolchain pin.
+Pinning them is in `tn/notes/open-issues.md`. nextest reads `vendor/reth/.config/nextest.toml`
+here (TN's, with the same `default` and `ci` profiles as the root's), not the root's.
 
 ## Taking changes from upstream
 

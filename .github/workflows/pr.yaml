@@ -476,7 +476,8 @@ jobs:
   # reth's tests: their dev-dependencies resolve only inside vendor/reth. The regression tests
   # of every backport in vendor/reth/CHANGES.md live there. Gated by ci-scope like the other
   # test lanes, with the same ceiling; the nested workspace builds into target/vendor-reth,
-  # which cache-deps.yaml warms into the same entry.
+  # which cache-deps.yaml warms into the same entry. rust-cache saves no workspace-local path
+  # package, so the vendored crates rebuild on every run (.github/ACTIONS.md, "Caches").
   vendor-reth-test:
     needs: ci-scope
     if: needs.ci-scope.outputs.run_tests == 'true'

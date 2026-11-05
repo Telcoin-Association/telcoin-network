@@ -178,10 +178,10 @@ jobs:
           save-if: "false"
 
       # pr.yaml's `test` job and etc/test-and-attest.sh run this guard before they build; a
-      # bump that pulls librocksdb-sys back into the default graph through a push the queue
+      # bump that pulls a RocksDB package back into the lockfile through a push the queue
       # did not make is the class of gap this workflow exists to catch. It only resolves
       # metadata: seconds with the restored cargo home.
-      - name: Assert rocksdb absent from the default feature graph
+      - name: Assert rocksdb absent from the lockfile and manifests
         run: ./etc/rocksdb-gate.sh
 
       - name: Build the default lane's test binaries
@@ -197,8 +197,8 @@ jobs:
         if: ${{ !cancelled() }}
         run: ./etc/ci-lanes.sh test-vendor-reth --build-only
 
-  # The commands of pr.yaml's `connection-limits-patch` and `quinn-proto-patch` jobs, in
-  # one job. No cache step, as there: main warms no entry for these crates.
+  # The commands of pr.yaml's `connection-limits-patch`, `quinn-proto-patch` and
+  # `revm-inspectors-patch` jobs, in one job. No cache step, as there: main warms no entry for these crates.
   carried-patches:
     if: github.actor != 'github-merge-queue[bot]'
     runs-on: ubuntu-latest

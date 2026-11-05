@@ -18,6 +18,12 @@
 #
 # TN's root manifest patches revm-inspectors (patches/revm-inspectors). The nested manifest does
 # not, so the same patch is passed with --config, and reth's tests run against the code TN ships.
+#
+# The packages cargo adds are resolved against crates.io when this runs, so a new release of one
+# of reth's test-only dependencies reaches CI unreviewed. `incompatible-rust-versions = fallback`
+# keeps those additions to versions that support the nested workspace's `rust-version`, so a
+# release that needs a newer rustc than TN's pin cannot break the lane. The resolution is still
+# not pinned (vendor/reth/tn/notes/open-issues.md).
 
 set -euo pipefail
 
@@ -27,11 +33,12 @@ ROOT="$(cd "$VENDOR/../.." && pwd)"
 cp "$ROOT/Cargo.lock" "$VENDOR/Cargo.lock"
 cd "$VENDOR"
 export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$ROOT/target}/vendor-reth"
-patch=(--config "patch.crates-io.revm-inspectors.path=\"$ROOT/patches/revm-inspectors\"")
+config=(--config "patch.crates-io.revm-inspectors.path=\"$ROOT/patches/revm-inspectors\""
+    --config 'resolver.incompatible-rust-versions="fallback"')
 # a +toolchain argument has to stay first
 if [[ "${1:-}" == +* ]]; then
     toolchain=$1
     shift
-    exec cargo "$toolchain" "${patch[@]}" "$@"
+    exec cargo "$toolchain" "${config[@]}" "$@"
 fi
-exec cargo "${patch[@]}" "$@"
+exec cargo "${config[@]}" "$@"

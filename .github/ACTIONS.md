@@ -191,6 +191,9 @@ Nothing stops either route beforehand.
 `main` is the only writer of the cache entries the lanes restore.
 `.github/workflows/cache-deps.yaml` runs there and saves two entries: `clippy-cache` (dependencies for both clippy passes, the release graph and every target under `--all-features`, under the nightly pin) and `test-cache` (dependencies for the three test lanes: default and adiri features, and the nested vendor/reth workspace with js-tracer, under the stable pin).
 `Swatinem/rust-cache` does not save the workspace crates or their test binaries, so each PR still builds those from its own source.
+That includes the 57 vendored reth crates: they are path packages inside the repository, so every test lane rebuilds them, where the git dependency they replaced was cached.
+rust-cache's pruning also keys on the root workspace's packages, so the dependencies only reth's own tests use (in `target/vendor-reth`) may not survive a save either.
+The lanes' times with the vendored reth have not yet been measured on a GitHub runner.
 The lanes in `pr.yaml` restore those and never save (`save-if: "false"`): a cache saved by a `pull_request` run is scoped to that PR's branch and one saved by a `merge_group` run lands on the queue's throwaway branch, so nothing else could ever read them, while the upload adds minutes to the critical path and eats quota that evicts the entries the queue does read.
 `main-compiles.yaml` restores the same two entries and never saves either, although it runs on `main` and could: it is outside the `cache-deps` concurrency group, so on a `Cargo.lock` push that the queue did not make it would race the warm to save the same key, and `cache-deps.yaml` stays the single writer.
 Three workflows name `clippy-cache`: `cache-deps.yaml` writes it, and `pr.yaml` and `main-compiles.yaml` restore it.

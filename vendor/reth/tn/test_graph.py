@@ -10,6 +10,10 @@ import unittest
 
 
 GRAPH = Path(__file__).resolve().with_name("graph.py")
+# cargo runs from the repository, as graph.py's own calls do, so rust-toolchain.toml picks the
+# toolchain. CI removes the default toolchain, and a bare `cargo` outside the repository then fails
+# or installs whatever stable is current.
+REPO = GRAPH.parents[3]
 TARGET = "x86_64-unknown-linux-gnu"
 PKG = '[package]\nname = "{}"\nversion = "0.1.0"\nedition = "2021"\n'
 # `app` uses `c` at run time and in its build script; the proc macro `m` uses `c` too.
@@ -34,8 +38,8 @@ class GraphViews(unittest.TestCase):
         for rel, text in FILES.items():
             (self.dir / "ws" / rel).parent.mkdir(parents=True, exist_ok=True)
             (self.dir / "ws" / rel).write_text(text)
-        subprocess.run(["cargo", "generate-lockfile", "--offline"], cwd=self.dir / "ws", check=True,
-                       capture_output=True)
+        subprocess.run(["cargo", "generate-lockfile", "--offline", "--manifest-path",
+                        self.dir / "ws" / "Cargo.toml"], cwd=REPO, check=True, capture_output=True)
 
     def graph(self, *args):
         return subprocess.run([sys.executable, "-I", "-B", str(GRAPH), *map(str, args)],

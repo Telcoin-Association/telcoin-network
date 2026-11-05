@@ -2,8 +2,9 @@
 
 The ledger of every difference between `vendor/reth` and the pinned upstream
 (`tn/upstream.toml`). `python3 -I vendor/reth/tn/vendor.py status` lists the files that differ;
-each one has to be covered by an entry here. Changes to TN's own files (`tn/`, the five TN docs,
-`.gitignore`) and to the filtered workspace manifest's member list are not listed.
+each one has to be covered by an entry here. Changes to TN's own files (`tn/`,
+`.config/nextest.toml`, the five TN docs, `.gitignore`) and to the filtered workspace manifest's
+member list are not listed.
 
 Entry format:
 

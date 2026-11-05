@@ -54,6 +54,16 @@ The structural fix is to give the RPC `TaskSpawner` (`crates/types/src/task_mana
 runtime or bounded blocking pool, so RPC load cannot delay block execution whatever each method
 does.
 
+## CORS on shifted workers' HTTP servers
+
+With HTTP and WebSocket on one port, reth's worker-0 server applies `ws_cors.or(http_cors)` to both
+transports (`vendor/reth/crates/rpc/rpc-builder/src/lib.rs`, the shared-port arm). Workers above 0
+get separate servers on shifted ports, and `worker_rpc_server_args`
+(`crates/tn-reth/src/env/rpc.rs`) carries `--http.corsdomain` to their WebSocket server, but not
+`--ws.origins` to their HTTP server. So with only `--ws.origins` set, worker 0's HTTP server sends
+CORS headers and the other workers' do not. That fails closed (browsers are refused), so it is
+not a security issue; the fix is to mirror the carry into `http_corsdomain`.
+
 ## RocksDB stubs and storage-v2 plumbing
 
 RocksDB itself is gone (TN-0014), but the zero-size stub types, the provider-factory field and
@@ -71,6 +81,25 @@ the tndb-b owners, who replace MDBX as the reth database (ROADMAP.md, Phase 3).
 needs (0.34.3). It retires when TN's reth moves to a revm-inspectors release that has upstream's
 fix (0.44.2 or later). `patches/revm-inspectors/PATCH.md` has the
 details.
+
+## reth's test-only dependencies are not pinned
+
+`tn/cargo.sh` seeds the nested lockfile from TN's on each run, and cargo resolves the packages only
+reth's tests need (about 75) against crates.io at that moment. TN's shipped code is unaffected,
+but the `test-vendor-reth` lane is not reproducible from a commit, and a bad release of one of
+those packages can fail it for every queued PR. `cargo.sh` limits them to versions that support
+the workspace's `rust-version`, which removes the commonest break (a release that needs a newer
+rustc). The complete fix is a committed overlay lockfile for the nested workspace, run with
+`--locked`, plus a check that its shared packages match TN's lockfile. That reverses DECISIONS.md
+D7, so it is its own change.
+
+## CI build time with the vendored crates
+
+rust-cache does not save path packages inside the repository, so every test lane now rebuilds the
+57 vendored crates, which the git dependency had cached, and `vendor-reth-test` compiles reth
+four ways. None of this has been timed on a GitHub runner. Before queueing the PR, a dispatch of
+`main-compiles.yaml` on the branch times the builds; caching the vendored crates would need
+sccache or a different cache layout.
 
 ## Ledger coverage is checked by hand
 
