@@ -93,7 +93,7 @@ struct ShutdownState {
     /// The Noticers subscribed before notify(), held weakly. A long-lived notifier, like the one
     /// in a node's task manager, sees a subscribe() for every task it spawns. Held strongly, each
     /// finished task's Noticer and stored waker would stay here until shutdown. Held weakly, a
-    /// dropped Noticer frees its state and waker at once, and subscribe() prunes the dead entry.
+    /// dropped Noticer frees its waker at once, and subscribe() prunes its dead entry later.
     noticers: Vec<Weak<NoticerState>>,
     /// subscribe() prunes the dead entries from `noticers` once it reaches this length.
     prune_at: usize,

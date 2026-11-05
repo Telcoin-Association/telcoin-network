@@ -41,6 +41,12 @@ its code there is identical to the registry's.
 The nested reth workspace has no `[patch]` of its own, so `vendor/reth/tn/cargo.sh` passes this
 one with `--config`, and reth's tests run against the code TN ships.
 
+## Advisories
+
+As a path package the patched crate is invisible to `cargo audit` and `cargo deny`, which match
+advisories against registry packages. Check revm-inspectors advisories by hand until the patch
+retires.
+
 ## Running its tests
 
 CI's `revm-inspectors-patch` job runs, from the repository root:
