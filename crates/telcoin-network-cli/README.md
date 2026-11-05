@@ -383,11 +383,15 @@ Complete tree after the node has run:
 ```
 
 `telcoin-network db stats` prints the static files and each table of the execution database:
-rows, pages and size. The default build reads while the node runs. A build with the `tn-lmdb`
+rows, pages and size. The default build reads while the node runs, and refuses a tn-lmdb database
+(`db/tn-lmdb.dat`, or the marker `db/mdbx-migrated`) as the node does. A build with the `tn-lmdb`
 feature needs the node stopped: it refuses while a node holds the datadir, and holds the datadir
 while it runs, so a node started meanwhile is refused until the report finishes. It never runs the
 MDBX to tn-lmdb migration: an MDBX database not yet migrated is refused until the node has started
-once.
+once, and an `mdbx.dat` the node refuses too (beside the marker, or beside a `tn-lmdb.dat` no
+migration left) is refused as the node refuses it. `telcoin-network db load-state` never runs the
+migration either: it restores into a fresh datadir, and a build with the `tn-lmdb` feature
+refuses a `db/` holding `mdbx.dat` before anything opens it.
 
 ## RPC configuration
 

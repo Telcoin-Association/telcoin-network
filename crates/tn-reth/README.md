@@ -276,7 +276,7 @@ All fee handling lives in `TNEvmHandler` (`src/evm/handler.rs`); system calls by
   math. The penalty is deducted from the caller's unused-gas refund and credited to the base-fee
   address. Penalty is computed from pre-refund gas so SSTORE refunds don't inflate it.
   User-facing documentation (formula, examples, detection recipe for wallets and integrators):
-  [`docs/gas-penalty.md`](../../docs/gas-penalty.md) at the repo root. Keep the two in sync.
+  [`docs/src/gas-penalty.md`](../../docs/src/gas-penalty.md) at the repo root. Keep the two in sync.
 - **`BASEFEE_ADDRESS` is a process-global `OnceLock`** (`src/lib.rs`), written once by
   `set_basefee_address` during `RethEnv::new` (`src/env/mod.rs`). The first write wins; later
   writes are **silently discarded** (the `set` error is intentionally ignored). If it is never
@@ -425,7 +425,11 @@ every path TN uses, and MDBX stays compiled in both builds. Every backend differ
   `check_consistency` would then prune the static files back to the empty database's tip. The
   checks use `try_exists`, so a stat error fails the open. The MDBX build's error names the
   directory and both engines; the operator runs the matching build or starts from a fresh datadir
-  (or `db load-state`).
+  (or `db load-state`). The MDBX build also refuses a migrated `db/` whose `tn-lmdb.dat` is
+  missing (the marker `db/mdbx-migrated` alone), saying to restore the file and run a tn-lmdb
+  build, rather than create a new database in its place. It warns of a stopped migration's temp
+  directory (`db/tn-lmdb-migrating/`, a partial copy beside an unchanged MDBX database), naming it
+  and its size, and never removes it.
 - **MDBX to tn-lmdb migration** (`src/env/database/migrate.rs`, tn-lmdb build): the first open of a
   `db/` holding `mdbx.dat` moves it onto tn-lmdb ("Migrating from MDBX" below).
 - **`--db.*` flags on tn-lmdb** (`tn_lmdb_args`): `--db.max-size` is the mapping's address-space
@@ -437,10 +441,10 @@ every path TN uses, and MDBX stays compiled in both builds. Every backend differ
   `--db.sync-mode durable` is durable commits. Refused at startup, naming the flag:
   `--db.exclusive`, `--db.read-transaction-timeout`, `--db.max-readers`, `--db.log-level`,
   `--db.sync-mode safe-no-sync`, and reth's `UtterlyNoSync`
-  and `NoMetaSync` sync modes (neither has a CLI value). The no-sync refusals say why and point at
-  `durable`: the engine's `NoSync` reuses the pages a commit frees only after a sync, and nothing
-  syncs a `NoSync` environment on its own, so the file would grow until one (see "Persist
-  benchmark"). They stay refused until the engine bounds that growth.
+  and `NoMetaSync` sync modes (neither has a CLI value). The `safe-no-sync` and `UtterlyNoSync`
+  refusals say why and point at `durable`: the engine's `NoSync` reuses the pages a commit frees
+  only after a sync, and nothing syncs a `NoSync` environment on its own, so the file would grow
+  until one (see "Persist benchmark"). They stay refused until the engine bounds that growth.
 - **Default page size** (`default_page_size`): the page size of a new database without
   `--db.page-size`. The MDBX build's is reth's own default, the OS page size clamped to 4 KiB..=64
   KiB (16 KiB on Apple Silicon, 4 KiB on x86 Linux), which its `open_rw` passes to MDBX explicitly;
@@ -448,18 +452,20 @@ every path TN uses, and MDBX stays compiled in both builds. Every backend differ
 - **Table stats** (`db_table_stats`, behind `telcoin-network db stats`): each of reth's tables the
   database has, sorted by name, with its rows, branch, leaf and overflow pages, and size (the page
   size times its pages, `DbTableStat`). A table the database lacks is skipped. The MDBX build
-  opens read-only through reth's `open_db_read_only`, which reads while the node runs, after
-  refusing a `db/` holding `tn-lmdb.dat`. The tn-lmdb build opens `TnLmdbEnv` read-only from the adapter's
-  `table_stats`, which needs the node stopped (`DB_TABLE_STATS_NEEDS_STOPPED_NODE`): a database a
-  node holds is refused with "in use: stop the node first", and `db stats` holds the datadir lock
-  for the report. It never migrates: a `db/` holding `mdbx.dat` is refused (a migration pending
-  or unfinished, which the node's start runs; beside the marker, as the open refuses it), and
-  with neither `mdbx.dat` nor `tn-lmdb.dat` there is no reth database.
+  opens read-only through reth's `open_db_read_only`, which reads while the node runs, after the
+  backend guard's checks (refusing a `db/` holding `tn-lmdb.dat` or the marker `db/mdbx-migrated`).
+  The tn-lmdb build opens `TnLmdbEnv` read-only and reads the adapter's `table_stats`, which needs
+  the node stopped (`DB_TABLE_STATS_NEEDS_STOPPED_NODE`): a database a node holds is refused with
+  "in use: stop the node first", and `db stats` holds the datadir lock for the report. It never
+  migrates: a `db/` holding `mdbx.dat` is refused, as the open refuses it beside the marker or
+  beside a `tn-lmdb.dat` no migration left (neither the marker nor the emptied
+  `db/tn-lmdb-migrating/`), and otherwise as a migration pending or unfinished, which the node's
+  start runs. With neither `mdbx.dat` nor `tn-lmdb.dat` there is no reth database.
 - **reth's dup-sort tables on tn-lmdb** (the adapter's crate docs, "Dup-sort tables"): the state
   tables (`PlainStorageState`, `HashedStorages`, `StoragesTrie`) are the engine's dup tables, each
-  key's rows in a nested tree of their own, so a seek bounded to an account's or a trie's rows
-  never reads the next key's; the changesets (`AccountChangeSets`, `StorageChangeSets`), appended
-  by block and read by range, are composite keys (`key ‖ subkey`) in plain engine tables. A
+  key's rows packed in its outer cell, or in a nested tree of their own once they outgrow it, so a
+  seek bounded to an account's or a trie's rows never reads the next key's; the changesets
+  (`AccountChangeSets`, `StorageChangeSets`), appended by block and read by range, are composite keys (`key ‖ subkey`) in plain engine tables. A
   table's form is part of the file's format: the open refuses a file holding one in the other
   form (`MDBX_INCOMPATIBLE`, naming the table and both forms). No tn-lmdb file in the other form
   exists outside tests (the backend is pre-release and off by default), so there is no migration
@@ -490,8 +496,9 @@ one of reth's: its rows are not copied (reth does not read them either).
   `db/mdbx-migrated` (its text lists the rows copied per table) and removes the temp directory.
   reth's static files and `database.version` file are not touched. The copy needs no case of its own
   for the dup-sort tables' forms: MDBX walks a key's values in subkey order, so each row is an
-  append of `key ‖ subkey` in order, a key's rows going to its nested tree on a dup table, also when
-  they span the copy's commits (`a_dup_key_with_more_rows_than_a_commit_migrates_whole`).
+  append of `key ‖ subkey` in order, a key's rows going to its packed set or nested tree on a dup
+  table, also when they span the copy's commits
+  (`a_dup_key_with_more_rows_than_a_commit_migrates_whole`).
 - **Free space:** the filesystem holds both databases while it copies. The migration refuses to
   start unless the live bytes of reth's tables in MDBX plus a quarter plus 1 GiB (or the growth
   step, `--db.growth-step`, when that is larger) are free (`needed_bytes`), and says the live bytes,
@@ -829,7 +836,7 @@ Block production must be a pure function of certified consensus output. Concrete
 | `src/cli.rs` | `RethCommand`/`RethConfig`: RPC namespace allowlist, disabling reth networking/discovery, per-sender pool-slot default (256). |
 | `src/dirs.rs` | TN data-directory layout and conversion to reth `DatadirArgs`. |
 | `src/env/mod.rs` | `RethEnv` wrapper (node config, blockchain provider, EVM config, task spawner); DB open/genesis init; sets `BASEFEE_ADDRESS`; shared read-only state-DB stack. |
-| `src/env/database.rs` | The database backend (`RethDbEnv`/`RethDb`, MDBX or tn-lmdb): `open_rw`, the backend guard, the `--db.*` mapping, the table stats of `db stats` (`db_table_stats`; see "Database backend"). `src/env/database/migrate.rs`: the MDBX to tn-lmdb migration (tn-lmdb build). |
+| `src/env/database.rs` | The database backend (`RethDbEnv`/`RethDb`, MDBX or tn-lmdb): `open_rw`, the backend guard, the `--db.*` mapping, the table stats of `db stats` (`db_table_stats`), `db load-state`'s refusal of a pending migration (`refuse_pending_migration`); see "Database backend". `src/env/database/migrate.rs`: the MDBX to tn-lmdb migration (tn-lmdb build). |
 | `src/env/epoch.rs` | Startup healing and epoch-boundary reads: `EpochState`, committees, BLS pubkeys, worker fee configs, classified registry reads (node-local vs chain-global failures). |
 | `src/env/execution.rs` | `build_block_from_batch_payload` (recover → execute → assemble), `finish_executing_output` (atomic blocks + finality markers), `finalize_block` (in-memory watches). |
 | `src/env/genesis.rs` | Genesis construction, including `ConsensusRegistry` account generation via a pre-genesis EVM and embedded-artifact JSON parsing; temp-chain env for tests. |
@@ -868,8 +875,8 @@ From `crates/tn-reth/Cargo.toml`:
 | `faucet` | Instant role-gated TEL mint replacing the timelocked mint. **Never on mainnet.** |
 | `adiri` | Adiri-testnet build: forwards `tn-types/adiri`, which compiles the adiri fork gates in `tn-types` `forks.rs`, and **implies `faucet`**. Each gate names the first adiri epoch on the new behaviour: 383 seed signatures (epoch seed chain replaces the leader-aggregate shuffle seed), 407 `ConsensusRegistry` and `WorkerConfigs` swap, 554 governance Safe onto the canonical v1.4.1 suite, 567 leader-seeded intra-round certificate order, 570 multi-worker `Committee` encoding, 574 seed-chain `PREVRANDAO`. This crate applies the two state-swap forks (407 and 554) itself, in the closing block of the epoch before (steps 1 and 2 of "Epoch close"). Non-adiri builds compile none of these constants and run the post-fork behaviour from genesis. |
 | `test-utils` | Test factories and payload helpers. |
-| `rocksdb` | Opt back in to reth's RocksDB backend (storage is MDBX-only today). Turns on the `rocksdb` features of `reth-node-core`, `reth-provider`, `reth-db-common`, `reth-stages` and `reth-prune`. |
-| `tn-lmdb` | Run the reth execution database on the tn-lmdb engine (`tn_lmdb_reth::TnLmdbEnv`) instead of MDBX. Off by default; see "Database backend". |
+| `rocksdb` | Opt back in to reth's RocksDB backend (TN's reth database never uses RocksDB: MDBX, or tn-lmdb with `tn-lmdb`). Turns on the `rocksdb` features of `reth-node-core`, `reth-provider`, `reth-db-common`, `reth-stages` and `reth-prune`. |
+| `tn-lmdb` | Run the reth execution database on the tn-lmdb engine (`tn_lmdb_reth::TnLmdbEnv`) instead of MDBX. Off by default. A node's first open on it migrates an MDBX database; see "Database backend". |
 
 The crate takes reth's individual crates, never the `reth` umbrella crate (which only re-exports
 them and pulls reth's CLI, `reth-ethereum-cli` and `reth-cli-commands`, into the graph). The
