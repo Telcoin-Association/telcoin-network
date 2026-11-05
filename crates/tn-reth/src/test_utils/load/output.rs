@@ -77,7 +77,8 @@ pub const NO_REGISTRY_PRODUCER: Address = address!("0x10ad0000000000000000000000
 pub struct OutputConfig {
     /// The batches, and so the blocks, in each output.
     pub batches: usize,
-    /// Each batch's target expected gas.
+    /// Each batch's target expected gas, at least the workload's [`Workload::largest`]
+    /// transaction: [`OutputFactory::new`] refuses less.
     pub batch_gas: u64,
     /// The commit-time step between consecutive outputs, in milliseconds.
     pub interval_ms: u64,
@@ -211,8 +212,14 @@ impl OutputFactory {
         config: OutputConfig,
     ) -> eyre::Result<Self> {
         eyre::ensure!(config.batches > 0, "an output needs batches");
-        eyre::ensure!(config.batch_gas > 0, "a batch needs a gas target");
         eyre::ensure!(config.interval_ms > 0, "commit times must rise");
+        let workload = Workload::new(env, spec, workload)?;
+        let (kind, most) = workload.largest();
+        eyre::ensure!(
+            config.batch_gas >= most,
+            "a {kind:?} transaction uses up to {most} gas, over the batch gas target {}",
+            config.batch_gas
+        );
 
         let tip = env.canonical_tip();
         let (nonce_epoch, round) = deconstruct_nonce(u64::from(tip.nonce));
@@ -240,7 +247,7 @@ impl OutputFactory {
         };
 
         Ok(Self {
-            workload: Workload::new(env, spec, workload)?,
+            workload,
             config,
             committee,
             leaders,
@@ -719,6 +726,26 @@ mod tests {
         let mut factory = bench.factory(spec(), 1)?;
         assert!(factory.next_output_closing().is_err());
         assert_eq!(factory.next_output().output.number(), 1, "the refusal built no output");
+        Ok(())
+    }
+
+    /// A batch target below the mix's largest transaction (a 1 KiB creation by default) is
+    /// refused up front, naming the kind, not turned into outputs of empty batches; a target of
+    /// that transaction's gas fills every batch.
+    #[tokio::test]
+    async fn test_output_factory_refuses_a_target_below_a_transaction() -> eyre::Result<()> {
+        let bench = Bench::open(&spec())?;
+        let workload = WorkloadConfig::default();
+        let factory = |batch_gas| {
+            OutputFactory::new(&bench.env, spec(), workload, OutputConfig { batch_gas, ..config() })
+        };
+        let err = factory(100_000).expect_err("no 100k batch fits a creation").to_string();
+        assert!(err.contains("Create") && err.contains("100000"), "{err}");
+
+        let (kind, most) = Workload::new(&bench.env, spec(), workload)?.largest();
+        assert_eq!(kind, LoadKind::Create);
+        let load = factory(most)?.next_output();
+        assert!(load.batches.iter().all(|meta| !meta.gas.is_empty()), "no batch is empty");
         Ok(())
     }
 }

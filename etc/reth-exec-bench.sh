@@ -10,10 +10,8 @@
 #                    reports/ into reth-exec-report-<host>-<time>.txt in the repo root, with the
 #                    runs' own SYSTEM, CONFIG, BINARIES and RUNS sections when reports/head.txt
 #                    is there. The runs are reports/runs.tsv's (the script's last runs in that
-#                    dir); a dir without it (a bench dir of an older script) has its runs read
-#                    from the report names, <profile>-<side>-<round>.json: every report there
-#                    counts as a completed run, a stale one from an earlier invocation included,
-#                    and a failed run is not known.
+#                    dir); a dir without it is refused, and so is a JSON report of another
+#                    version than the bench's JSON_REPORT_VERSION (report_version below), by name.
 #   Backend mode (no commit): this checkout (uncommitted changes included) built twice, MDBX (the
 #                    default features) against tn-lmdb (`--features tn-reth/tn-lmdb`).
 #   Commit mode (a before-commit): one backend, the commit against this checkout. The commit must
@@ -59,50 +57,53 @@
 #   itself, per run, over any in the environment, and TN_EXEC_BENCH_PAGE_SIZE when the run's
 #   backend has an EXEC_PAGE_SIZE_* set.
 #
-# Each test binary is run directly (not through cargo), its md5 and test count recorded, and the
-# run refused if the two binaries match or either lacks the ignored `exec_bench` test. Each build
-# has its own target dir under the bench dir: cargo names a workspace's crates by their path within
-# it and judges freshness by mtime, so two trees or two feature sets sharing one would reuse or
-# rebuild each other's artifacts. The before tree is an export of the commit (`git archive`; no
-# git writes) with this checkout's `tn-contracts` submodule linked in. Before the timed runs the
-# script refuses to start while rustc or cargo run. `TMPDIR`, the cache dir and the JSON report
-# path are set on each run's command line, never exported. A profile whose run fails is named in
-# the report and its remaining runs skipped; the other profiles still run, and the script exits 1.
+# Each test binary is run directly (not through cargo), its md5 and test count recorded, and the run
+# refused if the two binaries match or either lacks the ignored `exec_bench` test. Each build has
+# its own target dir under the bench dir: cargo names a workspace's crates by their path within it
+# and judges freshness by mtime, so two trees or two feature sets sharing one would reuse or rebuild
+# each other's artifacts. The before tree is an export of the commit (`git archive`; no git writes)
+# with this checkout's `tn-contracts` submodule linked in (CONFIG warns when the commit pins another
+# revision). The checkout's description in CONFIG names uncommitted and untracked changes to the
+# build's inputs: crates/, Cargo.toml, Cargo.lock, .cargo/ and rust-toolchain*. Before the timed
+# runs the script refuses to start while rustc or cargo run. `TMPDIR`, the cache dir and the JSON
+# report path are set on each run's command line, never exported. A profile whose run fails is named
+# in the report and its remaining runs skipped; the other profiles still run, and the script then
+# exits 1. Each profile prints each side's chain (the genesis, aged tip and final tip hashes of its
+# runs' JSON headers): execution is deterministic, so in backend mode the two sides must match, and
+# a profile whose runs differ is marked CHAINS DIFFER and makes the script exit 1 after the report.
 #
-# The report has the host, the knobs each run's JSON header records, the binaries, one line per
-# run, and per profile: each side's page size (as requested and as its database has it), each
-# side's median over the rounds of the total's p50, p90, p99 and mean,
-# each stage's mean, Mgas/s, tx/s and the database growth per output (allocated and logical);
-# with readers on, the writer's total mean with them on over off and each read's p50 and p99; with
-# epoch closes, the closing and normal outputs' total means; with an export, its duration, the
-# database growth while it held its read and the writer's total mean beside it over without; each
-# pair's B/A ratio of those; and the median ratio with its spread (min..max). On macOS a durable commit is
-# `F_FULLFSYNC` for libmdbx but a plain fsync for tn-lmdb, so backend-mode durable commit times
-# there are not like-for-like; the report says so.
+# The report has the host, the knobs each run's JSON header records, the binaries, one line per run,
+# and per profile: each side's page size (as requested and as its database has it), each side's
+# median over the rounds of the total's p50, p90, p99 and mean, each stage's mean, Mgas/s, tx/s and
+# the database growth per output (allocated and logical); with readers on, the writer's total mean
+# with them on over off and each read's p50 and p99; with epoch closes, the closing and normal
+# outputs' total means; with an export, its duration, the database growth while it held its read and
+# the writer's total mean beside it over without; each pair's B/A ratio of those; and the median
+# ratio with its spread (min..max). On macOS a durable commit is `F_FULLFSYNC` for libmdbx but a
+# plain fsync for tn-lmdb, so backend-mode durable commit times there are not like-for-like; the
+# report says so.
 #
-# From each run's per-output rows the table also has the gate's rows: the total's p90, p95 and
-# p99 pooled over every output of a side's paired rounds (one percentile of all of them, linear
+# From each run's per-output rows the table also has the tail and drift rows: the total's p90, p95
+# and p99 pooled over every output of a side's paired rounds (one percentile of all of them, linear
 # between the closest ranks as numpy's default; the ratio is of the two pooled values, so no
 # spread), and the database commit's (the `commit_mdbx` stage, on either backend) last-third over
-# first-third mean per run (the bench's `thirds`, else from the rows), each side's runs listed and
-# the ratio of the medians. Below it,
-# one line per run of the commit's mean in s over 10 consecutive equal groups of the timed
-# outputs (its drift over the run). Report v4 adds a block per side of the database's writes per
-# output: the commit's ms, the process's disk MiB written, the data file's growth in KiB and each
-# of the backend's counters that moved (mdbx_* or tn_lmdb_*, in the bench's order; `_ns` shown as
-# ms, a maximum as its max), then the commit's ms per page written (tn-lmdb: per
-# tn_lmdb_pages_synced; MDBX: per mdbx_newly + mdbx_cow + mdbx_split), which tells a commit that
-# writes more pages from one that writes the same pages slower. Each row there is a run's mean
-# over its timed outputs, its first third and its last third (and last/first), the median over a
-# side's rounds; a v3 report has no counters and says n/a. With EXEC_SYS_SAMPLE=1 a block per side
-# has the samples over each run's timed loop, its first third and its last third (medians over a
-# side's rounds): the disk's write MiB/s, ms per write (ms writing over writes completed), busy %
-# (ms doing I/O over wall), flushes/s and ms per flush, the page cache's Dirty max and mean and
-# Writeback max, the drive's temperature max, and the data file's extents at the first and last
-# extent sample. The bench prints nothing between its header and its report, so the first sample
-# at which the run log holds the report's stage table ends the timed loop and the loop's own
-# wall time (`throughput.elapsed_s`) places its start; a run whose log does not place it uses all
-# its samples, and the report says so.
+# first-third mean per run (the bench's `thirds`), each side's runs listed and the ratio of the
+# medians. Below it, one line per run of the commit's mean in s over 10 consecutive equal groups of
+# the timed outputs (its drift over the run). Then a block per side of the database's writes per
+# output: the commit's ms, the process's disk MiB written, the data file's growth in KiB and each of
+# the backend's counters that moved (mdbx_* or tn_lmdb_*, in the bench's order; `_ns` shown as ms, a
+# maximum as its max), then the commit's ms per page written (tn-lmdb: per tn_lmdb_pages_synced;
+# MDBX: per mdbx_newly + mdbx_cow + mdbx_split), which tells a commit that writes more pages from
+# one that writes the same pages slower. Each row there is a run's mean over its timed outputs, its
+# first third and its last third (and last/first), the median over a side's rounds. With
+# EXEC_SYS_SAMPLE=1 a block per side has the samples over each run's timed loop, its first third and
+# its last third (medians over a side's rounds): the disk's write MiB/s, ms per write (ms writing
+# over writes completed), busy % (ms doing I/O over wall), flushes/s and ms per flush, the page
+# cache's Dirty max and mean and Writeback max, the drive's temperature max, and the data file's
+# extents at the first and last extent sample. The bench prints and flushes one line the moment its
+# timed loop ends (`timed loop done: elapsed_s=...`), so the first sample at which the run log holds
+# that line ends the timed loop and the loop's own wall time (`throughput.elapsed_s`) places its
+# start; a run whose log does not place it uses all its samples, and the report says so.
 #
 # Needs a Rust toolchain, git, python3, and room in the bench dir for two release builds plus the
 # bench's cached bases (--report-only needs only git and python3); EXEC_SYS_SAMPLE=1 also needs
@@ -123,16 +124,21 @@
 #                                          are done), for --report-only
 #   logs/<profile>-<side>-<round>.log      each run's output, replaced by a rerun
 #   src-before/ and tmp/                   the before export and the runs' TMPDIR, each marked as
-#                                          the script's own and removed on exit
+#                                          the script's own and removed on exit; tmp/ is also
+#                                          emptied before each run
 # It removes nothing else there. A refusal or a failed build before the first run leaves no report.
 set -euo pipefail
 
 die() { echo "$*" >&2; exit 1; }
+# The bench's JSON_REPORT_VERSION: the only report version the report reads. The bench of each
+# build must write it (checked before the builds).
+report_version=5
 # The report's per-profile sections. Std-lib Python, read from stdin and run isolated (-I), so
 # nothing beside it is imported. `render_report run <manifest> <side a> <side b>` renders the runs
-# of a manifest; `render_report dir <bench dir>` those of a bench dir (--report-only).
+# of a manifest; `render_report dir <bench dir>` those of a bench dir (--report-only). It exits 3,
+# after rendering everything, when backend mode's two sides ran different chains.
 render_report() {
-    python3 -I - "$@" <<'PY'
+    EXEC_REPORT_VERSION="$report_version" python3 -I - "$@" <<'PY'
 import json
 import os
 import re
@@ -140,8 +146,9 @@ import statistics
 import sys
 
 # `run <manifest> <side a> <side b>`, or `dir <bench dir>`: re-render a bench dir's reports from
-# its reports/runs.tsv, else from the report names (<profile>-<side>-<round>.json).
+# its reports/runs.tsv.
 mode = sys.argv[1]
+REPORT_VERSION = int(os.environ["EXEC_REPORT_VERSION"])
 # The bench's stage keys under `total`, in its order, with their depth in its stage tree.
 STAGES = {
     "execute": 1, "signer_recovery": 2, "finish": 1, "hashed_state": 2, "state_root": 2,
@@ -150,8 +157,6 @@ STAGES = {
     "update_history_indices": 3, "save_blocks_sf": 2, "commit_sf": 1, "commit_mdbx": 1, "other": 1,
 }
 SIDE_PAIRS = (("mdbx", "tn-lmdb"), ("before", "after"))
-REPORT_NAME = re.compile(
-    r"^(?P<profile>.+)-(?P<side>mdbx|tn-lmdb|before|after)-(?P<round>[1-9][0-9]*)\.json$")
 
 
 def read_manifest(path, bench=None):
@@ -170,32 +175,17 @@ def read_manifest(path, bench=None):
     return runs
 
 
-def infer_runs(bench):
-    """Every report named <profile>-<side>-<round>.json, oldest first, as completed runs."""
-    reports = os.path.join(bench, "reports")
-    found = []
-    for entry in os.listdir(reports):
-        match = REPORT_NAME.match(entry)
-        if match:
-            path = os.path.join(reports, entry)
-            found.append((os.path.getmtime(path), entry, match, path))
-    runs = []
-    for _, _, match, path in sorted(found):
-        profile, side, rnd = match.group("profile"), match.group("side"), match.group("round")
-        runs.append(dict(profile=profile, side=side, round=int(rnd), status="0", json=path,
-                         log=os.path.join(bench, "logs", f"{profile}-{side}-{rnd}.log")))
-    return runs
-
-
 if mode == "run":
     manifest, side_a, side_b = sys.argv[2:5]
     runs = read_manifest(manifest)
 else:
     bench = sys.argv[2]
     manifest = os.path.join(bench, "reports", "runs.tsv")
-    runs = read_manifest(manifest, bench) if os.path.exists(manifest) else infer_runs(bench)
+    if not os.path.exists(manifest):
+        sys.exit(f"{manifest} is missing: only this script's runs re-render")
+    runs = read_manifest(manifest, bench)
     if not runs:
-        sys.exit(f"no runs in {bench}/reports (no runs.tsv, no <profile>-<side>-<round>.json)")
+        sys.exit(f"no runs in {manifest}")
     seen = {run["side"] for run in runs}
     for side_a, side_b in SIDE_PAIRS:
         if seen <= {side_a, side_b}:
@@ -206,7 +196,11 @@ else:
 
 def load(path):
     with open(path) as f:
-        return json.load(f)
+        doc = json.load(f)
+    if doc.get("report_version") != REPORT_VERSION:
+        sys.exit(f"{path} is report version {doc.get('report_version')}: this script reads "
+                 f"version {REPORT_VERSION} only")
+    return doc
 
 
 def metrics(doc):
@@ -222,22 +216,22 @@ def metrics(doc):
     out += [("Mgas/s", throughput.get("mgas_per_s")), ("tx/s", throughput.get("tx_per_s"))]
     sizes = doc.get("sizes", {})
     # Allocated growth moves in a backend's own steps (tn-lmdb's segments, MDBX's geometry); the
-    # logical growth (table bytes, report v2) compares the backends
+    # logical growth (table bytes) compares the backends
     out += [("db growth/output KiB", kib(sizes.get("db_growth_per_output_bytes"))),
             ("db logical growth/output KiB", kib(sizes.get("db_logical_growth_per_output_bytes")))]
-    side = doc.get("side_load")  # report v2: readers and the submitter beside the writer
+    side = doc.get("side_load")  # readers and the submitter beside the writer
     if side:
         out.append(("writer total on/off", split(side, "mean_ratio")))
         out.append(("side errors", side.get("errors")))
         for kind, reads in side.get("readers", {}).items():
             out += [(f"  {kind} p50 ms", reads.get("p50_ms")),
                     (f"  {kind} p99 ms", reads.get("p99_ms"))]
-    closes = doc.get("epoch_closes")  # report v3
+    closes = doc.get("epoch_closes")
     if closes:
         total = closes.get("writer", {}).get("total", {})
         out += [("closing total mean ms", (total.get("closing") or {}).get("mean_ms")),
                 ("normal total mean ms", (total.get("normal") or {}).get("mean_ms"))]
-    export = doc.get("export")  # report v3
+    export = doc.get("export")
     if export:
         out += [("export s", export.get("duration_s")),
                 # allocated, not length: MDBX's length is its preallocated geometry
@@ -320,20 +314,10 @@ def rows_of(doc):
     return doc.get("rows") or []
 
 
-def thirds_of(doc):
-    """The run's first and last third of its rows, as the bench's `thirds` splits them."""
-    _, first, last = windows(rows_of(doc), third_len(doc))
-    return first, last
-
-
 def commit_thirds(doc):
-    """The commit's last-third over first-third mean: the bench's own, else from the rows."""
-    stage = ((doc.get("thirds") or {}).get("stages") or {}).get("commit_mdbx") or {}
-    if stage.get("mean_ratio") is not None:
-        return stage["mean_ratio"]
-    first, last = thirds_of(doc)
-    return ratio(mean(r.get("commit_mdbx_ms") for r in last),
-                 mean(r.get("commit_mdbx_ms") for r in first))
+    """The commit's last-third over first-third mean, the bench's own (None under 3 outputs)."""
+    return (((doc.get("thirds") or {}).get("stages") or {}).get("commit_mdbx") or {}).get(
+        "mean_ratio")
 
 
 def deciles(doc, key="commit_mdbx_ms"):
@@ -345,7 +329,7 @@ def deciles(doc, key="commit_mdbx_ms"):
     return [mean(r.get(key) for r in rows[i * n // 10:(i + 1) * n // 10]) for i in range(10)]
 
 
-def gate_rows(docs, pairs, rounds):
+def tail_drift_rows(docs, pairs, rounds):
     """The tail and drift rows, in the table's columns: (label, a, b, ratio text, per run)."""
     out = []
     pooled = {side: [r.get("total_ms") for rnd in pairs for r in rows_of(docs[(side, rnd)])]
@@ -390,10 +374,10 @@ def windows(values, k):
 
 
 def counter_runs(doc):
-    """One v4 run's counter rows: [(label, (timed, first, last))] in db_counter_names order."""
+    """One run's counter rows: [(label, (timed, first, last))] in db_counter_names order."""
     rows = rows_of(doc)
     k = third_len(doc)
-    writes = doc.get("db_writes") or {}
+    writes = doc["db_writes"]
     maxima = set((writes.get("counters_max") or {}).keys())
 
     def row(label, values, agg=mean):
@@ -408,16 +392,13 @@ def counter_runs(doc):
     # the file's growth per output: each row's length over the one before it (the first row's
     # over the file before the timed outputs)
     previous = writes.get("db_file_len_before_bytes")
-    if previous is None:
-        previous = ((doc.get("sizes") or {}).get("before_timed") or {}).get("db_len_bytes")
     growth = []
     for r in rows:
         length = r.get("db_file_len_bytes")
         growth.append(None if length is None or previous is None else (length - previous) / 1024)
         previous = length
     out.append(row("file growth KiB", growth))
-    names = doc["header"].get("db_counter_names") or sorted(
-        {name for r in rows for name in r.get("db_counters") or {}})
+    names = doc["header"]["db_counter_names"]
     for name in names:
         values = counter(name)
         if not any(values):
@@ -472,21 +453,15 @@ def print_counters(docs, rounds):
     blocks = []
     notes = []
     for side in (side_a, side_b):
-        v4 = [docs[(side, rnd)] for rnd in rounds[side] if "db_writes" in docs[(side, rnd)]]
-        if not v4:
-            notes.append(f"{side}: n/a (report v3: no per-output database counters)")
-            continue
-        header = v4[0]["header"]
+        runs = [docs[(side, rnd)] for rnd in rounds[side]]
+        header = runs[0]["header"]
         error = header.get("disk_bytes_error")
-        notes.append(f"{side}: {len(v4)} run(s); disk bytes from "
+        notes.append(f"{side}: {len(runs)} run(s); disk bytes from "
                      f"{header.get('disk_bytes_source') or '-'}"
                      + (f" (a read FAILED: {error})" if error else ""))
-        blocks.append((side, merge_runs([counter_runs(doc) for doc in v4])))
+        blocks.append((side, merge_runs([counter_runs(doc) for doc in runs])))
     print()
-    if not blocks:
-        print("db writes per output: n/a (report v3: no per-output database counters)")
-        return
-    print_windows("db writes per output (report v4; per run the mean over its timed outputs, "
+    print_windows("db writes per output (per run the mean over its timed outputs, "
                   "its first and last third; medians over a side's rounds; counters that never "
                   "moved left out; _ns as ms)", ("timed", "first 1/3", "last 1/3"), blocks)
     for note in notes:
@@ -496,8 +471,6 @@ def print_counters(docs, rounds):
 SAMPLE_FIELDS = ("t", "log", "dirty", "writeback", "temp", "dev", "writes", "sectors",
                  "ms_writing", "ms_io", "flushes", "ms_flushing", "reads", "sectors_read",
                  "ms_reading", "anon", "cached", "available", "majflt", "refault_file")
-# a sampler before the read and memory columns wrote the first 12 fields only
-OLD_SAMPLE_FIELDS = 12
 
 
 def number(text):
@@ -520,14 +493,14 @@ def read_samples(path):
                 if len(fields) >= 3 and fields[1] == "disk":
                     disk = fields[2]
                 continue
-            if len(fields) not in (OLD_SAMPLE_FIELDS, len(SAMPLE_FIELDS)):
+            if len(fields) != len(SAMPLE_FIELDS):
                 continue
             sample = dict(zip(SAMPLE_FIELDS, fields))
             if disk is not None and sample["dev"] != disk:
                 continue
             for key in SAMPLE_FIELDS:
                 if key != "dev":
-                    sample[key] = number(sample[key]) if key in sample else None
+                    sample[key] = number(sample[key])
             if sample["t"] is not None:
                 samples.append(sample)
     return samples
@@ -548,13 +521,13 @@ def read_extents(path):
 def timed_span(samples, log, elapsed):
     """The timed loop's (start, end) in the samples' clock, and whether the log placed it.
 
-    The bench prints its header, then nothing until its report, just after the timed loop: the
-    first sample at which the log holds the stage table ends the loop, and the loop's own wall
-    time (throughput.elapsed_s) places its start."""
+    The bench prints and flushes one line the moment its timed loop ends: the first sample at
+    which the log holds it ends the loop, and the loop's own wall time (throughput.elapsed_s)
+    places its start."""
     start, end = samples[0]["t"], samples[-1]["t"]
     try:
         with open(log, "rb") as f:
-            found = re.search(rb"(?m)^stage +mean ", f.read())
+            found = re.search(rb"(?m)^timed loop done: ", f.read())
     except OSError:
         found = None
     if found is None or not elapsed:
@@ -676,6 +649,7 @@ def section(name, fn, *args):
 
 
 profiles = []
+chains_differ = []  # backend mode's profiles whose runs ran different chains
 for run in runs:
     if run["profile"] not in profiles:
         profiles.append(run["profile"])
@@ -708,6 +682,23 @@ for profile in profiles:
     sides_knobs = {knob_text(doc["header"].get("knobs", {})) for doc in docs.values()}
     if len(sides_knobs) > 1:
         print(f"KNOBS DIFFER between runs of {profile}: the ratios compare different loads")
+    # execution is deterministic: one load on two backends runs one chain
+    chains = {key: tuple(doc["header"][k] for k in ("genesis_hash", "aged_tip_hash",
+                                                     "final_tip_hash"))
+              for key, doc in docs.items()}
+    for side in (side_a, side_b):
+        for chain in sorted({chain for (s, _), chain in chains.items() if s == side}):
+            rnds = " ".join(str(rnd) for (s, rnd), c in sorted(chains.items())
+                            if s == side and c == chain)
+            print(f"{side} chain: genesis {chain[0][:18]} aged tip {chain[1][:18]} "
+                  f"final tip {chain[2][:18]} (rounds {rnds})")
+    if len(set(chains.values())) > 1:
+        if side_a == "mdbx":
+            print(f"FAILED: CHAINS DIFFER between runs of {profile}: the backends ran different "
+                  "chains, so the ratios compare different loads")
+            chains_differ.append(profile)
+        else:
+            print(f"chains differ between runs of {profile}: the change alters the load")
     pairs = sorted(rnd for (s, rnd) in docs if s == side_a and (side_b, rnd) in docs)
     if not pairs:
         print("no complete pair: no aggregation")
@@ -738,12 +729,12 @@ for profile in profiles:
         print(f"{label:<34} {fmt(median(a.values())):>11} {fmt(median(b.values())):>11}  "
               f"{spread:<30} {per_pair}")
 
-    def print_gate():
+    def print_tail_drift():
         # from the per-output rows: the pooled tail over the paired rounds, the commit's drift
-        for label, a, b, text, per_run in gate_rows(docs, pairs, rounds):
+        for label, a, b, text, per_run in tail_drift_rows(docs, pairs, rounds):
             print(f"{label:<34} {fmt(a):>11} {fmt(b):>11}  {text:<30} {per_run}".rstrip())
 
-    section("gate rows", print_gate)
+    section("tail and drift rows", print_tail_drift)
     section("commit deciles", print_deciles, docs, rounds)
     section("db writes", print_counters, docs, rounds)
     section("system samples", print_samples, mine, docs, rounds)
@@ -754,12 +745,16 @@ for run in runs:
     state = "" if run["status"] == "0" else f"  (FAILED: {run['status']})"
     json_path = run["json"] if run["status"] == "0" else "-"
     print(f"{run['profile']} {run['side']} round {run['round']}: {json_path}  log {run['log']}{state}")
+if chains_differ:  # rendered in full, then status 3: the caller fails on it
+    print(f"the backends ran different chains in: {' '.join(chains_differ)}", file=sys.stderr)
+    sys.exit(3)
 PY
 }
 
 if [ "${1:-}" = --report-only ]; then # re-render a bench dir's reports: no builds, no runs
     [ $# = 2 ] || die "usage: $0 --report-only <bench dir>"
-    [ -d "$2/reports" ] || die "$2 has no reports/ dir"
+    [ -f "$2/reports/runs.tsv" ] \
+        || die "$2 has no reports/runs.tsv: only a bench dir of this script's runs re-renders"
     command -v python3 >/dev/null || die "python3 is needed for the report"
     bench_dir="$(cd "$2" && pwd -P)"
     repo="$(cd "$(dirname "$0")" && git rev-parse --show-toplevel)"
@@ -769,19 +764,18 @@ if [ "${1:-}" = --report-only ]; then # re-render a bench dir's reports: no buil
         echo
         echo "### REPORT-ONLY"
         printf '%-18s %s\n' "date:" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "bench dir:" "$bench_dir"
-        if [ -f "$bench_dir/reports/runs.tsv" ]; then
-            printf '%-18s %s\n' "runs:" "reports/runs.tsv (the script's last runs there)"
-        else
-            printf '%-18s %s\n' "runs:" "from the report names, <profile>-<side>-<round>.json (no reports/runs.tsv: a failed run is not known, every report counts as completed)"
-        fi
+        printf '%-18s %s\n' "runs:" "reports/runs.tsv (the script's last runs there)"
         if [ -f "$bench_dir/reports/head.txt" ]; then # the runs' own SYSTEM, CONFIG, BINARIES, RUNS
             echo
             sed -n '/^### SYSTEM/,$p' "$bench_dir/reports/head.txt"
         fi
     } >"$report"
-    render_report dir "$bench_dir" >>"$report" || { rm -f "$report"; die "the report failed to render"; }
+    render_status=0
+    render_report dir "$bench_dir" >>"$report" || render_status=$?
+    case "$render_status" in 0 | 3) ;; *) rm -f "$report"; die "the report failed to render" ;; esac
     printf '\n### END %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >>"$report"
     echo "report: $report"
+    [ "$render_status" = 0 ] || die "the backends ran different chains: see CHAINS DIFFER in the report"
     exit 0
 fi
 
@@ -879,6 +873,12 @@ fi
 [ -f "$repo/tn-contracts/artifacts/ConsensusRegistry.json" ] \
     || die "tn-contracts is not checked out (git submodule update --init)"
 [ -f "$repo/$bench_file" ] || die "this checkout has no $bench_file"
+bench_report_version() { # the bench source on stdin: prints its JSON_REPORT_VERSION
+    sed -nE 's/^const JSON_REPORT_VERSION: u32 = ([0-9]+);$/\1/p'
+}
+written="$(bench_report_version <"$repo/$bench_file")"
+[ "$written" = "$report_version" ] \
+    || die "this checkout's bench writes report version ${written:-?}; this script reads $report_version"
 
 # A src-before or tmp this script did not create (no marker) is refused, never removed.
 marker=".reth-exec-bench"
@@ -916,6 +916,9 @@ else
     git -C "$repo" cat-file -e "$before^{commit}" 2>/dev/null || die "no commit $before"
     git -C "$repo" cat-file -e "$before:$bench_file" 2>/dev/null \
         || die "$before has no $bench_file: commit mode needs a commit that has the bench"
+    written="$(git -C "$repo" show "$before:$bench_file" | bench_report_version)"
+    [ "$written" = "$report_version" ] \
+        || die "$before's bench writes report version ${written:-?}; this script reads $report_version only"
     before_key="$(git -C "$repo" rev-parse --short "$before")"
     side_a="before"
     side_b="after"
@@ -966,12 +969,16 @@ kv() { printf '%-18s %s\n' "$1:" "$2" >>"$report"; }
 digest() {
     if command -v md5sum >/dev/null; then md5sum "$1" | cut -d' ' -f1; else md5 -q "$1"; fi
 }
+# What a build reads from the checkout: an uncommitted change to any of it changes the binaries
+# (the sources, the release profile, the locked dependencies, cargo's config, the toolchain).
+build_inputs=(crates Cargo.toml Cargo.lock .cargo 'rust-toolchain*')
 describe_checkout() {
-    local changes=""
-    git -C "$repo" diff --quiet HEAD -- crates || changes=" + uncommitted changes in crates/"
-    [ -z "$(git -C "$repo" ls-files --others --exclude-standard -- crates | head -1)" ] \
-        || changes="$changes + untracked files in crates/"
-    echo "$(git -C "$repo" rev-parse --short HEAD) ($(git -C "$repo" log -1 --format=%s HEAD))$changes"
+    local changed untracked
+    changed="$(git -C "$repo" diff --name-only HEAD -- "${build_inputs[@]}" | cut -d/ -f1 \
+        | sort -u | xargs)"
+    untracked="$(git -C "$repo" ls-files --others --exclude-standard -- "${build_inputs[@]}" \
+        | cut -d/ -f1 | sort -u | xargs)"
+    echo "$(git -C "$repo" rev-parse --short HEAD) ($(git -C "$repo" log -1 --format=%s HEAD))${changed:+ + uncommitted changes in: $changed}${untracked:+ + untracked files in: $untracked}"
 }
 {
     echo "### RETH-EXEC v1"
@@ -1008,12 +1015,15 @@ else
     kv mode "commit: before (A) against after (B), backend $backend"
     kv before "$before ($(git -C "$repo" log -1 --format=%s "$before"))"
     kv after "$(describe_checkout)"
-    kv change "$(git -C "$repo" diff --stat "$before" -- crates | tail -1)"
+    kv change "$(git -C "$repo" diff --stat "$before" -- "${build_inputs[@]}" | tail -1)"
     if cmp -s "$src_before/$bench_file" "$repo/$bench_file"; then
         kv "before bench" "identical to this checkout's"
     else
         kv "before bench" "DIFFERS from this checkout's (a changed timed region reads as a change)"
     fi
+    pinned="$(git -C "$repo" ls-tree "$before" tn-contracts | awk '{print $3}')"
+    linked="$(git -C "$repo/tn-contracts" rev-parse HEAD 2>/dev/null || echo unknown)"
+    [ "$pinned" = "$linked" ] || kv "WARNING" "the before build links this checkout's tn-contracts ($linked), not the ${pinned:-none} $before pins: both sides run this checkout's genesis contracts"
 fi
 order="$side_a $side_b"
 round=2
@@ -1180,6 +1190,8 @@ run() { # <profile> <side>: runs the side's binary once with the profile's setti
     json="$bench_dir/reports/$name.json"
     log="$bench_dir/logs/$name.log"
     rm -f "$json" "${json%.json}.sys.tsv" "${json%.json}.frag.tsv"
+    # a run killed hard leaves its clone in tmp/: drop it, so the extent probe finds this run's
+    find "$tmp_dir" -mindepth 1 -maxdepth 1 ! -name "$marker" -exec rm -rf {} +
     busy_now="$(busy_builds)"
     when="$(date -u +%H:%M:%SZ)"
     load="$(uptime | sed 's/.*load average[s]*: //' | tr -d ',')"
@@ -1224,11 +1236,14 @@ for profile in "${profiles[@]}"; do
 done
 
 cp "$report" "$bench_dir/reports/head.txt"
-render_report run "$manifest" "$side_a" "$side_b" >>"$report" \
-    || die "the report failed to render; after a fix: $0 --report-only $bench_dir"
+render_status=0
+render_report run "$manifest" "$side_a" "$side_b" >>"$report" || render_status=$?
+case "$render_status" in 0 | 3) ;; *) die "the report failed to render; after a fix: $0 --report-only $bench_dir" ;; esac
+chains=""
+[ "$render_status" = 0 ] || chains="; the backends ran different chains (CHAINS DIFFER in the report)"
 {
     echo
     echo "### END $(date -u +%Y-%m-%dT%H:%M:%SZ)"
 } >>"$report"
 echo "report: $report"
-[ -z "$failed" ] || die "failed profiles:$failed (see the report)"
+[ -z "$failed$chains" ] || die "failed profiles:${failed:- none} (see the report)$chains"

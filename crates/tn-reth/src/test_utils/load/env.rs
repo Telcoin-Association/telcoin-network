@@ -88,6 +88,12 @@ pub fn open_production_env_with_db(
 /// 4 KiB page dirtied in a file written by `write(2)` and still cached, against 4 KiB in one read
 /// cold at random, which inflated every commit of the run.
 ///
+/// Where the file system clones (APFS always, XFS and btrfs with reflink), the copy shares every
+/// block with `src`, so the first write to each shared block costs a copy-on-write in the file
+/// system (a new block and an extent update) that a node's own file never pays: timings taken
+/// there include it, on both backends, in proportion to each one's writes. ext4 has no reflink:
+/// `cp` copies in full there and the copy's timings are free of it.
+///
 /// `dst` must not exist; its parent must. `src` must not be open by a writer (close its env
 /// first): the copy is file by file, so a database written meanwhile copies torn.
 pub fn clone_datadir(src: &Path, dst: &Path) -> eyre::Result<()> {

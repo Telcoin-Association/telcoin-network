@@ -80,7 +80,7 @@ use crate::{
     rpc_server_args::RpcServerArgs,
     test_utils::{
         consensus_output_for_tests_at,
-        load::{announce_temp_dir, db_file_bytes},
+        load::{announce_temp_dir, base::BACKEND, db_file_bytes},
         TransactionFactory,
     },
     ExecutedBlock, NewCanonicalChain, OutputTrieOverlay, RethChainSpec, RethCommand, RethConfig,
@@ -513,7 +513,6 @@ fn sorted(durations: impl Iterator<Item = Duration>) -> Vec<Duration> {
 
 /// Print one parseable line for a mode.
 fn report(knobs: &Knobs, per_commit: usize, run: &ModeRun) {
-    let backend = if cfg!(feature = "tn-lmdb") { "tn-lmdb" } else { "mdbx" };
     let persist = sorted(run.commits.iter().copied());
     let db = sorted(run.splits.iter().map(|s| s.db()));
     let db_write = sorted(run.splits.iter().map(|s| s.db_write));
@@ -524,7 +523,7 @@ fn report(knobs: &Knobs, per_commit: usize, run: &ModeRun) {
     let us = |d: Duration| d.as_micros();
     let blocks = persist.len() * per_commit;
     println!(
-        "persist_bench backend={backend} sync={} per_commit={per_commit} n={} blocks={blocks} \
+        "persist_bench backend={BACKEND} sync={} per_commit={per_commit} n={} blocks={blocks} \
          txs={} median_us={} p90_us={} p99_us={} max_us={} mean_us={} total_ms={} \
          blocks_per_s={:.1} db_median_us={} db_p99_us={} db_write_median_us={} \
          db_commit_median_us={} db_commit_p99_us={} sf_write_median_us={} sf_commit_median_us={} \

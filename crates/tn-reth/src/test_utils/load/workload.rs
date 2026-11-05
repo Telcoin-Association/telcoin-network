@@ -31,7 +31,9 @@
 //! transaction's gas limit fits [`WorkloadConfig::block_gas_limit`] on top of the expected gas
 //! before it. Execution refuses a whole block when a transaction's gas limit exceeds the block's
 //! remaining gas, and this rule keeps every batch clear of that. The transaction that would
-//! overflow a batch opens the next one.
+//! overflow a batch opens the next one, so one that fits no batch would leave every later batch
+//! empty: [`Workload::new`] refuses a mix whose [`Workload::largest`] transaction's gas limit
+//! exceeds the block gas limit, and `next_batch` panics on a target below its gas.
 //!
 //! On the test chain (`test_workload_*` measure it), a native transfer uses 21,000 gas, an ERC20
 //! transfer about 39k to a holder and 56k to a fresh address, a swap about 79.5k, and a 1 KiB
@@ -240,6 +242,8 @@ pub struct Workload {
     zipf: Zipf,
     /// The planned transaction that overflowed the last batch, which opens the next one.
     pending: Option<Planned>,
+    /// The weighted kind whose transaction can use the most gas, and that gas.
+    largest: (LoadKind, u64),
 }
 
 impl Workload {
@@ -257,6 +261,19 @@ impl Workload {
             (CREATE_PREFIX..=MAX_CODE_SIZE).contains(&config.create_size),
             "a creation deploys {CREATE_PREFIX}..={MAX_CODE_SIZE} bytes, not {}",
             config.create_size
+        );
+        let largest = LoadKind::ALL
+            .into_iter()
+            .filter(|kind| config.mix.weight(*kind) > 0)
+            .map(|kind| (kind, max_gas(kind, &config)))
+            .max_by_key(|(_, gas)| *gas)
+            .expect("a kind has weight");
+        eyre::ensure!(
+            gas_limit(largest.1) <= config.block_gas_limit,
+            "a {:?} transaction's gas limit (up to {}) exceeds the block gas limit {}",
+            largest.0,
+            gas_limit(largest.1),
+            config.block_gas_limit
         );
 
         let senders = spec.sender_factories();
@@ -276,13 +293,29 @@ impl Workload {
             nonces,
             zipf: Zipf::new(spec.accounts, config.zipf_exponent),
             pending: None,
+            largest,
         })
+    }
+
+    /// The kind in the mix whose transaction can use the most gas, and that gas: an upper bound
+    /// that counts every calldata byte as nonzero. A batch target below it fits no such
+    /// transaction.
+    pub fn largest(&self) -> (LoadKind, u64) {
+        self.largest
     }
 
     /// The next batch: transactions in planned order while the expected gas stays within
     /// `target_gas` and each gas limit fits [`WorkloadConfig::block_gas_limit`] on top of the
     /// expected gas before it. Planning is serial; signing runs on rayon.
+    ///
+    /// Panics when `target_gas` is below [`Workload::largest`]'s gas: a transaction that fits no
+    /// batch would leave this batch and every later one empty.
     pub fn next_batch(&mut self, target_gas: u64) -> LoadBatch {
+        let (kind, most) = self.largest;
+        assert!(
+            target_gas >= most,
+            "a {kind:?} transaction uses up to {most} gas, over the batch target {target_gas}"
+        );
         let mut planned = Vec::new();
         let mut gas = 0;
         loop {
@@ -398,7 +431,30 @@ struct Planned {
 impl Planned {
     /// The gas limit: the expected gas plus 10%.
     fn gas_limit(&self) -> u64 {
-        self.gas + self.gas / 10
+        gas_limit(self.gas)
+    }
+}
+
+/// The gas limit of a transaction expected to use `gas`: 10% over it.
+fn gas_limit(gas: u64) -> u64 {
+    gas + gas / 10
+}
+
+/// The most gas a transaction of `kind` can use under `config`: [`Workload::plan`]'s gas with
+/// every calldata byte counted as nonzero, and an ERC20 transfer counted as to a fresh address.
+fn max_gas(kind: LoadKind, config: &WorkloadConfig) -> u64 {
+    let calldata = |len: usize| 16 * len as u64;
+    match kind {
+        LoadKind::Native => TX_GAS,
+        LoadKind::Erc20 => {
+            let len = transfer_calldata(Address::ZERO, U256::ZERO).len();
+            TX_GAS + calldata(len) + ERC20_TO_FRESH_GAS
+        }
+        LoadKind::Swap => TX_GAS + calldata(swap_calldata(0, U256::ZERO).len()) + SWAP_GAS,
+        LoadKind::Create => {
+            let init = INIT_HEADER as usize + config.create_size;
+            TX_GAS + calldata(init) + CREATE_GAS + 2 * words(init) + run_gas(config.create_size)
+        }
     }
 }
 
@@ -565,8 +621,12 @@ mod tests {
         let spec = spec();
         let bench = Bench::open(&spec)?;
         let config = WorkloadConfig { seed: 3, mix: Mix::only(kind), ..Default::default() };
-        let batch = Workload::new(&bench.env, spec, config)?.next_batch(TARGET);
+        let mut workload = Workload::new(&bench.env, spec, config)?;
+        let batch = workload.next_batch(TARGET);
         assert!(!batch.txs.is_empty());
+        let (largest, most) = workload.largest();
+        assert_eq!(largest, kind);
+        assert!(batch.gas.iter().all(|gas| *gas <= most), "{kind:?} stays within {most} gas");
         assert_eq!(batch.count(kind), batch.txs.len(), "a single-kind batch");
         assert!(batch.expected_gas() <= TARGET, "the batch stays within its target");
         let block = bench.execute(&batch)?;
@@ -767,6 +827,28 @@ mod tests {
             }
         }
         assert!(late.count(LoadKind::Create) > 0 && late.count(LoadKind::Erc20) > 0);
+        Ok(())
+    }
+
+    /// A transaction that fits no batch is refused, not left to empty every later batch: a
+    /// creation over the block gas limit at construction, and a batch target below the largest
+    /// transaction at `next_batch`.
+    #[tokio::test]
+    async fn test_workload_refuses_a_transaction_that_fits_no_batch() -> eyre::Result<()> {
+        let spec = spec();
+        let bench = Bench::open(&spec)?;
+        let config = WorkloadConfig { block_gas_limit: 200_000, ..Default::default() };
+        let err = Workload::new(&bench.env, spec, config).expect_err("over the block").to_string();
+        assert!(err.contains("Create") && err.contains("200000"), "{err}");
+
+        let mut workload = Workload::new(&bench.env, spec, WorkloadConfig::default())?;
+        let (kind, most) = workload.largest();
+        assert_eq!(kind, LoadKind::Create);
+        let small = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            workload.next_batch(most - 1)
+        }));
+        assert!(small.is_err(), "a target below the largest transaction panics");
+        assert!(!workload.next_batch(most).txs.is_empty(), "its own gas fits it");
         Ok(())
     }
 

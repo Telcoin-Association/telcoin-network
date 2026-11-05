@@ -77,7 +77,8 @@
 //!
 //! - `TN_EXEC_BENCH_OUTPUTS` (300): timed outputs, at least 1.
 //! - `TN_EXEC_BENCH_BATCHES` (8): batches, and so blocks, per output, at least 1.
-//! - `TN_EXEC_BENCH_GAS` (15000000): each batch's target expected gas, at least 1.
+//! - `TN_EXEC_BENCH_GAS` (15000000): each batch's target expected gas, at least the mix's largest
+//!   transaction (a 1 KiB creation uses about 275k); the output factory refuses less.
 //! - `TN_EXEC_BENCH_WARMUP` (20): untimed outputs on the clone before the timed loop.
 //! - `TN_EXEC_BENCH_AGING` (200): outputs executed into the cached aged base; 0 runs on the base.
 //! - `TN_EXEC_BENCH_PREFILL` (1000000): prefilled accounts, the existing recipients.
@@ -111,13 +112,17 @@
 //! - `TN_EXEC_BENCH_REPORT` (unset): a path to also write the report to as JSON ([`json_report`]).
 //!   Its dir must exist; it is checked before the run.
 //!
-//! **Report.** A header with the backend, sync mode, metrics mode, pacing, every knob, the page
-//! size (the open clone's, read with [`db_page_size`], and `PAGE_SIZE` as set or `default`), where
-//! the disk bytes come from ([`DISK_BYTES_SOURCE`], with the first failed read's reason), the
-//! host and the date (the base's `db` size is its data file's allocated bytes, then its length,
-//! which MDBX preallocates), and `pool + RPC: on`; one row per stage with the mean, p50, p90, p99
-//! (nearest rank) and max in milliseconds per output and its share of the total; then the
-//! throughput. Then:
+//! **Report.** The moment the timed loop ends the bench prints and flushes one line, `timed loop
+//! done: elapsed_s=<seconds>` (`etc/reth-exec-bench.sh`'s system sampler places the loop's end by
+//! it); the report follows once the run has closed. A header with the backend, sync mode, metrics
+//! mode, pacing, every knob, the page size (the open clone's, read with [`db_page_size`], and
+//! `PAGE_SIZE` as set or `default`), where the disk bytes come from ([`DISK_BYTES_SOURCE`], with
+//! the first failed read's reason), the host and the date (the base's `db` size is its data file's
+//! allocated bytes, then its length, which MDBX preallocates), the chain (the genesis hash, the
+//! hash of the tip the run starts from and of the tip after the timed loop: execution is
+//! deterministic, so two backends' runs of one load hold the same three), and `pool + RPC: on`; one
+//! row per stage with the mean, p50, p90, p99 (nearest rank) and max in milliseconds per output and
+//! its share of the total; then the throughput. Then:
 //!
 //! - `thirds`: each stage's mean and p50 over the first and the last third of the timed outputs
 //!   (`OUTPUTS / 3` each), and their ratios, last over first: how the stage changes as the history
@@ -172,13 +177,18 @@
 //! - `other`: `total` minus `execute`, `finish`, `overlay extend`, `save_blocks`, `commit sf` and
 //!   `commit mdbx`: the engine's own work, announcing the output and finalizing.
 //!
+//! reth names the database stages `mdbx` (its metrics `save_blocks_mdbx` and
+//! `save_blocks_commit_mdbx`) whatever the engine, and the labels and JSON keys keep its names: on
+//! the tn-lmdb build `mdbx` and `commit mdbx` time tn-lmdb.
+//!
 //! **JSON report.** One object, its names snake_case with the unit in the name, for scripts that
-//! aggregate runs: `report_version` (4); `header` (backend, sync, `page_size_bytes` (the open
+//! aggregate runs: `report_version` (5); `header` (backend, sync, `page_size_bytes` (the open
 //! clone's), `disk_bytes_source` (`"proc_pid_rusage"`, `"/proc/self/io"` or null),
 //! `disk_bytes_error` (the first failed read's reason, or null), `db_counter_names` (the database
 //! counters' names in the build's order: JSON objects come out with their keys sorted), metrics,
-//! pacing, host, date, base, aged, `pool_rpc`, and `knobs`, every knob, with `page_size` null for
-//! the backend's default);
+//! pacing, host, date, base, aged, `genesis_hash`, `aged_tip_hash` (the tip the run starts from:
+//! the aged base's, or the genesis with `AGING=0`), `final_tip_hash` (the tip after the timed
+//! loop), `pool_rpc`, and `knobs`, every knob, with `page_size` null for the backend's default);
 //! `rows`, one per timed output (`first_block`, `last_block`, `gas`, `txs`, `late`, `side_load`,
 //! `epoch_close`, `export_active`, each stage as `<key>_ms`, `db_counters` (an object of each
 //! database counter's name, `mdbx_*` or `tn_lmdb_*`, and its difference over the output),
@@ -187,10 +197,10 @@
 //! call, [`page_faults`]; null when a read failed) and `db_file_len_bytes` (after the output));
 //! `stats`, per
 //! stage key (`mean_ms`, `p50_ms`, `p90_ms`, `p99_ms`, `max_ms`, `share_pct`); `throughput`;
-//! `thirds` (null for fewer than 3 outputs: `outputs_per_third` and per stage key `first_mean_ms`,
-//! `first_p50_ms`, `last_mean_ms`, `last_p50_ms`, `mean_ratio`, `p50_ratio`); `sizes` (`open`,
-//! `before_timed`, `after_timed` and `closed`, each `db_len_bytes`, `db_allocated_bytes`,
-//! `static_files_len_bytes` and `static_files_allocated_bytes`, then
+//! `thirds` (null for fewer than 3 outputs; else `outputs_per_third` and `stages`, per stage key
+//! `first_mean_ms`, `first_p50_ms`, `last_mean_ms`, `last_p50_ms`, `mean_ratio`, `p50_ratio`);
+//! `sizes` (`open`, `before_timed`, `after_timed` and `closed`, each `db_len_bytes`,
+//! `db_allocated_bytes`, `static_files_len_bytes` and `static_files_allocated_bytes`, then
 //! `db_growth_per_output_bytes`, `static_files_growth_per_output_bytes` and
 //! `db_logical_growth_per_output_bytes`); `db_writes` (`counters_mean_per_output`, every counter's
 //! mean per output but the maxima, `counters_max`, each of [`MAXIMA`]'s largest,
@@ -249,7 +259,7 @@ use tn_reth::{
     snapshot::PinnedStateView,
     test_utils::load::{
         announce_temp_dir,
-        base::{base_dir_name, BACKEND, META_FILE},
+        base::{base_dir_name, BACKEND, META_FILE, TN_LMDB_BACKEND},
         build_base, clone_datadir, db_counters, db_file_bytes, db_page_size, dir_bytes,
         open_production_env_with_db, poll_addresses,
         readers::{KindSamples, PollSamples, POLL_INTERVAL},
@@ -758,7 +768,7 @@ impl Knobs {
             SyncMode::NoSync
         };
         eyre::ensure!(
-            !(sync == SyncMode::NoSync && backend == "tn-lmdb"),
+            !(sync == SyncMode::NoSync && backend == TN_LMDB_BACKEND),
             "{KNOB_PREFIX}SYNC=nosync is --db.sync-mode safe-no-sync, which the tn-lmdb build \
              refuses: run tn-lmdb with SYNC=durable"
         );
@@ -2588,6 +2598,12 @@ struct Header {
     date: String,
     base: String,
     aged: String,
+    /// The base's genesis hash.
+    genesis_hash: B256,
+    /// The tip the run starts from: the aged base's, or the genesis with `AGING=0`.
+    aged_tip_hash: B256,
+    /// The canonical tip after the timed loop.
+    final_tip_hash: B256,
     /// The timed loop's wall clock, from the first output's start to the last's end, without the
     /// time between segments ([`Timed::elapsed`]).
     elapsed: Duration,
@@ -2635,6 +2651,10 @@ fn report(
                 fsync: durable commit times are not like-for-like between the backends\n";
     }
     out += &format!("  base: {}\n  aged: {}\n", header.base, header.aged);
+    out += &format!(
+        "  chain: genesis {} aged tip {} final tip {}\n",
+        header.genesis_hash, header.aged_tip_hash, header.final_tip_hash
+    );
     out += "  pool + RPC: on (worker 0's transaction pool and HTTP RPC methods, as on a node)\n";
     out += &format!(
         "{:<26} {:>9} {:>9} {:>9} {:>9} {:>9} {:>7}   (ms per output)\n",
@@ -2920,8 +2940,9 @@ fn export_report(export: Option<&Result<ExportRun, String>>, rows: &[OutputRow])
     out
 }
 
-/// The JSON report's layout version, bumped when a field changes meaning or goes away.
-const JSON_REPORT_VERSION: u32 = 4;
+/// The JSON report's layout version, bumped when a field is added, changes meaning or goes away:
+/// `etc/reth-exec-bench.sh` reads this version only.
+const JSON_REPORT_VERSION: u32 = 5;
 
 /// The JSON report of the timed `rows`, the clone's `footprint` and the `side` load, if it ran
 /// (see the module docs). Its field names stay stable for the scripts that aggregate runs:
@@ -3043,6 +3064,9 @@ fn json_report(
             "date": header.date,
             "base": header.base,
             "aged": header.aged,
+            "genesis_hash": header.genesis_hash,
+            "aged_tip_hash": header.aged_tip_hash,
+            "final_tip_hash": header.final_tip_hash,
             "pool_rpc": "on",
             "knobs": {
                 "outputs": knobs.outputs,
@@ -3392,6 +3416,10 @@ async fn exec_bench() -> eyre::Result<()> {
         }
     }
     let elapsed = timed.elapsed();
+    let final_tip_hash = node.env.canonical_tip().hash();
+    // the system sampler of `etc/reth-exec-bench.sh` places the timed loop's end by this line
+    println!("timed loop done: elapsed_s={:.3}", elapsed.as_secs_f64());
+    std::io::stdout().flush()?;
     let export = timed.export.take();
     let disk_error = timed.disk_error.take();
     drop(timed);
@@ -3439,6 +3467,9 @@ async fn exec_bench() -> eyre::Result<()> {
         date,
         base: base_line,
         aged: aged_line,
+        genesis_hash: base.genesis_hash,
+        aged_tip_hash: source.tip_hash,
+        final_tip_hash,
         elapsed,
         export,
         disk_error,
@@ -3878,7 +3909,7 @@ mod tests {
 
         let rows = export_rows();
         let plain = json_report(&header(defaults()), &rows, &footprint(), None);
-        assert_eq!(plain["report_version"], 4);
+        assert_eq!(plain["report_version"], 5);
         assert_eq!(plain["epoch_closes"], Value::Null);
         assert_eq!(plain["export"], Value::Null);
         assert_eq!(plain["header"]["knobs"]["epoch_every"], 0);
@@ -4242,6 +4273,9 @@ mod tests {
             date: "today".to_owned(),
             base: "base".to_owned(),
             aged: "aged".to_owned(),
+            genesis_hash: B256::repeat_byte(1),
+            aged_tip_hash: B256::repeat_byte(2),
+            final_tip_hash: B256::repeat_byte(3),
             elapsed: Duration::from_secs(1),
             export: None,
             disk_error: None,
@@ -4431,6 +4465,13 @@ mod tests {
         assert!(report.contains(before), "{report}");
         assert!(report.contains("db 1024.0 KiB, static files 1.0 KiB"), "{report}");
         assert!(report.contains("\n  pool + RPC: on ("), "{report}");
+        let chain = format!(
+            "\n  chain: genesis {} aged tip {} final tip {}\n",
+            B256::repeat_byte(1),
+            B256::repeat_byte(2),
+            B256::repeat_byte(3)
+        );
+        assert!(report.contains(&chain), "{report}");
         let logical =
             "growth per executed output (logical, table bytes): db 1024.0 KiB over 3 outputs";
         assert!(report.contains(logical), "{report}");
@@ -4540,8 +4581,11 @@ mod tests {
         let at = |pointer: &str| {
             json.pointer(pointer).unwrap_or_else(|| panic!("no {pointer} in {json:#}")).clone()
         };
-        assert_eq!(at("/report_version"), 4);
+        assert_eq!(at("/report_version"), 5);
         assert_eq!(at("/header/backend"), BACKEND);
+        assert_eq!(at("/header/genesis_hash"), serde_json::json!(B256::repeat_byte(1)));
+        assert_eq!(at("/header/aged_tip_hash"), serde_json::json!(B256::repeat_byte(2)));
+        assert_eq!(at("/header/final_tip_hash"), format!("0x{}", "03".repeat(32)));
         assert_eq!(at("/header/sync"), "durable");
         assert_eq!(at("/header/page_size_bytes"), 16_384);
         assert_eq!(at("/header/disk_bytes_source"), serde_json::json!(DISK_BYTES_SOURCE));

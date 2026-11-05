@@ -546,11 +546,12 @@ one of reth's: its rows are not copied (reth does not read them either).
 new and existing accounts) and contract writes (new and existing slots) over a prefilled state,
 persisted one block per commit and several per commit (production persists once per consensus
 output). It also reports reth's own split of each persist (`save_blocks_mdbx`, the database's
-writes, and `save_blocks_commit_mdbx`, its commit, against the static files' write and commit), so
-the engine's share is visible. The knobs (`TN_PERSIST_BENCH_*`) are in its doc comment. Run each
+writes, and `save_blocks_commit_mdbx`, its commit, against the static files' write and commit; reth
+keeps these names whatever the engine), so the engine's share is visible. The knobs (`TN_PERSIST_BENCH_*`) are in its doc comment. Run each
 build from its own target directory:
 
 ```sh
+mkdir -p target/persist-bench-tmp
 TMPDIR=$PWD/target/persist-bench-tmp CARGO_TARGET_DIR=target/persist-mdbx \
   cargo test --release -p tn-reth --lib env::persist_bench::per_block_persist -- --ignored --exact --nocapture
 TMPDIR=$PWD/target/persist-bench-tmp CARGO_TARGET_DIR=target/persist-tn-lmdb \
@@ -570,7 +571,8 @@ persist on macOS is reth's static files: their commit is a `File::sync_all`, whi
 `F_FULLFSYNC` on macOS, on every commit in both builds. The verdict uses the no-sync runs
 (MDBX on `--db.sync-mode safe-no-sync`, tn-lmdb on the engine's `NoSync`), because a durable commit on macOS is `F_FULLFSYNC` for reth's
 MDBX but a plain fsync for tn-lmdb, so durable rows are not a like-for-like engine comparison (3+3
-durable runs: p99 ratio 0.93 and 0.91). Linux runs are pending.
+durable runs: p99 ratio 0.93 and 0.91). The backends' Linux comparison is the execution benchmark's
+("Current result" below).
 
 Under no-sync, `tn-lmdb.dat` grew to 2 GiB in every run, against 65 MiB durable: the pages a commit
 frees are reused only after a sync, and a no-sync run never syncs. The engine then remapped past
@@ -598,24 +600,32 @@ backend's database page size independently (the bench's `TN_EXEC_BENCH_PAGE_SIZE
 from 4096 to 65536 bytes; unset, the backend's default from `default_page_size`: MDBX the OS page,
 tn-lmdb 4096), and the report names each side's page size; each page size has its own cached bases.
 The script's header lists its settings and everything it writes. On macOS a durable commit is `F_FULLFSYNC` for libmdbx but a plain fsync for tn-lmdb, so
-durable commit times there are not like-for-like between the backends.
+durable commit times there are not like-for-like between the backends. The stages named `mdbx`
+(`mdbx` and `commit mdbx`, the JSON keys `save_blocks_mdbx` and `commit_mdbx`) carry reth's metric
+names, which reth keeps whatever the engine: on tn-lmdb they time tn-lmdb.
 
 From the per-output rows the script's report adds the tail and drift rows: the total's p90, p95 and
 p99 pooled over every output of a side's paired rounds (one percentile, linear between the closest
 ranks), the database commit's last-third over first-third mean per run, and one line per run of the
-commit's mean over ten consecutive groups of outputs. With report v4 it adds a block per side of the
+commit's mean over ten consecutive groups of outputs. It then adds a block per side of the
 database writes per output (the commit's ms, disk MiB, file growth and each counter that moved),
 each as the run's mean, first third and last third, ending with the commit's ms per page written
 (tn-lmdb: per `tn_lmdb_pages_synced`; MDBX: per `mdbx_newly + mdbx_cow + mdbx_split`): a commit that
 grows at the same ms per page writes more pages, one that grows per page writes the same pages
-slower. `etc/reth-exec-bench.sh --report-only <bench dir>` renders the report again from a bench
-directory's `reports/` (its `runs.tsv`, else the report names), with no builds and no runs. On Linux,
+slower. Each profile also prints each side's chain, the genesis, aged-tip and final-tip hashes in
+its runs' JSON headers: execution is deterministic, so in backend mode a difference is marked
+`CHAINS DIFFER` and fails the script after the report. `etc/reth-exec-bench.sh --report-only <bench
+dir>` renders the report again from a bench directory's `reports/runs.tsv`, with no builds and no
+runs. The script reads one JSON report version, the bench's `JSON_REPORT_VERSION`: it refuses a
+directory without `runs.tsv` or with a report of another version, and refuses before building a
+bench (in commit mode, the before commit's too) that writes another. On Linux,
 `EXEC_SYS_SAMPLE=1` runs a sampler beside each run (every second: `/proc/meminfo`'s Dirty and
 Writeback, the `/proc/diskstats` line of the whole disk under the bench directory and the drive's
 temperature; `filefrag`'s extent count of the data file when it appears and every 30 s, when
 installed), and the report gives per side the disk's write MiB/s, ms per write, busy %, flushes and
-ms per flush, Dirty and Writeback, the temperature and the extents over each run's timed loop and
-its first and last third. It samples the whole disk, so other writers on it show up.
+ms per flush, Dirty and Writeback, the temperature and the extents over each run's timed loop (its
+end placed by the line the bench prints and flushes the moment the loop ends) and its first and last
+third. It samples the whole disk, so other writers on it show up.
 
 Each timed output also records what it wrote, read just before and just after its
 `execute_consensus_output` call (outside its wall time; the database commit completes inside the
@@ -626,8 +636,8 @@ none elsewhere) and the database data file's length after it. The report's "data
 output" section gives each counter that moved as its mean per output (`_ns` counters in ms, the
 `tn_lmdb_max_gate_lag` maximum as its largest), the disk MiB and the data file's growth per output and
 over the run, then deciles (ten consecutive groups of outputs) of the commit's ms, the disk MiB and
-the file's length, which show whether the commit grows over a long run. The JSON report (version
-4) carries them per row (`db_counters`, `disk_bytes_written`, `db_file_len_bytes`), the source and
+the file's length, which show whether the commit grows over a long run. The JSON report carries
+them per row (`db_counters`, `disk_bytes_written`, `db_file_len_bytes`), the source and
 the counters' names in the build's order in its header (`disk_bytes_source`, `db_counter_names`)
 and the summary as `db_writes`. Caveats: the disk bytes are an
 approximation: Linux counts a page as it is dirtied (a page dirtied once and synced counts once),
@@ -645,120 +655,42 @@ and still cached, 4 KiB in one read cold at random): in a Linux run on a cached 
 commit grew from 82 to 583 ms over 300 outputs, all in its one `fdatasync` (199 to 532 MiB written
 per commit), and MDBX wrote about 970 MiB per commit. Linux commit numbers from runs on a cached copy
 are not comparable with later ones. On macOS nothing is evicted: it has no per-file eviction, and no
-folio writeback of this kind. On Linux tn-lmdb also advises its mappings `MADV_RANDOM`
+folio writeback of this kind. Where the file system clones (APFS always; XFS and btrfs with
+reflink), the copy shares every block with the base, so a commit's first write to each block also
+pays the file system's copy-on-write (a new block and an extent update), which a node's own file
+never pays: Mac timings include it, on both backends, in proportion to each one's writes. ext4 has
+no reflink: `cp` copies in full there. On Linux tn-lmdb also advises its mappings `MADV_RANDOM`
 (`EnvOptions::readahead`, off by default there), as reth's MDBX does, so its own faults do not build
 large folios.
 
-#### Mac baseline, 2026-10-28
+#### Current result: Linux, 2026-11-04
 
-The setup:
-- **Machine:** an Apple M1 Max (10 cores, 64 GiB) on its internal SSD (APFS), release builds,
-  durable sync on both backends.
-- **Run:** `etc/reth-exec-bench.sh` in backend mode, 2 ABBA rounds per profile, the bench's
-  defaults:
-  - state: 1M prefilled accounts, 10k senders, 64 pools, 200 aging and 20 warm-up outputs;
-  - load: 300 timed outputs, back to back, each 8 batches of 15M gas (about 2,400 transactions and
-    120M gas per output).
-- **Figures:** medians over the rounds, in ms per output. A ratio is tn-lmdb over MDBX, the median of
-  the two pairs' ratios.
+Backend mode on a Linux machine (a consumer NVMe drive, ext4) at commit 06a413e9e: the six
+profiles, 2 ABBA rounds each, 300 timed outputs per run, durable sync, the bench's defaults
+otherwise. tn-lmdb passed on all six:
 
-| profile | MDBX mean | tn-lmdb mean | ratio | MDBX p99 | tn-lmdb p99 | ratio [pairs] | Mgas/s, MDBX / tn-lmdb |
-|---|---|---|---|---|---|---|---|
-| `busy` | 801.5 | 852.5 | 1.06 | 1154 | 1358 | 1.18 [0.96..1.40] | 149.2 / 140.2 |
-| `busy-readers` (4 readers, the poller, the submitter) | 852.6 | 923.5 | 1.08 | 1213 | 1317 | 1.09 [1.05..1.12] | 140.2 / 129.5 |
-| `busy-metrics` (Prometheus, with readers) | 858.2 | 908.6 | 1.06 | 1185 | 1196 | 1.01 [0.96..1.06] | 139.3 / 131.6 |
-| `busy-epoch` (a close every 50 outputs) | 803.0 | 849.9 | 1.06 | 1118 | 1216 | 1.09 [0.96..1.22] | 148.9 / 140.7 |
-| `busy-export` (a state-pack export beside the writer) | 847.6 | 849.7 | 1.00 | 1299 | 1152 | 0.89 [0.86..0.91] | 141.0 / 140.7 |
-| `peak` (20 batches of 30M gas) | 2624 | 3878 | 1.48 | 3642 | 7599 | 2.09 [1.69..2.49] | 228.2 / 154.5 |
+| profile | tn-lmdb / MDBX | bar |
+|---|---|---|
+| `busy` | 0.980 | 1.02 |
+| `peak` (20 batches of 30M gas) | 1.013 | 1.02 |
+| `busy-readers` (4 readers, the poller, the submitter) | 1.009 | 1.05 |
+| `busy-metrics` (Prometheus, with readers) | 1.033 | 1.05 |
+| `busy-epoch` (a close every 50 outputs) | 1.008 | 1.05 |
+| `busy-export` (a state-pack export beside the writer) | 1.006 | 1.05 |
 
-Where an output's time goes, `busy`, mean ms:
+The drive syncs at one of two speeds and flips between them mid-run for either engine, so a whole
+run's ratio follows the drive's state (0.79 to 1.11 in this run) and is not judged. Each ratio above
+is over the pairs of outputs, one per backend, whose commits both ran in the fast state (under 4 µs
+per page written; 99 to 308 pairs per profile).
 
-| stage | MDBX | share | tn-lmdb | share | ratio |
-|---|---|---|---|---|---|
-| EVM execution (with signer recovery: 10.9 / 10.8) | 37.0 | 4.6% | 40.6 | 4.8% | 1.10 |
-| state root (`finish`: hashed state 1.4, state root 156.2 / 175.6) | 163.8 | 20.4% | 183.1 | 21.5% | 1.12 |
-| overlay extend | 5.6 | 0.7% | 5.5 | 0.6% | 1.00 |
-| writes (`save_blocks`: the database's writes beside the static files') | 139.0 | 17.3% | 114.6 | 13.4% | 0.82 |
-| static-file commit | 34.4 | 4.3% | 33.6 | 3.9% | 0.98 |
-| database commit | 419.3 | 52.3% | 472.6 | 55.4% | 1.13 |
-| other | 2.5 | 0.3% | 2.5 | 0.3% | 0.99 |
+`peak`'s remaining gap on those pairs, about 16 ms of a 173 ms commit, is the page CRC stamp
+(about 15 ms an output): tn-lmdb's data sync costs what MDBX's whole commit costs for the same pages
+(156 ms for 98k pages against 157 ms for 100k), and MDBX has no page checksums. The stamp's cost is
+the open item; the checksums stay.
 
-The database's writes split into these stages:
-
-| write stage | MDBX | tn-lmdb | ratio |
-|---|---|---|---|
-| `insert_block` | 0.3 | 0.2 | 0.77 |
-| `write_state` | 38.5 | 23.2 | 0.60 |
-| `write_hashed_state` | 25.6 | 19.6 | 0.77 |
-| `write_trie_updates` | 24.1 | 35.9 | 1.49 |
-| `update_history_indices` | 38.7 | 29.2 | 0.75 |
-
-What the runs and two `sample` profiles show (one busy run per backend, 120 s inside the timed
-loop):
-- **The database commit is I/O.** It is half of each output on both backends.
-  - On MDBX it is 99.9% `msync`: reth opens MDBX with a write map, so the commit writes back the
-    dirty mapped pages. On tn-lmdb it is 91% `fsync`, which writes back tn-lmdb's dirty mapped pages.
-  - The cost follows the pages a commit dirties, not the logical bytes. MDBX's file grew 616 MiB
-    while the export held its read for about 2.6 s (3–4 outputs): about 150–200 MiB of pages per
-    output, against 1.1 MiB of logical growth. Random keys over 1M accounts dirty a leaf, and its
-    path, per key touched.
-  - On macOS the write-back is at the VM page, 16 KiB on Apple Silicon. MDBX uses that as its page
-    size (reth's default, the OS page). tn-lmdb-reth uses 4 KiB pages, so each scattered page it
-    dirties writes back 16 KiB.
-  - libmdbx's durable sync is `F_FULLFSYNC` and tn-lmdb's a plain fsync. The Linux run (4 KiB pages,
-    `fdatasync`) is needed before ranking the backends on this stage.
-- **`peak` is tn-lmdb's weak spot.** Its commit grows over the run: per-decile means rise from
-  1.9 s to 3.25 s, with outputs up to 13 s. MDBX's stays at 1.0–1.3 s. In `busy`, tn-lmdb's commit
-  is about 620 ms for the first ~90 outputs, then about 400 ms (MDBX about 415).
-- **The rest of the run:**
-  - **History:** apart from tn-lmdb's early commits, each stage is flat from the first third of the
-    timed outputs to the last in `busy`.
-  - **Side load:** the readers cost the writer at most 5% (writer on/off 0.97–1.05 per run). Read
-    latencies match across the backends: p50 within 5%; `eth_getBlockByNumber` is 0.81x on tn-lmdb.
-  - **Prometheus:** no measurable cost.
-  - **Epoch close:** a closing output costs what a normal one does.
-- **The export:** it wrote 1.08M accounts, 2.07M storage slots and 25.8k bytecodes (a 152 MiB
-  pack) in 2.5–2.7 s (MDBX) and 2.2 s (tn-lmdb). The writer ran at 1.03x beside it on MDBX and 1.41x
-  on tn-lmdb, over only 2–4 outputs. tn-lmdb's growth while pinned reads 0: its file grows in
-  preallocated steps.
-
-#### Improvement candidates, by measured share (Mac)
-
-1. **The database commit, 52–55%:** the page write-back volume.
-   - **Persist every K outputs, not every output.** This amortizes the shared branch pages and the
-     hot leaves over K outputs. After a crash, the node would re-execute the outputs since the last
-     persist; it already replays the consensus output it missed on restart (`run_epoch`). It is a
-     TN design change (the overlay would span K outputs); no fork. The bench can measure it with a
-     persist-interval knob.
-   - **tn-lmdb:** an A/B of the page size (16 KiB, the OS page, on macOS) and of allocation locality.
-     A delta or WAL commit, writing the changed records and checkpointing pages later, is the
-     structural fix: an engine change.
-   - **Before tuning,** find what grows tn-lmdb's commit over a `peak` run.
-2. **The state root, 20–22%:** TN calls the serial `StateRoot::root_with_updates`.
-   reth-trie-parallel's `ParallelStateRoot` computes the storage roots on rayon. That is a tn-reth
-   change; no fork. tn-lmdb is 12% slower here, in cursor descents (`TreeCursor::descend`, 9% of an
-   output).
-3. **The database's writes, 13–17%:**
-   - **MDBX:** libmdbx's `mincore` residency check on page touch is 6.4% of an output.
-   - **tn-lmdb:** zero-filling each new page (`memset` in `Writer::alloc`) is 4.7% of an output, a
-     third of the write stage.
-   - **tn-lmdb's dup-sort emulation:** reth's writers do `seek_by_key_subkey`, `delete_current`,
-     then `upsert` per changed slot and trie node, where one put would do. The seek and the delete
-     are about 4% of an output (`delete_current` 3.1%, the seek 1.1%), and `write_trie_updates`
-     runs at 1.49x MDBX.
-   - **The fork question:** this stage is the one a reth fork could change. A one-call dup put
-     would remove the seek and the delete. The adapter can first try a cached seek position,
-     without a fork.
-4. **The static-file commit, 4%:** NippyJar's `File::sync_all` on every persist, which is
-   `F_FULLFSYNC` on macOS. It is reth code (a fork or an upstream change). Linux's `fsync` should
-   cost much less (not measured yet).
-5. **EVM execution, 5%,** with signer recovery at 1.4%. `CachedReads` is dropped every block
-   (`env/execution.rs`), so the hot token and router accounts are read again by each of an
-   output's blocks.
-
-The two largest stages (the commit's I/O, the state root) are reachable without forking reth. The
-parts a fork would change (the write pattern, about 4% on tn-lmdb, and the static-file sync, 4%)
-are smaller. The Linux run (the user's, with the same script) decides the commit ranking.
+Baseline from an earlier engine: a Mac run of 2026-10-28 (Apple M1 Max, APFS, so on block-sharing
+clones) had tn-lmdb's mean output time at 1.00 to 1.08x MDBX's on the busy profiles and 1.48x on
+`peak`.
 
 #### The load generator (`src/test_utils/load/`, `test-utils`)
 
@@ -806,11 +738,10 @@ are smaller. The Linux run (the user's, with the same script) decides the commit
   production `--db.*`, durable sync and `--db.page-size <page_size>`; a database with another page
   size (`db_page_size`) is an error.
   - The key (`base_dir_name`) is 16 hex digits of `keccak256` over the spec and `LAYOUT_VERSION`. A
-    derived datadir, such as an aged one, appends its own `extra` component. `LAYOUT_VERSION` is 3
-    since the state tables' engine dup tables on tn-lmdb keep a key of few rows in its outer cell
-    (a packed set), which renamed every base: each backend's bases, and their aged children,
-    rebuild once (a tn-lmdb base of an earlier layout holds those tables composite or unpacked,
-    which the open refuses).
+    derived datadir, such as an aged one, appends its own `extra` component. A change that makes a
+    base built by earlier code differ from what the code builds bumps `LAYOUT_VERSION`, which
+    renames every base: each backend's bases, and their aged children, rebuild once. The constant's
+    doc comment lists each version and why.
   - It writes `bench-base.json` (`BaseMeta`: the spec, the backend, the page size, the layout
     version, the sealed genesis header, the slim genesis hash, build times and sizes), then renames
     `<name>.building` into place. A later call returns the cached base.
@@ -823,7 +754,8 @@ are smaller. The Linux run (the user's, with the same script) decides the commit
     refuses another header (`GenesisHashMismatch`). The slim chain's `genesis().alloc` lacks the
     prefill; nothing on the open or execute path reads it.
   - Measured 2026-10-27 (Apple M-series laptop, release, durable, `build_base_at_scale` with 1M
-    accounts and 10k senders):
+    accounts and 10k senders), at layout version 1, before the engine's dup tables; the tn-lmdb
+    file has changed since:
 
     | backend | build | genesis and chain spec | `init_genesis` | data file allocated | peak RSS |
     |---|---|---|---|---|---|
@@ -833,7 +765,10 @@ are smaller. The Linux run (the user's, with the same script) decides the commit
   on-chain nonces: by default 40% native transfers, 40% ERC20 transfers, 15% swaps and 5% 1 KiB
   creations, with 20% fresh recipients and the rest Zipf-hot `account(i)`. `next_batch(target_gas)`
   signs a `LoadBatch` filled by exact expected gas, each gas limit 10% over it and within
-  `block_gas_limit` (30M). Gas on the test chain:
+  `block_gas_limit` (30M). A transaction that fits no batch is refused, not left to empty every
+  later one: `Workload::new` refuses a mix whose largest transaction (`largest()`, an upper bound)
+  exceeds `block_gas_limit`, `next_batch` panics on a target below it, and `OutputFactory::new`
+  refuses a `batch_gas` below it. Gas on the test chain:
 
   | transaction | gas |
   |---|---|

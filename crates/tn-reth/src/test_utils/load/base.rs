@@ -75,8 +75,12 @@ pub const META_FILE: &str = "bench-base.json";
 /// refuses a format-4 file at open, so every base rebuilds once, the MDBX ones with them.
 pub const LAYOUT_VERSION: u32 = 4;
 
-/// This build's database backend, as [`BaseMeta::backend`] records it.
-pub const BACKEND: &str = if cfg!(feature = "tn-lmdb") { "tn-lmdb" } else { "mdbx" };
+/// The tn-lmdb backend's label: [`BACKEND`] in a `tn-lmdb` build.
+pub const TN_LMDB_BACKEND: &str = "tn-lmdb";
+
+/// This build's database backend, as [`BaseMeta::backend`] records it: [`TN_LMDB_BACKEND`] or
+/// `mdbx`.
+pub const BACKEND: &str = if cfg!(feature = "tn-lmdb") { TN_LMDB_BACKEND } else { "mdbx" };
 
 /// The `--db.*` flags a base is built with: production defaults, durable sync, and a new file of
 /// `page_size` (a number of bytes) pages.
