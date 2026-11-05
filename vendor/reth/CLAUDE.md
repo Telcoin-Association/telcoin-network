@@ -7,7 +7,7 @@ against it").
 
 **Size: don't read the copy to understand TN's work.** `crates/` and `testing/` hold about 199k
 lines of Rust, almost all of it upstream code TN never changed. TN's whole change set is
-`vendor.py diff`: 110 files, about 14k lines removed and 2.3k added, most of the removals whole
+`vendor.py diff`: 110 files, about 14k lines removed and 2.5k added, most of the removals whole
 files. Start from that diff or from a ledger entry, never from a directory listing.
 
 **Read in this order:**
