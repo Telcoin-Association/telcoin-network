@@ -2120,15 +2120,20 @@ impl PeerManager {
         (known_key == key) != (known.pubkey == peer.network_key)
     }
 
-    /// Add a peer learned from the DHT for a tracked committee member or operator-pinned key.
+    /// Add a peer learned from the DHT for a committee member, an operator-pinned key, or a
+    /// scheduled or eligible key.
     ///
     /// Unlike [`Self::add_known_peer`], this path is reachable by any remote peer: a
     /// signature-valid kad record only proves the publisher owns the network key it advertises,
     /// not that the advertised [`BlsPublicKey`] belongs to any committee. Caching every such
     /// record would let a peer grow `known_peers` without bound by publishing records for endless
-    /// fresh keys (issue #827). Accept only tracked committee members and operator-pinned keys;
-    /// the latter set is bounded by local configuration. Kad lookups are only ever triggered for
-    /// current/next committee members and configured trusted hubs (see
+    /// fresh keys (issue #827). A record takes one of three branches. A member of a committee slot
+    /// or an operator-pinned key is cached in `known_peers`, bounded by the window and by local
+    /// configuration. A scheduled or eligible key is retained for export only, through
+    /// [`Self::retain_tracked`], which binds no identity and is bounded by [`MAX_TRACKED_KEYS`].
+    /// Any other key is dropped. Kad lookups are triggered for window members, for the upcoming
+    /// committees the epoch manager prefetches through [`Self::find_authorities`], for tracked
+    /// keys (see [`Self::trigger_tracked_lookups`]), and for configured trusted hubs (see
     /// [`Self::trigger_trusted_lookups`]), so an indirect lookup can confirm a hub's identity
     /// after its first connection was interrupted before the signed record arrived.
     #[cfg(test)]

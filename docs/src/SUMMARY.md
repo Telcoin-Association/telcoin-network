@@ -94,6 +94,7 @@
   * [rpc](rpc-methods/rpc/README.md)
     * [rpc\_modules](rpc-methods/rpc/rpc_modules.md)
   * [tn](rpc-methods/tn/README.md)
+    * [tn\_admissionSnapshot](rpc-methods/tn/tn_admissionsnapshot.md)
     * [tn\_delegationDigest](rpc-methods/tn/tn_delegationdigest.md)
     * [tn\_epochRecord](rpc-methods/tn/tn_epochrecord.md)
     * [tn\_epochRecordByHash](rpc-methods/tn/tn_epochrecordbyhash.md)
