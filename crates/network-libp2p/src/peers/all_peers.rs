@@ -1273,6 +1273,24 @@ impl AllPeers {
         self.peers.contains_key(&PeerIdentity::Confirmed(*bls_key))
     }
 
+    /// Evict the `Confirmed` record of `bls_key` and its `bls_by_peer_id` binding, but only while
+    /// the peer has no recorded connection status.
+    ///
+    /// A record with no connection status was never dialed, connected or banned, so evicting it
+    /// releases no connection or ban bookkeeping. Any other record is left to the ordinary
+    /// pruning, so a peer that has connected keeps its reputation and a banned peer cannot shed
+    /// its ban this way (issue #998).
+    pub(super) fn evict_unconnected(&mut self, bls_key: BlsPublicKey) {
+        let identity = PeerIdentity::Confirmed(bls_key);
+        let unconnected = self
+            .peers
+            .get(&identity)
+            .is_some_and(|peer| matches!(peer.connection_status(), ConnectionStatus::Unknown));
+        if unconnected {
+            self.evict(&identity);
+        }
+    }
+
     /// Evict the `Confirmed` record of `bls_key` through the same path as pruning, so tests can
     /// cover re-binding after an eviction (issue #1649).
     #[cfg(test)]

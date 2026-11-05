@@ -113,6 +113,10 @@ mod loop_budget_tests;
 #[path = "tests/tracked_rearm.rs"]
 mod tracked_rearm;
 
+#[cfg(test)]
+#[path = "tests/tracked_store.rs"]
+mod tracked_store;
+
 /// The unit of work that [`ConsensusNetwork::run`] services next, as chosen by
 /// [`next_loop_event`].
 #[derive(Debug)]
@@ -1743,10 +1747,32 @@ where
                 self.swarm.behaviour_mut().peer_manager.find_authorities(bls_keys);
             }
             NetworkCommand::UpdateTrackedKeys { epoch, scheduled, eligible } => {
-                self.swarm
-                    .behaviour_mut()
-                    .peer_manager
-                    .update_tracked_keys(epoch, scheduled, eligible);
+                let published_scheduled = scheduled.clone();
+                let behaviour = self.swarm.behaviour_mut();
+                // the peer manager applies the epoch rule and the key cap, so the store follows
+                // only an update it accepted and only the keys it kept
+                if behaviour.peer_manager.update_tracked_keys(epoch, scheduled, eligible) {
+                    // the store keeps the leading keys that fit its headroom, so they follow the
+                    // peer manager's cap priority: scheduled keys, then eligible keys, each in key
+                    // order
+                    let mut keys: Vec<_> = behaviour.peer_manager.tracked_keys().copied().collect();
+                    keys.sort_unstable_by_key(|key| (!published_scheduled.contains(key), *key));
+                    // the store rows only extend serving and the peer manager keeps its own
+                    // tracked records, so a short headroom or a failed prune must not hold back
+                    // the export
+                    match behaviour.kademlia.store_mut().retain_tracked(keys) {
+                        Ok(left_out) if left_out.is_empty() => {}
+                        Ok(left_out) => {
+                            let left_out = left_out.len();
+                            bounded_warn!(Command, target: "network-kad", epoch, left_out,
+                                "kad store headroom reached, tracked records left out");
+                        }
+                        Err(error) => {
+                            bounded_warn!(Command, target: "network-kad", epoch, ?error,
+                                "released tracked records could not be pruned; tracking continues");
+                        }
+                    }
+                }
             }
             NetworkCommand::GetValidatorRpc { bls_key, reply } => {
                 let rpc = self.swarm.behaviour().peer_manager.get_rpc(&bls_key);

@@ -295,6 +295,15 @@ pub(crate) struct PeerManager {
     /// ([`Self::prune_known_peers`]); ordinary kad-sourced updates remain timestamp-monotonic,
     /// while clamped values allow bounded repair under the shared local freshness policy.
     known_peers: HashMap<BlsPublicKey, NetworkInfo>,
+    /// Keys restored from the persisted kad store at startup, until the first
+    /// [`Self::prune_known_peers`] settles them.
+    ///
+    /// A restored record is cached and bound like a discovered one before any committee is
+    /// known, whatever class retained its row in the previous run. The first prune unbinds every
+    /// restored key it drops whose peer has not been dialed or connected since, so a row only the
+    /// tracked class held leaves no binding behind. Bounded by the persisted rows and emptied by
+    /// that prune.
+    restored_peers: HashSet<BlsPublicKey>,
     /// Admission metadata bounded to the same keys as the known-peer cache.
     known_timestamps: HashMap<BlsPublicKey, crate::freshness::RecordTimestamp>,
     /// Scheduled and eligible validator keys, with records retained for export only.
@@ -737,6 +746,7 @@ impl PeerManager {
             trusted_dials: HashMap::new(),
             peers,
             known_peers: Default::default(),
+            restored_peers: Default::default(),
             known_timestamps: Default::default(),
             tracked: Default::default(),
             bootstrap_keys: Default::default(),
@@ -1621,13 +1631,16 @@ impl PeerManager {
     /// schedule. Past [`MAX_TRACKED_KEYS`] distinct keys the excess is left out with a bounded
     /// warning. Tracking admits nothing: membership, scoring, and the admission inputs come only
     /// from the committee update. Lookups for newly tracked keys start on the next heartbeat.
+    ///
+    /// Returns whether the update was accepted, that is, not ignored for an older epoch.
     pub(crate) fn update_tracked_keys(
         &mut self,
         epoch: u64,
         scheduled: HashSet<BlsPublicKey>,
         eligible: HashSet<BlsPublicKey>,
-    ) {
-        match self.tracked.update(epoch, scheduled, eligible) {
+    ) -> bool {
+        let left_out = self.tracked.update(epoch, scheduled, eligible);
+        match left_out {
             None => {
                 debug!(target: "peer-manager", epoch, "ignoring tracked keys for an older epoch")
             }
@@ -1637,6 +1650,16 @@ impl PeerManager {
             }
         }
         self.record_tracked_resolution();
+        left_out.is_some()
+    }
+
+    /// Every key of the accepted tracked sets once, scheduled keys first.
+    ///
+    /// These are the sets [`Self::update_tracked_keys`] holds after its epoch rule and its
+    /// [`MAX_TRACKED_KEYS`] cap, so a store that follows them never tracks a key this swarm left
+    /// out. The local key is included when a publication lists it.
+    pub(crate) fn tracked_keys(&self) -> impl Iterator<Item = &BlsPublicKey> {
+        self.tracked.keys()
     }
 
     /// Write the committee connectivity gauges from the current committee slot.
@@ -1686,6 +1709,11 @@ impl PeerManager {
     /// An evicted key that is still tracked keeps its learned record in the tracked map, under
     /// the same freshness rule as any other tracked record; a config stub is not a record and is
     /// never moved. A tracked record is never promoted back into this cache.
+    ///
+    /// The first prune after startup also drops the peer-store record, and with it the peer-id
+    /// binding, of every restored key it evicts whose peer has not been dialed or connected
+    /// since ([`Self::add_restored_peer`]). A peer that has connected keeps its record for the
+    /// ordinary peer pruning.
     fn prune_known_peers(&mut self) {
         let observed = now();
         let demoted: Vec<_> = self
@@ -1712,6 +1740,11 @@ impl PeerManager {
         let known = &self.known_peers;
         self.stub_records.retain(|bls_key| known.contains_key(bls_key));
         self.known_timestamps.retain(|bls_key, _| known.contains_key(bls_key));
+        for bls_key in std::mem::take(&mut self.restored_peers) {
+            if !self.known_peers.contains_key(&bls_key) {
+                self.peers.evict_unconnected(bls_key);
+            }
+        }
         // the committee update running this prune refreshes the tracked gauges once afterwards
         demoted.into_iter().for_each(|(bls_key, info, timestamp)| {
             self.retain_tracked(bls_key, info, timestamp, observed);
@@ -1900,8 +1933,14 @@ impl PeerManager {
     /// attacker-fillable store entries into permanently pinned `known_peers` entries, so restored
     /// entries are deliberately NOT pinned — they survive only until the first
     /// [`Self::update_committees`] prunes non-members, restoring the issue #827 committee bound.
+    ///
+    /// Caching a restored record also binds its peer id in the peer store. The store persists
+    /// rows for tracked keys too, which must never be bound, so the key is remembered and that
+    /// first prune removes the binding of every evicted key whose peer has not been dialed or
+    /// connected since startup.
     pub(crate) fn add_restored_peer(&mut self, bls_key: BlsPublicKey, info: NetworkInfo) {
         self.cache_known_peer(bls_key, info);
+        self.restored_peers.insert(bls_key);
     }
 
     /// Restore a persisted admission ceiling without resetting it to the startup clock.
