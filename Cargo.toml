@@ -40,7 +40,12 @@ members = [
 # Carried libp2p patches are wired in through `[patch.crates-io]` below and kept out of
 # the workspace so that upstream code is not held to the house lints. Each patch has a PATCH.md
 # maintenance record.
-exclude = ["patches/libp2p-quic", "patches/libp2p-connection-limits", "patches/quinn-proto"]
+exclude = [
+    "patches/libp2p-quic",
+    "patches/libp2p-connection-limits",
+    "patches/quinn-proto",
+    "patches/libp2p-gossipsub",
+]
 
 # Explicitly set the resolver to version 2, which is the default for packages with edition >= 2021
 # https://doc.rust-lang.org/edition-guide/rust-2021/default-cargo-resolver.html
@@ -300,3 +305,6 @@ libp2p-quic = { path = "patches/libp2p-quic" }
 # Release per-peer connection accounting after the last connection closes.
 # See patches/libp2p-connection-limits/PATCH.md for provenance and retirement criteria.
 libp2p-connection-limits = { path = "patches/libp2p-connection-limits" }
+# Expire unanswered IWANT promises on every heartbeat, not only while peer scoring is active.
+# See patches/libp2p-gossipsub/PATCH.md for provenance and retirement criteria.
+libp2p-gossipsub = { path = "patches/libp2p-gossipsub" }

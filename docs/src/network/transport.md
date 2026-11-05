@@ -50,6 +50,7 @@ The per-peer connection ceiling is not a config field: it is fixed in code and i
 | Max connection data | 100 MiB | Unacknowledged bytes in flight across all streams of a connection |
 | Swarm idle connection timeout | 65 s | How long the swarm keeps an idle connection alive |
 | Established connections per peer | 8 | Concurrent connections one peer may hold, inbound and outbound combined |
+| Inbound accept task | inline | Where a listener decides on inbound attempts and accepts them; the spawned mode with a capacity is a measurement prototype (issue #1741), see [Inbound capacity qualification](inbound-capacity-qualification.md) |
 
 The effective handshake ceiling is the smaller of the handshake timeout and the max idle timeout, so a handshake in practice has 30 seconds, not 65.
 The keep-alive interval is set well below the idle timeout on purpose: a healthy but quiet connection is refreshed roughly six times before it would expire.

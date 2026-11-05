@@ -27,14 +27,15 @@ use std::{
     hash::{Hash, Hasher},
     io,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket},
+    num::NonZeroUsize,
     pin::Pin,
     task::{Context, Poll, Waker},
     time::Duration,
 };
 
 use futures::{
-    channel::oneshot,
-    future::{BoxFuture, Either},
+    channel::{mpsc, oneshot},
+    future::{AbortHandle, BoxFuture, Either},
     prelude::*,
     ready,
     stream::{SelectAll, StreamExt},
@@ -85,6 +86,8 @@ pub struct GenTransport<P: Provider> {
     hole_punch_attempts: HashMap<SocketAddr, oneshot::Sender<Connecting>>,
     /// How listeners decide on incoming connection attempts.
     incoming_policy: IncomingPolicy,
+    /// See [`Config::inbound_accept_task`].
+    inbound_accept_task: Option<NonZeroUsize>,
 }
 
 #[expect(deprecated)]
@@ -94,6 +97,7 @@ impl<P: Provider> GenTransport<P> {
         let handshake_timeout = config.handshake_timeout;
         let support_draft_29 = config.support_draft_29;
         let incoming_policy = IncomingPolicy::new(&config);
+        let inbound_accept_task = config.inbound_accept_task;
         let quinn_config = config.into();
         Self {
             listeners: SelectAll::new(),
@@ -104,6 +108,7 @@ impl<P: Provider> GenTransport<P> {
             support_draft_29,
             hole_punch_attempts: Default::default(),
             incoming_policy,
+            inbound_accept_task,
         }
     }
 
@@ -241,6 +246,7 @@ impl<P: Provider> Transport for GenTransport<P> {
             self.handshake_timeout,
             version,
             self.incoming_policy.clone(),
+            self.inbound_accept_task,
         )?;
         self.listeners.push(listener);
 
@@ -421,6 +427,134 @@ impl From<Error> for TransportError<Error> {
     }
 }
 
+/// What one `Incoming::accept` gives: the handshake, or its error.
+type AcceptResult = Result<quinn::Connecting, quinn::ConnectionError>;
+
+/// Where a [`Listener`] gets its incoming connection attempts from.
+/// See [`Config::inbound_accept_task`].
+enum AcceptSource {
+    /// The listener decides on the attempts and accepts them inside
+    /// `Transport::poll`, on the swarm task (the default).
+    Inline {
+        /// A future to poll new incoming connections.
+        accept: BoxFuture<'static, Option<quinn::Incoming>>,
+    },
+    /// A task of the provider runtime decides on the attempts and accepts them;
+    /// the accepted handshakes wait in a bounded queue until the swarm takes them.
+    Spawned {
+        /// The accepted handshakes, in order.
+        accepted: mpsc::Receiver<AcceptResult>,
+        /// Stops the task when the listener goes away.
+        abort: AbortHandle,
+    },
+}
+
+impl AcceptSource {
+    /// The inline source for `endpoint`.
+    fn inline(endpoint: &quinn::Endpoint) -> Self {
+        let endpoint = endpoint.clone();
+        AcceptSource::Inline {
+            accept: async move { endpoint.accept().await }.boxed(),
+        }
+    }
+
+    /// Spawn the accept task for `endpoint` on the runtime of `P` and return the
+    /// source that reads its queue.
+    ///
+    /// The queue holds `capacity` accepted handshakes: a futures channel holds its
+    /// buffer plus one entry per sender, and the task is the only sender.
+    fn spawned<P: Provider>(
+        endpoint: &quinn::Endpoint,
+        policy: &IncomingPolicy,
+        capacity: NonZeroUsize,
+    ) -> Self {
+        let (tx, accepted) = mpsc::channel(capacity.get().saturating_sub(1));
+        let state = AcceptTaskState {
+            endpoint: endpoint.clone(),
+            policy: policy.clone(),
+            outcomes_since_yield: 0,
+        };
+        let forward = futures::stream::unfold(state, AcceptTaskState::step)
+            .filter_map(std::future::ready)
+            .map(Ok::<AcceptResult, mpsc::SendError>)
+            .forward(tx);
+        let (task, abort) = futures::future::abortable(forward);
+        P::spawn(task.map(drop));
+        AcceptSource::Spawned { accepted, abort }
+    }
+}
+
+impl Drop for AcceptSource {
+    fn drop(&mut self) {
+        match self {
+            AcceptSource::Inline { .. } => {}
+            AcceptSource::Spawned { abort, .. } => abort.abort(),
+        }
+    }
+}
+
+/// The state of the accept task between two attempts.
+struct AcceptTaskState {
+    /// The listening endpoint.
+    endpoint: quinn::Endpoint,
+    /// How to decide on the attempts.
+    policy: IncomingPolicy,
+    /// Retry, Refuse or Ignore outcomes handled since the task last yielded.
+    outcomes_since_yield: usize,
+}
+
+impl AcceptTaskState {
+    /// Wait for the next attempt and decide on it. `None` when the endpoint closed.
+    /// The item is `None` for an attempt that got a Retry, Refuse or Ignore
+    /// outcome, and the result of `Incoming::accept` otherwise.
+    async fn step(mut self) -> Option<(Option<AcceptResult>, Self)> {
+        let incoming = self.endpoint.accept().await?;
+        if self.policy.retry_unvalidated && !incoming.remote_address_validated() {
+            self.policy.decide_unvalidated(incoming);
+            self.yield_at_budget().await;
+            Some((None, self))
+        } else {
+            self.outcomes_since_yield = 0;
+            Some((Some(incoming.accept()), self))
+        }
+    }
+
+    /// Count one Retry, Refuse or Ignore outcome. At
+    /// [`Config::max_incoming_outcomes_per_poll`] consecutive outcomes, count the
+    /// yield, yield to the executor once and start over, so that a stream of
+    /// attempts cannot keep the task from yielding.
+    async fn yield_at_budget(&mut self) {
+        self.outcomes_since_yield = self.outcomes_since_yield.saturating_add(1);
+        if self.outcomes_since_yield >= self.policy.max_outcomes_per_poll.max(1) {
+            self.policy.stats.inc_budget_yields();
+            YieldNow::default().await;
+            self.outcomes_since_yield = 0;
+        }
+    }
+}
+
+/// A future that is pending on its first poll, wakes its task at once, and is
+/// ready on the second poll.
+#[derive(Default)]
+struct YieldNow {
+    /// Whether the first poll happened.
+    polled: bool,
+}
+
+impl Future for YieldNow {
+    type Output = ();
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        if self.polled {
+            Poll::Ready(())
+        } else {
+            self.polled = true;
+            cx.waker().wake_by_ref();
+            Poll::Pending
+        }
+    }
+}
+
 /// Listener for incoming connections.
 struct Listener<P: Provider> {
     /// Id of the listener.
@@ -435,8 +569,8 @@ struct Listener<P: Provider> {
     /// An underlying copy of the socket to be able to hole punch with
     socket: UdpSocket,
 
-    /// A future to poll new incoming connections.
-    accept: BoxFuture<'static, Option<quinn::Incoming>>,
+    /// Where the incoming connection attempts come from.
+    accept_source: AcceptSource,
     /// Timeout for connection establishment on inbound connections.
     handshake_timeout: Duration,
 
@@ -468,6 +602,7 @@ impl<P: Provider> Listener<P> {
         handshake_timeout: Duration,
         version: ProtocolVersion,
         incoming_policy: IncomingPolicy,
+        inbound_accept_task: Option<NonZeroUsize>,
     ) -> Result<Self, Error> {
         let if_watcher;
         let pending_event;
@@ -486,13 +621,15 @@ impl<P: Provider> Listener<P> {
             })
         }
 
-        let endpoint_c = endpoint.clone();
-        let accept = async move { endpoint_c.accept().await }.boxed();
+        let accept_source = inbound_accept_task.map_or_else(
+            || AcceptSource::inline(&endpoint),
+            |capacity| AcceptSource::spawned::<P>(&endpoint, &incoming_policy, capacity),
+        );
 
         Ok(Listener {
             endpoint,
             socket,
-            accept,
+            accept_source,
             listener_id,
             version,
             handshake_timeout,
@@ -505,38 +642,92 @@ impl<P: Provider> Listener<P> {
         })
     }
 
-    /// Poll for the next incoming attempt that gets a handshake, and re-arm the
-    /// accept future.
+    /// Poll for the next accepted handshake (or the error of its
+    /// `Incoming::accept`). `Poll::Ready(None)` means that the endpoint closed.
     ///
-    /// When [`Config::retry_unvalidated_incoming`] is set, attempts from addresses
+    /// With the inline source ([`Config::inbound_accept_task`] is `None`) this
+    /// decides on the attempts here, on the swarm task: when
+    /// [`Config::retry_unvalidated_incoming`] is set, attempts from addresses
     /// that are not validated get a Retry (or Ignore / Refuse) here and never reach
     /// the caller. At most [`Config::max_incoming_outcomes_per_poll`] such outcomes
     /// are handled per call. Then the task is woken and `Poll::Pending` is returned,
     /// so that the task yields to the executor. After each outcome the new accept
     /// future is polled, so that it registers the waker.
-    fn poll_accept(&mut self, cx: &mut Context<'_>) -> Poll<Option<quinn::Incoming>> {
-        let budget = self.incoming_policy.max_outcomes_per_poll.max(1);
-        let flow = (0..budget).try_fold((), |(), _| match self.accept.poll_unpin(cx) {
-            Poll::Ready(Some(incoming)) => {
-                let endpoint = self.endpoint.clone();
-                self.accept = async move { endpoint.accept().await }.boxed();
-                if self.incoming_policy.retry_unvalidated && !incoming.remote_address_validated() {
-                    self.incoming_policy.decide_unvalidated(incoming);
-                    std::ops::ControlFlow::Continue(())
-                } else {
-                    std::ops::ControlFlow::Break(Poll::Ready(Some(incoming)))
+    ///
+    /// With the spawned source the accept task did all of that, and this only
+    /// takes the next entry out of the bounded queue.
+    fn poll_accept(&mut self, cx: &mut Context<'_>) -> Poll<Option<AcceptResult>> {
+        let Listener {
+            accept_source,
+            endpoint,
+            incoming_policy,
+            ..
+        } = self;
+        match accept_source {
+            AcceptSource::Inline { accept } => {
+                let budget = incoming_policy.max_outcomes_per_poll.max(1);
+                let flow = (0..budget).try_fold((), |(), _| match accept.poll_unpin(cx) {
+                    Poll::Ready(Some(incoming)) => {
+                        let endpoint = endpoint.clone();
+                        *accept = async move { endpoint.accept().await }.boxed();
+                        if incoming_policy.retry_unvalidated && !incoming.remote_address_validated()
+                        {
+                            incoming_policy.decide_unvalidated(incoming);
+                            std::ops::ControlFlow::Continue(())
+                        } else {
+                            std::ops::ControlFlow::Break(Poll::Ready(Some(incoming)))
+                        }
+                    }
+                    other => std::ops::ControlFlow::Break(other),
+                });
+                match flow {
+                    std::ops::ControlFlow::Break(poll) => {
+                        poll.map(|incoming| incoming.map(quinn::Incoming::accept))
+                    }
+                    std::ops::ControlFlow::Continue(()) => {
+                        incoming_policy.stats.inc_budget_yields();
+                        cx.waker().wake_by_ref();
+                        Poll::Pending
+                    }
                 }
             }
-            other => std::ops::ControlFlow::Break(other),
-        });
-        match flow {
-            std::ops::ControlFlow::Break(poll) => poll,
-            std::ops::ControlFlow::Continue(()) => {
-                self.incoming_policy.stats.inc_budget_yields();
-                cx.waker().wake_by_ref();
-                Poll::Pending
-            }
+            AcceptSource::Spawned { accepted, .. } => accepted.poll_next_unpin(cx),
         }
+    }
+
+    /// Count an accepted handshake and build the [`TransportEvent::Incoming`] for it.
+    fn incoming_event(&self, connecting: quinn::Connecting) -> <Self as Stream>::Item {
+        self.incoming_policy.stats.inc_accepted();
+
+        let local_addr = socketaddr_to_multiaddr(&self.socket_addr(), self.version);
+        let remote_addr = connecting.remote_address();
+        let send_back_addr = socketaddr_to_multiaddr(&remote_addr, self.version);
+
+        TransportEvent::Incoming {
+            upgrade: Connecting::new(connecting, self.handshake_timeout)
+                .observe_incoming(&self.incoming_policy.stats),
+            local_addr,
+            send_back_addr,
+            listener_id: self.listener_id,
+        }
+    }
+
+    /// Count a failed `Incoming::accept` and build the
+    /// [`TransportEvent::ListenerError`] for it.
+    fn accept_failed_event(&self, error: quinn::ConnectionError) -> <Self as Stream>::Item {
+        self.incoming_policy.stats.inc_accept_failed();
+        TransportEvent::ListenerError {
+            listener_id: self.listener_id,
+            error: Error::Connection(crate::ConnectionError(error)),
+        }
+    }
+
+    /// The event for the result of one `Incoming::accept`.
+    fn accepted_event(&self, accepted: AcceptResult) -> <Self as Stream>::Item {
+        accepted.map_or_else(
+            |error| self.accept_failed_event(error),
+            |connecting| self.incoming_event(connecting),
+        )
     }
 
     /// Report the listener as closed in a [`TransportEvent::ListenerClosed`] and
@@ -633,32 +824,8 @@ impl<P: Provider> Stream for Listener<P> {
             }
 
             match self.poll_accept(cx) {
-                Poll::Ready(Some(incoming)) => {
-                    let connecting = match incoming.accept() {
-                        Ok(connecting) => connecting,
-                        Err(error) => {
-                            self.incoming_policy.stats.inc_accept_failed();
-                            return Poll::Ready(Some(TransportEvent::ListenerError {
-                                listener_id: self.listener_id,
-                                error: Error::Connection(crate::ConnectionError(error)),
-                            }));
-                        }
-                    };
-
-                    self.incoming_policy.stats.inc_accepted();
-
-                    let local_addr = socketaddr_to_multiaddr(&self.socket_addr(), self.version);
-                    let remote_addr = connecting.remote_address();
-                    let send_back_addr = socketaddr_to_multiaddr(&remote_addr, self.version);
-
-                    let event = TransportEvent::Incoming {
-                        upgrade: Connecting::new(connecting, self.handshake_timeout)
-                            .observe_incoming(&self.incoming_policy.stats),
-                        local_addr,
-                        send_back_addr,
-                        listener_id: self.listener_id,
-                    };
-                    return Poll::Ready(Some(event));
+                Poll::Ready(Some(accepted)) => {
+                    return Poll::Ready(Some(self.accepted_event(accepted)));
                 }
                 Poll::Ready(None) => {
                     self.close(Ok(()));

@@ -42,6 +42,7 @@ use tn_types::{
 };
 use tokio::sync::{mpsc, oneshot, OwnedSemaphorePermit, Semaphore};
 use tracing::{debug, info, warn};
+pub(crate) mod gap_policy;
 pub mod handler;
 mod message;
 mod sync_codec;
@@ -60,34 +61,41 @@ pub(crate) type Res = PrimaryResponse;
 /// The primary serves inbound sync requests from one serve pool per class (epoch pack, missing
 /// certificates, consensus output; see `SyncServePools`), so a flood of one class cannot
 /// starve another. Any peer may take one of these permits. Each pool also holds
-/// `COMMITTEE_RESERVED_SYNC_STREAMS` permits that only a peer of the current or the next
-/// committee may take. A serve permit is held only while its request is served, never during
-/// the opening read (see `MAX_CONCURRENT_OPENING_READS`).
+/// `COMMITTEE_RESERVED_SYNC_STREAMS` permits per committee key, and only that key of the
+/// current or the next committee may take them. A serve permit is held only while its request
+/// is served, never during the opening read (see `MAX_CONCURRENT_OPENING_READS`).
 pub const MAX_CONCURRENT_EPOCH_STREAMS: usize = 5;
 
-/// Committee reserve of each inbound sync serve class.
+/// Reserve of each committee key in each inbound sync serve class.
 ///
-/// Each serve pool holds this many permits on top of its public share
-/// ([`MAX_CONCURRENT_EPOCH_STREAMS`]), and only a committee-tier peer may take them. Four is two
-/// committee peers at the per-peer cap ([`MAX_PENDING_REQUESTS_PER_PEER`]), so peers outside the
-/// committee that fill the public share cannot stop a lagging validator from fetching
-/// certificates and epoch packs from committee primaries. See GHSA-9h5w-9282-pc3g.
-pub(crate) const COMMITTEE_RESERVED_SYNC_STREAMS: usize = 4;
+/// Each serve pool holds this many permits for each key of the current or the next committee,
+/// on top of its public share ([`MAX_CONCURRENT_EPOCH_STREAMS`]). Only that key may take them,
+/// and no other key can take from its reserve. So peers outside the committee that fill the
+/// public share, and committee keys that hold streams without progress, cannot stop a different
+/// committee key from catching up (issue #1750). The per-peer cap
+/// ([`MAX_PENDING_REQUESTS_PER_PEER`], 2) lets a committee key open one more stream from the
+/// public share. See GHSA-9h5w-9282-pc3g.
+pub(crate) const COMMITTEE_RESERVED_SYNC_STREAMS: usize = 1;
 
 /// Public share of the opening-read budget for inbound sync streams.
 ///
 /// A permit is held only while the responder waits up to [`opening_read_bound`] (1 s public,
 /// 5 s committee) for the opening request frame of a stream. It is released as soon as that
 /// read ends, whatever its result, so no serve, control write or close holds it. In the worst
-/// case this many opening reads (plus the committee reserve) are in flight, each bounded by
-/// [`MAX_SYNC_REQUEST_FRAME_SIZE`].
+/// case this many opening reads (plus the reserve of each committee key) are in flight, each
+/// bounded by [`MAX_SYNC_REQUEST_FRAME_SIZE`].
 pub(crate) const MAX_CONCURRENT_OPENING_READS: usize = 8;
 
-/// Committee reserve of the opening-read budget for inbound sync streams.
+/// Reserve of each committee key in the opening-read budget for inbound sync streams.
 ///
-/// Only a committee-tier peer may take these permits, so silent streams from peers outside the
-/// committee cannot stop a committee peer from sending its request.
-pub(crate) const COMMITTEE_RESERVED_OPENING_READS: usize = 4;
+/// The budget holds this many permits for each key of the current or the next committee, on top
+/// of its public share ([`MAX_CONCURRENT_OPENING_READS`]). Only that key may take them, and no
+/// other key can take from its reserve. So silent streams from peers outside the committee, and
+/// committee keys that hold streams without progress, cannot stop a different committee key from
+/// sending its request and catching up (issue #1750). The per-peer cap
+/// ([`MAX_PENDING_REQUESTS_PER_PEER`], 2) lets a committee key open one more stream from the
+/// public share.
+pub(crate) const COMMITTEE_RESERVED_OPENING_READS: usize = 1;
 
 /// Maximum number of concurrent `EpochRecord` request-response serves across all peers.
 ///
@@ -502,8 +510,8 @@ impl SyncClass {
 /// The serve pools of the inbound sync path: one [`ReservedPool`] for each [`SyncClass`].
 ///
 /// Each pool has [`MAX_CONCURRENT_EPOCH_STREAMS`] public permits plus
-/// [`COMMITTEE_RESERVED_SYNC_STREAMS`] permits that only a committee-tier peer may take. A clone
-/// shares the same permits.
+/// [`COMMITTEE_RESERVED_SYNC_STREAMS`] permits per committee key, which only that key may take.
+/// A clone shares the same permits.
 #[derive(Clone, Debug)]
 pub(crate) struct SyncServePools {
     /// The pool for full and partial epoch-pack serves.
@@ -515,7 +523,7 @@ pub(crate) struct SyncServePools {
 }
 
 impl SyncServePools {
-    /// Create the three serve pools, each with its public share and its committee reserve.
+    /// Create the three serve pools, each with its public share and a reserve per committee key.
     pub(crate) fn new() -> Self {
         let pool =
             || ReservedPool::new(MAX_CONCURRENT_EPOCH_STREAMS, COMMITTEE_RESERVED_SYNC_STREAMS);
@@ -652,17 +660,19 @@ enum SyncOpening {
 
 impl SyncOpening {
     /// Classify a readable opening frame and, for a `Req`, try to take a serve permit of its
-    /// class for a peer of `tier`.
+    /// class for `peer`, a peer of `tier`. A committee-tier `peer` takes a permit from its own
+    /// reserve first and then from the public share.
     fn of_frame(
         frame: SyncFrame<PrimarySyncRequest>,
         pools: &SyncServePools,
+        peer: &BlsPublicKey,
         tier: PeerTier,
     ) -> Self {
         match frame {
             SyncFrame::Req(request) => {
                 let class = SyncClass::of(&request);
                 let admitted = |permit| Self::Admitted { request, class, permit };
-                pools.pool(class).try_acquire(tier).map_or(Self::AtCapacity(class), admitted)
+                pools.pool(class).try_acquire(peer, tier).map_or(Self::AtCapacity(class), admitted)
             }
             SyncFrame::Ack
             | SyncFrame::Deny(_)
@@ -727,7 +737,7 @@ pub(crate) async fn admit_and_serve_sync_stream<S, F, Fut>(
                 warn!(target: "primary::network", %peer, ?tier, ?e, "unreadable sync request frame");
                 SyncOpening::Unreadable
             },
-            |frame| SyncOpening::of_frame(frame, &serve_pools, tier),
+            |frame| SyncOpening::of_frame(frame, &serve_pools, &peer, tier),
         )
     });
     let elapsed = opened.elapsed();
@@ -2034,9 +2044,9 @@ pub struct PrimaryNetwork<DB, Events> {
     /// Hold a reference to the consensus chain.
     consensus_chain: ConsensusChain,
     /// Opening-read budget for inbound sync streams: [`MAX_CONCURRENT_OPENING_READS`] public
-    /// permits plus [`COMMITTEE_RESERVED_OPENING_READS`] committee-only permits. A permit is held
-    /// only while the opening request frame is read (bounded by [`opening_read_bound`], 1 s
-    /// public, 5 s committee).
+    /// permits plus [`COMMITTEE_RESERVED_OPENING_READS`] permits per committee key, which only
+    /// that key may take. A permit is held only while the opening request frame is read (bounded
+    /// by [`opening_read_bound`], 1 s public, 5 s committee).
     sync_opening: ReservedPool,
     /// Serve pools for inbound sync requests, one per [`SyncClass`]. A permit is held only while
     /// its request is served.
@@ -2363,7 +2373,7 @@ where
     /// Admission runs on stream open, ahead of any task spawn (#1308). The stream takes a slot
     /// under the per-peer cap ([`MAX_PENDING_REQUESTS_PER_PEER`]) and a permit from the
     /// opening-read budget ([`MAX_CONCURRENT_OPENING_READS`], plus
-    /// [`COMMITTEE_RESERVED_OPENING_READS`] for a committee-tier peer). A stream that misses
+    /// [`COMMITTEE_RESERVED_OPENING_READS`] per committee key). A stream that misses
     /// either takes the bounded shed path ([`Self::shed_inbound_sync_stream`]), which writes
     /// [`DenyReason::AtCapacity`] without reading so the requester retries elsewhere at once.
     ///
@@ -2372,16 +2382,17 @@ where
     /// opening-read permit, and takes a permit from the serve pool of the request's class
     /// ([`SyncServePools`]) before [`RequestHandler`] serves it. The per-peer slot is held for the
     /// life of the task and the serve permit only while the serve runs, so a silent peer holds no
-    /// serve capacity. A peer of the current or the next committee may take the committee
-    /// reserve of each budget, so peers outside the committee cannot stop a lagging validator
-    /// from syncing. See GHSA-9h5w-9282-pc3g.
+    /// serve capacity. Each key of the current or the next committee may take its own reserve
+    /// in each budget, and no other key can take from it. So neither peers outside the committee
+    /// nor other committee keys can stop a lagging validator from syncing. See
+    /// GHSA-9h5w-9282-pc3g and issue #1750.
     fn process_inbound_sync_stream(&self, peer: BlsPublicKey, stream: Stream) {
         let tier = self.reserved_peers.tier(&peer);
         // take both admission grants before spawning; a stream that misses either takes the
         // bounded shed path instead, so over-cap substream bursts cannot fan out past the shed
         // budget (#1308)
         let Some((slot, opening)) =
-            self.sync_peer_slots.try_take(peer).zip(self.sync_opening.try_acquire(tier))
+            self.sync_peer_slots.try_take(peer).zip(self.sync_opening.try_acquire(&peer, tier))
         else {
             self.shed_inbound_sync_stream(peer, stream);
             return;
@@ -2596,12 +2607,13 @@ mod sync_admission_tests {
         pools.pool(class).available_public() == MAX_CONCURRENT_EPOCH_STREAMS
     }
 
-    /// True when every serve pool still has all of its public and reserved permits.
-    fn serve_pools_untouched(pools: &SyncServePools) -> bool {
+    /// True when every serve pool still has all of its public permits and all of the reserved
+    /// permits of `committee`.
+    fn serve_pools_untouched(pools: &SyncServePools, committee: &BlsPublicKey) -> bool {
         let whole = |class: SyncClass| {
             let pool = pools.pool(class);
             pool.available_public() == MAX_CONCURRENT_EPOCH_STREAMS
-                && pool.available_reserved() == COMMITTEE_RESERVED_SYNC_STREAMS
+                && pool.available_reserved(committee) == COMMITTEE_RESERVED_SYNC_STREAMS
         };
         CLASSES.into_iter().all(whole)
     }
@@ -2741,7 +2753,7 @@ mod sync_admission_tests {
         /// task. `None` when the stream would be shed.
         fn open_silent_stream(&self, peer: BlsPublicKey) -> Option<JoinHandle<()>> {
             let tier = self.reserved.tier(&peer);
-            let grants = self.slots.try_take(peer).zip(self.opening.try_acquire(tier));
+            let grants = self.slots.try_take(peer).zip(self.opening.try_acquire(&peer, tier));
             grants.map(|(slot, opening)| {
                 let grant = SyncAdmission { peer, tier, slot, opening };
                 let (pools, net) = (self.pools.clone(), self.handle.clone());
@@ -2768,7 +2780,7 @@ mod sync_admission_tests {
             Fut: Future<Output = SyncServeOutcome> + Send + 'static,
         {
             let tier = self.reserved.tier(&peer);
-            let grants = self.slots.try_take(peer).zip(self.opening.try_acquire(tier));
+            let grants = self.slots.try_take(peer).zip(self.opening.try_acquire(&peer, tier));
             grants.map(|(slot, opening)| {
                 let grant = SyncAdmission { peer, tier, slot, opening };
                 let (pools, net) = (self.pools.clone(), self.handle.clone());
@@ -2899,7 +2911,9 @@ mod sync_admission_tests {
         // the opening read ended at once, and its permit is free while the close or the control
         // write is still pending
         assert_eq!(responder.opening.available_public(), MAX_CONCURRENT_OPENING_READS);
-        assert_eq!(responder.opening.available_reserved(), COMMITTEE_RESERVED_OPENING_READS);
+        let reserves: Vec<_> =
+            peers.iter().map(|peer| responder.opening.available_reserved(peer)).collect();
+        assert_eq!(reserves, vec![COMMITTEE_RESERVED_OPENING_READS; peers.len()]);
         assert!(opened.as_ref().is_some_and(|tasks| tasks.iter().all(|task| !task.is_finished())));
         assert_eq!(responder.in_flight(peers), vec![1; peers.len()]);
         // the bounded close or control write gives up, and the task ends
@@ -2913,21 +2927,23 @@ mod sync_admission_tests {
         std::iter::from_fn(|| commands.try_recv().ok()).map(mild_penalty_peer).collect()
     }
 
-    /// Public keys that fill the public share of a serve class cannot lock out a committee key.
-    /// Three public keys at the per-peer cap (two, two and one streams) fill the share of five, a
-    /// fourth public key is refused, the committee key is served from the reserve, the other
-    /// classes keep their whole share, and released permits refill the public share.
+    /// Public keys that fill the public share of a serve class cannot lock out a committee key,
+    /// and one committee key cannot take the reserve of another (issue #1750). Three public keys
+    /// at the per-peer cap (two, two and one streams) fill the share of five, and a fourth public
+    /// key is refused. A committee key is served from its own reserve until that reserve is empty,
+    /// and then it is refused. A second committee key still has its whole reserve and is served.
+    /// The other classes keep their whole share, and released permits refill the public share.
     #[test]
     fn committee_key_is_served_when_public_keys_fill_a_serve_class() {
-        let committee = key(1);
-        let reserved = ReservedPeers::new([committee]);
+        let (committee, other) = (key(1), key(4));
+        let reserved = ReservedPeers::new([committee, other]);
         let slots = PeerSlots::new(MAX_PENDING_REQUESTS_PER_PEER);
         let pools = SyncServePools::new();
         let pool = pools.pool(SyncClass::EpochPack);
         let held: Option<Vec<_>> = [(key(10), 2), (key(11), 2), (key(12), 1)]
             .into_iter()
             .flat_map(|(peer, count)| std::iter::repeat_n(peer, count))
-            .map(|peer| slots.try_take(peer).zip(pool.try_acquire(reserved.tier(&peer))))
+            .map(|peer| slots.try_take(peer).zip(pool.try_acquire(&peer, reserved.tier(&peer))))
             .collect();
         assert_eq!(held.as_ref().map(Vec::len), Some(MAX_CONCURRENT_EPOCH_STREAMS));
         assert_eq!(pool.available_public(), 0);
@@ -2935,44 +2951,70 @@ mod sync_admission_tests {
         assert!(slots.try_take(key(10)).is_none());
         // a fourth public key has a free slot but no serve permit
         assert!(slots.try_take(key(13)).is_some());
-        assert!(pool.try_acquire(reserved.tier(&key(13))).is_none());
-        // the committee key is served from the reserve
+        assert!(pool.try_acquire(&key(13), reserved.tier(&key(13))).is_none());
+        // the committee key is served from its own reserve until that reserve is empty
         assert_eq!(reserved.tier(&committee), PeerTier::Committee);
-        let committee_permit = pool.try_acquire(reserved.tier(&committee));
-        assert!(committee_permit.is_some());
-        assert_eq!(pool.available_reserved(), COMMITTEE_RESERVED_SYNC_STREAMS.saturating_sub(1));
+        let committee_permits: Option<Vec<_>> =
+            std::iter::repeat_with(|| pool.try_acquire(&committee, reserved.tier(&committee)))
+                .take(COMMITTEE_RESERVED_SYNC_STREAMS)
+                .collect();
+        assert!(committee_permits.is_some());
+        assert_eq!(pool.available_reserved(&committee), 0);
+        assert!(pool.try_acquire(&committee, reserved.tier(&committee)).is_none());
+        // a second committee key keeps its whole reserve and is still served
+        assert_eq!(pool.available_reserved(&other), COMMITTEE_RESERVED_SYNC_STREAMS);
+        let other_permit = pool.try_acquire(&other, reserved.tier(&other));
+        assert!(other_permit.is_some());
+        assert_eq!(
+            pool.available_reserved(&other),
+            COMMITTEE_RESERVED_SYNC_STREAMS.saturating_sub(1)
+        );
         // a flood of one class does not touch the other classes
         assert!(public_share_whole(&pools, SyncClass::MissingCertificates));
         assert!(public_share_whole(&pools, SyncClass::ConsensusOutput));
         // released permits refill the public share
         drop(held);
         assert_eq!(pool.available_public(), MAX_CONCURRENT_EPOCH_STREAMS);
-        assert!(pool.try_acquire(reserved.tier(&key(13))).is_some());
+        assert!(pool.try_acquire(&key(13), reserved.tier(&key(13))).is_some());
     }
 
     /// Opening reads draw only on the opening-read budget. Four public keys at the per-peer cap
-    /// fill its public share of eight, a fifth public key is refused, a committee key still
-    /// opens from the reserve, and every serve pool stays whole.
+    /// fill its public share of eight, and a fifth public key is refused. A committee key opens
+    /// from its own reserve until that reserve is empty, and then it is refused. A second
+    /// committee key still has its whole reserve and opens from it (issue #1750). Every serve
+    /// pool stays whole.
     #[test]
     fn opening_reads_leave_the_serve_pools_untouched() {
-        let committee = key(2);
-        let reserved = ReservedPeers::new([committee]);
+        let (committee, other) = (key(2), key(5));
+        let reserved = ReservedPeers::new([committee, other]);
         let slots = PeerSlots::new(MAX_PENDING_REQUESTS_PER_PEER);
         let opening = opening_pool();
         let pools = SyncServePools::new();
         let held: Option<Vec<_>> = (20..24)
             .flat_map(|seed| std::iter::repeat_n(key(seed), MAX_PENDING_REQUESTS_PER_PEER))
-            .map(|peer| slots.try_take(peer).zip(opening.try_acquire(reserved.tier(&peer))))
+            .map(|peer| slots.try_take(peer).zip(opening.try_acquire(&peer, reserved.tier(&peer))))
             .collect();
         assert_eq!(held.as_ref().map(Vec::len), Some(MAX_CONCURRENT_OPENING_READS));
         assert_eq!(opening.available_public(), 0);
-        assert!(opening.try_acquire(reserved.tier(&key(24))).is_none());
-        let committee_opening = opening.try_acquire(reserved.tier(&committee));
+        assert!(opening.try_acquire(&key(24), reserved.tier(&key(24))).is_none());
+        // the committee key opens from its own reserve until that reserve is empty
+        let committee_opening: Option<Vec<_>> =
+            std::iter::repeat_with(|| opening.try_acquire(&committee, reserved.tier(&committee)))
+                .take(COMMITTEE_RESERVED_OPENING_READS)
+                .collect();
         assert!(committee_opening.is_some());
-        assert!(serve_pools_untouched(&pools));
-        drop((held, committee_opening));
+        assert_eq!(opening.available_reserved(&committee), 0);
+        assert!(opening.try_acquire(&committee, reserved.tier(&committee)).is_none());
+        // a second committee key keeps its whole reserve and still opens
+        assert_eq!(opening.available_reserved(&other), COMMITTEE_RESERVED_OPENING_READS);
+        let other_opening = opening.try_acquire(&other, reserved.tier(&other));
+        assert!(other_opening.is_some());
+        assert!(serve_pools_untouched(&pools, &committee));
+        assert!(serve_pools_untouched(&pools, &other));
+        drop((held, committee_opening, other_opening));
         assert_eq!(opening.available_public(), MAX_CONCURRENT_OPENING_READS);
-        assert_eq!(opening.available_reserved(), COMMITTEE_RESERVED_OPENING_READS);
+        assert_eq!(opening.available_reserved(&committee), COMMITTEE_RESERVED_OPENING_READS);
+        assert_eq!(opening.available_reserved(&other), COMMITTEE_RESERVED_OPENING_READS);
     }
 
     /// Silent streams hold only the opening-read budget, and only until the opening read for
@@ -3004,26 +3046,35 @@ mod sync_admission_tests {
 
         // 750 ms: four opening reads are in flight, and no serve permit is taken
         assert_eq!(responder.opening.available_public(), open_cap.saturating_sub(3));
-        assert_eq!(responder.opening.available_reserved(), open_reserve.saturating_sub(1));
+        assert_eq!(
+            responder.opening.available_reserved(&committee),
+            open_reserve.saturating_sub(1)
+        );
         assert_eq!(responder.in_flight(&peers), vec![1, 1, 1, 1]);
-        assert!(serve_pools_untouched(&responder.pools));
+        assert!(serve_pools_untouched(&responder.pools, &committee));
 
         // 1125 ms: only the first public read timed out, and only its peer is charged
         tokio::time::advance(opening_step().saturating_add(opening_step() / 2)).await;
         settle().await;
         assert_eq!(responder.opening.available_public(), open_cap.saturating_sub(2));
-        assert_eq!(responder.opening.available_reserved(), open_reserve.saturating_sub(1));
+        assert_eq!(
+            responder.opening.available_reserved(&committee),
+            open_reserve.saturating_sub(1)
+        );
         assert_eq!(responder.in_flight(&peers), vec![1, 0, 1, 1]);
-        assert!(serve_pools_untouched(&responder.pools));
+        assert!(serve_pools_untouched(&responder.pools, &committee));
         assert_eq!(charged(), vec![Some(first)]);
 
         // 1625 ms: the other public reads timed out, and the public share is whole again
         tokio::time::advance(opening_step().saturating_mul(2)).await;
         settle().await;
         assert_eq!(responder.opening.available_public(), open_cap);
-        assert_eq!(responder.opening.available_reserved(), open_reserve.saturating_sub(1));
+        assert_eq!(
+            responder.opening.available_reserved(&committee),
+            open_reserve.saturating_sub(1)
+        );
         assert_eq!(responder.in_flight(&peers), vec![1, 0, 0, 0]);
-        assert!(serve_pools_untouched(&responder.pools));
+        assert!(serve_pools_untouched(&responder.pools, &committee));
         let later = charged();
         assert_eq!(later.len(), 2);
         assert!(later.contains(&Some(second)) && later.contains(&Some(third)));
@@ -3033,10 +3084,10 @@ mod sync_admission_tests {
         tokio::time::advance(opening_read_bound(PeerTier::Committee)).await;
         settle().await;
         assert_eq!(responder.opening.available_public(), open_cap);
-        assert_eq!(responder.opening.available_reserved(), open_reserve);
+        assert_eq!(responder.opening.available_reserved(&committee), open_reserve);
         assert_eq!(responder.in_flight(&peers), vec![0, 0, 0, 0]);
         assert!(tasks.is_some_and(|tasks| tasks.iter().all(JoinHandle::is_finished)));
-        assert!(serve_pools_untouched(&responder.pools));
+        assert!(serve_pools_untouched(&responder.pools, &committee));
         assert!(!responder.served.load(Ordering::SeqCst));
         assert!(charged().is_empty());
     }
@@ -3052,7 +3103,7 @@ mod sync_admission_tests {
         let peers = [committee, public];
         let charged = open_stuck_streams(&responder, &mut commands, &peers, &[]).await;
         assert_eq!(charged, vec![Some(public)]);
-        assert!(serve_pools_untouched(&responder.pools));
+        assert!(serve_pools_untouched(&responder.pools, &committee));
     }
 
     /// A stream whose opening frame is not a request frees its opening permit as soon as the
@@ -3066,7 +3117,7 @@ mod sync_admission_tests {
         let wire = encoded(SyncFrame::Ack).await;
         let charged = open_stuck_streams(&responder, &mut commands, &peers, &wire).await;
         assert_eq!(charged, vec![Some(public)]);
-        assert!(serve_pools_untouched(&responder.pools));
+        assert!(serve_pools_untouched(&responder.pools, &committee));
     }
 
     /// A request for a class whose public share is full is refused: it frees its opening permit
@@ -3077,24 +3128,26 @@ mod sync_admission_tests {
         let (committee, first, second) = (key(6), key(60), key(61));
         let (responder, mut commands) = Responder::new(committee);
         let pool = responder.pools.pool(SyncClass::EpochPack);
-        let held: Option<Vec<_>> = std::iter::repeat_with(|| pool.try_acquire(PeerTier::Public))
-            .take(MAX_CONCURRENT_EPOCH_STREAMS)
-            .collect();
+        let held: Option<Vec<_>> =
+            std::iter::repeat_with(|| pool.try_acquire(&key(62), PeerTier::Public))
+                .take(MAX_CONCURRENT_EPOCH_STREAMS)
+                .collect();
         assert_eq!(held.as_ref().map(Vec::len), Some(MAX_CONCURRENT_EPOCH_STREAMS));
         let wire = encoded(SyncFrame::Req(PrimarySyncRequest::EpochPack { epoch: 0 })).await;
         let peers = [first, second];
         let charged = open_stuck_streams(&responder, &mut commands, &peers, &wire).await;
         assert_eq!(charged, vec![]);
-        assert_eq!(pool.available_reserved(), COMMITTEE_RESERVED_SYNC_STREAMS);
+        assert_eq!(pool.available_reserved(&committee), COMMITTEE_RESERVED_SYNC_STREAMS);
         drop(held);
-        assert!(serve_pools_untouched(&responder.pools));
+        assert!(serve_pools_untouched(&responder.pools, &committee));
     }
 
     /// A valid request that arrives in the second half of the public opening window is admitted
     /// and served, but charged, so four identities cannot park eight opening permits for free.
     #[tokio::test(start_paused = true)]
     async fn late_valid_public_openings_are_charged() {
-        let (responder, mut commands) = Responder::new(key(9));
+        let committee = key(9);
+        let (responder, mut commands) = Responder::new(committee);
         let peers = [key(90), key(91), key(92), key(93)];
         let late = PUBLIC_SYNC_REQUEST_READ_TIMEOUT.saturating_sub(Duration::from_millis(1));
         let wire = encoded(SyncFrame::Req(PrimarySyncRequest::EpochPack { epoch: 0 })).await;
@@ -3119,9 +3172,12 @@ mod sync_admission_tests {
         assert!(opened.is_some_and(|tasks| tasks.iter().all(JoinHandle::is_finished)));
         assert!(responder.served.load(Ordering::SeqCst));
         assert_eq!(responder.opening.available_public(), MAX_CONCURRENT_OPENING_READS);
-        assert_eq!(responder.opening.available_reserved(), COMMITTEE_RESERVED_OPENING_READS);
+        assert_eq!(
+            responder.opening.available_reserved(&committee),
+            COMMITTEE_RESERVED_OPENING_READS
+        );
         assert_eq!(responder.in_flight(&peers), vec![0; peers.len()]);
-        assert!(serve_pools_untouched(&responder.pools));
+        assert!(serve_pools_untouched(&responder.pools, &committee));
         // every late opening costs one mild penalty, two per key
         let reports = std::iter::from_fn(|| commands.try_recv().ok());
         let charged: Vec<_> = reports.map(mild_penalty_peer).collect();
@@ -3194,7 +3250,7 @@ mod sync_admission_tests {
         tokio::time::advance(Duration::from_millis(2)).await;
         settle().await;
         assert!(task.is_some_and(|task| task.is_finished()));
-        assert!(serve_pools_untouched(&responder.pools));
+        assert!(serve_pools_untouched(&responder.pools, &committee));
         assert_eq!(responder.in_flight(&[public]), vec![0]);
         let reports = std::iter::from_fn(|| commands.try_recv().ok());
         let charged: Vec<_> = reports.map(mild_penalty_peer).collect();

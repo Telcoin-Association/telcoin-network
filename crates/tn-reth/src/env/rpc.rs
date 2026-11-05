@@ -19,6 +19,9 @@
 //! Epoch-priced simulation replacements also return registration errors. The eth
 //! methods (`crate::rpc_call`, `crate::rpc_bundle`) and debug methods (`crate::rpc_debug`)
 //! are installed only on transports configured to expose their corresponding namespace.
+//! With `--forward-txs`, the submission install is the forwarding handler
+//! (`crate::rpc_tx_forward`) instead of the fee-cap guard: it enforces the same cap, then
+//! relays to the configured validators rather than delegating to the local pool.
 //!
 //! Endpoints are derived per worker: [`RethEnv::start_rpc`] shifts the operator's
 //! configured http/ws ports into a per-worker band and suffixes the IPC path with the
@@ -50,6 +53,7 @@ use crate::{
     rpc_fee_history::{EpochFeeHistoryServer as _, FeeHistoryWithEpochBaseFee},
     rpc_fill_transaction::{EpochFillTransactionServer as _, FillTransactionWithEpochBaseFee},
     rpc_gas_price::{EpochGasPriceServer as _, GasPriceWithEpochBaseFee},
+    rpc_tx_forward::{EthSubmitForwarded, ForwardedEthSubmitServer as _},
     traits::{TNExecution, TelcoinNode},
     worker::WorkerNetwork,
     RethEnv, RpcServer, WorkerTxPool,
@@ -254,7 +258,8 @@ impl RethEnv {
     /// forwarding observers retain their handlers.
     ///
     /// Errors when the corrected fee-history method, the `--rpc.txfeecap` guard
-    /// (`crate::rpc_fee_cap`), the epoch-fee gas-price quotes, or the corrected
+    /// (`crate::rpc_fee_cap`) or, with `--forward-txs`, the forwarding handler
+    /// (`crate::rpc_tx_forward`), the epoch-fee gas-price quotes, or the corrected
     /// fill-transaction method cannot replace the stock eth handlers.
     pub fn get_rpc_server(
         &self,
@@ -326,14 +331,26 @@ impl RethEnv {
         // #1160). Reth's pool validator only checks the cap for local-treated
         // transactions, and raw RPC submissions are External, so the guard runs at the
         // RPC boundary and then delegates to these same reth handlers. The same guard checks
-        // worker admission, live worker membership, and live node mode before decoding.
-        let fee_cap_guard = EthSubmitWithCap::new(
-            eth_api.clone(),
-            TxFeeCapWei::new(self.node_config().rpc.rpc_tx_fee_cap),
-            admission,
-            base_fee.clone(),
-            node_mode,
-        );
+        // worker admission, live worker membership, and live node mode before decoding. A
+        // `--forward-txs` node enforces the same cap and then relays to its validators
+        // instead of touching its own pool; every worker's server shares the one forwarder.
+        let tx_fee_cap = TxFeeCapWei::new(self.node_config().rpc.rpc_tx_fee_cap);
+        let submission: Methods = match &self.inner.tx_forwarder {
+            Some(forwarder) => {
+                EthSubmitForwarded::new(eth_api.clone(), forwarder.clone(), tx_fee_cap)
+                    .into_rpc()
+                    .into()
+            }
+            None => EthSubmitWithCap::new(
+                eth_api.clone(),
+                tx_fee_cap,
+                admission,
+                base_fee.clone(),
+                node_mode,
+            )
+            .into_rpc()
+            .into(),
+        };
         // Use one registry so the replacement debug handlers share reth's concurrency
         // guard with the other tracing endpoints. Delegate through their RPC traits.
         let mut registry = rpc_builder.into_registry(
@@ -354,7 +371,7 @@ impl RethEnv {
         // Replace `eth_sendRawTransaction` / `eth_sendRawTransactionSync` on every
         // transport that exposes the eth namespace. A transport without the namespace
         // serves no submission methods, so it needs no guard.
-        server.add_or_replace_if_module_configured(RethRpcModule::Eth, fee_cap_guard.into_rpc())?;
+        server.add_or_replace_if_module_configured(RethRpcModule::Eth, submission)?;
         // Replace `eth_gasPrice` / `eth_maxPriorityFeePerGas` on every transport that
         // exposes the eth namespace. A transport without the namespace serves no
         // gas-price oracle methods to replace.
@@ -1732,4 +1749,6 @@ mod tests {
         );
         assert!(std::path::Path::new(&suffixed).exists(), "worker 1 IPC socket file must exist");
     }
+
+    mod forward_txs;
 }

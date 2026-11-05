@@ -45,7 +45,7 @@
 #                    stable pin that builds releases: the same build of the workspace test
 #                    binaries that failed in cache-deps.yaml and durable-e2e.yaml on
 #                    2026-10-29
-#   carried-patches  the library tests of the two carried patch crates, which sit outside
+#   carried-patches  the library tests of the three carried patch crates, which sit outside
 #                    the workspace and which an advisory fix can touch too
 #
 # The workspace tests are compiled, not run. A test that fails on main therefore still
@@ -192,8 +192,9 @@ jobs:
         if: ${{ !cancelled() }}
         run: ./etc/ci-lanes.sh test-adiri --build-only
 
-  # The commands of pr.yaml's `connection-limits-patch` and `quinn-proto-patch` jobs, in
-  # one job. No cache step, as there: main warms no entry for these crates.
+  # The commands of pr.yaml's `connection-limits-patch`, `quinn-proto-patch` and
+  # `gossipsub-patch` jobs, in one job. No cache step, as there: main warms no entry for
+  # these crates.
   carried-patches:
     if: github.actor != 'github-merge-queue[bot]'
     runs-on: ubuntu-latest
@@ -207,7 +208,11 @@ jobs:
       - name: Test connection accounting
         run: cargo +1.94 test --locked -p libp2p-connection-limits --lib
 
-      # Runs even when the step above failed, so both crates report.
+      # Runs even when a step above failed, so every crate reports.
       - name: Test the carried protocol observations
         if: ${{ !cancelled() }}
         run: cargo +1.94 test --locked --manifest-path patches/quinn-proto/Cargo.toml --lib
+
+      - name: Test promise expiry and the carried gossipsub unit tests
+        if: ${{ !cancelled() }}
+        run: cargo +1.94 test --locked -p libp2p-gossipsub --lib

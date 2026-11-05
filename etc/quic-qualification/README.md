@@ -117,9 +117,10 @@ honest traffic in every arm, including a reconnect/new-connection workload.
 | Controlled spoofed Initials | Owned test address space, Initial validity and achieved arrival rate |
 | Diverse real-address clients completing Retry | Source population, Retry completion, admission outcomes and achieved rate |
 
-The collector does not provide these generators or honest-traffic drivers. Pin
-the external tools and commands in the manifest, and retain raw per-attempt
-results. Bound each experiment to the predeclared below-saturation range using
+`generate.py` ships the two forged-source swarms for the spoofed Initial and
+peer-list rows (see below). Honest-traffic drivers and real-address Retry
+clients are still external. Pin the external tools and commands in the
+manifest, and retain raw per-attempt results. Bound each experiment to the predeclared below-saturation range using
 measured ingress, link utilization and generator telemetry. A configured send
 rate alone is insufficient. NIC octets also contain honest and unrelated traffic
 and omit some wire overhead; they do not alone prove wire-rate headroom.
@@ -180,6 +181,91 @@ traffic distribution, explicit resource/concurrency bounds, and affected
 established-resource/reconnect/deployment regressions. A failing qualification
 must pass with the selected remedy before readiness is claimed. These experiments
 do not gate a minimum Retry release that passes its own release checks.
+
+## Generate forged-source swarms
+
+`generate.py` puts forged IPv4 UDP datagrams on the wire from an approved
+isolated range. It needs Linux, root (a raw socket with `IP_HDRINCL`) and the
+stdlib only. It refuses IPv6 targets, any rate whose wire cost exceeds
+`--max-link-fraction` of `--link-mbps`, and a template that is not a plausible
+QUIC Initial (at least 1200 bytes, long header, nonzero version). It reports
+offered figures only; received figures come from the node.
+
+```sh
+sudo python3 -I etc/quic-qualification/generate.py initial \
+  --template initial.bin --source-range 198.51.100.0/24 --source-count 4096 \
+  --target 192.0.2.10:9000 --rate 20000 --duration 120 --link-mbps 10000 \
+  --output run-01-initial.json
+
+sudo python3 -I etc/quic-qualification/generate.py peerlist \
+  --sources peers.txt --size 64 \
+  --target 192.0.2.10:9000 --rate 20000 --duration 120 --link-mbps 10000 \
+  --output run-01-peerlist.json
+```
+
+`peers.txt` holds one `ip` or `ip:port` per line (comments with `#`). The
+summary records the schedule, offered packets and bytes, the achieved fraction
+of the requested rate, send errors by errno name (`EPERM`, `ENOBUFS`, `EAGAIN`
+and others), the source population and the template hash. `--dry-run` builds
+the first packets and the summary without a socket. Exit codes: 0 complete,
+2 preflight or usage failure, 3 interrupted (partial counts kept).
+
+## Measure from the node's metrics
+
+`measure.py` scrapes the node's Prometheus endpoint at a fixed interval and
+derives received rates, consensus progress, process CPU and RSS, honest dial
+success, handshake time and request latency quantiles from the scrapes. It
+needs the node started with `--metrics <addr>` and the stdlib only.
+
+```sh
+python3 -I etc/quic-qualification/measure.py \
+  --metrics http://127.0.0.1:9101/metrics --duration 180 --interval 1 \
+  --generator run-01-initial.json --generator run-01-peerlist.json \
+  --output run-01-measurement.json
+```
+
+`--from-files <dir>` replays saved `scrape-*.txt` files instead. A failed
+scrape is recorded under `gaps`, never as zeros, and a metric absent from every
+scrape is listed under `unavailable`. Quantiles use the node's global histogram
+buckets and carry the bucket bounds, so a p99.9 that fell into the overflow
+bucket is flagged rather than reported as a point. Exit codes: 0 complete,
+2 usage failure, 3 fewer than two scrapes or any gap.
+
+## Build the evidence record
+
+`record.py build` joins the manifest, the collector's `metadata.json` and
+`summary.json`, the measurement and the generator summaries into one record
+with the groups `build`, `topology`, `host_and_traffic`, `method` and
+`thresholds`, plus `open_limitations` and the SHA-256 of every input.
+
+```sh
+python3 -I etc/quic-qualification/record.py build \
+  --manifest run-01.json --collector run-01-collector \
+  --measurement run-01-measurement.json \
+  --generator run-01-initial.json --generator run-01-peerlist.json \
+  --configuration plain --output run-01-evidence.json
+
+python3 -I etc/quic-qualification/record.py capacity \
+  --records run-0*-evidence.json --output plain-capacity.json
+```
+
+`--configuration` is one of `plain`, `receive_buffer` or `accept_task`. The
+effective receive buffer comes from the collector's `ss -uamnep` capture
+(`skmem` `rb` on the node's sockets), never from a sysctl alone. Each threshold
+in `predeclared_acceptance` is `{value, owner, date}` and is evaluated to
+`pass`, `fail` or `unknown` with a reason. `capacity` takes the highest received
+rate among the records whose thresholds all pass for one configuration. A record
+is `fail` when one threshold fails, `unknown` when none fails and one is unknown,
+and the figure reports `null` with a reason when a record is `unknown` or no
+record passes. Exit codes: 0 no
+limitations, 2 manifest unusable, 3 one or more limitations recorded.
+
+## Run order
+
+Fill `run.example.json`, start `collect.py` and `measure.py`, run the swarms
+with `generate.py`, stop the scrapes, then `record.py build` and `record.py
+capacity`. The runbook with the full procedure is
+`docs/src/network/inbound-capacity-qualification.md`.
 
 ## Check the tooling
 
