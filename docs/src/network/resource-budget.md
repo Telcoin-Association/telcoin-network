@@ -69,10 +69,10 @@ The classes label the swarm metrics below and select the application's
 [serve budget](#serve-permits). They do not change swarm admission, queue space or scheduling.
 A message is shed, whatever its class, for one of five reasons. `queue_full`: the queue is full.
 `unsubscribed`: no application task receives from the queue. The primary network event queue uses
-this reason only for events other than gossip in a gap, see
+this reason in a gap for all events other than epoch votes, see
 [Primary event queue bounds](#primary-event-queue-bounds). `queue_budget`: the primary network
-event queue already holds its gap cap. `admission`: the application drops the request at its
-admission check.
+event queue already holds a gap cap for an epoch vote. `admission`: the application drops the
+request at its admission check.
 `serve_budget`: the application's serve budget for the class had no free permit. A
 shed request gets no response: the swarm drops the response channel, libp2p closes the stream, and
 the requester gets a stream error at once. It does not wait for its request timeout. The swarm does
@@ -87,21 +87,36 @@ loop receives each event when it arrives, so the queue can fill only in a gap wi
 between two epochs, and at start before the first epoch. While an event loop receives from the
 queue, the queue has no caps other than its capacity.
 
-In a gap, the queue holds only gossip, because the epoch votes arrive as gossip between two epochs
-and epoch-record voting needs them. The byte weight of gossip is the length of its data. In one gap
-the queue holds a maximum of 4,000 gossip messages and 32 MiB. The swarm sheds gossip past one of
-these caps as `queue_budget`. It sheds all other events in a gap as `unsubscribed`. A shed request
-drops its response channel, and the peer sends the request again. The certifier sends a vote
-request again until a new proposal replaces it. Peers send epoch-record and stream requests again.
+In a gap, the queue holds only gossip on the epoch-vote topic, because the epoch votes arrive as
+gossip between two epochs and epoch-record voting needs them. The byte weight of a vote is the
+length of its data. The author of a vote is its gossip source. The swarm forwards only gossip that
+an authorized publisher signed, so each forwarded vote has an author.
 
-The item cap is less than the queue capacity of 10,000, so the gossip that the queue holds in a gap
-does not fill the queue. The honest burst is approximately 40 rounds of certificates from a
-100-member committee, plus the epoch votes of the committee.
+The queue sheds all other events in a gap as `unsubscribed`. Thus certificate gossip and
+consensus-output gossip cannot take the space of the epoch votes. The certificate fetcher of the
+new epoch gets a shed certificate again when a later certificate names it as a parent. State sync
+gets shed consensus output again. A shed request drops its response channel, and the peer sends
+the request again. The certifier sends a vote request again until a new proposal replaces it. Peers
+send epoch-record and stream requests again.
 
-When the event loop of a new epoch subscribes, the queue discards the events other than gossip that
-the previous event loop left. It keeps the gossip in order and sets the gap counts to zero. If the
-gap dropped or discarded events, the primary writes one warning with the number of events kept,
-dropped, over the caps and discarded.
+The caps of one gap come from the committee parameters. At a boundary, the members of three
+committees (the previous, the current and the next) can publish on the epoch-vote topic. The caps
+are sized for committees of 100 members.
+
+| Cap | Value | Source |
+| --- | --- | --- |
+| Votes of one author | 4 | One vote for the closing epoch record, one for the previous record when it has no certificate, and two republished copies |
+| Votes | 1,200 | 3 committees x 100 members x 4 votes |
+| Bytes | 14,400,000 | 1,200 votes x the gossip message limit of 12,000 bytes |
+
+The swarm sheds a vote past one of these caps as `queue_budget`. Thus one member cannot take the
+space of the other members. The item cap is less than the queue capacity of 10,000, so the votes
+that the queue holds in a gap do not fill the queue.
+
+When the event loop of a new epoch subscribes, the queue discards the events other than epoch votes
+that the previous event loop left. It keeps the votes in order and sets the gap counts to zero,
+also the count of each author. If the gap dropped or discarded events, the primary writes one
+warning with the number of events kept, dropped, over the caps and discarded.
 
 ## Serve permits
 
