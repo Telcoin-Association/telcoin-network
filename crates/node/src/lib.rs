@@ -18,6 +18,7 @@ use tn_types::{
 };
 use tokio::task::JoinHandle;
 
+mod admission_rpc;
 pub mod engine;
 mod error;
 mod health;
@@ -27,6 +28,7 @@ mod network_dial;
 mod network_readiness;
 pub mod primary;
 pub mod worker;
+pub use admission_rpc::AdmissionSnapshotSource;
 pub use health::{HealthcheckBind, HealthcheckBindError};
 pub use manager::{
     build_epoch_record, catchup_accumulator, read_base_fees_for_entered_epoch,
@@ -109,6 +111,8 @@ pub struct EngineToPrimaryRpc {
     consensus_chain: ConsensusChain,
     /// Static node info to provide clients.
     node_info: RpcNodeInfo,
+    /// The node's swarm admission snapshots, shared by every RPC server.
+    admission: AdmissionSnapshotSource,
 }
 
 impl EngineToPrimaryRpc {
@@ -116,8 +120,9 @@ impl EngineToPrimaryRpc {
         consensus_bus: ConsensusBusApp,
         consensus_chain: ConsensusChain,
         node_info: RpcNodeInfo,
+        admission: AdmissionSnapshotSource,
     ) -> Self {
-        Self { consensus_bus, consensus_chain, node_info }
+        Self { consensus_bus, consensus_chain, node_info, admission }
     }
 
     /// Retrieve the consensus header by number.
@@ -187,7 +192,7 @@ impl EngineToPrimary for EngineToPrimaryRpc {
     }
 
     async fn admission_snapshot(&self) -> Option<RpcAdmissionSnapshot> {
-        None
+        self.admission.snapshot().await
     }
 }
 

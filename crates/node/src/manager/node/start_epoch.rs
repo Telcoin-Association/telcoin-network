@@ -581,6 +581,7 @@ where
             self.consensus_bus.clone(),
             self.consensus_chain.clone(),
             node_info,
+            self.admission_snapshots.clone(),
         ))
     }
 
@@ -828,6 +829,7 @@ where
                         rpc_context.consensus_bus,
                         self.consensus_chain.clone(),
                         node_info,
+                        self.admission_snapshots.clone(),
                     );
                     engine
                         .initialize_worker_components(
