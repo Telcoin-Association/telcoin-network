@@ -30,6 +30,9 @@ RUN apt-get update && \
 COPY Cargo* ./
 COPY bin/ ./bin/
 COPY crates/ ./crates/
+# Path dependencies of workspace members: the vendored reth and the carried crate patches.
+COPY vendor/ ./vendor/
+COPY patches/ ./patches/
 COPY chain-configs/ ./chain-configs/
 COPY tn-contracts/ ./tn-contracts/
 

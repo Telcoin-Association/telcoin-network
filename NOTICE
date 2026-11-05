@@ -25,4 +25,12 @@ The Sui code is licensed under the Apache License, Version 2.0.
 Other portions of this project are derived from work by:
 - Reth Contributors (c) 2022-2025 (Apache/MIT)
 
+`vendor/reth` is a modified copy of [reth](https://github.com/paradigmxyz/reth) (MIT or Apache
+License, Version 2.0); `vendor/reth/CHANGES.md` lists the modifications. It includes libmdbx,
+whose own notice is at `vendor/reth/crates/storage/libmdbx-rs/mdbx-sys/libmdbx/NOTICE`.
+
+`patches/revm-inspectors` is a modified copy of
+[revm-inspectors](https://github.com/paradigmxyz/revm-inspectors) 0.34.3 (MIT or Apache License,
+Version 2.0); `patches/revm-inspectors/PATCH.md` describes the change.
+
 If you have questions or comments regarding the licensed software, please contact `compliance@telcoin.org` so we can help.
