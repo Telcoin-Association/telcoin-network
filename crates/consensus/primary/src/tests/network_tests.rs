@@ -3331,6 +3331,9 @@ async fn test_consensus_result_previous_epoch_bounded_by_certified_record() -> e
         create_test_types_at_epoch(temp_dir.path(), 2).await;
     consensus_bus.node_mode().send_replace(NodeMode::Observer);
 
+    // Epoch records are stored in order from epoch 0.
+    seed_uncertified_epoch0(&handler, &committee).await;
+
     // The certified record of epoch 1: the fixture committee, closed at consensus number 5.
     let final_hash = ConsensusHeaderDigest::from(B256::random());
     let record = EpochRecord {
