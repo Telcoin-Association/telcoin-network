@@ -448,10 +448,17 @@ mod tests {
         PrefillSpec { registry: true, ..spec() }
     }
 
-    /// The seed chain value a commit at `round` folds from `previous` (the factory's leaders carry
-    /// the default seed signature).
-    fn folded(previous: EpochSeedChainValue, round: u32) -> tn_types::B256 {
-        previous.fold(round, &BlsSignature::default()).into_inner()
+    /// The seed a commit at `round` of `epoch` carries after `previous`, by
+    /// `CommittedSubDag::new`'s rule for that epoch: where `seed_signature_active(epoch)`, the
+    /// seed chain's fold of the leader's seed signature (the factory's leaders carry the
+    /// default one); before that fork (an `adiri` build's early epochs), the legacy seed,
+    /// keccak256 of the leader's aggregate signature (the default one).
+    fn folded(previous: EpochSeedChainValue, epoch: Epoch, round: u32) -> tn_types::B256 {
+        if tn_types::forks::seed_signature_active(epoch) {
+            previous.fold(round, &BlsSignature::default()).into_inner()
+        } else {
+            tn_types::keccak256(BlsSignature::default().to_bytes())
+        }
     }
 
     /// Three batches of [`BATCH_GAS`] per output.
@@ -649,7 +656,7 @@ mod tests {
         let chained = EpochSeedChainValue::from_committed(first.output.committee_shuffle_seed());
         assert_eq!(
             output.committee_shuffle_seed(),
-            folded(chained, output.leader_round()),
+            folded(chained, 0, output.leader_round()),
             "the closing seed folds the epoch's previous commit"
         );
 
@@ -678,7 +685,7 @@ mod tests {
         assert!((0..next.batches.len()).all(|index| next.batch(index).epoch == 1));
         assert_eq!(
             output.committee_shuffle_seed(),
-            folded(EpochSeedChainValue::epoch_root(1), output.leader_round()),
+            folded(EpochSeedChainValue::epoch_root(1), 1, output.leader_round()),
             "the new epoch's first commit folds its epoch root"
         );
         bench.execute(&next)?;
@@ -712,7 +719,7 @@ mod tests {
         assert!(committee.authority(output.leader().author()).is_some(), "a new-epoch leader");
         assert_eq!(
             output.committee_shuffle_seed(),
-            folded(EpochSeedChainValue::epoch_root(1), output.leader_round())
+            folded(EpochSeedChainValue::epoch_root(1), 1, output.leader_round())
         );
         bench.execute(&next)?;
         Ok(())
