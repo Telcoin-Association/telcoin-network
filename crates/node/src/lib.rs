@@ -11,7 +11,7 @@ use engine::TnBuilder;
 use manager::EpochManager;
 use tn_config::{KeyConfig, TelcoinDirs};
 use tn_primary::ConsensusBusApp;
-use tn_rpc::{ConsensusStorageError, EngineToPrimary, RpcNodeInfo};
+use tn_rpc::{ConsensusStorageError, EngineToPrimary, RpcAdmissionSnapshot, RpcNodeInfo};
 use tn_storage::consensus::ConsensusChain;
 use tn_types::{
     ConsensusHeader, ConsensusHeaderDigest, Epoch, EpochCertificate, EpochDigest, EpochRecord,
@@ -184,6 +184,10 @@ impl EngineToPrimary for EngineToPrimaryRpc {
 
     fn node_mode(&self) -> tn_types::NodeMode {
         self.consensus_bus.current_node_mode().into()
+    }
+
+    async fn admission_snapshot(&self) -> Option<RpcAdmissionSnapshot> {
+        None
     }
 }
 

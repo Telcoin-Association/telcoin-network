@@ -41,8 +41,8 @@ use tn_reth::{
     ExecutedBlock, NewCanonicalChain, OutputTrieOverlay, RethChainSpec, RethEnv,
 };
 use tn_rpc::{
-    ConsensusStorageError, EngineToPrimary, RpcNodeInfo, TelcoinNetworkRpcExt,
-    TelcoinNetworkRpcExtApiServer as _,
+    ConsensusStorageError, EngineToPrimary, RpcAdmissionSnapshot, RpcNodeInfo,
+    TelcoinNetworkRpcExt, TelcoinNetworkRpcExtApiServer as _,
 };
 use tn_storage::{consensus::ConsensusChain, mem_db::MemDatabase};
 use tn_test_utils::{
@@ -275,6 +275,10 @@ impl EngineToPrimary for NoopEngineToPrimary {
     }
 
     fn node_mode(&self) -> tn_types::NodeMode {
+        unreachable!("EngineToPrimary RPC is not exercised in this test")
+    }
+
+    async fn admission_snapshot(&self) -> Option<RpcAdmissionSnapshot> {
         unreachable!("EngineToPrimary RPC is not exercised in this test")
     }
 }
