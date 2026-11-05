@@ -410,8 +410,8 @@ jobs:
 
   # tn-lmdb feature lane: the default-feature test job above runs every reth database on MDBX,
   # so it never runs reth on tn-lmdb. This lane reruns the workspace with tn-reth's `tn-lmdb`
-  # feature; the reason it is a whole-workspace run lives in etc/ci-lanes.sh. Same 45-minute
-  # ceiling as `test`, for the same reasons.
+  # feature, less the packages the feature cannot change; the reasons live in etc/ci-lanes.sh.
+  # Same 45-minute ceiling as `test`, for the same reasons.
   tn-lmdb-test:
     needs: ci-scope
     if: needs.ci-scope.outputs.run_lanes == 'true'

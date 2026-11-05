@@ -113,9 +113,10 @@ rpassword = "7.4.0"
 #
 # `rocksdb` stays off: librocksdb-sys (the entire RocksDB C++ engine, 332 translation units,
 # the single largest native compile in the tree) enters the graph only through reth's
-# `rocksdb` features, and our storage is MDBX-only (`RocksDBProvider` resolves to reth's
-# zero-size stub with the feature off). Re-enable explicitly via the off-by-default `rocksdb`
-# feature on tn-reth / tn-node / telcoin-network-cli / telcoin-network.
+# `rocksdb` features, and TN's reth database never uses RocksDB (MDBX, or tn-lmdb with
+# `tn-lmdb`; `RocksDBProvider` resolves to reth's zero-size stub with the feature off).
+# Re-enable explicitly via the off-by-default `rocksdb` feature on tn-reth / tn-node /
+# telcoin-network-cli / telcoin-network.
 # The off-by-default `tn-lmdb` feature on the same four crates swaps TN's reth database from
 # MDBX to the tn-lmdb engine (`tn-lmdb-reth`); MDBX stays compiled either way.
 # NOTE: reth's `edge` features imply `rocksdb`; do not enable them while this gate is off.

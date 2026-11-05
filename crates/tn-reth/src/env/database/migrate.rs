@@ -14,8 +14,9 @@
 //! | `mdbx.dat` | `tn-lmdb.dat` | `mdbx-migrated` | the open |
 //! |---|---|---|---|
 //! | yes | no | no | migrates |
-//! | yes | yes | no | a migration stopped after its commit point: finishes it (removes MDBX's files, writes the marker) |
-//! | yes | either | yes | refused: something wrote MDBX after the migration (an older binary), and the static files may be ahead of tn-lmdb |
+//! | yes | yes | no, and the temp directory without a `tn-lmdb.dat` | a migration stopped after its commit point: finishes it (removes MDBX's files, writes the marker) |
+//! | yes | yes | no, nor that temp directory | refused, nothing changed: both engines' data files, not a stopped migration (a tn-lmdb database an older binary ran on MDBX?) |
+//! | yes | either | yes | refused: something wrote MDBX after the migration (an older binary), and the static files may no longer match tn-lmdb |
 //! | no | yes | no, and the temp directory without a `tn-lmdb.dat` | a migration stopped after removing MDBX's files: finishes it (writes the marker) |
 //! | no | yes | either | a normal open |
 //! | no | no | yes | refused: the migrated database is missing |
@@ -25,8 +26,8 @@
 //! runs, and the node holds its datadir lock while it opens the database, so one found by an open
 //! is a stopped migration's. Before the commit point it holds a partial or unrenamed copy, and is
 //! removed; after it, emptied by the rename, it is kept until the marker is written, so beside
-//! `tn-lmdb.dat` with neither MDBX's data file nor the marker it says a migration stopped before
-//! writing its marker.
+//! `tn-lmdb.dat` without the marker it says a migration stopped after its commit point. Without
+//! it, an `mdbx.dat` beside `tn-lmdb.dat` is no migration's, and is refused.
 //!
 //! **Steps.**
 //! 1. Remove a stopped migration's temp directory.
@@ -37,8 +38,8 @@
 //! 3. Check the free disk: the live bytes plus headroom ([`needed_bytes`]), else refuse, naming the
 //!    live bytes and the bytes needed and free. `mdbx.dat`'s size is no measure: the file grows in
 //!    large steps (a local node's is 4 GiB, mostly sparse) and keeps the pages it frees.
-//! 4. Open tn-lmdb in the temp directory with `NoSync`, the page size and reservation of the node's
-//!    `--db.*` flags, and create reth's tables.
+//! 4. Open tn-lmdb in the temp directory with `NoSync` and the page size, reservation and growth
+//!    step of the node's `--db.*` flags, and create reth's tables.
 //! 5. Copy each of reth's tables (`Tables::ALL`), read from MDBX in one transaction with the
 //!    long-read safety off, by appends, in write transactions of at most [`COMMIT_ROWS`] rows or
 //!    [`COMMIT_BYTES`] bytes, hashing each row's key and value as it goes (std's `DefaultHasher`,
@@ -51,8 +52,8 @@
 //!    fails; a read-back pass over each tn-lmdb table hashes equal to its copy; then
 //!    `TnLmdbEnv::sync`, the engine's full check of the file (`TnLmdbEnv::check`), and its entry
 //!    count of each table equal to the rows copied.
-//! 7. The commit point: close the tn-lmdb file, fsync the temp directory, rename its `tn-lmdb.dat`
-//!    into the database directory, and fsync that.
+//! 7. Close the tn-lmdb file, fsync the temp directory, and rename its `tn-lmdb.dat` into the
+//!    database directory: the commit point. Then fsync the database directory.
 //! 8. Remove MDBX's `mdbx.lck`, then `mdbx.dat` last (beside `tn-lmdb.dat`, its presence marks a
 //!    migration unfinished), and fsync the directory.
 //! 9. Write the marker [`MIGRATED_MARKER`] atomically (a temp file, fsync, rename, fsync of the
@@ -61,8 +62,10 @@
 //!
 //! A failure before the commit point removes the temp directory and leaves MDBX as it was. A stop
 //! there (a kill, a power loss) leaves MDBX in place too, and the next open migrates again from the
-//! start; a stop after the rename leaves `tn-lmdb.dat` beside MDBX's files, or beside the emptied
-//! temp directory once MDBX's files are gone, and the next open finishes the migration.
+//! start; a stop after the rename leaves `tn-lmdb.dat` beside the emptied temp directory (and
+//! MDBX's files until they are removed), and the next open finishes the migration. A failure after
+//! the rename (the database directory's fsync, or a step of finishing) keeps the temp directory as
+//! a stop does, and its error says the next start finishes the migration.
 //!
 //! **Why a temp directory.** A copy stopped part way cannot resume into the same file: the
 //! adapter's appends are not idempotent (a row appended again is refused, or replaces the last),
@@ -96,17 +99,10 @@ use tn_lmdb_reth::{SyncMode, TnLmdbArgs, TnLmdbEnv, TnLmdbEnvKind, DATA_FILE};
 use tn_storage::disk::{available_bytes, fsync_directory, fsync_file};
 use tracing::{info, warn};
 
-use super::{file_exists, mdbx_table_stat, MDBX_DATA_FILE};
+use super::{file_exists, mdbx_table_stat, MDBX_DATA_FILE, MIGRATED_MARKER, MIGRATING_DIR};
 
 #[cfg(test)]
 mod tests;
-
-/// The marker a finished migration leaves in the database directory. An `mdbx.dat` beside it was
-/// written after the migration, which is refused.
-pub(super) const MIGRATED_MARKER: &str = "mdbx-migrated";
-
-/// The directory, inside the database directory, a migration builds the tn-lmdb file in.
-pub(super) const MIGRATING_DIR: &str = "tn-lmdb-migrating";
 
 /// MDBX's lock file, removed before its data file.
 const MDBX_LOCK_FILE: &str = "mdbx.lck";
@@ -122,18 +118,18 @@ const COMMIT_BYTES: u64 = 64 << 20;
 /// A table's copy logs its progress every this many rows.
 const PROGRESS_ROWS: u64 = 10_000_000;
 
-/// The fixed part of the headroom a migration needs on the disk ([`needed_bytes`]).
+/// The least fixed part of the headroom a migration needs on the disk ([`needed_bytes`]).
 const HEADROOM_FLOOR: u64 = 1 << 30;
 
 /// The named steps of a migration, at which a test can stop it as a kill would (the test-only
-/// `STOP_AT`).
+/// `STOP_AT`), or fail it as an I/O error would (`FAIL_AT`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Step {
     /// After a commit of the copy: rows are in the temp directory's file.
     MidCopy,
     /// Verified, synced and closed, before the rename (the commit point).
     BeforeRename,
-    /// After the rename, before the temp directory and MDBX's files are removed.
+    /// After the rename, before the database directory's fsync and the removal of MDBX's files.
     AfterRename,
     /// After MDBX's files are removed, before the marker is written.
     BeforeMarker,
@@ -172,6 +168,9 @@ thread_local! {
     pub(super) static STOP_AT: std::cell::Cell<Option<Step>> = const { std::cell::Cell::new(None) };
     /// Test-only: the passes of the `STOP_AT` step to let by before stopping there.
     pub(super) static STOP_PASSES: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    /// Test-only: the step at which the next migration on this thread fails with an ordinary error,
+    /// as a failed I/O call would fail it: unlike a [`Killed`] stop, the failure's cleanup runs.
+    pub(super) static FAIL_AT: std::cell::Cell<Option<Step>> = const { std::cell::Cell::new(None) };
     /// Test-only: the free bytes the migrations on this thread read in place of the filesystem's.
     pub(super) static FREE_BYTES: std::cell::Cell<Option<u64>> =
         const { std::cell::Cell::new(None) };
@@ -181,8 +180,13 @@ thread_local! {
 }
 
 /// Pass step `at`; a test stops the migration there through `STOP_AT` (after `STOP_PASSES`
-/// passes of it).
+/// passes of it), or fails it there through `FAIL_AT`.
 fn step(at: Step) -> eyre::Result<()> {
+    #[cfg(test)]
+    if FAIL_AT.get() == Some(at) {
+        FAIL_AT.set(None);
+        eyre::bail!("the migration was failed at {at:?} by a test");
+    }
     #[cfg(test)]
     if STOP_AT.get() == Some(at) {
         match STOP_PASSES.get() {
@@ -211,8 +215,9 @@ fn take_fault(fault: CopyFault) -> bool {
 
 /// Settle the reth database directory `path` before the tn-lmdb build opens it (the module docs'
 /// states): migrate an MDBX database, finish a migration stopped after its commit point, refuse
-/// MDBX written after a migration, and remove a stopped migration's temp directory. `args` are
-/// the settings the node opens tn-lmdb with: a migrated file takes their page size and reservation.
+/// MDBX written after a migration or beside a tn-lmdb database no migration left, and remove a
+/// stopped migration's temp directory. `args` are the settings the node opens tn-lmdb with: a
+/// migrated file takes their page size, reservation and growth step.
 pub(super) fn migrate_from_mdbx(path: &Path, args: TnLmdbArgs) -> eyre::Result<()> {
     let mdbx = file_exists(&path.join(MDBX_DATA_FILE))?;
     let tn_lmdb = file_exists(&path.join(DATA_FILE))?;
@@ -220,11 +225,12 @@ pub(super) fn migrate_from_mdbx(path: &Path, args: TnLmdbArgs) -> eyre::Result<(
     match (mdbx, tn_lmdb, marker) {
         (true, _, true) => Err(written_after_migration(path)),
         (true, false, false) => migrate(path, args),
-        (true, true, false) => {
+        (true, true, false) if stopped_after_commit_point(path)? => {
             info!(target: "tn::reth", path = %path.display(), "finishing an MDBX to tn-lmdb migration stopped after its commit point");
             finish(path, FINISHED_LATER)
         }
-        (false, true, false) if stopped_before_marker(path)? => {
+        (true, true, false) => Err(both_engines(path)),
+        (false, true, false) if stopped_after_commit_point(path)? => {
             info!(target: "tn::reth", path = %path.display(), "finishing an MDBX to tn-lmdb migration stopped before its marker");
             finish(path, FINISHED_LATER)
         }
@@ -245,22 +251,40 @@ const FINISHED_LATER: &str =
     "migrated from MDBX to tn-lmdb; finished by a later open (the run that copied the rows logged \
      them)\n";
 
-/// Whether `path`, holding `tn-lmdb.dat` and neither MDBX's data file nor the marker, holds a
-/// migration stopped after it removed MDBX's files and before it wrote the marker: its temp
-/// directory, which a migration removes only after the marker, is there without a `tn-lmdb.dat`
-/// (the file moved out of it at the commit point).
-fn stopped_before_marker(path: &Path) -> eyre::Result<bool> {
+/// Whether `path`, holding `tn-lmdb.dat` and no marker, holds a migration stopped after its commit
+/// point (before or after it removed MDBX's files): its temp directory, which a migration removes
+/// only after the marker, is there without a `tn-lmdb.dat` (the file moved out of it at the commit
+/// point).
+pub(super) fn stopped_after_commit_point(path: &Path) -> eyre::Result<bool> {
     let temp = path.join(MIGRATING_DIR);
     Ok(file_exists(&temp)? && !file_exists(&temp.join(DATA_FILE))?)
+}
+
+/// The refusal of an `mdbx.dat` beside a `tn-lmdb.dat` in `path` that no migration left (no marker,
+/// no emptied temp directory): a tn-lmdb database a build running reth on MDBX opened, say, which
+/// creates MDBX's file beside it. Either file may be the one the static files match, so neither is
+/// removed.
+pub(super) fn both_engines(path: &Path) -> eyre::Report {
+    eyre::eyre!(
+        "the reth database at {} holds both {} and {}, with neither a finished MDBX to tn-lmdb \
+         migration's marker ({}) nor a stopped one's emptied temp directory ({}): this is not a \
+         stopped migration, so this build changes neither file. Resolve it by hand (start from a \
+         fresh datadir, or `db load-state`)",
+        path.display(),
+        path.join(MDBX_DATA_FILE).display(),
+        path.join(DATA_FILE).display(),
+        path.join(MIGRATED_MARKER).display(),
+        path.join(MIGRATING_DIR).display(),
+    )
 }
 
 /// The refusal of an `mdbx.dat` beside the marker of a finished migration in `path`.
 pub(super) fn written_after_migration(path: &Path) -> eyre::Report {
     eyre::eyre!(
         "the reth database at {} was migrated from MDBX to tn-lmdb ({} exists), but {} was written \
-         since, by a build running reth on MDBX (an older binary?): the static files may be ahead \
-         of the tn-lmdb database, so this build does not open it. Resolve it by hand (start from a \
-         fresh datadir, or `db load-state`)",
+         since, by a build running reth on MDBX (an older binary?): the static files may no longer \
+         match the tn-lmdb database, so this build does not open it. Resolve it by hand (start from \
+         a fresh datadir, or `db load-state`)",
         path.display(),
         path.join(MIGRATED_MARKER).display(),
         path.join(MDBX_DATA_FILE).display(),
@@ -269,13 +293,15 @@ pub(super) fn written_after_migration(path: &Path) -> eyre::Report {
 
 /// The free bytes a migration needs on the database's filesystem: `live`, the bytes of the pages
 /// reth's tables take in MDBX ([`mdbx_live_bytes`]), which hold the rows the copy writes, plus
-/// headroom of a quarter of it and [`HEADROOM_FLOOR`] (1 GiB). The headroom covers the tn-lmdb
-/// file's own layout (a value past about a quarter page goes to an overflow run of whole pages,
-/// where MDBX keeps up to about half a page in its leaf) and leaves the filesystem room to work.
-/// The check is an early refusal, not a promise: a disk that fills during the copy fails the
-/// migration, which removes its temp directory and leaves MDBX as it was.
-pub(super) const fn needed_bytes(live: u64) -> u64 {
-    live.saturating_add(live / 4).saturating_add(HEADROOM_FLOOR)
+/// headroom of a quarter of it and the larger of [`HEADROOM_FLOOR`] (1 GiB) and `max_growth`, the
+/// copy's largest growth step (`--db.growth-step`), which the file's last growth can take whole.
+/// The headroom covers the tn-lmdb file's own layout (a value past about a quarter page goes to an
+/// overflow run of whole pages, where MDBX keeps up to about half a page in its leaf) and leaves
+/// the filesystem room to work. The check is an early refusal, not a promise: a disk that fills
+/// during the copy fails the migration, which removes its temp directory and leaves MDBX as it was.
+pub(super) const fn needed_bytes(live: u64, max_growth: u64) -> u64 {
+    let fixed = if max_growth > HEADROOM_FLOOR { max_growth } else { HEADROOM_FLOOR };
+    live.saturating_add(live / 4).saturating_add(fixed)
 }
 
 /// The live bytes of reth's tables in the MDBX database `mdbx`: the pages of each table's tree and
@@ -349,7 +375,7 @@ fn migrate(path: &Path, args: TnLmdbArgs) -> eyre::Result<()> {
         .wrap_err("failed to open the MDBX database read-only")
         .wrap_err_with(unchanged)?;
     let live = mdbx_live_bytes(&src).wrap_err_with(unchanged)?;
-    let needed = needed_bytes(live);
+    let needed = needed_bytes(live, args.max_growth);
     let free = free_bytes(path)?;
     if free < needed {
         eyre::bail!(
@@ -375,21 +401,36 @@ fn migrate(path: &Path, args: TnLmdbArgs) -> eyre::Result<()> {
             return Err(e.wrap_err(unchanged()));
         }
     };
-    step(Step::AfterRename)?;
+    // Past the commit point a failure keeps the temp directory, emptied by the rename, so the
+    // next open finishes the migration.
+    let committed = || {
+        format!(
+            "the MDBX to tn-lmdb migration of the reth database at {} failed after its commit \
+             point ({} is in place): the next start finishes the migration",
+            path.display(),
+            path.join(DATA_FILE).display(),
+        )
+    };
+    let sync_rename = || {
+        step(Step::AfterRename)?;
+        fsync_directory(path)
+            .wrap_err_with(|| format!("failed to fsync directory {}", path.display()))
+    };
+    sync_rename().wrap_err_with(committed)?;
 
     let total: u64 = copies.iter().map(|copy| copy.rows).sum();
     let mut summary = format!("migrated from MDBX to tn-lmdb: {total} rows\n");
     for copy in &copies {
         summary.push_str(&format!("{} {}\n", copy.name, copy.rows));
     }
-    finish(path, &summary)?;
+    finish(path, &summary).wrap_err_with(committed)?;
     info!(target: "tn::reth", path = %path.display(), rows = total, tables = copies.len(), elapsed = ?started.elapsed(), "migrated the reth database from MDBX to tn-lmdb");
     Ok(())
 }
 
 /// Build the tn-lmdb copy of `src`, the MDBX database in `path`, in the directory `temp`, verified
-/// and durable ([`copy_and_verify`]), and move it into `path`: the commit point. Returns the copy
-/// of each table.
+/// and durable ([`copy_and_verify`]), and move it into `path`: the commit point, so a failure here
+/// leaves MDBX as it was. Returns the copy of each table.
 fn copy_and_install(
     path: &Path,
     temp: &Path,
@@ -403,8 +444,6 @@ fn copy_and_install(
     let (from, to) = (temp.join(DATA_FILE), path.join(DATA_FILE));
     std::fs::rename(&from, &to)
         .wrap_err_with(|| format!("failed to move {} to {}", from.display(), to.display()))?;
-    fsync_directory(path)
-        .wrap_err_with(|| format!("failed to fsync directory {}", path.display()))?;
     Ok(copies)
 }
 
@@ -612,7 +651,7 @@ impl<TX: DbTx> TableViewer<()> for VerifyTable<'_, TX> {
 /// Finish a migration whose `tn-lmdb.dat` is in place in `path`: remove MDBX's files (`mdbx.lck`,
 /// then `mdbx.dat` last), fsync the directory, write the marker with `summary` as its text, and
 /// remove the temp directory last: until the marker is written, the temp directory beside
-/// `tn-lmdb.dat` marks the migration unfinished ([`stopped_before_marker`]).
+/// `tn-lmdb.dat` marks the migration unfinished ([`stopped_after_commit_point`]).
 fn finish(path: &Path, summary: &str) -> eyre::Result<()> {
     remove_file_if_present(&path.join(MDBX_LOCK_FILE))?;
     remove_file_if_present(&path.join(MDBX_DATA_FILE))?;

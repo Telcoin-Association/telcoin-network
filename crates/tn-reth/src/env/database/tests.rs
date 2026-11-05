@@ -54,7 +54,7 @@ fn open_rw_refuses_the_other_engines_database() {
     {
         assert!(msg.contains("migration") && msg.contains("unchanged"), "says why: {msg}");
         assert_eq!(std::fs::read(path.join(other)).expect("read"), b"planted", "MDBX unchanged");
-        let temp = path.join(migrate::MIGRATING_DIR).try_exists().expect("stat");
+        let temp = path.join(MIGRATING_DIR).try_exists().expect("stat");
         assert!(!temp, "the failed migration's temp directory is removed");
     }
 
@@ -212,6 +212,84 @@ fn db_table_stats_fails_on_a_stat_error() {
 
     let err = db_table_stats(&file.join("db")).expect_err("a stat error fails the stats");
     assert!(format!("{err:#}").contains("failed to check for"), "the check's own error: {err:#}");
+}
+
+/// [`refuse_pending_migration`] refuses only a directory whose open would first migrate it: on the
+/// tn-lmdb build one holding `mdbx.dat`, whatever it holds, naming the file; the MDBX build never
+/// migrates, so it refuses nothing. Neither changes the directory.
+#[test]
+fn refuse_pending_migration_refuses_only_a_directory_the_open_would_migrate() {
+    let tmp = TempDir::new().expect("tempdir");
+    let path = tmp.path().join("db");
+    refuse_pending_migration(&path).expect("no directory");
+    std::fs::create_dir(&path).expect("db dir");
+    refuse_pending_migration(&path).expect("an empty directory");
+    std::fs::write(path.join("tn-lmdb.dat"), b"a tn-lmdb database").expect("plant");
+    refuse_pending_migration(&path).expect("a tn-lmdb database alone");
+
+    std::fs::write(path.join("mdbx.dat"), b"an MDBX database").expect("plant");
+    let checked = refuse_pending_migration(&path);
+    #[cfg(not(feature = "tn-lmdb"))]
+    checked.expect("the MDBX build never migrates");
+    #[cfg(feature = "tn-lmdb")]
+    {
+        let msg = format!("{:#}", checked.expect_err("the open would migrate it"));
+        assert!(msg.contains(&path.join("mdbx.dat").display().to_string()), "names it: {msg}");
+    }
+    assert_eq!(std::fs::read(path.join("mdbx.dat")).expect("read"), b"an MDBX database");
+    assert_eq!(std::fs::read_dir(&path).expect("list").count(), 2, "nothing else is made");
+}
+
+/// The MDBX build's guard on a migration's leftovers: its marker and its temp directory.
+#[cfg(not(feature = "tn-lmdb"))]
+mod mdbx {
+    use super::*;
+
+    /// A migrated database whose `tn-lmdb.dat` is missing (the marker alone) is refused, saying to
+    /// run a tn-lmdb build, and nothing is created beside the static files in its place. `db stats`
+    /// refuses it the same way.
+    #[test]
+    fn open_rw_refuses_a_migrated_directory_without_its_file() {
+        let tmp = TempDir::new().expect("tempdir");
+        let path = tmp.path().join("db");
+        std::fs::create_dir(&path).expect("db dir");
+        std::fs::write(path.join(MIGRATED_MARKER), b"migrated").expect("marker");
+
+        let refused = |err: eyre::Report| {
+            let msg = format!("{err:#}");
+            let marker = path.join(MIGRATED_MARKER).display().to_string();
+            assert!(msg.contains(&marker), "names the marker: {msg}");
+            assert!(msg.contains("is missing") && msg.contains("`tn-lmdb` feature"), "{msg}");
+        };
+        refused(open_rw(&config(test_db_args()), &path).expect_err("the marker alone"));
+        refused(db_table_stats(&path).expect_err("the stats refuse it too"));
+        for absent in [OWN_AND_OTHER_DATA_FILE.0, "mdbx.lck", TN_LMDB_DATA_FILE] {
+            assert!(!path.join(absent).try_exists().expect("stat"), "no {absent} is created");
+        }
+        let version = reth_db::version::db_version_file_path(&path).try_exists().expect("stat");
+        assert!(!version, "no version file is written");
+    }
+
+    /// A stopped migration's temp directory beside an MDBX database is left as it is: the database
+    /// opens, and the directory and its partial copy are kept. The guard warns of it, naming the
+    /// directory and its size ([`dir_bytes`]).
+    #[test]
+    fn open_rw_keeps_a_stopped_migrations_temp_directory() {
+        let tmp = TempDir::new().expect("tempdir");
+        let path = tmp.path().join("db");
+        let config = config(test_db_args());
+        drop(open_rw(&config, &path).expect("an MDBX database"));
+        let temp = path.join(MIGRATING_DIR);
+        std::fs::create_dir(&temp).expect("temp dir");
+        std::fs::write(temp.join(TN_LMDB_DATA_FILE), b"a stopped copy").expect("partial copy");
+        std::fs::write(temp.join("other"), b"more").expect("another file");
+
+        drop(open_rw(&config, &path).expect("the MDBX database opens beside it"));
+        db_table_stats(&path).expect("the stats read beside it");
+        let copy = std::fs::read(temp.join(TN_LMDB_DATA_FILE)).expect("the temp directory is kept");
+        assert_eq!(copy, b"a stopped copy", "its copy is unchanged");
+        assert_eq!(dir_bytes(&temp).expect("size"), 18, "the size the warning names");
+    }
 }
 
 #[cfg(feature = "tn-lmdb")]

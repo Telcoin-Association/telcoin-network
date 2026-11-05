@@ -6,8 +6,8 @@
 //! the crate names [`RethDbEnv`] and [`RethDb`], never either engine.
 //!
 //! [`open_rw`] opens (or creates) the read-write database a node runs on. Both builds first run
-//! [`check_backend`]: the MDBX build refuses a database directory that holds tn-lmdb's file, and
-//! the tn-lmdb build migrates an MDBX database onto tn-lmdb (`migrate`).
+//! [`check_backend`]: the MDBX build refuses a database directory that holds tn-lmdb's file or a
+//! migration's marker, and the tn-lmdb build migrates an MDBX database onto tn-lmdb (`migrate`).
 //! [`db_table_stats`] reads each table's figures for `db stats`: live beside a running node on
 //! MDBX, with the node stopped on tn-lmdb ([`DB_TABLE_STATS_NEEDS_STOPPED_NODE`]).
 //! [`default_page_size`] is the page size a new database gets without `--db.page-size`.
@@ -44,6 +44,15 @@ const MDBX_DATA_FILE: &str = "mdbx.dat";
 /// build does not compile in.
 #[cfg(not(feature = "tn-lmdb"))]
 const TN_LMDB_DATA_FILE: &str = "tn-lmdb.dat";
+
+/// The marker a finished MDBX to tn-lmdb migration leaves in the database directory. The tn-lmdb
+/// build refuses an `mdbx.dat` beside it (written after the migration); the MDBX build refuses
+/// the directory.
+const MIGRATED_MARKER: &str = "mdbx-migrated";
+
+/// The directory, inside the database directory, an MDBX to tn-lmdb migration builds its file in.
+/// The tn-lmdb build removes a stopped migration's; the MDBX build warns of it and leaves it.
+const MIGRATING_DIR: &str = "tn-lmdb-migrating";
 
 /// The `--db.*` settings of a throwaway temp chain's database (`RethEnv::new_for_temp_chain`).
 ///
@@ -166,7 +175,10 @@ fn open_tn_lmdb(
 /// the node would lose its chain. Each check is `try_exists`, so a stat error fails the open and
 /// is never read as an absent file.
 ///
-/// The MDBX build refuses `tn-lmdb.dat`.
+/// The MDBX build refuses `tn-lmdb.dat`, and a migrated directory whose `tn-lmdb.dat` is missing
+/// (the marker [`MIGRATED_MARKER`] alone). It warns of a stopped migration's temp directory
+/// ([`MIGRATING_DIR`], a partial copy beside an unchanged MDBX database), naming it and its size,
+/// and never removes it.
 #[cfg(not(feature = "tn-lmdb"))]
 fn check_backend(path: &Path) -> eyre::Result<()> {
     let tn_lmdb = path.join(TN_LMDB_DATA_FILE);
@@ -179,7 +191,34 @@ fn check_backend(path: &Path) -> eyre::Result<()> {
             tn_lmdb.display(),
         );
     }
+    let marker = path.join(MIGRATED_MARKER);
+    if file_exists(&marker)? {
+        eyre::bail!(
+            "the reth database at {} was migrated from MDBX to tn-lmdb ({} exists), but {} is \
+             missing, and this build runs reth on MDBX: it does not create a new database beside \
+             the datadir's static files in its place; restore the file and run a build with the \
+             `tn-lmdb` feature, or start from a fresh datadir (or `db load-state`)",
+            path.display(),
+            marker.display(),
+            tn_lmdb.display(),
+        );
+    }
+    let temp = path.join(MIGRATING_DIR);
+    if file_exists(&temp)? {
+        let size = match dir_bytes(&temp) {
+            Ok(bytes) => format!("{bytes} bytes"),
+            Err(e) => format!("unknown ({e})"),
+        };
+        tracing::warn!(target: "tn::reth", dir = %temp.display(), %size, "a stopped MDBX to tn-lmdb migration left its temp directory, a partial copy (the MDBX database is unchanged): this build never removes it; remove it by hand to free its space");
+    }
     Ok(())
+}
+
+/// The bytes of the files directly in `dir`: a migration's temp directory holds no directories.
+#[cfg(not(feature = "tn-lmdb"))]
+fn dir_bytes(dir: &Path) -> std::io::Result<u64> {
+    std::fs::read_dir(dir)?
+        .try_fold(0u64, |sum, entry| Ok(sum.saturating_add(entry?.metadata()?.len())))
 }
 
 /// Never open a database directory that holds the other engine's data file as it is.
@@ -191,12 +230,46 @@ fn check_backend(path: &Path) -> eyre::Result<()> {
 ///
 /// The tn-lmdb build moves an MDBX database (`mdbx.dat`) onto tn-lmdb instead, through
 /// `migrate::migrate_from_mdbx` (its module docs list the states and steps), with `args`' page
-/// size and reservation. It also finishes a migration stopped after its commit point, refuses an
-/// `mdbx.dat` written after a migration (or a migrated database whose `tn-lmdb.dat` is missing),
-/// and removes a stopped migration's temp directory.
+/// size, reservation and growth step. It also finishes a migration stopped after its commit point,
+/// refuses an `mdbx.dat` written after a migration or beside a `tn-lmdb.dat` no migration left (or
+/// a migrated database whose `tn-lmdb.dat` is missing), and removes a stopped migration's temp
+/// directory.
 #[cfg(feature = "tn-lmdb")]
 fn check_backend(path: &Path, args: tn_lmdb_reth::TnLmdbArgs) -> eyre::Result<()> {
     migrate::migrate_from_mdbx(path, args)
+}
+
+/// Refuse the database directory `path`, before anything opens it, if this build's open would
+/// first migrate it: for `db load-state`, which restores into a fresh datadir and must not move a
+/// node's database onto another engine before it refuses the datadir. A stat error fails it.
+///
+/// The MDBX build never migrates, so it refuses nothing here: its open refuses a tn-lmdb or
+/// migrated directory before creating anything.
+#[cfg(not(feature = "tn-lmdb"))]
+pub fn refuse_pending_migration(path: &Path) -> eyre::Result<()> {
+    let _ = path;
+    Ok(())
+}
+
+/// Refuse the database directory `path`, before anything opens it, if this build's open would
+/// first migrate it: for `db load-state`, which restores into a fresh datadir and must not move a
+/// node's database onto another engine before it refuses the datadir. A stat error fails it.
+///
+/// The tn-lmdb build refuses a directory holding MDBX's data file (`mdbx.dat`), whatever its
+/// database holds: the open would migrate it, or finish a stopped migration, which removes MDBX's
+/// files.
+#[cfg(feature = "tn-lmdb")]
+pub fn refuse_pending_migration(path: &Path) -> eyre::Result<()> {
+    let mdbx = path.join(MDBX_DATA_FILE);
+    if file_exists(&mdbx)? {
+        eyre::bail!(
+            "the reth database at {} holds an MDBX database ({} exists), which this build's open \
+             would first migrate to tn-lmdb: refused before anything opens it",
+            path.display(),
+            mdbx.display(),
+        );
+    }
+    Ok(())
 }
 
 /// The figures of one of reth's tables in the database's newest committed state
@@ -228,7 +301,8 @@ pub const DB_TABLE_STATS_NEEDS_STOPPED_NODE: bool = cfg!(feature = "tn-lmdb");
 /// added to reth's tables still reports.
 ///
 /// The MDBX build opens read-only through reth's `open_db_read_only`, which works while a node
-/// runs. It first refuses a directory holding a tn-lmdb database, as the backend guard does.
+/// runs. It first refuses a directory holding a tn-lmdb database, or a migrated one, as the
+/// backend guard does.
 #[cfg(not(feature = "tn-lmdb"))]
 pub fn db_table_stats(path: &Path) -> eyre::Result<Vec<DbTableStat>> {
     use reth_db::{
@@ -294,8 +368,9 @@ fn mdbx_table_stat(
 /// ([`DB_TABLE_STATS_NEEDS_STOPPED_NODE`]): a database another handle holds with write access is
 /// refused with an error saying to stop the node. It never migrates: a directory holding an MDBX
 /// database (`mdbx.dat`) is refused, as one whose migration to tn-lmdb is pending or unfinished
-/// (the node's open runs it), or, beside a finished migration's marker, as the node's open
-/// refuses it. With neither `mdbx.dat` nor `tn-lmdb.dat` there is no reth database at `path`.
+/// (the node's open runs it), or, beside a finished migration's marker or a `tn-lmdb.dat` no
+/// migration left, as the node's open refuses it. With neither `mdbx.dat` nor `tn-lmdb.dat` there
+/// is no reth database at `path`.
 #[cfg(feature = "tn-lmdb")]
 pub fn db_table_stats(path: &Path) -> eyre::Result<Vec<DbTableStat>> {
     use reth_db::{mdbx::Error as MdbxError, DatabaseError};
@@ -303,8 +378,11 @@ pub fn db_table_stats(path: &Path) -> eyre::Result<Vec<DbTableStat>> {
 
     let mdbx = path.join(MDBX_DATA_FILE);
     if file_exists(&mdbx)? {
-        if file_exists(&path.join(migrate::MIGRATED_MARKER))? {
+        if file_exists(&path.join(MIGRATED_MARKER))? {
             return Err(migrate::written_after_migration(path));
+        }
+        if file_exists(&path.join(DATA_FILE))? && !migrate::stopped_after_commit_point(path)? {
+            return Err(migrate::both_engines(path));
         }
         eyre::bail!(
             "the reth database at {} holds an MDBX database ({} exists): its MDBX to tn-lmdb \

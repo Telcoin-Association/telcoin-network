@@ -127,8 +127,15 @@ lane_test_tn_lmdb() {
     # runs reth on tn-lmdb. This is the same workspace run with tn-reth's `tn-lmdb` feature:
     # feature unification switches every crate that opens a reth database (tn-reth, tn-node,
     # the CLI and every test built on them) to tn-lmdb, so between the two lanes each of those
-    # tests runs once against each engine.
-    run cargo nextest run --locked --workspace --features tn-reth/tn-lmdb "${run_mode[@]}"
+    # tests runs once against each engine. The feature changes only tn-reth (it adds tn-lmdb-reth
+    # as tn-reth's dependency, with no feature change on any other package), so a package with no
+    # dependency path to tn-reth, dev-dependencies included (`cargo tree --workspace -i tn-reth
+    # -e normal,build,dev`), builds and tests the same as in lane_test_default. The engine's and
+    # the adapter's suites are such packages and are excluded. Every other package reaches
+    # tn-reth, if only through a dev-dependency, and reruns here (tn-utils, with no path either,
+    # holds a single test).
+    run cargo nextest run --locked --workspace --exclude tn-lmdb --exclude tn-lmdb-reth \
+        --features tn-reth/tn-lmdb "${run_mode[@]}"
 }
 
 (($# <= 2)) || usage

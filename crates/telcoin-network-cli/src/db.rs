@@ -22,8 +22,9 @@ use std::{
 };
 use tn_config::{Config, ConfigFmt, ConfigTrait as _, PidLock, TelcoinDirs as _};
 use tn_reth::{
-    db_table_stats, iter_static_files, snapshot::SnapshotRestorer, DbTableStat, RethCommand,
-    RethConfig, RethEnv, StaticFileProvider, TNPrimitives, DB_TABLE_STATS_NEEDS_STOPPED_NODE,
+    db_table_stats, iter_static_files, refuse_pending_migration, snapshot::SnapshotRestorer,
+    DbTableStat, RethCommand, RethConfig, RethEnv, StaticFileProvider, TNPrimitives,
+    DB_TABLE_STATS_NEEDS_STOPPED_NODE,
 };
 use tn_storage::{
     consensus::ConsensusChain,
@@ -719,6 +720,17 @@ impl DbLoadStateArgs {
             bail!("datadir {} does not exist", datadir.display());
         }
         let _pid_lock = PidLock::acquire(&datadir)?;
+
+        // A restore never migrates the reth database. `SnapshotRestorer::open` refuses a datadir
+        // holding chain data only once the database is open, and on a build whose open first moves
+        // an MDBX database onto tn-lmdb that open would already have migrated it: such a datadir is
+        // refused here, before anything opens it.
+        refuse_pending_migration(&datadir.reth_db_path()).map_err(|e| {
+            e.wrap_err(
+                "`db load-state` restores into a fresh datadir and never migrates its reth \
+                 database",
+            )
+        })?;
 
         // Genesis chain spec: bundled via `--chain`, else from the datadir config (mirrors the node
         // command). Genesis is the trust root, so it must match the chain the pack came from.
@@ -1672,6 +1684,31 @@ mod tests {
             .execute(datadir)
             .expect_err("load-state must refuse while a node holds the lock");
         assert!(err.to_string().contains("another telcoin process"), "unexpected error: {err}");
+    }
+
+    /// `db load-state` never migrates the reth database: on a build whose open first moves an MDBX
+    /// database onto tn-lmdb, a datadir holding `db/mdbx.dat` is refused before anything opens it
+    /// (`tn_reth::refuse_pending_migration`, the first check after the datadir lock), and the file
+    /// is left as it was. The MDBX build's open never migrates, so there the run fails later (here
+    /// on the absent config) and nothing opens the planted file either.
+    #[test]
+    fn db_load_state_never_migrates_the_reth_database() {
+        use tn_config::TelcoinDirs as _;
+        let dir = tempfile::tempdir().unwrap();
+        let datadir = dir.path().to_path_buf();
+        let db = datadir.reth_db_path();
+        fs::create_dir_all(&db).unwrap();
+        fs::write(db.join("mdbx.dat"), b"an MDBX database").unwrap();
+
+        let err = super::DbLoadStateArgs { pack: dir.path().join("bundle"), chain: None }
+            .execute(datadir)
+            .expect_err("no bundle, and on tn-lmdb an MDBX database");
+        let msg = format!("{err:#}");
+        let migrating_build = tn_reth::refuse_pending_migration(&db).is_err();
+        assert_eq!(msg.contains("never migrates its reth database"), migrating_build, "{msg}");
+        assert_eq!(fs::read(db.join("mdbx.dat")).unwrap(), b"an MDBX database", "mdbx.dat kept");
+        let entries: Vec<_> = fs::read_dir(&db).unwrap().map(|e| e.unwrap().file_name()).collect();
+        assert_eq!(entries, ["mdbx.dat"], "nothing else is made in the reth database directory");
     }
 
     /// `db stats` holds the datadir lock only when the reth database cannot be read beside a

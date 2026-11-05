@@ -3,10 +3,10 @@
 # RocksDB guard: fail if rocksdb enters the default feature graph.
 #
 # librocksdb-sys is the entire RocksDB C++ engine (332 translation units) and the single
-# largest native compile in the tree. Storage here is MDBX-only, so the workspace takes reth's
-# individual crates (never the `reth` umbrella, whose defaults include it) and leaves `rocksdb`
-# off; see the note above the reth entries in Cargo.toml, including the warning that reth's
-# `edge` features imply it.
+# largest native compile in the tree. TN's reth database never uses RocksDB (MDBX, or tn-lmdb
+# with `tn-lmdb`), so the workspace takes reth's individual crates (never the `reth` umbrella,
+# whose defaults include it) and leaves `rocksdb` off; see the note above the reth entries in
+# Cargo.toml, including the warning that reth's `edge` features imply it.
 # This guard catches the bump that re-introduces it through some other default set: the
 # cost would land on every build, and the cache warm on main would absorb it without a
 # word.

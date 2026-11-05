@@ -3,7 +3,9 @@
 //! migration of a copy of a real database.
 
 use super::*;
-use crate::env::database::{db_table_stats, open_tn_lmdb, temp_chain_db_args, RethDb};
+use crate::env::database::{
+    db_table_stats, open_tn_lmdb, temp_chain_db_args, tn_lmdb_args, RethDb,
+};
 use reth_db::{
     cursor::DbDupCursorRO as _,
     mdbx::DatabaseFlags,
@@ -636,6 +638,38 @@ fn a_migration_stopped_before_its_marker_is_finished() {
     assert!(marker.contains("finished by a later open"), "{marker}");
 }
 
+/// A migration that fails after its commit point (here at the database directory's fsync after
+/// the rename) keeps MDBX's files and the temp directory, emptied by the rename, and says the next
+/// start finishes the migration, not that MDBX is unchanged; the next open finishes it.
+#[test]
+fn a_failure_after_the_commit_point_is_finished_by_the_next_open() {
+    let tmp = TempDir::new().expect("tempdir");
+    let path = tmp.path().join("db");
+    let expected = build_mdbx(&path);
+
+    FAIL_AT.set(Some(Step::AfterRename));
+    let err = open(&path).expect_err("the migration fails after its commit point");
+    assert_eq!(FAIL_AT.get(), None, "the failure was made");
+    let msg = format!("{err:#}");
+    assert!(msg.contains("the next start finishes the migration"), "{msg}");
+    assert!(!msg.contains("unchanged"), "{msg}");
+    for present in [DATA_FILE, MDBX_DATA_FILE, MIGRATING_DIR] {
+        assert!(exists(&path.join(present)), "{present} is kept");
+    }
+    assert!(!exists(&path.join(MIGRATING_DIR).join(DATA_FILE)), "emptied by the rename");
+    assert!(!exists(&path.join(MIGRATED_MARKER)), "no marker");
+
+    let db = open(&path).expect("the next open finishes the migration");
+    let mut rows = raw_rows(&*db);
+    rows.get_mut(tables::VersionHistory::NAME).expect("history").pop();
+    assert!(rows == expected, "every row, as MDBX held it");
+    for gone in [MDBX_DATA_FILE, MDBX_LOCK_FILE, MIGRATING_DIR] {
+        assert!(!exists(&path.join(gone)), "{gone} is removed");
+    }
+    let marker = std::fs::read_to_string(path.join(MIGRATED_MARKER)).expect("marker");
+    assert!(marker.contains("finished by a later open"), "{marker}");
+}
+
 /// An `mdbx.dat` beside a finished migration's marker was written after the migration: the open
 /// refuses it, naming both files, and changes nothing. `db stats` refuses it the same way.
 #[test]
@@ -669,6 +703,48 @@ fn mdbx_written_after_a_migration_is_refused() {
     let mut rows = raw_rows(&*open(&path).expect("open once resolved"));
     rows.get_mut(tables::VersionHistory::NAME).expect("history").pop();
     assert_eq!(rows, expected);
+}
+
+/// An `mdbx.dat` beside a `tn-lmdb.dat` that no migration left (no marker, and no temp directory
+/// emptied by a migration's rename), as a build running reth on MDBX leaves one it creates beside a
+/// new tn-lmdb database, is no stopped migration: the open refuses it, naming both files, and
+/// changes nothing. A temp directory still holding a copy (one from before a commit point) does
+/// not make it one. `db stats` refuses it the same way.
+#[test]
+fn mdbx_beside_a_database_no_migration_left_is_refused() {
+    let tmp = TempDir::new().expect("tempdir");
+    let path = tmp.path().join("db");
+    let db = open(&path).expect("a new database");
+    let tx = db.tx_mut().expect("tx_mut");
+    tx.put::<tables::CanonicalHeaders>(7, Default::default()).expect("put");
+    tx.commit().expect("commit");
+    drop(db);
+    std::fs::write(path.join(MDBX_DATA_FILE), b"written by an older binary").expect("plant");
+    let tn_lmdb = std::fs::read(path.join(DATA_FILE)).expect("tn-lmdb.dat");
+    let temp = path.join(MIGRATING_DIR);
+
+    let refused = |err: eyre::Report, case: &str| {
+        let msg = format!("{err:#}");
+        assert!(msg.contains("not a stopped migration"), "{case}: says why: {msg}");
+        for file in [MDBX_DATA_FILE, DATA_FILE] {
+            let named = msg.contains(&path.join(file).display().to_string());
+            assert!(named, "{case}: names {file}: {msg}");
+        }
+        let mdbx = std::fs::read(path.join(MDBX_DATA_FILE)).expect("mdbx.dat");
+        assert_eq!(mdbx, b"written by an older binary", "{case}: mdbx.dat unchanged");
+        let now = std::fs::read(path.join(DATA_FILE)).expect("tn-lmdb.dat");
+        assert!(now == tn_lmdb, "{case}: tn-lmdb.dat unchanged");
+        assert!(!exists(&path.join(MIGRATED_MARKER)), "{case}: no marker");
+    };
+    refused(open(&path).expect_err("both engines' files"), "no temp directory");
+    assert!(!exists(&temp), "no temp directory is made");
+    refused(db_table_stats(&path).expect_err("the stats refuse it"), "db stats");
+
+    std::fs::create_dir(&temp).expect("temp dir");
+    std::fs::write(temp.join(DATA_FILE), b"a stopped copy").expect("stale file");
+    refused(open(&path).expect_err("both engines' files"), "a temp directory with a copy");
+    let stale = std::fs::read(temp.join(DATA_FILE)).expect("the temp directory is kept");
+    assert_eq!(stale, b"a stopped copy");
 }
 
 /// A migrated database whose `tn-lmdb.dat` is missing (the marker alone) is refused, and nothing is
@@ -779,14 +855,17 @@ fn mdbx_code(err: &eyre::Report) -> Option<i32> {
 }
 
 /// The free space a migration needs: the live bytes of reth's tables in MDBX, a quarter of them,
-/// and 1 GiB.
+/// and 1 GiB or the copy's growth step, whichever is larger.
 #[test]
-fn needed_bytes_is_the_live_bytes_plus_a_quarter_and_a_gib() {
+fn needed_bytes_is_the_live_bytes_plus_a_quarter_and_a_gib_or_the_growth_step() {
     const GIB: u64 = 1 << 30;
-    assert_eq!(needed_bytes(0), GIB);
-    assert_eq!(needed_bytes(1000), 1250 + GIB);
-    assert_eq!(needed_bytes(4 * GIB), 6 * GIB);
-    assert_eq!(needed_bytes(u64::MAX), u64::MAX, "saturates");
+    /// A growth step under 1 GiB (the temp chain's).
+    const STEP: u64 = 4 << 20;
+    assert_eq!(needed_bytes(0, STEP), GIB);
+    assert_eq!(needed_bytes(1000, STEP), 1250 + GIB);
+    assert_eq!(needed_bytes(4 * GIB, GIB), 6 * GIB);
+    assert_eq!(needed_bytes(4 * GIB, 8 * GIB), 13 * GIB, "a step over 1 GiB is taken whole");
+    assert_eq!(needed_bytes(u64::MAX, STEP), u64::MAX, "saturates");
 }
 
 /// The live bytes of reth's tables in the MDBX database in `path`: each table's branch, leaf and
@@ -819,8 +898,9 @@ fn a_migration_without_the_free_space_it_needs_is_refused() {
     // MDBX's file holds more than its tables' live pages, so a check sized on the file would
     // refuse the run below that has exactly the free space the live bytes need.
     assert!(0 < live && live < file, "live {live} bytes, file {file} bytes");
-    let needed = needed_bytes(live);
-    assert!(needed < needed_bytes(file));
+    let max_growth = tn_lmdb_args(&tn_lmdb_db_args()).expect("args").max_growth;
+    let needed = needed_bytes(live, max_growth);
+    assert!(needed < needed_bytes(file, max_growth));
 
     FREE_BYTES.set(Some(needed - 1));
     let err = open(&path).expect_err("too little free space");
@@ -1010,7 +1090,7 @@ fn migrates_a_copy_of_a_real_database() {
     println!(
         "mdbx.dat {mdbx_len} bytes, its tables' live pages {live} bytes: the migration needs {} \
          bytes free",
-        needed_bytes(live)
+        needed_bytes(live, TnLmdbArgs::default().max_growth)
     );
 
     crate::init_reth_defaults();
