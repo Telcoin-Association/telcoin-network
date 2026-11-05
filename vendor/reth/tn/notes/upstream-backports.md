@@ -55,7 +55,7 @@ Severity below is for TN, which differs from upstream's in places. Relevant TN f
 
 | sha | subject | crate | why it matters to TN | status |
 |---|---|---|---|---|
-| 75d587208 | `enforce_tracked_nonce` | transaction-pool | The pool re-admits a nonce from a batch that reached quorum, so a sender gets free skipped transactions (review finding T2-1; also on the reth git dependency). Enabling it needs the batch builder's repool, requeue and orphan paths reconciled first. Pool admission only: no batch or block validity change | tracked in `tasks/issue-pool-quorum-nonce-readmission.md` |
+| 75d587208 | `enforce_tracked_nonce` | transaction-pool | The pool re-admits a nonce from a batch that reached quorum, so a sender gets free skipped transactions (review finding T2-1; also on the reth git dependency). Enabling it needs the batch builder's repool, requeue and orphan paths reconciled first. Pool admission only: no batch or block validity change | described in `open-issues.md` |
 
 ### High (correctness, not security)
 
@@ -90,8 +90,9 @@ names the segment and anchor; diagnostics only). Each picks cleanly or with test
 fd1c9982c (implicit simulate gas cap; Amsterdam/EIP-8037 only), 7b3432d95 (`eth_simulateV1`
 timestamp overflow in `sanitize_chain`, which TN's v1.11 simulate code predates), 0eeb8c5ef
 (eth/68 packing; devp2p, not vendored), a9b6969e7 (init-state OOM; TN does not use reth's
-state-dump import), 1b20c9bfc (prune checkpoints in the static-file consistency check; it only
-affects receipts, senders and changesets in static files, which storage v1 keeps in MDBX),
+state-dump import), 1b20c9bfc (prune checkpoints in the static-file consistency check; senders
+and changesets are in MDBX under storage v1, and receipts are in static files but TN never prunes,
+so the checkpoints it reads are unset),
 6bd6bf28a (receipts static-file sizing; node-builder and receipts-in-static-files only),
 00f9bd2a9 (`tx_hash()` instead of `trie_hash()`; equal for Ethereum transaction types, so it only
 saves a re-hash),

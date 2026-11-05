@@ -22,7 +22,7 @@ can have two units with different features. The views keep them apart:
 
 The targets are x86_64-unknown-linux-gnu (the release target) and aarch64-apple-darwin.
 `--target <triple>` after `--` replaces them (repeat it for several). Other arguments after `--`
-go to each `cargo tree` call: `--features telcoin-network/tndb-b`, `-p <pkg>`, `--offline`, or
+go to each `cargo tree` call: `--features telcoin-network/js-tracer`, `-p <pkg>`, `--offline`, or
 `--manifest-path <checkout>/Cargo.toml` to snapshot another checkout, such as the commit before
 a change, with this script.
 

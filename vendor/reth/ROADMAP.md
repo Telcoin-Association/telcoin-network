@@ -4,9 +4,27 @@ Where the vendored reth goes next, in the order that makes each step cheap and s
 `tn/notes/usage-map.md` first: it records what TN actually uses from each crate and where. Status
 markers: **[done]**, **[next]**, **[later]**.
 
-## Status (2026-10-31)
+## Status (2026-11-05, the PR to `main`)
 
-- 101 reth crates were vendored at v1.11.3; 57 remain after reduction Phases 1, 2, 4a, 6a, 6b
+- The vendoring moved from `sls_tndb_b_vendor`, where it sat on top of the tndb-b storage work, to
+  its own branch off `main` (D8). Nothing from tndb-b is included.
+- The ledger runs TN-0001 to TN-0037. A review on 2026-11-01 found nothing Critical and nothing
+  that can split validators. Its fixes: TN-0034 to TN-0037, `patches/revm-inspectors` (Boa's
+  recursion limit), a test that pins storage v1, WebSocket origin checks on every worker's server,
+  and tooling fixes. What it left open is in `tn/notes/open-issues.md`.
+- CI now runs reth's own tests for the vendored crates and the `js-tracer` build (lane
+  `test-vendor-reth`, job `vendor-reth-test`) and the patched crate's tests (job
+  `revm-inspectors-patch`).
+- `make test-upgrade` runs `main`'s binary and this one side by side: rolling in-place upgrade,
+  re-execution from genesis on both binaries, a rollback, and identical block hash, `stateRoot`
+  and `receiptsRoot` on every node. Run it against the deployed release before rolling out a
+  change to the execution or storage path (CLAUDE.md, "Fork safety").
+
+## Status (2026-10-31, on `sls_tndb_b_vendor`)
+
+Commit ids and the tndb-b counts below are from that branch, not from `main`'s history.
+
+- 101 reth crates were vendored at v1.11.3; 57 remain after reduction Phases 1, 2, 4 (TN-0012), 6a, 6b
   and the second pass (TN-0025 to TN-0033, tag `reth-reduction-2-start`). Synced to v1.11.4.
   RocksDB is gone (TN-0014); its zero-size stubs stay until the tndb-b work (D15). The ledger
   runs TN-0001 to TN-0033.
@@ -57,12 +75,12 @@ markers: **[done]**, **[next]**, **[later]**.
   a feature needs an explanation in the commit. The revm precompile backends (`secp256k1`, `blst`,
   `c-kzg`) and `asm-keccak` are consensus-relevant: losing one can change results or performance
   without a compile error.
-- Verification ladder, cheapest first: `cargo check --workspace --all-targets` (default and
-  `--features tn-reth/tndb-b`), `etc/ci-lanes.sh fmt` and `clippy`, the nextest lanes, then the
-  e2e restart and epoch suites (`make test-restarts`, `make test-epochs`, and the `-tndb`
-  variants). Run reth's own tests for any vendored crate you change (`tn/cargo.sh test -p ...`).
-- Tag `reth-reduction-start` sits on the last commit before the first reduction. `git diff
-  reth-reduction-start` shows everything reduction has done.
+- Verification ladder, cheapest first: `cargo check --workspace --all-targets`,
+  `etc/ci-lanes.sh fmt` and `clippy`, the nextest lanes including `test-vendor-reth`, then the
+  e2e restart and epoch suites (`make test-restarts`, `make test-epochs`). For a change on the
+  execution or storage path, also `make build-e2e-bin-prev TN_PREV_REF=<release>` and then
+  `make test-upgrade`. Run reth's own tests for any vendored crate you change
+  (`tn/cargo.sh test -p ...`).
 
 ## Phase 0: vendor [done]
 
@@ -204,7 +222,7 @@ CHANGES.md and DECISIONS.md should remain).
   traits.
 - `reth-evm-ethereum` contributes three items. TN pins all forks at genesis, so a TN-owned
   `revm_spec` and receipt builder are small.
-- `reth-metrics` in nine TN crates becomes `metrics` plus `metrics-derive` (mechanical).
+- `reth-metrics` in six TN crates becomes `metrics` plus `metrics-derive` (mechanical).
 - [done, TN-0012] `reth-primitives` became `reth-primitives-traits` plus `reth-ethereum-primitives`;
   `tn-types` now owns the `Block`/`BlockBody`/`SealedBlock` aliases. Going further (TN-owned
   `Sealed*`/`Recovered*`) touches about 150 sites through `tn-types`.
@@ -226,8 +244,9 @@ rules.
 its `CompressionLayer` and optional JWT layer. 6b done 2026-10-31 (TN-0021): `admin`, `miner`,
 `otterscan`, `reth` and `txpool` are removed, together with the unused anvil, hardhat, engine,
 testing and validation traits. An upstream change to a deleted file merges as "left deleted";
-only rpc-builder's registry arms and the two `lib.rs` files can conflict. `mev` stays: TN's
-epoch-fee adapter serves `eth_callBundle` through `EthBundle`.
+only rpc-builder's registry arms and the two `lib.rs` files can conflict. `mev` went later
+(TN-0033). `eth_callBundle` stays in the `eth` namespace: TN's epoch-fee adapter
+(`tn-reth/src/rpc_bundle.rs`) wraps reth's `EthBundle`.
 
 TN serves only `eth`, `net`, `web3`, `debug`, `trace` and `rpc` (`ALLOWED_MODULES` in
 `tn-reth/src/cli.rs`) plus its own `tn` namespace, and overrides seven methods. The vendored
@@ -292,7 +311,7 @@ Left, with the reason:
 - A trial `sync v2.0.0` (2026-10-30) showed the shape of the next major step:
   `reth-primitives-traits`, `reth-codecs(-derive)` and `reth-zstd-compressors` move to crates.io,
   `reth-primitives` and `reth-engine-service` disappear, `engine/execution-cache` is new, and revm
-  goes from 34 to 36. Do Phase 1 before attempting it: fewer crates, fewer conflicts.
+  goes from 34 to 36.
 - Security fixes in revm and alloy arrive through crates.io, independent of reth. Bump them in
   `vendor/reth/Cargo.toml` and the root `Cargo.lock`.
 

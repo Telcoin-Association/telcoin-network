@@ -6,14 +6,21 @@ possible but optional.
 
 - Base: imported from upstream `v1.11.3` (`d6324d63e27e`), synced to `v1.11.4`
   (`2ac58a25f561`). The current pin is always in `tn/upstream.toml`.
-- Tags: `reth-vendor-import-v1.11.3` (verbatim import), `reth-vendor-v1.11.3` (vendoring done
-  and verified), `reth-reduction-start` (last commit before reduction). `git diff
-  reth-reduction-start` shows everything the reduction changed.
+- History: the import, the vendoring and both reduction passes were done on
+  `sls_tndb_b_vendor`, on top of the tndb-b work, and moved to a branch off `main` for review.
+  The local tags from that work (`reth-vendor-import-v1.11.3`, `reth-vendor-v1.11.3`,
+  `reth-reduction-start`, `reth-reduction-2-start`) are not in `main`'s history. The durable
+  record is `vendor.py diff` against the pin, plus CHANGES.md.
+- tndb-b: work in progress to replace MDBX as reth's database, on `sls_tndb_b_vendor`. It is not
+  on `main`, and it is not `tndb`, TN's consensus database in `crates/storage`.
 - Carried: the reth crates in TN's dependency graph (57 after both reduction passes; 101 at
   import), plus the test-only `reth-testing-utils`. The list is in `tn/crates.txt`.
 - TN's changes against upstream: CHANGES.md, the ledger.
 - Why it is built this way: DECISIONS.md.
 - What comes next (tndb-b, trimming Ethereum-only code, alloy/revm directly): ROADMAP.md.
+- Known issues left for separate changes: `tn/notes/open-issues.md`.
+- Agents and reviewers: CLAUDE.md is the short path through all of this (read order, where
+  things are, fork-safety checks, tracking upstream).
 
 ## Layout
 
@@ -27,10 +34,12 @@ vendor/reth/
   testing/...       testing/testing-utils (dev-only)
   tn/               TN tooling: vendor.py, graph.py, cargo.sh, crates.txt, upstream.toml, and
                     the tools' tests (test_*.py)
-  README.md CHANGES.md DECISIONS.md ROADMAP.md   (TN's docs; upstream's README is not carried)
+  tn/notes/         the usage map, the upstream-backport tracker and the open issues
+  README.md CHANGES.md DECISIONS.md ROADMAP.md CLAUDE.md
+                    TN's docs (upstream's README and CLAUDE.md are not carried)
 ```
 
-Everything outside `tn/` and the four TN docs mirrors an upstream path. Crate names are
+Everything outside `tn/` and the five TN docs mirrors an upstream path. Crate names are
 unchanged (`reth-db`, `reth-provider`, ...), so TN code imports `reth_db::...` exactly as before.
 
 ## How TN builds against it
@@ -65,15 +74,19 @@ Things that differ from the git dependency this replaced:
    `TN(TN-NNNN):`. Leave out cosmetic changes. They make every upstream sync conflict for
    nothing.
 4. Build and test: `make check`, the TN tests that touch the area, and reth's own tests for the
-   crate (`vendor/reth/tn/cargo.sh test -p <crate>`).
+   crate (`vendor/reth/tn/cargo.sh test -p <crate>`). For a change on the execution or storage
+   path, also run the fork checks in CLAUDE.md ("Fork safety"), which end with
+   `make test-upgrade`.
 
-Run `python3 -I vendor/reth/tn/vendor.py diff [PATH...]` to see the full diff of TN's changes
-against the pinned upstream. `status` lists the changed files.
+Run `python3 -I vendor/reth/tn/vendor.py diff [PATH...]` (paths relative to `vendor/reth`) to see
+the full diff of TN's changes against the pinned upstream. `status` lists the changed files.
 
 ## Running reth's own tests
 
 reth's unit and integration tests only resolve inside the nested workspace (their
-dev-dependencies are reth's). Use:
+dev-dependencies are reth's). CI runs them in the `test-vendor-reth` lane
+(`etc/ci-lanes.sh test-vendor-reth`, job `vendor-reth-test`), with and without `js-tracer`. By
+hand:
 
 ```
 vendor/reth/tn/cargo.sh test -p reth-db --lib
@@ -177,8 +190,7 @@ entry from the root `Cargo.toml` if TN named the crate, and refresh `Cargo.lock`
 ## Verifying the copy
 
 - `python3 -I vendor/reth/tn/vendor.py status` compares every vendored file with the pinned
-  upstream and lists what differs. Right after the import (tag `reth-vendor-import-v1.11.3`) it
-  printed "identical".
+  upstream and lists what differs. Right after the import it printed "identical".
 - `vendor.py check` reports workspace dependencies the vendored manifests use but the nested
   workspace does not define.
 - `vendor.py status` also warns about files a `.gitignore` rule hides from git, which would

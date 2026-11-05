@@ -8,6 +8,9 @@ internals directly (`src/lib.rs`).
 This document is written for maintainers and security researchers. Everything below is derived
 from the code at the cited paths; when the code and this file disagree, the code wins.
 
+reth is vendored at `vendor/reth` and built from source. TN's changes to it are in
+`vendor/reth/CHANGES.md`; `vendor/reth/CLAUDE.md` is the quick guide for agents and reviewers.
+
 ## Execution model
 
 - Consensus is the only block producer. Certified `ConsensusOutput` (a committed sub-DAG with

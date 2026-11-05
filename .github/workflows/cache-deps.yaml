@@ -17,7 +17,7 @@
 #   clippy-cache  both clippy passes (etc/ci-lanes.sh), the release graph and every target
 #                 under --all-features, under the nightly pin; read by pr.yaml's `clippy`
 #                 job and main-compiles.yaml's `fmt-clippy`
-#   test-cache    dependencies for both test lanes (default and adiri features) under
+#   test-cache    dependencies for the test lanes (default, adiri, vendored reth) under
 #                 the stable pin; read by pr.yaml's `test` and `adiri-test` and by
 #                 main-compiles.yaml's `build-tests`. Workspace test binaries are rebuilt
 #                 per run because rust-cache does not save workspace crates.

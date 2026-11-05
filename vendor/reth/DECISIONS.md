@@ -97,8 +97,8 @@ alone: it is barely more code, and the safe state is the default.
 
 ## D8. Git workflow
 
-Decided with the maintainer, 2026-10-30: local commits and tags only, on `sls_tndb_b_vendor`;
-nothing is pushed. Reduction work happens on the same branch after the tag `reth-reduction-start`.
+Decided with the maintainer, 2026-10-30: commits and tags on `sls_tndb_b_vendor`, pushed only
+when the maintainer says so. The branch has since been pushed; the tags are local only. Reduction work happens on the same branch after the tag `reth-reduction-start`.
 
 Tags:
 
@@ -116,6 +116,10 @@ tndb-b integration commit (9905e5468) without its database backend. The tags sti
 commits on `sls_tndb_b_vendor`. At each one the `vendor/reth` tree is identical to the matching
 commit on `sls_reth_vendor`, so `git diff <tag> -- vendor/reth` gives the same result on both
 branches.
+
+`main` squash-merges pull requests, so none of these commits or tags will be in `main`'s history.
+What lasts is the copy itself, `vendor.py diff` against the pin in `tn/upstream.toml`, and this
+ledger.
 
 ## D9. Keep MDBX compiled for now
 
@@ -224,7 +228,7 @@ instead of overflowing the thread's stack (T1-1).
 
 Maintainer direction, 2026-10-31: apply High and Critical security fixes, track everything else
 in `tn/notes/upstream-backports.md`. Severity is judged against TN, not taken from upstream or
-from the first survey. Two items were raised and two lowered:
+from the first survey. One item was raised and two lowered:
 
 - Raised to High: upstream's RPC blocking-work limits (TN-0019, six commits; first rated Medium).
   TN's execution engine and certificate validation share tokio's blocking pool with RPC, so

@@ -7,9 +7,9 @@ custom tracer API. reth implements it with the `JsInspector` from revm-inspector
 boa, a JavaScript engine written in Rust.
 
 TN builds without it. JavaScript tracers sit behind the opt-in `js-tracer` Cargo feature, defined
-in [`crates/tn-reth/Cargo.toml`](Cargo.toml#L153) and forwarded by
-[`tn-node`](../node/Cargo.toml#L61) and the
-[`telcoin-network` binary](../../bin/telcoin-network/Cargo.toml#L28). Whether to remove the
+in [`crates/tn-reth/Cargo.toml`](Cargo.toml) and forwarded by
+[`tn-node`](../node/Cargo.toml) and the
+[`telcoin-network` binary](../../bin/telcoin-network/Cargo.toml). Whether to remove the
 feature entirely is waiting on a maintainer review.
 
 ## What a build without it does
@@ -120,6 +120,9 @@ If the team decides to drop JavaScript tracers for good:
    [README](README.md#feature-flags) feature table, the test's `cfg(feature = "js-tracer")` branch
    (keep its refusal check), this file, and the note about it on the
    [`debug_traceTransaction`](../../docs/src/rpc-methods/debug/debug_tracetransaction.md) page.
+   Remove the two `js-tracer` runs from `lane_test_vendor_reth` in `etc/ci-lanes.sh`, and
+   consider retiring `patches/revm-inspectors`, which matters only to JavaScript tracers (its
+   PATCH.md lists what to delete).
 2. In `vendor/reth`, as a ledgered change (`CHANGES.md`): delete `js_tracer_interrupt.rs`, the
    `js-tracer` code in `crates/rpc/rpc/src/debug.rs` and
    `crates/rpc/rpc-eth-types/src/error/mod.rs`, and the `js-tracer` features of reth-rpc,

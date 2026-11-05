@@ -4,6 +4,10 @@ Research behind ROADMAP.md. Regenerate it before relying on it after large chang
 `file:line` references drift. Paths are relative to the TN repository root; a bare path such as
 `env/mod.rs:188` is under `crates/tn-reth/src/`.
 
+Taken on `sls_tndb_b_vendor`, which also carries the tndb-b storage work. Rows naming
+`tndb-b-reth`, `TndbEnv`, `env/database.rs`'s tndb-b build or `migrate.rs` do not apply to
+`main`. On `main`, five crates use `reth-metrics` only for its derive, not eight.
+
 Vendored: 57 reth crates plus the dev-only `reth-testing-utils` (`vendor/reth/tn/crates.txt`),
 down from 101 (TN-0005, TN-0009, TN-0011, TN-0012, and TN-0028 to TN-0032 in the second pass).
 RocksDB is gone (TN-0014). `cargo tree`

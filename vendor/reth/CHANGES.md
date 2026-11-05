@@ -2,7 +2,7 @@
 
 The ledger of every difference between `vendor/reth` and the pinned upstream
 (`tn/upstream.toml`). `python3 -I vendor/reth/tn/vendor.py status` lists the files that differ;
-each one has to be covered by an entry here. Changes to TN's own files (`tn/`, the four TN docs,
+each one has to be covered by an entry here. Changes to TN's own files (`tn/`, the five TN docs,
 `.gitignore`) and to the filtered workspace manifest's member list are not listed.
 
 Entry format:
@@ -11,8 +11,8 @@ Entry format:
   *Files*: what changed. *Why*: the reason, in a sentence or two. *Upstream*: worth offering
   upstream? (yes / no / n/a).
 
-Use the id in code comments (`TN(TN-NNNN): ...`) where an edit would surprise a reader. Kept
-newest last.
+Use the id in code comments (`TN(TN-NNNN): ...`) where an edit would surprise a reader. Grouped
+by section, newest last within each.
 
 ## Vendoring (base v1.11.3)
 
@@ -56,6 +56,7 @@ newest last.
   `EthereumEngineValidator`, which needs `reth-ethereum-payload-builder`, so keeping them would
   keep the whole node-builder subgraph in the nested workspace. TN does not serve the engine
   API. rpc-builder's http, ws, startup, middleware and serde tests stay. *Upstream*: n/a.
+  *Later*: TN-0010 and TN-0011 removed `rpc-engine-api`, so only the rpc-builder edits remain.
 
 - **TN-0005** — Remove 24 crates TN no longer depends on. *Kind*: removal.
   *Files*: removed from `tn/crates.txt` and the nested manifest with `vendor.py remove`:
@@ -76,8 +77,8 @@ newest last.
   `crates/rpc/rpc-eth-api/src/helpers/{block,call,config}.rs` (imports),
   `crates/rpc/rpc-eth-api/Cargo.toml`; `crates/rpc/rpc/src/eth/core.rs` (the
   `EthRpcConverterFor`, `EthApiFor` and `EthApiBuilderFor` aliases), `crates/rpc/rpc/src/eth/mod.rs`,
-  `crates/rpc/rpc/src/validation.rs` (imports from `reth-payload-primitives`),
-  `crates/rpc/rpc/Cargo.toml`.
+  `crates/rpc/rpc/src/validation.rs` (imports from `reth-payload-primitives`; the file was
+  deleted later by TN-0010), `crates/rpc/rpc/Cargo.toml`.
   *Why*: `reth-node-api` is the node builder's component API, and TN builds `EthApi` from
   `RpcNodeCoreAdapter`. The RPC crates used it only for re-exports (now taken from
   `reth-primitives-traits` and `reth-payload-primitives`) and for conveniences over
@@ -155,8 +156,9 @@ newest last.
   changed: the macro-expanded source (`-Zunpretty=expanded`) of reth-provider, reth-db-common
   and reth-db-api is identical before and after, apart from the source line numbers `tracing`
   embeds. Cargo.lock loses rocksdb, librocksdb-sys, bzip2-sys and lz4-sys.
-  *Still present*: the zero-size `RocksDBProvider` stub (`providers/rocksdb_stub.rs`) and the
-  storage-v2 plumbing that takes it (ROADMAP.md, "RocksDB step B"). *Upstream*: no.
+  *Still present*: the zero-size `RocksDBProvider` stub (`providers/rocksdb_stub.rs`; only its
+  module comment changed) and the storage-v2 plumbing that takes it (ROADMAP.md, "RocksDB step
+  B"). *Upstream*: no.
 
 - **TN-0020** — reth-node-core's version info comes from the upstream pin, not TN's git state.
   *Kind*: build.
@@ -216,7 +218,8 @@ newest last.
 
 - **TN-0028** — reth-db-common keeps genesis initialization only. *Kind*: removal.
   *Files*: `crates/storage/db-common/src/{init.rs, lib.rs}`, `Cargo.toml`; deleted
-  `src/db_tool/`; `crates/etl` removed from the vendored set.
+  `src/db_tool/`; `crates/etl` removed from the vendored set; the workspace manifest's
+  `boyer-moore-magiclen` entry.
   *Why*: TN calls only `init_genesis`. The state-dump import (`init_from_state_dump`, its JSONL
   parsers, `dump_state` and the two dump constants) and `DbTool` (the `reth db` CLI helper) were
   unused, and they were the only users of `reth-etl`, `boyer-moore-magiclen` (and its
@@ -324,8 +327,8 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   that name), `crates/rpc/rpc/Cargo.toml` (optional `humantime` as upstream; tokio `time`).
   *Why*: a JS tracer in `debug_traceTransaction`/`debug_traceCall` ignored its `timeout` and kept
   running on a blocking thread after the client dropped the request, until it finished or the node
-  ran out of memory (upstream #27543). TN builds with `js-tracer` and serves `debug` when an
-  operator names it (off by default). Now the timeout is honored (geth's 5 s default; expiry
+  ran out of memory (upstream #27543). TN compiles JS tracers only with its opt-in `js-tracer`
+  feature (D21) and serves `debug` only when an operator names it. Now the timeout is honored (geth's 5 s default; expiry
   returns `ExecutionTimedOut`) and a timed-out or dropped request stops the trace at the next
   inspector hook.
   *Adaptation*: upstream uses `JsInspectorInterrupt` from revm-inspectors 0.44.2, which needs

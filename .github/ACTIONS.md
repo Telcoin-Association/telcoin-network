@@ -27,6 +27,9 @@ So the two gates cover different things and neither replaces the other:
 | runs on | a maintainer's machine | GitHub runners |
 | on the pull request | checked on every run | `fmt`, `clippy` and the guards for every PR, drafts included; `test`, `adiri-test` and `vendor-reth-test` skipped for a draft or a maintainer-authored PR |
 
+`vendor-reth-test` runs reth's own tests for the vendored crates in `vendor/reth`, and the opt-in `js-tracer` build (`etc/ci-lanes.sh test-vendor-reth`); the root lanes cannot reach either.
+The carried patch crates under `patches/` that sit outside the workspace get a job each (`quinn-proto-patch`, `revm-inspectors-patch`) for the same reason.
+
 The queue builds a temporary `gh-readonly-queue/main/...` branch and fires a `merge_group` event against it.
 Three consequences worth remembering:
 
@@ -90,7 +93,7 @@ The nightly `durable-e2e` failed the same way.
 From then on every queued PR failed its `test` lane on `main + PR`, whatever it changed.
 
 `.github/workflows/main-compiles.yaml` (*Main compiles*) is the tripwire for that.
-On every push to `main` that the merge queue did not make, it runs `fmt` and both `clippy` passes, checks with `etc/rocksdb-gate.sh` that rocksdb stays out of the default feature graph, builds the test binaries of the three test lanes under the stable pin that builds releases, and runs the library tests of the three carried patch crates.
+On every push to `main` that the merge queue did not make, it runs `fmt` and both `clippy` passes, checks with `etc/rocksdb-gate.sh` that no RocksDB package is in `Cargo.lock` and no manifest names one, builds the test binaries of the three test lanes under the stable pin that builds releases, and runs the library tests of the three carried patch crates.
 It cannot block anything.
 No check can gate an advisory merge, so it is not a required check, and it reports only once the commit is on `main`: a failed run shows on `main`'s commit list and emails the account that pushed, and nobody else.
 It compiles the workspace tests without running them, so a test that fails on `main` still surfaces first in the next queued PR's `test` lane.
@@ -200,7 +203,7 @@ The `observations` job in `quic-observations.yaml` keys its own entry too and ne
 A warm runs on a push to `main` that touches a `Cargo.toml`, `Cargo.lock`, `rust-toolchain.toml`, `rust-nightly`, `.cargo/config.toml`, `etc/ci-lanes.sh` or the workflow itself; on a schedule twice a week (GitHub deletes an entry not accessed for seven days, and a quiet week would otherwise leave the queue cold); and by hand from the Actions tab (*Warm dependency cache* -> *Run workflow*).
 When the entry already matches, the run restores it, rebuilds only the workspace crates, saves nothing, and is done in a few minutes.
 
-All fifteen cache steps pin the same `Swatinem/rust-cache` release: two in `cache-deps.yaml`, three in `pr.yaml`, two in `main-compiles.yaml`, two each in `quic-observations.yaml` and `committee-convergence.yaml`, and one each in `consensus-liveness.yaml`, `durable-e2e.yaml`, `sigkill-recovery.yaml` and `quic-interop.yaml`.
+All sixteen cache steps pin the same `Swatinem/rust-cache` release: two in `cache-deps.yaml`, four in `pr.yaml`, two in `main-compiles.yaml`, two each in `quic-observations.yaml` and `committee-convergence.yaml`, and one each in `consensus-liveness.yaml`, `durable-e2e.yaml`, `sigkill-recovery.yaml` and `quic-interop.yaml`.
 Three of its properties shape all of this.
 They were checked against v2.9.2, and a later release can change them; the third is about a release that changes the key:
 

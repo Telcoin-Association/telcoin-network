@@ -15,7 +15,7 @@
 # the queue's lanes need, flag for flag; `--build-only` below is its one concession, and it
 # exists only because nextest has no other way to build a lane without running it.
 #
-# A fourth, .github/workflows/main-compiles.yaml, runs fmt, clippy and both test lanes with
+# A fourth, .github/workflows/main-compiles.yaml, runs fmt, clippy and the test lanes with
 # `--build-only` after every push to main that the merge queue did not make. A
 # security-advisory merge reaches main without either pr.yaml event, so that workflow is
 # what says such a commit still compiles. It reports after the fact and gates nothing.

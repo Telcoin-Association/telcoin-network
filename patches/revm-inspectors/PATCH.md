@@ -43,14 +43,26 @@ one with `--config`, and reth's tests run against the code TN ships.
 
 ## Running its tests
 
-The crate is excluded from TN's workspace, and cargo cannot test it in place inside a git worktree
-nested in another checkout (it walks up to the outer workspace). Copy it somewhere outside any
-workspace, drop the `snapbox` dev-dependency (used only by upstream's integration tests, which the
-published crate does not include) if it is not in the local registry, and run
+CI's `revm-inspectors-patch` job runs, from the repository root:
+
+```
+cargo +1.94 test --locked --manifest-path patches/revm-inspectors/Cargo.toml --features js-tracer --lib
+```
+
+The crate is excluded from TN's workspace, so that works in a plain checkout. Inside a git
+worktree nested in another checkout it does not: cargo walks up past the excluding workspace to
+the outer one. There, copy the crate somewhere outside any workspace, drop the `snapbox`
+dev-dependency (used only by upstream's integration tests, which the published crate does not
+include) if it is not in the local registry, and run
 `cargo test --features js-tracer --lib tracing::js::tests`.
 
 ## Retirement
 
 Remove this patch when TN's reth moves to a revm-inspectors release that contains #548 (0.44.2
-or later). Check that release's `RECURSION_LIMIT` before deleting the directory, the
-`[patch.crates-io]` entry and the `--config` line in `vendor/reth/tn/cargo.sh`.
+or later). Check that release's `RECURSION_LIMIT`, then delete:
+- this directory, its `exclude` entry and its `[patch.crates-io]` entry in the root `Cargo.toml`;
+- the `--config` line in `vendor/reth/tn/cargo.sh`;
+- the `revm-inspectors-patch` job in `.github/workflows/pr.yaml` and its entries in the
+  `CI Success` gate (`etc/transport-patches/test_ci_gate.py` tests the gate);
+- its step in `.github/workflows/main-compiles.yaml`, and the patch-crate count in
+  `.github/ACTIONS.md`.
