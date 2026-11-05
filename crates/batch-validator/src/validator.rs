@@ -1,8 +1,17 @@
 //! Block validator
 
+use lru::LruCache;
 use rayon::iter::{IntoParallelRefIterator as _, ParallelIterator as _};
+#[cfg(any(test, feature = "test-utils"))]
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::{
+    collections::HashMap,
+    num::NonZeroUsize,
+    sync::{Arc, Mutex, PoisonError},
+};
 use tn_reth::{
-    recover_raw_transaction, recover_signed_transaction, RethEnv, TxPool as _, WorkerTxPool,
+    decode_signed_transaction, recover_raw_transaction, verify_transaction_signature, RethEnv,
+    TxPool as _, WorkerTxPool,
 };
 use tn_types::{
     batch_allowlisted_tx_type, max_batch_gas, max_batch_size, BatchValidation,
@@ -12,6 +21,13 @@ use tn_types::{
 
 /// Type convenience for implementing block validation errors.
 type BatchValidationResult<T> = Result<T, BatchValidationError>;
+
+/// Capacity of the cache of transaction hashes with a verified signature.
+///
+/// A full batch of minimal transfers holds about 10k transactions, so the cache spans several
+/// full batches. Each entry is one 32 byte hash plus the LRU list overhead.
+pub(crate) const VERIFIED_SIGNATURE_CACHE_CAPACITY: NonZeroUsize =
+    NonZeroUsize::MIN.saturating_add(65_535);
 
 /// Batch validator
 /// Important note about batch validation, we rely on libp2p to verify that
@@ -33,12 +49,32 @@ pub struct BatchValidator {
     base_fee: u64,
     /// Epoch we are validating for.
     epoch: Epoch,
+    /// Hashes of transactions whose signature passed signer recovery.
+    ///
+    /// The transaction hash covers the signature bytes, so one hash has one validity. The batch
+    /// beneficiary is not validated, so a peer can resend the same signed transactions under a
+    /// fresh digest. The cache lets each resend skip recovery. The node builds a new validator
+    /// for each epoch, so the cache lives for one epoch. Clones share the cache.
+    verified_signatures: Arc<Mutex<LruCache<TxHash, ()>>>,
+    /// Count of the signer recoveries that this validator performed.
+    ///
+    /// This is an observable for tests. It shows which checks run before recovery and that the
+    /// cache skips known hashes. Clones share the count.
+    #[cfg(any(test, feature = "test-utils"))]
+    signer_recoveries: Arc<AtomicUsize>,
 }
 
 impl BatchValidation for BatchValidator {
     /// Validate a peer's batch.
     ///
     /// Workers do not execute full batches. This method validates the required information.
+    ///
+    /// The checks run cheapest first, and each check costs less than the next (issue #1774). The
+    /// digest, the worker id, the epoch, and the base fee read only the batch header, so a wrong
+    /// header fails before any transaction is decoded. The byte size check reads only the
+    /// lengths. Decode does not recover signers. The type allowlist and the gas sum read the
+    /// decoded transactions. Signer recovery costs one ECDSA operation for each transaction, so
+    /// it runs last, and only for transaction hashes that are not in the verified cache.
     ///
     /// On success (and only on success) the batch's transaction hashes are recorded in the
     /// worker pool's deferral window, so this node's batch builder skips them while the peer
@@ -66,6 +102,10 @@ impl BatchValidation for BatchValidator {
             });
         }
 
+        // validate base fee: all batches for a worker and epoch have the same base fee. The fee is
+        // a header field, so a wrong fee fails before any transaction is decoded.
+        self.validate_basefee(batch.base_fee_per_gas)?;
+
         // obtain info for validation
         let transactions = batch.transactions();
 
@@ -73,7 +113,7 @@ impl BatchValidation for BatchValidator {
         // Use the parent timestamp for consistency with the batch builder.
         self.validate_batch_size_bytes(transactions, batch.epoch)?;
 
-        // validate txs decode
+        // validate txs decode, without signer recovery
         let decoded_txs = self.decode_transactions(transactions, digest)?;
 
         // validate every tx type is on the executable allowlist
@@ -83,8 +123,9 @@ impl BatchValidation for BatchValidator {
         // Use the parent timestamp for consistency with the batch builder.
         self.validate_batch_gas(&decoded_txs, batch.epoch)?;
 
-        // validate base fee- all batches for a worker and epoch have the same base fee.
-        self.validate_basefee(batch.base_fee_per_gas)?;
+        // verify signatures last: signer recovery is the most expensive check, and the cache
+        // skips transactions that this validator already verified
+        self.verify_signatures(&decoded_txs, digest)?;
 
         // the batch is valid: remember its transactions so this node's own builder does not pack
         // a copy of something a peer is already proposing (issue #1329). Recording happens only
@@ -124,7 +165,10 @@ impl BatchValidation for BatchValidator {
 }
 
 impl BatchValidator {
-    /// Create a new instance of [Self]
+    /// Create a new instance of [Self].
+    ///
+    /// The verified signature cache starts empty. The node builds a new validator for each epoch,
+    /// so the cache never outlives its epoch.
     pub fn new(
         reth_env: RethEnv,
         tx_pool: Option<WorkerTxPool>,
@@ -132,7 +176,26 @@ impl BatchValidator {
         base_fee: u64,
         epoch: Epoch,
     ) -> Self {
-        Self { reth_env, tx_pool, worker_id, base_fee, epoch }
+        Self {
+            reth_env,
+            tx_pool,
+            worker_id,
+            base_fee,
+            epoch,
+            verified_signatures: Arc::new(Mutex::new(LruCache::new(
+                VERIFIED_SIGNATURE_CACHE_CAPACITY,
+            ))),
+            #[cfg(any(test, feature = "test-utils"))]
+            signer_recoveries: Arc::default(),
+        }
+    }
+
+    /// Return the count of the signer recoveries that this validator performed.
+    ///
+    /// Clones share the count. Tests read it to prove the check order and the cache.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn signer_recoveries(&self) -> usize {
+        self.signer_recoveries.load(Ordering::Relaxed)
     }
 
     /// Validate the size of transactions (in bytes).
@@ -159,7 +222,9 @@ impl BatchValidator {
 
     /// Decode transactions to ensure encode/decode is valid.
     ///
-    /// The decoded transactions are then used to validate max batch gas.
+    /// Decode does not recover signers. The decoded transactions are then used to validate the
+    /// type allowlist and max batch gas. `Self::verify_signatures` checks the signatures last. A
+    /// decode failure maps to `RecoverTransaction`, the same error as a bad signature.
     #[inline]
     fn decode_transactions(
         &self,
@@ -168,7 +233,7 @@ impl BatchValidator {
     ) -> BatchValidationResult<Vec<TransactionSigned>> {
         transactions
             .par_iter()
-            .map(|tx| Self::recover_and_validate(tx, digest))
+            .map(|tx| Self::decode_and_validate(tx, digest))
             .collect::<BatchValidationResult<Vec<_>>>()
     }
 
@@ -233,13 +298,55 @@ impl BatchValidator {
         })
     }
 
-    /// Helper function for decoding and recovering transactions.
-    fn recover_and_validate(
+    /// Helper function for decoding one transaction without signer recovery.
+    fn decode_and_validate(
         tx: &[u8],
         digest: BlockHash,
     ) -> BatchValidationResult<TransactionSigned> {
-        recover_signed_transaction(tx)
+        decode_signed_transaction(tx)
             .map_err(|e| BatchValidationError::RecoverTransaction(digest, e.to_string()))
+    }
+
+    /// Verify every transaction signature by signer recovery, and skip hashes in the cache.
+    ///
+    /// This is the most expensive check, so `validate_batch` runs it last. One lock collects the
+    /// distinct hashes that the cache does not hold. Recovery then runs in parallel without the
+    /// lock. A second lock records every verified hash. A failed recovery caches nothing and
+    /// fails the batch with `RecoverTransaction`.
+    fn verify_signatures(
+        &self,
+        transactions: &[TransactionSigned],
+        digest: BlockHash,
+    ) -> BatchValidationResult<()> {
+        let missing: HashMap<TxHash, &TransactionSigned> = {
+            let cache = self.verified_signatures.lock().unwrap_or_else(PoisonError::into_inner);
+            transactions
+                .iter()
+                .map(|tx| (*tx.hash(), tx))
+                .filter(|(hash, _)| !cache.contains(hash))
+                .collect()
+        };
+
+        if missing.is_empty() {
+            Ok(())
+        } else {
+            let verified = missing
+                .par_iter()
+                .map(|(hash, tx)| {
+                    #[cfg(any(test, feature = "test-utils"))]
+                    self.signer_recoveries.fetch_add(1, Ordering::Relaxed);
+                    verify_transaction_signature(tx).map(|()| *hash).map_err(|e| {
+                        BatchValidationError::RecoverTransaction(digest, e.to_string())
+                    })
+                })
+                .collect::<BatchValidationResult<Vec<TxHash>>>()?;
+
+            let mut cache = self.verified_signatures.lock().unwrap_or_else(PoisonError::into_inner);
+            verified.into_iter().for_each(|hash| {
+                cache.put(hash, ());
+            });
+            Ok(())
+        }
     }
 }
 
@@ -267,8 +374,8 @@ mod tests {
     use tn_test_utils::wait_until;
     use tn_types::{
         gas_accumulator::BaseFeeContainer, max_batch_gas, test_genesis, Address, Batch, Bytes,
-        Encodable2718 as _, FromHex, GenesisAccount, TaskManager, B256, MIN_PROTOCOL_BASE_FEE,
-        U256,
+        Decodable2718 as _, Encodable2718 as _, EthSignature, FromHex, GenesisAccount,
+        SignableTransaction as _, TaskManager, B256, MIN_PROTOCOL_BASE_FEE, U256,
     };
 
     /// Return the next valid sealed batch
@@ -776,6 +883,148 @@ mod tests {
         batch.transactions = vec![legacy_tx, eip2930_tx];
 
         assert_matches!(validator.validate_batch(batch.clone().seal_slow()), Ok(()));
+    }
+
+    /// A wrong header base fee fails before decode, so an undecodable transaction costs nothing.
+    #[tokio::test]
+    async fn test_invalid_base_fee_rejected_before_decode() {
+        let tmp_dir = TempDir::new().unwrap();
+        let task_manager = TaskManager::default();
+        let TestTools { valid_batch, validator, .. } =
+            test_tools(tmp_dir.path(), &task_manager).await;
+        let (batch, _) = valid_batch.split();
+
+        // replace the first transaction with bytes that do not decode
+        let Batch { transactions, epoch, beneficiary, worker_id, received_at, .. } = batch;
+        let undecodable_batch = Batch {
+            transactions: std::iter::once(b"this is a bad transaction".to_vec())
+                .chain(transactions.into_iter().skip(1))
+                .collect(),
+            epoch,
+            beneficiary,
+            base_fee_per_gas: MIN_PROTOCOL_BASE_FEE,
+            worker_id,
+            received_at,
+        };
+
+        // control: with the correct fee, the batch fails decode
+        assert_matches!(
+            validator.validate_batch(undecodable_batch.clone().seal_slow()),
+            Err(BatchValidationError::RecoverTransaction(_, _))
+        );
+
+        // with a wrong fee, the header check fails first
+        let badfee = MIN_PROTOCOL_BASE_FEE * 100;
+        let invalid_batch = Batch { base_fee_per_gas: badfee, ..undecodable_batch };
+        assert_matches!(
+            validator.validate_batch(invalid_batch.seal_slow()),
+            Err(BatchValidationError::InvalidBaseFee { expected_base_fee, base_fee })
+                if expected_base_fee == MIN_PROTOCOL_BASE_FEE && base_fee == badfee
+        );
+        assert_eq!(validator.signer_recoveries(), 0);
+    }
+
+    /// An over-gas batch fails the gas sum before any signer recovery.
+    #[tokio::test]
+    async fn test_gas_checked_before_signer_recovery() {
+        let tmp_dir = TempDir::new().unwrap();
+        let task_manager = TaskManager::default();
+        let TestTools { valid_batch, validator, .. } =
+            test_tools(tmp_dir.path(), &task_manager).await;
+        let (batch, _) = valid_batch.split();
+
+        // sign excessive transaction
+        let mut tx_factory = TransactionFactory::new();
+        let value = U256::from(10).checked_pow(U256::from(18)).expect("1e18 doesn't overflow U256");
+        let gas_price = 7;
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+
+        // create transaction with max gas limit above the max allowed
+        let invalid_transaction = tx_factory.create_eip1559_encoded(
+            chain,
+            Some(max_batch_gas(batch.epoch) + 1),
+            gas_price,
+            Some(Address::ZERO),
+            value, // 1 TEL
+            Bytes::new(),
+        );
+
+        let Batch { beneficiary, epoch, base_fee_per_gas, received_at, .. } = batch;
+        let invalid_batch = Batch {
+            transactions: vec![invalid_transaction],
+            epoch,
+            beneficiary,
+            base_fee_per_gas,
+            worker_id: 0,
+            received_at,
+        };
+
+        assert_matches!(
+            validator.validate_batch(invalid_batch.seal_slow()),
+            Err(BatchValidationError::HeaderMaxGasExceedsGasLimit {
+                total_possible_gas: _,
+                gas_limit: _
+            })
+        );
+        assert_eq!(validator.signer_recoveries(), 0);
+    }
+
+    /// The same signed transactions resent under a fresh digest skip signer recovery.
+    #[tokio::test]
+    async fn test_signature_recovery_cached_per_tx_hash() {
+        let tmp_dir = TempDir::new().unwrap();
+        let task_manager = TaskManager::default();
+        let TestTools { valid_batch, validator, .. } =
+            test_tools(tmp_dir.path(), &task_manager).await;
+        let first_digest = valid_batch.digest();
+        let (batch, _) = valid_batch.split();
+        let tx_count = batch.transactions.len();
+
+        assert_matches!(validator.validate_batch(batch.clone().seal_slow()), Ok(()));
+        assert_eq!(validator.signer_recoveries(), tx_count);
+
+        // the beneficiary is not validated, so the same transactions arrive under a new digest
+        let resent = Batch { beneficiary: Address::random(), ..batch }.seal_slow();
+        assert_ne!(resent.digest(), first_digest);
+        assert_matches!(validator.validate_batch(resent), Ok(()));
+        assert_eq!(validator.signer_recoveries(), tx_count);
+    }
+
+    /// A decodable transaction with a signature that fails recovery is rejected and not cached.
+    #[tokio::test]
+    async fn test_invalid_signature_still_rejected() {
+        let tmp_dir = TempDir::new().unwrap();
+        let task_manager = TaskManager::default();
+        let TestTools { valid_batch, validator, .. } =
+            test_tools(tmp_dir.path(), &task_manager).await;
+        let (mut batch, _) = valid_batch.split();
+
+        // decode a valid fixture transaction and keep its signed body
+        let signed = TransactionSigned::decode_2718_exact(
+            batch.transactions.first().expect("valid batch has transactions"),
+        )
+        .expect("fixture tx decodes");
+        let eip1559 = signed.as_eip1559().expect("fixture tx is eip1559");
+
+        // an `s` value above half the secp256k1 order still encodes and decodes, but EIP-2
+        // signer recovery rejects it
+        let signature = eip1559.signature();
+        let bad_signature = EthSignature::new(signature.r(), U256::MAX, signature.v());
+        let tampered = TransactionSigned::from(eip1559.tx().clone().into_signed(bad_signature));
+        batch.transactions = vec![tampered.encoded_2718()];
+
+        assert_matches!(
+            validator.validate_batch(batch.clone().seal_slow()),
+            Err(BatchValidationError::RecoverTransaction(_, _))
+        );
+        assert_eq!(validator.signer_recoveries(), 1);
+
+        // a failed recovery is not cached: a resend pays recovery again and fails again
+        assert_matches!(
+            validator.validate_batch(batch.seal_slow()),
+            Err(BatchValidationError::RecoverTransaction(_, _))
+        );
+        assert_eq!(validator.signer_recoveries(), 2);
     }
 
     /// Compute the committee slot a sender address would be routed to.

@@ -13,9 +13,11 @@ use tn_types::{BlsKeypair, NetworkKeypair, Signer as _};
 /// Construct an authenticated primary record with an explicitly controlled timestamp.
 fn signed_record(key: &BlsKeypair, timestamp: tn_types::TimestampSec) -> NodeRecord {
     let domain = RecordDomain::new(2017, NetworkType::Primary);
+    let netkey = NetworkKeypair::generate_ed25519();
     let mut record = NodeRecord::build(
         domain,
-        NetworkKeypair::generate_ed25519().public().into(),
+        key.public(),
+        &netkey,
         // Authenticated readers accept only QUIC endpoints, see `validate_advertised_addresses`.
         Multiaddr::empty()
             .with(Protocol::Ip4(Ipv4Addr::LOCALHOST))
@@ -23,7 +25,8 @@ fn signed_record(key: &BlsKeypair, timestamp: tn_types::TimestampSec) -> NodeRec
             .with(Protocol::QuicV1),
         None,
         |bytes| key.sign(bytes),
-    );
+    )
+    .expect("sign record");
     record.info.timestamp = timestamp;
     // Sign the actual timestamp in the fixture rather than mutate authenticated bytes.
     record.signature = key.sign(&encode(&(
@@ -33,6 +36,17 @@ fn signed_record(key: &BlsKeypair, timestamp: tn_types::TimestampSec) -> NodeRec
         tn_types::WorkerId::default(),
         &record.info,
     )));
+    // Co-sign the same info with the network key, mirroring `network_signing_bytes`.
+    record.network_signature = netkey
+        .sign(&encode(&(
+            b"telcoin-network/node-record/network-key/v1".as_slice(),
+            domain.chain_id(),
+            0_u8,
+            tn_types::WorkerId::default(),
+            key.public(),
+            &record.info,
+        )))
+        .expect("sign record");
     record
 }
 

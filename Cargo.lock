@@ -5480,8 +5480,6 @@ dependencies = [
 [[package]]
 name = "libp2p-gossipsub"
 version = "0.50.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1b625461b45e5b36facf07ff3585b831bcaf26cab8907ac8f47d1e8e999999e0"
 dependencies = [
  "async-channel",
  "asynchronous-codec",
@@ -12028,6 +12026,7 @@ version = "0.1.0"
 dependencies = [
  "assert_matches",
  "eyre",
+ "lru",
  "rayon",
  "tempfile",
  "tn-reth",
@@ -12535,6 +12534,7 @@ dependencies = [
  "async-trait",
  "eyre",
  "futures",
+ "lru",
  "metrics",
  "metrics-util",
  "parking_lot",
@@ -12565,20 +12565,27 @@ dependencies = [
  "axum",
  "clap",
  "eyre",
+ "fdlimit",
  "futures",
  "humantime",
  "hyper",
  "hyper-util",
+ "jsonrpsee-types",
+ "libc",
  "metrics",
+ "metrics-util",
+ "rcgen",
  "reqwest 0.12.28",
+ "rustls-native-certs",
  "serde",
  "serde_json",
+ "serde_yaml",
  "socket2",
  "tempfile",
- "tn-config",
  "tn-metrics",
  "tn-types",
  "tokio",
+ "tokio-rustls",
  "tower-http",
  "tracing",
  "tracing-subscriber 0.3.23",

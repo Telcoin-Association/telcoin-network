@@ -117,7 +117,7 @@ It reports that the responder gave up, which is different from the transport fai
 
 ## Deny is backpressure, not a fault
 
-A responder admits a bounded number of concurrent sync streams: each serve class has its own slot pool with a reserve for committee peers, and one peer can hold at most two in-flight sync streams (see [Admission](#admission)).
+A responder admits a bounded number of concurrent sync streams: each serve class has its own slot pool with a separate reserve for each committee key, and one peer can hold at most two in-flight sync streams (see [Admission](#admission)).
 Past that it does not drop the stream.
 It writes `Deny(AtCapacity)` and closes.
 
@@ -139,10 +139,14 @@ A peer whose BLS key is in the current committee or the next committee is in the
 The committee keys are captured when the network is built for an epoch.
 
 1. **Per-peer cap.** One peer can hold at most two in-flight sync streams. A third stream is shed.
-2. **Opening read.** The stream takes an opening-read slot while the responder reads the request frame, for at most 1 second for a public peer and 5 seconds for a committee peer. A public peer whose valid request arrives in the second half of its 1-second window is charged a mild penalty, whether the request is then admitted or refused. There are 8 slots for any peer and 4 more that only committee peers can take. The opening-read slot is released as soon as the read ends, before any control write or close; the per-peer slot lasts for the whole task. A stream that never sends a valid request never takes a serve slot.
-3. **Serve.** The request selects its serve class: epoch pack, missing certificates, or consensus output. Each class has its own pool of 5 slots for any peer and 4 more that only committee peers can take, so public peers that fill one class cannot block a committee peer or a different class. A full class answers `Deny(AtCapacity)`.
+2. **Opening read.** The stream takes an opening-read slot while the responder reads the request frame, for at most 1 second for a public peer and 5 seconds for a committee peer. A public peer whose valid request arrives in the second half of its 1-second window is charged a mild penalty, whether the request is then admitted or refused. There are 8 slots for any peer and 1 more for each committee key, which only that key can take. The opening-read slot is released as soon as the read ends, before any control write or close; the per-peer slot lasts for the whole task. A stream that never sends a valid request never takes a serve slot.
+3. **Serve.** The request selects its serve class: epoch pack, missing certificates, or consensus output. Each class has its own pool of 5 slots for any peer and 1 more for each committee key, which only that key can take. So public peers that fill one class cannot block a committee peer or a different class. A full class answers `Deny(AtCapacity)`.
 
-The worker batch sync stream uses the same tiers, with one pool of 5 slots for any peer and 4 for committee peers.
+The worker batch sync stream uses the same tiers, with one pool of 5 slots for any peer and 1 more for each committee key.
+
+Each committee key has its own reserve in each pool, and no committee key can take the reserve of another.
+So committee keys that hold streams without progress cannot stop a different committee key from catching up.
+The per-peer cap of two lets a committee key open its second stream from the slots for any peer.
 
 Each serve is also bounded in time:
 
@@ -171,10 +175,10 @@ These admission penalties are enforced, unlike the stream-failure penalties unde
 | Inbound streams per peer | 256 per second | Inbound sync streams accepted from one peer per one-second window; the next one is refused |
 | Pending outbound per connection | 256 | Opens buffered by one connection handler before it sheds |
 | In-flight sync streams per peer | 2 | Sync streams one peer can hold on a responder at once |
-| Opening reads | 8 + 4 committee | Streams waiting up to 1s (public) or 5s (committee) for their request frame |
+| Opening reads | 8 + 1 per committee key | Streams waiting up to 1s (public) or 5s (committee) for their request frame |
 | Requester opening write (primary) | 1s | Deadline for writing and flushing the opening request frame (`SYNC_REQUEST_WRITE_TIMEOUT`) |
-| Serve slots per class | 5 + 4 committee | Concurrent serves of each class: epoch pack, missing certificates, consensus output |
-| Worker batch serves | 5 + 4 committee | Concurrent worker batch sync serves |
+| Serve slots per class | 5 + 1 per committee key | Concurrent serves of each class: epoch pack, missing certificates, consensus output |
+| Worker batch serves | 5 + 1 per committee key | Concurrent worker batch sync serves |
 | Epoch-pack serve deadline | 30s per started MiB, plus 30s | Total time one epoch-pack serve can take |
 | Public epoch-pack serve hold limit | 200s | Fixed, size-independent bound on one public-tier epoch-pack serve (`PUBLIC_EPOCH_PACK_SERVE_TIMEOUT`); a serve that outlives it is dropped and charged as a stall; committee-tier serves keep the throughput-floor deadline |
 

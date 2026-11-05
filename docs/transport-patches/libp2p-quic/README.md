@@ -18,8 +18,8 @@ reporting still apply.
 | Maintained mirror | [Telcoin's tracked vendored tree](../../../patches/libp2p-quic) |
 | Exact patch revision | [`372fa302bbb85758c9341b2c6b2247db3e9601ca`](https://github.com/Telcoin-Association/telcoin-network/commit/372fa302bbb85758c9341b2c6b2247db3e9601ca) |
 | Override | Root `[patch.crates-io]`, `libp2p-quic = { path = "patches/libp2p-quic" }`, excluded from workspace membership |
-| Complete normalized diff | [upstream.diff](../../../patches/libp2p-quic/upstream.diff), SHA-256 `1a08485b867559bf990d177969a0977b2f08c54d8571bf2b9440fe079ea89f5b` |
-| Runtime tree fingerprint | `be1002f4e4b49de0024775ce0a4adff1e70fa8913c1304da6b8be7a01ab5e84b` |
+| Complete normalized diff | [upstream.diff](../../../patches/libp2p-quic/upstream.diff), SHA-256 `444cba51a1bc018163e1176ce42e58453b7761a3909895cc035e77203c58849d` |
+| Runtime tree fingerprint | `31dd6839aa578069f3c8847401fa95baa5fe3a339dd2d2908e4ad70ae32f4884` |
 
 The patch revision identifies the current Retry and incoming-observation source. The original
 Retry policy was introduced in `a740a484e4944871f8a81e825ce84dd1559ee158`; issue #1680 adds the

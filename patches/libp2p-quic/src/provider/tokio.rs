@@ -19,6 +19,7 @@
 // DEALINGS IN THE SOFTWARE.
 
 use std::{
+    future::Future,
     io,
     net::{SocketAddr, UdpSocket},
     task::{Context, Poll},
@@ -55,6 +56,10 @@ impl super::Provider for Provider {
 
     fn sleep(duration: Duration) -> BoxFuture<'static, ()> {
         tokio::time::sleep(duration).boxed()
+    }
+
+    fn spawn<F: Future<Output = ()> + Send + 'static>(future: F) {
+        tokio::spawn(future);
     }
 
     fn send_to<'a>(
