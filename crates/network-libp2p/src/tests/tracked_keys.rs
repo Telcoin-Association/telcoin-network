@@ -1,11 +1,12 @@
 //! Scheduled and eligible key tracking: ingest, isolation from admission and pruning, demotion,
-//! freshness, the lookup scheduler, and the key cap.
+//! freshness, the lookup scheduler, the key cap, and the admission snapshot with its gauges.
 
 use super::*;
 use crate::{
     common::create_multiaddr, diagnostics::emission_tests::Capture, metrics::ConnectionDirection,
     types::NetworkType, CommitteeUpdate,
 };
+use metrics_util::debugging::{DebugValue, DebuggingRecorder, Snapshotter};
 use rand::{rngs::StdRng, SeedableRng as _};
 use std::{collections::BTreeSet, task::Waker};
 use tn_types::{BlsKeypair, NetworkKeypair, TimestampSec};
@@ -658,4 +659,358 @@ async fn tracked_key_cap_warns_and_drops_the_excess() {
     assert_eq!(capture.message_count("tracked key limit reached"), 1, "a fitting set is quiet");
     assert!(left_out.iter().all(|key| manager.tracked.contains(key)));
     assert!(manager.tracked.record(&kept[0]).is_none(), "the replaced set's records are dropped");
+}
+
+/// The entry `snapshot` lists for `key`.
+#[track_caller]
+fn entry(snapshot: &SwarmAdmissionSnapshot, key: BlsPublicKey) -> &TrackedEntry {
+    snapshot.entries.iter().find(|entry| entry.bls_pubkey == key).expect("key listed")
+}
+
+/// Assert that `entry` reports `info` as a signed record: its identity, addresses and timestamp.
+#[track_caller]
+fn assert_record(entry: &TrackedEntry, info: &NetworkInfo) {
+    assert_eq!(entry.source, EntrySource::Record);
+    assert_eq!(entry.peer_id, Some(peer_id(info)));
+    assert_eq!(entry.network_pubkey.as_ref(), Some(&info.pubkey));
+    assert_eq!(entry.multiaddrs, info.multiaddrs);
+    assert_eq!(entry.record_multiaddrs, None);
+    assert_eq!(entry.record_timestamp, Some(info.timestamp));
+}
+
+/// Assert that `entry` holds neither a record nor a binding, and so is not admitted.
+#[track_caller]
+fn assert_unresolved(entry: &TrackedEntry) {
+    assert_eq!(entry.source, EntrySource::Unresolved);
+    assert!(entry.peer_id.is_none() && entry.network_pubkey.is_none());
+    assert!(entry.multiaddrs.is_empty() && entry.record_multiaddrs.is_none());
+    assert_eq!(entry.record_timestamp, None);
+    assert!(!entry.admitted);
+}
+
+/// Assert that `entry` reports the configured binding `node` in `slot` and no signed record.
+#[track_caller]
+fn assert_configured(entry: &TrackedEntry, node: &P2pNode, slot: TrackedSlot) {
+    assert_eq!(entry.slots, [slot]);
+    assert_eq!(entry.source, EntrySource::Config);
+    assert_eq!(entry.peer_id, Some(PeerId::from(node.network_key.clone())));
+    assert_eq!(entry.network_pubkey.as_ref(), Some(&node.network_key));
+    assert_eq!(entry.multiaddrs, std::slice::from_ref(&node.network_address));
+    assert_eq!(entry.record_multiaddrs, None);
+    assert_eq!(entry.record_timestamp, None, "a configured binding is not a signed record");
+}
+
+/// The tracked gauges of the primary swarm in one recorder snapshot, keyed by name without the
+/// family prefix and with the slot label in braces.
+fn tracked_gauges(snapshotter: &Snapshotter) -> BTreeMap<String, f64> {
+    snapshotter
+        .snapshot()
+        .into_vec()
+        .into_iter()
+        .filter_map(|(key, _, _, value)| {
+            let key = key.key();
+            let name = key.name().strip_prefix("tn_network.tracked_")?;
+            let primary =
+                key.labels().any(|label| label.key() == "network" && label.value() == "primary");
+            let slot = key.labels().find(|label| label.key() == "slot");
+            let name =
+                slot.map_or_else(|| name.to_owned(), |slot| format!("{name}{{{}}}", slot.value()));
+            match value {
+                DebugValue::Gauge(value) if primary => Some((name, value.0)),
+                _ => None,
+            }
+        })
+        .collect()
+}
+
+/// The expected tracked gauges: required and unresolved keys per tracked slot, then the number of
+/// retained tracked records.
+fn gauges(scheduled: [f64; 2], eligible: [f64; 2], records: f64) -> BTreeMap<String, f64> {
+    BTreeMap::from([
+        ("records".to_owned(), records),
+        ("required_members{eligible}".to_owned(), eligible[0]),
+        ("required_members{scheduled}".to_owned(), scheduled[0]),
+        ("unresolved_members{eligible}".to_owned(), eligible[1]),
+        ("unresolved_members{scheduled}".to_owned(), scheduled[1]),
+    ])
+}
+
+/// In an accepted Closed window the snapshot lists every remote key once, sorted by key bytes,
+/// with the union of its slots. A current member whose cached record gives an authorized peer id
+/// is admitted; an eligible-only key is not, even when its forged record claims an authorized
+/// peer id. The snapshot carries the status of the same evaluation and building it changes no
+/// admission state.
+#[tokio::test]
+async fn snapshot_admits_window_members_only() {
+    let window = ClosedWindow::new();
+    let mut manager = window.manager();
+    let (member, _) = window.members[0];
+    let (_, claimed) = &window.members[1];
+    let (scheduled, eligible, forger) = (bls(140), bls(141), bls(142));
+    manager.update_tracked_keys(
+        7,
+        HashSet::from([scheduled, window.local]),
+        HashSet::from([member, eligible, forger]),
+    );
+    let eligible_info = network_info();
+    let forged = NetworkInfo { pubkey: claimed.pubkey.clone(), ..network_info() };
+    manager.add_discovered_peer(eligible, eligible_info.clone());
+    manager.add_discovered_peer(forger, forged.clone());
+
+    let status = format!("{:?}", manager.admission_status());
+    let snapshot = manager.admission_snapshot();
+    assert_eq!(format!("{:?}", manager.admission_status()), status, "building changes nothing");
+    assert_eq!(format!("{:?}", snapshot.status), status);
+    assert_eq!(snapshot.status.effective(), AdmissionMode::Closed);
+    assert_eq!(snapshot.network, "primary");
+    assert_eq!(snapshot.tracked_epoch, Some(7));
+
+    let listed: Vec<_> = snapshot.entries.iter().map(|entry| entry.bls_pubkey).collect();
+    let mut expected: Vec<_> =
+        window.members.iter().map(|(key, _)| *key).chain([scheduled, eligible, forger]).collect();
+    expected.sort_unstable_by(|a, b| AsRef::<[u8]>::as_ref(a).cmp(AsRef::<[u8]>::as_ref(b)));
+    assert_eq!(listed, expected, "every remote key once in key-byte order, the local key left out");
+    assert_eq!(entry(&snapshot, member).slots, [TrackedSlot::Current, TrackedSlot::Eligible]);
+
+    let authorized = manager.evaluate_admission().1;
+    window.members.iter().for_each(|(key, info)| {
+        let listed = entry(&snapshot, *key);
+        assert_record(listed, info);
+        assert!(authorized.contains(&peer_id(info)));
+        assert!(listed.admitted, "a current member with an authorized peer id is admitted");
+    });
+    let eligible_entry = entry(&snapshot, eligible);
+    assert_eq!(eligible_entry.slots, [TrackedSlot::Eligible]);
+    assert_record(eligible_entry, &eligible_info);
+    assert!(!eligible_entry.admitted);
+    let forged_entry = entry(&snapshot, forger);
+    assert_record(forged_entry, &forged);
+    assert!(authorized.contains(&peer_id(&forged)), "the forged peer id is authorized");
+    assert!(!forged_entry.admitted, "an eligible-only key is never admitted");
+    let scheduled_entry = entry(&snapshot, scheduled);
+    assert_eq!(scheduled_entry.slots, [TrackedSlot::Scheduled]);
+    assert_unresolved(scheduled_entry);
+}
+
+/// Every source value: a configured hub or bootstrap binding is `config` until a signed record
+/// replaces it, a launch key is `stub` and also reports the signed addresses once a signed record
+/// is cached, and any other tracked key reports its tracked record or is `unresolved`.
+#[tokio::test]
+async fn snapshot_reports_every_source() -> eyre::Result<()> {
+    let mut manager = manager();
+    let (hub, hub_node) = node(150);
+    let (boot, boot_node) = node(151);
+    let (launch, launch_node) = node(152);
+    let (tracked, missing) = (bls(153), bls(154));
+    manager.add_trusted_peers(BTreeMap::from([(hub, hub_node.clone())]));
+    manager.add_bootstrap_peer(boot, info_of(&boot_node));
+    manager.seed_committee_peers(BTreeMap::from([(launch, launch_node.clone())]))?;
+    manager.update_committees(HashSet::new(), HashSet::from([launch]), HashSet::new());
+    manager.update_tracked_keys(1, HashSet::new(), HashSet::from([tracked, missing]));
+    let tracked_info = network_info();
+    manager.add_discovered_peer(tracked, tracked_info.clone());
+
+    let snapshot = manager.admission_snapshot();
+    assert_eq!(snapshot.entries.len(), 5);
+    assert_configured(entry(&snapshot, hub), &hub_node, TrackedSlot::Trusted);
+    assert_configured(entry(&snapshot, boot), &boot_node, TrackedSlot::Bootstrap);
+    assert!(entry(&snapshot, hub).admitted && entry(&snapshot, boot).admitted, "operator grants");
+    let launch_entry = entry(&snapshot, launch);
+    assert_eq!(launch_entry.slots, [TrackedSlot::Current]);
+    assert_eq!(launch_entry.source, EntrySource::Stub);
+    assert_eq!(launch_entry.peer_id, Some(PeerId::from(launch_node.network_key.clone())));
+    assert_eq!(launch_entry.multiaddrs, std::slice::from_ref(&launch_node.network_address));
+    assert_eq!(launch_entry.record_multiaddrs, None, "no signed record yet");
+    assert_eq!(launch_entry.record_timestamp, None);
+    assert!(!launch_entry.admitted, "no window has been accepted");
+    assert_eq!(entry(&snapshot, tracked).slots, [TrackedSlot::Eligible]);
+    assert_record(entry(&snapshot, tracked), &tracked_info);
+    assert_eq!(entry(&snapshot, missing).slots, [TrackedSlot::Eligible]);
+    assert_unresolved(entry(&snapshot, missing));
+
+    let signed = NetworkInfo { pubkey: launch_node.network_key.clone(), ..network_info() };
+    let boot_record = NetworkInfo { pubkey: boot_node.network_key.clone(), ..network_info() };
+    assert_ne!(signed.multiaddrs, std::slice::from_ref(&launch_node.network_address));
+    manager.add_discovered_peer(launch, signed.clone());
+    manager.add_discovered_peer(boot, boot_record.clone());
+    let snapshot = manager.admission_snapshot();
+    let launch_entry = entry(&snapshot, launch);
+    assert_eq!(launch_entry.source, EntrySource::Stub);
+    assert_eq!(launch_entry.peer_id, Some(peer_id(&signed)));
+    assert_eq!(
+        launch_entry.multiaddrs,
+        std::slice::from_ref(&launch_node.network_address),
+        "launch address"
+    );
+    assert_eq!(launch_entry.record_multiaddrs.as_ref(), Some(&signed.multiaddrs));
+    assert_eq!(launch_entry.record_timestamp, Some(signed.timestamp));
+    assert_record(entry(&snapshot, boot), &boot_record);
+    Ok(())
+}
+
+/// Before a versioned window is accepted the committee slots label the entries and nothing is
+/// admitted through them; once a window is accepted it labels the entries and grants admission,
+/// even after the committee slots move without it.
+#[tokio::test]
+async fn snapshot_window_falls_back_to_committee_slots() {
+    let local = bls(160);
+    let mut manager = manager();
+    manager.configure_admission(
+        AdmissionConfig::new(AdmissionMode::Closed, Duration::from_secs(300)),
+        local,
+    );
+    let (previous, current, next, incoming) = (bls(161), bls(162), bls(163), bls(164));
+    manager.update_committees(
+        HashSet::from([previous]),
+        HashSet::from([current]),
+        HashSet::from([next]),
+    );
+    let current_info = network_info();
+    manager.add_discovered_peer(current, current_info.clone());
+    let slots = |snapshot: &SwarmAdmissionSnapshot| {
+        snapshot
+            .entries
+            .iter()
+            .map(|entry| (entry.bls_pubkey, entry.slots.clone()))
+            .collect::<BTreeMap<_, _>>()
+    };
+
+    assert!(manager.admission_policy.window().is_none());
+    let snapshot = manager.admission_snapshot();
+    assert_eq!(
+        slots(&snapshot),
+        BTreeMap::from([
+            (previous, vec![TrackedSlot::Previous]),
+            (current, vec![TrackedSlot::Current]),
+            (next, vec![TrackedSlot::Next]),
+        ])
+    );
+    assert_record(entry(&snapshot, current), &current_info);
+    assert!(snapshot.entries.iter().all(|entry| !entry.admitted), "only a window grants");
+
+    assert!(manager.update_committees_at(
+        CommitteeUpdate::EpochStart,
+        3,
+        HashSet::new(),
+        HashSet::from([current, local]),
+        HashSet::from([incoming]),
+    ));
+    // the committee slots move without a versioned update; the accepted window stays
+    manager.update_committees(HashSet::new(), HashSet::from([current, next]), HashSet::new());
+    assert!(manager.admission_policy.window().is_some());
+    let snapshot = manager.admission_snapshot();
+    assert_eq!(
+        slots(&snapshot),
+        BTreeMap::from([
+            (current, vec![TrackedSlot::Current]),
+            (incoming, vec![TrackedSlot::Next])
+        ])
+    );
+    assert_record(entry(&snapshot, current), &current_info);
+    assert!(entry(&snapshot, current).admitted, "the accepted window grants");
+    assert_unresolved(entry(&snapshot, incoming));
+}
+
+/// `tracked_epoch` is `None` until the first tracked publication, then follows the accepted one.
+#[tokio::test]
+async fn snapshot_tracked_epoch_follows_accepted_publications() {
+    let mut manager = manager();
+    let snapshot = manager.admission_snapshot();
+    assert_eq!(snapshot.tracked_epoch, None);
+    assert!(snapshot.entries.is_empty());
+
+    let key = bls(170);
+    manager.update_tracked_keys(4, HashSet::from([key]), HashSet::new());
+    assert_eq!(manager.admission_snapshot().tracked_epoch, Some(4));
+    manager.update_tracked_keys(3, HashSet::new(), HashSet::new());
+    let snapshot = manager.admission_snapshot();
+    assert_eq!(snapshot.tracked_epoch, Some(4), "an older publication is ignored");
+    assert_eq!(entry(&snapshot, key).slots, [TrackedSlot::Scheduled]);
+}
+
+/// A key that has just moved from the eligible set into the window, its committee lookup still
+/// pending, reports its tracked record. A tracked record resolves no identity, so a forged one
+/// claiming an authorized peer id admits nothing, and the key is admitted once its committee
+/// record is cached.
+#[tokio::test]
+async fn window_key_without_cached_record_reports_its_tracked_record() {
+    let window = ClosedWindow::new();
+    let mut manager = window.manager();
+    let (joining, forger) = (bls(180), bls(181));
+    manager.update_tracked_keys(7, HashSet::new(), HashSet::from([joining, forger]));
+    let joining_info = network_info();
+    let (_, claimed) = &window.members[0];
+    let forged = NetworkInfo { pubkey: claimed.pubkey.clone(), ..network_info() };
+    manager.add_discovered_peer(joining, joining_info.clone());
+    manager.add_discovered_peer(forger, forged.clone());
+
+    let current: HashSet<_> =
+        window.members.iter().map(|(key, _)| *key).chain([window.local]).collect();
+    assert!(manager.update_committees_at(
+        CommitteeUpdate::EpochStart,
+        8,
+        HashSet::new(),
+        current,
+        HashSet::from([joining, forger]),
+    ));
+    assert!(!manager.known_peers.contains_key(&joining), "committee lookup pending");
+    assert!(!manager.known_peers.contains_key(&forger));
+
+    let snapshot = manager.admission_snapshot();
+    let joining_entry = entry(&snapshot, joining);
+    assert_eq!(joining_entry.slots, [TrackedSlot::Next, TrackedSlot::Eligible]);
+    assert_record(joining_entry, &joining_info);
+    assert!(!joining_entry.admitted, "a tracked record resolves no identity");
+    let forged_entry = entry(&snapshot, forger);
+    assert_record(forged_entry, &forged);
+    assert!(manager.evaluate_admission().1.contains(&peer_id(&forged)), "claims an authorized id");
+    assert!(!forged_entry.admitted, "a forged tracked record admits nothing");
+
+    let learned = NetworkInfo { multiaddrs: vec![create_multiaddr(None)], ..joining_info.clone() };
+    assert_ne!(learned.multiaddrs, joining_info.multiaddrs);
+    manager.add_discovered_peer(joining, learned.clone());
+    let snapshot = manager.admission_snapshot();
+    assert_record(entry(&snapshot, joining), &learned);
+    assert!(entry(&snapshot, joining).admitted, "the cached record resolves the identity");
+}
+
+/// The tracked gauges count each tracked slot's keys other than the local one and those without
+/// a signed record, where a configured binding counts as unresolved, plus the retained tracked
+/// records; a publication, a retained record, and a heartbeat each publish them afresh.
+#[tokio::test]
+async fn tracked_gauges_follow_publication_ingest_and_heartbeat() {
+    let recorder = DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    let mut manager = metrics::with_local_recorder(&recorder, manager);
+    let local = bls(190);
+    manager.configure_admission(
+        AdmissionConfig::new(AdmissionMode::Open, Duration::from_secs(300)),
+        local,
+    );
+    let (scheduled, unresolved, recorded, missing) = (bls(191), bls(192), bls(193), bls(194));
+    let (boot, boot_node) = node(195);
+    manager.add_bootstrap_peer(boot, info_of(&boot_node));
+
+    metrics::with_local_recorder(&recorder, || {
+        manager.update_tracked_keys(
+            1,
+            HashSet::from([scheduled, unresolved, local]),
+            HashSet::from([recorded, missing, boot]),
+        );
+    });
+    assert_eq!(tracked_gauges(&snapshotter), gauges([2.0, 2.0], [3.0, 3.0], 0.0));
+
+    metrics::with_local_recorder(&recorder, || {
+        manager.add_discovered_peer(scheduled, network_info());
+        manager.add_self_advertised_peer(PeerId::random(), recorded, network_info());
+    });
+    assert_eq!(tracked_gauges(&snapshotter), gauges([2.0, 1.0], [3.0, 2.0], 2.0));
+
+    // the recorder snapshot above drained every gauge, and a record retained behind the
+    // ingest sites is seen first by the heartbeat
+    let info = network_info();
+    let timestamp = crate::freshness::RecordTimestamp::admit(info.timestamp, now());
+    assert!(manager.tracked.retain(missing, info, timestamp, now()));
+    metrics::with_local_recorder(&recorder, || manager.heartbeat());
+    assert_eq!(tracked_gauges(&snapshotter), gauges([2.0, 1.0], [3.0, 1.0], 3.0));
 }

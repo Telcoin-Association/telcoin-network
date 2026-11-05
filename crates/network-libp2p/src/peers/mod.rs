@@ -18,6 +18,7 @@ pub(crate) use behavior::PeerAdmissionDenied;
 pub(crate) use manager::{PeerManager, PutRecordRate};
 pub use penalty::LoadPenalty;
 pub(crate) use penalty::Severity;
+pub use tracked::{EntrySource, SwarmAdmissionSnapshot, TrackedEntry, TrackedSlot};
 pub(crate) use types::{LookupClass, PeerEvent, PenaltyOutcome, MAX_PEER_EXCHANGE_MESSAGE_SIZE};
 pub use types::{
     PeerExchangeKey, PeerExchangeMap, Penalty, MAX_PEER_EXCHANGE_ADDRS_PER_PEER,

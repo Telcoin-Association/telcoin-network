@@ -5,13 +5,18 @@
 //! never admitted, scored, pinned, or bound to a peer id. Its record lives here, not in the peer
 //! manager's `known_peers` cache or the peer store, so admission, gossip attribution, and request
 //! delivery behave exactly as they would without tracking.
+//!
+//! The same keys, together with the committee window and the configured peers, make up the
+//! swarm's [`SwarmAdmissionSnapshot`], which the node exports to host tooling.
 
+use super::AdmissionStatus;
 use crate::{freshness::RecordTimestamp, types::NetworkInfo};
+use libp2p::{Multiaddr, PeerId};
 use std::{
     collections::{HashMap, HashSet},
     time::Duration,
 };
-use tn_types::{BlsPublicKey, TimestampSec};
+use tn_types::{BlsPublicKey, NetworkPublicKey, TimestampSec};
 use tokio::time::Instant;
 
 /// The most distinct keys one swarm tracks across its scheduled and eligible sets.
@@ -71,6 +76,26 @@ impl TrackedKeys {
     /// Whether `key` is in the scheduled or the eligible set.
     pub(super) fn contains(&self, key: &BlsPublicKey) -> bool {
         self.scheduled.contains(key) || self.eligible.contains(key)
+    }
+
+    /// Epoch of the accepted sets, `None` until the first update.
+    pub(super) fn epoch(&self) -> Option<u64> {
+        self.epoch
+    }
+
+    /// Keys of the committee scheduled two epochs ahead.
+    pub(super) fn scheduled(&self) -> &HashSet<BlsPublicKey> {
+        &self.scheduled
+    }
+
+    /// Keys of the eligible validator pool.
+    pub(super) fn eligible(&self) -> &HashSet<BlsPublicKey> {
+        &self.eligible
+    }
+
+    /// Number of records retained for tracked keys.
+    pub(super) fn record_count(&self) -> usize {
+        self.records.len()
     }
 
     /// Every tracked key once, scheduled keys first.
@@ -141,6 +166,135 @@ impl TrackedKeys {
             })
             .collect()
     }
+}
+
+/// One swarm's admission view: its admission status and every key it tracks.
+///
+/// The peer manager builds it from local state in one pass, so `status` and every entry's
+/// `admitted` flag come from the same admission evaluation. Listing a key grants it nothing: a
+/// key held only as scheduled or eligible is reported for export and never admitted.
+#[derive(Clone, Debug)]
+pub struct SwarmAdmissionSnapshot {
+    /// The swarm's metrics label: `primary`, or `worker-N` for worker `N`.
+    pub network: String,
+    /// Epoch of the latest accepted scheduled and eligible key publication, or `None` before the
+    /// first.
+    pub tracked_epoch: Option<u64>,
+    /// The swarm's connection admission status.
+    pub status: AdmissionStatus,
+    /// Every key the swarm tracks, sorted by BLS key bytes.
+    ///
+    /// The swarm's own identity is never listed: it is not a connection source, and the
+    /// connected-peer count of [`AdmissionStatus`] excludes it as well.
+    pub entries: Vec<TrackedEntry>,
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+impl SwarmAdmissionSnapshot {
+    /// Build a snapshot from its parts, for tests that need one without a swarm.
+    pub fn new_for_test(
+        network: impl Into<String>,
+        tracked_epoch: Option<u64>,
+        status: AdmissionStatus,
+        entries: Vec<TrackedEntry>,
+    ) -> Self {
+        Self { network: network.into(), tracked_epoch, status, entries }
+    }
+}
+
+/// One BLS key of a [`SwarmAdmissionSnapshot`], with the slots it holds and the addresses the
+/// swarm would reach it at.
+#[derive(Clone, Debug)]
+pub struct TrackedEntry {
+    /// The key's BLS public key.
+    pub bls_pubkey: BlsPublicKey,
+    /// Every slot the key holds, in [`TrackedSlot`] declaration order.
+    pub slots: Vec<TrackedSlot>,
+    /// The peer id of `network_pubkey`, or `None` when `source` is [`EntrySource::Unresolved`].
+    pub peer_id: Option<PeerId>,
+    /// The network key of the held record or configured binding, or `None` when `source` is
+    /// [`EntrySource::Unresolved`].
+    pub network_pubkey: Option<NetworkPublicKey>,
+    /// The addresses the swarm uses for the key: the launch address when `source` is
+    /// [`EntrySource::Stub`], otherwise those of the held record or configured binding.
+    pub multiaddrs: Vec<Multiaddr>,
+    /// The signed record's own addresses when a launch address replaces them in `multiaddrs`
+    /// and they differ from it, otherwise `None`.
+    ///
+    /// The two lists differ when the operator's inventory is stale or the validator moved; a
+    /// firewall that must not cut a live peer allows both.
+    pub record_multiaddrs: Option<Vec<Multiaddr>>,
+    /// The signed record's timestamp in seconds since the Unix epoch, or `None` while the swarm
+    /// holds no signed record for the key; a configured binding is not a signed record.
+    pub record_timestamp: Option<u64>,
+    /// Where `multiaddrs` came from.
+    pub source: EntrySource,
+    /// Whether the key's identity is in the authorized set that Closed admission enforces.
+    ///
+    /// True only for a key in the accepted committee window or with an operator grant whose
+    /// identity, resolved as admission resolves it from a cached record or a configured binding,
+    /// is authorized. A tracked record resolves no identity: a key held only as scheduled or
+    /// eligible, or a window key whose only record is its tracked one, is not admitted through
+    /// it, even when the record claims an authorized peer id. The flag does not depend on the
+    /// effective mode: under Open or Grace a peer outside the authorized set may still connect.
+    pub admitted: bool,
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+impl TrackedEntry {
+    /// Build an unresolved, unadmitted entry for `bls_pubkey` in `slots`, with no identity and no
+    /// addresses, for tests that need one without a swarm; struct update syntax fills the rest.
+    pub fn new_for_test(bls_pubkey: BlsPublicKey, slots: Vec<TrackedSlot>) -> Self {
+        Self {
+            bls_pubkey,
+            slots,
+            peer_id: None,
+            network_pubkey: None,
+            multiaddrs: Vec::new(),
+            record_multiaddrs: None,
+            record_timestamp: None,
+            source: EntrySource::Unresolved,
+            admitted: false,
+        }
+    }
+}
+
+/// Why a swarm lists a key in its [`SwarmAdmissionSnapshot`]; an entry lists every slot that
+/// applies.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TrackedSlot {
+    /// Member of the previous committee of the accepted window, or of the swarm's committee
+    /// slots before a window is accepted.
+    Previous,
+    /// Member of the current committee of the accepted window, or of the swarm's committee
+    /// slots before a window is accepted.
+    Current,
+    /// Member of the next committee of the accepted window, or of the swarm's committee slots
+    /// before a window is accepted.
+    Next,
+    /// Member of the committee scheduled two epochs ahead; tracked for export, never admitted
+    /// for it.
+    Scheduled,
+    /// In the eligible validator pool; tracked for export, never admitted for it.
+    Eligible,
+    /// Configured as a trusted hub or trusted peer.
+    Trusted,
+    /// Configured as a bootstrap peer.
+    Bootstrap,
+}
+
+/// Where a [`TrackedEntry`]'s addresses came from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EntrySource {
+    /// A signed node record the swarm verified.
+    Record,
+    /// An operator-configured binding (trusted, bootstrap or explicit peer) with no signed
+    /// record yet.
+    Config,
+    /// A `committee_peers` launch address, which replaces the addresses of any signed record.
+    Stub,
+    /// Neither a signed record nor a configured binding is held; the entry has no addresses.
+    Unresolved,
 }
 
 /// Lookup schedule for one tracked key.

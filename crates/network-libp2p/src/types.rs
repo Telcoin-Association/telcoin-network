@@ -2,7 +2,7 @@
 
 use crate::{
     codec::TNMessage, error::NetworkError, peers::Penalty, serve_permits::ServePermits,
-    AdmissionStatus, CommitteeUpdate, GossipMessage, PeerExchangeMap,
+    AdmissionStatus, CommitteeUpdate, GossipMessage, PeerExchangeMap, SwarmAdmissionSnapshot,
 };
 pub use libp2p::gossipsub::MessageId;
 use libp2p::{
@@ -526,6 +526,11 @@ where
         /// Admission observations from this handle's swarm.
         reply: oneshot::Sender<AdmissionStatus>,
     },
+    /// Export the swarm's admission status with every key it tracks, built from local state.
+    AdmissionSnapshot {
+        /// The snapshot of this handle's swarm.
+        reply: oneshot::Sender<SwarmAdmissionSnapshot>,
+    },
     /// Pre-dial recovery: forgive bans for a committee so it can be dialed, without mutating the
     /// committee slots.
     PrepareCommitteeDial {
@@ -981,6 +986,19 @@ where
     pub async fn admission_status(&self) -> NetworkResult<AdmissionStatus> {
         let (reply, res) = oneshot::channel();
         self.sender.send(NetworkCommand::AdmissionStatus { reply }).await?;
+        res.await.map_err(Into::into)
+    }
+
+    /// Export this swarm's admission status together with every key it tracks: the committee
+    /// window, the scheduled and eligible keys, and the trusted and bootstrap peers, each with
+    /// its slots, addresses, address source, and admission decision.
+    ///
+    /// The swarm answers from local state without network queries, but the command shares the
+    /// channel that carries publishes, so a caller that polls it should cache the answer and
+    /// bound its wait.
+    pub async fn admission_snapshot(&self) -> NetworkResult<SwarmAdmissionSnapshot> {
+        let (reply, res) = oneshot::channel();
+        self.sender.send(NetworkCommand::AdmissionSnapshot { reply }).await?;
         res.await.map_err(Into::into)
     }
 

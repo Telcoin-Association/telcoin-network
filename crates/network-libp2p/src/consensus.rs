@@ -1729,6 +1729,10 @@ where
                 let status = self.swarm.behaviour().peer_manager.admission_status();
                 send_or_log_error!(reply, status, "AdmissionStatus");
             }
+            NetworkCommand::AdmissionSnapshot { reply } => {
+                let snapshot = self.swarm.behaviour().peer_manager.admission_snapshot();
+                send_or_log_error!(reply, snapshot, "AdmissionSnapshot");
+            }
             NetworkCommand::PrepareCommitteeDial { committee } => {
                 // Deadlock-breaker pre-dial: forgive bans so the committee can be dialed without
                 // mutating the committee slots (the real slot update follows shortly after).

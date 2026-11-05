@@ -6,7 +6,10 @@ use super::{
     cache::BannedPeerCache,
     peer::MAX_MULTIADDRS_PER_PEER,
     status::NewConnectionStatus,
-    tracked::{TrackedKeys, MAX_TRACKED_KEYS},
+    tracked::{
+        EntrySource, SwarmAdmissionSnapshot, TrackedEntry, TrackedKeys, TrackedSlot,
+        MAX_TRACKED_KEYS,
+    },
     types::{ConnectionDirection, ConnectionType, DialRequest, LookupClass, PeerAction},
     PeerEvent, PeerExchangeMap, Penalty,
 };
@@ -343,6 +346,14 @@ pub(crate) struct PeerManager {
     /// Membership is chain-derived. Signed records can refresh RPC endpoints, but changing a
     /// launch identity or address requires a coordinated inventory update and restart.
     committee_peers: BTreeMap<BlsPublicKey, tn_types::P2pNode>,
+    /// Addresses of the latest signed record cached for a `committee_peers` key, as signed,
+    /// before the launch address replaced them in `known_peers`.
+    ///
+    /// Read only by the admission snapshot, which reports both address lists. Keys are a subset
+    /// of `committee_peers`, so the map is bounded by the launch inventory. A config stub for the
+    /// key also passes through the replacement, so an entry describes a signed record only while
+    /// the key is not in `stub_records`.
+    launch_record_addrs: HashMap<BlsPublicKey, Vec<Multiaddr>>,
     /// A queue of events that the `PeerManager` is waiting to produce.
     events: VecDeque<PeerEvent>,
     /// A queue of peers to dial.
@@ -435,6 +446,112 @@ impl PeerManager {
             self.local_peer_id,
             |peer| self.is_connected(peer),
         )
+    }
+
+    /// Build this swarm's admission snapshot from a single admission evaluation.
+    ///
+    /// Lists every key in a committee slot, the scheduled or eligible set, or the trusted or
+    /// bootstrap configuration, except this swarm's own identity, sorted by key bytes. Committee
+    /// slots come from the accepted window, or from the swarm's committee slots before a window
+    /// is accepted. Each key reports the record or binding that [`Self::snapshot_record`]
+    /// selects. `admitted` restates the admission predicate: the key is in the accepted window
+    /// or holds an operator grant, and the identity admission resolves for it is authorized.
+    /// A key held only as scheduled or eligible is neither, so a forged record claiming an
+    /// authorized peer id for it is still not admitted.
+    pub(crate) fn admission_snapshot(&self) -> SwarmAdmissionSnapshot {
+        let (status, authorized) = self.evaluate_admission();
+        let accepted = self.admission_policy.window();
+        let window = accepted.unwrap_or_else(|| self.peers.committee_slots());
+        // the chain order is the slot order of every entry, and the map sorts keys by bytes
+        let slots = [TrackedSlot::Previous, TrackedSlot::Current, TrackedSlot::Next]
+            .into_iter()
+            .zip(window)
+            .chain([
+                (TrackedSlot::Scheduled, self.tracked.scheduled()),
+                (TrackedSlot::Eligible, self.tracked.eligible()),
+                (TrackedSlot::Trusted, &self.trusted_keys),
+                (TrackedSlot::Bootstrap, &self.bootstrap_keys),
+            ])
+            .flat_map(|(slot, keys)| keys.iter().map(move |key| (*key, slot)))
+            .filter(|(key, _)| Some(*key) != self.local_bls_key)
+            .fold(BTreeMap::<BlsPublicKey, Vec<TrackedSlot>>::new(), |mut slots, (key, slot)| {
+                slots.entry(key).or_default().push(slot);
+                slots
+            });
+        let entries = slots
+            .into_iter()
+            .map(|(bls_key, slots)| {
+                let (info, source, signed) = self.snapshot_record(&bls_key, window);
+                let peer_id = info.map(|info| PeerId::from(info.pubkey.clone()));
+                let multiaddrs = info.map(|info| info.multiaddrs.clone()).unwrap_or_default();
+                let record_multiaddrs = self
+                    .launch_record_addrs
+                    .get(&bls_key)
+                    .filter(|record| {
+                        source == EntrySource::Stub && signed && **record != multiaddrs
+                    })
+                    .cloned();
+                let granted = accepted.is_some_and(|committees| {
+                    committees.iter().any(|keys| keys.contains(&bls_key))
+                }) || self.admission_operator_peers.contains_key(&bls_key);
+                // admission resolves a granted key through its `known_peers` entry, then its
+                // operator binding, never through a tracked record
+                let identity = self
+                    .known_peers
+                    .get(&bls_key)
+                    .map(|info| PeerId::from(info.pubkey.clone()))
+                    .or_else(|| self.admission_operator_peers.get(&bls_key).copied());
+                TrackedEntry {
+                    bls_pubkey: bls_key,
+                    slots,
+                    peer_id,
+                    network_pubkey: info.map(|info| info.pubkey.clone()),
+                    multiaddrs,
+                    record_multiaddrs,
+                    record_timestamp: info.filter(|_| signed).map(|info| info.timestamp),
+                    source,
+                    admitted: granted && identity.is_some_and(|peer| authorized.contains(&peer)),
+                }
+            })
+            .collect();
+        SwarmAdmissionSnapshot {
+            network: self.metrics.network().to_owned(),
+            tracked_epoch: self.tracked.epoch(),
+            status,
+            entries,
+        }
+    }
+
+    /// Select the record or binding the admission snapshot reports for `bls_key`.
+    ///
+    /// A key in a committee slot of `window`, a committee member, or a pinned key (trusted,
+    /// bootstrap, explicit, and launch peers all pin) reads `known_peers`, the cache admission
+    /// itself resolves from: a `committee_peers` key is a launch stub, another config stub is a
+    /// configured binding, and any other entry a signed record. Every other key, and such a key
+    /// with no `known_peers` entry, reads its tracked record: a key that has just moved from the
+    /// eligible set into a slot keeps that record until its committee lookup lands. A key with
+    /// neither is unresolved. Returns the entry, its source, and whether the entry is a signed
+    /// record rather than a configured binding.
+    fn snapshot_record(
+        &self,
+        bls_key: &BlsPublicKey,
+        window: [&HashSet<BlsPublicKey>; 3],
+    ) -> (Option<&NetworkInfo>, EntrySource, bool) {
+        let cached = window.iter().any(|keys| keys.contains(bls_key))
+            || self.peers.is_committee_member(bls_key)
+            || self.pinned_peers.contains(bls_key);
+        let stub = self.stub_records.contains(bls_key);
+        match self.known_peers.get(bls_key).filter(|_| cached) {
+            Some(info) if self.committee_peers.contains_key(bls_key) => {
+                (Some(info), EntrySource::Stub, !stub)
+            }
+            Some(info) if stub => (Some(info), EntrySource::Config, false),
+            Some(info) => (Some(info), EntrySource::Record, true),
+            None => match self.tracked.record(bls_key) {
+                Some(info) => (Some(info), EntrySource::Record, true),
+                None => (None, EntrySource::Unresolved, false),
+            },
+        }
     }
 
     /// Apply one predicate to every connection direction, including unknown pending identities.
@@ -627,6 +744,7 @@ impl PeerManager {
             pinned_peers: Default::default(),
             stub_records: Default::default(),
             committee_peers: Default::default(),
+            launch_record_addrs: Default::default(),
             events: Default::default(),
             dial_requests: Default::default(),
             temporarily_banned,
@@ -975,6 +1093,7 @@ impl PeerManager {
             banned_count,
         );
         self.record_committee_connectivity();
+        self.record_tracked_resolution();
 
         // enforce connection limits
         self.prune_connected_peers();
@@ -1480,6 +1599,8 @@ impl PeerManager {
             .as_ref()
             .is_some_and(|key| self.peers.current_committee().contains(key));
         self.record_committee_connectivity();
+        // the new slots decide where tracked keys resolve, and the prune may have demoted records
+        self.record_tracked_resolution();
     }
 
     /// Pre-dial recovery: forgive bans for a committee so a subsequent dial loop can connect,
@@ -1515,6 +1636,7 @@ impl PeerManager {
                 bounded_warn!(Command, target: "peer-manager", epoch, left_out, max = MAX_TRACKED_KEYS, "tracked key limit reached, keys left out");
             }
         }
+        self.record_tracked_resolution();
     }
 
     /// Write the committee connectivity gauges from the current committee slot.
@@ -1526,6 +1648,30 @@ impl PeerManager {
         let (size, connected) = self.peers.current_committee_connectivity();
         let expected = if self.local_in_current_committee { size.saturating_sub(1) } else { 0 };
         self.metrics.set_committee_connectivity(size, expected, connected);
+    }
+
+    /// Write the tracked-key gauges: per tracked slot, the keys other than this swarm's own and
+    /// how many of them lack a signed record, plus the count of retained tracked records.
+    ///
+    /// Each key resolves where the admission snapshot reads it ([`Self::snapshot_record`]), so a
+    /// configured binding counts as unresolved, as it does for the committee resolution gauges.
+    /// Called on tracked changes, committee updates, and the heartbeat, never per swarm poll.
+    fn record_tracked_resolution(&self) {
+        let window = self.admission_policy.window().unwrap_or_else(|| self.peers.committee_slots());
+        [("scheduled", self.tracked.scheduled()), ("eligible", self.tracked.eligible())]
+            .into_iter()
+            .for_each(|(slot, keys)| {
+                let required = keys.iter().filter(|key| Some(**key) != self.local_bls_key);
+                let expected = required.clone().count();
+                let unresolved = required
+                    .filter(|key| {
+                        let (_, _, signed) = self.snapshot_record(key, window);
+                        !signed
+                    })
+                    .count();
+                self.metrics.set_tracked_resolution(slot, expected, unresolved);
+            });
+        self.metrics.set_tracked_records(self.tracked.record_count());
     }
 
     /// Drop cached network info for peers no longer worth tracking, bounding `known_peers`.
@@ -1566,6 +1712,7 @@ impl PeerManager {
         let known = &self.known_peers;
         self.stub_records.retain(|bls_key| known.contains_key(bls_key));
         self.known_timestamps.retain(|bls_key, _| known.contains_key(bls_key));
+        // the committee update running this prune refreshes the tracked gauges once afterwards
         demoted.into_iter().for_each(|(bls_key, info, timestamp)| {
             self.retain_tracked(bls_key, info, timestamp, observed);
         });
@@ -1964,7 +2111,9 @@ impl PeerManager {
         let cacheable =
             self.peers.is_committee_member(&bls_key) || self.pinned_peers.contains(&bls_key);
         if !cacheable && self.is_tracked_key(&bls_key) {
-            self.retain_tracked(bls_key, info, timestamp, now());
+            if self.retain_tracked(bls_key, info, timestamp, now()) {
+                self.record_tracked_resolution();
+            }
         } else if !cacheable {
             trace!(
                 target: "peer-manager",
@@ -2100,8 +2249,11 @@ impl PeerManager {
         let advertised: PeerId = info.pubkey.clone().into();
         let cacheable =
             self.peers.is_committee_member(&bls_key) || self.pinned_peers.contains(&bls_key);
-        if !cacheable && self.is_tracked_key(&bls_key) {
-            self.retain_tracked(bls_key, info.clone(), timestamp, observed);
+        if !cacheable
+            && self.is_tracked_key(&bls_key)
+            && self.retain_tracked(bls_key, info.clone(), timestamp, observed)
+        {
+            self.record_tracked_resolution();
         }
         match () {
             () if cacheable && self.kad_timestamp_is_stale(&bls_key, timestamp, observed) => {
@@ -2271,9 +2423,11 @@ impl PeerManager {
         } else if !self.launch_binding_matches(bls_key, &info) {
             bounded_warn!(PeerRecord, target: "peer-manager", ?bls_key, "rejecting record that contradicts launch inventory");
         } else {
-            self.committee_peers.get(&bls_key).iter().for_each(|peer| {
-                info.multiaddrs = vec![peer.network_address.clone()];
-            });
+            if let Some(peer) = self.committee_peers.get(&bls_key) {
+                let signed =
+                    std::mem::replace(&mut info.multiaddrs, vec![peer.network_address.clone()]);
+                self.launch_record_addrs.insert(bls_key, signed);
+            }
             self.cache_compatible_peer_with_timestamp(bls_key, info, timestamp);
         }
     }
@@ -2297,22 +2451,26 @@ impl PeerManager {
     /// The caller has checked that the key is tracked. A record that contradicts a configured hub
     /// or a launch binding, in either direction, is refused as on the committee cache path, and a
     /// record that does not supersede the held one is dropped. Nothing here touches the peer
-    /// store, `known_peers`, or [`Self::peer_to_bls`].
+    /// store, `known_peers`, or [`Self::peer_to_bls`]. Returns whether the record was kept.
     fn retain_tracked(
         &mut self,
         bls_key: BlsPublicKey,
         info: NetworkInfo,
         timestamp: crate::freshness::RecordTimestamp,
         observed: tn_types::TimestampSec,
-    ) {
+    ) -> bool {
         if !self.trusted_binding_matches(bls_key, &info) {
             bounded_warn!(PeerRecord, target: "peer-manager", ?bls_key, "ignoring tracked record that contradicts configured hub identity");
+            false
         } else if !self.launch_binding_matches(bls_key, &info) {
             bounded_warn!(PeerRecord, target: "peer-manager", ?bls_key, "ignoring tracked record that contradicts launch inventory");
+            false
         } else if self.tracked.retain(bls_key, info, timestamp, observed) {
             trace!(target: "peer-manager", ?bls_key, "retaining tracked peer record");
+            true
         } else {
             trace!(target: "peer-manager", ?bls_key, "dropping stale tracked peer record");
+            false
         }
     }
 
