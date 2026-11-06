@@ -6,7 +6,10 @@
 //!
 //! The mined transactions are returned with the built block so the worker can update the pool.
 
-use std::collections::HashMap;
+use std::{
+    collections::HashMap,
+    time::{Duration, Instant},
+};
 use tn_reth::{ChangedAccount, TxPool};
 use tn_types::{
     max_batch_gas, max_batch_size, Address, Batch, BatchBuilderArgs, Encodable2718 as _, TxHash,
@@ -38,6 +41,60 @@ pub struct BatchBuilderOutput {
     pub(crate) peer_deferred: usize,
     /// Transactions evicted for exceeding a whole-batch limit, excluding their descendants.
     pub(crate) unpackable: usize,
+    /// Selection statistics for the `batch built` line and the build metrics.
+    pub(crate) stats: BuildStats,
+}
+
+/// Why transaction selection stopped adding transactions to a batch.
+///
+/// Selection walks the whole pending set, so a batch counts as full only when a
+/// remaining-capacity check turned away a transaction that fits an empty batch. Whole-batch
+/// evictions, peer deferrals and skipped transaction types leave capacity unused and do not
+/// count.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BuildReason {
+    /// Selection ran out of pending transactions before a capacity limit turned one away.
+    Drained,
+    /// The batch gas limit turned away the first capacity-deferred transaction.
+    ///
+    /// This fires on the first gas deferral, which a single large transaction can cause while
+    /// the batch is far from full, so read it together with the line's `gas=`.
+    GasFull,
+    /// The batch byte limit turned away the first capacity-deferred transaction.
+    BytesFull,
+}
+
+impl BuildReason {
+    /// The static label carried by the `batch built` line and the `builds_total` counter.
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::Drained => "drained",
+            Self::GasFull => "gas_full",
+            Self::BytesFull => "bytes_full",
+        }
+    }
+}
+
+/// Selection statistics for one batch build.
+///
+/// Pool ages run from each included transaction's pool admission (reth's
+/// `ValidPoolTransaction::timestamp`, which a queued-to-pending promotion keeps) to the end of
+/// selection, so they cover both the pending wait and any nonce-gap wait in the queued
+/// sub-pool. All fields are zero for an empty batch apart from `reason` and `build`.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct BuildStats {
+    /// Why selection stopped adding transactions.
+    pub(crate) reason: BuildReason,
+    /// Median pool age of the included transactions (the older middle one for an even count).
+    pub(crate) pool_age_p50: Duration,
+    /// Oldest pool age among the included transactions.
+    pub(crate) pool_age_max: Duration,
+    /// Wall time of the whole build: selection, encoding, evictions and the balance reads.
+    pub(crate) build: Duration,
+    /// Encoded EIP-2718 bytes of the included transactions, as the batch validator measures.
+    pub(crate) bytes: usize,
+    /// Sum of the included transactions' gas limits.
+    pub(crate) gas: u64,
 }
 
 /// Build a batch on the blocking pool, including transaction encoding and sender balance reads.
@@ -71,6 +128,7 @@ pub fn build_batch<P: TxPool>(
     worker_id: WorkerId,
     base_fee: u64,
 ) -> BatchBuilderOutput {
+    let build_start = Instant::now();
     let BatchBuilderArgs { mut pool, beneficiary, epoch } = args;
     let gas_limit = max_batch_gas(epoch);
     let max_size = max_batch_size(epoch);
@@ -94,6 +152,10 @@ pub fn build_batch<P: TxPool>(
     let mut sender_nonces: HashMap<Address, u64> = HashMap::new();
     let mut sender_costs: HashMap<Address, U256> = HashMap::new();
     let mut peer_deferred: usize = 0;
+    // the first remaining-capacity limit that turned a transaction away
+    let mut capacity_limit: Option<BuildReason> = None;
+    // pool admission time of every included transaction, turned into ages after selection
+    let mut admitted_at: Vec<Instant> = Vec::new();
 
     // begin loop through sorted "best" transactions in pending pool
     // and execute them to build the block
@@ -150,10 +212,12 @@ pub fn build_batch<P: TxPool>(
                 // Compare remaining capacity without overflowing cumulative sums. Transactions
                 // that fit an empty batch stay pending with their descendants for a later build.
                 best_txs.exceeds_gas_limit(&pool_tx, gas_limit);
+                capacity_limit.get_or_insert(BuildReason::GasFull);
                 debug!(target: "worker::batch_builder", ?pool_tx, "marking tx invalid due to gas constraint");
             }
             () if encoded_size > max_size.saturating_sub(total_bytes_size) => {
                 best_txs.max_batch_size(&pool_tx, encoded_size, max_size);
+                capacity_limit.get_or_insert(BuildReason::BytesFull);
                 debug!(target: "worker::batch_builder", ?pool_tx, "marking tx invalid due to bytes constraint");
             }
             () => {
@@ -165,6 +229,7 @@ pub fn build_batch<P: TxPool>(
                 // append transaction to the list of executed transactions
                 mined_transactions.push(*pool_tx.hash());
                 transactions.push(encoded);
+                admitted_at.push(pool_tx.timestamp);
 
                 // track max nonce per sender for pool state updates
                 let sender = pool_tx.sender();
@@ -183,6 +248,16 @@ pub fn build_batch<P: TxPool>(
             }
         }
     }
+
+    // one clock read for every age; sorting the admission times newest first sorts the ages
+    // ascending, and the batch is bounded by its gas and byte limits
+    let selected_at = Instant::now();
+    admitted_at.sort_unstable_by(|a, b| b.cmp(a));
+    let pool_age = |admitted: Option<&Instant>| {
+        admitted.map_or(Duration::ZERO, |admitted| selected_at.saturating_duration_since(*admitted))
+    };
+    let pool_age_p50 = pool_age(admitted_at.get(admitted_at.len() / 2));
+    let pool_age_max = pool_age(admitted_at.last());
 
     // batch
     let batch =
@@ -238,8 +313,24 @@ pub fn build_batch<P: TxPool>(
         })
         .collect();
 
+    let stats = BuildStats {
+        reason: capacity_limit.unwrap_or(BuildReason::Drained),
+        pool_age_p50,
+        pool_age_max,
+        build: build_start.elapsed(),
+        bytes: total_bytes_size,
+        gas: total_possible_gas,
+    };
+
     // return output
-    BatchBuilderOutput { batch, mined_transactions, changed_accounts, peer_deferred, unpackable }
+    BatchBuilderOutput {
+        batch,
+        mined_transactions,
+        changed_accounts,
+        peer_deferred,
+        unpackable,
+        stats,
+    }
 }
 
 #[cfg(test)]
@@ -703,6 +794,71 @@ mod tests {
             "the producer packed {encoded_total} encoded bytes, over the {} limit the validator \
              enforces on the same measurement",
             max_batch_size(EPOCH),
+        );
+    }
+
+    /// Build `txs` once after they have sat in the pool for `wait`, returning the output and
+    /// an upper bound on any packed transaction's pool age.
+    fn build_after(txs: &[Vec<u8>], wait: Duration) -> (BatchBuilderOutput, Duration) {
+        let admitted = Instant::now();
+        let mut pool = TestPool::new(txs);
+        std::thread::sleep(wait);
+        let args = BatchBuilderArgs { pool: &mut pool, beneficiary: Address::ZERO, epoch: 0 };
+        let output = build_batch(args, 0, MIN_PROTOCOL_BASE_FEE);
+        (output, admitted.elapsed())
+    }
+
+    /// Selection reports why it stopped, what it packed and how long the packed transactions
+    /// waited in the pool, without changing the batch it builds.
+    #[test]
+    fn build_stats_report_reason_size_and_pool_age() {
+        let wait = Duration::from_millis(5);
+        let size = |txs: &[Vec<u8>]| txs.iter().map(Vec::len).sum::<usize>();
+
+        // drained: everything pending fits
+        let mut sender = TransactionFactory::new();
+        let small = vec![
+            capacity_transaction(&mut sender, 21_000, 0),
+            capacity_transaction(&mut sender, 30_000, 0),
+        ];
+        let (output, since_admission) = build_after(&small, wait);
+        let stats = output.stats;
+        assert_eq!(output.batch.transactions, small);
+        assert_eq!(stats.reason, BuildReason::Drained);
+        assert_eq!((stats.bytes, stats.gas), (size(&small), 51_000));
+        assert!(stats.pool_age_p50 >= wait && stats.pool_age_p50 <= stats.pool_age_max);
+        assert!(stats.pool_age_max <= since_admission);
+        assert!(stats.build <= since_admission);
+
+        // gas full: a whole-batch transaction turns a second sender away
+        let mut first_sender = TransactionFactory::new();
+        let mut deferred_sender = TransactionFactory::new_random();
+        let full = capacity_transaction(&mut first_sender, max_batch_gas(0), 0);
+        let deferred = capacity_transaction(&mut deferred_sender, 21_000, 0);
+        let (output, _) = build_after(&[full.clone(), deferred], wait);
+        assert_eq!(output.batch.transactions, vec![full.clone()]);
+        assert_eq!(output.stats.reason, BuildReason::GasFull);
+        assert_eq!((output.stats.bytes, output.stats.gas), (full.len(), max_batch_gas(0)));
+        assert!(output.stats.pool_age_max >= wait);
+
+        // bytes full: two half-size transactions cannot share a batch
+        let mut first_sender = TransactionFactory::new();
+        let mut deferred_sender = TransactionFactory::new_random();
+        let half = max_batch_size(0) / 2;
+        let first = capacity_transaction(&mut first_sender, max_batch_gas(0) / 4, half);
+        let deferred = capacity_transaction(&mut deferred_sender, max_batch_gas(0) / 4, half);
+        let (output, _) = build_after(&[first.clone(), deferred], wait);
+        assert_eq!(output.batch.transactions, vec![first]);
+        assert_eq!(output.stats.reason, BuildReason::BytesFull);
+
+        // an empty pool drains at once with zero ages
+        let (output, _) = build_after(&[], Duration::ZERO);
+        assert!(output.batch.transactions.is_empty());
+        assert_eq!(output.stats.reason, BuildReason::Drained);
+        assert_eq!((output.stats.bytes, output.stats.gas), (0, 0));
+        assert_eq!(
+            (output.stats.pool_age_p50, output.stats.pool_age_max),
+            (Duration::ZERO, Duration::ZERO)
         );
     }
 }
