@@ -5,7 +5,9 @@
 //! ## Open and recovery
 //!
 //! A missing or empty file is created atomically: both metas (txn 0, no tables) are written to
-//! `<path>.creating`, synced, and renamed over the path. The file is then locked
+//! `<path>.creating`, synced, and renamed over the path. A symbolic link at the path is followed
+//! only to a file holding bytes: a dangling one, or one to an empty file, is refused (the rename
+//! would replace the link, not create its target). The file is then locked
 //! (`flock(LOCK_EX | LOCK_NB)`, so a second open fails with [`Error::Locked`], in this process
 //! too), and the newest valid meta chosen ([`choose_meta`]). Open never writes to an existing
 //! file: a file that is shorter than the chosen meta's page count, not a tn-lmdb file, or whose
@@ -57,7 +59,7 @@ use std::{
     fs::{self, File, OpenOptions},
     io,
     ops::Range,
-    os::unix::fs::{FileExt as _, MetadataExt as _},
+    os::unix::fs::{FileExt as _, MetadataExt as _, OpenOptionsExt as _},
     path::{Path, PathBuf},
     sync::{
         atomic::{fence, AtomicU64, Ordering},
@@ -462,8 +464,10 @@ pub(crate) struct Writer {
     /// takes from elsewhere ([`Self::verifies`], [`Self::verify_ns`], the file's growth).
     pub(crate) stats: IoStats,
     /// [`IoStats::verifies`]: counted by [`PageWrite::count_verify`], whose callers hold the store
-    /// by shared reference (and the store is `Sync`), so an atomic. Only the writing
-    /// transaction's thread changes it, by a relaxed load and store, never a read-modify-write.
+    /// by shared reference (and the store is `Sync`), so an atomic. Every caller is inside a
+    /// write, which holds the `RwTxn` by `&mut`, so one thread changes it at a time, by a
+    /// relaxed load and store, never a read-modify-write. The types do not enforce that: a
+    /// caller reached through a shared `&RwTxn` could lose counts, harmless in a statistic.
     verifies: AtomicU64,
     /// [`IoStats::verify_ns`], kept as [`Self::verifies`] is.
     verify_ns: AtomicU64,
@@ -690,10 +694,13 @@ impl Writer {
         if durable.is_some_and(|txn| txn >= self.last.txn) {
             return Ok(());
         }
-        let _guard = UnwindLatch(latch, "a sync panicked");
+        let guard = UnwindLatch(latch, "a sync panicked");
         let pages: Vec<u32> = self.unsynced.drain().map(|p| p as u32).collect();
         let last = self.last;
-        self.make_durable(&pages, &last).inspect_err(|e| latch.fail(format!("sync: {e}")))
+        let synced =
+            self.make_durable(&pages, &last).inspect_err(|e| latch.fail(format!("sync: {e}")));
+        guard.disarm();
+        synced
     }
 
     /// Publish `meta` as the newest committed state (commit step 7): readers that begin from
@@ -1131,7 +1138,8 @@ impl Env {
     /// for a file that cannot be opened safely (left unchanged); [`Error::InvalidPageSize`] for
     /// an invalid `options.page_size`; [`Error::InvalidMaxGrowth`] for an `options.max_growth`
     /// under [`MIN_GROWTH`](crate::MIN_GROWTH) (both refused before the file is touched);
-    /// [`Error::Io`].
+    /// [`Error::Io`], `NotFound` for a symbolic link at `path` to a missing or empty file (left
+    /// as it is).
     pub fn open(path: impl AsRef<Path>, options: EnvOptions) -> Result<Env> {
         let path = path.as_ref();
         Geometry::new(options.page_size)?;
@@ -1431,29 +1439,73 @@ fn open_shared(path: &Path) -> Result<File> {
     Err(Error::Locked)
 }
 
-/// True if the file at `path` is missing or empty: open creates it.
+/// True if the file at `path` is missing or empty: open creates it. A symbolic link at `path` is
+/// followed only to a file holding bytes: one whose target is missing or empty is refused,
+/// [`Error::Io`] (`NotFound`) naming the link, and left as it is. [`create`]'s rename would
+/// replace the link itself with a new, empty database, leaving the one the link names (on a disk
+/// not mounted, say) behind.
 fn needs_create(path: &Path) -> Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() => {}
+        Ok(meta) => return Ok(meta.len() == 0),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(true),
+        Err(e) => return Err(e.into()),
+    }
+    let refused = |target: &str| {
+        Error::Io(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!(
+                "the database path {} is a symbolic link to {target}: refused, as creating a \
+                 database there would replace the link",
+                path.display()
+            ),
+        ))
+    };
     match fs::metadata(path) {
-        Ok(meta) => Ok(meta.len() == 0),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(true),
+        Ok(target) if target.len() > 0 => Ok(false),
+        Ok(_) => Err(refused("an empty file")),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Err(refused("a missing file")),
         Err(e) => Err(e.into()),
     }
 }
 
 /// Create the file at `path` atomically (open step 2): both metas of a new file (txn 0, no
-/// tables) are written to `<path>.creating` (truncating any leftover), synced, and renamed over
-/// the path, and the directory is synced. The temporary file is locked while it is built: one
-/// another creator holds locked is [`Error::Locked`] at once. A file another handle created
-/// meanwhile is kept, and the temporary file is then removed if unused ([`remove_unused`]).
+/// tables) are written to `<path>.creating` (truncating any leftover; a symbolic link or any
+/// other file that is not a regular file there is refused, [`Error::Io`], and left as it is),
+/// synced, and renamed over the path, and the directory is synced. The temporary file is locked
+/// while it is built: one another creator holds locked is [`Error::Locked`] at once. A file
+/// another handle created meanwhile is kept, and a path [`needs_create`] now refuses is refused:
+/// either way the temporary file is then removed if unused ([`remove_unused`]).
 fn create(path: &Path, page_size: u32) -> Result<()> {
     let mut tmp = path.as_os_str().to_owned();
     tmp.push(".creating");
     let tmp = PathBuf::from(tmp);
-    let file = OpenOptions::new().read(true).write(true).create(true).truncate(false).open(&tmp)?;
+    // Never through a symbolic link (`O_NOFOLLOW`), whose target the truncate and the writes
+    // below would overwrite, and only into a regular file.
+    let refused = |what: &str| {
+        Error::Io(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{} is {what}: refused as a new database's temporary file", tmp.display()),
+        ))
+    };
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&tmp)
+        .map_err(|e| match e.raw_os_error() {
+            Some(libc::ELOOP) => refused("a symbolic link"),
+            _ => e.into(),
+        })?;
+    if !file.metadata()?.is_file() {
+        return Err(refused("not a regular file"));
+    }
     if !sys::flock_exclusive(&file)? {
         return Err(Error::Locked);
     }
-    if !needs_create(path)? {
+    if !needs_create(path).inspect_err(|_| remove_unused(&tmp, &file))? {
         remove_unused(&tmp, &file);
         return Ok(());
     }

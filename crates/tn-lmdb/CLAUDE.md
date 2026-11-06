@@ -44,7 +44,7 @@ Each row: the file's role, its entry points, what a change must keep; item docs 
 | `freelist.rs` | Record codec, `next_record`, `decode_pages`, the fixed-point `save` (README "Free list and page reuse"). |
 | `catalog.rs` | `DupOptions` (public; `PACKED_DEFAULT`, `resolved`, `resolve`: `InvalidDupOptions`), `TableRecord` (`RECORD_LEN`; `decode` refuses unknown flags, non-zero reserved bytes, `DupRecord::broken_rule`), `usable` (a record held to this build's limits at every use: `catalog::get`, `Env::check`), the catalog ops. |
 | `check.rs` | `Env::check`: structure plus exact page accounting; `claim_run` (a run read's checks, full CRC included, plus its zero pad); `Checker::walk` (`Leaves::{Plain, DupOuter}`); `Checker::walk_dup` (width, nested trees walked `Plain`, packed sets validated whole, an inline cell in a table that never packs refused (`NOT_NESTED`), totals against the record); `TableCheck`. |
-| `latch.rs` | `Latch` (first cause wins; `fail` vs `fail_damaged`), `UnwindLatch`. |
+| `latch.rs` | `Latch` (first cause wins; `fail` vs `fail_damaged`), `UnwindLatch` (a guarded step that ends without a panic of its own calls `disarm`, so an unrelated unwind never latches). |
 | `file.rs` | `PageFile`: the reserved mapping (each page slice made from the raw pointer over its own bytes, never a reference to the whole mapping), `grow` (capped by `EnvOptions::max_growth`, at least `MIN_GROWTH`), `trim_to`, the syncs (`msync_range`, `msync_page`, `fdatasync_all`, the size sync), poison; `ReadOnlyFile`; `advise_access` (do-not-flag 16); `MapView` (the readers' and the writer's, updated in place by a remap). |
 | `sys.rs` | `fsync_file`, `fdatasync_file`, `fsync_directory`, `allocate_range`, `flock_exclusive` (a writer's open), `flock_shared` (a read-only open's). |
 | `crc.rs` | A copy of `crates/storage/src/archive/crc.rs`; keep the code a copy (its module doc and two `dead_code` allows differ, as the module doc says). |
@@ -58,8 +58,10 @@ Each row: the file's role, its entry points, what a change must keep; item docs 
 - **Never `File::sync_all` or `sync_data`** (`F_FULLFSYNC` on macOS). Use `sys::fsync_file` and
   `sys::fdatasync_file`, a plain fsync on macOS.
 - **Grow the file with `sys::allocate_range`** (real blocks), so a full disk is an `io::Error`,
-  not a `SIGBUS`. On macOS the first writes into preallocated slack before an `fsync` are slow
-  (README, Platform notes); that cost is accepted: do not grow sparse to avoid it.
+  not a `SIGBUS`, on a file that shares no blocks (copy-on-write file systems and reflinked
+  copies can still `SIGBUS` on a full disk: README, Platform notes). On macOS the first writes
+  into preallocated slack before an `fsync` are slow (README, Platform notes); that cost is
+  accepted: do not grow sparse to avoid it.
 - **Every sync wrapper reports to `disk_model` in tests.** `msync` (`msync_range`, `msync_page`)
   calls `flushed_range`; `fsync`/`fdatasync` (`fdatasync_all`, the size sync) call `flushed_all`.
   A sync path that skips the model makes the crash tests lie.

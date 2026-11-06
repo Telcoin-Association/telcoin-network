@@ -633,3 +633,217 @@ fn a_live_leaf_freed_by_a_later_drop_is_corrupt_once_reused() {
     drop(ro);
     assert!(env.failure().is_some(), "the get latched");
 }
+
+/// The key of the one row [`two_tables`] gives each table: `key` in a plain table, outer key 1
+/// with the subkey `key` in a dup table.
+fn first_key(dup: bool) -> Vec<u8> {
+    if dup {
+        dup::dup_key(1, b"key")
+    } else {
+        b"key".to_vec()
+    }
+}
+
+/// A cleanly closed file with the tables `a` and `d`, plain or (with `dup`) dup tables of
+/// [`dup::OPTIONS`], each holding one row under [`first_key`] whose value is the table's name,
+/// its catalog one leaf: the dir, the path, both handles and the meta's next table id.
+fn two_tables(dup: bool) -> (TempDir, PathBuf, [Table; 2], u32) {
+    let (dir, path) = temp("tn_lmdb_table_ids");
+    let env = open(&path, SyncMode::Durable);
+    let mut txn = env.begin_rw().expect("rw");
+    let tables = ["a", "d"].map(|name| {
+        let table =
+            if dup { txn.create_dup_table(name, dup::OPTIONS) } else { txn.create_table(name) };
+        let table = table.expect("create");
+        txn.put(&table, &first_key(dup), name.as_bytes()).expect("put");
+        table
+    });
+    txn.commit().expect("commit");
+    let next = env.inner().current().meta.next_table_id;
+    (dir, path, tables, next)
+}
+
+/// A catalog record whose id is not below its state's next table id (the id the next table
+/// created takes) is `Corrupt` at its first use, before a handle carries the id: either
+/// transaction's `open_table`, a get, a table stat and a put through a handle taken before,
+/// `create_table` of its name, its `open_table` after a create took the id, and `Env::check`.
+/// Each latches; the table beside it reads on.
+#[test]
+fn a_catalog_record_id_past_the_next_table_id_is_corrupt_at_first_use() {
+    let (dir, path, [_, d], next) = two_tables(false);
+    for id in [next, u32::MAX] {
+        let crafted = dir.path().join(format!("crafted-{id}"));
+        fs::copy(&path, &crafted).expect("copy");
+        dup::restamp_record(&crafted, |record| record.id = id);
+        {
+            let (_dir, env) = dup::copy_of(&crafted);
+            let ro = env.begin_ro().expect("ro");
+            let a = ro.open_table("a").expect("a's record").expect("a");
+            assert_eq!(ro.get(&a, b"key").expect("get"), Some(&b"a"[..]));
+            assert!(env.failure().is_none(), "id {id}: table a met no damage");
+        }
+        let uses = [
+            "ro open_table",
+            "ro get",
+            "ro stat",
+            "rw open_table",
+            "rw put",
+            "create_table",
+            "after a create",
+            "check",
+        ];
+        for what in uses {
+            let (_dir, env) = dup::copy_of(&crafted);
+            let result = match what {
+                "ro open_table" => env.begin_ro().expect("ro").open_table("d").map(drop),
+                "ro get" => env.begin_ro().expect("ro").get(&d, b"key").map(drop),
+                "ro stat" => env.begin_ro().expect("ro").table_stat(&d).map(drop),
+                "rw open_table" => env.begin_rw().expect("rw").open_table("d").map(drop),
+                "rw put" => env.begin_rw().expect("rw").put(&d, b"k", b"v"),
+                "create_table" => env.begin_rw().expect("rw").create_table("d").map(drop),
+                "after a create" => {
+                    let mut txn = env.begin_rw().expect("rw");
+                    let c = txn.create_table("c").expect("create");
+                    assert_eq!(c.id(), next, "the table created takes the next id");
+                    txn.open_table("d").map(drop)
+                }
+                _ => env.check().map(drop),
+            };
+            let message =
+                if what == "check" { "impossible record" } else { "not below the state's next" };
+            assert!(
+                matches!(&result, Err(Error::Corrupt(m)) if m.contains(message)),
+                "id {id} {what}: {result:?}"
+            );
+            assert!(env.failure().is_some(), "id {id} {what}: latched");
+        }
+    }
+}
+
+/// The rows a write transaction's detached cursor reads from its first row on.
+fn cursor_rows(txn: &RwTxn, cursor: &mut crate::TxnCursor) -> Vec<(Vec<u8>, Vec<u8>)> {
+    let mut rows = Vec::new();
+    let mut row = cursor.first(txn).expect("first").map(|(k, v)| (k.to_vec(), v.to_vec()));
+    while let Some(r) = row {
+        rows.push(r);
+        row = cursor.next(txn).expect("next").map(|(k, v)| (k.to_vec(), v.to_vec()));
+    }
+    rows
+}
+
+/// Two catalog records of one id below the next table id (damage only `Env::check`, which scans
+/// the catalog, can see) are two tables in a write transaction, each with its own working
+/// record: a detached cursor of `d` reads `d`'s tree after writes to both tables, `a`'s first,
+/// never `a`'s; and dropping `a` after a write to `d` keeps `d`'s write, so the commit records
+/// `d`'s new tree and the file's accounting is exact (`d`'s old pages freed once, none leaked).
+#[test]
+fn two_catalog_records_of_one_id_keep_their_own_working_records() {
+    let (_dir, path, [a, _], _) = two_tables(false);
+    dup::restamp_record(&path, |record| record.id = a.id());
+    let env = open(&path, SyncMode::Durable);
+    let mut txn = env.begin_rw().expect("rw");
+    let a = txn.open_table("a").expect("open").expect("a");
+    let d = txn.open_table("d").expect("open").expect("d");
+    assert_eq!(a.id(), d.id(), "the crafted catalog gives both tables one id");
+    txn.put(&a, b"a2", b"a").expect("put");
+    let mut cursor = txn.cursor_detached(&d).expect("cursor");
+    txn.put(&d, b"d2", b"d").expect("put");
+    txn.put(&a, b"a3", b"a").expect("put");
+    let expected = [(b"d2".to_vec(), b"d".to_vec()), (b"key".to_vec(), b"d".to_vec())];
+    assert_eq!(cursor_rows(&txn, &mut cursor), expected, "d's cursor reads d's tree");
+
+    txn.drop_table(a).expect("drop");
+    txn.commit().expect("commit");
+    let state = newest_state(&env);
+    assert_eq!(state, State::from([("d".to_string(), expected.into_iter().collect())]));
+    assert!(env.failure().is_none());
+}
+
+/// Two dup tables of one id (a crafted catalog's, as in
+/// [`two_catalog_records_of_one_id_keep_their_own_working_records`]), written under one outer
+/// key, `a` first: a detached dup cursor of `d` takes the key's nested root from the cell while
+/// `d` has no working record (though `a`'s working map holds the key), then from `d`'s working
+/// map once `d` is written, never from `a`'s.
+#[test]
+fn a_dup_cursor_reads_its_own_working_map_beside_a_table_of_its_id() {
+    let (_dir, path, [a, _], _) = two_tables(true);
+    dup::restamp_record(&path, |record| record.id = a.id());
+    let env = open(&path, SyncMode::Durable);
+    let mut txn = env.begin_rw().expect("rw");
+    let a = txn.open_table("a").expect("open").expect("a");
+    let d = txn.open_table("d").expect("open").expect("d");
+    assert_eq!(a.id(), d.id(), "the crafted catalog gives both tables one id");
+    let two = dup::dup_key(1, b"two");
+    txn.put(&a, &two, b"a").expect("put");
+    let mut cursor = txn.dup_cursor_detached(&d).expect("cursor");
+    let mut rows = |txn: &RwTxn| {
+        let mut rows = Vec::new();
+        let mut row = cursor.first(txn).expect("first").map(|(k, v)| (k.to_vec(), v.to_vec()));
+        while let Some(r) = row {
+            rows.push(r);
+            row = cursor.next(txn).expect("next").map(|(k, v)| (k.to_vec(), v.to_vec()));
+        }
+        rows
+    };
+    let of_d = |key: Vec<u8>| (key, b"d".to_vec());
+    assert_eq!(rows(&txn), [of_d(first_key(true))], "d's committed rows");
+    txn.put(&d, &two, b"d").expect("put");
+    assert_eq!(rows(&txn), [of_d(first_key(true)), of_d(two)], "d's working rows");
+    assert_eq!(txn.dup_rows_for_test(&a).len(), 2, "a's rows");
+    assert!(env.failure().is_none());
+}
+
+/// A meta whose txn id is one short of the last (only a crafted record has it) opens, and its
+/// reads serve; its commit, which would take the last id and leave the writer none to begin, is
+/// `Corrupt` before anything is written, in either sync mode: no panic, no wrap, both meta slots
+/// as they were. It latches, reads go on, and a reopen finds the state as it was.
+#[test]
+fn a_commit_of_the_last_txn_id_is_refused_before_it_writes() {
+    let (_dir, path) = temp("tn_lmdb_last_txn");
+    {
+        let env = open(&path, SyncMode::Durable);
+        let mut txn = env.begin_rw().expect("rw");
+        let a = txn.create_table("a").expect("a");
+        txn.put(&a, b"key", b"a").expect("put");
+        txn.commit().expect("commit");
+    }
+    let file = fs::OpenOptions::new().read(true).write(true).open(&path).expect("open");
+    let slot = |at: u64| {
+        let mut record = [0; META_LEN];
+        file.read_exact_at(&mut record, at * P).expect("read");
+        record
+    };
+    let txn_of = |at: u64| Meta::decode(&slot(at)).expect("meta").txn;
+    let newest = if txn_of(0) > txn_of(1) { 0 } else { 1 };
+    // Re-encoded, so the record passes its CRC.
+    let last = Meta { txn: u64::MAX - 1, ..Meta::decode(&slot(newest)).expect("meta") };
+    file.write_all_at(&last.encode(), newest * P).expect("write");
+    let slots = [slot(0), slot(1)];
+    for sync in [SyncMode::Durable, SyncMode::NoSync] {
+        let env = open(&path, sync);
+        let ro = env.begin_ro().expect("ro");
+        assert_eq!(ro.txn_id(), u64::MAX - 1, "{sync:?}");
+        let a = ro.open_table("a").expect("open").expect("a");
+        let mut txn = env.begin_rw().expect("rw");
+        assert_eq!(txn.txn_id(), u64::MAX, "{sync:?}");
+        txn.put(&a, b"key", b"b").expect("put");
+        txn.put(&a, b"more", b"b").expect("put");
+        let result = txn.commit();
+        assert!(
+            matches!(&result, Err(Error::Corrupt(m)) if m.contains("leaves no txn after this")),
+            "{sync:?}: {result:?}"
+        );
+        assert!(env.failure().is_some(), "{sync:?}: latched");
+        assert_eq!(ro.get(&a, b"key").expect("get"), Some(&b"a"[..]), "{sync:?}: reads go on");
+        drop(ro);
+        drop(env);
+        assert_eq!([slot(0), slot(1)], slots, "{sync:?}: neither meta slot changed");
+    }
+    let env = open(&path, SyncMode::Durable);
+    let ro = env.begin_ro().expect("ro");
+    assert_eq!(ro.txn_id(), u64::MAX - 1);
+    assert_eq!(
+        state_of(&ro, ["a"]),
+        State::from([("a".to_string(), Rows::from([(b"key".to_vec(), b"a".to_vec())]))])
+    );
+}

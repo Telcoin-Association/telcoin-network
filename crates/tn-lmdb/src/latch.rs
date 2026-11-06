@@ -102,8 +102,18 @@ impl Latch {
 }
 
 /// Latches a failure (with the given cause) if dropped while unwinding: a panic in the step it
-/// covers leaves state no later write or commit may build on.
+/// covers leaves state no later write or commit may build on. The step ends with
+/// [`Self::disarm`], so a guard made while an unrelated panic unwinds (a commit or sync run by
+/// a destructor) latches only if its own step panics.
 pub(crate) struct UnwindLatch<'a>(pub(crate) &'a Latch, pub(crate) &'static str);
+
+impl UnwindLatch<'_> {
+    /// The covered step finished (returning `Ok` or `Err`): drop the guard without its check.
+    #[inline]
+    pub(crate) fn disarm(self) {
+        std::mem::forget(self);
+    }
+}
 
 impl Drop for UnwindLatch<'_> {
     fn drop(&mut self) {
@@ -149,5 +159,33 @@ mod tests {
         }));
         assert!(caught.is_err());
         assert_eq!(latch.failure().as_deref(), Some("panic during commit"));
+    }
+
+    /// A guarded step a destructor runs while an unrelated panic unwinds latches only if it
+    /// panics itself: one that finishes disarms its guard.
+    #[test]
+    fn a_step_run_during_an_unrelated_unwind_latches_only_on_its_own_panic() {
+        /// Runs a guarded step when dropped; the step panics (caught here) if `.1`.
+        struct StepOnDrop<'a>(&'a Latch, bool);
+        impl Drop for StepOnDrop<'_> {
+            fn drop(&mut self) {
+                let (latch, panics) = (self.0, self.1);
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let guard = UnwindLatch(latch, "the step panicked");
+                    assert!(!panics, "the step's own panic");
+                    guard.disarm();
+                }));
+            }
+        }
+        let latch = Latch::default();
+        for panics in [false, true] {
+            let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _step = StepOnDrop(&latch, panics);
+                panic!("unrelated");
+            }));
+            assert!(caught.is_err());
+            assert_eq!(latch.is_failed(), panics, "the step panicked: {panics}");
+        }
+        assert_eq!(latch.failure().as_deref(), Some("the step panicked"));
     }
 }

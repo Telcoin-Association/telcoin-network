@@ -377,6 +377,10 @@ outside 7..={max} for this page size": no build writes one, as `create_dup_table
 `packed_max`). A plain record always passes.
 
 Table ids are unique over the file's life, so a dropped and re-created table gets a new id.
+A record whose id is not below its state's next table id (the meta's) is `Corrupt` at first use:
+`open_table`, a handle's resolution and `create_table`. Two records of one id below it are found
+only by `Env::check`; the engine tells table handles apart by id and name, so their tables stay
+apart until then.
 
 ### Nested cells and dup records
 
@@ -600,17 +604,23 @@ while the transaction runs.
 A record that lists a page a tree still holds passes these checks: telling would take a walk of
 every tree. A write that hands the page out overwrites it, and a read through the old pointer
 then fails its checks (a run of more than one page fails its CRC; a tree page or a 1-page run its
-header or txn identity), so the damage is met as `Corrupt`, never as wrong data. A write that
-instead takes the page out of its tree while the page waits in the pool finds it at commit both
-free and freed (`Allocator::reusable`), which is `Corrupt` too. A `clear_table` or `drop_table`
-of the tree that holds the page, after a write in the same transaction handed it out, finds it
-private under a page the transaction did not write (`tree_pages`), `Corrupt`. In a later
-transaction, the page now published, a free of a tree without runs cannot tell (it does not read
-the leaf) and frees the page again; once a write reuses it, a read through either pointer fails
-its txn identity, `Corrupt`. A forged nested root named by two outer cells of a dup table, each
-cell written in its own transaction, is the same case. A page freed twice in one transaction (two
-pointers naming it, such as two cells naming one run) is `Corrupt` at commit
-(`Allocator::reusable`). `Env::check` reports the page as used twice.
+header or txn identity), so a read that starts after the overwrite meets the damage as `Corrupt`,
+never as wrong data. A read already under way does not: a value returned before the write and
+still borrowed changes under its borrow, and a reader on another thread can see the page change
+after its checks passed. Reads stay bounds-checked, so this is wrong values, then `Corrupt`, never
+an access outside the page. Damage at rest cannot get here (the free tree's page CRCs catch it);
+a file crafted with valid CRCs, or a writer bug, can. A write that instead takes the page out of
+its tree while the page waits in the pool finds it at commit both free and freed
+(`Allocator::reusable`), which is `Corrupt` too. A `clear_table` or `drop_table` of the tree that
+holds the page, after a write in the same transaction handed it out, finds it private under a page
+the transaction did not write (`tree_pages`), `Corrupt`. In a later transaction, the page now
+published, a free of a tree without runs cannot tell (it does not read the leaf) and frees the
+page again; once a write reuses it, a read through either pointer fails its txn identity,
+`Corrupt`. A forged nested root named by two outer cells of a dup table, each cell written in its
+own transaction, is the same case. A page freed twice in one transaction (two pointers naming it,
+such as two cells naming one run) is `Corrupt` at commit (`Allocator::reusable`). `Env::check`
+reports the page as used twice, so run it (a read-only open is enough) on a database file
+imported from elsewhere before the first write to it.
 
 **Reuse timing.** A record's txn is the reuse gate its pages wait for: once the gate reaches it,
 no durable meta and no live reader reaches them. A page freed by txn N is listed under N, since
@@ -912,11 +922,17 @@ checks as `Cursor`'s.
    `InvalidPageSize`, and `options.max_growth` at least `MIN_GROWTH` (1 MiB), else
    `InvalidMaxGrowth`, even for an existing file. Nothing is created or opened before.
 2. **Create the file if it is missing or empty.** Both metas (txn 0, page count 2, empty trees)
-   are written with `pwrite` to `<path>.creating`, which is locked and truncated first. Then
+   are written with `pwrite` to `<path>.creating`, which is opened with `O_NOFOLLOW` (a symbolic
+   link there, or anything but a regular file, fails the open with `Io` naming it and is left as
+   it is), then locked and truncated. Then
    `fdatasync_file`, rename over the path, and `fsync_directory`. If another creator holds
    `<path>.creating` locked, the open fails with `Locked` at once, without waiting: that creator
    holds the database. If another handle created the file meanwhile, its file is kept, and the
    unused `<path>.creating` is removed when the name still holds the empty file this open locked.
+   A symbolic link at the path is followed only to a file that holds bytes: a dangling link, or
+   one to an empty file, is refused (`Io` of kind `NotFound`, naming the link) and nothing is
+   created, because the rename would put a new, empty database in place of the link rather than
+   create its target.
 3. **Lock.** `flock(LOCK_EX | LOCK_NB)`, else `Locked`. A second open in the same process fails
    too. The locked file must be the one the path names, and non-empty. A creator may rename its
    new file over the path between this open and its lock, so the open is retried up to three
@@ -929,7 +945,8 @@ checks as `Cursor`'s.
      must be byte-identical.
    - An `UnsupportedVersion` record in either slot refuses the file.
    - No valid meta is `Corrupt` if any slot carries the magic, else `NotTnLmdb`.
-5. **Txn check.** A meta txn of `u64::MAX` (no next txn) is `Corrupt`.
+5. **Txn check.** A meta txn of `u64::MAX` (no next txn) is `Corrupt`. A meta at `u64::MAX - 1`
+   opens, and its commit (which would leave no txn after it) is `Corrupt` before step 1.
 6. **Length check.** A file shorter than `page_count × P` is `Corrupt`. Open never falls back to
    the older meta.
 7. **`fsync_file` once.** A crash may have left a meta in the page cache whose msync never
@@ -1029,7 +1046,7 @@ this order:
 |---|---|
 | any error inside `commit` or `sync` (`fail`; `fail_damaged` for `Corrupt`) | `KeyTooLarge`, `KeyTooShort`, `ValueTooLarge`, `AppendOutOfOrder`, `KeyExists`, `ReadOnly` |
 | an I/O or growth error in a write (`fail`); a failed msync also poisons the file, which is never retried | `TableNotFound`, `StaleTable`, `TableKind`, `InvalidTableName`, `InvalidDupOptions`, `WrongTxn` |
-| a panic part way through a write, commit or sync (`UnwindLatch` guard) | a miss (`Ok(None)`) |
+| a panic part way through a write, commit or sync (`UnwindLatch` guard; one a destructor runs while an unrelated panic unwinds latches only on a panic of its own) | a miss (`Ok(None)`) |
 | `Corrupt` from any read, get or cursor move (`fail_damaged`) | errors from `Env::open` (there is no environment yet) |
 | a failed `Env::check` | |
 
@@ -1060,7 +1077,8 @@ A latched environment skips its close: no final sync (NoSync) and no trim ([Clos
   holds back page reuse, so the file grows instead.
 - Multi-process access alongside a writer is out of scope. The `flock` makes a second process's
   open fail with `Locked`. Read-only opens (`Env::open_read_only`) take the lock shared, so any
-  number of processes may read a file no writer holds.
+  number of processes may read a file no writer holds. The lock is advisory and may hold only on
+  one host: keep the file on a local file system ([Platform notes](#platform-notes)).
 
 ---
 
@@ -1556,7 +1574,7 @@ fails a check, a subkey of another length, any check of a descent) is
 | `Env::begin_ro() / begin_rw() / try_begin_rw()` | start transactions: an `RoTxn` (one committed state of every table, kept intact while it lives), an `RwTxn` (`ReadOnly` in a read-only environment) |
 | `Env::oldest_reader_age() -> Option<Duration>` | how long the oldest live reader has held a superseded snapshot (pages freed after it wait for it to end, so the file grows meanwhile); `None` when every reader holds the current snapshot, and in a read-only environment. Lock-free; refreshed at each commit (see [Readers and snapshots](#readers-and-snapshots)) |
 | `Env::sync()` | make NoSync commits durable (a no-op when nothing is pending, and in a read-only environment) |
-| `Env::check() -> CheckReport` | full structural check plus exact page accounting, each root's entry count and page counters compared with its tree. `CheckReport` gives the state's txn id and page count, the catalog, table, free-tree and free pages, the free records, and a `TableCheck { entries, pages, height }` per table. |
+| `Env::check() -> CheckReport` | full structural check plus exact page accounting, each root's entry count and page counters compared with its tree. `CheckReport` gives the state's txn id and page count, the catalog, table, free-tree and free pages, the free records, and a `TableCheck { entries, pages, height }` per table. A failed accounting names the first 16 runs of leaked pages and counts the rest; the check holds 4 bytes per page of the page count, so a meta counting far more pages than the file holds data for (a crafted file) costs that much address space. |
 | `Env::stat() -> EnvStat` | `page_size`, `txn_id`, `page_count`, `tables` |
 | `Env::free_pages() -> u64` | the pages the newest committed state's free list holds (space the file can reuse before it grows; the reth adapter reports it as reth's `db.freelist` gauge): every free record read with the allocator's checks, so damage is `Corrupt` and latches |
 | `Env::io_stats() -> IoStats` | the writer's I/O and allocation counters (see [I/O counters](#io-counters) below): in memory only, cumulative since this open, all zero in a read-only environment; published at the end of every commit, abort and `Env::sync`, read with one short lock of that copy (never a wait for an open write transaction) |
@@ -1812,9 +1830,9 @@ it lands on, a multi-page overflow value in full).
   macOS uses `F_PREALLOCATE` plus `set_len`, and other unix targets use a plain `set_len`.
   Preallocation makes a full disk an `io::Error` at growth, not a `SIGBUS` on a mapped write.
   That holds only where preallocation works: on other unix targets, and on a file system without
-  it (`fallocate` failing with `EOPNOTSUPP` or `ENOSYS`, as on tmpfs and some network file
-  systems, or `F_PREALLOCATE` with `ENOTSUP`), growth falls back to a sparse `set_len`, and a
-  full disk can then be a `SIGBUS` on a mapped write.
+  it (`fallocate` failing with `EOPNOTSUPP` or `ENOSYS`, as on NFS before version 4.2 and FUSE
+  file systems that do not implement it, or `F_PREALLOCATE` with `ENOTSUP`), growth falls back to
+  a sparse `set_len`, and a full disk can then be a `SIGBUS` on a mapped write.
   Growth is geometric: at least `clamp(len, 1 MiB, max_growth)` more (`EnvOptions::max_growth`,
   default 1 GiB, at least `MIN_GROWTH`, 1 MiB), rounded to the OS page, so a running file holds a
   preallocated tail of up to one step past its pages. A clean close truncates the file to its
@@ -1822,6 +1840,22 @@ it lands on, a multi-page overflow value in full).
   file holds no preallocated tail; a failed or skipped trim (a crash, a latched close) leaves the
   slack. Past the reservation the mapping moves to a new reservation of at least twice the size.
   Retired mappings are kept until close while a reader may hold a view of them.
+- **A mapped access can still be a `SIGBUS`.** Preallocation covers a page's first write only.
+  Every commit rewrites a meta page and reused pages in place, and where a rewrite needs new
+  space a full disk can fail it with a `SIGBUS`: on a copy-on-write file system (btrfs, ZFS),
+  and for a file that shares blocks with a copy or a snapshot (a reflink copy, which `cp` makes
+  by default since coreutils 9 where the file system supports it; an APFS clone; a Time Machine
+  local snapshot). The full-disk guarantee holds on a file system that overwrites in place (ext4,
+  XFS) for a file that shares no blocks. Elsewhere keep free space in hand, and never
+  reflink-copy a live datadir (`cp --reflink=never`): the copy makes the live file's blocks
+  shared. A read error from the drive (`EIO`) under the mapping is a `SIGBUS` too, not an `Io`
+  or `Corrupt` error.
+- **Local file systems only.** The lock is an advisory `flock`: it excludes the processes on one
+  host that take it. On a network file system it can be local to each host (NFS mounted with
+  `local_lock=flock` or `local_lock=all`, FUSE file systems such as sshfs), so two hosts could
+  both open the file for writing and corrupt it. A process that writes the file without the lock
+  (an `rsync` into a live datadir) changes bytes readers hold: like a foreign truncation
+  ([Read-only open](#read-only-open)), it is outside the model.
 - **Linux: every mapping of the file is advised `MADV_RANDOM`** (`file::advise_access`;
   do-not-flag item 16), unless `EnvOptions::readahead` is set: the writer's mapping at open and
   after each remap past the reservation, and a read-only environment's. Elsewhere `readahead`
@@ -1925,7 +1959,8 @@ These limits and non-goals are known:
   further needs a new split proof (one split keeps both halves within `U` only for entries of at
   most `U / 2`) and a format change.
 - **No multi-process access** alongside a live writer: there is no shared reader table. A
-  read-only open takes the lock shared, so it and a writer exclude each other.
+  read-only open takes the lock shared, so it and a writer exclude each other. No multi-host
+  access either: the lock assumes a local file system ([Platform notes](#platform-notes)).
 - Merging is local and merge-only. A delete merges only the pages it changes, siblings never
   borrow entries, and a page stays under a quarter full when no neighbour fits into it. Pages no
   delete changes are not revisited, so there is no fill bound for the whole tree: only the pages
@@ -1954,7 +1989,10 @@ argument and the measurements. Code and other docs cite the items by number, so 
      writer's and the readers', is formed from the base pointer over exactly its own bytes, and no
      reference to the whole mapping exists. Sound under the single-writer model: the base is
      stable inside the reservation, readers see only published, immutable pages, retired mappings
-     outlive every view of them, and a read-only open's shared lock keeps every writer out.
+     outlive every view of them, and a read-only open's shared lock keeps every writer out. It
+     also rests on a truthful free list: a crafted file whose free list names a live page can make
+     a write overwrite bytes a reader still holds
+     ([Free list and page reuse](#free-list-and-page-reuse)).
      Copy-on-write adds no `unsafe` ([Commit protocol](#commit-protocol)).
    - `sys.rs`: the libc calls `fsync`, `fallocate`, `fcntl(F_PREALLOCATE)`, `sysconf` and `flock`,
      each on a live file descriptor (`sysconf` takes none).

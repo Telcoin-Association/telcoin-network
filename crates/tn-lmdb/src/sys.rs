@@ -62,11 +62,13 @@ pub(crate) fn fdatasync_file(file: &File) -> io::Result<()> {
     }
 }
 
-/// Reserve real disk blocks for `[from, to)` of `file` and grow it to `to` bytes, so a later
-/// store through a mapping into that range can never SIGBUS on a full filesystem: running out of
+/// Reserve real disk blocks for `[from, to)` of `file` and grow it to `to` bytes, so the first
+/// store through a mapping into that range cannot SIGBUS on a full filesystem: running out of
 /// space surfaces here as an `io::Error` instead. A bare `set_len`/ftruncate only moves EOF and
 /// leaves the new bytes as sparse holes whose first write fault allocates a block and, when the
-/// disk is full, delivers `SIGBUS` with no Rust error path.
+/// disk is full, delivers `SIGBUS` with no Rust error path. A later rewrite is covered only on a
+/// filesystem that overwrites in place: a copy-on-write one, or a file sharing blocks with a
+/// reflink copy or a snapshot, needs new space at each rewrite (README, Platform notes).
 ///
 /// `from` must be the file's current length (macOS reserves from the physical end of file). Where
 /// the platform or filesystem cannot preallocate, this falls back to a plain (sparse) resize so the
@@ -88,8 +90,9 @@ pub(crate) fn allocate_range(file: &File, from: u64, to: u64) -> io::Result<()> 
     });
     match allocated {
         Ok(()) => Ok(()),
-        // Some filesystems (tmpfs, some network/older FS) don't implement fallocate; fall back to
-        // a plain resize (sparse) rather than failing an otherwise-serviceable growth.
+        // Some filesystems (NFS before 4.2, FUSE filesystems without it) don't implement
+        // fallocate; fall back to a plain resize (sparse) rather than failing an
+        // otherwise-serviceable growth.
         Err(err) if matches!(err.raw_os_error(), Some(libc::EOPNOTSUPP) | Some(libc::ENOSYS)) => {
             file.set_len(to)
         }

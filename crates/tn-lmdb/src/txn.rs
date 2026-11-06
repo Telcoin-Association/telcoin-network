@@ -37,9 +37,10 @@ use crate::{
 };
 
 /// A handle on one table: its name and its id. A committed table's id is never given to another
-/// table over the file's life, so a handle of a table that was dropped (and perhaps re-created
-/// under the same name) is refused with [`Error::StaleTable`] rather than reaching the new table;
-/// a handle used in a transaction whose state predates the table is refused with
+/// table over the file's life (a catalog record whose id is not below its state's next table id
+/// is [`Error::Corrupt`] at its first use), so a handle of a table that was dropped (and perhaps
+/// re-created under the same name) is refused with [`Error::StaleTable`] rather than reaching the
+/// new table; a handle used in a transaction whose state predates the table is refused with
 /// [`Error::TableNotFound`]. The id alone does not name a table: the id of a table created in a
 /// transaction that aborted goes to the next table created, under its own name, and a handle of
 /// another file may carry it too. A handle is the table with its id and its name.
@@ -69,7 +70,9 @@ impl Table {
     /// The table's id. A committed table's id is never given to another table over the file's
     /// life, so among the handles that open cursors in one transaction (each names a table of
     /// its state) the id tells the tables apart; across files, or for a handle of a table whose
-    /// creation aborted, it does not (see [`Table`]).
+    /// creation aborted, it does not (see [`Table`]). Nor does it in a catalog damaged to hold
+    /// two records of one id, which only `Env::check` refuses: the engine tells its handles
+    /// apart by id and name.
     #[inline]
     pub fn id(&self) -> u32 {
         self.id
@@ -179,6 +182,26 @@ fn resolve(found: Option<TableRecord>, table: &Table, next_table_id: u32) -> Res
         Some(record) if record.id == table.id => Ok(record),
         _ if table.id >= next_table_id => Err(Error::TableNotFound(table.name().to_string())),
         _ => Err(Error::StaleTable(table.name().to_string())),
+    }
+}
+
+/// The committed record of table `name` in `catalog`, the catalog of a committed state whose next
+/// table id is `next_table_id` ([`catalog::get`]). Each table took the next id when it was
+/// created, so a record whose id is not below it is damage, [`Error::Corrupt`]: refused at its
+/// first use, before a handle carries the id that the next table created would take too.
+fn committed_record<S: PageRead + ?Sized>(
+    store: &S,
+    catalog: &TreeRoot,
+    name: &str,
+    next_table_id: u32,
+) -> Result<Option<TableRecord>> {
+    match catalog::get(store, catalog, name)? {
+        Some(record) if record.id >= next_table_id => Err(Error::Corrupt(format!(
+            "catalog record of table {name:?}: id {} not below the state's next table id \
+             {next_table_id}",
+            record.id
+        ))),
+        found => Ok(found),
     }
 }
 
@@ -1452,7 +1475,8 @@ impl RoTxn {
         #[cfg(all(test, debug_assertions))]
         CATALOG_RESOLVES.with(|n| n.set(n.get() + 1));
         let meta = &self.snapshot.meta;
-        let found = catalog::get(&*self.snapshot, &meta.catalog, table.name())?;
+        let found =
+            committed_record(&*self.snapshot, &meta.catalog, table.name(), meta.next_table_id)?;
         let record = resolve(found, table, meta.next_table_id)?;
         let resolved = (record.root, record.dup);
         if let Some(from) = free {
@@ -2165,7 +2189,8 @@ impl ReadTxn for RoTxn {
     fn open_table(&self, name: &str) -> Result<Option<Table>> {
         catalog::check_name(name)?;
         self.read(|s| {
-            Ok(catalog::get(s, &s.meta.catalog, name)?.map(|record| Table::new(record.id, name)))
+            let found = committed_record(s, &s.meta.catalog, name, s.meta.next_table_id)?;
+            Ok(found.map(|record| Table::new(record.id, name)))
         })
     }
 
@@ -2314,11 +2339,13 @@ impl Work {
         (writer, &mut self.catalog, &mut self.catalog_trusted)
     }
 
-    /// Table `name`'s working record, if it exists.
+    /// Table `name`'s working record, if it exists. A table created in this transaction has a
+    /// working record until it is dropped, so a record found in the catalog is a committed one,
+    /// held to the base state's next table id ([`committed_record`]).
     fn lookup(&self, name: &str) -> Result<Option<TableRecord>> {
         match self.tables.iter().find(|w| *w.table.name == *name) {
             Some(w) => Ok(Some(w.record)),
-            None => catalog::get(self.writer(), &self.catalog, name),
+            None => committed_record(self.writer(), &self.catalog, name, self.base.next_table_id),
         }
     }
 
@@ -2493,8 +2520,15 @@ impl Work {
 
     /// Commit steps 1–7 (see the env module docs): the changed tables' roots into the catalog,
     /// the free list's save, the new meta, the pages' CRCs, the durable steps (or their deferral),
-    /// and publication.
+    /// and publication. The writer then begins the next txn, so a txn of `u64::MAX` (its base
+    /// meta's id is one only a crafted meta has) is [`Error::Corrupt`] before anything is written.
     fn commit(&mut self, inner: &EnvInner) -> Result<u64> {
+        let Some(next_txn) = self.txn.checked_add(1) else {
+            return Err(Error::Corrupt(format!(
+                "the meta's txn id {} leaves no txn after this commit's",
+                self.base.txn
+            )));
+        };
         for i in 0..self.tables.len() {
             if !self.tables[i].nested.is_empty() {
                 self.flush_nested(i)?;
@@ -2539,7 +2573,7 @@ impl Work {
             SyncMode::NoSync => writer.defer_sync(&pages),
         }
         writer.publish(inner, meta);
-        writer.alloc.begin_txn(txn + 1);
+        writer.alloc.begin_txn(next_txn);
         Ok(txn)
     }
 }
@@ -2576,8 +2610,10 @@ impl RwTxn {
     fn write<T>(&mut self, op: impl FnOnce(&mut Work) -> Result<T>) -> Result<T> {
         let latch = &self.inner.latch;
         latch.check()?;
-        let _guard = UnwindLatch(latch, "a write panicked part way");
-        op(&mut self.work).inspect_err(|e| latch.latch_error(e))
+        let guard = UnwindLatch(latch, "a write panicked part way");
+        let result = op(&mut self.work).inspect_err(|e| latch.latch_error(e));
+        guard.disarm();
+        result
     }
 
     /// Run a read of the working state, latching damage it finds.
@@ -2638,7 +2674,7 @@ impl RwTxn {
                     table.name()
                 )));
             }
-            work.tables.retain(|w| w.table.id != record.id);
+            work.tables.retain(|w| !w.table.is(&table));
             work.schema += 1;
             work.changed = true;
             Ok(())
@@ -2951,7 +2987,7 @@ impl RwTxn {
         if !self.work.changed {
             return Ok(self.work.base.txn);
         }
-        let _guard = UnwindLatch(&inner.latch, "a commit panicked part way");
+        let guard = UnwindLatch(&inner.latch, "a commit panicked part way");
         let txn = self.work.commit(inner).inspect_err(|e| match e {
             Error::Corrupt(cause) => inner.latch.fail_damaged(format!("commit: {cause}")),
             e => inner.latch.fail(format!("commit: {e}")),
@@ -2961,6 +2997,7 @@ impl RwTxn {
         if let Some(writer) = self.work.writer.take() {
             inner.return_writer(writer);
         }
+        guard.disarm();
         Ok(txn)
     }
 
@@ -3406,10 +3443,13 @@ impl Tracker {
         }
     }
 
-    /// [`Self::table_writes`] by a search of the working records.
+    /// [`Self::table_writes`] by a search of the working records, by the whole handle: two tables
+    /// of one id (a damaged catalog's) never share a slot. A slot's record stays at its index
+    /// until a drop, which moves [`Work::schema`] and so forgets the slot, so the id compare of
+    /// the checks that follow is then exact.
     #[inline(never)]
     fn find_slot(&mut self, work: &Work) -> u64 {
-        self.slot = work.tables.iter().position(|w| w.table.id == self.table.id);
+        self.slot = work.tables.iter().position(|w| w.table.is(&self.table));
         self.scanned = work.tables.len();
         self.slot.map_or(0, |i| work.tables[i].writes)
     }
@@ -4010,7 +4050,7 @@ impl<'a> WorkRoots<'a> {
                     .work
                     .tables
                     .iter()
-                    .all(|w| w.table.id != track.table.id || w.nested.is_empty()),
+                    .all(|w| !w.table.is(&track.table) || w.nested.is_empty()),
             "dup table {}: a cursor's root source skipped the working map",
             track.table.name()
         );

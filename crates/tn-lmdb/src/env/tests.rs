@@ -170,6 +170,88 @@ fn create_removes_its_unused_temporary_file() {
     assert!(fs::read(&path).expect("read") == before);
 }
 
+/// `<path>.creating` is never opened through a symbolic link, nor used unless it is a regular
+/// file: a link planted there (to a victim file, or dangling) or a FIFO fails the open, naming
+/// it, and the victim, the link and the path are as they were. A regular one is then used.
+#[test]
+fn a_temporary_file_that_is_not_a_regular_file_is_refused() {
+    use std::os::unix::fs::FileTypeExt as _;
+    let (dir, path) = temp();
+    let creating = path.with_file_name("db.creating");
+    let victim = dir.path().join("victim");
+    fs::write(&victim, b"the victim's bytes").expect("victim");
+    let refused = |what: &str| {
+        let e = Env::open(&path, EnvOptions::default()).expect_err("the open must fail");
+        let Error::Io(io) = &e else { panic!("{what}: {e}") };
+        let message = io.to_string();
+        assert!(message.contains(&creating.display().to_string()), "{what}: {e}");
+        assert!(message.contains(what), "{what}: {e}");
+        assert!(fs::symlink_metadata(&path).is_err(), "{what}: the path is not created");
+    };
+    std::os::unix::fs::symlink(&victim, &creating).expect("link");
+    refused("a symbolic link");
+    assert_eq!(fs::read(&victim).expect("read"), b"the victim's bytes");
+    assert_eq!(fs::read_link(&creating).expect("still a link"), victim);
+    let gone = dir.path().join("gone");
+    fs::remove_file(&creating).expect("remove");
+    std::os::unix::fs::symlink(&gone, &creating).expect("link");
+    refused("a symbolic link");
+    assert!(fs::symlink_metadata(&gone).is_err(), "nothing is created through the link");
+
+    fs::remove_file(&creating).expect("remove");
+    let made = std::process::Command::new("mkfifo").arg(&creating).status().expect("mkfifo");
+    assert!(made.success());
+    refused("not a regular file");
+    assert!(fs::symlink_metadata(&creating).expect("stat").file_type().is_fifo());
+    fs::remove_file(&creating).expect("remove");
+    drop(open(&path));
+    assert!(!creating.exists());
+}
+
+/// A symbolic link at the path is followed only to a file holding bytes: a dangling link (its
+/// target's disk not mounted, say) or one to an empty file is refused, `Io(NotFound)` naming the
+/// link, and nothing changes at either end; a read-only open refuses both too. A link to a
+/// database opens and writes it.
+#[test]
+fn a_symlinked_path_opens_only_the_database_it_names() {
+    let (dir, path) = temp();
+    let creating = path.with_file_name("db.creating");
+    let target = dir.path().join("unmounted").join("db");
+    std::os::unix::fs::symlink(&target, &path).expect("link");
+    let refused = |what: &str| {
+        let e = Env::open(&path, EnvOptions::default()).expect_err("the open must fail");
+        let Error::Io(io) = &e else { panic!("{what}: {e}") };
+        assert_eq!(io.kind(), io::ErrorKind::NotFound, "{what}: {e}");
+        assert!(io.to_string().contains(&path.display().to_string()), "{what}: {e}");
+        assert_eq!(fs::read_link(&path).expect("still a link"), target, "{what}");
+        assert!(!creating.exists(), "{what}: nothing is built aside");
+    };
+    refused("a dangling link");
+    assert!(!target.exists());
+    // A link made after open's check is refused by the creator's, which removes its unused file.
+    assert!(matches!(create(&path, 4096), Err(Error::Io(_))));
+    assert!(!creating.exists() && !target.exists());
+    let e = Env::open_read_only(&path, EnvOptions::default()).expect_err("read-only");
+    assert!(matches!(&e, Error::Io(io) if io.kind() == io::ErrorKind::NotFound), "{e}");
+
+    fs::create_dir(target.parent().expect("parent")).expect("mount");
+    fs::write(&target, b"").expect("empty target");
+    refused("a link to an empty file");
+    assert_eq!(fs::read(&target).expect("read"), b"", "the target is untouched");
+    let e = Env::open_read_only(&path, EnvOptions::default()).expect_err("read-only");
+    assert!(matches!(e, Error::NotTnLmdb), "{e}");
+
+    fs::remove_file(&target).expect("remove");
+    put_all(&open(&target), "t", &[(b"k", b"v")]);
+    let env = open(&path);
+    assert_eq!(put_all(&env, "t", &[(b"k2", b"v2")]), 2);
+    drop(env);
+    assert_eq!(fs::read_link(&path).expect("still a link"), target);
+    let ro = Env::open_read_only(&target, EnvOptions::default()).expect("the target");
+    let txn = ro.begin_ro().expect("ro");
+    assert_eq!(val(&txn, &table(&txn, "t"), b"k2").as_deref(), Some(&b"v2"[..]));
+}
+
 /// The file is locked while any handle or transaction of an environment lives, against
 /// another open in this process too.
 #[test]
@@ -534,6 +616,54 @@ fn a_latched_env_neither_writes_nor_syncs_on_drop() {
     drop(env);
     let env = open(&path);
     assert_eq!(env.stat().txn_id, 0, "the unsynced commit was not synced by the drop");
+}
+
+/// A sync a destructor runs while an unrelated panic unwinds makes the state durable and leaves
+/// the environment unlatched: only a panic of the sync itself latches.
+#[test]
+fn a_sync_a_destructor_runs_during_an_unrelated_unwind_does_not_latch() {
+    struct SyncOnDrop(Env);
+    impl Drop for SyncOnDrop {
+        fn drop(&mut self) {
+            self.0.sync().expect("sync");
+        }
+    }
+    let (_dir, path) = temp();
+    let env = Env::open(&path, options(4096, SyncMode::NoSync)).expect("open");
+    put_all(&env, "a", &[(b"k", b"1")]);
+    let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _sync = SyncOnDrop(env.clone());
+        panic!("unrelated");
+    }));
+    assert!(caught.is_err());
+    assert_eq!(env.failure(), None);
+    assert_eq!(put_all(&env, "a", &[(b"k", b"2")]), 2);
+    env.crash();
+    let env = open(&path);
+    assert_eq!(env.stat().txn_id, 1, "the sync made txn 1 durable");
+}
+
+/// A write and a commit that a destructor runs during an unrelated panic's unwind succeed and do
+/// not latch: their guards latch only on a panic of their own.
+#[test]
+fn a_write_and_commit_a_destructor_runs_during_an_unrelated_unwind_do_not_latch() {
+    struct PutOnDrop(Env);
+    impl Drop for PutOnDrop {
+        fn drop(&mut self) {
+            put_all(&self.0, "a", &[(b"k", b"2")]);
+        }
+    }
+    let (_dir, path) = temp();
+    let env = Env::open(&path, options(4096, SyncMode::Durable)).expect("open");
+    put_all(&env, "a", &[(b"k", b"1")]);
+    let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _put = PutOnDrop(env.clone());
+        panic!("unrelated");
+    }));
+    assert!(caught.is_err());
+    assert_eq!(env.failure(), None);
+    let ro = env.begin_ro().expect("ro");
+    assert_eq!((ro.txn_id(), val(&ro, &table(&ro, "a"), b"k")), (2, Some(b"2".to_vec())));
 }
 
 /// `NoSync` commits are visible in-process at once; a crash rolls back to the last sync; a

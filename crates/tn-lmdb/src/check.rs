@@ -73,7 +73,11 @@ enum Leaves {
 /// The page walk's state: who uses each page, and every page claimed twice.
 struct Checker<'s> {
     snapshot: &'s Snapshot,
-    /// The owner of each page number below the page count.
+    /// The owner of each page number below the page count: 4 bytes per page the meta counts,
+    /// allocated zeroed, so only the pages the walk claims are written. A meta counting far more
+    /// pages than the file holds data for (a sparse file meets open's length check for free) is
+    /// a crafted file: its table costs address space and one scan, not memory (up to 16 GiB of
+    /// address space at most: a process that cannot have it aborts, as on any allocation).
     owner: Vec<Owner>,
     /// The owners' names: `[none, catalog, free tree, free list, tables...]`.
     owners: Vec<String>,
@@ -84,6 +88,9 @@ struct Checker<'s> {
 const CATALOG: Owner = 1;
 const FREE_TREE: Owner = 2;
 const FREE_LIST: Owner = 3;
+
+/// The most runs of leaked pages a failed check's message names; it counts the rest.
+const LISTED: usize = 16;
 
 impl Checker<'_> {
     /// Claim page `p` for `owner`: false (and noted) if something claimed it already.
@@ -398,9 +405,8 @@ pub(crate) fn check_snapshot(snapshot: &Snapshot) -> Result<CheckReport> {
     report.free_pages = free_pages;
     report.free_records = free_records;
 
-    let leaked: Vec<u32> =
-        (2..meta.page_count).filter(|&p| checker.owner[p as usize] == 0).collect();
-    if leaked.is_empty() && checker.twice.is_empty() {
+    let leaked = leaked_runs(&checker.owner);
+    if leaked.is_none() && checker.twice.is_empty() {
         return Ok(report);
     }
     let twice: Vec<String> = checker
@@ -413,7 +419,7 @@ pub(crate) fn check_snapshot(snapshot: &Snapshot) -> Result<CheckReport> {
     Err(Error::Corrupt(format!(
         "check: page accounting of txn {}: leaked {}; used twice [{}]",
         meta.txn,
-        page_runs(&leaked),
+        leaked.as_deref().unwrap_or("[]"),
         twice.join(", ")
     )))
 }
@@ -423,21 +429,60 @@ fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// `pages` (ascending) as compact runs: `[2, 5..8]`.
-fn page_runs(pages: &[u32]) -> String {
-    let mut runs: Vec<String> = Vec::new();
-    let mut i = 0;
-    while i < pages.len() {
-        let mut j = i;
-        while j + 1 < pages.len() && pages[j + 1] == pages[j] + 1 {
-            j += 1;
+/// The runs of pages of `2..owner.len()` nothing claimed, found in one pass, as compact runs:
+/// `[2, 5..8]`; `None` if there are none. Only the first [`LISTED`] runs are kept, the rest
+/// counted: `[2, 5..8, ...; 7 more runs, 4294967268 pages in all]`. So a meta whose page count
+/// runs far past the pages any tree or record names (a crafted file) costs no memory past the
+/// owner table.
+fn leaked_runs(owner: &[Owner]) -> Option<String> {
+    let (mut listed, mut runs, mut pages, mut start) = (Vec::new(), 0_u64, 0_u64, 2);
+    for chunk in owner.get(2..).unwrap_or_default().chunk_by(|a, b| (*a == 0) == (*b == 0)) {
+        let end = start + chunk.len();
+        if chunk[0] == 0 {
+            runs += 1;
+            pages += chunk.len() as u64;
+            if listed.len() < LISTED {
+                listed.push(if chunk.len() == 1 {
+                    start.to_string()
+                } else {
+                    format!("{start}..{end}")
+                });
+            }
         }
-        runs.push(if i == j {
-            pages[i].to_string()
-        } else {
-            format!("{}..{}", pages[i], pages[j] + 1)
-        });
-        i = j + 1;
+        start = end;
     }
-    format!("[{}]", runs.join(", "))
+    if runs == 0 {
+        return None;
+    }
+    let more = runs - listed.len() as u64;
+    if more > 0 {
+        listed.push(format!("...; {more} more runs, {pages} pages in all"));
+    }
+    Some(format!("[{}]", listed.join(", ")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Leaked pages are named as runs, up to [`LISTED`] of them, and the rest counted: the
+    /// message stays short however many runs the meta's page count leaves unclaimed.
+    #[test]
+    fn leaked_runs_name_the_first_runs_and_count_the_rest() {
+        assert_eq!(leaked_runs(&[0, 0]), None);
+        assert_eq!(leaked_runs(&[0, 0, 1, 2]), None);
+        assert_eq!(leaked_runs(&[0, 0, 0, 1, 0, 0, 0, 1, 0]).as_deref(), Some("[2, 4..7, 8]"));
+        // From page 2 on, every other page leaked: a run per page, far more than are named.
+        let runs = 100_000;
+        let owner: Vec<Owner> = (0..2 + 2 * runs).map(|p| (p % 2) as Owner).collect();
+        let named: Vec<String> = (0..LISTED).map(|i| (2 + 2 * i).to_string()).collect();
+        assert_eq!(
+            leaked_runs(&owner).expect("leaked"),
+            format!(
+                "[{}, ...; {} more runs, {runs} pages in all]",
+                named.join(", "),
+                runs - LISTED
+            )
+        );
+    }
 }
