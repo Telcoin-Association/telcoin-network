@@ -791,21 +791,32 @@ pub fn leader_seeded_ordering_fork_epoch_override() -> Option<Epoch> {
 ///   the same PR: headers already committed at or past the fork epoch in the eight-field layout do
 ///   not decode under the armed build.
 ///
-/// PLACEHOLDER: `u32::MAX` practically never fires. Set a concrete future epoch in a dedicated
-/// epoch-setting PR only after every validator and observer runs a gate-capable build. The full
-/// fork schedule is logged at startup so operators can diff it across the fleet; a compile-time
-/// constant that differs between binaries has no other in-protocol detection.
+/// Armed for adiri (chain 2017) at epoch 735: every header and committed sub-DAG whose own epoch
+/// is 735 or later carries millisecond timestamps. Measured boundary: Mon 2026-11-09 14:33:01 UTC
+/// (08:33 CST). Derived from the registry's `getEpochInfo` first-block heights for epochs 721-724
+/// and the timestamps of the epoch-closing blocks just before them (02:33:01, 08:33:01, 14:33:01
+/// and 20:33:01 UTC on 2026-11-06, exactly 21,600 s apart), snapshotted at epoch 724 / block
+/// 525185 on 2026-11-06 21:37 UTC via rpc.adiri.tel; the same six-hour grid reproduces the
+/// epoch-574 boundary (2026-09-30 08:33 UTC) 150 epochs earlier. 735 is 11 epochs past the
+/// snapshot, so the eight-epoch margin above holds for a merge before epoch 727 begins (Sat
+/// 2026-11-07 14:33 UTC).
 ///
-/// Rollout sequence (standard hard-fork rule): deploy the gate-capable build fleet-wide first
+/// Re-verify at merge and at tag time. If epoch 735 has begun, raise the constant in the same PR
+/// (the second arming constraint above). The full fork schedule is logged at startup so operators
+/// can diff it across the fleet; a compile-time constant that differs between binaries has no
+/// other in-protocol detection.
+///
+/// Rollout sequence (standard hard-fork rule): the gate-capable build goes out fleet-wide first
 /// (safe indefinitely while dormant, since it keeps the seconds-only layout and rules for every
-/// epoch below the constant), then land the epoch-setting PR fleet-wide before the fork epoch
-/// begins. A straggler still on an old build past the boundary has no ninth header field to read
-/// and keeps applying the seconds-only rules, so the fleet must be fully upgraded before the
-/// epoch is armed.
+/// epoch below the constant), and every validator, observer and RPC node must run a build that
+/// carries this constant before the closing block of epoch 734, the boundary that opens 735. A
+/// straggler past that boundary, whether on a build without the gate or on a gate-capable build
+/// without this constant, has no ninth header field to read and keeps applying the seconds-only
+/// rules, so it cannot decode the fleet's post-fork headers.
 ///
 /// Non-adiri builds (mainnet) have no dormant period: millisecond timestamps are active from
 /// genesis and this constant does not exist there.
-pub const SUBSECOND_TIMESTAMP_FORK_EPOCH: Epoch = u32::MAX;
+pub const SUBSECOND_TIMESTAMP_FORK_EPOCH: Epoch = 735;
 
 /// Compile-time enforcement of the first arming constraint documented on
 /// [`SUBSECOND_TIMESTAMP_FORK_EPOCH`]: a rollout PR that sets this fork below the seed fork

@@ -120,8 +120,8 @@ fn expected_millis(epoch: Epoch, created_at: TimestampMs) -> u16 {
     }
 }
 
-/// An epoch at which the sub-second fork is active on this build: the adiri placeholder fork
-/// epoch, or genesis elsewhere.
+/// An epoch at which the sub-second fork is active on this build: the adiri fork epoch, or
+/// genesis elsewhere.
 fn active_epoch() -> Epoch {
     #[cfg(feature = "adiri")]
     {
