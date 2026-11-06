@@ -5,7 +5,7 @@
 use crate::{
     codec::{PeerExchangeCodec, TNCodec, TNMessage},
     diagnostics::{bounded_error, bounded_reply_error as error, bounded_warn},
-    error::NetworkError,
+    error::{normalize_outbound_failure, NetworkError},
     gossip_config::{gossipsub_config, GossipBehaviour, RejectGossipKey},
     kad::{identical_refresh, node_record_key, KadStore},
     metrics::{
@@ -29,6 +29,7 @@ use crate::{
 use futures::StreamExt as _;
 use libp2p::{
     connection_limits::{self, ConnectionLimits},
+    core::upgrade::Version,
     gossipsub::{
         self, Event as GossipEvent, IdentTopic, Message as GossipMessage, MessageAcceptance,
         PublishError, Topic, TopicHash,
@@ -906,9 +907,21 @@ where
             .with_behaviour(|_| behavior)
             .map_err(|_| NetworkError::BuildSwarm)?
             .with_swarm_config(|c| {
+                // request-response proposes one protocol per substream, so `V1Lazy` sends the
+                // proposal and the request in one flight. strict `V1` waits a round trip for the
+                // listener's confirmation first, which made every vote request cost two round
+                // trips on a 10-region bench while gossiped certificates arrived in half of one.
+                // a lazy rejection surfaces on the first read as an io error: see
+                // `normalize_outbound_failure`. the sync stream and the vendored gossipsub finish
+                // negotiation with a zero-length read in their outbound upgrades, so a peer
+                // without the protocol still fails the open. gossipsub's first proposal (`1.1.0`)
+                // stays strict and only its `1.0.0` fallback is lazy. kad may report
+                // `ProtocolConfirmed` for a peer before the listener confirms, which is harmless
+                // while kad bucket inserts are manual.
                 c.with_idle_connection_timeout(
                     network_config.libp2p_config().max_idle_connection_timeout,
                 )
+                .with_substream_upgrade_protocol_override(Version::V1Lazy)
             })
             .with_connection_timeout(connection_timeout)
             .build();
@@ -1964,18 +1977,22 @@ where
                         // (see `RejectReason::penalty`): an oversized payload is charged to the
                         // relaying peer, an unauthorized author to the author, each only once its
                         // identity has resolved and, for the author, only while this node runs the
-                        // live epoch. The relaying peer is never penalized for an author fault
-                        // (#801/#785).
+                        // live epoch and the author's own connection delivered the frame. The
+                        // relaying peer is never penalized for an author fault (#801/#785), and
+                        // the author is never penalized for a frame some other peer delivered
+                        // (GHSA-vw36-8f6c-vppp).
                         let relayer =
                             self.swarm.behaviour().peer_manager.peer_to_bls(&propagation_source);
                         let author_id = message.source;
                         let author = author_id
                             .as_ref()
                             .and_then(|id| self.swarm.behaviour().peer_manager.peer_to_bls(id));
+                        let delivery = GossipDelivery::of(author_id.as_ref(), &propagation_source);
                         let topic = &message.topic;
                         match reason.penalty(
                             relayer.is_some(),
                             author.is_some(),
+                            delivery,
                             self.epoch_position,
                         ) {
                             RejectPenalty::FatalRelayer => {
@@ -1996,7 +2013,7 @@ where
                                         target: "network",
                                         ?author_id,
                                         ?topic,
-                                        "unauthorized-author gossip - applying fatal penalty to the author, not the forwarding relayer: {propagation_source:?}"
+                                        "unauthorized-author gossip - applying fatal penalty to the author, which delivered the frame itself: {propagation_source:?}"
                                     );
                                     self.swarm
                                         .behaviour_mut()
@@ -2010,7 +2027,8 @@ where
                                     ?reason,
                                     ?topic,
                                     ?propagation_source,
-                                    "rejecting gossip without an attributable penalty (unresolved relayer/author, this node's committee-view lag, or a historical epoch replay)"
+                                    ?delivery,
+                                    "rejecting gossip without an attributable penalty (unresolved relayer/author, a frame delivered by a peer other than its author, this node's committee-view lag, or a historical epoch replay)"
                                 );
                             }
                         }
@@ -2131,6 +2149,7 @@ where
             }
             ReqResEvent::OutboundFailure { peer, request_id, error, connection_id: _ } => {
                 debug!(target: "network", ?peer, ?error, "Outbound failure for req/res");
+                let error = normalize_outbound_failure(error);
                 // handle px disconnects
                 //
                 // px attempts to support peer discovery, but failures are okay
@@ -2337,6 +2356,7 @@ where
                 }
             },
             ReqResEvent::OutboundFailure { peer, request_id, error, .. } => {
+                let error = normalize_outbound_failure(error);
                 let kind = match &error {
                     ReqResOutboundFailure::DialFailure => "outbound_dial_failure",
                     ReqResOutboundFailure::Timeout => "outbound_timeout",
@@ -2496,6 +2516,7 @@ where
             },
             ReqResEvent::OutboundFailure { peer, request_id, error, connection_id: _ } => {
                 debug!(target: "network", ?peer, ?error, "Outbound failure for peer exchange");
+                let error = normalize_outbound_failure(error);
                 if let Some(pending) = self.pending_goodbyes.remove(&request_id) {
                     match &error {
                         // Not penalized: honest version skew, the same class the main
@@ -3506,12 +3527,39 @@ enum RejectReason {
     /// so the relaying peer is accountable.
     TooLarge,
     /// The message author is absent, has no resolved BLS identity, or is not an authorized
-    /// publisher for the topic. The fault is the author's, not the forwarder's: an honest relayer
-    /// merely forwarded content the author is responsible for, so the relaying peer is never
-    /// penalized (the reject-path analogue of #801/#785). The resolved author is charged instead;
-    /// an honest author authorized under a neighbouring committee view is spared by the committee
-    /// exemption in the peer manager.
+    /// publisher for the topic. The relaying peer is never penalized: an honest relayer merely
+    /// forwarded content the author is responsible for (the reject-path analogue of #801/#785).
+    /// The resolved author is charged only when its own connection delivered the frame
+    /// ([`GossipDelivery::ByAuthor`]): a signed frame is static and gossipsub remembers its id for
+    /// the duplicate-cache window only, so any peer that once held the frame can deliver it again,
+    /// and charging the author for that delivery would let any connected peer ban a validator that
+    /// has since left the committee window (GHSA-vw36-8f6c-vppp). An honest author authorized
+    /// under a neighbouring committee view is spared by the committee exemption in the peer
+    /// manager.
     UnauthorizedAuthor,
+}
+
+/// Who delivered a rejected gossip message to this node, relative to the message author.
+///
+/// Gossipsub authenticates `propagation_source` through the connection the frame arrived on, while
+/// `GossipMessage::source` names the signer of a static frame. Only the delivery is an act of the
+/// peer it names: the signer is accountable for the frame's content, not for every later delivery
+/// of that frame by someone else.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GossipDelivery {
+    /// The author's own connection delivered the frame, so the delivery is the author's act.
+    ByAuthor,
+    /// A peer other than the author delivered the frame, or the message carries no author.
+    Relayed,
+}
+
+impl GossipDelivery {
+    /// Classify a delivery from the message author and the peer the frame arrived from.
+    fn of(author: Option<&PeerId>, propagation_source: &PeerId) -> Self {
+        author
+            .filter(|author| *author == propagation_source)
+            .map_or(GossipDelivery::Relayed, |_| GossipDelivery::ByAuthor)
+    }
 }
 
 /// The peer-scoring outcome for a rejected gossip message. Rejecting never propagates the message;
@@ -3520,7 +3568,8 @@ enum RejectReason {
 enum RejectPenalty {
     /// Fatally penalize the relaying peer (`propagation_source`).
     FatalRelayer,
-    /// Fatally penalize the message author (`GossipMessage::source`).
+    /// Fatally penalize the message author (`GossipMessage::source`), which is also the peer that
+    /// delivered the frame.
     FatalAuthor,
     /// Do not penalize any peer.
     Skip,
@@ -3528,19 +3577,29 @@ enum RejectPenalty {
 
 impl RejectReason {
     /// Decide the peer-scoring outcome for this reject, given whether the relaying peer's and the
-    /// message author's BLS identities have resolved.
+    /// message author's BLS identities have resolved, who delivered the frame, and where this
+    /// node's epoch stands.
     ///
     /// An oversized payload is charged to the relaying peer: the size bound is a compile-time
     /// protocol constant ([`MAX_GOSSIP_MESSAGE_SIZE`]), identical on every honest node and enforced
     /// on both the publish and receive paths, so an honest peer never originates one and (under
     /// gossipsub `Strict` validation) never forwards one, making a delivered oversized payload
-    /// relayer misbehavior. An unauthorized
-    /// author is charged to the *author*, never the forwarder — an honest relayer merely forwarded
-    /// content the author is responsible for (the reject-path analogue of #801/#785), and an honest
+    /// relayer misbehavior. An unauthorized author is charged to the *author*, never the forwarder:
+    /// an honest relayer merely forwarded content the author is responsible for (the reject-path
+    /// analogue of #801/#785), and an honest
     /// author authorized under a neighbouring committee view is spared downstream by the committee
     /// exemption in the peer manager. Either penalty is skipped until the accountable peer's
     /// identity resolves: unattributable otherwise (the same join-window race the Accept path
     /// documents), which for the author also covers the anonymous-message and view-lag cases.
+    ///
+    /// The author penalty also needs `delivery` to be [`GossipDelivery::ByAuthor`]. A signed frame
+    /// is static, and gossipsub forgets its id once the duplicate-cache window passes, so any peer
+    /// that received the frame while the author held a committee slot can deliver it again after
+    /// the author leaves the previous/current/next window. The propagation source is the only peer
+    /// whose act this node observes: the author is charged when that peer is the author, and no one
+    /// is charged when it is not, because a relayer that holds a neighbouring committee view, or
+    /// that forwards a frame it accepted at an older epoch, is not misbehaving either
+    /// (GHSA-vw36-8f6c-vppp).
     ///
     /// The author penalty also needs `position` to be [`EpochPosition::Live`]. A replaying node
     /// holds the publisher allowlists of the historical epoch it replays, while the live committee
@@ -3553,13 +3612,16 @@ impl RejectReason {
         self,
         relayer_resolved: bool,
         author_resolved: bool,
+        delivery: GossipDelivery,
         position: EpochPosition,
     ) -> RejectPenalty {
         match self {
             RejectReason::TooLarge if relayer_resolved => RejectPenalty::FatalRelayer,
             RejectReason::TooLarge => RejectPenalty::Skip,
             RejectReason::UnauthorizedAuthor
-                if author_resolved && position == EpochPosition::Live =>
+                if author_resolved
+                    && delivery == GossipDelivery::ByAuthor
+                    && position == EpochPosition::Live =>
             {
                 RejectPenalty::FatalAuthor
             }
