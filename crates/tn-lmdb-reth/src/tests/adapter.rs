@@ -1410,6 +1410,24 @@ fn a_cursor_may_outlive_its_tx() {
     assert!(pool.upgrade().is_none(), "the last cursor freed the pool");
 }
 
+/// The pool keys a cursor by its table's id and name: a cursor given back for one table is never
+/// taken for another of the same id, as two tables of a damaged catalog can share one.
+#[test]
+fn the_cursor_pool_keys_by_id_and_name() {
+    let dir = tempfile::tempdir().unwrap();
+    let env =
+        tn_lmdb::Env::open(dir.path().join("pool.dat"), tn_lmdb::EnvOptions::default()).unwrap();
+    let mut txn = env.begin_rw().unwrap();
+    let table = txn.create_table("A").unwrap();
+    txn.commit().unwrap();
+    let ro = Arc::new(env.begin_ro().unwrap());
+    let pool = ReadPool::default();
+    pool.give_back(table.id(), "A", Box::new(ReadCursor::open(&ro, &table, None).unwrap()));
+    assert!(pool.take(table.id(), "B").is_none(), "another table's cursor of the same id");
+    assert!(pool.take(table.id(), "A").is_some());
+    assert!(pool.take(table.id(), "A").is_none());
+}
+
 /// The pool keeps at most [`ReadPool::PER_TABLE`] engine cursors a table: six cursors of one
 /// table dropped together leave four, six of another four more, and a cursor taken from the
 /// pool leaves it.

@@ -207,13 +207,14 @@ impl ReadCursor {
 ///
 /// It is shared by the transaction and its cursors, which may outlive it: a cursor dropped after
 /// its transaction gives its engine cursor to a pool nobody takes from, freed with the pool's
-/// last share. A cursor is keyed by its table's id ([`EngineTable::id`]): every handle that
-/// opens a cursor in one transaction names a committed table of its snapshot, and a committed
-/// table's id is never another table's, so within a transaction the id is the table. The lock is
+/// last share. A cursor is keyed by its table's id ([`EngineTable::id`]) and reth's name for the
+/// table: every handle that opens a cursor in one transaction names a committed table of its
+/// snapshot, and the engine tells two tables apart by id and name, so a damaged catalog that gives
+/// two tables one id still never hands one table's cursor to the other. The lock is
 /// held for a scan of the pool and a push or a removal; a cursor the pool refuses drops after the
 /// lock is released.
 #[derive(Default)]
-pub(crate) struct ReadPool(Mutex<Vec<(u32, Box<ReadCursor>)>>);
+pub(crate) struct ReadPool(Mutex<Vec<(u32, &'static str, Box<ReadCursor>)>>);
 
 impl std::fmt::Debug for ReadPool {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -226,25 +227,27 @@ impl ReadPool {
     /// one table of a read-only transaction, about.
     pub(crate) const PER_TABLE: usize = 4;
 
-    /// A cursor of table `id` the pool holds, reset, or `None`.
+    /// A cursor of the table of `id` and reth's `name` the pool holds, reset, or `None`.
     #[inline]
-    pub(crate) fn take(&self, id: u32) -> Option<Box<ReadCursor>> {
+    pub(crate) fn take(&self, id: u32, name: &'static str) -> Option<Box<ReadCursor>> {
         let mut cursor = {
             let mut pool = self.0.lock();
-            let at = pool.iter().rposition(|(table, _)| *table == id)?;
-            pool.swap_remove(at).1
+            let at = pool.iter().rposition(|(table, n, _)| *table == id && *n == name)?;
+            pool.swap_remove(at).2
         };
         cursor.reset();
         Some(cursor)
     }
 
-    /// Keep `cursor`, of table `id`, unless the pool holds [`Self::PER_TABLE`] of that table.
+    /// Keep `cursor`, of the table of `id` and `name`, unless the pool holds [`Self::PER_TABLE`] of
+    /// that table.
     #[inline]
-    fn give_back(&self, id: u32, cursor: Box<ReadCursor>) {
+    pub(crate) fn give_back(&self, id: u32, name: &'static str, cursor: Box<ReadCursor>) {
         let refused = {
             let mut pool = self.0.lock();
-            if pool.iter().filter(|(table, _)| *table == id).count() < Self::PER_TABLE {
-                pool.push((id, cursor));
+            let held = pool.iter().filter(|(table, n, _)| *table == id && *n == name).count();
+            if held < Self::PER_TABLE {
+                pool.push((id, name, cursor));
                 None
             } else {
                 Some(cursor)
@@ -1317,7 +1320,7 @@ pub struct TnLmdbCursor<T: Table> {
     rows: Rows,
     /// The transaction's pool, which takes the engine cursor back on drop.
     pool: Arc<ReadPool>,
-    /// The engine table's id, the cursor's key in `pool`.
+    /// The engine table's id, with `T::NAME` the cursor's key in `pool`.
     table: u32,
     _table: PhantomData<T>,
 }
@@ -1346,7 +1349,7 @@ impl<T: Table> TnLmdbCursor<T> {
 impl<T: Table> Drop for TnLmdbCursor<T> {
     fn drop(&mut self) {
         if let Some(cursor) = self.cursor.take() {
-            self.pool.give_back(self.table, cursor);
+            self.pool.give_back(self.table, T::NAME, cursor);
         }
     }
 }

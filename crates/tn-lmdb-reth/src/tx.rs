@@ -214,7 +214,7 @@ impl DbTx for TnLmdbTx {
         let entry = resolve::<T>(&self.tables, &*self.txn)?;
         let (table, dup) = entry.check::<T>()?;
         let id = table.id();
-        let cursor = match self.pool.take(id) {
+        let cursor = match self.pool.take(id, T::NAME) {
             Some(cursor) => cursor,
             None => Box::new(
                 ReadCursor::open(&self.txn, table, dup)
