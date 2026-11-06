@@ -19,7 +19,7 @@ use reth_provider::{DBProvider as _, HashedPostStateProvider as _, StateRootProv
 use reth_trie::{HashedPostState, HashedStorage, StateRoot, TrieInput, TrieInputSorted};
 use reth_trie_db::DatabaseStateRoot as _;
 use secp256k1::rand::{rngs::StdRng, RngCore as _, SeedableRng as _};
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 use tn_reth::{payload::TNPayload, ExecutedBlock, NewCanonicalChain, OutputTrieOverlay};
 use tn_types::{Account, Address, Bytes, B256, MIN_PROTOCOL_BASE_FEE, U256};
 
@@ -227,5 +227,91 @@ fn test_unpersisted_chain_roots_match_memory_overlay_oracle() -> eyre::Result<()
         env.canonical_header.hash(),
         "canonical tip is the last built block",
     );
+    Ok(())
+}
+
+/// The untimed wrapper is transparent and the build is deterministic. Two blocks of one output
+/// are built from the same payloads through `build_block_from_batch_payload` (now a wrapper over
+/// the timed build) and `build_block_from_batch_payload_timed`, each path with its own output
+/// overlay, and must agree on the block hash, state root, gas, receipts and bundle state. Each
+/// block carries a replayed transaction (skipped as invalid) and bytes that do not decode
+/// (dropped at recovery), so both drop paths run, and block 2's root runs over a non-empty
+/// overlay.
+///
+/// Both paths share one implementation, so this cannot catch a difference from the pre-split
+/// build. That equivalence rests on the transaction moving into the builder as the same
+/// `Recovered<T>` value it used to clone, and on
+/// `test_unpersisted_chain_roots_match_memory_overlay_oracle`, whose independent reth oracle
+/// checks the roots built through the timed root provider.
+#[test]
+fn test_timed_build_matches_untimed_build() -> eyre::Result<()> {
+    let mut env = PipelineTestEnv::new();
+    let cims = env.reth_env.canonical_in_memory_state();
+    let recipient = Address::random();
+    let beneficiary = Address::random();
+    let mut untimed_overlay = OutputTrieOverlay::new();
+    let mut timed_overlay = OutputTrieOverlay::new();
+
+    for i in 1..=2u64 {
+        let parent = env.canonical_header.clone();
+        let output = consensus_output_for_test(i as u32, 0, i, env.block_timestamp);
+        let mut txs: Vec<Vec<u8>> = (0..3u64)
+            .map(|amount| {
+                env.user_factory.create_eip1559_encoded(
+                    env.chain.clone(),
+                    Some(1_000_000),
+                    MIN_PROTOCOL_BASE_FEE.into(),
+                    Some(recipient),
+                    U256::from(amount + 1),
+                    Bytes::new(),
+                )
+            })
+            .collect();
+        txs.push(txs[0].clone());
+        txs.push(vec![0xde, 0xad, 0xbe, 0xef]);
+
+        // `new_for_test` randomizes the beneficiary, batch digest and mix hash: pin them so both
+        // paths build from the same payload
+        let payload = || {
+            TNPayload::new_for_test_with(
+                parent.clone(),
+                &output,
+                beneficiary,
+                B256::with_last_byte(i as u8),
+                B256::with_last_byte(0x80 | i as u8),
+            )
+        };
+        let untimed =
+            env.reth_env.build_block_from_batch_payload(payload(), &txs, &mut untimed_overlay)?;
+        let (timed, timings) = env.reth_env.build_block_from_batch_payload_timed(
+            payload(),
+            &txs,
+            &mut timed_overlay,
+        )?;
+
+        let header = untimed.recovered_block.clone_sealed_header();
+        let timed_header = timed.recovered_block.clone_sealed_header();
+        assert_eq!(header.hash(), timed_header.hash(), "block hash diverged at block {i}");
+        assert_eq!(header.state_root, timed_header.state_root, "state root diverged at block {i}");
+        assert_eq!(header.gas_used, timed_header.gas_used, "gas used diverged at block {i}");
+        assert_eq!(
+            untimed.execution_output.result.receipts, timed.execution_output.result.receipts,
+            "receipts diverged at block {i}",
+        );
+        assert_eq!(
+            untimed.execution_output.state, timed.execution_output.state,
+            "bundle state diverged at block {i}",
+        );
+        assert_eq!(timed.recovered_block.transaction_count(), 3, "both drop paths ran");
+        // the root lap is read off the root provider wrapper: zero would mean it was never timed
+        assert!(timings.root > Duration::ZERO, "root lap not measured at block {i}");
+        assert!(timings.evm > Duration::ZERO, "evm lap not measured at block {i}");
+
+        // chain the (identical) block in memory only, as the engine does within an output
+        cims.update_chain(NewCanonicalChain::Commit { new: vec![untimed] });
+        cims.set_canonical_head(header.clone());
+        env.canonical_header = header;
+        env.block_timestamp += 1;
+    }
     Ok(())
 }
