@@ -262,6 +262,11 @@ fn penalty_from_header_error(error: &HeaderError) -> Option<Penalty> {
         // restarted validator. The error carries rounds but no epoch, so a different header for
         // the same round cannot be told apart from a stale request of an earlier epoch.
         HeaderError::AlreadyVotedForLaterRound { .. } => None,
+        // ignore (this voter's own catch-up, not the requester's fault)
+        //
+        // the refusal describes the voter's state, never the header, so the requester is left
+        // free to retry and earns the vote once this node has caught up
+        HeaderError::NotActiveCvv => None,
         // ignore (this voter's restored datadir, not the requester's fault)
         //
         // a snapshot-restored voter cannot check a block below its floor; the requester's header
@@ -423,6 +428,28 @@ mod tests {
         assert!(!relayer_fault.is_author_content_fault());
         assert!(author_penalty(&relayer_fault).is_none());
         assert!(matches!(Option::<Penalty>::from(&relayer_fault), Some(Penalty::Medium)));
+    }
+
+    /// A voter that refuses because of its own catch-up state says nothing about the header: the
+    /// refusal carries no penalty and answers the requester with a retryable response, so the
+    /// requester asks again instead of giving up on this voter for the header.
+    #[test]
+    fn local_catch_up_refusals_are_recoverable_and_not_penalized() {
+        use crate::network::PrimaryResponse;
+
+        let assert_recoverable_without_penalty = |error: HeaderError| {
+            assert_eq!(penalty_from_header_error(&error), None, "{error} must carry no penalty");
+            let error = PrimaryNetworkError::InvalidHeader(error);
+            assert!(Option::<Penalty>::from(&error).is_none(), "{error} must carry no penalty");
+            assert!(
+                matches!(
+                    PrimaryResponse::into_error_ref(&error),
+                    PrimaryResponse::RecoverableError(_)
+                ),
+                "{error} must answer the requester with a retryable response"
+            );
+        };
+        assert_recoverable_without_penalty(HeaderError::NotActiveCvv);
     }
 
     /// A snapshot-restored voter can never check a header's block below its floor: the refusal

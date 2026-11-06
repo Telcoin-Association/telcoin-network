@@ -96,6 +96,14 @@ pub struct PrimaryMetrics {
     /// `MAX_COMMIT_RUN_AHEAD_ROUNDS` ahead of the leader round this node has executed, counted
     /// once per hold.
     pub(crate) commit_run_ahead_blocked_total: Counter,
+    // bench5 f3-rejoin
+    /// Vote requests refused because this node is not an active committee validator (inactive
+    /// catch-up or observer).
+    ///
+    /// Such a node answers at once with a recoverable refusal instead of holding the request until
+    /// the vote timeout, so this moves only while the node is not an active CVV, plus the rare
+    /// request whose node was demoted before it signed.
+    pub(crate) votes_refused_inactive_total: Counter,
     /// Rounds the committed round leads the last leader round the engine processed (mirrored
     /// from the committed-round and recent-blocks watch channels; zero while execution is at or
     /// ahead of it).
@@ -518,6 +526,7 @@ mod tests {
             metrics.commit_latency_seconds.record(1.0);
             metrics.record_consensus_output_bytes(123);
             metrics.commit_run_ahead_blocked_total.increment(1);
+            metrics.votes_refused_inactive_total.increment(1);
             metrics.execution_check_retries_total.increment(4);
         });
 
@@ -550,6 +559,8 @@ mod tests {
         let (_, _, _, value) = find("tn_primary.max_consensus_output_bytes");
         assert!(matches!(value, DebugValue::Gauge(g) if g.0 == 123.0));
         let (_, _, _, value) = find("tn_primary.commit_run_ahead_blocked_total");
+        assert!(matches!(value, DebugValue::Counter(1)));
+        let (_, _, _, value) = find("tn_primary.votes_refused_inactive_total");
         assert!(matches!(value, DebugValue::Counter(1)));
         let (_, _, _, value) = find("tn_primary.execution_check_retries_total");
         assert!(matches!(value, DebugValue::Counter(4)));

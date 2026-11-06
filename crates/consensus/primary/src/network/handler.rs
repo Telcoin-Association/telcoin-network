@@ -778,6 +778,15 @@ where
                 return Ok(PrimaryResponse::Vote(vote));
             }
         }
+        // a node that is not an active cvv (an inactive node catching up, or an observer) has no
+        // live dag to check the header's parents against and must not sign a new vote. refuse
+        // here, after the recast above (a vote already signed for this header is still returned)
+        // and before the per-author lock and the execution wait, so the requester learns at once
+        // instead of waiting out the vote timeout. `vote_inner` checks again before it signs
+        if !self.consensus_bus.is_active_cvv() {
+            self.consensus_bus.metrics().votes_refused_inactive_total.increment(1);
+            return Err(HeaderError::NotActiveCvv.into());
+        }
         // We have already verified committee membership with the peer check but this will double
         // check. Each committee member has it's own lock so different authorities can be
         // voted on in parallel but only one vote for an authority can proceed at a time.
@@ -1344,7 +1353,12 @@ where
             }
         }
 
-        // this node hasn't voted yet
+        // this node hasn't voted yet. read the mode again: a node demoted while this request
+        // waited on execution, parents or batches must not sign a new vote
+        if !self.consensus_bus.is_active_cvv() {
+            self.consensus_bus.metrics().votes_refused_inactive_total.increment(1);
+            return Err(HeaderError::NotActiveCvv.into());
+        }
         let vote = Vote::new(
             &header,
             self.consensus_config.authority_id().ok_or(HeaderError::NotCommitteeMember)?,

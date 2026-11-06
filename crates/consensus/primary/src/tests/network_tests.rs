@@ -4062,6 +4062,199 @@ async fn execution_lag_beyond_window_is_not_behind() {
     assert!(!handler.behind_consensus(0, 403, None).await, "execution lag alone is not behind");
 }
 
+// ---- bench5 f3-rejoin (vote path) ----
+
+/// A `CvvInactive` voter refuses a vote request at once with `NotActiveCvv`.
+///
+/// The header's execution block is never executed here, so a voter that reached
+/// `wait_for_execution` would hold the request until the vote timeout. The paused clock does not
+/// move, no time is recorded for the `exec_wait` stage, and the refusal counter moves by one. The
+/// refusal carries no penalty and answers the requester with a retryable response: the requester's
+/// `request_vote` asks again and leaves the vote retryable, and all its attempts together take less
+/// than one vote timeout.
+///
+/// A header an active voter signs (its block executed, genesis parents) from a second author is
+/// refused too and leaves no vote stored; once the node is active again the same header is signed.
+#[tokio::test(start_paused = true)]
+async fn test_vote_refused_while_inactive() -> eyre::Result<()> {
+    let temp_dir = TempDir::new().unwrap();
+    let recorder = DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    let TestTypes { committee, handler, parent, consensus_bus, task_manager: _task_manager } = {
+        // the bus and the handler register their metrics with the recorder active while built
+        let _local_recorder = metrics::set_default_local_recorder(&recorder);
+        create_test_types(temp_dir.path()).await
+    };
+    consensus_bus.node_mode().send_replace(NodeMode::CvvInactive);
+
+    let header = committee
+        .header_builder_last_authority()
+        .latest_execution_block(BlockNumHash::new(1, BlockHash::random()))
+        .created_at(1)
+        .build();
+    let peer = *committee.last_authority().authority().protocol_key();
+
+    let start = tokio::time::Instant::now();
+    let err = handler
+        .vote(peer, header.clone(), vec![])
+        .await
+        .expect_err("an inactive voter must refuse a new vote request");
+    assert_eq!(start.elapsed(), Duration::ZERO, "the refusal must not wait on execution");
+    assert_matches!(err, PrimaryNetworkError::InvalidHeader(HeaderError::NotActiveCvv));
+    assert!(Option::<Penalty>::from(&err).is_none(), "the refusal must not penalize the author");
+    assert_matches!(
+        PrimaryResponse::into_error_ref(&err),
+        PrimaryResponse::RecoverableError(_),
+        "the refusal must answer the requester with a retryable response"
+    );
+
+    let snapshot = snapshotter.snapshot().into_vec();
+    let refused = snapshot.iter().find_map(|(key, _, _, value)| {
+        (key.key().name() == "tn_primary.votes_refused_inactive_total").then_some(value)
+    });
+    assert_matches!(refused, Some(DebugValue::Counter(1)), "the refusal must be counted");
+    let exec_wait = snapshot.iter().find_map(|(key, _, _, value)| {
+        (key.key().name() == "tn_primary.vote_stage_seconds"
+            && key.key().labels().any(|l| l.key() == "stage" && l.value() == "exec_wait"))
+        .then_some(value)
+    });
+    assert!(
+        !matches!(exec_wait, Some(DebugValue::Histogram(samples)) if !samples.is_empty()),
+        "the refusal must not reach the execution wait"
+    );
+
+    let voter = *committee.first_authority().authority().protocol_key();
+    let start = tokio::time::Instant::now();
+    let (result, responses) = request_vote_in_process(&handler, voter, peer, header).await;
+    assert_matches!(result, Err(NetworkError::RPCRetryable(_)), "the vote must stay retryable");
+    assert!(
+        responses.len() > 1
+            && responses.iter().all(|r| matches!(r, PrimaryResponse::RecoverableError(_))),
+        "the requester must retry, and every refusal must be recoverable: {responses:?}"
+    );
+    assert!(
+        start.elapsed() < Parameters::default().vote_timeout,
+        "the requester's attempts must not wait on the inactive voter, took {:?}",
+        start.elapsed()
+    );
+
+    let second = committee.authority_fixture_by_idx(1).expect("a second authority");
+    let second_peer = *second.authority().protocol_key();
+    let signable = second
+        .header_builder(&committee.committee())
+        .latest_execution_block(BlockNumHash::new(parent.number(), parent.hash()))
+        .created_at(1)
+        .build();
+    let node_storage = committee.first_authority().consensus_config().node_storage().clone();
+    assert_matches!(
+        handler.vote(second_peer, signable.clone(), vec![]).await,
+        Err(PrimaryNetworkError::InvalidHeader(HeaderError::NotActiveCvv)),
+        "an inactive voter must not sign a header an active voter signs"
+    );
+    assert!(node_storage.read_vote_info(&second.id())?.is_none(), "no vote may be stored");
+    consensus_bus.node_mode().send_replace(NodeMode::CvvActive);
+    assert_matches!(
+        handler.vote(second_peer, signable, vec![]).await?,
+        PrimaryResponse::Vote(_),
+        "the same header must be signed once the node is active"
+    );
+    assert!(node_storage.read_vote_info(&second.id())?.is_some(), "the vote must be stored");
+
+    Ok(())
+}
+
+/// A voter demoted while a vote request waits on execution refuses at the signature instead of
+/// signing, and stores no vote.
+///
+/// Block 1 executes half a second into the request in the same step that turns the node inactive,
+/// so the request passes every check and reaches the signature as an inactive node.
+#[tokio::test(start_paused = true)]
+async fn test_vote_refused_when_demoted_mid_request() -> eyre::Result<()> {
+    let temp_dir = TempDir::new().unwrap();
+    let TestTypes { committee, handler, parent, consensus_bus, task_manager: _task_manager } =
+        create_test_types(temp_dir.path()).await;
+    let author = committee.last_authority();
+    let peer = *author.authority().protocol_key();
+    let block = SealedHeader::seal_slow(ExecHeader {
+        number: 1,
+        parent_hash: parent.hash(),
+        ..Default::default()
+    });
+    let header = committee
+        .header_builder_last_authority()
+        .latest_execution_block(BlockNumHash::new(1, block.hash()))
+        .created_at(1)
+        .build();
+    let demote = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        consensus_bus.node_mode().send_replace(NodeMode::CvvInactive);
+        consensus_bus.recent_blocks().send_modify(|blocks| {
+            blocks.push_latest(
+                1,
+                ConsensusNumHash::new(1, ConsensusHeaderDigest::default()),
+                Some(block),
+            )
+        });
+    });
+
+    assert_matches!(
+        handler.vote(peer, header, vec![]).await,
+        Err(PrimaryNetworkError::InvalidHeader(HeaderError::NotActiveCvv)),
+        "a node demoted before it signs must refuse"
+    );
+    demote.await?;
+    let vote_info = committee
+        .first_authority()
+        .consensus_config()
+        .node_storage()
+        .read_vote_info(&author.id())?;
+    assert!(vote_info.is_none(), "a node demoted before it signs must store no vote");
+
+    Ok(())
+}
+
+/// A vote this node signed while active is still recast after it turns inactive, and a new header
+/// from the same author is refused.
+///
+/// The inactive refusal sits after the recast fast path, so an author whose header this node
+/// already voted for gets the same vote back instead of a refusal.
+#[tokio::test]
+async fn test_vote_recast_while_inactive() -> eyre::Result<()> {
+    let temp_dir = TempDir::new().unwrap();
+    let TestTypes { committee, handler, parent, consensus_bus, task_manager: _task_manager } =
+        create_test_types(temp_dir.path()).await;
+    let peer = *committee.last_authority().authority().protocol_key();
+    let builder = || {
+        committee
+            .header_builder_last_authority()
+            .latest_execution_block(BlockNumHash::new(parent.number(), parent.hash()))
+            .created_at(1)
+    };
+    let header = builder().build();
+
+    let PrimaryResponse::Vote(vote) = handler.vote(peer, header.clone(), vec![]).await? else {
+        panic!("an active voter must vote for a valid header");
+    };
+
+    consensus_bus.node_mode().send_replace(NodeMode::CvvInactive);
+    let PrimaryResponse::Vote(recast) = handler.vote(peer, header.clone(), vec![]).await? else {
+        panic!("an inactive voter must recast the vote it already signed for this header");
+    };
+    assert_eq!(recast.header_digest(), vote.header_digest());
+    assert_eq!(recast.author(), vote.author());
+    assert_eq!(recast.signature(), vote.signature());
+
+    let next = builder().round(2).build();
+    assert_ne!(next.digest(), header.digest());
+    assert_matches!(
+        handler.vote(peer, next, vec![]).await,
+        Err(PrimaryNetworkError::InvalidHeader(HeaderError::NotActiveCvv)),
+        "an inactive voter must refuse a header it has not voted for"
+    );
+
+    Ok(())
+}
+
 /// Records every `primary` warn line as `message key=value ...` on the thread it is installed on
 /// with [`tracing::subscriber::set_default`].
 struct PrimaryWarnLines(Arc<Mutex<Vec<String>>>);
