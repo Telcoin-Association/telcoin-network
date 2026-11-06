@@ -349,7 +349,8 @@ def report(bench_dir, args):
                 verdict = "improved"
             else:
                 verdict = "ok"
-        gated = exact or sync != "durable" or gate_durable
+        # A row the bench marks `gate: false` (a commit row at the quick tier) is reported only.
+        gated = exact or (bool(source.get("gate", True)) and (sync != "durable" or gate_durable))
         if not gated:
             if verdict == "REGRESSION":
                 ungated_over.append(label)
@@ -383,7 +384,8 @@ def report(bench_dir, args):
         ("thresholds", f"time rows: head/base median > {1 + threshold:g} and min > "
                        f"{1 + threshold / 2:g}; exact rows: head > base x {1 + size_threshold:g}; "
                        + ("durable rows gated" if gate_durable
-                          else "durable time rows reported, not gated")),
+                          else "durable time rows reported, not gated")
+                       + "; rows the bench marks `gate: false` reported, not gated"),
     ]
     if meta.get("busy"):
         header.append(("WARNING", f"other builds were running when the runs started: {meta['busy']}"))
@@ -403,7 +405,8 @@ def report(bench_dir, args):
                         ("ok", "improved", "REGRESSION", "not gated", "new", "removed") if k in counts)
     out.append(f"rows: {len(table)} ({summary})")
     if ungated_over:
-        out.append(f"past the time threshold but not gated (durable): {', '.join(ungated_over)}")
+        out.append("past the time threshold but not gated (durable, or `gate: false`): "
+                   f"{', '.join(ungated_over)}")
     if gated_regressions:
         out.append(f"result: REGRESSION in {len(gated_regressions)} gated row"
                    f"{'s' if len(gated_regressions) != 1 else ''}: {', '.join(gated_regressions)}")

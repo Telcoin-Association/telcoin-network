@@ -451,7 +451,7 @@ Until tn-lmdb is on `main`, a pull request into `main` gets exit 2 from the base
 The report is written to the job summary and uploaded, with the run settings (`meta.tsv`), each run's JSON and the build and run logs, as the artifact `tn-lmdb-bench-<run id>-<attempt>`, kept 15 days.
 Download it and run `etc/tn-lmdb-bench-compare.sh --report-only <dir> [--threshold PCT]` to compare the same runs again under other thresholds.
 
-Hosted runners share their hardware, so the time rows are noisier there than on a quiet machine, and the quick tier with the default thresholds (10% on time rows, 1% on the exact size rows; durable rows reported, not gated) catches large regressions only.
+Hosted runners share their hardware, so the time rows are noisier there than on a quiet machine, and the quick tier with the default thresholds (10% on time rows, 1% on the exact size rows; durable rows, and the quick tier's two single-commit rows, reported, not gated) catches large regressions only.
 For anything finer, run the script locally, with more rounds, on an idle machine.
 
 The job uses the same toolchain install step as the other workflows, and the builds use the head commit's `rust-toolchain.toml`.

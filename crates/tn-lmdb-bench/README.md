@@ -10,6 +10,13 @@ Every row is a fixed, seeded workload with a stable name. It runs `reps` times, 
 environment in a fresh temp directory (under `$TMPDIR`), and records one sample per rep. Data is
 generated before timing; a timer wraps the measured loop only. Lower is better for every row.
 
+A time row's sample is the fastest of its passes in the rep. A pass is the row's measured loop: run
+again over the same state for a read row, on a fresh environment (its state set up untimed) for a
+row that writes. A row runs passes until they add up to 30 ms of measured time and number 3 (or add
+up to 100 ms), at most 16: a scan of 100k entries takes about 3 ms, a commit well under one, and
+a sample that short lands whole in one scheduler hiccup or load spike. A pass of 100 ms or more
+runs once.
+
 - **Time rows** (`ns_per_op`): nanoseconds per operation (the "op" column below). Noisy.
 - **Exact rows** (`bytes`, `pages_per_op`, `exact: true`): deterministic sizes, the same on every
   run of a revision: any change is real. The smoke test checks that two runs agree.
@@ -33,9 +40,9 @@ of writing pages again after a sync), which is why it is the one to gate on.
 | row | op | sync | what it models |
 |---|---|---|---|
 | `put.seq` | put | n | `n` 8-byte big-endian sequential keys, 100-byte values, one transaction: the put loop |
-| `put.seq.commit` | commit | * | that transaction's commit |
+| `put.seq.commit` | commit | * | that transaction's commit (not gated at the quick tier, see below) |
 | `put.rand` | put | n | `n` random 32-byte keys, one transaction: the put loop |
-| `put.rand.commit` | commit | * | its commit |
+| `put.rand.commit` | commit | * | its commit (not gated at the quick tier) |
 | `put.rand.file_bytes` | bytes | n | the file's used span (pages times page size) after it |
 | `put.append` | append | n | `put.seq` through `RwTxn::append` |
 | `put.cursor` | put | n | `put.seq` through `RwCursor::put` |
@@ -44,7 +51,7 @@ of writing pages again after a sync), which is why it is the one to gate on.
 | `scan.fwd`, `scan.rev` | entry | n | full cursor scans of the random table |
 | `seek.range` | seek | n | a seek to a random absent key, then 9 `next` (100k seeks) |
 | `seek.range.sorted` | seek | n | the same targets sorted ascending, as a walker seeks |
-| `commit.small` | transaction | * | transactions of 3 puts committed one by one (2000) |
+| `commit.small` | transaction | * | transactions of 3 puts committed one by one into a fresh environment (2000) |
 | `mixed` | operation | * | 50/50 deletes and re-inserts over a full random table, 1000 a transaction (100k) |
 | `delete.rand90` | delete | n | 90% of a random table deleted in random order, one transaction |
 | `churn` | round | * | 10 rounds of fill and 90% delete over `n / 4` random keys |
@@ -68,8 +75,8 @@ of writing pages again after a sync), which is why it is the one to gate on.
 
 | tier | `n` | reps | sync | wall time (M1 Max) |
 |---|---|---|---|---|
-| `quick` | 100k | 3 | nosync | about 7 s (durable rows: 6 s more) |
-| `default` | 1M | 3 | nosync | about 1.5 min |
+| `quick` | 100k | 3 | nosync | about 15 s (durable rows: 6 s more); a comparison of 4 rounds, 2 min |
+| `default` | 1M | 3 | nosync | about 2 min |
 | `full` | 1M | 7 | nosync, durable | several minutes; durable time depends on the drive |
 
 `--n` and `--reps` override a tier's.
@@ -101,11 +108,16 @@ cargo build --release -p tn-lmdb-bench
   "page_size": 4096, "os": "macos", "arch": "aarch64",
   "rows": [ { "name": "put.seq", "group": "generic", "sync": "nosync", "metric": "ns_per_op",
               "unit": "ns", "samples": [51.9, 51.7, 49.9], "median": 51.7, "min": 49.9,
-              "max": 51.9, "exact": false } ] }
+              "max": 51.9, "exact": false, "gate": true } ] }
 ```
 
 `metric` is `ns_per_op` (unit `ns`), `bytes` (`B`) or `pages_per_op` (`pages`); the last two are
-exact. A row is keyed by `name` and `sync`. `median` of an even count is the mean of the middle two.
+exact. A row is keyed by `name` and `sync`. `median` of an even count is the mean of the middle
+two. `gate` is false for a row the comparison reports but does not gate at the run's tier: the two
+single-commit rows (`put.seq.commit`, `put.rand.commit`) at the quick tier, where a commit of 100k
+entries takes a fraction of a millisecond, mostly writing fresh file pages, and its cost moves by
+10% and more from one run to the next with the machine's memory state, however many passes it
+takes. From the default tier on (1M entries, a commit of milliseconds) they are gated.
 
 ## Comparing two revisions
 
@@ -123,18 +135,23 @@ Both sides run head's bench source, each built as a standalone package against i
 between the two binaries. The bench uses only public API that exists from a451515f4, the first
 commit with tn-lmdb, on. An unchanged tn-lmdb, or a change that does not reach the binary, exits 0
 with "nothing to compare" (`--allow-same` runs it anyway: an A/A run that shows the noise). The
-runs alternate, base head then head base (`--rounds`, default 2), and each row's samples are pooled
-per side. A time row regresses when head's median over base's is above 1 + `--threshold` (default
-10%) and head's min over base's is above 1 + half of it. An exact row regresses when it grows past
-`--size-threshold` (default 1%). Durable time rows are reported, and gated only with
-`--gate-durable`. Exit codes: 0 no gated regression, 1 a gated regression, 2 a usage, build or
+runs alternate, base head then head base (`--rounds`, default 4 at the quick tier and 2
+otherwise), and each row's samples are pooled per side. A time row regresses when head's median
+over base's is above 1 + `--threshold` (default 10%) and head's min over base's is above 1 + half
+of it. An exact row regresses when it grows past `--size-threshold` (default 1%). Durable time rows
+are reported, and gated only with `--gate-durable`; a row whose JSON says `gate: false` is
+reported only. Exit codes: 0 no gated regression, 1 a gated regression, 2 a usage, build or
 environment error. A base without tn-lmdb (`main` until tn-lmdb merges) is refused. The report is
 `<bench dir>/report.md` (default bench dir `$TMPDIR/tn-lmdb-bench-compare`). The script's header
 comment is the full reference. CI runs it on pull requests labeled `bench`, and by hand
 (`.github/ACTIONS.md`, "tn-lmdb regression bench").
 
-On a busy machine the quick tier's time rows move by more than 10% from run to run. A row flagged
-once and gone on a rerun with more rounds (`--rounds 4 --rows <row>`) is noise. Trust a
+Within one run a quick-tier time row holds to a few percent. On a busy machine whole runs still
+move: when other work starts, every sample of the next run can sit 10 to 20% above the run before.
+The pooled comparison absorbs that when each side has runs on both sides of the change (neither
+side's min then comes from the slow stretch alone), which is why the quick tier runs four rounds:
+two (A B B A) put both of head's runs in the middle, where one load change can cover them. A row
+flagged once and gone on a rerun with more rounds (`--rounds 6 --rows <row>`) is noise. Trust a
 regression that holds over repeated runs.
 
 Durable rows time real syncs, and consumer NVMe drives commit at two speeds that flip mid-run, so a

@@ -17,7 +17,7 @@ use tn_lmdb::{DupOptions, EnvOptions, RwTxn, SyncMode, Table};
 
 use crate::{
     data::{random_bytes, shuffled, Rng},
-    open, per_op, settle, used_bytes, Out,
+    fastest, fresh_passes, per_op, settle, used_bytes, Out,
 };
 
 /// The outer key width of the state rows' table (PlainStorageState: an address).
@@ -111,65 +111,75 @@ impl StateData {
 /// `STATE_BATCH`, commits included, each settled untimed; per row), `reth.state.file_bytes`,
 /// `reth.state.get` (a `DupRoCursor::seek_dup` of a random row through a reset cursor, as reth's
 /// `seek_by_key_subkey` through a pooled cursor; per get) and `reth.state.walk` (every key's rows
-/// by `seek_key` then `next_in_prefix`, as reth's `walk_dup`; per row).
+/// by `seek_key` then `next_in_prefix`, as reth's `walk_dup`; per row), each read row the fastest
+/// of its passes.
 pub(crate) fn state(dir: &Path, options: EnvOptions, data: &StateData, out: &mut Out<'_>) {
-    let env = open(dir, "state", options);
-    let mut txn = env.begin_rw().expect("begin");
     let key_len = u16::try_from(STATE_KEY).expect("a narrow key");
-    let table = txn
-        .create_dup_table("PlainStorageState", DupOptions::packed(key_len))
-        .expect("create the dup table");
-    txn.commit().expect("commit");
-    settle(&env);
     let rows = data.rows();
-    let mut time = Duration::ZERO;
-    for first in (0..rows).step_by(STATE_BATCH) {
-        let start = Instant::now();
+    let wanted = [out.wants("reth.state.load")];
+    let ([time], env, table) = fresh_passes(dir, "state", options, wanted, |env| {
         let mut txn = env.begin_rw().expect("begin");
-        for i in first..(first + STATE_BATCH).min(rows) {
-            txn.put(&table, data.row(i), data.value(i)).expect("put");
-        }
+        let table = txn
+            .create_dup_table("PlainStorageState", DupOptions::packed(key_len))
+            .expect("create the dup table");
         txn.commit().expect("commit");
-        time += start.elapsed();
-        settle(&env);
-    }
+        settle(env);
+        let mut time = Duration::ZERO;
+        for first in (0..rows).step_by(STATE_BATCH) {
+            let start = Instant::now();
+            let mut txn = env.begin_rw().expect("begin");
+            for i in first..(first + STATE_BATCH).min(rows) {
+                txn.put(&table, data.row(i), data.value(i)).expect("put");
+            }
+            txn.commit().expect("commit");
+            time += start.elapsed();
+            settle(env);
+        }
+        ([time], table)
+    });
     out.push("reth.state.load", per_op(time, rows));
     out.push("reth.state.file_bytes", used_bytes(&env));
     let ro = Arc::new(env.begin_ro().expect("begin ro"));
     let mut cursor = ro.dup_cursor_owned(&table).expect("dup cursor");
     if out.wants("reth.state.get") {
-        let start = Instant::now();
-        let (mut hits, mut bytes) = (0, 0);
-        for &i in &data.gets {
-            let logical = data.row(i as usize);
-            cursor.reset();
-            let (k, v) = cursor
-                .seek_dup(&logical[..STATE_KEY], &logical[STATE_KEY..])
-                .expect("seek_dup")
-                .expect("a row");
-            hits += usize::from(k == logical);
-            bytes += v.len();
-        }
-        let time = start.elapsed();
-        assert_eq!(hits, data.gets.len(), "every get finds its row");
-        black_box(bytes);
+        let time = fastest(|| {
+            let start = Instant::now();
+            let (mut hits, mut bytes) = (0, 0);
+            for &i in &data.gets {
+                let logical = data.row(i as usize);
+                cursor.reset();
+                let (k, v) = cursor
+                    .seek_dup(&logical[..STATE_KEY], &logical[STATE_KEY..])
+                    .expect("seek_dup")
+                    .expect("a row");
+                hits += usize::from(k == logical);
+                bytes += v.len();
+            }
+            let time = start.elapsed();
+            assert_eq!(hits, data.gets.len(), "every get finds its row");
+            black_box(bytes);
+            time
+        });
         out.push("reth.state.get", per_op(time, data.gets.len()));
     }
     if out.wants("reth.state.walk") {
-        let start = Instant::now();
-        let (mut walked, mut bytes) = (0, 0);
-        for &k in &data.walks {
-            let mut row = cursor.seek_key(data.key(k)).expect("seek_key");
-            while let Some((_, v)) = row {
-                walked += 1;
-                bytes += v.len();
-                row = cursor.next_in_prefix(STATE_KEY).expect("next_in_prefix");
+        let time = fastest(|| {
+            let start = Instant::now();
+            let (mut walked, mut bytes) = (0, 0);
+            for &k in &data.walks {
+                let mut row = cursor.seek_key(data.key(k)).expect("seek_key");
+                while let Some((_, v)) = row {
+                    walked += 1;
+                    bytes += v.len();
+                    row = cursor.next_in_prefix(STATE_KEY).expect("next_in_prefix");
+                }
             }
-        }
-        let time = start.elapsed();
-        assert_eq!(walked, rows, "the walks read every row once");
-        black_box(bytes);
-        out.push("reth.state.walk", per_op(time, walked));
+            let time = start.elapsed();
+            assert_eq!(walked, rows, "the walks read every row once");
+            black_box(bytes);
+            time
+        });
+        out.push("reth.state.walk", per_op(time, rows));
     }
 }
 
@@ -268,49 +278,55 @@ impl ChangeSetData {
 /// every `CS_COMMIT_BLOCKS` blocks, commits included, each settled untimed; per row),
 /// `reth.changesets.file_bytes`, and `reth.changesets.walk` (`CS_WALKS` walks as reth's
 /// `walk_range` takes them: a seek to a block's first row, then steps across keys to the last row
-/// of the walk's last block; per row read).
+/// of the walk's last block; per row read, the fastest of its passes).
 pub(crate) fn changesets(dir: &Path, options: EnvOptions, data: &ChangeSetData, out: &mut Out<'_>) {
-    let env = open(dir, "changesets", options);
-    let mut txn = env.begin_rw().expect("begin");
-    let table = txn.create_table("StorageChangeSets").expect("create");
-    txn.commit().expect("commit");
-    settle(&env);
-    let mut time = Duration::ZERO;
-    for first in (0..data.blocks()).step_by(CS_COMMIT_BLOCKS) {
-        let last = (first + CS_COMMIT_BLOCKS).min(data.blocks());
-        let start = Instant::now();
+    let wanted = [out.wants("reth.changesets.append")];
+    let ([time], env, table) = fresh_passes(dir, "changesets", options, wanted, |env| {
         let mut txn = env.begin_rw().expect("begin");
-        for i in data.block_starts[first]..data.block_starts[last] {
-            txn.append(&table, data.key(i), data.value(i)).expect("append");
-        }
+        let table = txn.create_table("StorageChangeSets").expect("create");
         txn.commit().expect("commit");
-        time += start.elapsed();
-        settle(&env);
-    }
+        settle(env);
+        let mut time = Duration::ZERO;
+        for first in (0..data.blocks()).step_by(CS_COMMIT_BLOCKS) {
+            let last = (first + CS_COMMIT_BLOCKS).min(data.blocks());
+            let start = Instant::now();
+            let mut txn = env.begin_rw().expect("begin");
+            for i in data.block_starts[first]..data.block_starts[last] {
+                txn.append(&table, data.key(i), data.value(i)).expect("append");
+            }
+            txn.commit().expect("commit");
+            time += start.elapsed();
+            settle(env);
+        }
+        ([time], table)
+    });
     out.push("reth.changesets.append", per_op(time, data.rows()));
     out.push("reth.changesets.file_bytes", used_bytes(&env));
     if out.wants("reth.changesets.walk") {
         let ro = Arc::new(env.begin_ro().expect("begin ro"));
-        let start = Instant::now();
-        let (mut walked, mut bytes) = (0, 0);
-        for &first in &data.walk_starts {
-            let mut cursor = ro.cursor_owned(&table).expect("cursor");
-            let end = ((first + data.walk_blocks) as u64).to_be_bytes();
-            let mut row = cursor.seek(data.key(data.block_starts[first])).expect("seek");
-            while let Some((k, v)) = row {
-                if k[..8] >= end[..] {
-                    break;
-                }
-                walked += 1;
-                bytes += v.len();
-                row = cursor.next().expect("next");
-            }
-        }
-        let time = start.elapsed();
         let expected: usize = data.walk_starts.iter().map(|&w| data.walk_rows(w)).sum();
-        assert_eq!(walked, expected, "a walk reads its blocks' rows");
-        black_box(bytes);
-        out.push("reth.changesets.walk", per_op(time, walked));
+        let time = fastest(|| {
+            let start = Instant::now();
+            let (mut walked, mut bytes) = (0, 0);
+            for &first in &data.walk_starts {
+                let mut cursor = ro.cursor_owned(&table).expect("cursor");
+                let end = ((first + data.walk_blocks) as u64).to_be_bytes();
+                let mut row = cursor.seek(data.key(data.block_starts[first])).expect("seek");
+                while let Some((k, v)) = row {
+                    if k[..8] >= end[..] {
+                        break;
+                    }
+                    walked += 1;
+                    bytes += v.len();
+                    row = cursor.next().expect("next");
+                }
+            }
+            let time = start.elapsed();
+            assert_eq!(walked, expected, "a walk reads its blocks' rows");
+            black_box(bytes);
+            time
+        });
+        out.push("reth.changesets.walk", per_op(time, expected));
     }
 }
 
@@ -434,30 +450,33 @@ impl RewriteData {
     }
 }
 
-/// One rewrite row's passes: `load` fills a table in one transaction (untimed), then each of
-/// `RW_TXNS` transactions runs `txn_loop` (given the transaction's index; timed) and commits and
-/// settles (untimed). The loops' total time per key.
+/// One rewrite row's sample: on a fresh environment `name` (a pass, run until its row's
+/// [`Fastest`](crate::Fastest) is done), `load` fills a table in one transaction (untimed), then
+/// each of `RW_TXNS` transactions runs `txn_loop` (given the transaction's index; timed) and
+/// commits and settles (untimed). The fastest pass's loops' total time per key.
 fn rewrite_pass(
     dir: &Path,
     name: &str,
     options: EnvOptions,
-    load: impl FnOnce(&mut RwTxn) -> Table,
+    load: impl Fn(&mut RwTxn) -> Table,
     mut txn_loop: impl FnMut(&mut RwTxn, &Table, usize) -> usize,
 ) -> f64 {
-    let env = open(dir, name, options);
-    let mut txn = env.begin_rw().expect("begin");
-    let table = load(&mut txn);
-    txn.commit().expect("commit");
-    settle(&env);
-    let (mut time, mut keys) = (Duration::ZERO, 0);
-    for t in 0..RW_TXNS {
+    let ([time], _, keys) = fresh_passes(dir, name, options, [true], |env| {
         let mut txn = env.begin_rw().expect("begin");
-        let start = Instant::now();
-        keys += txn_loop(&mut txn, &table, t);
-        time += start.elapsed();
+        let table = load(&mut txn);
         txn.commit().expect("commit");
-        settle(&env);
-    }
+        settle(env);
+        let (mut time, mut keys) = (Duration::ZERO, 0);
+        for t in 0..RW_TXNS {
+            let mut txn = env.begin_rw().expect("begin");
+            let start = Instant::now();
+            keys += txn_loop(&mut txn, &table, t);
+            time += start.elapsed();
+            txn.commit().expect("commit");
+            settle(env);
+        }
+        ([time], keys)
+    });
     per_op(time, keys)
 }
 
@@ -742,79 +761,85 @@ fn extend_history(
 /// and, under `SyncMode::Durable`, `reth.block.pages_synced` (the pages the block commits synced,
 /// per block, from `Env::io_stats`).
 pub(crate) fn block(dir: &Path, options: EnvOptions, data: &BlockData, out: &mut Out<'_>) {
-    let env = open(dir, "block", options);
-    let mut txn = env.begin_rw().expect("begin");
-    let packed = DupOptions::packed(32);
-    let t = BlockTables {
-        headers: txn.create_table("Headers").expect("create"),
-        transactions: txn.create_table("Transactions").expect("create"),
-        receipts: txn.create_table("Receipts").expect("create"),
-        accounts: txn.create_table("HashedAccounts").expect("create"),
-        storages: txn.create_dup_table("HashedStorages", packed).expect("create"),
-        account_changes: txn.create_table("AccountChangeSets").expect("create"),
-        storage_changes: txn.create_table("StorageChangeSets").expect("create"),
-        account_history: txn.create_table("AccountsHistory").expect("create"),
-        storage_history: txn.create_table("StoragesHistory").expect("create"),
-    };
-    let max = u64::MAX.to_be_bytes();
-    for (i, account) in data.accounts.iter().enumerate() {
-        txn.put(&t.accounts, account, data.value(i, ACCOUNT_LEN)).expect("put");
-        let key: [u8; 28] = address_key(account, &[], &max);
-        txn.put(&t.account_history, &key, data.value(i, BlockData::hist_len(i))).expect("put");
-    }
-    for (i, slot) in data.slots.iter().enumerate() {
-        txn.put(&t.storages, slot, data.value(i, 1 + i % 32)).expect("put");
-        let key: [u8; 60] = address_key(slot, &slot[32..], &max);
-        txn.put(&t.storage_history, &key, data.value(i, BlockData::hist_len(i))).expect("put");
-    }
-    txn.commit().expect("commit");
-    settle(&env);
-    let before = env.io_stats();
-    let mut scratch = Vec::with_capacity(HIST_MAX);
-    let mut time = Duration::ZERO;
-    for (b, ops) in data.blocks.iter().enumerate() {
-        let start = Instant::now();
-        let mut txn = env.begin_rw().expect("begin");
-        let number = ops.number;
-        txn.append(&t.headers, &number.to_be_bytes(), data.value(b, HEADER_LEN)).expect("header");
-        let first_tx = (number - 1) * BLOCK_TXS as u64;
-        for tx in first_tx..first_tx + BLOCK_TXS as u64 {
-            let value = data.value(tx as usize, TX_LEN);
-            txn.append(&t.transactions, &tx.to_be_bytes(), value).expect("transaction");
-        }
-        for tx in first_tx..first_tx + BLOCK_TXS as u64 {
-            let value = data.value(tx as usize + 1, RECEIPT_LEN);
-            txn.append(&t.receipts, &tx.to_be_bytes(), value).expect("receipt");
-        }
-        for (i, account) in ops.accounts.iter().enumerate() {
-            txn.put(&t.accounts, account, data.value(b + i, ACCOUNT_LEN)).expect("account");
-        }
-        let mut cursor = txn.dup_cursor_detached(&t.storages).expect("dup cursor");
-        for (i, slot) in ops.slots.iter().enumerate() {
-            let found = cursor.seek_dup(&txn, &slot[..32], &slot[32..]).expect("seek_dup");
-            black_box(found.map(|(_, v)| v.len()));
-            cursor.put(&mut txn, slot, data.value(b + i, 1 + i % 32)).expect("slot");
-        }
-        for (i, key) in ops.account_changes.iter().enumerate() {
-            let value = data.value(b + i, ACCOUNT_LEN);
-            txn.append(&t.account_changes, key, value).expect("account change");
-        }
-        for (i, key) in ops.storage_changes.iter().enumerate() {
-            let value = data.value(b + i, 1 + i % 32);
-            txn.append(&t.storage_changes, key, value).expect("storage change");
-        }
-        let mut cursor = txn.cursor_detached(&t.account_history).expect("cursor");
-        for key in &ops.account_history {
-            extend_history(&mut txn, &mut cursor, &mut scratch, key, number);
-        }
-        let mut cursor = txn.cursor_detached(&t.storage_history).expect("cursor");
-        for key in &ops.storage_history {
-            extend_history(&mut txn, &mut cursor, &mut scratch, key, number);
-        }
-        txn.commit().expect("commit");
-        time += start.elapsed();
-        settle(&env);
-    }
+    let ([time], env, before) =
+        fresh_passes(dir, "block", options, [out.wants("reth.block")], |env| {
+            let mut txn = env.begin_rw().expect("begin");
+            let packed = DupOptions::packed(32);
+            let t = BlockTables {
+                headers: txn.create_table("Headers").expect("create"),
+                transactions: txn.create_table("Transactions").expect("create"),
+                receipts: txn.create_table("Receipts").expect("create"),
+                accounts: txn.create_table("HashedAccounts").expect("create"),
+                storages: txn.create_dup_table("HashedStorages", packed).expect("create"),
+                account_changes: txn.create_table("AccountChangeSets").expect("create"),
+                storage_changes: txn.create_table("StorageChangeSets").expect("create"),
+                account_history: txn.create_table("AccountsHistory").expect("create"),
+                storage_history: txn.create_table("StoragesHistory").expect("create"),
+            };
+            let max = u64::MAX.to_be_bytes();
+            for (i, account) in data.accounts.iter().enumerate() {
+                txn.put(&t.accounts, account, data.value(i, ACCOUNT_LEN)).expect("put");
+                let key: [u8; 28] = address_key(account, &[], &max);
+                txn.put(&t.account_history, &key, data.value(i, BlockData::hist_len(i)))
+                    .expect("put");
+            }
+            for (i, slot) in data.slots.iter().enumerate() {
+                txn.put(&t.storages, slot, data.value(i, 1 + i % 32)).expect("put");
+                let key: [u8; 60] = address_key(slot, &slot[32..], &max);
+                txn.put(&t.storage_history, &key, data.value(i, BlockData::hist_len(i)))
+                    .expect("put");
+            }
+            txn.commit().expect("commit");
+            settle(env);
+            let before = env.io_stats();
+            let mut scratch = Vec::with_capacity(HIST_MAX);
+            let mut time = Duration::ZERO;
+            for (b, ops) in data.blocks.iter().enumerate() {
+                let start = Instant::now();
+                let mut txn = env.begin_rw().expect("begin");
+                let number = ops.number;
+                txn.append(&t.headers, &number.to_be_bytes(), data.value(b, HEADER_LEN))
+                    .expect("header");
+                let first_tx = (number - 1) * BLOCK_TXS as u64;
+                for tx in first_tx..first_tx + BLOCK_TXS as u64 {
+                    let value = data.value(tx as usize, TX_LEN);
+                    txn.append(&t.transactions, &tx.to_be_bytes(), value).expect("transaction");
+                }
+                for tx in first_tx..first_tx + BLOCK_TXS as u64 {
+                    let value = data.value(tx as usize + 1, RECEIPT_LEN);
+                    txn.append(&t.receipts, &tx.to_be_bytes(), value).expect("receipt");
+                }
+                for (i, account) in ops.accounts.iter().enumerate() {
+                    txn.put(&t.accounts, account, data.value(b + i, ACCOUNT_LEN)).expect("account");
+                }
+                let mut cursor = txn.dup_cursor_detached(&t.storages).expect("dup cursor");
+                for (i, slot) in ops.slots.iter().enumerate() {
+                    let found = cursor.seek_dup(&txn, &slot[..32], &slot[32..]).expect("seek_dup");
+                    black_box(found.map(|(_, v)| v.len()));
+                    cursor.put(&mut txn, slot, data.value(b + i, 1 + i % 32)).expect("slot");
+                }
+                for (i, key) in ops.account_changes.iter().enumerate() {
+                    let value = data.value(b + i, ACCOUNT_LEN);
+                    txn.append(&t.account_changes, key, value).expect("account change");
+                }
+                for (i, key) in ops.storage_changes.iter().enumerate() {
+                    let value = data.value(b + i, 1 + i % 32);
+                    txn.append(&t.storage_changes, key, value).expect("storage change");
+                }
+                let mut cursor = txn.cursor_detached(&t.account_history).expect("cursor");
+                for key in &ops.account_history {
+                    extend_history(&mut txn, &mut cursor, &mut scratch, key, number);
+                }
+                let mut cursor = txn.cursor_detached(&t.storage_history).expect("cursor");
+                for key in &ops.storage_history {
+                    extend_history(&mut txn, &mut cursor, &mut scratch, key, number);
+                }
+                txn.commit().expect("commit");
+                time += start.elapsed();
+                settle(env);
+            }
+            ([time], before)
+        });
     let blocks = data.blocks.len();
     out.push("reth.block", per_op(time, blocks));
     out.push("reth.block.file_bytes", used_bytes(&env));

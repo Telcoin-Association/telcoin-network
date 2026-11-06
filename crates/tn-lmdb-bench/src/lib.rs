@@ -5,7 +5,10 @@
 //! Every row is a fixed, seeded workload with a stable name ([`ROWS`]). Each runs `reps` times,
 //! each rep in a fresh environment in a fresh temp directory, and records one sample per rep:
 //! nanoseconds per operation for a time row, or a deterministic size for an exact row (bytes, or
-//! pages per block), which must not change between runs. Lower is better for every row.
+//! pages per block), which must not change between runs. Lower is better for every row. A time
+//! row of a short measured loop runs it again within the rep (a read loop over the same state, a
+//! put loop or a commit in a fresh environment each time) until its passes add up to a few tens
+//! of milliseconds, and its sample is its fastest pass.
 //!
 //! Rows belong to a group: `generic` (the engine's basic operations on plain tables) and `reth`
 //! (the shapes and write patterns of reth's tables, as the reth adapter lays them out). A row runs
@@ -136,6 +139,7 @@ impl Modes {
 pub(crate) enum Job {
     Seq,
     Rand,
+    Small,
     Api,
     Mixed,
     Delete,
@@ -150,9 +154,10 @@ pub(crate) enum Job {
 
 impl Job {
     /// Every job, in run order.
-    const ALL: [Self; 12] = [
+    const ALL: [Self; 13] = [
         Self::Seq,
         Self::Rand,
+        Self::Small,
         Self::Api,
         Self::Mixed,
         Self::Delete,
@@ -169,6 +174,7 @@ impl Job {
         match self {
             Self::Seq => "seq",
             Self::Rand => "rand",
+            Self::Small => "small",
             Self::Api => "api",
             Self::Mixed => "mixed",
             Self::Delete => "delete",
@@ -197,8 +203,21 @@ pub struct RowSpec {
     pub modes: Modes,
     /// What one operation is (time rows), or what is measured (exact rows).
     pub op: &'static str,
+    /// Whether the comparison gates the row at the quick tier (its JSON's `gate`). A commit row's
+    /// sample there is one commit of 100k entries, a fraction of a millisecond spent mostly
+    /// writing fresh file pages, whose cost moves by 10% and more from run to run with the
+    /// machine's memory state however many passes it takes: such a row is reported at the quick
+    /// tier, and gated from the default tier (1M entries) on.
+    pub quick_gate: bool,
     /// The job that measures it.
     pub(crate) job: Job,
+}
+
+impl RowSpec {
+    /// The row, not gated at the quick tier.
+    const fn not_gated_at_quick(self) -> Self {
+        Self { quick_gate: false, ..self }
+    }
 }
 
 const fn row(
@@ -209,7 +228,7 @@ const fn row(
     job: Job,
     op: &'static str,
 ) -> RowSpec {
-    RowSpec { name, group, metric, modes, op, job }
+    RowSpec { name, group, metric, modes, op, quick_gate: true, job }
 }
 
 use Group::{Generic, Reth};
@@ -219,9 +238,9 @@ use Modes::{DurableOnly, Every, NoSyncOnly};
 /// Every row, in report order. The README's table describes each.
 pub const ROWS: &[RowSpec] = &[
     row("put.seq", Generic, NsPerOp, NoSyncOnly, Job::Seq, "put"),
-    row("put.seq.commit", Generic, NsPerOp, Every, Job::Seq, "commit"),
+    row("put.seq.commit", Generic, NsPerOp, Every, Job::Seq, "commit").not_gated_at_quick(),
     row("put.rand", Generic, NsPerOp, NoSyncOnly, Job::Rand, "put"),
-    row("put.rand.commit", Generic, NsPerOp, Every, Job::Rand, "commit"),
+    row("put.rand.commit", Generic, NsPerOp, Every, Job::Rand, "commit").not_gated_at_quick(),
     row("put.rand.file_bytes", Generic, Bytes, NoSyncOnly, Job::Rand, "file used span"),
     row("put.append", Generic, NsPerOp, NoSyncOnly, Job::Api, "append"),
     row("put.cursor", Generic, NsPerOp, NoSyncOnly, Job::Api, "cursor put"),
@@ -232,7 +251,7 @@ pub const ROWS: &[RowSpec] = &[
     row("scan.rev", Generic, NsPerOp, NoSyncOnly, Job::Rand, "entry"),
     row("seek.range", Generic, NsPerOp, NoSyncOnly, Job::Rand, "seek + 9 next"),
     row("seek.range.sorted", Generic, NsPerOp, NoSyncOnly, Job::Rand, "seek + 9 next"),
-    row("commit.small", Generic, NsPerOp, Every, Job::Rand, "transaction"),
+    row("commit.small", Generic, NsPerOp, Every, Job::Small, "transaction"),
     row("mixed", Generic, NsPerOp, Every, Job::Mixed, "put or delete"),
     row("delete.rand90", Generic, NsPerOp, NoSyncOnly, Job::Delete, "delete"),
     row("churn", Generic, NsPerOp, Every, Job::Churn, "round"),
@@ -261,7 +280,7 @@ pub const ROWS: &[RowSpec] = &[
 /// A benchmark tier: the default size, reps and sync modes of a run.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Tier {
-    /// `n` 100k, 3 reps, `nosync`: about a minute.
+    /// `n` 100k, 3 reps, `nosync`: seconds.
     Quick,
     /// `n` 1M, 3 reps, `nosync`: minutes.
     Default,
@@ -344,6 +363,9 @@ pub struct RowResult {
     pub max: f64,
     /// Whether the row is deterministic: any change is real.
     pub exact: bool,
+    /// Whether the comparison gates the row at this run's tier ([`RowSpec::quick_gate`]); a row
+    /// of `false` is reported, not gated.
+    pub gate: bool,
 }
 
 /// A run's results: the schema-1 JSON `--out` writes.
@@ -393,7 +415,7 @@ impl Out<'_> {
     }
 }
 
-/// Open (create) the environment `name` in `dir`.
+/// Open (create) the environment `name` in `dir`: the file `<name>.tn-lmdb`.
 pub(crate) fn open(dir: &Path, name: &str, options: EnvOptions) -> Env {
     Env::open(dir.join(format!("{name}.tn-lmdb")), options).expect("open tn-lmdb")
 }
@@ -415,6 +437,102 @@ pub(crate) fn per_op(time: Duration, ops: usize) -> f64 {
 /// `time` in nanoseconds.
 pub(crate) fn nanos(time: Duration) -> f64 {
     time.as_nanos() as f64
+}
+
+/// The least measured time a time row's passes add up to in one rep. A pass of a few
+/// milliseconds (a scan of 100k entries, a commit) lands whole in one scheduler hiccup, a load
+/// spike or a stretch on an efficiency core, so such a row runs its pass again until its passes
+/// add up to this.
+const PASS_TARGET: Duration = Duration::from_millis(30);
+/// The fewest passes a time row runs in one rep, unless they add up to [`ENOUGH`]: a row's sample
+/// is its fastest pass, and the fastest of a few drops the passes a slowdown hit.
+const FEWEST_PASSES: usize = 3;
+/// The measured time after which a row stops short of [`FEWEST_PASSES`]: a pass this long or
+/// longer (most rows at 1M entries, a workload of many commits at 100k) runs once.
+const ENOUGH: Duration = Duration::from_millis(100);
+/// The most passes a time row runs in one rep.
+const MAX_PASSES: usize = 16;
+
+/// The fastest of a time row's passes in one rep. A pass is added until the passes add up to
+/// [`PASS_TARGET`] and number [`FEWEST_PASSES`] (or add up to [`ENOUGH`]), or number
+/// [`MAX_PASSES`]. A pass is the row's measured loop: again over the same state for a read row,
+/// on a fresh state (a fresh environment, set up untimed) for a row that writes.
+pub(crate) struct Fastest {
+    /// Whether the run wants the row: a row it does not want is done from the start, and its
+    /// passes follow its job's other rows.
+    wanted: bool,
+    /// The fastest pass so far.
+    best: Duration,
+    /// The passes' measured time.
+    total: Duration,
+    /// The passes so far.
+    passes: usize,
+}
+
+impl Fastest {
+    /// No passes yet of a row the run wants (`wanted`) or does not.
+    pub(crate) const fn new(wanted: bool) -> Self {
+        Self { wanted, best: Duration::MAX, total: Duration::ZERO, passes: 0 }
+    }
+
+    /// Record a pass's measured time.
+    pub(crate) fn add(&mut self, time: Duration) {
+        self.best = self.best.min(time);
+        self.total += time;
+        self.passes += 1;
+    }
+
+    /// Whether the row has its sample.
+    pub(crate) fn done(&self) -> bool {
+        !self.wanted
+            || self.passes >= MAX_PASSES
+            || (self.total >= PASS_TARGET && (self.passes >= FEWEST_PASSES || self.total >= ENOUGH))
+    }
+
+    /// The fastest pass.
+    pub(crate) const fn best(&self) -> Duration {
+        self.best
+    }
+}
+
+/// The sample of a time row whose pass needs no fresh state (a read loop): `pass` (one run of
+/// the measured loop, returning its measured time) run until a [`Fastest`] is done; the fastest
+/// pass.
+pub(crate) fn fastest(mut pass: impl FnMut() -> Duration) -> Duration {
+    let mut fastest = Fastest::new(true);
+    while !fastest.done() {
+        fastest.add(pass());
+    }
+    fastest.best()
+}
+
+/// The samples of the time rows a job measures together on a fresh state (a put loop and its
+/// commit, a workload of many commits): `pass` sets a fresh environment `name` in `dir` up
+/// (untimed) and returns its rows' measured times and a value, and runs again on a fresh
+/// environment until every row's [`Fastest`] is done (`wanted` says which rows the run wants; a
+/// job whose rows it does not want still runs once, for its exact rows). Each pass's environment
+/// but the last is closed and its file removed; the rows' fastest passes come back with the last
+/// pass's environment and value.
+pub(crate) fn fresh_passes<const N: usize, T>(
+    dir: &Path,
+    name: &str,
+    options: EnvOptions,
+    wanted: [bool; N],
+    mut pass: impl FnMut(&Env) -> ([Duration; N], T),
+) -> ([Duration; N], Env, T) {
+    let mut rows = wanted.map(Fastest::new);
+    loop {
+        let env = open(dir, name, options);
+        let (times, value) = pass(&env);
+        for (row, time) in rows.iter_mut().zip(times) {
+            row.add(time);
+        }
+        if rows.iter().all(Fastest::done) {
+            return (rows.map(|row| row.best()), env, value);
+        }
+        drop(env);
+        std::fs::remove_file(dir.join(format!("{name}.tn-lmdb"))).expect("remove a pass's file");
+    }
 }
 
 /// The file's used span: the newest committed state's pages times the page size.
@@ -548,6 +666,7 @@ pub fn run(config: &Config, progress: &mut dyn FnMut(&str)) -> Report {
                 let each: fn(&Path, EnvOptions, &data::Data, &mut Out<'_>) = match generic_job {
                     Job::Seq => generic::seq,
                     Job::Rand => generic::rand,
+                    Job::Small => generic::small,
                     Job::Api => generic::api,
                     Job::Mixed => generic::mixed,
                     Job::Delete => generic::delete,
@@ -591,6 +710,7 @@ pub fn run(config: &Config, progress: &mut dyn FnMut(&str)) -> Report {
                 max,
                 samples,
                 exact: row.metric.exact(),
+                gate: row.quick_gate || config.tier != Tier::Quick,
             }
         })
         .collect();
@@ -676,7 +796,9 @@ mod tests {
             assert_eq!(result.samples.len(), 1, "{} ({})", row.name, mode.name());
             assert!(result.median > 0.0, "{} ({}) measured nothing", row.name, mode.name());
             assert_eq!(result.exact, row.metric.exact());
+            assert_eq!(result.gate, row.quick_gate, "{} at the quick tier", row.name);
         }
+        assert!(first.rows.iter().any(|r| r.name == "put.seq.commit" && !r.gate));
         // Every row that has a durable twin ran under both modes, and pages_synced only durable.
         assert!(first
             .rows
@@ -694,13 +816,42 @@ mod tests {
         for key in ["label", "tier", "n", "reps", "page_size", "os", "arch", "rows"] {
             assert!(value.get(key).is_some(), "the report has {key}");
         }
-        for key in
-            ["name", "group", "sync", "metric", "unit", "samples", "median", "min", "max", "exact"]
-        {
+        for key in [
+            "name", "group", "sync", "metric", "unit", "samples", "median", "min", "max", "exact",
+            "gate",
+        ] {
             assert!(value["rows"][0].get(key).is_some(), "a row has {key}");
         }
         let back: Report = serde_json::from_str(&json).expect("deserialize");
-        assert_eq!(back, first, "the JSON round-trips");
+        // serde_json (without its `float_roundtrip` feature) parses a float to within an ulp of
+        // the one it printed, not always to it: the floats round-trip that closely, the rest
+        // exactly.
+        let floats = |r: &Report| -> Vec<f64> {
+            r.rows
+                .iter()
+                .flat_map(|w| w.samples.iter().copied().chain([w.median, w.min, w.max]))
+                .collect()
+        };
+        let (got, want) = (floats(&back), floats(&first));
+        assert_eq!(got.len(), want.len());
+        for (a, b) in got.into_iter().zip(want) {
+            assert!((a - b).abs() <= b.abs() * 1e-15, "{b} round-trips as {a}");
+        }
+        let without_floats = |r: &Report| Report {
+            rows: r
+                .rows
+                .iter()
+                .map(|w| RowResult {
+                    samples: Vec::new(),
+                    median: 0.0,
+                    min: 0.0,
+                    max: 0.0,
+                    ..w.clone()
+                })
+                .collect(),
+            ..r.clone()
+        };
+        assert_eq!(without_floats(&back), without_floats(&first), "the JSON round-trips");
 
         // The exact rows again, from their jobs alone: the same values.
         let exact = Config { rows: ROWS.iter().filter(|r| r.metric.exact()).collect(), ..tiny() };
@@ -714,6 +865,34 @@ mod tests {
                 .expect("the first run has the row");
             assert_eq!(before.samples, again.samples, "{} ({}) is exact", again.name, again.sync);
         }
+
+        // Past the quick tier every row is gated.
+        let commits = Config {
+            tier: Tier::Default,
+            rows: ROWS.iter().filter(|r| !r.quick_gate).collect(),
+            modes: vec![Mode::NoSync],
+            ..tiny()
+        };
+        assert!(!commits.rows.is_empty());
+        assert!(run(&commits, &mut |_| {}).rows.iter().all(|r| r.gate));
+    }
+
+    #[test]
+    fn passes_stop_at_the_target() {
+        let passes = |ms: u64| {
+            let mut fastest = Fastest::new(true);
+            while !fastest.done() {
+                fastest.add(Duration::from_millis(ms + fastest.passes as u64 % 2));
+            }
+            (fastest.passes, fastest.best())
+        };
+        let ms = Duration::from_millis;
+        assert_eq!(passes(1), (MAX_PASSES, ms(1)));
+        assert_eq!(passes(5), (6, ms(5)), "30 ms of passes");
+        assert_eq!(passes(20), (FEWEST_PASSES, ms(20)));
+        assert_eq!(passes(60), (2, ms(60)), "100 ms of passes stop short of the fewest");
+        assert_eq!(passes(150), (1, ms(150)));
+        assert!(Fastest::new(false).done(), "a row the run does not want runs no pass of its own");
     }
 
     #[test]

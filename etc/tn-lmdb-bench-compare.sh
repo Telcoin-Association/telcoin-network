@@ -17,9 +17,12 @@
 #   --tier quick|default|full, --rows PAT[,PAT..], --sync nosync,durable, --n N, --reps K
 #                      passed to every bench run as they are (the bench's own defaults without
 #                      them); --rows takes exact row names or prefixes ending in `*`
-#   --rounds K         interleaved pairs (default 2, every tier): round 1 runs base then head,
-#                      round 2 head then base, and so on (A B B A for 2). With 1 each side has
-#                      a single run, so a load spike during one run decides its rows alone
+#   --rounds K         interleaved pairs (default 4 at the quick tier, 2 otherwise): round 1
+#                      runs base then head, round 2 head then base, and so on (A B B A for 2).
+#                      With 1 each side has a single run, so a load spike during one run decides
+#                      its rows alone; with 2 a load change that spans the middle two runs (both
+#                      head's) moves all of one side's runs, which 4 rounds of the quick tier's
+#                      short runs make unlikely
 #   --threshold PCT    a time row regresses when head's median over base's is above 1 + PCT/100
 #                      AND head's min over base's above 1 + PCT/200 (default 10): both, so that
 #                      one noisy run on either side cannot decide alone. `improved` is the mirror
@@ -73,9 +76,11 @@
 # minimums. The report has both commits, the host, rustc, the bench config (tier, n, reps and page size, from
 # the JSON), the rounds and thresholds, then one line per row: name, group, sync, base and head
 # median, ratio, min ratio, each side's spread ((max - min) / median of its pooled samples) and
-# the verdict: ok, improved, REGRESSION, not gated (a durable time row), or new and removed (a
-# row on one side only, never gated). Lower is better for every row. When rustc or cargo
-# processes were running as the runs started, the report says so.
+# the verdict: ok, improved, REGRESSION, not gated (a durable time row, or a row whose JSON says
+# `gate: false`: the bench marks the commit rows so at the quick tier, where one commit is too
+# short to hold still), or new and removed (a row on one side only, never gated). Lower is better
+# for every row. When rustc or cargo processes were running as the runs started, the report says
+# so.
 #
 # Needs git, a Rust toolchain, python3 3.11 or later (its tomllib; --report-only needs 3.8) and
 # cmp. In the bench dir (marked as the script's own with a .tn-lmdb-bench-compare file; an
@@ -172,7 +177,12 @@ for pair in "--n:$n" "--reps:$reps" "--rounds:$rounds"; do
     value="${pair#*:}"
     [ -z "$value" ] || positive "$value" || die "${pair%%:*} takes a positive integer, not '$value'"
 done
-rounds="${rounds:-2}"
+if [ -z "$rounds" ]; then
+    # A quick run is short, so four rounds cost little, and they give each side runs on both
+    # sides of a load change of a busy machine: neither side's min then comes from the slow
+    # stretch alone, so the min ratio does not call the change a regression.
+    if [ "$tier" = quick ]; then rounds=4; else rounds=2; fi
+fi
 threshold="${threshold:-10}"
 size_threshold="${size_threshold:-1}"
 if [ "$worktree" = 1 ]; then
