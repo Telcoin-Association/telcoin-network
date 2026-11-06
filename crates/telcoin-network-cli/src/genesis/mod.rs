@@ -660,7 +660,7 @@ mod tests {
     /// way the e2e suite drives it (`crates/e2e-tests/src/lib.rs`): mint 4 placeholder
     /// validators via the in-process keytool, then run the ceremony with flags mirroring the
     /// committed placeholder identity:
-    /// - chain id 0x1e7 (487), unchanged from the committed genesis;
+    /// - chain id 0x2db (731), unchanged from the committed genesis;
     /// - owner + dev-funded account [`MAINNET_PLACEHOLDER_OWNER`];
     /// - basefee address 0x99..99, preserving the committed parameters.yaml;
     /// - epoch duration [`MAINNET_EPOCH_DURATION_SECS`] (21600s, the mainnet target of issue
@@ -718,7 +718,7 @@ mod tests {
         let ceremony = CommandParser::<GenesisArgs>::parse_from([
             "tn",
             "--chain-id",
-            "0x1e7",
+            "0x2db",
             "--consensus-registry-owner",
             MAINNET_PLACEHOLDER_OWNER,
             "--dev-funded-account",
