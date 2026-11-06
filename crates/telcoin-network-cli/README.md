@@ -69,12 +69,42 @@ telcoin-network keytool generate observer \
 
 The `--bls-passphrase-source` global flag controls how the BLS private key is encrypted at rest. It applies to `keytool generate` (encryption) and `node` (decryption).
 
-| Value           | Behavior                                                                                                                                      |
-| --------------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
-| `env` (default) | Read passphrase from `TN_BLS_PASSPHRASE` environment variable. The variable is cleared from the process environment immediately after reading |
-| `stdin`         | Read the first line from stdin until EOF                                                                                                      |
-| `ask`           | Prompt interactively on the terminal (foreground TTY required)                                                                                |
-| `no-passphrase` | Store the key unencrypted. Testing only; never use in production                                                                              |
+| Value           | Behavior                                                                                                                                                                                                                                                                                                                                                                    |
+| --------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `env` (default) | Read passphrase from `TN_BLS_PASSPHRASE` environment variable. The variable is removed from the process environment immediately after reading; on Linux the value bytes of every `TN_BLS_PASSPHRASE=` entry are zeroed first. The name and a run of zero bytes as long as the value stay visible in `/proc/<pid>/environ`, so the passphrase length can still be read there |
+| `stdin`         | Read the first line from stdin until EOF. All trailing whitespace, including the newline, is trimmed                                                                                                                                                                                                                                                                        |
+| `ask`           | Prompt interactively on the terminal (foreground TTY required)                                                                                                                                                                                                                                                                                                              |
+| `no-passphrase` | Store the key unencrypted. Testing only; never use in production                                                                                                                                                                                                                                                                                                            |
+| `credential`    | Read the systemd credential named by `--bls-passphrase-credential` from `$CREDENTIALS_DIRECTORY`. Removes one final `\n` or `\r\n` only; other whitespace is kept                                                                                                                                                                                                           |
+
+`stdin` and `credential` treat whitespace differently. `stdin` trims all trailing whitespace from the line, while `credential` removes only the final line ending. A passphrase that ends in a space works with `credential` and `env`, but `stdin` cuts the space off. The `credential` source fails when `CREDENTIALS_DIRECTORY` is unset or empty, when the credential file is missing or unreadable, when its content is not valid UTF-8, or when it is empty once the line ending is removed. Commands that need no passphrase (`db`, `keytool set-rpc`) do not read the credential.
+
+#### Running under systemd
+
+With systemd 250 or newer, store the passphrase as an encrypted credential and let the unit hand it to the node:
+
+```bash
+# prompts for the passphrase without echoing it; -n leaves off the trailing newline
+systemd-ask-password -n "BLS passphrase:" | systemd-creds encrypt --name=bls-passphrase - /etc/telcoin/bls-passphrase.cred
+```
+
+```ini
+[Service]
+LoadCredentialEncrypted=bls-passphrase:/etc/telcoin/bls-passphrase.cred
+ExecStart=/usr/local/bin/telcoin-network --bls-passphrase-source credential node --datadir /var/lib/telcoin --http
+```
+
+systemd decrypts the credential when the unit starts and places it in the unit's credential directory, which it names in `CREDENTIALS_DIRECTORY`. The node reads the passphrase from there, so it never appears on the command line, in the unit's `Environment=`, or in the process environment. `LoadCredential=bls-passphrase:<path>` works the same way for an unencrypted file. To use another credential name, pass `--bls-passphrase-credential <NAME>` or set `TN_BLS_PASSPHRASE_CREDENTIAL`; an empty value keeps the default, `bls-passphrase`. The name is checked only when the `credential` source reads it.
+
+An existing unit that passes the passphrase through `Environment=TN_BLS_PASSPHRASE=...` or an `EnvironmentFile=` moves to the credential in five steps:
+
+1. Encrypt the passphrase with the `systemd-creds encrypt` command above.
+2. Replace the `Environment=` or `EnvironmentFile=` line with `LoadCredentialEncrypted=bls-passphrase:<path>`, where `<path>` is the file step 1 wrote. If the environment file sets other variables too, keep the `EnvironmentFile=` line, delete only the `TN_BLS_PASSPHRASE` line from that file, and add the `LoadCredentialEncrypted=` line next to it.
+3. Add `--bls-passphrase-source credential` to `ExecStart=` before the `node` subcommand, as in the example above.
+4. Run `systemctl daemon-reload` and restart the unit.
+5. Confirm in the journal (`journalctl -u <unit>`) that the node started. Then check that the node's environment no longer holds the variable: `sudo cat /proc/$(systemctl show -p MainPID --value <unit>)/environ | tr '\0' '\n' | grep '^TN_BLS_PASSPHRASE='` prints nothing.
+
+The key file `node-keys/bls.kw` and the passphrase do not change, so nothing is re-keyed. The previous unit keeps working as the rollback, because `env` remains the default source: restore it, and its environment file if step 2 changed that, then reload and restart.
 
 Encrypted keys use AES-256-GCM-SIV with PBKDF2-HMAC-SHA256 key derivation (1,000,000 iterations). The encrypted file is saved as `node-keys/bls.kw`; unencrypted keys are saved as `node-keys/bls.key`.
 
@@ -307,27 +337,30 @@ telcoin-network node \
 
 ### node flags
 
-| Flag                  | Default        | Description                                                                                    |
-| --------------------- | -------------- | ---------------------------------------------------------------------------------------------- |
-| `--chain`             | none           | Join a named network (`adiri`, `test-net`, `main-net`)                                         |
-| `--instance`          | none           | Instance number (1-200) for port offsetting. See [Multi-instance setup](#multi-instance-setup) |
-| `--metrics`           | none           | Enable Prometheus metrics at this socket address (e.g. `127.0.0.1:9101`)                       |
-| `--healthcheck`       | none           | TCP health check port. Env: `HEALTHCHECK_TCP_PORT`                                             |
-| `--node-name`         | auto-generated | Name for OpenTelemetry service identification                                                  |
-| `--tracing-url`       | none           | OpenTelemetry collector URL (e.g. `http://192.168.1.2:4317`). Env: `TN_TRACING_URL`            |
-| `--with-unused-ports` | `false`        | Let the OS assign all ports (mutually exclusive with `--instance`)                             |
+| Flag                     | Default        | Description                                                                                                                                                                                         |
+| ------------------------ | -------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `--chain`                | none           | Join a named network (`adiri`, `test-net`, `main-net`)                                                                                                                                              |
+| `--bootstrap-peers`      | none           | Bootstrap dial hints as a YAML or JSON map keyed by BLS public key, for this process only. `{}` selects the genesis fallback                                                                        |
+| `--bootstrap-peers-file` | none           | Read the `--bootstrap-peers` map from a file (same format; checked at argument parsing). Conflicts with `--bootstrap-peers`. A relative path resolves from the working directory, `/` under systemd |
+| `--instance`             | none           | Instance number (1-200) for port offsetting. See [Multi-instance setup](#multi-instance-setup)                                                                                                      |
+| `--metrics`              | none           | Enable Prometheus metrics at this socket address (e.g. `127.0.0.1:9101`)                                                                                                                            |
+| `--healthcheck`          | none           | Health listener: a port (binds `127.0.0.1`) or a socket address (`[::1]:8080`, `0.0.0.0:8080`). Env: `HEALTHCHECK_TCP_PORT`                                                                         |
+| `--node-name`            | auto-generated | Name for OpenTelemetry service identification                                                                                                                                                       |
+| `--tracing-url`          | none           | OpenTelemetry collector URL (e.g. `http://192.168.1.2:4317`). Env: `TN_TRACING_URL`                                                                                                                 |
+| `--with-unused-ports`    | `false`        | Let the OS assign all ports (mutually exclusive with `--instance`)                                                                                                                                  |
 
 ### global flags
 
 These flags apply to all subcommands:
 
-| Flag                      | Default                 | Description                                                              |
-| ------------------------- | ----------------------- | ------------------------------------------------------------------------ |
-| `--datadir`               | OS-specific (see below) | Path to the data directory                                               |
-| `--bls-passphrase-source` | `env`                   | How to obtain the BLS passphrase: `env`, `stdin`, `ask`, `no-passphrase` |
-| `-v` ... `-vvvvv`         | none                    | Verbosity level (info, debug, trace, etc.)                               |
-| `--log.stdout.format`     | default                 | Log output format (e.g. `log-fmt`)                                       |
-| `--color`                 | `auto`                  | Color mode: `always`, `auto`, `never`                                    |
+| Flag                          | Default                 | Description                                                                                                   |
+| ----------------------------- | ----------------------- | ------------------------------------------------------------------------------------------------------------- |
+| `--datadir`                   | OS-specific (see below) | Path to the data directory                                                                                    |
+| `--bls-passphrase-source`     | `env`                   | How to obtain the BLS passphrase: `env`, `stdin`, `ask`, `no-passphrase`, `credential`                        |
+| `--bls-passphrase-credential` | `bls-passphrase`        | Credential name the `credential` source reads; empty selects the default. Env: `TN_BLS_PASSPHRASE_CREDENTIAL` |
+| `-v` ... `-vvvvv`             | none                    | Verbosity level (info, debug, trace, etc.)                                                                    |
+| `--log.stdout.format`         | default                 | Log output format (e.g. `log-fmt`)                                                                            |
+| `--color`                     | `auto`                  | Color mode: `always`, `auto`, `never`                                                                         |
 
 Default data directory by platform:
 
@@ -341,15 +374,18 @@ Default data directory by platform:
 
 ### Environment variables
 
-| Variable                   | Used by          | Description                                                |
-| -------------------------- | ---------------- | ---------------------------------------------------------- |
-| `TN_BLS_PASSPHRASE`        | keytool, node    | BLS key passphrase (cleared from env after read)           |
-| `EXECUTION_ADDRESS`        | keytool generate | Fee recipient address                                      |
-| `TN_EXTERNAL_PRIMARY_ADDR` | keytool generate | External multiaddr for primary P2P                         |
-| `TN_EXTERNAL_WORKER_ADDRS` | keytool generate | External multiaddrs for worker P2P (comma-separated)       |
-| `TN_TRACING_URL`           | node             | OpenTelemetry collector endpoint                           |
-| `HEALTHCHECK_TCP_PORT`     | node             | TCP health check port                                      |
-| `RUST_LOG`                 | all              | Standard Rust log filter directive (e.g. `info,evm=debug`) |
+| Variable                       | Used by          | Description                                                                                                                                                     |
+| ------------------------------ | ---------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `TN_BLS_PASSPHRASE`            | keytool, node    | BLS key passphrase (removed from env after read; on Linux the value bytes of every entry are zeroed, so the name and one zero byte per value byte stay visible) |
+| `TN_BLS_PASSPHRASE_CREDENTIAL` | keytool, node    | Credential name for `--bls-passphrase-source credential`                                                                                                        |
+| `CREDENTIALS_DIRECTORY`        | keytool, node    | Set by systemd; where the `credential` source looks                                                                                                             |
+| `EXECUTION_ADDRESS`            | keytool generate | Fee recipient address                                                                                                                                           |
+| `TN_EXTERNAL_PRIMARY_ADDR`     | keytool generate | External multiaddr for primary P2P                                                                                                                              |
+| `TN_EXTERNAL_WORKER_ADDRS`     | keytool generate | External multiaddrs for worker P2P (comma-separated)                                                                                                            |
+| `TN_TRACING_URL`               | node             | OpenTelemetry collector endpoint                                                                                                                                |
+| `HEALTHCHECK_TCP_PORT`         | node             | Health listener bind: port or socket address (same as `--healthcheck`)                                                                                          |
+| `TN_FORWARD_TXS`               | node             | Target list for `--forward-txs`, kept off the command line                                                                                                      |
+| `RUST_LOG`                     | all              | Standard Rust log filter directive (e.g. `info,evm=debug`)                                                                                                      |
 
 ## Data directory layout
 
@@ -370,8 +406,12 @@ Complete tree after the node has run:
   db/                             # execution layer database (Reth/MDBX)
     static_files/                 #   static block data
   consensus-db/                   # consensus protocol database
-    epoch/                        #   per-epoch consensus data (certs, votes, payloads)
-    epochs/                       #   epoch pack files for archive storage
+    tndb/                         #   consensus DB (tndb): one log per environment
+      epoch/                      #     certificates, votes, payloads, last proposal
+      kad/                        #     peer records
+      cache/                      #     batch cache
+      mdbx-migrated               #     marker: the one-time copy from MDBX is done
+    epochs/                       #   per-epoch consensus packs, epoch records, certificate packs
 ```
 
 ## RPC configuration
@@ -405,6 +445,8 @@ Enable the HTTP and WebSocket RPC servers with `--http` and `--ws`. By default, 
 | `--rpc.max-logs-per-response`            | `20000`               | Max logs in one `eth_getLogs` or filter response (0 = no limit) |
 | `--rpc.gascap`                           | `50000000`            | Max gas for `eth_call` and the call-tracing methods             |
 | `--rpc.txfeecap`                         | `0` (no cap)          | Max transaction fee via RPC (0 = no cap)                        |
+| `--forward-txs`                          | none                  | Forward `eth_sendRawTransaction` and `eth_sendRawTransactionSync` to an ordered failover list of validator RPC targets instead of the local pool. Env: `TN_FORWARD_TXS`. See [Public RPC nodes](../../docs/src/getting-started/public-rpc-nodes.md) |
+| `--sanitize-txs`                         | `false`               | Decode each transaction, recover its signer, and check the transaction type and chain id before forwarding (requires `--forward-txs`). See [Public RPC nodes](../../docs/src/getting-started/public-rpc-nodes.md#sanitizing-submissions) |
 
 ### available RPC namespaces
 
@@ -492,7 +534,8 @@ Inbound (must be open; the P2P rows use the conventional ports, so substitute th
 | 49594 | UDP      | Worker consensus P2P                                          |
 | 8545  | TCP      | HTTP RPC (if enabled; restrict to trusted sources)            |
 | 8546  | TCP      | WebSocket RPC (if enabled; restrict to trusted sources)       |
-| 9101  | TCP      | Prometheus metrics (if enabled; restrict to monitoring infra) |
+| 9101  | TCP      | Prometheus metrics (if enabled; bind loopback or a private interface, see [Private observability listeners](../../docs/src/getting-started/observability-listeners.md)) |
+| 8080  | TCP      | Health check (if enabled; bind loopback or a private interface)   |
 
 Outbound: Unrestricted UDP for QUIC connections to peers.
 
@@ -636,6 +679,8 @@ The node reads the file once, at startup, so restart it after an edit.
 
 #### Rolling back to an older binary
 
+A node that has started a tndb release (the consensus DB under `consensus-db/tndb`) cannot roll back to an MDBX release such as `v0.15.0-adiri`: the move from MDBX is one-way and one-time, and the older binary would start with no record of this validator's votes and proposals. See [Upgrade and rollback](../../docs/src/getting-started/validator-operations.md#release-and-network-update-process). The rest of this section applies to a node that has not yet started a tndb release.
+
 Binaries from before sub-second timestamps, such as `v0.15.0-adiri`, read this field as a whole number of seconds and reject a string.
 A `network-config` holding a humantime value (every datadir a newer binary created, and any file edited to a value such as `250ms`) fails to parse on an older binary, and that binary does not start.
 Before rolling back, do one of these:
@@ -693,10 +738,10 @@ Traces are exported every 30 seconds. Only spans with targets prefixed `telcoin`
 Enable a TCP health check for load balancers and monitoring:
 
 ```bash
-telcoin-network node --healthcheck 8080
+telcoin-network node --healthcheck 127.0.0.1:8080
 ```
 
-The endpoint binds to `0.0.0.0` on the specified port and serves three HTTP routes before closing each connection:
+A bare port binds `127.0.0.1`; a socket address binds that interface; `0.0.0.0:<port>` must be written out to listen on every interface. Startup logs `operator listener bound` with the address and its reach. The endpoint serves three HTTP routes before closing each connection:
 
 | Request path | Response | Meaning |
 | --- | --- | --- |
@@ -707,7 +752,16 @@ The endpoint binds to `0.0.0.0` on the specified port and serves three HTTP rout
 Network reachability is sampled every five seconds with bounded probes and served from a cache; it can recover after peers become reachable without restarting the node.
 It does not certify consensus or synchronization readiness, and is separate from transaction acceptance.
 
-Warning: This endpoint accepts connections from any source, exposes established-peer counts, and has no connection limits or rate limiting. Place it behind a firewall and do not expose it to the public internet.
+Warning: This endpoint has no connection limits or rate limiting and exposes established-peer counts. Keep the bind private (loopback or an operator-selected interface); a firewall is defense in depth.
+
+Migration from the port-only flag:
+
+| Before | After |
+| --- | --- |
+| `--healthcheck 8080` or `HEALTHCHECK_TCP_PORT=8080` bound `0.0.0.0:8080` | Still accepted; binds `127.0.0.1:8080` |
+| Probes from another host or the kubelet reached the wildcard bind | Refused; write `--healthcheck 0.0.0.0:8080` or the node's private address |
+
+See [Private observability listeners](../../docs/src/getting-started/observability-listeners.md) for the full migration table and deployment examples.
 
 ### Log verbosity
 
@@ -790,6 +844,8 @@ docker compose up
 ```
 
 Validators are accessible on host ports 8545-8542 (mapped from container port 8545).
+
+Health and metrics bind each validator's compose-network address (`10.10.0.2N:8080`, `10.10.0.2N:9101`) and are not published to the host. `compose.observability.yaml` adds a Prometheus scraper on that network; see [Private observability listeners](../../docs/src/getting-started/observability-listeners.md).
 
 ## Staking registration
 
@@ -892,6 +948,7 @@ chmod 600 /var/lib/telcoin/node-keys/*
 
 ### Passphrase management
 
+- systemd: Use `--bls-passphrase-source credential` with `LoadCredentialEncrypted=` (see [Running under systemd](#running-under-systemd)).
 - Production: Use `--bls-passphrase-source env` with a secrets manager that injects `TN_BLS_PASSPHRASE` into the process environment.
 - Interactive: Use `--bls-passphrase-source ask` for manual startup (requires a foreground TTY).
 - CI/automated: Use `--bls-passphrase-source stdin` to pipe the passphrase from a secure source.
@@ -900,8 +957,8 @@ chmod 600 /var/lib/telcoin/node-keys/*
 ### Network security
 
 - RPC endpoints: Bind to `127.0.0.1` (the default) unless you need external access. If exposing RPC, use a reverse proxy with authentication and rate limiting. The endpoint a validator advertises is the exception: observers call it without credentials, so serve it over HTTPS with rate limiting only (see [Advertising a JSON-RPC endpoint](#advertising-a-json-rpc-endpoint)).
-- Health check: The `--healthcheck` endpoint has no rate limiting (see [Health check endpoint](#health-check-endpoint)). Keep it behind a firewall.
-- Metrics: Restrict Prometheus metrics to your monitoring infrastructure. Do not expose port 9101 publicly.
+- Health check: Bind `--healthcheck` to loopback or a private interface (`--healthcheck 127.0.0.1:8080`); the endpoint has no rate limiting (see [Health check endpoint](#health-check-endpoint)).
+- Metrics: Bind `--metrics` to loopback or a private interface and restrict it to your monitoring infrastructure. Never publish port 9101 on a public interface.
 - P2P ports: the primary and worker UDP ports from `node-info.yaml` (49590 and 49594 by convention) must be reachable by other validators. All other ports should be firewalled.
 
 ### Proof of possession

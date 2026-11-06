@@ -69,13 +69,13 @@ use alloy::{
 use futures::{future::OptionFuture, StreamExt};
 use rand::{seq::SliceRandom as _, Rng};
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashSet},
     net::{Ipv4Addr, Ipv6Addr},
     num::NonZeroU64,
     sync::{Arc, Mutex},
     time::Duration,
 };
-use tn_types::{BlsPublicKey, RpcInfo, TaskSpawner, TxnForwarder};
+use tn_types::{BlsPublicKey, RpcInfo, TaskSpawner, TxnForwarder, WorkerId};
 use tokio::{
     sync::{OwnedSemaphorePermit, Semaphore},
     time::{timeout, Instant},
@@ -418,6 +418,8 @@ fn check_public_domain(name: &str) -> Result<(), RefusedTarget> {
 /// Per-endpoint state the forwarder keeps across batch seals, behind one lock.
 #[derive(Default)]
 struct EndpointCache {
+    /// Latest observer snapshot, bounded by current committee membership.
+    coverage: Option<SubmitCoverage>,
     /// HTTP providers cached per advertised endpoint so consecutive batch seals reuse the
     /// underlying connection pool instead of paying a fresh TCP+TLS handshake per validator
     /// per seal. Entries for endpoints that are no longer advertised are evicted on each
@@ -438,6 +440,53 @@ struct EndpointCache {
     /// endpoint leaves the advertisement set, whichever comes first. Bounded the same way as
     /// `providers`: entries for endpoints no longer advertised are evicted on each forward.
     unreachable: BTreeMap<String, Instant>,
+}
+
+/// Current committee coverage derived from the same providers admission uses.
+struct SubmitCoverage {
+    /// Configured worker swarm, never a peer or endpoint label.
+    worker: WorkerId,
+    /// Current members, including unresolved identities and missing advertisements.
+    members: HashSet<BlsPublicKey>,
+    /// Policy-admitted endpoints, grouped so each current member counts at most once.
+    endpoints: BTreeMap<BlsPublicKey, BTreeSet<String>>,
+}
+
+impl EndpointCache {
+    /// Publish member coverage after admission, demotion, or recovery changes.
+    fn publish_coverage(&self) {
+        self.coverage.iter().for_each(|coverage| {
+            let usable = coverage
+                .endpoints
+                .iter()
+                .filter(|(key, endpoints)| {
+                    coverage.members.contains(key)
+                        && endpoints.iter().any(|endpoint| {
+                            self.providers.contains_key(endpoint)
+                                && !self.unreachable.contains_key(endpoint)
+                        })
+                })
+                .count();
+            let network = format!("worker-{}", coverage.worker);
+            let count = |value| u32::try_from(value).map_or(f64::from(u32::MAX), f64::from);
+            metrics::gauge!("tn_worker_submit_expected_members", "network" => network.clone())
+                .set(count(coverage.members.len()));
+            metrics::gauge!("tn_worker_submit_usable_members", "network" => network)
+                .set(count(usable));
+        });
+    }
+
+    /// Demote an endpoint in admission and coverage at the transport failure itself.
+    fn demote_endpoint(&mut self, endpoint: &str) {
+        self.unreachable.insert(endpoint.to_owned(), Instant::now());
+        self.publish_coverage();
+    }
+
+    /// Lift a transport demotion in admission and coverage after a successful delivery.
+    fn recover_endpoint(&mut self, endpoint: &str) {
+        self.unreachable.remove(endpoint);
+        self.publish_coverage();
+    }
 }
 
 /// Forwards observer transactions to validators over their advertised JSON-RPC endpoints.
@@ -471,6 +520,57 @@ impl std::fmt::Debug for WorkerRpcForwarder {
 }
 
 impl WorkerRpcForwarder {
+    /// Refresh observer coverage using an atomic network membership/advertisement snapshot.
+    /// Learned records retain the existing committee-window lifetime. Usability additionally
+    /// requires this consumer's URL policy and demotion checks, without probing remote servers.
+    /// `advertisements` supplies the complete consumer set; `rpcs` supplies fresh candidates.
+    pub fn observe_submit_coverage(
+        &self,
+        worker: WorkerId,
+        members: &HashSet<BlsPublicKey>,
+        rpcs: &[(BlsPublicKey, RpcInfo)],
+        advertisements: &[(BlsPublicKey, RpcInfo)],
+    ) {
+        let current_rpcs: Vec<_> =
+            rpcs.iter().filter(|(key, _)| members.contains(key)).cloned().collect();
+        let current_advertisements: Vec<_> =
+            advertisements.iter().filter(|(key, _)| members.contains(key)).cloned().collect();
+        // Preserve the exact advertisement lifecycle used by forwarding. A record becoming
+        // ineligible for coverage must not erase an endpoint's admission cooldown.
+        let _ = self.cached_providers(&current_advertisements);
+        let mut cache = self.cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        cache.coverage = Some(SubmitCoverage {
+            worker,
+            members: members.clone(),
+            endpoints: current_rpcs
+                .iter()
+                .filter_map(|(key, rpc)| {
+                    let endpoint = rpc.http.to_string();
+                    cache.providers.contains_key(&endpoint).then_some((*key, endpoint))
+                })
+                .fold(BTreeMap::<_, BTreeSet<_>>::new(), |mut endpoints, (key, endpoint)| {
+                    endpoints.entry(key).or_default().insert(endpoint);
+                    endpoints
+                }),
+        });
+        cache.publish_coverage();
+        let observed = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0.0, |time| time.as_secs_f64());
+        metrics::gauge!("tn_worker_submit_observed_timestamp_seconds", "network" => format!("worker-{worker}"))
+            .set(observed);
+    }
+
+    /// Mark an unavailable observation conservatively, including startup and shutdown.
+    pub fn clear_submit_coverage(&self, worker: WorkerId) {
+        let mut cache = self.cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        cache.coverage = None;
+        let network = format!("worker-{worker}");
+        metrics::gauge!("tn_worker_submit_expected_members", "network" => network.clone()).set(0.0);
+        metrics::gauge!("tn_worker_submit_usable_members", "network" => network.clone()).set(0.0);
+        metrics::gauge!("tn_worker_submit_observed_timestamp_seconds", "network" => network)
+            .set(0.0);
+    }
     /// Set the inclusion window for this worker's retained transactions. The default is three
     /// executed consensus outputs. A zero-output speculative retransmission cannot be configured.
     pub fn with_retry_outputs(self, outputs: NonZeroU64) -> Self {
@@ -525,7 +625,7 @@ impl WorkerRpcForwarder {
         cache.unreachable.retain(|url, demoted| {
             advertised.contains(url) && demoted.elapsed() < UNREACHABLE_COOLDOWN
         });
-        validator_rpcs
+        let providers = validator_rpcs
             .iter()
             .filter_map(|(key, rpc)| {
                 let url = rpc.http.to_string();
@@ -577,7 +677,9 @@ impl WorkerRpcForwarder {
                     })
                     .map(|provider| (*key, (url, provider)))
             })
-            .collect()
+            .collect();
+        cache.publish_coverage();
+        providers
     }
 
     /// Spawn the background task that forwards one batch, holding `permit` for its lifetime.
@@ -1088,8 +1190,7 @@ async fn walk_fallback_chain(
                             cache
                                 .lock()
                                 .unwrap_or_else(|poisoned| poisoned.into_inner())
-                                .unreachable
-                                .remove(endpoint);
+                                .recover_endpoint(endpoint);
                         }
                         pending_verdict.iter().for_each(|verdict| match verdict {
                             HeldVerdict::Rejected { validator, reason } => {
@@ -1159,8 +1260,7 @@ async fn walk_fallback_chain(
                             cache
                                 .lock()
                                 .unwrap_or_else(|poisoned| poisoned.into_inner())
-                                .unreachable
-                                .insert(endpoint.clone(), Instant::now());
+                                .demote_endpoint(endpoint);
                         }
                         debug!(
                             target: "worker::forward",
@@ -1452,6 +1552,107 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tn_types::{BlsKeypair, TaskManager};
 
+    /// Coverage counts current members once and follows the admission cache through recovery.
+    #[tokio::test]
+    async fn committee_convergence_submit_coverage() -> eyre::Result<()> {
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let forwarder = test_forwarder();
+        let other_worker = test_forwarder();
+        let [member, missing, refused, departed] = [201, 202, 203, 204].map(test_key);
+        let members = HashSet::from([member, missing, refused]);
+        let rpc = test_rpc("https://validator.example.com:8545/")?;
+        let second = test_rpc("https://second.example.com:8545/")?;
+        let private = test_rpc("http://127.0.0.1:8545/")?;
+        // The debugging recorder drains every gauge; assertions share one state snapshot.
+        let observations = std::cell::RefCell::new(snapshotter.snapshot().into_vec());
+        let refresh = || *observations.borrow_mut() = snapshotter.snapshot().into_vec();
+        let gauge = |name: &str, network: &str| {
+            observations.borrow().iter().find_map(|(key, _, _, value)| {
+                (key.key().name() == name
+                    && key.key().labels().count() == 1
+                    && key
+                        .key()
+                        .labels()
+                        .all(|label| label.key() == "network" && label.value() == network))
+                .then_some(value)
+                .and_then(|value| match value {
+                    DebugValue::Gauge(value) => Some(value.0),
+                    DebugValue::Counter(_) | DebugValue::Histogram(_) => None,
+                })
+            })
+        };
+        metrics::with_local_recorder(&recorder, || {
+            forwarder.clear_submit_coverage(0);
+            refresh();
+            assert_eq!(gauge("tn_worker_submit_observed_timestamp_seconds", "worker-0"), Some(0.0));
+            // Cache an old URL, then omit it from the authoritative snapshot.
+            forwarder.cached_providers(&[(departed, rpc.clone())]);
+            forwarder.observe_submit_coverage(0, &members, &[], &[]);
+            refresh();
+            assert_eq!(gauge("tn_worker_submit_usable_members", "worker-0"), Some(0.0));
+            let advertised = [
+                (member, rpc.clone()),
+                (member, second.clone()),
+                (refused, private),
+                (departed, rpc.clone()),
+            ];
+            forwarder.observe_submit_coverage(0, &members, &advertised, &advertised);
+            refresh();
+            assert_eq!(gauge("tn_worker_submit_expected_members", "worker-0"), Some(3.0));
+            assert_eq!(gauge("tn_worker_submit_usable_members", "worker-0"), Some(1.0));
+            other_worker.observe_submit_coverage(1, &HashSet::from([missing]), &[], &[]);
+            refresh();
+            assert_eq!(gauge("tn_worker_submit_expected_members", "worker-1"), Some(1.0));
+            assert_eq!(gauge("tn_worker_submit_usable_members", "worker-1"), Some(0.0));
+            forwarder
+                .cache
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .demote_endpoint(second.http.as_str());
+            refresh();
+            assert_eq!(gauge("tn_worker_submit_usable_members", "worker-0"), Some(1.0));
+            // A refresh while demoted must retain enough consumer state to observe recovery.
+            let advertised = [(member, second.clone())];
+            forwarder.observe_submit_coverage(0, &members, &advertised, &advertised);
+            refresh();
+            assert_eq!(gauge("tn_worker_submit_usable_members", "worker-0"), Some(0.0));
+            // Losing record freshness must not retire an endpoint's advertised cooldown.
+            forwarder.observe_submit_coverage(0, &members, &[], &advertised);
+            assert!(forwarder.cached_providers(&advertised).is_empty());
+            forwarder.observe_submit_coverage(0, &members, &advertised, &advertised);
+            refresh();
+            assert_eq!(gauge("tn_worker_submit_usable_members", "worker-0"), Some(0.0));
+            forwarder
+                .cache
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .recover_endpoint(second.http.as_str());
+            refresh();
+            assert_eq!(gauge("tn_worker_submit_usable_members", "worker-0"), Some(1.0));
+            let advertised = [(member, rpc.clone()), (missing, rpc.clone()), (refused, rpc)];
+            forwarder.observe_submit_coverage(0, &members, &advertised, &advertised);
+            refresh();
+            assert_eq!(gauge("tn_worker_submit_usable_members", "worker-0"), Some(3.0));
+            // Rotation removes departed identities even if their URL is supplied again.
+            let advertised = [(member, second)];
+            forwarder.observe_submit_coverage(
+                0,
+                &HashSet::from([missing]),
+                &advertised,
+                &advertised,
+            );
+            refresh();
+            assert_eq!(gauge("tn_worker_submit_expected_members", "worker-0"), Some(1.0));
+            assert_eq!(gauge("tn_worker_submit_usable_members", "worker-0"), Some(0.0));
+            forwarder.clear_submit_coverage(0);
+            refresh();
+            assert_eq!(gauge("tn_worker_submit_expected_members", "worker-0"), Some(0.0));
+            assert_eq!(gauge("tn_worker_submit_observed_timestamp_seconds", "worker-0"), Some(0.0));
+        });
+        Ok(())
+    }
+
     /// A reason at the cap passes through untouched.
     #[test]
     fn clamp_reason_keeps_short_reasons() {
@@ -1710,13 +1911,17 @@ mod tests {
     ///
     /// Every response closes its connection, so alloy re-dials per call and `hits` counts
     /// exactly the `eth_sendRawTransaction` attempts this validator's endpoint received.
-    fn scripted_endpoint(payload: &'static str, hits: Arc<AtomicUsize>) -> eyre::Result<String> {
+    fn scripted_endpoint(
+        payload: impl Into<String>,
+        hits: Arc<AtomicUsize>,
+    ) -> eyre::Result<String> {
+        let payload = payload.into();
         let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
         let addr = listener.local_addr()?;
         std::thread::spawn(move || {
             listener.incoming().map_while(Result::ok).for_each(|stream| {
                 hits.fetch_add(1, Ordering::SeqCst);
-                let _ = serve_one(stream, payload);
+                let _ = serve_one(stream, &payload);
             });
         });
         Ok(format!("http://{addr}"))
@@ -2223,6 +2428,48 @@ mod tests {
         .await;
 
         assert!(matches!(outcome, ForwardOutcome::Delivered(_)));
+        Ok(())
+    }
+
+    /// Multiple inactive refusals are endpoint-local, so an active fallback still receives the tx.
+    #[tokio::test]
+    async fn inactive_validators_do_not_stop_the_fallback_chain() -> eyre::Result<()> {
+        let error = crate::rpc_fee_cap::ensure_can_submit(tn_types::NodeMode::CvvInactive)
+            .err()
+            .ok_or_else(|| eyre::eyre!("inactive admission must refuse the transaction"))?;
+        // Serialize the production refusal rather than duplicating its code or message.
+        let payload = format!(
+            r#"{{"jsonrpc":"2.0","id":__ID__,"error":{}}}"#,
+            serde_json::to_string(&error)?,
+        );
+        let first_hits = Arc::new(AtomicUsize::new(0));
+        let second_hits = Arc::new(AtomicUsize::new(0));
+        let active_hits = Arc::new(AtomicUsize::new(0));
+        let endpoints = vec![
+            scripted_endpoint(payload.clone(), Arc::clone(&first_hits))?,
+            scripted_endpoint(payload, Arc::clone(&second_hits))?,
+            scripted_endpoint(DELIVERY_BODY, Arc::clone(&active_hits))?,
+        ];
+        let (keys, providers) = scripted_chain(&endpoints)?;
+        let held = Mutex::new(None);
+        let outcome = walk_fallback_chain(
+            &[0_u8; 32],
+            keys.iter().cloned(),
+            &providers,
+            &held,
+            &Mutex::new(BTreeSet::new()),
+            &Mutex::new(EndpointCache::default()),
+        )
+        .await;
+
+        assert!(matches!(outcome, ForwardOutcome::Delivered(_)), "unexpected outcome: {outcome:?}");
+        assert_eq!(first_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(second_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(active_hits.load(Ordering::SeqCst), 1);
+        assert!(matches!(
+            *held.lock().unwrap_or_else(|poisoned| poisoned.into_inner()),
+            Some(HeldVerdict::Delivered(_))
+        ));
         Ok(())
     }
 

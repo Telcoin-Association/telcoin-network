@@ -195,7 +195,7 @@ async fn test_static_fee_applied_at_epoch_boundary() -> eyre::Result<()> {
         epoch2.epoch_id
     );
 
-    guard.kill_all();
+    guard.finish();
     Ok(())
 }
 
@@ -327,7 +327,7 @@ async fn test_eip1559_fee_rises_at_epoch_boundaries() -> eyre::Result<()> {
          Check test_logs/basefee_eip1559/."
     );
 
-    guard.kill_all();
+    guard.finish();
     Ok(())
 }
 
@@ -502,7 +502,7 @@ async fn test_mid_epoch_restart_recovers_static_fee() -> eyre::Result<()> {
         kill_idx + 1
     );
 
-    guard.kill_all();
+    guard.finish();
     Ok(())
 }
 
@@ -841,7 +841,7 @@ async fn test_boundary_kill_restart_recovers_next_epoch_fee() -> eyre::Result<()
         local_snap.epoch_id
     );
 
-    guard.kill_all();
+    guard.finish();
     Ok(())
 }
 
@@ -1009,6 +1009,6 @@ fn wait_for_block_fee(node: &str, block_number: u64, max_secs: u64) -> eyre::Res
         if std::time::Instant::now() >= deadline {
             return Ok(None);
         }
-        std::thread::sleep(Duration::from_secs(1));
+        std::thread::sleep(Duration::from_millis(50));
     }
 }

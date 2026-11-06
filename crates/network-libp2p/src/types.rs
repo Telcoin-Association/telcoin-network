@@ -1,7 +1,8 @@
 //! Constants and trait implementations for network compatibility.
 
 use crate::{
-    codec::TNMessage, error::NetworkError, peers::Penalty, GossipMessage, PeerExchangeMap,
+    codec::TNMessage, error::NetworkError, peers::Penalty, serve_permits::ServePermits,
+    AdmissionStatus, CommitteeUpdate, GossipMessage, PeerExchangeMap,
 };
 pub use libp2p::gossipsub::MessageId;
 use libp2p::{
@@ -19,6 +20,47 @@ use tokio::sync::{mpsc, oneshot};
 
 /// The result for network operations.
 pub type NetworkResult<T> = Result<T, NetworkError>;
+
+/// One atomic view of current membership and its learned submit advertisements.
+///
+/// Membership includes unresolved identities. Coverage candidates exclude configuration
+/// stubs and expired store rows. The complete consumer advertisement set is retained separately
+/// so observing freshness cannot retire an advertised endpoint's transport cooldown.
+#[derive(Clone, Debug)]
+pub struct CommitteeRpcSnapshot {
+    /// Current committee identities from authoritative epoch state.
+    members: HashSet<BlsPublicKey>,
+    /// Learned RPC advertisements belonging to these members.
+    rpcs: Vec<(BlsPublicKey, RpcInfo)>,
+    /// Complete current advertisements used by forwarding, including cached records.
+    advertisements: Vec<(BlsPublicKey, RpcInfo)>,
+}
+
+impl CommitteeRpcSnapshot {
+    /// Construct a snapshot on the swarm loop, without an intervening committee update.
+    pub(crate) fn new(
+        members: HashSet<BlsPublicKey>,
+        rpcs: Vec<(BlsPublicKey, RpcInfo)>,
+        advertisements: Vec<(BlsPublicKey, RpcInfo)>,
+    ) -> Self {
+        Self { members, rpcs, advertisements }
+    }
+
+    /// Current identities, including members without an RPC advertisement.
+    pub fn members(&self) -> &HashSet<BlsPublicKey> {
+        &self.members
+    }
+
+    /// Fresh verified coverage candidates; callers must still apply endpoint admission policy.
+    pub fn rpcs(&self) -> &[(BlsPublicKey, RpcInfo)] {
+        &self.rpcs
+    }
+
+    /// Complete advertisement set, matching the forwarding consumer's cache lifecycle.
+    pub fn advertisements(&self) -> &[(BlsPublicKey, RpcInfo)] {
+        &self.advertisements
+    }
+}
 
 /// Helper trait to cast lib-specific results into RPC messages.
 pub trait IntoResponse<M> {
@@ -278,6 +320,13 @@ where
         /// Reply for connection outcome.
         reply: oneshot::Sender<NetworkResult<()>>,
     },
+    /// Install process-lifetime trusted hub connections in this swarm.
+    AddTrustedPeers {
+        /// Validated operator-provisioned identities and address hints for this swarm only.
+        peers: BTreeMap<BlsPublicKey, P2pNode>,
+        /// Acknowledge installation independently of remote availability.
+        reply: oneshot::Sender<NetworkResult<()>>,
+    },
     /// Seed fixed launch bindings without granting committee membership.
     SeedCommitteePeers {
         /// This swarm's operator-owned BLS/network/address bindings.
@@ -387,6 +436,14 @@ where
         /// Reply to caller.
         reply: oneshot::Sender<Vec<PeerId>>,
     },
+    /// Inspect a signed identity binding when waiting for authentication in transport tests.
+    #[cfg(test)]
+    VerifiedPeerBls {
+        /// Transport identity whose signed binding is required.
+        peer: PeerId,
+        /// Reply to caller, excluding unverified configuration hints.
+        reply: oneshot::Sender<Option<BlsPublicKey>>,
+    },
     /// Number of established peers available to `SendRequestAny`.
     EstablishedPeerCount {
         /// Reply to caller, excluding pending dials.
@@ -445,6 +502,30 @@ where
         /// The next epoch committee.
         next: HashSet<BlsPublicKey>,
     },
+    /// Tell the gossip reject path where the epoch this node runs stands relative to the live
+    /// network. Sent at every epoch entry, before the topic allowlists of that epoch.
+    SetEpochPosition {
+        /// Live tip or historical replay.
+        position: EpochPosition,
+    },
+    /// Set or renew a complete authoritative admission window at an epoch revision.
+    UpdateAdmissionCommittees {
+        /// Epoch-start publication or lease renewal.
+        update: CommitteeUpdate,
+        /// Epoch owning the immutable committee window.
+        epoch: u64,
+        /// Previous committee.
+        previous: HashSet<BlsPublicKey>,
+        /// Current committee.
+        current: HashSet<BlsPublicKey>,
+        /// Next committee.
+        next: HashSet<BlsPublicKey>,
+    },
+    /// Observe admission inputs without conflating records, connections, and consensus readiness.
+    AdmissionStatus {
+        /// Admission observations from this handle's swarm.
+        reply: oneshot::Sender<AdmissionStatus>,
+    },
     /// Pre-dial recovery: forgive bans for a committee so it can be dialed, without mutating the
     /// committee slots.
     PrepareCommitteeDial {
@@ -480,6 +561,11 @@ where
     GetAllValidatorRpcs {
         /// The reply to caller.
         reply: oneshot::Sender<Vec<(BlsPublicKey, RpcInfo)>>,
+    },
+    /// Atomically read current membership and learned RPC advertisements.
+    GetCommitteeRpcSnapshot {
+        /// The reply to caller.
+        reply: oneshot::Sender<CommitteeRpcSnapshot>,
     },
     /// Read a single record from the local kad store by BLS key.
     ///
@@ -518,6 +604,11 @@ where
 {
     /// Sending channel to the network to process commands.
     sender: mpsc::Sender<NetworkCommand<Req, Res>>,
+    /// The application's per-class serve permits for this swarm's inbound requests.
+    ///
+    /// A handle that the swarm built shares the swarm's pools. Any other handle carries
+    /// unmetered pools, so it admits every request and registers no series.
+    serve_permits: ServePermits,
 }
 
 impl<Req, Res> NetworkHandle<Req, Res>
@@ -525,15 +616,26 @@ where
     Req: TNMessage,
     Res: TNMessage,
 {
-    /// Create a new instance of Self.
+    /// Create a new instance of Self with unmetered serve permits.
     pub fn new(sender: mpsc::Sender<NetworkCommand<Req, Res>>) -> Self {
-        Self { sender }
+        Self { sender, serve_permits: ServePermits::unmetered() }
     }
 
     /// Create a handle to no where for test setup.
     pub fn new_for_test() -> Self {
         let (sender, _) = mpsc::channel(100);
-        Self { sender }
+        Self::new(sender)
+    }
+
+    /// Return this handle with the swarm's serve permits in place of the unmetered pools.
+    #[must_use]
+    pub fn with_serve_permits(self, serve_permits: ServePermits) -> Self {
+        Self { serve_permits, ..self }
+    }
+
+    /// The per-class serve permits that request handlers offer inbound requests to.
+    pub fn serve_permits(&self) -> &ServePermits {
+        &self.serve_permits
     }
 
     /// Start swarm listening on the given address. Returns an error if the address is not
@@ -556,7 +658,7 @@ where
 
     /// Add explicit "trusted" peer.
     ///
-    /// These peers are considered "trusted" and do not receive penalties.
+    /// These peers retain operator privileges and ignore load penalties. Protocol penalties apply.
     /// This does not unban ips and should only be called during initialization.
     pub async fn add_trusted_peer_and_dial(
         &self,
@@ -592,6 +694,19 @@ where
     ) -> NetworkResult<()> {
         let (reply, rx) = oneshot::channel();
         self.sender.send(NetworkCommand::AddBootstrapPeers { peers, reply }).await?;
+        rx.await?
+    }
+
+    /// Install hubs and maintain their connections until the network shuts down.
+    ///
+    /// Acknowledges registration immediately, including when a hub is offline. The swarm owns
+    /// one retry timer and one schedule per hub; duplicate installation preserves existing bans.
+    pub async fn add_trusted_peers(
+        &self,
+        peers: BTreeMap<BlsPublicKey, P2pNode>,
+    ) -> NetworkResult<()> {
+        let (reply, rx) = oneshot::channel();
+        self.sender.send(NetworkCommand::AddTrustedPeers { peers, reply }).await?;
         rx.await?
     }
 
@@ -654,7 +769,36 @@ where
         Ok(was_subscribed.await?)
     }
 
+    /// The free and total slots of the command channel.
+    ///
+    /// `test_full_command_channel_publish_waits_then_resolves` reads it to see when the channel
+    /// is full.
+    #[cfg(test)]
+    pub(crate) fn command_channel_slots(&self) -> (usize, usize) {
+        (self.sender.capacity(), self.sender.max_capacity())
+    }
+
     /// Publish a message on a certain topic.
+    ///
+    /// The swarm task never waits for a peer during a publish (see
+    /// `ConsensusNetwork::process_command`). The caller can wait at two points only:
+    ///
+    /// - The send on the command channel waits while the channel holds its 100 commands. This
+    ///   occurs only when the swarm task is behind, and the swarm task drains the channel at its
+    ///   loop rate.
+    /// - The reply comes in the loop iteration that takes the command from the channel. It holds
+    ///   the gossipsub result, for example `PublishError::AllQueuesFull` when the send queue of
+    ///   every recipient peer is full. The swarm task does not retry a failed publish.
+    ///
+    /// The callers that wait here are the certifier (certificates), the executor subscriber
+    /// (consensus output), the epoch-vote manager (epoch votes) and the worker (batch digests).
+    /// None of them runs on the swarm task, so a wait delays that caller and never the swarm
+    /// task. The wait has no timeout, and the send is not `try_send`, by decision (issue #1656):
+    /// both would drop a message during a short burst that the swarm task drains, and neither
+    /// helps when the swarm task stalls, because every other [`NetworkHandle`] call uses the
+    /// same channel. A timeout on the reply also does not cancel a publish that is already in
+    /// the channel. `test_full_command_channel_publish_waits_then_resolves` records what a
+    /// caller sees when the channel is full.
     pub async fn publish(&self, topic: String, msg: Vec<u8>) -> NetworkResult<MessageId> {
         let (reply, published) = oneshot::channel();
         self.sender.send(NetworkCommand::Publish { topic, msg, reply }).await?;
@@ -682,6 +826,10 @@ where
     }
 
     /// Retrieve a collection of connected peers.
+    ///
+    /// Members of the current committee come first. Within each group the order is the peer
+    /// manager's order, so a caller that tries peers in turn reaches committee members before
+    /// other peers.
     pub async fn connected_peers(&self) -> NetworkResult<Vec<BlsPublicKey>> {
         let (reply, peers) = oneshot::channel();
         self.sender.send(NetworkCommand::ConnectedPeers { reply }).await?;
@@ -766,6 +914,65 @@ where
         Ok(())
     }
 
+    /// Tell the swarm whether this node runs the live epoch or replays a historical one.
+    ///
+    /// The gossip reject path charges an unauthorized author only at [`EpochPosition::Live`].
+    pub async fn set_epoch_position(&self, position: EpochPosition) -> NetworkResult<()> {
+        self.sender.send(NetworkCommand::SetEpochPosition { position }).await?;
+        Ok(())
+    }
+
+    /// Publish the authoritative admission window at epoch start. An accepted update always
+    /// applies the committee update, also on a same-epoch re-entry. Older or contradictory
+    /// revisions trigger fallback without replacing accepted membership.
+    pub async fn update_committees_at(
+        &self,
+        epoch: u64,
+        previous: HashSet<BlsPublicKey>,
+        current: HashSet<BlsPublicKey>,
+        next: HashSet<BlsPublicKey>,
+    ) -> NetworkResult<()> {
+        self.sender
+            .send(NetworkCommand::UpdateAdmissionCommittees {
+                update: CommitteeUpdate::EpochStart,
+                epoch,
+                previous,
+                current,
+                next,
+            })
+            .await?;
+        Ok(())
+    }
+
+    /// Renew the lease of the accepted admission window. An identical window only renews the
+    /// lease. Older or contradictory revisions trigger fallback without replacing membership.
+    pub async fn renew_committees_at(
+        &self,
+        epoch: u64,
+        previous: HashSet<BlsPublicKey>,
+        current: HashSet<BlsPublicKey>,
+        next: HashSet<BlsPublicKey>,
+    ) -> NetworkResult<()> {
+        self.sender
+            .send(NetworkCommand::UpdateAdmissionCommittees {
+                update: CommitteeUpdate::Renewal,
+                epoch,
+                previous,
+                current,
+                next,
+            })
+            .await?;
+        Ok(())
+    }
+
+    /// Observe this swarm's policy, resolved-record quorum, and connected current peers.
+    /// Consensus readiness remains a separate node-level observation.
+    pub async fn admission_status(&self) -> NetworkResult<AdmissionStatus> {
+        let (reply, res) = oneshot::channel();
+        self.sender.send(NetworkCommand::AdmissionStatus { reply }).await?;
+        res.await.map_err(Into::into)
+    }
+
     /// Forgive bans for a committee so it can be dialed, without mutating the committee slots.
     ///
     /// Used by the deadlock-breaker pre-dial path; the real slot update follows via
@@ -828,6 +1035,14 @@ where
     pub async fn get_all_validator_rpcs(&self) -> NetworkResult<Vec<(BlsPublicKey, RpcInfo)>> {
         let (reply, rx) = oneshot::channel();
         self.sender.send(NetworkCommand::GetAllValidatorRpcs { reply }).await?;
+        rx.await.map_err(Into::into)
+    }
+
+    /// Read current membership and learned RPC advertisements on the same swarm iteration.
+    /// Polling also retries discovery for unresolved members, including configuration stubs.
+    pub async fn get_committee_rpc_snapshot(&self) -> NetworkResult<CommitteeRpcSnapshot> {
+        let (reply, rx) = oneshot::channel();
+        self.sender.send(NetworkCommand::GetCommitteeRpcSnapshot { reply }).await?;
         rx.await.map_err(Into::into)
     }
 }
@@ -924,6 +1139,16 @@ where
         peers.await.map_err(Into::into)
     }
 
+    /// Inspect the verified BLS binding without treating a configuration hint as proof.
+    pub(crate) async fn verified_peer_bls(
+        &self,
+        peer: PeerId,
+    ) -> NetworkResult<Option<BlsPublicKey>> {
+        let (reply, binding) = oneshot::channel();
+        self.sender.send(NetworkCommand::VerifiedPeerBls { peer, reply }).await?;
+        binding.await.map_err(Into::into)
+    }
+
     /// Send a request to a peer by peer id.
     ///
     /// Returns a handle for the caller to await the peer's response.
@@ -952,4 +1177,20 @@ where
         self.sender.send(NetworkCommand::KadStoreGet { key, reply }).await?;
         rx.await.map_err(Into::into)
     }
+}
+
+/// Where the epoch this node runs stands relative to the live network.
+///
+/// The gossip reject path consults it before it charges an unauthorized author. A node that
+/// replays a historical epoch holds the publisher allowlists and committee slots of that epoch,
+/// so a live committee member outside its window is not misbehaving when its gossip arrives
+/// here: the message is still dropped, but the author is not charged.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum EpochPosition {
+    /// The node runs the latest epoch it knows; an unauthorized author is charged.
+    #[default]
+    Live,
+    /// The node replays an epoch its committee already closed; an unauthorized author is dropped
+    /// without a penalty.
+    Historical,
 }

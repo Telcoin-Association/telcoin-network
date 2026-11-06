@@ -87,6 +87,9 @@ async fn imported_manager(
     let mut record = previous.clone();
     record.final_consensus = ConsensusNumHash::new(6, parent);
     source.epochs().save_record(record.clone()).await?;
+    // An import of the live epoch installs in place only when the record it carries is the
+    // epoch's stored record, so store it on the manager's chain first.
+    manager.consensus_chain.epochs().save_record(record.clone()).await?;
     let (stream, len) = source.get_epoch_stream(0).await?;
     manager
         .consensus_chain

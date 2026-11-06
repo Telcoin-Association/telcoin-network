@@ -26,6 +26,8 @@
 //! - `metrics` — Prometheus metrics for the execution environment.
 //! - `payload` — `TNPayload`, the per-block data derived from consensus output.
 //! - `rpc_server_args` — the subset of reth RPC server args TN exposes.
+//! - `rpc_tx_forward` — `--forward-txs`: relays raw transaction submissions to operator-configured
+//!   validator RPC endpoints instead of the local pool.
 //! - `snapshot` — export/restore of reth's plain EVM state.
 //! - `system_calls` — solidity interfaces and epoch-boundary system calls (ConsensusRegistry,
 //!   Issuance, worker configs).
@@ -130,12 +132,16 @@ mod evm;
 pub mod forward;
 mod forward_pending;
 mod metrics;
+mod rpc_bundle;
 mod rpc_call;
+mod rpc_debug;
 mod rpc_fee_cap;
+pub use rpc_fee_cap::node_mode_accepts_submissions;
 mod rpc_fee_history;
 mod rpc_fill_transaction;
 mod rpc_gas_price;
 pub mod rpc_server_args;
+mod rpc_tx_forward;
 pub mod snapshot;
 pub mod system_calls;
 mod types;
@@ -155,6 +161,7 @@ pub use evm::{
 };
 pub use forward::{ForwardTargetPolicy, WorkerRpcForwarder};
 pub use metrics::report_db_metrics;
+pub use rpc_tx_forward::{ForwardTarget, ForwardTargets, TxForwardConfig};
 pub use types::*;
 
 #[cfg(any(feature = "test-utils", test))]

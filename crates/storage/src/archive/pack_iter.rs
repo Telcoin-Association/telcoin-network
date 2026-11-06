@@ -12,6 +12,7 @@ use tn_types::try_decode;
 use tokio::io::{AsyncRead, AsyncReadExt as _};
 
 use crate::archive::{
+    crc::{crc32, crc32_update},
     error::{fetch::FetchError, load_header::LoadHeaderError},
     pack::{DataHeader, PackCompression, DATA_HEADER_BYTES},
 };
@@ -26,7 +27,33 @@ fn zstd_decode_error(e: io::Error) -> FetchError {
     FetchError::DeserializeValue(format!("zstd: {e}"))
 }
 
-/// Iterate over a Db's key, value pairs in insert order.
+/// Decompress a zstd record `compressed` payload into `out`, enforcing the in-memory
+/// `MAX_RECORD_SIZE` cap on the decompressed size, so an oversized record is reported as
+/// `RequestedDecompressSizeTooLarge`. Shared by every decompression site: the iterators (sync and
+/// async), which reuse their buffer, and the `&self` `fetch` path (`PackInner::read_record_into`),
+/// which decompresses into a fresh buffer and then decodes the slice. Clears `out` first and
+/// returns a borrow of it.
+///
+/// The record's frame passed its CRC before this runs, so a payload zstd rejects is what the writer
+/// produced, not a read failure: it is reported as a decode fault, never as `IO` (a peer stream's
+/// importer treats `IO` as a transport failure that says nothing about the bytes).
+pub(crate) fn decompress_checked<'a>(
+    compressed: &[u8],
+    out: &'a mut Vec<u8>,
+) -> Result<&'a [u8], FetchError> {
+    let mut decoder = zstd::stream::read::Decoder::new(compressed).map_err(zstd_decode_error)?;
+    decoder.window_log_max(24).map_err(zstd_decode_error)?;
+    out.clear();
+    // +1 lets us detect overflow vs. natural EOF
+    let mut limited = decoder.take(MAX_RECORD_SIZE as u64 + 1);
+    limited.read_to_end(out).map_err(zstd_decode_error)?;
+    if out.len() as u64 > MAX_RECORD_SIZE as u64 {
+        return Err(FetchError::RequestedDecompressSizeTooLarge(MAX_RECORD_SIZE));
+    }
+    Ok(out)
+}
+
+/// Iterate over a pack's records (values) in insert order.
 /// This iterator is "raw", it does not use any indexes just the data file.
 #[derive(Debug)]
 pub struct PackIter<V, R>
@@ -48,6 +75,8 @@ where
     end: u64,
     /// Absolute file offset of the next record to read, tracked so the scan can stop at `end`.
     pos: u64,
+    /// The largest record read (a longer one is refused, never allocated for).
+    max_record: u32,
 }
 
 impl<V, R> PackIter<V, R>
@@ -56,8 +85,7 @@ where
     R: Read + Seek,
 {
     /// Open the iterator using reader as a data source.
-    /// Produces an iterator over all the (key, values).  All and records
-    /// are returned in insert order.
+    /// Produces an iterator over all the records, in insert order.
     ///
     /// `end` is the logical data length (header + all complete records); the scan stops there
     /// instead of at physical EOF so mmap capacity padding is never decoded as a record.
@@ -78,7 +106,15 @@ where
             // `load_header` consumed exactly the fixed-size header, so the first record starts
             // here.
             pos: DATA_HEADER_BYTES as u64,
+            max_record: MAX_RECORD_SIZE,
         })
+    }
+
+    /// Read records up to `max` bytes instead of [`MAX_RECORD_SIZE`] (a pack opened with a larger
+    /// cap, see [`MmapFileOptions::max_record_size`](crate::archive::data_file::MmapFileOptions)).
+    pub(crate) fn with_max_record(mut self, max: u32) -> Self {
+        self.max_record = max;
+        self
     }
 
     /// Return the version of the underlying data.
@@ -104,11 +140,28 @@ where
         Ok(())
     }
 
-    /// Read the next record or return an error if an overflow bucket.
-    /// This expects the file cursor to be positioned at the records first byte.
-    ///
-    /// Stops at the logical `end` (returning `NotFound`) before reading past the data into any mmap
-    /// capacity padding; `pos` is advanced by the on-disk frame size of each record read.
+    /// Read the next record's payload without decoding it: CRC-checked and decompressed bytes,
+    /// borrowed until the next call. The raw counterpart of `next`, for byte logs written with
+    /// [`Pack::append_raw`](crate::archive::pack::Pack::append_raw). `None` at the logical end; an
+    /// `Err` is a torn or corrupt frame (see [`Self::logical_position`] for where to cut).
+    pub fn next_raw(&mut self) -> Option<Result<&[u8], FetchError>> {
+        match Self::read_frame(
+            &mut self.reader,
+            &mut self.buffer,
+            &mut self.decompress_buffer,
+            self.compression,
+            self.end,
+            &mut self.pos,
+            self.max_record,
+        ) {
+            Ok(payload) => Some(Ok(payload)),
+            Err(FetchError::NotFound) => None,
+            Err(err) => Some(Err(err)),
+        }
+    }
+
+    /// Read and decode the next record.
+    /// This expects the file cursor to be positioned at the record's first byte.
     fn read_record_file<R2: Read + Seek>(
         file: &mut R2,
         buffer: &mut Vec<u8>,
@@ -116,12 +169,41 @@ where
         compression: PackCompression,
         end: u64,
         pos: &mut u64,
+        max: u32,
     ) -> Result<V, FetchError> {
+        let payload =
+            Self::read_frame(file, buffer, decompress_buffer, compression, end, pos, max)?;
+        try_decode::<V>(payload).map_err(|e| FetchError::DeserializeValue(e.to_string()))
+    }
+
+    /// Read the next record's frame and return its CRC-checked (and decompressed) payload.
+    /// This expects the file cursor to be positioned at the record's first byte.
+    ///
+    /// Stops at the logical `end` (returning `NotFound`) before reading past the data into any mmap
+    /// capacity padding; `pos` is advanced by the on-disk frame size of each record read.
+    fn read_frame<'b, R2: Read + Seek>(
+        file: &mut R2,
+        buffer: &'b mut Vec<u8>,
+        decompress_buffer: &'b mut Vec<u8>,
+        compression: PackCompression,
+        end: u64,
+        pos: &mut u64,
+        max: u32,
+    ) -> Result<&'b [u8], FetchError> {
         // At (or past) the logical data end: stop cleanly rather than decode trailing padding.
         if *pos >= end {
             return Err(FetchError::NotFound);
         }
-        let mut crc32_hasher = crc32fast::Hasher::new();
+        #[cfg(test)]
+        if FAIL_READ_AT.with(|at| at.get() == Some(*pos))
+            && FAIL_READ_SKIP.with(|skip| skip.replace(skip.get().saturating_sub(1))) == 0
+        {
+            FAIL_READ_AT.with(|at| at.set(None));
+            if FAIL_READ_TORN.with(|torn| torn.replace(false)) {
+                return Err(FetchError::IO(io::ErrorKind::UnexpectedEof.into()));
+            }
+            return Err(FetchError::IO(io::Error::from_raw_os_error(5)));
+        }
         let mut val_size_buf = [0_u8; 4];
         if let Err(err) = file.read_exact(&mut val_size_buf) {
             // An EOF here should be caused by no more records although it is possible there
@@ -132,10 +214,9 @@ where
             }
             return Err(FetchError::IO(err));
         }
-        crc32_hasher.update(&val_size_buf);
         let val_size = u32::from_le_bytes(val_size_buf);
-        if val_size > MAX_RECORD_SIZE {
-            return Err(FetchError::RequestedSizeTooLarge(val_size, MAX_RECORD_SIZE));
+        if val_size > max {
+            return Err(FetchError::RequestedSizeTooLarge(val_size, max));
         }
         // On-disk frame: 4-byte size prefix + payload + 4-byte CRC. `checked_add` mirrors the
         // offset-arithmetic hardening in `MmapDataFile::write`; the `*pos >= end` guard above plus
@@ -158,8 +239,8 @@ where
         }
         buffer.resize(val_size as usize, 0);
         file.read_exact(buffer)?;
-        crc32_hasher.update(buffer);
-        let calc_crc32 = crc32_hasher.finalize();
+        // The record CRC covers `len | payload`.
+        let calc_crc32 = crc32_update(crc32(&val_size_buf), buffer);
         let mut buf_u32 = [0_u8; 4];
         file.read_exact(&mut buf_u32)?;
         *pos = frame_end;
@@ -167,26 +248,22 @@ where
         if calc_crc32 != read_crc32 {
             return Err(FetchError::CrcFailed);
         }
-        let buffer = match compression {
-            PackCompression::None => buffer,
-            PackCompression::ZStd => {
-                // The frame passed its CRC, so a payload zstd rejects is what the writer produced,
-                // not a read failure: report it as a decode fault, never as `IO` (a peer stream's
-                // importer treats `IO` as a transport failure that says nothing about the bytes).
-                let mut decoder =
-                    zstd::stream::read::Decoder::new(&buffer[..]).map_err(zstd_decode_error)?;
-                decoder.window_log_max(24).map_err(zstd_decode_error)?;
-                decompress_buffer.clear();
-                // +1 lets us detect overflow vs. natural EOF
-                let mut limited = decoder.take(MAX_RECORD_SIZE as u64 + 1);
-                limited.read_to_end(decompress_buffer).map_err(zstd_decode_error)?;
-                if decompress_buffer.len() as u64 > MAX_RECORD_SIZE as u64 {
-                    return Err(FetchError::RequestedDecompressSizeTooLarge(MAX_RECORD_SIZE));
-                }
-                decompress_buffer
-            }
-        };
-        try_decode::<V>(&buffer[..]).map_err(|e| FetchError::DeserializeValue(e.to_string()))
+        match compression {
+            PackCompression::None => Ok(&buffer[..]),
+            PackCompression::ZStd => decompress_checked(&buffer[..], decompress_buffer),
+        }
+    }
+}
+
+impl FetchError {
+    /// Is this a read the disk failed, as opposed to a frame that is short, runs past the end or
+    /// fails its checks? [`PackIter::read_frame`] defines the split: a tear (a frame past the
+    /// logical end, a short read) is an `IO` error of kind `UnexpectedEof`; any other `IO` error is
+    /// a disk failure; CRC, decompression and decode failures are not `IO` at all. A log walk must
+    /// stop on a read failure with an error, never take it for a torn tail: acked records may
+    /// follow it, and the bytes may read on a retry.
+    pub(crate) fn is_read_failure(&self) -> bool {
+        matches!(self, FetchError::IO(e) if e.kind() != io::ErrorKind::UnexpectedEof)
     }
 }
 
@@ -204,6 +281,7 @@ where
             self.compression,
             self.end,
             &mut self.pos,
+            self.max_record,
         ) {
             Ok(val) => Some(Ok(val)),
             Err(err) => match err {
@@ -214,7 +292,7 @@ where
     }
 }
 
-/// Async Iterate over a Db's key, value pairs in insert order.
+/// Async iteration over a pack's records (values) in insert order.
 /// This iterator is "raw", it does not use any indexes just the data file.
 ///
 /// Unlike [`PackIter`], this has **no logical-end bound** — it reads to reader EOF and stops only
@@ -243,8 +321,7 @@ where
     R: AsyncRead + Unpin,
 {
     /// Open the iterator using reader as a data source.
-    /// Produces an iterator over all the (key, values).  All and records
-    /// are returned in insert order.
+    /// Produces an iterator over all the records, in insert order.
     pub async fn open(
         mut reader: R,
         uid_idx: u64,
@@ -273,8 +350,7 @@ where
     }
 
     /// Open the iterator using reader as a data source.
-    /// Produces an iterator over all the (key, values).  All and records
-    /// are returned in insert order.
+    /// Produces an iterator over all the records, in insert order.
     /// This version only expects a chunk of records not a complete pack file (no header for
     /// instance).
     pub async fn open_partial(
@@ -297,15 +373,15 @@ where
         self.version
     }
 
-    /// Read the next record or return an error if an overflow bucket.
-    /// This expects the file cursor to be positioned at the records first byte.
-    async fn read_record_file(
-        file: &mut R,
-        buffer: &mut Vec<u8>,
-        decompress_buffer: &mut Vec<u8>,
-        compression: PackCompression,
-    ) -> Result<V, FetchError> {
-        let mut crc32_hasher = crc32fast::Hasher::new();
+    /// Return the compression of the underlying data.
+    pub fn compression(&self) -> PackCompression {
+        self.compression
+    }
+
+    /// Read the next record's frame, leaving its CRC-checked payload in `buffer` as stored
+    /// (compressed when the data is). A clean end of the reader at a record boundary is
+    /// `NotFound`.
+    async fn read_frame(file: &mut R, buffer: &mut Vec<u8>) -> Result<(), FetchError> {
         let mut val_size_buf = [0_u8; 4];
         if let Err(err) = file.read_exact(&mut val_size_buf).await {
             // An EOF here should be caused by no more records although it is possible there
@@ -316,58 +392,53 @@ where
             }
             return Err(FetchError::IO(err));
         }
-        crc32_hasher.update(&val_size_buf);
         let val_size = u32::from_le_bytes(val_size_buf);
         if val_size > MAX_RECORD_SIZE {
             return Err(FetchError::RequestedSizeTooLarge(val_size, MAX_RECORD_SIZE));
         }
         buffer.resize(val_size as usize, 0);
         file.read_exact(buffer).await?;
-        crc32_hasher.update(buffer);
-        let calc_crc32 = crc32_hasher.finalize();
+        // The record CRC covers `len | payload`.
+        let calc_crc32 = crc32_update(crc32(&val_size_buf), buffer);
         let mut buf_u32 = [0_u8; 4];
         file.read_exact(&mut buf_u32).await?;
         let read_crc32 = u32::from_le_bytes(buf_u32);
         if calc_crc32 != read_crc32 {
             return Err(FetchError::CrcFailed);
         }
-        let buffer = match compression {
-            PackCompression::None => buffer,
-            PackCompression::ZStd => {
-                // The frame passed its CRC, so a payload zstd rejects is what the writer produced,
-                // not a read failure: report it as a decode fault, never as `IO` (a peer stream's
-                // importer treats `IO` as a transport failure that says nothing about the bytes).
-                let mut decoder =
-                    zstd::stream::read::Decoder::new(&buffer[..]).map_err(zstd_decode_error)?;
-                decoder.window_log_max(24).map_err(zstd_decode_error)?;
-                decompress_buffer.clear();
-                // +1 lets us detect overflow vs. natural EOF
-                let mut limited = decoder.take(MAX_RECORD_SIZE as u64 + 1);
-                limited.read_to_end(decompress_buffer).map_err(zstd_decode_error)?;
-                if decompress_buffer.len() as u64 > MAX_RECORD_SIZE as u64 {
-                    return Err(FetchError::RequestedDecompressSizeTooLarge(MAX_RECORD_SIZE));
-                }
-                decompress_buffer
-            }
-        };
-        try_decode::<V>(&buffer[..]).map_err(|e| FetchError::DeserializeValue(e.to_string()))
+        Ok(())
     }
 
     /// Return the next V when available.
     pub async fn next(&mut self) -> Option<Result<V, FetchError>> {
-        match Self::read_record_file(
-            &mut self.reader,
-            &mut self.buffer,
-            &mut self.decompress_buffer,
-            self.compression,
-        )
-        .await
-        {
-            Ok(val) => Some(Ok(val)),
-            Err(err) => match err {
-                FetchError::NotFound => None,
-                _ => Some(Err(err)),
+        let decoded = match Self::read_frame(&mut self.reader, &mut self.buffer).await {
+            Ok(()) => match self.compression {
+                PackCompression::None => Ok(&self.buffer[..]),
+                PackCompression::ZStd => {
+                    decompress_checked(&self.buffer[..], &mut self.decompress_buffer)
+                }
             },
+            Err(err) => Err(err),
+        };
+        match decoded.and_then(|payload| {
+            try_decode::<V>(payload).map_err(|e| FetchError::DeserializeValue(e.to_string()))
+        }) {
+            Ok(val) => Some(Ok(val)),
+            Err(FetchError::NotFound) => None,
+            Err(err) => Some(Err(err)),
+        }
+    }
+
+    /// Return the next record's CRC-checked payload without decompressing or decoding it: the
+    /// bytes as stored, compressed when [`Self::compression`] says so (see
+    /// [`decompress_checked`]). `None` at a clean end. Lets a caller do a record's CPU work (the
+    /// decompress and the decode) elsewhere than where it reads the stream.
+    pub async fn next_frame(&mut self) -> Option<Result<Vec<u8>, FetchError>> {
+        let mut frame = Vec::new();
+        match Self::read_frame(&mut self.reader, &mut frame).await {
+            Ok(()) => Some(Ok(frame)),
+            Err(FetchError::NotFound) => None,
+            Err(err) => Some(Err(err)),
         }
     }
 
@@ -375,4 +446,17 @@ where
     pub fn into_reader(self) -> R {
         self.reader
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only: this thread's next read of a record frame starting at this position fails once,
+    /// as a disk read can (`EIO`).
+    pub(crate) static FAIL_READ_AT: std::cell::Cell<Option<u64>> =
+        const { std::cell::Cell::new(None) };
+    /// Test-only: how many reads at [`FAIL_READ_AT`] succeed before the one that fails (so a test
+    /// can fail a later pass over the same log).
+    pub(crate) static FAIL_READ_SKIP: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    /// Test-only: the injected failure is a short read (a torn frame), not `EIO`.
+    pub(crate) static FAIL_READ_TORN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }

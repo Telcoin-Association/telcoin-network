@@ -1,6 +1,6 @@
 //! Handle specific request types received from the network.
 
-use super::PrimaryResponse;
+use super::{PrimaryResponse, SyncServeOutcome};
 use crate::{
     error::{CertManagerError, PrimaryNetworkError, PrimaryNetworkResult},
     network::message::{PrimaryGossip, PrimaryRPCError},
@@ -36,11 +36,11 @@ use tracing::{debug, error, info, warn};
 /// Set to an arbitrary 10 seconds to read 16kb buffer.
 const SEND_STREAM_BUFFER_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Total timeout for serving a single consensus-output response over the sync protocol.
+/// Wall-clock cap on sending one consensus-output sync pack to a peer.
 ///
-/// A single output is small and bounded (unlike a whole epoch pack, whose serve is bounded by a
-/// throughput floor rather than a fixed wall-clock cap — see `send_sync_epoch_pack_over_stream`),
-/// so a fixed backstop is fine here: it caps the admission slot a drip-reading peer can hold.
+/// It bounds a single message, not a whole epoch pack, so it caps the admission slot a
+/// drip-reading peer can hold during one consensus-output serve. The public epoch-pack serve
+/// bound is `PUBLIC_EPOCH_PACK_SERVE_TIMEOUT` in the network module, which is its own constant.
 const SEND_SYNC_PACK_TIMEOUT: Duration = Duration::from_secs(200);
 
 /// Total timeout for serving a missing-certificates response over the sync protocol.
@@ -56,6 +56,16 @@ type AuthEquivocationMap = HashMap<
     AuthorityIdentifier,
     TokioMutex<Option<(Epoch, Round, HeaderDigest, Option<PrimaryResponse>)>>,
 >;
+
+/// The committee that may sign a `ConsensusResult` for one epoch, with the bound a certified
+/// epoch record puts on the result's consensus number. See issue #1771.
+struct ConsensusResultCommittee {
+    /// Keys whose signatures count towards the f+1 threshold.
+    keys: BTreeSet<BlsPublicKey>,
+    /// `final_consensus.number` of the certified epoch record for the epoch, when this node holds
+    /// one: no output of that epoch is numbered above it.
+    final_number: Option<u64>,
+}
 
 /// A pending consensus-result signature tally.
 ///
@@ -173,7 +183,9 @@ where
         // too far behind.
         let (exec_number, exec_epoch, exec_round) = self
             .consensus_bus
-            .last_consensus_block(&self.consensus_chain)
+            .with_last_consensus_block(&self.consensus_chain, |h| {
+                (h.number, h.sub_dag.leader_epoch(), h.sub_dag.leader_round())
+            })
             .await
             .inspect_err(|e| {
                 // A failed lookup is logged loudly but degrades to the same conservative
@@ -184,7 +196,6 @@ where
             })
             .ok()
             .flatten()
-            .map(|h| (h.number, h.sub_dag.leader_epoch(), h.sub_dag.leader_round()))
             .unwrap_or((0, 0, 0));
         // When empty outputs are skipped by execution, no new EVM block is produced.
         // In that case, rely on the most recent consensus round processed by the engine.
@@ -205,12 +216,9 @@ where
         // `Parameters::validate_operational_floors` keeps the configured `gc_depth` above this
         // buffer, so the window is positive.  `saturating_sub` still guards the test-fixture path,
         // where that floor is intentionally not enforced and a small `gc_depth` can zero the
-        // window.
-        let gc_depth = self
-            .consensus_config
-            .parameters()
-            .gc_depth
-            .saturating_sub(tn_types::GC_ACTIVITY_BUFFER);
+        // window.  The rejoin rule in the executor's subscriber derives its window from the same
+        // helper, so promotion always sits inside this demotion window.
+        let gc_depth = tn_types::gc_activity_window(self.consensus_config.parameters().gc_depth);
         // is our round outside the GC window
         // Will be false when not the same epoch (can't compare rounds) but
         // epoch_behind will work in that case.
@@ -262,6 +270,32 @@ where
         } else {
             self.consensus_chain.epochs().get_committee_keys(epoch).await
         }
+    }
+
+    /// The committee that may sign a `ConsensusResult` for `epoch`, with the bound a certified
+    /// epoch record puts on the result's consensus number (issue #1771).
+    ///
+    /// Signers are accepted from the previous, current or next committee only: the same window the
+    /// gossip layer authorises publishers from (`boundary_publishers` in the node's epoch start,
+    /// issues #898 and #912). An older stored committee is never consulted, because its keys are
+    /// retired and carry no stake, so f+1 of them would cost an attacker nothing. When this node
+    /// holds the certified epoch record for `epoch`, the record's `final_consensus.number` bounds
+    /// the numbers that epoch can have produced. Returns `None` for an epoch outside the window
+    /// and for the previous epoch when its committee is not stored yet.
+    async fn consensus_result_committee(&self, epoch: Epoch) -> Option<ConsensusResultCommittee> {
+        let current = self.consensus_config.committee().epoch();
+        // `epoch` is peer-supplied, so the window test never adds to it; `checked_sub` keeps the
+        // previous-epoch test total at epoch 0.
+        let in_window =
+            epoch == current || epoch == current + 1 || current.checked_sub(1) == Some(epoch);
+        let keys = if in_window { self.get_committee(epoch).await } else { None }?;
+        let final_number = self
+            .consensus_chain
+            .epochs()
+            .get_epoch_by_number(epoch)
+            .await
+            .and_then(|(record, cert)| cert.map(|_| record.final_consensus.number));
+        Some(ConsensusResultCommittee { keys, final_number })
     }
 
     /// True if a vote for this `(author, epoch, epoch-record)` has already been verified and
@@ -378,10 +412,14 @@ where
                     // We have already dealt with this hash or we are past this output.
                     return Ok(());
                 }
-                if let Some(committee) = self.get_committee(epoch).await {
-                    // If we do not have the committee to verify this message then just ignore for
-                    // now. Another one will be along soon and we should be
-                    // syncing epochs in the background.
+                if let Some(ConsensusResultCommittee { keys: committee, final_number }) =
+                    self.consensus_result_committee(epoch).await
+                {
+                    // Signers come from the previous, current or next committee only, the same
+                    // window the gossip layer authorises publishers from; an older committee's
+                    // keys are retired and never verify a result (issue #1771). Without the
+                    // committee the message is ignored for now: another one will be along soon
+                    // and epochs sync in the background.
                     ensure!(
                         committee.contains(&key),
                         PrimaryNetworkError::PeerNotInCommittee(Box::new(key))
@@ -393,13 +431,24 @@ where
                         // possible and don't want to do the cert verify if we can
                         // skip it.  So this seems like the place.  And of course
                         // close any windows to double counting a signature.
+                        // A certified epoch record fixes the last consensus number of its epoch,
+                        // so a result numbered past it cannot be real. It is dropped here, before
+                        // the BLS verify (cheap-first), so a bogus number never costs a verify or
+                        // pins the last-published watch (issue #1771).
+                        let past_certified_record =
+                            final_number.is_some_and(|final_number| number > final_number);
+                        if past_certified_record {
+                            debug!(target: "primary", epoch, number, ?final_number, "consensus result numbered past its certified epoch record, ignoring (issue #1771)");
+                        }
                         let guard = self.consensus_certs.lock();
-                        if guard
-                            .get(&consensus_result_hash)
-                            .and_then(|tally| tally.signers.get(&key))
-                            .is_some()
+                        if past_certified_record
+                            || guard
+                                .get(&consensus_result_hash)
+                                .and_then(|tally| tally.signers.get(&key))
+                                .is_some()
                         {
-                            // We have already counted this signature so ignore.
+                            // We have already counted this signature, or the number is impossible
+                            // for its epoch, so ignore.
                             return Ok(());
                         }
                         drop(guard);
@@ -497,10 +546,15 @@ where
                         self.consensus_bus.publish_consensus_num_hash_if_newer(epoch, number, hash);
                         self.consensus_certs.lock().clear();
                     }
-                } else {
-                    // Not sure we can sanity check this epoch.  However if it is bogus the code
-                    // to handle it should be fine, it stops when out of epochs.
+                } else if epoch >= self.consensus_config.committee().epoch().saturating_sub(1) {
+                    // The previous epoch without its record, or an epoch past the next one: this
+                    // node may be missing epoch records, so nudge the sync. If the epoch is bogus
+                    // the code to handle it should be fine, it stops when out of epochs.
                     self.consensus_bus.set_request_missing_epoch_if_newer(epoch);
+                } else {
+                    // An epoch below the committee window: its signers are retired, so the result
+                    // is dropped rather than verified against a stored committee (issue #1771).
+                    debug!(target: "primary", epoch, number, "consensus result for an epoch below the committee window, ignoring (issue #1771)");
                 }
             }
             PrimaryGossip::EpochVote(vote) => {
@@ -608,19 +662,19 @@ where
 
                 // This fast path recasts a stored vote before taking the per-author lock, so it
                 // must be gated on the same durability barrier as the slow paths.
-                // If any epoch-DB commit has failed, the `Votes` guard for this
-                // author/round may live only in the authoritative mem layer and
-                // never on disk, so recasting here would risk the same
-                // self-inflicted equivocation on restart that the first-vote barrier guards
-                // against. The poison latch fails this barrier after any failed
-                // commit; fail-stop the node rather than recast a non-durable vote
-                // (issue #975).
+                // If any epoch-DB write or sync has failed, the `Votes` guard for this
+                // author/round may be readable without ever having reached disk, so recasting
+                // here would risk the same self-inflicted equivocation on restart that the
+                // first-vote barrier guards against. The store's failure latch fails this
+                // barrier after any failed write or sync; end the epoch rather than recast a
+                // non-durable vote (issue #975), after which `run_epoch` finds the store unable
+                // to make writes durable and stops the node.
                 self.consensus_config
                     .node_storage()
                     .persist::<Votes>()
                     .await
                     .inspect_err(|e| {
-                        error!(target: "primary", "epoch DB durable barrier failed on fast vote recast; initiating node shutdown: {e}");
+                        error!(target: "primary", "epoch DB durable barrier failed on fast vote recast; ending the epoch (the node stops if its stores cannot write): {e}");
                         self.consensus_config.shutdown().notify();
                     })?;
                 info!(target: "primary", "Recast vote {vote:?} for {} at round {}", header, header.round());
@@ -817,8 +871,8 @@ where
             ))))
         } else {
             // tier 3: further ahead than the tolerance plus the time a vote request stays open,
-            // more than ordinary clock skew explains. reject this header for good: `Self::vote`
-            // caches the error for its digest and the network layer charges a severe penalty
+            // reject this header for good: `Self::vote` caches the error for its digest.
+            // Clock skew can be local to either peer, so rejection carries no score penalty.
             warn!(
                 target: "primary",
                 "Rejected header {:?} due to timestamp {created_at} ms newer than {now} ms",
@@ -1109,19 +1163,19 @@ where
                             header,
                             header.round()
                         );
-                        // Recast of a prior matching vote. If any epoch-DB commit has since failed,
-                        // the `Votes` guard for this author/round may live only in the
-                        // authoritative mem layer and not on disk, so
-                        // resending it here would risk the same
-                        // self-inflicted equivocation on restart. The poison latch fails this
-                        // barrier after any failed commit; fail-stop rather than recast a
-                        // non-durable vote (issue #975).
+                        // Recast of a prior matching vote. If any epoch-DB write or sync has since
+                        // failed, the `Votes` guard for this author/round may be readable without
+                        // ever having reached disk, so resending it here would risk the same
+                        // self-inflicted equivocation on restart. The store's failure latch fails
+                        // this barrier after any failed write or sync; end the epoch rather than
+                        // recast a non-durable vote (issue #975), and `run_epoch` then stops the
+                        // node.
                         self.consensus_config
                             .node_storage()
                             .persist::<Votes>()
                             .await
                             .inspect_err(|e| {
-                                error!(target: "primary", "epoch DB durable barrier failed on vote recast; initiating node shutdown: {e}");
+                                error!(target: "primary", "epoch DB durable barrier failed on vote recast; ending the epoch (the node stops if its stores cannot write): {e}");
                                 self.consensus_config.shutdown().notify();
                             })?;
                         return Ok(PrimaryResponse::Vote(vote));
@@ -1150,8 +1204,9 @@ where
         // ordinary crash. See issue #934.
         //
         // If the barrier reports a failed commit (disk full, `EIO`, checksum), the vote is not on
-        // disk, so returning it would risk that same self-inflicted equivocation. Fail-stop the
-        // node and refuse to return the vote. The error maps to `PrimaryNetworkError::Storage`,
+        // disk, so returning it would risk that same self-inflicted equivocation. Refuse to return
+        // the vote and end the epoch: `run_epoch` then finds the store unable to make writes
+        // durable and stops the node. The error maps to `PrimaryNetworkError::Storage`,
         // which carries no peer penalty: this is our local disk failure, not the peer's fault
         // (issue #975).
         self.consensus_config
@@ -1159,7 +1214,7 @@ where
             .persist::<Votes>()
             .await
             .inspect_err(|e| {
-                error!(target: "primary", "epoch DB durable barrier failed for vote; initiating node shutdown: {e}");
+                error!(target: "primary", "epoch DB durable barrier failed for vote; ending the epoch (the node stops if its stores cannot write): {e}");
                 self.consensus_config.shutdown().notify();
             })?;
 
@@ -1254,24 +1309,19 @@ where
     /// The bytes are streamed to the requesting peer over the typed sync protocol (see
     /// `process_sync_consensus_output_stream`), because a single output can exceed the
     /// request/response message-size limit.
+    ///
+    /// The answer comes only from data that is available now. A number past the local consensus
+    /// tip is reported as [`PrimaryNetworkError::UnknownConsensusOutput`] at once, without a pack
+    /// read and without a wait. The caller holds a sync-stream permit, so a wait here would hold
+    /// that permit while it waits. The requester retries the output (with its own backoff) at
+    /// another peer. The storage layer saves an output before it advances the latest consensus
+    /// number, so this check never hides a saved output.
     pub(super) async fn consensus_output_bytes(
         &self,
         number: u64,
     ) -> PrimaryNetworkResult<Vec<u8>> {
-        let mut my_number = self.consensus_chain.latest_consensus_number();
-        // If we are behind then wait up to two seconds to catch up.
-        let mut count = 0;
-        if number.saturating_sub(my_number) < 4 {
-            // Only wait if we are close.
-            while my_number < number {
-                tokio::time::sleep(Duration::from_millis(100)).await;
-                my_number = self.consensus_chain.latest_consensus_number();
-                if count >= 20 {
-                    // Don't wait more than 2 seconds for this to show up.
-                    return Err(PrimaryNetworkError::UnknownConsensusOutput(number));
-                }
-                count += 1;
-            }
+        if number > self.consensus_chain.latest_consensus_number() {
+            return Err(PrimaryNetworkError::UnknownConsensusOutput(number));
         }
         match self.consensus_chain.consensus_output_bytes_by_number(number).await {
             Ok(Some(bytes)) => Ok(bytes),
@@ -1296,50 +1346,39 @@ where
         Ok(PrimaryResponse::EpochRecord { record, certificate })
     }
 
-    /// Retrieve the consensus header by number.
+    /// Retrieve the epoch record and its certificate by epoch number.
+    ///
+    /// A record without its certificate is reported as [`PrimaryNetworkError::UnavailableEpoch`]
+    /// at once, without a wait, so the serve does not hold its epoch-record permit while the
+    /// certificate is missing. The requester retries (with its own backoff).
     async fn get_epoch_by_number(
         &self,
         epoch: Epoch,
     ) -> PrimaryNetworkResult<(EpochRecord, EpochCertificate)> {
-        match self.consensus_chain.epochs().get_epoch_by_number(epoch).await {
-            Some((record, Some(cert))) => Ok((record, cert)),
-            Some((_record, None)) => {
-                // If we have the record but not the cert then wait a beat for it to show up.
-                for _ in 0..5 {
-                    tokio::time::sleep(Duration::from_millis(300)).await;
-                    if let Some((record, Some(cert))) =
-                        self.consensus_chain.epochs().get_epoch_by_number(epoch).await
-                    {
-                        return Ok((record, cert));
-                    }
-                }
-                Err(PrimaryNetworkError::UnavailableEpoch(epoch))
-            }
-            None => Err(PrimaryNetworkError::UnavailableEpoch(epoch)),
-        }
+        self.consensus_chain
+            .epochs()
+            .get_epoch_by_number(epoch)
+            .await
+            .and_then(|(record, cert)| cert.map(|cert| (record, cert)))
+            .ok_or(PrimaryNetworkError::UnavailableEpoch(epoch))
     }
 
-    /// Retrieve the consensus header by hash
+    /// Retrieve the epoch record and its certificate by epoch-record digest.
+    ///
+    /// A record without its certificate is reported as
+    /// [`PrimaryNetworkError::UnavailableEpochDigest`] at once, without a wait, so the serve does
+    /// not hold its epoch-record permit while the certificate is missing. The requester retries
+    /// (with its own backoff).
     async fn get_epoch_by_hash(
         &self,
         hash: EpochDigest,
     ) -> PrimaryNetworkResult<(EpochRecord, EpochCertificate)> {
-        match self.consensus_chain.epochs().get_epoch_by_hash(hash).await {
-            Some((record, Some(cert))) => Ok((record, cert)),
-            Some((_record, None)) => {
-                // If we have the record but not the cert then wait a beat for it to show up.
-                for _ in 0..5 {
-                    tokio::time::sleep(Duration::from_millis(300)).await;
-                    if let Some((record, Some(cert))) =
-                        self.consensus_chain.epochs().get_epoch_by_hash(hash).await
-                    {
-                        return Ok((record, cert));
-                    }
-                }
-                Err(PrimaryNetworkError::UnavailableEpochDigest(hash))
-            }
-            None => Err(PrimaryNetworkError::UnavailableEpochDigest(hash)),
-        }
+        self.consensus_chain
+            .epochs()
+            .get_epoch_by_hash(hash)
+            .await
+            .and_then(|(record, cert)| cert.map(|cert| (record, cert)))
+            .ok_or(PrimaryNetworkError::UnavailableEpochDigest(hash))
     }
 
     /// Number of tracked consensus-result digests. Test-only accessor used to assert the
@@ -1361,10 +1400,13 @@ where
     /// The exchange has already been admitted against the concurrency caps and its
     /// opening request frame read by the caller. This streams the pack via
     /// [`send_sync_epoch_pack_over_stream`], which bounds a slow reader with a per-frame write
-    /// timeout and a rolling throughput floor rather than a total timeout. A send failure is
-    /// logged and best-effort signalled with [`SyncFrame::Err`] so the requester
-    /// stops waiting; it is not a peer fault, so no penalty is returned (metrics-only
-    /// during the item-6 rollout, like the legacy responder).
+    /// timeout, a rolling throughput floor and a total deadline sized from the pack length. A
+    /// send failure is logged and best-effort signalled with [`SyncFrame::Err`] so the requester
+    /// stops waiting.
+    ///
+    /// Returns [`SyncServeOutcome::Completed`] when the pack was sent or shed with `Deny`,
+    /// [`SyncServeOutcome::Stalled`] when a write timed out (the caller may charge a public-tier
+    /// peer), and [`SyncServeOutcome::Failed`] for any other error.
     ///
     /// [`send_sync_epoch_pack_over_stream`]: crate::network::sync_codec::send_sync_epoch_pack_over_stream
     pub(super) async fn process_sync_epoch_pack_stream(
@@ -1374,15 +1416,16 @@ where
         epoch: Epoch,
         stop_number: Option<u64>,
         consensus_chain: &ConsensusChain,
-    ) -> PrimaryNetworkResult<()> {
+    ) -> SyncServeOutcome {
         debug!(target: "primary::network", %peer, epoch, ?stop_number, "serving inbound sync epoch pack stream");
         let max_frame = crate::network::sync_codec::MAX_SYNC_PACK_FRAME_SIZE;
 
-        // No fixed overall serve cap: `send_sync_epoch_pack_over_stream` enforces a per-frame write
-        // timeout (`SEND_STREAM_BUFFER_TIMEOUT`) AND a rolling-window throughput floor, so a large
-        // honest pack can take as long as it needs at/above the floor while a drip-reading peer
-        // (which keeps resetting the per-frame timer) is cut within roughly one window —
-        // without capping the pack size a slow-but-honest requester could ever receive.
+        // `send_sync_epoch_pack_over_stream` bounds the serve three ways: a per-frame write
+        // timeout (`SEND_STREAM_BUFFER_TIMEOUT`), a rolling-window throughput floor, and a total
+        // deadline (`pack_serve_deadline`) of one floor window per started MiB of pack plus one.
+        // A large honest pack at or above the floor finishes inside the deadline; a drip reader
+        // that keeps resetting the per-frame timer is cut by the floor or, at the latest, by the
+        // deadline.
         let served = crate::network::sync_codec::send_sync_epoch_pack_over_stream(
             &mut stream,
             consensus_chain,
@@ -1393,8 +1436,10 @@ where
         )
         .await;
 
-        // a send failure or timeout is logged and best-effort signalled so the
-        // requester stops waiting; it is not a peer fault, so no penalty
+        // a send failure or timeout is logged and best-effort signalled so the requester stops
+        // waiting; a timed-out write is classified `Stalled` so the admission layer can charge a
+        // public-tier peer
+        let outcome = SyncServeOutcome::of(&served);
         if let Err(e) = served {
             warn!(target: "primary::network", %peer, ?e, "failed to serve sync epoch pack stream");
             // bound the best-effort error write: a peer that read the `Ack` then
@@ -1417,7 +1462,7 @@ where
         // reading cannot pin this responder task on the FIN flush
         let _ = timeout(crate::network::SYNC_REQUEST_READ_TIMEOUT, stream.close()).await;
 
-        Ok(())
+        outcome
     }
 
     /// Serve an inbound missing-certificates sync exchange.
@@ -1434,8 +1479,12 @@ where
     /// A request whose `skip_rounds` is out of bounds fails the collector build and is
     /// declined with [`SyncFrame::Err`]`(`[`SyncFrameError::Malformed`]`)` before any
     /// `Ack`; any later serve failure is logged and best-effort signalled with
-    /// `SyncFrame::Err`. Errors are metrics-only during the rollout (no penalty),
-    /// matching the legacy responder and the epoch-pack sync path.
+    /// `SyncFrame::Err`.
+    ///
+    /// Returns [`SyncServeOutcome::Completed`] when the certificates were sent,
+    /// [`SyncServeOutcome::Stalled`] when a write timed out (the caller may charge a public-tier
+    /// peer), and [`SyncServeOutcome::Failed`] for a malformed request, an overall serve timeout
+    /// or any other error.
     ///
     /// [`send_sync_certificates_over_stream`]: crate::network::sync_codec::send_sync_certificates_over_stream
     pub(super) async fn process_sync_missing_certs_stream(
@@ -1444,7 +1493,7 @@ where
         mut stream: Stream,
         exclusive_lower_bound: Round,
         skip_rounds: Vec<(AuthorityIdentifier, Vec<u8>)>,
-    ) -> PrimaryNetworkResult<()> {
+    ) -> SyncServeOutcome {
         debug!(target: "primary::network", %peer, exclusive_lower_bound, "serving inbound sync missing certificates stream");
         let max_frame = crate::network::sync_codec::MAX_SYNC_CERT_FRAME_SIZE;
         let (mut encode_buffer, mut compressed_buffer) = (Vec::new(), Vec::new());
@@ -1470,7 +1519,7 @@ where
                 stream.close().await
             })
             .await;
-            return Ok(());
+            return SyncServeOutcome::Failed;
         };
 
         // bound the whole serve; flatten the timeout's outer Result into the send's
@@ -1486,8 +1535,10 @@ where
         .map_err(PrimaryNetworkError::from)
         .and_then(|served| served);
 
-        // a serve failure or timeout is logged and best-effort signalled so the
-        // requester stops waiting; it is not a peer fault, so no penalty
+        // a serve failure or timeout is logged and best-effort signalled so the requester stops
+        // waiting; a timed-out write is classified `Stalled` so the admission layer can charge a
+        // public-tier peer
+        let outcome = SyncServeOutcome::of(&served);
         if let Err(e) = served {
             warn!(target: "primary::network", %peer, ?e, "failed to serve sync missing certificates stream");
             // bound the best-effort error write: a peer that read the `Ack` then
@@ -1509,21 +1560,24 @@ where
         // reading cannot pin this responder task on the FIN flush
         let _ = timeout(crate::network::SYNC_REQUEST_READ_TIMEOUT, stream.close()).await;
 
-        Ok(())
+        outcome
     }
 
     /// Serve an inbound single-consensus-output sync exchange.
     ///
     /// The exchange has already been admitted against the concurrency caps and its
     /// opening `Req(ConsensusOutput { number })` frame read by the caller. This
-    /// resolves the output bytes (with the same brief catch-up wait as before, via
-    /// [`Self::consensus_output_bytes`]) and streams them with
+    /// resolves the output bytes from local data only, without a wait (via
+    /// [`Self::consensus_output_bytes`]), and streams them with
     /// [`send_sync_consensus_output_over_stream`]: an available output is sent as
     /// `Ack` + `Data`* + `End`; a benign miss (unknown number, or one not yet built
     /// during catch-up) sheds with a [`SyncFrame::Deny`]`(Unavailable)` frame so the
     /// requester retries elsewhere. A send failure is logged and best-effort signalled
-    /// with [`SyncFrame::Err`]; it is not a peer fault, so no penalty is returned
-    /// (metrics-only during the item-9b rollout, like the epoch-pack sync path).
+    /// with [`SyncFrame::Err`].
+    ///
+    /// Returns [`SyncServeOutcome::Completed`] when the output was sent or shed with `Deny`,
+    /// [`SyncServeOutcome::Stalled`] when a write timed out (the caller may charge a public-tier
+    /// peer), and [`SyncServeOutcome::Failed`] for an overall serve timeout or any other error.
     ///
     /// [`send_sync_consensus_output_over_stream`]: crate::network::sync_codec::send_sync_consensus_output_over_stream
     pub(super) async fn process_sync_consensus_output_stream(
@@ -1531,7 +1585,7 @@ where
         peer: BlsPublicKey,
         mut stream: Stream,
         number: u64,
-    ) -> PrimaryNetworkResult<()> {
+    ) -> SyncServeOutcome {
         debug!(target: "primary::network", %peer, number, "serving inbound sync consensus output stream");
         let max_frame = crate::network::sync_codec::MAX_SYNC_PACK_FRAME_SIZE;
 
@@ -1554,8 +1608,10 @@ where
         .map_err(PrimaryNetworkError::from)
         .and_then(|served| served);
 
-        // a send failure or timeout is logged and best-effort signalled so the
-        // requester stops waiting; it is not a peer fault, so no penalty
+        // a send failure or timeout is logged and best-effort signalled so the requester stops
+        // waiting; a timed-out write is classified `Stalled` so the admission layer can charge a
+        // public-tier peer
+        let outcome = SyncServeOutcome::of(&served);
         if let Err(e) = served {
             warn!(target: "primary::network", %peer, ?e, "failed to serve sync consensus output stream");
             // bound the best-effort error write: a peer that read the `Ack` then
@@ -1578,7 +1634,7 @@ where
         // reading cannot pin this responder task on the FIN flush
         let _ = timeout(crate::network::SYNC_REQUEST_READ_TIMEOUT, stream.close()).await;
 
-        Ok(())
+        outcome
     }
 }
 

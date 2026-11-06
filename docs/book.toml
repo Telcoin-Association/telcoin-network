@@ -12,8 +12,8 @@ create-missing = false
 git-repository-url = "https://github.com/Telcoin-Association/telcoin-network"
 edit-url-template = "https://github.com/Telcoin-Association/telcoin-network/edit/main/docs/src/{path}"
 # Served at the root of docs.telcoin.network (the GitHub Pages custom domain).
-# Only the 404 page's <base href> depends on this; the docs workflow overrides
-# it per version build and must agree (SITE_ROOT in .github/workflows/docs.yaml).
+# Only the 404 page's <base href> depends on this; change it here if the site
+# moves under a path prefix.
 site-url = "/"
 
 # Theme (docs/theme/): light + navy only; the header switch offers Light/System/Dark.
@@ -31,7 +31,7 @@ enable = true
 level = 0
 
 # rpc-methods/ was reorganized by namespace; old page URLs redirect to the new ones.
-# Targets are relative to the old page so they also resolve under the /<tag>/ builds.
+# Targets are relative to the old page.
 [output.html.redirect]
 "/rpc-methods/eth_accounts.html" = "eth/eth_accounts.html"
 "/rpc-methods/eth_blocknumber.html" = "eth/eth_blocknumber.html"

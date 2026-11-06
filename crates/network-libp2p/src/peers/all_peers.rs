@@ -6,12 +6,14 @@
 use super::{
     banned::BannedPeers,
     peer::Peer,
+    policy::{PeerPolicy, TrustBasis},
     score::ReputationUpdate,
     status::ConnectionStatus,
-    types::{ConnectionDirection, PeerIdentity, TrustBasis},
+    types::{ConnectionDirection, PeerIdentity, PenaltyOutcome},
     PeerExchangeMap, Penalty,
 };
 use crate::{
+    diagnostics::{bounded_error, bounded_reply_error as error, bounded_warn},
     error::NetworkError,
     peers::{score::Reputation, status::NewConnectionStatus, types::PeerAction},
     send_or_log_error,
@@ -28,7 +30,7 @@ use std::{
 use tn_config::ScoreConfig;
 use tn_types::{BlsPublicKey, NetworkPublicKey};
 use tokio::sync::oneshot;
-use tracing::{debug, error, warn};
+use tracing::debug;
 #[cfg(test)]
 #[path = "../tests/peers.rs"]
 mod peers;
@@ -53,6 +55,10 @@ pub(super) struct AllPeers {
     /// id is translated to the telcoin-domain identity that keys `peers`. It is kept in lockstep
     /// with the `Confirmed` entries in `peers`: an entry exists here iff the peer is stored under
     /// a [PeerIdentity::Confirmed] key.
+    ///
+    /// Committee identity is keyed on this index, so a committee member's record is exempt from
+    /// pruning, and the peer manager re-binds a member from its cached node record when a
+    /// refreshed copy of that record is dropped as stale or on a committee update (issue #1649).
     bls_by_peer_id: HashMap<PeerId, BlsPublicKey>,
     /// Members of the previous epoch's committee, keyed by [BlsPublicKey].
     ///
@@ -129,6 +135,10 @@ impl AllPeers {
     }
 
     /// Remove a peer from the collection, keeping the `bls_by_peer_id` resolution index in sync.
+    ///
+    /// Pruning never passes a committee record here (see [`Self::collect_excess_peers`]). A path
+    /// that does remove a committee member's record also removes its binding; the peer manager
+    /// restores it from its cached node record (issue #1649).
     fn evict(&mut self, identity: &PeerIdentity) -> Option<Peer> {
         let removed = self.peers.remove(identity);
         if let (PeerIdentity::Confirmed(_), Some(peer)) = (identity, removed.as_ref()) {
@@ -192,7 +202,8 @@ impl AllPeers {
 
     /// Create a peer that is "trusted".
     ///
-    /// This overwrites peer records and unbans ips.
+    /// Operator configuration grants retention and load privileges. Recorded protocol penalties,
+    /// domain bans, and bounded observed-IP evidence survive reload and network-key rotation.
     pub(super) fn add_trusted_peer(
         &mut self,
         bls_public_key: BlsPublicKey,
@@ -205,17 +216,44 @@ impl AllPeers {
         // bls key that previously presented this network key, or confirmed under a previous
         // network key; each displaced record is removed through `evict` / released so no
         // `bls_by_peer_id` entry or status counter goes stale
-        if let Some(displaced) = (current != confirmed).then(|| self.evict(&current)).flatten() {
-            self.release_displaced_record(&displaced);
-        }
-        if let Some(displaced) = self.evict(&confirmed) {
-            self.release_displaced_record(&displaced);
+        let protocol_records: Vec<_> = self
+            .peers
+            .get(&confirmed)
+            .into_iter()
+            .chain(self.peers.get(&current).filter(|_| current != confirmed))
+            .filter(|peer| !peer.permits_load_forgiveness())
+            .cloned()
+            .collect();
+        (current != confirmed)
+            .then(|| self.evict(&current))
+            .flatten()
+            .into_iter()
+            .for_each(|displaced| self.release_displaced_record(&displaced));
+        self.evict(&confirmed)
+            .into_iter()
+            .for_each(|displaced| self.release_displaced_record(&displaced));
+        let mut peer = Peer::new_trusted(bls_public_key, network_key, self.score_config.clone());
+        protocol_records.iter().for_each(|record| peer.retain_protocol_reputation(record));
+        if peer.reputation().banned() {
+            peer.set_connection_status(ConnectionStatus::Banned { instant: Instant::now() });
+            self.banned_peers.add_banned_peer(&peer);
         }
         self.bls_by_peer_id.insert(peer_id, bls_public_key);
-        self.peers.insert(
-            confirmed,
-            Peer::new_trusted(bls_public_key, network_key, self.score_config.clone()),
-        );
+        self.peers.insert(confirmed, peer);
+    }
+
+    /// Retain an operator hub while preserving existing reputation and connection accounting.
+    pub(super) fn retain_operator_peer(
+        &mut self,
+        bls_public_key: BlsPublicKey,
+        network_key: NetworkPublicKey,
+        addrs: Vec<Multiaddr>,
+    ) {
+        self.upsert_peer(bls_public_key, network_key, addrs);
+        self.peers
+            .get_mut(&PeerIdentity::Confirmed(bls_public_key))
+            .into_iter()
+            .for_each(|peer| peer.retain_for_operator());
     }
 
     /// Create a peer.
@@ -272,17 +310,23 @@ impl AllPeers {
     /// This method is called when the application layer identifies a problem and reports a peer.
     pub(super) fn process_penalty(&mut self, peer_id: &PeerId, penalty: Penalty) -> PeerAction {
         let id = self.identity_for(peer_id);
-        let exemption = self.trust_basis_for(&id);
-        if let Some(peer) = self.peers.get_mut(&id) {
+        let policy = self.peer_policy(peer_id);
+        let update = self.peers.get_mut(&id).map(|peer| {
             let prior_reputation = peer.reputation();
-            let new_reputation = peer.apply_penalty(penalty, exemption);
+            let new_reputation = peer.apply_penalty(penalty, policy);
+            (prior_reputation, new_reputation, peer.connection_status().is_connected_or_dialing())
+        });
+        update.map_or_else(|| {
+            bounded_warn!(PeerState, target: "peer-manager", ?peer_id, "application layer reported an unknown peer");
+            PeerAction::NoAction
+        }, |(prior_reputation, new_reputation, connected_or_dialing)| {
             debug!(target: "peer-manager", ?peer_id, ?prior_reputation, ?new_reputation);
 
             if new_reputation == prior_reputation {
                 return PeerAction::NoAction;
             }
 
-            let res = match new_reputation {
+            match new_reputation {
                 Reputation::Banned => {
                     debug!(target: "peer-manager", ?peer_id, "penalty resulted in banning peer");
 
@@ -290,28 +334,23 @@ impl AllPeers {
                     self.update_connection_status(peer_id, NewConnectionStatus::Banned)
                 }
                 Reputation::Disconnected => {
-                    if peer.connection_status().is_connected_or_dialing() {
+                    if connected_or_dialing {
                         self.update_connection_status(
                             peer_id,
                             NewConnectionStatus::Disconnecting { banned: true },
                         )
                     } else {
-                        warn!(target: "peer-manager", ?peer_id, ?prior_reputation, "process_penalty for disconnected peer");
+                        bounded_warn!(PeerState, target: "peer-manager", ?peer_id, ?prior_reputation, "process_penalty for disconnected peer");
                         self.update_connection_status(peer_id, NewConnectionStatus::Disconnected)
                     }
                 }
                 Reputation::Trusted => {
                     // this should never happen
-                    error!(target: "peer-manager", ?peer_id, "process_penalty resulted in peer becoming trusted");
+                    bounded_error!(PeerState, target: "peer-manager", ?peer_id, "process_penalty resulted in peer becoming trusted");
                     PeerAction::NoAction
                 }
-            };
-
-            return res;
-        }
-
-        warn!(target: "peer-manager", ?peer_id, "application layer reported an unknown peer");
-        PeerAction::NoAction
+            }
+        })
     }
 
     /// Ensure a [Peer] exists.
@@ -334,7 +373,7 @@ impl AllPeers {
         let id = if matches!(resolved, PeerIdentity::Confirmed(_))
             && !self.peers.contains_key(&resolved)
         {
-            error!(target: "peer-manager", ?peer_id, "bls_by_peer_id entry found without a confirmed record - repairing index");
+            bounded_error!(PeerRecord, target: "peer-manager", ?peer_id, "bls_by_peer_id entry found without a confirmed record - repairing index");
             self.bls_by_peer_id.remove(peer_id);
             PeerIdentity::Unidentified(*peer_id)
         } else {
@@ -343,7 +382,7 @@ impl AllPeers {
         if !self.peers.contains_key(&id) {
             // initialize unknown peer and log warning if status update is invalid for unknown peers
             if !new_status.valid_initial_state() {
-                warn!(target: "peer-manager",
+                bounded_warn!(PeerRecord, target: "peer-manager",
                     "Attempt to update {:?} for unknown peer {:?}. Current peers:\n{:?}",
                     new_status,
                     peer_id,
@@ -357,12 +396,11 @@ impl AllPeers {
 
         // ensure peer is banned if the new state is Banned
         if matches!(new_status, &NewConnectionStatus::Banned) {
-            let exemption = self.trust_basis(peer_id);
             if let Some(peer) = self.peers.get_mut(&id) {
-                peer.ensure_banned(peer_id, exemption);
+                peer.ensure_banned(peer_id);
             } else {
                 // unreachable
-                error!(target: "peer-manager", ?peer_id, "impossible - peer was just created if it didn't already exist");
+                bounded_error!(PeerRecord, target: "peer-manager", ?peer_id, "impossible - peer was just created if it didn't already exist");
             }
         }
 
@@ -380,7 +418,10 @@ impl AllPeers {
     /// Peers that fail to connect within dial timeout are updated to
     /// `ConnectionStatus::Disconnected`. It's important these peers are disconnected because
     /// dialing peers are counted towards the limit on inbound connections.
-    pub(super) fn heartbeat_maintenance(&mut self) -> Vec<(PeerId, PeerAction)> {
+    pub(super) fn heartbeat_maintenance(
+        &mut self,
+        temporary_ban_duration: Duration,
+    ) -> Vec<(PeerId, PeerAction)> {
         let peers_to_disconnect: Vec<PeerId> = self
             .peers
             .iter()
@@ -408,7 +449,7 @@ impl AllPeers {
         }
 
         // update scores for all other peers
-        self.update_peer_scores()
+        self.update_peer_scores(Instant::now(), temporary_ban_duration)
     }
 
     /// Update scores for heartbeat interval.
@@ -417,23 +458,38 @@ impl AllPeers {
     /// updated. Peers are possibly unbanned, but penalties are not applied with this method.
     /// It's impossible for a peer to become banned during heartbeat maintenance.
     ///
-    /// See [Self::apply_penalty] for ban logic.
-    fn update_peer_scores(&mut self) -> Vec<(PeerId, PeerAction)> {
+    /// A disconnect-level penalty can ban the connection without banning the reputation. Recover
+    /// that status after the same timeout used by the manager's temporary-ban cache. Reputation
+    /// bans retain their score-decay lockout. The explicit instant keeps expiry tests
+    /// deterministic.
+    ///
+    /// See [Self::process_penalty] for ban logic.
+    fn update_peer_scores(
+        &mut self,
+        now: Instant,
+        temporary_ban_duration: Duration,
+    ) -> Vec<(PeerId, PeerAction)> {
         // filter peers that are eligible to become unbanned
-        let previous_committee = &self.previous_committee;
-        let current_committee = &self.current_committee;
-        let next_committee = &self.next_committee;
+        let previous = &self.previous_committee;
+        let current = &self.current_committee;
+        let next = &self.next_committee;
         let unbanned_peers = self.peers.iter_mut().filter_map(|(id, peer)| {
-            let exemption =
-                Self::exemption(id, peer, previous_committee, current_committee, next_committee);
-            let update = peer.heartbeat(exemption);
+            let validator = match id {
+                PeerIdentity::Confirmed(key) => previous.contains(key) || current.contains(key) || next.contains(key),
+                PeerIdentity::Unidentified(_) => false,
+            };
+            let policy = PeerPolicy::from_bases(
+                peer.is_operator_allowlisted().then_some(TrustBasis::Operator).into_iter()
+                    .chain(validator.then_some(TrustBasis::Validator)),
+            );
+            let update = peer.heartbeat(policy);
             match update {
                 ReputationUpdate::Unbanned => {
                     Self::peer_id_for(id, peer)
                 },
                 // filter other results and log error
                 ReputationUpdate::Banned | ReputationUpdate::Disconnect => {
-                    error!(
+                    bounded_error!(PeerState,
                         target: "peer-manager",
                         ?update,
                         ?id,
@@ -441,7 +497,16 @@ impl AllPeers {
                     );
                     None
                 },
-                ReputationUpdate::None => None,
+                ReputationUpdate::None => {
+                    let expired_status_ban = matches!(
+                        peer.connection_status(),
+                        ConnectionStatus::Banned { instant }
+                            if now.saturating_duration_since(*instant) >= temporary_ban_duration
+                    );
+                    (expired_status_ban && !peer.reputation().banned())
+                        .then(|| Self::peer_id_for(id, peer))
+                        .flatten()
+                },
             }
         }).collect::<Vec<_>>();
 
@@ -559,11 +624,11 @@ impl AllPeers {
                     self.disconnected_peers = self.disconnected_peers.saturating_sub(1);
                 }
                 ConnectionStatus::Banned { .. } => {
-                    error!(target: "peer-manager", ?peer_id, "accepted a connection from a banned peer");
+                    bounded_error!(PeerAdmission, target: "peer-manager", ?peer_id, "accepted a connection from a banned peer");
                     self.banned_peers.remove_banned_peer(peer.known_ip_addresses());
                 }
                 ConnectionStatus::Disconnecting { .. } => {
-                    warn!(target: "peer-manager", ?peer_id, "connected to a disconnecting peer")
+                    bounded_warn!(PeerAdmission, target: "peer-manager", ?peer_id, "connected to a disconnecting peer")
                 }
                 ConnectionStatus::Unknown
                 | ConnectionStatus::Connected { .. }
@@ -590,26 +655,26 @@ impl AllPeers {
         if let Some(peer) = self.peers.get_mut(&id) {
             match current_status {
                 ConnectionStatus::Banned { .. } => {
-                    warn!(target: "peer-manager", ?peer_id, "dialing a banned peer");
+                    bounded_warn!(PeerState, target: "peer-manager", ?peer_id, "dialing a banned peer");
                     self.banned_peers.remove_banned_peer(peer.known_ip_addresses());
                 }
                 ConnectionStatus::Disconnected { .. } => {
                     self.disconnected_peers = self.disconnected_peers.saturating_sub(1);
                 }
                 ConnectionStatus::Connected { .. } => {
-                    warn!(target: "peer-manager", ?peer_id, "dialing an already connected peer")
+                    bounded_warn!(PeerState, target: "peer-manager", ?peer_id, "dialing an already connected peer")
                 }
                 ConnectionStatus::Dialing { .. } => {
-                    warn!(target: "peer-manager", ?peer_id, "dialing an already dialing peer")
+                    bounded_warn!(PeerState, target: "peer-manager", ?peer_id, "dialing an already dialing peer")
                 }
                 ConnectionStatus::Disconnecting { .. } => {
-                    warn!(target: "peer-manager", ?peer_id, "dialing a disconnecting peer")
+                    bounded_warn!(PeerState, target: "peer-manager", ?peer_id, "dialing a disconnecting peer")
                 }
                 ConnectionStatus::Unknown => {} // default status
             }
 
             if let Err(e) = peer.register_dialing() {
-                error!(target: "peer-manager", e, ?peer_id, "error updating peer to dialing");
+                bounded_error!(PeerState, target: "peer-manager", e, ?peer_id, "error updating peer to dialing");
             }
         }
 
@@ -672,7 +737,7 @@ impl AllPeers {
             PeerAction::Ban(banned_ips)
         } else {
             // NOTE: this should never happen
-            warn!(target: "peer-manager", ?peer_id, "failed to retrieve peer data for handling disconnect and ban");
+            bounded_warn!(PeerState, target: "peer-manager", ?peer_id, "failed to retrieve peer data for handling disconnect and ban");
             PeerAction::Ban(Vec::new())
         }
     }
@@ -709,7 +774,7 @@ impl AllPeers {
             }
             ConnectionStatus::Banned { .. } => {
                 // banned peers should already be disconnected
-                error!(target: "peer-manager", ?peer_id, "disconnecting from a banned peer - banned peer should already be disconnected");
+                bounded_error!(PeerState, target: "peer-manager", ?peer_id, "disconnecting from a banned peer - banned peer should already be disconnected");
             }
             ConnectionStatus::Connected { .. } | ConnectionStatus::Dialing { .. } => {
                 // support discovery with peer exchange if the target number of peers is reached
@@ -753,7 +818,7 @@ impl AllPeers {
                     PeerAction::NoAction
                 }
                 ConnectionStatus::Banned { .. } => {
-                    error!(target: "peer-manager", ?peer_id, "banning already banned peer");
+                    bounded_error!(PeerState, target: "peer-manager", ?peer_id, "banning already banned peer");
                     let already_banned_ips = self.banned_peers.banned_ips();
                     PeerAction::Ban(peer.filter_new_ips_to_ban(&already_banned_ips))
                 }
@@ -762,7 +827,7 @@ impl AllPeers {
                     PeerAction::Disconnect
                 }
                 ConnectionStatus::Unknown => {
-                    warn!(target: "peer-manager", ?peer_id, "banning an unknown peer");
+                    bounded_warn!(PeerState, target: "peer-manager", ?peer_id, "banning an unknown peer");
                     self.banned_peers.add_banned_peer(peer);
                     peer.set_connection_status(ConnectionStatus::Banned {
                         instant: Instant::now(),
@@ -772,7 +837,7 @@ impl AllPeers {
                 }
             }
         } else {
-            warn!(target: "peer-manager", ?peer_id, "failed to retrieve peer data for handling banned transition");
+            bounded_warn!(PeerState, target: "peer-manager", ?peer_id, "failed to retrieve peer data for handling banned transition");
             PeerAction::NoAction
         }
     }
@@ -786,7 +851,7 @@ impl AllPeers {
         let id = self.identity_for(peer_id);
         if let Some(peer) = self.peers.get_mut(&id) {
             if matches!(peer.reputation(), Reputation::Banned) {
-                error!(target: "peer-manager", ?peer_id, "unbanning a banned peer");
+                bounded_error!(PeerState, target: "peer-manager", ?peer_id, "unbanning a banned peer");
             }
 
             // expected status is "banned", but there are possible edge cases
@@ -819,7 +884,7 @@ impl AllPeers {
                 }
                 ConnectionStatus::Unknown | ConnectionStatus::Connected { .. } => {
                     // technically an error, but not fatal
-                    error!(target: "peer-manager", ?peer_id, "unbanning a connected peer");
+                    bounded_error!(PeerState, target: "peer-manager", ?peer_id, "unbanning a connected peer");
                 }
             }
         }
@@ -856,54 +921,28 @@ impl AllPeers {
         }
     }
 
-    /// The [TrustBasis] exempting `peer` from the score model this epoch, if any.
+    /// Derive retention and load-scoring privileges from all live trust bases.
     ///
-    /// Validator status is derived live from the three tracked committee slots (it is never
-    /// stored on the peer, so it cannot drift out of sync with rotation); operator allowlisting
-    /// is read from the peer. Validator takes precedence in the reported basis as it is the
-    /// operationally significant signal when a penalty is suppressed.
-    fn exemption(
-        id: &PeerIdentity,
-        peer: &Peer,
-        previous_committee: &HashSet<BlsPublicKey>,
-        current_committee: &HashSet<BlsPublicKey>,
-        next_committee: &HashSet<BlsPublicKey>,
-    ) -> Option<TrustBasis> {
-        let in_committee = |bls_public_key: &BlsPublicKey| {
-            previous_committee.contains(bls_public_key)
-                || current_committee.contains(bls_public_key)
-                || next_committee.contains(bls_public_key)
-        };
-        match id {
-            PeerIdentity::Confirmed(bls_public_key) if in_committee(bls_public_key) => {
-                Some(TrustBasis::Validator)
-            }
-            PeerIdentity::Confirmed(_) | PeerIdentity::Unidentified(_) => {
-                peer.is_operator_allowlisted().then_some(TrustBasis::Operator)
-            }
+    /// Committee rotation revokes only committee-derived privileges; operator trust survives.
+    pub(super) fn peer_policy(&self, peer_id: &PeerId) -> PeerPolicy {
+        let operator = self.get_peer(peer_id).is_some_and(|peer| peer.is_operator_allowlisted());
+        PeerPolicy::from_bases(
+            operator
+                .then_some(TrustBasis::Operator)
+                .into_iter()
+                .chain(self.is_peer_validator(peer_id).then_some(TrustBasis::Validator)),
+        )
+    }
+
+    /// The [PenaltyOutcome] of `penalty` for the peer identified by `peer_id`.
+    ///
+    /// The manager records penalty metrics with this outcome, after the exemption decision.
+    pub(super) fn penalty_outcome(&self, peer_id: &PeerId, penalty: Penalty) -> PenaltyOutcome {
+        if self.peer_policy(peer_id).applies(penalty) {
+            PenaltyOutcome::Applied
+        } else {
+            PenaltyOutcome::Exempt
         }
-    }
-
-    /// The [TrustBasis] exempting the peer identified by `peer_id`, if it is known and exempt.
-    ///
-    /// `None` means the peer is subject to the normal score model.
-    fn trust_basis(&self, peer_id: &PeerId) -> Option<TrustBasis> {
-        let id = self.identity_for(peer_id);
-        self.trust_basis_for(&id)
-    }
-
-    /// The [TrustBasis] exempting the peer with the already-resolved identity `id`, if it is
-    /// known and exempt.
-    fn trust_basis_for(&self, id: &PeerIdentity) -> Option<TrustBasis> {
-        self.peers.get(id).and_then(|peer| {
-            Self::exemption(
-                id,
-                peer,
-                &self.previous_committee,
-                &self.current_committee,
-                &self.next_committee,
-            )
-        })
     }
 
     /// Boolean indicating if the ip address is associated with a banned peer.
@@ -956,6 +995,9 @@ impl AllPeers {
     }
 
     /// Collect connected peers to exchange with disconnecting peer.
+    ///
+    /// Truncated to [`MAX_PEER_EXCHANGE_ENTRIES`](super::types::MAX_PEER_EXCHANGE_ENTRIES) so
+    /// the receiver's bounded decoder always accepts an honest map.
     pub(super) fn peer_exchange(&self) -> PeerExchangeMap {
         self.peers
             .values()
@@ -966,6 +1008,7 @@ impl AllPeers {
                     None
                 }
             })
+            .take(super::types::MAX_PEER_EXCHANGE_ENTRIES)
             .collect::<HashMap<_, _>>()
             .into()
     }
@@ -1011,6 +1054,13 @@ impl AllPeers {
     /// peer. Once the heap is full, a candidate replaces that top only when the candidate is
     /// older, so the heap converges on the `excess` oldest peers. Callers evict exactly these
     /// entries, which keeps the freshest bans/disconnects and drops only stale ones (issue #799).
+    /// Operator entries are bounded by configuration and retained with their reputation, so
+    /// reconnect scheduling cannot recreate a pruned hub and erase its protocol ban.
+    /// Committee records (see [`Self::is_committee_record`]) are never collected either: evicting
+    /// one drops its `bls_by_peer_id` binding, and the member then loses its validator identity at
+    /// this node until it re-signs its record (issue #1649). The exempt set is bounded by the three
+    /// committee slots, so the memory bound behind the pruning caps still holds. Callers can
+    /// therefore receive fewer than `excess` entries.
     /// Used by Self::prune_banned_peers and Self::prune_disconnected_peers.
     fn collect_excess_peers<F>(
         &self,
@@ -1024,7 +1074,9 @@ impl AllPeers {
         let mut excess_peers = BinaryHeap::with_capacity(excess);
 
         for (id, peer) in &self.peers {
-            if let Some(instant) = filter(peer.connection_status()) {
+            if let Some(instant) = filter(peer.connection_status())
+                .filter(|_| !peer.is_operator_allowlisted() && !self.is_committee_record(id))
+            {
                 // max-heap by instant: the heap's top (peek) is the NEWEST collected peer
                 let entry = (instant, *id, peer.known_ip_addresses().collect::<Vec<_>>());
 
@@ -1073,6 +1125,13 @@ impl AllPeers {
     }
 
     /// Prune excess number of disconnected peers to prevent exhausting memory.
+    ///
+    /// Committee and operator records are exempt (see [`Self::collect_excess_peers`]), so a call
+    /// can evict fewer than `excess` records. `disconnected_peers` is decremented once per evicted
+    /// record only, so it keeps counting the exempt `Disconnected` records and the next call
+    /// computes the excess from the true total. Each call makes one bounded pass over the
+    /// collection and does not retry, so it terminates even when every `Disconnected` record is
+    /// exempt.
     fn prune_disconnected_peers(&mut self) {
         let excess = self.disconnected_peers.saturating_sub(self.max_disconnected_peers);
 
@@ -1107,9 +1166,9 @@ impl AllPeers {
     ///
     /// No trust flag is stored on peers: a member's validator exemption is derived live from the
     /// three committee slots (issue #715), so overwriting the slots is itself the demotion - a
-    /// member absent from all three slots re-enters the normal score model immediately, while
-    /// operator-allowlisted peers keep their exemption regardless. Members of the new committees
-    /// whose network identity is known are forgiven any bans and have their scores primed to max;
+    /// member absent from all three slots re-enters protocol scoring immediately, while
+    /// operator-allowlisted peers retain their load exemption. Members of the new committees
+    /// whose network identity is known have all reputation bans forgiven and scores primed to max;
     /// a member appearing in more than one committee is processed once.
     pub(super) fn update_committees(
         &mut self,
@@ -1140,8 +1199,8 @@ impl AllPeers {
     /// update follows shortly after via `update_committees`.
     ///
     /// Because validator exemption is derived from the slots, members not already in a slot are
-    /// NOT penalty-exempt during this window (intentional: exemption only ever follows
-    /// authoritative slot state). They are unbanned with scores primed to max, and the exemption
+    /// NOT score-exempt during this window (intentional: exemption only ever follows
+    /// authoritative slot state). Existing reputation bans are forgiven. The exemption
     /// begins when `update_committees` writes the slots.
     pub(super) fn mark_committee_for_dial(
         &mut self,
@@ -1154,6 +1213,32 @@ impl AllPeers {
     /// [`Self::update_committees`].
     pub(super) fn current_committee(&self) -> &HashSet<BlsPublicKey> {
         &self.current_committee
+    }
+
+    /// Count the current committee and its members that hold an established connection.
+    ///
+    /// Returns `(size, connected)`. `size` is the member count of the current slot. `connected`
+    /// counts members whose `Confirmed` record is connected; the store keys each confirmed peer
+    /// once by its BLS key, so a member counts once however many connections it holds. Members
+    /// of only the previous or next slot are not counted, and a connected peer whose BLS key is
+    /// not yet learned (`Unidentified`) is not counted. Both values are zero until
+    /// [`Self::update_committees`] sets a committee.
+    pub(super) fn current_committee_connectivity(&self) -> (usize, usize) {
+        let connected = self
+            .current_committee
+            .iter()
+            .filter(|bls_key| {
+                self.peers
+                    .get(&PeerIdentity::Confirmed(**bls_key))
+                    .is_some_and(|peer| peer.connection_status().is_connected())
+            })
+            .count();
+        (self.current_committee.len(), connected)
+    }
+
+    /// Authoritative previous/current/next slots, including identities not yet resolved.
+    pub(super) fn committee_slots(&self) -> [&HashSet<BlsPublicKey>; 3] {
+        [&self.previous_committee, &self.current_committee, &self.next_committee]
     }
 
     /// Whether `bls_key` sits in any tracked committee slot (previous, current, or next).
@@ -1169,12 +1254,38 @@ impl AllPeers {
             || self.next_committee.contains(bls_key)
     }
 
+    /// Whether `identity` keys the `Confirmed` record of a member of any tracked committee slot
+    /// (previous, current, or next).
+    ///
+    /// Uses the same three slots as the validator scoring exemption and retention protection
+    /// ([`Self::is_peer_validator`]), so a member that keeps its validator privileges also keeps
+    /// the record and the `bls_by_peer_id` binding that back them. Pruning skips these records
+    /// (see [`Self::collect_excess_peers`]); the set is bounded by three committee sizes.
+    fn is_committee_record(&self, identity: &PeerIdentity) -> bool {
+        match identity {
+            PeerIdentity::Confirmed(bls_public_key) => self.is_committee_member(bls_public_key),
+            PeerIdentity::Unidentified(_) => false,
+        }
+    }
+
+    /// Whether a `Confirmed` record is stored for `bls_key`.
+    pub(super) fn has_confirmed_record(&self, bls_key: &BlsPublicKey) -> bool {
+        self.peers.contains_key(&PeerIdentity::Confirmed(*bls_key))
+    }
+
+    /// Evict the `Confirmed` record of `bls_key` through the same path as pruning, so tests can
+    /// cover re-binding after an eviction (issue #1649).
+    #[cfg(test)]
+    pub(super) fn evict_confirmed(&mut self, bls_key: BlsPublicKey) -> Option<Peer> {
+        self.evict(&PeerIdentity::Confirmed(bls_key))
+    }
+
     /// Lazily apply committee membership to a single member the moment its network identity is
     /// learned.
     ///
     /// Called from the discovery path ([`super::manager::PeerManager::add_known_peer`]) after a
     /// peer is re-keyed onto its `Confirmed` identity. If the member belongs to any tracked
-    /// committee slot it is unbanned and its score primed immediately, closing the window for
+    /// committee slot its reputation ban is forgiven and score primed, closing the window for
     /// members that were tracked by [`Self::update_committees`] before their [PeerId] was known
     /// (the validator exemption itself derives from the slots, so it already applies). A no-op
     /// for peers that are not in any tracked committee.
@@ -1194,60 +1305,49 @@ impl AllPeers {
     /// Operates per [BlsPublicKey] against the existing `Confirmed` peer records: a member with no
     /// record yet (its libp2p [PeerId] has not been discovered) is skipped here and handled later
     /// via [`Self::apply_membership_if_committee`]. For members with a record, the banned status
-    /// is forgiven, IPs associated with the committee node are reset, and the peer's score is
-    /// reset to max. No trust flag is stored: the member's validator exemption is derived from
-    /// the committee slots, so it incurs no penalties while tracked (members of the pre-dial
-    /// path may not be in a slot yet; their exemption begins once `update_committees` lands).
+    /// is forgiven for both load and protocol history, with matching score and IP-ban bookkeeping.
+    /// No trust flag is stored: the member's scoring exemption follows the committee slots.
+    /// Members of the pre-dial path may not be in a slot yet; their exemption begins once
+    /// `update_committees` lands.
     /// Returns the unban actions for the manager to apply; the committee slots are owned by the
     /// callers.
     fn apply_committee_membership(
         &mut self,
         members: impl IntoIterator<Item = BlsPublicKey>,
     ) -> Vec<(PeerId, PeerAction)> {
-        let mut actions = Vec::new();
-        for bls_key in members {
+        members.into_iter().filter_map(|bls_key| {
             let identity = PeerIdentity::Confirmed(bls_key);
             // only members whose network identity is already known have a confirmed record and a
             // recoverable peer id; others are trusted lazily on discovery
-            let Some(peer_id) = self.peers.get(&identity).and_then(|peer| peer.peer_id()) else {
-                continue;
-            };
+            let peer_id = self
+                .peers
+                .get(&identity)
+                .and_then(|peer| peer.peer_id())?;
 
             // the NewConnectionStatus doesn't affect this call
             let status = self.ensure_peer_exists(&peer_id, &NewConnectionStatus::Unbanned);
 
-            match status {
-                ConnectionStatus::Disconnecting { banned } => {
-                    // unban peer
-                    if banned {
-                        warn!(target: "peer-manager", ?peer_id, "unbanning committee member that was disconnecting pending ban");
-                        let action =
-                            self.update_connection_status(&peer_id, NewConnectionStatus::Unbanned);
-                        actions.push((peer_id, action));
-                    }
+            let action = match status {
+                ConnectionStatus::Banned { .. }
+                | ConnectionStatus::Disconnecting { banned: true } => {
+                    bounded_warn!(PeerState, target: "peer-manager", ?peer_id, "unbanning banned committee member");
+                    Some(self.update_connection_status(&peer_id, NewConnectionStatus::Unbanned))
                 }
-                ConnectionStatus::Banned { .. } => {
-                    warn!(target: "peer-manager", ?peer_id, "unbanning banned committee member");
-                    let action =
-                        self.update_connection_status(&peer_id, NewConnectionStatus::Unbanned);
-                    actions.push((peer_id, action));
-                }
-                ConnectionStatus::Disconnected { .. }
+                ConnectionStatus::Disconnecting { banned: false }
+                | ConnectionStatus::Disconnected { .. }
                 | ConnectionStatus::Dialing { .. }
                 | ConnectionStatus::Unknown
-                | ConnectionStatus::Connected { .. } => { /* nothing to do */ }
-            }
+                | ConnectionStatus::Connected { .. } => None,
+            };
 
             // update peer regardless of connection status; validator trust is derived from the
             // committee slots, so we only prime the score (no trust flag is stored)
-            if let Some(peer) = self.peers.get_mut(&identity) {
+            self.peers.get_mut(&identity).into_iter().for_each(|peer| {
                 peer.reset_score_to_max();
                 self.banned_peers.remove_validator_ip(&peer_id, peer.known_ip_addresses());
-            }
-        }
-
-        // return any unban actions for committee peers
-        actions
+            });
+            action.map(|action| (peer_id, action))
+        }).collect()
     }
 
     /// Check if a peer is eligible for dial attempt.

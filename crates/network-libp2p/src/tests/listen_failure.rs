@@ -136,8 +136,20 @@ async fn test_listen_failure_reasons_and_accounting() -> eyre::Result<()> {
         .iter()
         .filter(|(key, _)| key.name() == "tn_network.listen_failures_total")
         .collect();
-    assert_eq!(failures.len(), 16);
+    // every reason is registered at zero, so each network has one series per reason, including
+    // the closed admission reason that this test never raises
+    assert_eq!(failures.len(), 2 * crate::metrics::ListenFailureReason::all().count());
     assert!(failures.iter().all(|(key, _)| key.labels().count() == 2));
+    ["primary", "worker-0"].iter().for_each(|network| {
+        assert_eq!(
+            metric(
+                &snapshot,
+                "tn_network.listen_failures_total",
+                &[("network", network), ("reason", "peer_manager_closed_admission")]
+            ),
+            Some(&DebugValue::Counter(0))
+        );
+    });
     assert_eq!(
         metric(&snapshot, "tn_network.connections_closed_total", &[("network", "primary")]),
         Some(&DebugValue::Counter(0))

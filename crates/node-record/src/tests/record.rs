@@ -1,7 +1,8 @@
 //! Unit tests for the signed node record.
 
 use crate::{
-    AddressError, NetworkInfo, NetworkType, NodeRecord, RecordDomain, MAX_ADVERTISED_MULTIADDRS,
+    AddressError, NetworkInfo, NetworkType, NodeRecord, RecordDomain, RecordError,
+    MAX_ADVERTISED_MULTIADDRS,
 };
 use libp2p::Multiaddr;
 use tn_types::{
@@ -21,7 +22,7 @@ fn create_multiaddr(_ip: Option<std::net::IpAddr>) -> Multiaddr {
 /// these tests need no dependency on the node's config crate.
 struct KeyConfig {
     bls: BlsKeypair,
-    network: NetworkPublicKey,
+    network: NetworkKeypair,
 }
 
 /// Parse a QUIC test endpoint, returning the address-policy error for malformed fixture input.
@@ -29,9 +30,10 @@ fn endpoint(input: &str) -> Result<Multiaddr, AddressError> {
     input.parse().map_err(|_| AddressError::InvalidTransport)
 }
 
-/// Ordered overlap records retain the existing wire layout and authenticate every endpoint byte.
+/// Ordered overlap records keep the previous wire layout as an exact prefix, append the
+/// network-key co-signature (issue #1751), and authenticate every endpoint byte.
 #[test]
-fn multi_address_records_preserve_wire_and_authentication() -> Result<(), AddressError> {
+fn multi_address_records_preserve_wire_and_authentication() -> Result<(), RecordError> {
     use rand::{rngs::StdRng, SeedableRng as _};
     use serde::{Deserialize, Serialize};
     use tn_types::{encode, try_decode, TimestampSec};
@@ -69,18 +71,24 @@ fn multi_address_records_preserve_wire_and_authentication() -> Result<(), Addres
     .into_iter()
     .map(endpoint)
     .collect::<Result<Vec<_>, _>>()?;
-    [1, 2, MAX_ADVERTISED_MULTIADDRS].into_iter().try_for_each(|count| {
+    [1, 2, MAX_ADVERTISED_MULTIADDRS].into_iter().try_for_each(|count| -> Result<(), RecordError> {
         let record = NodeRecord::build_multi(
             domain,
-            key.primary_network_public_key(),
+            &key.primary_public_key(),
+            key.primary_network_keypair(),
             addresses.iter().take(count).cloned().collect(),
             None,
             |data| key.request_signature_direct(data),
         )?;
         let bytes = encode(&record);
+        // The co-signature extends the wire layout (issue #1751): previous readers reject the
+        // trailing bytes, and the previous layout is an exact prefix of the current bytes.
+        assert!(try_decode::<PreviousRecord>(&bytes).is_err());
+        let prefix = encode(&(&record.info, &record.signature));
+        assert!(bytes.starts_with(&prefix));
         let previous: PreviousRecord =
-            try_decode(&bytes).map_err(|_| AddressError::InvalidTransport)?;
-        assert_eq!(encode(&previous), bytes);
+            try_decode(&prefix).map_err(|_| AddressError::InvalidTransport)?;
+        assert_eq!(encode(&previous), prefix);
         let previous_payload = encode(&(
             b"telcoin-network/node-record/v1".as_slice(),
             2017u64,
@@ -88,13 +96,15 @@ fn multi_address_records_preserve_wire_and_authentication() -> Result<(), Addres
             1u16,
             &previous.info,
         ));
-        // Old readers authenticate the identical bytes. Their one-address admission rule
+        // Old readers authenticate the identical prefix bytes. Their one-address admission rule
         // deliberately rejects overlap records until readers have been upgraded.
         assert!(previous.signature.verify_raw(&previous_payload, &key.primary_public_key()));
         assert!(!previous.signature.verify_raw(&encode(&previous.info), &key.primary_public_key()));
-        let pre_domain = PreviousRecord {
+        // A pre-domain BLS signature in the current layout decodes but never verifies.
+        let pre_domain = NodeRecord {
+            info: record.info.clone(),
             signature: key.request_signature_direct(&encode(&previous.info)),
-            info: previous.info,
+            network_signature: record.network_signature.clone(),
         };
         assert!(NodeRecord::try_decode_compat(&encode(&pre_domain)).is_some());
         assert!(NodeRecord::decode_and_verify(
@@ -160,12 +170,13 @@ fn advertised_address_policy_is_symmetric() -> Result<(), AddressError> {
     .try_for_each(|multiaddrs| {
         assert!(NodeRecord::build_multi(
             domain,
-            key.primary_network_public_key(),
+            &key.primary_public_key(),
+            key.primary_network_keypair(),
             multiaddrs.clone(),
             None,
             |data| key.request_signature_direct(data)
         )
-        .is_err());
+        .is_err_and(|err| matches!(err, RecordError::Address(_))));
         let info = NetworkInfo {
             pubkey: key.primary_network_public_key(),
             multiaddrs,
@@ -173,7 +184,11 @@ fn advertised_address_policy_is_symmetric() -> Result<(), AddressError> {
             rpc: None,
         };
         let signature = key.request_signature_direct(&NodeRecord::signing_bytes(domain, &info));
-        let record = NodeRecord { info, signature };
+        let network_signature = key
+            .primary_network_keypair()
+            .sign(&NodeRecord::network_signing_bytes(domain, &key.primary_public_key(), &info))
+            .expect("ed25519 signing is infallible");
+        let record = NodeRecord { info, signature, network_signature };
         assert!(NodeRecord::decode_and_verify(&encode(&record), domain, &key.primary_public_key())
             .is_none());
         Ok(())
@@ -185,15 +200,21 @@ fn advertised_address_policy_is_symmetric() -> Result<(), AddressError> {
 
 impl KeyConfig {
     fn new_with_testing_key(bls: BlsKeypair) -> Self {
-        Self { bls, network: NetworkKeypair::generate_ed25519().public().into() }
+        Self { bls, network: NetworkKeypair::generate_ed25519() }
     }
 
     fn primary_public_key(&self) -> BlsPublicKey {
         *self.bls.public()
     }
 
+    /// The public half of the network identity the record advertises.
     fn primary_network_public_key(&self) -> NetworkPublicKey {
-        self.network.clone()
+        self.network.public().into()
+    }
+
+    /// The network keypair that co-signs the record's binding to the BLS key.
+    fn primary_network_keypair(&self) -> &NetworkKeypair {
+        &self.network
     }
 
     fn request_signature_direct(&self, data: &[u8]) -> BlsSignature {
@@ -212,11 +233,13 @@ fn test_node_record() {
     // build a valid node record
     let node_record = NodeRecord::build(
         domain,
-        key_config.primary_network_public_key(),
+        &key_config.primary_public_key(),
+        key_config.primary_network_keypair(),
         multiaddr,
         None,
         |data| key_config.request_signature_direct(data),
-    );
+    )
+    .expect("sign record");
     let (bls_pubkey, record) =
         node_record.clone().verify(domain, &pubkey).expect("valid node record");
 
@@ -248,11 +271,13 @@ fn test_node_record_with_rpc_roundtrip() {
 
     let node_record = NodeRecord::build(
         domain,
-        key_config.primary_network_public_key(),
+        &key_config.primary_public_key(),
+        key_config.primary_network_keypair(),
         multiaddr,
         Some(rpc.clone()),
         |data| key_config.request_signature_direct(data),
-    );
+    )
+    .expect("sign record");
 
     // encode and decode round-trip preserves rpc and stays verifiable
     let bytes = encode(&node_record);
@@ -322,11 +347,13 @@ fn test_legacy_record_compat_decode_and_verify() {
     let rpc = RpcInfo { http: "https://a.example:8545/".parse().expect("http url"), ws: None };
     let current = NodeRecord::build(
         domain,
-        key_config.primary_network_public_key(),
+        &key_config.primary_public_key(),
+        key_config.primary_network_keypair(),
         multiaddr,
         Some(rpc.clone()),
         |data| key_config.request_signature_direct(data),
-    );
+    )
+    .expect("sign record");
     let current_bytes = encode(&current);
     let decoded = NodeRecord::try_decode_compat(&current_bytes).expect("current bytes decode");
     assert_eq!(decoded.info.rpc, Some(rpc));
@@ -358,11 +385,13 @@ fn test_cross_role_replay_rejected() {
     // sign for the worker(0) network
     let record = NodeRecord::build(
         worker_domain,
-        key_config.primary_network_public_key(),
+        &key_config.primary_public_key(),
+        key_config.primary_network_keypair(),
         multiaddr,
         None,
         |data| key_config.request_signature_direct(data),
-    );
+    )
+    .expect("sign record");
 
     // in-memory path: verifies under the SAME worker domain, rejected under primary
     assert!(record.clone().verify(worker_domain, &pubkey).is_some());
@@ -383,11 +412,13 @@ fn test_cross_worker_replay_rejected() {
     let worker_1 = RecordDomain::new(2017, NetworkType::Worker(1));
     let record = NodeRecord::build(
         worker_0,
-        key_config.primary_network_public_key(),
+        &key_config.primary_public_key(),
+        key_config.primary_network_keypair(),
         create_multiaddr(None),
         None,
         |data| key_config.request_signature_direct(data),
-    );
+    )
+    .expect("sign record");
     assert!(record.clone().verify(worker_0, &pubkey).is_some());
     assert!(record.clone().verify(worker_1, &pubkey).is_none());
     let bytes = tn_types::encode(&record);
@@ -416,11 +447,13 @@ fn test_cross_chain_replay_rejected() {
     // sign for chain_a
     let record = NodeRecord::build(
         domain_a,
-        key_config.primary_network_public_key(),
+        &key_config.primary_public_key(),
+        key_config.primary_network_keypair(),
         multiaddr,
         None,
         |data| key_config.request_signature_direct(data),
-    );
+    )
+    .expect("sign record");
 
     // verifies under chain_a, rejected under chain_b
     assert!(record.clone().verify(domain_a, &pubkey).is_some());
@@ -446,13 +479,99 @@ fn test_node_record_without_rpc_roundtrip() {
 
     let node_record = NodeRecord::build(
         domain,
-        key_config.primary_network_public_key(),
+        &key_config.primary_public_key(),
+        key_config.primary_network_keypair(),
         multiaddr,
         None,
         |data| key_config.request_signature_direct(data),
-    );
+    )
+    .expect("sign record");
     let bytes = encode(&node_record);
     let decoded: NodeRecord = decode(&bytes);
     assert!(decoded.info.rpc.is_none());
     assert!(decoded.verify(domain, &pubkey).is_some());
+}
+
+/// Issue #1751: a BLS key cannot publish a record that names a network key whose holder did not
+/// co-sign the binding to that BLS key.
+#[test]
+fn network_key_must_cosign_binding() {
+    use tn_types::encode;
+
+    let victim = KeyConfig::new_with_testing_key(BlsKeypair::generate(&mut rand::rng()));
+    let attacker = BlsKeypair::generate(&mut rand::rng());
+    let domain = RecordDomain::new(2017, NetworkType::Primary);
+    let honest = NodeRecord::build(
+        domain,
+        &victim.primary_public_key(),
+        victim.primary_network_keypair(),
+        create_multiaddr(None),
+        None,
+        |data| victim.request_signature_direct(data),
+    )
+    .expect("sign record");
+
+    // (1) the honest record verifies under the victim's BLS key
+    assert!(honest.clone().verify(domain, &victim.primary_public_key()).is_some());
+
+    // (2) the attacker signs the victim's info with its own BLS key and copies the victim's
+    // co-signature, which covers the victim's BLS key and not the attacker's
+    let forged = NodeRecord {
+        signature: attacker.sign(&NodeRecord::signing_bytes(domain, &honest.info)),
+        ..honest.clone()
+    };
+    assert!(NodeRecord::decode_and_verify(&encode(&forged), domain, attacker.public()).is_none());
+    assert!(forged.clone().verify(domain, attacker.public()).is_none());
+
+    // (3) a co-signature by another network key over the right payload does not bind the
+    // network key that the record names
+    let other_network = NetworkKeypair::generate_ed25519();
+    let wrong_cosigner = NodeRecord {
+        network_signature: other_network
+            .sign(&NodeRecord::network_signing_bytes(domain, attacker.public(), &forged.info))
+            .expect("sign"),
+        ..forged.clone()
+    };
+    assert!(wrong_cosigner.verify(domain, attacker.public()).is_none());
+
+    // (4) a record without a co-signature never verifies
+    let unsigned = NodeRecord { network_signature: Vec::new(), ..forged };
+    assert!(unsigned.verify(domain, attacker.public()).is_none());
+
+    // (5) when the victim's network key does co-sign the attacker's BLS key, the record
+    // verifies: the check is the co-signature, not equality of the two key pairs
+    let consented = NodeRecord::build(
+        domain,
+        attacker.public(),
+        victim.primary_network_keypair(),
+        create_multiaddr(None),
+        None,
+        |data| attacker.sign(data),
+    )
+    .expect("sign record");
+    assert!(consented.verify(domain, attacker.public()).is_some());
+}
+
+/// Bytes in the pre-#1751 layout (the current info and the BLS signature, without the
+/// co-signature) are rejected by the compat decoder and by the authenticated decoder.
+#[test]
+fn previous_layout_without_cosignature_is_rejected() {
+    use tn_types::encode;
+
+    let key_config = KeyConfig::new_with_testing_key(BlsKeypair::generate(&mut rand::rng()));
+    let domain = RecordDomain::new(2017, NetworkType::Primary);
+    let record = NodeRecord::build(
+        domain,
+        &key_config.primary_public_key(),
+        key_config.primary_network_keypair(),
+        create_multiaddr(None),
+        None,
+        |data| key_config.request_signature_direct(data),
+    )
+    .expect("sign record");
+    // BCS flattens the tuple, so these are exactly the pre-#1751 wire bytes
+    let previous = encode(&(&record.info, &record.signature));
+    assert!(NodeRecord::try_decode_compat(&previous).is_none());
+    assert!(NodeRecord::decode_and_verify(&previous, domain, &key_config.primary_public_key())
+        .is_none());
 }

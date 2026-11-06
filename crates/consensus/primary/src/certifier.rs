@@ -502,7 +502,38 @@ impl<DB: Database> Certifier<DB> {
             // We have already processed this certificate, doing so again could produce signature
             // equivocation and destroy deterministic randomness (based on the leader
             // signature). Since we got here try to re-publish the certificate on gossip
-            // network
+            // network, but only once the record is durable.
+            //
+            // The record can still be memory-only here. The proposal task that formed it releases
+            // the proposal lock right after its insert, before its own barrier acks, so this task
+            // can read the row while its disk write is still queued. The proposer's `LastProposed`
+            // barrier for a same-digest reproposal does not cover that write: `persist` queues its
+            // barrier when called and the runner acks in FIFO order, so a barrier covers only the
+            // writes queued before it, and the reproposal's barrier can be queued before the
+            // insert. Gossiping a memory-only record lets a crash or a failed commit lose it, so a
+            // restart misses this guard and certifies the header again, possibly over a different
+            // 2f+1 subset and with a different aggregate signature (#963, #964). This task read
+            // the row, so the row's insert was queued before the barrier below, and the barrier
+            // covers it. This is the same fence #979 put on the vote fast-recast (issue #1530).
+            //
+            // Release the lock first. This path inserts nothing, so it needs no exclusion, and
+            // holding the lock across a whole-DB barrier would stall every other proposal (see
+            // the comment where the formed-certificate path drops the lock).
+            //
+            // If the barrier fails, the epoch DB has latched a failed commit (or its runner is
+            // gone), so the record can be lost on restart. Refuse to republish and end the epoch:
+            // `run_epoch` then finds the store unable to make writes durable and stops the node.
+            // This task is not critical, so returning the error alone would not end the epoch.
+            drop(_guard);
+            self.config
+                .node_storage()
+                .persist::<ProposedCertificates>()
+                .await
+                .inspect_err(|e| {
+                    error!(target: "primary::certifier", "durable barrier failed for already-certified certificate, refusing to re-publish; ending the epoch (the node stops if its stores cannot write): {e}");
+                    self.config.shutdown().notify();
+                })
+                .map_err(|e| TaskError::from_message(e.to_string()))?;
             if let Err(e) = self.network.publish_certificate(cert).await {
                 error!(target: "primary::certifier", ?e, "failed to re-gossip certificate");
             }
@@ -520,8 +551,15 @@ impl<DB: Database> Certifier<DB> {
             proposal_result = self.propose_header(header, reissue_failed) => {
                 match proposal_result {
                     Ok(mut certificate) => {
+                        // A failed insert leaves no guard record, so a later proposal of this header
+                        // could certify it again with a different aggregate. End the epoch (this
+                        // certificate never leaves the node): `run_epoch` then stops the node if
+                        // the store can no longer make writes durable. This task is spawned as a
+                        // non-critical task, and the task manager discards a non-critical task's
+                        // error, so returning it alone would not end the epoch (issue #1530).
                         if let Err(e) = self.config.node_storage().insert::<ProposedCertificates>(&header_digest, &certificate) {
-                            error!(target: "primary::certifier", "error accepting own certificate, unable to save the certificate: {e}");
+                            error!(target: "primary::certifier", "error accepting own certificate, unable to save the certificate; ending the epoch (the node stops if its stores cannot write): {e}");
+                            self.config.shutdown().notify();
                             return Err(TaskError::from_message(e.to_string()));
                         }
 
@@ -529,17 +567,17 @@ impl<DB: Database> Certifier<DB> {
                         //
                         // The lock exists to make the already-certified check at the top of this
                         // method atomic with the insert above, and that pair is now complete: the
-                        // insert updates the in-memory layer synchronously, so any later proposal
-                        // reaching that check already observes this certificate. Nothing below
-                        // needs the exclusion.
+                        // insert is readable as soon as it returns, so any later proposal reaching
+                        // that check already observes this certificate. Nothing below needs the
+                        // exclusion.
                         //
-                        // Holding it across the barrier would be actively harmful, because
-                        // `persist` is a *whole-DB* barrier - the table parameter is unused
-                        // and only selects which of the three DBs to target - so it defers while
-                        // any write txn on the epoch DB is open and drains only at refcount zero,
-                        // with no timeout. Under catch-up or epoch close that is tens to hundreds
-                        // of milliseconds during which every other proposal would queue behind this
-                        // lock. Do not widen this critical section back out.
+                        // Holding it across the barrier would be actively harmful: `persist` waits
+                        // for a sync round of the whole epoch environment's log (the table only
+                        // selects the environment) covering every write made before it, so it
+                        // waits on the disk (an msync, plus an fsync if the log grew), longest on
+                        // a slow volume, under catch-up or at epoch close, and every other proposal
+                        // would queue behind this lock meanwhile. Do not widen this critical
+                        // section back out.
                         drop(_guard);
 
                         // Wait for the `ProposedCertificates` record to be durable before
@@ -555,15 +593,18 @@ impl<DB: Database> Certifier<DB> {
                         // record is not on disk, so the internal processing and gossip publish below
                         // would externalize a certificate whose guard record can be lost on restart -
                         // exactly the re-proposal and leader-signature perturbation this barrier
-                        // exists to prevent. Refuse and fail the task (mirroring the insert failure
-                        // handled above) rather than externalize a non-durable certificate
-                        // (issue #975).
+                        // exists to prevent. Refuse rather than externalize a non-durable certificate
+                        // (issue #975), and end the epoch as the vote barriers do (#979), after
+                        // which `run_epoch` finds the store unable to make writes durable and stops
+                        // the node: returning the error from this non-critical task alone would not
+                        // end the epoch (issue #1530).
                         self.config
                             .node_storage()
                             .persist::<ProposedCertificates>()
                             .await
                             .map_err(|e| {
-                                error!(target: "primary::certifier", "durable barrier failed for own certificate, refusing to externalize: {e}");
+                                error!(target: "primary::certifier", "durable barrier failed for own certificate, refusing to externalize; ending the epoch (the node stops if its stores cannot write): {e}");
+                                self.config.shutdown().notify();
                                 TaskError::from_message(e.to_string())
                             })?;
 

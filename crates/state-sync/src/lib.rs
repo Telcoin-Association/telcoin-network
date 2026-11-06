@@ -24,7 +24,7 @@ mod epoch;
 pub use epoch::{spawn_epoch_record_collector, sync_epoch_records_to_tip};
 mod consensus;
 mod metrics;
-use crate::metrics::STATE_SYNC_METRICS;
+use crate::metrics::{StateSyncMetrics, STATE_SYNC_METRICS};
 use consensus::spawn_track_recent_consensus;
 pub use consensus::{request_missing_packs, spawn_fetch_consensus, spawn_fetch_recent_consensus};
 
@@ -324,16 +324,13 @@ async fn spawn_stream_consensus_headers<DB: Database>(
                     config.node_storage(),
                     &consensus_chain,
                     epoch,
+                    &STATE_SYNC_METRICS,
                 )
                 .await;
                 if last_consensus_header.sub_dag.leader_epoch() > epoch {
                     return Ok(());
                 }
                 last_consensus_height = last_consensus_header.number;
-                STATE_SYNC_METRICS
-                    .headers_fetched_total
-                    .increment(last_consensus_height.saturating_sub(prev_height));
-
                 if let Err(e) = caught_up {
                     // a mismatched cache entry was already removed, so the retry refetches it
                     // through the stall and gap path below; a real fork keeps failing here, logged
@@ -432,6 +429,7 @@ async fn spawn_stream_consensus_headers<DB: Database>(
 /// which ends the walk. After an error the caller resumes from it. Re-reading the last consensus
 /// block (the executed tip) instead would re-send outputs still queued in `sync_output` but not yet
 /// saved. The subscriber skips them as stale, but each one uses a queue slot.
+/// Each successful delivery increments `metrics` immediately so cancellation preserves its count.
 ///
 /// A fresh node (`from` is the default header at number 0) anchors block 1 on the
 /// `parent_hash` block 1 carries rather than on `from.digest()`. The default header's digest is
@@ -446,6 +444,7 @@ async fn catch_up_consensus_from_to<DB: Database>(
     db: &DB,
     consensus_chain: &ConsensusChain,
     epoch: Epoch,
+    metrics: &StateSyncMetrics,
 ) -> eyre::Result<()> {
     // number 0 is only reachable from the default header a fresh node starts from
     let fresh_start = from.number == 0;
@@ -585,7 +584,7 @@ async fn catch_up_consensus_from_to<DB: Database>(
             consensus_bus.sync_output().send(output),
             SYNC_OUTPUT_SEND_WARN_INTERVAL,
             |waited| {
-                STATE_SYNC_METRICS.output_send_stalls_total.increment(1);
+                metrics.output_send_stalls_total.increment(1);
                 warn!(
                     target: "tn::observer",
                     block_number = number,
@@ -598,6 +597,9 @@ async fn catch_up_consensus_from_to<DB: Database>(
         )
         .await?;
         *from = consensus_header;
+        // Rejoining or crossing an epoch can cancel this pass before it returns to its caller.
+        // Record each delivered header now, while both the send and progress update are complete.
+        metrics.headers_fetched_total.increment(1);
     }
     Ok(())
 }
@@ -783,6 +785,7 @@ mod tests {
             &MemDatabase::default(),
             &chain,
             fixture.committee().epoch(),
+            &StateSyncMetrics::default(),
         )
         .await?;
         assert_eq!(from.number, 2, "catch-up must walk past block 1 to the target");
@@ -808,6 +811,7 @@ mod tests {
             &db,
             &chain,
             fixture.committee().epoch(),
+            &StateSyncMetrics::default(),
         )
         .await
         .expect_err("a wrong parent after block 1 must be rejected");
@@ -901,6 +905,69 @@ mod tests {
         );
     }
 
+    /// Delivered headers remain counted when a catch-up pass is cancelled during its next send.
+    #[tokio::test]
+    async fn catch_up_counts_deliveries_before_the_pass_finishes() -> eyre::Result<()> {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let temp_dir = TempDir::new()?;
+        let chain =
+            ConsensusChain::new_for_test(temp_dir.path().to_owned(), fixture.committee()).await?;
+        let block1 = output_at(&fixture, 1, B256::ZERO.into());
+        let block2 = output_at(&fixture, 2, block1.consensus_header().digest());
+        let db = MemDatabase::default();
+        db.insert::<ConsensusCache>(&1, &block1)?;
+        db.insert::<ConsensusCache>(&2, &block2)?;
+
+        let consensus_bus = ConsensusBusApp::new();
+        consensus_bus.recent_blocks().send_modify(|blocks| {
+            blocks.push_latest(
+                0,
+                ConsensusNumHash::default(),
+                Some(SealedHeader::new(ExecHeader::default(), B256::ZERO)),
+            )
+        });
+        let _receiver = consensus_bus.subscribe_sync_output();
+        // Leave one slot: the first delivery succeeds and the second must remain pending.
+        futures::future::try_join_all(
+            (1..SYNC_OUTPUT_CHANNEL_CAPACITY)
+                .map(|_| consensus_bus.sync_output().send(block1.clone())),
+        )
+        .await?;
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let metrics = ::metrics::with_local_recorder(&recorder, || {
+            StateSyncMetrics::new_with_labels(Vec::<::metrics::Label>::new())
+        });
+        let mut from = ConsensusHeader::default();
+        // Ignore cooperative yields so Pending means the next delivery is backpressured.
+        let mut catch_up = Box::pin(tokio::task::unconstrained(catch_up_consensus_from_to(
+            &consensus_bus,
+            &mut from,
+            block2.consensus_header(),
+            &db,
+            &chain,
+            fixture.committee().epoch(),
+            &metrics,
+        )));
+        assert!(
+            futures::poll!(catch_up.as_mut()).is_pending(),
+            "catch-up must remain blocked on its second delivery"
+        );
+        drop(catch_up);
+        assert_eq!(from.number, 1, "only the delivered header may advance progress");
+        let counter =
+            snapshotter.snapshot().into_vec().into_iter().find_map(|(key, _, _, value)| {
+                (key.key().name() == "tn_state_sync.headers_fetched_total").then_some(value)
+            });
+        assert!(
+            matches!(counter, Some(DebugValue::Counter(1))),
+            "the delivered header must be counted before cancellation: {counter:?}"
+        );
+        Ok(())
+    }
+
     /// The bounded `sync_output` queue is the catch-up loop's only throttle through an empty
     /// stretch, so a subscriber that stops draining parks the loop at the send. The loop must stay
     /// parked (not fail, not skip the output) and warn once per elapsed interval while it waits,
@@ -957,9 +1024,16 @@ mod tests {
         let epoch = fixture.committee().epoch();
         let catch_up = tokio::spawn(async move {
             let mut from = ConsensusHeader::default();
-            let result =
-                catch_up_consensus_from_to(&consensus_bus, &mut from, target, &db, &chain, epoch)
-                    .await;
+            let result = catch_up_consensus_from_to(
+                &consensus_bus,
+                &mut from,
+                target,
+                &db,
+                &chain,
+                epoch,
+                &StateSyncMetrics::default(),
+            )
+            .await;
             (result, from)
         });
 

@@ -16,17 +16,21 @@ reporting still apply.
 | Upstream base | `7171dce2f90c05ba7892d4ba926abb1881db27c7` from `.cargo_vcs_info.json` |
 | Archive SHA-256 | `4f78ca359466657b380e469fe8c04df2f4447d1430838e6c3cef4a1c51ccb2ee` |
 | Maintained mirror | [Telcoin's tracked vendored tree](../../../patches/libp2p-quic) |
-| Exact patch revision | [`a740a484e4944871f8a81e825ce84dd1559ee158`](https://github.com/Telcoin-Association/telcoin-network/commit/a740a484e4944871f8a81e825ce84dd1559ee158) |
+| Exact patch revision | [`372fa302bbb85758c9341b2c6b2247db3e9601ca`](https://github.com/Telcoin-Association/telcoin-network/commit/372fa302bbb85758c9341b2c6b2247db3e9601ca) |
 | Override | Root `[patch.crates-io]`, `libp2p-quic = { path = "patches/libp2p-quic" }`, excluded from workspace membership |
-| Complete normalized diff | [upstream.diff](../../../patches/libp2p-quic/upstream.diff), SHA-256 `70bcf353a43adf946424c40b663fe02e871a1b0b6ad346c2f19ecfbb5c92973c` |
-| Runtime tree fingerprint | `51fa07a9f61861af00723b4b96f8e68deece21a021b5cee870903ebf669d5f26` |
+| Complete normalized diff | [upstream.diff](../../../patches/libp2p-quic/upstream.diff), SHA-256 `444cba51a1bc018163e1176ce42e58453b7761a3909895cc035e77203c58849d` |
+| Runtime tree fingerprint | `31dd6839aa578069f3c8847401fa95baa5fe3a339dd2d2908e4ad70ae32f4884` |
 
-The patch revision identifies the runtime source introduced on main. This PR
-updates documentation and registry crypto pins without changing that source.
+The patch revision identifies the current Retry and incoming-observation source. The original
+Retry policy was introduced in `a740a484e4944871f8a81e825ce84dd1559ee158`; issue #1680 adds the
+[Quinn observation companion](../quinn-proto/README.md) and lifecycle observations.
 The fingerprint excludes only `PATCH.md` and `upstream.diff`; per-file hashes
 are retained in the source evidence. Cargo selects the path package, not an
-unused override. `libp2p-tls`, `quinn`, `quinn-proto` and crypto dependencies
-remain registry packages. No source replacement configuration is involved.
+unused override. `libp2p-tls`, `quinn` and crypto dependencies remain registry packages.
+The exact-version quinn-proto companion is also selected by a tracked path override.
+Current default and Adiri graphs, features and per-file source hashes are in the
+[observation source evidence](../quinn-proto/evidence/source.json). Earlier evidence below
+records the dated original transport qualification.
 
 [sources.py](../../../etc/transport-patches/sources.py) verifies the official
 archive checksum, normalizes `Cargo.toml.orig`, removes registry-only files,
@@ -92,17 +96,28 @@ source form without changing the node lockfile.
 | Registry `quinn-proto` 0.11.6 | RUSTSEC-2024-0373 | Detected, exit 1 | Detected, exit 1 |
 | Identical path `quinn-proto` 0.11.6 | RUSTSEC-2024-0373 | Missed, exit 0 | Missed, exit 0 |
 
-This proves a path coverage gap in both tools. The source-neutral manual match
-checks the advisory's package and affected/fixed ranges against actual
-resolution and the carried diff. The node resolves registry `quinn-proto`
-0.11.18, which is outside the affected range (fixed in 0.11.7). The vendored
-diff delegates Retry to Quinn and carries no Quinn backport. That advisory
-therefore does not apply to this carried build. The control and match are
-repeated in required CI; an empty scanner report cannot replace them.
+This proves a path coverage gap in both tools. The gate closes it for the
+carried versions: `advisories.py` audits a registry-form copy of the node
+lockfile in which the recorded path packages carry the registry source, so
+cargo-audit matches advisories against `libp2p-quic` 0.14.0 and `quinn-proto`
+0.11.18 by name and version. The same rewrite of the path control must report
+RUSTSEC-2024-0373, or the gate fails. The source-neutral manual match checks
+the advisory's package and affected/fixed ranges against actual resolution and
+the carried diff. The node resolves the carried path `quinn-proto` 0.11.18
+([companion record](../quinn-proto/README.md)), which is outside the affected
+range (fixed in 0.11.7). The vendored diff delegates Retry to Quinn and carries
+no Quinn backport. That advisory therefore does not apply to this carried
+build. The controls, the registry-form scan and the match are repeated in
+required CI; an empty scanner report cannot replace them.
 
 The fresh scan also identified [GHSA-2mjx-qc3c-rqvc](https://github.com/advisories/GHSA-2mjx-qc3c-rqvc),
 RUSTSEC-2026-0285, affecting the old rustls 0.23.37 pin. This PR updates rustls
-to the fixed 0.23.45, AWS-LC to 1.18.1 / 0.45.0 and rustls-webpki to 0.103.15.
+to the fixed 0.23.46, AWS-LC to 1.18.1 / 0.45.0 and rustls-webpki to 0.103.15.
+The 2026-10-15 lockfile update from rustls 0.23.45 to 0.23.46 also addresses
+RUSTSEC-2026-0346, RUSTSEC-2026-0347, RUSTSEC-2026-0348 and RUSTSEC-2026-0349,
+which the required advisory gate detected in the carried transport closure.
+The committed evidence snapshots below describe the earlier qualification;
+CI captures fresh source and advisory evidence for the current lockfile.
 The scoped updated transport scan has no findings. The workspace scan exits
 1 with seven findings outside the complete QUIC/TLS dependency closure; this record does not
 claim the entire workspace is advisory-free.
@@ -111,8 +126,10 @@ Advisory qualification reuses the hashed default and Adiri source metadata and
 requires it to identify the current lockfile. It follows every normal and build
 dependency from the resolved QUIC/TLS stack, matching findings by package name
 and exact version. A transitive certificate or crypto dependency therefore
-cannot escape the gate through a crate-name shortlist. Additional non-registry
-dependencies in that closure require an extended source record and controls.
+cannot escape the gate through a crate-name shortlist. The closure holds two
+path packages, `libp2p-quic` and `quinn-proto`; each has a source record, and
+the registry-form scan covers both. Any further non-registry dependency in
+that closure needs the same source record before `sources.py` accepts it.
 
 Dependabot was checked separately on 2026-09-30:
 

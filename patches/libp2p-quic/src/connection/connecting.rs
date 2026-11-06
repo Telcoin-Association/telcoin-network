@@ -40,14 +40,25 @@ use crate::{Connection, ConnectionError, Error};
 /// A QUIC connection currently being negotiated.
 #[derive(Debug)]
 pub struct Connecting {
+    /// Live inbound handshake observation, absent for outbound dials.
+    incoming: Option<crate::incoming::HandshakeGuard>,
+    /// The handshake raced against its configured deadline.
     connecting: Select<quinn::Connecting, Delay>,
 }
 
 impl Connecting {
+    /// Race a QUIC handshake against the configured transport deadline.
     pub(crate) fn new(connection: quinn::Connecting, timeout: Duration) -> Self {
         Connecting {
+            incoming: None,
             connecting: select(connection, Delay::new(timeout)),
         }
+    }
+
+    /// Attach the incoming observation after accept succeeded, before the swarm event.
+    pub(crate) fn observe_incoming(mut self, stats: &std::sync::Arc<crate::IncomingStats>) -> Self {
+        self.incoming = Some(stats.handshake());
+        self
     }
 }
 
@@ -82,7 +93,9 @@ impl Future for Connecting {
     type Output = Result<(PeerId, Connection), Error>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let connection = match futures::ready!(self.connecting.poll_unpin(cx)) {
+        let outcome = futures::ready!(self.connecting.poll_unpin(cx));
+        self.incoming.take();
+        let connection = match outcome {
             Either::Right(_) => return Poll::Ready(Err(Error::HandshakeTimedOut)),
             Either::Left((connection, _)) => connection.map_err(ConnectionError)?,
         };

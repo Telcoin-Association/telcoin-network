@@ -50,6 +50,7 @@ The per-peer connection ceiling is not a config field: it is fixed in code and i
 | Max connection data | 100 MiB | Unacknowledged bytes in flight across all streams of a connection |
 | Swarm idle connection timeout | 65 s | How long the swarm keeps an idle connection alive |
 | Established connections per peer | 8 | Concurrent connections one peer may hold, inbound and outbound combined |
+| Inbound accept task | inline | Where a listener decides on inbound attempts and accepts them; the spawned mode with a capacity is a measurement prototype (issue #1741), see [Inbound capacity qualification](inbound-capacity-qualification.md) |
 
 The effective handshake ceiling is the smaller of the handshake timeout and the max idle timeout, so a handshake in practice has 30 seconds, not 65.
 The keep-alive interval is set well below the idle timeout on purpose: a healthy but quiet connection is refreshed roughly six times before it would expire.
@@ -104,7 +105,7 @@ The external address advertised to peers still comes from the node's info file, 
 
 Operators arriving from other clients go looking for `--p2p-port` or `--listen-addr`.
 Neither flag exists; `--bootstrap-peers` is available to override bootstrap dial hints for the current process.
-The node command's flags cover the named chain, bootstrap dial hints, a consensus-metrics socket, an instance number, state export and its retention limit, the re-pack monitor, unused-port mode, a healthcheck port, a node name, and a tracing endpoint, plus a global data directory and the JSON-RPC server arguments.
+The node command's flags cover the named chain, bootstrap dial hints, a consensus-metrics socket, an instance number, state export and its retention limit, the re-pack monitor, unused-port mode, a healthcheck bind (port or socket address), a node name, and a tracing endpoint, plus a global data directory and the JSON-RPC server arguments.
 
 Listener addresses come from the generated node info and the two override variables above.
 Bootstrap peers come from the network config's `bootstrap_peers` map, falling back to the genesis committee when the map is empty.
@@ -163,6 +164,7 @@ Worker `k` of one validator reaches only worker `k` of the others.
 
 The failure mode is quiet by design.
 There is no error message describing the mismatch, because there is nothing to reject — the two peers simply have no protocol in common.
+Outbound substreams negotiate optimistically (multistream-select `V1Lazy`), so a dialer that proposes one protocol sends its first request bytes in the same flight as the proposal, and a listener with no protocol in common answers `na` and drops the stream without any handler seeing those bytes.
 
 ## Source of truth
 

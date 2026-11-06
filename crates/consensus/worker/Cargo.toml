@@ -18,6 +18,7 @@ thiserror = { workspace = true }
 tokio = { workspace = true, features = ["sync", "rt", "macros"] }
 tracing = { workspace = true }
 parking_lot = { workspace = true }
+lru = { workspace = true }
 
 tn-storage = { workspace = true }
 tn-network-types = { workspace = true }
@@ -41,6 +42,7 @@ tn-types = { workspace = true, features = ["test-utils"] }
 tn-test-utils = { workspace = true }
 tn-worker = { workspace = true, features = ["test-utils"] }
 assert_matches = { workspace = true }
+rand = { workspace = true }
 
 [features]
 default = []

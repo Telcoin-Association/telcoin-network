@@ -1,18 +1,29 @@
 //! Test network handler tests.
 
 use assert_matches::assert_matches;
-use std::{collections::BTreeSet, sync::Arc};
+use futures::{future, StreamExt as _};
+use std::{
+    collections::BTreeSet,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
+    time::Duration,
+};
 use tn_batch_validator::NoopBatchValidator;
 use tn_network_libp2p::{
+    error::NetworkError,
     types::{NetworkCommand, NetworkHandle},
     GossipMessage, Penalty, TopicHash,
 };
-use tn_network_types::MockWorkerToPrimary;
+use tn_network_types::{
+    MockWorkerToPrimary, WorkerOthersBatchMessage, WorkerOwnBatchMessage, WorkerToPrimaryClient,
+};
 use tn_storage::{mem_db::MemDatabase, tables::NodeBatchesCache};
 use tn_test_utils::CommitteeFixture;
 use tn_types::{
-    Batch, BatchValidation, BatchValidationError, BcsError, BlsPublicKey, Database, SealedBatch,
-    TaskManager, B256,
+    Address, AuthorityIdentifier, Batch, BatchValidation, BatchValidationError, BcsError,
+    BlsPublicKey, Database, SealedBatch, TaskManager, B256,
 };
 use tn_worker::{
     RequestHandler, WorkerGossip, WorkerNetworkError, WorkerNetworkHandle, WorkerRequest,
@@ -78,6 +89,15 @@ fn create_test_types_with_chain_id(chain_id: u64) -> TestTypes {
 fn create_test_types_with_validator(
     validator: Arc<dyn BatchValidation>,
 ) -> (TestTypes, MemDatabase) {
+    create_test_types_with_validator_and_primary(validator, Arc::new(MockWorkerToPrimary()))
+}
+
+/// Like [`create_test_types_with_validator`], but binds `primary` as the worker's local primary
+/// handler, so a test can observe what the report path sends to the primary.
+fn create_test_types_with_validator_and_primary(
+    validator: Arc<dyn BatchValidation>,
+    primary: Arc<dyn WorkerToPrimaryClient>,
+) -> (TestTypes, MemDatabase) {
     let committee = CommitteeFixture::builder(MemDatabase::default).randomize_ports(true).build();
     let authority = committee.first_authority();
     let config = authority.consensus_config();
@@ -92,7 +112,7 @@ fn create_test_types_with_validator(
     config
         .local_network(worker_id)
         .expect("worker 0 local network")
-        .set_worker_to_primary_local_handler(Arc::new(MockWorkerToPrimary()))
+        .set_worker_to_primary_local_handler(primary)
         .expect("register mock primary handler");
     let handler = RequestHandler::new(worker_id, validator, config, network_handle);
     (TestTypes { committee, handler, task_manager, network_commands_rx }, store)
@@ -109,6 +129,82 @@ impl BatchValidation for RejectingBatchValidator {
     }
 
     fn submit_txn_if_mine(&self, _tx_bytes: &[u8], _committee_size: u64, _committee_slot: u64) {}
+}
+
+/// The result a [`CountingBatchValidator`] returns for every batch.
+#[derive(Debug, Clone, Copy)]
+enum Verdict {
+    /// Accept every batch.
+    Accept,
+    /// Reject every batch with [`BatchValidationError::EmptyBatch`].
+    Reject,
+    /// Reject every batch with [`BatchValidationError::InvalidDigest`].
+    RejectDigest,
+}
+
+/// A [`BatchValidation`] that counts `validate_batch` calls and returns the same [`Verdict`] for
+/// every batch. Used to prove how often the report path validates a repeated batch.
+#[derive(Debug)]
+struct CountingBatchValidator {
+    /// Number of `validate_batch` calls so far.
+    calls: Arc<AtomicUsize>,
+    /// The result returned for every batch.
+    verdict: Verdict,
+}
+
+impl BatchValidation for CountingBatchValidator {
+    fn validate_batch(&self, _batch: SealedBatch) -> Result<(), BatchValidationError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        match self.verdict {
+            Verdict::Accept => Ok(()),
+            Verdict::Reject => Err(BatchValidationError::EmptyBatch),
+            Verdict::RejectDigest => Err(BatchValidationError::InvalidDigest),
+        }
+    }
+
+    fn submit_txn_if_mine(&self, _tx_bytes: &[u8], _committee_size: u64, _committee_slot: u64) {}
+}
+
+/// A [`WorkerToPrimaryClient`] that counts `report_others_batch` calls. Used to prove the report
+/// path still acknowledges a repeated batch.
+#[derive(Debug)]
+struct CountingWorkerToPrimary {
+    /// Number of `report_others_batch` calls so far.
+    others_reports: Arc<AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl WorkerToPrimaryClient for CountingWorkerToPrimary {
+    async fn report_own_batch(&self, _request: WorkerOwnBatchMessage) -> eyre::Result<()> {
+        Ok(())
+    }
+
+    async fn report_others_batch(&self, _request: WorkerOthersBatchMessage) -> eyre::Result<()> {
+        self.others_reports.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+/// Counters shared with a handler built by [`create_counting_test_types`].
+struct ReportCounters {
+    /// Number of `validate_batch` calls.
+    validations: Arc<AtomicUsize>,
+    /// Number of `report_others_batch` calls to the primary.
+    others_reports: Arc<AtomicUsize>,
+}
+
+/// Build a handler whose validator returns `verdict` and whose validator and primary count their
+/// calls. Returns the test types, the shared node store, and the counters.
+fn create_counting_test_types(verdict: Verdict) -> (TestTypes, MemDatabase, ReportCounters) {
+    let counters = ReportCounters {
+        validations: Arc::new(AtomicUsize::new(0)),
+        others_reports: Arc::new(AtomicUsize::new(0)),
+    };
+    let (types, store) = create_test_types_with_validator_and_primary(
+        Arc::new(CountingBatchValidator { calls: counters.validations.clone(), verdict }),
+        Arc::new(CountingWorkerToPrimary { others_reports: counters.others_reports.clone() }),
+    );
+    (types, store, counters)
 }
 
 // ============================================================================
@@ -135,6 +231,132 @@ async fn test_report_batch_fails_non_committee_peer() {
     let bad_peer = BlsPublicKey::default();
     let res = handler.pub_process_report_batch(&bad_peer, sealed_batch).await;
     assert_matches!(res, Err(WorkerNetworkError::NonCommitteeBatch));
+}
+
+/// A committee member that reports the same batch twice gets two acknowledgements, but the worker
+/// validates and caches the batch only once (issue #1515). Without the cache check the repeat is
+/// validated again, so the validation count is 2 and this test fails.
+#[tokio::test]
+async fn test_report_batch_dedupes_repeat_digest() {
+    let (TestTypes { committee, handler, .. }, store, counters) =
+        create_counting_test_types(Verdict::Accept);
+    // current-epoch batch (fixture epoch is 0)
+    let batch = Batch::default();
+    let digest = batch.digest();
+    let reporter = committee.last_authority().primary_public_key();
+
+    let first = handler.pub_process_report_batch(&reporter, batch.clone().seal(digest)).await;
+    assert_matches!(first, Ok(()));
+    let repeat = handler.pub_process_report_batch(&reporter, batch.seal(digest)).await;
+    assert_matches!(repeat, Ok(()));
+
+    assert_eq!(
+        counters.validations.load(Ordering::SeqCst),
+        1,
+        "a repeat of a cached digest must not be validated again"
+    );
+    assert_eq!(
+        counters.others_reports.load(Ordering::SeqCst),
+        2,
+        "every report must still be acknowledged"
+    );
+    assert!(store.get::<NodeBatchesCache>(&digest).expect("read store").is_some());
+}
+
+/// A repeat that attaches a different body to a cached digest is acknowledged, but that body is not
+/// validated or stored: the cache keeps the body the worker validated. Without the cache check the
+/// repeat overwrites the cached body, so this test fails.
+#[tokio::test]
+async fn test_report_batch_repeat_keeps_validated_body() {
+    let (TestTypes { committee, handler, .. }, store, counters) =
+        create_counting_test_types(Verdict::Accept);
+    let validated = Batch::default();
+    let digest = validated.digest();
+    // same digest, different body: the digest in a `SealedBatch` is not checked on construction
+    let other_body = Batch { beneficiary: Address::repeat_byte(0x42), ..Batch::default() };
+    assert_ne!(other_body.beneficiary, validated.beneficiary);
+    let reporter = committee.last_authority().primary_public_key();
+
+    let first = handler.pub_process_report_batch(&reporter, validated.clone().seal(digest)).await;
+    assert_matches!(first, Ok(()));
+    let repeat =
+        handler.pub_process_report_batch(&reporter, SealedBatch::new(other_body, digest)).await;
+    assert_matches!(repeat, Ok(()));
+
+    assert_eq!(counters.validations.load(Ordering::SeqCst), 1);
+    assert_eq!(counters.others_reports.load(Ordering::SeqCst), 2);
+    let cached = store
+        .get::<NodeBatchesCache>(&digest)
+        .expect("read store")
+        .expect("validated batch is cached");
+    assert_eq!(
+        cached.beneficiary, validated.beneficiary,
+        "a repeat must not replace the validated body of a cached digest"
+    );
+}
+
+/// A rejected batch is never cached, but its digest is kept as rejected for the epoch, so a repeat
+/// is refused without validation and never acknowledged (issue #1774). Without the rejected set the
+/// repeat is validated again, so the validation count is 2 and this test fails.
+#[tokio::test]
+async fn test_report_batch_rejected_repeat_is_refused_without_validation() {
+    let (TestTypes { committee, handler, .. }, store, counters) =
+        create_counting_test_types(Verdict::Reject);
+    let batch = Batch::default();
+    let digest = batch.digest();
+    let reporter = committee.last_authority().primary_public_key();
+
+    let first = handler.pub_process_report_batch(&reporter, batch.clone().seal(digest)).await;
+    assert_matches!(
+        first,
+        Err(WorkerNetworkError::BatchValidation(BatchValidationError::EmptyBatch))
+    );
+    let repeat = handler.pub_process_report_batch(&reporter, batch.seal(digest)).await;
+    assert!(
+        matches!(&repeat, Err(WorkerNetworkError::RejectedBatchRepeat(d)) if *d == digest),
+        "a repeat of a rejected digest must be refused, got {repeat:?}"
+    );
+
+    assert_eq!(
+        counters.validations.load(Ordering::SeqCst),
+        1,
+        "a repeat of a rejected digest must not be validated again"
+    );
+    assert_eq!(counters.others_reports.load(Ordering::SeqCst), 0);
+    assert!(store.get::<NodeBatchesCache>(&digest).expect("read store").is_none());
+}
+
+/// An `InvalidDigest` failure is never kept as rejected: the body did not hash to the claimed
+/// digest, so keeping that digest would let a sender poison the digest of an honest batch. A repeat
+/// of such a report is therefore validated again (issue #1774). If the failure were kept, the
+/// repeat would be refused without validation, so the validation count would be 1 and this test
+/// fails.
+#[tokio::test]
+async fn test_report_batch_invalid_digest_is_validated_again() {
+    let (TestTypes { committee, handler, .. }, store, counters) =
+        create_counting_test_types(Verdict::RejectDigest);
+    let batch = Batch::default();
+    let digest = batch.digest();
+    let reporter = committee.last_authority().primary_public_key();
+
+    let first = handler.pub_process_report_batch(&reporter, batch.clone().seal(digest)).await;
+    assert_matches!(
+        first,
+        Err(WorkerNetworkError::BatchValidation(BatchValidationError::InvalidDigest))
+    );
+    let repeat = handler.pub_process_report_batch(&reporter, batch.seal(digest)).await;
+    assert_matches!(
+        repeat,
+        Err(WorkerNetworkError::BatchValidation(BatchValidationError::InvalidDigest))
+    );
+
+    assert_eq!(
+        counters.validations.load(Ordering::SeqCst),
+        2,
+        "an invalid-digest failure must not be kept, so a repeat is validated again"
+    );
+    assert_eq!(counters.others_reports.load(Ordering::SeqCst), 0);
+    assert!(store.get::<NodeBatchesCache>(&digest).expect("read store").is_none());
 }
 
 // ============================================================================
@@ -410,9 +632,121 @@ async fn test_request_batches_no_peers() {
     });
 
     let mut digests = BTreeSet::from([B256::random()]);
-    let result = handle.pub_request_batches(&mut digests).await;
+    let result = handle.pub_request_batches(&mut digests, None).await;
     // no peers → returns Ok(empty)
     assert!(result.unwrap().is_empty());
+}
+
+/// The commands a [`WorkerNetworkHandle`] sends to its swarm, as a stream for a mock swarm.
+fn swarm_commands(
+    rx: mpsc::Receiver<NetworkCommand<WorkerRequest, WorkerResponse>>,
+) -> impl futures::Stream<Item = NetworkCommand<WorkerRequest, WorkerResponse>> {
+    futures::stream::unfold(rx, |mut rx| async move { rx.recv().await.map(|cmd| (cmd, rx)) })
+}
+
+/// A mock swarm for `request_batches`: it answers `ConnectedPeers` with `peers`, records the peer
+/// of each `OpenStream` on `opened`, and fails each open with a dial error. A dial error is not a
+/// negotiation failure, so the worker does not cache the peer as unsupported.
+async fn failing_open_swarm(
+    rx: mpsc::Receiver<NetworkCommand<WorkerRequest, WorkerResponse>>,
+    peers: Vec<BlsPublicKey>,
+    opened: mpsc::UnboundedSender<BlsPublicKey>,
+) {
+    swarm_commands(rx)
+        .for_each(|cmd| {
+            if let NetworkCommand::ConnectedPeers { reply } = cmd {
+                reply.send(peers.clone()).expect("send peers");
+            } else if let NetworkCommand::OpenStream { peer, reply, .. } = cmd {
+                opened.send(peer).expect("record open");
+                assert!(
+                    reply.send(Err(NetworkError::Dial("mock open failure".to_string()))).is_ok(),
+                    "send open result"
+                );
+            }
+            future::ready(())
+        })
+        .await;
+}
+
+/// `request_batches` tries the preferred peer (the header author) first, whatever order the swarm
+/// reports peers in, then the rest in the reported order. Each peer whose open fails is tried once.
+#[tokio::test]
+async fn test_request_batches_tries_preferred_peer_first() {
+    let committee = CommitteeFixture::builder(MemDatabase::default).randomize_ports(true).build();
+    let unknown = BlsPublicKey::default();
+    let other = committee.first_authority().primary_public_key();
+    let author = committee.last_authority().primary_public_key();
+    let (tx, rx) = mpsc::channel(10);
+    let (opened_tx, mut opened_rx) = mpsc::unbounded_channel();
+    tokio::spawn(failing_open_swarm(rx, vec![unknown, other, author], opened_tx));
+    let task_manager = TaskManager::default();
+    let handle =
+        WorkerNetworkHandle::new(NetworkHandle::new(tx), task_manager.get_spawner(), 0, 0, 0);
+
+    let mut digests = BTreeSet::from([B256::random()]);
+    let preferred = AuthorityIdentifier::from(author);
+    let result = handle.pub_request_batches(&mut digests, Some(&preferred)).await;
+    assert!(result.is_err(), "every open fails, so nothing is fetched");
+
+    let opened: Vec<BlsPublicKey> = std::iter::from_fn(|| opened_rx.try_recv().ok()).collect();
+    assert_eq!(opened, vec![author, unknown, other]);
+}
+
+/// A peer whose stream open never completes cannot hold `request_batches` past
+/// `BATCH_REQUEST_TOTAL_TIMEOUT`. The bound releases the caller: a gossip prefetch frees its
+/// permit, and the vote-path `synchronize` returns an error that its caller retries. Regression
+/// test for issue #1717.
+#[tokio::test(start_paused = true)]
+async fn test_request_batches_is_bounded_by_total_timeout() {
+    // `BATCH_REQUEST_TOTAL_TIMEOUT` is crate-private; keep this value in step with it
+    let total_timeout = Duration::from_secs(480);
+    let peers = vec![BlsPublicKey::default()];
+    let (tx, rx) = mpsc::channel(10);
+    tokio::spawn(swarm_commands(rx).fold(Vec::new(), move |mut held_opens, cmd| {
+        if let NetworkCommand::ConnectedPeers { reply } = cmd {
+            reply.send(peers.clone()).expect("send peers");
+        } else if let NetworkCommand::OpenStream { reply, .. } = cmd {
+            // hold the reply, so the open never completes or fails
+            held_opens.push(reply);
+        }
+        future::ready(held_opens)
+    }));
+    let task_manager = TaskManager::default();
+    let handle =
+        WorkerNetworkHandle::new(NetworkHandle::new(tx), task_manager.get_spawner(), 0, 0, 0);
+
+    let mut digests = BTreeSet::from([B256::random()]);
+    let start = tokio::time::Instant::now();
+    let result = handle.pub_request_batches(&mut digests, None).await;
+    let elapsed = start.elapsed();
+
+    assert_matches!(result, Err(NetworkError::Timeout));
+    assert!(
+        elapsed >= total_timeout && elapsed < total_timeout + Duration::from_secs(1),
+        "total timeout should fire at ~{total_timeout:?}, fired at {elapsed:?}"
+    );
+    assert_eq!(digests.len(), 1, "an unfetched digest stays requested");
+}
+
+/// A peer whose exchange fails in a way a retry does not fix (here, the stream open) is not tried
+/// again in the same `request_batches` call. Before this rule it was tried on each of the
+/// `MAX_BATCH_REQUEST_RETRIES` (3) passes.
+#[tokio::test]
+async fn test_request_batches_skips_failed_peer_on_later_passes() {
+    let peer = BlsPublicKey::default();
+    let (tx, rx) = mpsc::channel(10);
+    let (opened_tx, mut opened_rx) = mpsc::unbounded_channel();
+    tokio::spawn(failing_open_swarm(rx, vec![peer], opened_tx));
+    let task_manager = TaskManager::default();
+    let handle =
+        WorkerNetworkHandle::new(NetworkHandle::new(tx), task_manager.get_spawner(), 0, 0, 0);
+
+    let mut digests = BTreeSet::from([B256::random()]);
+    let result = handle.pub_request_batches(&mut digests, None).await;
+    assert!(result.is_err(), "the only peer fails, so nothing is fetched");
+
+    let opened: Vec<BlsPublicKey> = std::iter::from_fn(|| opened_rx.try_recv().ok()).collect();
+    assert_eq!(opened, vec![peer], "the failed peer is opened once, not once per pass");
 }
 
 // ============================================================================
@@ -501,7 +835,8 @@ fn test_is_author_content_fault() {
 // ============================================================================
 
 /// Test that acquiring all MAX_CONCURRENT_BATCH_STREAMS permits causes try_acquire_owned to fail,
-/// which is how the sync responder sheds load (a denied admission writes `Deny(AtCapacity)`).
+/// which is how the public share of the sync responder's batch-serve pool sheds load from public
+/// peers (a refused serve writes `Deny(AtCapacity)`; committee peers still have their reserve).
 #[tokio::test]
 async fn test_semaphore_exhaustion_denies_admission() {
     let semaphore = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_BATCH_STREAMS));

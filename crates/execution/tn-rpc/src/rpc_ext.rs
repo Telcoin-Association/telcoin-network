@@ -710,6 +710,20 @@ where
 }
 
 impl<N: EngineToPrimary> TelcoinNetworkRpcExt<N> {
+    /// Return a live mode reader for transaction admission on worker RPC servers.
+    ///
+    /// Shares the primary interface with `tn_nodeMode`, so admission follows the
+    /// same demotion and rejoin updates without caching a mode at server startup.
+    pub fn node_mode_reader(
+        &self,
+    ) -> impl Fn() -> tn_types::NodeMode + Send + Sync + 'static + use<N>
+    where
+        N: Send + Sync + 'static,
+    {
+        let primary = Arc::clone(&self.inner_node_network);
+        move || primary.node_mode()
+    }
+
     /// Create new instance of the Telcoin Network RPC extension.
     pub fn new(evm_state: RethEnv, inner_node_network: N) -> Self {
         let blocking_io_guard = Arc::new(Semaphore::new(MAX_CONCURRENT_BLOCKING_RPC_WORK));

@@ -1,8 +1,8 @@
 //! Configuration for network variables.
 
 use crate::{
-    ConfigFmt, ConfigTrait, NetworkBudgetError, NetworkProcessBudget, SwarmNetworkBudget,
-    TelcoinDirs,
+    ConfigFmt, ConfigTrait, NetworkBudgetError, NetworkProcessBudget, ServeBudget,
+    SourceAdmissionConfig, SwarmNetworkBudget, TelcoinDirs,
 };
 use libp2p::{kad::K_VALUE, multiaddr::Protocol, PeerId};
 use serde::{
@@ -11,10 +11,27 @@ use serde::{
 };
 use std::{collections::BTreeMap, fmt, num::NonZeroUsize, time::Duration};
 use tn_types::{BlsPublicKey, BootstrapServer, Committee, Multiaddr, P2pNode, Round, WorkerId};
-use tracing::warn;
+
+mod trusted;
+use tracing::{info, warn};
+pub use trusted::{TrustedNode, TrustedNodeConfigError};
 
 mod quic;
-pub use quic::QuicConfig;
+pub use quic::{InboundAcceptTask, QuicConfig};
+
+impl InboundAcceptTask {
+    /// The accepted-handshake queue capacity of the spawned mode; `None` keeps the inline path.
+    ///
+    /// The node writes this to the carried transport. The release fixtures compile `quic.rs` by
+    /// path against transports without such a field, so this node-only accessor lives here, where
+    /// their dead-code lint never sees it.
+    pub const fn spawned_capacity(self) -> Option<NonZeroUsize> {
+        match self {
+            Self::Inline => None,
+            Self::Spawned { capacity } => Some(capacity),
+        }
+    }
+}
 
 impl ConfigTrait for NetworkConfig {}
 
@@ -32,8 +49,15 @@ pub struct NetworkConfig {
     quic_config: QuicConfig,
     /// Optional process-wide allocation. Omission preserves the existing transport defaults.
     process_budget: Option<NetworkProcessBudget>,
+    /// Opt-in per-class serve permit budget. Omission leaves every class unbounded.
+    serve_budget: ServeBudget,
     /// The configuration for managing peers.
     peer_config: PeerConfig,
+    /// Connection admission policy shared by the primary and every worker swarm.
+    admission: AdmissionConfig,
+    /// Optional process-wide accounting of established connections by observed source.
+    /// No production limits are assumed when this configuration is absent.
+    source_admission: Option<SourceAdmissionConfig>,
     /// Legacy startup peer-wait budget, retained for configuration compatibility.
     ///
     /// Network readiness is sampled continuously and no longer delays epoch startup.
@@ -47,6 +71,11 @@ pub struct NetworkConfig {
     /// over this map, with an explicitly empty override selecting the genesis fallback.
     /// Committee membership and gossip publisher authorization remain derived from chain state.
     bootstrap_peers: BTreeMap<BlsPublicKey, BootstrapServer>,
+    /// Operator-provisioned hubs, maintained on the primary and every configured worker swarm.
+    ///
+    /// Keys identify BLS signers. Entries are dial hints and retention policy, never proof of
+    /// remote identity or permission to publish committee-only gossip.
+    trusted_nodes: BTreeMap<BlsPublicKey, TrustedNode>,
     /// Operator-owned launch inventory, independent of bootstrap selection.
     ///
     /// At genesis (epoch 0) a nonempty map must cover every committee member's primary and
@@ -155,6 +184,16 @@ impl fmt::Display for CommitteePeerError {
 impl std::error::Error for CommitteePeerError {}
 
 impl NetworkConfig {
+    /// Return this node's connection admission configuration.
+    pub fn admission(&self) -> &AdmissionConfig {
+        &self.admission
+    }
+
+    /// Return explicit deployment limits for source admission, when configured.
+    pub fn source_admission(&self) -> Option<&SourceAdmissionConfig> {
+        self.source_admission.as_ref()
+    }
+
     /// Return the local launch inventory. Membership remains derived from chain state.
     pub fn committee_peers(&self) -> &BTreeMap<BlsPublicKey, BootstrapServer> {
         &self.committee_peers
@@ -264,9 +303,54 @@ impl NetworkConfig {
         self.process_budget.as_ref().map(NetworkProcessBudget::allocate).transpose()
     }
 
+    /// The per-class serve permit budget. Every class is unbounded when not configured.
+    pub fn serve_budget(&self) -> ServeBudget {
+        self.serve_budget
+    }
+
     /// Endpoint mappings for the primary and every independently keyed worker.
     pub fn endpoints(&self) -> &EndpointMappings {
         &self.endpoints
+    }
+
+    /// Return the configured hubs and their per-swarm endpoints.
+    pub fn trusted_nodes(&self) -> &BTreeMap<BlsPublicKey, TrustedNode> {
+        &self.trusted_nodes
+    }
+
+    /// Select only the configured endpoints belonging to one worker swarm.
+    pub fn trusted_worker_peers(&self, worker_id: WorkerId) -> BTreeMap<BlsPublicKey, P2pNode> {
+        self.trusted_nodes
+            .iter()
+            .filter_map(|(bls, node)| node.worker(worker_id).cloned().map(|peer| (*bls, peer)))
+            .collect()
+    }
+
+    /// Validate every hub before spawning networks, including the resolved bootstrap overrides.
+    ///
+    /// A shared hub list can name this node too. An entry for this node's BLS key is valid only
+    /// when its network keys are this node's keys. That entry is then removed, so this node
+    /// never dials or retains itself. Any other entry that uses this node's network keys fails.
+    pub fn validate_trusted_nodes(
+        &mut self,
+        bootstrap: &BTreeMap<BlsPublicKey, BootstrapServer>,
+        num_workers: usize,
+        local_bls: &BlsPublicKey,
+        local_primary: &P2pNode,
+        local_workers: &[P2pNode],
+    ) -> Result<(), TrustedNodeConfigError> {
+        trusted::validate(
+            &self.trusted_nodes,
+            bootstrap,
+            num_workers,
+            local_bls,
+            local_primary,
+            local_workers,
+        )?;
+        if self.trusted_nodes.remove(local_bls).is_some() {
+            info!(target: "tn::config", %local_bls, "trusted_nodes names this node; entry skipped");
+        }
+        Ok(())
     }
 
     /// Return the legacy startup peer-readiness budget.
@@ -391,6 +475,56 @@ impl NetworkConfig {
     pub fn write_config<TND: TelcoinDirs>(&self, tn_datadir: &TND) -> eyre::Result<()> {
         let path = tn_datadir.network_config_path();
         Self::write_to_path(path, self, ConfigFmt::YAML)
+    }
+}
+
+/// Connection admission rollout mode. Authentication and resource limits apply in every mode.
+#[derive(Serialize, Deserialize, Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum AdmissionMode {
+    /// Preserve unrestricted discovery and the existing identity and ban checks.
+    #[default]
+    Open,
+    /// Permit discovery while operators observe and repair the admission inputs.
+    Grace,
+    /// Admit only committee, trusted, and bootstrap identities when inputs are complete.
+    Closed,
+}
+
+/// Settings for renewable, epoch-versioned connection admission snapshots.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(default)]
+pub struct AdmissionConfig {
+    /// Requested rollout mode; an unsafe snapshot always falls back to Open or Grace.
+    mode: AdmissionMode,
+    /// Maximum seconds since the epoch owner last renewed the authoritative snapshot.
+    snapshot_max_age_secs: u64,
+}
+
+impl Default for AdmissionConfig {
+    fn default() -> Self {
+        Self { mode: AdmissionMode::Open, snapshot_max_age_secs: 300 }
+    }
+}
+
+impl AdmissionConfig {
+    /// Construct a policy with an explicit renewal lease. A zero lease prevents Closed.
+    pub fn new(mode: AdmissionMode, snapshot_max_age: Duration) -> Self {
+        Self { mode, snapshot_max_age_secs: snapshot_max_age.as_secs() }
+    }
+
+    /// Return the requested rollout mode.
+    pub fn mode(&self) -> AdmissionMode {
+        self.mode
+    }
+
+    /// Return the snapshot lease, measured with the swarm's monotonic clock.
+    pub fn snapshot_max_age(&self) -> Duration {
+        Duration::from_secs(self.snapshot_max_age_secs)
+    }
+
+    /// Renew at one third of the lease, with a minimum interval of one second.
+    pub fn refresh_interval(&self) -> Duration {
+        Duration::from_secs((self.snapshot_max_age_secs / 3).max(1))
     }
 }
 
@@ -606,7 +740,8 @@ pub struct SyncConfig {
     /// - Beyond this tolerance but within this tolerance plus [`crate::Parameters::vote_timeout`],
     ///   it answers with a retryable response and charges no penalty. The proposer retries the
     ///   request, and by then the lead may be back within tolerance.
-    /// - Further ahead, it rejects the header and penalizes the proposer.
+    /// - Further ahead, it rejects the header without a score penalty. Clock skew may be local to
+    ///   either peer, so rejecting the header must not prevent recovery through that peer.
     ///
     /// Defaults to 250 ms, and [`NetworkConfig::read_config`] logs a warning for values above one
     /// second.
@@ -697,7 +832,8 @@ pub struct PeerConfig {
     pub heartbeat_interval: u64,
     /// The target number of connected peers.
     pub target_num_peers: usize,
-    /// The timeout for dialing a peer.
+    /// The requested timeout for dialing a peer.
+    /// The network raises this to cover all signed endpoints plus transport and delivery slack.
     pub dial_timeout: Duration,
     /// A fraction of `Self::target_num_peers` that is allowed to connect to this node in excess of
     /// `PeerManager::target_num_peers`.
@@ -957,6 +1093,8 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rand::{rngs::StdRng, SeedableRng};
+    use tn_types::{BlsKeypair, Multiaddr, NetworkKeypair};
 
     /// Default and legacy configs retain the production two-minute readiness budget.
     #[test]
@@ -985,6 +1123,216 @@ mod tests {
         serde_yaml::from_str::<tn_types::Committee>(tn_types::MAINNET_COMMITTEE)
             .map(|committee| committee.bootstrap_servers())
             .map_err(Into::into)
+    }
+
+    /// Build hubs with explicit worker IDs from real genesis identities.
+    fn trusted_fixture() -> eyre::Result<BTreeMap<BlsPublicKey, TrustedNode>> {
+        bootstrap_fixture().and_then(|peers| {
+            peers
+                .into_iter()
+                .map(|(bls, server)| {
+                    let worker =
+                        server.worker(0).cloned().ok_or_else(|| eyre::eyre!("genesis worker 0"))?;
+                    let workers = [(0, worker), (1, server.primary.clone())].into_iter().collect();
+                    Ok((bls, TrustedNode::new(server.primary, workers)))
+                })
+                .collect()
+        })
+    }
+
+    /// Return a node identity that no fixture entry uses.
+    fn outside_identity() -> (BlsPublicKey, P2pNode, Vec<P2pNode>) {
+        let endpoint = || {
+            P2pNode::from((NetworkKeypair::generate_ed25519().public().into(), Multiaddr::empty()))
+        };
+        (
+            *BlsKeypair::generate(&mut StdRng::from_seed([7; 32])).public(),
+            endpoint(),
+            vec![endpoint(), endpoint()],
+        )
+    }
+
+    /// Validate as a node whose identity no fixture entry uses.
+    fn validate_outside(
+        config: &mut NetworkConfig,
+        bootstrap: &BTreeMap<BlsPublicKey, BootstrapServer>,
+        num_workers: usize,
+    ) -> Result<(), TrustedNodeConfigError> {
+        let (bls, primary, workers) = outside_identity();
+        config.validate_trusted_nodes(bootstrap, num_workers, &bls, &primary, &workers)
+    }
+
+    /// YAML preserves multiple hubs and explicit worker IDs, and old files need no new key.
+    #[test]
+    fn trusted_nodes_round_trip_multiple_workers() -> eyre::Result<()> {
+        let config = NetworkConfig { trusted_nodes: trusted_fixture()?, ..Default::default() };
+        let mut parsed: NetworkConfig = serde_yaml::from_str(&serde_yaml::to_string(&config)?)?;
+        assert_eq!(parsed.trusted_nodes(), config.trusted_nodes());
+        validate_outside(&mut parsed, &BTreeMap::new(), 2)?;
+        assert!(parsed.trusted_nodes().values().all(|node| node.worker(0).is_some()
+            && node.worker(1).is_some()
+            && node.worker(2).is_none()));
+        let legacy: NetworkConfig = serde_yaml::from_str("hostname: legacy\n")?;
+        assert!(legacy.trusted_nodes().is_empty());
+        Ok(())
+    }
+
+    /// Missing and unsupported worker IDs fail before any swarm can be spawned.
+    #[test]
+    fn trusted_nodes_require_every_supported_worker() -> eyre::Result<()> {
+        let mut config = NetworkConfig { trusted_nodes: trusted_fixture()?, ..Default::default() };
+        [1, 3].into_iter().try_for_each(|count| -> eyre::Result<()> {
+            let error = validate_outside(&mut config, &BTreeMap::new(), count)
+                .err()
+                .ok_or_else(|| eyre::eyre!("expected invalid worker coverage"))?;
+            assert!(error.to_string().contains(".workers: expected every worker ID"));
+            Ok(())
+        })
+    }
+
+    /// The startup selector keeps worker identities and addresses isolated by worker ID.
+    #[test]
+    fn trusted_nodes_worker_endpoint_isolation() -> eyre::Result<()> {
+        let config = NetworkConfig { trusted_nodes: trusted_fixture()?, ..Default::default() };
+        let worker0 = config.trusted_worker_peers(0);
+        let worker1 = config.trusted_worker_peers(1);
+        assert_eq!(worker0.len(), config.trusted_nodes().len());
+        assert_eq!(worker1.len(), config.trusted_nodes().len());
+        config.trusted_nodes().iter().for_each(|(bls, node)| {
+            assert_eq!(worker0.get(bls), node.worker(0));
+            assert_eq!(worker1.get(bls), node.worker(1));
+            assert_ne!(worker0.get(bls), worker1.get(bls));
+        });
+        assert!(config.trusted_worker_peers(2).is_empty());
+        Ok(())
+    }
+
+    /// Bootstrap and trusted entries may share hints, but cannot bind one BLS key to two IDs.
+    #[test]
+    fn trusted_nodes_reject_conflicting_bootstrap_identity() -> eyre::Result<()> {
+        let bootstrap = bootstrap_fixture()?;
+        let trusted: BTreeMap<_, _> = bootstrap
+            .iter()
+            .map(|(bls, server)| {
+                (
+                    *bls,
+                    TrustedNode::new(
+                        server.primary.clone(),
+                        server
+                            .workers
+                            .iter()
+                            .cloned()
+                            .enumerate()
+                            .filter_map(|(id, worker)| {
+                                WorkerId::try_from(id).ok().map(|id| (id, worker))
+                            })
+                            .collect(),
+                    ),
+                )
+            })
+            .collect();
+        let mut config = NetworkConfig { trusted_nodes: trusted, ..Default::default() };
+        validate_outside(&mut config, &bootstrap, 1)?;
+        let alternate =
+            bootstrap.values().nth(1).ok_or_else(|| eyre::eyre!("second hub"))?.primary.clone();
+        let first =
+            config.trusted_nodes.values_mut().next().ok_or_else(|| eyre::eyre!("first hub"))?;
+        *first = TrustedNode::new(alternate.clone(), [(0, alternate)].into_iter().collect());
+        let error = validate_outside(&mut config, &bootstrap, 1)
+            .err()
+            .ok_or_else(|| eyre::eyre!("expected conflicting BLS binding"))?;
+        assert!(error.to_string().contains("contradictory PeerId bindings"));
+        Ok(())
+    }
+
+    /// A PeerId cannot be assigned to multiple BLS identities in the same swarm.
+    #[test]
+    fn trusted_nodes_reject_duplicate_peer_identity() -> eyre::Result<()> {
+        let mut trusted = trusted_fixture()?;
+        let endpoint =
+            trusted.values().next().ok_or_else(|| eyre::eyre!("first hub"))?.primary().clone();
+        trusted.values_mut().for_each(|node| {
+            *node = TrustedNode::new(
+                endpoint.clone(),
+                [(0, endpoint.clone()), (1, endpoint.clone())].into_iter().collect(),
+            );
+        });
+        let mut config = NetworkConfig { trusted_nodes: trusted, ..Default::default() };
+        let error = validate_outside(&mut config, &BTreeMap::new(), 2)
+            .err()
+            .ok_or_else(|| eyre::eyre!("expected duplicate PeerId"))?;
+        assert!(error.to_string().contains("assigned to multiple BLS keys"));
+        Ok(())
+    }
+
+    /// A /p2p address suffix must identify the expected authenticated transport key.
+    #[test]
+    fn trusted_nodes_reject_conflicting_address_identity() -> eyre::Result<()> {
+        let mut trusted = trusted_fixture()?;
+        let node = trusted.values_mut().next().ok_or_else(|| eyre::eyre!("first hub"))?;
+        let mut endpoint = node.primary().clone();
+        endpoint.network_address.push(libp2p::multiaddr::Protocol::P2p(libp2p::PeerId::random()));
+        *node = TrustedNode::new(
+            endpoint,
+            [(0, node.primary().clone()), (1, node.primary().clone())].into_iter().collect(),
+        );
+        let mut config = NetworkConfig { trusted_nodes: trusted, ..Default::default() };
+        let error = validate_outside(&mut config, &BTreeMap::new(), 2)
+            .err()
+            .ok_or_else(|| eyre::eyre!("expected conflicting address identity"))?;
+        assert!(error.to_string().contains("address /p2p identity must match network key"));
+        Ok(())
+    }
+
+    /// A shared hub list may name this node; a matching self entry is valid and skipped.
+    #[test]
+    fn trusted_nodes_skip_matching_self_entry() -> eyre::Result<()> {
+        let mut config = NetworkConfig { trusted_nodes: trusted_fixture()?, ..Default::default() };
+        let (bls, node) = config
+            .trusted_nodes()
+            .iter()
+            .next()
+            .map(|(bls, node)| (*bls, node.clone()))
+            .ok_or_else(|| eyre::eyre!("first hub"))?;
+        let workers: Vec<_> = (0..2).filter_map(|id| node.worker(id).cloned()).collect();
+        let count = config.trusted_nodes().len();
+        config.validate_trusted_nodes(&BTreeMap::new(), 2, &bls, node.primary(), &workers)?;
+        assert_eq!(config.trusted_nodes().len() + 1, count);
+        assert!(!config.trusted_nodes().contains_key(&bls));
+        Ok(())
+    }
+
+    /// This node's BLS key with another network key is a contradictory self entry.
+    #[test]
+    fn trusted_nodes_reject_self_bls_with_other_network_key() -> eyre::Result<()> {
+        let mut config = NetworkConfig { trusted_nodes: trusted_fixture()?, ..Default::default() };
+        let bls = *config.trusted_nodes().keys().next().ok_or_else(|| eyre::eyre!("first hub"))?;
+        let (_, primary, workers) = outside_identity();
+        let error = config
+            .validate_trusted_nodes(&BTreeMap::new(), 2, &bls, &primary, &workers)
+            .err()
+            .ok_or_else(|| eyre::eyre!("expected self identity mismatch"))?;
+        assert!(error.to_string().contains("own BLS key must use this node's network key"));
+        Ok(())
+    }
+
+    /// Another hub cannot use one of this node's network keys.
+    #[test]
+    fn trusted_nodes_reject_other_bls_with_own_network_key() -> eyre::Result<()> {
+        let mut config = NetworkConfig { trusted_nodes: trusted_fixture()?, ..Default::default() };
+        let primary = config
+            .trusted_nodes()
+            .values()
+            .next()
+            .map(|node| node.primary().clone())
+            .ok_or_else(|| eyre::eyre!("first hub"))?;
+        let (bls, _, workers) = outside_identity();
+        let error = config
+            .validate_trusted_nodes(&BTreeMap::new(), 2, &bls, &primary, &workers)
+            .err()
+            .ok_or_else(|| eyre::eyre!("expected network key owned by this node"))?;
+        assert!(error.to_string().contains("belongs to this node"));
+        Ok(())
     }
 
     /// Launch inventory round-trips and is independent of bootstrap override selection.
@@ -1533,6 +1881,22 @@ hostname: "my-validator"
         assert!(config.validate().is_err(), "a negative score_halflife must be rejected");
     }
 
+    /// A network config without a serve budget leaves every class unbounded, and a partial budget
+    /// sets only the named class.
+    #[test]
+    fn serve_budget_is_optional_and_partial() -> Result<(), serde_json::Error> {
+        let absent: NetworkConfig = serde_json::from_value(serde_json::json!({}))?;
+        assert_eq!(absent.serve_budget(), ServeBudget::default());
+        let partial: NetworkConfig =
+            serde_json::from_value(serde_json::json!({ "serve_budget": { "vote": 8 } }))?;
+        assert_eq!(partial.serve_budget().vote(), 8);
+        assert_eq!(partial.serve_budget().epoch_record(), 0);
+        assert_eq!(partial.serve_budget().certificate_sync(), 0);
+        assert_eq!(partial.serve_budget().batch(), 0);
+        assert_eq!(partial.serve_budget().other(), 0);
+        Ok(())
+    }
+
     /// Process allocations cap transport values and preserve lower operator settings.
     #[test]
     fn process_budget_caps_quic_without_raising_lower_settings() -> Result<(), std::io::Error> {
@@ -1564,8 +1928,21 @@ hostname: "my-validator"
         assert_eq!(lower.max_stream_data, 100);
         let legacy: NetworkConfig = serde_json::from_str("{}")?;
         assert_eq!(legacy.swarm_budget(), Ok(None));
-        assert_eq!(legacy.quic_config().with_budget(None).max_connection_data, 100 * 1024 * 1024);
+        assert_eq!(legacy.quic_config().with_budget(None).max_connection_data, 4 * 1024 * 1024);
         Ok(())
+    }
+
+    /// The built-in QUIC credit holds one full request-response message per stream with the same
+    /// headroom, two stream windows per connection, and at most the libp2p stream ceiling.
+    #[test]
+    fn default_quic_credit_is_bounded_by_the_message_size() {
+        let quic = super::QuicConfig::default();
+        let rpc_message =
+            u32::try_from(super::LibP2pConfig::default().max_rpc_message_size).unwrap_or(u32::MAX);
+        assert_eq!(quic.max_stream_data, rpc_message.saturating_mul(2));
+        assert_eq!(quic.max_connection_data, quic.max_stream_data.saturating_mul(2));
+        assert_eq!(quic.max_concurrent_stream_limit, 256);
+        assert_eq!(quic.with_budget(None).max_connection_data, 4 * 1024 * 1024);
     }
 
     #[test]
@@ -1666,5 +2043,23 @@ hostname: "my-validator"
         // the remaining fields still load from the file rather than from the default
         assert_eq!(parsed.max_proposed_header_age_limit, config.max_proposed_header_age_limit);
         Ok(())
+    }
+
+    /// An empty `quic_config` section yields the inline accept task on the node configuration.
+    #[test]
+    fn empty_quic_section_keeps_the_inline_accept_task() -> Result<(), serde_yaml::Error> {
+        let node: NetworkConfig = serde_yaml::from_str("quic_config: {}")?;
+        assert_eq!(node.quic_config().inbound_accept_task, super::InboundAcceptTask::Inline);
+        Ok(())
+    }
+
+    /// The inline accept task maps to no spawned capacity, and the spawned mode maps to its
+    /// capacity, which the node writes to the carried transport.
+    #[test]
+    fn spawned_capacity_maps_the_accept_task() {
+        let capacity = std::num::NonZeroUsize::MIN.saturating_add(63);
+        assert_eq!(super::InboundAcceptTask::Inline.spawned_capacity(), None);
+        let spawned = super::InboundAcceptTask::Spawned { capacity };
+        assert_eq!(spawned.spawned_capacity(), Some(capacity));
     }
 }

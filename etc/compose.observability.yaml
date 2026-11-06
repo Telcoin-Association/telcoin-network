@@ -1,0 +1,22 @@
+# Overlay: docker compose -f compose.yaml -f compose.observability.yaml up
+# Adds a Prometheus collector on the validators network. Nothing here publishes a node
+# listener; the Prometheus UI is published on host loopback only.
+# See docs/src/getting-started/observability-listeners.md.
+services:
+  prometheus:
+    image: prom/prometheus:v2.53.0
+    container_name: prometheus
+    depends_on:
+      - validator1
+      - validator2
+      - validator3
+      - validator4
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - 127.0.0.1:9090:9090
+    networks:
+      validators:
+        ipv4_address: 10.10.0.90

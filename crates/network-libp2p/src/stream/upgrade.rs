@@ -1,3 +1,4 @@
+use futures::{future::BoxFuture, AsyncReadExt as _, FutureExt as _};
 use libp2p::{core::UpgradeInfo, swarm::StreamProtocol, InboundUpgrade, OutboundUpgrade, Stream};
 use std::{
     convert::Infallible,
@@ -51,13 +52,25 @@ impl InboundUpgrade<Stream> for TNStreamProtocol {
 
 impl OutboundUpgrade<Stream> for TNStreamProtocol {
     type Output = Stream;
-    type Error = Infallible;
-    type Future = Ready<Result<Self::Output, Self::Error>>;
+    type Error = std::io::Error;
+    type Future = BoxFuture<'static, Result<Self::Output, Self::Error>>;
 
     // The caller chose the single advertised protocol, so the negotiated info is
     // redundant; correlation and framing are the application layer's concern.
-    fn upgrade_outbound(self, stream: Stream, _: Self::Info) -> Self::Future {
-        ready(Ok(stream))
+    //
+    // the swarm negotiates lazily (`V1Lazy`), which hands the stream back before the
+    // listener confirms the protocol and would defer a rejection to the caller's
+    // first read. a zero-length read drives negotiation to completion without
+    // consuming data, so a peer that does not speak sync still fails the open (the
+    // callers' capability signal) and the open costs the same round trip as strict
+    // negotiation.
+    fn upgrade_outbound(self, mut stream: Stream, _: Self::Info) -> Self::Future {
+        async move {
+            let consumed = stream.read(&mut []).await?;
+            debug_assert_eq!(consumed, 0, "an empty buffer reads no stream data");
+            Ok(stream)
+        }
+        .boxed()
     }
 }
 
@@ -126,7 +139,7 @@ impl StreamFailure {
             // transport-level: the peer went away or could not be reached
             Self::DialFailure => None,
             // stalled open
-            Self::Timeout => Some(Penalty::Mild),
+            Self::Timeout => Some(Penalty::Load(crate::LoadPenalty::Timeout)),
             // the peer speaks none of our stream protocols: honest version/role
             // skew, not a fault — not penalized, like `DialFailure` (mirrors the
             // request-response `UnsupportedProtocols` arm in `consensus.rs`).
@@ -142,7 +155,7 @@ impl StreamFailure {
                 _ => Some(Penalty::Medium),
             },
             // application-level abuse of the inbound stream path
-            Self::InboundRateLimited => Some(Penalty::Medium),
+            Self::InboundRateLimited => Some(Penalty::Load(crate::LoadPenalty::StreamRateLimit)),
         }
     }
 }
@@ -170,9 +183,15 @@ mod tests {
     #[test]
     fn penalty_mapping_mirrors_reqres() {
         assert!(StreamFailure::DialFailure.penalty().is_none());
-        assert!(matches!(StreamFailure::Timeout.penalty(), Some(Penalty::Mild)));
+        assert!(matches!(
+            StreamFailure::Timeout.penalty(),
+            Some(Penalty::Load(crate::LoadPenalty::Timeout))
+        ));
         assert!(StreamFailure::UnsupportedProtocol.penalty().is_none());
-        assert!(matches!(StreamFailure::InboundRateLimited.penalty(), Some(Penalty::Medium)));
+        assert!(matches!(
+            StreamFailure::InboundRateLimited.penalty(),
+            Some(Penalty::Load(crate::LoadPenalty::StreamRateLimit))
+        ));
         // transport flaps on WAN are not the peer's fault
         assert!(StreamFailure::Io(ErrorKind::ConnectionReset).penalty().is_none());
         assert!(StreamFailure::Io(ErrorKind::BrokenPipe).penalty().is_none());

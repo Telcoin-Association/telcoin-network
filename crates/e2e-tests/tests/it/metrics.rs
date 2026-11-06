@@ -8,7 +8,8 @@ use crate::common::{
     network_advancing, scrape_metrics, start_validator, start_validator_with_args, ProcessGuard,
 };
 
-/// Poll the endpoint until the body contains all expected substrings (or time out).
+/// Poll the endpoint every 50ms until the body contains all expected substrings (or time out
+/// after `attempts` polls).
 fn scrape_until_contains(addr: &str, expected: &[&str], attempts: usize) -> eyre::Result<String> {
     let mut last = String::new();
     for _ in 0..attempts {
@@ -18,7 +19,7 @@ fn scrape_until_contains(addr: &str, expected: &[&str], attempts: usize) -> eyre
             }
             last = body;
         }
-        std::thread::sleep(Duration::from_secs(1));
+        std::thread::sleep(Duration::from_millis(50));
     }
     Err(eyre::eyre!(
         "metrics endpoint never served all of {expected:?}; last response:\n{}",
@@ -103,11 +104,13 @@ fn test_metrics_endpoint_serves_tn_and_reth_metrics() -> eyre::Result<()> {
             "tn_executor_outputs_ready_total",
             "tn_network_connected_peers",
         ],
-        45,
+        // At least the former 45 polls at 1s: 900 polls at 50ms.
+        900,
     )?;
 
     assert!(body.starts_with("HTTP/1.1 200 OK"), "expected 200 OK: {}", &body[..100]);
     info!(target: "e2e-test", "metrics endpoint serving tn_ and reth_ series");
 
+    guard.finish();
     Ok(())
 }

@@ -132,6 +132,7 @@ impl WorkerResponse {
             WorkerNetworkError::Bcs(_)
             | WorkerNetworkError::BatchValidation(_)
             | WorkerNetworkError::NonCommitteeBatch
+            | WorkerNetworkError::RejectedBatchRepeat(_)
             | WorkerNetworkError::InvalidRequest(_)
             | WorkerNetworkError::InvalidTopic
             | WorkerNetworkError::TooManyBatches { .. }

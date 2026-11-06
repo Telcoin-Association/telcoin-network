@@ -1,7 +1,22 @@
 //! QUIC settings shared by the node and independently resolved transport fixtures.
 
 use serde::{Deserialize, Serialize};
-use std::time::Duration;
+use std::{num::NonZeroUsize, time::Duration};
+
+/// Where a QUIC listener decides on inbound connection attempts and accepts them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "mode")]
+pub enum InboundAcceptTask {
+    /// The shipped default: the listener decides and accepts inside the swarm task.
+    #[default]
+    Inline,
+    /// A measurement prototype for issue #1741: a dedicated task decides and accepts, and
+    /// the accepted handshakes wait in a bounded queue until the swarm takes them.
+    Spawned {
+        /// Accepted handshakes that may wait for the swarm at one time.
+        capacity: NonZeroUsize,
+    },
+}
 
 /// Configure the quic transport for libp2p.
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -9,6 +24,7 @@ use std::time::Duration;
 pub struct QuicConfig {
     /// Timeout for the initial handshake when establishing a connection.
     /// The actual timeout is the minimum of this and the [`Self::max_idle_timeout`].
+    /// Each signed endpoint gets this window when dialing addresses in order.
     pub handshake_timeout: Duration,
     /// Maximum duration of inactivity in ms to accept before timing out the connection.
     pub max_idle_timeout: u32,
@@ -32,21 +48,50 @@ pub struct QuicConfig {
     ///
     /// Default `true`. Set `false` only as an operator rollback switch.
     pub retry_unvalidated_incoming: bool,
+    /// Where a listener decides on inbound connection attempts and accepts them.
+    ///
+    /// Default [`InboundAcceptTask::Inline`]. The spawned mode is a measurement prototype
+    /// for issue #1741 and not a production setting.
+    pub inbound_accept_task: InboundAcceptTask,
 }
+
+/// Default ceiling on concurrent incoming bidirectional streams per connection.
+///
+/// This is the libp2p QUIC default. A peer opens one stream per request, gossip frame or sync
+/// session, and the serve budgets hold far fewer than this in flight, so the value is headroom for
+/// a well-behaved peer and a bound for a hostile one. quinn buffers data for every opened stream
+/// until the swarm accepts it in index order, and every empty stream ahead of the data costs one
+/// inbound upgrade timeout, so the stream ceiling also bounds how long buffered data can wait.
+pub(crate) const DEFAULT_MAX_CONCURRENT_STREAM_LIMIT: u32 = 256;
+
+/// Default receive credit per stream, in bytes: 2 MiB.
+///
+/// A request-response message is at most `max_rpc_message_size` (1 MiB by default), a gossip frame
+/// stays under 2 MiB, and a sync frame is read in bounded chunks, so one stream window holds the
+/// largest message a protocol reads in one step with the same amount of headroom. A larger message
+/// still arrives: quinn re-issues stream credit as the handler reads.
+pub(crate) const DEFAULT_MAX_STREAM_DATA: u32 = 2 * 1024 * 1024;
+
+/// Default receive credit per connection, in bytes: 4 MiB, two full stream windows.
+///
+/// This is the most data one connection can make the node buffer before the application reads it.
+/// With the per-peer and per-swarm connection ceilings of the consensus network, a free peer id
+/// pins at most 32 MiB and a whole swarm at most 512 MiB. The previous 100 MiB window allowed
+/// 800 MiB per peer id and had no swarm bound. Throughput per connection stays at the window over
+/// the round-trip time: 40 MiB/s at 100 ms.
+pub(crate) const DEFAULT_MAX_CONNECTION_DATA: u32 = 4 * 1024 * 1024;
 
 impl Default for QuicConfig {
     fn default() -> Self {
         Self {
-            handshake_timeout: Duration::from_secs(65),
+            handshake_timeout: Duration::from_secs(10),
             max_idle_timeout: 30 * 1_000, // 30s
             keep_alive_interval: Duration::from_secs(5),
-            max_concurrent_stream_limit: 10_000,
-            // may need to increase these based on RTT
-            //
-            // maximum throughput = (buffer size / round-trip time)
-            max_stream_data: 50 * 1024 * 1024,      // 50MiB
-            max_connection_data: 100 * 1024 * 1024, // 100MiB
+            max_concurrent_stream_limit: DEFAULT_MAX_CONCURRENT_STREAM_LIMIT,
+            max_stream_data: DEFAULT_MAX_STREAM_DATA,
+            max_connection_data: DEFAULT_MAX_CONNECTION_DATA,
             retry_unvalidated_incoming: true,
+            inbound_accept_task: InboundAcceptTask::Inline,
         }
     }
 }
@@ -54,8 +99,8 @@ impl Default for QuicConfig {
 impl QuicConfig {
     /// Apply the shared transport settings while preserving libp2p's identity and other defaults.
     ///
-    /// The node applies its incoming connection policy separately because the release fixtures
-    /// use transports without that policy API.
+    /// The node applies its incoming connection policy and its inbound accept task separately
+    /// because the release fixtures use transports without those APIs.
     pub fn apply_to(&self, mut config: libp2p::quic::Config) -> libp2p::quic::Config {
         config.handshake_timeout = self.handshake_timeout;
         config.max_idle_timeout = self.max_idle_timeout;
@@ -69,8 +114,11 @@ impl QuicConfig {
 
 #[cfg(test)]
 mod tests {
-    use super::QuicConfig;
-    use std::time::Duration;
+    use super::{InboundAcceptTask, QuicConfig};
+    use std::{num::NonZeroUsize, time::Duration};
+
+    /// A nondefault accept queue capacity (64).
+    const CAPACITY: NonZeroUsize = NonZeroUsize::MIN.saturating_add(63);
 
     /// Every configurable field must reach the transport, including nondefault operator settings.
     #[test]
@@ -92,5 +140,32 @@ mod tests {
         assert_eq!(config.max_concurrent_stream_limit, settings.max_concurrent_stream_limit);
         assert_eq!(config.max_stream_data, settings.max_stream_data);
         assert_eq!(config.max_connection_data, settings.max_connection_data);
+    }
+
+    /// The shipped default keeps the inline path.
+    #[test]
+    fn inline_default_keeps_the_inline_path() {
+        assert_eq!(QuicConfig::default().inbound_accept_task, InboundAcceptTask::Inline);
+    }
+
+    /// The accept task setting round-trips through serde, an explicit spawned section parses,
+    /// and an empty section yields the inline default.
+    #[test]
+    fn inbound_accept_task_round_trips() -> Result<(), serde_json::Error> {
+        let spawned = QuicConfig {
+            inbound_accept_task: InboundAcceptTask::Spawned { capacity: CAPACITY },
+            ..QuicConfig::default()
+        };
+        let text = serde_json::to_string(&spawned)?;
+        assert!(text.contains(r#""mode":"spawned""#), "{text}");
+        assert!(text.contains(r#""capacity":64"#), "{text}");
+        let parsed: QuicConfig = serde_json::from_str(&text)?;
+        assert_eq!(parsed.inbound_accept_task, spawned.inbound_accept_task);
+        let explicit: QuicConfig =
+            serde_json::from_str(r#"{"inbound_accept_task":{"mode":"spawned","capacity":64}}"#)?;
+        assert_eq!(explicit.inbound_accept_task, InboundAcceptTask::Spawned { capacity: CAPACITY });
+        let empty: QuicConfig = serde_json::from_str("{}")?;
+        assert_eq!(empty.inbound_accept_task, InboundAcceptTask::Inline);
+        Ok(())
     }
 }

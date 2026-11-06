@@ -1,0 +1,61 @@
+[package]
+name = "libp2p-gossipsub"
+version = "0.50.0"
+edition = "2024"
+rust-version = "1.88.0"
+authors = ["Age Manning <Age@AgeManning.com>"]
+description = "Gossipsub protocol for libp2p"
+license = "MIT"
+repository = "https://github.com/libp2p/rust-libp2p"
+keywords = ["peer-to-peer", "libp2p", "networking"]
+categories = ["network-programming", "asynchronous"]
+
+[package.metadata.docs.rs]
+all-features = true
+
+[features]
+metrics = ["prometheus-client"]
+partial-messages = []
+
+[dependencies]
+async-channel = "2.5"
+asynchronous-codec = "0.7"
+base64 = "0.23"
+byteorder = "1.5"
+bytes = "1.12"
+either = "1.16"
+fnv = "1.0"
+futures = "0.3"
+futures-timer = "3.0"
+hashlink = "0.12"
+hex_fmt = "0.3"
+libp2p-core = "0.44.0"
+libp2p-identity = { version = "0.3.0", features = ["rand"] }
+libp2p-swarm = "0.48.0"
+prometheus-client = { version = "0.25", optional = true }
+prost = "0.14"
+prost-codec = "0.4.0"
+rand = "0.10"
+regex = "1.13"
+serde = { version = "1", features = ["derive"], optional = true }
+sha2 = "0.11"
+tracing = "0.1"
+web-time = "1.1"
+
+[target.'cfg(target_family="wasm")'.dependencies]
+futures-timer = { version = "3.0", features = ["wasm-bindgen"] }
+getrandom = { version = "0.4", features = ["wasm_js"] }
+
+[lints.clippy]
+dbg_macro = "warn"
+manual_let_else = "warn"
+type_complexity = "allow"
+unnecessary_wraps = "warn"
+used_underscore_binding = "warn"
+
+[lints.clippy.pedantic]
+level = "allow"
+priority = -1
+
+[lints.rust]
+unreachable_pub = "warn"

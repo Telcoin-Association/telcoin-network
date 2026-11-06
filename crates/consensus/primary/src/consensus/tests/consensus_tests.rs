@@ -23,6 +23,102 @@ use tn_types::{
 };
 use tokio::fs::create_dir_all;
 
+/// Loss of two authors produces one idle-time shortfall; restored traffic commits normally.
+///
+/// Paused Tokio time services the production driver's timer, so no wall-clock sleep or
+/// direct call to the observer's expiry or commit methods can make this test pass.
+#[tokio::test(start_paused = true)]
+async fn quorum_loss_and_recovery_through_consensus_driver() -> Result<(), String> {
+    use crate::metrics::test_recorder::TestMetricsRecorder;
+    use futures::{stream, StreamExt, TryStreamExt};
+    use metrics_util::debugging::DebugValue;
+    use tn_test_utils::wait_until;
+
+    let recorder = TestMetricsRecorder::new();
+    let metric = |name: &str| recorder.metric(name);
+    let cb = metrics::with_local_recorder(&recorder, ConsensusBus::new);
+    let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+    let committee = fixture.committee();
+    let config =
+        fixture.authorities().next().ok_or("missing fixture authority")?.consensus_config().clone();
+    let ids: Vec<_> = fixture.authorities().map(|authority| authority.id()).collect();
+    let genesis = Certificate::genesis(&committee).iter().map(|cert| cert.digest()).collect();
+    let (certificates, _) = make_optimal_certificates(&committee, 1..=5, &genesis, &ids);
+    let temp_dir = TempDir::new().map_err(|error| error.to_string())?;
+    let chain = ConsensusChain::new_for_test(temp_dir.path().to_owned(), committee.clone())
+        .await
+        .map_err(|error| error.to_string())?;
+    let schedule =
+        LeaderSchedule::from_store(committee.clone(), &chain, DEFAULT_BAD_NODES_STAKE_THRESHOLD)
+            .await
+            .map_err(|error| error.to_string())?;
+    let protocol =
+        Bullshark::new(committee.clone(), 3, schedule, DEFAULT_BAD_NODES_STAKE_THRESHOLD);
+    cb.app().recent_blocks().send_modify(|blocks| {
+        blocks.push_latest(
+            0,
+            ConsensusNumHash::new(0, ConsensusHeaderDigest::default()),
+            Some(SealedHeader::new(ExecHeader::default(), B256::default())),
+        )
+    });
+    let mut output = cb.subscribe_sequence();
+    let tasks = TaskManager::default();
+    Consensus::spawn(config.clone(), &cb, protocol, &tasks, &chain, None)
+        .await
+        .map_err(|error| error.to_string())?;
+
+    stream::iter(certificates.iter().filter(|cert| cert.round() == 1).take(2).cloned())
+        .then(|certificate| cb.new_certificates().send(certificate))
+        .try_collect::<Vec<_>>()
+        .await
+        .map_err(|error| error.to_string())?;
+    wait_until(
+        Duration::from_secs(35),
+        "idle consensus round has one quorum shortfall",
+        || async {
+            Ok(matches!(
+                metric("tn_primary.round_quorum_shortfalls_total"),
+                Some(DebugValue::Counter(1))
+            ))
+        },
+    )
+    .await
+    .map_err(|error| error.to_string())?;
+    assert!(matches!(metric("tn_primary.rounds_evaluated_total"), Some(DebugValue::Counter(1))));
+    assert!(matches!(metric("tn_primary.last_commit_timestamp_seconds"),
+        Some(DebugValue::Gauge(value)) if value.0 == 0.0));
+
+    // The same certificates include duplicates and late authors from the finalized round.
+    stream::iter(certificates)
+        .then(|certificate| cb.new_certificates().send(certificate))
+        .try_collect::<Vec<_>>()
+        .await
+        .map_err(|error| error.to_string())?;
+    wait_until(Duration::from_secs(5), "restored quorum commits again", || async {
+        Ok(*cb.app().committed_round_updates().borrow() >= 4
+            && matches!(metric("tn_primary.last_commit_timestamp_seconds"),
+                Some(DebugValue::Gauge(value)) if value.0 > 0.0))
+    })
+    .await
+    .map_err(|error| error.to_string())?;
+    assert!(output.try_recv().is_ok());
+    assert!(matches!(
+        metric("tn_primary.round_quorum_shortfalls_total"),
+        Some(DebugValue::Counter(1))
+    ));
+    assert!(matches!(metric("tn_primary.rounds_evaluated_total"),
+        Some(DebugValue::Counter(value)) if value >= 4));
+
+    config.shutdown().notify();
+    wait_until(Duration::from_secs(5), "shutdown disables the quorum observer", || async {
+        Ok(matches!(metric("tn_primary.quorum_observation_active"),
+            Some(DebugValue::Gauge(value)) if value.0 == 0.0))
+    })
+    .await
+    .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
 /// The fold domain separator, duplicated here on purpose (see [`independent_fold`]).
 const FOLD_DOMAIN: &[u8] = b"TN_EPOCH_SEED_FOLD_V1";
 
@@ -821,34 +917,85 @@ async fn test_seed_chain_survives_restart() {
     );
 }
 
-/// A certificate pack that cannot be used again is dropped on its first failure; only a full
-/// channel (transient backpressure) keeps it. A failed open or save latches an error that every
-/// later call returns, so before this only `SendFailed` dropped the pack, and a pack whose open
-/// failed was kept and logged an error for every certificate.
+/// A certificate pack failure stops the node; only a full channel (transient backpressure) lets
+/// consensus carry on without archiving that certificate. Every other `try_save` error is this
+/// node's own storage failing for good (a latched open, write or sync failure, or the pack's thread
+/// gone), so it becomes the consensus task's error.
 #[test]
 fn test_certificate_pack_failure_policy() {
-    use tn_storage::certificate_pack::{CertificatePack, PackError};
+    use tn_storage::certificate_pack::PackError;
 
-    assert!(super::keep_certificate_pack_after(&PackError::SendFull));
-    assert!(!super::keep_certificate_pack_after(&PackError::SendFailed));
-    assert!(!super::keep_certificate_pack_after(&PackError::Append("disk full".into())));
+    super::certificate_archived(Ok(())).expect("a queued certificate");
+    super::certificate_archived(Err(PackError::SendFull)).expect("backpressure is not a failure");
+    for failure in [PackError::SendFailed, PackError::Append("disk full".into())] {
+        let err = super::certificate_archived(Err(failure)).expect_err("a failed pack stops");
+        assert!(matches!(err, ConsensusError::CertificatePack(_)), "{err:?}");
+    }
+    let err =
+        super::certificate_archived(failed_certificate_pack().try_save(Certificate::default()))
+            .expect_err("a pack whose open failed stops consensus");
+    assert!(matches!(err, ConsensusError::CertificatePack(_)), "{err:?}");
+}
 
-    // The premise: a pack whose open failed returns its latched error (not `SendFailed`) from
-    // every later `try_save`. A plain file where the epoch directory belongs makes the open fail.
+/// A certificate pack whose open failed, once that failure has latched (a plain file where the
+/// epoch directory belongs makes the open fail). Every later `try_save` returns the latched error,
+/// not `SendFailed`.
+fn failed_certificate_pack() -> tn_storage::certificate_pack::CertificatePack {
     let dir = TempDir::new().expect("temp dir");
     std::fs::write(dir.path().join("epoch-0"), b"not a directory").expect("block the epoch dir");
-    let pack = CertificatePack::open(dir.path(), 0);
+    let pack = tn_storage::certificate_pack::CertificatePack::open(dir.path(), 0);
     // The open runs on the pack's thread; wait (bounded) for it to latch its failure.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
     while pack.get_error().is_ok() {
         assert!(std::time::Instant::now() < deadline, "the failed open never latched an error");
-        std::thread::sleep(std::time::Duration::from_millis(10));
+        std::thread::sleep(Duration::from_millis(10));
     }
-    for _ in 0..2 {
-        let err = pack.try_save(Certificate::default()).expect_err("a failed pack refuses saves");
-        assert!(!matches!(err, PackError::SendFailed), "the latched error is returned: {err:?}");
-        assert!(!super::keep_certificate_pack_after(&err), "a failed pack is dropped: {err:?}");
-    }
+    pack
+}
+
+/// The consensus task ends with the certificate pack's error at the first certificate it cannot
+/// archive, instead of logging it and dropping the pack. The task is critical, so its error ends
+/// the task manager it runs on: this test pins that the manager ends with the pack's error. What
+/// `run_epoch` does with an error that ends the epoch's task manager is pinned in tn-node
+/// (`epoch_tasks_ended_stops_the_node_unless_it_is_shutting_down`), and a node exiting non-zero on
+/// a store that fails mid-epoch end to end by
+/// `test_restarts_store_failure_stops_the_node_mid_epoch` in the e2e tests.
+#[tokio::test]
+async fn test_failed_certificate_pack_ends_the_consensus_task() {
+    let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+    let committee = fixture.committee();
+    let config = fixture.authorities().next().unwrap().consensus_config().clone();
+    let temp_dir = TempDir::new().unwrap();
+    let consensus_chain =
+        ConsensusChain::new_for_test(temp_dir.path().to_owned(), committee.clone()).await.unwrap();
+    let bullshark = Bullshark::new(
+        committee.clone(),
+        FLOOR_SUB_DAGS_PER_SCHEDULE,
+        LeaderSchedule::new(committee.clone(), LeaderSwapTable::default()),
+        DEFAULT_BAD_NODES_STAKE_THRESHOLD,
+    );
+    let cb = ConsensusBus::new();
+    let mut task_manager = TaskManager::default();
+    let pack = std::sync::Arc::new(failed_certificate_pack());
+    Consensus::spawn(config, &cb, bullshark, &task_manager, &consensus_chain, Some(pack))
+        .await
+        .unwrap();
+
+    let ids: Vec<_> = fixture.authorities().map(|a| a.id()).collect();
+    let genesis =
+        Certificate::genesis(&committee).iter().map(|x| x.digest()).collect::<BTreeSet<_>>();
+    let (certificates, _) = make_optimal_certificates(&committee, 1..=1, &genesis, &ids);
+    let certificate = certificates.front().expect("a round-1 certificate").clone();
+    cb.new_certificates().send(certificate).await.unwrap();
+
+    let ended = tokio::time::timeout(
+        Duration::from_secs(10),
+        task_manager.until_task_ends(tn_types::ShutdownNotifier::new()),
+    )
+    .await
+    .expect("the consensus task ends");
+    let err = ended.expect_err("the consensus task ends with an error");
+    assert!(format!("{err}").contains("certificate pack failed"), "{err}");
 }
 
 /// Whole seconds of every header's creation time in the epoch commit floor tests (see

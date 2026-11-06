@@ -75,6 +75,7 @@ tn-network-types = { workspace = true }
 tempfile = { workspace = true }
 tn-test-utils-committee = { workspace = true }
 tn-worker = { workspace = true, features = ["test-utils"] }
+tn-storage = { workspace = true, features = ["test-utils"] }
 
 [lints]
 workspace = true

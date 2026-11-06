@@ -10,8 +10,9 @@
 //! `HdxIndex::find_in_bucket` borrows the target bucket from the hdx mapping, scans it, and — on
 //! a miss — follows the append-only overflow chain by re-slicing the odx mapping one record at a
 //! time. Exactly one shared slice is live at any moment and no slice is ever held across a write,
-//! so a growth/remap (which needs `&mut`) can never invalidate one. Reads do **not** verify a
-//! per-op CRC (see the CRC note below).
+//! so a growth/remap (which needs `&mut`) can never invalidate one. Every bucket a lookup reads is
+//! CRC-verified before its answer is trusted; a bucket this handle dirtied since its last sync is
+//! trusted by its zeroed marker instead (see the CRC note below).
 //!
 //! ## Writes (write-through)
 //! Inserts are read-modify-write: the bucket is mutated in place through the mapping (its overflow
@@ -48,9 +49,10 @@ use crate::archive::{
     fxhasher::FxHasher,
     index::Index,
     pack::{DataHeader, DATA_HEADER_BYTES},
+    page_set::PageSet,
 };
 use std::{
-    collections::{BTreeSet, HashSet},
+    collections::BTreeSet,
     fs,
     hash::{BuildHasher, BuildHasherDefault, Hasher},
     io::{self, Read, Seek, SeekFrom, Write},
@@ -284,7 +286,7 @@ pub struct HdxIndex<
     /// read/write/sync paths consult it to tell the two apart; it is empty on open (so
     /// read-only handles trust no `Dirty` bucket) and cleared each sync (`crc_dirty_buckets`
     /// stamps exactly this set).
-    unsynced_buckets: HashSet<u64>,
+    unsynced_buckets: PageSet,
     _index_dir: PathBuf,
     /// Test-only: when set, the next bucket split fails mid-way (after both buckets are zeroed) to
     /// exercise the rollback in [`Self::split_one_bucket`].
@@ -358,10 +360,15 @@ impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndex<KSIZE, S> {
         }
 
         // The digest index does point lookups over fixed-offset hash buckets — random
-        // access with no benefit from readahead — so hint `MADV_RANDOM`.
+        // access with no benefit from readahead — so hint `MADV_RANDOM`. Not `derived`, though it
+        // is rebuilt from the data log: the epoch records' and certificate pack's recoveries read
+        // an unsealed hdx's `data_file_length` before any rebuild, as evidence to refuse a cut,
+        // and an hdx shorter than its header (a growth whose size never reached the disk) fails
+        // to open and so attests nothing. The first barrier after a growth fsyncs its size.
         let opts = MmapFileOptions {
             write_mode: WriteMode::Random,
             access: MmapAccess::Random,
+            derived: false,
             ..Default::default()
         };
         let mut hdx_file = MmapDataFile::open_with(dir.join("index.hdx"), read_only, opts)?;
@@ -495,7 +502,7 @@ impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndex<KSIZE, S> {
             synced: true,
             remove_on_drop: false,
             bloom,
-            unsynced_buckets: HashSet::new(),
+            unsynced_buckets: PageSet::default(),
             _index_dir: dir.to_owned(),
             #[cfg(test)]
             fail_next_split: false,
@@ -519,7 +526,7 @@ impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndex<KSIZE, S> {
     /// True if this handle wrote `bucket` since the last sync (so a `Dirty` trailer on it is
     /// expected).
     fn is_unsynced(&self, bucket: u64) -> bool {
-        self.unsynced_buckets.contains(&bucket)
+        self.unsynced_buckets.contains(bucket)
     }
 
     /// Number of keys hashed in this index.
@@ -974,9 +981,9 @@ impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndex<KSIZE, S> {
             // mark (a later split re-creates and re-marks it, and sync must not
             // try to CRC a bucket past the count).
             if !split_was_unsynced {
-                self.unsynced_buckets.remove(&split_bucket);
+                self.unsynced_buckets.remove(split_bucket);
             }
-            self.unsynced_buckets.remove(&(old_buckets as u64));
+            self.unsynced_buckets.remove(old_buckets as u64);
             return Err(e);
         }
         Ok(())
@@ -1182,9 +1189,9 @@ impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndex<KSIZE, S> {
         // an at-rest zeroed bucket as `Valid`, laundering the corruption; restricting to
         // the tracked set keeps that bucket `Dirty` so a later lookup / `bucket_crc_scan`
         // still flags it. Also makes sync O(written), not O(buckets). The set is consumed
-        // here (cleared for the next cycle).
-        let unsynced = std::mem::take(&mut self.unsynced_buckets);
-        for bucket in unsynced {
+        // here (cleared for the next cycle), in ascending bucket order.
+        let mut unsynced = std::mem::take(&mut self.unsynced_buckets);
+        for bucket in unsynced.drain() {
             let pos = self.bucket_pos(bucket);
             if let Some(buffer) = self.hdx_file.slice_mut(pos, Self::BUCKET_SIZE) {
                 if crc_is_zero(buffer) {
@@ -1194,6 +1201,8 @@ impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndex<KSIZE, S> {
                 }
             }
         }
+        // Put the drained (empty) set back so the next cycle reuses its allocation.
+        self.unsynced_buckets = unsynced;
     }
 
     /// Scan every main bucket and classify its CRC trailer (see [`BucketCrcReport`]). Read-only
@@ -1222,6 +1231,42 @@ impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndex<KSIZE, S> {
     #[cfg(test)]
     fn test_bloom_contains(&mut self, key: B256) -> bool {
         self.bloom.contains(key)
+    }
+}
+
+impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndex<KSIZE, S> {
+    /// The position stored for `key`, through a shared reference (what [`Index::load`] does): the
+    /// bloom filter first, then the key's bucket chain in the mapping. For readers that share the
+    /// index with its writer behind a read lock (a save, or a bucket split, takes the write lock).
+    pub fn get(&self, key: B256) -> Result<u64, FetchError> {
+        if !self.bloom.contains(key) {
+            return Err(FetchError::NotFound);
+        }
+        let bucket = self.hash_to_bucket(key.as_slice());
+        match self.find_in_bucket(bucket, key.as_slice())? {
+            Some(pos) => Ok(pos),
+            None => Err(FetchError::NotFound),
+        }
+    }
+}
+
+impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndex<KSIZE, S> {
+    /// Seal the index now and report the outcome: the ordered sync `Drop` runs (when the index
+    /// has unsynced writes), then the clean-close seal of the hdx and the odx file (see
+    /// [`MmapDataFile::seal`]). Every step runs whatever the earlier ones returned, as in `Drop`;
+    /// the first failure is returned. Dropping the index seals it too, but can only log a failure.
+    pub(crate) fn seal(mut self) -> io::Result<()> {
+        let synced = if self.read_only || self.remove_on_drop || self.synced {
+            Ok(())
+        } else {
+            self.ordered_sync()
+        };
+        // `Drop` must not retry the sync: a retried sync after a failed one can report success
+        // for writes that never reached the disk.
+        self.synced = true;
+        let hdx = self.hdx_file.seal();
+        let odx = self.odx_file.seal();
+        synced.and(hdx).and(odx)
     }
 }
 
@@ -1256,16 +1301,7 @@ impl<const KSIZE: usize, S: BuildHasher + Default> Index<B256, u64> for HdxIndex
     }
 
     fn load(&mut self, key: B256) -> Result<u64, FetchError> {
-        // Quick check the bloom filter first.
-        if !self.bloom.contains(key) {
-            Err(FetchError::NotFound)
-        } else {
-            let bucket = self.hash_to_bucket(key.as_slice());
-            match self.find_in_bucket(bucket, key.as_slice())? {
-                Some(pos) => Ok(pos),
-                None => Err(FetchError::NotFound),
-            }
-        }
+        self.get(key)
     }
 
     /// Flush and sync all the index data to disk. The `data_file_length` commit marker is written
@@ -1583,7 +1619,7 @@ mod tests {
         );
     }
 
-    /// F2: a cleanly-sealed index whose FIRST bucket is not CRC-valid is rejected on open, so the
+    /// A cleanly-sealed index whose FIRST bucket is not CRC-valid is rejected on open, so the
     /// caller rebuilds from the WAL instead of silently misreading buckets. This is exactly the
     /// shape a bloom-size mismatch produces — the bloom sits between the header and the first
     /// bucket, and its size is a compile-time constant not recorded on disk, so a build with a

@@ -20,7 +20,13 @@ use futures::{
     io::{AsyncRead as FuturesAsyncRead, AsyncWrite as FuturesAsyncWrite},
     AsyncWriteExt as _, FutureExt as _, StreamExt as _, TryFutureExt as _, TryStreamExt as _,
 };
-use std::time::{Duration, Instant};
+use std::{
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
+    time::{Duration, Instant},
+};
 use tn_network_libp2p::{read_frame, write_frame, DenyReason, PrimarySyncRequest, SyncFrame};
 use tn_storage::consensus::ConsensusChain;
 use tn_types::{encode, encoded_size, try_decode, BlsPublicKey, Certificate, Epoch};
@@ -52,13 +58,32 @@ const EPOCH_PACK_FRAME_TIMEOUT: Duration = Duration::from_secs(10);
 /// responder's writes and the requester's reads).
 const SYNC_RATE_WINDOW: Duration = Duration::from_secs(30);
 
-/// Minimum bytes an epoch-pack transfer must carry per [`SYNC_RATE_WINDOW`] (~35 KiB/s). Below this
-/// a transfer is treated as a drip/stall and aborted. This replaces the old fixed, size-independent
-/// wall-clock caps (a large honest pack could not finish inside them on a slow link, while a
-/// Byzantine peer could dribble just inside the per-frame timeout for the whole cap): a pack now
-/// finishes at any sustained rate at/above the floor, and a below-floor peer is cut within roughly
-/// one window.
+/// Minimum bytes an epoch-pack transfer must carry per [`SYNC_RATE_WINDOW`]: 1 MiB per 30 s
+/// sustained; a window stretched by a late chunk must carry proportionally more. Below this a
+/// transfer is treated as a drip/stall and aborted, so a pack finishes at any sustained rate
+/// at/above the floor, and a below-floor peer is cut within roughly one window. Both the
+/// requester's reads and the responder's writes check this floor. The responder additionally
+/// applies a fixed, size-independent `PUBLIC_EPOCH_PACK_SERVE_TIMEOUT` to public-tier epoch-pack
+/// serves, as an interim bound until a length-scaled bound lands.
 const SYNC_RATE_MIN_BYTES: u64 = 1 << 20;
+
+/// How many floors ([`SYNC_RATE_MIN_BYTES`]) a fresh peer must deliver per window: the ratio of
+/// [`SYNC_TARGET_MIN_BYTES`] to the floor.
+const SYNC_TARGET_RATE_MULTIPLE: u64 = 8;
+
+/// Minimum bytes per [`SYNC_RATE_WINDOW`] a FRESH peer (one not de-prioritised this epoch) must
+/// sustain for the requester to keep reading: 8 MiB per window (~273 KiB/s). This is well above
+/// the floor, below the rate the responder's own `PUBLIC_EPOCH_PACK_SERVE_TIMEOUT` already
+/// demands of a 100 MiB public pack (512 KiB/s), and far below an honest link. A de-prioritised
+/// peer is read at the floor ([`SyncRateBound::Floor`]) so a network whose only peers are slow
+/// still syncs.
+pub(crate) const SYNC_TARGET_MIN_BYTES: u64 = SYNC_RATE_MIN_BYTES * SYNC_TARGET_RATE_MULTIPLE;
+
+/// Wall-clock allowance for the latency part of one exchange (stream open, request write, `Ack`
+/// and first frame) on top of its bytes at the target rate ([`SyncServeMeter::speed`]). It is the
+/// protocol's own "ample on a working link" bound for one small frame
+/// (`PUBLIC_SYNC_REQUEST_READ_TIMEOUT`, 1 s).
+pub(crate) const SYNC_SERVE_LATENCY_ALLOWANCE: Duration = super::PUBLIC_SYNC_REQUEST_READ_TIMEOUT;
 
 /// How long one pack record may take to arrive over a sync stream: the time the largest record a
 /// pack may hold needs at the throughput floor, plus one window of slack. A shorter per-record
@@ -69,8 +94,9 @@ pub(crate) const SYNC_RECORD_TIMEOUT: Duration = Duration::from_secs(
         * SYNC_RATE_WINDOW.as_secs(),
 );
 
-/// A coarse throughput floor over a tumbling time window. Each completed window (≥ `window` since
-/// the last reset) must have carried at least `min_bytes`, else the transfer is below the floor.
+/// A coarse throughput floor over a tumbling time window. Each completed window (at least
+/// `window` since the last reset) must have carried at least `min_bytes`, prorated by the real
+/// window length, else the transfer is below the floor.
 /// Pure so it is unit-testable with an injected clock; see [`RateWatch::record`].
 struct RateWatch {
     window: Duration,
@@ -85,17 +111,100 @@ impl RateWatch {
     }
 
     /// Record `n` bytes transferred as of `now`. Returns `false` when a just-completed window
-    /// carried fewer than `min_bytes` (below the floor — the caller aborts); otherwise `true`.
-    /// A completed window (below floor or not) resets the counter for the next window.
+    /// carried fewer than `min_bytes` prorated by its real length (below the floor; the caller
+    /// aborts); otherwise `true`. A window completes once `elapsed = now - window_start` reaches
+    /// `window`, and it is ok iff `bytes * window >= min_bytes * elapsed` (in milliseconds): a
+    /// window stretched by a late chunk must carry proportionally more. A completed window (below
+    /// floor or not) resets the counter for the next window.
     fn record(&mut self, now: Instant, n: u64) -> bool {
         self.bytes = self.bytes.saturating_add(n);
-        if now.duration_since(self.window_start) >= self.window {
-            let ok = self.bytes >= self.min_bytes;
+        let elapsed = now.duration_since(self.window_start);
+        if elapsed >= self.window {
+            let carried = u128::from(self.bytes).saturating_mul(self.window.as_millis());
+            let owed = u128::from(self.min_bytes).saturating_mul(elapsed.as_millis());
+            let ok = carried >= owed;
             self.window_start = now;
             self.bytes = 0;
             return ok;
         }
         true
+    }
+}
+
+/// The throughput bound the requester's reader holds a peer to over each [`SYNC_RATE_WINDOW`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SyncRateBound {
+    /// The floor, [`SYNC_RATE_MIN_BYTES`] per window: for a peer already de-prioritised this
+    /// epoch, so a network whose only peers are slow still syncs.
+    Floor,
+    /// The target, [`SYNC_TARGET_MIN_BYTES`] per window: for a fresh peer.
+    Target,
+}
+
+impl SyncRateBound {
+    /// The bound for one probe: [`Self::Floor`] when the peer is `deprioritised` (it already
+    /// failed, timed out or served below the target rate this epoch), else [`Self::Target`].
+    pub(crate) fn for_probe(deprioritised: bool) -> Self {
+        if deprioritised {
+            Self::Floor
+        } else {
+            Self::Target
+        }
+    }
+
+    /// Minimum bytes per [`SYNC_RATE_WINDOW`] under this bound.
+    fn min_bytes(self) -> u64 {
+        match self {
+            Self::Floor => SYNC_RATE_MIN_BYTES,
+            Self::Target => SYNC_TARGET_MIN_BYTES,
+        }
+    }
+}
+
+/// How fast a completed serve delivered its bytes, as judged by [`SyncServeMeter::speed`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SyncServeSpeed {
+    /// The serve completed within [`SYNC_SERVE_LATENCY_ALLOWANCE`] plus the time its bytes need
+    /// at the target rate: the peer may become the preferred sync server.
+    Target,
+    /// The serve completed, but slower than that: the peer is de-prioritised for the epoch and
+    /// never holds the probe-first preference.
+    Slow,
+}
+
+/// Counts the pack bytes the requester's reader ([`sync_pack_reader`]) delivers for one exchange.
+///
+/// The probe walk keeps one handle and gives a clone to the reader, so after the exchange it can
+/// judge the serve's rate ([`Self::speed`]) from the bytes and the wall-clock time it took.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct SyncServeMeter(
+    /// Bytes delivered so far, shared by every clone.
+    Arc<AtomicU64>,
+);
+
+impl SyncServeMeter {
+    /// Add `n` delivered bytes.
+    pub(crate) fn record(&self, n: u64) {
+        self.0.fetch_add(n, Ordering::Relaxed);
+    }
+
+    /// The bytes delivered so far.
+    pub(crate) fn bytes(&self) -> u64 {
+        self.0.load(Ordering::Relaxed)
+    }
+
+    /// Judge a serve that took `elapsed`: [`SyncServeSpeed::Target`] when `elapsed` is at most
+    /// [`SYNC_SERVE_LATENCY_ALLOWANCE`] plus the time the delivered bytes need at
+    /// [`SYNC_TARGET_MIN_BYTES`] per [`SYNC_RATE_WINDOW`], else [`SyncServeSpeed::Slow`].
+    pub(crate) fn speed(&self, elapsed: Duration) -> SyncServeSpeed {
+        let transfer_ms = u128::from(self.bytes()).saturating_mul(SYNC_RATE_WINDOW.as_millis())
+            / u128::from(SYNC_TARGET_MIN_BYTES);
+        let budget_ms = SYNC_SERVE_LATENCY_ALLOWANCE.as_millis().saturating_add(transfer_ms);
+        if elapsed.as_millis() <= budget_ms {
+            SyncServeSpeed::Target
+        } else {
+            SyncServeSpeed::Slow
+        }
     }
 }
 
@@ -151,8 +260,10 @@ const MISSING_CERTS_FRAME_TIMEOUT: Duration = Duration::from_secs(10);
 /// ends with [`SyncFrame::End`]. A partial transfer bounds the source reader to the
 /// prefix length so it never streams past the verifiable point. Each frame write is
 /// bounded by `buffer_timeout` so a peer that stops reading cannot stall the
-/// responder task on an unbounded write. The caller has already admitted the
-/// exchange against the concurrency caps and read the opening request frame.
+/// responder task on an unbounded write. The whole data stream is also bounded by
+/// [`pack_serve_deadline`] of the pack length, so a requester cannot hold the serve
+/// longer than an honest link at the throughput floor needs. The caller has already
+/// admitted the exchange against the concurrency caps and read the opening request frame.
 pub(crate) async fn send_sync_epoch_pack_over_stream<S>(
     stream: &mut S,
     consensus_chain: &ConsensusChain,
@@ -203,11 +314,50 @@ where
     )
     .await?;
 
-    // `cap` bounds the reader to the pack's logical length in both cases — a full transfer to
-    // `[0, data_len)`, a partial prefix to `[0, end)` — so `take(cap)` stops the stream there and
-    // the trailing mmap capacity padding is never sent.
-    write_pack_data_frames(&mut epoch_stream.take(cap), stream, buffer_timeout).await?;
+    // `cap` bounds the reader to the pack's logical length in both cases (a full transfer to
+    // `[0, data_len)`, a partial prefix to `[0, end)`), so `take(cap)` stops the stream there
+    // and the trailing mmap capacity padding is never sent. The same length sizes the total
+    // serve deadline.
+    let mut capped = epoch_stream.take(cap);
+    write_pack_data_frames_within_deadline(&mut capped, cap, stream, buffer_timeout).await?;
     Ok(())
+}
+
+/// The total time an epoch-pack serve of `pack_bytes` bytes may take: one
+/// [`SYNC_RATE_WINDOW`] for each started [`SYNC_RATE_MIN_BYTES`] of pack, plus one window of
+/// slack. A requester that reads at the throughput floor finishes inside it, so the deadline
+/// never cuts a link the floor admits; a 100 MiB pack gets 50.5 minutes.
+pub(crate) fn pack_serve_deadline(pack_bytes: u64) -> Duration {
+    let windows = pack_bytes.div_ceil(SYNC_RATE_MIN_BYTES).saturating_add(1);
+    SYNC_RATE_WINDOW.saturating_mul(u32::try_from(windows).unwrap_or(u32::MAX))
+}
+
+/// Stream a pack reader as [`write_pack_data_frames`] does, bounded by the total deadline
+/// [`pack_serve_deadline`] of `pack_bytes`.
+///
+/// The per-frame write timeout and the throughput floor are checked frame by frame. The deadline
+/// is a hard upper bound on the whole serve that holds whatever those checks measure, so a
+/// requester that keeps each frame just inside its timeout still releases the serve slot. A
+/// missed deadline is an [`std::io::ErrorKind::TimedOut`] error, which the admission layer
+/// classifies as a stalled serve.
+pub(crate) async fn write_pack_data_frames_within_deadline<R, S>(
+    reader: &mut R,
+    pack_bytes: u64,
+    stream: &mut S,
+    buffer_timeout: Duration,
+) -> std::io::Result<()>
+where
+    R: TokioAsyncRead + Unpin + Send,
+    S: FuturesAsyncWrite + Unpin + Send,
+{
+    tokio::time::timeout(
+        pack_serve_deadline(pack_bytes),
+        write_pack_data_frames(reader, stream, buffer_timeout),
+    )
+    .await
+    .map_err(|_elapsed| {
+        std::io::Error::new(std::io::ErrorKind::TimedOut, "epoch pack serve missed its deadline")
+    })?
 }
 
 /// Stream a pack reader as [`SyncFrame::Data`] frames terminated by
@@ -247,8 +397,9 @@ where
                     .await?;
                     // Enforce the throughput floor on bytes the requester actually accepted (a
                     // completed `write_one_frame` means the frame was flushed): a drip-reading peer
-                    // that keeps resetting the per-frame timer is cut here instead of pinning the
-                    // responder task (and its admission slot) for a fixed wall-clock cap.
+                    // that keeps resetting the per-frame timer is cut here, within about one
+                    // window, rather than holding the responder task (and its admission slot)
+                    // until a whole-serve bound expires.
                     if !watch.record(Instant::now(), len) {
                         return Err(std::io::Error::new(
                             std::io::ErrorKind::TimedOut,
@@ -299,6 +450,12 @@ where
     })?
 }
 
+/// The requester's read clock for its rate bound: tokio's clock, so a paused test runtime drives
+/// it, and the same instant as [`Instant::now`] on a live runtime.
+fn reader_now() -> Instant {
+    tokio::time::Instant::now().into_std()
+}
+
 /// Reassemble the [`SyncFrame::Data`] frames of an accepted epoch-pack exchange
 /// into a contiguous [`tokio::io::AsyncRead`] terminating at [`SyncFrame::End`].
 ///
@@ -307,35 +464,54 @@ where
 /// surfaces as a read error so the importer aborts. The returned reader is fed
 /// directly to
 /// [`ConsensusChain::stream_import`](tn_storage::consensus::ConsensusChain::stream_import).
-pub(crate) fn sync_pack_reader<S>(stream: S) -> impl TokioAsyncRead + Unpin + Send
+///
+/// `bound` is the rate the peer must sustain over each [`SYNC_RATE_WINDOW`], prorated over the
+/// real window length: [`SyncRateBound::Target`] for a fresh peer, [`SyncRateBound::Floor`] for
+/// one already de-prioritised this epoch. `meter` counts every delivered `Data` byte, so the
+/// caller can judge the completed serve's rate ([`SyncServeMeter::speed`]). The bound is also
+/// checked when the `End` frame arrives: otherwise a peer that dribbles a few bytes and sends
+/// `End` after the window would finish as a clean serve, because only a `Data` chunk ran the
+/// check.
+pub(crate) fn sync_pack_reader<S>(
+    stream: S,
+    bound: SyncRateBound,
+    meter: SyncServeMeter,
+) -> impl TokioAsyncRead + Unpin + Send
 where
     S: FuturesAsyncRead + Unpin + Send + 'static,
 {
-    let watch = RateWatch::new(SYNC_RATE_WINDOW, SYNC_RATE_MIN_BYTES, Instant::now());
+    let watch = RateWatch::new(SYNC_RATE_WINDOW, bound.min_bytes(), reader_now());
     let frames = futures::stream::unfold(
-        (stream, Vec::new(), Vec::new(), watch),
-        |(mut stream, mut decode_buffer, mut compressed_buffer, mut watch)| async move {
+        (stream, Vec::new(), Vec::new(), watch, meter),
+        move |(mut stream, mut decode_buffer, mut compressed_buffer, mut watch, meter)| async move {
             let chunk =
                 next_pack_chunk(&mut stream, &mut decode_buffer, &mut compressed_buffer).await;
-            // Enforce the throughput floor on delivered bytes: a peer that dribbles small frames
+            // Enforce the rate bound on delivered bytes: a peer that dribbles small frames
             // just inside the per-frame timeout (never tripping it) is cut here instead
-            // of pinning the import for a fixed wall-clock cap. A below-floor window
-            // yields one error item, which unwinds `stream_import` so its `ImportPath`
-            // sentinel clears and the epoch is retryable.
-            let chunk = match chunk {
-                Ok(Some(bytes)) if !watch.record(Instant::now(), bytes.len() as u64) => {
+            // of pinning the import for a fixed wall-clock cap. The `End` frame runs the same
+            // check with no bytes, so a dribble that ends after the window is cut too. A
+            // below-bound window yields one error item, which unwinds `stream_import` so its
+            // `ImportPath` sentinel clears and the epoch is retryable.
+            let now = reader_now();
+            let chunk = chunk.and_then(|frame| {
+                let delivered = frame
+                    .as_ref()
+                    .map_or(0, |bytes| u64::try_from(bytes.len()).unwrap_or(u64::MAX));
+                meter.record(delivered);
+                if watch.record(now, delivered) {
+                    Ok(frame)
+                } else {
                     Err(std::io::Error::new(
                         std::io::ErrorKind::TimedOut,
                         format!(
-                            "epoch pack sync throughput below floor ({} bytes / {}s)",
-                            SYNC_RATE_MIN_BYTES,
-                            SYNC_RATE_WINDOW.as_secs(),
+                            "epoch pack sync throughput below {bound:?} bound ({min} bytes / {secs}s)",
+                            min = bound.min_bytes(),
+                            secs = SYNC_RATE_WINDOW.as_secs(),
                         ),
                     ))
                 }
-                other => other,
-            };
-            let state = (stream, decode_buffer, compressed_buffer, watch);
+            });
+            let state = (stream, decode_buffer, compressed_buffer, watch, meter);
             // Result<Option<bytes>> -> Option<Result<bytes>>: `End` stops the
             // stream, `Data` yields a chunk, an error yields one error item
             chunk.transpose().map(|item| (item.map(std::io::Cursor::new), state))
@@ -711,9 +887,120 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{
+        pin::Pin,
+        task::{Context, Poll},
+    };
     use tn_network_libp2p::SyncFrameError;
 
-    /// F15: the throughput floor trips only on a COMPLETED window that carried fewer than
+    /// Four throughput-floor units of pack: sixteen full `Data` frames.
+    const DRIP_PACK_LEN: usize = 4 << 20;
+
+    /// A requester that takes `delay` to accept each frame flush, so every frame lands inside the
+    /// per-frame write timeout while the whole serve runs as long as the frame count allows.
+    /// Writes and close complete at once.
+    struct DripSink {
+        /// How long each flush waits.
+        delay: Duration,
+        /// The flush in progress, if any.
+        pending: Option<Pin<Box<tokio::time::Sleep>>>,
+    }
+
+    impl FuturesAsyncWrite for DripSink {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            let delay = self.delay;
+            let pending = &mut self.pending;
+            let ready = std::future::Future::poll(
+                pending.get_or_insert_with(|| Box::pin(tokio::time::sleep(delay))).as_mut(),
+                cx,
+            );
+            ready.map(|()| {
+                *pending = None;
+                Ok(())
+            })
+        }
+
+        fn poll_close(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    /// The length of the drip pack as the deadline sees it.
+    fn drip_pack_bytes() -> u64 {
+        u64::try_from(DRIP_PACK_LEN).unwrap_or(u64::MAX)
+    }
+
+    /// Serve a [`DRIP_PACK_LEN`] pack of zeros to a [`DripSink`] that takes `delay` to accept each
+    /// frame, with a 10 s per-frame write timeout. Returns the serve result and the (paused) time
+    /// it took.
+    async fn drip_serve(delay: Duration) -> (std::io::Result<()>, Duration) {
+        let mut reader = std::io::Cursor::new(vec![0u8; DRIP_PACK_LEN]);
+        let mut sink = DripSink { delay, pending: None };
+        let start = tokio::time::Instant::now();
+        let served = write_pack_data_frames_within_deadline(
+            &mut reader,
+            drip_pack_bytes(),
+            &mut sink,
+            Duration::from_secs(10),
+        )
+        .await;
+        (served, start.elapsed())
+    }
+
+    /// The total epoch-pack serve deadline is one throughput-floor window per started MiB of
+    /// pack, plus one window, and saturates instead of overflowing.
+    #[test]
+    fn pack_serve_deadline_is_one_window_per_floor_plus_one() {
+        assert_eq!(pack_serve_deadline(0), Duration::from_secs(30));
+        assert_eq!(pack_serve_deadline(SYNC_RATE_MIN_BYTES), Duration::from_secs(60));
+        assert_eq!(
+            pack_serve_deadline(SYNC_RATE_MIN_BYTES.saturating_add(1)),
+            Duration::from_secs(90)
+        );
+        assert_eq!(
+            pack_serve_deadline(SYNC_RATE_MIN_BYTES.saturating_mul(100)),
+            Duration::from_secs(3030)
+        );
+        assert_eq!(pack_serve_deadline(u64::MAX), SYNC_RATE_WINDOW.saturating_mul(u32::MAX));
+    }
+
+    /// A requester that keeps every frame inside the per-frame write timeout, but reads so slowly
+    /// that the whole serve would outlast its deadline, is cut at the deadline with a `TimedOut`
+    /// error. Paused time leaves the wall-clock throughput floor idle, so only the deadline can
+    /// end this serve.
+    #[tokio::test(start_paused = true)]
+    async fn drip_reader_is_cut_at_the_pack_serve_deadline() {
+        let deadline = pack_serve_deadline(drip_pack_bytes());
+        let (served, elapsed) = drip_serve(Duration::from_millis(9_900)).await;
+        let err = served.expect_err("a drip reader must not finish the serve");
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut, "got {err:?}");
+        assert!(err.to_string().contains("deadline"), "got {err:?}");
+        assert!(elapsed >= deadline, "cut at {elapsed:?}, before the {deadline:?} deadline");
+        assert!(
+            elapsed < deadline.saturating_add(Duration::from_secs(1)),
+            "cut at {elapsed:?}, well after the {deadline:?} deadline"
+        );
+    }
+
+    /// A requester that accepts each frame after one second finishes the same serve well inside
+    /// its deadline.
+    #[tokio::test(start_paused = true)]
+    async fn steady_reader_finishes_inside_the_pack_serve_deadline() {
+        let deadline = pack_serve_deadline(drip_pack_bytes());
+        let (served, elapsed) = drip_serve(Duration::from_secs(1)).await;
+        assert!(served.is_ok(), "got {served:?}");
+        assert!(elapsed < deadline, "took {elapsed:?}, past the {deadline:?} deadline");
+    }
+
+    /// The throughput floor trips only on a COMPLETED window that carried fewer than
     /// `min_bytes`; an at/above-floor window resets and does not trip, and a partial
     /// (not-yet-elapsed) window keeps accumulating. Uses a manual clock so the tumbling-window
     /// logic is deterministic.
@@ -748,6 +1035,105 @@ mod tests {
         assert!(!w.record(t0 + Duration::from_secs(62), 10));
     }
 
+    /// A window stretched past `window` by a late chunk must carry `min_bytes` prorated by its
+    /// real length: 1000 bytes over 40 s is below a 1000-per-30 s floor, 1334 bytes is not, and a
+    /// window that completes at exactly 30 s owes exactly `min_bytes`.
+    #[test]
+    fn rate_watch_prorates_a_stretched_window() {
+        let t0 = Instant::now();
+        let window = Duration::from_secs(30);
+
+        let mut w = RateWatch::new(window, 1000, t0);
+        assert!(!w.record(t0 + Duration::from_secs(40), 1000), "1000 bytes over 40 s must trip");
+
+        let mut w = RateWatch::new(window, 1000, t0);
+        assert!(w.record(t0 + Duration::from_secs(40), 1334), "1334 bytes over 40 s must pass");
+
+        let mut w = RateWatch::new(window, 1000, t0);
+        assert!(w.record(t0 + Duration::from_secs(30), 1000), "1000 bytes over 30 s must pass");
+    }
+
+    /// The target bound is eight floors, and a probe reads a de-prioritised peer at the floor and
+    /// a fresh peer at the target.
+    #[test]
+    fn sync_rate_bound_target_is_eight_floors() {
+        assert_eq!(SyncRateBound::Target.min_bytes(), 8 * SyncRateBound::Floor.min_bytes());
+        assert_eq!(SyncRateBound::for_probe(true), SyncRateBound::Floor);
+        assert_eq!(SyncRateBound::for_probe(false), SyncRateBound::Target);
+    }
+
+    /// Every `Data` byte the reader delivers is counted on the caller's meter clone.
+    #[tokio::test]
+    async fn sync_serve_meter_counts_delivered_bytes() {
+        // a full chunk plus a partial one: two `Data` frames
+        let original = vec![7u8; SYNC_PACK_CHUNK_SIZE + 1234];
+        let framed = frame_pack(&original).await;
+        let meter = SyncServeMeter::default();
+        let mut reader =
+            sync_pack_reader(futures::io::Cursor::new(framed), SyncRateBound::Floor, meter.clone());
+        let mut received = Vec::new();
+        reader.read_to_end(&mut received).await.expect("read back");
+        assert_eq!(received, original);
+        assert_eq!(meter.bytes(), u64::try_from(original.len()).unwrap_or(u64::MAX));
+    }
+
+    /// A small output that completes inside the latency allowance is a target-rate serve.
+    #[test]
+    fn serve_speed_small_output_within_allowance_is_target() {
+        let meter = SyncServeMeter::default();
+        meter.record(10 * 1024);
+        assert_eq!(meter.speed(Duration::from_millis(300)), SyncServeSpeed::Target);
+    }
+
+    /// An output dribbled over 25 s is far slower than the target rate.
+    #[test]
+    fn serve_speed_dribbled_output_is_slow() {
+        let meter = SyncServeMeter::default();
+        meter.record(500 * 1024);
+        assert_eq!(meter.speed(Duration::from_secs(25)), SyncServeSpeed::Slow);
+    }
+
+    /// A 100 MiB pack delivered at exactly the target rate is a target-rate serve inside the 1 s
+    /// latency allowance, and a slow one past it.
+    #[test]
+    fn serve_speed_pack_at_target_rate_is_target() {
+        let meter = SyncServeMeter::default();
+        meter.record(100 << 20);
+        // 100 MiB at 8 MiB per 30 s takes 100 MiB * 30 s / 8 MiB = 375 s.
+        let at_target = Duration::from_secs(375);
+        assert_eq!(
+            meter.speed(at_target.saturating_add(Duration::from_secs(1))),
+            SyncServeSpeed::Target
+        );
+        assert_eq!(
+            meter.speed(at_target.saturating_add(Duration::from_secs(2))),
+            SyncServeSpeed::Slow
+        );
+    }
+
+    /// A peer that sends one small `Data` frame and then ends only after the window elapsed is cut
+    /// at the `End` frame with a `TimedOut` read error, not finished as a clean serve: the bound
+    /// is checked on `End` too. Paused time drives the reader's clock.
+    #[tokio::test(start_paused = true)]
+    async fn sync_pack_reader_cuts_a_dribble_that_ends_after_the_window() {
+        let framed = frame_pack(&[7u8; 1024]).await;
+        let mut reader = sync_pack_reader(
+            futures::io::Cursor::new(framed),
+            SyncRateBound::Floor,
+            SyncServeMeter::default(),
+        );
+        let mut first = vec![0u8; 4096];
+        let read = reader.read(&mut first).await.expect("read the data frame");
+        assert_eq!(read, 1024);
+
+        tokio::time::advance(SYNC_RATE_WINDOW.saturating_add(Duration::from_secs(1))).await;
+
+        let mut rest = Vec::new();
+        let err = reader.read_to_end(&mut rest).await.expect_err("a dribble must not end cleanly");
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut, "got {err:?}");
+        assert!(err.to_string().contains("Floor"), "got {err:?}");
+    }
+
     /// Frame `bytes` through [`write_pack_data_frames`] into an in-memory buffer.
     async fn frame_pack(bytes: &[u8]) -> Vec<u8> {
         let mut reader = std::io::Cursor::new(bytes.to_vec());
@@ -760,7 +1146,11 @@ mod tests {
 
     /// Reassemble framed bytes through [`sync_pack_reader`].
     async fn read_back(framed: Vec<u8>) -> std::io::Result<Vec<u8>> {
-        let mut reader = sync_pack_reader(futures::io::Cursor::new(framed));
+        let mut reader = sync_pack_reader(
+            futures::io::Cursor::new(framed),
+            SyncRateBound::Floor,
+            SyncServeMeter::default(),
+        );
         let mut out = Vec::new();
         reader.read_to_end(&mut out).await?;
         Ok(out)
@@ -888,7 +1278,10 @@ mod tests {
         .expect("read ack");
         assert!(matches!(ack, SyncFrame::Ack), "first frame must be Ack");
         let mut received = Vec::new();
-        sync_pack_reader(cursor).read_to_end(&mut received).await.expect("reassemble output");
+        sync_pack_reader(cursor, SyncRateBound::Floor, SyncServeMeter::default())
+            .read_to_end(&mut received)
+            .await
+            .expect("reassemble output");
         assert_eq!(received, original, "reassembled bytes must equal the served output");
     }
 
@@ -918,7 +1311,10 @@ mod tests {
         .expect("read ack");
         assert!(matches!(ack, SyncFrame::Ack), "first frame must be Ack");
         let mut received = Vec::new();
-        sync_pack_reader(cursor).read_to_end(&mut received).await.expect("reassemble output");
+        sync_pack_reader(cursor, SyncRateBound::Floor, SyncServeMeter::default())
+            .read_to_end(&mut received)
+            .await
+            .expect("reassemble output");
         assert!(received.is_empty(), "an empty served output reassembles to zero bytes");
     }
 
