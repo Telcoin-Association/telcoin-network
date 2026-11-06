@@ -17,6 +17,7 @@ pub use message::{MissingCertificatesRequest, PrimaryRequest, PrimaryResponse};
 use message::{PrimaryGossip, PrimaryRPCError};
 use parking_lot::Mutex;
 use rand::{seq::SliceRandom as _, Rng};
+use sync_codec::{SyncRateBound, SyncServeMeter, SyncServeSpeed};
 use tn_config::ConsensusConfig;
 use tn_network_libp2p::{
     error::NetworkError,
@@ -760,7 +761,8 @@ pub struct PrimaryNetworkHandle {
     /// [`Self::clear_sync_capability`] so a peer upgraded over the rotation boundary
     /// is re-probed.
     sync_capability: Arc<Mutex<HashMap<BlsPublicKey, bool>>>,
-    /// Per-peer memory of the last epoch a sync probe to that peer failed or timed out.
+    /// Per-peer memory of the last epoch a sync probe to that peer failed, timed out, or served
+    /// below the target rate ([`SyncServeSpeed::Slow`]).
     ///
     /// The probe loops shuffle their candidate peers and then move any peer whose recorded epoch
     /// equals the epoch being fetched to the BACK: a peer that failed once for this epoch is
@@ -770,12 +772,15 @@ pub struct PrimaryNetworkHandle {
     /// is against the current epoch) and the whole map is cleared on rotation via
     /// [`Self::clear_sync_capability`].
     epoch_sync_failed: Arc<Mutex<HashMap<BlsPublicKey, Epoch>>>,
-    /// The last peer that served a full pack, a partial pack or a verified consensus output.
+    /// The last peer that served a full pack, a partial pack or a verified consensus output at
+    /// the target rate.
     ///
     /// The probe loops try this peer first unless it already failed a probe for the epoch being
     /// fetched, so the header-by-header output walk returns to the peer that just served instead
     /// of reshuffling across the whole peer set for every number. Set only by a pack import that
-    /// returned `Ok` or by a hash-verified output, never by a failed or unanswered probe.
+    /// returned `Ok` or by a hash-verified output, never by a failed or unanswered probe, and only
+    /// by a serve at the target rate ([`SyncServeSpeed::Target`]): a floor-rate serve never sets
+    /// it, so the preference cannot be captured by a slow peer.
     /// [`Self::clear_sync_capability`] deliberately leaves it in place.
     last_sync_server: Arc<Mutex<Option<BlsPublicKey>>>,
 }
@@ -827,13 +832,15 @@ impl PrimaryNetworkHandle {
     /// re-probed for it this epoch. The last peer that served a sync request stays
     /// preferred: a peer that served the previous epoch very likely serves this one,
     /// and a wrong guess costs one probe, after which the preference is dropped
-    /// (see `forget_sync_server`).
+    /// (see `forget_sync_server`). The preference can safely survive rotation because only a
+    /// target-rate serve sets it.
     pub fn clear_sync_capability(&self) {
         self.sync_capability.lock().clear();
         self.epoch_sync_failed.lock().clear();
     }
 
-    /// Record that `peer` served a full pack, a partial pack or a verified consensus output.
+    /// Record that `peer` served a full pack, a partial pack or a verified consensus output at
+    /// the target rate ([`SyncServeSpeed::Target`]).
     ///
     /// The peer is cached sync-capable, any failure it recorded this epoch is cleared so a peer
     /// that recovered is no longer de-prioritised, and it becomes the peer the next probe walk
@@ -844,6 +851,18 @@ impl PrimaryNetworkHandle {
         self.sync_capability.lock().insert(peer, true);
         self.epoch_sync_failed.lock().remove(&peer);
         *self.last_sync_server.lock() = Some(peer);
+    }
+
+    /// Record that `peer` served a valid pack or a verified output, but below the target rate
+    /// ([`SyncServeSpeed::Slow`]).
+    ///
+    /// The peer stays sync-capable, sorts behind every fresh peer for the rest of the epoch
+    /// (`order_probe_peers`), and never holds or keeps the probe-first preference, so a peer that
+    /// serves at the floor cannot capture the walk (GHSA-8fj9-xc3h-gmxm).
+    fn record_sync_served_slowly(&self, peer: BlsPublicKey, epoch: Epoch) {
+        self.sync_capability.lock().insert(peer, true);
+        self.epoch_sync_failed.lock().insert(peer, epoch);
+        self.forget_sync_server(peer);
     }
 
     /// Forget `peer` as the preferred sync server when it is the one on record. Every probe of
@@ -1080,7 +1099,9 @@ impl PrimaryNetworkHandle {
         // that does not serve a probe loses the preference (`forget_sync_server`), and every
         // probe's opening write is bounded by `SYNC_REQUEST_WRITE_TIMEOUT`, so a peer that
         // served once and then stalls costs one bounded probe, not the walk. The preference is
-        // read in its own statement so its lock guard never overlaps the failure map's.
+        // read in its own statement so its lock guard never overlaps the failure map's. Only a
+        // serve at the target rate sets the preference; a slower one de-prioritises the
+        // peer for the epoch (`record_sync_served_slowly`).
         let preferred = *self.last_sync_server.lock();
         let peers = order_probe_peers(
             peers,
@@ -1101,13 +1122,30 @@ impl PrimaryNetworkHandle {
                 futures::future::ready(!known_unsyncable)
             })
             .then(move |peer| async move {
-                match self.sync_consensus_output_from_peer(peer, request).await {
+                // Read a peer already de-prioritised this epoch at the floor and a fresh one at
+                // the target rate; the failure map's guard drops at the end of the statement.
+                let deprioritised = self.epoch_sync_failed.lock().get(&peer) == Some(&epoch);
+                let bound = SyncRateBound::for_probe(deprioritised);
+                let meter = SyncServeMeter::default();
+                let started = tokio::time::Instant::now();
+                match self
+                    .sync_consensus_output_from_peer(peer, request, bound, meter.clone())
+                    .await
+                {
                     ConsensusOutputAttempt::Fetched(output) => {
-                        self.record_sync_served(peer);
+                        let elapsed = started.elapsed();
+                        let speed = meter.speed(elapsed);
+                        match speed {
+                            SyncServeSpeed::Target => self.record_sync_served(peer),
+                            SyncServeSpeed::Slow => self.record_sync_served_slowly(peer, epoch),
+                        }
                         debug!(
                             target: "primary::network",
                             %peer,
                             number,
+                            bytes = meter.bytes(),
+                            elapsed_ms = elapsed.as_millis(),
+                            ?speed,
                             "fetched verified consensus output over sync protocol"
                         );
                         Some(output)
@@ -1159,12 +1197,17 @@ impl PrimaryNetworkHandle {
 
     /// Run one consensus-output sync exchange against `peer`, flattening the classified
     /// outcome into a single [`ConsensusOutputAttempt`].
+    ///
+    /// `bound` is the rate the reader (`sync_codec::sync_pack_reader`) holds the peer to and
+    /// `meter` counts the bytes it delivers, so the walk can judge the serve's rate.
     async fn sync_consensus_output_from_peer(
         &self,
         peer: BlsPublicKey,
         request: ConsensusOutputSyncRequest<'_>,
+        bound: SyncRateBound,
+        meter: SyncServeMeter,
     ) -> ConsensusOutputAttempt {
-        self.try_sync_consensus_output_exchange(peer, request)
+        self.try_sync_consensus_output_exchange(peer, request, bound, meter)
             .await
             .map_or_else(|attempt| attempt, ConsensusOutputAttempt::Fetched)
     }
@@ -1180,10 +1223,15 @@ impl PrimaryNetworkHandle {
     /// is also penalized) once the peer has proved sync-capable. A transport I/O error
     /// during the open (`UpgradeIo`) is transient rather than a protocol mismatch, so it
     /// maps to `Failed`. `Ok` is always a header-hash-verified output.
+    ///
+    /// `bound` is the rate the reader (`sync_codec::sync_pack_reader`) holds the peer to and
+    /// `meter` counts the bytes it delivers, so the walk can judge the serve's rate.
     async fn try_sync_consensus_output_exchange(
         &self,
         peer: BlsPublicKey,
         request: ConsensusOutputSyncRequest<'_>,
+        bound: SyncRateBound,
+        meter: SyncServeMeter,
     ) -> Result<ConsensusOutput, ConsensusOutputAttempt> {
         // open the sync stream, flattening the command-channel and stream-open results.
         // Only a genuine negotiation failure (`UpgradeFailed`) is a peer that does not
@@ -1248,7 +1296,7 @@ impl PrimaryNetworkHandle {
             // so the probe falls through to the next peer instead of returning unverified
             // bytes. An empty stream yields `NotConsensus`, i.e. a miss -> next peer.
             SyncFrame::Ack => {
-                let reader = sync_codec::sync_pack_reader(stream);
+                let reader = sync_codec::sync_pack_reader(stream, bound, meter);
                 match request
                     .consensus_chain
                     .stream_decode_consensus_output(
@@ -1420,7 +1468,9 @@ impl PrimaryNetworkHandle {
     /// the opening request write under `SYNC_REQUEST_WRITE_TIMEOUT`, the `Ack` read, and
     /// the reader's per-frame timeout plus throughput floor after it), and the last peer
     /// that served is probed first only until it fails a probe, so one stalled peer costs
-    /// one bounded probe per walk rather than the walk.
+    /// one bounded probe per walk rather than the walk. Only a serve at the target rate makes a
+    /// peer the preferred server; a slower completed serve de-prioritises it for the epoch
+    /// (`record_sync_served_slowly`), so a peer that serves at the floor cannot capture the walk.
     async fn request_epoch_pack_sync(&self, sync: EpochPackSyncRequest<'_>) -> NetworkResult<()> {
         let EpochPackSyncRequest { epoch, last_consensus_number, .. } = sync;
         let peers = self.handle.connected_peers().await?;
@@ -1431,7 +1481,9 @@ impl PrimaryNetworkHandle {
         // `order_probe_peers`). A preferred peer that does not serve a probe loses the
         // preference (`forget_sync_server`), and every probe's opening write is bounded by
         // `SYNC_REQUEST_WRITE_TIMEOUT`. The preference is read in its own statement so its
-        // lock guard never overlaps the failure map's.
+        // lock guard never overlaps the failure map's. Only a serve at
+        // the target rate sets the preference; a slower one de-prioritises the peer for the epoch
+        // (`record_sync_served_slowly`).
         let preferred = *self.last_sync_server.lock();
         let peers = order_probe_peers(
             peers,
@@ -1452,13 +1504,27 @@ impl PrimaryNetworkHandle {
                 futures::future::ready(!known_unsyncable)
             })
             .then(move |peer| async move {
-                match self.sync_epoch_pack_from_peer(peer, sync).await {
+                // Read a peer already de-prioritised this epoch at the floor and a fresh one at
+                // the target rate; the failure map's guard drops at the end of the statement.
+                let deprioritised = self.epoch_sync_failed.lock().get(&peer) == Some(&epoch);
+                let bound = SyncRateBound::for_probe(deprioritised);
+                let meter = SyncServeMeter::default();
+                let started = tokio::time::Instant::now();
+                match self.sync_epoch_pack_from_peer(peer, sync, bound, meter.clone()).await {
                     EpochPackAttempt::Imported => {
-                        self.record_sync_served(peer);
+                        let elapsed = started.elapsed();
+                        let speed = meter.speed(elapsed);
+                        match speed {
+                            SyncServeSpeed::Target => self.record_sync_served(peer),
+                            SyncServeSpeed::Slow => self.record_sync_served_slowly(peer, epoch),
+                        }
                         info!(
                             target: "primary::network",
                             %peer,
                             epoch,
+                            bytes = meter.bytes(),
+                            elapsed_ms = elapsed.as_millis(),
+                            ?speed,
                             "streamed epoch pack file over sync protocol"
                         );
                         true
@@ -1516,12 +1582,17 @@ impl PrimaryNetworkHandle {
 
     /// Run one epoch-pack sync exchange against `peer`, flattening the classified
     /// outcome into a single [`EpochPackAttempt`].
+    ///
+    /// `bound` is the rate the reader (`sync_codec::sync_pack_reader`) holds the peer to and
+    /// `meter` counts the bytes it delivers, so the walk can judge the serve's rate.
     async fn sync_epoch_pack_from_peer(
         &self,
         peer: BlsPublicKey,
         sync: EpochPackSyncRequest<'_>,
+        bound: SyncRateBound,
+        meter: SyncServeMeter,
     ) -> EpochPackAttempt {
-        self.try_sync_epoch_pack_exchange(peer, sync)
+        self.try_sync_epoch_pack_exchange(peer, sync, bound, meter)
             .await
             .map_or_else(|attempt| attempt, |()| EpochPackAttempt::Imported)
     }
@@ -1541,10 +1612,15 @@ impl PrimaryNetworkHandle {
     /// tries the next peer. A transport I/O
     /// error during the open (`UpgradeIo`) is transient rather than a protocol
     /// mismatch, so it maps to `Failed` instead of poisoning the capability cache.
+    ///
+    /// `bound` is the rate the reader (`sync_codec::sync_pack_reader`) holds the peer to and
+    /// `meter` counts the bytes it delivers, so the walk can judge the serve's rate.
     async fn try_sync_epoch_pack_exchange(
         &self,
         peer: BlsPublicKey,
         sync: EpochPackSyncRequest<'_>,
+        bound: SyncRateBound,
+        meter: SyncServeMeter,
     ) -> Result<(), EpochPackAttempt> {
         let EpochPackSyncRequest {
             epoch,
@@ -1623,7 +1699,7 @@ impl PrimaryNetworkHandle {
             // the peer's fault on the legacy path, but the sync path is metrics-only
             // during rollout: classify it `Failed` (try next peer) without a penalty.
             SyncFrame::Ack => {
-                let reader = sync_codec::sync_pack_reader(stream);
+                let reader = sync_codec::sync_pack_reader(stream, bound, meter);
                 // The reader's own per-frame timeout and throughput floor cut a stalled or
                 // dribbling peer; the per-record timeout must not cut a transfer the floor admits.
                 let record_timeout = record_timeout.max(sync_codec::SYNC_RECORD_TIMEOUT);
@@ -1649,9 +1725,11 @@ impl PrimaryNetworkHandle {
                             .boxed()
                     };
                 // No fixed overall wall-clock cap: the reader (`sync_pack_reader`) enforces a
-                // throughput floor over a rolling window plus a per-frame timeout, so a large
-                // honest pack finishes at any sustained rate at/above the floor
-                // while a drip/stalled peer is cut quickly. On such an error the
+                // rate bound over a rolling window plus a per-frame timeout. A fresh peer must
+                // sustain `SYNC_TARGET_MIN_BYTES` per window and a de-prioritised peer the floor,
+                // both prorated over the real window length, and the `End` frame is checked too,
+                // so one slow probe costs about one window; the probe-first preference needs a
+                // target-rate serve. On such an error the
                 // future resolves `Err`, which unwinds `stream_import` so its
                 // `ImportPath` guard removes the import dir, releases the epoch's claim, and the
                 // epoch is retryable against another peer. The responder applies
@@ -1880,9 +1958,9 @@ where
 /// Order the candidate peers for a sync probe: shuffle for an unbiased base order, then stably
 /// sort them into four groups, each keeping its shuffled order: the `preferred` peer (the last one
 /// that served) if it is fresh, the other fresh peers, the `preferred` peer if it already
-/// failed/timed-out a probe for THIS `epoch`, and the other peers that failed this epoch. A
-/// `preferred` peer that is not in `peers` changes nothing. Pure so it is unit-testable with a
-/// seeded rng.
+/// failed, timed out, or served below the target rate on a probe for THIS `epoch`, and the
+/// other peers that failed this epoch. A `preferred` peer that is not in `peers` changes
+/// nothing. Pure so it is unit-testable with a seeded rng.
 ///
 /// The shuffle defeats the stable-`HashMap`-order starvation (a Byzantine peer fixed at the front
 /// of every walk), and the de-prioritisation keeps a slow/drip peer that failed one call from being
@@ -3272,5 +3350,42 @@ mod sync_server_preference_tests {
         assert_eq!(without, shuffle_only);
         assert_eq!(without.len(), peers.len());
         assert!(peers.iter().all(|p| without.contains(p)));
+    }
+
+    /// A completed serve below the target rate keeps the peer sync-capable but drops its
+    /// preference and de-prioritises it for the epoch (GHSA-8fj9-xc3h-gmxm).
+    #[test]
+    fn record_sync_served_slowly_demotes_and_forgets_the_peer() {
+        let handle = handle();
+        let peer = key(1);
+        handle.record_sync_served(peer);
+        handle.record_sync_served_slowly(peer, 3);
+        assert_eq!(*handle.last_sync_server.lock(), None);
+        assert_eq!(handle.epoch_sync_failed.lock().get(&peer), Some(&3));
+        assert_eq!(handle.sync_capability.lock().get(&peer), Some(&true));
+    }
+
+    /// A later target-rate serve clears a slow mark and restores the preference.
+    #[test]
+    fn record_sync_served_clears_a_slow_mark() {
+        let handle = handle();
+        let peer = key(1);
+        handle.record_sync_served_slowly(peer, 3);
+        handle.record_sync_served(peer);
+        assert_eq!(*handle.last_sync_server.lock(), Some(peer));
+        assert_eq!(handle.epoch_sync_failed.lock().get(&peer), None);
+    }
+
+    /// A slow server marked for the epoch sorts behind every fresh peer even while it holds the
+    /// recorded preference.
+    #[test]
+    fn order_probe_peers_puts_a_slow_server_behind_fresh_peers() {
+        let peers: Vec<BlsPublicKey> = (0..6).map(key).collect();
+        let slow = key(3);
+        let failed = HashMap::from([(slow, 3)]);
+        let ordered =
+            order_probe_peers(peers.clone(), &failed, 3, Some(slow), &mut StdRng::seed_from_u64(7));
+        assert_eq!(ordered.last(), Some(&slow));
+        assert_eq!(ordered.len(), peers.len());
     }
 }
