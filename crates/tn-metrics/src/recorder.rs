@@ -22,8 +22,9 @@ const SECONDS_BUCKETS: &[f64] =
 ///
 /// [`SECONDS_BUCKETS`] starts at 5 ms, so `histogram_quantile` interpolates every sample under
 /// it linearly inside [0, 5 ms] and reports about 2.5 ms for p50 whatever the real value is. The
-/// voter's fast vote stages (`tn_primary_vote_stage_seconds`) and the engine's queue wait
-/// (`tn_engine_queue_wait_seconds`) normally finish in that range. This layout adds sub-ms bounds
+/// voter's fast vote stages (`tn_primary_vote_stage_seconds`), the engine's queue wait
+/// (`tn_engine_queue_wait_seconds`) and the worker's in-process batch report to its primary
+/// (`tn_worker_batch_report_seconds`) normally finish in that range. This layout adds sub-ms bounds
 /// below [`SECONDS_BUCKETS`] and keeps all of its bounds, so a query that pins one of them (for
 /// example `le="0.005"`) still finds its series.
 const SUB_MS_SECONDS_BUCKETS: &[f64] = &[
@@ -165,6 +166,10 @@ fn build_prometheus_recorder() -> eyre::Result<PrometheusRecorder> {
         )?
         .set_buckets_for_metric(
             Matcher::Full("tn_engine_forward_wait_seconds".to_string()),
+            SUB_MS_SECONDS_BUCKETS,
+        )?
+        .set_buckets_for_metric(
+            Matcher::Full("tn_worker_batch_report_seconds".to_string()),
             SUB_MS_SECONDS_BUCKETS,
         )?
         .set_buckets_for_metric(Matcher::Suffix("_bytes".to_string()), BYTES_BUCKETS)?
@@ -350,6 +355,7 @@ mod tests {
                 .record(0.0003);
             metrics::histogram!("tn_engine.queue_wait_seconds").record(0.0003);
             metrics::histogram!("tn_engine.forward_wait_seconds").record(0.0003);
+            metrics::histogram!("tn_worker.batch_report_seconds", "worker" => "0").record(0.0003);
             metrics::histogram!("tn_test.other_seconds").record(0.0003);
         });
 
@@ -366,6 +372,8 @@ mod tests {
             "tn_engine_forward_wait_seconds_bucket{le=\"0.00025\"} 0\n",
             "tn_engine_forward_wait_seconds_bucket{le=\"0.0005\"} 1\n",
             "tn_engine_forward_wait_seconds_bucket{le=\"30\"} 1\n",
+            "tn_worker_batch_report_seconds_bucket{worker=\"0\",le=\"0.00025\"} 0\n",
+            "tn_worker_batch_report_seconds_bucket{worker=\"0\",le=\"0.0005\"} 1\n",
             "tn_test_other_seconds_bucket{le=\"0.005\"} 1\n",
         ]
         .into_iter()
