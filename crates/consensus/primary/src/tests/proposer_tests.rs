@@ -386,10 +386,11 @@ async fn test_proposer_recovers_round_from_last_proposed() {
     config.node_storage().write_last_proposed(&build_header_at(&author, 7, epoch, &[])).unwrap();
     assert_eq!(build_proposer(ConsensusBus::new()).round, 6, "round must be seeded to P - 1");
 
-    // a node that already advanced past P via state sync must not be dragged backwards
+    // a node that already advanced past P via state sync must not be dragged backwards: it
+    // starts at the primed round, never below it
     let ahead = ConsensusBus::new();
     ahead.app().primary_round_updates().send_replace(9);
-    assert_eq!(build_proposer(ahead).round, 0, "must not seed behind an already-advanced node");
+    assert_eq!(build_proposer(ahead).round, 9, "must not seed behind an already-advanced node");
 
     // rounds restart per epoch, so a record that outlived its epoch must not seed the round
     config
@@ -463,6 +464,23 @@ async fn test_restart_reproposes_identical_header() {
         proposed.created_at_ms(),
         "the reproposed header must keep its millisecond timestamp"
     );
+
+    // the first send above is the max-delay re-send, which leaves the round at P - 1. a quorum of
+    // parents at P - 1 must lead `propose_next_header` back to the same stored header rather than
+    // a rebuilt one with a fresh digest
+    let parents = parents_at(&fixture, 6, committee.epoch(), fixture.authorities().count());
+    cb.parents().send((parents, 6)).await.expect("parents channel open");
+    let header = tokio::time::timeout(Duration::from_secs(10), rx_headers.recv())
+        .await
+        .expect("parents at P - 1 lead to a proposal before the timeout")
+        .expect("header channel stayed open");
+    assert_eq!(
+        cb.app().primary_round(),
+        proposed.round(),
+        "the proposal came from propose_next_header, which moves the round watch to P"
+    );
+    assert_eq!(header, proposed, "parents at P - 1 must repropose the identical header");
+    assert_eq!(header.digest(), proposed.digest(), "the reproposed digest must be unchanged");
 }
 
 /// Pins this test process's sub-second timestamp fork to active (or dormant) from genesis, with
@@ -1101,4 +1119,226 @@ async fn test_mixed_epoch_parents_need_a_current_epoch_quorum() {
     proposer.process_parents(quorum, 5).unwrap();
     assert_eq!(proposer.round, 5, "three current-epoch parents are a quorum");
     assert_eq!(proposer.last_parents, current[..3], "the stale parent is not kept");
+}
+
+// ---- bench5 f3-rejoin ----
+
+/// A proposer for `config`'s authority on `cb`, built the way the primary builds it once
+/// `prime_consensus` has primed the round watches.
+fn proposer_on(
+    config: &ConsensusConfig<MemDatabase>,
+    committee: &Committee,
+    cb: &ConsensusBus,
+    task_manager: &TaskManager,
+) -> Proposer<MemDatabase> {
+    Proposer::new(
+        config.clone(),
+        config.authority_id().expect("authority"),
+        cb.clone(),
+        LeaderSchedule::new(committee.clone(), LeaderSwapTable::default()),
+        task_manager.get_spawner(),
+    )
+}
+
+/// A bus whose `primary_round` watch is primed at `round`, as `prime_consensus` leaves it for a
+/// validator promoted back into the committee at the network head.
+fn bus_primed_at(round: Round) -> ConsensusBus {
+    let cb = ConsensusBus::new();
+    cb.app().primary_round_updates().send_replace(round);
+    cb
+}
+
+/// `Proposer::new` never starts below the primed `primary_round`, and parents replayed from an
+/// older round move neither the round nor the watch backwards.
+///
+/// The certificate manager replays the store's last two rounds to the proposer at startup. On a
+/// validator promoted mid-epoch those rounds predate its demotion. A proposer starting at round 0
+/// took them through the future-round branch and wrote the watch back to them, then proposed far
+/// below the network head and stored that header as `LastProposed`.
+#[tokio::test]
+async fn test_proposer_starts_at_primary_round_above_recovered_round() {
+    let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+    let committee = fixture.committee();
+    let primary = fixture.authorities().next().unwrap();
+    let config = primary.consensus_config();
+    let epoch = committee.epoch();
+    let task_manager = TaskManager::default();
+
+    // the header stored before the demotion sits below the primed head
+    config
+        .node_storage()
+        .write_last_proposed(&build_header_at(&primary.id(), 7, epoch, &[]))
+        .unwrap();
+    let cb = bus_primed_at(30);
+    let mut proposer = proposer_on(&config, &committee, &cb, &task_manager);
+    assert_eq!(proposer.round, 30, "the round starts at the primed head, not at 0 or P - 1");
+    assert!(proposer.last_parents.is_empty(), "genesis is not a parent set for round 31");
+
+    let all = fixture.authorities().count();
+    proposer.process_parents(parents_at(&fixture, 4, epoch, all), 4).unwrap();
+    assert_eq!(proposer.round, 30, "parents replayed from an older round are ignored");
+    assert_eq!(cb.app().primary_round(), 30, "the round watch never moves backwards");
+
+    // the restart premise still holds: a stored header above the primed round seeds P - 1
+    config
+        .node_storage()
+        .write_last_proposed(&build_header_at(&primary.id(), 40, epoch, &[]))
+        .unwrap();
+    assert_eq!(
+        proposer_on(&config, &committee, &bus_primed_at(30), &task_manager).round,
+        39,
+        "a stored header above the primed round still seeds P - 1"
+    );
+}
+
+/// The max-delay tick re-sends `LastProposed` only when it is at or above the proposer's round.
+///
+/// A promoted validator keeps the header it stored before its demotion: the record is the
+/// equivocation guard for that round and only the epoch close clears it. Re-sent at the network
+/// head it is refused by every voter as too old, so it is left stored and not sent. A header at
+/// the proposer's round, or the round-`P` header a restart leaves one round above it, is re-sent.
+#[tokio::test(start_paused = true)]
+async fn test_max_delay_resend_skips_last_proposed_below_the_round() {
+    // a stale record below the primed round: stored, never re-sent
+    let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+    let committee = fixture.committee();
+    let primary = fixture.authorities().next().unwrap();
+    let config = primary.consensus_config();
+    let epoch = committee.epoch();
+    let max_delay = config.parameters().max_header_delay;
+    let task_manager = TaskManager::default();
+
+    let stale = build_header_at(&primary.id(), 5, epoch, &[B256::random()]);
+    config.node_storage().write_last_proposed(&stale).unwrap();
+    let cb = bus_primed_at(20);
+    let mut rx_headers = cb.subscribe_headers();
+    let proposer = proposer_on(&config, &committee, &cb, &task_manager);
+    assert_eq!(
+        proposer.resendable_last_proposed(),
+        None,
+        "a header below the round is not re-sent"
+    );
+    proposer.spawn(&task_manager);
+    assert!(
+        tokio::time::timeout(max_delay * 3, rx_headers.recv()).await.is_err(),
+        "three max-delay ticks without parents must not send the stale header"
+    );
+    assert_eq!(
+        config.node_storage().get_last_proposed().unwrap(),
+        Some(stale),
+        "the equivocation guard record is kept"
+    );
+
+    // a record at the proposer's round: re-sent byte-identical on the tick
+    let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+    let committee = fixture.committee();
+    let primary = fixture.authorities().next().unwrap();
+    let config = primary.consensus_config();
+    let task_manager = TaskManager::default();
+
+    let current = build_header_at(&primary.id(), 20, epoch, &[B256::random()]);
+    config.node_storage().write_last_proposed(&current).unwrap();
+    let cb = bus_primed_at(20);
+    let mut rx_headers = cb.subscribe_headers();
+    let proposer = proposer_on(&config, &committee, &cb, &task_manager);
+    assert_eq!(proposer.round, 20);
+    assert_eq!(proposer.resendable_last_proposed(), Some(current.clone()));
+    proposer.spawn(&task_manager);
+    let resent = tokio::time::timeout(max_delay * 3, rx_headers.recv())
+        .await
+        .expect("the header at the proposer's round is re-sent on the tick")
+        .expect("header channel stayed open");
+    assert_eq!(resent, current, "the re-sent header is the stored one");
+
+    // a restart: the stored round-P header sits one round above the seeded P - 1. a fresh
+    // fixture keeps this record out of the storage the proposer spawned above still reads
+    let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+    let committee = fixture.committee();
+    let primary = fixture.authorities().next().unwrap();
+    let config = primary.consensus_config();
+    let restart = build_header_at(&primary.id(), 21, epoch, &[B256::random()]);
+    config.node_storage().write_last_proposed(&restart).unwrap();
+    let proposer = proposer_on(&config, &committee, &bus_primed_at(20), &task_manager);
+    assert_eq!(proposer.round, 20, "a restart seeds P - 1");
+    assert_eq!(proposer.resendable_last_proposed(), Some(restart), "the restart re-send is kept");
+}
+
+/// A proposer seeded above round 0 proposes nothing until parents of its own round arrive.
+///
+/// A promoted validator's proposer used to start with the genesis certificates as parents, and
+/// its first max-delay tick proposed `primary_round + 1` on them: a header every voter rejects
+/// with `InvalidParentRound`. It now starts with no parents, and the guard refuses a parent set of
+/// any other round, genesis included.
+#[tokio::test(start_paused = true)]
+async fn test_seeded_round_waits_for_parents_of_that_round() {
+    let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+    let committee = fixture.committee();
+    let primary = fixture.authorities().next().unwrap();
+    let config = primary.consensus_config();
+    let epoch = committee.epoch();
+    let max_delay = config.parameters().max_header_delay;
+    let task_manager = TaskManager::default();
+
+    let cb = bus_primed_at(20);
+    let mut rx_headers = cb.subscribe_headers();
+    let mut proposer = proposer_on(&config, &committee, &cb, &task_manager);
+    assert_eq!(proposer.round, 20);
+
+    // the guard on its own: genesis parents never build a header above round 1
+    proposer.last_parents = Certificate::genesis(&committee);
+    assert!(!proposer.has_parents_for_round(), "genesis parents must not build round 21");
+    proposer.last_parents.clear();
+    assert!(!proposer.has_parents_for_round(), "no parents, no proposal");
+
+    proposer.spawn(&task_manager);
+    assert!(
+        tokio::time::timeout(max_delay * 3, rx_headers.recv()).await.is_err(),
+        "no header may be proposed before parents at the seeded round arrive"
+    );
+
+    let parents = parents_at(&fixture, 20, epoch, fixture.authorities().count());
+    cb.parents().send((parents.clone(), 20)).await.unwrap();
+    let header = tokio::time::timeout(max_delay * 3, rx_headers.recv())
+        .await
+        .expect("parents at the seeded round lead to a proposal")
+        .expect("header channel stayed open");
+    assert_eq!(header.round(), 21, "the proposal builds on the seeded round");
+    assert_eq!(
+        header.parents(),
+        &parents.iter().map(|parent| parent.digest()).collect::<BTreeSet<_>>(),
+        "the proposal's parents are the certificates of the seeded round"
+    );
+}
+
+/// The epoch start is unchanged: round 0, the genesis certificates as parents, round 1 proposed
+/// on the first tick.
+#[tokio::test]
+async fn test_epoch_start_proposes_round_one_on_genesis_parents() {
+    let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+    let committee = fixture.committee();
+    let primary = fixture.authorities().next().unwrap();
+    let config = primary.consensus_config();
+    let task_manager = TaskManager::default();
+
+    // reset_for_epoch and prime_consensus leave the round watch at 0 at an epoch start
+    let cb = ConsensusBus::new();
+    let mut rx_headers = cb.subscribe_headers();
+    let proposer = proposer_on(&config, &committee, &cb, &task_manager);
+    let genesis = Certificate::genesis(&committee);
+    assert_eq!(proposer.round, 0);
+    assert_eq!(proposer.last_parents, genesis, "the epoch starts on the genesis certificates");
+    assert!(proposer.has_parents_for_round(), "genesis parents build round 1");
+
+    proposer.spawn(&task_manager);
+    let header = tokio::time::timeout(Duration::from_secs(5), rx_headers.recv())
+        .await
+        .expect("the epoch start proposes before the timeout")
+        .expect("header channel stayed open");
+    assert_eq!(header.round(), 1, "the epoch starts at round 1");
+    assert_eq!(
+        header.parents(),
+        &genesis.iter().map(|parent| parent.digest()).collect::<BTreeSet<_>>(),
+        "round 1 builds on the genesis certificates"
+    );
+    assert!(header.validate(&committee).is_ok());
 }
