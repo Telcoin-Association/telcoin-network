@@ -303,7 +303,14 @@ impl ExecutorEngine {
                             );
                             // queue the output for local execution, stamped for the queue-wait
                             // histogram
+                            let consensus_number = output.number();
                             self.queued.push_back((queued_at, output));
+                            debug!(
+                                target: "engine",
+                                consensus_number,
+                                depth = self.queued.len(),
+                                "output queued"
+                            );
                             // backlog growth means execution is falling behind consensus
                             ENGINE_METRICS.queued_outputs.set(self.queued.len() as f64);
                         })

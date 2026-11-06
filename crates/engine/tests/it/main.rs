@@ -4631,3 +4631,240 @@ async fn test_same_second_outputs_eip4788_latest_root_wins() -> eyre::Result<()>
 
     Ok(())
 }
+
+// ---- bench5 exec-split ----
+
+/// One captured engine event: its message and its fields in emission order, each rendered as
+/// text.
+type CapturedEvent = (String, Vec<(String, String)>);
+
+/// Engine events captured by the subscriber [`capture_engine_events`] installs.
+static CAPTURED_ENGINE_EVENTS: std::sync::Mutex<Vec<CapturedEvent>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Installs, once per process, a global subscriber that records every `engine` event at debug
+/// and above into [`CAPTURED_ENGINE_EVENTS`], and clears what earlier tests left there.
+///
+/// Global rather than thread-local because the execution lines are emitted on the blocking
+/// execution thread. Tests hold `IT_TEST_GUARD`, so under a single-process `cargo test` run no
+/// other test logs into the store while one reads it.
+fn capture_engine_events() {
+    use tracing::{
+        field::{Field, Visit},
+        level_filters::LevelFilter,
+        span, Event, Level, Metadata, Subscriber,
+    };
+
+    /// Renders each field as text, in the order the event carries them.
+    struct Fields(Vec<(String, String)>);
+    impl Visit for Fields {
+        fn record_str(&mut self, field: &Field, value: &str) {
+            self.0.push((field.name().to_string(), value.to_string()));
+        }
+        fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+            self.0.push((field.name().to_string(), format!("{value:?}")));
+        }
+    }
+
+    /// Records `engine` events at debug and above.
+    struct Capture;
+    impl Subscriber for Capture {
+        fn enabled(&self, metadata: &Metadata<'_>) -> bool {
+            metadata.target() == "engine" && *metadata.level() <= Level::DEBUG
+        }
+        fn max_level_hint(&self) -> Option<LevelFilter> {
+            Some(LevelFilter::DEBUG)
+        }
+        fn new_span(&self, _: &span::Attributes<'_>) -> span::Id {
+            span::Id::from_u64(1)
+        }
+        fn record(&self, _: &span::Id, _: &span::Record<'_>) {}
+        fn record_follows_from(&self, _: &span::Id, _: &span::Id) {}
+        fn event(&self, event: &Event<'_>) {
+            let mut fields = Fields(Vec::new());
+            event.record(&mut fields);
+            let message = fields
+                .0
+                .iter()
+                .position(|(name, _)| name == "message")
+                .map(|at| fields.0.remove(at).1)
+                .unwrap_or_default();
+            CAPTURED_ENGINE_EVENTS
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push((message, fields.0));
+        }
+        fn enter(&self, _: &span::Id) {}
+        fn exit(&self, _: &span::Id) {}
+    }
+
+    static INSTALLED: std::sync::Once = std::sync::Once::new();
+    INSTALLED.call_once(|| {
+        tracing::subscriber::set_global_default(Capture)
+            .expect("no other global subscriber in this test binary");
+    });
+    CAPTURED_ENGINE_EVENTS.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clear();
+}
+
+/// The fields of every captured engine event whose message is `message`, in emission order.
+fn captured_engine_events(message: &str) -> Vec<Vec<(String, String)>> {
+    CAPTURED_ENGINE_EVENTS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .filter(|(captured, _)| captured == message)
+        .map(|(_, fields)| fields.clone())
+        .collect()
+}
+
+/// The names of `fields`, in emission order.
+fn field_names(fields: &[(String, String)]) -> Vec<&str> {
+    fields.iter().map(|(name, _)| name.as_str()).collect()
+}
+
+/// The value of the field `name` in `fields`.
+fn field_value<'a>(fields: &'a [(String, String)], name: &str) -> Option<&'a str> {
+    fields.iter().find(|(field, _)| field == name).map(|(_, value)| value.as_str())
+}
+
+/// The engine's log contract for the bench-5 land path: `output queued` names the consensus
+/// number and the queue depth after the push, and each block's `next block executed` line
+/// appends the output's consensus number and the block's batch index and digest, so a block
+/// joins back to its output and batch. The two timing lines keep their existing fields first
+/// and append the forward wait and the execute split.
+#[tokio::test]
+async fn test_engine_lines_carry_consensus_ids() -> eyre::Result<()> {
+    let _guard = IT_TEST_GUARD.lock();
+    capture_engine_events();
+    let tmp_dir = TempDir::new().expect("temp dir");
+
+    // Two valid batches -> two blocks in one output.
+    let chain = test_chain_spec_arc();
+    let batches = tn_reth::test_utils::batches(chain.clone(), 2);
+    let genesis = test_genesis_with_consensus_registry(4);
+    let (genesis, _txs_by_block, _signers_by_block) =
+        seeded_genesis_from_random_batches(genesis, batches.iter());
+    let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+
+    // create execution node components
+    let gas_accumulator = GasAccumulator::new(1); // 1 worker
+    let execution_node = default_test_execution_node(
+        Some(chain.clone()),
+        None,
+        tmp_dir.path(),
+        Some(gas_accumulator.clone()),
+    )?;
+    let committee =
+        create_committee_from_state(execution_node.epoch_state_from_canonical_tip().await?).await?;
+    let leader_id = committee.authorities().first().expect("first authority").id();
+    let batch_producer =
+        committee.authority(&leader_id).expect("authority in committee").execution_address();
+    gas_accumulator.rewards_counter().set_committee(committee);
+
+    //=== Consensus: one output containing both batches
+    let mut leader = Certificate::default();
+    leader.update_header_author_for_test(leader_id);
+    let sub_dag_index = 1;
+    leader.update_header_round_for_test(sub_dag_index as u32);
+    // genesis is stamped with `now()` on creation, so the leader never predates the parent block
+    leader.update_header_created_at_for_test(now());
+    let batch_digests: VecDeque<BlockHash> = batches.iter().map(|b| b.digest()).collect();
+    let expected_txs: usize = batches.iter().map(|b| b.transactions.len()).sum();
+    let sub_dag = CommittedSubDag::new(
+        vec![Certificate::default(), leader.clone()],
+        leader,
+        sub_dag_index,
+        ReputationScores::default(),
+        None,
+        tn_types::EpochSeedChainValue::genesis_placeholder(),
+    );
+    let consensus_number = 7;
+    let mut consensus_output = ConsensusOutput::new(
+        sub_dag,
+        ConsensusHeaderDigest::default(),
+        consensus_number,
+        false,
+        batch_digests.clone(),
+        vec![CertifiedBatch { address: batch_producer, batches }],
+    );
+    // stamped just before the send, as `EpochManager::process_output` does
+    consensus_output.set_forwarded_at(Instant::now());
+
+    //=== Execution: through the engine, so its run loop logs the arrival
+    let (to_engine, from_consensus) = tokio::sync::mpsc::channel(1);
+    let reth_env = execution_node.get_reth_env().await;
+    let genesis_header = chain.sealed_genesis_header();
+    let shutdown = Notifier::default();
+    let task_manager = TaskManager::default();
+    let (engine_update_tx, _engine_update_rx) = tokio::sync::mpsc::channel(64);
+    let engine = ExecutorEngine::new(
+        reth_env.clone(),
+        None,
+        from_consensus,
+        genesis_header,
+        shutdown.subscribe(),
+        task_manager.get_spawner(),
+        gas_accumulator,
+        tn_types::repack_monitor::RepackMonitor::default(),
+        engine_update_tx,
+    );
+    to_engine.send(consensus_output).await?;
+    drop(to_engine);
+    let res = timeout(Duration::from_secs(30), engine.run()).await?;
+    assert_matches!(res, Err(TnEngineError::ConsensusOutputStreamClosed));
+    assert_eq!(reth_env.last_block_number()?, 2, "both blocks executed");
+
+    let number = consensus_number.to_string();
+
+    let queued = captured_engine_events("output queued");
+    assert_eq!(queued.len(), 1, "one line per output taken off the channel");
+    assert_eq!(field_names(&queued[0]), ["consensus_number", "depth"]);
+    assert_eq!(field_value(&queued[0], "consensus_number"), Some(number.as_str()));
+    assert_eq!(field_value(&queued[0], "depth"), Some("1"));
+
+    let executed = captured_engine_events("next block executed");
+    assert_eq!(executed.len(), 2, "one line per block");
+    for (index, (line, digest)) in executed.iter().zip(&batch_digests).enumerate() {
+        assert_eq!(
+            field_names(line),
+            ["hash", "number", "consensus_number", "batch_index", "batch_digest"],
+            "existing fields first, consensus ids appended",
+        );
+        assert_eq!(field_value(line, "consensus_number"), Some(number.as_str()));
+        assert_eq!(field_value(line, "batch_index"), Some(index.to_string().as_str()));
+        assert_eq!(field_value(line, "batch_digest"), Some(digest.to_string().as_str()));
+    }
+
+    let finished = captured_engine_events("output execution task finished");
+    assert_eq!(finished.len(), 1);
+    assert_eq!(
+        field_names(&finished[0]),
+        ["consensus_number", "queue_wait_ms", "task_ms", "forward_wait_ms"]
+    );
+
+    let output_executed = captured_engine_events("output executed");
+    assert_eq!(output_executed.len(), 1);
+    assert_eq!(
+        field_names(&output_executed[0]),
+        [
+            "consensus_number",
+            "leader_round",
+            "blocks",
+            "batches",
+            "execute_ms",
+            "persist_ms",
+            "announce_ms",
+            "txs",
+            "recover_ms",
+            "evm_ms",
+            "root_ms",
+            "finish_ms",
+            "other_ms",
+            "max_block_root_ms",
+            "max_block_evm_ms",
+        ]
+    );
+    assert_eq!(field_value(&output_executed[0], "txs"), Some(expected_txs.to_string().as_str()));
+
+    Ok(())
+}
