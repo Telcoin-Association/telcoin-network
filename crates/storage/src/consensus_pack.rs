@@ -4432,7 +4432,9 @@ impl Inner {
         // A header that does not read (transport) or is from a newer build is no fault of the
         // sender's bytes; one that reads but is wrong (a failed CRC, another epoch's uid, a
         // foreign app number), or a stream that ends before its header is complete (see
-        // `record_read_error`), is.
+        // `record_read_error`), is. Its frames are read raw (`pump_import_frames`) and decoded
+        // by `ImportRecords::next` with `decompress_peer_record`; the iterator is bounded for
+        // the peer as well, so no `next` on this stream decodes a record unbounded (#1787).
         let mut stream_iter =
             AsyncPackIter::<PackRecord, R>::open(stream, epoch as u64, PACK_VERSION)
                 .await
@@ -4444,7 +4446,8 @@ impl Inner {
                         PackError::ReadError(e.to_string())
                     }
                     _ => PackError::UndecodableRecord(format!("stream header: {e}")),
-                })?;
+                })?
+                .bounded_for_peer();
         // A legacy v0 (batches-first) pack is only ever migrated on disk, never imported: an
         // upgraded peer serves its v0 epochs migrated, so refuse the source before writing
         // anything. An older build's honest bytes are no fault of the peer's (no penalty). A v1
@@ -5648,8 +5651,9 @@ struct ImportRecords {
 
 impl ImportRecords {
     /// The next record, or `None` at the stream's clean end. Bytes that do not decompress or
-    /// decode are the sender's ([`record_read_error`]). A reader that is gone without reporting an
-    /// end means the import was abandoned: its future was dropped.
+    /// decode are the sender's ([`record_read_error`]), and so is a record stored in more than
+    /// `stored_bound` of its content (`decompress_peer_record`, #1787). A reader that is gone
+    /// without reporting an end means the import was abandoned: its future was dropped.
     fn next(&mut self) -> Result<Option<ImportRecord>, PackError> {
         let Some(frame) = self.frames.blocking_recv() else {
             return Err(PackError::ReadError("stream import abandoned".to_string()));
@@ -5658,7 +5662,7 @@ impl ImportRecords {
         let payload = match self.compression {
             PackCompression::None => &frame[..],
             PackCompression::ZStd => {
-                crate::archive::pack_iter::decompress_checked(&frame, &mut self.payload)
+                crate::archive::pack_iter::decompress_peer_record(&frame, &mut self.payload)
                     .map_err(record_read_error)?
             }
         };
@@ -5979,7 +5983,9 @@ impl OutputStreamDecoder {
 /// ConsensusOutput, verifying the header's digest equals `expected_digest` the instant it is read —
 /// BEFORE any batch record is buffered. Used on the requested-output receive path, where the
 /// expected header hash is already known (from verified gossip / a verified descendant's parent).
-/// A mismatch is [`PackError::UnexpectedConsensusDigest`] and no batch bytes are read.
+/// A mismatch is [`PackError::UnexpectedConsensusDigest`] and no batch bytes are read. Peer
+/// records are bounded by `decompress_peer_record` (`AsyncPackIter::bounded_for_peer`): a record
+/// stored in more than `stored_bound` of its content is [`PackError::UndecodableRecord`] (#1787).
 pub async fn bytes_to_verified_output<R: AsyncRead + Unpin>(
     stream: R,
     compression: PackCompression,
@@ -5990,7 +5996,8 @@ pub async fn bytes_to_verified_output<R: AsyncRead + Unpin>(
     let mut stream_iter =
         AsyncPackIter::<PackRecord, R>::open_partial(stream, compression, PACK_VERSION)
             .await
-            .map_err(|e| PackError::ReadError(e.to_string()))?;
+            .map_err(|e| PackError::ReadError(e.to_string()))?
+            .bounded_for_peer();
     iter_to_output(&mut stream_iter, timeout, committee, HeaderExpectation::Digest(expected_digest))
         .await
 }
@@ -8577,6 +8584,89 @@ pub(crate) mod test {
             }
             other => panic!("expected UnexpectedConsensusDigest, got {other:?}"),
         }
+        drop(pack);
+    }
+
+    /// A peer's record padded with a zstd skippable frame past its stored bound
+    /// (`pack_iter::stored_bound`) is refused by [`bytes_to_verified_output`] as
+    /// [`PackError::UndecodableRecord`], though its frame CRC is valid and its content decodes;
+    /// the same bytes unpadded verify, so the pad is the cause (GHSA-8fj9-xc3h-gmxm, #1787).
+    #[tokio::test]
+    async fn test_bytes_to_verified_output_rejects_a_padded_record() {
+        use crate::{
+            archive::{
+                crc::{crc32, crc32_update},
+                pack_iter::stored_bound,
+            },
+            consensus_pack::{bytes_to_verified_output, PackError},
+        };
+        use std::io::Cursor;
+
+        let temp_dir = TempDir::with_prefix("test_padded_record").expect("temp dir");
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let committee = fixture.committee();
+        let previous_epoch = test_previous_epoch(&committee);
+        let pack = ConsensusPack::open_append(temp_dir.path(), previous_epoch, committee.clone())
+            .expect("open pack");
+        let parent = ConsensusHeader::default().digest();
+        let original = make_test_output(&committee, 0, chain, 1, parent);
+        pack.save_consensus_output(original.clone()).await.unwrap();
+        pack.persist().await.expect("persist");
+        // Header-first record bytes with no data header, as the sync stream reassembles them.
+        let bytes = pack.get_consensus_output_bytes(1).await.expect("bytes");
+
+        // Unpadded, the record bytes verify.
+        let decoded = bytes_to_verified_output(
+            Cursor::new(bytes.clone()),
+            PackCompression::ZStd,
+            Duration::from_secs(5),
+            &committee,
+            original.digest(),
+        )
+        .await
+        .expect("verified decode");
+        compare_outputs(&decoded, &original);
+
+        // The first record: `[u32 LE len][payload][u32 LE crc32(len_bytes || payload)]`.
+        let len_bytes: [u8; 4] =
+            bytes.get(..4).and_then(|b| <[u8; 4]>::try_from(b).ok()).expect("record length");
+        let len = usize::try_from(u32::from_le_bytes(len_bytes)).expect("record length fits");
+        let payload = bytes.get(4..4 + len).expect("first record payload");
+        let rest = bytes.get(4 + len + 4..).expect("records after the first");
+        let content_len = zstd::stream::decode_all(payload).expect("record decompresses").len();
+        // A skippable frame (RFC 8878 3.1.2) whose body alone is as long as the bound, so the
+        // padded record is above `stored_bound` whatever the size of the real frame.
+        let pad_len = stored_bound(content_len);
+        let new_payload: Vec<u8> = 0x184D_2A50_u32
+            .to_le_bytes()
+            .into_iter()
+            .chain(u32::try_from(pad_len).expect("pad length").to_le_bytes())
+            .chain(vec![0_u8; pad_len])
+            .chain(payload.iter().copied())
+            .collect();
+        let new_len = u32::try_from(new_payload.len()).expect("padded length").to_le_bytes();
+        // The CRC exactly as `AsyncPackIter::read_frame` computes it, so only the bound refuses.
+        let crc = crc32_update(crc32(&new_len), &new_payload);
+        let padded: Vec<u8> = new_len
+            .into_iter()
+            .chain(new_payload)
+            .chain(crc.to_le_bytes())
+            .chain(rest.iter().copied())
+            .collect();
+
+        let result = bytes_to_verified_output(
+            Cursor::new(padded),
+            PackCompression::ZStd,
+            Duration::from_secs(5),
+            &committee,
+            original.digest(),
+        )
+        .await;
+        assert!(
+            matches!(result, Err(PackError::UndecodableRecord(_))),
+            "a padded record must be undecodable, got {result:?}"
+        );
         drop(pack);
     }
 
