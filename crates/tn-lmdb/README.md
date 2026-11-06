@@ -2178,7 +2178,12 @@ before the owned and detached cursors): after the churn the table took 2.3 MiB o
 13.1 MiB without merging, and the churn took 729.2 ms against 742.5 ms. The delete rows of the
 same runs stayed within a few percent of merging off, and the other rows were unchanged.
 
-Comparison benchmarks live in the reth adapter crate:
+**Regression check:** [`tn-lmdb-bench`](../tn-lmdb-bench/README.md) runs generic and reth-shaped
+workloads through the public API, and `etc/tn-lmdb-bench-compare.sh [base] [head]` builds it
+against two revisions of this crate and compares them row by row (A B B A), with an exit code for
+CI. Run it on any change to a read, write or commit path: `--tier quick` takes about a minute.
+
+Comparison benchmarks against MDBX live in the reth adapter crate:
 [`tn-lmdb-reth/engine-bench.md`](../tn-lmdb-reth/engine-bench.md) runs this engine through its own
 API, and the adapter's [README](../tn-lmdb-reth/README.md) runs reth's database benches.
 

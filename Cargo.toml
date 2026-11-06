@@ -20,6 +20,7 @@ members = [
     "crates/state-sync",
     "crates/tn-metrics",
     "crates/tn-lmdb",
+    "crates/tn-lmdb-bench",
     "crates/tn-lmdb-reth",
     "crates/tn-reth",
     "crates/e2e-tests",
@@ -191,6 +192,7 @@ assert_matches = { version = "1.5.0" }
 tn-types = { path = "./crates/types" }
 tn-metrics = { path = "./crates/tn-metrics" }
 tn-reth = { path = "./crates/tn-reth" }
+tn-lmdb = { path = "./crates/tn-lmdb" }
 tn-lmdb-reth = { path = "./crates/tn-lmdb-reth" }
 tn-node = { path = "./crates/node" }
 tn-config = { path = "./crates/config" }

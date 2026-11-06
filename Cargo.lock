@@ -11772,6 +11772,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "tn-lmdb-bench"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tn-lmdb",
+]
+
+[[package]]
 name = "tn-lmdb-reth"
 version = "0.1.0"
 dependencies = [

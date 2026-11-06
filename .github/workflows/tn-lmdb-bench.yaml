@@ -1,0 +1,110 @@
+# The tn-lmdb regression bench (etc/tn-lmdb-bench-compare.sh): the engine bench built against a
+# pull request's base and head commits, run as interleaved rounds and compared row by row.
+#
+# Optional, and only when asked: on a pull request labeled `bench` (when the label is added, and
+# on every push or reopen while it stays), or by hand from the Actions tab (*tn-lmdb bench* ->
+# *Run workflow*, with any two revisions). It is not in pr.yaml, never runs on `merge_group`,
+# and is not a required check: `CI Success` stays the only one, so a red run here blocks
+# nothing. It is still not `continue-on-error`: a gated regression (exit 1), a refusal or a
+# build error (exit 2, e.g. a base without crates/tn-lmdb) fails the job, so the pull request
+# shows it. The report is the job summary and, with the runs' JSON and logs, an artifact.
+#
+# Hosted runners share their hardware, so the time rows are noisier here than on a quiet
+# machine: the quick tier and the default thresholds catch large regressions only. No
+# dependency cache: the bench builds as two small standalone packages in their own target dirs.
+# See .github/ACTIONS.md, "tn-lmdb regression bench".
+name: tn-lmdb bench
+
+on:
+  pull_request:
+    types: [labeled, synchronize, reopened]
+  workflow_dispatch:
+    inputs:
+      base:
+        description: "Base revision (commit, tag or branch; it must have crates/tn-lmdb)"
+        required: true
+      head:
+        description: "Head revision (empty: the commit this run is on)"
+        required: false
+        default: ""
+      tier:
+        description: "Bench tier"
+        type: choice
+        options: [quick, default, full]
+        default: quick
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
+
+# Reads the repository and runs the pull request's bench, like any pull_request job: a
+# read-only token and no secrets (least privilege, CodeQL actions/missing-workflow-permissions).
+permissions:
+  contents: read
+
+env:
+  CARGO_INCREMENTAL: 0
+  RUST_BACKTRACE: 1
+
+jobs:
+  bench:
+    name: tn-lmdb bench
+    # A pull request runs only with the `bench` label, and its `labeled` event only for that
+    # label, so adding some other label to a benched pull request does not run it again.
+    if: >-
+      github.event_name == 'workflow_dispatch'
+      || (github.event.action == 'labeled' && github.event.label.name == 'bench')
+      || (github.event.action != 'labeled' && contains(github.event.pull_request.labels.*.name, 'bench'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      # Full history: the script checks out both revisions with `git worktree add`.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+
+      - name: Compare base and head
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+          INPUT_BASE: ${{ inputs.base }}
+          INPUT_HEAD: ${{ inputs.head }}
+          INPUT_TIER: ${{ inputs.tier }}
+          BENCH_DIR: ${{ runner.temp }}/tn-lmdb-bench
+        run: |
+          set -euo pipefail
+          if [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
+            base="$INPUT_BASE"
+            head="${INPUT_HEAD:-HEAD}"
+            tier="${INPUT_TIER:-quick}"
+          else
+            base="$PR_BASE"
+            head="$PR_HEAD"
+            tier=quick
+          fi
+          ./etc/tn-lmdb-bench-compare.sh --tier "$tier" --bench-dir "$BENCH_DIR" -- "$base" "$head"
+
+      - name: Report to the job summary
+        if: always()
+        env:
+          REPORT: ${{ runner.temp }}/tn-lmdb-bench/report.md
+        run: |
+          if [ -f "$REPORT" ]; then cat "$REPORT" >> "$GITHUB_STEP_SUMMARY"; fi
+
+      - name: Upload the report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: tn-lmdb-bench-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/tn-lmdb-bench/report.md
+            ${{ runner.temp }}/tn-lmdb-bench/meta.tsv
+            ${{ runner.temp }}/tn-lmdb-bench/json
+            ${{ runner.temp }}/tn-lmdb-bench/logs
+          if-no-files-found: warn
+          retention-days: 15

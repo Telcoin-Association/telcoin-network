@@ -432,6 +432,32 @@ None of these is visible to the workflow, and each closes a gap the workflow lea
 4. **The repository's default workflow permission can stay read-only** (Settings -> Actions -> General -> Workflow permissions).
    `draft-release` asks for `contents: write` in its own `permissions:` block, which GitHub grants regardless of that default; without it `gh release create` fails with a 403.
 
+## tn-lmdb regression bench
+
+`.github/workflows/tn-lmdb-bench.yaml` runs `etc/tn-lmdb-bench-compare.sh --tier quick <base sha> <head sha>`: the tn-lmdb engine bench (`crates/tn-lmdb-bench`) built against both commits, run as interleaved rounds and compared row by row.
+The script's header comment is the reference for what it builds, runs and reports.
+
+It runs only when asked:
+
+- on a pull request labeled `bench`, against the pull request's base and head commits: when the label is added, and again on every push or reopen while it stays. Adding some other label does not run it. The label has to exist in the repository (Issues -> Labels) before it can be applied;
+- by hand (*tn-lmdb bench* -> *Run workflow*), with a `base` (required), a `head` (empty: the commit the run is on) and a `tier` (`quick`, `default` or `full`).
+
+It is optional by construction, and must stay so.
+It is not in `pr.yaml`, never runs on `merge_group`, and is not a required check; `CI Success` stays the only one (item 1 of "Repository settings this requires"), and the job's name is not `CI Success`.
+A red run blocks nothing: it is information for the reviewer.
+It is still not `continue-on-error`, so the pull request shows a red check when the script exits non-zero: 1 for a gated regression, 2 for a refusal or a build or run error.
+Until tn-lmdb is on `main`, a pull request into `main` gets exit 2 from the base check ("main does not have tn-lmdb"); dispatch it by hand with a base that has tn-lmdb instead.
+
+The report is written to the job summary and uploaded, with the run settings (`meta.tsv`), each run's JSON and the build and run logs, as the artifact `tn-lmdb-bench-<run id>-<attempt>`, kept 15 days.
+Download it and run `etc/tn-lmdb-bench-compare.sh --report-only <dir> [--threshold PCT]` to compare the same runs again under other thresholds.
+
+Hosted runners share their hardware, so the time rows are noisier there than on a quiet machine, and the quick tier with the default thresholds (10% on time rows, 1% on the exact size rows; durable rows reported, not gated) catches large regressions only.
+For anything finer, run the script locally, with more rounds, on an idle machine.
+
+The job uses the same toolchain install step as the other workflows, and the builds use the head commit's `rust-toolchain.toml`.
+It has no dependency cache: the bench builds as two small standalone packages in their own target directories under `runner.temp`, so it neither reads nor writes the entries in "Caches" (and is not one of the cache steps counted there).
+It triggers on `pull_request`, never `pull_request_target`: it compiles and runs the pull request's code, with a read-only token and no secrets, like every other pull request job.
+
 ## Environment
 Attesting devs must have "MAINTAINER" role to update contract state.
 

@@ -164,6 +164,11 @@ cargo test --release -p tn-lmdb -- --ignored --skip tn_lmdb_sync_and_merge --ski
 
 A change to the public API or to cursor behaviour also runs `crates/tn-lmdb-reth`'s checks.
 
+**A change to a read, write or commit path runs the regression check** before handing back:
+`etc/tn-lmdb-bench-compare.sh --tier quick --worktree HEAD` (the working tree against HEAD, about
+a minute; `--rows` narrows it, exit 1 is a gated regression; `crates/tn-lmdb-bench/README.md` has
+the rows). A perf change states its rows' ratios from it, and from `--tier default` before a commit.
+
 The benchmark runs on demand:
 `cargo test --release -p tn-lmdb tn_lmdb_sync_and_merge -- --ignored --nocapture --test-threads 1`.
 Set `TN_LMDB_BENCH_N` for a quick run. The stamp probe runs the same way, by its name
