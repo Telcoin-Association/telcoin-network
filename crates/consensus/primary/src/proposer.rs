@@ -186,9 +186,21 @@ impl<DB: Database> Proposer<DB> {
     /// overwritten and the round-`P` header is rebuilt with a *different* digest (`created_at` is
     /// wall-clock and sits inside the digest preimage). Voters holding a durable `Votes` record
     /// for round `P` then reject that new digest with `AlreadyVoted` forever, because nothing
-    /// converts elapsed time into progress. Seeding `round` to `P - 1` makes the first proposal
-    /// land on `P`, so the repropose filter in `Self::propose_next_header` hits and the
-    /// byte-identical header is re-sent - the premise the fail-closed vote guard depends on.
+    /// converts elapsed time into progress. Seeding `round` to `P - 1` makes the next proposal
+    /// land on `P`: the max-delay re-send in `Self::run` re-sends the stored round-`P` header, and
+    /// parents at `P - 1` lead `Self::propose_next_header` to the same header through its
+    /// repropose filter, so only the byte-identical header is ever sent - the premise the
+    /// fail-closed vote guard depends on. A max-delay re-send leaves the round at `P - 1`, so the
+    /// next max-delay interval is timed for round `P` instead of `P + 1`: the leader halving is one
+    /// round off for one interval, which is harmless.
+    ///
+    /// The round never starts below `primary_round`. `prime_consensus` seeds that watch at the
+    /// network head when a validator is promoted back into the committee mid-epoch, and a proposer
+    /// starting below it would follow the certificate manager's replay of the store's last two
+    /// rounds through the future-round branch of `Self::process_parents` and move the watch
+    /// backwards. The genesis certificates are the parents of round 1 only, so they seed
+    /// `last_parents` only when the round starts at 0; a proposer seeded above round 0 waits for
+    /// parents of its own round (see `Self::has_parents_for_round`).
     pub(crate) fn new(
         config: ConsensusConfig<DB>,
         authority_id: AuthorityIdentifier, // We need to be a validator so must have an id.
@@ -198,6 +210,8 @@ impl<DB: Database> Proposer<DB> {
     ) -> Self {
         let rx_shutdown = config.shutdown().subscribe();
         let genesis = Certificate::genesis(config.committee());
+        // one read so the recovery filter and the round floor below see the same value
+        let primary_round = consensus_bus.app().primary_round();
         // create min/max delay intervals
         let min_delay_interval = tokio::time::interval(config.parameters().min_header_delay);
         let max_delay_interval = tokio::time::interval(config.parameters().max_header_delay);
@@ -224,8 +238,12 @@ impl<DB: Database> Proposer<DB> {
             .flatten()
             .filter(|header| header.epoch() == config.committee().epoch())
             .map(|header| header.round())
-            .filter(|round| *round > consensus_bus.app().primary_round())
+            .filter(|round| *round > primary_round)
             .map_or(0, |round| round.saturating_sub(1));
+        let round = recovered_round.max(primary_round);
+        // a header above round 1 built on round-0 parents is rejected by every voter
+        // (`InvalidParentRound`), so genesis seeds the parents of round 1 and nothing else
+        let last_parents = if round == 0 { genesis } else { Vec::new() };
 
         Self {
             authority_id,
@@ -240,8 +258,8 @@ impl<DB: Database> Proposer<DB> {
             rx_shutdown,
             consensus_bus,
             proposer_store: config.node_storage().clone(),
-            round: recovered_round,
-            last_parents: genesis,
+            round,
+            last_parents,
             last_leader: None,
             digests: BTreeMap::new(),
             next_lane: 0,
@@ -575,6 +593,41 @@ impl<DB: Database> Proposer<DB> {
             0 => self.update_leader(),
             _ => self.enough_votes(),
         }
+    }
+
+    /// Whether `last_parents` holds parents for the round the next header builds on.
+    ///
+    /// `Self::propose_next_header` proposes at `max(self.round, primary_round) + 1`, so the parents
+    /// must be certificates of `max(self.round, primary_round)`. The proposer is the only writer of
+    /// `primary_round` while it runs (`reset_for_epoch` and `prime_consensus` write it before
+    /// `Self::new`, and the follower path that also writes it never runs beside a proposer), and
+    /// `Self::new` starts at or above it, so that term is defensive and the target is `self.round`
+    /// in practice. `last_parents` only ever holds one round (`Self::process_parents` replaces it
+    /// on a future round and extends it on the current one, a proposal takes it and a re-proposal
+    /// clears it), so the first parent's round is the round of the whole set. A non-empty set of
+    /// another round would build a header that voters reject with `InvalidParentRound`.
+    ///
+    /// The guard checks the round, not the voting weight: the certificate aggregator sends a
+    /// round's parents to the proposer only once they reach a quorum, and later certificates of
+    /// that round only extend the set.
+    ///
+    /// - Epoch start: `reset_for_epoch` and `prime_consensus` leave `primary_round` at 0 and the
+    ///   epoch close cleared `LastProposed`, so the proposer starts at round 0 with the genesis
+    ///   certificates (round 0) and proposes round 1 at once, as before.
+    /// - Promotion mid-epoch: `prime_consensus` seeds `primary_round` at the network head `N` and
+    ///   the proposer starts at `N` with no parents. The certificate validator's empty-parents jump
+    ///   moves the round to the network head, and the first quorum of parents at a round `r` at or
+    ///   above the proposer's round makes it propose `r + 1`. It never proposes `N + 1` on round-0
+    ///   parents.
+    /// - Restart with a stored round-`P` header: the proposer starts at `P - 1` with no parents,
+    ///   the max-delay tick re-sends the stored header, and parents at `P - 1` lead to the same
+    ///   header through the repropose filter.
+    ///
+    /// Proposals resume on any quorum of parents at or above the proposer's round, the same
+    /// liveness condition as after any round jump.
+    fn has_parents_for_round(&self) -> bool {
+        let parents_round = self.round.max(self.consensus_bus.app().primary_round());
+        self.last_parents.first().is_some_and(|parent| parent.round() == parents_round)
     }
 
     /// Process certificates received for this round.
@@ -952,6 +1005,33 @@ impl<DB: Database> Proposer<DB> {
         // If not an active CVV then don't propose anything.
     }
 
+    /// The stored `LastProposed` header the max-delay tick may re-send, if any.
+    ///
+    /// Only a header of this epoch at or above the proposer's round qualifies. A restart starts
+    /// the round at `P - 1` below the stored round-`P` header, so requiring the round to match
+    /// would drop the restart re-send. A header below the round was left behind by a jump to the
+    /// network head (a promotion, or the certificate validator's empty-parents jump): the proposer
+    /// has passed its round, so a re-send cannot help. The record is never deleted here: it stays
+    /// the equivocation guard for its round until the epoch close clears it.
+    ///
+    /// A store read error is logged and skips this re-send; the next proposal reads the record
+    /// again in `Self::propose_next_header`, which fails on the same error.
+    fn resendable_last_proposed(&self) -> Option<Header> {
+        let current_epoch = self.committee.epoch();
+        self.proposer_store
+            .get_last_proposed()
+            .inspect_err(|err| {
+                warn!(
+                    target: "primary::proposer",
+                    ?err,
+                    "could not read LastProposed for the max-delay re-send"
+                );
+            })
+            .ok()
+            .flatten()
+            .filter(|header| header.epoch() == current_epoch && header.round() >= self.round)
+    }
+
     /// Wrapper async function to either query the pending header or never resolve.
     async fn pending_header(
         pending_header: &mut Option<PendingHeaderTask>,
@@ -1047,7 +1127,7 @@ impl<DB: Database> Proposer<DB> {
             // - the worker created enough blocks (header_num_of_batches_threshold)
             //      - this is happy path
             //      - vote for leader or leader already has enough votes to trigger commit
-            let enough_parents = !self.last_parents.is_empty();
+            let enough_parents = self.has_parents_for_round();
             let enough_digests = self.pending_digests_len() >= self.header_num_of_batches_threshold;
 
             // evaluate conditions for bool value
@@ -1102,7 +1182,7 @@ impl<DB: Database> Proposer<DB> {
                 max_delay_timed_out = false;
                 min_delay_timed_out = false;
             } else if should_repropose_header {
-                if let Ok(Some(last_proposed)) = self.proposer_store.get_last_proposed() {
+                if let Some(last_proposed) = self.resendable_last_proposed() {
                     warn!(target: "primary::proposer", interval=?self.calc_max_delay(), "re-proposing last header after max delay interval expired for round {}", self.round);
                     let (tx, rx) = oneshot::channel();
                     let consensus_bus = self.consensus_bus.clone();
