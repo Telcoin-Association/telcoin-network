@@ -85,6 +85,39 @@ pub const fn rejoin_round_window(gc_depth: Round) -> Round {
     gc_activity_window(gc_depth) / 2
 }
 
+/// Rounds of certificates the certificate store keeps below the newest round it writes.
+///
+/// Each certificate write prunes every round below `H - ROUNDS_TO_KEEP`, where `H` is the round
+/// just written; the store's head runs 2 to 10 rounds past the newest committed header. Peers
+/// serve certificates only from this window, so it bounds how far behind a validator may restart
+/// consensus and still rebuild its DAG. A validator restarting from its last handled leader round
+/// `C` (a rejoin after catching up, or a restart) sets its GC round to `C - gc_depth`. Its
+/// certificate manager accepts a fetched certificate above `C - gc_depth + 1` only once the
+/// certificate's parents are accepted, and Bullshark's `check_parents` needs the same rounds, so
+/// every round from `C - gc_depth + 1` up must still exist on some peer. A round pruned on every
+/// peer parks all the fetched certificates above it: nothing commits, and the node is demoted
+/// again.
+///
+/// The rebuild is therefore complete while `H - C <= ROUNDS_TO_KEEP - gc_depth + 1`. The rejoin
+/// rule promotes once `C` trails the newest header by at most [`rejoin_round_window`] (20 rounds
+/// at `gc_depth` 50), so `H - C` reaches about 30 by the time the rejoined node fetches, and an
+/// active node trails by up to [`gc_activity_window`] (40 rounds) before it is demoted. With the
+/// former value of 64 the rebuild failed once `H - C` reached 16; 128 holds up to an `H - C` of
+/// 79 at `gc_depth` 50. The cost is about twice the store's live footprint; the pruning cadence
+/// is unchanged.
+///
+/// `Parameters::validate_operational_floors` requires
+/// `gc_depth + gc_activity_window(gc_depth) + RETENTION_SLACK <= ROUNDS_TO_KEEP` (100 <= 128 at
+/// `gc_depth` 50), which refuses any `gc_depth` above 64.
+pub const ROUNDS_TO_KEEP: Round = 128;
+
+/// Rounds of certificate retention reserved beyond `gc_depth + gc_activity_window(gc_depth)`.
+///
+/// A node's lag is measured against the round of an incoming certificate or of the newest header,
+/// while the certificate store prunes from the highest round it has written, which can run up to
+/// about 10 rounds further ahead. See [`ROUNDS_TO_KEEP`].
+pub const RETENTION_SLACK: Round = 10;
+
 /// Maximum number of batch digests a single primary `Header` may reference.
 ///
 /// The proposer caps its own headers at the configured `max_header_num_of_batches`, and
