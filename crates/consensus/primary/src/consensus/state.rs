@@ -233,7 +233,10 @@ impl ConsensusState {
             .or_insert_with(|| certificate.round());
         self.last_round = self.last_round.update(certificate.round(), self.gc_depth);
 
-        // Metric: certificate_commit_latency_ms - time from certificate creation to commit
+        // Metric: certificate_commit_latency_ms - time from certificate creation to commit. the
+        // age reads the wall clock against the header's own creation time, so it is a log field
+        // only and never feeds a consensus decision
+        let created_at = certificate.header().created_at_ms();
         info!(
             target: "consensus::metrics",
             round = certificate.round(),
@@ -241,6 +244,8 @@ impl ConsensusState {
             digest = ?certificate.digest(),
             committed_round = self.last_round.committed_round,
             gc_round = self.last_round.gc_round,
+            created_at_ms = created_at.as_millis(),
+            age_ms = u64::try_from(created_at.elapsed().as_millis()).unwrap_or(u64::MAX),
             "certificate committed"
         );
 
@@ -755,6 +760,13 @@ impl<DB: Database> Consensus<DB> {
                 let commit_latency = committed_sub_dag.leader().created_at_ms().elapsed();
                 metrics.commit_latency_seconds.record(commit_latency.as_secs_f64());
 
+                // copied out before the send moves the sub-dag
+                let subdag_index = committed_sub_dag.leader().nonce();
+                let leader_round = committed_sub_dag.leader_round();
+                let commit_timestamp_ms = committed_sub_dag.commit_timestamp_ms().as_millis();
+                let base_execution_block =
+                    committed_sub_dag.leader().latest_execution_block().number;
+
                 // NOTE: The size of the sub-dag can be arbitrarily large (depending on the network
                 // condition and Byzantine leaders).
                 self.consensus_bus
@@ -762,6 +774,17 @@ impl<DB: Database> Consensus<DB> {
                     .send(committed_sub_dag)
                     .await
                     .map_err(|_| ConsensusError::ShuttingDown)?;
+
+                // the sub-dag is final once the run-ahead gate let it through; this line marks its
+                // hand-off to the subscriber, which owns the execution wait that follows
+                info!(
+                    target: "consensus::metrics",
+                    subdag_index,
+                    leader_round,
+                    commit_timestamp_ms,
+                    base_execution_block,
+                    "subdag sequenced"
+                );
                 observer.record_commit();
             }
 

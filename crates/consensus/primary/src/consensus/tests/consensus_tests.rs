@@ -2028,3 +2028,116 @@ async fn spawn_stays_active_on_a_store_left_stale_by_catch_up() {
     assert_eq!(cb.app().committed_round(), committed_round, "primed from the pack");
     config.shutdown().notify();
 }
+
+// ---- bench5 land-path-obs ----
+
+/// A commit logs the land-path timestamps the stage analysis joins on: `certificate committed`
+/// with each certificate's creation time and age, `subdag committed` with its leader's creation
+/// time and the commit timestamp, and `subdag sequenced` (index, leader round, commit timestamp
+/// and base execution block, no execution wait) once the sub-dag is handed to the subscriber.
+///
+/// Catches: a `subdag sequenced` line missing after a commit or logged for another sub-dag, an
+/// execution wait creeping back onto the consensus side, and creation times read from anything
+/// other than the header's own `created_at`.
+#[tokio::test]
+async fn commit_logs_land_path_timestamps() {
+    use crate::log_capture::LogCapture;
+    use tn_types::now_ms;
+
+    let capture = LogCapture::new("consensus::metrics");
+    let _capture_guard = tracing::subscriber::set_default(capture.clone());
+
+    let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+    let committee = fixture.committee();
+    let config = fixture.authorities().next().unwrap().consensus_config().clone();
+    let ids: Vec<_> = fixture.authorities().map(|a| a.id()).collect();
+    let genesis =
+        Certificate::genesis(&committee).iter().map(|x| x.digest()).collect::<BTreeSet<_>>();
+    let (certificates, _) = make_optimal_certificates(&committee, 1..=7, &genesis, &ids);
+    let temp_dir = TempDir::new().unwrap();
+    let consensus_chain =
+        ConsensusChain::new_for_test(temp_dir.path().to_owned(), committee.clone()).await.unwrap();
+    let bullshark = Bullshark::new(
+        committee.clone(),
+        FLOOR_SUB_DAGS_PER_SCHEDULE,
+        LeaderSchedule::new(committee.clone(), LeaderSwapTable::default()),
+        DEFAULT_BAD_NODES_STAKE_THRESHOLD,
+    );
+    let cb = ConsensusBus::new();
+    let mut rx_sequence = cb.subscribe_sequence();
+    let task_manager = TaskManager::default();
+    Consensus::spawn(config.clone(), &cb, bullshark, &task_manager, &consensus_chain, None)
+        .await
+        .unwrap();
+
+    let start_ms = now_ms().as_millis();
+    for certificate in certificates {
+        cb.new_certificates().send(certificate).await.unwrap();
+    }
+    // rounds 1 to 7 commit the leaders of rounds 2, 4 and 6
+    let mut sub_dags = Vec::new();
+    while sub_dags.len() < 3 {
+        let sub_dag = tokio::time::timeout(Duration::from_secs(10), rx_sequence.recv())
+            .await
+            .expect("committed before the timeout")
+            .expect("sequence channel stayed open");
+        sub_dags.push(sub_dag);
+    }
+    assert_eq!(sub_dags.iter().map(CommittedSubDag::leader_round).collect::<Vec<_>>(), [2, 4, 6]);
+    // the line follows the send, so wait for the consensus task to write the last one
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while capture.events("subdag sequenced").len() < sub_dags.len() {
+        assert!(std::time::Instant::now() < deadline, "no subdag sequenced line per commit");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let end_ms = now_ms().as_millis();
+
+    let sequenced = capture.events("subdag sequenced");
+    assert_eq!(sequenced.len(), sub_dags.len(), "one line per sequenced sub-dag");
+    let committed = capture.events("subdag committed");
+    for (sub_dag, line) in sub_dags.iter().zip(&sequenced) {
+        let leader = sub_dag.leader();
+        let names: Vec<_> = line.fields.iter().map(|(name, _)| *name).collect();
+        assert_eq!(
+            names,
+            ["subdag_index", "leader_round", "commit_timestamp_ms", "base_execution_block"],
+            "subdag sequenced carries no wait field"
+        );
+        assert_eq!(line.u64_field("subdag_index"), Some(leader.nonce()));
+        assert_eq!(line.u64_field("leader_round"), Some(u64::from(sub_dag.leader_round())));
+        let commit_ms = sub_dag.commit_timestamp_ms().as_millis();
+        assert_eq!(line.u64_field("commit_timestamp_ms"), Some(commit_ms));
+        assert_eq!(
+            line.u64_field("base_execution_block"),
+            Some(leader.latest_execution_block().number)
+        );
+
+        let line = committed
+            .iter()
+            .find(|line| line.u64_field("leader_round") == Some(u64::from(leader.round())))
+            .expect("subdag committed for the sequenced leader");
+        assert_eq!(line.u64_field("subdag_index"), Some(leader.nonce()));
+        assert!(line.field("leader").is_some(), "the leader id stays on the line");
+        assert_eq!(
+            line.u64_field("leader_created_at_ms"),
+            Some(leader.created_at_ms().as_millis())
+        );
+        assert_eq!(line.u64_field("commit_timestamp_ms"), Some(commit_ms));
+    }
+
+    let certificates = capture.events("certificate committed");
+    assert!(!certificates.is_empty(), "the commits logged their certificates");
+    for line in &certificates {
+        assert!(line.u64_field("round").is_some() && line.field("origin").is_some());
+        let created_at = line.u64_field("created_at_ms").expect("created_at_ms");
+        let age = line.u64_field("age_ms").expect("age_ms");
+        // age is now minus created_at at the commit, which happened inside the test window
+        let committed_at = created_at + age;
+        assert!(
+            (start_ms..=end_ms).contains(&committed_at) || age == 0,
+            "created {created_at} + age {age} lies outside the commit window {start_ms}..={end_ms}"
+        );
+    }
+
+    config.shutdown().notify();
+}

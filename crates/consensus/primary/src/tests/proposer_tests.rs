@@ -66,12 +66,7 @@ async fn test_multi_worker_proposed_header_payload() -> eyre::Result<()> {
         (0_u8..3).map(|id| (B256::repeat_byte(id), u16::from(id))).collect();
     proposer.digests = payload
         .iter()
-        .map(|(digest, worker_id)| {
-            (
-                *worker_id,
-                VecDeque::from([ProposerDigest { digest: *digest, worker_id: *worker_id }]),
-            )
-        })
+        .map(|(digest, worker_id)| (*worker_id, VecDeque::from([queued(*digest, *worker_id)])))
         .collect();
     let selected = proposer.drain_digests_for_header();
     let identity = HeaderIdentity {
@@ -87,6 +82,7 @@ async fn test_multi_worker_proposed_header_payload() -> eyre::Result<()> {
         &cb,
         proposer.last_parents,
         selected,
+        untracked_trigger(),
     )
     .await?;
 
@@ -567,6 +563,7 @@ async fn propose_round_two(
         &cb,
         parents,
         VecDeque::new(),
+        untracked_trigger(),
     )
     .await
     .expect("header proposed");
@@ -924,14 +921,8 @@ async fn test_drain_digests_shares_header_slots_across_workers() {
     // worker 0 queues a deep backlog, worker 1 only three digests
     let w0: Vec<B256> = (0..15).map(|_| B256::random()).collect();
     let w1: Vec<B256> = (0..3).map(|_| B256::random()).collect();
-    proposer.digests.insert(
-        0,
-        w0.iter().map(|digest| ProposerDigest { digest: *digest, worker_id: 0 }).collect(),
-    );
-    proposer.digests.insert(
-        1,
-        w1.iter().map(|digest| ProposerDigest { digest: *digest, worker_id: 1 }).collect(),
-    );
+    proposer.digests.insert(0, w0.iter().map(|digest| queued(*digest, 0)).collect());
+    proposer.digests.insert(1, w1.iter().map(|digest| queued(*digest, 1)).collect());
 
     let selected = proposer.drain_digests_for_header();
     assert_eq!(selected.len(), 10, "header fills to the cap");
@@ -966,10 +957,7 @@ async fn test_drain_digests_single_worker_is_fifo() {
 
     let cap = proposer.max_header_num_of_batches;
     let w0: Vec<B256> = (0..cap + 2).map(|_| B256::random()).collect();
-    proposer.digests.insert(
-        0,
-        w0.iter().map(|digest| ProposerDigest { digest: *digest, worker_id: 0 }).collect(),
-    );
+    proposer.digests.insert(0, w0.iter().map(|digest| queued(*digest, 0)).collect());
 
     let selected = proposer.drain_digests_for_header();
     let got: Vec<B256> = selected.iter().map(|digest| digest.digest).collect();
@@ -1001,10 +989,9 @@ async fn test_drain_digests_rotates_across_headers_when_lanes_exceed_cap() {
     // twelve lanes with one digest each; lane 0 carries a persistent extra backlog
     (0..12u16).for_each(|worker_id| {
         let depth = if worker_id == 0 { 2 } else { 1 };
-        proposer.digests.insert(
-            worker_id,
-            (0..depth).map(|_| ProposerDigest { digest: B256::random(), worker_id }).collect(),
-        );
+        proposer
+            .digests
+            .insert(worker_id, (0..depth).map(|_| queued(B256::random(), worker_id)).collect());
     });
 
     let first: Vec<WorkerId> =
@@ -1341,4 +1328,193 @@ async fn test_epoch_start_proposes_round_one_on_genesis_parents() {
         "round 1 builds on the genesis certificates"
     );
     assert!(header.validate(&committee).is_ok());
+}
+
+// ---- bench5 land-path-obs ----
+
+/// A digest of `worker_id` that arrived from its worker just now.
+fn queued(digest: BlockHash, worker_id: WorkerId) -> ProposerDigest {
+    ProposerDigest { digest, worker_id, received: Instant::now() }
+}
+
+/// A [`ProposalTrigger`] for tests that read neither the proposal's reason nor its counter.
+fn untracked_trigger() -> ProposalTrigger {
+    ProposalTrigger {
+        reason: ProposeReason::MinDelay,
+        pending_before: 0,
+        proposed: Counter::noop(),
+    }
+}
+
+/// Each propose-condition branch reports its own reason, in the order the run loop checks them:
+/// the max delay first whatever the digests, then the digest threshold, then the min delay.
+///
+/// Catches: a swapped branch, or the threshold winning over an expired max delay, either of which
+/// files headers under the wrong `reason` in the stage analysis.
+#[test]
+fn test_propose_reason_names_each_condition_branch() {
+    assert_eq!(ProposeReason::select(true, true), ProposeReason::MaxDelay);
+    assert_eq!(ProposeReason::select(true, false), ProposeReason::MaxDelay);
+    assert_eq!(ProposeReason::select(false, true), ProposeReason::ParentsAndThreshold);
+    assert_eq!(ProposeReason::select(false, false), ProposeReason::MinDelay);
+    assert_eq!(ProposeReason::MaxDelay.as_str(), "max_delay");
+    assert_eq!(ProposeReason::ParentsAndThreshold.as_str(), "parents_and_threshold");
+    assert_eq!(ProposeReason::MinDelay.as_str(), "min_delay");
+}
+
+/// A proposal carries the reason `propose_next_header` was given to its `header proposed` line and
+/// to the `headers_proposed_total` counter of that reason. The line also reports the header's own
+/// creation time, its digests as 0x-prefixed hex in payload order, the oldest digest's wait and
+/// the queue depth before the header took its share; the oldest wait is also a
+/// `digest_wait_seconds` sample.
+///
+/// Catches: a reason dropped or replaced on its way to the spawned proposal, a counter of the wrong
+/// reason, a digest wait measured from the newest digest or from the proposal instead of the
+/// digest's arrival, `pending_before` read after the drain, and digests printed in any other form
+/// than the hex the stage tool joins on.
+#[tokio::test]
+async fn test_header_proposed_reports_reason_digests_and_digest_wait() {
+    use crate::log_capture::LogCapture;
+    use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
+    let capture = LogCapture::new("consensus::metrics");
+    let _capture_guard = tracing::subscriber::set_default(capture.clone());
+    let recorder = DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+
+    let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+    let committee = fixture.committee();
+    let primary = fixture.authorities().next().unwrap();
+    let config = primary.consensus_config();
+    let task_manager = TaskManager::default();
+    // both resolve their metric handles when built, so both are built under the local recorder
+    let cb = metrics::with_local_recorder(&recorder, ConsensusBus::new);
+    let _rx_headers = cb.subscribe_headers();
+    let mut proposer = metrics::with_local_recorder(&recorder, || {
+        Proposer::new(
+            config.clone(),
+            primary.id(),
+            cb.clone(),
+            LeaderSchedule::new(committee.clone(), LeaderSwapTable::default()),
+            task_manager.get_spawner(),
+        )
+    });
+    assert_eq!(proposer.max_header_num_of_batches, 10, "test assumes the default header cap");
+
+    let delay = Duration::from_millis(80);
+    let mut headers = Vec::new();
+    for reason in ProposeReason::ALL {
+        // twelve digests on one worker: the oldest arrived `delay` ago, and the header takes ten
+        let delayed = Instant::now().checked_sub(delay).expect("the clock runs past the delay");
+        let queue: VecDeque<_> = (0..12)
+            .map(|i| ProposerDigest {
+                digest: B256::random(),
+                worker_id: 0,
+                received: if i == 0 { delayed } else { Instant::now() },
+            })
+            .collect();
+        proposer.digests = BTreeMap::from([(0, queue)]);
+        let header = proposer
+            .propose_next_header(reason)
+            .expect("proposal spawned")
+            .await
+            .expect("proposal task reported")
+            .expect("header proposed");
+        assert_eq!(header.payload().len(), 10);
+        headers.push((reason, header));
+    }
+
+    let lines = capture.events("header proposed");
+    assert_eq!(lines.len(), headers.len(), "one line per proposed header");
+    for ((reason, header), line) in headers.iter().zip(&lines) {
+        assert_eq!(line.field("reason"), Some(reason.as_str()));
+        assert_eq!(line.u64_field("round"), Some(u64::from(header.round())));
+        assert_eq!(line.u64_field("num_batches"), Some(10));
+        assert_eq!(line.u64_field("pending_before"), Some(12), "queue depth before the drain");
+        assert_eq!(line.u64_field("created_at_ms"), Some(header.created_at_ms().as_millis()));
+        let wait = line.u64_field("oldest_digest_wait_ms").expect("oldest digest wait");
+        assert!(wait >= 80, "{} waited {wait} ms, less than the oldest digest", reason.as_str());
+        let expected: Vec<String> = header.payload().keys().map(ToString::to_string).collect();
+        assert_eq!(line.field("digests"), Some(format!("[{}]", expected.join(",")).as_str()));
+        assert!(expected.iter().all(|d| d.len() == 66 && d.starts_with("0x")), "0x + 64 hex chars");
+        assert_eq!(expected[0], expected[0].to_lowercase(), "lowercase hex");
+    }
+
+    let snapshot = snapshotter.snapshot().into_vec();
+    for reason in ProposeReason::ALL {
+        let value = snapshot
+            .iter()
+            .find(|(key, ..)| {
+                key.key().name() == "tn_primary.headers_proposed_total"
+                    && key
+                        .key()
+                        .labels()
+                        .any(|label| label.key() == "reason" && label.value() == reason.as_str())
+            })
+            .map(|(.., value)| value)
+            .unwrap_or_else(|| panic!("no headers_proposed_total for {}", reason.as_str()));
+        assert_eq!(value, &DebugValue::Counter(1), "{}", reason.as_str());
+    }
+    let samples = snapshot
+        .iter()
+        .find_map(|(key, _, _, value)| match value {
+            DebugValue::Histogram(samples)
+                if key.key().name() == "tn_primary.digest_wait_seconds" =>
+            {
+                Some(samples.clone())
+            }
+            _ => None,
+        })
+        .expect("digest_wait_seconds recorded");
+    assert_eq!(samples.len(), ProposeReason::ALL.len(), "one sample per header with digests");
+    assert!(samples.iter().all(|s| s.0 >= delay.as_secs_f64()), "the oldest digest's wait");
+}
+
+/// Re-queuing the digests of an uncommitted own header logs one `digests resent` line with the
+/// number of digests, the oldest re-queued header's round and the proposer's round, and restarts
+/// the re-queued digests' wait. An uncommitted header without digests re-sends nothing and logs
+/// nothing.
+///
+/// Catches: a missing or per-digest line, a count or round off the re-queued headers, and a
+/// re-queued digest keeping a stale or zero arrival time.
+#[tokio::test]
+async fn test_digests_resent_line_on_requeue() {
+    use crate::log_capture::LogCapture;
+
+    let capture = LogCapture::new("consensus::metrics");
+    let _capture_guard = tracing::subscriber::set_default(capture.clone());
+
+    let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+    let committee = fixture.committee();
+    let primary = fixture.authorities().next().unwrap();
+    let author = primary.id();
+    let task_manager = TaskManager::default();
+    let cb = ConsensusBus::new();
+    let mut proposer = proposer_on(&primary.consensus_config(), &committee, &cb, &task_manager);
+    proposer.round = 7;
+
+    let (d3, d4a, d4b) = (B256::random(), B256::random(), B256::random());
+    proposer.proposed_headers.insert(3, build_test_header(&author, 3, &[d3]));
+    proposer.proposed_headers.insert(4, build_test_header(&author, 4, &[d4a, d4b]));
+    proposer.proposed_headers.insert(5, build_test_header(&author, 5, &[B256::random()]));
+    proposer.proposed_headers.insert(6, build_test_header(&author, 6, &[]));
+
+    // round 5 commits: rounds 3 and 4 fall behind it uncommitted, round 6 is still in flight
+    let before = Instant::now();
+    proposer.process_committed_headers(6, vec![5]);
+
+    let lines = capture.events("digests resent");
+    assert_eq!(lines.len(), 1, "one line per re-queue");
+    assert_eq!(lines[0].u64_field("count"), Some(3));
+    assert_eq!(lines[0].u64_field("from_round"), Some(3));
+    assert_eq!(lines[0].u64_field("round"), Some(7));
+    let requeued: Vec<_> = proposer.digests.values().flatten().collect();
+    assert_eq!(requeued.iter().map(|d| d.digest).collect::<Vec<_>>(), [d3, d4a, d4b]);
+    assert!(requeued.iter().all(|d| d.received >= before), "the wait restarts at the re-queue");
+
+    // round 7 commits: only the empty round-6 header falls behind, so nothing is re-sent
+    proposer.digests.clear();
+    proposer.process_committed_headers(7, vec![7]);
+    assert!(proposer.digests.is_empty());
+    assert_eq!(capture.events("digests resent").len(), 1, "an empty header logs no re-send");
 }

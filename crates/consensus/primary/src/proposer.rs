@@ -18,11 +18,14 @@
 use crate::{
     consensus::LeaderSchedule,
     error::{ProposerError, ProposerResult},
+    metrics::{HeadersProposedHandles, ProposeReason},
     ConsensusBus,
 };
+use reth_metrics::metrics::Counter;
 use std::{
     cmp::Ordering,
     collections::{BTreeMap, VecDeque},
+    fmt,
     time::Instant,
 };
 use tn_config::{ConsensusConfig, KeyConfig};
@@ -59,7 +62,7 @@ impl OurDigestMessage {
     /// Splits the message into components required for processing the batch.
     fn process(self) -> (oneshot::Sender<()>, ProposerDigest) {
         let OurDigestMessage { digest, worker_id, ack_channel } = self;
-        let digest = ProposerDigest { digest, worker_id };
+        let digest = ProposerDigest { digest, worker_id, received: Instant::now() };
         (ack_channel, digest)
     }
 }
@@ -73,6 +76,10 @@ struct ProposerDigest {
     pub digest: BlockHash,
     /// The worker that produced this block.
     pub worker_id: WorkerId,
+    /// When the proposer queued this digest: its arrival from the worker, or its re-queue after
+    /// the header that carried it was not committed. The `header proposed` line and
+    /// `tn_primary_digest_wait_seconds` measure the oldest digest's wait from here.
+    pub received: Instant,
 }
 
 #[cfg(test)]
@@ -148,6 +155,8 @@ pub(crate) struct Proposer<DB: ProposerStore> {
     /// The seed message binds the header's round, so it cannot be signed once for the epoch; the
     /// signer handle is carried instead and used immediately before each [`Header::new`].
     key_config: KeyConfig,
+    /// The `tn_primary_headers_proposed_total{reason}` counters, resolved once per epoch.
+    headers_proposed: HeadersProposedHandles,
 }
 
 /// The identity a proposer stamps on a header it authors.
@@ -170,6 +179,19 @@ struct HeaderIdentity {
     /// message binds the header's round, so the signer travels with the identity and the signature
     /// is produced immediately before [`Header::new`].
     key_config: KeyConfig,
+}
+
+/// Why the proposer builds a header and what its queue held at that moment, carried into
+/// [`Proposer::propose_header`] for the `header proposed` line and the proposal metrics.
+///
+/// Observability only: nothing here changes what the header contains.
+struct ProposalTrigger {
+    /// The propose-condition branch that fired.
+    reason: ProposeReason,
+    /// Digests pending across all workers before this header took its share.
+    pending_before: usize,
+    /// `tn_primary_headers_proposed_total{reason}` for [`Self::reason`].
+    proposed: Counter,
 }
 
 impl<DB: Database> Proposer<DB> {
@@ -269,6 +291,7 @@ impl<DB: Database> Proposer<DB> {
             task_spawner,
             prior_epoch_record: config.prior_epoch_record(),
             key_config: config.key_config().clone(),
+            headers_proposed: HeadersProposedHandles::new(),
         }
     }
 
@@ -285,6 +308,7 @@ impl<DB: Database> Proposer<DB> {
         consensus_bus: &ConsensusBus,
         parents: Vec<Certificate>,
         digests: VecDeque<ProposerDigest>,
+        trigger: ProposalTrigger,
     ) -> ProposerResult<Header> {
         let HeaderIdentity {
             round: current_round,
@@ -354,6 +378,13 @@ impl<DB: Database> Proposer<DB> {
             created_at,
         );
 
+        // the oldest digest's wait ends here, once the header carrying it exists; a header
+        // without digests has no wait to report and records no sample
+        let oldest_digest_wait = digests.iter().map(|d| d.received).min().map(|r| r.elapsed());
+        if let Some(wait) = oldest_digest_wait {
+            consensus_bus.app().metrics().digest_wait_seconds.record(wait.as_secs_f64());
+        }
+
         // Metric: header_proposed - tracks header proposals
         info!(
             target: "consensus::metrics",
@@ -361,9 +392,14 @@ impl<DB: Database> Proposer<DB> {
             epoch = current_epoch,
             num_batches = digests.len(),
             num_parents = parents.len(),
+            created_at_ms = header.created_at_ms().as_millis(),
+            reason = trigger.reason.as_str(),
+            digests = %HeaderDigests(&digests),
+            oldest_digest_wait_ms = oldest_digest_wait.map_or(0, duration_ms),
+            pending_before = trigger.pending_before,
             "header proposed"
         );
-        consensus_bus.app().metrics().headers_proposed_total.increment(1);
+        trigger.proposed.increment(1);
 
         if enabled!(target: "primary::proposer", tracing::Level::TRACE) {
             let mut msg = format!("Created header {header:?} with parent certificates:\n");
@@ -780,6 +816,9 @@ impl<DB: Database> Proposer<DB> {
         let mut digests_to_resend: BTreeMap<WorkerId, VecDeque<ProposerDigest>> = BTreeMap::new();
         // Oldest to newest rounds.
         let mut retransmit_rounds = Vec::new();
+        // a re-queued digest's wait restarts here: the proposer keeps no arrival time for digests
+        // already in a header
+        let requeued_at = Instant::now();
 
         // walk proposed headers in order by round, up to the committed round
         self.proposed_headers
@@ -788,10 +827,11 @@ impl<DB: Database> Proposer<DB> {
             .for_each(|(header_round, header)| {
                 // add payloads from oldest to newest into each worker's lane
                 header.payload().iter().for_each(|(digest, worker_id)| {
-                    digests_to_resend
-                        .entry(*worker_id)
-                        .or_default()
-                        .push_back(ProposerDigest { digest: *digest, worker_id: *worker_id });
+                    digests_to_resend.entry(*worker_id).or_default().push_back(ProposerDigest {
+                        digest: *digest,
+                        worker_id: *worker_id,
+                        received: requeued_at,
+                    });
                 });
                 retransmit_rounds.push(*header_round);
             });
@@ -799,6 +839,17 @@ impl<DB: Database> Proposer<DB> {
         // process rounds that need to be retransmitted
         if !retransmit_rounds.is_empty() {
             let num_digests_to_resend: usize = digests_to_resend.values().map(VecDeque::len).sum();
+
+            // a header without digests leaves nothing to re-send
+            if num_digests_to_resend > 0 {
+                info!(
+                    target: "consensus::metrics",
+                    count = num_digests_to_resend,
+                    from_round = retransmit_rounds.first().copied().unwrap_or_default(),
+                    round = self.round,
+                    "digests resent"
+                );
+            }
 
             // prepend the reproposed batches to each worker's pending queue and update `self`
             std::mem::take(&mut self.digests).into_iter().for_each(|(worker_id, mut pending)| {
@@ -870,7 +921,10 @@ impl<DB: Database> Proposer<DB> {
     ///
     /// If a different header was already produced for the same round, then
     /// this method returns the earlier header. Otherwise the newly created header is returned.
-    fn propose_next_header(&mut self) -> ProposerResult<PendingHeaderTask> {
+    ///
+    /// `reason` is the propose-condition branch that fired; a new header reports it, a re-sent
+    /// header ignores it.
+    fn propose_next_header(&mut self, reason: ProposeReason) -> ProposerResult<PendingHeaderTask> {
         // Advance to the next round.
         self.round += 1;
         let updated_round = self.consensus_bus.app().primary_round() + 1;
@@ -933,6 +987,11 @@ impl<DB: Database> Proposer<DB> {
             // create new header
             None => {
                 // collect values from &mut self for this header
+                let trigger = ProposalTrigger {
+                    reason,
+                    pending_before: self.pending_digests_len(),
+                    proposed: self.headers_proposed.counter(reason),
+                };
                 let digests = self.drain_digests_for_header();
                 let parents = std::mem::take(&mut self.last_parents);
                 let authority_id = self.authority_id.clone();
@@ -955,6 +1014,7 @@ impl<DB: Database> Proposer<DB> {
                         &consensus_bus,
                         parents,
                         digests,
+                        trigger,
                     )
                     .await;
 
@@ -1166,19 +1226,13 @@ impl<DB: Database> Proposer<DB> {
                     warn!(target: "primary::proposer", interval=?self.calc_max_delay(), "max delay interval expired for round {}", self.round);
                 }
 
-                // obtain reason for logging
-                let reason = if max_delay_timed_out {
-                    "max_timeout"
-                } else if enough_digests {
-                    "threshold_size_reached"
-                } else {
-                    "min_timeout"
-                };
+                // the branch that fired, reported on the `header proposed` line
+                let reason = ProposeReason::select(max_delay_timed_out, enough_digests);
 
-                debug!(target: "primary::proposer", authority=?self.authority_id, ?reason, "proposing next header!");
+                debug!(target: "primary::proposer", authority=?self.authority_id, reason = reason.as_str(), "proposing next header!");
 
                 // propose header
-                pending_header = Some(self.propose_next_header()?);
+                pending_header = Some(self.propose_next_header(reason)?);
                 max_delay_timed_out = false;
                 min_delay_timed_out = false;
             } else if should_repropose_header {
@@ -1204,6 +1258,26 @@ impl<DB: Database> Proposer<DB> {
                 }
             }
         }
+    }
+}
+
+/// The digests of a new header for its `header proposed` line: `[0x…,0x…]`, each the full
+/// lowercase hex of a batch digest, in payload order.
+///
+/// Formatted only when the line is written, and a header holds at most
+/// `max_header_num_of_batches` digests, so the line stays bounded.
+struct HeaderDigests<'a>(&'a VecDeque<ProposerDigest>);
+
+impl fmt::Display for HeaderDigests<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("[")?;
+        for (i, proposed) in self.0.iter().enumerate() {
+            if i > 0 {
+                f.write_str(",")?;
+            }
+            write!(f, "{}", proposed.digest)?;
+        }
+        f.write_str("]")
     }
 }
 

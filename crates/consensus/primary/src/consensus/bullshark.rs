@@ -278,6 +278,8 @@ impl Bullshark {
                 min_round = min_round,
                 committed_round = state.last_round.committed_round,
                 leader = %leader.origin(),
+                leader_created_at_ms = leader.header().created_at_ms().as_millis(),
+                commit_timestamp_ms = sub_dag.commit_timestamp_ms().as_millis(),
                 "subdag committed"
             );
             self.leader_metrics.record_commit(leader.origin());
