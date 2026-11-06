@@ -31,8 +31,6 @@ static MAX_CONSENSUS_OUTPUT_BYTES: AtomicU64 = AtomicU64::new(0);
 #[derive(Metrics, Clone)]
 #[metrics(scope = "tn_primary")]
 pub struct PrimaryMetrics {
-    /// Headers proposed by this primary.
-    pub(crate) headers_proposed_total: Counter,
     /// Batch digests queued in the proposer awaiting inclusion in a header.
     pub(crate) proposer_pending_digests: Gauge,
     /// Votes received from peers on own header proposals.
@@ -95,6 +93,11 @@ pub struct PrimaryMetrics {
     /// `MAX_COMMIT_RUN_AHEAD_ROUNDS` ahead of the leader round this node has executed, counted
     /// once per hold.
     pub(crate) commit_run_ahead_blocked_total: Counter,
+    // bench5 land-path-obs
+    /// How long the oldest batch digest in each new own header waited in the proposer's queue,
+    /// from its arrival from the worker (or its re-queue after an uncommitted header) to the
+    /// header's creation. Headers without digests record nothing.
+    pub(crate) digest_wait_seconds: Histogram,
 }
 
 impl PrimaryMetrics {
@@ -278,6 +281,81 @@ impl VoteStageHandles {
     }
 }
 
+/// The propose-condition branch that made the proposer build a new header: the `reason` label of
+/// `tn_primary_headers_proposed_total` and the `reason=` field of the `header proposed` line.
+///
+/// Every branch also needs parents for the proposer's round. A re-sent header is not a new
+/// proposal and has no reason.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ProposeReason {
+    /// The round may advance and at least `header_num_of_batches_threshold` digests are pending.
+    ParentsAndThreshold,
+    /// The round may advance and the min header delay expired before the digest threshold was
+    /// reached.
+    MinDelay,
+    /// The max header delay expired, whether or not the round may advance.
+    MaxDelay,
+}
+
+impl ProposeReason {
+    /// Every reason, in [`Self::index`] order.
+    pub(crate) const ALL: [Self; 3] = [Self::ParentsAndThreshold, Self::MinDelay, Self::MaxDelay];
+
+    /// The reason for a proposal the proposer makes now: the max delay wins over the digest
+    /// threshold, which wins over the min delay, the order the proposer checks them in.
+    pub(crate) const fn select(max_delay_timed_out: bool, enough_digests: bool) -> Self {
+        if max_delay_timed_out {
+            Self::MaxDelay
+        } else if enough_digests {
+            Self::ParentsAndThreshold
+        } else {
+            Self::MinDelay
+        }
+    }
+
+    /// The static metric and log label for this reason.
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::ParentsAndThreshold => "parents_and_threshold",
+            Self::MinDelay => "min_delay",
+            Self::MaxDelay => "max_delay",
+        }
+    }
+
+    /// This reason's position in [`Self::ALL`] and in [`HeadersProposedHandles`].
+    const fn index(self) -> usize {
+        match self {
+            Self::ParentsAndThreshold => 0,
+            Self::MinDelay => 1,
+            Self::MaxDelay => 2,
+        }
+    }
+}
+
+/// The `tn_primary_headers_proposed_total{reason}` counters, resolved once when a proposer is
+/// built so no `metrics` macro runs per header. The handles are `Arc`-backed.
+#[derive(Clone, Debug)]
+pub(crate) struct HeadersProposedHandles {
+    /// One counter per [`ProposeReason`], indexed by its position in [`ProposeReason::ALL`].
+    by_reason: [Counter; ProposeReason::ALL.len()],
+}
+
+impl HeadersProposedHandles {
+    /// Resolve the counter of every reason against the installed recorder.
+    pub(crate) fn new() -> Self {
+        Self {
+            by_reason: ProposeReason::ALL.map(|reason| {
+                metrics::counter!("tn_primary.headers_proposed_total", "reason" => reason.as_str())
+            }),
+        }
+    }
+
+    /// The counter for headers proposed for `reason`.
+    pub(crate) fn counter(&self, reason: ProposeReason) -> Counter {
+        self.by_reason[reason.index()].clone()
+    }
+}
+
 /// Why this node changed its mode: the `reason` label of `tn_node_mode_transitions_total`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ModeTransitionReason {
@@ -458,7 +536,6 @@ mod tests {
         metrics::with_local_recorder(&recorder, || {
             // new_with_labels: Default::default() caches the first-bound recorder process-wide
             let metrics = PrimaryMetrics::new_with_labels(Vec::<metrics::Label>::new());
-            metrics.headers_proposed_total.increment(1);
             metrics.votes_received_total.increment(3);
             metrics.invalid_votes_total.increment(1);
             metrics.votes_deferred_future_header_total.increment(2);
@@ -472,6 +549,11 @@ mod tests {
             metrics.commit_latency_seconds.record(1.0);
             metrics.record_consensus_output_bytes(123);
             metrics.commit_run_ahead_blocked_total.increment(1);
+            // bench5 land-path-obs
+            metrics.digest_wait_seconds.record(0.25);
+            let proposed = HeadersProposedHandles::new();
+            proposed.counter(ProposeReason::MaxDelay).increment(2);
+            proposed.counter(ProposeReason::MinDelay).increment(1);
         });
 
         let snapshot = snapshotter.snapshot().into_vec();
@@ -482,8 +564,6 @@ mod tests {
                 .unwrap_or_else(|| panic!("metric {name} not registered"))
         };
 
-        let (_, _, _, value) = find("tn_primary.headers_proposed_total");
-        assert!(matches!(value, DebugValue::Counter(1)));
         let (_, _, _, value) = find("tn_primary.votes_received_total");
         assert!(matches!(value, DebugValue::Counter(3)));
         let (_, _, _, value) = find("tn_primary.votes_deferred_future_header_total");
@@ -504,6 +584,35 @@ mod tests {
         assert!(matches!(value, DebugValue::Gauge(g) if g.0 == 123.0));
         let (_, _, _, value) = find("tn_primary.commit_run_ahead_blocked_total");
         assert!(matches!(value, DebugValue::Counter(1)));
+        // bench5 land-path-obs: the proposed-header total carries a reason label on every series,
+        // so it has no unlabelled series beside them
+        let (_, _, _, value) = find("tn_primary.digest_wait_seconds");
+        assert!(matches!(value, DebugValue::Histogram(samples) if samples[0].0 == 0.25));
+        assert_eq!(
+            ProposeReason::ALL.map(ProposeReason::as_str),
+            ["parents_and_threshold", "min_delay", "max_delay"]
+        );
+        let proposed: Vec<_> = snapshot
+            .iter()
+            .filter(|(key, ..)| key.key().name() == "tn_primary.headers_proposed_total")
+            .map(|(key, _, _, value)| {
+                let reason = key.key().labels().find(|label| label.key() == "reason");
+                (reason.map(|label| label.value().to_string()), value)
+            })
+            .collect();
+        assert_eq!(proposed.len(), ProposeReason::ALL.len(), "one series per reason");
+        for reason in ProposeReason::ALL {
+            let (_, value) = proposed
+                .iter()
+                .find(|(label, _)| label.as_deref() == Some(reason.as_str()))
+                .unwrap_or_else(|| panic!("no headers_proposed_total{{reason={reason:?}}}"));
+            let expected = match reason {
+                ProposeReason::ParentsAndThreshold => 0,
+                ProposeReason::MinDelay => 1,
+                ProposeReason::MaxDelay => 2,
+            };
+            assert_eq!(*value, &DebugValue::Counter(expected), "{}", reason.as_str());
+        }
     }
 
     /// The vote path handles register every series and label the bench analysis reads: the four

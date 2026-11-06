@@ -354,7 +354,7 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "rate(tn_primary_headers_proposed_total{job=~\"$job\",instance=~\"$instance\"}[5m])",
+          "expr": "sum by (instance) (rate(tn_primary_headers_proposed_total{job=~\"$job\",instance=~\"$instance\"}[5m]))",
           "refId": "A",
           "legendFormat": "{{instance}} proposed/s"
         }

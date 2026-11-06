@@ -457,6 +457,13 @@ impl<DB: Database> Certifier<DB> {
                 // exit early when cancel notification received
                 _ = &cancel_proposal => {
                     debug!(target: "primary::certifier", "new proposal received - aborting proposal...");
+                    info!(
+                        target: "consensus::metrics",
+                        round = header.round(),
+                        epoch = header.epoch(),
+                        reason = "canceled",
+                        "header uncertified"
+                    );
                     return Err(DagError::Canceled);
                 }
             }
@@ -464,6 +471,13 @@ impl<DB: Database> Certifier<DB> {
 
         // log detailed header info if we failed to form a certificate
         let certificate = certificate.ok_or_else(|| {
+            info!(
+                target: "consensus::metrics",
+                round = header.round(),
+                epoch = header.epoch(),
+                reason = "no_certificate",
+                "header uncertified"
+            );
             if enabled!(tracing::Level::WARN) {
                 let mut msg = format!(
                     "Failed to form certificate from header {header:#?} with parent certificates:"
