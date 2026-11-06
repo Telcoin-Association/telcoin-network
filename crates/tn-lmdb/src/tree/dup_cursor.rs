@@ -382,8 +382,14 @@ impl DupWalk {
         if !(1..=usize::from(self.max_subkey)).contains(&s.len()) {
             return Err(self.bad_subkey(s.len()));
         }
-        self.key.truncate(self.kl());
-        self.key.extend_from_slice(s);
+        let kl = self.kl();
+        if self.key.len() == kl + s.len() {
+            // The common case, a subkey as long as the last: plain loads and stores, no `memcpy`.
+            page::copy_short(&mut self.key[kl..], s);
+        } else {
+            self.key.truncate(kl);
+            self.key.extend_from_slice(s);
+        }
         Ok(())
     }
 
