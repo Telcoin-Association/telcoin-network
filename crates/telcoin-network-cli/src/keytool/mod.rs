@@ -472,6 +472,48 @@ mod tests {
         Ok(())
     }
 
+    /// The listen addresses (without the peer ID) of the primary and every worker that
+    /// `keytool generate` wrote to `datadir`.
+    fn generated_listen_addresses(
+        datadir: &std::path::Path,
+    ) -> eyre::Result<Vec<tn_types::Multiaddr>> {
+        Config::load_from_path(datadir.join("node-info.yaml"), ConfigFmt::YAML).map(
+            |info: NodeInfo| {
+                std::iter::once(&info.p2p_info.primary)
+                    .chain(info.p2p_info.workers.iter())
+                    .map(|node| {
+                        node.network_address
+                            .iter()
+                            .filter(|protocol| !matches!(protocol, tn_types::Protocol::P2p(_)))
+                            .collect()
+                    })
+                    .collect()
+            },
+        )
+    }
+
+    /// Validators that one process generates never share a UDP listen port. The e2e harness
+    /// generates all of its validators in one process, and a shared port makes one node fail
+    /// to bind at startup (`Address already in use`).
+    #[tokio::test]
+    async fn test_generate_validators_get_distinct_udp_ports() -> eyre::Result<()> {
+        let tempdirs = (0..4).map(|_| tempfile::TempDir::new()).collect::<Result<Vec<_>, _>>()?;
+        let datadirs: Vec<std::path::PathBuf> =
+            tempdirs.iter().map(|dir| dir.path().to_path_buf()).collect();
+        datadirs.iter().try_for_each(|datadir| {
+            KeygenArgs { workers: 2, ..keygen_args(None) }.execute(datadir, None)
+        })?;
+        let listeners = datadirs
+            .iter()
+            .map(|datadir| generated_listen_addresses(datadir))
+            .collect::<eyre::Result<Vec<_>>>()?
+            .concat();
+        let distinct: std::collections::HashSet<&tn_types::Multiaddr> = listeners.iter().collect();
+        assert_eq!(listeners.len(), 12, "4 validators with a primary and 2 workers each");
+        assert_eq!(distinct.len(), listeners.len(), "every listen socket must be distinct");
+        Ok(())
+    }
+
     /// Explicit worker addresses retain their order and receive the matching derived peer ID.
     #[tokio::test]
     async fn test_generate_multiple_worker_external_addresses() -> eyre::Result<()> {

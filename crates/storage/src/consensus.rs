@@ -604,14 +604,16 @@ impl ConsensusChain {
         self.with_recent_header(epoch, digest, ConsensusHeader::clone).ok()
     }
 
-    /// Create a new empty consensus chain with a dummy epoch 0 pack ready.
+    /// Create a new empty consensus chain with a dummy pack ready for the committee's epoch.
+    /// The synthesized previous record carries the epoch before the committee's, so a committee
+    /// at any epoch passes the previous-epoch check in [`Self::new_epoch`].
     pub async fn new_for_test(
         base_path: PathBuf,
         committee: Committee,
     ) -> Result<ConsensusChain, ConsensusChainError> {
         let me = Self::new(base_path, committee.clone())?;
         let rec = EpochRecord {
-            epoch: 0,
+            epoch: committee.epoch().saturating_sub(1),
             committee: committee.bls_keys().iter().copied().collect(),
             next_committee: committee.bls_keys().iter().copied().collect(),
             ..Default::default()
