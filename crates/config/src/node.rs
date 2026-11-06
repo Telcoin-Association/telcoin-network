@@ -460,6 +460,14 @@ impl Parameters {
     ///   the buffer collapses that window to zero and wedges the node inactive during normal
     ///   operation. Coupling the floor to the same constant the handler subtracts keeps the two
     ///   from drifting apart.
+    /// - `gc_depth + gc_activity_window(gc_depth) + RETENTION_SLACK` must not exceed
+    ///   [`tn_types::ROUNDS_TO_KEEP`]. Peers prune certificates below their newest written round
+    ///   minus `ROUNDS_TO_KEEP`, and a validator that restarts consensus up to the activity window
+    ///   behind (a rejoin, a restart) rebuilds its DAG from the `gc_depth` rounds below that point,
+    ///   which it can fetch only while some peer still holds them. With `ROUNDS_TO_KEEP` 128 any
+    ///   `gc_depth` above 64 is refused here (100 <= 128 at `gc_depth` 50); the protocol ceiling
+    ///   [`tn_types::MAX_GC_DEPTH`] (50) refuses those first today, so this check binds once that
+    ///   ceiling is raised.
     /// - `max_header_num_of_batches` must be at least one, otherwise the proposer caps every header
     ///   at zero batch digests: it drains no transactions while its digest queue grows without
     ///   bound.
@@ -481,6 +489,23 @@ impl Parameters {
             "gc_depth {} must exceed the activity buffer {} or the node cannot stay active",
             self.gc_depth,
             tn_types::GC_ACTIVITY_BUFFER,
+        );
+        // the window is `gc_depth - GC_ACTIVITY_BUFFER` here (the check above), so the largest
+        // gc_depth that fits is `(ROUNDS_TO_KEEP + GC_ACTIVITY_BUFFER - RETENTION_SLACK) / 2`
+        let window = tn_types::gc_activity_window(self.gc_depth);
+        let retention =
+            self.gc_depth.saturating_add(window).saturating_add(tn_types::RETENTION_SLACK);
+        eyre::ensure!(
+            retention <= tn_types::ROUNDS_TO_KEEP,
+            "gc_depth {} + activity window {} + retention slack {} = {} exceeds ROUNDS_TO_KEEP {}: \
+             peers prune the certificate rounds a rejoining validator rebuilds its DAG from, so a \
+             gc_depth above {} refuses to start",
+            self.gc_depth,
+            window,
+            tn_types::RETENTION_SLACK,
+            retention,
+            tn_types::ROUNDS_TO_KEEP,
+            (tn_types::ROUNDS_TO_KEEP + tn_types::GC_ACTIVITY_BUFFER - tn_types::RETENTION_SLACK) / 2,
         );
         eyre::ensure!(
             self.max_header_num_of_batches >= 1,
@@ -890,5 +915,39 @@ mod test {
         adiri
             .validate_operational_floors()
             .expect("the adiri preset must satisfy the operational floors");
+    }
+
+    /// The certificate-retention floor accepts the devnet `gc_depth` (50 + 40 + 10 = 100 <= 128)
+    /// and the largest that fits (64 + 54 + 10 = 128).
+    #[test]
+    fn parameters_accept_gc_depth_within_certificate_retention() {
+        for gc_depth in [50, 64] {
+            let params = Parameters { gc_depth, ..Default::default() };
+            assert!(
+                params.validate_operational_floors().is_ok(),
+                "gc_depth {gc_depth} fits ROUNDS_TO_KEEP and must be accepted"
+            );
+        }
+    }
+
+    /// The certificate-retention floor refuses a `gc_depth` whose rebuild window peers may have
+    /// pruned, with a message naming the numbers and the rule.
+    #[test]
+    fn parameters_reject_gc_depth_beyond_certificate_retention() {
+        let params = Parameters { gc_depth: 65, ..Default::default() };
+        assert!(
+            params.validate_operational_floors().is_err(),
+            "gc_depth 65 needs 130 rounds of retention and must be rejected"
+        );
+        let params = Parameters { gc_depth: 79, ..Default::default() };
+        let err = params
+            .validate_operational_floors()
+            .expect_err("gc_depth 79 needs 158 rounds of retention and must be rejected");
+        assert_eq!(
+            err.to_string(),
+            "gc_depth 79 + activity window 69 + retention slack 10 = 158 exceeds ROUNDS_TO_KEEP \
+             128: peers prune the certificate rounds a rejoining validator rebuilds its DAG from, \
+             so a gc_depth above 64 refuses to start"
+        );
     }
 }
