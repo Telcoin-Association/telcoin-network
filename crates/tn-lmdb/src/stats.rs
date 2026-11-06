@@ -48,7 +48,8 @@ pub struct IoStats {
     /// to its last, the clean pages between included.
     pub msync_span_pages: u64,
     /// Bytes the file grew by: its physical length, which grows geometrically, with real blocks,
-    /// ahead of the pages in use ([`Self::pages_from_end`] counts those).
+    /// ahead of the pages in use ([`Self::pages_from_end`] counts those). A growth that first cut
+    /// a tail the file had at open counts from the cut length.
     pub bytes_grown: u64,
     /// Write rounds of the free list's fixed-point save (step 1), summed over the commits: 0 for a
     /// commit that freed nothing and took nothing from the list; a save settles in at most 3

@@ -101,8 +101,9 @@ fn runs_base(page_size: u32) -> Base {
     assert!(SLACK.contains(&left), "{left} pages of slack");
     check(&env);
     // Closed as a crash, which skips the close's trim (`Writer::trim_tail`): a clean close would
-    // give the slack back, and the crash commit would then grow the file. In `Durable` nothing
-    // else differs: the drop of a durable environment syncs nothing.
+    // give the slack back, and the crash commit would then grow the file (`run_case` takes the
+    // slack as the reopened writer's own). In `Durable` nothing else differs: the drop of a
+    // durable environment syncs nothing.
     env.crash();
     Base {
         dir,

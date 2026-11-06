@@ -953,6 +953,9 @@ checks as `Cursor`'s.
    finished. What open reads must be durable before anything is built on it.
 8. **Map** inside a reservation of `max(map_reserve, file length)`, advised `MADV_RANDOM` unless
    `readahead` is set ([Platform notes](#platform-notes); do-not-flag item 16); a remap past the reservation is advised the same way.
+   The writer takes the bytes past the pages any meta slot names as not preallocated: its first
+   growth past them cuts the file to those pages and grows from there
+   ([Platform notes](#platform-notes)). Open itself writes nothing.
 9. **Check both tree roots** (`check_root`). Each root must be a tree page in range that passes
    its full CRC and `page::validate`. Its header must name it, with `txn as u32 == root_txn` and
    txn no later than the meta's. It must be a leaf exactly when the height is 1. The height is
@@ -1838,8 +1841,13 @@ it lands on, a multi-page overflow value in full).
   preallocated tail of up to one step past its pages. A clean close truncates the file to its
   pages, rounded up to the OS page (`PageFile::trim_to`, see [Close](#close)), so the resting
   file holds no preallocated tail; a failed or skipped trim (a crash, a latched close) leaves the
-  slack. Past the reservation the mapping moves to a new reservation of at least twice the size.
-  Retired mappings are kept until close while a reader may hold a view of them.
+  slack. A reopened writer does not trust that slack: a sparse copy or restore
+  (`cp --sparse=always`, `rsync -S`, `tar -S`, a backup tool that punches runs of zeros) can have
+  made it holes, where a first write on a full disk is a `SIGBUS`. Its first growth past the pages
+  any meta slot names truncates the file to them and grows from there, preallocated, so the
+  guarantee holds for an inherited tail too. Past the reservation the mapping moves to a new
+  reservation of at least twice the size. Retired mappings are kept until close while a reader
+  may hold a view of them.
 - **A mapped access can still be a `SIGBUS`.** Preallocation covers a page's first write only.
   Every commit rewrites a meta page and reused pages in place, and where a rewrite needs new
   space a full disk can fail it with a `SIGBUS`: on a copy-on-write file system (btrfs, ZFS),
@@ -2015,6 +2023,8 @@ argument and the measurements. Code and other docs cite the items by number, so 
    authoritative. A clean close trims it; a crash, a latched close, a failed final sync or a failed
    trim keeps it, because the longer file is always valid while a trim whose length rests on state
    the close cannot trust could cut a page a meta names. In doubt, no trim. See [Close](#close).
+   A writer that opens a file with such a tail cuts it at its first growth and grows again,
+   preallocated ([Platform notes](#platform-notes)).
 6. **A torn or invalid meta slot is not repaired at open.** Open never writes; the slot counts as
    the lowest and is the next one a commit overwrites. See [Open and recovery](#open-and-recovery).
 7. **Leftover pages go back under the consumed keys in page order, not each under its own record's
@@ -2141,7 +2151,7 @@ invariants a change must keep.
 | `catalog.rs` | the table catalog (`TableRecord`, the 96-byte record of a plain or a dup table; `TableRecord::usable`, the limits of this build; `DupOptions`) |
 | `check.rs` | `Env::check`: the full structural check (every overflow run's CRC included, a dup table's nested trees, packed sets and totals) and exact page accounting |
 | `latch.rs` | the failure latch |
-| `file.rs` | `PageFile` (reserved mapping, preallocated growth capped by `EnvOptions::max_growth`, the close's tail trim `trim_to`, msync, poison), `ReadOnlyFile` (a read-only open's `PROT_READ` mapping) and `MapView` (the lock-free reader view of either) |
+| `file.rs` | `PageFile` (reserved mapping, preallocated growth capped by `EnvOptions::max_growth`, the close's tail trim `trim_to`, the cut of an inherited tail `distrust_tail`, msync, poison), `ReadOnlyFile` (a read-only open's `PROT_READ` mapping) and `MapView` (the lock-free reader view of either) |
 | `sys.rs` | `fsync_file`, `fdatasync_file`, `fsync_directory`, `allocate_range`, `os_page_size`, `flock_exclusive`, `flock_shared` |
 | `crc.rs`, `page_set.rs` | copied from `crates/storage/src/archive/` (`page_set.rs` adds a touched-word list, so `clear` and `drain` cost the words touched, not the file) |
 | `disk_model.rs` | test-only page-cache and power-loss model |

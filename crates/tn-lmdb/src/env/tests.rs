@@ -1772,6 +1772,46 @@ fn a_crash_drops_without_a_trim() {
     assert_eq!(file_len(&path), before, "a crash trims nothing");
 }
 
+/// A tail an earlier process left past the pages in use is not taken as preallocated: a crash
+/// keeps the slack, and a sparse copy of the file can make it holes (modeled by cutting the tail
+/// and extending the file again). The reopen writes nothing. The first growth past the pages cuts
+/// the tail and grows from the pages, one step, with real blocks under the whole file, and a
+/// clean close and a reopen find every row. The blocks check bites only where an extension leaves
+/// holes (ext4, XFS); APFS allocates the extended range, and there the length check shows the cut.
+#[test]
+fn an_inherited_tail_is_cut_and_regrown_with_real_blocks() {
+    let (_dir, path) = temp();
+    let env = open(&path);
+    commit_rows(&env, "a", 0, 300, 150);
+    let stat = env.stat();
+    let used = u64::from(stat.page_count) * u64::from(stat.page_size);
+    let len = env.with_writer(|w| w.file.file_len());
+    assert!(used + 8 * 4096 <= len, "the file grew past its pages: {used} of {len}");
+    env.crash();
+    let file = fs::OpenOptions::new().write(true).open(&path).expect("open the file");
+    file.set_len(used).expect("cut the tail");
+    file.set_len(len).expect("extend it without blocks");
+    drop(file);
+    let sparse = allocated(&path);
+
+    let env = open(&path);
+    assert_eq!((file_len(&path), allocated(&path)), (len, sparse), "the reopen writes nothing");
+    commit_rows(&env, "a", 300, 100, 150);
+    let grown = env.with_writer(|w| w.file.file_len());
+    let want =
+        (used + used.clamp(crate::MIN_GROWTH, 1 << 30)).next_multiple_of(sys::os_page_size());
+    assert_eq!(grown, want, "one step from the pages in use, not from the inherited length {len}");
+    assert!(
+        allocated(&path) >= grown,
+        "the regrown file is backed in full: {} allocated bytes of {grown} ({sparse} before)",
+        allocated(&path)
+    );
+    drop(env);
+    let env = open(&path);
+    env.check().expect("check");
+    assert_rows(&env, "a", 400, 150);
+}
+
 /// A `NoSync` close whose final sync fails drops without a trim: the file keeps its length and
 /// reopens to the last synced state. The failure is an injected crash after the data sync, which
 /// leaves the file unpoisoned, so only the failed sync stops the trim.

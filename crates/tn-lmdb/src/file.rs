@@ -43,7 +43,9 @@
 //! running file holds up to one step of it; a clean close gives it back ([`PageFile::trim_to`],
 //! from `EnvInner::drop` through `Writer::trim_tail`), truncating the file to its pages rounded up
 //! to the OS page, so a resting file holds no preallocated tail. A crash, a latched close or a
-//! failed trim keeps the slack.
+//! failed trim keeps the slack. A writer that opens such a file does not take the slack as its
+//! own ([`PageFile::distrust_tail`]): a sparse copy or restore may have made it holes. Its first
+//! growth past the pages in use truncates the file to them and grows from there, preallocated.
 //!
 //! ## Durability
 //!
@@ -161,6 +163,10 @@ pub(crate) struct PageFile {
     map: MmapRaw,
     /// The physical file length (`<= map.len()`): the writer's accessors stop here.
     len: u64,
+    /// The length below which [`Self::ensure_len`] needs no growth (`<= len`): `len` itself once
+    /// this file has grown or been trimmed, and at open the pages in use when the environment
+    /// says so ([`Self::distrust_tail`]).
+    backed: u64,
     /// The lock-free reader view of the current mapping.
     view: Arc<MapView>,
     /// Mappings replaced while [`Self::view`] was shared: kept mapped until this file drops so a
@@ -233,6 +239,7 @@ impl PageFile {
             file,
             map,
             len,
+            backed: len,
             view,
             retired: Vec::new(),
             readahead,
@@ -278,14 +285,40 @@ impl PageFile {
     /// [`Self::sync_size_if_grown`]. A failure poisons the file.
     pub(crate) fn ensure_len(&mut self, needed: u64) -> Result<()> {
         self.check_poison()?;
-        if needed <= self.len {
+        if needed <= self.backed {
             return Ok(());
         }
         self.grow(needed).inspect_err(|_| self.poison())
     }
 
+    /// Take the bytes past `used` as a tail this file did not preallocate: an earlier process
+    /// left it (a crash, a latched close or a failed trim keeps the slack), and a sparse copy or
+    /// restore of the file (`cp --sparse=always`, `rsync -S`, `tar -S`) may have made it holes,
+    /// where a first store on a full disk is a SIGBUS. The first growth past `used`
+    /// ([`Self::grow`]) truncates the file to `used` and grows it again, preallocated. Writes
+    /// nothing now. `used` covers every page any state the file holds names; past the file's
+    /// length it changes nothing.
+    pub(crate) fn distrust_tail(&mut self, used: u64) {
+        self.backed = self.backed.min(used);
+    }
+
+    /// Test-only: take the whole file as this file's own growth, as if it had grown it, undoing
+    /// [`Self::distrust_tail`]. For a crash test whose commit must not grow a reopened file.
+    #[cfg(test)]
+    pub(crate) fn trust_tail(&mut self) {
+        self.backed = self.len;
+    }
+
     /// The growth step of [`Self::ensure_len`].
     fn grow(&mut self, needed: u64) -> Result<()> {
+        if self.len > self.backed {
+            // The tail `distrust_tail` marked: cut it, then grow from the pages in use like any
+            // growth. Nothing reads or writes past `backed` before this (the writer allocates no
+            // page past it), and a power loss that brings the old length back leaves only slack.
+            self.file.set_len(self.backed)?;
+            self.len = self.backed;
+            self.size_unsynced.store(true, Ordering::Relaxed);
+        }
         let step = self.len.clamp(MIN_GROWTH, self.max_growth);
         let target = needed
             .max(self.len.saturating_add(step))
@@ -298,6 +331,7 @@ impl PageFile {
         }
         self.bytes_grown += target - self.len;
         self.len = target;
+        self.backed = target;
         self.size_unsynced.store(true, Ordering::Relaxed);
         Ok(())
     }
@@ -323,6 +357,7 @@ impl PageFile {
         }
         self.file.set_len(len).inspect_err(|_| self.poison())?;
         self.len = len;
+        self.backed = self.backed.min(len);
         self.size_unsynced.store(true, Ordering::Relaxed);
         Ok(())
     }

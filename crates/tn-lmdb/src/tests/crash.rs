@@ -42,8 +42,9 @@ fn key(i: u32) -> [u8; 4] {
 /// A cleanly closed file to crash commits on: its last commit's state and txn, the state before
 /// it, its page size, and the workload a case runs on it: the changes of the two commits
 /// `SyncMode::NoSync` cases leave unsynced (by round), the crashing commit's, whether that commit
-/// grows the file, and a check of the layout the matrix relies on, run on the state the crashing
-/// commit made (`dry_run`).
+/// grows the file (when it does not, [`run_case`] takes the base's slack as the reopened writer's
+/// own growth, `PageFile::trust_tail`), and a check of the layout the matrix relies on, run on
+/// the state the crashing commit made (`dry_run`).
 pub(super) struct Base {
     pub(super) dir: TempDir,
     pub(super) path: PathBuf,
@@ -194,6 +195,11 @@ pub(super) fn run_case(base: &Base, sync: SyncMode, by_msync: bool, at: Option<C
     env.with_writer(|w| {
         w.data_by_msync = by_msync;
         w.alloc.log_pages = true;
+        if !base.grows {
+            // The base's slack stands for room this writer grew earlier in its process: a
+            // reopened writer cuts and regrows an inherited tail at its first growth.
+            w.file.trust_tail();
+        }
     });
     let mut latest = base.state.clone();
     if sync == SyncMode::NoSync {

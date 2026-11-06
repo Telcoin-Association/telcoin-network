@@ -813,17 +813,27 @@ impl Writer {
         self.file.trim_to(len)
     }
 
-    /// The length a clean close may truncate the file to: the most pages any state a meta slot
-    /// holds on disk names, and never fewer than the newest state's ([`Self::last`]), times the
-    /// page size, rounded up to the OS page. A torn or invalid slot (`None`) names no state an
-    /// open can recover, so it is left out; a valid slot whose record in the file does not decode
-    /// to its txn is one this writer cannot account for, and refuses the trim
-    /// ([`Error::Failed`]).
+    /// The length a clean close may truncate the file to: [`Self::used_len`] rounded up to the OS
+    /// page.
+    fn trim_len(&self) -> Result<u64> {
+        let used = self.used_len()?;
+        used.checked_next_multiple_of(sys::os_page_size())
+            .ok_or_else(|| Error::Failed(format!("no length holds {used} bytes")))
+    }
+
+    /// The bytes of the file's pages in use: the most pages any state a meta slot holds on disk
+    /// names, and never fewer than the newest state's ([`Self::last`]), times the page size. A
+    /// file cut to it still opens to every state its slots hold: the clean close's trim
+    /// ([`Self::trim_len`]), and open's cut of an inherited tail ([`PageFile::distrust_tail`]). A
+    /// torn or invalid slot (`None`) names no state an open can recover, so it is left out; a
+    /// valid slot whose record in the file does not decode to its txn is one this writer cannot
+    /// account for, and is [`Error::Failed`].
     ///
     /// The page count never shrinks from one committed state to the next (the allocator's next
     /// page number only grows within a transaction, and an abort puts it back), so the newest
-    /// state's count is the largest; the slots' are read anyway, which costs a close nothing.
-    fn trim_len(&self) -> Result<u64> {
+    /// state's count is the largest; the slots' are read anyway, which costs an open or a close
+    /// nothing.
+    fn used_len(&self) -> Result<u64> {
         let size = self.geometry.page_size();
         let mut pages = self.last.page_count;
         for (slot, txn) in self.slots.iter().enumerate() {
@@ -838,9 +848,7 @@ impl Writer {
                 }
             }
         }
-        (u64::from(pages) * size as u64)
-            .checked_next_multiple_of(sys::os_page_size())
-            .ok_or_else(|| Error::Failed(format!("no length holds {pages} pages")))
+        Ok(u64::from(pages) * size as u64)
     }
 
     /// Test-only: the txns the meta slots hold on disk.
@@ -1155,7 +1163,7 @@ impl Env {
         let file =
             PageFile::from_file(file, options.map_reserve, options.readahead, options.max_growth)?;
         let snapshot = checked_snapshot(meta, geometry, file.view())?;
-        let writer = Writer {
+        let mut writer = Writer {
             view: file.view(),
             file,
             geometry,
@@ -1196,6 +1204,10 @@ impl Env {
             #[cfg(test)]
             stamped_on: 0,
         };
+        // A tail past the pages in use is an earlier process's, maybe sparse: the first growth
+        // past those pages cuts it and grows again, preallocated. Nothing is written here.
+        let used = writer.used_len()?;
+        writer.file.distrust_tail(used);
         let inner = EnvInner::new(geometry, options.sync, snapshot, Some(Box::new(writer)), None);
         Ok(Env { inner: Arc::new(inner) })
     }
