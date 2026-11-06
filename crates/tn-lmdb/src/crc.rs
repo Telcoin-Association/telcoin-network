@@ -226,6 +226,7 @@ pub(crate) fn zero_crc(buffer: &mut [u8]) {
 /// True if `buffer`'s trailing 4-byte CRC is all zero — the "dirty / not-yet-CRC'd" sentinel
 /// written by [`zero_crc`]. Cheap: reads the 4 CRC bytes and computes nothing. Buffers too short to
 /// hold a payload + CRC are not considered zero.
+#[inline]
 pub(crate) fn crc_is_zero(buffer: &[u8]) -> bool {
     let len = buffer.len();
     if len < 5 {

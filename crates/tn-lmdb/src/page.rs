@@ -592,17 +592,27 @@ fn invariant(page: &[u8], what: impl Display) -> Error {
 // zeros); they do not check the page.
 
 /// The page number recorded in the header.
+#[inline]
 pub(crate) fn pgno(page: &[u8]) -> u32 {
     get_u32(page, PGNO_OFF).unwrap_or(0)
 }
 
 /// The page kind, or [`Error::Corrupt`] for an unknown tag.
+#[inline]
 pub(crate) fn kind(page: &[u8]) -> Result<Kind> {
     match page.get(KIND_OFF) {
         Some(&KIND_BRANCH) => Ok(Kind::Branch),
         Some(&KIND_LEAF) => Ok(Kind::Leaf),
-        tag => Err(corrupt(page, format_args!("unknown page kind {tag:?}"))),
+        tag => Err(unknown_kind(page, tag)),
     }
+}
+
+/// [`kind`]'s [`Error::Corrupt`] for the kind byte `tag` (`None`: the buffer has none). Cold and
+/// out of line, so a [`kind`] inlined into a descent carries none of the formatting.
+#[cold]
+#[inline(never)]
+fn unknown_kind(page: &[u8], tag: Option<&u8>) -> Error {
+    corrupt(page, format_args!("unknown page kind {tag:?}"))
 }
 
 /// The header flags (zero in this format version).
@@ -617,6 +627,7 @@ pub(crate) fn nkeys(page: &[u8]) -> usize {
 }
 
 /// The id of the transaction that wrote the page.
+#[inline]
 pub(crate) fn txn(page: &[u8]) -> u64 {
     get_u64(page, TXN_OFF).unwrap_or(0)
 }
@@ -1079,6 +1090,7 @@ fn cell_extent(page: &[u8], h: &Hdr, i: usize) -> Result<(usize, usize)> {
 }
 
 /// The key of cell `i` of either kind (empty for a branch's cell 0).
+#[inline]
 fn key_at<'a>(page: &'a [u8], h: &Hdr, i: usize) -> Result<&'a [u8]> {
     let (k, klen) = match h.kind {
         Kind::Leaf => {
@@ -1667,6 +1679,7 @@ pub(crate) fn keys_in_range(page: &[u8], lo: Option<&[u8]>, hi: Option<&[u8]>) -
 }
 
 /// The range check of [`keys_in_range`] on a parsed header.
+#[inline]
 fn keys_within(page: &[u8], h: &Hdr, lo: Option<&[u8]>, hi: Option<&[u8]>) -> Result<bool> {
     let first = usize::from(h.kind == Kind::Branch);
     if h.nkeys <= first {
@@ -1992,6 +2005,7 @@ fn write_branch_cell(cell: &mut [u8], key: &[u8], child: u32, child_txn: u32) {
 
 /// Child `i` of a branch as `(child_pgno, child_txn)`; `child_txn` is the low 32 bits of the
 /// child's header txn, checked on every descent ([`BranchView::child`]).
+#[inline]
 pub(crate) fn branch_child(page: &[u8], i: usize) -> Result<(u32, u32)> {
     BranchView { page, h: hdr_of(page, Kind::Branch)? }.child(i)
 }
@@ -2033,6 +2047,7 @@ pub(crate) fn branch_route<'a>(page: &'a [u8], key: &[u8]) -> Result<Route<'a>> 
 }
 
 /// The [`Route`] to child `i` of a branch, from one header check ([`BranchView::route_at`]).
+#[inline]
 pub(crate) fn branch_route_at(page: &[u8], i: usize) -> Result<Route<'_>> {
     BranchView { page, h: hdr_of(page, Kind::Branch)? }.route_at(i)
 }

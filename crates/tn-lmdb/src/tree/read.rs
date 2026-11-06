@@ -19,6 +19,7 @@ use crate::{
 /// The CRC itself is not recomputed here (that costs a pass over the page on every read):
 /// copy-on-write verifies a page before copying it, and the root of each tree is verified when
 /// the file is opened.
+#[inline]
 pub(crate) fn checked_page<'a>(
     pgno: u32,
     page_count: u32,
@@ -33,6 +34,7 @@ pub(crate) fn checked_page<'a>(
 /// branch cell's `child` and `child_txn`, or a root's): after those checks, the low 32 bits of
 /// the header's txn must equal `want_txn`, so a pointer to a stale copy or redirected to another
 /// page is [`Error::Corrupt`]. The header's page number and txn are read once for every check.
+#[inline]
 pub(crate) fn checked_child<'a>(
     pgno: u32,
     want_txn: u32,
@@ -55,23 +57,20 @@ fn checked<'a>(
     slice: impl FnOnce(u32) -> Option<&'a [u8]>,
 ) -> Result<&'a [u8]> {
     if pgno < 2 || pgno >= page_count {
-        return Err(Error::Corrupt(format!(
-            "page {pgno} is not a tree page of a file of {page_count} pages"
-        )));
+        return Err(fetch_error(pgno, Refused::NotTreePage { page_count }));
     }
-    let page = slice(pgno)
-        .ok_or_else(|| Error::Corrupt(format!("page {pgno} is not mapped ({page_count} pages)")))?;
+    let Some(page) = slice(pgno) else {
+        return Err(fetch_error(pgno, Refused::NotMapped { page_count }));
+    };
     if !private && crc::crc_is_zero(page) {
-        return Err(Error::Corrupt(format!("published page {pgno} was never stamped (zero CRC)")));
+        return Err(fetch_error(pgno, Refused::NeverStamped));
     }
     let (header, txn) = (page::pgno(page), page::txn(page));
     if header != pgno {
-        return Err(Error::Corrupt(format!("page {pgno} holds page {header}")));
+        return Err(fetch_error(pgno, Refused::Holds { header }));
     }
     if txn > snapshot_txn {
-        return Err(Error::Corrupt(format!(
-            "page {pgno} was written by txn {txn}, after the reading snapshot's txn {snapshot_txn}"
-        )));
+        return Err(fetch_error(pgno, Refused::WrittenAfter { txn, snapshot_txn }));
     }
     if let Some(want_txn) = want_txn {
         check_identity(pgno, txn, want_txn)?;
@@ -79,17 +78,59 @@ fn checked<'a>(
     Ok(page)
 }
 
+/// The check of [`checked`] a page fetch failed, with what its message names.
+enum Refused {
+    /// The page number is a meta page's, or not below the file's `page_count`.
+    NotTreePage { page_count: u32 },
+    /// The page is below `page_count` but not mapped.
+    NotMapped { page_count: u32 },
+    /// A published page's CRC trailer is zero.
+    NeverStamped,
+    /// The header names page `header`.
+    Holds { header: u32 },
+    /// The header's `txn` is newer than the reading snapshot's `snapshot_txn`.
+    WrittenAfter { txn: u64, snapshot_txn: u64 },
+}
+
+/// The [`Error::Corrupt`] of a fetch of page `pgno` that [`checked`] refused. Cold and out of
+/// line, so a fetch inlined into a descent carries none of the formatting.
+#[cold]
+#[inline(never)]
+fn fetch_error(pgno: u32, refused: Refused) -> Error {
+    Error::Corrupt(match refused {
+        Refused::NotTreePage { page_count } => {
+            format!("page {pgno} is not a tree page of a file of {page_count} pages")
+        }
+        Refused::NotMapped { page_count } => {
+            format!("page {pgno} is not mapped ({page_count} pages)")
+        }
+        Refused::NeverStamped => format!("published page {pgno} was never stamped (zero CRC)"),
+        Refused::Holds { header } => format!("page {pgno} holds page {header}"),
+        Refused::WrittenAfter { txn, snapshot_txn } => format!(
+            "page {pgno} was written by txn {txn}, after the reading snapshot's txn {snapshot_txn}"
+        ),
+    })
+}
+
 /// The identity check of a page reached through a pointer naming `(pgno, want_txn)` whose header
 /// holds `pgno` and `txn`: the low 32 bits of `txn` must be `want_txn`.
 #[inline]
 pub(crate) fn check_identity(pgno: u32, txn: u64, want_txn: u32) -> Result<()> {
     if txn as u32 != want_txn {
-        return Err(Error::Corrupt(format!(
-            "page {pgno} (txn {txn}) is not the copy its parent names (txn {want_txn}): a \
-             redirected or stale pointer"
-        )));
+        return Err(identity_error(pgno, txn, want_txn));
     }
     Ok(())
+}
+
+/// The [`Error::Corrupt`] of a failed [`check_identity`]. Cold and out of line, as
+/// [`fetch_error`].
+#[cold]
+#[inline(never)]
+fn identity_error(pgno: u32, txn: u64, want_txn: u32) -> Error {
+    Error::Corrupt(format!(
+        "page {pgno} (txn {txn}) is not the copy its parent names (txn {want_txn}): a \
+         redirected or stale pointer"
+    ))
 }
 
 /// The leaf a [`descend`] reached, with the key range `[lo, hi)` its ancestors' separators give
@@ -157,6 +198,7 @@ pub(crate) fn descend<'s, S: PageRead + ?Sized>(
 
 /// Intersect `[lo, hi)` (`None`: unbounded) with the range `route`'s branch gives the child it
 /// takes.
+#[inline]
 pub(crate) fn tighten<'s>(route: &Route<'s>, lo: &mut Option<&'s [u8]>, hi: &mut Option<&'s [u8]>) {
     if let Some(k) = route.lo {
         if lo.is_none_or(|lo| page::cmp_keys(k, lo).is_gt()) {

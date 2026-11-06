@@ -136,6 +136,7 @@ impl MapView {
     /// Borrow exactly `[offset, offset + len)` if it lies within the published bytes, else `None`.
     /// Only those bytes are borrowed, so the writer rewriting other published bytes in place (a
     /// page no reader's snapshot can reach) is never borrowed from where it is being written.
+    #[inline]
     pub(crate) fn slice(&self, offset: u64, len: usize) -> Option<&[u8]> {
         let end = offset.checked_add(len as u64)?;
         let limit = self.published.load(Ordering::Acquire).min(self.mapped.load(Ordering::Acquire));

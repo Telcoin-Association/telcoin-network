@@ -232,6 +232,7 @@ impl PageRead for Snapshot {
         self.meta.page_count
     }
 
+    #[inline]
     fn page(&self, pgno: u32) -> Result<&[u8]> {
         let size = self.geometry.page_size();
         checked_page(pgno, self.meta.page_count, self.meta.txn, false, |p| {
@@ -239,6 +240,7 @@ impl PageRead for Snapshot {
         })
     }
 
+    #[inline]
     fn child(&self, pgno: u32, want_txn: u32) -> Result<&[u8]> {
         let size = self.geometry.page_size();
         checked_child(pgno, want_txn, self.meta.page_count, self.meta.txn, false, |p| {

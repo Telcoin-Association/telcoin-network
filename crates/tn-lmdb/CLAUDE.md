@@ -126,7 +126,11 @@ Each row: the file's role, its entry points, what a change must keep; item docs 
   `#[inline(always)]` once it has many callers and LLVM stops inlining it (`leaf_cell`,
   `LeafView::entry` and `entry_with_key_tail` each left the adapter's
   `RoCursor::current_with_key_tail` when they gained callers). A new caller of a hot helper can
-  push it out of line: compare the read rows after adding one.
+  push it out of line: compare the read rows after adding one. Mark a call chain whole: a helper
+  inlined into the adapter turns each non-`#[inline]` function it calls into a cross-crate call
+  (marking only `Snapshot::child` made each fetch call `MapView::slice`, `crc_is_zero`, `pgno`
+  and `txn` out of line), and keep its error formatting in a `#[cold]` helper so the inlined
+  code stays small. The bench crate's release asm shows what crosses.
 - **The reth adapter relies on the cursors' documented states**, the dup cursors' too (each equal
   to a plain cursor's on the composite twin). A change to what a cursor does after a delete,
   after `last`, after a refused write or on a reseek, or to a public signature, also runs
