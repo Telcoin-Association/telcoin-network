@@ -271,6 +271,7 @@ impl Network<'_> {
             rpc_port,
             TEST,
             0,
+            &[],
         );
         let slot = self.guard.push(child);
         eyre::ensure!(slot == idx, "{name} landed in guard slot {slot}");

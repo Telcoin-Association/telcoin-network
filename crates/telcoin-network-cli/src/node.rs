@@ -533,10 +533,9 @@ mod tests {
     /// A file name that is not valid UTF-8 is read like any other, and a missing file under
     /// such a name still fails at argument parsing.
     ///
-    /// Ignored on macOS: APFS refuses to create a file whose name is not valid UTF-8 (EILSEQ,
-    /// os error 92), so the test cannot set up its file there.
+    /// A filesystem that only takes valid UTF-8 names (APFS on macOS refuses the name with
+    /// `EILSEQ`) cannot hold the file, so the test ends after the missing-file half there.
     #[cfg(unix)]
-    #[cfg_attr(target_os = "macos", ignore = "APFS rejects non-UTF-8 file names (EILSEQ)")]
     #[test]
     fn bootstrap_peers_file_accepts_non_utf8_path() -> eyre::Result<()> {
         use std::{ffi::OsStr, os::unix::ffi::OsStrExt as _};
@@ -561,7 +560,17 @@ mod tests {
         assert_eq!(kind, ErrorKind::ValueValidation);
         assert!(message.contains(path.to_string_lossy().as_ref()), "{message}");
 
-        std::fs::write(&path, &raw)?;
+        match std::fs::write(&path, &raw) {
+            Ok(()) => {}
+            Err(error)
+                if error.raw_os_error() == Some(libc::EILSEQ)
+                    || error.kind() == std::io::ErrorKind::InvalidFilename =>
+            {
+                eprintln!("skipping the readable half: this filesystem refuses the name ({error})");
+                return Ok(());
+            }
+            Err(error) => return Err(error.into()),
+        }
         let from_file = parse(&path)?;
         let inline = NodeCommand::<NoArgs>::try_parse_from(["node", "--bootstrap-peers", &raw])?;
         assert!(from_file.bootstrap_peers_file.is_some());

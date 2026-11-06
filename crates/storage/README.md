@@ -498,10 +498,20 @@ guard exists it is named so a reviewer can confirm it, not re-derive it.
 1. **`unsafe { Mmap::map / MmapMut::map_mut }` (data_file.rs).** Sound under the single-writer pack
    model (one writable handle per file for its lifetime; read-only handles map only *sealed* files).
    Each block carries a `SAFETY:` comment. Not a memory-safety defect.
-2. **Read-only mmap SIGBUS window.** A read-only handle mapping a file a writer could truncate is a
-   known hazard, guarded by (a) opening read-only only on *sealed* packs and (b) `set_read_bound`
-   clamping the read ceiling to the index-attested length. The `debug_assert_eq!` in `open_static`
-   compiles out in release — the clamp is the real guard. Deliberate defense-in-depth.
+2. **Read-only mmap SIGBUS window.**
+   A read-only handle mapping a file a writer could truncate is a known hazard.
+   Three guards cover it.
+   (a) Read-only opens are confined to *sealed* packs.
+   `get_static` serves the live epoch from the writer handle, never a read-only map of it.
+   The epoch handoff seals the previous pack under `pack_install`, and an open that fails retries under that lock, after the seal.
+   `open_static` checks `files_consistent` only after the map, so its first, unlocked open in `get_static` can still reach a file the handoff is sealing.
+   The next two guards keep that open inside the file.
+   (b) `MmapDataFile::open_with` refuses a read-only mapping shorter than the length it read before mapping, so at the map the mapping covers every offset below `end`.
+   The open then fails instead of clamping `end` to the shorter mapping: the sentinel check ran against the longer file, so its verdict no longer describes the file, and mapping the longer length would SIGBUS.
+   Between the map and the clamp the open touches only the header page and the first record, both below the logical end a seal keeps, and `files_consistent` refuses an unclean handle before any further read.
+   (c) `set_read_bound` clamps the read ceiling to the index-attested length, so no later read touches bytes a truncation could remove.
+   The `debug_assert_eq!` in `open_static` compiles out in release — the clamp is the real guard.
+   Deliberate defense-in-depth.
 3. **Trailing bytes past the logical end are not corruption.** mmap capacity padding and the 8-byte
    clean-close sentinel live in `[end, capacity]`; every read/slice/iterator is bounded to `end`. Do
    not flag "file is longer than its data" or "extra bytes after the last record".

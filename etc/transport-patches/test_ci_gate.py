@@ -21,10 +21,17 @@ def gate_script():
     return textwrap.dedent(source.split("  ci-success:\n", 1)[1].split("        run: |\n", 1)[1])
 
 
-def execute(event, run_tests, transport, script=None, connection_limits="success", pins="success",
-            quinn_proto="success", revm_inspectors="success", fmt=None, clippy=None,
-            archive_mode_gate=None, test=None, adiri_test=None, vendor_reth_test=None):
-    """Run the gate on the fixture; a lane keyword left as None keeps the fixture's result for that lane."""
+def gate_needs():
+    """The job names in the real `ci-success` `needs:` line, sorted as the gate reads its RESULTS keys."""
+    source = (ROOT / ".github/workflows/pr.yaml").read_text()
+    needs = source.split("  ci-success:\n", 1)[1].split("    needs: [", 1)[1].split("]", 1)[0]
+    return sorted(name.strip() for name in needs.split(","))
+
+
+def fixture(event, run_tests, transport, connection_limits="success", pins="success", quinn_proto="success",
+            gossipsub_patch="success", revm_inspectors="success", fmt=None, clippy=None, archive_mode_gate=None,
+            test=None, adiri_test=None, vendor_reth_test=None):
+    """The `needs` context handed to the gate; a lane keyword left as None keeps the fixture's result for that lane."""
     results = {name: {"result": "success"} for name in ALWAYS_RUN}
     results.update({name: {"result": "success" if run_tests else "skipped"} for name in GATED})
     overrides = {"fmt": fmt, "clippy": clippy, "archive-mode-gate": archive_mode_gate, "test": test,
@@ -35,8 +42,15 @@ def execute(event, run_tests, transport, script=None, connection_limits="success
                     "transport-evidence": {"result": transport},
                     "connection-limits-patch": {"result": connection_limits},
                     "quinn-proto-patch": {"result": quinn_proto},
+                    "gossipsub-patch": {"result": gossipsub_patch},
                     "revm-inspectors-patch": {"result": revm_inspectors},
                     "quic-profile-pins": {"result": pins}})
+    return results
+
+
+def execute(event, run_tests, transport, script=None, **lanes):
+    """Run the gate on the fixture; the lane keywords are those of `fixture`."""
+    results = fixture(event, run_tests, transport, **lanes)
     return subprocess.run(["bash", "-c", gate_script() if script is None else script],
                           env={"PATH": os.environ["PATH"], "EVENT_NAME": event, "RESULTS": json.dumps(results)},
                           capture_output=True)
@@ -81,6 +95,15 @@ class QuinnProtoGate(unittest.TestCase):
                     self.assertNotEqual(execute(event, run_tests, "success", quinn_proto=outcome).returncode, 0)
 
 
+class GossipsubPatchGate(unittest.TestCase):
+    def test_every_author_and_event_requires_success(self):
+        for event, run_tests in EVERY_PAIR:
+            self.assertEqual(execute(event, run_tests, "success").returncode, 0)
+            for outcome in ("skipped", "cancelled", "failure"):
+                with self.subTest(event=event, run_tests=run_tests, outcome=outcome):
+                    self.assertNotEqual(execute(event, run_tests, "success", gossipsub_patch=outcome).returncode, 0)
+
+
 class RevmInspectorsGate(unittest.TestCase):
     def test_every_author_and_event_requires_success(self):
         for event, run_tests in EVERY_PAIR:
@@ -89,6 +112,14 @@ class RevmInspectorsGate(unittest.TestCase):
                 with self.subTest(event=event, run_tests=run_tests, outcome=outcome):
                     result = execute(event, run_tests, "success", revm_inspectors=outcome)
                     self.assertNotEqual(result.returncode, 0)
+
+
+class NeedsDrift(unittest.TestCase):
+    def test_fixture_reports_exactly_the_jobs_ci_success_needs(self):
+        # The gate asserts its RESULTS keys against `expected`; this asserts the fixture against
+        # the real `needs:` line, so a job added to `needs` without a fixture entry fails here by
+        # name instead of surfacing only as a red CI Success on the next pull request.
+        self.assertEqual(sorted(fixture("pull_request", True, "success")), gate_needs())
 
 
 class QuicProfilePinsGate(unittest.TestCase):

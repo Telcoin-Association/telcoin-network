@@ -74,6 +74,12 @@ rand = { workspace = true }
 roaring = { workspace = true }
 crc32fast = "1.5.0"
 
+# `EILSEQ` for the non-UTF-8 bootstrap-peers test, which ends early on a filesystem that refuses
+# the name (APFS). Kept apart from the Linux-only runtime dependency above: the passphrase scrub
+# is Linux-gated, so a `cfg(unix)` runtime dependency would be unused on macOS.
+[target.'cfg(unix)'.dev-dependencies]
+libc = { workspace = true }
+
 [build-dependencies]
 vergen = { version = "8.0.0", features = ["build", "cargo", "git", "gitcl"] }
 

@@ -578,11 +578,25 @@ pub(crate) fn start_observer(
     test: &str,
     run: u32,
 ) -> Child {
-    start_named_observer(instance, bin, base_dir, "observer", rpc_port, test, run)
+    start_observer_with_args(instance, bin, base_dir, rpc_port, test, run, &[])
+}
+
+/// Start an observer node process with additional CLI arguments (e.g. `--forward-txs`).
+pub(crate) fn start_observer_with_args(
+    instance: usize,
+    bin: &'static TestBinary,
+    base_dir: &Path,
+    rpc_port: u16,
+    test: &str,
+    run: u32,
+    extra_args: &[&str],
+) -> Child {
+    start_named_observer(instance, bin, base_dir, "observer", rpc_port, test, run, extra_args)
 }
 
 /// Start a process running the observer node whose datadir is `base_dir/<name>`, as set up by
-/// [`e2e_tests::config_observer`].
+/// [`e2e_tests::config_observer`], with additional CLI arguments.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn start_named_observer(
     instance: usize,
     bin: &'static TestBinary,
@@ -591,6 +605,7 @@ pub(crate) fn start_named_observer(
     rpc_port: u16,
     test: &str,
     run: u32,
+    extra_args: &[&str],
 ) -> Child {
     let data_dir = base_dir.join(name);
     let ws_port = get_available_tcp_port("127.0.0.1").expect("ws port");
@@ -612,6 +627,8 @@ pub(crate) fn start_named_observer(
         .arg(ipc_path.to_string_lossy().as_ref())
         .arg("--node-name")
         .arg(format!("{test}-node{instance}"));
+
+    command.args(extra_args);
 
     setup_log_dir(&mut command, instance, test, run);
 

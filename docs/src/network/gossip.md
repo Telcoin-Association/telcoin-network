@@ -120,6 +120,7 @@ A frame that breaks a limit closes the stream, and none of its messages are deli
   The node's own `IHAVE` gossip fits in that control field because of the cap on message ids per `IHAVE` below.
   The codec reads in 8 KiB chunks and checks the size of its whole read buffer, not of one frame, so the limit adds one read chunk.
   Without that slack, two maximum frames sent back to back can close an honest stream.
+  The 16,387-byte bound covers the frames an author sends and the frames a node forwards, because the node rejects the one unsigned field that a forwarder could grow (see the `key` item below).
 - **Publish entries per frame: 8.** An honest peer sends one message per frame.
   The library default of 500 would let one frame force 500 signature checks.
   This is a per-frame bound, not a rate bound.
@@ -132,6 +133,12 @@ A frame that breaks a limit closes the stream, and none of its messages are deli
   Above the cap, each peer gets a different random subset of the ids, so gossip coverage drops but the stream stays open.
   The same setting caps the ids that the node requests from one peer with `IWANT` in one heartbeat.
   The cap changes only the frames that the node sends, so peers on other versions need no change.
+- **Unsigned `key` field: rejected.** The author signs `from`, `data`, `seqno` and `topic`, but not `key`.
+  A node forwards a message as it received it, so without this check a peer could add bytes in `key` to a valid message, and every honest node would forward the larger copy.
+  An ed25519 author never sends `key`, because its public key is inlined in its peer id, so the node drops every message that carries `key` (issue #1699).
+  This check drops the message only, and the stream stays open.
+  It runs before the duplicate cache, so a later clean copy of the same message is accepted.
+  The node does not penalize the peer, because a node on an older release forwards such a message without fault.
 
 No topic has its own size limit, because `MAX_GOSSIP_MESSAGE_SIZE` applies to every topic.
 The limits and the order in which the library applies them are recorded at `gossipsub_config`, with the resolved library versions.
@@ -145,12 +152,14 @@ The reason for the rejection decides only which peer, if any, loses reputation.
 - **Oversized payload: the relayer's fault.**
   An honest node never originates an oversized message and, under strict validation, never forwards one, so delivering one is misbehavior by the peer that delivered it.
   The relaying peer takes a fatal penalty.
-- **Unauthorized author: the author's fault.**
-  A forwarder that relayed content authored by someone else is not accountable for that content.
-  The resolved author takes the fatal penalty and the relayer takes none.
+- **Unauthorized author: the author's fault, charged only on the author's own delivery.**
+  A forwarder that relayed content authored by someone else is not accountable for that content, so the relayer takes no penalty.
+  The resolved author takes the fatal penalty only when the frame arrived over the author's own connection, which is the one delivery that is the author's act.
+  A signed frame is static, and gossipsub remembers its id for only the 60 s duplicate-cache window, so any peer that received the frame while the author held a committee slot could deliver it again after the author left the previous, current and next window.
+  Charging the author for such a delivery would let any connected peer ban an ex-committee validator at will (GHSA-vw36-8f6c-vppp), so a frame delivered by a peer other than its author is dropped and no one is charged.
 
 If the accountable identity has not resolved — a peer can be connected and relaying before its node record arrives — the node skips the penalty entirely rather than charging whichever peer happens to be in hand.
-The same skip covers an anonymous message and the case where this node's committee view lags a neighbour's.
+The same skip covers an anonymous message, a frame delivered by a peer other than its author, and the case where this node's committee view lags a neighbour's.
 Accepted messages carry both the relayer and the author onward, as optional identities, so a fault that only deep validation can surface is still charged to the author rather than the forwarder.
 
 ## Validation configuration
@@ -161,6 +170,11 @@ Manual validation is what allows the allowlist check to run before a message is 
 Gossipsub's own peer scoring is deliberately left disabled.
 The peer manager is the authoritative reputation system, and running gossipsub scoring alongside it would double-count the same misbehavior — once as a gossipsub score decay and again as a peer-manager penalty — with two sets of thresholds that could disagree about when to disconnect.
 Two gossipsub events do feed the peer manager directly: a peer that does not support gossipsub is fatally penalized, and a peer that persistently fails to keep up with the mesh takes a mild one.
+
+Keeping scoring off has two consequences inside the library.
+Upstream gossipsub removes an expired `IWANT` promise only from the scoring branch of its heartbeat, so a peer that advertises ids with `IHAVE` and never delivers would grow the promise map without bound.
+Upstream also skips an advertised id while any peer holds a pending promise for it, so one peer's unanswered promise, renewed with each `IHAVE` at no cost, would suppress the `IWANT` to every other advertiser of that id.
+The node therefore carries `patches/libp2p-gossipsub`, which expires promises on every heartbeat, applies the broken-promise penalty only while scoring is active, and skips an advertised id only when the advertising peer itself already holds a pending promise for it; `patches/libp2p-gossipsub/PATCH.md` records the patch and its retirement criteria.
 
 ## Topic re-validation in the application layer
 
@@ -187,7 +201,7 @@ See [Network architecture](../architecture/network.md) for the node roles this g
 |----------|------|
 | Topic names | `crates/config/src/network.rs` (`LibP2pConfig` topic constructors) |
 | Message size limit | `crates/config/src/network.rs` (`MAX_GOSSIP_MESSAGE_SIZE`) |
-| Gossipsub configuration, frame limits and the `IHAVE` id cap | `crates/network-libp2p/src/gossip_config.rs` (`gossipsub_config`), called from `ConsensusNetwork::new` |
+| Gossipsub configuration, frame limits, the `IHAVE` id cap and `key` rejection | `crates/network-libp2p/src/gossip_config.rs` (`gossipsub_config`, `RejectGossipKey`), called from `ConsensusNetwork::new` |
 | Allowlist check and subscribe/unsubscribe | `crates/network-libp2p/src/consensus.rs` (`verify_gossip`, `NetworkCommand::Subscribe`) |
 | Penalty attribution | `crates/network-libp2p/src/consensus.rs` (`RejectReason::penalty`) |
 | Per-epoch subscription and allowlists | `crates/node/src/manager/node/start_epoch.rs` (`spawn_primary_network_for_epoch`, `spawn_worker_network_for_epoch`) |

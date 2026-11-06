@@ -47,6 +47,7 @@ exclude = [
     "patches/libp2p-quic",
     "patches/libp2p-connection-limits",
     "patches/quinn-proto",
+    "patches/libp2p-gossipsub",
     "patches/revm-inspectors",
     "vendor/reth",
 ]
@@ -313,6 +314,9 @@ libp2p-quic = { path = "patches/libp2p-quic" }
 # Release per-peer connection accounting after the last connection closes.
 # See patches/libp2p-connection-limits/PATCH.md for provenance and retirement criteria.
 libp2p-connection-limits = { path = "patches/libp2p-connection-limits" }
+# Expire unanswered IWANT promises on every heartbeat, not only while peer scoring is active.
+# See patches/libp2p-gossipsub/PATCH.md for provenance and retirement criteria.
+libp2p-gossipsub = { path = "patches/libp2p-gossipsub" }
 # JavaScript tracers: Boa's recursion limit lowered to 128 so a recursive accessor cannot overflow
 # a blocking thread's stack (upstream #548). See patches/revm-inspectors/PATCH.md.
 revm-inspectors = { path = "patches/revm-inspectors" }
