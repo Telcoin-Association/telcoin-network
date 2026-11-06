@@ -23,8 +23,8 @@ use futures_util::{future::OptionFuture, StreamExt};
 use std::time::{Duration, Instant};
 use tn_reth::{CanonStateNotificationStream, ChangedAccount, RethEnv, WorkerTxPool};
 use tn_types::{
-    error::BlockSealError, Address, BatchBuilderArgs, BatchSender, Epoch, SealedHeader,
-    TaskSpawner, TxHash, WorkerId,
+    error::BlockSealError, Address, BatchBuilderArgs, BatchSender, Epoch, SealedBatch,
+    SealedHeader, TaskSpawner, TxHash, WorkerId,
 };
 use tokio::{
     sync::oneshot,
@@ -38,8 +38,11 @@ mod metrics;
 #[cfg(feature = "test-utils")]
 pub mod test_utils;
 
-use crate::metrics::BatchBuilderMetrics;
 pub use crate::metrics::{record_base_fee, record_pending_pool_transactions};
+use crate::{
+    batch::BuildStats,
+    metrics::{BatchBuilderMetrics, BuildReasonCounters},
+};
 
 /// The result of a successful batch build containing data needed to update the pool.
 #[derive(Debug)]
@@ -94,6 +97,42 @@ struct RefusalBackoff {
     refusals: u32,
 }
 
+/// What woke the run loop for the iteration that started a build, reported as `wake=` on the
+/// `batch built` line.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WakeSource {
+    /// The `max_batch_delay` tick. The loop's first pass reports this too: an interval's first
+    /// tick completes immediately, so entering the loop is that first tick.
+    Tick,
+    /// A canonical state notification from the engine.
+    Canonical,
+    /// The previous batch's quorum ack: a mined completion continues straight into the next
+    /// build. Any other completion skips one pass, so the next wake-up names the build.
+    Ack,
+}
+
+impl WakeSource {
+    /// The static label carried by the `batch built` line.
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Tick => "tick",
+            Self::Canonical => "canonical",
+            Self::Ack => "ack",
+        }
+    }
+}
+
+/// The run loop's view of the pool when it started a build, carried to the `batch built` line.
+#[derive(Clone, Copy, Debug)]
+struct BuildTrigger {
+    /// What woke the loop for the iteration that started the build.
+    wake: WakeSource,
+    /// Pending sub-pool size when the build started.
+    pending_before: usize,
+    /// Queued (nonce-gap) sub-pool size when the build started.
+    queued_before: usize,
+}
+
 /// Receiver for the async task that awaits a blocking batch build and the worker's seal result.
 type BuildResult = oneshot::Receiver<BatchBuilderResult<BuildOutcome>>;
 
@@ -141,6 +180,8 @@ pub struct BatchBuilder {
     epoch: Epoch,
     /// Prometheus metrics for this worker's batch builder.
     metrics: BatchBuilderMetrics,
+    /// Pre-resolved `builds_total` series of this worker, one per build reason.
+    build_counters: BuildReasonCounters,
     /// Backoff applied while every seal attempt is refused by forward admission
     /// (issue #1145). `None` whenever the last completed build was not a refusal.
     refusal_backoff: Option<RefusalBackoff>,
@@ -179,6 +220,7 @@ impl BatchBuilder {
             base_fee,
             epoch,
             metrics,
+            build_counters: BuildReasonCounters::new_for_worker(worker_id),
             refusal_backoff: None,
         })
     }
@@ -194,8 +236,9 @@ impl BatchBuilder {
     /// - convert result to fatal/non-fatal
     /// - return result
     ///
-    /// Workers only propose one batch at a time.
-    fn spawn_execution_task(&self) -> BuildResult {
+    /// Workers only propose one batch at a time. `trigger` is the run loop's view when it started
+    /// this build; it only feeds the `batch built` line.
+    fn spawn_execution_task(&self, trigger: BuildTrigger) -> BuildResult {
         let pool = self.pool.clone();
         let to_worker = self.to_worker.clone();
 
@@ -205,6 +248,7 @@ impl BatchBuilder {
         let worker_id = self.worker_id;
         let base_fee = self.base_fee;
         let metrics = self.metrics.clone();
+        let build_counters = self.build_counters.clone();
 
         let span = info_span!(target: "telcoin", "propose-batch", batch = field::Empty, worker_id, base_fee, epoch = self.epoch);
         let span_clone = span.clone();
@@ -215,7 +259,7 @@ impl BatchBuilder {
             let (ack, rx) = oneshot::channel();
 
             // this is safe to call without a semaphore bc it's held as a single `Option`
-            let BatchBuilderOutput { batch, mined_transactions, changed_accounts, peer_deferred, unpackable } =
+            let BatchBuilderOutput { batch, mined_transactions, changed_accounts, peer_deferred, unpackable, stats } =
                 match batch::spawn_batch_build(build_args, worker_id, base_fee).await {
                     Ok(output) => output,
                     Err(e) => {
@@ -252,6 +296,7 @@ impl BatchBuilder {
             } else {
                 let batch = batch.seal_slow();
                 span.record("batch", batch.digest().to_string());
+                report_batch_built(&metrics, &build_counters, worker_id, &batch, &stats, trigger);
 
                 // forward to worker and wait for ack that quorum was reached
                 if let Err(e) = to_worker.send((batch, ack)).await {
@@ -431,12 +476,15 @@ impl BatchBuilder {
         // exactly one iteration so the loop backs off (parks) before retrying, instead of
         // immediately rebuilding the same (still-unmined) transactions.
         let mut defer_build = false;
+        // what woke the loop last; the build this iteration starts reports it
+        let mut wake = WakeSource::Tick;
 
         // loop when a successful block is built
         loop {
             // refresh the pending-pool gauge on every wake, gated or not: operators watch it
             // exactly while a backoff or an in-flight build is holding the gate closed
-            let pending = self.pool.pool_size().pending;
+            let pool_size = self.pool.pool_size();
+            let pending = pool_size.pending;
             self.metrics.pending_pool_transactions.set(pending as f64);
             // only propose one block at a time; a live refusal backoff also holds the gate
             // closed, so a canonical-state wake-up cannot bypass it (issue #1145)
@@ -451,7 +499,12 @@ impl BatchBuilder {
                     // nothing pending
                 } else {
                     // start building the next batch
-                    self.pending_task = Some(self.spawn_execution_task());
+                    let trigger = BuildTrigger {
+                        wake,
+                        pending_before: pending,
+                        queued_before: pool_size.queued,
+                    };
+                    self.pending_task = Some(self.spawn_execution_task(trigger));
 
                     // don't break so pending_task receiver gets polled
                 }
@@ -466,6 +519,7 @@ impl BatchBuilder {
 
                 // This is used as a "wake up" when canonical state updates.
                 Some(latest) = self.state_changed.next() => {
+                    wake = WakeSource::Canonical;
                     // NOTE: separate background task applies these changes to the pool
                     // regardless of pending_task
                     self.last_canonical_update = latest.tip().clone_sealed_header()
@@ -478,6 +532,7 @@ impl BatchBuilder {
                     // the build resolved; the original `take`s the receiver and only restores it
                     // while it is still pending, so clear the slot here
                     self.pending_task = None;
+                    wake = WakeSource::Ack;
 
                     debug!(target: "block-builder", ?res, "pending task complete");
                     // ensure no fatal errors
@@ -545,10 +600,44 @@ impl BatchBuilder {
 
                 // periodic wake to check the pending pool; gated to no-build-in-flight to match the
                 // original, which only polled the interval while `pending_task` was `None`.
-                _ = self.max_delay_interval.tick(), if self.pending_task.is_none() => {}
+                _ = self.max_delay_interval.tick(), if self.pending_task.is_none() => {
+                    wake = WakeSource::Tick;
+                }
             }
         }
     }
+}
+
+/// Emit the `batch built` line and record the build metrics for a sealed, non-empty batch.
+///
+/// One line per batch, never per transaction. Durations are whole milliseconds.
+fn report_batch_built(
+    metrics: &BatchBuilderMetrics,
+    build_counters: &BuildReasonCounters,
+    worker_id: WorkerId,
+    batch: &SealedBatch,
+    stats: &BuildStats,
+    trigger: BuildTrigger,
+) {
+    let millis = |elapsed: Duration| u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
+    metrics.pool_age_seconds.record(stats.pool_age_max);
+    build_counters.record(stats.reason);
+    info!(
+        target: "consensus::metrics",
+        digest = %batch.digest(),
+        worker_id,
+        num_txs = batch.batch().transactions().len(),
+        bytes = stats.bytes,
+        gas = stats.gas,
+        reason = stats.reason.label(),
+        pool_age_p50_ms = millis(stats.pool_age_p50),
+        pool_age_max_ms = millis(stats.pool_age_max),
+        build_ms = millis(stats.build),
+        pending_before = trigger.pending_before,
+        queued_before = trigger.queued_before,
+        wake = trigger.wake.label(),
+        "batch built"
+    );
 }
 
 #[cfg(test)]
@@ -574,6 +663,10 @@ mod tests {
     };
     use tn_worker::{test_utils::TestMakeBlockQuorumWaiter, Worker, WorkerNetworkHandle};
     use tokio::time::timeout;
+
+    /// The trigger handed to builds a test spawns directly, outside the run loop.
+    const TEST_TRIGGER: BuildTrigger =
+        BuildTrigger { wake: WakeSource::Tick, pending_before: 0, queued_before: 0 };
 
     /// Drain the pending pool after the build gate but before the spawned task is polled.
     /// The empty result must never reach the worker, and the run loop must defer a newly
@@ -627,7 +720,7 @@ mod tests {
                 .await
                 .map_err(std::io::Error::other)?;
             assert!(txpool.pending_transactions().is_empty());
-            let done = batch_builder.spawn_execution_task();
+            let done = batch_builder.spawn_execution_task(TEST_TRIGGER);
 
             let outcome = tokio::select! {
                 outcome = done => outcome
@@ -1213,11 +1306,12 @@ mod tests {
         // await the build task itself: no sleeps, no polling of the run loop. The timeout is a
         // failure detector, not a wait: a build that seals reaches the ack wait and never
         // resolves, so it must surface as a failed assertion rather than a hung test.
-        let outcome = timeout(Duration::from_secs(5), batch_builder.spawn_execution_task())
-            .await
-            .expect("the build task finishes without waiting on a seal ack")
-            .expect("build task reports its outcome")
-            .expect("an all-deferred build is not a fatal error");
+        let outcome =
+            timeout(Duration::from_secs(5), batch_builder.spawn_execution_task(TEST_TRIGGER))
+                .await
+                .expect("the build task finishes without waiting on a seal ack")
+                .expect("build task reports its outcome")
+                .expect("an all-deferred build is not a fatal error");
 
         assert_matches!(outcome, BuildOutcome::Empty);
         assert!(
@@ -1632,5 +1726,180 @@ mod tests {
             "the post-batch pool update must install the epoch fee, not the stale canonical \
              tip header's",
         );
+    }
+
+    /// The `batch built` line and its metrics, captured without a formatting layer.
+    mod batch_built_line {
+        use super::*;
+        use crate::{batch::BuildReason, test_utils::TestPool};
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+        use std::{fmt, sync::Mutex};
+        use tracing::{
+            field::{Field, Visit},
+            span::{Attributes, Id, Record},
+            Event, Metadata, Subscriber,
+        };
+
+        /// One captured event: its target and its fields, the message under `message`.
+        #[derive(Debug, Default)]
+        struct Captured {
+            /// The event's target.
+            target: String,
+            /// Field names and values, strings without quotes.
+            fields: Vec<(String, String)>,
+        }
+
+        impl Captured {
+            /// The value of field `name`, if the event carries it.
+            fn field(&self, name: &str) -> Option<&str> {
+                self.fields.iter().find(|(key, _)| key == name).map(|(_, value)| value.as_str())
+            }
+        }
+
+        impl Visit for Captured {
+            fn record_str(&mut self, field: &Field, value: &str) {
+                self.fields.push((field.name().to_string(), value.to_string()));
+            }
+
+            fn record_debug(&mut self, field: &Field, value: &dyn fmt::Debug) {
+                self.fields.push((field.name().to_string(), format!("{value:?}")));
+            }
+        }
+
+        /// A subscriber that keeps every event and ignores spans.
+        #[derive(Clone, Default)]
+        struct Capture(Arc<Mutex<Vec<Captured>>>);
+
+        impl Subscriber for Capture {
+            fn enabled(&self, _metadata: &Metadata<'_>) -> bool {
+                true
+            }
+            fn new_span(&self, _attributes: &Attributes<'_>) -> Id {
+                Id::from_u64(1)
+            }
+            fn record(&self, _span: &Id, _values: &Record<'_>) {}
+            fn record_follows_from(&self, _span: &Id, _follows: &Id) {}
+            fn enter(&self, _span: &Id) {}
+            fn exit(&self, _span: &Id) {}
+            fn event(&self, event: &Event<'_>) {
+                let mut captured = Captured {
+                    target: event.metadata().target().to_string(),
+                    ..Default::default()
+                };
+                event.record(&mut captured);
+                self.0.lock().unwrap().push(captured);
+            }
+        }
+
+        /// Sign a zero-value transfer with an explicit gas limit.
+        fn transfer(factory: &mut TransactionFactory, gas_limit: u64) -> Vec<u8> {
+            factory
+                .create_explicit_eip1559(
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(gas_limit),
+                    Some(Address::ZERO),
+                    Some(U256::ZERO),
+                    None,
+                    None,
+                )
+                .encoded_2718()
+        }
+
+        /// A drained build and a gas-full build each emit one `batch built` line with every
+        /// contract field, and feed `pool_age_seconds` and `builds_total{reason}`.
+        #[test]
+        fn batch_built_line_carries_reason_pool_age_and_wake() {
+            let mut sender = TransactionFactory::new();
+            let mut other = TransactionFactory::new_random();
+            let full_gas = tn_types::max_batch_gas(0);
+            let drained = vec![transfer(&mut sender, 21_000), transfer(&mut sender, 21_000)];
+            let gas_full = vec![transfer(&mut sender, full_gas), transfer(&mut other, 21_000)];
+            let cases = [
+                (drained, WakeSource::Canonical, "drained", "2", 42_000.to_string()),
+                (gas_full, WakeSource::Ack, "gas_full", "1", full_gas.to_string()),
+            ];
+
+            let capture = Capture::default();
+            let recorder = DebuggingRecorder::new();
+            let snapshotter = recorder.snapshotter();
+            let mut digests = Vec::new();
+            ::metrics::with_local_recorder(&recorder, || {
+                tracing::subscriber::with_default(capture.clone(), || {
+                    let metrics = BatchBuilderMetrics::new_for_worker(3);
+                    let build_counters = BuildReasonCounters::new_for_worker(3);
+                    for (txs, wake, ..) in &cases {
+                        let mut pool = TestPool::new(txs);
+                        let args = BatchBuilderArgs {
+                            pool: &mut pool,
+                            beneficiary: Address::ZERO,
+                            epoch: 0,
+                        };
+                        let output = build_batch(args, 3, MIN_PROTOCOL_BASE_FEE);
+                        let batch = output.batch.seal_slow();
+                        digests.push(batch.digest().to_string());
+                        let trigger =
+                            BuildTrigger { wake: *wake, pending_before: 2, queued_before: 5 };
+                        report_batch_built(
+                            &metrics,
+                            &build_counters,
+                            3,
+                            &batch,
+                            &output.stats,
+                            trigger,
+                        );
+                    }
+                });
+            });
+
+            let events = capture.0.lock().unwrap();
+            let lines: Vec<_> = events
+                .iter()
+                .filter(|event| event.field("message") == Some("batch built"))
+                .collect();
+            assert_eq!(lines.len(), cases.len(), "one line per sealed batch: {events:?}");
+            for ((line, digest), (_, wake, reason, num_txs, gas)) in
+                lines.iter().zip(&digests).zip(&cases)
+            {
+                assert_eq!(line.target, "consensus::metrics");
+                assert_eq!(line.field("digest"), Some(digest.as_str()));
+                assert_eq!(line.field("worker_id"), Some("3"));
+                assert_eq!(line.field("num_txs"), Some(*num_txs));
+                assert_eq!(line.field("gas"), Some(gas.as_str()));
+                assert_eq!(line.field("reason"), Some(*reason));
+                assert_eq!(line.field("wake"), Some(wake.label()));
+                assert_eq!(line.field("pending_before"), Some("2"));
+                assert_eq!(line.field("queued_before"), Some("5"));
+                for field in ["bytes", "pool_age_p50_ms", "pool_age_max_ms", "build_ms"] {
+                    let value = line.field(field).unwrap_or_else(|| panic!("{field} missing"));
+                    assert!(value.parse::<u64>().is_ok(), "{field}={value} is not a number");
+                }
+            }
+
+            let snapshot = snapshotter.snapshot().into_vec();
+            let builds = |reason: BuildReason| {
+                snapshot.iter().find_map(|(key, _, _, value)| {
+                    (key.key().name() == "tn_batch_builder.builds_total"
+                        && key
+                            .key()
+                            .labels()
+                            .any(|l| l.key() == "reason" && l.value() == reason.label()))
+                    .then_some(value)
+                })
+            };
+            assert!(matches!(builds(BuildReason::Drained), Some(DebugValue::Counter(1))));
+            assert!(matches!(builds(BuildReason::GasFull), Some(DebugValue::Counter(1))));
+            assert!(matches!(builds(BuildReason::BytesFull), Some(DebugValue::Counter(0))));
+            let pool_age = snapshot
+                .iter()
+                .find(|(key, ..)| key.key().name() == "tn_batch_builder.pool_age_seconds")
+                .map(|(.., value)| value);
+            assert!(
+                matches!(pool_age, Some(DebugValue::Histogram(samples)) if samples.len() == 2),
+                "one pool-age sample per built batch: {pool_age:?}"
+            );
+        }
     }
 }
