@@ -39,7 +39,7 @@ use tn_types::{
 };
 use tokio::sync::{mpsc, oneshot};
 use tokio_stream::wrappers::ReceiverStream;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, trace, warn};
 
 /// Type alias for the blocking task that executes consensus output and returns the finalized
 /// `SealedHeader`.
@@ -206,7 +206,7 @@ impl ExecutorEngine {
         let has_reached_max_round =
             self.max_round.map(|target| round as u64 >= target).unwrap_or_default();
         if has_reached_max_round {
-            tracing::trace!(
+            trace!(
                 target: "engine",
                 ?progress,
                 max_round = ?self.max_round,
@@ -304,7 +304,7 @@ impl ExecutorEngine {
 
                 // poll receiver that returns output execution result
                 Some(res) = OptionFuture::from(self.pending_task.as_mut()), if self.pending_task.is_some() => {
-                    debug!(target: "engine", ?res, "reciever for execution result polled ready");
+                    trace!(target: "engine::dump", ?res, "reciever for execution result polled ready");
                     let finalized_header = res.map_err(Into::into).and_then(|res| res)?;
                     // the in-flight task resolved; clear the slot so the next round can be spawned
                     self.pending_task = None;

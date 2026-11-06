@@ -77,7 +77,7 @@ use reth_rpc_eth_types::utils::recover_raw_transaction as reth_recover_raw_trans
 use tn_types::{
     deconstruct_nonce, ConsensusNumHash, EngineUpdate, Round, SealedHeader, TransactionSigned,
 };
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, trace, warn};
 
 use crate::{
     error::{TnRethError, TnRethResult},
@@ -141,7 +141,7 @@ impl RethEnv {
         overlay: &mut OutputTrieOverlay,
     ) -> TnRethResult<ExecutedBlock> {
         let parent_header = payload.parent_header.clone();
-        debug!(target: "engine", ?parent_header, "retrieving state for next block");
+        trace!(target: "engine::dump", ?parent_header, "retrieving state for next block");
         let state_provider =
             self.inner.blockchain_provider.state_by_block_hash(parent_header.hash())?;
         let state = StateProviderDatabase::new(&state_provider);
