@@ -8,6 +8,7 @@ use crate::{
     },
     freshness::RecordTimestamp,
     types::{EpochPosition, GossipValidation, GossipVerdict, RecordDomain},
+    StreamError,
 };
 use assert_matches::assert_matches;
 use eyre::eyre;
@@ -1155,6 +1156,211 @@ async fn test_unsupported_protocol_does_not_penalize() -> eyre::Result<()> {
     );
 
     Ok(())
+}
+
+/// Build and run `config`'s network for `role`, keyed and addressed for that role, and
+/// start it listening. Returns the network's handle and its event receiver.
+async fn spawn_listening_network(
+    config: &ConsensusConfig<MemDatabase>,
+    role: NetworkType,
+    task_manager: &TaskManager,
+) -> eyre::Result<(
+    NetworkHandle<TestWorkerRequest, TestWorkerResponse>,
+    mpsc::Receiver<NetworkEvent<TestWorkerRequest, TestWorkerResponse>>,
+)> {
+    let (keypair, address) = match role {
+        NetworkType::Primary => {
+            (config.key_config().primary_network_keypair().clone(), config.primary_address())
+        }
+        NetworkType::Worker(id) => (
+            config.key_config().worker_network_keypair(id),
+            config.worker_address(id).ok_or_else(|| eyre!("no address for worker {id}"))?,
+        ),
+    };
+    let (tx, events) = mpsc::channel(10);
+    let network = ConsensusNetworkMemoryDB::<TestWorkerRequest, TestWorkerResponse>::new(
+        config.network_config(),
+        tx,
+        config.key_config().clone(),
+        keypair,
+        MemDatabase::default(),
+        task_manager.get_spawner(),
+        role,
+        address.clone(),
+        None,
+    )?;
+    let handle = network.network_handle();
+    tokio::spawn(async move {
+        network.run().await.expect("network run failed!");
+    });
+    handle.start_listening(address).await?;
+    Ok((handle, events))
+}
+
+/// A sync stream opened to a peer that does not serve the opener's sync protocol fails at
+/// open under the swarm's lazy substream negotiation (`V1Lazy`).
+///
+/// `V1Lazy` hands an outbound substream back before the listener confirms the protocol, so
+/// a rejection would otherwise surface only on the caller's first read, after the open had
+/// "succeeded". `TNStreamProtocol::upgrade_outbound` finishes the negotiation with a
+/// zero-length read; the rejection then reaches `classify_outbound` as an `Apply` error and
+/// is classified `(StreamFailure::UnsupportedProtocol, StreamError::UpgradeFailed)`, the
+/// penalty-exempt pair. The caller observes the `UpgradeFailed` half (callers read it as
+/// "this peer does not speak sync") and the connection is neither dropped nor scored.
+///
+/// A primary and a worker connect at the transport but serve different per-role sync
+/// protocols (`/tn-primary-sync-*` vs `/tn-worker-0-sync-*`). An open from the same primary
+/// to another primary is the positive control.
+#[tokio::test]
+async fn lazy_negotiation_sync_stream_to_wrong_role_fails_at_open() -> eyre::Result<()> {
+    let mut network_config = NetworkConfig::default();
+    network_config.peer_config_mut().heartbeat_interval = TEST_HEARTBEAT_INTERVAL;
+    let all_nodes =
+        CommitteeFixture::builder(MemDatabase::default).with_network_config(network_config).build();
+    let mut authorities = all_nodes.authorities();
+    let config_1 = authorities.next().expect("first authority").consensus_config();
+    let config_2 = authorities.next().expect("second authority").consensus_config();
+    let config_3 = authorities.next().expect("third authority").consensus_config();
+    let task_manager = TaskManager::default();
+
+    // the opener and the same-role target are primaries. the cross-role target is a worker
+    // of a third authority: a validator's primary and worker share one BLS key, and the
+    // open addresses its target by BLS key.
+    let (opener, _opener_events) =
+        spawn_listening_network(&config_1, NetworkType::Primary, &task_manager).await?;
+    let (primary, mut primary_events) =
+        spawn_listening_network(&config_2, NetworkType::Primary, &task_manager).await?;
+    let (worker, _worker_events) =
+        spawn_listening_network(&config_3, NetworkType::Worker(DEFAULT_WORKER_ID), &task_manager)
+            .await?;
+    let opener_bls = config_1.key_config().primary_public_key();
+    let primary_bls = config_2.key_config().primary_public_key();
+    let worker_bls = config_3.key_config().primary_public_key();
+    let worker_peer_id = worker.local_peer_id().await?;
+    let worker_addr = worker.listeners().await?.first().expect("worker listen addr").clone();
+
+    opener
+        .add_explicit_peer(primary_bls, config_2.primary_networkkey(), config_2.primary_address())
+        .await?;
+    opener
+        .add_explicit_peer(
+            worker_bls,
+            config_3.key_config().worker_network_public_key(DEFAULT_WORKER_ID),
+            worker_addr,
+        )
+        .await?;
+    opener.dial_by_bls(primary_bls).await?;
+    opener.dial_by_bls(worker_bls).await?;
+
+    // the same-role listener hands an inbound stream up only once it resolves the opener's
+    // BLS key; the cross-role connection is transport-only (no kad across roles)
+    let max_time = Duration::from_secs(5);
+    wait_for_peer_discovery(&primary, opener_bls, max_time).await?;
+    wait_until(max_time, "transport connection across roles establishes", || async {
+        Ok(opener.connected_peer_ids().await?.contains(&worker_peer_id))
+    })
+    .await?;
+
+    // the worker does not serve the primary's sync protocol: the open itself fails, as an
+    // unsupported protocol, instead of returning a stream that fails on its first read
+    let score_before = opener.peer_score(worker_peer_id).await?.expect("worker tracked");
+    let rejected = timeout(max_time, opener.open_stream(worker_bls)).await??;
+    assert_matches!(
+        rejected,
+        Err(NetworkError::Stream(StreamError::UpgradeFailed)),
+        "a cross-role sync open must fail at open with UpgradeFailed"
+    );
+
+    // unsupported protocol is honest role skew: the worker stays connected and unscored
+    assert!(
+        opener.connected_peer_ids().await?.contains(&worker_peer_id),
+        "a rejected sync open must not drop the connection"
+    );
+    assert_eq!(
+        opener.peer_score(worker_peer_id).await?,
+        Some(score_before),
+        "a rejected sync open must not change the peer's score"
+    );
+
+    // positive control: the same-role open negotiates and the listener receives the stream
+    let _stream = timeout(max_time, opener.open_stream(primary_bls))
+        .await??
+        .expect("same-role sync open must succeed");
+    let inbound = timeout(max_time, primary_events.recv()).await?;
+    assert_matches!(
+        inbound,
+        Some(NetworkEvent::InboundStream { peer, .. }) if peer == opener_bls,
+        "the same-role listener must receive the opener's stream"
+    );
+
+    Ok(())
+}
+
+/// A peer that does not speak gossipsub is still banned under the swarm's lazy negotiation.
+///
+/// Gossipsub proposes `/tn-meshsub-{chain}/1.1.0` and then `/1.0.0`, and `V1Lazy` applies only
+/// to a dialer's last proposal: once the peer rejects `/1.1.0`, the `/1.0.0` fallback is
+/// proposed lazily and the outbound substream is handed back before the rejection arrives. The
+/// vendored gossipsub's outbound upgrade finishes the negotiation with a zero-length read, so
+/// the rejection still disables the handler as `ProtocolUnsupported`, the behaviour reports
+/// `GossipsubNotSupported`, and the node applies the fatal penalty.
+///
+/// The raw swarm carries only the target's req-res protocol, like the legacy peer in
+/// `test_goodbye_falls_back_to_embedded_exchange_for_legacy_peer`, so every other protocol the
+/// target tries on it fails as unsupported, which is penalty-exempt. The target subscribes to a
+/// topic before the raw swarm dials: gossipsub only opens an outbound substream to a new peer
+/// to send it the node's subscriptions.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_peer_without_gossipsub_is_banned_under_lazy_negotiation() -> eyre::Result<()> {
+    let TestTypes { peer1, _task_manager, .. } =
+        create_test_types::<TestWorkerRequest, TestWorkerResponse>();
+    let NetworkPeer { config, network_events: _target_events, network_handle: target, network } =
+        peer1;
+    tokio::spawn(async move {
+        let res = network.run().await;
+        debug!(target: "network", ?res, "target network shutdown");
+    });
+    let target_addr = config.primary_address();
+    target.start_listening(target_addr.clone()).await?;
+    target.subscribe(TEST_TOPIC.into()).await?;
+
+    let libp2p_config = config.network_config().libp2p_config();
+    let raw_keypair = NetworkKeypair::generate_ed25519();
+    let raw_peer_id: PeerId = raw_keypair.public().into();
+    let raw_req_res = request_response::Behaviour::with_codec(
+        TNCodec::<TestWorkerRequest, TestWorkerResponse>::new(libp2p_config.max_rpc_message_size),
+        vec![(
+            NetworkType::Primary.req_res_protocol(libp2p_config.chain_id)?,
+            ProtocolSupport::Full,
+        )],
+        request_response::Config::default(),
+    );
+    let mut raw_swarm = SwarmBuilder::with_existing_identity(raw_keypair)
+        .with_tokio()
+        .with_quic()
+        .with_behaviour(|_| raw_req_res)
+        .map_err(|e| eyre!("raw swarm behaviour: {e:?}"))?
+        .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(30)))
+        .build();
+    raw_swarm.dial(target_addr)?;
+    let raw_task = tokio::spawn(async move {
+        loop {
+            let _ = raw_swarm.select_next_some().await;
+        }
+    });
+
+    let ban_threshold = config.network_config().peer_config().score_config.min_score_before_ban;
+    let target = &target;
+    let banned = wait_until(
+        Duration::from_secs(10),
+        "target bans the peer without gossipsub",
+        move || async move {
+            Ok(target.peer_score(raw_peer_id).await?.is_some_and(|score| score <= ban_threshold))
+        },
+    )
+    .await;
+    raw_task.abort();
+    banned
 }
 
 #[tokio::test]
@@ -5556,6 +5762,45 @@ async fn test_record_retrieval_legacy_fallback_is_deduplicated() -> eyre::Result
     Ok(())
 }
 
+/// A lazily negotiated rejection of record retrieval takes the legacy fallback.
+///
+/// Under the swarm's `V1Lazy` negotiation a peer without the record-exchange protocol is
+/// reported on the first read as `OutboundFailure::Io` wrapping `NegotiationError::Failed`, not
+/// as `UnsupportedProtocols`. The handler normalizes it, so the failure stays penalty-exempt and
+/// starts the legacy Kademlia query instead of deferring the request as a transport failure.
+#[tokio::test]
+async fn test_record_retrieval_lazy_rejection_takes_legacy_fallback() -> eyre::Result<()> {
+    use libp2p::core::upgrade::NegotiationError;
+    use std::io;
+
+    let TestTypes { peer1, peer2, .. } =
+        create_test_types::<TestWorkerRequest, TestWorkerResponse>();
+    let mut network = peer1.network;
+    let peer = *peer2.network.swarm.local_peer_id();
+    network.swarm.behaviour_mut().peer_manager.update_committees(
+        Default::default(),
+        [peer2.config.key_config().primary_public_key()].into_iter().collect(),
+        Default::default(),
+    );
+    network.process_kad_put_request(peer, peer2.network.get_peer_record())?;
+    let request = network.swarm.behaviour_mut().record_exchange.send_request(&peer, ());
+    assert!(network.record_exchange.allow_request(peer));
+    network.record_exchange.track(peer, request);
+    network.process_record_exchange_event(ReqResEvent::OutboundFailure {
+        peer,
+        connection_id: libp2p::swarm::ConnectionId::new_unchecked(1),
+        request_id: request,
+        error: ReqResOutboundFailure::Io(io::Error::from(NegotiationError::Failed)),
+    })?;
+    assert!(!network.swarm.behaviour().peer_manager.peer_banned(&peer));
+    assert_eq!(
+        network.kad_record_queries.len(),
+        1,
+        "a lazy rejection must take the legacy fallback, not the deferred retry"
+    );
+    Ok(())
+}
+
 #[path = "record_review_tests.rs"]
 mod record_review_tests;
 
@@ -5644,21 +5889,62 @@ fn accepted_gossip_carries_resolved_author_identity() -> eyre::Result<()> {
 }
 
 /// Finding 1 (#819): the network-layer reject path must never Fatal-ban the relaying peer for an
-/// author-attributable reject. An `UnauthorizedAuthor` reject charges the resolved author, and no
-/// one when the author is unresolved (anonymous message or this node's view lag) — but never the
-/// relayer, regardless of whether either identity has resolved.
+/// author-attributable reject. An `UnauthorizedAuthor` reject charges the resolved author that
+/// delivered its own frame, and no one when the author is unresolved (anonymous message or this
+/// node's view lag), but never the relayer, regardless of whether either identity has resolved.
 #[test]
 fn author_attributable_reject_charges_the_author_never_the_relayer() {
     [true, false].into_iter().for_each(|relayer_resolved| {
         assert_eq!(
-            RejectReason::UnauthorizedAuthor.penalty(relayer_resolved, true, EpochPosition::Live),
+            RejectReason::UnauthorizedAuthor.penalty(
+                relayer_resolved,
+                true,
+                GossipDelivery::ByAuthor,
+                EpochPosition::Live
+            ),
             RejectPenalty::FatalAuthor
         );
         assert_eq!(
-            RejectReason::UnauthorizedAuthor.penalty(relayer_resolved, false, EpochPosition::Live),
+            RejectReason::UnauthorizedAuthor.penalty(
+                relayer_resolved,
+                false,
+                GossipDelivery::ByAuthor,
+                EpochPosition::Live
+            ),
             RejectPenalty::Skip
         );
     });
+}
+
+/// GHSA-vw36-8f6c-vppp: a frame delivered by a peer other than its author never charges the
+/// author. The frame is static and gossipsub forgets its id after the duplicate-cache window, so
+/// any peer that once received it could otherwise ban the author after the author leaves the
+/// committee window. The relayer is not charged either (#801/#785).
+#[test]
+fn relayed_unauthorized_author_reject_charges_no_one() {
+    [true, false].into_iter().for_each(|relayer_resolved| {
+        [true, false].into_iter().for_each(|author_resolved| {
+            assert_eq!(
+                RejectReason::UnauthorizedAuthor.penalty(
+                    relayer_resolved,
+                    author_resolved,
+                    GossipDelivery::Relayed,
+                    EpochPosition::Live
+                ),
+                RejectPenalty::Skip
+            );
+        });
+    });
+}
+
+/// `GossipDelivery::of` names the author only when the propagation source is the author; a
+/// different source, or an anonymous message, is a relayed delivery.
+#[test]
+fn gossip_delivery_is_by_author_only_from_the_author_connection() {
+    let author = PeerId::random();
+    assert_eq!(GossipDelivery::of(Some(&author), &author), GossipDelivery::ByAuthor);
+    assert_eq!(GossipDelivery::of(Some(&author), &PeerId::random()), GossipDelivery::Relayed);
+    assert_eq!(GossipDelivery::of(None, &author), GossipDelivery::Relayed);
 }
 
 /// A replaying node never charges an unauthorized author: its allowlists belong to the
@@ -5668,25 +5954,37 @@ fn author_attributable_reject_charges_the_author_never_the_relayer() {
 fn historical_epoch_replay_never_charges_the_author() {
     [true, false].into_iter().for_each(|relayer_resolved| {
         [true, false].into_iter().for_each(|author_resolved| {
-            assert_eq!(
-                RejectReason::UnauthorizedAuthor.penalty(
-                    relayer_resolved,
-                    author_resolved,
-                    EpochPosition::Historical
-                ),
-                RejectPenalty::Skip
-            );
+            [GossipDelivery::ByAuthor, GossipDelivery::Relayed].into_iter().for_each(|delivery| {
+                assert_eq!(
+                    RejectReason::UnauthorizedAuthor.penalty(
+                        relayer_resolved,
+                        author_resolved,
+                        delivery,
+                        EpochPosition::Historical
+                    ),
+                    RejectPenalty::Skip
+                );
+            });
         });
         assert_eq!(
-            RejectReason::TooLarge.penalty(true, relayer_resolved, EpochPosition::Historical),
+            RejectReason::TooLarge.penalty(
+                true,
+                relayer_resolved,
+                GossipDelivery::Relayed,
+                EpochPosition::Historical
+            ),
             RejectPenalty::FatalRelayer
         );
     });
 }
 
 /// Drive the reject arm at `position` with a resolved author that no committee slot exempts, on
-/// a topic whose allowlist excludes it. Returns whether the author ended up banned.
-async fn unauthorized_author_banned_at(position: EpochPosition) -> eyre::Result<bool> {
+/// a topic whose allowlist excludes it, the frame delivered per `delivery`. Returns whether the
+/// author ended up banned.
+async fn unauthorized_author_banned_at(
+    position: EpochPosition,
+    delivery: GossipDelivery,
+) -> eyre::Result<bool> {
     let TestTypes { peer1, peer2, _task_manager } =
         create_test_types::<TestWorkerRequest, TestWorkerResponse>();
     let outsider = peer1.config.key_config().primary_public_key();
@@ -5715,31 +6013,59 @@ async fn unauthorized_author_banned_at(position: EpochPosition) -> eyre::Result<
         reply,
     })?;
     network.process_command(NetworkCommand::SetEpochPosition { position })?;
+    let propagation_source = match delivery {
+        GossipDelivery::ByAuthor => source,
+        GossipDelivery::Relayed => PeerId::random(),
+    };
     network.process_gossip_event(GossipEvent::Message {
-        propagation_source: PeerId::random(),
+        propagation_source,
         message_id: gossipsub::MessageId::from(b"unauthorized-author-gossip".to_vec()),
         message: GossipMessage { source: Some(source), ..test_gossip_message() },
     })?;
     Ok(network.swarm.behaviour().peer_manager.peer_banned(&source))
 }
 
-/// A replaying node rejects the message and leaves the resolved author unbanned.
+/// A replaying node rejects the message and leaves the resolved author unbanned, even when the
+/// author delivered the frame itself.
 #[tokio::test]
 async fn historical_replay_rejects_unauthorized_author_without_a_ban() -> eyre::Result<()> {
     assert!(
-        !unauthorized_author_banned_at(EpochPosition::Historical).await?,
+        !unauthorized_author_banned_at(EpochPosition::Historical, GossipDelivery::ByAuthor).await?,
         "a replaying node must not ban a resolved author outside the replayed allowlist"
     );
     Ok(())
 }
 
-/// The same reject at the live tip still charges the resolved author: the position guard spares
-/// only a replaying node.
+/// A replaying node leaves the resolved author of a relayed frame unbanned as well.
+#[tokio::test]
+async fn historical_replay_never_bans_a_relayed_unauthorized_author() -> eyre::Result<()> {
+    assert!(
+        !unauthorized_author_banned_at(EpochPosition::Historical, GossipDelivery::Relayed).await?,
+        "a replaying node must not ban the author of a relayed frame"
+    );
+    Ok(())
+}
+
+/// The same reject at the live tip still charges the resolved author when the author's own
+/// connection delivered the frame: the position guard spares only a replaying node, and the
+/// delivery guard spares only a frame someone else delivered.
 #[tokio::test]
 async fn live_epoch_still_bans_unauthorized_author() -> eyre::Result<()> {
     assert!(
-        unauthorized_author_banned_at(EpochPosition::Live).await?,
-        "a node at the tip still bans a resolved author outside the allowlist"
+        unauthorized_author_banned_at(EpochPosition::Live, GossipDelivery::ByAuthor).await?,
+        "a node at the tip still bans a resolved author that delivers its own unauthorized frame"
+    );
+    Ok(())
+}
+
+/// GHSA-vw36-8f6c-vppp: a resolved ex-member's old frame, re-sent by a different connected peer
+/// after the member left every committee slot, must not ban the member. Before the fix this
+/// delivery charged `Penalty::Fatal` to the author at the live tip.
+#[tokio::test]
+async fn live_epoch_relayed_replay_never_bans_the_author() -> eyre::Result<()> {
+    assert!(
+        !unauthorized_author_banned_at(EpochPosition::Live, GossipDelivery::Relayed).await?,
+        "a frame delivered by a peer other than its author must not ban the author"
     );
     Ok(())
 }
@@ -5754,11 +6080,21 @@ fn oversized_reject_penalizes_only_a_resolved_relayer() {
     for author_resolved in [true, false] {
         for position in [EpochPosition::Live, EpochPosition::Historical] {
             assert_eq!(
-                RejectReason::TooLarge.penalty(true, author_resolved, position),
+                RejectReason::TooLarge.penalty(
+                    true,
+                    author_resolved,
+                    GossipDelivery::Relayed,
+                    position
+                ),
                 RejectPenalty::FatalRelayer
             );
             assert_eq!(
-                RejectReason::TooLarge.penalty(false, author_resolved, position),
+                RejectReason::TooLarge.penalty(
+                    false,
+                    author_resolved,
+                    GossipDelivery::Relayed,
+                    position
+                ),
                 RejectPenalty::Skip
             );
         }

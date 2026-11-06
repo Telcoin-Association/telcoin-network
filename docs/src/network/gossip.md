@@ -152,12 +152,14 @@ The reason for the rejection decides only which peer, if any, loses reputation.
 - **Oversized payload: the relayer's fault.**
   An honest node never originates an oversized message and, under strict validation, never forwards one, so delivering one is misbehavior by the peer that delivered it.
   The relaying peer takes a fatal penalty.
-- **Unauthorized author: the author's fault.**
-  A forwarder that relayed content authored by someone else is not accountable for that content.
-  The resolved author takes the fatal penalty and the relayer takes none.
+- **Unauthorized author: the author's fault, charged only on the author's own delivery.**
+  A forwarder that relayed content authored by someone else is not accountable for that content, so the relayer takes no penalty.
+  The resolved author takes the fatal penalty only when the frame arrived over the author's own connection, which is the one delivery that is the author's act.
+  A signed frame is static, and gossipsub remembers its id for only the 60 s duplicate-cache window, so any peer that received the frame while the author held a committee slot could deliver it again after the author left the previous, current and next window.
+  Charging the author for such a delivery would let any connected peer ban an ex-committee validator at will (GHSA-vw36-8f6c-vppp), so a frame delivered by a peer other than its author is dropped and no one is charged.
 
 If the accountable identity has not resolved — a peer can be connected and relaying before its node record arrives — the node skips the penalty entirely rather than charging whichever peer happens to be in hand.
-The same skip covers an anonymous message and the case where this node's committee view lags a neighbour's.
+The same skip covers an anonymous message, a frame delivered by a peer other than its author, and the case where this node's committee view lags a neighbour's.
 Messages that pass the network-layer checks carry both the relayer and the author onward, as optional identities, so a fault that only deep validation can surface is still charged to the author rather than the forwarder.
 A certificate whose aggregate signature fails is such a fault: the primary reports Reject and the author takes a fatal penalty (#1772).
 
