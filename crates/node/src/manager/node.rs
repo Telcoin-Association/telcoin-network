@@ -1803,16 +1803,17 @@ where
     ///
     /// On restart the in-memory `recent_blocks` history is empty; this backfills it (up to the
     /// watch's capacity) so consensus components can resolve recent consensus number/hash lookups.
-    /// Each block's consensus hash is recovered from `parent_beacon_block_root`; round is set to 0
-    /// because it is not persisted, which is sufficient for hash resolution during catch-up.
+    /// Each block's consensus hash is recovered from `parent_beacon_block_root` and its leader
+    /// round from the block nonce, so the last consensus round reads the executed tip's leader
+    /// round.
     async fn try_restore_state(&self, engine: &ExecutionNode) -> eyre::Result<()> {
         // prime the recent_blocks watch with latest executed blocks
         let block_capacity = self.consensus_bus.recent_blocks_capacity();
 
         for recent_block in engine.last_executed_output_blocks(block_capacity).await? {
-            // On restore, use the block's consensus hash from parent_beacon_block_root.
-            // Round is set to 0 since we don't persist it; consensus number/hash still allows
-            // wait_for_consensus_execution to resolve hash lookups.
+            // On restore, use the block's consensus hash from parent_beacon_block_root and the
+            // leader round from the nonce; consensus number/hash lets
+            // wait_for_consensus_execution resolve hash lookups.
             let consensus_hash: ConsensusHeaderDigest =
                 recent_block.parent_beacon_block_root.unwrap_or_default().into();
             let (epoch, round) = deconstruct_nonce(recent_block.nonce.into());

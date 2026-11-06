@@ -194,15 +194,16 @@ where
         // When empty outputs are skipped by execution, no new EVM block is produced.
         // In that case, rely on the most recent consensus round processed by the engine.
         let processed_consensus_round = self.consensus_bus.last_consensus_round();
-        // The committed round is updated synchronously by the consensus core (Bullshark)
-        // when it commits certificates. This happens before the async engine pipeline processes
-        // them. Including it prevents false-positive "behind" detection when the engine
-        // lags behind a burst of empty consensus rounds.
+        // The committed round is updated by the consensus core (Bullshark) as soon as it commits
+        // certificates, before the async engine pipeline processes them: commits do not wait for
+        // local execution and may run ahead of it by up to `MAX_COMMIT_RUN_AHEAD_ROUNDS`. On an
+        // active node it therefore leads the two execution rounds above, and the window test
+        // below measures how far this node's commits lag the committee, not its execution lag.
         let committed_round = self.consensus_bus.committed_round();
         let effective_exec_round = exec_round.max(processed_consensus_round).max(committed_round);
         let (_last_consensus_epoch, last_consensus_number, _) =
             self.consensus_bus.published_consensus_num_hash();
-        // Use GC depth to estimate how many rounds we can be behind.
+        // Use GC depth to bound how many rounds our commits may trail the incoming round.
         // Subtract `GC_ACTIVITY_BUFFER` here so if we are right on the GC depth we will still go
         // inactive (small safety buffer).  The buffer is arbitrary but should make sure we are
         // comfortably within the current DAG. Trying to ride the GC window exactly can lead to

@@ -3927,3 +3927,41 @@ fn test_import_fault_is_peer_caused_whitelist() {
     ))
     .is_none());
 }
+
+// ---- bench5 f1-commit-lag ----
+
+/// A node whose committed round freezes is demoted once a certificate passes the activity window:
+/// committed 360 (execution at 352), certificate 403, window 40.
+///
+/// This is the path a commit held by the run-ahead gate takes: the gate stops the committed round,
+/// and the demotion follows 40 rounds later.
+#[tokio::test]
+async fn frozen_commit_is_behind() {
+    let temp_dir = TempDir::new().unwrap();
+    let TestTypes { handler, consensus_bus, .. } = create_test_types(temp_dir.path()).await;
+
+    let mut recent = RecentBlocks::new(1);
+    recent.push_latest(352, ConsensusNumHash::new(0, ConsensusHeaderDigest::default()), None);
+    consensus_bus.recent_blocks().send_replace(recent);
+    consensus_bus.committed_round_updates().send_replace(360);
+
+    assert!(handler.behind_consensus(0, 403, None).await, "a frozen commit is behind");
+}
+
+/// Execution far behind the committed round is not behind while commits keep up with the
+/// committee: execution at 100, committed 400, certificate 403.
+///
+/// A pin: it duplicates `test_behind_consensus_committed_round_prevents_false_positive` with the
+/// lag consensus can now run ahead of execution.
+#[tokio::test]
+async fn execution_lag_beyond_window_is_not_behind() {
+    let temp_dir = TempDir::new().unwrap();
+    let TestTypes { handler, consensus_bus, .. } = create_test_types(temp_dir.path()).await;
+
+    let mut recent = RecentBlocks::new(1);
+    recent.push_latest(100, ConsensusNumHash::new(0, ConsensusHeaderDigest::default()), None);
+    consensus_bus.recent_blocks().send_replace(recent);
+    consensus_bus.committed_round_updates().send_replace(400);
+
+    assert!(!handler.behind_consensus(0, 403, None).await, "execution lag alone is not behind");
+}

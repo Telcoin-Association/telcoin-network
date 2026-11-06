@@ -52,8 +52,8 @@ pub const DEFAULT_BAD_NODES_STAKE_THRESHOLD: u64 = 33;
 pub const MAX_GC_DEPTH: Round = 50;
 
 /// Rounds subtracted from a node's configured `gc_depth` when the consensus network handler
-/// computes its "activity window", the number of rounds a node may lag execution before it steps
-/// back as too far behind to be an active voter.
+/// computes its "activity window", the number of rounds a node's committed round may trail an
+/// incoming round before it steps back as too far behind to be an active voter.
 ///
 /// The buffer makes a node go inactive *before* it rides the garbage-collection horizon exactly,
 /// where subtle races live.  Because the window is `gc_depth - GC_ACTIVITY_BUFFER`, a configured
@@ -65,10 +65,13 @@ pub const GC_ACTIVITY_BUFFER: Round = 10;
 
 /// The activity window for a configured `gc_depth`: `gc_depth - GC_ACTIVITY_BUFFER`, saturating.
 ///
-/// An active CVV whose executed round trails an incoming round by more than this many rounds steps
-/// back to `CvvInactive` (the consensus network handler's `behind_consensus`).  The subtraction
-/// saturates so a test fixture with a `gc_depth` at or below the buffer gets a zero window instead
-/// of an underflow; production startup rejects that configuration.
+/// An active CVV whose committed round (or executed round, when that is higher) trails an incoming
+/// round by more than this many rounds steps back to `CvvInactive` (the consensus network handler's
+/// `behind_consensus`).  Consensus commits without waiting for local execution, so the window
+/// measures how far the node's commits lag the committee, not how far its execution lags: execution
+/// may trail the committed round by up to [`MAX_COMMIT_RUN_AHEAD_ROUNDS`] without a demotion.  The
+/// subtraction saturates so a test fixture with a `gc_depth` at or below the buffer gets a zero
+/// window instead of an underflow; production startup rejects that configuration.
 pub const fn gc_activity_window(gc_depth: Round) -> Round {
     gc_depth.saturating_sub(GC_ACTIVITY_BUFFER)
 }
@@ -117,6 +120,22 @@ pub const ROUNDS_TO_KEEP: Round = 128;
 /// while the certificate store prunes from the highest round it has written, which can run up to
 /// about 10 rounds further ahead. See [`ROUNDS_TO_KEEP`].
 pub const RETENTION_SLACK: Round = 10;
+
+/// Maximum number of rounds a committed leader may run ahead of the leader round this node has
+/// executed before the consensus task holds its next commit.
+///
+/// Consensus commits sub-dags without waiting for local execution; the fork check against each
+/// leader's execution block runs in the executor's subscriber, which saves an output only after
+/// that check passes.  On a validator whose execution is slower than the committee's, the
+/// committed round therefore leads the executed round, and this bound caps that lead.  Committed
+/// sub-dags carry headers only, so the bound holds at most about 500 of them (one leader every
+/// two rounds) between consensus and execution.  It equals the certificate validator's default
+/// `max_diff_between_external_cert_round_and_highest_local_round`, about eight minutes at two
+/// rounds a second.  While a commit is held the committed round stops advancing, so a node whose
+/// execution falls this far behind is demoted by the activity window ([`gc_activity_window`]).
+/// Rounds restart at every epoch, so until the first output of a new epoch executes, the executed
+/// round still reads the previous epoch's last leader round and the bound does not hold a commit.
+pub const MAX_COMMIT_RUN_AHEAD_ROUNDS: Round = 1_000;
 
 /// Maximum number of batch digests a single primary `Header` may reference.
 ///
