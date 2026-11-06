@@ -107,9 +107,16 @@ pub(crate) struct Values;
 impl CellRead for Values {
     type Out<'s> = &'s [u8];
 
+    /// [`PageRead::value`]'s body, matched here so that only a run reads the store: the borrowed
+    /// [`Cursor`]'s store is a trait object, on which a call to `value` is an indirect call
+    /// for every entry, an inline one too.
     #[inline(always)]
     fn read<'s, S: PageRead + ?Sized>(store: &'s S, val: Val<'s>) -> Result<&'s [u8]> {
-        store.value(val)
+        match val {
+            Val::Inline(v) => Ok(v),
+            Val::Overflow(ovf) => store.overflow(ovf),
+            Val::Nested(root) => Err(page::nested_error(root)),
+        }
     }
 }
 
@@ -173,7 +180,7 @@ pub(crate) type LandingOf<'s, R> = Option<(EntryOf<'s, R>, &'s [u8])>;
 type Peeked<'s, T> = Option<((&'s [u8], T), &'s [u8])>;
 
 /// Entry `i` of `leaf` with its value as `R` reads it (for [`Values`], an overflow value read
-/// from its run: [`PageRead::value`]).
+/// from its run: [`PageRead::overflow`]).
 #[inline]
 fn leaf_entry<'s, R: CellRead, S: PageRead + ?Sized>(
     store: &'s S,

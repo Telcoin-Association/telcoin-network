@@ -407,8 +407,9 @@ Anywhere else a nested cell, and a dup record where a plain table is expected, a
 - **A nested cell outside a dup table's outer tree** (in a plain table, the catalog, the free
   tree or a nested tree) is refused by every read and write that meets it, with one message
   (`page::nested_error`, "a nested cell in a tree that holds none"): a value read
-  (`PageRead::value`: gets, cursor moves and seeks), a cursor's `current_with_key_tail` and
-  `seek_with_key_tail`, a put or delete of its key (the path cache's included), copy-on-write of
+  (`PageRead::value` for gets, the same match in the plain cursors' `Values::read` for their moves
+  and seeks), a cursor's `current_with_key_tail` and `seek_with_key_tail`, a put or delete of
+  its key (the path cache's included), copy-on-write of
   a published leaf holding it and a merge absorbing that leaf (`check_cells_naming_this_txn`),
   a free walk that reads its leaf (`tree_pages`, behind `drop_table` and `clear_table`) and
   `Env::check`. `page::validate` holds it to the canonical shape above. A free walk reads every
@@ -885,7 +886,8 @@ and 2.1 us at 32 KiB at 4 KiB pages (`t4d`, runs of 3 and 9 pages), and 1.4 and 
 has no page without a header, so its read skips the CRC as a leaf's does (do-not-flag item 3): that took
 a `t4d` 2 KiB get from 724 to 302 ns and a `t16d` 8 KiB get from 1.30 us to 271 ns.
 
-**A nested cell is `Corrupt` at every value read** (`PageRead::value`) and every key-tail read
+**A nested cell is `Corrupt` at every value read** (`PageRead::value`, and `Values::read`, the plain
+cursors' copy of its match, which reads the store only for a run) and every key-tail read
 (the cursors' `key_tail`, behind `current_with_key_tail` and `seek_with_key_tail`): no value a
 read returns is one. Only a dup table's outer tree holds nested cells, and its reads match the
 cell itself (see [Dup tables](#dup-tables)); a cursor over a dup table is `TableKind`.
