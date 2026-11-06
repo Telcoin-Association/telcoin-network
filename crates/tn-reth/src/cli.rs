@@ -2,9 +2,10 @@
 //!
 //! This is the only reth CLI/config surface TN exposes: [`RethCommand`] narrows reth's full
 //! argument set to RPC, transaction-pool, and database args, and [`RethConfig::new`] fills in
-//! the rest of reth's `NodeConfig` with pinned values — reth networking/discovery fully
-//! disabled (TN runs its own libp2p stack), no reth payload builder, no dev/debug options, and
-//! reth's metrics server never launched (the prometheus endpoint is owned by `tn-metrics`).
+//! the rest of reth's `NodeConfig` with pinned values — no reth payload builder, no dev/debug
+//! options, and reth's metrics server never launched (the prometheus endpoint is owned by
+//! `tn-metrics`). reth's devp2p networking is not compiled in at all (TN runs its own libp2p
+//! stack; see vendor/reth CHANGES.md TN-0008).
 //!
 //! Security/operational policies enforced here:
 //! - RPC namespace allowlist: only the modules in `ALLOWED_MODULES` (eth, net, web3, debug, trace,
@@ -30,34 +31,25 @@
 //!   [`TN_TXPOOL_MAX_ACCOUNT_SLOTS_PER_SENDER`] (256, vs reth's 16), and the default IPC endpoint
 //!   becomes TN's [`DEFAULT_IPC_ENDPOINT`] (`tn.ipc`) rather than reth's `reth.ipc`.
 
-use std::{
-    collections::HashSet,
-    net::{IpAddr, Ipv4Addr},
-    path::Path,
-    sync::Arc,
-    time::Duration,
-};
+use std::{collections::HashSet, path::Path, sync::Arc, time::Duration};
 
 use clap::Parser;
-use reth::{
-    args::{
-        DatabaseArgs, DebugArgs, DefaultRpcServerArgs, DefaultTxPoolValues, DevArgs, DiscoveryArgs,
-        EngineArgs, EraArgs, EraSourceArgs, MetricArgs, NetworkArgs, PayloadBuilderArgs,
-        PruningArgs, StaticFilesArgs, StorageArgs, TxPoolArgs,
-    },
-    network::transactions::{
-        config::TransactionPropagationKind, TransactionIngressPolicy, TransactionPropagationMode,
-    },
-    rpc::builder::{RethRpcModule, RpcModuleSelection},
-};
 use reth_chainspec::ChainSpec as RethChainSpec;
-use reth_discv4::NatResolver;
-use reth_node_builder::{
-    NodeConfig, DEFAULT_MEMORY_BLOCK_BUFFER_TARGET, DEFAULT_PERSISTENCE_THRESHOLD,
-    DEFAULT_RESERVED_CPU_CORES, DEFAULT_SPARSE_TRIE_MAX_STORAGE_TRIES,
-    DEFAULT_SPARSE_TRIE_PRUNE_DEPTH,
+// The engine-tree defaults, from reth-engine-primitives (reth-tasks has its own
+// `DEFAULT_RESERVED_CPU_CORES` with a different value; this is the engine's).
+use reth_engine_primitives::{
+    DEFAULT_MEMORY_BLOCK_BUFFER_TARGET, DEFAULT_PERSISTENCE_THRESHOLD, DEFAULT_RESERVED_CPU_CORES,
+    DEFAULT_SPARSE_TRIE_MAX_STORAGE_TRIES, DEFAULT_SPARSE_TRIE_PRUNE_DEPTH,
 };
-use reth_node_core::node_config::DEFAULT_CROSS_BLOCK_CACHE_SIZE_MB;
+use reth_node_core::{
+    args::{
+        DatabaseArgs, DebugArgs, DefaultRpcServerArgs, DefaultTxPoolValues, DevArgs, EngineArgs,
+        EraArgs, EraSourceArgs, MetricArgs, PayloadBuilderArgs, PruningArgs, StaticFilesArgs,
+        StorageArgs, TxPoolArgs,
+    },
+    node_config::{NodeConfig, DEFAULT_CROSS_BLOCK_CACHE_SIZE_MB},
+};
+use reth_rpc_builder::{RethRpcModule, RpcModuleSelection};
 use tn_types::ETHEREUM_BLOCK_GAS_LIMIT_30M;
 use tracing::{info, warn};
 
@@ -96,8 +88,6 @@ pub struct RethCommand {
     #[clap(flatten)]
     pub db: DatabaseArgs,
 }
-
-const DEFAULT_UNUSED_ADDR: IpAddr = IpAddr::V4(Ipv4Addr::UNSPECIFIED);
 
 /// The reth rpc modules an operator may enable at all.
 ///
@@ -203,7 +193,7 @@ pub fn init_reth_defaults() {
         .is_err()
     {
         // The lock is already taken, so reading it back cannot change the outcome.
-        let effective = reth::args::RpcServerArgs::default().ipcpath;
+        let effective = reth_node_core::args::RpcServerArgs::default().ipcpath;
         if effective != DEFAULT_IPC_ENDPOINT {
             warn!(
                 target: "tn::reth",
@@ -306,57 +296,6 @@ impl RethConfig {
         Self::validate_rpc_modules(rpc.ws, &mut rpc.ws_api);
         // We don't just use Default for these Reth args.
         // This will force us to look at new options and make sure they are good for our use.
-        // We DO NOT use the Reth networking so these settings should reflect that.
-        let network = NetworkArgs {
-            discovery: DiscoveryArgs {
-                disable_discovery: true,
-                disable_nat: true,
-                disable_dns_discovery: true,
-                disable_discv4_discovery: true,
-                enable_discv5_discovery: false,
-                addr: DEFAULT_UNUSED_ADDR,
-                port: 0,
-                discv5_addr: None,
-                discv5_addr_ipv6: None,
-                discv5_port: 0,
-                discv5_port_ipv6: 0,
-                discv5_lookup_interval: 0,
-                discv5_bootstrap_lookup_interval: 0,
-                discv5_bootstrap_lookup_countdown: 0,
-            },
-            trusted_only: false,
-            trusted_peers: vec![],
-            bootnodes: None,
-            dns_retries: 0,
-            peers_file: None,
-            identity: "Reth Null Network".to_string(),
-            p2p_secret_key: None,
-            no_persist_peers: true,
-            nat: NatResolver::None,
-            addr: DEFAULT_UNUSED_ADDR,
-            port: 0,
-            max_outbound_peers: None,
-            max_inbound_peers: None,
-            max_concurrent_tx_requests: 0,
-            max_concurrent_tx_requests_per_peer: 0,
-            max_seen_tx_history: 0,
-            max_pending_pool_imports: 0,
-            soft_limit_byte_size_pooled_transactions_response: 0,
-            soft_limit_byte_size_pooled_transactions_response_on_pack_request: 0,
-            max_capacity_cache_txns_pending_fetch: 0,
-            net_if: None,
-            tx_propagation_policy: TransactionPropagationKind::None,
-            tx_ingress_policy: TransactionIngressPolicy::None,
-            disable_tx_gossip: true,
-            propagation_mode: TransactionPropagationMode::Max(0),
-            required_block_hashes: vec![],
-            network_id: None,
-            enforce_enr_fork_id: false,
-            max_peers: None,
-            netrestrict: None,
-            p2p_secret_key_hex: None,
-        };
-
         // Not using the Reth payload builder.
         let builder = PayloadBuilderArgs {
             extra_data: "tn-reth-na".to_string(),
@@ -488,7 +427,6 @@ impl RethConfig {
             metrics,
             instance,
             datadir,
-            network,
             rpc: rpc.into(),
             txpool,
             builder,
@@ -599,7 +537,7 @@ fn is_allowed(module: &RethRpcModule) -> bool {
 mod tests {
     use super::*;
     use clap::CommandFactory as _;
-    use reth::rpc::builder::RpcModuleSelection;
+    use reth_rpc_builder::RpcModuleSelection;
     use tempfile::TempDir;
     use tn_types::test_genesis;
 

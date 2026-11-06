@@ -33,11 +33,11 @@
 use std::sync::Arc;
 
 use jsonrpsee::Methods;
-use reth::rpc::{
-    builder::{config::RethRpcServerConfig as _, RethRpcModule, RpcModuleBuilder, RpcServerHandle},
-    eth::{EthApi, EthApiBuilder},
-};
 use reth_provider::providers::BlockchainProvider;
+use reth_rpc::eth::{EthApi, EthApiBuilder};
+use reth_rpc_builder::{
+    config::RethRpcServerConfig as _, RethRpcModule, RpcModuleBuilder, RpcServerHandle,
+};
 use reth_rpc_eth_api::RpcNodeCore;
 use reth_rpc_eth_types::EthConfig;
 use reth_transaction_pool::{blobstore::DiskFileBlobStore, EthTransactionPool};
@@ -150,7 +150,9 @@ fn worker_shifted_port(
 ///
 /// - `http_port` shifted down by `200 * worker_id` when the http server is enabled;
 /// - `ws_port` shifted up by `400 * worker_id` when the ws server is enabled;
-/// - `ipcpath` suffixed with `-w{worker_id}` when the IPC server is enabled.
+/// - `ipcpath` suffixed with `-w{worker_id}` when the IPC server is enabled;
+/// - when http and ws share one port, `ws_allowed_origins` falling back to `http_corsdomain`, the
+///   list the shared server checks WebSocket origins against.
 ///
 /// When both http and ws are enabled on fixed (non-zero) ports, the derivation needs
 /// `ws_port >= http_port` (reth's own default layout; equality is the shared http+ws
@@ -167,9 +169,9 @@ fn worker_shifted_port(
 /// (`RethConfig::new`), and the worker stride clears the whole instance range
 /// ([`WORKER_PORT_STRIDE`]), so combining the two flags cannot collide either.
 fn worker_rpc_server_args(
-    base: &reth::args::RpcServerArgs,
+    base: &reth_node_core::args::RpcServerArgs,
     worker_id: WorkerId,
-) -> TnRethResult<reth::args::RpcServerArgs> {
+) -> TnRethResult<reth_node_core::args::RpcServerArgs> {
     let base = base.clone();
     let inverted_fixed_bases = base.http
         && base.ws
@@ -199,7 +201,22 @@ fn worker_rpc_server_args(
             } else {
                 format!("{}-w{worker_id}", base.ipcpath)
             };
-            Ok(reth::args::RpcServerArgs { http_port, ws_port, ipcpath, ..base })
+            // On a shared http+ws port reth checks WebSocket origins against `--ws.origins`, or
+            // against `--http.corsdomain` when only that is set. The shift puts this worker's ws
+            // on its own server, which reads `--ws.origins` alone, so carry the list worker 0
+            // enforces instead of accepting every origin.
+            let ws_allowed_origins = if base.http && base.ws && base.http_port == base.ws_port {
+                base.ws_allowed_origins.clone().or_else(|| base.http_corsdomain.clone())
+            } else {
+                base.ws_allowed_origins.clone()
+            };
+            Ok(reth_node_core::args::RpcServerArgs {
+                http_port,
+                ws_port,
+                ipcpath,
+                ws_allowed_origins,
+                ..base
+            })
         }
     }
 }
@@ -426,8 +443,8 @@ mod tests {
     };
     use alloy::{primitives::U64, rpc::types::FeeHistory};
     use jsonrpsee::{rpc_params, RpcModule};
-    use reth::args::RpcStateCacheArgs;
     use reth_network_api::noop::NoopNetwork;
+    use reth_node_core::args::RpcStateCacheArgs;
     use reth_rpc_eth_types::{
         builder::config::PendingBlockKind, EthStateCacheConfig, FeeHistoryCacheConfig,
         ForwardConfig, GasPriceOracleConfig,
@@ -452,13 +469,13 @@ mod tests {
     /// The mode reader is evaluated on each request rather than at construction.
     fn rpc_methods_with_cap(
         cap_wei: u128,
-        rpc_args: reth::args::RpcServerArgs,
+        rpc_args: reth_node_core::args::RpcServerArgs,
         task_manager: &TaskManager,
         tmp_dir: &TempDir,
         node_mode: impl Fn() -> NodeMode + Send + Sync + 'static,
     ) -> (jsonrpsee::Methods, WorkerTxPool, Arc<RethChainSpec>) {
         let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
-        let rpc_args = reth::args::RpcServerArgs { rpc_tx_fee_cap: cap_wei, ..rpc_args };
+        let rpc_args = reth_node_core::args::RpcServerArgs { rpc_tx_fee_cap: cap_wei, ..rpc_args };
         let reth_env = RethEnv::new_for_temp_chain_with_rpc_args(
             chain.clone(),
             tmp_dir.path(),
@@ -496,7 +513,7 @@ mod tests {
             tmp_dir.path(),
             task_manager,
             None,
-            reth::args::RpcServerArgs { rpc_tx_fee_cap: 0, ..Default::default() },
+            reth_node_core::args::RpcServerArgs { rpc_tx_fee_cap: 0, ..Default::default() },
         )?;
         let pool = reth_env.init_txn_pool(accumulator.base_fee(worker_id))?;
         let network = WorkerNetwork::new_for_test(reth_env.chainspec());
@@ -589,7 +606,7 @@ mod tests {
             tmp_dir.path(),
             &task_manager,
             None,
-            reth::args::RpcServerArgs::default(),
+            reth_node_core::args::RpcServerArgs::default(),
         )
         .expect("temp chain env");
         let pool = reth_env.init_txn_pool(BaseFeeContainer::default()).expect("txn pool");
@@ -631,7 +648,7 @@ mod tests {
         // A disabled fee cap must not disable the independent node-mode guard.
         let (methods, pool, chain) = rpc_methods_with_cap(
             0,
-            reth::args::RpcServerArgs::default(),
+            reth_node_core::args::RpcServerArgs::default(),
             &task_manager,
             &tmp_dir,
             move || *mode_rx.borrow(),
@@ -700,7 +717,7 @@ mod tests {
         // wei (over).
         let (methods, pool, chain) = rpc_methods_with_cap(
             200_000,
-            reth::args::RpcServerArgs::default(),
+            reth_node_core::args::RpcServerArgs::default(),
             &task_manager,
             &tmp_dir,
             || NodeMode::CvvActive,
@@ -758,7 +775,7 @@ mod tests {
         let task_manager = TaskManager::default();
         let (methods, pool, chain) = rpc_methods_with_cap(
             0,
-            reth::args::RpcServerArgs::default(),
+            reth_node_core::args::RpcServerArgs::default(),
             &task_manager,
             &tmp_dir,
             || NodeMode::CvvActive,
@@ -790,8 +807,11 @@ mod tests {
         // IPC-only default above could mask an HTTP registration that missed the
         // guard. Serve HTTP alone (IPC disabled) and check its registration
         // directly: production validators serve the forwarder over HTTP.
-        let rpc_args =
-            reth::args::RpcServerArgs { http: true, ipcdisable: true, ..Default::default() };
+        let rpc_args = reth_node_core::args::RpcServerArgs {
+            http: true,
+            ipcdisable: true,
+            ..Default::default()
+        };
         let (methods, pool, chain) =
             rpc_methods_with_cap(200_000, rpc_args, &task_manager, &tmp_dir, || {
                 NodeMode::CvvActive
@@ -826,9 +846,17 @@ mod tests {
 
         init_reth_defaults();
         let transports = [
-            reth::args::RpcServerArgs { http: true, ipcdisable: true, ..Default::default() },
-            reth::args::RpcServerArgs { ws: true, ipcdisable: true, ..Default::default() },
-            reth::args::RpcServerArgs::default(),
+            reth_node_core::args::RpcServerArgs {
+                http: true,
+                ipcdisable: true,
+                ..Default::default()
+            },
+            reth_node_core::args::RpcServerArgs {
+                ws: true,
+                ipcdisable: true,
+                ..Default::default()
+            },
+            reth_node_core::args::RpcServerArgs::default(),
         ];
         futures::stream::iter(transports)
             .then(|rpc_args| async move {
@@ -840,7 +868,7 @@ mod tests {
                     temp.path(),
                     &tasks,
                     None,
-                    reth::args::RpcServerArgs { rpc_tx_fee_cap: 200_000, ..rpc_args },
+                    reth_node_core::args::RpcServerArgs { rpc_tx_fee_cap: 200_000, ..rpc_args },
                 )?;
                 let pool = env.init_txn_pool(BaseFeeContainer::default())?;
                 let network = WorkerNetwork::new_for_test(env.chainspec());
@@ -907,7 +935,7 @@ mod tests {
     fn epoch_fee_methods(
         epoch_fee: u64,
         header_fee: u64,
-        rpc_args: reth::args::RpcServerArgs,
+        rpc_args: reth_node_core::args::RpcServerArgs,
         task_manager: &TaskManager,
         tmp_dir: &TempDir,
     ) -> eyre::Result<(Methods, Arc<RethChainSpec>)> {
@@ -921,7 +949,7 @@ mod tests {
     fn epoch_fee_methods_from_genesis(
         epoch_fee: u64,
         genesis: alloy::genesis::Genesis,
-        rpc_args: reth::args::RpcServerArgs,
+        rpc_args: reth_node_core::args::RpcServerArgs,
         task_manager: &TaskManager,
         tmp_dir: &TempDir,
     ) -> eyre::Result<(Methods, Arc<RethChainSpec>)> {
@@ -1010,7 +1038,7 @@ mod tests {
         let (methods, _) = epoch_fee_methods(
             12_345,
             7,
-            reth::args::RpcServerArgs::default(),
+            reth_node_core::args::RpcServerArgs::default(),
             &task_manager,
             &tmp_dir,
         )?;
@@ -1037,8 +1065,13 @@ mod tests {
         init_reth_defaults();
         let tmp_dir = TempDir::new()?;
         let task_manager = TaskManager::default();
-        let (methods, _) =
-            epoch_fee_methods(7, 7, reth::args::RpcServerArgs::default(), &task_manager, &tmp_dir)?;
+        let (methods, _) = epoch_fee_methods(
+            7,
+            7,
+            reth_node_core::args::RpcServerArgs::default(),
+            &task_manager,
+            &tmp_dir,
+        )?;
         let request = alloy::rpc::types::TransactionRequest {
             from: Some(Address::repeat_byte(0x42)),
             to: Some(Address::ZERO.into()),
@@ -1060,7 +1093,7 @@ mod tests {
         let (methods, _) = epoch_fee_methods(
             7,
             1_000,
-            reth::args::RpcServerArgs::default(),
+            reth_node_core::args::RpcServerArgs::default(),
             &task_manager,
             &tmp_dir,
         )?;
@@ -1081,8 +1114,11 @@ mod tests {
         init_reth_defaults();
         let tmp_dir = TempDir::new()?;
         let task_manager = TaskManager::default();
-        let rpc_args =
-            reth::args::RpcServerArgs { http: true, ipcdisable: true, ..Default::default() };
+        let rpc_args = reth_node_core::args::RpcServerArgs {
+            http: true,
+            ipcdisable: true,
+            ..Default::default()
+        };
         let (methods, _) = epoch_fee_methods(12_345, 7, rpc_args, &task_manager, &tmp_dir)?;
         let request = alloy::rpc::types::TransactionRequest {
             from: Some(TransactionFactory::new().address()),
@@ -1180,7 +1216,7 @@ mod tests {
             tmp_dir.path(),
             &task_manager,
             None,
-            reth::args::RpcServerArgs::default(),
+            reth_node_core::args::RpcServerArgs::default(),
         )?;
         // One accumulator feeds the pool's container and the RPC server's handle, as in
         // production (#1262, #1282).
@@ -1227,7 +1263,7 @@ mod tests {
             rpc_state_cache: RpcStateCacheArgs { max_blocks: 11, ..Default::default() },
             ..Default::default()
         };
-        let config = reth::args::RpcServerArgs::from(args).eth_config();
+        let config = reth_node_core::args::RpcServerArgs::from(args).eth_config();
 
         assert_eq!(config.rpc_gas_cap, 100_000_000);
         assert_eq!(config.rpc_max_simulate_blocks, 42);
@@ -1259,7 +1295,7 @@ mod tests {
             tmp_dir.path(),
             task_manager,
             None,
-            reth::args::RpcServerArgs::default(),
+            reth_node_core::args::RpcServerArgs::default(),
         )
         .expect("temp chain env");
         // One accumulator feeds the pool's container and the RPC server's handle, as in
@@ -1403,7 +1439,7 @@ mod tests {
     /// call through the returned methods exercises the registered handler, not a copy.
     fn gas_price_methods(
         epoch_fee: u64,
-        rpc_args: reth::args::RpcServerArgs,
+        rpc_args: reth_node_core::args::RpcServerArgs,
         task_manager: &TaskManager,
         tmp_dir: &TempDir,
     ) -> (Methods, BaseFeeContainer) {
@@ -1459,7 +1495,7 @@ mod tests {
         let epoch_fee = 2_468_013_579_u64;
         let (methods, base_fee) = gas_price_methods(
             epoch_fee,
-            reth::args::RpcServerArgs::default(),
+            reth_node_core::args::RpcServerArgs::default(),
             &task_manager,
             &tmp_dir,
         );
@@ -1483,8 +1519,12 @@ mod tests {
     async fn test_max_priority_fee_per_gas_is_zero() {
         let tmp_dir = TempDir::new().expect("temp dir");
         let task_manager = TaskManager::default();
-        let (methods, _base_fee) =
-            gas_price_methods(1_000, reth::args::RpcServerArgs::default(), &task_manager, &tmp_dir);
+        let (methods, _base_fee) = gas_price_methods(
+            1_000,
+            reth_node_core::args::RpcServerArgs::default(),
+            &task_manager,
+            &tmp_dir,
+        );
 
         let tip: U256 =
             methods.call("eth_maxPriorityFeePerGas", rpc_params![]).await.expect("tip quote");
@@ -1503,8 +1543,11 @@ mod tests {
         let tmp_dir = TempDir::new().expect("temp dir");
         let task_manager = TaskManager::default();
         let epoch_fee = 1_122_334_455_u64;
-        let rpc_args =
-            reth::args::RpcServerArgs { http: true, ipcdisable: true, ..Default::default() };
+        let rpc_args = reth_node_core::args::RpcServerArgs {
+            http: true,
+            ipcdisable: true,
+            ..Default::default()
+        };
         let (methods, _base_fee) = gas_price_methods(epoch_fee, rpc_args, &task_manager, &tmp_dir);
 
         let quote: U256 = methods
@@ -1524,7 +1567,8 @@ mod tests {
     /// single-worker nodes and existing tooling see no change (#1287).
     #[test]
     fn test_worker_zero_keeps_operator_rpc_endpoints() {
-        let base = reth::args::RpcServerArgs { http: true, ws: true, ..Default::default() };
+        let base =
+            reth_node_core::args::RpcServerArgs { http: true, ws: true, ..Default::default() };
         let derived = worker_rpc_server_args(&base, 0).expect("worker 0 derivation");
         assert_eq!(derived.http_port, base.http_port);
         assert_eq!(derived.ws_port, base.ws_port);
@@ -1536,7 +1580,8 @@ mod tests {
     /// endpoints.
     #[test]
     fn test_worker_endpoints_are_distinct_per_worker() {
-        let base = reth::args::RpcServerArgs { http: true, ws: true, ..Default::default() };
+        let base =
+            reth_node_core::args::RpcServerArgs { http: true, ws: true, ..Default::default() };
         let worker_one = worker_rpc_server_args(&base, 1).expect("worker 1 derivation");
         let worker_two = worker_rpc_server_args(&base, 2).expect("worker 2 derivation");
         assert_eq!(worker_one.http_port, base.http_port - 200);
@@ -1547,6 +1592,43 @@ mod tests {
         assert_eq!(worker_two.ipcpath, format!("{}-w2", base.ipcpath));
     }
 
+    /// With http and ws on one port and only `--http.corsdomain` set, worker 0's shared server
+    /// checks WebSocket origins against that list. A worker above 0 gets its ws on a separate
+    /// server, which reads `--ws.origins` alone, so the derivation must carry the list there or
+    /// that worker accepts WebSocket upgrades from every origin.
+    #[test]
+    fn test_shared_port_origins_carry_to_shifted_ws_server() {
+        let base = reth_node_core::args::RpcServerArgs {
+            http: true,
+            ws: true,
+            http_port: 8545,
+            ws_port: 8545,
+            http_corsdomain: Some("https://observer.example".to_string()),
+            ws_allowed_origins: None,
+            ..Default::default()
+        };
+        let worker_zero = worker_rpc_server_args(&base, 0).expect("worker 0 derivation");
+        assert_eq!(worker_zero.ws_allowed_origins, None, "worker 0 keeps the config");
+
+        let worker_one = worker_rpc_server_args(&base, 1).expect("worker 1 derivation");
+        assert_ne!(worker_one.http_port, worker_one.ws_port, "the shift splits the servers");
+        assert_eq!(worker_one.ws_allowed_origins.as_deref(), Some("https://observer.example"));
+        assert_eq!(worker_one.http_corsdomain, base.http_corsdomain);
+
+        // an explicit ws list wins, as it does on the shared server
+        let both = reth_node_core::args::RpcServerArgs {
+            ws_allowed_origins: Some("https://ws.example".to_string()),
+            ..base.clone()
+        };
+        let worker_one = worker_rpc_server_args(&both, 1).expect("worker 1 derivation");
+        assert_eq!(worker_one.ws_allowed_origins.as_deref(), Some("https://ws.example"));
+
+        // separate base ports already give ws its own server, so nothing is carried
+        let separate = reth_node_core::args::RpcServerArgs { ws_port: 8546, ..base };
+        let worker_one = worker_rpc_server_args(&separate, 1).expect("worker 1 derivation");
+        assert_eq!(worker_one.ws_allowed_origins, None);
+    }
+
     /// A worker band cannot collide with any `--instance` offset. Instance arithmetic
     /// moves http down by at most 199 and ws up by at most 398 (`instance <= 200` in
     /// reth v1.11.3), and the closest approach between the two schemes is worker 1 of
@@ -1555,7 +1637,8 @@ mod tests {
     #[test]
     fn test_worker_bands_clear_the_instance_range() {
         // Instance 1 leaves the defaults unchanged, so `base` is instance 1's config.
-        let base = reth::args::RpcServerArgs { http: true, ws: true, ..Default::default() };
+        let base =
+            reth_node_core::args::RpcServerArgs { http: true, ws: true, ..Default::default() };
         let worker_one = worker_rpc_server_args(&base, 1).expect("worker 1 derivation");
         assert!(
             worker_one.http_port < base.http_port - 199,
@@ -1571,8 +1654,11 @@ mod tests {
     /// loudly instead of wrapping into a port another worker or instance owns.
     #[test]
     fn test_out_of_range_worker_port_is_a_loud_error() {
-        let low_http =
-            reth::args::RpcServerArgs { http: true, http_port: 100, ..Default::default() };
+        let low_http = reth_node_core::args::RpcServerArgs {
+            http: true,
+            http_port: 100,
+            ..Default::default()
+        };
         assert!(matches!(
             worker_rpc_server_args(&low_http, 1),
             Err(TnRethError::WorkerRpcPort {
@@ -1583,8 +1669,11 @@ mod tests {
             })
         ));
 
-        let high_ws =
-            reth::args::RpcServerArgs { ws: true, ws_port: u16::MAX, ..Default::default() };
+        let high_ws = reth_node_core::args::RpcServerArgs {
+            ws: true,
+            ws_port: u16::MAX,
+            ..Default::default()
+        };
         assert!(matches!(
             worker_rpc_server_args(&high_ws, 1),
             Err(TnRethError::WorkerRpcPort {
@@ -1601,7 +1690,7 @@ mod tests {
     /// path still gets the per-worker suffix (#1287: every worker shared it).
     #[test]
     fn test_zero_ports_stay_os_assigned_and_ipc_still_suffixes() {
-        let base = reth::args::RpcServerArgs {
+        let base = reth_node_core::args::RpcServerArgs {
             http: true,
             ws: true,
             http_port: 0,
@@ -1620,7 +1709,7 @@ mod tests {
     /// configured, keeping single-worker nodes on inverted bases working.
     #[test]
     fn test_inverted_transport_bases_are_a_loud_error() {
-        let base = reth::args::RpcServerArgs {
+        let base = reth_node_core::args::RpcServerArgs {
             http: true,
             http_port: 8800,
             ws: true,
@@ -1641,7 +1730,7 @@ mod tests {
     /// collide (http descends, ws ascends).
     #[test]
     fn test_equal_transport_bases_stay_valid() {
-        let base = reth::args::RpcServerArgs {
+        let base = reth_node_core::args::RpcServerArgs {
             http: true,
             http_port: 9000,
             ws: true,
@@ -1658,7 +1747,11 @@ mod tests {
     /// bare permission error.
     #[test]
     fn test_http_band_below_the_privileged_floor_is_a_loud_error() {
-        let base = reth::args::RpcServerArgs { http: true, http_port: 1100, ..Default::default() };
+        let base = reth_node_core::args::RpcServerArgs {
+            http: true,
+            http_port: 1100,
+            ..Default::default()
+        };
         assert!(matches!(
             worker_rpc_server_args(&base, 1),
             Err(TnRethError::WorkerRpcPort {
@@ -1675,7 +1768,7 @@ mod tests {
     /// server keeps its path unsuffixed.
     #[test]
     fn test_disabled_transports_keep_their_configured_values() {
-        let base = reth::args::RpcServerArgs {
+        let base = reth_node_core::args::RpcServerArgs {
             http: false,
             http_port: 100,
             ws: false,
@@ -1723,7 +1816,8 @@ mod tests {
         let task_manager = TaskManager::default();
         let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
         let ipcpath = tmp_dir.path().join("tn-test.ipc").to_string_lossy().into_owned();
-        let rpc_args = reth::args::RpcServerArgs { ipcpath: ipcpath.clone(), ..Default::default() };
+        let rpc_args =
+            reth_node_core::args::RpcServerArgs { ipcpath: ipcpath.clone(), ..Default::default() };
         let reth_env = RethEnv::new_for_temp_chain_with_rpc_args(
             chain,
             tmp_dir.path(),

@@ -32,7 +32,7 @@ use std::{
     net::{Ipv6Addr, SocketAddr},
 };
 
-use reth::rpc::builder::constants::DEFAULT_HTTP_RPC_PORT;
+use reth_rpc_builder::constants::DEFAULT_HTTP_RPC_PORT;
 use url::{Host, Url};
 
 /// The most targets one `--forward-txs` list may name.
