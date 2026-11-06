@@ -1776,8 +1776,11 @@ fn a_crash_drops_without_a_trim() {
 /// keeps the slack, and a sparse copy of the file can make it holes (modeled by cutting the tail
 /// and extending the file again). The reopen writes nothing. The first growth past the pages cuts
 /// the tail and grows from the pages, one step, with real blocks under the whole file, and a
-/// clean close and a reopen find every row. The blocks check bites only where an extension leaves
-/// holes (ext4, XFS); APFS allocates the extended range, and there the length check shows the cut.
+/// clean close and a reopen find every row. On Linux the extension is a hole (ext4, XFS, btrfs,
+/// tmpfs), which the test asserts, and stays one until each page is written, so there the blocks
+/// check bites. APFS leaves the hole too, but fills a sparse file's holes at its first write and
+/// msync through a mapping, so there the blocks check passes either way and the length check
+/// shows the cut.
 #[test]
 fn an_inherited_tail_is_cut_and_regrown_with_real_blocks() {
     let (_dir, path) = temp();
@@ -1793,6 +1796,11 @@ fn an_inherited_tail_is_cut_and_regrown_with_real_blocks() {
     file.set_len(len).expect("extend it without blocks");
     drop(file);
     let sparse = allocated(&path);
+    #[cfg(target_os = "linux")]
+    assert!(
+        sparse <= used + (len - used) / 2,
+        "the tail is a hole: {sparse} allocated bytes, {used} of pages in a file of {len}"
+    );
 
     let env = open(&path);
     assert_eq!((file_len(&path), allocated(&path)), (len, sparse), "the reopen writes nothing");
