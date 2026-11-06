@@ -356,6 +356,63 @@ impl HeadersProposedHandles {
     }
 }
 
+// bench5 cert-requeue
+/// Why the proposer put batch digests back at the front of its queue: the `cause` label of
+/// `tn_primary_digests_requeued_total` and the `cause=` field of the `digests resent` line.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RequeueCause {
+    /// A newer own header cancelled the vote collection of the header that carried them, so that
+    /// header will never be certified.
+    Canceled,
+    /// An own header at a later round was committed while the header that carried them was not.
+    Committed,
+}
+
+impl RequeueCause {
+    /// Every cause, in [`Self::index`] order.
+    pub(crate) const ALL: [Self; 2] = [Self::Canceled, Self::Committed];
+
+    /// The static metric and log label for this cause.
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Canceled => "canceled",
+            Self::Committed => "committed",
+        }
+    }
+
+    /// This cause's position in [`Self::ALL`] and in [`DigestsRequeuedHandles`].
+    const fn index(self) -> usize {
+        match self {
+            Self::Canceled => 0,
+            Self::Committed => 1,
+        }
+    }
+}
+
+/// The `tn_primary_digests_requeued_total{cause}` counters, resolved once when a proposer is
+/// built so no `metrics` macro runs per re-queue. The handles are `Arc`-backed.
+#[derive(Clone, Debug)]
+pub(crate) struct DigestsRequeuedHandles {
+    /// One counter per [`RequeueCause`], indexed by its position in [`RequeueCause::ALL`].
+    by_cause: [Counter; RequeueCause::ALL.len()],
+}
+
+impl DigestsRequeuedHandles {
+    /// Resolve the counter of every cause against the installed recorder.
+    pub(crate) fn new() -> Self {
+        Self {
+            by_cause: RequeueCause::ALL.map(|cause| {
+                metrics::counter!("tn_primary.digests_requeued_total", "cause" => cause.as_str())
+            }),
+        }
+    }
+
+    /// The counter of batch digests re-queued for `cause`.
+    pub(crate) fn counter(&self, cause: RequeueCause) -> &Counter {
+        &self.by_cause[cause.index()]
+    }
+}
+
 /// Why this node changed its mode: the `reason` label of `tn_node_mode_transitions_total`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ModeTransitionReason {
@@ -554,6 +611,9 @@ mod tests {
             let proposed = HeadersProposedHandles::new();
             proposed.counter(ProposeReason::MaxDelay).increment(2);
             proposed.counter(ProposeReason::MinDelay).increment(1);
+            // bench5 cert-requeue
+            let requeued = DigestsRequeuedHandles::new();
+            requeued.counter(RequeueCause::Canceled).increment(3);
         });
 
         let snapshot = snapshotter.snapshot().into_vec();
@@ -612,6 +672,24 @@ mod tests {
                 ProposeReason::MaxDelay => 2,
             };
             assert_eq!(*value, &DebugValue::Counter(expected), "{}", reason.as_str());
+        }
+        // bench5 cert-requeue: one digests_requeued_total series per cause, none unlabelled
+        assert_eq!(RequeueCause::ALL.map(RequeueCause::as_str), ["canceled", "committed"]);
+        let requeued: Vec<_> = snapshot
+            .iter()
+            .filter(|(key, ..)| key.key().name() == "tn_primary.digests_requeued_total")
+            .map(|(key, _, _, value)| {
+                let cause = key.key().labels().find(|label| label.key() == "cause");
+                (cause.map(|label| label.value().to_string()), value)
+            })
+            .collect();
+        assert_eq!(requeued.len(), RequeueCause::ALL.len(), "one series per cause");
+        for (cause, expected) in [(RequeueCause::Canceled, 3), (RequeueCause::Committed, 0)] {
+            let (_, value) = requeued
+                .iter()
+                .find(|(label, _)| label.as_deref() == Some(cause.as_str()))
+                .unwrap_or_else(|| panic!("no digests_requeued_total{{cause={cause:?}}}"));
+            assert_eq!(*value, &DebugValue::Counter(expected), "{}", cause.as_str());
         }
     }
 

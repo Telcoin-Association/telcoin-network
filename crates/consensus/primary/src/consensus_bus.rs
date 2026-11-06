@@ -21,7 +21,7 @@ use tn_storage::consensus::{ConsensusChain, ConsensusChainError};
 use tn_types::{
     deconstruct_nonce, BlockNumHash, CanonicalExecutionReader, Certificate, CommittedSubDag,
     ConsensusHeader, ConsensusHeaderDigest, ConsensusOutput, Epoch, EpochRecord, EpochVote, Header,
-    Round, TnReceiver, TnSender, CHANNEL_CAPACITY,
+    HeaderDigest, Round, TnReceiver, TnSender, CHANNEL_CAPACITY,
 };
 use tokio::{
     sync::{
@@ -74,6 +74,14 @@ const EXEX_CONSENSUS_OUTPUT_CHANNEL_CAPACITY: usize = 100;
 /// that drain the queue must never wait on it: a worker that waits for room in its own queue stops
 /// the consumption that would make room (see [`ConsensusBusApp::try_requeue_epoch_pack_file`]).
 pub const EPOCH_REQUEST_QUEUE_CAPACITY: usize = 1024;
+/// Depth of the bounded `uncertified_own_headers` queue.
+///
+/// The certifier queues one report per own header whose certification a newer own header
+/// cancelled, and never waits for room: a full queue drops the report, and the header's digests
+/// then wait for the proposer's next own commit as they did before the report existed. A cancel
+/// needs a newer header, which the proposer builds in the same loop that drains this queue, so the
+/// queue rarely holds more than one report.
+pub(crate) const UNCERTIFIED_OWN_HEADERS_CHANNEL_CAPACITY: usize = 64;
 
 /// What an always-subscribed [`QueChannel`] holds while no consumer holds its receiver.
 ///
@@ -1431,6 +1439,11 @@ struct ConsensusBusEpochInner {
     ///
     /// NOTE: this does not mean the header was executed yet.
     committed_own_headers: QueChannel<(Round, Vec<Round>)>,
+    /// Own headers that will never be certified because a newer own header cancelled their vote
+    /// collection, as `(round, digest)`, from the `Certifier` to the `Proposer`.
+    ///
+    /// Bounded by [`UNCERTIFIED_OWN_HEADERS_CHANNEL_CAPACITY`]; the certifier only `try_send`s.
+    uncertified_own_headers: QueChannel<(Round, HeaderDigest)>,
 
     /// Outputs the sequence of ordered certificates to the application layer.
     sequence: QueChannel<CommittedSubDag>,
@@ -1448,6 +1461,9 @@ impl ConsensusBusEpochInner {
             our_digests: QueChannel::new(),
             headers: QueChannel::new(),
             committed_own_headers: QueChannel::new(),
+            uncertified_own_headers: QueChannel::with_capacity(
+                UNCERTIFIED_OWN_HEADERS_CHANNEL_CAPACITY,
+            ),
             sequence: QueChannel::new(),
             certificate_manager: QueChannel::new(),
         }
@@ -1556,6 +1572,15 @@ impl ConsensusBus {
         &self.inner_epoch.committed_own_headers
     }
 
+    /// Reports own headers whose certification a newer own header cancelled, as
+    /// `(round, digest)`, so the `Proposer` can put their batch digests back in its queue.
+    ///
+    /// Bounded: send with `try_send` and drop the report when the queue is full.
+    /// Can only be subscribed to once.
+    pub(crate) fn uncertified_own_headers(&self) -> &impl TnSender<(Round, HeaderDigest)> {
+        &self.inner_epoch.uncertified_own_headers
+    }
+
     /// Outputs the sequence of ordered certificates from consensus.
     /// Can only be subscribed to once.
     pub fn sequence(&self) -> &impl TnSender<CommittedSubDag> {
@@ -1630,6 +1655,13 @@ impl ConsensusBus {
     /// NOTE: this does not mean the header was executed yet.
     pub fn subscribe_committed_own_headers(&self) -> impl TnReceiver<(Round, Vec<Round>)> {
         self.inner_epoch.committed_own_headers.subscribe()
+    }
+
+    /// Subscribe to the own headers whose certification a newer own header cancelled.
+    pub(crate) fn subscribe_uncertified_own_headers(
+        &self,
+    ) -> impl TnReceiver<(Round, HeaderDigest)> {
+        self.inner_epoch.uncertified_own_headers.subscribe()
     }
 
     /// Subscribe to sequence of ordered certificates to the application layer.
