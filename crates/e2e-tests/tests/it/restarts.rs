@@ -1910,3 +1910,284 @@ fn test_restarts_lagged_under_load() -> eyre::Result<()> {
         .wrap_err(format!("lagged rejoin under load failed, check logs in test_logs/{test}/"))
         .and(joined)
 }
+
+/// Node whose execution [`test_slow_execution_stays_active`] slows.
+const SLOW_NODE: usize = 2;
+
+/// Environment variable of the engine's execution-delay test hook
+/// (`tn_types::test_hooks::execution_delay`), set on [`SLOW_NODE`] only.
+const EXECUTION_DELAY_ENV: &str = "TN_TEST_EXECUTION_DELAY_MS";
+
+/// Milliseconds [`SLOW_NODE`] sleeps before it executes each output that carries batches.
+///
+/// Under load the e2e committee advances about five rounds a second, a leader commit every 0.4 s,
+/// so at 1.5 s an output the slowed node's execution falls about three rounds a second further
+/// behind and crosses the activity window of [`RESTART_TEST_GC_DEPTH`] within seconds (190 rounds
+/// behind by the end of the window when measured). Outputs without batches skip execution and the
+/// delay alike, so the backlog drains once the load stops.
+const SLOW_EXECUTION_DELAY_MS: &str = "1500";
+
+/// How long [`test_slow_execution_stays_active`] watches the slowed validator under load.
+const SLOW_EXECUTION_WINDOW: Duration = Duration::from_secs(60);
+
+/// Interval between the slowed validator's mode and metrics polls.
+const SLOW_EXECUTION_POLL: Duration = Duration::from_secs(2);
+
+/// Time limit for the slowed validator's execution to return inside the activity window once the
+/// load stops.
+///
+/// The backlog drains at 1.5 s an output with batches, and the pool still feeds batches for a while
+/// after the load stops, so the drain time follows the cadence of the run: the 190- and 226-round
+/// backlogs of two measured runs took 120 s and 176 s. The limit leaves more than twice the
+/// slower.
+const SLOW_EXECUTION_CATCH_UP: Duration = Duration::from_secs(420);
+
+/// Prometheus series of node mode changes, labelled `to` and `reason`.
+const MODE_TRANSITIONS: &str = "tn_node_mode_transitions_total";
+
+/// The `to` label of a demotion in [`MODE_TRANSITIONS`].
+const TO_INACTIVE: &str = r#"to="cvv_inactive""#;
+
+/// Prometheus gauge of how many rounds a node's committed round leads its executed round.
+const EXEC_LAG_ROUNDS: &str = "tn_primary_consensus_exec_lag_rounds";
+
+/// Prometheus gauge of a node's committed round.
+const COMMITTED_ROUND: &str = "tn_primary_committed_round";
+
+/// The warning a node logs when it demotes itself for falling behind consensus.
+const BEHIND_LOG: &str = "we are behind";
+
+/// A validator whose execution trails its commits by more than the activity window stays an active
+/// voter while the committee runs under load (issues #1781 and #1782).
+///
+/// [`SLOW_NODE`]'s engine sleeps [`SLOW_EXECUTION_DELAY_MS`] before it executes each output with
+/// batches, so under load its execution falls more than `gc_activity_window(gc_depth)` (15 rounds
+/// at [`RESTART_TEST_GC_DEPTH`]) behind its commits. Commits do not wait for execution, so the
+/// slowed node's committed round keeps pace with the committee and the activity window, which
+/// measures how far commits trail an incoming certificate, is never crossed: for
+/// [`SLOW_EXECUTION_WINDOW`] the node is `CvvActive` at every poll, counts no demotion and logs no
+/// [`BEHIND_LOG`], while its execution lag exceeds the window at least once and every node's
+/// committed round advances by more than the window. Once the load stops, its execution returns
+/// inside the window.
+///
+/// This fails on the base, where Bullshark waited for local execution before each commit: the
+/// slowed node's committed round froze with its execution, and the first certificate more than 15
+/// rounds ahead demoted it (`we are behind`, `tn_node_mode_transitions_total{to="cvv_inactive",
+/// reason="outside_gc_window"}`) within about 15 s of load. The bench-4 slow-fsync validators were
+/// demoted the same way, 41 rounds behind at the devnet `gc_depth` of 50.
+#[test]
+#[ignore = "should not run with a default cargo test, run restart tests as seperate step"]
+fn test_slow_execution_stays_active() -> eyre::Result<()> {
+    let _permit = super::common::acquire_test_permit();
+    let test = "slow_execution_stays_active";
+    let tmp_guard = tempfile::TempDir::new()?;
+    let temp_path = tmp_guard.path().to_path_buf();
+    let funded = vec![(
+        address_from_word(LOAD_SOURCE),
+        GenesisAccount::default().with_balance(U256::from(parse_ether("10_000_000")?)),
+    )];
+    config_local_testnet_with_gc_depth(
+        &temp_path,
+        Some("restart_test".to_string()),
+        Some(funded),
+        Some(RESTART_TEST_GC_DEPTH),
+    )?;
+    let bin = e2e_tests::get_telcoin_network_binary();
+    let port =
+        || get_available_tcp_port("127.0.0.1").ok_or_else(|| eyre::eyre!("no port available"));
+    let nodes = (0..4)
+        .map(|_| Ok((port()?, format!("127.0.0.1:{}", port()?))))
+        .collect::<eyre::Result<Vec<(u16, String)>>>()?;
+    let client_urls = <[String; 4]>::try_from(
+        nodes
+            .iter()
+            .map(|(rpc_port, _)| format!("http://127.0.0.1:{rpc_port}"))
+            .collect::<Vec<_>>(),
+    )
+    .map_err(|_| eyre::eyre!("expected four rpc urls"))?;
+    let metrics_addrs = nodes.iter().map(|(_, addr)| addr.as_str()).collect::<Vec<_>>();
+    let mut guard = ProcessGuard::empty();
+    nodes.iter().enumerate().for_each(|(i, (rpc_port, metrics_addr))| {
+        let env: &[(&str, &str)] =
+            if i == SLOW_NODE { &[(EXECUTION_DELAY_ENV, SLOW_EXECUTION_DELAY_MS)] } else { &[] };
+        let args = ["--metrics", metrics_addr.as_str()];
+        guard.push(start_validator_with_env(i, bin, &temp_path, *rpc_port, test, 0, &args, env));
+    });
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let sent = Arc::new(AtomicU64::new(0));
+    let load = spawn_load(client_urls[0].clone(), Arc::clone(&stop), Arc::clone(&sent));
+    let checked =
+        check_slow_execution_stays_active(&client_urls, &metrics_addrs, test, &stop, &sent);
+    stop.store(true, Ordering::Relaxed);
+    let joined = load.join().map_err(|_| eyre::eyre!("load thread panicked"));
+    guard.kill_all();
+    let summary = checked.wrap_err(format!(
+        "slowed validator did not stay active under load, check logs in test_logs/{test}/"
+    ))?;
+    eprintln!("{test}: {summary}");
+    joined
+}
+
+/// The checks of [`test_slow_execution_stays_active`]: [`SLOW_NODE`] stays active under load for
+/// [`SLOW_EXECUTION_WINDOW`] while its execution lags, then `stop` ends the load and its execution
+/// catches up. Returns the observed values for the test's summary line.
+fn check_slow_execution_stays_active(
+    client_urls: &[String; 4],
+    metrics_addrs: &[&str],
+    test: &str,
+    stop: &AtomicBool,
+    sent: &AtomicU64,
+) -> eyre::Result<String> {
+    network_advancing(client_urls)?;
+    wait_until_blocking(Duration::from_secs(30), "load transfers accepted", || {
+        Ok(sent.load(Ordering::Relaxed) > 0)
+    })?;
+    let window = f64::from(tn_types::gc_activity_window(RESTART_TEST_GC_DEPTH));
+    let slow_url = &client_urls[SLOW_NODE];
+    let slow_metrics = metrics_addrs[SLOW_NODE];
+    let committed_rounds = || {
+        metrics_addrs
+            .iter()
+            .map(|addr| scrape_metric_value(addr, COMMITTED_ROUND))
+            .collect::<eyre::Result<Vec<f64>>>()
+    };
+    let start_rounds = committed_rounds()?;
+
+    let start = Instant::now();
+    let mut max_lag = 0.0_f64;
+    let mut polls = 0_u32;
+    while start.elapsed() < SLOW_EXECUTION_WINDOW {
+        std::thread::sleep(SLOW_EXECUTION_POLL);
+        polls += 1;
+        let at = start.elapsed().as_secs();
+        let mode = get_node_mode(slow_url)
+            .wrap_err_with(|| format!("node {SLOW_NODE} mode at {at}s, poll {polls}"))?;
+        let body = scrape_metrics(slow_metrics)?;
+        let lag = labeled_sample(&body, EXEC_LAG_ROUNDS, &[])?
+            .ok_or_else(|| eyre::eyre!("node {SLOW_NODE} serves no {EXEC_LAG_ROUNDS}"))?;
+        max_lag = max_lag.max(lag);
+        let active = labeled_sample(&body, "tn_node_mode", &[r#"mode="cvv_active""#])?;
+        let demotions = labeled_sample(&body, MODE_TRANSITIONS, &[TO_INACTIVE])?.unwrap_or(0.0);
+        eyre::ensure!(
+            mode == NodeMode::CvvActive && active == Some(1.0) && demotions == 0.0,
+            "node {SLOW_NODE} left CvvActive {at}s into the load (poll {polls}): mode {mode:?}, \
+             tn_node_mode{{mode=\"cvv_active\"}} {active:?}, {demotions} demotions ({}), exec lag \
+             {lag} rounds (max {max_lag})",
+            samples_of(&body, MODE_TRANSITIONS)
+        );
+    }
+
+    let end_rounds = committed_rounds()?;
+    let advanced = start_rounds.iter().zip(&end_rounds).map(|(s, e)| e - s).collect::<Vec<_>>();
+    eyre::ensure!(
+        advanced.iter().all(|rounds| *rounds > window),
+        "a node's committed round advanced no more than the {window}-round activity window in \
+         {SLOW_EXECUTION_WINDOW:?} of load: committed rounds {start_rounds:?} -> {end_rounds:?}"
+    );
+    eyre::ensure!(
+        max_lag > window,
+        "node {SLOW_NODE}'s execution never trailed its commits by more than the {window}-round \
+         activity window (max {max_lag} over {polls} polls), so the run did not test the window"
+    );
+    let behind = node_log_lines(test, SLOW_NODE, 0)?
+        .into_iter()
+        .filter(|line| line.contains(BEHIND_LOG))
+        .collect::<Vec<_>>();
+    eyre::ensure!(
+        behind.is_empty(),
+        "node {SLOW_NODE} logged {} `{BEHIND_LOG}` lines, the first: {:?}",
+        behind.len(),
+        behind.first()
+    );
+
+    stop.store(true, Ordering::Relaxed);
+    let stopped = Instant::now();
+    wait_until_blocking(
+        SLOW_EXECUTION_CATCH_UP,
+        &format!("node {SLOW_NODE}'s execution to return inside the activity window"),
+        || {
+            Ok(scrape_metrics(slow_metrics)
+                .ok()
+                .and_then(|body| labeled_sample(&body, EXEC_LAG_ROUNDS, &[]).ok().flatten())
+                .is_some_and(|lag| lag < window))
+        },
+    )?;
+    let catch_up = stopped.elapsed();
+    let mode = get_node_mode(slow_url)?;
+    eyre::ensure!(
+        mode == NodeMode::CvvActive,
+        "node {SLOW_NODE} is {mode:?} after its execution caught up"
+    );
+    Ok(format!(
+        "max exec lag {max_lag} rounds (window {window}) over {polls} polls, committed rounds \
+         advanced {advanced:?}, caught up {catch_up:?} after the load stopped, {} transfers sent",
+        sent.load(Ordering::Relaxed)
+    ))
+}
+
+/// The sum of every sample of the prometheus series `name` in the scrape `body` whose label set
+/// holds each of `labels` (each a `key="value"` pair), or `None` when no sample matches.
+///
+/// A labelled counter has no sample until it first counts, so `None` reads as "never" for
+/// [`MODE_TRANSITIONS`]. Without `labels` every sample of `name` matches. A sample whose value
+/// does not parse is an error, so a format change cannot pass for an absent series.
+fn labeled_sample(body: &str, name: &str, labels: &[&str]) -> eyre::Result<Option<f64>> {
+    let mut total = None;
+    for line in body.lines().map(str::trim).filter(|line| !line.starts_with('#')) {
+        let Some(rest) = line.strip_prefix(name) else { continue };
+        let (set, value) = match rest.strip_prefix('{') {
+            Some(labelled) => match labelled.rsplit_once('}') {
+                Some(split) => split,
+                None => continue,
+            },
+            None if rest.starts_with(char::is_whitespace) => ("", rest),
+            // a longer series name that merely starts with `name`
+            None => continue,
+        };
+        if !labels.iter().all(|label| set.split(',').any(|pair| pair == *label)) {
+            continue;
+        }
+        let raw = value.split_whitespace().next().unwrap_or_default();
+        let value: f64 =
+            raw.parse().map_err(|e| eyre::eyre!("sample of `{name}` has value {raw:?}: {e}"))?;
+        total = Some(total.unwrap_or(0.0) + value);
+    }
+    Ok(total)
+}
+
+/// Every sample line of the prometheus series `name` in the scrape `body`, joined for an error
+/// message.
+fn samples_of(body: &str, name: &str) -> String {
+    body.lines()
+        .map(str::trim)
+        .filter(|line| {
+            line.starts_with(&format!("{name}{{")) || line.starts_with(&format!("{name} "))
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+/// Labelled samples are summed over the label sets that hold every requested pair; a longer
+/// series name and an unlabelled twin are told apart.
+#[test]
+fn test_labeled_sample_matches_label_subsets() -> eyre::Result<()> {
+    let body = "# TYPE tn_node_mode_transitions_total counter\n\
+                tn_node_mode_transitions_total{to=\"cvv_inactive\",reason=\"outside_gc_window\"} 1\n\
+                tn_node_mode_transitions_total{reason=\"epoch_behind\",to=\"cvv_inactive\"} 2\n\
+                tn_node_mode_transitions_total{to=\"cvv_active\",reason=\"rejoin\"} 1\n\
+                tn_node_mode{mode=\"cvv_active\"} 1\n\
+                tn_primary_consensus_exec_lag_rounds 17\n\
+                tn_primary_consensus_exec_lag_rounds_max 99\n";
+    assert_eq!(labeled_sample(body, MODE_TRANSITIONS, &[TO_INACTIVE])?, Some(3.0));
+    assert_eq!(
+        labeled_sample(body, MODE_TRANSITIONS, &[TO_INACTIVE, r#"reason="outside_gc_window""#])?,
+        Some(1.0)
+    );
+    assert_eq!(labeled_sample(body, MODE_TRANSITIONS, &[r#"reason="restart_gap""#])?, None);
+    assert_eq!(labeled_sample(body, "tn_node_mode", &[r#"mode="cvv_active""#])?, Some(1.0));
+    assert_eq!(labeled_sample(body, EXEC_LAG_ROUNDS, &[])?, Some(17.0));
+    assert!(labeled_sample("tn_primary_consensus_exec_lag_rounds NaNx\n", EXEC_LAG_ROUNDS, &[])
+        .is_err());
+    Ok(())
+}
