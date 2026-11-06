@@ -140,6 +140,22 @@ impl RethEnv {
         transactions: &Vec<Vec<u8>>,
         overlay: &mut OutputTrieOverlay,
     ) -> TnRethResult<ExecutedBlock> {
+        self.build_block_from_batch_payload_timed(payload, transactions, overlay)
+            .map(|(block, _timings)| block)
+    }
+
+    /// [`Self::build_block_from_batch_payload`], also returning the wall time of each build
+    /// phase as [`BlockBuildTimings`].
+    ///
+    /// The block is the one the untimed call builds: the laps only read the clock between
+    /// phases, and the root lap is read off the state-root provider wrapper after `finish`
+    /// returns. The engine sums the laps per consensus output into its `output executed` line.
+    pub fn build_block_from_batch_payload_timed(
+        &self,
+        payload: TNPayload,
+        transactions: &Vec<Vec<u8>>,
+        overlay: &mut OutputTrieOverlay,
+    ) -> TnRethResult<(ExecutedBlock, BlockBuildTimings)> {
         let parent_header = payload.parent_header.clone();
         trace!(target: "engine::dump", ?parent_header, "retrieving state for next block");
         let state_provider =
@@ -160,12 +176,16 @@ impl RethEnv {
         // copy in case of error
         let batch_digest = payload.batch_digest;
 
+        // observability only: each `lap` closes one phase of the returned timings
+        let mut stamp = Instant::now();
+
         let mut builder =
             self.inner.evm_config.builder_for_next_block(&mut db, &parent_header, payload)?;
 
         builder.apply_pre_execution_changes().inspect_err(|err| {
             warn!(target: "engine", %err, "failed to apply pre-execution changes");
         })?;
+        let setup = lap(&mut stamp);
 
         // Phase 1: Recover all transactions (ECDSA ecrecover) in parallel via rayon.
         // Always use par_iter — the slight overhead on small batches is negligible
@@ -208,11 +228,15 @@ impl RethEnv {
         RETH_METRICS
             .unrecoverable_txs_dropped_total
             .increment(u64::try_from(unrecoverable).unwrap_or(u64::MAX));
+        let recover = lap(&mut stamp);
 
         // Phase 2: Execute recovered transactions sequentially.
         for recovered in recovered_txs {
+            // the hash is cached at decode and is not an execution input: reading it first lets
+            // the transaction move into the builder without a per-transaction clone
+            let tx_hash = *recovered.tx_hash();
             // forks are impossible
-            match builder.execute_transaction(recovered.clone()) {
+            match builder.execute_transaction(recovered) {
                 Ok(_gas_used) => (),
                 Err(BlockExecutionError::Validation(BlockValidationError::InvalidTx {
                     error,
@@ -221,7 +245,7 @@ impl RethEnv {
                     // allow transaction errors (ie - duplicates)
                     //
                     // it's possible that another worker's batch included this transaction
-                    debug!(target: "engine", %error, tx_hash = ?recovered.hash(), "skipping invalid transaction");
+                    debug!(target: "engine", %error, ?tx_hash, "skipping invalid transaction");
                     // expected in normal operation - see the reason docs, this is not an alert
                     record_invalid_tx_skipped(InvalidTxSkipReason::classify(error.as_ref()));
                     continue;
@@ -230,16 +254,20 @@ impl RethEnv {
                 Err(err) => return Err(err.into()),
             }
         }
+        let evm = setup.saturating_add(lap(&mut stamp));
 
         // Scope the wrapper so its borrows of the overlay are dropped before the
         // overlay is extended below (`Arc::make_mut` must not see a live borrow).
-        let BlockBuilderOutcome { execution_result, block, hashed_state, trie_updates } = {
+        // `finish` runs the state root through the wrapper, which times it; the root lap is
+        // read off the wrapper before it drops and taken out of the finish lap below.
+        let (BlockBuilderOutcome { execution_result, block, hashed_state, trie_updates }, root) = {
             let root_provider = OverlayRootStateProvider::new(
                 &state_provider,
                 overlay,
                 &self.inner.blockchain_provider,
             );
-            builder.finish(&root_provider)?
+            let outcome = builder.finish(&root_provider)?;
+            (outcome, root_provider.root_elapsed())
         };
 
         debug!(target: "engine", hash=?block.hash(), "block builder outcome");
@@ -261,8 +289,9 @@ impl RethEnv {
             Arc::new(block_execution_output),
             computed_trie_data,
         );
+        let finish = lap(&mut stamp).saturating_sub(root);
 
-        Ok(res)
+        Ok((res, BlockBuildTimings { recover, evm, root, finish }))
     }
 
     /// Finalize the block (header) executed from consensus output in memory.
@@ -525,6 +554,24 @@ const PERSIST_COMMIT_SECONDS: &str = "tn_reth.persist_commit_seconds";
 const PERSISTED_ACCOUNTS_TOTAL: &str = "tn_reth.persisted_accounts_total";
 /// `tn_reth.persisted_storage_slots_total`: changed storage slots written, summed per block.
 const PERSISTED_STORAGE_SLOTS_TOTAL: &str = "tn_reth.persisted_storage_slots_total";
+
+/// Wall time of the phases of one [`RethEnv::build_block_from_batch_payload_timed`] call.
+///
+/// The four laps are disjoint; opening the parent state provider falls outside all of them.
+/// Observability only: nothing here feeds block contents.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct BlockBuildTimings {
+    /// Parallel signer recovery of the batch's transactions.
+    pub recover: Duration,
+    /// Builder setup, the pre-execution system calls and the sequential transaction loop.
+    pub evm: Duration,
+    /// The layered state root inside `builder.finish`, including the read-only database
+    /// transaction it opens.
+    pub root: Duration,
+    /// The rest of `builder.finish` (closing system calls, bundle merge, hashed post-state and
+    /// block assembly), plus the bundle take, the delta sorts and the overlay extend.
+    pub finish: Duration,
+}
 
 /// Wall time of each phase of one successful [`RethEnv::persist_executed_output`] call.
 #[derive(Debug, Clone, Copy)]

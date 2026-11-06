@@ -56,6 +56,23 @@ pub(crate) struct EngineMetrics {
     /// Wall-clock milliseconds the engine spent running execution tasks. The busy fraction of
     /// the engine is `rate(tn_engine_busy_milliseconds_total[1m]) / 1000`.
     pub(crate) busy_milliseconds_total: Counter,
+    // bench5 exec-split
+    /// Signer recovery time of one consensus output, summed over its blocks. With the evm,
+    /// root and finish histograms it splits the output's execute time; unlike
+    /// `execution_duration_seconds` (the whole task) these four time block building only.
+    pub(crate) recover_seconds: Histogram,
+    /// Builder setup, pre-execution system calls and transaction loop of one consensus output,
+    /// summed over its blocks.
+    pub(crate) evm_seconds: Histogram,
+    /// State-root time of one consensus output, summed over its blocks.
+    pub(crate) root_seconds: Histogram,
+    /// The rest of block finishing for one consensus output (closing system calls, bundle merge,
+    /// hashed post-state, assembly, delta sorts, overlay extend), summed over its blocks.
+    pub(crate) finish_seconds: Histogram,
+    /// Transactions handed to the block builder by fully executed consensus outputs, counted
+    /// before unrecoverable or invalid transactions are dropped (the per-transaction cost
+    /// denominator).
+    pub(crate) executed_transactions_total: Counter,
 }
 
 #[cfg(test)]
@@ -85,6 +102,11 @@ mod tests {
             metrics.queue_wait_seconds.record(0.25);
             metrics.persist_duration_seconds.record(0.5);
             metrics.busy_milliseconds_total.increment(750);
+            metrics.recover_seconds.record(0.01);
+            metrics.evm_seconds.record(0.02);
+            metrics.root_seconds.record(0.03);
+            metrics.finish_seconds.record(0.04);
+            metrics.executed_transactions_total.increment(12_500);
         });
 
         let snapshot = snapshotter.snapshot().into_vec();
@@ -118,5 +140,15 @@ mod tests {
         assert!(matches!(value, DebugValue::Histogram(h) if h.len() == 1 && h[0].0 == 0.5));
         let (_, _, _, value) = find("tn_engine.busy_milliseconds_total");
         assert!(matches!(value, DebugValue::Counter(750)));
+        let (_, _, _, value) = find("tn_engine.recover_seconds");
+        assert!(matches!(value, DebugValue::Histogram(h) if h.len() == 1 && h[0].0 == 0.01));
+        let (_, _, _, value) = find("tn_engine.evm_seconds");
+        assert!(matches!(value, DebugValue::Histogram(h) if h.len() == 1 && h[0].0 == 0.02));
+        let (_, _, _, value) = find("tn_engine.root_seconds");
+        assert!(matches!(value, DebugValue::Histogram(h) if h.len() == 1 && h[0].0 == 0.03));
+        let (_, _, _, value) = find("tn_engine.finish_seconds");
+        assert!(matches!(value, DebugValue::Histogram(h) if h.len() == 1 && h[0].0 == 0.04));
+        let (_, _, _, value) = find("tn_engine.executed_transactions_total");
+        assert!(matches!(value, DebugValue::Counter(12_500)));
     }
 }
