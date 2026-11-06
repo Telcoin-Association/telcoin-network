@@ -749,18 +749,26 @@ impl TreeCursor {
                 Some(leaf) => leaf,
                 None => store.page(pgno)?,
             };
-            let Some(prefix) = page::leaf_key(leaf, slot)?.get(..n) else {
-                return Ok(None);
+            // One header parse for the move. An empty prefix reads no cell: the cursor's own
+            // entry was read, or written by the cursor, when the cursor came to it.
+            let view = LeafView::new(leaf)?;
+            let prefix = if n == 0 {
+                &[][..]
+            } else {
+                let Some(prefix) = view.key(slot)?.get(..n) else {
+                    return Ok(None);
+                };
+                prefix
             };
             let to = if forward {
-                (slot + 1 < page::nkeys(leaf)).then_some(slot + 1)
+                (slot + 1 < view.nkeys()).then_some(slot + 1)
             } else {
                 slot.checked_sub(1)
             };
             match to {
                 Some(to) => {
                     c.check_leaf(store, leaf)?;
-                    let (k, v) = R::page_entry(leaf, to)?;
+                    let (k, v) = R::entry(&view, to)?;
                     if !k.starts_with(prefix) {
                         return Ok(None);
                     }
