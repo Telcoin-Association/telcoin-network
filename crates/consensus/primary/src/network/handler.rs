@@ -57,6 +57,16 @@ type AuthEquivocationMap = HashMap<
     TokioMutex<Option<(Epoch, Round, HeaderDigest, Option<PrimaryResponse>)>>,
 >;
 
+/// The committee that may sign a `ConsensusResult` for one epoch, with the bound a certified
+/// epoch record puts on the result's consensus number. See issue #1771.
+struct ConsensusResultCommittee {
+    /// Keys whose signatures count towards the f+1 threshold.
+    keys: BTreeSet<BlsPublicKey>,
+    /// `final_consensus.number` of the certified epoch record for the epoch, when this node holds
+    /// one: no output of that epoch is numbered above it.
+    final_number: Option<u64>,
+}
+
 /// A pending consensus-result signature tally.
 ///
 /// See the `consensus_certs` field, GHSA-2r5c-c4h7-gp5h, and GHSA-pvhw-9pmg-q2hg.
@@ -262,6 +272,32 @@ where
         }
     }
 
+    /// The committee that may sign a `ConsensusResult` for `epoch`, with the bound a certified
+    /// epoch record puts on the result's consensus number (issue #1771).
+    ///
+    /// Signers are accepted from the previous, current or next committee only: the same window the
+    /// gossip layer authorises publishers from (`boundary_publishers` in the node's epoch start,
+    /// issues #898 and #912). An older stored committee is never consulted, because its keys are
+    /// retired and carry no stake, so f+1 of them would cost an attacker nothing. When this node
+    /// holds the certified epoch record for `epoch`, the record's `final_consensus.number` bounds
+    /// the numbers that epoch can have produced. Returns `None` for an epoch outside the window
+    /// and for the previous epoch when its committee is not stored yet.
+    async fn consensus_result_committee(&self, epoch: Epoch) -> Option<ConsensusResultCommittee> {
+        let current = self.consensus_config.committee().epoch();
+        // `epoch` is peer-supplied, so the window test never adds to it; `checked_sub` keeps the
+        // previous-epoch test total at epoch 0.
+        let in_window =
+            epoch == current || epoch == current + 1 || current.checked_sub(1) == Some(epoch);
+        let keys = if in_window { self.get_committee(epoch).await } else { None }?;
+        let final_number = self
+            .consensus_chain
+            .epochs()
+            .get_epoch_by_number(epoch)
+            .await
+            .and_then(|(record, cert)| cert.map(|_| record.final_consensus.number));
+        Some(ConsensusResultCommittee { keys, final_number })
+    }
+
     /// True if a vote for this `(author, epoch, epoch-record)` has already been verified and
     /// forwarded.
     ///
@@ -376,10 +412,14 @@ where
                     // We have already dealt with this hash or we are past this output.
                     return Ok(());
                 }
-                if let Some(committee) = self.get_committee(epoch).await {
-                    // If we do not have the committee to verify this message then just ignore for
-                    // now. Another one will be along soon and we should be
-                    // syncing epochs in the background.
+                if let Some(ConsensusResultCommittee { keys: committee, final_number }) =
+                    self.consensus_result_committee(epoch).await
+                {
+                    // Signers come from the previous, current or next committee only, the same
+                    // window the gossip layer authorises publishers from; an older committee's
+                    // keys are retired and never verify a result (issue #1771). Without the
+                    // committee the message is ignored for now: another one will be along soon
+                    // and epochs sync in the background.
                     ensure!(
                         committee.contains(&key),
                         PrimaryNetworkError::PeerNotInCommittee(Box::new(key))
@@ -391,13 +431,24 @@ where
                         // possible and don't want to do the cert verify if we can
                         // skip it.  So this seems like the place.  And of course
                         // close any windows to double counting a signature.
+                        // A certified epoch record fixes the last consensus number of its epoch,
+                        // so a result numbered past it cannot be real. It is dropped here, before
+                        // the BLS verify (cheap-first), so a bogus number never costs a verify or
+                        // pins the last-published watch (issue #1771).
+                        let past_certified_record =
+                            final_number.is_some_and(|final_number| number > final_number);
+                        if past_certified_record {
+                            debug!(target: "primary", epoch, number, ?final_number, "consensus result numbered past its certified epoch record, ignoring (issue #1771)");
+                        }
                         let guard = self.consensus_certs.lock();
-                        if guard
-                            .get(&consensus_result_hash)
-                            .and_then(|tally| tally.signers.get(&key))
-                            .is_some()
+                        if past_certified_record
+                            || guard
+                                .get(&consensus_result_hash)
+                                .and_then(|tally| tally.signers.get(&key))
+                                .is_some()
                         {
-                            // We have already counted this signature so ignore.
+                            // We have already counted this signature, or the number is impossible
+                            // for its epoch, so ignore.
                             return Ok(());
                         }
                         drop(guard);
@@ -495,10 +546,15 @@ where
                         self.consensus_bus.publish_consensus_num_hash_if_newer(epoch, number, hash);
                         self.consensus_certs.lock().clear();
                     }
-                } else {
-                    // Not sure we can sanity check this epoch.  However if it is bogus the code
-                    // to handle it should be fine, it stops when out of epochs.
+                } else if epoch >= self.consensus_config.committee().epoch().saturating_sub(1) {
+                    // The previous epoch without its record, or an epoch past the next one: this
+                    // node may be missing epoch records, so nudge the sync. If the epoch is bogus
+                    // the code to handle it should be fine, it stops when out of epochs.
                     self.consensus_bus.set_request_missing_epoch_if_newer(epoch);
+                } else {
+                    // An epoch below the committee window: its signers are retired, so the result
+                    // is dropped rather than verified against a stored committee (issue #1771).
+                    debug!(target: "primary", epoch, number, "consensus result for an epoch below the committee window, ignoring (issue #1771)");
                 }
             }
             PrimaryGossip::EpochVote(vote) => {
