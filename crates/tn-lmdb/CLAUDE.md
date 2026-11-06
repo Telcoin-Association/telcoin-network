@@ -4,10 +4,11 @@
 B+trees with the values in their leaves (a value too large for its leaf goes to an overflow run of
 contiguous pages, up to 16 MiB), snapshot readers, a single writer, two meta pages, and a
 persisted free list. There is no log: the meta pages, the gated page reuse and the free list carry
-all crash safety. It depends on nothing in the workspace. Its primitives are copied from
-`tn-storage`, so never add a `tn-storage` dependency, nor a reth one: reth's database API lives
-in the adapter crate `crates/tn-lmdb-reth`, which builds on this crate's public API (its own
-`CLAUDE.md` covers it).
+all crash safety. The design is LMDB-style, but this is a separate engine with its own format, not
+LMDB or a binding to it, and it reads no LMDB or MDBX file (README, intro). It depends on nothing
+in the workspace. Its primitives are copied from `tn-storage`, so never add a `tn-storage`
+dependency, nor a reth one: reth's database API lives in the adapter crate `crates/tn-lmdb-reth`,
+which builds on this crate's public API (its own `CLAUDE.md` covers it).
 
 **Read in this order:**
 1. this file;
@@ -167,9 +168,10 @@ cargo test --release -p tn-lmdb -- --ignored --skip tn_lmdb_sync_and_merge --ski
 A change to the public API or to cursor behaviour also runs `crates/tn-lmdb-reth`'s checks.
 
 **A change to a read, write or commit path runs the regression check** before handing back:
-`etc/tn-lmdb-bench-compare.sh --tier quick --worktree HEAD` (the working tree against HEAD, about
-a minute; `--rows` narrows it, exit 1 is a gated regression; `crates/tn-lmdb-bench/README.md` has
-the rows). A perf change states its rows' ratios from it, and from `--tier default` before a commit.
+`etc/tn-lmdb-bench-compare.sh --tier quick --worktree HEAD` (the working tree against HEAD, four
+rounds, about 2 minutes; `--rows` narrows it, exit 1 is a gated regression;
+`crates/tn-lmdb-bench/README.md` has the rows). A perf change states its rows' ratios from it, and
+from `--tier default` before a commit.
 
 The benchmark runs on demand:
 `cargo test --release -p tn-lmdb tn_lmdb_sync_and_merge -- --ignored --nocapture --test-threads 1`.

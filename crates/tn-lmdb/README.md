@@ -2219,7 +2219,8 @@ same runs stayed within a few percent of merging off, and the other rows were un
 **Regression check:** [`tn-lmdb-bench`](../tn-lmdb-bench/README.md) runs generic and reth-shaped
 workloads through the public API, and `etc/tn-lmdb-bench-compare.sh [base] [head]` builds it
 against two revisions of this crate and compares them row by row (A B B A), with an exit code for
-CI. Run it on any change to a read, write or commit path: `--tier quick` takes about a minute.
+CI. Run it on any change to a read, write or commit path: `--tier quick` (four rounds) takes
+about 2 minutes.
 
 Comparison benchmarks against MDBX live in the reth adapter crate:
 [`tn-lmdb-reth/engine-bench.md`](../tn-lmdb-reth/engine-bench.md) runs this engine through its own
