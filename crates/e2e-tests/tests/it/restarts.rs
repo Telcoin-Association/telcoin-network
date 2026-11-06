@@ -1819,11 +1819,18 @@ fn spawn_load(
 }
 
 /// A validator restarted far behind while transactions keep flowing must catch up and rejoin
-/// consensus before the load stops (issue #1513).
+/// consensus before the load stops (issue #1513), once and for good (issue #1518).
 ///
 /// Before the fix a catching-up node rejoined only when the output it had just handled was the
 /// newest known header. A node that must execute every output does not reach that point while the
 /// committee keeps committing, so it stayed inactive until the load dropped.
+///
+/// After the rejoin the node must hold it under the same load ([`check_rejoin_held`]): one rejoin,
+/// still `CvvActive` past the rejoin grace, no demotion after the promotion, its own headers
+/// certified, no certificate fetch failing on missing parents and no stale header re-proposed. On
+/// the bench a promoted node whose peers had pruned the rounds it rebuilt from kept failing those
+/// fetches, never committed and was demoted again 41 rounds later; at this test's `gc_depth` the
+/// peers keep more rounds than the node needs, so that failure needs a deeper `gc_depth` to show.
 #[test]
 #[ignore = "should not run with a default cargo test, run restart tests as seperate step"]
 fn test_restarts_lagged_under_load() -> eyre::Result<()> {
@@ -1862,7 +1869,7 @@ fn test_restarts_lagged_under_load() -> eyre::Result<()> {
     let sent = Arc::new(AtomicU64::new(0));
     let load = spawn_load(client_urls[0].clone(), Arc::clone(&stop), Arc::clone(&sent));
 
-    let mut rejoin = || -> eyre::Result<()> {
+    let mut rejoin = || -> eyre::Result<String> {
         network_advancing(&client_urls)?;
         wait_until_blocking(Duration::from_secs(30), "load transfers accepted", || {
             Ok(sent.load(Ordering::Relaxed) > 0)
@@ -1900,15 +1907,132 @@ fn test_restarts_lagged_under_load() -> eyre::Result<()> {
             !load.is_finished() && sent.load(Ordering::Relaxed) > sent_at_restart,
             "the load stopped before the lagged validator rejoined"
         );
-        Ok(())
+        check_rejoin_held(&client_urls[2], &metrics_addr, test, 1)
     };
     let rejoined = rejoin();
     stop.store(true, Ordering::Relaxed);
     let joined = load.join().map_err(|_| eyre::eyre!("load thread panicked"));
     guard.kill_all();
-    rejoined
-        .wrap_err(format!("lagged rejoin under load failed, check logs in test_logs/{test}/"))
-        .and(joined)
+    let evidence = rejoined
+        .wrap_err(format!("lagged rejoin under load failed, check logs in test_logs/{test}/"))?;
+    eprintln!("{test}: {evidence}");
+    joined
+}
+
+/// How long [`check_rejoin_held`] waits after the rejoin before it checks that the rejoin held:
+/// past the rejoin grace (`REJOIN_DEMOTION_GRACE`), inside which a promoted node is not demoted
+/// for trailing the activity window.
+const REJOIN_HOLD: Duration =
+    tn_types::REJOIN_DEMOTION_GRACE.saturating_add(Duration::from_secs(5));
+
+/// The line the executor's subscriber logs when it promotes a catching-up node.
+const REJOIN_LOG: &str = "attempting to rejoin consensus";
+
+/// The line a vote aggregator logs when one of this node's own headers gathers a quorum of votes.
+const OWN_CERTIFICATE_LOG: &str = "quorum reached";
+
+/// The line the certificate fetcher logs when a fetched certificate cannot be accepted.
+const FETCH_FAILED_LOG: &str = "Fetch task failed";
+
+/// The line the proposer logs when it sends a stored header again.
+const REPROPOSE_LOG: &str = "reproposing header";
+
+/// The line state sync logs when it seeds the consensus rounds of a promoted node.
+const PRIMED_LOG: &str = "primed consensus rounds";
+
+/// Check that the lagged validator at `node` (metrics at `metrics_addr`, run `run` of `test`'s
+/// node 2) holds its rejoin, [`REJOIN_HOLD`] after it is first seen back in `CvvActive`.
+///
+/// The node must still be `CvvActive`, its process must have counted exactly one rejoin
+/// (`tn_node_mode_transitions_total{to="cvv_active",reason="rejoin"}`) and no demotion since the
+/// rejoin was seen. The demotion that sent the restarted node to catch-up is counted before the
+/// rejoin and is expected. After the last [`REJOIN_LOG`] line its log must show at least one own
+/// header certified ([`OWN_CERTIFICATE_LOG`]), no [`FETCH_FAILED_LOG`] for missing parents and no
+/// [`REPROPOSE_LOG`] of a header more than [`RESTART_TEST_GC_DEPTH`] rounds below the newest
+/// consensus header. The size of the restored DAG, the rejoin-grace holds and the seeded rounds are
+/// recorded without an expectation: the DAG of a promoted node refills from its peers.
+fn check_rejoin_held(node: &str, metrics_addr: &str, test: &str, run: u32) -> eyre::Result<String> {
+    let at_rejoin = scrape_metrics(metrics_addr)?;
+    let demotions_at_rejoin =
+        labeled_sample(&at_rejoin, MODE_TRANSITIONS, &[TO_INACTIVE])?.unwrap_or(0.0);
+    std::thread::sleep(REJOIN_HOLD);
+
+    let mode = get_node_mode(node)?;
+    let body = scrape_metrics(metrics_addr)?;
+    let rejoins =
+        labeled_sample(&body, MODE_TRANSITIONS, &[r#"to="cvv_active""#, r#"reason="rejoin""#])?
+            .unwrap_or(0.0);
+    let demotions = labeled_sample(&body, MODE_TRANSITIONS, &[TO_INACTIVE])?.unwrap_or(0.0);
+    let transitions = samples_of(&body, MODE_TRANSITIONS);
+    eyre::ensure!(
+        mode == NodeMode::CvvActive && rejoins == 1.0 && demotions == demotions_at_rejoin,
+        "the rejoin did not hold {REJOIN_HOLD:?} later: mode {mode:?}, {rejoins} rejoins, \
+         demotions {demotions_at_rejoin} at the rejoin and {demotions} now ({transitions})"
+    );
+    let grace_holds =
+        labeled_sample(&body, "tn_primary_rejoin_grace_holds_total", &[])?.unwrap_or(0.0);
+
+    let lines = node_log_lines(test, 2, run)?;
+    let promoted = lines
+        .iter()
+        .rposition(|line| line.contains(REJOIN_LOG))
+        .ok_or_else(|| eyre::eyre!("node 2 run {run} never logged `{REJOIN_LOG}`"))?;
+    let after = &lines[promoted + 1..];
+    let restored_certs = after.iter().find_map(|line| {
+        line.split(DAG_RESTORED_LOG).nth(1)?.split_whitespace().next()?.parse::<u64>().ok()
+    });
+    let restored_certs =
+        restored_certs.ok_or_else(|| eyre::eyre!("no `{DAG_RESTORED_LOG}` after the promotion"))?;
+    let own_certificates = after.iter().filter(|line| line.contains(OWN_CERTIFICATE_LOG)).count();
+    let fetch_failures = after
+        .iter()
+        .filter(|line| line.contains(FETCH_FAILED_LOG) && line.contains("missing parents"))
+        .collect::<Vec<_>>();
+    let stale_reproposals = after
+        .iter()
+        .filter(|line| line.contains(REPROPOSE_LOG))
+        .filter(|line| {
+            log_field(line, "header_round")
+                .zip(log_field(line, "newest_round"))
+                .is_some_and(|(header, newest)| header + u64::from(RESTART_TEST_GC_DEPTH) < newest)
+        })
+        .collect::<Vec<_>>();
+    eyre::ensure!(
+        own_certificates > 0 && fetch_failures.is_empty() && stale_reproposals.is_empty(),
+        "after the promotion node 2 certified {own_certificates} own headers, logged {} fetch \
+         failures for missing parents (first {:?}) and {} re-proposals more than \
+         {RESTART_TEST_GC_DEPTH} rounds below the newest header (first {:?})",
+        fetch_failures.len(),
+        fetch_failures.first(),
+        stale_reproposals.len(),
+        stale_reproposals.first()
+    );
+    let primed = after
+        .iter()
+        .find(|line| line.contains(PRIMED_LOG))
+        .map(|line| (log_field(line, "primary_round"), log_field(line, "newest_round")));
+    Ok(format!(
+        "one rejoin held {REJOIN_HOLD:?} ({transitions}), dag restored with {restored_certs} \
+         certs, {own_certificates} own certificates after the promotion, {grace_holds} rejoin \
+         grace holds, primed (primary_round, newest_round) {primed:?}"
+    ))
+}
+
+/// The number in the `name=value` field of a plain node log line.
+fn log_field(line: &str, name: &str) -> Option<u64> {
+    line.split_whitespace()
+        .find_map(|token| token.strip_prefix(name)?.strip_prefix('=')?.parse().ok())
+}
+
+/// A field is read only as a whole `name=` token, so `round` does not read `header_round`.
+#[test]
+fn test_log_field_reads_whole_fields() {
+    let line = "WARN primary::proposer: reproposing header current_round=752 header_round=5 \
+                newest_round=750 header=Header { round: 5 }";
+    assert_eq!(log_field(line, "header_round"), Some(5));
+    assert_eq!(log_field(line, "newest_round"), Some(750));
+    assert_eq!(log_field(line, "round"), None);
+    assert_eq!(log_field(line, "committed_round"), None);
 }
 
 /// Node whose execution [`test_slow_execution_stays_active`] slows.
