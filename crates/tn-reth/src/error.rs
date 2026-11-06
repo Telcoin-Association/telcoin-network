@@ -1,6 +1,6 @@
 //! Error type to wrap various Reth errors.
 
-use alloy::primitives::Bytes;
+use alloy::primitives::{Bytes, B256};
 use reth::rpc::{builder::error::RpcError, server_types::eth::EthApiError};
 use reth_errors::BlockExecutionError;
 use reth_provider::ProviderError;
@@ -123,6 +123,19 @@ pub enum TnRethError {
         http: u16,
         /// The operator-configured ws base port.
         ws: u16,
+    },
+    /// A consensus output's build scope was handed a payload on a parent other than the block it
+    /// was last advanced to.
+    ///
+    /// The scope's read cache and trie overlay describe the post-state of exactly that block;
+    /// building on any other parent from them would serve stale reads and roots and fork the
+    /// node, so the build fails closed instead.
+    #[error("output build scope is at block {expected}, but the payload's parent is {got}")]
+    ScopeParentMismatch {
+        /// The block the scope was last advanced to.
+        expected: B256,
+        /// The payload's parent block.
+        got: B256,
     },
 }
 
