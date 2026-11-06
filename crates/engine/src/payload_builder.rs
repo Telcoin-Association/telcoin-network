@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 use tn_reth::{
     error::TnRethError,
     payload::{BuildArguments, TNPayload},
-    BlockBuildTimings, CanonicalInMemoryState, ExecutedBlock, NewCanonicalChain, OutputTrieOverlay,
+    BlockBuildTimings, CanonicalInMemoryState, ExecutedBlock, NewCanonicalChain, OutputBuildScope,
     ProviderError, RethEnv,
 };
 use tn_types::{
@@ -170,13 +170,15 @@ pub(crate) fn execute_consensus_output_with_signers(
     // If a later block fails, the earlier blocks' advance is rolled back to this header so no
     // phantom canonical head survives (see `rollback_in_memory_output`).
     let anchor_header = canonical_header.clone();
-    // ONE output-scoped trie overlay, anchored at the pre-output database tip. Each built
-    // block's sorted deltas are merged into it in place, so later blocks' state roots layer
-    // the accumulated deltas over the database instead of re-merging every unpersisted
-    // ancestor per block through reth's memory-overlay provider (#1301). Dropped with this
-    // scope: persistence uses the per-block deltas, never this accumulation, and an error
-    // path discards it together with the rolled-back in-memory advance.
-    let mut output_overlay = OutputTrieOverlay::new();
+    // ONE build scope for the whole output, anchored at the pre-output database tip: its trie
+    // overlay takes each built block's sorted deltas in place, so later blocks' state roots
+    // layer the accumulated deltas over the database instead of re-merging every unpersisted
+    // ancestor per block through reth's memory-overlay provider (#1301), and its read cache
+    // keeps the parent-state reads of earlier blocks, advanced past each block, so an account
+    // or slot read by several blocks of the output is loaded once. Dropped with this function:
+    // persistence uses the per-block deltas, never this accumulation, and every error path
+    // returns, discarding it together with the rolled-back in-memory advance.
+    let mut build_scope = OutputBuildScope::new();
 
     if batches.is_empty() {
         if !output.close_epoch() {
@@ -249,7 +251,7 @@ pub(crate) fn execute_consensus_output_with_signers(
             &mut executed_blocks,
             &reth_env,
             &canonical_in_memory_state,
-            &mut output_overlay,
+            &mut build_scope,
             &mut timings,
             output.number(),
         );
@@ -352,7 +354,7 @@ pub(crate) fn execute_consensus_output_with_signers(
                 &mut executed_blocks,
                 &reth_env,
                 &canonical_in_memory_state,
-                &mut output_overlay,
+                &mut build_scope,
                 &mut timings,
                 output.number(),
             );
@@ -492,12 +494,13 @@ impl OutputTimings {
 
 /// Execute the transaction and update canon chain in-memory.
 ///
-/// `output_overlay` is the consensus output's shared accumulated trie overlay: the build
-/// computes this block's state root layered over it and then extends it with the block's
-/// sorted deltas for the NEXT block of the output (#1301). `recovered` is the batch's entry of
-/// the output's recovered signers. The build's phase laps are added to `timings`.
-/// `consensus_number` only labels the `next block executed` line, together with the payload's batch
-/// index and digest, so each block joins back to its consensus output and batch.
+/// `build_scope` is the consensus output's shared [`OutputBuildScope`]: the build computes this
+/// block's state root layered over its trie overlay (#1301) and reads the parent state through
+/// its read cache, then advances both to this block's post-state for the NEXT block of the
+/// output. `recovered` is the batch's entry of the output's recovered signers. The build's phase
+/// laps are added to `timings`. `consensus_number` only labels the `next block executed` line,
+/// together with the payload's batch index and digest, so each block joins back to its consensus
+/// output and batch.
 // the per-output accumulators and the log context are separate on purpose; bundling them into a
 // struct would only rename the same eight values
 #[allow(clippy::too_many_arguments)]
@@ -507,7 +510,7 @@ fn execute_payload(
     executed_blocks: &mut Vec<ExecutedBlock>,
     reth_env: &RethEnv,
     canonical_in_memory_state: &CanonicalInMemoryState,
-    output_overlay: &mut OutputTrieOverlay,
+    build_scope: &mut OutputBuildScope,
     timings: &mut OutputTimings,
     consensus_number: u64,
 ) -> EngineResult<SealedHeader> {
@@ -516,7 +519,7 @@ fn execute_payload(
     let batch_digest = payload.batch_digest;
     // execute
     let (next_canonical_block, block_timings) =
-        reth_env.build_block_from_recovered_payload(payload, recovered, output_overlay)?;
+        reth_env.build_block_from_recovered_payload(payload, recovered, build_scope)?;
     timings.add(&block_timings);
     trace!(target: "engine::dump", ?next_canonical_block, "block executed");
 
@@ -535,10 +538,11 @@ fn execute_payload(
     crate::metrics::ENGINE_METRICS.block_gas_used.record(canonical_header.gas_used as f64);
     // Eagerly advance the shared in-memory state. This is load-bearing within a multi-block
     // output: the next block in the loop resolves its parent state through this advance
-    // (account/storage/bytecode reads via reth's memory overlay; the state root itself runs
-    // over `output_overlay` instead, see #1301). The advance is speculative until the whole
-    // output commits durably after the loop; if a later block fails to build,
-    // `execute_consensus_output` compensates it via `rollback_in_memory_output`.
+    // (account/storage/bytecode reads that miss the scope's read cache go to reth's memory
+    // overlay; the state root itself runs over the scope's trie overlay instead, see #1301). The
+    // advance is speculative until the whole output commits durably after the loop; if a later
+    // block fails to build, `execute_consensus_output` compensates it via
+    // `rollback_in_memory_output`.
     canonical_in_memory_state.set_pending_block(next_canonical_block.clone());
     canonical_in_memory_state
         .update_chain(NewCanonicalChain::Commit { new: vec![next_canonical_block.clone()] });

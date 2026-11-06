@@ -19,7 +19,9 @@
 //! database transaction with the current block's deltas layered over the overlay.
 //! This bypasses (does not fix upstream) reth's per-block re-merge/copy/re-sort of
 //! every in-memory ancestor - see `build_block_from_batch_payload` for the honest
-//! cost bound. All other state reads still resolve through reth's memory overlay.
+//! cost bound. All other state reads still resolve through reth's memory overlay,
+//! behind a read cache that the engine keeps for the whole output (see
+//! [`OutputBuildScope`]).
 //!
 //! # Deliberate transaction drops (fork safety)
 //!
@@ -76,7 +78,12 @@ use reth_provider::{
     BlockExecutionOutput, CanonChainTracker as _, ChainStateBlockWriter as _, DBProvider as _,
     DatabaseProviderFactory as _, StateProviderFactory as _,
 };
-use reth_revm::{cached::CachedReads, database::StateProviderDatabase, State};
+use reth_revm::{
+    cached::{CachedAccount, CachedReads},
+    database::StateProviderDatabase,
+    db::BundleState,
+    State,
+};
 use reth_rpc_eth_types::utils::recover_raw_transaction as reth_recover_raw_transaction;
 use tn_types::{
     deconstruct_nonce, ConsensusNumHash, ConsensusOutput, EngineUpdate, Recovered, Round,
@@ -155,8 +162,10 @@ impl RethEnv {
     /// The block is the one the untimed call builds: the laps only read the clock between
     /// phases, and the root lap is read off the state-root provider wrapper after `finish`
     /// returns. The signers are recovered first, exactly as [`Self::recover_output_signers`]
-    /// recovers one batch, and the recovered transactions go through
-    /// [`Self::build_block_from_recovered_payload`], so both entry points share one build.
+    /// recovers one batch, and the recovered transactions go through the build that
+    /// [`Self::build_block_from_recovered_payload`] runs, so both entry points share one build.
+    /// Every call starts from an empty read cache; only the caller's `overlay` carries over from
+    /// one block of an output to the next.
     pub fn build_block_from_batch_payload_timed(
         &self,
         payload: TNPayload,
@@ -169,8 +178,10 @@ impl RethEnv {
         record_unrecoverable(transactions.len(), recovered.len());
         let recover = stamp.elapsed();
 
+        // a fresh read cache per call: these callers build one block at a time, often persisting
+        // between builds, so no read is kept past the block it was made for
         let (block, timings) =
-            self.build_block_from_recovered_payload(payload, recovered, overlay)?;
+            self.build_recovered_block(payload, recovered, overlay, &mut CachedReads::default())?;
         Ok((block, BlockBuildTimings { recover, ..timings }))
     }
 
@@ -227,22 +238,50 @@ impl RethEnv {
     /// [`Self::build_block_from_batch_payload`] runs after its own recovery (see its docs for
     /// the drop semantics and the state-root path), so the same recovered transactions build
     /// the same block. The returned timings' `recover` lap is zero: no recovery runs here.
+    ///
+    /// `scope` is the consensus output's [`OutputBuildScope`]: the block's state root layers over
+    /// its trie overlay, and its account, storage, code and block-hash reads go through its read
+    /// cache before the parent state provider. A successful build leaves both describing the
+    /// returned block's post-state, ready for the next block of the output. After an error the
+    /// scope no longer matches any block the caller will build next: drop it.
+    ///
+    /// # Errors
+    ///
+    /// [`TnRethError::ScopeParentMismatch`] when the scope was advanced before and the payload's
+    /// parent is not the block it was advanced to; nothing is built or advanced. Otherwise the
+    /// errors of the build itself.
     pub fn build_block_from_recovered_payload(
         &self,
         payload: TNPayload,
         recovered: Vec<Recovered<TransactionSigned>>,
+        scope: &mut OutputBuildScope,
+    ) -> TnRethResult<(ExecutedBlock, BlockBuildTimings)> {
+        scope.check_parent(payload.parent_header.hash())?;
+        let OutputBuildScope { overlay, reads, tip } = scope;
+        let (block, timings) = self.build_recovered_block(payload, recovered, overlay, reads)?;
+        *tip = Some(block.recovered_block.hash());
+        Ok((block, timings))
+    }
+
+    /// The block build behind every entry point: execute `recovered` on the parent state read
+    /// through `reads`, root it over `overlay`, then advance `overlay` and `reads` to the built
+    /// block's post-state.
+    ///
+    /// Neither is advanced on an error: every fallible step runs before the bundle is taken.
+    fn build_recovered_block(
+        &self,
+        payload: TNPayload,
+        recovered: Vec<Recovered<TransactionSigned>>,
         overlay: &mut OutputTrieOverlay,
+        reads: &mut CachedReads,
     ) -> TnRethResult<(ExecutedBlock, BlockBuildTimings)> {
         let parent_header = payload.parent_header.clone();
         trace!(target: "engine::dump", ?parent_header, "retrieving state for next block");
         let state_provider =
             self.inner.blockchain_provider.state_by_block_hash(parent_header.hash())?;
         let state = StateProviderDatabase::new(&state_provider);
-        let mut cached_reads = CachedReads::default();
-        let mut db = State::builder()
-            .with_database(cached_reads.as_db_mut(state))
-            .with_bundle_update()
-            .build();
+        let mut db =
+            State::builder().with_database(reads.as_db_mut(state)).with_bundle_update().build();
 
         debug!(
             target: "engine",
@@ -302,8 +341,14 @@ impl RethEnv {
         };
 
         debug!(target: "engine", hash=?block.hash(), "block builder outcome");
+        // `finish` merged every transition of the block, the closing system calls included, so
+        // the bundle is the block's whole state change; the build cannot fail past this point
+        let bundle = db.take_bundle();
+        // end the state's borrow of the read cache before the cache is advanced
+        drop(db);
+        advance_cached_reads(reads, &bundle);
         let block_execution_output =
-            BlockExecutionOutput { result: execution_result, state: db.take_bundle() };
+            BlockExecutionOutput { result: execution_result, state: bundle };
         let (sorted_hashed_state, sorted_trie_updates) =
             rayon::join(|| hashed_state.into_sorted(), || trie_updates.into_sorted());
         let computed_trie_data = ComputedTrieData::without_trie_input(
@@ -586,6 +631,77 @@ const PERSISTED_ACCOUNTS_TOTAL: &str = "tn_reth.persisted_accounts_total";
 /// `tn_reth.persisted_storage_slots_total`: changed storage slots written, summed per block.
 const PERSISTED_STORAGE_SLOTS_TOTAL: &str = "tn_reth.persisted_storage_slots_total";
 
+/// The build state one consensus output's blocks share: the trie overlay their state roots layer
+/// over and the cache their state reads go through.
+///
+/// The engine creates one scope per consensus output, before its first block, and passes it to
+/// [`RethEnv::build_block_from_recovered_payload`] for each block of the output in order. A
+/// successful build advances both halves to the built block's post-state; the scope is dropped
+/// with the output.
+///
+/// # Invariant
+///
+/// The read cache is a subset of the true pre-block state for the next block of this output:
+/// every cached account, storage slot, bytecode and block hash equals what that block's parent
+/// state provider returns for it, and anything absent is read from the provider. A hit therefore
+/// returns exactly what a fresh read would, and every block is byte-identical to the block an
+/// empty cache builds; the differential tests in `tests/it/trie_overlay.rs` and
+/// `tests/it/cached_reads_props.rs` pin that. Each build advances the cache from the block's
+/// bundle state, the change set the next block's provider resolves the parent from (see
+/// `advance_cached_reads`), so senders, recipients and contracts read by several blocks of one
+/// output are loaded from the database once.
+///
+/// One revm `State` kept across the blocks would also save the reads but breaks the roots: an
+/// account's `DestroyedChanged` status stays sticky across blocks, and reth rebuilds such an
+/// account's storage as wiped, so an account created and self-destructed in one block, recreated
+/// with a storage write in the next and written again in a third would lose the second block's
+/// slot from the state root.
+///
+/// # Errors
+///
+/// A failed build advances neither half, so the scope still describes the failed block's
+/// parent, which the caller will not build on again. Drop it: the engine aborts the whole output
+/// on any build error.
+///
+/// The scope remembers the block it was last advanced to and refuses a payload on any other
+/// parent ([`TnRethError::ScopeParentMismatch`]), so a scope kept past its output or reused on
+/// another branch fails closed instead of serving reads of a different state.
+#[derive(Debug, Default)]
+pub struct OutputBuildScope {
+    /// The output's accumulated trie overlay (see [`OutputTrieOverlay`]).
+    overlay: OutputTrieOverlay,
+    /// Reads of the next block's parent state, advanced past every built block.
+    reads: CachedReads,
+    /// The hash of the block the scope was last advanced to: the only parent it builds on.
+    /// `None` until the first block of the output is built.
+    tip: Option<B256>,
+}
+
+impl OutputBuildScope {
+    /// An empty scope for the first block of an output: no overlay (the database holds the
+    /// parent state) and no cached reads.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The read cache the next block of the output starts from (tests inspect it).
+    #[cfg(any(feature = "test-utils", test))]
+    pub fn reads(&self) -> &CachedReads {
+        &self.reads
+    }
+
+    /// Fail closed unless `parent` is the block the scope was last advanced to (any parent
+    /// passes before the first build).
+    fn check_parent(&self, parent: B256) -> TnRethResult<()> {
+        match self.tip {
+            Some(expected) if expected != parent => {
+                Err(TnRethError::ScopeParentMismatch { expected, got: parent })
+            }
+            _ => Ok(()),
+        }
+    }
+}
+
 /// Wall time of the phases of one [`RethEnv::build_block_from_batch_payload_timed`] call.
 ///
 /// The four laps are disjoint; opening the parent state provider falls outside all of them.
@@ -601,7 +717,8 @@ pub struct BlockBuildTimings {
     /// transaction it opens.
     pub root: Duration,
     /// The rest of `builder.finish` (closing system calls, bundle merge, hashed post-state and
-    /// block assembly), plus the bundle take, the delta sorts and the overlay extend.
+    /// block assembly), plus the bundle take, the read-cache advance, the delta sorts and the
+    /// overlay extend.
     pub finish: Duration,
 }
 
@@ -733,6 +850,53 @@ fn record_unrecoverable(handed: usize, recovered: usize) {
         .increment(u64::try_from(handed.saturating_sub(recovered)).unwrap_or(u64::MAX));
 }
 
+/// Advance an output's read cache from a built block's parent state to its post-state.
+///
+/// `bundle` is the block's whole state change. The next block's parent state provider answers
+/// every address in it from it (`BundleAccount::account_info`, `BundleAccount::storage_slot`)
+/// and every other address from the state below, which the block left unchanged, so cache
+/// entries of addresses outside the bundle stay valid. Each address in the bundle gets the
+/// provider's answer:
+///
+/// - destroyed in the block (`Destroyed`, `DestroyedChanged` when recreated after the destruct,
+///   `DestroyedAgain`) or left without info (deleted, or cleared as empty under EIP-161): the entry
+///   is evicted with its storage, and the next read reaches the provider, which applies the wipe;
+/// - otherwise the new info without its code and access-list id (a provider read carries neither;
+///   revm loads code by hash) and each written slot's present value. A storage-known status (an
+///   account the block created) also drops the account's other cached slots, which the provider
+///   answers as zero.
+///
+/// Cached bytecode is keyed by its own hash, and cached block hashes belong to blocks below the
+/// one that read them (revm asks the database only for the 256 before the current block), so
+/// both name the same values for every later block of the output: `contracts` and
+/// `block_hashes` are kept as they are.
+fn advance_cached_reads(reads: &mut CachedReads, bundle: &BundleState) {
+    // each bundle account updates only its own entry, so the map's iteration order cannot change
+    // the result
+    for (address, account) in &bundle.state {
+        let info = match &account.info {
+            Some(info) if !account.status.was_destroyed() => info,
+            _ => {
+                reads.accounts.remove(address);
+                continue;
+            }
+        };
+        let mut info = info.copy_without_code();
+        info.account_id = None;
+        let cached = reads
+            .accounts
+            .entry(*address)
+            .or_insert_with(|| CachedAccount { info: None, storage: Default::default() });
+        cached.info = Some(info);
+        if account.status.is_storage_known() {
+            cached.storage.clear();
+        }
+        cached
+            .storage
+            .extend(account.storage.iter().map(|(slot, value)| (*slot, value.present_value)));
+    }
+}
+
 /// Return the time since `stamp` and move `stamp` to now, so consecutive calls time
 /// consecutive phases.
 fn lap(stamp: &mut Instant) -> Duration {
@@ -752,7 +916,11 @@ mod tests {
     use super::*;
     use alloy::primitives::{Address, U256};
     use metrics_util::debugging::{DebugValue, DebuggingRecorder};
-    use reth_revm::{db::BundleState, state::AccountInfo};
+    use reth_revm::{
+        db::{states::StorageSlot, AccountStatus, BundleAccount, BundleState},
+        primitives::KECCAK_EMPTY,
+        state::{AccountInfo, Bytecode},
+    };
 
     /// One block's account reverts, in the shape `BundleState::new` takes.
     type AccountReverts = Vec<(Address, Option<Option<AccountInfo>>, Vec<(U256, U256)>)>;
@@ -823,6 +991,161 @@ mod tests {
         ));
         assert!(matches!(find(PERSISTED_ACCOUNTS_TOTAL), DebugValue::Counter(3)));
         assert!(matches!(find(PERSISTED_STORAGE_SLOTS_TOTAL), DebugValue::Counter(8)));
+    }
+
+    /// Account info carrying code and an access-list id, neither of which a cache entry may keep.
+    fn info_with_code(balance: u64, nonce: u64) -> AccountInfo {
+        let code = Bytecode::new_raw(alloy::primitives::Bytes::from_static(&[0x60, 0x00]));
+        AccountInfo {
+            balance: U256::from(balance),
+            nonce,
+            code_hash: code.hash_slow(),
+            account_id: Some(3),
+            code: Some(code),
+        }
+    }
+
+    /// A cache entry with `info` and the `(slot, value)` pairs of `storage`.
+    fn cached(info: Option<AccountInfo>, storage: &[(u64, u64)]) -> CachedAccount {
+        let storage = storage.iter().map(|(slot, value)| (U256::from(*slot), U256::from(*value)));
+        CachedAccount { info, storage: storage.collect() }
+    }
+
+    /// A bundle account with `info`, `status` and the `(slot, before, after)` writes of `storage`.
+    fn bundled(
+        info: Option<AccountInfo>,
+        storage: &[(u64, u64, u64)],
+        status: AccountStatus,
+    ) -> BundleAccount {
+        let storage = storage.iter().map(|(slot, before, after)| {
+            (U256::from(*slot), StorageSlot::new_changed(U256::from(*before), U256::from(*after)))
+        });
+        BundleAccount::new(None, info, storage.collect(), status)
+    }
+
+    /// The read cache moves to the block's post-state: destroyed (also destroyed-then-changed and
+    /// destroyed again), EIP-161-cleared and info-less accounts are evicted with their storage; a
+    /// changed account takes its new info without code or access-list id and its written slots
+    /// and keeps its other cached slots; a created account keeps only the slots the block
+    /// wrote; an account the cache did not hold is added; untouched accounts, code and block
+    /// hashes stay as they were.
+    #[test]
+    fn test_advance_cached_reads_follows_bundle() {
+        let address = Address::with_last_byte;
+        let (destroyed, destroyed_changed, cleared, absent, destroyed_again) =
+            (address(1), address(2), address(3), address(4), address(9));
+        let (changed, created, uncached, untouched) =
+            (address(5), address(6), address(7), address(8));
+        let old_info =
+            |balance: u64| AccountInfo { balance: U256::from(balance), ..Default::default() };
+
+        let mut reads = CachedReads::default();
+        reads.accounts.insert(destroyed, cached(Some(old_info(1)), &[(1, 5)]));
+        reads.accounts.insert(destroyed_changed, cached(Some(old_info(2)), &[(1, 5)]));
+        reads.accounts.insert(cleared, cached(Some(AccountInfo::default()), &[]));
+        reads.accounts.insert(absent, cached(None, &[]));
+        reads.accounts.insert(changed, cached(Some(old_info(10)), &[(1, 5), (3, 8)]));
+        reads.accounts.insert(destroyed_again, cached(Some(old_info(3)), &[(1, 5)]));
+        // stale non-zero slots under an absent account (orphaned storage): the block creates the
+        // account, after which the provider answers zero for every slot the block did not write
+        reads.accounts.insert(created, cached(None, &[(4, 7), (9, 3)]));
+        reads.accounts.insert(untouched, cached(Some(old_info(1)), &[(1, 1)]));
+        reads.contracts.insert(B256::with_last_byte(1), Bytecode::default());
+        reads.block_hashes.insert(7, B256::with_last_byte(7));
+        let contracts = reads.contracts.clone();
+        let block_hashes = reads.block_hashes.clone();
+
+        let bundle = BundleState {
+            state: [
+                (destroyed, bundled(None, &[], AccountStatus::Destroyed)),
+                (
+                    destroyed_changed,
+                    bundled(
+                        Some(info_with_code(2, 1)),
+                        &[(2, 0, 7)],
+                        AccountStatus::DestroyedChanged,
+                    ),
+                ),
+                // the transition EIP-161 makes of a touched empty account
+                (cleared, bundled(None, &[], AccountStatus::Destroyed)),
+                (absent, bundled(None, &[], AccountStatus::LoadedNotExisting)),
+                // destroyed, recreated and cleared again within the block
+                (destroyed_again, bundled(None, &[], AccountStatus::DestroyedAgain)),
+                (
+                    changed,
+                    bundled(Some(info_with_code(11, 2)), &[(1, 5, 6)], AccountStatus::Changed),
+                ),
+                (
+                    created,
+                    bundled(
+                        Some(info_with_code(0, 1)),
+                        &[(2, 0, 3)],
+                        AccountStatus::InMemoryChange,
+                    ),
+                ),
+                (
+                    uncached,
+                    bundled(Some(info_with_code(4, 0)), &[(5, 0, 6)], AccountStatus::Changed),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        };
+        advance_cached_reads(&mut reads, &bundle);
+
+        for evicted in [destroyed, destroyed_changed, cleared, absent, destroyed_again] {
+            assert!(!reads.accounts.contains_key(&evicted), "{evicted} must be evicted");
+        }
+        // `AccountInfo`'s `PartialEq` ignores code and access-list id: compare every field
+        let fields = |address: Address| {
+            let account = &reads.accounts[&address];
+            let info = account.info.as_ref().expect("cached info");
+            let mut storage: Vec<(U256, U256)> =
+                account.storage.iter().map(|(slot, value)| (*slot, *value)).collect();
+            storage.sort();
+            (
+                info.balance,
+                info.nonce,
+                info.code_hash,
+                info.code.is_none(),
+                info.account_id,
+                storage,
+            )
+        };
+        let slots = |pairs: &[(u64, u64)]| -> Vec<(U256, U256)> {
+            pairs.iter().map(|(slot, value)| (U256::from(*slot), U256::from(*value))).collect()
+        };
+        let code_hash = info_with_code(0, 0).code_hash;
+        assert_eq!(
+            fields(changed),
+            (U256::from(11), 2, code_hash, true, None, slots(&[(1, 6), (3, 8)]))
+        );
+        assert_eq!(fields(created), (U256::ZERO, 1, code_hash, true, None, slots(&[(2, 3)])));
+        assert_eq!(fields(uncached), (U256::from(4), 0, code_hash, true, None, slots(&[(5, 6)])));
+        assert_eq!(
+            fields(untouched),
+            (U256::from(1), 0, KECCAK_EMPTY, false, None, slots(&[(1, 1)]))
+        );
+        assert_eq!(reads.accounts.len(), 4, "only the changed, created, uncached and untouched");
+        assert_eq!(reads.contracts, contracts, "cached code is kept");
+        assert_eq!(reads.block_hashes, block_hashes, "cached block hashes are kept");
+    }
+
+    /// A scope builds only on the block it was last advanced to; before its first build any
+    /// parent passes.
+    #[test]
+    fn test_scope_builds_only_on_its_tip() {
+        let (first, second) = (B256::with_last_byte(1), B256::with_last_byte(2));
+        let mut scope = OutputBuildScope::new();
+        assert!(scope.check_parent(first).is_ok(), "a fresh scope takes any parent");
+        scope.tip = Some(second);
+        assert!(scope.check_parent(second).is_ok(), "the tip is the next parent");
+        assert!(matches!(
+            scope.check_parent(first),
+            Err(TnRethError::ScopeParentMismatch { expected, got })
+                if expected == second && got == first
+        ));
     }
 
     /// Consecutive laps time consecutive phases and advance the stamp.
