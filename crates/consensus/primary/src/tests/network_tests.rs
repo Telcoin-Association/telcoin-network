@@ -4388,3 +4388,149 @@ async fn behind_line_reports_execution_and_commit_lag() {
         behind[0]
     );
 }
+
+// ---- bench5 f3-rejoin ----
+
+/// The `tn_primary.rejoin_grace_holds_total` holds counted since the previous snapshot (a
+/// snapshot swaps every counter it reads back to zero); zero while unregistered.
+fn rejoin_grace_holds(snapshotter: &metrics_util::debugging::Snapshotter) -> u64 {
+    snapshotter
+        .snapshot()
+        .into_vec()
+        .into_iter()
+        .find_map(|(key, _, _, value)| match value {
+            DebugValue::Counter(count)
+                if key.key().name() == "tn_primary.rejoin_grace_holds_total" =>
+            {
+                Some(count)
+            }
+            _ => None,
+        })
+        .unwrap_or_default()
+}
+
+/// A handler whose committed round (5) is outside the gc window of a round-60 certificate, with
+/// its bus metrics bound to `recorder`.
+async fn create_test_types_outside_gc_window(
+    path: &Path,
+    recorder: &DebuggingRecorder,
+) -> TestTypes {
+    let types = {
+        // the bus registers its metrics with the recorder that is active while it is built
+        let _local_recorder = metrics::set_default_local_recorder(recorder);
+        create_test_types(path).await
+    };
+    let mut recent = RecentBlocks::new(1);
+    recent.push_latest(5, ConsensusNumHash::new(0, ConsensusHeaderDigest::default()), None);
+    types.consensus_bus.recent_blocks().send_replace(recent);
+    types.consensus_bus.committed_round_updates().send_replace(5);
+    types
+}
+
+/// A node promoted back into consensus holds its gc-window demotion for `REJOIN_DEMOTION_GRACE`:
+/// inside the grace a certificate past the window (committed 5 + 40 < 60) is counted but the node
+/// stays active, and once the grace has passed the same certificate demotes it. Every hold is
+/// counted, but the hold line is logged at most once a second and reports the holds since the
+/// previous line.
+#[tokio::test(start_paused = true)]
+async fn rejoin_grace_holds_gc_window_demotion() {
+    let temp_dir = TempDir::new().unwrap();
+    let recorder = DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    let TestTypes { handler, consensus_bus, .. } =
+        create_test_types_outside_gc_window(temp_dir.path(), &recorder).await;
+    consensus_bus
+        .rejoin_state()
+        .send_modify(|state| state.record_promotion(0, tokio::time::Instant::now()));
+    let lines = Arc::new(Mutex::new(Vec::new()));
+    let _guard = tracing::subscriber::set_default(PrimaryWarnLines(lines.clone()));
+    let hold_lines = || {
+        lines
+            .lock()
+            .iter()
+            .filter(|line| {
+                line.starts_with("behind the gc window inside the rejoin grace; holding demotion")
+            })
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+
+    // two holds within a second: both counted, one line
+    tokio::time::advance(Duration::from_secs(28)).await;
+    assert!(!handler.behind_consensus(0, 60, None).await, "held inside the grace");
+    tokio::time::advance(Duration::from_millis(500)).await;
+    assert!(!handler.behind_consensus(0, 60, None).await, "held again inside the grace");
+    assert!(consensus_bus.is_active_cvv(), "still active inside the grace");
+    assert_eq!(rejoin_grace_holds(&snapshotter), 2, "every hold is counted");
+    let held = hold_lines();
+    assert_eq!(held.len(), 1, "two holds within a second log one line: {held:?}");
+    assert!(held[0].ends_with(" holds_since_last_line=1"), "{}", held[0]);
+
+    // the next line, a second later, carries the hold that was not logged
+    tokio::time::advance(
+        tn_types::REJOIN_DEMOTION_GRACE - Duration::from_millis(28_500) - Duration::from_millis(1),
+    )
+    .await;
+    assert!(!handler.behind_consensus(0, 60, None).await, "held until the grace ends");
+    assert_eq!(rejoin_grace_holds(&snapshotter), 1);
+    let held = hold_lines();
+    assert_eq!(held.len(), 2, "{held:?}");
+    assert!(held[1].ends_with(" holds_since_last_line=2"), "{}", held[1]);
+
+    tokio::time::advance(Duration::from_millis(1)).await;
+    assert!(handler.behind_consensus(0, 60, None).await, "demoted once the grace has passed");
+    assert!(consensus_bus.is_cvv_inactive(), "inactive after the grace");
+    assert_eq!(rejoin_grace_holds(&snapshotter), 0, "a demotion is not a hold");
+    assert_eq!(hold_lines().len(), 2, "a demotion logs no hold line");
+}
+
+/// The grace holds only the gc-window demotion: a node an epoch behind is demoted at once, and a
+/// promotion recorded for another epoch holds nothing.
+#[tokio::test(start_paused = true)]
+async fn rejoin_grace_does_not_hold_epoch_behind() {
+    let temp_dir = TempDir::new().unwrap();
+    let recorder = DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    let TestTypes { handler, consensus_bus, .. } =
+        create_test_types_outside_gc_window(temp_dir.path(), &recorder).await;
+    consensus_bus
+        .rejoin_state()
+        .send_modify(|state| state.record_promotion(0, tokio::time::Instant::now()));
+
+    // a certificate past the early rounds of the next epoch: epoch_behind, not the gc window
+    assert!(handler.behind_consensus(1, 60, None).await, "an epoch behind is never held");
+    assert!(consensus_bus.is_cvv_inactive(), "demoted inside the grace");
+    assert_eq!(rejoin_grace_holds(&snapshotter), 0);
+
+    // a promotion keyed to another epoch does not hold this epoch's gc-window demotion
+    consensus_bus.node_mode().send_replace(NodeMode::CvvActive);
+    consensus_bus
+        .rejoin_state()
+        .send_modify(|state| state.record_promotion(7, tokio::time::Instant::now()));
+    assert!(handler.behind_consensus(0, 60, None).await, "another epoch's promotion holds nothing");
+    assert_eq!(rejoin_grace_holds(&snapshotter), 0);
+}
+
+/// The grace holds only while the incoming round leads the committed round by at most
+/// `ROUNDS_TO_KEEP - gc_depth`: one round past that bound peers have pruned rounds the rebuild
+/// needs, so a node promoted a moment ago is demoted.
+#[tokio::test(start_paused = true)]
+async fn rejoin_grace_is_bounded_by_the_rebuild_window() {
+    let temp_dir = TempDir::new().unwrap();
+    let recorder = DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    let TestTypes { committee, handler, consensus_bus, .. } =
+        create_test_types_outside_gc_window(temp_dir.path(), &recorder).await;
+    consensus_bus
+        .rejoin_state()
+        .send_modify(|state| state.record_promotion(0, tokio::time::Instant::now()));
+    let gc_depth = committee.first_authority().consensus_config().parameters().gc_depth;
+    let bound = tn_types::ROUNDS_TO_KEEP - gc_depth;
+
+    // committed 5: a certificate at the bound is held, one past it demotes inside the time grace
+    assert!(!handler.behind_consensus(0, 5 + bound, None).await, "held at the rebuild bound");
+    assert!(consensus_bus.is_active_cvv(), "still active at the bound");
+    assert!(handler.behind_consensus(0, 5 + bound + 1, None).await, "demoted past the bound");
+    assert!(consensus_bus.is_cvv_inactive(), "inactive inside the time grace");
+    assert_eq!(rejoin_grace_holds(&snapshotter), 1, "only the hold at the bound is counted");
+}

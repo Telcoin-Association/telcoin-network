@@ -51,6 +51,10 @@ const SEND_SYNC_PACK_TIMEOUT: Duration = Duration::from_secs(200);
 /// (and the admission slot it holds).
 const SEND_SYNC_CERTS_TIMEOUT: Duration = Duration::from_secs(200);
 
+/// Minimum interval between two `behind the gc window inside the rejoin grace; holding demotion`
+/// lines from one handler. Every hold is still counted in `rejoin_grace_holds_total`.
+const REJOIN_GRACE_LOG_INTERVAL: Duration = Duration::from_secs(1);
+
 /// Map to hold vote info to detect invalid votes, equivocation and cache responses in case of
 /// rerequests.
 type AuthEquivocationMap = HashMap<
@@ -121,6 +125,8 @@ pub(crate) struct RequestHandler<DB> {
     consensus_chain: ConsensusChain,
     /// Vote path metric handles, resolved once for this handler's epoch.
     vote_metrics: Arc<VoteStageHandles>,
+    /// Rate limit for the line logged when a demotion is held inside the rejoin grace.
+    rejoin_grace_log: Arc<Mutex<RejoinGraceLog>>,
 }
 
 impl<DB> RequestHandler<DB>
@@ -151,6 +157,7 @@ where
             deferred_vote_warned: Default::default(),
             consensus_chain,
             vote_metrics: Arc::new(VoteStageHandles::new()),
+            rejoin_grace_log: Default::default(),
         }
     }
 
@@ -163,6 +170,11 @@ where
     /// Detect if we are too far behind the given epoch, round and switch to CVV inactive if we are
     /// active. This will put us in a "catch up" mode until we have caught up enough to rejoin
     /// consensus.
+    ///
+    /// For [`tn_types::REJOIN_DEMOTION_GRACE`] after a rejoin in this epoch, and while the incoming
+    /// round leads the effective round by at most `ROUNDS_TO_KEEP - gc_depth`, a demotion for the
+    /// activity window is held instead: logged, counted in `rejoin_grace_holds_total`, and
+    /// answered as not behind. A demotion for an epoch behind is never held.
     pub(crate) async fn behind_consensus(
         &self,
         epoch: Epoch,
@@ -234,6 +246,39 @@ where
         } else {
             epoch > exec_epoch
         };
+        if outside_gc_window {
+            // a promoted node commits again only once its dag is refilled from peers; until then
+            // the window measures the rejoin, not a new fall behind. an epoch behind is never
+            // held, nor a lag past the rounds peers still keep, which no refill can recover
+            let rebuild_bound = tn_types::ROUNDS_TO_KEEP
+                .saturating_sub(self.consensus_config.parameters().gc_depth);
+            let since_promotion = self
+                .consensus_bus
+                .rejoin_state()
+                .borrow()
+                .promoted_at(self.consensus_config.committee().epoch())
+                .map(|promoted_at| promoted_at.elapsed());
+            if let Some(since_promotion) = since_promotion.filter(|since| {
+                *since < tn_types::REJOIN_DEMOTION_GRACE
+                    && round.saturating_sub(effective_exec_round) <= rebuild_bound
+            }) {
+                self.consensus_bus.metrics().rejoin_grace_holds_total.increment(1);
+                // every certificate past the window is held, about twenty a second under load,
+                // so the line is rate limited and carries the holds it stands for
+                let due = self.rejoin_grace_log.lock().record_hold(tokio::time::Instant::now());
+                if let Some(holds_since_last_line) = due {
+                    warn!(
+                        target: "primary",
+                        round,
+                        effective_round = effective_exec_round,
+                        since_promotion_ms = millis(since_promotion),
+                        holds_since_last_line,
+                        "behind the gc window inside the rejoin grace; holding demotion"
+                    );
+                }
+                return false;
+            }
+        }
         if outside_gc_window || epoch_behind {
             // We seem to be too far behind to be an active CVV, try to go
             // inactive to catch up.
@@ -1941,6 +1986,38 @@ impl VoteOutcome {
             Self::Timeout => "timeout",
             Self::Error => "error",
         }
+    }
+}
+
+/// Rate limit for the `behind the gc window inside the rejoin grace; holding demotion` line: one
+/// line per [`REJOIN_GRACE_LOG_INTERVAL`] at most, carrying the holds counted since the previous
+/// line. The lines add up to every hold up to the last one logged; holds after it appear on the
+/// next line, or only in `rejoin_grace_holds_total` if the node is demoted or the handler rebuilt
+/// first.
+///
+/// Locked only to record a hold, never across an await. Stamps use the tokio clock so a paused
+/// test clock drives the interval.
+#[derive(Debug, Default)]
+struct RejoinGraceLog {
+    /// When the last line was logged.
+    last_logged: Option<tokio::time::Instant>,
+    /// Holds recorded since the last line.
+    holds: u64,
+}
+
+impl RejoinGraceLog {
+    /// Record a hold at `now`. When a line is due, returns the holds it reports (this one and the
+    /// ones not logged since the previous line) and restarts the interval; otherwise `None`.
+    fn record_hold(&mut self, now: tokio::time::Instant) -> Option<u64> {
+        self.holds = self.holds.saturating_add(1);
+        let due = self.last_logged.is_none_or(|logged_at| {
+            now.saturating_duration_since(logged_at) >= REJOIN_GRACE_LOG_INTERVAL
+        });
+        if !due {
+            return None;
+        }
+        self.last_logged = Some(now);
+        Some(std::mem::take(&mut self.holds))
     }
 }
 
