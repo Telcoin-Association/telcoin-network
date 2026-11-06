@@ -173,25 +173,39 @@ pub fn spawn_state_sync<DB: Database>(
 /// An error here indicates a critical node failure.
 /// Note, if this returns an error then the DB could not be written to- this is probably fatal.
 /// Returns the number of bytes the encoded Output takes on disk IF this is written to the current
-/// pack or 0 if the output already resides in a static (imported) pack. An output whose number
+/// pack or 0 if the output already resides in a static (imported) pack, with how long the
+/// persist after the save took (see [`SavedConsensus`]). An output whose number
 /// does not advance the chain's latest consensus is an error (it used to be a silent 0-byte
 /// no-op, which let a node resuming from a collapsed height 0 discard every output silently).
 pub async fn save_consensus(
     consensus_output: ConsensusOutput,
     consensus_chain: &mut ConsensusChain,
     metrics: &PrimaryMetrics,
-) -> eyre::Result<u64> {
+) -> eyre::Result<SavedConsensus> {
     let output_bytes = consensus_chain.save_consensus_output(consensus_output).await?;
     // Make sure we have persisted the consensus output before we execute. Forwarding it to
     // execution evicts its batches from NodeBatchesCache, which is only safe once the pack holds
     // them.
-    consensus_chain.persist_current().await?;
+    let (pack_persist, slots_persist) = consensus_chain.persist_current_timed().await?;
     // A zero byte count means this output already resides in a static (imported) pack and
     // nothing was written; recording it as the "most recent" output size would be misleading.
     if output_bytes > 0 {
         metrics.record_consensus_output_bytes(output_bytes);
     }
-    Ok(output_bytes)
+    Ok(SavedConsensus { bytes: output_bytes, pack_persist, slots_persist })
+}
+
+/// What [`save_consensus`] wrote for one output and how long making it durable took.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SavedConsensus {
+    /// Bytes the encoded output takes in the current pack, or 0 when the output already resides
+    /// in a static (imported) pack and nothing was written.
+    pub bytes: u64,
+    /// How long the current pack's sync took.
+    pub pack_persist: Duration,
+    /// How long the sync of the latest-consensus slot files took. It runs beside the pack's
+    /// sync, so the persist as a whole takes about the longer of the two.
+    pub slots_persist: Duration,
 }
 
 /// Returns the ConsensusHeader that created the last executed block if can be found.

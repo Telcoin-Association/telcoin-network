@@ -451,13 +451,26 @@ impl<DB: Database> Subscriber<DB> {
     }
 
     /// Save consensus output and publish or signature.
+    ///
+    /// Once the output is durable it logs `output saved` with the time the pack's sync and the
+    /// slot files' sync took, and records the pack's in `consensus_pack_persist_seconds`.
     async fn handle_consensus_output(
         &self,
         consensus_chain: &mut ConsensusChain,
         output: ConsensusOutput,
     ) -> SubscriberResult<()> {
         debug!(target: "subscriber", output=?output.digest(), "saving next output");
-        save_consensus(output.clone(), consensus_chain, self.consensus_bus.metrics()).await?;
+        let saved =
+            save_consensus(output.clone(), consensus_chain, self.consensus_bus.metrics()).await?;
+        self.inner.metrics.consensus_pack_persist_seconds.record(saved.pack_persist.as_secs_f64());
+        info!(
+            target: "consensus::metrics",
+            number = output.number(),
+            leader_round = output.sub_dag().leader_round(),
+            pack_persist_ms = u64::try_from(saved.pack_persist.as_millis()).unwrap_or(u64::MAX),
+            slots_persist_ms = u64::try_from(saved.slots_persist.as_millis()).unwrap_or(u64::MAX),
+            "output saved"
+        );
         debug!(target: "subscriber", "broadcasting output...");
         // Publish the consensus result now that we are totally finished.
         let number = output.number();
@@ -631,6 +644,8 @@ impl<DB: Database> Subscriber<DB> {
         wait_floor: u64,
     ) -> SubscriberResult<ConsensusOutput> {
         self.wait_for_leader_execution(&sub_dag, number, wait_floor).await?;
+        // the batch fetch is timed from here, after the execution wait, to the assembled output
+        let fetch_started = Instant::now();
 
         let num_blocks = sub_dag.num_primary_batches();
         let num_certs = sub_dag.len();
@@ -734,6 +749,8 @@ impl<DB: Database> Subscriber<DB> {
             num_certs = num_certs,
             num_batches = batch_digests.len(),
             total_txs = total_txs,
+            fetch_ms = u64::try_from(fetch_started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            leader_epoch = sub_dag.leader_epoch(),
             "consensus output ready"
         );
         self.inner.metrics.outputs_ready_total.increment(1);
@@ -1782,6 +1799,232 @@ mod tests {
             assert!(bus.is_cvv_inactive(), "the node goes inactive");
             assert!(epoch_shutdown.noticed(), "the epoch shuts down");
             assert_eq!(chain.latest_consensus_number(), 0, "the forked output is not saved");
+        }
+    }
+
+    mod land_path_obs {
+        use super::*;
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+        use std::{cell::RefCell, collections::BTreeMap, future::Future, sync::Once};
+        use tn_network_types::MockPrimaryToWorkerClient;
+        use tn_types::{
+            Batch, BlockNumHash, ConsensusNumHash, EpochSeedChainValue, ExecHeader, SealedHeader,
+        };
+        use tracing::{
+            field::{Field, Visit},
+            span, Event, Metadata,
+        };
+
+        /// One `consensus::metrics` event: its message and its other fields as logged.
+        type Captured = (String, BTreeMap<String, String>);
+
+        thread_local! {
+            /// The `consensus::metrics` events logged on this thread while it captures.
+            static CAPTURED: RefCell<Option<Vec<Captured>>> = const { RefCell::new(None) };
+        }
+
+        /// Collects an event's fields by name, each value as its `Debug` text.
+        struct Fields(BTreeMap<String, String>);
+
+        impl Visit for Fields {
+            fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+                self.0.insert(field.name().to_string(), format!("{value:?}"));
+            }
+        }
+
+        /// Records the `consensus::metrics` events of the threads capturing at the time.
+        struct Capture;
+
+        impl tracing::Subscriber for Capture {
+            fn enabled(&self, metadata: &Metadata<'_>) -> bool {
+                metadata.target() == "consensus::metrics"
+            }
+            fn new_span(&self, _: &span::Attributes<'_>) -> span::Id {
+                span::Id::from_u64(1)
+            }
+            fn record(&self, _: &span::Id, _: &span::Record<'_>) {}
+            fn record_follows_from(&self, _: &span::Id, _: &span::Id) {}
+            fn event(&self, event: &Event<'_>) {
+                let mut fields = Fields(BTreeMap::new());
+                event.record(&mut fields);
+                let message = fields.0.remove("message").unwrap_or_default();
+                CAPTURED.with(|captured| {
+                    if let Some(events) = captured.borrow_mut().as_mut() {
+                        events.push((message, fields.0));
+                    }
+                });
+            }
+            fn enter(&self, _: &span::Id) {}
+            fn exit(&self, _: &span::Id) {}
+        }
+
+        /// Drive `work` on this thread, returning its result and the `consensus::metrics` events
+        /// it logged here.
+        ///
+        /// The capturing subscriber is the test binary's global default, installed once, and
+        /// records only the threads capturing at the time (the storage crate's pattern): a
+        /// thread-local default can miss events while other tests' subscribers come and go.
+        async fn capture<T>(work: impl Future<Output = T>) -> (T, Vec<Captured>) {
+            static INSTALLED: Once = Once::new();
+            INSTALLED.call_once(|| {
+                tracing::subscriber::set_global_default(Capture)
+                    .expect("no other global subscriber in this test binary");
+            });
+            CAPTURED.with(|captured| *captured.borrow_mut() = Some(Vec::new()));
+            let result = work.await;
+            let events = CAPTURED.with(|captured| captured.borrow_mut().take()).unwrap_or_default();
+            (result, events)
+        }
+
+        /// The fields of the only captured event with `message`.
+        fn only<'a>(events: &'a [Captured], message: &str) -> &'a BTreeMap<String, String> {
+            let matching: Vec<_> = events.iter().filter(|(m, _)| m == message).collect();
+            assert_eq!(matching.len(), 1, "one `{message}` line per output: {events:?}");
+            &matching[0].1
+        }
+
+        /// `fields[key]` as a whole number, failing the test when it is missing or not one.
+        fn whole(fields: &BTreeMap<String, String>, key: &str) -> u64 {
+            fields
+                .get(key)
+                .unwrap_or_else(|| panic!("`{key}` logged: {fields:?}"))
+                .parse()
+                .unwrap_or_else(|e| panic!("`{key}` is a whole number: {e}"))
+        }
+
+        /// A subscriber for the fixture's first authority whose metrics are `metrics`.
+        fn subscriber_with(
+            fixture: &CommitteeFixture<MemDatabase>,
+            consensus_chain: ConsensusChain,
+            consensus_bus: &ConsensusBusApp,
+            metrics: ExecutorMetrics,
+        ) -> Subscriber<MemDatabase> {
+            let config = fixture.authorities().next().unwrap().consensus_config();
+            let (network_tx, _network_rx) = mpsc::channel(1);
+            Subscriber {
+                consensus_bus: consensus_bus.clone(),
+                config: config.clone(),
+                network_handle: PrimaryNetworkHandle::new_for_test(network_tx),
+                inner: Arc::new(Inner {
+                    authority_id: config.authority_id(),
+                    committee: config.committee().clone(),
+                    consensus_chain,
+                    epoch_boundary: u64::MAX,
+                    metrics,
+                }),
+            }
+        }
+
+        /// Saving an output logs one `output saved` line keyed by its consensus number and leader
+        /// round, with the pack's and the slot files' persist times, and records the pack's in
+        /// `consensus_pack_persist_seconds`.
+        #[tokio::test]
+        async fn output_saved_reports_persist_times() {
+            let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+            let temp_dir = TempDir::new().unwrap();
+            let mut chain =
+                ConsensusChain::new_for_test(temp_dir.path().to_owned(), fixture.committee())
+                    .await
+                    .unwrap();
+            let bus = ConsensusBusApp::new();
+            let recorder = DebuggingRecorder::new();
+            let snapshotter = recorder.snapshotter();
+            // handles bound to the local recorder keep recording into it after the closure
+            let metrics = metrics::with_local_recorder(&recorder, || {
+                ExecutorMetrics::new_with_labels(Vec::<metrics::Label>::new())
+            });
+            let subscriber = subscriber_with(&fixture, chain.clone(), &bus, metrics);
+            let mut rx_consensus_output = bus.subscribe_consensus_output();
+            let output = chained_outputs(&fixture, 1).remove(0);
+            let leader_round = output.sub_dag().leader_round();
+
+            let (result, events) =
+                capture(subscriber.handle_consensus_output(&mut chain, output)).await;
+            result.expect("the output saves and is forwarded");
+            assert_eq!(rx_consensus_output.try_recv().expect("forwarded").number(), 1);
+
+            let saved = only(&events, "output saved");
+            assert_eq!(
+                saved.keys().map(String::as_str).collect::<Vec<_>>(),
+                ["leader_round", "number", "pack_persist_ms", "slots_persist_ms"]
+            );
+            assert_eq!(whole(saved, "number"), 1, "the consensus number");
+            assert_eq!(whole(saved, "leader_round"), u64::from(leader_round));
+            whole(saved, "pack_persist_ms");
+            whole(saved, "slots_persist_ms");
+
+            let snapshot = snapshotter.snapshot().into_vec();
+            let (_, _, _, value) = snapshot
+                .iter()
+                .find(|(key, ..)| key.key().name() == "tn_executor.consensus_pack_persist_seconds")
+                .expect("the pack persist histogram is registered");
+            assert!(
+                matches!(value, DebugValue::Histogram(samples) if samples.len() == 1),
+                "one pack persist sample per saved output: {value:?}"
+            );
+        }
+
+        /// An assembled output's `consensus output ready` line carries the batch fetch time and
+        /// the leader's epoch beside its consensus number and leader round.
+        #[tokio::test]
+        async fn output_ready_reports_fetch_ms_and_leader_epoch() {
+            let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+            let temp_dir = TempDir::new().unwrap();
+            let chain =
+                ConsensusChain::new_for_test(temp_dir.path().to_owned(), fixture.committee())
+                    .await
+                    .unwrap();
+            let bus = ConsensusBusApp::new();
+            // block 1 executed, so the leader below passes the execution wait and fork check
+            let local = B256::repeat_byte(1);
+            bus.recent_blocks().send_modify(|blocks| {
+                blocks.push_latest(
+                    0,
+                    ConsensusNumHash::new(1, ConsensusHeaderDigest::default()),
+                    Some(SealedHeader::new(ExecHeader { number: 1, ..Default::default() }, local)),
+                )
+            });
+            // worker 0 serves the one batch in the leader's payload
+            let batch = Batch::default();
+            fixture
+                .authorities()
+                .next()
+                .unwrap()
+                .consensus_config()
+                .local_network(0)
+                .expect("worker 0 local network")
+                .set_primary_to_worker_local_handler(Arc::new(MockPrimaryToWorkerClient {
+                    batches: std::collections::HashMap::from([(batch.digest(), batch.clone())]),
+                }))
+                .expect("register the worker mock");
+            let header = fixture
+                .header_builder_last_authority()
+                .latest_execution_block(BlockNumHash::new(1, local))
+                .with_payload_batch(&batch, 0)
+                .build();
+            let leader = fixture.certificate(&header);
+            let sub_dag = CommittedSubDag::new(
+                vec![leader.clone()],
+                leader,
+                0,
+                ReputationScores::new(&fixture.committee()),
+                None,
+                EpochSeedChainValue::genesis_placeholder(),
+            );
+            let leader_round = sub_dag.leader_round();
+            let subscriber = sync_subscriber(&fixture, chain, &bus);
+
+            let (output, events) =
+                capture(subscriber.fetch_batches(sub_dag, B256::ZERO.into(), 1, 1)).await;
+            let output = output.expect("the batch is fetched and the output assembled");
+            assert_eq!(output.number(), 1);
+
+            let ready = only(&events, "consensus output ready");
+            assert_eq!(whole(ready, "number"), 1, "the consensus number");
+            assert_eq!(whole(ready, "leader_round"), u64::from(leader_round));
+            assert_eq!(whole(ready, "leader_epoch"), u64::from(fixture.committee().epoch()));
+            assert_eq!(whole(ready, "num_batches"), 1);
+            whole(ready, "fetch_ms");
         }
     }
 }
