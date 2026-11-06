@@ -73,6 +73,13 @@ pub(crate) struct EngineMetrics {
     /// before unrecoverable or invalid transactions are dropped (the per-transaction cost
     /// denominator).
     pub(crate) executed_transactions_total: Counter,
+    /// Time from the node forwarding a consensus output (stamped just before its send on the
+    /// `to_engine` channel) to the engine taking it off that channel, a send blocked on a full
+    /// channel included. `queue_wait_seconds` covers the next hop.
+    pub(crate) forward_wait_seconds: Histogram,
+    /// Consensus outputs waiting in the `to_engine` channel behind the engine's own queue,
+    /// sampled when an output arrives and when an execution completes.
+    pub(crate) channel_depth: Gauge,
 }
 
 #[cfg(test)]
@@ -107,6 +114,8 @@ mod tests {
             metrics.root_seconds.record(0.03);
             metrics.finish_seconds.record(0.04);
             metrics.executed_transactions_total.increment(12_500);
+            metrics.forward_wait_seconds.record(0.05);
+            metrics.channel_depth.set(64.0);
         });
 
         let snapshot = snapshotter.snapshot().into_vec();
@@ -150,5 +159,9 @@ mod tests {
         assert!(matches!(value, DebugValue::Histogram(h) if h.len() == 1 && h[0].0 == 0.04));
         let (_, _, _, value) = find("tn_engine.executed_transactions_total");
         assert!(matches!(value, DebugValue::Counter(12_500)));
+        let (_, _, _, value) = find("tn_engine.forward_wait_seconds");
+        assert!(matches!(value, DebugValue::Histogram(h) if h.len() == 1 && h[0].0 == 0.05));
+        let (_, _, _, value) = find("tn_engine.channel_depth");
+        assert!(matches!(value, DebugValue::Gauge(g) if g.0 == 64.0));
     }
 }

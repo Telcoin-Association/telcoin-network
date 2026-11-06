@@ -9,7 +9,7 @@ use metrics_util::debugging::{DebugValue, DebuggingRecorder, Snapshotter};
 use std::{
     collections::{BTreeMap, HashMap, VecDeque},
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tempfile::TempDir;
 use tn_batch_builder::test_utils::execute_test_batch;
@@ -241,10 +241,13 @@ async fn test_empty_output_skips_execution() -> eyre::Result<()> {
 
 /// The engine must stop draining the consensus stream once its execution backlog reaches
 /// [`MAX_QUEUED_OUTPUTS`], then drain to completion (executing every output exactly once, in
-/// order) as completed executions re-open the gate.
+/// order) as completed executions re-open the gate. The outputs that waited in the full channel
+/// are stamped like the node's forwarder stamps them, so each records a non-zero forward wait,
+/// and the channel-depth gauge reads empty once everything drained.
 #[tokio::test]
 async fn test_queued_outputs_bounded_with_backpressure() -> eyre::Result<()> {
     let _guard = IT_TEST_GUARD.lock();
+    let snapshotter = install_metrics_recorder();
     let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
     let tmp_dir = TempDir::new().expect("temp dir");
     // execution node components
@@ -318,7 +321,10 @@ async fn test_queued_outputs_bounded_with_backpressure() -> eyre::Result<()> {
         engine.push_back_queued_for_test(output.clone());
     }
     for output in outputs_iter {
-        to_engine.send(output.clone()).await?;
+        // stamped just before the send, as `EpochManager::process_output` does
+        let mut output = output.clone();
+        output.set_forwarded_at(Instant::now());
+        to_engine.send(output).await?;
     }
     assert_eq!(to_engine.capacity(), 0, "test setup: channel must start full");
 
@@ -348,6 +354,29 @@ async fn test_queued_outputs_bounded_with_backpressure() -> eyre::Result<()> {
         assert_eq!(consensus_num_hash, output.num_hash());
     }
     assert!(engine_update_rx.try_recv().is_err(), "extra engine update: output executed twice");
+
+    // only the streamed (stamped) outputs record a forward wait, and each waited behind the
+    // full queue; the pre-filled outputs bypassed the channel unstamped
+    let snapshot = snapshotter.snapshot().into_vec();
+    let recorded = |name: &str| {
+        snapshot
+            .iter()
+            .find(|(key, ..)| key.key().name() == name)
+            .map(|(.., value)| value)
+            .unwrap_or_else(|| panic!("metric {name} not recorded"))
+    };
+    assert!(
+        matches!(
+            recorded("tn_engine.forward_wait_seconds"),
+            DebugValue::Histogram(waits)
+                if waits.len() == STREAMED && waits.iter().all(|wait| wait.0 > 0.0)
+        ),
+        "one non-zero forward wait per streamed output",
+    );
+    assert!(
+        matches!(recorded("tn_engine.channel_depth"), DebugValue::Gauge(depth) if depth.0 == 0.0),
+        "the drained channel reads empty",
+    );
 
     Ok(())
 }
