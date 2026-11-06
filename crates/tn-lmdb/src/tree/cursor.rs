@@ -1376,17 +1376,33 @@ impl TreeCursor {
                 return Err(Error::Corrupt(format!("branch page {pgno} has no children")));
             }
             let route = match edge {
-                Edge::First => branch.route_at(0)?,
-                Edge::Last => branch.route_at(n - 1)?,
+                Edge::First => {
+                    let route = branch.route_at(0)?;
+                    tighten(&route, &mut lo, &mut hi);
+                    route
+                }
+                Edge::Last => {
+                    let route = branch.route_at(n - 1)?;
+                    tighten(&route, &mut lo, &mut hi);
+                    route
+                }
                 Edge::Key(key) | Edge::Exact(key) => {
                     let route = branch.route(key)?;
                     if !compared_in_range(route.lo, route.hi, lo, hi) {
                         return Err(misrouted(pgno));
                     }
+                    // `compared_in_range` proved each bound the route has inside `[lo, hi)`, so
+                    // the route's bounds are the intersection's ([`tighten`] without its
+                    // compares).
+                    if route.lo.is_some() {
+                        lo = route.lo;
+                    }
+                    if route.hi.is_some() {
+                        hi = route.hi;
+                    }
                     route
                 }
             };
-            tighten(&route, &mut lo, &mut hi);
             self.push(pgno, route.index);
             (pgno, want_txn) = (route.child, route.child_txn);
         }
