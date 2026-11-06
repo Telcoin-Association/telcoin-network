@@ -4280,3 +4280,111 @@ async fn test_request_vote_retry_votes_once_execution_catches_up() -> eyre::Resu
 
     Ok(())
 }
+
+/// Records every `primary` warn line as `message key=value ...` on the thread it is installed on
+/// with [`tracing::subscriber::set_default`].
+struct PrimaryWarnLines(Arc<Mutex<Vec<String>>>);
+
+/// Appends an event's message and fields to a line in the order the event records them.
+struct LineVisitor<'a>(&'a mut String);
+
+impl tracing::field::Visit for LineVisitor<'_> {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        if field.name() == "message" {
+            self.0.push_str(&format!("{value:?}"));
+        } else {
+            self.0.push_str(&format!(" {}={value:?}", field.name()));
+        }
+    }
+}
+
+impl tracing::Subscriber for PrimaryWarnLines {
+    fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+        metadata.target() == "primary" && *metadata.level() == tracing::Level::WARN
+    }
+
+    fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+
+    fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+
+    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+
+    fn event(&self, event: &tracing::Event<'_>) {
+        let mut line = String::new();
+        event.record(&mut LineVisitor(&mut line));
+        self.0.lock().push(line);
+    }
+
+    fn enter(&self, _: &tracing::span::Id) {}
+
+    fn exit(&self, _: &tracing::span::Id) {}
+}
+
+/// The `we are behind` line ends with the execution backlog and both round lags: the newest known
+/// header is output 4,500 and the engine processed output 3 at round 352 (its stored header reads
+/// leader round 0, so the execution lag takes the processed round), consensus committed round 360
+/// and the proposer is at round 405.
+#[tokio::test]
+async fn behind_line_reports_execution_and_commit_lag() {
+    let temp_dir = TempDir::new().unwrap();
+    let TestTypes { committee, handler, consensus_bus, .. } =
+        create_test_types(temp_dir.path()).await;
+    let committee_obj = committee.committee();
+    let sub_dag = |number: u64| {
+        let cert = Certificate::default();
+        CommittedSubDag::new(
+            vec![cert.clone()],
+            cert,
+            number,
+            ReputationScores::new(&committee_obj),
+            None,
+            tn_types::EpochSeedChainValue::genesis_placeholder(),
+        )
+    };
+    for number in 1..=3u64 {
+        handler.consensus_chain().write_subdag_for_test(number, sub_dag(number)).await;
+    }
+    // the engine processed output 3, the header `write_subdag_for_test` stored for it
+    let processed = tn_types::ConsensusOutput::new(
+        sub_dag(3),
+        ConsensusHeaderDigest::default(),
+        3,
+        false,
+        Default::default(),
+        Vec::new(),
+    );
+    let mut recent = RecentBlocks::new(1);
+    recent.push_latest(352, processed.num_hash(), None);
+    consensus_bus.recent_blocks().send_replace(recent);
+    consensus_bus.committed_round_updates().send_replace(360);
+    consensus_bus.primary_round_updates().send_replace(405);
+    consensus_bus
+        .last_consensus_header()
+        .send_replace(Some(tn_types::ConsensusHeader { number: 4_500, ..Default::default() }));
+
+    let lines = Arc::new(Mutex::new(Vec::new()));
+    let _guard = tracing::subscriber::set_default(PrimaryWarnLines(lines.clone()));
+    assert!(handler.behind_consensus(0, 403, None).await, "committed 360 + 40 < 403 is behind");
+
+    let lines = lines.lock();
+    let behind: Vec<_> = lines
+        .iter()
+        .filter(|line| line.starts_with("we are behind, go to catchup mode!"))
+        .collect();
+    assert_eq!(behind.len(), 1, "one behind line: {lines:?}");
+    assert!(
+        behind[0].contains(" exec_number=3 exec_round=0 processed_consensus_round=352 "),
+        "the stored output resolves the executed number: {}",
+        behind[0]
+    );
+    assert!(
+        behind[0].ends_with(
+            " reason=\"outside_gc_window\" newest_header_number=4500 backlog_outputs=4497 \
+             exec_lag_rounds=8 commit_lag_rounds=45"
+        ),
+        "the lag fields follow the existing ones: {}",
+        behind[0]
+    );
+}

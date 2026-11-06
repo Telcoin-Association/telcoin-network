@@ -244,6 +244,16 @@ where
             } else {
                 ModeTransitionReason::EpochBehind
             };
+            // the newest consensus header this node knows, from its watch: on an active node the
+            // subscriber's newest save, but the state-sync fetchers also write it while the node
+            // follows consensus. the handler never reads the pack here
+            let newest_header_number = self
+                .consensus_bus
+                .last_consensus_header()
+                .borrow()
+                .as_ref()
+                .map_or(0, |header| header.number);
+            let primary_round = self.consensus_bus.primary_round();
             warn!(
                 target: "primary",
                 epoch,
@@ -257,6 +267,13 @@ where
                 effective_exec_round,
                 gc_window = gc_depth,
                 reason = reason.as_str(),
+                newest_header_number,
+                backlog_outputs = newest_header_number.saturating_sub(exec_number),
+                // the engine's processed round covers a failed or empty header lookup, as the
+                // `consensus_exec_lag_rounds` gauge does
+                exec_lag_rounds =
+                    committed_round.saturating_sub(exec_round.max(processed_consensus_round)),
+                commit_lag_rounds = primary_round.saturating_sub(committed_round),
                 "we are behind, go to catchup mode!"
             );
             let previous = self.consensus_bus.node_mode().send_replace(NodeMode::CvvInactive);
