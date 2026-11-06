@@ -18,7 +18,7 @@
 use crate::{
     consensus::LeaderSchedule,
     error::{ProposerError, ProposerResult},
-    metrics::{HeadersProposedHandles, ProposeReason},
+    metrics::{DigestsRequeuedHandles, HeadersProposedHandles, ProposeReason, RequeueCause},
     ConsensusBus,
 };
 use reth_metrics::metrics::Counter;
@@ -33,8 +33,8 @@ use tn_storage::{tables::LastProposed, ProposerStore};
 use tn_types::{
     forks::{seed_signature_active, subsecond_timestamp_active},
     now_ms, AuthorityIdentifier, BlockHash, Certificate, Committee, Database, Epoch, EpochDigest,
-    EpochSeedMessage, Hash as _, Header, Noticer, Round, TaskManager, TaskSpawner, TnReceiver,
-    TnSender, VotingPower, WorkerId,
+    EpochSeedMessage, Hash as _, Header, HeaderDigest, Noticer, Round, TaskManager, TaskSpawner,
+    TnReceiver, TnSender, VotingPower, WorkerId,
 };
 use tokio::{
     sync::oneshot,
@@ -157,6 +157,8 @@ pub(crate) struct Proposer<DB: ProposerStore> {
     key_config: KeyConfig,
     /// The `tn_primary_headers_proposed_total{reason}` counters, resolved once per epoch.
     headers_proposed: HeadersProposedHandles,
+    /// The `tn_primary_digests_requeued_total{cause}` counters, resolved once per epoch.
+    digests_requeued: DigestsRequeuedHandles,
 }
 
 /// The identity a proposer stamps on a header it authors.
@@ -292,6 +294,7 @@ impl<DB: Database> Proposer<DB> {
             prior_epoch_record: config.prior_epoch_record(),
             key_config: config.key_config().clone(),
             headers_proposed: HeadersProposedHandles::new(),
+            digests_requeued: DigestsRequeuedHandles::new(),
         }
     }
 
@@ -826,36 +829,17 @@ impl<DB: Database> Proposer<DB> {
             .take_while(|(header_round, _)| **header_round <= max_committed_round)
             .for_each(|(header_round, header)| {
                 // add payloads from oldest to newest into each worker's lane
-                header.payload().iter().for_each(|(digest, worker_id)| {
-                    digests_to_resend.entry(*worker_id).or_default().push_back(ProposerDigest {
-                        digest: *digest,
-                        worker_id: *worker_id,
-                        received: requeued_at,
-                    });
-                });
+                push_payload(&mut digests_to_resend, header, requeued_at);
                 retransmit_rounds.push(*header_round);
             });
 
         // process rounds that need to be retransmitted
         if !retransmit_rounds.is_empty() {
-            let num_digests_to_resend: usize = digests_to_resend.values().map(VecDeque::len).sum();
-
-            // a header without digests leaves nothing to re-send
-            if num_digests_to_resend > 0 {
-                info!(
-                    target: "consensus::metrics",
-                    count = num_digests_to_resend,
-                    from_round = retransmit_rounds.first().copied().unwrap_or_default(),
-                    round = self.round,
-                    "digests resent"
-                );
-            }
-
-            // prepend the reproposed batches to each worker's pending queue and update `self`
-            std::mem::take(&mut self.digests).into_iter().for_each(|(worker_id, mut pending)| {
-                digests_to_resend.entry(worker_id).or_default().append(&mut pending);
-            });
-            self.digests = digests_to_resend;
+            let num_digests_to_resend = self.prepend_requeued(
+                digests_to_resend,
+                retransmit_rounds.first().copied().unwrap_or_default(),
+                RequeueCause::Committed,
+            );
 
             // remove the old headers that failed
             // the proposed blocks are included in the next header
@@ -869,6 +853,77 @@ impl<DB: Database> Proposer<DB> {
                 self.proposed_headers.len()
             );
         }
+    }
+
+    /// Process the certifier's report that the own header at `round` with `digest` will never be
+    /// certified: a newer own header cancelled its vote collection.
+    ///
+    /// The header's batch digests go back to the front of their workers' queues, as the commit
+    /// path re-queues an uncommitted header's, so they ride the next header instead of waiting
+    /// for the next own commit. The header itself is never signed or sent again; only its digests
+    /// move, and the header leaves `proposed_headers` so the commit path cannot re-queue them a
+    /// second time.
+    ///
+    /// The report is acted on only for the exact header still tracked at `round`, and only below
+    /// the proposer's round: the max-delay re-send needs a header at or above the round and the
+    /// restart re-propose one at the round just advanced to, so a header below it is never sent to
+    /// the certifier again and cannot be certified after its digests moved. Anything else (the
+    /// commit path already re-queued it, or an unexpected report) is ignored, and the digests
+    /// stay where they are.
+    fn process_uncertified_header(&mut self, round: Round, digest: HeaderDigest) {
+        let mut requeued = BTreeMap::new();
+        match self.proposed_headers.get(&round) {
+            Some(header) if round < self.round && header.digest() == digest => {
+                push_payload(&mut requeued, header, Instant::now());
+            }
+            _ => {
+                debug!(
+                    target: "primary::proposer",
+                    round,
+                    %digest,
+                    proposer_round = self.round,
+                    "uncertified own header is not tracked below the round; nothing to re-queue"
+                );
+                return;
+            }
+        }
+        self.proposed_headers.remove(&round);
+        self.prepend_requeued(requeued, round, RequeueCause::Canceled);
+    }
+
+    /// Prepend `requeued`, the batch digests of own headers that will not be committed (oldest
+    /// first within each worker), to each worker's pending queue, and return how many there are.
+    ///
+    /// A non-empty re-queue logs one `digests resent` line and counts the digests in
+    /// `tn_primary_digests_requeued_total{cause}`. `from_round` is the round of the oldest header
+    /// the digests came from.
+    fn prepend_requeued(
+        &mut self,
+        mut requeued: BTreeMap<WorkerId, VecDeque<ProposerDigest>>,
+        from_round: Round,
+        cause: RequeueCause,
+    ) -> usize {
+        let count: usize = requeued.values().map(VecDeque::len).sum();
+        // a header without digests leaves nothing to re-send
+        if count == 0 {
+            return 0;
+        }
+        info!(
+            target: "consensus::metrics",
+            count,
+            from_round,
+            round = self.round,
+            cause = cause.as_str(),
+            "digests resent"
+        );
+        self.digests_requeued.counter(cause).increment(u64::try_from(count).unwrap_or(u64::MAX));
+
+        // prepend the re-queued digests to each worker's pending queue and update `self`
+        std::mem::take(&mut self.digests).into_iter().for_each(|(worker_id, mut pending)| {
+            requeued.entry(worker_id).or_default().append(&mut pending);
+        });
+        self.digests = requeued;
+        count
     }
 
     /// Total number of digests pending across all workers.
@@ -1057,9 +1112,17 @@ impl<DB: Database> Proposer<DB> {
             let rx_our_digests = self.consensus_bus.subscribe_our_digests();
             let rx_parents = self.consensus_bus.subscribe_parents();
             let rx_committed_own_headers = self.consensus_bus.subscribe_committed_own_headers();
+            let rx_uncertified_own_headers = self.consensus_bus.subscribe_uncertified_own_headers();
             task_manager.spawn_critical_task("proposer task", async move {
                 info!(target: "primary::proposer", "Starting proposer");
-                Ok(self.run(rx_our_digests, rx_parents, rx_committed_own_headers).await?)
+                Ok(self
+                    .run(
+                        rx_our_digests,
+                        rx_parents,
+                        rx_committed_own_headers,
+                        rx_uncertified_own_headers,
+                    )
+                    .await?)
             });
         }
         // If not an active CVV then don't propose anything.
@@ -1110,6 +1173,7 @@ impl<DB: Database> Proposer<DB> {
         mut rx_our_digests: impl TnReceiver<OurDigestMessage>,
         mut rx_parents: impl TnReceiver<(Vec<Certificate>, Round)>,
         mut rx_committed_own_headers: impl TnReceiver<(Round, Vec<Round>)>,
+        mut rx_uncertified_own_headers: impl TnReceiver<(Round, HeaderDigest)>,
     ) -> ProposerResult<()> {
         let mut pending_header = None;
         let mut max_delay_timed_out = false;
@@ -1145,6 +1209,10 @@ impl<DB: Database> Proposer<DB> {
                 Some((commit_round, committed_headers)) = rx_committed_own_headers.recv() => {
                     debug!(target: "primary::proposer", authority=?self.authority_id, round=self.round, "received committed update for own header");
                     self.process_committed_headers(commit_round, committed_headers);
+                }
+                // the certifier cancelled an own header's vote collection for a newer header
+                Some((round, digest)) = rx_uncertified_own_headers.recv() => {
+                    self.process_uncertified_header(round, digest);
                 }
                 res = Self::pending_header(&mut pending_header) => {
                     pending_header = None;
@@ -1279,6 +1347,25 @@ impl fmt::Display for HeaderDigests<'_> {
         }
         f.write_str("]")
     }
+}
+
+/// Append the batch digests of `header`, in payload order, to their workers' lanes in `lanes`,
+/// each stamped as queued at `requeued_at`.
+///
+/// The proposer keeps no arrival time for a digest already in a header, so a re-queued digest's
+/// wait restarts at `requeued_at`.
+fn push_payload(
+    lanes: &mut BTreeMap<WorkerId, VecDeque<ProposerDigest>>,
+    header: &Header,
+    requeued_at: Instant,
+) {
+    header.payload().iter().for_each(|(digest, worker_id)| {
+        lanes.entry(*worker_id).or_default().push_back(ProposerDigest {
+            digest: *digest,
+            worker_id: *worker_id,
+            received: requeued_at,
+        });
+    });
 }
 
 /// Whole milliseconds in `duration`, saturating at `u64::MAX`, for the timing fields of the

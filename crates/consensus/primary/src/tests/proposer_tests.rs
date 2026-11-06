@@ -1518,3 +1518,248 @@ async fn test_digests_resent_line_on_requeue() {
     assert!(proposer.digests.is_empty());
     assert_eq!(capture.events("digests resent").len(), 1, "an empty header logs no re-send");
 }
+
+// ---- bench5 cert-requeue ----
+
+/// A spawned epoch-start proposer whose round-1 header carries `first` on worker 0, with its bus,
+/// its header receiver and that header. The bus and the proposer resolve their metric handles
+/// under `recorder`.
+async fn spawn_with_first_header(
+    fixture: &CommitteeFixture<MemDatabase>,
+    task_manager: &TaskManager,
+    recorder: &metrics_util::debugging::DebuggingRecorder,
+    first: &[BlockHash],
+) -> (ConsensusBus, impl TnReceiver<Header>, Header) {
+    let committee = fixture.committee();
+    let config = fixture.authorities().next().unwrap().consensus_config();
+    let cb = metrics::with_local_recorder(recorder, ConsensusBus::new);
+    let mut rx_headers = cb.subscribe_headers();
+    let mut proposer = metrics::with_local_recorder(recorder, || {
+        proposer_on(&config, &committee, &cb, task_manager)
+    });
+    proposer.digests = BTreeMap::from([(0, first.iter().map(|d| queued(*d, 0)).collect())]);
+    proposer.spawn(task_manager);
+    let header = next_header_at(&mut rx_headers, 1).await;
+    assert_eq!(payload_digests(&header), first, "the first header carries the queued digests");
+    (cb, rx_headers, header)
+}
+
+/// The next header at `round` from `rx_headers`, past the max-delay re-sends of earlier rounds.
+async fn next_header_at(rx_headers: &mut impl TnReceiver<Header>, round: Round) -> Header {
+    loop {
+        let header = tokio::time::timeout(Duration::from_secs(30), rx_headers.recv())
+            .await
+            .unwrap_or_else(|_| panic!("no header at round {round} before the timeout"))
+            .expect("header channel stayed open");
+        assert!(header.round() <= round, "round {} came before round {round}", header.round());
+        if header.round() == round {
+            return header;
+        }
+    }
+}
+
+/// A header's batch digests in payload order.
+fn payload_digests(header: &Header) -> Vec<BlockHash> {
+    header.payload().keys().copied().collect()
+}
+
+/// Queue `digest` on worker 0 through the bus and wait until the proposer has taken it.
+async fn send_digest(cb: &ConsensusBus, digest: BlockHash) {
+    let (ack_channel, ack) = oneshot::channel();
+    cb.our_digests()
+        .send(OurDigestMessage { digest, worker_id: 0, ack_channel })
+        .await
+        .expect("digest queued");
+    ack.await.expect("the proposer acks the digest");
+}
+
+/// `tn_primary_digests_requeued_total` per cause, in [`RequeueCause::ALL`] order; `None` for a
+/// cause without a registered counter.
+fn requeued_totals(snapshotter: &metrics_util::debugging::Snapshotter) -> [Option<u64>; 2] {
+    let snapshot = snapshotter.snapshot().into_vec();
+    RequeueCause::ALL.map(|cause| {
+        snapshot
+            .iter()
+            .find(|(key, ..)| {
+                key.key().name() == "tn_primary.digests_requeued_total"
+                    && key
+                        .key()
+                        .labels()
+                        .any(|label| label.key() == "cause" && label.value() == cause.as_str())
+            })
+            .and_then(|(.., value)| match value {
+                metrics_util::debugging::DebugValue::Counter(total) => Some(*total),
+                _ => None,
+            })
+    })
+}
+
+/// The certifier's report that an own header was cancelled puts that header's digests at the front
+/// of the queue, so the next header carries them ahead of newer digests: the header after the one
+/// that cancelled it, not the one after the next own commit. The re-queue logs one `digests resent`
+/// line with `cause=canceled` and counts the digests under that cause.
+///
+/// Catches: a proposer that does not subscribe to the report or ignores it, digests appended
+/// behind newer ones, a missing or misattributed `cause`, and a per-digest line.
+#[tokio::test(start_paused = true)]
+async fn test_canceled_header_digests_ride_the_next_header() {
+    use crate::log_capture::LogCapture;
+    use metrics_util::debugging::DebuggingRecorder;
+
+    let capture = LogCapture::new("consensus::metrics");
+    let _capture_guard = tracing::subscriber::set_default(capture.clone());
+    let recorder = DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+    let epoch = fixture.committee().epoch();
+    let all = fixture.authorities().count();
+    let task_manager = TaskManager::default();
+
+    let (d1, d2, d3, d4) = (B256::random(), B256::random(), B256::random(), B256::random());
+    let (cb, mut rx_headers, canceled) =
+        spawn_with_first_header(&fixture, &task_manager, &recorder, &[d1, d2]).await;
+
+    // round 2 cancels round 1's vote collection in the certifier
+    send_digest(&cb, d3).await;
+    cb.parents().send((parents_at(&fixture, 1, epoch, all), 1)).await.expect("parents sent");
+    let newer = next_header_at(&mut rx_headers, 2).await;
+    assert_eq!(payload_digests(&newer), [d3]);
+
+    // the certifier's report, then a digest that arrives after it
+    cb.uncertified_own_headers()
+        .try_send((canceled.round(), canceled.digest()))
+        .expect("report queued");
+    send_digest(&cb, d4).await;
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while capture.events("digests resent").is_empty() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the proposer re-queues the cancelled header's digests");
+
+    cb.parents().send((parents_at(&fixture, 2, epoch, all), 2)).await.expect("parents sent");
+    let next = next_header_at(&mut rx_headers, 3).await;
+    assert_eq!(payload_digests(&next), [d1, d2, d4], "re-queued digests ride ahead of newer ones");
+
+    let lines = capture.events("digests resent");
+    assert_eq!(lines.len(), 1, "one line per re-queue");
+    assert_eq!(lines[0].u64_field("count"), Some(2));
+    assert_eq!(lines[0].u64_field("from_round"), Some(1));
+    assert_eq!(lines[0].u64_field("round"), Some(2));
+    assert_eq!(lines[0].field("cause"), Some("canceled"));
+    assert_eq!(requeued_totals(&snapshotter), [Some(2), Some(0)]);
+}
+
+/// A header re-sent by the max-delay tick is not cancelled and keeps its digests: the next header
+/// carries none of them, and nothing is re-queued.
+///
+/// Catches: a re-send path that re-queues the digests of a header that may still be certified,
+/// which would put them in two headers.
+#[tokio::test(start_paused = true)]
+async fn test_max_delay_resend_keeps_digests_out_of_the_next_header() {
+    use crate::log_capture::LogCapture;
+    use metrics_util::debugging::DebuggingRecorder;
+
+    let capture = LogCapture::new("consensus::metrics");
+    let _capture_guard = tracing::subscriber::set_default(capture.clone());
+    let recorder = DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+    let epoch = fixture.committee().epoch();
+    let all = fixture.authorities().count();
+    let task_manager = TaskManager::default();
+
+    let (d1, d2) = (B256::random(), B256::random());
+    let (cb, mut rx_headers, first) =
+        spawn_with_first_header(&fixture, &task_manager, &recorder, &[d1, d2]).await;
+
+    // no parents: the max-delay tick re-sends the stored header unchanged
+    let resent = tokio::time::timeout(Duration::from_secs(30), rx_headers.recv())
+        .await
+        .expect("the max-delay tick re-sends the header")
+        .expect("header channel stayed open");
+    assert_eq!(resent, first, "the re-send is the stored header");
+
+    cb.parents().send((parents_at(&fixture, 1, epoch, all), 1)).await.expect("parents sent");
+    let next = next_header_at(&mut rx_headers, 2).await;
+    assert!(payload_digests(&next).is_empty(), "the re-sent header keeps its digests");
+    assert!(capture.events("digests resent").is_empty(), "a re-send re-queues nothing");
+    assert_eq!(requeued_totals(&snapshotter), [Some(0), Some(0)]);
+}
+
+/// The two re-queue paths move each uncommitted header's digests once. A cancelled header leaves
+/// the tracked headers, so a later own commit does not re-queue it again; a header the commit path
+/// already re-queued ignores a late cancel report. A report for a header still at or above the
+/// proposer's round (one the max-delay tick may re-send) or with another digest moves nothing. The
+/// commit path still re-queues with `cause=committed`.
+///
+/// Catches: a digest re-queued by both paths (two headers carry it), a report acted on for a
+/// header that may still be certified, and the commit path losing its re-queue or its cause.
+#[tokio::test]
+async fn test_requeue_causes_move_each_header_once() {
+    use crate::log_capture::LogCapture;
+    use metrics_util::debugging::DebuggingRecorder;
+
+    let capture = LogCapture::new("consensus::metrics");
+    let _capture_guard = tracing::subscriber::set_default(capture.clone());
+    let recorder = DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+    let committee = fixture.committee();
+    let primary = fixture.authorities().next().unwrap();
+    let author = primary.id();
+    let task_manager = TaskManager::default();
+    let cb = ConsensusBus::new();
+    let mut proposer = metrics::with_local_recorder(&recorder, || {
+        proposer_on(&primary.consensus_config(), &committee, &cb, &task_manager)
+    });
+    proposer.round = 5;
+
+    let (a, b1, b2, c, e) =
+        (B256::random(), B256::random(), B256::random(), B256::random(), B256::random());
+    let h2 = build_test_header(&author, 2, &[a]);
+    let h3 = build_test_header(&author, 3, &[b1, b2]);
+    let h4 = build_test_header(&author, 4, &[c]);
+    let h5 = build_test_header(&author, 5, &[e]);
+    for header in [&h2, &h3, &h4, &h5] {
+        proposer.proposed_headers.insert(header.round(), header.clone());
+    }
+    let queue = |proposer: &Proposer<MemDatabase>| -> Vec<BlockHash> {
+        proposer.digests.values().flatten().map(|d| d.digest).collect()
+    };
+
+    // a cancel moves round 3's digests and stops tracking the header
+    proposer.process_uncertified_header(3, h3.digest());
+    assert_eq!(queue(&proposer), [b1, b2]);
+    assert!(!proposer.proposed_headers.contains_key(&3));
+
+    // a repeated report, a digest mismatch and the proposer's own round move nothing
+    proposer.process_uncertified_header(3, h3.digest());
+    proposer.process_uncertified_header(4, h2.digest());
+    proposer.process_uncertified_header(5, h5.digest());
+    assert_eq!(queue(&proposer), [b1, b2]);
+    assert!(
+        proposer.proposed_headers.contains_key(&4) && proposer.proposed_headers.contains_key(&5)
+    );
+
+    // round 4 commits: round 2 fell behind it uncommitted and goes ahead of the queue; round 3 is
+    // not re-queued a second time
+    proposer.process_committed_headers(6, vec![4]);
+    assert_eq!(queue(&proposer), [a, b1, b2]);
+
+    // a cancel report for the header the commit path re-queued moves nothing
+    proposer.process_uncertified_header(2, h2.digest());
+    assert_eq!(queue(&proposer), [a, b1, b2]);
+
+    let lines = capture.events("digests resent");
+    assert_eq!(lines.len(), 2, "one line per re-queue that moved digests");
+    assert_eq!(lines[0].field("cause"), Some("canceled"));
+    assert_eq!(lines[0].u64_field("count"), Some(2));
+    assert_eq!(lines[0].u64_field("from_round"), Some(3));
+    assert_eq!(lines[1].field("cause"), Some("committed"));
+    assert_eq!(lines[1].u64_field("count"), Some(1));
+    assert_eq!(lines[1].u64_field("from_round"), Some(2));
+    assert_eq!(lines[1].u64_field("round"), Some(5));
+    assert_eq!(requeued_totals(&snapshotter), [Some(2), Some(1)]);
+}

@@ -16,8 +16,9 @@ use tn_storage::{tables::ProposedCertificates, CertificateStore};
 use tn_types::{
     ensure,
     error::{DagError, DagResult},
-    AuthorityIdentifier, BlsPublicKey, Certificate, Committee, Database, Header, HeaderDigest,
-    Noticer, Notifier, TaskError, TaskManager, TaskResult, TaskSpawner, TnReceiver, Vote,
+    AuthorityIdentifier, BlsPublicKey, Certificate, Committee, Database, Epoch, Header,
+    HeaderDigest, Noticer, Notifier, Round, TaskError, TaskManager, TaskResult, TaskSpawner,
+    TnReceiver, TnSender, Vote,
 };
 use tokio::sync::{mpsc, Mutex, Notify};
 use tracing::{debug, enabled, error, info, instrument, warn};
@@ -71,6 +72,9 @@ pub(crate) struct Certifier<DB> {
     in_flight: InFlightMarker,
     /// Prometheus metrics for vote collection and certificate formation.
     metrics: crate::PrimaryMetrics,
+    /// The consensus channels: reports own headers that a newer own header cancelled to the
+    /// proposer (see [`Self::report_canceled`]).
+    consensus_bus: ConsensusBus,
 }
 
 impl<DB: Database> Certifier<DB> {
@@ -128,6 +132,7 @@ impl<DB: Database> Certifier<DB> {
                 proposal_lock: Arc::new(Mutex::new(())),
                 in_flight: Arc::default(),
                 metrics,
+                consensus_bus,
             }
             .run(rx_headers)
             .await;
@@ -457,13 +462,6 @@ impl<DB: Database> Certifier<DB> {
                 // exit early when cancel notification received
                 _ = &cancel_proposal => {
                     debug!(target: "primary::certifier", "new proposal received - aborting proposal...");
-                    info!(
-                        target: "consensus::metrics",
-                        round = header.round(),
-                        epoch = header.epoch(),
-                        reason = "canceled",
-                        "header uncertified"
-                    );
                     return Err(DagError::Canceled);
                 }
             }
@@ -574,11 +572,23 @@ impl<DB: Database> Certifier<DB> {
         // still spawn its vote requests
         if new_proposal_noticer.noticed() {
             debug!(target: "primary::certifier", %header_digest, "header superseded before its proposal started; skipping proposal");
+            // this path runs before the already-certified check below, so it also takes the
+            // identical re-send of a header certified earlier (the max-delay re-send): only a
+            // header with no stored certificate is reported, and a read error reports nothing
+            if matches!(
+                self.config.node_storage().get::<ProposedCertificates>(&header_digest),
+                Ok(None)
+            ) {
+                self.report_canceled(header.round(), header.epoch(), header_digest);
+            }
             return Ok(());
         }
-        if let Ok(Some(cert)) =
-            self.config.node_storage().get::<ProposedCertificates>(&header_digest)
-        {
+        let stored_certificate =
+            self.config.node_storage().get::<ProposedCertificates>(&header_digest);
+        // a read error falls through into the proposal below, and that header may already hold a
+        // stored and gossiped certificate: a cancel reports only a header known to have none
+        let report_on_cancel = matches!(stored_certificate, Ok(None));
+        if let Ok(Some(cert)) = stored_certificate {
             info!(target: "primary::certifier", "asked to propose a header that is already certified {header_digest}, skipping proposal and re-publishing");
             // We have already processed this certificate, doing so again could produce signature
             // equivocation and destroy deterministic randomness (based on the leader
@@ -620,11 +630,16 @@ impl<DB: Database> Certifier<DB> {
             }
             return Ok(());
         }
+        // the header moves into its proposal below; a cancel reports it by round, epoch and digest
+        let (header_round, header_epoch) = (header.round(), header.epoch());
         tokio::select! {
             // listen for new_proposal notification to exit
             // NOTE: sub here is okay bc no loop
             _ = new_proposal_noticer => {
                 debug!(target: "primary::certifier", "new proposal notification received");
+                if report_on_cancel {
+                    self.report_canceled(header_round, header_epoch, header_digest);
+                }
                 Ok(())
             },
 
@@ -711,6 +726,9 @@ impl<DB: Database> Certifier<DB> {
                                     auth=?self.authority_id,
                                     "certifier cancelled proposed header task"
                                 );
+                                if report_on_cancel {
+                                    self.report_canceled(header_round, header_epoch, header_digest);
+                                }
                                 Ok(())
                             }
                             // log other errors loudly
@@ -726,6 +744,44 @@ impl<DB: Database> Certifier<DB> {
                     }
                 }
             }
+        }
+    }
+
+    /// Report that the own header at `round` of `epoch` with `digest` will never be certified: a
+    /// newer own header cancelled its proposal before a certificate formed.
+    ///
+    /// Logs the `header uncertified` line with `reason=canceled`, and tells the proposer so it
+    /// can move the header's batch digests to its next header: only the author can aggregate the
+    /// votes for its header, and the proposer never sends a header below its round again. The
+    /// line counts every cancel, including the idle cancels of headers without digests that the
+    /// proposer's `digests resent` line never shows.
+    ///
+    /// Called only where `new_proposal` ends the proposal of a header without a stored certificate,
+    /// never where a proposal ends without a certificate: the identical header re-sent on the
+    /// max-delay tick may still be certified then. A shutdown also fires `new_proposal`; nothing
+    /// is logged or reported once it has.
+    ///
+    /// Never waits: a full queue drops the report with a debug line, and the digests then wait for
+    /// the proposer's next own commit, which re-queues every uncommitted header below it.
+    fn report_canceled(&self, round: Round, epoch: Epoch, digest: HeaderDigest) {
+        if self.config.shutdown().is_notified() {
+            return;
+        }
+        info!(
+            target: "consensus::metrics",
+            round,
+            epoch,
+            reason = "canceled",
+            "header uncertified"
+        );
+        if let Err(e) = self.consensus_bus.uncertified_own_headers().try_send((round, digest)) {
+            debug!(
+                target: "primary::certifier",
+                round,
+                %digest,
+                %e,
+                "uncertified own header report dropped"
+            );
         }
     }
 
