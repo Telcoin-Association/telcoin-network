@@ -581,11 +581,22 @@ impl RejoinState {
     /// Record a promotion in `epoch` at `now`: one more attempt, stamped `now`. A promotion in an
     /// epoch other than the one held starts a new count.
     pub fn record_promotion(&mut self, epoch: Epoch, now: Instant) {
-        if self.epoch != epoch {
-            *self = Self { epoch, ..Self::default() };
-        }
+        self.enter_epoch(epoch);
         self.attempts = self.attempts.saturating_add(1);
         self.promoted_at = Some(now);
+    }
+
+    /// Start a new count for `epoch` unless it is the epoch held, as an inactive node does when it
+    /// enters a new epoch. The readers already see a new epoch as zero attempts and no promotion,
+    /// so this only makes the reset explicit. A restart inside the held epoch keeps the count, so
+    /// the per-epoch cap survives the mode changes between attempts. Returns true when the state
+    /// changed.
+    pub fn enter_epoch(&mut self, epoch: Epoch) -> bool {
+        if self.epoch == epoch {
+            return false;
+        }
+        *self = Self { epoch, ..Self::default() };
+        true
     }
 
     /// The promotions recorded in `epoch`; zero for any other epoch.

@@ -107,6 +107,20 @@ pub const fn rejoin_round_window(gc_depth: Round) -> Round {
 /// demoted at once.
 pub const REJOIN_DEMOTION_GRACE: Duration = Duration::from_secs(30);
 
+/// Promotions back to an active CVV a catching-up node makes in one epoch before it stops trying.
+///
+/// In the bench data a third promotion within one epoch has never succeeded: whatever demoted the
+/// node twice demotes it again, and every round trip costs the committee a member that proposes
+/// without committing. After two, the node keeps following consensus as an inactive CVV until the
+/// epoch boundary. The rejoin count is keyed by epoch, so the key alone starts the next epoch at
+/// zero; the sticky inactive entry into that epoch also resets it, as a second safeguard.
+///
+/// Every promotion counts as an attempt, a successful one included: a node whose first rejoin
+/// held for hours sits out the rest of the epoch once a second promotion fails. That is accepted
+/// for the bench. Upstream should count only promotions followed by a demotion inside the rejoin
+/// grace ([`REJOIN_DEMOTION_GRACE`]).
+pub const MAX_REJOIN_ATTEMPTS_PER_EPOCH: u32 = 2;
+
 /// Rounds of certificates the certificate store keeps below the newest round it writes.
 ///
 /// Each certificate write prunes every round below `H - ROUNDS_TO_KEEP`, where `H` is the round

@@ -20,6 +20,7 @@ use tn_types::{
     CertifiedBatch, CommittedSubDag, Committee, ConsensusHeader, ConsensusHeaderDigest,
     ConsensusOutput, ConsensusResult, Database, Epoch, EpochRecord, Hash as _, Noticer, Round,
     TaskManager, TaskSpawner, Timestamp, TimestampSec, TnReceiver, TnSender, WorkerId,
+    MAX_REJOIN_ATTEMPTS_PER_EPOCH,
 };
 use tracing::{debug, error, info, instrument, warn};
 
@@ -72,7 +73,10 @@ fn rejoin_epoch_is_open(
 ///
 /// `handled_epoch` and `handled_round` belong to the consensus output the node just handled.
 /// `newest_epoch`, `newest_round` and `newest_age` belong to the newest consensus header the node
-/// knows about. The rule has three parts:
+/// knows about. `attempts` counts the promotions this node already made in its epoch. The rule has
+/// four parts:
+/// - the node was promoted fewer than [`MAX_REJOIN_ATTEMPTS_PER_EPOCH`] times in its epoch; past
+///   that it follows consensus as inactive until the epoch boundary resets the count;
 /// - the newest known header is younger than [`REJOIN_HEAD_MAX_AGE`]. Freshness is checked on the
 ///   newest known header, not on the handled output, so a stale record still blocks promotion;
 /// - both are in the same epoch, because rounds only compare inside one epoch;
@@ -90,8 +94,10 @@ fn rejoin_ready(
     newest_round: Round,
     newest_age: Duration,
     rejoin_window: Round,
+    attempts: u32,
 ) -> bool {
-    newest_age < REJOIN_HEAD_MAX_AGE
+    attempts < MAX_REJOIN_ATTEMPTS_PER_EPOCH
+        && newest_age < REJOIN_HEAD_MAX_AGE
         && handled_epoch == newest_epoch
         && newest_round.saturating_sub(handled_round) <= rejoin_window
 }
@@ -318,6 +324,9 @@ impl<DB: Database> Subscriber<DB> {
                         age: header.sub_dag.commit_timestamp_ms().elapsed(),
                     }
                 });
+            // the promotions this node already made in its epoch, capped per epoch
+            let attempts =
+                self.consensus_bus.rejoin_state().borrow().attempts(self.inner.committee.epoch());
             if let Some(newest) = &newest {
                 // Rejoin when the handled output is within the rejoin window of the newest known
                 // header and that header is fresh. The freshness check stops a stale record from
@@ -330,6 +339,7 @@ impl<DB: Database> Subscriber<DB> {
                         newest.round,
                         newest.age,
                         rejoin_window,
+                        attempts,
                     )
                 {
                     let (exec_round, exec_number) = self.exec_progress();
@@ -350,7 +360,8 @@ impl<DB: Database> Subscriber<DB> {
                     return Ok(());
                 }
             }
-            let reason = RejoinBlocker::classify(epoch_is_open, newest.as_ref(), handled_epoch);
+            let reason =
+                RejoinBlocker::classify(epoch_is_open, attempts, newest.as_ref(), handled_epoch);
             blocked_counters[reason.index()].increment(1);
             if not_ready_log.should_log(reason, Instant::now()) {
                 // a node with no known header logs zeros for the newest header's fields
@@ -1048,6 +1059,9 @@ enum RejoinBlocker {
     /// The handled output is not from this subscriber's still-open epoch (see
     /// `rejoin_epoch_is_open`), so the node keeps replaying.
     EpochClosed,
+    /// This node was already promoted [`MAX_REJOIN_ATTEMPTS_PER_EPOCH`] times in its epoch, so it
+    /// follows consensus as inactive until the epoch boundary.
+    AttemptsExhausted,
     /// No consensus header has been seen yet to measure the network head by.
     NoKnownHeader,
     /// The newest known header is at least [`REJOIN_HEAD_MAX_AGE`] old.
@@ -1060,12 +1074,13 @@ enum RejoinBlocker {
 
 impl RejoinBlocker {
     /// The number of blockers.
-    const COUNT: usize = 5;
+    const COUNT: usize = 6;
 
     /// Every blocker, in the order [`Self::classify`] tests them. A blocker's position here is its
     /// [`Self::index`].
     const ALL: [Self; Self::COUNT] = [
         Self::EpochClosed,
+        Self::AttemptsExhausted,
         Self::NoKnownHeader,
         Self::StaleHead,
         Self::EpochMismatch,
@@ -1076,6 +1091,7 @@ impl RejoinBlocker {
     const fn as_str(self) -> &'static str {
         match self {
             Self::EpochClosed => "epoch_closed",
+            Self::AttemptsExhausted => "attempts_exhausted",
             Self::NoKnownHeader => "no_known_header",
             Self::StaleHead => "stale_head",
             Self::EpochMismatch => "epoch_mismatch",
@@ -1091,12 +1107,21 @@ impl RejoinBlocker {
     /// Classify a readiness check that failed: the first condition the check would refuse, in the
     /// order of [`Self::ALL`].
     ///
-    /// Call only on the not-ready branch. The first four blockers mirror `rejoin_epoch_is_open`
-    /// and the freshness and epoch parts of `rejoin_ready`, so a failed check that passes them
-    /// failed on the round gap.
-    fn classify(epoch_is_open: bool, newest: Option<&NewestHeader>, handled_epoch: Epoch) -> Self {
+    /// Call only on the not-ready branch. The first five blockers mirror `rejoin_epoch_is_open`
+    /// and the attempts, freshness and epoch parts of `rejoin_ready`, so a failed check that
+    /// passes them failed on the round gap. A node out of attempts reports that ahead of the
+    /// network head, which no longer decides anything for it in this epoch.
+    fn classify(
+        epoch_is_open: bool,
+        attempts: u32,
+        newest: Option<&NewestHeader>,
+        handled_epoch: Epoch,
+    ) -> Self {
         if !epoch_is_open {
             return Self::EpochClosed;
+        }
+        if attempts >= MAX_REJOIN_ATTEMPTS_PER_EPOCH {
+            return Self::AttemptsExhausted;
         }
         let Some(newest) = newest else {
             return Self::NoKnownHeader;
@@ -1877,8 +1902,14 @@ mod tests {
 
     // bench5 f3-rejoin
     mod f3_rejoin {
-        use super::*;
+        use super::{
+            super::{rejoin_ready, NewestHeader, RejoinBlocker},
+            *,
+        };
         use tn_primary::NodeMode;
+        use tn_types::{
+            rejoin_round_window, Epoch, Round, MAX_GC_DEPTH, MAX_REJOIN_ATTEMPTS_PER_EPOCH,
+        };
 
         /// A promotion goes through `promote`: it records one attempt and its time in the rejoin
         /// state, flips the node to an active CVV and ends the epoch.
@@ -1903,6 +1934,61 @@ mod tests {
             assert!(state.promoted_at(epoch).is_some(), "the promotion is stamped");
             assert!(bus.is_active_cvv(), "the node is active");
             assert!(epoch_shutdown.noticed(), "the epoch restarts");
+        }
+
+        /// The catching-up node's epoch in these cases.
+        const EPOCH: Epoch = 3;
+        /// Round of the newest known header, which the handled output matches.
+        const NEWEST: Round = 400;
+
+        /// A catching-up CVV rejoins twice in an epoch and is refused a third time with
+        /// `attempts_exhausted`, reported ahead of the head conditions but after a closed epoch.
+        /// The next epoch's key reads zero, and the sticky inactive entry into it resets the count
+        /// while a mode change inside the epoch keeps it.
+        #[test]
+        fn third_rejoin_in_an_epoch_is_refused() {
+            let window = rejoin_round_window(MAX_GC_DEPTH);
+            let fresh = Duration::from_millis(500);
+            let newest = NewestHeader { number: 9, epoch: EPOCH, round: NEWEST, age: fresh };
+            let bus = ConsensusBusApp::new();
+            let attempts = |epoch: Epoch| bus.rejoin_state().borrow().attempts(epoch);
+            let ready = |epoch: Epoch| {
+                rejoin_ready(epoch, NEWEST, epoch, NEWEST, fresh, window, attempts(epoch))
+            };
+
+            for promotion in 1..=MAX_REJOIN_ATTEMPTS_PER_EPOCH {
+                assert!(ready(EPOCH), "promotion {promotion} is allowed");
+                bus.rejoin_state().send_modify(|state| {
+                    state.record_promotion(EPOCH, tokio::time::Instant::now())
+                });
+            }
+            assert_eq!(attempts(EPOCH), 2);
+            assert!(!ready(EPOCH), "a third promotion in the epoch is refused");
+            assert_eq!(
+                RejoinBlocker::classify(true, attempts(EPOCH), Some(&newest), EPOCH),
+                RejoinBlocker::AttemptsExhausted
+            );
+            assert_eq!(
+                RejoinBlocker::classify(true, attempts(EPOCH), None, EPOCH),
+                RejoinBlocker::AttemptsExhausted,
+                "reported ahead of the head conditions"
+            );
+            assert_eq!(
+                RejoinBlocker::classify(false, attempts(EPOCH), Some(&newest), EPOCH),
+                RejoinBlocker::EpochClosed,
+                "a closed epoch is still reported first"
+            );
+            assert_eq!(RejoinBlocker::AttemptsExhausted.as_str(), "attempts_exhausted");
+
+            assert_eq!(attempts(EPOCH + 1), 0, "the next epoch's key starts at zero");
+            assert!(ready(EPOCH + 1), "the next epoch may rejoin again");
+            assert!(
+                !bus.rejoin_state().send_if_modified(|state| state.enter_epoch(EPOCH)),
+                "an inactive restart inside the epoch keeps the count"
+            );
+            assert_eq!(attempts(EPOCH), 2);
+            assert!(bus.rejoin_state().send_if_modified(|state| state.enter_epoch(EPOCH + 1)));
+            assert_eq!((attempts(EPOCH), attempts(EPOCH + 1)), (0, 0), "the boundary resets it");
         }
     }
 }
@@ -2014,6 +2100,7 @@ mod rejoin_tests {
             NEWEST,
             FRESH,
             rejoin_round_window(MAX_GC_DEPTH),
+            0,
         )
     }
 
@@ -2054,11 +2141,11 @@ mod rejoin_tests {
     fn no_rejoin_on_stale_newest_header() {
         let window = rejoin_round_window(MAX_GC_DEPTH);
         assert!(
-            !rejoin_ready(EPOCH, NEWEST, EPOCH, NEWEST, REJOIN_HEAD_MAX_AGE, window),
+            !rejoin_ready(EPOCH, NEWEST, EPOCH, NEWEST, REJOIN_HEAD_MAX_AGE, window, 0),
             "a newest header at the age limit must not promote"
         );
         assert!(
-            !rejoin_ready(EPOCH, NEWEST, EPOCH, NEWEST, Duration::from_secs(60), window),
+            !rejoin_ready(EPOCH, NEWEST, EPOCH, NEWEST, Duration::from_secs(60), window, 0),
             "an old newest header must not promote"
         );
     }
@@ -2068,7 +2155,7 @@ mod rejoin_tests {
     fn no_rejoin_across_epochs() {
         let window = rejoin_round_window(MAX_GC_DEPTH);
         assert!(
-            !rejoin_ready(EPOCH, NEWEST, EPOCH + 1, NEWEST, FRESH, window),
+            !rejoin_ready(EPOCH, NEWEST, EPOCH + 1, NEWEST, FRESH, window, 0),
             "a node in an older epoch must not rejoin"
         );
     }
@@ -2110,7 +2197,7 @@ mod rejoin_tests {
     fn rejoin_when_ahead_of_newest_header() {
         let window = rejoin_round_window(MAX_GC_DEPTH);
         assert!(
-            rejoin_ready(EPOCH, NEWEST + 2, EPOCH, NEWEST, FRESH, window),
+            rejoin_ready(EPOCH, NEWEST + 2, EPOCH, NEWEST, FRESH, window, 0),
             "a node past the newest known header must rejoin"
         );
     }
@@ -2147,13 +2234,19 @@ mod rejoin_tests {
         ];
         for (epoch_is_open, newest, expected) in cases {
             assert_eq!(
-                RejoinBlocker::classify(epoch_is_open, newest, EPOCH),
+                RejoinBlocker::classify(epoch_is_open, 0, newest, EPOCH),
                 expected,
                 "open={epoch_is_open} newest={newest:?}"
             );
         }
-        let labels =
-            ["epoch_closed", "no_known_header", "stale_head", "epoch_mismatch", "round_gap"];
+        let labels = [
+            "epoch_closed",
+            "attempts_exhausted",
+            "no_known_header",
+            "stale_head",
+            "epoch_mismatch",
+            "round_gap",
+        ];
         assert_eq!(RejoinBlocker::ALL.map(RejoinBlocker::as_str), labels);
         for (index, blocker) in RejoinBlocker::ALL.into_iter().enumerate() {
             assert_eq!(blocker.index(), index);
@@ -2170,14 +2263,16 @@ mod rejoin_tests {
             for newest_epoch in [EPOCH - 1, EPOCH, EPOCH + 1] {
                 for handled_round in [0, NEWEST - window - 1, NEWEST - window, NEWEST, NEWEST + 1] {
                     let newest = newest_header(newest_epoch, age);
-                    if rejoin_ready(EPOCH, handled_round, newest_epoch, NEWEST, age, window) {
+                    if rejoin_ready(EPOCH, handled_round, newest_epoch, NEWEST, age, window, 0) {
                         continue;
                     }
-                    let holds = match RejoinBlocker::classify(true, Some(&newest), EPOCH) {
+                    let holds = match RejoinBlocker::classify(true, 0, Some(&newest), EPOCH) {
                         RejoinBlocker::StaleHead => age >= REJOIN_HEAD_MAX_AGE,
                         RejoinBlocker::EpochMismatch => newest_epoch != EPOCH,
                         RejoinBlocker::RoundGap => NEWEST.saturating_sub(handled_round) > window,
-                        RejoinBlocker::EpochClosed | RejoinBlocker::NoKnownHeader => false,
+                        RejoinBlocker::EpochClosed
+                        | RejoinBlocker::AttemptsExhausted
+                        | RejoinBlocker::NoKnownHeader => false,
                     };
                     assert!(holds, "age={age:?} epoch={newest_epoch} round={handled_round}");
                 }
