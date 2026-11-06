@@ -221,6 +221,7 @@ pub fn execute_consensus_output(
             &canonical_in_memory_state,
             &mut output_overlay,
             &mut timings,
+            output.number(),
         );
         // On failure, revert the in-memory advance applied by any earlier block of this output so
         // the propagated error never leaves a phantom canonical head observable to RPC. The leader
@@ -303,6 +304,7 @@ pub fn execute_consensus_output(
                 &canonical_in_memory_state,
                 &mut output_overlay,
                 &mut timings,
+                output.number(),
             );
             // On failure of a later block, revert the in-memory advance applied by the earlier
             // blocks of this output so the propagated (node-halting) error never leaves a phantom
@@ -438,7 +440,11 @@ impl OutputTimings {
 /// `output_overlay` is the consensus output's shared accumulated trie overlay: the build
 /// computes this block's state root layered over it and then extends it with the block's
 /// sorted deltas for the NEXT block of the output (#1301). The build's phase laps are added to
-/// `timings`.
+/// `timings`. `consensus_number` only labels the `next block executed` line, together with the
+/// payload's batch index and digest, so each block joins back to its consensus output and batch.
+// the per-output accumulators and the log context are separate on purpose; bundling them into a
+// struct would only rename the same eight values
+#[allow(clippy::too_many_arguments)]
 fn execute_payload(
     payload: TNPayload,
     transactions: &Vec<Vec<u8>>,
@@ -447,7 +453,11 @@ fn execute_payload(
     canonical_in_memory_state: &CanonicalInMemoryState,
     output_overlay: &mut OutputTrieOverlay,
     timings: &mut OutputTimings,
+    consensus_number: u64,
 ) -> EngineResult<SealedHeader> {
+    // the payload moves into the build: keep its consensus ids for the log line
+    let batch_index = payload.batch_index;
+    let batch_digest = payload.batch_digest;
     // execute
     let (next_canonical_block, block_timings) =
         reth_env.build_block_from_batch_payload_timed(payload, transactions, output_overlay)?;
@@ -456,7 +466,15 @@ fn execute_payload(
 
     // update header for next block execution in loop
     let canonical_header = next_canonical_block.recovered_block.clone_sealed_header();
-    info!(target: "engine", hash = canonical_header.hash().to_string(), number = canonical_header.number, "next block executed");
+    info!(
+        target: "engine",
+        hash = canonical_header.hash().to_string(),
+        number = canonical_header.number,
+        consensus_number,
+        batch_index,
+        batch_digest = %batch_digest,
+        "next block executed"
+    );
     crate::metrics::ENGINE_METRICS.blocks_executed_total.increment(1);
     crate::metrics::ENGINE_METRICS.block_gas_used.record(canonical_header.gas_used as f64);
     // Eagerly advance the shared in-memory state. This is load-bearing within a multi-block
