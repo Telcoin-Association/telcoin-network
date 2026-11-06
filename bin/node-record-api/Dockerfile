@@ -30,11 +30,14 @@ RUN apt-get update && \
 COPY Cargo* ./
 COPY bin/ ./bin/
 COPY crates/ ./crates/
-# Path dependencies of workspace members: the vendored reth and the carried crate patches.
-COPY vendor/ ./vendor/
-COPY patches/ ./patches/
 COPY chain-configs/ ./chain-configs/
 COPY tn-contracts/ ./tn-contracts/
+# Workspace members and [patch.crates-io] path sources named by the root
+# Cargo.toml; cargo cannot load the workspace without them, even for -p.
+COPY examples/ ./examples/
+COPY patches/ ./patches/
+# The vendored reth: the root Cargo.toml's reth-* dependencies are paths into it.
+COPY vendor/ ./vendor/
 
 # Build only the API binary, then move it out of the cache mount so the
 # runtime stage can COPY it.
