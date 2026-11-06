@@ -228,6 +228,17 @@ pub enum HeaderError {
          not vote"
     )]
     NotActiveCvv,
+    /// This node's execution did not reach the block the header was built on within the voter's
+    /// execution wait, so it refuses to vote for now.
+    ///
+    /// `header_block` is the number of the header's `latest_execution_block` and `local_block` the
+    /// number of this node's latest executed block when the wait ran out. The refusal is
+    /// recoverable and carries no penalty: the requester retries, and a voter that has caught up
+    /// by then votes on the retry.
+    #[error(
+        "Execution is behind the header: header block {header_block}, local block {local_block}"
+    )]
+    ExecutionBehind { header_block: u64, local_block: u64 },
     /// The header's execution block lies below this node's restored-state floor, so this voter
     /// can never check it and refuses to vote.
     ///

@@ -15,7 +15,7 @@ use std::{
     sync::Arc,
     time::{Duration, Instant},
 };
-use tn_config::ConsensusConfig;
+use tn_config::{ConsensusConfig, VOTE_EXECUTION_WAIT};
 use tn_network_libp2p::{
     write_frame, GossipMessage, PrimarySyncRequest, Stream, SyncFrame, SyncFrameError,
 };
@@ -1104,11 +1104,19 @@ where
         // if peer is ahead, wait for execution to catch up
         // NOTE: this doesn't hurt since this node shouldn't vote until execution is caught up
         // ensure execution results match if this succeeds.
+        // the wait is bounded by `VOTE_EXECUTION_WAIT`, well inside the vote timeout: a voter
+        // further behind refuses with a recoverable `ExecutionBehind` instead of holding the
+        // request, so the requester asks again soon and votes once execution has caught up
         timing.enter(VoteStage::ExecWait);
         let header_block = header.latest_execution_block();
-        match self.consensus_bus.wait_for_execution(header_block).await {
-            Ok(()) => {}
-            Err(ExecutionCheckError::Fork) => {
+        match tokio::time::timeout(
+            VOTE_EXECUTION_WAIT,
+            self.consensus_bus.wait_for_execution(header_block),
+        )
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(ExecutionCheckError::Fork)) => {
                 error!(
                     target: "primary",
                     peer_hash = ?header_block,
@@ -1117,7 +1125,7 @@ where
                 );
                 return Err(HeaderError::UnknownExecutionResult(header_block).into());
             }
-            Err(ExecutionCheckError::BelowFloor { floor }) => {
+            Ok(Err(ExecutionCheckError::BelowFloor { floor })) => {
                 // a snapshot-restored voter holds no block below its floor, so it can neither
                 // confirm nor refute the header's and never will: a final refusal without a
                 // penalty, not a fork
@@ -1133,8 +1141,16 @@ where
                 }
                 .into());
             }
-            Err(ExecutionCheckError::Closed) => {
+            Ok(Err(ExecutionCheckError::Closed)) => {
                 return Err(HeaderError::ClosedWatchChannel.into());
+            }
+            Err(_) => {
+                self.consensus_bus.metrics().votes_refused_execution_behind_total.increment(1);
+                return Err(HeaderError::ExecutionBehind {
+                    header_block: header_block.number,
+                    local_block: self.consensus_bus.latest_execution_block_num_hash().number,
+                }
+                .into());
             }
         }
         timing.enter(VoteStage::Parents);
@@ -1938,6 +1954,10 @@ enum VoteOutcome {
     Deferred,
     /// The header round is beyond the committed round plus the gc depth.
     TooNew,
+    /// A recoverable refusal because this node is not ready to vote: it is not an active committee
+    /// validator, or its execution did not reach the header's block within the voter's execution
+    /// wait.
+    Behind,
     /// The request or its header failed a check, or a cached refusal was returned.
     Rejected,
     /// The vote timeout fired before a decision.
@@ -1960,6 +1980,9 @@ impl VoteOutcome {
             // a refusal cached for this header's digest
             Ok(_) => Self::Rejected,
             Err(PrimaryNetworkError::InvalidHeader(HeaderError::TooNew { .. })) => Self::TooNew,
+            Err(PrimaryNetworkError::InvalidHeader(
+                HeaderError::NotActiveCvv | HeaderError::ExecutionBehind { .. },
+            )) => Self::Behind,
             Err(PrimaryNetworkError::Timeout(_)) => Self::Timeout,
             Err(PrimaryNetworkError::InvalidHeader(
                 HeaderError::Storage(_)
@@ -1989,6 +2012,7 @@ impl VoteOutcome {
             Self::MissingParents => "missing_parents",
             Self::Deferred => "deferred",
             Self::TooNew => "too_new",
+            Self::Behind => "behind",
             Self::Rejected => "rejected",
             Self::Timeout => "timeout",
             Self::Error => "error",
@@ -2075,6 +2099,9 @@ mod tests {
         assert_eq!(outcome(Err(too_new.into()), &timing), "too_new");
         assert_eq!(outcome(Err(HeaderError::PeerNotAuthor.into()), &timing), "rejected");
         assert_eq!(outcome(Err(HeaderError::InvalidParentRound.into()), &timing), "rejected");
+        assert_eq!(outcome(Err(HeaderError::NotActiveCvv.into()), &timing), "behind");
+        let behind = HeaderError::ExecutionBehind { header_block: 12, local_block: 9 };
+        assert_eq!(outcome(Err(behind.into()), &timing), "behind");
         let storage = HeaderError::Storage(eyre::eyre!("disk"));
         assert_eq!(outcome(Err(storage.into()), &timing), "error");
         assert_eq!(

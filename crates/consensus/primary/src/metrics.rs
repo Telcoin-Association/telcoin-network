@@ -104,6 +104,12 @@ pub struct PrimaryMetrics {
     /// the vote timeout, so this moves only while the node is not an active CVV, plus the rare
     /// request whose node was demoted before it signed.
     pub(crate) votes_refused_inactive_total: Counter,
+    /// Vote requests refused because this node's execution did not reach the header's block
+    /// within the voter's execution wait (`VOTE_EXECUTION_WAIT`).
+    ///
+    /// A steady rate means this node executes behind the committee: it answers with a
+    /// recoverable refusal and votes on a retry once its execution has caught up.
+    pub(crate) votes_refused_execution_behind_total: Counter,
     /// Rounds the committed round leads the last leader round the engine processed (mirrored
     /// from the committed-round and recent-blocks watch channels; zero while execution is at or
     /// ahead of it).
@@ -527,6 +533,7 @@ mod tests {
             metrics.record_consensus_output_bytes(123);
             metrics.commit_run_ahead_blocked_total.increment(1);
             metrics.votes_refused_inactive_total.increment(1);
+            metrics.votes_refused_execution_behind_total.increment(2);
             metrics.execution_check_retries_total.increment(4);
         });
 
@@ -562,6 +569,8 @@ mod tests {
         assert!(matches!(value, DebugValue::Counter(1)));
         let (_, _, _, value) = find("tn_primary.votes_refused_inactive_total");
         assert!(matches!(value, DebugValue::Counter(1)));
+        let (_, _, _, value) = find("tn_primary.votes_refused_execution_behind_total");
+        assert!(matches!(value, DebugValue::Counter(2)));
         let (_, _, _, value) = find("tn_primary.execution_check_retries_total");
         assert!(matches!(value, DebugValue::Counter(4)));
     }

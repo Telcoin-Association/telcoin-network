@@ -26,7 +26,7 @@ use std::{
     time::{Duration, Instant},
 };
 use tempfile::TempDir;
-use tn_config::{ConsensusConfig, KeyConfig, Parameters};
+use tn_config::{ConsensusConfig, KeyConfig, Parameters, VOTE_EXECUTION_WAIT};
 use tn_network_libp2p::{
     error::NetworkError,
     types::{
@@ -2025,54 +2025,123 @@ async fn test_vote_per_authority_lock_concurrent_same_header() -> eyre::Result<(
     Ok(())
 }
 
-/// When `vote_inner` blocks longer than [`Parameters::vote_timeout`], `vote()` must return
-/// `PrimaryNetworkError::Timeout` once that timeout elapses.
+/// A voter whose execution has not reached the header's block refuses the vote as
+/// `ExecutionBehind` once [`VOTE_EXECUTION_WAIT`] passes, well inside the 5 s default
+/// [`Parameters::vote_timeout`], and a block that executes within the wait lets the vote proceed.
 ///
-/// `vote_timeout` is the voter-side limit on evaluating one vote request, including every wait for
-/// execution, parents, batches, or a future-dated header's lead. To force a reliable block the
-/// header's `latest_execution_block` is at block number 1 while the test environment only has
-/// block 0, so `wait_for_execution` suspends on the watch channel. The paused clock jumps from
-/// timer to timer, so the virtual time the call takes pins the configured timeout rather than the
-/// 5 s default or any other header-cadence setting.
+/// To force a reliable block the header's `latest_execution_block` is at block number 1 while the
+/// test environment only has block 0, so `wait_for_execution` suspends on the watch channel. The
+/// paused clock jumps from timer to timer, so the virtual time the call takes pins the execution
+/// wait rather than the vote timeout or any header-cadence setting.
 ///
-/// The timeout is recoverable: it carries no penalty and answers the requester with a
-/// `RecoverableError`, so the proposer asks again instead of giving up on this voter.
+/// The refusal is recoverable: it carries no penalty and answers the requester with a
+/// `RecoverableError`, so the proposer asks again instead of giving up on this voter. It also
+/// leaves the author's vote-cache entry as it was, so a header from the same author for the same
+/// round still earns a vote once block 1 executes within the wait. A block that executes within
+/// the wait at the header's height but with another hash still fails the fork check
+/// (`UnknownExecutionResult`) and stores no vote.
 #[tokio::test(start_paused = true)]
 async fn test_vote_inner_timeout() -> eyre::Result<()> {
-    let vote_timeout = Duration::from_millis(10);
     let temp_dir = TempDir::new().unwrap();
-    let TestTypes { committee, handler, task_manager: _task_manager, .. } =
-        create_test_types_with_vote_timeout(temp_dir.path(), vote_timeout).await;
-
-    // Block number 1 will never be executed in this test; vote_inner blocks in
-    // wait_for_execution until the outer timeout fires.
-    let future_block = BlockNumHash::new(1, BlockHash::random());
-    let header = committee
-        .header_builder_last_authority()
-        .latest_execution_block(future_block)
-        .created_at(1)
-        .build();
+    let TestTypes { committee, handler, parent, consensus_bus, task_manager: _task_manager } =
+        create_test_types(temp_dir.path()).await;
+    let vote_timeout = Parameters::default().vote_timeout;
+    assert!(VOTE_EXECUTION_WAIT < vote_timeout, "the execution wait must end first");
     let peer = *committee.last_authority().authority().protocol_key();
+    let builder = || committee.header_builder_last_authority().created_at(1);
 
+    // block 1 has not executed, so vote_inner waits for it until the execution wait runs out
+    let header =
+        builder().latest_execution_block(BlockNumHash::new(1, BlockHash::random())).build();
     let start = tokio::time::Instant::now();
     let err = handler
         .vote(peer, header, vec![])
         .await
-        .expect_err("a vote request that never finishes evaluating must time out");
+        .expect_err("a voter behind on execution must refuse the vote");
     let waited = start.elapsed();
 
-    assert_matches!(err, PrimaryNetworkError::Timeout(_), "expected Timeout error");
-    assert!(
-        waited >= vote_timeout && waited < vote_timeout * 2,
-        "the vote must time out after the configured vote_timeout {vote_timeout:?}, waited \
-         {waited:?}"
+    assert_matches!(
+        err,
+        PrimaryNetworkError::InvalidHeader(HeaderError::ExecutionBehind {
+            header_block: 1,
+            local_block: 0
+        }),
+        "expected ExecutionBehind error"
     );
-    assert!(Option::<Penalty>::from(&err).is_none(), "a vote timeout must not penalize the author");
+    assert!(
+        waited >= VOTE_EXECUTION_WAIT && waited < VOTE_EXECUTION_WAIT * 2,
+        "the voter must refuse after the execution wait {VOTE_EXECUTION_WAIT:?}, not the vote \
+         timeout {vote_timeout:?}, waited {waited:?}"
+    );
+    assert!(Option::<Penalty>::from(&err).is_none(), "the refusal must not penalize the author");
     assert_matches!(
         PrimaryResponse::into_error_ref(&err),
         PrimaryResponse::RecoverableError(_),
-        "a vote timeout must answer the requester with a retryable response"
+        "the refusal must answer the requester with a retryable response"
     );
+
+    // block 1 executes half-way through the wait: the vote proceeds
+    let block = SealedHeader::seal_slow(ExecHeader {
+        number: 1,
+        parent_hash: parent.hash(),
+        ..Default::default()
+    });
+    let header = builder().latest_execution_block(BlockNumHash::new(1, block.hash())).build();
+    let half = VOTE_EXECUTION_WAIT / 2;
+    let executed = consensus_bus.clone();
+    let execute = tokio::spawn(async move {
+        tokio::time::sleep(half).await;
+        executed.recent_blocks().send_modify(|blocks| {
+            blocks.push_latest(
+                1,
+                ConsensusNumHash::new(1, ConsensusHeaderDigest::default()),
+                Some(block),
+            )
+        });
+    });
+    let start = tokio::time::Instant::now();
+    assert_matches!(
+        handler.vote(peer, header, vec![]).await?,
+        PrimaryResponse::Vote(_),
+        "a block executed within the wait must let the vote proceed"
+    );
+    assert!(start.elapsed() >= half, "the vote must have waited for block 1");
+    execute.await?;
+
+    // block 2 executes within the wait with another hash than the header's: the fork check refuses
+    let other = committee.authority_fixture_by_idx(1).expect("a second authority");
+    let forked = SealedHeader::seal_slow(ExecHeader {
+        number: 2,
+        parent_hash: BlockHash::random(),
+        ..Default::default()
+    });
+    let header = other
+        .header_builder(&committee.committee())
+        .created_at(1)
+        .latest_execution_block(BlockNumHash::new(2, BlockHash::random()))
+        .build();
+    let execute = tokio::spawn(async move {
+        tokio::time::sleep(half).await;
+        consensus_bus.recent_blocks().send_modify(|blocks| {
+            blocks.push_latest(
+                2,
+                ConsensusNumHash::new(2, ConsensusHeaderDigest::default()),
+                Some(forked),
+            )
+        });
+    });
+    assert_matches!(
+        handler.vote(*other.authority().protocol_key(), header, vec![]).await,
+        Err(PrimaryNetworkError::InvalidHeader(HeaderError::UnknownExecutionResult(_))),
+        "a block of another hash at the header's height must fail the fork check"
+    );
+    execute.await?;
+    let vote_info = committee
+        .first_authority()
+        .consensus_config()
+        .node_storage()
+        .read_vote_info(&other.id())?;
+    assert!(vote_info.is_none(), "a failed fork check must store no vote");
 
     Ok(())
 }
@@ -4251,6 +4320,59 @@ async fn test_vote_recast_while_inactive() -> eyre::Result<()> {
         Err(PrimaryNetworkError::InvalidHeader(HeaderError::NotActiveCvv)),
         "an inactive voter must refuse a header it has not voted for"
     );
+
+    Ok(())
+}
+
+/// A voter a moment behind on execution still votes on the requester's retry.
+///
+/// Block 1 executes 1.5 s after the first request, so the first attempt waits out
+/// [`VOTE_EXECUTION_WAIT`] and is refused as recoverable, and the requester's retry 250 ms later
+/// finds the block executed within its own wait and earns the vote. Before the bound, the first
+/// attempt held the request until the 5 s vote timeout.
+#[tokio::test(start_paused = true)]
+async fn test_request_vote_retry_votes_once_execution_catches_up() -> eyre::Result<()> {
+    let temp_dir = TempDir::new().unwrap();
+    let TestTypes { committee, handler, parent, consensus_bus, task_manager: _task_manager } =
+        create_test_types(temp_dir.path()).await;
+    let voter = *committee.first_authority().authority().protocol_key();
+    let author = *committee.last_authority().authority().protocol_key();
+    let block = SealedHeader::seal_slow(ExecHeader {
+        number: 1,
+        parent_hash: parent.hash(),
+        ..Default::default()
+    });
+    let header = committee
+        .header_builder_last_authority()
+        .latest_execution_block(BlockNumHash::new(1, block.hash()))
+        .created_at(1)
+        .build();
+    let lag = VOTE_EXECUTION_WAIT + VOTE_EXECUTION_WAIT / 2;
+    let execute = tokio::spawn(async move {
+        tokio::time::sleep(lag).await;
+        consensus_bus.recent_blocks().send_modify(|blocks| {
+            blocks.push_latest(
+                1,
+                ConsensusNumHash::new(1, ConsensusHeaderDigest::default()),
+                Some(block),
+            )
+        });
+    });
+
+    let start = tokio::time::Instant::now();
+    let (result, responses) = request_vote_in_process(&handler, voter, author, header).await;
+    assert_matches!(result, Ok(RequestVoteResult::Vote(_)), "the retry must earn the vote");
+    assert_matches!(
+        responses.as_slice(),
+        [PrimaryResponse::RecoverableError(_), PrimaryResponse::Vote(_)],
+        "one recoverable refusal, then the vote: {responses:?}"
+    );
+    assert!(
+        start.elapsed() < Parameters::default().vote_timeout,
+        "the vote must arrive before a single vote timeout, took {:?}",
+        start.elapsed()
+    );
+    execute.await?;
 
     Ok(())
 }
