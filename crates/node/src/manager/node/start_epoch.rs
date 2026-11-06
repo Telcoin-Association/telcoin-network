@@ -1182,7 +1182,8 @@ where
     /// Decide this epoch's [`NodeMode`] and publish it to [`ConsensusBus::node_mode`].
     ///
     /// An existing `CvvInactive` state is sticky: a node syncing to rejoin
-    /// the committee stays inactive until that resolves elsewhere. Otherwise the node is an
+    /// the committee stays inactive until that resolves elsewhere, and entering a new epoch this
+    /// way starts the epoch's rejoin count again (see `RejoinState`). Otherwise the node is an
     /// `Observer` if it is not in this committee or a newer epoch record excludes it from the
     /// committee. A locally eligible node starts as `CvvInactive` when a newer epoch record proves
     /// it must catch up, and otherwise starts as `CvvActive`. `CvvActive` is optimistic: the node
@@ -1195,6 +1196,10 @@ where
     ) -> eyre::Result<NodeMode> {
         if self.consensus_bus.is_cvv_inactive() {
             // If we have an inactive mode then it was set so keep it for now.
+            // entering a new epoch inactive starts its rejoin count again; a restart inside the
+            // epoch (a demotion) keeps it, so the per-epoch cap on promotions holds
+            let epoch = consensus_config.committee().epoch();
+            self.consensus_bus.rejoin_state().send_if_modified(|state| state.enter_epoch(epoch));
             return Ok(NodeMode::CvvInactive);
         }
         debug!(target: "epoch-manager", authority_id=?consensus_config.authority_id(), "identifying node mode..." );
