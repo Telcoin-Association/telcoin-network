@@ -98,6 +98,14 @@ pub struct PrimaryMetrics {
     /// from its arrival from the worker (or its re-queue after an uncommitted header) to the
     /// header's creation. Headers without digests record nothing.
     pub(crate) digest_wait_seconds: Histogram,
+    // bench5 f3-rejoin
+    /// Vote requests refused because this node is not an active committee validator (inactive
+    /// catch-up or observer).
+    ///
+    /// Such a node answers at once with a recoverable refusal instead of holding the request until
+    /// the vote timeout, so this moves only while the node is not an active CVV, plus the rare
+    /// request whose node was demoted before it signed.
+    pub(crate) votes_refused_inactive_total: Counter,
 }
 
 impl PrimaryMetrics {
@@ -614,6 +622,7 @@ mod tests {
             // bench5 cert-requeue
             let requeued = DigestsRequeuedHandles::new();
             requeued.counter(RequeueCause::Canceled).increment(3);
+            metrics.votes_refused_inactive_total.increment(1);
         });
 
         let snapshot = snapshotter.snapshot().into_vec();
@@ -691,6 +700,8 @@ mod tests {
                 .unwrap_or_else(|| panic!("no digests_requeued_total{{cause={cause:?}}}"));
             assert_eq!(*value, &DebugValue::Counter(expected), "{}", cause.as_str());
         }
+        let (_, _, _, value) = find("tn_primary.votes_refused_inactive_total");
+        assert!(matches!(value, DebugValue::Counter(1)));
     }
 
     /// The vote path handles register every series and label the bench analysis reads: the four
