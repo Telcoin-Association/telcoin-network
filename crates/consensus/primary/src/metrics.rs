@@ -123,6 +123,11 @@ pub struct PrimaryMetrics {
     /// This is the lag the activity window demotes on, measured against the node's own round
     /// instead of an incoming certificate's.
     pub(crate) commit_lag_rounds: Gauge,
+    // bench5 f3-rejoin
+    /// Demotions for the activity window held because the node rejoined consensus less than
+    /// `REJOIN_DEMOTION_GRACE` ago, counted once per certificate or consensus result that would
+    /// have demoted it. Non-zero means a promoted node's DAG was not live yet.
+    pub(crate) rejoin_grace_holds_total: Counter,
     // bench5 f1-commit-lag
     /// Times the execution check asked the canonical database again because it could not answer
     /// for a block at or below the executed tip (a read error), one per retry.
@@ -534,6 +539,7 @@ mod tests {
             metrics.commit_run_ahead_blocked_total.increment(1);
             metrics.votes_refused_inactive_total.increment(1);
             metrics.votes_refused_execution_behind_total.increment(2);
+            metrics.rejoin_grace_holds_total.increment(1);
             metrics.execution_check_retries_total.increment(4);
         });
 
@@ -571,6 +577,8 @@ mod tests {
         assert!(matches!(value, DebugValue::Counter(1)));
         let (_, _, _, value) = find("tn_primary.votes_refused_execution_behind_total");
         assert!(matches!(value, DebugValue::Counter(2)));
+        let (_, _, _, value) = find("tn_primary.rejoin_grace_holds_total");
+        assert!(matches!(value, DebugValue::Counter(1)));
         let (_, _, _, value) = find("tn_primary.execution_check_retries_total");
         assert!(matches!(value, DebugValue::Counter(4)));
     }

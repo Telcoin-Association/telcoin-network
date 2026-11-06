@@ -346,9 +346,7 @@ impl<DB: Database> Subscriber<DB> {
                         exec_number,
                         "attempting to rejoin consensus"
                     );
-                    let previous = self.consensus_bus.node_mode().send_replace(NodeMode::CvvActive);
-                    self.consensus_bus.metrics().record_rejoin_transition(previous);
-                    self.config.shutdown().notify();
+                    self.promote();
                     return Ok(());
                 }
             }
@@ -380,6 +378,21 @@ impl<DB: Database> Subscriber<DB> {
             }
         }
         Ok(())
+    }
+
+    /// Promote this catching-up CVV back to an active CVV and end the epoch so it restarts as one.
+    ///
+    /// The promotion is recorded in the rejoin state (one more attempt in this epoch, stamped now)
+    /// before the node mode flips, so no demotion check can see the node active without its rejoin
+    /// grace.
+    fn promote(&self) {
+        let epoch = self.inner.committee.epoch();
+        self.consensus_bus
+            .rejoin_state()
+            .send_modify(|state| state.record_promotion(epoch, tokio::time::Instant::now()));
+        let previous = self.consensus_bus.node_mode().send_replace(NodeMode::CvvActive);
+        self.consensus_bus.metrics().record_rejoin_transition(previous);
+        self.config.shutdown().notify();
     }
 
     /// The leader round and consensus number of the last output the engine processed, executed or
@@ -1859,6 +1872,37 @@ mod tests {
             assert!(bus.is_cvv_inactive(), "the node goes inactive");
             assert!(epoch_shutdown.noticed(), "the epoch shuts down");
             assert_eq!(chain.latest_consensus_number(), 0, "the forked output is not saved");
+        }
+    }
+
+    // bench5 f3-rejoin
+    mod f3_rejoin {
+        use super::*;
+        use tn_primary::NodeMode;
+
+        /// A promotion goes through `promote`: it records one attempt and its time in the rejoin
+        /// state, flips the node to an active CVV and ends the epoch.
+        #[tokio::test]
+        async fn promote_stamps_the_rejoin_state() {
+            let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+            let temp_dir = TempDir::new().unwrap();
+            let consensus_chain =
+                ConsensusChain::new_for_test(temp_dir.path().to_owned(), fixture.committee())
+                    .await
+                    .unwrap();
+            let bus = ConsensusBusApp::new();
+            bus.node_mode().send_replace(NodeMode::CvvInactive);
+            let subscriber = sync_subscriber(&fixture, consensus_chain, &bus);
+            let epoch = fixture.committee().epoch();
+            let epoch_shutdown = subscriber.config.shutdown().subscribe();
+
+            subscriber.promote();
+
+            let state = *bus.rejoin_state().borrow();
+            assert_eq!(state.attempts(epoch), 1, "one attempt is recorded");
+            assert!(state.promoted_at(epoch).is_some(), "the promotion is stamped");
+            assert!(bus.is_active_cvv(), "the node is active");
+            assert!(epoch_shutdown.noticed(), "the epoch restarts");
         }
     }
 }

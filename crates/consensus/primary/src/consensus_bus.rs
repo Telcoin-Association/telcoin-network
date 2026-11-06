@@ -30,7 +30,7 @@ use tokio::{
         broadcast, mpsc,
         watch::{self, error::RecvError},
     },
-    time::error::Elapsed,
+    time::{error::Elapsed, Instant},
 };
 use tracing::{error, info, warn};
 
@@ -556,6 +556,57 @@ impl From<NodeMode> for tn_types::NodeMode {
     }
 }
 
+/// This node's rejoins in one epoch: how often its catching-up CVV was promoted back to an active
+/// CVV, and when the latest promotion happened.
+///
+/// Held in a node-lifetime watch ([`ConsensusBusApp::rejoin_state`]) and keyed by epoch instead of
+/// being cleared by [`ConsensusBusApp::reset_for_epoch`]: a promotion restarts the epoch's tasks
+/// without changing the epoch, and the restarted tasks must still see it. The first promotion in
+/// another epoch starts a new count, and a reader asking about another epoch sees no promotion.
+///
+/// The watch lives as long as the process. A restart clears the grace, which is right because a
+/// restart is not a rejoin, and clears the attempt count too, so the per-epoch cap does not span
+/// restarts.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RejoinState {
+    /// The epoch the count and the stamp belong to.
+    epoch: Epoch,
+    /// Promotions back to an active CVV in `epoch`.
+    attempts: u32,
+    /// When the latest promotion in `epoch` happened, on the tokio clock so a test can pause it.
+    promoted_at: Option<Instant>,
+}
+
+impl RejoinState {
+    /// Record a promotion in `epoch` at `now`: one more attempt, stamped `now`. A promotion in an
+    /// epoch other than the one held starts a new count.
+    pub fn record_promotion(&mut self, epoch: Epoch, now: Instant) {
+        if self.epoch != epoch {
+            *self = Self { epoch, ..Self::default() };
+        }
+        self.attempts = self.attempts.saturating_add(1);
+        self.promoted_at = Some(now);
+    }
+
+    /// The promotions recorded in `epoch`; zero for any other epoch.
+    pub fn attempts(&self, epoch: Epoch) -> u32 {
+        if self.epoch == epoch {
+            self.attempts
+        } else {
+            0
+        }
+    }
+
+    /// When the latest promotion in `epoch` happened; `None` if there was none in that epoch.
+    pub fn promoted_at(&self, epoch: Epoch) -> Option<Instant> {
+        if self.epoch == epoch {
+            self.promoted_at
+        } else {
+            None
+        }
+    }
+}
+
 /// The thread-safe inner type that holds all the channels for inner-consensus
 /// communication between different tasks.
 /// This contains things that exist for the app lifetime.
@@ -614,6 +665,10 @@ pub struct ConsensusBusAppInner {
 
     /// Status of sync?
     tx_sync_status: watch::Sender<NodeMode>,
+    /// This node's rejoins in the current epoch (see [`RejoinState`]).
+    ///
+    /// Not reset between epochs: the state is keyed by epoch.
+    tx_rejoin_state: watch::Sender<RejoinState>,
 
     /// Produce new epoch certs as they are recieved.
     new_epoch_votes: QueChannel<EpochVote>,
@@ -801,6 +856,7 @@ impl ConsensusBusApp {
 
         let (tx_recent_blocks, _) = watch::channel(RecentBlocks::new(recent_blocks as usize));
         let (tx_sync_status, _) = watch::channel(NodeMode::default());
+        let (tx_rejoin_state, _) = watch::channel(RejoinState::default());
 
         let sync_output = QueChannel::with_capacity(SYNC_OUTPUT_CHANNEL_CAPACITY);
         let consensus_output = QueChannel::with_capacity(CONSENSUS_OUTPUT_CHANNEL_CAPACITY);
@@ -828,6 +884,7 @@ impl ConsensusBusApp {
                 exex_certificates,
                 exex_consensus_output,
                 tx_sync_status,
+                tx_rejoin_state,
                 new_epoch_votes: QueChannel::new(),
                 tx_epoch_record,
                 primary_network_events: QueChannel::new_always_subscribed_held(
@@ -1069,6 +1126,15 @@ impl ConsensusBusApp {
     /// the committee after a failure during the epoch.
     pub fn is_cvv_inactive(&self) -> bool {
         self.inner.tx_sync_status.borrow().is_cvv_inactive()
+    }
+
+    /// This node's rejoins in the current epoch.
+    ///
+    /// The executor's subscriber records each promotion of a catching-up CVV here before it flips
+    /// the node mode; the network handler reads it to hold the activity-window demotion for
+    /// [`tn_types::REJOIN_DEMOTION_GRACE`] after a promotion.
+    pub fn rejoin_state(&self) -> &watch::Sender<RejoinState> {
+        &self.inner.tx_rejoin_state
     }
 
     /// Return the channel for primary network events.
@@ -2363,5 +2429,33 @@ mod tests {
     fn primary_gap_item_cap_fits_the_channel() {
         let items = crate::network::gap_policy::primary_event_gap_policy().max_items();
         assert!(items <= CHANNEL_CAPACITY, "{items}");
+    }
+
+    // bench5 f3-rejoin
+
+    /// The rejoin state counts promotions per epoch: a promotion in another epoch starts a new
+    /// count, a reader asking about another epoch sees none, and `reset_for_epoch` keeps it.
+    #[test]
+    fn rejoin_state_is_keyed_by_epoch() {
+        use super::RejoinState;
+
+        let start = tokio::time::Instant::now();
+        let later = start + Duration::from_secs(1);
+        let mut state = RejoinState::default();
+        assert_eq!((state.attempts(4), state.promoted_at(4)), (0, None));
+
+        state.record_promotion(4, start);
+        state.record_promotion(4, later);
+        assert_eq!((state.attempts(4), state.promoted_at(4)), (2, Some(later)));
+        assert_eq!((state.attempts(3), state.promoted_at(3)), (0, None), "another epoch sees none");
+
+        state.record_promotion(5, start);
+        assert_eq!((state.attempts(5), state.promoted_at(5)), (1, Some(start)), "a new count");
+        assert_eq!((state.attempts(4), state.promoted_at(4)), (0, None), "the old count is gone");
+
+        let bus = ConsensusBusApp::new();
+        bus.rejoin_state().send_modify(|state| state.record_promotion(4, start));
+        bus.reset_for_epoch();
+        assert_eq!(bus.rejoin_state().borrow().attempts(4), 1, "reset_for_epoch keeps it");
     }
 }

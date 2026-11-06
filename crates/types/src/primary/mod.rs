@@ -88,6 +88,25 @@ pub const fn rejoin_round_window(gc_depth: Round) -> Round {
     gc_activity_window(gc_depth) / 2
 }
 
+/// How long after a rejoin an active CVV holds its activity-window demotion.
+///
+/// A catching-up CVV is promoted once the output it handled is within [`rejoin_round_window`] of
+/// the newest known header, and restarts its epoch tasks from the committed round in its pack.
+/// That round only advances once the DAG above it is refilled from peers, so until then incoming
+/// certificates can lie past the activity window ([`gc_activity_window`]) and would demote the
+/// node before it commits once. The grace covers the fetches that those certificates' missing
+/// parents start and the commits that follow once the DAG is whole: thirty seconds is about 60
+/// rounds at two rounds a second. It does not wait for the certificate fetcher's fallback kick:
+/// the promotion is stamped before the epoch tasks restart, and the fallback timer (the sync
+/// config's `max_consenus_round_timeout`, 30 seconds by default) starts only in the restarted
+/// primary, so its first kick lands after the grace has ended.
+///
+/// Only the activity-window demotion is held, and only while the incoming round leads the node's
+/// committed round by at most `ROUNDS_TO_KEEP - gc_depth` rounds ([`ROUNDS_TO_KEEP`]): past that,
+/// peers have pruned rounds the rebuild needs and holding cannot help. A node an epoch behind is
+/// demoted at once.
+pub const REJOIN_DEMOTION_GRACE: Duration = Duration::from_secs(30);
+
 /// Rounds of certificates the certificate store keeps below the newest round it writes.
 ///
 /// Each certificate write prunes every round below `H - ROUNDS_TO_KEEP`, where `H` is the round
@@ -104,7 +123,9 @@ pub const fn rejoin_round_window(gc_depth: Round) -> Round {
 /// The rebuild is therefore complete while `H - C <= ROUNDS_TO_KEEP - gc_depth + 1`. The rejoin
 /// rule promotes once `C` trails the newest header by at most [`rejoin_round_window`] (20 rounds
 /// at `gc_depth` 50), so `H - C` reaches about 30 by the time the rejoined node fetches, and an
-/// active node trails by up to [`gc_activity_window`] (40 rounds) before it is demoted. With the
+/// active node trails by up to [`gc_activity_window`] (40 rounds) before it is demoted. Inside the
+/// rejoin grace ([`REJOIN_DEMOTION_GRACE`]) that demotion is held only while the node trails by
+/// at most `ROUNDS_TO_KEEP - gc_depth` rounds (78 at `gc_depth` 50), within this bound. With the
 /// former value of 64 the rebuild failed once `H - C` reached 16; 128 holds up to an `H - C` of
 /// 79 at `gc_depth` 50. The cost is about twice the store's live footprint; the pruning cadence
 /// is unchanged.
