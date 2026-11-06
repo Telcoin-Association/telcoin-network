@@ -13,7 +13,7 @@ use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     fmt::Debug,
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tn_config::ConsensusConfig;
 use tn_storage::{
@@ -24,7 +24,7 @@ use tn_types::{
     forks::subsecond_timestamp_active, AuthorityIdentifier, Certificate, CommittedSubDag,
     Committee, ConsensusChainReader, Database, Epoch, EpochSeedChainError, EpochSeedChainValue,
     Hash as _, HeaderDigest, Noticer, Round, TaskManager, TimestampMs, TimestampSec, TnReceiver,
-    TnSender,
+    TnSender, MAX_COMMIT_RUN_AHEAD_ROUNDS,
 };
 use tracing::{debug, error, info, instrument, warn};
 
@@ -342,6 +342,20 @@ pub struct Consensus<DB> {
     /// ended and stops the node if the seal reports a failed save: an error this task returned
     /// after the epoch's shutdown was signalled would only be logged.
     certificate_pack: Option<Arc<CertificatePack>>,
+
+    /// The consensus pack's committed round when this task was spawned: the floor of the executed
+    /// round the run-ahead gate measures commits against.
+    ///
+    /// Initial and new-epoch starts replay the pack and wait for its execution before consensus
+    /// starts, so there the floor matches execution. After a promotion from catch-up nothing is
+    /// replayed and the pack written by state sync can lead execution; the floor keeps that lead
+    /// from holding the first commits.
+    exec_floor: Round,
+
+    /// How many rounds a committed leader may run ahead of the executed round before its commit
+    /// is held: [`MAX_COMMIT_RUN_AHEAD_ROUNDS`], kept as a field so a test can hold a commit
+    /// without building a thousand rounds.
+    max_run_ahead: Round,
 }
 
 /// The outcome of archiving a certificate in this epoch's certificate pack, given what
@@ -449,6 +463,32 @@ fn resolve_epoch_commit_floor(
     Some(TimestampMs::from_parts(close_secs, 0))
 }
 
+/// Whether a sub-dag committed at `leader_round` may go on to execution while this node has
+/// executed through leader round `exec_round`: true unless the leader runs more than
+/// `max_run_ahead` rounds ahead. The sum saturates, so no round overflows the check.
+pub(crate) const fn commit_run_ahead_ok(
+    leader_round: Round,
+    exec_round: Round,
+    max_run_ahead: Round,
+) -> bool {
+    leader_round <= exec_round.saturating_add(max_run_ahead)
+}
+
+/// The lowest round of a restored DAG when it lies above the round after `last_committed_round`.
+///
+/// Bullshark orders the next sub-dag from the certificates just above the last committed round.
+/// The certificate store prunes from its newest round, and the consensus pack of a node whose
+/// execution lagged can trail that round by more than the prune depth, so a restart can restore a
+/// DAG with none of those certificates; ordering from it skips the missing history and can
+/// sequence a sub-dag no other node commits. `None` for a fresh epoch (nothing committed), an
+/// empty DAG (a promotion from catch-up, which stores no certificates) and a DAG that reaches
+/// down to the next round.
+fn restored_dag_gap(last_committed_round: Round, dag: &Dag) -> Option<Round> {
+    let dag_min_round = *dag.first_key_value()?.0;
+    (last_committed_round > 0 && dag_min_round > last_committed_round.saturating_add(1))
+        .then_some(dag_min_round)
+}
+
 impl<DB: Database> Consensus<DB> {
     pub async fn spawn(
         consensus_config: ConsensusConfig<DB>,
@@ -522,6 +562,27 @@ impl<DB: Database> Consensus<DB> {
             .committed_round_updates()
             .send_replace(state.last_round.committed_round);
 
+        // an active cvv must not order from a restored dag that starts above the next round (see
+        // `restored_dag_gap`); it goes inactive and catches up from its peers instead
+        if consensus_bus.is_active_cvv() {
+            if let Some(dag_min_round) = restored_dag_gap(last_committed_round, &state.dag) {
+                info!(
+                    target: "primary::consensus",
+                    last_committed_round,
+                    dag_min_round,
+                    "restored dag has a gap above the committed round; going inactive"
+                );
+                let previous = consensus_bus.app().node_mode().send_replace(NodeMode::CvvInactive);
+                record_mode_transition(
+                    previous,
+                    NodeMode::CvvInactive,
+                    ModeTransitionReason::RestartGap,
+                );
+                consensus_config.shutdown().notify();
+                return Ok(());
+            }
+        }
+
         let s = Self {
             committee: consensus_config.committee().clone(),
             consensus_bus: consensus_bus.clone(),
@@ -531,6 +592,8 @@ impl<DB: Database> Consensus<DB> {
             state,
             active: false,
             certificate_pack,
+            exec_floor: last_committed_round,
+            max_run_ahead: MAX_COMMIT_RUN_AHEAD_ROUNDS,
         };
 
         // Only run the consensus task if we are an active CVV.
@@ -562,17 +625,22 @@ impl<DB: Database> Consensus<DB> {
 
         // Listen to incoming certificates.
         loop {
+            // biased so shutdown is checked first: once a commit returned on shutdown (a held
+            // run-ahead gate), no certificate queued meanwhile may commit past the held sub-dag.
+            // the tick goes before the certificates, so a certificate burst cannot starve it
             tokio::select! {
+                biased;
+
                 // The epoch's owner seals the certificate pack once this task has ended.
                 _ = &self.rx_shutdown => return Ok(()),
 
+                _ = observation_tick.tick() => {
+                    observer.evaluate_expired(tokio::time::Instant::now());
+                },
                 Some(certificate) = rx_new_certificates.recv() => {
                     self.new_certificate(certificate, &mut observer).await.inspect_err(|e| {
                         error!(target: "epoch-manager", ?e, "new certificate failed");
                     })?;
-                },
-                _ = observation_tick.tick() => {
-                    observer.evaluate_expired(tokio::time::Instant::now());
                 },
             }
         }
@@ -612,27 +680,14 @@ impl<DB: Database> Consensus<DB> {
             let authority_id = self.consensus_config.authority_id();
 
             // Output the sequence in the right order.
-            let csd_len = committed_sub_dags.len();
-            for (i, committed_sub_dag) in committed_sub_dags.into_iter().enumerate() {
-                // We need to make sure execution has caught up so we can verify we have not forked.
-                // This will force the follow function to not outrun execution...  this is probably
-                // fine. Also once we can follow gossiped consensus output this will not really be
-                // an issue (except during initial catch up).
-                let base_execution_block = committed_sub_dag.leader().latest_execution_block();
-                if self.consensus_bus.app().wait_for_execution(base_execution_block).await.is_err()
-                {
-                    // This seems to be a bogus sub dag, we are out of sync...
-                    tracing::error!(target: "telcoin::consensus_state", "Got a bogus sub dag from bullshark, we are out of sync and probably can not recover!");
-                    // Going inactive will probably not help us at this point....
-                    let previous =
-                        self.consensus_bus.app().node_mode().send_replace(NodeMode::CvvInactive);
-                    record_mode_transition(
-                        previous,
-                        NodeMode::CvvInactive,
-                        ModeTransitionReason::BogusSubdag,
-                    );
-                    self.consensus_config.shutdown().notify();
-                    tracing::error!(target: "telcoin::consensus_state", ?base_execution_block, ?outcome, "commit {i} of {csd_len} subdags");
+            for committed_sub_dag in committed_sub_dags {
+                // commits do not wait for local execution: the subscriber checks each leader's
+                // execution block against this node's chain before it assembles and saves the
+                // output. this gate only bounds how far commits run ahead of execution
+                if !self.hold_commit_run_ahead(committed_sub_dag.leader_round()).await? {
+                    // the epoch is shutting down: the rest of the batch, the own-header report and
+                    // the commit-accounting check are skipped (a partial batch would fail that
+                    // check); the next epoch start re-primes the committed round from the pack
                     return Ok(());
                 }
 
@@ -672,8 +727,8 @@ impl<DB: Database> Consensus<DB> {
                     .map_err(|_| ConsensusError::ShuttingDown)?;
 
                 // Commit-accounting invariant: the last committed round must equal the max
-                // header round we just sequenced. If it ever disagrees, mirror the bogus-sub-dag
-                // handling above (go inactive + shut down cleanly) instead of panicking on the
+                // header round we just sequenced. If it ever disagrees, go inactive and shut down
+                // cleanly (as the subscriber's fork check does) instead of panicking on the
                 // single consensus task; the notified shutdown ends the run loop on the next
                 // select, so the trailing `Ok(())` is reached without further processing.
                 if self.state.last_round.committed_round == leader_commit_round {
@@ -700,6 +755,129 @@ impl<DB: Database> Consensus<DB> {
             }
         }
         Ok(())
+    }
+
+    /// Hold the commit of a sub-dag led at `leader_round` while it runs more than
+    /// [`Self::max_run_ahead`] rounds ahead of the leader round this node has executed.
+    ///
+    /// The executed round is the last leader round the engine processed, raised to
+    /// [`Self::exec_floor`]. A hold logs one warning and counts once in
+    /// `commit_run_ahead_blocked_total`, then ends, with an info line giving its length, when
+    /// execution advances far enough.
+    ///
+    /// Returns `Ok(false)` if the epoch shuts down while the commit is held, so the caller can
+    /// return before it reports a partial batch.
+    async fn hold_commit_run_ahead(&self, leader_round: Round) -> Result<bool, ConsensusError> {
+        let app = self.consensus_bus.app();
+        let exec_round = || app.last_consensus_round().max(self.exec_floor);
+        if commit_run_ahead_ok(leader_round, exec_round(), self.max_run_ahead) {
+            return Ok(true);
+        }
+        // subscribe, then read again: an execution update between the first read and the
+        // subscription is seen by the second read, any later one wakes the wait
+        let mut rx_recent_blocks = app.recent_blocks().subscribe();
+        if commit_run_ahead_ok(leader_round, exec_round(), self.max_run_ahead) {
+            return Ok(true);
+        }
+        let held_at = Instant::now();
+        warn!(
+            target: "primary::consensus",
+            leader_round,
+            exec_round = exec_round(),
+            "commit held: execution more than MAX_COMMIT_RUN_AHEAD_ROUNDS behind"
+        );
+        app.metrics().commit_run_ahead_blocked_total.increment(1);
+        loop {
+            tokio::select! {
+                biased;
+
+                _ = &self.rx_shutdown => return Ok(false),
+                changed = rx_recent_blocks.changed() => {
+                    // the bus owns the sender, so this fails only once the bus is gone
+                    changed.map_err(|_| ConsensusError::ShuttingDown)?;
+                    let executed = exec_round();
+                    if commit_run_ahead_ok(leader_round, executed, self.max_run_ahead) {
+                        info!(
+                            target: "primary::consensus",
+                            leader_round,
+                            exec_round = executed,
+                            held_ms = u64::try_from(held_at.elapsed().as_millis())
+                                .unwrap_or(u64::MAX),
+                            "commit hold released"
+                        );
+                        return Ok(true);
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod commit_run_ahead_tests {
+    use super::{commit_run_ahead_ok, restored_dag_gap, Dag};
+    use std::collections::HashMap;
+    use tn_types::{Round, MAX_COMMIT_RUN_AHEAD_ROUNDS};
+
+    /// The executed round every boundary case measures from.
+    const EXEC: Round = 300;
+
+    #[test]
+    fn commit_run_ahead_ok_at_the_executed_round() {
+        assert!(commit_run_ahead_ok(EXEC, EXEC, MAX_COMMIT_RUN_AHEAD_ROUNDS));
+    }
+
+    #[test]
+    fn commit_run_ahead_ok_one_round_ahead() {
+        assert!(commit_run_ahead_ok(EXEC + 1, EXEC, MAX_COMMIT_RUN_AHEAD_ROUNDS));
+    }
+
+    #[test]
+    fn commit_run_ahead_ok_at_the_bound() {
+        assert!(commit_run_ahead_ok(
+            EXEC + MAX_COMMIT_RUN_AHEAD_ROUNDS,
+            EXEC,
+            MAX_COMMIT_RUN_AHEAD_ROUNDS
+        ));
+        // a fresh start (nothing executed) commits up to the bound itself
+        assert!(commit_run_ahead_ok(MAX_COMMIT_RUN_AHEAD_ROUNDS, 0, MAX_COMMIT_RUN_AHEAD_ROUNDS));
+    }
+
+    #[test]
+    fn commit_run_ahead_holds_past_the_bound() {
+        assert!(!commit_run_ahead_ok(
+            EXEC + MAX_COMMIT_RUN_AHEAD_ROUNDS + 1,
+            EXEC,
+            MAX_COMMIT_RUN_AHEAD_ROUNDS
+        ));
+        assert!(!commit_run_ahead_ok(
+            MAX_COMMIT_RUN_AHEAD_ROUNDS + 1,
+            0,
+            MAX_COMMIT_RUN_AHEAD_ROUNDS
+        ));
+    }
+
+    #[test]
+    fn commit_run_ahead_ok_saturates_at_the_round_ceiling() {
+        assert!(commit_run_ahead_ok(Round::MAX, Round::MAX, MAX_COMMIT_RUN_AHEAD_ROUNDS));
+        assert!(commit_run_ahead_ok(Round::MAX, Round::MAX - 1, MAX_COMMIT_RUN_AHEAD_ROUNDS));
+        // an executed round ahead of the leader (an earlier epoch's last round) never holds
+        assert!(commit_run_ahead_ok(2, Round::MAX, MAX_COMMIT_RUN_AHEAD_ROUNDS));
+    }
+
+    /// A restored DAG is a gap only when it is not empty, the epoch has committed something and
+    /// its lowest round lies above the round after the committed round.
+    #[test]
+    fn restored_dag_gap_boundaries() {
+        let dag_from = |min_round: Round| -> Dag {
+            (min_round..min_round + 3).map(|round| (round, HashMap::new())).collect()
+        };
+        assert_eq!(restored_dag_gap(20, &Dag::new()), None, "an empty dag (a promotion)");
+        assert_eq!(restored_dag_gap(0, &dag_from(200)), None, "nothing committed yet");
+        assert_eq!(restored_dag_gap(20, &dag_from(1)), None, "a healthy restart");
+        assert_eq!(restored_dag_gap(20, &dag_from(21)), None, "the next round is present");
+        assert_eq!(restored_dag_gap(20, &dag_from(22)), Some(22));
+        assert_eq!(restored_dag_gap(20, &dag_from(200)), Some(200));
     }
 }
 

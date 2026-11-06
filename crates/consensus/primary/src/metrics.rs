@@ -90,6 +90,11 @@ pub struct PrimaryMetrics {
     /// Every caller looks the record up by the request's epoch, so a non-zero value is a caller
     /// bug.
     pub(crate) epoch_pack_record_epoch_mismatch_total: Counter,
+    // bench5 f1-commit-lag
+    /// Commits the consensus task held because the committed leader round ran more than
+    /// `MAX_COMMIT_RUN_AHEAD_ROUNDS` ahead of the leader round this node has executed, counted
+    /// once per hold.
+    pub(crate) commit_run_ahead_blocked_total: Counter,
 }
 
 impl PrimaryMetrics {
@@ -110,6 +115,18 @@ impl PrimaryMetrics {
     /// method is its route to [`record_mode_transition`].
     pub fn record_rejoin_transition(&self, previous: NodeMode) {
         record_mode_transition(previous, NodeMode::CvvActive, ModeTransitionReason::Rejoin);
+    }
+
+    /// Count an active CVV's demotion after a failed fork check in
+    /// `tn_node_mode_transitions_total{to="cvv_inactive", reason="bogus_subdag"}`.
+    ///
+    /// `previous` is the mode the watch held before the demotion, the value `send_replace`
+    /// returns. The check runs in the executor's subscriber before it assembles a committed
+    /// sub-dag's output, outside this crate, so this method is its route to
+    /// [`record_mode_transition`]. The label is the one the check carried when it ran in the
+    /// consensus task.
+    pub fn record_execution_fork_transition(&self, previous: NodeMode) {
+        record_mode_transition(previous, NodeMode::CvvInactive, ModeTransitionReason::BogusSubdag);
     }
 }
 
@@ -270,13 +287,17 @@ pub(crate) enum ModeTransitionReason {
     /// An active CVV saw a certificate or consensus result from an epoch ahead of the one it has
     /// executed.
     EpochBehind,
-    /// Bullshark committed a sub-dag whose leader references an execution block this node could
-    /// not wait for.
+    /// A committed sub-dag's leader references an execution block this node did not execute at
+    /// that height (the subscriber's fork check before it assembles the output).
     BogusSubdag,
     /// The committed round disagreed with the highest header round just sequenced.
     CommitAccounting,
     /// A catching-up CVV came within the rejoin window of the network head.
     Rejoin,
+    // bench5 f1-commit-lag
+    /// An active CVV restarted its epoch with a restored DAG whose lowest round lies above the
+    /// round after its committed round: the certificates Bullshark needs next were pruned.
+    RestartGap,
 }
 
 impl ModeTransitionReason {
@@ -288,6 +309,7 @@ impl ModeTransitionReason {
             Self::BogusSubdag => "bogus_subdag",
             Self::CommitAccounting => "commit_accounting",
             Self::Rejoin => "rejoin",
+            Self::RestartGap => "restart_gap",
         }
     }
 }
@@ -449,6 +471,7 @@ mod tests {
             metrics.subdags_committed_total.increment(1);
             metrics.commit_latency_seconds.record(1.0);
             metrics.record_consensus_output_bytes(123);
+            metrics.commit_run_ahead_blocked_total.increment(1);
         });
 
         let snapshot = snapshotter.snapshot().into_vec();
@@ -479,6 +502,8 @@ mod tests {
         assert!(matches!(value, DebugValue::Gauge(g) if g.0 == 123.0));
         let (_, _, _, value) = find("tn_primary.max_consensus_output_bytes");
         assert!(matches!(value, DebugValue::Gauge(g) if g.0 == 123.0));
+        let (_, _, _, value) = find("tn_primary.commit_run_ahead_blocked_total");
+        assert!(matches!(value, DebugValue::Counter(1)));
     }
 
     /// The vote path handles register every series and label the bench analysis reads: the four
@@ -572,6 +597,9 @@ mod tests {
             );
             metrics.record_rejoin_transition(NodeMode::CvvInactive);
             metrics.record_rejoin_transition(NodeMode::CvvActive);
+            demote(ModeTransitionReason::RestartGap);
+            metrics.record_execution_fork_transition(NodeMode::CvvActive);
+            metrics.record_execution_fork_transition(NodeMode::CvvInactive);
         });
 
         let snapshot = snapshotter.snapshot().into_vec();
@@ -593,10 +621,11 @@ mod tests {
         series.sort_by(|a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)));
         let expected = [
             ("cvv_active", "rejoin", 1),
-            ("cvv_inactive", "bogus_subdag", 1),
+            ("cvv_inactive", "bogus_subdag", 2),
             ("cvv_inactive", "commit_accounting", 1),
             ("cvv_inactive", "epoch_behind", 1),
             ("cvv_inactive", "outside_gc_window", 2),
+            ("cvv_inactive", "restart_gap", 1),
         ]
         .map(|(to, reason, count)| {
             (to.to_string(), reason.to_string(), DebugValue::Counter(count))

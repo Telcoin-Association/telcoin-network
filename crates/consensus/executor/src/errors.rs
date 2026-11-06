@@ -165,4 +165,23 @@ pub enum SubscriberError {
     /// An error from spawning consensus.
     #[error("Consensus error (from spawn): {0}")]
     Consensus(#[from] ConsensusError),
+
+    /// The leader of a committed sub-dag references an execution block this node did not execute
+    /// at that height.
+    ///
+    /// Once local execution reached the block's number, the block was neither among the recently
+    /// executed blocks nor canonical in the execution database: this node's execution has forked
+    /// from the leader's. The output is never saved; the subscriber goes inactive and shuts the
+    /// epoch down.
+    #[error(
+        "execution fork at consensus output {number}: leader's execution block {base_block} ({base_hash}) is not on the local chain"
+    )]
+    ExecutionFork {
+        /// The consensus number the output would have had.
+        number: u64,
+        /// The number of the leader's execution block.
+        base_block: u64,
+        /// The hash of the leader's execution block.
+        base_hash: BlockHash,
+    },
 }
