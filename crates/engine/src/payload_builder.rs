@@ -5,6 +5,8 @@
 use crate::{
     duration_ms,
     error::{EngineResult, TnEngineError},
+    metrics::ENGINE_METRICS,
+    recovery::{output_tx_count, recover_signers, RecoveryHandle},
 };
 use std::time::{Duration, Instant};
 use tn_reth::{
@@ -15,7 +17,7 @@ use tn_reth::{
 };
 use tn_types::{
     gas_accumulator::GasAccumulator, max_batch_gas, repack_monitor::RepackMonitor, ConsensusOutput,
-    EngineUpdate, Hash as _, SealedHeader, B256,
+    EngineUpdate, Hash as _, Recovered, SealedHeader, TransactionSigned, B256,
 };
 use tokio::sync::mpsc;
 use tracing::{debug, error, field, info, info_span, trace, warn};
@@ -30,14 +32,47 @@ use tracing::{debug, error, field, info, info_span, trace, warn};
 /// Every output that produces blocks ends with one `output executed` debug line (target
 /// `engine`) splitting its wall time into `execute_ms` (entry to the end of the block loop),
 /// `persist_ms` (the bounded durable persist, retries included) and `announce_ms` (the
-/// post-commit announce plus the in-memory finalize). `execute_ms` is split further into the
-/// block builds' summed laps (`recover_ms`, `evm_ms`, `root_ms`, `finish_ms`, see
-/// [`BlockBuildTimings`]) and `other_ms`, the rest of it (payload construction, in-memory chain
-/// updates, logging); `max_block_root_ms` and `max_block_evm_ms` are the slowest block's laps
-/// and `txs` counts the transactions handed to the builder. The skipped empty path does not log
-/// it.
+/// post-commit announce plus the in-memory finalize). `execute_ms` is split further into
+/// `recover_wait_ms` (the time spent obtaining the output's recovered signers), the block builds'
+/// summed laps (`evm_ms`, `root_ms`, `finish_ms`, see [`BlockBuildTimings`]) and `other_ms`, the
+/// rest of it (payload construction, in-memory chain updates, logging); `max_block_root_ms` and
+/// `max_block_evm_ms` are the slowest block's laps and `txs` counts the transactions handed to
+/// the builder. The skipped empty path does not log it.
+///
+/// This entry point recovers the output's signers inline, on the calling thread, before the
+/// first block. The engine's run loop instead starts that recovery on a background job when the
+/// output is queued and executes through `execute_consensus_output_with_signers`; both build the
+/// same blocks.
 pub fn execute_consensus_output(
     args: BuildArguments,
+    gas_accumulator: GasAccumulator,
+    repack_monitor: RepackMonitor,
+    engine_update_tx: mpsc::Sender<EngineUpdate>,
+) -> EngineResult<SealedHeader> {
+    execute_consensus_output_with_signers(
+        args,
+        None,
+        gas_accumulator,
+        repack_monitor,
+        engine_update_tx,
+    )
+}
+
+/// [`execute_consensus_output`] with the output's signers taken from `signers`, the handle of
+/// the background recovery job started when the output was queued, or recovered inline when it
+/// is `None`.
+///
+/// The handle is resolved before the first block, blocking until the job finishes (it usually
+/// has, while earlier outputs executed); the wait is the `output executed` line's
+/// `recover_wait_ms`. On catch-up or replay up to `MAX_QUEUED_OUTPUTS` jobs start together and
+/// share the global rayon pool, with each other, batch validation and the build's own parallel
+/// phases, so the first output's wait can exceed what inline recovery would take while the
+/// later outputs' waits read about zero. A job that ended without a result falls back to inline
+/// recovery (see [`RecoveryHandle::wait`]), so the signers never fail the output. Must run on a
+/// blocking thread when `signers` is `Some`.
+pub(crate) fn execute_consensus_output_with_signers(
+    args: BuildArguments,
+    signers: Option<RecoveryHandle>,
     gas_accumulator: GasAccumulator,
     repack_monitor: RepackMonitor,
     engine_update_tx: mpsc::Sender<EngineUpdate>,
@@ -67,12 +102,7 @@ pub fn execute_consensus_output(
     let batch_count = batches.len();
     // transactions handed to the block builder across every batch of the output (before any
     // unrecoverable or invalid transaction is dropped)
-    let tx_count: usize = output
-        .batches()
-        .iter()
-        .flat_map(|cert| cert.batches.iter())
-        .map(|b| b.transactions.len())
-        .sum();
+    let tx_count = output_tx_count(&output);
 
     let span = info_span!(target: "telcoin", "execute-consensus", epoch,
         consensus_number = output.number(),
@@ -215,7 +245,7 @@ pub fn execute_consensus_output(
         // execute the payload and update the current canonical header
         let executed = execute_payload(
             payload,
-            &vec![],
+            Vec::new(),
             &mut executed_blocks,
             &reth_env,
             &canonical_in_memory_state,
@@ -231,8 +261,28 @@ pub fn execute_consensus_output(
             rollback_in_memory_output(&canonical_in_memory_state, &anchor_header, &executed_blocks)
         })?;
     } else {
+        // The output's recovered signers, one entry per flattened batch: take them from the
+        // background job (blocking until it finishes) or recover them inline. Both come from
+        // `RethEnv::recover_output_signers`, which walks the batches in the order of the loop
+        // below, so the lengths match by construction; the check fails closed before any block
+        // advances the in-memory chain, should that ever change.
+        let wait_start = Instant::now();
+        let output_signers = match signers {
+            Some(handle) => handle.wait(&output, &ENGINE_METRICS),
+            None => recover_signers(&output, &ENGINE_METRICS),
+        };
+        timings.recover_wait = wait_start.elapsed();
+        if output_signers.len() != batches.len() {
+            return Err(TnEngineError::RecoveredSignersMismatch(
+                batches.len(),
+                output_signers.len(),
+            ));
+        }
+
         // loop and construct blocks from batches with transactions
-        for (batch_index, (cert_idx, batch_idx_in_cert)) in batches.into_iter().enumerate() {
+        for ((batch_index, (cert_idx, batch_idx_in_cert)), recovered) in
+            batches.into_iter().enumerate().zip(output_signers)
+        {
             let batch_digest = output
                 .get_batch_digest(batch_index)
                 .ok_or(TnEngineError::NextBlockDigestMissing)?;
@@ -298,7 +348,7 @@ pub fn execute_consensus_output(
             // execute the payload and update the current canonical header
             let executed = execute_payload(
                 payload,
-                &batch.transactions,
+                recovered,
                 &mut executed_blocks,
                 &reth_env,
                 &canonical_in_memory_state,
@@ -333,7 +383,7 @@ pub fn execute_consensus_output(
     span.record("executed_blocks", executed_blocks.len().to_string());
     let execute_elapsed = execute_start.elapsed();
     let block_count = executed_blocks.len();
-    crate::metrics::ENGINE_METRICS.recover_seconds.record(timings.recover);
+    // `tn_engine_recover_seconds` is recorded by the recovery itself (see `recover_signers`)
     crate::metrics::ENGINE_METRICS.evm_seconds.record(timings.evm);
     crate::metrics::ENGINE_METRICS.root_seconds.record(timings.root);
     crate::metrics::ENGINE_METRICS.finish_seconds.record(timings.finish);
@@ -383,7 +433,7 @@ pub fn execute_consensus_output(
         persist_ms = duration_ms(persist_elapsed),
         announce_ms = duration_ms(announce_elapsed),
         txs = tx_count,
-        recover_ms = duration_ms(timings.recover),
+        recover_wait_ms = duration_ms(timings.recover_wait),
         evm_ms = duration_ms(timings.evm),
         root_ms = duration_ms(timings.root),
         finish_ms = duration_ms(timings.finish),
@@ -404,8 +454,10 @@ pub fn execute_consensus_output(
 /// split histograms, never block contents.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 struct OutputTimings {
-    /// Summed signer-recovery laps.
-    recover: Duration,
+    /// Time the execution thread spent obtaining the output's recovered signers: blocked on the
+    /// background recovery job, or recovering inline (the fallback, and callers without a job),
+    /// plus any recovery lap inside the builds (zero: blocks build from recovered signers).
+    recover_wait: Duration,
     /// Summed builder-setup, pre-execution and transaction-loop laps.
     evm: Duration,
     /// Summed state-root laps.
@@ -421,7 +473,7 @@ struct OutputTimings {
 impl OutputTimings {
     /// Fold one block's laps into the output's sums and maxima.
     fn add(&mut self, block: &BlockBuildTimings) {
-        self.recover = self.recover.saturating_add(block.recover);
+        self.recover_wait = self.recover_wait.saturating_add(block.recover);
         self.evm = self.evm.saturating_add(block.evm);
         self.root = self.root.saturating_add(block.root);
         self.finish = self.finish.saturating_add(block.finish);
@@ -431,7 +483,10 @@ impl OutputTimings {
 
     /// The four summed laps together; `execute_ms` minus this is the line's `other_ms`.
     fn laps(&self) -> Duration {
-        self.recover.saturating_add(self.evm).saturating_add(self.root).saturating_add(self.finish)
+        self.recover_wait
+            .saturating_add(self.evm)
+            .saturating_add(self.root)
+            .saturating_add(self.finish)
     }
 }
 
@@ -439,15 +494,16 @@ impl OutputTimings {
 ///
 /// `output_overlay` is the consensus output's shared accumulated trie overlay: the build
 /// computes this block's state root layered over it and then extends it with the block's
-/// sorted deltas for the NEXT block of the output (#1301). The build's phase laps are added to
-/// `timings`. `consensus_number` only labels the `next block executed` line, together with the
-/// payload's batch index and digest, so each block joins back to its consensus output and batch.
+/// sorted deltas for the NEXT block of the output (#1301). `recovered` is the batch's entry of
+/// the output's recovered signers. The build's phase laps are added to `timings`.
+/// `consensus_number` only labels the `next block executed` line, together with the payload's batch
+/// index and digest, so each block joins back to its consensus output and batch.
 // the per-output accumulators and the log context are separate on purpose; bundling them into a
 // struct would only rename the same eight values
 #[allow(clippy::too_many_arguments)]
 fn execute_payload(
     payload: TNPayload,
-    transactions: &Vec<Vec<u8>>,
+    recovered: Vec<Recovered<TransactionSigned>>,
     executed_blocks: &mut Vec<ExecutedBlock>,
     reth_env: &RethEnv,
     canonical_in_memory_state: &CanonicalInMemoryState,
@@ -460,7 +516,7 @@ fn execute_payload(
     let batch_digest = payload.batch_digest;
     // execute
     let (next_canonical_block, block_timings) =
-        reth_env.build_block_from_batch_payload_timed(payload, transactions, output_overlay)?;
+        reth_env.build_block_from_recovered_payload(payload, recovered, output_overlay)?;
     timings.add(&block_timings);
     trace!(target: "engine::dump", ?next_canonical_block, "block executed");
 
@@ -660,7 +716,7 @@ mod tests {
         assert_eq!(
             timings,
             OutputTimings {
-                recover: ms(4),
+                recover_wait: ms(4),
                 evm: ms(14),
                 root: ms(16),
                 finish: ms(7),

@@ -2,7 +2,9 @@
 //!
 //! This module owns the path from certified consensus output to the canonical chain:
 //! executing a worker batch's payload into a block
-//! ([`RethEnv::build_block_from_batch_payload`]), committing a round's blocks to the
+//! ([`RethEnv::build_block_from_batch_payload`], or, with the signers recovered ahead of
+//! time by [`RethEnv::recover_output_signers`],
+//! [`RethEnv::build_block_from_recovered_payload`]), committing a round's blocks to the
 //! database ([`RethEnv::finish_executing_output`]), and updating the in-memory
 //! finalized/safe watches ([`RethEnv::finalize_block`]). Consensus output is the ONLY
 //! source of canonical blocks: there is no fork choice and no reorg path, and every
@@ -61,7 +63,9 @@ use std::{
 };
 
 use alloy::primitives::FixedBytes;
-use rayon::iter::{IntoParallelRefIterator as _, ParallelIterator as _};
+use rayon::iter::{
+    IndexedParallelIterator as _, IntoParallelRefIterator as _, ParallelIterator as _,
+};
 use reth_chain_state::{ComputedTrieData, ExecutedBlock, NewCanonicalChain};
 use reth_errors::{BlockExecutionError, BlockValidationError};
 use reth_evm::{
@@ -75,7 +79,8 @@ use reth_provider::{
 use reth_revm::{cached::CachedReads, database::StateProviderDatabase, State};
 use reth_rpc_eth_types::utils::recover_raw_transaction as reth_recover_raw_transaction;
 use tn_types::{
-    deconstruct_nonce, ConsensusNumHash, EngineUpdate, Round, SealedHeader, TransactionSigned,
+    deconstruct_nonce, ConsensusNumHash, ConsensusOutput, EngineUpdate, Recovered, Round,
+    SealedHeader, TransactionSigned, B256,
 };
 use tracing::{debug, error, info, trace, warn};
 
@@ -149,11 +154,83 @@ impl RethEnv {
     ///
     /// The block is the one the untimed call builds: the laps only read the clock between
     /// phases, and the root lap is read off the state-root provider wrapper after `finish`
-    /// returns. The engine sums the laps per consensus output into its `output executed` line.
+    /// returns. The signers are recovered first, exactly as [`Self::recover_output_signers`]
+    /// recovers one batch, and the recovered transactions go through
+    /// [`Self::build_block_from_recovered_payload`], so both entry points share one build.
     pub fn build_block_from_batch_payload_timed(
         &self,
         payload: TNPayload,
         transactions: &Vec<Vec<u8>>,
+        overlay: &mut OutputTrieOverlay,
+    ) -> TnRethResult<(ExecutedBlock, BlockBuildTimings)> {
+        // observability only: the recover lap; the recovered build times the other phases
+        let stamp = Instant::now();
+        let recovered = recover_batch_signers(transactions, payload.batch_digest);
+        record_unrecoverable(transactions.len(), recovered.len());
+        let recover = stamp.elapsed();
+
+        let (block, timings) =
+            self.build_block_from_recovered_payload(payload, recovered, overlay)?;
+        Ok((block, BlockBuildTimings { recover, ..timings }))
+    }
+
+    /// Recover the signer of every transaction in `output`, one `Vec` per batch.
+    ///
+    /// The outer `Vec` follows [`ConsensusOutput::flatten_batches`] order (certificates in
+    /// output order, then each certificate's batches), so entry `i` holds the transactions of
+    /// the block built from batch `i`; a single flat list would shift transactions across
+    /// blocks. Each inner `Vec` keeps its batch's transaction order.
+    ///
+    /// The drop semantics are those of the block build: a transaction whose signer cannot be
+    /// recovered is logged at error (with its batch digest and byte length, never the bytes),
+    /// counted in `tn_reth.unrecoverable_txs_dropped_total` and left out, because a certified
+    /// sub-DAG is fixed and erroring would halt every honest node on the same bytes (issue
+    /// #933). Every node drops the same transactions from the same certified bytes, so the
+    /// blocks built from the result through [`Self::build_block_from_recovered_payload`] equal
+    /// those [`Self::build_block_from_batch_payload`] builds from the bytes.
+    ///
+    /// Batches and the transactions within each batch are recovered in parallel on the global
+    /// rayon pool. The engine calls this on a blocking job when an output enters its queue, so
+    /// the work overlaps the previous output's execution.
+    pub fn recover_output_signers(
+        output: &ConsensusOutput,
+    ) -> Vec<Vec<Recovered<TransactionSigned>>> {
+        // the flattened order without the index pairs: certificate order, then batch order
+        let batches: Vec<&Vec<Vec<u8>>> = output
+            .batches()
+            .iter()
+            .flat_map(|cert| cert.batches.iter().map(|batch| &batch.transactions))
+            .collect();
+        let recovered: Vec<Vec<Recovered<TransactionSigned>>> = batches
+            .par_iter()
+            .enumerate()
+            .map(|(batch_index, transactions)| {
+                // the digest only labels the error line of a dropped transaction; a digest
+                // deque shorter than the batches fails the engine's own length check later
+                let batch_digest = output.get_batch_digest(batch_index).unwrap_or_default();
+                recover_batch_signers(transactions, batch_digest)
+            })
+            .collect();
+
+        // counted once per output, after the parallel phase (see `record_unrecoverable`)
+        record_unrecoverable(
+            batches.iter().map(|transactions| transactions.len()).sum(),
+            recovered.iter().map(Vec::len).sum(),
+        );
+        recovered
+    }
+
+    /// Construct a canonical block from a batch whose signers are already recovered.
+    ///
+    /// `recovered` is the batch's entry of [`Self::recover_output_signers`]: the transactions
+    /// that survived signer recovery, in batch order. The build is the one
+    /// [`Self::build_block_from_batch_payload`] runs after its own recovery (see its docs for
+    /// the drop semantics and the state-root path), so the same recovered transactions build
+    /// the same block. The returned timings' `recover` lap is zero: no recovery runs here.
+    pub fn build_block_from_recovered_payload(
+        &self,
+        payload: TNPayload,
+        recovered: Vec<Recovered<TransactionSigned>>,
         overlay: &mut OutputTrieOverlay,
     ) -> TnRethResult<(ExecutedBlock, BlockBuildTimings)> {
         let parent_header = payload.parent_header.clone();
@@ -173,9 +250,6 @@ impl RethEnv {
             "building new payload"
         );
 
-        // copy in case of error
-        let batch_digest = payload.batch_digest;
-
         // observability only: each `lap` closes one phase of the returned timings
         let mut stamp = Instant::now();
 
@@ -187,56 +261,13 @@ impl RethEnv {
         })?;
         let setup = lap(&mut stamp);
 
-        // Phase 1: Recover all transactions (ECDSA ecrecover) in parallel via rayon.
-        // Always use par_iter — the slight overhead on small batches is negligible
-        // compared to the savings on large ones, and avoids an extra code path.
-        //
-        // A transaction whose signer cannot be recovered cannot be executed, but a
-        // certified sub-DAG is fixed and identical on every honest node, so returning
-        // an error here would deterministically halt (and, on restart-replay,
-        // crash-loop) the whole network on a single undecodable transaction. Instead
-        // drop the unrecoverable transactions and continue, mirroring the `InvalidTx`
-        // tolerance of the execute phase below: every node drops the same
-        // transactions from the same certified bytes, so the resulting block stays
-        // deterministic (issue #933). The primary defense is validating batches before
-        // they can be certified; this only bounds the blast radius if one ever is.
-        let recovered_txs = transactions
-            .par_iter()
-            .filter_map(|tx_bytes| {
-                reth_recover_raw_transaction::<TransactionSigned>(tx_bytes)
-                    .inspect_err(|e| {
-                        error!(
-                            target: "engine",
-                            batch=?batch_digest,
-                            ?tx_bytes,
-                            "failed to recover signer, dropping transaction: {e}"
-                        )
-                    })
-                    .ok()
-            })
-            .collect::<Vec<_>>();
-
-        // Recovery failures are the signal that a batch carrying undecodable transaction bytes
-        // was certified, so make them alertable instead of log-only. Count once, after the
-        // parallel phase: incrementing inside the rayon closure would contend a single atomic on
-        // every transaction, and the batch width that sets the cost of that contention is
-        // attacker-chosen. The difference is exact because `filter_map` is the only thing above
-        // that removes elements. Unconditional, including the overwhelmingly common zero: one
-        // relaxed atomic add per block is free next to executing the block, and a guard here
-        // would leave the series unregistered on a healthy node.
-        let unrecoverable = transactions.len().saturating_sub(recovered_txs.len());
-        RETH_METRICS
-            .unrecoverable_txs_dropped_total
-            .increment(u64::try_from(unrecoverable).unwrap_or(u64::MAX));
-        let recover = lap(&mut stamp);
-
-        // Phase 2: Execute recovered transactions sequentially.
-        for recovered in recovered_txs {
+        // Execute the recovered transactions sequentially, in batch order.
+        for tx in recovered {
             // the hash is cached at decode and is not an execution input: reading it first lets
             // the transaction move into the builder without a per-transaction clone
-            let tx_hash = *recovered.tx_hash();
+            let tx_hash = *tx.tx_hash();
             // forks are impossible
-            match builder.execute_transaction(recovered) {
+            match builder.execute_transaction(tx) {
                 Ok(_gas_used) => (),
                 Err(BlockExecutionError::Validation(BlockValidationError::InvalidTx {
                     error,
@@ -291,7 +322,7 @@ impl RethEnv {
         );
         let finish = lap(&mut stamp).saturating_sub(root);
 
-        Ok((res, BlockBuildTimings { recover, evm, root, finish }))
+        Ok((res, BlockBuildTimings { recover: Duration::ZERO, evm, root, finish }))
     }
 
     /// Finalize the block (header) executed from consensus output in memory.
@@ -561,7 +592,8 @@ const PERSISTED_STORAGE_SLOTS_TOTAL: &str = "tn_reth.persisted_storage_slots_tot
 /// Observability only: nothing here feeds block contents.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct BlockBuildTimings {
-    /// Parallel signer recovery of the batch's transactions.
+    /// Parallel signer recovery of the batch's transactions; zero from
+    /// [`RethEnv::build_block_from_recovered_payload`], which takes recovered signers.
     pub recover: Duration,
     /// Builder setup, the pre-execution system calls and the sequential transaction loop.
     pub evm: Duration,
@@ -647,6 +679,58 @@ fn record_persisted_output(blocks: &[ExecutedBlock], phases: PersistPhases) {
         commit_ms = duration_ms(phases.commit),
         "persisted output"
     );
+}
+
+/// Recover the signers of one batch's transactions in parallel, dropping the unrecoverable ones.
+///
+/// A transaction whose signer cannot be recovered cannot be executed, but a certified sub-DAG
+/// is fixed and identical on every honest node, so returning an error here would
+/// deterministically halt (and, on restart-replay, crash-loop) the whole network on a single
+/// undecodable transaction. Instead the unrecoverable transactions are dropped, mirroring the
+/// `InvalidTx` tolerance of the execute phase: every node drops the same transactions from the
+/// same certified bytes, so the resulting block stays deterministic (issue #933). The primary
+/// defense is validating batches before they can be certified; this only bounds the blast
+/// radius if one ever is. Always `par_iter`: the overhead on small batches is negligible next
+/// to the savings on large ones, and it avoids an extra code path.
+///
+/// The error line carries the batch digest and the transaction's byte length; the bytes
+/// themselves are attacker-chosen and up to a batch in size, so they are never logged. The
+/// caller counts the drops with [`record_unrecoverable`].
+fn recover_batch_signers(
+    transactions: &Vec<Vec<u8>>,
+    batch_digest: B256,
+) -> Vec<Recovered<TransactionSigned>> {
+    transactions
+        .par_iter()
+        .filter_map(|tx_bytes| {
+            reth_recover_raw_transaction::<TransactionSigned>(tx_bytes)
+                .inspect_err(|e| {
+                    error!(
+                        target: "engine",
+                        batch = ?batch_digest,
+                        tx_len = tx_bytes.len(),
+                        "failed to recover signer, dropping transaction: {e}"
+                    )
+                })
+                .ok()
+        })
+        .collect()
+}
+
+/// Count the transactions signer recovery dropped: `handed` went in, `recovered` came out.
+///
+/// Recovery failures are the signal that a batch carrying undecodable transaction bytes was
+/// certified, so they are alertable instead of log-only. Callers count once, after the parallel
+/// phase: incrementing inside the rayon closure would contend a single atomic on every
+/// transaction, and the batch width that sets the cost of that contention is attacker-chosen.
+/// The difference is exact because `filter_map` is the only thing in
+/// [`recover_batch_signers`] that removes elements. Unconditional, including the
+/// overwhelmingly common zero: one relaxed atomic add is free next to executing the
+/// transactions, and a guard would leave the series unregistered on a healthy node.
+fn record_unrecoverable(handed: usize, recovered: usize) {
+    RETH_METRICS
+        .unrecoverable_txs_dropped_total
+        .increment(u64::try_from(handed.saturating_sub(recovered)).unwrap_or(u64::MAX));
 }
 
 /// Return the time since `stamp` and move `stamp` to now, so consecutive calls time
