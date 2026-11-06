@@ -13,15 +13,17 @@
 //!   in memory WITHOUT persisting between them - the true production shape of a multi-block
 //!   `ConsensusOutput`, which no other test in the tree exercises.
 
-use crate::pipeline_helpers::{consensus_output_for_test, PipelineTestEnv};
+use crate::pipeline_helpers::{
+    consensus_output_for_test, consensus_output_with_batches, PipelineTestEnv,
+};
 use reth_chain_state::ComputedTrieData;
 use reth_provider::{DBProvider as _, HashedPostStateProvider as _, StateRootProvider as _};
 use reth_trie::{HashedPostState, HashedStorage, StateRoot, TrieInput, TrieInputSorted};
 use reth_trie_db::DatabaseStateRoot as _;
 use secp256k1::rand::{rngs::StdRng, RngCore as _, SeedableRng as _};
 use std::{sync::Arc, time::Duration};
-use tn_reth::{payload::TNPayload, ExecutedBlock, NewCanonicalChain, OutputTrieOverlay};
-use tn_types::{Account, Address, Bytes, B256, MIN_PROTOCOL_BASE_FEE, U256};
+use tn_reth::{payload::TNPayload, ExecutedBlock, NewCanonicalChain, OutputTrieOverlay, RethEnv};
+use tn_types::{Account, Address, Bytes, TransactionTrait as _, B256, MIN_PROTOCOL_BASE_FEE, U256};
 
 /// Draw a deterministic 32-byte key from the seeded rng.
 fn rand_b256(rng: &mut StdRng) -> B256 {
@@ -312,6 +314,137 @@ fn test_timed_build_matches_untimed_build() -> eyre::Result<()> {
         cims.set_canonical_head(header.clone());
         env.canonical_header = header;
         env.block_timestamp += 1;
+    }
+    Ok(())
+}
+
+/// Signers recovered ahead of the build (`recover_output_signers`, as the engine's background job
+/// runs it) build the blocks the bytes path builds. One three-batch output, split across two
+/// certificates, is built block by block through `build_block_from_batch_payload` from each
+/// batch's bytes and through `build_block_from_recovered_payload` from the batch's entry of the
+/// recovered signers, each path with its own output overlay, and the two must agree on the block
+/// hash, state root, gas, receipts and bundle state.
+///
+/// The recovered signers come one `Vec` per batch in flattened order (certificate, then batch); a
+/// flat list would shift transactions across blocks, so the test pins the per-batch shape and
+/// order across both certificates. Batch 1 replays one of its own transactions and batch 3 (the
+/// second certificate's) repeats one of batch 1's, and both carry bytes that do not decode: every
+/// copy after the first executes nowhere (it is skipped as invalid in either block), the
+/// undecodable bytes are dropped at recovery, and the later blocks' roots run over a non-empty
+/// overlay.
+#[test]
+fn test_recovered_build_matches_bytes_build() -> eyre::Result<()> {
+    let mut env = PipelineTestEnv::new();
+    let cims = env.reth_env.canonical_in_memory_state();
+    let recipient = Address::random();
+    let beneficiary = Address::random();
+    let undecodable = vec![0xde, 0xad, 0xbe, 0xef];
+    // one sender, consecutive nonces 0..6
+    let txs: Vec<Vec<u8>> = (0..6u64)
+        .map(|amount| {
+            env.user_factory.create_eip1559_encoded(
+                env.chain.clone(),
+                Some(1_000_000),
+                MIN_PROTOCOL_BASE_FEE.into(),
+                Some(recipient),
+                U256::from(amount + 1),
+                Bytes::new(),
+            )
+        })
+        .collect();
+    // the first certificate carries batches 1 and 2, the second batch 3
+    let certificates = vec![
+        vec![
+            // nonce 0 replayed within the batch
+            vec![
+                txs[0].clone(),
+                txs[1].clone(),
+                txs[2].clone(),
+                txs[0].clone(),
+                undecodable.clone(),
+            ],
+            vec![txs[3].clone()],
+        ],
+        // nonce 1 again, already executed by block 1 of the same output
+        vec![vec![txs[1].clone(), txs[4].clone(), undecodable, txs[5].clone()]],
+    ];
+    let batch_bytes: Vec<Vec<Vec<u8>>> = certificates.iter().flatten().cloned().collect();
+    let output = consensus_output_with_batches(1, env.block_timestamp, certificates);
+
+    let signers = RethEnv::recover_output_signers(&output);
+    assert_eq!(signers.len(), output.flatten_batches().len(), "one entry per flattened batch");
+    // per batch and in batch order: every decodable copy survives recovery, duplicates included
+    // (only execution skips them)
+    let recovered_hashes: Vec<Vec<B256>> =
+        signers.iter().map(|batch| batch.iter().map(|tx| *tx.tx_hash()).collect()).collect();
+    let decoded_hashes: Vec<Vec<B256>> = batch_bytes
+        .iter()
+        .map(|batch| {
+            batch
+                .iter()
+                .filter_map(|bytes| tn_reth::recover_raw_transaction(bytes).ok())
+                .map(|tx| *tx.tx_hash())
+                .collect()
+        })
+        .collect();
+    assert_eq!(recovered_hashes, decoded_hashes);
+    assert_eq!(recovered_hashes.iter().map(Vec::len).collect::<Vec<_>>(), [4, 1, 3]);
+
+    let mut bytes_overlay = OutputTrieOverlay::new();
+    let mut recovered_overlay = OutputTrieOverlay::new();
+    for (i, (bytes, recovered)) in batch_bytes.iter().zip(signers).enumerate() {
+        let parent = env.canonical_header.clone();
+        // pin the beneficiary, batch digest and mix hash so both paths build the same payload
+        let payload = || {
+            TNPayload::new_for_test_with(
+                parent.clone(),
+                &output,
+                beneficiary,
+                B256::with_last_byte(i as u8 + 1),
+                B256::with_last_byte(0x80 | (i as u8 + 1)),
+            )
+        };
+        let from_bytes =
+            env.reth_env.build_block_from_batch_payload(payload(), bytes, &mut bytes_overlay)?;
+        let (from_recovered, timings) = env.reth_env.build_block_from_recovered_payload(
+            payload(),
+            recovered,
+            &mut recovered_overlay,
+        )?;
+
+        let header = from_bytes.recovered_block.clone_sealed_header();
+        let recovered_header = from_recovered.recovered_block.clone_sealed_header();
+        assert_eq!(header.hash(), recovered_header.hash(), "block hash diverged at block {i}");
+        assert_eq!(header.state_root, recovered_header.state_root, "state root diverged at {i}");
+        assert_eq!(header.receipts_root, recovered_header.receipts_root, "receipts root at {i}");
+        assert_eq!(header.gas_used, recovered_header.gas_used, "gas used diverged at block {i}");
+        assert_eq!(
+            from_bytes.execution_output.result.receipts,
+            from_recovered.execution_output.result.receipts,
+            "receipts diverged at block {i}",
+        );
+        assert_eq!(
+            from_bytes.execution_output.state, from_recovered.execution_output.state,
+            "bundle state diverged at block {i}",
+        );
+        assert_eq!(timings.recover, Duration::ZERO, "the recovered build recovers nothing");
+
+        // each nonce executes exactly once across the output: block 1 runs nonces 0-2 (its
+        // replayed nonce 0 is skipped), block 2 nonce 3, block 3 nonces 4-5 (the second
+        // certificate's repeat of nonce 1 is skipped)
+        let executed_nonces: Vec<u64> =
+            from_recovered.recovered_block.transactions_recovered().map(|tx| tx.nonce()).collect();
+        let expected_nonces: &[u64] = match i {
+            0 => &[0, 1, 2],
+            1 => &[3],
+            _ => &[4, 5],
+        };
+        assert_eq!(executed_nonces, expected_nonces, "executed nonces of block {i}");
+
+        // chain the (identical) block in memory only, as the engine does within an output
+        cims.update_chain(NewCanonicalChain::Commit { new: vec![from_bytes] });
+        cims.set_canonical_head(header.clone());
+        env.canonical_header = header;
     }
     Ok(())
 }

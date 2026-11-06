@@ -57,9 +57,12 @@ pub(crate) struct EngineMetrics {
     /// the engine is `rate(tn_engine_busy_milliseconds_total[1m]) / 1000`.
     pub(crate) busy_milliseconds_total: Counter,
     // bench5 exec-split
-    /// Signer recovery time of one consensus output, summed over its blocks. With the evm,
-    /// root and finish histograms it splits the output's execute time; unlike
-    /// `execution_duration_seconds` (the whole task) these four time block building only.
+    /// Signer recovery time of one consensus output: the duration of the background job that
+    /// recovers the output's signers when it is queued (or of the inline recovery, on the
+    /// fallback and for callers without a job). The job runs off the execution thread and
+    /// overlaps earlier outputs' execution, so unlike the evm, root and finish histograms this
+    /// is not part of the output's execute time; the part the execution thread waited for is
+    /// the `output executed` line's `recover_wait_ms`.
     pub(crate) recover_seconds: Histogram,
     /// Builder setup, pre-execution system calls and transaction loop of one consensus output,
     /// summed over its blocks.
@@ -80,6 +83,11 @@ pub(crate) struct EngineMetrics {
     /// Consensus outputs waiting in the `to_engine` channel behind the engine's own queue,
     /// sampled when an output arrives and when an execution completes.
     pub(crate) channel_depth: Gauge,
+    // bench5 signer-reuse
+    /// Consensus outputs whose background signer recovery ended without a result (the job
+    /// panicked), so the execution task recovered the signers inline from the same bytes.
+    /// Nonzero is a bug signal; the blocks built are the same either way.
+    pub(crate) recovery_fallback_total: Counter,
 }
 
 #[cfg(test)]
@@ -116,6 +124,7 @@ mod tests {
             metrics.executed_transactions_total.increment(12_500);
             metrics.forward_wait_seconds.record(0.05);
             metrics.channel_depth.set(64.0);
+            metrics.recovery_fallback_total.increment(1);
         });
 
         let snapshot = snapshotter.snapshot().into_vec();
@@ -163,5 +172,7 @@ mod tests {
         assert!(matches!(value, DebugValue::Histogram(h) if h.len() == 1 && h[0].0 == 0.05));
         let (_, _, _, value) = find("tn_engine.channel_depth");
         assert!(matches!(value, DebugValue::Gauge(g) if g.0 == 64.0));
+        let (_, _, _, value) = find("tn_engine.recovery_fallback_total");
+        assert!(matches!(value, DebugValue::Counter(1)));
     }
 }

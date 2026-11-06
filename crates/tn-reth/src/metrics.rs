@@ -2,12 +2,14 @@
 //!
 //! The counter series are exported under the `tn_reth` scope, in four unrelated groups.
 //!
-//! Block building. Two series count transactions that `build_block_from_batch_payload`
-//! declines to include in a block: `tn_reth.unrecoverable_txs_dropped_total` (alertable - a
-//! certified batch carried a transaction whose signer could not be recovered) and
-//! `tn_reth.invalid_txs_skipped_total` (expected - duplicates/invalid transactions across
-//! independently-batching workers, labeled by `reason`, see [`InvalidTxSkipReason`]). See
-//! [`RethEnvMetrics`] and the skip-reason docs for per-series semantics.
+//! Block building. Two series count transactions that block building
+//! (`build_block_from_batch_payload`, or `recover_output_signers` followed by
+//! `build_block_from_recovered_payload`) declines to include in a block:
+//! `tn_reth.unrecoverable_txs_dropped_total` (alertable - a certified batch carried a transaction
+//! whose signer could not be recovered) and `tn_reth.invalid_txs_skipped_total` (expected -
+//! duplicates/invalid transactions across independently-batching workers, labeled by `reason`, see
+//! [`InvalidTxSkipReason`]). See [`RethEnvMetrics`] and the skip-reason docs for per-series
+//! semantics.
 //!
 //! Observer transaction forwarding. A base series counts every transaction handed to the
 //! forwarder ([`crate::WorkerRpcForwarder`]): `tn_reth.forwarded_txns_queued_total`. Read
@@ -134,6 +136,11 @@ pub(crate) struct RethEnvMetrics {
     txpool_expired_txs_total: Counter,
 
     /// Transactions dropped while building a block because their signer could not be recovered.
+    ///
+    /// Counted at recovery: in the bytes build per block, before the builder is set up (a build
+    /// that then fails still counts its drops), and in `recover_output_signers` per consensus
+    /// output, which the engine runs when the output is queued, ahead of its blocks (an output
+    /// dropped from the queue at shutdown and replayed after a restart counts twice).
     ///
     /// Alert on any nonzero value. A certified sub-DAG is fixed and identical on every honest
     /// node, so an unrecoverable transaction is dropped rather than halting the network (see

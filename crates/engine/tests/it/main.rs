@@ -4855,7 +4855,7 @@ async fn test_engine_lines_carry_consensus_ids() -> eyre::Result<()> {
             "persist_ms",
             "announce_ms",
             "txs",
-            "recover_ms",
+            "recover_wait_ms",
             "evm_ms",
             "root_ms",
             "finish_ms",
@@ -4865,6 +4865,156 @@ async fn test_engine_lines_carry_consensus_ids() -> eyre::Result<()> {
         ]
     );
     assert_eq!(field_value(&output_executed[0], "txs"), Some(expected_txs.to_string().as_str()));
+
+    // the background recovery job started when the output was queued logs once per output
+    let recovered = captured_engine_events("signers recovered");
+    assert_eq!(recovered.len(), 1, "one line per output");
+    assert_eq!(field_names(&recovered[0]), ["consensus_number", "txs", "recover_ms"]);
+    assert_eq!(field_value(&recovered[0], "consensus_number"), Some(number.as_str()));
+    assert_eq!(field_value(&recovered[0], "txs"), Some(expected_txs.to_string().as_str()));
+
+    Ok(())
+}
+
+/// Signers recovered by the engine's background job build the blocks inline recovery builds.
+/// One three-batch output split across two certificates (the first carries batches 1 and 2, the
+/// second batch 3, which also repeats a transaction of batch 1 and carries bytes that do not
+/// decode) runs through the engine's run loop on one node (signers recovered by the job started
+/// when the output is queued, taken by the execution task before the first block) and through
+/// `execute_consensus_output` on a second node from the same genesis (signers recovered inline,
+/// on the execution thread). Both chains must agree block for block: same sealed blocks, so the
+/// same hashes, state and receipts roots, gas and transactions, in certificate-then-batch order,
+/// with the repeated transaction executed once and the undecodable bytes dropped by the job.
+#[tokio::test]
+async fn test_queued_recovery_matches_inline_recovery() -> eyre::Result<()> {
+    let _guard = IT_TEST_GUARD.lock();
+    let chain = test_chain_spec_arc();
+    let mut batches = tn_reth::test_utils::batches(chain.clone(), 3);
+    let genesis = test_genesis_with_consensus_registry(4);
+    let (genesis, _txs_by_block, _signers_by_block) =
+        seeded_genesis_from_random_batches(genesis, batches.iter());
+    let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+    // the transactions each block executes, before batch 3 gains a repeat of batch 1's first
+    // transaction and undecodable bytes (added after seeding, which decodes every transaction)
+    let executed_txs: Vec<usize> = batches.iter().map(|b| b.transactions.len()).collect();
+    let repeated = batches[0].transactions[0].clone();
+    batches[2].transactions.push(repeated);
+    batches[2].transactions.push(vec![0xde, 0xad, 0xbe, 0xef]);
+
+    // two execution nodes from the same genesis, one per recovery path
+    let queued_dir = TempDir::new().expect("temp dir");
+    let inline_dir = TempDir::new().expect("temp dir");
+    let queued_gas = GasAccumulator::new(1);
+    let inline_gas = GasAccumulator::new(1);
+    let queued_node = default_test_execution_node(
+        Some(chain.clone()),
+        None,
+        queued_dir.path(),
+        Some(queued_gas.clone()),
+    )?;
+    let inline_node = default_test_execution_node(
+        Some(chain.clone()),
+        None,
+        inline_dir.path(),
+        Some(inline_gas.clone()),
+    )?;
+    let committee =
+        create_committee_from_state(queued_node.epoch_state_from_canonical_tip().await?).await?;
+    let leader_id = committee.authorities().first().expect("first authority").id();
+    let batch_producer =
+        committee.authority(&leader_id).expect("authority in committee").execution_address();
+    queued_gas.rewards_counter().set_committee(committee.clone());
+    inline_gas.rewards_counter().set_committee(committee);
+
+    //=== Consensus: one output containing both batches
+    let mut leader = Certificate::default();
+    leader.update_header_author_for_test(leader_id);
+    let sub_dag_index = 1;
+    leader.update_header_round_for_test(sub_dag_index as u32);
+    // genesis is stamped with `now()` on creation, so the leader never predates the parent block
+    leader.update_header_created_at_for_test(now());
+    let batch_digests: VecDeque<BlockHash> = batches.iter().map(|b| b.digest()).collect();
+    let second_certificate = batches.split_off(2);
+    let sub_dag = CommittedSubDag::new(
+        vec![Certificate::default(), leader.clone()],
+        leader,
+        sub_dag_index,
+        ReputationScores::default(),
+        None,
+        tn_types::EpochSeedChainValue::genesis_placeholder(),
+    );
+    let consensus_output = ConsensusOutput::new(
+        sub_dag,
+        ConsensusHeaderDigest::default(),
+        1,
+        false,
+        batch_digests,
+        vec![
+            CertifiedBatch { address: batch_producer, batches },
+            CertifiedBatch { address: batch_producer, batches: second_certificate },
+        ],
+    );
+    let genesis_header = chain.sealed_genesis_header();
+
+    //=== queued path: through the engine's run loop
+    let queued_env = queued_node.get_reth_env().await;
+    let (to_engine, from_consensus) = tokio::sync::mpsc::channel(1);
+    let shutdown = Notifier::default();
+    let task_manager = TaskManager::default();
+    let (engine_update_tx, _engine_update_rx) = tokio::sync::mpsc::channel(64);
+    let engine = ExecutorEngine::new(
+        queued_env.clone(),
+        None,
+        from_consensus,
+        genesis_header.clone(),
+        shutdown.subscribe(),
+        task_manager.get_spawner(),
+        queued_gas,
+        tn_types::repack_monitor::RepackMonitor::default(),
+        engine_update_tx,
+    );
+    to_engine.send(consensus_output.clone()).await?;
+    drop(to_engine);
+    let res = timeout(Duration::from_secs(30), engine.run()).await?;
+    assert_matches!(res, Err(TnEngineError::ConsensusOutputStreamClosed));
+
+    //=== inline path: the public entry point, on a blocking thread as the engine runs it
+    let inline_env = inline_node.get_reth_env().await;
+    let (engine_update_tx, _engine_update_rx) = tokio::sync::mpsc::channel(64);
+    let args = BuildArguments::new(inline_env.clone(), consensus_output, genesis_header);
+    tokio::task::spawn_blocking(move || {
+        execute_consensus_output(
+            args,
+            inline_gas,
+            tn_types::repack_monitor::RepackMonitor::default(),
+            engine_update_tx,
+        )
+    })
+    .await??;
+
+    //=== the two chains are the same chain
+    assert_eq!(queued_env.last_block_number()?, 3, "one block per batch");
+    assert_eq!(inline_env.last_block_number()?, 3, "one block per batch");
+    for number in 1..=3u64 {
+        let queued = queued_env.sealed_block_by_number(number)?.expect("queued-path block");
+        let inline = inline_env.sealed_block_by_number(number)?.expect("inline-path block");
+        assert_eq!(queued.hash(), inline.hash(), "block hash diverged at block {number}");
+        assert_eq!(queued.state_root, inline.state_root, "state root diverged at {number}");
+        assert_eq!(queued.receipts_root, inline.receipts_root, "receipts root at {number}");
+        assert_eq!(queued.gas_used, inline.gas_used, "gas used diverged at block {number}");
+        assert_eq!(queued, inline, "sealed block diverged at block {number}");
+    }
+
+    // blocks follow certificate-then-batch order, and block 3 executes all of batch 3 but the
+    // skipped repeat and the dropped undecodable bytes
+    let block_txs: Vec<usize> = (1..=3u64)
+        .map(|number| {
+            queued_env
+                .sealed_block_by_number(number)
+                .map(|block| block.map(|block| block.body().transactions.len()).unwrap_or_default())
+        })
+        .collect::<Result<_, _>>()?;
+    assert_eq!(block_txs, executed_txs);
 
     Ok(())
 }
