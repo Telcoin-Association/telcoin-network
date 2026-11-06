@@ -266,7 +266,7 @@ fn penalty_from_header_error(error: &HeaderError) -> Option<Penalty> {
         //
         // the refusal describes the voter's state, never the header, so the requester is left
         // free to retry and earns the vote once this node has caught up
-        HeaderError::NotActiveCvv => None,
+        HeaderError::NotActiveCvv | HeaderError::ExecutionBehind { .. } => None,
     }
 }
 
@@ -445,5 +445,9 @@ mod tests {
             );
         };
         assert_recoverable_without_penalty(HeaderError::NotActiveCvv);
+        assert_recoverable_without_penalty(HeaderError::ExecutionBehind {
+            header_block: 12,
+            local_block: 9,
+        });
     }
 }
