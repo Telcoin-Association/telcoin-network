@@ -11,13 +11,15 @@ mod penalty;
 mod policy;
 mod score;
 mod status;
+mod tracked;
 mod types;
 pub use admission::{AdmissionFallback, AdmissionStatus, CommitteeUpdate};
 pub(crate) use behavior::PeerAdmissionDenied;
 pub(crate) use manager::{PeerManager, PutRecordRate};
 pub use penalty::LoadPenalty;
 pub(crate) use penalty::Severity;
-pub(crate) use types::{PeerEvent, PenaltyOutcome, MAX_PEER_EXCHANGE_MESSAGE_SIZE};
+pub use tracked::{EntrySource, SwarmAdmissionSnapshot, TrackedEntry, TrackedSlot};
+pub(crate) use types::{LookupClass, PeerEvent, PenaltyOutcome, MAX_PEER_EXCHANGE_MESSAGE_SIZE};
 pub use types::{
     PeerExchangeKey, PeerExchangeMap, Penalty, MAX_PEER_EXCHANGE_ADDRS_PER_PEER,
     MAX_PEER_EXCHANGE_ENTRIES,

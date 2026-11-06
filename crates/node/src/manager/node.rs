@@ -19,6 +19,7 @@ use crate::{
     },
     metrics::EpochMetrics,
     network_readiness::{monitor, NetworkReadiness},
+    AdmissionSnapshotSource,
 };
 use eyre::{eyre, WrapErr as _};
 use futures::TryStreamExt as _;
@@ -254,6 +255,11 @@ pub(crate) struct EpochManager<P, DB> {
     /// Worker network handles, indexed by [`WorkerId`](tn_types::WorkerId). Empty until
     /// [`spawn_node_networks`](Self::spawn_node_networks) runs.
     worker_network_handles: Vec<WorkerNetworkHandle>,
+    /// Admission snapshots served by `tn_admissionSnapshot` on every RPC server.
+    ///
+    /// Handed to each [`EngineToPrimaryRpc`](crate::EngineToPrimaryRpc) when it is built, and
+    /// given the network handles once [`run`](Self::run) spawns the networks.
+    admission_snapshots: AdmissionSnapshotSource,
     /// Key config - loaded once for application lifetime.
     key_config: KeyConfig,
     /// The epoch manager's [ShutdownNotifier] to shutdown all node processes.
@@ -800,6 +806,7 @@ where
             tn_datadir,
             primary_network_handle: None,
             worker_network_handles: Vec::new(),
+            admission_snapshots: AdmissionSnapshotSource::default(),
             key_config,
             node_shutdown,
             epoch_boundary: Default::default(),
@@ -1054,6 +1061,16 @@ where
             .as_ref()
             .ok_or_else(|| eyre!("no primary network handle"))?
             .clone();
+
+        // worker 0's rpc was built with this source before any swarm existed and serves snapshots
+        // from here on; inactive worker swarms report too, because they keep listening
+        self.admission_snapshots.set(
+            primary_network_handle.inner_handle().clone(),
+            self.worker_network_handles
+                .iter()
+                .map(|worker| (worker.worker_id(), worker.inner_handle().clone()))
+                .collect(),
+        )?;
 
         // Monitor process-lifetime handles before startup issues any network commands.
         let primary = primary_network_handle.inner_handle().clone();
