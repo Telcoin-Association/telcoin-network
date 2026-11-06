@@ -26,7 +26,7 @@ use std::{
     collections::{HashSet, VecDeque},
     future::{ready, Future},
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tn_config::{NetworkConfig, TelcoinDirs};
 use tn_executor::subscriber::spawn_subscriber;
@@ -681,9 +681,11 @@ where
     /// If the leader's commit timestamp has reached `self.epoch_boundary`, the output is flagged as
     /// the epoch's close so the engine finalizes the epoch on execution. The output's batches are
     /// evicted from [`NodeBatchesCache`] and [`OurNodeBatchesCache`] (see
-    /// [`evict_committed_batches`]), then the output is sent. `last_forwarded_consensus_number` is
-    /// updated only after the send succeeds, so the restart-replay and leftover-drain paths can
-    /// rely on it marking what actually reached the engine rather than what was merely dequeued.
+    /// [`evict_committed_batches`]), then the output is stamped with the hand-off instant
+    /// (`ConsensusOutput::set_forwarded_at`, observability only) and sent.
+    /// `last_forwarded_consensus_number` is updated only after the send succeeds, so the
+    /// restart-replay and leftover-drain paths can rely on it marking what actually reached the
+    /// engine rather than what was merely dequeued.
     pub(super) async fn process_output(
         &mut self,
         to_engine: &mpsc::Sender<ConsensusOutput>,
@@ -695,6 +697,9 @@ where
             output.set_epoch_close();
         }
         evict_committed_batches(&self.consensus_db, output.batch_digests());
+        // stamped before the send so the engine's forward wait includes a send blocked on a full
+        // channel; node-local, never serialized or hashed
+        output.set_forwarded_at(Instant::now());
         // only forward the output to the engine
         to_engine.send(output).await?;
         // store number after successful send

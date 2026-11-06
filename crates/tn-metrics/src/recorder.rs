@@ -163,6 +163,10 @@ fn build_prometheus_recorder() -> eyre::Result<PrometheusRecorder> {
             Matcher::Full("tn_engine_queue_wait_seconds".to_string()),
             SUB_MS_SECONDS_BUCKETS,
         )?
+        .set_buckets_for_metric(
+            Matcher::Full("tn_engine_forward_wait_seconds".to_string()),
+            SUB_MS_SECONDS_BUCKETS,
+        )?
         .set_buckets_for_metric(Matcher::Suffix("_bytes".to_string()), BYTES_BUCKETS)?
         .set_buckets_for_metric(Matcher::Full("tn_engine_block_gas_used".to_string()), GAS_BUCKETS)?
         .set_buckets_for_metric(
@@ -332,9 +336,9 @@ mod tests {
         assert!(rendered.contains("le=\"0.5\""), "{rendered}");
     }
 
-    /// The vote stage and engine queue wait histograms take the sub-ms layout through their
-    /// `Full` matchers, which win over the `_seconds` suffix, and every other `_seconds`
-    /// histogram keeps [`SECONDS_BUCKETS`].
+    /// The vote stage, engine queue wait and engine forward wait histograms take the sub-ms
+    /// layout through their `Full` matchers, which win over the `_seconds` suffix, and every
+    /// other `_seconds` histogram keeps [`SECONDS_BUCKETS`].
     #[test]
     fn test_sub_ms_histograms_render_sub_ms_buckets() {
         let inner = build_prometheus_recorder().expect("recorder builds");
@@ -345,6 +349,7 @@ mod tests {
             metrics::histogram!("tn_primary.vote_stage_seconds", "stage" => "validate")
                 .record(0.0003);
             metrics::histogram!("tn_engine.queue_wait_seconds").record(0.0003);
+            metrics::histogram!("tn_engine.forward_wait_seconds").record(0.0003);
             metrics::histogram!("tn_test.other_seconds").record(0.0003);
         });
 
@@ -358,6 +363,9 @@ mod tests {
             "tn_engine_queue_wait_seconds_bucket{le=\"0.00025\"} 0\n",
             "tn_engine_queue_wait_seconds_bucket{le=\"0.0005\"} 1\n",
             "tn_engine_queue_wait_seconds_bucket{le=\"30\"} 1\n",
+            "tn_engine_forward_wait_seconds_bucket{le=\"0.00025\"} 0\n",
+            "tn_engine_forward_wait_seconds_bucket{le=\"0.0005\"} 1\n",
+            "tn_engine_forward_wait_seconds_bucket{le=\"30\"} 1\n",
             "tn_test_other_seconds_bucket{le=\"0.005\"} 1\n",
         ]
         .into_iter()
