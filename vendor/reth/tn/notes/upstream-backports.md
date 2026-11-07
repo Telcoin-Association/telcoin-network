@@ -57,6 +57,7 @@ Severity below is for TN, which differs from upstream's in places. Relevant TN f
 | 62808bd06 | TN-0043 | the pool admits a sender whose code hash is the empty hash (an EOA to the EVM) | upstream test; txpool 230/230 |
 | 0e14f1a8a | TN-0044 | an IPC connection's service loop ends when its response channel closes instead of spinning | reth-ipc 17/17 |
 | a68f9e19f | TN-0044 | `--rpc.max-subscriptions-per-connection` limits IPC connections (each request had built a fresh counter) | upstream test; reth-ipc 18/18 |
+| 9580b7fc1 | TN-0045 | test only: zstd 0.13 compatibility fixtures for nippy-jar, so a zstd bump cannot silently stop reading static files | the test itself |
 
 ## Open
 
@@ -93,13 +94,11 @@ Severity below is for TN, which differs from upstream's in places. Relevant TN f
 
 ### Low
 
-e7ebeb869 (partial
-receipts), 1a6ba945a
-(codecs decode), 078c22d5f (iterative BlockState drop), 44a74f9ea (reject conflicting
-transaction fees in call requests), 33b785d97 (`0x` data for empty reverts), 9580b7fc1 (zstd
-0.13 compatibility test, test only). 1a6ba945a and 078c22d5f are on the execution path
-(`codecs`, `chain-state`) for a change that does not alter state; they wait for the next
-fork-checked change rather than carry that cost alone.
+e7ebeb869 (partial receipts), 1a6ba945a (codecs decode), 078c22d5f (iterative BlockState
+drop), 44a74f9ea (reject conflicting transaction fees in call requests), 33b785d97 (`0x` data for
+empty reverts). 1a6ba945a and 078c22d5f are on the execution path (`codecs`, `chain-state`) for a
+change that does not alter state; they wait for the next fork-checked change rather than carry
+that cost alone.
 
 ### Not applicable
 

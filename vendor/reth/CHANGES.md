@@ -520,6 +520,16 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   *Tests*: upstream's `test_max_subscriptions_per_connection`; reth-ipc 18/18. *Upstream*: n/a
   (upstream commits).
 
+- **TN-0045** — Backport 9580b7fc1: a test that zstd 0.13 still decodes reth's static-file
+  compression. *Kind*: backport (test only).
+  *Files*: `crates/storage/nippy-jar/src/lib.rs` (`test_zstd_013_compatibility`), added
+  `crates/storage/nippy-jar/tests/fixtures/zstd-0.13/` (a dictionary and blocks written with zstd
+  0.13, and upstream's README for them).
+  *Why*: TN's static files (headers, transactions, receipts) are zstd-compressed with
+  dictionaries, and TN ships zstd 0.13.3. The test fails if a zstd bump stops reading what 0.13
+  wrote, before any datadir meets it. No shipped code changes. *Tests*: reth-nippy-jar and reth-db
+  51/51. *Upstream*: n/a (upstream commit).
+
 ## TN fixes (not from an upstream commit)
 
 - **TN-0036** — Debug traces hold their tracing permit until their blocking task ends. *Kind*:
