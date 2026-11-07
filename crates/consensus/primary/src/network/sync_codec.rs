@@ -22,7 +22,7 @@ use futures::{
 };
 use std::{
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc,
     },
     time::{Duration, Instant},
@@ -71,12 +71,21 @@ const SYNC_RATE_MIN_BYTES: u64 = 1 << 20;
 /// [`SYNC_TARGET_MIN_BYTES`] to the floor.
 const SYNC_TARGET_RATE_MULTIPLE: u64 = 8;
 
-/// Minimum bytes per [`SYNC_RATE_WINDOW`] a FRESH peer (one not de-prioritised this epoch) must
-/// sustain for the requester to keep reading: 8 MiB per window (~273 KiB/s). This is well above
-/// the floor, below the rate the responder's own `PUBLIC_EPOCH_PACK_SERVE_TIMEOUT` already
-/// demands of a 100 MiB public pack (512 KiB/s), and far below an honest link. A de-prioritised
-/// peer is read at the floor ([`SyncRateBound::Floor`]) so a network whose only peers are slow
-/// still syncs.
+/// Minimum bytes per [`SYNC_RATE_WINDOW`] a fresh peer must sustain for the requester to keep
+/// reading: 8 MiB per 30 s window, about 273 KiB/s or 2.24 Mbit/s per stream. A node with three
+/// epoch fetchers needs about 6.7 Mbit/s to meet it on every stream. The target is well above the
+/// floor, below the rate the responder's own `PUBLIC_EPOCH_PACK_SERVE_TIMEOUT` already demands of
+/// a 100 MiB public pack (512 KiB/s), and far below an honest link.
+///
+/// A fresh peer is read at the target ([`SyncRateBound::Target`]). A peer cut at the target in a
+/// probe walk is probed again at the floor in the same walk, with no sleep
+/// (`walk_with_floor_fallback`). A de-prioritised peer (one marked slow for that epoch) is read at
+/// the floor ([`SyncRateBound::Floor`]), so a network whose only peers are slow still syncs. A
+/// peer that serves at or above the target becomes the preferred sync server. It keeps the
+/// probe-first slot until it fails a probe, until an exploration walk
+/// (`SYNC_PREFERENCE_EXPLORE_EVERY` in `network/mod.rs`) finds another peer that serves at the
+/// target, or until the epoch rotates. So a peer that serves at exactly the target can hold the
+/// slot for up to that many walks (#1787).
 pub(crate) const SYNC_TARGET_MIN_BYTES: u64 = SYNC_RATE_MIN_BYTES * SYNC_TARGET_RATE_MULTIPLE;
 
 /// Wall-clock allowance for the latency part of one exchange (stream open, request write, `Ack`
@@ -172,25 +181,55 @@ pub(crate) enum SyncServeSpeed {
     Slow,
 }
 
-/// Counts the pack bytes the requester's reader ([`sync_pack_reader`]) delivers for one exchange.
+/// Counts the pack bytes the requester's reader ([`sync_pack_reader`]) delivers for one exchange,
+/// and notes whether the reader cut the exchange for falling below [`SyncRateBound::Target`].
 ///
 /// The probe walk keeps one handle and gives a clone to the reader, so after the exchange it can
-/// judge the serve's rate ([`Self::speed`]) from the bytes and the wall-clock time it took.
+/// judge the serve's rate ([`Self::speed`]) from the bytes and the wall-clock time it took, and
+/// tell a cut at the target ([`Self::cut_at_target`]) from any other failure (#1787).
 #[derive(Clone, Debug, Default)]
 pub(crate) struct SyncServeMeter(
-    /// Bytes delivered so far, shared by every clone.
-    Arc<AtomicU64>,
+    /// The byte count and the cut flag, shared by every clone.
+    Arc<SyncServeMeterState>,
 );
+
+/// The shared state behind a [`SyncServeMeter`] and all of its clones.
+#[derive(Debug, Default)]
+struct SyncServeMeterState {
+    /// Bytes delivered so far ([`SyncServeMeter::record`]).
+    bytes: AtomicU64,
+    /// Whether the reader cut the exchange for falling below [`SyncRateBound::Target`]
+    /// ([`SyncServeMeter::note_cut`]).
+    cut_at_target: AtomicBool,
+}
 
 impl SyncServeMeter {
     /// Add `n` delivered bytes.
     pub(crate) fn record(&self, n: u64) {
-        self.0.fetch_add(n, Ordering::Relaxed);
+        self.0.bytes.fetch_add(n, Ordering::Relaxed);
     }
 
     /// The bytes delivered so far.
     pub(crate) fn bytes(&self) -> u64 {
-        self.0.load(Ordering::Relaxed)
+        self.0.bytes.load(Ordering::Relaxed)
+    }
+
+    /// Record that the reader ([`sync_pack_reader`]) cut the stream for falling below `bound`.
+    /// Only a cut at [`SyncRateBound::Target`] is remembered, because only that cut is worth a
+    /// retry at the floor in the same walk; see `walk_with_floor_fallback` in `network/mod.rs`
+    /// (#1787).
+    pub(crate) fn note_cut(&self, bound: SyncRateBound) {
+        match bound {
+            SyncRateBound::Target => self.0.cut_at_target.store(true, Ordering::Relaxed),
+            SyncRateBound::Floor => {}
+        }
+    }
+
+    /// Whether the reader cut the exchange for falling below [`SyncRateBound::Target`]
+    /// ([`Self::note_cut`]). A cut at the floor, a clean serve and any other failure leave it
+    /// `false` (#1787).
+    pub(crate) fn cut_at_target(&self) -> bool {
+        self.0.cut_at_target.load(Ordering::Relaxed)
     }
 
     /// Judge a serve that took `elapsed`: [`SyncServeSpeed::Target`] when `elapsed` is at most
@@ -501,6 +540,7 @@ where
                 if watch.record(now, delivered) {
                     Ok(frame)
                 } else {
+                    meter.note_cut(bound);
                     Err(std::io::Error::new(
                         std::io::ErrorKind::TimedOut,
                         format!(
@@ -1132,6 +1172,58 @@ mod tests {
         let err = reader.read_to_end(&mut rest).await.expect_err("a dribble must not end cleanly");
         assert_eq!(err.kind(), std::io::ErrorKind::TimedOut, "got {err:?}");
         assert!(err.to_string().contains("Floor"), "got {err:?}");
+    }
+
+    /// Drive the dribble of `sync_pack_reader_cuts_a_dribble_that_ends_after_the_window` at
+    /// `bound` with `meter`: one small `Data` frame, then `End` after the window. Returns the
+    /// result of reading the rest of the stream after the window.
+    async fn read_dribble_at(
+        bound: SyncRateBound,
+        meter: SyncServeMeter,
+    ) -> std::io::Result<usize> {
+        let payload = [7u8; 1024];
+        let framed = frame_pack(&payload).await;
+        let mut reader = sync_pack_reader(futures::io::Cursor::new(framed), bound, meter);
+        let mut first = vec![0u8; payload.len()];
+        reader.read_exact(&mut first).await?;
+        tokio::time::advance(SYNC_RATE_WINDOW.saturating_add(Duration::from_secs(1))).await;
+        let mut rest = Vec::new();
+        reader.read_to_end(&mut rest).await
+    }
+
+    /// A reader cut for falling below the target bound marks the cut on the caller's meter clone,
+    /// so the probe walk can retry the peer at the floor (`walk_with_floor_fallback`, #1787). A
+    /// cut at the floor and a clean read at the target leave the mark unset. Paused time drives
+    /// the reader's clock.
+    #[tokio::test(start_paused = true)]
+    async fn sync_pack_reader_marks_a_target_cut_on_the_meter() {
+        let target_cut = SyncServeMeter::default();
+        let err = read_dribble_at(SyncRateBound::Target, target_cut.clone())
+            .await
+            .expect_err("a dribble must not end cleanly at the target");
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut, "got {err:?}");
+        assert!(err.to_string().contains("Target"), "got {err:?}");
+        assert!(target_cut.cut_at_target(), "a cut at the target must be marked");
+
+        let floor_cut = SyncServeMeter::default();
+        let err = read_dribble_at(SyncRateBound::Floor, floor_cut.clone())
+            .await
+            .expect_err("a dribble must not end cleanly at the floor");
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut, "got {err:?}");
+        assert!(!floor_cut.cut_at_target(), "a cut at the floor must not be marked");
+
+        let clean = SyncServeMeter::default();
+        let framed = frame_pack(&[7u8; 1024]).await;
+        let mut reader = sync_pack_reader(
+            futures::io::Cursor::new(framed),
+            SyncRateBound::Target,
+            clean.clone(),
+        );
+        let mut received = Vec::new();
+        reader.read_to_end(&mut received).await.expect("a clean read at the target");
+        assert_eq!(received.len(), 1024);
+        assert!(!clean.cut_at_target(), "a clean read must not be marked");
+        assert!(clean.bytes() > 0, "a clean read must count its bytes");
     }
 
     /// Frame `bytes` through [`write_pack_data_frames`] into an in-memory buffer.

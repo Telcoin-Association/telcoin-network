@@ -116,6 +116,12 @@ A typed append-only record log over an `MmapDataFile`. Each record on disk is
 A 28-byte `DataHeader` (`DATA_HEADER_BYTES`: type, version, uid, appnum, compression, CRC32) leads every file and
 is validated on open. `raw_iter` walks the log using **only** the data file (no indexes), bounded to
 the clone-time logical `end` — this is the authoritative replay source for index rebuilds.
+A record received from a peer (`stream_import`, `bytes_to_verified_output`) must also fit zstd's
+worst-case stored size for its decompressed content (`stored_bound`, checked by
+`decompress_peer_record`). A padded record (a skippable frame, an empty frame or block) is refused
+as undecodable, so the sync rate meter cannot be fed stored bytes that carry no content (#1787).
+Local reads keep the unbounded decode: an import stores a peer's bytes verbatim, so a pack imported
+before this check may hold such a record.
 
 ### 3. The derived indexes
 

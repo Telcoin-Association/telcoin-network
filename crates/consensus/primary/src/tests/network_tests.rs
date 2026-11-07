@@ -3681,12 +3681,11 @@ fn test_order_probe_peers_deprioritises_this_epoch_failures() {
         (0..5).map(|_| *BlsKeypair::generate(&mut rng).public()).collect();
 
     // peers[0], peers[1] failed THIS epoch (7); peers[2] failed a DIFFERENT epoch (6, ignored).
-    let mut failed: HashMap<BlsPublicKey, Epoch> = HashMap::new();
-    failed.insert(peers[0], 7);
-    failed.insert(peers[1], 7);
-    failed.insert(peers[2], 6);
+    let failed: HashSet<(BlsPublicKey, Epoch)> =
+        [(peers[0], 7), (peers[1], 7), (peers[2], 6)].into_iter().collect();
 
-    let ordered = crate::network::order_probe_peers(peers.clone(), &failed, 7, None, &mut rng);
+    let ordered =
+        crate::network::order_probe_peers(peers.clone(), &failed, 7, None, false, &mut rng);
 
     // Same set, no drops.
     assert_eq!(
@@ -3831,7 +3830,7 @@ fn test_order_probe_peers_puts_last_server_first() {
     let mut rng = StdRng::from_seed([7; 32]);
     let peers: Vec<BlsPublicKey> =
         (0..6).map(|_| *BlsKeypair::generate(&mut rng).public()).collect();
-    let none_failed = HashMap::new();
+    let none_failed: HashSet<(BlsPublicKey, Epoch)> = HashSet::new();
 
     // whichever peer served last, it is probed first while it has not failed this epoch
     for &preferred in &peers {
@@ -3840,6 +3839,7 @@ fn test_order_probe_peers_puts_last_server_first() {
             &none_failed,
             7,
             Some(preferred),
+            false,
             &mut rng,
         );
         assert_eq!(ordered[0], preferred, "a fresh preferred peer must be probed first");
@@ -3847,16 +3847,29 @@ fn test_order_probe_peers_puts_last_server_first() {
 
     // the preferred peer and one other both failed epoch 7: both sit behind the four fresh peers,
     // the preferred one first
-    let failed: HashMap<BlsPublicKey, Epoch> = [(peers[0], 7), (peers[1], 7)].into();
-    let ordered =
-        crate::network::order_probe_peers(peers.clone(), &failed, 7, Some(peers[0]), &mut rng);
+    let failed: HashSet<(BlsPublicKey, Epoch)> =
+        [(peers[0], 7), (peers[1], 7)].into_iter().collect();
+    let ordered = crate::network::order_probe_peers(
+        peers.clone(),
+        &failed,
+        7,
+        Some(peers[0]),
+        false,
+        &mut rng,
+    );
     assert_eq!(ordered[4], peers[0], "a failed preferred peer must lead the failed group");
     assert_eq!(ordered[5], peers[1], "the other failed peer must be probed last");
 
     // a failure recorded for another epoch does not cost the preference
-    let stale: HashMap<BlsPublicKey, Epoch> = [(peers[0], 6)].into();
-    let ordered =
-        crate::network::order_probe_peers(peers.clone(), &stale, 7, Some(peers[0]), &mut rng);
+    let stale: HashSet<(BlsPublicKey, Epoch)> = [(peers[0], 6)].into_iter().collect();
+    let ordered = crate::network::order_probe_peers(
+        peers.clone(),
+        &stale,
+        7,
+        Some(peers[0]),
+        false,
+        &mut rng,
+    );
     assert_eq!(ordered[0], peers[0], "a failure in another epoch must not demote the peer");
 
     // a preferred key that is not connected changes nothing: same rng state, same order as `None`
@@ -3866,9 +3879,11 @@ fn test_order_probe_peers_puts_last_server_first() {
         &none_failed,
         7,
         Some(stranger),
+        false,
         &mut rng.clone(),
     );
-    let without = crate::network::order_probe_peers(peers.clone(), &none_failed, 7, None, &mut rng);
+    let without =
+        crate::network::order_probe_peers(peers.clone(), &none_failed, 7, None, false, &mut rng);
     assert_eq!(with_stranger, without, "an unconnected preferred key must not reorder peers");
     assert_eq!(
         with_stranger.into_iter().collect::<BTreeSet<_>>(),
@@ -3889,7 +3904,7 @@ async fn test_probe_loops_open_last_server_first() {
     // preferred peer is among the failed ones, so it loses the preference
     let unsupported: HashSet<_> = peers[..4].iter().copied().collect();
     let (handle, opened) = spawn_scripted_swarm(peers.clone(), unsupported);
-    handle.record_sync_served(peers[9]);
+    handle.record_sync_served(peers[9], 0);
     let result = handle.request_epoch_pack(&record, &record, &chain, Duration::from_secs(10));
     assert!(result.await.is_err(), "no peer serves, so the pack fetch must fail");
     let opens = std::mem::take(&mut *opened.lock());
@@ -3904,7 +3919,7 @@ async fn test_probe_loops_open_last_server_first() {
     // the four unsupported peers are now cached unsyncable and skipped; every other peer failed
     // epoch 0 above. Serving again restores the preference (and clears the peer's failure), so
     // the preferred peer leads that group until it fails once more
-    handle.record_sync_served(peers[9]);
+    handle.record_sync_served(peers[9], 0);
     let result = handle.request_consensus_output(1, &chain, ConsensusHeaderDigest::default()).await;
     assert!(result.is_err(), "no peer serves, so the output fetch must fail");
     let opens = std::mem::take(&mut *opened.lock());
@@ -3918,8 +3933,8 @@ async fn test_probe_loops_open_last_server_first() {
 
     // a preferred peer that already failed this epoch goes behind every fresh peer
     let (handle, opened) = spawn_scripted_swarm(peers.clone(), HashSet::new());
-    handle.record_sync_served(peers[9]);
-    handle.epoch_sync_failed.lock().insert(peers[9], 0);
+    handle.record_sync_served(peers[9], 0);
+    handle.epoch_sync_failed.lock().insert((peers[9], 0));
     let result = handle.request_epoch_pack(&record, &record, &chain, Duration::from_secs(10));
     assert!(result.await.is_err(), "no peer serves, so the pack fetch must fail");
     let opens = std::mem::take(&mut *opened.lock());
@@ -3928,28 +3943,40 @@ async fn test_probe_loops_open_last_server_first() {
     assert_eq!(*handle.last_sync_server.lock(), None, "and it loses the preference as well");
 }
 
-/// `clear_sync_capability` empties the per-epoch caches but keeps the last peer that served.
+/// `clear_sync_capability` empties the per-epoch caches and also drops the last peer that
+/// served, so a peer preferred in one epoch gets no head start in the next (#1787). Serving
+/// clears only the `(peer, epoch)` slow mark it was recorded for.
 #[test]
-fn test_clear_sync_capability_keeps_last_server() {
+fn test_clear_sync_capability_drops_last_server() {
     let (tx, _rx) = tokio::sync::mpsc::channel(1);
     let handle = PrimaryNetworkHandle::new_for_test(tx);
     let mut rng = StdRng::from_seed([7; 32]);
     let peer = *BlsKeypair::generate(&mut rng).public();
     let other = *BlsKeypair::generate(&mut rng).public();
 
-    handle.epoch_sync_failed.lock().insert(peer, 3);
-    handle.epoch_sync_failed.lock().insert(other, 3);
-    handle.record_sync_served(peer);
+    handle.epoch_sync_failed.lock().insert((peer, 2));
+    handle.epoch_sync_failed.lock().insert((peer, 3));
+    handle.epoch_sync_failed.lock().insert((other, 3));
+    handle.record_sync_served(peer, 3);
     assert_eq!(handle.sync_capability.lock().get(&peer), Some(&true));
     assert!(
-        !handle.epoch_sync_failed.lock().contains_key(&peer),
+        !handle.epoch_sync_failed.lock().contains(&(peer, 3)),
         "serving must clear the peer's failure for this epoch"
     );
+    assert!(
+        handle.epoch_sync_failed.lock().contains(&(peer, 2)),
+        "serving in one epoch must not clear the peer's failure for another epoch"
+    );
+    assert!(
+        handle.epoch_sync_failed.lock().contains(&(other, 3)),
+        "serving must not clear another peer's failure"
+    );
+    assert_eq!(*handle.last_sync_server.lock(), Some(peer), "serving must set the preference");
 
     handle.clear_sync_capability();
     assert!(handle.sync_capability.lock().is_empty(), "capability cache must be cleared");
-    assert!(handle.epoch_sync_failed.lock().is_empty(), "failure map must be cleared");
-    assert_eq!(*handle.last_sync_server.lock(), Some(peer), "the preference must survive");
+    assert!(handle.epoch_sync_failed.lock().is_empty(), "failure set must be cleared");
+    assert_eq!(*handle.last_sync_server.lock(), None, "the preference must be dropped");
 }
 
 /// `import_fault_is_peer_caused` admits ONLY faults attributable solely to
