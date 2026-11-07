@@ -138,7 +138,8 @@ pub fn spawn_state_sync<DB: Database>(
         NodeMode::CvvActive => {}
         NodeMode::CvvInactive | NodeMode::Observer => {
             // If we are not an active CVV then follow latest consensus from peers.
-            let (config_clone, consensus_bus_clone) = (config.clone(), consensus_bus.clone());
+            let (config_clone, consensus_bus_clone, consensus_chain_clone) =
+                (config.clone(), consensus_bus.clone(), consensus_chain.clone());
             task_spawner.spawn_task(
                 "state sync: track latest consensus header from peers",
                 async move {
@@ -146,6 +147,7 @@ pub fn spawn_state_sync<DB: Database>(
                     spawn_track_recent_consensus(
                         config_clone,
                         consensus_bus_clone,
+                        consensus_chain_clone,
                     ).await;
                     Ok(())
                 },

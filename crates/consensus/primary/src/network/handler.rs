@@ -12,7 +12,10 @@ use futures::AsyncWriteExt as _;
 use parking_lot::Mutex;
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
-    sync::Arc,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
     time::{Duration, Instant},
 };
 use tn_config::{ConsensusConfig, VOTE_EXECUTION_WAIT};
@@ -137,6 +140,10 @@ pub(crate) struct RequestHandler<DB> {
     vote_metrics: Arc<VoteStageHandles>,
     /// Rate limit for the line logged when a demotion is held inside the rejoin grace.
     rejoin_grace_log: Arc<Mutex<RejoinGraceLog>>,
+    /// True while the rejoin grace holds a demotion: set by a hold, cleared once an incoming round
+    /// is inside the activity window again. A demotion while it is set is the held one taking
+    /// effect at the end of the grace, so the rejoin it follows counts as failed.
+    rejoin_grace_holding: Arc<AtomicBool>,
 }
 
 impl<DB> RequestHandler<DB>
@@ -168,6 +175,7 @@ where
             consensus_chain,
             vote_metrics: Arc::new(VoteStageHandles::new()),
             rejoin_grace_log: Default::default(),
+            rejoin_grace_holding: Default::default(),
         }
     }
 
@@ -185,6 +193,9 @@ where
     /// round leads the effective round by at most `ROUNDS_TO_KEEP - gc_depth`, a demotion for the
     /// activity window is held instead: logged, counted in `rejoin_grace_holds_total`, and
     /// answered as not behind. A demotion for an epoch behind is never held.
+    ///
+    /// A demotion settles the latest rejoin in the rejoin state: it failed when the demotion came
+    /// inside the grace, or was the one the grace held taking effect when the grace ended.
     pub(crate) async fn behind_consensus(
         &self,
         epoch: Epoch,
@@ -273,6 +284,7 @@ where
                     && round.saturating_sub(effective_exec_round) <= rebuild_bound
             }) {
                 self.consensus_bus.metrics().rejoin_grace_holds_total.increment(1);
+                self.rejoin_grace_holding.store(true, Ordering::Relaxed);
                 // every certificate past the window is held, about twenty a second under load,
                 // so the line is rate limited and carries the holds it stands for
                 let due = self.rejoin_grace_log.lock().record_hold(tokio::time::Instant::now());
@@ -288,6 +300,10 @@ where
                 }
                 return false;
             }
+        } else if epoch == exec_epoch {
+            // a round of the executed epoch inside the window: a hold, if any, has ended without
+            // a demotion
+            self.rejoin_grace_holding.store(false, Ordering::Relaxed);
         }
         if outside_gc_window || epoch_behind {
             // We seem to be too far behind to be an active CVV, try to go
@@ -333,6 +349,15 @@ where
             );
             let previous = self.consensus_bus.node_mode().send_replace(NodeMode::CvvInactive);
             record_mode_transition(previous, NodeMode::CvvInactive, reason);
+            // settle the latest rejoin now rather than when the catch-up loop restarts, which
+            // waits for the engine to drain the outputs already sequenced
+            let released_hold =
+                outside_gc_window && self.rejoin_grace_holding.load(Ordering::Relaxed);
+            let committee_epoch = self.consensus_config.committee().epoch();
+            let now = tokio::time::Instant::now();
+            self.consensus_bus.rejoin_state().send_if_modified(|state| {
+                state.record_demotion(committee_epoch, now, released_hold)
+            });
             self.consensus_config.shutdown().notify();
             true
         } else {
