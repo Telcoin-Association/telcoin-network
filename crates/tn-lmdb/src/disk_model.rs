@@ -4,10 +4,14 @@
 //! flushes them) but only within the durable length, and an fsync or fdatasync takes the whole
 //! file, its length included. Growing or truncating the file changes only its live length: as
 //! POSIX allows, a size change no fsync made durable can be lost, and with it every byte past the
-//! durable length, msync'd or not. [`power_loss`] gives the file back its durable length and
-//! writes the image over it: bytes never flushed are gone. [`power_loss_random`] models a harsher
-//! crash in which some unflushed pages (and perhaps the size change) had already been written back,
-//! some pages only in part. Untracked files cost one atomic load per flush.
+//! durable length, msync'd or not. A truncation below the durable length ([`truncated`]) also
+//! lowers the image's *trusted prefix* until the next fsync: an msync copies only within it, since
+//! a page past it, once the file grows again, lives in blocks the durable length does not name,
+//! and a power loss that brings that length back reads the old blocks. [`power_loss`] gives the
+//! file back its durable length and writes the image over it: bytes never flushed are gone.
+//! [`power_loss_random`] models a harsher crash in which some unflushed pages (and perhaps the
+//! size change) had already been written back, some pages only in part. Untracked files cost one
+//! atomic load per flush.
 
 use std::{
     collections::HashMap,
@@ -24,9 +28,25 @@ use std::{
 const SECTOR: usize = 512;
 
 static TRACKED: AtomicUsize = AtomicUsize::new(0);
-static IMAGES: Mutex<Option<HashMap<u64, Vec<u8>>>> = Mutex::new(None);
+static IMAGES: Mutex<Option<HashMap<u64, Image>>> = Mutex::new(None);
 
-fn images() -> std::sync::MutexGuard<'static, Option<HashMap<u64, Vec<u8>>>> {
+/// A tracked file's disk: its bytes (their length the durable length) and the prefix of them an
+/// msync still reaches.
+#[derive(Clone)]
+struct Image {
+    bytes: Vec<u8>,
+    /// At most `bytes.len()`: the durable length, lowered by a truncation below it until the
+    /// next fsync (see the module docs).
+    trusted: usize,
+}
+
+impl Image {
+    fn new(bytes: Vec<u8>) -> Self {
+        Self { trusted: bytes.len(), bytes }
+    }
+}
+
+fn images() -> std::sync::MutexGuard<'static, Option<HashMap<u64, Image>>> {
     IMAGES.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
@@ -34,7 +54,7 @@ fn images() -> std::sync::MutexGuard<'static, Option<HashMap<u64, Vec<u8>>>> {
 pub(crate) fn track(path: &Path) {
     let ino = std::fs::metadata(path).expect("metadata").ino();
     let bytes = std::fs::read(path).expect("read the tracked file");
-    images().get_or_insert_with(HashMap::new).insert(ino, bytes);
+    images().get_or_insert_with(HashMap::new).insert(ino, Image::new(bytes));
     TRACKED.fetch_add(1, Ordering::Relaxed);
 }
 
@@ -70,15 +90,31 @@ pub(crate) fn flushed_range(ino: u64, base: *const u8, mapped: u64, start: u64, 
     let page = crate::sys::os_page_size();
     let from = (start - start % page) as usize;
     // Past the durable length the bytes may reach their blocks, but the size that makes them part
-    // of the file may not: they stay lost until an fsync makes the length durable.
-    let to = ((end.div_ceil(page) * page).min(mapped) as usize).min(image.len());
+    // of the file may not: they stay lost until an fsync makes the length durable. Past the
+    // trusted prefix they reach blocks that length does not name.
+    let to = ((end.div_ceil(page) * page).min(mapped) as usize).min(image.trusted);
     if from >= to {
         return;
     }
     // SAFETY: the caller's `[base, base + mapped)` is a live mapping and `[from, to)` lies within
     // it; the copy goes into the model's own buffer, which no one else touches.
     unsafe {
-        std::ptr::copy_nonoverlapping(base.add(from), image[from..to].as_mut_ptr(), to - from);
+        std::ptr::copy_nonoverlapping(
+            base.add(from),
+            image.bytes[from..to].as_mut_ptr(),
+            to - from,
+        );
+    }
+}
+
+/// The file with inode `ino` was truncated to `len` bytes: below the durable length, that lowers
+/// the trusted prefix until the next fsync (see the module docs).
+pub(crate) fn truncated(ino: u64, len: u64) {
+    if TRACKED.load(Ordering::Relaxed) == 0 {
+        return;
+    }
+    if let Some(image) = images().as_mut().and_then(|images| images.get_mut(&ino)) {
+        image.trusted = image.trusted.min(len as usize);
     }
 }
 
@@ -103,12 +139,12 @@ pub(crate) fn flushed_all(file: &File) {
     let len = file.metadata().map(|meta| meta.len()).unwrap_or(0) as usize;
     let mut bytes = vec![0_u8; len];
     if file.read_exact_at(&mut bytes, 0).is_ok() {
-        *image = bytes;
+        *image = Image::new(bytes);
     }
 }
 
 /// The image of the tracked file at `path`, its inode, and the file opened for writing.
-fn image_of(path: &Path) -> (u64, Vec<u8>, File) {
+fn image_of(path: &Path) -> (u64, Image, File) {
     let ino = std::fs::metadata(path).expect("metadata").ino();
     let image = images()
         .as_ref()
@@ -122,18 +158,23 @@ fn image_of(path: &Path) -> (u64, Vec<u8>, File) {
 /// back (an unsynced growth is cut off, an unsynced truncation undone) and every byte is the
 /// image's.
 pub(crate) fn power_loss(path: &Path) {
-    let (_, image, file) = image_of(path);
-    file.set_len(image.len() as u64).expect("restore the durable length");
-    file.write_all_at(&image, 0).expect("write the image");
+    let (ino, image, file) = image_of(path);
+    file.set_len(image.bytes.len() as u64).expect("restore the durable length");
+    file.write_all_at(&image.bytes, 0).expect("write the image");
+    if let Some(image) = images().as_mut().and_then(|images| images.get_mut(&ino)) {
+        image.trusted = image.bytes.len();
+    }
 }
 
 /// A power loss in which the kernel had already written back some unflushed pages, some of them
-/// only in part. If the file's length differs from its durable length, a first seeded draw picks
-/// which survives (the size change was written back early, or not); with equal lengths no draw
-/// is spent. Each byte up to the surviving length has an *old* value, the image's (zero past the
-/// durable length), and a *new* value, the file's current byte (the old one past the current
-/// length). For every OS page whose old and new bytes differ, one seeded draw picks, with equal
-/// odds:
+/// only in part. If the file's length differs from its durable length, or a truncation lowered
+/// its trusted prefix, a first seeded draw picks whether the size change survives (it was written
+/// back early, or not); with neither no draw is spent. Each byte up to the surviving length has an
+/// *old* value, the image's (zero past the durable length, and past the trusted prefix when the
+/// size change survives: blocks allocated since), and a *new* value, the file's current byte (the
+/// old one past the current length, and past the trusted prefix when the size change is lost: those
+/// writes went to blocks the durable length does not name). For every OS page whose old and new
+/// bytes differ, one seeded draw picks, with equal odds:
 /// - **old**: the whole page reads as the image (never written back, [`power_loss`]'s outcome);
 /// - **new**: the whole page reads as the current bytes (written back early);
 /// - **torn**: each 512-byte sector independently (a fair seeded coin) reads old or new: a
@@ -146,13 +187,18 @@ pub(crate) fn power_loss_random(path: &Path, seed: u64) {
     let (ino, image, file) = image_of(path);
     let live = file.metadata().expect("metadata").len() as usize;
     let mut rng = SplitMix64(seed);
-    let len = if live == image.len() || rng.next().is_multiple_of(2) { live } else { image.len() };
-    // The old bytes, zero past the durable length; the new ones, old past the current length.
-    let mut old = image;
+    let durable = image.bytes.len();
+    let pending = live != durable || image.trusted < durable;
+    let kept = !pending || rng.next().is_multiple_of(2);
+    let len = if kept { live } else { durable };
+    let mut old = image.bytes;
+    if kept {
+        old.truncate(image.trusted);
+    }
     old.resize(len, 0);
     let mut bytes = vec![0_u8; live];
     file.read_exact_at(&mut bytes, 0).expect("read the file");
-    bytes.truncate(len);
+    bytes.truncate(if kept { len } else { image.trusted.min(len) });
     bytes.extend_from_slice(&old[bytes.len()..]);
     let page = crate::sys::os_page_size() as usize;
     for start in (0..len).step_by(page) {
@@ -176,7 +222,7 @@ pub(crate) fn power_loss_random(path: &Path, seed: u64) {
     file.set_len(len as u64).expect("set the surviving length");
     file.write_all_at(&bytes, 0).expect("write the surviving bytes");
     if let Some(image) = images().as_mut().and_then(|images| images.get_mut(&ino)) {
-        *image = bytes;
+        *image = Image::new(bytes);
     }
 }
 
@@ -280,6 +326,54 @@ mod tests {
             untrack(&copy);
         }
         assert_eq!(lengths.len(), 2, "the size change is sometimes kept, sometimes lost");
+        untrack(&path);
+    }
+
+    /// A truncation below the durable length keeps an msync of a page past the cut, once the file
+    /// regrew, from the disk until an fsync: a strict power loss brings back the durable length
+    /// and the page's old bytes, and a random one either keeps the size change (the page new or
+    /// zero) or loses it with the page's write; after a size sync the page survives.
+    #[test]
+    fn a_truncation_keeps_later_msyncs_past_the_cut_from_the_disk() {
+        let tmp = tempfile::TempDir::with_prefix("tn_lmdb_power_loss_cut").expect("temp dir");
+        let page = os_page_size() as usize;
+        let (path, file) = tracked_file(&tmp, 4, 0xAA);
+        drop(file);
+        // Cut the file to two pages, regrow it, write page 3 with 0xBB and msync it.
+        let cut_and_write = |sync: bool| {
+            let mut file = PageFile::open(&path, 1 << 26).expect("open");
+            file.distrust_tail(2 * page as u64);
+            file.ensure_len(4 * page as u64).expect("cut and regrow");
+            file.page_mut(3, page).expect("page").fill(0xBB);
+            file.msync_range(3 * page as u64..4 * page as u64).expect("msync");
+            if sync {
+                file.sync_size_if_grown().expect("size sync");
+            }
+        };
+        cut_and_write(false);
+        let mut seen = std::collections::BTreeSet::new();
+        for seed in 0..16 {
+            let copy = tmp.path().join(format!("copy{seed}"));
+            copy_tracked(&path, &copy);
+            power_loss_random(&copy, seed);
+            let bytes = std::fs::read(&copy).expect("read");
+            let third = &bytes[3 * page..4 * page];
+            let kept = bytes.len() > 4 * page;
+            let allowed: &[u8] = if kept { &[0, 0xBB] } else { &[0xAA] };
+            assert!(third.iter().all(|b| allowed.contains(b)), "seed {seed}, kept {kept}");
+            seen.extend(third.iter().copied());
+            untrack(&copy);
+        }
+        assert!(seen.contains(&0xAA) && seen.contains(&0xBB), "{seen:?}");
+        power_loss(&path);
+        let bytes = std::fs::read(&path).expect("read");
+        assert_eq!(bytes.len(), 4 * page, "the durable length comes back");
+        assert!(bytes[3 * page..].iter().all(|&b| b == 0xAA), "the msync past the cut is lost");
+
+        cut_and_write(true);
+        power_loss(&path);
+        let bytes = std::fs::read(&path).expect("read");
+        assert!(bytes[3 * page..4 * page].iter().all(|&b| b == 0xBB), "synced, the page survives");
         untrack(&path);
     }
 

@@ -24,9 +24,11 @@
 //! them durable (one `msync` when they form one range, else one `fdatasync` of the file; see
 //! [`data_sync`]), then the file's size if it grew and that sync did not already cover it, and
 //! only then writes the new meta over the slot holding the lower txn and syncs that one page. A
-//! crash before the meta's sync recovers the previous state; after it, the new one. In
-//! [`SyncMode::NoSync`] a commit only stamps and publishes in memory; [`Env::sync`] (or the
-//! environment's drop) runs the durable steps for the newest state.
+//! crash before the meta is copied recovers the previous state; after its sync, the new one; in
+//! between, the new one if its record survived intact (a process crash keeps it in the page
+//! cache, which a reopen reads; a power loss, only if it reached the disk), else the previous one
+//! (README, Commit protocol). In [`SyncMode::NoSync`] a commit only stamps and publishes in
+//! memory; [`Env::sync`] (or the environment's drop) runs the durable steps for the newest state.
 //!
 //! ## Readers
 //!
@@ -222,9 +224,12 @@ impl Snapshot {
     }
 
     /// Page `pgno` again, without the per-fetch checks, for a cursor that fetched it with them
-    /// before: the snapshot's pages do not change while it lives. `None` if it is not mapped.
+    /// before: the snapshot's pages do not change while it lives. Never a meta page, which the
+    /// writer rewrites in place: those checks refused page numbers below 2 (`MapView::slice`).
+    /// `None` if it is not mapped.
     #[inline]
     pub(crate) fn page_again(&self, pgno: u32) -> Option<&[u8]> {
+        debug_assert!(pgno >= 2, "page_again of meta page {pgno}");
         let size = self.geometry.page_size();
         self.view.slice(u64::from(pgno) * size as u64, size)
     }
@@ -1167,9 +1172,12 @@ impl Env {
         let file = open_locked(path, options.page_size)?;
         let (chosen, geometry) = choose_state(&file)?;
         let meta = chosen.meta;
-        // A crash may have left a meta in the page cache whose msync never finished: make what
-        // this open reads durable before anything is built on it.
+        // A crash may have left a meta in the page cache whose msync never finished, or a
+        // created file whose name never reached the disk (a `create` that died, or failed, before
+        // its directory sync): make what this open reads, and the name it found it by, durable
+        // before anything is built on them.
         sys::fsync_file(&file)?;
+        sys::fsync_directory(parent_dir(path))?;
         let file =
             PageFile::from_file(file, options.map_reserve, options.readahead, options.max_growth)?;
         let snapshot = checked_snapshot(meta, geometry, file.view())?;
@@ -1542,9 +1550,14 @@ fn create(path: &Path, page_size: u32) -> Result<()> {
     file.write_all_at(&metas, 0)?;
     sys::fdatasync_file(&file)?;
     fs::rename(&tmp, path)?;
-    let dir = path.parent().filter(|dir| !dir.as_os_str().is_empty()).unwrap_or(Path::new("."));
-    sys::fsync_directory(dir)?;
+    sys::fsync_directory(parent_dir(path))?;
     Ok(())
+}
+
+/// The directory holding the entry `path` names (`.` for a bare file name): the one a [`create`]
+/// renames into and [`Env::open`] step 7 syncs.
+fn parent_dir(path: &Path) -> &Path {
+    path.parent().filter(|dir| !dir.as_os_str().is_empty()).unwrap_or(Path::new("."))
 }
 
 /// Remove the temporary file `tmp` that [`create`] opened and locked as `file` but did not use,

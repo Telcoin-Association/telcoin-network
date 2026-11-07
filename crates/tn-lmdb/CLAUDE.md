@@ -67,8 +67,10 @@ Each row: the file's role, its entry points, what a change must keep; item docs 
   (`PageFile::distrust_tail`): never let the writer allocate into it without the cut and regrowth
   at the first growth (which covers the tail only).
 - **Every sync wrapper reports to `disk_model` in tests.** `msync` (`msync_range`, `msync_page`)
-  calls `flushed_range`; `fsync`/`fdatasync` (`fdatasync_all`, the size sync) call `flushed_all`.
-  A sync path that skips the model makes the crash tests lie.
+  calls `flushed_range`; `fsync`/`fdatasync` (`fdatasync_all`, the size sync) call `flushed_all`;
+  a truncation (`grow`'s cut, `trim_to`) calls `truncated`, which keeps a later msync past the cut
+  off the model's disk until the next fsync. A sync path that skips the model makes the crash
+  tests lie.
 - **Never panic on bytes from disk.** Page accessors bounds-check and return `Corrupt`. A page
   read from the file passes `page::validate` before its first change, which copy-on-write does.
 - **Never rely on zeros from `alloc` or `alloc_run`.** A new page or run keeps its old bytes, so
@@ -157,12 +159,13 @@ Each row: the file's role, its entry points, what a change must keep; item docs 
     `Allocator::fail_allocs_after`, `Allocator::log_pages` (fills `load_log` and `free_log`; off
     at every open, so the release benches never grow them), `Allocator::reference_save` (the save
     through `reusable_reference` plus a sort); `PageFile::fail_next_msync`,
+    `PageFile::fail_next_fsync` (the size sync's or `fdatasync_all`'s),
     `PageFile::trust_tail` (the whole file as this process's growth, undoing `distrust_tail`),
     `PageFile::open_with_max_growth`; `Env::crash` (`EnvInner::crash_on_drop`: drop as a crash
     would).
   - Reports: `max_save_rounds`, `data_by_file`, `stamped_on`, the allocator's `load_log`,
     `free_log` and `run_stats`, `PageSet::visited`, `file::take_advice_log` (the advice each
-    mapping got); plus test accessors (the `Allocator`'s `freed`, `pool`, `take_freed`,
+    mapping got), `sys::take_dir_sync_log` (the directories `fsync_directory` synced); plus test accessors (the `Allocator`'s `freed`, `pool`, `take_freed`,
     `add_to_pool`).
   - Hooks: `RwTxn::forget_nested`, `RwTxn::plant_nested` (a working entry no nested cell
     names), `PageWrite::merges_applied` (the `MergeReport` of a delete that merged or refused a

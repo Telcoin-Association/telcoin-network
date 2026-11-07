@@ -79,10 +79,14 @@ impl Table {
     }
 }
 
-// A read-only transaction may be shared between threads.
+// The handles README's Concurrency rules call `Send + Sync`: a `Cell` or an `Rc` added to one (to
+// `Work` or `Writer`, say) fails the build here instead of the sharing those rules promise.
 const _: fn() = || {
     fn send_sync<T: Send + Sync>() {}
+    send_sync::<crate::Env>();
     send_sync::<RoTxn>();
+    send_sync::<RwTxn>();
+    send_sync::<Cursor<'static>>();
     send_sync::<RoCursor>();
     send_sync::<TxnCursor>();
     send_sync::<DupRoCursor>();

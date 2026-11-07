@@ -23,7 +23,25 @@ use std::{fs::File, io, os::fd::AsRawFd, path::Path};
 ///
 /// `path` must refer to a directory (a regular file would just have its contents synced).
 pub(crate) fn fsync_directory(path: &Path) -> io::Result<()> {
-    fsync_file(&File::open(path)?)
+    fsync_file(&File::open(path)?)?;
+    #[cfg(test)]
+    DIR_SYNC_LOG.with(|log| log.borrow_mut().push(path.to_path_buf()));
+    Ok(())
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only: the directories [`fsync_directory`] synced on this thread, in order. Read with
+    /// [`take_dir_sync_log`].
+    static DIR_SYNC_LOG: std::cell::RefCell<Vec<std::path::PathBuf>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Test-only: the directories this thread synced since the last call, oldest first (see
+/// [`DIR_SYNC_LOG`]).
+#[cfg(test)]
+pub(crate) fn take_dir_sync_log() -> Vec<std::path::PathBuf> {
+    DIR_SYNC_LOG.with(|log| std::mem::take(&mut *log.borrow_mut()))
 }
 
 /// `fsync(2)` `file`: [`File::sync_all`] everywhere but macOS, where that is `F_FULLFSYNC`

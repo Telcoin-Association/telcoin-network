@@ -629,6 +629,99 @@ fn a_failed_msync_latches() {
     assert_eq!(env.stat().txn_id, 1);
 }
 
+/// The sync a commit's injected failure hits, for [`a_failed_sync_latches_and_recovers`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum FailedSync {
+    /// Step 4 by one `fdatasync` of the file.
+    DataFdatasync,
+    /// Step 5: the size sync of a commit that grew the file, its data synced by one `msync`.
+    SizeSync,
+    /// Step 6: the meta page's `msync`, the data synced by one `fdatasync`.
+    MetaMsync,
+}
+
+/// Commit L, then a commit M whose `failed` sync fails: M errs with the injected `Io` error, which
+/// latches the environment, the slots keep their txns (the reuse gate stays where L left it), and
+/// `Env::sync` is refused. After the crash, and a strict power loss when `strict`, the file reopens
+/// at L and passes `Env::check`; after a failed meta msync without a power loss it reopens at M,
+/// whose record the page cache kept (a failed commit's outcome is unknown until a reopen).
+fn a_failed_sync_latches_and_recovers(failed: FailedSync) {
+    for strict in [false, true] {
+        let (_dir, path) = temp();
+        let env = open(&path);
+        let l = put_all(&env, "t", &[(b"k", b"1")]);
+        disk_model::track(&path);
+        let slots = env.with_writer(|w| w.slots());
+        let len = env.with_writer(|w| w.file.file_len());
+        let mut txn = env.begin_rw().expect("begin");
+        let t = table(&txn, "t");
+        txn.put(&t, b"k", b"2").expect("put");
+        if failed == FailedSync::SizeSync {
+            txn.put(&t, b"big", &vec![7; len as usize]).expect("a value past the file's end");
+            assert!(txn.writer_mut().file.size_unsynced(), "the commit grows the file");
+        }
+        let w = txn.writer_mut();
+        let cause = match failed {
+            FailedSync::DataFdatasync => {
+                w.data_by_fdatasync = true;
+                w.file.fail_next_fsync();
+                "injected fsync failure"
+            }
+            FailedSync::SizeSync => {
+                w.data_by_msync = true;
+                w.file.fail_next_fsync();
+                "injected fsync failure"
+            }
+            FailedSync::MetaMsync => {
+                w.data_by_fdatasync = true;
+                w.file.fail_next_msync();
+                "injected msync failure"
+            }
+        };
+        let err = txn.commit().expect_err("the commit's sync fails");
+        assert!(matches!(err, Error::Io(_)), "{failed:?}: {err:?}");
+        assert!(
+            env.failure().is_some_and(|c| c.contains(cause)),
+            "{failed:?}: latched by the sync"
+        );
+        assert_eq!(env.with_writer(|w| w.slots()), slots, "{failed:?}: the slots keep their txns");
+        assert!(matches!(env.sync(), Err(Error::Failed(_))), "{failed:?}");
+        env.crash();
+        if strict {
+            disk_model::power_loss(&path);
+        }
+        disk_model::untrack(&path);
+        let env = open(&path);
+        let want = if failed == FailedSync::MetaMsync && !strict { l + 1 } else { l };
+        assert_eq!(env.stat().txn_id, want, "{failed:?}, strict {strict}");
+        let ro = env.begin_ro().expect("ro");
+        let want = if want == l { b"1" } else { b"2" };
+        assert_eq!(val(&ro, &table(&ro, "t"), b"k").as_deref(), Some(&want[..]), "{failed:?}");
+        drop(ro);
+        env.check().expect("check");
+    }
+}
+
+/// A commit whose data `fdatasync` fails latches and recovers L
+/// ([`a_failed_sync_latches_and_recovers`]).
+#[test]
+fn a_failed_data_fdatasync_latches_and_recovers_the_last_commit() {
+    a_failed_sync_latches_and_recovers(FailedSync::DataFdatasync);
+}
+
+/// A commit whose size sync fails latches and recovers L ([`a_failed_sync_latches_and_recovers`]).
+#[test]
+fn a_failed_size_sync_latches_and_recovers_the_last_commit() {
+    a_failed_sync_latches_and_recovers(FailedSync::SizeSync);
+}
+
+/// A commit whose meta msync fails latches and recovers L after a power loss, M after a process
+/// crash ([`a_failed_sync_latches_and_recovers`]).
+#[test]
+fn a_failed_meta_msync_latches_and_recovers_the_last_or_the_new_commit() {
+    a_failed_sync_latches_and_recovers(FailedSync::MetaMsync);
+}
+
 /// A write that fails part way latches: the open transaction's later writes and its commit
 /// fail, and in `NoSync` the environment's drop does not sync, so the unsynced commits are
 /// lost as in a crash.
@@ -872,6 +965,22 @@ fn open_makes_the_meta_it_reads_durable() {
     disk_model::power_loss(&path);
     disk_model::untrack(&path);
     assert_eq!(open(&path).stat().txn_id, 3, "the open synced the meta it chose");
+}
+
+/// Every writer open syncs the directory naming the file, so a file whose creator died (or
+/// failed) before its directory sync gets its name made durable by the next open; a read-only
+/// open syncs nothing.
+#[test]
+fn a_writer_open_syncs_the_directory_naming_the_file() {
+    let (dir, path) = temp();
+    crate::sys::take_dir_sync_log();
+    drop(open(&path));
+    let dir = dir.path().to_path_buf();
+    assert_eq!(crate::sys::take_dir_sync_log(), [dir.clone(), dir.clone()], "create, then open");
+    drop(open(&path));
+    assert_eq!(crate::sys::take_dir_sync_log(), [dir], "an open of an existing file");
+    drop(Env::open_read_only(&path, EnvOptions::default()).expect("read-only"));
+    assert_eq!(crate::sys::take_dir_sync_log(), Vec::<PathBuf>::new(), "a read-only open");
 }
 
 /// Damage a read finds latches the environment: writes fail, other reads continue.

@@ -129,7 +129,8 @@ impl MapView {
 
     /// Publish `len` bytes as readable. They must already lie within the file, and no byte a
     /// reader's snapshot can reach may change while the reader can see it (the writer rewrites
-    /// only pages no snapshot reaches).
+    /// only pages no snapshot reaches, and the meta pages, which no reader slices: see
+    /// [`Self::slice`]).
     pub(crate) fn publish_len(&self, len: u64) {
         self.published.store(len, Ordering::Release);
     }
@@ -137,6 +138,13 @@ impl MapView {
     /// Borrow exactly `[offset, offset + len)` if it lies within the published bytes, else `None`.
     /// Only those bytes are borrowed, so the writer rewriting other published bytes in place (a
     /// page no reader's snapshot can reach) is never borrowed from where it is being written.
+    ///
+    /// No reader slices pages 0 and 1, the meta slots: they lie inside the published bytes, but
+    /// the writer rewrites one of them in place at every durable commit and sync. A reader's page
+    /// number passes `checked_page`, which refuses one below 2, before it is sliced, and
+    /// `Snapshot::page_again` takes only page numbers that passed it. Only the writer may slice
+    /// one, on its own thread, between its writes of them (`Writer::copy_published_with` slices
+    /// its source before `checked_page` refuses it).
     #[inline]
     pub(crate) fn slice(&self, offset: u64, len: usize) -> Option<&[u8]> {
         let end = offset.checked_add(len as u64)?;
@@ -150,7 +158,8 @@ impl MapView {
         }
         // SAFETY: `[base, base + mapped)` is a live mapping (see the type docs), and
         // `[offset, end)` lies within it and within the published bytes, which the owner does not
-        // modify while a reader can reach them.
+        // modify while a reader can reach them, but for the meta pages, which only the writer
+        // that rewrites them slices (see the method docs).
         Some(unsafe { std::slice::from_raw_parts(base.add(offset as usize), len) })
     }
 }
@@ -159,7 +168,6 @@ impl MapView {
 /// take `&mut self`; the barriers take `&self`.
 #[derive(Debug)]
 pub(crate) struct PageFile {
-    file: File,
     /// The current mapping: shared, read-write, over the reservation `[0, map.len())`. Only ever
     /// reached through its raw pointer ([`MmapRaw::as_ptr`], [`MmapRaw::as_mut_ptr`]).
     map: MmapRaw,
@@ -174,6 +182,9 @@ pub(crate) struct PageFile {
     /// Mappings replaced while [`Self::view`] was shared: kept mapped until this file drops so a
     /// reader still holding an old base stays valid.
     retired: Vec<MmapRaw>,
+    /// The file, declared after the mappings so they unmap before it closes (fields drop in
+    /// declaration order) and its lock lasts as long as any of them.
+    file: File,
     /// Leave every mapping to the kernel's readahead instead of advising `MADV_RANDOM` (see the
     /// module docs' Access advice): `EnvOptions::readahead`, applied to each remap too.
     readahead: bool,
@@ -193,6 +204,9 @@ pub(crate) struct PageFile {
     /// Test-only: fail the next msync (see [`Self::fail_next_msync`]).
     #[cfg(test)]
     fail_next_msync: AtomicBool,
+    /// Test-only: fail the next fdatasync (see [`Self::fail_next_fsync`]).
+    #[cfg(test)]
+    fail_next_fsync: AtomicBool,
 }
 
 impl PageFile {
@@ -251,6 +265,8 @@ impl PageFile {
             poisoned: AtomicBool::new(false),
             #[cfg(test)]
             fail_next_msync: AtomicBool::new(false),
+            #[cfg(test)]
+            fail_next_fsync: AtomicBool::new(false),
         })
     }
 
@@ -319,6 +335,8 @@ impl PageFile {
             // growth. Nothing reads or writes past `backed` before this (the writer allocates no
             // page past it), and a power loss that brings the old length back leaves only slack.
             self.file.set_len(self.backed)?;
+            #[cfg(test)]
+            crate::disk_model::truncated(self.ino, self.backed);
             self.len = self.backed;
             self.size_unsynced.store(true, Ordering::Relaxed);
         }
@@ -359,6 +377,8 @@ impl PageFile {
             )));
         }
         self.file.set_len(len).inspect_err(|_| self.poison())?;
+        #[cfg(test)]
+        crate::disk_model::truncated(self.ino, len);
         self.len = len;
         self.backed = self.backed.min(len);
         self.size_unsynced.store(true, Ordering::Relaxed);
@@ -519,7 +539,7 @@ impl PageFile {
     pub(crate) fn sync_size_if_grown(&self) -> Result<()> {
         self.check_poison()?;
         if self.size_unsynced.load(Ordering::Relaxed) {
-            fdatasync_file(&self.file).inspect_err(|_| self.poison())?;
+            self.fdatasync().inspect_err(|_| self.poison())?;
             self.size_unsynced.store(false, Ordering::Relaxed);
         }
         Ok(())
@@ -529,9 +549,18 @@ impl PageFile {
     /// its size too. A failure poisons the file.
     pub(crate) fn fdatasync_all(&self) -> Result<()> {
         self.check_poison()?;
-        fdatasync_file(&self.file).inspect_err(|_| self.poison())?;
+        self.fdatasync().inspect_err(|_| self.poison())?;
         self.size_unsynced.store(false, Ordering::Relaxed);
         Ok(())
+    }
+
+    /// One `fdatasync` of the file, for the size sync and [`Self::fdatasync_all`].
+    fn fdatasync(&self) -> Result<()> {
+        #[cfg(test)]
+        if self.fail_next_fsync.swap(false, Ordering::Relaxed) {
+            return Err(io::Error::other("injected fsync failure").into());
+        }
+        Ok(fdatasync_file(&self.file)?)
     }
 
     /// Test-only: make the next msync fail as if the kernel had reported a writeback error.
@@ -539,12 +568,20 @@ impl PageFile {
     pub(crate) fn fail_next_msync(&self) {
         self.fail_next_msync.store(true, Ordering::Relaxed);
     }
+
+    /// Test-only: make the next fdatasync (the size sync's or [`Self::fdatasync_all`]'s) fail as
+    /// if the kernel had reported a writeback error.
+    #[cfg(test)]
+    pub(crate) fn fail_next_fsync(&self) {
+        self.fail_next_fsync.store(true, Ordering::Relaxed);
+    }
 }
 
 impl Drop for PageFile {
     fn drop(&mut self) {
         // A reader still holding the view finds nothing mapped from now on, rather than a mapping
-        // about to go. The mappings (current and retired) unmap as the fields drop.
+        // about to go. The mappings (current and retired) unmap as the fields drop, then the file
+        // closes.
         self.view.set_mapping(std::ptr::null(), 0);
     }
 }
@@ -554,10 +591,11 @@ impl Drop for PageFile {
 /// so readers borrow the mapping through [`MapView`] as they borrow a writer's.
 #[derive(Debug)]
 pub(crate) struct ReadOnlyFile {
-    /// The file, kept open so its shared lock lasts as long as the mapping.
-    _file: File,
     /// The mapping: shared, read-only, over `[0, file length)`.
     _map: Mmap,
+    /// The file, declared after the mapping so it unmaps before the file closes (fields drop in
+    /// declaration order) and the shared lock lasts as long as the mapping.
+    _file: File,
     /// The lock-free reader view of the mapping.
     view: Arc<MapView>,
 }

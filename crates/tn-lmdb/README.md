@@ -959,8 +959,11 @@ checks as `Cursor`'s.
    `a_commit_of_the_last_txn_id_is_refused_before_it_writes`).
 6. **Length check.** A file shorter than `page_count × P` is `Corrupt`. Open never falls back to
    the older meta.
-7. **`fsync_file` once.** A crash may have left a meta in the page cache whose msync never
-   finished. What open reads must be durable before anything is built on it.
+7. **`fsync_file` once, then the directory.** A crash may have left a meta in the page cache whose
+   msync never finished, and a `create` that died or failed between its rename and its
+   `fsync_directory` may have left the file's name not durable. What open reads, and the name it
+   found it by, must be durable before anything is built on them
+   (`a_writer_open_syncs_the_directory_naming_the_file`).
 8. **Map** inside a reservation of `max(map_reserve, file length)`, advised `MADV_RANDOM` unless
    `readahead` is set ([Platform notes](#platform-notes); do-not-flag item 16); a remap past the
    reservation is advised the same way. The writer takes the bytes past the pages any meta slot
@@ -1854,7 +1857,9 @@ reads the value of the entry it lands on, a multi-page overflow value in full).
 - **A page size below the OS page puts both metas in one OS page** (4 KiB pages on Apple
   Silicon's 16 KiB OS pages, or on a 64 KiB-page arm64 or ppc64 Linux kernel). A mapped write
   dirties the whole OS page and an msync rounds down to it, so every meta msync also writes back
-  the kept slot's bytes, unchanged. On a drive whose sector writes are atomic that is harmless.
+  the kept slot's bytes, unchanged. So does every data sync, or early writeback, of the other
+  pages in that OS page (pages 2 and 3 with 4 KiB pages on 16 KiB OS pages, 2 to 15 on 64 KiB
+  ones). On a drive whose sector writes are atomic that is harmless.
   A drive that can garble a whole sector it was writing when power fails could lose both metas
   in one commit, and the file would no longer open. The crash model (`power_loss_random`) mixes
   old and new per 512-byte sector, so it cannot show this: unchanged bytes stay unchanged. Where
@@ -2033,7 +2038,8 @@ argument and the measurements. Code and other docs cite the items by number, so 
      The writer's reservation is an `MmapRaw` from the safe `map_raw`, so every page slice, the
      writer's and the readers', is formed from the base pointer over exactly its own bytes, and no
      reference to the whole mapping exists. Sound under the single-writer model: the base is
-     stable inside the reservation, readers see only published, immutable pages, retired mappings
+     stable inside the reservation, readers see only published, immutable pages (the two meta pages, which the writer rewrites in
+     place and no reader slices, aside), retired mappings
      outlive every view of them, and a read-only open's shared lock keeps every writer out. It
      also rests on a truthful free list: a crafted file whose free list names a live page can make
      a write overwrite bytes a reader still holds
