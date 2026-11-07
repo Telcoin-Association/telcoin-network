@@ -616,7 +616,8 @@ fn unknown_kind(page: &[u8], tag: Option<&u8>) -> Error {
 }
 
 /// The header flags (zero in this format version).
-pub(crate) fn flags(page: &[u8]) -> u8 {
+#[inline]
+fn flags(page: &[u8]) -> u8 {
     page.get(FLAGS_OFF).copied().unwrap_or(0)
 }
 
@@ -1706,7 +1707,8 @@ fn write_leaf_cell(cell: &mut [u8], key: &[u8], value: impl CellVal) {
     value.write(cell, k);
 }
 
-/// The key of leaf entry `i` ([`LeafView::key`]).
+/// Test-only: the key of leaf entry `i` ([`LeafView::key`]).
+#[cfg(test)]
 pub(crate) fn leaf_key(page: &[u8], i: usize) -> Result<&[u8]> {
     LeafView { page, h: hdr_of(page, Kind::Leaf)? }.key(i)
 }

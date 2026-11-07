@@ -165,11 +165,13 @@ pub(crate) struct Chosen {
 /// Choose the meta to open at (open step 4). `read(offset)` returns the 128-byte record at
 /// `offset` of the file, or `None` if the file ends before it.
 ///
-/// Meta 0 lies at offset 0. If it is valid its page size P places meta 1; if not, meta 1 is
-/// probed at every page size P and accepted only if it names that P. The valid meta with the
-/// highest txn wins. When both are valid they must agree on the page size, and two metas of the
-/// same txn must be byte-identical (a commit writes a new txn); else [`Error::Corrupt`]. With no
-/// valid meta the file fails closed: [`Error::NotTnLmdb`] if no record has the magic, else
+/// Meta 0 lies at offset 0. If it is valid its page size P places meta 1; if not, meta 1 is the
+/// first record carrying the magic at an offset P of [`PAGE_SIZES`], smallest first (the offsets
+/// below it lie in meta 0's zero tail), accepted only if it names that P; the offsets past it
+/// are never read, as they hold the file's other pages. The valid meta with the highest txn
+/// wins. When both are valid they must agree on the page size, and two metas of the same txn
+/// must be byte-identical (a commit writes a new txn); else [`Error::Corrupt`]. With no valid
+/// meta the file fails closed: [`Error::NotTnLmdb`] if no record read has the magic, else
 /// [`Error::Corrupt`]. A record of another format version is [`Error::UnsupportedVersion`] even
 /// if the other slot is valid: opening at the older slot would overwrite a newer state.
 pub(crate) fn choose_meta(
@@ -213,29 +215,24 @@ pub(crate) fn choose_meta(
         };
     }
 
-    // Meta 0 is unreadable: find meta 1 by the page size it names.
-    let mut magic_seen =
-        matches!(&zero, Some((_, decoded)) if !matches!(decoded, Err(Error::NotTnLmdb)));
-    let mut found = None;
+    // Meta 0 is unreadable: meta 1 is the first record carrying the magic. A meta page is zero
+    // past its record (create writes the zeros, a commit the record alone), so the probe stops
+    // at meta 1 and never decodes a page after it, whose bytes can be anything (a value's).
+    let neither = || Error::Corrupt("neither meta page is valid".to_string());
     for p in PAGE_SIZES {
         let Some((_, decoded)) = slot(u64::from(p))? else { break };
-        unsupported(&decoded)?;
         match decoded {
-            Ok(m) if m.page_size == p => {
-                if found.replace(m).is_some() {
-                    return Err(Error::Corrupt(
-                        "meta 0 is invalid and meta 1 appears at two page sizes".to_string(),
-                    ));
-                }
-            }
             Err(Error::NotTnLmdb) => {}
-            _ => magic_seen = true,
+            Ok(m) if m.page_size == p => return Ok(Chosen { meta: m, slots: [None, Some(m.txn)] }),
+            decoded => {
+                unsupported(&decoded)?;
+                return Err(neither());
+            }
         }
     }
-    match found {
-        Some(meta) => Ok(Chosen { meta, slots: [None, Some(meta.txn)] }),
-        None if magic_seen => Err(Error::Corrupt("neither meta page is valid".to_string())),
-        None => Err(Error::NotTnLmdb),
+    match zero {
+        Some((_, Err(Error::NotTnLmdb))) | None => Err(Error::NotTnLmdb),
+        Some(_) => Err(neither()),
     }
 }
 
@@ -408,10 +405,43 @@ mod tests {
         let mut file = vec![0; 3 * 8192];
         file[8192..8192 + META_LEN].copy_from_slice(&meta(4096, 3).encode());
         assert!(matches!(choose(&file), Err(Error::Corrupt(_))));
-        // Two candidates for meta 1, each at its own page size: ambiguous, so refused.
+        // The first record carrying the magic is meta 1: one valid at a larger page size is page
+        // 2 of the 4 KiB file the first names, never read.
         file[4096..4096 + META_LEN].copy_from_slice(&meta(4096, 3).encode());
-        file[8192..8192 + META_LEN].copy_from_slice(&meta(8192, 3).encode());
-        assert!(matches!(choose(&file), Err(Error::Corrupt(_))));
+        file[8192..8192 + META_LEN].copy_from_slice(&meta(8192, 4).encode());
+        assert_eq!(choose(&file).expect("choose").meta, meta(4096, 3));
+    }
+
+    /// With meta 0 invalid, the probe stops at meta 1, which carries the magic: the pages past
+    /// it are never read as metas, whatever their bytes (a value's can hold the magic and
+    /// another version, or a whole record naming its offset), and a damaged meta 1 is refused
+    /// whatever follows it.
+    #[test]
+    fn a_probe_never_reads_the_pages_past_meta_1() {
+        let other = FORMAT_VERSION + 1;
+        for p in PAGE_SIZES {
+            let mut torn = meta(p, 9).encode();
+            torn[CRC_AT] ^= 1;
+            for later in PAGE_SIZES.into_iter().filter(|&q| q > p) {
+                let mut newer = meta(later, 11).encode();
+                newer[8..12].copy_from_slice(&other.to_le_bytes());
+                for planted in [newer, meta(later, 10).encode()] {
+                    let at = later as usize;
+                    let mut file = image(p, Some(torn), Some(meta(p, 8).encode()));
+                    file.resize(file.len().max(at + META_LEN), 0);
+                    file[at..at + META_LEN].copy_from_slice(&planted);
+                    assert_eq!(
+                        choose(&file).expect("opens at meta 1"),
+                        Chosen { meta: meta(p, 8), slots: [None, Some(8)] },
+                        "page size {p}, record at {later}"
+                    );
+                    // Meta 1 torn too: no valid meta, whatever the later page holds.
+                    let p = p as usize;
+                    file[p..p + META_LEN].copy_from_slice(&torn);
+                    assert!(matches!(choose(&file), Err(Error::Corrupt(_))), "both torn");
+                }
+            }
+        }
     }
 
     /// No valid meta fails closed: `Corrupt` when the magic is there, `NotTnLmdb` when it is not.

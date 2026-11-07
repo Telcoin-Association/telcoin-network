@@ -2,10 +2,12 @@
 //! functions that add and check a CRC-32 trailer on byte buffers. The trailer is always the last
 //! four bytes, little endian.
 //!
-//! The code is a copy of `crates/storage/src/archive/crc.rs`; keep it one. Two things differ: the
-//! doc comments, which speak of this crate's B+tree pages where that file speaks of its digest
-//! index, and the `allow(dead_code)` outside tests on [`check_crc`] and [`add_crc32`], which only
-//! the unit tests call here. A sync from that file keeps both.
+//! The code is a copy of `crates/storage/src/archive/crc.rs`; keep it one. Three things differ:
+//! the doc comments, which speak of this crate's B+tree pages where that file speaks of its digest
+//! index; the `allow(dead_code)` outside tests on [`check_crc`] and [`add_crc32`], which only the
+//! unit tests call here; and `#[inline]` on [`crc_is_zero`], the dirty check of every page fetch,
+//! which the reth adapter compiles inlined (without it, a cross-crate call per fetch: see
+//! `CLAUDE.md`'s `#[inline]` rule). A sync from that file keeps all three.
 
 /// A CRC of exactly zero is indistinguishable from the all-zero "dirty" sentinel [`zero_crc`]
 /// writes, so buffers whose validity is classified by [`crc_state`] (the B+tree pages) are
@@ -226,6 +228,7 @@ pub(crate) fn zero_crc(buffer: &mut [u8]) {
 /// True if `buffer`'s trailing 4-byte CRC is all zero — the "dirty / not-yet-CRC'd" sentinel
 /// written by [`zero_crc`]. Cheap: reads the 4 CRC bytes and computes nothing. Buffers too short to
 /// hold a payload + CRC are not considered zero.
+// Not in the tn-storage copy: the adapter inlines this check (see the module docs).
 #[inline]
 pub(crate) fn crc_is_zero(buffer: &[u8]) -> bool {
     let len = buffer.len();

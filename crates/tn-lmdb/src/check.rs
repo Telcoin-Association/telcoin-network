@@ -81,15 +81,53 @@ struct Checker<'s> {
     owner: Vec<Owner>,
     /// The owners' names: `[none, catalog, free tree, free list, tables...]`.
     owners: Vec<String>,
-    /// `(page, first owner, second owner)` for each page claimed twice.
-    twice: Vec<(u32, Owner, Owner)>,
+    /// The pages claimed twice.
+    twice: Twice,
+}
+
+/// The pages claimed twice: every one counted, the first [`LISTED`] kept as `(page, first owner,
+/// second owner)`, so a damaged free tree listing every page the trees hold (one double claim
+/// per page) costs no memory per page and a short message.
+#[derive(Default)]
+struct Twice {
+    listed: Vec<(u32, Owner, Owner)>,
+    count: u64,
+}
+
+impl Twice {
+    fn note(&mut self, p: u32, first: Owner, second: Owner) {
+        self.count += 1;
+        if self.listed.len() < LISTED {
+            self.listed.push((p, first, second));
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.count == 0
+    }
+
+    /// The pages for a message, by `owners`' names: `[9 (catalog and free list)]`, and past
+    /// [`LISTED`] of them `[9 (..), ...; 7 more]`.
+    fn describe(&self, owners: &[String]) -> String {
+        let mut named: Vec<String> = self
+            .listed
+            .iter()
+            .map(|&(p, a, b)| format!("{p} ({} and {})", owners[a as usize], owners[b as usize]))
+            .collect();
+        let more = self.count - self.listed.len() as u64;
+        if more > 0 {
+            named.push(format!("...; {more} more"));
+        }
+        format!("[{}]", named.join(", "))
+    }
 }
 
 const CATALOG: Owner = 1;
 const FREE_TREE: Owner = 2;
 const FREE_LIST: Owner = 3;
 
-/// The most runs of leaked pages a failed check's message names; it counts the rest.
+/// The most runs of leaked pages, and the most pages used twice, a failed check's message names;
+/// it counts the rest.
 const LISTED: usize = 16;
 
 impl Checker<'_> {
@@ -97,7 +135,7 @@ impl Checker<'_> {
     fn claim(&mut self, p: u32, owner: Owner) -> bool {
         let first = self.owner[p as usize];
         if first != 0 {
-            self.twice.push((p, first, owner));
+            self.twice.note(p, first, owner);
             return false;
         }
         self.owner[p as usize] = owner;
@@ -348,7 +386,7 @@ pub(crate) fn check_snapshot(snapshot: &Snapshot) -> Result<CheckReport> {
         snapshot,
         owner: vec![0; meta.page_count as usize],
         owners: ["", "catalog", "free tree", "free list"].map(String::from).to_vec(),
-        twice: Vec::new(),
+        twice: Twice::default(),
     };
     let mut report =
         CheckReport { txn_id: meta.txn, page_count: meta.page_count, ..Default::default() };
@@ -409,18 +447,11 @@ pub(crate) fn check_snapshot(snapshot: &Snapshot) -> Result<CheckReport> {
     if leaked.is_none() && checker.twice.is_empty() {
         return Ok(report);
     }
-    let twice: Vec<String> = checker
-        .twice
-        .iter()
-        .map(|&(p, a, b)| {
-            format!("{p} ({} and {})", checker.owners[a as usize], checker.owners[b as usize])
-        })
-        .collect();
     Err(Error::Corrupt(format!(
-        "check: page accounting of txn {}: leaked {}; used twice [{}]",
+        "check: page accounting of txn {}: leaked {}; used twice {}",
         meta.txn,
         leaked.as_deref().unwrap_or("[]"),
-        twice.join(", ")
+        checker.twice.describe(&checker.owners)
     )))
 }
 
@@ -483,6 +514,34 @@ mod tests {
                 named.join(", "),
                 runs - LISTED
             )
+        );
+    }
+
+    /// Pages used twice are named up to [`LISTED`] of them and the rest counted: a free tree
+    /// listing every page a tree holds keeps the message short.
+    #[test]
+    fn pages_used_twice_name_the_first_and_count_the_rest() {
+        let owners = ["", "catalog", "free tree", "free list", "table \"a\""].map(String::from);
+        let mut twice = Twice::default();
+        assert!(twice.is_empty());
+        assert_eq!(twice.describe(&owners), "[]");
+        twice.note(9, 4, FREE_LIST);
+        twice.note(11, CATALOG, 4);
+        assert!(!twice.is_empty());
+        let both = "[9 (table \"a\" and free list), 11 (catalog and table \"a\")]";
+        assert_eq!(twice.describe(&owners), both);
+        // A free tree listing each of 100k pages a table holds: one double claim per page.
+        let pages = 100_000;
+        let mut many = Twice::default();
+        for p in 2..2 + pages {
+            many.note(p, 4, FREE_LIST);
+        }
+        assert_eq!((many.listed.len(), many.count), (LISTED, u64::from(pages)));
+        let named: Vec<String> =
+            (2..2 + LISTED as u32).map(|p| format!("{p} (table \"a\" and free list)")).collect();
+        assert_eq!(
+            many.describe(&owners),
+            format!("[{}, ...; {} more]", named.join(", "), pages - LISTED as u32)
         );
     }
 }

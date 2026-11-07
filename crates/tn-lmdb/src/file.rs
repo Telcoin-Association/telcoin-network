@@ -875,4 +875,41 @@ mod tests {
         assert!(pf.is_poisoned());
         assert!(matches!(pf.ensure_len(4096), Err(Error::Failed(_))));
     }
+
+    /// A growth that fails after cutting a distrusted tail leaves the file at the pages in use,
+    /// poisoned, each page below them as it was and none past them reachable; it reopens at
+    /// that length with the same bytes.
+    #[test]
+    fn a_growth_failing_after_the_tail_cut_leaves_the_pages_in_use() {
+        let tmp = TempDir::with_prefix("tn_lmdb_file_cut_fail").expect("temp dir");
+        let path = tmp.path().join("db");
+        let mut pf = PageFile::open(&path, 16 << 20).expect("open");
+        let pages = 4;
+        let used = u64::from(pages) * 4096;
+        pf.ensure_len(used).expect("grow");
+        for pgno in 0..pages {
+            pf.page_mut(pgno, 4096).expect("page").fill(0xA0 + pgno as u8);
+        }
+        let assert_pages = |pf: &PageFile| {
+            for pgno in 0..pages {
+                let page = pf.page(pgno, 4096).expect("a page in use");
+                assert!(page.iter().all(|&b| b == 0xA0 + pgno as u8), "page {pgno}");
+            }
+            assert_eq!(pf.page(pages, 4096), None, "past the pages in use");
+        };
+        assert!(pf.file_len() > used, "the growth left a tail");
+        pf.distrust_tail(used);
+        // The cut comes first; this target (no OS-page multiple holds it) is refused after it.
+        assert!(matches!(pf.ensure_len(u64::MAX - 5), Err(Error::Failed(_))));
+        assert!(pf.is_poisoned());
+        assert_eq!(pf.file_len(), used);
+        assert_eq!(std::fs::metadata(&path).expect("metadata").len(), used);
+        assert_pages(&pf);
+        drop(pf);
+
+        let pf = PageFile::open(&path, 16 << 20).expect("reopen");
+        assert!(!pf.is_poisoned());
+        assert_eq!(pf.file_len(), used);
+        assert_pages(&pf);
+    }
 }

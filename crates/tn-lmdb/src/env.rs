@@ -1155,8 +1155,9 @@ impl Env {
     /// for a file that cannot be opened safely (left unchanged); [`Error::InvalidPageSize`] for
     /// an invalid `options.page_size`; [`Error::InvalidMaxGrowth`] for an `options.max_growth`
     /// under [`MIN_GROWTH`](crate::MIN_GROWTH) (both refused before the file is touched);
-    /// [`Error::Io`], `NotFound` for a symbolic link at `path` to a missing or empty file (left
-    /// as it is).
+    /// [`Error::Io`], `NotFound` for a symbolic link at `path` to a missing or empty file, and
+    /// `InvalidInput` naming it for a `<path>.creating` that is a symbolic link or not a regular
+    /// file when the open would create the file (each left as it is).
     pub fn open(path: impl AsRef<Path>, options: EnvOptions) -> Result<Env> {
         let path = path.as_ref();
         Geometry::new(options.page_size)?;
@@ -1318,8 +1319,9 @@ impl Env {
     /// each kind its root counts; every free record is well formed; and the pages reachable from
     /// the trees (their runs' included) and those the free list lists are disjoint and cover
     /// `2..page_count` exactly. Any failure is [`Error::Corrupt`] naming the damage, or the pages
-    /// leaked (used by nothing) and used twice, and latches the environment. It reads through a
-    /// snapshot, alongside readers and the writer.
+    /// leaked (used by nothing) and used twice (the first 16 runs and pages named, the rest
+    /// counted), and latches the environment. It reads through a snapshot, alongside readers and
+    /// the writer.
     pub fn check(&self) -> Result<CheckReport> {
         let inner = &self.inner;
         check::check_snapshot(&inner.current()).inspect_err(|e| inner.latch.latch_error(e))
@@ -1518,6 +1520,7 @@ fn create(path: &Path, page_size: u32) -> Result<()> {
         .open(&tmp)
         .map_err(|e| match e.raw_os_error() {
             Some(libc::ELOOP) => refused("a symbolic link"),
+            Some(libc::EISDIR) => refused("not a regular file"),
             _ => e.into(),
         })?;
     if !file.metadata()?.is_file() {

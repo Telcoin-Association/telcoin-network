@@ -171,8 +171,9 @@ fn create_removes_its_unused_temporary_file() {
 }
 
 /// `<path>.creating` is never opened through a symbolic link, nor used unless it is a regular
-/// file: a link planted there (to a victim file, or dangling) or a FIFO fails the open, naming
-/// it, and the victim, the link and the path are as they were. A regular one is then used.
+/// file: a link planted there (to a victim file, or dangling), a FIFO or a directory fails the
+/// open, naming it, and the victim, the link and the path are as they were. A regular one is
+/// then used.
 #[test]
 fn a_temporary_file_that_is_not_a_regular_file_is_refused() {
     use std::os::unix::fs::FileTypeExt as _;
@@ -204,6 +205,10 @@ fn a_temporary_file_that_is_not_a_regular_file_is_refused() {
     refused("not a regular file");
     assert!(fs::symlink_metadata(&creating).expect("stat").file_type().is_fifo());
     fs::remove_file(&creating).expect("remove");
+    fs::create_dir(&creating).expect("a directory");
+    refused("not a regular file");
+    assert!(fs::symlink_metadata(&creating).expect("stat").is_dir());
+    fs::remove_dir(&creating).expect("remove");
     drop(open(&path));
     assert!(!creating.exists());
 }
@@ -404,6 +409,35 @@ fn a_damaged_newest_meta_falls_back_one_txn() {
     let env = open(&path);
     let ro = env.begin_ro().expect("ro");
     assert_eq!(val(&ro, &table(&ro, "a"), b"k").as_deref(), Some(&b"3"[..]));
+}
+
+/// With meta 0 damaged, open finds meta 1 and never reads a page past it as a meta: a file whose
+/// run pages each start with the magic and another format version (a value's bytes) opens at
+/// meta 1 and reads the value back.
+#[test]
+fn a_value_holding_meta_bytes_never_refuses_the_open() {
+    let (_dir, path) = temp();
+    let env = open(&path);
+    let mut planted = [0; 12];
+    planted[..8].copy_from_slice(&crate::meta::MAGIC);
+    planted[8..].copy_from_slice(&(crate::meta::FORMAT_VERSION + 1).to_le_bytes());
+    // A run's page after its first starts at value offset `4096 k - RUN_HEADER`.
+    let mut value = vec![7; 20 * 4096];
+    for at in (4096 - crate::overflow::RUN_HEADER..value.len() - planted.len()).step_by(4096) {
+        value[at..at + planted.len()].copy_from_slice(&planted);
+    }
+    put_all(&env, "a", &[(b"k", &value)]); // txn 1: slot 1 (a tie goes to slot 1)
+    drop(env);
+    let bytes = fs::read(&path).expect("read");
+    for p in [8, 16] {
+        assert_eq!(bytes[p * 4096..][..planted.len()], planted, "page {p} starts with them");
+    }
+    flip(&path, 20); // meta 0, txn 0
+
+    let env = open(&path);
+    assert_eq!(env.with_writer(|w| w.slots), [None, Some(1)]);
+    let ro = env.begin_ro().expect("ro");
+    assert_eq!(val(&ro, &table(&ro, "a"), b"k"), Some(value));
 }
 
 /// Both metas damaged, or a damaged tree root: the open fails closed and changes nothing.
@@ -1842,10 +1876,11 @@ fn a_failed_final_sync_skips_the_trim() {
     assert_rows(&env, "a", 300, 150);
 }
 
-/// After a trim the file grows again from its trimmed length, the next step computed from it
-/// (`clamp(len, MIN_GROWTH, max_growth)` more), and a second clean close trims again.
+/// After a trim the reopened file grows from its pages in use (the trimmed length less the
+/// OS-page rounding, which the reopen does not trust: `PageFile::distrust_tail`), one step
+/// (`clamp(used, MIN_GROWTH, max_growth)`) more, and a second clean close trims again.
 #[test]
-fn a_trimmed_file_grows_from_its_trimmed_length_and_trims_again() {
+fn a_trimmed_file_grows_from_its_pages_in_use_and_trims_again() {
     let (_dir, path) = temp();
     let env = open(&path);
     commit_rows(&env, "a", 0, 300, 150);
@@ -1853,6 +1888,9 @@ fn a_trimmed_file_grows_from_its_trimmed_length_and_trims_again() {
     let trimmed = file_len(&path);
     let env = open(&path);
     assert_eq!(env.with_writer(|w| w.file.file_len()), trimmed);
+    assert_eq!(trimmed_len(&env), trimmed, "the close trimmed to the pages, rounded");
+    let stat = env.stat();
+    let used = u64::from(stat.page_count) * u64::from(stat.page_size);
     let mut rows = 300;
     while env.with_writer(|w| w.file.file_len()) == trimmed {
         assert!(rows < 20_000, "the file never grew");
@@ -1860,7 +1898,8 @@ fn a_trimmed_file_grows_from_its_trimmed_length_and_trims_again() {
         rows += 100;
     }
     let grown = env.with_writer(|w| w.file.file_len());
-    assert_eq!(grown, trimmed + trimmed.clamp(crate::MIN_GROWTH, 1 << 30), "one step from it");
+    let step = used.clamp(crate::MIN_GROWTH, 1 << 30);
+    assert_eq!(grown, (used + step).next_multiple_of(sys::os_page_size()), "one step from them");
     let want = trimmed_len(&env);
     assert!(want < grown);
     drop(env);

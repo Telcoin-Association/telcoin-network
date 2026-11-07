@@ -327,19 +327,20 @@ pub(crate) fn last_key<'s, S: PageRead + ?Sized>(
                 root.height
             )));
         }
-        let n = page::nkeys(page);
         if at_leaf_level {
-            let Some(last) = n.checked_sub(1) else {
+            // The header is parsed before its count is trusted, an empty root's too.
+            let leaf = page::LeafView::new(page)?;
+            let Some(last) = leaf.nkeys().checked_sub(1) else {
                 if depth > 1 {
                     return Err(Error::Corrupt(format!("non-root leaf {pgno} is empty")));
                 }
                 return Ok(None);
             };
-            let key = page::leaf_key(page, last)?;
+            let key = leaf.key(last)?;
             check_miss(pgno, Some(key), None, lo, hi)?;
             return Ok(Some(key));
         }
-        let Some(last) = n.checked_sub(1) else {
+        let Some(last) = page::nkeys(page).checked_sub(1) else {
             return Err(Error::Corrupt(format!("branch {pgno} has no child")));
         };
         let route = page::BranchView::new(page)?.route_at(last)?;
@@ -466,6 +467,63 @@ mod tests {
         assert!(store.page(root.root).is_ok());
     }
 
+    /// Each check of a fetch ([`checked_page`], and [`checked_child`]'s identity after them) is
+    /// `Corrupt` with its own message, run in order: a meta or past-the-end page number (the
+    /// store not asked), a page the store does not map, a published page with a zero CRC, a
+    /// header naming another page, a txn after the snapshot, and a child's txn its parent does
+    /// not name; when two fail, the first is named.
+    #[test]
+    fn each_fetch_check_refuses_with_its_message() {
+        let (count, snapshot) = (10, 5);
+        let mut page = vec![0_u8; 4096];
+        page::set_pgno_txn(&mut page, 7, snapshot);
+        page[4092..].copy_from_slice(&[1, 2, 3, 4]); // a non-zero CRC trailer
+        let fetch = |pgno: u32, page: &[u8], private: bool| {
+            let slice = |p: u32| (p == 7).then_some(page);
+            match checked_page(pgno, count, snapshot, private, slice) {
+                Err(Error::Corrupt(m)) => m,
+                other => panic!("page {pgno}: {other:?}"),
+            }
+        };
+        let child = |want_txn: u32, page: &[u8], snapshot: u64| {
+            checked_child(7, want_txn, count, snapshot, false, |_| Some(page)).map(drop)
+        };
+        for pgno in [0, 1, count, u32::MAX] {
+            let refused = checked_page(pgno, count, snapshot, false, |_| unreachable!("asked"));
+            let want = format!("page {pgno} is not a tree page of a file of {count} pages");
+            assert!(matches!(refused, Err(Error::Corrupt(m)) if m == want), "page {pgno}");
+        }
+        assert_eq!(fetch(8, &page, false), "page 8 is not mapped (10 pages)");
+        assert!(checked_page(7, count, snapshot, false, |_| Some(&page[..])).is_ok());
+        assert!(child(snapshot as u32, &page, snapshot).is_ok());
+
+        let mut dirty = page.clone();
+        dirty[4092..].fill(0);
+        assert_eq!(fetch(7, &dirty, false), "published page 7 was never stamped (zero CRC)");
+        assert!(checked_page(7, count, snapshot, true, |_| Some(&dirty[..])).is_ok(), "private");
+        let mut other = page.clone();
+        page::set_pgno_txn(&mut other, 6, snapshot);
+        assert_eq!(fetch(7, &other, false), "page 7 holds page 6");
+        let mut later = page.clone();
+        page::set_pgno_txn(&mut later, 7, snapshot + 1);
+        let after = "page 7 was written by txn 6, after the reading snapshot's txn 5";
+        assert_eq!(fetch(7, &later, false), after);
+        let stale = "page 7 (txn 5) is not the copy its parent names (txn 4): a redirected or \
+                     stale pointer";
+        assert!(matches!(child(4, &page, snapshot), Err(Error::Corrupt(m)) if m == stale));
+        // The identity compares the txn's low 32 bits.
+        let mut wide = page.clone();
+        page::set_pgno_txn(&mut wide, 7, (1 << 32) + 5);
+        assert!(child(5, &wide, u64::MAX).is_ok());
+
+        // The first failing check is named.
+        page::set_pgno_txn(&mut dirty, 6, snapshot);
+        assert_eq!(fetch(7, &dirty, false), "published page 7 was never stamped (zero CRC)");
+        page::set_pgno_txn(&mut other, 6, snapshot + 1);
+        assert_eq!(fetch(7, &other, false), "page 7 holds page 6");
+        assert!(matches!(child(4, &later, snapshot), Err(Error::Corrupt(m)) if m == after));
+    }
+
     /// A branch cell redirected to an older, still CRC-valid copy of its child (same page range,
     /// stale contents) passes every range check; only the cell's `child_txn` exposes it. A cell
     /// redirected to another page is caught too. Reads and writes both refuse.
@@ -578,5 +636,22 @@ mod tests {
         store.raw_mut(root.root).copy_from_slice(&original);
         let want = key_of(999);
         assert_eq!(last_key(&store.reader(), &root).expect("restored"), Some(&want[..]));
+    }
+
+    /// [`last_key`] parses a leaf's header before it trusts the count, an empty root leaf's too:
+    /// one whose header is damaged (a flags byte this format never sets, CRC restamped) is
+    /// `Corrupt`, as a `get` finds it, and not an empty tree.
+    #[test]
+    fn last_key_refuses_an_empty_root_leaf_with_a_damaged_header() {
+        let (mut store, root) = committed_tree(1);
+        assert_eq!(root.height, 1);
+        page::leaf_delete(store.raw_mut(root.root), 0).expect("delete");
+        store.restamp(root.root);
+        assert_eq!(last_key(&store.reader(), &root).expect("an empty root leaf"), None);
+        store.raw_mut(root.root)[5] = 1; // the header's flags byte
+        store.restamp(root.root);
+        assert!(matches!(read(&store, &root, &key_of(0)), Err(Error::Corrupt(_))), "get");
+        let got = last_key(&store.reader(), &root).map(|k| k.map(<[u8]>::to_vec));
+        assert!(matches!(&got, Err(Error::Corrupt(m)) if m.contains("page flags 0x1")), "{got:?}");
     }
 }
