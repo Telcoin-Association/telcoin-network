@@ -1476,6 +1476,107 @@ fn a_dup_write_its_totals_cannot_count_changes_nothing() {
     }
 }
 
+/// A record that decodes but miscounts its trees can leave a write's totals breaking a record
+/// rule (each write checks them against the counters' types only): the commit refuses that
+/// working record as `Corrupt`, naming the rule, before it goes into the catalog, and latches;
+/// `table_stat` before it gives saturated sums. A packing table whose record counts neither its
+/// one packed set nor its row, then a packed put of a new subkey; a table that never packs whose
+/// key 1's nested cell names another table's tree of more leaves, then `delete_prefix` of key 1,
+/// which takes that tree out of the totals; a packing table whose rows total `u64::MAX`, then a
+/// nested put.
+#[test]
+fn a_working_record_that_breaks_a_record_rule_is_corrupt_at_commit() {
+    let packing = DupOptions { key_len: 4, packed_max: PACKED_SMALL };
+    for (case, rule) in [
+        ("unpacked set", "packed rows without a packed set"),
+        ("foreign tree", "a nested tree without a leaf or a row"),
+        ("row total", "a row total past u64"),
+    ] {
+        let (_dir, path) = temp("tn_lmdb_dup_broken_rule");
+        {
+            let env = open(&path, SyncMode::Durable);
+            let mut txn = env.begin_rw().expect("rw");
+            match case {
+                "unpacked set" => {
+                    let d = txn.create_dup_table("d", packing).expect("d");
+                    txn.put(&d, &dup_key(1, b"a"), b"v").expect("put");
+                }
+                "foreign tree" => {
+                    // d: keys 1 to 45 of one row (a leaf each), key 99 of many small rows; b: key
+                    // 1 of fewer leaves than d's trees hold, more than key 99's tree.
+                    let d = txn.create_dup_table("d", OPTIONS).expect("d");
+                    let b = txn.create_dup_table("b", OPTIONS).expect("b");
+                    for k in 1..=45 {
+                        txn.put(&d, &dup_key(k, b"s"), b"x").expect("put");
+                    }
+                    for s in 0..3000_u32 {
+                        txn.put(&d, &dup_key(99, &s.to_be_bytes()), b"").expect("put");
+                    }
+                    for s in 0..200_u32 {
+                        txn.put(&b, &dup_key(1, &s.to_be_bytes()), &[3; 900]).expect("put");
+                    }
+                }
+                _ => {
+                    let d = txn.create_dup_table("d", packing).expect("d");
+                    txn.put(&d, &dup_key(1, b"a"), b"v").expect("a packed key");
+                    for s in 0..20_u8 {
+                        txn.put(&d, &dup_key(2, &[s]), &[s; 8]).expect("a nested key");
+                    }
+                }
+            }
+            txn.commit().expect("commit");
+        }
+        match case {
+            "unpacked set" => restamp_record(&path, |record| {
+                record.root.entries = 0;
+                record.dup.as_mut().expect("dup").packed_rows = 0;
+            }),
+            "foreign tree" => {
+                let (leaf, foreign) = {
+                    let env = open(&path, SyncMode::Durable);
+                    let snapshot = env.inner().current();
+                    let (d, b) = (tree(&env, "d"), tree(&env, "b"));
+                    assert_eq!(d.height, 1, "d's outer tree is one leaf");
+                    let page = snapshot.page(b.root).expect("b's outer leaf");
+                    let Find::Found { value: Val::Nested(root), .. } =
+                        page::leaf_find(page, &1u32.to_be_bytes()).expect("find")
+                    else {
+                        panic!("b's key 1 is nested");
+                    };
+                    (d.root, TreeRoot::decode(root).expect("a nested root"))
+                };
+                restamp_cell(&path, leaf, &1u32.to_be_bytes(), Val::Nested(&foreign.encode()));
+            }
+            _ => restamp_record(&path, |record| {
+                let dup = record.dup.as_mut().expect("dup");
+                assert_eq!((dup.packed_rows, dup.nested_trees), (1, 1));
+                dup.nested_entries = u64::MAX - dup.packed_rows;
+            }),
+        }
+        let env = open(&path, SyncMode::Durable);
+        let mut txn = env.begin_rw().expect("rw");
+        let d = txn.open_table("d").expect("open").expect("d");
+        match case {
+            "unpacked set" => txn.put(&d, &dup_key(1, b"b"), b"w").expect("packed put"),
+            "foreign tree" => {
+                txn.delete_prefix(&d, &1u32.to_be_bytes()).expect("delete_prefix");
+            }
+            _ => txn.put(&d, &dup_key(2, b"new"), b"w").expect("nested put"),
+        }
+        let stat = txn.table_stat(&d).expect("stat");
+        if case == "row total" {
+            assert_eq!(stat.entries, u64::MAX, "{case}: a saturated row total");
+        }
+        let result = txn.commit();
+        let message = format!("dup table d: the working record breaks a record rule: {rule}");
+        assert!(
+            matches!(&result, Err(Error::Corrupt(m)) if m.contains(&message)),
+            "{case}: {result:?}"
+        );
+        assert!(env.failure().is_some_and(|f| f.contains(&message)), "{case}: latched");
+    }
+}
+
 /// A dup record whose outer key width is 3 over a tree of 4-byte outer keys fails `Env::check` at
 /// the first outer key, and latches.
 #[test]
@@ -1933,6 +2034,65 @@ fn a_free_walk_refuses_dup_totals_that_miss_its_trees() {
         assert!(env.failure().is_some(), "drop {dropping}: latched");
         let alloc = &txn.writer_mut().alloc;
         assert!(alloc.freed().is_empty(), "drop {dropping}: nothing freed");
+    }
+}
+
+/// A nested cell whose root counts one leaf page more than its tree holds (still a possible root,
+/// the outer leaf's CRC stamped again) is refused by `delete_prefix` of its key before anything
+/// is freed: the free walk holds the pages it collects to the handle's counters (an emptying row
+/// delete holds the same handle exactly). `Corrupt`, naming the tree's root, and latched; both
+/// when taking the counts out of the record's totals would break a record rule (key 1 the only
+/// tree of many leaves) and when the record has the slack to hide them (key 4's tree too), which
+/// would otherwise commit totals that miscount.
+#[test]
+fn delete_prefix_refuses_a_nested_root_miscounting_its_pages() {
+    let k = |i: u32| i.to_be_bytes();
+    for slack in [false, true] {
+        let (_dir, path) = temp("tn_lmdb_dup_miscounted_nested");
+        {
+            let env = open(&path, SyncMode::Durable);
+            let mut txn = env.begin_rw().expect("rw");
+            let d = txn.create_dup_table("d", OPTIONS).expect("d");
+            let keys: &[(u32, u32)] =
+                if slack { &[(1, 2000), (4, 2000)] } else { &[(1, 2000), (2, 1), (3, 1)] };
+            for &(key, rows) in keys {
+                for s in 0..rows {
+                    txn.put(&d, &dup_key(key, &s.to_be_bytes()), b"12345678").expect("put");
+                }
+            }
+            txn.commit().expect("commit");
+        }
+        let (leaf, root) = {
+            let env = open(&path, SyncMode::Durable);
+            let snapshot = env.inner().current();
+            let outer = tree(&env, "d");
+            assert_eq!(outer.height, 1, "the outer tree is one leaf");
+            let page = snapshot.page(outer.root).expect("the outer leaf");
+            let Find::Found { value: Val::Nested(root), .. } =
+                page::leaf_find(page, &k(1)).expect("find")
+            else {
+                panic!("key 1 is nested");
+            };
+            (outer.root, TreeRoot::decode(root).expect("a nested root"))
+        };
+        assert!(root.height == 2 && root.leaf_pages >= 2, "{root:?}");
+        let inflated = TreeRoot { leaf_pages: root.leaf_pages + 1, ..root };
+        restamp_cell(&path, leaf, &k(1), Val::Nested(&inflated.encode()));
+        let env = open(&path, SyncMode::Durable);
+        let mut txn = env.begin_rw().expect("rw");
+        let d = txn.open_table("d").expect("open").expect("d");
+        let result = txn.delete_prefix(&d, &k(1));
+        let message = format!(
+            "tree walk: the tree of root {} holds {} branch and {} leaf pages, the handle counts \
+             {} and {}",
+            root.root, root.branch_pages, root.leaf_pages, root.branch_pages, inflated.leaf_pages
+        );
+        assert!(
+            matches!(&result, Err(Error::Corrupt(m)) if m.contains(&message)),
+            "slack {slack}: {result:?}"
+        );
+        assert!(env.failure().is_some(), "slack {slack}: latched");
+        assert!(txn.writer_mut().alloc.freed().is_empty(), "slack {slack}: nothing freed");
     }
 }
 

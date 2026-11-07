@@ -3118,7 +3118,10 @@ pub(crate) struct NestedSums {
 /// with a descent's checks (the page its parent names, a branch above the leaf level) and, if
 /// published and not stamped here, verified ([`verify_published`]) before its child pointers are
 /// followed: they decide which pages leave the tree, so a pointer damaged at rest must not free a
-/// live page. Every child must be a tree page of the file reached once.
+/// live page. Every child must be a tree page of the file reached once, and the branch and leaf
+/// pages collected must be the handle's `branch_pages` and `leaf_pages` (a sound tree's handle
+/// counts its pages exactly), so a caller that takes the handle's counters out of a total (a dup
+/// table's `delete_prefix`) never takes a miscount.
 ///
 /// **Provenance**, as in [`descend_write`]: a page private to this transaction named by a page it
 /// did not write, or by an untrusted root handle (`root_trusted` is the handle's provenance), is
@@ -3207,7 +3210,9 @@ impl<'s, S: PageWrite + ?Sized> PageWalk<'s, S> {
         self.seen.insert(root.root);
         self.out.pages.push(root.root);
         let mut level = vec![(root.root, root.root_txn)];
+        let mut branches = 0_u64;
         for _ in 1..root.height {
+            branches += level.len() as u64;
             let mut next = Vec::new();
             for &(p, txn) in &level {
                 let page = check_header(p, txn)?;
@@ -3239,6 +3244,14 @@ impl<'s, S: PageWrite + ?Sized> PageWalk<'s, S> {
         let Some(&(first, txn)) = level.first() else {
             return Err(corrupt(format!("a level of the tree of height {} is empty", root.height)));
         };
+        let leaf_pages = level.len() as u64;
+        if branches != u64::from(root.branch_pages) || leaf_pages != u64::from(root.leaf_pages) {
+            return Err(corrupt(format!(
+                "the tree of root {} holds {branches} branch and {leaf_pages} leaf pages, the \
+                 handle counts {} and {}",
+                root.root, root.branch_pages, root.leaf_pages
+            )));
+        }
         let dup = matches!(leaves, Leaves::Dup { .. });
         if !dup && root.overflow_pages == 0 {
             if page::kind(check_header(first, txn)?)? != Kind::Leaf {

@@ -101,7 +101,7 @@ Each row: the file's role, its entry points, what a change must keep; item docs 
   (README do-not-flag 22), so the cell is the truth for a packed key and nothing overlays it. Map
   entries come only from a nested cell, a nested create and a promotion, and leave with their
   cell; a nested key never demotes (do-not-flag 24), so a map hit is always nested. `dup_entry`
-  debug-asserts it, and the free walks' hit count fails a drop or clear that meets an entry
+  checks it in debug builds (`Corrupt` on a disagreement: only damage), and the free walks' hit count fails a drop or clear that meets an entry
   whose cell is packed.
 - **A packed set is checked at its first use, never at copy-on-write.** Reads run
   `PackedView::new` and the rows they touch; every write that decodes a set, the free walks and

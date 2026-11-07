@@ -362,7 +362,8 @@ broken rule:
   the packed sets times `(packed_max − 2) / 5` ("more packed rows than the packed sets can hold": a
   row takes at least a 4-byte slot and a 1-byte subkey);
 - the outer tree's pages plus the three nested page counts are at most `MAX_TREE_PAGES`, so the
-  page totals of `TableStat` cannot overflow;
+  page totals of `TableStat` cannot overflow (a write transaction's working record over a damaged
+  one can break the rules until its commit refuses it, so `TableStat`'s sums saturate);
 - `nested_entries + packed_rows` does not overflow a `u64` (the table's row count).
 
 A record that decodes is then held to this build's limits at every use (`TableRecord::usable`,
@@ -578,8 +579,11 @@ changes, and do not latch.
   must not free it. A tree whose `overflow_pages` is 0 reads its branches, its first leaf and its
   private leaves (in memory) only. A tree with runs reads every leaf, checks each run's header,
   identity and provenance (`leaving_run`, without the CRC: the value is not read), and requires
-  the run pages to add up to `overflow_pages`. Damage refuses the free with `Corrupt`, before any
-  page is freed.
+  the run pages to add up to `overflow_pages`. Every tree a free walk meets (a plain table's, a
+  dup table's outer and nested trees, `delete_prefix`'s nested tree) must also hold exactly the
+  branch and leaf pages its handle counts, counted from the levels the walk reads, so a root that
+  miscounts its pages is refused too. Damage refuses the free with `Corrupt`, before any page is
+  freed.
 - When `pool` is empty, the writer refills it (`Writer::refill`). It takes free records smallest
   first, and only while their txn is at most the **reuse gate**:
 
@@ -1326,7 +1330,8 @@ nested tree's. `append` orders by the logical key: an outer key before the table
 not past its last); a later one starts a new nested tree. A put of a new outer key builds its
 nested tree first, then writes its outer cell; a delete that empties a nested tree removes its
 outer cell, and the tree's last leaf is freed. `delete_prefix(k)` frees `k`'s whole nested tree in
-one walk, which collects every page and run before it frees any (damage is refused first), removes
+one walk, which collects every page and run before it frees any (damage, a root whose counters
+miss its pages included, is refused first), removes
 the cell and returns the rows removed (0, and no change, when `k` holds none). On a packed key the
 same calls work on its set, below.
 
@@ -1351,7 +1356,8 @@ the set and borrows the value from the mapping.
 - **No map entry (invariant P).** A packed key has no entry in the working map (below): its cell is
   rewritten at each write, so the cell is the truth for it, and only nested keys wait for the
   flush (do-not-flag item 22).
-  Debug builds assert it in `txn::dup_entry`, and a free walk's hit count enforces it in every
+  Debug builds check it in `txn::dup_entry` and `Work::flush_nested` (a disagreement, which only
+  a crafted branch can cause, is `Corrupt`), and a free walk's hit count enforces it in every
   build.
 - **The write stamp.** Every packed change (a create, rewrite, row delete, cell removal or
   promotion) moves the table's write stamp, even an in-place rewrite that leaves the outer root's
@@ -1419,7 +1425,9 @@ dup write counts them before it changes anything: a write into a key's tree take
 of the totals first (`OtherTrees`), a delete checks the tree count it would leave first, and a new
 key counts its tree in a copy of the totals before its cell is written. So a record that cannot
 count the key's tree changes nothing; only a sum past a counter's type is met after a write into
-an existing tree.
+an existing tree. A record that decodes but miscounts its trees can leave totals that break a
+record rule: the commit refuses such a working record (`Corrupt`, naming the rule, latched)
+before it goes into the catalog, and `table_stat` in that transaction saturates its sums.
 `TableStat` is O(1) for both kinds:
 
 | field | plain | dup |
@@ -1565,7 +1573,9 @@ from a cell the map supersedes, and from the cell otherwise.
   is read from the outer leaf the cursor holds (`held_cell`: the page fetched with the per-fetch
   checks, the slot's key first, else, once the leaf has had the full range check, a search of the
   leaf when the key lies within its first and last keys; do-not-flag item 29), and from the outer
-  root (`read::find_outer`) when that leaf lacks it.
+  root (`read::find_outer`) when that leaf lacks it. In a tree whose branches are sound that cell
+  is the one a root descent finds; a crafted branch (reads check no separator order) can make
+  them differ, and the outer write's copy-on-write `validate` of that branch refuses it.
 - A write to a packed key, a promotion included, rewrites the outer cell, so the cursor finds its
   row again by key (the write reports no slot, `DupPlaced::slot` `None`); `delete_current` of a
   set's row places by key on the follower, and of a set's only row (the cell removed) from the
@@ -1594,7 +1604,7 @@ from a cell the map supersedes, and from the cell otherwise.
   (`dup_txn_cursors_and_direct_writes_match_the_composite_twin`) holds the two copies to the
   same behaviour.
 
-**Errors.** Damage a move meets (an outer key of another width, an outer cell that is not a nested
+**Errors.** Damage a move or a write through the cursor meets (an outer key of another width, an outer cell that is not a nested
 cell or, in a table that packs, a packed set, an empty or damaged nested root, a packed set that
 fails a check, a subkey of another length, any check of a descent) is
 `Corrupt`, latches, and leaves the cursor unset (a `DupTxnCursor` out of the deleted state too).

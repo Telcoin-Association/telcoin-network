@@ -497,6 +497,69 @@ fn a_table_root_past_the_end_is_refused_by_the_tree_walk() {
     }
 }
 
+/// A table root that counts one leaf or one branch page more than its tree holds (still a
+/// possible root, in a catalog record whose leaf's CRC is stamped again): `drop_table` and
+/// `clear_table` walk the tree to free it, and `tree_pages` holds the pages it collects to the
+/// handle's counters, refusing the root before anything is freed. The error is `Corrupt`, names
+/// the root, and latches.
+#[test]
+fn a_table_root_miscounting_its_pages_is_refused_by_the_tree_walk() {
+    for field in ["leaf_pages", "branch_pages"] {
+        for dropping in [false, true] {
+            let (_dir, path) = temp("tn_lmdb_damage_miscounted_root");
+            let (catalog, root) = {
+                let env = open(&path, SyncMode::Durable);
+                let mut txn = env.begin_rw().expect("begin");
+                let t = txn.create_table("t").expect("t");
+                for i in 0..300_u32 {
+                    txn.put(&t, &i.to_be_bytes(), &value(3, i, 100)).expect("put");
+                }
+                txn.commit().expect("commit");
+                let meta = env.inner().current().meta;
+                assert_eq!(meta.catalog.height, 1, "the catalog is one leaf");
+                (meta.catalog.root, tree(&env, "t"))
+            };
+            assert_eq!(root.height, 2, "{root:?}");
+            let miscounted = match field {
+                "leaf_pages" => TreeRoot { leaf_pages: root.leaf_pages + 1, ..root },
+                _ => TreeRoot { branch_pages: root.branch_pages + 1, ..root },
+            };
+            restamped(&path, catalog, |page| {
+                let i = (0..page::nkeys(page))
+                    .find(|&i| page::leaf_inline_entry(page, i).expect("entry").0 == b"t")
+                    .expect("t's record");
+                let (_, value) = page::leaf_inline_entry(page, i).expect("entry");
+                let off = value.as_ptr() as usize - page.as_ptr() as usize;
+                let mut record = catalog::TableRecord::decode(value).expect("record");
+                record.root = miscounted;
+                let bytes = record.encode();
+                page[off..off + bytes.len()].copy_from_slice(&bytes);
+            });
+            let env = open(&path, SyncMode::Durable);
+            let mut txn = env.begin_rw().expect("begin");
+            let t = txn.open_table("t").expect("open").expect("t");
+            let result = if dropping { txn.drop_table(t) } else { txn.clear_table(&t) };
+            let what = format!("{field}, drop {dropping}");
+            let message = format!(
+                "tree walk: the tree of root {} holds {} branch and {} leaf pages, the handle \
+                 counts {} and {}",
+                root.root,
+                root.branch_pages,
+                root.leaf_pages,
+                miscounted.branch_pages,
+                miscounted.leaf_pages
+            );
+            assert!(
+                matches!(&result, Err(Error::Corrupt(m)) if m.contains(&message)),
+                "{what}: {result:?}"
+            );
+            assert!(txn.writer_mut().alloc.freed().is_empty(), "{what}: nothing freed");
+            drop(txn);
+            assert!(env.failure().is_some(), "{what}: latched");
+        }
+    }
+}
+
 /// Table `u`'s last leaf in the fixture (`u` has two levels and no runs, so a free of it reads its
 /// root and only its first leaf), and a copy of the fixture's file, named `what`, whose first free
 /// record (which passes the reuse gate) also lists that leaf, the record's leaf CRC stamped again.
@@ -853,4 +916,59 @@ fn a_commit_of_the_last_txn_id_is_refused_before_it_writes() {
         state_of(&ro, ["a"]),
         State::from([("a".to_string(), Rows::from([(b"key".to_vec(), b"a".to_vec())]))])
     );
+}
+
+/// A meta whose txn id is far above the other slot's (one short of the last: a valid record,
+/// which open takes) makes the reuse gate's lag, the writer's txn less the older slot's, near
+/// `u64::MAX`: a write that loads free records more than once sums it into
+/// `IoStats::gate_lag_sum`, which saturates (no overflow panic, no wrap), and its commit is then
+/// the `Corrupt` that [`a_commit_of_the_last_txn_id_is_refused_before_it_writes`] pins.
+#[test]
+fn a_far_meta_txn_saturates_the_gate_lag() {
+    let (_dir, path) = temp("tn_lmdb_far_txn");
+    {
+        let env = open(&path, SyncMode::Durable);
+        let mut txn = env.begin_rw().expect("rw");
+        let big = txn.create_table("big").expect("big");
+        for i in 0..2000_u32 {
+            txn.put(&big, &i.to_be_bytes(), &value(1, i, 900)).expect("put");
+        }
+        txn.commit().expect("commit");
+        let mut txn = env.begin_rw().expect("rw");
+        let big = txn.open_table("big").expect("open").expect("big");
+        txn.drop_table(big).expect("drop");
+        txn.commit().expect("commit");
+        // Two more commits, so the dropped pages pass the gate of both slots.
+        for k in 0..2_u32 {
+            let mut txn = env.begin_rw().expect("rw");
+            let t = txn.create_table("t").expect("t");
+            txn.put(&t, &k.to_be_bytes(), b"v").expect("put");
+            txn.commit().expect("commit");
+        }
+    }
+    let file = fs::OpenOptions::new().read(true).write(true).open(&path).expect("open");
+    let slot = |at: u64| {
+        let mut record = [0; META_LEN];
+        file.read_exact_at(&mut record, at * P).expect("read");
+        Meta::decode(&record).expect("meta")
+    };
+    let newest = if slot(0).txn > slot(1).txn { 0 } else { 1 };
+    // Re-encoded, so the record passes its CRC.
+    let far = Meta { txn: u64::MAX - 1, ..slot(newest) };
+    file.write_all_at(&far.encode(), newest * P).expect("write");
+    let env = open(&path, SyncMode::Durable);
+    let mut txn = env.begin_rw().expect("rw");
+    let w = txn.create_table("w").expect("w");
+    for i in 0..1500_u32 {
+        txn.put(&w, &i.to_be_bytes(), &value(2, i, 900)).expect("put");
+    }
+    let stats = txn.writer_mut().stats;
+    assert!(stats.gate_lag_samples >= 2, "{stats:?}");
+    assert_eq!(stats.gate_lag_sum, u64::MAX, "a saturated sum");
+    let result = txn.commit();
+    assert!(
+        matches!(&result, Err(Error::Corrupt(m)) if m.contains("leaves no txn after this")),
+        "{result:?}"
+    );
+    assert!(env.failure().is_some(), "latched");
 }

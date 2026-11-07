@@ -1347,6 +1347,33 @@ fn a_private_cell_with_no_map_entry_is_corrupt_under_a_dup_cursor() {
     txn.abort();
 }
 
+/// A put through a dup cursor that meets damage (its key's cell naming a page private to the
+/// transaction with no working entry, the entry forgotten through the test hook) is `Corrupt`,
+/// latches, and leaves the cursor unset and out of the deleted state, from a row and from the
+/// deleted state, as a failed `delete_current` leaves it.
+#[test]
+fn damage_a_cursor_put_meets_leaves_the_cursor_unset() {
+    for deleted in [false, true] {
+        let (_dir, env, d, _p, _) = setup("tn_lmdb_dup_txn_put_damage", &[(1, 3), (3, 3)]);
+        let mut txn = env.begin_rw().expect("rw");
+        for s in 0..5 {
+            txn.put(&d, &row_key(2, s), b"new").expect("put");
+        }
+        let mut c = txn.dup_cursor_detached(&d).expect("cursor");
+        assert!(c.seek_exact(&txn, &row_key(2, 1)).expect("seek").is_some());
+        if deleted {
+            assert!(c.delete_current(&mut txn).expect("delete"));
+            assert_eq!(c.state(), (State::At, true), "on the follower");
+        }
+        assert!(txn.forget_nested(&d, &2u32.to_be_bytes()));
+        let put = c.put(&mut txn, &row_key(2, 9), b"v");
+        let message = "private to this transaction, with no working root";
+        assert!(matches!(&put, Err(Error::Corrupt(m)) if m.contains(message)), "{put:?}");
+        assert_eq!(c.state(), (State::Unset, false), "deleted {deleted}");
+        assert!(env.failure().is_some(), "deleted {deleted}: Corrupt latches");
+    }
+}
+
 /// A dup cursor used with another transaction is `WrongTxn`, and after its table was dropped
 /// `StaleTable`: nothing changes and nothing latches.
 #[test]
@@ -1636,6 +1663,110 @@ fn packed_damage_under_a_dup_cursor_is_corrupt() {
             assert_eq!(c.state(), (State::Unset, false), "{what} {op}");
             assert!(env.failure().is_some(), "{what} {op}: latched");
         }
+    }
+}
+
+/// A cleanly closed file holding a plain table `p` of one row and dup table `d` (default packed
+/// limit) of 600 packed keys of one row, but the last, key 599, a nested tree, under an outer
+/// root branch whose separators from its middle child to its next-to-last (the last child's
+/// kept) were then forged past every key, and a packed cell for key 599 forged at the end of the
+/// middle child's left neighbour, both CRCs stamped again. The last key's edge descent passes
+/// every check and reaches its real, nested cell; a descent from the root for it reaches the
+/// forged packed one. Returns the path and key 599.
+fn misrouting_branch() -> (TempDir, std::path::PathBuf, [u8; 4]) {
+    use crate::{
+        page::{Fit, LeafMut},
+        tree::{read::descend, PageRead as _},
+    };
+    let (dir, path) = temp("tn_lmdb_dup_txn_misrouted");
+    let last = 599u32.to_be_bytes();
+    let (root, forged, mid) = {
+        let env = open(&path, SyncMode::Durable);
+        let mut txn = env.begin_rw().expect("rw");
+        let p = txn.create_table("p").expect("p");
+        txn.put(&p, b"row", b"v").expect("put");
+        let d = txn.create_dup_table("d", DupOptions::packed(4)).expect("d");
+        for k in 0..600u32 {
+            txn.put(&d, &dup_key(k, b"s"), &[7; 10]).expect("put");
+        }
+        for s in 0..40u8 {
+            txn.put(&d, &[&last[..], &[b't', s]].concat(), &[9; 60]).expect("promote");
+        }
+        txn.commit().expect("commit");
+        let root = super::damage::tree(&env, "d");
+        assert_eq!(root.height, 2, "{root:?}");
+        let snapshot = env.inner().current();
+        let page = snapshot.page(root.root).expect("the outer root");
+        let n = page::nkeys(page);
+        assert!(n >= 4, "{n} children");
+        let mid = 1 + (n - 1) / 2;
+        let (forged, _) = page::branch_child(page, mid - 1).expect("a child");
+        let leaf = descend(&*snapshot, &root, &last, |_, _, _, _| Ok(())).unwrap().unwrap().pgno;
+        assert_eq!(leaf, page::branch_child(page, n - 1).expect("the last child").0);
+        (root.root, forged, mid)
+    };
+    restamped(&path, root, |page| {
+        for i in mid..page::nkeys(page) - 1 {
+            let key = page::branch_key(page, i).expect("a separator");
+            let (off, len) = (key.as_ptr() as usize - page.as_ptr() as usize, key.len());
+            page[off..off + len].fill(0xff);
+        }
+    });
+    restamped(&path, forged, |page| {
+        // A packed set of one row: subkey "x" and an empty value.
+        let set = [1, 0, 7, 0, 1, 0, b'x'];
+        let n = page::nkeys(page);
+        LeafMut::new(page).expect("a leaf").delete(n - 1).expect("its last cell");
+        let fit = LeafMut::new(page).expect("a leaf").insert(n - 1, &last, &set[..]);
+        assert_eq!(fit.expect("insert"), Fit::Done);
+    });
+    (dir, path, last)
+}
+
+/// A dup cursor's outer leaf and a descent from the root disagree on a key's cell under a
+/// crafted root branch ([`misrouting_branch`]): the cursor at the last key (an edge descent)
+/// loads its nested root from its held leaf, while the root's descent finds a packed set. Debug
+/// builds check the two agree and refuse the disagreement as `Corrupt` (never a panic): a put
+/// of the key after the cursor's, which finds the key's working entry, and the commit's flush
+/// after the cursor's refused insert loaded the entry unchanged; each latches. Release builds do
+/// not check: the put case's commit refuses the branch where its flush copies it, and latches; the
+/// refused insert's commit copies no outer page.
+#[test]
+fn a_held_outer_leaf_a_crafted_branch_contradicts_is_corrupt() {
+    let (_fixture, path, last) = misrouting_branch();
+    for case in ["put", "flush"] {
+        let (_dir, env) = copy_of(&path);
+        let mut txn = env.begin_rw().expect("rw");
+        let d = txn.open_table("d").expect("open").expect("d");
+        let mut c = txn.dup_cursor_detached(&d).expect("cursor");
+        let at = c.last(&txn).expect("last").map(|(key, _)| key[..K].to_vec());
+        assert_eq!(at.as_deref(), Some(&last[..]), "{case}: the last key");
+        let result = if case == "put" {
+            c.put(&mut txn, &[&last[..], b"u1"].concat(), b"w").expect("the cursor's put");
+            let put = txn.put(&d, &[&last[..], b"u2"].concat(), b"w");
+            put.and_then(|()| txn.commit().map(drop))
+        } else {
+            let refused = c.insert(&mut txn, &[&last[..], b"s"].concat(), b"w");
+            assert!(matches!(refused, Err(Error::KeyExists)), "{refused:?}");
+            assert!(env.failure().is_none(), "a refused insert does not latch");
+            let p = txn.open_table("p").expect("open").expect("p");
+            txn.put(&p, b"other", b"v").expect("put");
+            let commit = txn.commit().map(drop);
+            if !cfg!(debug_assertions) {
+                continue;
+            }
+            commit
+        };
+        let message = match case {
+            "put" if cfg!(debug_assertions) => "has a working entry and a packed set from the root",
+            "put" => "out of key order",
+            _ => "is not its working root",
+        };
+        assert!(
+            matches!(&result, Err(Error::Corrupt(m)) if m.contains(message)),
+            "{case}: {result:?}"
+        );
+        assert!(env.failure().is_some(), "{case}: latched");
     }
 }
 

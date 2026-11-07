@@ -794,7 +794,7 @@ impl Writer {
         let started = Instant::now();
         let gate = self.reuse_gate();
         let lag = self.alloc.txn().saturating_sub(gate);
-        self.stats.gate_lag_sum += lag;
+        self.stats.gate_lag_sum = self.stats.gate_lag_sum.saturating_add(lag);
         self.stats.gate_lag_samples += 1;
         self.stats.max_gate_lag = self.stats.max_gate_lag.max(lag);
         let (free, page_count) = (self.last.free, self.last.page_count);

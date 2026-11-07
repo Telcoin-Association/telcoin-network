@@ -122,7 +122,9 @@ pub struct TableStat {
 
 impl TableStat {
     /// The figures of a table whose tree is `root`, with `dup` for a dup table: its outer and
-    /// nested trees summed. The record rules bound the sums ([`TableRecord::decode`]).
+    /// nested trees summed. The record rules bound the sums of a record read from the catalog
+    /// ([`TableRecord::decode`]); a write transaction's working record over a damaged one may break
+    /// them until its commit refuses it, so the sums saturate.
     fn of(root: &TreeRoot, dup: Option<&DupRecord>) -> Self {
         let plain = Self {
             entries: root.entries,
@@ -135,10 +137,10 @@ impl TableStat {
         };
         let Some(d) = dup else { return plain };
         Self {
-            entries: d.nested_entries + d.packed_rows,
-            branch_pages: plain.branch_pages + d.nested_branch_pages,
-            leaf_pages: plain.leaf_pages + d.nested_leaf_pages,
-            overflow_pages: plain.overflow_pages + d.nested_overflow_pages,
+            entries: d.nested_entries.saturating_add(d.packed_rows),
+            branch_pages: plain.branch_pages.saturating_add(d.nested_branch_pages),
+            leaf_pages: plain.leaf_pages.saturating_add(d.nested_leaf_pages),
+            overflow_pages: plain.overflow_pages.saturating_add(d.nested_overflow_pages),
             nested_trees: d.nested_trees,
             dup: Some(d.options()),
             ..plain
@@ -397,12 +399,16 @@ fn dup_entry<'m>(
     } else if cfg!(debug_assertions) && packed_max != 0 {
         // A key with a working map entry has a nested cell, never a packed set: entries come only
         // from a nested cell, a created tree and a promotion, and a nested key never goes back.
+        // Only damage breaks it: a crafted branch can route the root's descent to another leaf than
+        // the one a cursor held when it loaded the entry ([`held_cell`]); release builds refuse the
+        // branch at the outer write's copy instead.
         let cell = outer_cell(writer, table, packed_max, outer, k);
-        assert!(
-            !matches!(cell, Ok(Some(OuterVal::Packed(_)))),
-            "dup table {}: key {k:02x?} has a working entry and a packed set",
-            table.name()
-        );
+        if matches!(cell, Ok(Some(OuterVal::Packed(_)))) {
+            return Err(Error::Corrupt(format!(
+                "dup table {}: key {k:02x?} has a working entry and a packed set from the root",
+                table.name()
+            )));
+        }
     }
     Ok(match map.get_mut(k) {
         Some(n) => DupEntry::Nested(n),
@@ -414,13 +420,15 @@ fn dup_entry<'m>(
 /// the leaf had the full range check ([`DupHint::held`]), read by the record's packed-set limit
 /// `packed_max` ([`outer_val`]); `None` for no leaf or a leaf without the key, so the caller
 /// finds the cell from the root. The cursor is up to date at a row of `k`, so the leaf is the
-/// working outer tree's leaf for `k`, entered with a descent's checks: a cell of `k` there is the
-/// one a descent from the root finds. The page is fetched with the per-fetch checks, as the
-/// cursor's moves fetch it ([`checked`]); the slot's key first (the cursor's landing entry, or
-/// an entry of a leaf checked in full), else, in a leaf checked in full only, a search of the
-/// leaf when `k` lies between its first and last keys: a leaf a seek entered may hold keys
-/// outside its range ([`TreeCursor::leaf_checked`]), and its search could find a cell a descent
-/// from the root does not.
+/// working outer tree's leaf for `k`, entered with a descent's checks: in a tree whose branches
+/// are sound, a cell of `k` there is the one a descent from the root finds. A read checks no
+/// branch's separator order, so a crafted branch can make the two differ; the outer write's
+/// copy-on-write `validate` of that branch then refuses it (`Corrupt`). The page is fetched with
+/// the per-fetch checks, as the cursor's moves fetch it ([`checked`]); the slot's key first (the
+/// cursor's landing entry, or an entry of a leaf checked in full), else, in a leaf checked in full
+/// only, a search of the leaf when `k` lies between its first and last keys: a leaf a seek entered
+/// may hold keys outside its range ([`TreeCursor::leaf_checked`]), and its search could find a cell
+/// a descent from the root does not.
 fn held_cell<'s>(
     writer: &'s Writer,
     table: &Table,
@@ -1193,10 +1201,11 @@ fn no_cell(table: &Table, k: &[u8]) -> Error {
 
 /// The delete of every row under the outer key `key` from the dup table at `i` in
 /// [`Work::tables`]: the key's nested tree is freed in one walk ([`write::free_subtree`]: its
-/// pages are collected first, so damage frees nothing), then its cell and its entry go; a packed
-/// set (validated whole by [`dup_entry`]) frees no page, only its cell goes; returns the rows
-/// removed. The totals are moved first, so a record that cannot count the tree frees
-/// nothing either. A key of another width than the table's is refused before anything changes.
+/// pages are collected first and held to the root's counters, so damage, a root that miscounts
+/// its pages included, frees nothing), then its cell and its entry go; a packed set (validated
+/// whole by [`dup_entry`]) frees no page, only its cell goes; returns the rows removed. The
+/// totals are moved first, so a record that cannot count the tree frees nothing either. A key of
+/// another width than the table's is refused before anything changes.
 fn dup_delete_prefix(work: &mut Work, i: usize, key: &[u8]) -> Result<u64> {
     let dup = dup_mut(&mut work.tables[i].record.dup);
     let (key_len, packed_max) = (usize::from(dup.key_len), dup.packed_max);
@@ -2517,16 +2526,12 @@ impl Work {
         self.changed = true;
     }
 
-    /// [`Self::set_record`] after a dup write, which moved the table's totals in place: debug
-    /// builds check that the record the commit writes still decodes.
+    /// [`Self::set_record`] after a dup write, which moved the table's totals in place. Each
+    /// write checks its totals against the counters' types only: a record that decodes but
+    /// miscounts its trees can leave totals that break a record rule, which the commit refuses
+    /// before the record goes into the catalog ([`Self::commit`]).
     fn set_dup_record(&mut self, i: usize, root: TreeRoot, trusted: bool) {
         self.set_record(i, root, trusted);
-        debug_assert_eq!(
-            self.tables[i].record.dup.and_then(|d| d.broken_rule(&root)),
-            None,
-            "dup table {}: the working record breaks a record rule",
-            self.tables[i].table.name()
-        );
     }
 
     /// Write the changed nested roots of the dup table at `i` in [`Self::tables`] into their
@@ -2561,12 +2566,18 @@ impl Work {
         }
         #[cfg(debug_assertions)]
         for (k, n) in &w.nested {
-            // A key with a working entry has a nested cell, never a packed set.
+            // A key with a working entry has a nested cell, never a packed set, and the flush left
+            // its working root there. Only damage breaks it ([`dup_entry`]'s check).
             let cell = match outer_cell(&*writer, &w.table, packed_max, &outer, k) {
                 Ok(Some(OuterVal::Nested(b))) => Some(b),
                 _ => None,
             };
-            assert_eq!(cell, Some(&n.root.encode()), "the flushed outer cell of key {k:02x?}");
+            if cell != Some(&n.root.encode()) {
+                return Err(Error::Corrupt(format!(
+                    "dup table {}: the flushed outer cell of key {k:02x?} is not its working root",
+                    w.table.name()
+                )));
+            }
         }
         if flushed {
             self.set_record(i, outer, trusted);
@@ -2574,10 +2585,12 @@ impl Work {
         Ok(())
     }
 
-    /// Commit steps 1–7 (see the env module docs): the changed tables' roots into the catalog,
-    /// the free list's save, the new meta, the pages' CRCs, the durable steps (or their deferral),
-    /// and publication. The writer then begins the next txn, so a txn of `u64::MAX` (its base
-    /// meta's id is one only a crafted meta has) is [`Error::Corrupt`] before anything is written.
+    /// Commit steps 1–7 (see the env module docs): the changed tables' roots into the catalog
+    /// (a dup table's record refused as [`Error::Corrupt`] if its totals break a record rule:
+    /// [`Self::set_dup_record`]), the free list's save, the new meta, the pages' CRCs, the durable
+    /// steps (or their deferral), and publication. The writer then begins the next txn, so a
+    /// txn of `u64::MAX` (its base meta's id is one only a crafted meta has) is
+    /// [`Error::Corrupt`] before anything is written.
     fn commit(&mut self, inner: &EnvInner) -> Result<u64> {
         let Some(next_txn) = self.txn.checked_add(1) else {
             return Err(Error::Corrupt(format!(
@@ -2602,6 +2615,11 @@ impl Work {
         writer.crash_point(CrashAt::BeforeSave)?;
         let started = Instant::now();
         for (name, record) in &dirty {
+            if let Some(rule) = record.dup.and_then(|d| d.broken_rule(&record.root)) {
+                return Err(Error::Corrupt(format!(
+                    "dup table {name}: the working record breaks a record rule: {rule}"
+                )));
+            }
             catalog::put(writer, catalog, catalog_trusted, name, record)?;
         }
         let mut free = base.free;
@@ -2969,8 +2987,9 @@ impl RwTxn {
     }
 
     /// A new, unset cursor over `table` that can also write: the moves of a [`Cursor`] over this
-    /// transaction's working state, plus [`RwCursor::put`], [`RwCursor::append`] and
-    /// [`RwCursor::delete_current`]. It holds the transaction until it is dropped.
+    /// transaction's working state, plus [`RwCursor::put`], [`RwCursor::append`],
+    /// [`RwCursor::insert`] and [`RwCursor::delete_current`]. It holds the transaction until it is
+    /// dropped.
     /// [`Error::TableKind`] for a dup table.
     pub fn cursor_mut(&mut self, table: &Table) -> Result<RwCursor<'_>> {
         let root = self.read(|work| work.plain_root(table))?;
@@ -4772,7 +4791,19 @@ impl DupTxnCursor {
             Some(k) if was_current => self.walk.hints(k, &self.outer_root),
             _ => NO_DUP_HINT,
         };
-        let placed = txn.dup_put_entry(&self.track.table, key, value, kind, hints)?;
+        let placed = match txn.dup_put_entry(&self.track.table, key, value, kind, hints) {
+            Ok(placed) => placed,
+            Err(e) => {
+                // A refusal changes nothing, the cursor included; a failure the environment
+                // latches (damage, I/O, a broken invariant) leaves it unset, as a failed
+                // `delete_current` does.
+                if matches!(e, Error::Corrupt(_) | Error::Io(_) | Error::Failed(_)) {
+                    self.walk.unset();
+                    self.deleted = false;
+                }
+                return Err(e);
+            }
+        };
         self.deleted = false;
         self.track.writes = self.track.table_writes(&txn.work);
         let work = &txn.work;
