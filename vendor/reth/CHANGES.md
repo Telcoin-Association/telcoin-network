@@ -476,6 +476,16 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   Message only. *Tests*: tn-reth's `trace_filter_honours_max_trace_filter_blocks` now checks the
   whole message. *Upstream*: n/a (upstream commit).
 
+- **TN-0041** — Backport bf1db83ae: pool validation workers release the shared queue before
+  validating. *Kind*: backport.
+  *Files*: `crates/transaction-pool/src/validate/task.rs` (`ValidationTask::run`, a test).
+  *Why*: each worker held the job receiver's lock while it ran a job (a `while let` scrutinee's
+  temporary lives through the loop body), so `--txpool.additional-validation-tasks` workers
+  validated one transaction at a time. TN builds its pool with these workers
+  (`WorkerTxPool::build`). Pool throughput only; what is admitted does not change.
+  *Tests*: upstream's `cloned_workers_validate_while_another_job_is_blocked`; transaction-pool
+  228/228. *Upstream*: n/a (upstream commit).
+
 ## TN fixes (not from an upstream commit)
 
 - **TN-0036** — Debug traces hold their tracing permit until their blocking task ends. *Kind*:

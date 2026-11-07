@@ -52,6 +52,7 @@ Severity below is for TN, which differs from upstream's in places. Relevant TN f
 | revm-inspectors a5638ca (#548) | `patches/revm-inspectors` | **security**: Boa's recursion limit 10,000 → 128, so a recursive getter or setter in a JS tracer cannot overflow a blocking thread's stack and abort the node (`js-tracer` builds only). Carried as a patched crate, not a vendored file; see its PATCH.md. Found by the review | 3 tests; getter and setter abort the process without the fix |
 | 6e4009eed | TN-0039 | a lagging `eth_subscribe("logs")` subscriber skips the missed blocks instead of panicking its subscription task | nested build; no upstream test |
 | 6d718d0c2 | TN-0040 | `trace_filter`'s range error names the configured limit, not 100 | tn-reth namespace test |
+| bf1db83ae | TN-0041 | pool validation workers no longer hold the job queue's lock while validating, so `--txpool.additional-validation-tasks` runs in parallel | upstream test; txpool 228/228 |
 
 ## Open
 
@@ -81,7 +82,6 @@ Severity below is for TN, which differs from upstream's in places. Relevant TN f
 | 13a59de4b (+ 621f663ed) | stop long blocking jobs once the request is dropped | rpc-eth-api, tasks | Extends TN-0019 to synchronous jobs that never yield (e.g. long `eth_call`s). Needs the `CancelOnDrop` move into reth-tasks first. | not tried |
 | 294e21507 | heal finalized/safe ahead of highest header | provider | After an unwind, "finalized" can point past the tip. Lives in the MDBX `DatabaseProvider`: **for the tndb-b owners.** | clean |
 | 5fc3a81d3 | bound safe-no-sync rollback with a sync period | db | Without a period, `--db.sync-mode safe-no-sync` can lose days of data on power loss. **MDBX: for the tndb-b owners.** | test-only |
-| bf1db83ae | release receiver lock before validating | transaction-pool | `additional_validation_tasks` validates one transaction at a time. | clean |
 | 080a9cfc1, c4cd5c9b7 | `apply_pre_execution_changes` in replay and `debug_traceCallMany` | rpc-eth-api, rpc | TN's EIP-4788/EIP-2935 system calls are skipped in replays and traces. | clean; check `executor_for_block` |
 | 8861e2724 | notify subscribers when set_block_info promotes | transaction-pool | TN calls `set_block_info`; transactions promoted by a basefee drop never reach pending listeners. | clean |
 | 5b0120dbb | lower default block/receipt cache limits | rpc-eth-types | High default memory use unless TN sets its own limits. | clean |
