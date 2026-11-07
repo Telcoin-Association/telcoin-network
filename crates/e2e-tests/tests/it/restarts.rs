@@ -1920,12 +1920,22 @@ const EXECUTION_DELAY_ENV: &str = "TN_TEST_EXECUTION_DELAY_MS";
 
 /// Milliseconds [`SLOW_NODE`] sleeps before it executes each output that carries batches.
 ///
-/// Under load the e2e committee advances about five rounds a second, a leader commit every 0.4 s,
-/// so at 1.5 s an output the slowed node's execution falls about three rounds a second further
-/// behind and crosses the activity window of [`RESTART_TEST_GC_DEPTH`] within seconds (190 rounds
-/// behind by the end of the window when measured). Outputs without batches skip execution and the
-/// delay alike, so the backlog drains once the load stops.
-const SLOW_EXECUTION_DELAY_MS: &str = "1500";
+/// The delay `d` keeps the slowed node's lag well below the commit run-ahead bound
+/// (`tn_types::MAX_COMMIT_RUN_AHEAD_ROUNDS`, 1000 rounds), past which its commits are held and the
+/// activity window demotes it by design. Under load the e2e committee advances `r` = 5.9 to 6.3
+/// rounds a second with a leader every two rounds, every output carries batches, and the slowed
+/// node executes one output every `d` plus about 25 ms, two rounds each. Its lag grows by
+/// `r - 2/d`, about 2.3 rounds a second at `d` = 0.5 s: it passes the 15-round activity window of
+/// [`RESTART_TEST_GC_DEPTH`] about 7 s into the load and reached 130 to 152 rounds by the end of
+/// the 60-s [`SLOW_EXECUTION_WINDOW`] `W` in the measured runs.
+///
+/// The backlog at the stop, `B = (r/2 - 1/d) * W` (about 70 outputs), plus the `E` outputs that
+/// still carry batches after the stop (batches the load left waiting for a header, 3 to 109
+/// measured), drains in `D = (B + E) * d` while consensus keeps committing, so the lag peaks below
+/// `r * D`: about 220 rounds at `E` = 0 and 560 at `E` = 109, the latter only if execution made no
+/// progress during the drain. The measured peaks were 172 to 300 rounds. At the earlier 1.5 s, `B`
+/// alone was about 150 outputs and `D` about 220 s, and the lag reached the bound.
+const SLOW_EXECUTION_DELAY_MS: &str = "500";
 
 /// How long [`test_slow_execution_stays_active`] watches the slowed validator under load.
 const SLOW_EXECUTION_WINDOW: Duration = Duration::from_secs(60);
@@ -1936,11 +1946,9 @@ const SLOW_EXECUTION_POLL: Duration = Duration::from_secs(2);
 /// Time limit for the slowed validator's execution to return inside the activity window once the
 /// load stops.
 ///
-/// The backlog drains at 1.5 s an output with batches, and the pool still feeds batches for a while
-/// after the load stops, so the drain time follows the cadence of the run: the 190- and 226-round
-/// backlogs of two measured runs took 120 s and 176 s. The limit leaves more than twice the
-/// slower.
-const SLOW_EXECUTION_CATCH_UP: Duration = Duration::from_secs(420);
+/// The drain `D` of [`SLOW_EXECUTION_DELAY_MS`] took 37 to 98 s in the measured runs (35 to 90 s
+/// by its arithmetic). The limit leaves more than twice the slowest, for a busier host.
+const SLOW_EXECUTION_CATCH_UP: Duration = Duration::from_secs(240);
 
 /// Prometheus series of node mode changes, labelled `to` and `reason`.
 const MODE_TRANSITIONS: &str = "tn_node_mode_transitions_total";
@@ -1953,6 +1961,10 @@ const EXEC_LAG_ROUNDS: &str = "tn_primary_consensus_exec_lag_rounds";
 
 /// Prometheus gauge of a node's committed round.
 const COMMITTED_ROUND: &str = "tn_primary_committed_round";
+
+/// Prometheus counter of the commits a node held because its execution fell more than
+/// `tn_types::MAX_COMMIT_RUN_AHEAD_ROUNDS` behind them.
+const RUN_AHEAD_BLOCKED: &str = "tn_primary_commit_run_ahead_blocked_total";
 
 /// The warning a node logs when it demotes itself for falling behind consensus.
 const BEHIND_LOG: &str = "we are behind";
@@ -1968,7 +1980,11 @@ const BEHIND_LOG: &str = "we are behind";
 /// [`SLOW_EXECUTION_WINDOW`] the node is `CvvActive` at every poll, counts no demotion and logs no
 /// [`BEHIND_LOG`], while its execution lag exceeds the window at least once and every node's
 /// committed round advances by more than the window. Once the load stops, its execution returns
-/// inside the window.
+/// inside the window while the node stays `CvvActive` at every poll and its commit run-ahead gate
+/// never holds a commit ([`RUN_AHEAD_BLOCKED`] stays 0). A held commit freezes the committed round
+/// and demotes the node `outside_gc_window` by design, so the test sizes the backlog to peak well
+/// below `MAX_COMMIT_RUN_AHEAD_ROUNDS` (see [`SLOW_EXECUTION_DELAY_MS`]); a zero count tells a
+/// caught-up node from one the gate demoted.
 ///
 /// This fails on the base, where Bullshark waited for local execution before each commit: the
 /// slowed node's committed round froze with its execution, and the first certificate more than 15
@@ -2060,25 +2076,12 @@ fn check_slow_execution_stays_active(
     while start.elapsed() < SLOW_EXECUTION_WINDOW {
         std::thread::sleep(SLOW_EXECUTION_POLL);
         polls += 1;
-        let at = start.elapsed().as_secs();
-        let mode = get_node_mode(slow_url)
-            .wrap_err_with(|| format!("node {SLOW_NODE} mode at {at}s, poll {polls}"))?;
-        let body = scrape_metrics(slow_metrics)?;
-        let lag = labeled_sample(&body, EXEC_LAG_ROUNDS, &[])?
-            .ok_or_else(|| eyre::eyre!("node {SLOW_NODE} serves no {EXEC_LAG_ROUNDS}"))?;
-        max_lag = max_lag.max(lag);
-        let active = labeled_sample(&body, "tn_node_mode", &[r#"mode="cvv_active""#])?;
-        let demotions = labeled_sample(&body, MODE_TRANSITIONS, &[TO_INACTIVE])?.unwrap_or(0.0);
-        eyre::ensure!(
-            mode == NodeMode::CvvActive && active == Some(1.0) && demotions == 0.0,
-            "node {SLOW_NODE} left CvvActive {at}s into the load (poll {polls}): mode {mode:?}, \
-             tn_node_mode{{mode=\"cvv_active\"}} {active:?}, {demotions} demotions ({}), exec lag \
-             {lag} rounds (max {max_lag})",
-            samples_of(&body, MODE_TRANSITIONS)
-        );
+        let at = format!("{}s into the load (poll {polls})", start.elapsed().as_secs());
+        max_lag = max_lag.max(poll_slow_node(slow_url, slow_metrics, &at)?);
     }
 
     let end_rounds = committed_rounds()?;
+    let loaded = start.elapsed();
     let advanced = start_rounds.iter().zip(&end_rounds).map(|(s, e)| e - s).collect::<Vec<_>>();
     eyre::ensure!(
         advanced.iter().all(|rounds| *rounds > window),
@@ -2101,29 +2104,60 @@ fn check_slow_execution_stays_active(
         behind.first()
     );
 
+    // the backlog drains while consensus keeps committing, so the lag still grows until the last
+    // output with batches executes: every poll of the drain must also find the node active and
+    // its run-ahead gate idle
     stop.store(true, Ordering::Relaxed);
     let stopped = Instant::now();
-    wait_until_blocking(
-        SLOW_EXECUTION_CATCH_UP,
-        &format!("node {SLOW_NODE}'s execution to return inside the activity window"),
-        || {
-            Ok(scrape_metrics(slow_metrics)
-                .ok()
-                .and_then(|body| labeled_sample(&body, EXEC_LAG_ROUNDS, &[]).ok().flatten())
-                .is_some_and(|lag| lag < window))
-        },
-    )?;
+    let mut peak_lag = 0.0_f64;
+    loop {
+        let at = format!("{}s after the load stopped", stopped.elapsed().as_secs());
+        let lag = poll_slow_node(slow_url, slow_metrics, &at)?;
+        peak_lag = peak_lag.max(lag);
+        if lag < window {
+            break;
+        }
+        eyre::ensure!(
+            stopped.elapsed() < SLOW_EXECUTION_CATCH_UP,
+            "node {SLOW_NODE}'s execution did not return inside the {window}-round activity \
+             window within {SLOW_EXECUTION_CATCH_UP:?} of the load stopping: exec lag {lag} \
+             rounds (peak {peak_lag})"
+        );
+        std::thread::sleep(SLOW_EXECUTION_POLL);
+    }
     let catch_up = stopped.elapsed();
-    let mode = get_node_mode(slow_url)?;
-    eyre::ensure!(
-        mode == NodeMode::CvvActive,
-        "node {SLOW_NODE} is {mode:?} after its execution caught up"
-    );
+    let rate = advanced[SLOW_NODE] / loaded.as_secs_f64();
     Ok(format!(
-        "max exec lag {max_lag} rounds (window {window}) over {polls} polls, committed rounds \
-         advanced {advanced:?}, caught up {catch_up:?} after the load stopped, {} transfers sent",
+        "{rate:.1} rounds/s under load, max exec lag {max_lag} rounds (window {window}) over \
+         {polls} polls, committed rounds advanced {advanced:?}, peak exec lag {peak_lag} rounds \
+         and no run-ahead hold while the backlog drained, caught up {catch_up:?} after the load \
+         stopped, {} transfers sent",
         sent.load(Ordering::Relaxed)
     ))
+}
+
+/// One poll of [`SLOW_NODE`] for [`check_slow_execution_stays_active`], `at` naming when for an
+/// error: its execution lag in rounds, once its mode, its mode gauge and its demotion count show
+/// it `CvvActive` and [`RUN_AHEAD_BLOCKED`] shows that its commits were never held.
+///
+/// The counter is required to be served, so a renamed series cannot pass for zero holds.
+fn poll_slow_node(url: &str, metrics_addr: &str, at: &str) -> eyre::Result<f64> {
+    let mode = get_node_mode(url).wrap_err_with(|| format!("node {SLOW_NODE} mode {at}"))?;
+    let body = scrape_metrics(metrics_addr)?;
+    let lag = labeled_sample(&body, EXEC_LAG_ROUNDS, &[])?
+        .ok_or_else(|| eyre::eyre!("node {SLOW_NODE} serves no {EXEC_LAG_ROUNDS}"))?;
+    let held = labeled_sample(&body, RUN_AHEAD_BLOCKED, &[])?
+        .ok_or_else(|| eyre::eyre!("node {SLOW_NODE} serves no {RUN_AHEAD_BLOCKED}"))?;
+    let active = labeled_sample(&body, "tn_node_mode", &[r#"mode="cvv_active""#])?;
+    let demotions = labeled_sample(&body, MODE_TRANSITIONS, &[TO_INACTIVE])?.unwrap_or(0.0);
+    eyre::ensure!(
+        mode == NodeMode::CvvActive && active == Some(1.0) && demotions == 0.0 && held == 0.0,
+        "node {SLOW_NODE} left CvvActive or held a commit {at}: mode {mode:?}, \
+         tn_node_mode{{mode=\"cvv_active\"}} {active:?}, {demotions} demotions ({}), {held} \
+         commits held by the run-ahead gate, exec lag {lag} rounds",
+        samples_of(&body, MODE_TRANSITIONS)
+    );
+    Ok(lag)
 }
 
 /// The sum of every sample of the prometheus series `name` in the scrape `body` whose label set
