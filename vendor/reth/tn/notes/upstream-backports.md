@@ -54,6 +54,7 @@ Severity below is for TN, which differs from upstream's in places. Relevant TN f
 | 6d718d0c2 | TN-0040 | `trace_filter`'s range error names the configured limit, not 100 | tn-reth namespace test |
 | bf1db83ae | TN-0041 | pool validation workers no longer hold the job queue's lock while validating, so `--txpool.additional-validation-tasks` runs in parallel | upstream test; txpool 228/228 |
 | 8861e2724 | TN-0042 | transactions a lower base fee promotes in `set_block_info` reach pending listeners (`newPendingTransactions`) | TN test fails without the fix; txpool 229/229 |
+| 62808bd06 | TN-0043 | the pool admits a sender whose code hash is the empty hash (an EOA to the EVM) | upstream test; txpool 230/230 |
 
 ## Open
 
@@ -90,8 +91,8 @@ Severity below is for TN, which differs from upstream's in places. Relevant TN f
 
 ### Low
 
-0e14f1a8a and a68f9e19f (IPC loop spin; max subscriptions per connection), 10d130182 (pool gas
-limit at startup), 62808bd06 (empty code hash senders), e7ebeb869 (partial receipts), 1a6ba945a
+0e14f1a8a and a68f9e19f (IPC loop spin; max subscriptions per connection), e7ebeb869 (partial
+receipts), 1a6ba945a
 (codecs decode), 078c22d5f (iterative BlockState drop), 44a74f9ea (reject conflicting
 transaction fees in call requests), 33b785d97 (`0x` data for empty reverts), 9580b7fc1 (zstd
 0.13 compatibility test, test only). 1a6ba945a and 078c22d5f are on the execution path
@@ -110,7 +111,9 @@ so the checkpoints it reads are unset),
 00f9bd2a9 (`tx_hash()` instead of `trie_hash()`; equal for Ethereum transaction types, so it only
 saves a re-hash),
 db17c899c (`reth db migrate-v2`; TN has no reth CLI), adfcad70c (edits a pruned-anchor check
-v1.11.4 does not have).
+v1.11.4 does not have), 10d130182 (the pool's starting block gas limit from the tip header instead
+of 30M; every TN header carries the genesis gas limit, which is 30M on both chains, so nothing
+changes).
 From the 2026-11-06 survey: 6624ff8a9 (default `eth_call` gas cap; Amsterdam only), b2f6dc910,
 c0e8be419, 2a343e40f, 6f7896f9c and 19d390ad9 (evm2, the next sync), 65977b8e1 (secp256k1
 bump; a third-party version change on the fork list, and the devp2p crates are not carried),

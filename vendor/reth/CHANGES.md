@@ -498,6 +498,17 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   a transaction below the base fee, lowers the fee, and expects its hash on a pending listener;
   it fails without the change. *Upstream*: n/a (upstream commit).
 
+- **TN-0043** — Backport 62808bd06: the pool admits senders whose code hash is the empty hash.
+  *Kind*: backport.
+  *Files*: `crates/transaction-pool/src/validate/eth.rs` (the sender-is-a-contract check and
+  upstream's test; the pick's test-module conflicts are with upstream tests added after v1.11.4,
+  which are not taken).
+  *Why*: an account can carry `Some(KECCAK_EMPTY)` as its code hash, as an account with empty
+  code in a genesis allocation does. The pool refused its transactions as a contract's, while the
+  EVM treats it as an EOA (EIP-3607 checks for code, not for a hash). Pool admission only: no batch
+  or block validity change. *Tests*: upstream's `accepts_sender_with_empty_bytecode`;
+  transaction-pool 230/230. *Upstream*: n/a (upstream commit).
+
 ## TN fixes (not from an upstream commit)
 
 - **TN-0036** — Debug traces hold their tracing permit until their blocking task ends. *Kind*:
