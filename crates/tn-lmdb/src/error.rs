@@ -53,8 +53,8 @@ pub enum Error {
     #[error("tn-lmdb: append of a key that does not sort after the table's last key")]
     AppendOutOfOrder,
     /// An insert ([`crate::RwTxn::insert`], [`crate::RwCursor::insert`],
-    /// [`crate::TxnCursor::insert`]) of a key the table already holds. It is refused before
-    /// anything changes and does not latch.
+    /// [`crate::TxnCursor::insert`], [`crate::DupTxnCursor::insert`]) of a key the table already
+    /// holds. It is refused before anything changes and does not latch.
     #[error("tn-lmdb: insert of a key the table already holds")]
     KeyExists,
     /// No table with this name exists.
@@ -99,9 +99,9 @@ pub enum Error {
     /// latch.
     #[error("tn-lmdb: the environment is open read-only")]
     ReadOnly,
-    /// A detached cursor ([`crate::TxnCursor`]) used with a write transaction other than the one
-    /// that made it (a later one, even one that reuses the transaction id of an aborted one). It
-    /// changes nothing and does not latch.
+    /// A detached cursor ([`crate::TxnCursor`], [`crate::DupTxnCursor`]) used with a write
+    /// transaction other than the one that made it (a later one, even one that reuses the
+    /// transaction id of an aborted one). It changes nothing and does not latch.
     #[error("tn-lmdb: a cursor used with a write transaction other than its own")]
     WrongTxn,
 }

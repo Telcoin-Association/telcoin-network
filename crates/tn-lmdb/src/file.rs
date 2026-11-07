@@ -46,6 +46,7 @@
 //! failed trim keeps the slack. A writer that opens such a file does not take the slack as its
 //! own ([`PageFile::distrust_tail`]): a sparse copy or restore may have made it holes. Its first
 //! growth past the pages in use truncates the file to them and grows from there, preallocated.
+//! The cut covers the tail only: holes such a copy made inside the pages in use stay.
 //!
 //! ## Durability
 //!
@@ -298,7 +299,8 @@ impl PageFile {
     /// where a first store on a full disk is a SIGBUS. The first growth past `used`
     /// ([`Self::grow`]) truncates the file to `used` and grows it again, preallocated. Writes
     /// nothing now. `used` covers every page any state the file holds names; past the file's
-    /// length it changes nothing.
+    /// length it changes nothing. The cut covers the tail only: holes a sparse copy made inside
+    /// the pages in use stay, and nothing allocates them again (README, Platform notes).
     pub(crate) fn distrust_tail(&mut self, used: u64) {
         self.backed = self.backed.min(used);
     }

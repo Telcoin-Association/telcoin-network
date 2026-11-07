@@ -1922,11 +1922,20 @@ fn tree_cursor_stays_small() {
     );
 }
 
-/// A write transaction's detached cursor keeps the size it had before its staleness fields moved
-/// into the shared tracker (in a test build, which adds its reseek counter).
+/// A write transaction's detached cursor is its path (a `TreeCursor`), the table's root as of its
+/// last call (a `TreeRoot`), its saved-key and deleted-key buffers, the staleness tracker the dup
+/// cursor shares (a table handle and six words: the transaction's serial and schema counter, the
+/// remembered record index, an `Option` of two, the count of records scanned, the table's write
+/// stamp), and one word for the deleted flag and a test build's reseek counter: a field added to
+/// the cursor or its tracker fails this bound, which names the parts it adds up.
 #[test]
-fn txn_cursor_size_unchanged() {
-    assert_eq!(size_of::<crate::TxnCursor>(), 464, "TxnCursor size");
+fn txn_cursor_stays_small() {
+    let word = size_of::<u64>();
+    let tracker = size_of::<Table>() + 6 * word;
+    let parts =
+        size_of::<TreeCursor>() + size_of::<TreeRoot>() + 2 * size_of::<Vec<u8>>() + tracker + word;
+    let size = size_of::<crate::TxnCursor>();
+    assert!(size <= parts, "TxnCursor is {size} bytes, its parts {parts}");
 }
 
 // ---- seeks from the cursor's position ----

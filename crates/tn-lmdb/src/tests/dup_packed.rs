@@ -1093,10 +1093,11 @@ fn measure(shape: &SizeShape, form: SizeForm, rows: &[(Vec<u8>, Vec<u8>)], appen
 /// File size by packed-set bound: a state of many small contracts, each an outer key with a few
 /// rows, stored as a composite plain table, a dup table that never packs, and dup tables packing at
 /// half the default bound of the outer key and at the default ([`DupOptions::PACKED_DEFAULT`]).
-/// Three shapes (PlainStorageState's widths and short values, HashedStorages', StoragesTrie's
-/// longer values), 20,000 contracts of 1 to 20 rows, written by random puts and by ascending
-/// appends; then, for the first shape, 5,000 contracts of a fixed row count at the counts where a
-/// bound changes the form. Prints each state's pages by tree and kind, and the file's; guards, at
+/// Three shapes (20-byte outer keys with 32-byte subkeys and values of 1 to 32 bytes, 32-byte outer
+/// keys with the same rows, and 32-byte outer keys with 65-byte subkeys and values of 60 to 140
+/// bytes), 20,000 contracts of 1 to 20 rows, written by random puts and by ascending appends;
+/// then, for the first shape, 5,000 contracts of a fixed row count at the counts where a bound
+/// changes the form. Prints each state's pages by tree and kind, and the file's; guards, at
 /// random order for the first shape, that the default stays within 1.2x composite and that never
 /// packing costs at least 2.5x.
 #[test]

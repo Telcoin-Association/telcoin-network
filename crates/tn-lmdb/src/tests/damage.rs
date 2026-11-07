@@ -531,10 +531,11 @@ fn put_until_private(txn: &mut RwTxn, w: &Table, p: u32, len: usize) -> u32 {
 /// transaction, `drop_table` and `clear_table` of `u` meet `L` private to the transaction under
 /// `u`'s published root (`tree_pages` reads only `u`'s first leaf, but checks every child's
 /// provenance): `Corrupt`, which latches, with nothing freed, and every `w` key still reads back
-/// in the transaction (a get of `u`'s is its committed value or `Corrupt`: `w`'s puts overwrote
-/// `L`). Freeing `L` would pool it at once: the next put would take it for another
-/// table and `w`'s gets would return that table's entries, or, for a run page, the commit would
-/// stamp `L` as a page of its own.
+/// in the transaction. `w`'s puts overwrote `L` in place, so once the transaction is gone a get
+/// of `u`'s keys in `L` is `Corrupt` (naming `L`), and of the others their committed values.
+/// Freeing `L` would pool it at once: the next put would take it for another table and `w`'s gets
+/// would return that table's entries, or, for a run page, the commit would stamp `L` as a page of
+/// its own.
 #[test]
 fn a_free_of_a_tree_refuses_a_leaf_this_transaction_holds_for_another() {
     let fx = fixture();
@@ -572,12 +573,18 @@ fn a_free_of_a_tree_refuses_a_leaf_this_transaction_holds_for_another() {
             // `w`'s puts overwrote `L` in place (the damage), so `u`'s keys in `L` are refused.
             let ro = env.begin_ro().expect("ro");
             let u = ro.open_table("u").expect("open").expect("u");
+            let mut refused = 0;
             for (k, want) in &fx.state["u"] {
                 match ro.get(&u, k) {
                     Ok(got) => assert!(got == Some(&want[..]), "{what}: u's key {k:?}"),
-                    Err(e) => assert!(matches!(e, Error::Corrupt(_)), "{what}: {e}"),
+                    Err(Error::Corrupt(e)) => {
+                        assert!(e.contains(&format!("page {leaf} ")), "{what}: {e}");
+                        refused += 1;
+                    }
+                    Err(e) => panic!("{what}: u's key {k:?}: {e}"),
                 }
             }
+            assert!(refused > 0, "{what}: u's keys in L are refused");
             drop(ro);
             drop(env);
             fs::remove_file(&path).expect("remove");

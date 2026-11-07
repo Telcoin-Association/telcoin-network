@@ -8,7 +8,7 @@ use std::{collections::BTreeMap, fs, sync::Arc};
 
 use super::{
     damage::{restamped, tree, Stage, P},
-    dup::{dup_key, restamp_cell, restamp_record, OPTIONS},
+    dup::{dup_key, restamp_cell, restamp_record, COLD, HOT, OPTIONS},
     *,
 };
 use crate::{
@@ -16,12 +16,6 @@ use crate::{
     tree::{read::descend, PageRead as _, TreeRoot},
     Error,
 };
-
-/// The outer key of the fixture's large nested tree: two levels and a value in a run.
-pub(crate) const HOT: u32 = 7;
-
-/// An outer key of the fixture with a nested tree of one leaf.
-pub(crate) const COLD: u32 = 8;
 
 /// The outer keys of the fixture's dup table: enough for an outer tree of two levels.
 const OUTER: u32 = 400;
@@ -32,13 +26,13 @@ const K: usize = OPTIONS.key_len as usize;
 /// A cleanly closed file holding dup table `d` (of [`OPTIONS`]: outer keys 0 to [`OUTER`], 1 to 3
 /// rows each but [`HOT`]'s 300 and its run) and plain table `p` (two levels) beside it, and a
 /// dropped table's pages in a free tree of one leaf.
-pub(crate) struct DupFixture {
-    pub(crate) dir: TempDir,
-    pub(crate) path: PathBuf,
-    pub(crate) plain: Rows,
-    pub(crate) dup: Rows,
+pub(super) struct DupFixture {
+    pub(super) dir: TempDir,
+    pub(super) path: PathBuf,
+    pub(super) plain: Rows,
+    pub(super) dup: Rows,
     /// Each outer key's outer leaf and the nested root its cell names.
-    pub(crate) cells: BTreeMap<u32, (u32, TreeRoot)>,
+    pub(super) cells: BTreeMap<u32, (u32, TreeRoot)>,
     /// A leaf of `p` and a key it holds.
     plain_leaf: (u32, Vec<u8>),
     /// The leaf of [`HOT`]'s nested tree that holds its first rows.
@@ -51,7 +45,7 @@ pub(crate) struct DupFixture {
     next_txn: u32,
 }
 
-pub(crate) fn dup_fixture() -> DupFixture {
+pub(super) fn dup_fixture() -> DupFixture {
     let (dir, path) = temp("tn_lmdb_dup_sweep");
     let (mut plain, mut dup) = (Rows::new(), Rows::new());
     let env = open(&path, SyncMode::Durable);
@@ -132,7 +126,7 @@ pub(crate) fn dup_fixture() -> DupFixture {
 
 /// Edit, in place, the cell of `key` in leaf `pgno` of the file at `path` (`edit` takes the page
 /// and the cell's offset), the leaf's CRC stamped again: a cell no leaf mutator writes.
-pub(crate) fn raw_cell(path: &Path, pgno: u32, key: &[u8], edit: impl FnOnce(&mut [u8], usize)) {
+pub(super) fn raw_cell(path: &Path, pgno: u32, key: &[u8], edit: impl FnOnce(&mut [u8], usize)) {
     restamped(path, pgno, |page| {
         let Find::Found { index, .. } = page::leaf_find(page, key).expect("find") else {
             panic!("{key:02x?} is in leaf {pgno}");
@@ -159,7 +153,7 @@ fn empty_subkey(path: &Path, pgno: u32) {
 /// of each through a detached cursor (as [`rewrite_through_cursors`]) and put to it, fill a new
 /// table, commit, and check. The first error must be `Corrupt` from `stage`
 /// and the environment latched (read-only: by the operation that returned it); writes fail.
-pub(crate) fn sweep_dup(
+pub(super) fn sweep_dup(
     env: &Env,
     plain: &Rows,
     dup: &Rows,
@@ -174,7 +168,7 @@ pub(crate) fn sweep_dup(
 /// [`sweep_dup`] whose write stage puts to every fifth row of `written` in `d`, not of `dup`: a
 /// hidden key's rows, left out of the gets and the scan, can still be the write stage's.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn sweep_dup_writing(
+pub(super) fn sweep_dup_writing(
     env: &Env,
     plain: &Rows,
     dup: &Rows,
@@ -292,7 +286,7 @@ fn rewrite_through_cursors(
 /// One damage case: its name, the stage of the write-side sweep and of the read-only sweep that
 /// first meet it, the outer key whose rows the sweeps leave alone (so a later use meets it), and
 /// the damage.
-pub(crate) type Case<'a> = (&'a str, Stage, Stage, Option<u32>, Box<dyn Fn(&Path) + 'a>);
+pub(super) type Case<'a> = (&'a str, Stage, Stage, Option<u32>, Box<dyn Fn(&Path) + 'a>);
 
 /// The cases over `fx`.
 fn cases(fx: &DupFixture) -> Vec<Case<'_>> {

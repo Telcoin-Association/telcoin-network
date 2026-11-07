@@ -1,8 +1,8 @@
 //! `current_with_key_tail` on every cursor kind ([`crate::Cursor`], [`crate::RoCursor`],
-//! [`crate::TxnCursor`]) over a table of composite keys (`key ‖ subkey`, as a dup-sort table's
-//! rows are stored) holding inline values, empty ones and values in overflow runs: at each entry
-//! the key, and the key's last bytes joined to an inline value as one slice of the page, or an
-//! overflow value apart, against what `current` returns.
+//! [`crate::TxnCursor`]) over a table of composite keys (`key ‖ subkey`, as a composite-key table
+//! holds a key's rows) holding inline values, empty ones and values in overflow runs: at each
+//! entry the key, and the key's last bytes joined to an inline value as one slice of the page, or
+//! an overflow value apart, against what `current` returns.
 
 use std::sync::Arc;
 

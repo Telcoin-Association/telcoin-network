@@ -402,7 +402,7 @@ fn older_state_stays_recoverable(base: &Base) {
     disk_model::untrack(&path);
     // Damage the newest meta (txn `base.txn`, in the slot the commit was not writing).
     let file = fs::OpenOptions::new().read(true).write(true).open(&path).expect("open");
-    let at = (1 - slot) as u64 * 4096 + 20;
+    let at = (1 - slot) as u64 * u64::from(base.page_size) + 20;
     let mut b = [0];
     file.read_exact_at(&mut b, at).expect("read");
     file.write_all_at(&[b[0] ^ 0x10], at).expect("write");

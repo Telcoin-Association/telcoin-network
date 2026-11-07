@@ -23,7 +23,7 @@ use crate::{
     tree::{
         read::descend,
         test_harness::{walk_outer_tree, walk_packing_tree, ReportSeed, Rng},
-        PageRead as _, TreeRoot,
+        PageRead as _, TreeRoot, MAX_TREE_PAGES,
     },
     CheckReport, DupOptions, Env, EnvOptions, Error, ReadTxn, Result, TableStat,
 };
@@ -1298,10 +1298,12 @@ fn dup_totals_follow_every_change() {
     assert_rows("after a reopen", ro.dup_rows_for_test(&d), get, &model);
 }
 
-/// The outer key of [`damaged`]'s large nested tree, of two levels with a value in a run.
+/// The outer key of the dup fixtures' large nested tree, of two levels with a value in a run:
+/// [`damaged`]'s and `dup_sweep::dup_fixture`'s (300 rows and the run in each).
 pub(super) const HOT: u32 = 7;
 
-/// An outer key of [`damaged`]'s with a nested tree of one leaf.
+/// An outer key of the dup fixtures ([`damaged`], `dup_sweep::dup_fixture`) with a nested tree of
+/// one leaf.
 pub(super) const COLD: u32 = 8;
 
 /// A cleanly closed file `dir/db` holding dup table `d` (of [`OPTIONS`]): outer keys 0 to 39 with
@@ -1418,6 +1420,59 @@ fn check_refuses_dup_totals_off_by_one() {
         assert_reads(field, &path, &model);
         let message = format!("{field} {was} in its trees, not the {} its record counts", was + 1);
         assert_check_refuses(field, &path, &["check: table \"d\": ", &message]);
+    }
+}
+
+/// A dup write whose record cannot count the key's nested tree is `Corrupt`, latches, and changes
+/// nothing the transaction then reads, each op on a fresh copy. With a row total one short of
+/// [`HOT`]'s tree, a put into that tree leaves the row unwritten and a delete from it leaves the
+/// row there. With the nested overflow pages at the most a file holds (every record rule kept),
+/// a new key's put of a value in a run leaves no cell for the key, in an outer leaf already
+/// private to the transaction (the delete of key 0's one row before it), which a cell written
+/// before the refusal would have changed in place.
+#[test]
+fn a_dup_write_its_totals_cannot_count_changes_nothing() {
+    let short = TempDir::with_prefix("tn_lmdb_dup_totals_short").expect("temp dir");
+    let (short, model) = damaged(short.path(), |path, cells| {
+        let hot = cells[&HOT].1.entries;
+        restamp_record(path, |record| record.dup.as_mut().expect("dup").nested_entries = hot - 1);
+    });
+    let full = TempDir::with_prefix("tn_lmdb_dup_totals_full").expect("temp dir");
+    let (full, _) = damaged(full.path(), |path, _| {
+        restamp_record(path, |record| {
+            let outer = record.root.pages();
+            let dup = record.dup.as_mut().expect("dup");
+            let others = u64::from(dup.nested_branch_pages) + u64::from(dup.nested_leaf_pages);
+            let most = MAX_TREE_PAGES - outer - others;
+            dup.nested_overflow_pages = u32::try_from(most).expect("a page count");
+        });
+    });
+    let run = vec![0x5a; 100 * 4096];
+    for (op, path, key) in [
+        ("put", &short, dup_key(HOT, b"new")),
+        ("delete", &short, dup_key(HOT, b"big")),
+        ("new key", &full, dup_key(40, b"new")),
+    ] {
+        let (_dir, env) = copy_of(path);
+        let mut txn = env.begin_rw().expect("rw");
+        let d = txn.open_table("d").expect("open").expect("d");
+        let result = match op {
+            "put" => txn.put(&d, &key, b"value"),
+            "delete" => txn.delete(&d, &key).map(drop),
+            _ => {
+                assert!(txn.delete(&d, &dup_key(0, &[0])).expect("delete"), "key 0's one row");
+                txn.put(&d, &key, &run)
+            }
+        };
+        let k = key[..4].to_vec();
+        let message = format!("totals do not count the nested tree of key {k:02x?}");
+        assert!(
+            matches!(&result, Err(Error::Corrupt(m)) if m.contains(&message)),
+            "{op}: {result:?}"
+        );
+        assert!(env.failure().is_some(), "{op}: latched");
+        let want = model.get(&key).map(Vec::as_slice);
+        assert_eq!(txn.get(&d, &key).expect("get"), want, "{op}: the row as it was");
     }
 }
 

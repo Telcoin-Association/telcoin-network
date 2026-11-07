@@ -6,8 +6,9 @@
 //! the doc comments, which speak of this crate's B+tree pages where that file speaks of its digest
 //! index; the `allow(dead_code)` outside tests on [`check_crc`] and [`add_crc32`], which only the
 //! unit tests call here; and `#[inline]` on [`crc_is_zero`], the dirty check of every page fetch,
-//! which the reth adapter compiles inlined (without it, a cross-crate call per fetch: see
-//! `CLAUDE.md`'s `#[inline]` rule). A sync from that file keeps all three.
+//! which a crate instantiating the engine's read paths compiles inlined (without it, a
+//! cross-crate call per fetch: see `CLAUDE.md`'s `#[inline]` rule). A sync from that file keeps
+//! all three.
 
 /// A CRC of exactly zero is indistinguishable from the all-zero "dirty" sentinel [`zero_crc`]
 /// writes, so buffers whose validity is classified by [`crc_state`] (the B+tree pages) are

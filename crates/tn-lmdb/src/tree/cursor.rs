@@ -42,9 +42,10 @@
 //! path's branches again; a leaf already checked in full is not checked again, as a step does
 //! not check it again.
 //!
-//! A write through a cursor at an entry passes the cursor's slots to the write's descent as a
-//! routing hint ([`TreeCursor::hint`], [`write::Hint`]): slots only, each one followed only where
-//! the key lies in the hinted child's range, with every check of the write's descent kept.
+//! A write through a detached cursor at an entry (a `TxnCursor`'s or a `DupTxnCursor`'s) passes
+//! the cursor's slots to the write's descent as a routing hint ([`TreeCursor::hint`],
+//! [`write::Hint`]): slots only, each one followed only where the key lies in the hinted child's
+//! range, with every check of the write's descent kept. An `RwCursor`'s writes pass none.
 
 use super::{read::tighten, write, PageRead, TreeRoot, MAX_HEIGHT};
 use crate::{
@@ -107,16 +108,12 @@ pub(crate) struct Values;
 impl CellRead for Values {
     type Out<'s> = &'s [u8];
 
-    /// [`PageRead::value`]'s body, matched here so that only a run reads the store: the borrowed
-    /// [`Cursor`]'s store is a trait object, on which a call to `value` is an indirect call
-    /// for every entry, an inline one too.
+    /// [`super::read_value`], [`PageRead::value`]'s body, called here, not through `value`, so
+    /// that only a run reads the store: the borrowed [`Cursor`]'s store is a trait object, on
+    /// which a call to `value` is an indirect call for every entry, an inline one too.
     #[inline(always)]
     fn read<'s, S: PageRead + ?Sized>(store: &'s S, val: Val<'s>) -> Result<&'s [u8]> {
-        match val {
-            Val::Inline(v) => Ok(v),
-            Val::Overflow(ovf) => store.overflow(ovf),
-            Val::Nested(root) => Err(page::nested_error(root)),
-        }
+        super::read_value(store, val)
     }
 }
 

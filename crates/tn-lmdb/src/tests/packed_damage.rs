@@ -11,8 +11,8 @@ use std::{collections::BTreeMap, fs, path::Path, sync::Arc};
 
 use super::{
     damage::{tree, Stage},
-    dup::{dup_key, restamp_cell, restamp_encoded, restamp_record},
-    dup_sweep::{dup_fixture, raw_cell, sweep_dup_writing, Case, COLD, HOT},
+    dup::{dup_key, restamp_cell, restamp_encoded, restamp_record, COLD, HOT},
+    dup_sweep::{dup_fixture, raw_cell, sweep_dup_writing, Case},
     *,
 };
 use crate::{

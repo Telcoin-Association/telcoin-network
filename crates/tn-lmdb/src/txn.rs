@@ -26,7 +26,7 @@ use crate::{
     page::{self, Search, Val},
     stats::elapsed_ns,
     tree::{
-        cursor::{self, Cursor, Entry, KeyTail, State, TreeCursor},
+        cursor::{self, Cells, Cursor, Entry, KeyTail, State, TreeCursor},
         dup_cursor::{
             nested_cell, DupHint, DupWalk, NestedRoots, Pick, PickTail, PickValue, Row, NO_DUP_HINT,
         },
@@ -85,6 +85,8 @@ const _: fn() = || {
     send_sync::<RoTxn>();
     send_sync::<RoCursor>();
     send_sync::<TxnCursor>();
+    send_sync::<DupRoCursor>();
+    send_sync::<DupTxnCursor>();
     send_sync::<Table>();
 };
 
@@ -488,21 +490,59 @@ fn apply_delta(
     before: &TreeRoot,
     after: &TreeRoot,
 ) -> Result<()> {
-    let pages = |n: u32, before: u32, after: u32| n.checked_sub(before)?.checked_add(after);
-    let moved = (
-        dup.nested_entries.checked_sub(before.entries).and_then(|n| n.checked_add(after.entries)),
-        pages(dup.nested_branch_pages, before.branch_pages, after.branch_pages),
-        pages(dup.nested_leaf_pages, before.leaf_pages, after.leaf_pages),
-        pages(dup.nested_overflow_pages, before.overflow_pages, after.overflow_pages),
-    );
-    let (Some(entries), Some(branch), Some(leaf), Some(overflow)) = moved else {
-        return Err(totals_error(table, k));
-    };
-    dup.nested_entries = entries;
-    dup.nested_branch_pages = branch;
-    dup.nested_leaf_pages = leaf;
-    dup.nested_overflow_pages = overflow;
-    Ok(())
+    OtherTrees::of(dup, table, k, before)?.with(dup, table, k, after)
+}
+
+/// A dup table's nested rows and pages less one key's tree: the first half of [`apply_delta`],
+/// which a write into the key's tree takes before it changes anything, so that a record that
+/// cannot count the tree changes nothing; the second half adds the tree's new counts once it is
+/// written ([`Self::with`]).
+#[derive(Clone, Copy)]
+struct OtherTrees {
+    entries: u64,
+    branch_pages: u32,
+    leaf_pages: u32,
+    overflow_pages: u32,
+}
+
+impl OtherTrees {
+    /// The totals of `dup` less nested tree `root`'s (of outer key `k` in `table`):
+    /// [`totals_error`] if `dup` counts fewer rows or pages of a kind than `root` holds.
+    #[inline(always)]
+    fn of(dup: &DupRecord, table: &Table, k: &[u8], root: &TreeRoot) -> Result<Self> {
+        let less = (
+            dup.nested_entries.checked_sub(root.entries),
+            dup.nested_branch_pages.checked_sub(root.branch_pages),
+            dup.nested_leaf_pages.checked_sub(root.leaf_pages),
+            dup.nested_overflow_pages.checked_sub(root.overflow_pages),
+        );
+        let (Some(entries), Some(branch_pages), Some(leaf_pages), Some(overflow_pages)) = less
+        else {
+            return Err(totals_error(table, k));
+        };
+        Ok(Self { entries, branch_pages, leaf_pages, overflow_pages })
+    }
+
+    /// Store these totals plus nested tree `root`'s in `dup`. Only a sum past its counter's type
+    /// is refused ([`totals_error`], `dup` unchanged): a record whose totals lie within one
+    /// write of that bound, which a write in place meets after its change to the tree.
+    #[inline(always)]
+    fn with(self, dup: &mut DupRecord, table: &Table, k: &[u8], root: &TreeRoot) -> Result<()> {
+        let more = (
+            self.entries.checked_add(root.entries),
+            self.branch_pages.checked_add(root.branch_pages),
+            self.leaf_pages.checked_add(root.leaf_pages),
+            self.overflow_pages.checked_add(root.overflow_pages),
+        );
+        let (Some(entries), Some(branch), Some(leaf), Some(overflow)) = more else {
+            return Err(totals_error(table, k));
+        };
+        dup.nested_entries = entries;
+        dup.nested_branch_pages = branch;
+        dup.nested_leaf_pages = leaf;
+        dup.nested_overflow_pages = overflow;
+        Ok(())
+    }
 }
 
 /// Where a dup put left its row, for a [`DupTxnCursor`] to land on it ([`dup_put`]).
@@ -543,6 +583,8 @@ struct DupRemoved {
 /// table's over the logical key: the outer key must not sort before the table's last outer key,
 /// and with that key the subkey must sort after its last subkey. The writes into the key's tree
 /// and cell route by `hints` (a dup cursor's at a row of `k`, [`DupHint`]); a new key's by none.
+/// The totals are counted before the write, so a record that cannot count the key's tree changes
+/// nothing ([`OtherTrees`]; only a sum past its counter's type is met after a write in place).
 #[inline(never)]
 fn dup_put(
     work: &mut Work,
@@ -590,7 +632,8 @@ fn dup_put(
     };
     match entry {
         DupEntry::Nested(n) => {
-            let before = n.root;
+            // The other trees' totals first: a record that cannot count this tree changes nothing.
+            let others = OtherTrees::of(dup_mut(&mut w.record.dup), &w.table, k, &n.root)?;
             let placed = write::put_cached(
                 writer,
                 &mut n.root,
@@ -602,7 +645,7 @@ fn dup_put(
                 hints.nested,
             )?;
             n.changed = true;
-            apply_delta(dup_mut(&mut w.record.dup), &w.table, k, &before, &n.root)?;
+            others.with(dup_mut(&mut w.record.dup), &w.table, k, &n.root)?;
             work.set_dup_record(i, outer, trusted);
             return Ok(DupPlaced { created: false, slot: placed.slot() });
         }
@@ -614,7 +657,13 @@ fn dup_put(
         }
         DupEntry::Absent => {}
     }
-    // A key with no cell: its nested tree first, then the cell naming it, current from the start.
+    // A key with no cell: the totals in a copy, counted before anything the transaction reads
+    // changes, so a record that cannot count the new tree changes nothing (as `promote` does);
+    // then its nested tree (private pages nothing names yet), then the cell naming it, current
+    // from the start.
+    let mut totals = *dup_mut(&mut w.record.dup);
+    totals.nested_trees =
+        totals.nested_trees.checked_add(1).ok_or_else(|| totals_error(&w.table, k))?;
     let (mut root, mut root_trusted) = (TreeRoot::EMPTY, false);
     let mut cache = Box::<write::PathCache>::default();
     write::put_cached(
@@ -627,6 +676,7 @@ fn dup_put(
         PutKind::Upsert,
         write::NO_HINT,
     )?;
+    apply_delta(&mut totals, &w.table, k, &TreeRoot::EMPTY, &root)?;
     let outer_kind = if kind == PutKind::Append { PutKind::Append } else { PutKind::Insert };
     match write::put_outer_cell(
         writer,
@@ -648,9 +698,7 @@ fn dup_put(
         }
         Err(e) => return Err(e),
     }
-    let dup = dup_mut(&mut w.record.dup);
-    dup.nested_trees = dup.nested_trees.checked_add(1).ok_or_else(|| totals_error(&w.table, k))?;
-    apply_delta(dup, &w.table, k, &TreeRoot::EMPTY, &root)?;
+    w.record.dup = Some(totals);
     w.nested.insert(k.into(), Nested { root, trusted: root_trusted, changed: false, cache });
     work.set_dup_record(i, outer, trusted);
     Ok(DupPlaced { created: true, slot: None })
@@ -853,7 +901,9 @@ fn promote(
 /// The delete of the logical `key` from the dup table at `i` in [`Work::tables`]: from the key's
 /// nested tree, and the tree's outer cell with it when the delete empties the tree, or from its
 /// packed set ([`packed_delete`]). A nested key stays nested at any row count. The writes into
-/// the key's tree and cell route by `hints` (a dup cursor's at the row, [`DupHint`]).
+/// the key's tree and cell route by `hints` (a dup cursor's at the row, [`DupHint`]). The totals
+/// are counted before the write, so a record that cannot count the key's tree, or its tree among
+/// the nested trees, changes nothing ([`OtherTrees`]).
 #[inline(never)]
 fn dup_delete(work: &mut Work, i: usize, key: &[u8], hints: DupHint<'_>) -> Result<DupRemoved> {
     let missed = DupRemoved { found: false, emptied: false, slot: None };
@@ -892,7 +942,11 @@ fn dup_delete(work: &mut Work, i: usize, key: &[u8], hints: DupHint<'_>) -> Resu
             return Ok(removed);
         }
     };
-    let before = n.root;
+    // The other trees' totals, and their count should the delete empty this tree, first: a
+    // record that cannot count this tree changes nothing.
+    let dup = dup_mut(&mut w.record.dup);
+    let others = OtherTrees::of(dup, &w.table, k, &n.root)?;
+    let trees = dup.nested_trees.checked_sub(1).ok_or_else(|| totals_error(&w.table, k))?;
     let removed =
         write::delete_cached(writer, &mut n.root, &mut n.trusted, &mut n.cache, s, hints.nested)?;
     if !removed.found() {
@@ -901,8 +955,7 @@ fn dup_delete(work: &mut Work, i: usize, key: &[u8], hints: DupHint<'_>) -> Resu
     let mut slot = removed.slot();
     let after = n.root;
     n.changed = true;
-    let dup = dup_mut(&mut w.record.dup);
-    apply_delta(dup, &w.table, k, &before, &after)?;
+    others.with(dup, &w.table, k, &after)?;
     if after.is_empty() {
         // The delete freed the tree's last leaf: its cell and its entry go too.
         let removed = write::delete_outer_cell(
@@ -919,8 +972,7 @@ fn dup_delete(work: &mut Work, i: usize, key: &[u8], hints: DupHint<'_>) -> Resu
         }
         slot = removed.slot();
         w.nested.remove(k);
-        dup.nested_trees =
-            dup.nested_trees.checked_sub(1).ok_or_else(|| totals_error(&w.table, k))?;
+        dup.nested_trees = trees;
     }
     work.set_dup_record(i, outer, trusted);
     #[cfg(test)]
@@ -2722,9 +2774,9 @@ impl RwTxn {
     /// Store `value` under `key` in `table` as its new last entry: `key` must sort strictly after
     /// the table's last key (an empty table takes any key), else [`Error::AppendOutOfOrder`]. It is
     /// the fast way to load keys in ascending order: an append into the table's cached rightmost
-    /// leaf neither descends nor searches. The table's path cache holds the leaf of its last put or
-    /// append in this transaction (after an append split, the new right leaf) until a page is
-    /// allocated or freed; any other append descends. A refused append
+    /// leaf neither descends nor searches. The table's path cache holds the leaf of its last put,
+    /// append or delete in this transaction (after an append split, the new right leaf) until a
+    /// page is allocated or freed; any other append descends. A refused append
     /// ([`Error::AppendOutOfOrder`], [`Error::KeyTooLarge`], [`Error::ValueTooLarge`]) changes
     /// nothing and does not fail the environment.
     ///
@@ -3284,13 +3336,19 @@ impl RwCursor<'_> {
     /// table's last entry leaves it there). The cursor is left on the deleted entry's follower in
     /// the deleted state (see the type docs). A failed delete leaves the cursor unset.
     pub fn delete_current(&mut self) -> Result<bool> {
-        // The key goes into the deleted-key buffer, reused from the last delete.
-        let Self { txn, tree, deleted_key, .. } = self;
+        // The key alone (`Cells` reads no value, as `RwTxn::delete` reads none), into the
+        // deleted-key buffer reused from the last delete.
+        let Self { txn, tree, deleted, deleted_key, .. } = self;
         let txn: &RwTxn = txn;
-        let Some((k, _)) =
-            tree.current(txn.work.writer()).inspect_err(|e| txn.inner.latch.latch_error(e))?
-        else {
-            return Ok(false);
+        let k = match tree.current_in::<Cells, _>(txn.work.writer(), None) {
+            Ok(Some((k, _))) => k,
+            Ok(None) => return Ok(false),
+            Err(e) => {
+                txn.inner.latch.latch_error(&e);
+                tree.unset();
+                *deleted = false;
+                return Err(e);
+            }
         };
         deleted_key.clear();
         deleted_key.extend_from_slice(k);

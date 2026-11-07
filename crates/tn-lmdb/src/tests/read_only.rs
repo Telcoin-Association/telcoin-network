@@ -287,8 +287,8 @@ fn sweep_read_only(env: &Env, state: &State, what: &str, stage: Stage) {
 
 /// Damage at rest to a leaf, a branch, the catalog or the free list, opened read-only, is met as
 /// `Corrupt` by the first read that reaches it, else by `Env::check` (damage an ordinary
-/// environment meets at its first write), and latches; damage to a tree root fails the open
-/// closed. The file is byte-identical after each.
+/// environment meets at its first write), and latches; damage to the catalog or free-tree root
+/// fails the open closed. The file is byte-identical after each.
 #[test]
 fn damage_at_rest_is_met_by_read_only_reads_and_check() {
     let fx = fixture();

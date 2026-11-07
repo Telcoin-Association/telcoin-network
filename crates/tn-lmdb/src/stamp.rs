@@ -46,7 +46,8 @@ pub(crate) fn threads(bytes: usize) -> usize {
 }
 
 /// [`MAX_THREADS`] capped by `std::thread::available_parallelism`, which reads the CPU affinity
-/// and, on Linux, the cgroup quota files: read once, at the first large commit.
+/// and, on Linux, the cgroup quota files: read once, at the first commit ([`threads`] asks for
+/// it at every commit that stamps pages, small ones included).
 fn max_threads() -> usize {
     static MAX: OnceLock<usize> = OnceLock::new();
     *MAX.get_or_init(|| {

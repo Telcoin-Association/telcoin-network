@@ -276,16 +276,26 @@ pub(crate) trait PageRead {
         Ok(overflow::value(self.run(ovf, RunCrc::MultiPage)?, ovf))
     }
 
-    /// A leaf value as a reader sees it: the inline bytes, or the value its run holds
-    /// ([`Self::overflow`]). A nested root is no value: [`Error::Corrupt`]
-    /// ([`crate::page::nested_error`]).
+    /// A leaf value as a reader sees it ([`read_value`]). No store overrides it: the plain
+    /// cursors call [`read_value`] itself, so a get and a cursor read each value alike.
     #[inline]
     fn value<'s>(&'s self, val: Val<'s>) -> Result<&'s [u8]> {
-        match val {
-            Val::Inline(v) => Ok(v),
-            Val::Overflow(ovf) => self.overflow(ovf),
-            Val::Nested(root) => Err(crate::page::nested_error(root)),
-        }
+        read_value(self, val)
+    }
+}
+
+/// A leaf value as a reader sees it, read through `store`: the inline bytes, or the value its run
+/// holds ([`PageRead::overflow`]). A nested root is no value: [`Error::Corrupt`]
+/// ([`crate::page::nested_error`]). The body of [`PageRead::value`] and of the plain cursors'
+/// read ([`cursor::Values`]), forced inline and generic over the store, so that on a trait-object
+/// store (the borrowed [`cursor::Cursor`]'s) only a run's read is an indirect call: an inline
+/// value is a tag test.
+#[inline(always)]
+pub(crate) fn read_value<'s, S: PageRead + ?Sized>(store: &'s S, val: Val<'s>) -> Result<&'s [u8]> {
+    match val {
+        Val::Inline(v) => Ok(v),
+        Val::Overflow(ovf) => store.overflow(ovf),
+        Val::Nested(root) => Err(crate::page::nested_error(root)),
     }
 }
 

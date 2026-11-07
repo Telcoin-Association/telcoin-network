@@ -53,7 +53,10 @@ impl Drop for StopOnDrop<'_> {
 
 /// `readers` threads read while the writer makes `commits` commits in `sync` mode. Reader 0 holds
 /// each pinned snapshot across 40 commits (so the writer's queue of snapshots grows past its
-/// pruning threshold behind it); the others swap theirs for a fresh one at random.
+/// pruning threshold behind it); the others swap theirs for a fresh one at random. The writer
+/// goes on past `commits` (up to four times as many) until reader 0 has held two snapshots so,
+/// and the writer has reused pages while one of them was pinned: the reuse gate is then tested
+/// against a reader it must hold back, however late the readers started.
 fn readers_under_churn(readers: usize, commits: u32, sync: SyncMode, seed: u64) {
     let (_dir, path) = temp("tn_lmdb_concurrency");
     let env = open(&path, sync);
@@ -61,6 +64,11 @@ fn readers_under_churn(readers: usize, commits: u32, sync: SyncMode, seed: u64) 
     let mut model = Rows::new();
     let stop = AtomicBool::new(false);
     let (rescans, fresh, committed) = (AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0));
+    // The pages reused so far (the allocator's load log, stored before each commit's count is
+    // released), reader 0's swaps after holding a snapshot across 40 commits, and those of its
+    // pins under which pages were reused.
+    let (loaded, held, reused_under_pin) =
+        (AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0));
     let write = |rng: &mut Rng, model: &mut Rows, round: u32| {
         let mut txn = env.begin_rw().expect("begin");
         let t = txn.create_table("t").expect("t");
@@ -88,7 +96,8 @@ fn readers_under_churn(readers: usize, commits: u32, sync: SyncMode, seed: u64) 
         let stored: Vec<u8> = count.to_le_bytes().into_iter().chain(hash.to_le_bytes()).collect();
         txn.put(&sum, b"digest", &stored).expect("put");
         txn.commit().expect("commit");
-        committed.fetch_add(1, Ordering::Relaxed);
+        loaded.store(env.with_writer(|w| w.alloc.load_log.len()) as u64, Ordering::Relaxed);
+        committed.fetch_add(1, Ordering::Release);
         if round % 10 == 9 {
             // In `SyncMode::NoSync` freed pages are reusable only once syncs move the metas.
             env.sync().expect("sync");
@@ -100,8 +109,12 @@ fn readers_under_churn(readers: usize, commits: u32, sync: SyncMode, seed: u64) 
         for r in 0..readers {
             let (env, stop, rescans, fresh, committed) =
                 (&env, &stop, &rescans, &fresh, &committed);
+            let (loaded, held, reused_under_pin) = (&loaded, &held, &reused_under_pin);
             s.spawn(move || {
                 let mut rng = Rng(seed ^ ((r as u64 + 1) * 0x9E37_79B9));
+                // Reader 0's count of reused pages once two commits followed its pin: a later
+                // reuse took place under the pin.
+                let mut pinned_loaded = None;
                 let mut pinned = env.begin_ro().expect("ro");
                 let mut pinned_at = committed.load(Ordering::Relaxed);
                 let mut want = scan(&pinned);
@@ -112,8 +125,21 @@ fn readers_under_churn(readers: usize, commits: u32, sync: SyncMode, seed: u64) 
                     assert!(ro.txn_id() >= pinned.txn_id());
                     let got = scan(&ro);
                     fresh.fetch_add(1, Ordering::Relaxed);
-                    let now = committed.load(Ordering::Relaxed);
-                    let swap = if r == 0 { now >= pinned_at + 40 } else { rng.below(4) == 0 };
+                    let now = committed.load(Ordering::Acquire);
+                    if r == 0 && pinned_loaded.is_none() && now >= pinned_at + 2 {
+                        pinned_loaded = Some(loaded.load(Ordering::Relaxed));
+                    }
+                    let spanned = now >= pinned_at + 40;
+                    if r == 0 && spanned {
+                        // Held across 40 commits, and any reuse counted here was under it: one
+                        // more rescan before it goes.
+                        let n = pinned_loaded.take();
+                        let reused = n.is_some_and(|n| loaded.load(Ordering::Relaxed) > n);
+                        assert_eq!(scan(&pinned), want, "the pinned snapshot changed");
+                        held.fetch_add(1, Ordering::Relaxed);
+                        reused_under_pin.fetch_add(u64::from(reused), Ordering::Relaxed);
+                    }
+                    let swap = if r == 0 { spanned } else { rng.below(4) == 0 };
                     if swap {
                         (pinned, want, pinned_at) = (ro, got, now);
                     }
@@ -122,14 +148,20 @@ fn readers_under_churn(readers: usize, commits: u32, sync: SyncMode, seed: u64) 
             });
         }
         let _stop = StopOnDrop(&stop);
-        for round in 1..commits {
+        let shown =
+            || held.load(Ordering::Relaxed) >= 2 && reused_under_pin.load(Ordering::Relaxed) >= 1;
+        let mut round = 1;
+        while round < commits || (!shown() && round < 4 * commits) {
             write(&mut rng, &mut model, round);
+            round += 1;
         }
     });
     assert_eq!(env.failure(), None);
     check(&env);
     let reused = env.with_writer(|w| w.alloc.load_log.len());
     assert!(reused > 0, "pages were reused");
+    assert!(held.load(Ordering::Relaxed) >= 2, "reader 0 held two snapshots across 40 commits");
+    assert!(reused_under_pin.load(Ordering::Relaxed) >= 1, "pages were reused under a pin");
     assert!(rescans.load(Ordering::Relaxed) > readers as u64, "the readers rescanned");
     assert!(fresh.load(Ordering::Relaxed) > readers as u64, "the readers took fresh snapshots");
     let ro = env.begin_ro().expect("ro");

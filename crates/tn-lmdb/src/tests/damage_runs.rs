@@ -17,7 +17,7 @@ use crate::{
     env::tests::flip,
     overflow::{run_pages, Ovf, RUN_HEADER},
     page,
-    tree::PageRead as _,
+    tree::{cursor, PageRead as _},
     Error,
 };
 
@@ -318,6 +318,55 @@ fn a_damaged_overflow_counter_refuses_drop_and_clear() {
         drop(env);
         fs::remove_file(&path).expect("remove");
     }
+}
+
+/// `RwCursor::delete_current` reads the key of the entry it deletes, not its value, as
+/// `RwTxn::delete` reads none: a middle page of key 2's run flipped under the cursor (after the
+/// seek that read the value) is never met, the delete moves the cursor to key 3, the commit frees
+/// the run and the file checks clean. A key read that fails (`o`'s leaf flipped under the cursor
+/// to name another page) is `Corrupt`, latches, and leaves the cursor unset, as a failed delete
+/// leaves it.
+#[test]
+fn a_cursor_delete_reads_the_key_alone() {
+    let fx = fixture();
+    let at = places(&fx.path);
+    let two = at.ovf(2);
+    let begin = |env: &Env| {
+        let txn = env.begin_rw().expect("begin");
+        let o = txn.open_table("o").expect("open").expect("o");
+        (txn, o)
+    };
+
+    let (path, env) = damaged(&fx, "run under a cursor", &|_| {});
+    let (mut txn, o) = begin(&env);
+    let mut c = txn.cursor_mut(&o).expect("cursor");
+    assert!(c.seek_exact(&key(2)).expect("seek").is_some());
+    flip(&path, u64::from(two.pgno + 1) * P + 100);
+    assert!(c.delete_current().expect("the delete reads no value"));
+    assert_eq!(c.current().expect("current").map(|(k, _)| k.to_vec()), Some(key(3).to_vec()));
+    drop(c);
+    txn.commit().expect("commit");
+    let mut state = fx.state.clone();
+    state.get_mut("o").expect("o").remove(&key(2)[..]).expect("key 2");
+    assert_eq!(newest_state(&env), state);
+    drop(env);
+    fs::remove_file(&path).expect("remove");
+
+    let (path, env) = damaged(&fx, "leaf under a cursor", &|_| {});
+    let (mut txn, o) = begin(&env);
+    let mut c = txn.cursor_mut(&o).expect("cursor");
+    assert!(c.seek_exact(&key(2)).expect("seek").is_some());
+    flip(&path, u64::from(at.leaf) * P);
+    match c.delete_current() {
+        Err(Error::Corrupt(e)) => assert!(e.contains(&format!("page {} holds", at.leaf)), "{e}"),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(c.state(), (cursor::State::Unset, false), "a failed delete leaves it unset");
+    drop(c);
+    drop(txn);
+    assert!(env.failure().is_some(), "the damage latched");
+    drop(env);
+    fs::remove_file(&path).expect("remove");
 }
 
 /// A free record that passes the reuse gate and lists a middle page of a live 9-page run (its
