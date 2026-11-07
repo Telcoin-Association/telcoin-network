@@ -139,13 +139,13 @@ These are deliberate; don't report them:
 ## Tracking upstream reth
 
 The upstream clone is `$RETH_UPSTREAM`, or `~/.cache/tn-vendor/reth`, which `vendor.py` clones
-on first use. The last survey of upstream `main` stopped at `84caec584` (2026-10-30); the tracker
+on first use. The last survey of upstream `main` stopped at `44a74f9ea` (2026-11-06); the tracker
 records it. To survey what landed since, over the carried paths only:
 
 ```
 U=${RETH_UPSTREAM:-$HOME/.cache/tn-vendor/reth}
 git -C "$U" fetch origin
-git -C "$U" log --no-merges --oneline 84caec584..origin/main -- \
+git -C "$U" log --no-merges --oneline 44a74f9ea..origin/main -- \
   $(grep -v '^#' vendor/reth/tn/crates.txt | awk 'NF{print $1}')
 ```
 

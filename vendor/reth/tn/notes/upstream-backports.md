@@ -5,7 +5,9 @@ Survey: 2026-10-30, upstream `v1.11.4` → `origin/main` at `84caec584`, over th
 (`git log --no-merges 564ffa586..origin/main`, 1126 commits, about 100 trial-picked). Security
 items were re-checked against TN's code on 2026-10-31, and the static-file paths (`nippy-jar`,
 `providers/static_file`, `db/src/static_file`) were swept again the same day. reth publishes no
-GitHub security advisories, so this commit-log survey is the only source.
+GitHub security advisories, so this commit-log survey is the only source. A second survey on
+2026-11-06 covered `84caec584..44a74f9ea` (26 commits on the vendored paths) and re-checked every
+Open row with `git apply --check`; the next survey starts at `44a74f9ea`.
 
 To apply one: `RETH_UPSTREAM=<clone> python3 -I vendor/reth/tn/vendor.py pick <sha>`, resolve,
 add a CHANGES.md entry (kind `backport`), build, and run the crate's tests with
@@ -51,6 +53,13 @@ Severity below is for TN, which differs from upstream's in places. Relevant TN f
 
 ## Open
 
+### Execution path: a coordinated upgrade, not a backport
+
+| sha | subject | crate | why it matters to TN | status |
+|---|---|---|---|---|
+| 8572c88fe | tighten iterator seek boundary | trie | **State-root bug on TN's path.** `TrieNodeIter` skips a stored branch whose key only starts with the seek prefix, so a leaf inserted before a deeper stored branch is left out of the incremental root. TN computes every block's root this way (`output_overlay.rs`). Upstream's test fails on this copy and passes with the one-line fix. Applying it changes the root wherever the case occurs | not applied; `open-issues.md` |
+| 5868ee478 | rewind backward overlay seeks | trie | Overlay cursors skip entries on a backward seek. Not hit by current `StateRoot` callers, but this code sits under TN's output overlay, so it goes with 8572c88fe | conflicts; hand port is about 8 lines using `reset()` |
+
 ### Deferred to its own change
 
 | sha | subject | crate | why it matters to TN | status |
@@ -76,14 +85,18 @@ Severity below is for TN, which differs from upstream's in places. Relevant TN f
 | 080a9cfc1, c4cd5c9b7 | `apply_pre_execution_changes` in replay and `debug_traceCallMany` | rpc-eth-api, rpc | TN's EIP-4788/EIP-2935 system calls are skipped in replays and traces. | clean; check `executor_for_block` |
 | 8861e2724 | notify subscribers when set_block_info promotes | transaction-pool | TN calls `set_block_info`; transactions promoted by a basefee drop never reach pending listeners. | clean |
 | 5b0120dbb | lower default block/receipt cache limits | rpc-eth-types | High default memory use unless TN sets its own limits. | clean |
-| 5868ee478 | rewind backward overlay seeks | trie | Overlay cursors skip entries on a backward seek. Not hit by current `StateRoot` callers, but this code sits under TN's output_overlay. | conflicts; hand port is about 8 lines using `reset()` |
+| 329fcfc73 | bound `eth_callBundle` work | rpc | TN serves `eth_callBundle` (`rpc_bundle.rs`). Each transaction's gas is capped, the bundle's total is not, so one request runs N × the gas cap under one blocking-IO permit. Port the cumulative check (not the EIP-8037 branch); the cancellation check needs 13a59de4b | hand port |
+| 0973a1387, 34f77be92 | stop `eth_simulateV1` and the pending-block build once the request is dropped | rpc-eth-api | Build on 13a59de4b. TN defaults `--rpc.pending-block none` | after 13a59de4b |
 
 ### Low
 
 0e14f1a8a and a68f9e19f (IPC loop spin; max subscriptions per connection), 10d130182 (pool gas
 limit at startup), 62808bd06 (empty code hash senders), e7ebeb869 (partial receipts), 1a6ba945a
-(codecs decode), 078c22d5f (iterative BlockState drop), adfcad70c (static-file unwind error
-names the segment and anchor; diagnostics only). Each picks cleanly or with test-only conflicts.
+(codecs decode), 078c22d5f (iterative BlockState drop), 44a74f9ea (reject conflicting
+transaction fees in call requests), 33b785d97 (`0x` data for empty reverts), 9580b7fc1 (zstd
+0.13 compatibility test, test only). 1a6ba945a and 078c22d5f are on the execution path
+(`codecs`, `chain-state`) for a change that does not alter state; they wait for the next
+fork-checked change rather than carry that cost alone.
 
 ### Not applicable
 
@@ -96,7 +109,15 @@ so the checkpoints it reads are unset),
 6bd6bf28a (receipts static-file sizing; node-builder and receipts-in-static-files only),
 00f9bd2a9 (`tx_hash()` instead of `trie_hash()`; equal for Ethereum transaction types, so it only
 saves a re-hash),
-db17c899c (`reth db migrate-v2`; TN has no reth CLI).
+db17c899c (`reth db migrate-v2`; TN has no reth CLI), adfcad70c (edits a pruned-anchor check
+v1.11.4 does not have).
+From the 2026-11-06 survey: 6624ff8a9 (default `eth_call` gas cap; Amsterdam only), b2f6dc910,
+c0e8be419, 2a343e40f, 6f7896f9c and 19d390ad9 (evm2, the next sync), 65977b8e1 (secp256k1
+bump; a third-party version change on the fork list, and the devp2p crates are not carried),
+aa03178bd (`eth_capabilities`, not in v1.11.4), b7a853a60 (`reth` namespace, removed),
+9dc3e4c9c, 32d01073f, 8f3cfd117, 824dc1c89 and its revert 14bf073c6 (auth server and JWT; TN
+runs no engine API), 277fc1257 (`mev` namespace, removed), 965ba8cb5 (performance only),
+d5991a4db, 04f829c26, 0d1b63a1f (cosmetic).
 
 ## Not simple backports
 

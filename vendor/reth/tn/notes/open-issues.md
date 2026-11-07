@@ -3,9 +3,36 @@
 The PR that brought `vendor/reth` onto `main` fixed what its reviews found that was small and
 safe to change before the testnet upgrade. The items below are known and deliberately left for
 their own changes, because each is too large for that PR or needs other owners. None of them lets
-two validators execute a block differently.
+two validators on the same release execute a block differently. Fixing the first one would change
+some blocks' state roots, so it needs a coordinated upgrade.
 
 Upstream fixes that are simply not applied yet are tracked in `upstream-backports.md`, not here.
+
+## The incremental state root can skip a changed subtree (upstream 8572c88fe)
+
+`TrieNodeIter` (`vendor/reth/crates/trie/trie/src/node_iter.rs`, the `can_skip_node` seek check)
+skips re-hashing a stored branch when the walker's key merely *starts with* the seek prefix. When
+the stored key is deeper than the prefix, hashed entries between the two are never visited: a leaf
+inserted there (upstream's test inserts storage slot `0x1000..` beside stored branches under
+`0x10a0..`) is left out of the root. Upstream fixed it on 2026-11-03 by skipping only at the exact
+prefix. The line is the same in reth v1.11.3, which `main` builds, and in this copy.
+
+TN computes every block's root this way: `OutputTrieOverlay::layered_root_with_updates`
+(`crates/tn-reth/src/env/output_overlay.rs`) runs `StateRoot` over stored trie nodes with prefix
+sets from the block's own changes. Upstream's test fails on this copy (incremental root `0x52fe…`,
+rebuilt root `0x6b94…`) and passes with the one-line fix.
+
+- Fork risk today: none between nodes on the same release. The skip is deterministic, so every
+  node that built its trie by executing the same blocks computes the same root, right or wrong. A
+  node whose trie was rebuilt from scratch (snapshot import, `crates/tn-reth/src/snapshot.rs`)
+  hard-fails at import if the chain's root ever went wrong, instead of forking.
+- Fork risk of the fix: any block where the case occurs gets a different root on a fixed binary.
+  So the fix is a coordinated upgrade, never a rolling one, and it is not applied here.
+- Has the testnet hit it? Unknown. A snapshot export from a testnet node and an import elsewhere
+  answers it: the import rebuilds the trie from scratch and compares with the header's root. A
+  replay of the testnet from genesis on a fixed binary answers it too, and names the first block.
+- Fix: apply 8572c88fe at a coordinated upgrade height (or with a height gate if the testnet's
+  history already contains such a block), after `graph.py` and `make test-upgrade`.
 
 ## The pool re-admits a nonce from a batch that reached quorum (review finding T2-1)
 
@@ -92,10 +119,10 @@ sccache or a different cache layout.
 each one, but no tool or CI job compares the two. A `vendor.py ledger` check (every changed file
 named by an entry, every `TN(TN-NNNN)` id defined) would make that mechanical.
 
-## The upstream survey is from 2026-10-30
+## The upstream survey is from 2026-11-06
 
-`upstream-backports.md` surveyed upstream `main` up to `84caec584`. Upstream has moved since; the
-next survey starts there (CLAUDE.md, "Tracking upstream reth").
+`upstream-backports.md` surveyed upstream `main` up to `44a74f9ea`. The next survey starts there
+(CLAUDE.md, "Tracking upstream reth").
 
 ## Branches that carry tndb-b
 
