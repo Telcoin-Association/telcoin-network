@@ -43,7 +43,9 @@ const STARTUP_SYNC_RETRY_BACKOFF: Duration = Duration::from_millis(250);
 /// restart into a transitioning network several times over. It stays short because at genesis,
 /// and whenever the whole network restarts at once, every peer drops requests until its own first
 /// epoch starts, which happens only after its own startup sync: without this cap every node would
-/// sit out the full [`STARTUP_SYNC_TIMEOUT`] before serving anyone.
+/// sit out the full [`STARTUP_SYNC_TIMEOUT`] before serving anyone. A node that gives up on a
+/// longer gap and starts an epoch the network already closed is still demoted once the record
+/// collector stores a later epoch's certified record (see `run_epoch` in `tn-node`).
 const STARTUP_SYNC_UNANSWERED_BUDGET: Duration = Duration::from_secs(2);
 
 /// Where a collection pass stopped (see [`collect_epoch_records`]).
@@ -220,7 +222,9 @@ fn stop_on_local_failure(e: EpochDbError, epoch: Epoch) -> eyre::Result<()> {
 /// [`CollectedPass`]).
 ///
 /// Fails only when our own epoch store fails to save or persist (see [`stop_on_local_failure`]);
-/// a peer's invalid or refused record is logged and asked for again on a later pass.
+/// a peer's invalid or refused record is logged and asked for again on a later pass. Each
+/// certified record stored is published on [`ConsensusBusApp::certified_record_epoch`], so an
+/// active validator still running an epoch the network already closed leaves it to catch up.
 async fn collect_epoch_records(
     last_epoch: Epoch,
     consensus_chain: &ConsensusChain,
@@ -280,6 +284,7 @@ async fn collect_epoch_records(
                             });
                         }
                         result_epoch = epoch;
+                        consensus_bus.set_certified_record_epoch_if_newer(epoch);
                         info!(
                             target: "epoch-manager",
                             "retrieved cert for epoch {epoch}: {epoch_hash} from a peer",
@@ -567,6 +572,8 @@ mod tests {
             CollectedPass { epoch: 2, definitive: true },
             "collector should fetch through the ejection epoch"
         );
+        // the epoch manager is woken with the newest certified record stored
+        assert_eq!(*consensus_bus.app().certified_record_epoch().borrow(), Some(2));
 
         // Both records validated (parent link + ejection tolerance + shrunken
         // quorum together) and were saved with their certs.
