@@ -459,6 +459,16 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   taken); the other pins the no-permit path, which would hang with an awaited acquire.
   *Upstream*: n/a (upstream commit). A later sync takes upstream's version of the function.
 
+- **TN-0039** — Backport 6e4009eed: a log subscription survives a lagging canonical-state
+  channel. *Kind*: backport.
+  *Files*: `crates/rpc/rpc/src/eth/pubsub.rs` (`EthPubSub::log_stream`).
+  *Why*: the stream `expect`ed every canonical-state notification, so a subscriber that fell
+  more than the channel's capacity behind panicked its subscription task on the `Lagged` error.
+  TN's task manager ignores the panic, so only that client's `eth_subscribe("logs")` ended, with
+  a panic in the node's log. It now reads `canonical_state_stream()`, which skips the missed
+  notifications, as reth's other canonical-state consumers do. RPC only. *Tests*: none upstream;
+  the change swaps one stream constructor for another. *Upstream*: n/a (upstream commit).
+
 ## TN fixes (not from an upstream commit)
 
 - **TN-0036** — Debug traces hold their tracing permit until their blocking task ends. *Kind*:
