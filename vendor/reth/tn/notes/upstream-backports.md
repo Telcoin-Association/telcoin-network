@@ -62,6 +62,7 @@ Severity below is for TN, which differs from upstream's in places. Relevant TN f
 | 5b0120dbb | TN-0047 | RPC cache defaults 1000 blocks and 500 blocks' receipts (were 5000 and 2000; a TN block can be 1 MB) | hand port; nested tests |
 | 8fa539225 | TN-0048 | traces and replays apply the node's own block executor's pre-execution changes (TN's EIP-4788 runs only on an output's first batch), not reth's Ethereum `SystemCaller` | tn-reth trace tests through TN's executor |
 | c4cd5c9b7 | TN-0048 | `debug_traceCallMany` at a transaction index applies the block's pre-execution changes before replaying its earlier transactions | nested reth-rpc tests |
+| 080a9cfc1 | TN-0048 | `spawn_replay_transaction` applies the block's pre-execution changes (unused by TN today) | nested tests |
 
 ## Open
 
@@ -91,7 +92,6 @@ Severity below is for TN, which differs from upstream's in places. Relevant TN f
 | 13a59de4b (+ 621f663ed) | stop long blocking jobs once the request is dropped | rpc-eth-api, tasks | Extends TN-0019 to synchronous jobs that never yield (e.g. long `eth_call`s). Needs the `CancelOnDrop` move into reth-tasks first. | not tried |
 | 294e21507 | heal finalized/safe ahead of highest header | provider | After an unwind, "finalized" can point past the tip. Lives in the MDBX `DatabaseProvider`: **for the tndb-b owners.** | clean |
 | 5fc3a81d3 | bound safe-no-sync rollback with a sync period | db | Without a period, `--db.sync-mode safe-no-sync` can lose days of data on power loss. **MDBX: for the tndb-b owners.** | test-only |
-| 080a9cfc1, c4cd5c9b7 | `apply_pre_execution_changes` in replay and `debug_traceCallMany` | rpc-eth-api, rpc | TN's EIP-4788/EIP-2935 system calls are skipped in replays and traces. | clean; check `executor_for_block` |
 | 329fcfc73 (cancellation check) | stop `eth_callBundle` between transactions once the request is dropped | rpc | The cumulative gas check is applied (TN-0046); this part builds on 13a59de4b | after 13a59de4b |
 | 0973a1387, 34f77be92 | stop `eth_simulateV1` and the pending-block build once the request is dropped | rpc-eth-api | Build on 13a59de4b. TN defaults `--rpc.pending-block none` | after 13a59de4b |
 
