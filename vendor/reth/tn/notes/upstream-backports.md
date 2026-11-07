@@ -60,6 +60,7 @@ Severity below is for TN, which differs from upstream's in places. Relevant TN f
 | 9580b7fc1 | TN-0045 | test only: zstd 0.13 compatibility fixtures for nippy-jar, so a zstd bump cannot silently stop reading static files | the test itself |
 | 329fcfc73 (partial) | TN-0046 | **security**: an `eth_callBundle` request's transactions share its block gas limit, so one request cannot run N × the call gas cap. Without the EIP-8037 branch and the cancellation check | TN tests; the refusal test fails without the check |
 | 5b0120dbb | TN-0047 | RPC cache defaults 1000 blocks and 500 blocks' receipts (were 5000 and 2000; a TN block can be 1 MB) | hand port; nested tests |
+| 8fa539225 | TN-0048 | traces and replays apply the node's own block executor's pre-execution changes (TN's EIP-4788 runs only on an output's first batch), not reth's Ethereum `SystemCaller` | tn-reth trace tests through TN's executor |
 
 ## Open
 

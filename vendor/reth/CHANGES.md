@@ -563,6 +563,21 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   change. RPC memory only. *Tests*: reth-node-core and rpc-eth-types tests (none assert the
   defaults). *Upstream*: n/a (upstream commit).
 
+- **TN-0048** — Backport upstream's pre-execution fixes for traces and replays. *Kind*:
+  backport.
+  *Files*: `crates/rpc/rpc-eth-api/src/helpers/trace.rs`, `crates/rpc/rpc/src/debug.rs`.
+  *Why*: 8fa539225: `Trace::apply_pre_execution_changes` ran reth's Ethereum `SystemCaller`
+  instead of the node's block executor, so traces and replays of a TN block wrote the EIP-4788
+  beacon root on every block, where TN's executor (`tn-reth/src/evm/block.rs`) writes it only on an
+  output's first batch. The post-state matched only because every block of an output carries the
+  same root and timestamp. It now calls `executor_for_block(..).apply_pre_execution_changes()`,
+  which TN's `TnEvmConfig` supports for re-execution and which reads only the header. The
+  conflicts were TN-0036's edits around the three `debug.rs` call sites; only the call's arguments
+  change there. RPC only: block execution does not go through these helpers.
+  *Tests*: reth-rpc and rpc-eth-api 43/43 (49/49 with `js-tracer`); tn-reth's trace and debug
+  namespace tests, which trace a mined TN block through TN's executor, 10/10. *Upstream*: n/a
+  (upstream commits).
+
 ## TN fixes (not from an upstream commit)
 
 - **TN-0036** — Debug traces hold their tracing permit until their blocking task ends. *Kind*:
