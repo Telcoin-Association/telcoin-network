@@ -564,34 +564,75 @@ impl From<NodeMode> for tn_types::NodeMode {
     }
 }
 
-/// This node's rejoins in one epoch: how often its catching-up CVV was promoted back to an active
-/// CVV, and when the latest promotion happened.
+/// This node's rejoins in one epoch: how many promotions of its catching-up CVV back to an active
+/// CVV failed, and when the latest promotion happened.
 ///
 /// Held in a node-lifetime watch ([`ConsensusBusApp::rejoin_state`]) and keyed by epoch instead of
 /// being cleared by [`ConsensusBusApp::reset_for_epoch`]: a promotion restarts the epoch's tasks
 /// without changing the epoch, and the restarted tasks must still see it. The first promotion in
 /// another epoch starts a new count, and a reader asking about another epoch sees no promotion.
 ///
+/// A promotion is recorded as pending ([`Self::record_promotion`]) and the first demotion after it
+/// settles it ([`Self::record_demotion`]): the promotion failed when that demotion came inside
+/// [`tn_types::REJOIN_DEMOTION_GRACE`] of it, or was one the grace held until it ended. Only failed
+/// promotions count toward [`tn_types::MAX_REJOIN_ATTEMPTS_PER_EPOCH`]; a promotion that holds past
+/// the grace never does. A failed promotion on a stalled consensus head is counted apart
+/// ([`Self::stalled_failures`]): the cap does not apply to that rule, which backs off instead.
+///
 /// The watch lives as long as the process. A restart clears the grace, which is right because a
-/// restart is not a rejoin, and clears the attempt count too, so the per-epoch cap does not span
+/// restart is not a rejoin, and clears the failure count too, so the per-epoch cap does not span
 /// restarts.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct RejoinState {
     /// The epoch the count and the stamp belong to.
     epoch: Epoch,
-    /// Promotions back to an active CVV in `epoch`.
-    attempts: u32,
+    /// Promotions back to an active CVV in `epoch` that a demotion followed inside the grace, the
+    /// count the rejoin cap reads. Promotions on a stalled consensus head are not in it.
+    failed: u32,
+    /// Failed promotions on a stalled consensus head in `epoch`.
+    failed_stalled: u32,
     /// When the latest promotion in `epoch` happened, on the tokio clock so a test can pause it.
     promoted_at: Option<Instant>,
+    /// True from the latest promotion in `epoch` until the first demotion after it settles it.
+    pending: bool,
+    /// True when the latest promotion in `epoch` was made on a stalled consensus head.
+    stalled: bool,
 }
 
 impl RejoinState {
-    /// Record a promotion in `epoch` at `now`: one more attempt, stamped `now`. A promotion in an
-    /// epoch other than the one held starts a new count.
-    pub fn record_promotion(&mut self, epoch: Epoch, now: Instant) {
+    /// Record a promotion in `epoch` at `now`: stamped `now` and pending until a demotion settles
+    /// it. `stalled` marks a promotion on a stalled consensus head. A promotion in an epoch other
+    /// than the one held starts a new count.
+    pub fn record_promotion(&mut self, epoch: Epoch, now: Instant, stalled: bool) {
         self.enter_epoch(epoch);
-        self.attempts = self.attempts.saturating_add(1);
         self.promoted_at = Some(now);
+        self.pending = true;
+        self.stalled = stalled;
+    }
+
+    /// Settle the latest promotion in `epoch` after a demotion at `now`: it failed when `now` lies
+    /// inside [`tn_types::REJOIN_DEMOTION_GRACE`] of the promotion or `released_hold` says the
+    /// grace held this demotion until it ended. A failed promotion counts toward the cap, or
+    /// toward [`Self::stalled_failures`] when it was made on a stalled consensus head. Only the
+    /// first demotion after a promotion settles it, and a demotion in another epoch settles
+    /// nothing. Returns true when the state changed.
+    pub fn record_demotion(&mut self, epoch: Epoch, now: Instant, released_hold: bool) -> bool {
+        if self.epoch != epoch || !self.pending {
+            return false;
+        }
+        self.pending = false;
+        let inside_grace = self.promoted_at.is_some_and(|promoted_at| {
+            now.saturating_duration_since(promoted_at) < tn_types::REJOIN_DEMOTION_GRACE
+        });
+        if !(released_hold || inside_grace) {
+            return true;
+        }
+        if self.stalled {
+            self.failed_stalled = self.failed_stalled.saturating_add(1);
+        } else {
+            self.failed = self.failed.saturating_add(1);
+        }
+        true
     }
 
     /// Start a new count for `epoch` unless it is the epoch held, as an inactive node does when it
@@ -607,10 +648,11 @@ impl RejoinState {
         true
     }
 
-    /// The promotions recorded in `epoch`; zero for any other epoch.
+    /// The failed promotions recorded in `epoch` that the rejoin cap reads, those on a stalled
+    /// consensus head excluded; zero for any other epoch.
     pub fn attempts(&self, epoch: Epoch) -> u32 {
         if self.epoch == epoch {
-            self.attempts
+            self.failed
         } else {
             0
         }
@@ -623,6 +665,21 @@ impl RejoinState {
         } else {
             None
         }
+    }
+
+    /// The failed promotions on a stalled consensus head recorded in `epoch`; zero for any other
+    /// epoch. The rejoin cap does not read them; the stalled-head rule backs off by them.
+    pub fn stalled_failures(&self, epoch: Epoch) -> u32 {
+        if self.epoch == epoch {
+            self.failed_stalled
+        } else {
+            0
+        }
+    }
+
+    /// True when the latest promotion in `epoch` has not been settled by a demotion yet.
+    pub fn is_pending(&self, epoch: Epoch) -> bool {
+        self.epoch == epoch && self.pending
     }
 }
 
@@ -1116,7 +1173,9 @@ impl ConsensusBusApp {
     ///
     /// The executor's subscriber records each promotion of a catching-up CVV here before it flips
     /// the node mode; the network handler reads it to hold the activity-window demotion for
-    /// [`tn_types::REJOIN_DEMOTION_GRACE`] after a promotion.
+    /// [`tn_types::REJOIN_DEMOTION_GRACE`] after a promotion. The network handler settles the
+    /// promotion when it demotes the node, and the subscriber settles it, if no demotion site did,
+    /// when it starts catching up again (see [`RejoinState::record_demotion`]).
     pub fn rejoin_state(&self) -> &watch::Sender<RejoinState> {
         &self.inner.tx_rejoin_state
     }
@@ -2377,8 +2436,8 @@ mod tests {
 
     // bench5 f3-rejoin
 
-    /// The rejoin state counts promotions per epoch: a promotion in another epoch starts a new
-    /// count, a reader asking about another epoch sees none, and `reset_for_epoch` keeps it.
+    /// The rejoin state counts failed promotions per epoch: a promotion in another epoch starts a
+    /// new count, a reader asking about another epoch sees none, and `reset_for_epoch` keeps it.
     #[test]
     fn rejoin_state_is_keyed_by_epoch() {
         use super::RejoinState;
@@ -2388,18 +2447,70 @@ mod tests {
         let mut state = RejoinState::default();
         assert_eq!((state.attempts(4), state.promoted_at(4)), (0, None));
 
-        state.record_promotion(4, start);
-        state.record_promotion(4, later);
+        state.record_promotion(4, start, false);
+        assert!(state.record_demotion(4, later, false), "a demotion inside the grace fails it");
+        state.record_promotion(4, later, false);
+        assert!(state.record_demotion(4, later, false));
         assert_eq!((state.attempts(4), state.promoted_at(4)), (2, Some(later)));
         assert_eq!((state.attempts(3), state.promoted_at(3)), (0, None), "another epoch sees none");
 
-        state.record_promotion(5, start);
-        assert_eq!((state.attempts(5), state.promoted_at(5)), (1, Some(start)), "a new count");
+        state.record_promotion(5, start, false);
+        assert_eq!((state.attempts(5), state.promoted_at(5)), (0, Some(start)), "a new count");
         assert_eq!((state.attempts(4), state.promoted_at(4)), (0, None), "the old count is gone");
 
         let bus = ConsensusBusApp::new();
-        bus.rejoin_state().send_modify(|state| state.record_promotion(4, start));
+        bus.rejoin_state().send_modify(|state| {
+            state.record_promotion(4, start, false);
+            state.record_demotion(4, start, false);
+        });
         bus.reset_for_epoch();
         assert_eq!(bus.rejoin_state().borrow().attempts(4), 1, "reset_for_epoch keeps it");
+    }
+
+    /// Only a promotion that a demotion follows inside the rejoin grace counts: one that holds
+    /// past the grace never does, unless the demotion is one the grace held until it ended. A
+    /// promotion is settled once, by the first demotion after it, and a demotion in another epoch
+    /// or without a pending promotion changes nothing.
+    #[test]
+    fn rejoin_state_counts_only_failed_promotions() {
+        use super::RejoinState;
+        use tn_types::REJOIN_DEMOTION_GRACE;
+
+        let start = tokio::time::Instant::now();
+        let mut state = RejoinState::default();
+        assert!(!state.record_demotion(4, start, false), "nothing to settle without a promotion");
+
+        // demoted a moment before the grace ends: failed
+        state.record_promotion(4, start, false);
+        assert!(state.is_pending(4));
+        let just_inside = start + REJOIN_DEMOTION_GRACE - Duration::from_millis(1);
+        assert!(state.record_demotion(4, just_inside, false));
+        assert!(!state.is_pending(4), "the demotion settles the promotion");
+        assert_eq!(state.attempts(4), 1);
+        assert!(!state.record_demotion(4, just_inside, false), "settled once");
+        assert_eq!(state.attempts(4), 1);
+
+        // held past the grace, then demoted for something else: not failed
+        state.record_promotion(4, start, false);
+        assert!(state.record_demotion(4, start + REJOIN_DEMOTION_GRACE, false));
+        assert_eq!(state.attempts(4), 1, "a promotion that outlasts the grace does not count");
+
+        // a demotion the grace held until it ended: failed
+        state.record_promotion(4, start, false);
+        let after = start + REJOIN_DEMOTION_GRACE + Duration::from_millis(50);
+        assert!(state.record_demotion(4, after, true));
+        assert_eq!(state.attempts(4), 2, "a released hold counts");
+
+        // a failed promotion on a stalled head is counted apart from the cap
+        state.record_promotion(4, start, true);
+        assert!(state.record_demotion(4, start, false));
+        assert_eq!((state.attempts(4), state.stalled_failures(4)), (2, 1));
+        assert_eq!(state.stalled_failures(5), 0, "another epoch sees none");
+
+        // a demotion in another epoch settles nothing
+        state.record_promotion(4, start, false);
+        assert!(!state.record_demotion(5, start, false));
+        assert!(state.is_pending(4));
+        assert_eq!(state.attempts(4), 2);
     }
 }

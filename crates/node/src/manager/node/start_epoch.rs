@@ -1197,7 +1197,7 @@ where
         if self.consensus_bus.is_cvv_inactive() {
             // If we have an inactive mode then it was set so keep it for now.
             // entering a new epoch inactive starts its rejoin count again; a restart inside the
-            // epoch (a demotion) keeps it, so the per-epoch cap on promotions holds
+            // epoch (a demotion) keeps it, so the per-epoch cap on failed promotions holds
             let epoch = consensus_config.committee().epoch();
             self.consensus_bus.rejoin_state().send_if_modified(|state| state.enter_epoch(epoch));
             return Ok(NodeMode::CvvInactive);

@@ -107,19 +107,63 @@ pub const fn rejoin_round_window(gc_depth: Round) -> Round {
 /// demoted at once.
 pub const REJOIN_DEMOTION_GRACE: Duration = Duration::from_secs(30);
 
-/// Promotions back to an active CVV a catching-up node makes in one epoch before it stops trying.
+/// Failed promotions back to an active CVV a catching-up node takes in one epoch before it stops
+/// trying.
 ///
 /// In the bench data a third promotion within one epoch has never succeeded: whatever demoted the
 /// node twice demotes it again, and every round trip costs the committee a member that proposes
-/// without committing. After two, the node keeps following consensus as an inactive CVV until the
-/// epoch boundary. The rejoin count is keyed by epoch, so the key alone starts the next epoch at
-/// zero; the sticky inactive entry into that epoch also resets it, as a second safeguard.
+/// without committing. After two failures, the node keeps following consensus as an inactive CVV
+/// until the epoch boundary. The rejoin count is keyed by epoch, so the key alone starts the next
+/// epoch at zero; the sticky inactive entry into that epoch also resets it, as a second safeguard.
 ///
-/// Every promotion counts as an attempt, a successful one included: a node whose first rejoin
-/// held for hours sits out the rest of the epoch once a second promotion fails. That is accepted
-/// for the bench. Upstream should count only promotions followed by a demotion inside the rejoin
-/// grace ([`REJOIN_DEMOTION_GRACE`]).
+/// Only failed promotions count. A promotion fails when the node is demoted again inside the
+/// rejoin grace ([`REJOIN_DEMOTION_GRACE`]), including a demotion the grace held that took effect
+/// when the grace ended. A promotion that holds past the grace never counts, so the demotions a
+/// node takes later in the epoch, after rejoins that worked, do not use up its attempts.
+///
+/// The cap neither refuses a rejoin on a stalled consensus head ([`REJOIN_STALLED_HEAD_AFTER`])
+/// nor counts it when it fails: refusing it would keep a committee halted below quorum for the
+/// rest of the epoch. That rule backs off instead.
 pub const MAX_REJOIN_ATTEMPTS_PER_EPOCH: u32 = 2;
+
+/// How long a catching-up CVV must watch the consensus head stall, at a header it has replayed,
+/// before it rejoins consensus without waiting for a fresher one.
+///
+/// A catching-up CVV normally rejoins only on a fresh head, a header committed a few seconds ago,
+/// so that a stale record cannot promote a node that has not caught up. But a committee commits
+/// only while a quorum of its members is active. If this node's demotion left fewer than a quorum
+/// active, no new output arrives, the newest header only ages and the freshness rule can never be
+/// met: without another path the committee stays halted until an operator restarts an inactive
+/// member. So while it is inactive the node also checks on a timer, and rejoins whatever the
+/// header's age once all of these hold:
+/// - the newest header it knows is at least this old, and has stayed its newest for at least this
+///   long since the node started catching up. The node must watch the stall itself: its header
+///   watch moves only with its own saves while it is active, so right after a demotion the header
+///   reads old however fast the committee commits;
+/// - no peer advertises a newer consensus number. A number heard before the demotion counts too.
+///   State sync fetches it when the node starts catching up, and each check whose newest header has
+///   not moved for a check interval asks for the outputs up to it again, so a lost fetch does not
+///   hold the node below a frontier no later gossip will move;
+/// - the node has replayed everything up to that header, so nothing is left to catch up;
+/// - the header is in the node's epoch, or is the final header of the epoch before it (a committee
+///   that halted at the start of an epoch, where every member starts with an empty DAG).
+///
+/// A loaded committee that still commits moves the node's header watch and the advertised number
+/// well inside this time: twenty seconds is about forty rounds at two rounds a second. The idle
+/// margin is thin. Without transactions a primary proposes once per `max_header_delay` (2.5 s by
+/// default), so an idle committee commits about four times in twenty seconds, and three absent
+/// leaders in a row (possible with f = 3 at n = 10) leave about twenty seconds without a commit. A
+/// node can then rejoin through this rule while the committee still commits. That is harmless,
+/// because the node has replayed up to the frontier and joins as a current member, but such a
+/// rejoin bypasses the cap.
+///
+/// The rejoin cap ([`MAX_REJOIN_ATTEMPTS_PER_EPOCH`]) neither refuses this rejoin nor counts it.
+/// Instead the stall the node must watch doubles with each such rejoin that fails in the epoch, up
+/// to eight times this. If the node was only cut off and the committee moved on without it, a
+/// certificate it receives after the rejoin demotes it again: at once when the node trails by more
+/// than `ROUNDS_TO_KEEP - gc_depth` rounds, otherwise when the rejoin grace
+/// ([`REJOIN_DEMOTION_GRACE`]) ends, up to thirty seconds later.
+pub const REJOIN_STALLED_HEAD_AFTER: Duration = Duration::from_secs(20);
 
 /// Rounds of certificates the certificate store keeps below the newest round it writes.
 ///
