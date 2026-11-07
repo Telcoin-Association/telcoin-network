@@ -48,6 +48,8 @@ The chain id in the protocol name means a node on one chain fails negotiation ag
 
 The requester waits 5 seconds for the first response frame.
 A peer that negotiates the protocol but never answers trips that timeout, and the requester moves to the next peer instead of stalling the whole catch-up.
+On the worker, the whole batch stream is also bounded (95 seconds), so one peer can use at most 120 seconds of a 480-second `request_batches` call: the batches validated before the bound are kept, and the peer is recorded as stalled for the epoch and asked after the unmarked peers of its tier on later calls; a complete exchange slower than its allowance (15 seconds plus 1 second per batch) is marked too, and an empty answer is marked only when it took 5 seconds or more.
+Each tier of the connected-peer list is shuffled per request so no peer keeps a fixed early place.
 On the responding side, a peer that opens a stream and never sends its request frame is dropped after 1 second if it is a public-tier peer and after 5 seconds if it is a committee peer.
 While it waits it holds only an opening-read slot, never a serve slot.
 A public-tier peer is charged a mild penalty for a silent, unreadable or unexpected opening, for a valid request that arrives in the second half of its 1-second opening window, for a stalled serve, and, for an epoch pack, for a serve cut at the 200-second hold limit, and, for a worker batch serve, for a serve cut at the 60-second hold limit and for a request above the 500-digest cap.
