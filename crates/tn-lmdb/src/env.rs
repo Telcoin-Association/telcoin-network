@@ -195,7 +195,14 @@ impl std::fmt::Debug for Env {
 
 /// One committed state as readers see it: its meta (txn, catalog and free-tree roots, page
 /// count), the mapping's reader view, and the tree roots of the tables its readers resolved.
+///
+/// Aligned to 128 bytes (a cache line on Apple silicon, the pair of lines x86-64 prefetches
+/// together), so that in its `Arc` the reference counts have a line of their own. Every read
+/// transaction's begin and end write those counts, and every page fetch reads the meta and the
+/// view: on one line, readers on other threads would take a cache miss on each fetch after a
+/// begin or end elsewhere. The cost is the padding, under 128 bytes per live snapshot.
 #[derive(Debug)]
+#[repr(align(128))]
 pub(crate) struct Snapshot {
     /// The state's meta.
     pub(crate) meta: Meta,

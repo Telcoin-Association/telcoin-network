@@ -691,6 +691,15 @@ as an `Arc` under a `parking_lot::RwLock`. `begin_ro` clones the current one, so
 state of every table. The environment's own `Arc` to the current snapshot keeps the reader queue
 non-empty.
 
+**Readers on many threads share few lines.** `Snapshot` is aligned to 128 bytes, so in its `Arc`
+the reference counts that every `begin_ro` and reader drop write sit on a line of their own, apart
+from the meta and view each page fetch reads (under 128 bytes of padding per live snapshot). A
+transaction still makes six atomic writes on lines every reader writes: the environment's and the
+snapshot's `Arc` counts, each up and down, and the `RwLock`'s read lock and unlock. The bench rows
+`ro.txn` and `ro.txn.mt` (one thread against four) show what that shared state costs: on an M1
+Max, about 365 against 550 ns a transaction of two gets, a worst case of back-to-back
+transactions.
+
 **A long reader shows, at no cost to readers.** A reader holding a superseded snapshot keeps every
 page freed after it from reuse (the gate in [Free list and page reuse](#free-list-and-page-reuse)),
 so the file grows while it lives; the pages become reusable once it ends.

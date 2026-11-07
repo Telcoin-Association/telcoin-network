@@ -28,7 +28,7 @@ Each row: the file's role, its entry points, what a change must keep; item docs 
 |---|---|
 | `lib.rs` | Crate docs, `compile_error!` off unix, the re-exports (the whole public API). |
 | `error.rs` | `Error` (`thiserror`) and `Result`. |
-| `env.rs` | `Env`: open and recovery, steps 1–9 (`choose_state` 4–6, `checked_snapshot` 9; README "Open and recovery"), `open_read_only` (README "Read-only open"), the writer hand-off, snapshots (`Snapshot::page_again`, do-not-flag 14), the reader queue (`Published`, `reuse_gate`, `Env::oldest_reader_age`), commit steps 3–6 (`stamp_private`, `make_durable`, `data_sync`), `alloc`, `copy_published_with` (a private source refused; `copy_unpublished`), `io_stats`, the test-only `CrashAt`, the close (`EnvInner::drop`, `Writer::trim_tail`; README "Close"). |
+| `env.rs` | `Env`: open and recovery, steps 1–9 (`choose_state` 4–6, `checked_snapshot` 9; README "Open and recovery"), `open_read_only` (README "Read-only open"), the writer hand-off, snapshots (`Snapshot::page_again`, do-not-flag 14; `Snapshot` aligned to 128 bytes, its `Arc` counts on a line of their own), the reader queue (`Published`, `reuse_gate`, `Env::oldest_reader_age`), commit steps 3–6 (`stamp_private`, `make_durable`, `data_sync`), `alloc`, `copy_published_with` (a private source refused; `copy_unpublished`), `io_stats`, the test-only `CrashAt`, the close (`EnvInner::drop`, `Writer::trim_tail`; README "Close"). |
 | `stats.rs` | `IoStats` (public, each counter documented; `since`), `elapsed_ns` and `lap`, the commit steps' clock reads. |
 | `txn.rs` | Transactions and handles: `RoTxn`, `RwTxn`, `ReadTxn`; `Table` resolution through the snapshot's `TableRoots` (`RoTxn::root`, `resolve_root`; do-not-flag 15); commit steps 1–3 and 7 (`Work::commit`, `Work::flush_nested` first). Cursors: `RoCursor`, `RwCursor`, `TxnCursor` (detached; `Tracker` checks `Work::set_record`'s stamp, `Work::schema`, `Work::serial`), `DupRoCursor`, `DupTxnCursor` (`WorkRoots`). Dup tables: `dup_put`, `dup_delete`, `dup_delete_prefix`, `dup_get`, `packed_put`, `packed_delete`, `promote`, the working map (`Working::nested`, `dup_entry`, `held_cell`: do-not-flag 29), the free walks (`WalkRoots`, `free_dup_table`). See the dup Rules. |
 | `meta.rs` | Meta record codec (`FORMAT_VERSION` 5), `choose_meta`, `slot_to_write`. Any other version is `UnsupportedVersion`, checked before the CRC, never damage; no migration. |
@@ -177,7 +177,8 @@ A change to the public API or to cursor behaviour also runs `crates/tn-lmdb-reth
 `etc/tn-lmdb-bench-compare.sh --tier quick --worktree HEAD` (the working tree against HEAD, four
 rounds, about 2 minutes; `--rows` narrows it, exit 1 is a gated regression;
 `crates/tn-lmdb-bench/README.md` has the rows). A perf change states its rows' ratios from it, and
-from `--tier default` before a commit.
+from `--tier default` before a commit. A change to `begin_ro`, a read transaction's drop or
+`Snapshot`'s layout states `ro.txn` and `ro.txn.mt` from the default tier.
 
 The benchmark runs on demand:
 `cargo test --release -p tn-lmdb tn_lmdb_sync_and_merge -- --ignored --nocapture --test-threads 1`.
