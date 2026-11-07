@@ -114,18 +114,23 @@ Run cargo in the nested workspace only through `cargo.sh`. A bare `cargo` there 
 rust-analyzer opened on `vendor/reth`) resolves without TN's revm-inspectors patch and writes that
 into the nested lockfile; the next `cargo.sh` run overwrites it.
 
-`cargo.sh` seeds `vendor/reth/Cargo.lock` from TN's lockfile (the nested lockfile is
-git-ignored) and builds into `target/vendor-reth`. When one of reth's dev-dependencies needs a
-newer version of a crate TN also uses, cargo bumps it in the nested lockfile only. At v1.11.3 that
-happens for `libc` and `cargo_metadata`. TN's own lockfile is never touched. TN's root manifest
-patches revm-inspectors (`patches/revm-inspectors/PATCH.md`), and `cargo.sh` passes the same patch
-with `--config`, so reth's tests run against the code TN ships.
+`cargo.sh` seeds `vendor/reth/Cargo.lock` (git-ignored) on every run from TN's lockfile plus
+`tn/test-only.lock`, which pins the 72 packages only reth's tests need, and builds into
+`target/vendor-reth`. TN's own lockfile is never touched. TN's root manifest patches
+revm-inspectors (`patches/revm-inspectors/PATCH.md`), and `cargo.sh` passes the same patch with
+`--config`, so reth's tests run against the code TN ships.
 
-The packages only reth's tests need are resolved against crates.io on each run, so they are not
-pinned. `cargo.sh` sets `resolver.incompatible-rust-versions = "fallback"`, so they stay at
-versions that support the nested workspace's `rust-version` (1.88), below TN's toolchain pin.
-Pinning them is in `tn/notes/open-issues.md`. nextest reads `vendor/reth/.config/nextest.toml`
-here (TN's, with the same `default` and `ci` profiles as the root's), not the root's.
+`python3 -I vendor/reth/tn/lockfile.py check`, which the `test-vendor-reth` lane runs, fails when
+the nested workspace resolves a package neither file pins, or when the vendored crates' production
+dependencies resolve a version TN does not ship. A test-only package can cause the second by
+needing a newer shared crate: codspeed's nix 0.31.3 needs libc 0.2.186, so nix is pinned at 0.31.2
+and libc stays at TN's 0.2.183. `cargo_metadata` still differs (0.19.2 against TN's 0.18.1), but
+only reth's tests use it. When the check fails, `lockfile.py update` re-resolves and rewrites
+`tn/test-only.lock`; pin a package lower first with `cargo.sh update -p <pkg>@<version> --precise
+<older>`, and run `update` after each pin. `cargo.sh` sets `resolver.incompatible-rust-versions =
+"fallback"`, so new resolutions stay at versions that support the nested workspace's
+`rust-version` (1.88). nextest reads `vendor/reth/.config/nextest.toml` here (TN's, with the same
+`default` and `ci` profiles as the root's), not the root's.
 
 ## Taking changes from upstream
 

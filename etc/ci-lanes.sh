@@ -223,9 +223,13 @@ lane_test_vendor_reth() {
     # repositories, workspaces and lockfiles.
     run python3 -B -I -m unittest discover -s vendor/reth/tn -p 'test_*.py'
     run python3 -B -I -m unittest discover -s etc -p 'test_rocksdb_gate.py'
+    # The nested workspace resolves only packages TN's Cargo.lock or tn/test-only.lock pins, and
+    # the vendored crates resolve TN's versions of what they share with TN (tn/lockfile.py).
+    run python3 -B -I vendor/reth/tn/lockfile.py check
     # reth's own unit and integration tests for the vendored crates (vendor/reth/README.md).
     # They resolve only inside the nested workspace, which tn/cargo.sh runs with its lockfile
-    # seeded from TN's; reth's dev-dependencies add packages to it, so --locked cannot apply.
+    # seeded from TN's and tn/test-only.lock; reth's dev-dependencies add packages to it, so
+    # --locked cannot apply, and the check above stands in for it.
     # Neither the root workspace lanes above nor clippy reach these tests, and the regression
     # tests of every backport in vendor/reth/CHANGES.md live here. reth-db runs on its own with
     # two threads: at the default count macOS fails some MDBX opens with ENOMEM

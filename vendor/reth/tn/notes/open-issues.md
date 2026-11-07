@@ -79,17 +79,6 @@ needs (0.34.3). It retires when TN's reth moves to a revm-inspectors release tha
 fix (0.44.2 or later). `patches/revm-inspectors/PATCH.md` has the
 details.
 
-## reth's test-only dependencies are not pinned
-
-`tn/cargo.sh` seeds the nested lockfile from TN's on each run, and cargo resolves the packages only
-reth's tests need (about 75) against crates.io at that moment. TN's shipped code is unaffected,
-but the `test-vendor-reth` lane is not reproducible from a commit, and a bad release of one of
-those packages can fail it for every queued PR. `cargo.sh` limits them to versions that support
-the workspace's `rust-version`, which removes the commonest break (a release that needs a newer
-rustc). The complete fix is a committed overlay lockfile for the nested workspace, run with
-`--locked`, plus a check that its shared packages match TN's lockfile. That reverses DECISIONS.md
-D7, so it is its own change.
-
 ## CI build time with the vendored crates
 
 rust-cache does not save path packages inside the repository, so every test lane now rebuilds the

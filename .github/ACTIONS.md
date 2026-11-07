@@ -27,7 +27,7 @@ So the two gates cover different things and neither replaces the other:
 | runs on | a maintainer's machine | GitHub runners |
 | on the pull request | checked on every run | `fmt`, `clippy` and the guards for every PR, drafts included; `test`, `adiri-test` and `vendor-reth-test` skipped for a draft or a maintainer-authored PR |
 
-`vendor-reth-test` runs reth's own tests for the vendored crates in `vendor/reth`, and the opt-in `js-tracer` build (`etc/ci-lanes.sh test-vendor-reth`); the root lanes cannot reach either.
+`vendor-reth-test` runs reth's own tests for the vendored crates in `vendor/reth`, and the opt-in `js-tracer` build (`etc/ci-lanes.sh test-vendor-reth`); the root lanes cannot reach either. It first checks that the nested workspace resolves only pinned packages (`vendor/reth/tn/lockfile.py check`).
 The carried patch crates under `patches/` that sit outside the workspace get a job each (`connection-limits-patch`, `quinn-proto-patch`, `gossipsub-patch`, `revm-inspectors-patch`) for the same reason.
 
 The queue builds a temporary `gh-readonly-queue/main/...` branch and fires a `merge_group` event against it.
@@ -93,7 +93,7 @@ The nightly `durable-e2e` failed the same way.
 From then on every queued PR failed its `test` lane on `main + PR`, whatever it changed.
 
 `.github/workflows/main-compiles.yaml` (*Main compiles*) is the tripwire for that.
-On every push to `main` that the merge queue did not make, it runs `fmt` and both `clippy` passes, checks with `etc/rocksdb-gate.sh` that no RocksDB package is in `Cargo.lock` and no manifest names one, builds the test binaries of the three test lanes under the stable pin that builds releases, and runs the library tests of the four carried patch crates.
+On every push to `main` that the merge queue did not make, it runs `fmt` and both `clippy` passes, checks with `etc/rocksdb-gate.sh` that no RocksDB package is in `Cargo.lock` or `vendor/reth/tn/test-only.lock` and no manifest names one, builds the test binaries of the three test lanes under the stable pin that builds releases, and runs the library tests of the four carried patch crates.
 It cannot block anything.
 No check can gate an advisory merge, so it is not a required check, and it reports only once the commit is on `main`: a failed run shows on `main`'s commit list and emails the account that pushed, and nobody else.
 It compiles the workspace tests without running them, so a test that fails on `main` still surfaces first in the next queued PR's `test` lane.

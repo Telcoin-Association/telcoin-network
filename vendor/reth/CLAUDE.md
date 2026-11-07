@@ -37,6 +37,7 @@ not list.
 | the carried revm-inspectors fix | `patches/revm-inspectors/PATCH.md` |
 | CI for this code | `etc/ci-lanes.sh test-vendor-reth`; `.github/workflows/pr.yaml` jobs `vendor-reth-test` and `revm-inspectors-patch` |
 | the RocksDB ban | `etc/rocksdb-gate.sh` (DECISIONS.md D14) |
+| how reth's test-only dependencies are pinned | `tn/test-only.lock`, `tn/lockfile.py` (DECISIONS.md D7) |
 
 TN code outside `crates/tn-reth` touches reth in a few places only: `tn-types` (primitives,
 `ChainSpec`, reth's `TaskSpawner` for TN's task manager), `tn-config`, `tn-exex`, `tn-storage`
@@ -130,7 +131,8 @@ These are deliberate; don't report them:
   storage-v2 plumbing stay until the storage work replaces them (D15, ROADMAP "RocksDB step B").
 - MDBX stays compiled (D9). Its upstream fixes are tracked for the tndb-b owners.
 - reth's code style, lints and rustfmt config apply here, not TN's.
-- The nested `Cargo.lock` is generated and git-ignored (D7).
+- The nested `Cargo.lock` is generated and git-ignored (D7); `tn/test-only.lock` pins what only
+  reth's tests need, and `tn/lockfile.py check` guards both.
 - Tests that needed a removed crate were dropped with it (D11).
 - `cargo.sh check -p <crate>` fails for some crates; build with `--workspace` (D18).
 - Carried crates still have code TN doesn't call; trimming it is ROADMAP work (D12, D20).
