@@ -89,8 +89,15 @@ queue, the queue has no caps other than its capacity.
 
 In a gap, the queue holds only gossip on the epoch-vote topic, because the epoch votes arrive as
 gossip between two epochs and epoch-record voting needs them. The byte weight of a vote is the
-length of its data. The author of a vote is its gossip source. The swarm forwards only gossip that
-an authorized publisher signed, so each forwarded vote has an author.
+length of its data. The queue holds a vote only when its data decodes to a vote for the epoch of the
+last event loop or the epoch before it. These are the epoch records that the vote handler accepts
+at this boundary: the record that closes, and the previous record when it has no certificate. The
+share key of a vote is its gossip source and its epoch. The swarm forwards only gossip that an
+authorized publisher signed, so each forwarded vote has a source.
+
+Before the first event loop, the queue has no epoch and holds no vote. The vote collector
+republishes each vote until quorum, so a vote shed at start arrives again after the event loop
+starts.
 
 The queue sheds all other events in a gap as `unsubscribed`. Thus certificate gossip and
 consensus-output gossip cannot take the space of the epoch votes. The certificate fetcher of the
@@ -105,17 +112,25 @@ are sized for committees of 100 members.
 
 | Cap | Value | Source |
 | --- | --- | --- |
-| Votes of one author | 4 | One vote for the closing epoch record, one for the previous record when it has no certificate, and two republished copies |
-| Votes | 1,200 | 3 committees x 100 members x 4 votes |
+| Copies of one vote | 2 | The vote of one author for one epoch record, and one republished copy |
+| Epoch records | 2 | The closing epoch record, and the previous record when it has no certificate |
+| Votes | 1,200 | 3 committees x 100 members x 2 records x 2 copies |
 | Bytes | 14,400,000 | 1,200 votes x the gossip message limit of 12,000 bytes |
 
 The swarm sheds a vote past one of these caps as `queue_budget`. Thus one member cannot take the
 space of the other members. The item cap is less than the queue capacity of 10,000, so the votes
 that the queue holds in a gap do not fill the queue.
 
+Known residual, replay: gossipsub has no freshness check, so a connected peer can replay old vote
+frames that a member signed. The queue sheds a replayed vote for an epoch outside the window as
+`unsubscribed`, so it takes no share. A replayed vote for an epoch in the window is a genuine vote
+of the member for that record, so the member loses no vote. The policy does not check the vote
+signature, so a member can publish votes with any epoch, but the window limits the member to 2
+records x 2 copies. Replayed votes in the window still count against the item cap of 1,200.
+
 When the event loop of a new epoch subscribes, the queue discards the events other than epoch votes
 that the previous event loop left. It keeps the votes in order and sets the gap counts to zero,
-also the count of each author. If the gap dropped or discarded events, the primary writes one
+also the count of each author and epoch. If the gap dropped or discarded events, the primary writes one
 warning with the number of events kept, dropped, over the caps and discarded.
 
 ## Serve permits

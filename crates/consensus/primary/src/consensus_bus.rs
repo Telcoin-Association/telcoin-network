@@ -85,8 +85,9 @@ pub const EPOCH_REQUEST_QUEUE_CAPACITY: usize = 1024;
 pub(crate) struct GapPolicy<T> {
     /// The channel name for the log.
     name: &'static str,
-    /// The weight of a message to hold, or `None` for a message to drop.
-    hold: fn(&T) -> Option<GapWeight>,
+    /// The weight of a message to hold, or `None` for a message to drop. The second argument is
+    /// the epoch of the last consumer, or `None` before the first consumer.
+    hold: fn(&T, Option<Epoch>) -> Option<GapWeight>,
     /// The most messages that the channel holds in one gap.
     max_items: usize,
     /// The most bytes that the channel holds in one gap.
@@ -100,7 +101,7 @@ impl<T> GapPolicy<T> {
     /// `max_per_author` messages of one author in one gap.
     pub(crate) fn new(
         name: &'static str,
-        hold: fn(&T) -> Option<GapWeight>,
+        hold: fn(&T, Option<Epoch>) -> Option<GapWeight>,
         max_items: usize,
         max_bytes: usize,
         max_per_author: usize,
@@ -159,6 +160,9 @@ impl GapWeight {
 struct GapState {
     /// A consumer holds the receiver. Subscribe sets it and the receiver's drop clears it.
     present: bool,
+    /// The epoch of the last consumer, or `None` before the first one. The policy uses it to
+    /// decide what to hold in the next gap.
+    epoch: Option<Epoch>,
     /// Messages held in this gap.
     items: usize,
     /// Bytes held in this gap.
@@ -174,9 +178,9 @@ struct GapState {
 }
 
 impl GapState {
-    /// The state when a consumer subscribes: present, with the gap counters at zero.
-    fn with_consumer() -> Self {
-        Self { present: true, ..Self::default() }
+    /// The state when a consumer of `epoch` subscribes: present, with the gap counters at zero.
+    fn with_consumer(epoch: Option<Epoch>) -> Self {
+        Self { present: true, epoch, ..Self::default() }
     }
 
     /// Hold a message of `weight` when it fits the caps of `policy` and the cap of its author,
@@ -238,7 +242,7 @@ impl<T> GapHold<T> {
         if state.present {
             GapAdmit::Open
         } else {
-            (self.policy.hold)(value)
+            (self.policy.hold)(value, state.epoch)
                 .map(|weight| state.hold(weight, &self.policy))
                 .unwrap_or_else(|| state.drop_unheld())
         }
@@ -254,12 +258,16 @@ impl<T> GapHold<T> {
     /// Discard the queued messages that the policy does not hold: the requests, errors and
     /// streams that the previous consumer left. Put the held ones back in order, mark the
     /// consumer present and reset the gap counters. Write one log with what the gap dropped and
-    /// what this discards. A message sent while this runs can land ahead of the held ones.
-    fn enter(&self, rx: &mut mpsc::Receiver<T>, tx: &mpsc::Sender<T>) {
+    /// what this discards. A message sent while this runs can land ahead of the held ones. The
+    /// consumer of `epoch` sets the epoch of the next gap. With `None` the epoch does not change.
+    fn enter(&self, rx: &mut mpsc::Receiver<T>, tx: &mpsc::Sender<T>, epoch: Option<Epoch>) {
         let queued: Vec<T> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        // Use the epoch of the gap in which the messages arrived, not the epoch of the new
+        // consumer, so the held messages of the last gap stay held.
+        let gap_epoch = self.state.lock().epoch;
         let (kept, discarded) =
             queued.into_iter().fold((0_usize, 0_usize), |(kept, discarded), value| {
-                if (self.policy.hold)(&value).is_some() {
+                if (self.policy.hold)(&value, gap_epoch).is_some() {
                     // The queue was just drained, so it has room for the held messages. Count
                     // one that it still refuses as discarded.
                     tx.try_send(value).map_or((kept, discarded.saturating_add(1)), |()| {
@@ -269,7 +277,10 @@ impl<T> GapHold<T> {
                     (kept, discarded.saturating_add(1))
                 }
             });
-        let gap = std::mem::replace(&mut *self.state.lock(), GapState::with_consumer());
+        let gap = std::mem::replace(
+            &mut *self.state.lock(),
+            GapState::with_consumer(epoch.or(gap_epoch)),
+        );
         let shed = gap.dropped.saturating_add(gap.over_budget).saturating_add(discarded);
         if shed > 0 {
             warn!(
@@ -405,9 +416,20 @@ impl<T> QueChannel<T> {
     where
         T: Send + 'static,
     {
+        self.subscribe_in_epoch(None)
+    }
+
+    /// Subscribe like [`Self::subscribe`] as the consumer of `epoch`.
+    ///
+    /// On a channel with a gap policy, the policy uses `epoch` to decide what to hold in the gap
+    /// after this consumer. With `None` the channel keeps the epoch of the last consumer.
+    pub(crate) fn subscribe_in_epoch(&self, epoch: Option<Epoch>) -> impl TnReceiver<T> + 'static
+    where
+        T: Send + 'static,
+    {
         let mut receiver = self.receiver.lock().take();
         let Some(rx) = receiver.as_mut() else { panic!("Another subscription is already in use!") };
-        self.gap.iter().for_each(|gap| gap.enter(rx, &self.channel));
+        self.gap.iter().for_each(|gap| gap.enter(rx, &self.channel, epoch));
         self.subscribed.store(true, Ordering::Release);
         QueChanReceiver {
             receiver,
@@ -441,7 +463,7 @@ impl<T> QueChannel<T> {
         if discarded > 0 {
             warn!(target: "primary", discarded, "discarded messages a previous subscriber left queued");
         }
-        self.gap.iter().for_each(|gap| gap.enter(rx, &self.channel));
+        self.gap.iter().for_each(|gap| gap.enter(rx, &self.channel, None));
         self.subscribed.store(true, Ordering::Release);
         QueChanReceiver {
             receiver,
@@ -1158,11 +1180,14 @@ impl ConsensusBusApp {
     ///
     /// First discard the events that the previous epoch's event loop left queued and that the gap
     /// policy does not hold (see [`crate::network::gap_policy`]). The held gossip, including the
-    /// epoch votes that arrive between two epochs, stays queued in order.
+    /// epoch votes that arrive between two epochs, stays queued in order. `epoch` is the epoch of
+    /// the event loop that subscribes. In the gap after this event loop, the gap policy holds only
+    /// the votes for this epoch and the epoch before it.
     pub fn subscribe_primary_network_events(
         &self,
+        epoch: Epoch,
     ) -> impl TnReceiver<NetworkEvent<crate::network::Req, crate::network::Res>> {
-        self.inner.primary_network_events.subscribe()
+        self.inner.primary_network_events.subscribe_in_epoch(Some(epoch))
     }
 
     /// Provide a subscription (Receiver) for consensus output.
@@ -2266,7 +2291,7 @@ mod tests {
     type Gap = (bool, usize);
 
     /// Hold the messages marked held, at their byte weight, all from one author.
-    fn gap_hold(message: &Gap) -> Option<GapWeight> {
+    fn gap_hold(message: &Gap, _: Option<Epoch>) -> Option<GapWeight> {
         message.0.then(|| GapWeight::new(message.1, GapAuthor::new(vec![0])))
     }
 
@@ -2358,7 +2383,7 @@ mod tests {
     type Authored = (u8, usize);
 
     /// Hold every authored message, at its byte weight.
-    fn authored_hold(message: &Authored) -> Option<GapWeight> {
+    fn authored_hold(message: &Authored, _: Option<Epoch>) -> Option<GapWeight> {
         Some(GapWeight::new(message.1, GapAuthor::new(vec![message.0])))
     }
 

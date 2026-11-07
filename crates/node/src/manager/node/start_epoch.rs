@@ -892,7 +892,8 @@ where
         previous_committee_keys: HashSet<BlsPublicKey>,
     ) -> eyre::Result<()> {
         // get event streams for the primary network handler
-        let rx_event_stream = self.consensus_bus.subscribe_primary_network_events();
+        let rx_event_stream =
+            self.consensus_bus.subscribe_primary_network_events(consensus_config.epoch());
 
         // set committee for network to prevent banning
         debug!(target: "epoch-manager", auth=?consensus_config.authority_id(), "spawning primary network for epoch");
