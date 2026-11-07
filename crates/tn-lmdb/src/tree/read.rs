@@ -122,11 +122,11 @@ pub(crate) fn check_identity(pgno: u32, txn: u64, want_txn: u32) -> Result<()> {
     Ok(())
 }
 
-/// The [`Error::Corrupt`] of a failed [`check_identity`]. Cold and out of line, as
-/// [`fetch_error`].
+/// The [`Error::Corrupt`] of a failed [`check_identity`], and of the writer's checks of a page's
+/// header against the pointer naming it (`tree::write`). Cold and out of line, as [`fetch_error`].
 #[cold]
 #[inline(never)]
-fn identity_error(pgno: u32, txn: u64, want_txn: u32) -> Error {
+pub(crate) fn identity_error(pgno: u32, txn: u64, want_txn: u32) -> Error {
     Error::Corrupt(format!(
         "page {pgno} (txn {txn}) is not the copy its parent names (txn {want_txn}): a \
          redirected or stale pointer"

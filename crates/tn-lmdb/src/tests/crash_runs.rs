@@ -6,7 +6,8 @@
 //! for byte through a get and both cursor scans. The commit ends with a run at the top of its
 //! pages and does not grow the file, so the one `msync` of step 4 alone must cover that run's
 //! interior pages (a growth's size sync writes every page). A variant that grows the file through
-//! a run survives a power loss.
+//! a run survives a power loss. The matrix on the same commit with the base's slack distrusted,
+//! as a reopened writer takes it, runs every crash point of a commit that cuts the inherited tail.
 
 use std::fs;
 
@@ -210,6 +211,35 @@ fn every_crash_point_recovers_a_workload_of_overflow_runs() {
 fn every_crash_point_recovers_a_workload_of_overflow_runs_heavy() {
     for page_size in [4096, 16384] {
         matrix(&runs_base(page_size), 40);
+    }
+}
+
+/// [`runs_base`] with its slack left to the reopened writer as open leaves it: distrusted (no
+/// `PageFile::trust_tail`). The crash commit fits that slack (the run workload's matrix does not
+/// grow the file), so here it grows only because its first page past the pages in use is the
+/// writer's first growth, which cuts the inherited tail (the file shrinks to the pages in use)
+/// and grows the file again from there (`PageFile::grow`); the dry run's growth check shows it.
+fn cutting_base(page_size: u32) -> Base {
+    Base { grows: true, layout: |_| {}, ..runs_base(page_size) }
+}
+
+/// The matrix on a crash commit that cuts the inherited tail ([`cutting_base`]): every crash
+/// point of it, before and after the cut and the regrowth are durable, x {process crash, strict
+/// power loss, a random power loss} x {`Durable`, `NoSync`} x {data synced by `fdatasync`, by
+/// one `msync`} reopens to exactly the allowed state, whose values read back byte for byte. A
+/// strict power loss brings the old length back, a process crash keeps the new one.
+#[test]
+fn every_crash_point_of_a_commit_that_cuts_the_inherited_tail_recovers() {
+    matrix(&cutting_base(4096), 1);
+}
+
+/// [`every_crash_point_of_a_commit_that_cuts_the_inherited_tail_recovers`] at two page sizes,
+/// with many random power losses.
+#[test]
+#[ignore = "heavy: run with --release"]
+fn every_crash_point_of_a_commit_that_cuts_the_inherited_tail_recovers_heavy() {
+    for page_size in [4096, 16384] {
+        matrix(&cutting_base(page_size), 20);
     }
 }
 

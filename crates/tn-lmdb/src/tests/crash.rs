@@ -39,12 +39,14 @@ fn key(i: u32) -> [u8; 4] {
     i.to_be_bytes()
 }
 
-/// A cleanly closed file to crash commits on: its last commit's state and txn, the state before
+/// A closed file to crash commits on (closed cleanly, which trims its slack, or as a crash, which
+/// keeps it: `crash_runs.rs`'s `runs_base`): its last commit's state and txn, the state before
 /// it, its page size, and the workload a case runs on it: the changes of the two commits
 /// `SyncMode::NoSync` cases leave unsynced (by round), the crashing commit's, whether that commit
 /// grows the file (when it does not, [`run_case`] takes the base's slack as the reopened writer's
-/// own growth, `PageFile::trust_tail`), and a check of the layout the matrix relies on, run on
-/// the state the crashing commit made (`dry_run`).
+/// own growth, `PageFile::trust_tail`; when it does, the reopened writer distrusts any slack the
+/// base kept, so its first growth cuts it), and a check of the layout the matrix relies on, run
+/// on the state the crashing commit made (`dry_run`).
 pub(super) struct Base {
     pub(super) dir: TempDir,
     pub(super) path: PathBuf,
