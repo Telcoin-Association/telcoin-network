@@ -479,18 +479,33 @@ pub(crate) const fn commit_run_ahead_ok(
     leader_round <= exec_round.saturating_add(max_run_ahead)
 }
 
-/// The lowest round of a restored DAG when it lies above the round after `last_committed_round`.
+/// The lowest round of a restored DAG that has a hole: a round missing between the round after
+/// the GC round, `last_committed_round - gc_depth + 1`, and `last_committed_round`.
 ///
-/// Bullshark orders the next sub-dag from the certificates just above the last committed round.
-/// The certificate store prunes from its newest round, and the consensus pack of a node whose
-/// execution lagged can trail that round by more than the prune depth, so a restart can restore a
-/// DAG with none of those certificates; ordering from it skips the missing history and can
-/// sequence a sub-dag no other node commits. `None` for a fresh epoch (nothing committed), an
-/// empty DAG (a promotion from catch-up, which stores no certificates) and a DAG that reaches
-/// down to the next round.
-fn restored_dag_gap(last_committed_round: Round, dag: &Dag) -> Option<Round> {
+/// The restore reads every stored certificate above `gc_round` (see
+/// `construct_dag_from_cert_store`), and ordering can need any of them, not only those above the
+/// committed round: a certificate in `(gc_round, last_committed_round]` that no leader has
+/// committed yet is still ordered by the next leader whose history reaches it, and `order_dag`
+/// skips a parent missing from the DAG instead of failing. Ordering over a hole can sequence a
+/// sub-dag no other node commits. Two histories leave one:
+/// - execution lagged: the certificate store prunes from its newest round, and the consensus pack
+///   can trail that round by more than the prune depth less `gc_depth`, so the DAG starts above the
+///   round after the GC round;
+/// - the node was inactive, when it stores no certificates, and restarts within about `gc_depth`
+///   rounds of its promotion: the rounds it spent inactive are missing at the bottom or in the
+///   middle of the window. Such a restart is demoted once although nothing is wrong with the node;
+///   it costs one more catch-up, the price of never ordering over a hole.
+///
+/// `None` for a fresh epoch (nothing committed), an empty DAG (a promotion from catch-up, which
+/// stores no certificates) and a DAG holding every round of the window.
+fn restored_dag_gap(last_committed_round: Round, gc_round: Round, dag: &Dag) -> Option<Round> {
     let dag_min_round = *dag.first_key_value()?.0;
-    (last_committed_round > 0 && dag_min_round > last_committed_round.saturating_add(1))
+    let expected_min_round = gc_round.saturating_add(1);
+    let window = expected_min_round..=last_committed_round;
+    // `range` panics on an inverted range, so an empty window (a zero gc_depth) checks the bottom
+    let window_complete =
+        window.is_empty() || dag.range(window.clone()).map(|(round, _)| *round).eq(window);
+    (last_committed_round > 0 && (dag_min_round > expected_min_round || !window_complete))
         .then_some(dag_min_round)
 }
 
@@ -567,14 +582,20 @@ impl<DB: Database> Consensus<DB> {
             .committed_round_updates()
             .send_replace(state.last_round.committed_round);
 
-        // an active cvv must not order from a restored dag that starts above the next round (see
-        // `restored_dag_gap`); it goes inactive and catches up from its peers instead
+        // an active cvv must not order from a restored dag with a hole between the round after
+        // its gc round and its committed round (see `restored_dag_gap`); it goes inactive and
+        // catches up from its peers instead
         if consensus_bus.is_active_cvv() {
-            if let Some(dag_min_round) = restored_dag_gap(last_committed_round, &state.dag) {
+            let gc_round = state.last_round.gc_round;
+            if let Some(dag_min_round) =
+                restored_dag_gap(last_committed_round, gc_round, &state.dag)
+            {
                 info!(
                     target: "primary::consensus",
                     last_committed_round,
                     dag_min_round,
+                    gc_round,
+                    expected_min = gc_round.saturating_add(1),
                     "restored dag has a gap above the committed round; going inactive"
                 );
                 let previous = consensus_bus.app().node_mode().send_replace(NodeMode::CvvInactive);
@@ -889,18 +910,48 @@ mod commit_run_ahead_tests {
     }
 
     /// A restored DAG is a gap only when it is not empty, the epoch has committed something and
-    /// its lowest round lies above the round after the committed round.
+    /// it misses a round between the round after the GC round, `C - gc_depth + 1`, and `C`.
     #[test]
     fn restored_dag_gap_boundaries() {
-        let dag_from = |min_round: Round| -> Dag {
-            (min_round..min_round + 3).map(|round| (round, HashMap::new())).collect()
+        const GC_DEPTH: Round = 50;
+        const C: Round = 200;
+        const GC_ROUND: Round = C - GC_DEPTH;
+        // rounds `min_round` through `C + 2`, without `missing`
+        let dag_from_without = |min_round: Round, missing: Option<Round>| -> Dag {
+            (min_round..=C + 2)
+                .filter(|round| Some(*round) != missing)
+                .map(|round| (round, HashMap::new()))
+                .collect()
         };
-        assert_eq!(restored_dag_gap(20, &Dag::new()), None, "an empty dag (a promotion)");
-        assert_eq!(restored_dag_gap(0, &dag_from(200)), None, "nothing committed yet");
-        assert_eq!(restored_dag_gap(20, &dag_from(1)), None, "a healthy restart");
-        assert_eq!(restored_dag_gap(20, &dag_from(21)), None, "the next round is present");
-        assert_eq!(restored_dag_gap(20, &dag_from(22)), Some(22));
-        assert_eq!(restored_dag_gap(20, &dag_from(200)), Some(200));
+        let dag_from = |min_round: Round| dag_from_without(min_round, None);
+        assert_eq!(restored_dag_gap(C, GC_ROUND, &Dag::new()), None, "an empty dag (a promotion)");
+        assert_eq!(restored_dag_gap(0, 0, &dag_from(150)), None, "nothing committed yet");
+        assert_eq!(
+            restored_dag_gap(C, GC_ROUND, &dag_from(C - GC_DEPTH + 1)),
+            None,
+            "the round after the gc round is present"
+        );
+        assert_eq!(restored_dag_gap(C, GC_ROUND, &dag_from(C - 120)), None, "rounds below it too");
+        assert_eq!(
+            restored_dag_gap(C, GC_ROUND, &dag_from(C - GC_DEPTH + 2)),
+            Some(C - GC_DEPTH + 2),
+            "the round after the gc round is missing"
+        );
+        // the old boundary admitted a dag reaching down to the round after the committed round,
+        // with a hole in the rounds an uncommitted certificate can still be ordered from
+        assert_eq!(restored_dag_gap(C, GC_ROUND, &dag_from(C + 1)), Some(C + 1));
+        // a hole in the middle of the window, from rounds spent inactive before a promotion
+        let middle_hole = dag_from_without(C - GC_DEPTH + 1, Some(C - 10));
+        assert_eq!(restored_dag_gap(C, GC_ROUND, &middle_hole), Some(C - GC_DEPTH + 1));
+        let committed_round_missing = dag_from_without(C - GC_DEPTH + 1, Some(C));
+        assert_eq!(restored_dag_gap(C, GC_ROUND, &committed_round_missing), Some(C - GC_DEPTH + 1));
+        // inside the epoch's first gc_depth rounds the gc round saturates at 0: the dag must reach
+        // round 1
+        assert_eq!(restored_dag_gap(20, 0, &dag_from(1)), None, "a healthy early restart");
+        assert_eq!(restored_dag_gap(20, 0, &dag_from(2)), Some(2));
+        // a zero gc_depth leaves an empty window: only the bottom is checked
+        assert_eq!(restored_dag_gap(C, C, &dag_from(C + 1)), None);
+        assert_eq!(restored_dag_gap(C, C, &dag_from(C + 2)), Some(C + 2));
     }
 }
 

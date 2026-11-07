@@ -267,6 +267,11 @@ fn penalty_from_header_error(error: &HeaderError) -> Option<Penalty> {
         // the refusal describes the voter's state, never the header, so the requester is left
         // free to retry and earns the vote once this node has caught up
         HeaderError::NotActiveCvv | HeaderError::ExecutionBehind { .. } => None,
+        // ignore (this voter's restored datadir, not the requester's fault)
+        //
+        // a snapshot-restored voter cannot check a block below its floor; the requester's header
+        // may be valid, and the voters with the full history decide it
+        HeaderError::BelowRestoreFloor { .. } => None,
     }
 }
 
@@ -449,5 +454,19 @@ mod tests {
             header_block: 12,
             local_block: 9,
         });
+    }
+
+    /// A snapshot-restored voter can never check a header's block below its floor: the refusal
+    /// carries no penalty, and it is final (not retryable), so the requester stops asking this
+    /// voter for the header.
+    #[test]
+    fn below_restore_floor_refusal_is_final_and_not_penalized() {
+        use crate::network::PrimaryResponse;
+
+        let error = HeaderError::BelowRestoreFloor { header_block: 50, floor: 100 };
+        assert_eq!(penalty_from_header_error(&error), None);
+        let error = PrimaryNetworkError::InvalidHeader(error);
+        assert!(Option::<Penalty>::from(&error).is_none());
+        assert!(matches!(PrimaryResponse::into_error_ref(&error), PrimaryResponse::Error(_)));
     }
 }

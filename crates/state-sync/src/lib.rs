@@ -12,7 +12,9 @@ use tn_test_utils_committee as _;
 
 use std::{future::Future, time::Duration};
 use tn_config::ConsensusConfig;
-use tn_primary::{ConsensusBusApp, NodeMode, PrimaryMetrics, SYNC_OUTPUT_CHANNEL_CAPACITY};
+use tn_primary::{
+    ConsensusBusApp, ExecutionCheckError, NodeMode, PrimaryMetrics, SYNC_OUTPUT_CHANNEL_CAPACITY,
+};
 use tn_storage::{consensus::ConsensusChain, tables::ConsensusCache};
 use tn_types::{
     ConsensusHeader, ConsensusHeaderDigest, ConsensusOutput, Database, Epoch, TaskError,
@@ -603,18 +605,35 @@ async fn catch_up_consensus_from_to<DB: Database>(
             },
         )
         .await;
-        if wait_result.is_err() {
-            // We seem to have forked, so die.
-            error!(
+        match wait_result {
+            Ok(()) => {}
+            // a snapshot-restored node holds no block below its floor and cannot check this one;
+            // the voters that certified the leader checked it against their own chains
+            Err(ExecutionCheckError::BelowFloor { floor }) => warn!(
                 target: "tn::observer",
                 block_number = number,
-                ?base_execution_block,
-                "wait_for_execution failed - execution fork detected"
-            );
-            return Err(eyre::eyre!(
-                "consensus_output has a parent not in our chain, missing {base_execution_block:?} recents: {:?}!",
-                consensus_bus.recent_blocks().borrow()
-            ));
+                base_block = base_execution_block.number,
+                floor,
+                "output's base block is below the restored-state floor; not checked"
+            ),
+            Err(ExecutionCheckError::Closed) => {
+                return Err(eyre::eyre!(
+                    "recent blocks watch closed while checking {base_execution_block:?}"
+                ));
+            }
+            Err(ExecutionCheckError::Fork) => {
+                // We seem to have forked, so die.
+                error!(
+                    target: "tn::observer",
+                    block_number = number,
+                    ?base_execution_block,
+                    "wait_for_execution failed - execution fork detected"
+                );
+                return Err(eyre::eyre!(
+                    "consensus_output has a parent not in our chain, missing {base_execution_block:?} recents: {:?}!",
+                    consensus_bus.recent_blocks().borrow()
+                ));
+            }
         }
         // Deliver the full, verified output (with batches) for execution. The queue is bounded, so
         // this send blocks while the subscriber is behind; the epoch task manager aborts this task
@@ -1288,6 +1307,74 @@ mod tests {
             EXEC_ROUND,
             "committed_round is the exec round"
         );
+        Ok(())
+    }
+
+    // ---- bench5 f1-commit-lag ----
+
+    /// SEC-6: a snapshot-restored node cannot check a leader block below its floor. Catch-up
+    /// delivers the output to `sync_output` with one warning and returns `Ok`, where a failed
+    /// check would return an error that the stream retries forever.
+    #[tokio::test]
+    async fn catch_up_delivers_an_output_below_the_restore_floor() -> eyre::Result<()> {
+        /// A datadir restored at block 100 that attests no block.
+        struct RestoredAt100;
+        impl tn_types::CanonicalExecutionReader for RestoredAt100 {
+            fn canonical_execution_hash(&self, _: u64) -> Option<B256> {
+                None
+            }
+            fn restored_state_floor(&self) -> Option<u64> {
+                Some(100)
+            }
+        }
+
+        let warnings = Arc::new(AtomicUsize::new(0));
+        let _log_guard = tracing::subscriber::set_default(ObserverWarnCounter(warnings.clone()));
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let temp_dir = TempDir::new()?;
+        let chain =
+            ConsensusChain::new_for_test(temp_dir.path().to_owned(), fixture.committee()).await?;
+        let block1 = output_at(&fixture, 1, B256::ZERO.into());
+        let leader_block = block1.consensus_header().sub_dag.leader().latest_execution_block();
+        assert!(leader_block.number < 100, "the leader names a block below the floor");
+        let db = MemDatabase::default();
+        db.insert::<ConsensusCache>(&1, &block1)?;
+
+        // executed through block 120 after the restore, with no block at the leader's height
+        let consensus_bus = ConsensusBusApp::new();
+        consensus_bus.recent_blocks().send_modify(|blocks| {
+            blocks.push_latest(
+                1,
+                ConsensusNumHash::default(),
+                Some(SealedHeader::new(
+                    ExecHeader { number: 120, ..Default::default() },
+                    B256::repeat_byte(1),
+                )),
+            )
+        });
+        consensus_bus.set_canonical_reader(Arc::new(RestoredAt100));
+        let mut rx_sync_output = consensus_bus.subscribe_sync_output();
+
+        let mut from = ConsensusHeader::default();
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            catch_up_consensus_from_to(
+                &consensus_bus,
+                &mut from,
+                block1.consensus_header(),
+                &db,
+                &chain,
+                fixture.committee().epoch(),
+                &StateSyncMetrics::default(),
+            ),
+        )
+        .await
+        .expect("catch-up does not wait on a block it cannot check")?;
+
+        assert_eq!(from.number, 1, "the output is recorded as progress");
+        let delivered = rx_sync_output.try_recv().map(|output| output.consensus_header().number);
+        assert_eq!(delivered.ok(), Some(1), "the output reached sync_output");
+        assert_eq!(warnings.load(Ordering::SeqCst), 1, "one below-floor warning");
         Ok(())
     }
 }

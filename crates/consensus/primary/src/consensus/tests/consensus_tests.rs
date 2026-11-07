@@ -1897,11 +1897,13 @@ async fn gate_releases_when_execution_advances() {
     config.shutdown().notify();
 }
 
-/// An active CVV whose restored DAG starts more than one round above its committed round goes
-/// inactive and starts no consensus task.
+/// An active CVV whose restored DAG starts above the round after its GC round goes inactive and
+/// starts no consensus task.
 ///
-/// The pack committed leader 20, while the certificate store kept only rounds 200 to 260 (it
-/// prunes from its newest round): ordering from that DAG would skip rounds 21 to 199.
+/// The pack committed leader C, while the certificate store kept only the rounds from
+/// `C - gc_depth + 2` (it prunes from its newest round): ordering from that DAG would skip round
+/// `C - gc_depth + 1`, whose uncommitted certificates the next leader can still reach. The DAG
+/// reaches below `C + 1`, so the boundary this replaced let it through.
 #[tokio::test]
 async fn spawn_demotes_on_restored_dag_gap() {
     let fixture = CommitteeFixture::builder(MemDatabase::default).build();
@@ -1913,8 +1915,12 @@ async fn spawn_demotes_on_restored_dag_gap() {
     let temp_dir = TempDir::new().unwrap();
     let consensus_chain =
         ConsensusChain::new_for_test(temp_dir.path().to_owned(), committee.clone()).await.unwrap();
+    let gc_depth = config.parameters().gc_depth;
+    let committed_round = gc_depth + 20;
+    let first_stored_round = committed_round - gc_depth + 2;
 
-    let (_, leader) = mock_certificate(&committee, ids[0].clone(), 20, BTreeSet::new());
+    let (_, leader) =
+        mock_certificate(&committee, ids[0].clone(), committed_round, BTreeSet::new());
     let committed = CommittedSubDag::new(
         vec![leader.clone()],
         leader,
@@ -1924,7 +1930,12 @@ async fn spawn_demotes_on_restored_dag_gap() {
         EpochSeedChainValue::epoch_root(committee.epoch()),
     );
     consensus_chain.write_subdag_for_test(1, committed).await;
-    let (stored, _) = make_optimal_certificates(&committee, 200..=260, &genesis, &ids);
+    let (stored, _) = make_optimal_certificates(
+        &committee,
+        first_stored_round..=committed_round + 10,
+        &genesis,
+        &ids,
+    );
     for certificate in stored {
         config.node_storage().write(certificate).unwrap();
     }
@@ -1944,7 +1955,11 @@ async fn spawn_demotes_on_restored_dag_gap() {
 
     assert!(cb.is_cvv_inactive(), "the node goes inactive");
     assert!(rx_shutdown.noticed(), "the epoch shuts down to restart in catch-up");
-    assert_eq!(cb.app().committed_round(), 20, "the committed round is primed from the pack");
+    assert_eq!(
+        cb.app().committed_round(),
+        committed_round,
+        "the committed round is primed from the pack"
+    );
     // the consensus task subscribes before it is spawned and a second subscription panics, so
     // this subscription succeeding shows no task was spawned
     let _rx_new_certificates = cb.subscribe_new_certificates();

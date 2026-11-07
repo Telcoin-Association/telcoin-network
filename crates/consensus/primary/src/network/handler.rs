@@ -6,7 +6,7 @@ use crate::{
     metrics::{record_mode_transition, ModeTransitionReason, VoteStage, VoteStageHandles},
     network::message::{PrimaryGossip, PrimaryRPCError},
     state_sync::{CertificateCollector, StateSynchronizer},
-    ConsensusBusApp, NodeMode,
+    ConsensusBusApp, ExecutionCheckError, NodeMode,
 };
 use futures::AsyncWriteExt as _;
 use parking_lot::Mutex;
@@ -1105,7 +1105,7 @@ where
         .await
         {
             Ok(Ok(())) => {}
-            Ok(Err(_)) => {
+            Ok(Err(ExecutionCheckError::Fork)) => {
                 error!(
                     target: "primary",
                     peer_hash = ?header_block,
@@ -1113,6 +1113,25 @@ where
                     "unexpected execution result received"
                 );
                 return Err(HeaderError::UnknownExecutionResult(header_block).into());
+            }
+            Ok(Err(ExecutionCheckError::BelowFloor { floor })) => {
+                // a snapshot-restored voter holds no block below its floor, so it can neither
+                // confirm nor refute the header's and never will: a final refusal without a
+                // penalty, not a fork
+                warn!(
+                    target: "primary",
+                    header_block = header_block.number,
+                    floor,
+                    "header's execution block is below the restored-state floor; not voting"
+                );
+                return Err(HeaderError::BelowRestoreFloor {
+                    header_block: header_block.number,
+                    floor,
+                }
+                .into());
+            }
+            Ok(Err(ExecutionCheckError::Closed)) => {
+                return Err(HeaderError::ClosedWatchChannel.into());
             }
             Err(_) => {
                 self.consensus_bus.metrics().votes_refused_execution_behind_total.increment(1);
@@ -1958,6 +1977,7 @@ impl VoteOutcome {
                 HeaderError::Storage(_)
                 | HeaderError::ClosedWatchChannel
                 | HeaderError::NotCommitteeMember
+                | HeaderError::BelowRestoreFloor { .. }
                 | HeaderError::SyncBatches(_)
                 | HeaderError::TNSend(_)
                 | HeaderError::PendingCertificateOneshot,

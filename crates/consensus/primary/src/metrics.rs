@@ -131,6 +131,13 @@ pub struct PrimaryMetrics {
     /// `REJOIN_DEMOTION_GRACE` ago, counted once per certificate or consensus result that would
     /// have demoted it. Non-zero means a promoted node's DAG was not live yet.
     pub(crate) rejoin_grace_holds_total: Counter,
+    // bench5 f1-commit-lag
+    /// Times the execution check asked the canonical database again because it could not answer
+    /// for a block at or below the executed tip (a read error), one per retry.
+    ///
+    /// Zero in a healthy node; a rising value means the execution database keeps failing reads
+    /// and the waits behind it (votes, the subscriber, catch-up) are held.
+    pub(crate) execution_check_retries_total: Counter,
 }
 
 impl PrimaryMetrics {
@@ -675,6 +682,7 @@ mod tests {
             metrics.votes_refused_inactive_total.increment(1);
             metrics.votes_refused_execution_behind_total.increment(2);
             metrics.rejoin_grace_holds_total.increment(1);
+            metrics.execution_check_retries_total.increment(4);
         });
 
         let snapshot = snapshotter.snapshot().into_vec();
@@ -758,6 +766,8 @@ mod tests {
         assert!(matches!(value, DebugValue::Counter(2)));
         let (_, _, _, value) = find("tn_primary.rejoin_grace_holds_total");
         assert!(matches!(value, DebugValue::Counter(1)));
+        let (_, _, _, value) = find("tn_primary.execution_check_retries_total");
+        assert!(matches!(value, DebugValue::Counter(4)));
     }
 
     /// The vote path handles register every series and label the bench analysis reads: the four

@@ -8,7 +8,7 @@ use std::fmt::Debug;
 use thiserror::Error;
 use tn_primary::consensus::ConsensusError;
 use tn_storage::StoreError;
-use tn_types::{AuthorityIdentifier, BlockHash, HeaderDigest, WorkerId};
+use tn_types::{AuthorityIdentifier, BlockHash, HeaderDigest, Round, WorkerId};
 
 /// Returns an error if the given condition is false.
 ///
@@ -169,10 +169,10 @@ pub enum SubscriberError {
     /// The leader of a committed sub-dag references an execution block this node did not execute
     /// at that height.
     ///
-    /// Once local execution reached the block's number, the block was neither among the recently
-    /// executed blocks nor canonical in the execution database: this node's execution has forked
-    /// from the leader's. The output is never saved; the subscriber goes inactive and shuts the
-    /// epoch down.
+    /// Once local execution reached the block's number, this node held a different block at that
+    /// number, in its recently executed blocks or as canonical in its execution database: this
+    /// node's execution has forked from the leader's. The output is never saved; the subscriber
+    /// goes inactive and shuts the epoch down.
     #[error(
         "execution fork at consensus output {number}: leader's execution block {base_block} ({base_hash}) is not on the local chain"
     )]
@@ -183,5 +183,9 @@ pub enum SubscriberError {
         base_block: u64,
         /// The hash of the leader's execution block.
         base_hash: BlockHash,
+        /// The author of the leader certificate that named the block.
+        leader: AuthorityIdentifier,
+        /// The round of the leader certificate.
+        leader_round: Round,
     },
 }

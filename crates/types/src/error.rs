@@ -239,6 +239,15 @@ pub enum HeaderError {
         "Execution is behind the header: header block {header_block}, local block {local_block}"
     )]
     ExecutionBehind { header_block: u64, local_block: u64 },
+    /// The header's execution block lies below this node's restored-state floor, so this voter
+    /// can never check it and refuses to vote.
+    ///
+    /// `header_block` is the number of the header's `latest_execution_block` and `floor` the
+    /// earliest block this snapshot-restored node holds. The refusal is final for the header but
+    /// carries no penalty: it describes this voter's datadir, not a fault in the header, and the
+    /// voters with the full history decide it.
+    #[error("Header's execution block {header_block} is below the restored-state floor {floor}")]
+    BelowRestoreFloor { header_block: u64, floor: u64 },
     /// Worker's ID is not in the cache.
     #[error("Header has an unknown worker ID")]
     UnkownWorkerId,
