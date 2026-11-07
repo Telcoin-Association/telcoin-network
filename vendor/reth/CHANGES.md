@@ -513,8 +513,12 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   *Files*: `crates/rpc/ipc/src/server/mod.rs`.
   *Why*: 0e14f1a8a: a connection's service loop kept polling its closed response channel, which
   returns at once, so it spun a core until the connection's other arms ended; it now ends the
-  loop. TN serves IPC on every worker unless `--ipcdisable` is set. RPC only. *Tests*: reth-ipc
-  17/17. *Upstream*: n/a (upstream commits).
+  loop. a68f9e19f: each request built a fresh subscription counter, so
+  `--rpc.max-subscriptions-per-connection` never limited an IPC connection; the connection's
+  counter is now shared by its requests. TN serves IPC on every worker unless `--ipcdisable` is
+  set; the socket is local, so only a local process could open the subscriptions. RPC only.
+  *Tests*: upstream's `test_max_subscriptions_per_connection`; reth-ipc 18/18. *Upstream*: n/a
+  (upstream commits).
 
 ## TN fixes (not from an upstream commit)
 

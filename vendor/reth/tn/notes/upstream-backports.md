@@ -56,6 +56,7 @@ Severity below is for TN, which differs from upstream's in places. Relevant TN f
 | 8861e2724 | TN-0042 | transactions a lower base fee promotes in `set_block_info` reach pending listeners (`newPendingTransactions`) | TN test fails without the fix; txpool 229/229 |
 | 62808bd06 | TN-0043 | the pool admits a sender whose code hash is the empty hash (an EOA to the EVM) | upstream test; txpool 230/230 |
 | 0e14f1a8a | TN-0044 | an IPC connection's service loop ends when its response channel closes instead of spinning | reth-ipc 17/17 |
+| a68f9e19f | TN-0044 | `--rpc.max-subscriptions-per-connection` limits IPC connections (each request had built a fresh counter) | upstream test; reth-ipc 18/18 |
 
 ## Open
 
@@ -92,7 +93,7 @@ Severity below is for TN, which differs from upstream's in places. Relevant TN f
 
 ### Low
 
-a68f9e19f (IPC max subscriptions per connection), e7ebeb869 (partial
+e7ebeb869 (partial
 receipts), 1a6ba945a
 (codecs decode), 078c22d5f (iterative BlockState drop), 44a74f9ea (reject conflicting
 transaction fees in call requests), 33b785d97 (`0x` data for empty reverts), 9580b7fc1 (zstd
