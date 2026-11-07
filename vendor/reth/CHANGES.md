@@ -630,13 +630,18 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
 
 - **TN-0052** — Backport upstream's Low fixes on the chain-state and storage paths. *Kind*:
   backport.
-  *Files*: `crates/chain-state/src/in_memory.rs`.
+  *Files*: `crates/chain-state/src/in_memory.rs`, `crates/storage/codecs/src/alloy/header.rs`.
   *Why*: none changes what a block executes to or what a datadir stores.
   - 078c22d5f: `BlockState` drops its parent chain in a loop. The derived drop recursed once per
     in-memory ancestor it released, so dropping the head of a long unpersisted chain could
     overflow a thread's stack. Drop only; the conflict was a later upstream test in the same
     module, not taken.
-  *Tests*: upstream's `deep_chain_drop_preserves_shared_tail`. *Upstream*: n/a (upstream commits).
+  - 1a6ba945a: `AlloyHeader::from_compact` returns the buffer past the header, not the buffer it
+    was given, so a type that decodes a header followed by more fields reads them from the right
+    offset. TN stores headers as whole values (static files, MDBX), which ignore the returned
+    buffer, so decoded headers and stored bytes are unchanged.
+  *Tests*: upstream's `deep_chain_drop_preserves_shared_tail`; codecs' compact round-trip tests.
+  *Upstream*: n/a (upstream commits).
 
 ## TN fixes (not from an upstream commit)
 
