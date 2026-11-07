@@ -48,9 +48,20 @@ const REJOIN_HEAD_MAX_AGE: Duration = Duration::from_secs(5);
 /// sends none. A quarter of the stall threshold keeps the rejoin within one interval of the
 /// threshold at a negligible cost: two watch reads and two consensus-chain hints per tick, a send
 /// on the gap-request watch while the gossiped frontier is ahead of the replayed outputs and the
-/// head has stood still for an interval, and a request to the epoch-record actor only for a check
-/// that passes the hints.
+/// head, or the replayed output, has stood still for an interval, and a request to the
+/// epoch-record actor only for a check that passes the hints. A stalled head re-sends the gap
+/// request every interval; a replay stuck below a moving head re-sends its first request with a
+/// doubling wait capped at [`REJOIN_STUCK_REPLAY_MAX_BACKOFF`].
 const REJOIN_STALLED_HEAD_CHECK_INTERVAL: Duration = Duration::from_secs(5);
+
+/// The longest wait between two gap requests of a replay stuck below a moving head
+/// ([`Subscriber::rerequest_behind_frontier`]).
+///
+/// The first request goes out one [`REJOIN_STALLED_HEAD_CHECK_INTERVAL`] after the replay stopped
+/// moving, and the wait doubles with every repeat of the same request (10 s, 20 s, 40 s) up to
+/// this cap, so a replay that cannot move (an output no peer serves, or a stream that refuses
+/// what it is given) costs one bounded walk a minute rather than a new, wider walk per check.
+const REJOIN_STUCK_REPLAY_MAX_BACKOFF: Duration = Duration::from_secs(60);
 
 /// The most the stalled-head rule backs off: a catching-up CVV must watch the head stall for at
 /// most this many times [`tn_types::REJOIN_STALLED_HEAD_AFTER`] (see
@@ -71,7 +82,8 @@ const REJOIN_STALLED_HEAD_NOT_READY_LOG_INTERVAL: Duration = Duration::from_secs
 
 /// Minimum interval between two `re-requesting consensus outputs behind the gossiped frontier`
 /// lines of one catch-up loop. The re-request itself repeats every
-/// [`REJOIN_STALLED_HEAD_CHECK_INTERVAL`] while the gap stays open.
+/// [`REJOIN_STALLED_HEAD_CHECK_INTERVAL`] while the head stays stalled, and backs off up to
+/// [`REJOIN_STUCK_REPLAY_MAX_BACKOFF`] while only the replay is stuck.
 const REJOIN_FRONTIER_REREQUEST_LOG_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Shortest wait for local execution that a committed sub-dag logs before its output is assembled.
@@ -427,7 +439,12 @@ impl<DB: Database> Subscriber<DB> {
         // a stall counts only from here: the newest known header is whatever this node saved or
         // heard before it was demoted, which says nothing about whether the committee still
         // commits. the first check is one interval in
-        let mut stalled = StalledHeadCheck::new(self.newest_number(), entry, stall_needed);
+        let mut stalled = StalledHeadCheck::new(
+            self.newest_number(),
+            self.inner.consensus_chain.latest_consensus_number(),
+            entry,
+            stall_needed,
+        );
         let mut stalled_head_check = tokio::time::interval_at(
             entry + REJOIN_STALLED_HEAD_CHECK_INTERVAL,
             REJOIN_STALLED_HEAD_CHECK_INTERVAL,
@@ -555,8 +572,9 @@ impl<DB: Database> Subscriber<DB> {
     ///
     /// A refused check logs `stalled head not ready` with the part that blocked it, at most once
     /// per [`REJOIN_STALLED_HEAD_NOT_READY_LOG_INTERVAL`]. A check that finds the gossiped frontier
-    /// ahead of the replayed outputs while the newest known header has not moved for a check
-    /// interval asks state sync to fetch the gap again ([`Self::rerequest_behind_frontier`]).
+    /// ahead of the replayed outputs while the newest known header, or the replayed output, has
+    /// not moved for a check interval asks state sync to fetch the gap again
+    /// ([`Self::rerequest_behind_frontier`]).
     ///
     /// A committee halted below quorum commits nothing, so without this check the freshness rule of
     /// [`rejoin_ready`] would keep this node inactive, and the committee halted, for good.
@@ -571,9 +589,12 @@ impl<DB: Database> Subscriber<DB> {
         let (_, gossiped_number, _) = gossiped;
         let chain = &self.inner.consensus_chain;
         let replayed_number = chain.latest_consensus_number();
-        if gossiped_number > replayed_number && unchanged_for >= REJOIN_STALLED_HEAD_CHECK_INTERVAL
+        let replay_unchanged_for = check.observe_replay(replayed_number, now);
+        let head_stalled = unchanged_for >= REJOIN_STALLED_HEAD_CHECK_INTERVAL;
+        if gossiped_number > replayed_number
+            && (head_stalled || replay_unchanged_for >= REJOIN_STALLED_HEAD_CHECK_INTERVAL)
         {
-            self.rerequest_behind_frontier(check, gossiped, replayed_number, now);
+            self.rerequest_behind_frontier(check, gossiped, replayed_number, head_stalled, now);
         }
         let mut ready = stalled_head_ready(
             chain.latest_consensus_epoch(),
@@ -631,15 +652,29 @@ impl<DB: Database> Subscriber<DB> {
 
     /// Ask state sync to fetch the outputs from `replayed_number + 1` up to the `gossiped`
     /// frontier again, through the gap fill of the consensus fetch task, at most once per
-    /// [`REJOIN_STALLED_HEAD_CHECK_INTERVAL`].
+    /// [`REJOIN_STALLED_HEAD_CHECK_INTERVAL`] while the head is stalled (`head_stalled`), and with
+    /// a backoff while only the replay is stuck.
     ///
     /// A gossiped number is fetched once, when it arrives, and that fetch can end without the
     /// outputs: the fetch task holds back a number while too many walks run, and a walk abandons a
     /// range in an epoch no local pack decodes. A committee halted below quorum gossips nothing
     /// later, so the gap would stay open and the frontier part of [`stalled_head_ready`] would
-    /// refuse forever. The fetch task defers a request that running walks already cover
-    /// (`reserve_if_uncovered`), so this recovers a fetch that was skipped or has ended, not one a
-    /// covering walk is still retrying, and repeating it costs nothing while such walks run.
+    /// refuse forever. A live committee keeps gossiping, but each later walk stops at the previous
+    /// gossiped number, so nothing refetches outputs lost below that floor: state sync drops an
+    /// output from its cache when it hands it to a catch-up loop, and the next loop discards what
+    /// the previous one left queued (a promotion that ended in a demotion), so a replay stuck
+    /// below a moving head asks too. The fetch task defers a request that running walks already
+    /// cover (`reserve_if_uncovered`), so this recovers a fetch that was skipped or has ended,
+    /// not one a covering walk is still retrying, and repeating it costs nothing while such
+    /// walks run.
+    ///
+    /// A replay stuck below a moving head would widen that request with every check: its floor
+    /// stays while the frontier rises, so once the previous walk has ended the wider range is
+    /// uncovered and every check would start another walk down to the floor. While the floor
+    /// stays the same, the stuck replay therefore re-sends its first request unchanged (a walk
+    /// still running covers it, and gossip walks fetch the outputs above it anyway), and waits
+    /// twice as long before each repeat, up to [`REJOIN_STUCK_REPLAY_MAX_BACKOFF`]; a replay that
+    /// moves resets both ([`StalledHeadCheck::observe_replay`]).
     ///
     /// A frontier gossiped in a later epoch than this node's committee is not re-requested: the
     /// walk would abort at once in an epoch this node cannot decode yet, and the send would replace
@@ -649,22 +684,50 @@ impl<DB: Database> Subscriber<DB> {
         check: &mut StalledHeadCheck,
         gossiped: (Epoch, u64, ConsensusHeaderDigest),
         replayed_number: u64,
+        head_stalled: bool,
         now: tokio::time::Instant,
     ) {
         let (epoch, to, hash) = gossiped;
-        if epoch > self.inner.committee.epoch()
-            || !rate_limit_due(&mut check.rerequested, now, REJOIN_STALLED_HEAD_CHECK_INTERVAL)
-        {
+        if epoch > self.inner.committee.epoch() {
             return;
         }
-        let from = replayed_number.saturating_add(1);
-        self.consensus_bus.consensus_gap_request().send_replace(Some((epoch, to, hash, from)));
+        let fresh = (epoch, to, hash, replayed_number.saturating_add(1));
+        let stuck_replay = if head_stalled {
+            None
+        } else {
+            match check.stuck_replay {
+                Some(stuck) if now.saturating_duration_since(stuck.sent) < stuck.wait => return,
+                Some(stuck) => Some(StuckReplayRequest {
+                    sent: now,
+                    wait: stuck.wait.saturating_mul(2).min(REJOIN_STUCK_REPLAY_MAX_BACKOFF),
+                    ..stuck
+                }),
+                None => Some(StuckReplayRequest {
+                    request: fresh,
+                    sent: now,
+                    wait: REJOIN_STALLED_HEAD_CHECK_INTERVAL.saturating_mul(2),
+                }),
+            }
+        };
+        if !rate_limit_due(&mut check.rerequested, now, REJOIN_STALLED_HEAD_CHECK_INTERVAL) {
+            return;
+        }
+        let (request, backoff) = match stuck_replay {
+            Some(stuck) => {
+                check.stuck_replay = Some(stuck);
+                (stuck.request, stuck.wait)
+            }
+            None => (fresh, REJOIN_STALLED_HEAD_CHECK_INTERVAL),
+        };
+        self.consensus_bus.consensus_gap_request().send_replace(Some(request));
         if rate_limit_due(&mut check.rerequest_logged, now, REJOIN_FRONTIER_REREQUEST_LOG_INTERVAL)
         {
+            let (_, to, _, from) = request;
             info!(
                 target: "subscriber",
                 from,
                 to,
+                backoff_ms = u64::try_from(backoff.as_millis()).unwrap_or(u64::MAX),
                 "re-requesting consensus outputs behind the gossiped frontier"
             );
         }
@@ -1363,19 +1426,20 @@ fn rate_limit_due(
     due
 }
 
-/// The newest consensus header number a catching-up CVV has watched, and since when it has stayed
-/// the newest. Owned by one catch-up loop.
+/// A consensus number a catching-up CVV has watched, the newest known header's or the newest
+/// replayed output's, and since when it has stayed the same. Owned by one catch-up loop.
 #[derive(Clone, Copy, Debug)]
 struct ObservedHead {
-    /// The newest known header's number when last observed; `None` while no header is known.
+    /// The number when last observed. Only a watched head is ever `None` (no header known yet);
+    /// a watched replay always has a number.
     number: Option<u64>,
     /// When `number` was first observed, or the catch-up loop started if it has not changed.
     since: tokio::time::Instant,
 }
 
 impl ObservedHead {
-    /// Observe the newest known header's `number` at `now` and return how long it has stayed the
-    /// newest. A changed number restarts the watch at `now`.
+    /// Observe `number` at `now` and return how long it has stayed the same. A changed number
+    /// restarts the watch at `now`.
     fn observe(&mut self, number: Option<u64>, now: tokio::time::Instant) -> Duration {
         if number != self.number {
             *self = Self { number, since: now };
@@ -1390,6 +1454,8 @@ impl ObservedHead {
 struct StalledHeadCheck {
     /// The newest known header and how long it has stayed the newest.
     observed_head: ObservedHead,
+    /// The newest replayed output and how long it has stayed the newest.
+    observed_replay: ObservedHead,
     /// How long the head must stall before this loop rejoins on it
     /// ([`stalled_head_stall_needed`]).
     stall_needed: Duration,
@@ -1399,22 +1465,61 @@ struct StalledHeadCheck {
     rerequested: Option<tokio::time::Instant>,
     /// When this loop last logged a re-request.
     rerequest_logged: Option<tokio::time::Instant>,
+    /// The gap request a replay stuck below a moving head last sent, and its backoff; `None`
+    /// until the stuck replay first asks, and again once the replay moves.
+    stuck_replay: Option<StuckReplayRequest>,
 }
 
 impl StalledHeadCheck {
-    /// The state of a catch-up loop that started at `entry` knowing the header `newest_number`.
+    /// The state of a catch-up loop that started at `entry` knowing the header `newest_number`,
+    /// with the outputs through `replayed_number` replayed.
     fn new(
         newest_number: Option<u64>,
+        replayed_number: u64,
         entry: tokio::time::Instant,
         stall_needed: Duration,
     ) -> Self {
         Self {
             observed_head: ObservedHead { number: newest_number, since: entry },
+            observed_replay: ObservedHead { number: Some(replayed_number), since: entry },
             stall_needed,
             not_ready_logged: None,
             rerequested: None,
             rerequest_logged: None,
+            stuck_replay: None,
         }
+    }
+
+    /// Observe the newest replayed output at `now` and return how long it has stayed the newest.
+    /// A replay that moved past the floor of the last stuck-replay request ends that request and
+    /// its backoff, so a replay that sticks again asks afresh one check interval later.
+    fn observe_replay(&mut self, replayed_number: u64, now: tokio::time::Instant) -> Duration {
+        let unchanged_for = self.observed_replay.observe(Some(replayed_number), now);
+        if self.stuck_replay.is_some_and(|stuck| stuck.floor() != replayed_number.saturating_add(1))
+        {
+            self.stuck_replay = None;
+        }
+        unchanged_for
+    }
+}
+
+/// A gap request sent for a replay stuck below a moving head
+/// ([`Subscriber::rerequest_behind_frontier`]), repeated unchanged while the replay stays stuck.
+#[derive(Clone, Copy, Debug)]
+struct StuckReplayRequest {
+    /// The request as sent on the gap-request watch: `(epoch, to, hash, from)`.
+    request: (Epoch, u64, ConsensusHeaderDigest, u64),
+    /// When it was last sent.
+    sent: tokio::time::Instant,
+    /// How long after `sent` it may be sent again: doubles with every repeat, up to
+    /// [`REJOIN_STUCK_REPLAY_MAX_BACKOFF`].
+    wait: Duration,
+}
+
+impl StuckReplayRequest {
+    /// The lowest consensus number the request asks for: the stuck replay's next output.
+    const fn floor(&self) -> u64 {
+        self.request.3
     }
 }
 
@@ -2533,7 +2638,7 @@ mod tests {
                 stalled_head_stall_needed, NewestHeader, ObservedHead, RejoinBlocker,
                 StalledHeadBlocker, StalledHeadCheck, REJOIN_HEAD_MAX_AGE,
                 REJOIN_STALLED_HEAD_CHECK_INTERVAL, REJOIN_STALLED_HEAD_MAX_BACKOFF,
-                REJOIN_STALLED_HEAD_NOT_READY_LOG_INTERVAL,
+                REJOIN_STALLED_HEAD_NOT_READY_LOG_INTERVAL, REJOIN_STUCK_REPLAY_MAX_BACKOFF,
             },
             *,
         };
@@ -3291,7 +3396,8 @@ mod tests {
         /// A check that finds the gossiped frontier, 38, ahead of the replayed outputs, 31, while
         /// the newest known header has not moved for a check interval asks state sync to fetch 32
         /// to 38 again: one gap request per check interval, logged once per 30 s. A head watched
-        /// for less than an interval, or one that moved since the last check, asks nothing.
+        /// for less than an interval, or a head and a replay that both moved since the last check,
+        /// ask nothing.
         #[tokio::test(start_paused = true)]
         async fn stalled_check_rerequests_the_outputs_behind_the_gossiped_frontier() {
             let fixture = CommitteeFixture::builder(MemDatabase::default).build();
@@ -3310,6 +3416,7 @@ mod tests {
             let _lines = tracing::subscriber::set_default(lines.clone());
             let mut check = StalledHeadCheck::new(
                 Some(31),
+                31,
                 tokio::time::Instant::now(),
                 REJOIN_STALLED_HEAD_AFTER,
             );
@@ -3338,6 +3445,7 @@ mod tests {
             let from_to = BTreeMap::from([
                 ("from".to_string(), "32".to_string()),
                 ("to".to_string(), "38".to_string()),
+                ("backoff_ms".to_string(), "5000".to_string()),
             ]);
             assert_eq!(logged, vec![from_to], "one line per 30 s");
 
@@ -3346,9 +3454,12 @@ mod tests {
                 33,
                 decades_ago,
             )));
+            let mut chain = subscriber.inner.consensus_chain.clone();
+            let output_32 = chained_outputs(&fixture, 32).pop().unwrap();
+            save_consensus(output_32, &mut chain, bus.metrics()).await.unwrap();
             tokio::time::advance(REJOIN_STALLED_HEAD_CHECK_INTERVAL).await;
             assert!(!subscriber.rejoin_on_stalled_head(&mut check).await);
-            assert!(!rx_gap.has_changed().unwrap(), "the head moved since the last check");
+            assert!(!rx_gap.has_changed().unwrap(), "the head and the replay moved");
 
             // a frontier in the next epoch is not re-requested; back in this epoch it is
             bus.last_published_consensus_num_hash().send_replace((epoch + 1, 40, frontier));
@@ -3358,7 +3469,206 @@ mod tests {
             bus.last_published_consensus_num_hash().send_replace((epoch, 38, frontier));
             tokio::time::advance(REJOIN_STALLED_HEAD_CHECK_INTERVAL).await;
             assert!(!subscriber.rejoin_on_stalled_head(&mut check).await);
+            assert_eq!(*rx_gap.borrow_and_update(), Some((epoch, 38, frontier, 33)));
+            assert!(bus.is_cvv_inactive());
+        }
+
+        /// A replay stuck below a frontier that keeps moving asks for the gap once it has stayed
+        /// for a check interval, although the newest known header never stays: the outputs a
+        /// previous catch-up loop took from state sync's cache and never saved (a promotion that
+        /// ended in a demotion, as in `restarts::test_restartstt` before the restored-dag fix) lie
+        /// below the floor of every later gossip walk. A replay that moves again asks nothing.
+        #[tokio::test(start_paused = true)]
+        async fn stalled_replay_rerequests_the_outputs_behind_a_moving_head() {
+            let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+            let (subscriber, bus, _dir) = caught_up_to(&fixture, 31).await;
+            let epoch = fixture.committee().epoch();
+            let now_ish = tn_types::now_ms();
+            let head = |number| {
+                bus.last_consensus_header()
+                    .send_replace(Some(header_created_at(&fixture, number, now_ish)));
+            };
+            head(36);
+            let frontier: ConsensusHeaderDigest = B256::repeat_byte(38).into();
+            bus.last_published_consensus_num_hash().send_replace((epoch, 38, frontier));
+            let mut rx_gap = bus.consensus_gap_request().subscribe();
+            let mut check = StalledHeadCheck::new(
+                Some(36),
+                31,
+                tokio::time::Instant::now(),
+                REJOIN_STALLED_HEAD_AFTER,
+            );
+
+            tokio::time::advance(REJOIN_STALLED_HEAD_CHECK_INTERVAL - Duration::from_millis(1))
+                .await;
+            head(37);
+            assert!(!subscriber.rejoin_on_stalled_head(&mut check).await);
+            assert!(!rx_gap.has_changed().unwrap(), "the replay may still move");
+
+            tokio::time::advance(Duration::from_millis(1)).await;
+            head(38);
+            assert!(!subscriber.rejoin_on_stalled_head(&mut check).await);
+            assert!(rx_gap.has_changed().unwrap(), "the replay stayed for a check interval");
             assert_eq!(*rx_gap.borrow_and_update(), Some((epoch, 38, frontier, 32)));
+
+            let mut chain = subscriber.inner.consensus_chain.clone();
+            let output_32 = chained_outputs(&fixture, 32).pop().unwrap();
+            save_consensus(output_32, &mut chain, bus.metrics()).await.unwrap();
+            tokio::time::advance(REJOIN_STALLED_HEAD_CHECK_INTERVAL).await;
+            head(39);
+            assert!(!subscriber.rejoin_on_stalled_head(&mut check).await);
+            assert!(!rx_gap.has_changed().unwrap(), "the replay moved since the last check");
+            assert!(bus.is_cvv_inactive());
+        }
+
+        /// A catch-up loop whose failed promotions reached the cap still follows consensus: its
+        /// timer asks state sync for the outputs below a moving frontier within one check interval
+        /// when no output arrives, so the node keeps replaying for the rest of the epoch.
+        #[tokio::test(start_paused = true)]
+        async fn exhausted_loop_still_rerequests_a_stuck_replay() {
+            let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+            let (subscriber, bus, _dir) = caught_up_to(&fixture, 31).await;
+            let epoch = fixture.committee().epoch();
+            let start = tokio::time::Instant::now();
+            bus.rejoin_state().send_modify(|state| {
+                for _ in 0..MAX_REJOIN_ATTEMPTS_PER_EPOCH {
+                    state.record_promotion(epoch, start, false);
+                    state.record_demotion(epoch, start, false);
+                }
+            });
+            assert_eq!(bus.rejoin_state().borrow().attempts(epoch), MAX_REJOIN_ATTEMPTS_PER_EPOCH);
+            let now_ish = tn_types::now_ms();
+            let head = |number| {
+                bus.last_consensus_header()
+                    .send_replace(Some(header_created_at(&fixture, number, now_ish)));
+            };
+            head(33);
+            let frontier: ConsensusHeaderDigest = B256::repeat_byte(40).into();
+            bus.last_published_consensus_num_hash().send_replace((epoch, 40, frontier));
+            let mut rx_gap = bus.consensus_gap_request().subscribe();
+
+            let task = spawn_rejoin_loop(&subscriber).await;
+            // the head moves every second, the replay never does
+            for number in 34..=38 {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                head(number);
+            }
+            settle_in_real_time().await;
+            assert!(rx_gap.has_changed().unwrap(), "the stuck replay was re-requested");
+            assert_eq!(*rx_gap.borrow_and_update(), Some((epoch, 40, frontier, 32)));
+            assert!(bus.is_cvv_inactive(), "the loop keeps following");
+            assert!(!task.is_finished());
+            task.abort();
+            assert!(task.await.is_err_and(|error| error.is_cancelled()));
+        }
+
+        /// Run `checks` stalled-head checks one check interval apart while the newest known header
+        /// and the gossiped frontier both move by one before every check (the frontier from
+        /// `frontier_base + 1`), and return each gap request sent with the seconds since `start`.
+        async fn checks_under_a_moving_head(
+            subscriber: &Subscriber<MemDatabase>,
+            bus: &ConsensusBusApp,
+            fixture: &CommitteeFixture<MemDatabase>,
+            check: &mut StalledHeadCheck,
+            start: tokio::time::Instant,
+            frontier_base: u64,
+            checks: u64,
+        ) -> Vec<(u64, Option<(Epoch, u64, ConsensusHeaderDigest, u64)>)> {
+            let epoch = fixture.committee().epoch();
+            let now_ish = tn_types::now_ms();
+            let mut rx_gap = bus.consensus_gap_request().subscribe();
+            let mut sent = Vec::new();
+            for step in 1..=checks {
+                tokio::time::advance(REJOIN_STALLED_HEAD_CHECK_INTERVAL).await;
+                let top = frontier_base + step;
+                bus.last_consensus_header().send_replace(Some(header_created_at(
+                    fixture,
+                    top - 2,
+                    now_ish,
+                )));
+                let hash: ConsensusHeaderDigest =
+                    B256::repeat_byte(u8::try_from(top).unwrap()).into();
+                bus.last_published_consensus_num_hash().send_replace((epoch, top, hash));
+                assert!(!subscriber.rejoin_on_stalled_head(check).await);
+                if rx_gap.has_changed().unwrap() {
+                    let at = tokio::time::Instant::now().saturating_duration_since(start);
+                    sent.push((at.as_secs(), *rx_gap.borrow_and_update()));
+                }
+            }
+            sent
+        }
+
+        /// A replay stuck at 31 below a head and a frontier that move before every check asks for
+        /// 32 up to the frontier of the moment once it has stayed for a check interval, then
+        /// re-sends that same request, without widening its top to the newer frontier, after
+        /// waits of 10, 20 and 40 s and then every 60 s: a walk still running covers the repeat,
+        /// so the fetch task defers it, and a replay that cannot move costs one bounded walk a
+        /// minute. The line carries the wait before the next repeat.
+        #[tokio::test(start_paused = true)]
+        async fn stuck_replay_under_a_moving_head_resends_the_same_range_with_backoff() {
+            let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+            let (subscriber, bus, _dir) = caught_up_to(&fixture, 31).await;
+            let epoch = fixture.committee().epoch();
+            let lines = SubscriberLines::default();
+            let _lines = tracing::subscriber::set_default(lines.clone());
+            let start = tokio::time::Instant::now();
+            let mut check = StalledHeadCheck::new(Some(31), 31, start, REJOIN_STALLED_HEAD_AFTER);
+
+            let sent =
+                checks_under_a_moving_head(&subscriber, &bus, &fixture, &mut check, start, 38, 39)
+                    .await;
+            let first = Some((epoch, 39, B256::repeat_byte(39).into(), 32));
+            let at: Vec<_> = sent.iter().map(|(at, _)| *at).collect();
+            assert_eq!(at, vec![5, 15, 35, 75, 135, 195], "waits of 5, 10, 20, 40, 60 and 60 s");
+            assert!(
+                sent.iter().all(|(_, request)| *request == first),
+                "the floor stays and the top is not widened: {sent:?}"
+            );
+            let backoff_ms: Vec<_> = lines
+                .with_message("re-requesting consensus outputs behind the gossiped frontier")
+                .into_iter()
+                .map(|fields| {
+                    assert_eq!(fields.get("from").map(String::as_str), Some("32"));
+                    assert_eq!(fields.get("to").map(String::as_str), Some("39"));
+                    fields.get("backoff_ms").cloned().unwrap_or_default()
+                })
+                .collect();
+            let cap = REJOIN_STUCK_REPLAY_MAX_BACKOFF.as_millis().to_string();
+            assert_eq!(
+                backoff_ms,
+                vec!["10000".to_string(), "40000".to_string(), cap.clone(), cap.clone(), cap],
+                "one line per 30 s at most"
+            );
+            assert!(bus.is_cvv_inactive());
+        }
+
+        /// A replay that moves ends the stuck-replay backoff: once it sticks again it asks for the
+        /// gap above its new floor, up to the frontier of the moment, one check interval later,
+        /// and repeats that new request after 10 s, as a replay stuck for the first time does.
+        #[tokio::test(start_paused = true)]
+        async fn replay_progress_resets_the_stuck_replay_backoff() {
+            let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+            let (subscriber, bus, _dir) = caught_up_to(&fixture, 31).await;
+            let epoch = fixture.committee().epoch();
+            let start = tokio::time::Instant::now();
+            let mut check = StalledHeadCheck::new(Some(31), 31, start, REJOIN_STALLED_HEAD_AFTER);
+
+            let sent =
+                checks_under_a_moving_head(&subscriber, &bus, &fixture, &mut check, start, 38, 4)
+                    .await;
+            let stuck_at_31 = Some((epoch, 39, B256::repeat_byte(39).into(), 32));
+            assert_eq!(sent, vec![(5, stuck_at_31), (15, stuck_at_31)], "backing off at 20 s");
+
+            let mut chain = subscriber.inner.consensus_chain.clone();
+            let output_32 = chained_outputs(&fixture, 32).pop().unwrap();
+            save_consensus(output_32, &mut chain, bus.metrics()).await.unwrap();
+            let sent =
+                checks_under_a_moving_head(&subscriber, &bus, &fixture, &mut check, start, 42, 4)
+                    .await;
+            // 25 s: the replay moved since the check at 20 s; 30 s: stuck for an interval
+            // again, asked afresh; 40 s: the first repeat, 10 s later
+            let stuck_at_32 = Some((epoch, 44, B256::repeat_byte(44).into(), 33));
+            assert_eq!(sent, vec![(30, stuck_at_32), (40, stuck_at_32)]);
             assert!(bus.is_cvv_inactive());
         }
     }
