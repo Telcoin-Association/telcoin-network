@@ -1822,7 +1822,7 @@ mod tests {
     use tn_types::{
         CommittedSubDag, ConsensusHeaderDigest, ConsensusNumHash, ConsensusOutput, Epoch,
         EpochRecord, TnReceiver as _, TnSender as _, TryRecvError, TrySendError, TrySendOutcome,
-        B256, CHANNEL_CAPACITY,
+        B256,
     };
 
     /// The smallest output that can sit in `sync_output` or `consensus_output`; only its number
