@@ -40,12 +40,14 @@ use reth_rpc_builder::{
 };
 use reth_rpc_eth_api::RpcNodeCore;
 use reth_rpc_eth_types::EthConfig;
+use reth_tasks::TokioTaskExecutor;
 use reth_transaction_pool::{blobstore::DiskFileBlobStore, EthTransactionPool};
 use tn_types::{gas_accumulator::WorkerBaseFee, NodeMode, WorkerId};
 
 use crate::{
     error::{TnRethError, TnRethResult},
     evm::TnEvmConfig,
+    rpc_blocking::RpcTaskSpawner,
     rpc_bundle::{BundleWithEpochBaseFee, EpochBundleServer as _},
     rpc_call::{EpochSimulationServer as _, SimulationWithEpochBaseFee},
     rpc_debug::{DebugSimulationWithEpochBaseFee, EpochDebugSimulationServer as _},
@@ -240,8 +242,8 @@ fn worker_rpc_server_args(
 ///   consumer of the cache.
 /// - `send_raw_transaction_sync_timeout`: applied here, absent from reth's reference. No CLI flag
 ///   feeds it yet, so it re-applies the default (forward compatibility).
-/// - task spawner: reth injects its own; TN keeps the builder's default executor, the same behavior
-///   as before this fix.
+/// - task spawner: reth injects its own; TN sets an [`RpcTaskSpawner`] in `get_rpc_server`, so the
+///   API's blocking work runs on RPC's own pool.
 fn apply_eth_config<N: RpcNodeCore, Rpc, NextEnv>(
     builder: EthApiBuilder<N, Rpc, NextEnv>,
     config: EthConfig,
@@ -300,11 +302,16 @@ impl RethEnv {
             TnEvmConfig,
         > = transaction_pool.into();
         let tn_execution = Arc::new(TNExecution);
+        // RPC's blocking work runs on its own pool, so it cannot take the blocking threads block
+        // execution and certificate validation use (`rpc_blocking.rs`). Every other task keeps
+        // its spawner: TN's for the modules, reth's default executor for the eth API.
+        let rpc_executor = RpcTaskSpawner::new(self.inner.task_spawner.clone())?;
+        let eth_executor = RpcTaskSpawner::new(TokioTaskExecutor::default())?;
         let rpc_builder = RpcModuleBuilder::default()
             .with_provider(self.inner.blockchain_provider.clone())
             .with_pool(transaction_pool.clone())
             .with_network(network.clone())
-            .with_executor(Box::new(self.inner.task_spawner.clone()))
+            .with_executor(Box::new(rpc_executor))
             .with_evm_config(self.inner.evm_config.clone())
             .with_consensus(tn_execution.clone());
 
@@ -332,6 +339,7 @@ impl RethEnv {
                 .eth_config()
                 .max_batch_size(self.node_config().txpool.max_batch_size),
         )
+        .task_spawner(eth_executor)
         .build();
 
         let engine_events = reth_tokio_util::EventSender::default();

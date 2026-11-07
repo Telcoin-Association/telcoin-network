@@ -61,20 +61,6 @@ unpaid tip. Skipped copies add nothing to `gas_used`, so the base fee does not r
   update for an earlier block that touches the sender also lowers the tracked nonce again
   (`txpool.rs`), so a complete fix makes that update monotonic. Needs the batch-builder owners.
 
-## RPC work shares the blocking pool with execution and consensus
-
-reth's RPC and TN's execution engine and certificate validation all run on tokio's one blocking
-pool (512 threads by default). Semaphores bound most RPC work: upstream's for `eth_call`,
-`eth_callMany`, `eth_simulateV1`, `eth_getLogs` and `eth_getProof` (TN-0019, TN-0035), and TN's for
-`eth_estimateGas`, `eth_fillTransaction`, `eth_createAccessList`, `eth_callBundle` (TN-0037,
-`crates/tn-reth/src/rpc_call.rs`), `debug_trace*` (TN-0036), and `trace_*` and
-`debug_executionWitness*` (TN-0038), and a request that loses its client stops its long loops
-(TN-0049).
-
-The structural fix is to give the RPC `TaskSpawner` (`crates/types/src/task_manager.rs`) its own
-runtime or bounded blocking pool, so RPC load cannot delay block execution whatever each method
-does.
-
 ## RocksDB stubs and storage-v2 plumbing
 
 RocksDB itself is gone (TN-0014), but the zero-size stub types, the provider-factory field and

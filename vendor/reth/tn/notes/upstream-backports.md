@@ -17,9 +17,10 @@ with the features the workspace unifies.
 
 Severity below is for TN, which differs from upstream's in places. Relevant TN facts:
 
-- consensus and RPC share one tokio runtime, and the execution engine (`crates/engine`,
-  `spawn_blocking_task`) and certificate validation (`spawn_blocking`) use the same blocking pool
-  as RPC;
+- consensus and RPC share one tokio runtime. Until 2026-11-06 the execution engine
+  (`crates/engine`, `spawn_blocking_task`) and certificate validation (`spawn_blocking`) also used
+  the same blocking pool as RPC; since then RPC's blocking work has a pool of its own
+  (`tn-reth/src/rpc_blocking.rs`), and the RPC limits keep their value as per-method bounds;
 - `debug` and `trace` are opt-in (off by default, warned when enabled; `tn-reth/src/cli.rs`);
 - non-critical task panics are ignored by TN's `TaskManager`, and `panic` is the default
   `unwind`;
@@ -140,11 +141,13 @@ d5991a4db, 04f829c26, 0d1b63a1f (cosmetic).
 
 ## TN-side hardening (not upstream fixes)
 
-- **A separate blocking pool for RPC.** The root cause behind TN-0019's severity: reth RPC and
-  TN's consensus/execution share tokio's blocking pool (512 threads by default). Semaphores bound
-  most RPC work. Since 2026-11-04 `eth_estimateGas`, `eth_fillTransaction`, `eth_createAccessList`
-  and `eth_callBundle` hold a blocking-IO permit (TN-0037 and tn-reth's `rpc_call.rs`) and
-  `debug_trace*` keeps its tracing permit until its thread ends (TN-0036); upstream main does
-  neither. Since 2026-11-06 `trace_*` and `debug_executionWitness*` keep theirs too (TN-0038).
-  Giving the RPC `TaskSpawner` (`tn-types` `task_manager.rs`) its own runtime or bounded pool would
-  isolate block execution from RPC load regardless of per-method permits.
+- **A separate blocking pool for RPC (done 2026-11-06).** The root cause behind TN-0019's
+  severity was that reth RPC and TN's consensus/execution shared tokio's blocking pool (512
+  threads by default), and each worker's RPC server bounds its work with its own permits, so the
+  bounds add up across workers. `tn-reth/src/rpc_blocking.rs` gives RPC's blocking work a
+  runtime of its own (up to 512 threads), through the eth API's and the RPC modules' task
+  spawners; every other RPC task keeps its spawner. The per-method permits still bound each
+  method: `eth_estimateGas`, `eth_fillTransaction`, `eth_createAccessList` and `eth_callBundle`
+  hold a blocking-IO permit (TN-0037 and tn-reth's `rpc_call.rs`), `debug_trace*`, `trace_*` and
+  `debug_executionWitness*` keep their tracing permit until their thread ends (TN-0036, TN-0038),
+  and a dropped request stops its long loops (TN-0049).

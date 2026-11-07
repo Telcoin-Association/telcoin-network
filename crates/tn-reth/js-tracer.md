@@ -42,8 +42,8 @@ build of `telcoin-network` (the profile the Docker image uses) is 54.8 MB withou
 62.7 MB with it. Build time barely changes: a clean release build took 1m50s without it and 1m54s
 with it on 16 cores, because boa compiles in parallel with the rest of the graph.
 
-A JavaScript tracer is code the RPC caller supplies, and the node runs it on its blocking pool at
-every EVM step of the traced transaction. Nothing limits how long one of its functions runs:
+A JavaScript tracer is code the RPC caller supplies, and the node runs it on RPC's blocking pool
+(`rpc_blocking.rs`) at every EVM step of the traced transaction. Nothing limits how long one of its functions runs:
 
 - boa's loop limit doesn't. revm-inspectors sets it to 200,000 iterations, but boa counts them per
   call frame, so a function that calls a looping function from a loop gets a fresh 200,000 on
