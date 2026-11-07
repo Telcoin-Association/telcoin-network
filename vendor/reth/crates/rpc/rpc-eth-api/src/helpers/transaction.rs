@@ -15,7 +15,7 @@ use alloy_dyn_abi::TypedData;
 use alloy_eips::{eip2718::Encodable2718, BlockId};
 use alloy_network::{TransactionBuilder, TransactionBuilder4844};
 use alloy_primitives::{Address, Bytes, TxHash, B256, U256};
-use alloy_rpc_types_eth::{BlockNumberOrTag, TransactionInfo};
+use alloy_rpc_types_eth::{BlockNumberOrTag, TransactionInfo, TransactionRequest};
 use futures::{Future, StreamExt};
 use reth_chain_state::CanonStateSubscriptions;
 use reth_primitives_traits::{
@@ -411,6 +411,8 @@ pub trait EthTransactions: LoadTransaction<Provider: BlockReaderIdExt> {
 
     /// Signs transaction with a matching signer, if any and submits the transaction to the pool.
     /// Returns the hash of the signed transaction.
+    ///
+    /// Rejects requests that mix legacy and EIP-1559 fee fields.
     fn send_transaction_request(
         &self,
         mut request: RpcTxReq<Self::NetworkTypes>,
@@ -419,6 +421,9 @@ pub trait EthTransactions: LoadTransaction<Provider: BlockReaderIdExt> {
         Self: EthApiSpec + LoadBlock + EstimateCall,
     {
         async move {
+            ensure_no_conflicting_fee_fields(request.as_ref())
+                .map_err(Self::Error::from_eth_err)?;
+
             let from = match request.as_ref().from() {
                 Some(from) => from,
                 None => return Err(SignError::NoAccount.into_eth_err()),
@@ -464,6 +469,8 @@ pub trait EthTransactions: LoadTransaction<Provider: BlockReaderIdExt> {
     }
 
     /// Fills the defaults on a given unsigned transaction.
+    ///
+    /// Rejects requests that mix legacy and EIP-1559 fee fields.
     fn fill_transaction(
         &self,
         mut request: RpcTxReq<Self::NetworkTypes>,
@@ -472,6 +479,9 @@ pub trait EthTransactions: LoadTransaction<Provider: BlockReaderIdExt> {
         Self: EthApiSpec + LoadBlock + EstimateCall + LoadFee,
     {
         async move {
+            ensure_no_conflicting_fee_fields(request.as_ref())
+                .map_err(Self::Error::from_eth_err)?;
+
             let from = match request.as_ref().from() {
                 Some(from) => from,
                 None => return Err(SignError::NoAccount.into_eth_err()),
@@ -567,11 +577,16 @@ pub trait EthTransactions: LoadTransaction<Provider: BlockReaderIdExt> {
 
     /// Signs a transaction request using the given account in request
     /// Returns the EIP-2718 encoded signed transaction.
+    ///
+    /// Rejects requests that mix legacy and EIP-1559 fee fields.
     fn sign_transaction(
         &self,
         request: RpcTxReq<Self::NetworkTypes>,
     ) -> impl Future<Output = Result<Bytes, Self::Error>> + Send {
         async move {
+            ensure_no_conflicting_fee_fields(request.as_ref())
+                .map_err(Self::Error::from_eth_err)?;
+
             let from = match request.as_ref().from() {
                 Some(from) => from,
                 None => return Err(SignError::NoAccount.into_eth_err()),
@@ -731,4 +746,12 @@ pub trait LoadTransaction: SpawnBlocking + FullEthApiTypes + RpcNodeCoreExt {
             Ok(block.map(|block| (transaction, block)))
         }
     }
+}
+
+/// Rejects legacy gas prices combined with EIP-1559 fee fields before transaction construction.
+const fn ensure_no_conflicting_fee_fields(request: &TransactionRequest) -> Result<(), EthApiError> {
+    if request.gas_price.is_some() && request.has_eip1559_fields() {
+        return Err(EthApiError::ConflictingFeeFieldsInRequest)
+    }
+    Ok(())
 }
