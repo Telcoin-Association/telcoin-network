@@ -1181,10 +1181,11 @@ mod tests {
         bound: SyncRateBound,
         meter: SyncServeMeter,
     ) -> std::io::Result<usize> {
-        let framed = frame_pack(&[7u8; 1024]).await;
+        let payload = [7u8; 1024];
+        let framed = frame_pack(&payload).await;
         let mut reader = sync_pack_reader(futures::io::Cursor::new(framed), bound, meter);
-        let mut first = vec![0u8; 4096];
-        reader.read(&mut first).await?;
+        let mut first = vec![0u8; payload.len()];
+        reader.read_exact(&mut first).await?;
         tokio::time::advance(SYNC_RATE_WINDOW.saturating_add(Duration::from_secs(1))).await;
         let mut rest = Vec::new();
         reader.read_to_end(&mut rest).await
