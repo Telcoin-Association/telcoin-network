@@ -55,6 +55,7 @@ Severity below is for TN, which differs from upstream's in places. Relevant TN f
 | bf1db83ae | TN-0041 | pool validation workers no longer hold the job queue's lock while validating, so `--txpool.additional-validation-tasks` runs in parallel | upstream test; txpool 228/228 |
 | 8861e2724 | TN-0042 | transactions a lower base fee promotes in `set_block_info` reach pending listeners (`newPendingTransactions`) | TN test fails without the fix; txpool 229/229 |
 | 62808bd06 | TN-0043 | the pool admits a sender whose code hash is the empty hash (an EOA to the EVM) | upstream test; txpool 230/230 |
+| 0e14f1a8a | TN-0044 | an IPC connection's service loop ends when its response channel closes instead of spinning | reth-ipc 17/17 |
 
 ## Open
 
@@ -91,7 +92,7 @@ Severity below is for TN, which differs from upstream's in places. Relevant TN f
 
 ### Low
 
-0e14f1a8a and a68f9e19f (IPC loop spin; max subscriptions per connection), e7ebeb869 (partial
+a68f9e19f (IPC max subscriptions per connection), e7ebeb869 (partial
 receipts), 1a6ba945a
 (codecs decode), 078c22d5f (iterative BlockState drop), 44a74f9ea (reject conflicting
 transaction fees in call requests), 33b785d97 (`0x` data for empty reverts), 9580b7fc1 (zstd

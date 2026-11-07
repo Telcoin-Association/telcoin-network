@@ -509,6 +509,13 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   or block validity change. *Tests*: upstream's `accepts_sender_with_empty_bytecode`;
   transaction-pool 230/230. *Upstream*: n/a (upstream commit).
 
+- **TN-0044** — Backport upstream's IPC server fixes. *Kind*: backport.
+  *Files*: `crates/rpc/ipc/src/server/mod.rs`.
+  *Why*: 0e14f1a8a: a connection's service loop kept polling its closed response channel, which
+  returns at once, so it spun a core until the connection's other arms ended; it now ends the
+  loop. TN serves IPC on every worker unless `--ipcdisable` is set. RPC only. *Tests*: reth-ipc
+  17/17. *Upstream*: n/a (upstream commits).
+
 ## TN fixes (not from an upstream commit)
 
 - **TN-0036** — Debug traces hold their tracing permit until their blocking task ends. *Kind*:
