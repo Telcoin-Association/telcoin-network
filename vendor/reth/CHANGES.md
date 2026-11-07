@@ -573,7 +573,9 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   same root and timestamp. It now calls `executor_for_block(..).apply_pre_execution_changes()`,
   which TN's `TnEvmConfig` supports for re-execution and which reads only the header. The
   conflicts were TN-0036's edits around the three `debug.rs` call sites; only the call's arguments
-  change there. RPC only: block execution does not go through these helpers.
+  change there. c4cd5c9b7: `debug_traceCallMany` at a transaction index replayed the block's
+  earlier transactions without the block's pre-execution changes first. RPC only: block
+  execution does not go through these helpers.
   *Tests*: reth-rpc and rpc-eth-api 43/43 (49/49 with `js-tracer`); tn-reth's trace and debug
   namespace tests, which trace a mined TN block through TN's executor, 10/10. *Upstream*: n/a
   (upstream commits).

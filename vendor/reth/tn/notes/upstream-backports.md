@@ -61,6 +61,7 @@ Severity below is for TN, which differs from upstream's in places. Relevant TN f
 | 329fcfc73 (partial) | TN-0046 | **security**: an `eth_callBundle` request's transactions share its block gas limit, so one request cannot run N × the call gas cap. Without the EIP-8037 branch and the cancellation check | TN tests; the refusal test fails without the check |
 | 5b0120dbb | TN-0047 | RPC cache defaults 1000 blocks and 500 blocks' receipts (were 5000 and 2000; a TN block can be 1 MB) | hand port; nested tests |
 | 8fa539225 | TN-0048 | traces and replays apply the node's own block executor's pre-execution changes (TN's EIP-4788 runs only on an output's first batch), not reth's Ethereum `SystemCaller` | tn-reth trace tests through TN's executor |
+| c4cd5c9b7 | TN-0048 | `debug_traceCallMany` at a transaction index applies the block's pre-execution changes before replaying its earlier transactions | nested reth-rpc tests |
 
 ## Open
 
