@@ -454,15 +454,16 @@ The `--rpc-cache.*` flags bound it [^rpc-cache]:
 
 | Flag | Default | Holds |
 | --- | --- | --- |
-| `--rpc-cache.max-blocks` | 5000 | Full blocks |
-| `--rpc-cache.max-receipts` | 2000 | Receipts, per block |
+| `--rpc-cache.max-blocks` | 1000 | Full blocks |
+| `--rpc-cache.max-receipts` | 500 | Receipts, per block |
 | `--rpc-cache.max-headers` | 1000 | Headers |
 | `--rpc-cache.max-concurrent-db-requests` | 512 | Concurrent database reads behind the cache |
 | `--rpc-cache.max-cached-tx-hashes` | 30000 | Transaction hash lookups |
 
 The block, receipt and header limits count entries, not bytes.
-Each block comes from one batch [^block-per-batch], and a batch can be up to 1 MB, so 5000 cached blocks can hold up to 5 GB of transaction data before decoding overhead.
-At the benchmark's average batch of about 64 KB, the same 5000 blocks hold about 0.3 GB.
+Each block comes from one batch [^block-per-batch], and a batch can be up to 1 MB, so 1000 cached blocks can hold up to 1 GB of transaction data before decoding overhead.
+At the benchmark's average batch of about 64 KB, the same 1000 blocks hold about 64 MB.
+Earlier releases defaulted to 5000 blocks and 2000 blocks' receipts, up to 5 GB of blocks.
 If resident memory grows with RPC load, lower `--rpc-cache.max-blocks` first.
 Disable swap on observers too.
 
@@ -664,7 +665,7 @@ Notes whose names start with `b-` cite the benchmark: the run, and the field in 
 [^b-obs-rec]: Measured, r20260923-0515, `gcp_by_role.observer`: the c3 observer (4 physical cores, 16 GB) used 13% CPU and 15% memory at p95 with its engine queue at 3 or below. The e2 shape already meets the half-capacity rule on CPU and memory, but its execution fell behind at times, so the recommended tier uses the c3 shape.
 [^b-obs-disk]: Measured demand, `gcp_by_role.observer.disk_write_bytes_per_sec.p95_max_node` and `disk_write_ops_per_sec.p95_max_node`: 64 MB/s at 4,770 IOPS (e2) and 174 MB/s at 1,790 IOPS (c3), the same order as a validator. An observer keeps the same archive data, so it uses the validator disk figures.
 [^b-obs-net]: Measured demand, `gcp_by_role.observer.network_received_bytes_per_sec.p95_max_node` and `network_sent_bytes_per_sec.p95_max_node`: 2.7 Mbps (e2) and 4.5 Mbps (c3) in, under 1 Mbps out. 50 Mbps is the provisional figure, kept because it is more than ten times the measured demand. Initial sync from genesis was not measured.
-[^b-rpc]: Modelled; the benchmark sent no RPC load to the observer. Minimum: the follower's recommended CPU, and the follower's 8 GB plus up to 5 GB for the default RPC caches (5000 blocks of up to 1 MB), rounded to 16 GB. Recommended 32 GB and headroom 64 GB leave room for concurrent RPC work and for raising the cache limits. The 8-core CPU figure is the provisional estimate, kept until RPC load is measured. Network is the follower's 50 Mbps plus RPC traffic.
+[^b-rpc]: Modelled; the benchmark sent no RPC load to the observer. Minimum: the follower's recommended CPU, and the follower's 8 GB plus up to 1 GB for the default RPC caches (1000 blocks of up to 1 MB), rounded to 16 GB. Recommended 32 GB and headroom 64 GB leave room for concurrent RPC work and for raising the cache limits. The 8-core CPU figure is the provisional estimate, kept until RPC load is measured. Network is the follower's 50 Mbps plus RPC traffic.
 [^b-mbase]: Measured, r20260923-0708 and r20260923-0515, sampler CSVs (`sampler/*.csv`, `rss_anon_kb`) in the idle window after funding and before load: 0.4 to 0.5 GB per validator, 0.3 GB before funding, 0.2 GB on the observer. The chain was new, so long-running nodes sit higher.
 [^b-pchot]: Measured proxy, `sampler_by_node.*.rss_file_kb.run_max` against `gcp_by_node.*.disk_read_ops_per_sec` (p95): c3 validators held 2.1 to 3.1 GB of file-backed pages and read at most 5 IOPS; e2 validators held 1.7 to 1.8 GB and five of ten read 1,800 to 3,000 IOPS.
 [^b-replay]: Measured, r20260923-0708, bench-validator-05 killed at 08:30:12Z and restarted at 08:35:11Z: `prometheus.reth_process_resident_memory_bytes` peaked at 6.9 GB and the sampler's `rss_total_kb` at 7.0 GB, with `tn_engine_queued_outputs` at 8. The validators that never stopped peaked at 7.2 GB (`telcoin_rss_bytes.max_max_node`).

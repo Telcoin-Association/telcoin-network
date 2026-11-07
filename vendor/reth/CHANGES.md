@@ -544,6 +544,18 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   fails without the check) and `bundle_within_the_gas_limit_runs`. *Upstream*: n/a (upstream
   commit).
 
+- **TN-0047** — Backport 5b0120dbb: lower the RPC block and receipt cache defaults. *Kind*:
+  backport.
+  *Files*: `crates/rpc/rpc-server-types/src/constants.rs` (`DEFAULT_BLOCK_CACHE_MAX_LEN` 5000 →
+  1000, `DEFAULT_RECEIPT_CACHE_MAX_LEN` 2000 → 500), `crates/rpc/rpc-eth-types/src/cache/config.rs`
+  (the matching doc lines). A hand port: upstream's context has a block-access-list cache v1.11.4
+  lacks.
+  *Why*: TN sets no cache limits of its own (`RpcServerArgs` flattens reth's
+  `RpcStateCacheArgs`), and a TN block is one batch of up to 1 MB, so the old block default could
+  hold 5 GB. Operators who set `--rpc-cache.max-blocks` or `--rpc-cache.max-receipts` see no
+  change. RPC memory only. *Tests*: reth-node-core and rpc-eth-types tests (none assert the
+  defaults). *Upstream*: n/a (upstream commit).
+
 ## TN fixes (not from an upstream commit)
 
 - **TN-0036** — Debug traces hold their tracing permit until their blocking task ends. *Kind*:
