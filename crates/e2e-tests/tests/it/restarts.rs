@@ -2349,3 +2349,351 @@ fn test_labeled_sample_matches_label_subsets() -> eyre::Result<()> {
         .is_err());
     Ok(())
 }
+
+// ---- bench5 f3-rejoin ----
+
+/// The validator [`test_restarts_halt_recovers_on_stalled_head`] demotes and freezes (node 3). It
+/// is index 2, the node [`wait_for_downtime`] leaves out of its progress reads.
+const HALTED_INACTIVE_NODE: usize = 2;
+
+/// The validator [`test_restarts_halt_recovers_on_stalled_head`] kills (node 4), which leaves two
+/// active members of four, one short of the quorum of three.
+const HALTED_KILLED_NODE: usize = 3;
+
+/// Time limit for the resumed [`HALTED_INACTIVE_NODE`] to demote itself on the first certificate
+/// past its activity window.
+const HALT_DEMOTION_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How long the consensus head must stay unchanged before the committee counts as halted.
+///
+/// It exceeds `tn_types::REJOIN_STALLED_HEAD_AFTER` (20 s), so the head the inactive member resumes
+/// on is old enough for the stalled-head rule, and four times the five-second freshness limit of
+/// the usual rejoin rule, which therefore cannot promote it.
+const HALT_MIN: Duration = Duration::from_secs(21);
+
+/// Time limit for the halt to set in after the kill: commits of certificates already formed with
+/// the killed node's votes can still land.
+const HALT_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Interval between consensus head reads while the test watches the halt.
+const HALT_POLL: Duration = Duration::from_millis(500);
+
+/// Time limit, from the inactive member's resume, for the committee to commit again.
+///
+/// The budget, about 60 s: up to 10 s to fetch the outputs behind the gossiped frontier (fetches
+/// from the killed node fail after about 5 s, and a lost fetch is asked for again within two 5 s
+/// stalled-head checks), up to one check before the stall clock starts on the replayed head, the
+/// 20 s stall plus one check when timer jitter misses the threshold, and about 18 s from the
+/// promotion to the first commit, which the restarted primary spends fetching the certificates it
+/// needs before it votes. Measured runs took 42 to 53 s.
+const STALLED_HEAD_RECOVERY: Duration = Duration::from_secs(90);
+
+/// The line a catching-up CVV logs when the stalled-head rule promotes it.
+const STALLED_HEAD_REJOIN_LOG: &str = "rejoining on a stalled consensus head";
+
+/// Prometheus counter of promotions on a stalled consensus head.
+const STALLED_HEAD_REJOINS: &str = "tn_executor_stalled_head_rejoins_total";
+
+/// Prometheus counter of the usual rejoin rule's refusals, labelled `reason`.
+const REJOIN_BLOCKED: &str = "tn_executor_rejoin_blocked_total";
+
+/// The `reason` label of a refusal because the newest known header is too old.
+const STALE_HEAD: &str = r#"reason="stale_head""#;
+
+/// The labels of a promotion in [`MODE_TRANSITIONS`], from either rejoin rule.
+const TO_ACTIVE_REJOIN: [&str; 2] = [r#"to="cvv_active""#, r#"reason="rejoin""#];
+
+/// A committee halted below quorum resumes when its inactive member rejoins on the stalled head,
+/// with no process restart (SEC-2, issue #1518).
+///
+/// Four validators, quorum three, `gc_depth` [`RESTART_TEST_GC_DEPTH`]. [`HALTED_INACTIVE_NODE`] is
+/// frozen with SIGSTOP while the other three commit past its activity window, resumed until the
+/// first certificate it sees demotes it to `CvvInactive`, and frozen again at once, so it cannot
+/// catch up while the head is fresh. [`HALTED_KILLED_NODE`] is then killed: two active members
+/// remain, and the consensus head of nodes 1 and 2 stays unchanged for [`HALT_MIN`]. The inactive
+/// member is resumed: it replays to the stalled head, the usual rule refuses the head as stale,
+/// and after watching it stall it promotes itself; the committee commits again within
+/// [`STALLED_HEAD_RECOVERY`] and a transfer sent to node 1 executes on node 3.
+///
+/// The test checks node 3's counters and log: one stalled-head promotion, one rejoin transition
+/// (so the usual rule never promoted), at least one `stale_head` refusal, exactly one demotion, and
+/// one `rejoining on a stalled consensus head` line, logged after it replayed the halted head;
+/// nodes 1 and 2 count no demotion.
+///
+/// This fails without the stalled-head rule: an inactive CVV checked readiness only after an
+/// output, and only on a head under five seconds old, so the resumed node replays to the halted
+/// head, refuses it as stale and stays inactive, and the committee never commits again.
+#[test]
+#[ignore = "should not run with a default cargo test, run restart tests as seperate step"]
+fn test_restarts_halt_recovers_on_stalled_head() -> eyre::Result<()> {
+    let _permit = super::common::acquire_test_permit();
+    let test = "restarts_halt_recovers_on_stalled_head";
+    let tmp_guard = tempfile::TempDir::new()?;
+    let temp_path = tmp_guard.path().to_path_buf();
+    config_local_testnet_with_gc_depth(
+        &temp_path,
+        Some("restart_test".to_string()),
+        None,
+        Some(RESTART_TEST_GC_DEPTH),
+    )?;
+    let bin = e2e_tests::get_telcoin_network_binary();
+    let port =
+        || get_available_tcp_port("127.0.0.1").ok_or_else(|| eyre::eyre!("no port available"));
+    let nodes = (0..4)
+        .map(|_| Ok((port()?, format!("127.0.0.1:{}", port()?))))
+        .collect::<eyre::Result<Vec<(u16, String)>>>()?;
+    let client_urls = <[String; 4]>::try_from(
+        nodes
+            .iter()
+            .map(|(rpc_port, _)| format!("http://127.0.0.1:{rpc_port}"))
+            .collect::<Vec<_>>(),
+    )
+    .map_err(|_| eyre::eyre!("expected four rpc urls"))?;
+    let metrics_addrs = nodes.iter().map(|(_, addr)| addr.as_str()).collect::<Vec<_>>();
+    let mut guard = ProcessGuard::empty();
+    nodes.iter().enumerate().for_each(|(i, (rpc_port, metrics_addr))| {
+        let args = ["--metrics", metrics_addr.as_str()];
+        guard.push(start_validator_with_args(i, bin, &temp_path, *rpc_port, test, 0, &args));
+    });
+    let inactive_pid = guard
+        .get_mut(HALTED_INACTIVE_NODE)
+        .map(|child| i32::try_from(child.id()).map(Pid::from_raw))
+        .ok_or_else(|| eyre::eyre!("missing node {}", HALTED_INACTIVE_NODE + 1))??;
+
+    let checked = check_halt_recovers_on_stalled_head(
+        &mut guard,
+        inactive_pid,
+        &client_urls,
+        &metrics_addrs,
+        test,
+    );
+    // a frozen node handles the teardown's sigterm only once it runs again
+    if let Err(e) = signal::kill(inactive_pid, Signal::SIGCONT) {
+        error!(target: "restart-test", ?e, "failed to resume the frozen validator before teardown");
+    }
+    match checked {
+        Ok(summary) => {
+            guard.finish();
+            eprintln!("{test}: {summary}");
+            Ok(())
+        }
+        Err(e) => {
+            guard.kill_all();
+            Err(e.wrap_err(format!(
+                "halted committee did not resume on a stalled head, check logs in test_logs/{test}/"
+            )))
+        }
+    }
+}
+
+/// The steps and checks of [`test_restarts_halt_recovers_on_stalled_head`]. `inactive_pid` is
+/// [`HALTED_INACTIVE_NODE`]'s process; [`HALTED_KILLED_NODE`] is taken out of `guard` and killed.
+/// Returns the measured times and counter values for the test's summary line.
+fn check_halt_recovers_on_stalled_head(
+    guard: &mut ProcessGuard,
+    inactive_pid: Pid,
+    client_urls: &[String; 4],
+    metrics_addrs: &[&str],
+    test: &str,
+) -> eyre::Result<String> {
+    let node = |index: usize| index + 1;
+    let inactive_url = &client_urls[HALTED_INACTIVE_NODE];
+    network_advancing(client_urls)?;
+    wait_until_blocking(Duration::from_secs(45), "all four validators commit", || {
+        Ok(client_urls
+            .iter()
+            .all(|url| get_latest_consensus_header_number(url).is_ok_and(|number| number > 0)))
+    })?;
+
+    // the other three commit past the frozen node's activity window
+    signal::kill(inactive_pid, Signal::SIGSTOP)?;
+    wait_for_downtime(client_urls, RESTART_TEST_DOWNTIME_SECS)?;
+
+    // resumed, the node sees certificates far past its window and demotes itself; it is frozen
+    // again as soon as it is inactive, before it can catch up to a head the usual rule calls fresh
+    signal::kill(inactive_pid, Signal::SIGCONT)?;
+    let resumed = Instant::now();
+    wait_until_blocking(
+        HALT_DEMOTION_TIMEOUT,
+        &format!("node {} to demote itself after it resumed", node(HALTED_INACTIVE_NODE)),
+        || Ok(get_node_mode(inactive_url).is_ok_and(|mode| mode == NodeMode::CvvInactive)),
+    )?;
+    signal::kill(inactive_pid, Signal::SIGSTOP)?;
+    let demoted_after = resumed.elapsed();
+
+    let mut killed = guard
+        .take(HALTED_KILLED_NODE)
+        .ok_or_else(|| eyre::eyre!("missing node {}", node(HALTED_KILLED_NODE)))?;
+    kill_child(&mut killed);
+    let killed_rpc: eyre::Result<String> = call_rpc(
+        &client_urls[HALTED_KILLED_NODE],
+        "eth_blockNumber",
+        rpc_params![],
+        0,
+        "killed validator",
+    );
+    eyre::ensure!(
+        killed_rpc.is_err(),
+        "node {} serves RPC after the kill",
+        node(HALTED_KILLED_NODE)
+    );
+
+    // nodes 1 and 2 cannot certify alone: the head must stay put
+    let block_before = get_block_number(&client_urls[0])?;
+    let (halt_head, halt_started) = wait_for_halt(&client_urls[..2])?;
+    let halted_for = halt_started.elapsed();
+    let block_halted = get_block_number(&client_urls[0])?;
+    eyre::ensure!(
+        block_halted == block_before,
+        "node 1's block number moved from {block_before} to {block_halted} during the halt at \
+         consensus head {halt_head}"
+    );
+
+    // the inactive member resumes on a head older than the usual rule accepts; nothing restarts
+    signal::kill(inactive_pid, Signal::SIGCONT)?;
+    let resumed = Instant::now();
+    wait_until_blocking(
+        STALLED_HEAD_RECOVERY,
+        &format!("node 1 to commit past the halted consensus head {halt_head}"),
+        || {
+            Ok(get_latest_consensus_header_number(&client_urls[0])
+                .is_ok_and(|number| number > halt_head))
+        },
+    )?;
+    let halt_to_commit = halt_started.elapsed();
+    let resume_to_commit = resumed.elapsed();
+    wait_until_blocking(
+        Duration::from_secs(30),
+        &format!("nodes 1-3 to commit past the halted consensus head {halt_head}"),
+        || {
+            Ok(client_urls[..3].iter().all(|url| {
+                get_latest_consensus_header_number(url).is_ok_and(|number| number > halt_head)
+            }))
+        },
+    )?;
+    wait_for_node_mode(inactive_url, NodeMode::CvvActive)?;
+
+    // blocks execute again on nodes 1-3
+    let key = get_key("test-source");
+    let to_account = address_from_word("testing");
+    send_and_confirm(&client_urls[0], inactive_url, &key, to_account, 0)?;
+    let balance = get_balance(inactive_url, &to_account.to_string(), 1)?;
+    for (index, url) in client_urls[..2].iter().enumerate() {
+        let peer_balance = get_balance_above_with_retry(url, &to_account.to_string(), balance - 1)?;
+        eyre::ensure!(
+            peer_balance == balance,
+            "node {} reads a balance of {peer_balance}, node {} {balance}",
+            node(index),
+            node(HALTED_INACTIVE_NODE)
+        );
+    }
+    let blocks = client_urls[..3]
+        .iter()
+        .map(|url| get_block_number(url))
+        .collect::<eyre::Result<Vec<_>>>()?;
+    eyre::ensure!(
+        blocks.iter().all(|block| *block > block_halted),
+        "nodes 1-3 are at blocks {blocks:?}, not past the halted block {block_halted}"
+    );
+
+    // node 3 rejoined once, on the stalled-head rule, after the usual rule refused the old head
+    let body = scrape_metrics(metrics_addrs[HALTED_INACTIVE_NODE])?;
+    let stalled_rejoins = labeled_sample(&body, STALLED_HEAD_REJOINS, &[])?;
+    let rejoins = labeled_sample(&body, MODE_TRANSITIONS, &TO_ACTIVE_REJOIN)?;
+    let demotions = labeled_sample(&body, MODE_TRANSITIONS, &[TO_INACTIVE])?;
+    let stale_head = labeled_sample(&body, REJOIN_BLOCKED, &[STALE_HEAD])?;
+    eyre::ensure!(
+        stalled_rejoins == Some(1.0)
+            && rejoins == Some(1.0)
+            && demotions == Some(1.0)
+            && stale_head.is_some_and(|refusals| refusals >= 1.0),
+        "node {}: {STALLED_HEAD_REJOINS} {stalled_rejoins:?}, rejoin transitions {rejoins:?}, \
+         demotions {demotions:?} ({}), stale-head refusals {stale_head:?} ({})",
+        node(HALTED_INACTIVE_NODE),
+        samples_of(&body, MODE_TRANSITIONS),
+        samples_of(&body, REJOIN_BLOCKED)
+    );
+    let lines = node_log_lines(test, HALTED_INACTIVE_NODE, 0)?;
+    let stalled_lines =
+        lines.iter().filter(|line| line.contains(STALLED_HEAD_REJOIN_LOG)).collect::<Vec<_>>();
+    let usual_lines = lines.iter().filter(|line| line.contains(REJOIN_LOG)).count();
+    let head_age_ms = stalled_lines.first().and_then(|line| log_field(line, "head_age_ms"));
+    let replayed = stalled_lines.first().and_then(|line| log_field(line, "replayed_number"));
+    eyre::ensure!(
+        stalled_lines.len() == 1 && usual_lines == 0,
+        "node {} logged {} `{STALLED_HEAD_REJOIN_LOG}` lines and {usual_lines} `{REJOIN_LOG}` \
+         lines, the first stalled-head line: {:?}",
+        node(HALTED_INACTIVE_NODE),
+        stalled_lines.len(),
+        stalled_lines.first()
+    );
+    eyre::ensure!(
+        head_age_ms
+            .is_some_and(|age| u128::from(age) >= tn_types::REJOIN_STALLED_HEAD_AFTER.as_millis()),
+        "node {} promoted on a head {head_age_ms:?} ms old: {:?}",
+        node(HALTED_INACTIVE_NODE),
+        stalled_lines.first()
+    );
+    eyre::ensure!(
+        replayed == Some(halt_head),
+        "node {} promoted after replaying to {replayed:?}, not to the halted consensus head \
+         {halt_head}: {:?}",
+        node(HALTED_INACTIVE_NODE),
+        stalled_lines.first()
+    );
+
+    // nodes 1 and 2 were never behind
+    for (index, addr) in metrics_addrs[..2].iter().enumerate() {
+        let body = scrape_metrics(addr)?;
+        let demotions = labeled_sample(&body, MODE_TRANSITIONS, &[TO_INACTIVE])?.unwrap_or(0.0);
+        let stalled_rejoins = labeled_sample(&body, STALLED_HEAD_REJOINS, &[])?.unwrap_or(0.0);
+        eyre::ensure!(
+            demotions == 0.0 && stalled_rejoins == 0.0,
+            "node {} counted {demotions} demotions ({}) and {stalled_rejoins} stalled-head rejoins",
+            node(index),
+            samples_of(&body, MODE_TRANSITIONS)
+        );
+    }
+
+    Ok(format!(
+        "node {} demoted {demoted_after:?} after it resumed; consensus head {halt_head} halted \
+         {halted_for:?} before node {} resumed; first commit {halt_to_commit:?} after the halt \
+         began, {resume_to_commit:?} after the resume; promoted on a head {head_age_ms:?} ms old; \
+         node {} counters: {STALLED_HEAD_REJOINS} {stalled_rejoins:?}, rejoin transitions \
+         {rejoins:?}, demotions {demotions:?}, stale-head refusals {stale_head:?}; blocks {blocks:?}",
+        node(HALTED_INACTIVE_NODE),
+        node(HALTED_INACTIVE_NODE),
+        node(HALTED_INACTIVE_NODE)
+    ))
+}
+
+/// Wait until the newest consensus header any of `client_urls` reports has stayed unchanged for
+/// [`HALT_MIN`], within [`HALT_TIMEOUT`]. Returns that header's number and when the test first
+/// read it, which is when the halt began to within [`HALT_POLL`].
+fn wait_for_halt(client_urls: &[String]) -> eyre::Result<(u64, Instant)> {
+    let head = || {
+        client_urls
+            .iter()
+            .map(|url| get_latest_consensus_header_number(url))
+            .collect::<eyre::Result<Vec<_>>>()
+            .map(|numbers| numbers.into_iter().max().unwrap_or_default())
+    };
+    let start = Instant::now();
+    let mut halted = (head()?, Instant::now());
+    loop {
+        if halted.1.elapsed() >= HALT_MIN {
+            return Ok(halted);
+        }
+        eyre::ensure!(
+            start.elapsed() < HALT_TIMEOUT,
+            "the consensus head of {client_urls:?} kept moving for {HALT_TIMEOUT:?} with two \
+             active members, last at {}",
+            halted.0
+        );
+        std::thread::sleep(HALT_POLL);
+        let now = head()?;
+        if now != halted.0 {
+            halted = (now, Instant::now());
+        }
+    }
+}
