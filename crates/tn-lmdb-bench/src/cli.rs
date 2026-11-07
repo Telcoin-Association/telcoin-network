@@ -1,7 +1,11 @@
 //! The command line: arguments parsed by hand (the CLI is small), the progress on stderr, the
-//! table on stdout, the JSON to `--out`. Exit 0 on success, 2 on a usage or environment error.
+//! table on stdout, the JSON to `--out`. Exit 0 on success; 2 on a usage or environment error,
+//! refused before any work (a `$TMPDIR` on tmpfs or ramfs, or one a temp dir cannot be made in;
+//! an `--out` that cannot be written); 101 when the run itself fails (an engine error, such as a
+//! full disk, or a failed check of a workload's own results: a panic, its message on stderr). An
+//! interrupted run (a signal) leaves its rep's `tn-lmdb-bench-*` dir under `$TMPDIR`.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::{memory_fs, run, table, Config, Group, Mode, Tier, ROWS};
 
@@ -154,6 +158,29 @@ pub fn parse_args(args: &[String]) -> Result<Command, String> {
     Ok(Command::Run(config, out))
 }
 
+/// Refuse a temp dir the run cannot use, before any work: one on tmpfs or ramfs (syncs there cost
+/// nothing), or one a temp dir cannot be made in (missing, not a directory, not writable), which
+/// the first rep would otherwise find by a panic.
+fn check_temp_dir(tmp: &Path) -> Result<(), String> {
+    if let Some(fs) = memory_fs(tmp) {
+        return Err(format!(
+            "the temp dir {} is on {fs}: syncs there cost nothing. Set TMPDIR to a directory on a \
+             real disk, for this command only.",
+            tmp.display()
+        ));
+    }
+    tempfile::Builder::new()
+        .prefix("tn-lmdb-bench-")
+        .tempdir_in(tmp)
+        .and_then(tempfile::TempDir::close)
+        .map_err(|e| {
+            format!(
+                "cannot make a temp dir under {}: {e}. Set TMPDIR to a writable directory.",
+                tmp.display()
+            )
+        })
+}
+
 /// The command line: run `args` (without the program name) and return the exit code.
 pub fn cli_main(args: Vec<String>) -> i32 {
     let (config, out) = match parse_args(&args) {
@@ -174,12 +201,8 @@ pub fn cli_main(args: Vec<String>) -> i32 {
         }
     };
     let tmp = std::env::temp_dir();
-    if let Some(fs) = memory_fs(&tmp) {
-        eprintln!(
-            "tn-lmdb-bench: the temp dir {} is on {fs}: syncs there cost nothing. Set TMPDIR to a \
-             directory on a real disk, for this command only.",
-            tmp.display()
-        );
+    if let Err(message) = check_temp_dir(&tmp) {
+        eprintln!("tn-lmdb-bench: {message}");
         return 2;
     }
     if let Some(path) = &out {
@@ -267,6 +290,24 @@ mod tests {
             "--rows get.hit --sync durable",
         ] {
             assert!(parse_args(&args(bad)).is_err(), "{bad} is refused");
+        }
+    }
+
+    #[test]
+    fn a_temp_dir_the_run_cannot_use_is_refused() {
+        let root = tempfile::tempdir().expect("a temp dir");
+        check_temp_dir(root.path()).expect("a writable dir is used");
+        assert_eq!(
+            std::fs::read_dir(root.path()).expect("list").count(),
+            0,
+            "the probe is removed"
+        );
+        let missing = root.path().join("missing");
+        let file = root.path().join("file");
+        std::fs::write(&file, b"").expect("write");
+        for dir in [missing, file] {
+            let err = check_temp_dir(&dir).expect_err("refused");
+            assert!(err.contains("cannot make a temp dir"), "{err}");
         }
     }
 }

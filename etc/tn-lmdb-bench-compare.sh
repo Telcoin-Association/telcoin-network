@@ -10,7 +10,7 @@
 #                                     [--size-threshold PCT] [--gate-durable]
 #   base               the revision to compare against (default main); any rev git resolves to a
 #                      commit. A revision without tn-lmdb (no crates/tn-lmdb/Cargo.toml) is
-#                      refused: main has none until the branch that adds tn-lmdb merges.
+#                      refused (exit 2).
 #   head               the revision under test (default HEAD, this checkout's HEAD commit)
 #   --worktree         this checkout's working tree is head, uncommitted and untracked changes
 #                      included (no head argument then)
@@ -50,15 +50,15 @@
 #   (RUSTFLAGS, CARGO_HOME, ...) reach both builds alike. CARGO_TARGET_DIR is ignored: each side
 #   builds into its own build-<side>/target.
 #
-# Both sides run the same bench source, head's crates/tn-lmdb-bench (src/ and build.rs), each
-# built as a standalone package against its own tn-lmdb, so the only difference between the two
-# binaries is the engine. A side's build dir holds a generated Cargo.toml (the bench's manifest
-# with its workspace-inherited fields and dependency versions resolved from head's root
-# Cargo.toml, head's [profile.release] copied, tn-lmdb a path dependency, an empty [workspace]),
-# head's Cargo.lock, head's .cargo/config.toml and rust-toolchain.toml (cargo and rustup read
-# those from the build's directory, not the engine's), and `engine`, a link to the side's
-# checkout: a `git worktree add --detach` of its commit under the bench dir (head's is this
-# checkout with --worktree). Cargo hashes a path dependency inside the build's root by its
+# Both sides run the same bench source, head's crates/tn-lmdb-bench (src/, and build.rs if it
+# has one), each built as a standalone package against its own tn-lmdb, so the only difference
+# between the two binaries is the engine. A side's build dir holds a generated Cargo.toml (the
+# bench's manifest with its workspace-inherited fields and dependency versions resolved from
+# head's root Cargo.toml, head's [profile.release] copied, tn-lmdb a path dependency, an empty
+# [workspace]), head's Cargo.lock, head's .cargo/config.toml and rust-toolchain.toml (cargo and
+# rustup read those from the build's directory, not the engine's), and `engine`, a link to the
+# side's checkout: a `git worktree add --detach` of its commit under the bench dir (head's is
+# this checkout with --worktree). Cargo hashes a path dependency inside the build's root by its
 # relative path and gives rustc relative source paths, so the binary does not depend on where
 # the side's checkout is: two checkouts of one tn-lmdb build byte-identical binaries. The
 # script compares them: identical binaries mean the change does not reach the bench (comments,
@@ -77,25 +77,34 @@
 # the JSON), the rounds and thresholds, then one line per row: name, group, sync, base and head
 # median, ratio, min ratio, each side's spread ((max - min) / median of its pooled samples) and
 # the verdict: ok, improved, REGRESSION, not gated (a durable time row, or a row whose JSON says
-# `gate: false`: the bench marks the commit rows so at the quick tier, where one commit is too
-# short to hold still), or new and removed (a row on one side only, never gated). Lower is better
-# for every row. When rustc or cargo processes were running as the runs started, the report says
-# so.
+# `gate: false`: the bench marks the commit rows so in a run of fewer than 1M entries, the quick
+# tier's, where one commit is too short to hold still), or new and removed (a row on one side
+# only, never gated). Lower is better for every row. When rustc or cargo processes were running
+# as the runs started, the report says so.
 #
 # Needs git, a Rust toolchain, python3 3.11 or later (its tomllib; --report-only needs 3.8) and
 # cmp. In the bench dir (marked as the script's own with a .tn-lmdb-bench-compare file; an
 # existing, non-empty dir without it is refused) the script writes only:
+#   .lock/                        held for the whole run (made by an atomic mkdir, with the
+#                                 run's pid inside, removed at exit), so a second run on the
+#                                 same dir is refused (exit 2); a run killed by SIGKILL leaves
+#                                 it: remove it once that run is gone. --report-only takes none
 #   wt-base/, wt-head/            the side checkouts (git worktrees), removed at exit unless
 #                                 --keep, then `git worktree prune`
 #   build-base/, build-head/      each side's standalone build; its target/ is kept for reruns
+#   logs/worktree-<side>.log      each `git worktree add`'s output
 #   logs/build-<side>.log, logs/<side>-<round>.log  each build's and run's output
 #   json/<side>-<round>.json      each run's JSON (emptied when the runs start)
 #   meta.tsv                      the run's commits, host and settings, for --report-only
-#   report.md                     the report, also printed; its path is printed last
+#   report.md                     the report, also printed; its path is printed last (one
+#                                 line saying why when there is nothing to compare)
 #   tmp/                          the runs' TMPDIR, removed at exit
 # Exit codes: 0 no gated regression (or nothing to compare), 1 a gated regression, 2 a usage,
-# environment, build or run error.
-set -euo pipefail
+# environment, build or run error, or any failure the script does not expect (never 1).
+set -Eeuo pipefail
+# A command that fails outside an `if`, `||` or `&&` (a full disk, a permission error) would end
+# the script with its own status, which may be 1, a gated regression's code: exit 2 instead.
+trap 'rc=$?; echo "tn-lmdb-bench-compare: line $LINENO: unexpected failure (status $rc): $BASH_COMMAND" >&2; exit 2' ERR
 
 die() {
     echo "tn-lmdb-bench-compare: $*" >&2
@@ -199,8 +208,7 @@ engine_dir="crates/tn-lmdb"
 bench_crate="crates/tn-lmdb-bench"
 # What a side's tn-lmdb compiles from: its crate and the root manifest it inherits fields from.
 engine_inputs=("$engine_dir" Cargo.toml)
-no_engine_hint="main does not have tn-lmdb until the branch that adds it merges: pass a base that does, e.g. a451515f4 or later"
-resolve() { # <rev>: prints its commit
+resolve() { # <rev>: prints its commit (its die ends a `$(...)` only: call it as `x="$(resolve ..)" || exit 2`)
     git -C "$repo" rev-parse --verify --quiet "$1^{commit}" || die "$1 is not a commit here"
 }
 short() { git -C "$repo" rev-parse --short "$1"; }
@@ -211,16 +219,16 @@ rev_text() { # <rev> <commit>: "rev (short sha)", or the short sha alone for a s
         *) echo "$1 ($(short "$2"))" ;;
     esac
 }
-base_commit="$(resolve "$base")"
+base_commit="$(resolve "$base")" || exit 2
 git -C "$repo" cat-file -e "$base_commit:$engine_dir/Cargo.toml" 2>/dev/null \
-    || die "base $(rev_text "$base" "$base_commit") does not have tn-lmdb ($engine_dir/Cargo.toml): $no_engine_hint"
+    || die "base $(rev_text "$base" "$base_commit") does not have tn-lmdb ($engine_dir/Cargo.toml): pass a base that has it"
 if [ "$worktree" = 1 ]; then
-    head_commit="$(resolve HEAD)"
+    head_commit="$(resolve HEAD)" || exit 2
     [ -f "$repo/$engine_dir/Cargo.toml" ] || die "this working tree does not have tn-lmdb ($engine_dir)"
 else
-    head_commit="$(resolve "$head")"
+    head_commit="$(resolve "$head")" || exit 2
     git -C "$repo" cat-file -e "$head_commit:$engine_dir/Cargo.toml" 2>/dev/null \
-        || die "head $(rev_text "$head" "$head_commit") does not have tn-lmdb ($engine_dir/Cargo.toml): $no_engine_hint"
+        || die "head $(rev_text "$head" "$head_commit") does not have tn-lmdb ($engine_dir/Cargo.toml): pass a head that has it"
 fi
 
 # The working tree's changes to what a build reads, for the report's head line.
@@ -248,17 +256,6 @@ else
     git -C "$repo" diff --quiet "$base_commit" "$head_commit" -- "${engine_inputs[@]}" && same_engine=1
 fi
 base_text="$(rev_text "$base" "$base_commit")"
-if [ "$same_engine" = 1 ] && [ "$allow_same" = 0 ]; then
-    echo "base $base_text and head $head_text have the same tn-lmdb ($engine_dir and the root Cargo.toml): nothing to compare"
-    exit 0
-fi
-if [ "$worktree" = 1 ]; then
-    [ -f "$repo/$bench_crate/Cargo.toml" ] \
-        || die "this working tree has no $bench_crate: both sides run head's bench source"
-else
-    git -C "$repo" cat-file -e "$head_commit:$bench_crate/Cargo.toml" 2>/dev/null \
-        || die "head $head_text has no $bench_crate: both sides run head's bench source"
-fi
 
 # The bench dir: created here, or one this script made before (its marker), never another.
 marker=".tn-lmdb-bench-compare"
@@ -283,10 +280,14 @@ fi
 tmp_dir="$bench_dir/tmp"
 json_dir="$bench_dir/json"
 log_dir="$bench_dir/logs"
+lock_dir="$bench_dir/.lock"
 
-# Worktrees this run added: removed at exit unless --keep.
+# Worktrees this run added: removed at exit unless --keep. At exit nothing is removed unless this
+# run took the lock: a refused run must not remove the files of the run that holds it.
 added=()
+locked=0
 cleanup() {
+    [ "$locked" = 1 ] || return 0
     rm -rf "$tmp_dir" 2>/dev/null || true
     if [ "$keep" = 0 ] && [ "${#added[@]}" -gt 0 ]; then
         for dir in "${added[@]}"; do
@@ -294,10 +295,38 @@ cleanup() {
         done
         git -C "$repo" worktree prune >/dev/null 2>&1 || true
     fi
+    rm -rf "$lock_dir" 2>/dev/null || true
 }
 trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
+# One run at a time on a bench dir: a second would remove the first's worktrees, rebuild its
+# binaries and empty its json/ and tmp/ under it. mkdir is atomic, and portable (macOS has no
+# flock(1)).
+if ! mkdir "$lock_dir" 2>/dev/null; then
+    [ -d "$lock_dir" ] || die "cannot create the lock $lock_dir"
+    holder="$(cat "$lock_dir/pid" 2>/dev/null || true)"
+    die "refusing $bench_dir: another run holds it (pid ${holder:-unknown}; lock $lock_dir): wait for it or pass another --bench-dir, and remove $lock_dir if that run is gone"
+fi
+locked=1
+echo "$$" >"$lock_dir/pid"
+
+nothing_to_compare() { # <why>: says so, in report.md too (CI's job summary shows it), and exits 0
+    printf '# tn-lmdb bench: base vs head\n\n%s: nothing to compare\n' "$1" >"$bench_dir/report.md"
+    echo "$1: nothing to compare"
+    echo "report: $bench_dir/report.md"
+    exit 0
+}
+if [ "$same_engine" = 1 ] && [ "$allow_same" = 0 ]; then
+    nothing_to_compare "base $base_text and head $head_text have the same tn-lmdb ($engine_dir and the root Cargo.toml)"
+fi
+if [ "$worktree" = 1 ]; then
+    [ -f "$repo/$bench_crate/Cargo.toml" ] \
+        || die "this working tree has no $bench_crate: both sides run head's bench source"
+else
+    git -C "$repo" cat-file -e "$head_commit:$bench_crate/Cargo.toml" 2>/dev/null \
+        || die "head $head_text has no $bench_crate: both sides run head's bench source"
+fi
 mkdir -p "$log_dir" "$json_dir"
 unset CARGO_TARGET_DIR
 
@@ -357,8 +386,7 @@ build head
 bin_base="$bench_dir/build-base/target/release/tn-lmdb-bench"
 bin_head="$bench_dir/build-head/target/release/tn-lmdb-bench"
 if cmp -s "$bin_base" "$bin_head" && [ "$allow_same" = 0 ]; then
-    echo "the base $base_text and head $head_text bench binaries are identical: what differs between their tn-lmdb ($engine_dir, the root Cargo.toml) does not reach the binary: nothing to compare"
-    exit 0
+    nothing_to_compare "the base $base_text and head $head_text bench binaries are identical: what differs between their tn-lmdb ($engine_dir, the root Cargo.toml) does not reach the binary"
 fi
 
 run_args=()

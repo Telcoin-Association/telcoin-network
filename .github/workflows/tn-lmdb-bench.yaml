@@ -1,5 +1,6 @@
-# The tn-lmdb regression bench (etc/tn-lmdb-bench-compare.sh): the engine bench built against a
-# pull request's base and head commits, run as interleaved rounds and compared row by row.
+# The tn-lmdb regression bench (etc/tn-lmdb-bench-compare.sh): the engine bench built against
+# what merging a pull request changes (its merge commit, and that commit's first parent: the base
+# branch it merges onto), run as interleaved rounds and compared row by row.
 #
 # Optional, and only when asked: on a pull request labeled `bench` (when the label is added, and
 # on every push or reopen while it stays), or by hand from the Actions tab (*tn-lmdb bench* ->
@@ -21,7 +22,7 @@ on:
   workflow_dispatch:
     inputs:
       base:
-        description: "Base revision (commit, tag or branch; it must have crates/tn-lmdb)"
+        description: "Base revision (commit, tag or branch, a branch read as origin/<branch>; it must have crates/tn-lmdb)"
         required: true
       head:
         description: "Head revision (empty: the commit this run is on)"
@@ -33,8 +34,15 @@ on:
         options: [quick, default, full]
         default: quick
 
+# A benched pull request's runs share a group, so a push cancels the stale run. A run whose job
+# skips (a pull request without the label, or another label added) gets a group of its own, so
+# it cancels nothing: the condition is the job's `if` below for a pull request (keep the two in
+# step). A dispatched run's group is its own.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  group: >-
+    ${{ github.workflow }}-${{ ((github.event.action == 'labeled' && github.event.label.name == 'bench')
+    || (github.event.action != 'labeled' && contains(github.event.pull_request.labels.*.name, 'bench')))
+    && github.event.pull_request.number || github.run_id }}
   cancel-in-progress: true
 
 # Reads the repository and runs the pull request's bench, like any pull_request job: a
@@ -50,7 +58,8 @@ jobs:
   bench:
     name: tn-lmdb bench
     # A pull request runs only with the `bench` label, and its `labeled` event only for that
-    # label, so adding some other label to a benched pull request does not run it again.
+    # label, so adding some other label to a benched pull request does not run it again (nor,
+    # by `concurrency` above, cancel its run).
     if: >-
       github.event_name == 'workflow_dispatch'
       || (github.event.action == 'labeled' && github.event.label.name == 'bench')
@@ -58,7 +67,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
-      # Full history: the script checks out both revisions with `git worktree add`.
+      # Full history: the script checks out both revisions with `git worktree add`, and a pull
+      # request's base is its merge commit's first parent. On a pull request this checks out the
+      # merge commit (`github.sha`, refs/pull/<n>/merge).
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
@@ -70,21 +81,34 @@ jobs:
       - name: Compare base and head
         env:
           EVENT_NAME: ${{ github.event_name }}
-          PR_BASE: ${{ github.event.pull_request.base.sha }}
-          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+          MERGE_SHA: ${{ github.sha }}
           INPUT_BASE: ${{ inputs.base }}
           INPUT_HEAD: ${{ inputs.head }}
           INPUT_TIER: ${{ inputs.tier }}
           BENCH_DIR: ${{ runner.temp }}/tn-lmdb-bench
         run: |
           set -euo pipefail
+          # The checkout makes a local branch for the run's own ref only; any other branch is
+          # origin/<branch> here. commit_ref <rev>: the rev when it resolves as given, else
+          # origin/<rev> when that does (else the rev, for the script to refuse).
+          commit_ref() {
+            if ! git rev-parse -q --verify "$1^{commit}" >/dev/null \
+              && git rev-parse -q --verify "origin/$1^{commit}" >/dev/null; then
+              echo "origin/$1"
+            else
+              echo "$1"
+            fi
+          }
           if [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
-            base="$INPUT_BASE"
-            head="${INPUT_HEAD:-HEAD}"
+            base="$(commit_ref "$INPUT_BASE")"
+            head="$(commit_ref "${INPUT_HEAD:-HEAD}")"
             tier="${INPUT_TIER:-quick}"
           else
-            base="$PR_BASE"
-            head="$PR_HEAD"
+            # What merging changes: the merge commit against the base tip it merges onto, not
+            # the base branch's tip against the pull request's head, whose difference holds the
+            # base's own changes since the branch point.
+            head="$MERGE_SHA"
+            base="$(git rev-parse --verify "$MERGE_SHA^1")"
             tier=quick
           fi
           ./etc/tn-lmdb-bench-compare.sh --tier "$tier" --bench-dir "$BENCH_DIR" -- "$base" "$head"

@@ -192,8 +192,13 @@ impl Job {
     }
 }
 
-/// One row: a stable name (the key two runs compare by), its group, its metric, the sync modes
-/// it runs under, and what one operation of a time row is.
+/// The entries a bulk table (`n`) from which the comparison gates every row: a smaller run (the
+/// quick tier's 100k) reports the rows whose [`RowSpec::small_gate`] is `false` without gating
+/// them.
+pub const GATE_EVERY_ROW_FROM_N: usize = 1_000_000;
+
+/// One row: a stable name (the key two runs compare by), its group, its metric and the sync modes
+/// it runs under. The README's table says what one operation of a time row is.
 #[derive(Clone, Copy, Debug)]
 pub struct RowSpec {
     /// The row's stable name.
@@ -204,34 +209,33 @@ pub struct RowSpec {
     pub metric: Metric,
     /// The sync modes it runs under.
     pub modes: Modes,
-    /// What one operation is (time rows), or what is measured (exact rows).
-    pub op: &'static str,
-    /// Whether the comparison gates the row at the quick tier (its JSON's `gate`). A commit row's
-    /// sample there is one commit of 100k entries, a fraction of a millisecond spent mostly
+    /// Whether the comparison gates the row in a run of fewer than [`GATE_EVERY_ROW_FROM_N`]
+    /// entries a bulk table ([`RowSpec::gate`]). A commit row's sample in a run of the quick
+    /// tier's 100k is one commit of 100k entries, a fraction of a millisecond spent mostly
     /// writing fresh file pages, whose cost moves by 10% and more from run to run with the
-    /// machine's memory state however many passes it takes: such a row is reported at the quick
-    /// tier, and gated from the default tier (1M entries) on.
-    pub quick_gate: bool,
+    /// machine's memory state however many passes it takes: such a row is reported in a small
+    /// run, and gated from 1M entries (the default and full tiers) on. The run's size decides,
+    /// not its tier's name, since `--n` overrides the tier's.
+    pub small_gate: bool,
     /// The job that measures it.
     pub(crate) job: Job,
 }
 
 impl RowSpec {
-    /// The row, not gated at the quick tier.
-    const fn not_gated_at_quick(self) -> Self {
-        Self { quick_gate: false, ..self }
+    /// The row, not gated in a run of fewer than [`GATE_EVERY_ROW_FROM_N`] entries.
+    const fn not_gated_when_small(self) -> Self {
+        Self { small_gate: false, ..self }
+    }
+
+    /// Whether the comparison gates the row in a run of `n` entries a bulk table: its JSON's
+    /// `gate`.
+    pub const fn gate(&self, n: usize) -> bool {
+        self.small_gate || n >= GATE_EVERY_ROW_FROM_N
     }
 }
 
-const fn row(
-    name: &'static str,
-    group: Group,
-    metric: Metric,
-    modes: Modes,
-    job: Job,
-    op: &'static str,
-) -> RowSpec {
-    RowSpec { name, group, metric, modes, op, quick_gate: true, job }
+const fn row(name: &'static str, group: Group, metric: Metric, modes: Modes, job: Job) -> RowSpec {
+    RowSpec { name, group, metric, modes, small_gate: true, job }
 }
 
 use Group::{Generic, Reth};
@@ -240,46 +244,46 @@ use Modes::{DurableOnly, Every, NoSyncOnly};
 
 /// Every row, in report order. The README's table describes each.
 pub const ROWS: &[RowSpec] = &[
-    row("put.seq", Generic, NsPerOp, NoSyncOnly, Job::Seq, "put"),
-    row("put.seq.commit", Generic, NsPerOp, Every, Job::Seq, "commit").not_gated_at_quick(),
-    row("put.rand", Generic, NsPerOp, NoSyncOnly, Job::Rand, "put"),
-    row("put.rand.commit", Generic, NsPerOp, Every, Job::Rand, "commit").not_gated_at_quick(),
-    row("put.rand.file_bytes", Generic, Bytes, NoSyncOnly, Job::Rand, "file used span"),
-    row("put.append", Generic, NsPerOp, NoSyncOnly, Job::Api, "append"),
-    row("put.cursor", Generic, NsPerOp, NoSyncOnly, Job::Api, "cursor put"),
-    row("put.txn_cursor", Generic, NsPerOp, NoSyncOnly, Job::Api, "detached cursor put"),
-    row("get.hit", Generic, NsPerOp, NoSyncOnly, Job::Rand, "get"),
-    row("get.miss", Generic, NsPerOp, NoSyncOnly, Job::Rand, "get"),
-    row("scan.fwd", Generic, NsPerOp, NoSyncOnly, Job::Rand, "entry"),
-    row("scan.rev", Generic, NsPerOp, NoSyncOnly, Job::Rand, "entry"),
-    row("seek.range", Generic, NsPerOp, NoSyncOnly, Job::Rand, "seek + 9 next"),
-    row("seek.range.sorted", Generic, NsPerOp, NoSyncOnly, Job::Rand, "seek + 9 next"),
-    row("ro.txn", Generic, NsPerOp, NoSyncOnly, Job::Txn, "transaction"),
-    row("ro.txn.mt", Generic, NsPerOp, NoSyncOnly, Job::Txn, "transaction a thread"),
-    row("commit.small", Generic, NsPerOp, Every, Job::Small, "transaction"),
-    row("mixed", Generic, NsPerOp, Every, Job::Mixed, "put or delete"),
-    row("delete.rand90", Generic, NsPerOp, NoSyncOnly, Job::Delete, "delete"),
-    row("churn", Generic, NsPerOp, Every, Job::Churn, "round"),
-    row("churn.file_bytes", Generic, Bytes, Every, Job::Churn, "file used span"),
-    row("churn.table_bytes", Generic, Bytes, Every, Job::Churn, "table pages"),
-    row("big.2k", Generic, NsPerOp, NoSyncOnly, Job::Big, "put"),
-    row("big.2k.get", Generic, NsPerOp, NoSyncOnly, Job::Big, "get"),
-    row("big.8k", Generic, NsPerOp, NoSyncOnly, Job::Big, "put"),
-    row("big.8k.get", Generic, NsPerOp, NoSyncOnly, Job::Big, "get"),
-    row("big.32k", Generic, NsPerOp, NoSyncOnly, Job::Big, "put"),
-    row("big.32k.get", Generic, NsPerOp, NoSyncOnly, Job::Big, "get"),
-    row("reth.state.load", Reth, NsPerOp, Every, Job::State, "row"),
-    row("reth.state.get", Reth, NsPerOp, NoSyncOnly, Job::State, "get"),
-    row("reth.state.walk", Reth, NsPerOp, NoSyncOnly, Job::State, "row"),
-    row("reth.state.file_bytes", Reth, Bytes, Every, Job::State, "file used span"),
-    row("reth.changesets.append", Reth, NsPerOp, Every, Job::ChangeSets, "row"),
-    row("reth.changesets.walk", Reth, NsPerOp, NoSyncOnly, Job::ChangeSets, "row"),
-    row("reth.changesets.file_bytes", Reth, Bytes, Every, Job::ChangeSets, "file used span"),
-    row("reth.history.rewrite", Reth, NsPerOp, Every, Job::HistoryRewrite, "key"),
-    row("reth.dup.rewrite", Reth, NsPerOp, Every, Job::DupRewrite, "pair"),
-    row("reth.block", Reth, NsPerOp, Every, Job::Block, "block"),
-    row("reth.block.file_bytes", Reth, Bytes, Every, Job::Block, "file used span"),
-    row("reth.block.pages_synced", Reth, PagesPerOp, DurableOnly, Job::Block, "pages synced"),
+    row("put.seq", Generic, NsPerOp, NoSyncOnly, Job::Seq),
+    row("put.seq.commit", Generic, NsPerOp, Every, Job::Seq).not_gated_when_small(),
+    row("put.rand", Generic, NsPerOp, NoSyncOnly, Job::Rand),
+    row("put.rand.commit", Generic, NsPerOp, Every, Job::Rand).not_gated_when_small(),
+    row("put.rand.file_bytes", Generic, Bytes, NoSyncOnly, Job::Rand),
+    row("put.append", Generic, NsPerOp, NoSyncOnly, Job::Api),
+    row("put.cursor", Generic, NsPerOp, NoSyncOnly, Job::Api),
+    row("put.txn_cursor", Generic, NsPerOp, NoSyncOnly, Job::Api),
+    row("get.hit", Generic, NsPerOp, NoSyncOnly, Job::Rand),
+    row("get.miss", Generic, NsPerOp, NoSyncOnly, Job::Rand),
+    row("scan.fwd", Generic, NsPerOp, NoSyncOnly, Job::Rand),
+    row("scan.rev", Generic, NsPerOp, NoSyncOnly, Job::Rand),
+    row("seek.range", Generic, NsPerOp, NoSyncOnly, Job::Rand),
+    row("seek.range.sorted", Generic, NsPerOp, NoSyncOnly, Job::Rand),
+    row("ro.txn", Generic, NsPerOp, NoSyncOnly, Job::Txn),
+    row("ro.txn.mt", Generic, NsPerOp, NoSyncOnly, Job::Txn),
+    row("commit.small", Generic, NsPerOp, Every, Job::Small),
+    row("mixed", Generic, NsPerOp, Every, Job::Mixed),
+    row("delete.rand90", Generic, NsPerOp, NoSyncOnly, Job::Delete),
+    row("churn", Generic, NsPerOp, Every, Job::Churn),
+    row("churn.file_bytes", Generic, Bytes, Every, Job::Churn),
+    row("churn.table_bytes", Generic, Bytes, Every, Job::Churn),
+    row("big.2k", Generic, NsPerOp, NoSyncOnly, Job::Big),
+    row("big.2k.get", Generic, NsPerOp, NoSyncOnly, Job::Big),
+    row("big.8k", Generic, NsPerOp, NoSyncOnly, Job::Big),
+    row("big.8k.get", Generic, NsPerOp, NoSyncOnly, Job::Big),
+    row("big.32k", Generic, NsPerOp, NoSyncOnly, Job::Big),
+    row("big.32k.get", Generic, NsPerOp, NoSyncOnly, Job::Big),
+    row("reth.state.load", Reth, NsPerOp, Every, Job::State),
+    row("reth.state.get", Reth, NsPerOp, NoSyncOnly, Job::State),
+    row("reth.state.walk", Reth, NsPerOp, NoSyncOnly, Job::State),
+    row("reth.state.file_bytes", Reth, Bytes, Every, Job::State),
+    row("reth.changesets.append", Reth, NsPerOp, Every, Job::ChangeSets),
+    row("reth.changesets.walk", Reth, NsPerOp, NoSyncOnly, Job::ChangeSets),
+    row("reth.changesets.file_bytes", Reth, Bytes, Every, Job::ChangeSets),
+    row("reth.history.rewrite", Reth, NsPerOp, Every, Job::HistoryRewrite),
+    row("reth.dup.rewrite", Reth, NsPerOp, Every, Job::DupRewrite),
+    row("reth.block", Reth, NsPerOp, Every, Job::Block),
+    row("reth.block.file_bytes", Reth, Bytes, Every, Job::Block),
+    row("reth.block.pages_synced", Reth, PagesPerOp, DurableOnly, Job::Block),
 ];
 
 /// A benchmark tier: the default size, reps and sync modes of a run.
@@ -368,8 +372,8 @@ pub struct RowResult {
     pub max: f64,
     /// Whether the row is deterministic: any change is real.
     pub exact: bool,
-    /// Whether the comparison gates the row at this run's tier ([`RowSpec::quick_gate`]); a row
-    /// of `false` is reported, not gated.
+    /// Whether the comparison gates the row at this run's size ([`RowSpec::gate`]); a row of
+    /// `false` is reported, not gated.
     pub gate: bool,
 }
 
@@ -716,7 +720,7 @@ pub fn run(config: &Config, progress: &mut dyn FnMut(&str)) -> Report {
                 max,
                 samples,
                 exact: row.metric.exact(),
-                gate: row.quick_gate || config.tier != Tier::Quick,
+                gate: row.gate(config.n),
             }
         })
         .collect();
@@ -802,7 +806,11 @@ mod tests {
             assert_eq!(result.samples.len(), 1, "{} ({})", row.name, mode.name());
             assert!(result.median > 0.0, "{} ({}) measured nothing", row.name, mode.name());
             assert_eq!(result.exact, row.metric.exact());
-            assert_eq!(result.gate, row.quick_gate, "{} at the quick tier", row.name);
+            assert_eq!(
+                result.gate, row.small_gate,
+                "{} in a run of {} entries",
+                row.name, config.n
+            );
         }
         assert!(first.rows.iter().any(|r| r.name == "put.seq.commit" && !r.gate));
         // Every row that has a durable twin ran under both modes, and pages_synced only durable.
@@ -872,15 +880,24 @@ mod tests {
             assert_eq!(before.samples, again.samples, "{} ({}) is exact", again.name, again.sync);
         }
 
-        // Past the quick tier every row is gated.
+        // The run's size decides the gate, not its tier's name: a default-tier run of the tiny
+        // size gates the small-run rows no more than a quick one.
         let commits = Config {
             tier: Tier::Default,
-            rows: ROWS.iter().filter(|r| !r.quick_gate).collect(),
+            rows: ROWS.iter().filter(|r| !r.small_gate).collect(),
             modes: vec![Mode::NoSync],
             ..tiny()
         };
         assert!(!commits.rows.is_empty());
-        assert!(run(&commits, &mut |_| {}).rows.iter().all(|r| r.gate));
+        assert!(run(&commits, &mut |_| {}).rows.iter().all(|r| !r.gate));
+    }
+
+    #[test]
+    fn every_row_is_gated_from_the_size_on() {
+        let small: Vec<&str> = ROWS.iter().filter(|r| !r.gate(100_000)).map(|r| r.name).collect();
+        assert_eq!(small, ["put.seq.commit", "put.rand.commit"]);
+        assert!(ROWS.iter().all(|r| r.gate(GATE_EVERY_ROW_FROM_N)));
+        assert!(ROWS.iter().any(|r| !r.gate(GATE_EVERY_ROW_FROM_N - 1)));
     }
 
     #[test]

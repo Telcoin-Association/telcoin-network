@@ -18,7 +18,10 @@ tn-lmdb.
 (each one bench run's JSON, schema 1), writes `report.md` there and prints it. The run settings
 come from the dir's `meta.tsv` when there is one (key, tab, value per line); a threshold given
 on the command line wins over it. Exits 0 with no gated regression, 1 with one, 2 when the
-JSON is missing, of another schema, or of runs with different configs.
+JSON is missing, of another schema or shape, or of runs with different configs.
+
+Any other failure (an unreadable file, a manifest of a shape `manifest` does not expect) exits 2
+too, never 1: 1 means a gated regression to the script's callers.
 """
 
 import json
@@ -192,6 +195,14 @@ def read_meta(bench_dir):
     return meta
 
 
+def valid_row(row):
+    """Whether `row` has the shape `pool` and `report` read: a string name and numeric samples."""
+    return (isinstance(row, dict) and isinstance(row.get("name"), str)
+            and isinstance(row.get("samples"), list)
+            and all(isinstance(s, (int, float)) and not isinstance(s, bool)
+                    for s in row["samples"]))
+
+
 def load_runs(bench_dir, side):
     json_dir = os.path.join(bench_dir, "json")
     runs = []
@@ -209,9 +220,15 @@ def load_runs(bench_dir, side):
                 doc = json.load(f)
         except (OSError, ValueError) as err:
             fail(f"{path}: {err}")
+        if not isinstance(doc, dict):
+            fail(f"{path}: not a tn-lmdb-bench JSON (the top level is not an object)")
         if doc.get("schema") != SCHEMA or doc.get("bench") != "tn-lmdb-bench":
             fail(f"{path}: not a tn-lmdb-bench JSON of schema {SCHEMA} (schema "
                  f"{doc.get('schema')!r}, bench {doc.get('bench')!r})")
+        rows = doc.get("rows")
+        if not isinstance(rows, list) or not all(valid_row(row) for row in rows):
+            fail(f"{path}: `rows` must be a list of rows, each with a string `name` and a list "
+                 "of numbers `samples`")
         doc["_path"] = path
         docs.append(doc)
     return docs
@@ -349,8 +366,9 @@ def report(bench_dir, args):
                 verdict = "improved"
             else:
                 verdict = "ok"
-        # A row the bench marks `gate: false` (a commit row at the quick tier) is reported only.
-        gated = exact or (bool(source.get("gate", True)) and (sync != "durable" or gate_durable))
+        # A row the bench marks `gate: false` (a commit row of a small run) is reported only, an
+        # exact one too; a durable time row is gated only with --gate-durable.
+        gated = bool(source.get("gate", True)) and (exact or sync != "durable" or gate_durable)
         if not gated:
             if verdict == "REGRESSION":
                 ungated_over.append(label)
@@ -368,6 +386,12 @@ def report(bench_dir, args):
     def cell(key, default="unknown"):
         return meta.get(key) or default
 
+    # The sync modes the runs ran, from their rows: without --sync (an empty `sync` in meta.tsv)
+    # the bench runs its tier's.
+    modes = ", ".join(dict.fromkeys(key[1] for key in keys)) or "none"
+    if "sync" in meta and not meta["sync"]:
+        modes += " (the tier's)"
+
     out = ["# tn-lmdb bench: base vs head", ""]
     header = [
         ("base", f"{cell('base')} {meta.get('base_subject', '')}".strip()),
@@ -378,7 +402,7 @@ def report(bench_dir, args):
         ("date", cell("date")),
         ("tier", f"{first.get('tier')}, n {first.get('n')}, reps {first.get('reps')}, "
                  f"page size {first.get('page_size')}"),
-        ("filters", f"rows {cell('rows', 'all')}, sync {cell('sync', 'all')}"),
+        ("filters", f"rows {cell('rows', 'all')}; sync {modes}"),
         ("rounds", f"{cell('rounds', '?')} ({cell('order', '?')}): {len(base_docs)} base and "
                    f"{len(head_docs)} head runs, each row's samples pooled per side"),
         ("thresholds", f"time rows: head/base median > {1 + threshold:g} and min > "
@@ -405,7 +429,7 @@ def report(bench_dir, args):
                         ("ok", "improved", "REGRESSION", "not gated", "new", "removed") if k in counts)
     out.append(f"rows: {len(table)} ({summary})")
     if ungated_over:
-        out.append("past the time threshold but not gated (durable, or `gate: false`): "
+        out.append("past the threshold but not gated (durable, or `gate: false`): "
                    f"{', '.join(ungated_over)}")
     if gated_regressions:
         out.append(f"result: REGRESSION in {len(gated_regressions)} gated row"
@@ -420,11 +444,16 @@ def report(bench_dir, args):
 
 
 def main():
-    if len(sys.argv) >= 2 and sys.argv[1] == "manifest" and len(sys.argv) == 5:
-        manifest(*sys.argv[2:5])
-        return 0
-    if len(sys.argv) >= 3 and sys.argv[1] == "report":
-        return report(sys.argv[2], sys.argv[3:])
+    try:
+        if len(sys.argv) >= 2 and sys.argv[1] == "manifest" and len(sys.argv) == 5:
+            manifest(*sys.argv[2:5])
+            return 0
+        if len(sys.argv) >= 3 and sys.argv[1] == "report":
+            return report(sys.argv[2], sys.argv[3:])
+    except Exception as err:
+        # A failure not anticipated exits 2, never 1 (a gated regression). `fail`'s exit is a
+        # SystemExit, not an Exception, so it passes through as it is.
+        fail(f"unexpected failure: {type(err).__name__}: {err}")
     fail("usage: manifest <bench Cargo.toml> <root Cargo.toml> <out> | report <bench dir> [...]")
 
 
