@@ -54,16 +54,6 @@ The structural fix is to give the RPC `TaskSpawner` (`crates/types/src/task_mana
 runtime or bounded blocking pool, so RPC load cannot delay block execution whatever each method
 does.
 
-## CORS on shifted workers' HTTP servers
-
-With HTTP and WebSocket on one port, reth's worker-0 server applies `ws_cors.or(http_cors)` to both
-transports (`vendor/reth/crates/rpc/rpc-builder/src/lib.rs`, the shared-port arm). Workers above 0
-get separate servers on shifted ports, and `worker_rpc_server_args`
-(`crates/tn-reth/src/env/rpc.rs`) carries `--http.corsdomain` to their WebSocket server, but not
-`--ws.origins` to their HTTP server. So with only `--ws.origins` set, worker 0's HTTP server sends
-CORS headers and the other workers' do not. That fails closed (browsers are refused), so it is
-not a security issue; the fix is to mirror the carry into `http_corsdomain`.
-
 ## RocksDB stubs and storage-v2 plumbing
 
 RocksDB itself is gone (TN-0014), but the zero-size stub types, the provider-factory field and
