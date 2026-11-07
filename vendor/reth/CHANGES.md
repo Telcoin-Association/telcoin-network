@@ -506,3 +506,30 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   `blocking_io_permit_tests` drop each request while its blocking task is stalled on the account
   store and check that the permit stays taken until the task ends; both fail when the permit is
   held by the request instead of the task. *Upstream*: yes.
+
+- **TN-0038** — `trace_*` and `debug_executionWitness*` hold their tracing permits until their
+  blocking tasks end. *Kind*: fix (security).
+  *Files*: `crates/rpc/rpc/src/trace.rs` (the eleven `TraceApiServer` handlers, the public
+  methods behind them, and `trace_permit_tests`), `crates/rpc/rpc/src/debug.rs`
+  (`debug_execution_witness_for_block`, its two handlers, and `trace_permit_tests`, which now
+  covers the witness methods and uses the shared harness), `crates/rpc/rpc/src/permit_test_utils.rs`
+  (TN-owned, test only: the harness TN-0036's tests used, moved out so both modules share it),
+  `crates/rpc/rpc/src/lib.rs` (declares it), `crates/storage/provider/src/test_utils/mock.rs`
+  (test support: `MockEthProvider::recovered_block_range` returns the stored blocks instead of
+  none, so `trace_filter` has blocks to trace).
+  *Why*: TN-0036 left these as upstream has them: the handler held the permit while the request
+  was open, so a request whose client left returned its permit while its blocking thread ran on,
+  and repeated requests could occupy any number of the blocking threads that block execution and
+  certificate validation also use. Each method now takes its permit where the handler did and moves
+  it into the closure its blocking task runs, as TN-0036 does for the debug traces. For the block
+  traces (`trace_block`, `trace_replayBlockTransactions`, `trace_blockOpcodeGas`) that closure is
+  the per-transaction callback, which the task owns until it ends. `trace_filter` keeps upstream's
+  two permits, now in an `Arc` shared by its block fetches and block traces, so they return when the
+  last of those tasks ends. `trace_get` takes its permit through `trace_transaction`. Callers of the
+  public methods must not hold a tracing permit. `trace_block_storage_access` has no handler and is
+  unchanged.
+  *Tests*: `trace.rs`'s `trace_permit_tests` drops each of the eleven `trace_*` requests while its
+  blocking task is stalled on the account store, with exactly the permits the method takes; a second
+  request must not start a blocking task until the first one's ends. `debug.rs`'s test does the same
+  for `debug_executionWitness` and `debug_executionWitnessByBlockHash`. All thirteen fail before the
+  change. *Upstream*: yes; upstream main still releases these permits on disconnect.

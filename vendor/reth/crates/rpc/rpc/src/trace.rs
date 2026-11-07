@@ -88,11 +88,21 @@ where
     // bound
     Eth: Trace + Call + LoadPendingBlock + LoadTransaction + 'static,
 {
+    /// Acquires the tracing permit a trace moves into its blocking task.
+    ///
+    /// TN(TN-0038): upstream's RPC handlers hold the permit only while the request is open, so a
+    /// trace that loses its client frees it while its thread runs on. Each trace method takes the
+    /// permit here, once, and its blocking task drops it when the work ends.
+    async fn trace_task_permit(&self) -> Result<OwnedSemaphorePermit, Eth::Error> {
+        self.acquire_trace_permit().await.map_err(|_| EthApiError::InternalEthError.into())
+    }
+
     /// Executes the given call and returns a number of possible traces for it.
     pub async fn trace_call(
         &self,
         trace_request: TraceCallRequest<RpcTxReq<Eth::NetworkTypes>>,
     ) -> Result<TraceResults, Eth::Error> {
+        let permit = self.trace_task_permit().await?;
         let at = trace_request.block_id.unwrap_or_default();
         let config = TracingInspectorConfig::from_parity_config(&trace_request.trace_types);
         let overrides =
@@ -101,6 +111,7 @@ where
         let this = self.clone();
         self.eth_api()
             .spawn_with_call_at(trace_request.call, at, overrides, move |db, evm_env, tx_env| {
+                let _permit = permit;
                 let res = this.eth_api().inspect(&mut *db, evm_env, tx_env, &mut inspector)?;
                 let trace_res = inspector
                     .into_parity_builder()
@@ -118,6 +129,7 @@ where
         trace_types: HashSet<TraceType>,
         block_id: Option<BlockId>,
     ) -> Result<TraceResults, Eth::Error> {
+        let permit = self.trace_task_permit().await?;
         let tx = recover_raw_transaction::<PoolPooledTx<Eth::Pool>>(&tx)?
             .map(<Eth::Pool as TransactionPool>::Transaction::pooled_into_consensus);
 
@@ -128,6 +140,7 @@ where
 
         self.eth_api()
             .spawn_trace_at_with_state(evm_env, tx_env, config, at, move |inspector, res, db| {
+                let _permit = permit;
                 inspector
                     .into_parity_builder()
                     .into_trace_results_with_state(&res, &trace_types, &db)
@@ -145,12 +158,14 @@ where
         calls: Vec<(RpcTxReq<Eth::NetworkTypes>, HashSet<TraceType>)>,
         block_id: Option<BlockId>,
     ) -> Result<Vec<TraceResults>, Eth::Error> {
+        let permit = self.trace_task_permit().await?;
         let at = block_id.unwrap_or(BlockId::pending());
         let (evm_env, at) = self.eth_api().evm_env_at(at).await?;
 
         // execute all transactions on top of each other and record the traces
         self.eth_api()
             .spawn_with_state_at_block(at, move |eth_api, mut db| {
+                let _permit = permit;
                 let mut results = Vec::with_capacity(calls.len());
                 let mut calls = calls.into_iter().peekable();
 
@@ -190,9 +205,11 @@ where
         hash: B256,
         trace_types: HashSet<TraceType>,
     ) -> Result<TraceResults, Eth::Error> {
+        let permit = self.trace_task_permit().await?;
         let config = TracingInspectorConfig::from_parity_config(&trace_types);
         self.eth_api()
             .spawn_trace_transaction_in_block(hash, config, move |_, inspector, res, db| {
+                let _permit = permit;
                 let trace_res = inspector
                     .into_parity_builder()
                     .into_trace_results_with_state(&res, &trace_types, &db)
@@ -238,11 +255,13 @@ where
         &self,
         hash: B256,
     ) -> Result<Option<Vec<LocalizedTransactionTrace>>, Eth::Error> {
+        let permit = self.trace_task_permit().await?;
         self.eth_api()
             .spawn_trace_transaction_in_block(
                 hash,
                 TracingInspectorConfig::default_parity(),
                 move |tx_info, inspector, _, _| {
+                    let _permit = permit;
                     let traces =
                         inspector.into_parity_builder().into_localized_transaction_traces(tx_info);
                     Ok(traces)
@@ -257,11 +276,13 @@ where
         &self,
         tx_hash: B256,
     ) -> Result<Option<TransactionOpcodeGas>, Eth::Error> {
+        let permit = self.trace_task_permit().await?;
         self.eth_api()
             .spawn_trace_transaction_in_block_with_inspector(
                 tx_hash,
                 OpcodeGasInspector::default(),
                 move |_tx_info, inspector, _res, _| {
+                    let _permit = permit;
                     let trace = TransactionOpcodeGas {
                         transaction_hash: tx_hash,
                         opcode_gas: inspector.opcode_gas_iter().collect(),
@@ -373,6 +394,16 @@ where
             .into())
         }
 
+        // TN(TN-0038): the filter's two permits are shared by its block fetches and block traces,
+        // and return when the last of those blocking tasks ends, not when the request does.
+        let permits = Arc::new(
+            self.inner
+                .blocking_task_guard
+                .clone()
+                .acquire_many_owned(2)
+                .await
+                .map_err(|_| EthApiError::InternalEthError)?,
+        );
         let mut all_traces = Vec::new();
         let mut block_traces = Vec::with_capacity(self.inner.eth_config.max_tracing_requests);
         for chunk_start in (start..=end).step_by(self.inner.eth_config.max_tracing_requests) {
@@ -382,9 +413,11 @@ where
             );
 
             // fetch all blocks in that chunk
+            let fetch_permits = Arc::clone(&permits);
             let blocks = self
                 .eth_api()
                 .spawn_blocking_io(move |this| {
+                    let _permits = fetch_permits;
                     Ok(this
                         .provider()
                         .recovered_block_range(chunk_start..=chunk_end)
@@ -398,12 +431,14 @@ where
             // trace all blocks
             for block in &blocks {
                 let matcher = matcher.clone();
+                let block_permits = Arc::clone(&permits);
                 let traces = self.eth_api().trace_block_until(
                     block.hash().into(),
                     Some(block.clone()),
                     None,
                     TracingInspectorConfig::default_parity(),
                     move |tx_info, mut ctx| {
+                        let _permits = &block_permits;
                         let mut traces = ctx
                             .take_inspector()
                             .into_parity_builder()
@@ -475,11 +510,13 @@ where
         &self,
         block_id: BlockId,
     ) -> Result<Option<Vec<LocalizedTransactionTrace>>, Eth::Error> {
+        let permit = self.trace_task_permit().await?;
         let traces = self.eth_api().trace_block_with(
             block_id,
             None,
             TracingInspectorConfig::default_parity(),
-            |tx_info, mut ctx| {
+            move |tx_info, mut ctx| {
+                let _permit = &permit;
                 let traces = ctx
                     .take_inspector()
                     .into_parity_builder()
@@ -513,12 +550,14 @@ where
         block_id: BlockId,
         trace_types: HashSet<TraceType>,
     ) -> Result<Option<Vec<TraceResultsWithTransactionHash>>, Eth::Error> {
+        let permit = self.trace_task_permit().await?;
         self.eth_api()
             .trace_block_with(
                 block_id,
                 None,
                 TracingInspectorConfig::from_parity_config(&trace_types),
                 move |tx_info, mut ctx| {
+                    let _permit = &permit;
                     let mut full_trace = ctx
                         .take_inspector()
                         .into_parity_builder()
@@ -549,6 +588,7 @@ where
         &self,
         block_id: BlockId,
     ) -> Result<Option<BlockOpcodeGas>, Eth::Error> {
+        let permit = self.trace_task_permit().await?;
         let res = self
             .eth_api()
             .trace_block_inspector(
@@ -556,6 +596,7 @@ where
                 None,
                 OpcodeGasInspector::default,
                 move |tx_info, ctx| {
+                    let _permit = &permit;
                     let trace = TransactionOpcodeGas {
                         transaction_hash: tx_info.hash.expect("tx hash is set"),
                         opcode_gas: ctx.inspector.opcode_gas_iter().collect(),
@@ -628,7 +669,7 @@ where
         state_overrides: Option<StateOverride>,
         block_overrides: Option<Box<BlockOverrides>>,
     ) -> RpcResult<TraceResults> {
-        let _permit = self.acquire_trace_permit().await;
+        // TN(TN-0038): the trace takes its permit itself and holds it in its blocking task.
         let request =
             TraceCallRequest { call, trace_types, block_id, state_overrides, block_overrides };
         Ok(Self::trace_call(self, request).await.map_err(Into::into)?)
@@ -640,7 +681,7 @@ where
         calls: Vec<(RpcTxReq<Eth::NetworkTypes>, HashSet<TraceType>)>,
         block_id: Option<BlockId>,
     ) -> RpcResult<Vec<TraceResults>> {
-        let _permit = self.acquire_trace_permit().await;
+        // TN(TN-0038): the trace takes its permit itself and holds it in its blocking task.
         Ok(Self::trace_call_many(self, calls, block_id).await.map_err(Into::into)?)
     }
 
@@ -651,7 +692,7 @@ where
         trace_types: HashSet<TraceType>,
         block_id: Option<BlockId>,
     ) -> RpcResult<TraceResults> {
-        let _permit = self.acquire_trace_permit().await;
+        // TN(TN-0038): the trace takes its permit itself and holds it in its blocking task.
         Ok(Self::trace_raw_transaction(self, data, trace_types, block_id)
             .await
             .map_err(Into::into)?)
@@ -663,7 +704,7 @@ where
         block_id: BlockId,
         trace_types: HashSet<TraceType>,
     ) -> RpcResult<Option<Vec<TraceResultsWithTransactionHash>>> {
-        let _permit = self.acquire_trace_permit().await;
+        // TN(TN-0038): the trace takes its permit itself and holds it in its blocking task.
         Ok(Self::replay_block_transactions(self, block_id, trace_types)
             .await
             .map_err(Into::into)?)
@@ -675,7 +716,7 @@ where
         transaction: B256,
         trace_types: HashSet<TraceType>,
     ) -> RpcResult<TraceResults> {
-        let _permit = self.acquire_trace_permit().await;
+        // TN(TN-0038): the trace takes its permit itself and holds it in its blocking task.
         Ok(Self::replay_transaction(self, transaction, trace_types).await.map_err(Into::into)?)
     }
 
@@ -684,7 +725,7 @@ where
         &self,
         block_id: BlockId,
     ) -> RpcResult<Option<Vec<LocalizedTransactionTrace>>> {
-        let _permit = self.acquire_trace_permit().await;
+        // TN(TN-0038): the trace takes its permit itself and holds it in its blocking task.
         Ok(Self::trace_block(self, block_id).await.map_err(Into::into)?)
     }
 
@@ -695,7 +736,7 @@ where
     /// # Limitations
     /// This currently requires block filter fields, since reth does not have address indices yet.
     async fn trace_filter(&self, filter: TraceFilter) -> RpcResult<Vec<LocalizedTransactionTrace>> {
-        let _permit = self.inner.blocking_task_guard.clone().acquire_many_owned(2).await;
+        // TN(TN-0038): the filter takes its permits itself and holds them in its tasks.
         Ok(Self::trace_filter(self, filter).await.map_err(Into::into)?)
     }
 
@@ -706,7 +747,7 @@ where
         hash: B256,
         indices: Vec<Index>,
     ) -> RpcResult<Option<LocalizedTransactionTrace>> {
-        let _permit = self.acquire_trace_permit().await;
+        // TN(TN-0038): the trace takes its permit itself and holds it in its blocking task.
         Ok(Self::trace_get(self, hash, indices.into_iter().map(Into::into).collect())
             .await
             .map_err(Into::into)?)
@@ -717,7 +758,7 @@ where
         &self,
         hash: B256,
     ) -> RpcResult<Option<Vec<LocalizedTransactionTrace>>> {
-        let _permit = self.acquire_trace_permit().await;
+        // TN(TN-0038): the trace takes its permit itself and holds it in its blocking task.
         Ok(Self::trace_transaction(self, hash).await.map_err(Into::into)?)
     }
 
@@ -726,13 +767,13 @@ where
         &self,
         tx_hash: B256,
     ) -> RpcResult<Option<TransactionOpcodeGas>> {
-        let _permit = self.acquire_trace_permit().await;
+        // TN(TN-0038): the trace takes its permit itself and holds it in its blocking task.
         Ok(Self::trace_transaction_opcode_gas(self, tx_hash).await.map_err(Into::into)?)
     }
 
     /// Handler for `trace_blockOpcodeGas`
     async fn trace_block_opcode_gas(&self, block_id: BlockId) -> RpcResult<Option<BlockOpcodeGas>> {
-        let _permit = self.acquire_trace_permit().await;
+        // TN(TN-0038): the trace takes its permit itself and holds it in its blocking task.
         Ok(Self::trace_block_opcode_gas(self, block_id).await.map_err(Into::into)?)
     }
 }
@@ -799,5 +840,156 @@ fn reward_trace<H: BlockHeader>(header: &H, reward: RewardAction) -> LocalizedTr
             error: None,
             result: None,
         },
+    }
+}
+
+/// TN(TN-0038): a `trace_*` request holds its tracing permits until its blocking tasks end.
+#[cfg(test)]
+mod trace_permit_tests {
+    use super::*;
+    use crate::permit_test_utils::{
+        assert_abandoned_request_keeps_its_permit, Abandon, MockChain, RequestFuture, TestEthApi,
+    };
+    use alloy_eips::eip2718::Encodable2718;
+    use alloy_primitives::TxKind;
+    use alloy_rpc_types_eth::TransactionRequest;
+    use futures::TryFutureExt;
+
+    /// The handlers that take tracing permits.
+    #[derive(Clone, Copy, Debug)]
+    enum TraceMethod {
+        Call,
+        CallMany,
+        RawTransaction,
+        ReplayBlockTransactions,
+        ReplayTransaction,
+        Block,
+        Filter,
+        Get,
+        Transaction,
+        TransactionOpcodeGas,
+        BlockOpcodeGas,
+    }
+
+    const ALL_METHODS: [TraceMethod; 11] = [
+        TraceMethod::Call,
+        TraceMethod::CallMany,
+        TraceMethod::RawTransaction,
+        TraceMethod::ReplayBlockTransactions,
+        TraceMethod::ReplayTransaction,
+        TraceMethod::Block,
+        TraceMethod::Filter,
+        TraceMethod::Get,
+        TraceMethod::Transaction,
+        TraceMethod::TransactionOpcodeGas,
+        TraceMethod::BlockOpcodeGas,
+    ];
+
+    impl TraceMethod {
+        /// The permits the method takes: `trace_filter` takes two, as upstream's handler did.
+        const fn permits(self) -> usize {
+            match self {
+                Self::Filter => 2,
+                _ => 1,
+            }
+        }
+    }
+
+    /// A trace API with exactly the permits `method` takes, over [`MockChain`].
+    struct Fixture {
+        chain: MockChain,
+        api: TraceApi<TestEthApi>,
+    }
+
+    impl Fixture {
+        fn new(method: TraceMethod) -> Self {
+            let chain = MockChain::new();
+            let api = TraceApi::new(
+                chain.eth_api(),
+                BlockingTaskGuard::new(method.permits()),
+                EthConfig::default(),
+            );
+            Self { chain, api }
+        }
+
+        fn start(&self, method: TraceMethod) -> RequestFuture<'_> {
+            let api = &self.api;
+            let tx = &self.chain.block.body().transactions[0];
+            let call = || TransactionRequest {
+                to: Some(TxKind::Call(Address::with_last_byte(2))),
+                ..Default::default()
+            };
+            let types = || HashSet::from_iter([TraceType::Trace]);
+            let block_1 = || BlockId::Number(1.into());
+            match method {
+                TraceMethod::Call => Box::pin(
+                    TraceApiServer::trace_call(api, call(), types(), None, None, None).map_ok(drop),
+                ),
+                TraceMethod::CallMany => Box::pin(
+                    TraceApiServer::trace_call_many(api, vec![(call(), types())], Some(block_1()))
+                        .map_ok(drop),
+                ),
+                TraceMethod::RawTransaction => Box::pin(
+                    TraceApiServer::trace_raw_transaction(
+                        api,
+                        tx.encoded_2718().into(),
+                        types(),
+                        Some(block_1()),
+                    )
+                    .map_ok(drop),
+                ),
+                TraceMethod::ReplayBlockTransactions => Box::pin(
+                    TraceApiServer::replay_block_transactions(api, block_1(), types()).map_ok(drop),
+                ),
+                TraceMethod::ReplayTransaction => Box::pin(
+                    TraceApiServer::replay_transaction(api, *tx.tx_hash(), types()).map_ok(drop),
+                ),
+                TraceMethod::Block => {
+                    Box::pin(TraceApiServer::trace_block(api, block_1()).map_ok(drop))
+                }
+                TraceMethod::Filter => Box::pin(
+                    TraceApiServer::trace_filter(
+                        api,
+                        TraceFilter {
+                            from_block: Some(1),
+                            to_block: Some(1),
+                            ..Default::default()
+                        },
+                    )
+                    .map_ok(drop),
+                ),
+                TraceMethod::Get => Box::pin(
+                    TraceApiServer::trace_get(api, *tx.tx_hash(), vec![Index::from(0)])
+                        .map_ok(drop),
+                ),
+                TraceMethod::Transaction => {
+                    Box::pin(TraceApiServer::trace_transaction(api, *tx.tx_hash()).map_ok(drop))
+                }
+                TraceMethod::TransactionOpcodeGas => Box::pin(
+                    TraceApiServer::trace_transaction_opcode_gas(api, *tx.tx_hash()).map_ok(drop),
+                ),
+                TraceMethod::BlockOpcodeGas => {
+                    Box::pin(TraceApiServer::trace_block_opcode_gas(api, block_1()).map_ok(drop))
+                }
+            }
+        }
+    }
+
+    /// With every tracing permit taken by one request, a `trace_*` request that loses its client
+    /// while its blocking task still runs keeps its permits, so a second request does not start a
+    /// blocking task until the first one's ends.
+    #[tokio::test]
+    async fn dropped_trace_keeps_its_permits_until_its_tasks_end() {
+        for method in ALL_METHODS {
+            let fx = Fixture::new(method);
+            let name = format!("{method:?}");
+            assert_abandoned_request_keeps_its_permit(
+                &fx.chain,
+                &name,
+                || fx.start(method),
+                Abandon::Drop,
+            )
+            .await;
+        }
     }
 }

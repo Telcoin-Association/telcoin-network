@@ -40,15 +40,10 @@ reth's RPC and TN's execution engine and certificate validation all run on tokio
 pool (512 threads by default). Semaphores bound most RPC work: upstream's for `eth_call`,
 `eth_callMany`, `eth_simulateV1`, `eth_getLogs` and `eth_getProof` (TN-0019, TN-0035), and TN's for
 `eth_estimateGas`, `eth_fillTransaction`, `eth_createAccessList`, `eth_callBundle` (TN-0037,
-`crates/tn-reth/src/rpc_call.rs`) and `debug_trace*` (TN-0036). Two gaps remain:
-
-- `trace_*` and `debug_executionWitness*` release their permit when the client disconnects while
-  the blocking work runs on, as upstream does. Both namespaces are opt-in, and the work is bounded
-  by block gas. The fix is TN-0036's pattern: take the permit in the public method and move it
-  into the blocking closure.
-- Long synchronous jobs (a large `eth_call`) run to completion after the client leaves. Upstream
-  13a59de4b and 621f663ed stop them; they need `CancelOnDrop` moved into reth-tasks first
-  (`upstream-backports.md`, Medium).
+`crates/tn-reth/src/rpc_call.rs`), `debug_trace*` (TN-0036), and `trace_*` and
+`debug_executionWitness*` (TN-0038). One gap remains: long synchronous jobs (a large `eth_call`)
+run to completion after the client leaves. Upstream 13a59de4b and 621f663ed stop them; they need
+`CancelOnDrop` moved into reth-tasks first (`upstream-backports.md`, Medium).
 
 The structural fix is to give the RPC `TaskSpawner` (`crates/types/src/task_manager.rs`) its own
 runtime or bounded blocking pool, so RPC load cannot delay block execution whatever each method

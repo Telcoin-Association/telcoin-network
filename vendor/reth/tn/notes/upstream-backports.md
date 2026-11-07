@@ -119,8 +119,6 @@ db17c899c (`reth db migrate-v2`; TN has no reth CLI).
   most RPC work. Since 2026-11-04 `eth_estimateGas`, `eth_fillTransaction`, `eth_createAccessList`
   and `eth_callBundle` hold a blocking-IO permit (TN-0037 and tn-reth's `rpc_call.rs`) and
   `debug_trace*` keeps its tracing permit until its thread ends (TN-0036); upstream main does
-  neither. `trace_*` and `debug_executionWitness*` still release their permit when the client
-  disconnects, as upstream does (`debug`/`trace` are opt-in, and that work is bounded by block
-  gas). Giving the RPC `TaskSpawner`
-  (`tn-types` `task_manager.rs`) its own runtime or bounded pool would isolate block execution
-  from RPC load regardless of per-method permits.
+  neither. Since 2026-11-06 `trace_*` and `debug_executionWitness*` keep theirs too (TN-0038).
+  Giving the RPC `TaskSpawner` (`tn-types` `task_manager.rs`) its own runtime or bounded pool would
+  isolate block execution from RPC load regardless of per-method permits.

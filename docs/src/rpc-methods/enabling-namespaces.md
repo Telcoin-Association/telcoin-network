@@ -55,7 +55,7 @@ Some `debug_*` methods are registered but do nothing; [debug](debug/README.md) l
 
 | Flag | Default | Effect |
 | --- | --- | --- |
-| `--rpc.max-tracing-requests` | CPU cores minus 2, at least 2 | Concurrent tracing requests, shared by `debug_trace*`, `debug_executionWitness*` and `trace_*`; further requests wait for a free slot. A `debug_trace*` request keeps its slot until its trace ends, even after a timeout or a disconnect |
+| `--rpc.max-tracing-requests` | CPU cores minus 2, at least 2 | Concurrent tracing requests, shared by `debug_trace*`, `debug_executionWitness*` and `trace_*`; further requests wait for a free slot. A request keeps its slot until its trace ends, even after a timeout or a disconnect |
 | `--rpc.max-trace-filter-blocks` | `100` | Largest block range one `trace_filter` request may cover |
 | `--rpc.max-blocks-per-filter` | `100000` (`0` = no limit) | Largest block range for `eth_getLogs` and log filters |
 | `--rpc.max-logs-per-response` | `20000` (`0` = no limit) | Most logs one `eth_getLogs` or filter response may return |

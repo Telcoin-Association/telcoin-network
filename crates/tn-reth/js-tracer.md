@@ -59,7 +59,7 @@ every EVM step of the traced transaction. Nothing limits how long one of its fun
 
 What bounds the cost is the number of threads. Each `debug_trace*` request holds a tracing permit
 (`--rpc.max-tracing-requests`) until its trace ends, even after it times out or the client leaves
-(TN-0036). So at most that many blocking threads run debug traces at once, however long one takes.
+(TN-0036); `debug_executionWitness*` and `trace_*` do the same (TN-0038). So at most that many blocking threads run debug traces at once, however long one takes.
 The cost moves to other callers instead: a trace that runs for an hour keeps its permit for an hour,
 and the `debug_trace*`, `debug_executionWitness*` and `trace_*` requests that share the permits
 queue behind it.
