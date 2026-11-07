@@ -2,7 +2,7 @@
 
 The ledger of every difference between `vendor/reth` and the pinned upstream
 (`tn/upstream.toml`). `python3 -I vendor/reth/tn/vendor.py status` lists the files that differ;
-each one has to be covered by an entry here. Changes to TN's own files (`tn/`,
+each one has to be covered by an entry here, which `vendor.py ledger` checks. Changes to TN's own files (`tn/`,
 `.config/nextest.toml`, the five TN docs, `.gitignore`) and to the filtered workspace manifest's
 member list are not listed.
 
@@ -150,15 +150,17 @@ by section, newest last within each.
   providers/{consistent,blockchain_provider,mod}.rs, providers/state/historical.rs,
   traits/rocksdb_provider.rs, test_utils/noop.rs}`, `crates/storage/db-common/src/init.rs` and
   `crates/storage/db-api/src/models/metadata.rs` (their `not(...)` twins became unconditional);
-  the `rocksdb` and `edge` features removed from provider, storage-api, db-common, db-api and
-  node-core, and the optional `rocksdb` dependency from provider and the workspace manifest.
+  the `rocksdb` and `edge` features removed from
+  `crates/storage/{provider,storage-api,db-common,db-api}/Cargo.toml` and
+  `crates/node/core/Cargo.toml`, and the optional `rocksdb` dependency from provider and the
+  workspace manifest.
   *Why*: maintainer decision (2026-10-30, DECISIONS.md D14): RocksDB is gone from TN in every
   configuration. Before, it was an off-by-default feature. Proof that nothing TN compiles
   changed: the macro-expanded source (`-Zunpretty=expanded`) of reth-provider, reth-db-common
   and reth-db-api is identical before and after, apart from the source line numbers `tracing`
   embeds. Cargo.lock loses rocksdb, librocksdb-sys, bzip2-sys and lz4-sys.
-  *Still present*: the zero-size `RocksDBProvider` stub (`providers/rocksdb_stub.rs`; only its
-  module comment changed) and the storage-v2 plumbing that takes it (ROADMAP.md, "RocksDB step
+  *Still present*: the zero-size `RocksDBProvider` stub
+  (`crates/storage/provider/src/providers/rocksdb_stub.rs`; only its module comment changed) and the storage-v2 plumbing that takes it (ROADMAP.md, "RocksDB step
   B"). *Upstream*: no.
 
 - **TN-0020** — reth-node-core's version info comes from the upstream pin, not TN's git state.
@@ -354,6 +356,8 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   (upstream commit).
 
 - **TN-0019** — Backport upstream's RPC blocking-work limits. *Kind*: backport (security).
+  *Files*: `crates/rpc/rpc-eth-api/src/helpers/{call.rs, blocking_task.rs, state.rs}`,
+  `crates/rpc/rpc/src/eth/filter.rs`.
   *Why*: TN runs consensus and RPC on one tokio runtime, and the execution engine
   (`crates/engine`, `spawn_blocking_task`) and certificate validation (`spawn_blocking`) use the
   same blocking pool as RPC. RPC methods that occupied blocking threads without taking a permit
@@ -387,6 +391,9 @@ cleanly; if it conflicts, take upstream's side for the files listed here.
   was already right. *Upstream*: n/a (upstream commit).
 
 - **TN-0023** — Backport upstream's static-file fixes. *Kind*: backport.
+  *Files*: `crates/storage/provider/src/providers/static_file/{manager.rs, mod.rs}`,
+  `crates/storage/nippy-jar/src/{writer.rs, cursor.rs, lib.rs}`,
+  `crates/storage/db/src/static_file/cursor.rs`.
   *Why*: TN (storage v1) keeps headers, transactions and receipts in reth's static files, heals
   them with `check_consistency` at every startup, and reads them while persistence appends. These
   fixes cover cache races, recovery and torn tails in that code. Static files are outside the

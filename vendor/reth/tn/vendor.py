@@ -25,6 +25,8 @@ Commands (run from anywhere; python3 -I vendor/reth/tn/vendor.py <cmd>):
   diff [PATH...]    unified diff of TN's changes against the pinned upstream
   check             report workspace dependencies the vendored manifests use but the nested
                     workspace does not define (a crate upstream added that is not vendored)
+  ledger            check CHANGES.md against `status`: every changed file named by an entry,
+                    every `TN(TN-NNNN)` id in the code defined by one
   sync REF          move the copy to upstream REF (tag or commit), 3-way, and repin
   pick COMMIT       apply one upstream commit (its diff against its first parent), 3-way;
                     the pin does not move
@@ -54,6 +56,7 @@ HERE = Path(__file__).resolve().parent  # vendor/reth/tn
 VENDOR = HERE.parent  # vendor/reth
 REPO = VENDOR.parent.parent  # TN repository root
 CRATES_TXT = HERE / "crates.txt"
+CHANGES_MD = VENDOR / "CHANGES.md"
 UPSTREAM_TOML = HERE / "upstream.toml"
 MANIFEST = "Cargo.toml"
 # Upstream root files carried verbatim besides the manifest: the formatter and clippy configs
@@ -537,6 +540,64 @@ def cmd_diff(args):
     return 0
 
 
+LEDGER_ENTRY = re.compile(r"^- \*\*(TN-\d{4})\*\*(.*?)(?=^- \*\*TN-\d{4}\*\*|^#|\Z)", re.S | re.M)
+CODE_ID = re.compile(r"TN\(([^)]*)\)")
+
+
+def expand_braces(text):
+    """`a/{b,c/{d,e}}.rs` -> `a/b.rs`, `a/c/d.rs`, `a/c/e.rs`."""
+    m = re.search(r"\{([^{}]*)\}", text)
+    if not m:
+        return [text]
+    return [x for alt in m.group(1).split(",")
+            for x in expand_braces(text[:m.start()] + alt.strip() + text[m.end():])]
+
+
+def ledger_paths(text, crates):
+    """Map every path the ledger's entries name to the ids of the entries that name it.
+
+    A path is a backticked token, which may wrap across lines and use `{a,b}` alternatives. It
+    is written from vendor/reth (`crates/...`, `testing/...`), or from a crate the same entry
+    named earlier (`tests/it/startup.rs` after `crates/rpc/rpc-builder/src/lib.rs`). A directory
+    names every file under it. The words "workspace manifest" name the root `Cargo.toml`."""
+    named = {}
+    by_len = sorted(crates, key=len, reverse=True)
+    for m in LEDGER_ENTRY.finditer(text):
+        tn, body = m.groups()
+        if "workspace manifest" in re.sub(r"\s+", " ", body):
+            named.setdefault(MANIFEST, set()).add(tn)
+        bases = []
+        for token in re.findall(r"`([^`]+)`", body):
+            for raw in expand_braces(re.sub(r"\s*\n\s*", "", token).strip()):
+                path = raw.rstrip("/")
+                crate = next((c for c in by_len if path == c or path.startswith(c + "/")), None)
+                if crate:
+                    bases = [crate] + [b for b in bases if b != crate]
+                    named.setdefault(path, set()).add(tn)
+                elif path == MANIFEST or path.startswith(("crates/", "testing/")):
+                    named.setdefault(path, set()).add(tn)
+                elif "/" in raw or "." in raw:
+                    for b in bases:
+                        named.setdefault(f"{b}/{path}", set()).add(tn)
+    return named
+
+
+def ledger_problems(rows, text, crates, code_files):
+    """What `ledger` reports, from `classify` rows, the ledger's text and {path: text} of the
+    vendored files: changed files no entry names, and ids the code uses that no entry defines."""
+    named = ledger_paths(text, crates)
+    unnamed = [(k, rel) for k, rel in rows
+               if not any(rel == p or rel.startswith(p + "/") for p in named)]
+    defined = {m.group(1) for m in LEDGER_ENTRY.finditer(text)}
+    undefined = {}
+    for rel, body in sorted(code_files.items()):
+        for m in CODE_ID.finditer(body):
+            for tn in re.findall(r"TN-\d{4}", m.group(1)):
+                if tn not in defined:
+                    undefined.setdefault(tn, []).append(rel)
+    return unnamed, undefined
+
+
 def workspace_dep_names(manifest_text):
     names, section = set(), None
     for line in manifest_text.splitlines():
@@ -600,6 +661,29 @@ def cmd_check(args):
     commit = up.resolve(pin["commit"])
     manifest = up.git("show", f"{commit}:{MANIFEST}").stdout.decode()
     return print_missing(*missing_deps(crates, manifest))
+
+
+def cmd_ledger(args):
+    pin = read_pin()
+    crates = read_crates()
+    up = upstream_from(args, pin)
+    commit = up.resolve(pin["commit"])
+    with tempfile.TemporaryDirectory() as td:
+        base = up.export(commit, crates, td)
+        rows = classify(base, crates)
+    code = {rel: (read(VENDOR, rel) or b"").decode(errors="replace")
+            for rel in scope_files(VENDOR, crates)}
+    unnamed, undefined = ledger_problems(rows, CHANGES_MD.read_text(), crates, code)
+    for k, rel in unnamed:
+        print(f"not in CHANGES.md: {k:9} {rel}")
+    for tn, rels in sorted(undefined.items()):
+        print(f"no CHANGES.md entry for {tn}: {', '.join(rels)}")
+    if unnamed or undefined:
+        print("\nname each file in an entry's *Files* line (from vendor/reth, or from a crate the "
+              "entry named before it), and give each id an entry")
+        return 1
+    print(f"ledger: CHANGES.md names all {len(rows)} changed files and defines every TN id")
+    return 0
 
 
 def cmd_sync(args):
@@ -755,6 +839,7 @@ def main():
     p.add_argument("paths", nargs="*")
     p.set_defaults(fn=cmd_diff)
     sub.add_parser("check").set_defaults(fn=cmd_check)
+    sub.add_parser("ledger").set_defaults(fn=cmd_ledger)
     p = sub.add_parser("sync")
     p.add_argument("ref")
     p.set_defaults(fn=cmd_sync)

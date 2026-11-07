@@ -113,12 +113,6 @@ four ways. None of this has been timed on a GitHub runner. Before queueing the P
 `main-compiles.yaml` on the branch times the builds; caching the vendored crates would need
 sccache or a different cache layout.
 
-## Ledger coverage is checked by hand
-
-`vendor.py status` lists the files that differ from upstream, and CHANGES.md must account for
-each one, but no tool or CI job compares the two. A `vendor.py ledger` check (every changed file
-named by an entry, every `TN(TN-NNNN)` id defined) would make that mechanical.
-
 ## The upstream survey is from 2026-11-06
 
 `upstream-backports.md` surveyed upstream `main` up to `44a74f9ea`. The next survey starts there

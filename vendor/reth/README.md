@@ -70,7 +70,7 @@ Things that differ from the git dependency this replaced:
    later syncs harder to reason about.
 2. Add an entry to CHANGES.md: an id (`TN-NNNN`), the files, what changed and why, and whether
    it is worth offering upstream. CHANGES.md is the ledger. `vendor.py status` must list only
-   files that some entry accounts for.
+   files that some entry accounts for, which `vendor.py ledger` checks.
 3. Where an edit would surprise a reader of reth's code, leave a short comment that starts with
    `TN(TN-NNNN):`. Leave out cosmetic changes. They make every upstream sync conflict for
    nothing.
@@ -204,6 +204,10 @@ entry from the root `Cargo.toml` if TN named the crate, and refresh `Cargo.lock`
   upstream and lists what differs. Right after the import it printed "identical".
 - `vendor.py check` reports workspace dependencies the vendored manifests use but the nested
   workspace does not define.
+- `vendor.py ledger` fails when a file `status` lists is not named by a CHANGES.md entry, or a
+  `TN(TN-NNNN)` comment cites an id with no entry. An entry names a file by its path from
+  `vendor/reth` (braces such as `src/{a.rs, b.rs}` expand) or from a crate it named earlier, or
+  names a whole directory. It needs the upstream clone, as `status` does, so CI does not run it.
 - `vendor.py status` also warns about files a `.gitignore` rule hides from git, which would
   otherwise drop out of the committed copy without anyone noticing. `sync`, `pick`, `add` and
   `remove` end with the same warning, and exit 1 when it lists files.

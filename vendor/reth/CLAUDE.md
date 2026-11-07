@@ -92,7 +92,7 @@ validator proposes, but every validator executes the same batches the same way.
 ## Commands
 
 ```
-python3 -I vendor/reth/tn/vendor.py status | check | diff [path...]
+python3 -I vendor/reth/tn/vendor.py status | check | ledger | diff [path...]
 vendor/reth/tn/cargo.sh check --workspace --all-targets      # never -p alone (D18)
 vendor/reth/tn/cargo.sh nextest run -p reth-rpc               # add --features js-tracer for JS tracers
 vendor/reth/tn/cargo.sh nextest run -p reth-db --test-threads 2   # macOS MDBX ENOMEM otherwise
@@ -111,14 +111,15 @@ dependencies but never run their tests, and TN's clippy lane skips them.
 README.md, "Changing vendored code", has the procedure. In short: one focused commit, a CHANGES.md
 entry, a `TN(TN-NNNN):` comment where the edit would surprise a reader of reth's code, no
 cosmetic edits (each one conflicts at every sync), and the fork checks above when the change
-touches the execution or storage path. Nothing checks ledger coverage automatically: compare
-`vendor.py status` with the entries' *Files* lines yourself.
+touches the execution or storage path. `vendor.py ledger` checks the ledger against `status`:
+name each changed file in an entry, from `vendor/reth` or from a crate the entry named before it.
 
 ## Reviewing this code
 
 Review TN's diff, not the copy. A cheap integrity pass:
-1. `vendor.py status` lists only files some ledger entry names.
-2. Every `TN(TN-NNNN)` id in the code has an entry, and every entry's files appear in `status`.
+1. `vendor.py ledger` passes: every file `status` lists is named by an entry, and every
+   `TN(TN-NNNN)` id in the code has one.
+2. Every entry's files appear in `status` (by eye; an entry can name a file it later restored).
 3. `vendor.py check` and `etc/rocksdb-gate.sh` pass.
 4. `git diff main -- Cargo.lock` adds no package and changes no third-party version.
 
