@@ -149,7 +149,10 @@ its value in a run adds the run's pages to `overflow_pages`, and a replace or de
 run subtracts them (`TreeRoot::add_run`, `remove_run`, both checked). A copy-on-write copy replaces
 a page and shares its runs, so it changes no count. `Env::check` compares every root's counters
 with the pages its walk finds, by kind, and `overflow_pages` with the pages of the runs its leaves
-name.
+name. A write computes the handle it leaves before it changes anything: a put moves its run
+counter, counts its insert and checks room for its split's worst case first, and a delete's
+`handle_after` checks every subtraction (an emptied tree's handle must count exactly its one leaf
+and the branches above it), so a handle past its bounds is `Corrupt` with the tree unchanged.
 
 `TreeRoot::check` refuses an impossible shape with `Corrupt`:
 - The empty tree is exactly `root = u32::MAX` with every other field 0, and costs no pages.
@@ -400,9 +403,9 @@ Anywhere else a nested cell, and a dup record where a plain table is expected, a
 - **A nested cell outside a dup table's outer tree** (in a plain table, the catalog, the free
   tree or a nested tree) is refused by every read and write that meets it, with one message
   (`page::nested_error`, "a nested cell in a tree that holds none"): a value read
-  (`PageRead::value` for gets, the same match in the plain cursors' `Values::read` for their moves
-  and seeks), a cursor's `current_with_key_tail` and `seek_with_key_tail`, a put or delete of
-  its key (the path cache's included), copy-on-write of
+  (`tree::read_value`, the body of `PageRead::value` for gets and of the plain cursors'
+  `Values::read` for their moves and seeks), a cursor's `current_with_key_tail` and
+  `seek_with_key_tail`, a put or delete of its key (the path cache's included), copy-on-write of
   a published leaf holding it and a merge absorbing that leaf (`check_cells_naming_this_txn`),
   a free walk that reads its leaf (`tree_pages`, behind `drop_table` and `clear_table`) and
   `Env::check`. `page::validate` holds it to the canonical shape above. A free walk reads every
@@ -832,9 +835,10 @@ else the search's), as the cursor's descent does. The rule is
 rules that close the gap are deliberate (do-not-flag item 11):
 
 - an untrusted parent (or root handle) naming a private page is `Corrupt`: a sound tree never
-  has that edge. The descents (`descend_write`, `collapse_to`), a merge's sibling reads
-  (`sibling_view`, `check_sibling_chain`) and the free walk of `clear` and `drop`
-  (`tree_pages`, which also checks a private child's identity) all apply it;
+  has that edge. The descents (`descend_write`), the chains a delete checks below a merge sibling
+  and along a widened neighbour's edge (`check_edge_chain`), a merge's sibling reads
+  (`sibling_view`) and the free walk of `clear` and `drop` (`tree_pages`, which also checks a
+  private child's identity) all apply it;
 - when the writer copies a published branch it did not stamp (where `verify_published` runs),
   every cell whose `child_txn` equals this txn's low 32 bits must name a page whose header
   matches the cell and whose full txn is below this one (`check_cells_naming_this_txn`).
@@ -886,11 +890,12 @@ experiment, the same multi-page gets took 0.34–0.40 us. A 1-page run has no pa
 header, so its read skips the CRC as a leaf's does (do-not-flag item 3), which in that code took
 a `t4d` 2 KiB get from 724 to 302 ns and a `t16d` 8 KiB get from 1.30 us to 271 ns.
 
-**A nested cell is `Corrupt` at every value read** (`PageRead::value`, and `Values::read`, the plain
-cursors' copy of its match, which reads the store only for a run) and every key-tail read
-(the cursors' `key_tail`, behind `current_with_key_tail` and `seek_with_key_tail`): no value a
-read returns is one. Only a dup table's outer tree holds nested cells, and its reads match the
-cell itself (see [Dup tables](#dup-tables)); a cursor over a dup table is `TableKind`.
+**A nested cell is `Corrupt` at every value read** (`tree::read_value`, which both `PageRead::value`
+and the plain cursors' `Values::read` call, so a cursor reads the store only for a run) and every
+key-tail read (the cursors' `key_tail`, behind `current_with_key_tail` and
+`seek_with_key_tail`): no value a read returns is one. Only a dup table's outer tree holds nested
+cells, and its reads match the cell itself (see [Dup tables](#dup-tables)); a cursor over a dup
+table is `TableKind`.
 
 **CRCs are not recomputed on every read** of a tree page. That would cost a pass over the page
 each time. The CRC is verified in these places instead:
@@ -1215,7 +1220,7 @@ checked as an untrusted page on a descent is:
   The range check passes a key 1 equal to its lower bound, and the merged page would then hold that
   key twice.
 - An absorbed branch sibling also has its child-0 chain descended to the leaf level
-  (`check_sibling_chain`), each page with a descent's checks: not private (a published page names
+  (`check_edge_chain`), each page with a descent's checks: not private (a published page names
   none), the page and txn its parent names, a branch above the leaf level and a leaf at it, not
   empty, verified unless this writer stamped it, and its keys within the bounds tightened at each
   step. A branch's own keys bound its children but say nothing of a single child's subtree, and
@@ -1227,14 +1232,29 @@ checked as an untrusted page on a descent is:
 - A refused neighbour is read no further than its header, so damage only its CRC finds (a flipped
   value byte, say) is met at its first real use, as a reader's lazy reads meet it.
 
+**Checks on a widened neighbour.** An unlink or a collapse hands the range of the child it removes
+to a neighbour: the next child when it removes child 0 (which takes the branch's lower bound with
+cell 0), else the one before (whose upper bound grows to the next cell's key, or the branch's
+own); a collapse's remaining child becomes the root, unbounded. No descent read that neighbour's
+keys against the bound it gains, so before anything changes `check_widened_neighbour` descends the
+neighbour's edge toward the lost bound to the leaf level (`check_edge_chain`: child 0 at every
+level for the next child, the last child for the one before), each page with a descent's checks
+and, unless it is trusted, its keys within the range it had before the removal. A CRC-valid page
+holding a key outside that range (a crafted page, or a writer's bug the CRC was stamped over) is
+`Corrupt`, not made valid by the delete. Only that edge's pages gain range: the separators on it
+bound every other page below the neighbour, as before. `collapse_to` then only follows the
+single-child branches below the remaining child, which that chain checked.
+
 All of this runs in `plan_delete`, before anything changes: damage is `Corrupt` with the tree as it
 was, and the environment latches.
 
 **Counters.** `handle_after` computes the handle a delete leaves before anything changes: one
 entry fewer, the deleted value's run uncounted, the emptied pages uncounted and, for the merges
 (`Merged`), one leaf or branch fewer per absorbed sibling and one branch and one level fewer for a
-root that gave way. Each subtraction is checked, and a handle whose counters cannot allow the change
-is `Corrupt`.
+root that gave way. An emptied tree's handle must count exactly the pages the delete drops, its
+one leaf and the branches above it, and no run pages after the deleted value's (at height 2 or
+more `TreeRoot::check` asks for two leaves, so a single-child root is damage). Each subtraction is
+checked, and a handle whose counters cannot allow the change is `Corrupt`.
 
 **What else stays true.** A merge never lengthens a separator or adds one to any page, so it never
 splits (do-not-flag item 9). The path cache stays sound because every merge frees a page, which
@@ -1391,7 +1411,12 @@ overflow pages; the outer `root` counts the outer tree's own pages and entries, 
 are `root.entries − nested_trees` (no field of their own). A set owns no page: its bytes are in the
 outer leaves the outer counters already count. Every write updates them in memory at once,
 with checked arithmetic (a total that would underflow or overflow is `Corrupt`: only a damaged
-record gets there), so a write transaction's `table_stat` includes changes not yet flushed.
+record gets there), so a write transaction's `table_stat` includes changes not yet flushed. A
+dup write counts them before it changes anything: a write into a key's tree takes that tree out
+of the totals first (`OtherTrees`), a delete checks the tree count it would leave first, and a new
+key counts its tree in a copy of the totals before its cell is written. So a record that cannot
+count the key's tree changes nothing; only a sum past a counter's type is met after a write into
+an existing tree.
 `TableStat` is O(1) for both kinds:
 
 | field | plain | dup |
@@ -1602,7 +1627,7 @@ fails a check, a subkey of another length, any check of a descent) is
 | `RwTxn::delete_prefix(&Table, k) -> u64` | a dup table's rows under the outer key `k` (exactly `key_len` bytes) removed, its nested tree, if it has one, freed in one walk (a packed key's cell owns no page); returns the rows removed (`TableKind` on a plain table) |
 | `RwTxn::insert(table, key, value)` | put only a key the table does not hold: a present key is `KeyExists`, found by the put's own search (in the table's cached leaf, else by the descent's plan) and refused before anything changes, with no latch; a new key is stored exactly as `put` stores it |
 | `RwTxn::append(table, key, value)` | put a new last entry: `key` must sort strictly after the table's last key (an empty table takes any key), else `AppendOutOfOrder`, refused before anything changes. An append into the table's cached rightmost leaf neither descends nor searches; the cache holds the leaf of the table's last put, append or delete in this transaction (after an append split, the new right leaf) until a page is allocated or freed, and any other append descends. |
-| `RwTxn::cursor_mut -> RwCursor` | cursor moves and prefix steps plus `put`, `append` (as `RwTxn::append`), `insert` (as `RwTxn::insert`) and `delete_current`. A put, append or insert leaves the cursor at its entry: placed from the path it wrote (after an append split, from the new path the split refills the table's path cache with), or re-sought by key after any other split; a refused one leaves the cursor where it was. A delete re-seeks by key, so after any merges the cursor is on the deleted entry's follower in a deleted state, so a walk that deletes as it goes skips nothing: `next` returns the follower without stepping past it, `current` returns it too, `prev` returns the entry before it, and another `delete_current` deletes it. Right after a delete the prefix steps compare with the deleted key: the follower (`next_in_prefix`) or the entry before (`prev_in_prefix`) if it shares the prefix, else `None` with the cursor still on the follower in the deleted state. With no follower the cursor is after the end: `next`, `current` and `delete_current` find nothing and `prev` returns the new last entry. |
+| `RwTxn::cursor_mut -> RwCursor` | cursor moves and prefix steps plus `put`, `append` (as `RwTxn::append`), `insert` (as `RwTxn::insert`) and `delete_current`. A put, append or insert leaves the cursor at its entry: placed from the path it wrote (after an append split, from the new path the split refills the table's path cache with), or re-sought by key after any other split; a refused one leaves the cursor where it was. A delete re-seeks by key, so after any merges the cursor is on the deleted entry's follower in a deleted state, so a walk that deletes as it goes skips nothing: `next` returns the follower without stepping past it, `current` returns it too, `prev` returns the entry before it, and another `delete_current` deletes it. Right after a delete the prefix steps compare with the deleted key: the follower (`next_in_prefix`) or the entry before (`prev_in_prefix`) if it shares the prefix, else `None` with the cursor still on the follower in the deleted state. With no follower the cursor is after the end: `next`, `current` and `delete_current` find nothing and `prev` returns the new last entry. `delete_current` reads only the entry's key (no value, as `RwTxn::delete` reads none, so a run's CRC is not checked), and a failed delete leaves the cursor unset. |
 | `RwTxn::cursor_detached(&self, &Table) -> TxnCursor` | a write cursor that holds no borrow of the transaction: its moves (`first`, `last`, `next`, `prev`, `current`, `seek`, `seek_exact`, the prefix steps) take `&RwTxn` and return entries borrowed from it; its writes (`put`, `insert`, `append`, `delete_current`) take `&mut RwTxn`; after a delete, `follower_shares_prefix(n)` (whether the follower shares the deleted key's first `n` bytes, from the keys the cursor kept, without moving it) takes `&RwTxn`. The states, the writes' placement and the deleted state are `RwCursor`'s. After `last` (or `prev` from unset) the cursor is on that entry as after any move: `next` and `next_in_prefix` return an entry another writer has put past it since, else `None` (the cursor after the end). Several cursors, over one table or several, and the transaction's own writes interleave, each seeing the others' writes; see [Detached cursors](#detached-cursors-txncursor) below. |
 | `RwTxn::commit() -> txn id / abort()` | finish |
 | `Cursor` | `first`, `last`, `next`, `prev`, `current`, `seek` (first `>= key`), `seek_exact`, and the prefix steps `next_in_prefix(n)`, `prev_in_prefix(n)` (below) |
