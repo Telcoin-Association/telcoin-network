@@ -1897,13 +1897,15 @@ async fn gate_releases_when_execution_advances() {
     config.shutdown().notify();
 }
 
-/// An active CVV whose restored DAG starts above the round after its GC round goes inactive and
-/// starts no consensus task.
+/// An active CVV whose restored DAG holds a certificate that ordering can still reach with a
+/// parent missing from the DAG goes inactive and starts no consensus task.
 ///
-/// The pack committed leader C, while the certificate store kept only the rounds from
-/// `C - gc_depth + 2` (it prunes from its newest round): ordering from that DAG would skip round
-/// `C - gc_depth + 1`, whose uncommitted certificates the next leader can still reach. The DAG
-/// reaches below `C + 1`, so the boundary this replaced let it through.
+/// The pack committed leader C in a sub-dag that holds only the leader, so no other authority
+/// has a committed round, while the certificate store kept only the rounds from
+/// `C - gc_depth + 2` (it prunes from its newest round). The other authorities' certificates of
+/// that bottom round are therefore still orderable, and their parents (genesis digests standing in
+/// for round `C - gc_depth + 1`) are missing from the DAG, so ordering from it would walk into the
+/// hole. The DAG reaches below `C + 1`, so a check of its lowest round alone would let it through.
 #[tokio::test]
 async fn spawn_demotes_on_restored_dag_gap() {
     let fixture = CommitteeFixture::builder(MemDatabase::default).build();
@@ -1963,4 +1965,66 @@ async fn spawn_demotes_on_restored_dag_gap() {
     // the consensus task subscribes before it is spawned and a second subscription panics, so
     // this subscription succeeding shows no task was spawned
     let _rx_new_certificates = cb.subscribe_new_certificates();
+}
+
+/// An active CVV promoted after catching up through the consensus pack restores a store the
+/// follower path left stale: the certificates of rounds 1 to 8, stored before its demotion, and
+/// none of the rounds 9 to 18 it followed. None of them is above its author's committed round, so
+/// the restore is no gap and the node stays active (`restarts::test_restartstt`, which the window
+/// check this replaced demoted on every promotion).
+#[tokio::test]
+async fn spawn_stays_active_on_a_store_left_stale_by_catch_up() {
+    let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+    let committee = fixture.committee();
+    let config = fixture.authorities().next().unwrap().consensus_config().clone();
+    let ids: Vec<_> = fixture.authorities().map(|a| a.id()).collect();
+    let genesis =
+        Certificate::genesis(&committee).iter().map(|x| x.digest()).collect::<BTreeSet<_>>();
+    let temp_dir = TempDir::new().unwrap();
+    let consensus_chain =
+        ConsensusChain::new_for_test(temp_dir.path().to_owned(), committee.clone()).await.unwrap();
+    let committed_round = 18;
+    let (certificates, _) =
+        make_optimal_certificates(&committee, 1..=committed_round, &genesis, &ids);
+
+    // the sub-dag of the round-18 leader holds round 17: the pack's committed rounds are 18 for
+    // the leader's author and 17 for the rest
+    let leader = certificates
+        .iter()
+        .find(|c| c.round() == committed_round && c.origin() == &ids[0])
+        .cloned()
+        .unwrap();
+    let mut sub_dag: Vec<_> =
+        certificates.iter().filter(|c| c.round() == committed_round - 1).cloned().collect();
+    sub_dag.push(leader.clone());
+    let committed = CommittedSubDag::new(
+        sub_dag,
+        leader,
+        0,
+        ReputationScores::new(&committee),
+        None,
+        EpochSeedChainValue::epoch_root(committee.epoch()),
+    );
+    consensus_chain.write_subdag_for_test(1, committed).await;
+    for certificate in certificates.into_iter().filter(|c| c.round() <= 8) {
+        config.node_storage().write(certificate).unwrap();
+    }
+
+    let bullshark = Bullshark::new(
+        committee.clone(),
+        FLOOR_SUB_DAGS_PER_SCHEDULE,
+        LeaderSchedule::new(committee.clone(), LeaderSwapTable::default()),
+        DEFAULT_BAD_NODES_STAKE_THRESHOLD,
+    );
+    let cb = ConsensusBus::new();
+    let rx_shutdown = config.shutdown().subscribe();
+    let task_manager = TaskManager::default();
+    Consensus::spawn(config.clone(), &cb, bullshark, &task_manager, &consensus_chain, None)
+        .await
+        .unwrap();
+
+    assert!(cb.is_active_cvv(), "the node stays active");
+    assert!(!rx_shutdown.noticed(), "the epoch keeps running");
+    assert_eq!(cb.app().committed_round(), committed_round, "primed from the pack");
+    config.shutdown().notify();
 }

@@ -474,34 +474,57 @@ pub(crate) const fn commit_run_ahead_ok(
     leader_round <= exec_round.saturating_add(max_run_ahead)
 }
 
-/// The lowest round of a restored DAG that has a hole: a round missing between the round after
-/// the GC round, `last_committed_round - gc_depth + 1`, and `last_committed_round`.
+/// The lowest round of a restored DAG holding a certificate that ordering can still reach and
+/// whose parent is missing from the DAG, or `None` when there is no such certificate.
 ///
-/// The restore reads every stored certificate above `gc_round` (see
-/// `construct_dag_from_cert_store`), and ordering can need any of them, not only those above the
-/// committed round: a certificate in `(gc_round, last_committed_round]` that no leader has
-/// committed yet is still ordered by the next leader whose history reaches it, and `order_dag`
-/// skips a parent missing from the DAG instead of failing. Ordering over a hole can sequence a
-/// sub-dag no other node commits. Two histories leave one:
+/// The restore reads every stored certificate above `gc_round` without checking its parents (see
+/// `construct_dag_from_cert_store`). Ordering walks parents only from the certificates it can
+/// still sequence: `order_dag` skips a certificate at or below its author's round in
+/// `last_committed` without looking at its parents, and `linked` walks only rounds above the
+/// committed round, where every certificate is uncommitted. Where ordering does look, it skips a
+/// parent missing from the DAG instead of failing, so ordering over such a hole can sequence a
+/// sub-dag no other node commits. A certificate is therefore a hole's top when it is above its
+/// author's committed round, at least two rounds above `gc_round` (ordering never looks below
+/// the round after a leader's gc round, which is at or above this one) and has a parent missing
+/// from the round below it.
+///
+/// Every certificate inserted after the restore has its parents checked (`check_parents`), and
+/// the certificate manager writes one to the store, and hands it to consensus, only once its
+/// parents are stored, fetching the missing ones from peers. So a hole can only come from the
+/// restore, and only these histories leave one:
 /// - execution lagged: the certificate store prunes from its newest round, and the consensus pack
-///   can trail that round by more than the prune depth less `gc_depth`, so the DAG starts above the
-///   round after the GC round;
-/// - the node was inactive, when it stores no certificates, and restarts within about `gc_depth`
-///   rounds of its promotion: the rounds it spent inactive are missing at the bottom or in the
-///   middle of the window. Such a restart is demoted once although nothing is wrong with the node;
-///   it costs one more catch-up, the price of never ordering over a hole.
+///   can trail that round by more than the prune depth less `gc_depth`, so the uncommitted
+///   certificates at the bottom of the DAG lost their parents;
+/// - a DAG detached above the committed round, whose lowest certificates are uncommitted by
+///   definition.
 ///
-/// `None` for a fresh epoch (nothing committed), an empty DAG (a promotion from catch-up, which
-/// stores no certificates) and a DAG holding every round of the window.
-fn restored_dag_gap(last_committed_round: Round, gc_round: Round, dag: &Dag) -> Option<Round> {
-    let dag_min_round = *dag.first_key_value()?.0;
-    let expected_min_round = gc_round.saturating_add(1);
-    let window = expected_min_round..=last_committed_round;
-    // `range` panics on an inverted range, so an empty window (a zero gc_depth) checks the bottom
-    let window_complete =
-        window.is_empty() || dag.range(window.clone()).map(|(round, _)| *round).eq(window);
-    (last_committed_round > 0 && (dag_min_round > expected_min_round || !window_complete))
-        .then_some(dag_min_round)
+/// A store left stale by a period as a follower is not a hole: the follower path writes no
+/// certificates, so a promotion after catch-up restores only the certificates stored before the
+/// demotion. The certificate manager stored each of them after its parents, so they carry no hole
+/// of their own, and the rounds between them and the committed round are fetched from peers once
+/// new certificates reference them. `None` also for an empty DAG.
+fn restored_dag_gap(
+    last_committed: &HashMap<AuthorityIdentifier, Round>,
+    gc_round: Round,
+    dag: &Dag,
+) -> Option<Round> {
+    // the dag's inner maps are hash maps, but each check below only asks whether any certificate
+    // of a round matches, which does not depend on their iteration order
+    dag.range(gc_round.saturating_add(2)..).find_map(|(round, certificates)| {
+        let parents: BTreeSet<&HeaderDigest> = dag
+            .get(&round.saturating_sub(1))
+            .map(|parents| parents.values().map(|(digest, _)| digest).collect())
+            .unwrap_or_default();
+        certificates
+            .values()
+            .any(|(_, certificate)| {
+                let reachable = certificate.round()
+                    > last_committed.get(certificate.origin()).copied().unwrap_or_default();
+                reachable
+                    && certificate.header().parents().iter().any(|parent| !parents.contains(parent))
+            })
+            .then_some(*round)
+    })
 }
 
 impl<DB: Database> Consensus<DB> {
@@ -577,20 +600,22 @@ impl<DB: Database> Consensus<DB> {
             .committed_round_updates()
             .send_replace(state.last_round.committed_round);
 
-        // an active cvv must not order from a restored dag with a hole between the round after
-        // its gc round and its committed round (see `restored_dag_gap`); it goes inactive and
-        // catches up from its peers instead
+        // an active cvv must not order from a restored dag in which a certificate it can still
+        // order has a missing parent (see `restored_dag_gap`); it goes inactive and catches up
+        // from its peers instead
         if consensus_bus.is_active_cvv() {
             let gc_round = state.last_round.gc_round;
-            if let Some(dag_min_round) =
-                restored_dag_gap(last_committed_round, gc_round, &state.dag)
+            if let Some(hole_round) = restored_dag_gap(&state.last_committed, gc_round, &state.dag)
             {
+                // the hole can lie below the committed round (an author's uncommitted certificates
+                // there are still orderable), so `hole_round` is the fact; the message text is
+                // the restart-gap log contract the analysis tools match, and it stays as it is
                 info!(
                     target: "primary::consensus",
                     last_committed_round,
-                    dag_min_round,
+                    dag_min_round = state.dag.first_key_value().map_or(0, |(round, _)| *round),
+                    hole_round,
                     gc_round,
-                    expected_min = gc_round.saturating_add(1),
                     "restored dag has a gap above the committed round; going inactive"
                 );
                 let previous = consensus_bus.app().node_mode().send_replace(NodeMode::CvvInactive);
@@ -837,8 +862,13 @@ impl<DB: Database> Consensus<DB> {
 #[cfg(test)]
 mod commit_run_ahead_tests {
     use super::{commit_run_ahead_ok, restored_dag_gap, Dag};
-    use std::collections::HashMap;
-    use tn_types::{Round, MAX_COMMIT_RUN_AHEAD_ROUNDS};
+    use crate::test_utils::{make_optimal_certificates, mock_certificate};
+    use std::collections::{BTreeSet, HashMap};
+    use tn_storage::mem_db::MemDatabase;
+    use tn_test_utils_committee::CommitteeFixture;
+    use tn_types::{
+        AuthorityIdentifier, Certificate, Hash as _, Round, MAX_COMMIT_RUN_AHEAD_ROUNDS,
+    };
 
     /// The executed round every boundary case measures from.
     const EXEC: Round = 300;
@@ -886,49 +916,160 @@ mod commit_run_ahead_tests {
         assert!(commit_run_ahead_ok(2, Round::MAX, MAX_COMMIT_RUN_AHEAD_ROUNDS));
     }
 
-    /// A restored DAG is a gap only when it is not empty, the epoch has committed something and
-    /// it misses a round between the round after the GC round, `C - gc_depth + 1`, and `C`.
+    /// Four authorities, every certificate of rounds `1..=70` referencing the whole round below.
+    fn optimal_rounds() -> (Vec<AuthorityIdentifier>, Vec<Certificate>) {
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let committee = fixture.committee();
+        let ids: Vec<_> = fixture.authorities().map(|authority| authority.id()).collect();
+        let genesis =
+            Certificate::genesis(&committee).iter().map(|c| c.digest()).collect::<BTreeSet<_>>();
+        let (certificates, _) = make_optimal_certificates(&committee, 1..=70, &genesis, &ids);
+        (ids, certificates.into_iter().collect())
+    }
+
+    /// The dag the restore builds from the stored `certificates` that `stored` keeps.
+    fn restored(certificates: &[Certificate], stored: impl Fn(&Certificate) -> bool) -> Dag {
+        let mut dag = Dag::new();
+        for certificate in certificates.iter().filter(|certificate| stored(certificate)) {
+            dag.entry(certificate.round())
+                .or_default()
+                .insert(certificate.origin().clone(), (certificate.digest(), certificate.clone()));
+        }
+        dag
+    }
+
+    /// Every authority committed through `round`, except `lagging`, committed through `its_round`
+    /// (absent from the map when that is 0, as for an authority nothing of which was committed).
+    fn committed(
+        ids: &[AuthorityIdentifier],
+        round: Round,
+        lagging: Option<(&AuthorityIdentifier, Round)>,
+    ) -> HashMap<AuthorityIdentifier, Round> {
+        ids.iter()
+            .filter_map(|id| match lagging {
+                Some((lagging, its_round)) if lagging == id => {
+                    (its_round > 0).then(|| (id.clone(), its_round))
+                }
+                _ => Some((id.clone(), round)),
+            })
+            .collect()
+    }
+
+    /// The restart that `restarts::test_restartstt` hits: a validator killed around round 8,
+    /// caught up through the consensus pack to committed round 18 and promoted. The follower path
+    /// stores no certificates, so the store still holds rounds 1 to 8 and nothing for 9 to 18.
+    /// Every one of those certificates is at or below its author's committed round, so ordering
+    /// never walks their parents, and the certificate manager fetches rounds 9 on from peers.
+    #[test]
+    fn restored_dag_gap_ignores_a_store_left_stale_by_catch_up() {
+        let (ids, certificates) = optimal_rounds();
+        // gc_depth 25 (the e2e committee) keeps the gc round at 0 through committed round 25
+        let stale = restored(&certificates, |c| c.round() <= 8);
+        assert_eq!(restored_dag_gap(&committed(&ids, 18, None), 0, &stale), None);
+        // the killed validator's last certificates were never committed: they are reachable, and
+        // the manager stored them after their parents
+        let killed = Some((&ids[3], 6));
+        assert_eq!(restored_dag_gap(&committed(&ids, 18, killed), 0, &stale), None);
+        // the same store holding a certificate the killed validator stored without one of its
+        // parents (impossible through the manager) is a hole at that certificate's round
+        let without_parent = restored(&certificates, |c| {
+            c.round() <= 8 && !(c.round() == 7 && c.origin() == &ids[0])
+        });
+        assert_eq!(restored_dag_gap(&committed(&ids, 18, killed), 0, &without_parent), Some(8));
+    }
+
+    /// A restored dag is a gap exactly when a certificate ordering can reach (above its author's
+    /// committed round, two rounds or more above the gc round) has a parent missing from it.
     #[test]
     fn restored_dag_gap_boundaries() {
-        const GC_DEPTH: Round = 50;
-        const C: Round = 200;
-        const GC_ROUND: Round = C - GC_DEPTH;
-        // rounds `min_round` through `C + 2`, without `missing`
-        let dag_from_without = |min_round: Round, missing: Option<Round>| -> Dag {
-            (min_round..=C + 2)
-                .filter(|round| Some(*round) != missing)
-                .map(|round| (round, HashMap::new()))
-                .collect()
+        const C: Round = 60;
+        const GC_ROUND: Round = 35;
+        let (ids, certificates) = optimal_rounds();
+        let all = committed(&ids, C, None);
+        let slow = committed(&ids, C, Some((&ids[3], 40)));
+        let never = committed(&ids, C, Some((&ids[3], 0)));
+        let in_rounds = |low: Round, high: Round| {
+            restored(&certificates, move |c| (low..=high).contains(&c.round()))
         };
-        let dag_from = |min_round: Round| dag_from_without(min_round, None);
-        assert_eq!(restored_dag_gap(C, GC_ROUND, &Dag::new()), None, "an empty dag (a promotion)");
-        assert_eq!(restored_dag_gap(0, 0, &dag_from(150)), None, "nothing committed yet");
+
+        assert_eq!(restored_dag_gap(&all, GC_ROUND, &Dag::new()), None, "an empty dag");
         assert_eq!(
-            restored_dag_gap(C, GC_ROUND, &dag_from(C - GC_DEPTH + 1)),
+            restored_dag_gap(&slow, GC_ROUND, &in_rounds(GC_ROUND + 1, 65)),
             None,
-            "the round after the gc round is present"
+            "a full window"
         );
-        assert_eq!(restored_dag_gap(C, GC_ROUND, &dag_from(C - 120)), None, "rounds below it too");
         assert_eq!(
-            restored_dag_gap(C, GC_ROUND, &dag_from(C - GC_DEPTH + 2)),
-            Some(C - GC_DEPTH + 2),
-            "the round after the gc round is missing"
+            restored_dag_gap(&slow, GC_ROUND, &in_rounds(1, 65)),
+            None,
+            "rounds below it too"
         );
-        // the old boundary admitted a dag reaching down to the round after the committed round,
-        // with a hole in the rounds an uncommitted certificate can still be ordered from
-        assert_eq!(restored_dag_gap(C, GC_ROUND, &dag_from(C + 1)), Some(C + 1));
-        // a hole in the middle of the window, from rounds spent inactive before a promotion
-        let middle_hole = dag_from_without(C - GC_DEPTH + 1, Some(C - 10));
-        assert_eq!(restored_dag_gap(C, GC_ROUND, &middle_hole), Some(C - GC_DEPTH + 1));
-        let committed_round_missing = dag_from_without(C - GC_DEPTH + 1, Some(C));
-        assert_eq!(restored_dag_gap(C, GC_ROUND, &committed_round_missing), Some(C - GC_DEPTH + 1));
-        // inside the epoch's first gc_depth rounds the gc round saturates at 0: the dag must reach
-        // round 1
-        assert_eq!(restored_dag_gap(20, 0, &dag_from(1)), None, "a healthy early restart");
-        assert_eq!(restored_dag_gap(20, 0, &dag_from(2)), Some(2));
-        // a zero gc_depth leaves an empty window: only the bottom is checked
-        assert_eq!(restored_dag_gap(C, C, &dag_from(C + 1)), None);
-        assert_eq!(restored_dag_gap(C, C, &dag_from(C + 2)), Some(C + 2));
+
+        // a dag detached above the committed round (the f1-1 boundary): its lowest certificates
+        // are uncommitted and their parents are missing
+        assert_eq!(restored_dag_gap(&all, GC_ROUND, &in_rounds(C + 2, 65)), Some(C + 2));
+        // the round right above the committed round is uncommitted too: f1-1 admitted this one
+        assert_eq!(restored_dag_gap(&all, GC_ROUND, &in_rounds(C + 1, 65)), Some(C + 1));
+
+        // sec-3, lagged execution: the store pruned from its newest round lost the window's
+        // bottom. a slow authority's certificates there are still uncommitted, so ordering would
+        // walk into the hole
+        assert_eq!(restored_dag_gap(&slow, GC_ROUND, &in_rounds(45, 65)), Some(45));
+        // with every certificate there committed nothing reachable lacks a parent
+        assert_eq!(restored_dag_gap(&all, GC_ROUND, &in_rounds(45, 65)), None);
+
+        // a hole in the middle of the window, under an uncommitted certificate and under committed
+        // ones only
+        let middle_hole = restored(&certificates, |c| c.round() > GC_ROUND && c.round() != 50);
+        assert_eq!(restored_dag_gap(&slow, GC_ROUND, &middle_hole), Some(51));
+        assert_eq!(restored_dag_gap(&all, GC_ROUND, &middle_hole), None);
+        // one missing certificate above the committed round, which every certificate of the round
+        // above references
+        let one_missing = restored(&certificates, |c| {
+            c.round() > GC_ROUND && !(c.round() == 62 && c.origin() == &ids[1])
+        });
+        assert_eq!(restored_dag_gap(&all, GC_ROUND, &one_missing), Some(63));
+
+        // the gc boundary: ordering never looks at the parents of a certificate in the round
+        // after the gc round, only from the round after that
+        assert_eq!(restored_dag_gap(&never, GC_ROUND, &in_rounds(GC_ROUND + 1, 65)), None);
+        assert_eq!(
+            restored_dag_gap(&never, GC_ROUND, &in_rounds(GC_ROUND + 2, 65)),
+            Some(GC_ROUND + 2)
+        );
+
+        // nothing committed yet (a fresh epoch, gc round 0): round 1's genesis parents are never
+        // looked at, so only a dag missing its first rounds is a gap
+        let nothing = HashMap::new();
+        assert_eq!(restored_dag_gap(&nothing, 0, &in_rounds(1, 10)), None);
+        assert_eq!(restored_dag_gap(&nothing, 0, &in_rounds(3, 10)), Some(3));
+    }
+
+    /// Only the parents a certificate references count: with one certificate of round 62 missing
+    /// from the store, a round 63 whose certificates each reference the 2f+1 stored ones leaves
+    /// no hole, where a round 63 referencing the whole round 62 is one (`one_missing` in
+    /// `restored_dag_gap_boundaries`).
+    #[test]
+    fn restored_dag_gap_counts_only_referenced_parents() {
+        const C: Round = 60;
+        const GC_ROUND: Round = 35;
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let committee = fixture.committee();
+        let ids: Vec<_> = fixture.authorities().map(|authority| authority.id()).collect();
+        let genesis =
+            Certificate::genesis(&committee).iter().map(|c| c.digest()).collect::<BTreeSet<_>>();
+        let (certificates, _) = make_optimal_certificates(&committee, 1..=62, &genesis, &ids);
+        let lost = |c: &Certificate| c.round() == 62 && c.origin() == &ids[1];
+        let quorum: BTreeSet<_> = certificates
+            .iter()
+            .filter(|c| c.round() == 62 && !lost(c))
+            .map(|c| c.digest())
+            .collect();
+        assert_eq!(quorum.len(), 3, "2f+1 of four");
+        let quorum_linked =
+            ids.iter().map(|id| mock_certificate(&committee, id.clone(), 63, quorum.clone()).1);
+        let stored: Vec<_> = certificates.into_iter().chain(quorum_linked).collect();
+        let dag = restored(&stored, |c| c.round() > GC_ROUND && !lost(c));
+        assert_eq!(restored_dag_gap(&committed(&ids, C, None), GC_ROUND, &dag), None);
     }
 }
 
