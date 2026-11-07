@@ -297,6 +297,13 @@ impl TnLmdbTxMut {
         self.txn.lock().deferred.skip_next_flush();
     }
 
+    /// Test-only: make the next `delete_current_duplicates` on an engine dup table read as
+    /// `fault`, as a tree and a cursor that disagree would.
+    #[cfg(test)]
+    pub(crate) fn break_next_wipe(&self, fault: crate::cursor::WipeFault) {
+        self.txn.lock().deferred.break_next_wipe(fault);
+    }
+
     /// `tx.put` or `tx.append` (`append`) of `key` and `value` into `T`. An append follows
     /// MDBX's rule: the table's last key is taken again, its value replaced (on a dup-sort table,
     /// with a value anywhere among its rows). On a dup-sort table both store the row of `value`'s

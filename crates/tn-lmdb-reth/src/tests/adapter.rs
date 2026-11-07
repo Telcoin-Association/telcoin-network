@@ -1415,6 +1415,7 @@ fn a_cursor_may_outlive_its_tx() {
 #[test]
 fn the_cursor_pool_keys_by_id_and_name() {
     let dir = tempfile::tempdir().unwrap();
+    let _open = super::SPAWN_LOCK.read();
     let env =
         tn_lmdb::Env::open(dir.path().join("pool.dat"), tn_lmdb::EnvOptions::default()).unwrap();
     let mut txn = env.begin_rw().unwrap();

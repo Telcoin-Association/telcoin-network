@@ -8,9 +8,13 @@
 //!
 //! **Ops:** the transaction's `get`, `put`, `append` (mostly in order), `delete` with no value,
 //! a matching value or another, `clear` and `entries`; up to two write cursors and one read cursor
-//! at a time, each on any table, with every cursor method and short walks (a dup method on a plain
-//! table is its plain counterpart: `next_dup` is `next`, `last_dup` is `last` and so on); commit,
-//! abort, and a read transaction opened at one point and read later, which must show its snapshot.
+//! of the write transaction at a time, each on any table, with every cursor method and short walks
+//! (a dup method on a plain table is its plain counterpart: `next_dup` is `next`, `last_dup` is
+//! `last` and so on); commit, abort, and a read transaction opened at one point and read later,
+//! which must show its snapshot: its `get`, `entries` and a walk of a new cursor, and a cursor of
+//! its own (slot [`SNAP`], over the engine's read-only cursors) with every read method and walk,
+//! kept across the write transaction's commits and aborts and reopened now and then (the one it
+//! replaces goes back to the transaction's cursor pool, and the new one may take it, reset).
 //! Every value is made from its row and a version counter, so a value read back names the write
 //! that made it.
 //!
@@ -21,7 +25,9 @@
 //! of them (the skips are the same on both databases until their outcomes first differ). A cursor
 //! in a state that leads to a difference is *tainted*: its relative calls (`next`, `prev`,
 //! `current`, the dup moves and the deletes) are skipped until an absolute one (a seek, `first`,
-//! `last`, a write or a walk) places it again. Each skip is counted against its class:
+//! `last`, a write or a walk) places it again. The read transaction's cursor reads a snapshot no
+//! writer changes (its model is the snapshot's tables), so only classes 1, 7 and 8 reach it. Each
+//! skip is counted against its class:
 //! 1. **past either end:** `next` or `next_no_dup` finding nothing (except right after `last`,
 //!    which MDBX matches), `prev` finding nothing, a `seek`, `first` or `last` finding nothing, a
 //!    delete of the table's last key (and, by another writer, of the cursor's row with no row after
@@ -62,7 +68,7 @@
 //!    row from a cursor that has moved.
 //!
 //! An error other than the expected ones (`MDBX_KEYEXIST`, `MDBX_EKEYMISMATCH`, `MDBX_ENODATA`)
-//! also taints the cursor, counted apart. About 4% of the ops are skipped (about 3% in the
+//! also taints the cursor, counted apart. About 4.5% of the ops are skipped (about 3% in the
 //! default's shorter scripts); a run fails if a tenth or more are (skipped against run), as its
 //! scripts would then test little. On a difference proptest shrinks the script, then prints it
 //! with both outcome lists.
@@ -219,7 +225,8 @@ enum Op {
     Delete(Tb, K, Del),
     Clear(Tb),
     Entries(Tb),
-    /// (Re)opens cursor slot 0 or 1 (write) or 2 (read) on a table.
+    /// (Re)opens cursor slot 0 or 1 (write), 2 (read) or [`SNAP`] (the read transaction's) on a
+    /// table.
     Open(usize, Tb),
     /// A call on a cursor slot; a closed slot opens on the table first.
     Cursor(usize, Tb, C),
@@ -494,15 +501,43 @@ where
     }
 }
 
-/// A cursor of the write transaction, by table; the `Ro` ones from `cursor_read`.
+/// A cursor of the write transaction, by table; `Ro` from `cursor_read` (slot 2).
 enum AnyCursor<TX: DbTxMut + DbTx> {
     H(TX::CursorMut<CanonicalHeaders>),
     S(TX::DupCursorMut<PlainStorageState>),
     B(TX::CursorMut<Bytecodes>),
-    RoH(<TX as DbTx>::Cursor<CanonicalHeaders>),
-    RoS(<TX as DbTx>::DupCursor<PlainStorageState>),
-    RoB(<TX as DbTx>::Cursor<Bytecodes>),
+    Ro(AnyReadCursor<TX>),
 }
+
+/// A read cursor (`cursor_read`, `cursor_dup_read`), by table: the write transaction's (slot 2)
+/// or the read transaction's (slot [`SNAP`]).
+enum AnyReadCursor<TX: DbTx> {
+    H(TX::Cursor<CanonicalHeaders>),
+    S(TX::DupCursor<PlainStorageState>),
+    B(TX::Cursor<Bytecodes>),
+}
+
+impl<TX: DbTx> AnyReadCursor<TX> {
+    fn open(tx: &TX, tb: Tb) -> Result<Self, DatabaseError> {
+        Ok(match tb {
+            Tb::H => Self::H(tx.cursor_read()?),
+            Tb::S => Self::S(tx.cursor_dup_read()?),
+            Tb::B => Self::B(tx.cursor_read()?),
+        })
+    }
+
+    fn exec(&mut self, call: &Call) -> Res {
+        match self {
+            Self::H(c) => exec_ro::<CanonicalHeaders, _>(c, call),
+            Self::S(c) => exec_dup(c, call),
+            Self::B(c) => exec_ro::<Bytecodes, _>(c, call),
+        }
+    }
+}
+
+/// The cursor slot of the read transaction's cursor; 0 and 1 are the write transaction's write
+/// cursors, 2 its read cursor.
+const SNAP: usize = 3;
 
 /// Why a cursor's relative calls are skipped: the skip class, and whether the cursor is before
 /// the first row (where libmdbx's `last_dup` aborts).
@@ -597,9 +632,14 @@ struct Runner<'d, DB: Database> {
     second_values: bool,
     tx: Option<DB::TXMut>,
     cursors: [Option<AnyCursor<DB::TXMut>>; 3],
-    models: [Option<CurModel>; 3],
+    /// The cursors' models, by slot ([`SNAP`] last).
+    models: [Option<CurModel>; 4],
     snap: Option<DB::TX>,
+    /// The read transaction's cursor (slot [`SNAP`]).
+    snap_cursor: Option<AnyReadCursor<DB::TX>>,
     model: Tables,
+    /// The read transaction's tables: what was committed when it opened.
+    snap_model: Tables,
     committed: Tables,
     ver: u32,
     run: Run,
@@ -652,9 +692,11 @@ fn run<DB: Database>(db: &DB, ops: &[Op], second_values: bool) -> Run {
         second_values,
         tx: Some(db.tx_mut().expect("begin")),
         cursors: [None, None, None],
-        models: [None, None, None],
+        models: [None, None, None, None],
         snap: None,
+        snap_cursor: None,
         model: Default::default(),
+        snap_model: Default::default(),
         committed: Default::default(),
         ver: 0,
         run: Run::default(),
@@ -663,6 +705,7 @@ fn run<DB: Database>(db: &DB, ops: &[Op], second_values: bool) -> Run {
         r.op(*op);
     }
     r.op(Op::Commit);
+    r.snap_cursor = None;
     r.snap = None;
     let tx = db.tx().expect("read");
     for tb in [Tb::H, Tb::S, Tb::B] {
@@ -885,11 +928,14 @@ impl<DB: Database> Runner<'_, DB> {
     }
 
     fn snap_open(&mut self) {
+        self.snap_cursor = None;
+        self.models[SNAP] = None;
         self.snap = None;
         let snap = self.db.tx();
         self.run.ran += 1;
         self.push("snap open".into(), show_done(&snap.as_ref().map(drop)));
         self.snap = snap.ok();
+        self.snap_model = self.committed.clone();
     }
 
     /// The read transaction, opened here if none is.
@@ -900,9 +946,10 @@ impl<DB: Database> Runner<'_, DB> {
         self.snap.as_ref().expect("a read transaction")
     }
 
+    /// Closes the write transaction's cursors; the read transaction's stays.
     fn close_cursors(&mut self) {
         self.cursors = [None, None, None];
-        self.models = [None, None, None];
+        self.models[..SNAP].fill(None);
     }
 
     /// Reads every table in a new read transaction and checks the model holds the same rows.
@@ -972,9 +1019,10 @@ impl<DB: Database> Runner<'_, DB> {
         self.push(label, show_done(&res));
     }
 
-    /// Another writer than cursor `by` (`None`: the transaction) deleted `removed` from `tb`.
+    /// Another writer than cursor `by` (`None`: the transaction) deleted `removed` from `tb`. The
+    /// read transaction's cursor ([`SNAP`]) reads a snapshot no writer changes.
     fn others_on_delete(&mut self, by: Option<usize>, tb: Tb, removed: &[Row]) {
-        for j in 0..3 {
+        for j in 0..SNAP {
             let Some(m) = self.models[j].as_ref().filter(|m| m.tb == tb && Some(j) != by) else {
                 continue;
             };
@@ -1012,9 +1060,9 @@ impl<DB: Database> Runner<'_, DB> {
         }
     }
 
-    /// Another writer than cursor `by` put `row` in `tb`.
+    /// Another writer than cursor `by` put `row` in `tb` (not seen by [`SNAP`]'s snapshot).
     fn others_on_put(&mut self, by: Option<usize>, tb: Tb, row: Row) {
-        for j in 0..3 {
+        for j in 0..SNAP {
             let Some(m) = self.models[j].as_ref().filter(|m| m.tb == tb && Some(j) != by) else {
                 continue;
             };
@@ -1040,12 +1088,20 @@ impl<DB: Database> Runner<'_, DB> {
     }
 
     fn open(&mut self, slot: usize, tb: Tb) {
+        if slot == SNAP {
+            // The old cursor goes back to the transaction's pool, and the new one may take it.
+            self.snap_cursor = None;
+            let cursor = AnyReadCursor::open(self.snap(), tb);
+            self.run.ran += 1;
+            self.push(format!("open c{slot} {tb:?}"), show_done(&cursor.as_ref().map(drop)));
+            self.snap_cursor = cursor.ok();
+            self.models[slot] = Some(CurModel::new(tb));
+            return;
+        }
         self.cursors[slot] = None;
         let tx = self.tx();
         let cursor = match (slot, tb) {
-            (2, Tb::H) => tx.cursor_read::<CanonicalHeaders>().map(AnyCursor::RoH),
-            (2, Tb::S) => tx.cursor_dup_read::<PlainStorageState>().map(AnyCursor::RoS),
-            (2, Tb::B) => tx.cursor_read::<Bytecodes>().map(AnyCursor::RoB),
+            (2, _) => AnyReadCursor::open(tx, tb).map(AnyCursor::Ro),
             (_, Tb::H) => tx.cursor_write::<CanonicalHeaders>().map(AnyCursor::H),
             (_, Tb::S) => tx.cursor_dup_write::<PlainStorageState>().map(AnyCursor::S),
             (_, Tb::B) => tx.cursor_write::<Bytecodes>().map(AnyCursor::B),
@@ -1143,9 +1199,25 @@ impl<DB: Database> Runner<'_, DB> {
     }
 
     fn cursor(&mut self, slot: usize, hint: Tb, c: C) {
+        if slot == SNAP {
+            if self.snap_cursor.is_none() {
+                self.open(slot, hint);
+            }
+            // The cursor reads the read transaction's snapshot: for its call the model's tables
+            // are the snapshot's, which no writer changes (its calls are reads only).
+            mem::swap(&mut self.model, &mut self.snap_model);
+            self.cursor_call(slot, c);
+            mem::swap(&mut self.model, &mut self.snap_model);
+            return;
+        }
         if self.cursors[slot].is_none() {
             self.open(slot, hint);
         }
+        self.cursor_call(slot, c);
+    }
+
+    /// Runs drawn call `c` on open cursor `slot`.
+    fn cursor_call(&mut self, slot: usize, c: C) {
         let tb = self.models[slot].as_ref().expect("open").tb;
         let call = self.resolve(tb, c);
         let label = format!("c{slot} {tb:?} {call:?}");
@@ -1175,13 +1247,15 @@ impl<DB: Database> Runner<'_, DB> {
             }
         }
         self.run.ran += 1;
-        let res = match self.cursors[slot].as_mut().expect("open") {
-            AnyCursor::H(c) => exec_rw::<CanonicalHeaders, _>(c, &call),
-            AnyCursor::S(c) => exec_dup_rw(c, &call),
-            AnyCursor::B(c) => exec_rw::<Bytecodes, _>(c, &call),
-            AnyCursor::RoH(c) => exec_ro::<CanonicalHeaders, _>(c, &call),
-            AnyCursor::RoS(c) => exec_dup(c, &call),
-            AnyCursor::RoB(c) => exec_ro::<Bytecodes, _>(c, &call),
+        let res = if slot == SNAP {
+            self.snap_cursor.as_mut().expect("open").exec(&call)
+        } else {
+            match self.cursors[slot].as_mut().expect("open") {
+                AnyCursor::H(c) => exec_rw::<CanonicalHeaders, _>(c, &call),
+                AnyCursor::S(c) => exec_dup_rw(c, &call),
+                AnyCursor::B(c) => exec_rw::<Bytecodes, _>(c, &call),
+                AnyCursor::Ro(c) => c.exec(&call),
+            }
         };
         let shown = show_res(&res);
         self.moved(slot, tb, &call, res);
@@ -1553,7 +1627,8 @@ fn op() -> impl Strategy<Value = Op> {
         5 => (0usize..2, table(), prop_oneof![3 => read_call(), 2 => write_call()])
             .prop_map(|(s, t, c)| Op::Cursor(s, t, c)),
         2 => (table(), read_call()).prop_map(|(t, c)| Op::Cursor(2, t, c)),
-        1 => (0usize..3, table()).prop_map(|(s, t)| Op::Open(s, t)),
+        2 => (table(), read_call()).prop_map(|(t, c)| Op::Cursor(SNAP, t, c)),
+        1 => (0..=SNAP, table()).prop_map(|(s, t)| Op::Open(s, t)),
     ];
     let txns = prop_oneof![
         4 => Just(Op::Commit),
@@ -1694,10 +1769,10 @@ const PINNED_MOVED: &str = "ops run and skipped by class at the fixed seed, agai
                             ones), anything else is a behaviour change to find first";
 
 /// [`random_scripts_skip_counts_are_pinned_at_seed_1`]'s totals.
-const DEFAULT_TOTALS: Totals = (1455, [18, 0, 5, 0, 0, 6, 0, 2, 0]);
+const DEFAULT_TOTALS: Totals = (1604, [20, 0, 11, 1, 0, 7, 0, 3, 0]);
 
 /// [`random_scripts_skip_counts_are_pinned_at_seed_1_heavy`]'s totals.
-const HEAVY_TOTALS: Totals = (287_215, [7650, 3, 2504, 61, 73, 1136, 45, 938, 0]);
+const HEAVY_TOTALS: Totals = (294_529, [8988, 4, 2304, 23, 62, 1022, 52, 1048, 0]);
 
 /// Random scripts of transaction and cursor calls on three tables (one dup-sort, one with
 /// overflow values) give the same outcomes on tn-lmdb, in every form, as on MDBX.

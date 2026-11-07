@@ -1378,7 +1378,8 @@ impl<T: DupSort> DbDupCursorRO<T> for TnLmdbCursor<T> {
 ///
 /// A failure of a held delete is the error of the call that runs it (the commit's, if that runs
 /// it), and is kept ([`Self::failure`]): the transaction's commit refuses it, since the cursor's
-/// `delete_current` reported the delete done.
+/// `delete_current` reported the delete done. So is a refused wipe of a key on an engine dup table
+/// ([`TnLmdbCursorMut::delete_current_duplicates`]), which may have deleted rows.
 #[derive(Debug, Default)]
 pub(crate) struct Deferred {
     /// The held delete, if any (at most one a transaction).
@@ -1387,7 +1388,7 @@ pub(crate) struct Deferred {
     key: Vec<u8>,
     /// The engine cursors and positions other accessors left after running a cursor's held delete.
     parked: Vec<Parked>,
-    /// The first failure of a held delete: the commit refuses it.
+    /// The first failure of a held delete, or a refused wipe's: the commit refuses it.
     failed: Option<DatabaseErrorInfo>,
     /// The last held delete's number; each cursor knows its own by it.
     last: u64,
@@ -1403,6 +1404,22 @@ pub(crate) struct Deferred {
     /// ordering would ([`Self::skip_next_flush`]).
     #[cfg(test)]
     skip_next_flush: bool,
+    /// Test-only: the next wipe of a key on an engine dup table
+    /// ([`TnLmdbCursorMut::delete_current_duplicates`]) reads as this fault
+    /// ([`Self::break_next_wipe`]).
+    #[cfg(test)]
+    wipe_fault: Option<WipeFault>,
+}
+
+/// Test-only: how [`Deferred::break_next_wipe`] makes a wipe of a key on an engine dup table read,
+/// as a tree and a cursor that disagree would.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum WipeFault {
+    /// The wipe removed no row.
+    NoRowRemoved,
+    /// The wipe left a row of the key after the cursor.
+    RowLeft,
 }
 
 /// The test-only counts of [`Deferred`]: the rewrites made as one engine put, the held deletes
@@ -1443,7 +1460,7 @@ impl Deferred {
     ) -> tn_lmdb::Result<NonZeroU64> {
         if self.pending.is_some() {
             let what = "a second delete was held before the first ran";
-            return Err(self.fail(held_delete_broken(table, what)));
+            return Err(self.fail(invariant_broken(table, what)));
         }
         self.last += 1;
         let number = NonZeroU64::new(self.last).expect("numbered from 1");
@@ -1525,7 +1542,7 @@ impl Deferred {
         ran.map_err(|e| self.fail(e))
     }
 
-    /// Keep the failure `e` of a held delete (the first one), for the commit to refuse.
+    /// Keep the failure `e` of a held delete or a wipe (the first one), for the commit to refuse.
     fn fail(&mut self, e: tn_lmdb::Error) -> tn_lmdb::Error {
         if self.failed.is_none() {
             self.failed = Some(error::info(&e));
@@ -1533,7 +1550,8 @@ impl Deferred {
         e
     }
 
-    /// The first held delete's failure, if one failed: the transaction must not commit.
+    /// The first failure of a held delete or a wipe, if one failed: the transaction must not
+    /// commit.
     pub(crate) fn failure(&self) -> Option<DatabaseErrorInfo> {
         self.failed.clone()
     }
@@ -1574,19 +1592,25 @@ impl Deferred {
     pub(crate) fn skip_next_flush(&mut self) {
         self.skip_next_flush = true;
     }
+
+    /// Test-only: make the next wipe of a key on an engine dup table read as `fault`.
+    #[cfg(test)]
+    pub(crate) fn break_next_wipe(&mut self, fault: WipeFault) {
+        self.wipe_fault = Some(fault);
+    }
 }
 
 /// A held delete's row was not where its cursor found it: no accessor writes before running it,
 /// so the table is damaged or the adapter wrong.
 fn held_row_missing(table: &EngineTable) -> tn_lmdb::Error {
-    held_delete_broken(table, "the row of a held delete is missing")
+    invariant_broken(table, "the row of a held delete is missing")
 }
 
-/// The error for a held delete that broke the adapter's invariant (`what` happened in `table`):
-/// the engine's `Failed` (`MDBX_PANIC`), with a message saying what it is, since nothing latched:
-/// the commit refuses this write transaction ([`Deferred::fail`]), and the environment and later
-/// transactions carry on.
-fn held_delete_broken(table: &EngineTable, what: &str) -> tn_lmdb::Error {
+/// The error for a write that broke the adapter's invariant (`what` happened in `table`): a held
+/// delete, or a wipe of a key on an engine dup table. The engine's `Failed` (`MDBX_PANIC`), with a
+/// message saying what it is, since nothing latched: the commit refuses this write transaction
+/// ([`Deferred::fail`]), and the environment and later transactions carry on.
+fn invariant_broken(table: &EngineTable, what: &str) -> tn_lmdb::Error {
     tn_lmdb::Error::Failed(format!(
         "tn-lmdb-reth refuses this write transaction (the environment did not latch): {what} in \
          table {:?}, damage or an adapter bug",
@@ -2013,7 +2037,9 @@ impl<T: DupSort> DbDupCursorRW<T> for TnLmdbCursorMut<T> {
     /// Deletes every row of the current row's key (right after a delete, of the follower's key,
     /// as MDBX's does), and leaves the cursor on the next key's first row as after a delete
     /// (`next` and `current` return it, `prev_dup` finds nothing). With the cursor not at a row
-    /// (fresh, unset, past either end) this is MDBX's `MDBX_ENODATA`.
+    /// (fresh, unset, past either end) this is MDBX's `MDBX_ENODATA`. On an engine dup table, a
+    /// wipe that removed no row or left one of its key (damage, or a bug) is refused with the
+    /// engine's `Failed` (`MDBX_PANIC`), and the commit refuses the transaction.
     fn delete_current_duplicates(&mut self) -> Result<(), DatabaseError> {
         let dup = self.rows.layout::<T>()?;
         let mut guard = self.txn.lock();
@@ -2036,9 +2062,26 @@ impl<T: DupSort> DbDupCursorRW<T> for TnLmdbCursorMut<T> {
             // at or after the cursor's subkey would be found instead, where the loop's cursor
             // stays on the next key's.
             let deleted = txn.delete_prefix(&self.table, &key).map_err(error::delete)?;
-            debug_assert!(deleted > 0, "the cursor's row was a row of the key");
             let shares = self.cursor.follower_shares_prefix(txn, dup.key).map_err(error::delete)?;
-            debug_assert!(!shares, "no row of the key is left");
+            #[cfg(test)]
+            let (deleted, shares) = match state.deferred.wipe_fault.take() {
+                Some(WipeFault::NoRowRemoved) => (0, shares),
+                Some(WipeFault::RowLeft) => (deleted, true),
+                None => (deleted, shares),
+            };
+            // The walk took the cursor's row and left no row of its key, else the tree and the
+            // cursor disagree (damage the engine did not detect, or a bug): a wipe reported done
+            // would keep rows reth deleted, or leave the cursor blind to them. Refused, and the
+            // commit refuses the transaction ([`Deferred::fail`]).
+            if deleted == 0 || shares {
+                let what = if deleted == 0 {
+                    "a wipe of the cursor's key removed no row"
+                } else {
+                    "a wipe of the cursor's key left a row of it"
+                };
+                let broken = invariant_broken(&self.table, what);
+                return Err(error::delete(state.deferred.fail(broken)));
+            }
         } else {
             self.cursor.seek(txn, &key).map_err(error::delete)?;
             while self.cursor.delete_current(txn).map_err(error::delete)? {

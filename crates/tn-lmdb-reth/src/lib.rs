@@ -137,8 +137,10 @@
 //! one, else `EIO`; `NotTnLmdb` is `MDBX_INVALID`; and `UnsupportedVersion` is
 //! `MDBX_VERSION_MISMATCH`. `Failed` is also this crate's refusal of a write transaction whose held
 //! delete (the dup rewrite) broke the adapter's invariant: its row missing (damage the engine did
-//! not detect), or a second delete held before the first ran (an adapter bug). Its message says
-//! the environment did not latch: the commit refuses that transaction, and later ones carry on.
+//! not detect), or a second delete held before the first ran (an adapter bug); or whose
+//! `delete_current_duplicates` on an engine dup table removed no row, or left a row of its key (the
+//! tree and the cursor disagree). Its message says the environment did not latch: the commit
+//! refuses that transaction, and later ones carry on.
 //!
 //! **Differences from MDBX.** reth's code reaches none of them. Each cursor difference is pinned
 //! beside MDBX's result by `known_cursor_deviations_from_mdbx` or
@@ -274,9 +276,12 @@
 //! value for value and error for error.
 //! A script works on `CanonicalHeaders`, `PlainStorageState` (dup-sort, with keys and subkeys
 //! drawn from small sets so rows collide) and `Bytecodes` (values from 8 bytes to 40 KiB, so
-//! overflow runs), through the transaction's calls, two write cursors and a read cursor (every
-//! cursor call and the walks), commits, aborts, and a read transaction that must keep its
-//! snapshot. Each value names the write that made it. The runner models the tables and each
+//! overflow runs), through the transaction's calls, two write cursors and a read cursor of the
+//! write transaction (every cursor call and the walks), commits, aborts, and a read transaction
+//! that must keep its snapshot, read by its `get`, `entries` and walks, and by a cursor of its own
+//! (every read call and the walks, over the engine's read-only cursors), kept across the write
+//! transaction's commits and taken again from the transaction's cursor pool now and then. Each
+//! value names the write that made it. The runner models the tables and each
 //! cursor's place from the run's own outcomes, and skips an op that would land in one of the
 //! differences above or in the zone where MDBX is no oracle, counting each skip by class: past
 //! either end; another writer's delete and put; another writer's change to the cursor's dup key;
@@ -285,8 +290,8 @@
 //! row that exists mostly writes the value it holds, which both databases take; a quarter of them
 //! write another value, a second value for the subkey, which runs on tn-lmdb only and must be
 //! refused (`MDBX_KEYEXIST` with this crate's message) and change nothing: it is skipped on MDBX,
-//! and the ops after it must still match MDBX's. About 4% of the ops are skipped; the test fails if
-//! a tenth or more are, and each form's skips by class must equal MDBX's run's. On a difference
+//! and the ops after it must still match MDBX's. About 4.5% of the ops are skipped; the test fails
+//! if a tenth or more are, and each form's skips by class must equal MDBX's run's. On a difference
 //! proptest shrinks the script and prints both outcome lists. The scripts come from a new random
 //! seed each run, printed with the counts and in a failure's message (`PROPTEST_RNG_SEED` reruns
 //! it, or picks the seed); `random_scripts_skip_counts_are_pinned_at_seed_1` (and `_heavy`) runs

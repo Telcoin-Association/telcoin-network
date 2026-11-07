@@ -10,6 +10,7 @@ use super::{
     Form,
 };
 use crate::{
+    cursor::WipeFault,
     dup::{dup_layout, DupLayout, DUP_LAYOUTS},
     tx::compressed,
     TnLmdbEnv, TnLmdbEnvKind,
@@ -1983,4 +1984,43 @@ fn a_held_delete_that_fails_unlatched_still_fails_the_commit() {
         assert_eq!(every_row(&db.tx().unwrap()), "1/1=1 1/3=3 1/5=5");
         db.update(|tx| tx.put::<PlainStorageState>(a(2), e(1, 1))).unwrap().unwrap();
     });
+}
+
+/// A `delete_current_duplicates` on an engine dup table whose wipe removed no row of the cursor's
+/// key, or left one (the test-only `TnLmdbTxMut::break_next_wipe`: the tree and the cursor
+/// disagree, as damage the engine did not detect or a bug would make them), is refused with the
+/// engine's `Failed` (`MDBX_PANIC`), and the commit refuses the transaction with it: the
+/// environment stays open, and every row is still there.
+#[test]
+fn a_wipe_that_breaks_its_invariant_is_refused_and_fails_the_commit() {
+    for (fault, what) in
+        [(WipeFault::NoRowRemoved, "removed no row"), (WipeFault::RowLeft, "left a row of it")]
+    {
+        for form in [Form::Packed, Form::PackedSmall] {
+            let (_dir, db) = create_test_db_with(TnLmdbEnvKind::RW, form);
+            db.update(|tx| {
+                for (k, sk) in [(1, 1), (1, 3), (1, 5), (2, 1)] {
+                    tx.put::<PlainStorageState>(a(k), e(sk, u64::from(sk)))?;
+                }
+                Ok::<_, DatabaseError>(())
+            })
+            .unwrap()
+            .unwrap();
+            let tx = db.tx_mut().unwrap();
+            let mut c = tx.cursor_dup_write::<PlainStorageState>().unwrap();
+            assert_eq!(val(c.seek_by_key_subkey(a(1), s(3))), "3");
+            tx.break_next_wipe(fault);
+            let failed = match c.delete_current_duplicates().unwrap_err() {
+                DatabaseError::Delete(info) => info,
+                other => panic!("{}, {fault:?}: {other:?}", form.name()),
+            };
+            assert_eq!(failed.code, Error::Panic.to_err_code(), "{}, {fault:?}", form.name());
+            assert!(failed.message.contains(what), "{}: {}", form.name(), failed.message);
+            drop(c);
+            assert_eq!(dbg(tx.commit().unwrap_err()), dbg(DatabaseError::Commit(failed)));
+            assert_eq!(db.failure(), None);
+            assert_eq!(every_row(&db.tx().unwrap()), "1/1=1 1/3=3 1/5=5 2/1=1");
+            db.update(|tx| tx.put::<PlainStorageState>(a(3), e(1, 1))).unwrap().unwrap();
+        }
+    }
 }
